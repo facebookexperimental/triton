@@ -7,6 +7,7 @@
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Tools/LayoutUtils.h"
+#include "llvm/ADT/DenseMap.h"
 
 namespace {
 
@@ -186,11 +187,15 @@ struct LocalDeallocOpConversion
 
 struct LocalLoadOpConversion : public ConvertOpToLLVMPattern<LocalLoadOp> {
 public:
-  LocalLoadOpConversion(LLVMTypeConverter &typeConverter,
-                        const TargetInfoBase &targetInfo,
-                        PatternBenefit benefit = 1)
-      : ConvertOpToLLVMPattern(typeConverter, benefit), targetInfo(targetInfo) {
-  }
+  LocalLoadOpConversion(
+      LLVMTypeConverter &typeConverter, const TargetInfoBase &targetInfo,
+      PatternBenefit benefit = 1,
+      std::shared_ptr<DistributedCoordinateGroups> coordinateGroups = nullptr)
+      : ConvertOpToLLVMPattern(typeConverter, benefit), targetInfo(targetInfo),
+        coordinateGroups(
+            coordinateGroups
+                ? std::move(coordinateGroups)
+                : std::make_shared<DistributedCoordinateGroups>()) {}
 
   LogicalResult
   matchAndRewrite(LocalLoadOp op, OpAdaptor adaptor,
@@ -219,8 +224,25 @@ public:
       cvt = invertAndComposeBlockLocal(sharedLayout, regLayout);
     }
 
+    std::optional<std::pair<Value, Value>> distributedCoordinates;
+    if (auto group = op->getAttrOfType<IntegerAttr>(
+            "tlx.rematerialize_coordinates_group")) {
+      auto kLane = str_attr("lane");
+      auto kWarp = str_attr("warp");
+      auto outDims = to_vector(cvt.getOutDimNames());
+      bool rematerializeLane =
+          cvt.hasInDim(kLane) && !cvt.sublayoutIsZero({kLane}, outDims);
+      bool rematerializeWarp =
+          cvt.hasInDim(kWarp) && !cvt.sublayoutIsZero({kWarp}, outDims);
+      distributedCoordinates = coordinateGroups->getOrCreate(
+          op, group.getInt(), rematerializeLane, rematerializeWarp, rewriter,
+          targetInfo);
+    }
+
     auto outVals = lowerLocalLdSt(loc, ctx, cvt, {}, llvmElemTy, memDescTy,
-                                  smemObj, rewriter, targetInfo, op);
+                                  smemObj, rewriter, targetInfo, op,
+                                  /*ctaRank=*/{}, /*barrierPtr=*/{},
+                                  distributedCoordinates);
 
     Value result = packLLElements(loc, typeConverter, outVals, rewriter, regTy);
     rewriter.replaceOp(op, result);
@@ -230,6 +252,7 @@ public:
 
 private:
   const TargetInfoBase &targetInfo;
+  std::shared_ptr<DistributedCoordinateGroups> coordinateGroups;
 };
 
 struct LocalStoreOpConversion
@@ -533,12 +556,14 @@ private:
 
 void mlir::triton::populateMemoryOpToLLVMPatterns(
     LLVMTypeConverter &typeConverter, const TargetInfoBase &targetInfo,
-    RewritePatternSet &patterns, PatternBenefit benefit) {
+    RewritePatternSet &patterns, PatternBenefit benefit,
+    std::shared_ptr<DistributedCoordinateGroups> coordinateGroups) {
   patterns.add<GlobalScratchAllocOpConversion>(typeConverter, targetInfo,
                                                benefit);
   patterns.add<LocalAllocOpConversion>(typeConverter, targetInfo, benefit);
   patterns.add<LocalDeallocOpConversion>(typeConverter, benefit);
-  patterns.add<LocalLoadOpConversion>(typeConverter, targetInfo, benefit);
+  patterns.add<LocalLoadOpConversion>(typeConverter, targetInfo, benefit,
+                                      std::move(coordinateGroups));
   patterns.add<LocalGatherOpConversion>(typeConverter, targetInfo, benefit);
   patterns.add<LocalScatterOpConversion>(typeConverter, targetInfo, benefit);
   patterns.add<LocalStoreOpConversion>(typeConverter, targetInfo, benefit);

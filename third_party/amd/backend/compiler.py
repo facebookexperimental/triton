@@ -69,6 +69,17 @@ def _parse_llvm_fn_attrs(attrs):
     return tuple(parsed)
 
 
+def _get_codegen_flags(options):
+    flags = []
+    if options.reverse_local_assignment:
+        flags.append("greedy-reverse-local-assignment")
+    if options.sink_insts_to_avoid_spills:
+        flags.append("sink-insts-to-avoid-spills")
+    if options.regclass_priority_trumps_globalness:
+        flags.append("greedy-regclass-priority-trumps-globalness")
+    return flags
+
+
 @dataclass(frozen=True)
 class HIPOptions:
     num_warps: int = 4
@@ -106,6 +117,13 @@ class HIPOptions:
     # Comma-separated LLVM function attributes; bare names are emitted as valueless attributes.
     # Example: llvm_fn_attrs="amdgpu-sched-strategy=iterative-ilp,noinline"
     llvm_fn_attrs: str | Tuple[Tuple[str, str], ...] = ""
+
+    # Cache-keyed LLVM register-pressure controls. Keeping these as explicit
+    # backend options lets pressure-sensitive kernels opt in without changing
+    # allocator behavior (or cache identity) for unrelated kernels.
+    reverse_local_assignment: bool = False
+    sink_insts_to_avoid_spills: bool = False
+    regclass_priority_trumps_globalness: bool = False
 
     def __post_init__(self):
         gfx_major = int(self.arch[3:-2])  # Drop "gfx" prefix and minor/patch number
@@ -616,7 +634,7 @@ class HIPBackend(BaseBackend):
         assert len(names) == 1
         metadata["name"] = names[0]
         # llvm -> hsaco
-        flags = []
+        flags = _get_codegen_flags(options)
         if is_expert_scheduling_enabled(options.arch):
             flags.append("amdgpu-expert-scheduling-mode")
         features = disable_real_true16_feature(options.arch)

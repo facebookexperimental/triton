@@ -5,19 +5,205 @@ from .utility import cuda_parse_arch
 
 
 @tl.builtin
-def require_layout(x, layout, pin: tl.constexpr = True, _semantic=None):
+def extract_slice(source, shape, offsets, _semantic=None):
+    """Extract an aligned register slice without cross-thread movement.
+
+    The result preserves ``source``'s distributed layout and selects the
+    statically shaped region beginning at ``offsets``. The source and result
+    must have identical lane/warp ownership at CTA-tile granularity;
+    unsupported or misaligned slices fail during compilation.
+    """
+    assert isinstance(source, tl.tensor), f"source must be a tensor, got {type(source).__name__}"
+    shape = [tl._unwrap_if_constexpr(dim) for dim in shape]
+    offsets = [tl._unwrap_if_constexpr(offset) for offset in offsets]
+    rank = len(source.shape)
+    assert len(shape) == rank, f"shape must have rank {rank}, got {len(shape)}"
+    assert len(offsets) == rank, f"offsets must have rank {rank}, got {len(offsets)}"
+    assert all(isinstance(dim, int) and dim > 0 for dim in shape), "shape must contain positive constexpr integers"
+    assert all(isinstance(offset, int) and offset >= 0
+               for offset in offsets), ("offsets must contain non-negative constexpr integers")
+    for axis, (extent, offset, source_extent) in enumerate(zip(shape, offsets, source.shape)):
+        source_extent = tl._unwrap_if_constexpr(source_extent)
+        assert offset + extent <= source_extent, (
+            f"slice exceeds source extent at axis {axis}: {offset} + {extent} > {source_extent}")
+    handle = _semantic.builder.create_amd_extract_slice(source.handle, shape, offsets)
+    return tl.tensor(handle, tl.block_type(source.dtype, shape))
+
+
+@tl.builtin
+def rematerialized_range(
+    start,
+    end,
+    identity,
+    placement=None,
+    _semantic=None,
+):
+    """Materialize a distributed integer range at this source location.
+
+    This has the same numerical values as ``tl.arange(start, end)``. Unlike a
+    pure range, instances with distinct ``identity`` values are kept separate
+    under common-subexpression elimination, so cheap lane/warp coordinate
+    arithmetic can be recomputed near each use instead of remaining live
+    through a register-intensive software pipeline. ``placement`` supplies an
+    optional scheduling dependency that keeps the range near that source
+    location.
+    """
+    start = tl._unwrap_if_constexpr(start)
+    end = tl._unwrap_if_constexpr(end)
+    identity = tl._unwrap_if_constexpr(identity)
+    assert isinstance(start, int) and not isinstance(start, bool), ("start must be a constexpr integer")
+    assert isinstance(
+        end, int) and not isinstance(end, bool) and end > start, ("end must be a constexpr integer greater than start")
+    assert isinstance(identity, int) and not isinstance(identity, bool), ("identity must be a constexpr integer")
+    placement = tl._unwrap_if_constexpr(placement)
+    if placement is None:
+        placement = 0
+    placement = _semantic.to_tensor(placement)
+    placement = _semantic.cast(placement, tl.int32)
+    assert not placement.type.is_block(), "placement must be a scalar"
+
+    shape = [end - start]
+    handle = _semantic.builder.create_amd_rematerialized_range(
+        start,
+        end,
+        identity,
+        placement.handle,
+    )
+    return tl.tensor(handle, tl.block_type(tl.int32, shape))
+
+
+@tl.builtin
+def amd_register_resident(
+    value,
+    register_class: tl.constexpr = "agpr",
+    registers_per_group: tl.constexpr = 1,
+    _semantic=None,
+):
+    """Keep a distributed tensor in native AGPR or VGPR tuples.
+
+    ``registers_per_group`` is the power-of-two number of consecutive 32-bit
+    registers exposed to the allocator as one tuple.
+    """
+    register_class = tl._unwrap_if_constexpr(register_class)
+    registers_per_group = tl._unwrap_if_constexpr(registers_per_group)
+    assert isinstance(value, tl.tensor), "value must be a distributed tensor"
+    assert register_class in ("agpr", "vgpr"), ('register_class must be either "agpr" or "vgpr"')
+    assert (isinstance(registers_per_group, int) and not isinstance(registers_per_group, bool) and registers_per_group
+            in (1, 2, 4, 8, 16, 32)), "registers_per_group must be a power of two between 1 and 32"
+    handle = _semantic.builder.create_amd_register_resident(value.handle, register_class, registers_per_group)
+    return tl.tensor(handle, value.type)
+
+
+@tl.builtin
+def amd_scheduled_mfma(
+    a,
+    b,
+    acc,
+    accumulator_role: tl.constexpr,
+    resident_operand: tl.constexpr = None,
+    accumulator_register_class: tl.constexpr = None,
+    initialize: tl.constexpr = False,
+    _semantic=None,
+):
+    """Update native CDNA4 MFMA fragments with source-controlled scheduling.
+
+    Unlike ``tl.dot``, which represents one logical matrix product and carries
+    no accumulator-lifetime or register-class contract, this operation exposes
+    independent native fragment chains in source order. A ``tl.dot`` result can
+    still remain live across phases through ordinary SSA uses; its backend
+    lowering infers that lifetime instead of receiving an explicit role.
+
+    ``accumulator_role`` controls the lowering contract, not the numerical
+    operation. ``"transient"`` describes a phase-local chain: ``auto`` storage
+    selects VGPRs and lowering uses ROCDL MFMA intrinsics so LLVM can model
+    instruction latency and hazards. ``"persistent"`` describes a chain
+    carried across phases: ``auto`` storage selects AGPRs and lowering uses
+    register-constrained inline assembly. An explicit
+    ``accumulator_register_class`` overrides that default, allowing two
+    persistent accumulator sets to occupy complementary register files.
+    """
+    resident_operand = tl._unwrap_if_constexpr(resident_operand)
+    accumulator_role = tl._unwrap_if_constexpr(accumulator_role)
+    accumulator_register_class = tl._unwrap_if_constexpr(accumulator_register_class)
+    initialize = tl._unwrap_if_constexpr(initialize)
+    assert isinstance(a, tl.tensor) and isinstance(b, tl.tensor), ("a and b must be distributed tensors")
+    assert isinstance(acc, tl.tensor), "acc must be a distributed tensor"
+    assert resident_operand is None or (isinstance(resident_operand, int) and not isinstance(resident_operand, bool)
+                                        and resident_operand in (0, 1)), "resident_operand must be None, 0, or 1"
+    assert accumulator_role in ("transient",
+                                "persistent"), ('accumulator_role must be either "transient" or "persistent"')
+    assert accumulator_register_class in (None, "agpr",
+                                          "vgpr"), ("accumulator_register_class must be None, \"agpr\", or \"vgpr\"")
+    assert isinstance(initialize, bool), "initialize must be a constexpr bool"
+    resident_role = {None: "none", 0: "lhs", 1: "rhs"}[resident_operand]
+    accumulator_class = ("auto" if accumulator_register_class is None else accumulator_register_class)
+    handle = _semantic.builder.create_amd_scheduled_mfma(
+        a.handle,
+        b.handle,
+        acc.handle,
+        resident_role,
+        accumulator_role,
+        accumulator_class,
+        initialize,
+    )
+    return tl.tensor(handle, acc.type)
+
+
+@tl.builtin
+def amd_mfma_commit(value, preserve, _semantic=None):
+    """Commit transient MFMA results and thread a live dot operand.
+
+    ``value`` may be one tensor or a tuple of independent transient
+    ``amd_scheduled_mfma`` results. The returned copy of ``preserve`` can be
+    consumed by the next source stage to make its residency explicit.
+    """
+    single_value = isinstance(value, tl.tensor)
+    values = (value, ) if single_value else value
+    assert isinstance(values,
+                      (tuple, tl.tuple)) and len(values) > 0, ("value must be a tensor or nonempty tensor tuple")
+    assert all(isinstance(item, tl.tensor) for item in values), ("value must contain only tensors")
+    assert isinstance(preserve, tl.tensor), "preserve must be a tensor"
+    inputs = tuple(values) + (preserve, )
+    handles = _semantic.builder.create_amd_mfma_commit([item.handle for item in inputs])
+    outputs = tuple(tl.tensor(handle, item.type) for handle, item in zip(handles, inputs))
+    if single_value:
+        return outputs[0], outputs[-1]
+    return outputs
+
+
+@tl.builtin
+def require_layout(
+    x,
+    layout,
+    pin: tl.constexpr = True,
+    late_address_compute: tl.constexpr = False,
+    _semantic=None,
+):
     """Require a register tensor layout, optionally as a hard user anchor.
 
     With the default ``pin=True``, ``layout`` is wrapped as
     ``#tlx.user_layout`` (PinnedEncodingTrait), so downstream layout passes
     treat it as fixed. With ``pin=False``, the requirement remains
     optimizer-flexible and may be propagated or materialized as a conversion.
+
+    ``late_address_compute=True`` asks shared-memory-backed layout conversions
+    to derive their addresses at this conversion. This is useful for a late
+    epilogue conversion whose otherwise-cheap address expressions would remain
+    live through a register-heavy loop.
     """
     layout = tl._unwrap_if_constexpr(layout)
     pin = tl._unwrap_if_constexpr(pin)
+    late_address_compute = tl._unwrap_if_constexpr(late_address_compute)
     assert isinstance(pin, bool), f"pin must be a constexpr bool, got {type(pin).__name__}"
+    assert isinstance(late_address_compute, bool), ("late_address_compute must be a constexpr bool, got "
+                                                    f"{type(late_address_compute).__name__}")
     enc = layout.to_ir(_semantic.builder, x.shape, x.dtype)
-    handle = _semantic.builder.create_require_layout(x.handle, enc, pin=pin)
+    handle = _semantic.builder.create_require_layout(
+        x.handle,
+        enc,
+        pin=pin,
+        late_address_compute=late_address_compute,
+    )
     return tl.tensor(handle, x.type)
 
 

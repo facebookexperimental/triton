@@ -44,6 +44,15 @@ public:
                             Value ctaId, Type elemTy, Value pred,
                             Operation *localLoadOp = nullptr) const = 0;
 
+  // Start a fresh machine live range for a distributed thread coordinate.
+  // Targets that support cheap coordinate rematerialization can override this
+  // hook; the default preserves the original SSA value.
+  virtual Value rematerializeDistributedCoordinate(RewriterBase &rewriter,
+                                                   Location loc,
+                                                   Value coordinate) const {
+    return coordinate;
+  }
+
   void storeShared(RewriterBase &rewriter, Location loc, Value ptr, Value val,
                    Value pred) const {
     storeDShared(rewriter, loc, ptr, /*ctaId=*/Value(), val, pred);

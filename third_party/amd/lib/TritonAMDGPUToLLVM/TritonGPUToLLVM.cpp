@@ -197,10 +197,12 @@ struct ConvertTritonAMDGPUToLLVM
     populatePatterns7(mlir::triton::populateGatherOpToLLVMPatterns,
                       commonBenefit);
 
+    auto coordinateGroups = std::make_shared<DistributedCoordinateGroups>();
     AMD::populateMemoryOpToLLVMPatterns(typeConverter, patterns, targetInfo,
-                                        AMDBenefit);
+                                        AMDBenefit, coordinateGroups);
     mlir::triton::populateMemoryOpToLLVMPatterns(typeConverter, targetInfo,
-                                                 patterns, commonBenefit);
+                                                 patterns, commonBenefit,
+                                                 std::move(coordinateGroups));
     mlir::triton::populateMakeRangeOpToLLVMPattern(typeConverter, targetInfo,
                                                    patterns, commonBenefit);
     mlir::triton::populateAssertOpToLLVMPattern(typeConverter, patterns,

@@ -1,5 +1,6 @@
 #include "triton/Tools/LayoutUtils.h"
 #include "triton/Tools/GenericSwizzling.h"
+#include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/MathExtras.h"
 
 namespace mlir::triton {
@@ -374,8 +375,8 @@ actionAdditiveStrides(const LinearLayout &layout, const LinearLayout addrLayout,
   // `regsPerInst`. In particular, callers do not need to pre-zero those bases
   // for the invariant to hold.
   assert(layout.getNumInDims() != 0);
-  assert(llvm::isPowerOf2_64(regsPerInst) &&
-         "regsPerInst must be a power of two");
+  if (regsPerInst <= 0 || !llvm::isPowerOf2_64(regsPerInst))
+    llvm_unreachable("regsPerInst must be a positive power of two");
   auto kReg = *layout.getInDimNames().begin();
   assert(kReg.str() == "register");
   const size_t regBasisPerVec = llvm::Log2_64(regsPerInst);
@@ -388,8 +389,9 @@ actionAdditiveStrides(const LinearLayout &layout, const LinearLayout addrLayout,
   }
   SmallVector<size_t> front, back;
   auto layoutNamedBases = layout.flattenOuts().getBases();
-  assert(layoutNamedBases.lookup(kReg).size() >= regBasisPerVec &&
-         "layout must have at least log2(regsPerInst) register bases");
+  if (layoutNamedBases.lookup(kReg).size() < regBasisPerVec)
+    llvm_unreachable(
+        "layout must have at least log2(regsPerInst) register bases");
   for (auto [idx, basis] : llvm::enumerate(layoutNamedBases.lookup(kReg))) {
     if (idx < regBasisPerVec || (basis[0] & bits) == 0) {
       front.push_back(idx);

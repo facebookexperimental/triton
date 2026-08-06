@@ -477,7 +477,7 @@ struct ConvertTritonAtomicRMWOpToBufferAtomicRMW
         op->getLoc(), op);
     rewriter.replaceOpWithNewOp<triton::amdgpu::BufferAtomicRMWOp>(
         op, op.getVal().getType(), atomicRmwOp, basePtr, tensorOffset,
-        op.getVal(), blockStride, sem, scope, maybeMask);
+        op.getVal(), blockStride, sem, scope, maybeMask, vecSize);
 
     return success();
   }

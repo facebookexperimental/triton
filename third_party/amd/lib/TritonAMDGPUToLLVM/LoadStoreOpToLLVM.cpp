@@ -1719,13 +1719,30 @@ struct BufferAtomicRMWOpConversion
 
     unsigned numElems = getTotalElemsPerThread(ptrType);
     unsigned vec = getVectorSize(ptr, offset, axisAnalysisPass);
+    unsigned contiguity = op.getContiguity();
+    if (contiguity > numElems || numElems % contiguity != 0)
+      return rewriter.notifyMatchFailure(
+          op, "contiguity must divide the per-thread element count");
+    // Preserve alignment proven before the buffer op reduced a tensor pointer
+    // to a scalar resource descriptor plus tensor offsets.
+    vec = std::max(vec, contiguity);
+
+    // A buffer atomic emits one instruction for every `vec` elements, so a
+    // mask must be uniform across that whole group. In particular, apply the
+    // mask restriction before selecting packed 16-bit atomics: scalar f16 and
+    // bf16 buffer atomic instructions do not exist.
+    SmallVector<Value> maskElems =
+        getMaskElemsAndUpdateVeclen(rewriter, loc, llMask, mask, vec);
 
     // v4f16 and v4bf16 variants of buffer atomics do not exist.
     // only v2f16 and v2bf16.
     if (valueElemTy.isBF16() || valueElemTy.isF16()) {
       // We clamp to the only supported vectorization width here (2).
       // In ConvertToBufferOps we check that we have a large enough vector size
-      assert(vec >= 2);
+      if (vec < 2)
+        return op.emitOpError(
+            "16-bit buffer atomics require two contiguous elements per "
+            "thread after applying the mask");
       vec = 2u;
       // The max width of a buffer atomic op is 64-bits
       // Some types like F32 don't have a 2x vectorized version
@@ -1737,10 +1754,6 @@ struct BufferAtomicRMWOpConversion
     // Get the offsets and value
     SmallVector<Value> offsetElems = unpackLLElements(loc, llOffset, rewriter);
     SmallVector<Value> valueElems = unpackLLElements(loc, llData, rewriter);
-
-    // Get the mask
-    SmallVector<Value> maskElems =
-        getMaskElemsAndUpdateVeclen(rewriter, loc, llMask, mask, vec);
 
     Value rsrcDesc = bufferEmitter.createResourceDescriptor(llPtr, llStride);
     SmallVector<Value> loadedVals;

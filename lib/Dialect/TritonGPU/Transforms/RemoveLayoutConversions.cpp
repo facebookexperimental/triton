@@ -38,6 +38,39 @@ namespace mlir::triton::gpu {
 
 namespace {
 
+// A layout conversion requested at the source level can acquire a short
+// elementwise/conversion suffix when pinned layouts are materialized.  Layout
+// propagation may then eliminate the marked conversion and retain a later
+// conversion from that suffix.  Mark those downstream conversions as part of
+// the same transfer so the late coordinate-rematerialization request follows
+// the conversion that survives.
+static void propagateCoordinateRematerialization(FuncOp funcOp) {
+  SmallVector<Value> worklist;
+  DenseSet<Value> visited;
+  funcOp.walk([&](ConvertLayoutOp op) {
+    if (op->hasAttr("tlx.rematerialize_coordinates"))
+      worklist.push_back(op.getResult());
+  });
+
+  while (!worklist.empty()) {
+    Value value = worklist.pop_back_val();
+    if (!visited.insert(value).second)
+      continue;
+    for (Operation *user : value.getUsers()) {
+      if (user->getNumResults() != 1)
+        continue;
+      if (auto convert = dyn_cast<ConvertLayoutOp>(user)) {
+        convert->setAttr("tlx.rematerialize_coordinates",
+                         UnitAttr::get(funcOp.getContext()));
+        worklist.push_back(convert.getResult());
+        continue;
+      }
+      if (user->hasTrait<OpTrait::Elementwise>())
+        worklist.push_back(user->getResult(0));
+    }
+  }
+}
+
 // -----------------------------------------------------------------------------
 //
 // -----------------------------------------------------------------------------
@@ -288,6 +321,12 @@ static bool hasConvertToMMATransisitiveUse(Operation *op, Attribute encoding) {
 // Return true if the op is an op with a layout we don't want to change. We will
 // propagate the layout starting from anchor ops.
 bool isLayoutAnchor(Operation *op) {
+  // Some frontend operations carry a layout-dependent semantic promise (for
+  // example, a trusted per-thread vector-contiguity width). Retagging such an
+  // operation would invalidate that promise.
+  if (op->hasAttr("tlx.preserve_layout"))
+    return true;
+
   // A user-pinned result (an encoding carrying PinnedEncodingTrait, e.g. TLX's
   // #tlx.user_layout) is a hard anchor regardless of the producing op: the user
   // explicitly chose that layout, so layout optimization must not rewrite it.
@@ -561,6 +600,12 @@ void LayoutPropagation::resolveConflicts() {
     LayoutInfo &info = it.second;
     if (info.encodings.size() <= 1)
       continue;
+    if (op && op->hasAttr("tlx.preserve_layout")) {
+      auto originalType = cast<RankedTensorType>(it.first.getType());
+      info.encodings.clear();
+      info.encodings.insert(originalType.getEncoding());
+      continue;
+    }
     // Hacky resolve, prefer block encoding.
     // TODO: add a proper heuristic.
     Attribute encoding = *info.encodings.begin();
@@ -895,6 +940,8 @@ void LayoutPropagation::rewriteOp(Operation *op) {
 }
 
 bool canBeRemat(Operation *op) {
+  if (op->hasAttr("tlx.preserve_layout"))
+    return false;
   if (isa<LoadOp, StoreOp>(op))
     return !isExpensiveLoadOrStore(op);
   if (isa<triton::gpu::LocalLoadOp>(op))
@@ -1923,6 +1970,7 @@ public:
 
     // 1. Propagate layout forward starting from "anchor" ops.
     m.walk([this](FuncOp funcOp) {
+      propagateCoordinateRematerialization(funcOp);
       LayoutPropagation layoutPropagation(funcOp, smemBudget);
       layoutPropagation.initAnchorLayout();
       layoutPropagation.propagateLayout();
