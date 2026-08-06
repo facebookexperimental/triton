@@ -138,3 +138,51 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
     tt.return
   }
 }
+
+// -----
+
+// A synchronous local_load with one use can be rematerialized in a new layout
+// even when its tile is large. Both the loop initializer and backedge load are
+// replaced, so this does not duplicate LDS traffic.
+
+// CHECK-LABEL: @rematerialize_one_use_loop_scale
+// CHECK: %[[INIT:.*]] = ttg.local_load {{.*}} -> tensor<128x4xi8, #[[$SCALE:[a-zA-Z0-9_]+]]>
+// CHECK: scf.for {{.*}} iter_args({{.*}}%[[CARRIED:.*]] = %[[INIT]]) -> {{.*}}tensor<128x4xi8, #[[$SCALE]]>
+// CHECK-NOT: ttg.convert_layout
+// CHECK: ttg.local_load {{.*}} -> tensor<128x4xi8, #[[$SCALE]]>
+// CHECK-NOT: ttg.convert_layout
+
+#blocked_scale = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [1, 0]}>
+#linear_scale = #ttg.linear<{register = [[0, 1], [0, 2], [64, 0]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], warp = [[0, 0], [32, 0]], block = []}>
+#linear_b_scale = #ttg.linear<{register = [[0, 1], [0, 2], [64, 0]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], warp = [[32, 0], [0, 0]], block = []}>
+#mma_a = #ttg.amd_wmma<{version = 3, isTranspose = true, ctaLayout = {register = [[0, 1], [1, 0]], warp = [[0, 2], [2, 0]]}, instrShape = [16, 16, 128]}>
+#mma_b = #ttg.amd_wmma<{version = 3, isTranspose = true, ctaLayout = {register = [[0, 1], [1, 0]], warp = [[0, 2], [2, 0]]}, instrShape = [16, 16, 64]}>
+#dot_a = #ttg.dot_op<{opIdx = 0, parent = #mma_a, kWidth = 16}>
+#dot_b = #ttg.dot_op<{opIdx = 1, parent = #mma_b, kWidth = 16}>
+#shared_scale = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#smem_scale = #ttg.shared_memory
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @rematerialize_one_use_loop_scale(
+      %a: tensor<128x128xf8E4M3FN, #dot_a>,
+      %b: tensor<64x128xi8, #dot_b>,
+      %b_scale: tensor<128x4xi8, #linear_b_scale>,
+      %acc: tensor<128x128xf32, #mma_a>,
+      %init_buf: !ttg.memdesc<128x4xi8, #shared_scale, #smem_scale>,
+      %next_buf: !ttg.memdesc<128x4xi8, #shared_scale, #smem_scale>)
+      -> tensor<128x128xf32, #mma_a> {
+    %c0 = arith.constant 0 : i32
+    %c1 = arith.constant 1 : i32
+    %c4 = arith.constant 4 : i32
+    %init_scale = ttg.local_load %init_buf : !ttg.memdesc<128x4xi8, #shared_scale, #smem_scale> -> tensor<128x4xi8, #blocked_scale>
+    %result:2 = scf.for %i = %c0 to %c4 step %c1
+        iter_args(%iter_acc = %acc, %iter_scale = %init_scale)
+        -> (tensor<128x128xf32, #mma_a>, tensor<128x4xi8, #blocked_scale>) : i32 {
+      %scale = ttg.convert_layout %iter_scale : tensor<128x4xi8, #blocked_scale> -> tensor<128x4xi8, #linear_scale>
+      %dot = tt.dot_scaled %a scale %scale, %b scale %b_scale, %iter_acc lhs = e4m3 rhs = e2m1 {fastMath = false} : tensor<128x128xf8E4M3FN, #dot_a>, tensor<128x4xi8, #linear_scale> * tensor<64x128xi8, #dot_b>, tensor<128x4xi8, #linear_b_scale> -> tensor<128x128xf32, #mma_a>
+      %next_scale = ttg.local_load %next_buf : !ttg.memdesc<128x4xi8, #shared_scale, #smem_scale> -> tensor<128x4xi8, #blocked_scale>
+      scf.yield %dot, %next_scale : tensor<128x128xf32, #mma_a>, tensor<128x4xi8, #blocked_scale>
+    }
+    tt.return %result#0 : tensor<128x128xf32, #mma_a>
+  }
+}
