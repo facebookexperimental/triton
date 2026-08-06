@@ -25,7 +25,11 @@ from triton.compiler.compiler import ASTSource, compile as triton_compile
 from triton.compiler.errors import CompilationError
 from triton.backends.compiler import GPUTarget
 from triton.language.extra.tlx.tutorials.amd_tdm_gemm_pipelined import (
-    matmul_tdm_pipelined_kernel as _amd_tdm_gemm_kernel, )
+    matmul as _amd_tdm_matmul,
+    matmul_tdm_pipelined_kernel as _amd_tdm_gemm_kernel,
+    matmul_tdm_pipelined_single_warp_per_simd_schedule as _amd_tdm_single_warp_matmul,
+    matmul_tdm_pipelined_single_warp_per_simd_schedule_kernel as _amd_tdm_single_warp_kernel,
+)
 from triton.language.extra.tlx.tutorials.amd_mxfp_gemm_tdm_pipelined import (
     matmul as _amd_mxfp_matmul,
     mxgemm_tdm_pipelined_kernel as _amd_mxfp_gemm_kernel,
@@ -962,10 +966,76 @@ def test_amd_tdm_gemm_pipelined_compiles_gfx1250(device):
     )
     ttgir = compiled.asm["ttgir"]
     assert "amdg.async_tdm_copy_global_to_local" in ttgir
+    assert "amdg.async_tdm_copy_local_to_global" in ttgir
     assert "amdg.tdm_prefetch" in ttgir
     assert "ttg.padded_shared" in ttgir, "expected propagated padded encoding"
     amdgcn = compiled.asm["amdgcn"]
     assert "tensor_load_to_lds" in amdgcn or "tensor.load.to.lds" in amdgcn
+    assert "tensor_store_from_lds" in amdgcn or "tensor.store.from.lds" in amdgcn
+
+
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
+def test_amd_tdm_gemm_pipelined_correctness_gfx1250(device):
+    torch.manual_seed(0)
+    a = torch.randn((128, 64), device=device, dtype=torch.float16)
+    b = torch.randn((64, 128), device=device, dtype=torch.float16)
+    actual = _amd_tdm_matmul(a, b)
+    expected = torch.matmul(a, b)
+    torch.testing.assert_close(actual, expected, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize("TRANSPOSE_B", [False, True])
+def test_amd_tdm_gemm_single_warp_compiles_gfx1250(TRANSPOSE_B):
+    compiled = compile_for_gfx1250(
+        _amd_tdm_single_warp_kernel,
+        signature={
+            "a_ptr": "*fp16",
+            "b_ptr": "*fp16",
+            "c_ptr": "*bf16",
+            "M": "i32",
+            "N": "i32",
+            "K": "i32",
+            "stride_am": "i64",
+            "stride_ak": "i64",
+            "stride_bk": "i64",
+            "stride_bn": "i64",
+            "stride_cm": "i64",
+            "stride_cn": "i64",
+        },
+        constexprs={
+            "BLOCK_M": 32,
+            "BLOCK_N": 32,
+            "BLOCK_K": 128,
+            "NUM_BUFFERS": 2,
+            "TRANSPOSE_B": TRANSPOSE_B,
+            "L2_PREFETCH_DISTANCE": 2,
+        },
+    )
+    ttgir = compiled.asm["ttgir"]
+    assert "amdg.async_tdm_fused_copy_global_to_local" in ttgir
+    assert "amdg.async_tdm_copy_local_to_global" in ttgir
+    assert "amdg.tdm_prefetch" in ttgir
+    assert "tt.dot" in ttgir
+
+    amdgcn = compiled.asm["amdgcn"]
+    tensor_loads = amdgcn.count("tensor_load_to_lds") + amdgcn.count("tensor.load.to.lds")
+    tensor_stores = amdgcn.count("tensor_store_from_lds") + amdgcn.count("tensor.store.from.lds")
+    assert tensor_loads == 3
+    assert tensor_stores == 1
+
+
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
+@pytest.mark.parametrize("TRANSPOSE_B", [False, True])
+def test_amd_tdm_gemm_single_warp_correctness_gfx1250(device, TRANSPOSE_B):
+    torch.manual_seed(0)
+    M = N = 256
+    K = 512
+    a = torch.randn((M, K), device=device, dtype=torch.float16)
+    b = torch.randn((K, N), device=device, dtype=torch.float16)
+    b_input = b.T.contiguous() if TRANSPOSE_B else b
+    actual = _amd_tdm_single_warp_matmul(a, b_input, TRANSPOSE_B=TRANSPOSE_B)
+    expected = torch.matmul(a.to(torch.float32), b.to(torch.float32)).to(torch.bfloat16)
+    torch.testing.assert_close(actual, expected, atol=1e-2, rtol=1e-2)
 
 
 @triton.jit
