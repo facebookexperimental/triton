@@ -126,20 +126,23 @@ class CublasUnsupportedShape(Exception):
 class CublasUnsupportedPlatform(CublasUnsupportedShape):
     """No measured strategy for this GPU architecture.
 
-    Every reconstruction rule in this file is architecture-specific and was measured, not
-    derived, so it must not be extrapolated: the sm_103 rules did not carry over to sm_100 when
-    that move was tried. Subclasses `CublasUnsupportedShape` on purpose, so a caller that
-    already writes `except CublasUnsupportedShape: <fall back to cuBLAS>` keeps working
-    unchanged on a machine we have not measured."""
+    Every reconstruction rule in this file was measured on a GPU, not derived, so it must not be
+    extrapolated to one we have not run on -- even though sm_100 and sm_103 did turn out to
+    agree. Subclasses `CublasUnsupportedShape` on purpose, so a caller that already writes
+    `except CublasUnsupportedShape: <fall back to cuBLAS>` keeps working unchanged on a machine
+    we have not measured."""
 
 
 # --------------------------------------------------------------------------- #
 # Per-platform strategy
 #
 # PORTING GUIDE. Everything cuBLAS-specific in this file lives in an ArchProfile below, so
-# adding a GPU is filling in one dataclass -- no dispatch code changes. Nothing here may be
-# guessed from another architecture: when the sm_103 rules were carried over to sm_100 they
-# were wrong, and the same is expected in reverse. Each field says how to measure it.
+# adding a GPU is filling in one dataclass -- no dispatch code changes. Each field says how to
+# measure it, and measuring is the point: sm_103 turned out to share every sm_100 table but one
+# gemv row, but that was established by re-reading each kernel family on a GB300, not by
+# assuming it. An earlier attempt to carry rules the other way, from sm_103 to sm_100, was
+# wrong -- though those rules were an earlier and buggier design, so that failure is weak
+# evidence about the architectures and strong evidence about guessing.
 #
 # The gate is (compute capability, cuBLASLt version). The cuBLASLt library we call through
 # ctypes is what decides the kernels -- its name literally carries the arch, e.g.
@@ -317,6 +320,10 @@ _SM100 = ArchProfile(
         # not imply the same order. Customs 45, 62 and 63 share one signature and have three
         # different recipes. The shortcut does hold for gemv2N/gemv2T_kernel_val, where the ints
         # in the signature are the parameters.
+        #
+        # Custom 8 was only ever reached at K under 80 here, and below one chunk length a chunked
+        # recipe and an unbounded one are the same kernel, so this row is not discriminating above
+        # that. sm_103 reads a 256-k chunk for it; see `_SM103`.
         ((13, 0), (1, 1, 0, False)), ((13, 6), (1, 1, 0, False)), ((13, 7), (1, 1, 0, False)),
         ((13, 8), (1, 1, 0, False)), ((13, 84), (1, 1, 0, False)), ((13, 14), (1, 16, 16, False)),
         ((13, 36), (-64, 32, 0, True)), ((13, 37), (1, 32, 0, True)), ((13, 40), (-64, 4, 0, True)),
@@ -363,10 +370,37 @@ _SM100 = ArchProfile(
 )
 
 
-# Placeholders. Fill in the fields above on the machine in question and flip `measured=True`;
-# the dispatch, the kernels and the eval need no changes. Re-measure every field -- the values
-# in `_SM100` are not a starting point, they are a different architecture's answer.
-_SM103 = ArchProfile(name="sm_103 (NVIDIA GB300)")
+def _with_row(table, key, value):
+    """One row of a measured table replaced, for an architecture that shares all the others."""
+    assert any(k == key for k, _ in table), key
+    return tuple((k, value if k == key else v) for k, v in table)
+
+
+# sm_103 shares every sm_100 table but one gemv row. That is a measurement, not an assumption:
+# each family was re-read on a GB300 against cuBLASLt 13.1.1 -- the same version `_SM100` was
+# measured against, so a difference here would be architecture and not library. 449,520 shapes,
+# 0 declined, 2,174,951 of 2,179,476 byte-compares bit-identical, and every mismatch is the
+# known nvjet deep-K tail. The two gemv families were read with the floating-point probe rather
+# than a byte-compare, because a wrong gemv recipe survives most random inputs: a deliberately
+# wrong `ALGO 14` plan still byte-matched on 91.7% of shapes, so a pass rate proves nothing
+# there. `sm_count` and `threads_per_sm` are the same 152 and 2048 as sm_100, and the
+# `CUSTOM_OPTION 10` cap was re-read at exactly the 9728 elements that predicts.
+_SM103 = dataclasses.replace(
+    _SM100,
+    name="sm_103 (NVIDIA GB300)",
+    measured=True,
+    cublaslt_versions=((13, 1), ),
+    measured_cublaslt="13.1.1",
+    # `CUSTOM_OPTION 8` closes an accumulator group every 256 k here, read off an adjacent-L
+    # boundary scan. The sm_100 row says unbounded, which is the same kernel while K <= 256 and
+    # diverges above it -- byte-equal 15/15 with this row against 7/15 with sm_100's.
+    gemv_recipe=_with_row(_SM100.gemv_recipe, (13, 8), (1, 1, 256, False)),
+)
+
+# Placeholder. Fill in the fields above on the machine in question and flip `measured=True`;
+# the dispatch, the kernels and the eval need no changes. Re-measure every field rather than
+# copying `_SM100` -- sm_103 turned out to share its tables, but that was established by
+# re-reading each family on the GPU, not assumed.
 _SM90 = ArchProfile(name="sm_90 (NVIDIA H100)")
 
 _PROFILES = {(10, 0): _SM100, (10, 3): _SM103, (9, 0): _SM90}
