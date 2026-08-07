@@ -11,30 +11,21 @@ value it cannot model becomes an ``OpaqueLeaf`` whose token is the structural ex
 two trees compare equal only when provably the same computation.
 """
 
-import hashlib
-
 from pyptx.ir.nodes import RegisterOperand, VectorOperand
 
-from bitequiv.ptx.affine import AffineEval, canon, reqntid_of
+from bitequiv.core.affine_algebra import canon
+from bitequiv.core.canonicalize import _REDUCE_FP, collapse_balanced, tree_hashes
+from bitequiv.core.treeir import FpOp, Leaf, OpaqueLeaf, OpaqueOp, ShflCombine, SmemExchange
+from bitequiv.ptx.affine import AffineEval, reqntid_of
 from bitequiv.ptx.leaves import leaf_coord, leaf_columns
 from bitequiv.ptx.linker import Def, DefUse
-from bitequiv.ptx.treeir import (FpOp, ITreeReduce, Leaf, LoopReduce, Mma, OpaqueLeaf, OpaqueOp,
-                                 ShflCombine, SmemExchange)
 
 _FP_WIDTHS = frozenset({".f16", ".f16x2", ".f32", ".f64", ".bf16", ".bf16x2"})
 _FP_KINDS = frozenset({"add", "sub", "mul", "div", "min", "max"})
 
-# Reduce combine ops whose BALANCED tree we collapse to a layout-invariant signature.
-# add (sum), min, max: all associative + commutative, so a balanced (inner_tree) tree of them is
-# layout-invariant. min/max are DELIBERATELY not in treeir._COMMUTATIVE (their children are never
-# sorted) so a NaN payload rides positionally — inner_tree fixes ONE balanced tree at any layout,
-# so the pairing (hence NaN propagation) is identical -> bit-identical. mul is excluded (product
-# reductions are rare + carry an fma-contraction ambiguity).
-_REDUCE_FP = frozenset({"add", "min", "max"})
-
 
 def _is_fp(inst):
-    return bool(inst.modifiers) and inst.modifiers[-1] in _FP_WIDTHS
+    return bool(inst.modifiers) and any(m in _FP_WIDTHS for m in inst.modifiers)
 
 
 def _offset(operand):
@@ -196,285 +187,10 @@ class _Builder:
         return FpOp(tag, aux, tuple(kids))  # tag == fp kind (add/sub/mul/div/min/max)
 
 
-def _postorder(root):
-    """Nodes of a tree in post-order (children before parents), each visited once even in a
-    shared DAG. Iterative, so deep folds never hit Python's recursion limit."""
-    order, seen = [], set()
-    stack = [(root, False)]
-    while stack:
-        node, done = stack.pop()
-        if id(node) in seen:
-            continue
-        if not done:
-            stack.append((node, True))
-            for c in node.children:
-                if id(c) not in seen:
-                    stack.append((c, False))
-        else:
-            seen.add(id(node))
-            order.append(node)
-    return order
-
-
-def tree_sig(root):
-    """Full canonical signature string of a tree (readable; for small trees / debugging).
-    A shared DAG inlines a shared subtree at each reference, so this can be very large for a
-    big reduction — :func:`tree_hash` is what the descriptor uses."""
-    memo = {}
-    for node in _postorder(root):
-        memo[id(node)] = node.sig_local([memo[id(c)] for c in node.children])
-    return memo[id(root)]
-
-
-def tree_hash(root):
-    """Compact canonical signature: a Merkle hash where each node hashes its local string
-    over its children's hashes. Equal trees (including shared DAGs) -> equal hash, computed
-    once per unique node, so the descriptor stays O(1)-sized regardless of reduction size."""
-    h = {}
-    for node in _postorder(root):
-        local = node.sig_local([h[id(c)] for c in node.children])
-        h[id(node)] = hashlib.sha1(local.encode()).hexdigest()[:16]
-    return h[id(root)]
-
-
 def build_trees(func):
     """List of reconstructed reduction-tree roots for one ``.entry`` (one per result store)."""
     b = _Builder(func)
     return [b.build(reg, idx) for reg, idx in b.roots()]
-
-
-def _coordfree_sig(node):
-    """Canonical signature of a (leaf-boundary) subtree with Leaf coordinates blanked, so two
-    leaves computing the same thing at different layout positions compare equal."""
-    memo = {}
-    for n in _postorder(node):
-        memo[id(n)] = "L[]" if isinstance(n, Leaf) else n.sig_local([memo[id(c)] for c in n.children])
-    return memo[id(node)]
-
-
-def _leaf_cols_union(node):
-    """Union of every descendant Leaf's column image, or None if any is unrecoverable."""
-    out = set()
-    for n in _postorder(node):
-        if isinstance(n, Leaf):
-            if n.cols is None:
-                return None
-            out |= n.cols
-    return out
-
-
-def _is_reduce_node(n):
-    return ((isinstance(n, FpOp) and not n.fused and n.kind in _REDUCE_FP and len(n.children) == 2)
-            or (isinstance(n, ShflCombine) and n.kind in _REDUCE_FP) or isinstance(n, SmemExchange))
-
-
-def _balance_pass(root):
-    """Per node: (balanced, height, optok). A subtree is a balanced reduction iff every reduce
-    node has children that are balanced reductions of one consistent op AND (for the 2-ary fp
-    combine) their heights differ by <= 1 — the AVL property that separates inner_tree's balanced
-    tree from unordered's left-fold. Boundary leaves are trivial arity-1 balanced reductions."""
-    bal, ht, optok = {}, {}, {}
-    for n in _postorder(root):
-        if _is_reduce_node(n):
-            kids = list(n.children)
-            ops = {optok[id(c)] for c in kids if optok[id(c)] is not None}
-            if isinstance(n, FpOp):
-                ops.add(n.kind + "".join(n.mods))
-            op = next(iter(ops)) if len(ops) == 1 else None  # single consistent op, else None (never empty-iter)
-            kids_bal = all(bal[id(c)] for c in kids)
-            if isinstance(n, FpOp):
-                bal[id(n)] = kids_bal and op is not None and abs(ht[id(kids[0])] - ht[id(kids[1])]) <= 1
-            else:  # shfl / smem: 1-ary cross-thread step; balance carried from its child
-                bal[id(n)] = kids_bal and op is not None
-            ht[id(n)] = max((ht[id(c)] for c in kids), default=0) + 1
-            optok[id(n)] = op
-        else:
-            bal[id(n)], ht[id(n)], optok[id(n)] = True, 0, None
-    return bal, ht, optok
-
-
-def _has_opaque(node):
-    return any(isinstance(n, (OpaqueLeaf, OpaqueOp)) for n in _postorder(node))
-
-
-# Pure per-element ops that are safe to keep VERBATIM inside a collapsed reduction's leaf: each is
-# a deterministic function of ONE element (cast/copy/abs/neg + the transcendentals a softmax /
-# rmsnorm / layernorm applies before the reduce), hence layout-invariant. Its token rides verbatim
-# into leaf_sig (compared, never dropped), so equal leaf_sig => same op; a config WITHOUT the op
-# gets a different leaf_sig and never merges.
-_PURE_ELT = ("cvt", "mov", "abs", "neg", "ex2", "lg2", "exp", "log",
-             "sqrt", "rsqrt", "rcp", "sin", "cos", "tanh")
-
-
-def _tok_is_pure(token):
-    """True iff ``token``'s OPCODE (the part before the first '.') is a pure per-element op. Matched
-    at the opcode boundary (``token == p`` or ``token.startswith(p + '.')``), never a bare prefix,
-    so 'neg' cannot alias a hypothetical 'negX' and 'exp' cannot alias an unrelated 'expand'."""
-    return any(token == p or token.startswith(p + ".") for p in _PURE_ELT)
-
-
-def _leaf_layout_invariant(node):
-    """A reduction boundary-leaf subtree is layout-invariant (safe to collapse over) iff it has
-    NO cross-thread op (Shfl/Smem), NO lost-provenance OpaqueLeaf, no fused-fma ACC-chain (a
-    layout-dependent accumulation, not a per-element value), and every OpaqueOp is a pure
-    per-element op (cvt/mov/abs/neg) kept verbatim. This admits the bf16 promote (cvt.f32.bf16)
-    and a single product mul(L,L) / fma(L,L;const) while refusing anything whose value could
-    depend on the thread/lane layout."""
-    for n in _postorder(node):
-        if isinstance(n, (ShflCombine, SmemExchange, Mma, LoopReduce)):
-            return False  # cross-thread / opaque-chunk / loop-fold node: not a per-element leaf
-        if isinstance(n, OpaqueLeaf):
-            return False
-        if isinstance(n, OpaqueOp) and not _tok_is_pure(n.token):
-            return False
-        if isinstance(n, FpOp) and n.fused and len(n.children) == 3 and isinstance(
-                n.children[2], (FpOp, ShflCombine, SmemExchange, ITreeReduce)):
-            return False  # fma acc-chain (a*b + running_acc) is layout-dependent, not a leaf
-    return True
-
-
-def _shfl_dir(node, ht):
-    """The butterfly DIRECTION: the distinct offsets of the FIRST (min-height, nearest-leaves)
-    shuffle step. count-up (inner_tree) starts at offset 1; count-down (unordered) starts at 16.
-    They pair lanes differently -> different bits, so this must be in the token. It is
-    num_warps-INVARIANT (the within-warp butterfly's first step is offset 1 for inner_tree at any
-    num_warps; cross-warp shuffles sit at higher height), so it distinguishes the orderings
-    WITHOUT blocking num_warps recovery (the full offset sequence would, since cross-warp shuffle
-    count scales with num_warps)."""
-    shfls = [(ht[id(n)], str(n.offset)) for n in _postorder(node) if isinstance(n, ShflCombine)]
-    if not shfls:
-        return ()
-    lo = min(h for h, _ in shfls)
-    return tuple(sorted({off for h, off in shfls if h == lo}))
-
-
-def _single_element(node):
-    """True iff every ``Leaf`` under a boundary subtree reads the SAME element (identical coord) —
-    i.e. the boundary is a per-element function ``f(x_i)`` (``exp(L)``, ``mul(L,L)`` of one element,
-    a bare ``L``). Then the multiset ``{f(x_i)}`` is layout-invariant, so a balanced reduction over
-    it is bit-identical at any layout and MAY collapse. A boundary combining DISTINCT elements
-    (``mul(L_i, L_j)``, i != j) is layout-invariant only if the PAIRING is data-fixed, which the
-    coord-blanking ``_coordfree_sig`` cannot prove — so refuse it (sound; stays over-split)."""
-    coords = {n.coord for n in _postorder(node) if isinstance(n, Leaf)}
-    return len(coords) == 1
-
-
-def _collapse_info(node):
-    """(reduce_op_token, uniform_coord_free_leaf_sig) for a balanced reduction, or None if it
-    cannot be SOUNDLY collapsed. The BOUNDARY leaves are the non-reduce CHILDREN of reduce nodes
-    (NOT every non-reduce postorder node — collecting the latter double-counts a boundary's own
-    internal nodes, e.g. it sees both ``cvt(L)`` and its child ``L`` -> two coord-free sigs -> a
-    spurious bail; that is why the baseline never collapsed cvt/exp/mul-fed reductions). Guards: a
-    single consistent reduce op; >= 2 boundary leaves; every boundary is layout-invariant
-    (pure-elt) AND single-element AND has the SAME coord-free computation (dropping coords is then
-    safe); and the column image is recoverable for every leaf (addressing understood)."""
-    op, leaves = None, []
-    for n in _postorder(node):
-        if not _is_reduce_node(n):
-            continue
-        if isinstance(n, FpOp) and not n.fused and len(n.children) == 2:
-            tok = n.kind + "".join(n.mods)
-            if op is None:
-                op = tok
-            elif op != tok:
-                return None
-        for c in n.children:  # a boundary leaf is a non-reduce child of a reduce node
-            if not _is_reduce_node(c):
-                leaves.append(c)
-    if op is None or len(leaves) < 2:
-        return None
-    if not all(_leaf_layout_invariant(l) for l in leaves):
-        return None  # a layout-dependent / lost-provenance leaf -> do not collapse
-    if not all(_single_element(l) for l in leaves):
-        return None  # a boundary over DISTINCT elements: pairing may be layout-dependent
-    if len({_coordfree_sig(l) for l in leaves}) != 1:
-        return None  # non-uniform leaf computations -> conservative
-    for l in leaves:  # require addressing understood for every leaf (column image recoverable)
-        if _leaf_cols_union(l) is None:
-            return None
-    return (op, _coordfree_sig(leaves[0]))
-
-
-def output_coordfree_key(node):
-    """Coord-free dedup key for one output of a MULTI-output entry (a COLLAPSED tree), or None if the
-    tree is not safe to coord-blank.
-
-    A multi-output entry (softmax / layernorm / rmsnorm: one output per row, many rows per block) is
-    kept VERBATIM by the descriptor today, so num_warps (which redistributes rows across threads)
-    never merges. But when EVERY output is a clean per-element function of its own element over
-    num_warps-invariant reductions — ``out[i] = f(x_i, ITreeReduce(row_i))`` — blanking the leaf coord
-    makes all outputs share ONE key, and deduping that key across the entry gives a num_warps-invariant
-    descriptor (the per-thread output COUNT varies with num_warps, but the SET of distinct output
-    computations does not). An unordered per-row reduction keeps its ShflCombine offsets in the
-    coord-free string (num_warps-bearing) so it still splits — inner_tree recovers, unordered does not.
-
-    SAFE only when the output's VALUE structure is fully modeled: no lost-provenance ``OpaqueLeaf``
-    (except a CONSTANT immediate, which is num_warps-invariant), and every ``OpaqueOp`` is a pure
-    per-element op (cvt / exp / mov / ...). A Leaf's COORD may be opaque (a swizzle / multi-dim address
-    the affine pass could not pin) — that is only ADDRESSING (which element), and blanking it is the
-    whole point; faithful reconstruction already guarantees the value DEPENDENCY is captured, so what
-    remains is an elementwise map over num_warps-invariant reductions. A tree with an unmodeled value
-    op / lost non-constant leaf returns None and the caller falls back to the verbatim (sound,
-    over-split) descriptor. This blanks more than the guarded reduction collapse (in particular it does
-    not re-prove the elementwise assumption for a swizzled address), so it is gated on the empirical
-    fuzzer (0 over-merge) rather than statically proven."""
-    for n in _postorder(node):
-        if isinstance(n, OpaqueLeaf) and "imm(" not in n.token:
-            return None  # a lost-provenance (non-constant) value -> unsafe to coord-blank
-        if isinstance(n, OpaqueOp) and not _tok_is_pure(n.token):
-            return None  # an unmodeled value op -> unsafe
-        if isinstance(n, Leaf) and n.coord is None:
-            return None  # no coord at all (not even opaque) -> nothing to blank soundly
-    return _coordfree_sig(node)
-
-
-def _rebuild(n, kids):
-    """Reconstruct node n with already-processed children kids."""
-    if isinstance(n, (Leaf, OpaqueLeaf, ITreeReduce)):
-        return n
-    if isinstance(n, FpOp):
-        return FpOp(n.kind, n.mods, tuple(kids), n.fused)
-    if isinstance(n, OpaqueOp):
-        return OpaqueOp(n.token, tuple(kids))
-    if isinstance(n, ShflCombine):
-        return ShflCombine(n.offset, n.kind, n.mods, kids[0])
-    if isinstance(n, SmemExchange):
-        return SmemExchange(kids[0])
-    if isinstance(n, Mma):
-        return Mma(n.token, n.flags, tuple(kids))
-    if isinstance(n, LoopReduce):
-        return LoopReduce(n.op, kids[0], n.key)
-    return n
-
-
-def collapse_balanced(root):
-    """Replace each MAXIMAL balanced reduction with a layout-invariant ITreeReduce node.
-
-    Sound: only balanced reductions collapse (inner_tree; unordered's left-fold stays intact),
-    and only when the column image + a uniform leaf computation are fully recovered. Different
-    chunk sizes (BLOCK_N) -> different column image -> distinct; fp_fusion -> different leaf/fold
-    structure -> distinct. Iterative (no recursion on deep folds)."""
-    bal, ht, optok = _balance_pass(root)
-    # Collapse every MAXIMAL balanced reduction region, including per-chunk reductions nested
-    # under a persistent kernel's cross-chunk loop. The ITreeReduce token keeps the reduction
-    # height (= log2(BLOCK_N)+const, num_warps-invariant, BLOCK_N-monotone), so different chunk
-    # sizes stay in distinct classes.
-    collapsible = {id(n): (_is_reduce_node(n) and bal[id(n)] and optok[id(n)] is not None) for n in _postorder(root)}
-    has_coll_parent = {}
-    for n in _postorder(root):
-        if collapsible[id(n)]:
-            for c in n.children:
-                has_coll_parent[id(c)] = True
-    new = {}
-    for n in _postorder(root):
-        region_root = collapsible[id(n)] and not has_coll_parent.get(id(n), False)
-        info = _collapse_info(n) if region_root else None
-        if info is not None:
-            op, leaf_sig = info
-            new[id(n)] = ITreeReduce(op, leaf_sig, ht[id(n)], _shfl_dir(n, ht))
-        else:
-            new[id(n)] = _rebuild(n, [new[id(c)] for c in n.children])
-    return new[id(root)]
 
 
 def entry_signatures(func):
@@ -490,4 +206,4 @@ def entry_signatures(func):
     roots = build_trees(func)
     if len(roots) == 1:
         roots = [collapse_balanced(roots[0])]
-    return tuple(sorted(tree_hash(t) for t in roots))
+    return tuple(sorted(tree_hashes(roots)))

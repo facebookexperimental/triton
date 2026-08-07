@@ -49,6 +49,8 @@ namespace mlir {
 namespace triton {
 namespace nvidia_gpu {
 
+namespace {
+
 FailureOr<gpu::CGAEncodingAttr> parseCGALayoutRankTwo(AsmParser &parser) {
   Attribute attr;
   if (parser.parseAttribute(attr).failed())
@@ -61,6 +63,8 @@ FailureOr<gpu::CGAEncodingAttr> parseCGALayoutRankTwo(AsmParser &parser) {
 void printCGALayoutRankTwo(AsmPrinter &printer, gpu::CGAEncodingAttr cgaAttr) {
   gpu::printCGAAttr(printer, cgaAttr);
 }
+
+} // namespace
 
 TensorMemoryScalesBlockRepOrder getTensorMemoryScalesBlockRepOrder(
     Operation *op, bool isA, ScaleDotElemType aType, ScaleDotElemType bType,
@@ -228,7 +232,9 @@ getDistributedLayoutForTmemLdSt(const LinearLayout &ll, TMemAccessAtom atom,
       // Software padding with just one column
       return getDistributedLayoutForTmemLdSt(ll, atom, numWarps, 32);
     } else {
-      assert(false && "Should not happen");
+      // This can fail for fp4_padded layouts as we don't support implicit
+      // padding and unpadding upon load yet.
+      return std::nullopt;
     }
   }
   // getTileLayout returns the layout for a bitwidth of 32
@@ -349,15 +355,6 @@ getDistributedLayoutForTmemLdSt(gpu::MemDescType memType, TMemAccessAtom atom,
 DistributedEncodingTrait getDefaultLayoutForTmemLdSt(gpu::MemDescType memType,
                                                      unsigned numWarps) {
   auto *ctx = memType.getContext();
-  bool prefer16x256 =
-      triton::tools::getBoolEnv("TRITON_PREFER_TMEM_16x256_LAYOUT");
-  if (prefer16x256) {
-    auto layout = getDistributedLayoutForTmemLdSt(
-        memType, TMemAccessAtom::I16x256b, numWarps);
-    if (layout) {
-      return LinearEncodingAttr::get(ctx, std::move(*layout));
-    }
-  }
   auto layout = getDistributedLayoutForTmemLdSt(
       memType, TMemAccessAtom::I32x32b, numWarps);
   assert(layout);
@@ -440,7 +437,7 @@ bool isDistributedLayoutTMemCompatible(Operation *op,
 LogicalResult TensorMemoryEncodingAttr::verify(
     function_ref<InFlightDiagnostic()> emitError, unsigned blockM,
     unsigned blockN, unsigned colStride, gpu::CGAEncodingAttr cgaLayout,
-    bool twoCTAs, TensorMemoryCTAMode) {
+    bool twoCTAs, TensorMemoryCTAMode, bool fp4Padded) {
   if (cgaLayout.getRank() != 2) {
     return emitError() << "CGALayout must have rank 2";
   }
@@ -471,6 +468,11 @@ LogicalResult TensorMemoryEncodingAttr::verify(
   if (!(colStride == 1 || colStride == 2 || colStride == 4)) {
     return emitError() << "colStride must be 1, 2, or 4 but got "
                        << "but got " << colStride;
+  }
+  if (fp4Padded && colStride != 1) {
+    return emitError() << "fp4Padded tensor memory layout requires colStride "
+                          "1 but got "
+                       << colStride;
   }
   return success();
 }

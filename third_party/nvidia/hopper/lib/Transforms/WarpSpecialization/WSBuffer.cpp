@@ -40,9 +40,10 @@ namespace mlir {
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
 #define LDBG(X) LLVM_DEBUG(DBGS() << X << "\n")
 
-static bool
-enclosingAChannel(Operation *ctrlOp,
-                  const DenseSet<Operation *> &regionsWithChannels) {
+namespace {
+
+bool enclosingAChannel(Operation *ctrlOp,
+                       const DenseSet<Operation *> &regionsWithChannels) {
   for (auto *op : regionsWithChannels) {
     if (ctrlOp == op)
       return true;
@@ -54,16 +55,6 @@ enclosingAChannel(Operation *ctrlOp,
         return true;
   }
   return false;
-}
-
-unsigned getLoopDepth(Operation *op) {
-  unsigned depth = 0;
-  auto pOp = op->getParentOfType<scf::ForOp>();
-  while (pOp) {
-    ++depth;
-    pOp = pOp->getParentOfType<scf::ForOp>();
-  }
-  return depth;
 }
 
 // Update preOrderOps with a list of region Ops nested under ctrlOp that will
@@ -670,6 +661,10 @@ scf::ForOp createNewLoop(scf::ForOp forOp, scf::ForOp &parentForOp,
   return newForOp;
 }
 
+} // namespace
+
+// Here we assume the source and destination ops are in the same region op.
+// Go through channels, and get a set of region ops containing channels.
 void collectRegionsWithChannels(const SmallVector<Channel *> &channels,
                                 DenseSet<Operation *> &regionsWithChannels) {
   for (auto *channel : channels) {
@@ -735,6 +730,8 @@ void collectRegionsWithChannels(const SmallVector<Channel *> &channels,
     }
   }
 }
+
+namespace {
 
 // Go through a list of operations in opList, recursively call into
 // createNewLoopWrapper or rewriteIfOp.
@@ -1251,6 +1248,8 @@ scf::WhileOp createNewWhileWrapper(scf::WhileOp origWhileOp,
   });
   return newWhileOp;
 }
+
+} // namespace
 
 void appendAccumCntsForOps(SmallVector<Operation *> &taskTopOps,
                            const SmallVector<Channel *> &channels,

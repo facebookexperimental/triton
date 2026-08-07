@@ -88,9 +88,12 @@ the re-sync.
     Return a subview of the buffer indexed by `buffer_idx` from `buffers`. Both the explicit `local_view()` call and the indexing syntax `[]` are supported.
 
 
-- `distributed_tensor = tlx.local_load(buffer, optional_token)` **[Hopper+, MI300+]**
+- `distributed_tensor = tlx.local_load(buffer, token=None, layout=None, relaxed=False, rematerialize_coordinates=False, rematerialize_coordinates_group=None)` **[Hopper+, MI300+]**
 
-    Loads the buffer from local memory or tensor memory into a distributed tensor.
+    Loads the buffer from local or tensor memory. `layout` pins a requested
+    register layout. On AMD, the rematerialization options start fresh address
+    coordinate live ranges either per load or for a named group of nearby
+    loads; the two options are mutually exclusive.
 
 
 - `tlx.local_store(buffer, distributed_tensor)` **[Hopper+, MI300+]**
@@ -590,6 +593,12 @@ Binary wheels are available for CPython 3.10-3.14.
 
     Perform the arrive operation on an mbarrier. If `remote_cta_rank` is provided, signals the barrier in the specified remote CTA's shared memory (useful for multi-CTA synchronization).
 
+- `tlx.amd_sched_barrier(mask=0)`  **[AMD]**
+
+    Prevents selected AMD machine-instruction classes from crossing a source
+    boundary. It is a scheduling marker, not a workgroup barrier or memory
+    fence.
+
 ### Memory Fences
 
 - `tlx.fence(scope)` **[Hopper+]** issues a memory fence. The `scope` argument is required:
@@ -1031,7 +1040,7 @@ TLX uses **CUDA-native cluster semantics** which differs from Triton's approach:
     tlx.dump_layout(v)                  # -> // cute: _64:_1
     ```
 
-- `x = tlx.require_layout(x, layout, pin=True)` **[Hopper+, MI300+]**
+- `x = tlx.require_layout(x, layout, pin=True, late_address_compute=False)` **[Hopper+, MI300+]**
 
     Require a register tensor `x` to use `layout`, expressed as a
     `tlx.layout(...)` (Shape:Stride). With the default `pin=True`, the `#linear`
@@ -1049,6 +1058,11 @@ TLX uses **CUDA-native cluster semantics** which differs from Triton's approach:
     requested encoding without the `#tlx.user_layout` hard anchor, allowing
     later layout passes to propagate the requirement or materialize a layout
     conversion. The default remains `pin=True` for existing callers.
+
+    On AMD, `late_address_compute=True` asks shared-memory-backed layout
+    conversions to compute their addresses at this use. The backend does this
+    by rematerializing inexpensive lane/warp coordinates, shortening their live
+    ranges across register-heavy regions.
 
     Pair with `tlx.assert_same_layout(x, layout)` (below) to statically verify the
     pin survived to the final TTGIR.
@@ -1104,7 +1118,9 @@ Buffer operations access global memory via a scalar base pointer and a tensor of
 Load a tensor of values from global memory.
 
 ```python
-result = tlx.buffer_load(ptr, offsets, mask=None, other=None, cache=None)
+result = tlx.buffer_load(
+    ptr, offsets, mask=None, other=None, cache=None, contiguity=1
+)
 ```
 
 | Argument | Type | Description |
@@ -1114,6 +1130,7 @@ result = tlx.buffer_load(ptr, offsets, mask=None, other=None, cache=None)
 | `mask` | bool tensor, optional | When `mask[i]` is `False`, the element is not loaded. |
 | `other` | tensor or scalar, optional | Value used for masked-out elements (where `mask[i]` is `False`). |
 | `cache` | str, optional | Cache modifier (e.g. `".ca"`, `".cg"`). |
+| `contiguity` | constexpr int | Trusted positive power-of-two vectorization width; it must divide each thread's element count. |
 
 **Returns**: A tensor with the same shape as `offsets` and element type matching the pointee type of `ptr`.
 
@@ -1138,6 +1155,23 @@ tlx.buffer_store(stored_value, ptr, offsets, mask=None, cache=None)
 **Returns**: Nothing.
 
 Lowers to `amdg.buffer_store`, which is eventually lowered to `rocdl.raw.ptr.buffer.store`.
+
+### `tlx.buffer_atomic_add`
+
+Atomically add a tensor through an AMD scalar resource descriptor.
+
+```python
+previous = tlx.buffer_atomic_add(
+    ptr, offsets, value, mask=None, sem=None, scope=None, contiguity=1
+)
+```
+
+`contiguity` is the same trusted per-thread adjacency width accepted by
+`buffer_load`; values greater than one also preserve the selected layout. The
+operation returns the values observed before the additions. FP16 and BF16 use
+packed two-element instructions, so `contiguity` must be at least two and any
+mask must be uniform for each adjacent pair. Compilation fails if mask analysis
+reduces the legal vector width below two.
 
 ### `tlx.buffer_load_to_local`
 
@@ -1209,6 +1243,37 @@ data = tlx.buffer_load(base, offsets)
 ```
 
 Lowers to `amdg.assume_uniform`, which is eventually lowered to `llvm.amdgcn.readfirstlane` — that makes the result uniform by construction as far as LLVM's uniformity analysis is concerned. On non-AMD backends it is a no-op that returns its argument. Nothing verifies the assertion: if the value is not actually uniform, every lane silently gets lane 0's value.
+
+## Explicit MFMA Scheduling (AMD)
+
+> **[MI350]** — the source-scheduled operations are restricted to CDNA4
+> (`gfx950`) native BF16 MFMA layouts.
+
+- `tl.dot(a, b, acc)` preserves a TLX-pinned accumulator layout, so whole dots
+  need no AMD-specific wrapper.
+- `tlx.extract_slice(source, shape, offsets)` selects an aligned register
+  fragment without cross-thread movement.
+- `tlx.rematerialized_range(start, end, anchor, placement=None)` recreates
+  inexpensive distributed coordinates near a use instead of carrying them
+  through a long software pipeline.
+- `tlx.amd_register_resident(value, register_class="agpr", registers_per_group=1)`
+  keeps a distributed value in allocator-visible native register tuples.
+- `tlx.amd_scheduled_mfma(...)` exposes independent native MFMA accumulator
+  chains in deterministic N-major, M-minor, K-reduction source order.
+- `tlx.amd_mfma_commit(value, preserve)` applies the CDNA4 MFMA result hazard
+  boundary while threading a live dot-operand dependency.
+- `tlx.amd_sched_barrier(mask=0)` prevents selected AMD machine-instruction
+  classes from crossing a source boundary. It is a scheduling marker, not a
+  workgroup barrier or memory fence.
+
+These primitives describe fragments, lifetimes, and ordering without assigning
+physical registers. Their verifiers reject unsupported targets, layouts,
+element types, and native fragment widths before lowering.
+
+Unlike `tl.dot`, `amd_scheduled_mfma` carries an explicit `accumulator_role`.
+`transient` selects the latency-aware intrinsic path for phase-local work;
+`persistent` selects register-constrained lowering for a chain carried across
+phases. Neither role changes the numerical matrix operation.
 
 ## AMD TDM Descriptor Loads
 

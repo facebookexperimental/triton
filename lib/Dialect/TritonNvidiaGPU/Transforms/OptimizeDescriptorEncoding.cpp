@@ -6,6 +6,7 @@
 #include "triton/Dialect/Triton/IR/Types.h"
 #include "triton/Dialect/TritonGPU/IR/Attributes.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
 #include "triton/Dialect/TritonGPU/IR/TritonGPUInterfaces.h"
 #include "triton/Dialect/TritonGPU/Transforms/DescriptorMemoryLayouts.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
@@ -36,17 +37,91 @@ static bool isTMACompatibleEncoding(Attribute enc) {
   return false;
 }
 
+static Attribute getCompatibleSharedEncoding(Attribute enc,
+                                             ArrayRef<int64_t> shape,
+                                             Type elementType) {
+  if (isTMACompatibleEncoding(enc))
+    return enc;
+
+  auto sharedLinear = dyn_cast<ttg::SharedLinearEncodingAttr>(enc);
+  if (!sharedLinear)
+    return {};
+
+  auto *ctx = enc.getContext();
+  auto cgaLayout = ttg::getCGALayout(sharedLinear);
+  auto order = ttg::getOrder(sharedLinear, shape);
+  auto sharedLinearLayout = ttg::toLinearLayout(shape, sharedLinear);
+  auto isEquivalent = [&](ttg::NVMMASharedEncodingAttr candidate) {
+    auto candidateLayout = ttg::nvmmaSharedToLinearLayout(
+        shape, candidate, ttg::TMAMode::Tiled, /*disableSwizzle=*/false,
+        /*emitErrors=*/false);
+    return succeeded(candidateLayout) && *candidateLayout == sharedLinearLayout;
+  };
+
+  SmallVector<ttg::NVMMASharedEncodingAttr> preferredCandidates;
+  // TMA descriptors only support non-transposed layouts. Preserve Triton's
+  // default shape/order-based choice when it already matches this
+  // shared_linear layout. The full candidate scan below is only a fallback for
+  // equivalent non-transposed layouts not selected by the heuristic builder.
+  for (bool fp4Padded : {false, true}) {
+    auto preferred = ttg::NVMMASharedEncodingAttr::get(
+        ctx, shape, order, cgaLayout, elementType, fp4Padded);
+    preferredCandidates.push_back(preferred);
+    if (isEquivalent(preferred))
+      return preferred;
+  }
+
+  unsigned elementBitWidth = std::max(8u, elementType.getIntOrFloatBitWidth());
+  for (bool fp4Padded : {false, true}) {
+    for (unsigned swizzle : {0u, 32u, 64u, 128u}) {
+      auto candidate = ttg::NVMMASharedEncodingAttr::get(
+          ctx, swizzle, /*transposed=*/false, elementBitWidth, fp4Padded,
+          cgaLayout);
+      if (llvm::is_contained(preferredCandidates, candidate))
+        continue;
+      if (isEquivalent(candidate))
+        return candidate;
+    }
+  }
+
+  return {};
+}
+
 Attribute findLoadEncodingFromUsers(Operation *op) {
+  auto getCompatibleEncodingForType = [&](Type type) -> Attribute {
+    if (auto memDescTy = dyn_cast<ttg::MemDescType>(type)) {
+      return getCompatibleSharedEncoding(memDescTy.getEncoding(),
+                                         memDescTy.getShape(),
+                                         memDescTy.getElementType());
+    }
+    if (auto tensorTy = dyn_cast<RankedTensorType>(type)) {
+      return getCompatibleSharedEncoding(tensorTy.getEncoding(),
+                                         tensorTy.getShape(),
+                                         tensorTy.getElementType());
+    }
+    return {};
+  };
+
+  if (auto attr = op->getDiscardableAttr("tt.desired_encoding")) {
+    if (op->getNumResults() != 0) {
+      if (auto resultTy =
+              dyn_cast<RankedTensorType>(op->getResult(0).getType())) {
+        if (auto compatible = getCompatibleSharedEncoding(
+                attr, resultTy.getShape(), resultTy.getElementType()))
+          return compatible;
+      }
+    }
+  }
+
   // Ignore multiple users and just pick the first compatible layout
   for (auto use : op->getUsers()) {
     if (auto alloc = dyn_cast<ttg::LocalAllocOp>(use)) {
-      auto enc = alloc.getType().getEncoding();
-      if (isTMACompatibleEncoding(enc))
-        return enc;
+      if (auto compatible = getCompatibleEncodingForType(alloc.getType()))
+        return compatible;
     } else if (auto store = dyn_cast<ttg::LocalStoreOp>(use)) {
-      auto enc = store.getDst().getType().getEncoding();
-      if (isTMACompatibleEncoding(enc))
-        return enc;
+      if (auto compatible =
+              getCompatibleEncodingForType(store.getDst().getType()))
+        return compatible;
     }
   }
   return {};
@@ -605,7 +680,6 @@ public:
   using BaseT::BaseT;
 
   void runOnOperation() override {
-    MLIRContext *context = &getContext();
     ModuleOp m = getOperation();
     if (failed(assignMemoryLayouts(m)))
       signalPassFailure();

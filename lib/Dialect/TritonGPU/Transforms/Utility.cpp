@@ -1099,27 +1099,28 @@ LogicalResult getConvertBackwardSlice(
     auto currentValueType = dyn_cast<RankedTensorType>(currentValue.getType());
     if (!currentValueType)
       continue;
-    // Skip propagating through for op/while op/ws op results for now.
-    // TODO: enable this based on needs.
-    auto defOp = currentValue.getDefiningOp();
-    if (isa_and_nonnull<scf::ForOp, scf::WhileOp, ttg::WarpSpecializeOp>(defOp))
-      return failure();
     if (failed(updateLayout(currentValue, encoding)))
       return failure();
     // If the value already has the desired encoding, we can stop here without
     // adding it to the slice.
     if (currentValueType.getEncoding() == encoding)
       continue;
-    slice.insert(currentValue);
 
     // If there is already an existing conversion to the target layout, we don't
-    // need to propagate to the operands.
+    // need to rematerialize this value or propagate to its operands.
     // Note that this is per-use rather than per-value, so if another use fails
     // the getExistingConversion check, we may still traverse the operands.
     if (getExistingConversion &&
         getExistingConversion(*currentValueUse, encoding)) {
       continue;
     }
+
+    // Skip propagating through for op/while op/ws op results for now.
+    // TODO: enable this based on needs.
+    auto defOp = currentValue.getDefiningOp();
+    if (isa_and_nonnull<scf::ForOp, scf::WhileOp, ttg::WarpSpecializeOp>(defOp))
+      return failure();
+    slice.insert(currentValue);
 
     if (auto ifOp = currentValue.getDefiningOp<scf::IfOp>()) {
       if (stopPropagation && stopPropagation(ifOp))
@@ -1281,7 +1282,7 @@ std::optional<StringRef> getAMDArch(Operation *module) {
   return ref.drop_front(4); // drop the "hip:"
 }
 
-inline ttg::SwizzledSharedEncodingAttr
+static inline ttg::SwizzledSharedEncodingAttr
 swizzleDotOperandLike(RankedTensorType type, ttg::CGAEncodingAttr cgaLayout) {
   // We want to see if the linear layout has the same order as an mma microtile
   // of shape (8, 4*kWidth) or (4*kWidth, 8). If so, we return a
@@ -1290,8 +1291,7 @@ swizzleDotOperandLike(RankedTensorType type, ttg::CGAEncodingAttr cgaLayout) {
   // the swizzling
 
   auto *ctx = type.getContext();
-  auto layout = ttg::toLinearEncoding(type);
-  auto order = layout.getThreadOrder();
+  auto order = ttg::getThreadOrder(type);
   auto rank = order.size();
   if (rank < 2) {
     return {};
@@ -1304,7 +1304,7 @@ swizzleDotOperandLike(RankedTensorType type, ttg::CGAEncodingAttr cgaLayout) {
   } else {
     return {};
   }
-  auto kWidth = layout.getContigPerThread()[order[0]];
+  auto kWidth = ttg::getContigPerThread(type)[order[0]];
   SmallVector<unsigned> microtileShape(rank, 1);
   microtileShape[order[0]] = 4 * kWidth;
   microtileShape[order[1]] = 8;
@@ -1312,7 +1312,7 @@ swizzleDotOperandLike(RankedTensorType type, ttg::CGAEncodingAttr cgaLayout) {
   // 2, ...]
   auto repOrder = to_vector(llvm::seq<unsigned>(rank));
   auto tile = ttg::nvidiaMmaTile(ctx, microtileShape, kWidth, order, repOrder);
-  if (!divideLeft(layout.getLinearLayout(), tile).has_value()) {
+  if (!divideLeft(ttg::toLinearLayout(type), tile).has_value()) {
     return {};
   }
   return ttg::SwizzledSharedEncodingAttr::get(
@@ -1812,10 +1812,13 @@ void replaceUsesAndPropagateType(
                                            trans.getOrder());
     } else if (auto reshape = dyn_cast<ttg::MemDescReshapeOp>(user)) {
       ttg::MemDescType oldType = reshape.getType();
-      bool isMutable = cast<ttg::MemDescType>(val.getType()).getMutableMemory();
+      ttg::MemDescType srcType = cast<ttg::MemDescType>(val.getType());
+      SmallVector<int64_t> allocShape = to_vector(
+          srcType.getAllocShape().drop_back(srcType.getShape().size()));
+      llvm::append_range(allocShape, oldType.getShape());
       auto newDstType = ttg::MemDescType::get(
           oldType.getShape(), oldType.getElementType(), oldType.getEncoding(),
-          oldType.getMemorySpace(), isMutable, oldType.getAllocShape());
+          oldType.getMemorySpace(), srcType.getMutableMemory(), allocShape);
       newVal = ttg::MemDescReshapeOp::create(builder, reshape.getLoc(),
                                              newDstType, val);
     }
@@ -1858,7 +1861,15 @@ replaceUsesWithLocalLoad(OpBuilder &builder, OpResult old,
   SmallVector<ttg::LocalAllocOp> allocsToErase;
   for (Operation *user : old.getUsers()) {
     if (auto userAlloc = dyn_cast<ttg::LocalAllocOp>(user)) {
-      if (allocTy.getEncoding() == userAlloc.getType().getEncoding()) {
+      auto userAllocTy = userAlloc.getType();
+
+      auto allocEnc = dyn_cast<ttg::LayoutEncodingTrait>(allocTy.getEncoding());
+      auto userAllocEnc =
+          dyn_cast<ttg::LayoutEncodingTrait>(userAllocTy.getEncoding());
+      if ((allocTy.getEncoding() == userAllocTy.getEncoding()) ||
+          (allocEnc && userAllocEnc &&
+           ttg::areLayoutsEquivalent(allocTy.getShape(), allocEnc,
+                                     userAllocEnc))) {
         replaceUsesAndPropagateType(builder, userAlloc, alloc);
         allocsToErase.push_back(userAlloc);
       }

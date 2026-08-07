@@ -211,3 +211,19 @@ def named_barrier_arrive(
     bar_handle = _semantic._convert_elem_to_ir_value(bar, require_i64=False)
     arrive_count_handle = _semantic._convert_elem_to_ir_value(arrive_count, require_i64=False)
     _semantic.builder.create_named_barrier_arrive(bar_handle, arrive_count_handle)
+
+
+@tl.builtin
+def amd_sched_barrier(mask: tl.constexpr = 0, _semantic=None):
+    """Prevent AMD machine instructions from crossing this source boundary.
+
+    This is a compiler scheduling marker, not a workgroup barrier or a memory
+    fence. It adds no synchronization between waves. ``mask=0`` blocks every
+    instruction class from crossing the boundary in either direction.
+    """
+    if _semantic.builder.options.backend_name != "hip":
+        raise NotImplementedError("tlx.amd_sched_barrier is only supported on AMD (HIP) backends")
+    mask = tl._unwrap_if_constexpr(mask)
+    assert isinstance(mask, int), f"mask must be a constexpr integer, got {type(mask).__name__}"
+    assert 0 <= mask <= 0xFFF, f"mask must use only AMD scheduling-class bits 0..11, got {mask:#x}"
+    _semantic.builder.create_amd_sched_barrier(mask)

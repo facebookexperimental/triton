@@ -803,77 +803,83 @@ class Autotuner(KernelInterface):
                 else:
                     pruned_configs = self.prune_configs(kwargs)
 
-                def benchmark():
-                    # facebook begin
-                    import importlib
-                    if importlib.util.find_spec("torch.monitor") is not None:
-                        from torch.monitor import _WaitCounter
-                        waitcounter = _WaitCounter("pytorch.triton.benchmark").guard()
-                        waitcounter.__enter__()
-
-                    # facebook end
-                    bench_start = time.time()
-                    timings = {}
-                    compiled = {}  # config -> CompiledKernel (captured during the bench launch)
-                    for config in pruned_configs:
-                        timings[config] = self._bench(*args, config=config, **kwargs)
-                        compiled[config] = self._last_compiled_kernel
-                    # IR-based pruning runs here, AFTER benchmarking, reusing each config's
-                    # already-compiled artifact (no extra compile); a rejected config is pruned
-                    # by marking its timing invalid (inf) so it cannot win.
-                    #
-                    # DESIGN NOTE — why this is a post-bench pass and not an inline per-config
-                    # prune (raised in review D107928110): compilation is not a discrete step the
-                    # autotuner controls. A config's compiled artifact (CompiledKernel.asm) only
-                    # becomes available as the return value of `self.fn.run(...)` in jit.py, which
-                    # *fuses* compile + launch (JITFunction.run: compile on cache miss, then
-                    # launch, then return the kernel). `_bench` captures it as a side effect on
-                    # `self._last_compiled_kernel`. So a config's IR exists only once it has been
-                    # compiled AND benchmarked; pruning it *before* timing would require a separate
-                    # compile pass that re-implements jit.py's run pipeline (deliberately avoided).
-                    # Folding this pass into the loop above (per-config inline) is a pure code-org
-                    # change and is doable, but must still thread the captured kernel + reference
-                    # config through the loop and preserve the "first finite-time config =
-                    # reference" and "at least one survivor" semantics — left as a separate pass on
-                    # purpose; touch with care.
-                    if self.ir_config_prune is not None:
-                        self._ir_prune_after_bench(pruned_configs, timings, compiled)
-                    bench_end = time.time()
-                    self.bench_time = bench_end - bench_start
-                    # facebook begin T203283446
-                    if importlib.util.find_spec("torch.monitor") is not None:
-                        waitcounter.__exit__()
-                    if knobs.autotuning.print:
-                        print(
-                            f'\nPrinting ALL Multiple Triton autotuning Configs with timings in sorted order for kernel {self.fn}:',
-                            flush=True)
-                        sorted_configs = builtins.sorted(timings, key=timings.get)
-                        for config in sorted_configs:
-                            print(f'Triton autotune config: [{config}]; Triton autotune timing: {timings[config]}',
-                                  flush=True)
-                    # facebook end T203283446
-                    self.cache[key] = builtins.min(timings, key=timings.get)
-                    full_nargs = {**self.nargs, **kwargs, **self.cache[key].all_kwargs()}
-                    self.pre_hook(full_nargs, reset_only=True)
-                    self.configs_timings = timings
-
-                if self.cache_results:
-                    used_cached_result = self.check_disk_cache(key, pruned_configs, benchmark)
+                if len(pruned_configs) == 1 and self.ir_config_prune is None:
+                    # Match single-config autotune behavior: no benchmarking is needed.
+                    self.cache[key] = pruned_configs[0]
+                    used_cached_result = True
                 else:
-                    benchmark()
 
-                if knobs.autotuning.listener is not None:
-                    jit_fn = self.fn
-                    while not isinstance(jit_fn, JITFunction):
-                        jit_fn = jit_fn.fn
-                    knobs.autotuning.listener(
-                        fn=jit_fn,
-                        key=key,
-                        best_config=self.cache[key],
-                        configs_timings=self.configs_timings,
-                        duration=getattr(self, 'bench_time', None) if not used_cached_result else None,
-                        cache_hit=used_cached_result,
-                    )
+                    def benchmark():
+                        # facebook begin
+                        import importlib
+                        if importlib.util.find_spec("torch.monitor") is not None:
+                            from torch.monitor import _WaitCounter
+                            waitcounter = _WaitCounter("pytorch.triton.benchmark").guard()
+                            waitcounter.__enter__()
+
+                        # facebook end
+                        bench_start = time.time()
+                        timings = {}
+                        compiled = {}  # config -> CompiledKernel (captured during the bench launch)
+                        for config in pruned_configs:
+                            timings[config] = self._bench(*args, config=config, **kwargs)
+                            compiled[config] = self._last_compiled_kernel
+                        # IR-based pruning runs here, AFTER benchmarking, reusing each config's
+                        # already-compiled artifact (no extra compile); a rejected config is pruned
+                        # by marking its timing invalid (inf) so it cannot win.
+                        #
+                        # DESIGN NOTE — why this is a post-bench pass and not an inline per-config
+                        # prune (raised in review D107928110): compilation is not a discrete step the
+                        # autotuner controls. A config's compiled artifact (CompiledKernel.asm) only
+                        # becomes available as the return value of `self.fn.run(...)` in jit.py, which
+                        # *fuses* compile + launch (JITFunction.run: compile on cache miss, then
+                        # launch, then return the kernel). `_bench` captures it as a side effect on
+                        # `self._last_compiled_kernel`. So a config's IR exists only once it has been
+                        # compiled AND benchmarked; pruning it *before* timing would require a separate
+                        # compile pass that re-implements jit.py's run pipeline (deliberately avoided).
+                        # Folding this pass into the loop above (per-config inline) is a pure code-org
+                        # change and is doable, but must still thread the captured kernel + reference
+                        # config through the loop and preserve the "first finite-time config =
+                        # reference" and "at least one survivor" semantics — left as a separate pass on
+                        # purpose; touch with care.
+                        if self.ir_config_prune is not None:
+                            self._ir_prune_after_bench(pruned_configs, timings, compiled)
+                        bench_end = time.time()
+                        self.bench_time = bench_end - bench_start
+                        # facebook begin T203283446
+                        if importlib.util.find_spec("torch.monitor") is not None:
+                            waitcounter.__exit__()
+                        if knobs.autotuning.print:
+                            print(
+                                f'\nPrinting ALL Multiple Triton autotuning Configs with timings in sorted order for kernel {self.fn}:',
+                                flush=True)
+                            sorted_configs = builtins.sorted(timings, key=timings.get)
+                            for config in sorted_configs:
+                                print(f'Triton autotune config: [{config}]; Triton autotune timing: {timings[config]}',
+                                      flush=True)
+                        # facebook end T203283446
+                        self.cache[key] = builtins.min(timings, key=timings.get)
+                        full_nargs = {**self.nargs, **kwargs, **self.cache[key].all_kwargs()}
+                        self.pre_hook(full_nargs, reset_only=True)
+                        self.configs_timings = timings
+
+                    if self.cache_results:
+                        used_cached_result = self.check_disk_cache(key, pruned_configs, benchmark)
+                    else:
+                        benchmark()
+
+                    if knobs.autotuning.listener is not None:
+                        jit_fn = self.fn
+                        while not isinstance(jit_fn, JITFunction):
+                            jit_fn = jit_fn.fn
+                        knobs.autotuning.listener(
+                            fn=jit_fn,
+                            key=key,
+                            best_config=self.cache[key],
+                            configs_timings=self.configs_timings,
+                            duration=getattr(self, 'bench_time', None) if not used_cached_result else None,
+                            cache_hit=used_cached_result,
+                        )
 
             config = self.cache[key]
             self._last_key = key
@@ -1423,7 +1429,7 @@ def heuristics(values):
         def kernel(x_ptr, x_size, BLOCK_SIZE: tl.constexpr):
             ...
     :param values: a dictionary of meta-parameter names and functions that compute the value of the meta-parameter.
-                   each such function takes a list of positional arguments as input.
+                   each such function takes a dict of all the arguments passed to the kernel, keyed by argument name, as input.
     :type values: dict[str, Callable[[dict[str, Any]], Any]]
     """
 

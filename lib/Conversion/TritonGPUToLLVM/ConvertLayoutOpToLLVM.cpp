@@ -54,6 +54,13 @@ struct ConvertLayoutOpConversion
     auto kRegister = str_attr("register");
 
     auto dims = conversion.getInDimNames();
+    auto srcEnc = cast<RankedTensorType>(srcTy).getEncoding();
+    auto dstEnc = cast<RankedTensorType>(dstTy).getEncoding();
+    if ((isGenericLinearEncoding(srcEnc) || isGenericLinearEncoding(dstEnc)) &&
+        llvm::range_size(dims) > 1)
+      return op.emitError("ConvertLayoutOp  supports GenericLinearEncoding "
+                          " only when the conversion is transfer between "
+                          "values in the same thread.");
     bool alwaysUseWarpShuffle = cvtAlwaysUseWarpShuffle(op);
     assert(to_vector(conversion.getInDimNames()) ==
            to_vector(conversion.getOutDimNames()));
@@ -130,7 +137,8 @@ struct ConvertLayoutOpConversion
   SmallVector<Value> transferWithinBlockModular(
       Location loc, ConversionPatternRewriter &rewriter,
       const LinearLayout &srcLayout, const LinearLayout &dstLayout,
-      ArrayRef<Value> inVals, Type llvmElemTy, Value smemBase) const {
+      ArrayRef<Value> inVals, Type llvmElemTy, Value smemBase,
+      std::optional<std::pair<Value, Value>> distributedCoordinates) const {
     auto *ctx = rewriter.getContext();
     auto b = TritonLLVMOpBuilder(loc, rewriter);
     auto kReg = str_attr("register");
@@ -154,9 +162,10 @@ struct ConvertLayoutOpConversion
       assert(srcLayout.getOutDimSize(dim) == dstLayout.getOutDimSize(dim) &&
              "source and destination logical dimensions must have equal size");
 
-    auto laneAndWarpId = getLaneAndWarpId(rewriter, loc);
-    Value laneId = laneAndWarpId.first;
-    Value warpId = laneAndWarpId.second;
+    std::pair<Value, Value> coordinates = distributedCoordinates
+                                              ? *distributedCoordinates
+                                              : getLaneAndWarpId(rewriter, loc);
+    auto [laneId, warpId] = coordinates;
     auto elemPtrTy = ptr_ty(ctx, targetInfo.getSharedAddressSpace());
     smemBase = b.bitcast(smemBase, elemPtrTy);
 
@@ -234,7 +243,9 @@ struct ConvertLayoutOpConversion
   SmallVector<Value> transferSwizzlingLocalMemImpl(
       Location loc, ConversionPatternRewriter &rewriter,
       const LinearLayout &srcLayout, const LinearLayout &dstLayout,
-      ArrayRef<Value> inVals, Type llvmElemTy, Value smemBase) const {
+      ArrayRef<Value> inVals, Type llvmElemTy, Value smemBase,
+      Operation *sourceOp,
+      std::optional<std::pair<Value, Value>> distributedCoordinates) const {
     auto *ctx = rewriter.getContext();
     auto b = TritonLLVMOpBuilder(loc, rewriter);
     // We handle transformations recursively as they all need a preprocessing
@@ -246,9 +257,9 @@ struct ConvertLayoutOpConversion
       auto newInVals = llvm::to_vector(llvm::map_range(inVals, [&](Value v) {
         return b.ptrtoint(llvmElemTyPtr, v).getResult();
       }));
-      auto outVals =
-          transferSwizzlingLocalMemImpl(loc, rewriter, srcLayout, dstLayout,
-                                        newInVals, llvmElemTyPtr, smemBase);
+      auto outVals = transferSwizzlingLocalMemImpl(
+          loc, rewriter, srcLayout, dstLayout, newInVals, llvmElemTyPtr,
+          smemBase, sourceOp, distributedCoordinates);
       for (auto &v : outVals) {
         v = b.inttoptr(llvmElemTy, v);
       }
@@ -262,7 +273,8 @@ struct ConvertLayoutOpConversion
       auto newInVals = llvm::to_vector(llvm::map_range(
           inVals, [&](Value v) { return b.zext(i8ElemTy, v).getResult(); }));
       auto outVals = transferSwizzlingLocalMemImpl(
-          loc, rewriter, srcLayout, dstLayout, newInVals, i8ElemTy, smemBase);
+          loc, rewriter, srcLayout, dstLayout, newInVals, i8ElemTy, smemBase,
+          sourceOp, distributedCoordinates);
       for (auto &v : outVals) {
         v = b.trunc(llvmElemTy, v);
       }
@@ -275,7 +287,8 @@ struct ConvertLayoutOpConversion
       auto prmtSrc = removeBroadcastSrc.apply(srcLayout);
       auto newInVals = removeBroadcastSrc.apply(inVals);
       return transferSwizzlingLocalMemImpl(loc, rewriter, prmtSrc, dstLayout,
-                                           newInVals, llvmElemTy, smemBase);
+                                           newInVals, llvmElemTy, smemBase,
+                                           sourceOp, distributedCoordinates);
     }
 
     // Remove broadcasting in dst
@@ -283,7 +296,8 @@ struct ConvertLayoutOpConversion
     if (!removeBroadcastDst.isIdentity()) {
       auto prmtDst = removeBroadcastDst.apply(dstLayout);
       auto outVals = transferSwizzlingLocalMemImpl(
-          loc, rewriter, srcLayout, prmtDst, inVals, llvmElemTy, smemBase);
+          loc, rewriter, srcLayout, prmtDst, inVals, llvmElemTy, smemBase,
+          sourceOp, distributedCoordinates);
       return broadcastAs(outVals, dstLayout);
     }
 
@@ -291,7 +305,8 @@ struct ConvertLayoutOpConversion
     // and we don't have broadcasting in the registers
     if (srcLayout.isModular() || dstLayout.isModular())
       return transferWithinBlockModular(loc, rewriter, srcLayout, dstLayout,
-                                        inVals, llvmElemTy, smemBase);
+                                        inVals, llvmElemTy, smemBase,
+                                        distributedCoordinates);
 
     auto bitwidth = llvmElemTy.getIntOrFloatBitWidth();
     int numBanks = targetInfo.getSharedMemoryBanks();
@@ -310,7 +325,7 @@ struct ConvertLayoutOpConversion
     auto reps = LinearLayout::identity1D(nReps, kReg, kReps);
 
     auto totalStoreCvt = srcLayout.invertAndCompose(smem);
-    auto totalLoadCvt = dstLayout.invertAndCompose(smem);
+    auto totalLoadCvt = invertAndComposeBlockLocal(smem, dstLayout);
 
     // The permutation exists by construction of the reps dimension in
     // optimalSwizzling
@@ -347,7 +362,7 @@ struct ConvertLayoutOpConversion
       } else if (isBlockSync) {
         targetInfo.barrier(loc, rewriter, triton::gpu::AddrSpace::Local);
       } else {
-        targetInfo.clusterBarrier(loc, rewriter);
+        targetInfo.clusterBarrier(loc, rewriter, sourceOp);
       }
     };
 
@@ -359,12 +374,20 @@ struct ConvertLayoutOpConversion
       // Store
       lowerLdStShared(loc, ctx, storeCvt, tileInVals, llvmElemTy, smemBase,
                       /*paddingShifts=*/{}, affineOffset, maskSpanAffineOffset,
-                      rewriter, targetInfo);
+                      rewriter, targetInfo,
+                      /*maybeMaxVecElems=*/{},
+                      /*localLoadOp=*/nullptr,
+                      /*ctaRank=*/{},
+                      /*barrierPtr=*/{}, distributedCoordinates);
       emitBarrier();
       // Load
       auto tileOutVals = lowerLdStShared(
           loc, ctx, loadCvt, {}, llvmElemTy, smemBase, /*paddingShifts=*/{},
-          affineOffset, maskSpanAffineOffset, rewriter, targetInfo);
+          affineOffset, maskSpanAffineOffset, rewriter, targetInfo,
+          /*maybeMaxVecElems=*/{},
+          /*localLoadOp=*/nullptr,
+          /*ctaRank=*/{},
+          /*barrierPtr=*/{}, distributedCoordinates);
       llvm::append_range(outVals, tileOutVals);
     }
 
@@ -387,8 +410,18 @@ struct ConvertLayoutOpConversion
     auto smemBase =
         LLVM::getSharedMemoryBase(loc, rewriter, targetInfo, op.getOperation());
     auto inVals = unpackLLElements(loc, src, rewriter);
+
+    std::optional<std::pair<Value, Value>> distributedCoordinates;
+    if (op->hasAttr("tlx.rematerialize_coordinates")) {
+      auto [laneId, warpId] = getLaneAndWarpId(rewriter, loc);
+      distributedCoordinates = {
+          targetInfo.rematerializeDistributedCoordinate(rewriter, loc, laneId),
+          targetInfo.rematerializeDistributedCoordinate(rewriter, loc, warpId),
+      };
+    }
     auto outVals = transferSwizzlingLocalMemImpl(
-        loc, rewriter, srcLayout, dstLayout, inVals, llvmElemTy, smemBase);
+        loc, rewriter, srcLayout, dstLayout, inVals, llvmElemTy, smemBase, op,
+        distributedCoordinates);
 
     Value result =
         packLLElements(loc, getTypeConverter(), outVals, rewriter, dstTy);

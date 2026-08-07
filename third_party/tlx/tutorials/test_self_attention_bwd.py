@@ -2,7 +2,7 @@
 hand-written TLX bwd, and both vs a torch-autograd float causal-SiLU reference.
 
 Runs WITHOUT meta-WS (TRITON_USE_META_WS unset): the TLX self-attn fwd uses
-num_stages=0 and asserts under meta-WS, so this is the process where plain-Triton
+num_stages=1 and asserts under meta-WS, so this is the process where plain-Triton
 and TLX can coexist. (The autoWS variant is a separate process /
 test_self_attention_autows.py.) HSTU_SELF_PIN=1 pins the bwd autotune to one
 config so it compiles fast instead of building the ~29-config bwd space.

@@ -11,7 +11,7 @@ Layers (built on the ``pyptx`` parser, which gives no def-use / no symbolic eval
 * :mod:`bitequiv.ptx.linker`  — def-use / last-writer over the flat instruction list.
 * :mod:`bitequiv.ptx.affine`  — conservative symbolic evaluator for integer address
   registers (affine over ``tid``/``ctaid``/params, or a structural OPAQUE token).
-* :mod:`bitequiv.ptx.treeir`  — the reduction-tree node types + canonical serialization.
+* :mod:`bitequiv.core.treeir` — the reduction-tree node types + canonical serialization.
 * :mod:`bitequiv.ptx.builder` — backward tree builder from the result store.
 * :mod:`bitequiv.ptx.leaves`  — leaf labeling (the layout analog).
 

@@ -119,10 +119,16 @@ def _reduce_k_body_source(
     bias_name: str | None = None,
     stride_bias_m: int = 0,
     stride_bias_n: int = 1,
+    index_dtype: str = "tl.int32",
 ) -> str:
+    # The spliced fused epilogue references INDEX_DTYPE (Inductor's per-kernel index
+    # dtype, used for dynamic-shape bounds like `tl.full([], ks0, dtype=INDEX_DTYPE)`).
+    # The main template kernel defines it, but this generated reducer is a standalone
+    # kernel, so define it here from the template kernel's own index_dtype.
     code = textwrap.dedent(f"""
     BLOCK_SIZE_M: tl.constexpr = 32
     BLOCK_SIZE_N: tl.constexpr = 32
+    INDEX_DTYPE: tl.constexpr = {index_dtype}
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
     offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
@@ -210,6 +216,7 @@ def emit_aoti_reduce_k_call(
                 bias_kernel_ptr,
                 stride_bias_m,
                 stride_bias_n,
+                index_dtype=getattr(template_kernel, "index_dtype", "tl.int32"),
             ))
         source_code = source.getvalue().replace(
             str(Placeholder.DESCRIPTIVE_NAME), reduce_name

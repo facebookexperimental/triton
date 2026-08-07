@@ -51,7 +51,9 @@ Value createBufferView(OpBuilderWithAsyncTaskIds &builder, Value alloc,
                                              viewDescType, alloc, idx);
 }
 
-static int getTMALoadSize(tt::DescriptorLoadOp &tmaLoad) {
+namespace {
+
+int getTMALoadSize(tt::DescriptorLoadOp &tmaLoad) {
   auto tensorTy = cast<RankedTensorType>(tmaLoad->getResult(0).getType());
   int loadSize = product(tensorTy.getShape());
   return loadSize * tensorTy.getElementType().getIntOrFloatBitWidth() / 8;
@@ -86,6 +88,8 @@ Value getBufferForPipelineStage(OpBuilderWithAsyncTaskIds &builder,
   return desc;
 }
 
+} // namespace
+
 Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
                             SmallVector<tt::DescriptorLoadOp> &tmaLoads,
                             SmallVector<Value> &buffers, Value barrierAlloc,
@@ -114,8 +118,8 @@ Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
   auto prodBarrier =
       getBarrierForPipelineStage(builder, barrierAlloc, bufferIdx);
   auto pred = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(loc, 1, 1);
-  auto expect = builder.createWithAsyncTaskIds<ttng::BarrierExpectOp>(
-      loc, prodBarrier, sizeInBytes, pred);
+  builder.createWithAsyncTaskIds<ttng::BarrierExpectOp>(loc, prodBarrier,
+                                                        sizeInBytes, pred);
 
   // Convert all the producers to async_tma_copy_global_to_local
   Operation *copy = nullptr;

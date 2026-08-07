@@ -23,6 +23,11 @@ add_mlir_doc(TLXOps TLXOps dialects/ -gen-op-doc -dialect=tlx)
 add_public_tablegen_target(TLXTableGen)
 
 
+set(LLVM_TARGET_DEFINITIONS TLXLayoutInterface.td)
+mlir_tablegen(TLXLayoutInterface.h.inc -gen-attr-interface-decls)
+mlir_tablegen(TLXLayoutInterface.cpp.inc -gen-attr-interface-defs)
+add_public_tablegen_target(TLXLayoutInterfaceIncGen)
+
 set(LLVM_TARGET_DEFINITIONS TLXAttrDefs.td)
 mlir_tablegen(TLXAttrDefs.h.inc -gen-attrdef-decls)
 mlir_tablegen(TLXAttrDefs.cpp.inc -gen-attrdef-defs)

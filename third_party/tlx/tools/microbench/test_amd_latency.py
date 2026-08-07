@@ -70,7 +70,7 @@ def test_niter_is_runtime_loop_not_constexpr_unrolled():
     source = inspect.getsource(amd_latency)
     assert "NITER: tl.constexpr" not in source
     assert "range(NITER)" not in source
-    assert "tl.range(0, NITER, loop_unroll_factor=1, num_stages=0)" in source
+    assert "tl.range(0, NITER, loop_unroll_factor=1, num_stages=1)" in source
 
 
 def test_lds_pointer_chase_expected_matches_cpu_sequence():

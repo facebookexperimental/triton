@@ -20,6 +20,7 @@
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
+#include "triton/Dialect/TritonNvidiaGPU/Transforms/ClusterBarrierMbarAllocator.h"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/TMAUtilities.h"
 #include "triton/Tools/LayoutUtils.h"
 
@@ -560,13 +561,25 @@ struct StoreOpConversion : public ConvertOpToLLVMPattern<triton::StoreOp>,
 };
 
 void createBarrier(ConversionPatternRewriter &rewriter, Location loc,
-                   int numCTAs) {
+                   int numCTAs, Operation *sourceOp) {
   auto b = TritonLLVMOpBuilder(loc, rewriter);
   if (numCTAs == 1) {
     b.barrier(ttg::AddrSpace::Local);
   } else {
-    triton::nvidia_gpu::ClusterBarrierOp::create(rewriter, loc);
+    auto barrier = triton::nvidia_gpu::ClusterBarrierOp::create(rewriter, loc);
+    triton::nvidia_gpu::copyClusterBarrierMbarOffset(sourceOp, barrier);
   }
+}
+
+Value loadScalarAtomicResult(ConversionPatternRewriter &rewriter, Location loc,
+                             const NVIDIA::TargetInfo &targetInfo,
+                             Value atomPtr, Type valueTy, int numCTAs) {
+  auto b = TritonLLVMOpBuilder(loc, rewriter);
+  if (numCTAs == 1)
+    return b.load(valueTy, atomPtr);
+  // Scalar atomics are issued by CTA 0, so read CTA 0's scratch allocation.
+  return targetInfo.loadDShared(rewriter, loc, atomPtr, b.i32_val(0), valueTy,
+                                b.true_val());
 }
 
 struct AtomicCASOpConversion
@@ -649,8 +662,9 @@ struct AtomicCASOpConversion
         st(dstOprStore, valOprStore).maybePredicate(threadPred);
         auto ASMReturnTy = void_ty(ctx);
         ptxBuilderStore.launch(rewriter, loc, ASMReturnTy);
-        createBarrier(rewriter, loc, numCTAs);
-        Value ret = b.load(valueElemTy, atomPtr);
+        createBarrier(rewriter, loc, numCTAs, op);
+        Value ret = loadScalarAtomicResult(rewriter, loc, targetInfo, atomPtr,
+                                           valueElemTy, numCTAs);
         rewriter.replaceOp(op, {ret});
         return success();
       }
@@ -844,8 +858,9 @@ public:
         atomPtr = b.bitcast(atomPtr, ptr_ty(ctx, 3));
         // Only threads with rmwMask = True store the result
         targetInfo.storeShared(rewriter, loc, atomPtr, loadAcquireOp, pred);
-        createBarrier(rewriter, loc, numCTAs);
-        Value ret = b.load(valueElemTy, atomPtr);
+        createBarrier(rewriter, loc, numCTAs, op);
+        Value ret = loadScalarAtomicResult(rewriter, loc, targetInfo, atomPtr,
+                                           valueElemTy, numCTAs);
         rewriter.replaceOp(op, {ret});
         return success();
       }
@@ -979,8 +994,9 @@ public:
         atomPtr = b.bitcast(atomPtr, ptr_ty(ctx, 3));
         // Only threads with rmwMask = True store the result
         targetInfo.storeShared(rewriter, loc, atomPtr, *old, pred);
-        createBarrier(rewriter, loc, numCTAs);
-        Value ret = b.load(valueElemTy, atomPtr);
+        createBarrier(rewriter, loc, numCTAs, op);
+        Value ret = loadScalarAtomicResult(rewriter, loc, targetInfo, atomPtr,
+                                           valueElemTy, numCTAs);
         rewriter.replaceOp(op, {ret});
         return success();
       }
@@ -1151,8 +1167,8 @@ struct AsyncCopyGlobalToLocalOpConversion
                            RewriterBase &rewriter, Location loc,
                            ArrayRef<Value> vals, Value shmemAddr, int startIdx,
                            VectorType vecTy,
-                           std::optional<Value> ctaId) -> SmallVector<Value> {
-      assert(!ctaId.has_value() && "cp.async does not support cross-cta loads");
+                           Value ctaId) -> SmallVector<Value> {
+      assert(!ctaId && "cp.async does not support cross-cta loads");
       assert(isa<VectorType>(vecTy));
       auto *ctx = rewriter.getContext();
       auto elemTy = vecTy.getElementType();
@@ -1344,7 +1360,6 @@ struct AsyncTMACopyGlobalToLocalOpConversion
     auto kMsg = str_attr("msg");
     auto kBlock = str_attr("block");
     const auto numCopies = msgToOffset.getInDimSize(kMsg);
-    auto zero = b.i32_val(0);
     auto ctaId = nvgpu::ClusterCTAIdOp::create(rewriter, loc);
     // We multicast if the flag is on and the block layout has broadcasting
     bool multicast = op.getMulticast();
@@ -1408,8 +1423,12 @@ struct AsyncTMACopyGlobalToLocalOpConversion
       // otherwise it is CTA-local. The barrier component keys on the barrier
       // layout (not the SMEM layout), matching #9510.
       auto multicastMask = op.getMulticastTargets();
-      bool clusterScope = crossCTABarrier || multicast ||
-                          multicastMask != nullptr || op.getTwoCta();
+      // The current Hopper toolchain emits PTX < 8.6, where shared::cta TMA
+      // loads are not accepted. Conservatively use cluster scope on Hopper;
+      // keep CTA scope on Blackwell.
+      bool clusterScope = computeCapability < 100 || crossCTABarrier ||
+                          multicast || multicastMask != nullptr ||
+                          op.getTwoCta();
       std::string tmaInst = "@$0 cp.async.bulk.tensor." + std::to_string(rank) +
                             "d.shared::" + (clusterScope ? "cluster" : "cta") +
                             ".global.mbarrier::complete_tx::bytes";

@@ -661,6 +661,8 @@ void populateTLXPatterns(TritonGPUTypeConverter &typeConverter,
       typeConverter, context);
   patterns.add<GenericOpPattern<triton::amdgpu::AssumeUniformOp>>(typeConverter,
                                                                   context);
+  patterns.add<GenericOpPattern<triton::amdgpu::RematerializedRangeOp>>(
+      typeConverter, context);
 }
 
 //

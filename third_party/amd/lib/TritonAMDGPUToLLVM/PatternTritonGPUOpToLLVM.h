@@ -2,10 +2,15 @@
 #define TRITON_THIRD_PARTY_AMD_LIB_TRITONAMDGPUTOLLVM_PATTERNTRITONGPUOPTOLLVM_H_
 
 #include "TargetInfo.h"
-#include "mlir/Analysis/DataFlowFramework.h"
 #include "mlir/Conversion/LLVMCommon/TypeConverter.h"
 #include "triton/Analysis/Allocation.h"
 #include "triton/Analysis/AxisInfo.h"
+
+#include <memory>
+
+namespace mlir::triton {
+class DistributedCoordinateGroups;
+}
 
 namespace mlir::triton::AMD {
 void populateConvertLayoutOpToLLVMPatterns(LLVMTypeConverter &typeConverter,
@@ -13,10 +18,11 @@ void populateConvertLayoutOpToLLVMPatterns(LLVMTypeConverter &typeConverter,
                                            RewritePatternSet &patterns,
                                            PatternBenefit benefit);
 
-void populateMemoryOpToLLVMPatterns(LLVMTypeConverter &typeConverter,
-                                    RewritePatternSet &patterns,
-                                    const TargetInfo &targetInfo,
-                                    PatternBenefit benefit);
+void populateMemoryOpToLLVMPatterns(
+    LLVMTypeConverter &typeConverter, RewritePatternSet &patterns,
+    const TargetInfo &targetInfo, PatternBenefit benefit,
+    std::shared_ptr<mlir::triton::DistributedCoordinateGroups>
+        coordinateGroups);
 
 void populateDotOpToLLVMPatterns(LLVMTypeConverter &typeConverter,
                                  RewritePatternSet &patterns,
@@ -43,7 +49,6 @@ void populateLoadStoreOpToLLVMPatterns(LLVMTypeConverter &typeConverter,
                                        const TargetInfo &targetInfo,
                                        RewritePatternSet &patterns,
                                        ModuleAxisInfoAnalysis &axisInfoAnalysis,
-                                       const DataFlowSolver *uniformitySolver,
                                        PatternBenefit benefit);
 
 void populateBarrierOpToLLVMPatterns(LLVMTypeConverter &typeConverter,

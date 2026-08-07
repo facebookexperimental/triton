@@ -10,6 +10,7 @@ from .barrier import (
     fence_mbarrier_init_cluster,
     named_barrier_arrive,
     named_barrier_wait,
+    amd_sched_barrier,
 )
 from .dynamic_launch import (
     _alloc_clc_responses,
@@ -28,6 +29,7 @@ from .mem_ops import (
     async_store,
     async_descriptor_load,
     assume_uniform,
+    buffer_atomic_add,
     buffer_load,
     buffer_load_to_local,
     zeros,
@@ -63,7 +65,18 @@ from .mem_ops import (
     subslice,
     tmem_copy,
 )
-from .mma_ops import async_dot, async_dot_scaled, async_dot_wait, require_layout, tcgen05_commit
+from .mma_ops import (
+    amd_mfma_commit,
+    amd_register_resident,
+    amd_scheduled_mfma,
+    async_dot,
+    async_dot_scaled,
+    async_dot_wait,
+    extract_slice,
+    rematerialized_range,
+    require_layout,
+    tcgen05_commit,
+)
 from .types import (
     async_token,
     buffered_tensor,
@@ -128,6 +141,11 @@ __all__ = [
     "nv_mma_shared_layout_encoding",
     "storage_kind",
     "layout",
+    "amd_mfma_commit",
+    "amd_register_resident",
+    "amd_scheduled_mfma",
+    "extract_slice",
+    "rematerialized_range",
     "buffered_tensor",
     "buffered_tensor_type",
     "storage_alias_spec",
@@ -146,6 +164,7 @@ __all__ = [
     # mem_ops
     "assume_uniform",
     "async_store",
+    "buffer_atomic_add",
     "buffer_load",
     "buffer_load_to_local",
     "zeros",
@@ -194,6 +213,7 @@ __all__ = [
     "fence_mbarrier_init_cluster",
     "named_barrier_wait",
     "named_barrier_arrive",
+    "amd_sched_barrier",
     # mma_ops
     "async_dot",
     "async_dot_scaled",

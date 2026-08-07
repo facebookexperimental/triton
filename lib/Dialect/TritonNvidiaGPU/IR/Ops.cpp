@@ -29,6 +29,7 @@
 #include "tlx/dialect/include/IR/Dialect.h"
 #include "triton/Analysis/Utility.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
+#include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Attributes.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/TritonGPUInterfaces.h"
@@ -41,6 +42,7 @@
 #include "triton/Tools/StrUtil.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/ErrorHandling.h"
+#include "llvm/Support/MathExtras.h"
 #include "llvm/Support/raw_ostream.h"
 
 using namespace mlir::triton::gpu;
@@ -69,6 +71,210 @@ LogicalResult MapToRemoteBufferOp::verify() {
     return emitOpError() << "Invalid memory space for remote MemDesc: "
                          << remoteType;
   }
+  return success();
+}
+
+// -- PackedArithOp --
+namespace {
+constexpr llvm::StringLiteral Half = "hb";
+constexpr llvm::StringLiteral X2 = "fhb";
+constexpr llvm::StringLiteral Alternate = "542u";
+constexpr llvm::StringLiteral AlternateResult = "54";
+
+struct PackedArithSignatureRule {
+  llvm::StringLiteral operations;
+  StringRef resultTypes;
+  StringRef operandTypes[3];
+  llvm::StringLiteral modifiers;
+  unsigned operandSuffixes;
+};
+} // namespace
+
+static const PackedArithTypeInfo &getPackedArithTypeInfo(Type elementType) {
+  static const struct {
+    TypeID type;
+    PackedArithTypeInfo info;
+  } types[] = {
+      {TypeID::get<Float32Type>(), {"f32x2", 2, 64, 'f'}},
+      {TypeID::get<Float16Type>(), {"f16x2", 2, 32, 'h'}},
+      {TypeID::get<BFloat16Type>(), {"bf16x2", 2, 32, 'b'}},
+      {TypeID::get<Float8E5M2Type>(), {"e5m2x4", 4, 32, '5'}},
+      {TypeID::get<Float8E4M3FNType>(), {"e4m3x4", 4, 32, '4'}},
+      {TypeID::get<IntegerType>(), {"e2m1x4", 4, 16, '2'}},
+      {TypeID::get<Float8E8M0FNUType>(), {"ue8m0x4", 4, 32, 'u'}},
+  };
+  for (const auto &type : types)
+    if (elementType.getTypeID() == type.type)
+      return type.info;
+  llvm_unreachable("unsupported packed arithmetic element type");
+}
+
+static FailureOr<PackedArithInstructionSpec>
+resolvePackedArithInstructionSpec(PackedArithOp op) {
+  auto kind = op.getOpKind();
+  const auto *result = &getPackedArithTypeInfo(op.getType().getElementType());
+  SmallVector<const PackedArithTypeInfo *, 3> operands;
+  for (Value operand : op.getOperands())
+    operands.push_back(&getPackedArithTypeInfo(
+        cast<RankedTensorType>(operand.getType()).getElementType()));
+
+  // clang-format off
+  static constexpr PackedArithSignatureRule signatures[] = {
+      // operations       result           operands                     modifiers  suffixes
+      {"add sub mul",    X2,              {"=", "="},                  "",        0},
+      {"fma",            X2,              {"=", "=", "="},             "rn",      0},
+      {"min max",        Half,            {"=", "="},                  "",        0},
+      {"add sub",        "f",             {Half, "f"},                 "",        2},
+      {"add sub",        "h",             {"f", "f"},                  "rz.ftz",  2},
+      {"add sub",        "b",             {"f", "f"},                  "rz",      2},
+      {"mul",            "h",             {"f", "f"},                  "ftz.rz",  2},
+      {"mul",            "b",             {"f", "f"},                  "rz",      2},
+      {"mul",            Half,            {"=", "!"},                  "",        2},
+      {"fma",            "f",             {Half, "f", "f"},            "rn",      3},
+      {"add sub",        AlternateResult, {Alternate, "="},            "",        1},
+      {"mul",            AlternateResult, {Alternate, Alternate},      "",        2},
+      {"fma",            AlternateResult, {Alternate, Alternate, "="}, "",        2},
+  };
+  // clang-format on
+
+  auto matches = [result](StringRef types, const PackedArithTypeInfo *info) {
+    if (types == "=")
+      return info == result;
+    if (types == "!")
+      return info != result && Half.contains(info->kind);
+    return types.contains(info->kind);
+  };
+  for (const PackedArithSignatureRule &signature : signatures) {
+    if (!StringRef(signature.operations)
+             .contains(stringifyPackedArithOpKind(kind)) ||
+        !matches(signature.resultTypes, result))
+      continue;
+    auto types = ArrayRef(signature.operandTypes).take_front(operands.size());
+    if (!llvm::all_of(llvm::zip_equal(operands, types), [&](auto pair) {
+          return matches(std::get<1>(pair), std::get<0>(pair));
+        }))
+      continue;
+    return PackedArithInstructionSpec{result, std::move(operands),
+                                      signature.modifiers,
+                                      signature.operandSuffixes};
+  }
+  return failure();
+}
+
+PackedArithInstructionSpec getPackedArithInstructionSpec(PackedArithOp op) {
+  auto spec = resolvePackedArithInstructionSpec(op);
+  assert(succeeded(spec) && "expected a verified packed arithmetic operation");
+  return std::move(*spec);
+}
+
+static std::optional<unsigned> inferPackedArithFp4Axis(PackedArithOp op) {
+  auto resultShape = op.getType().getShape();
+  std::optional<unsigned> axis;
+  for (Value operand : op.getOperands()) {
+    auto type = cast<RankedTensorType>(operand.getType());
+    if (!type.getElementType().isInteger(8))
+      continue;
+    if (type.getRank() != resultShape.size())
+      return std::nullopt;
+    auto shape = type.getShape();
+    auto [sourceDim, resultDim] = llvm::mismatch(shape, resultShape);
+    if (sourceDim == shape.end())
+      return std::nullopt;
+    unsigned differing = std::distance(shape.begin(), sourceDim);
+    if (2 * *sourceDim != *resultDim ||
+        !llvm::equal(shape.drop_front(differing + 1),
+                     resultShape.drop_front(differing + 1)) ||
+        (axis && *axis != differing))
+      return std::nullopt;
+    axis = differing;
+  }
+  return axis;
+}
+
+unsigned getPackedArithFp4Axis(PackedArithOp op) {
+  auto axis = inferPackedArithFp4Axis(op);
+  assert(axis && "expected a verified packed arithmetic operation with an "
+                 "FP4 operand");
+  return *axis;
+}
+
+LogicalResult PackedArithOp::verify() {
+  unsigned expectedOperands = getOpKind() == PackedArithOpKind::FMA ? 3 : 2;
+  if (getNumOperands() != expectedOperands)
+    return emitOpError() << stringifyPackedArithOpKind(getOpKind())
+                         << " expects " << expectedOperands
+                         << " operands but got " << getNumOperands();
+
+  auto tensorType = getResult().getType();
+  const auto &resultInfo = getPackedArithTypeInfo(tensorType.getElementType());
+  if (!isa_and_nonnull<DistributedEncodingTrait>(tensorType.getEncoding()))
+    return emitOpError("requires a distributed tensor layout");
+
+  auto instruction = resolvePackedArithInstructionSpec(*this);
+  if (failed(instruction)) {
+    auto diag = emitOpError()
+                << "unsupported " << stringifyPackedArithOpKind(getOpKind())
+                << " signature " << resultInfo.suffix << " <- (";
+    llvm::interleaveComma(getOperands(), diag, [&](Value operand) {
+      diag << getPackedArithTypeInfo(
+                  cast<RankedTensorType>(operand.getType()).getElementType())
+                  .suffix;
+    });
+    return diag << ")";
+  }
+
+  std::optional<unsigned> fp4Axis = inferPackedArithFp4Axis(*this);
+  if (!fp4Axis && llvm::any_of(instruction->operands,
+                               [](auto *info) { return info->isFP4(); }))
+    return emitOpError("requires every fp4 operand to have the result shape "
+                       "with the same single dimension halved");
+
+  unsigned packWidth = resultInfo.lanes;
+  unsigned resultRegisters = getUniqueElemsPerThread(tensorType);
+  if (resultRegisters < packWidth || resultRegisters % packWidth != 0)
+    return emitOpError() << "result layout must provide a multiple of "
+                         << packWidth << " unique elements per thread";
+
+  for (auto [index, operand] : llvm::enumerate(getOperands())) {
+    auto operandType = cast<RankedTensorType>(operand.getType());
+    const auto &operandInfo = *instruction->operands[index];
+    if (operandInfo.isFP4()) {
+      Attribute operandEncoding = operandType.getEncoding();
+      Attribute expectedResultEncoding;
+      if (isa_and_nonnull<DistributedEncodingTrait>(operandEncoding)) {
+        auto *dialect =
+            operandEncoding.getDialect()
+                .getRegisteredInterface<triton::DialectInferLayoutInterface>();
+        if (dialect &&
+            failed(dialect->inferFp4ToFpOpEncoding(
+                operandType.getShape(), *fp4Axis, operandEncoding,
+                expectedResultEncoding, /*fwdInference=*/true, std::nullopt)))
+          expectedResultEncoding = {};
+      }
+      if (!expectedResultEncoding ||
+          !areLayoutsEquivalent(
+              tensorType.getShape(),
+              cast<LayoutEncodingTrait>(expectedResultEncoding),
+              cast<LayoutEncodingTrait>(tensorType.getEncoding())))
+        return emitOpError() << "fp4 operand " << index
+                             << " must have a layout compatible with the "
+                                "result";
+      continue;
+    }
+    if (operandType.getShape() != tensorType.getShape())
+      return emitOpError() << "operand " << index
+                           << " must have the result shape "
+                           << tensorType.getShape() << ", but got "
+                           << operandType.getShape();
+    if (!isa_and_nonnull<LayoutEncodingTrait>(operandType.getEncoding()) ||
+        !areLayoutsEquivalent(
+            tensorType.getShape(),
+            cast<LayoutEncodingTrait>(operandType.getEncoding()),
+            cast<LayoutEncodingTrait>(tensorType.getEncoding())))
+      return emitOpError() << "operand " << index
+                           << " must have a layout equivalent to the result";
+  }
+
   return success();
 }
 
@@ -214,6 +420,44 @@ LogicalResult InvalBarrierOp::verify() {
   return success();
 }
 
+// -- AsyncSharedStoreOp --
+LogicalResult AsyncSharedStoreOp::verify() {
+  // PTX defines weak shared::cluster st.async as UB for a one-CTA cluster.
+  if (gpu::lookupNumCTAs(getOperation()) < 2)
+    return emitOpError("requires at least two CTAs in the cluster");
+  if (!getDst().getType().getMutableMemory())
+    return emitOpError("cannot store into immutable memory");
+  if (failed(triton::gpu::verifyMemoryOpTypes(*this, getSrc().getType(),
+                                              getDst().getType())))
+    return failure();
+  if (failed(verifyBarrierType(*this, getMbarrier().getType())))
+    return failure();
+
+  auto srcTy = getSrc().getType();
+  auto dstTy = getDst().getType();
+  unsigned bitwidth = getIntOrFloatOrPtrBitWidth(srcTy.getElementType());
+
+  auto regLayout = toLinearLayout(srcTy);
+  auto sharedLayout = isPaddedEncoding(dstTy.getEncoding())
+                          ? paddedLinearLayout(dstTy)
+                          : toLinearLayout(dstTy);
+  auto cvt = regLayout.invertAndCompose(sharedLayout);
+  std::optional<int> maybeMaxVecElems;
+  if (isPaddedEncoding(dstTy.getEncoding()))
+    maybeMaxVecElems = getMinInterval(dstTy.getEncoding());
+  auto vectorization =
+      largestVectorisation(getContext(), cvt, bitwidth, maybeMaxVecElems);
+  unsigned elemsPerVec = vectorization.first;
+  if (elemsPerVec * bitwidth < 32)
+    return emitOpError("requires a layout vectorizing stores to at least 32 "
+                       "bits");
+  return success();
+}
+
+TypedValue<MemDescType> AsyncSharedStoreOp::getBarrier() {
+  return getMbarrier();
+}
+
 // -- FenceMBarrierInitReleaseClusterOp --
 LogicalResult FenceMBarrierInitReleaseClusterOp::verify() {
   // FB: comment out these because we allow the op in frontend/ttir, where the
@@ -228,11 +472,12 @@ LogicalResult ClusterArriveOp::verify() {
   // FB: verifier intentionally relaxed. The numCTAs > 1 check is omitted
   // because the TLX frontend emits this op in frontend/ttir before the cluster
   // dim is known. The upstream #9456 "cannot be inside ttg.warp_specialize"
-  // restriction is also NOT enforced here: beta's automatic-warp-specialization
-  // and TLX Blackwell pipelines legitimately place ttng.cluster_arrive inside a
-  // ttg.warp_specialize region, and beta's ClusterArriveOpConversion lowers it
-  // there (all-warps wrapping). Enforcing the restriction made PassManager::run
-  // fail across the Blackwell autows/TLX targets.
+  // restriction is also NOT enforced here: Meta Triton's
+  // automatic-warp-specialization and TLX Blackwell pipelines legitimately
+  // place ttng.cluster_arrive inside a ttg.warp_specialize region, and Meta
+  // Triton's ClusterArriveOpConversion lowers it there (all-warps wrapping).
+  // Enforcing the restriction made PassManager::run fail across the Blackwell
+  // autows/TLX targets.
   return success();
 }
 
@@ -242,17 +487,30 @@ LogicalResult ClusterWaitOp::verify() {
   return success();
 }
 
+static LogicalResult verifyClusterIsMultiCTA(Operation *op) {
+  int numCTAs = triton::gpu::lookupNumCTAs(op);
+  if (numCTAs <= 1)
+    return op->emitOpError("requires ttg.num-ctas > 1");
+  return success();
+}
+
 // -- ClusterBarrierOp --
 LogicalResult ClusterBarrierOp::verify() {
-  // ClusterBarrierOp is backend-inserted (not emitted by beta lowering, which
-  // has no TargetInfo::clusterBarrier creator), so the full upstream check
-  // applies; it never runs on real beta IR.
-  int numCTAs = triton::gpu::lookupNumCTAs(getOperation());
-  if (numCTAs <= 1)
-    return emitOpError("requires ttg.num-ctas > 1");
-  if (getOperation()->getParentOfType<mlir::triton::gpu::WarpSpecializeOp>())
-    return emitOpError("cannot be used inside `ttg.warp_specialize`");
-  return success();
+  if (failed(verifyClusterIsMultiCTA(getOperation())))
+    return failure();
+  auto func = getOperation()->getParentOfType<FunctionOpInterface>();
+  if (!func)
+    return emitOpError("must be inside a kernel function");
+  if (triton::isKernel(func))
+    return success();
+  // Inlineable Triton helpers are verified before the inliner moves their
+  // bodies into the kernel.
+  if (auto tritonFunc = dyn_cast<triton::FuncOp>(func.getOperation())) {
+    auto noinline = tritonFunc->getAttrOfType<BoolAttr>("noinline");
+    if (!noinline || !noinline.getValue())
+      return success();
+  }
+  return emitOpError("must be inside a kernel function");
 }
 
 TypedValue<MemDescType> InvalBarrierOp::getBarrier() { return getAlloc(); }
@@ -282,10 +540,10 @@ LogicalResult WaitBarrierOp::verify() {
   return success();
 }
 
-// Forward declaration. The single (beta-adapted) definition lives below near
-// verifyTMABarrierLayout; beta deliberately tolerates an unset CGA layout, so
-// we keep that version rather than the upstream hard-failing one this
-// cherry-pick carried.
+// Forward declaration. The single Meta Triton-adapted definition lives below
+// near verifyTMABarrierLayout; Meta Triton deliberately tolerates an unset CGA
+// layout, so we keep that version rather than the upstream hard-failing one
+// this cherry-pick carried.
 static LogicalResult verifyBarrierCGALayout(Operation *op, Value barrier,
                                             CGAEncodingAttr expectedCGALayout,
                                             StringRef barrierName);
@@ -411,10 +669,10 @@ static LogicalResult verifyBarrierCGALayout(Operation *op, Value barrier,
                                             StringRef barrierName) {
   auto barrierTy = cast<MemDescType>(barrier.getType());
   auto actualCGALayout = getCGALayout(barrierTy.getEncoding());
-  // beta divergence: beta's TMA kernels commonly leave the barrier CGA layout
-  // unset (empty block bases = the default single-CTA layout) rather than
-  // spelling out the explicit form upstream emits. Treat an unset layout as
-  // satisfying the expectation instead of hard-failing (mirrors
+  // Meta Triton divergence: Meta Triton's TMA kernels commonly leave the
+  // barrier CGA layout unset (empty block bases = the default single-CTA
+  // layout) rather than spelling out the explicit form upstream emits. Treat an
+  // unset layout as satisfying the expectation instead of hard-failing (mirrors
   // verifyTMAEncoding's skip-when-no-encoding behavior below). This keeps the
   // check meaningful for barriers that DO carry an explicit CGA layout.
   auto kBlock = StringAttr::get(op->getContext(), "block");
@@ -910,11 +1168,12 @@ LogicalResult TCGen5MMAOp::verify() {
   }
   for (auto barrier : getBarriers()) {
     auto barrierTy = cast<MemDescType>(barrier.getType());
-    // FB/beta divergence: beta's TLX / warp-spec paths emit multi-dimensional
-    // tc_gen5_mma barriers (e.g. 1x1xi64), which verifyBarrierType (which
-    // models only the rank-1 `Nxi64` mbarrier form introduced upstream by
-    // #9474) does not understand. Only verify the rank-1 form; leave beta's
-    // higher-rank barriers unchecked here as they were before #9474.
+    // Meta Triton divergence: Meta Triton's TLX / warp-spec paths emit
+    // multi-dimensional tc_gen5_mma barriers (e.g. 1x1xi64), which
+    // verifyBarrierType (which models only the rank-1 `Nxi64` mbarrier form
+    // introduced upstream by #9474) does not understand. Only verify the rank-1
+    // form; leave Meta Triton's higher-rank barriers unchecked here as they
+    // were before #9474.
     if (barrierTy.getRank() == 1) {
       if (failed(verifyBarrierType(*this, barrierTy)) ||
           failed(verifyCompletionBarrierLayout(getOperation(), barrier)))
@@ -946,11 +1205,16 @@ LogicalResult TCGen5MMAOp::verify() {
   auto retEnc = dyn_cast<TensorMemoryEncodingAttr>(retType.getEncoding());
   if (!retEnc)
     return emitOpError("Return operand must have a TensorMemory encoding");
+  if (retEnc.getFp4Padded())
+    return emitOpError("Accumulator must not be fp4_padded");
 
   // Check colStride of TMEM operands
   if (auto tmem = dyn_cast<TensorMemoryEncodingAttr>(aEnc)) {
     if (tmem.getColStride() != 1)
       return emitOpError("The col stride of the LHS operand must be 1");
+    if (tmem.getFp4Padded())
+      return emitOpError(
+          "fp4_padded tensor memory LHS is only supported by scaled MMA");
   }
   if (retEnc.getColStride() != 32 / retType.getElementTypeBitWidth())
     return emitOpError("The col stride of the return operand must be 32 / ")
@@ -1070,8 +1334,7 @@ ValueRange TCGen5MMAOp::getCompletionBarrierPreds() {
 
 static void appendMulticastDesc(SmallVectorImpl<Value> &descs,
                                 TypedValue<MemDescType> desc) {
-  if (isa<SharedEncodingTrait>(desc.getType().getEncoding()))
-    descs.push_back(desc);
+  descs.push_back(desc);
 }
 
 SmallVector<Value> TCGen5MMAOp::getCompletionDescs() {
@@ -1221,6 +1484,37 @@ verifyScaleBlockRepOrder(TCGen5MMAScaledOp op,
   return success();
 }
 
+static LogicalResult verifyScaledLHSOperand(Operation *op, Type elementType,
+                                            TensorMemoryEncodingAttr encoding,
+                                            ScaleDotElemType aType,
+                                            ScaleDotElemType bType) {
+  if (aType == ScaleDotElemType::E2M1) {
+    if (!elementType.isInteger(8))
+      return op->emitOpError("expected e2m1 LHS operand to have i8 storage");
+    if (encoding.getFp4Padded() &&
+        !llvm::is_contained({ScaleDotElemType::E4M3, ScaleDotElemType::E5M2},
+                            bType))
+      return op->emitOpError("can only use fp4_padded LHS when RHS is float8");
+    if (llvm::is_contained({ScaleDotElemType::E4M3, ScaleDotElemType::E5M2},
+                           bType) &&
+        !encoding.getFp4Padded())
+      return op->emitOpError(
+          "expected e2m1 LHS operand to be fp4_padded when RHS is float8");
+    return success();
+  }
+
+  if (isa<Float8E4M3FNType, Float8E5M2Type>(elementType)) {
+    if (!llvm::is_contained({ScaleDotElemType::E4M3, ScaleDotElemType::E5M2},
+                            aType)) {
+      return op->emitOpError(
+          "expected float8 LHS operand to have e4m3 or e5m2 format");
+    }
+    return success();
+  }
+
+  return op->emitOpError("unsupported LHS operand type for scaled MMA");
+}
+
 LogicalResult TCGen5MMAScaledOp::verify() {
   if (!getIsAsync() && !getBarriers().empty()) {
     return emitOpError("The op is synchronous but a barrier is present.");
@@ -1245,8 +1539,17 @@ LogicalResult TCGen5MMAScaledOp::verify() {
     return emitOpError(
         "expected accumulator layout to be a TensorMemoryLayout");
   }
+  if (enc.getFp4Padded())
+    return emitOpError("accumulator layout must not be fp4_padded");
   if (enc.getBlockM() != 128)
     return emitOpError("only supports instruction shape blockM=128");
+  if (auto lhsEnc =
+          dyn_cast<TensorMemoryEncodingAttr>(getA().getType().getEncoding())) {
+    if (failed(verifyScaledLHSOperand(getOperation(),
+                                      getA().getType().getElementType(), lhsEnc,
+                                      getAType(), getBType())))
+      return failure();
+  }
   auto aScaleType = cast<MemDescType>(getAScale().getType());
   auto bScaleType = cast<MemDescType>(getBScale().getType());
   auto isScaleBlockRepOrderRelevant = [](MemDescType scaleType) {
@@ -1640,28 +1943,28 @@ LogicalResult TMEMCopyOp::verify() {
     return emitOpError("Source must have at least 16-byte alignment to be "
                        "representable in a matrix descriptor.");
   }
-  // FB/beta divergence: beta's TMEMCopy supports flexible multi-dimensional
-  // SMEM source shapes (e.g. 5D TMA scale loads) into a DummyTMEMLayoutAttr
-  // destination whose deferred layout is resolved later. Such swizzled
-  // multi-dim sources have no representable linear layout yet (toLinearLayout
-  // would report_fatal_error "Illegal shared layout"), so skip the upstream
-  // cga-layout equality check entirely when the destination layout is still a
-  // placeholder.
+  // Meta Triton divergence: Meta Triton's TMEMCopy supports flexible
+  // multi-dimensional SMEM source shapes (e.g. 5D TMA scale loads) into a
+  // DummyTMEMLayoutAttr destination whose deferred layout is resolved later.
+  // Such swizzled multi-dim sources have no representable linear layout yet
+  // (toLinearLayout would report_fatal_error "Illegal shared layout"), so skip
+  // the upstream cga-layout equality check entirely when the destination layout
+  // is still a placeholder.
   if (!isa<triton::tlx::DummyTMEMLayoutAttr>(dstTy.getEncoding())) {
     auto shmemLl = toLinearLayout(srcTy);
     auto tmemLl = toLinearLayout(dstTy);
 
     // The upstream cga-layout equality check uses invertAndCompose, which
-    // requires matching out-dim names AND tmem out-dim sizes >= shmem out-dim
-    // sizes (its internal assertion). beta's flexible multi-dimensional scale
-    // SMEM sources can be larger than the tmem destination, which would trip
-    // that assertion, so only run the check when the out-dims are compatible
-    // (the rank-equal case upstream assumes).
+    // requires matching out-dim names AND shmem out-dim sizes >= tmem out-dim
+    // sizes (its internal assertion). Meta Triton's flexible multi-dimensional
+    // scale SMEM sources can have incompatible per-dimension shapes, so only
+    // run the check when the out-dims are compatible (the rank-equal case
+    // upstream assumes).
     bool compatibleOutDims =
         llvm::equal(shmemLl.getOutDimNames(), tmemLl.getOutDimNames());
     if (compatibleOutDims) {
       for (auto dim : tmemLl.getOutDimNames()) {
-        if (tmemLl.getOutDimSize(dim) < shmemLl.getOutDimSize(dim)) {
+        if (shmemLl.getOutDimSize(dim) < tmemLl.getOutDimSize(dim)) {
           compatibleOutDims = false;
           break;
         }
@@ -1725,8 +2028,8 @@ LogicalResult TMEMSubSliceOp::verify() {
 
   if (!isa<triton::nvidia_gpu::TensorMemorySpaceAttr>(srcTy.getMemorySpace()))
     return emitOpError("The source must be a tensor memory buffer.");
-  // Beta divergence: TMEM subslices may be higher-rank (multibuffered) and may
-  // reduce blockN (packed/reuse), so we do not enforce upstream #7777's
+  // Meta Triton divergence: TMEM subslices may be higher-rank (multibuffered)
+  // and may reduce blockN (packed/reuse), so we do not enforce upstream #7777's
   // rank==2 / same-encoding / same-allocShape restrictions. We require equal
   // rank and innermost-dimension slicing instead.
   if (srcTy.getRank() != dstTy.getRank())
@@ -1783,7 +2086,7 @@ LogicalResult TMEMSubSliceOp::verify() {
     return emitOpError(
         "The destination must use the same TMEM encoding kind as the source.");
   }
-  // Checks adopted from upstream #7777 that are compatible with beta's
+  // Checks adopted from upstream #7777 that are compatible with Meta Triton's
   // higher-rank / reduced-blockN subslices.
   if (srcTy.getElementType() != dstTy.getElementType())
     return emitOpError(
@@ -1810,7 +2113,7 @@ void TMEMSubSliceOp::build(OpBuilder &builder, OperationState &state,
     newEncoding = triton::nvidia_gpu::TensorMemoryEncodingAttr::get(
         builder.getContext(), encoding.getBlockM(), newBlockN,
         encoding.getColStride(), encoding.getCGALayout(), encoding.getTwoCTAs(),
-        encoding.getCtaMode());
+        encoding.getCtaMode(), encoding.getFp4Padded());
   }
   auto subsliceType = gpu::MemDescType::get(
       shape, allocTy.getElementType(), newEncoding, allocTy.getMemorySpace(),

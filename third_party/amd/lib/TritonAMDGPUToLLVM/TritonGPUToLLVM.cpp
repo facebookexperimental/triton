@@ -5,10 +5,6 @@
 #include "TargetInfo.h"
 #include "TritonAMDGPUToLLVM/MembarUtility.h"
 #include "TritonAMDGPUToLLVM/TypeConverter.h"
-#include "TritonAMDGPUToLLVM/UniformityAnalysis.h"
-#include "mlir/Analysis/DataFlow/ConstantPropagationAnalysis.h"
-#include "mlir/Analysis/DataFlow/DeadCodeAnalysis.h"
-#include "mlir/Analysis/DataFlowFramework.h"
 #include "mlir/Conversion/ArithToLLVM/ArithToLLVM.h"
 #include "mlir/Conversion/ControlFlowToLLVM/ControlFlowToLLVM.h"
 #include "mlir/Conversion/GPUToNVVM/GPUToNVVMPass.h"
@@ -67,7 +63,6 @@ public:
     addIllegalDialect<triton::instrument::TritonInstrumentDialect>();
     addIllegalDialect<mlir::gpu::GPUDialect>();
     addLegalOp<mlir::UnrealizedConversionCastOp>();
-    addLegalOp<triton::amdgpu::InstructionSchedHint>();
     // Warp specialization is lowered later.
     addLegalOp<triton::gpu::WarpSpecializeOp>();
     addLegalOp<triton::gpu::WarpYieldOp>();
@@ -95,7 +90,7 @@ struct ConvertTritonAMDGPUToLLVM
     ModuleOp mod = getOperation();
 
     AMD::TargetInfo targetInfo(this->gfxArch.getValue());
-    if (targetInfo.getISAFamily() == AMD::ISAFamily::Unknown) {
+    if (targetInfo.getISAFamily() == triton::amdgpu::ISAFamily::Unknown) {
       mod.emitError("unsupported target: '") << this->gfxArch.getValue() << "'";
       return signalPassFailure();
     }
@@ -160,18 +155,8 @@ struct ConvertTritonAMDGPUToLLVM
     // Make benefit for AMD specific patterns higher so they apply before common
     // patterns
     int AMDBenefit = commonBenefit + 1;
-    auto populatePatterns1 = [&](auto populateFunc, int benefit) {
-      populateFunc(typeConverter, patterns, axisInfoAnalysis, allocation,
-                   benefit);
-    };
-
     auto populatePatterns5 = [&](auto populateFunc, int benefit) {
       populateFunc(typeConverter, patterns, benefit);
-    };
-
-    auto populatePatterns6 = [&](auto populateFunc, int benefit) {
-      populateFunc(typeConverter, patterns, axisInfoAnalysis, allocation,
-                   targetInfo, benefit);
     };
 
     auto populatePatterns7 = [&](auto populateFunc, int benefit) {
@@ -192,19 +177,8 @@ struct ConvertTritonAMDGPUToLLVM
     AMD::populateFpCastOpToLLVMPatterns(typeConverter, patterns, ftz,
                                         axisInfoAnalysis, allocation,
                                         targetInfo, AMDBenefit);
-    // Run a dataflow analysis that classifies every SSA value as
-    // wave-uniform or per-lane. The buffer-ops splitter queries this
-    // to decide which offset components can move to the SGPR soffset.
-    DataFlowSolver uniformitySolver;
-    uniformitySolver.load<dataflow::DeadCodeAnalysis>();
-    uniformitySolver.load<dataflow::SparseConstantPropagation>();
-    AMD::loadUniformityAnalysis(uniformitySolver);
-    if (failed(uniformitySolver.initializeAndRun(mod)))
-      return signalPassFailure();
-
     AMD::populateLoadStoreOpToLLVMPatterns(typeConverter, targetInfo, patterns,
-                                           axisInfoAnalysis, &uniformitySolver,
-                                           AMDBenefit);
+                                           axisInfoAnalysis, AMDBenefit);
     AMD::populateMaskedOpsToLLVMPatterns(patterns, targetInfo);
     AMD::populateBarrierOpToLLVMPatterns(typeConverter, patterns, AMDBenefit);
     AMD::populateTensorPtrOpsToLLVMPatterns(typeConverter, patterns,
@@ -223,10 +197,12 @@ struct ConvertTritonAMDGPUToLLVM
     populatePatterns7(mlir::triton::populateGatherOpToLLVMPatterns,
                       commonBenefit);
 
+    auto coordinateGroups = std::make_shared<DistributedCoordinateGroups>();
     AMD::populateMemoryOpToLLVMPatterns(typeConverter, patterns, targetInfo,
-                                        AMDBenefit);
+                                        AMDBenefit, coordinateGroups);
     mlir::triton::populateMemoryOpToLLVMPatterns(typeConverter, targetInfo,
-                                                 patterns, commonBenefit);
+                                                 patterns, commonBenefit,
+                                                 std::move(coordinateGroups));
     mlir::triton::populateMakeRangeOpToLLVMPattern(typeConverter, targetInfo,
                                                    patterns, commonBenefit);
     mlir::triton::populateAssertOpToLLVMPattern(typeConverter, patterns,
@@ -294,9 +270,10 @@ private:
     // Ask for 16B alignment on global_smem because that's the largest we should
     // ever need (4xi32).
     auto arrayTy = LLVM::LLVMArrayType::get(elemTy, 0);
-    auto global = LLVM::GlobalOp::create(
+    LLVM::GlobalOp::create(
         b, loc, arrayTy, /*isConstant=*/false, LLVM::Linkage::External,
-        "global_smem", /*value=*/Attribute(), /*alignment=*/16,
+        "global_smem",
+        /*value=*/Attribute(), /*alignment=*/16,
         // Add ROCm support.
         static_cast<unsigned>(NVVM::NVVMMemorySpace::Shared));
   }

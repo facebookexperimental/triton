@@ -1,4 +1,4 @@
-#include "TritonAMDGPUToLLVM/TargetUtils.h"
+#include "Dialect/TritonAMDGPU/IR/TargetFeatures.h"
 #include "TritonAMDGPUTransforms/Passes.h" // IWYU pragma: keep
 #include "amd/lib/TritonAMDGPUTransforms/PipelineUtility.h"
 #include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
@@ -51,18 +51,32 @@ Operation *streamPredication(RewriterBase &rewriter, Operation *op,
     scf::YieldOp::create(elseB, loc, zeroValues);
     return ifOp;
   }
-  // TDM ops with I32 predicates need explicit type conversion since the
-  // generic PredicatedOpInterface path produces I1 masks.
-  if (isa<triton::amdgpu::AsyncTDMCopyGlobalToLocalOp,
-          triton::amdgpu::AsyncTDMGatherOp>(op)) {
-    auto predicatedOp = cast<tt::PredicatedOpInterface>(op);
+  // Gate the copy by chaining a pred-only update_tensor_descriptor onto its
+  // descriptor: the chained update inherits the positioning and narrows pred to
+  // the loop predicate.
+  if (auto copyOp = dyn_cast<triton::amdgpu::AsyncTDMCopyGlobalToLocalOp>(op)) {
     rewriter.setInsertionPoint(op);
-    auto predI32 = arith::ExtUIOp::create(
-        rewriter, op->getLoc(), predicatedOp.getPredicateOperand().getType(),
-        pred);
-    Value mask = arith::AndIOp::create(
-        rewriter, op->getLoc(), predicatedOp.getPredicateOperand(), predI32);
-    predicatedOp.setPredicateOperand(mask);
+    auto predI32 = arith::ExtUIOp::create(rewriter, op->getLoc(),
+                                          rewriter.getI32Type(), pred);
+    auto updated = triton::amdgpu::UpdateTensorDescriptorOp::create(
+        rewriter, op->getLoc(), copyOp.getDesc().getType(), copyOp.getDesc(),
+        /*add_offsets=*/ValueRange{}, /*set_bounds=*/ValueRange{},
+        /*pred=*/predI32);
+    copyOp.getDescMutable().assign(updated.getResult());
+    return op;
+  }
+  // Pure gather inherits pred from its descriptor; gate it the same way as the
+  // copy by chaining a pred-only update_tensor_descriptor onto its descriptor.
+  if (auto gatherOp = dyn_cast<triton::amdgpu::AsyncTDMGatherOp>(op)) {
+    rewriter.setInsertionPoint(op);
+    auto predI32 = arith::ExtUIOp::create(rewriter, op->getLoc(),
+                                          rewriter.getI32Type(), pred);
+    auto updated = triton::amdgpu::UpdateTensorDescriptorOp::create(
+        rewriter, op->getLoc(), gatherOp.getDesc().getType(),
+        gatherOp.getDesc(),
+        /*add_offsets=*/ValueRange{}, /*set_bounds=*/ValueRange{},
+        /*pred=*/predI32);
+    gatherOp.getDescMutable().assign(updated.getResult());
     return op;
   } else if (isa<tt::DescriptorStoreLikeOpInterface>(op)) {
     auto loc = op->getLoc();
@@ -184,17 +198,14 @@ struct PipelinePass : impl::TritonAMDGPUPipelineBase<PipelinePass> {
     expandLoops(moduleOp);
 
     if (useAsyncCopy) {
-      auto arch = getAMDArch(moduleOp);
-      auto family =
-          arch ? tt::AMD::deduceISAFamily(*arch) : tt::AMD::ISAFamily::Unknown;
+      auto targetFeatures = tt::amdgpu::TargetFeatures::fromModuleOp(moduleOp);
       // Only asyncmark targets (CDNA3/CDNA4) need updateWaits here: their
       // lowering reads ttg.async_wait's `num` directly into wait.asyncmark(N),
       // and PR #9883 made UpdateAsyncWaitCount a no-op on those archs, so
       // without this call the pipeliner-authored num=0 would serialize the
       // SWP. Every other family keeps the prior combineRedundantWaitOps-only
       // path: their num is re-derived downstream by UpdateAsyncWaitCount.
-      if (family == tt::AMD::ISAFamily::CDNA3 ||
-          family == tt::AMD::ISAFamily::CDNA4) {
+      if (targetFeatures.isCDNA3() || targetFeatures.isCDNA4()) {
         mlir::triton::updateWaits(moduleOp);
       }
     }

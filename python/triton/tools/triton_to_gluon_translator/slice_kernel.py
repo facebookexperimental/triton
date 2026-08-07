@@ -44,7 +44,11 @@ class GlobalValue:
     original_value: Any
 
     @staticmethod
-    def wrap(value: Any, name: str, find_module: Callable[[], ModuleType]) -> "GlobalValue":
+    def wrap(
+        value: Any,
+        name: str,
+        resolve_definition: Callable[[], tuple[str, ModuleType]],
+    ) -> "GlobalValue":
         assert not isinstance(value, GlobalValue), "value is already a GlobalValue"
         if isinstance(value, FunctionType) and hasattr(value, "__triton_builtin__"):
             return GlobalValue(value, value)
@@ -52,14 +56,16 @@ class GlobalValue:
             return GlobalValue(value, value)
         # Treat closure globals as global variables, not function definitions.
         if isinstance(value, FunctionType) and value.__closure__ is not None:
-            return GlobalValue(GlobalVariable(name, value, find_module()), value)
+            name, module = resolve_definition()
+            return GlobalValue(GlobalVariable(name, value, module), value)
 
         if isinstance(value, BuiltinFunctionType | FunctionType | type):
             return GlobalValue(value, value)
         if isinstance(value, JITCallable):
             assert isinstance(value.fn, FunctionType)
             return GlobalValue(value.fn, value)
-        return GlobalValue(GlobalVariable(name, value, find_module()), value)
+        name, module = resolve_definition()
+        return GlobalValue(GlobalVariable(name, value, module), value)
 
     @property
     def name(self) -> str:
@@ -192,10 +198,10 @@ def bind_import_stmt(context: scoped_dict[str, Any], stmt: ast.Import) -> bool:
     return bind_import_aliases(context, stmt.names, get_import_binding)
 
 
-def get_name_ref_module(name: str, cur_module: ModuleType, filter: FilterFn) -> ModuleType:
+def resolve_name_ref(name: str, cur_module: ModuleType, filter: FilterFn) -> tuple[str, ModuleType]:
     # Bottom out at the leaf modules.
     if filter(cur_module):
-        return cur_module
+        return name, cur_module
     source = inspect.getsource(cur_module)
     tree = ast.parse(source)
     for stmt in tree.body:
@@ -203,11 +209,11 @@ def get_name_ref_module(name: str, cur_module: ModuleType, filter: FilterFn) -> 
             for alias in stmt.names:
                 if alias.asname == name or (alias.asname is None and alias.name == name):
                     next_module = resolve_module_alias(stmt, cur_module)
-                    return get_name_ref_module(alias.name, next_module, filter)
+                    return resolve_name_ref(alias.name, next_module, filter)
         elif isinstance(stmt, ast.Assign | ast.AnnAssign):
             target = get_assign_target(stmt)
             if target is not None and target.id == name:
-                return cur_module
+                return name, cur_module
     raise ValueError(f"could not find module for {name} in {cur_module.__name__}")
 
 
@@ -281,7 +287,7 @@ class ReferenceScanner(ast.NodeVisitor):
         if isinstance(value, ModuleType | LocalMarker):
             return self.generic_visit(node)
         global_value = self.value_remap.get(id(value), None) or GlobalValue.wrap(
-            value, name, lambda: get_name_ref_module(name, rel_module, self.filter))
+            value, name, lambda: resolve_name_ref(name, rel_module, self.filter))
 
         ref_id = global_value.id
         module = global_value.module
@@ -362,7 +368,11 @@ def get_base_value(path: str) -> GlobalValue:
         raise ValueError(f"invalid Python object format: {path}")
     module_str, value_name = path.split(":")
     module = importlib.import_module(module_str)
-    return GlobalValue.wrap(getattr(module, value_name), value_name, lambda: module)
+    return GlobalValue.wrap(
+        getattr(module, value_name),
+        value_name,
+        lambda: (value_name, module),
+    )
 
 
 def is_submodule(module: ModuleType, leaf_modules: list[str]) -> bool:
@@ -446,7 +456,7 @@ class ReferenceRewriter(ast.NodeTransformer):
         if isinstance(value, ModuleType | LocalMarker):
             return self.generic_visit(node)
         global_value = self.value_remap.get(id(value), None) or GlobalValue.wrap(
-            value, name, lambda: get_name_ref_module(name, rel_module, self.filter))
+            value, name, lambda: resolve_name_ref(name, rel_module, self.filter))
 
         ref_id = global_value.id
         if ref_id not in self.references:
@@ -533,10 +543,10 @@ class ReferenceRewriter(ast.NodeTransformer):
 
 @dataclass
 class SliceRewriter(ReferenceRewriter):
+    target: TranslatorTarget = field(kw_only=True)
     translate_to_gluon: bool = False
     inline_helpers: ordered_set[str] = field(default_factory=ordered_set[str])
     cvt_context: list[bool] = field(default_factory=lambda: [False])
-    target: TranslatorTarget = TranslatorTarget.NVIDIA
 
     def __post_init__(self) -> None:
         # Special rules for sugaring imports.
@@ -627,8 +637,20 @@ def is_stdlib_module(module: ModuleType) -> bool:
     if origin in ["built-in", "frozen"]:
         return True
 
-    stdlib_path = Path(sysconfig.get_paths()["stdlib"])
-    return Path(origin).is_relative_to(stdlib_path)
+    origin_path = Path(origin)
+    # A virtual environment can load packages from its base Python installation.
+    # Those packages live below the base stdlib path, but are not included in the
+    # active environment's purelib or platlib paths.
+    if any(part in {"site-packages", "dist-packages"} for part in origin_path.parts):
+        return False
+
+    sys_paths = sysconfig.get_paths()
+    site_package_paths = [Path(sys_paths[key]) for key in ("purelib", "platlib") if key in sys_paths]
+    if any(origin_path.is_relative_to(site_path) for site_path in site_package_paths):
+        return False
+
+    stdlib_paths = [Path(sys_paths[key]) for key in ("stdlib", "platstdlib") if key in sys_paths]
+    return any(origin_path.is_relative_to(stdlib_path) for stdlib_path in stdlib_paths)
 
 
 def find_references(
@@ -725,7 +747,8 @@ def slice_kernel(
     leaf_paths: list[str] | None = None,
     translate_to_gluon: bool = False,
     rewrite_spec: RewriteSpec | None = None,
-    target: TranslatorTarget = TranslatorTarget.NVIDIA,
+    *,
+    target: TranslatorTarget,
 ) -> str:
     rewrite_spec = rewrite_spec or RewriteSpec()
     base_values: list[GlobalValue] = [get_base_value(root_path) for root_path in root_paths]
@@ -762,7 +785,11 @@ def slice_kernel(
         for fn in jit_functions:
             gluon_fn = getattr(module, fn.name)
             assert isinstance(gluon_fn, JITFunction)
-            value_remap[fn.id] = GlobalValue.wrap(gluon_fn, fn.name, lambda: module)
+            value_remap[fn.id] = GlobalValue.wrap(
+                gluon_fn,
+                fn.name,
+                lambda: (fn.name, module),
+            )
 
     references, graph = find_references(
         base_values,
@@ -826,7 +853,8 @@ def slice_kernel_from_trace(
     translate_to_gluon: bool,
     extra_modules: dict[str, str],
     rewrite_spec: RewriteSpec | None = None,
-    target: TranslatorTarget = TranslatorTarget.NVIDIA,
+    *,
+    target: TranslatorTarget,
 ) -> str:
     module_remap: dict[str, str] = {}
     for name, path in extra_modules.items():
@@ -873,7 +901,8 @@ def main(
     leaf_paths: list[str] | None = None,
     translate_to_gluon: bool = False,
     output_path: str = "/tmp/reference.py",
-    target: TranslatorTarget = TranslatorTarget.NVIDIA,
+    *,
+    target: TranslatorTarget,
 ) -> None:
     output = slice_kernel(
         root_paths=root_paths,
@@ -899,6 +928,7 @@ def _main_cli() -> None:
     parser.add_argument("--translate-to-gluon", action="store_true",
                         help="Translate Triton JIT callables to Gluon while slicing.")
     parser.add_argument("--output-path", default="/tmp/reference.py", help="Path to write the sliced output.")
+    parser.add_argument("--target", required=True, help="Target architecture (e.g. nvidia, gfx1250).")
     args = parser.parse_args()
     main(
         root_paths=args.root_paths,
@@ -907,6 +937,7 @@ def _main_cli() -> None:
         leaf_paths=args.leaf_paths or None,
         translate_to_gluon=args.translate_to_gluon,
         output_path=args.output_path,
+        target=TranslatorTarget(args.target),
     )
 
 

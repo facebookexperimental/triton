@@ -7,6 +7,7 @@ add_triton_library(TLXIR
   DEPENDS
   TLXTableGen
   TLXTypesIncGen
+  TLXLayoutInterfaceIncGen
   TLXAttrDefsIncGen
 
   LINK_LIBS PUBLIC

@@ -14,6 +14,7 @@ structural kinds (warp-leader, first-N, loop induction variable) that would let 
 RECOVER more freedom are a later extension; the floor needs only the structural-vs-data-dependent
 split so the interpreter can fail closed on data-dependent control flow.
 """
+import logging
 from dataclasses import dataclass
 
 from pyptx.ir.nodes import RegisterOperand, VectorOperand
@@ -22,6 +23,8 @@ from bitequiv.ptx.mma import _is_mma
 
 DATA_DEPENDENT = "DATA_DEPENDENT"
 STRUCTURAL = "STRUCTURAL"
+
+_log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -56,12 +59,17 @@ class PredicateDecoder:
     def decode(self, pred_reg, before_index):
         """``PredInfo`` for the predicate held in ``pred_reg`` at ``before_index`` (a program point in
         the same linearized stream the interpreter walks)."""
-        dd = self._depends_on_data(pred_reg, before_index)
-        return PredInfo(DATA_DEPENDENT if dd else STRUCTURAL)
+        trigger = self._depends_on_data(pred_reg, before_index)
+        if trigger is not None:  # log WHY the sound floor fired, so a fail-closed kernel is debuggable
+            _log.debug("control-flow floor: predicate %s is DATA_DEPENDENT (traces to `%s` at index %s) "
+                       "-> dropping it would be unsound, failing closed", pred_reg,
+                       trigger.inst.opcode + "".join(trigger.inst.modifiers), trigger.index)
+        return PredInfo(DATA_DEPENDENT if trigger is not None else STRUCTURAL)
 
     def _depends_on_data(self, reg, before_index):
-        """True iff the value in ``reg`` traces back (through def-use) to a data source. Iterative
-        with a seen-set so a shared/cyclic def graph terminates."""
+        """The producing ``Def`` of the runtime-data source ``reg`` traces back to (through def-use), or
+        ``None`` if ``reg`` is structural. Iterative with a seen-set so a shared/cyclic def graph
+        terminates. (Returning the Def, not just a bool, lets ``decode`` log which op forced the floor.)"""
         stack, seen = [(reg, before_index)], set()
         while stack:
             r, at = stack.pop()
@@ -72,11 +80,11 @@ class PredicateDecoder:
             if d is None:
                 continue  # kernel param / special register (%tid, %laneid, ...) -> structural leaf
             if _is_data_source(d.inst):
-                return True
+                return d
             for o in (d.inst.operands[1:] if d.inst.operands else []):  # source operands
                 if isinstance(o, RegisterOperand):
                     stack.append((o.name, d.index))
                 elif isinstance(o, VectorOperand):
                     stack.extend((e.name, d.index) for e in o.elements
                                  if isinstance(e, RegisterOperand))
-        return False
+        return None

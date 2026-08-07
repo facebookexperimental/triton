@@ -43,8 +43,12 @@ public:
       rewriter.replaceOp(requireLayoutOp, requireLayoutOp.getSrc());
       return success();
     }
-    rewriter.replaceOpWithNewOp<ttg::ConvertLayoutOp>(
-        requireLayoutOp, requireLayoutOp.getType(), requireLayoutOp.getSrc());
+    auto convert = ttg::ConvertLayoutOp::create(
+        rewriter, requireLayoutOp.getLoc(), requireLayoutOp.getType(),
+        requireLayoutOp.getSrc());
+    if (requireLayoutOp->hasAttr("tlx.rematerialize_coordinates"))
+      convert->setAttr("tlx.rematerialize_coordinates", rewriter.getUnitAttr());
+    rewriter.replaceOp(requireLayoutOp, convert);
     return success();
   }
 };
@@ -445,6 +449,11 @@ public:
         return WalkResult::interrupt();
       if (auto allocOp = dyn_cast<ttg::LocalAllocOp>(op)) {
         if (isRetaggableLocalAllocLoadFallback(allocOp))
+          return WalkResult::interrupt();
+      }
+      if (auto copyOp = dyn_cast<ttng::TMEMCopyOp>(op)) {
+        auto dstType = cast<ttg::MemDescType>(copyOp.getDst().getType());
+        if (isa_and_nonnull<DummyTMEMLayoutAttr>(dstType.getEncoding()))
           return WalkResult::interrupt();
       }
       return WalkResult::advance();

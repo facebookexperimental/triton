@@ -55,7 +55,7 @@ def _k_baseline(seed_ptr, out_ptr, check_ptr, NITER):
     tid = tlx.thread_id(0)
     x = tl.load(seed_ptr).to(tl.float32)
     t0 = tlx.clock64()
-    for _ in tl.range(0, NITER, loop_unroll_factor=1, num_stages=0):
+    for _ in tl.range(0, NITER, loop_unroll_factor=1, num_stages=1):
         x += 1.0
     t1 = tlx.clock64()
     if tid == 0:
@@ -70,7 +70,7 @@ def _k_valu_dependent(seed_ptr, out_ptr, check_ptr, NITER):
     mul = tl.load(seed_ptr + 1).to(tl.float32)
     inc = tl.load(seed_ptr + 2).to(tl.float32)
     t0 = tlx.clock64()
-    for _ in tl.range(0, NITER, loop_unroll_factor=1, num_stages=0):
+    for _ in tl.range(0, NITER, loop_unroll_factor=1, num_stages=1):
         x = x * mul + inc
     t1 = tlx.clock64()
     if tid == 0:
@@ -94,7 +94,7 @@ def _k_valu_independent_x4(seed_ptr, out_ptr, check_ptr, NITER):
     inc2 = tl.load(seed_ptr + 10).to(tl.float32)
     inc3 = tl.load(seed_ptr + 11).to(tl.float32)
     t0 = tlx.clock64()
-    for _ in tl.range(0, NITER, loop_unroll_factor=1, num_stages=0):
+    for _ in tl.range(0, NITER, loop_unroll_factor=1, num_stages=1):
         x0 = x0 * mul0 + inc0
         x1 = x1 * mul1 + inc1
         x2 = x2 * mul2 + inc2
@@ -115,7 +115,7 @@ def _k_lds_dependent_gather_chase(table_ptr, out_ptr, check_ptr, NITER):
 
     idx = tl.load(table_ptr + 64).to(tl.int32)
     t0 = tlx.clock64()
-    for _ in tl.range(0, NITER, loop_unroll_factor=1, num_stages=0):
+    for _ in tl.range(0, NITER, loop_unroll_factor=1, num_stages=1):
         gathered = tlx.local_gather(table[0], tl.full((1,), idx, tl.int32), 0)
         idx = tl.sum(gathered, axis=0).to(tl.int32)
     t1 = tlx.clock64()
@@ -137,7 +137,7 @@ def _k_lds_independent_gather_x4(table_ptr, out_ptr, check_ptr, NITER):
     idx2 = tl.load(table_ptr + 66).to(tl.int32)
     idx3 = tl.load(table_ptr + 67).to(tl.int32)
     t0 = tlx.clock64()
-    for _ in tl.range(0, NITER, loop_unroll_factor=1, num_stages=0):
+    for _ in tl.range(0, NITER, loop_unroll_factor=1, num_stages=1):
         idx0 = tl.sum(tlx.local_gather(table[0], tl.full((1,), idx0, tl.int32), 0), axis=0).to(tl.int32)
         idx1 = tl.sum(tlx.local_gather(table[0], tl.full((1,), idx1, tl.int32), 0), axis=0).to(tl.int32)
         idx2 = tl.sum(tlx.local_gather(table[0], tl.full((1,), idx2, tl.int32), 0), axis=0).to(tl.int32)
@@ -154,7 +154,7 @@ def _k_global_tl_load_dependent(src_ptr, out_ptr, check_ptr, NITER):
     idx = tl.load(src_ptr + 1).to(tl.int64)
     acc = tl.full((), 0, tl.int64)
     t0 = tlx.clock64()
-    for _ in tl.range(0, NITER, loop_unroll_factor=1, num_stages=0):
+    for _ in tl.range(0, NITER, loop_unroll_factor=1, num_stages=1):
         # src contains a self pointer at 0; this creates a serialized global load
         # dependency without changing the address range.
         idx = tl.load(src_ptr + idx).to(tl.int64)
@@ -172,7 +172,7 @@ def _k_global_direct_to_lds_composite(src_ptr, out_ptr, check_ptr, NITER):
     offs = tl.arange(0, 32)[:, None] * 32 + tl.arange(0, 32)[None, :]
     acc = tl.zeros((32, 32), tl.float32)
     t0 = tlx.clock64()
-    for _ in tl.range(0, NITER, loop_unroll_factor=1, num_stages=0):
+    for _ in tl.range(0, NITER, loop_unroll_factor=1, num_stages=1):
         tok = tlx.buffer_load_to_local(smem[0], src_ptr, offs)
         tlx.async_load_commit_group([tok])
         tlx.async_load_wait_group(0)
@@ -195,7 +195,7 @@ def _k_mfma_dependent(a_ptr, b_ptr, out_ptr, check_ptr, NITER):
     b = tl.load(b_ptr + offs_k[:, None] * 32 + offs_n[None, :])
     acc = tl.zeros((32, 32), tl.float32)
     t0 = tlx.clock64()
-    for _ in tl.range(0, NITER, loop_unroll_factor=1, num_stages=0):
+    for _ in tl.range(0, NITER, loop_unroll_factor=1, num_stages=1):
         acc = tl.dot(a, b, acc, allow_tf32=False)
     t1 = tlx.clock64()
     s = tl.sum(tl.sum(acc, axis=1), axis=0)
@@ -223,7 +223,7 @@ def _k_mfma_independent_x4(a_ptr, b_ptr, out_ptr, check_ptr, NITER):
     acc2 = tl.zeros((32, 32), tl.float32)
     acc3 = tl.zeros((32, 32), tl.float32)
     t0 = tlx.clock64()
-    for _ in tl.range(0, NITER, loop_unroll_factor=1, num_stages=0):
+    for _ in tl.range(0, NITER, loop_unroll_factor=1, num_stages=1):
         acc0 = tl.dot(a0, b0, acc0, allow_tf32=False)
         acc1 = tl.dot(a1, b1, acc1, allow_tf32=False)
         acc2 = tl.dot(a2, b2, acc2, allow_tf32=False)

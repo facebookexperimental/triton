@@ -116,16 +116,7 @@ void AutomaticWarpSpecialization::runOnOperation() {
   addPassWithPartitionVerifier(createTritonGPUPartitionScheduling());
   addPassWithPartitionVerifier(createNVWSHoistTmemStore());
   addPassWithPartitionVerifier(createNVWSInsertAref());
-  // META_WS_CHANGE: InsertTmemAref fails with Meta's partition layout
-  // (getInitialSchedule + schedulePostLoopOps). Keep disabled until partition
-  // scheduling is aligned with upstream. LoadMMASpecialization is retained
-  // locally as the fallback.
-#if 0
   addPassWithPartitionVerifier(createNVWSInsertTmemAref());
-#else
-  addPassWithPartitionVerifier(
-      createTritonGPULoadMMASpecialization({numStages}));
-#endif
   // `int-range-optimizations` and SCCP are good at cleaning up loop arithmetic.
   // FIXME: Re-enable integer range analysis once it is fixed.
   // pm.addPass(arith::createIntRangeOptimizationsPass());

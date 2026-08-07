@@ -4,13 +4,14 @@ Walk ``linearize(func)`` in program order over a symbolic thread, maintaining ``
 (the value-DAG node each register currently holds) plus transient markers (``_Shuffle`` butterfly
 partners, ``_Packed`` f32x2 lane pairs). Each instruction is a transfer function that looks its
 operands up in ``regs`` (forward) instead of resolving them backward. The produced value-DAG reuses
-:mod:`bitequiv.ptx.treeir`, so the same ``collapse_balanced`` + ``tree_hash`` yield a descriptor
+:mod:`bitequiv.core.treeir`, so the same ``collapse_balanced`` + ``tree_hash`` yield a descriptor
 directly comparable to the backward ``entry_signatures`` (the cross-check oracle).
 
 Modeled so far: ``ld.global`` (scalar + vector slots) -> leaves; the fp combines
 (``add/sub/mul/div/min/max``, ``fma``) and the within-warp butterfly ``op(p, shfl.bfly(p, off))`` ->
 ``ShflCombine`` for any reduce op; ``mov`` pass-through; the cross-warp shared exchange
-(``st.shared`` -> ``ld.shared`` -> ``SmemExchange``, the forward SmemModel); and packed ``.f32x2``
+(``st.shared`` [scalar or VECTOR, per element] -> ``bar.sync`` phase -> ``ld.shared`` / ``ldmatrix``
+resolved against the last closed phase under a same-structure guard -> ``SmemExchange``); and packed ``.f32x2``
 reductions (``mov.b64`` pack/unpack + ``.f32x2`` combine/fma decomposed per lane). ``st.global``
 values are the roots (a packed store expands to one root per f32 lane). A loop-carried
 ``acc = acc + chunk`` (a chunked / persistent reduction) is summarized as a ``LoopReduce`` fold over
@@ -24,22 +25,37 @@ the affine domain, resolved on demand for leaf coordinates).
 
 import hashlib
 
-from pyptx.ir.nodes import RegisterOperand, VectorOperand
+from pyptx.ir.nodes import AddressOperand, ImmediateOperand, RegisterOperand, VectorOperand
 
-from bitequiv.ptx.affine import AffineEval, canon, reqntid_of
-from bitequiv.ptx.builder import _postorder, collapse_balanced, output_coordfree_key, tree_hash
+from bitequiv.core.affine_algebra import canon
+from bitequiv.core.canonicalize import (_forest_postorder, collapse_balanced, collapse_balanced_forest,
+                                        output_coordfree_keys, tree_hash, tree_hashes)
+from bitequiv.core.treeir import FpOp, Leaf, LoopReduce, Mma, OpaqueLeaf, OpaqueOp, ShflCombine, SmemExchange
+from bitequiv.ptx.affine import AffineEval, reqntid_of, thread_image
 from bitequiv.ptx.forward.cfg import has_unknown_control
 from bitequiv.ptx.forward.loops import (find_loops, loop_accumulates, loop_carried_accumulators,
                                         loop_self_increments)
 from bitequiv.ptx.forward.predicate import PredicateDecoder
-from bitequiv.ptx.leaves import leaf_coord, leaf_columns
+from bitequiv.ptx.leaves import _load_width, leaf_coord, leaf_columns
 from bitequiv.ptx.linker import DefUse, _def_regs, linearize
-from bitequiv.ptx.mma import _is_mma, _mma_fence
-from bitequiv.ptx.treeir import (FpOp, Leaf, LoopReduce, Mma, OpaqueLeaf, OpaqueOp, ShflCombine,
-                                 SmemExchange)
+from bitequiv.ptx.mma import _fence_all_matmul, _is_mma, _mma_fence, mma_token_counts
 
 _FP_WIDTHS = frozenset({".f16", ".f16x2", ".f32", ".f64", ".bf16", ".bf16x2"})
 _FP_KINDS = frozenset({"add", "sub", "mul", "div", "min", "max"})
+# The f16-in-a-32-bit-reg within-warp butterfly wraps its `shfl.bfly.b32` in a `cvt.u32.u16` (widen the
+# 16-bit fp payload so a `.b32` shuffle can move it) + a `cvt.u16.u32` (narrow it back). Both are pure
+# bit-repacks of the SAME 16-bit payload, so the forward walk carries the register value THROUGH them
+# (see `_transfer`) to keep the `_Shuffle` butterfly marker alive for the downstream `add.f16`.
+_U16_U32_REPACK = frozenset({".u16", ".u32"})
+# A packed op decomposes into independent per-lane SCALAR ops (`.f32x2` = two `.f32`, bit-identical),
+# so a decomposed lane node carries the SCALAR width. Keeping the packed width on a lane node would
+# make its reduce-op token (`add.f32x2`) differ from the surrounding scalar `.f32` combines and break
+# the balanced-reduction collapse's op-consistency across the packed boundary -> num_warps over-split.
+_PACKED_TO_SCALAR = {".f32x2": ".f32", ".f16x2": ".f16", ".bf16x2": ".bf16"}
+
+
+def _scalar_mods(mods):
+    return tuple(_PACKED_TO_SCALAR.get(m, m) for m in mods)
 # Packed 2-wide f32 (two f32 lanes in one 64-bit register, assembled/split by `mov.b64`). On
 # sm_90+/sm_100 the compiler folds an f32 reduction into `.f32x2` ops, burying the per-lane shfl
 # butterflies inside `mov.b64`/`add.f32x2` — idiom 2 decomposes these back to per-lane scalar trees.
@@ -47,11 +63,24 @@ _PACKED_WIDTH = ".f32x2"
 
 
 def _is_fp(inst):
-    return bool(inst.modifiers) and inst.modifiers[-1] in _FP_WIDTHS
+    return bool(inst.modifiers) and any(m in _FP_WIDTHS for m in inst.modifiers)
 
 
 def _is_packed(inst):
-    return bool(inst.modifiers) and inst.modifiers[-1] == _PACKED_WIDTH
+    return bool(inst.modifiers) and any(m == _PACKED_WIDTH for m in inst.modifiers)
+
+
+def _redux_minmax_kind(mods):
+    """``min``/``max`` iff ``mods`` are an fp min/max ``redux.sync`` (a hardware warp-reduce), else
+    ``None``. Only fp min/max is order-invariant and thus safe to model as a cross-lane reduce;
+    ``redux.add`` (hardware-ordered) and integer redux (index math) return None -> opaque/fail closed."""
+    if not any(m in _FP_WIDTHS for m in mods):
+        return None
+    if ".max" in mods:
+        return "max"
+    if ".min" in mods:
+        return "min"
+    return None
 
 
 def _offset(operand):
@@ -95,17 +124,38 @@ class ForwardInterp:
     def __init__(self, func):
         self.flat = linearize(func)
         self.du = DefUse(func)  # reused for leaf addresses + not-produced-in-body operand fallback
+        self._out_reach = self._compute_output_reach()  # regs that transitively feed an st.global VALUE
         ntid = reqntid_of(func)
         self.ev = AffineEval(self.du, ntid)
         self.colev = AffineEval(self.du, ntid, absorb_opaque=True)
         self.regs = {}  # reg name -> value-DAG Node (or a transient _Shuffle marker)
-        # Forward shared-memory model: (stream_index, stored_value_node) for each scalar shared store,
-        # in program order. A shared load resolves to the most-recent prior store's value subtree
-        # (the single-reduction canonical cross-warp exchange), wrapped in a SmemExchange. Because we
-        # walk FORWARD, the store's value is already in the register state when the load reads it —
-        # the cross-warp fan-in is captured by construction, not inverted/guessed as in the backward
-        # resolver. (Vector shared stores + address-matched multi-buffer resolution are Phase 2b.)
+        # Forward shared-memory model (PHASE + address match). Each st.shared element is recorded into
+        # the current write phase as (slot image, value node); `bar.sync` closes the phase. A shared
+        # load / ldmatrix resolves against the most-recently CLOSED phase in two layers:
+        #
+        #   1. ADDRESS-MATCHED. Both the load and the stores are evaluated to an affine over the
+        #      `%tid` bit basis — which IS the (warp, lane) decomposition: `%tid.x` bits [0,5) index
+        #      the lane, bits [5,..) the warp. A warp-leader store's slot is then a function of the
+        #      WARP bits and the reading warp's load slot a function of the LANE bits, and composing
+        #      the two images gives the real slot <-> warp map. The load takes the value of the
+        #      store(s) whose slot image it actually intersects, and those must share one coord-free
+        #      structure. A load whose slot NO store in the phase wrote is unmodeled -> FAIL CLOSED.
+        #   2. Otherwise (an address that is not provably affine) the old address-agnostic fallback:
+        #      if EVERY write in the phase has the same coord-free structure, return one. If not even
+        #      that holds, FAIL CLOSED.
+        #
+        # Sound because the reader's element is interchangeable with any write of the same structure
+        # (same reduction sub-tree, config-invariant column set), so the following combine reduces the
+        # real cross-warp fan-in and `collapse_balanced` makes a BALANCED exchange num_warps-invariant
+        # (the recovery); an UNORDERED partial keeps its num_warps-bearing physical height (split,
+        # correct). Layer 1 additionally fails closed on a load whose slot NO store in the phase wrote
+        # (a stale / unrelated shared buffer), which layer 2 alone would silently answer with an
+        # unrelated subtree. `smem_stores` keeps every (index, node) for the MMA-epilogue sink scan in
+        # `_mma_entry_descriptor`.
         self.smem_stores = []
+        self._smem_phase = []  # (slot image | None, value node) written since the last bar
+        self._smem_closed = []  # the most-recently closed phase (what a load reads)
+        self._cf_hash_memo = {}  # id(node) -> coord-free Merkle hash, for the `_resolve_smem` check
         # Sound floor: set False when the walk hits a cross-thread structure this phase does not
         # model faithfully (a cross-warp shared load). The reconstructed tree is then untrustworthy
         # for the verbatim hash (it would over-merge across num_warps), so forward_descriptor falls
@@ -196,20 +246,14 @@ class ForwardInterp:
                     if isinstance(e, RegisterOperand):
                         roots.extend(self._root_nodes(e, at))  # a _Packed store -> one root per lane
                 continue
+            if op == "bar":
+                # Phase boundary: the writes since the previous bar become the phase a following load
+                # reads. Any barrier separates a shared write phase from the read phase after it.
+                self._smem_closed = self._smem_phase
+                self._smem_phase = []
+                continue
             if op == "st" and ".shared" in mods and len(inst.operands) >= 2:
-                val = inst.operands[1]  # scalar shared store: record its value for later loads
-                if isinstance(val, RegisterOperand):
-                    self.smem_stores.append((at, self._node(val, at)))
-                else:
-                    # A VECTOR st.shared writes a packed multi-element slot this phase does not model.
-                    # Skipping it silently is UNSOUND: a later scalar ld.shared would then resolve to a
-                    # STALE earlier store while faithful stays True (the tree is wrong but TRUSTED, so
-                    # two bit-different configs can collapse to one descriptor -> OVER-MERGE). Fail
-                    # closed instead. (The DCR / reviewer soundness concern on D112727538. The remaining
-                    # address-agnostic multi-buffer case among all-scalar stores -- resolving a scalar
-                    # load to a DIFFERENT scalar buffer -- needs address-matched resolution and is a
-                    # follow-up, bundled with the multi-output cross-warp recovery.)
-                    self.faithful = False
+                self._record_shared_store(inst, at)
                 continue
             if op == "mov" and ".b64" in mods and len(inst.operands) == 2 and self._b64_mov(inst, at):
                 continue  # mov.b64 pack ({lo,hi}->rd) / unpack (rd->{lo,hi}) handled in place
@@ -244,36 +288,94 @@ class ForwardInterp:
             # Over-identifying an MMA output only ever ADDS a splitting term (sound, monotone).
             return Mma("mma-out")
         if op == "ld" and ".shared" in mods:
-            src = self._match_smem(at)
+            src = self._resolve_smem(self._load_slot_image(inst, at))
             if src is not None:
                 return SmemExchange(src)  # cross-warp exchange: read the stored partial's subtree
-            self.faithful = False  # unmatched shared load -> fail closed (opaque fallback below)
+            self.faithful = False  # unresolvable shared load -> fail closed (opaque fallback below)
         elif op == "ldmatrix":
-            self.faithful = False  # ldmatrix hardware-transpose relocation -> Phase 2b
+            # ldmatrix is a hardware-TRANSPOSED shared read: it relocates stored values across lanes.
+            # Model it like ld.shared -> return a phase partial. The transpose only permutes which
+            # element each lane receives; the reduction structure (hence the collapsed, num_warps-
+            # invariant descriptor) is identical whichever it reads, so returning one is faithful.
+            src = self._resolve_smem(self._load_slot_image(inst, at))
+            if src is not None:
+                return SmemExchange(src)
+            self.faithful = False  # unresolvable ldmatrix -> fail closed
         if op == "shfl" and ".bfly" in mods and len(inst.operands) >= 3:
             # preserve a _Packed source (a b64 shfl shuffles BOTH lanes); _deref only unnests _Shuffle
             return _Shuffle(self._deref(self._val(inst.operands[1], at)), _offset(inst.operands[2]))
+        if op == "redux" and ".sync" in mods and len(inst.operands) >= 2:
+            kind = _redux_minmax_kind(mods)
+            if kind is not None:
+                # Hardware warp-reduce: `redux.sync.{min,max}.f32 d, a, mask` reduces `a` across the
+                # whole warp in ONE instruction. min/max are order-invariant, so this is bit-identical
+                # to the shfl-butterfly form the compiler emits at other configs (col_max uses redux at
+                # num_warps=32, shfl butterflies below), so model it as a cross-lane min/max reduce and
+                # the extent-free min/max collapse merges them. Keep ONLY the fp-width modifier (drop
+                # `.sync`/`.max` — the kind rides in `kind`) so the reduce-op token is `max.f32`,
+                # MATCHING the butterfly's, else the region has two op tokens and will not collapse.
+                # Only fp min/max: redux.add's hardware reduction order need not match the butterfly's,
+                # and integer redux is index math, not a value reduction -> both fall through to the
+                # opaque fallback (fail closed, sound).
+                width = tuple(m for m in mods if m in _FP_WIDTHS)
+                return ShflCombine("redux", kind, width, self._node(inst.operands[1], at))
         if op == "mov" and len(inst.operands) == 2 and isinstance(inst.operands[1], RegisterOperand):
             return self._val(inst.operands[1], at)  # pass-through (preserves a _Shuffle / _Packed)
+        if op == "mov" and len(inst.operands) == 2 and isinstance(inst.operands[1], ImmediateOperand):
+            # `mov.b32 %r, 0f3FB8AA3B` IS the constant. Whether ptxas materializes a literal in a
+            # register or feeds it straight to the consumer is a register-allocation choice that
+            # varies with num_warps, so keeping the two forms apart (an `OpaqueOp` carrying the `mov`
+            # token vs the consumer's plain immediate `OpaqueLeaf`) split configs whose arithmetic is
+            # identical (softmax's log2(e) factor). `_val` produces exactly the node an inline
+            # immediate produces, so the two spellings now converge. Value-preserving: a `mov` of an
+            # immediate is the identity on that immediate.
+            return self._val(inst.operands[1], at)
         if _is_packed(inst) and op in _FP_KINDS and len(inst.operands) == 3:
             return self._packed_combine(op, mods, inst.operands[1], inst.operands[2], at)
         if _is_packed(inst) and op == "fma" and len(inst.operands) == 4:
             return self._packed_fma(mods, inst.operands[1:], at)
         if op == "fma" and _is_fp(inst) and len(inst.operands) == 4:
             return FpOp("fma", mods, tuple(self._node(o, at) for o in inst.operands[1:]), fused=True)
+        if op in ("min", "max") and _is_fp(inst) and len(inst.operands) >= 4:
+            return self._nary_minmax(op, mods, inst, at)
         if op in _FP_KINDS and _is_fp(inst) and len(inst.operands) == 3:
             acc = self._acc.get(id(inst))
             if acc is not None and op == "add":
                 return self._loop_reduce(inst, acc, at)  # loop-carried add-accumulation -> fold summary
             return self._combine(inst, at)
+        if op == "cvt" and len(inst.operands) == 2 and set(mods) == _U16_U32_REPACK:
+            # f16 within-warp butterfly:  cvt.u32.u16 (widen) -> shfl.bfly.b32 -> cvt.u16.u32 (narrow)
+            # -> add.f16.  The 16-bit fp payload rides in a 32-bit register only so the `.b32` shuffle
+            # can move it; both cvts are pure bit-repacks of that SAME payload (widen zero-extends the
+            # irrelevant high 16 bits, narrow truncates them back off), i.e. identity on the fp value.
+            # So carry the register value THROUGH the cvt (keeping any `_Shuffle` marker) instead of
+            # burying it in an OpaqueOp: the following `add.f16` then still sees `add(p, shfl.bfly(p,
+            # off))` and rebuilds a `ShflCombine` WITH its offset. Without this the marker is stripped
+            # at the narrow cvt (the OpaqueOp branch below), so inner_tree (count-up) and unordered
+            # (count-down) f16 reductions both reconstruct as the SAME offset-free `add.f16` fold and
+            # OVER-MERGE across the order. bf16/f32 reduce in f32 (shuffle the value directly, no u16
+            # repack) so they are unaffected.
+            v = self._val(inst.operands[1], at)
+            if mods[0] == ".u32":
+                return v  # widen (u16->u32, zero-extend): payload-preserving -> pass value/marker through
+            if isinstance(v, _Shuffle):
+                return v  # narrow (u32->u16) of a shuffled payload: pass the butterfly marker through
+            # A narrow cvt whose source is NOT a shuffled payload could drop meaningful high bits (not
+            # provably value-preserving) -> leave it opaque / fail-closed below (sound, never over-merge).
         # Any other unmodeled op (an f64 half-assembly `or.b64`, a `cvt`, ...): keep it as an
         # OpaqueOp NODE with its register operands as children + non-register operands in the token,
         # EXACTLY like the backward else-branch, so the value-DAG matches. A pure integer/address op
         # is stored too but never pulled into a value tree (value ops read value operands; addresses
         # go through the affine domain), so this is harmless and lazy at the descriptor level. If an
         # operand still carries a transient marker HERE it is genuinely unmodeled (the packed
-        # reductions were reconstructed above) -> fail closed (see `_consumes_marker`).
-        if any(self._consumes_marker(o, at) for o in inst.operands[1:]):
+        # reductions were reconstructed above) -> fail closed (see `_consumes_marker`) — BUT only when
+        # this op's result actually FEEDS an output store. A marker consumed by a DEAD / address / mask
+        # op (register reuse — e.g. an integer `min.u32` reading a b32 register that once held a shfl
+        # partner) never enters an output tree, so stripping its marker cannot change the reconstructed
+        # result; tripping faithful there is a false alarm that needlessly buries a recoverable
+        # reduction (measured: it blocked dot / col_dot inner_tree from collapsing). Gate on
+        # `_feeds_output` so only a genuine output-reaching dependency loss fails closed (sound).
+        if self._feeds_output(inst) and any(self._consumes_marker(o, at) for o in inst.operands[1:]):
             self.faithful = False
         reg_ops = [o for o in inst.operands[1:] if isinstance(o, RegisterOperand)]
         others = [o for o in inst.operands[1:] if not isinstance(o, RegisterOperand)]
@@ -281,6 +383,48 @@ class ForwardInterp:
         if others:
             tok += "{" + ",".join(canon(self.ev.of_operand(o, at)) for o in others) + "}"
         return OpaqueOp(tok, tuple(self._node(o, at) for o in reg_ops))
+
+    def _nary_minmax(self, op, mods, inst, at):
+        """PTX n-ary min/max (`max.f32 d, a, b, c` reduces 3+ inputs in one instruction) -> a left-chain
+        of binary combines. min/max are associative + commutative, so any binary shape is bit-identical;
+        the sources are plain registers (no butterfly). Without this an n-ary max fell to an OpaqueOp,
+        so the whole max fold stayed opaque and never collapsed (col_max)."""
+        smods = _scalar_mods(mods)
+        node = self._node(inst.operands[1], at)
+        for s in inst.operands[2:]:
+            node = FpOp(op, smods, (node, self._node(s, at)))
+        return node
+
+    def _compute_output_reach(self):
+        """Set of register names that transitively feed an ``st.global`` VALUE operand (the output
+        roots), by backward def-use closure. A conservative OVER-approximation (every def of a name,
+        register reuse included), so a name OUTSIDE it provably reaches no output — used to skip a
+        spurious ``faithful=False`` when a DEAD op consumes a transient marker (see ``_transfer``)."""
+        reach, frontier = set(), []
+        for inst in self.flat:
+            if inst.opcode == "st" and ".global" in inst.modifiers and len(inst.operands) >= 2:
+                val = inst.operands[1]
+                elts = val.elements if isinstance(val, VectorOperand) else [val]
+                frontier += [e.name for e in elts if isinstance(e, RegisterOperand)]
+        while frontier:
+            r = frontier.pop()
+            if r in reach:
+                continue
+            reach.add(r)
+            for d in self.du.defs_by_reg.get(r, ()):  # all defs of r (register reuse -> conservative)
+                for o in (d.inst.operands[1:] if d.inst.operands else ()):
+                    regs = o.elements if isinstance(o, VectorOperand) else (o, )
+                    frontier += [e.name for e in regs if isinstance(e, RegisterOperand)]
+        return reach
+
+    def _feeds_output(self, inst):
+        """True if any register ``inst`` defines transitively feeds an ``st.global`` value (i.e. it is
+        part of an output computation). A False here means the op is dead / address / mask math whose
+        result never reaches an output tree."""
+        for name, _slot in _def_regs(inst):
+            if name in self._out_reach:
+                return True
+        return False
 
     def _consumes_marker(self, operand, at):
         """True if ``operand`` (a register, or a vector of registers) currently holds a transient
@@ -351,7 +495,8 @@ class ForwardInterp:
         if any(x is None for pair in lanes for x in pair):
             self.faithful = False
             return OpaqueOp(op + "".join(mods), (self._node(a, at), self._node(b, at)))
-        return _Packed(self._combine_nodes(op, mods, x, y) for x, y in lanes)
+        smods = _scalar_mods(mods)  # each lane is a scalar op (bit-identical to the packed op)
+        return _Packed(self._combine_nodes(op, smods, x, y) for x, y in lanes)
 
     def _packed_fma(self, mods, operands, at):
         """A `fma.f32x2` -> a `_Packed` of the two per-lane fused fmas. Fail closed if an operand is
@@ -366,7 +511,7 @@ class ForwardInterp:
                 return OpaqueOp("fma" + "".join(mods), tuple(self._node(o, at) for o in operands))
             if any(isinstance(x, _Shuffle) for x in lane):
                 self.faithful = False
-            out.append(FpOp("fma", mods, tuple(self._scalar(x) for x in lane), fused=True))
+            out.append(FpOp("fma", _scalar_mods(mods), tuple(self._scalar(x) for x in lane), fused=True))
         return _Packed(out)
 
     def _b64_mov(self, inst, at):
@@ -399,18 +544,117 @@ class ForwardInterp:
             return [self._deref(l) for l in v.lanes]
         return [self._scalar(v)]
 
-    def _match_smem(self, at):
-        """Value subtree of the most-recent shared store before ``at`` (the single-reduction
-        canonical cross-warp exchange), or ``None`` if there is none. Because the walk is forward,
-        the stored value is already reconstructed — Phase 2b adds address-matched multi-buffer
-        resolution + vector/ldmatrix relocation; this covers the common one-buffer exchange."""
-        node = None
-        for i, n in self.smem_stores:
-            if i < at:
-                node = n
+    def _slot_image(self, operand, at, byte_offsets=(0, )):
+        """``(uniform_key, byte offsets)`` this shared access touches over the thread grid, or
+        ``None`` when the address is not provably affine. ``byte_offsets`` spreads a vector access
+        over its elements (element ``k`` of a ``.vN`` access sits ``k * width`` bytes past the base):
+        a STORE element gets its own slot, a LOAD gets the union of all the slots it reads."""
+        if not isinstance(operand, AddressOperand):
+            return None
+        img = thread_image(self.ev, self.ev.of_address(operand, at))
+        if img is None:
+            return None
+        uniform, offs = img
+        if byte_offsets == (0, ):
+            return uniform, offs
+        return uniform, frozenset(o + b for o in offs for b in byte_offsets)
+
+    def _load_slot_image(self, inst, at):
+        """Slot image of a shared LOAD, covering every element of a ``.vN`` / ``ldmatrix`` read (the
+        forward walk gives all of them one value node, so they must all be matched)."""
+        if len(inst.operands) < 2:
+            return None
+        dst = inst.operands[0]
+        n = len(dst.elements) if isinstance(dst, VectorOperand) else 1
+        width = _load_width(inst.modifiers) or 0
+        return self._slot_image(inst.operands[1], at, tuple(k * width for k in range(n)))
+
+    def _record_shared_store(self, inst, at):
+        """Record each ``st.shared`` element (scalar or VECTOR, one write per f32 slot) into the
+        current write phase + the flat ``smem_stores`` (used by the MMA-epilogue sink scan). Each
+        element carries the SLOT IMAGE of the address it lands at, so a later load can be matched to
+        the stores that actually wrote the slot it reads. A ``_Packed`` element (two f32 lanes in one
+        64-bit register) expands to two value nodes that share one slot image — imprecise but
+        conservative: a load matching that slot then has to find BOTH lanes structurally equal."""
+        val = inst.operands[1]
+        elts = val.elements if isinstance(val, VectorOperand) else [val]
+        width = _load_width(inst.modifiers) or 0
+        for k, e in enumerate(elts):
+            if not isinstance(e, RegisterOperand):
+                continue  # an immediate element (a constant) carries no reduction structure
+            img = self._slot_image(inst.operands[0], at, (k * width, ))
+            for node in self._store_nodes(e, at):
+                self.smem_stores.append((at, node))
+                self._smem_phase.append((img, node))
+
+    def _store_nodes(self, operand, at):
+        """Value node(s) an ``st.shared`` element contributes to the write phase. A ``_Packed`` (a
+        ``.f32x2`` partial held in a 64-bit register) expands to its two per-lane nodes -> two f32
+        slots. A completed scalar node is itself. A still-transient ``_Shuffle`` — an UNCONSUMED
+        butterfly partner being stored (the shuffle result itself, not a reduced partial) — or a
+        ``_Packed`` lane that is a ``_Shuffle`` loses the reduction pairing -> fail closed."""
+        v = self._val(operand, at)
+        if isinstance(v, _Packed):
+            out = []
+            for lane in v.lanes:
+                if isinstance(lane, _Shuffle):
+                    self.faithful = False
+                out.append(self._deref(lane))
+            return out
+        if isinstance(v, _Shuffle):
+            self.faithful = False
+            return [v.child]
+        return [v]
+
+    def _cf_hash(self, node):
+        """Coord-free Merkle hash of a subtree (Leaf coordinates blanked) — the same equivalence the
+        string ``_coordfree_sig`` tests, but as a fixed-size hash that composes over CHILD hashes and
+        is memoized by node id across the whole run. ``_resolve_smem`` uses it to decide whether a
+        shared phase's writes all share one structure in O(new nodes) instead of serializing every
+        candidate's full subtree: the string form INLINES a shared subtree at each reference, so on a
+        deeply shared DAG (welford's unrolled two-pass fold) it is quadratic in the chain length and
+        one entry blew past a 20 GB cap. Only an equality test reads this, never a descriptor."""
+        memo = self._cf_hash_memo
+        if id(node) in memo:
+            return memo[id(node)]
+        stack = [(node, False)]
+        while stack:
+            n, done = stack.pop()
+            if id(n) in memo:
+                continue
+            if not done:
+                stack.append((n, True))
+                for c in n.children:
+                    if id(c) not in memo:
+                        stack.append((c, False))
             else:
-                break
-        return node
+                local = "L[]" if isinstance(n, Leaf) else n.sig_local([memo[id(c)] for c in n.children])
+                memo[id(n)] = hashlib.sha1(local.encode()).hexdigest()[:16]
+        return memo[id(node)]
+
+    def _resolve_smem(self, load_img=None):
+        """Value subtree a shared load / ldmatrix reads, or ``None`` to fail closed. See the
+        shared-memory model note in :meth:`__init__` for the two layers.
+
+        Layer 1 (address-matched) needs the load address AND every store address in the phase to be
+        provably affine — an unresolved store could have written the very slot we read — and takes the
+        value of the stores whose slot image the load actually intersects. Those stores must share one
+        coord-free structure, which is what makes returning any one of them faithful. Layer 2 is the
+        old address-agnostic whole-phase check, kept for an unresolved address. Falls back to the
+        still-open phase only when nothing has been closed yet (a load before any bar)."""
+        cands = self._smem_closed if self._smem_closed else self._smem_phase
+        if not cands:
+            return None
+        if load_img is not None and all(si is not None for si, _ in cands):
+            uniform, offs = load_img
+            hit = [n for si, n in cands if si[0] == uniform and (si[1] & offs)]
+            if hit and len({self._cf_hash(n) for n in hit}) == 1:
+                return hit[-1]
+            if not hit:
+                return None  # reads a slot this phase never wrote -> unmodeled -> fail closed
+        if len({self._cf_hash(n) for _, n in cands}) != 1:
+            return None  # mixed-structure phase -> ambiguous without the address -> fail closed
+        return cands[-1][1]
 
     def fingerprint(self):
         """Conservative per-config key used when the reconstruction is not faithful. Folds the
@@ -422,7 +666,7 @@ class ForwardInterp:
         ntid = ",".join(f"{k}{v}" for k, v in sorted(self.ev.reqntid.items())) or "?"
         shfl, stores, fp, fma = [], {}, 0, 0
         for inst in self.flat:
-            is_fp = inst.modifiers and any(t in inst.modifiers[-1] for t in (".f16", ".f32", ".f64", ".bf16"))
+            is_fp = inst.modifiers and any(t in m for m in inst.modifiers for t in (".f16", ".f32", ".f64", ".bf16"))
             if inst.opcode == "shfl" and ".bfly" in inst.modifiers and len(inst.operands) >= 3:
                 shfl.append(str(_offset(inst.operands[2])))
             elif inst.opcode == "st" and ".shared" in inst.modifiers:
@@ -443,6 +687,59 @@ class ForwardInterp:
                 f"|fp={fp}|fma={fma}|cf={cond},dd{dd}")
 
 
+# Element-type modifiers a global load may carry (the vector-width `.vN` rides separately).
+_LDG_TYPE_MODS = frozenset({".b8", ".b16", ".b32", ".b64", ".b128", ".f16", ".f32", ".f64"})
+
+
+def _reduces_without_leaf(nodes):
+    """True iff the RAW (uncollapsed) output forest reduces over a CROSS-THREAD structure (a
+    ``ShflCombine`` butterfly / ``SmemExchange``) yet reaches NO loaded ``Leaf`` anywhere.
+    ``nodes`` is the forest post-order of the raw roots.
+
+    Such a tree reduces only over a constant SEED + cross-warp shuffles — the reduced input
+    data (the within-thread / chunk fold that feeds the accumulator) was NOT captured by the
+    forward walk. Its collapsed hash is then blind to the chunk grouping: an unrolled
+    loop-carried fold (a chunked / persistent reduction whose loop the compiler fully
+    unrolled, so ``_loop_steps`` finds no back-edge and emits no ``loops=`` fence) over-merges
+    across different chunkings (r0_block), which produce different FP accumulation orders and
+    thus different bits. The RAW roots are checked ON PURPOSE: ``collapse_balanced`` absorbs a
+    recovered reduction's leaves into a leafless ``ITreeReduce``, so the collapsed tree of a
+    NORMAL reduction has no ``Leaf`` either — only the raw tree distinguishes a faithful
+    leaf-bearing reduction from this data-losing one."""
+    has_leaf = has_cross_thread = False
+    for n in nodes:
+        if isinstance(n, Leaf):
+            has_leaf = True
+        elif isinstance(n, (ShflCombine, SmemExchange)):
+            has_cross_thread = True
+    return has_cross_thread and not has_leaf
+
+
+def _global_load_shape(func):
+    """Multiset (canonical string) of ``ld.global`` vector-width x element-type over the entry —
+    a chunk-BEARING residual for the fail-closed floor. A fully-unrolled loop-carried fold's
+    chunk count changes the load vectorization/count (r0_block=512 -> ``.v2.b32``x32 vs
+    r0_block=1024 -> ``.v4.b32``x16), so two chunkings get different keys. Appended ONLY in the
+    fail-closed no-leaf path, so it only ever ADDS splitting (monotone-sound)."""
+    m = {}
+    for inst in linearize(func):
+        if inst.opcode == "ld" and ".global" in inst.modifiers:
+            w = "".join(x for x in inst.modifiers if x.startswith(".v") or x in _LDG_TYPE_MODS)
+            m[w] = m.get(w, 0) + 1
+    return ",".join(f"{k}x{n}" for k, n in sorted(m.items()))
+
+
+# Node budget for the signature stage. Past this many UNIQUE value-DAG nodes the entry takes the
+# conservative fingerprint instead of the collapsed hash. With one memo shared by all the outputs
+# the collapse + hash is linear in this count, so the budget is a backstop against a shape nobody
+# has measured yet, not an active behaviour change: the largest entry that reaches this check
+# across the whole evaluation corpus is 10,793 nodes (18x under), and the largest entry anywhere —
+# a GEMM, which takes the MMA fence path and never gets here — is 72,325 (2.8x under).
+# Fingerprinting is unconditionally sound — it only ever over-splits — so tripping the budget costs
+# recovery, never correctness.
+_MAX_DAG_NODES = 200_000
+
+
 def forward_descriptor(func):
     """Per-entry forward descriptor: the collapsed + Merkle-hashed output trees (reusing the backward
     ``collapse_balanced`` + ``tree_hash`` so it is directly comparable to
@@ -452,6 +749,16 @@ def forward_descriptor(func):
     roots = interp.run()
     if not interp.faithful:
         return (interp.fingerprint(), )
+    nodes = _forest_postorder(roots)  # every unique value-DAG node once, shared by all the outputs
+    if len(nodes) > _MAX_DAG_NODES:
+        return (interp.fingerprint(), )  # see `_MAX_DAG_NODES`
+    if _reduces_without_leaf(nodes):
+        # Faithful walk, but the reduction lost its input leaves (a fully-unrolled loop-carried
+        # fold reduced only over the seed + cross-warp shuffles). The hash cannot see the chunk
+        # grouping -> fail closed with the conservative fingerprint + the global-load shape (a
+        # chunk-bearing residual), so different r0_block chunkings split. Monotone: this only
+        # converts an over-merging hash into a MORE-split fingerprint, never the reverse.
+        return (interp.fingerprint() + "|ldg=" + _global_load_shape(func), )
     if len(roots) == 1:
         return (tree_hash(collapse_balanced(roots[0])), )
     # MULTI-output: num_warps redistributes the entry's rows across threads, so the forward per-thread
@@ -462,11 +769,14 @@ def forward_descriptor(func):
     # reduction keeps its ShflCombine offsets in the key -> stays split (correct). If ANY output is not
     # cleanly reconstructed (opaque leaf / unrecovered coord), fall back to the verbatim trees (sound,
     # over-split). Replaces the old blanket multi-output G3 guard; gated on the fuzzer (0 over-merge).
-    collapsed = [collapse_balanced(r) for r in roots]
-    keys = [output_coordfree_key(t) for t in collapsed]
+    # The three stages share ONE memo across the outputs, so a subtree k outputs have in common is
+    # collapsed / scanned / hashed once instead of k times (the outputs of a prefix scan share almost
+    # everything, which is what made this quadratic).
+    collapsed = collapse_balanced_forest(roots)
+    keys = output_coordfree_keys(collapsed)
     if all(k is not None for k in keys):
         return tuple(sorted({hashlib.sha1(k.encode()).hexdigest()[:16] for k in keys}))
-    return tuple(sorted(tree_hash(t) for t in collapsed))
+    return tuple(sorted(tree_hashes(collapsed)))
 
 
 def _fence_str(fence):
@@ -485,8 +795,9 @@ def _fence_str(fence):
 
 def _epilogue_reduces_mma(sinks):
     """True iff any sink value-DAG REDUCES over the MMA output — a reduce node (a 2-ary add/min/max
-    ``FpOp`` whose BOTH children carry an ``Mma`` leaf, or a ``ShflCombine`` / ``SmemExchange`` over an
-    Mma-bearing subtree). This is the ``tl.sum`` / ``tl.max`` epilogue over ``C = A @ B``
+    ``FpOp`` whose BOTH children carry an ``Mma`` leaf, or a ``ShflCombine`` butterfly over an
+    Mma-bearing subtree; a bare ``SmemExchange`` is a relocation READ, not a reduction, so it does NOT
+    count — see the inline comment). This is the ``tl.sum`` / ``tl.max`` epilogue over ``C = A @ B``
     (gemm_reduce_sum / softmax / layernorm), whether it lowers to a within-thread fold (no shfl), a
     cross-lane butterfly, or a cross-warp shared exchange. It EXCLUDES an elementwise epilogue
     (``relu(acc*alpha + bias)``: the bias add has one non-Mma child, relu's max pairs with a constant)
@@ -496,37 +807,52 @@ def _epilogue_reduces_mma(sinks):
     and the within-thread fold is invisible -> over-merge across unordered / inner_tree).
 
     ``sinks`` is EVERY reachable value-DAG root, not just the ``st.global`` stores: a softmax /
-    layernorm output is the full tile written through ``ldmatrix`` (a transposed read the walk fails
-    closed on, so the ``st.global`` root is an opaque relocation), which buries the ``sum(e)`` reduction
-    mid-computation. Scanning the recorded shared-store values and the live registers too surfaces it.
-    The ``Mma``-bearing walk is memoized across all sinks (shared subtrees walked once)."""
+    layernorm output is the full tile written through ``ldmatrix``, which relocates the reduced values
+    across lanes, so the ``st.global`` root alone can miss the ``sum(e)`` reduction buried
+    mid-computation. Scanning the recorded shared-store values and the live registers too surfaces its
+    ``FpOp``-both-children-``Mma`` combine. ONE forest walk covers every sink, so a subtree many sinks
+    share (the whole accumulator chain, typically) is visited once instead of once per sink."""
     has_mma = {}
-    for root in sinks:
-        for n in _postorder(root):
-            if id(n) in has_mma:
-                continue
-            has_mma[id(n)] = isinstance(n, Mma) or any(has_mma[id(c)] for c in n.children)
-            if isinstance(n, (ShflCombine, SmemExchange)) and has_mma[id(n)]:
-                return True
-            if (isinstance(n, FpOp) and not n.fused and n.kind in ("add", "min", "max")
-                    and len(n.children) == 2 and all(has_mma[id(c)] for c in n.children)):
-                return True
+    for n in _forest_postorder(sinks):
+        has_mma[id(n)] = isinstance(n, Mma) or any(has_mma[id(c)] for c in n.children)
+        # A ShflCombine (butterfly) IS a reduce step, so over an Mma subtree it is a genuine
+        # cross-lane reduction. A bare SmemExchange is NOT — it is a cross-warp / relocation READ
+        # (pure data movement). The GEMM epilogue stages the MMA accumulator through
+        # st.shared -> ldmatrix -> st.global, which now reconstructs as SmemExchange(Mma) but
+        # reduces nothing; counting it here over-split every pure GEMM into the per-config
+        # fingerprint (undoing the tiling-invariant fence). A REAL cross-warp reduction over the
+        # MMA output still fires: its combine is the FpOp(add/min/max)-both-children-Mma below, and
+        # it also carries a within-warp ShflCombine / shfl.bfly. So key on an actual reduce node.
+        if isinstance(n, ShflCombine) and has_mma[id(n)]:
+            return True
+        if (isinstance(n, FpOp) and not n.fused and n.kind in ("add", "min", "max")
+                and len(n.children) == 2 and all(has_mma[id(c)] for c in n.children)):
+            return True
     return False
 
 
 def _mma_entry_descriptor(func, fence):
     """Descriptor for an entry containing MMA (tensor-core) ops, via the tiling-invariant fence.
 
-    A PURE GEMM (MMA, no reduction over the output) is the fence ALONE -> num_warps + BLOCK_M/BLOCK_N
-    are free (recovered), with ``loops=`` kept (BLOCK_K is a real, bit-relevant K split). An MMA + a
-    reduction OVER the MMA output (FA softmax, or gemm_reduce_sum / softmax / layernorm) is FAIL-CLOSED:
-    the fence AND the reduction fingerprint both ride, so configs differing in EITHER the MMA shape OR
-    the reduction order split (sound, never over-merged). The reduction is detected structurally
-    (:func:`_epilogue_reduces_mma`) rather than by ``shfl.bfly`` presence, so a within-thread epilogue
-    fold (no shuffle) — which the shfl-only trigger missed, over-merging unordered vs inner_tree — is
-    now caught. The reduction fingerprint carries num_warps back in that case; the pure GEMM drops it
-    deliberately (num_warps is a free re-tiling of the same dot products)."""
-    from bitequiv.ptx.forward.loops import reduction_trip_signature
+    A PROVEN-PURE tensor-core fold (:func:`bitequiv.ptx.forward.loops.is_pure_mma_fold`: the loop's
+    accumulator is written only by MMA and read by nothing else) in an exactly-accumulating MMA family
+    (:func:`_fence_all_matmul`: f16/bf16/tf32), with no reduction over the output, is the fence ALONE
+    -> num_warps + BLOCK_M/BLOCK_N + BLOCK_K are all free (recovered) and v2 (``mma.sync``) merges with
+    v5 (``tcgen05``): the fence token is form- and tiling-invariant and ``loops=`` (BLOCK_K) is dropped
+    because BLOCK_K then only re-batches the same in-order k-fold (native-k fixed, exact F=25
+    accumulate). fp8 keeps ``loops=`` (imprecise-acc cadence).
+
+    Anything the fold recognizer cannot prove is FAIL-CLOSED on the conservative per-config
+    fingerprint: an MMA + a reduction OVER the output (FA softmax, or gemm_reduce_sum / softmax /
+    layernorm, detected structurally by :func:`_epilogue_reduces_mma` rather than by ``shfl.bfly``
+    presence, so a within-thread epilogue fold is caught too), and equally any tensor-core loop that
+    runs extra fp arithmetic inside the fold (``input_precision=tf32x3``, whose compensation sums are
+    grouped per K chunk, so its BLOCK_K IS bit-relevant). The fingerprint — not ``loops=`` alone — is
+    the fallback ON PURPOSE: a tcgen05 fold increments no pointer, so ``_loop_steps`` is empty there
+    and ``loops=`` would leave the descriptor chunk-blind exactly where the proof failed. The
+    fail-closed side additionally carries ``mmacnt=`` (:func:`bitequiv.ptx.mma.mma_token_counts`), the
+    matmul reduction extent the fence drops on the strength of a proof that did not hold here."""
+    from bitequiv.ptx.forward.loops import is_pure_mma_fold, reduction_trip_signature
     from bitequiv.ptx_reduction import _loop_steps
     parts = [_fence_str(fence)]
     interp = ForwardInterp(func)
@@ -543,10 +869,30 @@ def _mma_entry_descriptor(func, fence):
     sinks += [v for _, v in interp.smem_stores if hasattr(v, "children")]
     sinks += [v for v in interp.regs.values() if hasattr(v, "children")]
     has_shfl = any(inst.opcode == "shfl" and ".bfly" in inst.modifiers for inst in linearize(func))
-    if has_shfl or _epilogue_reduces_mma(sinks):
-        parts.append("mma+red|" + interp.fingerprint())
-    steps = _loop_steps(func)  # BLOCK_K split (+ the tcgen05 / fp8 K carried here, not in the token)
-    if steps:
+    reduces = has_shfl or _epilogue_reduces_mma(sinks)
+    # Positive proof that one loop iteration contributes nothing but MMA products to an accumulator
+    # nothing else touches. Without it we know only that the entry HAS tensor-core ops, which says
+    # nothing about whether re-chunking the fold is bit-free.
+    pure_fold = is_pure_mma_fold(func)
+    if reduces or not pure_fold:
+        # The fence alone does not describe this entry's fp behaviour: something outside the MMAs
+        # (an epilogue / in-fold reduction, or extra in-fold arithmetic) also decides the bits. Fail
+        # closed on the conservative per-config fingerprint, which carries num_warps, the ordered
+        # shuffle sequence and the op counts, so any of those differing splits.
+        parts.append("mma+fp|" + interp.fingerprint())
+        # The fingerprint counts every fp op EXCEPT the tensor-core ones, which the fence drops on
+        # purpose (a re-tiling issues a different MMA count over the same dot products). That licence
+        # comes from the pure-fold proof, which just failed here, so put the count back: it is the one
+        # witness of the matmul's REDUCTION EXTENT (attention's head dim, a GEMM's K), which the rest
+        # of the key cannot see. Fail-closed side only -> a proven-pure fold keeps BLOCK_K and v2==v5.
+        parts.append("mmacnt=" + ",".join(f"{t}x{n}" for t, n in mma_token_counts(func)))
+    steps = _loop_steps(func)
+    # BLOCK_K is bit-neutral only for a PROVEN-pure f16/bf16/tf32 tensor-core fold: native-k is fixed
+    # and each MMA's F=25 accumulate is exact, so BLOCK_K then only re-batches the same in-order
+    # k-fold. Drop loops= there -> recovers BLOCK_K AND lets v2 (mma.sync, emits loops=) match v5
+    # (tcgen05, emits none). Keep loops= for fp8 (the max_num_imprecise_acc cadence can shift with
+    # BLOCK_K), when the entry reduces over the MMA output, and whenever the fold is not proven pure.
+    if steps and (reduces or not pure_fold or not _fence_all_matmul(fence)):
         parts.append("loops=" + ",".join(map(str, steps)))
     sig = reduction_trip_signature(func)
     if sig is not None:

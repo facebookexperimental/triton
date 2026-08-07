@@ -138,9 +138,10 @@ LogicalResult OpTrait::impl::verifyTensorLayouts(Operation *op) {
       return success();
 
     mlir::Attribute layout = rankedTy.getEncoding();
-    if (!layout)
+    if (!layout || triton::encodingContainsTlxNoVerifyLayout(layout))
       return success();
 
+    layout = triton::unwrapTlxWrappers(layout);
     Dialect &dialect = layout.getDialect();
     auto verifyLayoutInterface =
         dyn_cast<mlir::triton::DialectVerifyTensorLayoutInterface>(&dialect);

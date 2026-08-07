@@ -1093,6 +1093,8 @@ class CUDABackend(BaseBackend):
         passes.ttgpuir.add_allocate_warp_groups(pm, "consan" in options.instrumentation_mode)
         passes.convert.add_scf_to_cf(pm)
         passes.gluon.add_inliner(pm)
+        if "consan" in options.instrumentation_mode:
+            passes.ttgpuir.add_prepare_consan_captures(pm, "nvidia")
         nvidia.passes.ttnvgpuir.add_allocate_tensor_memory(pm)
         nvidia.passes.ttgpuir.add_allocate_shared_memory_nv(pm, capability, ptx_version)
         nvidia.passes.ttnvgpuir.add_check_matmul_two_cta(pm)
@@ -1115,17 +1117,18 @@ class CUDABackend(BaseBackend):
         nvidia.passes.hopper.add_tma_store_token_wait_lowering(pm)
         nvidia.passes.ttnvgpuir.add_tmem_barrier_insertion(pm)
         nvidia.passes.ttgpuir.add_to_llvmir(pm, capability, ptx_version, "consan" in options.instrumentation_mode)
+        nvidia.passes.ttnvgpuir.add_initialize_ws_cluster_barriers(pm, capability, ptx_version)
         passes.ttgpuir.add_canonicalize_llvm_ir(pm)
         passes.common.add_cse(pm)
-        # FB/beta divergence: upstream #9535 ("Re-order WS lowering and NVGPU
-        # lowering") is fully reverted for beta. #9535 moved warp-id
+        # Meta Triton divergence: upstream #9535 ("Re-order WS lowering and NVGPU
+        # lowering") is fully reverted for Meta Triton. #9535 moved warp-id
         # relativization out of NVGPUToLLVM into the WS pass and ran WS-to-llvm
-        # before nvgpu-to-llvm. On beta's diverged NVGPU/WS lowering that (a)
+        # before nvgpu-to-llvm. On Meta Triton's diverged NVGPU/WS lowering that (a)
         # crashes ConvertNVGPUToLLVM with "operand #0 does not dominate this use"
         # on every Blackwell warp-specialized/TLX/autows kernel, and (b) leaves
         # the NVGPU WarpIdOp lowering using an absolute (non-relative) tid inside
         # warp-specialize regions, which silently miscompiles warpgroup reductions
-        # (e.g. test_warpgroup_reduction returns 0). Beta keeps the pre-#9535
+        # (e.g. test_warpgroup_reduction returns 0). Meta Triton keeps the pre-#9535
         # behavior: NVGPUToLLVM relativizes the warp-group tid and runs before WS
         # lowering.
         nvidia.passes.ttnvgpuir.add_nvgpu_to_llvm(pm)
@@ -1278,9 +1281,11 @@ class CUDABackend(BaseBackend):
             # Accept more ptxas options if provided
             ptx_extra_options = opt.ptx_options.split(" ") if opt.ptx_options else []
 
-            # Use -Ofc mid to compile ConSan code, if nothing else is specified.
-            if any(mode in knobs.compilation.instrumentation_mode for mode in ["consan", "fpsan"]):
-                ptx_extra_options += ["-Ofc", "mid"]
+            # -Ofc mid miscompiles some large ConSan kernels into invalid global
+            # accesses; -O1 keeps compile time reasonable without that ptxas bug.
+            if (not knobs.nvidia.disable_ptxas_opt
+                    and any(mode in opt.instrumentation_mode for mode in ["consan", "fpsan"])):
+                ptx_extra_options += ["--opt-level", "1"]
 
             # Add --regAllocOptLevel=2 to work around ptxas 13.x bug
             reg_alloc = ["--regAllocOptLevel=2"]

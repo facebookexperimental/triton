@@ -20,6 +20,18 @@ from triton.runtime.driver import driver
 _bridge_registered = False
 
 
+class _ProfileAllocator:
+    """Provide the C dispatcher with the Python launcher's profile-scratch fallback."""
+
+    def get(self):
+        if _allocation.has_profile_allocator():
+            return _allocation._profile_allocator.get()
+        return driver.active.allocate_default_profile_scratch
+
+
+_profile_allocator = _ProfileAllocator()
+
+
 def _load_module():
     """Return the cuda_utils module (contains _TritonDispatcher type)."""
     global _bridge_registered
@@ -233,7 +245,7 @@ def make_triton_dispatcher(schema, cu_function: int):
         profile_scratch_size=schema.get("profile_scratch_size", 0),
         profile_scratch_align=schema.get("profile_scratch_align", 1),
         allocator=_allocation._allocator,
-        profile_allocator=_allocation._profile_allocator,
+        profile_allocator=_profile_allocator,
         tma_meta=tma_meta_list,
         cluster_dim_x=int(cluster_dims[0]) if len(cluster_dims) > 0 else 1,
         cluster_dim_y=int(cluster_dims[1]) if len(cluster_dims) > 1 else 1,

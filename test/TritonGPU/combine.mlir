@@ -10,6 +10,10 @@
 #layout5 = #ttg.blocked<{sizePerThread = [1, 2], threadsPerWarp = [32, 1], warpsPerCTA = [2, 2], order = [0, 1]}>
 #linear = #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [0, 32]], warp = [[16, 0], [32, 0]], block = []}>
 
+#fp4_blocked_src = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
+#fp4_blocked_dst = #ttg.blocked<{sizePerThread = [2, 1], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
+#fp4_dst = #ttg.linear<{register = [[32, 0], [1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], lane = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16]], warp = [[0, 32], [0, 64]], block = []}>
+
 
 module attributes {"ttg.num-warps" = 4 : i32, "ttg.num-ctas" = 1 : i32} {
 
@@ -90,6 +94,16 @@ tt.func @fp4_keep_convert() -> tensor<64x64xf16, #linear> {
   // CHECK: ttg.fp4_to_fp
   // CHECK-NOT: ttg.convert_layout
   tt.return %converted : tensor<64x64xf16, #linear>
+}
+
+// CHECK-LABEL: fp4_no_backward_inference
+tt.func @fp4_no_backward_inference() -> tensor<64x128xbf16, #fp4_dst> {
+  %arg0 = arith.constant dense<0> : tensor<32x128xi8, #fp4_blocked_src>
+  %0 = ttg.fp4_to_fp %arg0 {axis = 0 : i32} : tensor<32x128xi8, #fp4_blocked_src> -> tensor<64x128xbf16, #fp4_blocked_dst>
+  %1 = ttg.convert_layout %0 : tensor<64x128xbf16, #fp4_blocked_dst> -> tensor<64x128xbf16, #fp4_dst>
+  // CHECK: ttg.fp4_to_fp
+  // CHECK: ttg.convert_layout
+  tt.return %1 : tensor<64x128xbf16, #fp4_dst>
 }
 
 // Hoist the convert on top of ext to make it cheaper.
@@ -4563,6 +4577,37 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
       "use"(%7) : (tensor<8x8xf32, #blocked1>) -> ()
       "other_use"(%arg3) : (tensor<8x8xf32, #blocked>) -> ()
       scf.yield %arg3 : tensor<8x8xf32, #blocked>
+    }
+    tt.return
+  }
+}
+
+// -----
+
+// CHECK-LABEL: @remat_for_iter_arg_stale_mapping
+// CHECK-NOT: ttg.convert_layout
+// CHECK: scf.for
+// CHECK: tt.store
+// CHECK: tt.store
+// CHECK-NOT: ttg.convert_layout
+// CHECK: tt.return
+#blocked = #ttg.blocked<{sizePerThread = [1, 2], threadsPerWarp = [1, 32], warpsPerCTA = [4, 1], order = [1, 0]}>
+#blocked1 = #ttg.blocked<{sizePerThread = [2, 1], threadsPerWarp = [32, 1], warpsPerCTA = [1, 4], order = [0, 1]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @remat_for_iter_arg_stale_mapping(%ptr: !tt.ptr<f32>, %upper: i32) {
+    %zero = arith.constant 0 : i32
+    %one = arith.constant 1 : i32
+    %init = arith.constant dense<1.0> : tensor<8x8xf32, #blocked>
+    %ptrs = tt.splat %ptr : !tt.ptr<f32> -> tensor<8x8x!tt.ptr<f32>, #blocked1>
+    %source = tt.load %ptrs : tensor<8x8x!tt.ptr<f32>, #blocked1>
+    %prior_ptrs = tt.splat %ptr : !tt.ptr<f32> -> tensor<8x8x!tt.ptr<f32>, #blocked>
+    %loop = scf.for %iv = %zero to %upper step %one iter_args(%iter = %init) -> (tensor<8x8xf32, #blocked>) : i32 {
+      %early = ttg.convert_layout %iter : tensor<8x8xf32, #blocked> -> tensor<8x8xf32, #blocked1>
+      tt.store %ptrs, %early : tensor<8x8x!tt.ptr<f32>, #blocked1>
+      %prior = ttg.convert_layout %source : tensor<8x8xf32, #blocked1> -> tensor<8x8xf32, #blocked>
+      tt.store %prior_ptrs, %prior : tensor<8x8x!tt.ptr<f32>, #blocked>
+      %late = ttg.convert_layout %source : tensor<8x8xf32, #blocked1> -> tensor<8x8xf32, #blocked>
+      scf.yield %late : tensor<8x8xf32, #blocked>
     }
     tt.return
   }

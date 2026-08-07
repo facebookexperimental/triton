@@ -1,6 +1,5 @@
 #include "Dialect/TritonAMDGPU/IR/Dialect.h"
 #include "TritonAMDGPUToLLVM/Passes.h"
-#include "TritonAMDGPUToLLVM/TargetUtils.h"
 #include "TritonAMDGPUTransforms/Passes.h"
 #include "amd/include/hipblas_instance.h"
 #include "amd/include/hipblas_types.h"
@@ -55,17 +54,6 @@ void init_triton_amd_passes_ttgpuir(py::module &&m) {
         [](mlir::PassManager &pm, const std::string &arch, bool ftz) {
           pm.addPass(createConvertBuiltinFuncToLLVMPass(arch, ftz));
         });
-  m.def("insert_instruction_sched_hints", [](mlir::PassManager &pm,
-                                             const std::string &variant) {
-    pm.addPass(createTritonAMDGPUInsertInstructionSchedHintsPass(variant));
-  });
-  m.def("lower_instruction_sched_hints",
-        [](mlir::PassManager &pm, const std::string &arch, int32_t numStages) {
-          pm.addPass(createTritonAMDGPULowerInstructionSchedHintsPass(
-              arch, numStages));
-        });
-  ADD_PASS_WRAPPER_0("add_prepare_consan_captures",
-                     mlir::triton::createPrepareConSanCaptures);
   ADD_PASS_OPTION_WRAPPER_1("add_allocate_shared_memory",
                             mlir::triton::createAllocateAMDGPUSharedMemoryPass,
                             const std::string &);
@@ -109,8 +97,6 @@ void init_triton_amd_passes_ttgpuir(py::module &&m) {
                      mlir::createTritonAMDGPULowerBarrierOps);
   ADD_FUNC_PASS_WRAPPER_0("add_optimize_buffer_op_ptr",
                           mlir::createTritonAMDGPUOptimizeBufferOpPtr);
-  ADD_PASS_WRAPPER_0("add_annotate_buffer_op_split_safety",
-                     mlir::createTritonAMDGPUAnnotateBufferOpSplitSafety);
   ADD_PASS_WRAPPER_0("add_fold_true_cmpi", mlir::createTritonAMDFoldTrueCmpI);
   ADD_PASS_WRAPPER_0("add_fp_sanitizer", mlir::createTritonAMDGPUFpSanitizer);
 

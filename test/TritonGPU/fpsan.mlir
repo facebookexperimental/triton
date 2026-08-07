@@ -25,6 +25,108 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
 
 // -----
 
+#packed = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [1, 0]}>
+#fp4 = #ttg.blocked<{sizePerThread = [1, 2], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [1, 0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: @packed_arith_fpsan_ue8m0_multiple_fp4
+  tt.func public @packed_arith_fpsan_ue8m0_multiple_fp4(
+      %scale: tensor<128x4xf8E8M0FNU, #packed>,
+      %a: tensor<128x2xi8, #fp4>,
+      %b: tensor<128x2xi8, #fp4>,
+      %addend: tensor<128x4xf8E4M3FN, #packed>) -> tensor<128x4xf8E4M3FN, #packed> {
+    // CHECK: arith.muli
+    // CHECK: tti.experimental_fpsan_embed
+    // CHECK: arith.addi
+    // CHECK: arith.muli
+    // CHECK: arith.addi
+    // CHECK-NOT: ttng.packed_arith
+    %product = ttng.packed_arith mul %a, %b : (tensor<128x2xi8, #fp4>, tensor<128x2xi8, #fp4>) -> tensor<128x4xf8E4M3FN, #packed>
+    %scaled = ttng.packed_arith add %scale, %product : (tensor<128x4xf8E8M0FNU, #packed>, tensor<128x4xf8E4M3FN, #packed>) -> tensor<128x4xf8E4M3FN, #packed>
+    %result = ttng.packed_arith fma %scale, %a, %scaled : (tensor<128x4xf8E8M0FNU, #packed>, tensor<128x2xi8, #fp4>, tensor<128x4xf8E4M3FN, #packed>) -> tensor<128x4xf8E4M3FN, #packed>
+    tt.return %result : tensor<128x4xf8E4M3FN, #packed>
+  }
+}
+
+// -----
+
+#packed = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [1, 0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: @packed_arith_fpsan_x2
+  tt.func public @packed_arith_fpsan_x2(
+      %f32a: tensor<128x4xf32, #packed>,
+      %f32b: tensor<128x4xf32, #packed>,
+      %f32c: tensor<128x4xf32, #packed>,
+      %f16a: tensor<128x4xf16, #packed>,
+      %f16b: tensor<128x4xf16, #packed>) -> tensor<128x4xf16, #packed> {
+    // CHECK: tti.experimental_fpsan_embed
+    // CHECK: arith.addi
+    // CHECK: arith.subi
+    // CHECK: arith.muli
+    // CHECK: arith.addi
+    // CHECK: arith.extsi
+    // CHECK: arith.minsi
+    // CHECK: arith.maxsi
+    // CHECK-NOT: ttng.packed_arith
+    %add = ttng.packed_arith add %f32a, %f32b : (tensor<128x4xf32, #packed>, tensor<128x4xf32, #packed>) -> tensor<128x4xf32, #packed>
+    %sub = ttng.packed_arith sub %add, %f32b : (tensor<128x4xf32, #packed>, tensor<128x4xf32, #packed>) -> tensor<128x4xf32, #packed>
+    %mul = ttng.packed_arith mul %sub, %f32b : (tensor<128x4xf32, #packed>, tensor<128x4xf32, #packed>) -> tensor<128x4xf32, #packed>
+    %fma = ttng.packed_arith fma %mul, %f32b, %f32c : (tensor<128x4xf32, #packed>, tensor<128x4xf32, #packed>, tensor<128x4xf32, #packed>) -> tensor<128x4xf32, #packed>
+    %up = ttng.packed_arith add %f16a, %fma : (tensor<128x4xf16, #packed>, tensor<128x4xf32, #packed>) -> tensor<128x4xf32, #packed>
+    %down = ttng.packed_arith sub %up, %f32c : (tensor<128x4xf32, #packed>, tensor<128x4xf32, #packed>) -> tensor<128x4xf16, #packed>
+    %min = ttng.packed_arith min %down, %f16b : (tensor<128x4xf16, #packed>, tensor<128x4xf16, #packed>) -> tensor<128x4xf16, #packed>
+    %max = ttng.packed_arith max %min, %f16b : (tensor<128x4xf16, #packed>, tensor<128x4xf16, #packed>) -> tensor<128x4xf16, #packed>
+    tt.return %max : tensor<128x4xf16, #packed>
+  }
+}
+
+// -----
+
+#packed = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [1, 0]}>
+#fp4 = #ttg.blocked<{sizePerThread = [1, 2], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [1, 0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: @packed_arith_fpsan_x4
+  tt.func public @packed_arith_fpsan_x4(
+      %fp4: tensor<128x2xi8, #fp4>,
+      %e4m3: tensor<128x4xf8E4M3FN, #packed>,
+      %e5m2: tensor<128x4xf8E5M2, #packed>) -> tensor<128x4xf8E4M3FN, #packed> {
+    // CHECK: arith.andi
+    // CHECK: arith.shrui
+    // CHECK: tt.join
+    // CHECK: tt.reshape
+    // CHECK: tti.experimental_fpsan_embed
+    // CHECK: arith.addi
+    // CHECK: arith.muli
+    // CHECK: arith.addi
+    // CHECK-NOT: ttng.packed_arith
+    %add = ttng.packed_arith add %fp4, %e4m3 : (tensor<128x2xi8, #fp4>, tensor<128x4xf8E4M3FN, #packed>) -> tensor<128x4xf8E4M3FN, #packed>
+    %mul = ttng.packed_arith mul %e5m2, %fp4 : (tensor<128x4xf8E5M2, #packed>, tensor<128x2xi8, #fp4>) -> tensor<128x4xf8E4M3FN, #packed>
+    %fma = ttng.packed_arith fma %fp4, %e5m2, %add : (tensor<128x2xi8, #fp4>, tensor<128x4xf8E5M2, #packed>, tensor<128x4xf8E4M3FN, #packed>) -> tensor<128x4xf8E4M3FN, #packed>
+    %out = ttng.packed_arith add %mul, %fma : (tensor<128x4xf8E4M3FN, #packed>, tensor<128x4xf8E4M3FN, #packed>) -> tensor<128x4xf8E4M3FN, #packed>
+    tt.return %out : tensor<128x4xf8E4M3FN, #packed>
+  }
+}
+
+// -----
+
+#result = #ttg.blocked<{sizePerThread = [4, 2], threadsPerWarp = [1, 32], warpsPerCTA = [1, 4], order = [0, 1]}>
+#fp4 = #ttg.blocked<{sizePerThread = [2, 2], threadsPerWarp = [1, 32], warpsPerCTA = [1, 4], order = [0, 1]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: @packed_arith_fpsan_fp4_axis0
+  tt.func public @packed_arith_fpsan_fp4_axis0(
+      %fp4: tensor<2x256xi8, #fp4>,
+      %f8: tensor<4x256xf8E4M3FN, #result>) -> tensor<4x256xf8E4M3FN, #result> {
+    // CHECK: tt.join
+    // CHECK: tt.trans
+    // CHECK: tt.reshape
+    // CHECK: arith.addi
+    // CHECK-NOT: ttng.packed_arith
+    %out = ttng.packed_arith add %fp4, %f8 : (tensor<2x256xi8, #fp4>, tensor<4x256xf8E4M3FN, #result>) -> tensor<4x256xf8E4M3FN, #result>
+    tt.return %out : tensor<4x256xf8E4M3FN, #result>
+  }
+}
+
+// -----
+
 #blocked = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [1, 0]}>
 #dot_operand_a = #ttg.dot_op<{opIdx = 0, parent = #blocked}>
 #dot_operand_b = #ttg.dot_op<{opIdx = 1, parent = #blocked}>
@@ -32,10 +134,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
   // CHECK-LABEL: @dot_i8_decomposition
   tt.func public @dot_i8_decomposition() -> tensor<32x32xf32, #blocked> {
     // CHECK: scf.for
-    // CHECK: tti.dot_i8 {{.*}} aSigned = true, bSigned = true
-    // CHECK: tti.dot_i8 {{.*}} aSigned = false, bSigned = true
-    // CHECK: tti.dot_i8 {{.*}} aSigned = true, bSigned = false
-    // CHECK: tti.dot_i8 {{.*}} aSigned = false, bSigned = false
+    // CHECK-COUNT-8: tti.dot_i8
     // CHECK-NOT: tti.dot_i8
     %one = arith.constant 1.000000e+00 : f16
     %zero = arith.constant dense<0.000000e+00> : tensor<32x32xf32, #blocked>
@@ -48,15 +147,113 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
 
 // -----
 
+#blocked = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [32, 1], warpsPerCTA = [1, 1], order = [1, 0]}>
+#dot_operand_a = #ttg.dot_op<{opIdx = 0, parent = #blocked}>
+#dot_operand_b = #ttg.dot_op<{opIdx = 1, parent = #blocked}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: @dot_i8_to_i16_decomposition
+  tt.func public @dot_i8_to_i16_decomposition() -> tensor<16x8xf16, #blocked> {
+    // CHECK: tti.dot_i8 {{.*}} aSigned = true, bSigned = true
+    // CHECK-NOT: tti.dot_i8
+    %one = arith.constant 1.000000e+00 : f8E4M3FN
+    %zero = arith.constant dense<0.000000e+00> : tensor<16x8xf16, #blocked>
+    %a = tt.splat %one : f8E4M3FN -> tensor<16x32xf8E4M3FN, #dot_operand_a>
+    %b = tt.splat %one : f8E4M3FN -> tensor<32x8xf8E4M3FN, #dot_operand_b>
+    %out = tt.dot %a, %b, %zero : tensor<16x32xf8E4M3FN, #dot_operand_a> * tensor<32x8xf8E4M3FN, #dot_operand_b> -> tensor<16x8xf16, #blocked>
+    tt.return %out : tensor<16x8xf16, #blocked>
+  }
+
+  // CHECK-LABEL: @dot_i8_to_i32_decomposition
+  tt.func public @dot_i8_to_i32_decomposition() -> tensor<16x8xf32, #blocked> {
+    // CHECK: tti.dot_i8 {{.*}} aSigned = true, bSigned = true
+    // CHECK-NOT: tti.dot_i8
+    %one = arith.constant 1.000000e+00 : f8E4M3FN
+    %zero = arith.constant dense<0.000000e+00> : tensor<16x8xf32, #blocked>
+    %a = tt.splat %one : f8E4M3FN -> tensor<16x32xf8E4M3FN, #dot_operand_a>
+    %b = tt.splat %one : f8E4M3FN -> tensor<32x8xf8E4M3FN, #dot_operand_b>
+    %out = tt.dot %a, %b, %zero : tensor<16x32xf8E4M3FN, #dot_operand_a> * tensor<32x8xf8E4M3FN, #dot_operand_b> -> tensor<16x8xf32, #blocked>
+    tt.return %out : tensor<16x8xf32, #blocked>
+  }
+
+  // CHECK-LABEL: @dot_i16_to_i16_decomposition
+  tt.func public @dot_i16_to_i16_decomposition() -> tensor<16x8xf16, #blocked> {
+    // CHECK: tti.dot_i8 {{.*}} aSigned = false, bSigned = false
+    // CHECK: tti.dot_i8 {{.*}} aSigned = false, bSigned = true
+    // CHECK: tti.dot_i8 {{.*}} aSigned = true, bSigned = false
+    // CHECK-NOT: tti.dot_i8
+    %one = arith.constant 1.000000e+00 : f16
+    %zero = arith.constant dense<0.000000e+00> : tensor<16x8xf16, #blocked>
+    %a = tt.splat %one : f16 -> tensor<16x32xf16, #dot_operand_a>
+    %b = tt.splat %one : f16 -> tensor<32x8xf16, #dot_operand_b>
+    %out = tt.dot %a, %b, %zero : tensor<16x32xf16, #dot_operand_a> * tensor<32x8xf16, #dot_operand_b> -> tensor<16x8xf16, #blocked>
+    tt.return %out : tensor<16x8xf16, #blocked>
+  }
+
+  // CHECK-LABEL: @dot_i16_to_i32_decomposition
+  tt.func public @dot_i16_to_i32_decomposition() -> tensor<16x8xf32, #blocked> {
+    // CHECK: tti.dot_i8 {{.*}} aSigned = false, bSigned = false
+    // CHECK: tti.dot_i8 {{.*}} aSigned = false, bSigned = true
+    // CHECK: tti.dot_i8 {{.*}} aSigned = true, bSigned = false
+    // CHECK: tti.dot_i8 {{.*}} aSigned = true, bSigned = true
+    // CHECK-NOT: tti.dot_i8
+    %one = arith.constant 1.000000e+00 : f16
+    %zero = arith.constant dense<0.000000e+00> : tensor<16x8xf32, #blocked>
+    %a = tt.splat %one : f16 -> tensor<16x32xf16, #dot_operand_a>
+    %b = tt.splat %one : f16 -> tensor<32x8xf16, #dot_operand_b>
+    %out = tt.dot %a, %b, %zero : tensor<16x32xf16, #dot_operand_a> * tensor<32x8xf16, #dot_operand_b> -> tensor<16x8xf32, #blocked>
+    tt.return %out : tensor<16x8xf32, #blocked>
+  }
+
+  // CHECK-LABEL: @dot_i32_to_i32_decomposition
+  tt.func public @dot_i32_to_i32_decomposition() -> tensor<16x8xf32, #blocked> {
+    // CHECK-COUNT-10: tti.dot_i8
+    // CHECK-NOT: tti.dot_i8
+    %one = arith.constant 1.000000e+00 : f32
+    %zero = arith.constant dense<0.000000e+00> : tensor<16x8xf32, #blocked>
+    %a = tt.splat %one : f32 -> tensor<16x32xf32, #dot_operand_a>
+    %b = tt.splat %one : f32 -> tensor<32x8xf32, #dot_operand_b>
+    %out = tt.dot %a, %b, %zero : tensor<16x32xf32, #dot_operand_a> * tensor<32x8xf32, #dot_operand_b> -> tensor<16x8xf32, #blocked>
+    tt.return %out : tensor<16x8xf32, #blocked>
+  }
+
+  // CHECK-LABEL: @dot_i64_to_i64_decomposition
+  tt.func public @dot_i64_to_i64_decomposition() -> tensor<16x8xf64, #blocked> {
+    // CHECK-COUNT-36: tti.dot_i8
+    // CHECK-NOT: tti.dot_i8
+    // CHECK: arith.extsi {{.*}} : tensor<{{.*}}xi32, #{{.*}}> to tensor<{{.*}}xi64, #{{.*}}>
+    // CHECK-NOT: tti.dot_i8
+    %one = arith.constant 1.000000e+00 : f64
+    %zero = arith.constant dense<0.000000e+00> : tensor<16x8xf64, #blocked>
+    %a = tt.splat %one : f64 -> tensor<16x32xf64, #dot_operand_a>
+    %b = tt.splat %one : f64 -> tensor<32x8xf64, #dot_operand_b>
+    %out = tt.dot %a, %b, %zero : tensor<16x32xf64, #dot_operand_a> * tensor<32x8xf64, #dot_operand_b> -> tensor<16x8xf64, #blocked>
+    tt.return %out : tensor<16x8xf64, #blocked>
+  }
+
+  // CHECK-LABEL: @dot_i8_single_warp_tile
+  tt.func public @dot_i8_single_warp_tile() -> tensor<64x64xf32, #blocked> {
+    // CHECK: tensor<32x32x!tt.ptr<i32>
+    %one = arith.constant 1.000000e+00 : f8E4M3FN
+    %zero = arith.constant dense<0.000000e+00> : tensor<64x64xf32, #blocked>
+    %a = tt.splat %one : f8E4M3FN -> tensor<64x32xf8E4M3FN, #dot_operand_a>
+    %b = tt.splat %one : f8E4M3FN -> tensor<32x64xf8E4M3FN, #dot_operand_b>
+    %out = tt.dot %a, %b, %zero : tensor<64x32xf8E4M3FN, #dot_operand_a> * tensor<32x64xf8E4M3FN, #dot_operand_b> -> tensor<64x64xf32, #blocked>
+    tt.return %out : tensor<64x64xf32, #blocked>
+  }
+}
+
+// -----
+
 #blocked = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [1, 0]}>
 #dot_operand_a = #ttg.dot_op<{opIdx = 0, parent = #blocked}>
 #dot_operand_b = #ttg.dot_op<{opIdx = 1, parent = #blocked}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
   // CHECK-LABEL: @dot_f64_i8_decomposition
   tt.func public @dot_f64_i8_decomposition() -> tensor<32x32xf64, #blocked> {
-    // CHECK-COUNT-36: tti.dot_i8
+    // CHECK-COUNT-72: tti.dot_i8
     // CHECK-NOT: tti.dot_i8
     // CHECK: arith.extsi {{.*}} : tensor<{{.*}}xi32, #{{.*}}> to tensor<{{.*}}xi64, #{{.*}}>
+    // CHECK-NOT: tti.dot_i8
     %one = arith.constant 1.000000e+00 : f64
     %zero = arith.constant dense<0.000000e+00> : tensor<32x32xf64, #blocked>
     %a = tt.splat %one : f64 -> tensor<32x32xf64, #dot_operand_a>
@@ -138,10 +335,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
   // CHECK-LABEL: @dot_scaled_i8_decomposition
   tt.func public @dot_scaled_i8_decomposition() -> tensor<32x32xf32, #blocked> {
     // CHECK: scf.for
-    // CHECK: tti.dot_i8 {{.*}} aSigned = true, bSigned = true
-    // CHECK: tti.dot_i8 {{.*}} aSigned = false, bSigned = true
-    // CHECK: tti.dot_i8 {{.*}} aSigned = true, bSigned = false
-    // CHECK: tti.dot_i8 {{.*}} aSigned = false, bSigned = false
+    // CHECK-COUNT-8: tti.dot_i8
     // CHECK-NOT: tti.dot_i8
     // CHECK-NOT: ttg.dot_scaled
     %one = arith.constant 1.000000e+00 : f16
@@ -166,7 +360,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
     // CHECK: tt.store
     // CHECK: ttg.barrier global_read|global_write
     // CHECK: scf.for
-    // CHECK-COUNT-10: tti.dot_i8
+    // CHECK-COUNT-40: tti.dot_i8
     // CHECK-NOT: tti.dot_i8
     // CHECK: ttg.barrier global_read|global_write
     // CHECK: %[[RAW:.*]] = tt.load
@@ -331,18 +525,31 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
   tt.func public @exp_ops(%a: tensor<4xf32>) -> (tensor<4xf32>, tensor<4xf32>) {
     // CHECK-DAG: arith.constant dense<594471359>
     // CHECK-DAG: arith.constant dense<1>
-    // CHECK-DAG: arith.constant dense<0>
-    // CHECK-DAG: arith.constant dense<-1555856531>
     // CHECK: tti.experimental_fpsan_embed
     // CHECK: arith.muli
-    // CHECK: arith.andi
-    // CHECK: arith.cmpi
-    // CHECK: arith.select
+    // CHECK-NOT: scf.for
     // CHECK-NOT: math.exp
     // CHECK-NOT: math.exp2
     %0 = math.exp %a : tensor<4xf32>
     %1 = math.exp2 %a : tensor<4xf32>
     tt.return %0, %1 : tensor<4xf32>, tensor<4xf32>
+  }
+}
+
+// -----
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
+  // CHECK-LABEL: @exp2_all_widths
+  tt.func public @exp2_all_widths(%a8: f8E4M3FN, %a16: f16, %ab16: bf16, %a32: f32, %a64: f64) -> (f8E4M3FN, f16, bf16, f32, f64) {
+    // CHECK-NOT: scf.for
+    // CHECK-NOT: math.exp2
+    %r8 = math.exp2 %a8 : f8E4M3FN
+    %r16 = math.exp2 %a16 : f16
+    %rb16 = math.exp2 %ab16 : bf16
+    %r32 = math.exp2 %a32 : f32
+    %r64 = math.exp2 %a64 : f64
+    // CHECK: tt.return
+    tt.return %r8, %r16, %rb16, %r32, %r64 : f8E4M3FN, f16, bf16, f32, f64
   }
 }
 
@@ -404,8 +611,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
 
 // -----
 
-// CHECK-LABEL: @extern_unary
-tt.func public @extern_unary(%a: tensor<4xf32>) -> tensor<4xf32> {
+// CHECK-LABEL: @extern_unary_fallback
+tt.func public @extern_unary_fallback(%a: tensor<4xf32>) -> tensor<4xf32> {
   // CHECK: tti.experimental_fpsan_embed
   // CHECK: arith.xori
   // CHECK-NOT: tt.extern_elementwise
@@ -415,8 +622,21 @@ tt.func public @extern_unary(%a: tensor<4xf32>) -> tensor<4xf32> {
 
 // -----
 
-// CHECK-LABEL: @extern_binary
-tt.func public @extern_binary(%a: tensor<4xf32>, %b: tensor<4xf32>) -> tensor<4xf32> {
+// CHECK-LABEL: @extern_unary_known
+tt.func public @extern_unary_known(%a: tensor<4xf32>) -> tensor<4xf32> {
+  // CHECK: tti.experimental_fpsan_embed
+  // CHECK: arith.muli
+  // CHECK: arith.xori
+  // CHECK: arith.muli
+  // CHECK-NOT: tt.extern_elementwise
+  %0 = tt.extern_elementwise %a {libname = "", libpath = "", pure = true, symbol = "__nv_logf"} : (tensor<4xf32>) -> tensor<4xf32>
+  tt.return %0 : tensor<4xf32>
+}
+
+// -----
+
+// CHECK-LABEL: @extern_binary_fallback
+tt.func public @extern_binary_fallback(%a: tensor<4xf32>, %b: tensor<4xf32>) -> tensor<4xf32> {
   // CHECK: tti.experimental_fpsan_embed
   // CHECK: arith.addi
   // CHECK: arith.xori
@@ -427,13 +647,41 @@ tt.func public @extern_binary(%a: tensor<4xf32>, %b: tensor<4xf32>) -> tensor<4x
 
 // -----
 
-// CHECK-LABEL: @extern_ternary
-tt.func public @extern_ternary(%a: tensor<4xf32>, %b: tensor<4xf32>, %c: tensor<4xf32>) -> tensor<4xf32> {
+// CHECK-LABEL: @extern_binary_known
+tt.func public @extern_binary_known(%a: tensor<4xf32>, %b: tensor<4xf32>) -> tensor<4xf32> {
+  // CHECK: tti.experimental_fpsan_embed
+  // CHECK-NOT: arith.xori
+  // CHECK: tti.experimental_fpsan_unembed
+  // CHECK-NOT: tt.extern_elementwise
+  %0 = tt.extern_elementwise %a, %b {libname = "", libpath = "", pure = true, symbol = "__nv_fdiv_rn"} : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+  tt.return %0 : tensor<4xf32>
+}
+
+// -----
+
+// CHECK-LABEL: @extern_ternary_known
+tt.func public @extern_ternary_known(%a: tensor<4xf32>, %b: tensor<4xf32>, %c: tensor<4xf32>) -> tensor<4xf32> {
+  // CHECK: %[[A:.*]] = tti.experimental_fpsan_embed
+  // CHECK: %[[B:.*]] = tti.experimental_fpsan_embed
+  // CHECK: %[[C:.*]] = tti.experimental_fpsan_embed
+  // CHECK: %[[MUL:.*]] = arith.muli %[[A]], %[[B]]
+  // CHECK: %[[SUM:.*]] = arith.addi %[[MUL]], %[[C]]
+  // CHECK: tti.experimental_fpsan_unembed %[[SUM]]
+  // CHECK-NOT: arith.xori
+  // CHECK-NOT: tt.extern_elementwise
+  %0 = tt.extern_elementwise %a, %b, %c {libname = "", libpath = "", pure = true, symbol = "__nv_fmaf"} : (tensor<4xf32>, tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+  tt.return %0 : tensor<4xf32>
+}
+
+// -----
+
+// CHECK-LABEL: @extern_ternary_fallback
+tt.func public @extern_ternary_fallback(%a: tensor<4xf32>, %b: tensor<4xf32>, %c: tensor<4xf32>) -> tensor<4xf32> {
   // CHECK: tti.experimental_fpsan_embed
   // CHECK: arith.addi
   // CHECK: arith.xori
   // CHECK-NOT: tt.extern_elementwise
-  %0 = tt.extern_elementwise %a, %b, %c {libname = "", libpath = "", pure = true, symbol = "__nv_fmaf"} : (tensor<4xf32>, tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+  %0 = tt.extern_elementwise %a, %b, %c {libname = "", libpath = "", pure = true, symbol = "__nv_norm3df"} : (tensor<4xf32>, tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
   tt.return %0 : tensor<4xf32>
 }
 

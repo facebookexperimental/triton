@@ -1,5 +1,6 @@
 #include "triton/Tools/LayoutUtils.h"
 #include "triton/Tools/GenericSwizzling.h"
+#include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/MathExtras.h"
 
 namespace mlir::triton {
@@ -34,6 +35,42 @@ bool squareSublayoutIsIdentity(const LinearLayout &ll,
                                ArrayRef<StringAttr> dimNames) {
   return checkSquareSublayout(
       ll, dimNames, [](int b, int32_t basis) { return basis == (1 << b); });
+}
+
+LinearLayout invertAndComposeBlockLocal(const LinearLayout &A,
+                                        const LinearLayout &B) {
+  assert(!B.getInDimNames().empty());
+  auto kBlock =
+      StringAttr::get(B.getInDimNames().begin()->getContext(), "block");
+  assert(A.hasInDim(kBlock) && B.hasInDim(kBlock));
+  assert(A.getInDimSize(kBlock) <= B.getInDimSize(kBlock));
+
+  auto localA = A;
+  if (A.getInDimSize(kBlock) < B.getInDimSize(kBlock)) {
+    auto bases = A.getBases();
+    bases[kBlock].resize(B.getBases().at(kBlock).size(),
+                         std::vector<int32_t>(A.getNumOutDims(), 0));
+    localA = LinearLayout(std::move(bases), A.getOutDims(),
+                          /*requireSurjective=*/false);
+  }
+  auto cvt = B.invertAndCompose(localA);
+
+  // A zero block basis does not affect A's outputs, so force that output
+  // coordinate to equal the corresponding input block bit. This does not
+  // change the composition.
+  auto bases = cvt.getBases();
+  int blockOutIdx = cvt.getOutDimIndex(kBlock);
+  for (auto [i, aBlockBasis] : llvm::enumerate(localA.getBases().at(kBlock))) {
+    if (!llvm::all_of(aBlockBasis, [](int32_t basis) { return basis == 0; }))
+      continue;
+    int blockBit = 1 << i;
+    for (auto &inDimBases : llvm::make_second_range(bases))
+      for (auto &basis : inDimBases)
+        basis[blockOutIdx] &= ~blockBit;
+    bases[kBlock][i][blockOutIdx] |= blockBit;
+  }
+  return LinearLayout(std::move(bases), cvt.getOutDims(),
+                      /*requireSurjective=*/false);
 }
 
 LinearLayout
@@ -86,15 +123,20 @@ ensureLayoutNotLargerThan(const LinearLayout &layout,
     // From the largest basis to the smallest.
     llvm::sort(sortedBases,
                [](auto a, auto b) { return std::get<2>(a) > std::get<2>(b); });
-    for (auto [inDimName, basisIdx, outValue] : sortedBases) {
-      if (span <= shrinkTarget) {
-        break;
-      }
-      if (!broadcastRegisters && inDimName == kRegister) {
-        broadcastedDims.insert(basisIdx);
-      } else {
-        bases[inDimName][basisIdx][outDim.index()] = 0;
-      }
+    for (size_t i = 0; i < sortedBases.size() && span > shrinkTarget;) {
+      int outValue = std::get<2>(sortedBases[i]);
+      do {
+        auto inDimName = std::get<0>(sortedBases[i]);
+        auto basisIdx = std::get<1>(sortedBases[i++]);
+        if (!broadcastRegisters && inDimName == kRegister) {
+          broadcastedDims.insert(basisIdx);
+        } else {
+          bases[inDimName][basisIdx][outDim.index()] = 0;
+        }
+      } while (i < sortedBases.size() &&
+               std::get<2>(sortedBases[i]) == outValue);
+      // Duplicate bases encode the same output bit and shrink the span only
+      // after every copy has been removed.
       span >>= 1;
     }
   }
@@ -317,31 +359,41 @@ ColumnAction actionRemoveBroadcastedRegs(const LinearLayout &layout) {
 }
 std::pair<int64_t, ColumnAction>
 actionAdditiveStrides(const LinearLayout &layout, const LinearLayout addrLayout,
-                      uint64_t maskSpanOffsets) {
+                      uint64_t maskSpanOffsets, int64_t regsPerInst) {
   // General idea:
-  // We wan to swap an xor into an addition when computing the register offsets.
-  // We can do this if the output bits of this register are disjoint from those
-  // from lanes/warps/blocks or any affine offset (i.e., markSpanOffsets).
-
-  // Note this function assumes that if any registers are used in the addrLayout
-  // of the layout (as in ldmatrix/stmatrix) they will be the first non-zero
-  // registers within `layout`
+  // We want to swap an xor into an addition when computing the register
+  // offsets. We can do this if the output bits of this register are disjoint
+  // from those from lanes/warps/blocks or any affine offset (i.e.,
+  // maskSpanOffsets).
+  //
+  // Additionally, the lowering only ever evaluates register offsets at indices
+  // that are multiples of `regsPerInst` (the inner-loop stride, matching one
+  // vectorised instruction). The first `log2(regsPerInst)` register bases are
+  // therefore never selected by any computed index and are trivially additive,
+  // independent of their basis value. We force them into the "additive" group
+  // unconditionally so that the returned `nAdditive` is always at least
+  // `regsPerInst`. In particular, callers do not need to pre-zero those bases
+  // for the invariant to hold.
   assert(layout.getNumInDims() != 0);
+  if (regsPerInst <= 0 || !llvm::isPowerOf2_64(regsPerInst))
+    llvm_unreachable("regsPerInst must be a positive power of two");
   auto kReg = *layout.getInDimNames().begin();
   assert(kReg.str() == "register");
+  const size_t regBasisPerVec = llvm::Log2_64(regsPerInst);
   uint32_t bits = maskSpanOffsets;
-  llvm::SetVector<uint32_t> tileBases;
   auto addrNamedBases = addrLayout.flattenOuts().getBases();
   for (auto bases : llvm::make_second_range(addrNamedBases)) {
     for (auto basis : bases) {
       bits |= basis[0];
-      tileBases.insert(basis[0]);
     }
   }
   SmallVector<size_t> front, back;
   auto layoutNamedBases = layout.flattenOuts().getBases();
+  if (layoutNamedBases.lookup(kReg).size() < regBasisPerVec)
+    llvm_unreachable(
+        "layout must have at least log2(regsPerInst) register bases");
   for (auto [idx, basis] : llvm::enumerate(layoutNamedBases.lookup(kReg))) {
-    if ((basis[0] & bits) == 0 || tileBases.contains(basis[0])) {
+    if (idx < regBasisPerVec || (basis[0] & bits) == 0) {
       front.push_back(idx);
     } else {
       back.push_back(idx);

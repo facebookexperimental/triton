@@ -3,13 +3,13 @@
 
 include "mlir/Pass/PassBase.td"
 
-def AllocateAMDGPUSharedMemory : Pass<"allocate-amdgpu-shared-memory", "mlir::ModuleOp"> {
+def AllocateAMDGPUSharedMemory
+    : Pass<"allocate-amdgpu-shared-memory", "mlir::ModuleOp"> {
   let summary = "Add metadata for shared memory allocation";
   let constructor = "mlir::triton::createAllocateAMDGPUSharedMemoryPass(\"\")";
 
-  let options = [
-      Option<"arch", "arch", "std::string", /*default*/"\"\"",
-             "gfx target device architecture, e.g., gfx942">,
+  let options = [Option<"arch", "arch", "std::string", /*default*/ "\"\"",
+                        "gfx target device architecture, e.g., gfx942">,
   ];
 
   let description = [{
@@ -20,88 +20,63 @@ def AllocateAMDGPUSharedMemory : Pass<"allocate-amdgpu-shared-memory", "mlir::Mo
   }];
 }
 
-def ConvertTritonAMDGPUToLLVM : Pass<"convert-triton-amdgpu-to-llvm", "mlir::ModuleOp"> {
-    let summary = "Convert TritonGPU to LLVM";
-    let constructor = "mlir::triton::createConvertTritonAMDGPUToLLVMPass(\"\", /*ftz=*/true)";
+def ConvertTritonAMDGPUToLLVM
+    : Pass<"convert-triton-amdgpu-to-llvm", "mlir::ModuleOp"> {
+  let summary = "Convert TritonGPU to LLVM";
+  let constructor =
+      "mlir::triton::createConvertTritonAMDGPUToLLVMPass(\"\", /*ftz=*/true)";
 
-    let dependentDialects = ["mlir::arith::ArithDialect",
-                             "mlir::math::MathDialect",
-                             "mlir::gpu::GPUDialect",
-                             "mlir::scf::SCFDialect",
-                             "mlir::LLVM::LLVMDialect",
-                             "mlir::triton::TritonDialect",
-                             "mlir::triton::gpu::TritonGPUDialect",
-                             "mlir::ROCDL::ROCDLDialect"];
+  let dependentDialects = ["mlir::arith::ArithDialect",
+                           "mlir::math::MathDialect", "mlir::gpu::GPUDialect",
+                           "mlir::scf::SCFDialect", "mlir::LLVM::LLVMDialect",
+                           "mlir::triton::TritonDialect",
+                           "mlir::triton::gpu::TritonGPUDialect",
+                           "mlir::ROCDL::ROCDLDialect"];
 
-    let options = [
-        Option<"gfxArch", "gfx-arch", "std::string", /*default*/"std::string{}",
-               "Specify the GFX architecture name, e.g., gfx942, gfx950, etc.">,
-        Option<"ftz", "ftz", "bool", /*default*/"true",
-               "flush denorms for math functions">,
-    ];
+  let options =
+      [Option<"gfxArch", "gfx-arch", "std::string", /*default*/ "std::string{}",
+              "Specify the GFX architecture name, e.g., gfx942, gfx950, etc.">,
+       Option<"ftz", "ftz", "bool", /*default*/ "true",
+              "flush denorms for math functions">,
+  ];
 }
 
-def ConvertBuiltinFuncToLLVM : Pass<"convert-builtin-func-to-llvm", "mlir::ModuleOp"> {
-    let summary = "Convert Builtin Func to LLVM";
-    let constructor = "mlir::triton::createConvertBuiltinFuncToLLVMPass(\"\", /*ftz=*/true)";
+def ConvertBuiltinFuncToLLVM
+    : Pass<"convert-builtin-func-to-llvm", "mlir::ModuleOp"> {
+  let summary = "Convert Builtin Func to LLVM";
+  let constructor =
+      "mlir::triton::createConvertBuiltinFuncToLLVMPass(\"\", /*ftz=*/true)";
 
-    let dependentDialects = ["mlir::LLVM::LLVMDialect"];
+  let dependentDialects = ["mlir::LLVM::LLVMDialect"];
 
-    let options = [
-        Option<"gfxArch", "gfx-arch", "std::string", /*default*/"std::string{}",
-               "Specify the GFX architecture name, e.g., gfx942, gfx950, etc.">,
-        Option<"ftz", "ftz", "bool", /*default*/"true",
-               "flush denorms for math functions">,
-    ];
-}
-
-def TritonAMDGPUInsertInstructionSchedHints : Pass<"triton-amdgpu-insert-instruction-sched-hints", "mlir::ModuleOp"> {
-    let summary = "Insert instruction scheduling hints after the dot ops in the main loop";
-    let constructor = "mlir::triton::createTritonAMDGPUInsertInstructionSchedHintsPass(/*variant=*/\"\")";
-
-    let dependentDialects = ["mlir::LLVM::LLVMDialect",
-                             "mlir::triton::amdgpu::TritonAMDGPUDialect"];
-
-    let options = [
-        Option<"variant", "variant", "std::string", /*default*/"\"none\"",
-               "instruction scheduling variant">,
-    ];
-}
-
-def TritonAMDGPULowerInstructionSchedHints : Pass<"triton-amdgpu-lower-insert-instruction-sched-hints", "mlir::ModuleOp"> {
-    let summary = "Lower instruction scheduling hints to LLVM intrinsics";
-    let constructor = "mlir::triton::createTritonAMDGPULowerInstructionSchedHintsPass(/*gfxArch=*/\"\",/*numStages=*/2)";
-
-    let dependentDialects = ["mlir::LLVM::LLVMDialect",
-                             "mlir::ROCDL::ROCDLDialect",
-                             "mlir::triton::amdgpu::TritonAMDGPUDialect"];
-
-    let options = [
-        Option<"gfxArch", "gfx-arch", "std::string", /*default*/"std::string{}",
-               "Specify the GFX architecture name, e.g., gfx942, gfx950, etc.">,
-        Option<"numStages", "num_stages", "int32_t", /*default*/"2",
-                "number of pipeline stages">,
-    ];
+  let options =
+      [Option<"gfxArch", "gfx-arch", "std::string", /*default*/ "std::string{}",
+              "Specify the GFX architecture name, e.g., gfx942, gfx950, etc.">,
+       Option<"ftz", "ftz", "bool", /*default*/ "true",
+              "flush denorms for math functions">,
+  ];
 }
 
 def ConvertWarpPipeline : Pass<"convert-warp-pipeline", "mlir::ModuleOp"> {
-    let summary = "Emit conditional barrier and inlines scf.execute_region for warp-pipeline";
-    let constructor = "mlir::triton::AMD::createConvertWarpPipelinePass(\"\")";
+  let summary = "Emit conditional barrier and inlines scf.execute_region for "
+                "warp-pipeline";
+  let constructor = "mlir::triton::AMD::createConvertWarpPipelinePass(\"\")";
 
-    let dependentDialects = ["mlir::LLVM::LLVMDialect",
-                             "mlir::gpu::GPUDialect",
-                             "mlir::ROCDL::ROCDLDialect",
-                             "mlir::triton::amdgpu::TritonAMDGPUDialect"];
+  let dependentDialects = ["mlir::LLVM::LLVMDialect", "mlir::gpu::GPUDialect",
+                           "mlir::ROCDL::ROCDLDialect",
+                           "mlir::triton::amdgpu::TritonAMDGPUDialect"];
 
-    let options = [
-        Option<"gfxArch", "gfx-arch", "std::string", /*default*/"std::string{}",
-               "Specify the GFX architecture name, e.g., gfx942, gfx950, etc.">,
-    ];
+  let options =
+      [Option<"gfxArch", "gfx-arch", "std::string", /*default*/ "std::string{}",
+              "Specify the GFX architecture name, e.g., gfx942, gfx950, etc.">,
+  ];
 }
 
-def TritonAMDGPUConvertWarpSpecializeToLLVM : Pass<"triton-amdgpu-convert-warp-specialize-to-llvm", "mlir::ModuleOp"> {
+def TritonAMDGPUConvertWarpSpecializeToLLVM
+    : Pass<"triton-amdgpu-convert-warp-specialize-to-llvm", "mlir::ModuleOp"> {
   let summary = "lower `ttg.warp_specialize` to LLVM";
-  let constructor = "mlir::triton::AMD::createTritonAMDGPUConvertWarpSpecializeToLLVMPass(\"\")";
+  let constructor = "mlir::triton::AMD::"
+                    "createTritonAMDGPUConvertWarpSpecializeToLLVMPass(\"\")";
   let description = [{
     The `triton-amdgpu-convert-warp-specialize-to-llvm` pass performs codegen for warp
     specialization. It is a function-level transformation that rewrites
@@ -109,23 +84,13 @@ def TritonAMDGPUConvertWarpSpecializeToLLVM : Pass<"triton-amdgpu-convert-warp-s
     states between the default warpgroup and the worker warps.
   }];
 
-  let dependentDialects = ["mlir::LLVM::LLVMDialect", "mlir::ROCDL::ROCDLDialect"];
+  let dependentDialects = ["mlir::LLVM::LLVMDialect",
+                           "mlir::ROCDL::ROCDLDialect"];
 
-  let options = [
-    Option<"gfxArch", "gfx-arch", "std::string", /*default*/"std::string{}",
-           "Specify the GFX architecture name, e.g., gfx942, gfx950, etc.">,
+  let options =
+      [Option<"gfxArch", "gfx-arch", "std::string", /*default*/ "std::string{}",
+              "Specify the GFX architecture name, e.g., gfx942, gfx950, etc.">,
   ];
-}
-
-def PrepareConSanCaptures : Pass<"prepare-consan-captures", "mlir::ModuleOp"> {
-  let summary = "Reserve shared memory for ConSan captures in WarpSpecializeOps";
-  let description = [{
-    Scans the module to estimate how many WarpSpecialize captures the
-    ConcurrencySanitizer pass will add, and sets a
-    `consan.extra_capture_bytes` attribute on each WarpSpecializeOp.
-    The AllocateAMDGPUSharedMemory pass reads this attribute to reserve
-    enough LDS for the expanded capture struct.
-  }];
 }
 
 #endif

@@ -49,7 +49,6 @@ void doTaskPartition(triton::FuncOp &funcOp, unsigned numWarpGroups) {
 
   if (loops.empty() || !hasLoad || dots.empty())
     return;
-
   // Step 1. Select loads into the first task, which is the producer task by
   // default. Place dots into the second task, which is the consumer.
   // Only consider loads that are connected to a dot op in a loop.

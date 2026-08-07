@@ -760,8 +760,9 @@ loadDotOperandEnc(triton::LoadOp ld) {
   return nullptr;
 }
 
-static void lowerLoadToStagedCopy(scf::ForOp forOp, triton::LoadOp ld,
-                                  const triton::AMD::TargetInfo &targetInfo) {
+static void
+lowerLoadToStagedCopy(scf::ForOp forOp, triton::LoadOp ld,
+                      const triton::amdgpu::TargetFeatures &targetFeatures) {
   auto ty = dyn_cast<RankedTensorType>(ld.getType());
   if (!ty || ty.getRank() != 2)
     return;
@@ -775,7 +776,7 @@ static void lowerLoadToStagedCopy(scf::ForOp forOp, triton::LoadOp ld,
   triton::gpu::SharedEncodingTrait sharedEnc;
   if (auto dotOpEnc = loadDotOperandEnc(ld)) {
     auto srcTOM = cast<triton::gpu::TensorOrMemDesc>(ld.getType());
-    sharedEnc = composePaddedLayout(targetInfo, dotOpEnc.getOpIdx(),
+    sharedEnc = composePaddedLayout(targetFeatures, dotOpEnc.getOpIdx(),
                                     dotOpEnc.getKWidth(), srcTOM, sharedOrder,
                                     dotOpEnc, /*useAsyncCopy=*/true);
     if (!sharedEnc)
@@ -806,8 +807,7 @@ static void lowerLoadToStagedCopy(scf::ForOp forOp, triton::LoadOp ld,
 // Opt-in (TRITON_AMD_EARLY_LOWER): early-lower every pipelineable global load
 // feeding an MFMA dot, for each inner loop.
 static void runEarlyLowerLoads(ModuleOp module) {
-  auto arch = mlir::getAMDArch(module);
-  triton::AMD::TargetInfo targetInfo(arch ? arch->str() : "");
+  auto targetFeatures = triton::amdgpu::TargetFeatures::fromModuleOp(module);
   SmallVector<scf::ForOp> loops;
   module.walk([&](scf::ForOp f) { loops.push_back(f); });
   for (scf::ForOp forOp : loops) {
@@ -817,7 +817,7 @@ static void runEarlyLowerLoads(ModuleOp module) {
         loads.push_back(ld);
     });
     for (triton::LoadOp ld : loads)
-      lowerLoadToStagedCopy(forOp, ld, targetInfo);
+      lowerLoadToStagedCopy(forOp, ld, targetFeatures);
   }
 }
 

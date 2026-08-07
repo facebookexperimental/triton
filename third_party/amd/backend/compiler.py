@@ -33,8 +33,16 @@ def is_async_copy_enabled(arch):
     return ((arch in ["gfx950", "gfx1250"]) if knobs.amd.use_async_copy is None else knobs.amd.use_async_copy)
 
 
-def is_expert_sched_supported(arch):
+def is_coexec_scheduler_supported(arch):
     return arch in ["gfx1250"]
+
+
+def is_expert_scheduling_enabled(arch):
+    if arch not in ["gfx1250"]:
+        return False
+    if knobs.amd.use_expert_scheduling is None:
+        return True
+    return knobs.amd.use_expert_scheduling
 
 
 def is_fpsan_supported(arch):
@@ -59,6 +67,17 @@ def _parse_llvm_fn_attrs(attrs):
         if name:
             parsed.append((name, value.strip() if sep else ""))
     return tuple(parsed)
+
+
+def _get_codegen_flags(options):
+    flags = []
+    if options.reverse_local_assignment:
+        flags.append("greedy-reverse-local-assignment")
+    if options.sink_insts_to_avoid_spills:
+        flags.append("sink-insts-to-avoid-spills")
+    if options.regclass_priority_trumps_globalness:
+        flags.append("greedy-regclass-priority-trumps-globalness")
+    return flags
 
 
 @dataclass(frozen=True)
@@ -91,30 +110,20 @@ class HIPOptions:
     instrumentation_mode: str = ""
 
     # The following option provides hints to the AMDGPU backend regarding instruction scheduling
-    # for all `tt.dot` operations in a kernel. The "none" variant preserves the default
-    # instruction scheduling of the AMDGPU backend which aims at maximizing occupancy.
-    # The option is experimental and may change at any time regarding its semantics and/or may
-    # be gone entirely anytime.
-    #
-    # Current experimental scheduling variants:
-    #
-    # attention: enables a bunch of optimizations for attention kernels, including:
-    #            - iglp 2 and sched.barrier around it
-    #            - sink-insts-to-avoid-spills flag to avoid register spills
-    # memory-bound-attention: enables custom scheduling strategy in llvm backend,
-    #            This option targets special FA variant, which is memory bound and
-    #            has a lot of elementwise operations from fused operand dequantizations.
-    #            Note that this option is highly experimental,
-    #            and will be removed as soon as default sceduler algorithm is fixed.
-    #
-    # Option allows to set multiple variants divided by commas:
-    # schedule_hint="attention,memory-bound-attention"
-    schedule_hint: str = "none"
+    # for all `tt.dot` operations in a kernel. Experimental; right now no effect.
+    schedule_hint: str = ''
 
     # Experimental: intended for development and debugging; may change or be removed without notice.
     # Comma-separated LLVM function attributes; bare names are emitted as valueless attributes.
     # Example: llvm_fn_attrs="amdgpu-sched-strategy=iterative-ilp,noinline"
     llvm_fn_attrs: str | Tuple[Tuple[str, str], ...] = ""
+
+    # Cache-keyed LLVM register-pressure controls. Keeping these as explicit
+    # backend options lets pressure-sensitive kernels opt in without changing
+    # allocator behavior (or cache identity) for unrelated kernels.
+    reverse_local_assignment: bool = False
+    sink_insts_to_avoid_spills: bool = False
+    regclass_priority_trumps_globalness: bool = False
 
     def __post_init__(self):
         gfx_major = int(self.arch[3:-2])  # Drop "gfx" prefix and minor/patch number
@@ -356,9 +365,6 @@ class HIPBackend(BaseBackend):
         if os.environ.get("TRITON_ENABLE_TTGIR_SCHED"):
             amd.passes.ttgpuir.add_dot_decompose_and_schedule(pm, "")
         passes.common.add_canonicalizer(pm)
-        if options.schedule_hint.lower() != "none":
-            for hint in options.schedule_hint.split(","):
-                amd.passes.ttgpuir.insert_instruction_sched_hints(pm, hint)
         passes.ttgpuir.add_remove_layout_conversions(pm, 0)
         passes.ttgpuir.add_reduce_data_duplication(pm)
         if is_in_thread_transpose_enabled(options.arch):
@@ -450,7 +456,7 @@ class HIPBackend(BaseBackend):
         passes.gluon.add_inliner(pm)
         passes.convert.add_index_to_llvmir(pm)
         if "consan" in options.instrumentation_mode and is_consan_supported(options.arch):
-            amd.passes.ttgpuir.add_prepare_consan_captures(pm)
+            passes.ttgpuir.add_prepare_consan_captures(pm, "amd")
         amd.passes.ttgpuir.add_allocate_shared_memory(pm, options.arch)
         if "consan" in options.instrumentation_mode and is_consan_supported(options.arch):
             passes.ttgpuir.add_concurrency_sanitizer(pm)
@@ -461,10 +467,6 @@ class HIPBackend(BaseBackend):
         if HIPBackend.instrumentation:
             HIPBackend.instrumentation.patch("ttgpuir_to_llvmir", pm, mod.context)
         passes.ttgpuir.add_allocate_global_scratch_memory(pm)
-        if knobs.amd.use_buffer_ops:
-            # CSE matching assume and loop-bound expressions before range analysis.
-            passes.common.add_cse(pm)
-            amd.passes.ttgpuir.add_annotate_buffer_op_split_safety(pm)
         ## __HIP_FTZ is used to control the denorm flushing behavior of exp2 op as follows:
         ## 1. If __HIP_FTZ = 1, exp2 flushes denorms in input and output regardless
         ##    of the value of kernel arg `allow_flush_denorm`.
@@ -484,9 +486,6 @@ class HIPBackend(BaseBackend):
         passes.common.add_cse(pm)
         passes.common.add_symbol_dce(pm)
 
-        if options.schedule_hint.lower() != "none":
-            amd.passes.ttgpuir.lower_instruction_sched_hints(pm, options.arch, options.num_stages)
-
         # This can not be moved below the di_scope pass
         if HIPBackend.instrumentation:
             HIPBackend.instrumentation.patch("llvmir_to_llvm", pm, mod.context)
@@ -495,6 +494,7 @@ class HIPBackend(BaseBackend):
             passes.llvmir.add_di_scope(pm)
 
         amd.passes.ttgpuir.add_builtin_func_to_llvmir(pm, options.arch, __HIP_FTZ)
+        passes.convert.add_reconcile_unrealized_casts(pm)
         pm.run(mod, "make_llir")
 
         if knobs.compilation.dump_ir_extract_di_local_variables:
@@ -550,8 +550,6 @@ class HIPBackend(BaseBackend):
         if total_num_warps is not None:
             total_warps_num = total_num_warps
         kernel_fn.add_fn_attr("amdgpu-flat-work-group-size", f"1,{total_warps_num*options.warp_size}")
-        if "memory-bound-attention" in options.schedule_hint.split(","):
-            kernel_fn.add_fn_attr("amdgpu-sched-strategy", "iterative-ilp")
         kernel_fn.add_fn_attr("uniform-work-group-size", "true")
         # LLVM AMDGPU backend supports the attribute "amdgpu-waves-per-eu"="<min>[, <max>]".
         # This attribute may be attached to a kernel function definition and is an optimization hint.
@@ -563,8 +561,9 @@ class HIPBackend(BaseBackend):
         # Specifying N, N forces LLVM to focus on a single register count, simplifies some heuristics
         # and may improve scheduling.
         kernel_fn.add_fn_attr("amdgpu-waves-per-eu", f"{options.waves_per_eu}, {options.waves_per_eu}")
-        if is_expert_sched_supported(options.arch) and options.num_warps <= 4:
-            fns[0].add_fn_attr("amdgpu-sched-strategy", "coexec")
+        if is_coexec_scheduler_supported(options.arch) and options.num_warps <= 4:
+            kernel_fn.add_fn_attr("amdgpu-sched-strategy", "coexec")
+
         denormal_mode = "preserve-sign" if options.allow_flush_denorm else "ieee"
         kernel_fn.add_fn_attr("denormal-fp-math-f32", denormal_mode)
         if knobs.compilation.enable_asan:
@@ -580,7 +579,7 @@ class HIPBackend(BaseBackend):
         #
         # TODO(tyb0807): Disabled when using MIR swap/dump because the value is
         # not serializable to/from MIR YAML
-        if not (knobs.amd.swap_mir or knobs.amd.dump_mir):
+        if options.arch != "gfx1250" and not (knobs.amd.swap_mir or knobs.amd.dump_mir):
             amd.set_all_fn_arg_inreg(kernel_fn)
 
         if knobs.compilation.enable_asan:
@@ -635,8 +634,8 @@ class HIPBackend(BaseBackend):
         assert len(names) == 1
         metadata["name"] = names[0]
         # llvm -> hsaco
-        flags = []
-        if is_expert_sched_supported(options.arch):
+        flags = _get_codegen_flags(options)
+        if is_expert_scheduling_enabled(options.arch):
             flags.append("amdgpu-expert-scheduling-mode")
         features = disable_real_true16_feature(options.arch)
         ir_hash = hashlib.sha256(src.encode("utf-8")).hexdigest()

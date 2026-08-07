@@ -20,6 +20,8 @@
 
 namespace py = pybind11;
 
+namespace {
+
 void init_triton_analysis(py::module &&m) {
   py::class_<mlir::ModuleAllocation>(m, "allocation", py::module_local())
       .def(py::init<mlir::ModuleOp>());
@@ -102,6 +104,12 @@ void init_triton_passes_ttgpuir(py::module &&m) {
                      createTritonGPUCoalesceAsyncCopy);
   ADD_PASS_WRAPPER_0("add_global_sanitizer",
                      createTritonInstrumentGlobalSanitizer);
+  m.def("add_prepare_consan_captures",
+        [](PassManager &pm, const std::string &target) {
+          TritonInstrumentPrepareConSanCapturesOptions options;
+          options.target = target;
+          pm.addPass(createTritonInstrumentPrepareConSanCaptures(options));
+        });
   ADD_PASS_WRAPPER_0("add_concurrency_sanitizer",
                      createTritonInstrumentConcurrencySanitizer);
   ADD_PASS_WRAPPER_0("add_fp_sanitizer", createTritonInstrumentFpSanitizer);
@@ -134,6 +142,8 @@ void init_triton_passes_convert(py::module &&m) {
   ADD_PASS_WRAPPER_0("add_index_to_llvmir", createConvertIndexToLLVMPass);
   ADD_PASS_WRAPPER_0("add_arith_to_llvmir", createArithToLLVMConversionPass);
   ADD_PASS_WRAPPER_0("add_nvvm_to_llvm", createConvertNVVMToLLVMPass);
+  ADD_PASS_WRAPPER_0("add_reconcile_unrealized_casts",
+                     createReconcileUnrealizedCastsPass);
 }
 
 void init_triton_passes_llvmir(py::module &&m) {
@@ -152,6 +162,8 @@ void init_gluon_passes(py::module &&m) {
   ADD_PASS_WRAPPER_0("add_infer_coalesced_encodings",
                      gluon::createGluonInferCoalescedEncodingsPass);
 }
+
+} // namespace
 
 void init_triton_passes(py::module &&m) {
   init_triton_analysis(m.def_submodule("analysis"));

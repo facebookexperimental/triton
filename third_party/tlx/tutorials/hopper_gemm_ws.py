@@ -141,7 +141,7 @@ def _skinny_matmul_kernel(
         tlx.async_load_commit_group([token_a, token_b])
 
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-    for k in tl.range(0, tl.cdiv(K_LEN, BLOCK_K), num_stages=0):
+    for k in tl.range(0, tl.cdiv(K_LEN, BLOCK_K), num_stages=1):
         buf = k % NUM_STAGES
         a_k = tlx.local_view(buffers_A, buf)
         b_k = tlx.local_view(buffers_B, buf)
@@ -319,7 +319,7 @@ def _skinny_tma_kernel(
         tlx.async_descriptor_load(b_desc, buf_b, [offset_k, offset_bn], bar_b)
 
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-    for k in tl.range(0, num_k_iters, num_stages=0):
+    for k in tl.range(0, num_k_iters, num_stages=1):
         buf = k % NUM_STAGES
         phase = (k // NUM_STAGES) & 1
 

@@ -70,7 +70,8 @@ public:
     return std::nullopt;
   }
 
-  std::optional<WaitOpInfo> getWaitOpInfo(Operation *op) const override {
+  std::optional<WaitOpInfo>
+  getWaitOpInfo(Operation *op, const tti::AuxDataMap &) const override {
     if (auto tmaStoreWaitOp = dyn_cast<ttng::TMAStoreWaitOp>(op))
       return WaitOpInfo{tti::CommitKind::TmaStore,
                         static_cast<int>(tmaStoreWaitOp.getPendings()),
@@ -89,8 +90,6 @@ public:
     };
     if (auto initOp = dyn_cast<ttng::InitBarrierOp>(op))
       mask = getBarrierMask(initOp.getAlloc());
-    if (auto expectOp = dyn_cast<ttng::BarrierExpectOp>(op))
-      mask = getBarrierMask(expectOp.getAlloc());
     if (auto waitOp = dyn_cast<ttng::WaitBarrierOp>(op))
       mask = getBarrierMask(waitOp.getAlloc());
     if (auto invalOp = dyn_cast<ttng::InvalBarrierOp>(op))
@@ -123,20 +122,15 @@ public:
 
   std::optional<MemEffectsOpInfo>
   getMemEffectsOpInfo(Operation *op) const override {
-    auto info = ConSanTargetHooks::getMemEffectsOpInfo(op);
-    if (info)
-      return info;
+    std::optional<MemEffectsOpInfo> info;
     if (auto expectOp = dyn_cast<ttng::BarrierExpectOp>(op)) {
       info.emplace();
       info->trackingKind = MemEffectsOpInfo::TrackingKind::Barrier;
       info->pred = expectOp.getPred();
-      auto barrierTy = expectOp.getAlloc().getType();
-      int txCount = expectOp.getSize() * ttg::lookupNumCTAs(op) /
-                    barrierTy.getNumElements();
-      info->barriers.push_back({expectOp.getBarrier(), nullptr,
-                                /*count=*/1,
-                                MemEffectsOpInfo::BarrierTrackingMode::Frontier,
-                                /*txCount=*/txCount});
+      info->barriers.push_back(
+          {expectOp.getBarrier(), nullptr,
+           /*count=*/1, MemEffectsOpInfo::BarrierTrackingMode::Frontier,
+           /*txCount=*/static_cast<int>(expectOp.getSize())});
     }
     if (auto loadOp = dyn_cast<ttng::TMEMLoadOp>(op)) {
       info.emplace();
@@ -237,6 +231,17 @@ public:
       info->operandEffects.emplace_back(MemEffectsOpInfo::Effects::Write,
                                         copyOp.getResult());
     }
+    if (auto storeOp = dyn_cast<ttng::AsyncSharedStoreOp>(op)) {
+      info.emplace();
+      info->trackingKind = MemEffectsOpInfo::TrackingKind::Barrier;
+      info->barriers.push_back(
+          {storeOp.getBarrier(), nullptr, /*count=*/0,
+           MemEffectsOpInfo::BarrierTrackingMode::EffectWrites,
+           /*txCount=*/
+           -static_cast<int>(tti::getMemDescLength(storeOp.getDst()))});
+      info->operandEffects.emplace_back(MemEffectsOpInfo::Effects::Write,
+                                        storeOp.getDst());
+    }
     if (auto tryCancelOp = dyn_cast<ttng::CLCTryCancelOp>(op)) {
       info.emplace();
       info->trackingKind = MemEffectsOpInfo::TrackingKind::Barrier;
@@ -244,8 +249,7 @@ public:
           {tryCancelOp.getMbarrier(), nullptr, /*count=*/0,
            MemEffectsOpInfo::BarrierTrackingMode::EffectWrites,
            /*txCount=*/
-           -static_cast<int>(tti::getMemDescLength(tryCancelOp.getResult())),
-           /*diagonalEffectRecipientCTAs=*/true});
+           -static_cast<int>(tti::getMemDescLength(tryCancelOp.getResult()))});
       info->operandEffects.emplace_back(MemEffectsOpInfo::Effects::Write,
                                         tryCancelOp.getResult());
     }
@@ -294,10 +298,11 @@ public:
       info->barriers.push_back(
           {arriveOp.getBarrier(), nullptr, (int)arriveOp.getCount()});
     }
-    return info;
+    return info ? info : ConSanTargetHooks::getMemEffectsOpInfo(op);
   }
 
-  SmallVector<CommitKindDesc> getOutstandingReadCommitKinds() const override {
+  SmallVector<CommitKindDesc>
+  getOutstandingReadCommitKinds(const tti::AuxDataMap &) const override {
     return {{tti::CommitKind::Wgmma, "warpgroup_mma operand read"},
             {tti::CommitKind::TmaStore, "async_copy_shared_to_global"}};
   }

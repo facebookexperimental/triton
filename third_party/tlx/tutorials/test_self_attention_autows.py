@@ -29,7 +29,7 @@ Notes:
   are set BEFORE importing the kernel so the constexpr/config pick see them.
 - HSTU_SELF_DP=1: data_partition_factor=2 would need BLOCK_M=256 (each slice
   >=128 TMEM rows) which OOMs TMEM on this kernel, so DP is off here.
-- The TLX self-attn *fwd* uses num_stages=0 and asserts under meta-WS, so it
+- The TLX self-attn *fwd* uses num_stages=1 and asserts under meta-WS, so it
   cannot be compiled in the same (META_WS) process; the accuracy oracle here is
   the torch reference (as in test_cross_attention_bwd_autows.py). The dq-reduce
   config's grads match this torch ref to bf16 precision, i.e. the same numerics

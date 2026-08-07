@@ -583,6 +583,20 @@ def test_tmem_copy_rejects_logical_rank2_scale_smem(device):
 
 
 @pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
+@pytest.mark.parametrize("num_blocks", [1, 2])
+def test_tmem_copy_accepts_packed_rank2_scale_smem(num_blocks, device):
+
+    @triton.jit
+    def kernel(NUM_BLOCKS: tl.constexpr):
+        smem = tlx.local_alloc((32 * NUM_BLOCKS, 16), tl.uint8, tl.constexpr(1))
+        tmem = tlx.local_alloc((128, 16 * NUM_BLOCKS), tl.uint8, tl.constexpr(1), tlx.storage_kind.tmem)
+        tlx.tmem_copy(smem[0], tmem[0])
+
+    compiled = kernel.warmup(num_blocks, grid=(1, ))
+    assert compiled.asm["ttgir"].count("ttng.tmem_copy") == 1
+
+
+@pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
 @pytest.mark.parametrize("BLOCK_SIZE_M, BLOCK_SIZE_N", [(64, 64), (64, 8), (128, 16)])
 def test_tmem_load_store(BLOCK_SIZE_M, BLOCK_SIZE_N, device):
 
