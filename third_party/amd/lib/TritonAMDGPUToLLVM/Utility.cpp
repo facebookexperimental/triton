@@ -1,7 +1,9 @@
 #include "Utility.h"
 #include "AsyncUtility.h"
 #include "Dialect/TritonAMDGPU/IR/Dialect.h"
+#include "Dialect/TritonAMDGPU/IR/TargetFeatures.h"
 #include "TritonAMDGPUToLLVM/GCNAsmFormat.h"
+#include "triton/Tools/Sys/GetEnv.h"
 #include "mlir/Dialect/LLVMIR/LLVMTypes.h"
 #include "mlir/Dialect/LLVMIR/ROCDLDialect.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
@@ -737,11 +739,58 @@ unsigned getContiguity(Value ptr, Value offset,
   return std::min(align, contiguity);
 }
 
+// CDNA4 (gfx950) implements unaligned global loads/stores in hardware -- the
+// subtarget advertises `unaligned-buffer-access` ("Hardware supports unaligned
+// global loads and stores"), and LLVM will happily select
+//   load <8 x half>, ptr addrspace(1) %p, align 2  ->  global_load_dwordx4
+// `ModuleAxisInfoAnalysis::getContiguity` nevertheless clamps the vector width to
+// the *provable* alignment (AxisInfo.cpp: `contiguity = std::min(align,
+// contiguity)`). That is the right default -- most targets fault or split on a
+// misaligned wide access -- but on CDNA4 it forfeits a real capability: an operand
+// whose row stride is odd (e.g. a [M,K] fp16 matrix with K odd, where row m starts
+// at an odd element offset) drops to one 2-byte load per element even though the
+// elements are perfectly contiguous.
+//
+// So on CDNA4 only, derive the width from contiguity alone. Alignment is dropped;
+// *contiguity is not* -- the addresses must still be consecutive, which is what
+// makes the wide access describe the same bytes. Both the layout's per-thread
+// contiguity and AxisInfo's memory contiguity still bound the result.
+//
+// Gated to UNMASKED accesses by the matching check in getNumElementsPerThread: a
+// masked load cannot vectorize, and widening its layout costs coalescing for
+// nothing (measured 2.3x slower on the a16w16 BMM).
+static bool allowsUnalignedVectorLoads(Value ptr) {
+  Operation *op = ptr.getDefiningOp();
+  auto modOp = op ? op->getParentOfType<ModuleOp>()
+                  : cast<BlockArgument>(ptr)
+                        .getOwner()
+                        ->getParentOp()
+                        ->getParentOfType<ModuleOp>();
+  if (!modOp)
+    return false;
+  return mlir::triton::amdgpu::TargetFeatures::fromModuleOp(modOp).isCDNA4();
+}
+
+// Contiguity ignoring the alignment clamp: min(layout contigPerThread, AxisInfo
+// memory contiguity) along the fastest dimension.
+static unsigned getUnalignedContiguity(Value ptr,
+                                       ModuleAxisInfoAnalysis &axisAnalysisPass,
+                                       RankedTensorType tensorTy) {
+  auto order = triton::gpu::getOrder(tensorTy);
+  unsigned contig = triton::gpu::getContigPerThread(tensorTy)[order[0]];
+  if (auto *axisInfo = axisAnalysisPass.getAxisInfo(ptr))
+    contig = std::min<unsigned>(contig, axisInfo->getContiguity(order[0]));
+  return std::max<unsigned>(contig, 1);
+}
+
 unsigned getVectorSize(Value ptr, ModuleAxisInfoAnalysis &axisAnalysisPass) {
   auto tensorTy = dyn_cast<RankedTensorType>(ptr.getType());
   if (!tensorTy)
     return 1;
   auto contiguity = getContiguity(ptr, axisAnalysisPass);
+  if (allowsUnalignedVectorLoads(ptr))
+    contiguity = std::max(
+        contiguity, getUnalignedContiguity(ptr, axisAnalysisPass, tensorTy));
   auto pointeeBitWidth = triton::getPointeeBitWidth(tensorTy);
   unsigned vec = std::min<unsigned>(128 / pointeeBitWidth, contiguity);
   // No-op for pow2; clamps the NPOT sizePerThread misalign (see NVIDIA).
@@ -752,9 +801,16 @@ unsigned getVectorSize(Value ptr, Value offset,
                        ModuleAxisInfoAnalysis &axisAnalysisPass) {
   auto contiguity = getContiguity(ptr, offset, axisAnalysisPass);
   auto pointeeBitWidth = triton::getPointeeBitWidth(ptr.getType());
-  unsigned vec = std::min<unsigned>(128 / pointeeBitWidth, contiguity);
   auto tensorTy =
       dyn_cast<RankedTensorType>(getPointerTypeWithShape(ptr, offset));
+  // Buffer ops (scalar base + offset tensor) take this overload; see the comment
+  // on the single-operand getVectorSize. Here the alignment clamp is applied
+  // twice -- once inside getContiguity(offset) and again as min(align,...) on the
+  // scalar base's divisibility -- so both have to be bypassed on CDNA4.
+  if (tensorTy && allowsUnalignedVectorLoads(offset))
+    contiguity = std::max(
+        contiguity, getUnalignedContiguity(offset, axisAnalysisPass, tensorTy));
+  unsigned vec = std::min<unsigned>(128 / pointeeBitWidth, contiguity);
   return clampVecSizeForNpot(vec, tensorTy);
 }
 

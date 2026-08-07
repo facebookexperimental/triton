@@ -10,6 +10,7 @@
 #include "mlir/IR/IRMapping.h"
 #include "third_party/amd/include/Dialect/TritonAMDGPU/IR/Dialect.h"
 #include "triton/Analysis/AxisInfo.h"
+#include "triton/Tools/Sys/GetEnv.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
@@ -190,6 +191,33 @@ unsigned getNumElementsPerThread(Operation *op, SmallVector<unsigned> order,
   unsigned maxContig =
       std::min(valInfo.getContiguity(order[0]), shapePerCTA[order[0]]);
   unsigned alignment = std::min(maxMultiple, maxContig);
+  // CDNA4 (gfx950) implements unaligned global access in hardware, so the width
+  // need not be clamped to the provable alignment -- only to the contiguity, which
+  // is what guarantees the wide access covers the same bytes. Without this an
+  // operand with an odd row stride (e.g. [M,K] fp16 with K odd) is coalesced to one
+  // element per thread and every access degrades to a 2-byte load. Matches the
+  // relaxation in the AMD getVectorSize; both are needed, since this one picks the
+  // layout and that one picks the emitted vector width.
+  //
+  // Only for an UNMASKED access. A mask that varies along the vectorized dim blocks
+  // vectorization at lowering, so relaxing a masked load would widen its per-thread
+  // layout -- costing global coalescing, since a lane's elements then span several
+  // rows -- while still emitting scalar loads. That combination measured 2.3x
+  // SLOWER on the a16w16 BMM. Masked accesses keep the clamp.
+  auto isUnmasked = [](Operation *o) {
+    if (auto ld = dyn_cast<triton::LoadOp>(o))
+      return !ld.getMask();
+    if (auto st = dyn_cast<triton::StoreOp>(o))
+      return !st.getMask();
+    return false; // unknown op: stay conservative
+  };
+  if (isUnmasked(op)) {
+    if (auto modOp = op->getParentOfType<ModuleOp>()) {
+      if (auto tgt = modOp->getAttrOfType<StringAttr>(triton::gpu::AttrTargetName))
+        if (tgt.getValue().contains("gfx950"))
+          alignment = maxContig;
+    }
+  }
   unsigned maxElementsPerThread = getMaxElementsPerThread(op, maxVecBits);
   unsigned currPerThread = std::min(alignment, maxElementsPerThread);
   LDBG("elemNumBytes: " << elemNumBytes
