@@ -197,6 +197,47 @@ LogicalResult mlir::triton::lowerWarpSpecializeBarriers(
       return failure();
   }
 
+  // Remove redundant consecutive per-partition barriers.
+  // After barrier lowering, membar-inserted gpu::BarrierOps may produce
+  // consecutive NVVM::BarrierOps with the same barrier ID and thread count.
+  // The second barrier is a no-op since all participating threads already
+  // synchronized on the first. Only targets NVVM::BarrierOp (per-partition
+  // barriers), not the switch-loop barriers (llvm.nvvm.barrier.cta.sync.all)
+  // which must stay in pairs to match across switch cases.
+  for (LLVM::LLVMFuncOp func : wsKernels) {
+    SmallVector<NVVM::BarrierOp> toErase;
+    func.walk([&](Block *block) {
+      NVVM::BarrierOp prevBarrier = nullptr;
+      for (Operation &op : *block) {
+        if (auto barrier = dyn_cast<NVVM::BarrierOp>(&op)) {
+          if (prevBarrier) {
+            auto getConstantInt = [](Value v) -> std::optional<int64_t> {
+              if (auto constOp =
+                      dyn_cast_or_null<LLVM::ConstantOp>(v.getDefiningOp()))
+                if (auto intAttr = dyn_cast<IntegerAttr>(constOp.getValue()))
+                  return intAttr.getInt();
+              return std::nullopt;
+            };
+            auto prevId = getConstantInt(prevBarrier.getOperand(0));
+            auto curId = getConstantInt(barrier.getOperand(0));
+            auto prevCount = getConstantInt(prevBarrier.getOperand(1));
+            auto curCount = getConstantInt(barrier.getOperand(1));
+            if (prevId && curId && prevCount && curCount && *prevId == *curId &&
+                *prevCount == *curCount) {
+              toErase.push_back(barrier);
+              continue;
+            }
+          }
+          prevBarrier = barrier;
+        } else if (!isPure(&op)) {
+          prevBarrier = nullptr;
+        }
+      }
+    });
+    for (auto op : toErase)
+      op.erase();
+  }
+
   return success();
 }
 
