@@ -179,6 +179,13 @@ class ArchProfile:
     # pair the reconstruction turns on, and the stages id is the only field that pins it.
     # Measure: same sweep, read `<tbK>x<stages>` and the `s<MMA>gemm` token from the name.
     stages_recipe: tuple = ()
+    # (family, CUBLASLT_ALGO_CONFIG_STAGES_ID) keys whose kernel has a SECOND accumulation level
+    # at its own block_k: every block_k-long block is summed on its own and the block totals are
+    # added forward, rather than one flat accumulator running the whole slice. Empty means every
+    # key on this architecture is flat, which is what sm_100 and sm_103 measured. Measure by
+    # byte-comparing the two forms as K grows: they agree exactly while K fits ONE block_k step
+    # and part company at the first K that needs two, including exact multiples of block_k.
+    block_level_keys: tuple = ()
     # Partition grains to try for CUTLASS split-K, largest first; cross-check against `kAlignK`
     # in `cutlass/.../params_universal_base.h`.
     splitk_grains: tuple = ()        # sm_100: (8, 64)
@@ -376,6 +383,15 @@ def _with_row(table, key, value):
     return tuple((k, value if k == key else v) for k, v in table)
 
 
+def _with_new_rows(table, rows):
+    """Rows APPENDED to a measured table, for keys another architecture never reaches. Refuses to
+    overwrite an existing key, so a table that grows can never silently change what it already
+    says."""
+    have = {k for k, _ in table}
+    assert not (have & {k for k, _ in rows}), have & {k for k, _ in rows}
+    return table + tuple(rows)
+
+
 # sm_103 shares every sm_100 table but one gemv row. That is a measurement, not an assumption:
 # each family was re-read on a GB300 against cuBLASLt 13.1.1 -- the same version `_SM100` was
 # measured against, so a difference here would be architecture and not library. 449,520 shapes,
@@ -397,11 +413,82 @@ _SM103 = dataclasses.replace(
     gemv_recipe=_with_row(_SM100.gemv_recipe, (13, 8), (1, 1, 256, False)),
 )
 
-# Placeholder. Fill in the fields above on the machine in question and flip `measured=True`;
-# the dispatch, the kernels and the eval need no changes. Re-measure every field rather than
-# copying `_SM100` -- sm_103 turned out to share its tables, but that was established by
-# re-reading each family on the GPU, not assumed.
-_SM90 = ArchProfile(name="sm_90 (NVIDIA H100)")
+# sm_90 needs four kinds of change from sm_100: 12 EXTRA gemv rows for `CUSTOM_OPTION` values
+# Blackwell never reaches, 3 CHANGED gemv rows, a different `sm_count`, and one nvjet key that
+# grows a second accumulation level. Every family was re-read on an H100 against cuBLASLt
+# 13.1.1 -- the same version `_SM100` was measured against, so a difference here is architecture
+# and not library.
+#
+# This is the first architecture whose tensor core is a different generation (`wgmma`, not
+# `tcgen05`), and most of it still carried over: the reachable `ALGO_ID` set enumerates
+# byte-identical to sm_103 for fp16, bf16 and fp8; ALGO 66's `STAGES_ID` is still 35 for
+# fp16/bf16 and 36 for fp8; the CUTLASS `STAGES_ID` key space is still {0} + {7..20} + {25}; and
+# ALGO 11's two rows re-read exactly, verified up to K = 30,292, which is both sides of the
+# K = 512 boundary where its second accumulation level starts to bite.
+#
+# The gemv rows were read with the floating-point L-probe rather than a byte-compare, because a
+# wrong gemv recipe survives most random inputs. Every one was settled by ELIMINATION over a
+# 1,355-recipe grid -- "only this recipe could have produced these bits" -- with the chunk length
+# then read off an adjacent-L boundary scan at K = 262,144, where the k range holds 128 to 65,536
+# tiles and a chunked recipe could not have hidden. The table is complete for what the TOP
+# heuristic returns: an 8,000,000-shape scan over vector lengths to 1e6 and K to 4e6 produced 42
+# distinct `ALGO_ID 13` `CUSTOM_OPTION` values and every one is keyed below.
+#
+# Two `ALGO_ID`s the top heuristic returns here have NO row and decline: 41 (16 hits in 400,000
+# fp16 draws) and 56 (8 hits). Both are tensor-core kernels whose accumulation order no plan in
+# this file reproduces -- 41 byte-matches a plain accumulator on 28/48 (shape, seed) pairs, and
+# only when `K % 64 < 32`; 56 matches nothing tried, at 0/48. Declining is the honest answer
+# until they are measured.
+_SM90 = dataclasses.replace(
+    _SM100,
+    name="sm_90 (NVIDIA H100)",
+    measured=True,
+    cublaslt_versions=((13, 1), ),
+    measured_cublaslt="13.1.1",
+    # THREE CHANGED ROWS, applied first. The single-lane options close an accumulator on a fixed
+    # k here, where sm_100 records them as unbounded: 0 every 512 k, 7 and 8 every 256 k. Read off
+    # the adjacent-L boundary scan at K 8,192 and 32,768, which prints the boundary positions with
+    # no model in the loop -- 0 lands on 511, 1023, 1535, ... and 7 and 8 on 255, 511, 767, ...,
+    # one gap value each and nothing in between. Byte-checked as well: these rows are 30/30 over
+    # K 128..65536 where sm_100's unbounded row loses 10 to 14 of the same 30. sm_100's rows are
+    # not wrong for sm_100 -- below one chunk length a chunked recipe and an unbounded one are the
+    # same kernel -- and sm_103 already had to change its option 8 the same way.
+    #
+    # THEN THE 12 NEW ROWS, for `CUSTOM_OPTION` values sm_100 never reaches. They are not a new
+    # family: every one lands in a shape sm_100 already has, and they extend its even/odd pairing
+    # -- an even option is the contiguous-slice form at some lane count and the next odd one is
+    # the strided form at the same lane count (100/101 at W 16, 110/111 at W 4, and 92, 74 pairing
+    # with sm_100's 93, 75 at W 32). Every one is `CC` 0: the boundary scan found no accumulator
+    # boundary anywhere in a 262,144-long k range.
+    gemv_recipe=_with_new_rows(_with_row(_with_row(_with_row(
+        _SM100.gemv_recipe, (13, 0), (1, 1, 512, False)),
+        (13, 7), (1, 1, 256, False)),
+        (13, 8), (1, 1, 256, False)), (
+        ((13, 68), (-64, 4, 0, True)), ((13, 72), (-64, 16, 0, True)),
+        ((13, 74), (-64, 32, 0, True)), ((13, 89), (1, 8, 0, True)),
+        ((13, 92), (-64, 32, 0, True)), ((13, 96), (-64, 4, 0, True)),
+        ((13, 100), (-64, 16, 0, True)), ((13, 101), (1, 16, 0, True)),
+        ((13, 102), (-64, 2, 0, True)), ((13, 106), (-64, 8, 0, True)),
+        ((13, 110), (-64, 4, 0, True)), ((13, 111), (1, 4, 0, True)),
+    )),
+    # The one family that genuinely changed shape. H100's fp8 nvjet kernel -- STAGES_ID 36, which
+    # is fp8-only here, so this touches nothing else -- closes an accumulator every 128 k and adds
+    # the block totals afterwards, where the same key on sm_100 and sm_103 runs one flat
+    # accumulator. Read straight off a K walk at 16-k steps: the flat form is byte-identical to
+    # cuBLAS at K 16 through 128, the whole range that fits ONE 128-k step, and misses every K
+    # from 160 up including exact multiples of 128, which rules out a residue-tile explanation.
+    # The block form is byte-identical 7/7 at SPLITK_NUM 1 and 7/7 on split-K shapes where the
+    # current flat plan is 0/7. Triton is on the same hardware path either way -- it emits
+    # `wgmma.mma_async.sync.aligned.m64n128k32.f32.e4m3.e4m3`, the native fp8 MMA -- so this is
+    # cuBLAS's grouping and not a Triton fallback.
+    block_level_keys=(("nvjet", 36), ),
+    # H100 holds 132 * 2048 threads, not GB200's and GB300's 152 * 2048, so the `CUSTOM_OPTION 10`
+    # occupancy cap moves with it. It was bisected here rather than assumed: 8448 output elements
+    # still run 32 lanes and 8449 does not, and 8448 * 32 == 132 * 2048 exactly. That is the first
+    # evidence the formula ports rather than the constant.
+    sm_count=132,
+    threads_per_sm=2048,
+)
 
 _PROFILES = {(10, 0): _SM100, (10, 3): _SM103, (9, 0): _SM90}
 
@@ -548,6 +635,49 @@ def _splitk_partial(A, B, W, M, N, K, am, ak, bk, bn, ws, wm, wn, CHUNK, BM: tl.
         acc = tl.dot(tl.load(ap, mask=km[None, :], other=0.0), tl.load(bp, mask=km[:, None], other=0.0), acc)
         ap += BK * ak
         bp += BK * bk
+    ocm = (pm * BM + tl.arange(0, BM)).to(tl.int64)
+    ocn = (pn * BN + tl.arange(0, BN)).to(tl.int64)
+    tl.store(W + sk.to(tl.int64) * ws + ocm[:, None] * wm + ocn[None, :] * wn, acc,
+             mask=(ocm[:, None] < M) & (ocn[None, :] < N))
+
+
+@triton.jit
+def _splitk_partial_blocks(A, B, W, M, N, K, am, ak, bk, bn, ws, wm, wn, CHUNK, BLOCK_K,
+                           BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
+    """Pass 1 with a SECOND accumulation level at the kernel's own threadblock k step.
+
+    Slice `sk` covers [sk*CHUNK, min((sk+1)*CHUNK, K)) as in `_splitk_partial`, but inside the
+    slice each BLOCK_K-long block is summed into its OWN fp32 accumulator and the block totals
+    are then added forward, instead of one flat accumulator running the whole slice. Two
+    forward chains, nested.
+
+    That is not a refinement of the flat form, it is a different sum. The two agree exactly
+    while a slice fits one block -- which is why the flat form matched cuBLAS on H100 fp8 up to
+    K = 128 and missed every K above it, even multiples of 128.
+
+    CHUNK and BLOCK_K are runtime args so one compiled kernel serves every combination."""
+    pid = tl.program_id(0)
+    sk = tl.program_id(1)
+    npn = tl.cdiv(N, BN)
+    pm = pid // npn
+    pn = pid % npn
+    om = ((pm * BM + tl.arange(0, BM)) % M).to(tl.int64)
+    on = ((pn * BN + tl.arange(0, BN)) % N).to(tl.int64)
+    k0 = sk * CHUNK
+    kend = tl.minimum(k0 + CHUNK, K)
+    ok = tl.arange(0, BK).to(tl.int64)
+    acc = tl.zeros((BM, BN), dtype=tl.float32)
+    for blk in range(0, tl.cdiv(CHUNK, BLOCK_K)):
+        b0 = k0 + blk * BLOCK_K
+        btop = tl.minimum(b0 + BLOCK_K, kend)
+        sub = tl.zeros((BM, BN), dtype=tl.float32)
+        for ki in range(0, tl.cdiv(BLOCK_K, BK)):
+            kk = b0 + ki * BK + ok
+            real = kk < btop
+            a = tl.load(A + om[:, None] * am + kk[None, :] * ak, mask=real[None, :], other=0.0)
+            b = tl.load(B + kk[:, None] * bk + on[None, :] * bn, mask=real[:, None], other=0.0)
+            sub = tl.dot(a, b, sub)
+        acc = tl.where(blk == 0, sub, acc + sub)
     ocm = (pm * BM + tl.arange(0, BM)).to(tl.int64)
     ocn = (pn * BN + tl.arange(0, BN)).to(tl.int64)
     tl.store(W + sk.to(tl.int64) * ws + ocm[:, None] * wm + ocn[None, :] * wn, acc,
@@ -1004,6 +1134,28 @@ def _triton_splitk(a, b, chunk, out_dtype, scale=1.0, BK=64):
     c = torch.empty(M, N, device=DEVICE, dtype=out_dtype)
     _splitk_combine[(ntile, )](w, c, M, N, w.stride(0), w.stride(1), w.stride(2), c.stride(0), c.stride(1), nsplit,
                                scale, BM=BM, BN=BN, num_warps=4)
+    return c
+
+
+def _triton_splitk_blocks(a, b, chunk, block_k, out_dtype, scale=1.0, BK=32):
+    """Two nested forward chains: `chunk`-long slices, each the forward sum of its `block_k`-long
+    block totals, and the slice partials added forward in fp32. `chunk == K` is the
+    SPLITK_NUM 1 case -- one slice, so only the block level is left."""
+    b = _kcontig(b)
+    M, K = a.shape
+    N = b.shape[1]
+    nsplit = (K + chunk - 1) // chunk
+    if nsplit < 1 or nsplit > 8192:
+        return None
+    BM, BN = _tile(M, N, a.dtype)
+    ntile = triton.cdiv(M, BM) * triton.cdiv(N, BN)
+    w = torch.empty(nsplit, M, N, device=DEVICE, dtype=torch.float32)
+    _splitk_partial_blocks[(ntile, nsplit)](a, b, w, M, N, K, a.stride(0), a.stride(1), b.stride(0),
+                                            b.stride(1), w.stride(0), w.stride(1), w.stride(2),
+                                            chunk, block_k, BM=BM, BN=BN, BK=BK, num_warps=4)
+    c = torch.empty(M, N, device=DEVICE, dtype=out_dtype)
+    _splitk_combine[(ntile, )](w, c, M, N, w.stride(0), w.stride(1), w.stride(2), c.stride(0),
+                               c.stride(1), nsplit, scale, BM=BM, BN=BN, num_warps=4)
     return c
 
 
@@ -1521,11 +1673,17 @@ def _plan_tensor_core(prof, family, M, N, K, kind, config):
         return None, f"unsupported STAGES_ID {stages} for {family}"
     block_k, k_per_dot = recipe
 
-    if family == "nvjet":  # cuBLAS's own kernels: one fp32 accumulator, block_k-grained split-K
+    if family == "nvjet":  # cuBLAS's own kernels: block_k-grained split-K
+        two_level = (family, stages) in prof.block_level_keys
         if nsplit <= 1:
-            return ("plain", None), "ok"
+            # One accumulator over the whole K, unless this key's kernel closes an accumulator
+            # every block_k -- then the whole K is the single slice and only the block level is
+            # left.
+            return ((("split_blocks", (K, block_k)) if two_level else ("plain", None)), "ok")
         chunk = _chunk_from_ns(K, nsplit, block_k)
-        return (("split", chunk), "ok") if block_k <= chunk < K else (None, "chunk out of range")
+        if not block_k <= chunk < K:
+            return None, "chunk out of range"
+        return ((("split_blocks", (chunk, block_k)) if two_level else ("split", chunk)), "ok")
     if kind == "fp8":  # cuBLAS refuses fp8 unless every dim is a multiple of 16, so it never
         return None, "unsupported fp8 on a CUTLASS kernel"  # leaves nvjet; if it did, unmeasured
     if nsplit <= 1:
@@ -1636,6 +1794,8 @@ def _reconstruct(a, b, out_dtype, plan, scale=1.0):
         return _triton_plain_k_per_dot(a, b, out_dtype, arg[0], arg[1], scale=scale)
     if mode == "splitk_groups":
         return _triton_splitk_groups(a, b, arg[0], arg[1], arg[2], arg[3], out_dtype, scale=scale)
+    if mode == "split_blocks":
+        return _triton_splitk_blocks(a, b, arg[0], arg[1], out_dtype, scale=scale)
     # The three CUDA-core modes take no scale: they are fp16/bf16 only, and `scale` is the fp8
     # operand-scale fold, which the API refuses to accept for any other dtype.
     if mode == "gemmsn":
