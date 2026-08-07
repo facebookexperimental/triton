@@ -933,6 +933,12 @@ static void lowerLoop(scf::ForOp forOp,
                                                              loadToInfo))) {
     ChainedDotSchedule::updateSchedule(forOp, loadToInfo, schedule,
                                        axisInfoAnalysis, useAsyncCopy);
+    // Record the schedule that was actually materialized. BlockPingpong cannot
+    // infer it from the number of dot-like operations because the single-dot
+    // and two-dot layouts can contain the same operations.
+    if (usePingpong)
+      forOp->setAttr(triton::AMD::AttrTwoDotSchedule,
+                     UnitAttr::get(forOp.getContext()));
   } else {
     SingleDotSchedule::updateSchedule(forOp, loadToInfo, schedule,
                                       axisInfoAnalysis, useAsyncCopy,

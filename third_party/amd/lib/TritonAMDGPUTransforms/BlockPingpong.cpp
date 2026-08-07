@@ -9,6 +9,7 @@
 #include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassManager.h"
 #include "third_party/amd/include/Dialect/TritonAMDGPU/IR/Dialect.h"
+#include "third_party/amd/lib/TritonAMDGPUTransforms/PipelineUtility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/Schedule.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
@@ -83,6 +84,7 @@ class Pingponger {
   SmallVector<ttg::AsyncCopyGlobalToLocalOp> asyncCopyOps;
   SmallVector<ttg::AsyncWaitOp> asyncWaitOps;
   SmallVector<ttg::AsyncCommitGroupOp> asyncCommitOps;
+  SmallVector<tt::DotOpInterface> dotLikeOps;
   SmallVector<tt::DotOp> dotOps;
   SmallVector<tt::DotScaledOp> scaledDotOps;
   SmallVector<SmallVector<Operation *>> subViewOps;
@@ -786,7 +788,7 @@ LogicalResult Pingponger::transformTwoClusterWithAsyncAndAll(OpBuilder &builder,
 // between memory and compute phases.
 LogicalResult Pingponger::transformChainedDotSchedule(OpBuilder &builder,
                                                       Location loc) {
-  assert(dotOps.size() == 2);
+  assert(dotLikeOps.size() == 2);
 
   // Memory clusters start with either ttg.async_wait or ttg.local_store
   auto findNextMemoryCluster = [](Operation *op) {
@@ -796,8 +798,9 @@ LogicalResult Pingponger::transformChainedDotSchedule(OpBuilder &builder,
     return op;
   };
 
-  std::array memoryClusterStartOps = {findNextMemoryCluster(dotOps[0]),
-                                      findNextMemoryCluster(dotOps[1])};
+  std::array memoryClusterStartOps = {
+      findNextMemoryCluster(dotLikeOps[0].getOperation()),
+      findNextMemoryCluster(dotLikeOps[1].getOperation())};
 
   if (llvm::is_contained(memoryClusterStartOps, nullptr) ||
       memoryClusterStartOps[0] == memoryClusterStartOps[1]) {
@@ -808,7 +811,7 @@ LogicalResult Pingponger::transformChainedDotSchedule(OpBuilder &builder,
 
   builder.setInsertionPointToStart(forOp.getBody());
   // ComputeCluster 1
-  updateOpInsertion(dotOps[0]);
+  updateOpInsertion(dotLikeOps[0].getOperation());
   prependOp(ROCDL::SBarrierOp::create(builder, loc), false);
   prependOp(ROCDL::SchedBarrier::create(builder, loc, 0), false);
 
@@ -841,7 +844,7 @@ LogicalResult Pingponger::transformChainedDotSchedule(OpBuilder &builder,
   // s_barrier
   //
   // Check note 2 and 3 for details.
-  updateOpInsertion(dotOps[1]);
+  updateOpInsertion(dotLikeOps[1].getOperation());
   prependOp(ROCDL::SchedBarrier::create(builder, loc, 0), false);
   prependOp(ROCDL::SetPrioOp::create(builder, loc, lowPriority), false);
   prependOp(createLocalMMRAFence(builder, loc, LLVM::AtomicOrdering::release),
@@ -985,6 +988,14 @@ void Pingponger::addAsymmetricSyncToLoop(OpBuilder &builder, Location loc) {
 }
 
 void Pingponger::getDotPingponged() {
+  // LowerLoops sets this only when it materializes the two-dot layout for a
+  // pipeline configured to use pingpong. This pass is the marker's sole
+  // consumer and always removes it, even when the transform is later rejected;
+  // dot count alone cannot distinguish that layout from a single-dot schedule.
+  bool hasTwoDotSchedule =
+      forOp->hasAttr(triton::AMD::AttrTwoDotSchedule);
+  forOp->removeAttr(triton::AMD::AttrTwoDotSchedule);
+
   if (numStages <= 1) {
     LDBG("Pingpong pass expect a loop transformed by pipeliner that prefetches "
          "memory and reduces dependencies among the operations in the same "
@@ -1012,10 +1023,6 @@ void Pingponger::getDotPingponged() {
         })
         .Case<ttg::LocalStoreOp>(
             [&](auto lStore) { lStoreOps.push_back(lStore); })
-        .Case<tt::DotOp>(
-            [&](auto pingpongDot) { dotOps.push_back(pingpongDot); })
-        .Case<tt::DotScaledOp>(
-            [&](auto pingpongDot) { scaledDotOps.push_back(pingpongDot); })
         .Case<ttg::AsyncCopyGlobalToLocalOp>(
             [&](auto asyncOp) { asyncCopyOps.push_back(asyncOp); })
         .Case<ttg::AsyncCommitGroupOp>([&](auto asyncCommitGroupOp) {
@@ -1025,13 +1032,26 @@ void Pingponger::getDotPingponged() {
             [&](auto asyncOp) { asyncWaitOps.push_back(asyncOp); });
   });
 
+  // Pingpong moves dot and memory clusters within the loop body, so nested dots
+  // are not supported. Use the scheduler's direct-child collector for both the
+  // single-dot and two-dot paths instead of counting nested dots that cannot be
+  // transformed safely.
+  dotLikeOps = ChainedDotSchedule::collectDotLikeOps(forOp);
+  for (tt::DotOpInterface dotLikeOp : dotLikeOps) {
+    if (auto dotOp = dyn_cast<tt::DotOp>(dotLikeOp.getOperation()))
+      dotOps.push_back(dotOp);
+    else if (auto scaledDotOp =
+                 dyn_cast<tt::DotScaledOp>(dotLikeOp.getOperation()))
+      scaledDotOps.push_back(scaledDotOp);
+  }
+
   // Currently, pingpong scheduling is known as helpful under limited condition.
   // Individual conditions are checked while collecting each operation such as
   // software pipelining and dot rank=2. Also only accept the for-loop with
   // supported combination of operations because this transformation is very
   // tightly scheduling the latencies.
 
-  int64_t numOfDotLikeOps = scaledDotOps.size() + dotOps.size();
+  int64_t numOfDotLikeOps = dotLikeOps.size();
 
   if (numOfDotLikeOps < 1 || numOfDotLikeOps > 2) {
     LDBG("Only handle one or two dotlike ops");
@@ -1039,7 +1059,7 @@ void Pingponger::getDotPingponged() {
   }
 
   if (numOfDotLikeOps == 2) {
-    if (numStages != 4)
+    if (numStages != 4 || !hasTwoDotSchedule)
       return;
 
     if (transformChainedDotSchedule(builder, loc).failed()) {
@@ -1048,6 +1068,8 @@ void Pingponger::getDotPingponged() {
       return;
     }
     addAsymmetricSyncToLoop(builder, loc);
+    // The transforms below handle single-dot schedules only.
+    return;
   }
 
   useAsyncCopy = (asyncCopyOps.size() > 0);
