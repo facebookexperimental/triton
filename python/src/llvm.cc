@@ -52,6 +52,14 @@ struct BreakStructPhiNodesPass : PassInfoMixin<BreakStructPhiNodesPass> {
 
 using namespace llvm;
 
+// Native gfx950 LLIR scheduler (python/src/LlirSchedule.cpp). Registers the
+// LLVM-IR MFMA<->mem/VALU scheduling pass at OptimizerLast on the given
+// builder. This declaration MUST stay above the anonymous namespace below --
+// inside it the symbol gets internal linkage and the link fails.
+namespace mlir::triton::amdsched {
+void registerLlirSchedAtOptimizerLast(llvm::PassBuilder &PB);
+} // namespace mlir::triton::amdsched
+
 namespace {
 
 // Set an LLVM command-line option using addOccurrence (simulates command-line)
@@ -743,6 +751,38 @@ void init_triton_llvm(py::module &&m) {
         std::string pluginFile =
             mlir::triton::tools::getStrEnv("LLVM_PASS_PLUGIN_PATH");
 
+        // TRITON_LLVM_OPTS="opt1=val1,opt2=val2" sets registered LLVM cl::opt
+        // values by name, so backend knobs that are only exposed as -mllvm
+        // flags can be driven from Python without a custom driver. Needed for
+        // the AMDGPU register-allocation knobs (amdgpu-spill-vgpr-to-agpr,
+        // amdgpu-mfma-vgpr-form, ...) that decide whether MFMA accumulators
+        // stay in one register bank; on a4w4 only 54/256 MFMAs currently
+        // accumulate in place because the accumulator is split AGPR/VGPR.
+        if (auto optStr = mlir::triton::tools::getStrEnv("TRITON_LLVM_OPTS");
+            !optStr.empty()) {
+          auto &registry = llvm::cl::getRegisteredOptions();
+          llvm::SmallVector<llvm::StringRef, 8> parts;
+          llvm::StringRef(optStr).split(parts, ',', -1, /*KeepEmpty=*/false);
+          for (llvm::StringRef p : parts) {
+            auto [name, value] = p.trim().split('=');
+            auto it = registry.find(name.trim());
+            if (it == registry.end()) {
+              llvm::errs() << "[triton] TRITON_LLVM_OPTS: unknown option '"
+                           << name << "'\n";
+              continue;
+            }
+            std::string v = value.trim().str();
+            if (v.empty())
+              v = "true";
+            if (it->second->addOccurrence(0, name.trim(), v))
+              llvm::errs() << "[triton] TRITON_LLVM_OPTS: failed to set '"
+                           << name << "' = '" << v << "'\n";
+            else
+              llvm::errs() << "[triton] TRITON_LLVM_OPTS: " << name << " = "
+                           << v << "\n";
+          }
+        }
+
         // We don't pass the targetMachine to the LLVM-IR pass builder, unless
         // `arch` is specified.
         //
@@ -759,6 +799,14 @@ void init_triton_llvm(py::module &&m) {
               createTargetMachine(mod, arch, enable_fp_fusion, features);
         PassBuilder pb(/*targetMachine=*/targetMachine.get(), tuningOptions,
                        std::nullopt, instrCbPtr);
+
+        // Native in-tree gfx950 LLIR scheduler (ported from the out-of-tree
+        // ROCm plugin). Registers at OptimizerLast, like the external plugin,
+        // but compiled into libtriton so it needs no plugin .so / default
+        // visibility / KEEP_TARGET_MACHINE (arch is non-empty here so the
+        // target machine is already created above).
+        if (mlir::triton::tools::getBoolEnv("TRITON_ENABLE_LLIR_SCHED"))
+          mlir::triton::amdsched::registerLlirSchedAtOptimizerLast(pb);
 
         if (!pluginFile.empty()) {
           // TODO: Add some logging here that we inserted a pass into the LLVM

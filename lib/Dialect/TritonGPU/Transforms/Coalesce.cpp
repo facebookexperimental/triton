@@ -209,6 +209,45 @@ struct CoalescePass : public impl::TritonGPUCoalesceBase<CoalescePass> {
                 pinned = concrete;
             }
           }
+        } else if (auto load = dyn_cast<triton::LoadOp>(curr)) {
+          // Same idea one step removed, for a global->register->LDS staging
+          // load. The pin cannot ride on the load itself (the author writes
+          // `tlx.require_layout(tl.load(...))`), so it sits on the
+          // require_layout that consumes the load and feeds ttg.local_store --
+          // which, like tt.store, has no result to carry the trait. Without
+          // this, the coalescer sizes the load purely from provable global
+          // vectorization: a 2-byte-aligned operand (e.g. odd K) yields
+          // sizePerThread=[1,1], so each lane's elements are strided down M and
+          // the local_store degrades to one ds_write_b16 per element, each with
+          // its own vmcnt wait. Honoring the pin keeps the lane's elements
+          // contiguous along K, which costs the load nothing (alignment forces
+          // the same instruction count either way) and collapses the LDS drain
+          // to a single wide ds_write.
+          //
+          // Deliberately narrow: only an explicit user pin
+          // (#tlx.user_layout, minted solely by require_layout(pin=True)) whose
+          // pinned value feeds a ttg.local_store. Matched generically through
+          // the result encoding rather than by naming the TLX op, so core
+          // Triton keeps no dependency on the TLX dialect.
+          auto loadTy = dyn_cast<RankedTensorType>(load.getResult().getType());
+          for (Operation *user : load->getUsers()) {
+            if (!loadTy || user->getNumResults() != 1)
+              continue;
+            auto rt = dyn_cast<RankedTensorType>(user->getResult(0).getType());
+            if (!rt || rt.getShape() != loadTy.getShape())
+              continue;
+            if (!hasRecursivePin(rt.getEncoding()))
+              continue;
+            if (llvm::none_of(user->getResult(0).getUsers(), [](Operation *u) {
+                  return isa<triton::gpu::LocalStoreOp>(u);
+                }))
+              continue;
+            Attribute concrete = triton::unwrapTlxWrappers(rt.getEncoding());
+            if (isa_and_nonnull<DistributedEncodingTrait>(concrete)) {
+              pinned = concrete;
+              break;
+            }
+          }
         }
         if (pinned) {
           layoutMap[curr] = pinned;

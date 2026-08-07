@@ -11,6 +11,8 @@ from .barrier import (
     named_barrier_arrive,
     named_barrier_wait,
     amd_sched_barrier,
+    sched_region_begin,
+    sched_region_end,
 )
 from .dynamic_launch import (
     _alloc_clc_responses,
@@ -212,6 +214,8 @@ __all__ = [
     "named_barrier_wait",
     "named_barrier_arrive",
     "amd_sched_barrier",
+    "sched_region_begin",
+    "sched_region_end",
     # mma_ops
     "async_dot",
     "async_dot_scaled",
