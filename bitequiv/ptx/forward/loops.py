@@ -12,6 +12,8 @@ descriptor drop its chunk (BLOCK_K) fence.
 """
 from pyptx.ir.nodes import Block, ImmediateOperand, Label, RegisterOperand, VectorOperand
 
+from bitequiv.ptx.affine import Affine, AffineEval, reqntid_of
+from bitequiv.ptx.linker import DefUse
 from bitequiv.ptx.mma import _is_mma
 
 # fp combine ops + widths, used to detect a loop-carried floating-point accumulation.
@@ -278,6 +280,40 @@ def _setp_bounds_of(insts, regs):
     return out
 
 
+def _symbolic_bounds_of(insts, regs, ev):
+    """Canonical form of the RUNTIME (non-literal) values a counter in ``regs`` is compared against.
+
+    :func:`_setp_bounds_of` sees a bound only when it is an immediate. A reduction loop whose bound is
+    computed at run time — the common tiled / triangular case ``for j in range(0, program_id * TILE)``
+    — is then invisible, and two configs whose folds are split at DIFFERENT points share a signature.
+    Evaluating the bound register as an :class:`~bitequiv.ptx.affine.Affine` over the symbol basis
+    recovers exactly the missing fact: the bound is ``TILE * %ctaid``, so ``TILE`` (how many chunks
+    this CTA's fold covers before the loop hands over to the next region) is in the key.
+
+    A value that is not PROVABLY affine yields one fixed placeholder rather than its structural token:
+    that token inlines unresolved register names, which are allocation noise and would split
+    bit-identical configs. Recording only "a runtime bound of unknown form is present" keeps the term
+    stable while still separating it from a proven affine one."""
+    out = set()
+    for i, inst in enumerate(insts):
+        if inst.opcode != "setp" or len(inst.operands) < 3:
+            continue
+        comparands = inst.operands[1:]
+        if not any(isinstance(o, RegisterOperand) and o.name in regs for o in comparands):
+            continue
+        for o in comparands:
+            if isinstance(o, RegisterOperand) and o.name not in regs:
+                value = ev.of_reg(o.name, i)
+                out.add(value.to_str() if isinstance(value, Affine) else "?")
+    return out
+
+
+def _with_bounds(base, bounds):
+    """``base`` alone when no runtime bound was recovered (byte-identical to the two-tier signature),
+    else ``base`` plus the ``("bound", ...)`` tier."""
+    return base if not bounds else (base, ("bound", tuple(sorted(bounds))))
+
+
 def reduction_trip_signature(func):
     """Hashable fingerprint that distinguishes the outer reduction loops' TRIP COUNTS (the split-K
     regrouping = num_splits), or ``None`` when the entry has no nested-reduction structure (a plain
@@ -294,12 +330,21 @@ def reduction_trip_signature(func):
       likewise tiling-invariant per split count.
     Both are keyed on num_splits and independent of the tiling axes, so they recover the tiling freedom
     while keeping the split counts distinct. Returns ``None`` unless an outer reduction loop exists, so
-    a plain tiled GEMM keeps its tiling-invariant fence."""
+    a plain tiled GEMM keeps its tiling-invariant fence.
+
+    Neither tier can see a bound that is not a compile-time constant, so a third ``("bound", ...)``
+    tier (:func:`_symbolic_bounds_of`) carries the RUNTIME bounds as affine forms. It is appended, not
+    substituted, so a signature that has no runtime bound is byte-identical to before — the tier can
+    only ever SPLIT. This is what fences a fold whose split point moves with the output tile: causal
+    attention runs its unmasked KV blocks in one loop up to ``BLOCK_M * program_id`` and the masked
+    diagonal band in a second loop with DIFFERENT arithmetic, so ``BLOCK_M`` decides which KV blocks
+    are rounded which way even though both loops exist, with the same op mix, at every ``BLOCK_M``."""
     insts, loops = find_loops(func)
     splitloops = outer_reduction_loops(insts, loops)
     if not splitloops:
         return None
-    clean = set()
+    ev = AffineEval(DefUse(func), reqntid_of(func))
+    clean, bounds = set(), set()
     for h, latch in splitloops:
         steps = {}
         for k in range(h, latch + 1):
@@ -312,11 +357,12 @@ def reduction_trip_signature(func):
                         steps[d.name] = int(b.text, 0)
                     except (ValueError, TypeError):
                         continue
+        bounds |= _symbolic_bounds_of(insts, set(steps), ev)
         for reg, step in steps.items():
             for bound in _setp_bounds_of(insts, {reg}):
                 clean.add((step, bound))
     if clean:
-        return ("trip", tuple(sorted(clean)))
+        return _with_bounds(("trip", tuple(sorted(clean))), bounds)
     region = []
     for h, latch in splitloops:
         cs = set()
@@ -330,4 +376,4 @@ def reduction_trip_signature(func):
                         except (ValueError, TypeError):
                             continue
         region.append(tuple(sorted(cs)))
-    return ("region", tuple(sorted(region)))
+    return _with_bounds(("region", tuple(sorted(region))), bounds)
