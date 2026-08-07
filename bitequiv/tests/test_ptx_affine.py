@@ -3,8 +3,9 @@ from pyptx.parser import parse
 
 from bitequiv.ptx.affine import Affine, AffineEval, Opaque, canon, reqntid_of
 from bitequiv.ptx.linker import DefUse
+from bitequiv.ptx_reduction import ptx_header
 
-_HEADER = ".version 8.5\n.target sm_90a\n.address_size 64\n"
+_HEADER = ptx_header()
 
 
 def _eval(body, reg, reqntid=True):

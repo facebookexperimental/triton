@@ -3,8 +3,9 @@ from pyptx.parser import parse
 
 from bitequiv.ptx.linker import linearize
 from bitequiv.ptx.mma import _is_mma, _mma_fence, _mma_token
+from bitequiv.ptx_reduction import ptx_header
 
-_HDR = ".version 8.5\n.target sm_90a\n.address_size 64\n"
+_HDR = ptx_header()
 
 
 def _entry(body):

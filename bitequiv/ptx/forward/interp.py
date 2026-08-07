@@ -58,11 +58,11 @@ _PACKED_WIDTH = ".f32x2"
 
 
 def _is_fp(inst):
-    return bool(inst.modifiers) and inst.modifiers[-1] in _FP_WIDTHS
+    return bool(inst.modifiers) and any(m in _FP_WIDTHS for m in inst.modifiers)
 
 
 def _is_packed(inst):
-    return bool(inst.modifiers) and inst.modifiers[-1] == _PACKED_WIDTH
+    return bool(inst.modifiers) and any(m == _PACKED_WIDTH for m in inst.modifiers)
 
 
 def _redux_minmax_kind(mods):
@@ -555,7 +555,7 @@ class ForwardInterp:
         ntid = ",".join(f"{k}{v}" for k, v in sorted(self.ev.reqntid.items())) or "?"
         shfl, stores, fp, fma = [], {}, 0, 0
         for inst in self.flat:
-            is_fp = inst.modifiers and any(t in inst.modifiers[-1] for t in (".f16", ".f32", ".f64", ".bf16"))
+            is_fp = inst.modifiers and any(t in m for m in inst.modifiers for t in (".f16", ".f32", ".f64", ".bf16"))
             if inst.opcode == "shfl" and ".bfly" in inst.modifiers and len(inst.operands) >= 3:
                 shfl.append(str(_offset(inst.operands[2])))
             elif inst.opcode == "st" and ".shared" in inst.modifiers:
