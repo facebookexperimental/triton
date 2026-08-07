@@ -28,8 +28,8 @@ import hashlib
 from pyptx.ir.nodes import RegisterOperand, VectorOperand
 
 from bitequiv.ptx.affine import AffineEval, canon, reqntid_of
-from bitequiv.ptx.builder import (_coordfree_sig, _postorder, collapse_balanced, output_coordfree_key,
-                                  tree_hash)
+from bitequiv.ptx.builder import (_forest_postorder, collapse_balanced, collapse_balanced_forest, output_coordfree_keys,
+                                  tree_hash, tree_hashes)
 from bitequiv.ptx.forward.cfg import has_unknown_control
 from bitequiv.ptx.forward.loops import (find_loops, loop_accumulates, loop_carried_accumulators,
                                         loop_self_increments)
@@ -144,6 +144,7 @@ class ForwardInterp:
         self.smem_stores = []
         self._smem_phase = []  # value nodes written since the last bar (the open phase)
         self._smem_closed = []  # value nodes of the most-recently closed phase (what a load reads)
+        self._cf_hash_memo = {}  # id(node) -> coord-free Merkle hash, for the `_resolve_smem` check
         # Sound floor: set False when the walk hits a cross-thread structure this phase does not
         # model faithfully (a cross-warp shared load). The reconstructed tree is then untrustworthy
         # for the verbatim hash (it would over-merge across num_warps), so forward_descriptor falls
@@ -554,6 +555,32 @@ class ForwardInterp:
             return [v.child]
         return [v]
 
+    def _cf_hash(self, node):
+        """Coord-free Merkle hash of a subtree (Leaf coordinates blanked) — the same equivalence the
+        string ``_coordfree_sig`` tests, but as a fixed-size hash that composes over CHILD hashes and
+        is memoized by node id across the whole run. ``_resolve_smem`` uses it to decide whether a
+        shared phase's writes all share one structure in O(new nodes) instead of serializing every
+        candidate's full subtree: the string form INLINES a shared subtree at each reference, so on a
+        deeply shared DAG (welford's unrolled two-pass fold) it is quadratic in the chain length and
+        one entry blew past a 20 GB cap. Only an equality test reads this, never a descriptor."""
+        memo = self._cf_hash_memo
+        if id(node) in memo:
+            return memo[id(node)]
+        stack = [(node, False)]
+        while stack:
+            n, done = stack.pop()
+            if id(n) in memo:
+                continue
+            if not done:
+                stack.append((n, True))
+                for c in n.children:
+                    if id(c) not in memo:
+                        stack.append((c, False))
+            else:
+                local = "L[]" if isinstance(n, Leaf) else n.sig_local([memo[id(c)] for c in n.children])
+                memo[id(n)] = hashlib.sha1(local.encode()).hexdigest()[:16]
+        return memo[id(node)]
+
     def _resolve_smem(self):
         """Value subtree a shared load / ldmatrix reads: a representative write from the most-recently
         CLOSED phase, or ``None`` (fail closed) when the phase is empty or its writes are not all the
@@ -565,7 +592,7 @@ class ForwardInterp:
         cands = self._smem_closed if self._smem_closed else self._smem_phase
         if not cands:
             return None
-        if len({_coordfree_sig(c) for c in cands}) != 1:
+        if len({self._cf_hash(c) for c in cands}) != 1:
             return None  # mixed-structure phase -> ambiguous without the address -> fail closed
         return cands[-1]
 
@@ -604,9 +631,10 @@ class ForwardInterp:
 _LDG_TYPE_MODS = frozenset({".b8", ".b16", ".b32", ".b64", ".b128", ".f16", ".f32", ".f64"})
 
 
-def _reduces_without_leaf(roots):
-    """True iff some RAW (uncollapsed) root reduces over a CROSS-THREAD structure (a
+def _reduces_without_leaf(nodes):
+    """True iff the RAW (uncollapsed) output forest reduces over a CROSS-THREAD structure (a
     ``ShflCombine`` butterfly / ``SmemExchange``) yet reaches NO loaded ``Leaf`` anywhere.
+    ``nodes`` is the forest post-order of the raw roots.
 
     Such a tree reduces only over a constant SEED + cross-warp shuffles — the reduced input
     data (the within-thread / chunk fold that feeds the accumulator) was NOT captured by the
@@ -619,12 +647,11 @@ def _reduces_without_leaf(roots):
     NORMAL reduction has no ``Leaf`` either — only the raw tree distinguishes a faithful
     leaf-bearing reduction from this data-losing one."""
     has_leaf = has_cross_thread = False
-    for r in roots:
-        for n in _postorder(r):
-            if isinstance(n, Leaf):
-                has_leaf = True
-            elif isinstance(n, (ShflCombine, SmemExchange)):
-                has_cross_thread = True
+    for n in nodes:
+        if isinstance(n, Leaf):
+            has_leaf = True
+        elif isinstance(n, (ShflCombine, SmemExchange)):
+            has_cross_thread = True
     return has_cross_thread and not has_leaf
 
 
@@ -642,6 +669,17 @@ def _global_load_shape(func):
     return ",".join(f"{k}x{n}" for k, n in sorted(m.items()))
 
 
+# Node budget for the signature stage. Past this many UNIQUE value-DAG nodes the entry takes the
+# conservative fingerprint instead of the collapsed hash. With one memo shared by all the outputs
+# the collapse + hash is linear in this count, so the budget is a backstop against a shape nobody
+# has measured yet, not an active behaviour change: the largest entry that reaches this check
+# across the whole evaluation corpus is 10,793 nodes (18x under), and the largest entry anywhere —
+# a GEMM, which takes the MMA fence path and never gets here — is 72,325 (2.8x under).
+# Fingerprinting is unconditionally sound — it only ever over-splits — so tripping the budget costs
+# recovery, never correctness.
+_MAX_DAG_NODES = 200_000
+
+
 def forward_descriptor(func):
     """Per-entry forward descriptor: the collapsed + Merkle-hashed output trees (reusing the backward
     ``collapse_balanced`` + ``tree_hash`` so it is directly comparable to
@@ -651,7 +689,10 @@ def forward_descriptor(func):
     roots = interp.run()
     if not interp.faithful:
         return (interp.fingerprint(), )
-    if _reduces_without_leaf(roots):
+    nodes = _forest_postorder(roots)  # every unique value-DAG node once, shared by all the outputs
+    if len(nodes) > _MAX_DAG_NODES:
+        return (interp.fingerprint(), )  # see `_MAX_DAG_NODES`
+    if _reduces_without_leaf(nodes):
         # Faithful walk, but the reduction lost its input leaves (a fully-unrolled loop-carried
         # fold reduced only over the seed + cross-warp shuffles). The hash cannot see the chunk
         # grouping -> fail closed with the conservative fingerprint + the global-load shape (a
@@ -668,11 +709,14 @@ def forward_descriptor(func):
     # reduction keeps its ShflCombine offsets in the key -> stays split (correct). If ANY output is not
     # cleanly reconstructed (opaque leaf / unrecovered coord), fall back to the verbatim trees (sound,
     # over-split). Replaces the old blanket multi-output G3 guard; gated on the fuzzer (0 over-merge).
-    collapsed = [collapse_balanced(r) for r in roots]
-    keys = [output_coordfree_key(t) for t in collapsed]
+    # The three stages share ONE memo across the outputs, so a subtree k outputs have in common is
+    # collapsed / scanned / hashed once instead of k times (the outputs of a prefix scan share almost
+    # everything, which is what made this quadratic).
+    collapsed = collapse_balanced_forest(roots)
+    keys = output_coordfree_keys(collapsed)
     if all(k is not None for k in keys):
         return tuple(sorted({hashlib.sha1(k.encode()).hexdigest()[:16] for k in keys}))
-    return tuple(sorted(tree_hash(t) for t in collapsed))
+    return tuple(sorted(tree_hashes(collapsed)))
 
 
 def _fence_str(fence):
@@ -706,27 +750,24 @@ def _epilogue_reduces_mma(sinks):
     layernorm output is the full tile written through ``ldmatrix``, which relocates the reduced values
     across lanes, so the ``st.global`` root alone can miss the ``sum(e)`` reduction buried
     mid-computation. Scanning the recorded shared-store values and the live registers too surfaces its
-    ``FpOp``-both-children-``Mma`` combine. The ``Mma``-bearing walk is memoized across all sinks
-    (shared subtrees walked once)."""
+    ``FpOp``-both-children-``Mma`` combine. ONE forest walk covers every sink, so a subtree many sinks
+    share (the whole accumulator chain, typically) is visited once instead of once per sink."""
     has_mma = {}
-    for root in sinks:
-        for n in _postorder(root):
-            if id(n) in has_mma:
-                continue
-            has_mma[id(n)] = isinstance(n, Mma) or any(has_mma[id(c)] for c in n.children)
-            # A ShflCombine (butterfly) IS a reduce step, so over an Mma subtree it is a genuine
-            # cross-lane reduction. A bare SmemExchange is NOT — it is a cross-warp / relocation READ
-            # (pure data movement). The GEMM epilogue stages the MMA accumulator through
-            # st.shared -> ldmatrix -> st.global, which now reconstructs as SmemExchange(Mma) but
-            # reduces nothing; counting it here over-split every pure GEMM into the per-config
-            # fingerprint (undoing the tiling-invariant fence). A REAL cross-warp reduction over the
-            # MMA output still fires: its combine is the FpOp(add/min/max)-both-children-Mma below, and
-            # it also carries a within-warp ShflCombine / shfl.bfly. So key on an actual reduce node.
-            if isinstance(n, ShflCombine) and has_mma[id(n)]:
-                return True
-            if (isinstance(n, FpOp) and not n.fused and n.kind in ("add", "min", "max")
-                    and len(n.children) == 2 and all(has_mma[id(c)] for c in n.children)):
-                return True
+    for n in _forest_postorder(sinks):
+        has_mma[id(n)] = isinstance(n, Mma) or any(has_mma[id(c)] for c in n.children)
+        # A ShflCombine (butterfly) IS a reduce step, so over an Mma subtree it is a genuine
+        # cross-lane reduction. A bare SmemExchange is NOT — it is a cross-warp / relocation READ
+        # (pure data movement). The GEMM epilogue stages the MMA accumulator through
+        # st.shared -> ldmatrix -> st.global, which now reconstructs as SmemExchange(Mma) but
+        # reduces nothing; counting it here over-split every pure GEMM into the per-config
+        # fingerprint (undoing the tiling-invariant fence). A REAL cross-warp reduction over the
+        # MMA output still fires: its combine is the FpOp(add/min/max)-both-children-Mma below, and
+        # it also carries a within-warp ShflCombine / shfl.bfly. So key on an actual reduce node.
+        if isinstance(n, ShflCombine) and has_mma[id(n)]:
+            return True
+        if (isinstance(n, FpOp) and not n.fused and n.kind in ("add", "min", "max")
+                and len(n.children) == 2 and all(has_mma[id(c)] for c in n.children)):
+            return True
     return False
 
 
