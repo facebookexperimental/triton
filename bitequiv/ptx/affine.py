@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from pyptx.ir.nodes import (
     AddressOperand,
     ImmediateOperand,
+    LabelOperand,
     RegisterOperand,
 )
 
@@ -189,6 +190,12 @@ class AffineEval:
             return self.of_reg(operand.name, before_index)
         if isinstance(operand, AddressOperand):
             return self.of_address(operand, before_index)
+        if isinstance(operand, LabelOperand):
+            # A bare symbol used as a VALUE (`mov.b32 %r, global_smem`) is that symbol's ADDRESS: a
+            # link-time constant, the same for every thread. Same symbol form `of_address` already
+            # gives a non-`%` base, so `[global_smem+8]` and `mov %r, global_smem; [%r+8]` agree.
+            # Without this the shared-memory base poisoned every address built on it to `Opaque`.
+            return _symbol("sym:" + operand.name)
         return Opaque(f"operand({type(operand).__name__})")
 
     def of_address(self, addr, before_index):
@@ -282,7 +289,12 @@ class AffineEval:
         if op in ("or", "xor") and len(srcs) == 2:
             return self._or_xor(ev(srcs[0]), ev(srcs[1]))
         if op == "bfe" and len(srcs) == 3:  # bit-field extract: bits [pos, pos+len) of a
-            return self._bfe(ev(srcs[0]), ev(srcs[1]), ev(srcs[2]))
+            # SIGNED `bfe.s32/.s64` SIGN-EXTENDS the extracted field, so a 1-bit extract yields 0 or
+            # -1, not 0 or 1 — the idiom Triton uses to turn a tid bit into an xor-swizzle mask. Only
+            # the unsigned form is the plain bit slice modeled below; leave the signed one opaque.
+            if any(m in (".u32", ".u64") for m in mods):
+                return self._bfe(ev(srcs[0]), ev(srcs[1]), ev(srcs[2]))
+            return self._opaque_def(d)
 
         return self._opaque_def(d)
 
@@ -436,6 +448,70 @@ class AffineEval:
         parts = [canon(self.of_operand(o, d.index)) for o in inst.operands[1:]]
         slot = "" if d.slot is None else f"#{d.slot}"
         return Opaque(f"{inst.opcode}{''.join(inst.modifiers)}{slot}({','.join(parts)})")
+
+
+# Cap on the number of thread-grid addresses :func:`thread_image` will materialize.
+_MAX_IMAGE = 1 << 16
+
+
+def _bit_basis(ev, aff):
+    """Rewrite ``aff``'s thread-index terms into the ``%tid.<dim>.bit<i>`` basis.
+
+    This basis IS the (warp, lane) decomposition of the thread index: ``%tid.x`` bits [0, 5) are the
+    LANE inside a warp and bits [5, log2(ntid.x)) are the WARP. So a cross-warp shared exchange reads
+    directly off it — a warp leader's store address is a function of the warp bits, the reading
+    warp's load address a function of the lane bits — and enumerating the basis
+    (:func:`thread_image`) composes the two into the real slot <-> warp map.
+
+    Returns ``(uniform_terms, bit_terms, const)`` where ``uniform_terms`` is the frozenset of
+    ``(symbol, coeff)`` that are CONSTANT across a thread block (the shared-array base, ``%ctaid``,
+    kernel params) and ``bit_terms`` maps a bit symbol to its coefficient. ``None`` when a term is
+    not decomposable (a non-power-of-two / unknown ``ntid``, or an unknown varying symbol), in which
+    case the caller must fail closed. Expanding a PLAIN ``%tid.<dim>`` into its bits is exact
+    because ``ntid`` is a power of two, and it keeps the plain and the already-sliced forms of the
+    same thread index on ONE basis so their images cannot be double-counted."""
+    if not isinstance(aff, Affine):
+        return None
+    uniform, bits = [], {}
+    for sym, coeff in aff.terms:
+        parts = sym.split(".")
+        if parts[-1].startswith("bit") and parts[0] in ("%tid", "%laneid"):
+            bits[sym] = bits.get(sym, 0) + coeff  # already on the bit basis
+            continue
+        if parts[0] == "%laneid":
+            stem, n = "%laneid", 32
+        elif parts[0] == "%tid" and len(parts) == 2:
+            stem, n = sym, ev.reqntid.get(parts[1])
+        elif sym.startswith(("sym:", "reg:", "param:", "%ctaid", "%nctaid", "%ntid")):
+            uniform.append((sym, coeff))  # uniform across the block -> not part of the slot index
+            continue
+        else:
+            return None  # an unknown varying symbol -> the image cannot be proven
+        if not _is_pow2(n):
+            return None
+        for i in range(n.bit_length() - 1):
+            b = f"{stem}.bit{i}"
+            bits[b] = bits.get(b, 0) + coeff * (1 << i)
+    return frozenset(uniform), {s: c for s, c in bits.items() if c != 0}, aff.const
+
+
+def thread_image(ev, aff):
+    """``(uniform_key, offsets)`` of an address over the whole thread grid, or ``None``.
+
+    ``uniform_key`` identifies the memory object (the ``global_smem`` base symbol + any block-uniform
+    row offset); ``offsets`` is the frozenset of byte addresses the instruction touches as the thread
+    index ranges over the block. Two accesses can only alias when their ``uniform_key`` matches, and
+    then exactly on the intersection of their ``offsets``."""
+    got = _bit_basis(ev, aff)
+    if got is None:
+        return None
+    uniform, bits, const = got
+    offs = {const}
+    for coeff in bits.values():
+        offs = {o for base in offs for o in (base, base + coeff)}
+        if len(offs) > _MAX_IMAGE:
+            return None
+    return uniform, frozenset(offs)
 
 
 def reqntid_of(func):
