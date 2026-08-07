@@ -1251,9 +1251,19 @@ phases. Neither role changes the numerical matrix operation.
 
 ## AMD TDM Descriptor Loads
 
-`tlx.async_amd_descriptor_load(desc, result, offsets, pred=None)` issues an AMD
-TDM descriptor load from global memory to a TLX local buffer. It is available on
-TDM-capable AMD targets (`gfx1250+`) and should be synchronized with
+`tlx.update_tensor_descriptor(desc, add_offsets=None, set_bounds=None,
+pred=None, clamp_bounds=False)` produces a positioned descriptor SSA value.
+`add_offsets` advances the tile position without changing bounds;
+`set_bounds` rewrites absolute bounds; and `pred` replaces the inherited
+predicate. Use `clamp_bounds=True` with `add_offsets` to derive the remaining
+OOB extent of an advanced tile.
+
+`tlx.async_amd_descriptor_load(desc, result, offsets=None, pred=None,
+clamp_bounds=True)` issues an AMD TDM descriptor load from global memory to a
+TLX local buffer. If `offsets` is omitted, `desc` is used as already positioned
+and its predicate is preserved. The analogous store accepts `offsets=None` for
+the same reason. Both operations are available on TDM-capable AMD targets
+(`gfx1250+`) and should be synchronized with
 `tlx.async_amd_descriptor_wait`.
 
 `tlx.async_amd_descriptor_load_group(descs, results, offsets, warp_masks,
