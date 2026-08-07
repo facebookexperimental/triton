@@ -1,11 +1,11 @@
-"""Forward SmemModel (phase + same-structure guard) soundness + recovery, on hand-crafted PTX.
+"""Forward SmemModel (phase + address match) soundness + recovery, on hand-crafted PTX.
 
-The model records each ``st.shared`` element (scalar OR vector) into the current write phase, closes
-the phase at ``bar.sync``, and resolves a ``ld.shared`` / ``ldmatrix`` against the most-recently closed
-phase: it returns a representative write IFF every write in that phase has the SAME coord-free value
-structure, else it FAILS CLOSED. This replaces the old blanket "vector st.shared -> fail closed" floor
-(D112727538). Sound because the reader's element is interchangeable with any write of the same
-structure; a mixed-structure phase can't be resolved without the exact address -> fail closed.
+The model records each ``st.shared`` element (scalar OR vector) into the current write phase with the
+SLOT IMAGE of its address, closes the phase at ``bar.sync``, and resolves a ``ld.shared`` /
+``ldmatrix`` against the most-recently closed phase in two layers: (1) match the load's slot image
+against the stores' and take the value of the store(s) that actually wrote it — a PROVEN relocation;
+(2) if an address is not provably affine, the older address-blind rule (return a representative iff
+every write in the phase has the same coord-free structure), else FAIL CLOSED.
 
 CPU-only (parses hand-crafted PTX, no GPU)."""
 from bitequiv.ptx.forward.interp import forward_module_descriptor as CHECK
@@ -67,9 +67,10 @@ PTX_VECTOR = _HEAD + """
 }
 """
 
-# MIXED-structure phase: one write is a Leaf (f1), the other a combine add(f1,f2). Their coord-free sigs
-# differ, so a following ld.shared cannot be resolved without the exact address -> FAIL CLOSED (the real
-# soundness guard now that vector stores are modeled).
+# MIXED-structure phase: one write is a Leaf (f1), the other a combine add(f1,f2). Their coord-free
+# sigs differ, so an address-BLIND model cannot tell which the load reads. Both slots are provably
+# affine here, so the address match picks the store that actually wrote the loaded slot (`bufA+0` =
+# the Leaf) and the reconstruction stays faithful.
 PTX_MIXED = _HEAD + """
 .visible .entry k(.param .u64 pin, .param .u64 pout) {
   .reg .f32 %f<8>;
@@ -94,6 +95,66 @@ PTX_MIXED = _HEAD + """
   ld.shared.f32 %f4, [%r2];
   cvta.to.global.u64 %rd7, %rd2;
   st.global.f32 [%rd7], %f4;
+  ret;
+}
+"""
+
+# The same MIXED phase, but the load address is derived from a value LOADED FROM MEMORY, so it is not
+# provably affine: the address match cannot run and the address-blind fallback sees two structures ->
+# FAIL CLOSED (the layered floor).
+PTX_MIXED_OPAQUE_ADDR = _HEAD + """
+.visible .entry k(.param .u64 pin, .param .u64 pout) {
+  .reg .f32 %f<8>;
+  .reg .b32 %r<8>;
+  .reg .b64 %rd<8>;
+  .shared .align 4 .b8 bufA[128];
+  ld.param.u64 %rd1, [pin];
+  ld.param.u64 %rd2, [pout];
+  cvta.to.global.u64 %rd3, %rd1;
+  mov.u32 %r1, %tid.x;
+  mul.wide.u32 %rd4, %r1, 4;
+  add.s64 %rd5, %rd3, %rd4;
+  ld.global.f32 %f1, [%rd5];
+  add.s64 %rd6, %rd5, 4;
+  ld.global.f32 %f2, [%rd6];
+  add.f32 %f3, %f1, %f2;
+  mov.u32 %r2, bufA;
+  st.shared.f32 [%r2], %f1;
+  add.s32 %r3, %r2, 4;
+  st.shared.f32 [%r3], %f3;
+  bar.sync 0;
+  ld.global.u32 %r6, [%rd5];
+  add.s32 %r7, %r2, %r6;
+  ld.shared.f32 %f4, [%r7];
+  cvta.to.global.u64 %rd7, %rd2;
+  st.global.f32 [%rd7], %f4;
+  ret;
+}
+"""
+
+# A load of a slot NO store in the phase wrote (the store lands at bufA+0, the load reads bufA+64).
+# Address-blind the model happily returns the one write it has; with the address it is provably a
+# DIFFERENT slot, so the value read was never captured -> fail closed.
+PTX_UNWRITTEN_SLOT = _HEAD + """
+.visible .entry k(.param .u64 pin, .param .u64 pout) {
+  .reg .f32 %f<4>;
+  .reg .b32 %r<4>;
+  .reg .b64 %rd<8>;
+  .shared .align 4 .b8 bufA[128];
+  ld.param.u64 %rd1, [pin];
+  ld.param.u64 %rd2, [pout];
+  cvta.to.global.u64 %rd3, %rd1;
+  mov.u32 %r1, %tid.x;
+  mul.wide.u32 %rd4, %r1, 4;
+  add.s64 %rd5, %rd3, %rd4;
+  ld.global.f32 %f1, [%rd5];
+  mov.u32 %r2, bufA;
+  st.shared.f32 [%r2], %f1;
+  bar.sync 0;
+  add.s32 %r3, %r2, 64;
+  ld.shared.f32 %f2, [%r3];
+  cvta.to.global.u64 %rd6, %rd2;
+  st.global.f32 [%rd6], %f2;
   ret;
 }
 """
@@ -132,10 +193,25 @@ def test_scalar_and_uniform_vector_agree():
     assert CHECK(PTX_SCALAR) == CHECK(PTX_VECTOR)
 
 
-def test_mixed_structure_phase_fails_closed():
-    # A phase holding writes of DIFFERENT structure (Leaf vs add) cannot be resolved address-blind:
-    # the load could read either -> fail closed (conservative fingerprint), the soundness guard.
-    d = CHECK(PTX_MIXED)
+def test_mixed_structure_phase_resolved_by_address():
+    # A phase holding writes of DIFFERENT structure (Leaf vs add) is ambiguous address-blind, but both
+    # slots are provably affine, so the load is matched to the store that wrote ITS slot (bufA+0, the
+    # Leaf) and the reconstruction stays faithful — and equals the single-store scalar kernel, which
+    # computes exactly the same thing.
+    assert _faithful(CHECK(PTX_MIXED))
+    assert CHECK(PTX_MIXED) == CHECK(PTX_SCALAR)
+
+
+def test_mixed_structure_unprovable_address_fails_closed():
+    # Same mixed phase, but the load address comes from a value read out of memory -> not provably
+    # affine -> the address match cannot run and the address-blind fallback fails closed.
+    d = CHECK(PTX_MIXED_OPAQUE_ADDR)
+    assert d and "fwd-incomplete" in str(d[0])
+
+
+def test_load_of_unwritten_slot_fails_closed():
+    # The loaded slot is provably NOT one this phase wrote, so the value is unmodeled -> fail closed.
+    d = CHECK(PTX_UNWRITTEN_SLOT)
     assert d and "fwd-incomplete" in str(d[0])
 
 
@@ -224,3 +300,113 @@ def test_within_thread_minmax_keeps_column_key():
     # reduction, so it keeps its column key: two different column layouts stay DISTINCT (conservative,
     # so the extent-drop can never merge two genuinely different partial maxes).
     assert CHECK(_minmax_kern(1024, "within")) != CHECK(_minmax_kern(4096, "within"))
+
+
+# --------------------------------------------------------------------------- #
+# Cross-warp num_warps recovery. A matched shared exchange is a RELOCATION: it moves one partial
+# from one thread to another and combines nothing, so it adds no reduction height. Two configs that
+# reduce the same element count in the same balanced count-up order therefore agree even though one
+# splits the work over two warps (and needs the exchange) and the other over one (and does not).
+# --------------------------------------------------------------------------- #
+def _bfly(offs, first):
+    """A butterfly chain of ``add.f32(p, shfl.bfly(p, off))`` over ``offs``, leaf -> root."""
+    out, cur = [], first
+    for i, o in enumerate(offs):
+        out.append(f"  shfl.sync.bfly.b32 %f{10 + i}, {cur}, {o}, 31, -1;")
+        out.append(f"  add.f32 %f{30 + i}, {cur}, %f{10 + i};")
+        cur = f"%f{30 + i}"
+    return "\n".join(out), cur
+
+
+def _one_warp(offs):
+    """32 threads x 2 elements: a within-thread add then a 32-lane butterfly. 64 elements, no
+    shared memory at all."""
+    body, cur = _bfly(offs, "%f3")
+    return _HEAD + f"""
+.visible .entry k(.param .u64 pin, .param .u64 pout) .reqntid 32, 1, 1
+{{
+  .reg .pred %p<4>;
+  .reg .f32 %f<64>;
+  .reg .b32 %r<16>;
+  .reg .b64 %rd<16>;
+  .shared .align 4 .b8 buf[512];
+  ld.param.u64 %rd1, [pin];
+  ld.param.u64 %rd2, [pout];
+  cvta.to.global.u64 %rd3, %rd1;
+  mov.u32 %r1, %tid.x;
+  mul.wide.u32 %rd4, %r1, 4;
+  add.s64 %rd5, %rd3, %rd4;
+  ld.global.f32 %f1, [%rd5];
+  add.s64 %rd6, %rd5, 128;
+  ld.global.f32 %f2, [%rd6];
+  add.f32 %f3, %f1, %f2;
+{body}
+  cvta.to.global.u64 %rd7, %rd2;
+  st.global.f32 [%rd7], {cur};
+  ret;
+}}
+"""
+
+
+def _two_warps(offs):
+    """64 threads x 1 element: a 32-lane butterfly, then a cross-warp exchange through shared memory
+    (warp leader writes slot = warp id, lane `l < 2` reads slot = l) and one more butterfly step.
+    The SAME 64 elements in the same balanced count-up order as :func:`_one_warp`."""
+    body, cur = _bfly(offs, "%f1")
+    return _HEAD + f"""
+.visible .entry k(.param .u64 pin, .param .u64 pout) .reqntid 64, 1, 1
+{{
+  .reg .pred %p<4>;
+  .reg .f32 %f<64>;
+  .reg .b32 %r<16>;
+  .reg .b64 %rd<16>;
+  .shared .align 4 .b8 buf[512];
+  ld.param.u64 %rd1, [pin];
+  ld.param.u64 %rd2, [pout];
+  cvta.to.global.u64 %rd3, %rd1;
+  mov.u32 %r1, %tid.x;
+  mul.wide.u32 %rd4, %r1, 4;
+  add.s64 %rd5, %rd3, %rd4;
+  ld.global.f32 %f1, [%rd5];
+{body}
+  mov.u32 %r2, buf;
+  shr.u32 %r3, %r1, 5;
+  shl.b32 %r4, %r3, 2;
+  add.s32 %r5, %r2, %r4;
+  and.b32 %r6, %r1, 31;
+  setp.eq.b32 %p1, %r6, 0;
+  @%p1 st.shared.f32 [%r5], {cur};
+  bar.sync 0;
+  shl.b32 %r7, %r1, 2;
+  add.s32 %r8, %r2, %r7;
+  setp.lt.u32 %p2, %r1, 2;
+  @%p2 ld.shared.f32 %f50, [%r8];
+  shfl.sync.bfly.b32 %f51, %f50, 1, 31, -1;
+  add.f32 %f52, %f50, %f51;
+  cvta.to.global.u64 %rd9, %rd2;
+  st.global.f32 [%rd9], %f52;
+  ret;
+}}
+"""
+
+
+_UP = [1, 2, 4, 8, 16]     # count-up (inner_tree): the canonical balanced order
+_DOWN = [16, 8, 4, 2, 1]   # count-down (unordered): pairs lanes differently -> different bits
+
+
+def test_cross_warp_exchange_recovers_num_warps():
+    # The slot <-> warp map is provable (store slot = warp id, load slot = lane), so the exchange is a
+    # matched relocation and carries no height: one warp with a two-element within-thread fold and two
+    # warps with a shared exchange collapse to the SAME `ITREE[add.f32;L[];h6;s('1',)]`.
+    assert _faithful(CHECK(_one_warp(_UP)))
+    assert _faithful(CHECK(_two_warps(_UP)))
+    assert CHECK(_one_warp(_UP)) == CHECK(_two_warps(_UP))
+
+
+def test_cross_warp_exchange_splits_on_reduction_order():
+    # Same element count and the same exchange, but a count-DOWN butterfly pairs the lanes
+    # differently, so the bits differ and the descriptors must stay apart -- in both directions of
+    # the comparison, and against the one-warp count-down form too.
+    assert CHECK(_two_warps(_UP)) != CHECK(_two_warps(_DOWN))
+    assert CHECK(_one_warp(_UP)) != CHECK(_one_warp(_DOWN))
+    assert CHECK(_two_warps(_DOWN)) != CHECK(_one_warp(_DOWN))

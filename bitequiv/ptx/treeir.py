@@ -141,11 +141,12 @@ class FpOp:
     fused: bool = False  # True for fma: children = (a, b, c) computing a*b + c
 
     def sig_local(self, child_sigs):
-        # .rn is the DEFAULT rounding for add/mul/fma (op.f32 == op.rn.f32 bit-for-bit), so strip an
-        # explicit .rn there to merge enable_fp_fusion's implicit-vs-explicit-.rn difference (e.g.
-        # the persistent kernel's cross-chunk add). Do NOT touch div/sub/min/max (kept verbatim) —
-        # normalizing those broke welford soundness.
-        m = _norm("".join(self.mods)) if self.kind in ("add", "mul", "fma") else "".join(self.mods)
+        # .rn is the DEFAULT rounding for add/sub/mul/fma (op.f32 == op.rn.f32 bit-for-bit), so strip
+        # an explicit .rn there to merge enable_fp_fusion's implicit-vs-explicit-.rn difference (e.g.
+        # the persistent kernel's cross-chunk add, or softmax's `x - max` with fp fusion off). Do NOT
+        # touch div/min/max (kept verbatim) — normalizing those broke welford soundness, and `div`
+        # genuinely carries its rounding/approximation mode in that modifier.
+        m = _norm("".join(self.mods)) if self.kind in ("add", "sub", "mul", "fma") else "".join(self.mods)
         kids = list(child_sigs)
         if self.fused and len(kids) == 3:
             ab = sorted(kids[:2])
@@ -189,7 +190,11 @@ class ShflCombine:
 class SmemExchange:
     """Warp-leader partials crossing through shared memory (a phase boundary in the
     cross-warp reduction). The transpose itself is implied by the surrounding shuffle
-    offsets; this node just marks the exchange so the tree shape is faithful."""
+    offsets; this node just marks the exchange so the tree shape is faithful.
+
+    An exchange RELOCATES one value from one thread to another — an ``ld.shared`` reads a single slot,
+    so its fan-in is exactly one and it combines nothing. That is why it carries no reduction height
+    (see :func:`bitequiv.ptx.builder._balance_pass`)."""
 
     child: object
 

@@ -91,3 +91,44 @@ def test_affine_value_identity_ignores_range():
     x = Affine(4, frozenset({("%tid.x", 4)}), rng=(0, 512))
     y = Affine(4, frozenset({("%tid.x", 4)}), rng=None)
     assert x == y and hash(x) == hash(y)
+
+
+def test_signed_bfe_is_opaque():
+    # `bfe.s32 d, a, 4, 1` SIGN-EXTENDS the single extracted bit -> 0 or -1, which is how Triton
+    # turns a tid bit into an xor-swizzle mask. Modeling it as the plain 0/1 bit slice would make the
+    # swizzled address provably (and wrongly) affine, so the signed form must stay opaque.
+    assert isinstance(_eval("mov.u32 %r1, %tid.x;\nbfe.s32 %r2, %r1, 4, 1;", "%r2"), Opaque)
+    # The unsigned form IS the plain bit slice and stays exact.
+    u = _eval("mov.u32 %r1, %tid.x;\nbfe.u32 %r2, %r1, 4, 1;", "%r2")
+    assert isinstance(u, Affine) and canon(u) == "1*%tid.x.bit4"
+
+
+def test_symbol_operand_is_a_stable_base():
+    # A bare symbol used as a value (the shared-array base) is a link-time constant, so an address
+    # built on it stays affine instead of poisoning the whole expression to Opaque.
+    v = _eval("mov.b32 %r1, global_smem;\nmov.u32 %r2, %tid.x;\nshl.b32 %r3, %r2, 2;\n"
+              "add.s32 %r4, %r1, %r3;", "%r4")
+    assert isinstance(v, Affine) and canon(v) == "4*%tid.x+1*sym:global_smem"
+
+
+def test_thread_image_enumerates_the_slot_set():
+    from bitequiv.ptx.affine import thread_image
+    src = (f"{_HEADER}.visible .entry k(.param .u64 .ptr .global k_param_0, .param .u32 k_param_1)\n"
+           ".reqntid 128\n{\n.reg .b32 %r<40>;\n.reg .b64 %rd<20>;\n"
+           # a warp-leader store: slot = (tid >> 5) * 4 bytes, i.e. one slot per warp
+           "mov.u32 %r1, %tid.x;\nshr.u32 %r2, %r1, 5;\nshl.b32 %r3, %r2, 2;\n"
+           "mov.b32 %r4, global_smem;\nadd.s32 %r5, %r4, %r3;\n"
+           # the reading warp: slot = lane * 4 bytes
+           "and.b32 %r6, %r1, 31;\nshl.b32 %r7, %r6, 2;\nadd.s32 %r8, %r4, %r7;\n"
+           "ret;\n}\n")
+    m = parse(src)
+    f = [d for d in m.directives if getattr(d, "is_entry", False)][0]
+    du = DefUse(f)
+    ev = AffineEval(du, reqntid_of(f))
+    st = thread_image(ev, ev.of_reg("%r5", len(du.insts)))
+    ld = thread_image(ev, ev.of_reg("%r8", len(du.insts)))
+    base = frozenset({("sym:global_smem", 1)})
+    assert st == (base, frozenset({0, 4, 8, 12}))           # 4 warps at reqntid 128
+    assert ld == (base, frozenset(4 * i for i in range(32)))  # 32 lanes
+    # the store slots are a subset of what the reading warp covers -> the exchange is matched
+    assert st[1] <= ld[1]

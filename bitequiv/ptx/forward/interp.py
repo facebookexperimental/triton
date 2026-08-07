@@ -25,16 +25,16 @@ the affine domain, resolved on demand for leaf coordinates).
 
 import hashlib
 
-from pyptx.ir.nodes import RegisterOperand, VectorOperand
+from pyptx.ir.nodes import AddressOperand, ImmediateOperand, RegisterOperand, VectorOperand
 
-from bitequiv.ptx.affine import AffineEval, canon, reqntid_of
+from bitequiv.ptx.affine import AffineEval, canon, reqntid_of, thread_image
 from bitequiv.ptx.builder import (_forest_postorder, collapse_balanced, collapse_balanced_forest, output_coordfree_keys,
                                   tree_hash, tree_hashes)
 from bitequiv.ptx.forward.cfg import has_unknown_control
 from bitequiv.ptx.forward.loops import (find_loops, loop_accumulates, loop_carried_accumulators,
                                         loop_self_increments)
 from bitequiv.ptx.forward.predicate import PredicateDecoder
-from bitequiv.ptx.leaves import leaf_coord, leaf_columns
+from bitequiv.ptx.leaves import _load_width, leaf_coord, leaf_columns
 from bitequiv.ptx.linker import DefUse, _def_regs, linearize
 from bitequiv.ptx.mma import _fence_all_matmul, _is_mma, _mma_fence, mma_token_counts
 from bitequiv.ptx.treeir import (FpOp, Leaf, LoopReduce, Mma, OpaqueLeaf, OpaqueOp, ShflCombine,
@@ -129,21 +129,32 @@ class ForwardInterp:
         self.ev = AffineEval(self.du, ntid)
         self.colev = AffineEval(self.du, ntid, absorb_opaque=True)
         self.regs = {}  # reg name -> value-DAG Node (or a transient _Shuffle marker)
-        # Forward shared-memory model (PHASE + same-structure guard, address-agnostic). Each st.shared
-        # element's value node is recorded into the current write phase; `bar.sync` closes the phase. A
-        # shared load / ldmatrix resolves against the most-recently CLOSED phase: if EVERY write in that
-        # phase has the SAME coord-free value structure, the load returns one (a SmemExchange over the
-        # cross-warp partial), else it FAILS CLOSED. Sound because the reader's element is interchangeable
-        # with any write of the same structure (same reduction sub-tree, config-invariant column set), so
-        # the following combine reduces the real cross-warp fan-in and `collapse_balanced` makes a
-        # BALANCED exchange num_warps-invariant (the recovery); an UNORDERED partial keeps its num_warps-
-        # bearing physical height (split, correct). A mixed-structure phase can't be resolved without the
-        # exact address -> fail closed. This replaces the old most-recent, scalar-only match and
-        # un-fail-closes the VECTOR st.shared path (recorded per element). `smem_stores` keeps every
-        # (index, node) for the MMA-epilogue sink scan in `_mma_entry_descriptor`.
+        # Forward shared-memory model (PHASE + address match). Each st.shared element is recorded into
+        # the current write phase as (slot image, value node); `bar.sync` closes the phase. A shared
+        # load / ldmatrix resolves against the most-recently CLOSED phase in two layers:
+        #
+        #   1. ADDRESS-MATCHED. Both the load and the stores are evaluated to an affine over the
+        #      `%tid` bit basis — which IS the (warp, lane) decomposition: `%tid.x` bits [0,5) index
+        #      the lane, bits [5,..) the warp. A warp-leader store's slot is then a function of the
+        #      WARP bits and the reading warp's load slot a function of the LANE bits, and composing
+        #      the two images gives the real slot <-> warp map. The load takes the value of the
+        #      store(s) whose slot image it actually intersects, and those must share one coord-free
+        #      structure. A load whose slot NO store in the phase wrote is unmodeled -> FAIL CLOSED.
+        #   2. Otherwise (an address that is not provably affine) the old address-agnostic fallback:
+        #      if EVERY write in the phase has the same coord-free structure, return one. If not even
+        #      that holds, FAIL CLOSED.
+        #
+        # Sound because the reader's element is interchangeable with any write of the same structure
+        # (same reduction sub-tree, config-invariant column set), so the following combine reduces the
+        # real cross-warp fan-in and `collapse_balanced` makes a BALANCED exchange num_warps-invariant
+        # (the recovery); an UNORDERED partial keeps its num_warps-bearing physical height (split,
+        # correct). Layer 1 additionally fails closed on a load whose slot NO store in the phase wrote
+        # (a stale / unrelated shared buffer), which layer 2 alone would silently answer with an
+        # unrelated subtree. `smem_stores` keeps every (index, node) for the MMA-epilogue sink scan in
+        # `_mma_entry_descriptor`.
         self.smem_stores = []
-        self._smem_phase = []  # value nodes written since the last bar (the open phase)
-        self._smem_closed = []  # value nodes of the most-recently closed phase (what a load reads)
+        self._smem_phase = []  # (slot image | None, value node) written since the last bar
+        self._smem_closed = []  # the most-recently closed phase (what a load reads)
         self._cf_hash_memo = {}  # id(node) -> coord-free Merkle hash, for the `_resolve_smem` check
         # Sound floor: set False when the walk hits a cross-thread structure this phase does not
         # model faithfully (a cross-warp shared load). The reconstructed tree is then untrustworthy
@@ -277,7 +288,7 @@ class ForwardInterp:
             # Over-identifying an MMA output only ever ADDS a splitting term (sound, monotone).
             return Mma("mma-out")
         if op == "ld" and ".shared" in mods:
-            src = self._resolve_smem()
+            src = self._resolve_smem(self._load_slot_image(inst, at))
             if src is not None:
                 return SmemExchange(src)  # cross-warp exchange: read the stored partial's subtree
             self.faithful = False  # unresolvable shared load -> fail closed (opaque fallback below)
@@ -286,7 +297,7 @@ class ForwardInterp:
             # Model it like ld.shared -> return a phase partial. The transpose only permutes which
             # element each lane receives; the reduction structure (hence the collapsed, num_warps-
             # invariant descriptor) is identical whichever it reads, so returning one is faithful.
-            src = self._resolve_smem()
+            src = self._resolve_smem(self._load_slot_image(inst, at))
             if src is not None:
                 return SmemExchange(src)
             self.faithful = False  # unresolvable ldmatrix -> fail closed
@@ -310,6 +321,15 @@ class ForwardInterp:
                 return ShflCombine("redux", kind, width, self._node(inst.operands[1], at))
         if op == "mov" and len(inst.operands) == 2 and isinstance(inst.operands[1], RegisterOperand):
             return self._val(inst.operands[1], at)  # pass-through (preserves a _Shuffle / _Packed)
+        if op == "mov" and len(inst.operands) == 2 and isinstance(inst.operands[1], ImmediateOperand):
+            # `mov.b32 %r, 0f3FB8AA3B` IS the constant. Whether ptxas materializes a literal in a
+            # register or feeds it straight to the consumer is a register-allocation choice that
+            # varies with num_warps, so keeping the two forms apart (an `OpaqueOp` carrying the `mov`
+            # token vs the consumer's plain immediate `OpaqueLeaf`) split configs whose arithmetic is
+            # identical (softmax's log2(e) factor). `_val` produces exactly the node an inline
+            # immediate produces, so the two spellings now converge. Value-preserving: a `mov` of an
+            # immediate is the identity on that immediate.
+            return self._val(inst.operands[1], at)
         if _is_packed(inst) and op in _FP_KINDS and len(inst.operands) == 3:
             return self._packed_combine(op, mods, inst.operands[1], inst.operands[2], at)
         if _is_packed(inst) and op == "fma" and len(inst.operands) == 4:
@@ -524,17 +544,48 @@ class ForwardInterp:
             return [self._deref(l) for l in v.lanes]
         return [self._scalar(v)]
 
+    def _slot_image(self, operand, at, byte_offsets=(0, )):
+        """``(uniform_key, byte offsets)`` this shared access touches over the thread grid, or
+        ``None`` when the address is not provably affine. ``byte_offsets`` spreads a vector access
+        over its elements (element ``k`` of a ``.vN`` access sits ``k * width`` bytes past the base):
+        a STORE element gets its own slot, a LOAD gets the union of all the slots it reads."""
+        if not isinstance(operand, AddressOperand):
+            return None
+        img = thread_image(self.ev, self.ev.of_address(operand, at))
+        if img is None:
+            return None
+        uniform, offs = img
+        if byte_offsets == (0, ):
+            return uniform, offs
+        return uniform, frozenset(o + b for o in offs for b in byte_offsets)
+
+    def _load_slot_image(self, inst, at):
+        """Slot image of a shared LOAD, covering every element of a ``.vN`` / ``ldmatrix`` read (the
+        forward walk gives all of them one value node, so they must all be matched)."""
+        if len(inst.operands) < 2:
+            return None
+        dst = inst.operands[0]
+        n = len(dst.elements) if isinstance(dst, VectorOperand) else 1
+        width = _load_width(inst.modifiers) or 0
+        return self._slot_image(inst.operands[1], at, tuple(k * width for k in range(n)))
+
     def _record_shared_store(self, inst, at):
         """Record each ``st.shared`` element (scalar or VECTOR, one write per f32 slot) into the
-        current write phase + the flat ``smem_stores`` (used by the MMA-epilogue sink scan)."""
+        current write phase + the flat ``smem_stores`` (used by the MMA-epilogue sink scan). Each
+        element carries the SLOT IMAGE of the address it lands at, so a later load can be matched to
+        the stores that actually wrote the slot it reads. A ``_Packed`` element (two f32 lanes in one
+        64-bit register) expands to two value nodes that share one slot image — imprecise but
+        conservative: a load matching that slot then has to find BOTH lanes structurally equal."""
         val = inst.operands[1]
         elts = val.elements if isinstance(val, VectorOperand) else [val]
-        for e in elts:
+        width = _load_width(inst.modifiers) or 0
+        for k, e in enumerate(elts):
             if not isinstance(e, RegisterOperand):
                 continue  # an immediate element (a constant) carries no reduction structure
+            img = self._slot_image(inst.operands[0], at, (k * width, ))
             for node in self._store_nodes(e, at):
                 self.smem_stores.append((at, node))
-                self._smem_phase.append(node)
+                self._smem_phase.append((img, node))
 
     def _store_nodes(self, operand, at):
         """Value node(s) an ``st.shared`` element contributes to the write phase. A ``_Packed`` (a
@@ -581,20 +632,29 @@ class ForwardInterp:
                 memo[id(n)] = hashlib.sha1(local.encode()).hexdigest()[:16]
         return memo[id(node)]
 
-    def _resolve_smem(self):
-        """Value subtree a shared load / ldmatrix reads: a representative write from the most-recently
-        CLOSED phase, or ``None`` (fail closed) when the phase is empty or its writes are not all the
-        SAME coord-free structure. Address-agnostic but sound: the reader's element is interchangeable
-        with any write of the same structure (same cross-warp partial sub-tree, config-invariant column
-        set), so returning one is faithful and the following combine reduces the real fan-in. A
-        mixed-structure phase cannot be resolved without the exact address -> fail closed (over-split).
-        Falls back to the still-open phase only when nothing has been closed yet (a load before any bar)."""
+    def _resolve_smem(self, load_img=None):
+        """Value subtree a shared load / ldmatrix reads, or ``None`` to fail closed. See the
+        shared-memory model note in :meth:`__init__` for the two layers.
+
+        Layer 1 (address-matched) needs the load address AND every store address in the phase to be
+        provably affine — an unresolved store could have written the very slot we read — and takes the
+        value of the stores whose slot image the load actually intersects. Those stores must share one
+        coord-free structure, which is what makes returning any one of them faithful. Layer 2 is the
+        old address-agnostic whole-phase check, kept for an unresolved address. Falls back to the
+        still-open phase only when nothing has been closed yet (a load before any bar)."""
         cands = self._smem_closed if self._smem_closed else self._smem_phase
         if not cands:
             return None
-        if len({self._cf_hash(c) for c in cands}) != 1:
+        if load_img is not None and all(si is not None for si, _ in cands):
+            uniform, offs = load_img
+            hit = [n for si, n in cands if si[0] == uniform and (si[1] & offs)]
+            if hit and len({self._cf_hash(n) for n in hit}) == 1:
+                return hit[-1]
+            if not hit:
+                return None  # reads a slot this phase never wrote -> unmodeled -> fail closed
+        if len({self._cf_hash(n) for _, n in cands}) != 1:
             return None  # mixed-structure phase -> ambiguous without the address -> fail closed
-        return cands[-1]
+        return cands[-1][1]
 
     def fingerprint(self):
         """Conservative per-config key used when the reconstruction is not faithful. Folds the
