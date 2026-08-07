@@ -36,7 +36,7 @@ from bitequiv.ptx.forward.loops import (find_loops, loop_accumulates, loop_carri
 from bitequiv.ptx.forward.predicate import PredicateDecoder
 from bitequiv.ptx.leaves import leaf_coord, leaf_columns
 from bitequiv.ptx.linker import DefUse, _def_regs, linearize
-from bitequiv.ptx.mma import _fence_all_matmul, _is_mma, _mma_fence
+from bitequiv.ptx.mma import _fence_all_matmul, _is_mma, _mma_fence, mma_token_counts
 from bitequiv.ptx.treeir import (FpOp, Leaf, LoopReduce, Mma, OpaqueLeaf, OpaqueOp, ShflCombine,
                                  SmemExchange)
 
@@ -748,7 +748,9 @@ def _mma_entry_descriptor(func, fence):
     runs extra fp arithmetic inside the fold (``input_precision=tf32x3``, whose compensation sums are
     grouped per K chunk, so its BLOCK_K IS bit-relevant). The fingerprint — not ``loops=`` alone — is
     the fallback ON PURPOSE: a tcgen05 fold increments no pointer, so ``_loop_steps`` is empty there
-    and ``loops=`` would leave the descriptor chunk-blind exactly where the proof failed."""
+    and ``loops=`` would leave the descriptor chunk-blind exactly where the proof failed. The
+    fail-closed side additionally carries ``mmacnt=`` (:func:`bitequiv.ptx.mma.mma_token_counts`), the
+    matmul reduction extent the fence drops on the strength of a proof that did not hold here."""
     from bitequiv.ptx.forward.loops import is_pure_mma_fold, reduction_trip_signature
     from bitequiv.ptx_reduction import _loop_steps
     parts = [_fence_str(fence)]
@@ -777,6 +779,12 @@ def _mma_entry_descriptor(func, fence):
         # closed on the conservative per-config fingerprint, which carries num_warps, the ordered
         # shuffle sequence and the op counts, so any of those differing splits.
         parts.append("mma+fp|" + interp.fingerprint())
+        # The fingerprint counts every fp op EXCEPT the tensor-core ones, which the fence drops on
+        # purpose (a re-tiling issues a different MMA count over the same dot products). That licence
+        # comes from the pure-fold proof, which just failed here, so put the count back: it is the one
+        # witness of the matmul's REDUCTION EXTENT (attention's head dim, a GEMM's K), which the rest
+        # of the key cannot see. Fail-closed side only -> a proven-pure fold keeps BLOCK_K and v2==v5.
+        parts.append("mmacnt=" + ",".join(f"{t}x{n}" for t, n in mma_token_counts(func)))
     steps = _loop_steps(func)
     # BLOCK_K is bit-neutral only for a PROVEN-pure f16/bf16/tf32 tensor-core fold: native-k is fixed
     # and each MMA's F=25 accumulate is exact, so BLOCK_K then only re-batches the same in-order
