@@ -225,11 +225,17 @@ class _Builder:
         return FpOp(tag, aux, tuple(kids))  # tag == fp kind (add/sub/mul/div/min/max)
 
 
-def _postorder(root):
-    """Nodes of a tree in post-order (children before parents), each visited once even in a
-    shared DAG. Iterative, so deep folds never hit Python's recursion limit."""
+def _forest_postorder(roots):
+    """Nodes of a whole FOREST in post-order (children before parents), each visited once even
+    when the roots share subtrees. Iterative, so deep folds never hit Python's recursion limit.
+
+    Walking (and re-materializing) per root costs O(roots x nodes) on a DAG whose roots share a
+    long chain — a prefix scan, where ``root[i]`` contains ``root[i-1]``, is the worst case. One
+    shared walk makes it O(unique nodes). The emission ORDER differs from the concatenated
+    per-root walks; that is immaterial because every consumer computes a node's value from its
+    children's values, so only children-before-parents matters."""
     order, seen = [], set()
-    stack = [(root, False)]
+    stack = [(r, False) for r in reversed(roots)]
     while stack:
         node, done = stack.pop()
         if id(node) in seen:
@@ -245,6 +251,12 @@ def _postorder(root):
     return order
 
 
+def _postorder(root):
+    """Nodes of one tree in post-order (children before parents), each visited once even in a
+    shared DAG."""
+    return _forest_postorder([root])
+
+
 def tree_sig(root):
     """Full canonical signature string of a tree (readable; for small trees / debugging).
     A shared DAG inlines a shared subtree at each reference, so this can be very large for a
@@ -255,15 +267,25 @@ def tree_sig(root):
     return memo[id(root)]
 
 
+def tree_hashes(roots):
+    """:func:`tree_hash` for EVERY root of one shared DAG, hashing each unique node ONCE.
+
+    A per-root call gives each root a fresh memo, so a subtree shared by k roots is re-hashed k
+    times. The hash is a pure bottom-up Merkle fold — a node's hash is a function of its own local
+    string and its children's hashes, never of which root reached it — so one shared memo yields
+    byte-identical hashes for a fraction of the work."""
+    h = {}
+    for node in _forest_postorder(roots):
+        local = node.sig_local([h[id(c)] for c in node.children])
+        h[id(node)] = hashlib.sha1(local.encode()).hexdigest()[:16]
+    return [h[id(r)] for r in roots]
+
+
 def tree_hash(root):
     """Compact canonical signature: a Merkle hash where each node hashes its local string
     over its children's hashes. Equal trees (including shared DAGs) -> equal hash, computed
     once per unique node, so the descriptor stays O(1)-sized regardless of reduction size."""
-    h = {}
-    for node in _postorder(root):
-        local = node.sig_local([h[id(c)] for c in node.children])
-        h[id(node)] = hashlib.sha1(local.encode()).hexdigest()[:16]
-    return h[id(root)]
+    return tree_hashes([root])[0]
 
 
 def build_trees(func):
@@ -297,13 +319,17 @@ def _is_reduce_node(n):
             or (isinstance(n, ShflCombine) and n.kind in _REDUCE_FP) or isinstance(n, SmemExchange))
 
 
-def _balance_pass(root):
+def _balance_pass(order):
     """Per node: (balanced, height, optok). A subtree is a balanced reduction iff every reduce
     node has children that are balanced reductions of one consistent op AND (for the 2-ary fp
     combine) their heights differ by <= 1 — the AVL property that separates inner_tree's balanced
-    tree from unordered's left-fold. Boundary leaves are trivial arity-1 balanced reductions."""
+    tree from unordered's left-fold. Boundary leaves are trivial arity-1 balanced reductions.
+
+    ``order`` is a post-order node list (one tree's or a whole forest's). Every value is a pure
+    function of the node's own subtree, so a forest-wide pass gives each node exactly the values a
+    per-tree pass would."""
     bal, ht, optok = {}, {}, {}
-    for n in _postorder(root):
+    for n in order:
         if _is_reduce_node(n):
             kids = list(n.children)
             ops = {optok[id(c)] for c in kids if optok[id(c)] is not None}
@@ -526,14 +552,34 @@ def output_coordfree_key(node):
     over-split) descriptor. This blanks more than the guarded reduction collapse (in particular it does
     not re-prove the elementwise assumption for a swizzled address), so it is gated on the empirical
     fuzzer (0 over-merge) rather than statically proven."""
-    for n in _postorder(node):
-        if isinstance(n, OpaqueLeaf) and "imm(" not in n.token:
-            return None  # a lost-provenance (non-constant) value -> unsafe to coord-blank
-        if isinstance(n, OpaqueOp) and not _tok_is_pure(n.token):
-            return None  # an unmodeled value op -> unsafe
-        if isinstance(n, Leaf) and n.coord is None:
-            return None  # no coord at all (not even opaque) -> nothing to blank soundly
-    return _coordfree_sig(node)
+    return output_coordfree_keys([node])[0]
+
+
+def _coordfree_blankable(n):
+    """Is THIS node (ignoring its children) safe to coord-blank? See :func:`output_coordfree_key`."""
+    if isinstance(n, OpaqueLeaf) and "imm(" not in n.token:
+        return False  # a lost-provenance (non-constant) value -> unsafe to coord-blank
+    if isinstance(n, OpaqueOp) and not _tok_is_pure(n.token):
+        return False  # an unmodeled value op -> unsafe
+    if isinstance(n, Leaf) and n.coord is None:
+        return False  # no coord at all (not even opaque) -> nothing to blank soundly
+    return True
+
+
+def output_coordfree_keys(nodes):
+    """:func:`output_coordfree_key` for EVERY output tree of one entry, sharing the safety scan and
+    the signature memo across them, so a subtree several outputs share is scanned and serialized
+    once instead of once per output. Both are pure bottom-up folds, so the returned keys are
+    byte-identical to the per-tree calls. Signatures are built only for the trees that passed the
+    scan (an unsafe tree returns ``None`` and its string is never needed)."""
+    order = _forest_postorder(nodes)
+    safe = {}
+    for n in order:
+        safe[id(n)] = _coordfree_blankable(n) and all(safe[id(c)] for c in n.children)
+    sig, wanted = {}, [n for n in nodes if safe[id(n)]]
+    for n in _forest_postorder(wanted):
+        sig[id(n)] = "L[]" if isinstance(n, Leaf) else n.sig_local([sig[id(c)] for c in n.children])
+    return [sig[id(n)] if safe[id(n)] else None for n in nodes]
 
 
 def _rebuild(n, kids):
@@ -569,20 +615,100 @@ def collapse_balanced(root):
       cross-warp reduction resolved to a representative), the set varies -> distinct -> stays
       over-split (sound, no recovery).
 
-    Iterative (no recursion on deep folds)."""
-    bal, ht, optok = _balance_pass(root)
-    # Collapse every MAXIMAL balanced reduction region, including per-chunk reductions nested
-    # under a persistent kernel's cross-chunk loop. The ITreeReduce token keeps the reduction
-    # height (= log2(BLOCK_N)+const, num_warps-invariant, BLOCK_N-monotone), so different chunk
-    # sizes stay in distinct classes.
-    collapsible = {id(n): (_is_reduce_node(n) and bal[id(n)] and optok[id(n)] is not None) for n in _postorder(root)}
-    has_coll_parent = {}
-    for n in _postorder(root):
+    Iterative (no recursion on deep folds). Use :func:`collapse_balanced_forest` for a multi-output
+    entry — calling this per output rebuilds every shared subtree once per output."""
+    order = _postorder(root)
+    ht, collapsible = _collapse_prep(order)
+    marks = {}
+    for n in order:
         if collapsible[id(n)]:
             for c in n.children:
-                has_coll_parent[id(c)] = True
+                marks[id(c)] = True
+    return _collapse_regions(order, [root], ht, collapsible, marks)[0]
+
+
+def _collapse_prep(order):
+    """(height, collapsible) per node of a post-order list. Collapse every MAXIMAL balanced
+    reduction region, including per-chunk reductions nested under a persistent kernel's cross-chunk
+    loop. The ITreeReduce token keeps the reduction height (= log2(BLOCK_N)+const,
+    num_warps-invariant, BLOCK_N-monotone), so different chunk sizes stay in distinct classes."""
+    bal, ht, optok = _balance_pass(order)
+    return ht, {id(n): (_is_reduce_node(n) and bal[id(n)] and optok[id(n)] is not None) for n in order}
+
+
+def collapse_balanced_forest(roots):
+    """:func:`collapse_balanced` for EVERY output root of one value-DAG, rebuilding each unique node
+    ONCE.
+
+    A per-root call gives each root a fresh output map, so a subtree shared by k roots is
+    re-materialized k times: O(roots x nodes) new node objects, all live at once (measured: a
+    512-root prefix scan expanded a 3,719-node DAG into 631,169 objects, ~2.5 n^2). Every quantity
+    the collapse computes is a pure bottom-up function of a node's own subtree — ``_balance_pass``,
+    ``collapsible``, ``_collapse_info``, ``_shfl_dir``, ``_rebuild`` — with ONE exception: whether a
+    node is a region ROOT also depends on its PARENTS, which are a per-root fact. That flag is
+    resolved by :func:`_shared_region_marks`, which falls back to the exact per-root pass when the
+    roots disagree."""
+    order = _forest_postorder(roots)
+    ht, collapsible = _collapse_prep(order)
+    marks = _shared_region_marks(order, roots, collapsible)
+    if marks is None:
+        return [collapse_balanced(r) for r in roots]
+    return _collapse_regions(order, roots, ht, collapsible, marks)
+
+
+# Cap on the root x node bitmasks :func:`_shared_region_marks` builds (bits, ~8 MB). Beyond it the
+# per-root pass is used instead — same descriptors, just the old cost.
+_MAX_REGION_MARK_BITS = 1 << 26
+
+
+def _shared_region_marks(order, roots, collapsible):
+    """One ``has_coll_parent`` map valid for EVERY root, or ``None`` when the roots disagree.
+
+    :func:`collapse_balanced` treats a collapsible node as a region ROOT only when no collapsible
+    PARENT of it is reachable from that root, so the same shared node can legitimately be a region
+    root under one output and be swallowed by a larger region under another. With one shared memo a
+    node is rebuilt once, so whichever answer came first would silently win for everyone — that
+    would move a collapse boundary and change a descriptor. Decide it exactly with two bitmasks over
+    the roots: ``reach[n]`` = the roots that reach n; ``mark[n]`` = the roots that reach some
+    collapsible parent of n. Root R sees ``has_coll_parent[n] = bit R of mark[n]``, so the roots
+    agree on n iff ``mark[n] & reach[n]`` is empty or is all of ``reach[n]``.
+
+    Only COLLAPSIBLE nodes are checked: ``region_root = collapsible[n] and not has_coll_parent[n]``
+    short-circuits, so the flag is never read anywhere else. That matters — a prefix scan does have
+    nodes whose parents differ per root, but none of them is collapsible, so the shared path stays
+    live exactly where it pays off."""
+    if len(roots) * len(order) > _MAX_REGION_MARK_BITS:
+        return None
+    reach = {}
+    for i, r in enumerate(roots):
+        reach[id(r)] = reach.get(id(r), 0) | (1 << i)
+    for n in reversed(order):  # reversed post-order visits every parent before its children
+        m = reach.get(id(n), 0)
+        if m:
+            for c in n.children:
+                reach[id(c)] = reach.get(id(c), 0) | m
+    mark = {}
+    for n in order:
+        if collapsible[id(n)]:
+            m = reach.get(id(n), 0)
+            for c in n.children:
+                mark[id(c)] = mark.get(id(c), 0) | m
+    out = {}
+    for n in order:
+        if not collapsible[id(n)]:
+            continue
+        m = mark.get(id(n), 0) & reach[id(n)]
+        if m:
+            if m != reach[id(n)]:
+                return None  # some root reaches n without reaching any collapsible parent of it
+            out[id(n)] = True
+    return out
+
+
+def _collapse_regions(order, roots, ht, collapsible, has_coll_parent):
+    """Collapsed tree of each root, sharing one output map over ``order`` (see the two callers)."""
     new = {}
-    for n in _postorder(root):
+    for n in order:
         region_root = collapsible[id(n)] and not has_coll_parent.get(id(n), False)
         info = _collapse_info(n, ht) if region_root else None
         if info is not None:
@@ -611,7 +737,7 @@ def collapse_balanced(root):
                 new[id(n)] = ITreeReduce(op, leaf_sig, ht[id(n)], _shfl_dir(n, ht))
         else:
             new[id(n)] = _rebuild(n, [new[id(c)] for c in n.children])
-    return new[id(root)]
+    return [new[id(r)] for r in roots]
 
 
 def _cols_key(cols):
@@ -634,4 +760,4 @@ def entry_signatures(func):
     roots = build_trees(func)
     if len(roots) == 1:
         roots = [collapse_balanced(roots[0])]
-    return tuple(sorted(tree_hash(t) for t in roots))
+    return tuple(sorted(tree_hashes(roots)))
