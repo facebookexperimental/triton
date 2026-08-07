@@ -2130,6 +2130,7 @@ def test_async_amd_desc_load_compiles_gfx1250(device):
     )
     ttgir = compiled.asm["ttgir"]
     assert "async_tdm_copy_global_to_local" in ttgir
+    assert "clamp_bounds" in ttgir
     assert "async_tdm_wait" in ttgir
     assert "local_load" in ttgir
     assert "amdgcn" in compiled.asm
@@ -2239,6 +2240,109 @@ def test_async_amd_desc_store_compiles_gfx1250(device):
     ttgir = compiled.asm["ttgir"]
     assert "async_tdm_copy_global_to_local" in ttgir
     assert "async_tdm_copy_local_to_global" in ttgir
+    assert ttgir.count("clamp_bounds") == 2
+
+
+@triton.jit
+def _update_tensor_descriptor_store_kernel(
+    x_ptr,
+    y_ptr,
+    M: tl.constexpr,
+    N: tl.constexpr,
+):
+    desc_in = tl.make_tensor_descriptor(x_ptr, [M, N], [N, 1], [M, N])
+    desc_out = tl.make_tensor_descriptor(y_ptr, [M, N], [N, 1], [M, N])
+    load_buf = tlx.local_alloc((M, N), tl.float16, 1)
+    store_buf = tlx.local_alloc((M, N), tl.float16, 1)
+    load_view = tlx.local_view(load_buf, 0)
+    store_view = tlx.local_view(store_buf, 0)
+
+    pred = tl.program_id(0) == 0
+    desc_in = tlx.update_tensor_descriptor(desc_in, set_bounds=[M, N], pred=pred)
+    offset_m = desc_in.shape[0] - M
+    offset_n = (desc_in.strides[1] - 1).to(tl.int32)
+    desc_in = tlx.update_tensor_descriptor(desc_in, add_offsets=[offset_m, offset_n])
+    tlx.async_amd_descriptor_load(desc_in, load_view)
+    tlx.async_amd_descriptor_wait(0)
+    tlx.local_store(store_view, tlx.local_load(load_view))
+
+    desc_out = tlx.update_tensor_descriptor(desc_out, add_offsets=[0, 0], clamp_bounds=True)
+    tlx.async_amd_descriptor_store(desc_out, store_view)
+    tlx.async_amd_descriptor_wait(0)
+
+
+@pytest.mark.skipif(not is_hip(), reason="Requires HIP runtime")
+def test_update_tensor_descriptor_store_compiles_gfx1250(device):
+    compiled = compile_for_gfx1250(
+        _update_tensor_descriptor_store_kernel,
+        signature={"x_ptr": "*fp16", "y_ptr": "*fp16"},
+        constexprs={"M": 32, "N": 32},
+    )
+    ttgir = compiled.asm["ttgir"]
+    assert "amdg.update_tensor_descriptor" in ttgir
+    assert "set_bounds =" in ttgir
+    assert "pred =" in ttgir
+    assert "clamp_bounds" in ttgir
+    assert "amdg.async_tdm_copy_local_to_global" in ttgir
+    assert ttgir.count("clamp_bounds") == 1
+    # Two explicit input updates and one output update are the only descriptor
+    # mutations. Neither pre-positioned copy may add a no-op update.
+    assert ttgir.count("amdg.update_tensor_descriptor") == 3
+
+
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
+def test_update_tensor_descriptor_roundtrip_gfx1250(device):
+    x = torch.randn((32, 32), dtype=torch.float16, device=device)
+    y = torch.empty_like(x)
+    _update_tensor_descriptor_store_kernel[(1, )](x, y, M=32, N=32)
+    torch.testing.assert_close(x, y)
+
+
+@triton.jit
+def _invalid_update_tensor_descriptor_kernel(x_ptr, MODE: tl.constexpr):
+    desc = tl.make_tensor_descriptor(x_ptr, [16, 16], [16, 1], [16, 16])
+    if MODE == 0:
+        desc = tlx.update_tensor_descriptor(desc)
+    elif MODE == 1:
+        desc = tlx.update_tensor_descriptor(desc, pred=True, clamp_bounds=True)
+    elif MODE == 2:
+        desc = tlx.update_tensor_descriptor(
+            desc,
+            add_offsets=[0, 0],
+            set_bounds=[16, 16],
+            clamp_bounds=True,
+        )
+    elif MODE == 3:
+        desc = tlx.update_tensor_descriptor(desc, add_offsets=[0])
+    else:
+        desc = tlx.update_tensor_descriptor(desc, add_offsets=[0, 0])
+
+
+@pytest.mark.parametrize(
+    "mode, error",
+    [
+        (0, "requires at least one"),
+        (1, "clamp_bounds requires add_offsets"),
+        (2, "clamp_bounds and set_bounds are mutually exclusive"),
+        (3, "add_offsets must have length 2"),
+    ],
+)
+def test_update_tensor_descriptor_rejects_invalid_gfx1250(mode, error):
+    with pytest.raises(CompilationError, match=error):
+        compile_for_gfx1250(
+            _invalid_update_tensor_descriptor_kernel,
+            signature={"x_ptr": "*fp16"},
+            constexprs={"MODE": mode},
+        )
+
+
+def test_update_tensor_descriptor_rejects_unsupported_target():
+    with pytest.raises(CompilationError, match="only available on AMD TDM-capable targets"):
+        compile_for_gfx950(
+            _invalid_update_tensor_descriptor_kernel,
+            signature={"x_ptr": "*fp16"},
+            constexprs={"MODE": 4},
+        )
 
 
 @pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
