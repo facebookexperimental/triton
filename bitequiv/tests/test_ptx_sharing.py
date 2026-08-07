@@ -7,9 +7,10 @@ true: the collapsed / hashed trees are byte-identical to the per-root ones (incl
 per-root collapse BOUNDARY legitimately differs between roots), and the node budget fails CLOSED to
 the conservative fingerprint instead of merging. CPU-only."""
 import bitequiv.ptx.forward.interp as interp_mod
-from bitequiv.ptx.builder import _forest_postorder, collapse_balanced, collapse_balanced_forest, tree_hash, tree_hashes
+from bitequiv.core.canonicalize import (_forest_postorder, collapse_balanced, collapse_balanced_forest, tree_hash,
+                                        tree_hashes)
+from bitequiv.core.treeir import FpOp, ITreeReduce, Leaf, OpaqueOp
 from bitequiv.ptx.forward.interp import forward_module_descriptor
-from bitequiv.ptx.treeir import FpOp, ITreeReduce, Leaf, OpaqueOp
 from bitequiv.ptx_reduction import ptx_header
 
 _HDR = ptx_header()

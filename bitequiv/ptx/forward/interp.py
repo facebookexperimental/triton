@@ -4,7 +4,7 @@ Walk ``linearize(func)`` in program order over a symbolic thread, maintaining ``
 (the value-DAG node each register currently holds) plus transient markers (``_Shuffle`` butterfly
 partners, ``_Packed`` f32x2 lane pairs). Each instruction is a transfer function that looks its
 operands up in ``regs`` (forward) instead of resolving them backward. The produced value-DAG reuses
-:mod:`bitequiv.ptx.treeir`, so the same ``collapse_balanced`` + ``tree_hash`` yield a descriptor
+:mod:`bitequiv.core.treeir`, so the same ``collapse_balanced`` + ``tree_hash`` yield a descriptor
 directly comparable to the backward ``entry_signatures`` (the cross-check oracle).
 
 Modeled so far: ``ld.global`` (scalar + vector slots) -> leaves; the fp combines
@@ -27,9 +27,11 @@ import hashlib
 
 from pyptx.ir.nodes import AddressOperand, ImmediateOperand, RegisterOperand, VectorOperand
 
-from bitequiv.ptx.affine import AffineEval, canon, reqntid_of, thread_image
-from bitequiv.ptx.builder import (_forest_postorder, collapse_balanced, collapse_balanced_forest, output_coordfree_keys,
-                                  tree_hash, tree_hashes)
+from bitequiv.core.affine_algebra import canon
+from bitequiv.core.canonicalize import (_forest_postorder, collapse_balanced, collapse_balanced_forest,
+                                        output_coordfree_keys, tree_hash, tree_hashes)
+from bitequiv.core.treeir import FpOp, Leaf, LoopReduce, Mma, OpaqueLeaf, OpaqueOp, ShflCombine, SmemExchange
+from bitequiv.ptx.affine import AffineEval, reqntid_of, thread_image
 from bitequiv.ptx.forward.cfg import has_unknown_control
 from bitequiv.ptx.forward.loops import (find_loops, loop_accumulates, loop_carried_accumulators,
                                         loop_self_increments)
@@ -37,8 +39,6 @@ from bitequiv.ptx.forward.predicate import PredicateDecoder
 from bitequiv.ptx.leaves import _load_width, leaf_coord, leaf_columns
 from bitequiv.ptx.linker import DefUse, _def_regs, linearize
 from bitequiv.ptx.mma import _fence_all_matmul, _is_mma, _mma_fence, mma_token_counts
-from bitequiv.ptx.treeir import (FpOp, Leaf, LoopReduce, Mma, OpaqueLeaf, OpaqueOp, ShflCombine,
-                                 SmemExchange)
 
 _FP_WIDTHS = frozenset({".f16", ".f16x2", ".f32", ".f64", ".bf16", ".bf16x2"})
 _FP_KINDS = frozenset({"add", "sub", "mul", "div", "min", "max"})

@@ -11,9 +11,9 @@ import os
 from pyptx.ir.nodes import Function
 from pyptx.parser import parse
 
-from bitequiv.ptx.builder import _postorder, collapse_balanced
+from bitequiv.core.canonicalize import _postorder, collapse_balanced
+from bitequiv.core.treeir import FpOp, ITreeReduce, Leaf, OpaqueOp, ShflCombine
 from bitequiv.ptx.forward.interp import ForwardInterp, forward_module_descriptor
-from bitequiv.ptx.treeir import FpOp, ITreeReduce, Leaf, OpaqueOp, ShflCombine
 from bitequiv.ptx_reduction import ptx_header
 
 _HDR = ptx_header()

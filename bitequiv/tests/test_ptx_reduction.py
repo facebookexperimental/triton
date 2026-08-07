@@ -67,8 +67,8 @@ def test_each_num_warps_is_a_distinct_ptx_class():
 
 
 def _has_fma(name):
+    from bitequiv.core.treeir import FpOp
     from bitequiv.ptx.builder import build_trees
-    from bitequiv.ptx.treeir import FpOp
     from pyptx.parser import parse
     func = [d for d in parse(_fixture(name)).directives if getattr(d, "is_entry", False)][0]
     seen, stack, found = set(), list(build_trees(func)), False
