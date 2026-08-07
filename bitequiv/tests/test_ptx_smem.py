@@ -269,7 +269,7 @@ def test_cross_thread_minmax_is_extent_free():
     from pyptx.ir.nodes import Function
     from pyptx.parser import parse
 
-    from bitequiv.ptx.builder import collapse_balanced, tree_sig
+    from bitequiv.core.canonicalize import collapse_balanced, tree_sig
     from bitequiv.ptx.forward.interp import ForwardInterp
     from bitequiv.ptx_reduction import _ensure_header
     assert _faithful(CHECK(_minmax_kern(1024, "shfl")))

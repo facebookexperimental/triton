@@ -2,9 +2,9 @@
 interpreter loop-carried add-accumulation -> LoopReduce. CPU-only."""
 from pyptx.parser import parse
 
-from bitequiv.ptx.builder import collapse_balanced, output_coordfree_key, tree_hash
+from bitequiv.core.canonicalize import collapse_balanced, output_coordfree_key, tree_hash
+from bitequiv.core.treeir import FpOp, ITreeReduce, Leaf, LoopReduce, Mma, OpaqueLeaf, OpaqueOp
 from bitequiv.ptx.forward.interp import ForwardInterp, forward_module_descriptor
-from bitequiv.ptx.treeir import FpOp, ITreeReduce, Leaf, LoopReduce, Mma, OpaqueLeaf, OpaqueOp
 from bitequiv.ptx_reduction import _ensure_header
 
 
@@ -147,7 +147,7 @@ def test_coordfree_key_rejects_shfl_bearing():
     # an UNORDERED per-row reduction keeps its cross-thread ShflCombine -> its coord-free string carries
     # the num_warps-bearing offset, so two num_warps still differ (correctly NOT recovered). Here we just
     # confirm the key exists (it is the verbatim-ish coordfree, not None) so the SET still splits by offset.
-    from bitequiv.ptx.treeir import ShflCombine
+    from bitequiv.core.treeir import ShflCombine
     t = ShflCombine(16, "add", (".f32", ), Leaf("c0", frozenset({0})))
     k16 = output_coordfree_key(t)
     k8 = output_coordfree_key(ShflCombine(8, "add", (".f32", ), Leaf("c1", frozenset({1}))))

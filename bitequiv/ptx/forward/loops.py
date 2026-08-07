@@ -12,7 +12,8 @@ descriptor drop its chunk (BLOCK_K) fence.
 """
 from pyptx.ir.nodes import Block, ImmediateOperand, Label, RegisterOperand, VectorOperand
 
-from bitequiv.ptx.affine import Affine, AffineEval, reqntid_of
+from bitequiv.core.affine_algebra import Affine
+from bitequiv.ptx.affine import AffineEval, reqntid_of
 from bitequiv.ptx.linker import DefUse
 from bitequiv.ptx.mma import _is_mma
 
