@@ -6,8 +6,8 @@ import os
 
 from pyptx.parser import parse
 
+from bitequiv.core.treeir import FpOp, Leaf, ShflCombine, SmemExchange
 from bitequiv.ptx.builder import build_trees, entry_signatures
-from bitequiv.ptx.treeir import FpOp, Leaf, ShflCombine, SmemExchange
 
 _FIX = os.path.join(os.path.dirname(__file__), "fixtures", "ptx")
 

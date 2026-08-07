@@ -669,8 +669,9 @@ def parse_args(argv):
                    help="config-subset x fuzz-seeds x input-size for precision/performance "
                    "(other stages always run at mid)")
     p.add_argument("--checker", default=_DEFAULT_CHECKER, help="module:function descriptor (default: repo checker)")
-    p.add_argument("--artifact", default="ptx", choices=("ptx", "ttgir"),
-                   help="which compiled IR artifact to feed the checker (default: ptx)")
+    p.add_argument("--artifact", default="ptx", choices=("ptx", "ttgir", "amdgcn"),
+                   help="which compiled IR artifact to feed the checker (default: ptx; amdgcn for the "
+                   "AMD forward checker bitequiv.amdgcn.forward.interp:forward_module_descriptor)")
     p.add_argument(
         "--allow-unsound", action="store_true",
         help="report over-merges but exit 0 instead of 1 — for checkers that are "
