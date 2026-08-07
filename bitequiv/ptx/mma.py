@@ -94,10 +94,15 @@ def _dtype_family(dtypes):
 
 
 def _fence_all_matmul(fence):
-    """True iff every token in an :func:`_mma_fence` is the canonical non-fp8 ``matmul|`` form — i.e. a
-    pure f16/bf16/tf32 tensor-core GEMM. The forward descriptor uses this to drop the bit-free
-    ``loops=`` (BLOCK_K) for such GEMMs, while keeping it for fp8 (``max_num_imprecise_acc`` cadence)
-    and the native-form cases."""
+    """True iff every token in an :func:`_mma_fence` is the canonical non-fp8 ``matmul|`` form, i.e.
+    every tensor-core op in the entry accumulates its products EXACTLY (the f16/bf16/tf32 families;
+    fp8's ``max_num_imprecise_acc`` cadence does not, and keeps its native form).
+
+    This is a statement about the MMA DTYPE only. It says nothing about what the loop around the MMA
+    does, so it is NOT on its own a licence to drop the chunk (BLOCK_K) fence — the forward descriptor
+    pairs it with :func:`bitequiv.ptx.forward.loops.is_pure_mma_fold`, which proves the fold structure
+    separately. Reading this predicate as "so the entry is a plain GEMM" is an open-world guess: every
+    tensor-core kernel that is not one (``input_precision=tf32x3``, attention, ...) also passes it."""
     return fence is not None and fence[0] == "mma" and all(t.startswith("matmul|") for t in fence[1])
 
 

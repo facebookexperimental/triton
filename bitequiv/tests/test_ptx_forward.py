@@ -211,21 +211,65 @@ def _mma_body(body):
 
 def test_mma_within_thread_reduction_rides_fingerprint():
     # A within-thread add fold over the 4 MMA-output lanes (no shfl.bfly) is a reduction over the MMA
-    # output -> the descriptor carries "mma+red" (the fingerprint), not the fence alone.
+    # output -> the descriptor carries the fingerprint ("mma+fp"), not the fence alone.
     (desc, ) = forward_module_descriptor(
         _mma_body(_WGMMA4 + "add.f32 %f5, %f1, %f2;\nadd.f32 %f6, %f5, %f3;\n"
                   "add.f32 %f7, %f6, %f4;\nst.global.f32 [%rd2], %f7;\n"))
-    assert desc.startswith("mma|") and "mma+red" in desc
+    assert desc.startswith("mma|") and "mma+fp" in desc
+
+
+# -- Phase 4c: the chunk (BLOCK_K) fence is dropped only for a PROVEN-pure MMA fold ----------
+# Dropping ``loops=`` recovers BLOCK_K and merges mma.sync with tcgen05, but it is bit-safe only when
+# one loop iteration contributes nothing but MMA products to an accumulator nothing else touches
+# (``is_pure_mma_fold``). Deciding it from the MMA dtype alone ("all tokens are matmul| => a plain
+# GEMM") admits every tensor-core kernel that is NOT a plain GEMM -- measured on
+# ``input_precision=tf32x3``, whose 3-pass f32 emulation sums its compensation products INSIDE the K
+# loop, so its BLOCK_K IS bit-relevant and the checker merged 4 distinct bit classes into 2.
+
+def _mma_fold(step, in_loop="", epilogue=""):
+    """A K-loop folding one MMA per iteration with chunk step ``step``, plus optional extra
+    arithmetic INSIDE the loop and an ``epilogue`` after it."""
+    return (_HDR + ".visible .entry k(.param .u64 po)\n{\n"
+            ".reg .b64 %rd<8>;\n.reg .f32 %f<16>;\n.reg .b32 %r<8>;\n.reg .pred %p<4>;\n"
+            "ld.param.u64 %rd1, [po];\ncvta.to.global.u64 %rd2, %rd1;\nmov.b32 %r2, 0;\n"
+            "$L__K:\n" + _WGMMA4 + in_loop + f"add.s32 %r2, %r2, {step};\n"
+            "setp.lt.s32 %p1, %r2, 1024;\n@%p1 bra $L__K;\n" + epilogue +
+            "st.global.f32 [%rd2], %f1;\nret;\n}\n")
+
+
+def test_pure_mma_fold_recovers_block_k():
+    # A K-loop whose body is nothing but the MMA: re-chunking it re-batches the SAME in-order k-fold,
+    # so the two chunk steps must land on ONE descriptor (the tiling-invariant fence alone).
+    a = forward_module_descriptor(_mma_fold(32))
+    b = forward_module_descriptor(_mma_fold(64))
+    assert a == b and "loops=" not in a[0] and "fwd-incomplete" not in a[0]
+
+
+def test_extra_arithmetic_in_fold_keeps_chunk_fence():
+    # Extra fp arithmetic INSIDE the fold (the tf32x3 compensation shape) makes the chunking
+    # bit-relevant -> fail closed: the chunk fence rides and the two chunk steps must SPLIT.
+    comp = "sub.f32 %f6, %f7, %f8;\n"
+    a = forward_module_descriptor(_mma_fold(32, in_loop=comp))
+    b = forward_module_descriptor(_mma_fold(64, in_loop=comp))
+    assert a != b and "loops=32" in a[0] and "fwd-incomplete" in a[0]
 
 
 def test_mma_elementwise_epilogue_stays_pure_fence():
     # An elementwise epilogue (acc + bias): the add has a non-Mma child (bias from ld.global), so it is
-    # NOT a reduction over the MMA output -> the clean tiling-invariant fence, no "mma+red" (must not
-    # over-split the pure GEMMs, e.g. gemm_bias_relu).
+    # NOT a reduction over the MMA output, and it sits outside the fold -> the clean tiling-invariant
+    # fence (must not over-split the pure GEMMs, e.g. gemm_bias_relu).
     (desc, ) = forward_module_descriptor(
-        _mma_body(_WGMMA4 + "ld.global.f32 %f5, [%rd2];\nadd.f32 %f6, %f1, %f5;\n"
-                  "st.global.f32 [%rd2], %f6;\n"))
-    assert desc.startswith("mma|") and "mma+red" not in desc
+        _mma_fold(32, epilogue="ld.global.f32 %f5, [%rd2];\nadd.f32 %f1, %f1, %f5;\n"))
+    assert desc.startswith("mma|") and "fwd-incomplete" not in desc
+
+
+def test_epilogue_arithmetic_does_not_trip_the_fold():
+    # The same fp op AFTER the loop (gemm_bias_relu's elementwise epilogue) cannot regroup the k-fold,
+    # so the recognizer must stay LOOP-SCOPED: the chunk steps still merge on the pure fence.
+    epi = "ld.global.f32 %f5, [%rd2];\nfma.rn.f32 %f1, %f1, %f5, %f5;\n"
+    a = forward_module_descriptor(_mma_fold(32, epilogue=epi))
+    b = forward_module_descriptor(_mma_fold(64, epilogue=epi))
+    assert a == b and "loops=" not in a[0] and "fwd-incomplete" not in a[0]
 
 
 def test_mma_reduction_orders_do_not_over_merge():
