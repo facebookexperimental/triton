@@ -1410,6 +1410,18 @@ hand-poking attributes.
 Currently consumed only by the scaled-WMMA pattern (gfx1250). Regular
 `tt.dot` WMMA and the MFMA patterns do not read it.
 
+### Explicit WMMA layout pinning
+
+`tlx.require_amd_wmma_layout(x, version=3, transposed=True, warp_bases=...,
+reg_bases=..., instr_shape=(16, 16, 128))` pins a tensor to an explicit AMD
+WMMA register/warp layout. This is useful for tuned gfx1250 epilogues that must
+retain the accumulator ownership chosen by `tiles_per_warp` across otherwise
+layout-neutral tensor operations. The bases contain one linear-layout basis
+vector per register or warp bit and must match the tensor rank.
+
+The helper lowers to a pinned `tlx.require_layout`; omit it when automatic
+layout propagation is sufficient.
+
 ## Kernels Implemented with TLX
 
 ### GEMM kernels
