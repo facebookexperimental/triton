@@ -236,7 +236,10 @@ public:
       dumpAfter(moduleOp, "doValidateTMAStoreAnnotations");
     }
 
-    doCodePartition(funcOp, numStages);
+    if (failed(doCodePartition(funcOp, numStages))) {
+      signalPassFailure();
+      return;
+    }
     dumpAfter(moduleOp, "doCodePartition");
 
     if (pingpongAutoWS) {

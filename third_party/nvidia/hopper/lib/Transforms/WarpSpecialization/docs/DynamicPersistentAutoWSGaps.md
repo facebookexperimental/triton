@@ -188,21 +188,29 @@ Broadcast depth defaults to one, which keeps partitions in lockstep at the tile
 claim. Depth greater than one is covered by lit but lacks runtime correctness
 and performance coverage.
 
-## 2-CTA Gap
+## 2-CTA / physical-cluster status
 
-Dynamic persistence with a 2-CTA MMA requires one logical tile claim per CTA
-cluster. The current scheduler seeds work from physical program IDs, and the
-atomic broadcast synchronizes warp partitions within a CTA. It does not define:
+The atomic dynamic scheduler now has a backend-only physical-cluster protocol.
+An early pass proves and tags the canonical scheduler before AutoWS. During
+code partitioning, after accumulation counters are established but before
+physical partition cloning, the compiler makes cluster rank zero reserve `K`
+consecutive PIDs, distributes the base via DSM, and derives
+`base + cluster_cta_rank`. A standalone late pass performs the same lowering
+without WS. Full/empty remote mbarriers protect publication and reuse. This
+composes with the existing intra-CTA AutoWS atomic broadcast rather than
+replacing it.
 
-- physical-CTA to logical-cluster tile mapping;
-- which CTA owns the cluster's atomic claim;
-- how the claimed tile ID is distributed to the peer CTA;
-- counter initialization and termination accounting per cluster.
+The implementation uses the product of explicit `ctas_per_cga` dimensions, so
+`(2,1)`, `(2,2)`, and `(4,1)` use the same protocol. The compiler linearizes
+physical cluster coordinates but deliberately does not define the problem's
+1-D-to-2-D tile mapping. The kernel owns that mapping, schedule padding, and
+cluster-aligned counter initialization. Compilation fails before barriers are
+introduced unless the canonical loop and divisibility proof succeed.
 
-Therefore dynamic 2-CTA should be treated as a separate feature after basic
-outer-while AutoWS works. Reusing the intra-CTA atomic broadcast without a
-cluster-level ownership protocol would allow both CTAs to advance the global
-counter independently.
+Focused lit coverage exists for `(2,2)` and `(4,1)`, and the unified Blackwell
+tutorial matrix includes clustered dynamic scheduling under Meta AutoWS. A
+second Blackwell runtime test covers the standalone non-WS lowering. Additional
+cluster shapes remain coverage work, not a frontend API gap.
 
 ## Frontend and Configuration Gaps
 

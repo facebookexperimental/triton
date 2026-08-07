@@ -814,6 +814,7 @@ class CUDABackend(BaseBackend):
         if (capability // 10 >= 10 and opt.cluster_dims is not None and max(opt.cluster_dims) >= 2
                 and opt.ctas_per_cga is not None):
             nvidia.passes.ttnvgpuir.add_check_matmul_two_cta(pm)
+            nvidia.passes.ttnvgpuir.add_atomic_tile_scheduler_prepare(pm)
         # optimize TTGIR
         ptx_version = get_ptx_version_from_options(opt, capability)
         max_vec_bits = 256 if capability >= 100 and ptx_version >= 88 else 128
@@ -961,6 +962,7 @@ class CUDABackend(BaseBackend):
             # CLC tile scheduler (Stage 4): materialize the async-token form into
             # the response buffer + completion mbarrier. Explicit clusters also
             # get a reuse rendezvous. Runs after warp specialization.
+            nvidia.passes.ttnvgpuir.add_atomic_tile_scheduler_materialize(pm)
             nvidia.passes.ttnvgpuir.add_clc_materialize(pm)
             nvidia.passes.ttnvgpuir.add_remove_tmem_tokens(pm)
             # 2-CTA: Insert cross-CTA sync AFTER all WS passes.

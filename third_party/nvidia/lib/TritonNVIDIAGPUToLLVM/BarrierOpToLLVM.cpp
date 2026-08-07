@@ -404,7 +404,7 @@ struct ArriveBarrierOpConversion
     // perThread arrives are per-thread (no leader pattern) and must NOT emit a
     // CTA-wide barrier -- doing so would deadlock under warp specialization
     // where not all threads of the CTA reach the arrive.
-    if (!isPerThread)
+    if (!isPerThread && !op.getWarpGroupLeader())
       ttg::BarrierOp::create(rewriter, loc, ttg::AddrSpace::Local);
 
     // A barrier physically in cluster shared memory must be signalled with
@@ -459,7 +459,7 @@ struct ArriveBarrierOpConversion
 
       std::stringstream ptxAsm;
       ptxAsm << "@$0 mbarrier.arrive.";
-      if (op.isMulticast())
+      if (op.isMulticast() || isRemoteBarrier)
         ptxAsm << "release.cluster.";
       ptxAsm << (isRemoteBarrier || isCrossCluster || op.isMulticast()
                      ? "shared::cluster"
