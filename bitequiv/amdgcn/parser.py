@@ -65,6 +65,7 @@ class Function:
     body: list
     reqntid: dict = field(default_factory=dict)  # {'x': flat_workgroup_size} when known
     directives: tuple = ()
+    labels: dict = field(default_factory=dict)  # local label name -> index into `body` (loop analysis)
 
 
 # ---- tokenizing -----------------------------------------------------------
@@ -230,13 +231,17 @@ def parse(text):
     while i < n:
         name = _label_of(lines[i])
         if name in names:
-            body = []
+            body, labels = [], {}
             i += 1
             while i < n:
                 lab = _label_of(lines[i])
                 if lab in names:  # next kernel starts
                     i -= 1
                     break
+                if lab is not None:  # a local (loop) label -> record where it points into `body`
+                    labels[lab] = len(body)
+                    i += 1
+                    continue
                 inst = parse_instruction(lines[i])
                 if inst is not None:
                     body.append(inst)
@@ -244,6 +249,6 @@ def parse(text):
                         break
                 i += 1
             reqntid = {"x": wg[name]} if name in wg else {}
-            funcs.append(Function(name=name, is_entry=True, body=body, reqntid=reqntid))
+            funcs.append(Function(name=name, is_entry=True, body=body, reqntid=reqntid, labels=labels))
         i += 1
     return funcs
