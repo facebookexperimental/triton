@@ -11,6 +11,7 @@ add_triton_library(TritonGPUModuloCore
   ModuloScheduling/SwingScheduler.cpp
   ModuloScheduling/ExhaustiveScheduler.cpp
   ModuloScheduling/Z3ConstraintEncoder.cpp
+  ModuloScheduling/Z3JointSolver.cpp
   ModuloScheduling/ModuloScheduleGraph.cpp
 
   LINK_LIBS PUBLIC
