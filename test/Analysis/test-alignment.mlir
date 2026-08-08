@@ -275,6 +275,29 @@ tt.func @rem() {
 
 // -----
 
+// Preserve useful subgroup information through the nested quotient/remainder
+// decomposition used by gather-transpose pointer tensors.
+tt.func @partial_div_rem_groups() {
+  // expected-remark @below {{contiguity = [128], divisibility = [1073741824], constancy = [1], constant_value = <none>}}
+  %n = tt.make_range {end = 128 : i32, start = 0 : i32} : tensor<128xi32>
+  // expected-remark @below {{contiguity = [1], divisibility = [64], constancy = [128], constant_value = 64}}
+  %c64 = arith.constant dense<64> : tensor<128xi32>
+  // Two contiguous groups of [0, ..., 63].
+  // expected-remark @below {{contiguity = [64], divisibility = [64], constancy = [1], constant_value = <none>}}
+  %token = arith.remsi %n, %c64 : tensor<128xi32>
+  // expected-remark @below {{contiguity = [1], divisibility = [8], constancy = [128], constant_value = 8}}
+  %c8 = arith.constant dense<8> : tensor<128xi32>
+  // [0 x 8, 1 x 8, ..., 7 x 8] repeated twice.
+  // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [8], constant_value = <none>}}
+  %group = arith.divsi %token, %c8 : tensor<128xi32>
+  // Eight contiguous groups [0, ..., 7].
+  // expected-remark @below {{contiguity = [8], divisibility = [8], constancy = [1], constant_value = <none>}}
+  %within_group = arith.remsi %token, %c8 : tensor<128xi32>
+  tt.return
+}
+
+// -----
+
 tt.func @expanddims() {
   // expected-remark @below {{contiguity = [128], divisibility = [1073741824], constancy = [1], constant_value = <none>}}
   %0 = tt.make_range {end = 128 : i32, start = 0 : i32} : tensor<128xi32>

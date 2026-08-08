@@ -453,7 +453,11 @@ private:
     // the minimal constancy is gcd(d_lhs, d_rhs).
     // Since gcd(d_lhs, d_rhs) maybe > len(lhs),
     // we need to use another gcd to get the actual constancy.
-    if (AxisInfoVisitor::isContiguousDim(lhs, shape, dim) &&
+    // Full-dimension contiguity is not required.  A partially contiguous
+    // numerator still produces constant runs after integer division when the
+    // run boundaries are aligned to the divisor.  The gcd below encodes both
+    // the run length and that alignment.
+    if (lhs.getContiguity(dim) > 1 &&
         AxisInfoVisitor::isConstantDim(rhs, shape, dim)) {
       constancy = std::max(constancy,
                            gcd(lhs.getContiguity(dim), lhs.getDivisibility(dim),
@@ -514,7 +518,13 @@ private:
     // The minimal contiguity is gcd(d_lhs, d_rhs).
     // Since gcd(d_lhs, d_rhs) maybe > len(lhs),
     // we need to use another gcd to get the actual contiguity.
-    if (AxisInfoVisitor::isContiguousDim(lhs, shape, dim) &&
+    // Partial contiguity is sufficient here.  For example, if lhs repeats
+    // contiguous groups of 64 elements, `lhs % 8` repeats contiguous groups
+    // of 8 elements even when the tensor dimension itself is larger than 64.
+    // The gcd with lhs divisibility and the divisor below ensures that group
+    // boundaries are aligned, so requiring full-dimension contiguity loses
+    // valid information without making the inference safer.
+    if (lhs.getContiguity(dim) > 1 &&
         AxisInfoVisitor::isConstantDim(rhs, shape, dim)) {
       contiguity = gcd(lhs.getContiguity(dim), lhs.getDivisibility(dim),
                        rhs.getDivisibility(dim));
