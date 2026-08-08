@@ -2622,10 +2622,22 @@ static inline int td_convert_args(TritonDispatcher *self,
   return 0;
 }
 
+/* Read one grid dimension from a Python int, normalizing an empty grid to 0.
+ * triton_launch_kernel() treats a non-positive grid as a no-op launch, so the
+ * dispatcher must too: casting a negative dimension straight to unsigned would
+ * wrap it into a huge gridDim that cuLaunchKernelEx rejects with
+ * CUDA_ERROR_INVALID_VALUE. */
+static inline unsigned td_grid_dim(PyObject *obj) {
+  long v = PyLong_AsLong(obj);
+  return v > 0 ? (unsigned)v : 0u;
+}
+
 /* Relaunch with pre-built attrs (cuLaunchKernelEx wrapper) */
 static inline CUresult td_relaunch(TritonDispatcher *d, unsigned gx,
                                    unsigned gy, unsigned gz, CUstream stream) {
-  if (gx * gy * gz == 0)
+  /* Per-dimension, not gx * gy * gz: the product overflows to 0 for legal
+   * grids such as (1 << 26, 64, 1), which would silently skip the launch. */
+  if (gx == 0 || gy == 0 || gz == 0)
     return CUDA_SUCCESS;
   if (d->use_core_launch) {
     /* Converged path: launch through the shared core in launch.h. */
@@ -2964,12 +2976,12 @@ static PyObject *TritonDispatcher_vectorcall(PyObject *callable,
   if (PyErr_Occurred())
     return NULL;
 
+  if (gx_l <= 0 || gy_l <= 0 || gz_l <= 0)
+    Py_RETURN_NONE;
+
   unsigned gx = (unsigned)gx_l;
   unsigned gy = (unsigned)gy_l;
   unsigned gz = (unsigned)gz_l;
-
-  if (gx * gy * gz == 0)
-    Py_RETURN_NONE;
 
   CUstream stream = (CUstream)(uintptr_t)PyLong_AsUnsignedLongLong(args[3]);
 
@@ -3117,12 +3129,9 @@ static PyObject *JITRunner_new(PyTypeObject *type, PyObject *args,
   Py_INCREF(dispatcher_obj);
 
   Py_ssize_t gs = PyTuple_Size(grid_tuple);
-  self->grid[0] =
-      (gs > 0) ? (unsigned)PyLong_AsLong(PyTuple_GET_ITEM(grid_tuple, 0)) : 1;
-  self->grid[1] =
-      (gs > 1) ? (unsigned)PyLong_AsLong(PyTuple_GET_ITEM(grid_tuple, 1)) : 1;
-  self->grid[2] =
-      (gs > 2) ? (unsigned)PyLong_AsLong(PyTuple_GET_ITEM(grid_tuple, 2)) : 1;
+  self->grid[0] = (gs > 0) ? td_grid_dim(PyTuple_GET_ITEM(grid_tuple, 0)) : 1;
+  self->grid[1] = (gs > 1) ? td_grid_dim(PyTuple_GET_ITEM(grid_tuple, 1)) : 1;
+  self->grid[2] = (gs > 2) ? td_grid_dim(PyTuple_GET_ITEM(grid_tuple, 2)) : 1;
 
   self->get_stream_fn = get_stream_fn;
   Py_INCREF(get_stream_fn);
@@ -3385,12 +3394,9 @@ static PyObject *fast_subscript(PyObject *self, PyObject *grid) {
     pr->dispatcher = (TritonDispatcher *)disp;
     Py_INCREF(disp);
     Py_ssize_t gs = PyTuple_Size(grid_tuple);
-    pr->grid[0] =
-        (gs > 0) ? (unsigned)PyLong_AsLong(PyTuple_GET_ITEM(grid_tuple, 0)) : 1;
-    pr->grid[1] =
-        (gs > 1) ? (unsigned)PyLong_AsLong(PyTuple_GET_ITEM(grid_tuple, 1)) : 1;
-    pr->grid[2] =
-        (gs > 2) ? (unsigned)PyLong_AsLong(PyTuple_GET_ITEM(grid_tuple, 2)) : 1;
+    pr->grid[0] = (gs > 0) ? td_grid_dim(PyTuple_GET_ITEM(grid_tuple, 0)) : 1;
+    pr->grid[1] = (gs > 1) ? td_grid_dim(PyTuple_GET_ITEM(grid_tuple, 1)) : 1;
+    pr->grid[2] = (gs > 2) ? td_grid_dim(PyTuple_GET_ITEM(grid_tuple, 2)) : 1;
 
     pr->get_stream_fn = gsf;
     Py_INCREF(gsf);
