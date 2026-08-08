@@ -10,8 +10,9 @@
 
 namespace mlir::triton::gpu {
 
-/// Solve a joint-solver-0.1 scheduling problem in process. Returns failure
-/// when Z3 support is disabled or the problem schema is unsupported.
+/// Dispatch joint-solver-0.1 schedule problems and joint-solver-0.2 partition
+/// or joint problems to their in-process Z3 backends. Returns failure when Z3
+/// support is disabled or the problem schema is unsupported.
 FailureOr<std::string> runZ3JointSolver(llvm::StringRef problemJson);
 
 } // namespace mlir::triton::gpu

@@ -89,7 +89,10 @@ static std::string buildProblemJSON(const DataDependenceGraph &ddg, int minII,
     });
   }
 
-  double timeLimitS = 20.0;
+  // The wall clock is only a backstop against a hang; the deterministic
+  // rlimit budget in the solver is what is meant to stop the search, so this
+  // is set well above the time that budget normally takes to run out.
+  double timeLimitS = 180.0;
   if (auto env = tools::getStrEnv("TRITON_MODULO_JOINT_SOLVER_TIMEOUT_S");
       !env.empty())
     timeLimitS = std::max(1.0, std::atof(env.c_str()));
@@ -109,6 +112,16 @@ static std::string buildProblemJSON(const DataDependenceGraph &ddg, int minII,
       {"edges", std::move(edges)},
       {"buffers", std::move(buffers)},
   };
+  // Escape hatches for the deterministic budget, mirroring the timeout knob
+  // above. Both travel in the request, so they land in the solver cache key
+  // automatically and cannot silently return an answer found under a
+  // different budget.
+  if (auto env = tools::getStrEnv("TRITON_MODULO_JOINT_SOLVER_RLIMIT");
+      !env.empty())
+    root["rlimit"] = std::max<int64_t>(0, std::atoll(env.c_str()));
+  if (auto env = tools::getStrEnv("TRITON_MODULO_JOINT_SOLVER_SEED");
+      !env.empty())
+    root["random_seed"] = std::max<int64_t>(0, std::atoll(env.c_str()));
   std::string out;
   llvm::raw_string_ostream os(out);
   os << llvm::json::Value(std::move(root));
@@ -152,11 +165,14 @@ static bool verifySolution(const DataDependenceGraph &ddg,
   }
   ModuloReservationTable table(res.II);
   for (const auto &node : ddg.getNodes()) {
+    auto cycleIt = res.nodeToCycle.find(node.idx);
+    if (cycleIt == res.nodeToCycle.end() || cycleIt->second < 0)
+      return false;
     if (node.pipeline == HWPipeline::NONE)
       continue;
     int dur = nodeDuration(node);
-    int cycle = res.nodeToCycle.lookup(node.idx);
-    if (cycle < 0 || dur > res.II)
+    int cycle = cycleIt->second;
+    if (dur > res.II)
       return false;
     if (!table.isIntervalFree(cycle, node.pipeline, dur)) {
       LLVM_DEBUG(DBGS() << "verify: reservation conflict at N" << node.idx
@@ -220,6 +236,9 @@ runJointSolverSchedule(const DataDependenceGraph &ddg, int minII,
   }
   if (result.nodeToCycle.size() != ddg.getNumNodes())
     return failure();
+  for (const auto &node : ddg.getNodes())
+    if (!result.nodeToCycle.contains(node.idx))
+      return failure();
 
   // TRITON_MODULO_SCHED_SHIFT=k (debug): rigidly translate the solution by
   // +k cycles before verification. A modulo schedule is model-equivalent
