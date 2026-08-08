@@ -12,6 +12,11 @@
 #include "llvm/Support/JSON.h"
 #include "llvm/Support/raw_ostream.h"
 #include <cstdlib>
+#include <list>
+#include <mutex>
+#include <optional>
+#include <string>
+#include <unordered_map>
 
 #define DEBUG_TYPE "modulo-scheduling-joint-solver"
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
@@ -44,7 +49,8 @@ static int serialUpperBound(const DataDependenceGraph &ddg, int minII) {
 }
 
 static std::string buildProblemJSON(const DataDependenceGraph &ddg, int minII,
-                                    int maxII, int smemBudget, int tmemColLimit) {
+                                    int maxII, int smemBudget,
+                                    int tmemColLimit) {
   // Streaming classification (Twill §5.3): a variable-latency op with no
   // incoming data dependence (TMA input loads) runs ahead of the pipeline
   // behind its ring buffer, so in steady state its consumers do not wait its
@@ -184,8 +190,127 @@ static bool verifySolution(const DataDependenceGraph &ddg,
   return true;
 }
 
+namespace {
+
+constexpr size_t kJointSolverCacheCapacity = 64;
+
+static void writeCanonicalJSON(llvm::raw_ostream &os,
+                               const llvm::json::Value &value) {
+  if (const auto *object = value.getAsObject()) {
+    llvm::SmallVector<llvm::StringRef> keys;
+    keys.reserve(object->size());
+    for (const auto &entry : *object)
+      keys.push_back(entry.first);
+    llvm::sort(keys);
+
+    os << '{';
+    for (auto [index, key] : llvm::enumerate(keys)) {
+      if (index != 0)
+        os << ',';
+      os << llvm::json::Value(key.str()) << ':';
+      writeCanonicalJSON(os, *object->get(key));
+    }
+    os << '}';
+    return;
+  }
+  if (const auto *array = value.getAsArray()) {
+    os << '[';
+    for (auto [index, element] : llvm::enumerate(*array)) {
+      if (index != 0)
+        os << ',';
+      writeCanonicalJSON(os, element);
+    }
+    os << ']';
+    return;
+  }
+  os << value;
+}
+
+static FailureOr<std::string> canonicalizeJSON(llvm::StringRef json) {
+  auto parsed = llvm::json::parse(json);
+  if (!parsed) {
+    llvm::consumeError(parsed.takeError());
+    return failure();
+  }
+  std::string canonical;
+  llvm::raw_string_ostream os(canonical);
+  writeCanonicalJSON(os, *parsed);
+  return canonical;
+}
+
+class JointSolverCache {
+public:
+  std::optional<std::string> lookup(llvm::StringRef key) {
+    std::lock_guard<std::mutex> lock(mutex);
+    auto found = entries.find(key.str());
+    if (found == entries.end())
+      return std::nullopt;
+    lru.splice(lru.begin(), lru, found->second);
+    return found->second->second;
+  }
+
+  void insert(std::string key, std::string response) {
+    std::lock_guard<std::mutex> lock(mutex);
+    auto found = entries.find(key);
+    if (found != entries.end()) {
+      found->second->second = std::move(response);
+      lru.splice(lru.begin(), lru, found->second);
+      return;
+    }
+    lru.emplace_front(std::move(key), std::move(response));
+    entries.emplace(lru.front().first, lru.begin());
+    if (entries.size() <= kJointSolverCacheCapacity)
+      return;
+    entries.erase(lru.back().first);
+    lru.pop_back();
+  }
+
+private:
+  using EntryList = std::list<std::pair<std::string, std::string>>;
+  std::mutex mutex;
+  EntryList lru;
+  std::unordered_map<std::string, EntryList::iterator> entries;
+};
+
+static JointSolverCache &jointSolverCache() {
+  static JointSolverCache cache;
+  return cache;
+}
+
+static bool isCacheableResponse(llvm::StringRef response) {
+  auto parsed = llvm::json::parse(response);
+  if (parsed) {
+    const auto *object = parsed->getAsObject();
+    if (object == nullptr)
+      return false;
+    auto status = object->getString("status");
+    if (status) {
+      if (*status == "ok")
+        return true;
+      if (*status == "infeasible")
+        return object->getBoolean("proven_unsat").value_or(false);
+    }
+    return false;
+  }
+  llvm::consumeError(parsed.takeError());
+  return false;
+}
+
+} // namespace
+
 FailureOr<std::string> runJointSolverBackend(llvm::StringRef problemJson) {
-  return runZ3JointSolver(problemJson);
+  auto canonicalProblem = canonicalizeJSON(problemJson);
+  if (failed(canonicalProblem))
+    return failure();
+  if (auto cached = jointSolverCache().lookup(*canonicalProblem))
+    return std::move(*cached);
+
+  auto response = runZ3JointSolver(*canonicalProblem);
+  if (failed(response))
+    return failure();
+  if (isCacheableResponse(*response))
+    jointSolverCache().insert(*canonicalProblem, *response);
+  return response;
 }
 
 FailureOr<ModuloScheduleResult>
