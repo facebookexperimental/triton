@@ -55,7 +55,7 @@ LogicalResult doMemoryPlanner(triton::FuncOp funcOp, unsigned numBuffers,
 void doBufferAllocation(triton::FuncOp funcOp);
 void doHoistLoopInvariantTMEMStore(triton::FuncOp funcOp);
 void removeRedundantTmemZeroStores(triton::FuncOp funcOp);
-void doCodePartition(triton::FuncOp funcOp, unsigned numBuffers);
+LogicalResult doCodePartition(triton::FuncOp funcOp, unsigned numBuffers);
 void doTokenLowering(triton::FuncOp funcOp, unsigned numConsumerGroups);
 void doPingPongPrep(triton::FuncOp funcOp, unsigned numWarpGroups,
                     int capability, int defaultNumStages);

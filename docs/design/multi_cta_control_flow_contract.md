@@ -153,11 +153,27 @@ fill the group, the scheduler must either issue padded work that keeps both CTAs
 on the collective trace or make the whole group exit before the next multi-CTA
 operation.
 
-Current 2-CTA persistent matmul schedules rely on this kernel-level invariant:
+Static 2-CTA persistent matmul schedules rely on this kernel-level invariant:
 paired CTAs stay on the same N tile and cover adjacent M tiles, and an odd M-tile
 count is padded so the final pair does not cross into an incompatible N tile.
-The compiler does not currently prove arbitrary persistent tile schedulers are
+The compiler does not prove arbitrary static persistent tile schedulers are
 pair-aligned.
+
+For the canonical atomic dynamic scheduler, the NVIDIA backend now recognizes
+the ordinary frontend loop before warp specialization. It proves a uniform
+counter, canonical direct loop carry, and a cluster-uniform tile bound divisible
+by physical cluster size `K`. It then linearizes the seed in cluster-major
+X-fastest order. During AutoWS, after run-once owner assignment but before
+physical partition cloning, rank zero atomically reserves `K` consecutive PIDs
+and distributes the base to the cluster; rank `r` executes PID `base + r`.
+Ready and reuse mbarriers make the full physical cluster the scheduler
+protocol's participation group. Failure of the proof is a compile error before
+this collective protocol is introduced.
+
+This proof establishes scheduler alignment, not problem mapping. The kernel
+author remains responsible for mapping each linear PID to problem coordinates,
+padding the scheduled tile space, and initializing the counter to the aligned
+number of launched physical CTAs.
 
 Cluster-level schedulers such as multi-CTA CLC can satisfy the contract by
 distributing one shared work assignment to the cluster and deriving each CTA's

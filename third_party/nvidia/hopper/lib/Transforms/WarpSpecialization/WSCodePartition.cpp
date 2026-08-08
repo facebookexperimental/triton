@@ -26,6 +26,7 @@
 #include "triton/Dialect/TritonGPU/Transforms/TritonGPUConversion.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonNvidiaGPU/Transforms/Passes.h"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/TMAUtilities.h"
 #include "llvm/ADT/MapVector.h"
 #include <unordered_set>
@@ -5190,7 +5191,7 @@ static void lowerMultiTaskSubtiledRegions(triton::FuncOp funcOp) {
 
 } // namespace
 
-void doCodePartition(triton::FuncOp funcOp, unsigned numBuffers) {
+LogicalResult doCodePartition(triton::FuncOp funcOp, unsigned numBuffers) {
   // Step 1: collect all communications between producers and consumers.
   SmallVector<std::unique_ptr<Channel>> channelsOrigin;
   collectAllocChannels(channelsOrigin, funcOp);
@@ -5199,7 +5200,7 @@ void doCodePartition(triton::FuncOp funcOp, unsigned numBuffers) {
     channels.push_back(c.get());
   }
   if (channels.empty()) {
-    return;
+    return success();
   }
   SmallVector<Channel *> orderedChannels;
   orderedChannels = channels;
@@ -5393,6 +5394,13 @@ void doCodePartition(triton::FuncOp funcOp, unsigned numBuffers) {
     LDBG("\n\nafter appendAccumCntsForOps");
     funcOp.dump();
   });
+
+  // Materialize the physical-cluster reservation after accumulation counters
+  // have been added, but before the loop is cloned into physical partitions.
+  // This keeps barrier initialization in function scope and avoids perturbing
+  // appendAccumCntsForOps with the scheduler's private phase carry.
+  if (failed(ttng::materializeClusterAtomicTileScheduler(funcOp)))
+    return failure();
   // Step 4.5: Collect TMA staging reuse info before createBufferForAllocs
   // rewrites the alloc ops (which would lose the local_store users).
   struct StagingReuseInfo {
@@ -5631,6 +5639,7 @@ void doCodePartition(triton::FuncOp funcOp, unsigned numBuffers) {
     LDBG("\n\nwith specializeRegion");
     funcOp.dump();
   });
+  return success();
 }
 
 #define GEN_PASS_DEF_NVGPUTESTWSCODEPARTITION
@@ -5645,7 +5654,8 @@ public:
   void runOnFuncOp(triton::FuncOp funcOp) {
     // Disable code partitioning when numBuffers is 0.
     if (numBuffers > 0)
-      doCodePartition(funcOp, numBuffers);
+      if (failed(doCodePartition(funcOp, numBuffers)))
+        return signalPassFailure();
     // Set NameLoc("accum_cnt") on ForOp block arguments whose corresponding
     // yield operand already has an "accum_cnt" NameLoc. This must be done at
     // the end because earlier steps may replace ForOps and lose block arg locs.
