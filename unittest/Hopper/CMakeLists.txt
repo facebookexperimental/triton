@@ -13,8 +13,18 @@ add_triton_ut(
     TritonGPUModuloCore
 )
 
+add_triton_ut(
+  NAME ModuloScheduleTest
+  SRCS modulo_schedule_test.cpp
+  LIBS
+    TritonGPUModuloCore
+)
+
 if(TRITON_ENABLE_Z3_JOINT_SOLVER)
   target_compile_definitions(Z3ConstraintEncoderTest
+    PRIVATE TRITON_ENABLE_Z3_JOINT_SOLVER=1
+  )
+  target_compile_definitions(ModuloScheduleTest
     PRIVATE TRITON_ENABLE_Z3_JOINT_SOLVER=1
   )
 endif()

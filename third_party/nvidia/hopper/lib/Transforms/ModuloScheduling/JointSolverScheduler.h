@@ -1,0 +1,38 @@
+// (c) Meta Platforms, Inc. and affiliates. Confidential and proprietary.
+//
+// Joint-solver modulo scheduling backend — complete solver for joint schedule +
+// buffer-depth feasibility, the successor of ExhaustiveScheduler's
+// branch-and-bound (docs/SolverMigrationNotes.md, "Suggested sequencing"
+// step 2). The schedule model is solved in process by the native Z3 backend;
+// this side serializes the DDG, parses the schedule back, and RE-VERIFIES it
+// against the reservation table and dependence constraints, so the solver is
+// not part of the correctness TCB.
+//
+// Selected with TRITON_USE_MODULO_SCHEDULE=joint_solver. Because the search is
+// complete, the II sweep runs from minII to a true feasibility bound
+// (critical path + total serial work) with NO slack window — guard 2 of
+// SolverMigrationNotes.md does not apply to this backend.
+
+#ifndef TRITON_NVIDIA_HOPPER_MODULO_SCHEDULING_JOINT_SOLVER_H
+#define TRITON_NVIDIA_HOPPER_MODULO_SCHEDULING_JOINT_SOLVER_H
+
+#include "DataDependenceGraph.h"
+#include "ModuloReservationTable.h"
+
+namespace mlir::triton::gpu {
+
+/// Run joint-solver modulo scheduling. Returns failure if the native solver is
+/// unavailable, errors, or returns a schedule that fails re-verification;
+/// callers fall back to the heuristic backends.
+FailureOr<ModuloScheduleResult>
+runJointSolverSchedule(const DataDependenceGraph &ddg, int minII,
+                       int smemBudget = 232448, int tmemColLimit = 512);
+
+/// Run the native joint solver on an arbitrary problem JSON and return its raw
+/// solution JSON. The follow-up partition solver reuses this dispatcher for
+/// joint-solver-0.2 requests.
+FailureOr<std::string> runJointSolverBackend(llvm::StringRef problemJson);
+
+} // namespace mlir::triton::gpu
+
+#endif // TRITON_NVIDIA_HOPPER_MODULO_SCHEDULING_JOINT_SOLVER_H
