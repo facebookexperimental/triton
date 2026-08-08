@@ -31,6 +31,8 @@ runJointSolverSchedule(const DataDependenceGraph &ddg, int minII,
 /// Run the native joint solver on an arbitrary problem JSON and return the raw
 /// solution JSON text. Shared by the schedule backend above and the
 /// joint-partition mode (ModuloSchedulePass's partitionJointSolver).
+/// Proven results are cached by canonical request JSON in a bounded,
+/// thread-safe LRU.
 FailureOr<std::string> runJointSolverBackend(llvm::StringRef problemJson);
 
 } // namespace mlir::triton::gpu
