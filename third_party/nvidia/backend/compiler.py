@@ -26,6 +26,35 @@ TRITON_MAX_TMA_DESCS = 8
 TRITON_MAX_TMA_DIMS = 5
 
 
+_PTX_FILE_DIRECTIVE = re.compile(
+    r"""
+    # Match one complete PTX .file directive and preserve its prefix.
+    ^
+    (?P<directive_prefix>
+        [ \t]* \.file [ \t]+
+        \d+ [ \t]+ "
+    )
+    (?P<path>
+        (?: [^"\\] | \\. )*  # Allow escaped characters in the quoted path.
+    )
+    "
+    (?: [ \t]* , [ \t]* \d+ [ \t]* , [ \t]* \d+ )?  # Optional mtime and size.
+    [ \t]*
+    $
+    """,
+    flags=re.MULTILINE | re.X,
+)
+
+
+def normalize_ptx_file_metadata(src: str) -> str:
+    def normalize_file(match: re.Match[str]) -> str:
+        filename = match.group("path").rsplit("/", 1)[-1]
+        virtual_path = f"<source>/{filename}"
+        return f'{match.group("directive_prefix")}{virtual_path}", 0, 0'
+
+    return _PTX_FILE_DIRECTIVE.sub(normalize_file, src)
+
+
 def min_dot_size(target: GPUTarget):
 
     def check_dot_compatibility(lhs_type, rhs_type) -> Tuple[int, int, int]:  # [m, n, k]
@@ -1247,6 +1276,7 @@ class CUDABackend(BaseBackend):
             # Note: if this flag is removed, the source var name and type info will be lost when ptx was compiled into cubin
             #           and we may not be able to see them in cuda-gdb
             ret = re.sub(r",\s*debug|debug,\s*", "", ret)
+        ret = normalize_ptx_file_metadata(ret)
         if knobs.nvidia.dump_nvptx:
             print("// -----// NVPTX Dump //----- //")
             print(ret)
