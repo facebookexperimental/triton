@@ -3,6 +3,7 @@
 #include "ModuloReservationTable.h"
 
 #include "ExhaustiveScheduler.h"
+#include "JointSolverScheduler.h"
 #include "SwingScheduler.h"
 #include "triton/Tools/Sys/GetEnv.h"
 #include "llvm/Support/Debug.h"
@@ -251,9 +252,9 @@ static int computeEarliestStart(unsigned nodeIdx,
   return earliest;
 }
 
-static FailureOr<ModuloScheduleResult> runRauIMS(const DataDependenceGraph &ddg,
-                                                 int minII, int maxII,
-                                                 int maxBacktracks) {
+FailureOr<ModuloScheduleResult> runRauIMS(const DataDependenceGraph &ddg,
+                                          int minII, int maxII,
+                                          int maxBacktracks) {
   LLVM_DEBUG(DBGS() << "Computing critical path heights...\n");
   auto heights = ddg.computeCriticalPathHeights();
   LLVM_DEBUG(DBGS() << "Heights computed for " << heights.size() << " nodes\n");
@@ -408,6 +409,23 @@ runModuloScheduling(const DataDependenceGraph &ddg, int maxII,
   if (computedMinII <= 0)
     return failure();
   const int minII = std::max(computedMinII, minIIOverride);
+  auto algo = mlir::triton::tools::getStrEnv("TRITON_USE_MODULO_SCHEDULE");
+
+  // The complete solver computes its own true feasibility bound. Dispatch it
+  // before the heuristic maxII window, which can discard feasible schedules.
+  if (algo == "joint_solver") {
+    LLVM_DEBUG(DBGS() << "Using native Z3 joint solver\n");
+    auto result = runJointSolverSchedule(
+        ddg, minII, /*smemBudget=*/232448, /*tmemColLimit=*/512);
+    if (failed(result))
+      return failure();
+    if (!tryRepairModuloSchedule(ddg, *result)) {
+      LLVM_DEBUG(DBGS() << "Rejecting invalid final schedule\n");
+      return failure();
+    }
+    return result;
+  }
+
   if (maxII <= 0)
     maxII = 2 * minII;
   else if (maxII < minII)
@@ -430,12 +448,12 @@ runModuloScheduling(const DataDependenceGraph &ddg, int maxII,
   });
 
   // TRITON_USE_MODULO_SCHEDULE selects the scheduling algorithm:
+  //   "joint_solver" → Native Z3 joint schedule and buffer-depth solver
   //   "sms"        → Swing Modulo Scheduling (Llosa et al., PACT 1996)
   //   "exhaustive" → Exhaustive search with joint memory feasibility
   //   "random"     → Random sampling with greedy placement
   //   "contracted" → Two-stage GEMM search on a contracted compute graph
   //   "1" or other → Rau's Iterative Modulo Scheduling (Rau, 1994)
-  auto algo = mlir::triton::tools::getStrEnv("TRITON_USE_MODULO_SCHEDULE");
 
   auto validateResult = [&](FailureOr<ModuloScheduleResult> result)
       -> FailureOr<ModuloScheduleResult> {
@@ -476,6 +494,210 @@ runModuloScheduling(const DataDependenceGraph &ddg, int maxII,
 
   LLVM_DEBUG(DBGS() << "Using Rau's Iterative Modulo Scheduling (IMS)\n");
   return validateResult(runRauIMS(ddg, minII, maxII, maxBacktracks));
+}
+
+// ── Baseline comparison (M2 acceptance criteria) ────────────────────────────
+
+bool isLegalModuloSchedule(const DataDependenceGraph &ddg,
+                           const ModuloScheduleResult &schedule) {
+  if (!isValidModuloSchedule(ddg, schedule))
+    return false;
+  ModuloReservationTable table(schedule.II);
+  for (const auto &node : ddg.getNodes()) {
+    auto cycleIt = schedule.nodeToCycle.find(node.idx);
+    if (cycleIt == schedule.nodeToCycle.end() || cycleIt->second < 0)
+      return false;
+    if (node.pipeline == HWPipeline::NONE)
+      continue;
+    int duration = getReservationDuration(node);
+    if (duration > schedule.II ||
+        !table.isIntervalFree(cycleIt->second, node.pipeline, duration))
+      return false;
+    table.reserve(cycleIt->second, node.pipeline, node.idx, duration);
+  }
+  return true;
+}
+
+std::optional<int>
+BaselineComparisonReport::baselineII(llvm::StringRef name) const {
+  for (const BaselineII &entry : baselines)
+    if (entry.name == name)
+      return entry.ii;
+  return std::nullopt;
+}
+
+bool BaselineComparisonReport::improvesOnRau() const {
+  auto rau = baselineII("rau");
+  return jointII && rau && *jointII < *rau;
+}
+
+bool BaselineComparisonReport::regressesOnRau() const {
+  auto rau = baselineII("rau");
+  return jointII && rau && *jointII > *rau;
+}
+
+bool BaselineComparisonReport::isMinIIBound() const {
+  if (minII <= 0 || !jointII || *jointII != minII)
+    return false;
+  for (const BaselineII &entry : baselines)
+    if (entry.ii && *entry.ii != minII)
+      return false;
+  return true;
+}
+
+bool baselineReportRequested() {
+  return !mlir::triton::tools::getStrEnv("TRITON_MODULO_BASELINE_REPORT")
+              .empty();
+}
+
+namespace {
+
+/// Run one backend and keep its II only if the schedule it produced is legal.
+/// Note this uses the in-tree checker rather than Z3JointSolutionValidator:
+/// the two enforce the same two properties for the v1 model (dependences +
+/// exclusive modular reservation), and the in-tree one keeps every baseline
+/// row available in builds without Z3, where only the joint row drops out.
+BaselineII runBaseline(llvm::StringRef name, const DataDependenceGraph &ddg,
+                       FailureOr<ModuloScheduleResult> scheduled) {
+  if (failed(scheduled))
+    return BaselineII{name, std::nullopt, "no schedule found"};
+  if (!isLegalModuloSchedule(ddg, *scheduled))
+    return BaselineII{name, std::nullopt, "schedule failed validation"};
+  return BaselineII{name, scheduled->II, ""};
+}
+
+/// Right-justify `text` in `width` columns, always leaving at least one space
+/// so adjacent cells never run together when a value overflows the column.
+void printCell(llvm::raw_ostream &os, llvm::StringRef text, size_t width) {
+  os.indent(
+      static_cast<unsigned>(width > text.size() ? width - text.size() : 1))
+      << text;
+}
+
+void printCell(llvm::raw_ostream &os, std::optional<int> value, size_t width) {
+  printCell(os, value ? std::to_string(*value) : std::string("-"), width);
+}
+
+constexpr size_t kFixtureWidth = 22;
+constexpr size_t kNumberWidth = 12;
+
+} // namespace
+
+BaselineComparisonReport compareAgainstBaselines(const DataDependenceGraph &ddg,
+                                                 llvm::StringRef fixture) {
+  BaselineComparisonReport report;
+  report.fixture = fixture.str();
+
+  const int minII = ddg.computeMinII();
+  if (minII <= 0 || ddg.getNumNodes() == 0)
+    return report;
+  report.minII = minII;
+  // Exactly the window `runModuloScheduling` gives the heuristic backends
+  // (guard 2). The whole point of the Rau row is that it is what the compiler
+  // would otherwise have done, so it must be run with the production bound —
+  // a roomier window would quietly flatter Rau, a tighter one would rig the
+  // comparison in the solver's favour. The joint solver and the relaxed bound
+  // compute their own true feasibility bounds and take no window.
+  const int heuristicMaxII =
+      std::min(2 * minII, minII + std::max(10, minII / 8));
+
+  if (auto joint = runJointSolverSchedule(ddg, minII);
+      succeeded(joint) && isLegalModuloSchedule(ddg, *joint))
+    report.jointII = joint->II;
+
+  if (auto bound = runJointSolverRelaxedLowerBound(ddg, minII);
+      succeeded(bound))
+    report.relaxedLowerBound = *bound;
+
+  report.baselines.push_back(runBaseline(
+      "rau", ddg, runRauIMS(ddg, minII, heuristicMaxII, /*maxBacktracks=*/20)));
+  report.baselines.push_back(
+      runBaseline("sms", ddg, runSMS(ddg, minII, heuristicMaxII)));
+  // Exhaustive bails out above its node/MMA ceiling, so an absent row here is
+  // expected on anything but a small loop. Reported for free context: where it
+  // does terminate it brackets the optimum from the other side.
+  report.baselines.push_back(runBaseline(
+      "exhaustive", ddg,
+      runExhaustiveSearch(ddg, heuristicMaxII, /*smemBudget=*/232448,
+                          /*tmemColLimit=*/512, minII)));
+  return report;
+}
+
+void printBaselineComparison(llvm::raw_ostream &os,
+                             const BaselineComparisonReport &report) {
+  auto printFixtureCell = [&](llvm::StringRef text) {
+    os << "  " << text.substr(0, kFixtureWidth);
+    os.indent(static_cast<unsigned>(
+        text.size() < kFixtureWidth ? kFixtureWidth - text.size() : 1));
+  };
+
+  os << "modulo-baseline-report: " << report.fixture << "\n";
+  printFixtureCell("fixture");
+  printCell(os, llvm::StringRef("MinII"), kNumberWidth);
+  printCell(os, llvm::StringRef("II_full"), kNumberWidth);
+  printCell(os, llvm::StringRef("relaxed_LB"), kNumberWidth);
+  for (const BaselineII &entry : report.baselines)
+    printCell(os, "II_" + entry.name.str(), kNumberWidth);
+  os << "\n";
+
+  printFixtureCell(report.fixture);
+  printCell(os, report.minII, kNumberWidth);
+  printCell(os, report.jointII, kNumberWidth);
+  printCell(os, report.relaxedLowerBound, kNumberWidth);
+  for (const BaselineII &entry : report.baselines)
+    printCell(os, entry.ii, kNumberWidth);
+  os << "\n";
+
+  for (const BaselineII &entry : report.baselines)
+    if (!entry.ii && !entry.note.empty())
+      os << "  note: " << entry.name << ": " << entry.note << "\n";
+
+  // Criterion 1 — soundness. A relaxation's feasible set is a superset of the
+  // full model's, so its optimum can never exceed the full model's. Violation
+  // means a constraint is mis-encoded, NOT that the solver got slower.
+  os << "  soundness (II_full >= relaxed_LB): ";
+  if (!report.soundnessCheckable())
+    os << "SKIP (joint solver or relaxed bound unavailable)\n";
+  else if (report.soundnessHolds())
+    os << "PASS (gap " << *report.jointII - *report.relaxedLowerBound << ")\n";
+  else
+    os << "FAIL\n";
+
+  // Criterion 2 has two halves, kept separate so a tie can never be read as
+  // the acceptance criterion being met. Rau is Triton's current default
+  // scheduler and the path the joint solver's own fallback takes.
+  auto rau = report.baselineII("rau");
+
+  // 2a — no regression against Rau. Required on EVERY fixture.
+  os << "  no-regression (II_full <= II_rau): ";
+  if (!report.jointII || !rau)
+    os << "SKIP (joint solver or rau unavailable)\n";
+  else if (report.regressesOnRau())
+    os << "FAIL (" << *report.jointII << " > " << *rau << ")\n";
+  else
+    os << "PASS\n";
+
+  // 2b — the acceptance criterion proper: strict improvement on at least one
+  // fixture. A single loop cannot decide "at least one", so this line reports
+  // only what this fixture contributes. Reported, never tuned for: a NO is a
+  // real finding to take to the team, not a reason to adjust the fixture.
+  os << "  strict improvement (II_full < II_rau): ";
+  if (!report.jointII || !rau)
+    os << "SKIP (joint solver or rau unavailable)\n";
+  else if (report.improvesOnRau())
+    os << "YES (-" << *rau - *report.jointII << " vs rau)\n";
+  else if (report.isMinIIBound())
+    os << "NO (every backend is at MinII " << report.minII
+       << " — this fixture is MinII-bound and cannot separate schedulers; it "
+          "is not evidence about the solver)\n";
+  else
+    os << "NO (tied with rau at " << *rau << ")\n";
+
+  // The relaxed bound is NOT a pure resource-only model. Stated at the point
+  // of use so the number is never mistaken for a textbook one.
+  os << "  relaxed_LB keeps resource exclusivity only; still-hard: cycle "
+        "domain bounds, canonical-root pinning, SMEM/TMEM ceilings (vacuous "
+        "once their gated contributors are dropped)\n";
 }
 
 } // namespace mlir::triton::gpu

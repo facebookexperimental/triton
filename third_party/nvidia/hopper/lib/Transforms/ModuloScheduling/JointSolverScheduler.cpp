@@ -4,13 +4,17 @@
 
 #include "JointSolverScheduler.h"
 
-#include "ExhaustiveScheduler.h"
+#include "Z3JointSolutionValidator.h"
 #include "Z3JointSolver.h"
+#include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Tools/Sys/GetEnv.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/JSON.h"
 #include "llvm/Support/raw_ostream.h"
+#include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <list>
 #include <mutex>
@@ -48,9 +52,51 @@ static int serialUpperBound(const DataDependenceGraph &ddg, int minII) {
   return static_cast<int>(std::max<int64_t>(minII, bound));
 }
 
-static std::string buildProblemJSON(const DataDependenceGraph &ddg, int minII,
-                                    int maxII, int smemBudget,
-                                    int tmemColLimit) {
+struct SolverBuffer {
+  unsigned allocNodeIdx;
+  bool isTmem;
+  int64_t sizeBytes;
+  int64_t tmemCols;
+  llvm::SmallVector<unsigned, 4> consumerNodes;
+};
+
+static llvm::SmallVector<SolverBuffer>
+extractSolverBuffers(const DataDependenceGraph &ddg) {
+  llvm::SmallVector<SolverBuffer> buffers;
+  for (const auto &node : ddg.getNodes()) {
+    Operation *op = node.op;
+    SolverBuffer buffer;
+    buffer.allocNodeIdx = node.idx;
+    if (isa<LocalAllocOp>(op)) {
+      auto memDesc = dyn_cast<MemDescType>(op->getResult(0).getType());
+      if (!memDesc)
+        continue;
+      int64_t elements = 1;
+      for (int64_t dimension : memDesc.getShape())
+        elements *= dimension;
+      buffer.isTmem = false;
+      buffer.sizeBytes =
+          elements * memDesc.getElementType().getIntOrFloatBitWidth() / 8;
+      buffer.tmemCols = 0;
+    } else if (node.tmemAllocCols > 0) {
+      buffer.isTmem = true;
+      buffer.sizeBytes = 0;
+      buffer.tmemCols = node.tmemAllocCols;
+    } else {
+      continue;
+    }
+    for (const DDGEdge *edge : ddg.getOutEdges(node.idx))
+      if (edge->distance == 0)
+        buffer.consumerNodes.push_back(edge->dstIdx);
+    buffers.push_back(std::move(buffer));
+  }
+  return buffers;
+}
+
+static std::string
+buildProblemJSON(const DataDependenceGraph &ddg, int minII, int maxII,
+                 int smemBudget, int tmemColLimit,
+                 llvm::ArrayRef<llvm::StringRef> relaxKeepKinds = {}) {
   // Streaming classification (Twill §5.3): a variable-latency op with no
   // incoming data dependence (TMA input loads) runs ahead of the pipeline
   // behind its ring buffer, so in steady state its consumers do not wait its
@@ -82,7 +128,7 @@ static std::string buildProblemJSON(const DataDependenceGraph &ddg, int minII,
     });
   }
   llvm::json::Array buffers;
-  for (const auto &buf : extractSchedBuffers(ddg)) {
+  for (const auto &buf : extractSolverBuffers(ddg)) {
     llvm::json::Array consumers;
     for (unsigned c : buf.consumerNodes)
       consumers.push_back(static_cast<int64_t>(c));
@@ -128,6 +174,12 @@ static std::string buildProblemJSON(const DataDependenceGraph &ddg, int minII,
   if (auto env = tools::getStrEnv("TRITON_MODULO_JOINT_SOLVER_SEED");
       !env.empty())
     root["random_seed"] = std::max<int64_t>(0, std::atoll(env.c_str()));
+  if (!relaxKeepKinds.empty()) {
+    llvm::json::Array keptKinds;
+    for (llvm::StringRef kind : relaxKeepKinds)
+      keptKinds.push_back(kind.str());
+    root["relax_keep_kinds"] = std::move(keptKinds);
+  }
   std::string out;
   llvm::raw_string_ostream os(out);
   os << llvm::json::Value(std::move(root));
@@ -277,23 +329,86 @@ static JointSolverCache &jointSolverCache() {
   return cache;
 }
 
-static bool isCacheableResponse(llvm::StringRef response) {
+constexpr unsigned kDefaultRetryCount = 1;
+constexpr unsigned kMaxRetryCount = 3;
+constexpr double kMaxRetryTimeoutSeconds = 300.0;
+
+enum class ResponseKind { Ok, ProvenUnsat, Inconclusive, Other };
+
+static ResponseKind classifyResponse(llvm::StringRef response) {
   auto parsed = llvm::json::parse(response);
-  if (parsed) {
-    const auto *object = parsed->getAsObject();
-    if (object == nullptr)
-      return false;
-    auto status = object->getString("status");
-    if (status) {
-      if (*status == "ok")
-        return true;
-      if (*status == "infeasible")
-        return object->getBoolean("proven_unsat").value_or(false);
-    }
+  if (!parsed) {
+    llvm::consumeError(parsed.takeError());
+    return ResponseKind::Other;
+  }
+  const auto *object = parsed->getAsObject();
+  if (!object)
+    return ResponseKind::Other;
+  auto status = object->getString("status");
+  if (!status)
+    return ResponseKind::Other;
+  if (*status == "ok")
+    return ResponseKind::Ok;
+  if (*status == "infeasible" &&
+      object->getBoolean("proven_unsat").value_or(false))
+    return ResponseKind::ProvenUnsat;
+  if (*status == "inconclusive")
+    return ResponseKind::Inconclusive;
+  return ResponseKind::Other;
+}
+
+static bool validateSolution(llvm::StringRef problem,
+                             llvm::StringRef response) {
+  std::string validation = validateZ3JointSolution(problem, response);
+  auto parsed = llvm::json::parse(validation);
+  if (!parsed) {
+    llvm::consumeError(parsed.takeError());
+    LLVM_DEBUG(DBGS() << "validator returned malformed JSON\n");
     return false;
   }
-  llvm::consumeError(parsed.takeError());
-  return false;
+  const auto *object = parsed->getAsObject();
+  bool valid = object && object->getBoolean("valid").value_or(false);
+  if (!valid)
+    LLVM_DEBUG(DBGS() << "solution rejected by validator: " << validation
+                      << "\n");
+  return valid;
+}
+
+static unsigned retryCount() {
+  auto env = tools::getStrEnv("TRITON_MODULO_JOINT_SOLVER_RETRIES");
+  if (env.empty())
+    return kDefaultRetryCount;
+  char *end = nullptr;
+  long parsed = std::strtol(env.c_str(), &end, 10);
+  if (end == env.c_str() || *end != '\0')
+    return kDefaultRetryCount;
+  return static_cast<unsigned>(std::clamp<long>(parsed, 0, kMaxRetryCount));
+}
+
+static FailureOr<std::string>
+problemForAttempt(llvm::StringRef canonicalProblem, unsigned attempt) {
+  if (attempt == 0)
+    return canonicalProblem.str();
+
+  auto parsed = llvm::json::parse(canonicalProblem);
+  if (!parsed) {
+    llvm::consumeError(parsed.takeError());
+    return failure();
+  }
+  auto *object = parsed->getAsObject();
+  if (!object)
+    return failure();
+  auto baseTimeout = object->getNumber("time_limit_s");
+  if (!baseTimeout || !std::isfinite(*baseTimeout) || *baseTimeout <= 0.0)
+    return failure();
+  double multiplier = std::ldexp(1.0, static_cast<int>(attempt));
+  (*object)["time_limit_s"] =
+      std::min(*baseTimeout * multiplier, kMaxRetryTimeoutSeconds);
+
+  std::string retryProblem;
+  llvm::raw_string_ostream os(retryProblem);
+  writeCanonicalJSON(os, *parsed);
+  return retryProblem;
 }
 
 } // namespace
@@ -305,12 +420,32 @@ FailureOr<std::string> runJointSolverBackend(llvm::StringRef problemJson) {
   if (auto cached = jointSolverCache().lookup(*canonicalProblem))
     return std::move(*cached);
 
-  auto response = runZ3JointSolver(*canonicalProblem);
-  if (failed(response))
-    return failure();
-  if (isCacheableResponse(*response))
-    jointSolverCache().insert(*canonicalProblem, *response);
-  return response;
+  unsigned retries = retryCount();
+  for (unsigned attempt = 0; attempt <= retries; ++attempt) {
+    auto attemptProblem = problemForAttempt(*canonicalProblem, attempt);
+    if (failed(attemptProblem))
+      return failure();
+    auto response = runZ3JointSolver(*attemptProblem);
+    if (failed(response))
+      return failure();
+
+    ResponseKind kind = classifyResponse(*response);
+    if (kind == ResponseKind::Ok) {
+      if (!validateSolution(*attemptProblem, *response))
+        return failure();
+      jointSolverCache().insert(*canonicalProblem, *response);
+      return response;
+    }
+    if (kind == ResponseKind::ProvenUnsat) {
+      jointSolverCache().insert(*canonicalProblem, *response);
+      return response;
+    }
+    if (kind != ResponseKind::Inconclusive || attempt == retries)
+      return response;
+    LLVM_DEBUG(DBGS() << "inconclusive response; retry " << attempt + 1 << '/'
+                      << retries << " with a fresh backend\n");
+  }
+  llvm_unreachable("joint-solver retry loop must return");
 }
 
 FailureOr<ModuloScheduleResult>
@@ -387,6 +522,101 @@ runJointSolverSchedule(const DataDependenceGraph &ddg, int minII,
   }
   LLVM_DEBUG(DBGS() << "SUCCESS at II=" << result.II << "\n");
   return result;
+}
+
+/// Exclusive modular reservation only — the half of `verifySolution` that a
+/// resource-relaxed schedule is still required to satisfy. Dependences are
+/// deliberately not checked: dropping them is the point of the relaxation.
+static bool
+verifyResourceExclusivity(const DataDependenceGraph &ddg, int ii,
+                          const llvm::DenseMap<unsigned, int> &cycles) {
+  if (ii <= 0)
+    return false;
+  ModuloReservationTable table(ii);
+  for (const auto &node : ddg.getNodes()) {
+    auto cycleIt = cycles.find(node.idx);
+    if (cycleIt == cycles.end() || cycleIt->second < 0)
+      return false;
+    if (node.pipeline == HWPipeline::NONE)
+      continue;
+    int dur = nodeDuration(node);
+    if (dur > ii || !table.isIntervalFree(cycleIt->second, node.pipeline, dur))
+      return false;
+    table.reserve(cycleIt->second, node.pipeline, node.idx, dur);
+  }
+  return true;
+}
+
+FailureOr<int> runJointSolverRelaxedLowerBound(const DataDependenceGraph &ddg,
+                                               int minII, int smemBudget,
+                                               int tmemColLimit) {
+  if (minII <= 0 || ddg.getNumNodes() == 0)
+    return failure();
+  int maxII = serialUpperBound(ddg, minII);
+
+  // Deliberately NOT routed through runJointSolverBackend: that wrapper
+  // validates every "ok" response against the full model, and a relaxed
+  // schedule violates the very constraints it dropped, so it would always be
+  // rejected. The relaxed run is not trusted either — the kept kind is
+  // re-verified below — but it has to be checked against the relaxed model,
+  // not the full one. Skipping the wrapper also skips its cache; the bound is
+  // only computed under TRITON_MODULO_BASELINE_REPORT, so that is not a hot
+  // path.
+  llvm::StringRef keep[] = {llvm::StringRef("resource")};
+  auto rawOut = runZ3JointSolver(
+      buildProblemJSON(ddg, minII, maxII, smemBudget, tmemColLimit, keep));
+  if (failed(rawOut))
+    return failure();
+  auto parsed = llvm::json::parse(*rawOut);
+  if (!parsed) {
+    llvm::consumeError(parsed.takeError());
+    return failure();
+  }
+  auto *obj = parsed->getAsObject();
+  if (!obj)
+    return failure();
+  auto status = obj->getString("status");
+  if (!status || *status != "ok") {
+    LLVM_DEBUG(DBGS() << "relaxed lower bound unavailable: status "
+                      << (status ? *status : "<none>") << "\n");
+    return failure();
+  }
+  // The backend must confirm it honoured the relaxation. Without this, a build
+  // whose solver silently ignored `relax_keep_kinds` would return the FULL
+  // model's II here, making the soundness invariant compare II_full against
+  // itself and pass vacuously.
+  if (!obj->getObject("relaxation")) {
+    LLVM_DEBUG(DBGS() << "backend did not honour relax_keep_kinds\n");
+    return failure();
+  }
+
+  auto ii = obj->getInteger("ii");
+  auto *cycles = obj->getObject("cycles");
+  if (!ii || !cycles || *ii <= 0)
+    return failure();
+
+  llvm::DenseMap<unsigned, int> nodeToCycle;
+  for (const auto &kv : *cycles) {
+    unsigned idx = 0;
+    if (llvm::StringRef(kv.first).getAsInteger(10, idx))
+      return failure();
+    auto cyc = kv.second.getAsInteger();
+    if (!cyc)
+      return failure();
+    nodeToCycle[idx] = static_cast<int>(*cyc);
+  }
+  if (nodeToCycle.size() != ddg.getNumNodes())
+    return failure();
+
+  // A relaxed bound that is too HIGH turns the soundness invariant into a
+  // false alarm, so the kept kind is re-verified before the number is used.
+  if (!verifyResourceExclusivity(ddg, static_cast<int>(*ii), nodeToCycle)) {
+    LLVM_DEBUG(DBGS() << "relaxed schedule violates the kept resource "
+                         "constraints — discarding the bound\n");
+    return failure();
+  }
+  LLVM_DEBUG(DBGS() << "relaxed lower bound = " << *ii << "\n");
+  return static_cast<int>(*ii);
 }
 
 } // namespace mlir::triton::gpu

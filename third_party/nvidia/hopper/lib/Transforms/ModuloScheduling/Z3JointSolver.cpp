@@ -159,6 +159,665 @@ private:
 
 enum class CandidateStatus { Sat, Unsat, Unknown, Error };
 
+constexpr llvm::StringLiteral kUnsatCoreSchema = "joint-solver-core-0.1";
+constexpr llvm::StringLiteral kDiagnosticSchema = "joint-solver-diagnostic-0.1";
+constexpr size_t kCoreMinimizeMaxGroups = 32;
+constexpr std::chrono::milliseconds kCoreMinimizeBudget(250);
+
+struct UnsatEvidence {
+  std::vector<std::string> groupIds;
+  std::string normalization = "normalized";
+};
+
+struct ConstraintProvenance {
+  std::string id;
+  std::string kind;
+  std::vector<int64_t> nodes;
+  std::optional<std::string> pipeline;
+  std::optional<std::string> relation;
+  std::optional<std::string> reason;
+  std::optional<std::string> capability;
+  std::optional<std::string> conditionalOn;
+  std::optional<int64_t> latency;
+  std::optional<int64_t> baseLatency;
+  std::optional<int64_t> roundTripLatency;
+  std::optional<int64_t> requiredLatency;
+  std::optional<int64_t> distance;
+  std::optional<int64_t> result;
+  std::optional<int64_t> buffer;
+  std::optional<int64_t> sizeBytes;
+  std::optional<int64_t> columns;
+  std::optional<int64_t> required;
+  bool emitRequired = false;
+  std::optional<int64_t> requiredLowerBound;
+  std::optional<int64_t> requiredWhenActive;
+  std::optional<bool> requiredIsDynamic;
+  std::optional<int64_t> available;
+  std::optional<int64_t> cluster;
+  std::optional<int64_t> minWarps;
+  std::optional<int64_t> group;
+  std::optional<int64_t> fixedStage;
+  std::optional<int64_t> loweringTemplate;
+  std::optional<int64_t> event;
+  std::vector<int64_t> channel;
+};
+
+using ProvenanceMap = std::map<std::string, ConstraintProvenance>;
+
+static int constraintKindRank(llvm::StringRef groupId) {
+  llvm::StringRef prefix = groupId.split(':').first;
+  if (prefix == "dep" || prefix == "dependence")
+    return 0;
+  if (prefix == "resource")
+    return 1;
+  if (prefix == "smem")
+    return 2;
+  if (prefix == "tmem")
+    return 3;
+  if (prefix == "warp-group")
+    return 4;
+  if (prefix == "register")
+    return 5;
+  if (prefix == "lowering")
+    return 6;
+  return 7;
+}
+
+static llvm::StringRef constraintKind(llvm::StringRef groupId) {
+  llvm::StringRef prefix = groupId.split(':').first;
+  return prefix == "dep" ? llvm::StringRef("dependence") : prefix;
+}
+
+static void normalizeCore(std::vector<std::string> &groupIds) {
+  llvm::sort(groupIds, [](const std::string &left, const std::string &right) {
+    int leftRank = constraintKindRank(left);
+    int rightRank = constraintKindRank(right);
+    return std::tie(leftRank, left) < std::tie(rightRank, right);
+  });
+  groupIds.erase(std::unique(groupIds.begin(), groupIds.end()), groupIds.end());
+}
+
+static void addProvenance(ProvenanceMap &provenance,
+                          ConstraintProvenance record) {
+  llvm::sort(record.nodes);
+  record.nodes.erase(std::unique(record.nodes.begin(), record.nodes.end()),
+                     record.nodes.end());
+  auto found = provenance.find(record.id);
+  if (found == provenance.end()) {
+    provenance.emplace(record.id, std::move(record));
+    return;
+  }
+  ConstraintProvenance &existing = found->second;
+  auto takeMaximum = [](std::optional<int64_t> &target,
+                        std::optional<int64_t> value) {
+    if (value)
+      target = target ? std::max(*target, *value) : value;
+  };
+  takeMaximum(existing.latency, record.latency);
+  takeMaximum(existing.baseLatency, record.baseLatency);
+  takeMaximum(existing.roundTripLatency, record.roundTripLatency);
+  takeMaximum(existing.requiredLatency, record.requiredLatency);
+  takeMaximum(existing.required, record.required);
+  takeMaximum(existing.requiredLowerBound, record.requiredLowerBound);
+  takeMaximum(existing.requiredWhenActive, record.requiredWhenActive);
+}
+
+static int64_t saturatedAdd(int64_t left, int64_t right) {
+  __int128 value = static_cast<__int128>(left) + right;
+  return static_cast<int64_t>(
+      std::min<__int128>(value, std::numeric_limits<int64_t>::max()));
+}
+
+static int64_t saturatedMultiply(int64_t left, int64_t right) {
+  __int128 value = static_cast<__int128>(left) * right;
+  return static_cast<int64_t>(
+      std::min<__int128>(value, std::numeric_limits<int64_t>::max()));
+}
+
+static llvm::json::Array integerArray(llvm::ArrayRef<int64_t> values) {
+  llvm::json::Array result;
+  result.reserve(values.size());
+  for (int64_t value : values)
+    result.push_back(value);
+  return result;
+}
+
+static llvm::json::Object provenanceToJson(const ConstraintProvenance &record) {
+  llvm::json::Object result{
+      {"id", record.id},
+      {"kind", record.kind},
+      {"nodes", integerArray(record.nodes)},
+  };
+  auto addString = [&](llvm::StringRef key,
+                       const std::optional<std::string> &value) {
+    if (value)
+      result[key] = *value;
+  };
+  auto addInteger = [&](llvm::StringRef key, std::optional<int64_t> value) {
+    if (value)
+      result[key] = *value;
+  };
+  addString("pipeline", record.pipeline);
+  addString("relation", record.relation);
+  addString("reason", record.reason);
+  addString("capability", record.capability);
+  addString("conditional_on", record.conditionalOn);
+  addInteger("latency", record.latency);
+  addInteger("base_latency", record.baseLatency);
+  addInteger("round_trip_latency", record.roundTripLatency);
+  addInteger("required_latency", record.requiredLatency);
+  addInteger("distance", record.distance);
+  addInteger("result", record.result);
+  addInteger("buffer", record.buffer);
+  addInteger("size_bytes", record.sizeBytes);
+  addInteger("columns", record.columns);
+  if (record.emitRequired)
+    result["required"] = record.required ? llvm::json::Value(*record.required)
+                                         : llvm::json::Value(nullptr);
+  addInteger("required_lower_bound", record.requiredLowerBound);
+  addInteger("required_when_active", record.requiredWhenActive);
+  if (record.requiredIsDynamic)
+    result["required_is_dynamic"] = *record.requiredIsDynamic;
+  addInteger("available", record.available);
+  addInteger("cluster", record.cluster);
+  addInteger("min_warps", record.minWarps);
+  addInteger("group", record.group);
+  addInteger("fixed_stage", record.fixedStage);
+  addInteger("template", record.loweringTemplate);
+  addInteger("event", record.event);
+  if (!record.channel.empty())
+    result["channel"] = integerArray(record.channel);
+  return result;
+}
+
+class AssumptionTracker {
+public:
+  AssumptionTracker(Z3_context context, const Z3ConstraintEncoder &encoder)
+      : context(context), encoder(encoder) {}
+
+  Z3_ast get(llvm::StringRef groupId) {
+    std::string key = groupId.str();
+    auto found = assumptions.find(key);
+    if (found != assumptions.end())
+      return found->second;
+    std::string name =
+        "constraint_assumption_" +
+        std::to_string(static_cast<unsigned>(assumptions.size()));
+    Z3_ast literal =
+        Z3_mk_const(context, Z3_mk_string_symbol(context, name.c_str()),
+                    Z3_mk_bool_sort(context));
+    assumptions.emplace(std::move(key), literal);
+    labelsByAst.emplace(Z3_get_ast_id(context, literal), groupId.str());
+    return literal;
+  }
+
+  void assertFormula(llvm::StringRef groupId, Z3_ast formula) {
+    encoder.assertFormula(encoder.implies(get(groupId), formula));
+  }
+
+  std::vector<Z3_ast> literals() const {
+    std::vector<Z3_ast> result;
+    result.reserve(assumptions.size());
+    for (const auto &[_, literal] : assumptions)
+      result.push_back(literal);
+    return result;
+  }
+
+  /// Literals for the named constraint kinds only (kinds as reported by
+  /// `constraintKind`, e.g. "resource", "dependence", "smem", "tmem").
+  /// Omitting a group's literal from the assumption vector leaves it a free
+  /// boolean, so Z3 may satisfy `literal -> constraint` by setting the literal
+  /// false — i.e. the group is relaxed away. The result is the corresponding
+  /// relaxed model, whose feasible set is a superset of the full model's.
+  std::vector<Z3_ast>
+  literalsForKinds(const std::set<std::string> &kinds) const {
+    std::vector<Z3_ast> result;
+    for (const auto &[groupId, literal] : assumptions)
+      if (kinds.count(constraintKind(groupId).str()))
+        result.push_back(literal);
+    return result;
+  }
+
+  std::optional<std::vector<Z3_ast>>
+  literalsFor(llvm::ArrayRef<std::string> groupIds) const {
+    std::vector<Z3_ast> result;
+    result.reserve(groupIds.size());
+    for (const std::string &groupId : groupIds) {
+      auto found = assumptions.find(groupId);
+      if (found == assumptions.end())
+        return std::nullopt;
+      result.push_back(found->second);
+    }
+    return result;
+  }
+
+  std::optional<std::vector<std::string>>
+  resolveCore(Z3_ast_vector rawCore) const {
+    if (!rawCore)
+      return std::nullopt;
+    std::vector<std::string> result;
+    unsigned size = Z3_ast_vector_size(context, rawCore);
+    result.reserve(size);
+    for (unsigned index = 0; index < size; ++index) {
+      Z3_ast literal = Z3_ast_vector_get(context, rawCore, index);
+      if (!literal)
+        return std::nullopt;
+      auto found = labelsByAst.find(Z3_get_ast_id(context, literal));
+      if (found == labelsByAst.end())
+        return std::nullopt;
+      result.push_back(found->second);
+    }
+    normalizeCore(result);
+    return result;
+  }
+
+private:
+  Z3_context context;
+  const Z3ConstraintEncoder &encoder;
+  std::map<std::string, Z3_ast> assumptions;
+  std::unordered_map<unsigned, std::string> labelsByAst;
+};
+
+static Z3_lbool checkWithAssumptions(Z3_context context, Z3_solver solver,
+                                     llvm::ArrayRef<Z3_ast> assumptions) {
+  return Z3_solver_check_assumptions(
+      context, solver, static_cast<unsigned>(assumptions.size()),
+      assumptions.empty() ? nullptr : assumptions.data());
+}
+
+static Z3_lbool checkWithAssumptions(Z3_context context, Z3_optimize optimize,
+                                     llvm::ArrayRef<Z3_ast> assumptions) {
+  return Z3_optimize_check(context, optimize,
+                           static_cast<unsigned>(assumptions.size()),
+                           assumptions.empty() ? nullptr : assumptions.data());
+}
+
+static UnsatEvidence extractUnsatEvidence(Z3_context context, Z3_solver solver,
+                                          const AssumptionTracker &tracker) {
+  UnsatEvidence evidence;
+  auto groupIds =
+      tracker.resolveCore(Z3_solver_get_unsat_core(context, solver));
+  if (groupIds)
+    evidence.groupIds = std::move(*groupIds);
+  return evidence;
+}
+
+static UnsatEvidence extractUnsatEvidence(Z3_context context,
+                                          Z3_optimize optimize,
+                                          const AssumptionTracker &tracker) {
+  UnsatEvidence evidence;
+  auto groupIds =
+      tracker.resolveCore(Z3_optimize_get_unsat_core(context, optimize));
+  if (groupIds)
+    evidence.groupIds = std::move(*groupIds);
+  return evidence;
+}
+
+static bool
+configureCoreCheckTimeout(Z3_context context, Z3_solver solver,
+                          std::chrono::steady_clock::time_point deadline) {
+  auto now = std::chrono::steady_clock::now();
+  if (now >= deadline)
+    return false;
+  auto remaining =
+      std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now)
+          .count();
+  unsigned timeout = static_cast<unsigned>(std::max<int64_t>(
+      1, std::min<int64_t>(remaining, std::numeric_limits<unsigned>::max())));
+  Z3_params params = Z3_mk_params(context);
+  if (!params)
+    return false;
+  Z3_params_inc_ref(context, params);
+  Z3_params_set_uint(context, params, Z3_mk_string_symbol(context, "timeout"),
+                     timeout);
+  Z3_solver_set_params(context, solver, params);
+  Z3_params_dec_ref(context, params);
+  return !z3ErrorSeen;
+}
+
+static void
+minimizeUnsatEvidence(Z3_context context, Z3_solver solver,
+                      const AssumptionTracker &tracker,
+                      std::chrono::steady_clock::time_point solverDeadline,
+                      UnsatEvidence &evidence) {
+  if (evidence.groupIds.empty() ||
+      evidence.groupIds.size() > kCoreMinimizeMaxGroups || z3ErrorSeen)
+    return;
+  auto deadline = std::min(solverDeadline, std::chrono::steady_clock::now() +
+                                               kCoreMinimizeBudget);
+  bool completed = true;
+  for (size_t index = 0; index < evidence.groupIds.size();) {
+    if (!configureCoreCheckTimeout(context, solver, deadline)) {
+      completed = false;
+      break;
+    }
+    std::vector<std::string> trial = evidence.groupIds;
+    trial.erase(trial.begin() + index);
+    auto trialLiterals = tracker.literalsFor(trial);
+    if (!trialLiterals) {
+      completed = false;
+      break;
+    }
+    Z3_lbool status = checkWithAssumptions(context, solver, *trialLiterals);
+    if (z3ErrorSeen) {
+      completed = false;
+      break;
+    }
+    if (status == Z3_L_FALSE) {
+      evidence.groupIds = std::move(trial);
+      continue;
+    }
+    if (status != Z3_L_TRUE) {
+      completed = false;
+      break;
+    }
+    ++index;
+  }
+  if (completed)
+    evidence.normalization = "locally_minimized";
+}
+
+static std::string dependenceGroupId(int64_t src, int64_t dst,
+                                     int64_t distance) {
+  return "dep:N" + std::to_string(src) + "->N" + std::to_string(dst) + ":d" +
+         std::to_string(distance);
+}
+
+static std::string resourceGroupId(llvm::StringRef pipeline, int64_t node) {
+  return "resource:" + pipeline.str() + ":N" + std::to_string(node);
+}
+
+static std::string bufferGroupId(llvm::StringRef kind, int64_t buffer) {
+  return kind.str() + ":buffer" + std::to_string(buffer);
+}
+
+static std::string clusterGroupId(int64_t cluster) {
+  return "warp-group:cluster" + std::to_string(cluster);
+}
+
+static std::string crossWGGroupId(int64_t src, int64_t dst, int64_t distance,
+                                  int64_t result) {
+  return "dep:cross-wg-rt:N" + std::to_string(src) + "->N" +
+         std::to_string(dst) + ":d" + std::to_string(distance) + ":r" +
+         std::to_string(result);
+}
+
+static std::string channelGroupId(int64_t src, int64_t dst, int64_t result) {
+  return "smem:channel:N" + std::to_string(src) + "->N" + std::to_string(dst) +
+         ":r" + std::to_string(result);
+}
+
+static std::string loopCarriedGroupId(int64_t src, int64_t dst,
+                                      int64_t distance, int64_t result) {
+  return "warp-group:loop-carried:N" + std::to_string(src) + "->N" +
+         std::to_string(dst) + ":d" + std::to_string(distance) + ":r" +
+         std::to_string(result);
+}
+
+static std::string fixedStageGroupId(int64_t node) {
+  return "lowering:fixed-stage:N" + std::to_string(node);
+}
+
+static std::string loweringEventGroupId(int64_t loweringTemplate,
+                                        int64_t event) {
+  return "lowering:template" + std::to_string(loweringTemplate) + ":event" +
+         std::to_string(event);
+}
+
+static llvm::json::Array coreGroupIds(const UnsatEvidence &evidence) {
+  llvm::json::Array result;
+  result.reserve(evidence.groupIds.size());
+  for (const std::string &groupId : evidence.groupIds)
+    result.push_back(groupId);
+  return result;
+}
+
+static llvm::json::Object makeUnsatCore(int64_t ii,
+                                        const UnsatEvidence &evidence) {
+  return llvm::json::Object{
+      {"schema", kUnsatCoreSchema},
+      {"candidateII", ii},
+      {"groupIds", coreGroupIds(evidence)},
+      {"backendStatus", "INFEASIBLE"},
+      {"provenUnsat", true},
+      {"normalization", evidence.normalization},
+  };
+}
+
+static std::vector<std::string>
+missingProvenance(const UnsatEvidence &evidence,
+                  const ProvenanceMap &provenance) {
+  std::vector<std::string> result;
+  for (const std::string &groupId : evidence.groupIds)
+    if (provenance.count(groupId) == 0)
+      result.push_back(groupId);
+  return result;
+}
+
+static llvm::json::Array
+makeAggregates(llvm::ArrayRef<const ConstraintProvenance *> records,
+               int64_t ii) {
+  llvm::json::Array aggregates;
+  std::map<std::string, std::vector<const ConstraintProvenance *>>
+      resourcesByPipeline;
+  std::map<std::string, std::vector<const ConstraintProvenance *>> byKind;
+  for (const ConstraintProvenance *record : records) {
+    byKind[record->kind].push_back(record);
+    if (record->kind == "resource")
+      resourcesByPipeline[record->pipeline.value_or("unknown")].push_back(
+          record);
+  }
+  for (const auto &[pipeline, resources] : resourcesByPipeline) {
+    int64_t required = 0;
+    for (const ConstraintProvenance *record : resources)
+      required = saturatedAdd(required, record->required.value_or(0));
+    aggregates.push_back(llvm::json::Object{
+        {"kind", "resource"},
+        {"resource", pipeline},
+        {"required", required},
+        {"available", resources.front()->available.value_or(ii)},
+    });
+  }
+  for (llvm::StringRef kind :
+       {"dependence", "smem", "tmem", "warp-group", "register", "lowering"}) {
+    auto found = byKind.find(kind.str());
+    if (found == byKind.end())
+      continue;
+    const auto &kindRecords = found->second;
+    bool exact = true;
+    int64_t exactRequired = 0;
+    int64_t lowerBound = 0;
+    for (const ConstraintProvenance *record : kindRecords) {
+      if (!record->emitRequired || !record->required)
+        exact = false;
+      if (kind == "tmem") {
+        exactRequired = std::max(exactRequired, record->required.value_or(0));
+        lowerBound = std::max(lowerBound, record->requiredLowerBound.value_or(
+                                              record->required.value_or(0)));
+      } else {
+        exactRequired =
+            saturatedAdd(exactRequired, record->required.value_or(0));
+        lowerBound = saturatedAdd(
+            lowerBound,
+            record->requiredLowerBound.value_or(record->required.value_or(0)));
+      }
+    }
+    if (kind == "dependence" || kind == "warp-group" || kind == "lowering")
+      exact = false;
+    if (kind == "warp-group")
+      lowerBound = 1;
+    llvm::json::Object aggregate{
+        {"kind", kind},
+        {"required",
+         exact ? llvm::json::Value(exactRequired) : llvm::json::Value(nullptr)},
+        {"available", kindRecords.front()->available.value_or(ii)},
+    };
+    if (!exact) {
+      aggregate["required_lower_bound"] = lowerBound;
+      aggregate["required_is_dynamic"] = true;
+    }
+    aggregates.push_back(std::move(aggregate));
+  }
+  llvm::sort(aggregates,
+             [](const llvm::json::Value &left, const llvm::json::Value &right) {
+               auto *leftObject = left.getAsObject();
+               auto *rightObject = right.getAsObject();
+               llvm::StringRef leftKind = *leftObject->getString("kind");
+               llvm::StringRef rightKind = *rightObject->getString("kind");
+               int leftRank = constraintKindRank(leftKind);
+               int rightRank = constraintKindRank(rightKind);
+               llvm::StringRef leftResource =
+                   leftObject->getString("resource").value_or("");
+               llvm::StringRef rightResource =
+                   rightObject->getString("resource").value_or("");
+               return std::tie(leftRank, leftResource) <
+                      std::tie(rightRank, rightResource);
+             });
+  return aggregates;
+}
+
+static llvm::json::Object makeUnsatDiagnostic(int64_t ii,
+                                              const UnsatEvidence &evidence,
+                                              const ProvenanceMap &provenance) {
+  std::vector<std::string> missing = missingProvenance(evidence, provenance);
+  if (evidence.groupIds.empty() || !missing.empty()) {
+    llvm::json::Object diagnostic{
+        {"schema", kDiagnosticSchema},
+        {"status", "coverage_error"},
+        {"ii", ii},
+        {"backendStatus", "INFEASIBLE"},
+        {"provenUnsat", true},
+        {"message", evidence.groupIds.empty()
+                        ? "backend returned no attributable assumption core"
+                        : "UNSAT core contains constraint groups without "
+                          "provenance"},
+    };
+    if (!missing.empty()) {
+      llvm::json::Array missingIds;
+      for (const std::string &groupId : missing)
+        missingIds.push_back(groupId);
+      diagnostic["missingGroupIds"] = std::move(missingIds);
+    }
+    return diagnostic;
+  }
+
+  llvm::json::Array constraints;
+  std::vector<const ConstraintProvenance *> records;
+  records.reserve(evidence.groupIds.size());
+  std::vector<std::string> kinds;
+  for (const std::string &groupId : evidence.groupIds) {
+    const ConstraintProvenance &record = provenance.at(groupId);
+    constraints.push_back(provenanceToJson(record));
+    records.push_back(&record);
+    if (llvm::find(kinds, record.kind) == kinds.end())
+      kinds.push_back(record.kind);
+  }
+  llvm::sort(kinds, [](const std::string &left, const std::string &right) {
+    return constraintKindRank(left) < constraintKindRank(right);
+  });
+  const std::map<std::string, std::string> names{
+      {"dependence", "dependence or recurrence bound"},
+      {"resource", "pipeline resource capacity"},
+      {"smem", "SMEM capacity"},
+      {"tmem", "TMEM capacity"},
+      {"warp-group", "warp-group legality"},
+      {"register", "register limit"},
+      {"lowering", "lowering or emitter capability"},
+  };
+  std::string summary =
+      "Candidate II " + std::to_string(ii) + " conflicts with ";
+  for (size_t index = 0; index < kinds.size(); ++index) {
+    if (index)
+      summary += ", ";
+    auto name = names.find(kinds[index]);
+    summary += name == names.end() ? kinds[index] : name->second;
+  }
+
+  llvm::json::Array suggestions;
+  for (const std::string &kind : kinds) {
+    bool crossWG = false;
+    bool channel = false;
+    bool loopCarried = false;
+    bool fixedStage = false;
+    for (const ConstraintProvenance *record : records) {
+      if (record->kind != kind)
+        continue;
+      crossWG |= record->roundTripLatency.has_value();
+      channel |= llvm::StringRef(record->id).starts_with("smem:channel:");
+      loopCarried |= record->reason == "loop_carried_register";
+      fixedStage |=
+          llvm::StringRef(record->id).starts_with("lowering:fixed-stage:");
+    }
+    if (kind == "dependence" && crossWG)
+      suggestions.push_back(
+          "consider reducing cross-WG handoff latency or revising the "
+          "warp-group split");
+    else if (kind == "smem" && channel)
+      suggestions.push_back(
+          "consider reducing cross-WG channel storage or revising the "
+          "warp-group split");
+    else if (kind == "warp-group" && loopCarried)
+      suggestions.push_back(
+          "consider revising the warp-group split to keep the loop-carried "
+          "value in one group");
+    else if (kind == "lowering" && fixedStage)
+      suggestions.push_back(
+          "consider allowing stage movement in the emitter or revising the "
+          "fixed-stage schedule");
+    else if (kind == "dependence")
+      suggestions.push_back(
+          "consider increasing II or reducing the reported recurrence "
+          "latency");
+    else if (kind == "resource")
+      suggestions.push_back(
+          "consider increasing II or reducing the reported pipeline "
+          "reservation");
+    else if (kind == "smem")
+      suggestions.push_back("consider reducing buffer depth or tile size");
+    else if (kind == "tmem")
+      suggestions.push_back(
+          "consider reducing overlapping TMEM columns or lifetimes");
+    else if (kind == "warp-group")
+      suggestions.push_back(
+          "consider allowing another warp group or revising the reported "
+          "incompatibility");
+    else if (kind == "register")
+      suggestions.push_back(
+          "consider reducing per-group warp or register requirements");
+    else if (kind == "lowering")
+      suggestions.push_back(
+          "consider a lowering template supported at the candidate II");
+  }
+
+  return llvm::json::Object{
+      {"schema", kDiagnosticSchema},
+      {"status", "unsat"},
+      {"ii", ii},
+      {"summary", std::move(summary)},
+      {"core", makeUnsatCore(ii, evidence)},
+      {"constraints", std::move(constraints)},
+      {"aggregates", makeAggregates(records, ii)},
+      {"suggestions", std::move(suggestions)},
+  };
+}
+
+static llvm::json::Object makeInconclusiveDiagnostic(int64_t ii,
+                                                     llvm::StringRef message) {
+  return llvm::json::Object{
+      {"schema", kDiagnosticSchema}, {"status", "inconclusive"}, {"ii", ii},
+      {"backendStatus", "UNKNOWN"},  {"message", message},
+  };
+}
+
+static void addUnsatDiagnostic(llvm::json::Object &result, int64_t ii,
+                               const UnsatEvidence &evidence,
+                               const ProvenanceMap &provenance) {
+  result["diagnostic"] = makeUnsatDiagnostic(ii, evidence, provenance);
+  if (!evidence.groupIds.empty() &&
+      missingProvenance(evidence, provenance).empty())
+    result["unsat_core"] = makeUnsatCore(ii, evidence);
+}
+
 static std::string serialize(llvm::json::Object object) {
   std::string output;
   llvm::raw_string_ostream stream(output);
@@ -398,7 +1057,28 @@ struct Problem {
   std::vector<Node> nodes;
   std::vector<Edge> edges;
   std::vector<Buffer> buffers;
+  // Assumption-gated constraint kinds to KEEP. Empty = the full model.
+  // Non-empty selects a relaxation, whose minimum feasible II is a lower
+  // bound on the full model's. Not every constraint is assumption-gated, so
+  // the relaxation is never a *pure* single-kind model — see
+  // `kUntrackedHardAssertions`.
+  std::set<std::string> relaxKeepKinds;
 };
+
+/// Constraints that stay hard assertions regardless of `relaxKeepKinds`,
+/// because they are asserted directly on the encoder rather than through
+/// `AssumptionTracker`. A relaxed bound is therefore tighter than a textbook
+/// relaxation of the same kinds — which keeps it a valid lower bound (a
+/// tighter bound is a stronger soundness test), but means it must not be
+/// reported as one. Mirrored in the report emitted by the baseline
+/// comparison; keep the two in sync.
+///
+/// Note that dropping the `smem`/`tmem` literals zeroes their charges, so the
+/// two budget ceilings survive but go vacuous; only the domain bounds and the
+/// canonical-root pin actually bind in a resource-only relaxation.
+constexpr llvm::StringLiteral kUntrackedHardAssertions =
+    "cycle domain bounds (0 <= cycle < horizon), canonical-root pinning, "
+    "smemTotal <= smem_budget, per-checkpoint TMEM columns <= tmem_col_limit";
 
 static std::optional<Problem> parseProblem(llvm::StringRef problemJson) {
   auto parsed = llvm::json::parse(problemJson);
@@ -430,6 +1110,18 @@ static std::optional<Problem> parseProblem(llvm::StringRef problemJson) {
     if (!value)
       return std::nullopt;
     problem.streamingVL = *value;
+  }
+
+  if (root->get("relax_keep_kinds")) {
+    auto *kinds = root->getArray("relax_keep_kinds");
+    if (!kinds || kinds->empty())
+      return std::nullopt;
+    for (const llvm::json::Value &value : *kinds) {
+      auto kind = value.getAsString();
+      if (!kind || kind->empty())
+        return std::nullopt;
+      problem.relaxKeepKinds.insert(kind->str());
+    }
   }
 
   auto *nodeValues = root->getArray("nodes");
@@ -551,6 +1243,58 @@ static int64_t effectiveLatency(const Problem &problem, const Edge &edge) {
   return edge.latency;
 }
 
+static ProvenanceMap constraintProvenance(const Problem &problem, int64_t ii) {
+  ProvenanceMap provenance;
+  for (const Edge &edge : problem.edges) {
+    const Node &src = problem.nodes[edge.src];
+    const Node &dst = problem.nodes[edge.dst];
+    ConstraintProvenance record;
+    record.id = dependenceGroupId(src.id, dst.id, edge.distance);
+    record.kind = "dependence";
+    record.nodes = {src.id, dst.id};
+    record.latency = effectiveLatency(problem, edge);
+    record.distance = edge.distance;
+    record.available = ii;
+    addProvenance(provenance, std::move(record));
+  }
+  for (const Node &node : problem.nodes) {
+    if (node.pipeline == "NONE")
+      continue;
+    ConstraintProvenance record;
+    record.id = resourceGroupId(node.pipeline, node.id);
+    record.kind = "resource";
+    record.nodes = {node.id};
+    record.pipeline = node.pipeline;
+    record.required = std::max<int64_t>(node.duration, 1);
+    record.emitRequired = true;
+    record.available = ii;
+    addProvenance(provenance, std::move(record));
+  }
+  for (const Buffer &buffer : problem.buffers) {
+    ConstraintProvenance record;
+    record.id = bufferGroupId(buffer.kind == BufferKind::Smem ? "smem" : "tmem",
+                              buffer.id);
+    record.kind = buffer.kind == BufferKind::Smem ? "smem" : "tmem";
+    record.nodes.push_back(problem.nodes[buffer.alloc].id);
+    for (size_t consumer : buffer.consumers)
+      record.nodes.push_back(problem.nodes[consumer].id);
+    record.buffer = buffer.id;
+    record.emitRequired = true;
+    record.requiredIsDynamic = true;
+    if (buffer.kind == BufferKind::Smem) {
+      record.sizeBytes = buffer.sizeBytes;
+      record.requiredLowerBound = buffer.sizeBytes;
+      record.available = problem.smemBudget;
+    } else {
+      record.columns = buffer.tmemCols;
+      record.requiredLowerBound = buffer.tmemCols;
+      record.available = problem.tmemColLimit;
+    }
+    addProvenance(provenance, std::move(record));
+  }
+  return provenance;
+}
+
 static std::optional<int64_t> computeHorizon(const Problem &problem,
                                              int64_t ii) {
   if (problem.nodes.empty())
@@ -632,11 +1376,13 @@ struct CandidateResult {
   __int128 objective = 0;
   BudgetExhausted budgetExhausted = BudgetExhausted::None;
   std::optional<uint64_t> rlimitUsed;
+  UnsatEvidence unsatEvidence;
 };
 
 static CandidateResult
 solveCandidate(const Problem &problem, int64_t ii,
-               std::chrono::steady_clock::time_point deadline) {
+               std::chrono::steady_clock::time_point deadline,
+               bool minimizeCore) {
   CandidateResult result;
   auto horizon = computeHorizon(problem, ii);
   if (!horizon)
@@ -646,6 +1392,8 @@ solveCandidate(const Problem &problem, int64_t ii,
   for (const Node &node : problem.nodes) {
     if (node.pipeline != "NONE" && std::max<int64_t>(node.duration, 1) > ii) {
       result.status = CandidateStatus::Unsat;
+      result.unsatEvidence.groupIds = {resourceGroupId(node.pipeline, node.id)};
+      result.unsatEvidence.normalization = "precheck";
       return result;
     }
   }
@@ -666,6 +1414,7 @@ solveCandidate(const Problem &problem, int64_t ii,
   if (!solver)
     return result;
   Z3ConstraintEncoder encoder(context, solver);
+  AssumptionTracker assumptions(context, encoder);
 
   Z3_ast iiValue = encoder.intValue(ii);
   Z3_ast horizonValue = encoder.intValue(*horizon);
@@ -696,15 +1445,18 @@ solveCandidate(const Problem &problem, int64_t ii,
   }
 
   for (const Edge &edge : problem.edges) {
+    std::string groupId = dependenceGroupId(
+        problem.nodes[edge.src].id, problem.nodes[edge.dst].id, edge.distance);
     Z3_ast distance = encoder.mul(encoder.intValue(edge.distance), iiValue);
     Z3_ast rhs = encoder.sub(
         encoder.add(cycles[edge.src],
                     encoder.intValue(effectiveLatency(problem, edge))),
         distance);
-    encoder.assertFormula(Z3_mk_ge(context, cycles[edge.dst], rhs));
+    assumptions.assertFormula(groupId,
+                              Z3_mk_ge(context, cycles[edge.dst], rhs));
     if (edge.distance == 0)
-      encoder.assertFormula(
-          Z3_mk_le(context, stages[edge.src], stages[edge.dst]));
+      assumptions.assertFormula(
+          groupId, Z3_mk_le(context, stages[edge.src], stages[edge.dst]));
   }
 
   // Ordered by pipeline name: this map is iterated to emit the mutual-exclusion
@@ -731,7 +1483,13 @@ solveCandidate(const Problem &problem, int64_t ii,
         std::vector<Z3_ast> separated{
             Z3_mk_ge(context, delta, encoder.intValue(leftDuration)),
             Z3_mk_le(context, delta, encoder.intValue(ii - rightDuration))};
-        encoder.assertFormula(encoder.conjunction(separated));
+        Z3_ast present = encoder.conjunction(
+            {assumptions.get(resourceGroupId(problem.nodes[left].pipeline,
+                                             problem.nodes[left].id)),
+             assumptions.get(resourceGroupId(problem.nodes[right].pipeline,
+                                             problem.nodes[right].id))});
+        encoder.assertFormula(
+            encoder.implies(present, encoder.conjunction(separated)));
       }
     }
   }
@@ -741,6 +1499,7 @@ solveCandidate(const Problem &problem, int64_t ii,
   struct TmemLifetime {
     Z3_ast start;
     Z3_ast end;
+    Z3_ast assumption;
     int64_t columns;
   };
   std::vector<TmemLifetime> tmemLifetimes;
@@ -753,8 +1512,10 @@ solveCandidate(const Problem &problem, int64_t ii,
           encoder.sub(encoder.maximum(lifetimeStages), stages[buffer.alloc]),
           encoder.intValue(1));
       smemDepths.push_back(depth);
+      Z3_ast charge = encoder.mul(encoder.intValue(buffer.sizeBytes), depth);
       smemCharges.push_back(
-          encoder.mul(encoder.intValue(buffer.sizeBytes), depth));
+          Z3_mk_ite(context, assumptions.get(bufferGroupId("smem", buffer.id)),
+                    charge, encoder.intValue(0)));
       continue;
     }
 
@@ -763,8 +1524,9 @@ solveCandidate(const Problem &problem, int64_t ii,
       lifetimeCycles.push_back(cycles[consumer]);
     Z3_ast end =
         encoder.add(encoder.maximum(lifetimeCycles), encoder.intValue(1));
-    tmemLifetimes.push_back(
-        TmemLifetime{cycles[buffer.alloc], end, buffer.tmemCols});
+    tmemLifetimes.push_back(TmemLifetime{
+        cycles[buffer.alloc], end,
+        assumptions.get(bufferGroupId("tmem", buffer.id)), buffer.tmemCols});
   }
   Z3_ast smemTotal = encoder.sum(smemCharges);
   encoder.assertFormula(
@@ -775,6 +1537,7 @@ solveCandidate(const Problem &problem, int64_t ii,
     activeColumns.reserve(tmemLifetimes.size());
     for (const TmemLifetime &lifetime : tmemLifetimes) {
       std::vector<Z3_ast> isActive{
+          lifetime.assumption,
           Z3_mk_le(context, lifetime.start, checkpoint.start),
           Z3_mk_lt(context, checkpoint.start, lifetime.end)};
       activeColumns.push_back(Z3_mk_ite(context, encoder.conjunction(isActive),
@@ -862,12 +1625,20 @@ solveCandidate(const Problem &problem, int64_t ii,
       !configureSolver(context, solver, *timeoutMs, problem.budget))
     return CandidateResult{};
 
-  Z3_lbool status = Z3_solver_check(context, solver);
+  const bool relaxed = !problem.relaxKeepKinds.empty();
+  std::vector<Z3_ast> assumptionLiterals =
+      relaxed ? assumptions.literalsForKinds(problem.relaxKeepKinds)
+              : assumptions.literals();
+  Z3_lbool status = checkWithAssumptions(context, solver, assumptionLiterals);
   if (z3ErrorSeen)
     return CandidateResult{};
   if (status == Z3_L_FALSE) {
     result.status = CandidateStatus::Unsat;
     result.rlimitUsed = readRLimitCount(context, solver);
+    result.unsatEvidence = extractUnsatEvidence(context, solver, assumptions);
+    if (minimizeCore)
+      minimizeUnsatEvidence(context, solver, assumptions, deadline,
+                            result.unsatEvidence);
     return result;
   }
   if (status == Z3_L_UNDEF)
@@ -879,6 +1650,14 @@ solveCandidate(const Problem &problem, int64_t ii,
   if (!baseCandidate)
     return CandidateResult{};
   result = std::move(*baseCandidate);
+
+  // A relaxed solve exists only to bound the minimum feasible II, and its
+  // objective is not comparable to the full model's (the dropped groups also
+  // drop their objective contributions). Stop at feasibility rather than
+  // paying for the composite-objective binary search.
+  if (relaxed)
+    return result;
+
   __int128 low = objectiveLowerBound(problem, ii, *horizon);
   __int128 high = result.objective;
   if (high < low)
@@ -901,7 +1680,7 @@ solveCandidate(const Problem &problem, int64_t ii,
       return CandidateResult{};
     }
 
-    status = Z3_solver_check(context, solver);
+    status = checkWithAssumptions(context, solver, assumptionLiterals);
     if (z3ErrorSeen) {
       Z3_solver_pop(context, solver, 1);
       return CandidateResult{};
@@ -943,6 +1722,12 @@ static llvm::json::Array toJsonArray(const std::vector<int64_t> &values) {
   for (int64_t value : values)
     result.push_back(value);
   return result;
+}
+
+static void insertSortedUnique(std::vector<int64_t> &values, int64_t value) {
+  auto position = std::lower_bound(values.begin(), values.end(), value);
+  if (position == values.end() || *position != value)
+    values.insert(position, value);
 }
 
 /// `rlimit_used` is the deterministic cost of the whole II sweep, summed over
@@ -988,7 +1773,7 @@ static llvm::json::Object makeSuccess(const Problem &problem, int64_t ii,
 
   double objective = static_cast<double>(candidate.objective);
 
-  return llvm::json::Object{
+  llvm::json::Object result{
       {"version", kSchemaVersion},
       {"status", "ok"},
       {"ii", ii},
@@ -997,6 +1782,19 @@ static llvm::json::Object makeSuccess(const Problem &problem, int64_t ii,
       {"objective", static_cast<double>(objective)},
       {"stats", makeStats(tried, unsat, unknown, problem.budget, rlimitUsed)},
   };
+  if (!problem.relaxKeepKinds.empty()) {
+    // Mark the result so a consumer cannot mistake a relaxed schedule for a
+    // full-model one: `ii` is a lower bound, `cycles` satisfy only the kept
+    // kinds, and `objective` is not comparable to a full-model objective.
+    llvm::json::Array keptKinds;
+    for (const std::string &kind : problem.relaxKeepKinds)
+      keptKinds.push_back(kind);
+    result["relaxation"] = llvm::json::Object{
+        {"keep_kinds", std::move(keptKinds)},
+        {"untracked_hard_assertions", kUntrackedHardAssertions.str()},
+    };
+  }
+  return result;
 }
 
 static FailureOr<std::string> run(llvm::StringRef problemJson) {
@@ -1014,62 +1812,103 @@ static FailureOr<std::string> run(llvm::StringRef problemJson) {
   std::vector<int64_t> unsat;
   std::vector<int64_t> unknown;
   uint64_t rlimitUsed = 0;
-  for (int64_t ii = problem->minII;; ++ii) {
-    tried.push_back(ii);
-    CandidateResult candidate = solveCandidate(*problem, ii, deadline);
+  std::optional<std::pair<int64_t, UnsatEvidence>> lastUnsat;
+  std::optional<std::pair<int64_t, CandidateResult>> best;
+
+  auto makeUnknown = [&](int64_t ii, const CandidateResult &candidate) {
+    insertSortedUnique(unknown, ii);
+    std::string message =
+        "joint solve inconclusive at II " + std::to_string(ii);
+    llvm::StringRef diagnosticMessage = candidate.reason.empty()
+                                            ? llvm::StringRef(message)
+                                            : llvm::StringRef(candidate.reason);
+    llvm::json::Object diagnostic =
+        makeInconclusiveDiagnostic(ii, diagnosticMessage);
+    return serialize(llvm::json::Object{
+        {"version", kSchemaVersion},
+        {"status", "inconclusive"},
+        {"proven_unsat", false},
+        {"backend_status", "UNKNOWN"},
+        // Which budget ran out. `rlimit` is deterministic and reproducible — a
+        // property of the problem, answered by raising the budget or
+        // simplifying the model. `walltime` is an environment signal and, with
+        // rlimit binding, should essentially never appear.
+        {"budget_exhausted",
+         budgetExhaustedName(candidate.budgetExhausted).str()},
+        {"message", std::move(message)},
+        {"diagnostic", std::move(diagnostic)},
+        {"stats",
+         makeStats(tried, unsat, unknown, problem->budget, rlimitUsed)},
+    });
+  };
+
+  // Feasibility is monotone in II. Map a schedule at II to a larger II' by
+  // keeping each cycle's stage and remainder: s * II + r -> s * II' + r.
+  // Resource phases stay identical; SMEM depths and TMEM endpoint ordering are
+  // preserved. For a dependence, (stageDelta + distance) is nonnegative, so
+  // increasing II can only preserve or relax its inequality.
+  int64_t low = problem->minII;
+  int64_t high = problem->maxII;
+  while (low < high) {
+    int64_t ii = low + (high - low) / 2;
+    insertSortedUnique(tried, ii);
+    CandidateResult candidate =
+        solveCandidate(*problem, ii, deadline, ii == problem->maxII);
     // Each II is solved in its own context, so the per-II counters sum to the
     // deterministic cost of the sweep.
     rlimitUsed += candidate.rlimitUsed.value_or(0);
     if (candidate.status == CandidateStatus::Sat) {
-      return serialize(makeSuccess(*problem, ii, candidate, tried, unsat,
-                                   unknown, rlimitUsed));
+      best = std::make_pair(ii, std::move(candidate));
+      high = ii;
+      continue;
     }
     if (candidate.status == CandidateStatus::Unsat) {
-      unsat.push_back(ii);
+      insertSortedUnique(unsat, ii);
+      lastUnsat = std::make_pair(ii, std::move(candidate.unsatEvidence));
+      low = ii + 1;
     } else if (candidate.status == CandidateStatus::Unknown) {
-      unknown.push_back(ii);
-      std::string message =
-          "joint solve inconclusive at II " + std::to_string(ii);
-      llvm::json::Object diagnostic{
-          {"schema", "joint-solver-diagnostic-0.1"},
-          {"status", "inconclusive"},
-          {"ii", ii},
-          {"backendStatus", "UNKNOWN"},
-          {"message", candidate.reason.empty() ? message : candidate.reason},
-      };
-      return serialize(llvm::json::Object{
-          {"version", kSchemaVersion},
-          {"status", "inconclusive"},
-          {"proven_unsat", false},
-          {"backend_status", "UNKNOWN"},
-          // Which budget ran out. `rlimit` is deterministic and reproducible —
-          // a property of the problem, answered by raising the budget or
-          // simplifying the model. `walltime` is an environment signal and,
-          // with rlimit binding, should essentially never appear.
-          {"budget_exhausted",
-           budgetExhaustedName(candidate.budgetExhausted).str()},
-          {"message", std::move(message)},
-          {"diagnostic", std::move(diagnostic)},
-          {"stats",
-           makeStats(tried, unsat, unknown, problem->budget, rlimitUsed)},
-      });
+      return makeUnknown(ii, candidate);
     } else {
       return failure();
     }
-    if (ii == problem->maxII)
-      break;
+  }
+
+  if (!best || best->first != low) {
+    insertSortedUnique(tried, low);
+    CandidateResult candidate =
+        solveCandidate(*problem, low, deadline, low == problem->maxII);
+    rlimitUsed += candidate.rlimitUsed.value_or(0);
+    if (candidate.status == CandidateStatus::Sat) {
+      best = std::make_pair(low, std::move(candidate));
+    } else if (candidate.status == CandidateStatus::Unsat) {
+      insertSortedUnique(unsat, low);
+      lastUnsat = std::make_pair(low, std::move(candidate.unsatEvidence));
+    } else if (candidate.status == CandidateStatus::Unknown) {
+      return makeUnknown(low, candidate);
+    } else {
+      return failure();
+    }
+  }
+  if (best) {
+    return serialize(makeSuccess(*problem, best->first, best->second, tried,
+                                 unsat, unknown, rlimitUsed));
   }
 
   std::string message = "no feasible II in [" + std::to_string(problem->minII) +
                         ", " + std::to_string(problem->maxII) + "]";
-  return serialize(llvm::json::Object{
+  llvm::json::Object result{
       {"version", kSchemaVersion},
       {"status", "infeasible"},
       {"proven_unsat", true},
       {"backend_status", "INFEASIBLE"},
       {"message", std::move(message)},
       {"stats", makeStats(tried, unsat, unknown, problem->budget, rlimitUsed)},
-  });
+  };
+  if (lastUnsat) {
+    ProvenanceMap provenance = constraintProvenance(*problem, lastUnsat->first);
+    addUnsatDiagnostic(result, lastUnsat->first, lastUnsat->second, provenance);
+  }
+  return serialize(std::move(result));
 }
 
 } // namespace v01
@@ -1607,6 +2446,203 @@ static std::optional<Problem> parseProblem(llvm::StringRef problemJson) {
   return problem;
 }
 
+static llvm::StringRef relationName(Relation relation) {
+  switch (relation) {
+  case Relation::Always:
+    return "always";
+  case Relation::SameWG:
+    return "same_wg";
+  case Relation::DifferentWG:
+    return "different_wg";
+  }
+  llvm_unreachable("unknown lowering relation");
+}
+
+static ProvenanceMap constraintProvenance(const Problem &problem) {
+  ProvenanceMap provenance;
+  auto addCluster = [&](size_t clusterIndex) {
+    const Cluster &cluster = problem.clusters[clusterIndex];
+    ConstraintProvenance record;
+    record.id = clusterGroupId(cluster.id);
+    record.kind = "warp-group";
+    record.cluster = cluster.id;
+    record.minWarps = cluster.minWarps;
+    record.available = problem.maxWGs;
+    for (size_t node : cluster.nodes)
+      record.nodes.push_back(problem.nodes[node].id);
+    addProvenance(provenance, std::move(record));
+  };
+  for (size_t cluster = 0; cluster < problem.clusters.size(); ++cluster)
+    addCluster(cluster);
+
+  for (const Node &node : problem.nodes) {
+    if (node.pipeline != "NONE" ||
+        std::max<int64_t>(node.duration, 1) > problem.ii) {
+      ConstraintProvenance resource;
+      resource.id = resourceGroupId(node.pipeline, node.id);
+      resource.kind = "resource";
+      resource.nodes = {node.id};
+      resource.pipeline = node.pipeline;
+      resource.required = std::max<int64_t>(node.duration, 1);
+      resource.emitRequired = true;
+      resource.available = problem.ii;
+      addProvenance(provenance, std::move(resource));
+    }
+    if (problem.mode == SolveMode::Joint) {
+      ConstraintProvenance fixedStage;
+      fixedStage.id = fixedStageGroupId(node.id);
+      fixedStage.kind = "lowering";
+      fixedStage.nodes = {node.id};
+      fixedStage.capability = "fixed-stage emitter";
+      fixedStage.fixedStage = node.fixedCycle / problem.ii;
+      fixedStage.available = problem.ii;
+      addProvenance(provenance, std::move(fixedStage));
+    }
+  }
+
+  for (const Edge &edge : problem.edges) {
+    const Node &src = problem.nodes[edge.src];
+    const Node &dst = problem.nodes[edge.dst];
+    int64_t baseLatency = problem.mode == SolveMode::Joint && edge.distance == 0
+                              ? std::max<int64_t>(edge.latency, 1)
+                              : edge.latency;
+    if (problem.mode == SolveMode::Joint) {
+      ConstraintProvenance dependence;
+      dependence.id = dependenceGroupId(src.id, dst.id, edge.distance);
+      dependence.kind = "dependence";
+      dependence.nodes = {src.id, dst.id};
+      dependence.latency = baseLatency;
+      dependence.distance = edge.distance;
+      dependence.available = problem.ii;
+      addProvenance(provenance, std::move(dependence));
+    }
+    bool crossCluster = edge.srcCluster && edge.dstCluster &&
+                        *edge.srcCluster != *edge.dstCluster;
+    if (!crossCluster)
+      continue;
+    if (edge.distance > 0 && edge.roundTrip > 0) {
+      ConstraintProvenance loopCarried;
+      loopCarried.id = loopCarriedGroupId(src.id, dst.id, edge.distance,
+                                          edge.srcResultIndex);
+      loopCarried.kind = "warp-group";
+      loopCarried.nodes = {src.id, dst.id};
+      loopCarried.relation = "same_wg";
+      loopCarried.reason = "loop_carried_register";
+      loopCarried.distance = edge.distance;
+      loopCarried.result = edge.srcResultIndex;
+      loopCarried.roundTripLatency = edge.roundTrip;
+      loopCarried.available = problem.maxWGs;
+      addProvenance(provenance, std::move(loopCarried));
+    } else if (problem.mode == SolveMode::Joint && edge.roundTrip > 0) {
+      ConstraintProvenance handoff;
+      handoff.id =
+          crossWGGroupId(src.id, dst.id, edge.distance, edge.srcResultIndex);
+      handoff.kind = "dependence";
+      handoff.nodes = {src.id, dst.id};
+      handoff.baseLatency = baseLatency;
+      handoff.roundTripLatency = edge.roundTrip;
+      handoff.requiredLatency = saturatedAdd(baseLatency, edge.roundTrip);
+      handoff.distance = edge.distance;
+      handoff.result = edge.srcResultIndex;
+      handoff.conditionalOn = "different_wg";
+      handoff.available = problem.ii;
+      addProvenance(provenance, std::move(handoff));
+    }
+    if (edge.channelBytes > 0) {
+      ConstraintProvenance channel;
+      channel.id = channelGroupId(src.id, dst.id, edge.srcResultIndex);
+      channel.kind = "smem";
+      channel.nodes = {src.id, dst.id};
+      channel.channel = {src.id, dst.id, edge.srcResultIndex};
+      channel.sizeBytes = edge.channelBytes;
+      channel.emitRequired = true;
+      channel.requiredLowerBound = 0;
+      channel.requiredWhenActive = edge.channelBytes;
+      channel.requiredIsDynamic = true;
+      channel.available = problem.smemBudget;
+      channel.conditionalOn = "different_wg";
+      addProvenance(provenance, std::move(channel));
+    }
+  }
+
+  for (const Buffer &buffer : problem.buffers) {
+    bool modelSmem = problem.mode == SolveMode::Joint && buffer.kind == "smem";
+    if (!modelSmem && buffer.kind != "tmem")
+      continue;
+    ConstraintProvenance record;
+    record.id = bufferGroupId(buffer.kind, buffer.id);
+    record.kind = buffer.kind;
+    record.nodes.push_back(problem.nodes[buffer.producer].id);
+    for (const BufferConsumer &consumer : buffer.consumers)
+      record.nodes.push_back(problem.nodes[consumer.node].id);
+    record.buffer = buffer.id;
+    record.sizeBytes = buffer.sizeBytes;
+    record.emitRequired = true;
+    record.requiredLowerBound =
+        saturatedMultiply(buffer.sizeBytes, buffer.minCount);
+    record.requiredIsDynamic = true;
+    record.available = modelSmem ? problem.smemBudget : problem.tmemBudgetBytes;
+    addProvenance(provenance, std::move(record));
+  }
+
+  int64_t fixedSmem = problem.mode == SolveMode::Joint ? problem.fixedSmem
+                                                       : problem.committedSmem;
+  if (fixedSmem > 0) {
+    ConstraintProvenance record;
+    record.id =
+        problem.mode == SolveMode::Joint ? "smem:fixed" : "smem:committed";
+    record.kind = "smem";
+    record.required = fixedSmem;
+    record.emitRequired = true;
+    record.requiredLowerBound = fixedSmem;
+    record.requiredIsDynamic = false;
+    record.available = problem.smemBudget;
+    addProvenance(provenance, std::move(record));
+  }
+
+  int64_t registerLimit = problem.regBudget.value_or(problem.smRegs);
+  for (size_t group = 0; group < problem.clusters.size(); ++group) {
+    ConstraintProvenance record;
+    record.id = "register:wg" + std::to_string(group);
+    record.kind = "register";
+    record.emitRequired = true;
+    record.requiredLowerBound = 0;
+    record.requiredIsDynamic = true;
+    record.available = registerLimit;
+    record.group = group;
+    addProvenance(provenance, std::move(record));
+  }
+  if (problem.defaultWGFootprint > 0) {
+    ConstraintProvenance record;
+    record.id = "register:default";
+    record.kind = "register";
+    record.required = problem.defaultWGFootprint;
+    record.emitRequired = true;
+    record.available = registerLimit;
+    addProvenance(provenance, std::move(record));
+  }
+
+  for (const LoweringTemplate &loweringTemplate : problem.loweringTemplates) {
+    for (const LoweringEvent &event : loweringTemplate.events) {
+      if (event.duration <= 0)
+        continue;
+      ConstraintProvenance record;
+      record.id = loweringEventGroupId(loweringTemplate.id, event.id);
+      record.kind = "lowering";
+      record.nodes = {problem.nodes[event.anchor].id};
+      record.loweringTemplate = loweringTemplate.id;
+      record.event = event.id;
+      record.relation = relationName(loweringTemplate.relation).str();
+      record.capability = event.kind;
+      record.required = event.duration;
+      record.emitRequired = true;
+      record.available = problem.ii;
+      addProvenance(provenance, std::move(record));
+    }
+  }
+  return provenance;
+}
+
 struct Candidate {
   CandidateStatus status = CandidateStatus::Error;
   std::vector<int64_t> cycles;
@@ -1617,6 +2653,7 @@ struct Candidate {
   std::string reason;
   BudgetExhausted budgetExhausted = BudgetExhausted::None;
   std::optional<uint64_t> rlimitUsed;
+  UnsatEvidence unsatEvidence;
 };
 
 struct IssueItem {
@@ -1666,6 +2703,14 @@ static Candidate solveProblem(const Problem &problem,
     result.budgetExhausted = BudgetExhausted::WallTime;
     return result;
   }
+  for (const Node &node : problem.nodes) {
+    if (std::max<int64_t>(node.duration, 1) > problem.ii) {
+      result.status = CandidateStatus::Unsat;
+      result.unsatEvidence.groupIds = {resourceGroupId(node.pipeline, node.id)};
+      result.unsatEvidence.normalization = "precheck";
+      return result;
+    }
+  }
 
   z3ErrorSeen = false;
   Context ownedContext;
@@ -1677,6 +2722,7 @@ static Candidate solveProblem(const Problem &problem,
   if (!solver)
     return result;
   Z3ConstraintEncoder encoder(context, solver);
+  AssumptionTracker assumptions(context, encoder);
 
   Z3_ast zero = encoder.intValue(0);
   Z3_ast iiValue = encoder.intValue(problem.ii);
@@ -1695,19 +2741,14 @@ static Candidate solveProblem(const Problem &problem,
     stages.push_back(stage);
     phases.push_back(phase);
     int64_t fixedStage = node.fixedCycle / problem.ii;
-    __int128 lower = static_cast<__int128>(fixedStage) * problem.ii;
-    __int128 upper = lower + problem.ii - 1;
-    if (upper > std::numeric_limits<int64_t>::max())
-      return result;
-    encoder.assertFormula(Z3_mk_ge(
-        context, cycle, encoder.intValue(static_cast<int64_t>(lower))));
-    encoder.assertFormula(Z3_mk_le(
-        context, cycle, encoder.intValue(static_cast<int64_t>(upper))));
-    encoder.assertFormula(
-        Z3_mk_eq(context, stage, encoder.intValue(fixedStage)));
-    if (problem.mode == SolveMode::Partition)
+    if (problem.mode == SolveMode::Joint) {
+      assumptions.assertFormula(
+          fixedStageGroupId(node.id),
+          Z3_mk_eq(context, stage, encoder.intValue(fixedStage)));
+    } else {
       encoder.assertFormula(
           Z3_mk_eq(context, cycle, encoder.intValue(node.fixedCycle)));
+    }
   }
   if (problem.canonicalRoot)
     encoder.assertFormula(
@@ -1715,10 +2756,14 @@ static Candidate solveProblem(const Problem &problem,
 
   const size_t clusterCount = problem.clusters.size();
   std::vector<Z3_ast> warpGroups;
+  std::vector<Z3_ast> clusterAssumptions;
   warpGroups.reserve(clusterCount);
+  clusterAssumptions.reserve(clusterCount);
   for (size_t index = 0; index < clusterCount; ++index) {
     Z3_ast wg = encoder.variable("v2_wg_" + std::to_string(index));
     warpGroups.push_back(wg);
+    clusterAssumptions.push_back(
+        assumptions.get(clusterGroupId(problem.clusters[index].id)));
     encoder.assertFormula(Z3_mk_ge(context, wg, zero));
     encoder.assertFormula(Z3_mk_lt(
         context, wg, encoder.intValue(static_cast<int64_t>(clusterCount))));
@@ -1743,8 +2788,12 @@ static Candidate solveProblem(const Problem &problem,
   auto sameWG = [&](size_t left, size_t right) {
     return Z3_mk_eq(context, warpGroups[left], warpGroups[right]);
   };
-  for (const auto &[left, right] : problem.warpGroupConflicts)
-    encoder.assertFormula(Z3_mk_not(context, sameWG(left, right)));
+  for (const auto &[left, right] : problem.warpGroupConflicts) {
+    Z3_ast present = encoder.conjunction(
+        {clusterAssumptions[left], clusterAssumptions[right]});
+    encoder.assertFormula(
+        encoder.implies(present, Z3_mk_not(context, sameWG(left, right))));
+  }
 
   for (const Edge &edge : problem.edges) {
     const Node &srcNode = problem.nodes[edge.src];
@@ -1755,11 +2804,18 @@ static Candidate solveProblem(const Problem &problem,
       // Tensor-core results consumed by CUDA/SFU must cross warp groups so
       // software readers cannot miss an mbarrier parity phase.
       if ((srcNode.pipeline == "TC" || srcNode.pipeline == "MFMA") &&
-          (dstNode.pipeline == "CUDA" || dstNode.pipeline == "SFU"))
-        encoder.assertFormula(
-            Z3_mk_not(context, sameWG(*srcCluster, *dstCluster)));
-      if (edge.distance > 0 && edge.roundTrip > 0)
-        encoder.assertFormula(sameWG(*srcCluster, *dstCluster));
+          (dstNode.pipeline == "CUDA" || dstNode.pipeline == "SFU")) {
+        Z3_ast present = encoder.conjunction(
+            {clusterAssumptions[*srcCluster], clusterAssumptions[*dstCluster]});
+        encoder.assertFormula(encoder.implies(
+            present, Z3_mk_not(context, sameWG(*srcCluster, *dstCluster))));
+      }
+      if (edge.distance > 0 && edge.roundTrip > 0) {
+        assumptions.assertFormula(loopCarriedGroupId(srcNode.id, dstNode.id,
+                                                     edge.distance,
+                                                     edge.srcResultIndex),
+                                  sameWG(*srcCluster, *dstCluster));
+      }
     }
 
     if (problem.mode != SolveMode::Joint)
@@ -1769,17 +2825,23 @@ static Candidate solveProblem(const Problem &problem,
     Z3_ast distance = encoder.mul(encoder.intValue(edge.distance), iiValue);
     Z3_ast base = encoder.sub(
         encoder.add(cycles[edge.src], encoder.intValue(latency)), distance);
-    encoder.assertFormula(Z3_mk_ge(context, cycles[edge.dst], base));
+    std::string dependenceId =
+        dependenceGroupId(srcNode.id, dstNode.id, edge.distance);
+    assumptions.assertFormula(dependenceId,
+                              Z3_mk_ge(context, cycles[edge.dst], base));
     if (edge.distance == 0)
-      encoder.assertFormula(
-          Z3_mk_le(context, stages[edge.src], stages[edge.dst]));
+      assumptions.assertFormula(
+          dependenceId, Z3_mk_le(context, stages[edge.src], stages[edge.dst]));
     if (srcCluster && dstCluster && *srcCluster != *dstCluster &&
         edge.roundTrip > 0 && !(edge.distance > 0 && edge.roundTrip > 0)) {
       Z3_ast cross = Z3_mk_not(context, sameWG(*srcCluster, *dstCluster));
       Z3_ast withRoundTrip =
           encoder.add(base, encoder.intValue(edge.roundTrip));
-      encoder.assertFormula(encoder.implies(
-          cross, Z3_mk_ge(context, cycles[edge.dst], withRoundTrip)));
+      assumptions.assertFormula(
+          crossWGGroupId(srcNode.id, dstNode.id, edge.distance,
+                         edge.srcResultIndex),
+          encoder.implies(cross,
+                          Z3_mk_ge(context, cycles[edge.dst], withRoundTrip)));
     }
   }
 
@@ -1794,6 +2856,24 @@ static Candidate solveProblem(const Problem &problem,
       templatePresence.push_back(same);
     else
       templatePresence.push_back(Z3_mk_not(context, same));
+  }
+  std::vector<std::vector<Z3_ast>> eventPresence;
+  eventPresence.reserve(problem.loweringTemplates.size());
+  for (size_t templateIndex = 0;
+       templateIndex < problem.loweringTemplates.size(); ++templateIndex) {
+    const LoweringTemplate &loweringTemplate =
+        problem.loweringTemplates[templateIndex];
+    std::vector<Z3_ast> presences;
+    presences.reserve(loweringTemplate.events.size());
+    for (const LoweringEvent &event : loweringTemplate.events) {
+      Z3_ast presence = templatePresence[templateIndex];
+      if (event.duration > 0)
+        presence = encoder.conjunction(
+            {presence, assumptions.get(loweringEventGroupId(loweringTemplate.id,
+                                                            event.id))});
+      presences.push_back(presence);
+    }
+    eventPresence.push_back(std::move(presences));
   }
 
   using EventKey = std::pair<size_t, int>;
@@ -1816,9 +2896,10 @@ static Candidate solveProblem(const Problem &problem,
   for (size_t nodeIndex = 0; nodeIndex < problem.nodes.size(); ++nodeIndex) {
     const Node &node = problem.nodes[nodeIndex];
     int64_t duration = std::max<int64_t>(node.duration, 1);
-    Z3_ast present = Z3_mk_true(context);
-    if (duration > problem.ii)
-      encoder.assertFormula(Z3_mk_false(context));
+    Z3_ast present =
+        node.pipeline == "NONE"
+            ? Z3_mk_true(context)
+            : assumptions.get(resourceGroupId(node.pipeline, node.id));
     issueItems.push_back(IssueItem{phases[nodeIndex], present, duration,
                                    node.pipeline, node.cluster});
   }
@@ -1845,9 +2926,9 @@ static Candidate solveProblem(const Problem &problem,
           const LoweringEvent &otherEvent =
               problem.loweringTemplates[otherTemplateIndex]
                   .events[otherEventIndex];
-          activeDurations.push_back(
-              Z3_mk_ite(context, templatePresence[otherTemplateIndex],
-                        encoder.intValue(otherEvent.duration), zero));
+          activeDurations.push_back(Z3_mk_ite(
+              context, eventPresence[otherTemplateIndex][otherEventIndex],
+              encoder.intValue(otherEvent.duration), zero));
         }
       } else {
         for (size_t index = 0; index < memberIndex; ++index) {
@@ -1855,9 +2936,9 @@ static Candidate solveProblem(const Problem &problem,
           const LoweringEvent &otherEvent =
               problem.loweringTemplates[otherTemplateIndex]
                   .events[otherEventIndex];
-          activeDurations.push_back(
-              Z3_mk_ite(context, templatePresence[otherTemplateIndex],
-                        encoder.intValue(otherEvent.duration), zero));
+          activeDurations.push_back(Z3_mk_ite(
+              context, eventPresence[otherTemplateIndex][otherEventIndex],
+              encoder.intValue(otherEvent.duration), zero));
         }
       }
       Z3_ast offset = encoder.sum(activeDurations);
@@ -1872,7 +2953,7 @@ static Candidate solveProblem(const Problem &problem,
             offset);
       }
       Z3_ast eventPhase = Z3_mk_mod(context, eventCycle, iiValue);
-      Z3_ast presence = templatePresence[templateIndex];
+      Z3_ast presence = eventPresence[templateIndex][eventIndex];
       size_t ownerCluster = event.owner == Owner::Src
                                 ? loweringTemplate.srcCluster
                                 : loweringTemplate.dstCluster;
@@ -1919,7 +3000,9 @@ static Candidate solveProblem(const Problem &problem,
           continue;
         Z3_ast same = sameWG(*left.cluster, *right.cluster);
         Z3_ast active =
-            encoder.conjunction({left.presence, right.presence, same});
+            encoder.conjunction({left.presence, right.presence, same,
+                                 clusterAssumptions[*left.cluster],
+                                 clusterAssumptions[*right.cluster]});
         encoder.assertFormula(encoder.implies(
             active,
             circularSeparation(encoder, left.phase, left.duration, right.phase,
@@ -1939,8 +3022,12 @@ static Candidate solveProblem(const Problem &problem,
       continue;
     Z3_ast cross =
         Z3_mk_not(context, sameWG(*edge.srcCluster, *edge.dstCluster));
+    Z3_ast present = encoder.conjunction(
+        {cross, assumptions.get(channelGroupId(problem.nodes[edge.src].id,
+                                               problem.nodes[edge.dst].id,
+                                               edge.srcResultIndex))});
     channelCharges.push_back(
-        Z3_mk_ite(context, cross, encoder.intValue(edge.channelBytes), zero));
+        Z3_mk_ite(context, present, encoder.intValue(edge.channelBytes), zero));
   }
 
   std::vector<Z3_ast> smemCharges;
@@ -1966,6 +3053,9 @@ static Candidate solveProblem(const Problem &problem,
     Z3_ast depth =
         encoder.maximum(computedDepth, encoder.intValue(buffer.minCount));
     Z3_ast charge = encoder.mul(encoder.intValue(buffer.sizeBytes), depth);
+    charge = Z3_mk_ite(context,
+                       assumptions.get(bufferGroupId(buffer.kind, buffer.id)),
+                       charge, zero);
     if (modelSmem) {
       smemCharges.push_back(charge);
       smemDepths.push_back(depth);
@@ -1975,12 +3065,19 @@ static Candidate solveProblem(const Problem &problem,
   }
   int64_t fixedSmem = problem.mode == SolveMode::Joint ? problem.fixedSmem
                                                        : problem.committedSmem;
+  Z3_ast fixedSmemCharge = encoder.intValue(fixedSmem);
+  if (fixedSmem > 0) {
+    llvm::StringRef groupId = problem.mode == SolveMode::Joint
+                                  ? llvm::StringRef("smem:fixed")
+                                  : llvm::StringRef("smem:committed");
+    fixedSmemCharge =
+        Z3_mk_ite(context, assumptions.get(groupId), fixedSmemCharge, zero);
+  }
   std::vector<Z3_ast> allSmemCharges = smemCharges;
   allSmemCharges.insert(allSmemCharges.end(), channelCharges.begin(),
                         channelCharges.end());
   encoder.assertFormula(Z3_mk_le(
-      context,
-      encoder.add(encoder.intValue(fixedSmem), encoder.sum(allSmemCharges)),
+      context, encoder.add(fixedSmemCharge, encoder.sum(allSmemCharges)),
       encoder.intValue(problem.smemBudget)));
   encoder.assertFormula(Z3_mk_le(context, encoder.sum(tmemCharges),
                                  encoder.intValue(problem.tmemBudgetBytes)));
@@ -2014,11 +3111,18 @@ static Candidate solveProblem(const Problem &problem,
       footprint = Z3_mk_ite(
           context, Z3_mk_eq(context, roundedWarps, encoder.intValue(warpCount)),
           encoder.intValue(problem.warpFootprint[warpCount]), footprint);
-    registerFootprints.push_back(footprint);
+    registerFootprints.push_back(
+        Z3_mk_ite(context,
+                  assumptions.get("register:wg" +
+                                  std::to_string(static_cast<int64_t>(group))),
+                  footprint, zero));
   }
+  Z3_ast defaultFootprint = encoder.intValue(problem.defaultWGFootprint);
+  if (problem.defaultWGFootprint > 0)
+    defaultFootprint = Z3_mk_ite(context, assumptions.get("register:default"),
+                                 defaultFootprint, zero);
   Z3_ast totalRegisters =
-      encoder.add(encoder.intValue(problem.defaultWGFootprint),
-                  encoder.sum(registerFootprints));
+      encoder.add(defaultFootprint, encoder.sum(registerFootprints));
   if (problem.regBudget)
     encoder.assertFormula(Z3_mk_le(context, totalRegisters,
                                    encoder.intValue(*problem.regBudget)));
@@ -2252,7 +3356,8 @@ static Candidate solveProblem(const Problem &problem,
       !configureOptimize(context, optimize, *timeoutMs, problem.budget))
     return result;
 
-  Z3_lbool status = Z3_optimize_check(context, optimize, 0, nullptr);
+  std::vector<Z3_ast> assumptionLiterals = assumptions.literals();
+  Z3_lbool status = checkWithAssumptions(context, optimize, assumptionLiterals);
   if (z3ErrorSeen)
     return result;
   // The counter lives on the context, so the assertion-accumulating solver
@@ -2260,6 +3365,9 @@ static Candidate solveProblem(const Problem &problem,
   result.rlimitUsed = readRLimitCount(context, solver);
   if (status == Z3_L_FALSE) {
     result.status = CandidateStatus::Unsat;
+    result.unsatEvidence = extractUnsatEvidence(context, optimize, assumptions);
+    minimizeUnsatEvidence(context, solver, assumptions, deadline,
+                          result.unsatEvidence);
     return result;
   }
   if (status == Z3_L_UNDEF) {
@@ -2546,18 +3654,24 @@ static FailureOr<std::string> run(llvm::StringRef problemJson) {
   }
   llvm::json::Object stats = makeStats(*problem, candidate);
   if (candidate.status == CandidateStatus::Unsat) {
-    return serialize(llvm::json::Object{
-        {"version", kSchemaVersion},
-        {"status", "infeasible"},
-        {"proven_unsat", true},
-        {"backend_status", "INFEASIBLE"},
-        {"message", "no feasible joint partition"},
-        {"stats", std::move(stats)},
-    });
+    llvm::StringRef message = problem->mode == SolveMode::Joint
+                                  ? "no feasible joint partition"
+                                  : "no feasible partition";
+    llvm::json::Object result{
+        {"version", kSchemaVersion}, {"status", "infeasible"},
+        {"proven_unsat", true},      {"backend_status", "INFEASIBLE"},
+        {"message", message},        {"stats", std::move(stats)},
+    };
+    ProvenanceMap provenance = constraintProvenance(*problem);
+    addUnsatDiagnostic(result, problem->ii, candidate.unsatEvidence,
+                       provenance);
+    return serialize(std::move(result));
   }
   if (candidate.status == CandidateStatus::Unknown) {
     std::string reason = candidate.reason.empty() ? "joint solve inconclusive"
                                                   : candidate.reason;
+    llvm::json::Object diagnostic =
+        makeInconclusiveDiagnostic(problem->ii, reason);
     return serialize(llvm::json::Object{
         {"version", kSchemaVersion},
         {"status", "inconclusive"},
@@ -2570,6 +3684,7 @@ static FailureOr<std::string> run(llvm::StringRef problemJson) {
          budgetExhaustedName(candidate.budgetExhausted).str()},
         {"message", std::move(reason)},
         {"stats", std::move(stats)},
+        {"diagnostic", std::move(diagnostic)},
     });
   }
   return failure();
