@@ -18,6 +18,7 @@
 #include "llvm/Support/JSON.h"
 
 #include "DataDependenceGraph.h"
+#include "JointSolverFallback.h"
 #include "JointSolverScheduler.h"
 #include "LatencyModel.h"
 #include "ModuloReservationTable.h"
@@ -61,6 +62,19 @@ using namespace mlir;
 namespace tt = triton;
 namespace ttg = triton::gpu;
 namespace ttng = triton::nvidia_gpu;
+
+/// TRITON_USE_MODULO_SCHEDULE value (and ScheduleDriverOptions::
+/// forceScheduleAlgo value) that selects the complete solver.
+static constexpr llvm::StringLiteral kJointSolverAlgo = "joint_solver";
+/// The algorithm a flag-off compile runs: Rau's IMS, what
+/// getActiveScheduleAlgo() reports when nothing is set. The terminal fallback
+/// names it explicitly so a fallback compile cannot inherit
+/// TRITON_USE_MODULO_SCHEDULE=joint_solver and loop forever.
+static constexpr llvm::StringLiteral kBaselineScheduleAlgo = "rau";
+/// Pass A.7's epilogue-subtile decision. The only IR attribute written before
+/// the lower-or-emit phase, so the only one a discarded attempt must restore.
+static constexpr llvm::StringLiteral kEpilogueSubtileAttrName =
+    "tt.epilogue_subtile";
 
 namespace {
 
@@ -876,7 +890,7 @@ static int getEpilogueSubtileForOp(Operation *op) {
     else
       S = 1;
   } else if (auto attr =
-                 op->getAttrOfType<IntegerAttr>("tt.epilogue_subtile")) {
+                 op->getAttrOfType<IntegerAttr>(kEpilogueSubtileAttrName)) {
     S = static_cast<int>(attr.getInt());
   }
   if (S > 1 && BN > 0 && BN % S == 0 && BN / S >= 32)
@@ -4825,7 +4839,7 @@ static void decideEpilogueSubtiles(ttg::ScheduleGraph &graph) {
     int S = std::max(sOverlap, sCap);
     if (S > 1) {
       storeOp->setAttr(
-          "tt.epilogue_subtile",
+          kEpilogueSubtileAttrName,
           IntegerAttr::get(IntegerType::get(storeOp->getContext(), 32), S));
       LLVM_DEBUG(llvm::dbgs()
                  << "[A.7] auto subtile S=" << S << " (BN=" << BN
@@ -6351,6 +6365,21 @@ applyGlobalWarpPartition(MutableArrayRef<ScheduledLoop> scheduledLoops,
                            jointMode == ttg::JointSolverMode::V1Only))
           jointDone = partitionJointSolver(schedLoop, reserved, /*v2=*/false);
         if (!jointDone) {
+          // Apply-stage terminal trigger. The heuristic partitioner below
+          // still runs so the attempt finishes in a well-formed state, but
+          // its result is not a legitimate outcome: it would pair a
+          // joint-solver MinII schedule with a heuristic partition. The
+          // policy layer in runScheduleDriver discards the whole attempt and
+          // reruns the complete baseline path. Replacing the current
+          // v2 -> v1 -> exhaustive mixed-state cascade itself is a separate
+          // cleanup with its own blast radius; this closes the joint solver's
+          // route into that state.
+          if (jointMode != ttg::JointSolverMode::Off)
+            ttg::reportJointSolverFailure(
+                ttg::JointSolverTrigger::PartitionSolve,
+                ("joint warp-group partition failed for a loop at II=" +
+                 Twine(schedLoop.II))
+                    .str());
           if (useGreedy)
             partitionIntoWarpGroups(schedLoop);
           else
@@ -6395,6 +6424,16 @@ applyGlobalWarpPartition(MutableArrayRef<ScheduledLoop> scheduledLoops,
       mergeNonOverlappingBuffers(schedLoop);
       finalizeLoweringPlanStatus(schedLoop);
     }
+  // Final memory audit. Under a joint mode each rejection is also a terminal
+  // trigger: a joint-solver schedule presses II down and buffer depths up, so
+  // it can overrun a budget the baseline schedule fits in. Reporting it lets
+  // the policy layer rerun the baseline instead of hard-failing a compile the
+  // heuristics would have completed.
+  auto reportAuditFailure = [&](const Twine &what) {
+    if (jointMode != ttg::JointSolverMode::Off)
+      ttg::reportJointSolverFailure(ttg::JointSolverTrigger::MemoryAudit,
+                                    what.str());
+  };
   int64_t finalSmem = 0;
   ttg::ScheduleLoop *diagnosticLoop = nullptr;
   llvm::DenseMap<Operation *, int64_t> smemByLoop;
@@ -6419,6 +6458,9 @@ applyGlobalWarpPartition(MutableArrayRef<ScheduledLoop> scheduledLoops,
               << "final lowering requires " << finalTmem
               << " bytes of TMEM, exceeding the " << kTmemBudgetBytes
               << "-byte budget";
+        reportAuditFailure("final lowering requires " + Twine(finalTmem) +
+                           " bytes of TMEM, exceeding the " +
+                           Twine(kTmemBudgetBytes) + "-byte budget");
         return failure();
       }
     }
@@ -6433,6 +6475,9 @@ applyGlobalWarpPartition(MutableArrayRef<ScheduledLoop> scheduledLoops,
           << "final lowering requires " << bytes
           << " bytes of TMEM, exceeding the " << kTmemBudgetBytes
           << "-byte budget";
+    reportAuditFailure("final lowering requires " + Twine(bytes) +
+                       " bytes of TMEM, exceeding the " +
+                       Twine(kTmemBudgetBytes) + "-byte budget");
     return failure();
   }
   if (finalSmem > kSmemBudgetBytes()) {
@@ -6441,6 +6486,9 @@ applyGlobalWarpPartition(MutableArrayRef<ScheduledLoop> scheduledLoops,
           << "final lowering requires " << finalSmem
           << " bytes of SMEM, exceeding the " << kSmemBudgetBytes()
           << "-byte budget";
+    reportAuditFailure("final lowering requires " + Twine(finalSmem) +
+                       " bytes of SMEM, exceeding the " +
+                       Twine(kSmemBudgetBytes()) + "-byte budget");
     return failure();
   }
   return success();
@@ -6680,6 +6728,13 @@ searchDataPartitionPlan(ModuleOp moduleOp, const ttg::LatencyModel &model,
         return success(diag.getSeverity() == DiagnosticSeverity::Warning ||
                        diag.getSeverity() == DiagnosticSeverity::Remark);
       });
+  // Same reasoning for the joint-solver fallback policy: a variant that fails
+  // to schedule a loop is a scored outcome here (it just loses), not a
+  // terminal trigger. Without this nested scope, absorbing the reports, one
+  // throwaway variant's solver failure would discard the whole joint attempt
+  // — or hard-fail the compile under strict-error — even though the winning
+  // plan scheduled cleanly.
+  ttg::JointSolverFallbackScope quietTriggers;
 
   struct Score {
     bool tmemLegal = true;
@@ -7758,155 +7813,284 @@ LogicalResult ttg::runScheduleDriver(ModuleOp moduleOp,
   // modulo pass leaves selection to TRITON_USE_MODULO_SCHEDULE. Threading it
   // (rather than parking it in a process-global) is what keeps two modules
   // compiled concurrently in one process from stealing each other's backend.
-  const std::string scheduleAlgo =
+  const std::string requestedAlgo =
       ttg::getActiveScheduleAlgo(opts.forceScheduleAlgo);
-
-  // Schedule/partition capability coupling (2026-07-10): a joint-solver
-  // schedule presses II to the proven minimum, and the heuristic partitioners
-  // were shaped by Rau-conservative schedules — on FA the combination
-  // re-creates the softmax-cut failure class guard 1 used to fence (case3 at
-  // MinII with the heuristic partitioner: 292.9 TF vs 662 with the joint-solver
-  // partition, 2.23x). Joint-solver schedules therefore always get the
-  // joint-solver v1 partition: TRITON_USE_MODULO_SCHEDULE=joint_solver becomes
-  // "joint pass minus v2" instead of a trap, and Off keeps meaning "heuristic
-  // partition for heuristic schedules". See docs/SolverMigrationNotes.md
-  // (2026-07-10 second entry).
-  JointSolverMode jointMode = opts.jointMode;
-  if (jointMode == JointSolverMode::Off && scheduleAlgo == "joint_solver") {
-    LDBG("Joint-solver schedule backend active — promoting warp partition "
-         "from heuristic to joint-solver v1");
-    jointMode = JointSolverMode::V1Only;
-  }
 
   ttg::NVLatencyModel model;
   triton::ModuleAxisInfoAnalysis axisInfoAnalysis(moduleOp);
 
-  // Pass A.5: compute the data-partition plan once (module-stable). Threaded
-  // into per-loop scheduling so the inner-loop MMA bundle and the outer-loop
-  // TMEM accumulator buffer are both tagged for the emitter.
-  // TRITON_DATA_PARTITION_N=auto searches the candidate factors with the
-  // scheduler itself; otherwise the factor is user-resolved (option > attr
-  // > env), 1 = off.
-  DataPartitionPlan partitionPlan =
-      dataPartitionAutoSearch(moduleOp, opts.dataPartitionFactor)
-          ? searchDataPartitionPlan(moduleOp, model, axisInfoAnalysis,
-                                    scheduleAlgo)
-          : computeDataPartitionPlan(moduleOp, opts.dataPartitionFactor);
-
-  // ================================================================
-  // Iterative scheduling loop (design doc Pass A orchestrator)
-  //
-  // Each iteration: schedule → derive depths → check budget →
-  // apply DDG transformations → re-run if any DDG changed.
-  // Converges in 1-2 iterations.
-  // ================================================================
   // Collect scheduling results across iterations. Only the LAST
   // iteration's results are emitted — earlier iterations are discarded
   // when DDG transformations trigger re-scheduling.
   SmallVector<ScheduledLoop, 2> scheduledLoops;
+  // The backend the surviving attempt actually used. The JSON dumps label
+  // themselves with it, so after a fallback it must read "rau", not the
+  // backend that was asked for and failed.
+  std::string scheduleAlgo = requestedAlgo;
 
-  constexpr int kMaxIterations = 3;
-  for (int iteration = 0; iteration < kMaxIterations; ++iteration) {
-    LDBG("=== Iterative scheduling: iteration " << iteration << " ===");
-    scheduledLoops.clear();
+  // One complete schedule + global-partition attempt. Everything below is
+  // read-only on the IR except the single `tt.epilogue_subtile` stamp that the
+  // caller snapshots around a discardable attempt, so a failed attempt can be
+  // thrown away wholesale.
+  auto runAttempt = [&](StringRef attemptAlgo,
+                        JointSolverMode requestedMode) -> LogicalResult {
+    scheduleAlgo = attemptAlgo.str();
 
-    // Single walk: collect every scf::ForOp with its nesting context and
-    // direct-body flags. Sorted deepest-first so we schedule inner loops
-    // before their outer wrappers — the outer schedule consumes the inner
-    // II as a super-node latency.
-    auto candidates = collectCandidates(moduleOp);
-
-    // We currently support at most a 2-level loop nest (an inner compute
-    // loop optionally wrapped by an outer tile/persistent loop). Refuse
-    // anything deeper rather than silently mis-scheduling — the prologue
-    // expansion, super-node DDG, and outer-loop pipelining all assume
-    // depth <= 1 today.
-    for (const auto &c : candidates) {
-      if (c.depth >= 2) {
-        c.op->emitError("modulo scheduling: loop nesting depth ")
-            << c.depth << " not supported (max 2 levels)";
-        return failure();
-      }
+    // Schedule/partition capability coupling (2026-07-10): a joint-solver
+    // schedule presses II to the proven minimum, and the heuristic
+    // partitioners were shaped by Rau-conservative schedules — on FA the
+    // combination re-creates the softmax-cut failure class guard 1 used to
+    // fence (case3 at MinII with the heuristic partitioner: 292.9 TF vs 662
+    // with the joint-solver partition, 2.23x). Joint-solver schedules
+    // therefore always get the joint-solver v1 partition:
+    // TRITON_USE_MODULO_SCHEDULE=joint_solver becomes "joint pass minus v2"
+    // instead of a trap, and Off keeps meaning "heuristic partition for
+    // heuristic schedules". See docs/SolverMigrationNotes.md (2026-07-10
+    // second entry). Recomputed per attempt: the baseline rerun must not
+    // inherit the joint attempt's promotion.
+    JointSolverMode jointMode = requestedMode;
+    if (jointMode == JointSolverMode::Off && scheduleAlgo == "joint_solver") {
+      LDBG("Joint-solver schedule backend active — promoting warp partition "
+           "from heuristic to joint-solver v1");
+      jointMode = JointSolverMode::V1Only;
     }
 
-    // Single bottom-up pass over candidates. `collectCandidates`'s
-    // contract is that the result is sorted by depth non-increasing so an
-    // inner K-loop (depth=1) is visited before its outer tile loop
-    // (depth=0). The outer DDG promotes the inner loop to a super-node
-    // whose `innerII` is the inner schedule's II, so this order is
-    // required for correctness — not just a stylistic preference. The
-    // assert below makes that invariant verifiable at runtime in case
-    // the sort in `collectCandidates` ever drifts.
+    // Pass A.5: compute the data-partition plan once (module-stable). Threaded
+    // into per-loop scheduling so the inner-loop MMA bundle and the outer-loop
+    // TMEM accumulator buffer are both tagged for the emitter.
+    // TRITON_DATA_PARTITION_N=auto searches the candidate factors with the
+    // scheduler itself; otherwise the factor is user-resolved (option > attr
+    // > env), 1 = off. Inside the attempt because the auto search schedules
+    // with the active backend — a baseline rerun has to re-derive it.
+    DataPartitionPlan partitionPlan =
+        dataPartitionAutoSearch(moduleOp, opts.dataPartitionFactor)
+            ? searchDataPartitionPlan(moduleOp, model, axisInfoAnalysis,
+                                      scheduleAlgo)
+            : computeDataPartitionPlan(moduleOp, opts.dataPartitionFactor);
+
+    // ================================================================
+    // Iterative scheduling loop (design doc Pass A orchestrator)
     //
-    // hasInnerLoop is the inner-vs-outer signal:
-    //   * true  → wraps a nested scf.for → outer
-    //   * false → leaf → inner (only worth scheduling if it has compute)
-    // Inner-vs-outer differences (super-node print, retaining the raw
-    // ModuloScheduleResult for lowerOuterLoopPipeline) live inside
-    // scheduleAndRecord / ScheduledLoop — not the call site.
-    unsigned numInner = 0, numOuter = 0;
-    [[maybe_unused]] unsigned prevDepth = std::numeric_limits<unsigned>::max();
-    for (const auto &c : candidates) {
-      assert(c.depth <= prevDepth && "candidates must be sorted deepest-first");
-      prevDepth = c.depth;
-      if (c.hasExistingAnnotation) {
-        LDBG("Skipping loop with existing tt.autows annotations");
-        continue;
-      }
-      if (c.hasInnerLoop) {
-        scheduleAndRecord(c.op, "Outer", /*isOuter=*/true, model,
-                          axisInfoAnalysis, partitionPlan, scheduleAlgo,
-                          opts.printScheduleGraph, scheduledLoops);
-        ++numOuter;
-      } else if (c.hasMMA || c.hasTMA) {
-        scheduleAndRecord(c.op, "Inner", /*isOuter=*/false, model,
-                          axisInfoAnalysis, partitionPlan, scheduleAlgo,
-                          opts.printScheduleGraph, scheduledLoops);
-        ++numInner;
-      }
-    }
-    LDBG("Scheduled " << numInner << " inner loop(s), " << numOuter
-                      << " outer loop(s)");
+    // Each iteration: schedule → derive depths → check budget →
+    // apply DDG transformations → re-run if any DDG changed.
+    // Converges in 1-2 iterations.
+    // ================================================================
+    constexpr int kMaxIterations = 3;
+    for (int iteration = 0; iteration < kMaxIterations; ++iteration) {
+      LDBG("=== Iterative scheduling: iteration " << iteration << " ===");
+      scheduledLoops.clear();
 
-    // ================================================================
-    // Pass B: Global warp-group partition + cross-group barriers across
-    // all scheduled loops. Replaces the per-loop call that used to live
-    // inside `buildScheduleGraph` — moving it out of scheduling makes
-    // cross-loop coordination possible (e.g., outer-loop super-node
-    // matched to inner-loop MMA's warp group).
-    // ================================================================
-    // For top-N autotuning: snapshot each loop's pristine pre-partition
-    // graph (no warp-group assignment, no synthesized barriers/channels)
-    // before the winner is committed. Overwritten each iteration so it
-    // reflects the final converged schedule. Cheap value copy; only when
-    // multi-graph dump is requested.
-    if (getDumpTopN() > 1)
-      for (auto &sl : scheduledLoops)
-        sl.prePartitionGraph = sl.graph;
-    if (failed(applyGlobalWarpPartition(scheduledLoops, jointMode)))
+      // Single walk: collect every scf::ForOp with its nesting context and
+      // direct-body flags. Sorted deepest-first so we schedule inner loops
+      // before their outer wrappers — the outer schedule consumes the inner
+      // II as a super-node latency.
+      auto candidates = collectCandidates(moduleOp);
+
+      // We currently support at most a 2-level loop nest (an inner compute
+      // loop optionally wrapped by an outer tile/persistent loop). Refuse
+      // anything deeper rather than silently mis-scheduling — the prologue
+      // expansion, super-node DDG, and outer-loop pipelining all assume
+      // depth <= 1 today.
+      for (const auto &c : candidates) {
+        if (c.depth >= 2) {
+          c.op->emitError("modulo scheduling: loop nesting depth ")
+              << c.depth << " not supported (max 2 levels)";
+          return failure();
+        }
+      }
+
+      // Single bottom-up pass over candidates. `collectCandidates`'s
+      // contract is that the result is sorted by depth non-increasing so an
+      // inner K-loop (depth=1) is visited before its outer tile loop
+      // (depth=0). The outer DDG promotes the inner loop to a super-node
+      // whose `innerII` is the inner schedule's II, so this order is
+      // required for correctness — not just a stylistic preference. The
+      // assert below makes that invariant verifiable at runtime in case
+      // the sort in `collectCandidates` ever drifts.
+      //
+      // hasInnerLoop is the inner-vs-outer signal:
+      //   * true  → wraps a nested scf.for → outer
+      //   * false → leaf → inner (only worth scheduling if it has compute)
+      // Inner-vs-outer differences (super-node print, retaining the raw
+      // ModuloScheduleResult for lowerOuterLoopPipeline) live inside
+      // scheduleAndRecord / ScheduledLoop — not the call site.
+      unsigned numInner = 0, numOuter = 0;
+      [[maybe_unused]] unsigned prevDepth =
+          std::numeric_limits<unsigned>::max();
+      for (const auto &c : candidates) {
+        assert(c.depth <= prevDepth &&
+               "candidates must be sorted deepest-first");
+        prevDepth = c.depth;
+        if (c.hasExistingAnnotation) {
+          LDBG("Skipping loop with existing tt.autows annotations");
+          continue;
+        }
+        if (c.hasInnerLoop) {
+          scheduleAndRecord(c.op, "Outer", /*isOuter=*/true, model,
+                            axisInfoAnalysis, partitionPlan, scheduleAlgo,
+                            opts.printScheduleGraph, scheduledLoops);
+          ++numOuter;
+        } else if (c.hasMMA || c.hasTMA) {
+          scheduleAndRecord(c.op, "Inner", /*isOuter=*/false, model,
+                            axisInfoAnalysis, partitionPlan, scheduleAlgo,
+                            opts.printScheduleGraph, scheduledLoops);
+          ++numInner;
+        }
+      }
+      LDBG("Scheduled " << numInner << " inner loop(s), " << numOuter
+                        << " outer loop(s)");
+
+      // ================================================================
+      // Pass B: Global warp-group partition + cross-group barriers across
+      // all scheduled loops. Replaces the per-loop call that used to live
+      // inside `buildScheduleGraph` — moving it out of scheduling makes
+      // cross-loop coordination possible (e.g., outer-loop super-node
+      // matched to inner-loop MMA's warp group).
+      // ================================================================
+      // For top-N autotuning: snapshot each loop's pristine pre-partition
+      // graph (no warp-group assignment, no synthesized barriers/channels)
+      // before the winner is committed. Overwritten each iteration so it
+      // reflects the final converged schedule. Cheap value copy; only when
+      // multi-graph dump is requested.
+      if (getDumpTopN() > 1)
+        for (auto &sl : scheduledLoops)
+          sl.prePartitionGraph = sl.graph;
+      if (failed(applyGlobalWarpPartition(scheduledLoops, jointMode)))
+        return failure();
+
+      // ================================================================
+      // Iterative refinement: apply DDG transformations and check if
+      // we need to re-schedule.
+      // ================================================================
+      bool ddgChanged = false;
+      ddgChanged |= applyDataPartitioning(moduleOp, model, scheduledLoops);
+      ddgChanged |= applyEpilogueSubtiling(moduleOp, model, scheduledLoops);
+
+      if (!ddgChanged) {
+        LDBG("Converged after " << iteration + 1 << " iteration(s)");
+        break;
+      }
+
+      if (iteration + 1 >= kMaxIterations) {
+        LDBG("Hit iteration limit (" << kMaxIterations
+                                     << ") — keeping last valid schedule");
+        break;
+      }
+
+      LDBG("DDG changed by transformation — re-scheduling");
+    } // end iterative loop
+    return success();
+  }; // end runAttempt
+
+  // ================================================================
+  // Terminal fallback policy.
+  //
+  // Every joint-solver trigger — schedule solve, warp-group partition, final
+  // memory audit — routes through this ONE decision. It sits above both the
+  // solve and the apply stages because that is the only vantage point from
+  // which "a joint MinII schedule with a heuristic partition" is preventable:
+  // the schedule stage cannot see a partition failure, and the partition
+  // stage has no schedule to fall back to.
+  // ================================================================
+  const bool jointAttempt = requestedAlgo == kJointSolverAlgo ||
+                            opts.jointMode != JointSolverMode::Off;
+
+  if (!jointAttempt) {
+    // Flag-off / heuristic path: no policy, no scope, no snapshot, no second
+    // attempt. Byte-for-byte the pre-Diff-11 behaviour.
+    if (failed(runAttempt(requestedAlgo, opts.jointMode)))
       return failure();
+  } else {
+    // The attempt is IR-read-only apart from A.7's `tt.epilogue_subtile`
+    // stamp, which is sticky and self-suppressing (it is only re-derived when
+    // the un-subtiled graph is over budget, which it no longer is once
+    // stamped). A discarded attempt must put it back or the baseline rerun
+    // starts from an already-shrunken store buffer and is no longer identical
+    // to a flag-off compile.
+    SmallVector<std::pair<Operation *, Attribute>> subtileSnapshot;
+    moduleOp.walk([&](tt::DescriptorStoreOp store) {
+      subtileSnapshot.emplace_back(store.getOperation(),
+                                   store->getAttr(kEpilogueSubtileAttrName));
+    });
 
-    // ================================================================
-    // Iterative refinement: apply DDG transformations and check if
-    // we need to re-schedule.
-    // ================================================================
-    bool ddgChanged = false;
-    ddgChanged |= applyDataPartitioning(moduleOp, model, scheduledLoops);
-    ddgChanged |= applyEpilogueSubtiling(moduleOp, model, scheduledLoops);
-
-    if (!ddgChanged) {
-      LDBG("Converged after " << iteration + 1 << " iteration(s)");
-      break;
+    // Attempt-1 diagnostics are provisional: an attempt we are about to
+    // discard must not leave an error or warning behind describing a compile
+    // that never happened. Capture them, and replay only when the attempt's
+    // outcome is the one the user sees.
+    SmallVector<Diagnostic> capturedDiags;
+    ttg::JointSolverFallbackScope fallback;
+    LogicalResult status = failure();
+    {
+      ScopedDiagnosticHandler capture(
+          moduleOp.getContext(), [&](Diagnostic &diag) {
+            capturedDiags.emplace_back(std::move(diag));
+            return success();
+          });
+      status = runAttempt(requestedAlgo, opts.jointMode);
     }
+    auto replayCapturedDiags = [&] {
+      for (Diagnostic &diag : capturedDiags)
+        moduleOp.getContext()->getDiagEngine().emit(std::move(diag));
+      capturedDiags.clear();
+    };
 
-    if (iteration + 1 >= kMaxIterations) {
-      LDBG("Hit iteration limit (" << kMaxIterations
-                                   << ") — keeping last valid schedule");
-      break;
+    std::optional<ttg::JointSolverTrigger> trigger = fallback.getTrigger();
+    if (failed(status) && !trigger)
+      trigger = ttg::JointSolverTrigger::AttemptFailed;
+
+    if (!trigger) {
+      replayCapturedDiags();
+    } else if (opts.strictError) {
+      // strict-error: the trigger IS the outcome. No rerun, no remark — the
+      // golden and determinism lanes want the failure, not a silently
+      // different schedule. Replay first, because for an AttemptFailed
+      // trigger the captured error is the actual cause.
+      replayCapturedDiags();
+      StringRef detail = fallback.getDetail();
+      InFlightDiagnostic diag =
+          moduleOp.emitError()
+          << "joint scheduling failed ("
+          << ttg::getJointSolverTriggerName(*trigger)
+          << ") and the strict-error terminal policy is enabled: refusing to "
+             "fall back to the baseline schedule";
+      if (!detail.empty())
+        diag.attachNote() << detail;
+      return failure();
+    } else {
+      // baseline: discard everything the joint attempt produced and rerun the
+      // complete heuristic schedule + partition path. A remark, never a
+      // warning — a successful baseline compile must not become an error
+      // under any -Werror-like policy.
+      StringRef name = ttg::getJointSolverTriggerName(*trigger);
+      StringRef detail = fallback.getDetail();
+      LDBG("Joint scheduling trigger '" << name << "' (" << fallback.getCount()
+                                        << " total) — rerunning the baseline "
+                                           "schedule + partition path");
+      {
+        // Scoped so the remark is reported here rather than at the end of the
+        // block: an InFlightDiagnostic flushes on destruction, which would
+        // print the fallback notice *after* everything the rerun emits, and
+        // drop it entirely if the rerun aborted.
+        InFlightDiagnostic remark =
+            moduleOp.emitRemark()
+            << "joint scheduling fell back to the baseline schedule and "
+               "partition path ("
+            << name << ")";
+        if (!detail.empty())
+          remark.attachNote() << detail;
+      }
+
+      scheduledLoops.clear();
+      for (auto [op, attr] : subtileSnapshot) {
+        if (attr)
+          op->setAttr(kEpilogueSubtileAttrName, attr);
+        else
+          op->removeAttr(kEpilogueSubtileAttrName);
+      }
+      if (failed(runAttempt(kBaselineScheduleAlgo, JointSolverMode::Off)))
+        return failure();
     }
-
-    LDBG("DDG changed by transformation — re-scheduling");
-  } // end iterative loop
+  }
 
   // ================================================================
   // Lower-or-emit phase. Runs ONCE after convergence so the iteration
@@ -8059,10 +8243,41 @@ struct ModuloSchedulePass
           "MMAs."),
       llvm::cl::init(0)};
 
+  Option<bool> strictError{
+      *this, "strict-error",
+      llvm::cl::desc(
+          "Terminal policy for joint-solver failures: fail the "
+          "compilation instead of falling back to the baseline "
+          "schedule. Also settable with TRITON_MODULO_STRICT_ERROR."),
+      llvm::cl::init(false)};
+
+  Option<std::string> forceJointSolverFault{
+      *this, "force-joint-solver-fault",
+      llvm::cl::desc("Test-only: replace the joint-solver backend with a "
+                     "canned fault (unavailable, timeout, unknown, "
+                     "global-unsat, malformed, illegal-schedule), optionally "
+                     "scoped with a 'schedule:' or 'partition:' prefix."),
+      llvm::cl::init("")};
+
   void runOnOperation() override {
     ttg::ScheduleDriverOptions opts;
     opts.printScheduleGraph = printScheduleGraph;
     opts.dataPartitionFactor = dataPartitionFactor;
+    // The Python compile path registers this pass with no options
+    // (ADD_PASS_WRAPPER_0), so the env var is the production channel and the
+    // option exists for lit tests.
+    opts.strictError =
+        strictError || triton::tools::getBoolEnv("TRITON_MODULO_STRICT_ERROR");
+    std::optional<ttg::ScopedJointSolverBackendOverride> fault;
+    if (!forceJointSolverFault.empty()) {
+      auto parsed = ttg::parseJointSolverFaultSpec(forceJointSolverFault);
+      if (!parsed) {
+        getOperation()->emitError("unknown force-joint-solver-fault '")
+            << forceJointSolverFault << "'";
+        return signalPassFailure();
+      }
+      fault.emplace(*parsed);
+    }
     if (failed(ttg::runScheduleDriver(getOperation(), opts)))
       signalPassFailure();
   }

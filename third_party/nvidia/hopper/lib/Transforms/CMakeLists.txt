@@ -7,6 +7,7 @@ add_triton_library(TritonGPUModuloCore
   ModuloScheduling/AMDLatencyModel.cpp
   ModuloScheduling/AMDWarpPipelinePartition.cpp
   ModuloScheduling/DataDependenceGraph.cpp
+  ModuloScheduling/JointSolverFallback.cpp
   ModuloScheduling/JointSolverScheduler.cpp
   ModuloScheduling/ModuloReservationTable.cpp
   ModuloScheduling/SwingScheduler.cpp

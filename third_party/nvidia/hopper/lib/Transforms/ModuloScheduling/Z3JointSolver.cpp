@@ -835,8 +835,7 @@ static std::string serialize(llvm::json::Object object) {
 ///
 /// Z3's work-unit accounting is internal and is not stable across releases, so
 /// this number is calibrated against one vendored version and must be
-/// re-measured when third-party/z3 is upgraded. docs/SolverDeterminism.md
-/// records the measurements it is derived from.
+/// re-measured when third-party/z3 is upgraded.
 constexpr unsigned kDefaultRLimit = 10000000;
 
 /// Z3 already defaults smt.random_seed and sat.random_seed to 0, so pinning

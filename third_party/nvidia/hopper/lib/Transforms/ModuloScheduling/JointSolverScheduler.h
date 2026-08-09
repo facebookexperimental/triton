@@ -19,6 +19,12 @@
 #include "DataDependenceGraph.h"
 #include "ModuloReservationTable.h"
 
+#include "llvm/ADT/StringRef.h"
+
+#include <functional>
+#include <optional>
+#include <string>
+
 namespace mlir::triton::gpu {
 
 /// Run joint-solver modulo scheduling. Returns failure if the native solver is
@@ -36,6 +42,91 @@ runJointSolverSchedule(const DataDependenceGraph &ddg, int minII,
 /// Inconclusive responses are retried with a fresh backend and a bounded,
 /// increasing timeout.
 FailureOr<std::string> runJointSolverBackend(llvm::StringRef problemJson);
+
+// ── Deterministic fake backend (tests) ──────────────────────────────────────
+//
+// The fallback policy has to be provable for failure modes a healthy solver
+// never produces. These faults replace the transport with a canned response,
+// one per terminal-policy trigger, so every trigger is reachable without a
+// live Z3 backend and without depending on wall-clock timing. Diff 9's
+// apply-stage rejection tests share the seam.
+
+/// One canned backend response. Names match the `force-joint-solver-fault=`
+/// pass option so lit tests read the same vocabulary as the C++ tests.
+enum class JointSolverFault {
+  /// Transport itself fails: backend missing or nonzero exit.
+  Unavailable,
+  /// Hard timeout — an inconclusive response, retried then given up on.
+  Timeout,
+  /// Z3 returned UNKNOWN.
+  Unknown,
+  /// Proven GLOBAL infeasibility. Distinct from a per-II UNSAT, which the
+  /// solver's own II sweep steps past and which is never terminal.
+  GlobalUnsat,
+  /// Truncated, schema-violating response text.
+  Malformed,
+  /// Schema-valid response carrying an ILLEGAL schedule. Exercises C++
+  /// re-verification rather than the transport or the parser.
+  IllegalSchedule,
+};
+
+/// Which solver request a fault applies to. The two stages are told apart by
+/// problem schema: joint-solver-0.1 is the per-loop schedule solve,
+/// joint-solver-0.2 is the warp-group partition / joint re-solve. Requests
+/// outside the selected stage reach the real backend, so a test can fail the
+/// apply stage while the schedule stage genuinely succeeds — the only way to
+/// prove the policy catches apply-stage failures at all.
+enum class JointSolverFaultStage { All, Schedule, Partition };
+
+struct JointSolverFaultSpec {
+  JointSolverFault fault;
+  JointSolverFaultStage stage = JointSolverFaultStage::All;
+};
+
+std::optional<JointSolverFault> parseJointSolverFault(llvm::StringRef name);
+llvm::StringRef getJointSolverFaultName(JointSolverFault fault);
+
+/// Parse a `force-joint-solver-fault=` value: a fault name, optionally
+/// prefixed with `schedule:` or `partition:` (default: both stages).
+std::optional<JointSolverFaultSpec>
+parseJointSolverFaultSpec(llvm::StringRef spec);
+
+/// The canned response for `fault` against `problemJson`.
+///
+/// `IllegalSchedule` is the one fault that cannot be forged from nothing: the
+/// solution schema carries an objective, per-II statistics and buffer depths
+/// that must agree with the problem, so a hand-built response would be
+/// rejected as malformed long before any semantic check runs (and would need
+/// re-forging on every schema change). It instead solves for real and then
+/// collapses every cycle to 0 — schema-identical, and dependence-violating
+/// for any problem with a positive-latency edge. It therefore needs a live
+/// backend; without one it degrades to `Unavailable`.
+FailureOr<std::string>
+makeJointSolverFaultResponse(JointSolverFault fault,
+                             llvm::StringRef problemJson);
+
+/// While an instance is alive, `runJointSolverBackend` routes every request on
+/// this thread to `respond` instead of the native backend, and bypasses the
+/// result cache in both directions so a fake response can neither be served
+/// from nor written to it. Thread-local and save/restore: nesting is
+/// well-defined and concurrent compiles never observe each other's override.
+class ScopedJointSolverBackendOverride {
+public:
+  using Responder = std::function<FailureOr<std::string>(llvm::StringRef)>;
+
+  explicit ScopedJointSolverBackendOverride(Responder respond);
+  explicit ScopedJointSolverBackendOverride(JointSolverFaultSpec spec);
+  explicit ScopedJointSolverBackendOverride(JointSolverFault fault)
+      : ScopedJointSolverBackendOverride(JointSolverFaultSpec{fault}) {}
+  ~ScopedJointSolverBackendOverride();
+  ScopedJointSolverBackendOverride(const ScopedJointSolverBackendOverride &) =
+      delete;
+  ScopedJointSolverBackendOverride &
+  operator=(const ScopedJointSolverBackendOverride &) = delete;
+
+private:
+  Responder saved;
+};
 
 /// Minimum II feasible under a relaxation of the joint model that keeps only
 /// the resource-exclusivity constraints, i.e. `relaxed_lower_bound`.

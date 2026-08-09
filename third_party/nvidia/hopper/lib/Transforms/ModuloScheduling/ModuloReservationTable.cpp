@@ -3,9 +3,11 @@
 #include "ModuloReservationTable.h"
 
 #include "ExhaustiveScheduler.h"
+#include "JointSolverFallback.h"
 #include "JointSolverScheduler.h"
 #include "SwingScheduler.h"
 #include "triton/Tools/Sys/GetEnv.h"
+#include "llvm/ADT/Twine.h"
 #include "llvm/Support/Debug.h"
 #include <algorithm>
 #include <climits>
@@ -419,25 +421,47 @@ runModuloScheduling(const DataDependenceGraph &ddg, llvm::StringRef algo,
   const int minII = std::max(computedMinII, minIIOverride);
   const std::string resolvedAlgo = getActiveScheduleAlgo(algo);
 
-  // The complete solver computes its own true feasibility bound. Dispatch it
-  // before the heuristic maxII window, which can discard feasible schedules.
-  if (resolvedAlgo == "joint_solver") {
-    LLVM_DEBUG(DBGS() << "Using native Z3 joint solver\n");
-    auto result = runJointSolverSchedule(
-        ddg, minII, /*smemBudget=*/232448, /*tmemColLimit=*/512);
-    if (failed(result))
-      return failure();
-    if (!tryRepairModuloSchedule(ddg, *result)) {
-      LLVM_DEBUG(DBGS() << "Rejecting invalid final schedule\n");
-      return failure();
-    }
-    return result;
-  }
-
   if (maxII <= 0)
     maxII = 2 * minII;
   else if (maxII < minII)
     return failure();
+
+  // `algo` selects the scheduling algorithm:
+  //   "joint_solver" → native in-process Z3 solver, joint
+  //                  schedule + buffer depths; falls back to Rau on failure
+  //   "sms"        → Swing Modulo Scheduling (Llosa et al., PACT 1996)
+  //   "exhaustive" → Exhaustive search with joint memory feasibility
+  //   "random"     → Random sampling with greedy placement
+  //   "contracted" → Two-stage GEMM search on a contracted compute graph
+  //   "rau", "1" or other → Rau's Iterative Modulo Scheduling (Rau, 1994)
+  // The joint-solver pass passes "joint_solver" down from
+  // ScheduleDriverOptions; empty falls back to TRITON_USE_MODULO_SCHEDULE.
+  if (resolvedAlgo == "joint_solver") {
+    // Complete search: sweeps II from minII to a true feasibility bound
+    // (critical path + serial work) with NO slack window — the window below
+    // (guard 2) exists only to absorb the incomplete heuristics'
+    // reservation-table fragmentation, a failure mode a complete solver
+    // does not have. See docs/SolverMigrationNotes.md (guard 2).
+    LLVM_DEBUG(DBGS() << "Using native Z3 joint solver\n");
+    auto res = runJointSolverSchedule(ddg, minII);
+    if (succeeded(res))
+      return res;
+    // Terminal, not a local repair. Falling through to Rau here would hand a
+    // heuristic schedule to the joint-solver warp-group partition — precisely
+    // the mixed state Diff 11's policy exists to prevent, and a state this
+    // frame cannot even detect because the partition runs several frames
+    // above it. The decision belongs to the one layer that wraps BOTH stages
+    // (runScheduleDriver): it reruns the complete baseline path, or fails the
+    // compilation under strict-error.
+    LLVM_DEBUG(DBGS() << "Joint solver failed/unavailable — deferring to the "
+                         "fallback policy\n");
+    reportJointSolverFailure(
+        JointSolverTrigger::ScheduleSolve,
+        ("native joint schedule solve failed (minII=" + llvm::Twine(minII) +
+         ", " + llvm::Twine(ddg.getNumNodes()) + " nodes)")
+            .str());
+    return failure();
+  }
 
   // Cap maxII to avoid spending too long on large DDGs. The slack window
   // scales with minII: GPU inner-loop IIs are hundreds of cycles with
@@ -454,14 +478,6 @@ runModuloScheduling(const DataDependenceGraph &ddg, llvm::StringRef algo,
     DBGS() << "ResMII=" << ddg.computeResMII()
            << " RecMII=" << ddg.computeRecMII() << "\n";
   });
-
-  // `algo` selects the scheduling algorithm:
-  //   "joint_solver" → Native Z3 joint schedule and buffer-depth solver
-  //   "sms"        → Swing Modulo Scheduling (Llosa et al., PACT 1996)
-  //   "exhaustive" → Exhaustive search with joint memory feasibility
-  //   "random"     → Random sampling with greedy placement
-  //   "contracted" → Two-stage GEMM search on a contracted compute graph
-  //   "1" or other → Rau's Iterative Modulo Scheduling (Rau, 1994)
 
   auto validateResult = [&](FailureOr<ModuloScheduleResult> result)
       -> FailureOr<ModuloScheduleResult> {

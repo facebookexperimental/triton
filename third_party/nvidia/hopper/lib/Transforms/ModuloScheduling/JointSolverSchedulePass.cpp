@@ -17,11 +17,16 @@
 // switching scheduler is purely a pass-selection decision in compiler.py
 // (TRITON_USE_JOINT_SCHEDULE=1 vs TRITON_USE_MODULO_SCHEDULE).
 
+#include "JointSolverScheduler.h"
 #include "ModuloScheduleDriver.h"
 
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Pass/Pass.h"
 #include "nvidia/hopper/include/Transforms/Passes.h"
+#include "triton/Tools/Sys/GetEnv.h"
+
+#include <optional>
+#include <string>
 
 using namespace mlir;
 namespace ttg = triton::gpu;
@@ -69,6 +74,24 @@ struct JointSolverSchedulePass
                      "(default), 1 = v1 only, 2 = v2 only"),
       llvm::cl::init(0)};
 
+  // Mirrors ModuloSchedulePass: the terminal fallback policy is a property of
+  // the driver, not of which pass selected the solver.
+  Option<bool> strictError{
+      *this, "strict-error",
+      llvm::cl::desc(
+          "Terminal policy for joint-solver failures: fail the "
+          "compilation instead of falling back to the baseline "
+          "schedule. Also settable with TRITON_MODULO_STRICT_ERROR."),
+      llvm::cl::init(false)};
+
+  Option<std::string> forceJointSolverFault{
+      *this, "force-joint-solver-fault",
+      llvm::cl::desc("Test-only: replace the joint-solver backend with a "
+                     "canned fault (unavailable, timeout, unknown, "
+                     "global-unsat, malformed, illegal-schedule), optionally "
+                     "scoped with a 'schedule:' or 'partition:' prefix."),
+      llvm::cl::init("")};
+
   void runOnOperation() override {
     ttg::ScheduleDriverOptions opts;
     opts.forceScheduleAlgo = "joint_solver";
@@ -85,6 +108,21 @@ struct JointSolverSchedulePass
     }
     opts.printScheduleGraph = printScheduleGraph;
     opts.dataPartitionFactor = dataPartitionFactor;
+    // The Python compile path registers this pass with no options
+    // (ADD_PASS_WRAPPER_0), so the env var is the production channel and the
+    // option exists for lit tests.
+    opts.strictError =
+        strictError || triton::tools::getBoolEnv("TRITON_MODULO_STRICT_ERROR");
+    std::optional<ttg::ScopedJointSolverBackendOverride> fault;
+    if (!forceJointSolverFault.empty()) {
+      auto parsed = ttg::parseJointSolverFaultSpec(forceJointSolverFault);
+      if (!parsed) {
+        getOperation()->emitError("unknown force-joint-solver-fault '")
+            << forceJointSolverFault << "'";
+        return signalPassFailure();
+      }
+      fault.emplace(*parsed);
+    }
     if (failed(ttg::runScheduleDriver(getOperation(), opts)))
       signalPassFailure();
   }

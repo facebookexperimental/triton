@@ -10,6 +10,7 @@
 #include "triton/Tools/Sys/GetEnv.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringSwitch.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/JSON.h"
 #include "llvm/Support/raw_ostream.h"
@@ -21,6 +22,7 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <utility>
 
 #define DEBUG_TYPE "modulo-scheduling-joint-solver"
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
@@ -416,21 +418,181 @@ problemForAttempt(llvm::StringRef canonicalProblem, unsigned attempt) {
   return retryProblem;
 }
 
+static ScopedJointSolverBackendOverride::Responder &backendOverrideSlot() {
+  static thread_local ScopedJointSolverBackendOverride::Responder responder;
+  return responder;
+}
+
 } // namespace
+
+ScopedJointSolverBackendOverride::ScopedJointSolverBackendOverride(
+    Responder respond)
+    : saved(std::exchange(backendOverrideSlot(), std::move(respond))) {}
+
+/// A joint-solver-0.1 problem is a schedule solve; joint-solver-0.2 is a
+/// partition / joint re-solve. Anything unrecognisable is left to the real
+/// backend rather than guessed at.
+static bool faultAppliesTo(JointSolverFaultStage stage,
+                           llvm::StringRef problemJson) {
+  if (stage == JointSolverFaultStage::All)
+    return true;
+  auto parsed = llvm::json::parse(problemJson);
+  if (!parsed) {
+    llvm::consumeError(parsed.takeError());
+    return false;
+  }
+  const auto *object = parsed->getAsObject();
+  auto version = object ? object->getString("version") : std::nullopt;
+  if (!version)
+    return false;
+  return stage == JointSolverFaultStage::Schedule
+             ? *version == "joint-solver-0.1"
+             : *version == "joint-solver-0.2";
+}
+
+ScopedJointSolverBackendOverride::ScopedJointSolverBackendOverride(
+    JointSolverFaultSpec spec)
+    : ScopedJointSolverBackendOverride(
+          [spec](llvm::StringRef problem) -> FailureOr<std::string> {
+            if (!faultAppliesTo(spec.stage, problem))
+              return runZ3JointSolver(problem);
+            return makeJointSolverFaultResponse(spec.fault, problem);
+          }) {}
+
+ScopedJointSolverBackendOverride::~ScopedJointSolverBackendOverride() {
+  backendOverrideSlot() = std::move(saved);
+}
+
+std::optional<JointSolverFault> parseJointSolverFault(llvm::StringRef name) {
+  return llvm::StringSwitch<std::optional<JointSolverFault>>(name)
+      .Case("unavailable", JointSolverFault::Unavailable)
+      .Case("timeout", JointSolverFault::Timeout)
+      .Case("unknown", JointSolverFault::Unknown)
+      .Case("global-unsat", JointSolverFault::GlobalUnsat)
+      .Case("malformed", JointSolverFault::Malformed)
+      .Case("illegal-schedule", JointSolverFault::IllegalSchedule)
+      .Default(std::nullopt);
+}
+
+std::optional<JointSolverFaultSpec>
+parseJointSolverFaultSpec(llvm::StringRef spec) {
+  JointSolverFaultStage stage = JointSolverFaultStage::All;
+  auto [head, tail] = spec.split(':');
+  if (!tail.empty()) {
+    if (head == "schedule")
+      stage = JointSolverFaultStage::Schedule;
+    else if (head == "partition")
+      stage = JointSolverFaultStage::Partition;
+    else
+      return std::nullopt;
+    spec = tail;
+  }
+  auto fault = parseJointSolverFault(spec);
+  if (!fault)
+    return std::nullopt;
+  return JointSolverFaultSpec{*fault, stage};
+}
+
+llvm::StringRef getJointSolverFaultName(JointSolverFault fault) {
+  switch (fault) {
+  case JointSolverFault::Unavailable:
+    return "unavailable";
+  case JointSolverFault::Timeout:
+    return "timeout";
+  case JointSolverFault::Unknown:
+    return "unknown";
+  case JointSolverFault::GlobalUnsat:
+    return "global-unsat";
+  case JointSolverFault::Malformed:
+    return "malformed";
+  case JointSolverFault::IllegalSchedule:
+    return "illegal-schedule";
+  }
+  return "";
+}
+
+FailureOr<std::string>
+makeJointSolverFaultResponse(JointSolverFault fault,
+                             llvm::StringRef problemJson) {
+  // Truncated mid-value: unparseable as JSON, so it exercises the response
+  // parser rather than any schema check.
+  constexpr llvm::StringLiteral kMalformed = R"({"status": "ok", "ii": )";
+
+  auto object = [](llvm::json::Object obj) {
+    std::string out;
+    llvm::raw_string_ostream os(out);
+    os << llvm::json::Value(std::move(obj));
+    return out;
+  };
+
+  switch (fault) {
+  case JointSolverFault::Unavailable:
+    return failure();
+  case JointSolverFault::Timeout:
+    return object(
+        llvm::json::Object{{"status", "inconclusive"},
+                           {"reason", "timeout"},
+                           {"message", "forced fault: hard timeout"}});
+  case JointSolverFault::Unknown:
+    return object(llvm::json::Object{
+        {"status", "inconclusive"},
+        {"reason", "unknown"},
+        {"message", "forced fault: solver returned UNKNOWN"}});
+  case JointSolverFault::GlobalUnsat:
+    return object(llvm::json::Object{
+        {"status", "infeasible"},
+        {"proven_unsat", true},
+        {"message", "forced fault: proven globally infeasible"}});
+  case JointSolverFault::Malformed:
+    return kMalformed.str();
+  case JointSolverFault::IllegalSchedule:
+    break;
+  }
+
+  // Solve for real, then collapse every cycle to 0 — see the header for why
+  // this is mutated rather than forged. A response with no `cycles` (the v1
+  // partition-only mode) has nothing schedule-shaped to corrupt and is passed
+  // through unchanged.
+  auto real = runZ3JointSolver(problemJson);
+  if (failed(real))
+    return failure();
+  auto parsed = llvm::json::parse(*real);
+  if (!parsed) {
+    llvm::consumeError(parsed.takeError());
+    return real;
+  }
+  auto *root = parsed->getAsObject();
+  auto *cycles = root ? root->getObject("cycles") : nullptr;
+  if (!cycles)
+    return real;
+  for (auto &entry : *cycles)
+    entry.second = llvm::json::Value(static_cast<int64_t>(0));
+  return object(std::move(*root));
+}
 
 FailureOr<std::string> runJointSolverBackend(llvm::StringRef problemJson) {
   auto canonicalProblem = canonicalizeJSON(problemJson);
   if (failed(canonicalProblem))
     return failure();
-  if (auto cached = jointSolverCache().lookup(*canonicalProblem))
-    return std::move(*cached);
+  // A forced fault must not be served from, or written to, the shared result
+  // cache — otherwise one test's canned response leaks into the next.
+  // By value, not by reference: the callable is invoked below, and a responder
+  // that installed or dropped an override mid-call would otherwise destroy the
+  // target of a live reference.
+  const ScopedJointSolverBackendOverride::Responder fakeBackend =
+      backendOverrideSlot();
+  const bool faulting = static_cast<bool>(fakeBackend);
+  if (!faulting)
+    if (auto cached = jointSolverCache().lookup(*canonicalProblem))
+      return std::move(*cached);
 
   unsigned retries = retryCount();
   for (unsigned attempt = 0; attempt <= retries; ++attempt) {
     auto attemptProblem = problemForAttempt(*canonicalProblem, attempt);
     if (failed(attemptProblem))
       return failure();
-    auto response = runZ3JointSolver(*attemptProblem);
+    auto response = faulting ? fakeBackend(*attemptProblem)
+                             : runZ3JointSolver(*attemptProblem);
     if (failed(response))
       return failure();
 
@@ -438,11 +600,13 @@ FailureOr<std::string> runJointSolverBackend(llvm::StringRef problemJson) {
     if (kind == ResponseKind::Ok) {
       if (!validateSolution(*attemptProblem, *response))
         return failure();
-      jointSolverCache().insert(*canonicalProblem, *response);
+      if (!faulting)
+        jointSolverCache().insert(*canonicalProblem, *response);
       return response;
     }
     if (kind == ResponseKind::ProvenUnsat) {
-      jointSolverCache().insert(*canonicalProblem, *response);
+      if (!faulting)
+        jointSolverCache().insert(*canonicalProblem, *response);
       return response;
     }
     if (kind != ResponseKind::Inconclusive || attempt == retries)
