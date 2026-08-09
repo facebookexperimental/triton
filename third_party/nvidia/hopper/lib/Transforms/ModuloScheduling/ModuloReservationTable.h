@@ -78,8 +78,12 @@ bool tryRepairModuloSchedule(const DataDependenceGraph &ddg,
                              ModuloScheduleResult &schedule);
 
 /// Run modulo scheduling on the DDG with the backend named by `algo`:
-///   "joint_solver" → native in-process Z3 solver; falls back to Rau on
-///                    failure
+///   "joint_solver" → native in-process Z3 solver. A failed solve is a
+///                    TERMINAL outcome here: it returns failure and reports a
+///                    JointSolverTrigger::ScheduleSolve to the fallback
+///                    policy (JointSolverFallback.h) instead of silently
+///                    degrading to Rau, which would leave a joint-solver
+///                    partition sitting on a heuristic schedule.
 ///   "sms"        → Swing Modulo Scheduling (Llosa et al., PACT 1996)
 ///   "exhaustive" → Exhaustive search with joint memory feasibility
 ///   "random"     → Random sampling with greedy placement
@@ -124,8 +128,7 @@ struct BaselineII {
 
 /// II-level comparison of the native joint solver against the in-tree
 /// schedulers on one DDG, plus the relaxed lower bound. Backs the M2
-/// acceptance criteria; see docs/Diff8BaselineComparison.md for what each
-/// number does and does not claim.
+/// acceptance criteria.
 struct BaselineComparisonReport {
   std::string fixture;
   int minII{};

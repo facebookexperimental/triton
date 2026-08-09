@@ -67,6 +67,12 @@ tools = [
 if config.triton_ext_enabled:
     config.available_features.add("triton-ext-enabled")
 
+# The native Z3 joint scheduler is an opt-in CMake option (default OFF); without
+# it runZ3JointSolver is a stub that always fails, so tests needing a real solve
+# gate on this. The Buck build declares the same feature from BUCK.template.
+if config.triton_enable_z3_joint_solver:
+    config.available_features.add("z3-joint-solver")
+
 # Detect an assertions build so tests that rely on `-debug-only` output (only
 # emitted when LLVM_ENABLE_ASSERTIONS is on) can guard with `REQUIRES: asserts`.
 # The `-debug-only` option itself is only registered in assertions builds, so its

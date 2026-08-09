@@ -52,6 +52,16 @@ struct ScheduleDriverOptions {
   bool printScheduleGraph = false;
   /// Mirror of the passes' data-partition-factor option (Pass A.5).
   int dataPartitionFactor = 0;
+  /// Terminal policy when the joint solver cannot produce a complete verified
+  /// result.
+  ///   false (default) → `baseline`: discard the joint attempt and rerun the
+  ///                     complete heuristic schedule + partition path, with a
+  ///                     remark. Byte-identical to a flag-off compile.
+  ///   true            → `strict-error`: fail the compilation, naming the
+  ///                     trigger. For the golden and determinism lanes.
+  /// Never fires on a per-II UNSAT — that is the solver's own II sweep making
+  /// progress, not a terminal outcome.
+  bool strictError = false;
 };
 
 /// Run the full Pass A orchestration on `moduleOp`. Returns failure on a
