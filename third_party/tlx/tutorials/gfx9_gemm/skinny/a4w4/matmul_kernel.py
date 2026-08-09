@@ -324,6 +324,9 @@ def _a4w4_skinny_kernel(
     ):
         for stage in tl.static_range(0, BUFFER_COUNT):
             tlx.async_load_wait_group(BUFFER_COUNT - 1)
+            # The wait is wave-local; all waves must finish their direct-to-LDS
+            # writes before the cooperative tile is consumed.
+            tl.debug_barrier()
             a = tlx.local_load(smem_a[stage], relaxed=True)
             b = tlx.local_load(tlx.local_trans(smem_b[stage]), relaxed=True)
             if BLOCK_M == 32:
@@ -346,6 +349,9 @@ def _a4w4_skinny_kernel(
             acc = tl.dot_scaled(
                 a, asc, "e2m1", b, bsc, "e2m1", acc
             )
+            # Do not let a faster wave overwrite this ring slot while another
+            # wave is still reading its share of the cooperative tile.
+            tl.debug_barrier()
             tlx.buffer_load_to_local(
                 smem_a[stage], a_base + stage * ak, a_off
             )
@@ -369,6 +375,7 @@ def _a4w4_skinny_kernel(
     # Drain the ring without refilling it.
     for stage in tl.static_range(0, BUFFER_COUNT):
         tlx.async_load_wait_group(BUFFER_COUNT - 1 - stage)
+        tl.debug_barrier()
         a = tlx.local_load(smem_a[stage], relaxed=True)
         b = tlx.local_load(tlx.local_trans(smem_b[stage]), relaxed=True)
         if BLOCK_M == 32:
