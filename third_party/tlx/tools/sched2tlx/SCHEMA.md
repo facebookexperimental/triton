@@ -200,6 +200,67 @@ The emitter groups sibling sub-ops by `subtile_count` and emits a single
 }
 ```
 
+### `lowering_templates` and `lowering_plan`
+
+These optional loop fields expose the joint solver's fixed-II lowering shadow
+model. Older graphs omit them and parse as an `absent` plan.
+
+`lowering_templates` contains the complete conditional event semantics:
+
+```json
+{
+  "id": 0,
+  "relation": "always",
+  "src_node": 9,
+  "dst_node": 10,
+  "src_cluster": 3,
+  "dst_cluster": 4,
+  "events": [{
+    "id": 0,
+    "kind": "tc_commit",
+    "owner": "src",
+    "anchor_node": 9,
+    "placement": "after",
+    "pipeline": "NONE",
+    "issue_duration": 1,
+    "completion_latency": 559,
+    "blocking": false,
+    "async": true,
+    "distance": 0,
+    "frequency": 1,
+    "buffer_id": null,
+    "bytes": 0,
+    "depth": 1,
+    "semaphore": "full",
+    "fusion_group": null,
+    "dedup_group": null
+  }]
+}
+```
+
+`relation` is `always`, `same_wg`, or `different_wg`. `lowering_plan`
+instantiates the active templates. `issue_duration` is per occurrence, so an
+event occupies `issue_duration * frequency` issue slots. Pipeline `NONE` means
+the event uses only its owner's warp-group issue stream; synchronization events
+do not reserve the anchor operation's chip-wide pipeline.
+
+```json
+{
+  "version": "lowering-plan-0.1",
+  "status": "shadow_verified",
+  "templates": [{
+    "id": 0,
+    "active": true,
+    "events": [{"id": 0, "cycle": 318, "wg": 2, "stream_order": 7}]
+  }]
+}
+```
+
+The statuses are `absent`, `shadow_unmodeled`, `shadow_verified`, and
+`shadow_stale`. None is authoritative for emission yet: sched2tlx parses and
+validates this contract, then continues to lower from `cross_wg_barriers`.
+See `ModuloScheduling/docs/LoweringPlan.md` for coverage and promotion gates.
+
 ## What the emitter does with this
 
 1. **Preamble** = walk all `scope == "function"` ops in source order, emit each

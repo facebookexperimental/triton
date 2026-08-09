@@ -14,12 +14,15 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <cstdlib>
 #include <functional>
 #include <initializer_list>
 #include <map>
 #include <optional>
 #include <set>
 #include <string>
+#include <thread>
 #include <tuple>
 #include <vector>
 
@@ -90,6 +93,98 @@ TEST(ModuloScheduleTest, RejectsRepairWhenLatestCycleIsOccupied) {
 
   EXPECT_FALSE(
       tryRepairModuloSchedule(schedule.II, schedule.nodeToCycle, nodes, edges));
+}
+
+// ── Schedule-backend selection ──────────────────────────────────────────────
+//
+// getActiveScheduleAlgo is a pure function of (forced argument, env var). It
+// used to consult a process-global slot written by an RAII override, which two
+// modules compiled concurrently in one process (triton.AsyncCompileMode with a
+// ThreadPoolExecutor; pass_manager.run releases the GIL) could corrupt for each
+// other. These tests pin the property that replaced it.
+
+constexpr const char *kScheduleAlgoEnvVar = "TRITON_USE_MODULO_SCHEDULE";
+
+/// Pins TRITON_USE_MODULO_SCHEDULE for one test and restores it on scope exit,
+/// so a test can't leak its value into the rest of the binary. `value ==
+/// nullptr` unsets the variable.
+class ScopedScheduleAlgoEnv {
+public:
+  explicit ScopedScheduleAlgoEnv(const char *value) {
+    if (const char *previous = std::getenv(kScheduleAlgoEnvVar))
+      saved = std::string(previous);
+    apply(value);
+  }
+  ~ScopedScheduleAlgoEnv() { apply(saved ? saved->c_str() : nullptr); }
+  ScopedScheduleAlgoEnv(const ScopedScheduleAlgoEnv &) = delete;
+  ScopedScheduleAlgoEnv &operator=(const ScopedScheduleAlgoEnv &) = delete;
+
+private:
+  static void apply(const char *value) {
+    if (value)
+      setenv(kScheduleAlgoEnvVar, value, /*overwrite=*/1);
+    else
+      unsetenv(kScheduleAlgoEnvVar);
+  }
+
+  std::optional<std::string> saved;
+};
+
+TEST(ScheduleAlgoSelectionTest, DefaultsToRauWithoutEnvOrForcedAlgo) {
+  ScopedScheduleAlgoEnv env(nullptr);
+
+  EXPECT_EQ(getActiveScheduleAlgo(), "rau");
+}
+
+TEST(ScheduleAlgoSelectionTest, EmptyForcedAlgoReadsTheEnvVar) {
+  ScopedScheduleAlgoEnv env("sms");
+
+  EXPECT_EQ(getActiveScheduleAlgo(), "sms");
+  EXPECT_EQ(getActiveScheduleAlgo(""), "sms");
+}
+
+TEST(ScheduleAlgoSelectionTest, ForcedAlgoWinsAndLeavesNoResidue) {
+  ScopedScheduleAlgoEnv env("sms");
+
+  EXPECT_EQ(getActiveScheduleAlgo("joint_solver"), "joint_solver");
+  // The forced choice is an argument, not state: the next caller without one
+  // still sees the env var. (Old failure mode: a leaked override made an
+  // unrelated compile run the joint solver it never asked for.)
+  EXPECT_EQ(getActiveScheduleAlgo(), "sms");
+}
+
+// The plan's two-compile scenario, at the selection function: one run forces
+// joint_solver, a concurrent one forces nothing. Each must keep its own
+// backend for its whole run — a shared slot would either be reset under the
+// forcing run ("lost restore") or read by the other one ("leaked override").
+TEST(ScheduleAlgoSelectionTest, ConcurrentSelectionsAreIndependent) {
+  ScopedScheduleAlgoEnv env("rau");
+  constexpr int kIterations = 2000;
+
+  std::atomic<bool> start{false};
+  std::string forcedSaw, unforcedSaw; // first wrong observation, if any
+
+  auto resolveRepeatedly = [&](llvm::StringRef forced, llvm::StringRef expected,
+                               std::string &firstWrong) {
+    while (!start.load(std::memory_order_acquire)) {
+    }
+    for (int i = 0; i < kIterations; ++i) {
+      std::string algo = getActiveScheduleAlgo(forced);
+      if (algo != expected && firstWrong.empty())
+        firstWrong = algo;
+    }
+  };
+
+  std::thread forcedRun(resolveRepeatedly, "joint_solver", "joint_solver",
+                        std::ref(forcedSaw));
+  std::thread unforcedRun(resolveRepeatedly, "", "rau", std::ref(unforcedSaw));
+  start.store(true, std::memory_order_release);
+  forcedRun.join();
+  unforcedRun.join();
+
+  EXPECT_EQ(forcedSaw, "") << "forced run lost its backend to a concurrent one";
+  EXPECT_EQ(unforcedSaw, "")
+      << "unforced run picked up a concurrent run's backend";
 }
 
 #ifdef TRITON_ENABLE_Z3_JOINT_SOLVER

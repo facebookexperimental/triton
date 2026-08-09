@@ -37,8 +37,11 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
 // JOINT: ttg.local_alloc {{.*}} {buffer.id = 1 : i32, buffer.merge_group_id = 1 : i32, loop.cluster = 3 : i32, loop.stage = 0 : i32, tt.num_buffers = 2 : i32, ttg.partition = array<i32: 2>}
 // JOINT: ttng.tmem_alloc {{.*}} {buffer.id = 2 : i32, buffer.merge_group_id = 2 : i32, loop.cluster = 4 : i32, loop.stage = 0 : i32, tt.num_buffers = 2 : i32, ttg.partition = array<i32: 3>}
 // JOINT: ttng.tc_gen5_mma {{.*}} {loop.cluster = 4 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 3>}
-// JOINT: ttng.tmem_load {{.*}} {loop.cluster = 0 : i32, loop.stage = 1 : i32, ttg.partition = array<i32: 3>}
-// JOINT: } {tt.modulo_ii = 1091 : i32, tt.num_stages = 2 : i32, tt.scheduled_max_stage = 1 : i32, ttg.partition.stages = [0 : i32, 0 : i32, 0 : i32, 1 : i32], ttg.partition_num_warps = array<i32: 4, 1, 1, 4>, ttg.warp_specialize.tag = 0 : i32}
+// The epilogue tmem_load gets a warp group of its own (4), separate from the
+// MMA's (3), once the solver's warp-group assignment is applied — hence five
+// partitions, not four.
+// JOINT: ttng.tmem_load {{.*}} {loop.cluster = 0 : i32, loop.stage = 1 : i32, ttg.partition = array<i32: 4>}
+// JOINT: } {tt.modulo_ii = 1091 : i32, tt.num_stages = 2 : i32, tt.scheduled_max_stage = 1 : i32, ttg.partition.stages = [0 : i32, 0 : i32, 0 : i32, 0 : i32, 1 : i32], ttg.partition_num_warps = array<i32: 4, 1, 1, 1, 4>, ttg.warp_specialize.tag = 0 : i32}
 //
 // M2 acceptance evidence on this same GEMM DDG. The IIs are solver- and
 // machine-dependent so they are matched as numbers, not pinned: what is

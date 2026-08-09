@@ -349,6 +349,10 @@ struct ScheduleLoop {
     unsigned arriveAfterNodeId{UINT_MAX};
     unsigned waitBeforeNodeId{UINT_MAX};
 
+    // Authoritative dependence distance from the ScheduleEdge that caused
+    // this synchronization record.
+    unsigned distance{0};
+
     // For mbarrier: expected bytes the producer writes (for expect_tx).
     int64_t expectBytes{0};
   };
