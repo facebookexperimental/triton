@@ -71,8 +71,10 @@ from .mma_ops import (
     async_dot,
     async_dot_scaled,
     async_dot_wait,
+    dot_scaled,
     extract_slice,
     rematerialized_range,
+    require_amd_wmma_layout,
     require_layout,
     tcgen05_commit,
 )
@@ -213,6 +215,8 @@ __all__ = [
     "named_barrier_arrive",
     "amd_sched_barrier",
     # mma_ops
+    "dot_scaled",
+    "require_amd_wmma_layout",
     "async_dot",
     "async_dot_scaled",
     "async_dot_wait",
