@@ -1349,8 +1349,9 @@ def test_async_dot_scaled_2cta(device):
 
 @pytest.mark.parametrize("A_DATA_TYPE", ["e5m2", "e4m3"])
 @pytest.mark.parametrize("B_DATA_TYPE", ["e5m2", "e4m3"])
+@pytest.mark.parametrize("N", [128, 256])
 @pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
-def test_async_dot_scaled(A_DATA_TYPE, B_DATA_TYPE, device):
+def test_async_dot_scaled(A_DATA_TYPE, B_DATA_TYPE, N, device):
     """
     Test D = (A * A_scale)  * (B * B_scale) with mxfp8 format for both A and B.
 
