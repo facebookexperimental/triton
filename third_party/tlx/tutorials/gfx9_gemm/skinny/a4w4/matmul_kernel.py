@@ -108,8 +108,7 @@ def _a4w4_skinny_kernel(
         )
         shared_tile_a: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases(
             [[1024, 16]],
-            [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64],
-             [1, 0], [2, 0], [4, 0], [8, 0], [16, 0]],
+            [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64], [1, 0], [2, 0], [4, 0], [8, 0], [16, 0]],
             [BLOCK_M, BKP],
         )
         scale_a_layout: tl.constexpr = tlx.layout(
@@ -139,8 +138,8 @@ def _a4w4_skinny_kernel(
         )
         shared_tile_a: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases(
             [[1024, 16]],
-            [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64],
-             [1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0]],
+            [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64], [1, 0], [2, 0], [4, 0], [8, 0], [16, 0],
+             [32, 0]],
             [BLOCK_M, BKP],
         )
         scale_a_layout: tl.constexpr = tlx.layout(
@@ -166,8 +165,8 @@ def _a4w4_skinny_kernel(
         )
         shared_tile_a: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases(
             [[1024, 16]],
-            [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64],
-             [1, 0], [32, 0], [64, 0], [2, 0], [4, 0], [8, 0], [16, 0]],
+            [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64], [1, 0], [32, 0], [64, 0], [2, 0], [4, 0],
+             [8, 0], [16, 0]],
             [BLOCK_M, BKP],
         )
         scale_a_layout: tl.constexpr = tlx.layout(
@@ -276,8 +275,7 @@ def _a4w4_skinny_kernel(
         # dword; strides and offsets are consequently expressed in dwords.
         offs_asm_packed = tl.arange(0, BLOCK_M // 4)
         asc_off = tlx.require_layout(
-            offs_asm_packed[:, None] +
-            tl.mul(offs_sg[None, :], stride_ask // 4, sanitize_overflow=False),
+            offs_asm_packed[:, None] + tl.mul(offs_sg[None, :], stride_ask // 4, sanitize_overflow=False),
             packed_scales_a,
         )
         a_scales_load_ptr = (a_scales_ptr + pid_m * BLOCK_M).to(tl.pointer_type(tl.uint32))
@@ -306,22 +304,16 @@ def _a4w4_skinny_kernel(
     # every stage visible to LLVM while the outer loop remains rolled.
     for stage in tl.static_range(0, BUFFER_COUNT):
         tlx.buffer_load_to_local(smem_a[stage], a_base + stage * ak, a_off)
-        tlx.buffer_load_to_local(
-            smem_asc[stage], a_scales_load_ptr + stage * sck_a, asc_off
-        )
+        tlx.buffer_load_to_local(smem_asc[stage], a_scales_load_ptr + stage * sck_a, asc_off)
         tlx.buffer_load_to_local(smem_b[stage], b_base + stage * bk, b_off)
-        tlx.buffer_load_to_local(
-            smem_bsc[stage], b_scales_ptr + stage * sck_b, bsc_off
-        )
+        tlx.buffer_load_to_local(smem_bsc[stage], b_scales_ptr + stage * sck_b, bsc_off)
         tlx.async_load_commit_group()
     a_base += ak * BUFFER_COUNT
     b_base += bk * BUFFER_COUNT
     a_scales_load_ptr += sck_a * BUFFER_COUNT
     b_scales_ptr += sck_b * BUFFER_COUNT
 
-    for k in tl.range(
-        0, iter_max - BUFFER_COUNT, BUFFER_COUNT, num_stages=1
-    ):
+    for k in tl.range(0, iter_max - BUFFER_COUNT, BUFFER_COUNT, num_stages=1):
         for stage in tl.static_range(0, BUFFER_COUNT):
             tlx.async_load_wait_group(BUFFER_COUNT - 1)
             # The wait is wave-local; all waves must finish their direct-to-LDS
@@ -340,32 +332,20 @@ def _a4w4_skinny_kernel(
                 asc_view = tlx.local_reshape(asc_view, [BLOCK_M, NG])
                 asc = tlx.local_load(asc_view, layout=scale_a_layout)
             else:
-                asc = tlx.local_load(
-                    smem_asc[stage], layout=scale_a_layout
-                )
-            bsc = tlx.local_load(
-                smem_bsc[stage], layout=scale_b_layout
-            )
-            acc = tl.dot_scaled(
-                a, asc, "e2m1", b, bsc, "e2m1", acc
-            )
+                asc = tlx.local_load(smem_asc[stage], layout=scale_a_layout)
+            bsc = tlx.local_load(smem_bsc[stage], layout=scale_b_layout)
+            acc = tl.dot_scaled(a, asc, "e2m1", b, bsc, "e2m1", acc)
             # Do not let a faster wave overwrite this ring slot while another
             # wave is still reading its share of the cooperative tile.
             tl.debug_barrier()
-            tlx.buffer_load_to_local(
-                smem_a[stage], a_base + stage * ak, a_off
-            )
+            tlx.buffer_load_to_local(smem_a[stage], a_base + stage * ak, a_off)
             tlx.buffer_load_to_local(
                 smem_asc[stage],
                 a_scales_load_ptr + stage * sck_a,
                 asc_off,
             )
-            tlx.buffer_load_to_local(
-                smem_b[stage], b_base + stage * bk, b_off
-            )
-            tlx.buffer_load_to_local(
-                smem_bsc[stage], b_scales_ptr + stage * sck_b, bsc_off
-            )
+            tlx.buffer_load_to_local(smem_b[stage], b_base + stage * bk, b_off)
+            tlx.buffer_load_to_local(smem_bsc[stage], b_scales_ptr + stage * sck_b, bsc_off)
             tlx.async_load_commit_group()
         a_base += ak * BUFFER_COUNT
         b_base += bk * BUFFER_COUNT
@@ -420,9 +400,7 @@ def choose_skinny_block_m(M, N, K=None):
     """
     if M == 256 and N == 4096 and K == 4096:
         return SKINNY_TINY_BLOCK_M
-    grid_64 = triton.cdiv(M, SKINNY_SMALL_BLOCK_M) * triton.cdiv(
-        N, SKINNY_BLOCK_N
-    )
+    grid_64 = triton.cdiv(M, SKINNY_SMALL_BLOCK_M) * triton.cdiv(N, SKINNY_BLOCK_N)
     return SKINNY_SMALL_BLOCK_M if grid_64 <= NUM_CU else SKINNY_BLOCK_M
 
 
@@ -466,11 +444,7 @@ def skinny_matmul(a, b, a_scales, b_scales, SPLIT_K=None, BLOCK_M=None):
     if BM == SKINNY_TINY_BLOCK_M:
         # The dword view requires four contiguous, aligned M-scale bytes and a
         # dword-expressible K-group stride. Fall back for exotic strided views.
-        if (
-            a_scales.stride(0) != 1
-            or a_scales.stride(1) % 4 != 0
-            or a_scales.data_ptr() % 4 != 0
-        ):
+        if (a_scales.stride(0) != 1 or a_scales.stride(1) % 4 != 0 or a_scales.data_ptr() % 4 != 0):
             BM = SKINNY_SMALL_BLOCK_M
     BN = SKINNY_BLOCK_N
     if SPLIT_K is None:
@@ -534,7 +508,5 @@ def skinny_matmul(a, b, a_scales, b_scales, SPLIT_K=None, BLOCK_M=None):
 
 def is_skinny(M, N, K):
     """Whether the occupancy-oriented skinny path should handle this shape."""
-    grid_mn = triton.cdiv(M, DISPATCH_BLOCK_M) * triton.cdiv(
-        N, DISPATCH_BLOCK_N
-    )
+    grid_mn = triton.cdiv(M, DISPATCH_BLOCK_M) * triton.cdiv(N, DISPATCH_BLOCK_N)
     return grid_mn <= NUM_CU // 4
