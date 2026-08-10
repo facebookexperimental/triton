@@ -864,22 +864,6 @@ bool canLoadDirectToLDS(const triton::AMD::TargetInfo &targetInfo,
           srcTy.getContext(), swizzledEnc.getVec(), 1, 1,
           swizzledEnc.getOrder(), swizzledEnc.getCGALayout());
       sharedLayout = tt::gpu::toLinearLayout(dstAllocShape, flatSharedEnc);
-    } else if (auto linearEnc =
-                   dyn_cast<triton::gpu::SharedLinearEncodingAttr>(dstEnc)) {
-      // Prefer a source distribution that already follows the explicit
-      // physical shared layout. GFX9 can then issue the coalesced wave write
-      // directly, without transferring the swizzle to source offsets.
-      auto actualLayout = sharedLayout;
-      auto actualCvt = srcLayout.invertAndCompose(actualLayout);
-      if (actualCvt.getNumConsecutiveInOut() != vectorSize ||
-          !canCoalesceWriteIntoSharedMemory(srcTy.getContext(), actualCvt,
-                                            targetInfo.getWarpSize(),
-                                            vectorSize)) {
-        auto flatSharedEnc = tt::gpu::SwizzledSharedEncodingAttr::get(
-            srcTy.getContext(), /*vec=*/1, /*perPhase=*/1, /*maxPhase=*/1,
-            linearEnc.getOrder(), linearEnc.getCGALayout());
-        sharedLayout = tt::gpu::toLinearLayout(dstAllocShape, flatSharedEnc);
-      }
     }
   }
   LinearLayout srcToSharedLayout = srcLayout.invertAndCompose(sharedLayout);

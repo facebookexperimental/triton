@@ -498,12 +498,10 @@ static amdgpu::BufferLoadToLocalOp findBufferProducer(Value memdesc) {
   return nullptr;
 }
 
-// For a buffer_load_to_local into a user-pinned padded or swizzled shared dst,
-// derive and pin the offset tensor's #linear so the direct-to-LDS write is
-// coalesced. Padded layouts expose their explicit linear component. Swizzled
-// layouts use their flat counterpart here; lowering applies the XOR to the
-// source offset. Idempotent; other shared encodings retain their established
-// lowering paths.
+// For a buffer_load_to_local into a user-pinned padded_shared dst, derive and
+// pin the offset tensor's #linear so the direct-to-LDS write is coalesced (via
+// deduceRegLayoutFromPaddedShared), sparing the author from hand-writing it.
+// Idempotent; only fires for user-pinned padded dsts.
 static void pinInferredBufferOffsetLayout(amdgpu::BufferLoadToLocalOp buf,
                                           triton::ModuleAxisInfoAnalysis &axis,
                                           OpBuilder &builder) {
@@ -516,19 +514,9 @@ static void pinInferredBufferOffsetLayout(amdgpu::BufferLoadToLocalOp buf,
   auto pinned = dyn_cast<ttg::PinnedEncodingTrait>(destTy.getEncoding());
   if (!pinned)
     return;
-  Attribute sharedEnc = pinned.getPinnedLayout();
-  std::optional<triton::LinearLayout> sharedOffsetLayout;
-  if (auto paddedEnc = dyn_cast<ttg::PaddedSharedEncodingAttr>(sharedEnc)) {
-    sharedOffsetLayout = paddedEnc.getLinearComponent();
-  } else if (auto swizzledEnc =
-                 dyn_cast<ttg::SwizzledSharedEncodingAttr>(sharedEnc)) {
-    auto flatEnc = ttg::SwizzledSharedEncodingAttr::get(
-        buf.getContext(), swizzledEnc.getVec(), 1, 1,
-        swizzledEnc.getOrder(), swizzledEnc.getCGALayout());
-    sharedOffsetLayout =
-        ttg::toLinearLayout(destTy.getAllocShape(), flatEnc);
-  }
-  if (!sharedOffsetLayout)
+  auto paddedEnc =
+      dyn_cast_or_null<ttg::PaddedSharedEncodingAttr>(pinned.getPinnedLayout());
+  if (!paddedEnc)
     return;
 
   auto offsetsTy = cast<RankedTensorType>(buf.getOffsets().getType());
@@ -558,12 +546,12 @@ static void pinInferredBufferOffsetLayout(amdgpu::BufferLoadToLocalOp buf,
   unsigned threadsPerWarp = ttg::TritonGPUDialect::getThreadsPerWarp(mod);
   unsigned numWarps = ttg::lookupNumWarps(buf);
 
-  auto regLayout = triton::AMD::deduceRegLayoutFromShared(
-      *sharedOffsetLayout, loadContig, threadsPerWarp, numWarps,
+  auto regLayout = triton::AMD::deduceRegLayoutFromPaddedShared(
+      paddedEnc.getLinearComponent(), loadContig, threadsPerWarp, numWarps,
       offsetsTy.getShape(), ttg::getCGALayout(offsetsTy.getEncoding()), ctx);
   if (failed(regLayout)) {
     buf->emitRemark() << "could not infer a coalesced direct-to-LDS offset "
-                         "layout from the pinned shared layout; check "
+                         "layout from the pinned padded shared layout; check "
                          "that the pinned shared layout is directly loadable";
     return;
   }

@@ -1009,44 +1009,6 @@ public:
   using BinaryOpVisitorImpl<OpTy>::BinaryOpVisitorImpl;
 
 private:
-  int64_t getContiguity(OpTy op, const AxisInfo &lhs, const AxisInfo &rhs,
-                        int dim) override {
-    if constexpr (!std::is_same_v<OpTy, arith::XOrIOp>) {
-      return 1;
-    } else {
-      // XOR preserves a contiguous run when the other operand is constant
-      // throughout the run and both operands have zeroes in the run's low
-      // address bits. Apply the rule symmetrically because XOR is commutative.
-      // ModuleAxisInfoAnalysis subsequently bounds this fact by the explicit
-      // register layout's per-thread contiguity.
-      auto preservedRun = [dim](const AxisInfo &varying, const AxisInfo &mask) {
-        return gcd(varying.getContiguity(dim), varying.getDivisibility(dim),
-                   mask.getConstancy(dim), mask.getDivisibility(dim));
-      };
-      return std::max(preservedRun(lhs, rhs), preservedRun(rhs, lhs));
-    }
-  }
-
-  int64_t getDivisibility(OpTy op, const AxisInfo &lhs, const AxisInfo &rhs,
-                          int dim) override {
-    if constexpr (!std::is_same_v<OpTy, arith::XOrIOp>) {
-      return 1;
-    } else {
-      // When the result run is shorter than an input run, result groups may
-      // start inside that input run. Do not carry stronger divisibility across
-      // those new group boundaries. Unit-contiguity facts apply to every
-      // element and therefore do not need clamping.
-      auto resultContiguity = getContiguity(op, lhs, rhs, dim);
-      auto divisibilityAtResultBase =
-          [dim, resultContiguity](const AxisInfo &operand) {
-            if (operand.getContiguity(dim) == 1)
-              return operand.getDivisibility(dim);
-            return gcd(operand.getDivisibility(dim), resultContiguity);
-          };
-      return gcd(divisibilityAtResultBase(lhs), divisibilityAtResultBase(rhs));
-    }
-  }
-
   std::optional<int64_t> getConstantValue(OpTy op, const AxisInfo &lhs,
                                           const AxisInfo &rhs) override {
     if (lhs.getConstantValue().has_value() &&
