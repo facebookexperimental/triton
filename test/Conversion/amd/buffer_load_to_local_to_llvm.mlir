@@ -319,6 +319,9 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 32 : i32, ttg.sha
 
     // Each thread needs to load 8 elements and we load 8 (sizePerThread) per buffer load instruction
     // GFX950: rocdl.make.buffer.rsrc
+    // The fastest shared dimension is one full contiguous offset row, so the
+    // swizzle is applied with integer lane-offset arithmetic, not ds_bpermute.
+    // GFX950-NOT: rocdl.ds_bpermute
     // GFX950: rocdl.raw.ptr.buffer.load.async.lds
     // GFX950-NOT: rocdl.raw.ptr.buffer.load.async.lds
 

@@ -133,38 +133,44 @@ def _a4w4_8wave_kernel(
         shape=((2, 2, 2, 2, 2, 2, 2, 2, 2), (2, 2, 2, 2, 2)),
         stride=((16, 32, 64, 128, 4096, 8192, 256, 512, 1024), (1, 2, 4, 8, 2048)),
     )
-    # ---- A scale global-load blocked layout (#blocked, [128,8]) ----
-    blocked_a_scales: tl.constexpr = tlx.layout(
-        shape=((2, 2, 2, 2, 2, 2, 2, 2, 2), (2, 2)),
-        stride=((32, 64, 128, 256, 512, 1, 0, 2, 4), (8, 16)),
-    )
-    # ---- B scale global-load blocked layout (#blocked1, FULL [256,8]) ----
-    blocked_b_scales: tl.constexpr = tlx.layout(
-        shape=((2, 2, 2, 2, 2, 2, 2, 2, 2), (2, 2)),
-        stride=((32, 64, 128, 256, 512, 1024, 1, 2, 4), (8, 16)),
-    )
     # ---- padded shared tile layout ([128,128] fp4, pad 32 @ 1024) ----
     shared_tile: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases(
         [[1024, 32]],
         [
-            [0, 1],
-            [0, 2],
-            [0, 4],
-            [0, 8],
-            [0, 16],
-            [0, 32],
-            [0, 64],
-            [1, 0],
-            [32, 0],
-            [64, 0],
-            [2, 0],
-            [4, 0],
-            [8, 0],
-            [16, 0],
+            [0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64],
+            [1, 0], [32, 0], [64, 0], [2, 0], [4, 0], [8, 0], [16, 0],
         ],
         [HALF_M, HALF_K],
     )
-    shared_scales: tl.constexpr = tlx.swizzled_layout(0, 0, 0, order=[0, 1])
+    # Wave's 8-byte chunk XOR, with its three phase bits assigned to the row
+    # bits that ds_read_b64_tr_b8 presents to distinct CDNA4 banks.  The A and
+    # B scale distributions expose different lane bases, hence the two small
+    # bit permutations.  Low three row bits stay identity so every direct LDS
+    # write remains one contiguous 8-byte global segment.
+    shared_a_scales: tl.constexpr = tlx.shared_linear_layout_encoding(
+        offset_bases=[
+            [1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0], [64, 0],
+            [8, 1], [32, 2], [16, 4],
+        ],
+        block_bases=[],
+        alignment=16,
+    )
+    shared_b_scales: tl.constexpr = tlx.shared_linear_layout_encoding(
+        offset_bases=[
+            [1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0], [64, 0], [128, 0],
+            [16, 1], [8, 2], [32, 4],
+        ],
+        block_bases=[],
+        alignment=16,
+    )
+    blocked_a_scales: tl.constexpr = tlx.layout(
+        shape=((2, 2, 2, 2, 2, 2, 2, 2, 2), (2, 2)),
+        stride=((32, 64, 128, 256, 512, 1, 0, 2, 4), (8, 16)),
+    )
+    blocked_b_scales: tl.constexpr = tlx.layout(
+        shape=((2, 2, 2, 2, 2, 2, 2, 2, 2), (2, 2)),
+        stride=((32, 64, 128, 256, 512, 1024, 1, 2, 4), (8, 16)),
+    )
     # ---- MFMA scale register layouts (get_mfma_scale_layout) ----
     scale_a_layout: tl.constexpr = tlx.layout(
         shape=((2, 2, 2, 2, 2, 2, 2, 2, 2), (2, 2, 2)),
@@ -224,9 +230,9 @@ def _a4w4_8wave_kernel(
     smem_a_bot = tlx.local_alloc((HALF_M, HALF_K), tlx.dtype_of(a_ptr), 2, layout=shared_tile)
     smem_b_left = tlx.local_alloc((HALF_N, HALF_K), tlx.dtype_of(b_ptr), 2, layout=shared_tile)
     smem_b_right = tlx.local_alloc((HALF_N, HALF_K), tlx.dtype_of(b_ptr), 2, layout=shared_tile)
-    smem_a_sc_t = tlx.local_alloc((HALF_M, NG), tlx.dtype_of(a_scales_ptr), 2, layout=shared_scales)
-    smem_a_sc_b = tlx.local_alloc((HALF_M, NG), tlx.dtype_of(a_scales_ptr), 2, layout=shared_scales)
-    smem_b_sc = tlx.local_alloc((BLOCK_N, NG), tlx.dtype_of(b_scales_ptr), 2, layout=shared_scales)
+    smem_a_sc_t = tlx.local_alloc((HALF_M, NG), tlx.dtype_of(a_scales_ptr), 2, layout=shared_a_scales)
+    smem_a_sc_b = tlx.local_alloc((HALF_M, NG), tlx.dtype_of(a_scales_ptr), 2, layout=shared_a_scales)
+    smem_b_sc = tlx.local_alloc((BLOCK_N, NG), tlx.dtype_of(b_scales_ptr), 2, layout=shared_b_scales)
 
     # ---- fp4 tile load offsets ([128,128]) ----
     offs_am = tl.arange(0, HALF_M)
@@ -241,14 +247,14 @@ def _a4w4_8wave_kernel(
 
     # ---- A scale load offsets ([128,8]) ----
     offs_ks_a = tl.arange(0, NG)
-    offs_asm = (pid_m * BLOCK_M + tl.arange(0, HALF_M)) % M
+    offs_asm = pid_m * BLOCK_M + tl.arange(0, HALF_M)
     a_sc_offsets = tl.mul(offs_asm[:, None], stride_asm, sanitize_overflow=False) + tl.mul(
         offs_ks_a[None, :], stride_ask, sanitize_overflow=False)
     a_sc_offsets = tlx.require_layout(a_sc_offsets, blocked_a_scales)
 
     # ---- B scale load offsets: FULL [256,8] in one copy ----
     offs_ks_b = tl.arange(0, NG)
-    offs_bsn = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N)) % N
+    offs_bsn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     b_sc_offsets = tl.mul(offs_bsn[:, None], stride_bsn, sanitize_overflow=False) + tl.mul(
         offs_ks_b[None, :], stride_bsk, sanitize_overflow=False)
     b_sc_offsets = tlx.require_layout(b_sc_offsets, blocked_b_scales)

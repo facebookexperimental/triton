@@ -422,6 +422,29 @@ struct DirectToLdsLoadConversionBase : public LoadStoreConversionBase {
     }
   }
 
+  // A row-confined shared swizzle can be applied directly to buffer offsets
+  // when AxisInfo proves that every logical element of the fastest shared
+  // dimension is one contiguous integer sequence.  This is deliberately
+  // stronger than the old `contiguity > 1` check removed in #7704: full-row
+  // contiguity proves that moving by a swizzled lane delta cannot cross a row
+  // or select an unrelated global-memory segment.
+  bool canApplySwizzlingWithLaneOffset(Value offsets,
+                                       MemDescType sharedTy) const {
+    auto offsetsTy = dyn_cast<RankedTensorType>(offsets.getType());
+    if (!offsetsTy)
+      return false;
+    auto order = triton::gpu::getOrder(sharedTy);
+    if (order.empty())
+      return false;
+    unsigned fastestDim = order.front();
+    AxisInfo *axisInfo = axisAnalysisPass.getAxisInfo(offsets);
+    if (!axisInfo || axisInfo->getRank() <= fastestDim ||
+        offsetsTy.getRank() <= fastestDim)
+      return false;
+    return axisInfo->getContiguity(fastestDim) ==
+           offsetsTy.getShape()[fastestDim];
+  }
+
   // Unified helper for async copy between global and shared memory.
   // Works for both load (global→shared) and store (shared→global).
   // Parameters:
@@ -789,16 +812,22 @@ struct BufferLoadToLocalOpConversion
     SmallVector<Value> swizzledLaneOffsets;
 
     auto maybeSwizzledEnc = dyn_cast<SwizzledSharedEncodingAttr>(dstEnc);
-    bool requiresSrcPtrSwizzling = !targetInfo.supportsDirectToLdsScatter() &&
-                                   maybeSwizzledEnc &&
-                                   maybeSwizzledEnc.getMaxPhase() != 1;
+    auto maybeLinearEnc = dyn_cast<SharedLinearEncodingAttr>(dstEnc);
+    bool requiresSrcPtrSwizzling =
+        !targetInfo.supportsDirectToLdsScatter() &&
+        ((maybeSwizzledEnc && maybeSwizzledEnc.getMaxPhase() != 1) ||
+         maybeLinearEnc);
+    bool canOffsetSwizzle = maybeSwizzledEnc && requiresSrcPtrSwizzling &&
+                            canApplySwizzlingWithLaneOffset(offset, dstTy);
     if (requiresSrcPtrSwizzling) {
       // TODO (alex): this is only correct as long as the lds view is a
       // contiguous block. So this can break if we slice along the 2 minor
       // dimensions.
+      unsigned sharedVec = maybeSwizzledEnc ? maybeSwizzledEnc.getVec() : 1;
+      auto order = triton::gpu::getOrder(dstTy);
       auto flatSharedEnc = SwizzledSharedEncodingAttr::get(
-          op->getContext(), maybeSwizzledEnc.getVec(), 1, 1,
-          maybeSwizzledEnc.getOrder(), maybeSwizzledEnc.getCGALayout());
+          op->getContext(), sharedVec, 1, 1, order,
+          triton::gpu::getCGALayout(dstEnc));
       flatDstTy = MemDescType::get(dstTy.getShape(), dstTy.getElementType(),
                                    flatSharedEnc, dstTy.getMemorySpace());
       swizzledLaneOffsets = emitSwizzledLaneOffsets(
@@ -836,9 +865,21 @@ struct BufferLoadToLocalOpConversion
       Value vecBytesVal = b.i32_val(vecBits / 8);
 
       Value maybeSwizzledMaskElem = maskElem;
-      if (requiresSrcPtrSwizzling)
-        applySwizzling(rewriter, loc, offsetElem, maybeSwizzledMaskElem, laneId,
-                       swizzleLaneOffset);
+      if (requiresSrcPtrSwizzling) {
+        if (canOffsetSwizzle) {
+          offsetElem = b.add(
+              offsetElem,
+              b.mul(swizzleLaneOffset,
+                    b.i32_val(vecTy.getNumElements())));
+          Value swizzledLaneId = b.add(laneId, swizzleLaneOffset);
+          maybeSwizzledMaskElem = shuffleMask(
+              rewriter, b, loc, targetInfo, swizzledLaneId,
+              maybeSwizzledMaskElem);
+        } else {
+          applySwizzling(rewriter, loc, offsetElem, maybeSwizzledMaskElem,
+                         laneId, swizzleLaneOffset);
+        }
+      }
 
       // Buffer-load-to-local supports zero-fill for per-lane masks by adjusting
       // the src offset to be OOB. Redundant-thread predication still needs a

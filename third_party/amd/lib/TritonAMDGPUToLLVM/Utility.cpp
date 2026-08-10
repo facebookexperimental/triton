@@ -858,6 +858,15 @@ bool canLoadDirectToLDS(const triton::AMD::TargetInfo &targetInfo,
           srcTy.getContext(), swizzledEnc.getVec(), 1, 1,
           swizzledEnc.getOrder(), swizzledEnc.getCGALayout());
       sharedLayout = tt::gpu::toLinearLayout(dstAllocShape, flatSharedEnc);
+    } else if (auto linearEnc =
+                   dyn_cast<triton::gpu::SharedLinearEncodingAttr>(dstEnc)) {
+      // The explicit XOR is transferred to source offsets by the lowering.
+      // Check direct-to-LDS coalescing against the corresponding flat shared
+      // layout, exactly as for a standard swizzled shared encoding.
+      auto flatSharedEnc = tt::gpu::SwizzledSharedEncodingAttr::get(
+          srcTy.getContext(), /*vec=*/1, /*perPhase=*/1, /*maxPhase=*/1,
+          linearEnc.getOrder(), linearEnc.getCGALayout());
+      sharedLayout = tt::gpu::toLinearLayout(dstAllocShape, flatSharedEnc);
     }
   }
   LinearLayout srcToSharedLayout = srcLayout.invertAndCompose(sharedLayout);

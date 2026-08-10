@@ -223,7 +223,7 @@ struct CoalesceAsyncCopyWrites
       // 4) Take any remaining bases as additional reg bases
 
       auto *ctx = srcTy.getContext();
-      auto newRegLayout = triton::AMD::deduceRegLayoutFromPaddedShared(
+      auto newRegLayout = triton::AMD::deduceRegLayoutFromShared(
           sharedLayout, loadContig, threadsPerWarp, numWarps, srcTy.getShape(),
           blockedEnc.getCGALayout(), ctx);
       if (failed(newRegLayout)) {
