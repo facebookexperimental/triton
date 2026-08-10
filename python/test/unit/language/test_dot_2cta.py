@@ -107,3 +107,124 @@ def test_tl_dot_2cta_data_partition(DATA_PARTITION_FACTOR, device):
     assert "ttg.warp_specialize" in ttgir
     assert ttgir.count("ttng.tc_gen5_mma") >= 2
     assert ttgir.count("two_ctas") >= 2
+
+
+@triton.jit
+def _tl_dot_2cta_persistent_meta_ws_kernel(
+    a_desc,
+    b_desc,
+    c_desc,
+    M,
+    N,
+    K,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    DATA_PARTITION_FACTOR: tl.constexpr,
+    NUM_SMS: tl.constexpr,
+):
+    # Meta-WS persistent 2-CTA loop. The grid is indexed in CTAs and stepped by
+    # NUM_SMS -- program_id is NOT divided by 2 -- because ctas_per_cga regroups
+    # the existing grid CTAs into clusters and auto-warp-specialization pairs
+    # them. What makes that pairing well-formed is the even M-tile count below:
+    # a cluster covers two adjacent M tiles, so an odd grid_m would leave the
+    # last cluster half-populated.
+    start_pid = tl.program_id(0)
+    grid_m = tl.cdiv(M, BLOCK_M)
+    grid_m = (grid_m + 1) // 2 * 2
+    grid_n = tl.cdiv(N, BLOCK_N)
+    num_tiles = grid_m * grid_n
+    k_tiles = tl.cdiv(K, BLOCK_K)
+
+    for tile_id in tl.range(
+            start_pid,
+            num_tiles,
+            NUM_SMS,
+            warp_specialize=True,
+            data_partition_factor=DATA_PARTITION_FACTOR,
+            smem_alloc_algo=1,
+    ):
+        pid_m = tile_id % grid_m
+        pid_n = tile_id // grid_m
+        offs_m = pid_m * BLOCK_M
+        offs_n = pid_n * BLOCK_N
+        acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+
+        for ki in range(k_tiles):
+            offs_k = ki * BLOCK_K
+            a = a_desc.load([offs_m, offs_k])
+            b = b_desc.load([offs_k, offs_n])
+            acc = tl.dot(a, b, acc, two_ctas=True)
+
+        c_desc.store([offs_m, offs_n], acc.to(tl.bfloat16))
+
+
+@pytest.mark.parametrize("DATA_PARTITION_FACTOR", [1, 2])
+@pytest.mark.parametrize("m", [512, 384])
+@pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell")
+def test_tl_dot_2cta_persistent_meta_ws(DATA_PARTITION_FACTOR, m, device):
+    """2-CTA under a persistent meta-WS loop, the convention production kernels use.
+
+    This is deliberately a second, distinct convention from
+    ``test_tl_dot_2cta_data_partition`` above, which pairs CTAs explicitly with
+    ``program_id(0) // 2`` and a ``NUM_SMS // 2`` step. Both are correct; mixing
+    them is not. Keeping only the explicit-pairing example made the persistent
+    form look like a missing ``// 2``, so both are pinned here.
+
+    m=384 gives an odd BLOCK_M tile count, exercising the even-rounding path.
+    """
+    torch.manual_seed(0)
+    dtype = torch.bfloat16
+    n = 256
+    k = 128
+    block_m = 128
+    block_n = 128
+    block_k = 64
+
+    a = torch.randn((m, k), device=device, dtype=dtype)
+    b = torch.randn((k, n), device=device, dtype=dtype)
+    c = torch.zeros((m, n), device=device, dtype=dtype)
+
+    a_desc = TensorDescriptor(a, a.shape, a.stride(), [block_m, block_k])
+    b_desc = TensorDescriptor(b, b.shape, b.stride(), [block_k, block_n])
+    c_desc = TensorDescriptor(c, c.shape, c.stride(), [block_m, block_n])
+
+    def alloc_fn(size: int, align: int, stream: Optional[int]):
+        return torch.empty(size, dtype=torch.int8, device=device)
+
+    triton.set_allocator(alloc_fn)
+    num_sms = torch.cuda.get_device_properties(device).multi_processor_count
+
+    # Round the M-tile count up to even to match the kernel, then round the CTA
+    # grid down to even so every launched CTA has a cluster partner.
+    grid_m = (triton.cdiv(m, block_m) + 1) // 2 * 2
+    num_tiles = grid_m * triton.cdiv(n, block_n)
+    grid_size = (min(num_sms, num_tiles) // 2) * 2
+
+    with triton.knobs.nvidia.scope():
+        triton.knobs.nvidia.use_meta_ws = True
+        triton.knobs.nvidia.use_meta_partition = True
+
+        kernel = _tl_dot_2cta_persistent_meta_ws_kernel[(grid_size, )](
+            a_desc,
+            b_desc,
+            c_desc,
+            M=m,
+            N=n,
+            K=k,
+            BLOCK_M=block_m,
+            BLOCK_N=block_n,
+            BLOCK_K=block_k,
+            DATA_PARTITION_FACTOR=DATA_PARTITION_FACTOR,
+            NUM_SMS=num_sms,
+            num_warps=4,
+            num_stages=2,
+            ctas_per_cga=(2, 1, 1),
+        )
+
+    ref = torch.matmul(a.to(torch.float32), b.to(torch.float32)).to(dtype)
+    torch.testing.assert_close(c, ref, atol=2e-2, rtol=2e-2)
+
+    ttgir = kernel.asm["ttgir"]
+    assert "ttg.warp_specialize" in ttgir
+    assert "two_ctas" in ttgir
