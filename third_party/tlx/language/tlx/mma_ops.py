@@ -286,11 +286,9 @@ def async_dot_scaled(
     # Blackwell block-scaled tcgen05.mma (PTX ISA 9.3, Table 42): the per-CTA
     # instruction shape is fixed to M=128 with N a multiple of 8 in [8, 256]. K is
     # only lower-bounded because the lowering splits the K blocks across instructions.
-    # Gap: the ISA allows N up to 256, but the current lowering rejects blockN==256 for
-    # the scaled op (see InsertTmemAref.cpp), so we cap N at 128 until that is fixed.
     assert M == 128, f"M must be 128 for the scaled MMA, but got {M}"
     assert K >= 16, "K must be at least 16"
-    assert 8 <= N <= 128 and N % 8 == 0, f"N must be a multiple of 8 in [8, 128], but got {N}"
+    assert 8 <= N <= 256 and N % 8 == 0, f"N must be a multiple of 8 in [8, 256], but got {N}"
 
     assert isinstance(A, tlx.buffered_tensor), "input must be a buffered tensor"
     assert isinstance(B, tlx.buffered_tensor), "input must be a buffered tensor"
