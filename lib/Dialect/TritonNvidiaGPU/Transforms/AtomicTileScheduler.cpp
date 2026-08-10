@@ -24,6 +24,7 @@
 #include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonNvidiaGPU/Transforms/ClusterHandoff.h"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/Passes.h"
 
 #include <numeric>
@@ -340,16 +341,6 @@ public:
   }
 };
 
-static Value mapBarrierToRank(OpBuilder &builder, Location loc, Value barrier,
-                              Value rank) {
-  auto localTy = cast<ttg::MemDescType>(barrier.getType());
-  auto remoteTy = ttg::MemDescType::get(
-      localTy.getShape(), localTy.getElementType(), localTy.getEncoding(),
-      SharedClusterMemorySpaceAttr::get(builder.getContext()),
-      localTy.getMutableMemory(), localTy.getAllocShape());
-  return MapToRemoteBufferOp::create(builder, loc, remoteTy, barrier, rank);
-}
-
 static Value createPidSlot(OpBuilder &builder, Location loc) {
   MLIRContext *ctx = builder.getContext();
   auto cga = ttg::CGAEncodingAttr::get1CTALayout(ctx, /*rank=*/1);
@@ -358,36 +349,6 @@ static Value createPidSlot(OpBuilder &builder, Location loc) {
                                     ttg::SharedMemorySpaceAttr::get(ctx),
                                     /*mutableMemory=*/true);
   return ttg::LocalAllocOp::create(builder, loc, type);
-}
-
-// A marked claim may already live inside an AutoWS owner partition. Keep its
-// DSM state at function lifetime so every CTA initializes the same captures
-// before the partition starts using them.
-static Value createPersistentBarrierAlloc(ImplicitLocOpBuilder &builder,
-                                          int arriveCount) {
-  Value alloc = createScalarAlloc(builder, builder.getI64Type(), 1);
-  Value barrier = createSingleBufferView(builder, alloc, 0);
-  InitBarrierOp::create(builder, barrier, arriveCount);
-  return alloc;
-}
-
-// Partition regions are isolated from above. Late materialization therefore
-// has to extend the already-created warp_specialize capture list explicitly.
-static Value captureInWarpPartition(Value value, Operation *user) {
-  auto wsOp = user->getParentOfType<ttg::WarpSpecializeOp>();
-  if (!wsOp || wsOp.getDefaultRegion().isAncestor(user->getParentRegion()))
-    return value;
-
-  Value captured;
-  auto partOp = wsOp.getPartitionOp();
-  partOp->insertOperands(partOp.getNumOperands(), value);
-  for (Region *region : wsOp.getPartitionRegions()) {
-    BlockArgument arg = region->addArgument(value.getType(), value.getLoc());
-    if (region->isAncestor(user->getParentRegion()))
-      captured = arg;
-  }
-  assert(captured && "operation not found in a warp partition region");
-  return captured;
 }
 
 static LogicalResult materializeClaim(tt::AtomicRMWOp atomic, int clusterSize) {
@@ -406,6 +367,7 @@ static LogicalResult materializeClaim(tt::AtomicRMWOp atomic, int clusterSize) {
   int numWarps = ttg::lookupNumWarps(atomic);
   int threadsPerWarp = ttg::TritonGPUDialect::getThreadsPerWarp(
       atomic->getParentOfType<ModuleOp>());
+
   OpBuilder loopBuilder(loop);
   Value zero = arith::ConstantIntOp::create(loopBuilder, loc, 0, 32);
   scf::WhileOp newLoop = replaceWhileOpWithNewSignature(
@@ -415,10 +377,8 @@ static LogicalResult materializeClaim(tt::AtomicRMWOp atomic, int clusterSize) {
   ImplicitLocOpBuilder allocBuilder(loc, func);
   allocBuilder.setInsertionPointToStart(&func.getBody().front());
   Value pidSlot = createPidSlot(allocBuilder, loc);
-  Value fullAlloc =
-      createPersistentBarrierAlloc(allocBuilder, /*arriveCount=*/1);
-  Value emptyAlloc =
-      createPersistentBarrierAlloc(allocBuilder, /*arriveCount=*/clusterSize);
+  Value fullAlloc = createPersistentMBarrierAlloc(allocBuilder, 1);
+  Value emptyAlloc = createPersistentMBarrierAlloc(allocBuilder, clusterSize);
   Value fullBar = createSingleBufferView(allocBuilder, fullAlloc, 0);
   Value emptyBar = createSingleBufferView(allocBuilder, emptyAlloc, 0);
   pidSlot = captureInWarpPartition(pidSlot, atomic);
@@ -427,29 +387,24 @@ static LogicalResult materializeClaim(tt::AtomicRMWOp atomic, int clusterSize) {
 
   Value phaseBefore = newLoop.getBeforeArguments().back();
   Value phaseAfter = newLoop.getAfterArguments().back();
-  auto condition = newLoop.getConditionOp();
-  condition.getArgsMutable().append(phaseBefore);
+  newLoop.getConditionOp().getArgsMutable().append(phaseBefore);
 
   OpBuilder builder(atomic);
   Type i32 = builder.getI32Type();
   Value rank = nvgpu::ClusterCTAIdOp::create(builder, loc, i32);
   Value zeroI32 = arith::ConstantIntOp::create(builder, loc, 0, 32);
-  Value oneI32 = arith::ConstantIntOp::create(builder, loc, 1, 32);
   Value isLeader = arith::CmpIOp::create(builder, loc, arith::CmpIPredicate::eq,
                                          rank, zeroI32);
   tagOwner(rank.getDefiningOp());
   tagOwner(zeroI32.getDefiningOp());
-  tagOwner(oneI32.getDefiningOp());
   tagOwner(isLeader.getDefiningOp());
 
-  // The first opposite-phase wait passes immediately.  Later iterations wait
-  // until every CTA has consumed the previous PID before rank zero overwrites
-  // any slot.
+  Value oneI32 = arith::ConstantIntOp::create(builder, loc, 1, 32);
   Value emptyPhase = arith::XOrIOp::create(builder, loc, phaseAfter, oneI32);
+  tagOwner(oneI32.getDefiningOp());
   tagOwner(emptyPhase.getDefiningOp());
   auto emptyWait =
       WaitBarrierOp::create(builder, loc, emptyBar, emptyPhase, isLeader);
-  emptyWait->setAttr("acquireCluster", builder.getUnitAttr());
   tagOwner(emptyWait);
 
   auto ifLeader = scf::IfOp::create(builder, loc, TypeRange{}, isLeader,
@@ -469,29 +424,21 @@ static LogicalResult materializeClaim(tt::AtomicRMWOp atomic, int clusterSize) {
   Value baseTensor =
       tt::SplatOp::create(leaderBuilder, loc, valueType, leaderAtomic);
 
-  // Rank zero writes and signals its own slot locally. Under AutoWS the normal
-  // arrive rendezvous is scoped to the owner partition.
+  // Rank zero publishes the claimed PID to every CTA's handoff slot.
   ttg::LocalStoreOp::create(leaderBuilder, loc, baseTensor, pidSlot);
   ArriveBarrierOp::create(leaderBuilder, loc, fullBar, /*count=*/1);
-
-  // Every other CTA receives the same base through generic-proxy DSM.  The
-  // release arrive and acquire wait order the store/load, so no async-proxy
-  // fence is required.
   for (int target = 1; target < clusterSize; ++target) {
     Value targetRank =
         arith::ConstantIntOp::create(leaderBuilder, loc, target, 32);
     ttg::RemoteShmemStoreOp::create(leaderBuilder, loc, baseTensor, pidSlot,
                                     targetRank);
-    Value remoteFull =
-        mapBarrierToRank(leaderBuilder, loc, fullBar, targetRank);
-    ArriveBarrierOp::create(leaderBuilder, loc, remoteFull, /*count=*/1);
+    createRemoteMBarrierArrive(leaderBuilder, loc, fullBar, targetRank);
   }
   ifLeader.walk(tagOwner);
 
   builder.setInsertionPointAfter(ifLeader);
   tagOwner(ifLeader);
   auto fullWait = WaitBarrierOp::create(builder, loc, fullBar, phaseAfter);
-  fullWait->setAttr("acquireCluster", builder.getUnitAttr());
   tagOwner(fullWait);
   Value loaded =
       ttg::LocalLoadOp::create(builder, loc, valueType, pidSlot, Value());
@@ -501,13 +448,9 @@ static LogicalResult materializeClaim(tt::AtomicRMWOp atomic, int clusterSize) {
   tagOwner(base.getDefiningOp());
   tagOwner(pid.getDefiningOp());
 
-  // Signal consumption to rank zero.  The remote mbarrier release is ordered
-  // after the generic-proxy load and rank zero's next opposite-phase wait is
-  // the matching acquire.
-  Value remoteEmpty = mapBarrierToRank(builder, loc, emptyBar, zeroI32);
-  tagOwner(remoteEmpty.getDefiningOp());
   auto emptyArrive =
-      ArriveBarrierOp::create(builder, loc, remoteEmpty, /*count=*/1);
+      createRemoteMBarrierArrive(builder, loc, emptyBar, zeroI32);
+  tagOwner(emptyArrive.getAlloc().getDefiningOp());
   tagOwner(emptyArrive);
 
   atomic.getResult().replaceAllUsesWith(pid);
@@ -515,16 +458,11 @@ static LogicalResult materializeClaim(tt::AtomicRMWOp atomic, int clusterSize) {
 
   auto yield = newLoop.getYieldOp();
   OpBuilder yieldBuilder(yield);
-  Attribute yieldTaskIds = yield->getAttr("async_task_id");
-  Value onePhase =
-      arith::ConstantIntOp::create(yieldBuilder, yield.getLoc(), 1, 32);
-  Value toggled =
-      arith::XOrIOp::create(yieldBuilder, yield.getLoc(), phaseAfter, onePhase);
-  if (yieldTaskIds) {
-    onePhase.getDefiningOp()->setAttr("async_task_id", yieldTaskIds);
-    toggled.getDefiningOp()->setAttr("async_task_id", yieldTaskIds);
-  }
-  yield.getResultsMutable().append(toggled);
+  Value nextPhase =
+      arith::XOrIOp::create(yieldBuilder, yield.getLoc(), phaseAfter, oneI32);
+  if (Attribute yieldTaskIds = yield->getAttr("async_task_id"))
+    nextPhase.getDefiningOp()->setAttr("async_task_id", yieldTaskIds);
+  yield.getResultsMutable().append(nextPhase);
   return success();
 }
 

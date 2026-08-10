@@ -845,6 +845,7 @@ def test_tutorial09_dynamic_2cta_without_warp_specialization(device):
     ttgir = kernel.asm["ttgir"]
     assert "ttg.warp_specialize" not in ttgir
     assert "ttg.remote_shmem_store" in ttgir
+    assert "ttng.cluster_barrier" not in ttgir
     assert "ttng.map_to_remote_buffer" in ttgir
     ref = torch.matmul(a.to(torch.float32), b.T.to(torch.float32)).to(dtype)
     torch.testing.assert_close(c, ref, atol=0.03, rtol=0.03)
@@ -1384,6 +1385,7 @@ _UNIFIED_OUTER_AUTOWS_CONFIGS = [
     pytest.param(tl.ClcTileScheduler, 128, 128, 1, 1, 1, False, False, 1, True, id="clc-subtile-1"),
     pytest.param(tl.ClcTileScheduler, 128, 128, 2, 1, 1, False, False, 1, True, id="clc-subtile-2"),
     pytest.param(tl.ClcTileScheduler, 128, 128, 4, 1, 1, False, False, 1, True, id="clc-subtile-4"),
+    pytest.param(tl.ClcTileScheduler, 256, 256, 1, 2, 2, False, True, 1, True, id="clc-2cta-data-partition-2"),
 ]
 
 
@@ -1408,9 +1410,6 @@ def test_tutorial09_matmul_tma_unified_persistent_while_loop_warp_specialize(
     """Exercise outer-loop AutoWS with each unified scheduler."""
     if blackwell_only and not is_blackwell():
         pytest.skip("Subtiled regions, BLOCK_M=256 data partitioning, and 2-CTA require Blackwell")
-    if NUM_CTAS == 2 and SCHEDULE is tl.ClcTileScheduler:
-        pytest.skip("The combined 2-CTA MMA + CLC configuration is not covered here")
-
     M, N, K = 2048, 2048, 256
     BLOCK_SIZE_K = 64
     GROUP_SIZE_M = 8
@@ -1521,11 +1520,15 @@ def test_tutorial09_matmul_tma_unified_persistent_while_loop_warp_specialize(
         assert "ttng.async_tma_copy_global_to_local" in ttgir, "Expected TMA copy"
         if SCHEDULE is not tl.ClcTileScheduler:
             assert "ttng.clc_" not in ttgir, "Expected non-CLC scheduling"
+        elif NUM_CTAS == 2:
+            assert "ttng.cluster_barrier" not in ttgir
+            assert "ttng.map_to_remote_buffer" in ttgir
         if SCHEDULE is tl.DynamicPersistent1DScheduler:
             assert "atomic" in ttgir, "Expected an atomic op driving the dynamic tile id"
             if NUM_CTAS == 2:
                 assert "ttg.remote_shmem_store" in ttgir, "Expected the cluster leader to distribute the claimed PID"
-                assert "ttng.map_to_remote_buffer" in ttgir, "Expected cluster-scoped PID handoff barriers"
+                assert "ttng.cluster_barrier" not in ttgir
+                assert "ttng.map_to_remote_buffer" in ttgir
 
         mma_op = "ttng.tc_gen5_mma" if is_blackwell() else "ttng.warp_group_dot"
         assert ttgir.count(mma_op) >= DATA_PARTITION_FACTOR, "Expected one MMA per data partition"

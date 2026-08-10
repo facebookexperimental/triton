@@ -91,12 +91,22 @@ NVIDIA backend adds a second protocol without changing
    with a rank-zero `atomic_add(counter, K)`. Rank zero publishes the returned
    base PID to the other `K-1` CTAs through generic-proxy DSM stores; every CTA
    uses `base + cluster_cta_rank`. The same late pass handles non-WS kernels.
-4. A ready barrier per CTA and a full-cluster reuse barrier on rank zero keep
-   the DSM slot phase-safe across persistent iterations. Under AutoWS, ordinary
-   arrive rendezvous are scoped to the owner partition. Remote arrivals use
-   release-cluster semantics and the matching local waits use acquire-cluster
-   semantics; this release/acquire protocol orders the generic-proxy DSM
-   stores/loads without an async-proxy fence.
+4. Full/empty mbarriers use TLX's existing remote-arrive/local-wait protocol to
+   publish the PID and protect slot reuse. Inside AutoWS they live in the
+   run-once owner partition, so compute partitions do not rendezvous; the owner
+   forwards the PID into the existing buffered AutoWS channel.
+
+The atomic and CLC late materializers share only the utility needed to capture
+function-lifetime handoff storage into an already-isolated owner partition.
+They reuse existing cluster and mbarrier operations rather than adding an
+atomic-specific wait mode. CLC's hardware multicast completion remains an
+ordinary local mbarrier wait, and its response reuse uses TLX's
+remote-arrive/local-wait pattern.
+
+The handoff is deliberately inserted after code partitioning, inside the
+run-once owner partition in each CTA. The owner copies the received tile ID into
+the existing multi-buffered AutoWS SMEM channel, and generic code partitioning
+distributes it without involving compute partitions in cross-CTA synchronization.
 
 This applies to the product of all explicit `ctas_per_cga` dimensions, including
 `(2,2)` and `(4,1)`. The kernel owns the mapping from the resulting linear PID

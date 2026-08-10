@@ -480,8 +480,7 @@ def TTNG_WaitBarrierOp
     its current phase.
 
     This lowers a waitloop using PTX instruction
-    mbarrier.try_wait.parity.shared::cta.b64. `acquireCluster` upgrades the
-    wait to acquire semantics at cluster scope for data published through DSM.
+    mbarrier.try_wait.parity.shared::cta.b64.
 
     Accepts an optional list of memory dependencies. If present, it is assumed
     that any of the dependencies may be accessed until the barrier completes.
@@ -494,28 +493,22 @@ def TTNG_WaitBarrierOp
       (ins Arg<TTG_MemDescType,
                "", [MemRead<SharedMemory>, MemWrite<SharedMemory>]>:$alloc,
           I32:$phase, Optional<I1>:$pred, Variadic<TTG_MemDescType>:$deps,
-          UnitAttr:$acquireCluster,
           OptionalAttr<DictionaryAttr>:$constraints);
 
   let builders =
       [OpBuilder<(ins "Value":$alloc, "Value":$phase), [{
-    build($_builder, $_state, alloc, phase, /*pred=*/static_cast<mlir::Value>(nullptr), /*deps=*/{}, /*acquireCluster=*/false, /*constraints=*/DictionaryAttr());
+    build($_builder, $_state, alloc, phase, /*pred=*/static_cast<mlir::Value>(nullptr), /*deps=*/{}, /*constraints=*/DictionaryAttr());
     }]>,
        OpBuilder<(ins "Value":$alloc, "Value":$phase, "Value":$pred), [{
-    build($_builder, $_state, alloc, phase, pred, /*deps=*/{}, /*acquireCluster=*/false, /*constraints=*/DictionaryAttr());
+    build($_builder, $_state, alloc, phase, pred, /*deps=*/{}, /*constraints=*/DictionaryAttr());
     }]>,
        OpBuilder<(ins "Value":$alloc, "Value":$phase, "ValueRange":$deps), [{
-    build($_builder, $_state, alloc, phase, /*pred=*/static_cast<mlir::Value>(nullptr), deps, /*acquireCluster=*/false, /*constraints=*/DictionaryAttr());
+    build($_builder, $_state, alloc, phase, /*pred=*/static_cast<mlir::Value>(nullptr), deps, /*constraints=*/DictionaryAttr());
     }]>,
        OpBuilder<(ins "Value":$alloc, "Value":$phase, "Value":$pred,
                      "ValueRange":$deps),
                  [{
-    build($_builder, $_state, alloc, phase, pred, deps, /*acquireCluster=*/false, /*constraints=*/DictionaryAttr());
-    }]>,
-       OpBuilder<(ins "Value":$alloc, "Value":$phase, "Value":$pred,
-                     "ValueRange":$deps, "DictionaryAttr":$constraints),
-                 [{
-    build($_builder, $_state, alloc, phase, pred, deps, /*acquireCluster=*/false, constraints);
+    build($_builder, $_state, alloc, phase, pred, deps, /*constraints=*/DictionaryAttr());
     }]>,
   ];
 

@@ -1,5 +1,5 @@
 // RUN: triton-opt %s -split-input-file --triton-nvidia-check-matmul-two-cta --verify-diagnostics | FileCheck %s
-// RUN: triton-opt %s -split-input-file --triton-nvidia-check-matmul-two-cta --triton-nvidia-gpu-atomic-tile-scheduler-prepare --triton-nvidia-gpu-atomic-tile-scheduler-materialize --verify-diagnostics | FileCheck %s --check-prefix=ATOMIC
+// RUN: triton-opt %s -split-input-file --triton-nvidia-check-matmul-two-cta --triton-nvidia-gpu-atomic-tile-scheduler-prepare --triton-nvidia-gpu-atomic-tile-scheduler-materialize --triton-nvidia-gpu-clc-split --triton-nvidia-gpu-clc-materialize --verify-diagnostics | FileCheck %s --check-prefix=ATOMIC
 
 #shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
 #shared1 = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = true, elementBitWidth = 16}>
@@ -63,11 +63,12 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // ATOMIC: arith.addi {{.*}}, %[[SEED_RANK]]
 // ATOMIC: scf.while
 // ATOMIC: %[[RANK:[0-9]+]] = nvg.cluster_id
-// ATOMIC: ttng.wait_barrier {{.*}}acquireCluster
+// ATOMIC: ttng.wait_barrier
 // ATOMIC: scf.if
 // ATOMIC-COUNT-1: tt.atomic_rmw add, acq_rel, gpu, {{.*}}, %c4_i32
 // ATOMIC-COUNT-3: ttg.remote_shmem_store
-// ATOMIC: ttng.wait_barrier {{.*}}acquireCluster
+// ATOMIC: ttng.wait_barrier
+// ATOMIC: ttg.local_load
 // ATOMIC: arith.addi {{.*}}, %[[RANK]]
 // ATOMIC: ttng.map_to_remote_buffer
 // ATOMIC: ttng.arrive_barrier
@@ -122,6 +123,33 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
       %dot = tt.dot %a, %b, %acc {two_ctas} : tensor<128x64xf16> * tensor<64x128xf16> -> tensor<128x128xf32>
       %next = tt.atomic_rmw add, acq_rel, gpu, %counter, %c1, %true : (!tt.ptr<i32>, i32, i1) -> i32
       scf.yield %next : i32
+    }
+    tt.return
+  }
+}
+
+// -----
+
+// CLC uses TLX's remote-arrive/local-wait mbarrier protocol for response reuse.
+// ATOMIC-LABEL: @clustered_clc_scheduler
+// ATOMIC: ttng.init_barrier {{.*}}, 1
+// ATOMIC: ttng.init_barrier {{.*}}, 2
+// ATOMIC: scf.while
+// ATOMIC: ttng.wait_barrier
+// ATOMIC: ttng.clc_try_cancel
+// ATOMIC: ttng.wait_barrier
+// ATOMIC: ttng.map_to_remote_buffer
+// ATOMIC: ttng.arrive_barrier
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32, "ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32} {
+  tt.func @clustered_clc_scheduler() {
+    %true = arith.constant true
+    %c0 = arith.constant 0 : i32
+    %result:4 = scf.while (%valid = %true, %x = %c0, %y = %c0, %z = %c0) : (i1, i32, i32, i32) -> (i1, i32, i32, i32) {
+      scf.condition(%valid) %valid, %x, %y, %z : i1, i32, i32, i32
+    } do {
+    ^bb0(%valid: i1, %x: i32, %y: i32, %z: i32):
+      %next_valid, %next_x, %next_y, %next_z = ttng.clc_advance : i1, i32, i32, i32
+      scf.yield %next_valid, %next_x, %next_y, %next_z : i1, i32, i32, i32
     }
     tt.return
   }

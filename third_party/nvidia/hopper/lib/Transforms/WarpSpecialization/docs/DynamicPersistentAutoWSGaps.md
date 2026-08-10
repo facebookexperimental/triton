@@ -211,6 +211,10 @@ tutorial matrix includes clustered dynamic scheduling under Meta AutoWS. A
 second Blackwell runtime test covers the standalone non-WS lowering. Additional
 cluster shapes remain coverage work, not a frontend API gap.
 
+The same unified matrix now covers 2-CTA CLC under Meta AutoWS. Atomic and CLC
+reuse TLX's remote-arrive/local-wait mbarrier pattern for publication and
+handoff-storage reuse without adding a new wait semantic.
+
 ## Frontend and Configuration Gaps
 
 The unified outer-while path now has Blackwell end-to-end coverage for

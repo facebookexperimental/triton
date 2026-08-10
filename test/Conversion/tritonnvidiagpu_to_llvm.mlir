@@ -138,13 +138,6 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
     tt.return
   }
 
-  // CHECK-LABEL: wait_barrier_acquire_cluster
-  tt.func @wait_barrier_acquire_cluster(%alloc: !ttg.memdesc<1xi64, #shared0, #smem>, %phase: i32) {
-    // CHECK: mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64
-    ttng.wait_barrier %alloc, %phase {acquireCluster} : !ttg.memdesc<1xi64, #shared0, #smem>
-    tt.return
-  }
-
   // CHECK-LABEL: arrive_barrier_per_thread_remote
   tt.func @arrive_barrier_per_thread_remote(%alloc: !ttg.memdesc<1xi64, #shared0, #ttng.shared_cluster_memory>) {
     // CHECK-NOT: nvvm.read.ptx.sreg.tid.x

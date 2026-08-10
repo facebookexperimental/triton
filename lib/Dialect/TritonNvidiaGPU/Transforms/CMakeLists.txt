@@ -1,5 +1,6 @@
 add_triton_library(TritonNvidiaGPUTransforms
   AtomicTileScheduler.cpp
+  ClusterHandoff.cpp
   ClusterBarrierMbarAllocator.cpp
   ClusterBarrierInsertion.cpp
   CheckMatmulTwoCTAs.cpp

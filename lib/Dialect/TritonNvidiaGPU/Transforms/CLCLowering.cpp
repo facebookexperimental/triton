@@ -25,6 +25,7 @@
 #include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonNvidiaGPU/Transforms/ClusterHandoff.h"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/Passes.h"
 
 namespace mlir {
@@ -43,13 +44,6 @@ namespace {
 // A CLC response is 16 bytes; the low-level ops require a rank-1 memdesc of
 // exactly 2 x i64 (see verifyCLCResultMemdesc).
 constexpr int kClcResponseBytes = 16;
-
-int getExplicitClusterSize(ModuleOp mod) {
-  if (ttg::TritonGPUDialect::getNumCTAs(mod) != 1)
-    return 1;
-  auto dims = ttg::TritonGPUDialect::getClusterDims(mod);
-  return dims[0] * dims[1] * dims[2];
-}
 
 Value createClcResponseAlloc(OpBuilder &b, Location loc) {
   MLIRContext *ctx = b.getContext();
@@ -158,7 +152,7 @@ struct CLCMaterializePass
     Location loc = read.getLoc();
     OpBuilder b(whileOp);
     Type i32 = b.getI32Type();
-    int clusterSize = getExplicitClusterSize(read->getParentOfType<ModuleOp>());
+    int clusterSize = getPhysicalClusterInfo(read).size;
 
     // Loop-carried phase, initialized to 0.
     Value zero =
@@ -167,19 +161,26 @@ struct CLCMaterializePass
         replaceWhileOpWithNewSignature(b, whileOp, {zero}, {i32});
     whileOp->erase();
 
-    // Response buffer + completion mbarrier, allocated before the loop. The
-    // barrier ops take a single-buffer view of the (1-deep) barrier allocation.
-    // Explicit clusters also use a second barrier to rendezvous before reuse.
-    b.setInsertionPoint(newLoop);
-    Value resp = createClcResponseAlloc(b, loc);
-    Value barAlloc = createBarrierAlloc(newLoop, /*numBarriers=*/1);
-    Value bar = createSingleBufferView(b, barAlloc, 0);
+    // Keep the response and barriers at function lifetime. If AutoWS placed
+    // the fetch in an isolated owner partition, capture them explicitly.
+    auto func = read->getParentOfType<FuncOp>();
+    ImplicitLocOpBuilder allocBuilder(loc, func);
+    allocBuilder.setInsertionPointToStart(&func.getBody().front());
+    Value resp = createClcResponseAlloc(allocBuilder, loc);
+    Value barAlloc =
+        createScalarAlloc(allocBuilder, allocBuilder.getI64Type(), 1);
+    Value bar = createSingleBufferView(allocBuilder, barAlloc, 0);
+    InitBarrierOp::create(allocBuilder, bar, /*count=*/1);
     Value emptyBar;
     if (clusterSize > 1) {
-      Value emptyBarAlloc =
-          createBarrierAlloc(newLoop, /*numBarriers=*/1, clusterSize);
-      emptyBar = createSingleBufferView(b, emptyBarAlloc, 0);
+      Value emptyAlloc =
+          createPersistentMBarrierAlloc(allocBuilder, clusterSize);
+      emptyBar = createSingleBufferView(allocBuilder, emptyAlloc, 0);
     }
+    resp = captureInWarpPartition(resp, read);
+    bar = captureInWarpPartition(bar, read);
+    if (emptyBar)
+      emptyBar = captureInWarpPartition(emptyBar, read);
 
     // Forward the phase from the before-region into the after-region and read
     // it back as the wait phase.
@@ -192,9 +193,6 @@ struct CLCMaterializePass
     // Materialize the issue: barrier_expect + clc_try_cancel.
     OpBuilder ib(issue);
     if (emptyBar) {
-      // The first wait passes immediately because an initialized mbarrier has
-      // phase 0. Later waits block until every CTA has consumed the previous
-      // multicast response and arrived on the lead CTA's empty barrier.
       Value rank =
           mlir::triton::nvgpu::ClusterCTAIdOp::create(ib, issue.getLoc(), i32);
       Value zero = arith::ConstantIntOp::create(ib, issue.getLoc(), 0, 32);
@@ -218,24 +216,10 @@ struct CLCMaterializePass
     Value x = CLCGetProgramIdOp::create(rb, loc, clcResult, 0);
     Value y = CLCGetProgramIdOp::create(rb, loc, clcResult, 1);
     Value z = CLCGetProgramIdOp::create(rb, loc, clcResult, 2);
-    if (emptyBar) {
-      // Remote mbarrier waits are illegal, so all CTAs arrive on rank zero's
-      // empty barrier and only rank zero waits on its local view above. Skip
-      // the final arrival when cancellation failed because the loop exits and
-      // the response storage will not be reused.
-      // TODO: Represent this response-buffer release with an explicit op that
-      // links resp and emptyBar, then let ProxyFenceInsertion place the fence.
+    if (clusterSize > 1) {
       FenceAsyncSharedOp::create(rb, loc, /*bCluster=*/false);
       Value zero = arith::ConstantIntOp::create(rb, loc, 0, 32);
-      auto emptyBarTy = cast<ttg::MemDescType>(emptyBar.getType());
-      auto remoteBarTy = ttg::MemDescType::get(
-          emptyBarTy.getShape(), emptyBarTy.getElementType(),
-          emptyBarTy.getEncoding(),
-          SharedClusterMemorySpaceAttr::get(rb.getContext()),
-          emptyBarTy.getMutableMemory(), emptyBarTy.getAllocShape());
-      Value remoteEmptyBar =
-          MapToRemoteBufferOp::create(rb, loc, remoteBarTy, emptyBar, zero);
-      ArriveBarrierOp::create(rb, loc, remoteEmptyBar, /*count=*/1, isValid);
+      createRemoteMBarrierArrive(rb, loc, emptyBar, zero, isValid);
     }
     read->replaceAllUsesWith(ValueRange{isValid, x, y, z});
     read->erase();
