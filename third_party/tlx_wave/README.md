@@ -83,7 +83,7 @@ closed responsibility:
 | Stage | Main modules | Responsibility |
 | --- | --- | --- |
 | Source import | [`source_import.py`](backend/converter/source_import.py), [`source_ir.py`](backend/converter/source_ir.py) | Copy kernel, region, operation, value, type, and attribute data out of TTGIR. Source MLIR handles do not cross this boundary. |
-| Type and layout conversion | [`types.py`](backend/converter/types.py), [`layouts.py`](backend/converter/layouts.py), [`coordinates.py`](backend/converter/coordinates.py) | Choose Wave value representations and mechanically serialize source layout structure. |
+| Type and layout conversion | [`types.py`](backend/converter/types.py), [`layouts.py`](backend/converter/layouts.py) | Choose Wave value representations and derive proved serialized relations from source layouts. |
 | Fact analysis | [`facts.py`](backend/converter/facts.py) | Record proven ranges, divisibility, affine coordinates, and pointer byte ranges with provenance. It does not assume integer arithmetic is non-overflowing without proof. |
 | Token analysis | [`tokens.py`](backend/converter/tokens.py) | Build async groups, memory effects, users, and structured-control-flow token carries. This is the sole owner of source dependency analysis. |
 | Operation conversion | [`op_conversion.py`](backend/converter/op_conversion.py), [`domains.py`](backend/converter/domains.py) | Rewrite source operations into a schema-closed `TargetProgram` with explicit operands, results, attributes, regions, facts, layouts, and event domains. |

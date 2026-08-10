@@ -4,9 +4,11 @@ from dataclasses import dataclass
 
 from triton._C.libtriton import linear_layout as _linear_layout
 
-LinearLayout = _linear_layout.LinearLayout
-
+from ..wave_bridge_tools import load_wave_dsl
 from .diagnostics import fail
+from .layout_domains import _is_power_of_two, classify_coordinate_domain
+
+LinearLayout = _linear_layout.LinearLayout
 
 STAGE = "type_layout"
 
@@ -22,6 +24,9 @@ class LayoutMap:
     lane_width: int
     properties: dict
     linear_layout: object | None = None
+    component_grid: tuple[int, int] | None = None
+    component_relation: tuple[int, ...] | None = None
+    active_relation: tuple[int, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -46,50 +51,24 @@ def mfma_instruction_spec(instr_shape):
 
 
 @dataclass(frozen=True)
-class PhysicalOffsetRecord:
-    element_offset: int
-    byte_offset: int
-    dword_offset: int | None
-    element_byte_width: int
-    layout_kind: str
-    order: tuple[int, ...]
-    logical_coords: tuple[int, ...]
-    logical_linear_offset: int
-    bindings: tuple[str, ...] = ()
-    assumptions: tuple[str, ...] = ()
-    proof_status: str = "static"
-    provenance: str = "shared_physical_offset"
+class _SharedAddressMap:
+    linear_layout: object
+    prefix_shape: tuple[int, ...]
+    inner_shape: tuple[int, ...]
 
 
 @dataclass(frozen=True)
-class PhysicalOffsetExpressionPlan:
-    expression_kind: str
-    offset_unit: str
-    element_byte_width: int
-    layout_kind: str
-    order: tuple[int, ...]
-    bindings: tuple[str, ...] = ("logical_coords", )
-    assumptions: tuple[str, ...] = ()
-    proof_status: str = "symbolic_verified"
-    provenance: str = "shared_physical_offset"
-    intervals: tuple[int, ...] = ()
-    paddings: tuple[int, ...] = ()
-    swizzled_vec: int | None = None
-    swizzled_per_phase: int | None = None
-    swizzled_max_phase: int | None = None
-    linear_component_bases: tuple[tuple[int, ...], ...] = ()
-    linear_inverse_offset_bases: tuple[tuple[int, ...], ...] = ()
+class _MmaComponentModel:
+    component_count: int
+    grid: tuple[int, int]
+    relation: tuple[int, ...]
 
 
-def build_layout_map(layout_map_id, value_id, source_type, lane_width):
+def build_layout_map(layout_map_id, value_id, source_type, lane_width, warp_count=1, block_count=1):
     if source_type.kind not in {"tensor", "memdesc"}:
         return None
     attr = source_type.encoding_attr
-    kind, properties = _layout_kind_and_properties(
-        attr,
-        value_id,
-        encoding=str(source_type.encoding or ""),
-    )
+    kind, properties = _layout_kind_and_properties(attr, value_id, encoding=str(source_type.encoding or ""))
     distributed_kinds = {
         "amd_mfma",
         "blocked",
@@ -98,39 +77,45 @@ def build_layout_map(layout_map_id, value_id, source_type, lane_width):
         "linear",
         "slice",
     }
-    linear_layout = (distributed_linear_layout_from_parts(
-        kind,
-        source_type.shape,
-        properties,
-        lane_width,
-        source_value_id=value_id,
-    ) if kind in distributed_kinds else None)
-    if kind in {"blocked", "linear", "generic_linear"}:
-        coordinate_domain = _layout_coordinate_domain(
-            kind,
-            source_type.shape,
-            properties,
-            lane_width,
-            value_id,
-            linear=linear_layout,
-        )
-        _require_supported_coordinate_domain(
-            kind,
-            source_type.shape,
-            properties,
-            coordinate_domain,
-            value_id,
-        )
+    canonical_shape = tuple(source_type.shape)
+    if source_type.kind == "memdesc" and source_type.alloc_shape:
+        canonical_shape = tuple(source_type.alloc_shape[-len(source_type.shape):])
+    if kind in distributed_kinds:
+        linear_layout = _linear_layout.to_linear_layout(canonical_shape, attr)
+    elif kind in {"shared_linear", "swizzled_shared"}:
+        component_rank = len(properties["order"])
+        if component_rank <= 0 or component_rank > len(canonical_shape):
+            fail(
+                "TLXW_TYPE_MALFORMED_LAYOUT",
+                STAGE,
+                "shared layout rank does not fit the allocation shape",
+                source_value_id=value_id,
+            )
+        linear_layout = _linear_layout.to_linear_layout(canonical_shape[-component_rank:], attr)
+    elif kind == "padded_shared":
+        # Padding is composed after the canonical linear component.
+        linear_layout = properties["linear_component"]
+    else:
+        linear_layout = None
+    mma_model = None
+    if kind in {"amd_mfma", "dot_operand"}:
+        mma_model = _mma_component_model(kind, source_type.element_type, properties, linear_layout,
+                                         source_value_id=value_id)
+        component_count = int(mma_model.component_count)
+    elif kind in {"blocked", "linear", "generic_linear"}:
+        coordinate_domain = classify_coordinate_domain(source_type.shape, lane_width, linear=linear_layout)
+        _require_supported_coordinate_domain(source_type.shape, coordinate_domain, value_id)
         properties = {**properties, "coordinate_domain": coordinate_domain}
         component_count = int(coordinate_domain["component_count"])
     else:
-        component_count = _layout_component_count(
-            source_type,
-            kind,
-            properties,
-            lane_width,
-            value_id,
-        )
+        component_count = _layout_component_count(source_type, lane_width, linear_layout)
+    active_relation = (_distributed_active_relation(
+        linear_layout,
+        lane_width=int(lane_width),
+        warp_count=int(warp_count),
+        block_count=int(block_count),
+        source_value_id=value_id,
+    ) if kind in distributed_kinds else None)
     return LayoutMap(
         layout_map_id,
         value_id,
@@ -141,6 +126,9 @@ def build_layout_map(layout_map_id, value_id, source_type, lane_width):
         int(lane_width),
         properties,
         linear_layout,
+        None if mma_model is None else mma_model.grid,
+        None if mma_model is None else mma_model.relation,
+        active_relation,
     )
 
 
@@ -149,18 +137,10 @@ def _layout_kind_and_properties(attr, value_id, *, encoding=None):
         return "none", {}
     if _attr_bool(attr, "is_tlx_no_verify_layout"):
         inner = _attr_value(attr, "get_tlx_no_verify_layout")
-        return _layout_kind_and_properties(
-            inner,
-            value_id,
-            encoding=str(inner),
-        )
+        return _layout_kind_and_properties(inner, value_id, encoding=str(inner))
     if _attr_bool(attr, "is_tlx_user_layout"):
         inner = _attr_value(attr, "get_tlx_user_layout")
-        return _layout_kind_and_properties(
-            inner,
-            value_id,
-            encoding=str(inner),
-        )
+        return _layout_kind_and_properties(inner, value_id, encoding=str(inner))
     if _attr_bool(attr, "is_blocked_encoding"):
         return "blocked", {
             "size_per_thread": _int_tuple(_attr_value(attr, "get_blocked_size_per_thread")),
@@ -179,11 +159,7 @@ def _layout_kind_and_properties(attr, value_id, *, encoding=None):
         }
     if _attr_bool(attr, "is_slice_encoding"):
         parent = _attr_value(attr, "get_slice_parent")
-        parent_kind, parent_properties = _layout_kind_and_properties(
-            parent,
-            value_id,
-            encoding=str(parent or ""),
-        )
+        parent_kind, parent_properties = _layout_kind_and_properties(parent, value_id, encoding=str(parent or ""))
         return "slice", {
             "dim": int(_attr_value(attr, "get_slice_dim")),
             "parent_kind": parent_kind,
@@ -191,11 +167,7 @@ def _layout_kind_and_properties(attr, value_id, *, encoding=None):
         }
     if _attr_bool(attr, "is_dot_operand_encoding"):
         parent = _attr_value(attr, "get_dot_operand_parent")
-        parent_kind, parent_properties = _layout_kind_and_properties(
-            parent,
-            value_id,
-            encoding=str(parent or ""),
-        )
+        parent_kind, parent_properties = _layout_kind_and_properties(parent, value_id, encoding=str(parent or ""))
         return "dot_operand", {
             "op_idx": int(_attr_value(attr, "get_dot_operand_op_idx")),
             "k_width": int(_attr_value(attr, "get_dot_operand_k_width")),
@@ -229,131 +201,361 @@ def _layout_kind_and_properties(attr, value_id, *, encoding=None):
             "intervals": _int_tuple(_attr_value(attr, "get_padded_shared_intervals")),
             "paddings": _int_tuple(_attr_value(attr, "get_padded_shared_paddings")),
             "order": _int_tuple(_attr_value(attr, "get_padded_shared_order")),
-            "linear_component": _attr_value(
-                attr,
-                "get_padded_shared_linear_component",
-            ),
+            "linear_component": _attr_value(attr, "get_padded_shared_linear_component"),
         }
-    fail(
-        "TLXW_TYPE_UNSUPPORTED_LAYOUT",
-        STAGE,
-        f"unsupported layout encoding {attr}",
-        source_value_id=value_id,
-    )
+    fail("TLXW_TYPE_UNSUPPORTED_LAYOUT", STAGE, f"unsupported layout encoding {attr}", source_value_id=value_id)
 
 
-def _layout_component_count(source_type, kind, properties, lane_width, value_id):
-    if kind in {"blocked", "linear", "generic_linear"}:
-        coordinate_domain = _layout_coordinate_domain(
-            kind,
-            source_type.shape,
-            properties,
-            lane_width,
-            source_value_id=value_id,
-        )
-        _require_supported_coordinate_domain(
-            kind,
-            source_type.shape,
-            properties,
-            coordinate_domain,
-            value_id,
-        )
-        return int(coordinate_domain["component_count"])
-    if kind == "dot_operand":
-        parent_properties = properties.get("parent_properties", {})
-        instr_shape = parent_properties.get("instr_shape", ())
-        warps_per_cta = parent_properties.get("warps_per_cta", ())
-        if len(instr_shape) >= 3 and len(warps_per_cta) >= 2 and len(source_type.shape) >= 2:
-            k_tile_extent = dot_operand_storage_k_tile_extent(
-                source_type.element_type,
-                properties,
-            )
-            op_idx = int(properties.get("op_idx", -1))
-            if op_idx == 0:
-                m_tiles = _per_wave_tile_count(
-                    int(source_type.shape[0]),
-                    int(instr_shape[0]),
-                    int(warps_per_cta[0]),
-                )
-                k_tiles = _ceil_div(int(source_type.shape[1]), k_tile_extent)
-                return m_tiles * k_tiles
-            if op_idx == 1:
-                n_tiles = _per_wave_tile_count(
-                    int(source_type.shape[1]),
-                    int(instr_shape[1]),
-                    int(warps_per_cta[1]),
-                )
-                k_tiles = _ceil_div(int(source_type.shape[0]), k_tile_extent)
-                return n_tiles * k_tiles
-        return 1
-    if kind == "slice":
-        parent_kind = properties.get("parent_kind")
-        parent_properties = properties.get("parent_properties", {})
-        if parent_kind in {
-                "blocked",
-                "linear",
-                "generic_linear",
-                "slice",
-                "amd_mfma",
-                "dot_operand",
-        }:
-            dim = int(properties.get("dim", 0))
-            shape = tuple(int(value) for value in source_type.shape)
-            if dim < 0 or dim > len(shape):
-                _layout_fail(
-                    "TLXW_TYPE_MALFORMED_LAYOUT",
-                    STAGE,
-                    "slice layout dimension is outside the parent rank",
-                    source_value_id=value_id,
-                )
-            parent_shape = list(shape)
-            parent_shape.insert(dim, 1)
-            if parent_kind == "amd_mfma":
-                return _mfma_component_count(
-                    tuple(parent_shape),
-                    parent_properties,
-                    lane_width,
-                    source_value_id=value_id,
-                )
-            linear = distributed_linear_layout_from_parts(
-                kind,
-                shape,
-                properties,
-                lane_width,
-                source_value_id=value_id,
-            )
-            return linear_layout_in_dim_size(linear, "register")
-    if kind == "amd_mfma":
-        return _mfma_component_count(
-            source_type.shape,
-            properties,
-            lane_width,
-            source_value_id=value_id,
-        )
+def _layout_component_count(source_type, lane_width, linear):
+    if linear is not None:
+        return linear_layout_in_dim_size(linear, "register")
     element_count = _product(source_type.shape)
     return max(1, _ceil_div(element_count, int(lane_width)))
 
 
-def distributed_register_count(
+def _mma_fragment_abi(
     kind,
-    shape,
+    element_type,
     properties,
-    lane_width,
+    lane_count,
     *,
     stage=STAGE,
+    diagnostic="TLXW_TYPE_MALFORMED_LAYOUT",
     source_op_index=None,
     source_value_id=None,
 ):
-    linear = distributed_linear_layout_from_parts(
+
+    def reject(message):
+        _layout_fail(diagnostic, stage, message, source_op_index=source_op_index, source_value_id=source_value_id)
+
+    if kind == "amd_mfma":
+        instr_shape = tuple(int(value) for value in properties.get("instr_shape", ()))
+        op_idx = None
+    elif kind == "dot_operand":
+        parent = properties.get("parent_properties", {})
+        instr_shape = tuple(int(value) for value in parent.get("instr_shape", ()))
+        op_idx = int(properties.get("op_idx", -1))
+    else:
+        reject("MFMA component model requires an accumulator or operand layout")
+    spec = mfma_instruction_spec(instr_shape)
+    if spec is None or len(instr_shape) != 3 or (op_idx is not None and op_idx not in (0, 1)):
+        reject("MFMA fragment quotient requires a supported instruction ABI")
+
+    lane_count = int(lane_count)
+    if lane_count <= 0:
+        reject("MFMA instruction ABI requires a nonempty lane domain")
+
+    if kind == "amd_mfma":
+        fragment = (int(spec.rows), int(spec.columns))
+        if _product(fragment) % lane_count:
+            reject("MFMA accumulator fragment does not divide the lane domain")
+        payload_elements = _product(fragment) // lane_count
+        payload_element_bits = 32
+        payload_registers = int(spec.accumulator_registers)
+    else:
+        element_bits = {
+            "bf16": 16,
+            "f16": 16,
+            "i8": 8,
+        }.get(str(element_type))
+        if element_bits is None or element_type not in spec.operand_element_types:
+            reject("MFMA operand fragment payload type is not supported by the instruction ABI")
+        payload_element_bits = int(element_bits)
+        payload_registers = int(spec.operand_registers)
+        payload_bits = payload_registers * 32
+        if payload_bits % payload_element_bits:
+            reject("MFMA operand register payload does not contain whole elements")
+        payload_elements = payload_bits // payload_element_bits
+        fragment_elements = payload_elements * lane_count
+        fragment = [0, 0]
+        fragment[op_idx] = int(instr_shape[op_idx])
+        if fragment_elements % fragment[op_idx]:
+            reject("MFMA operand payload does not form an integral instruction fragment")
+        fragment[1 - op_idx] = fragment_elements // fragment[op_idx]
+        fragment = tuple(fragment)
+
+    if (payload_elements <= 0 or not _is_power_of_two(payload_elements)
+            or payload_elements * payload_element_bits != payload_registers * 32
+            or any(extent <= 0 or not _is_power_of_two(extent) for extent in fragment)):
+        reject("MFMA instruction ABI does not define a binary physical fragment")
+    return payload_elements, payload_element_bits, payload_registers, fragment
+
+
+def _mma_component_model(
+    kind,
+    element_type,
+    properties,
+    linear,
+    *,
+    stage=STAGE,
+    diagnostic="TLXW_TYPE_MALFORMED_LAYOUT",
+    source_op_index=None,
+    source_value_id=None,
+):
+    """Prove the component/tile decomposition of one canonical MMA layout."""
+    if kind not in {"amd_mfma", "dot_operand"}:
+        return None
+
+    def reject(message):
+        _layout_fail(diagnostic, stage, message, source_op_index=source_op_index, source_value_id=source_value_id)
+
+    out_dims = tuple((str(name), int(size)) for name, size in linear.out_dims)
+    if tuple(name for name, _size in out_dims) != ("dim0", "dim1") or any(not _is_power_of_two(size)
+                                                                          for _name, size in out_dims):
+        reject("MFMA component model requires a binary rank-2 canonical LinearLayout")
+
+    lane_count = linear_layout_in_dim_size(linear, "lane")
+    payload_elements, _element_bits, _registers, fragment = _mma_fragment_abi(
         kind,
-        shape,
+        element_type,
         properties,
-        lane_width,
+        lane_count,
         stage=stage,
+        diagnostic=diagnostic,
         source_op_index=source_op_index,
         source_value_id=source_value_id,
     )
-    return linear_layout_in_dim_size(linear, "register")
+    shape = tuple(size for _name, size in out_dims)
+    visible_fragment = tuple(min(logical, physical) for logical, physical in zip(shape, fragment))
+    if payload_elements * lane_count % _product(visible_fragment):
+        reject("MFMA payload and lane domains do not cover the visible fragment")
+
+    register_count = linear_layout_in_dim_size(linear, "register")
+    if register_count % payload_elements:
+        reject("MFMA payload does not divide the canonical register domain")
+    component_count = register_count // payload_elements
+    tile_shape = tuple(_ceil_div(logical, physical) for logical, physical in zip(shape, fragment))
+    if any(not _is_power_of_two(extent) for extent in tile_shape):
+        reject("MFMA canonical layout has a non-binary fragment quotient")
+
+    input_bases = {
+        str(name): tuple(tuple(int(value)
+                               for value in basis)
+                         for basis in bases)
+        for name, bases in linear.bases
+    }
+    input_names = tuple(str(name) for name in linear.get_in_dim_names())
+    if set(input_names) - {"register", "lane", "warp", "block"}:
+        reject("MFMA canonical layout has an unsupported physical input dimension")
+    register_bases = input_bases.get("register", ())
+    payload_bits = payload_elements.bit_length() - 1
+    if len(register_bases) < payload_bits:
+        reject("MFMA canonical register domain is smaller than one payload")
+
+    def quotient_basis(basis, source):
+        quotient = []
+        for value, fragment_extent, tile_extent in zip(basis, fragment, tile_shape):
+            if int(value) % int(fragment_extent):
+                reject(f"MFMA {source} basis crosses fragment and tile coordinates")
+            value = int(value) // int(fragment_extent)
+            if value < 0 or value >= int(tile_extent):
+                reject(f"MFMA {source} tile basis exceeds the fragment quotient")
+            quotient.append(value)
+        return tuple(quotient)
+
+    component_bases = tuple(quotient_basis(basis, "component") for basis in register_bases[payload_bits:])
+    partition_bases = {
+        name: tuple(quotient_basis(basis, name)
+                    for basis in input_bases.get(name, ()))
+        for name in ("warp", "block")
+    }
+
+    def basis_masks(bases):
+        masks = [0, 0]
+        for basis in bases:
+            for dim, value in enumerate(basis):
+                masks[dim] |= value
+        return tuple(masks)
+
+    component_masks = basis_masks(component_bases)
+    partition_masks = basis_masks(tuple(basis for bases in partition_bases.values() for basis in bases))
+
+    for dim, extent in enumerate(tile_shape):
+        if (component_masks[dim] & partition_masks[dim]
+                or (component_masks[dim] | partition_masks[dim]) != int(extent) - 1):
+            reject("MFMA tile layout is not a direct component and workgroup quotient")
+
+    grid = tuple(1 << int(mask).bit_count() for mask in component_masks)
+    if _product(grid) != component_count:
+        reject("MFMA canonical component bits do not form a dense tile grid")
+
+    # Invert the exact GF(2) component map in physical register order.
+    positions = tuple((dim, bit)
+                      for dim, mask in enumerate(component_masks)
+                      for bit in range(int(mask).bit_length())
+                      if int(mask) & (1 << bit))
+    columns = tuple(
+        sum(int(bool(basis[dim] & (1 << bit))) << row
+            for row, (dim, bit) in enumerate(positions))
+        for basis in component_bases)
+    width = len(columns)
+    if len(positions) != width:
+        reject("MFMA component quotient is not square")
+    rows = [
+        sum(((column >> row) & 1) << bit
+            for bit, column in enumerate(columns)) | (1 << (width + row))
+        for row in range(width)
+    ]
+    for pivot in range(width):
+        source = next((row for row in range(pivot, width) if rows[row] & (1 << pivot)), None)
+        if source is None:
+            reject("MFMA component quotient is not invertible")
+        rows[pivot], rows[source] = rows[source], rows[pivot]
+        for row in range(width):
+            if row != pivot and rows[row] & (1 << pivot):
+                rows[row] ^= rows[pivot]
+    inverse_rows = tuple(row >> width for row in rows)
+
+    dsl = load_wave_dsl()
+    axes = tuple(dsl.sym(f"mma_axis{dim}") for dim in range(2))
+    symbols = {name: dsl.sym(f"mma_{name}") for name in ("intra", "lane", "warp", "block")}
+
+    def extract_bit(expression, bit):
+        return dsl.mod(dsl.floor(expression / (1 << bit)), 2)
+
+    axis_bits = tuple(
+        extract_bit(axes[dim], compact_bit)
+        for dim, mask in enumerate(component_masks)
+        for compact_bit, _bit in enumerate(bit for bit in range(int(mask).bit_length()) if int(mask) & (1 << bit)))
+    component = dsl.ixs_int(0)
+    for physical_bit, inverse_mask in enumerate(inverse_rows):
+        bit_value = dsl.ixs_int(0)
+        for axis_bit, value in enumerate(axis_bits):
+            if inverse_mask & (1 << axis_bit):
+                bit_value = dsl.xor(bit_value, value)
+        component += bit_value * (1 << physical_bit)
+    register = component * payload_elements + symbols["intra"]
+    extents = {
+        "intra": payload_elements,
+        "lane": lane_count,
+        "warp": linear_layout_in_dim_size(linear, "warp"),
+        "block": linear_layout_in_dim_size(linear, "block"),
+    }
+    facts = tuple(predicate for name, extent in extents.items() for predicate in _symbolic_range_predicates(
+        dsl, symbols[name], 0,
+        int(extent) - 1)) + tuple(predicate for dim, extent in enumerate(grid)
+                                  for predicate in _symbolic_range_predicates(dsl, axes[dim], 0,
+                                                                              int(extent) - 1))
+    physical = {"register": register, **{name: symbols[name] for name in ("lane", "warp", "block")}}
+    logical = _symbolic_layout_formula(dsl, linear, {name: physical[name] for name in input_names})
+
+    def remap_bits(expression, source_bits, destination_bits):
+        return sum(
+            (extract_bit(expression, source_bit) * (1 << destination_bit)
+             for source_bit, destination_bit in zip(source_bits, destination_bits)),
+            dsl.ixs_int(0),
+        )
+
+    def xor_basis(coordinates, source, bases):
+        for bit, basis in enumerate(bases):
+            bit_value = extract_bit(source, bit)
+            for dim, coefficient in enumerate(basis):
+                if coefficient:
+                    coordinates[dim] = dsl.xor(coordinates[dim], int(coefficient) * bit_value)
+
+    fragment_coords = [dsl.ixs_int(0), dsl.ixs_int(0)]
+    xor_basis(fragment_coords, symbols["intra"], register_bases[:payload_bits])
+    xor_basis(fragment_coords, symbols["lane"], input_bases.get("lane", ()))
+    partition_coords = [dsl.ixs_int(0), dsl.ixs_int(0)]
+    for name in ("warp", "block"):
+        xor_basis(partition_coords, symbols[name], partition_bases[name])
+
+    goals = [
+        ("component_lower", component >= 0),
+        ("component_upper", component < component_count),
+        ("register_lower", register >= 0),
+        ("register_upper", register < register_count),
+        ("component_roundtrip", dsl.ixs_eq(dsl.floor(register / payload_elements), component)),
+        ("intra_roundtrip", dsl.ixs_eq(dsl.mod(register, payload_elements), symbols["intra"])),
+    ]
+    for dim, ((name, logical_extent), fragment_extent, tile_extent) in enumerate(zip(out_dims, fragment, tile_shape)):
+        tile = dsl.floor(logical[name] / fragment_extent)
+        fragment_coord = dsl.mod(logical[name], fragment_extent)
+        component_bits = tuple(bit for bit in range(int(component_masks[dim]).bit_length())
+                               if int(component_masks[dim]) & (1 << bit))
+        deposited_component = remap_bits(axes[dim], range(len(component_bits)), component_bits)
+        compact_component = remap_bits(tile, component_bits, range(len(component_bits)))
+        merged_tile = deposited_component + partition_coords[dim]
+        goals.extend((
+            (f"{name}_component_order", dsl.ixs_eq(compact_component, axes[dim])),
+            (f"{name}_fragment_model", dsl.ixs_eq(fragment_coord, fragment_coords[dim])),
+            (f"{name}_tile_composition", dsl.ixs_eq(tile, merged_tile)),
+            (f"{name}_fragment_lower", fragment_coord >= 0),
+            (f"{name}_fragment_upper", fragment_coord < fragment_extent),
+            (f"{name}_tile_lower", tile >= 0),
+            (f"{name}_tile_upper", tile < tile_extent),
+            (f"{name}_partition_lower", partition_coords[dim] >= 0),
+            (f"{name}_partition_upper", partition_coords[dim] < tile_extent),
+            (f"{name}_logical_lower", logical[name] >= 0),
+            (f"{name}_logical_upper", logical[name] < logical_extent),
+        ))
+    proofs, normalized = dsl.ixs_check((*tuple(goal for _name, goal in goals), component), facts)
+    goal_proofs = proofs[:len(goals)]
+    if any(proof is not True for proof in goal_proofs):
+        status = "False" if False in goal_proofs else "Unknown"
+        failed = tuple(name for (name, _goal), proof in zip(goals, goal_proofs) if proof is not True)
+        reject("MFMA canonical component proof returned "
+               f"{status} for goals {failed}")
+    return _MmaComponentModel(component_count, grid, dsl.ixs_serialize(normalized[len(goals)]))
+
+
+def mma_tile_grid(
+    result_layout,
+    lhs_layout,
+    rhs_layout,
+    *,
+    stage=STAGE,
+    diagnostic="TLXW_TYPE_MALFORMED_LAYOUT",
+    source_op_index=None,
+):
+    """Return the MFMA component tile grid proved by the three layouts."""
+
+    def component_grid(layout):
+        if layout.linear_layout is None:
+            _layout_fail(
+                diagnostic,
+                stage,
+                "MFMA lowering requires the canonical LinearLayout model",
+                source_op_index=source_op_index,
+                source_value_id=layout.value_id,
+            )
+        grid = layout.component_grid
+        relation = layout.component_relation
+        if (grid is None or len(grid) != 2 or any(type(extent) is not int or extent <= 0 for extent in grid)
+                or not isinstance(relation, tuple) or not relation
+                or any(type(byte) is not int or not 0 <= byte <= 255 for byte in relation)):
+            _layout_fail(
+                diagnostic,
+                stage,
+                "MFMA layout does not have a proved instruction-component relation",
+                source_op_index=source_op_index,
+                source_value_id=layout.value_id,
+            )
+        return tuple(int(extent) for extent in grid)
+
+    result = component_grid(result_layout)
+    lhs = component_grid(lhs_layout)
+    rhs = component_grid(rhs_layout)
+    dsl = load_wave_dsl()
+    compatibility = (
+        dsl.ixs_eq(dsl.ixs_int(lhs[0]), dsl.ixs_int(result[0])),
+        dsl.ixs_eq(dsl.ixs_int(rhs[1]), dsl.ixs_int(result[1])),
+        dsl.ixs_eq(dsl.ixs_int(rhs[0]), dsl.ixs_int(lhs[1])),
+    )
+    proofs, _normalized = dsl.ixs_check(compatibility, ())
+    if any(proof is not True for proof in proofs):
+        _layout_fail(
+            diagnostic,
+            stage,
+            "MFMA operand and result LinearLayout component grids have incompatible "
+            "tile grids",
+            source_op_index=source_op_index,
+        )
+    return (
+        result[0],
+        result[1],
+        lhs[1],
+    )
 
 
 def distributed_linear_layout(
@@ -362,77 +564,14 @@ def distributed_linear_layout(
     stage=STAGE,
     source_op_index=None,
 ):
-    return distributed_linear_layout_from_parts(
-        layout.kind,
-        layout.shape,
-        layout.properties,
-        layout.lane_width,
-        stage=stage,
-        source_op_index=source_op_index,
-        source_value_id=layout.value_id,
-    )
-
-
-def distributed_linear_layout_from_parts(
-    kind,
-    shape,
-    properties,
-    lane_width,
-    *,
-    stage=STAGE,
-    source_op_index=None,
-    source_value_id=None,
-):
-    shape = tuple(int(dim) for dim in shape)
-    if kind == "blocked":
-        return _blocked_linear_layout(
-            shape,
-            properties,
-            stage=stage,
-            source_op_index=source_op_index,
-            source_value_id=source_value_id,
-        )
-    if kind in {"linear", "generic_linear"}:
-        return _linear_encoding_layout(
-            shape,
-            properties,
-            stage=stage,
-            source_op_index=source_op_index,
-            source_value_id=source_value_id,
-        )
-    if kind == "slice":
-        return _slice_linear_layout(
-            shape,
-            properties,
-            lane_width,
-            stage=stage,
-            source_op_index=source_op_index,
-            source_value_id=source_value_id,
-        )
-    if kind == "amd_mfma":
-        return _mfma_linear_layout(
-            shape,
-            properties,
-            lane_width,
-            stage=stage,
-            source_op_index=source_op_index,
-            source_value_id=source_value_id,
-        )
-    if kind == "dot_operand":
-        return _mfma_dot_operand_linear_layout(
-            shape,
-            properties,
-            lane_width,
-            stage=stage,
-            source_op_index=source_op_index,
-            source_value_id=source_value_id,
-        )
+    if layout.linear_layout is not None:
+        return layout.linear_layout
     _layout_fail(
         "TLXW_TYPE_UNSUPPORTED_LAYOUT",
         stage,
-        f"layout {kind} does not have a distributed register map",
+        f"layout {layout.kind} does not have a distributed register map",
         source_op_index=source_op_index,
-        source_value_id=source_value_id,
+        source_value_id=layout.value_id,
     )
 
 
@@ -443,28 +582,6 @@ def linear_layout_in_dim_size(linear, dim):
     return 1
 
 
-def linear_layout_out_dim_size(linear, dim, *, stage=STAGE):
-    for out_dim, size in linear.out_dims:
-        if out_dim == dim:
-            return int(size)
-    _layout_fail(
-        "TLXW_TYPE_MALFORMED_LAYOUT",
-        stage,
-        f"linear layout is missing output dimension {dim}",
-    )
-
-
-def linear_layout_coords(linear, register, lane, *, warp):
-    available = {
-        "block": 0,
-        "register": int(register),
-        "lane": int(lane),
-        "warp": int(warp),
-    }
-    coords = linear.apply({name: available[name] for name in linear.get_in_dim_names()})
-    return tuple(int(coords[f"dim{dim}"]) for dim in range(len(coords)))
-
-
 def linear_layout_bases(linear, in_dim):
     for name, bases in linear.bases:
         if name == in_dim:
@@ -472,1148 +589,1086 @@ def linear_layout_bases(linear, in_dim):
     return ()
 
 
-def linear_layout_component_registers(
+def _distributed_active_relation(
     linear,
+    *,
+    lane_width,
+    warp_count,
+    block_count,
+    source_value_id,
+):
+    """Return the zero-key predicate for one linear section of the layout."""
+    if linear is None:
+        return None
+
+    def reject(code, message):
+        _layout_fail(code, STAGE, message, source_value_id=source_value_id)
+
+    lane_width = int(lane_width)
+    warp_count = int(warp_count)
+    block_count = int(block_count)
+    if min(lane_width, warp_count, block_count) <= 0:
+        reject("TLXW_TYPE_MALFORMED_LAYOUT", "distributed ownership requires positive kernel dimensions")
+
+    out_dims = tuple((str(name), int(extent)) for name, extent in linear.out_dims)
+    if any(not _is_power_of_two(extent) for _name, extent in out_dims):
+        reject("TLXW_TYPE_UNSUPPORTED_LAYOUT", "replicated ownership requires a binary LinearLayout output domain")
+    out_rank = len(out_dims)
+    provided = {
+        str(name): tuple(tuple(int(value)
+                               for value in basis)
+                         for basis in bases)
+        for name, bases in linear.bases
+    }
+    unknown = tuple(sorted(set(provided) - {"register", "lane", "warp", "block"}))
+    if unknown:
+        reject("TLXW_TYPE_UNSUPPORTED_LAYOUT", f"distributed ownership has unsupported physical dimensions {unknown}")
+    register_extent = 1 << len(provided.get("register", ()))
+    physical_extents = {
+        "register": register_extent,
+        "lane": lane_width,
+        "warp": warp_count,
+        "block": block_count,
+    }
+    columns = []
+    for name in ("register", "lane", "warp", "block"):
+        extent = int(physical_extents[name])
+        if not _is_power_of_two(extent):
+            reject("TLXW_TYPE_UNSUPPORTED_LAYOUT", f"distributed ownership requires a binary {name} domain")
+        width = extent.bit_length() - 1
+        bases = provided.get(name, ())
+        if len(bases) > width or any(len(basis) != out_rank for basis in bases):
+            reject("TLXW_TYPE_MALFORMED_LAYOUT", f"LinearLayout {name} bases do not fit the kernel domain")
+        for bit in range(width):
+            basis = bases[bit] if bit < len(bases) else (0, ) * out_rank
+            if any(value < 0 or value >= extent for value, (_out_name, extent) in zip(basis, out_dims)):
+                reject("TLXW_TYPE_MALFORMED_LAYOUT", f"LinearLayout {name} basis exceeds its logical domain")
+            shift = 0
+            column = 0
+            for value, (_out_name, extent) in zip(basis, out_dims):
+                column |= int(value) << shift
+                shift += int(extent).bit_length() - 1
+            columns.append((name, bit, column))
+
+    physical_size = _product(physical_extents.values())
+    logical_size = _product(extent for _name, extent in out_dims)
+    if physical_size < logical_size or physical_size % logical_size:
+        reject("TLXW_TYPE_MALFORMED_LAYOUT", "LinearLayout physical domain does not cover its logical domain")
+    replication = physical_size // logical_size
+    if not _is_power_of_two(replication):
+        reject("TLXW_TYPE_UNSUPPORTED_LAYOUT", "distributed ownership requires a binary replication domain")
+
+    # Preserve the execution hierarchy in the canonical linear section.
+    logical_width = sum(extent.bit_length() - 1 for _name, extent in out_dims)
+    pivots = {}
+
+    def add_independent(column):
+        reduced = int(column)
+        while reduced:
+            pivot = reduced.bit_length() - 1
+            known = pivots.get(pivot)
+            if known is None:
+                pivots[pivot] = reduced
+                return True
+            reduced ^= known
+        return False
+
+    block_columns = tuple(column for column in columns if column[0] == "block")
+    if any(not add_independent(column) for _name, _bit, column in block_columns):
+        reject("TLXW_TYPE_UNSUPPORTED_LAYOUT", "replicated block ownership cannot be suppressed inside one workgroup")
+    nonpivots = []
+    for physical_dim in ("lane", "warp", "register"):
+        for name, bit, column in columns:
+            if name == physical_dim and not add_independent(column):
+                nonpivots.append((name, bit))
+    if len(pivots) != logical_width or not linear.is_surjective():
+        reject("TLXW_TYPE_UNSUPPORTED_LAYOUT", "distributed ownership requires a surjective binary LinearLayout")
+    kernel_width = replication.bit_length() - 1
+    if len(nonpivots) != kernel_width:
+        reject("TLXW_TYPE_MALFORMED_LAYOUT", "LinearLayout section does not span the physical replication domain")
+    if not nonpivots:
+        return None
+
+    dsl = load_wave_dsl()
+    item = dsl.sym("item")
+    slot = dsl.sym("slot")
+    inputs = {
+        "register": slot,
+        "lane": dsl.mod(item, lane_width),
+        "warp": dsl.floor(item / lane_width),
+    }
+
+    def extract_bit(expression, bit):
+        return dsl.mod(dsl.floor(expression / (1 << bit)), 2)
+
+    # Pack the non-pivot coordinates of the replication kernel directly.
+    digits = tuple(extract_bit(inputs[name], bit) for name, bit in nonpivots)
+    active_key = sum(
+        (digit * (1 << bit) for bit, digit in enumerate(digits)),
+        dsl.ixs_int(0),
+    )
+    facts = (
+        *_symbolic_range_predicates(
+            dsl,
+            item,
+            0,
+            lane_width * warp_count - 1,
+        ),
+        *_symbolic_range_predicates(
+            dsl,
+            slot,
+            0,
+            register_extent - 1,
+        ),
+    )
+    goals = (
+        dsl.ixs_eq(active_key, dsl.floor(active_key)),
+        active_key >= 0,
+        active_key <= replication - 1,
+    )
+    proofs, normalized = dsl.ixs_check((*goals, active_key), facts)
+    if any(proof is not True for proof in proofs[:len(goals)]):
+        status = "False" if False in proofs[:len(goals)] else "Unknown"
+        reject("TLXW_TYPE_UNSUPPORTED_LAYOUT", f"distributed ownership proof returned {status}")
+    owner_proofs, _ = dsl.ixs_check(
+        tuple(dsl.ixs_eq(digit, 0) for digit in digits),
+        (*facts, dsl.ixs_eq(active_key, 0)),
+    )
+    if any(proof is not True for proof in owner_proofs):
+        reject("TLXW_TYPE_UNSUPPORTED_LAYOUT", "ownership key is not injective")
+    return dsl.ixs_serialize(normalized[len(goals)])
+
+
+def packet_layout_relations(
+        sources,
+        results,
+        *,
+        transform="identity",
+        axis=None,
+        order=(),
+):
+    sources = tuple(sources)
+    results = tuple(results)
+    expected = ((2, 1) if transform == "join" else ((1, 2) if transform == "split" else (1, 1)))
+    if (len(sources), len(results)) != expected:
+        raise ValueError(f"{transform} packet relation requires {expected[0]} source layout(s) "
+                         f"and {expected[1]} result layout(s)")
+    if any(layout.linear_layout is None for layout in (*sources, *results)):
+        raise ValueError("packet redistribution requires distributed linear layouts")
+    lane_widths = {int(layout.lane_width) for layout in (*sources, *results)}
+    if len(lane_widths) != 1:
+        raise ValueError("packet redistribution requires equal source/result lane widths")
+
+    if transform == "join":
+        first, second = sources
+        result = results[0]
+        if first.linear_layout != second.linear_layout:
+            raise ValueError("packet join requires identical distributed operand layouts")
+        relation = _packet_relation_blob(
+            _joined_packet_layout(first),
+            result.linear_layout,
+            tuple(int(dim) for dim in result.shape),
+            tuple(int(dim) for dim in result.shape),
+            lane_width=int(result.lane_width),
+            source_components=int(first.component_count) + int(second.component_count),
+            destination_components=int(result.component_count),
+        )
+        return (relation, )
+
+    source = sources[0]
+    if transform == "split" and axis is None:
+        axis = len(source.shape) - 1
+    return tuple(
+        _packet_relation_blob(
+            source.linear_layout,
+            result.linear_layout,
+            tuple(int(dim) for dim in source.shape),
+            tuple(int(dim) for dim in result.shape),
+            lane_width=int(result.lane_width),
+            source_components=int(source.component_count),
+            destination_components=int(result.component_count),
+            transform=transform,
+            axis=axis,
+            order=order,
+            selector=selector if transform == "split" else None,
+        ) for selector, result in enumerate(results))
+
+
+def _symbolic_range_predicates(dsl, expression, lower, upper):
+    """Describe an integer-valued symbolic coordinate over a closed range."""
+    return (
+        dsl.ixs_eq(expression, dsl.floor(expression)),
+        expression >= int(lower),
+        expression <= int(upper),
+    )
+
+
+def make_range_relation(
     layout,
     component_count,
+    lane_width,
+    warp_count,
+    start,
+    end,
     *,
-    stage=STAGE,
     source_op_index=None,
     source_value_id=None,
 ):
-    component_count = int(component_count)
-    if component_count <= 0:
+    """Map the full physical packet domain to a distributed range value."""
+    linear = _complete_packet_physical_dims(
+        distributed_linear_layout(
+            layout,
+            stage=STAGE,
+            source_op_index=source_op_index,
+        ))
+    shape = tuple(int(extent) for extent in layout.shape)
+    if not shape or _product(shape) != int(end) - int(start):
         _layout_fail(
             "TLXW_TYPE_MALFORMED_LAYOUT",
-            stage,
-            "layout component register mapping requires a positive component count",
+            STAGE,
+            "make_range layout shape does not match its value interval",
             source_op_index=source_op_index,
             source_value_id=source_value_id,
         )
     register_count = linear_layout_in_dim_size(linear, "register")
-    if int(register_count) == component_count:
-        stride = 1
-    elif _is_mfma_component_layout(layout) and int(register_count) % component_count == 0:
-        stride = int(register_count) // component_count
-    else:
+    if int(component_count) != register_count:
         _layout_fail(
             "TLXW_TYPE_UNSUPPORTED_LAYOUT",
-            stage,
-            "layout component model does not match distributed register layout",
+            STAGE,
+            "scalar make_range components must match its distributed register domain",
             source_op_index=source_op_index,
             source_value_id=source_value_id,
         )
-    return tuple(int(component) * int(stride) for component in range(component_count))
-
-
-def dot_operand_storage_k_tile_extent(element_type, properties):
-    parent_properties = properties.get("parent_properties", {})
-    instr_shape = parent_properties.get("instr_shape", ())
-    if len(instr_shape) < 3:
-        return 1
-    instr_k = int(instr_shape[2])
-    k_width = int(properties.get("k_width", 0) or 0)
-    if element_type == "i8" and k_width > 0 and 32 % k_width == 0:
-        storage_pack = max(1, 32 // int(k_width))
-        if storage_pack > 1 and instr_k % storage_pack == 0:
-            return instr_k // storage_pack
-    return instr_k
-
-
-def _is_mfma_component_layout(layout):
-    return _layout_parts_are_mfma(layout.kind, layout.properties)
-
-
-def _layout_parts_are_mfma(kind, properties):
-    if kind == "amd_mfma":
-        return True
-    if kind == "slice":
-        return _layout_parts_are_mfma(
-            properties.get("parent_kind"),
-            properties.get("parent_properties", {}),
-        )
-    return False
-
-
-def layout_warp_count(layout):
-    if layout.kind in {"linear", "generic_linear"}:
-        return 1 << len(tuple(layout.properties.get("warp_bases", ())))
-    if layout.kind == "dot_operand":
-        return _layout_warp_count_from_parts(
-            layout.properties.get("parent_kind"),
-            layout.properties.get("parent_properties", {}),
-        )
-    if layout.kind == "slice":
-        return _layout_warp_count_from_parts(
-            layout.properties.get("parent_kind"),
-            layout.properties.get("parent_properties", {}),
-        )
-    warps_per_cta = tuple(int(value) for value in layout.properties.get("warps_per_cta", ()))
-    result = 1
-    for value in warps_per_cta:
-        result *= max(1, int(value))
-    return result
-
-
-def shared_physical_offset(
-    layout,
-    shape,
-    coords,
-    element_byte_width,
-    *,
-    stage=STAGE,
-    diagnostic="TLXW_TYPE_UNSUPPORTED_LAYOUT",
-    source_op_index=None,
-    source_value_id=None,
-):
-    shape = tuple(int(dim) for dim in shape)
-    coords = tuple(int(coord) for coord in coords)
-    element_byte_width = int(element_byte_width)
-    if element_byte_width <= 0:
-        _shared_layout_fail(
-            diagnostic,
-            stage,
-            "shared physical offset requires a positive element byte width",
-            layout=layout,
-            source_op_index=source_op_index,
-            source_value_id=source_value_id,
-        )
-    if len(coords) != len(shape):
-        _shared_layout_fail(
-            diagnostic,
-            stage,
-            "shared physical offset coordinate rank does not match shape rank",
-            layout=layout,
-            source_op_index=source_op_index,
-            source_value_id=source_value_id,
-        )
-    for coord, extent in zip(coords, shape):
-        if int(coord) < 0 or int(coord) >= int(extent):
-            _shared_layout_fail(
-                diagnostic,
-                stage,
-                f"shared physical offset coordinate {coords} exceeds shape {shape}",
-                layout=layout,
-                source_op_index=source_op_index,
-                source_value_id=source_value_id,
-            )
-
-    kind = shared_layout_kind(layout)
-    assumptions = ()
-    if kind == "dense":
-        order = default_physical_order(shape)
-        element_offset = static_linear_offset(shape, coords)
-        logical_linear_offset = element_offset
-        provenance = "dense_row_major"
-    elif kind == "swizzled_shared":
-        if is_identity_swizzled_shared(layout, shape):
-            order = default_physical_order(shape)
-            element_offset = static_linear_offset(shape, coords)
-            logical_linear_offset = element_offset
-            provenance = "identity_swizzled_row_major"
-        else:
-            order, vec, per_phase, max_phase = swizzled_shared_parameters(
-                layout,
-                shape,
-                stage=stage,
-                diagnostic=diagnostic,
-                source_op_index=source_op_index,
-                source_value_id=source_value_id,
-            )
-            minor_dim = int(order[0])
-            major_dim = int(order[1])
-            minor_extent = int(shape[minor_dim])
-            major = int(coords[major_dim])
-            minor = int(coords[minor_dim])
-            phase = (major // int(per_phase)) % int(max_phase)
-            if int(vec) * int(max_phase) <= minor_extent:
-                swizzled_minor = (((minor // int(vec)) ^ phase) * int(vec) + (minor % int(vec)))
-            else:
-                phase_offset = (int(vec) * int(phase)) % minor_extent
-                swizzled_minor = int(minor) ^ int(phase_offset)
-            if swizzled_minor >= minor_extent:
-                _shared_layout_fail(
-                    diagnostic,
-                    stage,
-                    "swizzled shared physical offset produces an "
-                    f"out-of-bounds minor coordinate {swizzled_minor}; "
-                    f"{swizzled_shared_description(layout)}",
-                    layout=layout,
-                    source_op_index=source_op_index,
-                    source_value_id=source_value_id,
-                )
-            physical_coords = list(coords)
-            physical_coords[minor_dim] = int(swizzled_minor)
-            element_offset = ordered_linear_offset(shape, physical_coords, order)
-            logical_linear_offset = ordered_linear_offset(shape, coords, order)
-            provenance = "swizzled_shared"
-            assumptions = ("minor_extent_divisible_by_vec", )
-    elif kind == "shared_linear":
-        order = shared_layout_physical_order(
-            layout,
-            shape,
-            stage=stage,
-            diagnostic=diagnostic,
-            source_op_index=source_op_index,
-            source_value_id=source_value_id,
-        )
-        inverse_offset_bases = shared_linear_inverse_offset_bases(
-            layout,
-            shape,
-            stage=stage,
-            diagnostic=diagnostic,
-            source_op_index=source_op_index,
-            source_value_id=source_value_id,
-        )
-        element_offset = offset_from_inverse_offset_bases(
-            inverse_offset_bases,
-            coords,
-        )
-        logical_linear_offset = static_linear_offset(shape, coords)
-        provenance = "shared_linear_inverse"
-        assumptions = ("single_block_bijective_shared_linear", )
-    elif kind == "padded_shared":
-        intervals, paddings = padded_shared_parameters(
-            layout,
-            stage=stage,
-            diagnostic=diagnostic,
-            source_op_index=source_op_index,
-            source_value_id=source_value_id,
-        )
-        order = shared_layout_physical_order(
-            layout,
-            shape,
-            stage=stage,
-            diagnostic=diagnostic,
-            source_op_index=source_op_index,
-            source_value_id=source_value_id,
-        )
-        offset_bases = padded_shared_linear_component_bases(
-            layout,
-            shape,
-            stage=stage,
-            diagnostic=diagnostic,
-            source_op_index=source_op_index,
-            source_value_id=source_value_id,
-        )
-        logical_linear_offset = offset_from_linear_component_bases(
-            offset_bases,
-            coords,
-            layout,
-            stage=stage,
-            diagnostic=diagnostic,
-            source_op_index=source_op_index,
-            source_value_id=source_value_id,
-        )
-        element_offset = int(logical_linear_offset)
-        for interval, padding in zip(intervals, paddings):
-            element_offset += (logical_linear_offset // int(interval)) * int(padding)
-        provenance = "padded_shared"
-        assumptions = ("valid_padded_intervals", )
-    else:
-        _shared_layout_fail(
-            diagnostic,
-            stage,
-            f"shared physical offset does not support layout {kind}",
-            layout=layout,
-            source_op_index=source_op_index,
-            source_value_id=source_value_id,
-        )
-
-    byte_offset = int(element_offset) * int(element_byte_width)
-    dword_offset = byte_offset // 4 if byte_offset % 4 == 0 else None
-    return PhysicalOffsetRecord(
-        element_offset=int(element_offset),
-        byte_offset=int(byte_offset),
-        dword_offset=dword_offset,
-        element_byte_width=int(element_byte_width),
-        layout_kind=kind,
-        order=tuple(int(dim) for dim in order),
-        logical_coords=coords,
-        logical_linear_offset=int(logical_linear_offset),
-        assumptions=tuple(assumptions),
-        provenance=provenance,
+    dsl = load_wave_dsl()
+    item = dsl.sym("item")
+    block = dsl.sym("block")
+    slot = dsl.sym("slot")
+    inputs = {
+        "block": block,
+        "item": item,
+        "lane": dsl.mod(item, int(lane_width)),
+        "warp": dsl.floor(item / int(lane_width)),
+        "register": slot,
+    }
+    goals = []
+    coords = _symbolic_layout_formula(dsl, linear, inputs)
+    flat = dsl.ixs_int(0)
+    for dim, extent in enumerate(shape):
+        coord = coords[f"dim{dim}"]
+        goals.extend((coord >= 0, coord < extent))
+        flat = flat * extent + coord
+    value = int(start) + flat
+    goals.extend((value >= int(start), value < int(end)))
+    facts = (
+        *_symbolic_range_predicates(
+            dsl,
+            item,
+            0,
+            int(lane_width) * int(warp_count) - 1,
+        ),
+        *_symbolic_range_predicates(
+            dsl,
+            block,
+            0,
+            linear_layout_in_dim_size(linear, "block") - 1,
+        ),
+        *_symbolic_range_predicates(
+            dsl,
+            slot,
+            0,
+            register_count - 1,
+        ),
     )
+    checked, normalized = dsl.ixs_check((*goals, value), facts)
+    goal_proofs = checked[:len(goals)]
+    if any(proof is not True for proof in goal_proofs):
+        status = "False" if False in goal_proofs else "Unknown"
+        raise ValueError(f"symbolic make_range layout proof returned {status}")
+    return dsl.ixs_serialize(normalized[len(goals)])
 
 
-def shared_physical_offset_from_linear(
-    layout,
-    shape,
-    linear,
-    element_byte_width,
+def local_memory_bit_offset_relation(
+    distributed_layout,
+    shared_layout,
+    logical_shape,
+    physical_shape,
+    logical_origin,
     *,
+    lane_width,
+    warp_count,
+    element_byte_width,
+    allocation_bytes,
     stage=STAGE,
     diagnostic="TLXW_TYPE_UNSUPPORTED_LAYOUT",
     source_op_index=None,
     source_value_id=None,
 ):
-    shape = tuple(int(dim) for dim in shape)
-    linear = int(linear)
-    if linear < 0 or linear >= _product(shape):
-        return None
-    coords = static_delinearize_row_major(
-        linear,
-        shape,
+    """Compose a distributed placement and shared layout into bit offsets."""
+    if distributed_layout is None or distributed_layout.linear_layout is None:
+        raise ValueError("local memory relation requires a distributed linear layout")
+    logical_shape = tuple(int(value) for value in logical_shape)
+    physical_shape = tuple(int(value) for value in physical_shape)
+    logical_origin = tuple(int(value) for value in logical_origin)
+    lane_width = int(lane_width)
+    warp_count = int(warp_count)
+    element_byte_width = int(element_byte_width)
+    allocation_bytes = int(allocation_bytes)
+    if (not logical_shape or len(logical_shape) != len(physical_shape) or len(logical_shape) != len(logical_origin)):
+        raise ValueError("local memory relation requires matching ranked shapes and origin")
+    if any(value <= 0 for value in (*logical_shape, *physical_shape)) or any(value < 0 for value in logical_origin):
+        raise ValueError("local memory relation requires positive shapes and nonnegative origin")
+    if (lane_width <= 0 or warp_count <= 0 or element_byte_width <= 0 or allocation_bytes <= 0):
+        raise ValueError("local memory relation requires positive physical extents")
+
+    linear = _complete_packet_physical_dims(distributed_layout.linear_layout)
+    register_count = linear_layout_in_dim_size(linear, "register")
+    if linear_layout_in_dim_size(linear, "lane") > lane_width:
+        raise ValueError("local memory relation lane domain exceeds the hardware wave")
+    if linear_layout_in_dim_size(linear, "warp") > warp_count:
+        raise ValueError("local memory relation warp domain exceeds the workgroup")
+    block_bases = linear_layout_bases(linear, "block")
+    if any(any(int(value) for value in basis) for basis in block_bases):
+        raise ValueError("local memory relation does not support nontrivial block bases")
+    expected_outputs = {f"dim{dim}": int(extent) for dim, extent in enumerate(logical_shape)}
+    if {str(name): int(extent) for name, extent in linear.out_dims} != expected_outputs:
+        raise ValueError("local memory relation logical dimensions do not match its shape")
+
+    address_layout, order, intervals, paddings = _shared_address_layout(
+        shared_layout,
+        physical_shape,
         stage=stage,
         diagnostic=diagnostic,
         source_op_index=source_op_index,
         source_value_id=source_value_id,
-        layout=layout,
     )
-    return shared_physical_offset(
+    dsl = load_wave_dsl()
+    item = dsl.sym("item")
+    slot = dsl.sym("slot")
+    packet_inputs = {
+        "block": dsl.ixs_int(0),
+        "item": item,
+        "lane": dsl.mod(item, lane_width),
+        "warp": dsl.floor(item / lane_width),
+    }
+    goals = []
+    element_bits = element_byte_width * 8
+    allocation_bits = allocation_bytes * 8
+    inputs = {
+        **packet_inputs,
+        "register": slot,
+    }
+    logical_by_name = _symbolic_layout_formula(
+        dsl,
+        linear,
+        inputs,
+    )
+    logical_coords = tuple(logical_by_name[f"dim{dim}"] for dim in range(len(logical_shape)))
+    for coord, extent in zip(logical_coords, logical_shape):
+        goals.extend((coord >= 0, coord < extent))
+    physical_coords = tuple(coord + origin for coord, origin in zip(logical_coords, logical_origin))
+    for coord, extent in zip(physical_coords, physical_shape):
+        goals.extend((coord >= 0, coord < extent))
+    element_offset = _symbolic_shared_element_offset(
+        dsl,
+        address_layout,
+        physical_shape,
+        physical_coords,
+        goals,
+        order=order,
+        intervals=intervals,
+        paddings=paddings,
+    )
+    bit_offset = element_bits * element_offset
+    goals.extend((
+        bit_offset >= 0,
+        bit_offset + element_bits <= allocation_bits,
+    ))
+
+    facts = (
+        *_symbolic_range_predicates(
+            dsl,
+            item,
+            0,
+            lane_width * warp_count - 1,
+        ),
+        *_symbolic_range_predicates(
+            dsl,
+            slot,
+            0,
+            register_count - 1,
+        ),
+    )
+    checked, normalized = dsl.ixs_check((*goals, bit_offset), facts)
+    goal_proofs = checked[:len(goals)]
+    if any(proof is not True for proof in goal_proofs):
+        status = "False" if False in goal_proofs else "Unknown"
+        raise ValueError(f"symbolic local memory address proof returned {status}")
+    return dsl.ixs_serialize(normalized[len(goals)])
+
+
+def memdesc_index_element_offset_relation(
+    parent_layout,
+    child_layout,
+    parent_shape,
+    child_shape,
+    *,
+    element_byte_width,
+    allocation_bytes,
+    stage=STAGE,
+    diagnostic="TLXW_TYPE_UNSUPPORTED_LAYOUT",
+    source_op_index=None,
+    source_value_id=None,
+):
+    """Return the exact physical element offset of a memdesc slot.
+
+    A ``ttg.memdesc_index`` drops the leading logical slot dimensions.  Its
+    pointer is therefore the shared-layout image of the row-major logical
+    element ``slot * product(child_shape)``.  The same address maps are used
+    for the parent base and for accesses through the resulting child view;
+    proving their translation identity here makes that pointer view exact.
+    """
+    parent_shape = tuple(int(extent) for extent in parent_shape)
+    child_shape = tuple(int(extent) for extent in child_shape)
+    element_byte_width = int(element_byte_width)
+    allocation_bytes = int(allocation_bytes)
+    if (not parent_shape or not child_shape or any(extent <= 0 for extent in (*parent_shape, *child_shape))):
+        raise ValueError("memdesc index relation requires positive ranked shapes")
+    if element_byte_width <= 0 or allocation_bytes <= 0:
+        raise ValueError("memdesc index relation requires positive physical extents")
+    parent_elements = _product(parent_shape)
+    child_elements = _product(child_shape)
+    if parent_elements % child_elements:
+        raise ValueError("memdesc index child shape does not evenly tile its parent shape")
+    slot_count = parent_elements // child_elements
+    if slot_count <= 0:
+        raise ValueError("memdesc index relation requires a nonempty slot domain")
+
+    parent_address, parent_order, parent_intervals, parent_paddings = (_shared_address_layout(
+        parent_layout,
+        parent_shape,
+        stage=stage,
+        diagnostic=diagnostic,
+        source_op_index=source_op_index,
+        source_value_id=source_value_id,
+    ))
+    child_address, child_order, child_intervals, child_paddings = (_shared_address_layout(
+        child_layout,
+        child_shape,
+        stage=stage,
+        diagnostic=diagnostic,
+        source_op_index=source_op_index,
+        source_value_id=source_value_id,
+    ))
+    dsl = load_wave_dsl()
+    slot = dsl.sym("slot")
+    child_linear = dsl.sym("child")
+
+    def row_major_coords(linear, shape, goals):
+        coords = []
+        for dim, extent in enumerate(shape):
+            stride = _product(shape[dim + 1:])
+            coord = dsl.mod(dsl.floor(linear / stride), int(extent))
+            goals.extend((coord >= 0, coord < int(extent)))
+            coords.append(coord)
+        return tuple(coords)
+
+    base_goals = []
+    base_linear = slot * child_elements
+    base_coords = row_major_coords(base_linear, parent_shape, base_goals)
+    base_offset = _symbolic_shared_element_offset(
+        dsl,
+        parent_address,
+        parent_shape,
+        base_coords,
+        base_goals,
+        order=parent_order,
+        intervals=parent_intervals,
+        paddings=parent_paddings,
+    )
+    base_byte_offset = base_offset * element_byte_width
+    base_goals.extend((
+        dsl.ixs_eq(base_offset, dsl.floor(base_offset)),
+        dsl.ixs_eq(
+            dsl.mod(base_byte_offset, element_byte_width),
+            dsl.ixs_int(0),
+        ),
+        base_byte_offset >= 0,
+        base_byte_offset + element_byte_width <= allocation_bytes,
+    ))
+    slot_facts = _symbolic_range_predicates(
+        dsl,
+        slot,
+        0,
+        slot_count - 1,
+    )
+    checked, normalized = dsl.ixs_check(
+        (*base_goals, base_offset),
+        slot_facts,
+    )
+    if any(proof is not True for proof in checked[:len(base_goals)]):
+        proofs = checked[:len(base_goals)]
+        status = "False" if False in proofs else "Unknown"
+        raise ValueError(f"symbolic memdesc index base proof returned {status}")
+
+    # A child memdesc remains a normal shared-layout view only when the parent
+    # map restricted to each logical slot is a translated copy of the child's
+    # map.  Establish that identity over the complete child domain instead of
+    # inferring it from sampled slot offsets.
+    translation_goals = []
+    parent_linear = base_linear + child_linear
+    parent_coords = row_major_coords(
+        parent_linear,
+        parent_shape,
+        translation_goals,
+    )
+    parent_offset = _symbolic_shared_element_offset(
+        dsl,
+        parent_address,
+        parent_shape,
+        parent_coords,
+        translation_goals,
+        order=parent_order,
+        intervals=parent_intervals,
+        paddings=parent_paddings,
+    )
+    child_coords = row_major_coords(
+        child_linear,
+        child_shape,
+        translation_goals,
+    )
+    child_offset = _symbolic_shared_element_offset(
+        dsl,
+        child_address,
+        child_shape,
+        child_coords,
+        translation_goals,
+        order=child_order,
+        intervals=child_intervals,
+        paddings=child_paddings,
+    )
+    translation_goals.extend((
+        dsl.ixs_eq(parent_offset, base_offset + child_offset),
+        parent_offset * element_byte_width + element_byte_width <= allocation_bytes,
+    ))
+    translation_facts = (
+        *slot_facts,
+        *_symbolic_range_predicates(
+            dsl,
+            child_linear,
+            0,
+            child_elements - 1,
+        ),
+    )
+    proofs, _ = dsl.ixs_check(tuple(translation_goals), translation_facts)
+    if any(proof is not True for proof in proofs):
+        status = "False" if False in proofs else "Unknown"
+        raise ValueError("symbolic memdesc index child-translation proof returned "
+                         f"{status}")
+    return (
+        dsl.ixs_serialize(normalized[len(base_goals)]),
+        int(slot_count),
+    )
+
+
+def shared_allocation_size_bytes(
+    layout,
+    shape,
+    element_byte_width,
+    *,
+    stage=STAGE,
+    diagnostic="TLXW_TYPE_UNSUPPORTED_LAYOUT",
+    source_op_index=None,
+    source_value_id=None,
+):
+    """Return the allocation size required by one shared address layout."""
+    shape = tuple(int(extent) for extent in shape)
+    element_byte_width = int(element_byte_width)
+    if not shape or any(extent <= 0 for extent in shape) or element_byte_width <= 0:
+        raise ValueError("shared allocation requires positive shape and element size")
+    _address, _order, intervals, paddings = _shared_address_layout(
         layout,
         shape,
-        coords,
-        int(element_byte_width),
         stage=stage,
         diagnostic=diagnostic,
         source_op_index=source_op_index,
         source_value_id=source_value_id,
     )
+    logical_extent = _product(shape)
+    padding_extent = sum((logical_extent // interval - int(logical_extent % interval == 0)) * padding
+                         for interval, padding in zip(intervals, paddings))
+    return (logical_extent + padding_extent) * element_byte_width
 
 
-def shared_physical_offset_expression_plan(
-    layout,
-    shape,
-    element_byte_width,
-    *,
-    stage=STAGE,
-    diagnostic="TLXW_TYPE_UNSUPPORTED_LAYOUT",
-    source_op_index=None,
-    source_value_id=None,
+def _packet_relation_blob(
+        source,
+        result,
+        source_shape,
+        result_shape,
+        *,
+        lane_width,
+        source_components,
+        destination_components,
+        transform="identity",
+        axis=None,
+        order=(),
+        selector=None,
 ):
-    shape = tuple(int(dim) for dim in shape)
-    element_byte_width = int(element_byte_width)
-    if element_byte_width <= 0:
-        _shared_layout_fail(
-            diagnostic,
-            stage,
-            "shared physical offset expression requires a positive element byte width",
-            layout=layout,
-            source_op_index=source_op_index,
-            source_value_id=source_value_id,
-        )
-    kind = shared_layout_kind(layout)
-    if kind == "dense":
-        return PhysicalOffsetExpressionPlan(
-            expression_kind="dense_row_major",
-            offset_unit="element",
-            element_byte_width=element_byte_width,
-            layout_kind=kind,
-            order=default_physical_order(shape),
-            provenance="dense_row_major",
-        )
-    if kind == "swizzled_shared":
-        if is_identity_swizzled_shared(layout, shape):
-            return PhysicalOffsetExpressionPlan(
-                expression_kind="dense_row_major",
-                offset_unit="element",
-                element_byte_width=element_byte_width,
-                layout_kind=kind,
-                order=default_physical_order(shape),
-                assumptions=("identity_swizzled_shared", ),
-                provenance="identity_swizzled_row_major",
-            )
-        order, vec, per_phase, max_phase = swizzled_shared_parameters(
-            layout,
-            shape,
-            stage=stage,
-            diagnostic=diagnostic,
-            source_op_index=source_op_index,
-            source_value_id=source_value_id,
-        )
-        return PhysicalOffsetExpressionPlan(
-            expression_kind="swizzled_xor",
-            offset_unit="element",
-            element_byte_width=element_byte_width,
-            layout_kind=kind,
-            order=tuple(int(dim) for dim in order),
-            assumptions=("minor_extent_divisible_by_vec", ),
-            provenance="swizzled_shared",
-            swizzled_vec=int(vec),
-            swizzled_per_phase=int(per_phase),
-            swizzled_max_phase=int(max_phase),
-        )
-    if kind == "shared_linear":
-        order = shared_layout_physical_order(
-            layout,
-            shape,
-            stage=stage,
-            diagnostic=diagnostic,
-            source_op_index=source_op_index,
-            source_value_id=source_value_id,
-        )
-        inverse_offset_bases = shared_linear_inverse_offset_bases(
-            layout,
-            shape,
-            stage=stage,
-            diagnostic=diagnostic,
-            source_op_index=source_op_index,
-            source_value_id=source_value_id,
-        )
-        return PhysicalOffsetExpressionPlan(
-            expression_kind="linear_shared",
-            offset_unit="element",
-            element_byte_width=element_byte_width,
-            layout_kind=kind,
-            order=tuple(int(dim) for dim in order),
-            assumptions=("single_block_bijective_shared_linear", ),
-            provenance="shared_linear_inverse",
-            linear_inverse_offset_bases=inverse_offset_bases,
-        )
-    if kind == "padded_shared":
-        intervals, paddings = padded_shared_parameters(
-            layout,
-            stage=stage,
-            diagnostic=diagnostic,
-            source_op_index=source_op_index,
-            source_value_id=source_value_id,
-        )
-        order = shared_layout_physical_order(
-            layout,
-            shape,
-            stage=stage,
-            diagnostic=diagnostic,
-            source_op_index=source_op_index,
-            source_value_id=source_value_id,
-        )
-        offset_bases = padded_shared_linear_component_bases(
-            layout,
-            shape,
-            stage=stage,
-            diagnostic=diagnostic,
-            source_op_index=source_op_index,
-            source_value_id=source_value_id,
-        )
-        return PhysicalOffsetExpressionPlan(
-            expression_kind="padded_linear",
-            offset_unit="element",
-            element_byte_width=element_byte_width,
-            layout_kind=kind,
-            order=tuple(int(dim) for dim in order),
-            assumptions=("valid_padded_intervals", ),
-            provenance="padded_shared",
-            intervals=tuple(int(value) for value in intervals),
-            paddings=tuple(int(value) for value in paddings),
-            linear_component_bases=tuple(tuple(int(value) for value in basis) for basis in offset_bases),
-        )
-    _shared_layout_fail(
-        diagnostic,
-        stage,
-        f"shared physical offset expression does not support layout {kind}",
-        layout=layout,
-        source_op_index=source_op_index,
-        source_value_id=source_value_id,
+    if source is None or result is None:
+        raise ValueError("packet redistribution requires distributed linear layouts")
+    source = _complete_packet_physical_dims(source)
+    result = _complete_packet_physical_dims(result)
+    if not source.is_surjective():
+        raise ValueError("packet redistribution requires a surjective source layout")
+    source_extents = {name: linear_layout_in_dim_size(source, name) for name in ("register", "lane", "warp", "block")}
+    result_extents = {name: linear_layout_in_dim_size(result, name) for name in ("register", "lane", "warp", "block")}
+    if source_extents["lane"] != result_extents["lane"]:
+        raise ValueError("packet redistribution requires equal source/result lane domains")
+    if source_extents["block"] != result_extents["block"]:
+        raise ValueError("packet redistribution requires equal source/result block domains")
+    mapped_dims, structural = _packet_transform_descriptor(
+        source_shape,
+        result_shape,
+        transform=transform,
+        axis=axis,
+        order=order,
     )
-
-
-def physical_offset_expression_plan_attrs(plan, prefix):
-    prefix = str(prefix)
-    attrs = {
-        f"{prefix}_physical_offset_plan": plan.expression_kind,
-        f"{prefix}_physical_offset_unit": plan.offset_unit,
-        f"{prefix}_physical_element_byte_width": int(plan.element_byte_width),
-        f"{prefix}_physical_layout_kind": plan.layout_kind,
-        f"{prefix}_physical_order": tuple(int(dim) for dim in plan.order),
-        f"{prefix}_physical_bindings": tuple(str(name) for name in plan.bindings),
-        f"{prefix}_physical_assumptions": tuple(str(assumption) for assumption in plan.assumptions),
-        f"{prefix}_physical_proof_status": plan.proof_status,
-        f"{prefix}_physical_provenance": plan.provenance,
+    dsl = load_wave_dsl()
+    item = dsl.sym("item")
+    packet = {
+        "block": dsl.sym("block"),
+        "item": item,
+        "lane": dsl.mod(item, int(lane_width)),
+        "warp": dsl.floor(item / int(lane_width)),
+        "register": dsl.sym("slot"),
     }
-    if plan.expression_kind == "padded_linear" or plan.intervals:
-        attrs[f"{prefix}_physical_intervals"] = tuple(int(value) for value in plan.intervals)
-    if plan.expression_kind == "padded_linear" or plan.paddings:
-        attrs[f"{prefix}_physical_paddings"] = tuple(int(value) for value in plan.paddings)
-    if plan.swizzled_vec is not None:
-        attrs[f"{prefix}_physical_swizzled_vec"] = int(plan.swizzled_vec)
-    if plan.swizzled_per_phase is not None:
-        attrs[f"{prefix}_physical_swizzled_per_phase"] = int(plan.swizzled_per_phase)
-    if plan.swizzled_max_phase is not None:
-        attrs[f"{prefix}_physical_swizzled_max_phase"] = int(plan.swizzled_max_phase)
-    if plan.linear_component_bases:
-        attrs[f"{prefix}_physical_linear_component_bases"] = tuple(
-            tuple(int(value) for value in basis) for basis in plan.linear_component_bases)
-    if plan.linear_inverse_offset_bases:
-        attrs[f"{prefix}_physical_linear_inverse_offset_bases"] = tuple(
-            tuple(int(value) for value in bases) for bases in plan.linear_inverse_offset_bases)
-    return attrs
+    if structural:
+        name, _extent, _source_dim = structural
+        packet[name] = dsl.sym(name) if selector is None else dsl.ixs_int(int(selector))
+    destination_extents = dict(result_extents)
+
+    def packet_fact_predicates():
+        relation_facts = (
+            *_symbolic_range_predicates(
+                dsl,
+                packet["block"],
+                0,
+                destination_extents["block"] - 1,
+            ),
+            *_symbolic_range_predicates(
+                dsl,
+                packet["item"],
+                0,
+                int(lane_width) * destination_extents["warp"] - 1,
+            ),
+            *_symbolic_range_predicates(
+                dsl,
+                packet["register"],
+                0,
+                destination_extents["register"] - 1,
+            ),
+        )
+        if structural and selector is None:
+            name, extent, _source_dim = structural
+            relation_facts += _symbolic_range_predicates(
+                dsl,
+                packet[name],
+                0,
+                extent - 1,
+            )
+        return relation_facts
+
+    def normalize_named(expressions, query_facts):
+        names = tuple(expressions)
+        _, normalized = dsl.ixs_check(
+            tuple(expressions[name] for name in names),
+            query_facts,
+        )
+        return dict(zip(names, normalized))
+
+    facts = packet_fact_predicates()
+    source_dims = tuple((str(name), int(size)) for name, size in source.out_dims)
+    result_dims = tuple((str(name), int(size)) for name, size in result.out_dims)
+    if (int(destination_components) <= 0 or result_extents["register"] % int(destination_components)):
+        raise ValueError("packet component count does not split the register domain")
+    source_slots = linear_layout_in_dim_size(source, "register")
+    source_warps = linear_layout_in_dim_size(source, "warp")
+    source_items = int(lane_width) * source_warps
+    source_blocks = linear_layout_in_dim_size(source, "block")
+    packed_extent = source_blocks * source_items * source_slots
+    result_physical = {
+        "register": dsl.mod(packet["register"], result_extents["register"]),
+        "lane": dsl.mod(packet["lane"], result_extents["lane"]),
+        "warp": dsl.mod(packet["warp"], result_extents["warp"]),
+        "block": dsl.mod(packet["block"], result_extents["block"]),
+    }
+    result_logical = _symbolic_layout_formula(dsl, result, result_physical)
+    expected_logical = _transform_logical_coordinates(
+        dsl,
+        result_logical,
+        source_dims,
+        result_dims,
+        mapped_dims,
+        structural,
+        packet,
+        reshape=transform == "reshape",
+    )
+    inverse = source.pseudoinvert()
+    mapped = _symbolic_layout_formula(dsl, inverse, expected_logical)
+    # Canonicalize the inverse physical coordinate under the exact destination
+    # packet domain before carrying it into the packed relation.
+    mapped = normalize_named(mapped, facts)
+    # Prove logical preservation through the canonical linear-layout
+    # composition.  Re-extracting bits from the materialized integer physical
+    # coordinate would discard the inverse's exact bit provenance.  Bits added
+    # below for replicated physical axes are kernel bases of the source layout,
+    # so they affect packet ownership but cannot affect this logical result.
+    mapped_logical = _symbolic_layout_formula(dsl, inverse.compose(source), expected_logical)
+    # A zero physical basis is an exact value replication.  The pseudoinverse
+    # leaves that free bit zero, so retain the destination's corresponding bit.
+    for name, bases in source.bases:
+        name = str(name)
+        for bit, basis in enumerate(bases):
+            if any(int(coefficient) for coefficient in basis):
+                continue
+            scale = 1 << bit
+            preferred = dsl.mod(dsl.floor(result_physical[name] / scale), 2)
+            mapped[name] = dsl.xor(mapped[name], scale * preferred)
+    mapped_item = mapped["warp"] * int(lane_width) + mapped["lane"]
+    packed = ((mapped["block"] * source_items + mapped_item) * source_slots + mapped["register"])
+    expected_logical = normalize_named(expected_logical, facts)
+    mapped_logical = normalize_named(mapped_logical, facts)
+    if mapped_logical.keys() != expected_logical.keys():
+        raise ValueError("packet relation proof has incompatible logical dimensions")
+    proof_goals = [
+        *((
+            f"logical_{name}",
+            dsl.ixs_eq(mapped_logical[name], expected_logical[name]),
+        ) for name in expected_logical),
+        ("block_lower_bound", mapped["block"] >= 0),
+        ("block_upper_bound", mapped["block"] < source_blocks),
+        ("lane_lower_bound", mapped["lane"] >= 0),
+        ("lane_upper_bound", mapped["lane"] < int(lane_width)),
+        ("warp_lower_bound", mapped["warp"] >= 0),
+        ("warp_upper_bound", mapped["warp"] < source_warps),
+        ("register_lower_bound", mapped["register"] >= 0),
+        ("register_upper_bound", mapped["register"] < source_slots),
+        ("item_lower_bound", mapped_item >= 0),
+        ("item_upper_bound", mapped_item < source_items),
+        ("packed_lower_bound", packed >= 0),
+        (
+            "packed_upper_bound",
+            packed < packed_extent,
+        ),
+        (
+            "unpacked_slot",
+            dsl.ixs_eq(dsl.mod(packed, source_slots), mapped["register"]),
+        ),
+        (
+            "unpacked_item",
+            dsl.ixs_eq(
+                dsl.mod(dsl.floor(packed / source_slots), source_items),
+                mapped_item,
+            ),
+        ),
+        (
+            "unpacked_block",
+            dsl.ixs_eq(
+                dsl.floor(packed / (source_slots * source_items)),
+                mapped["block"],
+            ),
+        ),
+    ]
+    proofs, normalized = dsl.ixs_check((*tuple(goal for _name, goal in proof_goals), packed), facts)
+    proofs = proofs[:len(proof_goals)]
+    if any(proof is not True for proof in proofs):
+        status = "False" if False in proofs else "Unknown"
+        failed = tuple(name for (name, _goal), proof in zip(proof_goals, proofs) if proof is not True)
+        raise ValueError("symbolic packet relation preservation proof returned "
+                         f"{status} for goals {failed}")
+    return dsl.ixs_serialize(normalized[len(proof_goals)])
 
 
-def shared_layout_kind(layout):
-    if layout is None or layout.kind == "none":
-        return "dense"
-    if layout.kind in {"linear", "generic_linear"}:
-        return "linear_shared"
-    return str(layout.kind)
-
-
-def default_physical_order(shape):
-    return tuple(reversed(range(len(tuple(shape)))))
-
-
-def expand_physical_order(
-    order,
-    rank,
-    *,
-    layout=None,
-    stage=STAGE,
-    diagnostic="TLXW_TYPE_UNSUPPORTED_LAYOUT",
-    source_op_index=None,
-    source_value_id=None,
+def _symbolic_layout_formula(
+    dsl,
+    linear,
+    inputs,
+    component_count=None,
 ):
-    order = tuple(int(dim) for dim in order)
-    rank = int(rank)
-    if len(order) > rank or sorted(order) != list(range(len(order))):
+    out_dims = tuple((str(name), int(size)) for name, size in linear.out_dims)
+    if component_count is not None:
+        register_count = linear_layout_in_dim_size(linear, "register")
+        if component_count <= 0 or register_count % component_count:
+            raise ValueError("packet component count does not split the register domain")
+    coordinates = [dsl.ixs_int(0) for _name, _size in out_dims]
+    for name, values in linear.bases:
+        source = inputs[str(name)]
+        for bit, basis in enumerate(values):
+            bit_value = dsl.mod(dsl.floor(source / (1 << bit)), 2)
+            for dim, coefficient in enumerate(basis):
+                if not coefficient:
+                    continue
+                if _is_power_of_two(out_dims[dim][1]):
+                    coordinates[dim] = dsl.xor(coordinates[dim], int(coefficient) * bit_value)
+                else:
+                    coordinates[dim] += int(coefficient) * bit_value
+    return {
+        name: coordinate if _is_power_of_two(size) else dsl.mod(coordinate, size)
+        for (name, size), coordinate in zip(out_dims, coordinates)
+    }
+
+
+def _symbolic_shared_element_offset(
+        dsl,
+        address_layout,
+        shape,
+        coords,
+        goals,
+        *,
+        order=(),
+        intervals=(),
+        paddings=(),
+):
+    if address_layout is None:
+        offset = dsl.ixs_int(0)
+        stride = 1
+        for dim in order:
+            offset += coords[int(dim)] * stride
+            stride *= int(shape[int(dim)])
+    else:
+        inner_rank = len(address_layout.inner_shape)
+        prefix_coords = tuple(coords[:-inner_rank]) if inner_rank else tuple(coords)
+        inner_coords = tuple(coords[-inner_rank:]) if inner_rank else ()
+        mapped = _symbolic_layout_formula(
+            dsl,
+            address_layout.linear_layout,
+            {f"dim{dim}": coord
+             for dim, coord in enumerate(inner_coords)},
+        )
+        outer = dsl.ixs_int(0)
+        for coord, extent in zip(prefix_coords, address_layout.prefix_shape):
+            outer = outer * int(extent) + coord
+        offset = outer * _product(address_layout.inner_shape) + mapped["offset"]
+        goals.append(dsl.ixs_eq(mapped["block"], dsl.ixs_int(0)))
+    goals.extend((offset >= 0, offset < _product(shape)))
+    encoded = offset
+    for interval, padding in zip(intervals, paddings):
+        encoded += dsl.floor(offset / int(interval)) * int(padding)
+    return encoded
+
+
+def _shared_address_layout(
+    layout,
+    shape,
+    *,
+    stage,
+    diagnostic,
+    source_op_index,
+    source_value_id,
+):
+    """Return the logical-coordinate to unpadded physical-offset map."""
+    shape = tuple(int(extent) for extent in shape)
+
+    def reject(message):
         _shared_layout_fail(
             diagnostic,
             stage,
-            f"shared layout order {order} cannot be applied to rank-{rank} shape",
+            message,
             layout=layout,
             source_op_index=source_op_index,
             source_value_id=source_value_id,
         )
-    prefix_rank = rank - len(order)
-    mapped = tuple(prefix_rank + int(dim) for dim in order)
-    return mapped + tuple(reversed(range(prefix_rank)))
 
-
-def shared_layout_physical_order(
-    layout,
-    shape,
-    *,
-    stage=STAGE,
-    diagnostic="TLXW_TYPE_UNSUPPORTED_LAYOUT",
-    source_op_index=None,
-    source_value_id=None,
-):
-    shape = tuple(int(dim) for dim in shape)
-    if not shape:
-        return ()
-    if layout is not None and layout.kind in {
+    kind = "dense" if layout is None or layout.kind == "none" else str(layout.kind)
+    order = tuple(reversed(range(len(shape))))
+    if layout is not None and kind in {
             "padded_shared",
             "shared_linear",
             "swizzled_shared",
     }:
-        order = tuple(int(dim) for dim in layout.properties.get("order", ()))
-        if order:
-            return expand_physical_order(
-                order,
-                len(shape),
-                layout=layout,
-                stage=stage,
-                diagnostic=diagnostic,
-                source_op_index=source_op_index,
-                source_value_id=source_value_id,
-            )
-    return default_physical_order(shape)
+        inner_order = tuple(int(dim) for dim in layout.properties.get("order", ()))
+        if inner_order:
+            if len(inner_order) > len(shape) or sorted(inner_order) != list(range(len(inner_order))):
+                reject(f"shared layout order {inner_order} cannot be applied to "
+                       f"rank-{len(shape)} shape")
+            prefix_rank = len(shape) - len(inner_order)
+            order = tuple(prefix_rank + dim for dim in inner_order) + tuple(reversed(range(prefix_rank)))
+    if kind == "dense":
+        return None, tuple(order), (), ()
+    if kind not in {"padded_shared", "shared_linear", "swizzled_shared"}:
+        reject(f"shared address layout does not support {kind}")
 
-
-def shared_linear_inverse_offset_bases(
-    layout,
-    shape,
-    *,
-    stage,
-    diagnostic,
-    source_op_index,
-    source_value_id,
-):
-    """Import a shared-linear logical-coordinate to LDS-offset map.
-
-    ``SharedLinearEncodingAttr`` stores the forward GF(2) map from physical
-    ``(offset, block)`` bits to logical coordinates.  Address generation needs
-    the inverse map.  Preserve that map as one offset-bit mask per logical
-    coordinate bit; masks may contain multiple bits and are combined with XOR.
-    """
-    shape = tuple(int(dim) for dim in shape)
-    linear = layout.properties.get("linear_component")
-    if linear is None:
-        _shared_layout_fail(
-            diagnostic,
-            stage,
-            "shared_linear layout is missing its linear map",
-            layout=layout,
-            source_op_index=source_op_index,
-            source_value_id=source_value_id,
-        )
-    in_dims = tuple(str(dim) for dim in linear.get_in_dim_names())
+    forward = layout.linear_layout
+    if forward is None:
+        reject(f"{kind} is missing its canonical LinearLayout")
+    in_dims = tuple(str(name) for name in forward.get_in_dim_names())
     if in_dims != ("offset", "block"):
-        _shared_layout_fail(
-            diagnostic,
-            stage,
-            "shared_linear map must use [offset, block] input dims; "
-            f"got {in_dims}",
-            layout=layout,
-            source_op_index=source_op_index,
-            source_value_id=source_value_id,
+        reject(f"shared address map must use [offset, block] input dims; got {in_dims}")
+    out_dims = tuple((str(name), int(extent)) for name, extent in forward.out_dims)
+    component_rank = len(out_dims)
+    if component_rank == 0 or component_rank > len(shape):
+        reject("shared address map rank does not fit the memdesc shape; "
+               f"map={out_dims}, shape={shape}")
+    inner_shape = shape[-component_rank:]
+    prefix_shape = shape[:-component_rank]
+    expected_out_dims = tuple((f"dim{dim}", int(extent)) for dim, extent in enumerate(inner_shape))
+    if out_dims != expected_out_dims:
+        reject("shared address map output dims do not match the trailing "
+               f"memdesc shape; got {out_dims}, expected {expected_out_dims}")
+    if not forward.is_invertible():
+        reject("shared address layout must be bijective")
+    inverse = forward.invert()
+    outputs = {str(name): int(extent) for name, extent in inverse.out_dims}
+    if outputs != {"offset": _product(inner_shape), "block": 1}:
+        reject(f"shared address layout has invalid physical domain {outputs}")
+    if kind == "padded_shared":
+        intervals = tuple(int(value) for value in layout.properties.get("intervals", ()))
+        paddings = tuple(int(value) for value in layout.properties.get("paddings", ()))
+        description = f"order={inner_order}, intervals={intervals}, paddings={paddings}"
+        if len(intervals) != len(paddings):
+            reject(f"padded shared interval/padding counts differ; {description}")
+        if any(interval <= 0 for interval in intervals):
+            reject(f"padded shared intervals must be positive; {description}")
+        if any(padding < 0 for padding in paddings):
+            reject(f"padded shared paddings must be nonnegative; {description}")
+    else:
+        intervals = paddings = ()
+    return (
+        _SharedAddressMap(
+            inverse,
+            tuple(prefix_shape),
+            tuple(inner_shape),
+        ),
+        tuple(order),
+        tuple(intervals),
+        tuple(paddings),
+    )
+
+
+def _complete_packet_physical_dims(linear):
+    bases = {str(name): values for name, values in linear.bases}
+    unknown = tuple(sorted(set(bases) - {"register", "lane", "warp", "block"}))
+    if unknown:
+        raise ValueError("packet layout has unbound physical input dimensions "
+                         f"{unknown}; compose helper dimensions into the packet domain first")
+    if all(name in bases for name in ("register", "lane", "warp", "block")):
+        return linear
+    names = tuple(bases) + tuple(name for name in ("register", "lane", "warp", "block") if name not in bases)
+    return LinearLayout.from_bases(
+        tuple((name, bases.get(name, ())) for name in names),
+        [str(name) for name, _size in linear.out_dims],
+        [int(size) for _name, size in linear.out_dims],
+        False,
+    )
+
+
+def _joined_packet_layout(layout):
+    linear = layout.linear_layout
+    if linear is None:
+        _layout_fail(
+            "TLXW_TYPE_UNSUPPORTED_LAYOUT",
+            STAGE,
+            "packet join requires a distributed linear layout",
+            source_value_id=layout.value_id,
         )
     out_dims = tuple((str(name), int(size)) for name, size in linear.out_dims)
-    expected_out_dims = tuple((f"dim{dim}", int(extent)) for dim, extent in enumerate(shape))
-    if out_dims != expected_out_dims:
-        _shared_layout_fail(
-            diagnostic,
-            stage,
-            "shared_linear output dims do not match memdesc shape; "
-            f"got {out_dims}, expected {expected_out_dims}",
-            layout=layout,
-            source_op_index=source_op_index,
-            source_value_id=source_value_id,
-        )
-    if not linear.is_invertible():
-        _shared_layout_fail(
-            diagnostic,
-            stage,
-            "shared_linear map must be bijective for Wave LDS addressing",
-            layout=layout,
-            source_op_index=source_op_index,
-            source_value_id=source_value_id,
-        )
-    inverse = linear.invert()
-    inverse_in_dims = tuple(str(dim) for dim in inverse.get_in_dim_names())
-    expected_in_dims = tuple(name for name, _size in expected_out_dims)
-    inverse_out_dims = tuple((str(name), int(size)) for name, size in inverse.out_dims)
-    if inverse_in_dims != expected_in_dims or tuple(name for name, _size in inverse_out_dims) != (
-            "offset",
-            "block",
-    ):
-        _shared_layout_fail(
-            diagnostic,
-            stage,
-            "shared_linear inverse map has unexpected dimensions; "
-            f"inputs={inverse_in_dims}, outputs={inverse_out_dims}",
-            layout=layout,
-            source_op_index=source_op_index,
-            source_value_id=source_value_id,
-        )
-    offset_size = dict(inverse_out_dims)["offset"]
-    block_size = dict(inverse_out_dims)["block"]
-    if int(block_size) != 1 or int(offset_size) != _product(shape):
-        _shared_layout_fail(
-            diagnostic,
-            stage,
-            "Wave shared_linear addressing requires one block and one unique "
-            f"offset per element; inverse outputs={inverse_out_dims}, shape={shape}",
-            layout=layout,
-            source_op_index=source_op_index,
-            source_value_id=source_value_id,
-        )
-    result = []
-    for dim, extent in enumerate(shape):
-        name = f"dim{dim}"
-        bases = linear_layout_bases(inverse, name)
-        expected_bits = _power_of_two_log2(
-            extent,
-            layout=layout,
-            stage=stage,
-            diagnostic=diagnostic,
-            source_op_index=source_op_index,
-            source_value_id=source_value_id,
-        )
-        if len(bases) != expected_bits or any(len(basis) != 2 for basis in bases):
-            _shared_layout_fail(
-                diagnostic,
-                stage,
-                "shared_linear inverse bases do not match the logical shape; "
-                f"dim={name}, bases={bases}, extent={extent}",
-                layout=layout,
-                source_op_index=source_op_index,
-                source_value_id=source_value_id,
-            )
-        if any(int(basis[1]) != 0 for basis in bases):
-            _shared_layout_fail(
-                diagnostic,
-                stage,
-                "shared_linear logical coordinates must not select another "
-                f"CTA block; dim={name}, bases={bases}",
-                layout=layout,
-                source_op_index=source_op_index,
-                source_value_id=source_value_id,
-            )
-        offset_bases = tuple(int(basis[0]) for basis in bases)
-        if any(value < 0 or value >= int(offset_size) for value in offset_bases):
-            _shared_layout_fail(
-                diagnostic,
-                stage,
-                "shared_linear inverse offset basis exceeds the allocation; "
-                f"dim={name}, bases={offset_bases}, offset_size={offset_size}",
-                layout=layout,
-                source_op_index=source_op_index,
-                source_value_id=source_value_id,
-            )
-        result.append(offset_bases)
-    return tuple(result)
-
-
-def offset_from_inverse_offset_bases(inverse_offset_bases, coords):
-    offset = 0
-    for dim, bases in enumerate(tuple(inverse_offset_bases)):
-        coord = int(coords[dim])
-        for bit, contribution in enumerate(tuple(bases)):
-            if coord & (1 << int(bit)):
-                offset ^= int(contribution)
-    return int(offset)
-
-
-def padded_shared_linear_component_bases(
-    layout,
-    shape,
-    *,
-    stage,
-    diagnostic,
-    source_op_index,
-    source_value_id,
-):
-    shape = tuple(int(dim) for dim in shape)
-    linear_component = layout.properties.get("linear_component")
-    if linear_component is not None:
-        bases = _padded_linear_component_offset_bases(
-            layout,
-            shape,
-            linear_component,
-            stage=stage,
-            diagnostic=diagnostic,
-            source_op_index=source_op_index,
-            source_value_id=source_value_id,
-        )
-    else:
-        order = shared_layout_physical_order(
-            layout,
-            shape,
-            stage=stage,
-            diagnostic=diagnostic,
-            source_op_index=source_op_index,
-            source_value_id=source_value_id,
-        )
-        bases = identity_offset_bases(shape, order)
-    _validate_padded_offset_bases(
-        layout,
-        shape,
+    selector = f"dim{len(out_dims)}"
+    bases = []
+    saw_register = False
+    for name, values in linear.bases:
+        values = [[*map(int, basis), 0] for basis in values]
+        if str(name) == "register":
+            saw_register = True
+            values.append([0] * len(out_dims) + [1])
+        bases.append((str(name), values))
+    if not saw_register:
+        bases.append(("register", [[0] * len(out_dims) + [1]]))
+    return LinearLayout.from_bases(
         bases,
-        stage=stage,
-        diagnostic=diagnostic,
-        source_op_index=source_op_index,
-        source_value_id=source_value_id,
+        [name for name, _size in out_dims] + [selector],
+        [size for _name, size in out_dims] + [2],
+        False,
     )
-    return tuple(tuple(int(value) for value in basis) for basis in bases)
 
 
-def _padded_linear_component_offset_bases(
-    layout,
-    shape,
-    linear_component,
+def _packet_transform_descriptor(source_shape, result_shape, *, transform, axis, order):
+    source_shape = tuple(int(dim) for dim in source_shape)
+    result_shape = tuple(int(dim) for dim in result_shape)
+    structural = None
+    if transform == "identity":
+        if source_shape != result_shape:
+            raise ValueError("identity layout conversion requires equal shapes")
+        mapped_dims = tuple(range(len(result_shape)))
+    elif transform == "broadcast":
+        if len(source_shape) != len(result_shape) or any(src not in (1, dst)
+                                                         for src, dst in zip(source_shape, result_shape)):
+            raise ValueError("broadcast layout conversion has incompatible shapes")
+        mapped_dims = tuple(None if size == 1 else dim for dim, size in enumerate(source_shape))
+    elif transform == "expand_dims":
+        if (axis is None or not 0 <= axis < len(result_shape) or result_shape[axis] != 1
+                or result_shape[:axis] + result_shape[axis + 1:] != source_shape):
+            raise ValueError("expand_dims layout conversion has incompatible shapes")
+        mapped_dims = tuple(None if dim == axis else dim - (dim > axis) for dim in range(len(result_shape)))
+    elif transform == "trans":
+        if (len(order) != len(source_shape) or sorted(order) != list(range(len(source_shape)))
+                or tuple(source_shape[dim] for dim in order) != result_shape):
+            raise ValueError("transpose layout conversion has an invalid order")
+        mapped_dims = tuple(int(dim) for dim in order)
+    elif transform in {"split", "reduction"}:
+        if (axis is None or not 0 <= axis < len(source_shape)
+                or source_shape[:axis] + source_shape[axis + 1:] != result_shape
+                or (transform == "split" and source_shape[axis] != 2)):
+            raise ValueError(f"{transform} layout conversion has incompatible shapes")
+        mapped_dims = tuple(dim + (dim >= axis) for dim in range(len(result_shape)))
+        name = "selector" if transform == "split" else "reduction"
+        structural = (name, int(source_shape[axis]), int(axis))
+    elif transform == "reshape":
+        if _product(source_shape) != _product(result_shape):
+            raise ValueError("reshape layout conversion changes the element count")
+        mapped_dims = None
+    else:
+        raise ValueError(f"unsupported packet layout transform {transform!r}")
+    return mapped_dims, structural
+
+
+def _transform_logical_coordinates(
+    dsl,
+    result_coordinates,
+    source_dims,
+    result_dims,
+    mapped_dims,
+    structural,
+    packet,
     *,
-    stage,
-    diagnostic,
-    source_op_index,
-    source_value_id,
+    reshape,
 ):
-    shape = tuple(int(dim) for dim in shape)
-    in_dims = tuple(str(dim) for dim in linear_component.get_in_dim_names())
-    if in_dims != ("offset", "block"):
-        _shared_layout_fail(
-            diagnostic,
-            stage,
-            "padded shared linearComponent must use [offset, block] input dims; "
-            f"got {in_dims}",
-            layout=layout,
-            source_op_index=source_op_index,
-            source_value_id=source_value_id,
-        )
-    out_dims = tuple((str(name), int(size)) for name, size in linear_component.out_dims)
-    component_shape = tuple(int(size) for _name, size in out_dims)
-    component_rank = len(component_shape)
-    if component_rank > len(shape):
-        _shared_layout_fail(
-            diagnostic,
-            stage,
-            "padded shared linearComponent rank exceeds memdesc shape rank; "
-            f"linearComponent dims={out_dims}, shape={shape}",
-            layout=layout,
-            source_op_index=source_op_index,
-            source_value_id=source_value_id,
-        )
-    expected_names = tuple((f"dim{dim}", int(extent)) for dim, extent in enumerate(component_shape))
-    if out_dims != expected_names or component_shape != shape[-component_rank:]:
-        _shared_layout_fail(
-            diagnostic,
-            stage,
-            "padded shared linearComponent output dims do not match trailing "
-            f"memdesc shape; got {out_dims}, shape={shape}",
-            layout=layout,
-            source_op_index=source_op_index,
-            source_value_id=source_value_id,
-        )
-    prefix_rank = len(shape) - component_rank
-    bases = [
-        tuple((0, ) * prefix_rank + tuple(int(value)
-                                          for value in basis))
-        for basis in linear_layout_bases(linear_component, "offset")
-    ]
-    for dim in reversed(range(prefix_rank)):
-        bits = _power_of_two_log2(
-            int(shape[dim]),
-            layout=layout,
-            stage=stage,
-            diagnostic=diagnostic,
-            source_op_index=source_op_index,
-            source_value_id=source_value_id,
-        )
-        for bit in range(bits):
-            basis = [0] * len(shape)
-            basis[dim] = 1 << bit
-            bases.append(tuple(basis))
-    return tuple(bases)
+    """Apply an ordinary tensor coordinate transform exactly."""
+    source_shape = tuple(size for _name, size in source_dims)
+    result_shape = tuple(size for _name, size in result_dims)
+    result_values = tuple(result_coordinates[str(name)] for name, _size in result_dims)
+    if reshape:
+        linear = dsl.ixs_int(0)
+        for coordinate, extent in zip(result_values, result_shape):
+            linear = linear * int(extent) + coordinate
+        values = [dsl.ixs_int(0)] * len(source_shape)
+        stride = 1
+        for dim in reversed(range(len(source_shape))):
+            values[dim] = dsl.mod(dsl.floor(linear / stride), source_shape[dim])
+            stride *= int(source_shape[dim])
+    else:
+        values = [dsl.ixs_int(0)] * len(source_shape)
+        for result_dim, source_dim in enumerate(mapped_dims):
+            if source_dim is not None:
+                values[source_dim] = result_values[result_dim]
+        if structural:
+            name, _extent, source_dim = structural
+            values[source_dim] = packet[name]
+    return {str(name): value for (name, _size), value in zip(source_dims, values)}
 
 
-def identity_offset_bases(shape, order):
-    shape = tuple(int(dim) for dim in shape)
-    bases = []
-    for dim in tuple(int(value) for value in order):
-        extent = int(shape[dim])
-        bits = _power_of_two_log2(extent)
-        for bit in range(bits):
-            basis = [0] * len(shape)
-            basis[dim] = 1 << bit
-            bases.append(tuple(basis))
-    return tuple(bases)
-
-
-def offset_from_linear_component_bases(
-    bases,
-    coords,
-    layout,
-    *,
-    stage,
-    diagnostic,
-    source_op_index,
-    source_value_id,
-):
-    offset = 0
-    for bit, dim, value in _iter_padded_offset_basis_bits(
-            layout,
-            bases,
-            len(tuple(coords)),
-            stage=stage,
-            diagnostic=diagnostic,
-            source_op_index=source_op_index,
-            source_value_id=source_value_id,
-    ):
-        if int(coords[dim]) & int(value):
-            offset += 1 << int(bit)
-    return int(offset)
-
-
-def _validate_padded_offset_bases(
-    layout,
-    shape,
-    bases,
-    *,
-    stage,
-    diagnostic,
-    source_op_index,
-    source_value_id,
-):
-    seen = set()
-    for _bit, dim, value in _iter_padded_offset_basis_bits(
-            layout,
-            bases,
-            len(tuple(shape)),
-            stage=stage,
-            diagnostic=diagnostic,
-            source_op_index=source_op_index,
-            source_value_id=source_value_id,
-    ):
-        key = (int(dim), int(value))
-        if key in seen:
-            _shared_layout_fail(
-                diagnostic,
-                stage,
-                "padded shared linearComponent repeats an offset basis bit; "
-                f"{padded_shared_description(layout)}",
-                layout=layout,
-                source_op_index=source_op_index,
-                source_value_id=source_value_id,
-            )
-        seen.add(key)
-
-
-def _iter_padded_offset_basis_bits(
-    layout,
-    bases,
-    rank,
-    *,
-    stage,
-    diagnostic,
-    source_op_index,
-    source_value_id,
-):
-    rank = int(rank)
-    for bit, basis in enumerate(tuple(bases)):
-        basis = tuple(int(value) for value in basis)
-        if len(basis) != rank:
-            _shared_layout_fail(
-                diagnostic,
-                stage,
-                "padded shared linearComponent basis rank does not match shape; "
-                f"basis={basis}, rank={rank}",
-                layout=layout,
-                source_op_index=source_op_index,
-                source_value_id=source_value_id,
-            )
-        nonzero = [(dim, value) for dim, value in enumerate(basis) if value]
-        if len(nonzero) != 1:
-            _shared_layout_fail(
-                diagnostic,
-                stage,
-                "padded shared linearComponent offset basis must move in "
-                f"exactly one dimension; basis={basis}",
-                layout=layout,
-                source_op_index=source_op_index,
-                source_value_id=source_value_id,
-            )
-        dim, value = nonzero[0]
-        if value <= 0 or not _is_power_of_two(value):
-            _shared_layout_fail(
-                diagnostic,
-                stage,
-                "padded shared linearComponent offset basis must be a "
-                f"positive power of two; basis={basis}",
-                layout=layout,
-                source_op_index=source_op_index,
-                source_value_id=source_value_id,
-            )
-        yield int(bit), int(dim), int(value)
-
-
-def _power_of_two_log2(
-    value,
-    *,
-    layout=None,
-    stage=STAGE,
-    diagnostic="TLXW_TYPE_UNSUPPORTED_LAYOUT",
-    source_op_index=None,
-    source_value_id=None,
-):
-    value = int(value)
-    if value <= 0 or not _is_power_of_two(value):
-        _shared_layout_fail(
-            diagnostic,
-            stage,
-            f"padded shared physical offset requires power-of-two shape dims; got {value}",
-            layout=layout,
-            source_op_index=source_op_index,
-            source_value_id=source_value_id,
-        )
-    return value.bit_length() - 1
-
-
-def _is_power_of_two(value):
-    value = int(value)
-    return value > 0 and value & (value - 1) == 0
-
-
-def static_linear_offset(shape, coords):
-    offset = 0
-    shape = tuple(int(dim) for dim in shape)
-    for dim, coord in enumerate(coords):
-        stride = _product(shape[dim + 1:])
-        offset += int(coord) * stride
-    return int(offset)
-
-
-def ordered_linear_offset(shape, coords, order):
-    offset = 0
-    stride = 1
-    shape = tuple(int(dim) for dim in shape)
-    for dim in order:
-        offset += int(coords[int(dim)]) * stride
-        stride *= int(shape[int(dim)])
-    return int(offset)
-
-
-def ordered_coords_from_linear(linear, shape, order):
-    coords = [0] * len(shape)
-    remainder = int(linear)
-    for dim in order:
-        extent = int(shape[int(dim)])
-        coords[int(dim)] = remainder % extent
-        remainder //= extent
-    return tuple(coords)
-
-
-def static_delinearize_row_major(
-    linear,
-    shape,
-    *,
-    stage=STAGE,
-    diagnostic="TLXW_TYPE_UNSUPPORTED_LAYOUT",
-    source_op_index=None,
-    source_value_id=None,
-    layout=None,
-):
-    shape = tuple(int(dim) for dim in shape)
-    coords = [0] * len(shape)
-    remainder = int(linear)
-    for dim in reversed(range(len(shape))):
-        extent = int(shape[dim])
-        coords[dim] = remainder % extent
-        remainder //= extent
-    if remainder:
-        _shared_layout_fail(
-            diagnostic,
-            stage,
-            f"linear index {linear} exceeds shape {shape}",
-            layout=layout,
-            source_op_index=source_op_index,
-            source_value_id=source_value_id,
-        )
-    return tuple(coords)
-
-
-def swizzled_shared_parameters(
-    layout,
-    shape,
-    *,
-    stage=STAGE,
-    diagnostic="TLXW_TYPE_UNSUPPORTED_LAYOUT",
-    source_op_index=None,
-    source_value_id=None,
-):
-    order = tuple(int(dim) for dim in layout.properties.get("order", ()))
-    shape = tuple(int(dim) for dim in shape)
-    if len(shape) < 2 or len(order) != len(shape) or sorted(order) != list(range(len(shape))):
-        _shared_layout_fail(
-            diagnostic,
-            stage,
-            "swizzled shared physical offsets require a rank-matching "
-            f"permutation; shape={shape}, {swizzled_shared_description(layout)}",
-            layout=layout,
-            source_op_index=source_op_index,
-            source_value_id=source_value_id,
-        )
-    vec = int(layout.properties["vec"])
-    per_phase = int(layout.properties["per_phase"])
-    max_phase = int(layout.properties["max_phase"])
-    if vec <= 0 or per_phase <= 0 or max_phase <= 0:
-        _shared_layout_fail(
-            diagnostic,
-            stage,
-            "swizzled shared layout requires positive vec/perPhase/maxPhase; "
-            f"got {swizzled_shared_description(layout)}",
-            layout=layout,
-            source_op_index=source_op_index,
-            source_value_id=source_value_id,
-        )
-    minor_extent = int(shape[int(order[0])])
-    if minor_extent % vec:
-        _shared_layout_fail(
-            diagnostic,
-            stage,
-            f"swizzled shared minor extent {minor_extent} is not divisible "
-            f"by vec={vec}; {swizzled_shared_description(layout)}",
-            layout=layout,
-            source_op_index=source_op_index,
-            source_value_id=source_value_id,
-        )
-    return order, vec, per_phase, max_phase
-
-
-def swizzled_shared_linear_component_bases(
-    layout,
-    shape,
-    *,
-    stage=STAGE,
-    diagnostic="TLXW_TYPE_UNSUPPORTED_LAYOUT",
-    source_op_index=None,
-    source_value_id=None,
-):
-    """Return Triton's physical-offset to logical-coordinate GF(2) map."""
-    shape = tuple(int(dim) for dim in shape)
-    order, vec, per_phase, max_phase = swizzled_shared_parameters(
-        layout,
-        shape,
-        stage=stage,
-        diagnostic=diagnostic,
-        source_op_index=source_op_index,
-        source_value_id=source_value_id,
-    )
-    minor_dim = int(order[0])
-    major_dim = int(order[1])
-    minor_extent = int(shape[minor_dim])
-    bases = []
-    for dim in order:
-        dim = int(dim)
-        bits = _power_of_two_log2(
-            shape[dim],
-            layout=layout,
-            stage=stage,
-            diagnostic=diagnostic,
-            source_op_index=source_op_index,
-            source_value_id=source_value_id,
-        )
-        for bit in range(bits):
-            value = 1 << int(bit)
-            basis = [0] * len(shape)
-            basis[dim] = value
-            if dim == major_dim:
-                phase = (value // int(per_phase)) % int(max_phase)
-                basis[minor_dim] = (int(vec) * int(phase)) % minor_extent
-            bases.append(tuple(int(component) for component in basis))
-    return tuple(bases)
-
-
-def padded_shared_parameters(
-    layout,
-    *,
-    stage=STAGE,
-    diagnostic="TLXW_TYPE_UNSUPPORTED_LAYOUT",
-    source_op_index=None,
-    source_value_id=None,
-):
-    intervals = tuple(int(value) for value in layout.properties.get("intervals", ()))
-    paddings = tuple(int(value) for value in layout.properties.get("paddings", ()))
-    if len(intervals) != len(paddings):
-        _shared_layout_fail(
-            diagnostic,
-            stage,
-            "padded shared layout requires matching interval/padding counts; "
-            f"{padded_shared_description(layout)}",
-            layout=layout,
-            source_op_index=source_op_index,
-            source_value_id=source_value_id,
-        )
-    if any(interval <= 0 for interval in intervals):
-        _shared_layout_fail(
-            diagnostic,
-            stage,
-            "padded shared intervals must be positive; "
-            f"{padded_shared_description(layout)}",
-            layout=layout,
-            source_op_index=source_op_index,
-            source_value_id=source_value_id,
-        )
-    return intervals, paddings
-
-
-def is_identity_swizzled_shared(layout, shape):
-    props = layout.properties
-    order = tuple(props.get("order", ()))
-    return (int(props.get("vec", 0)) == 1 and int(props.get("per_phase", 0)) == 1
-            and int(props.get("max_phase", 0)) == 1 and order == default_physical_order(shape))
-
-
-def swizzled_shared_description(layout):
-    props = layout.properties
-    return (f"order={tuple(props.get('order', ()))}, "
-            f"vec={int(props.get('vec', 0))}, "
-            f"per_phase={int(props.get('per_phase', 0))}, "
-            f"max_phase={int(props.get('max_phase', 0))}")
-
-
-def padded_shared_description(layout):
-    props = layout.properties
-    return (f"order={tuple(props.get('order', ()))}, "
-            f"intervals={tuple(int(value) for value in props.get('intervals', ()))}, "
-            f"paddings={tuple(int(value) for value in props.get('paddings', ()))}")
+def layout_warp_count(layout):
+    if layout.linear_layout is None:
+        raise ValueError("distributed layout is missing its LinearLayout model")
+    return linear_layout_in_dim_size(layout.linear_layout, "warp")
 
 
 def _shared_layout_fail(
@@ -1636,67 +1691,8 @@ def _shared_layout_fail(
     )
 
 
-def _layout_coordinate_domain(
-    kind,
-    shape,
-    properties,
-    lane_width,
-    source_value_id,
-    *,
-    linear=None,
-):
-    if linear is None:
-        linear = distributed_linear_layout_from_parts(
-            kind,
-            shape,
-            properties,
-            lane_width,
-            source_value_id=source_value_id,
-        )
-    component_count = linear_layout_in_dim_size(linear, "register")
-    warp_count = _layout_warp_count_from_parts(kind, properties)
-    block_count = linear_layout_in_dim_size(linear, "block")
-    shape = tuple(int(dim) for dim in shape)
-    total_elements = _product(shape)
-    physical_slots = int(component_count) * int(lane_width) * int(warp_count)
-    if int(block_count) <= 0 or total_elements % int(block_count):
-        coverage = "block_mismatch"
-        local_elements = total_elements
-        covered_elements = 0
-        duplicate_slots = 0
-    else:
-        local_elements = total_elements // int(block_count)
-        surjective = bool(linear.is_surjective())
-        injective = bool(linear.is_injective())
-        if surjective and injective and physical_slots == local_elements:
-            coverage = "exact"
-        elif surjective:
-            coverage = "replicated"
-        elif injective:
-            coverage = "partial"
-        else:
-            coverage = "duplicate_partial"
-        covered_elements = local_elements if surjective else 0
-        duplicate_slots = (max(0, physical_slots - local_elements) if surjective else 0)
-    return {
-        "coverage": coverage,
-        "component_count": int(component_count),
-        "covered_elements": int(covered_elements),
-        "duplicate_slots": int(duplicate_slots),
-        "local_elements": int(local_elements),
-        "physical_slots": int(physical_slots),
-        # LinearLayout construction already constrains every output basis to
-        # its declared dimension.  There is no separate out-of-bounds image to
-        # enumerate.
-        "out_of_bounds_slots": 0,
-        "block_count": int(block_count),
-    }
-
-
 def _require_supported_coordinate_domain(
-    kind,
     shape,
-    properties,
     coordinate_domain,
     source_value_id,
 ):
@@ -1706,621 +1702,9 @@ def _require_supported_coordinate_domain(
         "TLXW_TYPE_UNSUPPORTED_LAYOUT",
         STAGE,
         "unsupported distributed layout coordinate domain "
-        f"{coordinate_domain['coverage']}; kind={kind} shape={tuple(shape)} "
-        f"domain={coordinate_domain} bases={_basis_pattern(kind, properties)}",
+        f"{coordinate_domain['coverage']}; shape={tuple(shape)} "
+        f"domain={coordinate_domain}",
         source_value_id=source_value_id,
-    )
-
-
-def _layout_warp_count_from_parts(kind, properties):
-    if kind in {"linear", "generic_linear"}:
-        return 1 << len(tuple(properties.get("warp_bases", ())))
-    if kind in {"slice", "dot_operand"}:
-        return _layout_warp_count_from_parts(
-            properties.get("parent_kind"),
-            properties.get("parent_properties", {}),
-        )
-    warps_per_cta = tuple(int(value) for value in properties.get("warps_per_cta", ()))
-    result = 1
-    for value in warps_per_cta:
-        result *= max(1, int(value))
-    return result
-
-
-def _basis_pattern(kind, properties):
-    if kind in {"linear", "generic_linear"}:
-        return {
-            "register": tuple(properties.get("register_bases", ())),
-            "lane": tuple(properties.get("lane_bases", ())),
-            "warp": tuple(properties.get("warp_bases", ())),
-            "block": tuple(properties.get("block_bases", ())),
-        }
-    if kind == "blocked":
-        return {
-            "size_per_thread": tuple(properties.get("size_per_thread", ())),
-            "threads_per_warp": tuple(properties.get("threads_per_warp", ())),
-            "warps_per_cta": tuple(properties.get("warps_per_cta", ())),
-            "order": tuple(properties.get("order", ())),
-        }
-    return dict(properties)
-
-
-def mfma_registers_per_component(
-    layout,
-    *,
-    stage=STAGE,
-    source_op_index=None,
-):
-    instr_shape = tuple(int(value) for value in layout.properties.get("instr_shape", ()))
-    spec = mfma_instruction_spec(instr_shape)
-    if spec is not None:
-        return spec.accumulator_registers
-    _layout_fail(
-        "TLXW_TYPE_UNSUPPORTED_LAYOUT",
-        stage,
-        f"unsupported MFMA register count for instrShape={instr_shape}",
-        source_op_index=source_op_index,
-        source_value_id=layout.value_id,
-    )
-
-
-def _blocked_linear_layout(
-    shape,
-    properties,
-    *,
-    stage,
-    source_op_index,
-    source_value_id,
-):
-    rank = len(shape)
-    size_per_thread = tuple(int(value) for value in properties["size_per_thread"])
-    threads_per_warp = tuple(int(value) for value in properties["threads_per_warp"])
-    warps_per_cta = tuple(int(value) for value in properties["warps_per_cta"])
-    order = tuple(int(value) for value in properties["order"])
-    if not (len(size_per_thread) == len(threads_per_warp) == len(warps_per_cta) == len(order) == rank):
-        _layout_fail(
-            "TLXW_TYPE_MALFORMED_LAYOUT",
-            stage,
-            "blocked layout requires rank-matched metadata",
-            source_op_index=source_op_index,
-            source_value_id=source_value_id,
-        )
-    linear = (_identity_standard_nd("register", size_per_thread, order) *
-              _identity_standard_nd("lane", threads_per_warp, order) *
-              _identity_standard_nd("warp", warps_per_cta, order))
-    return _ensure_layout_matches_shape(
-        linear,
-        shape,
-        stage=stage,
-        source_op_index=source_op_index,
-        source_value_id=source_value_id,
-    )
-
-
-def _linear_encoding_layout(
-    shape,
-    properties,
-    *,
-    stage,
-    source_op_index,
-    source_value_id,
-):
-    rank = len(shape)
-    out_dims = [f"dim{dim}" for dim in range(rank)]
-    bases = [
-        ("register", [list(basis) for basis in properties.get("register_bases", ())]),
-        ("lane", [list(basis) for basis in properties.get("lane_bases", ())]),
-        ("warp", [list(basis) for basis in properties.get("warp_bases", ())]),
-        ("block", [list(basis) for basis in properties.get("block_bases", ())]),
-    ]
-    for in_dim, in_bases in bases:
-        for basis in in_bases:
-            if len(basis) != rank:
-                _layout_fail(
-                    "TLXW_TYPE_MALFORMED_LAYOUT",
-                    stage,
-                    f"linear layout {in_dim} basis rank does not match tensor rank",
-                    source_op_index=source_op_index,
-                    source_value_id=source_value_id,
-                )
-    return _linear_layout_from_bases_for_shape(
-        bases,
-        out_dims,
-        shape,
-        stage=stage,
-        source_op_index=source_op_index,
-        source_value_id=source_value_id,
-    )
-
-
-def _minimum_linear_basis_extent(bases, dim):
-    extent = 1
-    for _in_dim, in_bases in bases:
-        for basis in in_bases:
-            value = int(basis[int(dim)])
-            if value:
-                extent = max(extent, 1 << int(value).bit_length())
-    return extent
-
-
-def _linear_layout_from_bases_for_shape(
-    bases,
-    out_dims,
-    shape,
-    *,
-    stage,
-    source_op_index,
-    source_value_id,
-):
-    """Construct an explicit map before applying its tensor shape.
-
-    Triton may retain a parent encoding on broadcasted tensors whose singleton
-    dimensions are smaller than the encoding's bases.  LinearLayout validates
-    bases at construction time, so build the unshaped map at the minimum legal
-    extent and then apply the tensor shape in the same way as
-    combineCtaCgaWithShape.
-    """
-    shape = tuple(int(size) for size in shape)
-    construction_shape = tuple(max(shape[dim], _minimum_linear_basis_extent(bases, dim)) for dim in range(len(shape)))
-    linear = LinearLayout.from_bases(bases, list(out_dims), list(construction_shape), False)
-    return _ensure_layout_matches_shape(
-        linear,
-        shape,
-        stage=stage,
-        source_op_index=source_op_index,
-        source_value_id=source_value_id,
-    )
-
-
-def _slice_linear_layout(
-    shape,
-    properties,
-    lane_width,
-    *,
-    stage,
-    source_op_index,
-    source_value_id,
-):
-    parent_kind = properties.get("parent_kind")
-    parent_properties = properties.get("parent_properties", {})
-    if parent_kind not in {
-            "blocked",
-            "linear",
-            "generic_linear",
-            "slice",
-            "amd_mfma",
-            "dot_operand",
-    }:
-        _layout_fail(
-            "TLXW_TYPE_UNSUPPORTED_LAYOUT",
-            stage,
-            f"slice parent layout {parent_kind} does not have a distributed register map",
-            source_op_index=source_op_index,
-            source_value_id=source_value_id,
-        )
-    dim = int(properties.get("dim", 0))
-    shape = tuple(int(value) for value in shape)
-    parent_shape = list(shape)
-    if dim < 0 or dim > len(parent_shape):
-        _layout_fail(
-            "TLXW_TYPE_MALFORMED_LAYOUT",
-            stage,
-            "slice layout dimension is outside the parent rank",
-            source_op_index=source_op_index,
-            source_value_id=source_value_id,
-        )
-    if parent_kind in {"linear", "generic_linear"}:
-        return _project_explicit_linear_slice_layout(
-            shape,
-            parent_properties,
-            dim,
-            stage=stage,
-            source_op_index=source_op_index,
-            source_value_id=source_value_id,
-        )
-    parent_shape.insert(dim, 1)
-    parent = distributed_linear_layout_from_parts(
-        parent_kind,
-        tuple(parent_shape),
-        parent_properties,
-        lane_width,
-        stage=stage,
-        source_op_index=source_op_index,
-        source_value_id=source_value_id,
-    )
-    parent_dim_to_basis_index = {str(name): index for index, (name, _size) in enumerate(parent.out_dims)}
-    kept_parent_dims = [f"dim{index}" for index in range(len(parent_shape)) if index != dim]
-    out_dims = [f"dim{index}" for index in range(len(shape))]
-    bases = []
-    for in_dim, in_bases in parent.bases:
-        projected = []
-        for basis in in_bases:
-            basis = tuple(int(value) for value in basis)
-            projected.append([basis[parent_dim_to_basis_index[parent_dim]] for parent_dim in kept_parent_dims])
-        bases.append((in_dim, projected))
-    return _linear_layout_from_bases_for_shape(
-        bases,
-        out_dims,
-        shape,
-        stage=stage,
-        source_op_index=source_op_index,
-        source_value_id=source_value_id,
-    )
-
-
-def _project_explicit_linear_slice_layout(
-    shape,
-    parent_properties,
-    dim,
-    *,
-    stage,
-    source_op_index,
-    source_value_id,
-):
-    shape = tuple(int(value) for value in shape)
-    parent_rank = len(shape) + 1
-    dim = int(dim)
-    out_dims = [f"dim{index}" for index in range(len(shape))]
-    bases = []
-    for in_dim in ("register", "lane", "warp", "block"):
-        projected = []
-        for basis in parent_properties.get(f"{in_dim}_bases", ()):
-            basis = tuple(int(value) for value in basis)
-            if len(basis) != parent_rank:
-                _layout_fail(
-                    "TLXW_TYPE_MALFORMED_LAYOUT",
-                    stage,
-                    f"slice parent linear layout {in_dim} basis rank does not match parent rank",
-                    source_op_index=source_op_index,
-                    source_value_id=source_value_id,
-                )
-            projected_basis = [basis[index] for index in range(parent_rank) if index != dim]
-            if in_dim == "register" and not any(projected_basis) and any(basis):
-                continue
-            projected.append(projected_basis)
-        bases.append((in_dim, projected))
-    return _linear_layout_from_bases_for_shape(
-        bases,
-        out_dims,
-        shape,
-        stage=stage,
-        source_op_index=source_op_index,
-        source_value_id=source_value_id,
-    )
-
-
-def _mfma_linear_layout(
-    shape,
-    properties,
-    lane_width,
-    *,
-    stage,
-    source_op_index,
-    source_value_id,
-):
-    if len(shape) != 2:
-        _layout_fail(
-            "TLXW_TYPE_UNSUPPORTED_LAYOUT",
-            stage,
-            "MFMA distributed layout currently requires rank-2 tensors",
-            source_op_index=source_op_index,
-            source_value_id=source_value_id,
-        )
-    instr_shape = tuple(int(value) for value in properties.get("instr_shape", ()))
-    if mfma_instruction_spec(instr_shape) is None:
-        _layout_fail(
-            "TLXW_TYPE_UNSUPPORTED_LAYOUT",
-            stage,
-            f"unsupported MFMA instruction shape {instr_shape}",
-            source_op_index=source_op_index,
-            source_value_id=source_value_id,
-        )
-    element_bit_width = int(properties.get("element_bit_width", 32))
-    height = 1 if element_bit_width == 64 else 4
-    m_dim, n_dim = int(instr_shape[0]), int(instr_shape[1])
-    warp_size = int(lane_width)
-    tiles = (m_dim * n_dim) // (warp_size * height)
-    if tiles <= 0:
-        _layout_fail(
-            "TLXW_TYPE_UNSUPPORTED_LAYOUT",
-            stage,
-            "MFMA distributed layout requires at least one register tile",
-            source_op_index=source_op_index,
-            source_value_id=source_value_id,
-        )
-    dim_m = "dim0"
-    dim_n = "dim1"
-    if bool(properties.get("is_transposed", False)):
-        linear = LinearLayout.identity_1d(height, "register", dim_n)
-        linear *= (LinearLayout.identity_1d(m_dim, "lane", dim_m) *
-                   LinearLayout.identity_1d(warp_size // m_dim, "lane", dim_n))
-        linear *= LinearLayout.identity_1d(tiles, "register", dim_n)
-    else:
-        linear = LinearLayout.identity_1d(height, "register", dim_m)
-        linear *= (LinearLayout.identity_1d(n_dim, "lane", dim_n) *
-                   LinearLayout.identity_1d(warp_size // n_dim, "lane", dim_m))
-        linear *= LinearLayout.identity_1d(tiles, "register", dim_m)
-    linear = _linear_layout_transpose_outs(linear, (dim_n, dim_m))
-    tiles_per_warp = tuple(int(value) for value in properties.get("tiles_per_warp", ()))
-    if len(tiles_per_warp) < 2:
-        tiles_per_warp = (1, 1)
-    warps_per_cta = tuple(int(value) for value in properties.get("warps_per_cta", ()))
-    if len(warps_per_cta) != 2:
-        _layout_fail(
-            "TLXW_TYPE_MALFORMED_LAYOUT",
-            stage,
-            "MFMA distributed layout requires rank-2 warpsPerCTA metadata",
-            source_op_index=source_op_index,
-            source_value_id=source_value_id,
-        )
-    tiles_per_warp_m = max(1, int(tiles_per_warp[0]))
-    tiles_per_warp_n = max(1, int(tiles_per_warp[1]))
-    warps_per_cta_m = max(1, int(warps_per_cta[0]))
-    warps_per_cta_n = max(1, int(warps_per_cta[1]))
-    linear *= LinearLayout.identity_1d(tiles_per_warp_n, "register", dim_n)
-    linear *= LinearLayout.identity_1d(warps_per_cta_n, "warp", dim_n)
-    n_remainder = shape[1] // (n_dim * warps_per_cta_n * tiles_per_warp_n)
-    linear *= LinearLayout.identity_1d(max(1, n_remainder), "register", dim_n)
-    linear *= LinearLayout.identity_1d(tiles_per_warp_m, "register", dim_m)
-    linear *= LinearLayout.identity_1d(warps_per_cta_m, "warp", dim_m)
-    return _ensure_layout_matches_shape(
-        linear,
-        shape,
-        stage=stage,
-        source_op_index=source_op_index,
-        source_value_id=source_value_id,
-    )
-
-
-def _mfma_dot_operand_linear_layout(
-    shape,
-    properties,
-    lane_width,
-    *,
-    stage,
-    source_op_index,
-    source_value_id,
-):
-    """Build Triton's canonical kWidth-aware MFMA operand layout."""
-    shape = tuple(int(value) for value in shape)
-    if len(shape) != 2:
-        _layout_fail(
-            "TLXW_TYPE_UNSUPPORTED_LAYOUT",
-            stage,
-            "MFMA dot-operand layout currently requires rank-2 tensors",
-            source_op_index=source_op_index,
-            source_value_id=source_value_id,
-        )
-    if properties.get("parent_kind") != "amd_mfma":
-        _layout_fail(
-            "TLXW_TYPE_UNSUPPORTED_LAYOUT",
-            stage,
-            "dot-operand layout requires an AMD MFMA parent",
-            source_op_index=source_op_index,
-            source_value_id=source_value_id,
-        )
-    parent = properties.get("parent_properties", {})
-    instr_shape = tuple(int(value) for value in parent.get("instr_shape", ()))
-    if len(instr_shape) != 3:
-        _layout_fail(
-            "TLXW_TYPE_MALFORMED_LAYOUT",
-            stage,
-            "MFMA dot-operand layout requires a rank-3 instrShape",
-            source_op_index=source_op_index,
-            source_value_id=source_value_id,
-        )
-    op_idx = int(properties.get("op_idx", -1))
-    if op_idx not in {0, 1}:
-        _layout_fail(
-            "TLXW_TYPE_MALFORMED_LAYOUT",
-            stage,
-            f"unsupported dot operand index {op_idx}",
-            source_op_index=source_op_index,
-            source_value_id=source_value_id,
-        )
-    k_width = int(properties.get("k_width", 0) or 0)
-    non_k_extent = int(instr_shape[op_idx])
-    lane_width = int(lane_width)
-    if (not _is_power_of_two(k_width) or not _is_power_of_two(non_k_extent) or not _is_power_of_two(lane_width)
-            or lane_width % non_k_extent):
-        _layout_fail(
-            "TLXW_TYPE_MALFORMED_LAYOUT",
-            stage,
-            "MFMA dot-operand layout requires power-of-two kWidth, lane width, "
-            "and instruction non-K extent with an integral lane partition",
-            source_op_index=source_op_index,
-            source_value_id=source_value_id,
-        )
-
-    k_dim_index = 1 if op_idx == 0 else 0
-    non_k_dim_index = 0 if op_idx == 0 else 1
-    dim_k = f"dim{k_dim_index}"
-    dim_non_k = f"dim{non_k_dim_index}"
-    k_size = int(shape[k_dim_index])
-
-    registers = LinearLayout.identity_1d(k_width, "register", dim_k)
-    lanes = (LinearLayout.identity_1d(non_k_extent, "lane", dim_non_k) * LinearLayout.identity_1d(
-        lane_width // non_k_extent,
-        "lane",
-        dim_k,
-    ))
-    tile = registers * lanes
-    k_tile_size = (lane_width // non_k_extent) * k_width
-
-    # Keep Triton's special 64x4 operand rule even though the current WaveAMD
-    # MMA emitter supports only the symmetric MFMA families.  The layout model
-    # itself should stay faithful as support expands.
-    m_dim, n_dim = int(instr_shape[0]), int(instr_shape[1])
-    if ((m_dim, n_dim, op_idx) == (64, 4, 0) or (m_dim, n_dim, op_idx) == (4, 64, 1)):
-        tile *= LinearLayout.identity_1d(16, "register", dim_k)
-        k_tile_size *= 16
-
-    if k_size > k_tile_size:
-        if k_size % k_tile_size:
-            _layout_fail(
-                "TLXW_TYPE_UNSUPPORTED_LAYOUT",
-                stage,
-                "MFMA dot-operand K extent is not an integral number of tiles",
-                source_op_index=source_op_index,
-                source_value_id=source_value_id,
-            )
-        tile *= LinearLayout.identity_1d(
-            k_size // k_tile_size,
-            "register",
-            dim_k,
-        )
-
-    tiles_per_warp = tuple(int(value) for value in parent.get("tiles_per_warp", (1, 1)))
-    if len(tiles_per_warp) < 2:
-        tiles_per_warp = (1, 1)
-    tile *= LinearLayout.identity_1d(
-        max(1, int(tiles_per_warp[non_k_dim_index])),
-        "register",
-        dim_non_k,
-    )
-    tile = _linear_layout_transpose_outs(tile, (dim_k, dim_non_k))
-
-    warps_per_cta = tuple(int(value) for value in parent.get("warps_per_cta", ()))
-    if len(warps_per_cta) != 2:
-        _layout_fail(
-            "TLXW_TYPE_MALFORMED_LAYOUT",
-            stage,
-            "MFMA dot-operand layout requires rank-2 warpsPerCTA metadata",
-            source_op_index=source_op_index,
-            source_value_id=source_value_id,
-        )
-    warp = _identity_standard_nd("warp", warps_per_cta, (1, 0))
-    linear = tile * warp
-    return _ensure_layout_matches_shape(
-        linear,
-        shape,
-        extension_order=(k_dim_index, non_k_dim_index),
-        stage=stage,
-        source_op_index=source_op_index,
-        source_value_id=source_value_id,
-    )
-
-
-def _linear_layout_transpose_outs(linear, out_dim_names):
-    out_dim_names = tuple(str(name) for name in out_dim_names)
-    old_out_dims = tuple((str(name), int(size)) for name, size in linear.out_dims)
-    old_index = {name: index for index, (name, _size) in enumerate(old_out_dims)}
-    old_size = {name: size for name, size in old_out_dims}
-    bases = []
-    for in_dim, in_bases in linear.bases:
-        bases.append((
-            str(in_dim),
-            [[int(basis[old_index[name]]) for name in out_dim_names] for basis in in_bases],
-        ))
-    return LinearLayout.from_bases(
-        bases,
-        list(out_dim_names),
-        [old_size[name] for name in out_dim_names],
-        False,
-    )
-
-
-def _identity_standard_nd(in_dim, shape, order):
-    linear = LinearLayout()
-    for dim in order:
-        linear *= LinearLayout.identity_1d(int(shape[dim]), in_dim, f"dim{dim}")
-    return linear
-
-
-def _ensure_layout_matches_shape(
-    linear,
-    shape,
-    *,
-    extension_order=None,
-    stage,
-    source_op_index,
-    source_value_id,
-):
-    if extension_order is None:
-        extension_order = tuple(range(len(shape)))
-    extension_order = tuple(int(dim) for dim in extension_order)
-    if sorted(extension_order) != list(range(len(shape))):
-        _layout_fail(
-            "TLXW_TYPE_MALFORMED_LAYOUT",
-            stage,
-            "layout shape extension order is not a complete permutation",
-            source_op_index=source_op_index,
-            source_value_id=source_value_id,
-        )
-    shape_by_dim = {f"dim{dim}": int(shape[dim]) for dim in extension_order}
-    linear = _ensure_layout_not_smaller_than(
-        linear,
-        shape_by_dim,
-        stage=stage,
-        source_op_index=source_op_index,
-        source_value_id=source_value_id,
-    )
-    linear = _ensure_layout_not_larger_than(linear, shape_by_dim)
-    # Triton's combineCtaCgaWithShape canonicalizes distributed layouts to
-    # standard tensor-dimension order after applying the shape.  Keep the
-    # bridge model identical: physical swizzle planning flattens output dims,
-    # so retaining an encoding's construction order changes its bit bases.
-    standard_out_dims = tuple(f"dim{dim}" for dim in range(len(shape)))
-    if tuple(str(name) for name, _size in linear.out_dims) != standard_out_dims:
-        linear = _linear_layout_transpose_outs(linear, standard_out_dims)
-    return linear
-
-
-def _ensure_layout_not_smaller_than(
-    linear,
-    shape_by_dim,
-    *,
-    stage,
-    source_op_index,
-    source_value_id,
-):
-    for dim, desired_size in shape_by_dim.items():
-        actual_size = linear_layout_out_dim_size(linear, dim, stage=stage)
-        if desired_size > actual_size:
-            if desired_size % actual_size:
-                _layout_fail(
-                    "TLXW_TYPE_UNSUPPORTED_LAYOUT",
-                    stage,
-                    "layout remap requires non-integral shape extension",
-                    source_op_index=source_op_index,
-                    source_value_id=source_value_id,
-                )
-            linear *= LinearLayout.identity_1d(
-                desired_size // actual_size,
-                "register",
-                dim,
-            )
-    return linear
-
-
-def _ensure_layout_not_larger_than(linear, shape_by_dim):
-    out_dims = []
-    out_sizes = []
-    for dim, size in linear.out_dims:
-        resized = min(int(size), int(shape_by_dim[dim]))
-        out_dims.append(dim)
-        out_sizes.append(resized)
-    bases = []
-    for in_dim, in_bases in linear.bases:
-        rewritten = []
-        for basis in in_bases:
-            basis = [int(value) for value in basis]
-            was_zero = all(value == 0 for value in basis)
-            for index, value in enumerate(tuple(basis)):
-                if value >= out_sizes[index]:
-                    basis[index] = 0
-            is_zero = all(value == 0 for value in basis)
-            if in_dim == "register":
-                if was_zero or not is_zero:
-                    rewritten.append(basis)
-            else:
-                rewritten.append(basis)
-        bases.append((in_dim, rewritten))
-    return LinearLayout.from_bases(
-        bases,
-        out_dims,
-        out_sizes,
-        False,
     )
 
 
@@ -2374,50 +1758,6 @@ def _product(values):
     for value in values:
         result *= int(value)
     return result
-
-
-def _per_wave_mfma_tiles(shape, instr_shape, warps_per_cta):
-    total_m_tiles = _ceil_div(int(shape[0]), int(instr_shape[0]))
-    total_n_tiles = _ceil_div(int(shape[1]), int(instr_shape[1]))
-    warps_m = max(1, int(warps_per_cta[0]))
-    warps_n = max(1, int(warps_per_cta[1]))
-    return _ceil_div(total_m_tiles, warps_m), _ceil_div(total_n_tiles, warps_n)
-
-
-def mfma_cta_tile_coordinate(per_wave_tile, wave_coordinate, wave_count, tiles_per_warp):
-    """Map a per-wave MFMA tile index to its CTA tile coordinate.
-
-    Triton assigns ``tiles_per_warp`` adjacent instruction tiles to a wave,
-    then advances the wave coordinate, and only then repeats the pattern for
-    larger tensors.  With the default value of one this reduces to the usual
-    strided ``tile * wave_count + wave`` mapping.
-    """
-    per_wave_tile = int(per_wave_tile)
-    wave_coordinate = int(wave_coordinate)
-    wave_count = max(1, int(wave_count))
-    tiles_per_warp = max(1, int(tiles_per_warp))
-    local_tile = per_wave_tile % tiles_per_warp
-    repeat = per_wave_tile // tiles_per_warp
-    return local_tile + tiles_per_warp * (wave_coordinate + wave_count * repeat)
-
-
-def _mfma_component_count(shape, properties, lane_width, *, source_value_id=None):
-    del lane_width, source_value_id
-    shape = tuple(int(value) for value in shape)
-    instr_shape = properties.get("instr_shape", ())
-    warps_per_cta = properties.get("warps_per_cta", ())
-    if len(instr_shape) >= 2 and len(warps_per_cta) >= 2 and len(shape) >= 2:
-        m_tiles, n_tiles = _per_wave_mfma_tiles(
-            shape,
-            instr_shape,
-            warps_per_cta,
-        )
-        return m_tiles * n_tiles
-    return 1
-
-
-def _per_wave_tile_count(extent, instr_extent, warp_extent):
-    return _ceil_div(_ceil_div(int(extent), int(instr_extent)), max(1, int(warp_extent)))
 
 
 def _ceil_div(lhs, rhs):

@@ -110,9 +110,7 @@ def _synchronous_lds_region_ids(target_program):
 
 
 def _is_synchronous_lds_op(op):
-    if op.kind in {
-            "local_load",
-            "local_store",
-    }:
-        return True
-    return (op.kind == "buffer_load_to_local" and target_ir.attrs_dict(op).get("mode") == "scalarized_load_store")
+    return op.kind in {
+        "local_load",
+        "local_store",
+    }
