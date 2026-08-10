@@ -41,10 +41,10 @@ from triton.language.extra.tlx.tutorials.gfx9_gemm.inter_wave.a4w4.matmul_kernel
     BLOCK_M as _A4W4_INTER_WAVE_BLOCK_M,
     BLOCK_N as _A4W4_INTER_WAVE_BLOCK_N,
     MIN_K as _A4W4_INTER_WAVE_MIN_K,
-    NUM_CU as _A4W4_INTER_WAVE_NUM_CU,
     _a4w4_8wave_kernel as _a4w4_inter_wave_256tile_kernel,
     _A4W4_8WAVE_LLVM_FN_ATTRS,
     matmul as _a4w4_inter_wave_matmul,
+    select_matmul_path as _select_a4w4_inter_wave_path,
 )
 
 # Skip the entire module if no HIP runtime is available.
@@ -3067,28 +3067,29 @@ def test_a4w4_shape_stride_layouts_correctness_gfx950(device):
 @pytest.mark.parametrize("k", [1536, 2048])
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
 def test_a4w4_inter_wave_256tile_correctness_gfx950(device, k):
-    # A 3x3 grid exceeds the skinny-dispatch threshold, so these neighboring K
+    # A 2x33 grid exceeds the skinny-dispatch threshold, so these neighboring K
     # values exercise the 8-wave 256x256 path with two and three main-loop trips.
-    m = n = 768
+    m, n = 512, 8448
+    assert _select_a4w4_inter_wave_path(m, n, k) == "inter_wave_256x256"
     a, b, a_scales, b_scales = _generate_a4w4_inputs(m, n, k)
     actual = _a4w4_inter_wave_matmul(a, b, a_scales, b_scales)
     expected = _a4w4_reference(a, b, a_scales, b_scales)
     torch.testing.assert_close(actual, expected, atol=0.1, rtol=0.0)
 
 
-@pytest.mark.parametrize("m, n", [(768, 768), (512, 1280)])
+@pytest.mark.parametrize("m, n", [(256, 16640), (512, 8448)])
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
 def test_a4w4_inter_wave_256tile_single_trip_stress_gfx950(device, m, n):
     # K=1024 has four K tiles: two are prefetched and one two-tile main-loop
     # step consumes/refills the ring before the two-tile drain.
-    # Both public shapes exceed the skinny threshold and cover different
-    # multi-CTA grids through the production dispatcher.
+    # Both public shapes exceed the skinny threshold by the smallest possible
+    # grid margins and cover different multi-CTA grids through the dispatcher.
     k = _A4W4_INTER_WAVE_MIN_K
     grid_mn = triton.cdiv(m, _A4W4_INTER_WAVE_BLOCK_M) * triton.cdiv(n, _A4W4_INTER_WAVE_BLOCK_N)
     iter_max = k // _A4W4_INTER_WAVE_BLOCK_K
     main_trips = len(range(0, iter_max - 2, 2))
-    assert grid_mn in (9, 10)
-    assert grid_mn > _A4W4_INTER_WAVE_NUM_CU // 32
+    assert grid_mn in (65, 66)
+    assert _select_a4w4_inter_wave_path(m, n, k) == "inter_wave_256x256"
     assert (k, iter_max, main_trips) == (1024, 4, 1)
 
     a, b, a_scales, b_scales = _generate_a4w4_inputs(m, n, k)
