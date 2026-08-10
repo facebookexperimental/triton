@@ -7,6 +7,7 @@
 #include "mlir/IR/Attributes.h"
 #include "mlir/IR/MLIRContext.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
 #include "triton/Tools/GenericSwizzling.h"
 #include "triton/Tools/LayoutUtils.h"
 #include "triton/Tools/LinearLayout.h"
@@ -35,6 +36,19 @@ mlir::MLIRContext *getLinearLayoutContext() {
   static auto *ctx =
       new mlir::MLIRContext(mlir::MLIRContext::Threading::DISABLED);
   return ctx;
+}
+
+LinearLayout copyToLinearLayoutContext(const LinearLayout &layout) {
+  auto *ctx = getLinearLayoutContext();
+  LinearLayout::BasesT bases;
+  for (const auto &[dim, dimBases] : layout.getBases())
+    bases[mlir::StringAttr::get(ctx, dim.getValue())] = dimBases;
+  std::vector<std::pair<mlir::StringAttr, int32_t>> outDims;
+  outDims.reserve(layout.getNumOutDims());
+  for (const auto &[dim, size] : layout.getOutDims())
+    outDims.emplace_back(mlir::StringAttr::get(ctx, dim.getValue()), size);
+  return LinearLayout(std::move(bases), std::move(outDims),
+                      layout.isSurjective());
 }
 
 mlir::triton::gpu::LocalMemOpTile
@@ -393,6 +407,14 @@ void init_linear_layout(py::module_ &m) {
         }
         return result;
       });
+
+  m.def(
+      "to_linear_layout",
+      [](const std::vector<int64_t> &shape, mlir::Attribute layout) {
+        return copyToLinearLayoutContext(
+            mlir::triton::gpu::toLinearLayout(shape, layout));
+      },
+      py::arg("shape"), py::arg("layout"));
 
   m.def(
       "get_vec_bitwidth_ld_st",

@@ -194,6 +194,8 @@ def tlx_addmm_glu_kernel_optimized(
     NUM_XCDS: tl.constexpr,
     XCD_CHUNK: tl.constexpr,
 ):
+    tl.assume(M > 0)
+    tl.assume(N > 0)
     tl.assume(sa0 > 0)
     tl.assume(sa1 > 0)
     tl.assume(sb0 > 0)
@@ -425,6 +427,8 @@ def tlx_addmm_glu_kernel_optimized_async(
     NUM_BUFFERS: tl.constexpr,
     Y_PAD: tl.constexpr,
 ):
+    tl.assume(M > 0)
+    tl.assume(N > 0)
     tl.assume(sa0 > 0)
     tl.assume(sa1 > 0)
     tl.assume(sb0 > 0)
@@ -638,6 +642,8 @@ def tlx_addmm_glu_kernel_simple_async(
     XCD_CHUNK: tl.constexpr,
     Y_PAD: tl.constexpr,
 ):
+    tl.assume(M > 0)
+    tl.assume(N > 0)
     tl.assume(sa0 > 0)
     tl.assume(sa1 > 0)
     tl.assume(sb0 > 0)
@@ -727,6 +733,8 @@ def tlx_addmm_glu_kernel_persistent(
     XCD_CHUNK: tl.constexpr,
     NUM_CUS: tl.constexpr,
 ):
+    tl.assume(M > 0)
+    tl.assume(N > 0)
     tl.assume(sa0 > 0)
     tl.assume(sa1 > 0)
     tl.assume(sb0 > 0)
@@ -933,6 +941,8 @@ def tlx_addmm_glu_kernel_baseline(
     GROUP_SIZE_M: tl.constexpr,
     NUM_STAGES: tl.constexpr,
 ):
+    tl.assume(M > 0)
+    tl.assume(N > 0)
     pid = tl.program_id(axis=0)
     num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
@@ -1184,13 +1194,7 @@ def compile_kernel_shape_worker(kernel_name, shape, num_cus):
 def compilation_jobs(args):
     if args.mode == "perf_test":
         return [(kernel_name, (M, N, K)) for kernel_name, K in sorted(PERF_BASELINE_TFLOPS)]
-    return [
-        (kernel_name, (m, n, k))
-        for m in args.M
-        for n in args.N
-        for k in args.K
-        for kernel_name in args.kernel
-    ]
+    return [(kernel_name, (m, n, k)) for m in args.M for n in args.N for k in args.K for kernel_name in args.kernel]
 
 
 def precompile_kernels(args):

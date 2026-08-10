@@ -8,6 +8,7 @@ from .layouts import LayoutMap, build_layout_map
 _MMA_PACKET_ELEMENT_TYPES = frozenset({"bf16", "f16", "f32"})
 _MMA_DOT_OPERAND_ELEMENT_TYPES = _MMA_PACKET_ELEMENT_TYPES | frozenset({"i8"})
 
+
 @dataclass(frozen=True)
 class ConvertedType:
     kind: str
@@ -32,6 +33,8 @@ class TypeLayoutProgram:
 
 def convert_source_program(program):
     lane_width = int(program.kernel.threads_per_warp or 64)
+    warp_count = int(program.kernel.num_warps or 1)
+    block_count = int(program.kernel.num_ctas or 1)
     layouts = []
     converted_values = {}
     layout_templates = {}
@@ -44,17 +47,15 @@ def convert_source_program(program):
                 value_id,
                 source_type,
                 lane_width,
+                warp_count,
+                block_count,
             )
         template = layout_templates[layout_key]
-        layout = (
-            None
-            if template is None
-            else replace(
-                template,
-                layout_map_id=len(layouts),
-                value_id=value_id,
-            )
-        )
+        layout = (None if template is None else replace(
+            template,
+            layout_map_id=len(layouts),
+            value_id=value_id,
+        ))
         layout_id = None
         if layout is not None:
             layout_id = layout.layout_map_id
@@ -79,20 +80,14 @@ def _convert_type(source_type, layout, lane_width):
     if source_type.kind == "tensor":
         component_count = 1 if layout is None else int(layout.component_count)
         scalar_component_count = component_count
-        if (layout is not None and
-                (layout.kind in {"amd_mfma", "dot_operand"}
-                 or (layout.kind == "slice"
-                     and layout.properties.get("parent_kind") == "amd_mfma"))):
+        if layout is not None and layout.kind in {"amd_mfma", "dot_operand"}:
             # Coordinates, masks, and pointers need a scalar component for
             # every distributed register slot.  Floating MMA values below keep
             # their instruction-sized payload grouped as an ordinary typed
             # SIMD packet; only the immediate MMA wrapper is a fragment.
-            scalar_component_count = layouts.distributed_register_count(
-                layout.kind,
-                layout.shape,
-                layout.properties,
-                layout.lane_width,
-                source_value_id=layout.value_id,
+            scalar_component_count = layouts.linear_layout_in_dim_size(
+                layout.linear_layout,
+                "register",
             )
         if source_type.element_type == "i1":
             return ConvertedType(
@@ -119,8 +114,7 @@ def _convert_type(source_type, layout, lane_width):
                 lane_width,
                 component_count,
             )
-        if (layout is not None and layout.kind == "amd_mfma"
-                and source_type.element_type in _MMA_PACKET_ELEMENT_TYPES):
+        if (layout is not None and layout.kind == "amd_mfma" and source_type.element_type in _MMA_PACKET_ELEMENT_TYPES):
             return ConvertedType(
                 "tensor",
                 "simd_packet" if component_count == 1 else "simd_packet_tuple",

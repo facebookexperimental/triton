@@ -7,7 +7,7 @@ from .diagnostics import fail
 
 STAGE = "target_ir"
 
-TARGET_SCHEMA_VERSION = 4
+TARGET_SCHEMA_VERSION = 5
 ADDRESS_ARITHMETIC_NO_OVERFLOW = "no_overflow"
 
 # Token representations all lower to ``!wave.mem.token``, but protocol
@@ -83,6 +83,9 @@ class TargetLayout:
     lane_width: int
     properties: tuple[TargetAttr, ...] = ()
     linear_layout: TargetLinearLayout | None = None
+    component_grid: tuple[int, int] | None = None
+    component_relation: tuple[int, ...] | None = None
+    active_relation: tuple[int, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -363,6 +366,9 @@ def target_layout_from_converted(layout):
         int(layout.lane_width),
         tuple(TargetAttr(str(name), _target_layout_property_value(value)) for name, value in layout.properties.items()),
         (None if layout.linear_layout is None else _target_layout_property_value(layout.linear_layout)),
+        (None if layout.component_grid is None else tuple(int(extent) for extent in layout.component_grid)),
+        (None if layout.component_relation is None else tuple(int(byte) for byte in layout.component_relation)),
+        (None if layout.active_relation is None else tuple(int(byte) for byte in layout.active_relation)),
     )
 
 
@@ -390,16 +396,38 @@ def _target_layout_property_value(value):
     )
 
 
-def target_assumptions_from_facts(fact_program, source_value_targets):
+def target_assumptions_from_facts(
+    fact_program,
+    source_value_targets,
+    target_ops,
+):
+    assume_targets = {}
+    for op in target_ops:
+        if op.kind != "assume":
+            continue
+        result_ids = frozenset(int(result_id) for result_id in op.results)
+        for fact_id, target_id in zip(
+                op.fact_ids,
+                op.fact_target_ids,
+                strict=True,
+        ):
+            target_id = int(target_id)
+            if target_id in result_ids:
+                assume_targets.setdefault(int(fact_id), []).append(target_id)
     return tuple(
         TargetAssumption(
             int(fact.fact_id),
             str(fact.kind),
             str(fact.predicate),
-            tuple(int(target_id) for target_id in source_value_targets.get(
-                int(fact.subject_value_id),
-                (),
-            )),
+            tuple(
+                dict.fromkeys(
+                    assume_targets.get(
+                        int(fact.fact_id),
+                        source_value_targets.get(
+                            int(fact.subject_value_id),
+                            (),
+                        ),
+                    ))),
             None if fact.lower is None else int(fact.lower),
             None if fact.upper is None else int(fact.upper),
             None if fact.width is None else int(fact.width),

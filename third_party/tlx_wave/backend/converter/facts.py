@@ -47,9 +47,9 @@ def analyze_facts(source_program, type_layout_program):
     _add_type_width_facts(source_program, facts)
     _add_divisibility_facts(source_program, facts)
     _add_pointer_range_facts(source_program, facts)
-    _add_assume_facts(source_program, facts)
     _add_derived_range_facts(source_program, facts)
     _add_derived_pointer_range_facts(source_program, facts)
+    _add_assume_facts(source_program, facts)
     by_value = {}
     for fact in facts:
         by_value.setdefault(fact.subject_value_id, []).append(fact.fact_id)
@@ -224,7 +224,7 @@ def _derived_ranges_for_op(source_program, facts, op):
             yield op.results[0], start, end - 1, "derived:tt.make_range"
         return
     if (len(op.operands) == 1 and len(op.results) == 1 and op.name in _RANGE_PRESERVING_OPS):
-        value_range = _combined_range(source_program, facts, op.operands[0], op.index)
+        value_range = _combined_range(facts, op.operands[0])
         if value_range is not None:
             yield (
                 op.results[0],
@@ -256,8 +256,8 @@ def _derived_ranges_for_op(source_program, facts, op):
             "arith.minsi",
     }:
         return
-    lhs = _combined_range(source_program, facts, op.operands[0], op.index)
-    rhs = _combined_range(source_program, facts, op.operands[1], op.index)
+    lhs = _combined_range(facts, op.operands[0])
+    rhs = _combined_range(facts, op.operands[1])
     if lhs is None or rhs is None:
         return
     bounds = _signed_bounds(_integer_width(source_program.values[op.results[0]].type.raw))
@@ -308,9 +308,9 @@ def _derive_for_ranges(source_program, facts, op):
     region = source_program.regions[op.region_ids[0]]
     if not region.block_arg_ids:
         return
-    lower = _combined_range(source_program, facts, op.operands[0], op.index)
-    upper = _combined_range(source_program, facts, op.operands[1], op.index)
-    step = _combined_range(source_program, facts, op.operands[2], op.index)
+    lower = _combined_range(facts, op.operands[0])
+    upper = _combined_range(facts, op.operands[1])
+    step = _combined_range(facts, op.operands[2])
     if lower is None or step is None or lower[0] is None or step[0] is None:
         return
     if step[0] <= 0:
@@ -334,10 +334,7 @@ def _derive_if_ranges(source_program, facts, op):
             return
         region_yields.append((yield_op.index, yield_op.operands))
     for result_index, result_id in enumerate(op.results):
-        ranges = [
-            _combined_range(source_program, facts, yielded[result_index], yield_op_index)
-            for yield_op_index, yielded in region_yields
-        ]
+        ranges = [_combined_range(facts, yielded[result_index]) for yield_op_index, yielded in region_yields]
         if any(value_range is None for value_range in ranges):
             continue
         lowers = [value_range[0] for value_range in ranges if value_range[0] is not None]
@@ -358,7 +355,7 @@ def _append_improving_range_fact(
     provenance,
     source_op_index,
 ):
-    current = _combined_range(source_program, facts, value_id, source_op_index)
+    current = _combined_range(facts, value_id)
     if current is not None:
         current_lower, current_upper = current
         improves_lower = lower is not None and (current_lower is None or lower > current_lower)
@@ -411,14 +408,12 @@ def _append_improving_pointer_byte_range_fact(
     return True
 
 
-def _combined_range(source_program, facts, value_id, user_op_index):
+def _combined_range(facts, value_id):
     lower = None
     upper = None
     found = False
     for fact in facts:
         if fact.kind != "range" or fact.subject_value_id != value_id:
-            continue
-        if not _range_fact_is_in_scope(source_program, fact, user_op_index):
             continue
         found = True
         if fact.lower is not None:
@@ -441,71 +436,6 @@ def _combined_pointer_byte_range(facts, value_id):
         if fact.upper is not None:
             upper = fact.upper if upper is None else min(upper, fact.upper)
     return None if not found else (lower, upper)
-
-
-def _range_fact_is_in_scope(source_program, fact, user_op_index):
-    if user_op_index is None:
-        return fact.provenance != "llvm.intr.assume"
-    if fact.source_op_index is None:
-        return fact.provenance != "llvm.intr.assume"
-    return _source_fact_is_in_scope(
-        source_program,
-        fact.source_op_index,
-        user_op_index,
-    )
-
-
-def _source_fact_is_in_scope(source_program, fact_op_index, user_op_index):
-    if fact_op_index is None:
-        return False
-    if fact_op_index == user_op_index:
-        return True
-    try:
-        fact_op = source_program.ops[fact_op_index]
-    except IndexError:
-        return False
-    fact_region_id = fact_op.parent_region_id
-    if fact_region_id is None:
-        return False
-    user_anchor = _op_anchor_in_region(source_program, user_op_index, fact_region_id)
-    if user_anchor is None:
-        return False
-    if user_anchor == user_op_index:
-        return True
-    if user_anchor == fact_op_index:
-        return True
-    return _op_precedes_in_region(
-        source_program,
-        fact_region_id,
-        fact_op_index,
-        user_anchor,
-    )
-
-
-def _op_anchor_in_region(source_program, op_index, region_id):
-    current_op_index = op_index
-    while True:
-        try:
-            current_op = source_program.ops[current_op_index]
-        except IndexError:
-            return None
-        current_region_id = current_op.parent_region_id
-        if current_region_id == region_id:
-            return current_op_index
-        if current_region_id is None:
-            return None
-        parent_op_index = source_program.regions[current_region_id].parent_op_index
-        if parent_op_index is None:
-            return None
-        current_op_index = parent_op_index
-
-
-def _op_precedes_in_region(source_program, region_id, lhs_op_index, rhs_op_index):
-    try:
-        region_ops = source_program.regions[region_id].op_indices
-        return region_ops.index(lhs_op_index) < region_ops.index(rhs_op_index)
-    except (IndexError, ValueError):
-        return False
 
 
 def _has_bounds(value_range):
