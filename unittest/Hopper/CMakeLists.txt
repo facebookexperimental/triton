@@ -11,6 +11,8 @@ add_triton_ut(
   SRCS z3_constraint_encoder_test.cpp
   LIBS
     TritonGPUModuloCore
+    TritonGPUTransforms
+    TritonNvidiaGPUTransforms
 )
 
 add_triton_ut(
@@ -18,6 +20,8 @@ add_triton_ut(
   SRCS modulo_schedule_test.cpp
   LIBS
     TritonGPUModuloCore
+    TritonGPUTransforms
+    TritonNvidiaGPUTransforms
 )
 
 add_triton_ut(
@@ -25,6 +29,8 @@ add_triton_ut(
   SRCS joint_solver_fallback_test.cpp
   LIBS
     TritonGPUModuloCore
+    TritonGPUTransforms
+    TritonNvidiaGPUTransforms
 )
 
 if(TRITON_ENABLE_Z3_JOINT_SOLVER)
