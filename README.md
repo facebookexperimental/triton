@@ -1431,6 +1431,8 @@ layout propagation is sufficient.
 
 [Warp-specialized GEMM on Blackwell](third_party/tlx/tutorials/blackwell_gemm_ws.py)
 
+[Warp-specialized MXFP8 GEMM on Blackwell](third_party/tlx/tutorials/blackwell_gemm_ws_mxfp8.py)
+
 [Grouped GEMM on Blackwell](third_party/tlx/tutorials/blackwell_grouped_gemm_test.py)
 
 [Pipelined GEMM on Blackwell](third_party/tlx/tutorials/blackwell_gemm_pipelined.py)
