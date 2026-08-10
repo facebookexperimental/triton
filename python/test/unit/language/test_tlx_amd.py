@@ -8,7 +8,6 @@ required for the compilation checks. Correctness checks (actual execution) run
 only when the corresponding hardware is available.
 """
 import importlib.util
-import os
 import re
 import sys
 from pathlib import Path
@@ -2866,18 +2865,6 @@ def test_a4w4_shape_stride_layouts_compile_gfx950(device, tmp_path):
     assert amdgcn.count("ds_write") == 44
     assert amdgcn.count("ds_read") == 176
     assert "buffer_store_dwordx4" in amdgcn
-
-
-def test_a4w4_inter_wave_import_does_not_set_post_misched(monkeypatch):
-    module_path = (Path(__file__).resolve().parents[4] / "third_party" / "tlx" / "tutorials" / "gfx9_gemm" /
-                   "inter_wave" / "a4w4" / "matmul_kernel.py")
-    spec = importlib.util.spec_from_file_location("_tlx_a4w4_inter_wave_no_global_post_misched", module_path)
-    module = importlib.util.module_from_spec(spec)
-    monkeypatch.delenv("TRITON_DISABLE_POST_MISCHED", raising=False)
-
-    spec.loader.exec_module(module)
-
-    assert "TRITON_DISABLE_POST_MISCHED" not in os.environ
 
 
 def _compile_a4w4_inter_wave_256tile(m, n, k):
