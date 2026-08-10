@@ -50,11 +50,12 @@ THE THREE CHANGES THAT GOT IT HERE
      conflicts to 0.6% and is 3x SLOWER, because 8 bytes breaks the 16-byte alignment
      ds_read_b128 needs. The pad must be a power of two and >= 16.
 
-The scale tiles now use a derived 8-byte-chunk XOR instead of padding. Their
-global offset layouts match the physical XOR shared layouts, so direct-to-LDS
-writes the swizzled image without address arithmetic or reinterpretation. This
-reaches zero measured bank conflicts without ds_bpermute, ds_permute, DPP, or
-permlane.
+The scale tiles now use a derived 8-byte-chunk XOR instead of padding. For
+logical coordinates (row, group), A stores row ^ ((group & 4) << 2), while B
+stores row ^ ((group & 1) << 4) ^ ((group & 4) << 3). The global offset layouts
+encode the same maps, so direct-to-LDS writes the final physical image without
+address arithmetic or reinterpretation. This reaches zero measured bank
+conflicts without ds_bpermute, ds_permute, DPP, or permlane.
 
 STRUCTURAL CEILING: 16 s_barrier per body, 8 carrying a mandatory full lgkmcnt(0) LDS
 drain. The barrier is what forces the drain, not operand granularity, so the only way
@@ -148,11 +149,12 @@ def _a4w4_8wave_kernel(
         ],
         [HALF_M, HALF_K],
     )
-    # Minimal Wave-style 8-byte chunk XOR. Only the phase bits needed to make
-    # the five ds_read_b64_tr_b8 bank bases independent are applied: A needs
-    # phase 2 -> row bit 4; B needs phase 0 -> row bit 4 and phase 2 -> row
-    # bit 5. Low three row bits stay identity so every direct LDS write remains
-    # one contiguous 8-byte global segment.
+    # Map A (row, group) to (row ^ ((group & 4) << 2), group), and map B to
+    # (row ^ ((group & 1) << 4) ^ ((group & 4) << 3), group). These are the
+    # smallest row-bit changes that make the five ds_read_b64_tr_b8 bank bases
+    # distinct: A toggles row bit 4 from group bit 2; B additionally toggles
+    # row bit 4 from group bit 0 and row bit 5 from group bit 2. Row bits 0..2
+    # remain unchanged, preserving each contiguous 8-byte global segment.
     shared_a_scales: tl.constexpr = tlx.shared_linear_layout_encoding(
         offset_bases=[
             [1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0], [64, 0],
