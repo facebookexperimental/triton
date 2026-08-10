@@ -191,11 +191,10 @@ and performance coverage.
 ## 2-CTA / physical-cluster status
 
 The atomic dynamic scheduler now has a backend-only physical-cluster protocol.
-An early pass proves and tags the canonical scheduler before AutoWS. During
-code partitioning, after accumulation counters are established but before
-physical partition cloning, the compiler makes cluster rank zero reserve `K`
-consecutive PIDs, distributes the base via DSM, and derives
-`base + cluster_cta_rank`. A standalone late pass performs the same lowering
+An early pass proves and tags the canonical scheduler before AutoWS. Generic
+code partitioning assigns and clones the run-once owner. A late pass then makes
+cluster rank zero reserve `K` consecutive PIDs, distributes the base via DSM,
+and derives `base + cluster_cta_rank`; the same pass performs the lowering
 without WS. Full/empty remote mbarriers protect publication and reuse. This
 composes with the existing intra-CTA AutoWS atomic broadcast rather than
 replacing it.

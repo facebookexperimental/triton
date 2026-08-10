@@ -565,8 +565,6 @@ LogicalResult ArriveBarrierOp::verify() {
     return failure();
   if (getCount() < 1)
     return emitOpError("count must be greater than or equal to 1");
-  if (getPerThread() && getWarpGroupLeader())
-    return emitOpError("perThread and warpGroupLeader are mutually exclusive");
   if (isMulticast()) {
     if (getPerThread())
       return emitOpError("multicast arrive does not support perThread");

@@ -30,10 +30,10 @@ For an atomic dynamic scheduler used by a physical multi-CTA cluster, the
 NVIDIA backend wraps this pipeline with compiler-only preparation and
 materialization. Before AutoWS, `atomic-tile-scheduler-prepare` proves the
 canonical loop shape, linearizes the seed PID in physical-cluster order, and
-tags the claim. Inside code partitioning, after accumulation counters are
-created but before physical partition cloning, materialization makes cluster
-rank zero reserve `K` PIDs and distributes the base through DSM. The standalone
-late pass performs the same step for non-WS kernels. AutoWS's existing
+tags the claim. AutoWS assigns and clones the run-once owner without changing
+generic code partitioning. The late materialization pass then makes cluster
+rank zero reserve `K` PIDs and distributes the base through DSM; the same pass
+handles non-WS kernels. AutoWS's existing
 `doDynamicTileBroadcast` remains the separate, intra-CTA broadcast from the
 owner warp partition to the other partitions. The frontend scheduler API and
 TTIR shape do not change.
@@ -95,7 +95,7 @@ recognizes the `scf.while` outer loop (same doc).
 | `TaskIdPropagation.cpp` | — | `TaskIdBackwardPropagation` sparse dataflow analysis |
 | `WSTaskIdPropagate.cpp` | `doTaskIdPropagate` | Runs analysis and materializes task IDs |
 | `WSAtomicBroadcast.cpp` | `doDynamicTileBroadcast` | Cross-partition run-once "claim next tile" support: run a dynamic-persistent tile-id producer once and broadcast it, for both a `tt.atomic_rmw` counter and a CLC tile-scheduler fetch (`ttng.clc_read`) — or gracefully reject unsupported shapes. See [CrossPartitionAtomicSupport.md](CrossPartitionAtomicSupport.md) |
-| `lib/Dialect/TritonNvidiaGPU/Transforms/AtomicTileScheduler.cpp` | `atomic-tile-scheduler-prepare` / `materializeClusterAtomicTileScheduler` | Backend-only physical-cluster extension for the atomic dynamic scheduler: prove and tag before AutoWS, then reserve and distribute `K` PIDs before physical partition cloning (or in the standalone late pass without WS) |
+| `lib/Dialect/TritonNvidiaGPU/Transforms/AtomicTileScheduler.cpp` | `atomic-tile-scheduler-prepare` / `atomic-tile-scheduler-materialize` | Backend-only physical-cluster extension for the atomic dynamic scheduler: prove and tag before AutoWS, then reserve and distribute `K` PIDs in one late pass after optional warp specialization |
 | `WSDataPartition.cpp` | `doDataPartition` / `nvgpu-ws-data-partition` | Splits ops along M/N dimensions across warp groups |
 | `PingPong.cpp` | `doPingPongPrep` / `doPingPongSync` | Named barrier insertion for ping-pong scheduling |
 | `WSCodePartition.cpp` | `doBufferAllocation` | Channel discovery and SMEM/TMEM allocation hoisting (pre-pass) |

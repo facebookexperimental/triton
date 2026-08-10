@@ -86,20 +86,17 @@ NVIDIA backend adds a second protocol without changing
 2. AutoWS runs normally. `doDynamicTileBroadcast` still executes the tagged
    atomic in one warp partition per CTA and broadcasts its result to the other
    partitions in that CTA.
-3. During code partitioning, after its accumulation counters are created but
-   before physical partition cloning, cluster materialization replaces that
-   claim with a rank-zero `atomic_add(counter, K)`. Rank zero publishes the
-   returned base PID to the other `K-1` CTAs through generic-proxy DSM stores;
-   every CTA uses `base + cluster_cta_rank`. The standalone late pass handles
-   non-WS kernels.
+3. Generic code partitioning clones the marked atomic into its run-once owner
+   partition. The late cluster-materialization pass then replaces that claim
+   with a rank-zero `atomic_add(counter, K)`. Rank zero publishes the returned
+   base PID to the other `K-1` CTAs through generic-proxy DSM stores; every CTA
+   uses `base + cluster_cta_rank`. The same late pass handles non-WS kernels.
 4. A ready barrier per CTA and a full-cluster reuse barrier on rank zero keep
-   the DSM slot phase-safe across persistent iterations. The
-   `warpGroupLeader` arrival mode elects relative thread zero of the executing
-   partition without introducing a CTA-wide barrier that non-participating
-   warp-specialized partitions cannot reach. Remote arrivals use
-   release-cluster semantics; these generic-proxy stores/loads are ordered by
-   the release/acquire mbarrier protocol and do not require an async-proxy
-   fence.
+   the DSM slot phase-safe across persistent iterations. Under AutoWS, ordinary
+   arrive rendezvous are scoped to the owner partition. Remote arrivals use
+   release-cluster semantics and the matching local waits use acquire-cluster
+   semantics; this release/acquire protocol orders the generic-proxy DSM
+   stores/loads without an async-proxy fence.
 
 This applies to the product of all explicit `ctas_per_cga` dimensions, including
 `(2,2)` and `(4,1)`. The kernel owns the mapping from the resulting linear PID

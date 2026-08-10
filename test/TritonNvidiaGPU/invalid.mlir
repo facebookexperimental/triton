@@ -192,6 +192,56 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 
 // -----
 
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32, "ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32} {
+  tt.func @clustered_atomic_scheduler_requires_device_scope(
+      %counter: !tt.ptr<i32>, %a: tensor<128x64xf16>,
+      %b: tensor<64x128xf16>, %acc: tensor<128x128xf32>) {
+    %c1 = arith.constant 1 : i32
+    %c8 = arith.constant 8 : i32
+    %true = arith.constant true
+    %start = tt.get_program_id x : i32
+    %result = scf.while (%tile = %start) : (i32) -> i32 {
+      %valid = arith.cmpi slt, %tile, %c8 : i32
+      scf.condition(%valid) %tile : i32
+    } do {
+    ^bb0(%tile: i32):
+      %dot = tt.dot %a, %b, %acc {two_ctas} : tensor<128x64xf16> * tensor<64x128xf16> -> tensor<128x128xf32>
+      // expected-error @below {{clustered dynamic scheduler atomic must have GPU or system scope}}
+      %next = tt.atomic_rmw add, acq_rel, cta, %counter, %c1, %true : (!tt.ptr<i32>, i32, i1) -> i32
+      scf.yield %next : i32
+    }
+    tt.return
+  }
+}
+
+// -----
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32, "ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32} {
+  tt.func @clustered_atomic_scheduler_requires_direct_carry(
+      %counter: !tt.ptr<i32>, %a: tensor<128x64xf16>,
+      %b: tensor<64x128xf16>, %acc: tensor<128x128xf32>) {
+    %c0 = arith.constant 0 : i32
+    %c1 = arith.constant 1 : i32
+    %c8 = arith.constant 8 : i32
+    %true = arith.constant true
+    %start = tt.get_program_id x : i32
+    %result = scf.while (%tile = %start) : (i32) -> i32 {
+      %valid = arith.cmpi slt, %tile, %c8 : i32
+      scf.condition(%valid) %tile : i32
+    } do {
+    ^bb0(%tile: i32):
+      %dot = tt.dot %a, %b, %acc {two_ctas} : tensor<128x64xf16> * tensor<64x128xf16> -> tensor<128x128xf32>
+      // expected-error @below {{clustered dynamic scheduler atomic must be forwarded directly through scf.yield}}
+      %claimed = tt.atomic_rmw add, acq_rel, gpu, %counter, %c1, %true : (!tt.ptr<i32>, i32, i1) -> i32
+      %next = arith.addi %claimed, %c0 : i32
+      scf.yield %next : i32
+    }
+    tt.return
+  }
+}
+
+// -----
+
 #blocked_f16 = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0], CGALayout = [[0]]}>
 #shared_f16 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0], CGALayout = [[0]]}>
 #barrier_shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0], CGALayout = [[1]]}>

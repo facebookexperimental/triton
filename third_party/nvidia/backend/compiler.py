@@ -959,9 +959,9 @@ class CUDABackend(BaseBackend):
             passes.ttgpuir.add_combine_tensor_select_and_if(pm)
             # hoist again and allow hoisting out of if statements
             passes.ttgpuir.add_hoist_tmem_alloc(pm, True)
-            # CLC tile scheduler (Stage 4): materialize the async-token form into
-            # the response buffer + completion mbarrier. Explicit clusters also
-            # get a reuse rendezvous. Runs after warp specialization.
+            # Materialize marked cluster-atomic claims after optional warp
+            # specialization, then materialize the CLC async-token form. Explicit
+            # CLC clusters also get a reuse rendezvous.
             nvidia.passes.ttnvgpuir.add_atomic_tile_scheduler_materialize(pm)
             nvidia.passes.ttnvgpuir.add_clc_materialize(pm)
             nvidia.passes.ttnvgpuir.add_remove_tmem_tokens(pm)

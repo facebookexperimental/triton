@@ -9,10 +9,10 @@
 //
 // The prepare pass recognizes that canonical shape in a required multi-CTA
 // kernel, linearizes the initial physical CTA coordinate, and marks the atomic.
-// After warp specialization has assigned the run-once owner, materialization
-// turns the marked atomic into one cluster-leader reservation of K consecutive
-// PIDs and distributes the base PID through DSM. It runs before physical
-// partition cloning under AutoWS, or from the standalone late pass without WS.
+// After warp specialization has assigned and materialized the run-once owner,
+// the late materialization pass turns the marked atomic into one cluster-leader
+// reservation of K consecutive PIDs and distributes the base PID through DSM.
+// The same late pass handles kernels that are not warp specialized.
 // The public scheduler and its TTIR remain unchanged.
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -44,8 +44,8 @@ namespace {
 constexpr StringLiteral kClusterClaimAttr = "ttng.cluster_atomic_tile_claim";
 constexpr StringLiteral kClusterSizeAttr =
     "ttng.cluster_atomic_tile_cluster_size";
-constexpr StringLiteral kClusterSchedulerAttr =
-    "ttng.cluster_atomic_tile_scheduler";
+
+static LogicalResult materializeClusterAtomicTileScheduler(Operation *root);
 
 struct PreparedClaim {
   scf::WhileOp loop;
@@ -79,6 +79,24 @@ static bool isConstOne(Value value) {
   return value && matchPattern(value, m_One());
 }
 
+static bool reachesYield(Value value, scf::YieldOp yield) {
+  SmallVector<Value> worklist{value};
+  DenseSet<Value> visited;
+  visited.insert(value);
+  while (!worklist.empty()) {
+    Value current = worklist.pop_back_val();
+    for (Operation *user : current.getUsers()) {
+      if (user == yield)
+        return true;
+      for (Value result : user->getResults()) {
+        if (visited.insert(result).second)
+          worklist.push_back(result);
+      }
+    }
+  }
+  return false;
+}
+
 static FailureOr<unsigned> getDirectYieldIndex(tt::AtomicRMWOp atomic,
                                                scf::WhileOp loop) {
   if (!atomic.getResult().hasOneUse())
@@ -100,7 +118,7 @@ static int64_t getKnownDivisor(Value value, int64_t target,
   if (depth > 32)
     return 1;
   if (auto constant = value.getDefiningOp<arith::ConstantIntOp>())
-    return std::gcd<int64_t>(std::abs(constant.value()), target);
+    return std::gcd<int64_t>(constant.value() % target, target);
   if (auto arg = dyn_cast<BlockArgument>(value)) {
     auto func = dyn_cast_or_null<tt::FuncOp>(arg.getOwner()->getParentOp());
     if (!func || arg.getOwner() != &func.getBody().front())
@@ -164,6 +182,10 @@ static LogicalResult validateCanonicalClaim(scf::WhileOp loop,
     return atomic.emitError(
         "clustered dynamic scheduling requires a scalar i32 atomic_add of "
         "constant 1 with a true mask");
+  if (atomic.getScope() != tt::MemSyncScope::GPU &&
+      atomic.getScope() != tt::MemSyncScope::SYSTEM)
+    return atomic.emitError(
+        "clustered dynamic scheduler atomic must have GPU or system scope");
 
   auto counterArg = dyn_cast<BlockArgument>(atomic.getPtr());
   auto func = atomic->getParentOfType<tt::FuncOp>();
@@ -272,12 +294,12 @@ public:
       if (invalid || !hasTwoCTADot(loop))
         return;
 
-      SmallVector<std::pair<tt::AtomicRMWOp, unsigned>> carriedAtomics;
+      SmallVector<tt::AtomicRMWOp> carriedAtomics;
       loop.getAfterBody()->walk([&](tt::AtomicRMWOp atomic) {
         if (atomic->getParentOfType<scf::WhileOp>() != loop)
           return;
-        if (auto index = getDirectYieldIndex(atomic, loop); succeeded(index))
-          carriedAtomics.emplace_back(atomic, *index);
+        if (reachesYield(atomic.getResult(), loop.getYieldOp()))
+          carriedAtomics.push_back(atomic);
       });
       if (carriedAtomics.empty())
         return; // Static/non-atomic persistent schedule.
@@ -287,12 +309,19 @@ public:
         invalid = true;
         return;
       }
-      auto [atomic, index] = carriedAtomics.front();
-      if (failed(validateCanonicalClaim(loop, atomic, index, clusterSize))) {
+      tt::AtomicRMWOp atomic = carriedAtomics.front();
+      auto index = getDirectYieldIndex(atomic, loop);
+      if (failed(index)) {
+        atomic.emitError("clustered dynamic scheduler atomic must be forwarded "
+                         "directly through scf.yield");
         invalid = true;
         return;
       }
-      claims.push_back({loop, atomic, index});
+      if (failed(validateCanonicalClaim(loop, atomic, *index, clusterSize))) {
+        invalid = true;
+        return;
+      }
+      claims.push_back({loop, atomic, *index});
     });
     if (invalid)
       return signalPassFailure();
@@ -304,7 +333,6 @@ public:
           builder, loc, claim.loop.getInits()[claim.carriedIndex],
           *clusterDims);
       claim.loop->setOperand(claim.carriedIndex, seed);
-      claim.loop->setAttr(kClusterSchedulerAttr, builder.getUnitAttr());
       claim.atomic->setAttr(kClusterClaimAttr, builder.getUnitAttr());
       claim.atomic->setAttr(kClusterSizeAttr,
                             builder.getI32IntegerAttr(clusterSize));
@@ -332,17 +360,34 @@ static Value createPidSlot(OpBuilder &builder, Location loc) {
   return ttg::LocalAllocOp::create(builder, loc, type);
 }
 
-// These barriers may be created before AutoWS physically moves the persistent
-// loop into a partition region. Keep them at function lifetime: cleanup placed
-// immediately after the pre-specialization loop would otherwise remain before
-// the final warp_specialize op and invalidate a captured barrier before use.
-static Value createPersistentBarrierAlloc(Operation *insertBefore,
+// A marked claim may already live inside an AutoWS owner partition. Keep its
+// DSM state at function lifetime so every CTA initializes the same captures
+// before the partition starts using them.
+static Value createPersistentBarrierAlloc(ImplicitLocOpBuilder &builder,
                                           int arriveCount) {
-  ImplicitLocOpBuilder builder(insertBefore->getLoc(), insertBefore);
   Value alloc = createScalarAlloc(builder, builder.getI64Type(), 1);
   Value barrier = createSingleBufferView(builder, alloc, 0);
   InitBarrierOp::create(builder, barrier, arriveCount);
   return alloc;
+}
+
+// Partition regions are isolated from above. Late materialization therefore
+// has to extend the already-created warp_specialize capture list explicitly.
+static Value captureInWarpPartition(Value value, Operation *user) {
+  auto wsOp = user->getParentOfType<ttg::WarpSpecializeOp>();
+  if (!wsOp || wsOp.getDefaultRegion().isAncestor(user->getParentRegion()))
+    return value;
+
+  Value captured;
+  auto partOp = wsOp.getPartitionOp();
+  partOp->insertOperands(partOp.getNumOperands(), value);
+  for (Region *region : wsOp.getPartitionRegions()) {
+    BlockArgument arg = region->addArgument(value.getType(), value.getLoc());
+    if (region->isAncestor(user->getParentRegion()))
+      captured = arg;
+  }
+  assert(captured && "operation not found in a warp partition region");
+  return captured;
 }
 
 static LogicalResult materializeClaim(tt::AtomicRMWOp atomic, int clusterSize) {
@@ -367,13 +412,18 @@ static LogicalResult materializeClaim(tt::AtomicRMWOp atomic, int clusterSize) {
       loopBuilder, loop, {zero}, {loopBuilder.getI32Type()});
   loop->erase();
 
-  loopBuilder.setInsertionPoint(newLoop);
-  Value pidSlot = createPidSlot(loopBuilder, loc);
-  Value fullAlloc = createPersistentBarrierAlloc(newLoop, /*arriveCount=*/1);
+  ImplicitLocOpBuilder allocBuilder(loc, func);
+  allocBuilder.setInsertionPointToStart(&func.getBody().front());
+  Value pidSlot = createPidSlot(allocBuilder, loc);
+  Value fullAlloc =
+      createPersistentBarrierAlloc(allocBuilder, /*arriveCount=*/1);
   Value emptyAlloc =
-      createPersistentBarrierAlloc(newLoop, /*arriveCount=*/clusterSize);
-  Value fullBar = createSingleBufferView(loopBuilder, fullAlloc, 0);
-  Value emptyBar = createSingleBufferView(loopBuilder, emptyAlloc, 0);
+      createPersistentBarrierAlloc(allocBuilder, /*arriveCount=*/clusterSize);
+  Value fullBar = createSingleBufferView(allocBuilder, fullAlloc, 0);
+  Value emptyBar = createSingleBufferView(allocBuilder, emptyAlloc, 0);
+  pidSlot = captureInWarpPartition(pidSlot, atomic);
+  fullBar = captureInWarpPartition(fullBar, atomic);
+  emptyBar = captureInWarpPartition(emptyBar, atomic);
 
   Value phaseBefore = newLoop.getBeforeArguments().back();
   Value phaseAfter = newLoop.getAfterArguments().back();
@@ -399,6 +449,7 @@ static LogicalResult materializeClaim(tt::AtomicRMWOp atomic, int clusterSize) {
   tagOwner(emptyPhase.getDefiningOp());
   auto emptyWait =
       WaitBarrierOp::create(builder, loc, emptyBar, emptyPhase, isLeader);
+  emptyWait->setAttr("acquireCluster", builder.getUnitAttr());
   tagOwner(emptyWait);
 
   auto ifLeader = scf::IfOp::create(builder, loc, TypeRange{}, isLeader,
@@ -418,13 +469,10 @@ static LogicalResult materializeClaim(tt::AtomicRMWOp atomic, int clusterSize) {
   Value baseTensor =
       tt::SplatOp::create(leaderBuilder, loc, valueType, leaderAtomic);
 
-  // Rank zero writes and signals its own slot locally. warpGroupLeader makes
-  // relative thread zero perform the arrive without a CTA-wide barrier; after
-  // AutoWS only this partition's warps execute the protocol.
+  // Rank zero writes and signals its own slot locally. Under AutoWS the normal
+  // arrive rendezvous is scoped to the owner partition.
   ttg::LocalStoreOp::create(leaderBuilder, loc, baseTensor, pidSlot);
-  ArriveBarrierOp::create(
-      leaderBuilder, loc, fullBar, /*count=*/1, /*pred=*/Value(),
-      /*perThread=*/false, /*warpGroupLeader=*/true, DictionaryAttr());
+  ArriveBarrierOp::create(leaderBuilder, loc, fullBar, /*count=*/1);
 
   // Every other CTA receives the same base through generic-proxy DSM.  The
   // release arrive and acquire wait order the store/load, so no async-proxy
@@ -436,15 +484,14 @@ static LogicalResult materializeClaim(tt::AtomicRMWOp atomic, int clusterSize) {
                                     targetRank);
     Value remoteFull =
         mapBarrierToRank(leaderBuilder, loc, fullBar, targetRank);
-    ArriveBarrierOp::create(
-        leaderBuilder, loc, remoteFull, /*count=*/1, /*pred=*/Value(),
-        /*perThread=*/false, /*warpGroupLeader=*/true, DictionaryAttr());
+    ArriveBarrierOp::create(leaderBuilder, loc, remoteFull, /*count=*/1);
   }
   ifLeader.walk(tagOwner);
 
   builder.setInsertionPointAfter(ifLeader);
   tagOwner(ifLeader);
   auto fullWait = WaitBarrierOp::create(builder, loc, fullBar, phaseAfter);
+  fullWait->setAttr("acquireCluster", builder.getUnitAttr());
   tagOwner(fullWait);
   Value loaded =
       ttg::LocalLoadOp::create(builder, loc, valueType, pidSlot, Value());
@@ -459,9 +506,8 @@ static LogicalResult materializeClaim(tt::AtomicRMWOp atomic, int clusterSize) {
   // the matching acquire.
   Value remoteEmpty = mapBarrierToRank(builder, loc, emptyBar, zeroI32);
   tagOwner(remoteEmpty.getDefiningOp());
-  auto emptyArrive = ArriveBarrierOp::create(
-      builder, loc, remoteEmpty, /*count=*/1, /*pred=*/Value(),
-      /*perThread=*/false, /*warpGroupLeader=*/true, DictionaryAttr());
+  auto emptyArrive =
+      ArriveBarrierOp::create(builder, loc, remoteEmpty, /*count=*/1);
   tagOwner(emptyArrive);
 
   atomic.getResult().replaceAllUsesWith(pid);
@@ -479,7 +525,6 @@ static LogicalResult materializeClaim(tt::AtomicRMWOp atomic, int clusterSize) {
     toggled.getDefiningOp()->setAttr("async_task_id", yieldTaskIds);
   }
   yield.getResultsMutable().append(toggled);
-  newLoop->removeAttr(kClusterSchedulerAttr);
   return success();
 }
 
@@ -493,9 +538,7 @@ public:
   }
 };
 
-} // namespace
-
-LogicalResult materializeClusterAtomicTileScheduler(Operation *root) {
+static LogicalResult materializeClusterAtomicTileScheduler(Operation *root) {
   SmallVector<tt::AtomicRMWOp> claims;
   root->walk([&](tt::AtomicRMWOp atomic) {
     if (atomic->hasAttr(kClusterClaimAttr))
@@ -523,5 +566,7 @@ LogicalResult materializeClusterAtomicTileScheduler(Operation *root) {
   }
   return success();
 }
+
+} // namespace
 
 } // namespace mlir::triton::nvidia_gpu

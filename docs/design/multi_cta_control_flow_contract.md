@@ -163,9 +163,11 @@ For the canonical atomic dynamic scheduler, the NVIDIA backend now recognizes
 the ordinary frontend loop before warp specialization. It proves a uniform
 counter, canonical direct loop carry, and a cluster-uniform tile bound divisible
 by physical cluster size `K`. It then linearizes the seed in cluster-major
-X-fastest order. During AutoWS, after run-once owner assignment but before
-physical partition cloning, rank zero atomically reserves `K` consecutive PIDs
-and distributes the base to the cluster; rank `r` executes PID `base + r`.
+X-fastest order. AutoWS assigns the run-once owner and clones the physical
+partitions without special cluster-scheduler handling. A late materialization
+pass then rewrites the marked owner claim so rank zero atomically reserves `K`
+consecutive PIDs and distributes the base to the cluster; rank `r` executes PID
+`base + r`.
 Ready and reuse mbarriers make the full physical cluster the scheduler
 protocol's participation group. Failure of the proof is a compile error before
 this collective protocol is introduced.

@@ -309,7 +309,9 @@ def TritonNvidiaGPUAtomicTileSchedulerMaterializePass
     atomic_add by the physical cluster size, distribute the returned base PID
     through generic-proxy DSM stores, and derive each CTA's logical PID as
     base + cluster_cta_rank. Full and empty remote mbarriers provide data-ready
-    and reuse synchronization with a loop-carried phase.
+    and reuse synchronization with a loop-carried phase. This pass runs after
+    optional warp specialization, so the marked claim is already in its owner
+    partition and generic code partitioning remains unchanged.
   }];
 
   let dependentDialects = [

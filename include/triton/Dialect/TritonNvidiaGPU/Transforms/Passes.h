@@ -34,11 +34,6 @@ std::unique_ptr<Pass> createTritonNvidiaGPUPlanCTAPass();
 
 void registerConSanNVIDIAHooks();
 
-/// Materialize any clustered atomic tile claims below `root`. AutoWS calls
-/// this after run-once atomic broadcast but before physical partition cloning;
-/// the standalone pass handles kernels that are not warp specialized.
-LogicalResult materializeClusterAtomicTileScheduler(Operation *root);
-
 #define GEN_PASS_DECL
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/Passes.h.inc"
 

@@ -337,11 +337,13 @@ struct WaitBarrierOpConversion
     } else {
       // SM90+ polls with try_wait in a spin loop. Blackwell can opt into the
       // four-operand form, whose suspend hint lowers to NANOSLEEP.SYNCS.
+      std::string waitOp = op.getAcquireCluster()
+                               ? "mbarrier.try_wait.parity.acquire.cluster."
+                                 "shared::cta.b64"
+                               : "mbarrier.try_wait.parity.shared::cta.b64";
       std::string tryWait = useSuspendHint
-                                ? "\tmbarrier.try_wait.parity.shared::cta.b64 "
-                                  "complete, [$0], $1, $2;\n"
-                                : "\tmbarrier.try_wait.parity.shared::cta.b64 "
-                                  "complete, [$0], $1;\n";
+                                ? "\t" + waitOp + " complete, [$0], $1, $2;\n"
+                                : "\t" + waitOp + " complete, [$0], $1;\n";
       if (!predicated) {
         ptx = std::string(R"(
 {
@@ -404,7 +406,7 @@ struct ArriveBarrierOpConversion
     // perThread arrives are per-thread (no leader pattern) and must NOT emit a
     // CTA-wide barrier -- doing so would deadlock under warp specialization
     // where not all threads of the CTA reach the arrive.
-    if (!isPerThread && !op.getWarpGroupLeader())
+    if (!isPerThread)
       ttg::BarrierOp::create(rewriter, loc, ttg::AddrSpace::Local);
 
     // A barrier physically in cluster shared memory must be signalled with

@@ -1,5 +1,5 @@
 // RUN: triton-opt %s -split-input-file --triton-nvidia-check-matmul-two-cta --verify-diagnostics | FileCheck %s
-// RUN: triton-opt %s -split-input-file --triton-nvidia-gpu-atomic-tile-scheduler-prepare --triton-nvidia-gpu-atomic-tile-scheduler-materialize | FileCheck %s --check-prefix=ATOMIC
+// RUN: triton-opt %s -split-input-file --triton-nvidia-check-matmul-two-cta --triton-nvidia-gpu-atomic-tile-scheduler-prepare --triton-nvidia-gpu-atomic-tile-scheduler-materialize --verify-diagnostics | FileCheck %s --check-prefix=ATOMIC
 
 #shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
 #shared1 = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = true, elementBitWidth = 16}>
@@ -54,17 +54,20 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // compiler linearizes the physical cluster coordinate, reserves four PIDs with
 // one leader atomic, and distributes the base to the other three ranks.
 // ATOMIC-LABEL: @clustered_atomic_scheduler_2x2
+// ATOMIC: ttng.init_barrier {{.*}}, 1
+// ATOMIC: ttng.init_barrier {{.*}}, 4
 // ATOMIC: tt.get_program_id y
 // ATOMIC: arith.divui {{.*}}, %c2_i32
 // ATOMIC: %[[SEED_RANK:[0-9]+]] = nvg.cluster_id
 // ATOMIC: arith.muli {{.*}}, %c4_i32
 // ATOMIC: arith.addi {{.*}}, %[[SEED_RANK]]
-// ATOMIC: ttng.init_barrier {{.*}}, 4
 // ATOMIC: scf.while
 // ATOMIC: %[[RANK:[0-9]+]] = nvg.cluster_id
+// ATOMIC: ttng.wait_barrier {{.*}}acquireCluster
 // ATOMIC: scf.if
 // ATOMIC-COUNT-1: tt.atomic_rmw add, acq_rel, gpu, {{.*}}, %c4_i32
 // ATOMIC-COUNT-3: ttg.remote_shmem_store
+// ATOMIC: ttng.wait_barrier {{.*}}acquireCluster
 // ATOMIC: arith.addi {{.*}}, %[[RANK]]
 // ATOMIC: ttng.map_to_remote_buffer
 // ATOMIC: ttng.arrive_barrier
@@ -96,9 +99,10 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // A 4x1 cluster follows the same protocol; the shape only changes how the
 // physical cluster coordinate is linearized.
 // ATOMIC-LABEL: @clustered_atomic_scheduler_4x1
+// ATOMIC: ttng.init_barrier {{.*}}, 1
+// ATOMIC: ttng.init_barrier {{.*}}, 4
 // ATOMIC: arith.divui {{.*}}, %c4_i32
 // ATOMIC: arith.muli {{.*}}, %c4_i32
-// ATOMIC: ttng.init_barrier {{.*}}, 4
 // ATOMIC: scf.if
 // ATOMIC-COUNT-1: tt.atomic_rmw add, acq_rel, gpu, {{.*}}, %c4_i32
 // ATOMIC-COUNT-3: ttg.remote_shmem_store

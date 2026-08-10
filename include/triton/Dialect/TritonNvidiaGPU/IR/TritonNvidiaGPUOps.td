@@ -480,7 +480,8 @@ def TTNG_WaitBarrierOp
     its current phase.
 
     This lowers a waitloop using PTX instruction
-    mbarrier.try_wait.parity.shared::cta.b64.
+    mbarrier.try_wait.parity.shared::cta.b64. `acquireCluster` upgrades the
+    wait to acquire semantics at cluster scope for data published through DSM.
 
     Accepts an optional list of memory dependencies. If present, it is assumed
     that any of the dependencies may be accessed until the barrier completes.
@@ -493,22 +494,28 @@ def TTNG_WaitBarrierOp
       (ins Arg<TTG_MemDescType,
                "", [MemRead<SharedMemory>, MemWrite<SharedMemory>]>:$alloc,
           I32:$phase, Optional<I1>:$pred, Variadic<TTG_MemDescType>:$deps,
+          UnitAttr:$acquireCluster,
           OptionalAttr<DictionaryAttr>:$constraints);
 
   let builders =
       [OpBuilder<(ins "Value":$alloc, "Value":$phase), [{
-    build($_builder, $_state, alloc, phase, /*pred=*/static_cast<mlir::Value>(nullptr), /*deps=*/{}, /*constraints=*/DictionaryAttr());
+    build($_builder, $_state, alloc, phase, /*pred=*/static_cast<mlir::Value>(nullptr), /*deps=*/{}, /*acquireCluster=*/false, /*constraints=*/DictionaryAttr());
     }]>,
        OpBuilder<(ins "Value":$alloc, "Value":$phase, "Value":$pred), [{
-    build($_builder, $_state, alloc, phase, pred, /*deps=*/{}, /*constraints=*/DictionaryAttr());
+    build($_builder, $_state, alloc, phase, pred, /*deps=*/{}, /*acquireCluster=*/false, /*constraints=*/DictionaryAttr());
     }]>,
        OpBuilder<(ins "Value":$alloc, "Value":$phase, "ValueRange":$deps), [{
-    build($_builder, $_state, alloc, phase, /*pred=*/static_cast<mlir::Value>(nullptr), deps, /*constraints=*/DictionaryAttr());
+    build($_builder, $_state, alloc, phase, /*pred=*/static_cast<mlir::Value>(nullptr), deps, /*acquireCluster=*/false, /*constraints=*/DictionaryAttr());
     }]>,
        OpBuilder<(ins "Value":$alloc, "Value":$phase, "Value":$pred,
                      "ValueRange":$deps),
                  [{
-    build($_builder, $_state, alloc, phase, pred, deps, /*constraints=*/DictionaryAttr());
+    build($_builder, $_state, alloc, phase, pred, deps, /*acquireCluster=*/false, /*constraints=*/DictionaryAttr());
+    }]>,
+       OpBuilder<(ins "Value":$alloc, "Value":$phase, "Value":$pred,
+                     "ValueRange":$deps, "DictionaryAttr":$constraints),
+                 [{
+    build($_builder, $_state, alloc, phase, pred, deps, /*acquireCluster=*/false, constraints);
     }]>,
   ];
 
@@ -539,10 +546,7 @@ def TTNG_ArriveBarrierOp
     and the barrier must have the identity CGA layout `[[1], [2], ...]`. The
     default value of `ctaMask` is 0 (no multicast).
 
-    The operation accepts an optional predicate. `warpGroupLeader` selects
-    relative thread zero of the executing warp-specialized partition and
-    suppresses the otherwise implicit CTA-wide rendezvous. It is used when
-    non-participating warp groups cannot legally reach that rendezvous.
+    The operation accepts an optional predicate.
 
     Example:
 
@@ -557,7 +561,7 @@ def TTNG_ArriveBarrierOp
       (ins Arg<TTG_MemDescType,
                "", [MemRead<SharedMemory>, MemWrite<SharedMemory>]>:$alloc,
           I32Attr:$count, DefaultValuedOptionalAttr<I32Attr, "0">:$ctaMask,
-          Optional<I1>:$pred, UnitAttr:$perThread, UnitAttr:$warpGroupLeader,
+          Optional<I1>:$pred, UnitAttr:$perThread,
           OptionalAttr<DictionaryAttr>:$constraints);
 
   let assemblyFormat = [{
@@ -566,34 +570,28 @@ def TTNG_ArriveBarrierOp
 
   let builders =
       [OpBuilder<(ins "Value":$alloc, "uint32_t":$count), [{
-      return build($_builder, $_state, alloc, count, /*ctaMask=*/0u, /*pred=*/Value(), /*perThread=*/false, /*warpGroupLeader=*/false, /*constraints=*/DictionaryAttr());
+      return build($_builder, $_state, alloc, count, /*ctaMask=*/0u, /*pred=*/Value(), /*perThread=*/false, /*constraints=*/DictionaryAttr());
     }]>,
        OpBuilder<(ins "Value":$alloc, "uint32_t":$count, "Value":$pred), [{
-      return build($_builder, $_state, alloc, count, /*ctaMask=*/0u, pred, /*perThread=*/false, /*warpGroupLeader=*/false, /*constraints=*/DictionaryAttr());
+      return build($_builder, $_state, alloc, count, /*ctaMask=*/0u, pred, /*perThread=*/false, /*constraints=*/DictionaryAttr());
     }]>,
        OpBuilder<(ins "Value":$alloc, "uint32_t":$count, "uint32_t":$ctaMask,
                      "Value":$pred),
                  [{
-      return build($_builder, $_state, alloc, count, ctaMask, pred, /*perThread=*/false, /*warpGroupLeader=*/false, /*constraints=*/DictionaryAttr());
+      return build($_builder, $_state, alloc, count, ctaMask, pred, /*perThread=*/false, /*constraints=*/DictionaryAttr());
     }]>,
        OpBuilder<(ins "Value":$alloc, "uint32_t":$count, "bool":$perThread), [{
-      return build($_builder, $_state, alloc, count, /*ctaMask=*/0u, /*pred=*/Value(), perThread, /*warpGroupLeader=*/false, /*constraints=*/DictionaryAttr());
+      return build($_builder, $_state, alloc, count, /*ctaMask=*/0u, /*pred=*/Value(), perThread, /*constraints=*/DictionaryAttr());
     }]>,
        OpBuilder<(ins "Value":$alloc, "uint32_t":$count, "Value":$pred,
                      "bool":$perThread),
                  [{
-      return build($_builder, $_state, alloc, count, /*ctaMask=*/0u, pred, perThread, /*warpGroupLeader=*/false, /*constraints=*/DictionaryAttr());
+      return build($_builder, $_state, alloc, count, /*ctaMask=*/0u, pred, perThread, /*constraints=*/DictionaryAttr());
     }]>,
        OpBuilder<(ins "Value":$alloc, "uint32_t":$count, "Value":$pred,
                      "bool":$perThread, "DictionaryAttr":$constraints),
                  [{
-      return build($_builder, $_state, alloc, count, /*ctaMask=*/0u, pred, perThread, /*warpGroupLeader=*/false, constraints);
-    }]>,
-       OpBuilder<(ins "Value":$alloc, "uint32_t":$count, "Value":$pred,
-                     "bool":$perThread, "bool":$warpGroupLeader,
-                     "DictionaryAttr":$constraints),
-                 [{
-      return build($_builder, $_state, alloc, count, /*ctaMask=*/0u, pred, perThread, warpGroupLeader, constraints);
+      return build($_builder, $_state, alloc, count, /*ctaMask=*/0u, pred, perThread, constraints);
     }]>];
 
   let extraClassDeclaration = [{
