@@ -51,9 +51,10 @@ THE THREE CHANGES THAT GOT IT HERE
      ds_read_b128 needs. The pad must be a power of two and >= 16.
 
 The scale tiles now use a derived 8-byte-chunk XOR instead of padding. Their
-global row offsets are pre-swizzled, loaded directly into a flat LDS descriptor,
-then viewed through the XOR layout for ds_read_b64_tr_b8. This reaches zero
-measured bank conflicts without ds_bpermute, ds_permute, DPP, or permlane.
+global offset layouts match the physical XOR shared layouts, so direct-to-LDS
+writes the swizzled image without address arithmetic or reinterpretation. This
+reaches zero measured bank conflicts without ds_bpermute, ds_permute, DPP, or
+permlane.
 
 STRUCTURAL CEILING: 16 s_barrier per body, 8 carrying a mandatory full lgkmcnt(0) LDS
 drain. The barrier is what forces the drain, not operand granularity, so the only way
@@ -168,14 +169,17 @@ def _a4w4_8wave_kernel(
         block_bases=[],
         alignment=16,
     )
-    shared_scales_flat: tl.constexpr = tlx.swizzled_layout(0, 0, 0, order=[0, 1])
-    blocked_a_scales: tl.constexpr = tlx.layout(
+    # Match each scale tile's physical shared offset order: two 4-byte value
+    # bits, six lane bits, then warp bits. The XOR bases live entirely in the
+    # warp mapping, so TLX resolves these to #ttg.generic_linear and gfx9 can
+    # write the swizzled LDS image directly from ordinary logical offsets.
+    scale_load_a_layout: tl.constexpr = tlx.layout(
         shape=((2, 2, 2, 2, 2, 2, 2, 2, 2), (2, 2)),
-        stride=((32, 64, 128, 256, 512, 1, 0, 2, 4), (8, 16)),
+        stride=((32, 64, 128, 256, 512, 1, 2, 132, 0), (8, 16)),
     )
-    blocked_b_scales: tl.constexpr = tlx.layout(
+    scale_load_b_layout: tl.constexpr = tlx.layout(
         shape=((2, 2, 2, 2, 2, 2, 2, 2, 2), (2, 2)),
-        stride=((32, 64, 128, 256, 512, 1024, 1, 2, 4), (8, 16)),
+        stride=((32, 64, 128, 256, 512, 1024, 129, 2, 260), (8, 16)),
     )
     # ---- MFMA scale register layouts (get_mfma_scale_layout) ----
     scale_a_layout: tl.constexpr = tlx.layout(
@@ -236,9 +240,9 @@ def _a4w4_8wave_kernel(
     smem_a_bot = tlx.local_alloc((HALF_M, HALF_K), tlx.dtype_of(a_ptr), 2, layout=shared_tile)
     smem_b_left = tlx.local_alloc((HALF_N, HALF_K), tlx.dtype_of(b_ptr), 2, layout=shared_tile)
     smem_b_right = tlx.local_alloc((HALF_N, HALF_K), tlx.dtype_of(b_ptr), 2, layout=shared_tile)
-    smem_a_sc_t_flat = tlx.local_alloc((HALF_M, NG), tlx.dtype_of(a_scales_ptr), 2, layout=shared_scales_flat)
-    smem_a_sc_b_flat = tlx.local_alloc((HALF_M, NG), tlx.dtype_of(a_scales_ptr), 2, layout=shared_scales_flat)
-    smem_b_sc_flat = tlx.local_alloc((BLOCK_N, NG), tlx.dtype_of(b_scales_ptr), 2, layout=shared_scales_flat)
+    smem_a_sc_t = tlx.local_alloc((HALF_M, NG), tlx.dtype_of(a_scales_ptr), 2, layout=shared_a_scales)
+    smem_a_sc_b = tlx.local_alloc((HALF_M, NG), tlx.dtype_of(a_scales_ptr), 2, layout=shared_a_scales)
+    smem_b_sc = tlx.local_alloc((BLOCK_N, NG), tlx.dtype_of(b_scales_ptr), 2, layout=shared_b_scales)
 
     # ---- fp4 tile load offsets ([128,128]) ----
     offs_am = tl.arange(0, HALF_M)
@@ -254,22 +258,16 @@ def _a4w4_8wave_kernel(
     # ---- A scale load offsets ([128,8]) ----
     offs_ks_a = tl.arange(0, NG)
     offs_asm = pid_m * BLOCK_M + tl.arange(0, HALF_M)
-    # Pre-apply phase 2 -> row bit 4. The direct load writes a flat physical
-    # image which the zero-copy shared-layout view below interprets as swizzled.
-    offs_asm_swizzled = offs_asm[:, None] ^ ((offs_ks_a[None, :] & 4) << 2)
-    a_sc_offsets = tl.mul(offs_asm_swizzled, stride_asm, sanitize_overflow=False) + tl.mul(
+    a_sc_offsets = tl.mul(offs_asm[:, None], stride_asm, sanitize_overflow=False) + tl.mul(
         offs_ks_a[None, :], stride_ask, sanitize_overflow=False)
-    a_sc_offsets = tlx.require_layout(a_sc_offsets, blocked_a_scales)
+    a_sc_offsets = tlx.require_layout(a_sc_offsets, scale_load_a_layout)
 
     # ---- B scale load offsets: FULL [256,8] in one copy ----
     offs_ks_b = tl.arange(0, NG)
     offs_bsn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    # Pre-apply phase 0 -> row bit 4 and phase 2 -> row bit 5.
-    b_row_xor = ((offs_ks_b[None, :] & 1) << 4) ^ ((offs_ks_b[None, :] & 4) << 3)
-    offs_bsn_swizzled = offs_bsn[:, None] ^ b_row_xor
-    b_sc_offsets = tl.mul(offs_bsn_swizzled, stride_bsn, sanitize_overflow=False) + tl.mul(
+    b_sc_offsets = tl.mul(offs_bsn[:, None], stride_bsn, sanitize_overflow=False) + tl.mul(
         offs_ks_b[None, :], stride_bsk, sanitize_overflow=False)
-    b_sc_offsets = tlx.require_layout(b_sc_offsets, blocked_b_scales)
+    b_sc_offsets = tlx.require_layout(b_sc_offsets, scale_load_b_layout)
 
     # Scalar (uniform) base-pointer deltas for the quadrant / K-buffer variants.
     a_half_m = HALF_M * stride_am  # a_top -> a_bot
@@ -302,25 +300,25 @@ def _a4w4_8wave_kernel(
 
     # ---- Prologue: prefetch K-steps 0,1 into buffers 0,1 (8 commits) ----
     tlx.buffer_load_to_local(smem_b_left[0], b_base, b_tile_offsets)
-    tlx.buffer_load_to_local(smem_b_sc_flat[0], b_scales_ptr, b_sc_offsets)
+    tlx.buffer_load_to_local(smem_b_sc[0], b_scales_ptr, b_sc_offsets)
     tlx.async_load_commit_group()
     tlx.buffer_load_to_local(smem_a_top[0], a_base, a_tile_offsets)
-    tlx.buffer_load_to_local(smem_a_sc_t_flat[0], a_scales_ptr, a_sc_offsets)
+    tlx.buffer_load_to_local(smem_a_sc_t[0], a_scales_ptr, a_sc_offsets)
     tlx.async_load_commit_group()
     tlx.buffer_load_to_local(smem_a_bot[0], a_base + a_half_m, a_tile_offsets)
-    tlx.buffer_load_to_local(smem_a_sc_b_flat[0], a_scales_ptr + a_sc_half_m, a_sc_offsets)
+    tlx.buffer_load_to_local(smem_a_sc_b[0], a_scales_ptr + a_sc_half_m, a_sc_offsets)
     tlx.async_load_commit_group()
     tlx.buffer_load_to_local(smem_b_right[0], b_base + b_half_n, b_tile_offsets)
     tlx.async_load_commit_group()
 
     tlx.buffer_load_to_local(smem_b_left[1], b_base + b_k2, b_tile_offsets)
-    tlx.buffer_load_to_local(smem_b_sc_flat[1], b_scales_ptr + b_sc_k, b_sc_offsets)
+    tlx.buffer_load_to_local(smem_b_sc[1], b_scales_ptr + b_sc_k, b_sc_offsets)
     tlx.async_load_commit_group()
     tlx.buffer_load_to_local(smem_a_top[1], a_base + a_k2, a_tile_offsets)
-    tlx.buffer_load_to_local(smem_a_sc_t_flat[1], a_scales_ptr + a_sc_k, a_sc_offsets)
+    tlx.buffer_load_to_local(smem_a_sc_t[1], a_scales_ptr + a_sc_k, a_sc_offsets)
     tlx.async_load_commit_group()
     tlx.buffer_load_to_local(smem_a_bot[1], a_base + a_half_m + a_k2, a_tile_offsets)
-    tlx.buffer_load_to_local(smem_a_sc_b_flat[1], a_scales_ptr + a_sc_half_m + a_sc_k, a_sc_offsets)
+    tlx.buffer_load_to_local(smem_a_sc_b[1], a_scales_ptr + a_sc_half_m + a_sc_k, a_sc_offsets)
     tlx.async_load_commit_group()
     tlx.buffer_load_to_local(smem_b_right[1], b_base + b_half_n + b_k2, b_tile_offsets)
     tlx.async_load_commit_group()
@@ -333,12 +331,8 @@ def _a4w4_8wave_kernel(
     tlx.async_load_wait_group(6)
     b_left = tlx.local_load(tlx.local_trans(smem_b_left[0]), relaxed=True)
     a_top = tlx.local_load(smem_a_top[0], relaxed=True)
-    a_sc_top = tlx.local_load(
-        tlx.local_reinterpret(smem_a_sc_t_flat[0], tlx.dtype_of(a_scales_ptr), layout=shared_a_scales),
-        layout=scale_a_layout)
-    b_sc_comb = tlx.local_load(
-        tlx.local_reinterpret(smem_b_sc_flat[0], tlx.dtype_of(b_scales_ptr), layout=shared_b_scales),
-        layout=scale_b_comb_layout)
+    a_sc_top = tlx.local_load(smem_a_sc_t[0], layout=scale_a_layout)
+    b_sc_comb = tlx.local_load(smem_b_sc[0], layout=scale_b_comb_layout)
     b_sc_l, b_sc_r = tl.split(tl.trans(tl.reshape(b_sc_comb, 2, HALF_N, NG), 1, 2, 0))
     b_sc_left = tlx.require_layout(b_sc_l, scale_b_layout)
     b_sc_right = tlx.require_layout(b_sc_r, scale_b_layout)
@@ -351,12 +345,10 @@ def _a4w4_8wave_kernel(
             acc_tl = tl.dot_scaled(a_top, a_sc_top, "e2m1", b_left, b_sc_left, "e2m1", acc_tl)
         with tlx.warp_pipeline_stage("mem", priority=1):
             a_bot = tlx.local_load(smem_a_bot[0], relaxed=True)
-            a_sc_bot = tlx.local_load(
-                tlx.local_reinterpret(smem_a_sc_b_flat[0], tlx.dtype_of(a_scales_ptr), layout=shared_a_scales),
-                layout=scale_a_layout)
+            a_sc_bot = tlx.local_load(smem_a_sc_b[0], layout=scale_a_layout)
             tlx.amd_sched_barrier(0)  # keep ds_read(local_load) ahead of the global loads
             tlx.buffer_load_to_local(smem_b_left[0], b_base, b_tile_offsets)
-            tlx.buffer_load_to_local(smem_b_sc_flat[0], b_scales_ptr, b_sc_offsets)
+            tlx.buffer_load_to_local(smem_b_sc[0], b_scales_ptr, b_sc_offsets)
             tlx.async_load_commit_group()
 
         tlx.async_load_wait_group(5)
@@ -366,7 +358,7 @@ def _a4w4_8wave_kernel(
             b_right = tlx.local_load(tlx.local_trans(smem_b_right[0]), relaxed=True)
             tlx.amd_sched_barrier(0)  # keep ds_read(local_load) ahead of the global loads
             tlx.buffer_load_to_local(smem_a_top[0], a_base, a_tile_offsets)
-            tlx.buffer_load_to_local(smem_a_sc_t_flat[0], a_scales_ptr, a_sc_offsets)
+            tlx.buffer_load_to_local(smem_a_sc_t[0], a_scales_ptr, a_sc_offsets)
             tlx.async_load_commit_group()
 
         tlx.async_load_wait_group(5)
@@ -376,7 +368,7 @@ def _a4w4_8wave_kernel(
             b_left = tlx.local_load(tlx.local_trans(smem_b_left[1]), relaxed=True)
             tlx.amd_sched_barrier(0)  # keep ds_read(local_load) ahead of the global loads
             tlx.buffer_load_to_local(smem_a_bot[0], a_base + a_half_m, a_tile_offsets)
-            tlx.buffer_load_to_local(smem_a_sc_b_flat[0], a_scales_ptr + a_sc_half_m, a_sc_offsets)
+            tlx.buffer_load_to_local(smem_a_sc_b[0], a_scales_ptr + a_sc_half_m, a_sc_offsets)
             tlx.async_load_commit_group()
 
         tlx.async_load_wait_group(5)
@@ -384,12 +376,8 @@ def _a4w4_8wave_kernel(
             acc_br = tl.dot_scaled(a_bot, a_sc_bot, "e2m1", b_right, b_sc_right, "e2m1", acc_br)
         with tlx.warp_pipeline_stage("mem", priority=1):
             a_top = tlx.local_load(smem_a_top[1], relaxed=True)
-            a_sc_top = tlx.local_load(
-                tlx.local_reinterpret(smem_a_sc_t_flat[1], tlx.dtype_of(a_scales_ptr), layout=shared_a_scales),
-                layout=scale_a_layout)
-            b_sc_comb = tlx.local_load(
-                tlx.local_reinterpret(smem_b_sc_flat[1], tlx.dtype_of(b_scales_ptr), layout=shared_b_scales),
-                layout=scale_b_comb_layout)
+            a_sc_top = tlx.local_load(smem_a_sc_t[1], layout=scale_a_layout)
+            b_sc_comb = tlx.local_load(smem_b_sc[1], layout=scale_b_comb_layout)
             b_sc_l, b_sc_r = tl.split(tl.trans(tl.reshape(b_sc_comb, 2, HALF_N, NG), 1, 2, 0))
             b_sc_left = tlx.require_layout(b_sc_l, scale_b_layout)
             b_sc_right = tlx.require_layout(b_sc_r, scale_b_layout)
@@ -403,12 +391,10 @@ def _a4w4_8wave_kernel(
             acc_tl = tl.dot_scaled(a_top, a_sc_top, "e2m1", b_left, b_sc_left, "e2m1", acc_tl)
         with tlx.warp_pipeline_stage("mem", priority=1):
             a_bot = tlx.local_load(smem_a_bot[1], relaxed=True)
-            a_sc_bot = tlx.local_load(
-                tlx.local_reinterpret(smem_a_sc_b_flat[1], tlx.dtype_of(a_scales_ptr), layout=shared_a_scales),
-                layout=scale_a_layout)
+            a_sc_bot = tlx.local_load(smem_a_sc_b[1], layout=scale_a_layout)
             tlx.amd_sched_barrier(0)  # keep ds_read(local_load) ahead of the global loads
             tlx.buffer_load_to_local(smem_b_left[1], b_base + b_k2, b_tile_offsets)
-            tlx.buffer_load_to_local(smem_b_sc_flat[1], b_scales_ptr + b_sc_k, b_sc_offsets)
+            tlx.buffer_load_to_local(smem_b_sc[1], b_scales_ptr + b_sc_k, b_sc_offsets)
             tlx.async_load_commit_group()
 
         tlx.async_load_wait_group(5)
@@ -418,7 +404,7 @@ def _a4w4_8wave_kernel(
             b_right = tlx.local_load(tlx.local_trans(smem_b_right[1]), relaxed=True)
             tlx.amd_sched_barrier(0)  # keep ds_read(local_load) ahead of the global loads
             tlx.buffer_load_to_local(smem_a_top[1], a_base + a_k2, a_tile_offsets)
-            tlx.buffer_load_to_local(smem_a_sc_t_flat[1], a_scales_ptr + a_sc_k, a_sc_offsets)
+            tlx.buffer_load_to_local(smem_a_sc_t[1], a_scales_ptr + a_sc_k, a_sc_offsets)
             tlx.async_load_commit_group()
 
         tlx.async_load_wait_group(5)
@@ -428,7 +414,7 @@ def _a4w4_8wave_kernel(
             b_left = tlx.local_load(tlx.local_trans(smem_b_left[0]), relaxed=True)
             tlx.amd_sched_barrier(0)  # keep ds_read(local_load) ahead of the global loads
             tlx.buffer_load_to_local(smem_a_bot[1], a_base + a_half_m + a_k2, a_tile_offsets)
-            tlx.buffer_load_to_local(smem_a_sc_b_flat[1], a_scales_ptr + a_sc_half_m + a_sc_k, a_sc_offsets)
+            tlx.buffer_load_to_local(smem_a_sc_b[1], a_scales_ptr + a_sc_half_m + a_sc_k, a_sc_offsets)
             tlx.async_load_commit_group()
 
         tlx.async_load_wait_group(5)
@@ -436,12 +422,8 @@ def _a4w4_8wave_kernel(
             acc_br = tl.dot_scaled(a_bot, a_sc_bot, "e2m1", b_right, b_sc_right, "e2m1", acc_br)
         with tlx.warp_pipeline_stage("mem", priority=1):
             a_top = tlx.local_load(smem_a_top[0], relaxed=True)
-            a_sc_top = tlx.local_load(
-                tlx.local_reinterpret(smem_a_sc_t_flat[0], tlx.dtype_of(a_scales_ptr), layout=shared_a_scales),
-                layout=scale_a_layout)
-            b_sc_comb = tlx.local_load(
-                tlx.local_reinterpret(smem_b_sc_flat[0], tlx.dtype_of(b_scales_ptr), layout=shared_b_scales),
-                layout=scale_b_comb_layout)
+            a_sc_top = tlx.local_load(smem_a_sc_t[0], layout=scale_a_layout)
+            b_sc_comb = tlx.local_load(smem_b_sc[0], layout=scale_b_comb_layout)
             b_sc_l, b_sc_r = tl.split(tl.trans(tl.reshape(b_sc_comb, 2, HALF_N, NG), 1, 2, 0))
             b_sc_left = tlx.require_layout(b_sc_l, scale_b_layout)
             b_sc_right = tlx.require_layout(b_sc_r, scale_b_layout)
@@ -459,9 +441,7 @@ def _a4w4_8wave_kernel(
     tlx.async_load_wait_group(5)
     l_idx: tl.constexpr = 0  # (iter_max - 2) % 2, always 0 (iter_max even)
     a_bot = tlx.local_load(tlx.local_view(smem_a_bot, l_idx), relaxed=True)
-    a_sc_bot = tlx.local_load(
-        tlx.local_reinterpret(smem_a_sc_b_flat[l_idx], tlx.dtype_of(a_scales_ptr), layout=shared_a_scales),
-        layout=scale_a_layout)
+    a_sc_bot = tlx.local_load(smem_a_sc_b[l_idx], layout=scale_a_layout)
 
     acc_bl = tl.dot_scaled(a_bot, a_sc_bot, "e2m1", b_left, b_sc_left, "e2m1", acc_bl)
     tlx.async_load_wait_group(4)
@@ -475,12 +455,8 @@ def _a4w4_8wave_kernel(
     acc_br = tl.dot_scaled(a_bot, a_sc_bot, "e2m1", b_right, b_sc_right, "e2m1", acc_br)
     tlx.async_load_wait_group(2)
     a_top = tlx.local_load(tlx.local_view(smem_a_top, g_idx), relaxed=True)
-    a_sc_top = tlx.local_load(
-        tlx.local_reinterpret(smem_a_sc_t_flat[g_idx], tlx.dtype_of(a_scales_ptr), layout=shared_a_scales),
-        layout=scale_a_layout)
-    b_sc_comb = tlx.local_load(
-        tlx.local_reinterpret(smem_b_sc_flat[g_idx], tlx.dtype_of(b_scales_ptr), layout=shared_b_scales),
-        layout=scale_b_comb_layout)
+    a_sc_top = tlx.local_load(smem_a_sc_t[g_idx], layout=scale_a_layout)
+    b_sc_comb = tlx.local_load(smem_b_sc[g_idx], layout=scale_b_comb_layout)
     b_sc_l, b_sc_r = tl.split(tl.trans(tl.reshape(b_sc_comb, 2, HALF_N, NG), 1, 2, 0))
     b_sc_left = tlx.require_layout(b_sc_l, scale_b_layout)
     b_sc_right = tlx.require_layout(b_sc_r, scale_b_layout)
@@ -489,9 +465,7 @@ def _a4w4_8wave_kernel(
     acc_tl = tl.dot_scaled(a_top, a_sc_top, "e2m1", b_left, b_sc_left, "e2m1", acc_tl)
     tlx.async_load_wait_group(1)
     a_bot = tlx.local_load(tlx.local_view(smem_a_bot, g_idx), relaxed=True)
-    a_sc_bot = tlx.local_load(
-        tlx.local_reinterpret(smem_a_sc_b_flat[g_idx], tlx.dtype_of(a_scales_ptr), layout=shared_a_scales),
-        layout=scale_a_layout)
+    a_sc_bot = tlx.local_load(smem_a_sc_b[g_idx], layout=scale_a_layout)
 
     acc_bl = tl.dot_scaled(a_bot, a_sc_bot, "e2m1", b_left, b_sc_left, "e2m1", acc_bl)
     tlx.async_load_wait_group(0)

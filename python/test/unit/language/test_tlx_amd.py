@@ -3025,14 +3025,6 @@ def test_a4w4_inter_wave_256tile_codegen_gfx950(device, fresh_triton_cache, monk
     assert operand_shared is not None
     operand_alloc = rf"ttg.local_alloc : \(\) -> !ttg.memdesc<2x128x128xi8, {operand_shared.group(1)}, #smem"
     assert len(re.findall(operand_alloc, ttgir)) == 4
-    flat_scale_shared = re.search(
-        r"(#\w+) = #ttg.swizzled_shared<\{vec = 1, perPhase = 1, maxPhase = 1, order = \[0, 1\]\}>",
-        ttgir,
-    )
-    assert flat_scale_shared is not None
-    flat_scale_alias = flat_scale_shared.group(1)
-    assert len(re.findall(rf"ttg.local_alloc : \(\) -> !ttg.memdesc<2x128x8xi8, {flat_scale_alias}, #smem", ttgir)) == 2
-    assert len(re.findall(rf"ttg.local_alloc : \(\) -> !ttg.memdesc<2x256x8xi8, {flat_scale_alias}, #smem", ttgir)) == 1
     a_scale_shared = re.search(
         r"(#\w+) = #ttg.shared_linear<\{offset = \[\[1, 0\], \[2, 0\], \[4, 0\], \[8, 0\], \[16, 0\], "
         r"\[32, 0\], \[64, 0\], \[0, 1\], \[0, 2\], \[16, 4\]\]\}, alignment = 16>",
@@ -3044,8 +3036,33 @@ def test_a4w4_inter_wave_256tile_codegen_gfx950(device, fresh_triton_cache, monk
         ttgir,
     )
     assert a_scale_shared is not None and b_scale_shared is not None
-    assert len(re.findall(rf"ttg.memdesc_reinterpret .* -> !ttg.memdesc<128x8xi8, {a_scale_shared.group(1)}", ttgir)) == 4
-    assert len(re.findall(rf"ttg.memdesc_reinterpret .* -> !ttg.memdesc<256x8xi8, {b_scale_shared.group(1)}", ttgir)) == 2
+    a_scale_load = re.search(
+        r"(#\w+) = #ttg.generic_linear<\{register = \[\[1, 0\], \[2, 0\]\], "
+        r"lane = \[\[4, 0\], \[8, 0\], \[16, 0\], \[32, 0\], \[64, 0\], \[0, 1\]\], "
+        r"warp = \[\[0, 2\], \[16, 4\], \[0, 0\]\]",
+        ttgir,
+    )
+    b_scale_load = re.search(
+        r"(#\w+) = #ttg.generic_linear<\{register = \[\[1, 0\], \[2, 0\]\], "
+        r"lane = \[\[4, 0\], \[8, 0\], \[16, 0\], \[32, 0\], \[64, 0\], \[128, 0\]\], "
+        r"warp = \[\[16, 1\], \[0, 2\], \[32, 4\]\]",
+        ttgir,
+    )
+    assert a_scale_load is not None and b_scale_load is not None
+    assert f"tensor<128x8xi32, {a_scale_load.group(1)}>" in ttgir
+    assert f"tensor<256x8xi32, {b_scale_load.group(1)}>" in ttgir
+    assert len(
+        re.findall(
+            rf"ttg.local_alloc : \(\) -> !ttg.memdesc<2x128x8xi8, {a_scale_shared.group(1)}, #smem",
+            ttgir,
+        )) == 2
+    assert len(
+        re.findall(
+            rf"ttg.local_alloc : \(\) -> !ttg.memdesc<2x256x8xi8, {b_scale_shared.group(1)}, #smem",
+            ttgir,
+        )) == 1
+    assert "ttg.memdesc_reinterpret" not in ttgir
+    assert "arith.xori" not in ttgir
     assert ttgir.count('triton.warp_pipeline.stage = "mfma"') == 8
     assert ttgir.count('triton.warp_pipeline.stage = "mem"') == 8
     assert ttgir.count("rocdl.sched.barrier 0") == 8

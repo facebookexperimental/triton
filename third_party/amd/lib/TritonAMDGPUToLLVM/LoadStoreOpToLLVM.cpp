@@ -813,10 +813,20 @@ struct BufferLoadToLocalOpConversion
 
     auto maybeSwizzledEnc = dyn_cast<SwizzledSharedEncodingAttr>(dstEnc);
     auto maybeLinearEnc = dyn_cast<SharedLinearEncodingAttr>(dstEnc);
+    bool mapsDirectlyToShared = false;
+    if (maybeLinearEnc && !targetInfo.supportsDirectToLdsScatter()) {
+      auto srcLayout = triton::gpu::toLinearLayout(ptrType);
+      auto sharedLayout = triton::gpu::toLinearLayout(dstTy);
+      auto srcToShared = srcLayout.invertAndCompose(sharedLayout);
+      mapsDirectlyToShared =
+          srcToShared.getNumConsecutiveInOut() == vec &&
+          LLVM::AMD::canCoalesceWriteIntoSharedMemory(
+              op.getContext(), srcToShared, targetInfo.getWarpSize(), vec);
+    }
     bool requiresSrcPtrSwizzling =
         !targetInfo.supportsDirectToLdsScatter() &&
         ((maybeSwizzledEnc && maybeSwizzledEnc.getMaxPhase() != 1) ||
-         maybeLinearEnc);
+         (maybeLinearEnc && !mapsDirectlyToShared));
     bool canOffsetSwizzle = maybeSwizzledEnc && requiresSrcPtrSwizzling &&
                             canApplySwizzlingWithLaneOffset(offset, dstTy);
     if (requiresSrcPtrSwizzling) {
