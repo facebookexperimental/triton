@@ -40,6 +40,8 @@ class _Analysis:
         self.slot = self.dsl.sym("slot")
         self._memo = {}
         self._active = set()
+        self._explicit_uniform = {}
+        self._explicit_uniform_active = set()
         self._assumption_by_id = {
             int(assumption.assumption_id): assumption
             for assumption in target_program.assumptions
@@ -80,7 +82,13 @@ class _Analysis:
     def _domain(self, target_value_id):
         value = self.program.values[int(target_value_id)]
         if value.layout_map_id is None:
-            return None
+            # A scalar splat is an exact uniform packet even when a hand-built
+            # target program has no layout map.  Admit only that explicit SSA
+            # carrier: a missing layout alone is never evidence that a
+            # distributed value is uniform.
+            if not self._is_explicit_uniform(target_value_id):
+                return None
+            return _Point(self.block, self.item, self.slot), ()
         layout = self.program.layouts[int(value.layout_map_id)]
         if layout.linear_layout is None:
             return None
@@ -106,6 +114,26 @@ class _Analysis:
             *_range_facts(self.dsl, self.slot, 0, slot_count - 1),
         )
         return point, facts
+
+    def _is_explicit_uniform(self, target_value_id):
+        target_value_id = int(target_value_id)
+        if target_value_id in self._explicit_uniform:
+            return self._explicit_uniform[target_value_id]
+        if target_value_id in self._explicit_uniform_active:
+            return False
+        self._explicit_uniform_active.add(target_value_id)
+        try:
+            value = self.program.values[target_value_id]
+            if value.type.representation == "scalar":
+                result = True
+            else:
+                op = self.definition_by_result.get(target_value_id)
+                result = (op is not None and op.kind == "splat" and len(op.operands) == 1
+                          and self._is_explicit_uniform(op.operands[0]))
+        finally:
+            self._explicit_uniform_active.remove(target_value_id)
+        self._explicit_uniform[target_value_id] = result
+        return result
 
     def _evaluate(self, target_value_id, point, facts):
         target_value_id = int(target_value_id)
