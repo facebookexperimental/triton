@@ -992,12 +992,13 @@ def local_load(
     """
     Loads buffer from local or tensor memory into a distributed tensor.
 
-    ``relaxed=True`` marks an AMD LDS load as already ordered after its async
-    producer, avoiding an extra wait-count dependency. The caller must place
-    an async wait and workgroup barrier before a cooperatively produced tile is
-    consumed. This marker does not release the tile for a later refill; a
-    workgroup barrier is still required between cooperative consumption and an
-    async write that reuses the same LDS slice.
+    ``relaxed=True`` marks an AMD LDS load as ordered after its async producer,
+    avoiding an extra wait-count dependency. The caller must place an async
+    wait before a cooperatively produced tile is consumed; membar analysis
+    materializes the CTA barrier required after that memory-wait operation.
+    This marker does not release the tile for a later refill: the
+    consumer-to-refill dependency must still produce a CTA barrier when an
+    async write reuses the same LDS slice.
 
     ``layout`` (optional) pins the register layout of the loaded value, written
     as a ``tlx.layout(...)`` (Shape:Stride). It is mapped to a ``#linear``
