@@ -302,25 +302,25 @@ def _a4w4_8wave_kernel(
 
     # ---- Prologue: prefetch K-steps 0,1 into buffers 0,1 (8 commits) ----
     tlx.buffer_load_to_local(smem_b_left[0], b_base, b_tile_offsets)
-    tlx.buffer_load_to_local(smem_b_sc_flat[0], b_scales_ptr, b_sc_offsets, contiguity=4)
+    tlx.buffer_load_to_local(smem_b_sc_flat[0], b_scales_ptr, b_sc_offsets)
     tlx.async_load_commit_group()
     tlx.buffer_load_to_local(smem_a_top[0], a_base, a_tile_offsets)
-    tlx.buffer_load_to_local(smem_a_sc_t_flat[0], a_scales_ptr, a_sc_offsets, contiguity=4)
+    tlx.buffer_load_to_local(smem_a_sc_t_flat[0], a_scales_ptr, a_sc_offsets)
     tlx.async_load_commit_group()
     tlx.buffer_load_to_local(smem_a_bot[0], a_base + a_half_m, a_tile_offsets)
-    tlx.buffer_load_to_local(smem_a_sc_b_flat[0], a_scales_ptr + a_sc_half_m, a_sc_offsets, contiguity=4)
+    tlx.buffer_load_to_local(smem_a_sc_b_flat[0], a_scales_ptr + a_sc_half_m, a_sc_offsets)
     tlx.async_load_commit_group()
     tlx.buffer_load_to_local(smem_b_right[0], b_base + b_half_n, b_tile_offsets)
     tlx.async_load_commit_group()
 
     tlx.buffer_load_to_local(smem_b_left[1], b_base + b_k2, b_tile_offsets)
-    tlx.buffer_load_to_local(smem_b_sc_flat[1], b_scales_ptr + b_sc_k, b_sc_offsets, contiguity=4)
+    tlx.buffer_load_to_local(smem_b_sc_flat[1], b_scales_ptr + b_sc_k, b_sc_offsets)
     tlx.async_load_commit_group()
     tlx.buffer_load_to_local(smem_a_top[1], a_base + a_k2, a_tile_offsets)
-    tlx.buffer_load_to_local(smem_a_sc_t_flat[1], a_scales_ptr + a_sc_k, a_sc_offsets, contiguity=4)
+    tlx.buffer_load_to_local(smem_a_sc_t_flat[1], a_scales_ptr + a_sc_k, a_sc_offsets)
     tlx.async_load_commit_group()
     tlx.buffer_load_to_local(smem_a_bot[1], a_base + a_half_m + a_k2, a_tile_offsets)
-    tlx.buffer_load_to_local(smem_a_sc_b_flat[1], a_scales_ptr + a_sc_half_m + a_sc_k, a_sc_offsets, contiguity=4)
+    tlx.buffer_load_to_local(smem_a_sc_b_flat[1], a_scales_ptr + a_sc_half_m + a_sc_k, a_sc_offsets)
     tlx.async_load_commit_group()
     tlx.buffer_load_to_local(smem_b_right[1], b_base + b_half_n + b_k2, b_tile_offsets)
     tlx.async_load_commit_group()
@@ -356,7 +356,7 @@ def _a4w4_8wave_kernel(
                 layout=scale_a_layout)
             tlx.amd_sched_barrier(0)  # keep ds_read(local_load) ahead of the global loads
             tlx.buffer_load_to_local(smem_b_left[0], b_base, b_tile_offsets)
-            tlx.buffer_load_to_local(smem_b_sc_flat[0], b_scales_ptr, b_sc_offsets, contiguity=4)
+            tlx.buffer_load_to_local(smem_b_sc_flat[0], b_scales_ptr, b_sc_offsets)
             tlx.async_load_commit_group()
 
         tlx.async_load_wait_group(5)
@@ -366,7 +366,7 @@ def _a4w4_8wave_kernel(
             b_right = tlx.local_load(tlx.local_trans(smem_b_right[0]), relaxed=True)
             tlx.amd_sched_barrier(0)  # keep ds_read(local_load) ahead of the global loads
             tlx.buffer_load_to_local(smem_a_top[0], a_base, a_tile_offsets)
-            tlx.buffer_load_to_local(smem_a_sc_t_flat[0], a_scales_ptr, a_sc_offsets, contiguity=4)
+            tlx.buffer_load_to_local(smem_a_sc_t_flat[0], a_scales_ptr, a_sc_offsets)
             tlx.async_load_commit_group()
 
         tlx.async_load_wait_group(5)
@@ -376,7 +376,7 @@ def _a4w4_8wave_kernel(
             b_left = tlx.local_load(tlx.local_trans(smem_b_left[1]), relaxed=True)
             tlx.amd_sched_barrier(0)  # keep ds_read(local_load) ahead of the global loads
             tlx.buffer_load_to_local(smem_a_bot[0], a_base + a_half_m, a_tile_offsets)
-            tlx.buffer_load_to_local(smem_a_sc_b_flat[0], a_scales_ptr + a_sc_half_m, a_sc_offsets, contiguity=4)
+            tlx.buffer_load_to_local(smem_a_sc_b_flat[0], a_scales_ptr + a_sc_half_m, a_sc_offsets)
             tlx.async_load_commit_group()
 
         tlx.async_load_wait_group(5)
@@ -408,7 +408,7 @@ def _a4w4_8wave_kernel(
                 layout=scale_a_layout)
             tlx.amd_sched_barrier(0)  # keep ds_read(local_load) ahead of the global loads
             tlx.buffer_load_to_local(smem_b_left[1], b_base + b_k2, b_tile_offsets)
-            tlx.buffer_load_to_local(smem_b_sc_flat[1], b_scales_ptr + b_sc_k, b_sc_offsets, contiguity=4)
+            tlx.buffer_load_to_local(smem_b_sc_flat[1], b_scales_ptr + b_sc_k, b_sc_offsets)
             tlx.async_load_commit_group()
 
         tlx.async_load_wait_group(5)
@@ -418,7 +418,7 @@ def _a4w4_8wave_kernel(
             b_right = tlx.local_load(tlx.local_trans(smem_b_right[1]), relaxed=True)
             tlx.amd_sched_barrier(0)  # keep ds_read(local_load) ahead of the global loads
             tlx.buffer_load_to_local(smem_a_top[1], a_base + a_k2, a_tile_offsets)
-            tlx.buffer_load_to_local(smem_a_sc_t_flat[1], a_scales_ptr + a_sc_k, a_sc_offsets, contiguity=4)
+            tlx.buffer_load_to_local(smem_a_sc_t_flat[1], a_scales_ptr + a_sc_k, a_sc_offsets)
             tlx.async_load_commit_group()
 
         tlx.async_load_wait_group(5)
@@ -428,8 +428,7 @@ def _a4w4_8wave_kernel(
             b_left = tlx.local_load(tlx.local_trans(smem_b_left[0]), relaxed=True)
             tlx.amd_sched_barrier(0)  # keep ds_read(local_load) ahead of the global loads
             tlx.buffer_load_to_local(smem_a_bot[1], a_base + a_half_m + a_k2, a_tile_offsets)
-            tlx.buffer_load_to_local(smem_a_sc_b_flat[1], a_scales_ptr + a_sc_half_m + a_sc_k, a_sc_offsets,
-                                     contiguity=4)
+            tlx.buffer_load_to_local(smem_a_sc_b_flat[1], a_scales_ptr + a_sc_half_m + a_sc_k, a_sc_offsets)
             tlx.async_load_commit_group()
 
         tlx.async_load_wait_group(5)

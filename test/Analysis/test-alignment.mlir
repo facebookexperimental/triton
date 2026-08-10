@@ -531,7 +531,7 @@ tt.func @logic() {
   %5 = arith.andi %0, %1 : tensor<128xi32>
   // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [1], constant_value = <none>}}
   %6 = arith.ori %0, %1 : tensor<128xi32>
-  // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [1], constant_value = <none>}}
+  // expected-remark @below {{contiguity = [64], divisibility = [64], constancy = [1], constant_value = <none>}}
   %7 = arith.xori %0, %1 : tensor<128xi32>
   // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [8], constant_value = <none>}}
   %8 = arith.andi %2, %4 : tensor<128xi32>

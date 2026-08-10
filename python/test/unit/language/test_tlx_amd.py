@@ -227,7 +227,7 @@ def test_buffer_load_contiguity_vectorizes_gfx950():
 
 
 @triton.jit
-def _buffer_load_to_local_contiguity_kernel(x_ptr):
+def _buffer_load_to_local_xor_contiguity_kernel(x_ptr):
     load_layout: tl.constexpr = tlx.layout(
         shape=((2, 2, 2, 2, 2, 2, 2, 2, 2), (2, 2)),
         stride=((32, 64, 128, 256, 512, 1, 0, 2, 4), (8, 16)),
@@ -240,21 +240,50 @@ def _buffer_load_to_local_contiguity_kernel(x_ptr):
     offsets = (rows ^ ((groups & 4) << 2)) + groups * 128
     offsets = tlx.require_layout(offsets, load_layout, pin=False)
     smem = tlx.local_alloc((128, 8), tlx.dtype_of(x_ptr), 1, layout=shared_layout)
-    tlx.buffer_load_to_local(smem[0], x_ptr, offsets, contiguity=4)
+    tlx.buffer_load_to_local(smem[0], x_ptr, offsets)
 
 
-def test_buffer_load_to_local_contiguity_vectorizes_gfx950():
+@triton.jit
+def _buffer_load_to_local_low_bit_xor_kernel(x_ptr):
+    load_layout: tl.constexpr = tlx.layout(
+        shape=((2, 2, 2, 2, 2, 2, 2, 2, 2), (2, 2)),
+        stride=((32, 64, 128, 256, 512, 1, 0, 2, 4), (8, 16)),
+    )
+    shared_layout: tl.constexpr = tlx.swizzled_layout(0, 0, 0, order=[0, 1])
+    rows = tl.arange(0, 128)[:, None]
+    groups = tl.arange(0, 8)[None, :]
+    # Toggling the low bit reverses adjacent addresses. The same register
+    # layout must not turn this into a vectorizable direct-to-LDS load.
+    offsets = (rows ^ (groups & 1)) + groups * 128
+    offsets = tlx.require_layout(offsets, load_layout, pin=False)
+    smem = tlx.local_alloc((128, 8), tlx.dtype_of(x_ptr), 1, layout=shared_layout)
+    tlx.buffer_load_to_local(smem[0], x_ptr, offsets)
+
+
+def test_buffer_load_to_local_infers_xor_contiguity_gfx950():
     src = ASTSource(
-        fn=_buffer_load_to_local_contiguity_kernel,
+        fn=_buffer_load_to_local_xor_contiguity_kernel,
         signature={"x_ptr": "*u8"},
         constexprs={},
+        attrs={(0, ): [("tt.divisibility", 16)]},
     )
     compiled = triton_compile(src, target=GFX950, options={"num_warps": 8})
 
     ttgir = compiled.asm["ttgir"]
     assert "amdg.buffer_load_to_local" in ttgir
-    assert "contiguity = 4" in ttgir
+    assert "contiguity =" not in ttgir
     assert "buffer_load_dword" in compiled.asm["amdgcn"]
+
+
+def test_buffer_load_to_local_does_not_infer_low_bit_xor_contiguity_gfx950():
+    src = ASTSource(
+        fn=_buffer_load_to_local_low_bit_xor_kernel,
+        signature={"x_ptr": "*u8"},
+        constexprs={},
+        attrs={(0, ): [("tt.divisibility", 16)]},
+    )
+    with pytest.raises(RuntimeError, match="failed to translate module to LLVM IR"):
+        triton_compile(src, target=GFX950, options={"num_warps": 8})
 
 
 @triton.jit
@@ -3022,7 +3051,7 @@ def test_a4w4_inter_wave_256tile_codegen_gfx950(device, fresh_triton_cache, monk
     assert ttgir.count("rocdl.sched.barrier 0") == 8
     assert ttgir.count("tt.dot_scaled") == 16
     assert ttgir.count("amdg.buffer_load_to_local") == 28
-    assert ttgir.count("contiguity = 4") == 12
+    assert "contiguity" not in ttgir
 
     assert len(re.findall(r"^\s*v_mfma_scale_f32_16x16x128_f8f6f4\b", amdgcn, re.MULTILINE)) == 256
     assert len(re.findall(r"^\s*buffer_load_[^\n]*\blds\s*$", amdgcn, re.MULTILINE)) == 44
