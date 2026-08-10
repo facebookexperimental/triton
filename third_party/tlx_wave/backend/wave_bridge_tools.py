@@ -5,7 +5,6 @@ import hashlib
 import os
 import subprocess
 import sys
-import warnings
 from pathlib import Path
 
 _WAVE_PIPELINE_FILE = "pipelines.mlir"
@@ -89,35 +88,34 @@ def _existing_paths(candidates):
             yield path
 
 
-def _load_wave_dsl():
+def _add_wave_python_paths():
     for path in _existing_paths(_candidate_wave_python_paths()):
         path_str = str(path)
         if path_str not in sys.path:
             sys.path.insert(0, path_str)
 
-    with warnings.catch_warnings():
-        warnings.filterwarnings(
-            "ignore",
-            message="Attribute builder for .* is already registered",
-            category=RuntimeWarning,
-        )
-        try:
-            from mlir.dialects import wave_dsl as w
-        except Exception as exc:
-            candidates = "\n  ".join(str(path) for path in _candidate_wave_python_paths())
-            raise RuntimeError("tlx_wave requires Wave MLIR Python bindings from the third_party/wave submodule build. "
-                               "Build Triton with TRITON_CODEGEN_BACKENDS including tlx_wave, or run "
-                               "`python third_party/wave/build_tools/build_llvm.py --python-bindings` followed by "
-                               "`cmake -S third_party/wave -B third_party/wave/build/wave-build "
-                               "-G Ninja -DWAVE_ENABLE_PYTHON_BINDINGS=ON` and "
-                               "`cmake --build third_party/wave/build/wave-build`. "
-                               f"Unable to import mlir.dialects.wave_dsl: {type(exc).__name__}: {exc}. "
-                               f"Checked Wave Python package candidates:\n  {candidates}") from exc
+
+@functools.cache
+def load_wave_dsl():
+    _add_wave_python_paths()
+
+    try:
+        from mlir.dialects import wave_dsl as w
+    except Exception as exc:
+        candidates = "\n  ".join(str(path) for path in _candidate_wave_python_paths())
+        raise RuntimeError("tlx_wave requires Wave MLIR Python bindings from the third_party/wave submodule build. "
+                           "Build Triton with TRITON_CODEGEN_BACKENDS including tlx_wave, or run "
+                           "`python third_party/wave/build_tools/build_llvm.py --python-bindings` followed by "
+                           "`cmake -S third_party/wave -B third_party/wave/build/wave-build "
+                           "-G Ninja -DWAVE_ENABLE_PYTHON_BINDINGS=ON` and "
+                           "`cmake --build third_party/wave/build/wave-build`. "
+                           f"Unable to import mlir.dialects.wave_dsl: {type(exc).__name__}: {exc}. "
+                           f"Checked Wave Python package candidates:\n  {candidates}") from exc
     return w
 
 
 def _load_wave_ir():
-    _load_wave_dsl()
+    load_wave_dsl()
     try:
         from mlir import ir
         from mlir.dialects import gpu
@@ -238,7 +236,7 @@ def _compile_wave_module_to_hsaco(
 def _extract_hsaco_from_gpu_binary(binary_module_text):
     ir, gpu = _load_wave_ir()
     with ir.Context() as ctx, ir.Location.unknown():
-        _load_wave_dsl().register_dialects(ctx)
+        load_wave_dsl().register_dialects(ctx)
         module = ir.Module.parse(binary_module_text)
         binaries = [op for op in module.body.operations if op.operation.name == "gpu.binary"]
         if len(binaries) != 1:

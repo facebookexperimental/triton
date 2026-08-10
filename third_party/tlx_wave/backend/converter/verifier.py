@@ -124,6 +124,36 @@ def _verify_target_layouts(target_program):
                 f"target layout {layout.layout_map_id} has a malformed "
                 "symbolic linear layout",
             )
+        component_model = layout.kind in {"amd_mfma", "dot_operand"}
+        grid = layout.component_grid
+        relation = layout.component_relation
+        valid_grid = (isinstance(grid, tuple) and len(grid) == 2
+                      and all(type(extent) is int and extent > 0 for extent in grid)
+                      and int(grid[0]) * int(grid[1]) == int(layout.component_count))
+        valid_relation = lambda blob: (isinstance(blob, tuple) and bool(blob) and all(
+            type(byte) is int and 0 <= byte <= 255 for byte in blob))
+        if component_model != (valid_grid and valid_relation(relation)):
+            fail(
+                "TLXW_VERIFY_LAYOUT_SCHEMA",
+                STAGE,
+                f"target layout {layout.layout_map_id} has a malformed "
+                "component relation",
+            )
+        if not component_model and (grid is not None or relation is not None):
+            fail(
+                "TLXW_VERIFY_LAYOUT_SCHEMA",
+                STAGE,
+                f"target layout {layout.layout_map_id} has an unexpected "
+                "component relation",
+            )
+        if layout.active_relation is not None and (layout.linear_layout is None
+                                                   or not valid_relation(layout.active_relation)):
+            fail(
+                "TLXW_VERIFY_LAYOUT_SCHEMA",
+                STAGE,
+                f"target layout {layout.layout_map_id} has a malformed "
+                "active relation",
+            )
 
 
 def _verify_target_assumptions(target_program):
@@ -382,8 +412,12 @@ def _verify_ops(target_program, source_program):
             _verify_type_convert(op, target_program)
         if op.kind == "make_buffer":
             _verify_make_buffer(op, target_program)
+        if op.kind in {"mma", "mma_scaled"}:
+            _verify_mma_component_relation(op, target_program)
         if op.kind == "layout_convert":
             _verify_layout_convert_fact_policy(op)
+            if source_program is not None:
+                _verify_layout_convert_source_op(op, source_program)
         if op.kind in {
                 "broadcast",
                 "expand_dims",
@@ -428,9 +462,6 @@ def _verify_ops(target_program, source_program):
                 facts_by_id[fact_id],
                 target_value_id,
             )
-        if op.kind == "layout_convert":
-            if source_program is not None:
-                _verify_layout_convert_source_op(op, source_program)
         if source_program is not None:
             _verify_source_semantic_attrs(target_program, op, source_program)
         if op.kind in _PROOF_DEPENDENT_OPS and not op.fact_ids:
@@ -440,6 +471,8 @@ def _verify_ops(target_program, source_program):
                 f"target op {op.target_op_id} ({op.kind}) requires fact provenance",
                 target_op_id=op.target_op_id,
             )
+        if op.kind == "assume":
+            _verify_assume_ssa(op, target_program)
     _verify_region_op_ids(target_program, op_count)
 
 
@@ -1155,6 +1188,37 @@ def _verify_fact_target_compatible(target_program, op, fact, target_value_id):
     )
 
 
+def _verify_assume_ssa(op, target_program):
+    if (not op.operands or len(op.operands) != len(op.results) or len(set(op.operands)) != len(op.operands)
+            or len(set(op.results)) != len(op.results)):
+        fail(
+            "TLXW_VERIFY_ASSUME_SSA",
+            STAGE,
+            "assume requires unique paired SSA operands and results",
+            target_op_id=op.target_op_id,
+        )
+    if set(op.fact_target_ids) != set(op.results):
+        fail(
+            "TLXW_VERIFY_ASSUME_SSA",
+            STAGE,
+            "assume facts must target every explicit SSA result",
+            target_op_id=op.target_op_id,
+        )
+    for operand_id, result_id in zip(op.operands, op.results):
+        operand = target_program.values[int(operand_id)]
+        result = target_program.values[int(result_id)]
+        if (operand.type != result.type or operand.layout_map_id != result.layout_map_id
+                or operand.source_value_id != result.source_value_id or operand.event_domain != result.event_domain
+                or operand.resource_target_ids != result.resource_target_ids):
+            fail(
+                "TLXW_VERIFY_ASSUME_SSA",
+                STAGE,
+                "assume result must preserve its operand's target value contract",
+                target_op_id=op.target_op_id,
+                target_value_id=result_id,
+            )
+
+
 def _verify_attrs(op):
     names = set()
     for attr in op.attrs:
@@ -1180,6 +1244,45 @@ def _verify_attrs(op):
                 STAGE,
                 f"target op {op.target_op_id} attr {attr.name} is not schema data",
                 target_op_id=op.target_op_id,
+            )
+
+
+def _verify_mma_component_relation(op, target_program):
+    """Verify MMA operands carry the matching proved component relations."""
+    attrs = _attrs_dict(op)
+    m_tiles = attrs.get("m_tiles")
+    n_tiles = attrs.get("n_tiles")
+    k_tiles = attrs.get("k_tiles")
+    if (len(op.operands) < 3 or len(op.results) != 1
+            or any(type(extent) is not int or extent <= 0 for extent in (m_tiles, n_tiles, k_tiles))):
+        fail(
+            "TLXW_VERIFY_MMA_COMPONENT_RELATION",
+            STAGE,
+            "mma component algebra requires positive M, N, and K tile domains",
+            target_op_id=op.target_op_id,
+        )
+
+    domains = (
+        ("lhs", (m_tiles, k_tiles), op.operands[0]),
+        ("rhs", (k_tiles, n_tiles), op.operands[1]),
+        ("accumulator", (m_tiles, n_tiles), op.operands[2]),
+        ("result", (m_tiles, n_tiles), op.results[0]),
+    )
+    for name, grid, target_value_id in domains:
+        target_value = target_program.values[int(target_value_id)]
+        layout_id = target_value.layout_map_id
+        layout = (target_program.layouts[int(layout_id)]
+                  if layout_id is not None and 0 <= int(layout_id) < len(target_program.layouts) else None)
+        component_count = int(grid[0]) * int(grid[1])
+        if (layout is None or tuple(layout.component_grid or ()) != tuple(grid)
+                or not isinstance(layout.component_relation, tuple) or not layout.component_relation
+                or int(target_value.type.component_count) != component_count):
+            fail(
+                "TLXW_VERIFY_MMA_COMPONENT_RELATION",
+                STAGE,
+                f"mma {name} layout does not match its component tile domain",
+                target_op_id=op.target_op_id,
+                target_value_id=int(target_value_id),
             )
 
 
@@ -1337,8 +1440,64 @@ def _verify_memory_edges(op, target_program):
             "memory operation is missing its typed offset operand",
             target_op_id=op.target_op_id,
         )
+    if op.kind in {"buffer_load", "buffer_load_to_local", "buffer_store"}:
+        relation = attrs.get("bit_offset_relation")
+        binding_names = attrs.get("index_binding_names", ())
+        binding_count = attrs.get("index_binding_count", 0)
+        if not isinstance(binding_count, int) or binding_count < 0:
+            fail(
+                "TLXW_VERIFY_MEMORY_RELATION",
+                STAGE,
+                "memory relation binding count must be nonnegative",
+                target_op_id=op.target_op_id,
+            )
+        if (not isinstance(relation, tuple) or not relation
+                or any(type(byte) is not int or byte < 0 or byte > 255 for byte in relation)
+                or not isinstance(binding_names, tuple) or len(binding_names) != binding_count
+                or len(set(binding_names)) != binding_count or any(not isinstance(name, str) or not name
+                                                                   for name in binding_names)):
+            fail(
+                "TLXW_VERIFY_MEMORY_RELATION",
+                STAGE,
+                "memory bit-offset relation or binding names are malformed",
+                target_op_id=op.target_op_id,
+            )
+        ordinary_count = (2 + int(bool(attrs.get("has_mask", False))) +
+                          int(bool(attrs.get("has_other", False))) if op.kind == "buffer_load" else 3 +
+                          int(bool(attrs.get("has_mask", False))))
+        dependency_count = int(attrs.get("barrier_order_dependency_count", 0))
+        if op.kind == "buffer_load_to_local":
+            dependency_count += int(attrs.get("issue_dependency_count", 0))
+        if len(op.operands) != ordinary_count + binding_count + dependency_count:
+            fail(
+                "TLXW_VERIFY_MEMORY_RELATION",
+                STAGE,
+                "memory relation binding operand segment is malformed",
+                target_op_id=op.target_op_id,
+            )
+        for target_value_id in op.operands[ordinary_count:ordinary_count + binding_count]:
+            binding_type = target_program.values[int(target_value_id)].type
+            if (binding_type.representation != "scalar" or
+                (binding_type.element_type != "index"
+                 and not (isinstance(binding_type.element_type, str) and binding_type.element_type.startswith("i")))):
+                fail(
+                    "TLXW_VERIFY_MEMORY_RELATION",
+                    STAGE,
+                    "memory relation bindings must be scalar integer SSA values",
+                    target_op_id=op.target_op_id,
+                    target_value_id=int(target_value_id),
+                )
+            if int(target_value_id) not in target_program.kernel.arg_target_ids:
+                _require_value_dominates_op(
+                    target_program,
+                    int(target_value_id),
+                    op,
+                )
     offset_type = target_program.values[int(op.operands[offset_operand])].type
-    if (offset_type.element_type not in {"i32", "index"} or offset_type.representation not in {"simd", "simd_tuple"}):
+    if offset_type.element_type not in {
+            "i32",
+            "index",
+    } or offset_type.representation not in {"simd", "simd_tuple"}:
         fail(
             "TLXW_VERIFY_MEMORY_EDGE",
             STAGE,
@@ -1348,52 +1507,6 @@ def _verify_memory_edges(op, target_program):
             target_value_id=int(op.operands[offset_operand]),
         )
     has_mask = bool(attrs.get("has_mask", False))
-    redundant_register_mask = attrs.get("redundant_register_mask", 0)
-    redundant_lane_mask = attrs.get("redundant_lane_mask", 0)
-    redundant_wave_mask = attrs.get("redundant_wave_mask", 0)
-    ownership_masks = (
-        redundant_register_mask,
-        redundant_lane_mask,
-        redundant_wave_mask,
-    )
-    if (any(not isinstance(mask, int) or mask < 0 for mask in ownership_masks)
-            or (any(ownership_masks) and (op.kind != "buffer_store"))):
-        fail(
-            "TLXW_VERIFY_MEMORY_EDGE",
-            STAGE,
-            "invalid canonical ownership masks on memory operation",
-            target_op_id=op.target_op_id,
-        )
-    wave_count = attrs.get("wave_count")
-    if (redundant_wave_mask
-            and (not isinstance(wave_count, int) or wave_count <= 1 or wave_count &
-                 (wave_count - 1) or redundant_wave_mask >= wave_count or redundant_wave_mask & ~(wave_count - 1))):
-        fail(
-            "TLXW_VERIFY_MEMORY_EDGE",
-            STAGE,
-            "redundant-wave mask is incompatible with the memory wave count",
-            target_op_id=op.target_op_id,
-        )
-    lane_width = attrs.get("lane_width")
-    if (redundant_lane_mask
-            and (not isinstance(lane_width, int) or lane_width <= 1 or lane_width &
-                 (lane_width - 1) or redundant_lane_mask >= lane_width or redundant_lane_mask & ~(lane_width - 1))):
-        fail(
-            "TLXW_VERIFY_MEMORY_EDGE",
-            STAGE,
-            "redundant-lane mask is incompatible with the memory lane width",
-            target_op_id=op.target_op_id,
-        )
-    access_component_count = attrs.get("access_component_count")
-    if (redundant_register_mask
-            and (op.kind != "buffer_store" or not isinstance(access_component_count, int) or access_component_count <= 1
-                 or redundant_register_mask >= access_component_count)):
-        fail(
-            "TLXW_VERIFY_MEMORY_EDGE",
-            STAGE,
-            "redundant-register mask is incompatible with store components",
-            target_op_id=op.target_op_id,
-        )
     mode = attrs.get(
         "mask_operand_mode",
         "operand" if has_mask else "none",
@@ -1513,13 +1626,13 @@ def _verify_type_convert(op, target_program):
 def _verify_layout_transform(op, target_program):
     attrs = _attrs_dict(op)
     allowed_attrs = {
-        "broadcast": frozenset(),
-        "expand_dims": frozenset({"axis"}),
-        "join": frozenset(),
-        "split": frozenset(),
+        "broadcast": frozenset({"relation"}),
+        "expand_dims": frozenset({"axis", "relation"}),
+        "join": frozenset({"relation"}),
+        "split": frozenset({"relations"}),
     }
     if op.kind == "layout_convert":
-        allowed = {"fact_policy", "transform"}
+        allowed = {"fact_policy", "relation", "transform"}
         if attrs.get("transform") == "trans":
             allowed.add("order")
         allowed_attrs["layout_convert"] = frozenset(allowed)
@@ -1531,6 +1644,16 @@ def _verify_layout_transform(op, target_program):
             f"{op.kind} carries non-structural layout attrs {leaked_attrs}",
             target_op_id=op.target_op_id,
         )
+    relations = (attrs.get("relations", ()) if op.kind == "split" else (attrs.get("relation"), ))
+    expected_relation_count = 2 if op.kind == "split" else 1
+    if len(relations) != expected_relation_count or any(not isinstance(relation, tuple) or not relation or any(
+            type(byte) is not int or not 0 <= byte <= 255 for byte in relation) for relation in relations):
+        fail(
+            "TLXW_VERIFY_LAYOUT_RELATION",
+            STAGE,
+            f"{op.kind} requires one closed serialized relation map per result",
+            target_op_id=op.target_op_id,
+        )
     expected_counts = {
         "broadcast": (1, 1),
         "expand_dims": (1, 1),
@@ -1539,7 +1662,7 @@ def _verify_layout_transform(op, target_program):
         "split": (1, 2),
     }
     expected_operands, expected_results = expected_counts[op.kind]
-    if (len(op.operands) != expected_operands or len(op.results) != expected_results):
+    if len(op.operands) != expected_operands or len(op.results) != expected_results:
         fail(
             "TLXW_VERIFY_LAYOUT_TRANSFORM",
             STAGE,
@@ -1580,7 +1703,8 @@ def _verify_layout_transform(op, target_program):
                  and result_shape[:axis] + result_shape[axis + 1:] == source_shape)
     elif op.kind == "join":
         first_shape, second_shape, result_shape = shapes
-        valid = first_shape == second_shape and result_shape == first_shape + (2, )
+        valid = (first_shape == second_shape and result_shape == first_shape + (2, )
+                 and layouts[0].linear_layout == layouts[1].linear_layout)
     elif op.kind == "split":
         source_shape, first_shape, second_shape = shapes
         valid = (bool(source_shape) and source_shape[-1] == 2 and first_shape == second_shape == source_shape[:-1])
@@ -1608,7 +1732,7 @@ def _verify_layout_transform(op, target_program):
 
 def _verify_reduction(op, target_program):
     attrs = _attrs_dict(op)
-    allowed = {"axis", "reduction_ordering"}
+    allowed = {"axis", "reduction_ordering", "relation"}
     leaked_attrs = tuple(sorted(set(attrs) - allowed))
     if leaked_attrs:
         fail(

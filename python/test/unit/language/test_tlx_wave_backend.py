@@ -13,6 +13,7 @@ import pytest
 
 import triton
 from triton._C.libtriton import ir
+from triton._C.libtriton import linear_layout as triton_linear_layout
 from triton._C.libtriton.linear_layout import LinearLayout
 import triton.language as tl
 from triton.backends import backends
@@ -24,22 +25,29 @@ if "tlx_wave" in backends:
     from triton.backends.tlx_wave import compiler as tlx_wave_compiler
     from triton.backends.tlx_wave import driver as tlx_wave_driver
     from triton.backends.tlx_wave import wave_bridge_tools
-    from triton.backends.tlx_wave.converter import barrier_order as converter_barrier_order
+    from triton.backends.tlx_wave.converter import (
+        barrier_order as converter_barrier_order, )
     from triton.backends.tlx_wave.converter import boundary as converter_boundary
-    from triton.backends.tlx_wave.converter import canonicalize as converter_canonicalize
+    from triton.backends.tlx_wave.converter import (
+        canonicalize as converter_canonicalize, )
     from triton.backends.tlx_wave.converter import diagnostics as converter_diagnostics
     from triton.backends.tlx_wave.converter import domains as converter_domains
     from triton.backends.tlx_wave.converter import emission as converter_emission
     from triton.backends.tlx_wave.converter import facts as converter_facts
-    from triton.backends.tlx_wave.converter import coordinates as converter_coordinates
+    from triton.backends.tlx_wave.converter import (
+        layout_domains as converter_layout_domains, )
     from triton.backends.tlx_wave.converter import layouts as converter_layouts
-    from triton.backends.tlx_wave.converter import op_conversion as converter_op_conversion
+    from triton.backends.tlx_wave.converter import (
+        op_conversion as converter_op_conversion, )
     from triton.backends.tlx_wave.converter import pipeline as converter_pipeline
-    from triton.backends.tlx_wave.converter import source_import as converter_source_import
+    from triton.backends.tlx_wave.converter import (
+        source_import as converter_source_import, )
     from triton.backends.tlx_wave.converter import source_ir as converter_source_ir
     from triton.backends.tlx_wave.converter import target_ir as converter_target_ir
     from triton.backends.tlx_wave.converter import tokens as converter_tokens
     from triton.backends.tlx_wave.converter import types as converter_types
+    from triton.backends.tlx_wave.converter import (
+        value_relations as converter_value_relations, )
     from triton.backends.tlx_wave.converter import verifier as converter_verifier
 else:
     tlx_wave_compiler = None
@@ -52,7 +60,7 @@ else:
     converter_domains = None
     converter_emission = None
     converter_facts = None
-    converter_coordinates = None
+    converter_layout_domains = None
     converter_layouts = None
     converter_op_conversion = None
     converter_pipeline = None
@@ -61,6 +69,7 @@ else:
     converter_target_ir = None
     converter_tokens = None
     converter_types = None
+    converter_value_relations = None
     converter_verifier = None
 
 pytestmark = pytest.mark.skipif("tlx_wave" not in backends, reason="tlx_wave backend is not installed")
@@ -71,15 +80,19 @@ _TLX_WAVE_RUNTIME_ARCHES = {"gfx942", "gfx950"}
 
 
 def _fake_layout(
-        layout_map_id,
-        value_id,
-        *,
-        kind="blocked",
-        shape=(8, 8),
-        element_type="i32",
-        component_count=1,
-        lane_width=64,
-        properties=None,
+    layout_map_id,
+    value_id,
+    *,
+    kind="blocked",
+    shape=(8, 8),
+    element_type="i32",
+    component_count=1,
+    lane_width=64,
+    properties=None,
+    linear_layout=None,
+    component_grid=None,
+    component_relation=None,
+    active_relation=None,
 ):
     return converter_layouts.LayoutMap(
         layout_map_id,
@@ -90,6 +103,10 @@ def _fake_layout(
         int(component_count),
         int(lane_width),
         dict(properties or {}),
+        linear_layout,
+        component_grid,
+        component_relation,
+        active_relation,
     )
 
 
@@ -210,6 +227,145 @@ def _target_value_producer(target_program, target_value_id, *, kind=None):
     return producers[0]
 
 
+def _packet_layout_apply(linear, block, item, slot, lane_width):
+    available = {
+        "block": int(block),
+        "lane": int(item) % int(lane_width),
+        "register": int(slot),
+        "warp": int(item) // int(lane_width),
+    }
+    applied = linear.apply({name: available[name] for name in linear.get_in_dim_names()})
+    return tuple(int(applied[str(name)]) for name, _extent in linear.out_dims)
+
+
+def _materialize_target_linear_layout(linear):
+    if isinstance(linear, LinearLayout):
+        return linear
+    return LinearLayout.from_bases(
+        linear.bases,
+        [str(name) for name, _extent in linear.out_dims],
+        [int(extent) for _name, extent in linear.out_dims],
+        False,
+    )
+
+
+def _packet_relation_expected_coords(kind, result_coords, source_shape, attrs, selector):
+    if kind in {"identity", "join"}:
+        return tuple(result_coords)
+    if kind == "broadcast":
+        return tuple(0 if int(extent) == 1 else int(result_coords[dim]) for dim, extent in enumerate(source_shape))
+    if kind == "expand_dims":
+        axis = int(attrs["axis"])
+        return tuple(result_coords[:axis]) + tuple(result_coords[axis + 1:])
+    if kind == "reshape":
+        linear = 0
+        for coord, extent in zip(result_coords, attrs["result_shape"]):
+            linear = linear * int(extent) + int(coord)
+        source = [0] * len(source_shape)
+        for dim in reversed(range(len(source_shape))):
+            source[dim] = linear % int(source_shape[dim])
+            linear //= int(source_shape[dim])
+        return tuple(source)
+    if kind == "trans":
+        source = [0] * len(source_shape)
+        for result_dim, source_dim in enumerate(attrs["order"]):
+            source[int(source_dim)] = int(result_coords[result_dim])
+        return tuple(source)
+    if kind == "split":
+        return (*result_coords, int(selector))
+    raise AssertionError(f"missing packet relation oracle for {kind}")
+
+
+def _assert_packet_relation_semantics(target_program, op, relations, attrs):
+    source_layouts = tuple(target_program.layouts[target_program.values[int(value_id)].layout_map_id]
+                           for value_id in op.operands)
+    result_layouts = tuple(target_program.layouts[target_program.values[int(value_id)].layout_map_id]
+                           for value_id in op.results)
+    kind = (attrs.get("transform", "identity") if op.kind == "layout_convert" else op.kind)
+    source_layout = source_layouts[0]
+    source_linear = _materialize_target_linear_layout(source_layout.linear_layout)
+    if kind == "join":
+        source_linear = converter_layouts._joined_packet_layout(
+            SimpleNamespace(
+                linear_layout=source_linear,
+                value_id=source_layout.layout_map_id,
+            ))
+        source_shape = tuple(int(extent) for extent in result_layouts[0].shape)
+    else:
+        source_shape = tuple(int(extent) for extent in source_layout.shape)
+    assert source_linear is not None
+    source_lane_width = int(source_layout.lane_width)
+    source_slots = converter_layouts.linear_layout_in_dim_size(source_linear, "register")
+    source_items = source_lane_width * converter_layouts.linear_layout_in_dim_size(source_linear, "warp")
+    dsl, _ir = converter_emission._load_wave_dsl()
+
+    for selector, (relation, result_layout) in enumerate(zip(relations, result_layouts)):
+        result_linear = _materialize_target_linear_layout(result_layout.linear_layout)
+        assert result_linear is not None
+        result_lane_width = int(result_layout.lane_width)
+        result_blocks = converter_layouts.linear_layout_in_dim_size(result_linear, "block")
+        result_items = result_lane_width * converter_layouts.linear_layout_in_dim_size(result_linear, "warp")
+        result_slots = converter_layouts.linear_layout_in_dim_size(result_linear, "register")
+        source_block, source_item, source_slot = (converter_emission._packet_relation_exprs(
+            SimpleNamespace(dsl=dsl),
+            relation,
+            source_slots,
+            source_items,
+            destination_blocks=result_blocks,
+            destination_items=result_items,
+            destination_slots=result_slots,
+        ))
+        destination_facts = (
+            *converter_emission._index_range_facts(SimpleNamespace(dsl=dsl), dsl.sym("block"), result_blocks),
+            *converter_emission._index_range_facts(SimpleNamespace(dsl=dsl), dsl.sym("item"), result_items),
+            *converter_emission._index_range_facts(SimpleNamespace(dsl=dsl), dsl.sym("slot"), result_slots),
+        )
+        _proofs, canonical = dsl.ixs_check((source_block, source_item, source_slot), destination_facts)
+        assert tuple(bytes(dsl.ixs_serialize(expr)) for expr in canonical) == tuple(
+            bytes(dsl.ixs_serialize(expr)) for expr in (source_block, source_item, source_slot))
+        oracle_attrs = {
+            **attrs,
+            "result_shape": tuple(int(extent) for extent in result_layout.shape),
+        }
+        for block in range(result_blocks):
+            for item in range(result_items):
+                for slot in range(result_slots):
+                    point = {"block": block, "item": item, "slot": slot}
+                    mapped = (
+                        int(source_block.eval(point)),
+                        int(source_item.eval(point)),
+                        int(source_slot.eval(point)),
+                    )
+                    source_coords = _packet_layout_apply(
+                        source_linear,
+                        mapped[0],
+                        mapped[1],
+                        mapped[2],
+                        source_lane_width,
+                    )
+                    result_coords = _packet_layout_apply(
+                        result_linear,
+                        block,
+                        item,
+                        slot,
+                        result_lane_width,
+                    )
+                    expected = _packet_relation_expected_coords(
+                        kind,
+                        result_coords,
+                        source_shape,
+                        oracle_attrs,
+                        selector,
+                    )
+                    assert source_coords == expected, (
+                        kind,
+                        point,
+                        mapped,
+                        source_coords,
+                        expected,
+                    )
+
+
 def _assert_mechanical_layout_transform(
     target_program,
     op,
@@ -230,25 +386,278 @@ def _assert_mechanical_layout_transform(
     else:
         expected = {}
     attrs = converter_target_ir.attrs_dict(op)
+    relation_name = "relations" if op.kind == "split" else "relation"
+    relations = attrs.pop(relation_name)
+    if relation_name == "relation":
+        relations = (relations, )
+    for relation in relations:
+        assert isinstance(relation, tuple) and relation
+        assert all(type(byte) is int and 0 <= byte <= 255 for byte in relation)
     assert attrs == expected
+    _assert_packet_relation_semantics(
+        target_program,
+        op,
+        tuple(relations),
+        expected,
+    )
     for target_value_id in (*op.operands, *op.results):
         target_value = target_program.values[int(target_value_id)]
         assert target_value.layout_map_id is not None
         layout = target_program.layouts[int(target_value.layout_map_id)]
         assert layout.linear_layout is not None
-        assert tuple(size for _name, size in layout.linear_layout.out_dims) == layout.shape
+        assert (tuple(size for _name, size in layout.linear_layout.out_dims) == layout.shape)
 
 
 def _assert_layout_transforms_reach_wave(output):
-    expected = sum(2 if op.kind == "split" else 1
-                   for op in output.target_program.ops
-                   if op.kind in {"broadcast", "expand_dims", "join", "layout_convert", "split"})
+    expected = 0
+    for op in output.target_program.ops:
+        if op.kind not in {
+                "broadcast",
+                "expand_dims",
+                "join",
+                "layout_convert",
+                "split",
+        }:
+            continue
+        attrs = converter_target_ir.attrs_dict(op)
+        relations = (attrs["relations"] if op.kind == "split" else (attrs["relation"], ))
+        expected += len(relations)
     assert output.emitted_module.text.count("wave.redistribute") == expected
 
 
 def _packetized_local_load_attrs(output):
     attrs = [converter_target_ir.attrs_dict(op) for op in output.target_program.ops if op.kind == "local_load"]
     return [entry for entry in attrs if int(entry.get("packet_count", 1)) > 1]
+
+
+def _assert_bit_offset_relation_matches_layout(
+    relation,
+    distributed_layout,
+    shared_layout,
+    logical_shape,
+    physical_shape,
+    logical_origin,
+    *,
+    lane_width,
+    packet_width,
+    element_byte_width,
+):
+    linear = _materialize_target_linear_layout(distributed_layout.linear_layout)
+    logical_shape = tuple(int(value) for value in logical_shape)
+    physical_shape = tuple(int(value) for value in physical_shape)
+    logical_origin = tuple(int(value) for value in logical_origin)
+    assert len(logical_shape) == len(physical_shape) == len(logical_origin)
+    materialized_layout = replace(distributed_layout, linear_layout=linear)
+    allocation_bytes = converter_layouts.shared_allocation_size_bytes(
+        shared_layout,
+        physical_shape,
+        int(element_byte_width),
+        stage="test",
+        diagnostic="TLXW_TEST",
+        source_op_index=None,
+        source_value_id=None if shared_layout is None else shared_layout.value_id,
+    )
+    expected_relation = converter_layouts.local_memory_bit_offset_relation(
+        materialized_layout,
+        shared_layout,
+        logical_shape,
+        physical_shape,
+        logical_origin,
+        lane_width=int(lane_width),
+        warp_count=converter_layouts.linear_layout_in_dim_size(linear, "warp"),
+        element_byte_width=int(element_byte_width),
+        allocation_bytes=max(
+            math.prod(physical_shape) * int(element_byte_width),
+            int(allocation_bytes),
+        ),
+        stage="test",
+        diagnostic="TLXW_TEST",
+        source_op_index=None,
+        source_value_id=distributed_layout.value_id,
+    )
+    assert tuple(relation) == tuple(expected_relation)
+    dsl, _ir = converter_emission._load_wave_dsl()
+    bit_offset = dsl.ixs_deserialize(relation)
+    warp_count = converter_layouts.linear_layout_in_dim_size(linear, "warp")
+    item_count = int(lane_width) * int(warp_count)
+    slot_count = converter_layouts.linear_layout_in_dim_size(linear, "register")
+
+    assert slot_count % int(packet_width) == 0
+    for item in range(item_count):
+        for slot in range(slot_count):
+            value = bit_offset.eval({
+                "item": item,
+                "slot": slot,
+            })
+            assert value >= 0
+            assert value % (int(element_byte_width) * 8) == 0
+            assert value < int(allocation_bytes) * 8
+
+
+def _assert_local_access_relations_match_layout(
+    output,
+    access_ops,
+    *,
+    physical_shapes,
+    logical_origins,
+):
+    source_ops = {op.index: op for op in output.source_program.ops}
+    for target_op, physical_shape, logical_origin in zip(access_ops, physical_shapes, logical_origins, strict=True):
+        source_op = source_ops[int(target_op.source_op_index)]
+        if target_op.kind == "local_load":
+            memdesc_value_id = source_op.operands[0]
+            distributed_value_id = source_op.results[0]
+        else:
+            assert target_op.kind == "local_store"
+            distributed_value_id, memdesc_value_id = source_op.operands
+        distributed_value = output.type_layout_program.values[distributed_value_id]
+        distributed_layout = output.type_layout_program.layouts[int(distributed_value.layout_map_id)]
+        memdesc_value = output.type_layout_program.values[memdesc_value_id]
+        shared_layout = (None if memdesc_value.layout_map_id is None else output.type_layout_program.layouts[int(
+            memdesc_value.layout_map_id)])
+        attrs = converter_target_ir.attrs_dict(target_op)
+        assert attrs["bit_offset_relation"]
+        assert "bit_offset_relations" not in attrs
+        _assert_bit_offset_relation_matches_layout(
+            attrs["bit_offset_relation"],
+            distributed_layout,
+            shared_layout,
+            distributed_layout.shape,
+            physical_shape,
+            logical_origin,
+            lane_width=attrs["lane_width"],
+            packet_width=attrs["packet_width"],
+            element_byte_width=attrs["element_byte_width"],
+        )
+
+
+def _assert_local_copy_relation_matches_layout(
+    output,
+    copy_op,
+    *,
+    physical_shape,
+    logical_origin,
+):
+    source_op = {op.index: op for op in output.source_program.ops}[int(copy_op.source_op_index)]
+    memdesc_value_id = source_op.operands[0]
+    offset_value_id = source_op.operands[2]
+    distributed_value = output.type_layout_program.values[offset_value_id]
+    distributed_layout = output.type_layout_program.layouts[int(distributed_value.layout_map_id)]
+    memdesc_value = output.type_layout_program.values[memdesc_value_id]
+    shared_layout = (None if memdesc_value.layout_map_id is None else output.type_layout_program.layouts[int(
+        memdesc_value.layout_map_id)])
+    attrs = converter_target_ir.attrs_dict(copy_op)
+    _assert_bit_offset_relation_matches_layout(
+        attrs["destination_bit_offset_relation"],
+        distributed_layout,
+        shared_layout,
+        distributed_layout.shape,
+        physical_shape,
+        logical_origin,
+        lane_width=attrs["lane_width"],
+        packet_width=attrs["component_count"],
+        element_byte_width=attrs["element_byte_width"],
+    )
+
+
+def _assert_local_access_relations_match_own_shape(output, access_ops):
+    source_ops = {op.index: op for op in output.source_program.ops}
+    physical_shapes = []
+    logical_origins = []
+    for target_op in access_ops:
+        source_op = source_ops[int(target_op.source_op_index)]
+        memdesc_value_id = (source_op.operands[0] if target_op.kind == "local_load" else source_op.operands[1])
+        memdesc_type = output.source_program.values[memdesc_value_id].type
+        physical_shape = tuple(int(value) for value in (memdesc_type.alloc_shape or memdesc_type.shape))
+        physical_shapes.append(physical_shape)
+        logical_origins.append((0, ) * len(physical_shape))
+    _assert_local_access_relations_match_layout(
+        output,
+        access_ops,
+        physical_shapes=physical_shapes,
+        logical_origins=logical_origins,
+    )
+
+
+def _identity_offset_bases(shape, order=None):
+    shape = tuple(int(extent) for extent in shape)
+    if order is None:
+        order = tuple(reversed(range(len(shape))))
+    return tuple(
+        tuple(1 << bit if index == int(dim) else 0
+              for index in range(len(shape)))
+        for dim in order
+        for bit in range(int(shape[int(dim)]).bit_length() - 1))
+
+
+def _identity_shared_layout(shape, order=None):
+    shape = tuple(int(extent) for extent in shape)
+    return LinearLayout.from_bases(
+        (("offset", _identity_offset_bases(shape, order)), ("block", ())),
+        tuple(f"dim{dim}" for dim in range(len(shape))),
+        shape,
+        False,
+    )
+
+
+def _shared_bit_offset_values(layout, shape, coords, element_byte_width):
+    shape = tuple(int(extent) for extent in shape)
+    coords = tuple(tuple(int(value) for value in point) for point in coords)
+    register_bases = _identity_offset_bases(shape)
+    linear = LinearLayout.from_bases(
+        (("register", register_bases), ),
+        tuple(f"dim{dim}" for dim in range(len(shape))),
+        shape,
+        False,
+    )
+    distributed = _fake_layout(
+        0,
+        0,
+        kind="linear",
+        shape=shape,
+        element_type="i8",
+        component_count=math.prod(shape),
+        lane_width=1,
+        linear_layout=linear,
+    )
+    allocation_bytes = converter_layouts.shared_allocation_size_bytes(
+        layout,
+        shape,
+        int(element_byte_width),
+        stage="test",
+        diagnostic="TLXW_TEST",
+        source_op_index=None,
+        source_value_id=None if layout is None else layout.value_id,
+    )
+    relation = converter_layouts.local_memory_bit_offset_relation(
+        distributed,
+        layout,
+        shape,
+        shape,
+        (0, ) * len(shape),
+        lane_width=1,
+        warp_count=1,
+        element_byte_width=int(element_byte_width),
+        allocation_bytes=max(
+            math.prod(shape) * int(element_byte_width),
+            allocation_bytes,
+        ),
+        stage="test",
+        diagnostic="TLXW_TEST",
+        source_op_index=None,
+        source_value_id=distributed.value_id,
+    )
+    assert relation
+    assert all(type(byte) is int and 0 <= byte <= 255 for byte in relation)
+    dsl, _ir = converter_emission._load_wave_dsl()
+    expression = dsl.ixs_deserialize(relation)
+    values = []
+    for point in coords:
+        assert len(point) == len(shape)
+        slot = sum(int(coord) * math.prod(shape[dim + 1:]) for dim, coord in enumerate(point))
+        assert tuple(int(linear.apply({"register": slot})[f"dim{dim}"]) for dim in range(len(shape))) == point
+        values.append(expression.eval({"item": 0, "slot": slot}))
+    return tuple(values)
 
 
 def _memory_offset_edge(target_program, memory_op):
@@ -689,6 +1098,9 @@ def test_tlx_glu_precompile_reuses_variant_launch_configuration(monkeypatch):
         "tlx_optimized": bench.tlx_addmm_glu_kernel_optimized,
         "tlx_persistent": bench.tlx_addmm_glu_kernel_persistent,
     }
+    for kernel in kernels.values():
+        assert "tl.assume(M > 0)" in kernel.src
+        assert "tl.assume(N > 0)" in kernel.src
 
     for kernel_name, kernel in kernels.items():
 
@@ -1230,13 +1642,1016 @@ def _compile_tlx_gfx9_gemm_kernel(tmp_path, monkeypatch, case):
 def test_tlx_wave_converter_boundary_is_structurally_guarded():
     package_root = (Path(__file__).resolve().parents[4] / "third_party" / "tlx_wave" / "backend" / "converter")
     violations = converter_boundary.scan_paths(
-        (package_root, ),
+        (package_root, Path(wave_bridge_tools.__file__)),
         forbidden_import_prefixes=(
+            "ixsimpl",
             "triton.backends.tlx_wave.wave_bridge",
             "third_party.tlx_wave.backend.wave_bridge",
         ),
     )
     assert not violations, "\n".join(violation.format() for violation in violations)
+
+    def receiver_uses_builder(node):
+        while isinstance(node, ast.Attribute):
+            if node.attr == "builder":
+                return True
+            node = node.value
+        return isinstance(node, ast.Name) and node.id == "builder"
+
+    solver_boundary_violations = []
+    allowed_ixs_facades = {
+        "ixs_check",
+        "ixs_deserialize",
+        "ixs_eq",
+        "ixs_int",
+        "ixs_serialize",
+    }
+    used_ixs_facades = set()
+    bridge_paths = (*sorted(package_root.rglob("*.py")), Path(wave_bridge_tools.__file__))
+    for path in bridge_paths:
+        tree = ast.parse(path.read_text())
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Name) and node.id == "ixsimpl":
+                solver_boundary_violations.append(f"{path}:{node.lineno}: direct ixsimpl reference")
+            if isinstance(node, ast.Attribute) and node.attr in {
+                    "sym_ctx",
+                    "node_ptr",
+                    "free_symbols",
+                    "is_pred",
+                    "sym_name",
+                    "ExprAttr",
+                    "PredAttr",
+                    "RedistributionAttr",
+            }:
+                solver_boundary_violations.append(
+                    f"{path}:{node.lineno}: direct symbolic representation access .{node.attr}")
+            if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+                continue
+            method = node.func.attr
+            if method.startswith("ixs_"):
+                used_ixs_facades.add(method)
+                if method not in allowed_ixs_facades:
+                    solver_boundary_violations.append(f"{path}:{node.lineno}: unsupported Wave DSL facade .{method}()")
+            if method in {
+                    "facts",
+                    "check",
+                    "simplify",
+                    "assume_many",
+                    "serialize",
+                    "deserialize",
+                    "int_",
+                    "true_",
+                    "eq",
+                    "get_from_node_ptr",
+            }:
+                solver_boundary_violations.append(f"{path}:{node.lineno}: direct solver call .{method}()")
+            if method in {"assume", "assume_range"} and not receiver_uses_builder(node.func.value):
+                solver_boundary_violations.append(f"{path}:{node.lineno}: direct solver call .{method}()")
+    assert not solver_boundary_violations, "\n".join(solver_boundary_violations)
+    assert used_ixs_facades == allowed_ixs_facades
+
+    dsl, _ir = converter_emission._load_wave_dsl()
+    assert allowed_ixs_facades.isdisjoint(dsl.__all__)
+
+    test_tree = ast.parse(Path(__file__).read_text())
+    direct_test_solver_references = sorted({
+        f"{type(node).__name__}:{node.lineno}"
+        for node in ast.walk(test_tree)
+        if ((isinstance(node, ast.Name) and node.id == "ixsimpl") or (
+            isinstance(node, ast.Attribute) and node.attr == "sym_ctx"))
+    })
+    assert not direct_test_solver_references
+
+    op_conversion_source = Path(converter_op_conversion.__file__).read_text()
+    forbidden_fact_side_channels = {
+        "_operand_assume_fact_ids",
+        "_source_fact_is_in_scope",
+        "_op_anchor_in_region",
+        "_op_precedes_in_region",
+        "operand_fact_ids",
+        "operand_fact_target_ids",
+    }
+    assert not sorted(token for token in forbidden_fact_side_channels if token in op_conversion_source)
+    facts_source = Path(converter_facts.__file__).read_text()
+    forbidden_fact_analysis_side_channels = {
+        "_range_fact_is_in_scope",
+        "_source_fact_is_in_scope",
+        "_op_anchor_in_region",
+        "_op_precedes_in_region",
+    }
+    assert not sorted(token for token in forbidden_fact_analysis_side_channels if token in facts_source)
+    facts_tree = ast.parse(facts_source)
+    (analyze_facts, ) = [
+        node for node in facts_tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "analyze_facts"
+    ]
+    fact_analysis_calls = [
+        statement.value.func.id for statement in analyze_facts.body if isinstance(statement, ast.Expr)
+        and isinstance(statement.value, ast.Call) and isinstance(statement.value.func, ast.Name)
+    ]
+    assert fact_analysis_calls.index("_add_derived_range_facts") < fact_analysis_calls.index("_add_assume_facts")
+    op_conversion_tree = ast.parse(op_conversion_source)
+    private_layout_references = sorted({
+        node.attr
+        for node in ast.walk(op_conversion_tree)
+        if (isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id == "layouts"
+            and node.attr.startswith("_"))
+    })
+    assert private_layout_references == []
+
+    layouts_tree = ast.parse(Path(converter_layouts.__file__).read_text())
+    relation_apis = sorted(
+        node.name
+        for node in ast.walk(layouts_tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith("packet_layout_relation"))
+    assert relation_apis == ["packet_layout_relations"]
+
+    emission_tree = ast.parse(Path(converter_emission.__file__).read_text())
+    proximity_traversals = sorted({
+        f"{node.attr}:{node.lineno}"
+        for node in ast.walk(emission_tree)
+        if isinstance(node, ast.Attribute) and node.attr in {
+            "next_node",
+            "operations",
+            "owner",
+            "parent",
+            "previous_node",
+            "walk",
+        }
+    })
+    assert not proximity_traversals
+    emission_functions = {
+        node.name
+        for node in ast.walk(emission_tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    assert "_joined_packet_layout" not in emission_functions
+
+
+def test_tlx_wave_packet_relation_proves_non_linear_modular_reshape():
+    source_linear = LinearLayout.from_bases(
+        [("register", [[1, 0], [0, 1], [0, 2]])],
+        ["dim0", "dim1"],
+        [2, 3],
+        False,
+    )
+    result_linear = LinearLayout.from_bases(
+        [("register", [[1, 0], [2, 0], [0, 1]])],
+        ["dim0", "dim1"],
+        [3, 2],
+        False,
+    )
+    source = SimpleNamespace(
+        shape=(2, 3),
+        linear_layout=source_linear,
+        value_id=0,
+        lane_width=64,
+        component_count=8,
+    )
+    result = SimpleNamespace(
+        shape=(3, 2),
+        linear_layout=result_linear,
+        value_id=1,
+        lane_width=64,
+        component_count=8,
+    )
+
+    (relation, ) = converter_layouts.packet_layout_relations(
+        (source, ),
+        (result, ),
+        transform="reshape",
+    )
+    dsl, _ir = converter_emission._load_wave_dsl()
+    source_block, source_item, source_slot = converter_emission._packet_relation_exprs(
+        SimpleNamespace(dsl=dsl),
+        relation,
+        8,
+        64,
+        destination_blocks=1,
+        destination_items=64,
+        destination_slots=8,
+    )
+    for result_slot in range(8):
+        point = {"block": 0, "item": 0, "slot": result_slot}
+        mapped = {
+            "register": source_slot.eval(point),
+        }
+        source_coords = source_linear.apply(mapped)
+        result_coords = result_linear.apply({"register": result_slot})
+        flat = result_coords["dim0"] * 2 + result_coords["dim1"]
+        assert (source_block.eval(point), source_item.eval(point)) == (0, 0)
+        assert source_coords == {"dim0": flat // 3, "dim1": flat % 3}
+
+
+def test_tlx_wave_packet_relation_preserves_replicated_physical_bits():
+    linear = LinearLayout.from_bases(
+        [
+            ("register", [[1], [0]]),
+            ("lane", [[2], [0], [0], [0], [0], [0]]),
+            ("warp", [[0], [0]]),
+            ("block", [[0]]),
+        ],
+        ["dim0"],
+        [4],
+        False,
+    )
+    layout = SimpleNamespace(
+        shape=(4, ),
+        linear_layout=linear,
+        value_id=0,
+        lane_width=64,
+        component_count=4,
+    )
+
+    (relation, ) = converter_layouts.packet_layout_relations((layout, ), (layout, ))
+    dsl, _ir = converter_emission._load_wave_dsl()
+    block, item, slot = dsl.sym("block"), dsl.sym("item"), dsl.sym("slot")
+    facts = (
+        *converter_layouts._symbolic_range_predicates(dsl, block, 0, 1),
+        *converter_layouts._symbolic_range_predicates(dsl, item, 0, 255),
+        *converter_layouts._symbolic_range_predicates(dsl, slot, 0, 3),
+    )
+    _proofs, normalized = dsl.ixs_check((dsl.ixs_deserialize(relation), ), facts)
+    assert bytes(relation) == bytes(dsl.ixs_serialize(normalized[0]))
+    source_block, source_item, source_slot = converter_emission._packet_relation_exprs(
+        SimpleNamespace(dsl=dsl),
+        relation,
+        4,
+        256,
+        destination_blocks=2,
+        destination_items=256,
+        destination_slots=4,
+    )
+    assert bytes(dsl.ixs_serialize(source_block)) == bytes(dsl.ixs_serialize(block))
+    assert bytes(dsl.ixs_serialize(source_slot)) == bytes(dsl.ixs_serialize(slot))
+    point = {"block": 1, "item": 195, "slot": 3}
+    assert (
+        source_block.eval(point),
+        source_item.eval(point),
+        source_slot.eval(point),
+    ) == (1, 195, 3)
+
+
+def test_tlx_wave_packet_relation_normalizes_projected_physical_coordinate():
+    source_linear = LinearLayout.from_bases(
+        [
+            ("register", [
+                [0, 0, 1],
+                [0, 32, 0],
+                [0, 1, 0],
+                [0, 2, 0],
+                [0, 8, 0],
+                [0, 16, 0],
+            ]),
+            ("lane", [
+                [1, 0, 0],
+                [2, 0, 0],
+                [4, 0, 0],
+                [8, 0, 0],
+                [16, 0, 0],
+                [0, 4, 0],
+            ]),
+            ("warp", [[32, 0, 0], [64, 0, 0], [128, 0, 0]]),
+        ],
+        ["dim0", "dim1", "dim2"],
+        [256, 64, 2],
+        False,
+    )
+    result_linear = LinearLayout.from_bases(
+        [
+            ("register", [
+                [0, 1, 0],
+                [0, 0, 32],
+                [0, 0, 1],
+                [0, 0, 2],
+                [0, 0, 8],
+                [0, 0, 16],
+            ]),
+            ("lane", [
+                [1, 0, 0],
+                [2, 0, 0],
+                [4, 0, 0],
+                [8, 0, 0],
+                [16, 0, 0],
+                [0, 0, 4],
+            ]),
+            ("warp", [[32, 0, 0], [64, 0, 0], [128, 0, 0]]),
+        ],
+        ["dim0", "dim1", "dim2"],
+        [256, 2, 64],
+        False,
+    )
+    source = SimpleNamespace(
+        shape=(256, 64, 2),
+        linear_layout=source_linear,
+        value_id=0,
+        lane_width=64,
+        component_count=64,
+    )
+    result = SimpleNamespace(
+        shape=(256, 2, 64),
+        linear_layout=result_linear,
+        value_id=1,
+        lane_width=64,
+        component_count=64,
+    )
+
+    (relation, ) = converter_layouts.packet_layout_relations(
+        (source, ),
+        (result, ),
+        transform="trans",
+        order=(0, 2, 1),
+    )
+    dsl, _ir = converter_emission._load_wave_dsl()
+    source_block, source_item, source_slot = converter_emission._packet_relation_exprs(
+        SimpleNamespace(dsl=dsl),
+        relation,
+        64,
+        512,
+        destination_blocks=1,
+        destination_items=512,
+        destination_slots=64,
+    )
+    for item in (0, 31, 32, 63, 64, 255, 511):
+        for slot in range(64):
+            point = {"block": 0, "item": item, "slot": slot}
+            source_coords = source_linear.apply({
+                "register": source_slot.eval(point),
+                "lane": source_item.eval(point) % 64,
+                "warp": source_item.eval(point) // 64,
+            })
+            result_coords = result_linear.apply({
+                "register": slot,
+                "lane": item % 64,
+                "warp": item // 64,
+            })
+            assert source_block.eval(point) == 0
+            assert source_coords == {
+                "dim0": result_coords["dim0"],
+                "dim1": result_coords["dim2"],
+                "dim2": result_coords["dim1"],
+            }
+
+
+def test_tlx_wave_packet_relation_proves_logical_before_replication_bits():
+    source_linear = LinearLayout.from_bases(
+        [
+            ("register", [
+                [0, 0, 0, 0, 4, 0],
+                [0, 0, 0, 0, 8, 0],
+                [0, 0, 0, 0, 0, 0],
+                [0, 0, 0, 0, 0, 0],
+            ]),
+            ("lane", [
+                [0, 0, 0, 0, 0, 0],
+                [0, 0, 0, 0, 0, 0],
+                [0, 0, 0, 0, 0, 0],
+                [0, 0, 0, 1, 0, 0],
+                [0, 0, 0, 2, 0, 0],
+                [0, 0, 0, 4, 0, 0],
+            ]),
+            ("warp", [
+                [0, 0, 0, 0, 1, 0],
+                [0, 0, 0, 0, 2, 0],
+            ]),
+            ("block", []),
+        ],
+        ["dim0", "dim1", "dim2", "dim3", "dim4", "dim5"],
+        [1, 1, 1, 8, 16, 1],
+        False,
+    )
+    result_linear = LinearLayout.from_bases(
+        [
+            ("register", [
+                [0, 0, 0, 0, 0, 1],
+                [0, 0, 0, 0, 0, 2],
+                [0, 0, 0, 0, 0, 4],
+                [0, 0, 0, 0, 4, 0],
+                [0, 0, 0, 0, 8, 0],
+                [0, 0, 0, 0, 0, 0],
+                [0, 0, 0, 0, 0, 0],
+            ]),
+            ("lane", [
+                [0, 0, 0, 0, 0, 8],
+                [0, 0, 0, 0, 0, 16],
+                [0, 1, 0, 0, 0, 0],
+                [0, 0, 0, 1, 0, 0],
+                [0, 0, 0, 2, 0, 0],
+                [0, 0, 0, 4, 0, 0],
+            ]),
+            ("warp", [
+                [0, 0, 0, 0, 1, 0],
+                [0, 0, 0, 0, 2, 0],
+            ]),
+            ("block", []),
+        ],
+        ["dim0", "dim1", "dim2", "dim3", "dim4", "dim5"],
+        [1, 2, 1, 8, 16, 32],
+        False,
+    )
+    source = SimpleNamespace(
+        shape=(1, 1, 1, 8, 16, 1),
+        linear_layout=source_linear,
+        value_id=0,
+        lane_width=64,
+        component_count=16,
+    )
+    result = SimpleNamespace(
+        shape=(1, 2, 1, 8, 16, 32),
+        linear_layout=result_linear,
+        value_id=1,
+        lane_width=64,
+        component_count=128,
+    )
+
+    (relation, ) = converter_layouts.packet_layout_relations(
+        (source, ),
+        (result, ),
+        transform="broadcast",
+    )
+    dsl, _ir = converter_emission._load_wave_dsl()
+    source_block, source_item, source_slot = converter_emission._packet_relation_exprs(
+        SimpleNamespace(dsl=dsl),
+        relation,
+        16,
+        256,
+        destination_blocks=1,
+        destination_items=256,
+        destination_slots=128,
+    )
+    for item in (0, 7, 31, 32, 63, 64, 127, 255):
+        for slot in range(128):
+            point = {"block": 0, "item": item, "slot": slot}
+            source_coords = source_linear.apply({
+                "register": source_slot.eval(point),
+                "lane": source_item.eval(point) % 64,
+                "warp": source_item.eval(point) // 64,
+                "block": source_block.eval(point),
+            })
+            result_coords = result_linear.apply({
+                "register": slot,
+                "lane": item % 64,
+                "warp": item // 64,
+                "block": 0,
+            })
+            assert source_coords == {
+                "dim0": result_coords["dim0"],
+                "dim1": 0,
+                "dim2": result_coords["dim2"],
+                "dim3": result_coords["dim3"],
+                "dim4": result_coords["dim4"],
+                "dim5": 0,
+            }
+
+
+def test_tlx_wave_packet_relation_proves_split_through_logical_projection():
+    source_linear = LinearLayout.from_bases(
+        [
+            ("register", [
+                [0, 64, 0],
+                [0, 32, 0],
+                [0, 16, 0],
+                [0, 0, 1],
+                [0, 1, 0],
+            ]),
+            ("lane", [
+                [1, 0, 0],
+                [2, 0, 0],
+                [4, 0, 0],
+                [8, 0, 0],
+                [0, 2, 0],
+                [0, 4, 0],
+            ]),
+            ("warp", [[0, 8, 0], [16, 0, 0]]),
+            ("block", []),
+        ],
+        ["dim0", "dim1", "dim2"],
+        [32, 128, 2],
+        False,
+    )
+    result_linear = LinearLayout.from_bases(
+        [
+            ("register", [
+                [0, 64],
+                [0, 32],
+                [0, 16],
+                [0, 1],
+            ]),
+            ("lane", [
+                [1, 0],
+                [2, 0],
+                [4, 0],
+                [8, 0],
+                [0, 2],
+                [0, 4],
+            ]),
+            ("warp", [[0, 8], [16, 0]]),
+            ("block", []),
+        ],
+        ["dim0", "dim1"],
+        [32, 128],
+        False,
+    )
+    source = SimpleNamespace(
+        shape=(32, 128, 2),
+        linear_layout=source_linear,
+        value_id=0,
+        lane_width=64,
+        component_count=32,
+    )
+    result = SimpleNamespace(
+        shape=(32, 128),
+        linear_layout=result_linear,
+        value_id=1,
+        lane_width=64,
+        component_count=16,
+    )
+
+    relations = converter_layouts.packet_layout_relations(
+        (source, ),
+        (result, result),
+        transform="split",
+        axis=2,
+    )
+    dsl, _ir = converter_emission._load_wave_dsl()
+    for selector, relation in enumerate(relations):
+        source_block, source_item, source_slot = (converter_emission._packet_relation_exprs(
+            SimpleNamespace(dsl=dsl),
+            relation,
+            32,
+            256,
+            destination_blocks=1,
+            destination_items=256,
+            destination_slots=16,
+        ))
+        for item in range(256):
+            for slot in range(16):
+                point = {"block": 0, "item": item, "slot": slot}
+                source_coords = source_linear.apply({
+                    "register": source_slot.eval(point),
+                    "lane": source_item.eval(point) % 64,
+                    "warp": source_item.eval(point) // 64,
+                    "block": source_block.eval(point),
+                })
+                result_coords = result_linear.apply({
+                    "register": slot,
+                    "lane": item % 64,
+                    "warp": item // 64,
+                    "block": 0,
+                })
+                assert source_coords == {
+                    "dim0": result_coords["dim0"],
+                    "dim1": result_coords["dim1"],
+                    "dim2": selector,
+                }
+
+
+def test_tlx_wave_packet_relation_only_preserves_zero_physical_bases():
+    source_linear = LinearLayout.from_bases(
+        [
+            ("register", [[1], [2]]),
+            ("lane", [[0], [1], [0], [0], [0], [0]]),
+            ("warp", []),
+            ("block", []),
+        ],
+        ["dim0"],
+        [3],
+        False,
+    )
+    layout = SimpleNamespace(
+        shape=(3, ),
+        linear_layout=source_linear,
+        value_id=0,
+        lane_width=64,
+        component_count=4,
+    )
+
+    (relation, ) = converter_layouts.packet_layout_relations((layout, ), (layout, ))
+    dsl, _ir = converter_emission._load_wave_dsl()
+    _source_block, source_item, source_slot = converter_emission._packet_relation_exprs(
+        SimpleNamespace(dsl=dsl),
+        relation,
+        4,
+        64,
+        destination_blocks=1,
+        destination_items=64,
+        destination_slots=4,
+    )
+    point = {"block": 0, "item": 3, "slot": 0}
+    # Lane bit 0 is replicated and remains local.  Lane bit 1 contributes to
+    # the mod-3 value and therefore remains under the canonical inverse.
+    assert (source_item.eval(point), source_slot.eval(point)) == (1, 1)
+    assert source_linear.apply({"register": 1, "lane": 1, "warp": 0, "block": 0}) == {"dim0": 1}
+
+
+def test_tlx_wave_packet_relation_applies_modular_physical_outputs():
+    dsl, _ir = converter_emission._load_wave_dsl()
+    slot = dsl.sym("slot")
+    packed = dsl.mod(
+        dsl.mod(slot, 2) + dsl.mod(dsl.floor(slot / 2), 2),
+        3,
+    )
+    relation = dsl.ixs_serialize(packed)
+    _source_block, _source_item, source_slot = (converter_emission._packet_relation_exprs(
+        SimpleNamespace(dsl=dsl),
+        relation,
+        3,
+        64,
+        destination_blocks=1,
+        destination_items=64,
+        destination_slots=4,
+    ))
+
+    assert source_slot.eval({"slot": 3}) == 2
+
+
+def test_tlx_wave_packet_relation_rejects_unproved_modular_inverse():
+    source_linear = LinearLayout.from_bases(
+        [
+            ("register", [[2], [0]]),
+            ("lane", [[2], [1]]),
+            ("warp", [[1], [2]]),
+        ],
+        ["dim0"],
+        [3],
+        False,
+    )
+    result_linear = LinearLayout.from_bases(
+        [
+            ("register", [[1], [2]]),
+            ("lane", [[0], [1]]),
+            ("warp", [[0], [2]]),
+        ],
+        ["dim0"],
+        [3],
+        False,
+    )
+    source = SimpleNamespace(
+        shape=(3, ),
+        linear_layout=source_linear,
+        value_id=0,
+        lane_width=64,
+        component_count=4,
+    )
+    result = SimpleNamespace(
+        shape=(3, ),
+        linear_layout=result_linear,
+        value_id=1,
+        lane_width=64,
+        component_count=4,
+    )
+
+    with pytest.raises(ValueError, match="proof returned (False|Unknown)"):
+        converter_layouts.packet_layout_relations((source, ), (result, ))
+
+
+def test_tlx_wave_packet_relation_rejects_invalid_inverse_domains():
+    full = LinearLayout.from_bases(
+        [("register", [[1], [2]])],
+        ["dim0"],
+        [4],
+        False,
+    )
+
+    def layout(linear, *, lane_width=64, component_count=4):
+        return SimpleNamespace(
+            shape=(4, ),
+            linear_layout=linear,
+            value_id=0,
+            lane_width=lane_width,
+            component_count=component_count,
+        )
+
+    nonsurjective = LinearLayout.from_bases(
+        [("register", [[2]])],
+        ["dim0"],
+        [4],
+        False,
+    )
+    with pytest.raises(ValueError, match="surjective source layout"):
+        converter_layouts.packet_layout_relations(
+            (layout(nonsurjective, component_count=2), ),
+            (layout(full), ),
+        )
+
+    lane_partitioned = LinearLayout.from_bases(
+        [("register", [[1]]), ("lane", [[2]])],
+        ["dim0"],
+        [4],
+        False,
+    )
+    with pytest.raises(ValueError, match="equal source/result lane domains"):
+        converter_layouts.packet_layout_relations(
+            (layout(lane_partitioned, component_count=2), ),
+            (layout(full), ),
+        )
+
+    block_partitioned = LinearLayout.from_bases(
+        [("register", [[1]]), ("block", [[2]])],
+        ["dim0"],
+        [4],
+        False,
+    )
+    with pytest.raises(ValueError, match="equal source/result block domains"):
+        converter_layouts.packet_layout_relations(
+            (layout(block_partitioned, component_count=2), ),
+            (layout(full), ),
+        )
+
+    with pytest.raises(ValueError, match="equal source/result lane widths"):
+        converter_layouts.packet_layout_relations(
+            (layout(full, lane_width=32), ),
+            (layout(full, lane_width=64), ),
+        )
+
+
+def test_tlx_wave_packet_split_requires_binary_structural_axis():
+    source_linear = LinearLayout.from_bases(
+        [("register", [[1], [2]])],
+        ["dim0"],
+        [3],
+        False,
+    )
+    result_linear = LinearLayout.from_bases(
+        [("register", [])],
+        [],
+        [],
+        False,
+    )
+    source = SimpleNamespace(
+        shape=(3, ),
+        linear_layout=source_linear,
+        value_id=0,
+        lane_width=64,
+        component_count=4,
+    )
+    result = SimpleNamespace(
+        shape=(),
+        linear_layout=result_linear,
+        value_id=1,
+        lane_width=64,
+        component_count=1,
+    )
+    with pytest.raises(ValueError, match="split layout conversion has incompatible shapes"):
+        converter_layouts.packet_layout_relations(
+            (source, ),
+            (result, result),
+            transform="split",
+            axis=0,
+        )
+
+
+def test_tlx_wave_packet_relation_covers_npot_reduction_axis():
+    source_linear = LinearLayout.from_bases(
+        [("register", [[1], [2]])],
+        ["dim0"],
+        [3],
+        False,
+    )
+    result_linear = LinearLayout.from_bases(
+        [("register", [])],
+        [],
+        [],
+        False,
+    )
+    source = SimpleNamespace(
+        shape=(3, ),
+        linear_layout=source_linear,
+        value_id=0,
+        lane_width=64,
+        component_count=4,
+    )
+    result = SimpleNamespace(
+        shape=(),
+        linear_layout=result_linear,
+        value_id=1,
+        lane_width=64,
+        component_count=1,
+    )
+    (relation, ) = converter_layouts.packet_layout_relations(
+        (source, ),
+        (result, ),
+        transform="reduction",
+        axis=0,
+    )
+    assert relation and all(type(byte) is int and 0 <= byte <= 255 for byte in relation)
+    dsl, _ir = converter_emission._load_wave_dsl()
+    _source_block, _source_item, source_slot = (converter_emission._packet_relation_exprs(
+        SimpleNamespace(dsl=dsl),
+        relation,
+        4,
+        64,
+        destination_blocks=1,
+        destination_items=64,
+        destination_slots=1,
+        structural_extents=(("reduction", 3), ),
+    ))
+    zero = dsl.ixs_int(0)
+    assert bytes(dsl.ixs_serialize(_source_block)) == bytes(dsl.ixs_serialize(zero))
+    assert bytes(dsl.ixs_serialize(_source_item)) == bytes(dsl.ixs_serialize(zero))
+    assert bytes(dsl.ixs_serialize(source_slot)) == bytes(dsl.ixs_serialize(dsl.sym("reduction")))
+    assert source_slot.eval({"reduction": 2}) == 2
+
+
+def test_tlx_wave_local_memory_relation_composes_npot_layout_to_bit_offsets():
+    linear = LinearLayout.from_bases(
+        [("register", [[1], [2]])],
+        ["dim0"],
+        [3],
+        False,
+    )
+    distributed = replace(
+        _fake_layout(
+            0,
+            0,
+            kind="linear",
+            shape=(3, ),
+            element_type="f32",
+            component_count=4,
+            lane_width=1,
+        ),
+        linear_layout=linear,
+    )
+    relation = converter_layouts.local_memory_bit_offset_relation(
+        distributed,
+        None,
+        (3, ),
+        (3, ),
+        (0, ),
+        lane_width=1,
+        warp_count=1,
+        element_byte_width=4,
+        allocation_bytes=12,
+    )
+    dsl, _ir = converter_emission._load_wave_dsl()
+    bit_offset = dsl.ixs_deserialize(relation)
+
+    assert [bit_offset.eval({"item": 0, "slot": slot}) for slot in range(4)] == [
+        0,
+        32,
+        64,
+        0,
+    ]
+
+
+@pytest.mark.parametrize("shape", ((4, 8), (3, 5)))
+def test_tlx_wave_dense_local_memory_relation_uses_one_row_major_formula(shape):
+    register_bases = [[0, 1], [0, 2], [0, 4], [1, 0], [2, 0]]
+    distributed_linear = LinearLayout.from_bases(
+        [("register", register_bases)],
+        ["dim0", "dim1"],
+        list(shape),
+        False,
+    )
+    distributed = replace(
+        _fake_layout(
+            0,
+            0,
+            kind="linear",
+            shape=shape,
+            element_type="f16",
+            component_count=32,
+            lane_width=1,
+        ),
+        linear_layout=distributed_linear,
+    )
+    address_layout, order, intervals, paddings = (converter_layouts._shared_address_layout(
+        None,
+        shape,
+        stage="test",
+        diagnostic="TLXW_TEST",
+        source_op_index=None,
+        source_value_id=None,
+    ))
+    assert address_layout is None
+    assert order == (1, 0)
+    assert intervals == paddings == ()
+
+    relation = converter_layouts.local_memory_bit_offset_relation(
+        distributed,
+        None,
+        shape,
+        shape,
+        (0, 0),
+        lane_width=1,
+        warp_count=1,
+        element_byte_width=2,
+        allocation_bytes=math.prod(shape) * 2,
+    )
+    dsl, _ir = converter_emission._load_wave_dsl()
+    bit_offset = dsl.ixs_deserialize(relation)
+    for slot in range(32):
+        applied = distributed_linear.apply({"register": slot})
+        coords = (int(applied["dim0"]), int(applied["dim1"]))
+        row_major_offset = sum(int(coord) * math.prod(shape[dim + 1:]) for dim, coord in enumerate(coords))
+        assert bit_offset.eval({"item": 0, "slot": slot}) == row_major_offset * 16
+
+
+def test_tlx_wave_local_memory_relation_serializes_shared_layout_models():
+    shape = (8, 8)
+    offset_bases = _identity_offset_bases(shape)
+    distributed_linear = LinearLayout.from_bases(
+        [("register", offset_bases)],
+        ["dim0", "dim1"],
+        shape,
+        False,
+    )
+    distributed = replace(
+        _fake_layout(
+            0,
+            0,
+            kind="linear",
+            shape=shape,
+            element_type="f16",
+            component_count=64,
+            lane_width=1,
+        ),
+        linear_layout=distributed_linear,
+    )
+    linear_component = LinearLayout.from_bases(
+        [("offset", offset_bases), ("block", ())],
+        ["dim0", "dim1"],
+        shape,
+        False,
+    )
+    swizzled_component = LinearLayout.from_bases(
+        [
+            (
+                "offset",
+                ((1, 0), (2, 0), (4, 0), (2, 1), (0, 2), (0, 4)),
+            ),
+            ("block", ()),
+        ],
+        ["dim0", "dim1"],
+        shape,
+        False,
+    )
+    shared_layouts = (
+        None,
+        converter_layouts.LayoutMap(
+            1,
+            1,
+            "swizzled_shared",
+            shape,
+            "f16",
+            1,
+            1,
+            {"max_phase": 2, "order": (0, 1), "per_phase": 1, "vec": 2},
+            swizzled_component,
+        ),
+        converter_layouts.LayoutMap(
+            2,
+            2,
+            "padded_shared",
+            shape,
+            "f16",
+            1,
+            1,
+            {
+                "intervals": (4, ),
+                "linear_component": linear_component,
+                "order": (1, 0),
+                "paddings": (2, ),
+            },
+            linear_component,
+        ),
+        converter_layouts.LayoutMap(
+            3,
+            3,
+            "shared_linear",
+            shape,
+            "f16",
+            1,
+            1,
+            {
+                "alignment": 16,
+                "linear_component": linear_component,
+                "order": (1, 0),
+            },
+            linear_component,
+        ),
+    )
+    dsl, _ir = converter_emission._load_wave_dsl()
+    for shared_layout in shared_layouts:
+        relation = converter_layouts.local_memory_bit_offset_relation(
+            distributed,
+            shared_layout,
+            shape,
+            shape,
+            (0, 0),
+            lane_width=1,
+            warp_count=1,
+            element_byte_width=2,
+            allocation_bytes=4096,
+        )
+        assert relation
+        assert all(type(byte) is int and 0 <= byte <= 255 for byte in relation)
+        bit_offset = dsl.ixs_deserialize(relation)
+        element_offsets = {bit_offset.eval({"item": 0, "slot": slot}) // 16 for slot in range(64)}
+        if shared_layout is not None and shared_layout.kind == "padded_shared":
+            assert element_offsets == {offset + (offset // 4) * 2 for offset in range(64)}
+        else:
+            assert element_offsets == set(range(64))
 
 
 @pytest.mark.parametrize(
@@ -1432,21 +2847,37 @@ def test_tlx_wave_converter_type_layout_reuses_equivalent_layout_analysis(
     )
     source = converter_source_import.import_source_program(mod)
     original = converter_types.build_layout_map
+    original_to_linear_layout = converter_layouts._linear_layout.to_linear_layout
     calls = 0
+    canonical_calls = []
 
     def counted_build_layout_map(*args, **kwargs):
         nonlocal calls
         calls += 1
         return original(*args, **kwargs)
 
+    def counted_to_linear_layout(shape, attr):
+        canonical_calls.append((tuple(shape), attr))
+        return original_to_linear_layout(shape, attr)
+
     monkeypatch.setattr(
         converter_types,
         "build_layout_map",
         counted_build_layout_map,
     )
+    monkeypatch.setattr(
+        converter_layouts._linear_layout,
+        "to_linear_layout",
+        counted_to_linear_layout,
+    )
     converted = converter_types.convert_source_program(source)
 
     assert calls == 1
+    first_constant = next(op for op in source.ops if op.name == "arith.constant")
+    first_type = source.values[first_constant.results[0]].type
+    assert [(shape, str(attr)) for shape, attr in canonical_calls] == [
+        (first_type.shape, str(first_type.encoding_attr)),
+    ]
     assert len(converted.layouts) == 2
     assert converted.layouts[0].layout_map_id == 0
     assert converted.layouts[1].layout_map_id == 1
@@ -1565,7 +2996,7 @@ def test_tlx_wave_converter_type_layout_stage_supports_nested_slice_encoding(tmp
     linear = converter_layouts.distributed_linear_layout(layout)
     assert value.type.component_count == 1
     assert layout.properties["parent_kind"] == "slice"
-    assert converter_layouts.linear_layout_coords(linear, 0, 9, warp=0) == (1, 1)
+    assert _packet_layout_apply(linear, 0, 9, 0, 64) == (1, 1)
     del ctx
 
 
@@ -1595,9 +3026,16 @@ def test_tlx_wave_converter_make_range_uses_slice_coordinates(tmp_path):
 
     (range_op, ) = [op for op in target.ops if op.kind == "make_range"]
     attrs = converter_target_ir.attrs_dict(range_op)
-    assert attrs["coordinate_mode"] == "bit_affine_workitem"
-    assert attrs["component_bases"] == (0, )
-    assert attrs["workitem_coefficients"] == (1, 2, 4, 8, 16, 0)
+    relation = attrs["relation"]
+    dsl, _ir = converter_emission._load_wave_dsl()
+    expression = dsl.ixs_deserialize(relation)
+    assert [expression.eval({"block": 0, "item": item, "slot": 0}) for item in (0, 1, 31, 32, 63)] == [
+        0,
+        1,
+        31,
+        0,
+        31,
+    ]
     del ctx
 
 
@@ -2479,7 +3917,7 @@ def test_tlx_wave_converter_vectorizes_dense_i8_local_store(tmp_path):
     store_lines = [line for line in output.emitted_module.text.splitlines() if "wave.scatter" in line]
     assert len(store_lines) == 1
     assert "!wave.simd<vector<8xi8>, 64>" in store_lines[0]
-    assert "packet_bindings []()" in store_lines[0]
+    assert "packet_bindings" not in store_lines[0]
     assert "bit_offset" in store_lines[0]
     machine = _run_waveamd_to_machine(output.emitted_module.text)
     assert "waveamdmachine.ds_store_tuple_b32" in machine
@@ -2507,7 +3945,7 @@ def test_tlx_wave_converter_vectorizes_swizzled_i8_local_store(tmp_path):
     store_lines = [line for line in output.emitted_module.text.splitlines() if "wave.scatter" in line]
     assert len(store_lines) == 1
     assert "!wave.simd<vector<8xi8>, 64>" in store_lines[0]
-    assert "packet_bindings []()" in store_lines[0]
+    assert "packet_bindings" not in store_lines[0]
     assert "bit_offset" in store_lines[0]
     machine = _run_waveamd_to_machine(output.emitted_module.text)
     assert "waveamdmachine.ds_store_tuple_b32" in machine
@@ -2535,7 +3973,7 @@ def test_tlx_wave_converter_vectorizes_swizzled_f16_local_store(tmp_path):
     store_lines = [line for line in output.emitted_module.text.splitlines() if "wave.scatter" in line]
     assert len(store_lines) == 1
     assert "!wave.simd<vector<32xf16>, 64>" in store_lines[0]
-    assert "packet_bindings []()" in store_lines[0]
+    assert "packet_bindings" not in store_lines[0]
     assert "bit_offset" in store_lines[0]
     machine = _run_waveamd_to_machine(output.emitted_module.text)
     assert machine.count("waveamdmachine.ds_store_tuple_b32") == 4
@@ -2685,25 +4123,33 @@ def test_tlx_wave_converter_op_stage_lowers_basic_dataflow(tmp_path):
         "operation": "addi",
         "source_width": 32,
     }
-    assume_op = next(op for op in target.ops if op.kind == "assume")
-    assert assume_op.fact_ids
-    assert assume_op.fact_target_ids
+    assume_ops = [op for op in target.ops if op.kind == "assume"]
+    assert assume_ops
+    assert all(op.fact_ids for op in assume_ops)
+    assert all(len(op.operands) == len(op.results) for op in assume_ops)
+    assert all(set(op.fact_target_ids) == set(op.results) for op in assume_ops)
     range_op = next(op for op in target.ops if op.kind == "make_range")
-    assert converter_target_ir.attrs_dict(range_op) == {"end": 64, "start": 0}
+    range_attrs = converter_target_ir.attrs_dict(range_op)
+    range_relation = range_attrs.pop("relation")
+    assert range_attrs == {"end": 64, "start": 0}
+    dsl, _ir = converter_emission._load_wave_dsl()
+    range_expression = dsl.ixs_deserialize(range_relation)
+    assert [range_expression.eval({"item": item}) for item in range(64)] == list(range(64))
     assert not any(callable(attr.value) for op in target.ops for attr in op.attrs)
     assert not hasattr(target, "source_program")
     assert not hasattr(target, "target_ops")
     del ctx
 
 
-def test_tlx_wave_converter_materializes_operand_assumes_before_arithmetic(tmp_path):
+def test_tlx_wave_converter_carries_assumes_only_through_source_ordered_ssa(tmp_path):
     local_func = """
   tt.func public @converter_early_assume(%arg0: i32) attributes {noinline = false} {
     %c255 = arith.constant 255 : i32
-    %sum = arith.addi %arg0, %c255 : i32
+    %sum_before = arith.addi %arg0, %c255 : i32
     %zero = arith.constant 0 : i32
     %positive = arith.cmpi sgt, %arg0, %zero : i32
     llvm.intr.assume %positive : i1
+    %sum_after = arith.addi %arg0, %c255 : i32
     tt.return
   }
 """
@@ -2711,12 +4157,93 @@ def test_tlx_wave_converter_materializes_operand_assumes_before_arithmetic(tmp_p
 
     output = converter_pipeline.convert_ttgir_to_wave(mod)
 
-    add_op = next(op for op in output.target_program.ops
-                  if op.kind == "binary" and converter_target_ir.attrs_dict(op)["operation"] == "addi")
-    assert add_op.fact_ids
-    assert add_op.fact_target_ids == (output.target_program.kernel.arg_target_ids[0], )
+    add_ops = [
+        op for op in output.target_program.ops
+        if op.kind == "binary" and converter_target_ir.attrs_dict(op)["operation"] == "addi"
+    ]
+    assert len(add_ops) == 2
+    assert all(not op.fact_ids and not op.fact_target_ids for op in add_ops)
+    assume_ops = [op for op in output.target_program.ops if op.kind == "assume"]
+    (source_assume_op, ) = [op for op in assume_ops if op.source_op_index is not None]
+    seed_fact_ids = {fact_id for op in assume_ops if op.source_op_index is None for fact_id in op.fact_ids}
+    assert not seed_fact_ids.intersection(source_assume_op.fact_ids)
+    (assume_operand, ) = source_assume_op.operands
+    (assume_result, ) = source_assume_op.results
+    assert set(source_assume_op.fact_target_ids) == {assume_result}
+    assert assume_operand in add_ops[0].operands
+    assert assume_result not in add_ops[0].operands
+    assert assume_result in add_ops[1].operands
+    assert assume_operand not in add_ops[1].operands
+    assert add_ops[0].target_op_id < source_assume_op.target_op_id < add_ops[1].target_op_id
+
     wave = output.emitted_module.text
-    assert wave.index("wave.assume %arg0") < wave.index("wave.binary addi")
+    add_lines = [line for line in wave.splitlines() if "wave.binary addi" in line]
+    assume_lines = [line for line in wave.splitlines() if "wave.assume" in line]
+    assert len(add_lines) == 2
+    source_assume_line = assume_lines[-1]
+    source_assumed_value = _ssa_result_name(source_assume_line)
+    assert source_assumed_value not in add_lines[0]
+    assert source_assumed_value in add_lines[1]
+    assert wave.index(add_lines[0]) < wave.index(source_assume_line) < wave.index(add_lines[1])
+    del ctx
+
+
+def test_tlx_wave_converter_does_not_derive_loop_address_facts_from_later_assume(tmp_path):
+    local_func = """
+  tt.func public @converter_late_loop_bound(%upper: i32) attributes {noinline = false} {
+    %c0 = arith.constant 0 : i32
+    %c1 = arith.constant 1 : i32
+    %c4 = arith.constant 4 : i32
+    %c64 = arith.constant 64 : i32
+    %sum = scf.for %i = %c0 to %upper step %c1 iter_args(%acc = %c0) -> (i32) : i32 {
+      %address = arith.addi %i, %c4 : i32
+      scf.yield %acc : i32
+    }
+    %bounded = arith.cmpi sle, %upper, %c64 : i32
+    llvm.intr.assume %bounded : i1
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1)
+    source = converter_source_import.import_source_program(mod)
+    converted = converter_types.convert_source_program(source)
+    fact_program = converter_facts.analyze_facts(source, converted)
+
+    (for_op, ) = [op for op in source.ops if op.name == "scf.for"]
+    body = source.regions[for_op.region_ids[0]]
+    induction_arg = body.block_arg_ids[0]
+    induction_facts = converter_facts.facts_for_value(fact_program, induction_arg)
+    assert [(fact.lower, fact.upper) for fact in induction_facts if fact.provenance == "derived:scf.for"] == [
+        (0, (1 << 31) - 2),
+    ]
+
+    (address_op, ) = [source.ops[op_index] for op_index in body.op_indices if source.ops[op_index].name == "arith.addi"]
+    address_facts = converter_facts.facts_for_value(fact_program, address_op.results[0])
+    assert not [fact for fact in address_facts if fact.provenance == "derived:arith.addi"]
+
+    (source_assume_fact, ) = [
+        fact for fact in converter_facts.facts_for_value(fact_program, source.kernel.arg_ids[0])
+        if fact.provenance == "llvm.intr.assume"
+    ]
+    assert source_assume_fact.upper == 64
+    assert source_assume_fact.source_op_index > for_op.index
+
+    output = converter_pipeline.convert_ttgir_to_wave(mod)
+    (loop_assume, ) = [
+        op for op in output.target_program.ops if op.kind == "assume" and op.source_op_index == for_op.index
+    ]
+    assert source_assume_fact.fact_id not in loop_assume.fact_ids
+    assert all(fact_program.facts[fact_id].upper != 63 for fact_id in loop_assume.fact_ids)
+    (address_target_op, ) = [
+        op for op in output.target_program.ops if op.kind == "binary" and op.source_op_index == address_op.index
+    ]
+    assert not address_target_op.fact_ids and not address_target_op.fact_target_ids
+    (source_assume_op, ) = [
+        op for op in output.target_program.ops if op.kind == "assume" and source_assume_fact.fact_id in op.fact_ids
+    ]
+    (for_target_op, ) = [op for op in output.target_program.ops if op.kind == "for_loop"]
+    assert for_target_op.target_op_id < source_assume_op.target_op_id
+    _run_wave_verify(output.emitted_module.text)
     del ctx
 
 
@@ -3363,10 +4890,9 @@ def test_tlx_wave_full_barrier_orders_generic_and_buffer_memory_siblings(tmp_pat
         if ("wave.gather" in line or "wave.scatter" in line) and "#waveamd.buffer" in line
     ]
     assert len(buffer_access_lines) == 2
-    _assert_exact_execution_item_binding(
+    _assert_execution_item_binding(
         wave,
         buffer_access_lines,
-        upper_bound=63,
     )
     _run_wave_verify(wave)
     machine = _run_waveamd_to_machine(wave)
@@ -3838,6 +5364,64 @@ def test_tlx_wave_converter_verifier_rejects_missing_fact():
     assert diagnostic.no_fallback is True
 
 
+def test_tlx_wave_converter_verifier_requires_singleton_mma_component_relations():
+    dsl, _ir = converter_emission._load_wave_dsl()
+    relation = dsl.ixs_serialize(dsl.ixs_int(0))
+    target_type = converter_target_ir.TargetType(
+        "tensor",
+        "simd_packet",
+        "f32",
+        64,
+        1,
+    )
+    values = tuple(
+        converter_target_ir.TargetValue(
+            value_id,
+            target_type,
+            layout_map_id=value_id,
+        ) for value_id in range(4))
+    layouts = tuple(
+        converter_target_ir.TargetLayout(
+            value_id,
+            "dot_operand" if value_id < 2 else "amd_mfma",
+            (1, 1),
+            "f32",
+            1,
+            64,
+            component_grid=(1, 1),
+            component_relation=relation,
+        ) for value_id in range(4))
+    attrs = {
+        "m_tiles": 1,
+        "n_tiles": 1,
+        "k_tiles": 1,
+    }
+
+    def target_program(op_attrs):
+        op = converter_target_ir.TargetOp(
+            0,
+            "mma",
+            operands=(0, 1, 2),
+            results=(3, ),
+            attrs=tuple(converter_target_ir.TargetAttr(name, value) for name, value in op_attrs.items()),
+        )
+        return converter_target_ir.TargetProgram(
+            values,
+            (op, ),
+            (converter_target_ir.TargetRegion(0, (0, )), ),
+            {},
+            {},
+            layouts=layouts,
+        )
+
+    assert converter_verifier.verify_target_program(target_program(attrs))
+    malformed = dict(attrs)
+    malformed["m_tiles"] = 2
+    with pytest.raises(converter_diagnostics.Diagnostic) as exc_info:
+        converter_verifier.verify_target_program(target_program(malformed))
+    assert exc_info.value.code == "TLXW_VERIFY_MMA_COMPONENT_RELATION"
+
+
 @pytest.mark.parametrize("kind", ("buffer_load", "buffer_store", "buffer_load_to_local"))
 def test_tlx_wave_converter_verifier_rejects_zero_memory_contiguity(kind):
     target = converter_target_ir.TargetProgram(
@@ -3857,6 +5441,31 @@ def test_tlx_wave_converter_verifier_rejects_zero_memory_contiguity(kind):
 
     assert exc_info.value.code == "TLXW_VERIFY_MEMORY_CONTIGUITY"
     assert exc_info.value.stage == "verification"
+
+
+def _make_range_verifier_target(*, relation):
+    builder = converter_target_ir.TargetBuilder(layouts=(_identity_target_layout(), ))
+    result = builder.add_value(
+        converter_target_ir.TargetType("tensor", "simd", "i32", 64, 1),
+        layout_map_id=0,
+    )
+    attrs = {"start": 0, "end": 64, "relation": relation}
+    builder.add_op("make_range", results=(result, ), attrs=attrs)
+    return builder.build()
+
+
+def test_tlx_wave_converter_wave_dsl_rejects_unbound_make_range_relation():
+    dsl = wave_bridge_tools.load_wave_dsl()
+    relation = dsl.ixs_serialize(dsl.sym("unbound"))
+    target = _make_range_verifier_target(relation=relation)
+
+    converter_verifier.verify_target_program(target)
+
+    with pytest.raises(
+            ValueError,
+            match=r"free symbols missing from bindings: \['unbound'\]",
+    ):
+        converter_emission.emit_wave_module(target)
 
 
 def test_tlx_wave_converter_verifier_rejects_unknown_value_layout():
@@ -4079,6 +5688,55 @@ def test_tlx_wave_converter_verifier_rejects_incompatible_fact_target():
     assert diagnostic.no_fallback is True
 
 
+def test_tlx_wave_converter_verifier_binds_assumption_to_explicit_ssa_result():
+    builder = converter_target_ir.TargetBuilder()
+    scalar_i32 = converter_target_ir.TargetType("scalar", "scalar", "i32")
+    operand = builder.add_value(scalar_i32, source_value_id=0)
+    result = builder.add_value(scalar_i32, source_value_id=0)
+    builder.source_value_targets[0] = (result, )
+    builder.add_op(
+        "assume",
+        operands=(operand, ),
+        results=(result, ),
+        fact_ids=(0, ),
+        fact_target_ids=(result, ),
+    )
+    fact_program = converter_facts.FactProgram(
+        (converter_facts.Fact(
+            0,
+            "range",
+            0,
+            "sgt",
+            lower=1,
+            provenance="llvm.intr.assume",
+        ), ),
+        {0: (0, )},
+    )
+    builder.set_assumptions(
+        converter_target_ir.target_assumptions_from_facts(
+            fact_program,
+            builder.source_value_targets,
+            builder.ops,
+        ))
+    target = builder.build()
+
+    assert target.assumptions[0].subject_target_ids == (result, )
+    assert converter_verifier.verify_target_program(target)
+
+    malformed_assume = replace(
+        target.ops[0],
+        fact_target_ids=(operand, ),
+    )
+    with pytest.raises(converter_diagnostics.Diagnostic) as exc_info:
+        converter_verifier.verify_target_program(replace(target, ops=(malformed_assume, )), )
+
+    diagnostic = exc_info.value
+    assert diagnostic.code == "TLXW_VERIFY_FACT_TARGET"
+    assert diagnostic.target_op_id == malformed_assume.target_op_id
+    assert diagnostic.target_value_id == operand
+    assert diagnostic.fact_id == 0
+
+
 def test_tlx_wave_converter_verifier_rejects_layout_convert_without_fact_policy():
     builder = converter_target_ir.TargetBuilder()
     tensor = converter_target_ir.TargetType("tensor", "simd", "f32", 64, 1)
@@ -4125,6 +5783,7 @@ def test_tlx_wave_converter_verifier_rejects_invalidating_layout_convert_facts()
         converter_target_ir.target_assumptions_from_facts(
             fact_program,
             builder.source_value_targets,
+            builder.ops,
         ))
 
     with pytest.raises(converter_diagnostics.Diagnostic) as exc_info:
@@ -4265,6 +5924,9 @@ def test_tlx_wave_converter_verifier_rejects_semantic_memory_mask_edges():
                     "mask_predicate_component_map",
                     (0, ),
                 ),
+                converter_target_ir.TargetAttr("bit_offset_relation", _test_bit_offset_relation(32)),
+                converter_target_ir.TargetAttr("index_binding_count", 0),
+                converter_target_ir.TargetAttr("index_binding_names", ()),
             ),
         ), ),
         (converter_target_ir.TargetRegion(0, (0, )), ),
@@ -4309,6 +5971,9 @@ def test_tlx_wave_converter_verifier_rejects_f32_memory_offset_edges():
                 converter_target_ir.TargetAttr("has_mask", False),
                 converter_target_ir.TargetAttr("component_count", 1),
                 converter_target_ir.TargetAttr("access_component_count", 1),
+                converter_target_ir.TargetAttr("bit_offset_relation", _test_bit_offset_relation(32)),
+                converter_target_ir.TargetAttr("index_binding_count", 0),
+                converter_target_ir.TargetAttr("index_binding_names", ()),
             ),
         ), ),
         (converter_target_ir.TargetRegion(0, (0, )), ),
@@ -4655,29 +6320,35 @@ def test_tlx_wave_converter_emission_stage_emits_basic_wave_module(tmp_path):
     del ctx
 
 
+def _test_bit_offset_relation(element_bits, *, item_stride=1, slot_stride=1):
+    dsl, _ir = converter_emission._load_wave_dsl()
+    expression = int(element_bits) * (int(item_stride) * dsl.sym("item") + int(slot_stride) * dsl.sym("slot"))
+    return dsl.ixs_serialize(expression)
+
+
+def _test_memdesc_index_attrs(element_offset_scale, slot_count):
+    dsl, _ir = converter_emission._load_wave_dsl()
+    relation = int(element_offset_scale) * dsl.sym("slot")
+    return {
+        "element_offset_relation": dsl.ixs_serialize(relation),
+        "slot_count": int(slot_count),
+    }
+
+
+def _assert_memdesc_index_offsets(attrs, expected):
+    assert set(attrs) == {"element_offset_relation", "slot_count"}
+    assert int(attrs["slot_count"]) == len(tuple(expected))
+    dsl, _ir = converter_emission._load_wave_dsl()
+    relation = dsl.ixs_deserialize(attrs["element_offset_relation"])
+    assert [relation.eval({"slot": slot}) for slot in range(len(tuple(expected)))] == list(expected)
+
+
 def _dense_f32_local_access_attrs():
     return {
         "component_count": 1,
-        "coordinate_shape": (64, ),
-        "packet_coordinate_bases": ((0, ), ),
+        "bit_offset_relation": _test_bit_offset_relation(32),
         "packet_count": 1,
         "packet_width": 1,
-        "slot_coordinate_coefficients": (),
-        "workitem_coordinate_coefficients": (
-            (1, ),
-            (2, ),
-            (4, ),
-            (8, ),
-            (16, ),
-            (32, ),
-        ),
-        "memdesc_logical_origin": (0, ),
-        "memdesc_physical_shape": (64, ),
-        "memdesc_shape": (64, ),
-        "shared_physical_element_byte_width": 4,
-        "shared_physical_offset_plan": "dense_row_major",
-        "shared_physical_offset_unit": "element",
-        "source_shape": (64, ),
         "element_byte_width": 4,
         "element_type": "f32",
         "lane_width": 64,
@@ -4687,28 +6358,9 @@ def _dense_f32_local_access_attrs():
 def _dense_f16_mma_local_access_attrs():
     return {
         "component_count": 1,
-        "coordinate_shape": (512, ),
-        "packet_coordinate_bases": ((0, ), ),
+        "bit_offset_relation": _test_bit_offset_relation(16, item_stride=2),
         "packet_count": 1,
         "packet_width": 2,
-        "slot_coordinate_coefficients": ((1, ), ),
-        "workitem_coordinate_coefficients": (
-            (2, ),
-            (4, ),
-            (8, ),
-            (16, ),
-            (32, ),
-            (64, ),
-            (128, ),
-            (256, ),
-        ),
-        "memdesc_logical_origin": (0, ),
-        "memdesc_physical_shape": (512, ),
-        "memdesc_shape": (512, ),
-        "shared_physical_element_byte_width": 2,
-        "shared_physical_offset_plan": "dense_row_major",
-        "shared_physical_offset_unit": "element",
-        "source_shape": (512, ),
         "element_byte_width": 2,
         "element_type": "f16",
         "lane_width": 64,
@@ -4719,22 +6371,7 @@ def _dense_f32_dma_attrs():
     return {
         "cache_modifier": 1,
         "component_count": 1,
-        "destination_component_coordinate_bases": ((0, ), ),
-        "destination_coordinate_shape": (64, ),
-        "destination_logical_origin": (0, ),
-        "destination_offset_mode": "layout_coordinates",
-        "destination_physical_element_byte_width": 4,
-        "destination_physical_offset_plan": "dense_row_major",
-        "destination_physical_offset_unit": "element",
-        "destination_physical_shape": (64, ),
-        "destination_workitem_coordinate_coefficients": (
-            (1, ),
-            (2, ),
-            (4, ),
-            (8, ),
-            (16, ),
-            (32, ),
-        ),
+        "destination_bit_offset_relation": _test_bit_offset_relation(32),
         "element_byte_width": 4,
         "element_type": "f32",
         "has_mask": False,
@@ -4752,22 +6389,7 @@ def _dense_f16_symbolic_copy_attrs():
     return {
         "cache_modifier": 1,
         "component_count": 1,
-        "destination_component_coordinate_bases": ((0, ), ),
-        "destination_coordinate_shape": (512, ),
-        "destination_logical_origin": (0, ),
-        "destination_offset_mode": "layout_coordinates",
-        "destination_physical_element_byte_width": 2,
-        "destination_physical_offset_plan": "dense_row_major",
-        "destination_physical_offset_unit": "element",
-        "destination_physical_shape": (512, ),
-        "destination_workitem_coordinate_coefficients": (
-            (1, ),
-            (2, ),
-            (4, ),
-            (8, ),
-            (16, ),
-            (32, ),
-        ),
+        "destination_bit_offset_relation": _test_bit_offset_relation(16),
         "element_byte_width": 2,
         "element_type": "f16",
         "has_mask": False,
@@ -4857,16 +6479,12 @@ def _build_static_memdesc_view_store_target(*, parent_load=False):
             "shape": (2, 64),
         },
     )
-    for view, slot, static_byte_offset in ((view0, slot0, 0), (view1, slot1, 256)):
+    for view, slot in ((view0, slot0), (view1, slot1)):
         builder.add_op(
             "memdesc_index",
             operands=(alloc, slot),
             results=(view, ),
-            attrs={
-                "element_byte_width": 4,
-                "elements_per_slot": 64,
-                "static_byte_offset": static_byte_offset,
-            },
+            attrs=_test_memdesc_index_attrs(64, 2),
         )
     attrs = _dense_f32_local_access_attrs()
     builder.add_op("local_store", operands=(value, view0), attrs=attrs)
@@ -4959,12 +6577,10 @@ def _build_circular_memdesc_read_refill_target(
             "shape": (int(slot_count), int(slot_stride_bytes) // 4),
         },
     )
-    view_attrs = {
-        "element_byte_width": 4,
-        "elements_per_slot": int(slot_stride_bytes) // 4,
-        "slot_count": int(slot_count),
-        "static_byte_offset": None,
-    }
+    view_attrs = _test_memdesc_index_attrs(
+        int(slot_stride_bytes) // 4,
+        int(slot_count),
+    )
     builder.add_op(
         "memdesc_index",
         operands=(alloc, current_slot),
@@ -4990,7 +6606,7 @@ def _build_circular_memdesc_read_refill_target(
         attrs=_dense_f32_dma_attrs(),
     )
     builder.add_op("return")
-    return builder.build()
+    return converter_value_relations.attach_symbolic_memory_relations(builder.build())
 
 
 def _build_independent_async_dma_wait_target():
@@ -5060,7 +6676,7 @@ def _build_independent_async_dma_wait_target():
         },
     )
     builder.add_op("return")
-    return builder.build()
+    return converter_value_relations.attach_symbolic_memory_relations(builder.build())
 
 
 def _build_mma_read_then_dma_reuse_target(
@@ -5250,24 +6866,39 @@ def _build_mma_read_then_dma_reuse_target(
                 source_op_index=9001,
             )
     builder.add_op("return")
-    return builder.build()
+    return converter_value_relations.attach_symbolic_memory_relations(builder.build())
 
 
 def _ssa_result_name(line):
     return line.strip().split("=", 1)[0].strip()
 
 
-def _assert_exact_execution_item_binding(
-    wave_artifact,
-    access_lines,
-    *,
-    upper_bound,
-):
+def _assert_execution_item_binding(wave_artifact, access_lines):
     (execution_item_line, ) = [line for line in wave_artifact.splitlines() if "wave.workitem_id 0" in line]
-    assert f"{{upper_bound = {upper_bound} : i64}}" in execution_item_line
-    execution_item = _ssa_result_name(execution_item_line)
+    raw_execution_item = _ssa_result_name(execution_item_line)
+    (workgroup_size_match, ) = re.findall(
+        r"wave\.workgroup_size = array<i32: ([0-9]+), 1, 1>",
+        wave_artifact,
+    )
+    workgroup_upper = int(workgroup_size_match) - 1
+    execution_item_assumes = [
+        line for line in wave_artifact.splitlines() if re.search(
+            rf"=\s*wave\.assume\s+{re.escape(raw_execution_item)}(?:\s|$)",
+            line,
+        )
+    ]
+    (execution_item_assume, ) = execution_item_assumes
+    assert '#wave.pred<"x >= 0">' in execution_item_assume
+    assert f'#wave.pred<"-{workgroup_upper} + x <= 0">' in execution_item_assume
+    execution_item = _ssa_result_name(execution_item_assume)
     assert access_lines
-    assert all(f'bindings ["item"]({execution_item})' in line for line in access_lines)
+    assert all(
+        re.search(
+            rf'bindings \["item"(?:, "[^"]+")*\]\('
+            rf'{re.escape(execution_item)}(?:, [^)]+)*\)',
+            line,
+        ) for line in access_lines)
+    assert all(not _ssa_value_is_used(line, raw_execution_item) for line in access_lines)
     return execution_item
 
 
@@ -5389,6 +7020,9 @@ def test_tlx_wave_converter_verifier_rejects_dma_lds_release_segment():
             "issue_dependency_count": 0,
             "source_issue_dependency_count": 0,
             "lds_release_dependency_count": 0,
+            "bit_offset_relation": _test_bit_offset_relation(32),
+            "index_binding_count": 0,
+            "index_binding_names": (),
         },
     )
 
@@ -7715,10 +9349,15 @@ def test_tlx_wave_converter_pipeline_keeps_branch_assumes_scoped(tmp_path):
                        if op.kind == "binary" and converter_target_ir.attrs_dict(op)["operation"] == "addi")
     assert post_if_add.fact_ids == ()
     if_op = next(op for op in output.target_program.ops if op.kind == "if")
-    then_kinds = [
-        output.target_program.ops[op_id].kind for op_id in output.target_program.regions[if_op.region_ids[0]].op_ids
-    ]
+    then_ops = [output.target_program.ops[op_id] for op_id in output.target_program.regions[if_op.region_ids[0]].op_ids]
+    then_kinds = [op.kind for op in then_ops]
     assert then_kinds == ["cmpi", "assume"]
+    branch_assume = then_ops[-1]
+    (assume_operand, ) = branch_assume.operands
+    (assume_result, ) = branch_assume.results
+    assert set(branch_assume.fact_target_ids) == {assume_result}
+    assert assume_result not in post_if_add.operands
+    assert assume_operand in post_if_add.operands
     _run_wave_verify(output.emitted_module.text)
     del ctx
 
@@ -8784,9 +10423,7 @@ def test_tlx_wave_converter_pipeline_uses_compiler_barrier_for_circular_refill(
     output = converter_pipeline.convert_ttgir_to_wave(mod)
 
     dynamic_views = [
-        converter_target_ir.attrs_dict(op)
-        for op in output.target_program.ops
-        if op.kind == "memdesc_index" and converter_target_ir.attrs_dict(op)["static_byte_offset"] is None
+        converter_target_ir.attrs_dict(op) for op in output.target_program.ops if op.kind == "memdesc_index"
     ]
     assert dynamic_views
     assert all(attrs["slot_count"] == slot_count for attrs in dynamic_views)
@@ -9027,12 +10664,10 @@ def test_tlx_wave_converter_pipeline_lowers_memdesc_index(tmp_path):
         "memdesc_index",
         "return",
     ]
-    assert converter_target_ir.attrs_dict(output.target_program.ops[2]) == {
-        "element_byte_width": 2,
-        "elements_per_slot": 64,
-        "slot_count": 2,
-        "static_byte_offset": 128,
-    }
+    _assert_memdesc_index_offsets(
+        converter_target_ir.attrs_dict(output.target_program.ops[2]),
+        (0, 64),
+    )
     assert output.emitted_module.lds_size == 0
     assert "wave.lds_size" not in output.emitted_module.text
     assert "wave.alloc" in output.emitted_module.text
@@ -9040,18 +10675,42 @@ def test_tlx_wave_converter_pipeline_lowers_memdesc_index(tmp_path):
     del ctx
 
 
+def test_tlx_wave_converter_projects_unit_memdesc_index_assumptions(tmp_path):
+    preamble = """
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+"""
+    local_func = """
+  tt.func public @converter_unit_memdesc_index() attributes {noinline = false} {
+    %alloc = ttg.local_alloc : () -> !ttg.memdesc<1x64xf16, #shared, #smem, mutable>
+    %slot = arith.constant 0 : i32
+    %view = ttg.memdesc_index %alloc[%slot] : !ttg.memdesc<1x64xf16, #shared, #smem, mutable> -> !ttg.memdesc<64xf16, #shared, #smem, mutable>
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1, preamble=preamble)
+
+    output = converter_pipeline.convert_ttgir_to_wave(mod)
+
+    wave = output.emitted_module.text
+    (index_expr, ) = [line for line in wave.splitlines() if "wave.index_expr" in line]
+    assert 'wave.index_expr <"0">' in index_expr
+    assert "slot" not in index_expr
+    assert "[]()" in index_expr
+    _run_wave_verify(wave)
+    del ctx
+
+
 @pytest.mark.parametrize(
-    "shared_a,shared_b,expected_plan",
+    "shared_a,shared_b",
     [
         (
             "#ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>",
             "#ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>",
-            "dense_row_major",
         ),
         (
             "#ttg.padded_shared<[512:+16] {order = [1, 0], shape = [256, 64]}>",
             "#ttg.padded_shared<[512:+16] {order = [1, 0], shape = [64, 256]}>",
-            "padded_linear",
         ),
     ],
     ids=["identity-swizzled", "padded"],
@@ -9060,7 +10719,6 @@ def test_tlx_wave_converter_lowers_memdesc_subslice_as_physical_parent_view(
     tmp_path,
     shared_a,
     shared_b,
-    expected_plan,
 ):
     preamble = f"""
 #mma = #ttg.amd_mfma<{{version = 4, warpsPerCTA = [2, 4], instrShape = [16, 16, 32], isTransposed = true}}>
@@ -9102,14 +10760,14 @@ def test_tlx_wave_converter_lowers_memdesc_subslice_as_physical_parent_view(
             "view": "subslice",
         },
     ]
-    load_attrs = _packetized_local_load_attrs(output)
-    assert [attrs["memdesc_shape"] for attrs in load_attrs] == [(256, 32), (32, 256)]
-    assert [attrs["memdesc_physical_shape"] for attrs in load_attrs] == [(256, 64), (64, 256)]
-    assert [attrs["memdesc_logical_origin"] for attrs in load_attrs] == [(0, 32), (32, 0)]
-    assert [attrs["shared_physical_offset_plan"] for attrs in load_attrs] == [
-        expected_plan,
-        expected_plan,
-    ]
+    load_ops = [op for op in output.target_program.ops if op.kind == "local_load"]
+    assert len(load_ops) == 2
+    _assert_local_access_relations_match_layout(
+        output,
+        load_ops,
+        physical_shapes=((256, 64), (64, 256)),
+        logical_origins=((0, 32), (32, 0)),
+    )
     assert "waveamd.mma" in output.emitted_module.text
     _run_wave_verify(output.emitted_module.text)
     del ctx
@@ -9177,26 +10835,24 @@ def test_tlx_wave_converter_applies_memdesc_subslice_to_local_load_store(tmp_pat
 
     output = converter_pipeline.convert_ttgir_to_wave(mod)
 
-    accesses = [
-        converter_target_ir.attrs_dict(op)
-        for op in output.target_program.ops
-        if op.kind in {"local_store", "local_load"}
-    ]
+    accesses = [op for op in output.target_program.ops if op.kind in {"local_store", "local_load"}]
     assert len(accesses) == 2
-    assert [attrs["memdesc_logical_origin"] for attrs in accesses] == [(64, ), (64, )]
-    assert [attrs["memdesc_physical_shape"] for attrs in accesses] == [(128, ), (128, )]
+    _assert_local_access_relations_match_layout(
+        output,
+        accesses,
+        physical_shapes=((128, ), (128, )),
+        logical_origins=((64, ), (64, )),
+    )
     wave = output.emitted_module.text
     assert wave.count("wave.scatter") == 1
     assert wave.count("wave.gather") == 1
     local_access_lines = [line for line in wave.splitlines() if "wave.gather" in line or "wave.scatter" in line]
-    execution_item = _assert_exact_execution_item_binding(
+    execution_item = _assert_execution_item_binding(
         wave,
         local_access_lines,
-        upper_bound=63,
     )
     (sibling_item_line, ) = [line for line in wave.splitlines() if "wave.workitem_id 1" in line]
     sibling_item = _ssa_result_name(sibling_item_line)
-    assert "{upper_bound = 0 : i64}" in sibling_item_line
     assert sibling_item != execution_item
     assert all(f'bindings ["item"]({sibling_item})' not in line for line in local_access_lines)
     assert "wave.assume" in wave
@@ -9324,41 +10980,192 @@ def test_tlx_wave_converter_rejects_out_of_bounds_memdesc_subslice():
         )
 
 
-def test_tlx_wave_converter_static_memdesc_offsets_are_relative_to_operand():
-    ops = (
-        SimpleNamespace(name="ttg.local_alloc", operands=(), results=(0, ), index=0),
-        SimpleNamespace(name="ttg.memdesc_index", operands=(0, 10), results=(1, ), index=1),
-        SimpleNamespace(name="ttg.memdesc_index", operands=(1, 10), results=(2, ), index=2),
-    )
-    memdescs = {
-        1:
-        converter_op_conversion.MemdescInfo(
-            value_id=1,
-            element_type="f16",
-            element_byte_width=2,
-            shape=(2, 64),
-            alloc_shape=(2, 64),
-            allocation_bytes=256,
-        ),
-        2:
-        converter_op_conversion.MemdescInfo(
-            value_id=2,
-            element_type="f16",
-            element_byte_width=2,
-            shape=(64, ),
-            alloc_shape=(64, ),
-            allocation_bytes=128,
-        ),
-    }
+def test_tlx_wave_converter_memdesc_index_offset_follows_nested_ssa_chain(tmp_path):
+    preamble = """
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+"""
+    local_func = """
+  tt.func public @converter_nested_memdesc_index(%stage: i32) attributes {noinline = false} {
+    %alloc = ttg.local_alloc : () -> !ttg.memdesc<2x64xf16, #shared, #smem, mutable>
+    %zero = arith.constant 0 : i32
+    %two = arith.constant 2 : i32
+    %wrapped = arith.remui %stage, %two : i32
+    %derived = arith.addi %wrapped, %zero : i32
+    %view = ttg.memdesc_index %alloc[%derived] : !ttg.memdesc<2x64xf16, #shared, #smem, mutable> -> !ttg.memdesc<64xf16, #shared, #smem, mutable>
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1, preamble=preamble)
 
-    offsets = converter_op_conversion._compute_static_memdesc_byte_offsets(
-        ops,
-        memdescs,
-        {1: 256, 2: 128},
-        {10: 1},
+    output = converter_pipeline.convert_ttgir_to_wave(mod)
+
+    index_attrs = [converter_target_ir.attrs_dict(op) for op in output.target_program.ops if op.kind == "memdesc_index"]
+    assert len(index_attrs) == 1
+    _assert_memdesc_index_offsets(index_attrs[0], (0, 64))
+    wave = output.emitted_module.text
+    assert wave.count("wave.binary") >= 2
+    assert "wave.index_expr <\"64*slot\"" in wave
+    assert "wave.ptr_add" in wave
+    _run_wave_verify(wave)
+    del ctx
+
+
+def test_tlx_wave_memdesc_index_relation_preserves_nonuniform_linear_slot_map():
+    linear_layout = converter_layouts.LinearLayout
+    parent_component = linear_layout.from_bases(
+        (
+            (
+                "offset",
+                ((0, 1), (0, 2), (0, 4), (2, 0), (1, 0)),
+            ),
+            ("block", ()),
+        ),
+        ("dim0", "dim1"),
+        (4, 8),
+        False,
+    )
+    child_component = linear_layout.from_bases(
+        (("offset", ((1, ), (2, ), (4, ))), ("block", ())),
+        ("dim0", ),
+        (8, ),
+        False,
+    )
+    parent = converter_layouts.LayoutMap(
+        0,
+        1,
+        "shared_linear",
+        (4, 8),
+        "f16",
+        1,
+        64,
+        {"linear_component": parent_component, "order": (1, 0)},
+        parent_component,
+    )
+    child = converter_layouts.LayoutMap(
+        1,
+        2,
+        "shared_linear",
+        (8, ),
+        "f16",
+        1,
+        64,
+        {"linear_component": child_component, "order": (0, )},
+        child_component,
     )
 
-    assert offsets == {1: 256, 2: 128}
+    relation, slot_count = converter_layouts.memdesc_index_element_offset_relation(
+        parent,
+        child,
+        (4, 8),
+        (8, ),
+        element_byte_width=2,
+        allocation_bytes=64,
+    )
+
+    dsl, _ir = converter_emission._load_wave_dsl()
+    expression = dsl.ixs_deserialize(relation)
+    assert slot_count == 4
+    assert [expression.eval({"slot": slot}) for slot in range(slot_count)] == [
+        0,
+        16,
+        8,
+        24,
+    ]
+
+
+@pytest.mark.parametrize(
+    "kind,parent_properties,child_properties,allocation_bytes",
+    (
+        (
+            "padded_shared",
+            {
+                "intervals": (6, ),
+                "paddings": (1, ),
+                "order": (0, ),
+                "linear_component": None,
+            },
+            {
+                "intervals": (6, ),
+                "paddings": (1, ),
+                "order": (0, ),
+                "linear_component": None,
+            },
+            74,
+        ),
+        (
+            "swizzled_shared",
+            {"vec": 1, "per_phase": 1, "max_phase": 2, "order": (1, 0)},
+            {"vec": 1, "per_phase": 1, "max_phase": 2, "order": (0, )},
+            64,
+        ),
+    ),
+)
+def test_tlx_wave_memdesc_index_relation_rejects_nontranslated_slot_map(
+    kind,
+    parent_properties,
+    child_properties,
+    allocation_bytes,
+):
+    if kind == "padded_shared":
+        parent_linear = child_linear = _identity_shared_layout((8, ))
+        parent_properties = {
+            **parent_properties,
+            "linear_component": parent_linear,
+        }
+        child_properties = {
+            **child_properties,
+            "linear_component": child_linear,
+        }
+    else:
+        parent_linear = LinearLayout.from_bases(
+            (
+                (
+                    "offset",
+                    ((0, 1), (0, 2), (0, 4), (1, 1), (2, 0)),
+                ),
+                ("block", ()),
+            ),
+            ("dim0", "dim1"),
+            (4, 8),
+            False,
+        )
+        child_linear = _identity_shared_layout((8, ))
+    parent = converter_layouts.LayoutMap(
+        0,
+        1,
+        kind,
+        (4, 8),
+        "f16",
+        1,
+        64,
+        parent_properties,
+        parent_linear,
+    )
+    child = converter_layouts.LayoutMap(
+        1,
+        2,
+        kind,
+        (8, ),
+        "f16",
+        1,
+        64,
+        child_properties,
+        child_linear,
+    )
+
+    with pytest.raises(
+            ValueError,
+            match="child-translation proof returned (False|Unknown)",
+    ):
+        converter_layouts.memdesc_index_element_offset_relation(
+            parent,
+            child,
+            (4, 8),
+            (8, ),
+            element_byte_width=2,
+            allocation_bytes=allocation_bytes,
+        )
 
 
 def test_tlx_wave_converter_pipeline_lowers_padded_memdesc_index_stride(tmp_path):
@@ -9381,19 +11188,17 @@ def test_tlx_wave_converter_pipeline_lowers_padded_memdesc_index_stride(tmp_path
     output = converter_pipeline.convert_ttgir_to_wave(mod)
 
     local_alloc_attrs = converter_target_ir.attrs_dict(output.target_program.ops[0])
-    # Preserve the full physical stride for both indexed slots, including
-    # the otherwise-unused terminal padding of the final slot.
-    assert local_alloc_attrs["allocation_bytes"] == 67584
+    # Triton's padded extent omits the otherwise-unused terminal pad while
+    # preserving the full physical stride between indexed slots.
+    assert local_alloc_attrs["allocation_bytes"] == 67552
     assert output.emitted_module.lds_size == 0
     assert "wave.lds_size" not in output.emitted_module.text
     assert "wave.alloc" in output.emitted_module.text
 
     first_view_attrs = converter_target_ir.attrs_dict(output.target_program.ops[3])
     second_view_attrs = converter_target_ir.attrs_dict(output.target_program.ops[4])
-    assert first_view_attrs["elements_per_slot"] == 16896
-    assert first_view_attrs["static_byte_offset"] == 0
-    assert second_view_attrs["elements_per_slot"] == 16896
-    assert second_view_attrs["static_byte_offset"] == 33792
+    _assert_memdesc_index_offsets(first_view_attrs, (0, 16896))
+    _assert_memdesc_index_offsets(second_view_attrs, (0, 16896))
     assert "wave.ptr_add" in output.emitted_module.text
     del ctx
 
@@ -9431,13 +11236,12 @@ def test_tlx_wave_converter_pipeline_sizes_three_slot_padded_dot_buffers(tmp_pat
     memdesc_index_attrs = [
         converter_target_ir.attrs_dict(op) for op in output.target_program.ops if op.kind == "memdesc_index"
     ]
-    assert [attrs["elements_per_slot"] for attrs in memdesc_index_attrs] == [4224, 4224]
-    assert all(attrs["static_byte_offset"] is None for attrs in memdesc_index_attrs)
-    local_load_attrs = _packetized_local_load_attrs(output)
-    assert [attrs["shared_physical_offset_plan"] for attrs in local_load_attrs] == [
-        "padded_linear",
-        "padded_linear",
-    ]
+    assert len(memdesc_index_attrs) == 2
+    for attrs in memdesc_index_attrs:
+        _assert_memdesc_index_offsets(attrs, (0, 4224, 8448))
+    local_load_ops = [op for op in output.target_program.ops if op.kind == "local_load"]
+    assert len(local_load_ops) == 2
+    _assert_local_access_relations_match_own_shape(output, local_load_ops)
     assert "waveamd.mma" in output.emitted_module.text
     _run_wave_verify(output.emitted_module.text)
     del ctx
@@ -9466,8 +11270,10 @@ def test_tlx_wave_converter_pipeline_sizes_non_glu_padded_memdesc_slots(tmp_path
     (memdesc_index_attrs, ) = [
         converter_target_ir.attrs_dict(op) for op in output.target_program.ops if op.kind == "memdesc_index"
     ]
-    assert memdesc_index_attrs["elements_per_slot"] == 4224
-    assert memdesc_index_attrs["static_byte_offset"] is None
+    _assert_memdesc_index_offsets(
+        memdesc_index_attrs,
+        (0, 4224, 8448, 12672, 16896),
+    )
     assert "wave.ptr_add" in output.emitted_module.text
     del ctx
 
@@ -9504,7 +11310,27 @@ def test_tlx_wave_converter_pipeline_lowers_buffer_load_to_local_dma(tmp_path):
     attrs = converter_target_ir.attrs_dict(dma_op)
     assert attrs["mode"] == "symbolic_copy"
     assert attrs["component_count"] == 8
-    assert attrs["destination_offset_mode"] == "layout_coordinates"
+    relation = attrs["destination_bit_offset_relation"]
+    assert relation and all(type(byte) is int and 0 <= byte <= 255 for byte in relation)
+    dsl, _ir = converter_emission._load_wave_dsl()
+    destination_bit_offset = dsl.ixs_deserialize(relation)
+    (range_op, ) = [op for op in output.source_program.ops if op.name == "tt.make_range"]
+    range_layout = output.type_layout_program.layouts[output.type_layout_program.values[
+        range_op.results[0]].layout_map_id].linear_layout
+    for item in (0, 1, 63):
+        for slot in range(8):
+            physical = {
+                "block": 0,
+                "lane": item,
+                "register": slot,
+                "warp": 0,
+            }
+            logical = range_layout.apply({name: physical[name] for name in range_layout.get_in_dim_names()})["dim0"]
+            assert logical == item + 64 * slot
+            assert (destination_bit_offset.eval({
+                "item": item,
+                "slot": slot,
+            }) == 16 * logical)
     wave = output.emitted_module.text
     assert "waveamd.make_buffer" in wave
     assert "wave.gather" in wave
@@ -9517,12 +11343,39 @@ def test_tlx_wave_converter_pipeline_lowers_buffer_load_to_local_dma(tmp_path):
     assert "wave.barrier" not in wave
     dma_access_lines = [line for line in wave.splitlines() if "wave.gather" in line or "wave.scatter" in line]
     assert len(dma_access_lines) == 2
-    _assert_exact_execution_item_binding(
+    _assert_execution_item_binding(
         wave,
         dma_access_lines,
-        upper_bound=63,
     )
     lowered = _run_wave_lower_symbolic_memory(wave)
+    assert lowered.count("waveamd.dma_load_lds") == 1
+    assert "wave.gather" not in lowered
+    assert "wave.scatter" not in lowered
+    del ctx
+
+
+def test_tlx_wave_converter_lowers_lane_major_copy_to_direct_to_lds(tmp_path):
+    preamble = """
+#blocked = #ttg.blocked<{sizePerThread = [8], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+"""
+    local_func = """
+  tt.func public @converter_lane_major_copy(%arg0: !tt.ptr<f16> {tt.pointer_range = 32 : i32}) attributes {noinline = false} {
+    %alloc = ttg.local_alloc : () -> !ttg.memdesc<512xf16, #shared, #smem, mutable>
+    %range = tt.make_range {end = 512 : i32, start = 0 : i32} : tensor<512xi32, #blocked>
+    %token = amdg.buffer_load_to_local %arg0[%range] into %alloc : <f16>[tensor<512xi32, #blocked>] -> <512xf16, #shared, #smem, mutable>
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1, preamble=preamble)
+    output = converter_pipeline.convert_ttgir_to_wave(mod)
+    (copy_op, ) = [op for op in output.target_program.ops if op.kind == "buffer_load_to_local"]
+    relation = converter_target_ir.attrs_dict(copy_op)["destination_bit_offset_relation"]
+    dsl, _ir = converter_emission._load_wave_dsl()
+    destination_bit_offset = dsl.ixs_deserialize(relation)
+    assert destination_bit_offset.eval({"item": 3, "slot": 2}) == 16 * (8 * 3 + 2)
+    lowered = _run_wave_lower_symbolic_memory(output.emitted_module.text)
     assert lowered.count("waveamd.dma_load_lds") == 1
     assert "wave.gather" not in lowered
     assert "wave.scatter" not in lowered
@@ -9695,9 +11548,7 @@ def test_tlx_wave_converter_lowers_dynamic_memdesc_index_packet_dma_destination(
     ]
     memdesc_op = next(op for op in output.target_program.ops if op.kind == "memdesc_index")
     memdesc_attrs = converter_target_ir.attrs_dict(memdesc_op)
-    assert memdesc_attrs["element_byte_width"] == 2
-    assert memdesc_attrs["elements_per_slot"] == 512
-    assert memdesc_attrs["static_byte_offset"] is None
+    _assert_memdesc_index_offsets(memdesc_attrs, (0, 512))
     (load_op, ) = [op for op in output.target_program.ops if op.kind == "buffer_load_to_local"]
     load_attrs = converter_target_ir.attrs_dict(load_op)
     _assert_mechanical_symbolic_copy(load_attrs, masked=False)
@@ -9724,6 +11575,9 @@ def test_tlx_wave_converter_lowers_dynamic_padded_memdesc_index_packet_dma_desti
       %row_limit: i32,
       %stride: i32,
       %limit: i32 {tt.divisibility = 2 : i32}) attributes {noinline = false} {
+    %zero = arith.constant 0 : i32
+    %row_limit_positive = arith.cmpi sgt, %row_limit, %zero : i32
+    llvm.intr.assume %row_limit_positive : i1
     %alloc = ttg.local_alloc : () -> !ttg.memdesc<4x64x32xf16, #shared, #smem, mutable>
     %view = ttg.memdesc_index %alloc[%stage] : !ttg.memdesc<4x64x32xf16, #shared, #smem, mutable> -> !ttg.memdesc<64x32xf16, #shared, #smem, mutable>
     %rows = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32, #ttg.slice<{dim = 1, parent = #linear}>>
@@ -9751,13 +11605,12 @@ def test_tlx_wave_converter_lowers_dynamic_padded_memdesc_index_packet_dma_desti
     output = converter_pipeline.convert_ttgir_to_wave(mod)
 
     (local_alloc_op, ) = [op for op in output.target_program.ops if op.kind == "local_alloc"]
-    # Four indexed slots retain the full 4224-byte physical stride, including
-    # the final slot's terminal padding.
-    assert converter_target_ir.attrs_dict(local_alloc_op)["allocation_bytes"] == 16896
+    # The last logical element maps to physical element 8431. The 16-element
+    # pad after it is not addressable, so the exact allocation is 8432 f16s.
+    assert converter_target_ir.attrs_dict(local_alloc_op)["allocation_bytes"] == 16864
     (memdesc_index_op, ) = [op for op in output.target_program.ops if op.kind == "memdesc_index"]
     memdesc_attrs = converter_target_ir.attrs_dict(memdesc_index_op)
-    assert memdesc_attrs["elements_per_slot"] == 2112
-    assert memdesc_attrs["static_byte_offset"] is None
+    _assert_memdesc_index_offsets(memdesc_attrs, (0, 2112, 4224, 6336))
     (load_to_local_op, ) = [op for op in output.target_program.ops if op.kind == "buffer_load_to_local"]
     attrs = converter_target_ir.attrs_dict(load_to_local_op)
     _assert_mechanical_symbolic_copy(attrs, masked=True)
@@ -9765,7 +11618,10 @@ def test_tlx_wave_converter_lowers_dynamic_padded_memdesc_index_packet_dma_desti
     assert raw_wave.count("wave.where") == 1
     assert raw_wave.count("wave.gather") == 1
     assert raw_wave.count("wave.scatter") == 1
-    _assert_runtime_contiguity_scoped_by_where(raw_wave)
+    memory_lines = [line for line in raw_wave.splitlines() if "wave.gather" in line or "wave.scatter" in line]
+    assert all("packet_bindings" not in line for line in memory_lines)
+    gather_line = next(line for line in memory_lines if "wave.gather" in line)
+    assert all(f'"{name}"' in gather_line for name in attrs["index_binding_names"])
     wave = _run_wave_lower_symbolic_memory(raw_wave)
     assert "waveamd.dma_load_lds" in wave
     machine = _run_waveamd_to_machine(raw_wave)
@@ -9788,6 +11644,9 @@ def test_tlx_wave_converter_lowers_bit_affine_padded_dot_dma_packet(tmp_path, ):
       %row_limit: i32,
       %stride: i32,
     %limit: i32 {tt.divisibility = 2 : i32}) attributes {noinline = false} {
+    %zero = arith.constant 0 : i32
+    %row_limit_positive = arith.cmpi sgt, %row_limit, %zero : i32
+    llvm.intr.assume %row_limit_positive : i1
     %alloc = ttg.local_alloc : () -> !ttg.memdesc<4x64x32xf16, #shared, #smem, mutable>
     %view = ttg.memdesc_index %alloc[%stage] : !ttg.memdesc<4x64x32xf16, #shared, #smem, mutable> -> !ttg.memdesc<64x32xf16, #shared, #smem, mutable>
     %c1_i32 = arith.constant 1 : i32
@@ -9821,9 +11680,14 @@ def test_tlx_wave_converter_lowers_bit_affine_padded_dot_dma_packet(tmp_path, ):
     attrs = converter_target_ir.attrs_dict(load_to_local_op)
     _assert_mechanical_symbolic_copy(attrs, masked=True)
     local_alloc = next(op for op in output.target_program.ops if op.kind == "local_alloc")
-    assert converter_target_ir.attrs_dict(local_alloc)["allocation_bytes"] == 16896
+    assert converter_target_ir.attrs_dict(local_alloc)["allocation_bytes"] == 16864
     memdesc_index_ops = [op for op in output.target_program.ops if op.kind == "memdesc_index"]
-    assert [converter_target_ir.attrs_dict(op)["elements_per_slot"] for op in memdesc_index_ops] == [2112, 2112]
+    assert len(memdesc_index_ops) == 2
+    for op in memdesc_index_ops:
+        _assert_memdesc_index_offsets(
+            converter_target_ir.attrs_dict(op),
+            (0, 2112, 4224, 6336),
+        )
     raw_wave = output.emitted_module.text
     assert raw_wave.count("wave.where") == 1
     assert raw_wave.count("wave.gather") == 3
@@ -9986,6 +11850,9 @@ def test_tlx_wave_converter_lowers_broadcast_masked_2d_buffer_load_to_local_dma(
       %arg0: !tt.ptr<f16> {tt.pointer_range = 32 : i32},
       %row_limit: i32,
       %limit: i32 {tt.divisibility = 8 : i32}) attributes {noinline = false} {
+    %zero = arith.constant 0 : i32
+    %row_limit_positive = arith.cmpi sgt, %row_limit, %zero : i32
+    llvm.intr.assume %row_limit_positive : i1
     %alloc = ttg.local_alloc : () -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
     %rows = tt.make_range {end = 128 : i32, start = 0 : i32} : tensor<128xi32, #ttg.slice<{dim = 1, parent = #linear}>>
     %cols = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32, #ttg.slice<{dim = 0, parent = #linear}>>
@@ -10069,28 +11936,13 @@ def test_tlx_wave_converter_lowers_masked_narrow_padded_buffer_load_to_local_dma
     assert raw_wave.count("wave.scatter") == 1
     where_index = raw_wave.index("wave.where")
     otherwise_index = raw_wave.index("} otherwise", where_index)
-    before_where = raw_wave[:where_index]
-    where_body = raw_wave[where_index:otherwise_index]
-    value = r"%[A-Za-z0-9_.$-]+"
-    selected_range = re.compile(
-        rf"(?m)^\s*(?P<selected>{value}) = wave\.select (?P<mask>{value}), "
-        rf"(?P<raw>{value}), (?P<zero>{value})[^\n]*\n"
-        rf"\s*(?P<bounded>{value}) = wave\.assume (?P=selected) as \"x\" "
-        r"\[#wave\.pred<\"x >= 0\">, #wave\.pred<\"[^\"]*x <= 0\">\]", )
-    selected_ranges = tuple(selected_range.finditer(before_where))
-    assert len(selected_ranges) == int(attrs["component_count"])
-    where_header = raw_wave[where_index:raw_wave.index("{", where_index)]
-    where_masks = set(re.findall(value, where_header.split("wave.where", maxsplit=1)[1]))
-    assert {match.group("mask") for match in selected_ranges} == where_masks
-    (zero_offset, ) = {match.group("zero") for match in selected_ranges}
-    zero_splat = re.search(rf"{re.escape(zero_offset)} = wave\.splat (?P<scalar>{value})", before_where)
-    assert zero_splat is not None
-    assert f'{zero_splat.group("scalar")} = arith.constant 0 : i32' in before_where
-    assert '#wave.pred<"x >= 0">' not in where_body
-    _assert_masked_dma_packet_bindings_follow_ranges(
-        raw_wave,
-        selected_ranges,
-    )
+    gather_index = raw_wave.index("wave.gather", where_index)
+    assert gather_index < otherwise_index
+    memory_lines = [line for line in raw_wave.splitlines() if "wave.gather" in line or "wave.scatter" in line]
+    assert all("packet_bindings" not in line for line in memory_lines)
+    gather_line = next(line for line in memory_lines if "wave.gather" in line)
+    assert all(f'"{name}"' in gather_line for name in attrs["index_binding_names"])
+    assert re.search(r"wave\.select[^\n]*\n\s*%\d+ = wave\.assume", raw_wave) is None
     wave = _run_wave_lower_symbolic_memory(raw_wave)
     assert "waveamd.dma_load_lds" in wave
     assert "#waveamd.buffer, f16" in wave
@@ -10113,6 +11965,9 @@ def test_tlx_wave_converter_lowers_glu_like_masked_narrow_padded_buffer_load_to_
       %row_limit: i32,
       %stride: i32,
       %limit: i32 {tt.divisibility = 2 : i32}) attributes {noinline = false} {
+    %zero = arith.constant 0 : i32
+    %row_limit_positive = arith.cmpi sgt, %row_limit, %zero : i32
+    llvm.intr.assume %row_limit_positive : i1
     %alloc = ttg.local_alloc : () -> !ttg.memdesc<64x32xf16, #shared, #smem, mutable>
     %rows = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32, #ttg.slice<{dim = 1, parent = #linear}>>
     %cols = tt.make_range {end = 32 : i32, start = 0 : i32} : tensor<32xi32, #ttg.slice<{dim = 0, parent = #linear}>>
@@ -10147,28 +12002,18 @@ def test_tlx_wave_converter_lowers_glu_like_masked_narrow_padded_buffer_load_to_
     assert raw_wave.count("wave.scatter") == 1
     where_index = raw_wave.index("wave.where")
     otherwise_index = raw_wave.index("} otherwise", where_index)
-    before_where = raw_wave[:where_index]
-    where_body = raw_wave[where_index:otherwise_index]
-    value = r"%[A-Za-z0-9_.$-]+"
-    selected_range = re.compile(
-        rf"(?m)^\s*(?P<selected>{value}) = wave\.select (?P<mask>{value}), "
-        rf"(?P<raw>{value}), (?P<zero>{value})[^\n]*\n"
-        rf"\s*(?P<bounded>{value}) = wave\.assume (?P=selected) as \"x\" "
-        r"\[#wave\.pred<\"x >= 0\">, #wave\.pred<\"[^\"]*x <= 0\">\]", )
-    selected_ranges = tuple(selected_range.finditer(before_where))
-    assert len(selected_ranges) == int(attrs["component_count"])
-    where_header = raw_wave[where_index:raw_wave.index("{", where_index)]
-    where_masks = set(re.findall(value, where_header.split("wave.where", maxsplit=1)[1]))
-    assert {match.group("mask") for match in selected_ranges} == where_masks
-    (zero_offset, ) = {match.group("zero") for match in selected_ranges}
-    zero_splat = re.search(rf"{re.escape(zero_offset)} = wave\.splat (?P<scalar>{value})", before_where)
-    assert zero_splat is not None
-    assert f'{zero_splat.group("scalar")} = arith.constant 0 : i32' in before_where
-    assert '#wave.pred<"x >= 0">' not in where_body
-    _assert_masked_dma_packet_bindings_follow_ranges(
-        raw_wave,
-        selected_ranges,
-    )
+    gather_index = raw_wave.index("wave.gather", where_index)
+    assert gather_index < otherwise_index
+    memory_lines = [line for line in raw_wave.splitlines() if "wave.gather" in line or "wave.scatter" in line]
+    assert all("packet_bindings" not in line for line in memory_lines)
+    gather_line = next(line for line in memory_lines if "wave.gather" in line)
+    # The source assumptions prove both operands of the signed remainder are
+    # nonnegative, so its direct algebra canonically uses floor division.
+    assert "Trunc(" not in gather_line
+    assert "Piecewise" not in gather_line
+    assert "Max(" not in gather_line
+    assert all(f'"{name}"' in gather_line for name in attrs["index_binding_names"])
+    assert re.search(r"wave\.select[^\n]*\n\s*%\d+ = wave\.assume", raw_wave) is None
     wave = _run_wave_lower_symbolic_memory(raw_wave)
     assert "waveamd.dma_load_lds" in wave
     assert "#waveamd.buffer, f16" in wave
@@ -10192,6 +12037,11 @@ def test_tlx_wave_converter_lowers_contiguous_modulo_2d_buffer_load_to_local_dma
       %n: i32 {tt.divisibility = 8 : i32},
       %stride: i32 {tt.divisibility = 8 : i32},
       %limit: i32 {tt.divisibility = 8 : i32}) attributes {noinline = false} {
+    %zero = arith.constant 0 : i32
+    %n_positive = arith.cmpi sgt, %n, %zero : i32
+    llvm.intr.assume %n_positive : i1
+    %tile_n_nonnegative = arith.cmpi sge, %tile_n, %zero : i32
+    llvm.intr.assume %tile_n_nonnegative : i1
     %alloc = ttg.local_alloc : () -> !ttg.memdesc<64x256xf16, #shared, #smem, mutable>
     %ks = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32, #ttg.slice<{dim = 1, parent = #linear}>>
     %cols = tt.make_range {end = 256 : i32, start = 0 : i32} : tensor<256xi32, #ttg.slice<{dim = 0, parent = #linear}>>
@@ -10468,19 +12318,13 @@ def test_tlx_wave_converter_scalarized_buffer_load_to_local_swizzled_order01(tmp
     (load_to_local_op, ) = [op for op in output.target_program.ops if op.kind == "buffer_load_to_local"]
     attrs = converter_target_ir.attrs_dict(load_to_local_op)
     _assert_mechanical_symbolic_copy(attrs, masked=True)
-    assert attrs["destination_coordinate_shape"] == (8, 8)
-    assert attrs["destination_physical_offset_plan"] == "swizzled_xor"
-    assert attrs["destination_physical_offset_unit"] == "element"
-    assert attrs["destination_physical_element_byte_width"] == 2
-    assert attrs["destination_physical_layout_kind"] == "swizzled_shared"
-    assert attrs["destination_physical_order"] == (0, 1)
-    assert attrs["destination_physical_bindings"] == ("logical_coords", )
-    assert attrs["destination_physical_assumptions"] == ("minor_extent_divisible_by_vec", )
-    assert attrs["destination_physical_proof_status"] == "symbolic_verified"
-    assert attrs["destination_physical_provenance"] == "swizzled_shared"
-    assert attrs["destination_physical_swizzled_vec"] == 2
-    assert attrs["destination_physical_swizzled_per_phase"] == 1
-    assert attrs["destination_physical_swizzled_max_phase"] == 2
+    _assert_local_copy_relation_matches_layout(
+        output,
+        load_to_local_op,
+        physical_shape=(8, 8),
+        logical_origin=(0, 0),
+    )
+    assert not any(key.startswith("destination_physical_") for key in attrs)
     assert "destination_component_offsets" not in attrs
     assert "destination_shared_layout" not in attrs
     assert "destination_swizzled_order" not in attrs
@@ -10642,13 +12486,14 @@ def test_tlx_wave_converter_lowers_scalarized_swizzled_vec4_layout(tmp_path, ):
 
     (load_to_local_op, ) = [op for op in output.target_program.ops if op.kind == "buffer_load_to_local"]
     attrs = converter_target_ir.attrs_dict(load_to_local_op)
-    assert attrs["mode"] == "symbolic_copy"
-    assert attrs["destination_physical_offset_plan"] == "swizzled_xor"
-    assert attrs["destination_physical_proof_status"] == "symbolic_verified"
-    assert attrs["destination_physical_order"] == (0, 1)
-    assert attrs["destination_physical_swizzled_vec"] == 4
-    assert attrs["destination_physical_swizzled_per_phase"] == 1
-    assert attrs["destination_physical_swizzled_max_phase"] == 4
+    _assert_mechanical_symbolic_copy(attrs, masked=True)
+    _assert_local_copy_relation_matches_layout(
+        output,
+        load_to_local_op,
+        physical_shape=(8, 8),
+        logical_origin=(0, 0),
+    )
+    assert not any(key.startswith("destination_physical_") for key in attrs)
     wave = output.emitted_module.text
     assert wave.count("wave.gather") == 1
     assert wave.count("wave.scatter") == 1
@@ -10804,10 +12649,12 @@ def test_tlx_wave_converter_lowers_mult_warp_blocked_make_range_structurally(tmp
     (result_id, ) = range_op.results
     result_type = output.target_program.values[result_id].type
     assert result_type.component_count == 8
-    assert attrs["coordinate_mode"] == "affine_workitem"
-    assert attrs["component_bases"] == tuple(range(8))
-    assert attrs["workitem_stride"] == 8
-    assert "wave.binary muli" in output.emitted_module.text
+    dsl, _ir = converter_emission._load_wave_dsl()
+    expression = dsl.ixs_deserialize(attrs["relation"])
+    for item in range(64 * 8):
+        assert [expression.eval({"block": 0, "item": item, "slot": slot})
+                for slot in range(8)] == list(range(item * 8, item * 8 + 8))
+    assert output.emitted_module.text.count("wave.index_expr") == 8
     del ctx
 
 
@@ -10834,7 +12681,20 @@ def test_tlx_wave_converter_lowers_linear_make_range_with_block_basis(tmp_path, 
     (range_op, ) = [op for op in output.target_program.ops if op.kind == "make_range"]
     (result_id, ) = range_op.results
     assert output.target_program.values[result_id].type.component_count == 1
+    relation = converter_target_ir.attrs_dict(range_op)["relation"]
+    dsl, _ir = converter_emission._load_wave_dsl()
+    expression = dsl.ixs_deserialize(relation)
+    source = converter_source_import.import_source_program(mod)
+    converted = converter_types.convert_source_program(source)
+    source_range = next(op for op in source.ops if op.name == "tt.make_range")
+    layout = converted.layouts[converted.values[source_range.results[0]].layout_map_id]
+    linear = converter_layouts.distributed_linear_layout(layout)
+    for block in range(2):
+        for item in range(64):
+            expected = linear.apply({"register": 0, "lane": item, "warp": 0, "block": block})["dim0"]
+            assert expression.eval({"item": item, "block": block, "slot": 0}) == expected
     assert "wave.workitem_id" in output.emitted_module.text
+    assert "wave.cluster_workgroup_id" in output.emitted_module.text
     del ctx
 
 
@@ -10885,24 +12745,28 @@ def test_tlx_wave_converter_lowers_slice_of_explicit_linear_layout(tmp_path):
     del ctx
 
 
-def test_tlx_wave_explicit_linear_slice_restricts_replicated_bases():
-    linear = converter_layouts._project_explicit_linear_slice_layout(
-        (1, ),
-        {
-            "register_bases": ((1, 0), (2, 0), (4, 0), (0, 1), (0, 0)),
-            "lane_bases": (),
-            "warp_bases": (),
-            "block_bases": (),
-        },
-        1,
-        stage="test",
-        source_op_index=0,
-        source_value_id=0,
-    )
+def test_tlx_wave_explicit_linear_slice_restricts_replicated_bases(tmp_path):
+    preamble = """
+#parent = #ttg.generic_linear<{register = [[1, 0], [2, 0], [4, 0], [0, 1], [0, 0]], lane = [], warp = [], block = []}>
+#slice = #ttg.slice<{dim = 1, parent = #parent}>
+"""
+    local_func = """
+  tt.func public @converter_replicated_linear_slice() attributes {noinline = false} {
+    %value = arith.constant dense<0> : tensor<1xi32, #slice>
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1, preamble=preamble)
+    source = converter_source_import.import_source_program(mod)
+    converted = converter_types.convert_source_program(source)
+    constant_op = next(op for op in source.ops if op.name == "arith.constant")
+    layout = converted.layouts[converted.values[constant_op.results[0]].layout_map_id]
+    linear = converter_layouts.distributed_linear_layout(layout)
 
-    # Shape restriction preserves one canonical replicated register slot and
-    # removes bases that no longer name distinct elements of the slice.
-    assert converter_layouts.linear_layout_bases(linear, "register") == ((0, ), )
+    # Triton's canonical slice removes register bases that no longer name a
+    # distinct element of the sliced shape.
+    assert converter_layouts.linear_layout_bases(linear, "register") == ()
+    del ctx
 
 
 def test_tlx_wave_converter_lowers_bit_affine_linear_make_range(tmp_path):
@@ -10921,80 +12785,63 @@ def test_tlx_wave_converter_lowers_bit_affine_linear_make_range(tmp_path):
 
     (range_op, ) = [op for op in output.target_program.ops if op.kind == "make_range"]
     attrs = converter_target_ir.attrs_dict(range_op)
-    assert attrs["coordinate_mode"] == "bit_affine_workitem"
-    assert attrs["component_bases"] == (0, )
-    assert attrs["workitem_coefficients"] == (32, 16, 8, 4, 2, 1)
-    assert "wave.binary divui" in output.emitted_module.text
-    assert "wave.binary remui" in output.emitted_module.text
-    assert "wave.binary shrui" not in output.emitted_module.text
-    assert "wave.binary andi" not in output.emitted_module.text
+    relation = attrs["relation"]
+    dsl, _ir = converter_emission._load_wave_dsl()
+    expression = dsl.ixs_deserialize(relation)
+    source = converter_source_import.import_source_program(mod)
+    converted = converter_types.convert_source_program(source)
+    source_range = next(op for op in source.ops if op.name == "tt.make_range")
+    layout = converted.layouts[converted.values[source_range.results[0]].layout_map_id]
+    linear = converter_layouts.distributed_linear_layout(layout)
+    for item in range(64):
+        expected = linear.apply({"register": 0, "lane": item, "warp": 0, "block": 0})["dim0"]
+        assert expression.eval({"block": 0, "item": item, "slot": 0}) == expected
+    assert output.emitted_module.text.count("wave.index_expr") == 1
     del ctx
 
 
-def test_tlx_wave_layout_query_records_padded_physical_offset():
+def test_tlx_wave_layout_query_serializes_padded_physical_offset():
+    shape = (64, 128)
+    linear_component = _identity_shared_layout(shape, (1, 0))
     layout = converter_layouts.LayoutMap(
         0,
         7,
         "padded_shared",
-        (64, 128),
+        shape,
         "f16",
         1,
         64,
         {
             "intervals": (4, ),
+            "linear_component": linear_component,
             "order": (1, 0),
             "paddings": (16, ),
         },
+        linear_component,
     )
 
-    record = converter_layouts.shared_physical_offset(
+    (bit_offset, ) = _shared_bit_offset_values(
         layout,
-        (64, 128),
-        (0, 4),
+        shape,
+        ((0, 4), ),
         2,
+    )
+    assert bit_offset == 40 * 8
+
+    address_layout, order, intervals, paddings = (converter_layouts._shared_address_layout(
+        layout,
+        shape,
         stage="op_conversion",
         diagnostic="TLXW_OP_UNSUPPORTED_LOCAL_LOAD",
         source_op_index=12,
-    )
+        source_value_id=layout.value_id,
+    ))
+    assert address_layout is not None
+    assert order == (1, 0)
+    assert intervals == (4, )
+    assert paddings == (16, )
 
-    assert record.layout_kind == "padded_shared"
-    assert record.order == (1, 0)
-    assert record.logical_linear_offset == 4
-    assert record.element_offset == 20
-    assert record.byte_offset == 40
-    assert record.dword_offset == 10
-    assert record.element_byte_width == 2
-    assert record.logical_coords == (0, 4)
-    assert record.assumptions == ("valid_padded_intervals", )
-    assert record.provenance == "padded_shared"
-
-    plan = converter_layouts.shared_physical_offset_expression_plan(
-        layout,
-        (64, 128),
-        2,
-        stage="op_conversion",
-        diagnostic="TLXW_OP_UNSUPPORTED_LOCAL_LOAD",
-        source_op_index=12,
-    )
-    assert plan.expression_kind == "padded_linear"
-    assert plan.offset_unit == "element"
-    assert plan.element_byte_width == 2
-    assert plan.layout_kind == "padded_shared"
-    assert plan.order == (1, 0)
-    assert plan.intervals == (4, )
-    assert plan.paddings == (16, )
-    assert plan.assumptions == ("valid_padded_intervals", )
-
-    attrs = converter_layouts.physical_offset_expression_plan_attrs(
-        plan,
-        "destination",
-    )
-    assert attrs["destination_physical_offset_plan"] == "padded_linear"
-    assert attrs["destination_physical_offset_unit"] == "element"
-    assert attrs["destination_physical_element_byte_width"] == 2
-    assert attrs["destination_physical_intervals"] == (4, )
-    assert attrs["destination_physical_paddings"] == (16, )
-
+    empty_component = _identity_shared_layout((8, 8), (1, 0))
     empty_layout = converter_layouts.LayoutMap(
         2,
         9,
@@ -11005,60 +12852,55 @@ def test_tlx_wave_layout_query_records_padded_physical_offset():
         64,
         {
             "intervals": (),
+            "linear_component": empty_component,
             "order": (1, 0),
             "paddings": (),
         },
+        empty_component,
     )
-    empty_plan = converter_layouts.shared_physical_offset_expression_plan(
+    _address_layout, _order, intervals, paddings = (converter_layouts._shared_address_layout(
         empty_layout,
         (8, 8),
-        2,
         stage="op_conversion",
         diagnostic="TLXW_OP_UNSUPPORTED_LOCAL_LOAD",
         source_op_index=14,
-    )
-    empty_attrs = converter_layouts.physical_offset_expression_plan_attrs(
-        empty_plan,
-        "destination",
-    )
-    assert empty_plan.expression_kind == "padded_linear"
-    assert empty_attrs["destination_physical_offset_plan"] == "padded_linear"
-    assert empty_attrs["destination_physical_intervals"] == ()
-    assert empty_attrs["destination_physical_paddings"] == ()
+        source_value_id=empty_layout.value_id,
+    ))
+    assert intervals == ()
+    assert paddings == ()
 
 
 def test_tlx_wave_layout_query_supports_high_rank_padded_order():
+    shape = (2, 2, 2, 8, 16, 32)
+    order = (5, 1, 3, 4, 2, 0)
+    linear_component = _identity_shared_layout(shape, order)
     layout = converter_layouts.LayoutMap(
         0,
         7,
         "padded_shared",
-        (2, 2, 2, 8, 16, 32),
+        shape,
         "f16",
         1,
         64,
         {
             "intervals": (512, ),
-            "order": (5, 1, 3, 4, 2, 0),
+            "linear_component": linear_component,
+            "order": order,
             "paddings": (8, ),
         },
+        linear_component,
     )
 
-    record = converter_layouts.shared_physical_offset(
+    (bit_offset, ) = _shared_bit_offset_values(
         layout,
         layout.shape,
-        (0, 0, 0, 0, 1, 0),
+        ((0, 0, 0, 0, 1, 0), ),
         2,
-        stage="test",
-        diagnostic="TLXW_TYPE_UNSUPPORTED_LAYOUT",
     )
-
-    assert record.order == (5, 1, 3, 4, 2, 0)
-    assert record.logical_linear_offset == 512
-    assert record.element_offset == 520
-    assert record.byte_offset == 1040
+    assert bit_offset == 1040 * 8
 
 
-def test_tlx_wave_layout_query_records_transposed_padded_physical_offset():
+def test_tlx_wave_layout_query_serializes_transposed_padded_physical_offset():
     linear_component = LinearLayout.from_bases(
         [
             (
@@ -11092,44 +12934,28 @@ def test_tlx_wave_layout_query_records_transposed_padded_physical_offset():
             "order": (0, 1),
             "paddings": (16, ),
         },
+        linear_component,
     )
 
-    record = converter_layouts.shared_physical_offset(
+    (bit_offset, ) = _shared_bit_offset_values(
         layout,
         (8, 8),
-        (2, 1),
+        ((2, 1), ),
         2,
+    )
+    assert bit_offset == 84 * 8
+
+    address_layout, _order, intervals, paddings = (converter_layouts._shared_address_layout(
+        layout,
+        (8, 8),
         stage="op_conversion",
         diagnostic="TLXW_OP_UNSUPPORTED_LOCAL_LOAD",
         source_op_index=15,
-    )
-    assert record.logical_linear_offset == 10
-    assert record.element_offset == 42
-    assert record.byte_offset == 84
-    assert record.dword_offset == 21
-
-    plan = converter_layouts.shared_physical_offset_expression_plan(
-        layout,
-        (8, 8),
-        2,
-        stage="op_conversion",
-        diagnostic="TLXW_OP_UNSUPPORTED_LOCAL_LOAD",
-        source_op_index=15,
-    )
-    assert plan.expression_kind == "padded_linear"
-    assert plan.linear_component_bases == (
-        (1, 0),
-        (2, 0),
-        (4, 0),
-        (0, 1),
-        (0, 2),
-        (0, 4),
-    )
-    attrs = converter_layouts.physical_offset_expression_plan_attrs(
-        plan,
-        "shared",
-    )
-    assert attrs["shared_physical_linear_component_bases"] == plan.linear_component_bases
+        source_value_id=layout.value_id,
+    ))
+    assert address_layout is not None
+    assert intervals == (4, )
+    assert paddings == (16, )
 
 
 def test_tlx_wave_layout_query_rejects_shared_linear_as_dense():
@@ -11150,13 +12976,13 @@ def test_tlx_wave_layout_query_rejects_shared_linear_as_dense():
     )
 
     with pytest.raises(converter_diagnostics.Diagnostic) as exc_info:
-        converter_layouts.shared_physical_offset_expression_plan(
+        converter_layouts._shared_address_layout(
             layout,
             (8, 8),
-            2,
             stage="op_conversion",
             diagnostic="TLXW_OP_UNSUPPORTED_LOCAL_LOAD",
             source_op_index=16,
+            source_value_id=layout.value_id,
         )
 
     diagnostic = exc_info.value
@@ -11205,48 +13031,43 @@ def test_tlx_wave_layout_query_imports_shared_linear_inverse_map():
             "linear_component": linear_component,
             "order": (1, 0),
         },
+        linear_component,
     )
 
-    record = converter_layouts.shared_physical_offset(
+    (bit_offset, ) = _shared_bit_offset_values(
         layout,
         (256, 64),
-        (3, 32),
+        ((3, 32), ),
         2,
+    )
+    assert bit_offset == 16592 * 8
+
+    address_layout, order, intervals, paddings = (converter_layouts._shared_address_layout(
+        layout,
+        (256, 64),
         stage="op_conversion",
         diagnostic="TLXW_OP_UNSUPPORTED_LOCAL_LOAD",
         source_op_index=17,
-    )
-    assert record.layout_kind == "shared_linear"
-    assert record.order == (1, 0)
-    assert record.logical_linear_offset == 224
-    assert record.element_offset == 8296
-    assert record.byte_offset == 16592
-    assert record.provenance == "shared_linear_inverse"
-
-    plan = converter_layouts.shared_physical_offset_expression_plan(
-        layout,
-        (256, 64),
-        2,
-        stage="op_conversion",
-        diagnostic="TLXW_OP_UNSUPPORTED_LOCAL_LOAD",
-        source_op_index=17,
-    )
-    assert plan.expression_kind == "linear_shared"
-    assert plan.linear_inverse_offset_bases == (
-        (32, 72, 144, 256, 512, 1024, 2048, 4096),
-        (1, 2, 4, 8, 16, 8192),
-    )
-    attrs = converter_layouts.physical_offset_expression_plan_attrs(
-        plan,
-        "shared",
-    )
-    assert attrs["shared_physical_linear_inverse_offset_bases"] == (
-        (32, 72, 144, 256, 512, 1024, 2048, 4096),
-        (1, 2, 4, 8, 16, 8192),
-    )
+        source_value_id=layout.value_id,
+    ))
+    assert address_layout is not None
+    assert order == (1, 0)
+    assert intervals == paddings == ()
 
 
-def test_tlx_wave_layout_query_records_swizzled_physical_offset():
+def test_tlx_wave_layout_query_serializes_swizzled_physical_offset():
+    linear_component = LinearLayout.from_bases(
+        (
+            (
+                "offset",
+                ((1, 0), (2, 0), (4, 0), (2, 1), (0, 2), (0, 4)),
+            ),
+            ("block", ()),
+        ),
+        ("dim0", "dim1"),
+        (8, 8),
+        False,
+    )
     layout = converter_layouts.LayoutMap(
         1,
         8,
@@ -11261,103 +13082,32 @@ def test_tlx_wave_layout_query_records_swizzled_physical_offset():
             "per_phase": 1,
             "vec": 2,
         },
+        linear_component,
     )
 
-    record = converter_layouts.shared_physical_offset(
+    (bit_offset, ) = _shared_bit_offset_values(
         layout,
         (8, 8),
-        (2, 1),
+        ((2, 1), ),
         2,
+    )
+    assert bit_offset == 16 * 8
+
+    address_layout, order, intervals, paddings = (converter_layouts._shared_address_layout(
+        layout,
+        (8, 8),
         stage="op_conversion",
         diagnostic="TLXW_OP_UNSUPPORTED_BUFFER_ASYNC",
         source_op_index=13,
-    )
-
-    assert record.layout_kind == "swizzled_shared"
-    assert record.order == (0, 1)
-    assert record.logical_linear_offset == 10
-    assert record.element_offset == 8
-    assert record.byte_offset == 16
-    assert record.dword_offset == 4
-    assert record.assumptions == ("minor_extent_divisible_by_vec", )
-    assert record.provenance == "swizzled_shared"
-
-    plan = converter_layouts.shared_physical_offset_expression_plan(
-        layout,
-        (8, 8),
-        2,
-        stage="op_conversion",
-        diagnostic="TLXW_OP_UNSUPPORTED_BUFFER_ASYNC",
-        source_op_index=13,
-    )
-    assert plan.expression_kind == "swizzled_xor"
-    assert plan.offset_unit == "element"
-    assert plan.element_byte_width == 2
-    assert plan.layout_kind == "swizzled_shared"
-    assert plan.order == (0, 1)
-    assert plan.swizzled_vec == 2
-    assert plan.swizzled_per_phase == 1
-    assert plan.swizzled_max_phase == 2
-    assert plan.assumptions == ("minor_extent_divisible_by_vec", )
+        source_value_id=layout.value_id,
+    ))
+    assert address_layout is not None
+    assert order == (0, 1)
+    assert intervals == paddings == ()
 
 
-def test_tlx_wave_layout_query_records_rank4_swizzled_physical_offset():
-    layout = converter_layouts.LayoutMap(
-        6,
-        13,
-        "swizzled_shared",
-        (16, 16, 2, 32),
-        "f16",
-        1,
-        64,
-        {
-            "max_phase": 8,
-            "order": (3, 1, 0, 2),
-            "per_phase": 2,
-            "vec": 8,
-        },
-    )
-
-    record = converter_layouts.shared_physical_offset(
-        layout,
-        (16, 16, 2, 32),
-        (1, 2, 1, 24),
-        2,
-        stage="op_conversion",
-        diagnostic="TLXW_OP_UNSUPPORTED_BUFFER_ASYNC",
-        source_op_index=18,
-    )
-    assert record.order == (3, 1, 0, 2)
-    assert record.logical_linear_offset == 8792
-    assert record.element_offset == 8784
-    assert record.byte_offset == 17568
-
-    wrapped_phase = converter_layouts.shared_physical_offset(
-        layout,
-        (16, 16, 2, 32),
-        (0, 8, 0, 31),
-        2,
-        stage="op_conversion",
-        diagnostic="TLXW_OP_UNSUPPORTED_BUFFER_ASYNC",
-        source_op_index=18,
-    )
-    assert wrapped_phase.logical_linear_offset == 287
-    assert wrapped_phase.element_offset == 287
-
-    plan = converter_layouts.shared_physical_offset_expression_plan(
-        layout,
-        (16, 16, 2, 32),
-        2,
-        stage="op_conversion",
-        diagnostic="TLXW_OP_UNSUPPORTED_BUFFER_ASYNC",
-        source_op_index=18,
-    )
-    assert plan.expression_kind == "swizzled_xor"
-    assert plan.order == (3, 1, 0, 2)
-    assert converter_layouts.swizzled_shared_linear_component_bases(
-        layout,
-        (16, 16, 2, 32),
-    ) == (
+def test_tlx_wave_layout_query_serializes_rank4_swizzled_physical_offset():
+    offset_bases = (
         (0, 0, 0, 1),
         (0, 0, 0, 2),
         (0, 0, 0, 4),
@@ -11373,6 +13123,67 @@ def test_tlx_wave_layout_query_records_rank4_swizzled_physical_offset():
         (8, 0, 0, 0),
         (0, 0, 1, 0),
     )
+    linear_component = LinearLayout.from_bases(
+        (("offset", offset_bases), ("block", ())),
+        ("dim0", "dim1", "dim2", "dim3"),
+        (16, 16, 2, 32),
+        False,
+    )
+    layout = converter_layouts.LayoutMap(
+        6,
+        13,
+        "swizzled_shared",
+        (16, 16, 2, 32),
+        "f16",
+        1,
+        64,
+        {
+            "max_phase": 8,
+            "order": (3, 1, 0, 2),
+            "per_phase": 2,
+            "vec": 8,
+        },
+        linear_component,
+    )
+
+    bit_offset, wrapped_phase = _shared_bit_offset_values(
+        layout,
+        (16, 16, 2, 32),
+        ((1, 2, 1, 24), (0, 8, 0, 31)),
+        2,
+    )
+    assert bit_offset == 17568 * 8
+    assert wrapped_phase == 287 * 2 * 8
+
+    assert converter_layouts.linear_layout_bases(
+        layout.linear_layout,
+        "offset",
+    ) == offset_bases
+
+
+def test_tlx_wave_layout_query_treats_rank1_swizzle_as_dense_physical_order():
+    linear_component = _identity_shared_layout((16, ))
+    layout = converter_layouts.LayoutMap(
+        6,
+        13,
+        "swizzled_shared",
+        (16, ),
+        "f16",
+        1,
+        64,
+        {
+            "max_phase": 8,
+            "order": (0, ),
+            "per_phase": 2,
+            "vec": 4,
+        },
+        linear_component,
+    )
+
+    assert converter_layouts.linear_layout_bases(
+        layout.linear_layout,
+        "offset",
+    ) == ((1, ), (2, ), (4, ), (8, ))
 
 
 def test_tlx_wave_converter_preserves_memdesc_reshape_as_structural_view(tmp_path):
@@ -11428,19 +13239,19 @@ def test_tlx_wave_converter_lowers_replicated_generic_linear_make_range(tmp_path
 
     (target_range_op, ) = [op for op in output.target_program.ops if op.kind == "make_range"]
     attrs = converter_target_ir.attrs_dict(target_range_op)
-    assert attrs["coordinate_mode"] == "layout_coordinates"
-    assert attrs["component_coordinate_bases"] == ((0, ), (1, ), (2, ), (3, ))
-    assert attrs["workitem_coordinate_coefficients"] == (
-        (4, ),
-        (8, ),
-        (16, ),
-        (32, ),
-        (64, ),
-        (0, ),
-        (64, ),
-        (128, ),
-    )
-    assert "wave.binary xori" in output.emitted_module.text
+    dsl, _ir = converter_emission._load_wave_dsl()
+    expression = dsl.ixs_deserialize(attrs["relation"])
+    linear = converter_layouts.distributed_linear_layout(layout)
+    for item in range(256):
+        for register in range(4):
+            expected = linear.apply({
+                "register": register,
+                "lane": item % 64,
+                "warp": item // 64,
+                "block": 0,
+            })["dim0"]
+            assert expression.eval({"block": 0, "item": item, "slot": register}) == expected
+    assert output.emitted_module.text.count("wave.index_expr") == 4
     del ctx
 
 
@@ -11460,18 +13271,18 @@ def test_tlx_wave_converter_keeps_overlapping_xor_basis_out_of_affine_path(tmp_p
 
     (range_op, ) = [op for op in output.target_program.ops if op.kind == "make_range"]
     attrs = converter_target_ir.attrs_dict(range_op)
-    assert attrs["coordinate_mode"] == "layout_coordinates"
-    assert attrs["component_coordinate_bases"] == ((0, ), (1, ))
-    assert attrs["workitem_coordinate_coefficients"] == (
-        (3, ),
-        (6, ),
-        (12, ),
-        (24, ),
-        (48, ),
-        (96, ),
-    )
-    assert "wave.binary xori" in output.emitted_module.text
-    assert attrs.get("workitem_stride") is None
+    dsl, _ir = converter_emission._load_wave_dsl()
+    expression = dsl.ixs_deserialize(attrs["relation"])
+    source = converter_source_import.import_source_program(mod)
+    converted = converter_types.convert_source_program(source)
+    source_range = next(op for op in source.ops if op.name == "tt.make_range")
+    layout = converted.layouts[converted.values[source_range.results[0]].layout_map_id]
+    linear = converter_layouts.distributed_linear_layout(layout)
+    for item in range(64):
+        for register in range(2):
+            expected = linear.apply({"register": register, "lane": item, "warp": 0, "block": 0})["dim0"]
+            assert expression.eval({"block": 0, "item": item, "slot": register}) == expected
+    assert output.emitted_module.text.count("wave.index_expr") == 2
     del ctx
 
 
@@ -11492,30 +13303,23 @@ def test_tlx_wave_converter_materializes_rank2_blocked_coordinates(tmp_path):
     value = converted.values[constant_op.results[0]]
     layout = converted.layouts[value.layout_map_id]
 
-    plan = converter_coordinates.layout_coordinate_plan(
+    relation = converter_layouts.make_range_relation(
         layout,
         value.type.component_count,
         value.type.lane_width,
         1,
-        constant_op,
-        value.value_id,
+        0,
+        64,
+        source_op_index=constant_op.index,
+        source_value_id=value.value_id,
     )
-
-    assert plan.shape == (8, 8)
-    assert plan.component_bases == ((0, 0), )
-    assert plan.workitem_coefficients == (
-        (1, 0),
-        (2, 0),
-        (4, 0),
-        (0, 1),
-        (0, 2),
-        (0, 4),
-    )
+    assert relation
 
     target = converter_target_ir.TargetProgram(
         (converter_target_ir.TargetValue(
             0,
             converter_target_ir.TargetType("tensor", "simd", "i32", 64, 1),
+            layout_map_id=0,
         ), ),
         (converter_target_ir.TargetOp(
             0,
@@ -11524,118 +13328,62 @@ def test_tlx_wave_converter_materializes_rank2_blocked_coordinates(tmp_path):
             attrs=(
                 converter_target_ir.TargetAttr("start", 0),
                 converter_target_ir.TargetAttr("end", 64),
-                converter_target_ir.TargetAttr("coordinate_mode", "layout_coordinates"),
-                converter_target_ir.TargetAttr("coordinate_shape", plan.shape),
-                converter_target_ir.TargetAttr(
-                    "component_coordinate_bases",
-                    plan.component_bases,
-                ),
-                converter_target_ir.TargetAttr(
-                    "workitem_coordinate_coefficients",
-                    plan.workitem_coefficients,
-                ),
+                converter_target_ir.TargetAttr("relation", relation),
             ),
+            layout_map_ids=(0, ),
         ), ),
         (converter_target_ir.TargetRegion(0, (0, )), ),
         {},
         {},
+        layouts=(converter_target_ir.target_layout_from_converted(layout), ),
     )
     emitted = converter_emission.emit_wave_module(target)
 
-    assert "wave.binary divui" in emitted.text
-    assert "wave.binary remui" in emitted.text
-    assert "wave.binary shrui" not in emitted.text
-    assert "wave.binary andi" not in emitted.text
-    assert "wave.binary muli" in emitted.text
-    assert "overflow<nsw>" in emitted.text
+    assert emitted.text.count("wave.index_expr") == 1
     del ctx
 
 
-@pytest.mark.parametrize(
-    "is_transposed,expected_coefficients",
-    [
-        (True, ((1, 0), (2, 0), (4, 0), (8, 0), (0, 4), (0, 8))),
-        (False, ((0, 1), (0, 2), (0, 4), (0, 8), (4, 0), (8, 0))),
-    ],
-)
-def test_tlx_wave_layout_coordinate_plan_handles_mfma_out_dim_order(
-    is_transposed,
-    expected_coefficients,
-):
+def test_tlx_wave_make_range_rejects_grouped_register_payloads():
+    linear = LinearLayout.from_bases(
+        (("register", ((1, ), (2, ), (4, ))), ),
+        ("dim0", ),
+        (8, ),
+        False,
+    )
     layout = converter_layouts.LayoutMap(
         0,
         7,
-        "amd_mfma",
-        (16, 16),
-        "f32",
+        "linear",
+        (8, ),
+        "i32",
+        2,
         1,
-        64,
         {
-            "element_bit_width": 32,
-            "instr_shape": (16, 16, 32),
-            "is_transposed": is_transposed,
-            "tiles_per_warp": (1, 1),
-            "version": 4,
-            "warps_per_cta": (1, 1),
+            "register_bases": ((1, ), (2, ), (4, )),
+            "lane_bases": (),
+            "warp_bases": (),
+            "block_bases": (),
         },
+        linear,
     )
 
-    plan = converter_coordinates.layout_coordinate_plan(
-        layout,
-        1,
-        64,
-        1,
-        SimpleNamespace(index=0),
-        7,
-    )
-
-    assert plan.shape == (16, 16)
-    assert plan.component_bases == ((0, 0), )
-    assert plan.workitem_coefficients == expected_coefficients
-
-
-def test_tlx_wave_mfma_coordinate_plan_uses_logical_dim_order():
-    layout = _fake_layout(
-        0,
-        0,
-        kind="amd_mfma",
-        shape=(256, 128),
-        component_count=16,
-        lane_width=64,
-        properties={
-            "version": 4,
-            "warps_per_cta": (4, 2),
-            "instr_shape": (16, 16, 32),
-            "is_transposed": True,
-            "tiles_per_warp": (1, 1),
-            "element_bit_width": 32,
-        },
-    )
-
-    plan = converter_coordinates.layout_coordinate_plan(
-        layout,
-        layout.component_count,
-        layout.lane_width,
-        8,
-        SimpleNamespace(index=0),
-        0,
-    )
-
-    assert plan.component_bases[:4] == ((0, 0), (0, 32), (0, 64), (0, 96))
-    assert plan.workitem_coefficients == (
-        (1, 0),
-        (2, 0),
-        (4, 0),
-        (8, 0),
-        (0, 4),
-        (0, 8),
-        (0, 16),
-        (16, 0),
-        (32, 0),
-    )
+    with pytest.raises(
+            converter_diagnostics.Diagnostic,
+            match="scalar make_range components must match",
+    ):
+        converter_layouts.make_range_relation(
+            layout,
+            layout.component_count,
+            layout.lane_width,
+            1,
+            0,
+            8,
+            source_op_index=0,
+            source_value_id=7,
+        )
 
 
-def test_tlx_wave_converter_rejects_non_injective_linear_make_range(tmp_path):
+def test_tlx_wave_converter_accepts_canonical_replicated_linear_make_range(tmp_path):
     preamble = """
 #linear = #ttg.linear<{register = [], lane = [[0], [0], [0], [0], [0], [0]], warp = [], block = []}>
 """
@@ -11647,15 +13395,18 @@ def test_tlx_wave_converter_rejects_non_injective_linear_make_range(tmp_path):
 """
     mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1, preamble=preamble)
 
-    with pytest.raises(converter_diagnostics.Diagnostic) as exc_info:
-        converter_pipeline.convert_ttgir_to_wave(mod)
+    source = converter_source_import.import_source_program(mod)
+    converted = converter_types.convert_source_program(source)
+    range_op = next(op for op in source.ops if op.name == "tt.make_range")
+    value = converted.values[range_op.results[0]]
+    layout = converted.layouts[value.layout_map_id]
+    linear = converter_layouts.distributed_linear_layout(layout)
 
-    diagnostic = exc_info.value
-    assert diagnostic.code == "TLXW_TYPE_UNSUPPORTED_LAYOUT"
-    assert diagnostic.stage == "type_layout"
-    text = str(diagnostic)
-    assert "unsupported distributed layout coordinate domain duplicate_partial" in text
-    assert "bases={'register': (), 'lane': ((0,), (0,), (0,), (0,), (0,), (0,))" in text
+    assert layout.properties["coordinate_domain"]["coverage"] == "replicated"
+    assert value.type.component_count == 64
+    for lane in (0, 63):
+        assert [_packet_layout_apply(linear, 0, lane, register, 64)
+                for register in range(64)] == [(register, ) for register in range(64)]
     del ctx
 
 
@@ -11782,6 +13533,43 @@ def test_tlx_wave_converter_keeps_join_split_structural(
     del ctx
 
 
+def test_tlx_wave_converter_composes_value_relation_through_join_split(tmp_path):
+    preamble = """
+#source = #ttg.blocked<{sizePerThread = [2], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+#joined = #ttg.blocked<{sizePerThread = [2, 2], threadsPerWarp = [64, 1], warpsPerCTA = [1, 1], order = [1, 0]}>
+"""
+    local_func = """
+  tt.func public @converter_join_split_index_relation(
+      %src: !tt.ptr<f16> {tt.pointer_range = 32 : i32},
+      %dst: !tt.ptr<f16> {tt.pointer_range = 32 : i32}) attributes {noinline = false} {
+    %first = tt.make_range {end = 128 : i32, start = 0 : i32} : tensor<128xi32, #source>
+    %bias = arith.constant dense<128> : tensor<128xi32, #source>
+    %second = arith.addi %first, %bias overflow<nsw> : tensor<128xi32, #source>
+    %joined = tt.join %first, %second : tensor<128xi32, #source> -> tensor<128x2xi32, #joined>
+    %low, %high = tt.split %joined : tensor<128x2xi32, #joined> -> tensor<128xi32, #source>
+    %value = amdg.buffer_load %src[%high] {contiguity = 2 : i32} : tensor<128xf16, #source>
+    amdg.buffer_store %value, %dst[%low] {contiguity = 2 : i32} : tensor<128xf16, #source>
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1, preamble=preamble)
+
+    output = converter_pipeline.convert_ttgir_to_wave(mod)
+
+    assert [op.kind for op in output.target_program.ops].count("join") == 1
+    assert [op.kind for op in output.target_program.ops].count("split") == 1
+    wave = output.emitted_module.text
+    memory_lines = [line for line in wave.splitlines() if "wave.gather" in line or "wave.scatter" in line]
+    assert len(memory_lines) == 2
+    assert all("packet_bindings" not in line for line in memory_lines)
+    assert 'bit_offset = <"16*(128 + 2*item + slot)">' in memory_lines[0]
+    assert 'bit_offset = <"16*(2*item + slot)">' in memory_lines[1]
+    memory_ops = [op for op in output.target_program.ops if op.kind in {"buffer_load", "buffer_store"}]
+    assert all(converter_target_ir.attrs_dict(op)["index_binding_count"] == 0 for op in memory_ops)
+    _run_wave_verify(wave)
+    del ctx
+
+
 def test_tlx_wave_converter_keeps_reshape_transpose_structural(tmp_path):
     preamble = """
 #linear = #ttg.linear<{register = [], lane = [[1], [2], [4], [8], [16], [32]], warp = [], block = []}>
@@ -11863,131 +13651,6 @@ def test_tlx_wave_converter_serializes_equivalent_symbolic_layouts(tmp_path):
     del ctx
 
 
-def test_tlx_wave_converter_reuses_equivalent_fragment_local_load_plans(monkeypatch, ):
-    shared0 = _fake_layout(
-        0,
-        1,
-        kind="padded_shared",
-        shape=(128, 128),
-        element_type="bf16",
-        properties={
-            "intervals": (1, 16),
-            "paddings": (0, 1),
-            "order": (1, 0),
-        },
-    )
-    shared1 = _fake_layout(
-        1,
-        2,
-        kind="padded_shared",
-        shape=(128, 128),
-        element_type="bf16",
-        properties=shared0.properties,
-    )
-    dot_properties = {
-        "op_idx": 0,
-        "k_width": 16,
-        "parent_kind": "amd_mfma",
-        "parent_properties": {
-            "instr_shape": (32, 32, 16),
-            "warps_per_cta": (4, 2),
-        },
-    }
-    dot0 = _fake_layout(
-        2,
-        3,
-        kind="dot_operand",
-        shape=(128, 128),
-        element_type="bf16",
-        component_count=4,
-        properties=dot_properties,
-    )
-    dot1 = _fake_layout(
-        3,
-        4,
-        kind="dot_operand",
-        shape=(128, 128),
-        element_type="bf16",
-        component_count=4,
-        properties=dot_properties,
-    )
-    type_layout_program = converter_types.TypeLayoutProgram(
-        {
-            1: _converted_value(
-                1,
-                kind="memdesc",
-                representation="memdesc",
-                element_type="bf16",
-                layout_map_id=0,
-            ),
-            2: _converted_value(
-                2,
-                kind="memdesc",
-                representation="memdesc",
-                element_type="bf16",
-                layout_map_id=1,
-            ),
-        },
-        (shared0, shared1),
-    )
-    conversion_input = SimpleNamespace(
-        memdescs={
-            value_id: converter_op_conversion.MemdescInfo(
-                value_id,
-                "bf16",
-                2,
-                (128, 128),
-                (128, 136),
-                34816,
-            )
-            for value_id in (1, 2)
-        },
-        memdesc_views={
-            value_id: converter_op_conversion.MemdescViewInfo(
-                value_id,
-                (0, 0),
-                (128, 136),
-            )
-            for value_id in (1, 2)
-        },
-        fragment_local_load_plans={},
-        coordinate_plans={},
-    )
-    calls = 0
-
-    def fake_symbolic_plan(*args, **kwargs):
-        nonlocal calls
-        calls += 1
-        return {"load_mode": "symbolic_mma_payload_load"}
-
-    monkeypatch.setattr(
-        converter_op_conversion,
-        "_symbolic_mma_payload_gather_plan",
-        fake_symbolic_plan,
-    )
-    first = converter_op_conversion._fragment_local_load_plan(
-        conversion_input,
-        type_layout_program,
-        1,
-        dot0,
-        4,
-        4,
-        SimpleNamespace(index=10),
-    )
-    second = converter_op_conversion._fragment_local_load_plan(
-        conversion_input,
-        type_layout_program,
-        2,
-        dot1,
-        4,
-        4,
-        SimpleNamespace(index=11),
-    )
-
-    assert calls == 1
-    assert first is second
-
-
 def test_tlx_wave_converter_lowers_linear_alias_convert_layout(tmp_path):
     preamble = """
 #source = #ttg.linear<{register = [], lane = [[1], [2], [4], [8], [16], [32]], warp = [], block = []}>
@@ -12030,6 +13693,23 @@ def test_tlx_wave_converter_lowers_generic_multi_warp_linear_remap(tmp_path):
 
     (convert_op, ) = [op for op in output.target_program.ops if op.kind == "layout_convert"]
     _assert_mechanical_layout_transform(output.target_program, convert_op)
+    relation = converter_target_ir.attrs_dict(convert_op)["relation"]
+    dsl, _ir = converter_emission._load_wave_dsl()
+    source_block, source_item, source_slot = converter_emission._packet_relation_exprs(
+        SimpleNamespace(dsl=dsl),
+        relation,
+        2,
+        128,
+        destination_blocks=1,
+        destination_items=128,
+        destination_slots=2,
+    )
+    point = {"block": 0, "item": 64, "slot": 0}
+    assert (
+        source_block.eval(point),
+        source_item.eval(point),
+        source_slot.eval(point),
+    ) == (0, 64, 1)
     del ctx
 
 
@@ -12190,7 +13870,398 @@ def test_tlx_wave_mfma_layout_import_preserves_extended_metadata(tmp_path):
     del ctx
 
 
-def test_tlx_wave_mfma_linear_layout_logical_coordinates_match_native_samples():
+def test_tlx_wave_distributed_layouts_are_canonical_triton_layouts(tmp_path):
+    preamble = """
+#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [8, 8], warpsPerCTA = [1, 1], order = [1, 0]}>
+#slice_parent = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [64, 1], warpsPerCTA = [1, 1], order = [0, 1]}>
+#slice = #ttg.slice<{dim = 1, parent = #slice_parent}>
+#mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [1, 1], instrShape = [16, 16, 32], isTransposed = true}>
+#dot = #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 8}>
+#linear = #ttg.linear<{register = [[0, 1]], lane = [[1, 0], [2, 0], [4, 0], [0, 2], [0, 4], [0, 8]], warp = [], block = []}>
+"""
+    local_func = """
+  tt.func public @converter_canonical_distributed_layouts() attributes {noinline = false} {
+    %blocked = arith.constant dense<0> : tensor<8x8xi32, #blocked>
+    %slice = arith.constant dense<0> : tensor<64xi32, #slice>
+    %mma = arith.constant dense<0.000000e+00> : tensor<16x16xf32, #mma>
+    %dot = arith.constant dense<0.000000e+00> : tensor<16x32xf16, #dot>
+    %linear = arith.constant dense<0> : tensor<8x16xi32, #linear>
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1, preamble=preamble)
+    source = converter_source_import.import_source_program(mod)
+    converted = converter_types.convert_source_program(source)
+    constants = [op for op in source.ops if op.name == "arith.constant"]
+
+    assert len(constants) == 5
+    assert [converted.layouts[converted.values[op.results[0]].layout_map_id].kind
+            for op in constants] == ["blocked", "slice", "amd_mfma", "dot_operand", "linear"]
+    for op in constants:
+        source_type = source.values[op.results[0]].type
+        layout = converted.layouts[converted.values[op.results[0]].layout_map_id]
+        canonical = triton_linear_layout.to_linear_layout(
+            source_type.shape,
+            source_type.encoding_attr,
+        )
+        assert layout.linear_layout == canonical
+        assert tuple(int(size) for _name, size in canonical.out_dims) == source_type.shape
+    del ctx
+
+
+@pytest.mark.parametrize(
+    "shape,lane_width,register_bits,warp_bits,block_bits,out_dims,surjective,injective,expected",
+    (
+        pytest.param(
+            (3, ),
+            64,
+            0,
+            0,
+            1,
+            (("dim0", 3), ),
+            None,
+            None,
+            {
+                "coverage": "block_mismatch",
+                "component_count": 1,
+                "covered_elements": 0,
+                "duplicate_slots": 0,
+                "local_elements": 3,
+                "physical_slots": 64,
+                "out_of_bounds_slots": 0,
+                "block_count": 2,
+            },
+            id="block_mismatch",
+        ),
+        pytest.param(
+            (3, ),
+            64,
+            0,
+            0,
+            0,
+            (("dim0", 3), ),
+            None,
+            None,
+            {
+                "coverage": "modular",
+                "component_count": 1,
+                "covered_elements": 0,
+                "duplicate_slots": 0,
+                "local_elements": 3,
+                "physical_slots": 64,
+                "out_of_bounds_slots": 0,
+                "block_count": 1,
+            },
+            id="modular",
+        ),
+        pytest.param(
+            (64, ),
+            64,
+            0,
+            0,
+            0,
+            (("dim0", 64), ),
+            True,
+            True,
+            {
+                "coverage": "exact",
+                "component_count": 1,
+                "covered_elements": 64,
+                "duplicate_slots": 0,
+                "local_elements": 64,
+                "physical_slots": 64,
+                "out_of_bounds_slots": 0,
+                "block_count": 1,
+            },
+            id="exact",
+        ),
+        pytest.param(
+            (64, ),
+            64,
+            1,
+            0,
+            0,
+            (("dim0", 64), ),
+            True,
+            False,
+            {
+                "coverage": "replicated",
+                "component_count": 2,
+                "covered_elements": 64,
+                "duplicate_slots": 64,
+                "local_elements": 64,
+                "physical_slots": 128,
+                "out_of_bounds_slots": 0,
+                "block_count": 1,
+            },
+            id="replicated",
+        ),
+        pytest.param(
+            (128, ),
+            64,
+            0,
+            0,
+            0,
+            (("dim0", 128), ),
+            False,
+            True,
+            {
+                "coverage": "partial",
+                "component_count": 1,
+                "covered_elements": 0,
+                "duplicate_slots": 0,
+                "local_elements": 128,
+                "physical_slots": 64,
+                "out_of_bounds_slots": 0,
+                "block_count": 1,
+            },
+            id="partial",
+        ),
+        pytest.param(
+            (128, ),
+            64,
+            1,
+            0,
+            0,
+            (("dim0", 128), ),
+            False,
+            False,
+            {
+                "coverage": "duplicate_partial",
+                "component_count": 2,
+                "covered_elements": 0,
+                "duplicate_slots": 0,
+                "local_elements": 128,
+                "physical_slots": 128,
+                "out_of_bounds_slots": 0,
+                "block_count": 1,
+            },
+            id="duplicate_partial",
+        ),
+    ),
+)
+def test_tlx_wave_classify_coordinate_domain(
+    shape,
+    lane_width,
+    register_bits,
+    warp_bits,
+    block_bits,
+    out_dims,
+    surjective,
+    injective,
+    expected,
+):
+    queries = []
+
+    def query(name, result):
+        queries.append(name)
+        assert result is not None, f"{name} must not be queried for {expected['coverage']}"
+        return result
+
+    def bases(bit_count):
+        return tuple((1, ) for _ in range(bit_count))
+
+    linear = SimpleNamespace(
+        bases=(
+            ("register", bases(register_bits)),
+            ("lane", bases(6)),
+            ("warp", bases(warp_bits)),
+            ("block", bases(block_bits)),
+        ),
+        out_dims=out_dims,
+        is_surjective=lambda: query("is_surjective", surjective),
+        is_injective=lambda: query("is_injective", injective),
+    )
+
+    assert converter_layout_domains.classify_coordinate_domain(
+        shape,
+        lane_width,
+        linear,
+    ) == expected
+    assert queries == ([] if surjective is None else ["is_surjective", "is_injective"])
+
+
+def test_tlx_wave_converter_rejects_modular_distributed_ownership(tmp_path):
+    preamble = """
+#linear = #ttg.generic_linear<{register = [[1], [2]], lane = [[0], [0], [0], [0], [0], [0]], warp = [], block = []}>
+"""
+    local_func = """
+  tt.func public @converter_modular_distributed_ownership() attributes {noinline = false} {
+    %value = arith.constant dense<0> : tensor<3xi32, #linear>
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1, preamble=preamble)
+    source = converter_source_import.import_source_program(mod)
+    constant_op = next(op for op in source.ops if op.name == "arith.constant")
+    value_id = constant_op.results[0]
+
+    with pytest.raises(converter_diagnostics.Diagnostic) as exc_info:
+        converter_layouts.build_layout_map(
+            0,
+            value_id,
+            source.values[value_id].type,
+            lane_width=64,
+            warp_count=1,
+            block_count=1,
+        )
+
+    diagnostic = exc_info.value
+    assert diagnostic.code == "TLXW_TYPE_UNSUPPORTED_LAYOUT"
+    assert diagnostic.stage == "type_layout"
+    assert "coordinate domain modular" in diagnostic.reason
+    assert diagnostic.source_value_id == value_id
+    assert diagnostic.no_fallback is True
+
+    with pytest.raises(converter_diagnostics.Diagnostic) as conversion_exc_info:
+        converter_types.convert_source_program(source)
+    assert conversion_exc_info.value.code == diagnostic.code
+    assert conversion_exc_info.value.source_value_id == value_id
+    del ctx
+
+
+@pytest.mark.parametrize(
+    "name,preamble,shape,element_type,num_warps,expected_grid",
+    (
+        (
+            "tiled_accumulator",
+            "#enc = #ttg.amd_mfma<{version = 4, warpsPerCTA = [2, 2], "
+            "instrShape = [16, 16, 32], isTransposed = true, "
+            "tilesPerWarp = [2, 2]}>",
+            (256, 256),
+            "f32",
+            4,
+            (8, 8),
+        ),
+        (
+            "scaled_lhs",
+            "#mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [2, 2], "
+            "instrShape = [16, 16, 128], isTransposed = true}>\n"
+            "#enc = #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 16}>",
+            (256, 128),
+            "i8",
+            4,
+            (8, 2),
+        ),
+        (
+            "scaled_rhs",
+            "#mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [2, 2], "
+            "instrShape = [16, 16, 128], isTransposed = true}>\n"
+            "#enc = #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 16}>",
+            (128, 256),
+            "i8",
+            4,
+            (2, 8),
+        ),
+        (
+            "broadcast_accumulator",
+            "#enc = #ttg.amd_mfma<{version = 4, warpsPerCTA = [2, 4], "
+            "instrShape = [16, 16, 32], isTransposed = true}>",
+            (1, 256),
+            "f32",
+            8,
+            (1, 4),
+        ),
+    ),
+)
+def test_tlx_wave_canonical_mma_component_model(
+    tmp_path,
+    name,
+    preamble,
+    shape,
+    element_type,
+    num_warps,
+    expected_grid,
+):
+    literal = "0" if element_type.startswith("i") else "0.000000e+00"
+    local_func = f"""
+  tt.func public @{name}() attributes {{noinline = false}} {{
+    %value = arith.constant dense<{literal}> : tensor<{shape[0]}x{shape[1]}x{element_type}, #enc>
+    tt.return
+  }}
+"""
+    mod, ctx = _parse_ttgir(
+        tmp_path,
+        local_func,
+        num_warps=num_warps,
+        preamble=preamble,
+    )
+    source = converter_source_import.import_source_program(mod)
+    converted = converter_types.convert_source_program(source)
+    constant = next(op for op in source.ops if op.name == "arith.constant")
+    layout = converted.layouts[converted.values[constant.results[0]].layout_map_id]
+
+    model = converter_layouts._mma_component_model(
+        layout.kind,
+        layout.element_type,
+        layout.properties,
+        layout.linear_layout,
+        source_value_id=layout.value_id,
+    )
+
+    assert model.grid == expected_grid
+    assert model.component_count == math.prod(expected_grid)
+    assert layout.component_count == model.component_count
+    del ctx
+
+
+@pytest.mark.parametrize(
+    "component_bases",
+    (
+        ((0, 16), (16, 0), (0, 32), (32, 0)),
+        ((16, 16), (16, 0), (0, 32), (32, 0)),
+    ),
+)
+def test_tlx_wave_mma_component_model_uses_canonical_register_bit_order(component_bases, ):
+    linear = LinearLayout.from_bases(
+        [
+            (
+                "register",
+                ((0, 1), (0, 2), *component_bases),
+            ),
+            (
+                "lane",
+                ((1, 0), (2, 0), (4, 0), (8, 0), (0, 4), (0, 8)),
+            ),
+            ("warp", ()),
+            ("block", ()),
+        ],
+        ["dim0", "dim1"],
+        [64, 64],
+        False,
+    )
+
+    assert linear.is_invertible()
+    model = converter_layouts._mma_component_model(
+        "amd_mfma",
+        "f32",
+        {"instr_shape": (16, 16, 32)},
+        linear,
+    )
+    assert model.component_count == 16
+    assert model.grid == (4, 4)
+    dsl, _ir = converter_emission._load_wave_dsl()
+    relation = dsl.ixs_deserialize(model.relation)
+    axis0 = dsl.sym("mma_axis0")
+    axis1 = dsl.sym("mma_axis1")
+    for dim0 in range(4):
+        for dim1 in range(4):
+            _proofs, normalized = dsl.ixs_check(
+                (relation, ),
+                (
+                    dsl.ixs_eq(axis0, dsl.ixs_int(dim0)),
+                    dsl.ixs_eq(axis1, dsl.ixs_int(dim1)),
+                ),
+            )
+            component = int(normalized[0])
+            coordinates = linear.apply({"register": component * 4, "lane": 0, "warp": 0, "block": 0})
+            assert (
+                int(coordinates["dim0"]) // 16,
+                int(coordinates["dim1"]) // 16,
+            ) == (dim0, dim1)
+
+
+def test_tlx_wave_mfma_linear_layout_logical_coordinates_match_native_samples(tmp_path):
     cases = (
         (
             "mfma16_t_warps4x2",
@@ -12431,22 +14502,41 @@ def test_tlx_wave_mfma_linear_layout_logical_coordinates_match_native_samples():
     )
 
     for name, shape, properties, samples, expected in cases:
-        linear = converter_layouts.distributed_linear_layout_from_parts(
-            "amd_mfma",
-            shape,
-            properties,
-            64,
+        warps_per_cta = properties["warps_per_cta"]
+        instr_shape = properties["instr_shape"]
+        tiles_per_warp = properties["tiles_per_warp"]
+        preamble = f"""
+#mma = #ttg.amd_mfma<{{version = {properties['version']}, warpsPerCTA = [{warps_per_cta[0]}, {warps_per_cta[1]}], instrShape = [{instr_shape[0]}, {instr_shape[1]}, {instr_shape[2]}], isTransposed = {str(properties['is_transposed']).lower()}, tilesPerWarp = [{tiles_per_warp[0]}, {tiles_per_warp[1]}], elementBitWidth = {properties['element_bit_width']}}}>
+"""
+        element_type = "f64" if properties["element_bit_width"] == 64 else "f32"
+        local_func = f"""
+  tt.func public @{name}() attributes {{noinline = false}} {{
+    %value = arith.constant dense<0.000000e+00> : tensor<{shape[0]}x{shape[1]}x{element_type}, #mma>
+    tt.return
+  }}
+"""
+        mod, ctx = _parse_ttgir(
+            tmp_path,
+            local_func,
+            num_warps=warps_per_cta[0] * warps_per_cta[1],
+            preamble=preamble,
         )
+        source = converter_source_import.import_source_program(mod)
+        converted = converter_types.convert_source_program(source)
+        constant_op = next(op for op in source.ops if op.name == "arith.constant")
+        layout = converted.layouts[converted.values[constant_op.results[0]].layout_map_id]
+        linear = converter_layouts.distributed_linear_layout(layout)
         assert tuple(name for name, _size in linear.out_dims) == (
             "dim0",
             "dim1",
         ), name
         actual = tuple(
-            converter_layouts.linear_layout_coords(
+            _packet_layout_apply(
                 linear,
+                0,
+                warp * 64 + lane,
                 register,
-                lane,
-                warp=warp,
+                64,
             ) for register, lane, warp in samples)
         assert actual == expected, name
 
@@ -12456,15 +14546,17 @@ def test_tlx_wave_mfma_linear_layout_logical_coordinates_match_native_samples():
         )
         warp_count = converter_layouts.linear_layout_in_dim_size(linear, "warp")
         all_coords = tuple(
-            converter_layouts.linear_layout_coords(
+            _packet_layout_apply(
                 linear,
+                0,
+                warp * 64 + lane,
                 register,
-                lane,
-                warp=warp,
+                64,
             ) for warp in range(warp_count) for lane in range(64) for register in range(register_count))
         assert len(all_coords) == shape[0] * shape[1], name
         assert len(set(all_coords)) == len(all_coords), name
         assert all(0 <= coord[0] < shape[0] and 0 <= coord[1] < shape[1] for coord in all_coords), name
+        del ctx
 
 
 def test_tlx_wave_converter_packs_blocked_accumulator_remap_for_dot(tmp_path):
@@ -13265,7 +15357,9 @@ def test_tlx_wave_converter_pipeline_lowers_masked_buffer_store_with_where(tmp_p
     )
     assert output.emitted_module.text.count("wave.where") == 1
     assert output.emitted_module.text.count("wave.scatter") == 1
-    assert 'bit_offset = <"16*offset">' in output.emitted_module.text
+    scatter_line = next(line for line in output.emitted_module.text.splitlines() if "wave.scatter" in line)
+    assert "bit_offset =" in scatter_line
+    assert "Piecewise" not in scatter_line
     assert "wave.select" not in output.emitted_module.text
 
     machine = _run_waveamd_to_machine(output.emitted_module.text)
@@ -13274,8 +15368,7 @@ def test_tlx_wave_converter_pipeline_lowers_masked_buffer_store_with_where(tmp_p
     del ctx
 
 
-@pytest.mark.parametrize("register_mask", (1, 2))
-def test_tlx_wave_converter_applies_generic_buffer_store_ownership(tmp_path, register_mask):
+def test_tlx_wave_converter_derives_buffer_store_ownership_from_layout(tmp_path):
     preamble = """
 #linear = #ttg.linear<{
   register = [[1], [0]],
@@ -13293,14 +15386,11 @@ def test_tlx_wave_converter_applies_generic_buffer_store_ownership(tmp_path, reg
     %limit_splat = tt.splat %limit : i32 -> tensor<64xi32, #linear>
     %mask = arith.cmpi slt, %range, %limit_splat : tensor<64xi32, #linear>
     amdg.buffer_store %value, %arg0[%range], %mask {
-      amdgpu.redundant_lane_mask = 1 : i32,
-      amdgpu.redundant_register_mask = REGISTER_MASK : i32,
-      amdgpu.redundant_wave_mask = 7 : i32,
       contiguity = 2 : i32
     } : tensor<64xf16, #linear>
     tt.return
   }
-""".replace("REGISTER_MASK", str(register_mask))
+"""
     mod, ctx = _parse_ttgir(
         tmp_path,
         local_func,
@@ -13312,23 +15402,89 @@ def test_tlx_wave_converter_applies_generic_buffer_store_ownership(tmp_path, reg
 
     (store_op, ) = [op for op in output.target_program.ops if op.kind == "buffer_store"]
     attrs = converter_target_ir.attrs_dict(store_op)
-    assert attrs["redundant_register_mask"] == register_mask
-    assert attrs["redundant_lane_mask"] == 1
-    assert attrs["redundant_wave_mask"] == 7
+    assert not any(name.startswith("redundant_") for name in attrs)
     assert attrs["wave_count"] == 8
     assert attrs["contiguity"] == 2
+    offset_layout = output.target_program.layouts[int(output.target_program.values[store_op.operands[2]].layout_map_id)]
+    assert offset_layout.active_relation
     wave = output.emitted_module.text
     assert wave.count("wave.scatter") == 1
     assert wave.count("wave.where") == 1
-    assert "wave.binary andi" in wave
+    assert "wave.binary andi" not in wave
+    scatter_line = next(line for line in wave.splitlines() if "wave.scatter" in line)
+    assert "packet_bindings" not in scatter_line
+    assert "Piecewise" not in scatter_line
+    assert "anchor_" not in scatter_line
+    assert "bit_offset =" in scatter_line
+    assert "!wave.simd<vector<4xf16>, 64>" in scatter_line
     machine = _run_waveamd_to_machine(wave)
-    if register_mask == 1:
-        assert '#wave.pred<"-1 + x >= 0">, #wave.pred<"-1 + x <= 0">' not in wave
-    else:
-        _assert_runtime_contiguity_scoped_by_where(wave)
     assert machine.count("waveamdmachine.buffer_store_b16") == 2
     assert machine.count("waveamdmachine.exec_if") == 2
     del ctx
+
+
+def test_tlx_wave_converter_vectorizes_restricted_buffer_store_subspace(tmp_path):
+    preamble = """
+#linear = #ttg.linear<{
+  register = [[1], [0]],
+  lane = [[0], [2], [4], [8], [16], [32]],
+  warp = [[0], [0], [0]],
+  block = []
+}>
+"""
+    local_func = """
+  tt.func public @converter_owned_unmasked_buffer_store(
+      %arg0: !tt.ptr<f16> {tt.pointer_range = 32 : i32}) attributes {noinline = false} {
+    %range = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32, #linear>
+    %value = arith.constant dense<0.000000e+00> : tensor<64xf16, #linear>
+    amdg.buffer_store %value, %arg0[%range] {
+      contiguity = 2 : i32
+    } : tensor<64xf16, #linear>
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(
+        tmp_path,
+        local_func,
+        num_warps=8,
+        preamble=preamble,
+    )
+
+    output = converter_pipeline.convert_ttgir_to_wave(mod)
+
+    wave = output.emitted_module.text
+    assert wave.count("wave.where") == 1
+    scatter_line = next(line for line in wave.splitlines() if "wave.scatter" in line)
+    assert "!wave.simd<vector<4xf16>, 64>" in scatter_line
+    assert "Piecewise" not in scatter_line
+    machine = _run_waveamd_to_machine(wave)
+    assert machine.count("waveamdmachine.buffer_store_b32") == 1
+    assert "waveamdmachine.buffer_store_b16" not in machine
+    assert machine.count("waveamdmachine.exec_if") == 1
+    del ctx
+
+
+def test_tlx_wave_layout_ownership_selects_a_generic_linear_section():
+    linear = SimpleNamespace(
+        out_dims=(("dim0", 4), ),
+        bases=(
+            ("register", ((2, ), )),
+            ("lane", ((1, ), (1, ))),
+        ),
+        is_surjective=lambda: True,
+    )
+    relation = converter_layouts._distributed_active_relation(
+        linear,
+        lane_width=4,
+        warp_count=1,
+        block_count=1,
+        source_value_id=0,
+    )
+    dsl, _ir = converter_emission._load_wave_dsl()
+    active_key = dsl.ixs_deserialize(relation)
+    assert [active_key.eval({"item": item, "slot": slot})
+            for item in range(4)
+            for slot in range(2)] == [0, 0, 0, 0, 1, 1, 1, 1]
 
 
 def test_tlx_wave_converter_buffer_store_dynamic_scalar_offset_stays_structural(tmp_path):
@@ -13359,7 +15515,11 @@ def test_tlx_wave_converter_buffer_store_dynamic_scalar_offset_stays_structural(
         output.target_program,
         store_op,
     )
-    assert len(store_op.operands) == 3
+    attrs = converter_target_ir.attrs_dict(store_op)
+    assert len(store_op.operands) == 4
+    assert attrs["index_binding_count"] == 1
+    assert attrs["index_binding_names"] == ("t1", )
+    assert store_op.operands[3] == output.target_program.kernel.arg_target_ids[1]
     assert offset_edge.kind == "binary"
     assert offset_attrs["operation"] == "addi"
     assert "wave.assume" in output.emitted_module.text
@@ -13453,6 +15613,9 @@ def test_tlx_wave_converter_preserves_remui_memory_offset_ssa(tmp_path, ):
     wave = output.emitted_module.text
     assert "wave.binary remui" in wave
     assert "wave.assume" in wave
+    gather_line = next(line for line in wave.splitlines() if "wave.scatter" in line)
+    assert "Mod(" in gather_line
+    assert "Max(" not in gather_line
     machine = _run_waveamd_to_machine(wave)
     assert "waveamdmachine.buffer_store_b16" in machine
     del ctx
@@ -14126,8 +16289,9 @@ def test_tlx_wave_converter_pipeline_lowers_raw_masked_load_store(tmp_path):
     assert "waveamd.make_buffer" not in wave
     assert wave.count("wave.gather") == 1
     assert wave.count("wave.scatter") == 1
-    assert "base = <\"slot\">" in wave
-    assert "bit_offset = <\"0\">" in wave
+    memory_lines = [line for line in wave.splitlines() if "wave.gather" in line or "wave.scatter" in line]
+    assert all('bit_offset = <"32*item">' in line for line in memory_lines)
+    assert all("packet_bindings" not in line for line in memory_lines)
     assert wave.count("wave.where") == 2
     assert wave.count("otherwise") == 1
     assert "wave.select" not in wave
@@ -14174,7 +16338,11 @@ def test_tlx_wave_converter_pipeline_lowers_masked_buffer_load_with_other(tmp_pa
     assert output.emitted_module.text.count("wave.gather") == 1
     assert output.emitted_module.text.count("wave.scatter") == 1
     assert output.emitted_module.text.count("wave.where") == 2
-    assert output.emitted_module.text.count('bit_offset = <"32*offset">') == 2
+    memory_lines = [
+        line for line in output.emitted_module.text.splitlines() if "wave.gather" in line or "wave.scatter" in line
+    ]
+    assert all('bit_offset = <"32*item">' in line for line in memory_lines)
+    assert all("packet_bindings" not in line for line in memory_lines)
     assert "otherwise" in output.emitted_module.text
 
     machine = _run_waveamd_to_machine(output.emitted_module.text)
@@ -14190,9 +16358,11 @@ def test_tlx_wave_converter_vectorizes_contiguous_f16_buffer_load(tmp_path):
 """
     local_func = """
   tt.func public @converter_vector_buffer_load(
-      %arg0: !tt.ptr<f16> {tt.pointer_range = 32 : i32}) attributes {noinline = false} {
+      %arg0: !tt.ptr<f16> {tt.pointer_range = 32 : i32},
+      %arg1: !tt.ptr<f16> {tt.pointer_range = 32 : i32}) attributes {noinline = false} {
     %range = tt.make_range {end = 512 : i32, start = 0 : i32} : tensor<512xi32, #blocked>
     %loaded = amdg.buffer_load %arg0[%range] {contiguity = 8 : i32} : tensor<512xf16, #blocked>
+    amdg.buffer_store %loaded, %arg1[%range] {contiguity = 8 : i32} : tensor<512xf16, #blocked>
     tt.return
   }
 """
@@ -14207,13 +16377,61 @@ def test_tlx_wave_converter_vectorizes_contiguous_f16_buffer_load(tmp_path):
     assert wave.count("wave.gather") == 1
     assert "!wave.simd<vector<8xf16>, 64>" in wave
     assert wave.count("wave.extract") == 8
+    gather_line = next(line for line in wave.splitlines() if "wave.gather" in line)
+    assert 'bit_offset = <"16*(8*item + slot)">' in gather_line
+    assert "packet_bindings" not in gather_line
     machine = _run_waveamd_to_machine(wave)
     assert "waveamdmachine.buffer_load_tuple_b32" in machine
     assert "waveamdmachine.buffer_load_b16" not in machine
     del ctx
 
 
-def test_tlx_wave_converter_vectorizes_dynamic_stride_contiguous_f16_buffer_load(tmp_path):
+def test_tlx_wave_converter_keeps_opaque_ssa_select_as_exact_packet(tmp_path):
+    preamble = """
+#blocked = #ttg.blocked<{sizePerThread = [2], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+"""
+    local_func = """
+  tt.func public @converter_opaque_ssa_select_relation(
+      %src: !tt.ptr<f16> {tt.pointer_range = 32 : i32},
+      %choose: i1) attributes {noinline = false} {
+    %range = tt.make_range {end = 128 : i32, start = 0 : i32} : tensor<128xi32, #blocked>
+    %two = arith.constant dense<2> : tensor<128xi32, #blocked>
+    %shifted = arith.muli %range, %two overflow<nsw> : tensor<128xi32, #blocked>
+    %offset = arith.select %choose, %range, %shifted : i1, tensor<128xi32, #blocked>
+    %loaded = amdg.buffer_load %src[%offset] {contiguity = 1 : i32} : tensor<128xf16, #blocked>
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1, preamble=preamble)
+
+    output = converter_pipeline.convert_ttgir_to_wave(mod)
+
+    (load_op, ) = [op for op in output.target_program.ops if op.kind == "buffer_load"]
+    attrs = converter_target_ir.attrs_dict(load_op)
+    assert attrs["bit_offset_relation"]
+    assert attrs["index_binding_count"] == 1
+    (condition_name, ) = attrs["index_binding_names"]
+    dsl, _ir = converter_emission._load_wave_dsl()
+    relation = dsl.ixs_deserialize(attrs["bit_offset_relation"])
+    for choose in (0, 1):
+        for item in (0, 1, 63):
+            for slot in (0, 1):
+                logical = 2 * item + slot
+                assert relation.eval({
+                    "block": 0,
+                    "item": item,
+                    "slot": slot,
+                    condition_name: choose,
+                }) == 16 * logical * (1 if choose else 2)
+    gather = next(line for line in output.emitted_module.text.splitlines() if "wave.gather" in line)
+    assert "packet_bindings" not in gather
+    assert f'"{condition_name}"' in gather
+    assert "Piecewise" not in gather
+    _run_wave_verify(output.emitted_module.text)
+    del ctx
+
+
+def test_tlx_wave_converter_vectorizes_dynamic_stride_contiguous_f16_buffer_load(tmp_path, ):
     preamble = """
 #blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [4, 16], warpsPerCTA = [4, 1], order = [1, 0]}>
 #blocked_m = #ttg.slice<{dim = 1, parent = #blocked}>
@@ -14222,17 +16440,19 @@ def test_tlx_wave_converter_vectorizes_dynamic_stride_contiguous_f16_buffer_load
     local_func = """
   tt.func public @converter_dynamic_stride_vector_buffer_load(
       %arg0: !tt.ptr<f16> {tt.pointer_range = 32 : i32},
+      %arg1: !tt.ptr<f16> {tt.pointer_range = 32 : i32},
       %sy0: i32 {tt.divisibility = 16 : i32}) attributes {noinline = false} {
     %offs_m = tt.make_range {end = 128 : i32, start = 0 : i32} : tensor<128xi32, #blocked_m>
     %offs_n = tt.make_range {end = 128 : i32, start = 0 : i32} : tensor<128xi32, #blocked_n>
     %offs_m_e = tt.expand_dims %offs_m {axis = 1 : i32} : tensor<128xi32, #blocked_m> -> tensor<128x1xi32, #blocked>
     %offs_n_e = tt.expand_dims %offs_n {axis = 0 : i32} : tensor<128xi32, #blocked_n> -> tensor<1x128xi32, #blocked>
     %stride = tt.splat %sy0 : i32 -> tensor<128x1xi32, #blocked>
-    %row_offset = arith.muli %offs_m_e, %stride : tensor<128x1xi32, #blocked>
+    %row_offset = arith.muli %offs_m_e, %stride overflow<nsw> : tensor<128x1xi32, #blocked>
     %row_offset_b = tt.broadcast %row_offset : tensor<128x1xi32, #blocked> -> tensor<128x128xi32, #blocked>
     %col_offset_b = tt.broadcast %offs_n_e : tensor<1x128xi32, #blocked> -> tensor<128x128xi32, #blocked>
-    %offset = arith.addi %row_offset_b, %col_offset_b : tensor<128x128xi32, #blocked>
+    %offset = arith.addi %row_offset_b, %col_offset_b overflow<nsw> : tensor<128x128xi32, #blocked>
     %loaded = amdg.buffer_load %arg0[%offset] {contiguity = 8 : i32} : tensor<128x128xf16, #blocked>
+    amdg.buffer_store %loaded, %arg1[%offset] {contiguity = 8 : i32} : tensor<128x128xf16, #blocked>
     tt.return
   }
 """
@@ -14252,15 +16472,21 @@ def test_tlx_wave_converter_vectorizes_dynamic_stride_contiguous_f16_buffer_load
     wave = output.emitted_module.text
     assert wave.count("wave.gather") == 1
     assert "!wave.simd<vector<64xf16>, 64>" in wave
+    gather_line = next(line for line in wave.splitlines() if "wave.gather" in line)
+    assert attrs["index_binding_count"] == 1
+    assert len(attrs["index_binding_names"]) == 1
+    assert f'"{attrs["index_binding_names"][0]}"' in gather_line
+    assert "packet_bindings" not in gather_line
     machine = _run_waveamd_to_machine(wave)
     # The complete per-thread packet contains eight contiguous transactions;
     # Wave, rather than the bridge, discovers and lowers all eight.
     assert machine.count("waveamdmachine.buffer_load_tuple_b32") == 8
+    assert machine.count("waveamdmachine.buffer_store_tuple_b32") == 8
     assert "waveamdmachine.buffer_load_b16" not in machine
     del ctx
 
 
-def test_tlx_wave_converter_vectorizes_runtime_modulo_buffer_accesses(tmp_path):
+def test_tlx_wave_converter_rejects_unproved_runtime_unsigned_remainder(tmp_path):
     preamble = """
 #blocked = #ttg.blocked<{sizePerThread = [2], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
 """
@@ -14274,7 +16500,10 @@ def test_tlx_wave_converter_vectorizes_runtime_modulo_buffer_accesses(tmp_path):
     %base_s = tt.splat %base : i32 -> tensor<128xi32, #blocked>
     %raw = arith.addi %base_s, %range : tensor<128xi32, #blocked>
     %modulus_s = tt.splat %modulus : i32 -> tensor<128xi32, #blocked>
-    %offset = arith.remsi %raw, %modulus_s : tensor<128xi32, #blocked>
+    %offset = arith.remui %raw, %modulus_s : tensor<128xi32, #blocked>
+    %zero = arith.constant 0 : i32
+    %modulus_positive = arith.cmpi sgt, %modulus, %zero : i32
+    llvm.intr.assume %modulus_positive : i1
     %loaded = amdg.buffer_load %arg0[%offset] {contiguity = 2 : i32} : tensor<128xf16, #blocked>
     amdg.buffer_store %loaded, %arg1[%offset] {contiguity = 2 : i32} : tensor<128xf16, #blocked>
     tt.return
@@ -14282,23 +16511,17 @@ def test_tlx_wave_converter_vectorizes_runtime_modulo_buffer_accesses(tmp_path):
 """
     mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1, preamble=preamble)
 
-    output = converter_pipeline.convert_ttgir_to_wave(mod)
+    with pytest.raises(converter_diagnostics.Diagnostic) as exc_info:
+        converter_pipeline.convert_ttgir_to_wave(mod)
 
-    load_op = next(op for op in output.target_program.ops if op.kind == "buffer_load")
-    store_op = next(op for op in output.target_program.ops if op.kind == "buffer_store")
-    assert converter_target_ir.attrs_dict(load_op)["contiguity"] == 2
-    assert converter_target_ir.attrs_dict(store_op)["contiguity"] == 2
-    raw_wave = output.emitted_module.text
-    _assert_runtime_contiguity_identity_chain(raw_wave, minimum=2)
-    machine = _run_waveamd_to_machine(raw_wave)
-    assert "load_b16" not in machine
-    assert "store_b16" not in machine
-    assert "load_b32" in machine
-    assert "store_b32" in machine
+    diagnostic = exc_info.value
+    assert diagnostic.code == "TLXW_RELATION_UNREPRESENTABLE_OFFSET"
+    assert diagnostic.stage == "value_relations"
+    assert diagnostic.no_fallback is True
     del ctx
 
 
-def test_tlx_wave_converter_scopes_masked_runtime_contiguity(tmp_path):
+def test_tlx_wave_converter_consumer_mask_does_not_prove_remainder_domain(tmp_path):
     preamble = """
 #blocked = #ttg.blocked<{sizePerThread = [2], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
 """
@@ -14307,15 +16530,16 @@ def test_tlx_wave_converter_scopes_masked_runtime_contiguity(tmp_path):
       %arg0: !tt.ptr<f16> {tt.pointer_range = 32 : i32},
       %arg1: !tt.ptr<f16> {tt.pointer_range = 32 : i32},
       %base: i32,
-      %modulus: i32,
-      %limit: i32) attributes {noinline = false} {
+      %modulus: i32) attributes {noinline = false} {
     %range = tt.make_range {end = 128 : i32, start = 0 : i32} : tensor<128xi32, #blocked>
     %base_s = tt.splat %base : i32 -> tensor<128xi32, #blocked>
     %raw = arith.addi %base_s, %range : tensor<128xi32, #blocked>
     %modulus_s = tt.splat %modulus : i32 -> tensor<128xi32, #blocked>
     %offset = arith.remsi %raw, %modulus_s : tensor<128xi32, #blocked>
-    %active = arith.cmpi slt, %base, %limit : i32
-    %mask = tt.splat %active : i1 -> tensor<128xi1, #blocked>
+    %zero = arith.constant dense<0> : tensor<128xi32, #blocked>
+    %nonnegative = arith.cmpi sge, %raw, %zero : tensor<128xi32, #blocked>
+    %below_modulus = arith.cmpi slt, %raw, %modulus_s : tensor<128xi32, #blocked>
+    %mask = arith.andi %nonnegative, %below_modulus : tensor<128xi1, #blocked>
     %other = arith.constant dense<0.000000e+00> : tensor<128xf16, #blocked>
     %loaded = amdg.buffer_load %arg0[%offset], %mask, %other {contiguity = 2 : i32} : tensor<128xf16, #blocked>
     amdg.buffer_store %loaded, %arg1[%offset], %mask {contiguity = 2 : i32} : tensor<128xf16, #blocked>
@@ -14324,18 +16548,74 @@ def test_tlx_wave_converter_scopes_masked_runtime_contiguity(tmp_path):
 """
     mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1, preamble=preamble)
 
+    with pytest.raises(converter_diagnostics.Diagnostic) as exc_info:
+        converter_pipeline.convert_ttgir_to_wave(mod)
+
+    diagnostic = exc_info.value
+    assert diagnostic.code == "TLXW_RELATION_UNREPRESENTABLE_OFFSET"
+    assert diagnostic.stage == "value_relations"
+    assert diagnostic.no_fallback is True
+    del ctx
+
+
+def test_tlx_wave_converter_rejects_unproved_signed_division_overflow(tmp_path):
+    preamble = """
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+"""
+    local_func = """
+  tt.func public @converter_runtime_signed_division(
+      %arg0: !tt.ptr<f16> {tt.pointer_range = 32 : i32},
+      %base: i32) attributes {noinline = false} {
+    %base_s = tt.splat %base : i32 -> tensor<64xi32, #blocked>
+    %minus_one = arith.constant dense<-1> : tensor<64xi32, #blocked>
+    %offset = arith.divsi %base_s, %minus_one : tensor<64xi32, #blocked>
+    %loaded = amdg.buffer_load %arg0[%offset] {contiguity = 1 : i32} : tensor<64xf16, #blocked>
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1, preamble=preamble)
+
+    with pytest.raises(converter_diagnostics.Diagnostic) as exc_info:
+        converter_pipeline.convert_ttgir_to_wave(mod)
+
+    diagnostic = exc_info.value
+    assert diagnostic.code == "TLXW_RELATION_UNREPRESENTABLE_OFFSET"
+    assert diagnostic.stage == "value_relations"
+    assert diagnostic.no_fallback is True
+    del ctx
+
+
+def test_tlx_wave_converter_proves_signed_division_domain_from_ssa_range(tmp_path):
+    preamble = """
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+"""
+    local_func = """
+  tt.func public @converter_proved_signed_division(
+      %arg0: !tt.ptr<f16> {tt.pointer_range = 32 : i32}) attributes {noinline = false} {
+    %range = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32, #blocked>
+    %minus_one = arith.constant dense<-1> : tensor<64xi32, #blocked>
+    %offset = arith.divsi %range, %minus_one : tensor<64xi32, #blocked>
+    %loaded = amdg.buffer_load %arg0[%offset] {contiguity = 1 : i32} : tensor<64xf16, #blocked>
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1, preamble=preamble)
+
     output = converter_pipeline.convert_ttgir_to_wave(mod)
 
-    raw_wave = output.emitted_module.text
-    assert raw_wave.count("wave.where") == 2
-    assert raw_wave.count("packet_conditions(") == 2
-    _assert_runtime_contiguity_scoped_by_where(raw_wave, minimum=2)
-    machine = _run_waveamd_to_machine(raw_wave)
-    assert "waveamdmachine.buffer_load_b16" not in machine
-    assert "waveamdmachine.buffer_store_b16" not in machine
-    assert machine.count("waveamdmachine.buffer_load_b32") == 1
-    assert machine.count("waveamdmachine.buffer_store_b32") == 1
-    assert machine.count("waveamdmachine.exec_if") == 2
+    (load_op, ) = [op for op in output.target_program.ops if op.kind == "buffer_load"]
+    attrs = converter_target_ir.attrs_dict(load_op)
+    dsl, _ir = converter_emission._load_wave_dsl()
+    relation = dsl.ixs_deserialize(attrs["bit_offset_relation"])
+    for item in (0, 1, 63):
+        assert relation.eval({
+            "block": 0,
+            "item": item,
+            "slot": 0,
+        }) == ((-2 * item) % (1 << 32)) * 8
+    gather_line = next(line for line in output.emitted_module.text.splitlines() if "wave.gather" in line)
+    assert "Max(" not in gather_line
+    assert "Piecewise" not in gather_line
     del ctx
 
 
@@ -14619,6 +16899,23 @@ def test_tlx_wave_converter_packs_glu_bias_slice_into_mfma_fragment(tmp_path):
     mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=8, preamble=preamble)
     source_program = converter_source_import.import_source_program(mod)
     type_layout_program = converter_types.convert_source_program(source_program)
+    slice_layouts = [
+        layout for layout in type_layout_program.layouts
+        if layout.kind == "slice" and layout.properties.get("parent_kind") == "amd_mfma"
+    ]
+    assert slice_layouts
+    for layout in slice_layouts:
+        assert layout.component_count == converter_layouts.linear_layout_in_dim_size(
+            layout.linear_layout,
+            "register",
+        )
+        assert converter_layouts._mma_component_model(
+            layout.kind,
+            layout.element_type,
+            layout.properties,
+            layout.linear_layout,
+            source_value_id=layout.value_id,
+        ) is None
     fact_program = converter_facts.analyze_facts(source_program, type_layout_program)
     token_program = converter_tokens.build_token_program(source_program, type_layout_program)
     target_program = converter_op_conversion.convert_ops(
@@ -14642,6 +16939,7 @@ def test_tlx_wave_converter_packs_glu_bias_slice_into_mfma_fragment(tmp_path):
     (broadcast_op, ) = [op for op in target_program.ops if op.kind == "broadcast"]
     _assert_mechanical_layout_transform(target_program, broadcast_op)
 
+    target_program = converter_value_relations.attach_symbolic_memory_relations(target_program)
     wave = converter_emission.emit_wave_module(target_program).text
     assert wave.count("!wave.simd<vector<4xf32>, 64>") >= 4
     _run_wave_verify(wave)
@@ -14771,12 +17069,14 @@ def test_tlx_wave_converter_masks_buffer_load_offset_assumes(tmp_path):
 """
     local_func = """
   tt.func public @converter_masked_small_buffer_load(
-      %arg0: !tt.ptr<f32> {tt.pointer_range = 3 : i32}) attributes {noinline = false} {
+      %arg0: !tt.ptr<f32> {tt.pointer_range = 3 : i32},
+      %arg1: !tt.ptr<f32> {tt.pointer_range = 3 : i32}) attributes {noinline = false} {
     %range = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32, #blocked>
     %one = arith.constant dense<1> : tensor<64xi32, #blocked>
     %mask = arith.cmpi slt, %range, %one : tensor<64xi32, #blocked>
     %other = arith.constant dense<0.000000e+00> : tensor<64xf32, #blocked>
     %loaded = amdg.buffer_load %arg0[%range], %mask, %other {contiguity = 1 : i32} : tensor<64xf32, #blocked>
+    amdg.buffer_store %loaded, %arg1[%range], %mask {contiguity = 1 : i32} : tensor<64xf32, #blocked>
     tt.return
   }
 """
@@ -14879,7 +17179,7 @@ def test_tlx_wave_converter_pipeline_groups_2d_padded_dma_physical_linear_slots(
     del ctx
 
 
-def test_tlx_wave_converter_pipeline_preserves_runtime_modulo_contiguity(tmp_path):
+def test_tlx_wave_converter_pipeline_keeps_runtime_modulo_index_exact(tmp_path):
     preamble = """
 #linear = #ttg.linear<{register = [[0, 1], [8, 0], [16, 0], [32, 0], [64, 0]], lane = [[0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64]], warp = [[1, 0], [2, 0], [4, 0]], block = []}>
 #shared = #ttg.padded_shared<[128:+4] {order = [1, 0], shape = [128, 128]}>
@@ -14893,6 +17193,11 @@ def test_tlx_wave_converter_pipeline_preserves_runtime_modulo_contiguity(tmp_pat
       %stride: i32,
       %m: i32,
       %n: i32) attributes {noinline = false} {
+    %zero = arith.constant 0 : i32
+    %m_positive = arith.cmpi sgt, %m, %zero : i32
+    %n_positive = arith.cmpi sgt, %n, %zero : i32
+    llvm.intr.assume %m_positive : i1
+    llvm.intr.assume %n_positive : i1
     %alloc = ttg.local_alloc : () -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
     %rows = tt.make_range {end = 128 : i32, start = 0 : i32} : tensor<128xi32, #ttg.slice<{dim = 1, parent = #linear}>>
     %cols = tt.make_range {end = 128 : i32, start = 0 : i32} : tensor<128xi32, #ttg.slice<{dim = 0, parent = #linear}>>
@@ -14923,6 +17228,15 @@ def test_tlx_wave_converter_pipeline_preserves_runtime_modulo_contiguity(tmp_pat
 
     (dma_op, ) = [op for op in output.target_program.ops if op.kind == "buffer_load_to_local"]
     attrs = converter_target_ir.attrs_dict(dma_op)
+    source_assumes = [op for op in output.target_program.ops if op.kind == "assume" and op.source_op_index is not None]
+    assert len(source_assumes) == 2
+    assert all(len(op.operands) == len(op.results) == 1 for op in source_assumes)
+    assert all(set(op.fact_target_ids) == set(op.results) for op in source_assumes)
+    assumed_operands = {op.operands[0] for op in source_assumes}
+    assumed_results = {op.results[0] for op in source_assumes}
+    binding_ids = set(dma_op.operands[3:3 + attrs["index_binding_count"]])
+    assert assumed_results.issubset(binding_ids)
+    assert assumed_operands.isdisjoint(binding_ids)
     _assert_mechanical_symbolic_copy(attrs, masked=False)
     assert attrs["contiguity"] == 2
     raw_wave = output.emitted_module.text
@@ -14930,9 +17244,19 @@ def test_tlx_wave_converter_pipeline_preserves_runtime_modulo_contiguity(tmp_pat
     assert raw_wave.count("wave.scatter") == 1
     assert "linear_layout" not in raw_wave
     assert "assumed_contiguity" not in raw_wave
-    _assert_runtime_contiguity_identity_chain(raw_wave)
+    memory_lines = [line for line in raw_wave.splitlines() if "wave.gather" in line or "wave.scatter" in line]
+    assert all("packet_bindings" not in line for line in memory_lines)
+    gather_line = next(line for line in memory_lines if "wave.gather" in line)
+    assert "Trunc(" in gather_line
+    assert "Piecewise" not in gather_line
     wave = _run_wave_lower_symbolic_memory(raw_wave)
-    assert "waveamd.dma_load_lds" in wave
+    assert "waveamd.dma_load_lds" not in wave
+    assert "wave.gather" not in wave
+    assert "wave.scatter" not in wave
+    assert "wave.load" in wave
+    assert "!wave.ptr<#waveamd.buffer" in wave
+    assert "wave.store" in wave
+    assert "!wave.ptr<#wave.shared" in wave
     _run_waveamd_to_machine(raw_wave)
     del ctx
 
@@ -15006,35 +17330,11 @@ def test_tlx_wave_converter_pipeline_lowers_warp_tiled_mfma_dot(tmp_path):
     assert [attrs["component_count"] for attrs in local_load_attrs] == [8, 8]
     assert [attrs["packet_count"] for attrs in local_load_attrs] == [8, 8]
     assert [attrs["packet_width"] for attrs in local_load_attrs] == [8, 8]
-    assert [attrs["shared_physical_offset_plan"] for attrs in local_load_attrs] == [
-        "dense_row_major",
-        "dense_row_major",
-    ]
-    assert all("shared_layout_kind" not in attrs for attrs in local_load_attrs)
-    assert [attrs["coordinate_shape"] for attrs in local_load_attrs] == [
-        (256, 64),
-        (64, 128),
-    ]
-    assert local_load_attrs[1]["memdesc_shape"] == (64, 128)
-    assert local_load_attrs[0]["packet_coordinate_bases"] == (
-        (0, 0),
-        (0, 32),
-        (64, 0),
-        (64, 32),
-        (128, 0),
-        (128, 32),
-        (192, 0),
-        (192, 32),
-    )
-    assert local_load_attrs[1]["packet_coordinate_bases"] == (
-        (0, 0),
-        (32, 0),
-        (0, 32),
-        (32, 32),
-        (0, 64),
-        (32, 64),
-        (0, 96),
-        (32, 96),
+    assert all(attrs["bit_offset_relation"] for attrs in local_load_attrs)
+    assert all("bit_offset_relations" not in attrs for attrs in local_load_attrs)
+    _assert_local_access_relations_match_own_shape(
+        output,
+        [op for op in output.target_program.ops if op.kind == "local_load"],
     )
     assert all("load_mode" not in attrs for attrs in local_load_attrs)
     assert all("wave_tile_axis" not in attrs for attrs in local_load_attrs)
@@ -15053,6 +17353,27 @@ def test_tlx_wave_converter_pipeline_lowers_warp_tiled_mfma_dot(tmp_path):
             "waveamd.fragment_unpack",
             "waveamd.mma",
         )) for line in fragment_lines)
+
+    mma_op = next(op for op in output.target_program.ops if op.kind == "mma")
+    mma_layouts = tuple(output.target_program.layouts[int(output.target_program.values[target_value_id].layout_map_id)]
+                        for target_value_id in (*mma_op.operands[:3], mma_op.results[0]))
+    assert tuple(layout.component_grid for layout in mma_layouts) == (
+        (4, 2),
+        (2, 4),
+        (4, 4),
+        (4, 4),
+    )
+    assert all(layout.component_relation for layout in mma_layouts)
+    lhs_layout = mma_layouts[0]
+    malformed_layout = replace(lhs_layout, component_grid=(2, 4))
+    malformed = replace(
+        output.target_program,
+        layouts=tuple(malformed_layout if layout.layout_map_id == lhs_layout.layout_map_id else layout
+                      for layout in output.target_program.layouts),
+    )
+    with pytest.raises(converter_diagnostics.Diagnostic) as exc_info:
+        converter_verifier.verify_target_program(malformed)
+    assert exc_info.value.code == "TLXW_VERIFY_MMA_COMPONENT_RELATION"
     del ctx
 
 
@@ -15084,15 +17405,20 @@ def test_tlx_wave_converter_pipeline_lowers_typed_mfma_fragment_constants(tmp_pa
 def test_tlx_wave_converter_pipeline_keeps_mfma_fragment_math_structural(tmp_path):
     preamble = """
 #mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [1, 1], instrShape = [16, 16, 32], isTransposed = true}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#smem = #ttg.shared_memory
 """
     local_func = """
   tt.func public @converter_mfma_fragment_splat_math() attributes {noinline = false} {
+    %out = ttg.local_alloc : () -> !ttg.memdesc<16x16xf32, #shared, #smem, mutable>
     %lhs = arith.constant dense<1.250000e+00> : tensor<16x16xf32, #mma>
     %rhs = arith.constant dense<2.500000e+00> : tensor<16x16xf32, #mma>
     %maximum = arith.maxnumf %lhs, %rhs : tensor<16x16xf32, #mma>
     %product = arith.mulf %maximum, %lhs : tensor<16x16xf32, #mma>
     %sum = arith.addf %maximum, %maximum : tensor<16x16xf32, #mma>
     %difference = arith.subf %sum, %maximum : tensor<16x16xf32, #mma>
+    %result = arith.addf %difference, %product : tensor<16x16xf32, #mma>
+    ttg.local_store %result, %out : tensor<16x16xf32, #mma> -> !ttg.memdesc<16x16xf32, #shared, #smem, mutable>
     tt.return
   }
 """
@@ -15274,7 +17600,13 @@ def test_tlx_wave_converter_pipeline_reduces_mfma_fragments_within_waves(tmp_pat
     output = converter_pipeline.convert_ttgir_to_wave(mod)
 
     reductions = [op for op in output.target_program.ops if op.kind == "reduction"]
-    assert [converter_target_ir.attrs_dict(op) for op in reductions] == [
+    reduction_attrs = []
+    for op in reductions:
+        attrs = converter_target_ir.attrs_dict(op)
+        relation = attrs.pop("relation")
+        assert relation and all(type(byte) is int and 0 <= byte <= 255 for byte in relation)
+        reduction_attrs.append(attrs)
+    assert reduction_attrs == [
         {"axis": 1, "reduction_ordering": "unordered"},
         {"axis": 1, "reduction_ordering": "unordered"},
         {"axis": 1, "reduction_ordering": "unordered"},
@@ -15795,13 +18127,12 @@ def test_tlx_wave_converter_pipeline_lowers_glu_b_swizzle_transpose_load(tmp_pat
     assert attrs["component_count"] == 8
     assert attrs["packet_count"] == 8
     assert attrs["packet_width"] == 8
-    assert len(attrs["packet_coordinate_bases"]) == attrs["packet_count"]
-    assert attrs["coordinate_shape"] == (64, 128)
-    assert attrs["memdesc_shape"] == (64, 128)
-    assert attrs["shared_physical_offset_plan"] == "swizzled_xor"
-    assert attrs["shared_physical_swizzled_vec"] == 8
-    assert attrs["shared_physical_swizzled_per_phase"] == 1
-    assert attrs["shared_physical_swizzled_max_phase"] == 16
+    assert attrs["bit_offset_relation"]
+    assert "bit_offset_relations" not in attrs
+    _assert_local_access_relations_match_own_shape(
+        output,
+        [op for op in output.target_program.ops if op.kind in {"local_load", "local_store"}],
+    )
     assert "load_mode" not in attrs
     assert "mma_access_lane_layout" not in attrs
     assert "component_tile_offsets" not in attrs
@@ -15872,6 +18203,9 @@ def test_tlx_wave_converter_pipeline_uses_compiler_barrier_for_async_refill(tmp_
       %row_limit: i32,
       %stride: i32,
       %limit: i32 {tt.divisibility = 2 : i32}) attributes {noinline = false} {
+    %zero = arith.constant 0 : i32
+    %row_limit_positive = arith.cmpi sgt, %row_limit, %zero : i32
+    llvm.intr.assume %row_limit_positive : i1
     %a_alloc = ttg.local_alloc : () -> !ttg.memdesc<64x32xf16, #shared_a, #smem, mutable>
     %b_alloc = ttg.local_alloc : () -> !ttg.memdesc<32x128xf16, #shared_b, #smem, mutable>
     %rows = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32, #ttg.slice<{dim = 1, parent = #linear}>>
@@ -16103,42 +18437,20 @@ def test_tlx_wave_converter_pipeline_lowers_scaled_mfma_i8_local_loads(tmp_path)
     assert [attrs["component_count"] for attrs in local_load_attrs] == [16, 4]
     assert [attrs["packet_count"] for attrs in local_load_attrs] == [16, 4]
     assert [attrs["packet_width"] for attrs in local_load_attrs] == [16, 16]
-    assert [attrs["coordinate_shape"] for attrs in local_load_attrs] == [(256, 128), (128, 64)]
-    assert [attrs["memdesc_shape"] for attrs in local_load_attrs] == [(256, 128), (128, 64)]
-    assert all(len(attrs["packet_coordinate_bases"]) == attrs["packet_count"] for attrs in local_load_attrs)
+    assert all(attrs["bit_offset_relation"] for attrs in local_load_attrs)
+    assert all("bit_offset_relations" not in attrs for attrs in local_load_attrs)
+    _assert_local_access_relations_match_own_shape(
+        output,
+        [op for op in output.target_program.ops if op.kind == "local_load"],
+    )
     assert all("load_mode" not in attrs for attrs in local_load_attrs)
     assert all("mma_access_lane_layout" not in attrs for attrs in local_load_attrs)
-    assert [attrs["shared_physical_offset_plan"] for attrs in local_load_attrs] == [
-        "dense_row_major",
-        "swizzled_xor",
-    ]
-    assert [attrs["shared_physical_order"] for attrs in local_load_attrs] == [(1, 0), (0, 1)]
-    assert local_load_attrs[0]["packet_coordinate_bases"] == (
-        (0, 0),
-        (0, 64),
-        (32, 0),
-        (32, 64),
-        (64, 0),
-        (64, 64),
-        (96, 0),
-        (96, 64),
-        (128, 0),
-        (128, 64),
-        (160, 0),
-        (160, 64),
-        (192, 0),
-        (192, 64),
-        (224, 0),
-        (224, 64),
-    )
-    assert local_load_attrs[1]["packet_coordinate_bases"] == (
-        (0, 0),
-        (64, 0),
-        (0, 32),
-        (64, 32),
-    )
     (mma_attrs, ) = [converter_target_ir.attrs_dict(op) for op in output.target_program.ops if op.kind == "mma_scaled"]
-    assert (mma_attrs["m_tiles"], mma_attrs["n_tiles"], mma_attrs["k_tiles"]) == (8, 2, 2)
+    assert (mma_attrs["m_tiles"], mma_attrs["n_tiles"], mma_attrs["k_tiles"]) == (
+        8,
+        2,
+        2,
+    )
     assert mma_attrs["has_scales"]
     assert mma_attrs["kind"] == "mfma.scale.f32.16x16x128.f4.f4"
     assert (
@@ -16172,6 +18484,8 @@ def test_tlx_wave_converter_pipeline_lowers_scaled_mfma_32x32x64_local_loads(tmp
     %b_alloc = ttg.local_alloc : () -> !ttg.memdesc<128x128xi8, #shared_b, #smem, mutable>
     %lhs = ttg.local_load %a_alloc : !ttg.memdesc<128x128xi8, #shared_a, #smem, mutable> -> tensor<128x128xi8, #dot0>
     %rhs = ttg.local_load %b_alloc : !ttg.memdesc<128x128xi8, #shared_b, #smem, mutable> -> tensor<128x128xi8, #dot1>
+    ttg.local_store %lhs, %a_alloc : tensor<128x128xi8, #dot0> -> !ttg.memdesc<128x128xi8, #shared_a, #smem, mutable>
+    ttg.local_store %rhs, %b_alloc : tensor<128x128xi8, #dot1> -> !ttg.memdesc<128x128xi8, #shared_b, #smem, mutable>
     tt.return
   }
 """
@@ -16183,8 +18497,12 @@ def test_tlx_wave_converter_pipeline_lowers_scaled_mfma_32x32x64_local_loads(tmp
     assert [attrs["component_count"] for attrs in local_load_attrs] == [8, 4]
     assert [attrs["packet_count"] for attrs in local_load_attrs] == [8, 4]
     assert [attrs["packet_width"] for attrs in local_load_attrs] == [16, 16]
-    assert [attrs["coordinate_shape"] for attrs in local_load_attrs] == [(128, 128), (128, 128)]
-    assert all(len(attrs["packet_coordinate_bases"]) == attrs["packet_count"] for attrs in local_load_attrs)
+    assert all(attrs["bit_offset_relation"] for attrs in local_load_attrs)
+    assert all("bit_offset_relations" not in attrs for attrs in local_load_attrs)
+    _assert_local_access_relations_match_own_shape(
+        output,
+        [op for op in output.target_program.ops if op.kind in {"local_load", "local_store"}],
+    )
     assert all("load_mode" not in attrs for attrs in local_load_attrs)
     assert all("mma_access_lane_layout" not in attrs for attrs in local_load_attrs)
     machine = _run_waveamd_to_machine(output.emitted_module.text)
@@ -16192,13 +18510,50 @@ def test_tlx_wave_converter_pipeline_lowers_scaled_mfma_32x32x64_local_loads(tmp
     del ctx
 
 
-def test_tlx_wave_converter_lowers_scaled_mfma_32x32x64():
+def test_tlx_wave_converter_lowers_scaled_mfma_32x32x64(tmp_path):
     mfma_properties = {
         "version": 4,
         "warps_per_cta": (2, 4),
         "instr_shape": (32, 32, 64),
         "is_transposed": True,
     }
+    lhs_properties = {
+        "k_width": 16,
+        "op_idx": 0,
+        "parent_kind": "amd_mfma",
+        "parent_properties": mfma_properties,
+    }
+    rhs_properties = {
+        "k_width": 16,
+        "op_idx": 1,
+        "parent_kind": "amd_mfma",
+        "parent_properties": mfma_properties,
+    }
+    preamble = """
+#mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [2, 4], instrShape = [32, 32, 64], isTransposed = true}>
+#dot0 = #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 16}>
+#dot1 = #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 16}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#smem = #ttg.shared_memory
+"""
+    local_func = """
+  tt.func public @converter_scaled_mfma_layouts() attributes {noinline = false} {
+    %a_alloc = ttg.local_alloc : () -> !ttg.memdesc<128x128xi8, #shared, #smem, mutable>
+    %b_alloc = ttg.local_alloc : () -> !ttg.memdesc<128x128xi8, #shared, #smem, mutable>
+    %lhs = ttg.local_load %a_alloc : !ttg.memdesc<128x128xi8, #shared, #smem, mutable> -> tensor<128x128xi8, #dot0>
+    %rhs = ttg.local_load %b_alloc : !ttg.memdesc<128x128xi8, #shared, #smem, mutable> -> tensor<128x128xi8, #dot1>
+    %acc = arith.constant dense<0.000000e+00> : tensor<128x128xf32, #mma>
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=8, preamble=preamble)
+    source = converter_source_import.import_source_program(mod)
+    canonical_types = converter_types.convert_source_program(source)
+    load_ops = [op for op in source.ops if op.name == "ttg.local_load"]
+    acc_op = next(op for op in source.ops if op.name == "arith.constant")
+    canonical_layouts = [
+        canonical_types.layouts[canonical_types.values[op.results[0]].layout_map_id] for op in (*load_ops, acc_op)
+    ]
     layouts = (
         _fake_layout(
             0,
@@ -16207,12 +18562,10 @@ def test_tlx_wave_converter_lowers_scaled_mfma_32x32x64():
             shape=(128, 128),
             element_type="i8",
             component_count=8,
-            properties={
-                "k_width": 16,
-                "op_idx": 0,
-                "parent_kind": "amd_mfma",
-                "parent_properties": mfma_properties,
-            },
+            properties=lhs_properties,
+            linear_layout=canonical_layouts[0].linear_layout,
+            component_grid=canonical_layouts[0].component_grid,
+            component_relation=canonical_layouts[0].component_relation,
         ),
         _fake_layout(
             1,
@@ -16221,12 +18574,10 @@ def test_tlx_wave_converter_lowers_scaled_mfma_32x32x64():
             shape=(128, 128),
             element_type="i8",
             component_count=4,
-            properties={
-                "k_width": 16,
-                "op_idx": 1,
-                "parent_kind": "amd_mfma",
-                "parent_properties": mfma_properties,
-            },
+            properties=rhs_properties,
+            linear_layout=canonical_layouts[1].linear_layout,
+            component_grid=canonical_layouts[1].component_grid,
+            component_relation=canonical_layouts[1].component_relation,
         ),
         _fake_layout(
             2,
@@ -16236,6 +18587,9 @@ def test_tlx_wave_converter_lowers_scaled_mfma_32x32x64():
             element_type="f32",
             component_count=2,
             properties=mfma_properties,
+            linear_layout=canonical_layouts[2].linear_layout,
+            component_grid=canonical_layouts[2].component_grid,
+            component_relation=canonical_layouts[2].component_relation,
         ),
         _fake_layout(3, 3, kind="linear", shape=(128, 8), element_type="i8", component_count=8),
         _fake_layout(4, 4, kind="linear", shape=(128, 8), element_type="i8", component_count=4),
@@ -16320,9 +18674,10 @@ def test_tlx_wave_converter_lowers_scaled_mfma_32x32x64():
     assert mma_attrs["kind"] == "mfma.scale.f32.32x32x64.f4.f4"
     assert mma_attrs["lhs_registers"] == mma_attrs["rhs_registers"] == 4
     assert mma_attrs["acc_registers"] == 16
+    del ctx
 
 
-def test_tlx_wave_converter_pipeline_lowers_scaled_mfma_i8_scale_transpose_loads(tmp_path):
+def test_tlx_wave_converter_pipeline_lowers_scaled_mfma_i8_scale_transpose_loads(tmp_path, ):
     preamble = """
 #mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [2, 2], instrShape = [16, 16, 128], isTransposed = true}>
   #dot0 = #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 16}>
@@ -16381,8 +18736,12 @@ def test_tlx_wave_converter_pipeline_lowers_scaled_mfma_i8_scale_transpose_loads
     assert [attrs["component_count"] for attrs in scale_load_attrs] == [16, 8]
     assert [attrs["packet_count"] for attrs in scale_load_attrs] == [1, 1]
     assert [attrs["packet_width"] for attrs in scale_load_attrs] == [16, 8]
-    assert all(attrs["shared_physical_offset_plan"] == "swizzled_xor" for attrs in scale_load_attrs)
-    assert all(len(attrs["packet_coordinate_bases"]) == 1 for attrs in scale_load_attrs)
+    assert all(attrs["bit_offset_relation"] for attrs in scale_load_attrs)
+    assert all("bit_offset_relations" not in attrs for attrs in scale_load_attrs)
+    _assert_local_access_relations_match_own_shape(
+        output,
+        [op for op in output.target_program.ops if op.kind == "local_load"],
+    )
     assert all("result_value_mode" not in attrs for attrs in scale_load_attrs)
     assert all("result_packet_width" not in attrs for attrs in scale_load_attrs)
     assert all("semantic_role" not in attrs for attrs in scale_load_attrs)
@@ -16499,7 +18858,12 @@ def test_tlx_wave_converter_pipeline_lowers_transposed_scaled_mfma_i8_load(tmp_p
     assert [attrs["packet_count"] for attrs in local_load_attrs] == [16, 8]
     assert [attrs["packet_width"] for attrs in local_load_attrs] == [16, 16]
     assert local_load_attrs[1]["element_type"] == "i8"
-    assert local_load_attrs[1]["shared_physical_offset_plan"] == "padded_linear"
+    assert local_load_attrs[1]["bit_offset_relation"]
+    assert "bit_offset_relations" not in local_load_attrs[1]
+    _assert_local_access_relations_match_own_shape(
+        output,
+        [op for op in output.target_program.ops if op.kind == "local_load"],
+    )
     assert all("load_mode" not in attrs for attrs in local_load_attrs)
     assert all("mma_access_lane_layout" not in attrs for attrs in local_load_attrs)
     wave = output.emitted_module.text
@@ -16684,10 +19048,12 @@ def test_tlx_wave_converter_pipeline_lowers_mfma32_transpose_load(tmp_path):
   tt.func public @converter_mfma32_transpose_load() attributes {noinline = false} {
     %a_alloc = ttg.local_alloc : () -> !ttg.memdesc<32x32xf16, #shared, #smem, mutable>
     %b_alloc = ttg.local_alloc : () -> !ttg.memdesc<32x32xf16, #shared, #smem, mutable>
+    %out_alloc = ttg.local_alloc : () -> !ttg.memdesc<32x32xf32, #shared, #smem, mutable>
     %lhs = ttg.local_load %a_alloc : !ttg.memdesc<32x32xf16, #shared, #smem, mutable> -> tensor<32x32xf16, #dot0>
     %rhs = ttg.local_load %b_alloc : !ttg.memdesc<32x32xf16, #shared, #smem, mutable> -> tensor<32x32xf16, #dot1>
     %acc = arith.constant dense<0.000000e+00> : tensor<32x32xf32, #mma>
     %dot = tt.dot %lhs, %rhs, %acc : tensor<32x32xf16, #dot0> * tensor<32x32xf16, #dot1> -> tensor<32x32xf32, #mma>
+    ttg.local_store %dot, %out_alloc : tensor<32x32xf32, #mma> -> !ttg.memdesc<32x32xf32, #shared, #smem, mutable>
     tt.return
   }
 """
@@ -16698,15 +19064,12 @@ def test_tlx_wave_converter_pipeline_lowers_mfma32_transpose_load(tmp_path):
     assert [attrs["packet_count"]
             for attrs in local_load_attrs] == [attrs["component_count"] for attrs in local_load_attrs]
     assert all(attrs["packet_width"] == 8 for attrs in local_load_attrs)
-    assert [attrs["shared_physical_offset_plan"] for attrs in local_load_attrs] == [
-        "swizzled_xor",
-        "swizzled_xor",
-    ]
-    assert all(attrs["shared_physical_swizzled_vec"] == 8 for attrs in local_load_attrs)
-    assert [attrs["slot_coordinate_coefficients"] for attrs in local_load_attrs] == [
-        ((0, 1), (0, 2), (0, 8)),
-        ((1, 0), (2, 0), (8, 0)),
-    ]
+    assert all(attrs["bit_offset_relation"] for attrs in local_load_attrs)
+    assert all("bit_offset_relations" not in attrs for attrs in local_load_attrs)
+    _assert_local_access_relations_match_own_shape(
+        output,
+        [op for op in output.target_program.ops if op.kind in {"local_load", "local_store"}],
+    )
     assert all("shared_layout_kind" not in attrs for attrs in local_load_attrs)
     assert [op.kind for op in output.target_program.ops].count("layout_convert") == 0
     wave = output.emitted_module.text
@@ -16749,9 +19112,13 @@ def test_tlx_wave_converter_uses_physical_minor_k_order_for_swizzled_mfma_b_load
     output = converter_pipeline.convert_ttgir_to_wave(mod)
 
     (attrs, ) = _packetized_local_load_attrs(output)
-    assert attrs["shared_physical_order"] == (0, 1)
     assert attrs["packet_width"] == 8
-    assert len(attrs["packet_coordinate_bases"]) == attrs["packet_count"]
+    assert attrs["bit_offset_relation"]
+    assert "bit_offset_relations" not in attrs
+    _assert_local_access_relations_match_own_shape(
+        output,
+        [op for op in output.target_program.ops if op.kind == "local_load"],
+    )
     assert "load_mode" not in attrs
     assert "mma_access_lane_layout" not in attrs
     assert f"vector<8x{element_type}>" in output.emitted_module.text
@@ -16782,30 +19149,13 @@ def test_tlx_wave_converter_records_b16_transpose_chunk_deltas(tmp_path):
     assert local_load_attrs[0]["packet_count"] == local_load_attrs[0]["component_count"]
     assert local_load_attrs[0]["packet_width"] == 8
     assert "load_mode" not in local_load_attrs[0]
-    assert local_load_attrs[0]["shared_physical_offset_plan"] == "padded_linear"
-    assert local_load_attrs[0]["shared_physical_intervals"] == (4, )
-    assert local_load_attrs[0]["shared_physical_paddings"] == (16, )
-    assert local_load_attrs[0]["shared_physical_linear_component_bases"] == (
-        (0, 1),
-        (0, 2),
-        (0, 4),
-        (0, 8),
-        (0, 16),
-        (0, 32),
-        (0, 64),
-        (1, 0),
-        (2, 0),
-        (4, 0),
-        (8, 0),
-        (16, 0),
-        (32, 0),
+    assert local_load_attrs[0]["bit_offset_relation"]
+    assert "bit_offset_relations" not in local_load_attrs[0]
+    _assert_local_access_relations_match_own_shape(
+        output,
+        [op for op in output.target_program.ops if op.kind in {"local_load", "local_store"}],
     )
     assert "shared_layout_kind" not in local_load_attrs[0]
-    assert local_load_attrs[0]["slot_coordinate_coefficients"] == (
-        (1, 0),
-        (2, 0),
-        (8, 0),
-    )
     wave = output.emitted_module.text
     assert wave.count("wave.gather") == 8
     assert "waveamd.transpose_load" not in wave
@@ -17011,6 +19361,7 @@ def _convert_ttgir_to_wave_keep_dead(
         token_program,
     )
     target_program = converter_barrier_order.thread_barrier_issue_order(target_program)
+    target_program = converter_value_relations.attach_symbolic_memory_relations(target_program)
     if verify:
         converter_verifier.verify_target_program(
             target_program,
@@ -17199,11 +19550,14 @@ def _run_wave_lower_symbolic_memory(wave_artifact):
 
 def _assert_mechanical_symbolic_copy(attrs, *, masked=None):
     assert attrs["mode"] == "symbolic_copy"
-    assert attrs["destination_offset_mode"] == "layout_coordinates"
     assert attrs["component_count"] > 0
-    assert attrs["destination_coordinate_shape"]
-    assert len(attrs["destination_component_coordinate_bases"]) == attrs["component_count"]
+    relation = attrs["destination_bit_offset_relation"]
+    assert relation and all(type(byte) is int and 0 <= byte <= 255 for byte in relation)
     for policy_attr in (
+            "destination_component_coordinate_bases",
+            "destination_coordinate_shape",
+            "destination_offset_mode",
+            "destination_workitem_coordinate_coefficients",
             "packet_bytes",
             "packet_elements",
             "mask_alignment",
@@ -17218,57 +19572,6 @@ def _assert_mechanical_symbolic_copy(attrs, *, masked=None):
     if masked is not None:
         assert attrs["has_mask"] is masked
         assert attrs["mask_mode"] == ("exec_where" if masked else "none")
-
-
-def _assert_runtime_contiguity_identity_chain(wave_artifact, *, minimum=1):
-    value = r"%[A-Za-z0-9_.$-]+"
-    pattern = re.compile(rf"(?m)^\s*(?P<delta>{value}) = wave\.binary subi "
-                         rf"(?P<current>{value}), (?P<previous>{value})[^\n]*\n"
-                         rf"\s*(?P<unit>{value}) = wave\.assume (?P=delta) as \"x\" "
-                         r"\[#wave\.pred<\"-1 \+ x >= 0\">, #wave\.pred<\"-1 \+ x <= 0\">\][^\n]*\n"
-                         rf"\s*(?P<rebuilt>{value}) = wave\.binary addi (?P=previous), (?P=unit) "
-                         r"overflow<nsw>")
-    matches = tuple(pattern.finditer(wave_artifact))
-    assert len(matches) >= minimum
-    assert all(match.group("current") != match.group("previous") for match in matches)
-    return matches
-
-
-def _assert_runtime_contiguity_scoped_by_where(wave_artifact, *, minimum=1):
-    matches = _assert_runtime_contiguity_identity_chain(
-        wave_artifact,
-        minimum=minimum,
-    )
-    for match in matches:
-        prefix = wave_artifact[:match.start()]
-        assert prefix.rfind("wave.where ") > prefix.rfind("} : !wave.mask")
-    return matches
-
-
-def _assert_masked_dma_packet_bindings_follow_ranges(
-    wave_artifact,
-    selected_ranges,
-):
-    bounded = tuple(match.group("bounded") for match in selected_ranges)
-    matches = _assert_runtime_contiguity_scoped_by_where(wave_artifact)
-    relevant = tuple(match for match in matches if match.group("current") in bounded)
-    assert relevant
-
-    known = set(bounded)
-    rebuilt_by_current = {}
-    for match in relevant:
-        assert match.group("previous") in known
-        rebuilt_by_current[match.group("current")] = match.group("rebuilt")
-        known.add(match.group("rebuilt"))
-
-    (gather_line, ) = [line for line in wave_artifact.splitlines() if "wave.gather" in line]
-    packet_bindings = re.search(
-        r"packet_bindings \[[^]]*\]\((?P<operands>[^)]*)\)",
-        gather_line,
-    )
-    assert packet_bindings is not None
-    packet_operands = tuple(re.findall(r"%[A-Za-z0-9_.$-]+", packet_bindings.group("operands")))
-    assert packet_operands == tuple(rebuilt_by_current.get(value, value) for value in bounded)
 
 
 def _run_wave_compile_kernels(wave_artifact):
