@@ -142,7 +142,6 @@ def _tl_dot_2cta_persistent_meta_ws_kernel(
             NUM_SMS,
             warp_specialize=True,
             data_partition_factor=DATA_PARTITION_FACTOR,
-            smem_alloc_algo=1,
     ):
         pid_m = tile_id % grid_m
         pid_n = tile_id // grid_m
@@ -203,7 +202,6 @@ def test_tl_dot_2cta_persistent_meta_ws(DATA_PARTITION_FACTOR, m, device):
 
     with triton.knobs.nvidia.scope():
         triton.knobs.nvidia.use_meta_ws = True
-        triton.knobs.nvidia.use_meta_partition = True
 
         kernel = _tl_dot_2cta_persistent_meta_ws_kernel[(grid_size, )](
             a_desc,
