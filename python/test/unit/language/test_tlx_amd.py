@@ -2893,6 +2893,98 @@ def test_a4w4_inter_wave_skinny_correctness_gfx950(device):
     torch.testing.assert_close(actual, expected, atol=0.1, rtol=0.0)
 
 
+# ---------------------------------------------------------------------------
+# Test: tlx.assume_uniform marks a scalar wave-uniform for the AMD backend.
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _assume_uniform_ptr_kernel(ptr_array, out_ptr, BLOCK: tl.constexpr):
+    # A pointer loaded from memory is not provably uniform, so the backend would
+    # otherwise waterfall every buffer access built on it.
+    base = tl.load(ptr_array).to(tl.pointer_type(tl.float32))
+    base = tlx.assume_uniform(base)
+    offs = tl.arange(0, BLOCK).to(tl.int32)
+    tlx.buffer_store(tlx.buffer_load(base, offs), out_ptr, offs)
+
+
+@triton.jit
+def _assume_uniform_ptr_kernel_no_hint(ptr_array, out_ptr, BLOCK: tl.constexpr):
+    base = tl.load(ptr_array).to(tl.pointer_type(tl.float32))
+    offs = tl.arange(0, BLOCK).to(tl.int32)
+    tlx.buffer_store(tlx.buffer_load(base, offs), out_ptr, offs)
+
+
+@triton.jit
+def _assume_uniform_scalar_kernel(in_ptr, out_ptr, BLOCK: tl.constexpr):
+    v = tlx.assume_uniform(tl.load(in_ptr))
+    offs = tl.arange(0, BLOCK)
+    tl.store(out_ptr + offs, tl.zeros((BLOCK, ), tl.float32) + v.to(tl.float32))
+
+
+@pytest.mark.skipif(not is_hip(), reason="Requires HIP runtime")
+def test_assume_uniform_compiles_gfx950(device):
+    """assume_uniform on a loaded pointer produces amdg.assume_uniform in TTIR/TTGIR."""
+    compiled = compile_for_gfx950(
+        _assume_uniform_ptr_kernel,
+        signature={"ptr_array": "*i64", "out_ptr": "*fp32"},
+        constexprs={"BLOCK": 64},
+    )
+    assert "amdg.assume_uniform" in compiled.asm["ttir"]
+    assert "amdg.assume_uniform" in compiled.asm["ttgir"]
+    assert "amdgcn" in compiled.asm
+    assert len(compiled.asm["amdgcn"]) > 0
+
+
+@pytest.mark.skipif(not is_hip(), reason="Requires HIP runtime")
+def test_assume_uniform_emits_readfirstlane_gfx950(device):
+    """assume_uniform lowers to readfirstlane beyond what the backend emits anyway.
+
+    The buffer resource descriptor already forces one readfirstlane, so the count
+    is compared against the same kernel without the hint rather than asserted
+    absolutely.
+    """
+    signature = {"ptr_array": "*i64", "out_ptr": "*fp32"}
+    with_hint = compile_for_gfx950(_assume_uniform_ptr_kernel, signature, {"BLOCK": 64})
+    without_hint = compile_for_gfx950(_assume_uniform_ptr_kernel_no_hint, signature, {"BLOCK": 64})
+    assert with_hint.asm["llir"].count("readfirstlane") > without_hint.asm["llir"].count("readfirstlane")
+
+
+@pytest.mark.skipif(not is_hip(), reason="Requires HIP runtime")
+@pytest.mark.parametrize("dtype", ["i16", "i32", "i64", "fp16", "bf16", "fp32"])
+def test_assume_uniform_scalar_types_compiles_gfx950(device, dtype):
+    """assume_uniform accepts every 16/32/64-bit scalar type."""
+    compiled = compile_for_gfx950(
+        _assume_uniform_scalar_kernel,
+        signature={"in_ptr": f"*{dtype}", "out_ptr": "*fp32"},
+        constexprs={"BLOCK": 64},
+    )
+    assert "amdg.assume_uniform" in compiled.asm["ttgir"]
+    assert len(compiled.asm["amdgcn"]) > 0
+
+
+@pytest.mark.skipif(not is_hip(), reason="Requires HIP runtime")
+def test_assume_uniform_rejects_narrow_type_gfx950(device):
+    """readfirstlane has no sub-16-bit form, so narrower scalars are rejected."""
+    with pytest.raises(CompilationError, match="16/32/64-bit"):
+        compile_for_gfx950(
+            _assume_uniform_scalar_kernel,
+            signature={"in_ptr": "*i8", "out_ptr": "*fp32"},
+            constexprs={"BLOCK": 64},
+        )
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_assume_uniform_correctness_gfx950(device):
+    """assume_uniform returns its argument unchanged."""
+    size = 64
+    x = torch.rand(size, dtype=torch.float32, device=device)
+    out = torch.empty_like(x)
+    ptr_array = torch.tensor([x.data_ptr()], dtype=torch.int64, device=device)
+    _assume_uniform_ptr_kernel[(1, )](ptr_array, out, BLOCK=size)
+    torch.testing.assert_close(out, x)
+
+
 @triton.jit
 def _amd_sched_barrier_kernel(x_ptr, y_ptr, BLOCK: tl.constexpr):
     offsets = tl.arange(0, BLOCK)
