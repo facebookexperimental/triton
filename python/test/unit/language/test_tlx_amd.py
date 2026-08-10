@@ -25,6 +25,7 @@ from triton.compiler.compiler import ASTSource, compile as triton_compile
 from triton.compiler.errors import CompilationError
 from triton.backends.amd import compiler as amd_compiler
 from triton.backends.compiler import GPUTarget
+from triton.runtime.jit import MockTensor
 from triton.language.extra.tlx.tutorials.amd_tdm_gemm_pipelined import (
     matmul_tdm_pipelined_kernel as _amd_tdm_gemm_kernel, )
 from triton.language.extra.tlx.tutorials.amd_mxfp_gemm_tdm_pipelined import (
@@ -36,7 +37,12 @@ from triton.language.extra.tlx.tutorials.gfx9_gemm.intra_wave.a4w4.bench import 
     torch_reference as _a4w4_reference,
 )
 from triton.language.extra.tlx.tutorials.gfx9_gemm.inter_wave.a4w4.matmul_kernel import (
-    matmul as _a4w4_inter_wave_matmul, )
+    BLOCK_K as _A4W4_INTER_WAVE_BLOCK_K,
+    BLOCK_M as _A4W4_INTER_WAVE_BLOCK_M,
+    BLOCK_N as _A4W4_INTER_WAVE_BLOCK_N,
+    _a4w4_8wave_kernel as _a4w4_inter_wave_256tile_kernel,
+    matmul as _a4w4_inter_wave_matmul,
+)
 
 # Skip the entire module if no HIP runtime is available.
 pytestmark = pytest.mark.skipif(not is_hip(), reason="Requires HIP runtime")
@@ -2856,6 +2862,114 @@ def test_a4w4_shape_stride_layouts_compile_gfx950(device, tmp_path):
     assert amdgcn.count("ds_write") == 44
     assert amdgcn.count("ds_read") == 176
     assert "buffer_store_dwordx4" in amdgcn
+
+
+def test_a4w4_inter_wave_256tile_codegen_gfx950(device, fresh_triton_cache, monkeypatch):
+    """Freeze the MFMA/LDS/scheduling contract of the production 8-wave path."""
+    m = n = 768
+    k = 1536
+    grid_mn = triton.cdiv(m, _A4W4_INTER_WAVE_BLOCK_M) * triton.cdiv(n, _A4W4_INTER_WAVE_BLOCK_N)
+    a = MockTensor(torch.uint8, (m, k // 2))
+    b = MockTensor(torch.uint8, (n, k // 2))
+    c = MockTensor(torch.bfloat16, (m, n))
+    a_scales = MockTensor(torch.uint8, (m, k // 32))
+    b_scales = MockTensor(torch.uint8, (n, k // 32))
+
+    monkeypatch.setenv("TRITON_DISABLE_POST_MISCHED", "1")
+    with knobs.runtime.scope():
+        knobs.runtime.override_arch = "gfx950"
+        compiled = _a4w4_inter_wave_256tile_kernel.warmup(
+            a,
+            b,
+            c,
+            c,
+            a_scales,
+            b_scales,
+            m,
+            n,
+            k,
+            k // 2,
+            1,
+            k // 2,
+            1,
+            n,
+            1,
+            1,
+            m,
+            1,
+            n,
+            BLOCK_M=_A4W4_INTER_WAVE_BLOCK_M,
+            BLOCK_N=_A4W4_INTER_WAVE_BLOCK_N,
+            BLOCK_K=_A4W4_INTER_WAVE_BLOCK_K,
+            GROUP_SIZE_M=4,
+            NUM_XCDS=8,
+            GRID_MN=grid_mn,
+            SPLIT_K=1,
+            grid=(grid_mn, ),
+            num_warps=8,
+            num_stages=1,
+            matrix_instr_nonkdim=16,
+            llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"), ),
+        )
+
+    ttgir = compiled.asm["ttgir"]
+    amdgcn = compiled.asm["amdgcn"]
+
+    # The five layouts pinned by the inter-wave kernel resolve to the scale-A,
+    # combined-scale-B, scale-B, accumulator, and post-narrow bf16 store encodings.
+    pinned_linear_layouts = (
+        "register = [[0, 4], [32, 0], [64, 0]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [0, 1], [0, 2]], warp = [[0, 0], [0, 0], [16, 0]]",
+        "register = [[0, 4], [64, 0], [128, 0]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [0, 1], [0, 2]], warp = [[16, 0], [32, 0], [0, 0]]",
+        "register = [[0, 4], [64, 0]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [0, 1], [0, 2]], warp = [[16, 0], [32, 0], [0, 0]]",
+        "register = [[0, 1], [0, 2], [0, 64], [32, 0], [64, 0]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [0, 4], [0, 8]], warp = [[0, 16], [0, 32], [16, 0]]",
+    )
+    pinned_aliases = []
+    for layout in pinned_linear_layouts:
+        match = re.search(rf"(#\w+) = #ttg.linear<\{{{re.escape(layout)}", ttgir)
+        assert match is not None
+        pinned_aliases.append(match.group(1))
+    scale_a, combined_scale_b, scale_b, store = pinned_aliases
+    assert f"tensor<128x8xi8, {scale_a}>" in ttgir
+    assert f"tensor<256x8xi8, {combined_scale_b}>" in ttgir
+    assert f"tensor<128x8xi8, {scale_b}>" in ttgir
+    assert re.search(
+        rf"arith.truncf .* : tensor<128x128xf32, {store}> to tensor<128x128xbf16, {store}",
+        ttgir,
+    )
+    assert (
+        "#ttg.amd_mfma<{version = 4, warpsPerCTA = [2, 4], instrShape = [16, 16, 128], isTransposed = true}>"
+        in ttgir)
+    assert "#tlx.user_layout" not in ttgir
+    assert "#tlx.no_verify_layout" not in ttgir
+    assert ttgir.count("#ttg.padded_shared<[1024:+32]") == 2
+    operand_shared = re.search(r"(#\w+) = #ttg.padded_shared<\[1024:\+32\]", ttgir)
+    assert operand_shared is not None
+    operand_alloc = rf"ttg.local_alloc : \(\) -> !ttg.memdesc<2x128x128xi8, {operand_shared.group(1)}, #smem"
+    assert len(re.findall(operand_alloc, ttgir)) == 4
+    assert ttgir.count('triton.warp_pipeline.stage = "mfma"') == 8
+    assert ttgir.count('triton.warp_pipeline.stage = "mem"') == 8
+    assert ttgir.count("rocdl.sched.barrier 0") == 8
+    assert ttgir.count("tt.dot_scaled") == 16
+    assert ttgir.count("amdg.buffer_load_to_local") == 28
+
+    assert len(re.findall(r"^\s*v_mfma_scale_f32_16x16x128_f8f6f4\b", amdgcn, re.MULTILINE)) == 256
+    assert len(re.findall(r"^\s*buffer_load_[^\n]*\blds\s*$", amdgcn, re.MULTILINE)) == 44
+    assert len(re.findall(r"^\s*ds_read_b64_tr_b8\b", amdgcn, re.MULTILINE)) == 12
+    assert len(re.findall(r"^\s*ds_read_b128\b", amdgcn, re.MULTILINE)) == 112
+    assert len(re.findall(r"^\s*ds_write_b128\b", amdgcn, re.MULTILINE)) == 16
+    assert len(re.findall(r"^\s*ds_read", amdgcn, re.MULTILINE)) == 124
+    assert len(re.findall(r"^\s*ds_write", amdgcn, re.MULTILINE)) == 16
+    assert "ds_read_u8" not in amdgcn
+    # These are deliberate static goldens for the grid-9, K=1536 specialization.
+    assert len(re.findall(r"^\s*s_barrier\s*$", amdgcn, re.MULTILINE)) == 41
+    assert len(re.findall(r"^\s*s_waitcnt\b", amdgcn, re.MULTILINE)) == 51
+    assert compiled.metadata.shared == 143232
+    assert compiled.metadata.global_scratch_size == 0
+    assert compiled.metadata.TRITON_DISABLE_POST_MISCHED == "true"
+    assert ".private_segment_fixed_size: 0" in amdgcn
+    assert ".sgpr_spill_count: 0" in amdgcn
+    assert ".vgpr_spill_count: 0" in amdgcn
+    assert ".agpr_count:     0" in amdgcn
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
