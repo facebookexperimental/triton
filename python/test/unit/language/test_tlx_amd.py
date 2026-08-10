@@ -227,6 +227,37 @@ def test_buffer_load_contiguity_vectorizes_gfx950():
 
 
 @triton.jit
+def _buffer_load_to_local_contiguity_kernel(x_ptr):
+    load_layout: tl.constexpr = tlx.layout(
+        shape=((2, 2, 2, 2, 2, 2, 2, 2, 2), (2, 2)),
+        stride=((32, 64, 128, 256, 512, 1, 0, 2, 4), (8, 16)),
+    )
+    shared_layout: tl.constexpr = tlx.swizzled_layout(0, 0, 0, order=[0, 1])
+    rows = tl.arange(0, 128)[:, None]
+    groups = tl.arange(0, 8)[None, :]
+    # Preserve four-byte chunks but make ordinary axis analysis lose the
+    # adjacency proof, matching the MXFP scale address pre-swizzle.
+    offsets = (rows ^ ((groups & 4) << 2)) + groups * 128
+    offsets = tlx.require_layout(offsets, load_layout, pin=False)
+    smem = tlx.local_alloc((128, 8), tlx.dtype_of(x_ptr), 1, layout=shared_layout)
+    tlx.buffer_load_to_local(smem[0], x_ptr, offsets, contiguity=4)
+
+
+def test_buffer_load_to_local_contiguity_vectorizes_gfx950():
+    src = ASTSource(
+        fn=_buffer_load_to_local_contiguity_kernel,
+        signature={"x_ptr": "*u8"},
+        constexprs={},
+    )
+    compiled = triton_compile(src, target=GFX950, options={"num_warps": 8})
+
+    ttgir = compiled.asm["ttgir"]
+    assert "amdg.buffer_load_to_local" in ttgir
+    assert "contiguity = 4" in ttgir
+    assert "buffer_load_dword" in compiled.asm["amdgcn"]
+
+
+@triton.jit
 def _buffer_atomic_contiguity_layout_anchor_kernel(x_ptr, atomic_ptr, y_ptr):
     contiguous_layout: tl.constexpr = tlx.layout(
         shape=((64, 4), (4, )),
@@ -2965,11 +2996,33 @@ def test_a4w4_inter_wave_256tile_codegen_gfx950(device, fresh_triton_cache, monk
     assert operand_shared is not None
     operand_alloc = rf"ttg.local_alloc : \(\) -> !ttg.memdesc<2x128x128xi8, {operand_shared.group(1)}, #smem"
     assert len(re.findall(operand_alloc, ttgir)) == 4
+    flat_scale_shared = re.search(
+        r"(#\w+) = #ttg.swizzled_shared<\{vec = 1, perPhase = 1, maxPhase = 1, order = \[0, 1\]\}>",
+        ttgir,
+    )
+    assert flat_scale_shared is not None
+    flat_scale_alias = flat_scale_shared.group(1)
+    assert len(re.findall(rf"ttg.local_alloc : \(\) -> !ttg.memdesc<2x128x8xi8, {flat_scale_alias}, #smem", ttgir)) == 2
+    assert len(re.findall(rf"ttg.local_alloc : \(\) -> !ttg.memdesc<2x256x8xi8, {flat_scale_alias}, #smem", ttgir)) == 1
+    a_scale_shared = re.search(
+        r"(#\w+) = #ttg.shared_linear<\{offset = \[\[1, 0\], \[2, 0\], \[4, 0\], \[8, 0\], \[16, 0\], "
+        r"\[32, 0\], \[64, 0\], \[0, 1\], \[0, 2\], \[16, 4\]\]\}, alignment = 16>",
+        ttgir,
+    )
+    b_scale_shared = re.search(
+        r"(#\w+) = #ttg.shared_linear<\{offset = \[\[1, 0\], \[2, 0\], \[4, 0\], \[8, 0\], \[16, 0\], "
+        r"\[32, 0\], \[64, 0\], \[128, 0\], \[16, 1\], \[0, 2\], \[32, 4\]\]\}, alignment = 16>",
+        ttgir,
+    )
+    assert a_scale_shared is not None and b_scale_shared is not None
+    assert len(re.findall(rf"ttg.memdesc_reinterpret .* -> !ttg.memdesc<128x8xi8, {a_scale_shared.group(1)}", ttgir)) == 4
+    assert len(re.findall(rf"ttg.memdesc_reinterpret .* -> !ttg.memdesc<256x8xi8, {b_scale_shared.group(1)}", ttgir)) == 2
     assert ttgir.count('triton.warp_pipeline.stage = "mfma"') == 8
     assert ttgir.count('triton.warp_pipeline.stage = "mem"') == 8
     assert ttgir.count("rocdl.sched.barrier 0") == 8
     assert ttgir.count("tt.dot_scaled") == 16
     assert ttgir.count("amdg.buffer_load_to_local") == 28
+    assert ttgir.count("contiguity = 4") == 12
 
     assert len(re.findall(r"^\s*v_mfma_scale_f32_16x16x128_f8f6f4\b", amdgcn, re.MULTILINE)) == 256
     assert len(re.findall(r"^\s*buffer_load_[^\n]*\blds\s*$", amdgcn, re.MULTILINE)) == 44
@@ -2979,17 +3032,21 @@ def test_a4w4_inter_wave_256tile_codegen_gfx950(device, fresh_triton_cache, monk
     assert len(re.findall(r"^\s*ds_read", amdgcn, re.MULTILINE)) == 124
     assert len(re.findall(r"^\s*ds_write", amdgcn, re.MULTILINE)) == 16
     assert "ds_read_u8" not in amdgcn
+    assert "ds_bpermute" not in amdgcn
+    assert "ds_permute" not in amdgcn
+    assert "v_mov_b32_dpp" not in amdgcn
+    assert "v_permlane" not in amdgcn
     # These are deliberate static goldens for the grid-9, K=1536 specialization.
     assert len(re.findall(r"^\s*s_barrier\s*$", amdgcn, re.MULTILINE)) == 41
-    assert len(re.findall(r"^\s*s_waitcnt\b", amdgcn, re.MULTILINE)) == 51
+    assert len(re.findall(r"^\s*s_waitcnt\b", amdgcn, re.MULTILINE)) == 52
     assert compiled.metadata.shared == 143232
     assert compiled.metadata.global_scratch_size == 0
     assert tuple(map(tuple, compiled.metadata.llvm_fn_attrs)) == _A4W4_8WAVE_LLVM_FN_ATTRS
     assert compiled.metadata.TRITON_DISABLE_POST_MISCHED == "false"
     assert '"amdgpu-post-sched-strategy"="nop"' in compiled.asm["llir"]
-    assert ".private_segment_fixed_size: 0" in amdgcn
+    assert ".private_segment_fixed_size: 8" in amdgcn
     assert ".sgpr_spill_count: 0" in amdgcn
-    assert ".vgpr_spill_count: 0" in amdgcn
+    assert ".vgpr_spill_count: 1" in amdgcn
     assert ".agpr_count:     0" in amdgcn
 
     unrelated = compile_for_gfx950(
@@ -3015,12 +3072,13 @@ def test_a4w4_inter_wave_256tile_single_trip_codegen_gfx950(device, fresh_triton
     assert len(re.findall(r"^\s*v_mfma_scale_f32_16x16x128_f8f6f4\b", amdgcn, re.MULTILINE)) == 256
     assert len(re.findall(r"^\s*buffer_load_[^\n]*\blds\s*$", amdgcn, re.MULTILINE)) == 44
     assert len(re.findall(r"^\s*s_barrier\s*$", amdgcn, re.MULTILINE)) == 41
-    assert len(re.findall(r"^\s*s_waitcnt\b", amdgcn, re.MULTILINE)) == 51
+    assert len(re.findall(r"^\s*s_waitcnt\b", amdgcn, re.MULTILINE)) == 52
     assert "s_trap" not in amdgcn
     assert compiled.metadata.shared == 143232
     assert compiled.metadata.global_scratch_size == 0
+    assert ".private_segment_fixed_size: 8" in amdgcn
     assert ".sgpr_spill_count: 0" in amdgcn
-    assert ".vgpr_spill_count: 0" in amdgcn
+    assert ".vgpr_spill_count: 1" in amdgcn
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
