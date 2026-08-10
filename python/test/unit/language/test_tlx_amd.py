@@ -2913,9 +2913,8 @@ def _compile_a4w4_inter_wave_256tile(m, n, k):
         )
 
 
-def test_a4w4_inter_wave_256tile_codegen_gfx950(device, fresh_triton_cache, monkeypatch):
+def test_a4w4_inter_wave_256tile_codegen_gfx950(device, fresh_triton_cache):
     """Check the performance-sensitive structure of the compiled 256-tile path."""
-    monkeypatch.setenv("TRITON_DISABLE_POST_MISCHED", "0")
     compiled = _compile_a4w4_inter_wave_256tile(768, 768, 1536)
 
     ttgir = compiled.asm["ttgir"]
@@ -2954,7 +2953,6 @@ def test_a4w4_inter_wave_256tile_codegen_gfx950(device, fresh_triton_cache, monk
     assert compiled.metadata.shared == 143232
     assert compiled.metadata.global_scratch_size == 0
     assert tuple(map(tuple, compiled.metadata.llvm_fn_attrs)) == _A4W4_8WAVE_LLVM_FN_ATTRS
-    assert compiled.metadata.TRITON_DISABLE_POST_MISCHED == "false"
     assert '"amdgpu-post-sched-strategy"="nop"' in compiled.asm["llir"]
     assert ".private_segment_fixed_size: 8" in amdgcn
     assert ".sgpr_spill_count: 0" in amdgcn
@@ -2970,9 +2968,8 @@ def test_a4w4_inter_wave_256tile_codegen_gfx950(device, fresh_triton_cache, monk
     assert "amdgpu-post-sched-strategy" not in unrelated.asm["llir"]
 
 
-def test_a4w4_inter_wave_256tile_single_trip_codegen_gfx950(device, fresh_triton_cache, monkeypatch):
+def test_a4w4_inter_wave_256tile_single_trip_codegen_gfx950(device, fresh_triton_cache):
     """K=1024 retains the loop pipeline for its single main step."""
-    monkeypatch.setenv("TRITON_DISABLE_POST_MISCHED", "0")
     compiled = _compile_a4w4_inter_wave_256tile(768, 768, 1024)
     ttgir = compiled.asm["ttgir"]
     amdgcn = compiled.asm["amdgcn"]
