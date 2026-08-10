@@ -124,6 +124,7 @@ def _pa_decode_partition_kernel(
     row_page = offs_n // PAGE_SIZE
     row_in_page = offs_n % PAGE_SIZE
     num_tiles = tl.cdiv(end_page - start_page, PAGES_PER_TILE)
+
     if num_tiles > 0:
         physical = tl.load(BlockTables + seq * stride_bt_s +
                            tl.where(row_page < end_page - start_page, start_page + row_page, end_page - 1) *
@@ -138,6 +139,10 @@ def _pa_decode_partition_kernel(
 
         for tidx in tl.range(0, num_tiles):
             slot = tidx % BUFFER_DEPTH
+            tlx.async_load_wait_group(0)
+            kt = tlx.local_load(tlx.local_trans(tlx.local_view(k_buf, slot)))
+            v = tlx.local_load(tlx.local_view(v_buf, slot))
+
             nxt = tidx + 1
             if nxt < num_tiles:
                 nslot = nxt % BUFFER_DEPTH
@@ -151,12 +156,6 @@ def _pa_decode_partition_kernel(
                     Vc + n_physical[:, None] * stride_vc_b + kv_head * stride_vc_h +
                     row_in_page[:, None] * stride_vc_p + offs_d[None, :] * stride_vc_d, tlx.local_view(v_buf, nslot))
                 tlx.async_load_commit_group([ntok_k, ntok_v])
-                tlx.async_load_wait_group(1)
-            else:
-                tlx.async_load_wait_group(0)
-
-            kt = tlx.local_load(tlx.local_trans(tlx.local_view(k_buf, slot)))
-            v = tlx.local_load(tlx.local_view(v_buf, slot))
 
             tile_page0 = start_page + tidx * PAGES_PER_TILE
             qk = tl.dot(q, kt)  # q pre-scaled -> qk already in log2 units
@@ -291,7 +290,6 @@ def get_num_splits(num_seqs, num_kv_heads, max_ctx_len=None, page_size=None, pag
         by_tail = max(1, num_tiles // 32)  # keep the serial tail <= ~32 tiles/split
         hi = max(1, (num_cu * 8) // progs)  # never exceed ~eight waves
         splits = max(splits, min(hi, by_tail))
-
     return max(1, min(cap, splits))
 
 
