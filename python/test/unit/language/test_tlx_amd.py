@@ -8,6 +8,7 @@ required for the compilation checks. Correctness checks (actual execution) run
 only when the corresponding hardware is available.
 """
 import importlib.util
+import os
 import re
 import sys
 from pathlib import Path
@@ -43,6 +44,7 @@ from triton.language.extra.tlx.tutorials.gfx9_gemm.inter_wave.a4w4.matmul_kernel
     MIN_K as _A4W4_INTER_WAVE_MIN_K,
     NUM_CU as _A4W4_INTER_WAVE_NUM_CU,
     _a4w4_8wave_kernel as _a4w4_inter_wave_256tile_kernel,
+    _A4W4_8WAVE_LLVM_FN_ATTRS,
     matmul as _a4w4_inter_wave_matmul,
 )
 
@@ -2866,6 +2868,18 @@ def test_a4w4_shape_stride_layouts_compile_gfx950(device, tmp_path):
     assert "buffer_store_dwordx4" in amdgcn
 
 
+def test_a4w4_inter_wave_import_does_not_set_post_misched(monkeypatch):
+    module_path = (Path(__file__).resolve().parents[4] / "third_party" / "tlx" / "tutorials" / "gfx9_gemm" /
+                   "inter_wave" / "a4w4" / "matmul_kernel.py")
+    spec = importlib.util.spec_from_file_location("_tlx_a4w4_inter_wave_no_global_post_misched", module_path)
+    module = importlib.util.module_from_spec(spec)
+    monkeypatch.delenv("TRITON_DISABLE_POST_MISCHED", raising=False)
+
+    spec.loader.exec_module(module)
+
+    assert "TRITON_DISABLE_POST_MISCHED" not in os.environ
+
+
 def _compile_a4w4_inter_wave_256tile(m, n, k):
     grid_mn = triton.cdiv(m, _A4W4_INTER_WAVE_BLOCK_M) * triton.cdiv(n, _A4W4_INTER_WAVE_BLOCK_N)
     a = MockTensor(torch.uint8, (m, k // 2))
@@ -2908,13 +2922,13 @@ def _compile_a4w4_inter_wave_256tile(m, n, k):
             num_warps=8,
             num_stages=1,
             matrix_instr_nonkdim=16,
-            llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"), ),
+            llvm_fn_attrs=_A4W4_8WAVE_LLVM_FN_ATTRS,
         )
 
 
 def test_a4w4_inter_wave_256tile_codegen_gfx950(device, fresh_triton_cache, monkeypatch):
     """Freeze the MFMA/LDS/scheduling contract of the production 8-wave path."""
-    monkeypatch.setenv("TRITON_DISABLE_POST_MISCHED", "1")
+    monkeypatch.setenv("TRITON_DISABLE_POST_MISCHED", "0")
     compiled = _compile_a4w4_inter_wave_256tile(768, 768, 1536)
 
     ttgir = compiled.asm["ttgir"]
@@ -2970,16 +2984,26 @@ def test_a4w4_inter_wave_256tile_codegen_gfx950(device, fresh_triton_cache, monk
     assert len(re.findall(r"^\s*s_waitcnt\b", amdgcn, re.MULTILINE)) == 51
     assert compiled.metadata.shared == 143232
     assert compiled.metadata.global_scratch_size == 0
-    assert compiled.metadata.TRITON_DISABLE_POST_MISCHED == "true"
+    assert tuple(map(tuple, compiled.metadata.llvm_fn_attrs)) == _A4W4_8WAVE_LLVM_FN_ATTRS
+    assert compiled.metadata.TRITON_DISABLE_POST_MISCHED == "false"
+    assert '"amdgpu-post-sched-strategy"="nop"' in compiled.asm["llir"]
     assert ".private_segment_fixed_size: 0" in amdgcn
     assert ".sgpr_spill_count: 0" in amdgcn
     assert ".vgpr_spill_count: 0" in amdgcn
     assert ".agpr_count:     0" in amdgcn
 
+    unrelated = compile_for_gfx950(
+        _amd_sched_barrier_kernel,
+        signature={"x_ptr": "*bf16", "y_ptr": "*bf16", "BLOCK": "constexpr"},
+        constexprs={"BLOCK": 64},
+    )
+    assert tuple(map(tuple, unrelated.metadata.llvm_fn_attrs)) == ()
+    assert "amdgpu-post-sched-strategy" not in unrelated.asm["llir"]
+
 
 def test_a4w4_inter_wave_256tile_single_trip_codegen_gfx950(device, fresh_triton_cache, monkeypatch):
     """K=1024 retains the loop pipeline for its single main step."""
-    monkeypatch.setenv("TRITON_DISABLE_POST_MISCHED", "1")
+    monkeypatch.setenv("TRITON_DISABLE_POST_MISCHED", "0")
     compiled = _compile_a4w4_inter_wave_256tile(768, 768, 1024)
     ttgir = compiled.asm["ttgir"]
     amdgcn = compiled.asm["amdgcn"]

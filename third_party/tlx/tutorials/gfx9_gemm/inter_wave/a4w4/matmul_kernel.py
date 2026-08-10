@@ -56,17 +56,11 @@ down is to take an operand out of LDS entirely -- which also means chunked local
 will not help here.
 """
 
-import os
-
 import torch
 import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
 from triton.language.extra.tlx.tutorials.gfx9_gemm.skinny.a4w4 import is_skinny, skinny_matmul
-
-# Keep the LLVM post-RA machine scheduler from re-ordering the
-# warp_pipeline_stage mem/MFMA interleave.
-os.environ.setdefault("TRITON_DISABLE_POST_MISCHED", "1")
 
 BLOCK_M = 256
 BLOCK_N = 256
@@ -74,6 +68,14 @@ BLOCK_K = 256
 NUM_WARPS = 8
 GROUP_SIZE_M = 4
 NUM_XCDS = 8
+
+# Keep the LLVM post-RA machine scheduler from reordering this kernel's manual
+# warp_pipeline_stage mem/MFMA interleave. The AMD function attribute selects
+# LLVM's no-op post scheduler for this function only.
+_A4W4_8WAVE_LLVM_FN_ATTRS = (
+    ("amdgpu-agpr-alloc", "0,0"),
+    ("amdgpu-post-sched-strategy", "nop"),
+)
 
 # The 2x-unrolled pipeline prefetches two K tiles and drains two in the
 # epilogue, so it requires at least four tiles. The loop trip count stays a
@@ -613,7 +615,7 @@ def _matmul_256tile(a, b, a_scales, b_scales, SPLIT_K=None):
         num_stages=1,
         matrix_instr_nonkdim=16,
         # Forbid AGPRs: f32 accumulators write VGPRs directly (packs tighter, no spills).
-        llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"), ),
+        llvm_fn_attrs=_A4W4_8WAVE_LLVM_FN_ATTRS,
     )
     if SPLIT_K > 1:
         big = (M * N) >= (2048 * 2048)
