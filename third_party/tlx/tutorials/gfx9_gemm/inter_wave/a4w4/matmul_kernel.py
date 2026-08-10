@@ -75,13 +75,12 @@ NUM_WARPS = 8
 GROUP_SIZE_M = 4
 NUM_XCDS = 8
 
-# The 2x-unrolled pipeline prefetches 2 K-tiles and drains 2 in the epilogue, so
-# the pipelined loop runs (K/BLOCK_K - 2)/2 trips. At exactly K == 4*BLOCK_K the
-# loop runs a SINGLE trip, which the inter-wave `tritonamdgpu-warp-pipeline`
-# transform mis-schedules on multi-tile grids (correct for grid_mn==1, races for
-# grid_mn>1). Require >= 2 loop trips (K >= 6*BLOCK_K) so the steady state is
-# always non-empty; every production a4w4 shape uses K >= 4096 anyway.
-MIN_K = 6 * BLOCK_K
+# The 2x-unrolled pipeline prefetches two K tiles and drains two in the
+# epilogue, so it requires at least four tiles. The loop trip count stays a
+# runtime scalar so the generic canonicalizer cannot flatten the one-trip
+# K=1024 form and inflate its live ranges; K and KS remain constexpr to preserve
+# the pinned operand layouts.
+MIN_K = 4 * BLOCK_K
 KERNEL_NAME = "a4w4_8wave"
 
 
@@ -96,6 +95,7 @@ def _a4w4_8wave_kernel(
     M,
     N,
     K: tl.constexpr,
+    K_TILES,
     stride_am,
     stride_ak,
     stride_bn,
@@ -274,8 +274,11 @@ def _a4w4_8wave_kernel(
     acc_tr = tl.zeros((HALF_M, HALF_N), dtype=tl.float32)
     acc_br = tl.zeros((HALF_M, HALF_N), dtype=tl.float32)
 
-    iter_max: tl.constexpr = KS // BLOCK_K
-    tl.assume(iter_max > 5)
+    # _matmul_256tile derives this trusted runtime value from the asserted KS.
+    # The assumption keeps range/liveness analysis as precise as the old
+    # constexpr bound while preserving the one-trip scf.for at K=1024.
+    iter_max = K_TILES
+    tl.assume(iter_max > 3)
 
     # ---- Prologue: prefetch K-steps 0,1 into buffers 0,1 (8 commits) ----
     tlx.buffer_load_to_local(smem_b_left[0], b_base, b_tile_offsets)
@@ -523,9 +526,8 @@ def _reduce_k_kernel(workspace_ptr, c_ptr, M, N, SPLIT_K: tl.constexpr, BLOCK_SI
 
 
 NUM_CU = 256  # gfx950 (CDNA4) compute units
-# Each split must be a whole number of BLOCK_K tiles and keep the pipelined loop
-# at >= 2 trips (KS >= 6*BLOCK_K == MIN_K; see the module comment on MIN_K).
-MIN_KTILES_PER_SPLIT = MIN_K // BLOCK_K  # == 6
+# Each split must contain the two-tile prologue plus one two-tile main step.
+MIN_KTILES_PER_SPLIT = MIN_K // BLOCK_K  # == 4
 
 
 def choose_split_k(M, N, K):
@@ -566,7 +568,8 @@ def _matmul_256tile(a, b, a_scales, b_scales, SPLIT_K=None):
 
     assert M % BLOCK_M == 0, "M must be a multiple of 256"
     assert N % BLOCK_N == 0, "N must be a multiple of 256"
-    assert K >= MIN_K and K % (2 * BLOCK_K) == 0, "K must be at least 1536 and a multiple of 512"
+    assert K >= MIN_K and K % (2 * BLOCK_K) == 0, \
+        f"K must be at least {MIN_K} and a multiple of {2 * BLOCK_K}"
 
     if SPLIT_K is None:
         SPLIT_K = choose_split_k(M, N, K)
@@ -588,6 +591,7 @@ def _matmul_256tile(a, b, a_scales, b_scales, SPLIT_K=None):
         M,
         N,
         K,
+        KS // BLOCK_K,
         a.stride(0),
         a.stride(1),
         b.stride(0),

@@ -40,6 +40,8 @@ from triton.language.extra.tlx.tutorials.gfx9_gemm.inter_wave.a4w4.matmul_kernel
     BLOCK_K as _A4W4_INTER_WAVE_BLOCK_K,
     BLOCK_M as _A4W4_INTER_WAVE_BLOCK_M,
     BLOCK_N as _A4W4_INTER_WAVE_BLOCK_N,
+    MIN_K as _A4W4_INTER_WAVE_MIN_K,
+    NUM_CU as _A4W4_INTER_WAVE_NUM_CU,
     _a4w4_8wave_kernel as _a4w4_inter_wave_256tile_kernel,
     matmul as _a4w4_inter_wave_matmul,
 )
@@ -2864,10 +2866,7 @@ def test_a4w4_shape_stride_layouts_compile_gfx950(device, tmp_path):
     assert "buffer_store_dwordx4" in amdgcn
 
 
-def test_a4w4_inter_wave_256tile_codegen_gfx950(device, fresh_triton_cache, monkeypatch):
-    """Freeze the MFMA/LDS/scheduling contract of the production 8-wave path."""
-    m = n = 768
-    k = 1536
+def _compile_a4w4_inter_wave_256tile(m, n, k):
     grid_mn = triton.cdiv(m, _A4W4_INTER_WAVE_BLOCK_M) * triton.cdiv(n, _A4W4_INTER_WAVE_BLOCK_N)
     a = MockTensor(torch.uint8, (m, k // 2))
     b = MockTensor(torch.uint8, (n, k // 2))
@@ -2875,10 +2874,9 @@ def test_a4w4_inter_wave_256tile_codegen_gfx950(device, fresh_triton_cache, monk
     a_scales = MockTensor(torch.uint8, (m, k // 32))
     b_scales = MockTensor(torch.uint8, (n, k // 32))
 
-    monkeypatch.setenv("TRITON_DISABLE_POST_MISCHED", "1")
     with knobs.runtime.scope():
         knobs.runtime.override_arch = "gfx950"
-        compiled = _a4w4_inter_wave_256tile_kernel.warmup(
+        return _a4w4_inter_wave_256tile_kernel.warmup(
             a,
             b,
             c,
@@ -2888,6 +2886,7 @@ def test_a4w4_inter_wave_256tile_codegen_gfx950(device, fresh_triton_cache, monk
             m,
             n,
             k,
+            k // _A4W4_INTER_WAVE_BLOCK_K,
             k // 2,
             1,
             k // 2,
@@ -2911,6 +2910,12 @@ def test_a4w4_inter_wave_256tile_codegen_gfx950(device, fresh_triton_cache, monk
             matrix_instr_nonkdim=16,
             llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"), ),
         )
+
+
+def test_a4w4_inter_wave_256tile_codegen_gfx950(device, fresh_triton_cache, monkeypatch):
+    """Freeze the MFMA/LDS/scheduling contract of the production 8-wave path."""
+    monkeypatch.setenv("TRITON_DISABLE_POST_MISCHED", "1")
+    compiled = _compile_a4w4_inter_wave_256tile(768, 768, 1536)
 
     ttgir = compiled.asm["ttgir"]
     amdgcn = compiled.asm["amdgcn"]
@@ -2972,6 +2977,28 @@ def test_a4w4_inter_wave_256tile_codegen_gfx950(device, fresh_triton_cache, monk
     assert ".agpr_count:     0" in amdgcn
 
 
+def test_a4w4_inter_wave_256tile_single_trip_codegen_gfx950(device, fresh_triton_cache, monkeypatch):
+    """K=1024 retains the loop pipeline for its single main step."""
+    monkeypatch.setenv("TRITON_DISABLE_POST_MISCHED", "1")
+    compiled = _compile_a4w4_inter_wave_256tile(768, 768, 1024)
+    ttgir = compiled.asm["ttgir"]
+    amdgcn = compiled.asm["amdgcn"]
+
+    assert ttgir.count('triton.warp_pipeline.stage = "mfma"') == 8
+    assert ttgir.count('triton.warp_pipeline.stage = "mem"') == 8
+    assert ttgir.count("scf.execute_region") == 16
+    assert ttgir.count("scf.for") == 1
+    assert len(re.findall(r"^\s*v_mfma_scale_f32_16x16x128_f8f6f4\b", amdgcn, re.MULTILINE)) == 256
+    assert len(re.findall(r"^\s*buffer_load_[^\n]*\blds\s*$", amdgcn, re.MULTILINE)) == 44
+    assert len(re.findall(r"^\s*s_barrier\s*$", amdgcn, re.MULTILINE)) == 41
+    assert len(re.findall(r"^\s*s_waitcnt\b", amdgcn, re.MULTILINE)) == 51
+    assert "s_trap" not in amdgcn
+    assert compiled.metadata.shared == 143232
+    assert compiled.metadata.global_scratch_size == 0
+    assert ".sgpr_spill_count: 0" in amdgcn
+    assert ".vgpr_spill_count: 0" in amdgcn
+
+
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
 def test_a4w4_shape_stride_layouts_correctness_gfx950(device):
     m = n = 256
@@ -2982,16 +3009,38 @@ def test_a4w4_shape_stride_layouts_correctness_gfx950(device):
         torch.testing.assert_close(actual, expected, atol=0.1, rtol=0.0)
 
 
+@pytest.mark.parametrize("k", [1536, 2048])
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
-def test_a4w4_inter_wave_256tile_correctness_gfx950(device):
-    # 768x768x1536 -> 256-tile grid = 3*3 = 9 > NUM_CU/32, so the dispatcher takes
-    # the 8-wave 256x256 inter-wave path (K=1536 -> loop runs >= 2 trips).
+def test_a4w4_inter_wave_256tile_correctness_gfx950(device, k):
+    # A 3x3 grid exceeds the skinny-dispatch threshold, so these neighboring K
+    # values exercise the 8-wave 256x256 path with two and three main-loop trips.
     m = n = 768
-    k = 1536
     a, b, a_scales, b_scales = _generate_a4w4_inputs(m, n, k)
     actual = _a4w4_inter_wave_matmul(a, b, a_scales, b_scales)
     expected = _a4w4_reference(a, b, a_scales, b_scales)
     torch.testing.assert_close(actual, expected, atol=0.1, rtol=0.0)
+
+
+@pytest.mark.parametrize("m, n", [(768, 768), (512, 1280)])
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_a4w4_inter_wave_256tile_single_trip_stress_gfx950(device, m, n):
+    # K=1024 has four K tiles: two are prefetched and one two-tile main-loop
+    # step consumes/refills the ring before the two-tile drain.
+    # Both public shapes exceed the skinny threshold and cover different
+    # multi-CTA grids through the production dispatcher.
+    k = _A4W4_INTER_WAVE_MIN_K
+    grid_mn = triton.cdiv(m, _A4W4_INTER_WAVE_BLOCK_M) * triton.cdiv(n, _A4W4_INTER_WAVE_BLOCK_N)
+    iter_max = k // _A4W4_INTER_WAVE_BLOCK_K
+    main_trips = len(range(0, iter_max - 2, 2))
+    assert grid_mn in (9, 10)
+    assert grid_mn > _A4W4_INTER_WAVE_NUM_CU // 32
+    assert (k, iter_max, main_trips) == (1024, 4, 1)
+
+    a, b, a_scales, b_scales = _generate_a4w4_inputs(m, n, k)
+    expected = _a4w4_reference(a, b, a_scales, b_scales)
+    for launch in range(500):
+        actual = _a4w4_inter_wave_matmul(a, b, a_scales, b_scales)
+        torch.testing.assert_close(actual, expected, atol=0.1, rtol=0.0, msg=f"failed on launch {launch}")
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
