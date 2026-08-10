@@ -6679,6 +6679,90 @@ def _build_independent_async_dma_wait_target():
     return converter_value_relations.attach_symbolic_memory_relations(builder.build())
 
 
+def _build_distinct_layoutless_splat_dma_target(offset_count=17):
+    builder = converter_target_ir.TargetBuilder(kernel=converter_target_ir.TargetKernel(
+        name="converter_distinct_layoutless_splat_dma",
+        num_warps=1,
+        threads_per_warp=64,
+    ))
+    pointer_f32 = converter_target_ir.TargetType("pointer", "uniform_pointer", "f32")
+    scalar_i32 = converter_target_ir.TargetType("scalar", "scalar", "i32")
+    simd_i32 = converter_target_ir.TargetType("tensor", "simd", "i32", 64, 1)
+    memdesc_f32 = converter_target_ir.TargetType("memdesc", "memdesc", "f32")
+    token = converter_target_ir.TargetType("token", "token")
+
+    source = builder.add_value(pointer_f32)
+    builder.set_kernel_arg_targets((source, ))
+    builder.set_assumptions((converter_target_ir.TargetAssumption(
+        assumption_id=0,
+        kind="pointer_byte_range",
+        predicate="pointer byte range",
+        subject_target_ids=(source, ),
+        lower=0,
+        upper=256,
+        width=64,
+        signedness="unsigned",
+        provenance="kernel argument pointer range",
+    ), ))
+
+    for offset_value in range(int(offset_count)):
+        scalar = builder.add_value(scalar_i32)
+        offset = builder.add_value(simd_i32)
+        alloc = builder.add_value(memdesc_f32)
+        dma_token = builder.add_value(
+            token,
+            event_domain=converter_target_ir.EVENT_DOMAIN_DMA_COMPLETION,
+            resource_target_ids=(alloc, ),
+        )
+        group_token = builder.add_value(
+            token,
+            event_domain=converter_target_ir.EVENT_DOMAIN_DMA_GROUP,
+            resource_target_ids=(alloc, ),
+        )
+        ready_token = builder.add_value(
+            token,
+            event_domain=converter_target_ir.EVENT_DOMAIN_WAVE_LOCAL_READY,
+            resource_target_ids=(alloc, ),
+        )
+
+        builder.add_op("constant", results=(scalar, ), attrs={"value": offset_value})
+        builder.add_op("splat", operands=(scalar, ), results=(offset, ), attrs={"lane_width": 64})
+        builder.add_op(
+            "local_alloc",
+            results=(alloc, ),
+            attrs={
+                "align": 16,
+                "allocation_bytes": 256,
+                "element_type": "f32",
+                "shape": (64, ),
+            },
+        )
+        builder.add_op(
+            "buffer_load_to_local",
+            operands=(alloc, source, offset),
+            results=(dma_token, ),
+            attrs=_dense_f32_dma_attrs(),
+            fact_ids=(0, ),
+            fact_target_ids=(source, ),
+        )
+        builder.add_op(
+            "async_commit_group",
+            operands=(dma_token, ),
+            results=(group_token, ),
+        )
+        builder.add_op(
+            "async_wait",
+            operands=(group_token, ),
+            results=(ready_token, ),
+            attrs={
+                "completed_group_dependency_count": 1,
+                "retained_issue_dependency_count": 0,
+            },
+        )
+    builder.add_op("return")
+    return converter_value_relations.attach_symbolic_memory_relations(builder.build())
+
+
 def _build_mma_read_then_dma_reuse_target(
     num_warps=1,
     *,
@@ -7087,6 +7171,42 @@ def test_tlx_wave_converter_emission_waits_only_explicit_async_dma_groups():
     waited_group_token, live_group_token = map(_ssa_result_name, join_lines)
     assert waited_group_token in wait_lines[0]
     assert live_group_token not in wait_lines[0]
+    _run_wave_verify(emitted.text)
+
+
+def test_tlx_wave_converter_attaches_distinct_layoutless_splat_dma_offsets():
+    target_program = _build_distinct_layoutless_splat_dma_target()
+    copy_ops = tuple(op for op in target_program.ops if op.kind == "buffer_load_to_local")
+    offset_ids = tuple(int(op.operands[2]) for op in copy_ops)
+    definitions = {int(result): op for op in target_program.ops for result in op.results}
+
+    assert len(copy_ops) == 17
+    assert len(set(offset_ids)) == 17
+    assert converter_verifier.verify_target_program(target_program)
+
+    dsl, _ir = converter_emission._load_wave_dsl()
+    for expected_offset, copy_op, offset_id in zip(range(17), copy_ops, offset_ids, strict=True):
+        offset = target_program.values[offset_id]
+        assert offset.layout_map_id is None
+        splat = definitions[offset_id]
+        assert splat.kind == "splat"
+        (scalar_id, ) = splat.operands
+        scalar = definitions[int(scalar_id)]
+        assert scalar.kind == "constant"
+        assert converter_target_ir.attrs_dict(scalar)["value"] == expected_offset
+
+        attrs = converter_target_ir.attrs_dict(copy_op)
+        assert attrs["index_binding_count"] == 0
+        relation = dsl.ixs_deserialize(attrs["bit_offset_relation"])
+        for item in (0, 1, 31, 63):
+            assert relation.eval({
+                "block": 0,
+                "item": item,
+                "slot": 0,
+            }) == expected_offset * 4 * 8
+
+    emitted = converter_emission.emit_wave_module(target_program)
+    assert emitted.text.count("wave.gather") == 17
     _run_wave_verify(emitted.text)
 
 
