@@ -88,9 +88,12 @@ the re-sync.
     Return a subview of the buffer indexed by `buffer_idx` from `buffers`. Both the explicit `local_view()` call and the indexing syntax `[]` are supported.
 
 
-- `distributed_tensor = tlx.local_load(buffer, optional_token)` **[Hopper+, MI300+]**
+- `distributed_tensor = tlx.local_load(buffer, token=None, layout=None, relaxed=False, rematerialize_coordinates=False, rematerialize_coordinates_group=None)` **[Hopper+, MI300+]**
 
-    Loads the buffer from local memory or tensor memory into a distributed tensor.
+    Loads the buffer from local or tensor memory. `layout` pins a requested
+    register layout. On AMD, the rematerialization options start fresh address
+    coordinate live ranges either per load or for a named group of nearby
+    loads; the two options are mutually exclusive.
 
 
 - `tlx.local_store(buffer, distributed_tensor)` **[Hopper+, MI300+]**
@@ -1037,7 +1040,7 @@ TLX uses **CUDA-native cluster semantics** which differs from Triton's approach:
     tlx.dump_layout(v)                  # -> // cute: _64:_1
     ```
 
-- `x = tlx.require_layout(x, layout, pin=True)` **[Hopper+, MI300+]**
+- `x = tlx.require_layout(x, layout, pin=True, late_address_compute=False)` **[Hopper+, MI300+]**
 
     Require a register tensor `x` to use `layout`, expressed as a
     `tlx.layout(...)` (Shape:Stride). With the default `pin=True`, the `#linear`
@@ -1055,6 +1058,11 @@ TLX uses **CUDA-native cluster semantics** which differs from Triton's approach:
     requested encoding without the `#tlx.user_layout` hard anchor, allowing
     later layout passes to propagate the requirement or materialize a layout
     conversion. The default remains `pin=True` for existing callers.
+
+    On AMD, `late_address_compute=True` asks shared-memory-backed layout
+    conversions to compute their addresses at this use. The backend does this
+    by rematerializing inexpensive lane/warp coordinates, shortening their live
+    ranges across register-heavy regions.
 
     Pair with `tlx.assert_same_layout(x, layout)` (below) to statically verify the
     pin survived to the final TTGIR.
@@ -1110,7 +1118,9 @@ Buffer operations access global memory via a scalar base pointer and a tensor of
 Load a tensor of values from global memory.
 
 ```python
-result = tlx.buffer_load(ptr, offsets, mask=None, other=None, cache=None)
+result = tlx.buffer_load(
+    ptr, offsets, mask=None, other=None, cache=None, contiguity=1
+)
 ```
 
 | Argument | Type | Description |
@@ -1120,6 +1130,7 @@ result = tlx.buffer_load(ptr, offsets, mask=None, other=None, cache=None)
 | `mask` | bool tensor, optional | When `mask[i]` is `False`, the element is not loaded. |
 | `other` | tensor or scalar, optional | Value used for masked-out elements (where `mask[i]` is `False`). |
 | `cache` | str, optional | Cache modifier (e.g. `".ca"`, `".cg"`). |
+| `contiguity` | constexpr int | Trusted positive power-of-two vectorization width; it must divide each thread's element count. |
 
 **Returns**: A tensor with the same shape as `offsets` and element type matching the pointee type of `ptr`.
 
@@ -1144,6 +1155,23 @@ tlx.buffer_store(stored_value, ptr, offsets, mask=None, cache=None)
 **Returns**: Nothing.
 
 Lowers to `amdg.buffer_store`, which is eventually lowered to `rocdl.raw.ptr.buffer.store`.
+
+### `tlx.buffer_atomic_add`
+
+Atomically add a tensor through an AMD scalar resource descriptor.
+
+```python
+previous = tlx.buffer_atomic_add(
+    ptr, offsets, value, mask=None, sem=None, scope=None, contiguity=1
+)
+```
+
+`contiguity` is the same trusted per-thread adjacency width accepted by
+`buffer_load`; values greater than one also preserve the selected layout. The
+operation returns the values observed before the additions. FP16 and BF16 use
+packed two-element instructions, so `contiguity` must be at least two and any
+mask must be uniform for each adjacent pair. Compilation fails if mask analysis
+reduces the legal vector width below two.
 
 ### `tlx.buffer_load_to_local`
 
@@ -1189,6 +1217,63 @@ def kernel(src_ptr, dst_ptr, BLOCK_SIZE: tl.constexpr):
 ```
 
 For the async global-to-shared variant, see the warp-pipeline GEMM example (`third_party/amd/python/examples/gluon/f16_gemm_warp_pipeline_gfx1250.py`).
+
+## Wave Uniformity (AMD)
+
+### `tlx.assume_uniform`
+
+Assert that a scalar holds the same value in every lane of the wave.
+
+```python
+value = tlx.assume_uniform(value)
+```
+
+| Argument | Type | Description |
+|----------|------|-------------|
+| `value` | scalar pointer, or 16/32/64-bit int or float | Value asserted to be wave-uniform. Narrower types are not supported. |
+
+**Returns**: `value`, unchanged.
+
+The main use is buffer operations, which keep their base pointer in the scalar (SGPR) resource descriptor, so it has to be wave-uniform. When the backend cannot prove that it is — most commonly because the pointer was loaded from memory — it falls back to a per-lane waterfall loop around every access. `tlx.assume_uniform` tells the backend to take uniformity as given:
+
+```python
+base = tl.load(ptr_array + gid).to(tl.pointer_type(tl.float16))
+base = tlx.assume_uniform(base)
+data = tlx.buffer_load(base, offsets)
+```
+
+Lowers to `amdg.assume_uniform`, which is eventually lowered to `llvm.amdgcn.readfirstlane` — that makes the result uniform by construction as far as LLVM's uniformity analysis is concerned. On non-AMD backends it is a no-op that returns its argument. Nothing verifies the assertion: if the value is not actually uniform, every lane silently gets lane 0's value.
+
+## Explicit MFMA Scheduling (AMD)
+
+> **[MI350]** — the source-scheduled operations are restricted to CDNA4
+> (`gfx950`) native BF16 MFMA layouts.
+
+- `tl.dot(a, b, acc)` preserves a TLX-pinned accumulator layout, so whole dots
+  need no AMD-specific wrapper.
+- `tlx.extract_slice(source, shape, offsets)` selects an aligned register
+  fragment without cross-thread movement.
+- `tlx.rematerialized_range(start, end, anchor, placement=None)` recreates
+  inexpensive distributed coordinates near a use instead of carrying them
+  through a long software pipeline.
+- `tlx.amd_register_resident(value, register_class="agpr", registers_per_group=1)`
+  keeps a distributed value in allocator-visible native register tuples.
+- `tlx.amd_scheduled_mfma(...)` exposes independent native MFMA accumulator
+  chains in deterministic N-major, M-minor, K-reduction source order.
+- `tlx.amd_mfma_commit(value, preserve)` applies the CDNA4 MFMA result hazard
+  boundary while threading a live dot-operand dependency.
+- `tlx.amd_sched_barrier(mask=0)` prevents selected AMD machine-instruction
+  classes from crossing a source boundary. It is a scheduling marker, not a
+  workgroup barrier or memory fence.
+
+These primitives describe fragments, lifetimes, and ordering without assigning
+physical registers. Their verifiers reject unsupported targets, layouts,
+element types, and native fragment widths before lowering.
+
+Unlike `tl.dot`, `amd_scheduled_mfma` carries an explicit `accumulator_role`.
+`transient` selects the latency-aware intrinsic path for phase-local work;
+`persistent` selects register-constrained lowering for a chain carried across
+phases. Neither role changes the numerical matrix operation.
 
 ## AMD TDM Descriptor Loads
 
@@ -1351,6 +1436,18 @@ hand-poking attributes.
 Currently consumed only by the scaled-WMMA pattern (gfx1250). Regular
 `tt.dot` WMMA and the MFMA patterns do not read it.
 
+### Explicit WMMA layout pinning
+
+`tlx.require_amd_wmma_layout(x, version=3, transposed=True, warp_bases=...,
+reg_bases=..., instr_shape=(16, 16, 128))` pins a tensor to an explicit AMD
+WMMA register/warp layout. This is useful for tuned gfx1250 epilogues that must
+retain the accumulator ownership chosen by `tiles_per_warp` across otherwise
+layout-neutral tensor operations. The bases contain one linear-layout basis
+vector per register or warp bit and must match the tensor rank.
+
+The helper lowers to a pinned `tlx.require_layout`; omit it when automatic
+layout propagation is sufficient.
+
 ## Kernels Implemented with TLX
 
 ### GEMM kernels
@@ -1359,6 +1456,8 @@ Currently consumed only by the scaled-WMMA pattern (gfx1250). Regular
 [Warp-specialized GEMM on Hopper](third_party/tlx/tutorials/hopper_gemm_ws_test.py)
 
 [Warp-specialized GEMM on Blackwell](third_party/tlx/tutorials/blackwell_gemm_ws.py)
+
+[Warp-specialized MXFP8 GEMM on Blackwell](third_party/tlx/tutorials/blackwell_gemm_ws_mxfp8.py)
 
 [Grouped GEMM on Blackwell](third_party/tlx/tutorials/blackwell_grouped_gemm_test.py)
 

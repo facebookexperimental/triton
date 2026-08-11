@@ -578,6 +578,13 @@ class nvidia_knobs(base_knobs):
     use_modulo_schedule: env_opt_str = env_opt_str("TRITON_USE_MODULO_SCHEDULE")
     use_list_schedule: env_bool = env_bool("TRITON_USE_LIST_SCHEDULE")
     use_llm_schedule: env_bool = env_bool("TRITON_USE_LLM_SCHEDULE")
+    use_joint_schedule: env_bool = env_bool("TRITON_USE_JOINT_SCHEDULE")
+    # Terminal policy when the joint solver cannot produce a complete verified
+    # schedule. Off (default) falls back to the baseline schedule + partition
+    # path and emits a remark; on turns every terminal trigger into a
+    # compilation error. Read on the C++ side, mirrored here so tests can scope
+    # it (knobs.nvidia.scope()) instead of leaking global env state.
+    modulo_strict_error: env_bool = env_bool("TRITON_MODULO_STRICT_ERROR")
     disable_wsbarrier_reorder: env_bool = env_bool("TRITON_DISABLE_WSBARRIER_REORDER")
     dump_ttgir_to_tlx: env_bool = env_bool("TRITON_DUMP_TTGIR_TO_TLX")
     dump_tlx_benchmark: env_bool = env_bool("TRITON_DUMP_TLX_BENCHMARK")

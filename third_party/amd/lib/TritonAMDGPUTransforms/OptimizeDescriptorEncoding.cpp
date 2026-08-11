@@ -154,7 +154,8 @@ Attribute AMDGPUAssignDescriptorMemoryLayouts::getDesiredDescriptorEncoding(
     visited.push_back(value);
 
     for (Operation *user : value.getUsers()) {
-      if (auto update = dyn_cast<triton::amdgpu::UpdateTensorDescriptorOp>(user)) {
+      if (auto update =
+              dyn_cast<triton::amdgpu::UpdateTensorDescriptorOp>(user)) {
         if (update.getDesc() == value)
           worklist.push_back(update.getResult());
         continue;
@@ -187,8 +188,8 @@ Attribute AMDGPUAssignDescriptorMemoryLayouts::getDesiredDescriptorEncoding(
       if (auto partitioned =
               dyn_cast<ttg::PartitionedSharedEncodingAttr>(encoding))
         encoding = partitioned.getPartitionLayout();
-      encoding = getCompatibleSharedEncoding(
-          encoding, memoryType.getShape(), memoryType.getElementType());
+      encoding = getCompatibleSharedEncoding(encoding, memoryType.getShape(),
+                                             memoryType.getElementType());
       if (!encoding)
         continue;
       if (desiredEncoding && desiredEncoding != encoding)

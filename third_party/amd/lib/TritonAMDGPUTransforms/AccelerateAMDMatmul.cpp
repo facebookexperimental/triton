@@ -32,6 +32,7 @@ using triton::amdgpu::TargetFeatures;
 
 constexpr char AttrDecomposedDotScaledSource[] =
     "amdg.decomposed_dot_scaled_source";
+constexpr char AttrAMDWmmaTilesPerWarp[] = "amdg.wmma_tiles_per_warp";
 
 int getMfmaVersion(ISAFamily isaFamily) {
   switch (isaFamily) {
@@ -164,6 +165,44 @@ SmallVector<unsigned, 3> planWarps(Operation *dotOp, ArrayRef<int64_t> shape,
   }
 
   return ret;
+}
+
+LogicalResult validateWmmaTilesPerWarp(tt::DotScaledOp dotOp) {
+  auto attr = dotOp->getAttrOfType<DenseI32ArrayAttr>(AttrAMDWmmaTilesPerWarp);
+  if (!attr)
+    return success();
+
+  auto resultType = dotOp.getType();
+  unsigned rank = resultType.getRank();
+  ArrayRef<int32_t> requested = attr.asArrayRef();
+  if (requested.size() != rank)
+    return dotOp.emitOpError()
+           << AttrAMDWmmaTilesPerWarp << " must have " << rank << " entries";
+  if (rank != 2)
+    return dotOp.emitOpError()
+           << AttrAMDWmmaTilesPerWarp << " currently requires a rank-2 dot";
+
+  constexpr unsigned mDim = 16;
+  constexpr unsigned nDim = 16;
+  auto cgaLayout = ttg::getCGALayout(resultType.getEncoding());
+  auto shapePerCTA =
+      ttg::getShapePerCTA(cgaLayout.getCTASplitNum(), resultType.getShape());
+  auto warpsPerTile =
+      planWarps(dotOp, shapePerCTA, ttg::lookupNumWarps(dotOp), {mDim, nDim});
+  SmallVector<unsigned> instrPerDim = {mDim, nDim};
+  for (auto [dim, tiles] : llvm::enumerate(requested)) {
+    if (tiles <= 0)
+      return dotOp.emitOpError()
+             << AttrAMDWmmaTilesPerWarp << " entries must be positive";
+    uint64_t requiredExtent = static_cast<uint64_t>(instrPerDim[dim]) *
+                              warpsPerTile[dim] * static_cast<unsigned>(tiles);
+    if (static_cast<uint64_t>(shapePerCTA[dim]) < requiredExtent)
+      return dotOp.emitOpError()
+             << AttrAMDWmmaTilesPerWarp << " requires extent " << requiredExtent
+             << " in dimension " << dim
+             << ", which exceeds the result tile shape";
+  }
+  return success();
 }
 
 // Chooses a proper MFMA instruction that can used to compute the given dot op.
@@ -1188,8 +1227,15 @@ public:
 
     auto warpsPerTile =
         planWarps(dotOp, oldShapePerCTA, numWarps, {mDim, nDim});
-    // TODO: Select tilesPerWarp in Triton
     SmallVector<unsigned> tilesPerWarp(rank, 1u);
+    if (auto attr =
+            dotOp->getAttrOfType<DenseI32ArrayAttr>(AttrAMDWmmaTilesPerWarp)) {
+      ArrayRef<int32_t> requested = attr.asArrayRef();
+      tilesPerWarp.clear();
+      llvm::transform(
+          requested, std::back_inserter(tilesPerWarp),
+          [](int32_t tiles) { return static_cast<unsigned>(tiles); });
+    }
 
     auto ctaLayout =
         ttg::chooseWmmaCTALinearLayout(ctx, rank, warpsPerTile, tilesPerWarp);
@@ -1760,6 +1806,16 @@ struct TritonAMDGPUAccelerateMatmulPass
     TargetFeatures targetFeatures{llvm::StringRef(gfxArch)};
     auto isaFamily = targetFeatures.getISAFamily();
     unsigned wmmaVersion = getWmmaVersion(isaFamily);
+    if (isaFamily == ISAFamily::GFX1250) {
+      WalkResult validation = m.walk([&](tt::DotScaledOp dotOp) {
+        return failed(validateWmmaTilesPerWarp(dotOp)) ? WalkResult::interrupt()
+                                                       : WalkResult::advance();
+      });
+      if (validation.wasInterrupted()) {
+        signalPassFailure();
+        return;
+      }
+    }
     switch (isaFamily) {
     case ISAFamily::GFX1250:
       mfmaPatterns.add<ScaledBlockedToScaledWMMAF8F6F4>(context, wmmaVersion,

@@ -10,6 +10,8 @@ from triton.tools.tensor_descriptor import TensorDescriptor
 
 from triton.language.extra.tlx.tutorials.blackwell_gemm_ws import (
     matmul as _blackwell_gemm_ws, )
+from triton.language.extra.tlx.tutorials.blackwell_gemm_ws_mxfp8 import (
+    matmul as _blackwell_gemm_ws_mxfp8, )
 from triton.language.extra.tlx.tutorials.blackwell_gemm_clc import (
     matmul as _blackwell_gemm_clc, )
 from triton.language.extra.tlx.tutorials.blackwell_gemm_pipelined import (
@@ -319,7 +321,7 @@ class FlashAttention:
             "BLOCK_M": 256,
             "BLOCK_N": 128,
             "NUM_BUFFERS_Q": 1,
-            "NUM_BUFFERS_KV": 3,
+            "NUM_BUFFERS_KV": 5,
             "NUM_BUFFERS_QK": 1,
             "NUM_MMA_GROUPS": 2,
             "NUM_MMA_SLICES": 2,
@@ -420,6 +422,64 @@ class FlashAttention:
 # =============================================================================
 
 
+class Mxfp8Gemm:
+    """Utilities for native Blackwell MXFP8 scaled-MMA tests."""
+
+    SHAPES = [
+        (128, 128, 128),
+        (256, 256, 256),
+        (384, 256, 512),
+    ]
+
+    CONFIG_2CTA = {
+        "BLOCK_SIZE_M": 128,
+        "BLOCK_SIZE_N": 256,
+        "BLOCK_SIZE_K": 128,
+        "GROUP_SIZE_M": 2,
+        "NUM_SMEM_BUFFERS": 3,
+        "NUM_TMEM_BUFFERS": 1,
+        "NUM_MMA_GROUPS": 1,
+        "EPILOGUE_SUBTILE": 4,
+        "NUM_CTAS": 2,
+        "SPLIT_K": 1,
+        "ctas_per_cga": (2, 1, 1),
+    }
+
+    @staticmethod
+    def run_test(shape, config=None):
+        from torchao.prototype.mx_formats.mx_tensor import MXTensor, ScaleCalculationMode
+
+        M, N, K = shape
+        torch.manual_seed(0)
+        a = torch.empty((M, K), device=DEVICE, dtype=torch.bfloat16).normal_(std=0.5)
+        b = torch.empty((N, K), device=DEVICE, dtype=torch.bfloat16).normal_(std=0.5)
+        a_mx = MXTensor.to_mx(
+            a,
+            torch.float8_e4m3fn,
+            scaling_mode=ScaleCalculationMode.RCEIL,
+            is_swizzled_scales=True,
+        )
+        b_mx = MXTensor.to_mx(
+            b,
+            torch.float8_e4m3fn,
+            scaling_mode=ScaleCalculationMode.RCEIL,
+            is_swizzled_scales=True,
+        )
+
+        out = _blackwell_gemm_ws_mxfp8(
+            a_mx.qdata,
+            b_mx.qdata,
+            a_mx.scale,
+            b_mx.scale,
+            config=config,
+        )
+        ref = torch.matmul(
+            a_mx.dequantize(torch.float32),
+            b_mx.dequantize(torch.float32).T,
+        ).to(torch.bfloat16)
+        torch.testing.assert_close(out, ref, atol=1e-1, rtol=0.01)
+
+
 class ScaledMM:
     """Common utilities and configs for FP8 scaled_mm tests (blockwise / rowwise / tensorwise)."""
 
@@ -493,6 +553,112 @@ class ScaledMM:
 @pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell GPU")
 def test_blackwell_gemm_ws(dtype):
     Gemm.run_test(_blackwell_gemm_ws, Gemm.CONFIGS["blackwell_gemm_ws"], dtype=dtype)
+
+
+@pytest.mark.parametrize(
+    "shape",
+    Mxfp8Gemm.SHAPES,
+    ids=[f"{m}x{n}x{k}" for m, n, k in Mxfp8Gemm.SHAPES],
+)
+@pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell GPU")
+def test_blackwell_gemm_ws_mxfp8(shape):
+    Mxfp8Gemm.run_test(shape)
+
+
+@pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell GPU")
+def test_blackwell_gemm_ws_mxfp8_bn256_1cta():
+    Mxfp8Gemm.run_test(
+        (256, 384, 256),
+        config={
+            "BLOCK_SIZE_N": 256,
+            "BLOCK_SIZE_K": 128,
+            "GROUP_SIZE_M": 4,
+            "NUM_SMEM_BUFFERS": 2,
+            "NUM_TMEM_BUFFERS": 1,
+            "EPILOGUE_SUBTILE": 1,
+            "NUM_CTAS": 1,
+            "SPLIT_K": 1,
+        },
+    )
+
+
+@pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell GPU")
+def test_blackwell_gemm_ws_mxfp8_split_k():
+    Mxfp8Gemm.run_test(
+        (128, 128, 640),
+        config={
+            "SPLIT_K": 4,
+            "NUM_SMEM_BUFFERS": 4,
+        },
+    )
+
+
+@pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell GPU")
+def test_blackwell_gemm_ws_mxfp8_lean_pipeline():
+    Mxfp8Gemm.run_test(
+        (256, 256, 256),
+        config={
+            "GROUP_SIZE_M": 4,
+            "NUM_SMEM_BUFFERS": 4,
+            "NUM_TMEM_BUFFERS": 1,
+            "EPILOGUE_SUBTILE": 1,
+        },
+    )
+
+
+@pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell GPU")
+def test_blackwell_gemm_ws_mxfp8_deep_k_split_k():
+    Mxfp8Gemm.run_test(
+        (128, 128, 2048),
+        config={
+            "SPLIT_K": 4,
+            "NUM_SMEM_BUFFERS": 4,
+        },
+    )
+
+
+@pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell GPU")
+def test_blackwell_gemm_ws_mxfp8_2cta():
+    Mxfp8Gemm.run_test((256, 256, 256), config=Mxfp8Gemm.CONFIG_2CTA.copy())
+
+
+@pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell GPU")
+def test_blackwell_gemm_ws_mxfp8_2cta_64_columns_per_cta():
+    config = Mxfp8Gemm.CONFIG_2CTA.copy()
+    config["BLOCK_SIZE_N"] = 128
+    Mxfp8Gemm.run_test((256, 128, 256), config=config)
+
+
+@pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell GPU")
+def test_blackwell_gemm_ws_mxfp8_2cta_64_columns_odd_m_tiles():
+    config = Mxfp8Gemm.CONFIG_2CTA.copy()
+    config["BLOCK_SIZE_N"] = 128
+    Mxfp8Gemm.run_test((384, 128, 256), config=config)
+
+
+@pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell GPU")
+def test_blackwell_gemm_ws_mxfp8_2cta_tall_short_k():
+    config = Mxfp8Gemm.CONFIG_2CTA.copy()
+    config.update(
+        {
+            "GROUP_SIZE_M": 4,
+            "NUM_SMEM_BUFFERS": 4,
+            "EPILOGUE_SUBTILE": 1,
+        }
+    )
+    Mxfp8Gemm.run_test((512, 256, 256), config=config)
+
+
+@pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell GPU")
+def test_blackwell_gemm_ws_mxfp8_2cta_uneven_split_k():
+    config = Mxfp8Gemm.CONFIG_2CTA.copy()
+    config.update({"SPLIT_K": 4, "NUM_SMEM_BUFFERS": 4})
+    Mxfp8Gemm.run_test((256, 256, 640), config=config)
+
+
+@pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell GPU")
+def test_blackwell_gemm_ws_mxfp8_2cta_odd_m_tiles():
+    Mxfp8Gemm.run_test((384, 256, 256), config=Mxfp8Gemm.CONFIG_2CTA.copy())
 
 
 @pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell GPU")

@@ -7,6 +7,7 @@
 #include "mlir/IR/Operation.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringRef.h"
 
 namespace mlir::triton::gpu {
 
@@ -102,10 +103,16 @@ public:
   /// it is modulo-scheduled, so the super-node's `innerII` reflects the split
   /// (an M-partitioned inner MMA is scheduled at its partitioned ResMII, not
   /// the unpartitioned one). Empty by default = no partitioning.
+  ///
+  /// `scheduleAlgo` is the backend used for those inner super-node schedules;
+  /// a pass that forces a backend must thread it here too, or the nested
+  /// schedules silently fall back to the env-selected one. Empty = resolve
+  /// from TRITON_USE_MODULO_SCHEDULE (see getActiveScheduleAlgo).
   static DataDependenceGraph
   build(scf::ForOp loop, const LatencyModel &model,
         const llvm::DenseMap<Operation *, DataPartitionInfo> &partition =
-            llvm::DenseMap<Operation *, DataPartitionInfo>());
+            llvm::DenseMap<Operation *, DataPartitionInfo>(),
+        llvm::StringRef scheduleAlgo = {});
 
   llvm::ArrayRef<DDGNode> getNodes() const { return nodes; }
   llvm::ArrayRef<DDGEdge> getEdges() const { return edges; }

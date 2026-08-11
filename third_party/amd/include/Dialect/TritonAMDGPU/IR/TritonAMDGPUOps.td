@@ -254,6 +254,29 @@ def CondBarrierOp : TT_AMDGPU_Op<"cond_barrier"> {
 }
 
 //===----------------------------------------------------------------------===//
+// AssumeUniformOp
+//===----------------------------------------------------------------------===//
+
+def TT_AMDGPU_UniformScalar : AnyTypeOf<[I16, I32, I64, F16, BF16, F32, F64, TT_Ptr],
+                                        "16/32/64-bit scalar or pointer">;
+
+def AssumeUniformOp : TT_AMDGPU_Op<"assume_uniform", [Pure, SameOperandsAndResultType]> {
+  let summary = "Assert that a scalar value is wave-uniform";
+
+  let description = [{
+    Returns `src` unchanged, but tells the backend that its value is the same in
+    every lane of the wave. Lowers to `llvm.amdgcn.readfirstlane`, which makes
+    the result uniform by construction as far as LLVM's uniformity analysis is
+    concerned.
+  }];
+
+  let arguments = (ins TT_AMDGPU_UniformScalar:$src);
+  let results = (outs TT_AMDGPU_UniformScalar:$result);
+
+  let assemblyFormat = "$src attr-dict `:` type($src)";
+}
+
+//===----------------------------------------------------------------------===//
 // BufferLoadOp
 //===----------------------------------------------------------------------===//
 
@@ -301,6 +324,8 @@ def BufferLoadOp
           Optional<TT_BoolTensor>:$mask, Optional<TT_Tensor>:$other,
           DefaultValuedAttr<I32Attr, "1">:$contiguity);
   let results = (outs TT_Tensor:$result);
+
+  let hasVerifier = 1;
 
   let assemblyFormat = [{
       $ptr `[` $offsets `]` (`,` $mask^)? (`,` $other^)?
@@ -402,14 +427,19 @@ def BufferAtomicRMWOp
         Stride is the distance between the beginning of contiguous memory chunks. When performing a RMW, the `stride` is
         the address difference between the first elements of each row in bytes. Compiler tries to obtain the `stride`
         when it converts to the buffer ops because it is important for optimizing the cache memory access.
+        Contiguity is the maximum number of elements that can be processed by one vector atomic with the given layout
+        and mask. This preserves alignment information proven before canonicalizing the pointer to buffer form.
     }];
   let arguments = (ins TT_AtomicRMWAttr:$atomic_rmw_op,
       Arg<TT_Ptr, "Global memory pointer",
           [MemRead<GlobalMemory>, MemWrite<GlobalMemory>]>:$ptr,
       I32Tensor:$offsets, TT_Tensor:$value, Optional<I32>:$stride,
       TT_MemSemanticAttr:$sem, TT_MemSyncScopeAttr:$scope,
-      Optional<TT_BoolTensor>:$mask);
+      Optional<TT_BoolTensor>:$mask,
+      DefaultValuedAttr<I32Attr, "1">:$contiguity);
   let results = (outs TT_Tensor:$result);
+
+  let hasVerifier = 1;
 
   let assemblyFormat = [{
         $atomic_rmw_op `,` $sem `,` $scope `,` $value `,` $ptr `[` $offsets `]` (`,` $mask^)?
@@ -695,6 +725,151 @@ def LocalLoadPackedTransposedOp
   // Use qualified() otherwise "!ttg.memdesc<X>" is printed as "<X>".
   let assemblyFormat =
       [{$src (`token` $token^)? attr-dict `:` qualified(type($src)) `->` type($result)}];
+  let hasVerifier = 1;
+}
+
+//===----------------------------------------------------------------------===//
+// RematerializedRangeOp
+//===----------------------------------------------------------------------===//
+
+def RematerializedRangeOp : TT_AMDGPU_Op<"rematerialized_range", [
+    SameOperandsAndResultEncoding, Pure]> {
+  let summary = "Prefer rematerializing a distributed range at this point";
+  let description = [{
+    Produces the same logical values as a rank-one `tt.make_range`, but records
+    that recomputing the lane/warp coordinates at this source point is
+    preferable to carrying them through a long software pipeline.
+
+    Each source instance has an explicit identity attribute. This keeps
+    intentionally separate source instances distinct under CSE while `Pure`
+    allows layout propagation's unused clones to be deleted. The scalar
+    `placement` operand is a non-numerical scheduling dependency: tying it to
+    a loop induction value keeps the range at that loop-local source point.
+    Target lowering then starts fresh coordinate live ranges at the surviving
+    source location. The operation neither names physical registers nor changes
+    numerical results.
+  }];
+
+  let arguments = (ins I32:$placement, I32Attr:$start, I32Attr:$end,
+      I32Attr:$identity);
+  let results = (outs TT_Tensor:$result);
+
+  let assemblyFormat = [{
+    $start `to` $end `identity` $identity `at` $placement
+    attr-dict `:` type($result)
+  }];
+
+  let hasVerifier = 1;
+}
+
+//===----------------------------------------------------------------------===//
+// RegisterResidentOp
+//===----------------------------------------------------------------------===//
+
+def RegisterResidentOp : TT_AMDGPU_Op<"register_resident", [
+    Pure, SameOperandsAndResultType]> {
+  let summary = "Keep a distributed tensor in native AMD register tuples";
+  let description = [{
+    Returns `input` unchanged while assigning its packed per-thread values to
+    the requested AMD vector register class. `registers_per_group` is the
+    number of consecutive 32-bit registers represented by each
+    allocator-visible tuple. The distributed tensor encoding is preserved
+    exactly, so this allocation-only identity does not introduce a layout
+    conversion or an LDS round trip.
+
+    This is a general lifetime contract for values intentionally carried
+    across a software pipeline. It does not prescribe physical register
+    numbers, and target lowering emits no machine instruction.
+  }];
+
+  let arguments = (ins TT_Tensor:$input, StrAttr:$register_class,
+      I32Attr:$registers_per_group);
+  let results = (outs TT_Tensor:$result);
+
+  let assemblyFormat = [{
+    $input `class` $register_class `groups` $registers_per_group
+    attr-dict `:` type($input)
+  }];
+
+  let hasVerifier = 1;
+}
+
+//===----------------------------------------------------------------------===//
+// MfmaCommitOp
+//===----------------------------------------------------------------------===//
+
+def MfmaCommitOp : TT_AMDGPU_Op<"mfma_commit", [
+    DeclareOpInterfaceMethods<InferTypeOpInterface>,
+    AllTypesMatch<["inputs", "outputs"]>]> {
+  let summary = "Commit native vector MFMA fragments with live dependencies";
+  let description = [{
+    Returns every input unchanged after applying the architecture-defined MFMA
+    result hazard. One or more inputs must be direct transient
+    `scheduled_mfma` results. Additional dot operands are non-numerical live
+    dependencies, and their corresponding outputs may be consumed by the
+    following source stage. Multiple independent native results can therefore
+    share one completion boundary without first assembling a logical tensor.
+
+    Distributed MFMA and dot layouts determine storage roles and native
+    fragment widths. Source code does not provide physical register classes,
+    tuple sizes, or wait-state counts.
+
+    The operation is intentionally side-effecting so the completion and
+    liveness boundary cannot be deleted or moved across memory operations.
+  }];
+
+  let arguments = (ins Variadic<TT_Tensor>:$inputs);
+  let results = (outs Variadic<TT_Tensor>:$outputs);
+
+  let assemblyFormat = "$inputs attr-dict `:` type($inputs)";
+
+  let hasVerifier = 1;
+}
+
+//===----------------------------------------------------------------------===//
+// ScheduledMfmaOp
+//===----------------------------------------------------------------------===//
+
+def ScheduledMfmaOp : TT_AMDGPU_Op<"scheduled_mfma"> {
+  let summary = "Execute source-scheduled independent native MFMA fragments";
+  let description = [{
+    Computes the full per-wave Cartesian product of the native fragments in
+    `a` and `b`, replacing every corresponding fragment in `acc`. Native
+    instructions are emitted in N-major, M-minor, K-reduction order, so each
+    output fragment remains an independent dependency chain while consecutive
+    native K fragments stay on that chain.
+
+    `resident_operand` is `none`, `lhs`, or `rhs` and identifies an input
+    intentionally carried through the surrounding software pipeline.
+    `accumulator_role` is `transient` for a phase-local result or `persistent`
+    for an accumulator carried across phases. `accumulator_register_class` is
+    `auto`, `agpr`, or `vgpr`; `auto` lets target lowering derive storage from
+    the lifetime role, while an explicit class supports kernels whose two
+    persistent accumulator sets intentionally occupy complementary physical
+    files. `initialize` starts the native accumulators from zero. Completion
+    of transient result fragments is represented separately by `mfma_commit`.
+
+    All active lanes of a wave must execute this operation uniformly. This is
+    an explicit source contract because LLVM inline assembly cannot represent
+    a convergent-call attribute on the pinned compiler revision.
+
+    The initial contract supports CDNA4 BF16 inputs, F32 accumulators, one or
+    more K fragments per wave, and native 32x32x16 or 16x16x32 instruction
+    shapes.
+  }];
+
+  let arguments = (ins TT_Tensor:$a, TT_Tensor:$b, TT_Tensor:$acc,
+      StrAttr:$resident_operand, StrAttr:$accumulator_role,
+      StrAttr:$accumulator_register_class, BoolAttr:$initialize);
+  let results = (outs TT_Tensor:$result);
+
+  let assemblyFormat = [{
+    $a `,` $b `,` $acc `resident` $resident_operand
+    `accumulator` $accumulator_role
+    `register_class` $accumulator_register_class `initialize` $initialize
+    attr-dict `:` type($a) `,` type($b) `,` type($acc) `->` type($result)
+  }];
+
   let hasVerifier = 1;
 }
 

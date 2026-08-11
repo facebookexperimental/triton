@@ -66,7 +66,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
       %16 = ttg.async_copy_global_to_local %arg0, %15 : tensor<64x16x!tt.ptr<f16>, #blocked> -> <64x16xf16, #shared, #smem, mutable>
       %17 = ttg.async_commit_group tokens %16
       scf.yield %12, %6, %14, %arg19, %17, %arg21, %15, %11, %9 : tensor<128x16xf32, #mma>, tensor<128x16xf32, #mma>, tensor<64x16xf16, #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 2}>>, !ttg.async.token, !ttg.async.token, !ttg.memdesc<64x16xf16, #shared, #smem, mutable>, !ttg.memdesc<64x16xf16, #shared, #smem, mutable>, !ttg.async.token, !ttg.memdesc<64x16xf16, #shared, #smem, mutable>
-    }
+    } {amdg.two_dot_schedule}
     ttg.local_dealloc %1 : !ttg.memdesc<2x64x16xf16, #shared, #smem, mutable>
     ttg.local_dealloc %0 : !ttg.memdesc<2x64x16xf16, #shared, #smem, mutable>
     tt.return %5#0 : tensor<128x16xf32, #mma>
@@ -136,7 +136,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
       %12 = ttg.memdesc_index %1[%arg6] : !ttg.memdesc<2x64x16xf16, #shared, #smem, mutable> -> !ttg.memdesc<64x16xf16, #shared, #smem, mutable>
       %13 = tt.load %arg1 : tensor<64x16x!tt.ptr<f16>, #blocked>
       scf.yield %10, %6, %11, %arg19, %12, %8, %9, %13 : tensor<128x16xf32, #mma>, tensor<128x16xf32, #mma>, tensor<64x16xf16, #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 2}>>, !ttg.memdesc<64x16xf16, #shared, #smem, mutable>, !ttg.memdesc<64x16xf16, #shared, #smem, mutable>, !ttg.memdesc<64x16xf16, #shared, #smem, mutable>, tensor<64x16xf16, #blocked>, tensor<64x16xf16, #blocked>
-    }
+    } {amdg.two_dot_schedule}
     ttg.local_dealloc %1 : !ttg.memdesc<2x64x16xf16, #shared, #smem, mutable>
     ttg.local_dealloc %0 : !ttg.memdesc<2x64x16xf16, #shared, #smem, mutable>
     tt.return %5#0 : tensor<128x16xf32, #mma>
@@ -172,7 +172,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
       %12 = ttg.memdesc_index %1[%arg6] : !ttg.memdesc<2x64x16xf16, #shared, #smem, mutable> -> !ttg.memdesc<64x16xf16, #shared, #smem, mutable>
       %13 = tt.load %arg1 : tensor<64x16x!tt.ptr<f16>, #blocked>
       scf.yield %10, %6, %11, %arg19, %12, %12, %13, %13 : tensor<128x16xf32, #mma>, tensor<128x16xf32, #mma>, tensor<64x16xf16, #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 2}>>, !ttg.memdesc<64x16xf16, #shared, #smem, mutable>, !ttg.memdesc<64x16xf16, #shared, #smem, mutable>, !ttg.memdesc<64x16xf16, #shared, #smem, mutable>, tensor<64x16xf16, #blocked>, tensor<64x16xf16, #blocked>
-    }
+    } {amdg.two_dot_schedule}
     ttg.local_dealloc %1 : !ttg.memdesc<2x64x16xf16, #shared, #smem, mutable>
     ttg.local_dealloc %0 : !ttg.memdesc<2x64x16xf16, #shared, #smem, mutable>
     tt.return %5#0 : tensor<128x16xf32, #mma>
@@ -200,7 +200,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
       %13 = tt.load %arg1 : tensor<64x16x!tt.ptr<f16>, #blocked>
       %10 = tt.dot %arg10, %arg17, %arg16 : tensor<128x64xf16, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 2}>> * tensor<64x16xf16, #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 2}>> -> tensor<128x16xf32, #mma>
       scf.yield %10, %6, %11, %arg19, %arg20, %arg20, %13, %13 : tensor<128x16xf32, #mma>, tensor<128x16xf32, #mma>, tensor<64x16xf16, #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 2}>>, !ttg.memdesc<64x16xf16, #shared, #smem, mutable, 2x64x16>, !ttg.memdesc<64x16xf16, #shared, #smem, mutable, 2x64x16>, !ttg.memdesc<64x16xf16, #shared, #smem, mutable, 2x64x16>, tensor<64x16xf16, #blocked>, tensor<64x16xf16, #blocked>
-    }
+    } {amdg.two_dot_schedule}
     tt.return %5#0 : tensor<128x16xf32, #mma>
   }
 }

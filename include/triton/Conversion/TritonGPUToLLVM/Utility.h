@@ -13,6 +13,7 @@
 #include "triton/Tools/GenericSwizzling.h"
 #include "triton/Tools/LinearLayout.h"
 #include "triton/Tools/StrUtil.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/MathExtras.h"
 
@@ -49,6 +50,28 @@ createLLVMIntrinsicCallOp(OpBuilder &builder, Location loc, StringRef intrinsic,
 } // namespace mlir::LLVM
 
 namespace mlir::triton {
+
+// Shared by backend-specific and generic local-load conversion patterns so a
+// named group produces one lane/warp rematerialization point even when its
+// loads take different lowering paths.
+class DistributedCoordinateGroups {
+public:
+  std::pair<Value, Value> getOrCreate(Operation *op, int64_t group,
+                                      bool rematerializeLane,
+                                      bool rematerializeWarp,
+                                      RewriterBase &rewriter,
+                                      const TargetInfoBase &targetInfo);
+
+private:
+  struct Entry {
+    Value lane;
+    Value warp;
+    bool laneRematerialized = false;
+    bool warpRematerialized = false;
+  };
+
+  llvm::DenseMap<Block *, llvm::DenseMap<int64_t, Entry>> groups;
+};
 
 struct TritonLLVMOpBuilder {
   TritonLLVMOpBuilder(Location loc, OpBuilder &builder)
@@ -669,7 +692,8 @@ SmallVector<Value> lowerLdStShared(
     uint64_t maskSpanAffineOffset, RewriterBase &rewriter,
     const TargetInfoBase &targetInfo, std::optional<int> maybeMaxVecElems = {},
     Operation *localLoadOp = nullptr, std::optional<Value> ctaRank = {},
-    std::optional<Value> barrierPtr = {});
+    std::optional<Value> barrierPtr = {},
+    std::optional<std::pair<Value, Value>> distributedCoordinates = {});
 
 // Lower an ld/st-like operation given a layout and a callback that creates the
 // PTX instruction Lowers to st when valArrays is empty, and to ld when it is
@@ -699,13 +723,36 @@ SmallVector<Value> lowerLocalLdSt(
     Type llvmElemTy, triton::gpu::MemDescType srcTy, SharedMemoryObject smemObj,
     RewriterBase &rewriter, const TargetInfoBase &targetInfo,
     Operation *localLoadOp = nullptr, std::optional<Value> ctaRank = {},
-    std::optional<Value> barrierPtr = {});
+    std::optional<Value> barrierPtr = {},
+    std::optional<std::pair<Value, Value>> distributedCoordinates = {});
 
 SmallVector<Value> unpackLLElements(Location loc, Value llvmStruct,
                                     RewriterBase &rewriter);
 
+SmallVector<Value> unpackUniqueTensorElements(Location loc, Value llvmStruct,
+                                              RewriterBase &rewriter);
+
+/// Unpack the values in \p llvmStruct into a vector using the layout from
+/// \p originalType. Preserve a full-register ABI; if a target-specific ABI
+/// stores only unique registers, restore its broadcast dimensions.
+SmallVector<Value> unpackTensorElements(Location loc, Value llvmStruct,
+                                        RewriterBase &rewriter,
+                                        Type originalType);
+
 Value packLLElements(Location loc, const LLVMTypeConverter *typeConverter,
                      ValueRange resultVals, RewriterBase &rewriter, Type type);
+
+Value packUniqueTensorElements(Location loc,
+                               const LLVMTypeConverter *typeConverter,
+                               ValueRange resultVals, RewriterBase &rewriter,
+                               Type type);
+
+/// Pack values using the tensor layout from \p type. Preserve broadcast
+/// registers when the converted ABI materializes the full register tuple, and
+/// remove them only for an ABI that stores unique registers.
+Value packTensorElements(Location loc, const LLVMTypeConverter *typeConverter,
+                         ValueRange resultVals, RewriterBase &rewriter,
+                         Type type);
 
 SmallVector<Value> unpackLLVector(Location loc, Value llvmVec,
                                   RewriterBase &rewriter);

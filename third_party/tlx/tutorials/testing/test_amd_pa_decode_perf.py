@@ -1,6 +1,7 @@
 import argparse
 import math
 
+import pytest
 import torch
 
 import triton
@@ -8,9 +9,10 @@ import triton
 from triton.language.extra.tlx.tutorials.amd_pa_decode import (
     pa_decode_tlx as _pa_decode_tlx,
     build_inputs as _build_inputs,
+    ref_decode as _ref_decode,
 )
 
-from triton._internal_testing import is_hip
+from triton._internal_testing import is_hip, is_hip_cdna4
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
@@ -22,7 +24,18 @@ NUM_Q_HEADS = NUM_KV_HEADS * QUERY_GROUP_SIZE
 HEAD_DIM = 64
 PAGE_SIZE = 16
 
-DECODE_METHODS = ("tlx", "aiter")
+
+def _check_aiter_available():
+    try:
+        import aiter  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
+_AITER_AVAILABLE = _check_aiter_available()
+DECODE_METHODS = ("tlx", "aiter") if _AITER_AVAILABLE else ("tlx", )
+
 DEFAULT_DECODE_VERSIONS = list(DECODE_METHODS)
 
 
@@ -48,7 +61,11 @@ def _make_decode_fn(provider, out, q, kc, vc, ctx, bt, sm_scale, qlen, max_conte
 
         return _run_tlx
 
-    from aiter.ops.triton.gluon.pa_decode_gluon import pa_decode_gluon
+    try:
+        from aiter.ops.triton.gluon.pa_decode_gluon import pa_decode_gluon
+    except Exception as e:
+        print(f"[aiter] skipped: {e}")
+        return None
 
     kc, vc = _pack_aiter_kv_cache(kc, vc)
     num_seqs = q.shape[0] // qlen
@@ -80,9 +97,7 @@ def _make_decode_fn(provider, out, q, kc, vc, ctx, bt, sm_scale, qlen, max_conte
     )
 
 
-def create_benchmark(versions, qlen):
-    line_vals = list(versions)
-    line_names = list(versions)
+def get_x_values():
     # (BATCH, N_CTX)
     x_vals = [
         (1, 8192),
@@ -95,10 +110,17 @@ def create_benchmark(versions, qlen):
         (8, 131072),
     ]
 
+    return x_vals
+
+
+def create_benchmark(versions, qlen, use_kv_cache_pool=False):
+    line_vals = list(versions)
+    line_names = list(versions)
+
     @triton.testing.perf_report(
         triton.testing.Benchmark(
             x_names=["BATCH", "N_CTX"],
-            x_vals=x_vals,
+            x_vals=get_x_values(),
             line_arg="provider",
             line_vals=line_vals,
             line_names=line_names,
@@ -111,19 +133,45 @@ def create_benchmark(versions, qlen):
         # Bound physical KV memory for large sweeps via a shared page pool.
         pool = 4 * ((N_CTX + PAGE_SIZE - 1) // PAGE_SIZE) + 16
         q, kc, vc, ctx, bt = _build_inputs(BATCH, [N_CTX] * BATCH, NUM_Q_HEADS, NUM_KV_HEADS, HEAD_DIM, PAGE_SIZE,
-                                           query_length=qlen, device=DEVICE, pool_pages=pool)
+                                           query_length=qlen, device=DEVICE,
+                                           pool_pages=pool if use_kv_cache_pool else None)
         out = torch.empty_like(q)
         fn = _make_decode_fn(provider, out, q, kc, vc, ctx, bt, sm_scale, qlen, N_CTX)
+        if fn is None:
+            return float("nan"), float("nan"), float("nan")
         quantiles = [0.5, 0.2, 0.8]
         ms, min_ms, max_ms = triton.testing.do_bench(fn, quantiles=quantiles, warmup=100, rep=200)
 
         # Decode reads the whole KV cache once (K + V, bf16): report effective
         # HBM read bandwidth, the meaningful metric for this memory-bound op.
-        kv_bytes = 2 * BATCH * NUM_KV_HEADS * N_CTX * HEAD_DIM * 2
+        # Use actual tensor sizes: with pool_pages sharing, multiple sequences
+        # map to the same physical pages, so BATCH*N_CTX overcounts HBM bytes.
+        kv_bytes = (kc.numel() + vc.numel()) * kc.element_size()
         tbps = lambda ms: kv_bytes * 1e-12 / (ms * 1e-3)
-        return tbps(ms), tbps(max_ms), tbps(min_ms)
+        return tbps(ms), tbps(min_ms), tbps(max_ms)
 
     return benchmark
+
+
+@pytest.mark.parametrize("provider", list(DECODE_METHODS))
+@pytest.mark.parametrize("query_length", [1, 2, 3, 4], ids=lambda q: f"qlen{q}")
+@pytest.mark.parametrize("batch, n_ctx", get_x_values())
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware (CDNA4)")
+def test_correctness(batch, n_ctx, query_length, provider):
+    sm_scale = 1.0 / (HEAD_DIM**0.5)
+    ctx_lens = [n_ctx] * batch
+    query, key_cache, value_cache, context_lens, block_tables = _build_inputs(batch, ctx_lens, NUM_Q_HEADS,
+                                                                              NUM_KV_HEADS, HEAD_DIM, PAGE_SIZE,
+                                                                              query_length=query_length, device=DEVICE)
+    out = torch.empty_like(query)
+    fn = _make_decode_fn(provider, out, query, key_cache, value_cache, context_lens, block_tables, sm_scale,
+                         query_length, n_ctx)
+    if fn is None:
+        pytest.skip(f"{provider} not available")
+    fn()
+    ref = _ref_decode(query, key_cache, value_cache, context_lens, block_tables, sm_scale, NUM_Q_HEADS, NUM_KV_HEADS,
+                      query_length)
+    torch.testing.assert_close(out.float(), ref, atol=2e-2, rtol=2e-2)
 
 
 if __name__ == "__main__":
@@ -142,6 +190,11 @@ if __name__ == "__main__":
         default=[1],
         help="Query lengths to sweep (multi-token prediction: 1-4).",
     )
+    parser.add_argument(
+        "--use_cache_pool",
+        action='store_true',
+        help="use pool for kv cache to reduce kv cache size",
+    )
     args = parser.parse_args()
 
     if is_hip():
@@ -149,7 +202,7 @@ if __name__ == "__main__":
         print(f"Running paged-decode benchmarks for: {versions}, qlens={args.qlens}")
         for qlen in args.qlens:
             print(f"\n=== query_length = {qlen} ===")
-            report = create_benchmark(versions, qlen)
+            report = create_benchmark(versions, qlen, use_kv_cache_pool=args.use_cache_pool)
             if "tlx" in versions and "aiter" in versions:
                 df = report.run(return_df=True)
                 ylabel = "TB/s (effective HBM read)"
