@@ -76,11 +76,16 @@ the backing allocation to function entry:
 - **SMEM channels** (existing `LocalAllocOp` source):
   Hoist the existing alloc to function entry via `hoistLocalAlloc`.
 
-- **Tensor-typed channels** (no existing alloc):
-  Call `createLocalAlloc` which creates a new `LocalAllocOp` (SMEM)
-  or `TMEMAllocOp` (for 1D tensors on Blackwell ≥ cc100), and also
-  inserts a `LocalStoreOp` after the producer and a `LocalLoadOp`
-  before the consumer.
+- **Tensor-typed channels**:
+  Call `createLocalAlloc`, which can reuse a dominating, read-only
+  `LocalAllocOp` initialized from the same descriptor result. Reuse requires
+  the encoding and memory space selected for the channel; shape and element
+  type compatibility follow from `LocalAllocOp` verification. Mutability may
+  differ because the descriptor-backed allocation is read-only, whereas a
+  newly created allocation needs a `local_store`.
+  Otherwise it creates a new `LocalAllocOp` (SMEM) or `TMEMAllocOp` (for 1D
+  tensors on Blackwell ≥ cc100). It adds the consumer's `LocalLoadOp` and only
+  creates a producer `LocalStoreOp` for a new allocation.
 
 Channels sharing the same producer value share the same buffer.
 
