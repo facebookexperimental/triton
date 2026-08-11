@@ -268,7 +268,7 @@ void createChannel(Operation *producerOp, mlir::DominanceInfo &dom,
 
 // Can be one end of the channel.
 static bool isChannelAnchorOp(Operation *op) {
-  if (isa<tt::LoadOp, tt::DescriptorLoadOp>(op) ||
+  if (isa<tt::LoadOp>(op) ||
       isa<mlir::triton::DotOpInterface, ttng::TMEMStoreOp>(op))
     return true;
   // Local alloc op with a register operand can be the producer of a channel.
@@ -760,19 +760,12 @@ static Operation *ProducerIsGen5(Operation *producerOp) {
   return nullptr;
 }
 
-// Return the TMA descriptor load feeding this allocation-backed channel's
-// local_store producer. Channel collection must never expose a descriptor_load
-// directly because buffer allocation stages it through local_store.
+// Return the buffered TMA descriptor load producing this allocation-backed
+// channel.
 static Operation *findTMAProducer(Channel *ch) {
   Operation *producerOp = ch->getSrcOp();
-  assert(!isa<tt::DescriptorLoadOp>(producerOp) &&
-         "allocation-backed TMA channel must be staged through local_store");
-  if (auto ls = dyn_cast<ttg::LocalStoreOp>(producerOp)) {
-    Operation *def = ls.getSrc().getDefiningOp();
-    if (def && isa<tt::DescriptorLoadOp>(def))
-      return def;
-  }
-  return nullptr;
+  return dyn_cast_or_null<ttnvws::DescriptorLoadOp>(producerOp) ? producerOp
+                                                                : nullptr;
 }
 
 // Handle buffer index and phase computation for operations outside loops
@@ -1346,6 +1339,23 @@ static Value hoistLocalAlloc(
   return newBuf;
 }
 
+// After doConvertDescriptorLoadsToNVWS, a value that was produced by a TMA
+// descriptor load no longer appears as a `tt.descriptor_load`: it is a
+// local_load of an SMEM buffer written by an `nvws.descriptor_load`. Return
+// that nvws load (or null) so register-channel code can treat such a value like
+// the pre-conversion `tt::DescriptorLoadOp` -- otherwise these paths silently
+// dead-end (wrong SMEM encoding / spurious TMEM promotion) once the conversion
+// runs ahead of buffer allocation.
+static ttnvws::DescriptorLoadOp getConvertedDescriptorLoad(Operation *srcOp) {
+  auto localLoad = dyn_cast_or_null<ttg::LocalLoadOp>(srcOp);
+  if (!localLoad)
+    return nullptr;
+  for (Operation *user : localLoad.getSrc().getUsers())
+    if (auto nvwsLoad = dyn_cast<ttnvws::DescriptorLoadOp>(user))
+      return nvwsLoad;
+  return nullptr;
+}
+
 // Create a local buffer for register channels. Return the allocated buffer and
 // the new producer (reloaded value).
 static std::pair<Value, Value>
@@ -1437,9 +1447,11 @@ createLocalAlloc(OpBuilderWithAsyncTaskIds &builder, Channel *channel,
     } else if (tmaStore) {
       sharedLayout = ttng::getEncodingFromDescriptor(tmaStore, tensorType,
                                                      tmaStore.getDesc());
-    } else if (auto tmaLoad = dyn_cast<tt::DescriptorLoadOp>(srcOp)) {
-      sharedLayout = ttng::getEncodingFromDescriptor(tmaLoad, tmaLoad.getType(),
-                                                     tmaLoad.getDesc());
+    } else if (auto nvwsLoad = getConvertedDescriptorLoad(srcOp)) {
+      // TMA descriptor load (converted to nvws.descriptor_load before buffer
+      // allocation): use the descriptor's shared encoding.
+      sharedLayout = ttng::getEncodingFromDescriptor(nvwsLoad, tensorType,
+                                                     nvwsLoad.getDesc());
     } else {
       // Create an unswizzled layout for now.
       // TODO: optimize it based on the consumer.
@@ -1735,9 +1747,13 @@ DenseMap<Channel *, Value> createBuffer(const SmallVector<Channel *> &channels,
     } else if (auto tensorType =
                    dyn_cast<RankedTensorType>(srcValue.getType())) {
       int cc = getNVIDIAComputeCapability(funcOp->getParentOfType<ModuleOp>());
+      // Keep TMA-descriptor-loaded 1-D values (e.g. the m/Di softmax metadata)
+      // in SMEM rather than promoting them to TMEM. After conversion these
+      // appear as a local_load of an nvws.descriptor_load buffer; otherwise
+      // such a channel overflows the 512-column TMEM limit in FA backward.
       bool useTMEM = cc >= 100 && tensorType.getShape().size() == 1 &&
                      tensorType.getElementType().isIntOrFloat() &&
-                     !isa<tt::DescriptorLoadOp>(srcOp);
+                     !getConvertedDescriptorLoad(srcOp);
       auto res = createLocalAlloc(builder, channel, useTMEM);
       buffer = res.first;
       newProducer = res.second;
@@ -2757,14 +2773,12 @@ void insertAsyncComm(
     }
     builder.setAsynTaskIdsFromArray(asyncTasksPC);
 
-    SmallVector<tt::DescriptorLoadOp> tmaLoads;
-    SmallVector<Value> buffers;
+    SmallVector<ttnvws::DescriptorLoadOp> tmaLoads;
     // Go through all channels in this channel group.
     for (auto &c : kv.second) {
       if (auto *tmaLoadOp = findTMAProducer(c)) {
-        auto tmaLoad = cast<tt::DescriptorLoadOp>(tmaLoadOp);
+        auto tmaLoad = cast<ttnvws::DescriptorLoadOp>(tmaLoadOp);
         tmaLoads.push_back(tmaLoad);
-        buffers.push_back(bufferMap.find(c)->second);
       }
     }
 
@@ -4423,7 +4437,7 @@ void insertAsyncComm(
               funcOp.getContext(), masterChannel->relation.first,
               WSBarrierAttr::kDirectionForward)
               .build(funcOp.getContext());
-      optimizeTMALoads(builder, tmaLoads, buffers, *commChannel.producerBarrier,
+      optimizeTMALoads(builder, tmaLoads, *commChannel.producerBarrier,
                        bufferIdx, bufferIdx, phase, tmaHeadProducer,
                        headConsumer, consumerWaitPoint,
                        additionalConsumerTaskIds, waitConstraints);
@@ -4879,7 +4893,44 @@ void removeRedundantTmemZeroStores(triton::FuncOp funcOp) {
   }
 }
 
-void doBufferAllocation(triton::FuncOp funcOp) {
+static LogicalResult hoistDescriptorLoadBuffers(triton::FuncOp funcOp) {
+  SmallVector<ttg::LocalAllocOp> buffers;
+  DenseSet<Operation *> seen;
+  WalkResult result = funcOp.walk([&](ttnvws::DescriptorLoadOp load) {
+    Value buffer = load.getResult();
+    while (Operation *def = buffer.getDefiningOp()) {
+      if (!isa<ttg::MemDescIndexOp, ttg::MemDescSubsliceOp, ttg::MemDescTransOp,
+               ttg::MemDescReshapeOp, ttg::MemDescReinterpretOp>(def))
+        break;
+      buffer = def->getOperand(0);
+    }
+    auto alloc = buffer.getDefiningOp<ttg::LocalAllocOp>();
+    if (!alloc) {
+      load.emitError("expected descriptor load destination to be backed by "
+                     "ttg.local_alloc before buffer hoisting");
+      return WalkResult::interrupt();
+    }
+    if (!isa<triton::FuncOp>(alloc->getParentOp()) && seen.insert(alloc).second)
+      buffers.push_back(alloc);
+    return WalkResult::advance();
+  });
+  if (result.wasInterrupted())
+    return failure();
+
+  OpBuilderWithAsyncTaskIds builder(funcOp.getContext());
+  Operation *lastHoistedAlloc = nullptr;
+  for (ttg::LocalAllocOp alloc : buffers) {
+    if (lastHoistedAlloc)
+      builder.setInsertionPointAfter(lastHoistedAlloc);
+    else
+      builder.setInsertionPointToStart(&funcOp.getBody().front());
+    Value buffer = hoistLocalAlloc(builder, alloc);
+    lastHoistedAlloc = buffer.getDefiningOp();
+  }
+  return success();
+}
+
+LogicalResult doBufferAllocation(triton::FuncOp funcOp) {
   // Step 0: Swap transposed local_alloc + memdesc_trans patterns so that
   // allocs that share the same source value can also share a buffer.
   swapTransposedLocalAllocs(funcOp);
@@ -4887,6 +4938,12 @@ void doBufferAllocation(triton::FuncOp funcOp) {
   // Step 0.5: Merge duplicate local_allocs with same src and layout.
   // This must be done after swapTransposedLocalAllocs which normalizes layouts.
   mergeDuplicateLocalAllocs(funcOp);
+
+  // Step 0.75: Descriptor loads already write explicit SMEM buffers. Hoist
+  // those destinations before discovering the remaining tensor channels so
+  // memory planning sees the canonical allocation from the outset.
+  if (failed(hoistDescriptorLoadBuffers(funcOp)))
+    return failure();
 
   // Step 1: collect all communications between producers and consumers.
   SmallVector<std::unique_ptr<Channel>> channelsOrigin;
@@ -4906,6 +4963,7 @@ void doBufferAllocation(triton::FuncOp funcOp) {
   // Step 4: Split remaining local_alloc with tensor source into
   // local_alloc + local_store for downstream channel detection.
   separateLocalAllocWithSrc(funcOp);
+  return success();
 }
 
 namespace {
@@ -5644,8 +5702,29 @@ public:
 
   void runOnFuncOp(triton::FuncOp funcOp) {
     // Disable code partitioning when numBuffers is 0.
-    if (numBuffers > 0)
+    if (numBuffers > 0) {
+      bool descriptorBuffersArePlanned = true;
+      funcOp.walk([&](tt::DescriptorLoadOp load) {
+        if (!load->hasOneUse()) {
+          descriptorBuffersArePlanned = false;
+          return;
+        }
+        Operation *user = *load->getUsers().begin();
+        Operation *alloc = nullptr;
+        if (auto store = dyn_cast<ttg::LocalStoreOp>(user))
+          alloc = store.getDst().getDefiningOp();
+        else if (auto localAlloc = dyn_cast<ttg::LocalAllocOp>(user))
+          alloc = localAlloc;
+        if (!alloc || !alloc->hasAttr("buffer.id"))
+          descriptorBuffersArePlanned = false;
+      });
+      if (descriptorBuffersArePlanned &&
+          failed(doConvertDescriptorLoadsToNVWS(funcOp))) {
+        signalPassFailure();
+        return;
+      }
       doCodePartition(funcOp, numBuffers);
+    }
     // Set NameLoc("accum_cnt") on ForOp block arguments whose corresponding
     // yield operand already has an "accum_cnt" NameLoc. This must be done at
     // the end because earlier steps may replace ForOps and lose block arg locs.
@@ -5693,7 +5772,16 @@ public:
   using impl::NVGPUTestWSBufferAllocationBase<
       NVGPUTestWSBufferAllocationPass>::NVGPUTestWSBufferAllocationBase;
 
-  void runOnFuncOp(triton::FuncOp funcOp) { doBufferAllocation(funcOp); }
+  void runOnFuncOp(triton::FuncOp funcOp) {
+    if (failed(doConvertDescriptorLoadsToNVWS(funcOp))) {
+      signalPassFailure();
+      return;
+    }
+    if (failed(doBufferAllocation(funcOp))) {
+      signalPassFailure();
+      return;
+    }
+  }
 
   void runOnOperation() override {
     getOperation()->walk([&](triton::FuncOp funcOp) { runOnFuncOp(funcOp); });

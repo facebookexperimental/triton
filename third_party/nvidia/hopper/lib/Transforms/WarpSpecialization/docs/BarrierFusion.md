@@ -47,7 +47,8 @@ The **ready barriers** ("full barriers") signal that data is available. The
 **File**: `WSLowerMem.cpp` (`optimizeTMALoads`)
 
 TMA (Tensor Memory Accelerator) barrier fusion is the most common form of
-barrier fusion. When multiple TMA loads share the same dominant consumer
+barrier fusion. At this point TMA producers are buffered
+`nvws.descriptor_load` operations. When multiple loads share the same dominant consumer
 operation (e.g., they all feed into the same MMA), they are fused onto a
 **single mbarrier** with a **single `BarrierExpectOp`** whose byte count is
 the sum of all loads' sizes.
@@ -66,7 +67,8 @@ to their sum, a single barrier wait covers all loads.
    are grouped together. Each group gets a single barrier pair (ready + empty).
 
 2. **Compute combined byte count**: `BarrierExpectOp` is emitted once with
-   the total `txCount` summed across all TMA loads in the group.
+   the `txCount` attributes summed across all NVWS loads in the group. Each
+   count is computed from the descriptor's CTA-local shape.
 
 3. **Issue TMA copies**: All `AsyncTMACopyGlobalToLocalOp` operations in the
    group reference the same ready barrier. The hardware auto-arrives on this
@@ -79,7 +81,11 @@ to their sum, a single barrier wait covers all loads.
 
 `optimizeTMALoads` is called from `insertAsyncComm` in `WSCodePartition.cpp`
 during the `doCodePartition` pass. It processes groups of channels whose
-producers are TMA descriptor loads.
+producers are `nvws.descriptor_load` operations. Each operation already owns
+its destination memdesc, so planner buffer replacement cannot be bypassed by a
+separate lowering-side buffer lookup. Lowering derives the allocation from
+that destination and rebuilds its stage view with the fused barrier's buffer
+index, keeping the copy slot and barrier phase aligned.
 
 ## tcgen05_commit Barrier Fusion
 

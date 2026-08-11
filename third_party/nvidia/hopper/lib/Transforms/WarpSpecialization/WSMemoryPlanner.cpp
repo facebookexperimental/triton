@@ -8,6 +8,7 @@
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Transforms/Passes.h"
 #include "nvidia/hopper/include/Transforms/Passes.h"
+#include "nvidia/include/Dialect/NVWS/IR/Dialect.h"
 #include "triton/Analysis/Allocation.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
@@ -32,6 +33,8 @@
 #define DEBUG_TYPE "nvgpu-ws-memory-planner"
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
 #define LDBG(X) LLVM_DEBUG(DBGS() << X << "\n")
+
+namespace ttnvws = mlir::triton::nvws;
 
 // Environment variable to dump DOT files: TRITON_DUMP_WS_GRAPHS
 // When set to a directory path, dumps visualization files there.
@@ -188,6 +191,8 @@ static Operation *findOriginalLoadForChannel(Channel *ch) {
   Operation *srcOp = ch->getSrcOp();
   if (!srcOp)
     return nullptr;
+  if (isa<ttnvws::DescriptorLoadOp>(srcOp))
+    return srcOp;
   if (auto storeOp = dyn_cast<ttg::LocalStoreOp>(srcOp))
     return findOriginalLoadOp(storeOp.getSrc());
   return nullptr;
@@ -1238,12 +1243,7 @@ static bool isSmemTMAChannel(Operation *alloc,
     return false;
   if (isa<ttng::AsyncTMACopyGlobalToLocalOp>(srcOp))
     return true;
-  if (auto storeOp = dyn_cast<ttg::LocalStoreOp>(srcOp)) {
-    Value stored = storeOp.getSrc();
-    if (auto *defOp = stored.getDefiningOp())
-      return isa<tt::DescriptorLoadOp>(defOp);
-  }
-  return false;
+  return isa<ttnvws::DescriptorLoadOp>(srcOp);
 }
 
 /// Helper to read the loop.stage attribute from an op. Returns -1 if absent.
@@ -1767,6 +1767,41 @@ static bool areReuseEncodingsCompatible(const WSBuffer &candidate,
          candTy.getElementType() == tgtTy.getElementType();
 }
 
+static bool isDataDependent(Operation *srcOp, Operation *dstOp) {
+  return dependsThroughMemory(srcOp, dstOp);
+}
+
+static bool isOrderedDescriptorReuseTarget(const WSBuffer &candidate,
+                                           const WSBuffer &target,
+                                           SmallVector<Channel *> &channels) {
+  if (candidate.tmaStaging == 0)
+    return false;
+
+  Channel *targetChannel = findChannelForOp(target.allocOp, channels);
+  Channel *candidateChannel = findChannelForOp(candidate.allocOp, channels);
+  if (!targetChannel || !candidateChannel ||
+      !isa<ttnvws::DescriptorLoadOp>(targetChannel->getSrcOp()))
+    return false;
+
+  Operation *candidateProducer = getLogicalProducerOp(candidateChannel);
+  if (!candidateProducer)
+    return false;
+
+  SmallVector<Operation *> targetConsumers;
+  targetChannel->getDstOps(targetConsumers);
+  if (targetConsumers.empty()) {
+    if (Operation *consumer = targetChannel->getDstOp())
+      targetConsumers.push_back(consumer);
+  }
+  for (Operation *consumer : targetConsumers) {
+    for (Operation *actualConsumer : getActualConsumers(consumer)) {
+      if (isDataDependent(actualConsumer, candidateProducer))
+        return true;
+    }
+  }
+  return false;
+}
+
 /// Find an allocated buffer that a non-innermost candidate can reuse.
 /// The candidate must NOT be innermost (partition-unaware liveness is
 /// inaccurate within the inner loop). Can scan allocated innermost buffers
@@ -1834,7 +1869,15 @@ findReuseCandidate(WSBuffer &candidate, SmallVector<WSBuffer> &wsBuffers,
     }
 
     auto order = getLastConsumerOrderDetailed(buf, channels, numClusters);
-    int effectiveOrder = order.linearOrder < 0 ? INT_MAX : order.linearOrder;
+    int effectiveOrder = order.linearOrder;
+    if (effectiveOrder < 0) {
+      if (!isOrderedDescriptorReuseTarget(candidate, buf, channels))
+        effectiveOrder = INT_MAX;
+      else
+        // Sort a dependency-ordered, unstaged descriptor target after every
+        // target with an explicit pipeline order, but keep it selectable.
+        effectiveOrder = INT_MAX - 1;
+    }
     LDBG("  findReuseCandidate: target bufferId="
          << buf.bufferId << " size=" << buf.sizeBytes << "*" << buf.numCopies
          << " lastConsumerOrder=" << order.linearOrder
@@ -2237,6 +2280,20 @@ static unsigned allocateSmemBuffersViaSearch(
          << id << " members=" << blk.members.size() << " copy=" << blk.copies);
   }
   return nextId;
+}
+
+// doConvertDescriptorLoadsToNVWS always runs before the memory planner, so a
+// value fed by a TMA descriptor load is no longer a `tt.descriptor_load`
+// result: when the load has more than one use it becomes a local_load of the
+// SMEM buffer written by an `nvws.descriptor_load`. Match that shape so
+// descriptor-load staging buffers are still recognized for hoisting.
+static bool isFedByDescriptorLoad(Value stored) {
+  auto localLoad = stored.getDefiningOp<ttg::LocalLoadOp>();
+  if (!localLoad)
+    return false;
+  return llvm::any_of(localLoad.getSrc().getUsers(), [](Operation *user) {
+    return isa<ttnvws::DescriptorLoadOp>(user);
+  });
 }
 
 static unsigned allocateSmemBuffers(
@@ -2740,11 +2797,14 @@ static unsigned allocateSmemBuffers(
           continue;
         for (Operation *user : value.getUsers()) {
           if (auto store = dyn_cast<ttg::LocalStoreOp>(user)) {
-            if (isa_and_nonnull<tt::DescriptorLoadOp>(
-                    store.getSrc().getDefiningOp())) {
+            if (isFedByDescriptorLoad(store.getSrc())) {
               feedsTMA = true;
               break;
             }
+          }
+          if (isa<ttnvws::DescriptorLoadOp>(user)) {
+            feedsTMA = true;
+            break;
           }
           if (isa<ttng::AsyncTMACopyLocalToGlobalOp, ttng::AsyncTMAReduceOp>(
                   user)) {
@@ -5506,6 +5566,10 @@ public:
 
   void runOnFuncOp(triton::FuncOp funcOp) {
     if (numBuffers >= 1 || !readDecisionFile.empty()) {
+      if (failed(doConvertDescriptorLoadsToNVWS(funcOp))) {
+        signalPassFailure();
+        return;
+      }
       MemoryPlannerOptions options;
       options.readDecisionFile = readDecisionFile;
       options.writeDecisionFile = writeDecisionFile;
