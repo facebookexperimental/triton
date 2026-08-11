@@ -4,6 +4,7 @@ add_triton_library(TritonTools
   LinearLayout.cpp
   ModularArithmetic.cpp
   PluginUtils.cpp
+  RadixLayout.cpp
 
   DEPENDS
 
