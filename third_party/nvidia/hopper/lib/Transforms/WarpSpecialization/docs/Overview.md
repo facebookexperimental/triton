@@ -95,8 +95,8 @@ recognizes the `scf.while` outer loop (same doc).
 | `TaskIdPropagation.cpp` | — | `TaskIdBackwardPropagation` sparse dataflow analysis |
 | `WSTaskIdPropagate.cpp` | `doTaskIdPropagate` | Runs analysis and materializes task IDs |
 | `WSAtomicBroadcast.cpp` | `doDynamicTileBroadcast` | Cross-partition run-once "claim next tile" support: run a dynamic-persistent tile-id producer once and broadcast it, for both a `tt.atomic_rmw` counter and a CLC tile-scheduler fetch (`ttng.clc_read`) — or gracefully reject unsupported shapes. See [CrossPartitionAtomicSupport.md](CrossPartitionAtomicSupport.md) |
-| `lib/Dialect/TritonNvidiaGPU/Transforms/AtomicTileScheduler.cpp` | `atomic-tile-scheduler-prepare` / `atomic-tile-scheduler-materialize` | Backend-only physical-cluster extension for the atomic dynamic scheduler: prove and tag before AutoWS, then reserve and distribute `K` PIDs in one late pass after optional warp specialization |
-| `lib/Dialect/TritonNvidiaGPU/Transforms/ClusterHandoff.cpp` | shared utility | Captures function-lifetime atomic/CLC handoff storage into an already-isolated AutoWS owner partition and builds TLX-style remote mbarrier arrivals |
+| [`lib/Dialect/TritonNvidiaGPU/Transforms/AtomicTileScheduler.cpp`](AtomicTileScheduler.md) | `atomic-tile-scheduler-prepare` / `atomic-tile-scheduler-materialize` | Backend-only physical-cluster extension for the atomic dynamic scheduler: prove and tag before AutoWS, then reserve and distribute `K` PIDs in one late pass after optional warp specialization |
+| [`lib/Dialect/TritonNvidiaGPU/Transforms/ClusterHandoff.cpp`](ClusterHandoff.md) | shared utility | Captures function-lifetime atomic/CLC handoff storage into an already-isolated AutoWS owner partition and builds TLX-style remote mbarrier arrivals |
 | `WSDataPartition.cpp` | `doDataPartition` / `nvgpu-ws-data-partition` | Splits ops along M/N dimensions across warp groups |
 | `PingPong.cpp` | `doPingPongPrep` / `doPingPongSync` | Named barrier insertion for ping-pong scheduling |
 | `WSCodePartition.cpp` | `doBufferAllocation` | Channel discovery and SMEM/TMEM allocation hoisting (pre-pass) |
@@ -144,6 +144,8 @@ recognizes the `scf.while` outer loop (same doc).
 
 - [Task Partitioning & ID Propagation](TaskPartitionAndPropagation.md) — how ops are assigned to partitions
 - [Cross-Partition Run-Once Atomic Support](CrossPartitionAtomicSupport.md) — dynamic-persistent tile-id `atomic_add` broadcast
+- [Atomic Tile Scheduler](AtomicTileScheduler.md) — physical-cluster preparation, AutoWS interaction, and late PID handoff materialization
+- [Cluster Handoff Utilities](ClusterHandoff.md) — shared persistent mbarrier allocation, warp-partition capture, and remote-arrive builders
 - [Dynamic Persistent AutoWS Gaps](DynamicPersistentAutoWSGaps.md) — current inner-loop support, outer-while blockers, and completion criteria
 - [Data Partitioning](DataPartition.md) — splitting tensor dimensions across consumer warp groups
 - [Code Partitioning](CodePartition.md) — channel discovery, buffer creation, sync insertion

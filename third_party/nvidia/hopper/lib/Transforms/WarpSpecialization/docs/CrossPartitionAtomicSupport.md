@@ -73,6 +73,10 @@ handshake.
 
 ### Physical multi-CTA clusters
 
+See [Atomic Tile Scheduler](AtomicTileScheduler.md) for the complete pass and
+IR-shape contract, and [Cluster Handoff Utilities](ClusterHandoff.md) for the
+shared DSM/mbarrier builders used by the atomic and CLC materializers.
+
 The cross-partition broadcast above is intra-CTA; it is not itself a
 cluster-level scheduler. For an explicitly clustered 2-CTA MMA kernel, the
 NVIDIA backend adds a second protocol without changing
