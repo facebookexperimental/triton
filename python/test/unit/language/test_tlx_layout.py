@@ -235,8 +235,8 @@ def test_pinned_scf_loop_carried_const_init():
 def test_pinned_softmax_end_to_end():
     """End-to-end mirror of the HSTU forward softmax island: pinned load -> mask
     (select+add) -> thread-local reduce -> fma helper (tt.call) -> exp2 -> row sum
-    -> restructuring helper (reshape/split, auto-released) -> store. Exercises
-    every propagation/relaxation path together, with no explicit release."""
+    -> restructuring helper (reshape/split, pin preserved) -> store. Exercises
+    every propagation/inference path together, with no explicit release."""
 
     @triton.jit
     def _restructure_tail(p):
@@ -256,7 +256,7 @@ def test_pinned_softmax_end_to_end():
         p = tl.math.exp2(x)
         l = tl.reduce(p, 1, _pinned_add_combine)
         p = p * l[:, None]
-        # Restructuring helper: the fixup auto-releases the pin on the call arg.
+        # The fixup specializes the helper and preserves the pin through it.
         y = _restructure_tail(p)
         tlx.local_store(v, y)
 
@@ -297,12 +297,11 @@ def test_pinned_reduction_through_tl_max_sum_call():
 
 
 @pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
-def test_pinned_auto_release_through_restructuring_call():
+def test_pinned_preserved_through_restructuring_call():
     """A pinned tensor fed to a @triton.jit helper that restructures it
-    (reshape/permute/split, like subtile_ops._split_n_2D) compiles with no
-    explicit release: TritonTLXFixup inserts an internal layout release on the
-    placeholder call args (the pin has no meaning across the restructure) and
-    the tail runs in a compiler-chosen layout."""
+    (reshape/permute/split, like subtile_ops._split_n_2D) keeps its layout
+    constraint. TritonTLXFixup specializes the helper signature and re-infers
+    each result layout without inserting an implicit release."""
 
     @triton.jit
     def _restructure_helper(x):
@@ -315,10 +314,11 @@ def test_pinned_auto_release_through_restructuring_call():
         v = tlx.local_view(buf, 0)
         x = tlx.local_load(v, layout=LAYOUT)
         x = tl.math.exp2(x)  # pinned arith
-        y = _restructure_helper(x)  # tt.call, restructuring -> auto-release the arg
+        y = _restructure_helper(x)
         tlx.local_store(v, y)
 
     compiled = kernel.warmup(_row_per_thread_layout(), grid=(1, ), num_warps=4)
+    assert "tlx.release_layout" not in compiled.asm["ttir"]
     assert "no_verify_layout" not in compiled.asm["ttgir"]
 
 
