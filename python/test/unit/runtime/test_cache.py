@@ -6,6 +6,8 @@ import re
 import gc
 import shutil
 import pathlib
+import subprocess
+import sys
 from concurrent.futures import Executor, Future, ThreadPoolExecutor
 
 import pytest
@@ -15,6 +17,29 @@ import triton
 import triton.language as tl
 from triton._internal_testing import is_hip
 from triton.runtime.cache import FileCacheManager, RemoteCacheManager
+
+
+def test_file_cache_manager_writes_utf8_under_ascii_locale(tmp_path):
+    env = os.environ.copy()
+    env.update({
+        "LANG": "C",
+        "LC_ALL": "C",
+        "PYTHONCOERCECLOCALE": "0",
+        "PYTHONUTF8": "0",
+        "TRITON_CACHE_DIR": str(tmp_path),
+    })
+    script = """
+import locale
+from pathlib import Path
+
+from triton.runtime.cache import FileCacheManager
+
+assert locale.getpreferredencoding(False) == "ANSI_X3.4-1968"
+text = "generated launcher " + chr(0x2014)
+path = FileCacheManager("unicode").put(text, "launcher.c", binary=False)
+assert Path(path).read_text(encoding="utf-8") == text
+"""
+    subprocess.run([sys.executable, "-c", script], check=True, env=env)
 
 
 def test_file_cache_manager_get_group_rejects_missing_child(fresh_knobs, tmp_path):
