@@ -739,7 +739,7 @@ class TestSplitK(TestCase):
     )
     @unittest.skipIf(not has_tlx(), "TLX not available")
     def test_split_k_no_fusion(self):
-        """Verify epilogue fusion is disabled with split-K (relu applied separately)."""
+        """Verify the split-K epilogue is fused into the generated reducer."""
 
         def relu_mm(a, b):
             return torch.relu(torch.mm(a, b))
@@ -762,11 +762,12 @@ class TestSplitK(TestCase):
         torch.testing.assert_close(c_actual, c_expected, atol=0.01, rtol=0.01)
 
         code_str = "\n".join(code)
-        # Reduction kernel present (split-K was used)
-        self.assertIn("_reduce_k_kernel", code_str)
-        # relu should NOT be fused into the GEMM kernel — it should appear
-        # as a separate pointwise kernel after the reduction
-        self.assertIn("triton_poi_", code_str)
+        # Reduction kernel present (split-K was used). The generated reducer is
+        # named "{main_kernel}_reduce_k"; the legacy "_reduce_k_kernel" symbol is
+        # only emitted on the no-epilogue path.
+        self.assertIn("_reduce_k", code_str)
+        # relu is fused into the reducer, so no separate pointwise kernel
+        self.assertNotIn("triton_poi_", code_str)
 
 
 class TestReduceKKernel(TestCase):
