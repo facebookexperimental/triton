@@ -355,8 +355,7 @@ class HIPBackend(BaseBackend):
         else:
             amd.passes.ttgpuir.add_schedule_loops(pm, options.num_stages)
             amd.passes.ttgpuir.add_pipeline(pm, use_async_copy, use_block_pingpong)
-        if use_async_copy:
-            amd.passes.ttgpuir.add_coalesce_async_copy(pm, options.arch)
+        amd.passes.ttgpuir.add_coalesce_async_copy(pm, options.arch, use_async_copy)
         amd.passes.ttgpuir.add_convert_to_tensor_ops(pm)
         # Phase 0 — opt-in TTGIR-level scheduler scaffold. No-ops unless
         # TRITON_ENABLE_TTGIR_SCHED=1 (also re-checked inside the pass).
