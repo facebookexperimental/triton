@@ -5,6 +5,7 @@
 #include <Python.h>
 #include <dlfcn.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -1127,6 +1128,296 @@ cleanup:
   return NULL;
 }
 
+/* Meta-specific HIP dispatcher.  The generic HIP launcher above is already a
+ * C extension, but Python still rebuilds its launch tuple, flattens arguments,
+ * handles hooks, and unpacks metadata on every invocation.  This object binds
+ * the invariant launch state once and exposes a vectorcall hot path:
+ *   dispatcher(grid_x, grid_y, grid_z, stream, *kernel_args)
+ * Tensor descriptors and compiler-managed scratch deliberately fall back to
+ * the generic launcher for now; paged decode uses neither. */
+#define HIP_TD_MAX_KERNEL_ARGS 128
+#define HIP_TD_FIXED_ARGS 4
+
+typedef struct {
+  int8_t (*get_scalar_type)(PyObject *);
+  uint64_t (*get_data_ptr)(PyObject *);
+  int (*extract_tensordesc)(PyObject *, uint64_t *, int64_t *, int64_t *, int);
+  int8_t (*is_cuda_tensor)(PyObject *);
+} HIPTritonTensorAccessAPI;
+
+static HIPTritonTensorAccessAPI *hip_td_bridge = NULL;
+
+static PyObject *hipRegisterTensorBridge(PyObject *self, PyObject *arg) {
+  (void)self;
+  if (!PyCapsule_IsValid(arg, "triton_tensor_access_api")) {
+    PyErr_SetString(PyExc_TypeError,
+                    "Expected a triton_tensor_access_api PyCapsule");
+    return NULL;
+  }
+  hip_td_bridge = (HIPTritonTensorAccessAPI *)PyCapsule_GetPointer(
+      arg, "triton_tensor_access_api");
+  Py_RETURN_NONE;
+}
+
+typedef union {
+  hipDeviceptr_t ptr;
+  int8_t i8;
+  int16_t i16;
+  int32_t i32;
+  int64_t i64;
+  uint8_t u8;
+  uint16_t u16;
+  uint32_t u32;
+  uint64_t u64;
+  float f32;
+  double f64;
+} HIPTDArgSlot;
+
+typedef struct {
+  PyObject_HEAD vectorcallfunc vectorcall;
+  hipFunction_t function;
+  int num_warps;
+  int num_ctas;
+  int shared_mem;
+  int launch_cooperative_grid;
+  int warp_size;
+  int num_args;
+  uint8_t arg_types[HIP_TD_MAX_KERNEL_ARGS];
+  HIPTDArgSlot arg_storage[HIP_TD_MAX_KERNEL_ARGS];
+  void *kernel_params[HIP_TD_MAX_KERNEL_ARGS];
+} HIPTritonDispatcher;
+
+static inline int hip_td_extract_ptr(PyObject *obj, hipDeviceptr_t *out) {
+  if (obj == Py_None) {
+    *out = (hipDeviceptr_t)0;
+    return 0;
+  }
+  if (PyLong_Check(obj)) {
+    *out = (hipDeviceptr_t)PyLong_AsUnsignedLongLong(obj);
+    return PyErr_Occurred() ? -1 : 0;
+  }
+  if (hip_td_bridge && hip_td_bridge->is_cuda_tensor &&
+      hip_td_bridge->is_cuda_tensor(obj) == 1) {
+    *out = (hipDeviceptr_t)hip_td_bridge->get_data_ptr(obj);
+    return 0;
+  }
+  PyObject *ret = PyObject_CallMethodNoArgs(obj, data_ptr_str);
+  if (!ret)
+    return -1;
+  if (!PyLong_Check(ret)) {
+    Py_DECREF(ret);
+    PyErr_SetString(PyExc_TypeError,
+                    "Pointer argument must return an integer from data_ptr()");
+    return -1;
+  }
+  *out = (hipDeviceptr_t)PyLong_AsUnsignedLongLong(ret);
+  Py_DECREF(ret);
+  if (PyErr_Occurred())
+    return -1;
+  if (*out == 0)
+    return 0;
+  hipDeviceptr_t device_ptr = *out;
+  hipError_t status = hipSymbolTable.hipPointerGetAttribute(
+      &device_ptr, HIP_POINTER_ATTRIBUTE_DEVICE_POINTER, *out);
+  if (status == hipErrorInvalidValue) {
+    PyErr_SetString(PyExc_ValueError,
+                    "Pointer argument cannot be accessed from Triton (cpu tensor?)");
+    (void)hipSymbolTable.hipGetLastError();
+    return -1;
+  }
+  if (status != hipSuccess) {
+    gpuAssert(status, __FILE__, __LINE__);
+    return -1;
+  }
+  *out = device_ptr;
+  return 0;
+}
+
+static inline uint16_t hip_td_pack_fp16(double value) {
+  uint16_t result;
+#if 0x030600B1 <= PY_VERSION_HEX && PY_VERSION_HEX <= 0x030B00A1 &&            \
+    !defined(PYPY_VERSION)
+  _PyFloat_Pack2(value, (unsigned char *)&result, 1);
+#else
+  PyFloat_Pack2(value, (char *)&result, 1);
+#endif
+  return result;
+}
+
+static inline uint16_t hip_td_pack_bf16(double value) {
+  float f32 = (float)value;
+  uint32_t bits;
+  memcpy(&bits, &f32, sizeof(bits));
+  return (uint16_t)(bits >> 16);
+}
+
+static int hip_td_convert_args(HIPTritonDispatcher *self,
+                               PyObject *const *args) {
+  for (int i = 0; i < self->num_args; ++i) {
+    PyObject *arg = args[i];
+    HIPTDArgSlot *slot = &self->arg_storage[i];
+    switch (self->arg_types[i]) {
+    case EXTRACTOR_POINTER_INDEX:
+      if (hip_td_extract_ptr(arg, &slot->ptr) < 0)
+        return -1;
+      break;
+    case EXTRACTOR_INT8_INDEX:
+      slot->i8 = (int8_t)PyLong_AsLong(arg);
+      break;
+    case EXTRACTOR_INT16_INDEX:
+      slot->i16 = (int16_t)PyLong_AsLong(arg);
+      break;
+    case EXTRACTOR_INT32_INDEX:
+      slot->i32 = (int32_t)PyLong_AsLong(arg);
+      break;
+    case EXTRACTOR_INT64_INDEX:
+      slot->i64 = (int64_t)PyLong_AsLongLong(arg);
+      break;
+    case EXTRACTOR_UINT8_INDEX:
+      slot->u8 = (uint8_t)PyLong_AsUnsignedLong(arg);
+      break;
+    case EXTRACTOR_UINT16_INDEX:
+      slot->u16 = (uint16_t)PyLong_AsUnsignedLong(arg);
+      break;
+    case EXTRACTOR_UINT32_INDEX:
+      slot->u32 = (uint32_t)PyLong_AsUnsignedLong(arg);
+      break;
+    case EXTRACTOR_UINT64_INDEX:
+      slot->u64 = (uint64_t)PyLong_AsUnsignedLongLong(arg);
+      break;
+    case EXTRACTOR_FP16_INDEX:
+      slot->u16 = hip_td_pack_fp16(PyFloat_AsDouble(arg));
+      break;
+    case EXTRACTOR_BF16_INDEX:
+      slot->u16 = hip_td_pack_bf16(PyFloat_AsDouble(arg));
+      break;
+    case EXTRACTOR_FP32_INDEX:
+      slot->f32 = (float)PyFloat_AsDouble(arg);
+      break;
+    case EXTRACTOR_FP64_INDEX:
+      slot->f64 = PyFloat_AsDouble(arg);
+      break;
+    default:
+      PyErr_Format(PyExc_TypeError,
+                   "Unsupported HIP dispatcher type code %u for argument %d",
+                   self->arg_types[i], i);
+      return -1;
+    }
+    if (PyErr_Occurred())
+      return -1;
+  }
+  return 0;
+}
+
+static PyObject *HIPTritonDispatcher_vectorcall(PyObject *callable,
+                                                PyObject *const *args,
+                                                size_t nargsf,
+                                                PyObject *kwnames) {
+  HIPTritonDispatcher *self = (HIPTritonDispatcher *)callable;
+  Py_ssize_t nargs = PyVectorcall_NARGS(nargsf);
+  if (kwnames && PyTuple_GET_SIZE(kwnames) != 0) {
+    PyErr_SetString(PyExc_TypeError,
+                    "HIP _TritonDispatcher accepts positional arguments only");
+    return NULL;
+  }
+  if (nargs != HIP_TD_FIXED_ARGS + self->num_args) {
+    PyErr_Format(PyExc_TypeError, "HIP _TritonDispatcher expected %d args, got %zd",
+                 HIP_TD_FIXED_ARGS + self->num_args, nargs);
+    return NULL;
+  }
+
+  int grid_x = (int)PyLong_AsLong(args[0]);
+  int grid_y = (int)PyLong_AsLong(args[1]);
+  int grid_z = (int)PyLong_AsLong(args[2]);
+  uint64_t stream = PyLong_AsUnsignedLongLong(args[3]);
+  if (PyErr_Occurred())
+    return NULL;
+  if (grid_x * grid_y * grid_z == 0)
+    Py_RETURN_NONE;
+  if (hip_td_convert_args(self, args + HIP_TD_FIXED_ARGS) < 0)
+    return NULL;
+
+  _launch(grid_x, grid_y, grid_z, self->num_warps, self->num_ctas,
+          self->launch_cooperative_grid, self->shared_mem, self->warp_size,
+          (hipStream_t)(uintptr_t)stream, self->function, self->kernel_params);
+  if (PyErr_Occurred())
+    return NULL;
+  Py_RETURN_NONE;
+}
+
+static PyObject *HIPTritonDispatcher_new(PyTypeObject *type, PyObject *args,
+                                         PyObject *kwargs) {
+  unsigned long long function;
+  int num_warps, num_ctas, shared_mem, launch_cooperative_grid, warp_size;
+  PyObject *arg_type_codes;
+  static char *kwlist[] = {"function", "num_warps", "num_ctas", "shared_mem",
+                           "launch_cooperative_grid", "warp_size",
+                           "arg_type_codes", NULL};
+  if (!PyArg_ParseTupleAndKeywords(args, kwargs, "KiiiiiO", kwlist, &function,
+                                   &num_warps, &num_ctas, &shared_mem,
+                                   &launch_cooperative_grid, &warp_size,
+                                   &arg_type_codes))
+    return NULL;
+
+  PyObject *types = PySequence_Fast(arg_type_codes,
+                                    "arg_type_codes must be a sequence");
+  if (!types)
+    return NULL;
+  Py_ssize_t num_args = PySequence_Fast_GET_SIZE(types);
+  if (num_args > HIP_TD_MAX_KERNEL_ARGS - 2) {
+    Py_DECREF(types);
+    PyErr_SetString(PyExc_ValueError, "Too many HIP kernel arguments");
+    return NULL;
+  }
+
+  HIPTritonDispatcher *self = (HIPTritonDispatcher *)type->tp_alloc(type, 0);
+  if (!self) {
+    Py_DECREF(types);
+    return NULL;
+  }
+  self->vectorcall = HIPTritonDispatcher_vectorcall;
+  self->function = (hipFunction_t)(uintptr_t)function;
+  self->num_warps = num_warps;
+  self->num_ctas = num_ctas;
+  self->shared_mem = shared_mem;
+  self->launch_cooperative_grid = launch_cooperative_grid;
+  self->warp_size = warp_size;
+  self->num_args = (int)num_args;
+  memset(self->arg_storage, 0, sizeof(self->arg_storage));
+  memset(self->kernel_params, 0, sizeof(self->kernel_params));
+
+  for (Py_ssize_t i = 0; i < num_args; ++i) {
+    long code = PyLong_AsLong(PySequence_Fast_GET_ITEM(types, i));
+    if (PyErr_Occurred() || code <= EXTRACTOR_UNKOWN_INDEX ||
+        code >= EXTRACTOR_TYPE_COUNT || code == EXTRACTOR_TDMDESC_INDEX) {
+      Py_DECREF(types);
+      Py_DECREF(self);
+      if (!PyErr_Occurred())
+        PyErr_Format(PyExc_TypeError,
+                     "Unsupported HIP dispatcher type code %ld", code);
+      return NULL;
+    }
+    self->arg_types[i] = (uint8_t)code;
+    self->kernel_params[i] = &self->arg_storage[i];
+  }
+  Py_DECREF(types);
+  /* Every Triton HIP kernel ABI ends in global/profile scratch pointers. */
+  self->kernel_params[num_args] = &self->arg_storage[num_args];
+  self->kernel_params[num_args + 1] = &self->arg_storage[num_args + 1];
+  return (PyObject *)self;
+}
+
+static PyTypeObject HIPTritonDispatcherType = {
+    PyVarObject_HEAD_INIT(NULL, 0).tp_name =
+        "triton.backends.amd._TritonDispatcher",
+    .tp_basicsize = sizeof(HIPTritonDispatcher),
+    .tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_HAVE_VECTORCALL,
+    .tp_vectorcall_offset = offsetof(HIPTritonDispatcher, vectorcall),
+    .tp_call = PyVectorcall_Call,
+    .tp_new = HIPTritonDispatcher_new,
+    .tp_doc = "Meta-specific vectorcall dispatcher for HIP kernels.",
+};
+
 static PyMethodDef ModuleMethods[] = {
     {"load_binary", loadBinary, METH_VARARGS,
      "Load provided hsaco into HIP driver"},
@@ -1142,6 +1433,8 @@ static PyMethodDef ModuleMethods[] = {
      "argument parsing."},
     {"launch", launchKernel, METH_VARARGS,
      "Entry point for all kernels with this signature"},
+    {"register_tensor_bridge", hipRegisterTensorBridge, METH_O,
+     "Register the tensor access capsule for fast pointer extraction"},
     {NULL, NULL, 0, NULL} // sentinel
 };
 
@@ -1152,6 +1445,10 @@ static struct PyModuleDef ModuleDef = {PyModuleDef_HEAD_INIT, "hip_utils",
 
 PyMODINIT_FUNC PyInit_hip_utils(void) {
   if (!initSymbolTable()) {
+    return NULL;
+  }
+
+  if (PyType_Ready(&HIPTritonDispatcherType) < 0) {
     return NULL;
   }
 
@@ -1178,6 +1475,9 @@ PyMODINIT_FUNC PyInit_hip_utils(void) {
   PyModule_AddIntConstant(m, "ARG_CONSTEXPR", ARG_CONSTEXPR);
   PyModule_AddIntConstant(m, "ARG_KERNEL", ARG_KERNEL);
   PyModule_AddIntConstant(m, "ARG_TUPLE", ARG_TUPLE);
+  Py_INCREF(&HIPTritonDispatcherType);
+  PyModule_AddObject(m, "_TritonDispatcher",
+                     (PyObject *)&HIPTritonDispatcherType);
 
   return m;
 }

@@ -17,7 +17,7 @@ import torch
 import triton
 import triton.language as tl
 from triton import knobs
-from triton._internal_testing import is_cuda
+from triton._internal_testing import is_cuda, is_hip
 
 
 @contextlib.contextmanager
@@ -126,6 +126,47 @@ def test_dispatcher_core_empty_grid():
         _disp_add[(0, )](x, y, out, N, BLOCK=256)
     torch.cuda.synchronize()
     torch.testing.assert_close(out, torch.zeros(N, device="cuda"))
+
+
+@pytest.mark.skipif(not is_hip(), reason="Requires HIP")
+def test_hip_dispatcher_add_numerics_and_direct_call():
+    """HIP binds launch metadata once and uses the vectorcall dispatcher."""
+    N = 4096
+    BLOCK = 256
+    x = torch.randn(N, device="cuda")
+    y = torch.randn(N, device="cuda")
+    out = torch.empty(N, device="cuda")
+    grid = triton.cdiv(N, BLOCK)
+
+    with force_dispatcher():
+        compiled = _disp_add.warmup(x, y, out, N, BLOCK=BLOCK, grid=(grid, ))
+        compiled._init_handles()
+        dispatcher = getattr(compiled, "_dispatcher", None)
+        assert dispatcher is not None
+
+        device = triton.runtime.driver.active.get_current_device()
+        stream = triton.runtime.driver.active.get_current_stream(device)
+        dispatcher(grid, 1, 1, stream, x, y, out, N)
+
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out, x + y)
+
+
+@pytest.mark.skipif(not is_hip(), reason="Requires HIP")
+def test_hip_dispatcher_rejects_pageable_cpu_pointer():
+    N = 256
+    x = torch.randn(N, device="cpu")
+    y = torch.randn(N, device="cuda")
+    out = torch.empty_like(y)
+
+    with force_dispatcher():
+        compiled = _disp_add.warmup(y, y, out, N, BLOCK=N, grid=(1, ))
+        compiled._init_handles()
+        dispatcher = compiled._dispatcher
+        device = triton.runtime.driver.active.get_current_device()
+        stream = triton.runtime.driver.active.get_current_stream(device)
+        with pytest.raises(ValueError, match="cannot be accessed from Triton"):
+            dispatcher(1, 1, 1, stream, x, y, out, N)
 
 
 @pytest.mark.skipif(not is_cuda(), reason="Requires CUDA")

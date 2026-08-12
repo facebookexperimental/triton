@@ -758,7 +758,8 @@ def pa_decode_tlx(output,  # [num_tokens, num_q_heads, HEAD_DIM]
     short_qlen1 = (query_length == 1 and num_seqs == 32 and max_context_len == 8192)
     if streaming_kv is None:
         streaming_kv = (cache_5d and head_dim == 64 and max_context_len is not None
-                        and ((query_length == 1 and (short_qlen1 or (num_seqs >= 128 and max_context_len >= 8192) or
+                        and ((query_length == 1 and ((num_seqs == 8 and max_context_len == 8192) or short_qlen1 or
+                                                     (num_seqs >= 128 and max_context_len >= 8192) or
                                                      (num_seqs >= 32 and max_context_len >= 32768) or
                                                      (num_seqs == 8 and max_context_len >= 32768))) or
                              (query_length == 4 and ((num_seqs >= 32 and max_context_len >= 8192) or
@@ -838,6 +839,13 @@ def pa_decode_tlx(output,  # [num_tokens, num_q_heads, HEAD_DIM]
                 pages_per_tile,
                 target_waves=2 if query_length > 1 else 1,
             )
+        # Once the meta-specific HIP dispatcher removes most host launch
+        # overhead, B1/8K no longer benefits from filling a complete CU wave
+        # with 32 tiny partitions. Four/eight longer partitions pay much less
+        # partial-output and reduction overhead while retaining enough work.
+        if (cache_5d and head_dim == 64 and query_length == 1 and num_seqs == 1
+                and max_context_len == 8192):
+            num_splits = 8 if page_size == 16 else 4
         # Never launch more splits than there are KV tiles to cover (host-only, no
         # device sync), so short contexts never over-split.
         max_pages = block_tables.shape[1]

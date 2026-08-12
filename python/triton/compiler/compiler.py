@@ -619,7 +619,10 @@ class CompiledKernel:
         self._num_kernel_args = None
         if knobs.nvidia.use_triton_dispatcher and "launch_metadata" in self.asm:
             try:
-                from triton.backends.nvidia.triton_dispatcher_factory import make_triton_dispatcher
+                if self.metadata.target.backend == "hip":
+                    from triton.backends.amd.triton_dispatcher_factory import make_triton_dispatcher
+                else:
+                    from triton.backends.nvidia.triton_dispatcher_factory import make_triton_dispatcher
                 schema = json.loads(self.asm["launch_metadata"])
                 # Build both values before assigning to self so that a failure
                 # in either step leaves both attributes as None (atomic assignment).
