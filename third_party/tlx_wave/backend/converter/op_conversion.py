@@ -2906,7 +2906,6 @@ def _convert_buffer_store(builder, conversion_input, type_layout_program, fact_p
 
 
 def _convert_load(builder, conversion_input, type_layout_program, op):
-    del conversion_input
     fields = _load_fields(op)
     _require_default_tt_memory_attrs(op)
     pointer = type_layout_program.values[fields["pointer_value_id"]]
@@ -3012,6 +3011,15 @@ def _convert_load(builder, conversion_input, type_layout_program, op):
                 op,
             )
         operands.append(_single_source_target(builder, fields["other_value_id"], op))
+    element_byte_width = conversion_input.value_element_byte_widths.get(fields["pointer_value_id"], )
+    if element_byte_width is None:
+        fail(
+            "TLXW_OP_LOAD",
+            STAGE,
+            "tt.load pointer requires a statically sized element type",
+            source_op_index=op.index,
+            source_value_id=fields["pointer_value_id"],
+        )
     result_target_ids, result_layout_map_ids = _declare_results(
         builder,
         op,
@@ -3023,6 +3031,7 @@ def _convert_load(builder, conversion_input, type_layout_program, op):
         results=result_target_ids,
         attrs={
             "component_count": component_count,
+            "element_byte_width": int(element_byte_width),
             "element_type": loaded.type.element_type,
             "has_mask": fields["mask_value_id"] is not None,
             "has_other": fields["other_value_id"] is not None,
@@ -3035,7 +3044,6 @@ def _convert_load(builder, conversion_input, type_layout_program, op):
 
 
 def _convert_store(builder, conversion_input, type_layout_program, op):
-    del conversion_input
     fields = _store_fields(op)
     _require_default_tt_memory_attrs(op)
     pointer = type_layout_program.values[fields["pointer_value_id"]]
@@ -3103,11 +3111,21 @@ def _convert_store(builder, conversion_input, type_layout_program, op):
             op,
         )
         operands.append(_single_source_target(builder, fields["mask_value_id"], op))
+    element_byte_width = conversion_input.value_element_byte_widths.get(fields["pointer_value_id"], )
+    if element_byte_width is None:
+        fail(
+            "TLXW_OP_STORE",
+            STAGE,
+            "tt.store pointer requires a statically sized element type",
+            source_op_index=op.index,
+            source_value_id=fields["pointer_value_id"],
+        )
     builder.add_op(
         "store",
         operands=tuple(operands),
         attrs={
             "component_count": component_count,
+            "element_byte_width": int(element_byte_width),
             "element_type": pointer.type.element_type,
             "has_mask": fields["mask_value_id"] is not None,
             "lane_width": int(pointer.type.lane_width or value.type.lane_width or 64),
