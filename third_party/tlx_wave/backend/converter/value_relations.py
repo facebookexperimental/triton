@@ -46,6 +46,15 @@ class _Analysis:
             int(assumption.assumption_id): assumption
             for assumption in target_program.assumptions
         }
+        self._region_by_block_arg = {
+            int(block_arg_id): region
+            for region in target_program.regions
+            for block_arg_id in region.block_arg_ids
+        }
+        self._loop_by_region = {
+            int(region_id): op
+            for op in target_program.ops if op.kind == "for_loop" for region_id in op.region_ids
+        }
 
     def memory_relation(self, op):
         offset_index = _MEMORY_OFFSET_OPERAND.get(op.kind)
@@ -233,7 +242,7 @@ class _Analysis:
     def _evaluate_definition(self, target_value_id, point, facts):
         op = self.definition_by_result.get(int(target_value_id))
         if op is None:
-            return None
+            return self._loop_carried_relation(target_value_id, point, facts)
         attrs = target_ir.attrs_dict(op)
         if op.kind == "constant":
             literal = attrs.get("value")
@@ -355,6 +364,52 @@ class _Analysis:
                     self._memo[block_key] = previous
             return self._equivalent_relations((initial, yielded), facts)
         return None
+
+    def _loop_carried_relation(self, target_value_id, point, facts):
+        region = self._region_by_block_arg.get(int(target_value_id))
+        if region is None:
+            return None
+        loop = self._loop_by_region.get(int(region.target_region_id))
+        if loop is None:
+            return None
+        block_arg_index = tuple(int(value) for value in region.block_arg_ids).index(int(target_value_id))
+        source_results = int(target_ir.attrs_dict(loop).get("source_result_count", 0))
+        if block_arg_index == 0 or block_arg_index > source_results:
+            return None
+        initial_id = int(loop.operands[2 + block_arg_index])
+        yielded_id = int(region.yield_value_ids[block_arg_index - 1])
+        update = self.definition_by_result.get(yielded_id)
+        if update is None or update.kind != "binary" or len(update.operands) != 2:
+            return None
+        operation = target_ir.attrs_dict(update).get("operation")
+        lhs, rhs = (int(operand) for operand in update.operands)
+        if operation == "addi" and lhs == int(target_value_id):
+            delta_id, delta_sign = rhs, 1
+        elif operation == "addi" and rhs == int(target_value_id):
+            delta_id, delta_sign = lhs, 1
+        elif operation == "subi" and lhs == int(target_value_id):
+            delta_id, delta_sign = rhs, -1
+        else:
+            return None
+        initial = self._evaluate(initial_id, point, facts)
+        delta = self._evaluate(delta_id, point, facts)
+        induction = self._evaluate(int(region.block_arg_ids[0]), point, facts)
+        lower = self._evaluate(int(loop.operands[0]), point, facts)
+        step = self._evaluate(int(loop.operands[2]), point, facts)
+        relations = (initial, delta, induction, lower, step)
+        if any(relation is None for relation in relations):
+            return None
+        bindings = _merge_bindings(*relations)
+        if bindings is None:
+            return None
+        iteration = self.dsl.trunc((induction.expr - lower.expr) / step.expr)
+        expr = initial.expr + delta_sign * iteration * delta.expr
+        return self._normalized(
+            expr,
+            bindings,
+            facts,
+            tuple(constraint for relation in relations for constraint in relation.constraints),
+        )
 
     def _scalar(self, target_value_id):
         op = self.definition_by_result.get(int(target_value_id))

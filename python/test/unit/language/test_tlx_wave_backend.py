@@ -11606,6 +11606,60 @@ def test_tlx_wave_converter_keeps_dma_pointer_conversion_inside_loop(tmp_path):
     del ctx
 
 
+def test_tlx_wave_converter_maps_additive_loop_carried_buffer_offset(tmp_path):
+    preamble = """
+#blocked = #ttg.blocked<{sizePerThread = [8], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+"""
+    local_func = """
+  tt.func public @converter_loop_carried_buffer_offset(
+      %arg0: !tt.ptr<f16> {tt.pointer_range = 32 : i32},
+      %arg1: !tt.ptr<f16> {tt.pointer_range = 32 : i32}) attributes {noinline = false} {
+    %offset = tt.make_range {end = 512 : i32, start = 0 : i32} : tensor<512xi32, #blocked>
+    %c0_i32 = arith.constant 0 : i32
+    %c2_i32 = arith.constant 2 : i32
+    %c4_i32 = arith.constant 4 : i32
+    %advance = arith.constant dense<512> : tensor<512xi32, #blocked>
+    %result = scf.for %i = %c0_i32 to %c4_i32 step %c2_i32
+        iter_args(%current = %offset) -> (tensor<512xi32, #blocked>)  : i32 {
+      %loaded = amdg.buffer_load %arg0[%current] {contiguity = 8 : i32}
+          : tensor<512xf16, #blocked>
+      amdg.buffer_store %loaded, %arg1[%current] {contiguity = 8 : i32}
+          : tensor<512xf16, #blocked>
+      %next = arith.addi %current, %advance : tensor<512xi32, #blocked>
+      scf.yield %next : tensor<512xi32, #blocked>
+    }
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1, preamble=preamble)
+
+    output = converter_pipeline.convert_ttgir_to_wave(mod)
+
+    memory_ops = [op for op in output.target_program.ops if op.kind in {"buffer_load", "buffer_store"}]
+    assert len(memory_ops) == 2
+    dsl, _ir = converter_emission._load_wave_dsl()
+    for memory_op in memory_ops:
+        attrs = converter_target_ir.attrs_dict(memory_op)
+        relation = dsl.ixs_deserialize(attrs["bit_offset_relation"])
+        (induction_name, ) = attrs["index_binding_names"]
+        for induction in (0, 2):
+            for item, slot in ((0, 0), (1, 0), (63, 7)):
+                logical = 8 * item + slot + 512 * (induction // 2)
+                assert relation.eval({
+                    "block": 0,
+                    "item": item,
+                    "slot": slot,
+                    induction_name: induction,
+                }) == 16 * logical
+    wave = output.emitted_module.text
+    assert wave.count("wave.gather") == 1
+    assert wave.count("wave.scatter") == 1
+    lowered = _run_wave_lower_symbolic_memory(wave)
+    assert "wave.gather" not in lowered
+    assert "wave.scatter" not in lowered
+    del ctx
+
+
 def test_tlx_wave_converter_dma_affine_offset_marks_layout_math_nsw(tmp_path):
     preamble = """
 #blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [8, 8], warpsPerCTA = [8, 1], order = [1, 0]}>
