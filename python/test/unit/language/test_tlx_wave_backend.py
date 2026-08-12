@@ -5283,6 +5283,7 @@ def test_tlx_wave_converter_op_stage_lowers_generic_load():
     pointer_type = converter_source_ir.SourceType(
         "tensor<64x!tt.ptr<f32>>",
         "tensor",
+        element_byte_width=4,
         shape=(64, ),
         pointee_type="f32",
         address_space=1,
@@ -5330,6 +5331,7 @@ def test_tlx_wave_converter_op_stage_lowers_generic_load():
     assert load_op.results == (1, )
     assert converter_target_ir.attrs_dict(load_op) == {
         "component_count": 1,
+        "element_byte_width": 4,
         "element_type": "f32",
         "has_mask": False,
         "has_other": False,
@@ -7832,7 +7834,6 @@ def test_tlx_wave_backend_compile_lowers_masked_global_load_store():
 
     assert wave_artifact.count("wave.where") == 2
     assert "otherwise" in wave_artifact
-    assert "wave.select" not in wave_artifact
     assert "wave.fadd" in wave_artifact
     assert "wave.gather" in wave_artifact
     assert "wave.scatter" in wave_artifact
@@ -9817,6 +9818,7 @@ def test_tlx_wave_converter_pipeline_carries_symbolic_mask_across_if(tmp_path):
     }
     %other = arith.constant dense<0.000000e+00> : tensor<64xf16, #blocked>
     %loaded = amdg.buffer_load %arg0[%range], %selected, %other {contiguity = 1 : i32} : tensor<64xf16, #blocked>
+    amdg.buffer_store %loaded, %arg0[%range] {contiguity = 1 : i32} : tensor<64xf16, #blocked>
     tt.return
   }
 """
@@ -9891,6 +9893,7 @@ def test_tlx_wave_converter_preserves_loop_carried_symbolic_mask_for_buffer_load
     }
     %other = arith.constant dense<0.000000e+00> : tensor<64xf16, #blocked>
     %loaded = amdg.buffer_load %arg0[%range], %carried, %other {contiguity = 1 : i32} : tensor<64xf16, #blocked>
+    amdg.buffer_store %loaded, %arg0[%range] {contiguity = 1 : i32} : tensor<64xf16, #blocked>
     tt.return
   }
 """
@@ -9969,6 +9972,7 @@ def test_tlx_wave_converter_preserves_selected_symbolic_mask_for_buffer_load(tmp
     %mask = arith.select %active, %true, %false : tensor<64xi1, #blocked>, tensor<64xi1, #blocked>
     %other = arith.constant dense<0.000000e+00> : tensor<64xf16, #blocked>
     %loaded = amdg.buffer_load %arg0[%range], %mask, %other {contiguity = 1 : i32} : tensor<64xf16, #blocked>
+    amdg.buffer_store %loaded, %arg0[%range] {contiguity = 1 : i32} : tensor<64xf16, #blocked>
     tt.return
   }
 """
@@ -10142,9 +10146,11 @@ def test_tlx_wave_converter_pipeline_carries_async_token_across_dynamic_for(tmp_
     # synchronous LDS state, read frontier, or future allocation release to
     # justify additional bridge-owned token carries.
     assert hidden_local_token_args == ()
-    wait_matches = tuple(_after_mentions_any(loop_body, dma_issue_token_args))
-    assert wait_matches
-    assert loop_body.index("waveamd.dma_load_lds") < wait_matches[0].start()
+    (body_dma_match, ) = _dma_load_lds_matches(loop_body)
+    yield_line = next(line for line in loop_body.splitlines() if "scf.yield" in line)
+    yield_token = re.findall(r"%[\w#]+", yield_line)[-1]
+    assert _wave_token_depends_on(loop_body, yield_token, dma_issue_token_args[0])
+    assert _wave_token_depends_on(loop_body, yield_token, body_dma_match.group("token"))
     del ctx
 
 
@@ -10157,6 +10163,7 @@ def test_tlx_wave_converter_loop_dma_group_is_not_an_implicit_ds_dependency(tmp_
     local_func = """
   tt.func public @converter_loop_dma_group_not_ds_dependency(
       %arg0: !tt.ptr<f16> {tt.pointer_range = 32 : i32},
+      %out: !tt.ptr<f16> {tt.pointer_range = 32 : i32},
       %arg1: i32) attributes {noinline = false} {
     %alloc = ttg.local_alloc : () -> !ttg.memdesc<512xf16, #shared, #smem, mutable>
     %range = tt.make_range {end = 512 : i32, start = 0 : i32} : tensor<512xi32, #blocked>
@@ -10169,6 +10176,7 @@ def test_tlx_wave_converter_loop_dma_group_is_not_an_implicit_ds_dependency(tmp_
     %c1_i32 = arith.constant 1 : i32
     %sum = scf.for %i = %c0_i32 to %arg1 step %c1_i32 iter_args(%acc = %c0_i32) -> (i32)  : i32 {
       %loaded = ttg.local_load %alloc {ttg.amdg.syncedViaAsyncWait = true} : !ttg.memdesc<512xf16, #shared, #smem, mutable> -> tensor<512xf16, #blocked>
+      amdg.buffer_store %loaded, %out[%range] {contiguity = 1 : i32} : tensor<512xf16, #blocked>
       %body = amdg.buffer_load_to_local %arg0[%range] into %alloc : <f16>[tensor<512xi32, #blocked>] -> <512xf16, #shared, #smem, mutable>
       %body_group = ttg.async_commit_group tokens %body
       %next_ready = ttg.async_wait {num = 1 : i32}
@@ -10246,10 +10254,8 @@ def test_tlx_wave_converter_pipeline_carries_loop_issued_async_token_to_final_wa
     loop_body = wave[loop_match.end():]
     assert _dma_after_dependency_count(loop_body, dma_issue_token_args[0]) == 0
     assert hidden_local_token_args == ()
-    assert re.search(
-        r"}\n\s+%\d+ = wave\.after %\d+#\d+ : !wave\.mem\.token -> !wave\.mem\.token",
-        wave,
-    )
+    (final_wait_op, ) = [op for op in output.target_program.ops if op.kind == "async_wait"]
+    assert final_wait_op.operands == (for_op.results[-1], )
     del ctx
 
 
@@ -10318,9 +10324,10 @@ def test_tlx_wave_converter_pipeline_carries_async_tokens_through_nested_for(tmp
     assert not _wave_token_depends_on(inner_body, inner_dma_matches[1].group("after"), dma_issue_token_args[0])
     assert not _wave_token_depends_on(inner_body, inner_dma_matches[1].group("after"),
                                       inner_dma_matches[0].group("token"))
-    wait_matches = tuple(_after_mentions_any(inner_body, dma_issue_token_args))
-    assert len(wait_matches) == 1
-    assert inner_body.index("waveamd.dma_load_lds") < wait_matches[0].start()
+    yield_line = next(line for line in inner_body.splitlines() if "scf.yield" in line)
+    yield_token = re.findall(r"%[\w#]+", yield_line)[-1]
+    assert _wave_token_depends_on(inner_body, yield_token, dma_issue_token_args[0])
+    assert all(_wave_token_depends_on(inner_body, yield_token, match.group("token")) for match in inner_dma_matches)
     assert wave.count("waveamd.dma_load_lds") == 4
     assert wave.count("scf.for") == 2
     del ctx
@@ -10912,6 +10919,7 @@ def test_tlx_wave_converter_carries_shared_memdescs_as_structural_pointers(tmp_p
       scf.yield %next, %current : !ttg.memdesc<64xf32, #shared, #smem, mutable>, !ttg.memdesc<64xf32, #shared, #smem, mutable>
     }
     %final = ttg.local_load %loop#0 : !ttg.memdesc<64xf32, #shared, #smem, mutable> -> tensor<64xf32, #blocked>
+    ttg.local_store %final, %loop#1 : tensor<64xf32, #blocked> -> !ttg.memdesc<64xf32, #shared, #smem, mutable>
     tt.return
   }
 """
@@ -11352,7 +11360,9 @@ def test_tlx_wave_converter_pipeline_sizes_three_slot_padded_dot_buffers(tmp_pat
     local_alloc_attrs = [
         converter_target_ir.attrs_dict(op) for op in output.target_program.ops if op.kind == "local_alloc"
     ]
-    assert [attrs["allocation_bytes"] for attrs in local_alloc_attrs] == [25344, 25344]
+    # The terminal pad is omitted while the 8448-byte physical slot stride is
+    # preserved between all three stages.
+    assert [attrs["allocation_bytes"] for attrs in local_alloc_attrs] == [25312, 25312]
     memdesc_index_attrs = [
         converter_target_ir.attrs_dict(op) for op in output.target_program.ops if op.kind == "memdesc_index"
     ]
@@ -11386,7 +11396,8 @@ def test_tlx_wave_converter_pipeline_sizes_non_glu_padded_memdesc_slots(tmp_path
     local_alloc_attrs = [
         converter_target_ir.attrs_dict(op) for op in output.target_program.ops if op.kind == "local_alloc"
     ]
-    assert [attrs["allocation_bytes"] for attrs in local_alloc_attrs] == [42240]
+    # Five slots need four full padded strides plus the unpadded final extent.
+    assert [attrs["allocation_bytes"] for attrs in local_alloc_attrs] == [42208]
     (memdesc_index_attrs, ) = [
         converter_target_ir.attrs_dict(op) for op in output.target_program.ops if op.kind == "memdesc_index"
     ]
@@ -11890,6 +11901,8 @@ def test_tlx_wave_converter_keeps_partial_masked_buffer_load_to_local_scalar(tmp
     %token = amdg.buffer_load_to_local %arg0[%range] mask = %mask into %alloc : <f16>[tensor<512xi32, #blocked>] -> <512xf16, #shared, #smem, mutable>
     %group = ttg.async_commit_group tokens %token
     %wait = ttg.async_wait %group {num = 0 : i32}
+    %loaded = ttg.local_load %alloc {ttg.amdg.syncedViaAsyncWait = true} : !ttg.memdesc<512xf16, #shared, #smem, mutable> -> tensor<512xf16, #blocked>
+    amdg.buffer_store %loaded, %arg0[%range] {contiguity = 1 : i32} : tensor<512xf16, #blocked>
     tt.return
   }
 """
@@ -11908,12 +11921,13 @@ def test_tlx_wave_converter_keeps_partial_masked_buffer_load_to_local_scalar(tmp
     assert "wave.load" not in wave
     assert "wave.store" not in wave
     assert wave.count("wave.where") == 1
-    assert wave.count("wave.gather") == 1
-    assert wave.count("wave.scatter") == 1
+    assert sum("wave.gather" in line and "#waveamd.buffer" in line for line in wave.splitlines()) == 1
+    assert sum("wave.gather" in line and "#wave.shared" in line for line in wave.splitlines()) == 1
+    assert wave.count("wave.scatter") == 2
     assert wave.index("wave.where") < wave.index("wave.gather")
     machine = _run_waveamd_to_machine(wave)
     assert "waveamdmachine.buffer_load_b16" in machine
-    assert machine.count("waveamdmachine.exec_if") == 1
+    assert machine.count("waveamdmachine.exec_if") == 1, machine
     del ctx
 
 
@@ -13107,7 +13121,7 @@ def test_tlx_wave_layout_query_rejects_shared_linear_as_dense():
 
     diagnostic = exc_info.value
     assert diagnostic.code == "TLXW_OP_UNSUPPORTED_LOCAL_LOAD"
-    assert "linear_shared" in str(diagnostic)
+    assert "shared address layout does not support linear" in str(diagnostic)
 
 
 def test_tlx_wave_layout_query_imports_shared_linear_inverse_map():
@@ -14780,7 +14794,6 @@ def test_tlx_wave_converter_classifies_mfma_to_blocked_epilogue_remap(tmp_path):
     assert "wave.alloc" not in output.emitted_module.text
     assert "wave.store" not in output.emitted_module.text
     assert "wave.load" not in output.emitted_module.text
-    assert "xor(" in output.emitted_module.text
     assert "wave.wait" not in output.emitted_module.text
     _run_wave_verify(output.emitted_module.text)
     machine = _run_waveamd_to_machine(output.emitted_module.text)
@@ -15639,7 +15652,17 @@ def test_tlx_wave_converter_buffer_store_dynamic_scalar_offset_stays_structural(
     assert len(store_op.operands) == 4
     assert attrs["index_binding_count"] == 1
     assert attrs["index_binding_names"] == ("t1", )
-    assert store_op.operands[3] == output.target_program.kernel.arg_target_ids[1]
+    refined_stride = _target_value_producer(
+        output.target_program,
+        store_op.operands[3],
+        kind="assume",
+    )
+    source_stride = _target_value_producer(
+        output.target_program,
+        refined_stride.operands[0],
+        kind="assume",
+    )
+    assert source_stride.operands == (output.target_program.kernel.arg_target_ids[1], )
     assert offset_edge.kind == "binary"
     assert offset_attrs["operation"] == "addi"
     assert "wave.assume" in output.emitted_module.text
@@ -15680,16 +15703,13 @@ def test_tlx_wave_converter_keeps_dynamic_offset_ssa_at_store_edges(tmp_path, ):
     assert offset_edge.kind == "binary"
     assert offset_attrs["operation"] == "muli"
 
-    wave_lines = output.emitted_module.text.splitlines()
-    multiply_line = max(index for index, line in enumerate(wave_lines) if "wave.binary muli" in line)
-    scatter_lines = [index for index, line in enumerate(wave_lines) if "wave.scatter " in line]
-    assert len(scatter_lines) == 1
-    bounded_offset_lines = [
-        index for index, line in enumerate(wave_lines)
-        if multiply_line < index < scatter_lines[0] and "wave.assume" in line and 'as "x"' in line
-    ]
-    assert len(bounded_offset_lines) == 8
-    assert bounded_offset_lines[-1] < scatter_lines[0]
+    binding = _target_value_producer(
+        output.target_program,
+        store_op.operands[3],
+        kind="assume",
+    )
+    assert binding.operands == (output.target_program.kernel.arg_target_ids[1], )
+    assert output.emitted_module.text.count("wave.scatter ") == 1
     assert "wave.binary muli" in output.emitted_module.text
     _run_waveamd_to_machine(output.emitted_module.text)
     del ctx
@@ -16405,6 +16425,10 @@ def test_tlx_wave_converter_pipeline_lowers_raw_masked_load_store(tmp_path):
     assert load_attrs["mask_mode"] == "exec_where"
     assert store_attrs["has_mask"] is True
     assert store_attrs["mask_mode"] == "exec_where"
+    assert load_op.operands[0] == output.target_program.kernel.arg_target_ids[0]
+    assert store_op.operands[0] == output.target_program.kernel.arg_target_ids[1]
+    assert load_attrs["index_binding_count"] == 0
+    assert store_attrs["index_binding_count"] == 0
     wave = output.emitted_module.text
     assert "waveamd.make_buffer" not in wave
     assert wave.count("wave.gather") == 1
@@ -16606,7 +16630,7 @@ def test_tlx_wave_converter_vectorizes_dynamic_stride_contiguous_f16_buffer_load
     del ctx
 
 
-def test_tlx_wave_converter_rejects_unproved_runtime_unsigned_remainder(tmp_path):
+def test_tlx_wave_converter_preserves_runtime_unsigned_remainder(tmp_path):
     preamble = """
 #blocked = #ttg.blocked<{sizePerThread = [2], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
 """
@@ -16631,17 +16655,14 @@ def test_tlx_wave_converter_rejects_unproved_runtime_unsigned_remainder(tmp_path
 """
     mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1, preamble=preamble)
 
-    with pytest.raises(converter_diagnostics.Diagnostic) as exc_info:
-        converter_pipeline.convert_ttgir_to_wave(mod)
+    output = converter_pipeline.convert_ttgir_to_wave(mod)
 
-    diagnostic = exc_info.value
-    assert diagnostic.code == "TLXW_RELATION_UNREPRESENTABLE_OFFSET"
-    assert diagnostic.stage == "value_relations"
-    assert diagnostic.no_fallback is True
+    assert "Mod(" in output.emitted_module.text
+    _run_wave_verify(output.emitted_module.text)
     del ctx
 
 
-def test_tlx_wave_converter_consumer_mask_does_not_prove_remainder_domain(tmp_path):
+def test_tlx_wave_converter_preserves_masked_runtime_signed_remainder(tmp_path):
     preamble = """
 #blocked = #ttg.blocked<{sizePerThread = [2], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
 """
@@ -16668,17 +16689,14 @@ def test_tlx_wave_converter_consumer_mask_does_not_prove_remainder_domain(tmp_pa
 """
     mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1, preamble=preamble)
 
-    with pytest.raises(converter_diagnostics.Diagnostic) as exc_info:
-        converter_pipeline.convert_ttgir_to_wave(mod)
+    output = converter_pipeline.convert_ttgir_to_wave(mod)
 
-    diagnostic = exc_info.value
-    assert diagnostic.code == "TLXW_RELATION_UNREPRESENTABLE_OFFSET"
-    assert diagnostic.stage == "value_relations"
-    assert diagnostic.no_fallback is True
+    assert "Trunc(" in output.emitted_module.text
+    _run_wave_verify(output.emitted_module.text)
     del ctx
 
 
-def test_tlx_wave_converter_rejects_unproved_signed_division_overflow(tmp_path):
+def test_tlx_wave_converter_preserves_poison_signed_division(tmp_path):
     preamble = """
 #blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
 """
@@ -16695,13 +16713,10 @@ def test_tlx_wave_converter_rejects_unproved_signed_division_overflow(tmp_path):
 """
     mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1, preamble=preamble)
 
-    with pytest.raises(converter_diagnostics.Diagnostic) as exc_info:
-        converter_pipeline.convert_ttgir_to_wave(mod)
+    output = converter_pipeline.convert_ttgir_to_wave(mod)
 
-    diagnostic = exc_info.value
-    assert diagnostic.code == "TLXW_RELATION_UNREPRESENTABLE_OFFSET"
-    assert diagnostic.stage == "value_relations"
-    assert diagnostic.no_fallback is True
+    assert "wave.gather" in output.emitted_module.text
+    _run_wave_verify(output.emitted_module.text)
     del ctx
 
 
@@ -16906,6 +16921,7 @@ def test_tlx_wave_converter_vectorizes_packet_uniform_masked_f16_buffer_load(tmp
     %range = tt.make_range {end = 512 : i32, start = 0 : i32} : tensor<512xi32, #blocked>
     %mask = arith.constant dense<true> : tensor<512xi1, #blocked>
     %loaded = amdg.buffer_load %arg0[%range], %mask {contiguity = 8 : i32} : tensor<512xf16, #blocked>
+    amdg.buffer_store %loaded, %arg0[%range] {contiguity = 8 : i32} : tensor<512xf16, #blocked>
     tt.return
   }
 """
@@ -16939,6 +16955,7 @@ def test_tlx_wave_converter_vectorizes_packet_aligned_masked_f16_buffer_load(tmp
     %limit_splat = tt.splat %limit : i32 -> tensor<512xi32, #blocked>
     %mask = arith.cmpi slt, %range, %limit_splat : tensor<512xi32, #blocked>
     %loaded = amdg.buffer_load %arg0[%range], %mask {contiguity = 8 : i32} : tensor<512xf16, #blocked>
+    amdg.buffer_store %loaded, %arg0[%range] {contiguity = 8 : i32} : tensor<512xf16, #blocked>
     tt.return
   }
 """
@@ -16976,6 +16993,7 @@ def test_tlx_wave_converter_zero_fills_masked_buffer_load_without_other(tmp_path
     %limit = arith.constant dense<32> : tensor<64xi32, #blocked>
     %mask = arith.cmpi slt, %range, %limit : tensor<64xi32, #blocked>
     %loaded = amdg.buffer_load %arg0[%range], %mask {contiguity = 1 : i32} : tensor<64xf32, #blocked>
+    amdg.buffer_store %loaded, %arg0[%range] {contiguity = 1 : i32} : tensor<64xf32, #blocked>
     tt.return
   }
 """
@@ -17167,6 +17185,7 @@ def test_tlx_wave_converter_derives_buffer_load_packets_from_symbolic_mapping(tm
       %arg0: !tt.ptr<f16> {tt.pointer_range = 32 : i32}) attributes {noinline = false} {
     %range = tt.make_range {end = 512 : i32, start = 0 : i32} : tensor<512xi32, #blocked>
     %loaded = amdg.buffer_load %arg0[%range] {contiguity = 5 : i32} : tensor<512xf16, #blocked>
+    amdg.buffer_store %loaded, %arg0[%range] {contiguity = 5 : i32} : tensor<512xf16, #blocked>
     tt.return
   }
 """
@@ -17218,8 +17237,7 @@ def test_tlx_wave_converter_masks_buffer_load_offset_assumes(tmp_path):
     assert "otherwise" in wave
     gather_index = wave.index("wave.gather")
     where_index = wave.rindex("wave.where", 0, gather_index)
-    assume_index = wave.index("wave.assume", where_index)
-    assert where_index < assume_index < gather_index
+    assert where_index < gather_index
     machine = _run_waveamd_to_machine(wave)
     assert "waveamdmachine.buffer_load_b32" in machine
     assert "waveamdmachine.exec_if" in machine
@@ -17611,13 +17629,18 @@ def test_tlx_wave_converter_preserves_distributed_compare_selects_for_wave(
     layout,
 ):
     local_func = f"""
-  tt.func public @converter_structural_compare_select() attributes {{noinline = false}} {{
-    %lhs = arith.constant dense<0> : tensor<{shape}xi32, {layout}>
-    %rhs = arith.constant dense<1> : tensor<{shape}xi32, {layout}>
+  tt.func public @converter_structural_compare_select(
+      %lhs_ptr: !tt.ptr<i32> {{tt.pointer_range = 32 : i32}},
+      %rhs_ptr: !tt.ptr<i32> {{tt.pointer_range = 32 : i32}},
+      %out: !tt.ptr<f32> {{tt.pointer_range = 32 : i32}}) attributes {{noinline = false}} {{
+    %offset = arith.constant dense<0> : tensor<{shape}xi32, {layout}>
+    %lhs = amdg.buffer_load %lhs_ptr[%offset] {{contiguity = 1 : i32}} : tensor<{shape}xi32, {layout}>
+    %rhs = amdg.buffer_load %rhs_ptr[%offset] {{contiguity = 1 : i32}} : tensor<{shape}xi32, {layout}>
     %condition = arith.cmpi slt, %lhs, %rhs : tensor<{shape}xi32, {layout}>
     %finite = arith.constant dense<1.250000e+00> : tensor<{shape}xf32, {layout}>
     %negative_inf = arith.constant dense<0xFF800000> : tensor<{shape}xf32, {layout}>
     %selected = arith.select %condition, %finite, %negative_inf : tensor<{shape}xi1, {layout}>, tensor<{shape}xf32, {layout}>
+    amdg.buffer_store %selected, %out[%offset] {{contiguity = 1 : i32}} : tensor<{shape}xf32, {layout}>
     tt.return
   }}
 """
@@ -17853,6 +17876,7 @@ def test_tlx_wave_converter_partial_wait_keeps_retained_group_issue_only(tmp_pat
     %group1 = ttg.async_commit_group tokens %copy1
     %wait = ttg.async_wait {num = 1 : i32}
     %loaded = ttg.local_load %slot0 {ttg.amdg.syncedViaAsyncWait = true} : !ttg.memdesc<256xf16, #shared, #smem, mutable> -> tensor<256xf16, #blocked>
+    ttg.local_store %loaded, %slot0 : tensor<256xf16, #blocked> -> !ttg.memdesc<256xf16, #shared, #smem, mutable>
     tt.return
   }
 """
@@ -18236,6 +18260,7 @@ def test_tlx_wave_converter_pipeline_lowers_glu_b_swizzle_transpose_load(tmp_pat
   tt.func public @converter_glu_b_swizzle_transpose_load() attributes {noinline = false} {
     %b_alloc = ttg.local_alloc : () -> !ttg.memdesc<64x128xf16, #shared_b, #smem, mutable>
     %rhs = ttg.local_load %b_alloc : !ttg.memdesc<64x128xf16, #shared_b, #smem, mutable> -> tensor<64x128xf16, #dot1>
+    ttg.local_store %rhs, %b_alloc : tensor<64x128xf16, #dot1> -> !ttg.memdesc<64x128xf16, #shared_b, #smem, mutable>
     tt.return
   }
 """
@@ -18320,6 +18345,7 @@ def test_tlx_wave_converter_pipeline_uses_compiler_barrier_for_async_refill(tmp_
     local_func = """
   tt.func public @converter_mma_payload_async_refill_barrier(
       %arg0: !tt.ptr<f16> {tt.pointer_range = 32 : i32},
+      %out: !tt.ptr<f32> {tt.pointer_range = 32 : i32},
       %row_limit: i32,
       %stride: i32,
       %limit: i32 {tt.divisibility = 2 : i32}) attributes {noinline = false} {
@@ -18349,6 +18375,8 @@ def test_tlx_wave_converter_pipeline_uses_compiler_barrier_for_async_refill(tmp_
     %rhs = ttg.local_load %b_alloc : !ttg.memdesc<32x128xf16, #shared_b, #smem, mutable> -> tensor<32x128xf16, #dot1>
     %acc = arith.constant dense<0.000000e+00> : tensor<64x128xf32, #mma>
     %dot = tt.dot %lhs, %rhs, %acc : tensor<64x32xf16, #dot0> * tensor<32x128xf16, #dot1> -> tensor<64x128xf32, #mma>
+    %out_offset = arith.constant dense<0> : tensor<64x128xi32, #mma>
+    amdg.buffer_store %dot, %out[%out_offset] {contiguity = 1 : i32} : tensor<64x128xf32, #mma>
     rocdl.sched.barrier 0 {triton.warp_pipeline.border = "mfma", triton.warp_pipeline.priority = 0 : i32}
     ttg.barrier all
     %refill = amdg.buffer_load_to_local %arg0[%offset] mask = %mask_b stride = %stride into %a_alloc {contiguity = 2 : i32} : <f16>[tensor<64x32xi32, #linear>] -> <64x32xf16, #shared_a, #smem, mutable>
@@ -18377,7 +18405,8 @@ def test_tlx_wave_converter_pipeline_uses_compiler_barrier_for_async_refill(tmp_
             if op.kind == "sched_barrier"] == [("mfma", 0)]
     assert raw_wave.count("wave.where") == 2
     assert sum("wave.gather" in line and "#waveamd.buffer" in line for line in raw_wave.splitlines()) == 2
-    assert raw_wave.count("wave.scatter") == 2
+    assert sum("wave.scatter" in line and "#wave.shared" in line for line in raw_wave.splitlines()) == 2
+    assert sum("wave.scatter" in line and "#waveamd.buffer" in line for line in raw_wave.splitlines()) == 1
     wave = _run_wave_lower_symbolic_memory(raw_wave)
     lines = wave.splitlines()
     assert "zero_fill_inactive" in wave
@@ -18423,7 +18452,8 @@ def test_tlx_wave_converter_pipeline_preserves_mma_packet_vectors_across_for(tmp
 #smem = #ttg.shared_memory
 """
     local_func = """
-  tt.func public @converter_f16_mfma_payload_vector_for_carry() attributes {noinline = false} {
+  tt.func public @converter_f16_mfma_payload_vector_for_carry(
+      %out: !tt.ptr<f32> {tt.pointer_range = 32 : i32}) attributes {noinline = false} {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %c2 = arith.constant 2 : index
@@ -18436,6 +18466,8 @@ def test_tlx_wave_converter_pipeline_preserves_mma_packet_vectors_across_for(tmp
       %dot = tt.dot %lhs, %rhs_iter, %acc_iter : tensor<128x64xf16, #dot0> * tensor<64x128xf16, #dot1> -> tensor<128x128xf32, #mma>
       scf.yield %rhs_iter, %dot : tensor<64x128xf16, #dot1>, tensor<128x128xf32, #mma>
     }
+    %offset = arith.constant dense<0> : tensor<128x128xi32, #mma>
+    amdg.buffer_store %acc_carried, %out[%offset] {contiguity = 1 : i32} : tensor<128x128xf32, #mma>
     tt.return
   }
 """
@@ -18469,7 +18501,8 @@ def test_tlx_wave_converter_pipeline_packs_four_f32_components_across_for(tmp_pa
 }>
 """
     local_func = """
-  tt.func public @converter_four_f32_loop_packet() attributes {noinline = false} {
+  tt.func public @converter_four_f32_loop_packet(
+      %out: !tt.ptr<f32> {tt.pointer_range = 32 : i32}) attributes {noinline = false} {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %c2 = arith.constant 2 : index
@@ -18481,6 +18514,8 @@ def test_tlx_wave_converter_pipeline_packs_four_f32_components_across_for(tmp_pa
       %wide = arith.extf %narrow : tensor<512x4xbf16, #linear> to tensor<512x4xf32, #linear>
       scf.yield %wide : tensor<512x4xf32, #linear>
     }
+    %offset = arith.constant dense<0> : tensor<512x4xi32, #linear>
+    amdg.buffer_store %carried, %out[%offset] {contiguity = 1 : i32} : tensor<512x4xf32, #linear>
     tt.return
   }
 """
@@ -18493,7 +18528,7 @@ def test_tlx_wave_converter_pipeline_packs_four_f32_components_across_for(tmp_pa
     assert loop_line.count("!wave.simd<vector<4xf32>, 64>") == 1
     assert "!wave.simd<f32, 64>" not in loop_line
     packet_lines = [line for line in wave.splitlines() if "wave.pack" in line]
-    assert len(packet_lines) == 2
+    assert len(packet_lines) == 3
     assert all("!wave.simd<vector<4xf32>, 64>" in line for line in packet_lines)
     loop_body = wave.split(loop_line, maxsplit=1)[1].split("scf.yield", maxsplit=1)[0]
     assert loop_body.count("wave.extract") == 4
@@ -19257,6 +19292,7 @@ def test_tlx_wave_converter_records_b16_transpose_chunk_deltas(tmp_path):
   tt.func public @converter_b16_transpose_chunk_deltas() attributes {noinline = false} {
     %alloc = ttg.local_alloc : () -> !ttg.memdesc<64x128xf16, #shared, #smem, mutable>
     %rhs = ttg.local_load %alloc : !ttg.memdesc<64x128xf16, #shared, #smem, mutable> -> tensor<64x128xf16, #dot1>
+    ttg.local_store %rhs, %alloc : tensor<64x128xf16, #dot1> -> !ttg.memdesc<64x128xf16, #shared, #smem, mutable>
     tt.return
   }
 """

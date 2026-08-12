@@ -79,6 +79,69 @@ class _Analysis:
         bit_offset = normalized[1]
         return _Relation(bit_offset, relation.bindings)
 
+    def raw_memory_relation(self, op):
+        if op.kind not in {"load", "store"} or not op.operands:
+            return None
+        pointer_id = int(op.operands[0])
+        pointer_op = self.definition_by_result.get(pointer_id)
+        if pointer_op is None or pointer_op.kind != "addptr":
+            return None
+        domain = self._domain(pointer_id)
+        if domain is None:
+            return None
+        point, facts = domain
+        address = self._pointer_offset(pointer_id, point, facts)
+        if address is None:
+            fail(
+                "TLXW_RELATION_UNREPRESENTABLE_POINTER",
+                STAGE,
+                "tensor pointer SSA chain has no exact base-offset relation",
+                source_op_index=op.source_op_index,
+                source_value_id=pointer_id,
+                target_op_id=op.target_op_id,
+                target_value_id=pointer_id,
+            )
+        base_id, relation = address
+        element_bytes = int(target_ir.attrs_dict(op).get("element_byte_width", 0))
+        if element_bytes <= 0:
+            return None
+        bit_offset = relation.expr * element_bytes * 8
+        integer = self.dsl.ixs_eq(bit_offset, self.dsl.floor(bit_offset))
+        proofs, normalized = self.dsl.ixs_check(
+            (integer, bit_offset),
+            (*facts, *relation.constraints),
+        )
+        if proofs[0] is not True:
+            return None
+        return base_id, _Relation(normalized[1], relation.bindings)
+
+    def _pointer_offset(self, pointer_id, point, facts):
+        pointer_id = int(pointer_id)
+        value = self.program.values[pointer_id]
+        if value.type.representation == "uniform_pointer":
+            return pointer_id, _Relation(self.dsl.ixs_int(0))
+        op = self.definition_by_result.get(pointer_id)
+        if op is None:
+            return None
+        if op.kind == "splat" and len(op.operands) == 1:
+            return self._pointer_offset(int(op.operands[0]), point, facts)
+        if op.kind != "addptr" or len(op.operands) != 2:
+            return None
+        base = self._pointer_offset(int(op.operands[0]), point, facts)
+        offset = self._evaluate(int(op.operands[1]), point, facts)
+        if base is None or offset is None:
+            return None
+        base_id, base_offset = base
+        bindings = _merge_bindings(base_offset, offset)
+        if bindings is None:
+            return None
+        return base_id, self._normalized(
+            base_offset.expr + offset.expr,
+            bindings,
+            facts,
+            (*base_offset.constraints, *offset.constraints),
+        )
+
     def _domain(self, target_value_id):
         value = self.program.values[int(target_value_id)]
         if value.layout_map_id is None:
@@ -315,11 +378,6 @@ class _Analysis:
         bindings = _merge_bindings(lhs, rhs)
         if bindings is None:
             return None
-        proof_facts = (
-            *facts,
-            *lhs.constraints,
-            *rhs.constraints,
-        )
         operation = attrs.get("operation")
         width = attrs.get("source_width")
         try:
@@ -345,25 +403,9 @@ class _Analysis:
                 return None
             unsigned_lhs = _unsigned_fixed(self.dsl, lhs.expr, width)
             unsigned_rhs = _unsigned_fixed(self.dsl, rhs.expr, width)
-            proofs, _ = self.dsl.ixs_check(
-                (unsigned_rhs > 0, ),
-                proof_facts,
-            )
-            if proofs[0] is not True:
-                return None
             quotient = self.dsl.trunc(unsigned_lhs / unsigned_rhs)
             mathematical = (quotient if operation == "divui" else self.dsl.mod(unsigned_lhs, unsigned_rhs))
         elif operation in {"divsi", "remsi"}:
-            preconditions = [(rhs.expr < 0) | (rhs.expr > 0)]
-            if operation == "divsi":
-                minimum = -(1 << (width - 1))
-                preconditions.append((lhs.expr < minimum) | (lhs.expr > minimum) | (rhs.expr < -1) | (rhs.expr > -1))
-            proofs, _ = self.dsl.ixs_check(
-                tuple(preconditions),
-                proof_facts,
-            )
-            if any(proof is not True for proof in proofs):
-                return None
             quotient = self.dsl.trunc(lhs.expr / rhs.expr)
             mathematical = (quotient if operation == "divsi" else lhs.expr - rhs.expr * quotient)
         else:
@@ -590,7 +632,12 @@ def attach_symbolic_memory_relations(target_program):
     ops = []
     changed = False
     for op in target_program.ops:
-        relation = analysis.memory_relation(op)
+        raw_relation = analysis.raw_memory_relation(op)
+        base_id = None
+        if raw_relation is not None:
+            base_id, relation = raw_relation
+        else:
+            relation = analysis.memory_relation(op)
         if relation is None:
             if op.kind in _MEMORY_OFFSET_OPERAND:
                 offset_index = _MEMORY_OFFSET_OPERAND[op.kind]
@@ -617,10 +664,13 @@ def attach_symbolic_memory_relations(target_program):
             dependency_count += int(attrs.get("issue_dependency_count", 0))
         split = len(op.operands) - dependency_count
         binding_ids = tuple(target_id for _name, target_id in relation.bindings)
+        operands = op.operands
+        if base_id is not None:
+            operands = (int(base_id), *operands[1:])
         ops.append(
             replace(
                 op,
-                operands=(*op.operands[:split], *binding_ids, *op.operands[split:]),
+                operands=(*operands[:split], *binding_ids, *operands[split:]),
                 attrs=target_ir._attrs_tuple(attrs, op.target_op_id),
             ))
         changed = True

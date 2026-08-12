@@ -278,12 +278,14 @@ def _derived_ranges_for_op(source_program, facts, op):
             if not _fits_signed_range(lower, upper, bounds):
                 return
     elif op.name in {"arith.divsi", "arith.divui"}:
+        # Poison may refine to any result, so derive a range only when the
+        # positive-divisor precondition excludes it.
         if _is_nonnegative(lhs) and rhs[0] is not None and rhs[0] > 0:
             lower = 0
             if lhs[1] is not None:
                 upper = lhs[1] // rhs[0]
     elif op.name in {"arith.remsi", "arith.remui"}:
-        if _is_nonnegative(lhs):
+        if _is_nonnegative(lhs) and rhs[0] is not None and rhs[0] > 0:
             lower = 0
             if rhs[1] is not None and rhs[1] > 0:
                 upper = rhs[1] - 1
