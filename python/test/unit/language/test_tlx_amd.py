@@ -26,17 +26,35 @@ from triton.compiler.errors import CompilationError
 from triton.backends.amd import compiler as amd_compiler
 from triton.backends.compiler import GPUTarget
 from triton.language.extra.tlx.tutorials.amd_tdm_gemm_pipelined import (
-    matmul_tdm_pipelined_kernel as _amd_tdm_gemm_kernel, )
+    matmul as _amd_tdm_matmul,
+    matmul_tdm_pipelined_kernel as _amd_tdm_gemm_kernel,
+    matmul_tdm_pipelined_single_warp_per_simd_schedule as _amd_tdm_single_warp_matmul,
+    matmul_tdm_pipelined_single_warp_per_simd_schedule_kernel as _amd_tdm_single_warp_kernel,
+)
+from triton.language.extra.tlx.tutorials.amd_fa_tdm_pipelined import (
+    attention as _amd_fa_tdm_attention,
+    attn_fwd_tdm_pipelined_kernel as _amd_fa_tdm_kernel,
+)
+from triton.language.extra.tlx.tutorials.amd_grouped_gemm_gfx1250.grouped_gemm import (
+    _pick_grouped_gemm_config,
+    _remap_program_id_reference,
+    grouped_gemm_phase0,
+    grouped_gemm_tdm,
+    grouped_gemm_tdm_kernel,
+)
 from triton.language.extra.tlx.tutorials.amd_mxfp_gemm_tdm_pipelined import (
-    mxgemm_tdm_pipelined_kernel as _amd_mxfp_gemm_kernel, )
+    _validate_split_pipeline_depth as _validate_amd_mxfp_split_pipeline_depth,
+    matmul as _amd_mxfp_matmul,
+    mxgemm_tdm_pipelined_kernel as _amd_mxfp_gemm_kernel,
+    pack_scale as _amd_mxfp_pack_scale,
+)
 from triton.language.extra.tlx.tutorials.gfx9_gemm.intra_wave.a4w4.bench import (
     compile_shape as _compile_a4w4_shape,
     generate_mxfp4_inputs as _generate_a4w4_inputs,
     launch_matmul as _launch_a4w4,
     torch_reference as _a4w4_reference,
 )
-from triton.language.extra.tlx.tutorials.gfx9_gemm.inter_wave.a4w4.matmul_kernel import (
-    matmul as _a4w4_inter_wave_matmul, )
+from triton.tools.mxfp import MXScaleTensor
 
 # Skip the entire module if no HIP runtime is available.
 pytestmark = pytest.mark.skipif(not is_hip(), reason="Requires HIP runtime")
@@ -2169,6 +2187,7 @@ def test_async_amd_desc_load_compiles_gfx1250(device):
     )
     ttgir = compiled.asm["ttgir"]
     assert "async_tdm_copy_global_to_local" in ttgir
+    assert "clamp_bounds" in ttgir
     assert "async_tdm_wait" in ttgir
     assert "local_load" in ttgir
     assert "amdgcn" in compiled.asm
@@ -2278,6 +2297,109 @@ def test_async_amd_desc_store_compiles_gfx1250(device):
     ttgir = compiled.asm["ttgir"]
     assert "async_tdm_copy_global_to_local" in ttgir
     assert "async_tdm_copy_local_to_global" in ttgir
+    assert ttgir.count("clamp_bounds") == 2
+
+
+@triton.jit
+def _update_tensor_descriptor_store_kernel(
+    x_ptr,
+    y_ptr,
+    M: tl.constexpr,
+    N: tl.constexpr,
+):
+    desc_in = tl.make_tensor_descriptor(x_ptr, [M, N], [N, 1], [M, N])
+    desc_out = tl.make_tensor_descriptor(y_ptr, [M, N], [N, 1], [M, N])
+    load_buf = tlx.local_alloc((M, N), tl.float16, 1)
+    store_buf = tlx.local_alloc((M, N), tl.float16, 1)
+    load_view = tlx.local_view(load_buf, 0)
+    store_view = tlx.local_view(store_buf, 0)
+
+    pred = tl.program_id(0) == 0
+    desc_in = tlx.update_tensor_descriptor(desc_in, set_bounds=[M, N], pred=pred)
+    offset_m = desc_in.shape[0] - M
+    offset_n = (desc_in.strides[1] - 1).to(tl.int32)
+    desc_in = tlx.update_tensor_descriptor(desc_in, add_offsets=[offset_m, offset_n])
+    tlx.async_amd_descriptor_load(desc_in, load_view)
+    tlx.async_amd_descriptor_wait(0)
+    tlx.local_store(store_view, tlx.local_load(load_view))
+
+    desc_out = tlx.update_tensor_descriptor(desc_out, add_offsets=[0, 0], clamp_bounds=True)
+    tlx.async_amd_descriptor_store(desc_out, store_view)
+    tlx.async_amd_descriptor_wait(0)
+
+
+@pytest.mark.skipif(not is_hip(), reason="Requires HIP runtime")
+def test_update_tensor_descriptor_store_compiles_gfx1250(device):
+    compiled = compile_for_gfx1250(
+        _update_tensor_descriptor_store_kernel,
+        signature={"x_ptr": "*fp16", "y_ptr": "*fp16"},
+        constexprs={"M": 32, "N": 32},
+    )
+    ttgir = compiled.asm["ttgir"]
+    assert "amdg.update_tensor_descriptor" in ttgir
+    assert "set_bounds =" in ttgir
+    assert "pred =" in ttgir
+    assert "clamp_bounds" in ttgir
+    assert "amdg.async_tdm_copy_local_to_global" in ttgir
+    assert ttgir.count("clamp_bounds") == 1
+    # Two explicit input updates and one output update are the only descriptor
+    # mutations. Neither pre-positioned copy may add a no-op update.
+    assert ttgir.count("amdg.update_tensor_descriptor") == 3
+
+
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
+def test_update_tensor_descriptor_roundtrip_gfx1250(device):
+    x = torch.randn((32, 32), dtype=torch.float16, device=device)
+    y = torch.empty_like(x)
+    _update_tensor_descriptor_store_kernel[(1, )](x, y, M=32, N=32)
+    torch.testing.assert_close(x, y)
+
+
+@triton.jit
+def _invalid_update_tensor_descriptor_kernel(x_ptr, MODE: tl.constexpr):
+    desc = tl.make_tensor_descriptor(x_ptr, [16, 16], [16, 1], [16, 16])
+    if MODE == 0:
+        desc = tlx.update_tensor_descriptor(desc)
+    elif MODE == 1:
+        desc = tlx.update_tensor_descriptor(desc, pred=True, clamp_bounds=True)
+    elif MODE == 2:
+        desc = tlx.update_tensor_descriptor(
+            desc,
+            add_offsets=[0, 0],
+            set_bounds=[16, 16],
+            clamp_bounds=True,
+        )
+    elif MODE == 3:
+        desc = tlx.update_tensor_descriptor(desc, add_offsets=[0])
+    else:
+        desc = tlx.update_tensor_descriptor(desc, add_offsets=[0, 0])
+
+
+@pytest.mark.parametrize(
+    "mode, error",
+    [
+        (0, "requires at least one"),
+        (1, "clamp_bounds requires add_offsets"),
+        (2, "clamp_bounds and set_bounds are mutually exclusive"),
+        (3, "add_offsets must have length 2"),
+    ],
+)
+def test_update_tensor_descriptor_rejects_invalid_gfx1250(mode, error):
+    with pytest.raises(CompilationError, match=error):
+        compile_for_gfx1250(
+            _invalid_update_tensor_descriptor_kernel,
+            signature={"x_ptr": "*fp16"},
+            constexprs={"MODE": mode},
+        )
+
+
+def test_update_tensor_descriptor_rejects_unsupported_target():
+    with pytest.raises(CompilationError, match="only available on AMD TDM-capable targets"):
+        compile_for_gfx950(
+            _invalid_update_tensor_descriptor_kernel,
+            signature={"x_ptr": "*fp16"},
+            constexprs={"MODE": 4},
+        )
 
 
 @pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
@@ -2462,10 +2584,531 @@ def test_amd_tdm_gemm_pipelined_compiles_gfx1250(device):
     )
     ttgir = compiled.asm["ttgir"]
     assert "amdg.async_tdm_copy_global_to_local" in ttgir
+    assert "amdg.async_tdm_copy_local_to_global" in ttgir
     assert "amdg.tdm_prefetch" in ttgir
     assert "ttg.padded_shared" in ttgir, "expected propagated padded encoding"
     amdgcn = compiled.asm["amdgcn"]
     assert "tensor_load_to_lds" in amdgcn or "tensor.load.to.lds" in amdgcn
+    assert "tensor_store_from_lds" in amdgcn or "tensor.store.from.lds" in amdgcn
+
+
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
+def test_amd_tdm_gemm_pipelined_correctness_gfx1250(device):
+    torch.manual_seed(0)
+    a = torch.randn((128, 64), device=device, dtype=torch.float16)
+    b = torch.randn((64, 128), device=device, dtype=torch.float16)
+    actual = _amd_tdm_matmul(a, b)
+    expected = torch.matmul(a, b)
+    torch.testing.assert_close(actual, expected, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize("TRANSPOSE_B", [False, True])
+def test_amd_tdm_gemm_single_warp_compiles_gfx1250(TRANSPOSE_B):
+    compiled = compile_for_gfx1250(
+        _amd_tdm_single_warp_kernel,
+        signature={
+            "a_ptr": "*fp16",
+            "b_ptr": "*fp16",
+            "c_ptr": "*bf16",
+            "M": "i32",
+            "N": "i32",
+            "K": "i32",
+            "stride_am": "i64",
+            "stride_ak": "i64",
+            "stride_bk": "i64",
+            "stride_bn": "i64",
+            "stride_cm": "i64",
+            "stride_cn": "i64",
+        },
+        constexprs={
+            "BLOCK_M": 32,
+            "BLOCK_N": 32,
+            "BLOCK_K": 128,
+            "NUM_BUFFERS": 2,
+            "TRANSPOSE_B": TRANSPOSE_B,
+            "L2_PREFETCH_DISTANCE": 2,
+        },
+    )
+    ttgir = compiled.asm["ttgir"]
+    assert "amdg.async_tdm_fused_copy_global_to_local" in ttgir
+    assert "amdg.async_tdm_copy_local_to_global" in ttgir
+    assert "amdg.tdm_prefetch" in ttgir
+    assert "tt.dot" in ttgir
+
+    amdgcn = compiled.asm["amdgcn"]
+    tensor_loads = amdgcn.count("tensor_load_to_lds") + amdgcn.count("tensor.load.to.lds")
+    tensor_stores = amdgcn.count("tensor_store_from_lds") + amdgcn.count("tensor.store.from.lds")
+    assert tensor_loads == 3
+    assert tensor_stores == 1
+
+
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
+@pytest.mark.parametrize("TRANSPOSE_B", [False, True])
+def test_amd_tdm_gemm_single_warp_correctness_gfx1250(device, TRANSPOSE_B):
+    torch.manual_seed(0)
+    M = N = 256
+    K = 512
+    a = torch.randn((M, K), device=device, dtype=torch.float16)
+    b = torch.randn((K, N), device=device, dtype=torch.float16)
+    b_input = b.T.contiguous() if TRANSPOSE_B else b
+    actual = _amd_tdm_single_warp_matmul(a, b_input, TRANSPOSE_B=TRANSPOSE_B)
+    expected = torch.matmul(a.to(torch.float32), b.to(torch.float32)).to(torch.bfloat16)
+    torch.testing.assert_close(actual, expected, atol=1e-2, rtol=1e-2)
+
+
+def test_amd_fa_tdm_pipelined_compiles_gfx1250():
+    compiled = compile_for_gfx1250(
+        _amd_fa_tdm_kernel,
+        signature={
+            "q_ptr": "*bf16",
+            "k_ptr": "*bf16",
+            "v_ptr": "*bf16",
+            "o_ptr": "*fp32",
+            "stride_qz": "i64",
+            "stride_qh": "i64",
+            "stride_qm": "i64",
+            "stride_qk": "i64",
+            "stride_kz": "i64",
+            "stride_kh": "i64",
+            "stride_kn": "i64",
+            "stride_kk": "i64",
+            "stride_vz": "i64",
+            "stride_vh": "i64",
+            "stride_vn": "i64",
+            "stride_vk": "i64",
+            "stride_oz": "i64",
+            "stride_oh": "i64",
+            "stride_om": "i64",
+            "stride_on": "i64",
+        },
+        constexprs={
+            "SM_SCALE": 1.0 / (128**0.5),
+            "SEQLEN_Q": 1024,
+            "SEQLEN_K": 1024,
+            "BLOCK_M": 128,
+            "BLOCK_N": 128,
+            "HEAD_SZ": 128,
+        },
+    )
+    ttgir = compiled.asm["ttgir"]
+    assert "amdg.async_tdm_copy_global_to_local" in ttgir
+    assert "amdg.async_tdm_copy_local_to_global" in ttgir
+    assert "tt.dot" in ttgir
+    amdgcn = compiled.asm["amdgcn"]
+    assert "tensor_load_to_lds" in amdgcn or "tensor.load.to.lds" in amdgcn
+    assert "tensor_store_from_lds" in amdgcn or "tensor.store.from.lds" in amdgcn
+
+
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
+@pytest.mark.parametrize("SEQLEN", [640, 896])
+def test_amd_fa_tdm_pipelined_correctness_gfx1250(device, SEQLEN):
+    torch.manual_seed(0)
+    q = torch.randn((1, 1, SEQLEN, 128), device=device, dtype=torch.bfloat16)
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+    actual = _amd_fa_tdm_attention(q, k, v)
+    expected = torch.nn.functional.scaled_dot_product_attention(q, k, v).to(torch.float32)
+    torch.testing.assert_close(actual, expected, atol=5e-2, rtol=5e-2)
+
+
+def _grouped_gemm_compile_signature():
+    return {
+        "a_packed": "*fp16",
+        "b_t": "*fp16",
+        "c_packed": "*fp16",
+        "group_offsets": "*i32",
+        "group_size": "i32",
+        "N": "i32",
+        "stride_am": "i32",
+        "stride_bg": "i32",
+        "stride_bn": "i32",
+        "stride_cm": "i32",
+    }
+
+
+def _grouped_gemm_compile_attrs():
+    names = grouped_gemm_tdm_kernel.arg_names
+    attrs = {}
+    for name in ("a_packed", "b_t", "c_packed", "group_offsets"):
+        attrs[(names.index(name), )] = [["tt.divisibility", 16], ["tt.pointer_range", 32]]
+    for name in ("N", "stride_am", "stride_bg", "stride_bn", "stride_cm"):
+        attrs[(names.index(name), )] = [["tt.divisibility", 16]]
+    return attrs
+
+
+def _grouped_gemm_compile_config(**overrides):
+    config = {
+        "NUM_PROGRAMS": 8,
+        "BLOCK_M": 128,
+        "BLOCK_N": 128,
+        "BLOCK_K": 128,
+        "GROUP_M": 4,
+        "NUM_BUFFERS": 2,
+        "L2_PREFETCH_DISTANCE": 0,
+        "C_STAGING_MODE": 0,
+        "CROSS_TILE_PREFETCH": False,
+        "XCD_REMAP_MODE": 0,
+        "NUM_XCDS": 8,
+        "XCD_CHUNK": 2,
+        "K": 2048,
+    }
+    config.update(overrides)
+    return config
+
+
+_GROUPED_GEMM_COMPILE_CASES = [
+    pytest.param(_grouped_gemm_compile_config(NUM_BUFFERS=depth), id=f"depth-{depth}") for depth in (2, 3, 4)
+] + [
+    pytest.param(
+        _grouped_gemm_compile_config(BLOCK_N=256, NUM_BUFFERS=3),
+        id="128x256-depth3-alias",
+    ),
+    pytest.param(
+        _grouped_gemm_compile_config(NUM_PROGRAMS=4, BLOCK_N=256, C_STAGING_MODE=1),
+        id="128x256-depth2-dedicated",
+    ),
+    pytest.param(
+        _grouped_gemm_compile_config(NUM_PROGRAMS=4, BLOCK_M=256, C_STAGING_MODE=1),
+        id="256x128-depth2-dedicated",
+    ),
+] + [
+    pytest.param(
+        _grouped_gemm_compile_config(
+            NUM_PROGRAMS=32,
+            BLOCK_N=256,
+            C_STAGING_MODE=1,
+            CROSS_TILE_PREFETCH=True,
+            XCD_REMAP_MODE=mode,
+        ),
+        id=f"cross-prefetch-remap-{mode}",
+    ) for mode in (0, 1, 2)
+]
+
+
+@pytest.mark.parametrize("config", _GROUPED_GEMM_COMPILE_CASES)
+def test_grouped_gemm_tdm_compiles_gfx1250(config):
+    compiled = triton_compile(
+        ASTSource(
+            fn=grouped_gemm_tdm_kernel,
+            signature=_grouped_gemm_compile_signature(),
+            constexprs=config,
+            attrs=_grouped_gemm_compile_attrs(),
+        ),
+        target=GFX1250,
+        options={"num_warps": 4},
+    )
+    ttgir = compiled.asm["ttgir"]
+    assert "amdg.async_tdm_fused_copy_global_to_local" in ttgir
+    assert "amdg.async_tdm_copy_local_to_global" in ttgir
+    assert "tt.dot" in ttgir
+    amdgcn = compiled.asm["amdgcn"]
+    assert "tensor_load_to_lds" in amdgcn or "tensor.load.to.lds" in amdgcn
+    assert "tensor_store_from_lds" in amdgcn or "tensor.store.from.lds" in amdgcn
+    assert amdgcn.count("v_wmma_f32_16x16x32_f16") >= 64
+
+    if config["C_STAGING_MODE"] == 1:
+        assert compiled.metadata.shared < 320 * 1024
+    if config["CROSS_TILE_PREFETCH"]:
+        assert ttgir.count("amdg.async_tdm_fused_copy_global_to_local") >= 4
+
+
+@pytest.mark.parametrize("mode", ["none", "balanced", "chunked"])
+@pytest.mark.parametrize("num_programs", [4, 10, 32, 37])
+def test_grouped_gemm_xcd_remap_is_permutation(mode, num_programs):
+    mapped = [
+        _remap_program_id_reference(pid, num_programs, mode, num_xcds=8, chunk_size=2) for pid in range(num_programs)
+    ]
+    assert sorted(mapped) == list(range(num_programs))
+
+
+def test_grouped_gemm_cost_model_selects_expected_tiles():
+    large = _pick_grouped_gemm_config([4096] * 16, n=4096, k=4096, num_sms=256)
+    small = _pick_grouped_gemm_config([128] * 16, n=4096, k=4096, num_sms=256)
+    assert (large["block_m"], large["block_n"]) == (256, 256)
+    assert (small["block_m"], small["block_n"]) == (128, 256)
+
+
+def _make_grouped_packed_inputs(m_list, n, k, device):
+    groups = [torch.randn((m, k), device=device, dtype=torch.float16) for m in m_list]
+    b_t = torch.randn((len(m_list), n, k), device=device, dtype=torch.float16)
+    offsets = [0]
+    for m in m_list:
+        offsets.append(offsets[-1] + m)
+    return (
+        torch.cat(groups, dim=0).contiguous(),
+        b_t,
+        torch.tensor(offsets, device=device, dtype=torch.int32),
+        groups,
+    )
+
+
+def _check_grouped_packed_result(actual, groups, b_t):
+    start = 0
+    for i, a in enumerate(groups):
+        end = start + a.shape[0]
+        torch.testing.assert_close(actual[start:end], a @ b_t[i].T, atol=1e-2, rtol=1e-2)
+        start = end
+
+
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
+def test_grouped_gemm_phase0_ragged_gfx1250(device):
+    torch.manual_seed(0)
+    shapes = [(17, 33, 31), (64, 70, 64), (95, 128, 96), (128, 65, 129)]
+    group_a = [torch.randn((m, k), device=device, dtype=torch.float16) for m, _, k in shapes]
+    group_b = [torch.randn((k, n), device=device, dtype=torch.float16) for _, n, k in shapes]
+    actual = grouped_gemm_phase0(group_a, group_b, block_m=32, block_n=32, block_k=32)
+    for out, a, b in zip(actual, group_a, group_b):
+        torch.testing.assert_close(out, a @ b, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
+@pytest.mark.parametrize("depth", [2, 3, 4])
+def test_grouped_gemm_tdm_packed_correctness_gfx1250(device, depth):
+    torch.manual_seed(0)
+    a, b_t, offsets, groups = _make_grouped_packed_inputs([128, 256, 384], 256, 512, device)
+    actual = grouped_gemm_tdm(a, b_t, offsets, tdm_pipeline_depth=depth)
+    _check_grouped_packed_result(actual, groups, b_t)
+
+
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
+def test_grouped_gemm_tdm_asymmetric_correctness_gfx1250(device):
+    torch.manual_seed(0)
+    a, b_t, offsets, groups = _make_grouped_packed_inputs([128, 256], 512, 384, device)
+    actual = grouped_gemm_tdm(
+        a,
+        b_t,
+        offsets,
+        block_m=128,
+        block_n=256,
+        tdm_pipeline_depth=3,
+    )
+    _check_grouped_packed_result(actual, groups, b_t)
+
+
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
+def test_grouped_gemm_tdm_cross_prefetch_correctness_gfx1250(device):
+    torch.manual_seed(0)
+    a, b_t, offsets, groups = _make_grouped_packed_inputs([256, 128], 512, 512, device)
+    actual = grouped_gemm_tdm(
+        a,
+        b_t,
+        offsets,
+        block_m=128,
+        block_n=256,
+        num_programs=2,
+        c_staging_mode=1,
+        cross_tile_prefetch=True,
+    )
+    _check_grouped_packed_result(actual, groups, b_t)
+
+
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
+@pytest.mark.parametrize("mode", ["balanced", "chunked"])
+def test_grouped_gemm_tdm_xcd_remap_correctness_gfx1250(device, mode):
+    torch.manual_seed(0)
+    a, b_t, offsets, groups = _make_grouped_packed_inputs([1024], 512, 512, device)
+    actual = grouped_gemm_tdm(
+        a,
+        b_t,
+        offsets,
+        block_m=128,
+        block_n=256,
+        num_programs=16,
+        c_staging_mode=1,
+        xcd_remap_mode=mode,
+    )
+    _check_grouped_packed_result(actual, groups, b_t)
+
+
+@triton.jit
+def _async_amd_desc_load_fused_kernel(
+    a_ptr,
+    b_ptr,
+    output_ptr,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    CACHE: tl.constexpr,
+    COMPAT_MEMBERS: tl.constexpr,
+):
+    a_desc = tl.make_tensor_descriptor(
+        a_ptr,
+        shape=[M, N],
+        strides=[N, tl.constexpr(1)],
+        block_shape=[BLOCK_M, BLOCK_N],
+    )
+    b_desc = tl.make_tensor_descriptor(
+        b_ptr,
+        shape=[M, N],
+        strides=[N, tl.constexpr(1)],
+        block_shape=[BLOCK_M, BLOCK_N],
+    )
+    a_buf = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float16, 1)
+    b_buf = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float16, 1)
+    a_smem = tlx.local_view(a_buf, 0)
+    b_smem = tlx.local_view(b_buf, 0)
+
+    if COMPAT_MEMBERS == 1:
+        tok = tlx.async_amd_descriptor_load_group(
+            [a_desc],
+            [a_smem],
+            [[0, 0]],
+            [0b1111],
+        )
+    elif COMPAT_MEMBERS == 2:
+        tok = tlx.async_amd_descriptor_load_group(
+            [a_desc, b_desc],
+            [a_smem, b_smem],
+            [[0, 0], [0, 0]],
+            [0b0011, 0b1100],
+        )
+    else:
+        a_desc = tlx.update_tensor_descriptor(a_desc, add_offsets=[0, 0], pred=True, clamp_bounds=True)
+        b_desc = tlx.update_tensor_descriptor(b_desc, add_offsets=[0, 0], pred=True, clamp_bounds=True)
+        tok = tlx.async_amd_descriptor_load_fused(
+            [(a_desc, a_smem, 0b0011), (b_desc, b_smem, 0b1100)],
+            cache_modifier=CACHE,
+        )
+    tlx.async_amd_descriptor_wait(0, [tok])
+
+    data = tlx.local_load(a_smem) + tlx.local_load(b_smem)
+    offs_m = tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+    out_ptrs = output_ptr + offs_m[:, None] * N + offs_n[None, :]
+    tl.store(out_ptrs, data)
+
+
+def test_async_amd_desc_load_fused_compiles_gfx1250(device):
+    """Fused AMD descriptor loads lower to one static TDM instruction."""
+    compiled = compile_for_gfx1250(
+        _async_amd_desc_load_fused_kernel,
+        signature={"a_ptr": "*fp16", "b_ptr": "*fp16", "output_ptr": "*fp16"},
+        constexprs={"M": 16, "N": 32, "BLOCK_M": 16, "BLOCK_N": 32, "CACHE": "", "COMPAT_MEMBERS": 0},
+    )
+    ttgir = compiled.asm["ttgir"]
+    assert "amdg.async_tdm_fused_copy_global_to_local" in ttgir
+    assert "warp_used_hints = array<i32: 3, 12>" in ttgir
+    amdgcn = compiled.asm["amdgcn"]
+    n_tdm = len(re.findall(r"tensor_load_to_lds|tensor\.load\.to\.lds", amdgcn))
+    assert n_tdm == 1, f"expected one tensor_load_to_lds, got {n_tdm}\n{amdgcn}"
+    tdm_calls = re.findall(r"(?:tail )?call void @llvm\.amdgcn\.tensor\.load\.to\.lds[^\n]+", compiled.asm["llir"])
+    assert len(tdm_calls) == 1
+    assert re.search(r", i32 0\)(?:, .*)?$", tdm_calls[0])
+
+
+@pytest.mark.parametrize("compat_members", [1, 2])
+def test_async_amd_desc_load_group_compat_compiles_gfx1250(device, compat_members):
+    """The legacy grouped helper delegates to the canonical fused operation."""
+    compiled = compile_for_gfx1250(
+        _async_amd_desc_load_fused_kernel,
+        signature={"a_ptr": "*fp16", "b_ptr": "*fp16", "output_ptr": "*fp16"},
+        constexprs={
+            "M": 16,
+            "N": 32,
+            "BLOCK_M": 16,
+            "BLOCK_N": 32,
+            "CACHE": "",
+            "COMPAT_MEMBERS": compat_members,
+        },
+    )
+    if compat_members == 1:
+        assert "amdg.async_tdm_copy_global_to_local" in compiled.asm["ttgir"]
+        assert "amdg.async_tdm_fused_copy_global_to_local" not in compiled.asm["ttgir"]
+    else:
+        assert "amdg.async_tdm_fused_copy_global_to_local" in compiled.asm["ttgir"]
+    assert len(re.findall(r"tensor_load_to_lds|tensor\.load\.to\.lds", compiled.asm["amdgcn"])) == 1
+
+
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
+def test_async_amd_desc_load_fused_correctness_gfx1250(device):
+    """Canonical unmarked positioned descriptors load both fused members."""
+    rows, cols = 16, 32
+    a = torch.randn((rows, cols), device=device, dtype=torch.float16)
+    b = torch.randn((rows, cols), device=device, dtype=torch.float16)
+    output = torch.empty_like(a)
+    _async_amd_desc_load_fused_kernel[(1, )](
+        a,
+        b,
+        output,
+        M=rows,
+        N=cols,
+        BLOCK_M=rows,
+        BLOCK_N=cols,
+        CACHE="",
+        COMPAT_MEMBERS=0,
+    )
+    torch.testing.assert_close(output, a + b)
+
+
+def test_async_amd_desc_load_fused_cache_modifier_gfx1250(device):
+    """The cache modifier shared by fused members reaches the TDM intrinsic."""
+    compiled = compile_for_gfx1250(
+        _async_amd_desc_load_fused_kernel,
+        signature={"a_ptr": "*fp16", "b_ptr": "*fp16", "output_ptr": "*fp16"},
+        constexprs={"M": 16, "N": 32, "BLOCK_M": 16, "BLOCK_N": 32, "CACHE": ".cg", "COMPAT_MEMBERS": 0},
+    )
+    ttgir = compiled.asm["ttgir"]
+    assert "amdg.async_tdm_fused_copy_global_to_local" in ttgir
+    assert "cache = 3 : i32" in ttgir
+
+    # On gfx1250, .cg maps to DEV scope / regular cache behavior (aux = 16).
+    tdm_calls = re.findall(
+        r"(?:tail )?call void @llvm\.amdgcn\.tensor\.load\.to\.lds[^\n]+",
+        compiled.asm["llir"],
+    )
+    assert len(tdm_calls) == 1
+    assert re.search(r", i32 16\)(?:, .*)?$", tdm_calls[0])
+
+
+@triton.jit
+def _async_amd_desc_load_fused_pred_kernel(
+    a_ptr,
+    b_ptr,
+    output_ptr,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    DO_LOAD: tl.constexpr,
+):
+    a_desc = tl.make_tensor_descriptor(
+        a_ptr,
+        shape=[M, N],
+        strides=[N, tl.constexpr(1)],
+        block_shape=[BLOCK_M, BLOCK_N],
+    )
+    b_desc = tl.make_tensor_descriptor(
+        b_ptr,
+        shape=[M, N],
+        strides=[N, tl.constexpr(1)],
+        block_shape=[BLOCK_M, BLOCK_N],
+    )
+    a_buf = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float16, 1)
+    b_buf = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float16, 1)
+    pred = tl.full([], DO_LOAD, dtype=tl.int1)
+    a_desc = tlx.update_tensor_descriptor(a_desc, add_offsets=[0, 0], pred=pred, clamp_bounds=True)
+    b_desc = tlx.update_tensor_descriptor(b_desc, add_offsets=[0, 0], pred=pred, clamp_bounds=True)
+    tok = tlx.async_amd_descriptor_load_fused([
+        (a_desc, tlx.local_view(a_buf, 0), 0b0011),
+        (b_desc, tlx.local_view(b_buf, 0), 0b1100),
+    ])
+    tlx.async_amd_descriptor_wait(0, [tok])
+
+
+def test_async_amd_desc_load_fused_pred_compiles_gfx1250(device):
+    """Fused AMD descriptor loads inherit explicit i1 descriptor predicates."""
+    compiled = compile_for_gfx1250(
+        _async_amd_desc_load_fused_pred_kernel,
+        signature={"a_ptr": "*fp16", "b_ptr": "*fp16", "output_ptr": "*fp16"},
+        constexprs={"M": 16, "N": 32, "BLOCK_M": 16, "BLOCK_N": 32, "DO_LOAD": 1},
+    )
+    ttgir = compiled.asm["ttgir"]
+    assert "amdg.async_tdm_fused_copy_global_to_local" in ttgir
+    assert ("arith.extui" in ttgir and "i1 to i32" in ttgir) or "arith.constant 1 : i32" in ttgir
+    amdgcn = compiled.asm["amdgcn"]
+    n_tdm = len(re.findall(r"tensor_load_to_lds|tensor\.load\.to\.lds", amdgcn))
+    assert n_tdm == 1, f"expected one tensor_load_to_lds, got {n_tdm}\n{amdgcn}"
 
 
 # ---------------------------------------------------------------------------
@@ -2625,7 +3268,8 @@ def test_require_amd_wmma_layout_compiles_gfx1250():
     assert "#ttg.amd_wmma" in compiled.asm["ttgir"]
 
 
-def test_mxgemm_tdm_pipelined_compiles_gfx1250(device):
+@pytest.mark.parametrize("TDM_FUSION", ["none", "2way", "4way", "partial"])
+def test_mxgemm_tdm_pipelined_compiles_gfx1250(TDM_FUSION):
     """The mxfp GEMM tutorial kernel should lower to TDM + dot_scaled + WMMA."""
     compiled = compile_for_gfx1250(
         _amd_mxfp_gemm_kernel,
@@ -2656,14 +3300,147 @@ def test_mxgemm_tdm_pipelined_compiles_gfx1250(device):
             "GROUP_SIZE_M": 8,
             "TRANSPOSE_B": True,
             "NUM_BUFFERS": 2,
+            "SCALE_PRESHUFFLE": True,
+            "WITH_A_SCALE": True,
+            "SCHEDULE": "baseline",
+            "TDM_FUSION": TDM_FUSION,
+            "L2_PREFETCH_DISTANCE": 2,
+            "TDM_SPLIT": False,
         },
     )
     ttgir = compiled.asm["ttgir"]
     amdgcn = compiled.asm["amdgcn"]
-    assert "amdg.async_tdm_copy_global_to_local" in ttgir
+    if TDM_FUSION == "none":
+        assert "amdg.async_tdm_copy_global_to_local" in ttgir
+        assert "amdg.async_tdm_fused_copy_global_to_local" not in ttgir
+    else:
+        assert "amdg.async_tdm_fused_copy_global_to_local" in ttgir
+        assert "amdg.async_tdm_copy_global_to_local" not in ttgir
+    if TDM_FUSION == "2way":
+        assert "warp_used_hints = array<i32: 3, 12>" in ttgir
+    elif TDM_FUSION == "4way":
+        assert "warp_used_hints = array<i32: 1, 2, 4, 8>" in ttgir
+    elif TDM_FUSION == "partial":
+        assert "warp_used_hints = array<i32: 5, 10>" in ttgir
+    assert "amdg.tdm_prefetch" in ttgir
     assert "tt.dot_scaled" in ttgir
     assert "tensor_load_to_lds" in amdgcn or "tensor.load.to.lds" in amdgcn
     assert "wmma" in amdgcn
+
+
+@pytest.mark.parametrize(
+    "block_mn,dtype_a,dtype_b,a_ptr_type,b_ptr_type,tdm_fusion",
+    [
+        pytest.param(128, "e4m3", "e4m3", "*fp8e4nv", "*fp8e4nv", "none", id="m16-scale-64x4"),
+        pytest.param(256, "e4m3", "e2m1", "*fp8e4nv", "*u8", "partial", id="m16-scale-128x4"),
+        pytest.param(256, "e2m1", "e2m1", "*u8", "*u8", "partial", id="m32-scale-128x4"),
+    ],
+)
+def test_mxgemm_tdm_split_compiles_gfx1250(block_mn, dtype_a, dtype_b, a_ptr_type, b_ptr_type, tdm_fusion):
+    src = ASTSource(
+        fn=_amd_mxfp_gemm_kernel,
+        signature={
+            "a_ptr": a_ptr_type,
+            "b_ptr": b_ptr_type,
+            "c_ptr": "*fp32",
+            "a_scale": "*i8",
+            "b_scale": "*i8",
+            "M": "i32",
+            "N": "i32",
+            "K": "i32",
+            "stride_am": "i64",
+            "stride_ak": "i64",
+            "stride_bk": "i64",
+            "stride_bn": "i64",
+            "stride_cm": "i64",
+            "stride_cn": "i64",
+            "stride_scale": "i64",
+        },
+        constexprs={
+            "DTYPE_A": dtype_a,
+            "DTYPE_B": dtype_b,
+            "SCALE_BLOCK": 32,
+            "BLOCK_M": block_mn,
+            "BLOCK_N": block_mn,
+            "BLOCK_K": 256,
+            "GROUP_SIZE_M": 8,
+            "TRANSPOSE_B": True,
+            "NUM_BUFFERS": 3,
+            "SCALE_PRESHUFFLE": True,
+            "WITH_A_SCALE": True,
+            "SCHEDULE": "sliceMNK",
+            "TDM_FUSION": tdm_fusion,
+            "L2_PREFETCH_DISTANCE": -1,
+            "TDM_SPLIT": True,
+        },
+    )
+    compiled = triton_compile(src, target=GPUTarget("hip", "gfx1250", 32))
+    ttgir = compiled.asm["ttgir"]
+    amdgcn = compiled.asm["amdgcn"]
+    if tdm_fusion == "partial":
+        assert "amdg.async_tdm_fused_copy_global_to_local" in ttgir
+        assert "warp_used_hints = array<i32: 5, 10>" in ttgir
+    else:
+        assert "amdg.async_tdm_copy_global_to_local" in ttgir
+        assert "amdg.async_tdm_fused_copy_global_to_local" not in ttgir
+    assert "amdg.async_tdm_copy_local_to_global" in ttgir
+    assert "tt.dot_scaled" in ttgir
+    assert "ttg.convert_layout" not in ttgir
+    assert "tensor_load_to_lds" in amdgcn or "tensor.load.to.lds" in amdgcn
+    assert "wmma" in amdgcn
+
+
+def _mxfp_e8m0_to_float32(scale):
+    bits = scale.view(torch.uint8).to(torch.int32) << 23
+    return bits.view(torch.float32)
+
+
+def test_mxgemm_tdm_split_pipeline_depth_validation_gfx1250():
+    with pytest.raises(ValueError, match="NUM_BUFFERS must be at least 2"):
+        _validate_amd_mxfp_split_pipeline_depth(K=512, block_k=256, num_buffers=1)
+    with pytest.raises(ValueError, match="does not provide the 3 pipeline tiles required"):
+        _validate_amd_mxfp_split_pipeline_depth(K=512, block_k=256, num_buffers=3)
+    _validate_amd_mxfp_split_pipeline_depth(K=768, block_k=256, num_buffers=3)
+
+
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
+@pytest.mark.parametrize("tdm_fusion", ["none", "partial"])
+def test_mxgemm_tdm_split_correctness_gfx1250(device, tdm_fusion):
+    torch.manual_seed(0)
+    M = N = 128
+    K = 1536
+    scale_block = 32
+    a = torch.randint(20, 40, (M, K), dtype=torch.uint8).view(torch.float8_e4m3fn)
+    b = torch.randint(20, 40, (K, N), dtype=torch.uint8).view(torch.float8_e4m3fn)
+    a_scale = MXScaleTensor(size=(M, triton.cdiv(K, scale_block))).random(high=32.0).data
+    b_scale = MXScaleTensor(size=(N, triton.cdiv(K, scale_block))).random(high=32.0).data
+
+    a_scale_f32 = _mxfp_e8m0_to_float32(a_scale).repeat_interleave(scale_block, dim=1)[:M, :K]
+    b_scale_f32 = _mxfp_e8m0_to_float32(b_scale).repeat_interleave(scale_block, dim=1).T.contiguous()[:K, :N]
+    expected = torch.matmul(a.to(torch.float32) * a_scale_f32, b.to(torch.float32) * b_scale_f32)
+
+    actual = _amd_mxfp_matmul(
+        a.contiguous().to(device),
+        b.T.contiguous().to(device),
+        _amd_mxfp_pack_scale(a_scale).to(device),
+        _amd_mxfp_pack_scale(b_scale).to(device),
+        config={
+            "BLOCK_M": 128,
+            "BLOCK_N": 128,
+            "BLOCK_K": 256,
+            "SCALE_BLOCK": 32,
+            "NUM_BUFFERS": 3,
+            "DTYPE_A": "e4m3",
+            "DTYPE_B": "e4m3",
+            "SCHEDULE": "sliceMNK",
+            "TDM_FUSION": tdm_fusion,
+            "TDM_SPLIT": True,
+            "TRANSPOSE_B": True,
+            "num_warps": 4,
+            "waves_per_eu": 1,
+        },
+    )
+    torch.testing.assert_close(actual.cpu(), expected, rtol=1e-5, atol=2e-2)
 
 
 def test_tlx_gfx9_gemm_bench_parses_shapes_and_defaults():
@@ -2909,25 +3686,31 @@ def test_a4w4_shape_stride_layouts_correctness_gfx950(device):
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
 def test_a4w4_inter_wave_256tile_correctness_gfx950(device):
+    from triton.language.extra.tlx.tutorials.gfx9_gemm.inter_wave.a4w4.matmul_kernel import (
+        matmul as a4w4_inter_wave_matmul, )
+
     # 768x768x1536 -> 256-tile grid = 3*3 = 9 > NUM_CU/32, so the dispatcher takes
     # the 8-wave 256x256 inter-wave path (K=1536 -> loop runs >= 2 trips).
     m = n = 768
     k = 1536
     a, b, a_scales, b_scales = _generate_a4w4_inputs(m, n, k)
-    actual = _a4w4_inter_wave_matmul(a, b, a_scales, b_scales)
+    actual = a4w4_inter_wave_matmul(a, b, a_scales, b_scales)
     expected = _a4w4_reference(a, b, a_scales, b_scales)
     torch.testing.assert_close(actual, expected, atol=0.1, rtol=0.0)
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
 def test_a4w4_inter_wave_skinny_correctness_gfx950(device):
+    from triton.language.extra.tlx.tutorials.gfx9_gemm.inter_wave.a4w4.matmul_kernel import (
+        matmul as a4w4_inter_wave_matmul, )
+
     # 512x256x1536 -> 256-tile grid = 2*1 = 2 <= NUM_CU/32, so the dispatcher takes
     # the occupancy-starved 128x128 + split-K TLX path (and its fp32 reduce).
     m = 512
     n = 256
     k = 1536
     a, b, a_scales, b_scales = _generate_a4w4_inputs(m, n, k)
-    actual = _a4w4_inter_wave_matmul(a, b, a_scales, b_scales)
+    actual = a4w4_inter_wave_matmul(a, b, a_scales, b_scales)
     expected = _a4w4_reference(a, b, a_scales, b_scales)
     torch.testing.assert_close(actual, expected, atol=0.1, rtol=0.0)
 

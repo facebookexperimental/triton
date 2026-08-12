@@ -24,6 +24,8 @@ from .mem_ops import (
     allocate_tensor_descriptor,
     amd_descriptor_prefetch_tensor,
     async_amd_descriptor_load,
+    async_amd_descriptor_load_fused,
+    async_amd_descriptor_load_group,
     async_amd_descriptor_store,
     async_amd_descriptor_wait,
     async_store,
@@ -64,6 +66,7 @@ from .mem_ops import (
     storage_alias_spec,
     subslice,
     tmem_copy,
+    update_tensor_descriptor,
 )
 from .mma_ops import (
     amd_mfma_commit,
@@ -189,7 +192,10 @@ __all__ = [
     "local_reinterpret",
     "local_reshape",
     "allocate_tensor_descriptor",
+    "update_tensor_descriptor",
     "async_amd_descriptor_load",
+    "async_amd_descriptor_load_fused",
+    "async_amd_descriptor_load_group",
     "async_amd_descriptor_store",
     "async_amd_descriptor_wait",
     "amd_descriptor_prefetch_tensor",

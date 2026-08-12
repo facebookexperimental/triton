@@ -166,6 +166,18 @@ Attribute AMDGPUAssignDescriptorMemoryLayouts::getDesiredDescriptorEncoding(
               dyn_cast<triton::amdgpu::AsyncTDMCopyGlobalToLocalOp>(user)) {
         if (load.getDesc() == value)
           memoryType = load.getResult().getType();
+      } else if (auto groupLoad =
+                     dyn_cast<triton::amdgpu::AsyncTDMFusedCopyGlobalToLocalOp>(
+                         user)) {
+        for (auto [desc, dst] :
+             llvm::zip_equal(groupLoad.getDescs(), groupLoad.getDests())) {
+          if (desc == value) {
+            auto candidate = cast<ttg::MemDescType>(dst.getType());
+            if (memoryType && memoryType != candidate)
+              return {};
+            memoryType = candidate;
+          }
+        }
       } else if (auto store =
                      dyn_cast<triton::amdgpu::AsyncTDMCopyLocalToGlobalOp>(
                          user)) {
@@ -185,6 +197,8 @@ Attribute AMDGPUAssignDescriptorMemoryLayouts::getDesiredDescriptorEncoding(
         continue;
 
       Attribute encoding = memoryType.getEncoding();
+      while (auto pinned = dyn_cast<ttg::PinnedEncodingTrait>(encoding))
+        encoding = pinned.getPinnedLayout();
       if (auto partitioned =
               dyn_cast<ttg::PartitionedSharedEncodingAttr>(encoding))
         encoding = partitioned.getPartitionLayout();

@@ -27,7 +27,7 @@ void lowerLoops(ModuleOp moduleOp, bool useAsyncCopy, bool usePingpong);
 // CoarseSchedule (loop.stage / loop.cluster). Exposed so the decompose+modulo
 // pipeline (change #4) can reuse the expander after it re-buffers + serializes
 // its own modulo-derived schedule, without going through lowerLoops.
-void expandLoops(ModuleOp moduleOp);
+LogicalResult expandLoops(ModuleOp moduleOp);
 
 // LoadInfo encapsulates a load's key aspects wrt scheduling. The `distToUse`
 // and `use` fields grab values from getIndirectLevel() which is a thin wrapper

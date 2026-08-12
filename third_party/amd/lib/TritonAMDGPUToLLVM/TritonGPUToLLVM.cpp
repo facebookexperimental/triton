@@ -115,6 +115,11 @@ struct ConvertTritonAMDGPUToLLVM
                                     mlir::triton::AMD::membarFilter);
     membarPass.run();
 
+    // Descriptor updates are otherwise lowered before their fused consumer,
+    // losing the shared SSA structure used by the compact descriptor mux. Do
+    // this after allocation and membar analyses have seen the canonical op.
+    AMD::materializeFusedTDMLoweringOperands(mod);
+
     // Lower functions
     {
       TritonLLVMFunctionConversionTarget funcTarget(*context);

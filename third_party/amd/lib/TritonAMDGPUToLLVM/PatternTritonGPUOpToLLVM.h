@@ -13,6 +13,10 @@ class DistributedCoordinateGroups;
 }
 
 namespace mlir::triton::AMD {
+// Recover explicit offsets and predicates from visible positioned descriptors
+// before dialect conversion consumes their SSA structure.
+void materializeFusedTDMLoweringOperands(ModuleOp mod);
+
 void populateConvertLayoutOpToLLVMPatterns(LLVMTypeConverter &typeConverter,
                                            const TargetInfo &targetInfo,
                                            RewritePatternSet &patterns,
