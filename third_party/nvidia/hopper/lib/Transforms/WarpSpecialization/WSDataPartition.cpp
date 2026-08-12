@@ -7,6 +7,8 @@
 #include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
+#include "llvm/Support/JSON.h"
+#include "llvm/Support/raw_ostream.h"
 
 #include <optional>
 
@@ -21,6 +23,55 @@ namespace mlir {
 #define LDBG(X) LLVM_DEBUG(DBGS() << X << "\n")
 
 static const char *kDataPartitionAttrName = "tt.data_partition_factor";
+static const char *kDataPartitionIdAttrName = "tt.data_partition_id";
+
+static void remapAutoWSBufferIds(Operation *op, unsigned partition,
+                                 unsigned numPartitions) {
+  auto attr = op->getAttrOfType<StringAttr>("tt.autows");
+  if (!attr)
+    return;
+  auto parsed = llvm::json::parse(attr.getValue());
+  if (!parsed) {
+    llvm::consumeError(parsed.takeError());
+    return;
+  }
+  auto *object = parsed->getAsObject();
+  auto *channels = object ? object->getArray("channels") : nullptr;
+  if (!channels)
+    return;
+
+  bool changed = false;
+  for (llvm::json::Value &channel : *channels) {
+    auto channelString = channel.getAsString();
+    if (!channelString)
+      continue;
+    SmallVector<StringRef, 5> fields;
+    StringRef(*channelString).split(fields, ',');
+    if (fields.size() != 4 && fields.size() != 5)
+      continue;
+    unsigned oldId;
+    if (fields[3].getAsInteger(10, oldId))
+      continue;
+    SmallVector<std::string, 5> remappedFields;
+    remappedFields.reserve(fields.size());
+    for (auto [index, field] : llvm::enumerate(fields)) {
+      if (index == 3)
+        remappedFields.push_back(
+            std::to_string(oldId * numPartitions + partition));
+      else
+        remappedFields.push_back(field.str());
+    }
+    channel = llvm::join(remappedFields, ",");
+    changed = true;
+  }
+  if (!changed)
+    return;
+
+  std::string serialized;
+  llvm::raw_string_ostream stream(serialized);
+  stream << *parsed;
+  op->setAttr("tt.autows", StringAttr::get(op->getContext(), stream.str()));
+}
 
 static bool containsAll(const SmallVector<AsyncTaskId> &superset,
                         const SmallVector<AsyncTaskId> &subset) {
@@ -1273,6 +1324,9 @@ static Operation *sliceOp(Operation *op, int offset, IRMapping &mappings,
     builder.setInsertionPoint(op);
     auto newOp = builder.clone(*op, mappings);
     setAsyncTaskIds(newOp, sliceTaskIds);
+    newOp->setAttr(kDataPartitionIdAttrName, builder.getI32IntegerAttr(offset));
+    if (numOfPartitions > 1 && isDotOrMMAv5Op(newOp))
+      remapAutoWSBufferIds(newOp, offset, numOfPartitions);
     if (numOfPartitions > 1 && isa<LocalAllocOp, ttng::TMEMAllocOp>(newOp)) {
       newOp->setLoc(appendToNameLoc(
           newOp->getLoc(), "_" + std::to_string(offset), op->getContext()));
@@ -2023,6 +2077,14 @@ static Operation *sliceOp(Operation *op, int offset, IRMapping &mappings,
     llvm_unreachable("unsupported op type");
   }
 
+  // Some slicing paths construct the replacement explicitly rather than via
+  // cloneAndSetResultType (notably TMEM loads, transposes, and ranges).  Mark
+  // every replacement uniformly so the post-slice scheduler can serialize
+  // the complete partition chain instead of hoisting unmarked TMEM loads from
+  // both partitions together.
+  if (newOp != op)
+    newOp->setAttr(kDataPartitionIdAttrName, builder.getI32IntegerAttr(offset));
+
   LLVM_DEBUG({
     LDBG("resulting");
     newOp->dump();
@@ -2264,6 +2326,117 @@ static void reorderLoadsToFirstUse(triton::FuncOp &funcOp) {
   });
 }
 
+// Recursive slicing inserts each clone beside its source operation.  With two
+// data partitions this leaves independent chains interleaved operation by
+// operation, extending the live ranges of both partitions.  In FA forward the
+// correction task then holds both BM256 accumulator halves live and ptxas
+// spills them.  Group the clones by partition while the graph is still purely
+// data-partitioned, before scheduling and channel construction capture any
+// operation identities.  This matches TLX's complete DP0-then-DP1 execution.
+static void serializeDataPartitionedOps(triton::FuncOp &funcOp) {
+  funcOp.walk([&](Block *block) {
+    // Do not move a region-owning control-flow operation relative to values
+    // used only inside its nested regions: those captures are not explicit
+    // SSA operands of the parent op.  The profitable FA correction block has
+    // only straight-line tensor operations (tt.reduce regions are explicit
+    // dataflow ops), while entry/outer blocks contain scf control flow.
+    if (llvm::any_of(*block, [](Operation &op) {
+          return isa<LoopLikeOpInterface, scf::IfOp>(&op);
+        }))
+      return;
+
+    DenseMap<Operation *, unsigned> originalOrder;
+    DenseMap<Operation *, int64_t> partitionId;
+    unsigned index = 0;
+    for (Operation &op : *block) {
+      originalOrder[&op] = index++;
+      if (auto id = op.getAttrOfType<IntegerAttr>(kDataPartitionIdAttrName))
+        partitionId[&op] = id.getInt();
+    }
+
+    DenseSet<int64_t> ids;
+    for (auto [op, id] : partitionId)
+      ids.insert(id);
+    if (ids.size() < 2)
+      return;
+
+    // Auxiliary layout conversions are sometimes built explicitly instead of
+    // through cloneAndSetResultType.  Infer their partition from a unique
+    // marked operand so users move with their producer.
+    bool changed = true;
+    while (changed) {
+      changed = false;
+      for (Operation &blockOp : *block) {
+        Operation *op = &blockOp;
+        if (partitionId.count(op) || op->hasTrait<OpTrait::IsTerminator>())
+          continue;
+        std::optional<int64_t> inferred;
+        bool conflicting = false;
+        for (Value operand : op->getOperands()) {
+          Operation *def = operand.getDefiningOp();
+          auto it = def ? partitionId.find(def) : partitionId.end();
+          if (it == partitionId.end())
+            continue;
+          if (inferred && *inferred != it->second) {
+            conflicting = true;
+            break;
+          }
+          inferred = it->second;
+        }
+        if (inferred && !conflicting) {
+          partitionId[op] = *inferred;
+          changed = true;
+        }
+      }
+    }
+
+    // Rebuild the whole block, not just marked operations.  Region-bearing
+    // operations such as tt.reduce and shared scalar/layout adapters can be
+    // definitions or users of a marked value.  Keeping them in the
+    // topological schedule guarantees SSA dominance while the partition id is
+    // still the primary ordering key whenever dependencies permit it.
+    SmallVector<Operation *> candidates;
+    for (Operation &op : *block) {
+      if (!op.hasTrait<OpTrait::IsTerminator>())
+        candidates.push_back(&op);
+    }
+    DenseSet<Operation *> candidateSet(candidates.begin(), candidates.end());
+    DenseSet<Operation *> emitted;
+    SmallVector<Operation *> ordered;
+    ordered.reserve(candidates.size());
+    while (ordered.size() != candidates.size()) {
+      Operation *best = nullptr;
+      auto key = [&](Operation *op) {
+        int64_t id = partitionId.count(op) ? partitionId.lookup(op) : -1;
+        return std::pair(id, originalOrder.lookup(op));
+      };
+      for (Operation *candidate : candidates) {
+        if (emitted.contains(candidate))
+          continue;
+        bool ready = llvm::all_of(candidate->getOperands(), [&](Value operand) {
+          Operation *def = operand.getDefiningOp();
+          return !def || !candidateSet.contains(def) || emitted.contains(def);
+        });
+        if (ready && (!best || key(candidate) < key(best)))
+          best = candidate;
+      }
+      assert(best && "cycle while serializing data-partition operations");
+      emitted.insert(best);
+      ordered.push_back(best);
+    }
+
+    Operation *anchor = candidates.back()->getNextNode();
+    for (Operation *op : ordered) {
+      if (anchor)
+        op->moveBefore(anchor);
+      else
+        op->moveBefore(block, block->end());
+    }
+  });
+
+  funcOp.walk([&](Operation *op) { op->removeAttr(kDataPartitionIdAttrName); });
+}
+
 bool doDataPartition(triton::FuncOp &funcOp, unsigned numConsumerGroups) {
   DataPartitionScheme partitionScheme;
   partitionScheme.numPartitions = numConsumerGroups;
@@ -2343,6 +2516,8 @@ bool doDataPartition(triton::FuncOp &funcOp, unsigned numConsumerGroups) {
     LDBG("final cleanup failed");
     return false;
   }
+
+  serializeDataPartitionedOps(funcOp);
 
   // Make sure original ops are not used
   LLVM_DEBUG({
