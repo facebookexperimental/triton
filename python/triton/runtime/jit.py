@@ -1029,6 +1029,8 @@ class JITFunction(JITCallable, KernelInterface[T]):
                 reasons.append("pre_run_hooks active")
             if knobs.compilation.always_compile:
                 reasons.append("always_compile=True")
+            if self.used_global_vals:
+                reasons.append("used_global_vals non-empty")
             if knobs.runtime.add_stages_inspection_hook is not None:
                 reasons.append("add_stages_inspection_hook active")
             if knobs.runtime.launch_enter_hook:
@@ -1043,6 +1045,18 @@ class JITFunction(JITCallable, KernelInterface[T]):
                 stacklevel=2,
             )
         _user_kwargs = dict(kwargs) if kwargs else {}
+        # When the autotuner seeds the C fast-dispatch cache it stores the
+        # winning config's compilation options (num_warps, ctas_per_cga, …) in
+        # _fc_meta_kwargs. The steady-state autotuner path dispatches via
+        # self.fn[grid](*args) WITHOUT those kwargs. If the C cache misses (new
+        # argument specialization), we fall through to here and need the options
+        # for a correct recompilation. Merge them as defaults so callers that
+        # explicitly pass kwargs still win.
+        _fc_meta = getattr(self, '_fc_meta_kwargs', None)
+        if _fc_meta:
+            for k, v in _fc_meta.items():
+                if k not in kwargs:
+                    kwargs[k] = v
         kwargs["debug"] = kwargs.get("debug", self.debug) or knobs.runtime.debug
         # Enable sanitize_overflow if explicitly set via kwarg, env var (TRITON_SANITIZE_OVERFLOW), or if debug is enabled
         kwargs["sanitize_overflow"] = kwargs.get("sanitize_overflow",
