@@ -26,8 +26,8 @@ class async_task:
             if core._unwrap_if_constexpr(args[0]) == "default":
                 self.is_explict = True
                 self.is_default = True
-                assert "num_regs" not in kwargs and "registers" not in kwargs, \
-                    "Cannot specify registers for the default async_task; it receives leftover registers from the partition budget"
+                self.num_regs = core._unwrap_if_constexpr(kwargs.get("num_regs", kwargs.get("registers", None)))
+                _validate_num_regs(self.num_regs)
                 self.replicate = core._unwrap_if_constexpr(kwargs.get("replicate", 1))
                 self.warp_group_start_id = core._unwrap_if_constexpr(kwargs.get("warp_group_start_id", None))
             else:
