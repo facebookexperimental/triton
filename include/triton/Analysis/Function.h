@@ -129,7 +129,8 @@ private:
       // so overwrite the output state entirely.
       outputs[block] = state;
       for (VirtualBlock successor : successors) {
-        inputs[successor].join(transferEdge(state, block.first, successor.first));
+        inputs[successor].join(
+            transferEdge(state, block.first, successor.first));
         updateSuccessor(terminator, successor.first, &inputs[successor].get());
         worklist.push_back(successor);
       }
