@@ -854,7 +854,7 @@ def _emit_assume(state, op):
         )
     facts = {assumption.assumption_id: assumption for assumption in state.target_program.assumptions}
     for operand_id, result_id in zip(op.operands, op.results):
-        value = _require_value(state, operand_id, op)
+        components = _as_components(_require_value(state, operand_id, op))
         result_fact_ids = tuple(fact_id for fact_id, target_id in zip(op.fact_ids, op.fact_target_ids)
                                 if int(target_id) == int(result_id))
         if not result_fact_ids:
@@ -884,19 +884,13 @@ def _emit_assume(state, op):
                         target_op_id=op.target_op_id,
                         fact_id=fact_id,
                     )
-                value = state.builder.assume_divisible(
-                    value,
-                    int(fact.divisor),
-                )
+                components = tuple(
+                    state.builder.assume_divisible(component, int(fact.divisor)) for component in components)
                 continue
             assumptions = _range_assumptions(state.dsl, fact)
             if assumptions:
-                value = state.builder.assume(
-                    value,
-                    assumptions,
-                    name="x",
-                )
-        state.values[result_id] = value
+                components = tuple(state.builder.assume(component, assumptions, name="x") for component in components)
+        state.values[result_id] = _pack_components(components)
 
 
 def _emit_make_range(state, op):
@@ -910,9 +904,11 @@ def _emit_make_range(state, op):
     block = state.dsl.sym("block")
     slot = state.dsl.sym("slot")
     expression = _deserialize_relation_expr(state, attrs.get("relation"), op)
+    block_id = (state.builder.constant(state.dsl.i32(), 0)
+                if int(state.target_program.kernel.num_ctas or 1) == 1 else state.builder.cluster_workgroup_id())
     bindings = {
         item: workitem,
-        block: state.builder.cluster_workgroup_id(),
+        block: block_id,
     }
     index_type = state.dsl.simd_type(state.dsl.index_type(), width)
     value_type = state.dsl.simd_type(element_type, width)
@@ -1148,9 +1144,7 @@ def _emit_barrier(state, op):
     issue_target_ids = op.operands[-issue_count:] if issue_count else ()
     completion_tokens = tuple(_require_value(state, target_value_id, op) for target_value_id in completion_target_ids)
     issue_tokens = tuple(_require_value(state, target_value_id, op) for target_value_id in issue_target_ids)
-    barrier_token = state.builder.barrier(*completion_tokens)
-    if issue_tokens:
-        barrier_token = state.builder.after(barrier_token, *issue_tokens)
+    barrier_token = state.builder.barrier(*completion_tokens, *issue_tokens)
     if op.results:
         state.values[_single_result(op)] = barrier_token
 
@@ -4211,12 +4205,18 @@ def _emit_buffer_load(state, op):
 def _emit_store(state, op):
     attrs = target_ir.attrs_dict(op)
     operand_count = 3 if attrs["has_mask"] else 2
-    dependency = _barrier_order_dependency(state, op, operand_count)
+    binding_count = int(attrs.get("index_binding_count", 0))
+    dependency = _barrier_order_dependency(
+        state,
+        op,
+        operand_count + binding_count,
+    )
     operands = _operand_values(state, op, len(op.operands))[:operand_count]
     ptrs, values = operands[:2]
     masks = operands[2] if attrs["has_mask"] else None
     component_count = int(attrs["component_count"])
-    ptr_components = _as_components(ptrs)
+    symbolic_address = attrs.get("bit_offset_relation") is not None
+    ptr_components = (() if symbolic_address else _as_components(ptrs))
     value_components = _broadcast_component(state, values, component_count, op)
     splat_cache = []
     value_components = tuple(
@@ -4235,7 +4235,7 @@ def _emit_store(state, op):
             component_count,
             op,
         )
-    if len(ptr_components) != component_count:
+    if not symbolic_address and len(ptr_components) != component_count:
         fail(
             "TLXW_EMIT_COMPONENT_COUNT",
             STAGE,
@@ -4259,15 +4259,31 @@ def _emit_store(state, op):
         width=lane_width,
     )
     packet = state.dsl.wave.PackOp(packet_type, value_components).result
-    slot = state.dsl.sym("slot")
-    zero = state.dsl.ixs_int(0)
+    if symbolic_address:
+        bit_offset, relation_bindings = _symbolic_buffer_relation(
+            state,
+            op,
+            attrs,
+            operand_count,
+        )
 
     def emit_store():
+        if symbolic_address:
+            return state.builder.scatter(
+                packet,
+                [ptrs],
+                bit_offset=bit_offset,
+                bindings={
+                    state.dsl.sym("item"): state.execution_item,
+                    **relation_bindings,
+                },
+                after=dependency,
+            )
         return state.builder.scatter(
             packet,
             ptr_components,
-            base=slot,
-            bit_offset=zero,
+            base=state.dsl.sym("slot"),
+            bit_offset=state.dsl.ixs_int(0),
             after=dependency,
         )
 
@@ -4291,7 +4307,12 @@ def _emit_store(state, op):
 def _emit_load(state, op):
     attrs = target_ir.attrs_dict(op)
     operand_count = 1 + int(bool(attrs["has_mask"])) + int(bool(attrs["has_other"]))
-    dependency = _barrier_order_dependency(state, op, operand_count)
+    binding_count = int(attrs.get("index_binding_count", 0))
+    dependency = _barrier_order_dependency(
+        state,
+        op,
+        operand_count + binding_count,
+    )
     operands = _operand_values(state, op, len(op.operands))[:operand_count]
     ptrs = operands[0]
     operand_index = 1
@@ -4301,7 +4322,8 @@ def _emit_load(state, op):
         operand_index += 1
     other = operands[operand_index] if attrs["has_other"] else None
     component_count = int(attrs["component_count"])
-    ptr_components = _as_components(ptrs)
+    symbolic_address = attrs.get("bit_offset_relation") is not None
+    ptr_components = (() if symbolic_address else _as_components(ptrs))
     mask_components = None
     if masks is not None:
         mask_components = _as_mask_components(
@@ -4322,7 +4344,7 @@ def _emit_load(state, op):
                 op,
                 splat_cache,
             ) for other_component in other_components)
-    if len(ptr_components) != component_count:
+    if not symbolic_address and len(ptr_components) != component_count:
         fail(
             "TLXW_EMIT_COMPONENT_COUNT",
             STAGE,
@@ -4360,15 +4382,31 @@ def _emit_load(state, op):
         state.dsl.vector_type(component_count, element_type),
         width=lane_width,
     )
-    slot = state.dsl.sym("slot")
-    zero = state.dsl.ixs_int(0)
+    if symbolic_address:
+        bit_offset, relation_bindings = _symbolic_buffer_relation(
+            state,
+            op,
+            attrs,
+            operand_count,
+        )
 
     def emit_active_load():
+        if symbolic_address:
+            return state.builder.gather(
+                [ptrs],
+                packet_type,
+                bit_offset=bit_offset,
+                bindings={
+                    state.dsl.sym("item"): state.execution_item,
+                    **relation_bindings,
+                },
+                after=dependency,
+            )
         return state.builder.gather(
             ptr_components,
             packet_type,
-            base=slot,
-            bit_offset=zero,
+            base=state.dsl.sym("slot"),
+            bit_offset=state.dsl.ixs_int(0),
             after=dependency,
         )
 
