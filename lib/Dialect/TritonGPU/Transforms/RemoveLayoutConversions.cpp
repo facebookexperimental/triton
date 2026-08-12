@@ -151,8 +151,7 @@ private:
 
 class LayoutRematerialization {
 public:
-  LayoutRematerialization(FuncOp F, unsigned smemBudget = 0)
-      : funcOp(F), smemBudget(smemBudget) {}
+  LayoutRematerialization(FuncOp F) : funcOp(F) {}
 
   // Map the original value to the remat'ed one.
   void addRematValue(Value old, Attribute encoding, Value newV);
@@ -171,7 +170,8 @@ public:
 
   // TODO: Merge the three hoistConvert*(); functions as they are duplicate code
   void hoistConvertDotOperand();
-  void hoistConvertOnTopOfExtOrBroadcast();
+  void hoistConvertOnTopOfExtOrBroadcast(
+      const DenseSet<Operation *> *forceHoists = nullptr);
   void hoistConvertIntoConditionals();
 
   /// Attempt to hoist \p convertOp above operations that make the tensor larger
@@ -179,7 +179,8 @@ public:
   /// possible, rematerialize the slice between the convert and that operation
   /// and hoist the convert above it.
   /// \return true if \p convertOp was hoisted, false otherwise.
-  bool hoistConvertOnTopOfExtOrBroadcast(ConvertLayoutOp convertOp);
+  bool hoistConvertOnTopOfExtOrBroadcast(ConvertLayoutOp convertOp,
+                                         bool forceHoist = false);
 
   /// Attempt to hoist \p convertOp into conditionals so the conversion is only
   /// conditionally executed. If this is possible, rematerialize the slice
@@ -224,9 +225,6 @@ private:
   // map of the values remat based on encoding.
   DenseMap<std::pair<Value, Attribute>, Value> rematMapping;
   FuncOp funcOp;
-  // Meta extension: when > 0, the remove-layout pass is operating under a SMEM
-  // budget and convert-elimination hoists bypass the upstream perf cost gate.
-  unsigned smemBudget;
   DominanceInfo domInfo;
   PostDominanceInfo postDomInfo;
 };
@@ -1313,13 +1311,16 @@ bool LayoutRematerialization::backwardRematerialization() {
   return changed;
 }
 
-void LayoutRematerialization::hoistConvertOnTopOfExtOrBroadcast() {
+void LayoutRematerialization::hoistConvertOnTopOfExtOrBroadcast(
+    const DenseSet<Operation *> *forceHoists) {
   // Go through each ConvertLayoutOp.
   SmallVector<ConvertLayoutOp> convertOps;
   funcOp.walk(
       [&](ConvertLayoutOp convertOp) { convertOps.push_back(convertOp); });
   for (ConvertLayoutOp convertOp : convertOps) {
-    if (!hoistConvertOnTopOfExtOrBroadcast(convertOp)) {
+    bool forceHoist =
+        forceHoists && forceHoists->contains(convertOp.getOperation());
+    if (!hoistConvertOnTopOfExtOrBroadcast(convertOp, forceHoist)) {
       // If the conversion didn't get removed, consider it for reuse in future
       // backward slices.
       addRematValue(convertOp.getSrc(), convertOp.getType().getEncoding(),
@@ -1722,7 +1723,7 @@ bool LayoutRematerialization::hoistConvertDotOperand(
 // For convert left we try to hoist them above type extension to reduce the cost
 // of the convert.
 bool LayoutRematerialization::hoistConvertOnTopOfExtOrBroadcast(
-    ConvertLayoutOp convertOp) {
+    ConvertLayoutOp convertOp, bool forceHoist) {
   // DotOperand is hoisted by hoistDotOperand
   RankedTensorType targetType = convertOp.getType();
   if (isa<DotOperandEncodingAttr>(targetType.getEncoding()))
@@ -1781,10 +1782,9 @@ bool LayoutRematerialization::hoistConvertOnTopOfExtOrBroadcast(
   Attribute srcEncoding = inferSrcEncoding(extOrBroadcastOp, dstEncoding);
   if (!srcEncoding)
     return false;
-  // Under a SMEM budget (a Meta extension) eliminating convert-layout scratch
-  // takes priority over the upstream perf-cost heuristic (#9194), so force the
-  // hoist. Without a budget, keep the upstream cost gate.
-  if (smemBudget == 0) {
+  // Eliminating an over-budget convert-layout scratch allocation takes
+  // priority over the upstream perf-cost heuristic (#9194).
+  if (!forceHoist) {
     int64_t newCvtCost =
         getConvertCost(extOrBroadcastOp->getOperand(0), srcEncoding);
     if (!isRematBeneficial(convertOp, slice, layout, newCvtCost))
@@ -1937,11 +1937,12 @@ bool backwardRematerialization(ModuleOp module) {
   return changed;
 }
 
-void hoistConvert(ModuleOp module, unsigned smemBudget = 0) {
+void hoistConvert(ModuleOp module,
+                  const DenseSet<Operation *> *forceHoists = nullptr) {
   SmallVector<ConvertLayoutOp> convertOps;
-  module.walk([smemBudget](FuncOp funcOp) {
-    LayoutRematerialization layoutRemat(funcOp, smemBudget);
-    layoutRemat.hoistConvertOnTopOfExtOrBroadcast();
+  module.walk([forceHoists](FuncOp funcOp) {
+    LayoutRematerialization layoutRemat(funcOp);
+    layoutRemat.hoistConvertOnTopOfExtOrBroadcast(forceHoists);
 
     layoutRemat = LayoutRematerialization(funcOp);
     layoutRemat.hoistConvertIntoConditionals();
@@ -2075,7 +2076,7 @@ public:
     } while (changed);
     // 3. For remaining converts, try to hoist them above cast generating larger
     // size types in order to reduce the cost of the convert op.
-    hoistConvert(m, smemBudget);
+    hoistConvert(m);
     LLVM_DEBUG({
       DBGS() << "Module after hoisting converts:\n";
       m.dump();
@@ -2110,8 +2111,8 @@ public:
     // convert_layout ops whose scratch would push SMEM over budget, and try to
     // eliminate them by propagating the source encoding through their users.
     if (smemBudget > 0) {
-      eliminateOverBudgetConverts(m);
-      hoistConvert(m, smemBudget);
+      DenseSet<Operation *> forcedHoists = eliminateOverBudgetConverts(m);
+      hoistConvert(m, &forcedHoists);
       cleanupConvertOps();
     }
   }
@@ -2121,12 +2122,13 @@ public:
   // tmem_load) and the users are elementwise ops feeding into local_store/
   // local_load (which can accept any layout), propagate the source layout
   // through the convert's users and erase the convert.
-  void eliminateOverBudgetConverts(ModuleOp m) {
-    m.walk([this](FuncOp funcOp) {
+  DenseSet<Operation *> eliminateOverBudgetConverts(ModuleOp m) {
+    DenseSet<Operation *> forcedHoists;
+    m.walk([this, &forcedHoists](FuncOp funcOp) {
       unsigned baseSmem = computeBaseSmem(funcOp);
 
       // Collect converts whose scratch would push SMEM over budget.
-      SmallVector<ConvertLayoutOp> overBudgetConverts;
+      SmallVector<ConvertLayoutOp> candidates;
       funcOp->walk([&](ConvertLayoutOp cvt) {
         auto srcTy = cvt.getSrc().getType();
         auto dstTy = cvt.getType();
@@ -2138,17 +2140,20 @@ public:
         unsigned scratchBytes = getNumScratchElemsSwizzledCvt(srcTy, dstTy) *
                                 getElementBitWidth(srcTy) / 8;
         if (baseSmem + scratchBytes > smemBudget) {
-          overBudgetConverts.push_back(cvt);
+          candidates.push_back(cvt);
         }
       });
 
-      for (ConvertLayoutOp cvt : overBudgetConverts) {
+      for (ConvertLayoutOp cvt : candidates) {
         Attribute srcEnc = cvt.getSrc().getType().getEncoding();
         if (canPropagateSrcEncodingThroughUsers(cvt, srcEnc)) {
           propagateSrcEncodingAndErase(cvt, srcEnc);
+        } else {
+          forcedHoists.insert(cvt.getOperation());
         }
       }
     });
+    return forcedHoists;
   }
 
   // Check whether we can propagate srcEnc through all transitive users of the

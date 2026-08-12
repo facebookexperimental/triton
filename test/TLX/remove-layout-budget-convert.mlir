@@ -1,27 +1,21 @@
 // RUN: triton-opt %s -split-input-file -tritongpu-remove-layout-conversions="smem-budget=1" | FileCheck %s
 
-// Test that the budget-aware convert elimination correctly handles a local_load
-// chain where a value has users with different encoding requirements.
+// Test that a nonzero budget does not force elimination of a conversion that
+// needs no shared-memory scratch.
 //
 // Setup: a function argument anchored at #blocked_a feeds through a
 // convert_layout to #blocked_b. A local_load in #blocked_b feeds through
 // arith.extf into arith.subf (which also consumes the convert result) and
-// arith.negf. The pass should eliminate the convert without creating encoding
-// mismatches. The expected behavior is that backward rematerialization clones
-// the local_load chain so each user gets its preferred layout, avoiding any
-// convert_layout entirely.
+// arith.negf. The selected conversion is register-only, so it must retain the
+// normal profitability behavior even though the numeric budget is tiny.
 
 // CHECK-DAG: #[[$BLOCKED_A:.*]] = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
 // CHECK-DAG: #[[$BLOCKED_B:.*]] = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
 // CHECK-LABEL: @local_load_chain_external_user
-// The local_load chain is cloned: one in #blocked_a for subf, one in #blocked_b for negf
-// CHECK: ttg.local_load %{{.*}} -> tensor<128x64xbf16, #[[$BLOCKED_A]]>
 // CHECK: ttg.local_load %{{.*}} -> tensor<128x64xbf16, #[[$BLOCKED_B]]>
-// CHECK: arith.extf {{.*}} : tensor<128x64xbf16, #[[$BLOCKED_A]]> to tensor<128x64xf32, #[[$BLOCKED_A]]>
 // CHECK: arith.extf {{.*}} : tensor<128x64xbf16, #[[$BLOCKED_B]]> to tensor<128x64xf32, #[[$BLOCKED_B]]>
-// The subf operates in #blocked_a (matching its function argument operand)
+// CHECK: ttg.convert_layout {{.*}} : tensor<128x64xf32, #[[$BLOCKED_B]]> -> tensor<128x64xf32, #[[$BLOCKED_A]]>
 // CHECK: arith.subf {{.*}} : tensor<128x64xf32, #[[$BLOCKED_A]]>
-// The external user (negf) keeps #blocked_b — no encoding mismatch
 // CHECK: arith.negf {{.*}} : tensor<128x64xf32, #[[$BLOCKED_B]]>
 
 #blocked_a = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
