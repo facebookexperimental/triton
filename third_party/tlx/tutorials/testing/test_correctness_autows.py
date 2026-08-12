@@ -12,7 +12,11 @@ import torch
 import triton
 
 from triton.language.extra.tlx.tutorials.fused_attention_ws_device_tma import (
-    attention as _autows_fa, )
+    _attn_fwd,
+    _attn_fwd_persist,
+    attention as _autows_fa,
+    configs_fwd as _autows_fwd_configs,
+)
 from triton.language.extra.tlx.tutorials.fused_attention_ws_device_tma_dp import (
     attention as _autows_fa_dp, )
 
@@ -140,6 +144,27 @@ def test_autows_fa_non_causal(SUBTILING, VECT_MUL, FADD2_REDUCE, baseVariant):
         ref_out = FlashAttention.get_reference(q, k, v, sm_scale, causal=False)
         tri_out = _autows_fa(q, k, v, False, sm_scale, baseVariant, SUBTILING, VECT_MUL, FADD2_REDUCE)
         torch.testing.assert_close(tri_out, ref_out, atol=1e-2, rtol=0)
+
+
+@pytest.mark.parametrize("baseVariant", ["ws_persistent", "ws"])
+@pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell GPU")
+def test_autows_fa_2cta_non_causal(baseVariant):
+    config = next(config for config in _autows_fwd_configs if config.kwargs.get("NUM_CTAS") == 2)
+    kernel = _attn_fwd_persist if baseVariant == "ws_persistent" else _attn_fwd
+    old_configs = kernel.configs
+    old_cache = kernel.cache
+    kernel.configs = [config]
+    kernel.cache = {}
+
+    sm_scale = 0.5
+    q, k, v = FlashAttention.create_inputs(2, 2, 512, 128)
+    reference = FlashAttention.get_reference(q, k, v, sm_scale, causal=False)
+    try:
+        actual = _autows_fa(q, k, v, False, sm_scale, baseVariant, True, 1, False)
+        torch.testing.assert_close(actual, reference, atol=1e-2, rtol=0)
+    finally:
+        kernel.configs = old_configs
+        kernel.cache = old_cache
 
 
 # =============================================================================
