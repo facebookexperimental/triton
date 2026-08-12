@@ -14,6 +14,8 @@
 // CHECK: ttng.wait_barrier {{.*}}async_task_id = array<i32: 2>
 // CHECK: %[[LOCAL1:.*]] = ttg.local_load {{.*}}async_task_id = array<i32: 2>
 // CHECK: arith.subf %[[LOCAL1]], %[[LOCAL1]] {{.*}}async_task_id = array<i32: 2>
+// CHECK-NOT: tt.descriptor_load
+// CHECK-NOT: nvws.descriptor_load
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [4, 1], order = [1, 0]}>
 #shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
