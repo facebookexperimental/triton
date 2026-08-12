@@ -471,25 +471,51 @@ buck2 run @fbcode//mode/opt -m ovr_config//triton:beta \
    instructions in a kernel to use the same `cta_group`. FA with selective 2-CTA
    on only some dots is impossible; a kernel must use 2-CTA on all dots or none.
 
-6. **Dependent 2-CTA dot chains are rejected before lowering**: The current
-   implementation supports multiple independent 2-CTA MMAs in one loop,
-   including Auto-WS data partitioning. It does not yet support FA-style chains
-   where one 2-CTA `tt.dot` consumes a value derived from an earlier 2-CTA
-   `tt.dot` result. `CheckMatmulTwoCTAs` rejects this true data dependency while
-   it is still explicit in TTGIR, before dot lowering rewrites the computation
-   into TMEM alloc/load/store chains. `Transform2CTALoads` remains a mechanical
-   B-load split for already-legal 2-CTA MMAs.
+6. **Dependent 2-CTA dot chains require a supported exchange shape**: FA-style
+   chains are classified as either a collective contraction or a peer gather.
+   Rank-3 transpose/reshape/split sequences used only to statically subtile a
+   contraction remain collective contractions; they do not request a cross-CTA
+   peer gather. Rank-2 matrix transposes, such as the dQ path, still require the
+   peer-gather layouts recognized by `Plan2CTAExchange`.
 
-7. **Host-side TMA descriptor shape is updated through IR type metadata**:
+7. **Data partitioning remaps pinned AutoWS buffer IDs**: When DP clones an MMA,
+   each full channel annotation is remapped as
+   `partitioned_id = source_id * num_partitions + partition`. This preserves
+   source-level reuse relationships within a compute group without aliasing the
+   independently executing DP groups. Memtype-only annotations are unchanged.
+
+8. **Shared-producer classification is dependency-group based**: An op that
+    appears in multiple MMA backward slices is shared only when those MMAs
+    belong to different final dependency groups. Serial K-sliced MMAs that
+    accumulate into the same output stay in one group, so their common
+    qK/softmax/P producer remains in that computation task instead of being
+    staged through the correction task.
+
+9. **Data-partition chains are serialized after slicing**: Recursive DP slicing
+   initially interleaves corresponding operations from both partitions. A
+   temporary partition id and dependency-preserving block schedule group the
+   complete DP0 chain before DP1, matching TLX and preventing both accumulator
+   halves from being live in the correction task at once.
+
+10. **Host-side TMA descriptor shape is updated through IR type metadata**:
    `Transform2CTALoads` supports host-side TMA by updating the function argument's
    `TensorDescType` to half-width block shape. The runtime reads that final IR
    type via `getTensorDescMetadata()` and creates the `CuTensorMap` accordingly.
    The `cta_group::2` mode is carried by the PTX instruction qualifier, not a
    separate descriptor-side flag.
 
-8. **Pointer-store epilogues are not recognized by Meta WS partitioning**:
+11. **Pointer-store epilogues are not recognized by Meta WS partitioning**:
    WS + 2-CTA test kernels must use descriptor/TMA stores for the output. Pointer
    stores do not currently create the expected epilogue partition.
+
+12. **AutoWS still materializes more channel state than hand-written TLX**:
+   At the pinned non-causal `(B=4,H=48,S=4096,D=128)` BM256/DP2 configuration,
+   both kernels emit 12 TTGIR MMAs and 64 `UTCHMMA.2CTA` SASS instructions.
+   AutoWS nevertheless has 69 warp-specialize operands, 87 initialized
+   barriers, and 66/74 local loads/stores, versus TLX's 40 operands, 50
+   barriers, and 5/4 local loads/stores. AutoWS measures 1.84-1.85 ms while TLX
+   measures 1.15-1.22 ms. The next matching target is channel/barrier coalescing
+   and default-task operand liveness, not tile, DP, 2-CTA, or MMA count.
 
 ### Verified Non-Future Items
 
