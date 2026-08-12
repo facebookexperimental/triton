@@ -214,10 +214,10 @@ def _attn_fwd_inner_oss_dp(
             warp_specialize=warp_specialize,
             merge_epilogue=True,
             separate_epilogue_store=True,
-            assume_nonempty=True,
-            disallow_acc_multi_buffer=True,
+            assume_nonempty=TWO_CTAS,
+            disallow_acc_multi_buffer=TWO_CTAS,
             data_partition_factor=DP_FACTOR,
-            num_stages=KV_NUM_STAGES,
+            num_stages=KV_NUM_STAGES if TWO_CTAS else None,
     ):
         start_n = tl.multiple_of(start_n, BLOCK_N)
 
@@ -622,7 +622,7 @@ def _attn_fwd_persist(
             merge_epilogue=True,
             separate_epilogue_store=True,
             data_partition_factor=DP_FACTOR,
-            num_stages=OUTER_NUM_STAGES,
+            num_stages=OUTER_NUM_STAGES if NUM_CTAS == 2 else None,
     ):
         pid = tile_idx % n_tile_num
         off_hz = tile_idx // n_tile_num
