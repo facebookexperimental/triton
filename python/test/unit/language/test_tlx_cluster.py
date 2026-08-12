@@ -715,6 +715,88 @@ def test_cluster_launch_control_multi_cta_delayed_exit(device):
     torch.testing.assert_close(output, ref_out)
 
 
+@pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
+@pytest.mark.parametrize("noinline", [False, True])
+def test_cluster_launch_control_across_call(noinline, device):
+    """CLC state crossing a tt.call boundary.
+
+    The callee's parameter type is rebuilt from the frontend `clc_response_type`,
+    so it must match the `ui128` memdesc that `create_alloc_clc_responses`
+    allocates. When it did not, this failed TTIR verification with
+    "'tt.call' op operand type mismatch: expected ... 1xi64 ... provided ... 1xui128".
+    """
+
+    # Wrapping the `clc_consumer` builtin in a @triton.jit function is what forces
+    # a real tt.call: builtins expand inline at trace time, so only a jit callee
+    # gets a signature rebuilt from the frontend types.
+    @triton.jit(noinline=noinline)
+    def clc_consumer_callee(clc_context, clc_phase_consumer):
+        return tlx.clc_consumer(clc_context, clc_phase_consumer)
+
+    @triton.jit
+    def clc_call_kernel(
+        x_ptr,
+        y_ptr,
+        z_ptr,
+        n_elements,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        tile_id = tl.program_id(axis=0)
+        clc_phase_producer = 1
+        clc_phase_consumer = 0
+        clc_context = tlx.clc_create_context(1)
+
+        while tile_id != -1:
+            tlx.clc_producer(clc_context, clc_phase_producer)
+            clc_phase_producer ^= 1
+
+            block_start = tile_id * BLOCK_SIZE
+            offsets = block_start + tl.arange(0, BLOCK_SIZE)
+            mask = offsets < n_elements
+            x = tl.load(x_ptr + offsets, mask=mask)
+            y = tl.load(y_ptr + offsets, mask=mask)
+            tl.store(z_ptr + offsets, x + y, mask=mask)
+
+            # The whole CLCPipelineContext (mbarriers + clc_response) crosses the call.
+            tile_id = clc_consumer_callee(clc_context, clc_phase_consumer)
+            clc_phase_consumer ^= 1
+
+    BLOCK_SIZE = 1024
+    n_elements = BLOCK_SIZE * 16
+    x = torch.randn(n_elements, device=device)
+    y = torch.randn(n_elements, device=device)
+    output = torch.zeros_like(x)
+    grid = (triton.cdiv(n_elements, BLOCK_SIZE), )
+
+    kernel = clc_call_kernel[grid](x, y, output, n_elements, BLOCK_SIZE=BLOCK_SIZE, launch_cooperative_grid=True)
+
+    if noinline:
+        # The callee only survives the TTIR inliner when marked noinline. Pin
+        # its clc_response parameter to the `ui128` memdesc so a regression
+        # fails here rather than as an opaque verifier error.
+        callee_sigs = [line for line in kernel.asm["ttir"].splitlines() if line.lstrip().startswith("tt.func private")]
+        assert callee_sigs, "expected the noinline callee to survive the TTIR inliner"
+        assert any("ui128" in sig for sig in callee_sigs), callee_sigs
+
+    assert re.search(r"clusterlaunchcontrol.try_cancel", kernel.asm["ptx"])
+    torch.testing.assert_close(output, x + y)
+
+
+def test_clc_response_type_mangle():
+    """`clc_response_type` must not share a mangled name with `mbarrier_type`.
+
+    Both carry a placeholder `tl.int64` element type (Triton has no 128-bit
+    dtype), so the inherited `buffered_tensor_type.mangle` collapses them to the
+    same string for a given shape. A clc_response lowers to a `ui128` memdesc
+    and an mbarrier to an `i64` one, so that collision would let the `tt.func`
+    generated for one be reused from the JIT cache for the other.
+    """
+    for num in (0, 1):
+        clc_mangle = tlx.clc_response_type(num, None).mangle()
+        mbar_mangle = tlx.mbarrier_type(num, None, tlx.storage_kind.smem).mangle()
+        assert clc_mangle != mbar_mangle, f"num={num}: {clc_mangle}"
+
+
 @pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer for cluster sync")
 def test_explicit_cluster_sync_ws(device):
     """Test explicit cluster_barrier() behavior in WS mode.

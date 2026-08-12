@@ -37,6 +37,15 @@ namespace tlx = triton::tlx;
 namespace amdgpu = triton::amdgpu;
 namespace ttag = triton::amdgpu;
 
+// Element type of a CLC (Cluster Launch Control) response buffer. A CLC
+// response is a 16-byte opaque hardware object, so each stage is stored as one
+// `ui128`. Single source of truth: both `create_alloc_clc_responses` and the
+// `get_clc_response_element_ty` binding used by `tlx.clc_response_type.to_ir()`
+// go through here so the allocation and the frontend type can never diverge.
+static mlir::Type getCLCResponseElementType(mlir::OpBuilder &builder) {
+  return builder.getIntegerType(128, /*signed=*/false);
+}
+
 // Construct a CGAEncodingAttr from legacy (CTAsPerCGA, CTASplitNum, CTAOrder)
 // params. The single-CTA case must go through get1CTALayout: feeding all-1
 // params to CGAEncodingAttr::fromSplitParams builds a layout whose out-dims
@@ -1074,14 +1083,25 @@ void init_triton_tlx_ir(py::module &&m) {
              // This links the storage_alias_spec to the reuse_group tree
              self.create<tlx::SetBufferOverlapOp>(storageAliasSpec, overlapDef);
            })
+      // The element type of a CLC response buffer. A CLC response is a 16-byte
+      // opaque hardware object, so it is stored as one `ui128` per stage. This
+      // is exposed to Python so that `tlx.clc_response_type.to_ir()` rebuilds
+      // the exact same memdesc type as `create_alloc_clc_responses` below --
+      // any divergence only shows up when a CLC context crosses a `tt.call`
+      // (a CLC context passed into a @triton.jit helper), where the callee's
+      // parameter type is rebuilt from the frontend type and TTIR verification
+      // then fails with a `tt.call` operand type mismatch.
+      .def("get_clc_response_element_ty",
+           [](TritonOpBuilder &self) -> Type {
+             return getCLCResponseElementType(self.getBuilder());
+           })
       .def("create_alloc_clc_responses",
            [](TritonOpBuilder &self, int numResponses,
               Attribute clcResEncoding) -> mlir::Value {
              auto context = self.getBuilder().getContext();
              auto memorySpace = ttg::SharedMemorySpaceAttr::get(context);
              auto memDescType = ttg::MemDescType::get(
-                 {numResponses},
-                 self.getBuilder().getIntegerType(128, /*signed=*/false),
+                 {numResponses}, getCLCResponseElementType(self.getBuilder()),
                  clcResEncoding, memorySpace, /*mutableMemory=*/true);
 
              mlir::Value bufferViews =
