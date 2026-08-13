@@ -1356,11 +1356,21 @@ class clc_response_type(buffered_tensor_type):
     # both of which are opaque objects with fixed size
 
     def __init__(self, num: int, layout: Optional[swizzled_shared_layout_encoding]):
+        # A CLC response is a 16-byte opaque hardware object, i.e. one `ui128`
+        # per stage. Triton has no 128-bit `tl.dtype`, so the base class is
+        # given `tl.int64` as a placeholder and `to_ir` below builds the real
+        # element type through the builder instead of from `self.element_ty`.
         super().__init__(tl.int64, [1], num, storage_kind.smem, layout)
 
     def _unflatten_ir(self, handles: List[ir.value], cursor: int) -> Tuple[clc_response, int]:
         value = clc_response(handles[cursor], self.num, self.layout)
         return value, cursor + 1
+
+    def mangle(self) -> str:
+        # Distinct from buffered_tensor_type/mbarrier_type, whose mangles are
+        # derived from the (placeholder) int64 element type and would otherwise
+        # collide with this one for the same shape.
+        return f"clc_response_{self.num}"
 
     def to_ir(self, builder: ir.builder) -> None:
         if self.num >= 1:
@@ -1369,7 +1379,13 @@ class clc_response_type(buffered_tensor_type):
             shape = self.shape
         return builder.get_memdesc_type(
             shape,
-            self.element_ty.to_ir(builder),
+            # NOT self.element_ty: the allocation created by
+            # create_alloc_clc_responses uses `ui128`. Using the placeholder
+            # int64 here builds a different memdesc type whenever this type is
+            # reconstructed -- notably for a @triton.jit callee's parameter when
+            # a CLC context crosses a tt.call -- which fails TTIR verification
+            # with a `tt.call` operand type mismatch.
+            builder.get_clc_response_element_ty(),
             self.layout.to_ir(builder),
             self.storage.value,
         )
