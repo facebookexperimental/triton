@@ -162,7 +162,7 @@ def _join_value_relation(builder, source_ids, result_id):
     )
 
 
-def _memory_relation(builder, offset_target_id, element_byte_width):
+def _memory_relation(builder, offset_target_id, element_byte_width, element_contiguity):
     relation = _value_relation(builder, offset_target_id)
     if relation is None:
         fail(
@@ -183,6 +183,7 @@ def _memory_relation(builder, offset_target_id, element_byte_width):
         builder.layouts[int(value.layout_map_id)],
         relation.expr,
         element_byte_width=int(element_byte_width),
+        element_contiguity=int(element_contiguity),
     )
     return {
         "bit_offset_relation": bit_offset,
@@ -1457,7 +1458,19 @@ def _convert_splat(builder, view):
         pointer = builder.pointer_relations.get(int(view.operand_target_ids[0]))
         if pointer is not None:
             builder.pointer_relations[int(view.result_target_ids[0])] = pointer
-        relation = _value_relation(builder, view.operand_target_ids[0])
+        operand_target_id = int(view.operand_target_ids[0])
+        operand = builder.values[operand_target_id]
+        if operand.type.representation == "scalar" and _integer_target_type(operand.type):
+            relation = builder.value_relations.get(operand_target_id)
+            if relation is None or relation.bindings:
+                dsl = layouts.load_wave_dsl()
+                name = f"t{operand_target_id}"
+                relation = _IndexRelation(
+                    dsl.sym(name),
+                    ((name, operand_target_id), ),
+                )
+        else:
+            relation = _value_relation(builder, operand_target_id)
         if relation is not None:
             builder.value_relations[int(view.result_target_ids[0])] = relation
 
@@ -2759,7 +2772,12 @@ def _convert_buffer_load_to_local(
         fields["offset_value_id"],
         op,
     )
-    relation_attrs, relation_bindings = _memory_relation(builder, offset_target_id, memdesc.element_byte_width)
+    relation_attrs, relation_bindings = _memory_relation(
+        builder,
+        offset_target_id,
+        memdesc.element_byte_width,
+        contiguity,
+    )
     operands = [destination_target_id, base_target_id, offset_target_id]
     if has_mask:
         operands.append(_single_source_target(
@@ -3041,7 +3059,12 @@ def _convert_buffer_load(builder, conversion_input, type_layout_program, fact_pr
         runtime_operands.append(runtime_mask_target_id)
     if other_target_id is not None:
         runtime_operands.append(other_target_id)
-    relation_attrs, relation_bindings = _memory_relation(builder, runtime_offset_target_id, element_byte_width)
+    relation_attrs, relation_bindings = _memory_relation(
+        builder,
+        runtime_offset_target_id,
+        element_byte_width,
+        contiguity,
+    )
     runtime_operands.extend(relation_bindings)
     builder.add_op(
         "buffer_load",
@@ -3159,7 +3182,12 @@ def _convert_buffer_store(builder, conversion_input, type_layout_program, fact_p
     ]
     if runtime_mask_target_id is not None:
         runtime_operands.append(runtime_mask_target_id)
-    relation_attrs, relation_bindings = _memory_relation(builder, runtime_offset_target_id, element_byte_width)
+    relation_attrs, relation_bindings = _memory_relation(
+        builder,
+        runtime_offset_target_id,
+        element_byte_width,
+        contiguity,
+    )
     runtime_operands.extend(relation_bindings)
     builder.add_op(
         "buffer_store",
