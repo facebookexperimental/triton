@@ -1362,7 +1362,8 @@ def _packet_relation_blob(
         packet,
         reshape=transform == "reshape",
     )
-    if transform == "reshape":
+    binary_layouts = all(_is_power_of_two(extent) for _name, extent in (*source_dims, *result_dims))
+    if transform == "reshape" and not binary_layouts:
         # A reshape through non-power-of-two dimensions is not a GF(2) linear
         # map.  Keep its exact integer coordinate composition.
         inverse = source.pseudoinvert()
@@ -1374,15 +1375,18 @@ def _packet_relation_blob(
             result_dims,
             mapped_dims,
             structural,
-            reshape=False,
+            reshape=transform == "reshape",
         )
         same_layout = (transform == "identity" and not structural and tuple(source.bases) == tuple(result.bases)
                        and tuple(source.out_dims) == tuple(result.out_dims))
         if same_layout:
             mapped = dict(result_physical)
-        elif all(_is_power_of_two(extent) for _name, extent in source_dims):
+        elif binary_layouts:
             relation = _preferred_packet_relation(source, destination)
             mapped = _symbolic_layout_formula(dsl, relation, packet)
+            for name in _PACKET_PHYSICAL_DIMS:
+                if _packet_relation_output_is_direct(relation, name):
+                    mapped[name] = result_physical[name]
         elif transform == "identity" and not structural:
             raise ValueError("packet redistribution between distinct non-power-of-two layouts "
                              "is not representable by the GF(2) layout relation")
@@ -1991,6 +1995,22 @@ def _preferred_packet_relation(source, destination):
         [physical_extents[name] for name in _PACKET_PHYSICAL_DIMS],
         False,
     )
+
+
+def _packet_relation_output_is_direct(relation, name):
+    output_dims = tuple((str(output_name), int(extent)) for output_name, extent in relation.out_dims)
+    output_index = next((index for index, (output_name, _extent) in enumerate(output_dims) if output_name == name),
+                        None)
+    if output_index is None:
+        return False
+    if linear_layout_in_dim_size(relation, name) != output_dims[output_index][1]:
+        return False
+    for input_name, bases in relation.bases:
+        for bit, basis in enumerate(bases):
+            expected = 1 << bit if str(input_name) == name else 0
+            if int(basis[output_index]) != expected:
+                return False
+    return True
 
 
 def _transform_logical_coordinates(

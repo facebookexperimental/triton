@@ -323,6 +323,99 @@ def _transpose_frame(dsl, item):
     return group, within, origin_item, origin_slot
 
 
+def _unpack_packet_relation(dsl, relation, slots, items):
+    packed = dsl.ixs_deserialize(relation)
+    source_slot = dsl.mod(packed, slots)
+    source_item = dsl.mod(dsl.floor(packed / slots), items)
+    source_block = dsl.floor(packed / (slots * items))
+    facts = (
+        *layouts._symbolic_range_predicates(dsl, dsl.sym("block"), 0, 0),
+        *layouts._symbolic_range_predicates(dsl, dsl.sym("item"), 0, items - 1),
+        *layouts._symbolic_range_predicates(dsl, dsl.sym("slot"), 0, slots - 1),
+    )
+    return dsl.ixs_check((source_block, source_item, source_slot), facts)[1]
+
+
+def test_packet_relation_keeps_direct_physical_coordinates_literal():
+    bases = {
+        "register": ((1, 0), (2, 0), (4, 0)),
+        "lane": ((0, 1), (0, 2), (0, 4), (0, 8), (8, 0), (16, 0)),
+        "warp": ((0, 16), (0, 32)),
+        "block": (),
+    }
+
+    def make_linear(order):
+        return LinearLayout.from_bases(
+            tuple((name, bases[name]) for name in order),
+            ("dim0", "dim1"),
+            (32, 64),
+            False,
+        )
+
+    source = make_linear(("register", "lane", "warp", "block"))
+    result = make_linear(("warp", "register", "lane", "block"))
+    relation = layouts._packet_relation_blob(
+        source,
+        result,
+        (32, 64),
+        (32, 64),
+        lane_width=_LANE_WIDTH,
+        source_components=_PACKET_WIDTH,
+        destination_components=_PACKET_WIDTH,
+    )
+    dsl = layouts.load_wave_dsl()
+    source_block, source_item, source_slot = _unpack_packet_relation(dsl, relation, _PACKET_WIDTH, 256)
+    assert str(source_block) == "0"
+    assert str(source_item) == "item"
+    assert str(source_slot) == "slot"
+
+
+def test_binary_reshape_keeps_direct_physical_coordinates_literal():
+    source_shape = (1, 1, 2, 1, 16, 32)
+    result_shape = (32, 32)
+    source_bases = (
+        ("register", ((0, 0, 0, 0, 0, 1), (0, 0, 0, 0, 0, 2), (0, 0, 0, 0, 0, 4))),
+        ("lane", ((0, 0, 0, 0, 1, 0), (0, 0, 0, 0, 2, 0), (0, 0, 0, 0, 4, 0), (0, 0, 0, 0, 8, 0), (0, 0, 0, 0, 0, 8),
+                  (0, 0, 0, 0, 0, 16))),
+        ("warp", ((0, 0, 0, 0, 0, 0), (0, 0, 1, 0, 0, 0))),
+        ("block", ()),
+    )
+
+    def reshape_coordinate(coordinate):
+        linear = 0
+        for value, extent in zip(coordinate, source_shape, strict=True):
+            linear = linear * extent + value
+        return (linear // result_shape[1], linear % result_shape[1])
+
+    source = LinearLayout.from_bases(
+        source_bases,
+        tuple(f"dim{dim}" for dim in range(len(source_shape))),
+        source_shape,
+        False,
+    )
+    result = LinearLayout.from_bases(
+        tuple((name, tuple(reshape_coordinate(basis) for basis in bases)) for name, bases in source_bases),
+        ("dim0", "dim1"),
+        result_shape,
+        False,
+    )
+    relation = layouts._packet_relation_blob(
+        source,
+        result,
+        source_shape,
+        result_shape,
+        lane_width=_LANE_WIDTH,
+        source_components=_PACKET_WIDTH,
+        destination_components=_PACKET_WIDTH,
+        transform="reshape",
+    )
+    dsl = layouts.load_wave_dsl()
+    source_block, source_item, source_slot = _unpack_packet_relation(dsl, relation, _PACKET_WIDTH, 256)
+    assert str(source_block) == "0"
+    assert str(source_item) == "item"
+    assert str(source_slot) == "slot"
+
+
 def _prove_b16_transactions(dsl, relation, item_count, packet_count=8):
     item = dsl.sym("item")
     slot = dsl.sym("slot")
