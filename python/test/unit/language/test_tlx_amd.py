@@ -46,6 +46,22 @@ GFX942 = GPUTarget("hip", "gfx942", 64)
 GFX1250 = GPUTarget("hip", "gfx1250", 32)
 
 
+def test_amd_ttgir_schedule_env_is_cache_keyed_and_overridable(monkeypatch):
+    backend = amd_compiler.HIPBackend(GFX950)
+    monkeypatch.delenv("TRITON_AMD_TTGIR_SCHEDULE", raising=False)
+    baseline = backend.parse_options({})
+
+    monkeypatch.setenv("TRITON_AMD_TTGIR_SCHEDULE", "1")
+    env_enabled = backend.parse_options({})
+    config_disabled = backend.parse_options({"enable_sched_group_barrier_scheduler": False})
+
+    assert not baseline.enable_sched_group_barrier_scheduler
+    assert env_enabled.enable_sched_group_barrier_scheduler
+    assert env_enabled.hash() != baseline.hash()
+    assert not config_disabled.enable_sched_group_barrier_scheduler
+    assert config_disabled.hash() == baseline.hash()
+
+
 def test_amd_regalloc_codegen_options_are_cache_keyed():
     baseline = amd_compiler.HIPOptions(arch="gfx950")
     tuned = amd_compiler.HIPOptions(
@@ -53,6 +69,7 @@ def test_amd_regalloc_codegen_options_are_cache_keyed():
         reverse_local_assignment=True,
         sink_insts_to_avoid_spills=True,
         regclass_priority_trumps_globalness=True,
+        disable_unclustered_high_rp_reschedule=True,
     )
 
     assert tuned.hash() != baseline.hash()
@@ -61,7 +78,27 @@ def test_amd_regalloc_codegen_options_are_cache_keyed():
         "greedy-reverse-local-assignment",
         "sink-insts-to-avoid-spills",
         "greedy-regclass-priority-trumps-globalness",
+        "amdgpu-disable-unclustered-high-rp-reschedule",
     ]
+
+
+def test_amd_sched_group_barrier_options_are_cache_keyed_and_validated():
+    baseline = amd_compiler.HIPOptions(arch="gfx950")
+    tuned = amd_compiler.HIPOptions(
+        arch="gfx950",
+        enable_sched_group_barrier_scheduler=True,
+        sched_group_barrier_mfma_per_dwordx4=2,
+        sched_group_barrier_required_region_count=4,
+    )
+
+    assert tuned.hash() != baseline.hash()
+    assert tuned.enable_sched_group_barrier_scheduler
+    assert tuned.sched_group_barrier_mfma_per_dwordx4 == 2
+    assert tuned.sched_group_barrier_required_region_count == 4
+    with pytest.raises(ValueError, match="sched_group_barrier_mfma_per_dwordx4 must be positive"):
+        amd_compiler.HIPOptions(arch="gfx950", sched_group_barrier_mfma_per_dwordx4=0)
+    with pytest.raises(ValueError, match="sched_group_barrier_required_region_count must be non-negative"):
+        amd_compiler.HIPOptions(arch="gfx950", sched_group_barrier_required_region_count=-1)
 
 
 def compile_for_target(fn, signature, constexprs, target):

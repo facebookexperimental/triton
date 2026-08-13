@@ -446,4 +446,35 @@ def TritonAMDGPUDotDecomposeAndSchedule
                            "mlir::ROCDL::ROCDLDialect"];
 }
 
+def TritonAMDGPUSchedGroupBarrierScheduler
+    : Pass<"tritonamdgpu-sched-group-barrier-scheduler", "mlir::ModuleOp"> {
+  let summary =
+      "Price TTGIR operations for AMD sched_group_barrier scheduling";
+
+  let description = [{
+    Runs at the end of the AMD TTGIR pipeline, after transformations that can
+    change memory instruction classes or widths. The pass annotates relevant
+    operations with their eventual AMD machine-instruction class and exact
+    instruction count. It does not reorder TTGIR or emit LLVM IR.
+
+    ConvertTritonAMDGPUToLLVM consumes the annotations immediately after
+    ModuleMembarAnalysis, when the real LDS hazard regions are available, and
+    materializes an anchor/cover sched_group_barrier program in each eligible
+    region.
+  }];
+
+  let options = [
+    Option<"mfmaPerDwordx4", "mfma-per-dwordx4", "unsigned", /*default=*/"4",
+           "MFMA cover for a 128-bit VMEM read; narrower reads scale down.">,
+    Option<"requiredRegionCount", "required-region-count", "unsigned",
+           /*default=*/"0",
+           "Schedule only blocks with this many Membar-delimited regions; "
+           "zero accepts any region count.">,
+  ];
+
+  let dependentDialects = ["mlir::triton::TritonDialect",
+                           "mlir::triton::gpu::TritonGPUDialect",
+                           "mlir::triton::amdgpu::TritonAMDGPUDialect"];
+}
+
 #endif
