@@ -16471,7 +16471,7 @@ def test_tlx_wave_converter_pipeline_lowers_raw_masked_load_store(tmp_path):
     assert wave.count("wave.gather") == 1
     assert wave.count("wave.scatter") == 1
     memory_lines = [line for line in wave.splitlines() if "wave.gather" in line or "wave.scatter" in line]
-    assert all('bit_offset = <"32*item">' in line for line in memory_lines)
+    assert all('bit_offset = <"32*item">' in line for line in memory_lines), memory_lines
     assert all("packet_bindings" not in line for line in memory_lines)
     assert wave.count("wave.where") == 2
     assert wave.count("otherwise") == 1
@@ -16522,7 +16522,7 @@ def test_tlx_wave_converter_pipeline_lowers_masked_buffer_load_with_other(tmp_pa
     memory_lines = [
         line for line in output.emitted_module.text.splitlines() if "wave.gather" in line or "wave.scatter" in line
     ]
-    assert all('bit_offset = <"32*item">' in line for line in memory_lines)
+    assert all('bit_offset = <"8*Mod(4*item, 4294967296)">' in line for line in memory_lines), memory_lines
     assert all("packet_bindings" not in line for line in memory_lines)
     assert "otherwise" in output.emitted_module.text
 
@@ -16689,8 +16689,8 @@ def test_tlx_wave_converter_preserves_runtime_unsigned_remainder(tmp_path):
     %zero = arith.constant 0 : i32
     %modulus_positive = arith.cmpi sgt, %modulus, %zero : i32
     llvm.intr.assume %modulus_positive : i1
-    %loaded = amdg.buffer_load %arg0[%offset] {contiguity = 2 : i32} : tensor<128xf16, #blocked>
-    amdg.buffer_store %loaded, %arg1[%offset] {contiguity = 2 : i32} : tensor<128xf16, #blocked>
+    %loaded = amdg.buffer_load %arg0[%offset] {contiguity = 1 : i32} : tensor<128xf16, #blocked>
+    amdg.buffer_store %loaded, %arg1[%offset] {contiguity = 1 : i32} : tensor<128xf16, #blocked>
     tt.return
   }
 """
@@ -16723,8 +16723,8 @@ def test_tlx_wave_converter_preserves_masked_runtime_signed_remainder(tmp_path):
     %below_modulus = arith.cmpi slt, %raw, %modulus_s : tensor<128xi32, #blocked>
     %mask = arith.andi %nonnegative, %below_modulus : tensor<128xi1, #blocked>
     %other = arith.constant dense<0.000000e+00> : tensor<128xf16, #blocked>
-    %loaded = amdg.buffer_load %arg0[%offset], %mask, %other {contiguity = 2 : i32} : tensor<128xf16, #blocked>
-    amdg.buffer_store %loaded, %arg1[%offset], %mask {contiguity = 2 : i32} : tensor<128xf16, #blocked>
+    %loaded = amdg.buffer_load %arg0[%offset], %mask, %other {contiguity = 1 : i32} : tensor<128xf16, #blocked>
+    amdg.buffer_store %loaded, %arg1[%offset], %mask {contiguity = 1 : i32} : tensor<128xf16, #blocked>
     tt.return
   }
 """
@@ -17394,7 +17394,7 @@ def test_tlx_wave_converter_pipeline_keeps_runtime_modulo_index_exact(tmp_path):
     %col_2d = tt.expand_dims %col {axis = 0 : i32} : tensor<128xi32, #ttg.slice<{dim = 0, parent = #linear}>> -> tensor<1x128xi32, #linear>
     %col_b = tt.broadcast %col_2d : tensor<1x128xi32, #linear> -> tensor<128x128xi32, #linear>
     %offset = arith.addi %row_b, %col_b : tensor<128x128xi32, #linear>
-    %token = amdg.buffer_load_to_local %arg0[%offset] stride = %stride into %alloc {contiguity = 2 : i32} : <f16>[tensor<128x128xi32, #linear>] -> <128x128xf16, #shared, #smem, mutable>
+    %token = amdg.buffer_load_to_local %arg0[%offset] stride = %stride into %alloc {contiguity = 1 : i32} : <f16>[tensor<128x128xi32, #linear>] -> <128x128xf16, #shared, #smem, mutable>
     %group = ttg.async_commit_group tokens %token
     %wait = ttg.async_wait %group {num = 0 : i32}
     tt.return
@@ -17416,7 +17416,7 @@ def test_tlx_wave_converter_pipeline_keeps_runtime_modulo_index_exact(tmp_path):
     assert assumed_results.issubset(binding_ids)
     assert assumed_operands.isdisjoint(binding_ids)
     _assert_mechanical_symbolic_copy(attrs, masked=False)
-    assert attrs["contiguity"] == 2
+    assert attrs["contiguity"] == 1
     raw_wave = output.emitted_module.text
     assert raw_wave.count("wave.gather") == 1
     assert raw_wave.count("wave.scatter") == 1
