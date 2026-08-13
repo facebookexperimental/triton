@@ -28,6 +28,7 @@
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/TMAUtilities.h"
 #include "llvm/ADT/MapVector.h"
+#include "llvm/Support/JSON.h"
 #include <unordered_set>
 
 namespace tt = mlir::triton;
@@ -39,6 +40,24 @@ namespace mlir {
 #define DEBUG_TYPE "nvgpu-ws-code-partition"
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
 #define LDBG(X) LLVM_DEBUG(DBGS() << X << "\n")
+
+static bool hasAutoWSBoolean(triton::FuncOp funcOp, StringRef key) {
+  bool enabled = false;
+  funcOp.walk([&](Operation *op) {
+    auto attr = op->getAttrOfType<StringAttr>("tt.autows");
+    if (!attr)
+      return;
+    auto parsed = llvm::json::parse(attr.getValue());
+    if (!parsed) {
+      llvm::consumeError(parsed.takeError());
+      return;
+    }
+    auto *object = parsed->getAsObject();
+    if (object)
+      enabled |= object->getBoolean(key).value_or(false);
+  });
+  return enabled;
+}
 
 // After insertAsyncComm creates WSBarrier endpoints with dstTask, inject the
 // channelGraph computed from the full set of channels.
@@ -3678,9 +3697,14 @@ void insertAsyncComm(
                 funcOp.getContext(), masterChannel->relation.first,
                 WSBarrierAttr::kDirectionForward)
                 .build(funcOp.getContext());
+        Operation *completionMmaOverride = nullptr;
+        if (addCompletionBarrier && tailProducer != headProducer &&
+            isa<ttng::MMAv5OpInterface>(tailProducer))
+          completionMmaOverride = tailProducer;
         desyncMMAv5Op(builder, mmaOp, *commChannel.producerBarrier, bufferIdx,
                       phase, headConsumer, false, addCompletionBarrier,
-                      waitConstraints);
+                      waitConstraints, /*releaseOnLastIterOnly=*/false,
+                      completionMmaOverride);
       }
     }
     // Channel can have multiple consumers.
@@ -4827,6 +4851,12 @@ static void mergeDuplicateLocalAllocs(triton::FuncOp &funcOp) {
 void removeRedundantTmemZeroStores(triton::FuncOp funcOp) {
   DominanceInfo dominance(funcOp);
   auto isConstZeroTensor = [](Value v) -> bool {
+    // Hoisting can materialize an accumulator initializer in the default
+    // partition by converting the zero splat to the TMEM store's register
+    // layout.  The conversion preserves zero and must not hide it from this
+    // redundancy check.
+    if (auto convert = v.getDefiningOp<ttg::ConvertLayoutOp>())
+      v = convert.getSrc();
     auto constOp = v.getDefiningOp<arith::ConstantOp>();
     if (!constOp)
       return false;
@@ -5480,6 +5510,87 @@ void doCodePartition(triton::FuncOp funcOp, unsigned numBuffers) {
       channelsGroupedByConsumers[rep].push_back(ch);
       channelsGroupedByConsumers.erase(ch);
       mergedChannels.insert(ch);
+    }
+  }
+
+  // The 2-CTA FA forward schedule stores its final softmax sum and maximum in
+  // adjacent slots of one physical TMEM allocation, then loads both in the
+  // default partition.  Their producer and consumer ops differ, so the exact
+  // consumer matching above leaves two token handshakes.  TLX uses one: wait
+  // before the first load, release after the last load, acquire before the
+  // first store, and commit after the last store.  Form the same ordered group
+  // only for opted-in, single-buffer TMEM store/load channels whose endpoints
+  // are in the same blocks and tasks.
+  if (hasAutoWSBoolean(funcOp, "two_cta_fuse_final_stats")) {
+    for (auto &group : config.groups) {
+      for (size_t i = 0; i < group.channels.size(); ++i) {
+        Channel *rep = group.channels[i];
+        if (mergedChannels.contains(rep))
+          continue;
+        auto repIt = channelsGroupedByConsumers.find(rep);
+        if (repIt == channelsGroupedByConsumers.end() ||
+            rep->channelKind != DataChannelKind::TMEMAlloc ||
+            rep->getNumBuffers() != 1 ||
+            !isa<ttng::TMEMStoreOp>(rep->getSrcOp()) ||
+            !isa<ttng::TMEMLoadOp>(rep->getDstOp()))
+          continue;
+        for (size_t j = i + 1; j < group.channels.size(); ++j) {
+          Channel *ch = group.channels[j];
+          if (mergedChannels.contains(ch) ||
+              ch->channelKind != DataChannelKind::TMEMAlloc ||
+              ch->getNumBuffers() != 1 || ch->relation != rep->relation ||
+              !isa<ttng::TMEMStoreOp>(ch->getSrcOp()) ||
+              !isa<ttng::TMEMLoadOp>(ch->getDstOp()) ||
+              ch->getSrcOp()->getBlock() != rep->getSrcOp()->getBlock() ||
+              ch->getDstOp()->getBlock() != rep->getDstOp()->getBlock())
+            continue;
+          auto chIt = channelsGroupedByConsumers.find(ch);
+          if (chIt == channelsGroupedByConsumers.end())
+            continue;
+          repIt->second.append(chIt->second.begin(), chIt->second.end());
+          channelsGroupedByConsumers.erase(chIt);
+          mergedChannels.insert(ch);
+        }
+      }
+    }
+  }
+
+  // A subtiled accumulator has one MMAv5 producer and one TMEM-load consumer
+  // per slice. The slices share an allocation and advance in lockstep, so a
+  // single completion handshake can cover the ordered producer/consumer
+  // range: completion is attached to the last MMA and the wait is placed
+  // before the first load. This matches TLX's one accumulator barrier per
+  // compute group instead of one pair per slice.
+  if (hasAutoWSBoolean(funcOp, "two_cta_fuse_acc_slices")) {
+    for (size_t i = 0; i < orderedChannels.size(); ++i) {
+      Channel *rep = orderedChannels[i];
+      if (mergedChannels.contains(rep) ||
+          rep->channelKind != DataChannelKind::TMEMAlloc ||
+          rep->getNumBuffers() != 1 ||
+          !isa<ttng::MMAv5OpInterface>(rep->getSrcOp()) ||
+          !isa<ttng::TMEMLoadOp>(rep->getDstOp()))
+        continue;
+      auto repIt = channelsGroupedByConsumers.find(rep);
+      if (repIt == channelsGroupedByConsumers.end())
+        continue;
+      for (size_t j = i + 1; j < orderedChannels.size(); ++j) {
+        Channel *ch = orderedChannels[j];
+        if (mergedChannels.contains(ch) ||
+            ch->channelKind != DataChannelKind::TMEMAlloc ||
+            ch->getNumBuffers() != 1 || ch->relation != rep->relation ||
+            ch->getAllocOp() != rep->getAllocOp() ||
+            !isa<ttng::MMAv5OpInterface>(ch->getSrcOp()) ||
+            !isa<ttng::TMEMLoadOp>(ch->getDstOp()) ||
+            ch->getSrcOp()->getBlock() != rep->getSrcOp()->getBlock() ||
+            ch->getDstOp()->getBlock() != rep->getDstOp()->getBlock())
+          continue;
+        auto chIt = channelsGroupedByConsumers.find(ch);
+        if (chIt == channelsGroupedByConsumers.end())
+          continue;
+        repIt->second.append(chIt->second.begin(), chIt->second.end());
+        channelsGroupedByConsumers.erase(chIt);
+        mergedChannels.insert(ch);
+      }
     }
   }
   orderedChannels.erase(
