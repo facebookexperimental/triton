@@ -77,6 +77,8 @@ def _get_codegen_flags(options):
         flags.append("sink-insts-to-avoid-spills")
     if options.regclass_priority_trumps_globalness:
         flags.append("greedy-regclass-priority-trumps-globalness")
+    if options.disable_unclustered_high_rp_reschedule:
+        flags.append("amdgpu-disable-unclustered-high-rp-reschedule")
     return flags
 
 
@@ -124,6 +126,16 @@ class HIPOptions:
     reverse_local_assignment: bool = False
     sink_insts_to_avoid_spills: bool = False
     regclass_priority_trumps_globalness: bool = False
+    # Keep the pre-RA scheduler from replacing a pressure-sensitive schedule
+    # with the generic unclustered high-RP strategy. This is cache-keyed and
+    # per kernel so unrelated kernels retain the default pressure policy.
+    disable_unclustered_high_rp_reschedule: bool = False
+
+    # Cache-keyed, per-kernel schedule-group-barrier planning. Keep this name
+    # distinct from the pre-existing TTGIR dot-decomposition scheduler.
+    enable_sched_group_barrier_scheduler: bool = False
+    sched_group_barrier_mfma_per_dwordx4: int = 4
+    sched_group_barrier_required_region_count: int = 0
 
     def __post_init__(self):
         gfx_major = int(self.arch[3:-2])  # Drop "gfx" prefix and minor/patch number
@@ -138,6 +150,11 @@ class HIPOptions:
             object.__setattr__(self, "kpack", 1)
 
         object.__setattr__(self, 'llvm_fn_attrs', _parse_llvm_fn_attrs(self.llvm_fn_attrs))
+
+        if self.sched_group_barrier_mfma_per_dwordx4 <= 0:
+            raise ValueError("sched_group_barrier_mfma_per_dwordx4 must be positive")
+        if self.sched_group_barrier_required_region_count < 0:
+            raise ValueError("sched_group_barrier_required_region_count must be non-negative")
 
         default_libdir = Path(__file__).parent / "lib"
         extern_libs = {} if self.extern_libs is None else dict(self.extern_libs)
@@ -193,6 +210,11 @@ class HIPBackend(BaseBackend):
 
         if "enable_fp_fusion" not in opts:
             args["enable_fp_fusion"] = knobs.language.default_fp_fusion
+        if "enable_sched_group_barrier_scheduler" not in opts:
+            # Keep the environment variable as an experimental default. An
+            # explicit per-config value takes precedence so autotuning can
+            # select the scheduler independently for each kernel variant.
+            args["enable_sched_group_barrier_scheduler"] = knobs.amd.enable_ttgir_schedule
         args.update({k: opts[k] for k in HIPOptions.__dataclass_fields__.keys() if k in opts and opts[k] is not None})
         return HIPOptions(**args)
 
@@ -409,6 +431,12 @@ class HIPBackend(BaseBackend):
         # kernels) and as the last pass before pm.run so the cleanup passes above do
         # not strip the priority markers before the pipeliner consumes them.
         amd.passes.ttgpuir.add_warp_pipeline(pm)
+        if options.enable_sched_group_barrier_scheduler:
+            amd.passes.ttgpuir.add_sched_group_barrier_scheduler(
+                pm,
+                options.sched_group_barrier_mfma_per_dwordx4,
+                options.sched_group_barrier_required_region_count,
+            )
         if options.instrumentation_mode == "fpsan":
             amd.passes.ttgpuir.add_fp_sanitizer(pm)
             passes.ttgpuir.add_fp_sanitizer(pm)

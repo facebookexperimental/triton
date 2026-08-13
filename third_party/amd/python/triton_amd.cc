@@ -121,6 +121,9 @@ void init_triton_amd_passes_ttgpuir(py::module &&m) {
   ADD_PASS_OPTION_WRAPPER_1("add_dot_decompose_and_schedule",
                             mlir::createTritonAMDGPUDotDecomposeAndSchedule,
                             const std::string &);
+  ADD_PASS_OPTION_WRAPPER_2("add_sched_group_barrier_scheduler",
+                            mlir::createTritonAMDGPUSchedGroupBarrierScheduler,
+                            unsigned, unsigned);
   mlir::registerConSanAMDHooks();
   m.def("add_in_thread_transpose", [](mlir::PassManager &pm) {
     pm.addNestedPass<mlir::triton::FuncOp>(

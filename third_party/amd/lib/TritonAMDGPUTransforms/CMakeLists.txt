@@ -8,6 +8,7 @@ add_triton_library(TritonAMDGPUTransforms
   ConvertToBufferOps.cpp
   ConvertToTensorOps.cpp
   DotDecomposeAndSchedule.cpp
+  SchedGroupBarrierScheduler.cpp
   LowerBarrierOps.cpp
   OptimizeBufferOpPtr.cpp
   OptimizeDescriptorEncoding.cpp
