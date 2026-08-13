@@ -3218,7 +3218,7 @@ def test_a4w4_inter_wave_256tile_single_trip_codegen_gfx950(device, fresh_triton
 
 
 def test_a4w4_inter_wave_preshuffled_scale_codegen_gfx950(device, fresh_triton_cache):
-    """The prepacked ABI reuses the canonical conflict-free scale reads."""
+    """The fastest prepacked ABI coalesces both A halves into one b128 read."""
     compiled = _compile_a4w4_inter_wave_256tile(768, 768, 1536, preshuffled_scales=True)
     ttgir = compiled.asm["ttgir"]
     amdgcn = compiled.asm["amdgcn"]
@@ -3226,13 +3226,12 @@ def test_a4w4_inter_wave_preshuffled_scale_codegen_gfx950(device, fresh_triton_c
     assert "#tlx.user_layout" not in ttgir
     assert "#tlx.no_verify_layout" not in ttgir
     assert ttgir.count("amdg.buffer_load_to_local") == 24
-    assert "ttg.memdesc_reinterpret" in ttgir
     assert "buffer_load_dwordx2" not in amdgcn
     assert len(re.findall(r"^\s*buffer_load_[^\n]*\blds\s*$", amdgcn, re.MULTILINE)) == 40
-    assert len(re.findall(r"^\s*ds_read_b64_tr_b8\b", amdgcn, re.MULTILINE)) == 12
-    assert "ds_read_b64 " not in amdgcn
-    assert len(re.findall(r"^\s*ds_read_b128\b", amdgcn, re.MULTILINE)) == 112
-    assert len(re.findall(r"^\s*ds_read", amdgcn, re.MULTILINE)) == 124
+    assert "ds_read_b64_tr_b8" not in amdgcn
+    assert len(re.findall(r"^\s*ds_read_b64\b", amdgcn, re.MULTILINE)) == 4
+    assert len(re.findall(r"^\s*ds_read_b128\b", amdgcn, re.MULTILINE)) == 116
+    assert len(re.findall(r"^\s*ds_read", amdgcn, re.MULTILINE)) == 120
     assert compiled.metadata.shared == 143232
     assert compiled.metadata.global_scratch_size == 0
     assert ".private_segment_fixed_size: 0" in amdgcn
