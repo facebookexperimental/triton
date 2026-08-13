@@ -1026,56 +1026,42 @@ def local_memory_bit_offset_relation(
     for coord, extent in zip(physical_coords, physical_shape):
         goals.extend((coord >= 0, coord < extent))
     if (address_layout is not None and not address_layout.prefix_shape and logical_shape == physical_shape
-            and not any(logical_origin)):
+            and not any(logical_origin) and all(_is_power_of_two(interval) for interval in intervals)):
+        physical_layout = _compose_linear_layouts(
+            linear,
+            address_layout.linear_layout,
+        )
+        layout_inputs = {
+            "register": slot,
+            "lane": dsl.mod(item, lane_width),
+            "warp": dsl.floor(item / lane_width),
+            "block": dsl.ixs_int(0),
+        }
         mapped = None
-        mapped_includes_padding = False
-        if all(_is_power_of_two(interval) for interval in intervals):
-            weighted_physical_layout = _compose_linear_layouts(
-                linear,
-                address_layout.linear_layout,
-            )
-            lane = dsl.mod(item, lane_width)
-            weighted_inputs = {
-                "register": slot,
-                "lane": lane,
-                "warp": dsl.floor(item / lane_width),
-                "block": dsl.ixs_int(0),
-            }
-            output_weights = {}
-            for name, extent in weighted_physical_layout.out_dims:
-                weights = [1 << bit for bit in range(int(extent).bit_length() - 1)]
-                if str(name) == "offset":
-                    for bit, weight in enumerate(weights):
-                        weights[bit] += sum((weight // int(interval)) * int(padding)
-                                            for interval, padding in zip(intervals, paddings)
-                                            if weight >= int(interval))
-                output_weights[str(name)] = tuple(weights)
+        if not any(paddings):
             mapped = _symbolic_layout_field_formula(
                 dsl,
-                weighted_physical_layout,
-                weighted_inputs,
-                output_weights=output_weights,
+                physical_layout,
+                layout_inputs,
                 combine_with_xor=False,
             )
-            mapped_includes_padding = mapped is not None
-        if mapped is None:
-            physical_layout = _compose_linear_layouts(
-                item_linear,
-                address_layout.linear_layout,
-            )
-            mapped = _symbolic_layout_bit_formula(
-                dsl,
-                physical_layout,
-                physical_inputs,
-            )
-        goals.append(dsl.ixs_eq(mapped["block"], dsl.ixs_int(0)))
-        unpadded_offset = mapped["offset"]
-        if not mapped_includes_padding:
-            goals.extend((unpadded_offset >= 0, unpadded_offset < _product(physical_shape)))
-        element_offset = unpadded_offset
-        if not mapped_includes_padding:
+        physical_bits = (None if mapped is not None else _symbolic_layout_bits(dsl, physical_layout, layout_inputs))
+        goals.append(
+            dsl.ixs_eq(
+                mapped["block"] if mapped is not None else _symbolic_bits_to_int(dsl, physical_bits["block"]),
+                dsl.ixs_int(0),
+            ))
+        if mapped is not None:
+            element_offset = mapped["offset"]
+        else:
+            offset_bits = physical_bits["offset"]
+            element_offset = _symbolic_bits_to_int(dsl, offset_bits)
             for interval, padding in zip(intervals, paddings):
-                element_offset += dsl.floor(unpadded_offset / int(interval)) * int(padding)
+                first_padding_bit = int(interval).bit_length() - 1
+                element_offset += int(padding) * _symbolic_bits_to_int(
+                    dsl,
+                    offset_bits[first_padding_bit:],
+                )
     else:
         element_offset = _symbolic_shared_element_offset(
             dsl,
@@ -1503,8 +1489,8 @@ def _symbolic_layout_field_formula(
     return {name: coordinate for (name, _size), coordinate in zip(out_dims, coordinates)}
 
 
-def _symbolic_layout_bit_formula(dsl, linear, inputs):
-    """Serialize each GF(2) output bit before forming its integer value."""
+def _symbolic_layout_bits(dsl, linear, inputs):
+    """Compose each output bit of a GF(2) linear layout."""
     out_dims = tuple((str(name), int(size)) for name, size in linear.out_dims)
     if any(not _is_power_of_two(size) for _name, size in out_dims):
         raise ValueError("bitwise layout formula requires power-of-two output domains")
@@ -1520,14 +1506,19 @@ def _symbolic_layout_bit_formula(dsl, linear, inputs):
                             bits[output][output_bit],
                             value,
                         )
-    return {
-        name: sum(
-            ((1 << bit) * value
-             for bit, value in enumerate(values)),
-            dsl.ixs_int(0),
-        )
-        for (name, _size), values in zip(out_dims, bits)
-    }
+    return {name: tuple(values) for (name, _size), values in zip(out_dims, bits)}
+
+
+def _symbolic_bits_to_int(dsl, bits):
+    result = dsl.ixs_int(0)
+    for bit, value in enumerate(bits):
+        result = dsl.xor(result, (1 << bit) * value)
+    return result
+
+
+def _symbolic_layout_bit_formula(dsl, linear, inputs):
+    """Serialize each GF(2) output bit before forming its integer value."""
+    return {name: _symbolic_bits_to_int(dsl, bits) for name, bits in _symbolic_layout_bits(dsl, linear, inputs).items()}
 
 
 def _symbolic_shared_element_offset(
