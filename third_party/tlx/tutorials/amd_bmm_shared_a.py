@@ -28,7 +28,6 @@ import torch
 import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
-from triton.testing import do_bench
 
 BLOCK_N = 256
 BLOCK_K = 32
@@ -37,6 +36,7 @@ NB = 3
 
 
 def _swz(shape, cd):
+
     def basis(d, i):
         return [1 << i, 0] if d == 0 else [0, 1 << i]
 
@@ -59,80 +59,113 @@ def _chip(pid, nt, nx: tl.constexpr, cs: tl.constexpr):
 
 
 @triton.jit
-def _bmm_direct(a_ptr, b_ptr, c_ptr, M, N, K, sab, sam, sak, sbb, sbk, sbn, scb, scm, scn,
-                BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, AB: tl.constexpr, BB: tl.constexpr,
-                NUM_XCDS: tl.constexpr, GMN: tl.constexpr, NT: tl.constexpr, NB: tl.constexpr):
+def _bmm_direct(a_ptr, b_ptr, c_ptr, M, N, K, sab, sam, sak, sbb, sbk, sbn, scb, scm, scn, BM: tl.constexpr,
+                BN: tl.constexpr, BK: tl.constexpr, AB: tl.constexpr, BB: tl.constexpr, NUM_XCDS: tl.constexpr,
+                GMN: tl.constexpr, NT: tl.constexpr, NB: tl.constexpr):
     """Aligned rows, no K-tail (K % BLOCK_K == 0): direct-to-LDS + swizzled LDS."""
     npn = tl.cdiv(N, BN)
     pidf = _chip(tl.program_id(0), NT, NUM_XCDS, GMN)
-    bid = pidf // GMN; pid = pidf % GMN; pm = pid // npn; pn = pid % npn
+    bid = pidf // GMN
+    pid = pidf % GMN
+    pm = pid // npn
+    pn = pid % npn
     ash: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases([(512, 16)], AB, [BM, BK])
     bsh: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases([(512, 16)], BB, [BK, BN])
     sA = tlx.local_alloc((BM, BK), tl.float16, NB, layout=ash)
     sB = tlx.local_alloc((BK, BN), tl.float16, NB, layout=bsh)
-    om = (pm * BM + tl.arange(0, BM)) % M; on = (pn * BN + tl.arange(0, BN)) % N; ok = tl.arange(0, BK)
-    a_ptr = a_ptr + bid.to(tl.int64) * sab; b_ptr = b_ptr + bid.to(tl.int64) * sbb
-    ao = om[:, None] * sam; bo = on[None, :] * sbn; KI = tl.cdiv(K, BK)
+    om = (pm * BM + tl.arange(0, BM)) % M
+    on = (pn * BN + tl.arange(0, BN)) % N
+    ok = tl.arange(0, BK)
+    a_ptr = a_ptr + bid.to(tl.int64) * sab
+    b_ptr = b_ptr + bid.to(tl.int64) * sbb
+    ao = om[:, None] * sam
+    bo = on[None, :] * sbn
+    KI = tl.cdiv(K, BK)
     for i in tl.range(0, NB, loop_unroll_factor=NB):
         kk = i * BK
         tlx.buffer_load_to_local(tlx.local_view(sA, i), a_ptr, ao + (kk + ok[None, :]) * sak)
         tlx.buffer_load_to_local(tlx.local_view(sB, i), b_ptr, (kk + ok[:, None]) * sbk + bo)
         tlx.async_load_commit_group()
     tlx.async_load_wait_group(NB - 2)
-    a = tlx.local_load(tlx.local_view(sA, 0)); b = tlx.local_load(tlx.local_view(sB, 0))
+    a = tlx.local_load(tlx.local_view(sA, 0))
+    b = tlx.local_load(tlx.local_view(sB, 0))
     acc = tl.zeros((BM, BN), dtype=tl.float32)
     for k in tl.range(0, KI - NB):
-        cur = (k + 1) % NB; pf = k % NB; kp = (k + NB) * BK
+        cur = (k + 1) % NB
+        pf = k % NB
+        kp = (k + NB) * BK
         acc = tl.dot(a, b, acc)
         tlx.buffer_load_to_local(tlx.local_view(sA, pf), a_ptr, ao + (kp + ok[None, :]) * sak)
         tlx.buffer_load_to_local(tlx.local_view(sB, pf), b_ptr, (kp + ok[:, None]) * sbk + bo)
-        tlx.async_load_commit_group(); tlx.async_load_wait_group(NB - 2)
-        a = tlx.local_load(tlx.local_view(sA, cur)); b = tlx.local_load(tlx.local_view(sB, cur))
+        tlx.async_load_commit_group()
+        tlx.async_load_wait_group(NB - 2)
+        a = tlx.local_load(tlx.local_view(sA, cur))
+        b = tlx.local_load(tlx.local_view(sB, cur))
     acc = tl.dot(a, b, acc)
     tlx.async_load_wait_group(0)
     for i in tl.range(0, NB - 1, loop_unroll_factor=NB - 1):
         bf = (KI - (NB - 1) + i) % NB
         acc = tl.dot(tlx.local_load(tlx.local_view(sA, bf)), tlx.local_load(tlx.local_view(sB, bf)), acc)
-    et = c_ptr.dtype.element_ty; cb = c_ptr + bid.to(tl.int64) * scb
-    rm = pm * BM + tl.arange(0, BM); rn = pn * BN + tl.arange(0, BN)
+    et = c_ptr.dtype.element_ty
+    cb = c_ptr + bid.to(tl.int64) * scb
+    rm = pm * BM + tl.arange(0, BM)
+    rn = pn * BN + tl.arange(0, BN)
     tl.store(cb + scm * rm[:, None] + scn * rn[None, :], acc.to(et), mask=(rm[:, None] < M) & (rn[None, :] < N))
 
 
 @triton.jit
-def _bmm_register(a_ptr, b_ptr, c_ptr, M, N, K, sab, sam, sak, sbb, sbk, sbn, scb, scm, scn,
-                  BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
-                  NUM_XCDS: tl.constexpr, GMN: tl.constexpr, NT: tl.constexpr, NB: tl.constexpr):
+def _bmm_register(a_ptr, b_ptr, c_ptr, M, N, K, sab, sam, sak, sbb, sbk, sbn, scb, scm, scn, BM: tl.constexpr,
+                  BN: tl.constexpr, BK: tl.constexpr, NUM_XCDS: tl.constexpr, GMN: tl.constexpr, NT: tl.constexpr,
+                  NB: tl.constexpr):
     """Odd / unaligned K: register path (tl.load -> local_store), masked K-tail."""
     npn = tl.cdiv(N, BN)
     pidf = _chip(tl.program_id(0), NT, NUM_XCDS, GMN)
-    bid = pidf // GMN; pid = pidf % GMN; pm = pid // npn; pn = pid % npn
-    sA = tlx.local_alloc((BM, BK), tl.float16, NB); sB = tlx.local_alloc((BK, BN), tl.float16, NB)
-    om = (pm * BM + tl.arange(0, BM)) % M; on = (pn * BN + tl.arange(0, BN)) % N; ok = tl.arange(0, BK)
-    a_ptr = a_ptr + bid.to(tl.int64) * sab; b_ptr = b_ptr + bid.to(tl.int64) * sbb
-    ao = om[:, None] * sam; bo = on[None, :] * sbn; KI = tl.cdiv(K, BK)
+    bid = pidf // GMN
+    pid = pidf % GMN
+    pm = pid // npn
+    pn = pid % npn
+    sA = tlx.local_alloc((BM, BK), tl.float16, NB)
+    sB = tlx.local_alloc((BK, BN), tl.float16, NB)
+    om = (pm * BM + tl.arange(0, BM)) % M
+    on = (pn * BN + tl.arange(0, BN)) % N
+    ok = tl.arange(0, BK)
+    a_ptr = a_ptr + bid.to(tl.int64) * sab
+    b_ptr = b_ptr + bid.to(tl.int64) * sbb
+    ao = om[:, None] * sam
+    bo = on[None, :] * sbn
+    KI = tl.cdiv(K, BK)
     for i in tl.range(0, NB, loop_unroll_factor=NB):
-        kk = i * BK; km = (kk + ok) < K
+        kk = i * BK
+        km = (kk + ok) < K
         ar = tl.load(a_ptr + ao + (kk + ok[None, :]) * sak, mask=km[None, :], other=0.0)
         br = tl.load(b_ptr + (kk + ok[:, None]) * sbk + bo, mask=km[:, None], other=0.0)
-        tlx.local_store(tlx.local_view(sA, i), ar); tlx.local_store(tlx.local_view(sB, i), br)
+        tlx.local_store(tlx.local_view(sA, i), ar)
+        tlx.local_store(tlx.local_view(sB, i), br)
     tl.debug_barrier()
-    a = tlx.local_load(tlx.local_view(sA, 0)); b = tlx.local_load(tlx.local_view(sB, 0))
+    a = tlx.local_load(tlx.local_view(sA, 0))
+    b = tlx.local_load(tlx.local_view(sB, 0))
     acc = tl.zeros((BM, BN), dtype=tl.float32)
     for k in tl.range(0, KI - NB):
-        cur = (k + 1) % NB; pf = k % NB; kp = (k + NB) * BK
+        cur = (k + 1) % NB
+        pf = k % NB
+        kp = (k + NB) * BK
         acc = tl.dot(a, b, acc)
         km = (kp + ok) < K
         ar = tl.load(a_ptr + ao + (kp + ok[None, :]) * sak, mask=km[None, :], other=0.0)
         br = tl.load(b_ptr + (kp + ok[:, None]) * sbk + bo, mask=km[:, None], other=0.0)
-        tlx.local_store(tlx.local_view(sA, pf), ar); tlx.local_store(tlx.local_view(sB, pf), br)
+        tlx.local_store(tlx.local_view(sA, pf), ar)
+        tlx.local_store(tlx.local_view(sB, pf), br)
         tl.debug_barrier()
-        a = tlx.local_load(tlx.local_view(sA, cur)); b = tlx.local_load(tlx.local_view(sB, cur))
+        a = tlx.local_load(tlx.local_view(sA, cur))
+        b = tlx.local_load(tlx.local_view(sB, cur))
     acc = tl.dot(a, b, acc)
     for i in tl.range(0, NB - 1, loop_unroll_factor=NB - 1):
         bf = (KI - (NB - 1) + i) % NB
         acc = tl.dot(tlx.local_load(tlx.local_view(sA, bf)), tlx.local_load(tlx.local_view(sB, bf)), acc)
-    et = c_ptr.dtype.element_ty; cb = c_ptr + bid.to(tl.int64) * scb
-    rm = pm * BM + tl.arange(0, BM); rn = pn * BN + tl.arange(0, BN)
+    et = c_ptr.dtype.element_ty
+    cb = c_ptr + bid.to(tl.int64) * scb
+    rm = pm * BM + tl.arange(0, BM)
+    rn = pn * BN + tl.arange(0, BN)
     tl.store(cb + scm * rm[:, None] + scn * rn[None, :], acc.to(et), mask=(rm[:, None] < M) & (rn[None, :] < N))
 
 

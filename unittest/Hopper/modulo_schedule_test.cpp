@@ -294,12 +294,11 @@ constexpr GemmMachineModel kBlackwellGemmModel{
 
 static llvm::json::Object makeGemmProblem(const GemmMachineModel &model) {
   constexpr std::array<const char *, kGemmNodeCount> labels{
-      "ptr_a",       "ptr_b",     "tma_a", "tma_b", "barrier_expect",
-      "mma",         "acc_update", "sfu",   "cast",  "store",
+      "ptr_a", "ptr_b",      "tma_a", "tma_b", "barrier_expect",
+      "mma",   "acc_update", "sfu",   "cast",  "store",
   };
   constexpr std::array<const char *, kGemmNodeCount> pipelines{
-      "NONE", "NONE", "TMA", "TMA", "NONE",
-      "TC",   "CUDA", "SFU", "CUDA", "TMA",
+      "NONE", "NONE", "TMA", "TMA", "NONE", "TC", "CUDA", "SFU", "CUDA", "TMA",
   };
   constexpr std::array<int64_t, kGemmNodeCount> clusters{
       0, 0, 0, 0, 0, 1, 2, 2, 2, 3,
@@ -358,8 +357,7 @@ static llvm::json::Object makeGemmProblem(const GemmMachineModel &model) {
 
   llvm::json::Array buffers;
   auto addBuffer = [&](int64_t id, int64_t producer, llvm::StringRef kind,
-                       int64_t sizeBytes, int64_t minCount,
-                       int64_t consumer) {
+                       int64_t sizeBytes, int64_t minCount, int64_t consumer) {
     buffers.push_back(llvm::json::Object{
         {"id", id},
         {"producer", producer},
@@ -457,16 +455,14 @@ static llvm::json::Object makeGemmProblem(const GemmMachineModel &model) {
       {"nodes", std::move(nodes)},
       {"clusters",
        llvm::json::Array{
-           llvm::json::Object{
-               {"id", 0},
-               {"min_warps", 1},
-               {"nodes", llvm::json::Array{0, 1, 2, 3, 4}}},
+           llvm::json::Object{{"id", 0},
+                              {"min_warps", 1},
+                              {"nodes", llvm::json::Array{0, 1, 2, 3, 4}}},
            llvm::json::Object{
                {"id", 1}, {"min_warps", 1}, {"nodes", llvm::json::Array{5}}},
-           llvm::json::Object{
-               {"id", 2},
-               {"min_warps", 4},
-               {"nodes", llvm::json::Array{6, 7, 8}}},
+           llvm::json::Object{{"id", 2},
+                              {"min_warps", 4},
+                              {"nodes", llvm::json::Array{6, 7, 8}}},
            llvm::json::Object{
                {"id", 3}, {"min_warps", 1}, {"nodes", llvm::json::Array{9}}},
        }},
@@ -479,8 +475,7 @@ static llvm::json::Object makeGemmProblem(const GemmMachineModel &model) {
 
 using GoldenAssignment = std::tuple<int64_t, int64_t, int64_t, int64_t>;
 using GoldenBuffer = std::tuple<int64_t, int64_t, std::string>;
-using GoldenEvent =
-    std::tuple<int64_t, int64_t, int64_t, int64_t, int64_t>;
+using GoldenEvent = std::tuple<int64_t, int64_t, int64_t, int64_t, int64_t>;
 
 struct CanonicalGolden {
   std::string machineModel;
@@ -530,9 +525,9 @@ canonicalizeGolden(llvm::StringRef problemJson, llvm::StringRef solutionJson) {
       loweringPlan ? loweringPlan->getString("version") : std::nullopt;
   if (!status || *status != "ok" || !ii || *ii <= 0 || !usedWGs ||
       !modelVersion || !nodes || !clusters || !problemBuffers ||
-      !problemTemplates || !cycles || !warpGroups || !depths ||
-      !loweringPlan || !planVersion || *planVersion != "lowering-plan-0.1" ||
-      !planTemplates || cycles->size() != nodes->size() ||
+      !problemTemplates || !cycles || !warpGroups || !depths || !loweringPlan ||
+      !planVersion || *planVersion != "lowering-plan-0.1" || !planTemplates ||
+      cycles->size() != nodes->size() ||
       warpGroups->size() != clusters->size() ||
       planTemplates->size() != problemTemplates->size())
     return failure();
@@ -554,8 +549,7 @@ canonicalizeGolden(llvm::StringRef problemJson, llvm::StringRef solutionJson) {
     auto *cluster = value.getAsObject();
     auto clusterId = cluster ? cluster->getInteger("id") : std::nullopt;
     auto *clusterNodes = cluster ? cluster->getArray("nodes") : nullptr;
-    if (!clusterId || !clusterNodes ||
-        clusterToRawGroup.count(*clusterId) != 0)
+    if (!clusterId || !clusterNodes || clusterToRawGroup.count(*clusterId) != 0)
       return failure();
     auto group = warpGroups->getInteger(std::to_string(*clusterId));
     if (!group || *group < 0)
@@ -607,8 +601,7 @@ canonicalizeGolden(llvm::StringRef problemJson, llvm::StringRef solutionJson) {
     for (const llvm::json::Value &consumerValue : *consumers) {
       auto *consumer = consumerValue.getAsObject();
       auto node = consumer ? consumer->getInteger("node") : std::nullopt;
-      auto latency =
-          consumer ? consumer->getInteger("latency") : std::nullopt;
+      auto latency = consumer ? consumer->getInteger("latency") : std::nullopt;
       auto distance =
           consumer ? consumer->getInteger("distance") : std::nullopt;
       if (!node || !latency || !distance || cycleByNode.count(*node) == 0)
@@ -618,8 +611,7 @@ canonicalizeGolden(llvm::StringRef problemJson, llvm::StringRef solutionJson) {
     }
     if (lastEnd < producerCycle)
       return failure();
-    int64_t depth =
-        std::max((lastEnd - producerCycle) / *ii + 1, *minCount);
+    int64_t depth = std::max((lastEnd - producerCycle) / *ii + 1, *minCount);
     if (*kind == "smem") {
       ++smemBufferCount;
       auto serializedDepth = depths->getInteger(std::to_string(*id));
@@ -659,8 +651,8 @@ canonicalizeGolden(llvm::StringRef problemJson, llvm::StringRef solutionJson) {
         clusterToRawGroup.count(*srcCluster) == 0 ||
         clusterToRawGroup.count(*dstCluster) == 0)
       return failure();
-    bool sameGroup = clusterToRawGroup.at(*srcCluster) ==
-                     clusterToRawGroup.at(*dstCluster);
+    bool sameGroup =
+        clusterToRawGroup.at(*srcCluster) == clusterToRawGroup.at(*dstCluster);
     bool expectedActive = *relation == "always" ||
                           (*relation == "same_wg" && sameGroup) ||
                           (*relation == "different_wg" && !sameGroup);
@@ -686,9 +678,9 @@ canonicalizeGolden(llvm::StringRef problemJson, llvm::StringRef solutionJson) {
           expectedEventIds.erase(*eventId) != 1 ||
           rawToNormalizedGroup.count(*rawGroup) == 0)
         return failure();
-      golden.loweringEvents.emplace_back(
-          *id, *eventId, *cycle, rawToNormalizedGroup.at(*rawGroup),
-          *streamOrder);
+      golden.loweringEvents.emplace_back(*id, *eventId, *cycle,
+                                         rawToNormalizedGroup.at(*rawGroup),
+                                         *streamOrder);
     }
     if (expectedActive && !expectedEventIds.empty())
       return failure();
@@ -705,16 +697,15 @@ static CanonicalGolden expectedGemmGolden(const GemmMachineModel &model) {
   };
   CanonicalGolden golden{model.name, model.ii, 4, {}, {}, {}};
   for (size_t index = 0; index < kGemmNodeCount; ++index)
-    golden.assignments.emplace_back(
-        index, model.expectedCycles[index],
-        model.expectedCycles[index] / model.ii, groups[index]);
+    golden.assignments.emplace_back(index, model.expectedCycles[index],
+                                    model.expectedCycles[index] / model.ii,
+                                    groups[index]);
   golden.buffers = model.accumulatorInTmem
                        ? std::vector<GoldenBuffer>{{0, 2, "smem"},
                                                    {1, 2, "smem"},
                                                    {2, 2, "tmem"}}
-                       : std::vector<GoldenBuffer>{{0, 2, "smem"},
-                                                   {1, 2, "smem"},
-                                                   {2, 1, "smem"}};
+                       : std::vector<GoldenBuffer>{
+                             {0, 2, "smem"}, {1, 2, "smem"}, {2, 1, "smem"}};
   golden.loweringEvents = {
       {0, 0, 5, 0, 0},
       {0, 1, model.expectedCycles[5] - 1, 1, 0},
@@ -874,10 +865,8 @@ static void expectUnsatDiagnostic(
   auto diagnosticGroupIds = readStringArray(*diagnosticCore, "groupIds");
   auto diagnosticCoreSchema = diagnosticCore->getString("schema");
   auto diagnosticCoreII = diagnosticCore->getInteger("candidateII");
-  auto diagnosticCoreBackendStatus =
-      diagnosticCore->getString("backendStatus");
-  auto diagnosticCoreProvenUnsat =
-      diagnosticCore->getBoolean("provenUnsat");
+  auto diagnosticCoreBackendStatus = diagnosticCore->getString("backendStatus");
+  auto diagnosticCoreProvenUnsat = diagnosticCore->getBoolean("provenUnsat");
   auto diagnosticNormalization = diagnosticCore->getString("normalization");
   ASSERT_TRUE(succeeded(diagnosticGroupIds));
   ASSERT_TRUE(diagnosticCoreSchema);
@@ -935,8 +924,7 @@ static void expectUnsatDiagnostic(
     ASSERT_TRUE(kind);
     int rank = diagnosticKindRank(*kind);
     EXPECT_GE(rank, previousRank);
-    std::string resource =
-        aggregate->getString("resource").value_or("").str();
+    std::string resource = aggregate->getString("resource").value_or("").str();
     if (rank == previousRank)
       EXPECT_LE(previousResource, resource);
     previousRank = rank;
@@ -972,13 +960,14 @@ struct OracleSchedule {
   std::map<int64_t, int64_t> cycles;
 };
 
-static bool isOracleScheduleValid(
-    int64_t ii, const std::vector<OracleNode> &nodes,
-    const std::vector<OracleEdge> &edges,
-    const std::vector<OracleBuffer> &buffers, int64_t smemBudget,
-    int64_t tmemColLimit, bool streamingVL,
-    const std::map<int64_t, int64_t> &cycles,
-    std::optional<int64_t> canonicalRoot) {
+static bool isOracleScheduleValid(int64_t ii,
+                                  const std::vector<OracleNode> &nodes,
+                                  const std::vector<OracleEdge> &edges,
+                                  const std::vector<OracleBuffer> &buffers,
+                                  int64_t smemBudget, int64_t tmemColLimit,
+                                  bool streamingVL,
+                                  const std::map<int64_t, int64_t> &cycles,
+                                  std::optional<int64_t> canonicalRoot) {
   if (ii <= 0 || cycles.size() != nodes.size())
     return false;
   if (canonicalRoot) {
@@ -986,11 +975,10 @@ static bool isOracleScheduleValid(
     if (rootCycle == cycles.end() || rootCycle->second != 0)
       return false;
   } else if (!cycles.empty()) {
-    auto minimum = std::min_element(
-        cycles.begin(), cycles.end(),
-        [](const auto &left, const auto &right) {
-          return left.second < right.second;
-        });
+    auto minimum = std::min_element(cycles.begin(), cycles.end(),
+                                    [](const auto &left, const auto &right) {
+                                      return left.second < right.second;
+                                    });
     if (minimum->second != 0)
       return false;
   }
@@ -1002,9 +990,8 @@ static bool isOracleScheduleValid(
   for (const OracleEdge &edge : edges) {
     auto src = cycles.find(edge.src);
     auto dst = cycles.find(edge.dst);
-    int64_t latency = streamingVL && nodeById.at(edge.src)->streaming
-                          ? 0
-                          : edge.latency;
+    int64_t latency =
+        streamingVL && nodeById.at(edge.src)->streaming ? 0 : edge.latency;
     if (src == cycles.end() || dst == cycles.end() ||
         dst->second + edge.distance * ii < src->second + latency ||
         (edge.distance == 0 && src->second / ii > dst->second / ii))
@@ -1064,8 +1051,7 @@ static bool isOracleScheduleValid(
   for (const TmemLifetime &checkpoint : tmemLifetimes) {
     int64_t activeColumns = 0;
     for (const TmemLifetime &lifetime : tmemLifetimes)
-      if (lifetime.start <= checkpoint.start &&
-          checkpoint.start < lifetime.end)
+      if (lifetime.start <= checkpoint.start && checkpoint.start < lifetime.end)
         activeColumns += lifetime.columns;
     if (activeColumns > tmemColLimit)
       return false;
@@ -1137,11 +1123,10 @@ enumerateStageAwareSchedule(llvm::StringRef problemJson) {
     auto *consumers = buffer ? buffer->getArray("consumers") : nullptr;
     if (!id || !alloc || !kind || !sizeBytes || !tmemCols || !consumers ||
         !bufferIds.insert(*id).second || !nodeIds.count(*alloc) ||
-        (*kind != "smem" && *kind != "tmem") || *sizeBytes < 0 ||
-        *tmemCols < 0)
+        (*kind != "smem" && *kind != "tmem") || *sizeBytes < 0 || *tmemCols < 0)
       return failure();
-    OracleBuffer oracleBuffer{*id, *alloc, kind->str(), *sizeBytes,
-                              *tmemCols, {}};
+    OracleBuffer oracleBuffer{*id,        *alloc,    kind->str(),
+                              *sizeBytes, *tmemCols, {}};
     for (const llvm::json::Value &consumerValue : *consumers) {
       auto consumer = consumerValue.getAsInteger();
       if (!consumer || !nodeIds.count(*consumer))
@@ -1499,13 +1484,12 @@ static llvm::json::Object makeV1DiagnosticProblem() {
       {"time_limit_s", 5},
       {"streaming_vl", false},
       {"canonical_root", 0},
-      {"nodes",
-       llvm::json::Array{llvm::json::Object{
-           {"id", 0},
-           {"pipeline", "NONE"},
-           {"duration", 0},
-           {"streaming", false},
-       }}},
+      {"nodes", llvm::json::Array{llvm::json::Object{
+                    {"id", 0},
+                    {"pipeline", "NONE"},
+                    {"duration", 0},
+                    {"streaming", false},
+                }}},
       {"edges", llvm::json::Array{}},
       {"buffers", llvm::json::Array{}},
   };
@@ -1554,11 +1538,9 @@ constexpr llvm::StringLiteral kJointCrossIssueObjectiveProblem = R"json(
 }
 )json";
 
-static FailureOr<llvm::json::Object>
-makePipelineGroupingProblem(llvm::StringRef mode,
-                            llvm::StringRef producerPipeline,
-                            llvm::StringRef consumerPipeline, int64_t distance,
-                            int64_t maxWGs) {
+static FailureOr<llvm::json::Object> makePipelineGroupingProblem(
+    llvm::StringRef mode, llvm::StringRef producerPipeline,
+    llvm::StringRef consumerPipeline, int64_t distance, int64_t maxWGs) {
   auto problem = parseJsonObject(kPartitionObjectiveProblem);
   if (failed(problem))
     return failure();
@@ -1652,8 +1634,8 @@ TEST(Z3JointSolverTest, V1UnsatDiagnosticsCoverNativeConstraintKinds) {
     ASSERT_NE(node, nullptr);
     (*node)["pipeline"] = "TC";
     (*node)["duration"] = 2;
-    expectUnsatDiagnostic(serializeJsonObject(std::move(problem)),
-                          {"resource"}, {"resource:TC:N0"}, "precheck");
+    expectUnsatDiagnostic(serializeJsonObject(std::move(problem)), {"resource"},
+                          {"resource:TC:N0"}, "precheck");
   }
   {
     llvm::json::Object problem = makeV1DiagnosticProblem();
@@ -1686,30 +1668,27 @@ TEST(Z3JointSolverTest, V1UnsatDiagnosticsCoverNativeConstraintKinds) {
 }
 
 TEST(Z3JointSolverV2Test, UnsatDiagnosticsCoverNativeConstraintKinds) {
-  for (llvm::StringRef mode : {llvm::StringRef("partition"),
-                               llvm::StringRef("joint")}) {
+  for (llvm::StringRef mode :
+       {llvm::StringRef("partition"), llvm::StringRef("joint")}) {
     SCOPED_TRACE(mode.str());
-    auto problem = parseJsonObject(mode == "partition"
-                                       ? kPartitionObjectiveProblem
-                                       : kJointSolverV2Problem);
+    auto problem =
+        parseJsonObject(mode == "partition" ? kPartitionObjectiveProblem
+                                            : kJointSolverV2Problem);
     ASSERT_TRUE(succeeded(problem));
     (*problem)["max_wgs"] = 1;
     forceDifferentWarpGroups(*problem);
     expectUnsatDiagnostic(serializeJsonObject(std::move(*problem)),
                           {"warp-group"},
-                          {"warp-group:cluster10",
-                           "warp-group:cluster30"});
+                          {"warp-group:cluster10", "warp-group:cluster30"});
   }
   {
     auto problem = parseJsonObject(kJointSolverV2Problem);
     ASSERT_TRUE(succeeded(problem));
     forceDifferentWarpGroups(*problem);
     (*problem)["reg_budget"] = 1;
-    (*problem)["warp_footprint"] =
-        llvm::json::Array{0, 1, 1, 1, 1, 1, 1, 1, 1};
+    (*problem)["warp_footprint"] = llvm::json::Array{0, 1, 1, 1, 1, 1, 1, 1, 1};
     expectUnsatDiagnostic(serializeJsonObject(std::move(*problem)),
-                          {"register"},
-                          {"register:wg0", "register:wg1"});
+                          {"register"}, {"register:wg0", "register:wg1"});
   }
   {
     auto problem = parseJsonObject(kJointSolverV2Problem);
@@ -1722,8 +1701,7 @@ TEST(Z3JointSolverV2Test, UnsatDiagnosticsCoverNativeConstraintKinds) {
     ASSERT_NE(event, nullptr);
     (*event)["issue_duration"] = 5;
     expectUnsatDiagnostic(serializeJsonObject(std::move(*problem)),
-                          {"lowering"},
-                          {"lowering:template0:event7"});
+                          {"lowering"}, {"lowering:template0:event7"});
   }
   {
     auto problem = parseJsonObject(kPartitionObjectiveProblem);
@@ -1778,8 +1756,7 @@ TEST(Z3JointSolverTest, UnknownDiagnosticHasNoUnsatCore) {
   EXPECT_EQ(response->get("unsat_core"), nullptr);
   auto *diagnostic = response->getObject("diagnostic");
   ASSERT_NE(diagnostic, nullptr);
-  EXPECT_EQ(diagnostic->getString("schema"),
-            "joint-solver-diagnostic-0.1");
+  EXPECT_EQ(diagnostic->getString("schema"), "joint-solver-diagnostic-0.1");
   EXPECT_EQ(diagnostic->getString("status"), "inconclusive");
   EXPECT_EQ(diagnostic->getString("backendStatus"), "UNKNOWN");
   EXPECT_EQ(diagnostic->get("core"), nullptr);
@@ -1940,9 +1917,8 @@ TEST(Z3JointSolverV2Test, GemmValidationRejectsIllegalMutations) {
       ASSERT_NE(edge, nullptr);
       (*edge)["chan_bytes"] = 9;
     });
-    expectProblemMutationInvalid("register budget", [](auto &problem) {
-      problem["reg_budget"] = 55;
-    });
+    expectProblemMutationInvalid(
+        "register budget", [](auto &problem) { problem["reg_budget"] = 55; });
     expectProblemMutationInvalid("dependency", [&](auto &problem) {
       auto *edge = findEdge(problem, 5, 6);
       ASSERT_NE(edge, nullptr);
@@ -1975,10 +1951,9 @@ TEST(Z3JointSolverV2Test, GemmValidationRejectsIllegalMutations) {
     expectSolutionMutationInvalid("lowering placement", [](auto &solution) {
       auto *plan = solution.getObject("lowering_plan");
       auto *templates = plan ? plan->getArray("templates") : nullptr;
-      auto *loweringTemplate =
-          templates && !templates->empty()
-              ? templates->front().getAsObject()
-              : nullptr;
+      auto *loweringTemplate = templates && !templates->empty()
+                                   ? templates->front().getAsObject()
+                                   : nullptr;
       auto *events =
           loweringTemplate ? loweringTemplate->getArray("events") : nullptr;
       auto *event =
@@ -2212,7 +2187,6 @@ TEST(Z3JointSolverV2Test, CorrectnessRejectsUnsatisfiableWGConflict) {
   EXPECT_EQ(object->getBoolean("proven_unsat"), true);
 }
 
-
 TEST(Z3JointSolverV2Test, PreservesCommittedStages) {
   auto problem = parseJsonObject(kJointSolverV2Problem);
   ASSERT_TRUE(succeeded(problem));
@@ -2254,24 +2228,23 @@ TEST(Z3JointSolverV2Test, SerializesSameAnchorEventsOnOwnerWarpGroup) {
       {"dst_node", 1},
       {"src_cluster", 10},
       {"dst_cluster", 30},
-      {"events",
-       llvm::json::Array{llvm::json::Object{
-           {"id", 8},
-           {"kind", "arrive"},
-           {"owner", "src"},
-           {"anchor_node", 0},
-           {"placement", "before"},
-           {"pipeline", "NONE"},
-           {"issue_duration", 1},
-           {"completion_latency", 0},
-           {"blocking", false},
-           {"async", false},
-           {"distance", 0},
-           {"frequency", 1},
-           {"bytes", 0},
-           {"depth", 0},
-           {"semaphore", ""},
-       }}},
+      {"events", llvm::json::Array{llvm::json::Object{
+                     {"id", 8},
+                     {"kind", "arrive"},
+                     {"owner", "src"},
+                     {"anchor_node", 0},
+                     {"placement", "before"},
+                     {"pipeline", "NONE"},
+                     {"issue_duration", 1},
+                     {"completion_latency", 0},
+                     {"blocking", false},
+                     {"async", false},
+                     {"distance", 0},
+                     {"frequency", 1},
+                     {"bytes", 0},
+                     {"depth", 0},
+                     {"semaphore", ""},
+                 }}},
   });
 
   auto response = runJsonProblem(std::move(*problem));
@@ -2303,8 +2276,7 @@ TEST(Z3JointSolverV2Test, SerializesSameAnchorEventsOnOwnerWarpGroup) {
     ASSERT_NE(event, nullptr);
     EXPECT_EQ(event->getInteger("cycle"), expectedCycle++);
     EXPECT_EQ(event->getInteger("wg"), *ownerWarpGroup);
-    EXPECT_EQ(event->getInteger("stream_order"),
-              static_cast<int64_t>(index));
+    EXPECT_EQ(event->getInteger("stream_order"), static_cast<int64_t>(index));
   }
 }
 
@@ -2378,8 +2350,7 @@ TEST(Z3JointSolverV2Test, PartitionChannelsDistinguishProducerResults) {
   (*first)["chan_bytes"] = 60;
   (*first)["xissue"] = 0;
 
-  std::string oneResultJson =
-      serializeJsonObject(std::move(*oneResultProblem));
+  std::string oneResultJson = serializeJsonObject(std::move(*oneResultProblem));
   auto oneResultInput = parseJsonObject(oneResultJson);
   ASSERT_TRUE(succeeded(oneResultInput));
   auto oneResultResponse = runJsonProblem(std::move(*oneResultInput));
@@ -2404,8 +2375,7 @@ TEST(Z3JointSolverV2Test, PartitionChannelsDistinguishProducerResults) {
       {"dst_cluster", 30},
   });
   (*twoResultProblem)["smem_budget"] = 120;
-  std::string twoResultJson =
-      serializeJsonObject(std::move(*twoResultProblem));
+  std::string twoResultJson = serializeJsonObject(std::move(*twoResultProblem));
   auto feasibleProblem = parseJsonObject(twoResultJson);
   ASSERT_TRUE(succeeded(feasibleProblem));
   auto feasibleResponse = runJsonProblem(std::move(*feasibleProblem));
@@ -2438,8 +2408,8 @@ TEST(Z3JointSolverV2Test, AutomaticallySeparatesTensorCoreSoftwareReaders) {
         for (int64_t distance : {0, 1}) {
           SCOPED_TRACE(std::string(mode) + "/" + producer + "/" + consumer +
                        "/distance=" + std::to_string(distance));
-          auto problem = makePipelineGroupingProblem(
-              mode, producer, consumer, distance, 2);
+          auto problem = makePipelineGroupingProblem(mode, producer, consumer,
+                                                     distance, 2);
           ASSERT_TRUE(succeeded(problem));
           auto response = runJsonProblem(std::move(*problem));
           ASSERT_TRUE(succeeded(response));
@@ -2460,8 +2430,7 @@ TEST(Z3JointSolverV2Test, AutomaticallySeparatesTensorCoreSoftwareReaders) {
 TEST(Z3JointSolverV2Test, UnsafeReaderNeedsASecondWarpGroup) {
   for (const char *mode : {"partition", "joint"}) {
     for (int64_t distance : {0, 1}) {
-      SCOPED_TRACE(std::string(mode) +
-                   "/distance=" + std::to_string(distance));
+      SCOPED_TRACE(std::string(mode) + "/distance=" + std::to_string(distance));
       auto problem =
           makePipelineGroupingProblem(mode, "TC", "CUDA", distance, 1);
       ASSERT_TRUE(succeeded(problem));
@@ -2479,16 +2448,15 @@ TEST(Z3JointSolverV2Test, SafePipelinePairsMayShareOneWarpGroup) {
            {std::pair{"TMA", "CUDA"}, std::pair{"TC", "TC"}}) {
         SCOPED_TRACE(std::string(mode) + "/" + producer + "/" + consumer +
                      "/distance=" + std::to_string(distance));
-        auto problem = makePipelineGroupingProblem(
-            mode, producer, consumer, distance, 1);
+        auto problem =
+            makePipelineGroupingProblem(mode, producer, consumer, distance, 1);
         ASSERT_TRUE(succeeded(problem));
         auto response = runJsonProblem(std::move(*problem));
         ASSERT_TRUE(succeeded(response));
         EXPECT_EQ(response->getString("status"), "ok");
         auto *warpGroups = response->getObject("wg");
         ASSERT_NE(warpGroups, nullptr);
-        EXPECT_EQ(warpGroups->getInteger("10"),
-                  warpGroups->getInteger("30"));
+        EXPECT_EQ(warpGroups->getInteger("10"), warpGroups->getInteger("30"));
       }
     }
   }
