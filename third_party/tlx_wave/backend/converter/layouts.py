@@ -887,6 +887,35 @@ def make_range_relation(
     return dsl.ixs_serialize(normalized[len(goals)])
 
 
+def global_memory_bit_offset_relation(layout, index_expr, *, element_byte_width, wrap_i32=True):
+    """Compose one logical index expression with its final packet layout."""
+    if layout is None or layout.linear_layout is None:
+        raise ValueError("global memory relation requires a distributed linear layout")
+    dsl = load_wave_dsl()
+    linear = _complete_packet_physical_dims(layout.linear_layout)
+    linear = _packet_item_linear_layout(
+        linear,
+        int(layout.lane_width),
+        layout_warp_count(layout),
+        preserve_block=True,
+    )
+    logical = _symbolic_layout_formula(
+        dsl,
+        linear,
+        {
+            "block": dsl.sym("block"),
+            "slot": dsl.sym("slot"),
+            "item": dsl.sym("item"),
+        },
+    )
+    element_offset = index_expr.subs({dsl.sym(name): expression for name, expression in logical.items()})
+    byte_offset = int(element_byte_width) * element_offset
+    if wrap_i32:
+        byte_offset = dsl.mod(byte_offset, 1 << 32)
+    bit_offset = 8 * byte_offset
+    return tuple(int(byte) for byte in dsl.ixs_serialize(bit_offset))
+
+
 def local_memory_bit_offset_relation(
     distributed_layout,
     shared_layout,
@@ -932,6 +961,11 @@ def local_memory_bit_offset_relation(
     expected_outputs = {f"dim{dim}": int(extent) for dim, extent in enumerate(logical_shape)}
     if {str(name): int(extent) for name, extent in linear.out_dims} != expected_outputs:
         raise ValueError("local memory relation logical dimensions do not match its shape")
+    item_linear = _packet_item_linear_layout(
+        linear,
+        lane_width,
+        warp_count,
+    )
 
     address_layout, order, intervals, paddings = _shared_address_layout(
         shared_layout,
@@ -944,23 +978,17 @@ def local_memory_bit_offset_relation(
     dsl = load_wave_dsl()
     item = dsl.sym("item")
     slot = dsl.sym("slot")
-    packet_inputs = {
-        "block": dsl.ixs_int(0),
-        "item": item,
-        "lane": dsl.mod(item, lane_width),
-        "warp": dsl.floor(item / lane_width),
-    }
     goals = []
     element_bits = element_byte_width * 8
     allocation_bits = allocation_bytes * 8
-    inputs = {
-        **packet_inputs,
-        "register": slot,
+    physical_inputs = {
+        "slot": slot,
+        "item": item,
     }
     logical_by_name = _symbolic_layout_formula(
         dsl,
-        linear,
-        inputs,
+        item_linear,
+        physical_inputs,
     )
     logical_coords = tuple(logical_by_name[f"dim{dim}"] for dim in range(len(logical_shape)))
     for coord, extent in zip(logical_coords, logical_shape):
@@ -968,22 +996,35 @@ def local_memory_bit_offset_relation(
     physical_coords = tuple(coord + origin for coord, origin in zip(logical_coords, logical_origin))
     for coord, extent in zip(physical_coords, physical_shape):
         goals.extend((coord >= 0, coord < extent))
-    element_offset = _symbolic_shared_element_offset(
-        dsl,
-        address_layout,
-        physical_shape,
-        physical_coords,
-        goals,
-        order=order,
-        intervals=intervals,
-        paddings=paddings,
-    )
+    if (address_layout is not None and not address_layout.prefix_shape and logical_shape == physical_shape
+            and not any(logical_origin)):
+        physical_layout = _compose_linear_layouts(
+            item_linear,
+            address_layout.linear_layout,
+        )
+        mapped = _symbolic_layout_formula(dsl, physical_layout, physical_inputs)
+        goals.append(dsl.ixs_eq(mapped["block"], dsl.ixs_int(0)))
+        unpadded_offset = mapped["offset"]
+        goals.extend((unpadded_offset >= 0, unpadded_offset < _product(physical_shape)))
+        element_offset = unpadded_offset
+        for interval, padding in zip(intervals, paddings):
+            element_offset += dsl.floor(unpadded_offset / int(interval)) * int(padding)
+    else:
+        element_offset = _symbolic_shared_element_offset(
+            dsl,
+            address_layout,
+            physical_shape,
+            physical_coords,
+            goals,
+            order=order,
+            intervals=intervals,
+            paddings=paddings,
+        )
     bit_offset = element_bits * element_offset
     goals.extend((
         bit_offset >= 0,
         bit_offset + element_bits <= allocation_bits,
     ))
-
     facts = (
         *_symbolic_range_predicates(
             dsl,
@@ -998,12 +1039,12 @@ def local_memory_bit_offset_relation(
             register_count - 1,
         ),
     )
-    checked, normalized = dsl.ixs_check((*goals, bit_offset), facts)
+    checked, _normalized = dsl.ixs_check(tuple(goals), facts)
     goal_proofs = checked[:len(goals)]
     if any(proof is not True for proof in goal_proofs):
         status = "False" if False in goal_proofs else "Unknown"
         raise ValueError(f"symbolic local memory address proof returned {status}")
-    return dsl.ixs_serialize(normalized[len(goals)])
+    return dsl.ixs_serialize(bit_offset)
 
 
 def memdesc_index_element_offset_relation(
@@ -1244,48 +1285,6 @@ def _packet_relation_blob(
     if structural:
         name, _extent, _source_dim = structural
         packet[name] = dsl.sym(name) if selector is None else dsl.ixs_int(int(selector))
-    destination_extents = dict(result_extents)
-
-    def packet_fact_predicates():
-        relation_facts = (
-            *_symbolic_range_predicates(
-                dsl,
-                packet["block"],
-                0,
-                destination_extents["block"] - 1,
-            ),
-            *_symbolic_range_predicates(
-                dsl,
-                packet["item"],
-                0,
-                int(lane_width) * destination_extents["warp"] - 1,
-            ),
-            *_symbolic_range_predicates(
-                dsl,
-                packet["register"],
-                0,
-                destination_extents["register"] - 1,
-            ),
-        )
-        if structural and selector is None:
-            name, extent, _source_dim = structural
-            relation_facts += _symbolic_range_predicates(
-                dsl,
-                packet[name],
-                0,
-                extent - 1,
-            )
-        return relation_facts
-
-    def normalize_named(expressions, query_facts):
-        names = tuple(expressions)
-        _, normalized = dsl.ixs_check(
-            tuple(expressions[name] for name in names),
-            query_facts,
-        )
-        return dict(zip(names, normalized))
-
-    facts = packet_fact_predicates()
     source_dims = tuple((str(name), int(size)) for name, size in source.out_dims)
     result_dims = tuple((str(name), int(size)) for name, size in result.out_dims)
     if (int(destination_components) <= 0 or result_extents["register"] % int(destination_components)):
@@ -1293,8 +1292,6 @@ def _packet_relation_blob(
     source_slots = linear_layout_in_dim_size(source, "register")
     source_warps = linear_layout_in_dim_size(source, "warp")
     source_items = int(lane_width) * source_warps
-    source_blocks = linear_layout_in_dim_size(source, "block")
-    packed_extent = source_blocks * source_items * source_slots
     result_physical = {
         "register": dsl.mod(packet["register"], result_extents["register"]),
         "lane": dsl.mod(packet["lane"], result_extents["lane"]),
@@ -1312,80 +1309,36 @@ def _packet_relation_blob(
         packet,
         reshape=transform == "reshape",
     )
-    inverse = source.pseudoinvert()
-    mapped = _symbolic_layout_formula(dsl, inverse, expected_logical)
-    # Canonicalize the inverse physical coordinate under the exact destination
-    # packet domain before carrying it into the packed relation.
-    mapped = normalize_named(mapped, facts)
-    # Prove logical preservation through the canonical linear-layout
-    # composition.  Re-extracting bits from the materialized integer physical
-    # coordinate would discard the inverse's exact bit provenance.  Bits added
-    # below for replicated physical axes are kernel bases of the source layout,
-    # so they affect packet ownership but cannot affect this logical result.
-    mapped_logical = _symbolic_layout_formula(dsl, inverse.compose(source), expected_logical)
-    # A zero physical basis is an exact value replication.  The pseudoinverse
-    # leaves that free bit zero, so retain the destination's corresponding bit.
-    for name, bases in source.bases:
-        name = str(name)
-        for bit, basis in enumerate(bases):
-            if any(int(coefficient) for coefficient in basis):
-                continue
-            scale = 1 << bit
-            preferred = dsl.mod(dsl.floor(result_physical[name] / scale), 2)
-            mapped[name] = dsl.xor(mapped[name], scale * preferred)
+    if transform == "reshape":
+        # A reshape through non-power-of-two dimensions is not a GF(2) linear
+        # map.  Keep its exact integer coordinate composition.
+        inverse = source.pseudoinvert()
+        mapped = _symbolic_layout_formula(dsl, inverse, expected_logical)
+    else:
+        destination = _packet_destination_layout(
+            result,
+            source_dims,
+            result_dims,
+            mapped_dims,
+            structural,
+            reshape=False,
+        )
+        same_layout = (transform == "identity" and not structural and tuple(source.bases) == tuple(result.bases)
+                       and tuple(source.out_dims) == tuple(result.out_dims))
+        if same_layout:
+            mapped = dict(result_physical)
+        elif all(_is_power_of_two(extent) for _name, extent in source_dims):
+            relation = _preferred_packet_relation(source, destination)
+            mapped = _symbolic_layout_formula(dsl, relation, packet)
+        elif transform == "identity" and not structural:
+            raise ValueError("packet redistribution between distinct non-power-of-two layouts "
+                             "is not representable by the GF(2) layout relation")
+        else:
+            inverse = source.pseudoinvert()
+            mapped = _symbolic_layout_formula(dsl, inverse, expected_logical)
     mapped_item = mapped["warp"] * int(lane_width) + mapped["lane"]
     packed = ((mapped["block"] * source_items + mapped_item) * source_slots + mapped["register"])
-    expected_logical = normalize_named(expected_logical, facts)
-    mapped_logical = normalize_named(mapped_logical, facts)
-    if mapped_logical.keys() != expected_logical.keys():
-        raise ValueError("packet relation proof has incompatible logical dimensions")
-    proof_goals = [
-        *((
-            f"logical_{name}",
-            dsl.ixs_eq(mapped_logical[name], expected_logical[name]),
-        ) for name in expected_logical),
-        ("block_lower_bound", mapped["block"] >= 0),
-        ("block_upper_bound", mapped["block"] < source_blocks),
-        ("lane_lower_bound", mapped["lane"] >= 0),
-        ("lane_upper_bound", mapped["lane"] < int(lane_width)),
-        ("warp_lower_bound", mapped["warp"] >= 0),
-        ("warp_upper_bound", mapped["warp"] < source_warps),
-        ("register_lower_bound", mapped["register"] >= 0),
-        ("register_upper_bound", mapped["register"] < source_slots),
-        ("item_lower_bound", mapped_item >= 0),
-        ("item_upper_bound", mapped_item < source_items),
-        ("packed_lower_bound", packed >= 0),
-        (
-            "packed_upper_bound",
-            packed < packed_extent,
-        ),
-        (
-            "unpacked_slot",
-            dsl.ixs_eq(dsl.mod(packed, source_slots), mapped["register"]),
-        ),
-        (
-            "unpacked_item",
-            dsl.ixs_eq(
-                dsl.mod(dsl.floor(packed / source_slots), source_items),
-                mapped_item,
-            ),
-        ),
-        (
-            "unpacked_block",
-            dsl.ixs_eq(
-                dsl.floor(packed / (source_slots * source_items)),
-                mapped["block"],
-            ),
-        ),
-    ]
-    proofs, normalized = dsl.ixs_check((*tuple(goal for _name, goal in proof_goals), packed), facts)
-    proofs = proofs[:len(proof_goals)]
-    if any(proof is not True for proof in proofs):
-        status = "False" if False in proofs else "Unknown"
-        failed = tuple(name for (name, _goal), proof in zip(proof_goals, proofs) if proof is not True)
-        raise ValueError("symbolic packet relation preservation proof returned "
-                         f"{status} for goals {failed}")
-    return dsl.ixs_serialize(normalized[len(proof_goals)])
+    return dsl.ixs_serialize(packed)
 
 
 def _symbolic_layout_formula(
@@ -1561,6 +1514,71 @@ def _complete_packet_physical_dims(linear):
     )
 
 
+def _packet_item_linear_layout(
+    linear,
+    lane_width,
+    warp_count,
+    *,
+    preserve_block=False,
+):
+    """Rebase lane and warp packet inputs onto the physical item index."""
+    lane_width = int(lane_width)
+    warp_count = int(warp_count)
+    physical_extents = {name: linear_layout_in_dim_size(linear, name) for name in _PACKET_PHYSICAL_DIMS}
+    lane_bits = lane_width.bit_length() - 1
+    warp_bits = warp_count.bit_length() - 1
+    if 1 << lane_bits != lane_width or 1 << warp_bits != warp_count:
+        raise ValueError("packet item layout requires power-of-two hardware extents")
+    register_bits = physical_extents["register"].bit_length() - 1
+    physical_names = list(_PACKET_PHYSICAL_DIMS)
+
+    def basis(**values):
+        return [int(values.get(name, 0)) for name in physical_names]
+
+    slot_bases = [basis(register=1 << bit) for bit in range(register_bits)]
+    item_bases = [basis(lane=(1 << bit) if (1 << bit) < physical_extents["lane"] else 0) for bit in range(lane_bits)]
+    item_bases.extend(
+        basis(warp=(1 << bit) if (1 << bit) < physical_extents["warp"] else 0) for bit in range(warp_bits))
+    adapter_bases = [
+        ("slot", slot_bases),
+        ("item", item_bases),
+    ]
+    if preserve_block:
+        adapter_bases.append((
+            "block",
+            [basis(block=1 << bit) for bit in range(physical_extents["block"].bit_length() - 1)],
+        ))
+    adapter = LinearLayout.from_bases(
+        adapter_bases,
+        physical_names,
+        [physical_extents[name] for name in physical_names],
+        False,
+    )
+    return _compose_linear_layouts(adapter, linear)
+
+
+def _compose_linear_layouts(inner, outer):
+    """Compose equivalent LinearLayout objects from either Python binding."""
+    inner_outputs = tuple(str(name) for name, _extent in inner.out_dims)
+    outer_outputs = tuple(str(name) for name, _extent in outer.out_dims)
+    outer_bases = {str(name): tuple(tuple(map(int, basis)) for basis in values) for name, values in outer.bases}
+
+    def apply_outer(value):
+        result = [0] * len(outer_outputs)
+        for input_name, input_value in zip(inner_outputs, map(int, value)):
+            for bit, basis in enumerate(outer_bases[input_name]):
+                if input_value & (1 << bit):
+                    result = [lhs ^ rhs for lhs, rhs in zip(result, basis)]
+        return result
+
+    return LinearLayout.from_bases(
+        [(str(name), [apply_outer(value) for value in values]) for name, values in inner.bases],
+        outer_outputs,
+        [int(extent) for _name, extent in outer.out_dims],
+        False,
+    )
+
+
 def _joined_packet_layout(layout):
     linear = layout.linear_layout
     if linear is None:
@@ -1628,6 +1646,166 @@ def _packet_transform_descriptor(source_shape, result_shape, *, transform, axis,
     else:
         raise ValueError(f"unsupported packet layout transform {transform!r}")
     return mapped_dims, structural
+
+
+def _packet_destination_layout(result, source_dims, result_dims, mapped_dims, structural, *, reshape):
+    """Express destination physical coordinates in the source logical domain."""
+    source_shape = tuple(size for _name, size in source_dims)
+    result_shape = tuple(size for _name, size in result_dims)
+
+    def transform_coordinate(coordinate):
+        if reshape:
+            linear = 0
+            for component, extent in zip(coordinate, result_shape, strict=True):
+                linear = linear * extent + component
+            values = [0] * len(source_shape)
+            for dim in reversed(range(len(source_shape))):
+                values[dim] = linear % source_shape[dim]
+                linear //= source_shape[dim]
+            return values
+        values = [0] * len(source_shape)
+        for result_dim, source_dim in enumerate(mapped_dims):
+            if source_dim is not None:
+                values[source_dim] = coordinate[result_dim]
+        return values
+
+    bases = []
+    for name, values in result.bases:
+        bases.append((str(name), [transform_coordinate(tuple(map(int, basis))) for basis in values]))
+    if structural:
+        name, extent, source_dim = structural
+        selector_bases = []
+        bit = 1
+        while bit < extent:
+            basis = [0] * len(source_shape)
+            basis[source_dim] = bit
+            selector_bases.append(basis)
+            bit <<= 1
+        bases.append((name, selector_bases))
+    return LinearLayout.from_bases(
+        bases,
+        [name for name, _size in source_dims],
+        source_shape,
+        False,
+    )
+
+
+_PACKET_PHYSICAL_DIMS = ("register", "lane", "warp", "block")
+
+
+def _packet_layout_columns(linear):
+    return tuple(((str(name), bit), tuple(int(component)
+                                          for component in basis))
+                 for name, bases in linear.bases
+                 for bit, basis in enumerate(bases))
+
+
+def _flatten_packet_coordinate(linear, coordinate):
+    value = 0
+    offset = 0
+    for component, (_name, extent) in zip(coordinate, linear.out_dims, strict=True):
+        value |= int(component) << offset
+        offset += int(extent).bit_length() - 1
+    return value
+
+
+def _packet_source_equations(linear, columns):
+    logical_bits = sum(int(extent).bit_length() - 1 for _name, extent in linear.out_dims)
+    equations = [0] * logical_bits
+    offsets = []
+    offset = 0
+    for _name, extent in linear.out_dims:
+        offsets.append(offset)
+        offset += int(extent).bit_length() - 1
+    for column, (_physical, basis) in enumerate(columns):
+        for dim, component in enumerate(basis):
+            for bit in range(int(linear.out_dims[dim][1]).bit_length() - 1):
+                if component & (1 << bit):
+                    equations[offsets[dim] + bit] |= 1 << column
+    return tuple(equations)
+
+
+def _solve_packet_gf2(equations, rhs, variable_count, constraints=()):
+    rows = [[mask, (rhs >> bit) & 1] for bit, mask in enumerate(equations)]
+    rows.extend([[1 << variable, value] for variable, value in constraints])
+    pivots = []
+    pivot_row = 0
+    for column in range(variable_count):
+        pivot = next((row for row in range(pivot_row, len(rows)) if rows[row][0] & (1 << column)), None)
+        if pivot is None:
+            continue
+        rows[pivot_row], rows[pivot] = rows[pivot], rows[pivot_row]
+        pivot_mask, pivot_rhs = rows[pivot_row]
+        for row, values in enumerate(rows):
+            if row != pivot_row and values[0] & (1 << column):
+                values[0] ^= pivot_mask
+                values[1] ^= pivot_rhs
+        pivots.append((column, pivot_row))
+        pivot_row += 1
+    if any(mask == 0 and value for mask, value in rows):
+        return None
+    return sum(1 << column for column, row in pivots if rows[row][1])
+
+
+def _preferred_packet_solution(equations, rhs, source_columns, destination_column):
+    groups = {
+        name: tuple(index
+                    for index, ((column_name, _bit), _basis) in enumerate(source_columns)
+                    if column_name == name)
+        for name in _PACKET_PHYSICAL_DIMS
+    }
+    preferred = {index: int(destination_column == column) for index, (column, _basis) in enumerate(source_columns)}
+    constraints = []
+    variable_count = len(source_columns)
+    for name in reversed(_PACKET_PHYSICAL_DIMS):
+        proposed = constraints + [(variable, preferred[variable]) for variable in groups[name]]
+        if _solve_packet_gf2(equations, rhs, variable_count, proposed) is not None:
+            constraints = proposed
+    constrained = {variable for variable, _value in constraints}
+    for name in _PACKET_PHYSICAL_DIMS:
+        for variable in sorted(groups[name], key=lambda index: source_columns[index][0][1], reverse=True):
+            if variable in constrained:
+                continue
+            proposed = [*constraints, (variable, 0)]
+            value = int(_solve_packet_gf2(equations, rhs, variable_count, proposed) is None)
+            constraints.append((variable, value))
+            constrained.add(variable)
+    solution = _solve_packet_gf2(equations, rhs, variable_count, constraints)
+    if solution is None:
+        raise ValueError("packet layouts do not define a total redistribution")
+    return solution
+
+
+def _preferred_packet_relation(source, destination):
+    source_columns = _packet_layout_columns(source)
+    equations = _packet_source_equations(source, source_columns)
+    destination_columns = _packet_layout_columns(destination)
+    solutions = tuple(
+        _preferred_packet_solution(
+            equations,
+            _flatten_packet_coordinate(source, basis),
+            source_columns,
+            column,
+        ) for column, basis in destination_columns)
+    physical_extents = {name: linear_layout_in_dim_size(source, name) for name in _PACKET_PHYSICAL_DIMS}
+
+    def physical_coordinate(solution):
+        return tuple(
+            sum(1 << bit
+                for index, ((column_name, bit), _basis) in enumerate(source_columns)
+                if column_name == name and solution & (1 << index))
+            for name in _PACKET_PHYSICAL_DIMS)
+
+    relation_bases = []
+    solution = iter(solutions)
+    for name, bases in destination.bases:
+        relation_bases.append((str(name), [physical_coordinate(next(solution)) for _basis in bases]))
+    return LinearLayout.from_bases(
+        relation_bases,
+        list(_PACKET_PHYSICAL_DIMS),
+        [physical_extents[name] for name in _PACKET_PHYSICAL_DIMS],
+        False,
+    )
 
 
 def _transform_logical_coordinates(

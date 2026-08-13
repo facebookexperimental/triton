@@ -1,4 +1,4 @@
-"""Stateless source-op to target-program conversion."""
+"""Source-op to target-program conversion."""
 
 from dataclasses import dataclass, replace
 import re
@@ -22,6 +22,204 @@ _BINARY_OPS = {
     "arith.remsi": "remsi",
     "arith.remui": "remui",
 }
+
+
+@dataclass(frozen=True)
+class _IndexRelation:
+    expr: object
+    bindings: tuple[tuple[str, int], ...] = ()
+    join_branches: tuple[object, object] | None = None
+
+
+@dataclass(frozen=True)
+class _PointerRelation:
+    base_target_id: int
+    offset: _IndexRelation
+
+
+def _integer_target_type(target_type):
+    element_type = target_type.element_type
+    return element_type == "index" or (isinstance(element_type, str) and element_type.startswith("i"))
+
+
+def _value_relation(builder, target_id):
+    target_id = int(target_id)
+    relation = builder.value_relations.get(target_id)
+    if relation is not None:
+        return relation
+    value = builder.values[target_id]
+    if value.type.representation != "scalar" or not _integer_target_type(value.type):
+        return None
+    dsl = layouts.load_wave_dsl()
+    name = f"t{target_id}"
+    return _IndexRelation(dsl.sym(name), ((name, target_id), ))
+
+
+def _merge_relation_bindings(*relations):
+    bindings = {}
+    for relation in relations:
+        for name, target_id in relation.bindings:
+            previous = bindings.setdefault(str(name), int(target_id))
+            if previous != int(target_id):
+                raise ValueError(f"conflicting symbolic binding {name}")
+    return tuple(sorted(bindings.items()))
+
+
+def _set_binary_relation(builder, view, operation):
+    if len(view.result_target_ids) != 1 or len(view.operand_target_ids) != 2:
+        return
+    lhs = _value_relation(builder, view.operand_target_ids[0])
+    rhs = _value_relation(builder, view.operand_target_ids[1])
+    result = builder.values[view.result_target_ids[0]]
+    if lhs is None or rhs is None or not _integer_target_type(result.type):
+        return
+    dsl = layouts.load_wave_dsl()
+    if operation == "addi":
+        expr = lhs.expr + rhs.expr
+    elif operation == "subi":
+        expr = lhs.expr - rhs.expr
+    elif operation == "muli":
+        expr = lhs.expr * rhs.expr
+    elif operation == "andi":
+        expr = lhs.expr & rhs.expr
+    elif operation == "ori":
+        expr = lhs.expr | rhs.expr
+    elif operation == "xori":
+        expr = dsl.xor(lhs.expr, rhs.expr)
+    elif operation in {"divsi", "remsi"}:
+        quotient = dsl.trunc(lhs.expr / rhs.expr)
+        expr = quotient if operation == "divsi" else lhs.expr - rhs.expr * quotient
+    elif operation in {"divui", "remui"}:
+        width = int(target_ir.attrs_dict(builder.ops[-1]).get("source_width", 0))
+        if width <= 0 or width >= 63:
+            return
+        unsigned_lhs = dsl.mod(lhs.expr, 1 << width)
+        unsigned_rhs = dsl.mod(rhs.expr, 1 << width)
+        quotient = dsl.trunc(unsigned_lhs / unsigned_rhs)
+        value = quotient if operation == "divui" else dsl.mod(unsigned_lhs, unsigned_rhs)
+        bias = 1 << (width - 1)
+        expr = dsl.mod(value + bias, 1 << width) - bias
+    else:
+        return
+    builder.value_relations[int(view.result_target_ids[0])] = _IndexRelation(expr, _merge_relation_bindings(lhs, rhs))
+
+
+def _logical_relation_transform(builder, source_id, result_id, substitutions):
+    source = _value_relation(builder, source_id)
+    if source is None:
+        return
+    dsl = layouts.load_wave_dsl()
+    expr = source.expr.subs({dsl.sym(name): value for name, value in substitutions.items()})
+    builder.value_relations[int(result_id)] = _IndexRelation(expr, source.bindings)
+
+
+def _logical_view_substitutions(source_shape, result_shape, *, transform, axis=None, order=(), selector=None):
+    dsl = layouts.load_wave_dsl()
+    source_shape = tuple(map(int, source_shape))
+    result_shape = tuple(map(int, result_shape))
+    result_dims = tuple(dsl.sym(f"dim{dim}") for dim in range(len(result_shape)))
+    if transform == "expand_dims":
+        return {f"dim{dim}": result_dims[dim + (dim >= int(axis))] for dim in range(len(source_shape))}
+    if transform == "broadcast":
+        return {
+            f"dim{dim}": (dsl.ixs_int(0) if source_shape[dim] == 1 else result_dims[dim])
+            for dim in range(len(source_shape))
+        }
+    if transform == "reshape":
+        flat = dsl.ixs_int(0)
+        for coord, extent in zip(result_dims, result_shape):
+            flat = flat * extent + coord
+        substitutions = {}
+        for dim in reversed(range(len(source_shape))):
+            substitutions[f"dim{dim}"] = dsl.mod(flat, source_shape[dim])
+            flat = dsl.floor(flat / source_shape[dim])
+        return substitutions
+    if transform == "trans":
+        substitutions = {}
+        for result_dim, source_dim in enumerate(map(int, order)):
+            substitutions[f"dim{source_dim}"] = result_dims[result_dim]
+        return substitutions
+    if transform == "split":
+        substitutions = {f"dim{dim}": result_dims[dim] for dim in range(len(result_shape))}
+        substitutions[f"dim{len(result_shape)}"] = dsl.ixs_int(int(selector))
+        return substitutions
+    return {f"dim{dim}": result_dims[dim] for dim in range(min(len(source_shape), len(result_shape)))}
+
+
+def _join_value_relation(builder, source_ids, result_id):
+    first = _value_relation(builder, source_ids[0])
+    second = _value_relation(builder, source_ids[1])
+    if first is None or second is None:
+        return
+    dsl = layouts.load_wave_dsl()
+    first_value = builder.values[int(source_ids[0])]
+    first_layout = builder.layouts[int(first_value.layout_map_id)]
+    selector = dsl.sym(f"dim{len(first_layout.shape)}")
+    builder.value_relations[int(result_id)] = _IndexRelation(
+        (1 - selector) * first.expr + selector * second.expr,
+        _merge_relation_bindings(first, second),
+        (first, second),
+    )
+
+
+def _memory_relation(builder, offset_target_id, element_byte_width):
+    relation = _value_relation(builder, offset_target_id)
+    if relation is None:
+        fail(
+            "TLXW_RELATION_UNREPRESENTABLE_OFFSET",
+            STAGE,
+            "global-memory offset has no exact forward value relation",
+            target_value_id=int(offset_target_id),
+        )
+    value = builder.values[int(offset_target_id)]
+    if value.layout_map_id is None:
+        fail(
+            "TLXW_RELATION_UNREPRESENTABLE_OFFSET",
+            STAGE,
+            "global-memory tensor offset has no distributed layout",
+            target_value_id=int(offset_target_id),
+        )
+    bit_offset = layouts.global_memory_bit_offset_relation(
+        builder.layouts[int(value.layout_map_id)],
+        relation.expr,
+        element_byte_width=int(element_byte_width),
+    )
+    return {
+        "bit_offset_relation": bit_offset,
+        "index_binding_count": len(relation.bindings),
+        "index_binding_names": tuple(name for name, _target_id in relation.bindings),
+    }, tuple(target_id for _name, target_id in relation.bindings)
+
+
+def _pointer_memory_relation(builder, pointer_target_id, element_byte_width):
+    pointer = builder.pointer_relations.get(int(pointer_target_id))
+    if pointer is None:
+        fail(
+            "TLXW_RELATION_UNREPRESENTABLE_POINTER",
+            STAGE,
+            "tensor pointer has no exact forward base-offset relation",
+            target_value_id=int(pointer_target_id),
+        )
+    value = builder.values[int(pointer_target_id)]
+    if value.layout_map_id is None:
+        fail(
+            "TLXW_RELATION_UNREPRESENTABLE_POINTER",
+            STAGE,
+            "tensor pointer has no distributed layout",
+            target_value_id=int(pointer_target_id),
+        )
+    relation = layouts.global_memory_bit_offset_relation(
+        builder.layouts[int(value.layout_map_id)],
+        pointer.offset.expr,
+        element_byte_width=int(element_byte_width),
+        wrap_i32=False,
+    )
+    return pointer.base_target_id, {
+        "bit_offset_relation": relation,
+        "index_binding_count": len(pointer.offset.bindings),
+        "index_binding_names": tuple(name for name, _ in pointer.offset.bindings),
+    }, tuple(target_id for _name, target_id in pointer.offset.bindings)
+
 
 _FLOAT_BINARY_OPS = {
     "arith.addf": "addf",
@@ -531,13 +729,16 @@ def _seed_kernel_arguments(builder, conversion_input, type_layout_program):
                 "must be materialized inside the kernel",
                 source_value_id=source_value_id,
             )
-        arg_target_ids.append(
-            builder.add_value(
-                target_ir.target_type_from_converted(converted.type),
-                source_value_id=source_value_id,
-                debug_name=f"arg{source_value_id}",
-                layout_map_id=converted.layout_map_id,
-            ))
+        target_id = builder.add_value(
+            target_ir.target_type_from_converted(converted.type),
+            source_value_id=source_value_id,
+            debug_name=f"arg{source_value_id}",
+            layout_map_id=converted.layout_map_id,
+        )
+        arg_target_ids.append(target_id)
+        if converted.type.representation == "uniform_pointer":
+            builder.pointer_relations[target_id] = _PointerRelation(target_id,
+                                                                    _IndexRelation(layouts.load_wave_dsl().ixs_int(0)))
     builder.set_kernel_arg_targets(tuple(arg_target_ids))
 
 
@@ -720,19 +921,19 @@ def _converter_for_op(op_name):
 
 def _convert_constant(builder, view):
     (result_target_id, ) = view.result_target_ids
+    literal = _constant_literal(
+        view.attrs.get("value"),
+        source_op_index=view.op_index,
+        element_type=builder.values[result_target_id].type.element_type,
+    )
     builder.add_op(
         "constant",
         results=view.result_target_ids,
-        attrs={
-            "value":
-            _constant_literal(
-                view.attrs.get("value"),
-                source_op_index=view.op_index,
-                element_type=builder.values[result_target_id].type.element_type,
-            )
-        },
+        attrs={"value": literal},
         source_op_index=view.op_index,
     )
+    if type(literal) in {bool, int} and _integer_target_type(builder.values[result_target_id].type):
+        builder.value_relations[int(result_target_id)] = _IndexRelation(layouts.load_wave_dsl().ixs_int(int(literal)))
 
 
 def _convert_binary(builder, view):
@@ -755,6 +956,7 @@ def _convert_binary(builder, view):
         layout_map_ids=view.result_layout_map_ids,
         source_op_index=view.op_index,
     )
+    _set_binary_relation(builder, view, operation)
 
 
 def _convert_float_binary(builder, view):
@@ -1147,6 +1349,12 @@ def _convert_make_range(
         layout_map_ids=result_layout_map_ids,
         source_op_index=op.index,
     )
+    layout = type_layout_program.layouts[int(result_layout_map_ids[0])]
+    dsl = layouts.load_wave_dsl()
+    logical_index = dsl.ixs_int(0)
+    for dim, extent in enumerate(layout.shape):
+        logical_index = logical_index * int(extent) + dsl.sym(f"dim{dim}")
+    builder.value_relations[int(result_target_ids[0])] = _IndexRelation(int(attrs["start"]) + logical_index)
 
 
 def _make_range_coordinate_attrs(
@@ -1245,6 +1453,13 @@ def _convert_splat(builder, view):
         layout_map_ids=view.result_layout_map_ids,
         source_op_index=view.op_index,
     )
+    if len(view.result_target_ids) == 1 and len(view.operand_target_ids) == 1:
+        pointer = builder.pointer_relations.get(int(view.operand_target_ids[0]))
+        if pointer is not None:
+            builder.pointer_relations[int(view.result_target_ids[0])] = pointer
+        relation = _value_relation(builder, view.operand_target_ids[0])
+        if relation is not None:
+            builder.value_relations[int(view.result_target_ids[0])] = relation
 
 
 def _convert_addptr(builder, view):
@@ -1254,6 +1469,19 @@ def _convert_addptr(builder, view):
         results=view.result_target_ids,
         layout_map_ids=view.result_layout_map_ids,
         source_op_index=view.op_index,
+    )
+    if len(view.operand_target_ids) != 2 or len(view.result_target_ids) != 1:
+        return
+    pointer = builder.pointer_relations.get(int(view.operand_target_ids[0]))
+    offset = _value_relation(builder, view.operand_target_ids[1])
+    if pointer is None or offset is None:
+        return
+    builder.pointer_relations[int(view.result_target_ids[0])] = _PointerRelation(
+        pointer.base_target_id,
+        _IndexRelation(
+            pointer.offset.expr + offset.expr,
+            _merge_relation_bindings(pointer.offset, offset),
+        ),
     )
 
 
@@ -1287,6 +1515,14 @@ def _convert_expand_dims(builder, type_layout_program, op):
         layout_map_ids=result_layout_map_ids,
         source_op_index=op.index,
     )
+    source_shape = type_layout_program.layouts[int(type_layout_program.values[op.operands[0]].layout_map_id)].shape
+    result_shape = type_layout_program.layouts[int(result_layout_map_ids[0])].shape
+    _logical_relation_transform(
+        builder,
+        _operand_target_ids(builder, op)[0],
+        result_target_ids[0],
+        _logical_view_substitutions(source_shape, result_shape, transform="expand_dims", axis=axis),
+    )
 
 
 def _convert_broadcast(builder, type_layout_program, op):
@@ -1310,6 +1546,14 @@ def _convert_broadcast(builder, type_layout_program, op):
         attrs={"relation": relation},
         layout_map_ids=result_layout_map_ids,
         source_op_index=op.index,
+    )
+    source_shape = type_layout_program.layouts[int(type_layout_program.values[op.operands[0]].layout_map_id)].shape
+    result_shape = type_layout_program.layouts[int(result_layout_map_ids[0])].shape
+    _logical_relation_transform(
+        builder,
+        _operand_target_ids(builder, op)[0],
+        result_target_ids[0],
+        _logical_view_substitutions(source_shape, result_shape, transform="broadcast"),
     )
 
 
@@ -1335,6 +1579,7 @@ def _convert_join(builder, type_layout_program, op):
         layout_map_ids=result_layout_map_ids,
         source_op_index=op.index,
     )
+    _join_value_relation(builder, _operand_target_ids(builder, op), result_target_ids[0])
 
 
 def _convert_split(builder, type_layout_program, op):
@@ -1359,6 +1604,25 @@ def _convert_split(builder, type_layout_program, op):
         layout_map_ids=result_layout_map_ids,
         source_op_index=op.index,
     )
+    source_id = _operand_target_ids(builder, op)[0]
+    source_relation = _value_relation(builder, source_id)
+    for index, (result_target_id, relation) in enumerate(zip(result_target_ids, relations)):
+        if source_relation is not None and source_relation.join_branches is not None:
+            builder.value_relations[int(result_target_id)] = (source_relation.join_branches[index])
+            continue
+        source_shape = type_layout_program.layouts[int(type_layout_program.values[op.operands[0]].layout_map_id)].shape
+        result_shape = type_layout_program.layouts[int(result_layout_map_ids[index])].shape
+        _logical_relation_transform(
+            builder,
+            source_id,
+            result_target_id,
+            _logical_view_substitutions(
+                source_shape,
+                result_shape,
+                transform="split",
+                selector=index,
+            ),
+        )
 
 
 def _convert_program_id(builder, view):
@@ -1459,6 +1723,13 @@ def _convert_index_cast(builder, view):
         attrs={"mode": "index_cast"},
         source_op_index=view.op_index,
     )
+    relation = _value_relation(builder, view.operand_target_ids[0])
+    if relation is not None and result_type.representation != "scalar":
+        expr = relation.expr
+        if result_type.element_type == "i32" and operand_type.element_type != "i32":
+            dsl = layouts.load_wave_dsl()
+            expr = dsl.mod(expr + (1 << 31), 1 << 32) - (1 << 31)
+        builder.value_relations[int(view.result_target_ids[0])] = _IndexRelation(expr, relation.bindings)
 
 
 def _convert_if(
@@ -2488,6 +2759,7 @@ def _convert_buffer_load_to_local(
         fields["offset_value_id"],
         op,
     )
+    relation_attrs, relation_bindings = _memory_relation(builder, offset_target_id, memdesc.element_byte_width)
     operands = [destination_target_id, base_target_id, offset_target_id]
     if has_mask:
         operands.append(_single_source_target(
@@ -2495,6 +2767,7 @@ def _convert_buffer_load_to_local(
             fields["mask_value_id"],
             op,
         ))
+    operands.extend(relation_bindings)
     operands.extend(source_issue_dependency_target_ids)
     builder.add_op(
         "buffer_load_to_local",
@@ -2516,6 +2789,7 @@ def _convert_buffer_load_to_local(
             "mask_mode": "exec_where" if has_mask else "none",
             "mode": "symbolic_copy",
             "range_bytes": int(range_fact.upper),
+            **relation_attrs,
             "source_issue_dependency_count": len(source_issue_dependency_target_ids),
         },
         fact_ids=(range_fact.fact_id, ),
@@ -2767,6 +3041,8 @@ def _convert_buffer_load(builder, conversion_input, type_layout_program, fact_pr
         runtime_operands.append(runtime_mask_target_id)
     if other_target_id is not None:
         runtime_operands.append(other_target_id)
+    relation_attrs, relation_bindings = _memory_relation(builder, runtime_offset_target_id, element_byte_width)
+    runtime_operands.extend(relation_bindings)
     builder.add_op(
         "buffer_load",
         operands=tuple(runtime_operands),
@@ -2785,6 +3061,7 @@ def _convert_buffer_load(builder, conversion_input, type_layout_program, fact_pr
             "mask_mode": "exec_where" if has_mask else "none",
             "range_bytes": int(range_fact.upper),
             **result_value_attrs,
+            **relation_attrs,
         },
         fact_ids=(range_fact.fact_id, ),
         fact_target_ids=(base_target_id, ),
@@ -2882,6 +3159,8 @@ def _convert_buffer_store(builder, conversion_input, type_layout_program, fact_p
     ]
     if runtime_mask_target_id is not None:
         runtime_operands.append(runtime_mask_target_id)
+    relation_attrs, relation_bindings = _memory_relation(builder, runtime_offset_target_id, element_byte_width)
+    runtime_operands.extend(relation_bindings)
     builder.add_op(
         "buffer_store",
         operands=tuple(runtime_operands),
@@ -2898,6 +3177,7 @@ def _convert_buffer_store(builder, conversion_input, type_layout_program, fact_p
             "mask_mode": "exec_where" if has_mask else "none",
             "range_bytes": int(range_fact.upper),
             "wave_count": int(conversion_input.num_warps),
+            **relation_attrs,
         },
         fact_ids=(range_fact.fact_id, ),
         fact_target_ids=(base_target_id, ),
@@ -2949,7 +3229,8 @@ def _convert_load(builder, conversion_input, type_layout_program, op):
         "tt.load pointer and result",
         op,
     )
-    operands = [_single_source_target(builder, fields["pointer_value_id"], op)]
+    pointer_target_id = _single_source_target(builder, fields["pointer_value_id"], op)
+    operands = [pointer_target_id]
     if fields["mask_value_id"] is not None:
         mask = type_layout_program.values[fields["mask_value_id"]]
         if int(mask.type.component_count) not in (1, component_count):
@@ -3020,6 +3301,12 @@ def _convert_load(builder, conversion_input, type_layout_program, op):
             source_op_index=op.index,
             source_value_id=fields["pointer_value_id"],
         )
+    relation_attrs = {}
+    if pointer_target_id in builder.pointer_relations:
+        base_target_id, relation_attrs, relation_bindings = _pointer_memory_relation(
+            builder, pointer_target_id, element_byte_width)
+        operands[0] = base_target_id
+        operands.extend(relation_bindings)
     result_target_ids, result_layout_map_ids = _declare_results(
         builder,
         op,
@@ -3037,6 +3324,7 @@ def _convert_load(builder, conversion_input, type_layout_program, op):
             "has_other": fields["other_value_id"] is not None,
             "lane_width": int(loaded.type.lane_width or pointer.type.lane_width or 64),
             "mask_mode": "exec_where" if fields["mask_value_id"] is not None else "none",
+            **relation_attrs,
         },
         layout_map_ids=result_layout_map_ids,
         source_op_index=op.index,
@@ -3089,8 +3377,9 @@ def _convert_store(builder, conversion_input, type_layout_program, op):
             "tt.store value and pointer",
             op,
         )
+    pointer_target_id = _single_source_target(builder, fields["pointer_value_id"], op)
     operands = [
-        _single_source_target(builder, fields["pointer_value_id"], op),
+        pointer_target_id,
         _single_source_target(builder, fields["value_value_id"], op),
     ]
     if fields["mask_value_id"] is not None:
@@ -3120,6 +3409,12 @@ def _convert_store(builder, conversion_input, type_layout_program, op):
             source_op_index=op.index,
             source_value_id=fields["pointer_value_id"],
         )
+    relation_attrs = {}
+    if pointer_target_id in builder.pointer_relations:
+        base_target_id, relation_attrs, relation_bindings = _pointer_memory_relation(
+            builder, pointer_target_id, element_byte_width)
+        operands[0] = base_target_id
+        operands.extend(relation_bindings)
     builder.add_op(
         "store",
         operands=tuple(operands),
@@ -3130,6 +3425,7 @@ def _convert_store(builder, conversion_input, type_layout_program, op):
             "has_mask": fields["mask_value_id"] is not None,
             "lane_width": int(pointer.type.lane_width or value.type.lane_width or 64),
             "mask_mode": "exec_where" if fields["mask_value_id"] is not None else "none",
+            **relation_attrs,
         },
         source_op_index=op.index,
     )
@@ -3674,6 +3970,14 @@ def _convert_layout(builder, conversion_input, type_layout_program, op):
         layout_map_ids=result_layout_map_ids,
         source_op_index=op.index,
     )
+    source_shape = type_layout_program.layouts[int(type_layout_program.values[op.operands[0]].layout_map_id)].shape
+    result_shape = type_layout_program.layouts[int(result_layout_map_ids[0])].shape
+    _logical_relation_transform(
+        builder,
+        _operand_target_ids(builder, op)[0],
+        result_target_ids[0],
+        _logical_view_substitutions(source_shape, result_shape, transform="identity"),
+    )
 
 
 def _convert_structural_tensor_view(
@@ -3720,6 +4024,19 @@ def _convert_structural_tensor_view(
         attrs=attrs,
         layout_map_ids=result_layout_map_ids,
         source_op_index=op.index,
+    )
+    source_shape = type_layout_program.layouts[int(type_layout_program.values[op.operands[0]].layout_map_id)].shape
+    result_shape = type_layout_program.layouts[int(result_layout_map_ids[0])].shape
+    _logical_relation_transform(
+        builder,
+        _operand_target_ids(builder, op)[0],
+        result_target_ids[0],
+        _logical_view_substitutions(
+            source_shape,
+            result_shape,
+            transform=transform,
+            order=order,
+        ),
     )
 
 
@@ -4353,6 +4670,17 @@ def _convert_select(
         layout_map_ids=result_layout_map_ids,
         source_op_index=op.index,
     )
+    result_type = builder.values[int(result_target_id)].type
+    condition_relation = _value_relation(builder, condition_target_id)
+    true_relation = _value_relation(builder, true_target_id)
+    false_relation = _value_relation(builder, false_target_id)
+    if (result_type.representation != "scalar"
+            and all(relation is not None for relation in (condition_relation, true_relation, false_relation))):
+        expr = (condition_relation.expr * true_relation.expr + (1 - condition_relation.expr) * false_relation.expr)
+        builder.value_relations[int(result_target_id)] = _IndexRelation(
+            expr,
+            _merge_relation_bindings(condition_relation, true_relation, false_relation),
+        )
 
 
 def _unpack_mma_packet_edge(
