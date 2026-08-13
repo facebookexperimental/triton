@@ -130,11 +130,28 @@ bool isConstantZeroTensor(Value v) {
   return (matchPattern(v, m_Zero()) || matchPattern(v, m_AnyZeroFloat()));
 }
 
+// Packed f32 multiplication is emitted as elementwise inline PTX by kernels
+// that want to preserve paired arithmetic through lowering.  It has the same
+// zero-propagation property as arith.mulf, so look through the narrowly
+// recognized pure mul.f32x2 form when finding an accumulator's zero origin.
+bool isPackedF32Mul(Operation *op) {
+  auto inlineAsm = dyn_cast<ElementwiseInlineAsmOp>(op);
+  return inlineAsm && inlineAsm.getPure() &&
+         inlineAsm.getPackedElement() == 2 && op->getNumOperands() == 2 &&
+         op->getNumResults() == 1 &&
+         inlineAsm.getAsmString().contains("mul.f32x2");
+}
+
 std::optional<std::pair<Operation *, int>>
 findZeroInitOp(Value accUse, scf::ForOp forOp, bool &loopArgIsZero) {
   Value v = accUse;
   if (auto arg = dyn_cast<BlockArgument>(v)) {
-    assert(arg.getOwner() == forOp.getBody());
+    // A zero-preserving op can also consume a value captured from an outer
+    // block (for example the scale operand of a packed multiply).  Such a
+    // value is not the accumulator loop argument and does not establish a
+    // zero origin.
+    if (arg.getOwner() != forOp.getBody())
+      return std::nullopt;
     if (isConstantZeroTensor(forOp.getInitArgs()[arg.getArgNumber() - 1])) {
       loopArgIsZero = true;
     }
@@ -167,7 +184,7 @@ findZeroInitOp(Value accUse, scf::ForOp forOp, bool &loopArgIsZero) {
       return std::make_pair(ifOp, resultIndex);
     }
   }
-  if (auto multOp = dyn_cast<arith::MulFOp>(defOp)) {
+  if (isa<arith::MulFOp>(defOp) || isPackedF32Mul(defOp)) {
     auto output1 = findZeroInitOp(defOp->getOperand(0), forOp, loopArgIsZero);
     if (output1.has_value()) {
       return output1;

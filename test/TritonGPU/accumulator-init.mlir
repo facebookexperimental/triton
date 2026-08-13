@@ -311,6 +311,24 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
     tt.return %17 : tensor<128x16xf32, #mma1>
   }
 
+// CHECK-LABEL: @packed_mul_zero_init
+// CHECK-DAG: %[[FALSE:.+]] = arith.constant false
+// CHECK: scf.for {{.*}} iter_args(%[[ACC:.+]] = {{.*}}, %[[USE_ACC:.+]] = %[[FALSE]])
+// CHECK: tt.elementwise_inline_asm {{.*}} %[[ACC]], {{.*}}
+// CHECK: ttng.warp_group_dot {{.*}}, {{.*}}, {{.*}}, %[[USE_ACC]]
+  tt.func @packed_mul_zero_init(%A: !ttg.memdesc<128x64xf16, #shared, #smem>, %B: !ttg.memdesc<64x16xf16, #shared1, #smem>, %scale: tensor<128x16xf32, #mma1>) -> tensor<128x16xf32, #mma1> {
+    %c0_i32 = arith.constant 0 : i32
+    %cst = arith.constant dense<0.000000e+00> : tensor<128x16xf32, #mma1>
+    %c1_i32 = arith.constant 1 : i32
+    %c8_i32 = arith.constant 8 : i32
+    %result = scf.for %i = %c0_i32 to %c8_i32 step %c1_i32 iter_args(%acc = %cst) -> (tensor<128x16xf32, #mma1>) : i32 {
+      %scaled = tt.elementwise_inline_asm "mul.f32x2 $0, $2, $4;" {constraints = "=r,=r,r,r,r,r", packed_element = 2 : i32, pure = true} %acc, %scale : tensor<128x16xf32, #mma1>, tensor<128x16xf32, #mma1> -> tensor<128x16xf32, #mma1>
+      %next = ttng.warp_group_dot %A, %B, %scaled : !ttg.memdesc<128x64xf16, #shared, #smem> * !ttg.memdesc<64x16xf16, #shared1, #smem> -> tensor<128x16xf32, #mma1>
+      scf.yield %next : tensor<128x16xf32, #mma1>
+    }
+    tt.return %result : tensor<128x16xf32, #mma1>
+  }
+
 // CHECK-LABEL: @if_defines_alternative
 // CHECK: %[[ACC_NEXT:.+]] = ttng.warp_group_dot {{.*}}, {{.*}}, {{.*}}, %arg{{.*}} : !ttg.memdesc
   tt.func @if_defines_alternative(%A: !ttg.memdesc<128x64xf16, #shared, #smem>, %B: !ttg.memdesc<64x16xf16, #shared1, #smem>, %arg0: !tt.ptr<f16> {tt.divisibility = 16 : i32}, %arg1: !tt.ptr<f16> {tt.divisibility = 16 : i32}, %ext: i32, %inc: tensor<64x16xi32, #blocked> {tt.divisibility = 16 : i32}) -> tensor<128x16xf32, #mma1> {
