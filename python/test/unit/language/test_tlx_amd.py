@@ -3240,7 +3240,7 @@ def test_a4w4_inter_wave_preshuffled_scale_codegen_gfx950(device, fresh_triton_c
 
 
 def test_a4w4_inter_wave_merged_scale_codegen_gfx950(device, fresh_triton_cache):
-    """One merged scale ABI emits two full-workgroup scale DMAs per loop body."""
+    """The merged ABI combines wide scale DMA with conflict-free A b128 reads."""
     compiled = _compile_a4w4_inter_wave_merged_scales(768, 768, 1536)
     ttgir = compiled.asm["ttgir"]
     amdgcn = compiled.asm["amdgcn"]
@@ -3251,24 +3251,23 @@ def test_a4w4_inter_wave_merged_scale_codegen_gfx950(device, fresh_triton_cache)
     assert "ttg.memdesc_reinterpret" in ttgir
     assert len(re.findall(r"^\s*buffer_load_[^\n]*\blds\s*$", amdgcn, re.MULTILINE)) == 34
     assert len(re.findall(r"^\s*buffer_load_dwordx4[^\n]*\blds\s*$", amdgcn, re.MULTILINE)) == 34
-    assert len(re.findall(r"^\s*ds_read_b64_tr_b8\b", amdgcn, re.MULTILINE)) == 12
+    assert len(re.findall(r"^\s*ds_read_b64_tr_b8\b", amdgcn, re.MULTILINE)) == 4
     assert "ds_read_b64 " not in amdgcn
-    assert len(re.findall(r"^\s*ds_read_b128\b", amdgcn, re.MULTILINE)) == 112
-    assert len(re.findall(r"^\s*ds_read", amdgcn, re.MULTILINE)) == 124
+    assert len(re.findall(r"^\s*ds_read_b128\b", amdgcn, re.MULTILINE)) == 116
+    assert len(re.findall(r"^\s*ds_read", amdgcn, re.MULTILINE)) == 120
     assert "v_perm_b32" not in amdgcn
     # Refilling immediately after the second-half reads starts the next pair one
     # stage earlier. This deliberately pays a RAW-to-refill wait/barrier; moving
     # the copy across the next existing barrier shortens DMA latency hiding and
     # regresses both measured benchmark shapes.
-    # Three folded VGPR spills add one scratch wait at each epilogue reload.
-    assert len(re.findall(r"^\s*s_waitcnt\b", amdgcn, re.MULTILINE)) == 69
+    assert len(re.findall(r"^\s*s_waitcnt\b", amdgcn, re.MULTILINE)) == 66
     assert len(re.findall(r"^\s*s_barrier\s*$", amdgcn, re.MULTILINE)) == 42
     assert compiled.metadata.shared == 143232
     assert compiled.metadata.global_scratch_size == 0
-    assert ".private_segment_fixed_size: 16" in amdgcn
+    assert ".private_segment_fixed_size: 0" in amdgcn
     assert ".sgpr_count:     58" in amdgcn
     assert ".sgpr_spill_count: 0" in amdgcn
-    assert ".vgpr_spill_count: 3" in amdgcn
+    assert ".vgpr_spill_count: 0" in amdgcn
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")

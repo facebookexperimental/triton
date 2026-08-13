@@ -34,7 +34,9 @@ distinct caller ABI.
 ``matmul_merged_scales`` is a second experimental kernel and ABI. It accepts one
 flat allocation containing the packed A image followed by the packed B image,
 and uses one 16-byte DMA from every thread to gather the adjacent A+B images for
-two K tiles into LDS.
+two K tiles into LDS. Its A image places the four scale register values in the
+low physical bits for one aligned ``ds_read_b128``; bank-group address bits 4..6
+come from lane bits 0..2, keeping that wide read conflict-free.
 
 The Shape:Stride register/blocked/accumulator layouts below encode the gfx950
 16x16x128 scaled-MFMA / dot-operand / scale distributions, and are
@@ -192,23 +194,31 @@ def _a4w4_8wave_kernel(
         block_bases=[],
         alignment=16,
     )
+    # The combined A view assigns the four register-value bits to the low four
+    # physical address bits, so one aligned ds_read_b128 produces both 128-row
+    # MFMA scale fragments.  Address bits 4..6 are lane bits 0..2, which gives
+    # each dword phase all 32 LDS banks; the remaining lane and warp ownership
+    # bits select higher 128-byte regions.
+    # The merged layouts add the K-tile selector around the combined A map.
+    # Physical bit 11 is the 2048-byte A/B section selector, so it is unused by
+    # the A view; physical bit 12 selects the second K tile.
+    shared_merged_a_scales_combined: tl.constexpr = tlx.shared_linear_layout_encoding(
+        offset_bases=[
+            [0, 0, 4], [0, 32, 0], [0, 64, 0], [0, 128, 0],
+            [0, 1, 0], [0, 2, 0], [0, 4, 0], [0, 8, 0],
+            [0, 16, 0], [0, 0, 1], [0, 0, 2], [0, 0, 0], [1, 0, 0],
+        ],
+        block_bases=[],
+        alignment=16,
+    )
     # Physical A images concatenate the two canonical 128x8 half tiles. The
-    # merged layouts add section and K-tile selector bits around the canonical
-    # A/B maps so the full raw allocation can be reinterpreted before slicing.
+    # merged B layout adds section and K-tile selector bits around its canonical
+    # map so the full raw allocation can be reinterpreted before slicing.
     shared_a_scales_packed: tl.constexpr = tlx.shared_linear_layout_encoding(
         offset_bases=[
             [0, 1, 0], [0, 2, 0], [0, 4, 0], [0, 8, 0], [0, 16, 0],
             [0, 32, 0], [0, 64, 0], [0, 0, 1], [0, 0, 2], [0, 16, 4],
             [1, 0, 0],
-        ],
-        block_bases=[],
-        alignment=16,
-    )
-    shared_merged_a_scales: tl.constexpr = tlx.shared_linear_layout_encoding(
-        offset_bases=[
-            [0, 1, 0], [0, 2, 0], [0, 4, 0], [0, 8, 0], [0, 16, 0],
-            [0, 32, 0], [0, 64, 0], [0, 0, 1], [0, 0, 2], [0, 16, 4],
-            [1, 0, 0], [2, 0, 0], [4, 0, 0],
         ],
         block_bases=[],
         alignment=16,
@@ -225,8 +235,8 @@ def _a4w4_8wave_kernel(
     # The preshuffled ABIs DMA an already-swizzled physical image. Keep the raw
     # destination byte-linear so every wave writes consecutive 4-byte (separate)
     # or 16-byte (merged) vectors. Consumers reinterpret subranges through the
-    # canonical A/B XOR layouts above; the reinterpret changes only the LDS
-    # descriptor, not the bytes or their addresses.
+    # corresponding conflict-free consumer layouts above; reinterpretation
+    # changes only the LDS descriptor, not the bytes or their addresses.
     shared_scale_preshuffled: tl.constexpr = tlx.shared_linear_layout_encoding(
         offset_bases=[
             [1], [2], [4], [8], [16], [32], [64], [128], [256], [512], [1024],
@@ -267,6 +277,10 @@ def _a4w4_8wave_kernel(
     scale_a_layout: tl.constexpr = tlx.layout(
         shape=((2, 2, 2, 2, 2, 2, 2, 2, 2), (2, 2, 2)),
         stride=((8, 16, 32, 64, 1, 2, 0, 0, 128), (4, 256, 512)),
+    )
+    scale_a_comb_layout: tl.constexpr = tlx.layout(
+        shape=((2, 2, 2, 2, 2, 2, 2, 2, 2), (2, 2, 2, 2)),
+        stride=((8, 16, 32, 64, 1, 2, 0, 0, 128), (4, 256, 512, 1024)),
     )
     scale_b_layout: tl.constexpr = tlx.layout(
         shape=((2, 2, 2, 2, 2, 2, 2, 2, 2), (2, 2)),
@@ -330,7 +344,7 @@ def _a4w4_8wave_kernel(
         smem_sc = tlx.local_alloc(
             (2 * (BLOCK_M + BLOCK_N) * NG, ), tlx.dtype_of(a_scales_ptr), 1, layout=shared_scale_merged)
         smem_sc_a_view = tlx.local_reinterpret(
-            smem_sc[0], tl.uint8, [8, HALF_M, NG], layout=shared_merged_a_scales)
+            smem_sc[0], tl.uint8, [2, BLOCK_M, NG], layout=shared_merged_a_scales_combined)
         smem_sc_b_view = tlx.local_reinterpret(
             smem_sc[0], tl.uint8, [4, BLOCK_N, NG], layout=shared_merged_b_scales)
     elif PRESHUFFLED_SCALES:
@@ -483,24 +497,12 @@ def _a4w4_8wave_kernel(
         if MERGED_SCALE_DMA:
             b_sc_view_init = tlx.local_slice(
                 smem_sc_b_view, [1, 0, 0], [1, BLOCK_N, NG])
-            a_sc_top = tl.reshape(
-                tlx.local_load(
-                    tlx.local_slice(smem_sc_a_view, [0, 0, 0], [1, HALF_M, NG]),
-                    layout=scale_a_layout,
-                    relaxed=True,
-                ),
-                HALF_M,
-                NG,
-            )
-            a_sc_bot0 = tl.reshape(
-                tlx.local_load(
-                    tlx.local_slice(smem_sc_a_view, [1, 0, 0], [1, HALF_M, NG]),
-                    layout=scale_a_layout,
-                    relaxed=True,
-                ),
-                HALF_M,
-                NG,
-            )
+            a_sc_view_init = tlx.local_slice(
+                smem_sc_a_view, [0, 0, 0], [1, BLOCK_M, NG])
+            a_sc_comb = tlx.local_load(a_sc_view_init, layout=scale_a_comb_layout, relaxed=True)
+            a_sc_t, a_sc_b = tl.split(tl.trans(tl.reshape(a_sc_comb, 2, HALF_M, NG), 1, 2, 0))
+            a_sc_top = tlx.require_layout(a_sc_t, scale_a_layout)
+            a_sc_bot0 = tlx.require_layout(a_sc_b, scale_a_layout)
         else:
             a_sc_view_init = tlx.local_reinterpret(
                 smem_a_sc[0], tl.uint8, [2, HALF_M, NG], layout=shared_a_scales_packed)
@@ -586,29 +588,19 @@ def _a4w4_8wave_kernel(
             a_top = tlx.local_load(smem_a_top[1], relaxed=True)
             if PRESHUFFLED_SCALES:
                 if MERGED_SCALE_DMA:
-                    a_sc_top = tl.reshape(
-                        tlx.local_load(
-                            tlx.local_slice(smem_sc_a_view, [4, 0, 0], [1, HALF_M, NG]),
-                            layout=scale_a_layout,
-                            relaxed=True,
-                        ),
-                        HALF_M,
-                        NG,
-                    )
-                    a_sc_bot1 = tl.reshape(
-                        tlx.local_load(
-                            tlx.local_slice(smem_sc_a_view, [5, 0, 0], [1, HALF_M, NG]),
-                            layout=scale_a_layout,
-                            relaxed=True,
-                        ),
-                        HALF_M,
-                        NG,
-                    )
+                    a_sc_view_1 = tlx.local_slice(
+                        smem_sc_a_view, [1, 0, 0], [1, BLOCK_M, NG])
                     b_sc_view_1 = tlx.local_slice(
                         smem_sc_b_view, [3, 0, 0], [1, BLOCK_N, NG])
                 else:
                     a_sc_view_1 = tlx.local_reinterpret(
                         smem_a_sc[1], tl.uint8, [2, HALF_M, NG], layout=shared_a_scales_packed)
+                if MERGED_SCALE_DMA:
+                    a_sc_comb = tlx.local_load(a_sc_view_1, layout=scale_a_comb_layout, relaxed=True)
+                    a_sc_t, a_sc_b = tl.split(tl.trans(tl.reshape(a_sc_comb, 2, HALF_M, NG), 1, 2, 0))
+                    a_sc_top = tlx.require_layout(a_sc_t, scale_a_layout)
+                    a_sc_bot1 = tlx.require_layout(a_sc_b, scale_a_layout)
+                else:
                     a_sc_top = tl.reshape(
                         tlx.local_load(
                             tlx.local_slice(a_sc_view_1, [0, 0, 0], [1, HALF_M, NG]),
@@ -694,29 +686,19 @@ def _a4w4_8wave_kernel(
             a_top = tlx.local_load(smem_a_top[0], relaxed=True)
             if PRESHUFFLED_SCALES:
                 if MERGED_SCALE_DMA:
-                    a_sc_top = tl.reshape(
-                        tlx.local_load(
-                            tlx.local_slice(smem_sc_a_view, [0, 0, 0], [1, HALF_M, NG]),
-                            layout=scale_a_layout,
-                            relaxed=True,
-                        ),
-                        HALF_M,
-                        NG,
-                    )
-                    a_sc_bot0 = tl.reshape(
-                        tlx.local_load(
-                            tlx.local_slice(smem_sc_a_view, [1, 0, 0], [1, HALF_M, NG]),
-                            layout=scale_a_layout,
-                            relaxed=True,
-                        ),
-                        HALF_M,
-                        NG,
-                    )
+                    a_sc_view_0 = tlx.local_slice(
+                        smem_sc_a_view, [0, 0, 0], [1, BLOCK_M, NG])
                     b_sc_view_0 = tlx.local_slice(
                         smem_sc_b_view, [1, 0, 0], [1, BLOCK_N, NG])
                 else:
                     a_sc_view_0 = tlx.local_reinterpret(
                         smem_a_sc[0], tl.uint8, [2, HALF_M, NG], layout=shared_a_scales_packed)
+                if MERGED_SCALE_DMA:
+                    a_sc_comb = tlx.local_load(a_sc_view_0, layout=scale_a_comb_layout, relaxed=True)
+                    a_sc_t, a_sc_b = tl.split(tl.trans(tl.reshape(a_sc_comb, 2, HALF_M, NG), 1, 2, 0))
+                    a_sc_top = tlx.require_layout(a_sc_t, scale_a_layout)
+                    a_sc_bot0 = tlx.require_layout(a_sc_b, scale_a_layout)
+                else:
                     a_sc_top = tl.reshape(
                         tlx.local_load(
                             tlx.local_slice(a_sc_view_0, [0, 0, 0], [1, HALF_M, NG]),
@@ -785,29 +767,19 @@ def _a4w4_8wave_kernel(
     a_top = tlx.local_load(tlx.local_view(smem_a_top, g_idx), relaxed=True)
     if PRESHUFFLED_SCALES:
         if MERGED_SCALE_DMA:
-            a_sc_top = tl.reshape(
-                tlx.local_load(
-                    tlx.local_slice(smem_sc_a_view, [4, 0, 0], [1, HALF_M, NG]),
-                    layout=scale_a_layout,
-                    relaxed=True,
-                ),
-                HALF_M,
-                NG,
-            )
-            a_sc_bot1 = tl.reshape(
-                tlx.local_load(
-                    tlx.local_slice(smem_sc_a_view, [5, 0, 0], [1, HALF_M, NG]),
-                    layout=scale_a_layout,
-                    relaxed=True,
-                ),
-                HALF_M,
-                NG,
-            )
+            a_sc_view_epilogue = tlx.local_slice(
+                smem_sc_a_view, [1, 0, 0], [1, BLOCK_M, NG])
             b_sc_view_epilogue = tlx.local_slice(
                 smem_sc_b_view, [3, 0, 0], [1, BLOCK_N, NG])
         else:
             a_sc_view_epilogue = tlx.local_reinterpret(
                 smem_a_sc[g_idx], tl.uint8, [2, HALF_M, NG], layout=shared_a_scales_packed)
+        if MERGED_SCALE_DMA:
+            a_sc_comb = tlx.local_load(a_sc_view_epilogue, layout=scale_a_comb_layout, relaxed=True)
+            a_sc_t, a_sc_b = tl.split(tl.trans(tl.reshape(a_sc_comb, 2, HALF_M, NG), 1, 2, 0))
+            a_sc_top = tlx.require_layout(a_sc_t, scale_a_layout)
+            a_sc_bot1 = tlx.require_layout(a_sc_b, scale_a_layout)
+        else:
             a_sc_top = tl.reshape(
                 tlx.local_load(
                     tlx.local_slice(a_sc_view_epilogue, [0, 0, 0], [1, HALF_M, NG]),
@@ -1043,6 +1015,19 @@ def preshuffle_mxfp4_a_scales(scales):
     return torch.gather(tiles, -1, logical_rows).contiguous().reshape(-1)
 
 
+def _preshuffle_mxfp4_a_scales_b128(scales):
+    """Pack A scales for the merged ABI's conflict-free 128-bit LDS read."""
+    padded, padded_rows, padded_groups = _pad_mxfp4_scales(scales)
+    return (
+        padded.reshape(
+            padded_rows // 256, 2, 2, 2, 2, 2, 2, 2, 2,
+            padded_groups // 8, 2, 2, 2)
+        .permute(0, 9, 11, 12, 4, 5, 6, 7, 8, 1, 2, 3, 10)
+        .contiguous()
+        .reshape(-1)
+    )
+
+
 def preshuffle_mxfp4_b_scales(scales):
     """Pack B scales into the canonical conflict-free 256x8 LDS image."""
     padded, padded_rows, padded_groups = _pad_mxfp4_scales(scales)
@@ -1059,14 +1044,14 @@ def preshuffle_mxfp4_b_scales(scales):
 def preshuffle_mxfp4_scales(a_scales, b_scales):
     """Pack A and B scales into the merged kernel's single flat allocation.
 
-    Each half retains its native LDS-consumer order. The kernel creates two
-    logical subviews of the adjacent physical image, so no scale redistribution
-    is needed after the DMA.
+    A uses the combined b128 consumer order and B uses its canonical transpose
+    order. The kernel creates logical subviews of the adjacent physical image,
+    so no scale redistribution is needed after the DMA.
     """
     assert a_scales.device == b_scales.device, "A and B scales must be on the same device"
     assert a_scales.ndim == 2 and b_scales.ndim == 2
     assert a_scales.shape[1] == b_scales.shape[1], "A and B scales must have the same K groups"
-    return torch.cat((preshuffle_mxfp4_a_scales(a_scales), preshuffle_mxfp4_b_scales(b_scales)))
+    return torch.cat((_preshuffle_mxfp4_a_scales_b128(a_scales), preshuffle_mxfp4_b_scales(b_scales)))
 
 
 def _matmul_256tile(a, b, a_scales, b_scales, SPLIT_K=None):
