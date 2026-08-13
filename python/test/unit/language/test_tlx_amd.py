@@ -44,6 +44,8 @@ from triton.language.extra.tlx.tutorials.gfx9_gemm.inter_wave.a4w4.matmul_kernel
     _a4w4_8wave_kernel as _a4w4_inter_wave_256tile_kernel,
     _A4W4_8WAVE_LLVM_FN_ATTRS,
     matmul as _a4w4_inter_wave_matmul,
+    matmul_preshuffled as _a4w4_inter_wave_matmul_preshuffled,
+    preshuffle_mxfp4_a_scales as _preshuffle_a4w4_scales,
     select_matmul_path as _select_a4w4_inter_wave_path,
 )
 
@@ -3047,12 +3049,12 @@ def test_a4w4_shape_stride_layouts_compile_gfx950(device, tmp_path):
     assert "buffer_store_dwordx4" in amdgcn
 
 
-def _compile_a4w4_inter_wave_256tile(m, n, k):
+def _compile_a4w4_inter_wave_256tile(m, n, k, preshuffled_scales=False):
     grid_mn = triton.cdiv(m, _A4W4_INTER_WAVE_BLOCK_M) * triton.cdiv(n, _A4W4_INTER_WAVE_BLOCK_N)
     a = MockTensor(torch.uint8, (m, k // 2))
     b = MockTensor(torch.uint8, (n, k // 2))
     c = MockTensor(torch.bfloat16, (m, n))
-    a_scales = MockTensor(torch.uint8, (m, k // 32))
+    a_scales = MockTensor(torch.uint8, (m * k // 32, ) if preshuffled_scales else (m, k // 32))
     b_scales = MockTensor(torch.uint8, (n, k // 32))
 
     with knobs.runtime.scope():
@@ -3085,6 +3087,7 @@ def _compile_a4w4_inter_wave_256tile(m, n, k):
             NUM_XCDS=8,
             GRID_MN=grid_mn,
             SPLIT_K=1,
+            PRESHUFFLED_A_SCALES=preshuffled_scales,
             grid=(grid_mn, ),
             num_warps=8,
             num_stages=1,
@@ -3170,6 +3173,22 @@ def test_a4w4_inter_wave_256tile_single_trip_codegen_gfx950(device, fresh_triton
     assert ".vgpr_spill_count: 1" in amdgcn
 
 
+def test_a4w4_inter_wave_preshuffled_scale_codegen_gfx950(device, fresh_triton_cache):
+    """The experimental ABI loads A scales as register-native 8-byte vectors."""
+    compiled = _compile_a4w4_inter_wave_256tile(768, 768, 1536, preshuffled_scales=True)
+    ttgir = compiled.asm["ttgir"]
+    amdgcn = compiled.asm["amdgcn"]
+
+    assert "#tlx.user_layout" not in ttgir
+    assert "#tlx.no_verify_layout" not in ttgir
+    assert ttgir.count("amdg.buffer_load_to_local") == 20
+    assert len(re.findall(r"^\s*buffer_load_dwordx2\b", amdgcn, re.MULTILINE)) == 8
+    assert len(re.findall(r"^\s*buffer_load_[^\n]*\blds\s*$", amdgcn, re.MULTILINE)) == 36
+    assert len(re.findall(r"^\s*ds_read_b64_tr_b8\b", amdgcn, re.MULTILINE)) == 4
+    assert compiled.metadata.shared == 139136
+    assert compiled.metadata.global_scratch_size == 0
+
+
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
 def test_a4w4_shape_stride_layouts_correctness_gfx950(device):
     m = n = 256
@@ -3178,6 +3197,18 @@ def test_a4w4_shape_stride_layouts_correctness_gfx950(device):
         actual = _launch_a4w4(a, b, a_scales, b_scales)
         expected = _a4w4_reference(a, b, a_scales, b_scales)
         torch.testing.assert_close(actual, expected, atol=0.1, rtol=0.0)
+
+
+@pytest.mark.parametrize("k, split_k", [(1024, 1), (4096, 2)])
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_a4w4_inter_wave_preshuffled_scale_correctness_gfx950(device, k, split_k):
+    m = n = 256
+    a, b, a_scales, b_scales = _generate_a4w4_inputs(m, n, k)
+    a_scales_preshuffled = _preshuffle_a4w4_scales(a_scales)
+    actual = _a4w4_inter_wave_matmul_preshuffled(
+        a, b, a_scales_preshuffled, b_scales, SPLIT_K=split_k)
+    expected = _a4w4_reference(a, b, a_scales, b_scales)
+    torch.testing.assert_close(actual, expected, atol=0.0, rtol=0.0)
 
 
 @pytest.mark.parametrize(
