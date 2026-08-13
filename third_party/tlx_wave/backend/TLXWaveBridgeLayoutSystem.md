@@ -107,31 +107,30 @@ layouts. Their producer must compose the helper coordinates into the consuming
 packet or address domain. If that composition or required side metadata is not
 available, the bridge rejects the operation before emission.
 
-## Symbolic Queries
+## Symbolic Relations
 
 The bridge derives every packet relation through the same logical-coordinate
-path. It evaluates the result `LinearLayout` at the destination packet,
-applies the operation's exact logical transform to those expressions, and
-evaluates one canonical inverse of the source layout:
+path. It evaluates the result `LinearLayout` at the destination packet and
+applies the operation's exact logical transform. For power-of-two logical
+domains it solves the source `LinearLayout` directly over GF(2), preferring the
+identity constraints for whole physical groups whenever those constraints are
+satisfiable:
 
 ```text
-source_inverse = logical_identity.invert_and_compose(source)
 result_logical = evaluate(result, destination_physical)
 source_logical = logical_transform(result_logical, structural_inputs)
-source_physical = evaluate(source_inverse, source_logical)
-source_physical[replicated_bit] = destination_physical[replicated_bit]
+source_physical = preferred_preimage(source, source_logical,
+                                     destination_physical)
 ```
 
 Identity, transpose, broadcast, expand, join, split, reduction, and reshape all
 use this derivation. A reshape is the literal mixed-radix delinearization of
 `result_logical`; it does not select a second layout model. Split and reduction
-add their one literal structural coordinate to the same transform. The inverse
-selects the canonical representative, except that each literal-zero source
-physical basis retains the corresponding bounded destination-physical bit. Such
-a basis is exact value replication, so this changes ownership locality without
-changing the logical value. Coordinates introduced by a structural operation,
-such as a reduction coordinate or a fixed split selector, remain explicit
-relation inputs.
+add their one literal structural coordinate to the same transform. Coupled
+kernel freedom is solved together, so an identity layout remains a physical
+identity even when several nonzero physical bases represent the same logical
+bit. Coordinates introduced by a structural operation, such as a reduction
+coordinate or a fixed split selector, remain explicit relation inputs.
 
 The bridge translates each `LinearLayout` through the Wave DSL symbolic facade
 into its shared symbolic context. The bridge never imports the underlying
@@ -146,35 +145,36 @@ the layout:
 logical[dim] = combine(layout_basis[input_bit][dim] * bit(input))
 ```
 
-The proof applies the logical transform independently to the result expressions.
-It maps that point through Triton's canonical pseudoinverse and checks logical
-preservation through the pseudoinverse/source `LinearLayout` composition.  The
-source is required to be surjective, so this composition is its exact logical
-right-inverse contract; the transform itself remains outside the composition.
-The mapped physical expressions are independently canonicalized and proved
-in-bounds before serialization.  Replicated physical bits are retained only
-after the logical check because their source bases are zero and cannot change a
-logical coordinate.  No family-specific coordinate formula validates itself.
+The source is required to be surjective. Gaussian elimination constructs each
+physical output basis directly from the source equations and the transformed
+destination basis. The resulting `LinearLayout` establishes logical
+preservation and physical bounds by construction; the bridge does not send
+those identities back through ixsimpl as a second proof system. Mixed-radix
+reshape remains an exact integer expression outside this GF(2) path.
 
-One fact set bounds the destination packet coordinates and any structural input.
-The symbolic query proves the composed inverse maps to the required logical
-coordinates, every selected source coordinate bound, the packed
-source-coordinate range, and the exact pack/unpack round trip. The separate
-coordinate bounds prevent a carry in one coordinate from cancelling an
-out-of-range value in another. A false or unknown result rejects the relation.
-The only relation payload serialized into target IR is the proved packed
-expression:
+Global-memory relations use the same producer boundary. Conversion carries a
+small forward integer expression for offset-producing operations and composes
+its logical dimensions with the final distributed `LinearLayout` at the memory
+operation. Dynamic scalar leaves become ordinary mapping bindings. There is no
+target-SSA ancestry pass and no element-offset materialization carrier.
+
+Local-memory relations first rebase the canonical register/lane/warp physical
+inputs onto `(slot, item)`, with item bits formed from lane bits followed by warp
+bits. When the shared map covers the full tensor rank, that adapter, the
+distributed layout, and the shared inverse are composed as `LinearLayout`s and
+serialized once. This retains the full workgroup item basis instead of nesting
+lane remainders inside a second symbolic layout evaluation.
+
+The only redistribution payload serialized into target IR is the packed
+physical expression:
 
 ```text
 R = source_slot + source_slots * (source_item + items * source_block)
 ```
 
 Emission structurally deserializes `R` once, projects the three existing
-`wave.redistribute` expressions with floor and modulo, and normalizes those
-projections under the same exact destination packet-coordinate facts (including
-the reduction extent when present). This keeps the producer and consumer on one
-canonical symbolic carrier. No layout bases, inverse relation state, or
-unproved analysis object crosses this boundary.
+`wave.redistribute` expressions with floor and modulo. No layout bases, inverse
+relation state, or analysis object crosses this boundary.
 
 ### `coords(layout, hw)`
 
@@ -391,7 +391,7 @@ independently proved scalar/vector transaction or reject.
 
 `ttg.convert_layout` crosses the bridge as one structural operation whose normal
 operand and result metadata identifies the layouts and whose attributes contain
-the private physical-relation carrier. The carrier contains no movement mode,
+the private physical-relation payload. The payload contains no movement mode,
 register permutation, or component-source table.
 Reshape, transpose, broadcast, expand, join, split, and reduction all derive the
 same carrier from their literal logical transform and Triton's layout algebra.
@@ -405,8 +405,7 @@ For distributed tensor layouts, define:
 ```text
 S = toLinearLayout(source_type)
 D = toLinearLayout(result_type)
-P = logical_identity.invertAndCompose(S)
-C(h) = P(T(D(h)))
+C(h) = preferredPreimage(S, T(D(h)), h)
 ```
 
 Here `T` is the operation's exact logical transform. `C` maps each result
@@ -417,11 +416,10 @@ logical tensor element:
 T(D(result_hw)) == S(C(result_hw))
 ```
 
-After evaluating `C`, the bridge retains `h` for every individual physical bit
-whose source basis is the zero vector. This is the locality-preserving section
-of an explicitly replicated value; every nonzero source basis remains under
-the canonical inverse. The `wave-lower-redistribute` pass only classifies and
-lowers the resulting expressions:
+The preferred preimage constrains physical groups in block, warp, lane, and
+register priority order, retaining each complete identity group when the
+remaining system is still solvable. The `wave-lower-redistribute` pass only
+classifies and lowers the resulting expressions:
 
 - an identity relation folds to an alias;
 - register-only relations become ordinary pack/extract operations;
@@ -502,7 +500,8 @@ Target operations carry only schema data needed for emission:
 - MMA access metadata: operand role, instruction shape, element type, wave size,
   vector payload width, target family, and metadata ID;
 - ordinary memory metadata such as cache, contiguity, mask behavior, and pointer
-  range.
+  range;
+- global-memory bit-offset relations and their ordinary scalar binding names.
 
 Target IR must not carry source MLIR objects, Python layout objects, fact or
 layout analysis records, lazy resolvers, callables, emitter state, or

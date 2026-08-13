@@ -2086,9 +2086,8 @@ def _emit_memdesc_index(state, op):
         slot,
         int(attrs["slot_count"]),
     )
-    _, normalized = state.dsl.ixs_check((relation, ), assumptions)
     offset = state.builder.index_expr(
-        normalized[0],
+        relation,
         {slot: index},
         assumptions=assumptions,
     )
@@ -2264,7 +2263,7 @@ def _symbolic_mask_conditions(state, predicates):
 
 
 def _symbolic_buffer_relation(state, op, attrs, ordinary_operand_count):
-    """Deserialize a proved target-SSA relation and bind its scalar leaves."""
+    """Deserialize a producer-composed relation and bind its scalar leaves."""
     blob = attrs.get("bit_offset_relation")
     names = tuple(attrs.get("index_binding_names", ()))
     count = int(attrs.get("index_binding_count", 0))
@@ -2388,7 +2387,7 @@ def _prepare_symbolic_indexed_gather(
     bit_offset=None,
     relation_bindings=None,
 ):
-    """Prepare one gather over the exact emitted offset SSA values."""
+    """Prepare one gather from the producer-composed symbolic relation."""
     offsets = tuple(offsets)
     result_type = state.dsl.simd_type(
         state.dsl.vector_type(len(offsets), element_type),
@@ -2861,16 +2860,9 @@ def _specialize_packet_slot(
     packet_width,
 ):
     slot = state.dsl.sym("slot")
-    fresh = state.dsl.sym("__wave_packet_slot")
-    _, renamed = state.dsl.ixs_check(
-        (expression, ),
-        (state.dsl.ixs_eq(slot, fresh), ),
-    )
-    _, specialized = state.dsl.ixs_check(
-        renamed,
-        (state.dsl.ixs_eq(fresh, slot + int(packet) * int(packet_width)), ),
-    )
-    return specialized[0]
+    return expression.subs({
+        slot: slot + int(packet) * int(packet_width),
+    })
 
 
 def _deserialize_relation_expr(state, relation, op):
