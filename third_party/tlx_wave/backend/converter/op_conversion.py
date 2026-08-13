@@ -87,8 +87,13 @@ def _set_binary_relation(builder, view, operation):
     elif operation == "xori":
         expr = dsl.xor(lhs.expr, rhs.expr)
     elif operation in {"divsi", "remsi"}:
-        quotient = dsl.trunc(lhs.expr / rhs.expr)
-        expr = quotient if operation == "divsi" else lhs.expr - rhs.expr * quotient
+        width = int(target_ir.attrs_dict(builder.ops[-1]).get("source_width", 0))
+        if width <= 0 or width >= 63:
+            return
+        signed_lhs = layouts.signed_fixed_width_value(lhs.expr, width)
+        signed_rhs = layouts.signed_fixed_width_value(rhs.expr, width)
+        quotient = dsl.trunc(signed_lhs / signed_rhs)
+        expr = quotient if operation == "divsi" else signed_lhs - signed_rhs * quotient
     elif operation in {"divui", "remui"}:
         width = int(target_ir.attrs_dict(builder.ops[-1]).get("source_width", 0))
         if width <= 0 or width >= 63:
