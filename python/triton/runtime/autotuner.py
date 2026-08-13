@@ -13,7 +13,7 @@ from functools import cached_property
 from typing import Dict, Tuple, List, Optional
 
 from .. import knobs
-from .jit import KernelInterface, JITFunction, _compile_iq_suppress_competition
+from .jit import KernelInterface, JITFunction, _compile_iq_suppress_competition, _hash_fc_opts
 from .errors import OutOfResources, PTXASError, AutotunerError
 from .driver import driver
 from .cache import get_cache_manager, triton_key
@@ -647,7 +647,7 @@ class Autotuner(KernelInterface):
         _meta = {k: v for k, v in config_kwargs.items() if k not in fn_arg_name_set}
         _meta_opts = {k: v for k, v in _meta.items() if k not in getattr(self.fn, '_param_name_to_idx', {})}
         if _meta_opts:
-            options_hash = hash(tuple(sorted(_meta_opts.items()))) & 0xFFFFFFFFFFFFFFFF
+            options_hash = _hash_fc_opts(_meta_opts)
         else:
             options_hash = getattr(self.fn, '_fc_options_hash', 0)
 
@@ -747,7 +747,7 @@ class Autotuner(KernelInterface):
             if _meta:
                 _meta_opts = {k: v for k, v in _meta.items() if k not in getattr(self.fn, '_param_name_to_idx', {})}
                 if _meta_opts:
-                    self.fn._fc_options_hash = hash(tuple(sorted(_meta_opts.items()))) & 0xFFFFFFFFFFFFFFFF
+                    self.fn._fc_options_hash = _hash_fc_opts(_meta_opts)
                 # Store meta kwargs for C proxy fallback forwarding.
                 self.fn._fc_meta_kwargs = _meta
                 # Invalidate proxy cache so next __getitem__ creates a new proxy

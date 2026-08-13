@@ -87,6 +87,31 @@ if _CACHE_STATS_ON:
             print(f"  {kname}: {summary}", file=_sys.stderr, flush=True)
 
 
+def _make_hashable(v):
+    """Convert unhashable types to hashable equivalents for options hashing.
+
+    The C fast-path hashes non-parameter kwargs (e.g. ``extern_libs``) via
+    ``hash(tuple(sorted(opts.items())))``.  Dict/list/set values are not
+    hashable, so we recursively convert them:
+    - dicts  -> tuple of (key, transformed-value) pairs sorted by key
+    - sets   -> sorted tuple (order-independent hash)
+    - lists  -> tuple preserving order
+    """
+    if isinstance(v, dict):
+        return tuple((k, _make_hashable(val)) for k, val in sorted(v.items(), key=lambda kv: kv[0]))
+    if isinstance(v, (set, frozenset)):
+        return tuple(sorted(_make_hashable(x) for x in v))
+    if isinstance(v, list):
+        return tuple(_make_hashable(x) for x in v)
+    return v
+
+
+def _hash_fc_opts(opts):
+    """Compute a stable uint64 hash over non-parameter kwargs for the C fast cache."""
+    return hash(tuple(
+        (k, _make_hashable(v)) for k, v in sorted(opts.items(), key=lambda kv: kv[0]))) & 0xFFFFFFFFFFFFFFFF
+
+
 # Fast tensor access API — lazily registered on first use.
 # Provides ~10x faster dtype/data_ptr extraction via direct C struct access.
 _torch_bridge_loaded = False
@@ -973,8 +998,7 @@ class JITFunction(JITCallable, KernelInterface[T]):
                     else:
                         _fc_opts[k] = v
                 _fc_args = tuple(_fc_args)
-                _fc_hash = (hash(tuple(sorted(_fc_opts.items())))
-                            & 0xFFFFFFFFFFFFFFFF) if _fc_opts else self._fc_options_hash
+                _fc_hash = _hash_fc_opts(_fc_opts) if _fc_opts else self._fc_options_hash
             else:
                 _fc_args = args
                 _fc_hash = self._fc_options_hash
@@ -1192,8 +1216,7 @@ class JITFunction(JITCallable, KernelInterface[T]):
                         else:
                             _ins_opts[k] = v
                     _ins_args = tuple(_ins_args)
-                    _ins_hash = (hash(tuple(sorted(_ins_opts.items())))
-                                 & 0xFFFFFFFFFFFFFFFF) if _ins_opts else self._fc_options_hash
+                    _ins_hash = _hash_fc_opts(_ins_opts) if _ins_opts else self._fc_options_hash
                 else:
                     _ins_args = args
                     _ins_hash = self._fc_options_hash
