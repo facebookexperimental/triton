@@ -95,6 +95,7 @@ def _fa_v_layout():
             (8, 0),
             (16, 0),
             (32, 0),
+            (64, 0),
             (0, 32),
         ),
         (
@@ -109,7 +110,7 @@ def _fa_v_layout():
             (0, 0),
             (0, 0),
         ),
-        (64, 64),
+        (128, 64),
     )
 
 
@@ -125,6 +126,7 @@ def _fa_v_shared_layout():
                     (256, 0),
                     (1024, 0),
                     (2048, 0),
+                    (4096, 0),
                 ),
             ),
             (
@@ -133,7 +135,7 @@ def _fa_v_shared_layout():
             ),
         ),
         ("offset", "block"),
-        (64 * 64, 1),
+        (128 * 64, 1),
         False,
     )
     return _shared_layout(
@@ -321,7 +323,7 @@ def _transpose_frame(dsl, item):
     return group, within, origin_item, origin_slot
 
 
-def _prove_b16_transactions(dsl, relation, item_count):
+def _prove_b16_transactions(dsl, relation, item_count, packet_count=8):
     item = dsl.sym("item")
     slot = dsl.sym("slot")
     local_slot = dsl.sym("local_slot")
@@ -331,7 +333,7 @@ def _prove_b16_transactions(dsl, relation, item_count):
         *layouts._symbolic_range_predicates(dsl, group, 0, 1),
         *layouts._symbolic_range_predicates(dsl, within, 0, 3),
     )
-    for packet in range(8):
+    for packet in range(packet_count):
         packet_relation = relation.subs({
             slot: local_slot + packet * _PACKET_WIDTH,
         })
@@ -571,21 +573,39 @@ def test_fa_v_layout_to_symbolic_formula_proves_b16_contiguity():
         _fa_v_layout(),
         _fa_v_shared_layout(),
         warp_count=4,
-        allocation_bytes=8640,
-        shape=(64, 64),
+        allocation_bytes=17408,
+        shape=(128, 64),
     )
     item = dsl.sym("item")
     slot = dsl.sym("slot")
     unpadded = (dsl.mod(item, 32) + 128 * dsl.mod(dsl.floor(item / 32), 2) + 512 * dsl.mod(slot, 2) +
                 64 * dsl.mod(dsl.floor(slot / 2), 2) + 256 * dsl.mod(dsl.floor(slot / 4), 2) +
                 1024 * dsl.mod(dsl.floor(slot / 8), 2) + 2048 * dsl.mod(dsl.floor(slot / 16), 2) +
-                32 * dsl.mod(dsl.floor(slot / 32), 2))
-    assert relation == 16 * (544 * dsl.mod(slot, 2) + 64 * dsl.mod(dsl.floor(slot / 2), 2) +
-                             256 * dsl.mod(dsl.floor(slot / 4), 2) + 1088 * dsl.mod(dsl.floor(slot / 8), 4) +
-                             32 * dsl.mod(dsl.floor(slot / 32), 2) + dsl.mod(item, 32) +
-                             128 * dsl.mod(dsl.floor(dsl.mod(item, 64) / 32), 2))
+                4096 * dsl.mod(dsl.floor(slot / 32), 2) + 32 * dsl.mod(dsl.floor(slot / 64), 2))
+    unpadded_formula = dsl.xor(
+        dsl.mod(item, 2),
+        2 * dsl.mod(dsl.floor(dsl.mod(item, 64) / 2), 2),
+        4 * dsl.mod(dsl.floor(dsl.mod(item, 64) / 4), 2),
+        8 * dsl.mod(dsl.floor(dsl.mod(item, 64) / 8), 2),
+        16 * dsl.mod(dsl.floor(dsl.mod(item, 64) / 16), 2),
+        32 * dsl.mod(dsl.floor(slot / 64), 2),
+        64 * dsl.mod(dsl.floor(slot / 2), 2),
+        128 * dsl.mod(dsl.floor(dsl.mod(item, 64) / 32), 2),
+        256 * dsl.mod(dsl.floor(slot / 4), 2),
+        512 * dsl.mod(slot, 2),
+        1024 * dsl.mod(dsl.floor(slot / 8), 2),
+        2048 * dsl.mod(dsl.floor(slot / 16), 2),
+        4096 * dsl.mod(dsl.floor(slot / 32), 2),
+    )
+    padding_formula = 32 * dsl.xor(
+        dsl.mod(slot, 2),
+        2 * dsl.mod(dsl.floor(slot / 8), 2),
+        4 * dsl.mod(dsl.floor(slot / 16), 2),
+        8 * dsl.mod(dsl.floor(slot / 32), 2),
+    )
+    assert relation == 16 * (unpadded_formula + padding_formula)
     for physical_item in range(256):
-        for physical_slot in range(64):
+        for physical_slot in range(128):
             unpadded_value = int(unpadded.eval({
                 "item": physical_item,
                 "slot": physical_slot,
@@ -595,7 +615,7 @@ def test_fa_v_layout_to_symbolic_formula_proves_b16_contiguity():
                 "item": physical_item,
                 "slot": physical_slot,
             })) == expected
-    _prove_b16_transactions(dsl, relation, 256)
+    _prove_b16_transactions(dsl, relation, 256, packet_count=16)
 
 
 def test_padded_b_symbolic_relation_proves_b16_contiguity():
