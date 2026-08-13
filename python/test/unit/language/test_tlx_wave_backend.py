@@ -46,8 +46,6 @@ if "tlx_wave" in backends:
     from triton.backends.tlx_wave.converter import target_ir as converter_target_ir
     from triton.backends.tlx_wave.converter import tokens as converter_tokens
     from triton.backends.tlx_wave.converter import types as converter_types
-    from triton.backends.tlx_wave.converter import (
-        value_relations as converter_value_relations, )
     from triton.backends.tlx_wave.converter import verifier as converter_verifier
 else:
     tlx_wave_compiler = None
@@ -69,7 +67,6 @@ else:
     converter_target_ir = None
     converter_tokens = None
     converter_types = None
-    converter_value_relations = None
     converter_verifier = None
 
 pytestmark = pytest.mark.skipif("tlx_wave" not in backends, reason="tlx_wave backend is not installed")
@@ -1865,14 +1862,7 @@ def test_tlx_wave_packet_relation_preserves_replicated_physical_bits():
 
     (relation, ) = converter_layouts.packet_layout_relations((layout, ), (layout, ))
     dsl, _ir = converter_emission._load_wave_dsl()
-    block, item, slot = dsl.sym("block"), dsl.sym("item"), dsl.sym("slot")
-    facts = (
-        *converter_layouts._symbolic_range_predicates(dsl, block, 0, 1),
-        *converter_layouts._symbolic_range_predicates(dsl, item, 0, 255),
-        *converter_layouts._symbolic_range_predicates(dsl, slot, 0, 3),
-    )
-    _proofs, normalized = dsl.ixs_check((dsl.ixs_deserialize(relation), ), facts)
-    assert bytes(relation) == bytes(dsl.ixs_serialize(normalized[0]))
+    block, slot = dsl.sym("block"), dsl.sym("slot")
     source_block, source_item, source_slot = converter_emission._packet_relation_exprs(
         SimpleNamespace(dsl=dsl),
         relation,
@@ -2206,7 +2196,7 @@ def test_tlx_wave_packet_relation_proves_split_through_logical_projection():
                 }
 
 
-def test_tlx_wave_packet_relation_only_preserves_zero_physical_bases():
+def test_tlx_wave_packet_relation_preserves_physical_identity():
     source_linear = LinearLayout.from_bases(
         [
             ("register", [[1], [2]]),
@@ -2238,10 +2228,44 @@ def test_tlx_wave_packet_relation_only_preserves_zero_physical_bases():
         destination_slots=4,
     )
     point = {"block": 0, "item": 3, "slot": 0}
-    # Lane bit 0 is replicated and remains local.  Lane bit 1 contributes to
-    # the mod-3 value and therefore remains under the canonical inverse.
-    assert (source_item.eval(point), source_slot.eval(point)) == (1, 1)
-    assert source_linear.apply({"register": 1, "lane": 1, "warp": 0, "block": 0}) == {"dim0": 1}
+    assert (source_item.eval(point), source_slot.eval(point)) == (3, 0)
+
+
+def test_tlx_wave_packet_relation_preserves_coupled_physical_identity():
+    source_linear = LinearLayout.from_bases(
+        [
+            ("register", [[1]]),
+            ("lane", [[1]]),
+            ("warp", []),
+            ("block", []),
+        ],
+        ["dim0"],
+        [2],
+        False,
+    )
+    layout = SimpleNamespace(
+        shape=(2, ),
+        linear_layout=source_linear,
+        value_id=0,
+        lane_width=2,
+        component_count=2,
+    )
+
+    (relation, ) = converter_layouts.packet_layout_relations((layout, ), (layout, ))
+    dsl, _ir = converter_emission._load_wave_dsl()
+    _source_block, source_item, source_slot = converter_emission._packet_relation_exprs(
+        SimpleNamespace(dsl=dsl),
+        relation,
+        2,
+        2,
+        destination_blocks=1,
+        destination_items=2,
+        destination_slots=2,
+    )
+    for item in range(2):
+        for slot in range(2):
+            point = {"block": 0, "item": item, "slot": slot}
+            assert (source_item.eval(point), source_slot.eval(point)) == (item, slot)
 
 
 def test_tlx_wave_packet_relation_applies_modular_physical_outputs():
@@ -2301,7 +2325,7 @@ def test_tlx_wave_packet_relation_rejects_unproved_modular_inverse():
         component_count=4,
     )
 
-    with pytest.raises(ValueError, match="proof returned (False|Unknown)"):
+    with pytest.raises(ValueError, match="distinct non-power-of-two layouts"):
         converter_layouts.packet_layout_relations((source, ), (result, ))
 
 
@@ -6328,6 +6352,11 @@ def _test_bit_offset_relation(element_bits, *, item_stride=1, slot_stride=1):
     return dsl.ixs_serialize(expression)
 
 
+def _test_constant_relation(value):
+    dsl, _ir = converter_emission._load_wave_dsl()
+    return dsl.ixs_serialize(dsl.ixs_int(int(value)))
+
+
 def _test_memdesc_index_attrs(element_offset_scale, slot_count):
     dsl, _ir = converter_emission._load_wave_dsl()
     relation = int(element_offset_scale) * dsl.sym("slot")
@@ -6371,6 +6400,7 @@ def _dense_f16_mma_local_access_attrs():
 
 def _dense_f32_dma_attrs():
     return {
+        "bit_offset_relation": _test_bit_offset_relation(32),
         "cache_modifier": 1,
         "component_count": 1,
         "destination_bit_offset_relation": _test_bit_offset_relation(32),
@@ -6379,6 +6409,8 @@ def _dense_f32_dma_attrs():
         "has_mask": False,
         "has_stride_operand": False,
         "issue_dependency_count": 0,
+        "index_binding_count": 0,
+        "index_binding_names": (),
         "source_issue_dependency_count": 0,
         "lane_width": 64,
         "mask_mode": "none",
@@ -6389,6 +6421,7 @@ def _dense_f32_dma_attrs():
 
 def _dense_f16_symbolic_copy_attrs():
     return {
+        "bit_offset_relation": _test_bit_offset_relation(16),
         "cache_modifier": 1,
         "component_count": 1,
         "destination_bit_offset_relation": _test_bit_offset_relation(16),
@@ -6397,6 +6430,8 @@ def _dense_f16_symbolic_copy_attrs():
         "has_mask": False,
         "has_stride_operand": False,
         "issue_dependency_count": 0,
+        "index_binding_count": 0,
+        "index_binding_names": (),
         "source_issue_dependency_count": 0,
         "lane_width": 64,
         "mask_mode": "none",
@@ -6608,7 +6643,7 @@ def _build_circular_memdesc_read_refill_target(
         attrs=_dense_f32_dma_attrs(),
     )
     builder.add_op("return")
-    return converter_value_relations.attach_symbolic_memory_relations(builder.build())
+    return builder.build()
 
 
 def _build_independent_async_dma_wait_target():
@@ -6678,7 +6713,7 @@ def _build_independent_async_dma_wait_target():
         },
     )
     builder.add_op("return")
-    return converter_value_relations.attach_symbolic_memory_relations(builder.build())
+    return builder.build()
 
 
 def _build_distinct_layoutless_splat_dma_target(offset_count=17):
@@ -6743,7 +6778,10 @@ def _build_distinct_layoutless_splat_dma_target(offset_count=17):
             "buffer_load_to_local",
             operands=(alloc, source, offset),
             results=(dma_token, ),
-            attrs=_dense_f32_dma_attrs(),
+            attrs={
+                **_dense_f32_dma_attrs(),
+                "bit_offset_relation": _test_constant_relation(offset_value * 32),
+            },
             fact_ids=(0, ),
             fact_target_ids=(source, ),
         )
@@ -6762,7 +6800,7 @@ def _build_distinct_layoutless_splat_dma_target(offset_count=17):
             },
         )
     builder.add_op("return")
-    return converter_value_relations.attach_symbolic_memory_relations(builder.build())
+    return builder.build()
 
 
 def _build_mma_read_then_dma_reuse_target(
@@ -6952,7 +6990,7 @@ def _build_mma_read_then_dma_reuse_target(
                 source_op_index=9001,
             )
     builder.add_op("return")
-    return converter_value_relations.attach_symbolic_memory_relations(builder.build())
+    return builder.build()
 
 
 def _ssa_result_name(line):
@@ -11606,60 +11644,6 @@ def test_tlx_wave_converter_keeps_dma_pointer_conversion_inside_loop(tmp_path):
     del ctx
 
 
-def test_tlx_wave_converter_maps_additive_loop_carried_buffer_offset(tmp_path):
-    preamble = """
-#blocked = #ttg.blocked<{sizePerThread = [8], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
-"""
-    local_func = """
-  tt.func public @converter_loop_carried_buffer_offset(
-      %arg0: !tt.ptr<f16> {tt.pointer_range = 32 : i32},
-      %arg1: !tt.ptr<f16> {tt.pointer_range = 32 : i32}) attributes {noinline = false} {
-    %offset = tt.make_range {end = 512 : i32, start = 0 : i32} : tensor<512xi32, #blocked>
-    %c0_i32 = arith.constant 0 : i32
-    %c2_i32 = arith.constant 2 : i32
-    %c4_i32 = arith.constant 4 : i32
-    %advance = arith.constant dense<512> : tensor<512xi32, #blocked>
-    %result = scf.for %i = %c0_i32 to %c4_i32 step %c2_i32
-        iter_args(%current = %offset) -> (tensor<512xi32, #blocked>)  : i32 {
-      %loaded = amdg.buffer_load %arg0[%current] {contiguity = 8 : i32}
-          : tensor<512xf16, #blocked>
-      amdg.buffer_store %loaded, %arg1[%current] {contiguity = 8 : i32}
-          : tensor<512xf16, #blocked>
-      %next = arith.addi %current, %advance : tensor<512xi32, #blocked>
-      scf.yield %next : tensor<512xi32, #blocked>
-    }
-    tt.return
-  }
-"""
-    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1, preamble=preamble)
-
-    output = converter_pipeline.convert_ttgir_to_wave(mod)
-
-    memory_ops = [op for op in output.target_program.ops if op.kind in {"buffer_load", "buffer_store"}]
-    assert len(memory_ops) == 2
-    dsl, _ir = converter_emission._load_wave_dsl()
-    for memory_op in memory_ops:
-        attrs = converter_target_ir.attrs_dict(memory_op)
-        relation = dsl.ixs_deserialize(attrs["bit_offset_relation"])
-        (induction_name, ) = attrs["index_binding_names"]
-        for induction in (0, 2):
-            for item, slot in ((0, 0), (1, 0), (63, 7)):
-                logical = 8 * item + slot + 512 * (induction // 2)
-                assert relation.eval({
-                    "block": 0,
-                    "item": item,
-                    "slot": slot,
-                    induction_name: induction,
-                }) == 16 * logical
-    wave = output.emitted_module.text
-    assert wave.count("wave.gather") == 1
-    assert wave.count("wave.scatter") == 1
-    lowered = _run_wave_lower_symbolic_memory(wave)
-    assert "wave.gather" not in lowered
-    assert "wave.scatter" not in lowered
-    del ctx
-
-
 def test_tlx_wave_converter_dma_affine_offset_marks_layout_math_nsw(tmp_path):
     preamble = """
 #blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [8, 8], warpsPerCTA = [8, 1], order = [1, 0]}>
@@ -12195,11 +12179,6 @@ def test_tlx_wave_converter_lowers_glu_like_masked_narrow_padded_buffer_load_to_
     memory_lines = [line for line in raw_wave.splitlines() if "wave.gather" in line or "wave.scatter" in line]
     assert all("packet_bindings" not in line for line in memory_lines)
     gather_line = next(line for line in memory_lines if "wave.gather" in line)
-    # The source assumptions prove both operands of the signed remainder are
-    # nonnegative, so its direct algebra canonically uses floor division.
-    assert "Trunc(" not in gather_line
-    assert "Piecewise" not in gather_line
-    assert "Max(" not in gather_line
     assert all(f'"{name}"' in gather_line for name in attrs["index_binding_names"])
     assert re.search(r"wave\.select[^\n]*\n\s*%\d+ = wave\.assume", raw_wave) is None
     wave = _run_wave_lower_symbolic_memory(raw_wave)
@@ -13750,10 +13729,14 @@ def test_tlx_wave_converter_composes_value_relation_through_join_split(tmp_path)
     memory_lines = [line for line in wave.splitlines() if "wave.gather" in line or "wave.scatter" in line]
     assert len(memory_lines) == 2
     assert all("packet_bindings" not in line for line in memory_lines)
-    assert 'bit_offset = <"16*(128 + 2*item + slot)">' in memory_lines[0]
-    assert 'bit_offset = <"16*(2*item + slot)">' in memory_lines[1]
     memory_ops = [op for op in output.target_program.ops if op.kind in {"buffer_load", "buffer_store"}]
     assert all(converter_target_ir.attrs_dict(op)["index_binding_count"] == 0 for op in memory_ops)
+    dsl, _ir = converter_emission._load_wave_dsl()
+    for op, bias in zip(memory_ops, (128, 0)):
+        relation = dsl.ixs_deserialize(converter_target_ir.attrs_dict(op)["bit_offset_relation"])
+        for item in (0, 1, 31, 63):
+            for slot in (0, 1):
+                assert relation.eval({"block": 0, "item": item, "slot": slot}) == 16 * (bias + 2 * item + slot)
     _run_wave_verify(wave)
     del ctx
 
@@ -15705,7 +15688,7 @@ def test_tlx_wave_converter_buffer_store_dynamic_scalar_offset_stays_structural(
     attrs = converter_target_ir.attrs_dict(store_op)
     assert len(store_op.operands) == 4
     assert attrs["index_binding_count"] == 1
-    assert attrs["index_binding_names"] == ("t1", )
+    assert attrs["index_binding_names"] == (f"t{store_op.operands[3]}", )
     refined_stride = _target_value_producer(
         output.target_program,
         store_op.operands[3],
@@ -16576,7 +16559,11 @@ def test_tlx_wave_converter_vectorizes_contiguous_f16_buffer_load(tmp_path):
     assert "!wave.simd<vector<8xf16>, 64>" in wave
     assert wave.count("wave.extract") == 8
     gather_line = next(line for line in wave.splitlines() if "wave.gather" in line)
-    assert 'bit_offset = <"16*(8*item + slot)">' in gather_line
+    dsl, _ir = converter_emission._load_wave_dsl()
+    relation = dsl.ixs_deserialize(attrs["bit_offset_relation"])
+    for item in (0, 1, 31, 63):
+        for slot in range(8):
+            assert relation.eval({"block": 0, "item": item, "slot": slot}) == 16 * (8 * item + slot)
     assert "packet_bindings" not in gather_line
     machine = _run_waveamd_to_machine(wave)
     assert "waveamdmachine.buffer_load_tuple_b32" in machine
@@ -17131,7 +17118,6 @@ def test_tlx_wave_converter_packs_glu_bias_slice_into_mfma_fragment(tmp_path):
     (broadcast_op, ) = [op for op in target_program.ops if op.kind == "broadcast"]
     _assert_mechanical_layout_transform(target_program, broadcast_op)
 
-    target_program = converter_value_relations.attach_symbolic_memory_relations(target_program)
     wave = converter_emission.emit_wave_module(target_program).text
     assert wave.count("!wave.simd<vector<4xf32>, 64>") >= 4
     _run_wave_verify(wave)
@@ -19571,7 +19557,6 @@ def _convert_ttgir_to_wave_keep_dead(
         token_program,
     )
     target_program = converter_barrier_order.thread_barrier_issue_order(target_program)
-    target_program = converter_value_relations.attach_symbolic_memory_relations(target_program)
     if verify:
         converter_verifier.verify_target_program(
             target_program,

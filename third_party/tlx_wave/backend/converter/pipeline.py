@@ -10,7 +10,6 @@ from . import source_import
 from . import target_ir
 from . import tokens
 from . import types
-from . import value_relations
 from . import verifier
 
 
@@ -49,7 +48,6 @@ def convert_ttgir_to_wave(
         contract=target_ir.TargetContract(enable_fp_fusion=bool(enable_fp_fusion), ),
     )
     target_program = barrier_order.thread_barrier_issue_order(target_program)
-    target_program = value_relations.attach_symbolic_memory_relations(target_program)
     if verify:
         verifier.verify_target_program(
             target_program,

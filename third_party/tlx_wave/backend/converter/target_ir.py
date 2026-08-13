@@ -183,6 +183,10 @@ class TargetBuilder:
         self.layouts = tuple(layouts)
         self.assumptions = ()
         self.contract = contract or TargetContract()
+        # Conversion-only exact integer relations. They are consumed while
+        # building memory operations and are not part of the target schema.
+        self.value_relations = {}
+        self.pointer_relations = {}
 
     @property
     def current_region_id(self):
