@@ -92,10 +92,16 @@ def _attn_fwd_subtile(
     qk = tl.dot(
         q,
         k,
-        attrs=({"channels": [
-            "opndA,smem,1,2",
-            "opndD,tmem,1,0",
-        ]} if MMA_SLICES == 2 else None),
+        attrs=({
+            "channels": [
+                "opndA,smem,1,2",
+                "opndD,tmem,1,0",
+            ],
+            "two_cta_interleave_role": "qk" if TWO_CTAS else None,
+            "two_cta_tma_direct_wait": TWO_CTAS,
+            "two_cta_fuse_final_stats": TWO_CTAS,
+            "two_cta_fuse_acc_slices": TWO_CTAS,
+        } if MMA_SLICES == 2 else None),
         two_ctas=TWO_CTAS,
     )
 
@@ -151,14 +157,24 @@ def _attn_fwd_subtile(
             ps[0],
             v0,
             acc,
-            attrs={"channels": ["opndA,tmem,1,0,0"]},
+            attrs={
+                "two_cta_interleave_role": "pv" if TWO_CTAS else None,
+                "channels": ["opndA,tmem,1,0,0"],
+            },
             two_ctas=TWO_CTAS,
         )
         acc = tl.dot(
             ps[1],
             v1,
             acc,
-            attrs={"channels": ["opndA,tmem,1,0,64"]},
+            attrs={
+                "two_cta_interleave_role": "pv" if TWO_CTAS else None,
+                "channels": ["opndA,tmem,1,0,64"],
+                # ps[0] and ps[1] are adjacent slices of the same QK tile.
+                # The immediately preceding contraction has already
+                # rendezvoused both CTAs after that tile was produced.
+                "two_cta_sync_covered_by_prior": TWO_CTAS,
+            },
             two_ctas=TWO_CTAS,
         )
     # update m_i and l_i
@@ -283,11 +299,11 @@ elif supports_host_descriptor():
     NUM_STAGES_OPTIONS = [3]
 else:
     NUM_STAGES_OPTIONS = [3]
-FWD_2CTA_NUM_STAGES = int(os.environ.get("AUTOWS_FWD_NUM_STAGES", "5"))
+FWD_2CTA_NUM_STAGES = int(os.environ.get("AUTOWS_FWD_NUM_STAGES", "4"))
 FWD_2CTA_BLOCK_M = int(os.environ.get("AUTOWS_FWD_BLOCK_M", "256"))
 FWD_2CTA_DP_FACTOR = int(os.environ.get("AUTOWS_FWD_DP_FACTOR", "2"))
 FWD_2CTA_MMA_SLICES = int(os.environ.get("AUTOWS_FWD_MMA_SLICES", "2"))
-FWD_2CTA_KV_NUM_STAGES = int(os.environ.get("AUTOWS_FWD_KV_NUM_STAGES", "5"))
+FWD_2CTA_KV_NUM_STAGES = int(os.environ.get("AUTOWS_FWD_KV_NUM_STAGES", "4"))
 FWD_2CTA_OUTER_NUM_STAGES = int(os.environ.get("AUTOWS_FWD_OUTER_NUM_STAGES", "1"))
 
 configs = [
@@ -450,7 +466,18 @@ def _attn_fwd_tma_dp(
         l_i0 = l_i0_0
 
     m_i0 += tl.math.log2(l_i0)
-    acc0 = acc0 / l_i0[:, None]
+    if NUM_CTAS == 2:
+        # Match the TLX epilogue's packed-f32 normalization. Keeping adjacent
+        # output columns paired avoids scalarizing the large accumulator tile.
+        BM: tl.constexpr = acc0.shape[0]
+        BN: tl.constexpr = acc0.shape[1]
+        scale = 1.0 / l_i0
+        acc0_0, acc0_1 = acc0.reshape([BM, 2, BN // 2]).permute(0, 2, 1).split()
+        acc0_0 = _mul_f32x2(acc0_0, scale[:, None])
+        acc0_1 = _mul_f32x2(acc0_1, scale[:, None])
+        acc0 = tl.join(acc0_0, acc0_1).permute(0, 2, 1).reshape([BM, BN])
+    else:
+        acc0 = acc0 / l_i0[:, None]
     m_ptrs0 = M + off_hz * N_CTX + offs_m0
     tl.store(m_ptrs0, m_i0)
     desc_o.store([qo_offset_y, 0], acc0.to(dtype))
@@ -589,25 +616,25 @@ def _attn_fwd_persist(
 
     tile_idx = prog_id
 
-    desc_q = tl.make_tensor_descriptor(
+    desc_q = _maybe_make_tensor_desc(
         desc_q,
         shape=[Z * H * N_CTX, HEAD_DIM],
         strides=[HEAD_DIM, 1],
         block_shape=[BLOCK_M, HEAD_DIM],
     )
-    desc_k = tl.make_tensor_descriptor(
+    desc_k = _maybe_make_tensor_desc(
         desc_k,
         shape=[Z * H * N_CTX, HEAD_DIM],
         strides=[HEAD_DIM, 1],
         block_shape=[BLOCK_N, HEAD_DIM],
     )
-    desc_v = tl.make_tensor_descriptor(
+    desc_v = _maybe_make_tensor_desc(
         desc_v,
         shape=[Z * H * N_CTX, HEAD_DIM],
         strides=[HEAD_DIM, 1],
         block_shape=[BLOCK_N // MMA_SLICES, HEAD_DIM],
     )
-    desc_o = tl.make_tensor_descriptor(
+    desc_o = _maybe_make_tensor_desc(
         desc_o,
         shape=[Z * H * N_CTX, HEAD_DIM],
         strides=[HEAD_DIM, 1],
@@ -1673,14 +1700,27 @@ class _attention_opt(torch.autograd.Function):
             SUBTILING = os.environ["AUTOWS_FWD_SUBTILING"] == "1"
         if "AUTOWS_FWD_VECT_MUL" in os.environ:
             VECT_MUL = int(os.environ["AUTOWS_FWD_VECT_MUL"])
+        elif _fwd_num_ctas == "2":
+            VECT_MUL = 3
         extra_kern_args = {}
 
         M = torch.empty((q.shape[0], q.shape[1], q.shape[2]), device=q.device, dtype=torch.float32)
         warp_specialize = os.environ.get("AUTOWS_FWD_WARP_SPECIALIZE", "1") == "1"
-        desc_q = q
-        desc_v = v
-        desc_k = k
-        desc_o = o
+        # The non-persistent 1-CTA schedule still relies on the in-kernel
+        # descriptor creation path. Use host descriptors only for the focused
+        # 2-CTA configuration until that independent schedule is converted.
+        if supports_host_descriptor() and _fwd_num_ctas == "2":
+            y_dim = q.shape[0] * q.shape[1] * q.shape[2]
+            dummy_block = [1, 1]
+            desc_q = TensorDescriptor(q, shape=[y_dim, HEAD_DIM_K], strides=[HEAD_DIM_K, 1], block_shape=dummy_block)
+            desc_v = TensorDescriptor(v, shape=[y_dim, HEAD_DIM_K], strides=[HEAD_DIM_K, 1], block_shape=dummy_block)
+            desc_k = TensorDescriptor(k, shape=[y_dim, HEAD_DIM_K], strides=[HEAD_DIM_K, 1], block_shape=dummy_block)
+            desc_o = TensorDescriptor(o, shape=[y_dim, HEAD_DIM_K], strides=[HEAD_DIM_K, 1], block_shape=dummy_block)
+        else:
+            desc_q = q
+            desc_v = v
+            desc_k = k
+            desc_o = o
 
         def alloc_fn(size: int, align: int, _):
             return torch.empty(size, dtype=torch.int8, device="cuda")

@@ -42,8 +42,11 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
       %5 = arith.truncf %4#0 {async_task_id = array<i32: 1, 2>} : tensor<128x256xf32, #mma> to tensor<128x256xf16, #mma>
       %6 = ttg.convert_layout %5 {async_task_id = array<i32: 1, 2>} : tensor<128x256xf16, #mma> -> tensor<128x256xf16, #blocked1>
       %7 = tt.splat %arg2 {async_task_id = array<i32: 1, 2>} : !tt.ptr<f16> -> tensor<128x256x!tt.ptr<f16>, #blocked1>
-     // CHECK: tt.store {{.*}} : tensor<64x256x!tt.ptr<f16>, #blocked1>
-     // CHECK: tt.store {{.*}} : tensor<64x256x!tt.ptr<f16>, #blocked1>
+     // Post-loop epilogue is serialized per partition too (truncf/convert/store,
+     // then the same for the other half). The printed layout alias depends on
+     // first-use order, so match either numbering.
+     // CHECK: tt.store {{.*}} : tensor<64x256x!tt.ptr<f16>, {{#blocked[0-9]*}}>
+     // CHECK: tt.store {{.*}} : tensor<64x256x!tt.ptr<f16>, {{#blocked[0-9]*}}>
      tt.store %7, %6 {async_task_id = array<i32: 1, 2>} : tensor<128x256x!tt.ptr<f16>, #blocked1>
     } {tt.data_partition_factor = 2 : i32}
     tt.return
