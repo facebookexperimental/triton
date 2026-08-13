@@ -24,11 +24,12 @@ The production entry point uses the same ABI as the 4-wave a4w4 kernel:
   * scales: e8m0 uint8, shapes (M, K // 32) and (N, K // 32), contiguous along M/N
   * C: bfloat16, shape (M, N)
 
-``matmul_preshuffled`` is a separate experimental ABI: A scales are packed by
-``preshuffle_mxfp4_a_scales`` and loaded directly into MFMA scale registers,
-while B scales retain the canonical DMA-to-LDS path. It is intentionally not
-selected by ``matmul`` because controlled measurements show that its longer
-scale live ranges outweigh the removed LDS traffic.
+``matmul_preshuffled`` is a separate experimental ABI: both scale operands are
+packed into their LDS-consumer order and retain the production DMA-to-LDS
+pipeline.  The full 256-row A scale tile is read once, then split into its two
+128-row MFMA fragments; this is intended to coalesce the two canonical
+``ds_read_b64_tr_b8`` operations into one ``ds_read_b128``.  It remains outside
+``matmul`` because its flat, prepacked scale buffers are a distinct caller ABI.
 
 The Shape:Stride register/blocked/accumulator layouts below encode the gfx950
 16x16x128 scaled-MFMA / dot-operand / scale distributions, and are
@@ -133,7 +134,7 @@ def _a4w4_8wave_kernel(
     NUM_XCDS: tl.constexpr,
     GRID_MN: tl.constexpr,
     SPLIT_K: tl.constexpr,
-    PRESHUFFLED_A_SCALES: tl.constexpr = False,
+    PRESHUFFLED_SCALES: tl.constexpr = False,
 ):
     SCALE_GROUP_SIZE: tl.constexpr = 32
     HALF_M: tl.constexpr = BLOCK_M // 2  # 128
@@ -184,6 +185,17 @@ def _a4w4_8wave_kernel(
         block_bases=[],
         alignment=16,
     )
+    # Experimental scale ABI.  Its physical low bits are exactly the value
+    # bases consumed by each wave.  In particular the combined A tile puts
+    # (group bit 2, row bits 5, 6, 7) in adjacent bytes, so one ordinary
+    # 128-bit LDS transaction produces both 128-row A scale fragments.
+    shared_scale_preshuffled: tl.constexpr = tlx.shared_linear_layout_encoding(
+        offset_bases=[
+            [1], [2], [4], [8], [16], [32], [64], [128], [256], [512], [1024],
+        ],
+        block_bases=[],
+        alignment=16,
+    )
     # Match each scale tile's physical shared offset order: two 4-byte value
     # bits, six lane bits, then warp bits. The XOR bases live entirely in the
     # warp mapping, so TLX resolves these to #ttg.generic_linear and gfx9 can
@@ -196,10 +208,24 @@ def _a4w4_8wave_kernel(
         shape=((2, 2, 2, 2, 2, 2, 2, 2, 2), (2, 2)),
         stride=((32, 64, 128, 256, 512, 1024, 129, 2, 260), (8, 16)),
     )
+    # Four byte values per thread stage each 256x8 preshuffled tile.  The value
+    # bases are physical bits 0 and 1; the remaining physical bits are assigned
+    # across the 512 CTA threads.
+    scale_load_preshuffled_layout: tl.constexpr = tlx.layout(
+        shape=((2, 2, 2, 2, 2, 2, 2, 2, 2), (2, 2)),
+        stride=((4, 8, 16, 32, 64, 128, 256, 512, 1024), (1, 2)),
+    )
+    preshuffled_scale_shape: tl.constexpr = [2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2]
+    preshuffled_a_to_logical: tl.constexpr = (7, 8, 9, 4, 5, 6, 2, 3, 10, 0, 1)
+    preshuffled_b_to_logical: tl.constexpr = (8, 9, 2, 4, 5, 6, 7, 3, 10, 0, 1)
     # ---- MFMA scale register layouts (get_mfma_scale_layout) ----
     scale_a_layout: tl.constexpr = tlx.layout(
         shape=((2, 2, 2, 2, 2, 2, 2, 2, 2), (2, 2, 2)),
         stride=((8, 16, 32, 64, 1, 2, 0, 0, 128), (4, 256, 512)),
+    )
+    scale_a_comb_layout: tl.constexpr = tlx.layout(
+        shape=((2, 2, 2, 2, 2, 2, 2, 2, 2), (2, 2, 2, 2)),
+        stride=((8, 16, 32, 64, 1, 2, 0, 0, 128), (4, 256, 512, 1024)),
     )
     scale_b_layout: tl.constexpr = tlx.layout(
         shape=((2, 2, 2, 2, 2, 2, 2, 2, 2), (2, 2)),
@@ -250,15 +276,22 @@ def _a4w4_8wave_kernel(
         pid_m = first_pid_m + (pid % num_pid_in_group) % group_size_m
         pid_n = (pid % num_pid_in_group) // group_size_m
 
-    # Four double-buffered operand half-tiles + A-scale halves + combined B scale.
+    # Four double-buffered operand half-tiles plus scale tiles.  The canonical
+    # path keeps separate A halves; the experimental ABI stages one combined A
+    # tile so its consumer can issue a single 128-bit read.
     smem_a_top = tlx.local_alloc((HALF_M, HALF_K), tlx.dtype_of(a_ptr), 2, layout=shared_tile)
     smem_a_bot = tlx.local_alloc((HALF_M, HALF_K), tlx.dtype_of(a_ptr), 2, layout=shared_tile)
     smem_b_left = tlx.local_alloc((HALF_N, HALF_K), tlx.dtype_of(b_ptr), 2, layout=shared_tile)
     smem_b_right = tlx.local_alloc((HALF_N, HALF_K), tlx.dtype_of(b_ptr), 2, layout=shared_tile)
-    if not PRESHUFFLED_A_SCALES:
+    if PRESHUFFLED_SCALES:
+        smem_a_sc = tlx.local_alloc(
+            (BLOCK_M * NG, ), tlx.dtype_of(a_scales_ptr), 2, layout=shared_scale_preshuffled)
+        smem_b_sc = tlx.local_alloc(
+            (BLOCK_N * NG, ), tlx.dtype_of(b_scales_ptr), 2, layout=shared_scale_preshuffled)
+    else:
         smem_a_sc_t = tlx.local_alloc((HALF_M, NG), tlx.dtype_of(a_scales_ptr), 2, layout=shared_a_scales)
         smem_a_sc_b = tlx.local_alloc((HALF_M, NG), tlx.dtype_of(a_scales_ptr), 2, layout=shared_a_scales)
-    smem_b_sc = tlx.local_alloc((BLOCK_N, NG), tlx.dtype_of(b_scales_ptr), 2, layout=shared_b_scales)
+        smem_b_sc = tlx.local_alloc((BLOCK_N, NG), tlx.dtype_of(b_scales_ptr), 2, layout=shared_b_scales)
 
     # ---- fp4 tile load offsets ([128,128]) ----
     offs_am = tl.arange(0, HALF_M)
@@ -271,45 +304,34 @@ def _a4w4_8wave_kernel(
     b_tile_offsets = tlx.require_layout(offs_bn[:, None] * stride_bn + offs_bk[None, :] * stride_bk, g_load_layout)
     b_base = b_ptr + pid_n * BLOCK_N * stride_bn
 
-    # ---- A scale load offsets ([128,8]) ----
+    # ---- A scale load offsets ----
     offs_ks_a = tl.arange(0, NG)
-    offs_asm = pid_m * BLOCK_M + tl.arange(0, HALF_M)
-    if PRESHUFFLED_A_SCALES:
-        # Match the first scale operand in AITER's kernel: row/group low bits
-        # select the lane, row bit 4 selects the M wave, and (group bit 2,
-        # row bits 5..6) select eight consecutive register bytes. Row bit 7
-        # selects the top/bottom 128-row half.
-        a_sc_offsets = (
-            (offs_asm[:, None] // 256 * SCALE_GROUP_BLOCKS) * 2048
-            + (offs_asm[:, None] % 256) // 128 * 1024
-            + (((offs_asm[:, None] % 32) // 16) * 64
-               + (offs_ks_a[None, :] % 4) * 16
-               + offs_asm[:, None] % 16) * 8
-            + (offs_asm[:, None] % 128) // 32 * 2
-            + offs_ks_a[None, :] // 4
-        )
-        a_sc_offsets = tlx.require_layout(a_sc_offsets, scale_a_layout)
+    if PRESHUFFLED_SCALES:
+        a_sc_offsets = tlx.require_layout(tl.arange(0, BLOCK_M * NG), scale_load_preshuffled_layout)
     else:
+        offs_asm = pid_m * BLOCK_M + tl.arange(0, HALF_M)
         a_sc_offsets = tl.mul(offs_asm[:, None], stride_asm, sanitize_overflow=False) + tl.mul(
             offs_ks_a[None, :], stride_ask, sanitize_overflow=False)
         a_sc_offsets = tlx.require_layout(a_sc_offsets, scale_load_a_layout)
 
     # ---- B scale load offsets: FULL [256,8] in one copy ----
     offs_ks_b = tl.arange(0, NG)
-    offs_bsn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    b_sc_offsets = tl.mul(offs_bsn[:, None], stride_bsn, sanitize_overflow=False) + tl.mul(
-        offs_ks_b[None, :], stride_bsk, sanitize_overflow=False)
-    b_sc_offsets = tlx.require_layout(b_sc_offsets, scale_load_b_layout)
+    if PRESHUFFLED_SCALES:
+        b_sc_offsets = tlx.require_layout(tl.arange(0, BLOCK_N * NG), scale_load_preshuffled_layout)
+    else:
+        offs_bsn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        b_sc_offsets = tl.mul(offs_bsn[:, None], stride_bsn, sanitize_overflow=False) + tl.mul(
+            offs_ks_b[None, :], stride_bsk, sanitize_overflow=False)
+        b_sc_offsets = tlx.require_layout(b_sc_offsets, scale_load_b_layout)
 
     # Scalar (uniform) base-pointer deltas for the quadrant / K-buffer variants.
     a_half_m = HALF_M * stride_am  # a_top -> a_bot
     b_half_n = HALF_N * stride_bn  # b_left -> b_right
     a_k2 = HALF_K * stride_ak  # even -> odd (_next) K-step
     b_k2 = HALF_K * stride_bk
-    if PRESHUFFLED_A_SCALES:
-        a_sc_half_m: tl.constexpr = 1024
+    if PRESHUFFLED_SCALES:
         a_sc_k: tl.constexpr = 2048
-        b_sc_k = NG * stride_bsk
+        b_sc_k: tl.constexpr = 2048
     else:
         a_sc_half_m = HALF_M * stride_asm
         a_sc_k = NG * stride_ask
@@ -321,9 +343,11 @@ def _a4w4_8wave_kernel(
     # fat pointer as it already does for the pid_m/pid_n base offsets.
     a_base += split_id * KS_PACKED * stride_ak
     b_base += split_id * KS_PACKED * stride_bk
-    if PRESHUFFLED_A_SCALES:
+    if PRESHUFFLED_SCALES:
+        a_scales_ptr += pid_m * SCALE_GROUP_BLOCKS * 2048
+        b_scales_ptr += pid_n * SCALE_GROUP_BLOCKS * 2048
         a_scales_ptr += split_id * (KS_SCALE // NG) * 2048
-        b_scales_ptr += split_id * KS_SCALE * stride_bsk
+        b_scales_ptr += split_id * (KS_SCALE // NG) * 2048
     else:
         a_scales_ptr += split_id * KS_SCALE * stride_ask
         b_scales_ptr += split_id * KS_SCALE * stride_bsk
@@ -344,17 +368,13 @@ def _a4w4_8wave_kernel(
     tlx.buffer_load_to_local(smem_b_sc[0], b_scales_ptr, b_sc_offsets)
     tlx.async_load_commit_group()
     tlx.buffer_load_to_local(smem_a_top[0], a_base, a_tile_offsets)
-    if PRESHUFFLED_A_SCALES:
-        a_sc_top0 = tlx.buffer_load(a_scales_ptr, a_sc_offsets, contiguity=8)
-        a_sc_top0 = tlx.require_layout(a_sc_top0, scale_a_layout)
+    if PRESHUFFLED_SCALES:
+        tlx.buffer_load_to_local(smem_a_sc[0], a_scales_ptr, a_sc_offsets)
     else:
         tlx.buffer_load_to_local(smem_a_sc_t[0], a_scales_ptr, a_sc_offsets)
     tlx.async_load_commit_group()
     tlx.buffer_load_to_local(smem_a_bot[0], a_base + a_half_m, a_tile_offsets)
-    if PRESHUFFLED_A_SCALES:
-        a_sc_bot0 = tlx.buffer_load(a_scales_ptr + a_sc_half_m, a_sc_offsets, contiguity=8)
-        a_sc_bot0 = tlx.require_layout(a_sc_bot0, scale_a_layout)
-    else:
+    if not PRESHUFFLED_SCALES:
         tlx.buffer_load_to_local(smem_a_sc_b[0], a_scales_ptr + a_sc_half_m, a_sc_offsets)
     tlx.async_load_commit_group()
     tlx.buffer_load_to_local(smem_b_right[0], b_base + b_half_n, b_tile_offsets)
@@ -364,17 +384,13 @@ def _a4w4_8wave_kernel(
     tlx.buffer_load_to_local(smem_b_sc[1], b_scales_ptr + b_sc_k, b_sc_offsets)
     tlx.async_load_commit_group()
     tlx.buffer_load_to_local(smem_a_top[1], a_base + a_k2, a_tile_offsets)
-    if PRESHUFFLED_A_SCALES:
-        a_sc_top1 = tlx.buffer_load(a_scales_ptr + a_sc_k, a_sc_offsets, contiguity=8)
-        a_sc_top1 = tlx.require_layout(a_sc_top1, scale_a_layout)
+    if PRESHUFFLED_SCALES:
+        tlx.buffer_load_to_local(smem_a_sc[1], a_scales_ptr + a_sc_k, a_sc_offsets)
     else:
         tlx.buffer_load_to_local(smem_a_sc_t[1], a_scales_ptr + a_sc_k, a_sc_offsets)
     tlx.async_load_commit_group()
     tlx.buffer_load_to_local(smem_a_bot[1], a_base + a_half_m + a_k2, a_tile_offsets)
-    if PRESHUFFLED_A_SCALES:
-        a_sc_bot1 = tlx.buffer_load(a_scales_ptr + a_sc_half_m + a_sc_k, a_sc_offsets, contiguity=8)
-        a_sc_bot1 = tlx.require_layout(a_sc_bot1, scale_a_layout)
-    else:
+    if not PRESHUFFLED_SCALES:
         tlx.buffer_load_to_local(smem_a_sc_b[1], a_scales_ptr + a_sc_half_m + a_sc_k, a_sc_offsets)
     tlx.async_load_commit_group()
     tlx.buffer_load_to_local(smem_b_right[1], b_base + b_half_n + b_k2, b_tile_offsets)
@@ -388,11 +404,23 @@ def _a4w4_8wave_kernel(
     tlx.async_load_wait_group(6)
     b_left = tlx.local_load(tlx.local_trans(smem_b_left[0]), relaxed=True)
     a_top = tlx.local_load(smem_a_top[0], relaxed=True)
-    if PRESHUFFLED_A_SCALES:
-        a_sc_top = a_sc_top0
+    if PRESHUFFLED_SCALES:
+        a_sc_view_init = tlx.local_reshape(smem_a_sc[0], preshuffled_scale_shape)
+        a_sc_view_init = tlx.local_trans(a_sc_view_init, preshuffled_a_to_logical)
+        a_sc_view_init = tlx.local_reshape(a_sc_view_init, [BLOCK_M, NG])
+        a_sc_comb = tlx.local_load(a_sc_view_init, layout=scale_a_comb_layout, relaxed=True)
+        a_sc_t, a_sc_b = tl.split(tl.trans(tl.reshape(a_sc_comb, 2, HALF_M, NG), 1, 2, 0))
+        a_sc_top = tlx.require_layout(a_sc_t, scale_a_layout)
+        a_sc_bot0 = tlx.require_layout(a_sc_b, scale_a_layout)
     else:
         a_sc_top = tlx.local_load(smem_a_sc_t[0], layout=scale_a_layout)
-    b_sc_comb = tlx.local_load(smem_b_sc[0], layout=scale_b_comb_layout)
+    if PRESHUFFLED_SCALES:
+        b_sc_view_init = tlx.local_reshape(smem_b_sc[0], preshuffled_scale_shape)
+        b_sc_view_init = tlx.local_trans(b_sc_view_init, preshuffled_b_to_logical)
+        b_sc_view_init = tlx.local_reshape(b_sc_view_init, [BLOCK_N, NG])
+        b_sc_comb = tlx.local_load(b_sc_view_init, layout=scale_b_comb_layout, relaxed=True)
+    else:
+        b_sc_comb = tlx.local_load(smem_b_sc[0], layout=scale_b_comb_layout)
     b_sc_l, b_sc_r = tl.split(tl.trans(tl.reshape(b_sc_comb, 2, HALF_N, NG), 1, 2, 0))
     b_sc_left = tlx.require_layout(b_sc_l, scale_b_layout)
     b_sc_right = tlx.require_layout(b_sc_r, scale_b_layout)
@@ -405,7 +433,7 @@ def _a4w4_8wave_kernel(
             acc_tl = tl.dot_scaled(a_top, a_sc_top, "e2m1", b_left, b_sc_left, "e2m1", acc_tl)
         with tlx.warp_pipeline_stage("mem", priority=1):
             a_bot = tlx.local_load(smem_a_bot[0], relaxed=True)
-            if PRESHUFFLED_A_SCALES:
+            if PRESHUFFLED_SCALES:
                 a_sc_bot = a_sc_bot0
             else:
                 a_sc_bot = tlx.local_load(smem_a_sc_b[0], layout=scale_a_layout)
@@ -421,9 +449,8 @@ def _a4w4_8wave_kernel(
             b_right = tlx.local_load(tlx.local_trans(smem_b_right[0]), relaxed=True)
             tlx.amd_sched_barrier(0)  # keep ds_read(local_load) ahead of the global loads
             tlx.buffer_load_to_local(smem_a_top[0], a_base, a_tile_offsets)
-            if PRESHUFFLED_A_SCALES:
-                a_sc_next_top0 = tlx.buffer_load(a_scales_ptr, a_sc_offsets, contiguity=8)
-                a_sc_next_top0 = tlx.require_layout(a_sc_next_top0, scale_a_layout)
+            if PRESHUFFLED_SCALES:
+                tlx.buffer_load_to_local(smem_a_sc[0], a_scales_ptr, a_sc_offsets)
             else:
                 tlx.buffer_load_to_local(smem_a_sc_t[0], a_scales_ptr, a_sc_offsets)
             tlx.async_load_commit_group()
@@ -435,10 +462,7 @@ def _a4w4_8wave_kernel(
             b_left = tlx.local_load(tlx.local_trans(smem_b_left[1]), relaxed=True)
             tlx.amd_sched_barrier(0)  # keep ds_read(local_load) ahead of the global loads
             tlx.buffer_load_to_local(smem_a_bot[0], a_base + a_half_m, a_tile_offsets)
-            if PRESHUFFLED_A_SCALES:
-                a_sc_next_bot0 = tlx.buffer_load(a_scales_ptr + a_sc_half_m, a_sc_offsets, contiguity=8)
-                a_sc_next_bot0 = tlx.require_layout(a_sc_next_bot0, scale_a_layout)
-            else:
+            if not PRESHUFFLED_SCALES:
                 tlx.buffer_load_to_local(smem_a_sc_b[0], a_scales_ptr + a_sc_half_m, a_sc_offsets)
             tlx.async_load_commit_group()
 
@@ -447,11 +471,23 @@ def _a4w4_8wave_kernel(
             acc_br = tl.dot_scaled(a_bot, a_sc_bot, "e2m1", b_right, b_sc_right, "e2m1", acc_br)
         with tlx.warp_pipeline_stage("mem", priority=1):
             a_top = tlx.local_load(smem_a_top[1], relaxed=True)
-            if PRESHUFFLED_A_SCALES:
-                a_sc_top = a_sc_top1
+            if PRESHUFFLED_SCALES:
+                a_sc_view_1 = tlx.local_reshape(smem_a_sc[1], preshuffled_scale_shape)
+                a_sc_view_1 = tlx.local_trans(a_sc_view_1, preshuffled_a_to_logical)
+                a_sc_view_1 = tlx.local_reshape(a_sc_view_1, [BLOCK_M, NG])
+                a_sc_comb = tlx.local_load(a_sc_view_1, layout=scale_a_comb_layout, relaxed=True)
+                a_sc_t, a_sc_b = tl.split(tl.trans(tl.reshape(a_sc_comb, 2, HALF_M, NG), 1, 2, 0))
+                a_sc_top = tlx.require_layout(a_sc_t, scale_a_layout)
+                a_sc_bot1 = tlx.require_layout(a_sc_b, scale_a_layout)
             else:
                 a_sc_top = tlx.local_load(smem_a_sc_t[1], layout=scale_a_layout)
-            b_sc_comb = tlx.local_load(smem_b_sc[1], layout=scale_b_comb_layout)
+            if PRESHUFFLED_SCALES:
+                b_sc_view_1 = tlx.local_reshape(smem_b_sc[1], preshuffled_scale_shape)
+                b_sc_view_1 = tlx.local_trans(b_sc_view_1, preshuffled_b_to_logical)
+                b_sc_view_1 = tlx.local_reshape(b_sc_view_1, [BLOCK_N, NG])
+                b_sc_comb = tlx.local_load(b_sc_view_1, layout=scale_b_comb_layout, relaxed=True)
+            else:
+                b_sc_comb = tlx.local_load(smem_b_sc[1], layout=scale_b_comb_layout)
             b_sc_l, b_sc_r = tl.split(tl.trans(tl.reshape(b_sc_comb, 2, HALF_N, NG), 1, 2, 0))
             b_sc_left = tlx.require_layout(b_sc_l, scale_b_layout)
             b_sc_right = tlx.require_layout(b_sc_r, scale_b_layout)
@@ -465,7 +501,7 @@ def _a4w4_8wave_kernel(
             acc_tl = tl.dot_scaled(a_top, a_sc_top, "e2m1", b_left, b_sc_left, "e2m1", acc_tl)
         with tlx.warp_pipeline_stage("mem", priority=1):
             a_bot = tlx.local_load(smem_a_bot[1], relaxed=True)
-            if PRESHUFFLED_A_SCALES:
+            if PRESHUFFLED_SCALES:
                 a_sc_bot = a_sc_bot1
             else:
                 a_sc_bot = tlx.local_load(smem_a_sc_b[1], layout=scale_a_layout)
@@ -481,9 +517,8 @@ def _a4w4_8wave_kernel(
             b_right = tlx.local_load(tlx.local_trans(smem_b_right[1]), relaxed=True)
             tlx.amd_sched_barrier(0)  # keep ds_read(local_load) ahead of the global loads
             tlx.buffer_load_to_local(smem_a_top[1], a_base + a_k2, a_tile_offsets)
-            if PRESHUFFLED_A_SCALES:
-                a_sc_next_top1 = tlx.buffer_load(a_scales_ptr + a_sc_k, a_sc_offsets, contiguity=8)
-                a_sc_next_top1 = tlx.require_layout(a_sc_next_top1, scale_a_layout)
+            if PRESHUFFLED_SCALES:
+                tlx.buffer_load_to_local(smem_a_sc[1], a_scales_ptr + a_sc_k, a_sc_offsets)
             else:
                 tlx.buffer_load_to_local(smem_a_sc_t[1], a_scales_ptr + a_sc_k, a_sc_offsets)
             tlx.async_load_commit_group()
@@ -495,11 +530,7 @@ def _a4w4_8wave_kernel(
             b_left = tlx.local_load(tlx.local_trans(smem_b_left[0]), relaxed=True)
             tlx.amd_sched_barrier(0)  # keep ds_read(local_load) ahead of the global loads
             tlx.buffer_load_to_local(smem_a_bot[1], a_base + a_half_m + a_k2, a_tile_offsets)
-            if PRESHUFFLED_A_SCALES:
-                a_sc_next_bot1 = tlx.buffer_load(
-                    a_scales_ptr + a_sc_half_m + a_sc_k, a_sc_offsets, contiguity=8)
-                a_sc_next_bot1 = tlx.require_layout(a_sc_next_bot1, scale_a_layout)
-            else:
+            if not PRESHUFFLED_SCALES:
                 tlx.buffer_load_to_local(smem_a_sc_b[1], a_scales_ptr + a_sc_half_m + a_sc_k, a_sc_offsets)
             tlx.async_load_commit_group()
 
@@ -508,14 +539,23 @@ def _a4w4_8wave_kernel(
             acc_br = tl.dot_scaled(a_bot, a_sc_bot, "e2m1", b_right, b_sc_right, "e2m1", acc_br)
         with tlx.warp_pipeline_stage("mem", priority=1):
             a_top = tlx.local_load(smem_a_top[0], relaxed=True)
-            if PRESHUFFLED_A_SCALES:
-                a_sc_top = a_sc_next_top0
-                a_sc_bot0 = a_sc_next_bot0
-                a_sc_top1 = a_sc_next_top1
-                a_sc_bot1 = a_sc_next_bot1
+            if PRESHUFFLED_SCALES:
+                a_sc_view_0 = tlx.local_reshape(smem_a_sc[0], preshuffled_scale_shape)
+                a_sc_view_0 = tlx.local_trans(a_sc_view_0, preshuffled_a_to_logical)
+                a_sc_view_0 = tlx.local_reshape(a_sc_view_0, [BLOCK_M, NG])
+                a_sc_comb = tlx.local_load(a_sc_view_0, layout=scale_a_comb_layout, relaxed=True)
+                a_sc_t, a_sc_b = tl.split(tl.trans(tl.reshape(a_sc_comb, 2, HALF_M, NG), 1, 2, 0))
+                a_sc_top = tlx.require_layout(a_sc_t, scale_a_layout)
+                a_sc_bot0 = tlx.require_layout(a_sc_b, scale_a_layout)
             else:
                 a_sc_top = tlx.local_load(smem_a_sc_t[0], layout=scale_a_layout)
-            b_sc_comb = tlx.local_load(smem_b_sc[0], layout=scale_b_comb_layout)
+            if PRESHUFFLED_SCALES:
+                b_sc_view_0 = tlx.local_reshape(smem_b_sc[0], preshuffled_scale_shape)
+                b_sc_view_0 = tlx.local_trans(b_sc_view_0, preshuffled_b_to_logical)
+                b_sc_view_0 = tlx.local_reshape(b_sc_view_0, [BLOCK_N, NG])
+                b_sc_comb = tlx.local_load(b_sc_view_0, layout=scale_b_comb_layout, relaxed=True)
+            else:
+                b_sc_comb = tlx.local_load(smem_b_sc[0], layout=scale_b_comb_layout)
             b_sc_l, b_sc_r = tl.split(tl.trans(tl.reshape(b_sc_comb, 2, HALF_N, NG), 1, 2, 0))
             b_sc_left = tlx.require_layout(b_sc_l, scale_b_layout)
             b_sc_right = tlx.require_layout(b_sc_r, scale_b_layout)
@@ -533,7 +573,7 @@ def _a4w4_8wave_kernel(
     tlx.async_load_wait_group(5)
     l_idx: tl.constexpr = 0  # (iter_max - 2) % 2, always 0 (iter_max even)
     a_bot = tlx.local_load(tlx.local_view(smem_a_bot, l_idx), relaxed=True)
-    if PRESHUFFLED_A_SCALES:
+    if PRESHUFFLED_SCALES:
         a_sc_bot = a_sc_bot0
     else:
         a_sc_bot = tlx.local_load(smem_a_sc_b[l_idx], layout=scale_a_layout)
@@ -550,11 +590,23 @@ def _a4w4_8wave_kernel(
     acc_br = tl.dot_scaled(a_bot, a_sc_bot, "e2m1", b_right, b_sc_right, "e2m1", acc_br)
     tlx.async_load_wait_group(2)
     a_top = tlx.local_load(tlx.local_view(smem_a_top, g_idx), relaxed=True)
-    if PRESHUFFLED_A_SCALES:
-        a_sc_top = a_sc_top1
+    if PRESHUFFLED_SCALES:
+        a_sc_view_epilogue = tlx.local_reshape(smem_a_sc[g_idx], preshuffled_scale_shape)
+        a_sc_view_epilogue = tlx.local_trans(a_sc_view_epilogue, preshuffled_a_to_logical)
+        a_sc_view_epilogue = tlx.local_reshape(a_sc_view_epilogue, [BLOCK_M, NG])
+        a_sc_comb = tlx.local_load(a_sc_view_epilogue, layout=scale_a_comb_layout, relaxed=True)
+        a_sc_t, a_sc_b = tl.split(tl.trans(tl.reshape(a_sc_comb, 2, HALF_M, NG), 1, 2, 0))
+        a_sc_top = tlx.require_layout(a_sc_t, scale_a_layout)
+        a_sc_bot1 = tlx.require_layout(a_sc_b, scale_a_layout)
     else:
         a_sc_top = tlx.local_load(smem_a_sc_t[g_idx], layout=scale_a_layout)
-    b_sc_comb = tlx.local_load(smem_b_sc[g_idx], layout=scale_b_comb_layout)
+    if PRESHUFFLED_SCALES:
+        b_sc_view_epilogue = tlx.local_reshape(smem_b_sc[g_idx], preshuffled_scale_shape)
+        b_sc_view_epilogue = tlx.local_trans(b_sc_view_epilogue, preshuffled_b_to_logical)
+        b_sc_view_epilogue = tlx.local_reshape(b_sc_view_epilogue, [BLOCK_N, NG])
+        b_sc_comb = tlx.local_load(b_sc_view_epilogue, layout=scale_b_comb_layout, relaxed=True)
+    else:
+        b_sc_comb = tlx.local_load(smem_b_sc[g_idx], layout=scale_b_comb_layout)
     b_sc_l, b_sc_r = tl.split(tl.trans(tl.reshape(b_sc_comb, 2, HALF_N, NG), 1, 2, 0))
     b_sc_left = tlx.require_layout(b_sc_l, scale_b_layout)
     b_sc_right = tlx.require_layout(b_sc_r, scale_b_layout)
@@ -563,7 +615,7 @@ def _a4w4_8wave_kernel(
     acc_tl = tl.dot_scaled(a_top, a_sc_top, "e2m1", b_left, b_sc_left, "e2m1", acc_tl)
     tlx.async_load_wait_group(1)
     a_bot = tlx.local_load(tlx.local_view(smem_a_bot, g_idx), relaxed=True)
-    if PRESHUFFLED_A_SCALES:
+    if PRESHUFFLED_SCALES:
         a_sc_bot = a_sc_bot1
     else:
         a_sc_bot = tlx.local_load(smem_a_sc_b[g_idx], layout=scale_a_layout)
@@ -666,14 +718,7 @@ def choose_split_k(M, N, K):
     return best
 
 
-def preshuffle_mxfp4_a_scales(scales):
-    """Pack canonical ``[rows, K/32]`` E8M0 scales for direct register loads.
-
-    This adapts AITER's lane-major scale-preshuffle to this kernel's 2x4 wave
-    ownership. Physical storage is tiled as ``[256 rows, 8 groups]`` and ordered
-    ``[128-row half, M wave, lane, register]``, so each lane fetches its eight
-    A-scale bytes contiguously. Padding uses the E8M0 identity value (0x7f).
-    """
+def _pad_mxfp4_scales(scales):
     assert scales.dtype is torch.uint8
     assert scales.is_cuda
     assert scales.ndim == 2
@@ -688,9 +733,35 @@ def preshuffle_mxfp4_a_scales(scales):
         device=scales.device,
     )
     padded[:rows, :groups] = scales
+    return padded, padded_rows, padded_groups
+
+
+def preshuffle_mxfp4_a_scales(scales):
+    """Pack A scales so a combined 256x8 LDS tile is read with ``ds_read_b128``.
+
+    The four physical low bits are group bit 2 and row bits 5, 6, and 7: the
+    exact value bases of ``scale_a_comb_layout``. Padding uses the E8M0 identity
+    value (0x7f).
+    """
+    padded, padded_rows, padded_groups = _pad_mxfp4_scales(scales)
     return (
-        padded.reshape(padded_rows // 256, 2, 4, 2, 16, padded_groups // 8, 2, 4)
-        .permute(0, 5, 1, 3, 7, 4, 2, 6)
+        padded.reshape(
+            padded_rows // 256, 2, 2, 2, 2, 2, 2, 2, 2,
+            padded_groups // 8, 2, 2, 2)
+        .permute(0, 9, 11, 12, 7, 8, 4, 5, 6, 1, 2, 3, 10)
+        .contiguous()
+        .reshape(-1)
+    )
+
+
+def preshuffle_mxfp4_b_scales(scales):
+    """Pack B scales into the ordinary 64-bit LDS consumer order."""
+    padded, padded_rows, padded_groups = _pad_mxfp4_scales(scales)
+    return (
+        padded.reshape(
+            padded_rows // 256, 2, 2, 2, 2, 2, 2, 2, 2,
+            padded_groups // 8, 2, 2, 2)
+        .permute(0, 9, 11, 12, 3, 8, 4, 5, 6, 7, 1, 2, 10)
         .contiguous()
         .reshape(-1)
     )
@@ -758,7 +829,7 @@ def _matmul_256tile(a, b, a_scales, b_scales, SPLIT_K=None):
         NUM_XCDS=NUM_XCDS,
         GRID_MN=grid_mn,
         SPLIT_K=SPLIT_K,
-        PRESHUFFLED_A_SCALES=False,
+        PRESHUFFLED_SCALES=False,
         num_warps=NUM_WARPS,
         num_stages=1,
         matrix_instr_nonkdim=16,
@@ -785,19 +856,18 @@ def _matmul_256tile(a, b, a_scales, b_scales, SPLIT_K=None):
 
 
 def matmul_preshuffled(a, b, a_scales, b_scales, SPLIT_K=None):
-    """Experimental inter-wave kernel for a preshuffled A-scale buffer.
+    """Experimental pure-DMA kernel for two preshuffled scale buffers.
 
-    ``a_scales`` is a flat buffer returned by :func:`preshuffle_mxfp4_a_scales`
-    and loads directly into the scaled-MFMA register layout. ``b_scales`` keeps
-    the canonical ``[N, K/32]`` ABI and direct-to-LDS DMA, matching the operand
-    orientation used by AITER's 256x256 kernel.
+    Both scale arguments are flat buffers returned by the corresponding
+    :func:`preshuffle_mxfp4_a_scales` and
+    :func:`preshuffle_mxfp4_b_scales` helpers.
     """
     assert a.dtype is torch.uint8
     assert b.dtype is torch.uint8
     assert a_scales.dtype is torch.uint8
     assert b_scales.dtype is torch.uint8
     assert a.is_cuda and b.is_cuda and a_scales.is_cuda and b_scales.is_cuda
-    assert a_scales.ndim == 1 and b_scales.ndim == 2
+    assert a_scales.ndim == 1 and b_scales.ndim == 1
 
     M = a.shape[0]
     K_packed = a.shape[1]
@@ -807,8 +877,7 @@ def matmul_preshuffled(a, b, a_scales, b_scales, SPLIT_K=None):
     padded_groups = triton.cdiv(groups, 8) * 8
     assert b.shape == (N, K_packed), "B must have shape (N, K // 2)"
     assert a_scales.numel() == triton.cdiv(M, 256) * 256 * padded_groups
-    assert b_scales.shape == (N, groups)
-    assert b_scales.stride(0) == 1, "B scales must be contiguous along N"
+    assert b_scales.numel() == triton.cdiv(N, 256) * 256 * padded_groups
     assert M % BLOCK_M == 0, "M must be a multiple of 256"
     assert N % BLOCK_N == 0, "N must be a multiple of 256"
     assert K >= MIN_K and K % (2 * BLOCK_K) == 0, \
@@ -843,8 +912,8 @@ def matmul_preshuffled(a, b, a_scales, b_scales, SPLIT_K=None):
         c.stride(1),
         0,
         0,
-        b_scales.stride(0),
-        b_scales.stride(1),
+        0,
+        0,
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         BLOCK_K=BLOCK_K,
@@ -852,7 +921,7 @@ def matmul_preshuffled(a, b, a_scales, b_scales, SPLIT_K=None):
         NUM_XCDS=NUM_XCDS,
         GRID_MN=grid_mn,
         SPLIT_K=SPLIT_K,
-        PRESHUFFLED_A_SCALES=True,
+        PRESHUFFLED_SCALES=True,
         num_warps=NUM_WARPS,
         num_stages=1,
         matrix_instr_nonkdim=16,
