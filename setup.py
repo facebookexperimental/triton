@@ -476,6 +476,7 @@ def get_packages():
         yield "triton.profiler"
 
     yield "triton.language.extra.tlx"
+    yield "triton.language.extra.tlx.ops"
 
 
 def add_link_to_backends(external_only):

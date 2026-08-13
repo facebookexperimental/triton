@@ -1,12 +1,13 @@
 import argparse
 import math
+import os
 from types import SimpleNamespace
 
 import torch
 
 import triton
 
-from triton.language.extra.tlx.tutorials.amd_pa_decode import (
+from triton.language.extra.tlx.ops.amd_pa_decode import (
     pa_decode_tlx as _pa_decode_tlx,
     build_inputs as _build_inputs,
 )
@@ -23,6 +24,7 @@ QUERY_GROUP_SIZE = 8
 DECODE_METHODS = (
     "aiter_common",
     "sglang",
+    "sglang_tlx",
     "aiter_gluon",
     "tlx_5d",
     "tlx_5d_streaming",
@@ -72,7 +74,7 @@ def _make_decode_fn(
     context_partition_size = 256
     max_context_partition_num = math.ceil(int(ctx.max().item()) / context_partition_size)
 
-    if provider == "sglang":
+    if provider in ("sglang", "sglang_tlx"):
         if qlen != 1:
             raise ValueError("SGLang's vectorized_5d decode wrapper only supports query_length=1")
 
@@ -85,7 +87,11 @@ def _make_decode_fn(
             kv_cache_dtype=kc.dtype,
             k_scale=None,
             v_scale=None,
-            forward_metadata=SimpleNamespace(kv_indices=bt, swa_page_table=None),
+            forward_metadata=SimpleNamespace(
+                kv_indices=bt,
+                swa_page_table=None,
+                max_kv_len=max_context_len,
+            ),
         )
         layer = SimpleNamespace(
             tp_k_head_num=num_kv_heads,
@@ -99,6 +105,7 @@ def _make_decode_fn(
         )
         forward_batch = SimpleNamespace(batch_size=num_seqs, seq_lens=ctx)
 
+        os.environ["SGLANG_AITER_5D_DECODE_BACKEND"] = "tlx" if provider == "sglang_tlx" else "gluon"
         return lambda: forward_decode_vectorized_5d(backend, q, layer, forward_batch, kc, vc, out, None)
 
     if provider == "aiter_gluon":

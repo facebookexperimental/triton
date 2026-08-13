@@ -65,12 +65,16 @@ from triton.language.extra.tlx.tutorials.amd_fa_cluster import (
     attention as _amd_fa_cluster, )
 from triton.language.extra.tlx.tutorials.amd_fa_cluster import (
     persistent_attention as _amd_fa_cluster_persistent, )
-from triton.language.extra.tlx.tutorials.amd_pa_decode import (
+from triton.language.extra.tlx.ops.amd_pa_decode import (
     pa_decode_tlx as _amd_pa_decode,
     allocate_5d_kv_cache as _amd_pa_decode_allocate_5d,
+    allocate_pa_decode_workspace as _amd_pa_decode_allocate_workspace,
+    get_pa_decode_config as _amd_pa_decode_get_config,
+    reshape_and_cache_5d as _amd_pa_decode_reshape_and_cache_5d,
+)
+from triton.language.extra.tlx.tutorials.amd_pa_decode import (
     build_inputs as _amd_pa_decode_build_inputs,
     ref_decode as _amd_pa_decode_ref,
-    reshape_and_cache_5d as _amd_pa_decode_reshape_and_cache_5d,
     unpack_5d_kv_cache as _amd_pa_decode_unpack_5d,
 )
 from triton.language.extra.tlx.tutorials.amd_tdm_gemm_pipelined import (
@@ -1472,15 +1476,20 @@ def test_amd_pa_decode_5d_streaming_register(page_size, num_splits, query_length
                              num_kv_heads, query_length)
     out = torch.empty_like(query)
     workspace = None
+    config = None
     if page_size == 64 and num_splits == 4 and query_length == 1:
-        # Exercise the allocation-free serving path once; other cases retain
-        # internal workspace allocation so both APIs remain covered.
-        m_pow2 = 16
-        workspace = (
-            torch.empty((len(ctx_lens), num_kv_heads, num_splits, m_pow2, head_dim), dtype=torch.float32,
-                        device=DEVICE),
-            torch.empty((len(ctx_lens), num_kv_heads, num_splits, m_pow2), dtype=torch.float32, device=DEVICE),
+        # Exercise the cached-config, allocation-free serving path once; other
+        # cases retain internal selection/allocation so both APIs stay covered.
+        config = _amd_pa_decode_get_config(
+            query,
+            key_cache,
+            value_cache,
+            block_tables,
+            query_length=query_length,
+            num_splits=num_splits,
+            streaming_kv=True,
         )
+        workspace = _amd_pa_decode_allocate_workspace(query, key_cache, config)
     _amd_pa_decode(
         out,
         query,
@@ -1493,6 +1502,7 @@ def test_amd_pa_decode_5d_streaming_register(page_size, num_splits, query_length
         num_splits=num_splits,
         streaming_kv=True,
         workspace=workspace,
+        config=config,
     )
     torch.testing.assert_close(out.float(), ref, atol=2e-2, rtol=2e-2)
 
