@@ -12,6 +12,8 @@ inline constexpr StringLiteral kDisallowAccMultiBufferAttrName =
 inline constexpr StringLiteral kWarpSpecializeAttrName = "tt.warp_specialize";
 inline constexpr StringLiteral kScheduledMaxStageAttrName =
     "tt.scheduled_max_stage";
+inline constexpr StringLiteral kDataPartitionFactorAttrName =
+    "tt.data_partition_factor";
 
 enum class AutoWSLoopAttrPropagation {
   NotForwarded,

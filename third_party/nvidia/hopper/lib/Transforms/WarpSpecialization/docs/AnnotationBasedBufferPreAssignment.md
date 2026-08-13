@@ -31,7 +31,9 @@ tl.dot(k, qT, attrs={
 
 ### Channel Format
 
-Each channel string: `"operand,memoryType,numCopies,bufferId"`
+Each channel string is `"operand,memoryType,numCopies,bufferId"`. TMEM channels
+may add an explicit column offset:
+`"operand,tmem,numCopies,bufferId,bufferOffset"`.
 
 | Field | Values | Description |
 |-------|--------|-------------|
@@ -39,6 +41,7 @@ Each channel string: `"operand,memoryType,numCopies,bufferId"`
 | `memoryType` | `smem`, `tmem` | Memory backing for the channel |
 | `numCopies` | integer | Multi-buffering depth |
 | `bufferId` | integer | Buffer identity; shared IDs form reuse groups |
+| `bufferOffset` | integer (optional, TMEM only) | Column offset within the shared buffer owner; omitted means temporal reuse at offset 0 |
 
 ### MLIR Representation
 
