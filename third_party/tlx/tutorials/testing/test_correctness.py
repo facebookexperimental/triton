@@ -639,13 +639,11 @@ def test_blackwell_gemm_ws_mxfp8_2cta_64_columns_odd_m_tiles():
 @pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell GPU")
 def test_blackwell_gemm_ws_mxfp8_2cta_tall_short_k():
     config = Mxfp8Gemm.CONFIG_2CTA.copy()
-    config.update(
-        {
-            "GROUP_SIZE_M": 4,
-            "NUM_SMEM_BUFFERS": 4,
-            "EPILOGUE_SUBTILE": 1,
-        }
-    )
+    config.update({
+        "GROUP_SIZE_M": 4,
+        "NUM_SMEM_BUFFERS": 4,
+        "EPILOGUE_SUBTILE": 1,
+    })
     Mxfp8Gemm.run_test((512, 256, 256), config=config)
 
 

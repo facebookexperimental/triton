@@ -25,7 +25,6 @@ from triton.runtime.errors import PTXASError
 TRITON_MAX_TMA_DESCS = 8
 TRITON_MAX_TMA_DIMS = 5
 
-
 _PTX_FILE_DIRECTIVE = re.compile(
     r"""
     # Match one complete PTX .file directive and preserve its prefix.
@@ -47,6 +46,7 @@ _PTX_FILE_DIRECTIVE = re.compile(
 
 
 def normalize_ptx_file_metadata(src: str) -> str:
+
     def normalize_file(match: re.Match[str]) -> str:
         filename = match.group("path").rsplit("/", 1)[-1]
         virtual_path = f"<source>/{filename}"

@@ -596,9 +596,9 @@ static int64_t getLayoutScore(Attribute encoding) {
 // Estimate the number of contiguous atomic elements for a candidate layout.
 // AxisInfo is multidimensional, so evaluate it along the candidate layout's
 // register-contiguous dimension instead of treating sizePerThread as a scalar.
-static int64_t getAtomicContiguousWidth(
-    Value value, Attribute encoding,
-    ModuleAxisInfoAnalysis &axisInfoAnalysis) {
+static int64_t
+getAtomicContiguousWidth(Value value, Attribute encoding,
+                         ModuleAxisInfoAnalysis &axisInfoAnalysis) {
   Operation *op = value.getDefiningOp();
   if (!op || !isa<AtomicRMWOp, AtomicCASOp>(op))
     return 0;
@@ -642,8 +642,7 @@ static int64_t getAtomicContiguousWidth(
         contiguousDim >= static_cast<unsigned>(maskAxisInfo->getRank()))
       return 1;
     width = std::min<int64_t>(
-        width, std::max<int64_t>(
-                   maskAxisInfo->getConstancy(contiguousDim), 1));
+        width, std::max<int64_t>(maskAxisInfo->getConstancy(contiguousDim), 1));
   }
   int64_t maxVectorWidth = std::max<unsigned>(128 / elemBitWidth, 1);
   return std::min(std::max<int64_t>(width, 1), maxVectorWidth);

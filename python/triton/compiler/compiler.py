@@ -541,8 +541,8 @@ class CompiledKernel:
         asm_files = [Path(p) for c, p in metadata_group.items() if not c.endswith(".json")]
         binary_ext = backend.binary_ext
         self.asm = AsmDict({
-            file.suffix[1:]: file.read_bytes()
-            if file.suffix[1:] == binary_ext else file.read_text(encoding="utf-8")
+            file.suffix[1:]:
+            file.read_bytes() if file.suffix[1:] == binary_ext else file.read_text(encoding="utf-8")
             for file in asm_files
         })
         self.metadata_group = metadata_group
