@@ -887,7 +887,14 @@ def make_range_relation(
     return dsl.ixs_serialize(normalized[len(goals)])
 
 
-def global_memory_bit_offset_relation(layout, index_expr, *, element_byte_width, wrap_i32=True):
+def global_memory_bit_offset_relation(
+    layout,
+    index_expr,
+    *,
+    element_byte_width,
+    element_contiguity=1,
+    wrap_i32=True,
+):
     """Compose one logical index expression with its final packet layout."""
     if layout is None or layout.linear_layout is None:
         raise ValueError("global memory relation requires a distributed linear layout")
@@ -899,16 +906,28 @@ def global_memory_bit_offset_relation(layout, index_expr, *, element_byte_width,
         layout_warp_count(layout),
         preserve_block=True,
     )
-    logical = _symbolic_layout_formula(
+    physical_inputs = {
+        "block": dsl.sym("block"),
+        "slot": dsl.sym("slot"),
+        "item": dsl.sym("item"),
+    }
+    logical = _symbolic_layout_field_formula(
         dsl,
         linear,
-        {
-            "block": dsl.sym("block"),
-            "slot": dsl.sym("slot"),
-            "item": dsl.sym("item"),
-        },
+        physical_inputs,
+        combine_with_xor=False,
     )
+    if logical is None:
+        logical = _symbolic_layout_formula(dsl, linear, physical_inputs)
     element_offset = index_expr.subs({dsl.sym(name): expression for name, expression in logical.items()})
+    element_contiguity = int(element_contiguity)
+    if element_contiguity <= 0:
+        raise ValueError("global memory relation requires positive element contiguity")
+    if element_contiguity > 1:
+        slot = dsl.sym("slot")
+        group_slot = element_contiguity * dsl.floor(slot / element_contiguity)
+        group_origin = element_offset.subs({slot: group_slot})
+        element_offset = group_origin + dsl.mod(slot, element_contiguity)
     byte_offset = int(element_byte_width) * element_offset
     if wrap_i32:
         byte_offset = dsl.mod(byte_offset, 1 << 32)
@@ -961,11 +980,6 @@ def local_memory_bit_offset_relation(
     expected_outputs = {f"dim{dim}": int(extent) for dim, extent in enumerate(logical_shape)}
     if {str(name): int(extent) for name, extent in linear.out_dims} != expected_outputs:
         raise ValueError("local memory relation logical dimensions do not match its shape")
-    item_linear = _packet_item_linear_layout(
-        linear,
-        lane_width,
-        warp_count,
-    )
 
     address_layout, order, intervals, paddings = _shared_address_layout(
         shared_layout,
@@ -981,9 +995,24 @@ def local_memory_bit_offset_relation(
     goals = []
     element_bits = element_byte_width * 8
     allocation_bits = allocation_bytes * 8
+    item_linear = _packet_item_bit_linear_layout(
+        linear,
+        lane_width,
+        warp_count,
+    )
+    lane_bits = lane_width.bit_length() - 1
+
+    def item_bit(bit):
+        if bit < lane_bits:
+            return dsl.floor(dsl.mod(item, 1 << (bit + 1)) / (1 << bit))
+        warp_bit = bit - lane_bits
+        warp = dsl.floor(item / lane_width)
+        return dsl.floor(dsl.mod(warp, 1 << (warp_bit + 1)) / (1 << warp_bit))
+
     physical_inputs = {
         "slot": slot,
-        "item": item,
+        **{f"item{bit}": item_bit(bit)
+           for bit in range((lane_width * warp_count).bit_length() - 1)},
     }
     logical_by_name = _symbolic_layout_formula(
         dsl,
@@ -998,17 +1027,55 @@ def local_memory_bit_offset_relation(
         goals.extend((coord >= 0, coord < extent))
     if (address_layout is not None and not address_layout.prefix_shape and logical_shape == physical_shape
             and not any(logical_origin)):
-        physical_layout = _compose_linear_layouts(
-            item_linear,
-            address_layout.linear_layout,
-        )
-        mapped = _symbolic_layout_formula(dsl, physical_layout, physical_inputs)
+        mapped = None
+        mapped_includes_padding = False
+        if all(_is_power_of_two(interval) for interval in intervals):
+            weighted_physical_layout = _compose_linear_layouts(
+                linear,
+                address_layout.linear_layout,
+            )
+            lane = dsl.mod(item, lane_width)
+            weighted_inputs = {
+                "register": slot,
+                "lane": lane,
+                "warp": dsl.floor(item / lane_width),
+                "block": dsl.ixs_int(0),
+            }
+            output_weights = {}
+            for name, extent in weighted_physical_layout.out_dims:
+                weights = [1 << bit for bit in range(int(extent).bit_length() - 1)]
+                if str(name) == "offset":
+                    for bit, weight in enumerate(weights):
+                        weights[bit] += sum((weight // int(interval)) * int(padding)
+                                            for interval, padding in zip(intervals, paddings)
+                                            if weight >= int(interval))
+                output_weights[str(name)] = tuple(weights)
+            mapped = _symbolic_layout_field_formula(
+                dsl,
+                weighted_physical_layout,
+                weighted_inputs,
+                output_weights=output_weights,
+                combine_with_xor=False,
+            )
+            mapped_includes_padding = mapped is not None
+        if mapped is None:
+            physical_layout = _compose_linear_layouts(
+                item_linear,
+                address_layout.linear_layout,
+            )
+            mapped = _symbolic_layout_bit_formula(
+                dsl,
+                physical_layout,
+                physical_inputs,
+            )
         goals.append(dsl.ixs_eq(mapped["block"], dsl.ixs_int(0)))
         unpadded_offset = mapped["offset"]
-        goals.extend((unpadded_offset >= 0, unpadded_offset < _product(physical_shape)))
+        if not mapped_includes_padding:
+            goals.extend((unpadded_offset >= 0, unpadded_offset < _product(physical_shape)))
         element_offset = unpadded_offset
-        for interval, padding in zip(intervals, paddings):
-            element_offset += dsl.floor(unpadded_offset / int(interval)) * int(padding)
+        if not mapped_includes_padding:
+            for interval, padding in zip(intervals, paddings):
+                element_offset += dsl.floor(unpadded_offset / int(interval)) * int(padding)
     else:
         element_offset = _symbolic_shared_element_offset(
             dsl,
@@ -1040,7 +1107,7 @@ def local_memory_bit_offset_relation(
         ),
     )
     checked, _normalized = dsl.ixs_check(tuple(goals), facts)
-    goal_proofs = checked[:len(goals)]
+    goal_proofs = checked
     if any(proof is not True for proof in goal_proofs):
         status = "False" if False in goal_proofs else "Unknown"
         raise ValueError(f"symbolic local memory address proof returned {status}")
@@ -1370,6 +1437,99 @@ def _symbolic_layout_formula(
     }
 
 
+def _symbolic_layout_field_formula(
+    dsl,
+    linear,
+    inputs,
+    *,
+    output_weights=None,
+    combine_with_xor=True,
+):
+    """Compose a bit-permutation layout as maximal integer input fields."""
+    out_dims = tuple((str(name), int(size)) for name, size in linear.out_dims)
+    if any(not _is_power_of_two(size) for _name, size in out_dims):
+        return None
+    output_bits = [size.bit_length() - 1 for _name, size in out_dims]
+    if output_weights is None:
+        output_weights = {
+            name: tuple(1 << bit
+                        for bit in range(bit_count))
+            for (name, _size), bit_count in zip(out_dims, output_bits)
+        }
+    weights = [tuple(map(int, output_weights[name])) for name, _size in out_dims]
+    if any(len(values) != bit_count for values, bit_count in zip(weights, output_bits)):
+        return None
+    occupied = [set() for _ in out_dims]
+    fields_by_output = [[] for _ in out_dims]
+    for name, bases in linear.bases:
+        source = inputs.get(str(name))
+        if source is None:
+            return None
+        fields = []
+        current = None
+        for input_bit, basis in enumerate(bases):
+            nonzero = [(output, int(coefficient)) for output, coefficient in enumerate(basis) if int(coefficient)]
+            if not nonzero:
+                current = None
+                continue
+            if len(nonzero) != 1:
+                return None
+            output, coefficient = nonzero[0]
+            if coefficient <= 0 or coefficient & (coefficient - 1):
+                return None
+            output_bit = coefficient.bit_length() - 1
+            if (output_bit >= output_bits[output] or output_bit in occupied[output]):
+                return None
+            occupied[output].add(output_bit)
+            if (current is not None and current[0] == output and current[1] + current[3] == input_bit
+                    and current[2] + current[3] == output_bit
+                    and weights[output][output_bit] == 2 * weights[output][output_bit - 1]):
+                current[3] += 1
+            else:
+                current = [output, input_bit, output_bit, 1]
+                fields.append(current)
+        for output, input_bit, output_bit, width in fields:
+            value = source if input_bit == 0 and width == len(bases) else dsl.mod(
+                dsl.floor(source / (1 << input_bit)),
+                1 << width,
+            )
+            fields_by_output[output].append(weights[output][output_bit] * value)
+    coordinates = []
+    for fields in fields_by_output:
+        coordinate = dsl.ixs_int(0)
+        for field in fields:
+            coordinate = (dsl.xor(coordinate, field) if combine_with_xor else coordinate + field)
+        coordinates.append(coordinate)
+    return {name: coordinate for (name, _size), coordinate in zip(out_dims, coordinates)}
+
+
+def _symbolic_layout_bit_formula(dsl, linear, inputs):
+    """Serialize each GF(2) output bit before forming its integer value."""
+    out_dims = tuple((str(name), int(size)) for name, size in linear.out_dims)
+    if any(not _is_power_of_two(size) for _name, size in out_dims):
+        raise ValueError("bitwise layout formula requires power-of-two output domains")
+    bits = [[dsl.ixs_int(0) for _ in range(size.bit_length() - 1)] for _name, size in out_dims]
+    for name, bases in linear.bases:
+        source = inputs[str(name)]
+        for input_bit, basis in enumerate(bases):
+            value = dsl.mod(dsl.floor(source / (1 << input_bit)), 2)
+            for output, coefficient in enumerate(basis):
+                for output_bit in range(len(bits[output])):
+                    if int(coefficient) & (1 << output_bit):
+                        bits[output][output_bit] = dsl.xor(
+                            bits[output][output_bit],
+                            value,
+                        )
+    return {
+        name: sum(
+            ((1 << bit) * value
+             for bit, value in enumerate(values)),
+            dsl.ixs_int(0),
+        )
+        for (name, _size), values in zip(out_dims, bits)
+    }
+
+
 def _symbolic_shared_element_offset(
         dsl,
         address_layout,
@@ -1548,6 +1708,40 @@ def _packet_item_linear_layout(
             "block",
             [basis(block=1 << bit) for bit in range(physical_extents["block"].bit_length() - 1)],
         ))
+    adapter = LinearLayout.from_bases(
+        adapter_bases,
+        physical_names,
+        [physical_extents[name] for name in physical_names],
+        False,
+    )
+    return _compose_linear_layouts(adapter, linear)
+
+
+def _packet_item_bit_linear_layout(linear, lane_width, warp_count):
+    """Rebase packet ownership onto individual bits of the physical item."""
+    lane_width = int(lane_width)
+    warp_count = int(warp_count)
+    physical_extents = {name: linear_layout_in_dim_size(linear, name) for name in _PACKET_PHYSICAL_DIMS}
+    lane_bits = lane_width.bit_length() - 1
+    warp_bits = warp_count.bit_length() - 1
+    if 1 << lane_bits != lane_width or 1 << warp_bits != warp_count:
+        raise ValueError("packet item layout requires power-of-two hardware extents")
+    physical_names = list(_PACKET_PHYSICAL_DIMS)
+
+    def basis(**values):
+        return [int(values.get(name, 0)) for name in physical_names]
+
+    register_bits = physical_extents["register"].bit_length() - 1
+    adapter_bases = [
+        ("slot", [basis(register=1 << bit) for bit in range(register_bits)]),
+    ]
+    adapter_bases.extend((
+        f"item{bit}",
+        [
+            basis(lane=(1 << bit) if (1 << bit) < physical_extents["lane"] else 0, ) if bit < lane_bits else basis(
+                warp=(1 << (bit - lane_bits)) if (1 << (bit - lane_bits)) < physical_extents["warp"] else 0, )
+        ],
+    ) for bit in range(lane_bits + warp_bits))
     adapter = LinearLayout.from_bases(
         adapter_bases,
         physical_names,
