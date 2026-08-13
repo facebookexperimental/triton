@@ -188,21 +188,28 @@ Broadcast depth defaults to one, which keeps partitions in lockstep at the tile
 claim. Depth greater than one is covered by lit but lacks runtime correctness
 and performance coverage.
 
-## 2-CTA Gap
+## 2-CTA Status
 
-Dynamic persistence with a 2-CTA MMA requires one logical tile claim per CTA
-cluster. The current scheduler seeds work from physical program IDs, and the
-atomic broadcast synchronizes warp partitions within a CTA. It does not define:
+Dynamic persistence with a software atomic scheduler still requires one logical
+tile claim per CTA cluster. The atomic broadcast synchronizes warp partitions
+within a CTA, but it does not define:
 
 - physical-CTA to logical-cluster tile mapping;
 - which CTA owns the cluster's atomic claim;
 - how the claimed tile ID is distributed to the peer CTA;
 - counter initialization and termination accounting per cluster.
 
-Therefore dynamic 2-CTA should be treated as a separate feature after basic
-outer-while AutoWS works. Reusing the intra-CTA atomic broadcast without a
-cluster-level ownership protocol would allow both CTAs to advance the global
-counter independently.
+Therefore atomic-scheduled 2-CTA remains a separate feature. Reusing the
+intra-CTA atomic broadcast without a cluster-level ownership protocol would
+allow both CTAs to advance the global counter independently.
+
+The hardware CLC scheduler does provide cluster-level ownership. Clustered CLC
+state is now hoisted before the enclosing AutoWS operation and explicitly
+captured by all isolated worker regions. A 2-CTA outer-while matmul is covered
+end to end. The FA-forward integration is correct with one inner pipeline stage,
+but two or more stages currently fail synccheck with a missing wait on the QK
+MMA completion barrier. Until that pipeline carry/drain issue is fixed, the CLC
+FA configuration defaults both compiler and KV staging to one.
 
 ## Frontend and Configuration Gaps
 
@@ -266,7 +273,8 @@ Required coverage:
    `ws_atomic_broadcast_reject.mlir` proves the shared, category-independent
    `bailOut`/`removeWarpSpecMetadata` teardown. ("non-carried" and
    "unrelated-replicated" are the same `getLoopCarryingWhile==null` check.)
-7. **Hopper and Blackwell**: CLC sibling correctness is covered on Blackwell;
+7. **Hopper and Blackwell**: 1-CTA and clustered 2-CTA CLC sibling correctness
+   is covered on Blackwell;
    unified dynamic atomic correctness on Hopper now has a dedicated gated test
    (see #4) but has not yet been executed on SM90 hardware.
 8. **Performance**: compare static persistent, dynamic inner-loop AutoWS,
