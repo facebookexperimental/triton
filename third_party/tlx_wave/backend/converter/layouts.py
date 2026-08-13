@@ -935,6 +935,16 @@ def global_memory_bit_offset_relation(
     return tuple(int(byte) for byte in dsl.ixs_serialize(bit_offset))
 
 
+def signed_fixed_width_value(expression, width):
+    """Interpret an integer expression as a signed fixed-width SSA value."""
+    width = int(width)
+    if width <= 0 or width >= 63:
+        raise ValueError("signed fixed-width relation requires width in [1, 62]")
+    dsl = load_wave_dsl()
+    bias = 1 << (width - 1)
+    return dsl.mod(expression + bias, 1 << width) - bias
+
+
 def local_memory_bit_offset_relation(
     distributed_layout,
     shared_layout,

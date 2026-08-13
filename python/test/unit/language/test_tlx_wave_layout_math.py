@@ -651,6 +651,21 @@ def test_glu_b_global_layout_contiguity_normalizes_nonlinear_index():
     assert checked == (True, )
 
 
+def test_signed_i32_relation_wraps_before_division():
+    dsl = layouts.load_wave_dsl()
+    dividend = layouts.signed_fixed_width_value(dsl.sym("base") + dsl.sym("dim1"), 32)
+    divisor = layouts.signed_fixed_width_value(dsl.sym("extent"), 32)
+    remainder = dividend - divisor * dsl.trunc(dividend / divisor)
+    relation = dsl.ixs_deserialize(
+        layouts.global_memory_bit_offset_relation(_glu_b_global_layout(), remainder, element_byte_width=2))
+
+    assert int(dividend.eval({
+        "base": (1 << 31) - 1,
+        "dim1": 1,
+    })) == -(1 << 31)
+    assert "Mod(2147483648 + base + 8*Mod(item, 16) + Mod(slot, 8), 4294967296)" in str(relation)
+
+
 def test_glu_b_symbolic_relation_proves_b16_contiguity():
     dsl, relation = _bit_offset_relation(
         _glu_b_layout(),
