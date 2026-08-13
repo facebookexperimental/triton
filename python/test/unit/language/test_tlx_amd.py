@@ -3180,13 +3180,16 @@ def test_a4w4_shape_stride_layouts_correctness_gfx950(device):
         torch.testing.assert_close(actual, expected, atol=0.1, rtol=0.0)
 
 
-@pytest.mark.parametrize("k", [1536, 2048])
+@pytest.mark.parametrize(
+    "k, expected_path",
+    [(1536, "intra_wave_256x256"), (2048, "inter_wave_256x256")],
+)
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
-def test_a4w4_inter_wave_256tile_correctness_gfx950(device, k):
-    # A 2x33 grid exceeds the skinny-dispatch threshold, so these neighboring K
-    # values exercise the 8-wave 256x256 path with two and three main-loop trips.
+def test_a4w4_inter_wave_large_grid_dispatch_correctness_gfx950(device, k, expected_path):
+    # A 2x33 grid exceeds the skinny threshold. K=1536 selects the measured
+    # lower-overhead 4-wave path; K=2048 selects the 8-wave pipeline.
     m, n = 512, 8448
-    assert _select_a4w4_inter_wave_path(m, n, k) == "inter_wave_256x256"
+    assert _select_a4w4_inter_wave_path(m, n, k) == expected_path
     a, b, a_scales, b_scales = _generate_a4w4_inputs(m, n, k)
     actual = _a4w4_inter_wave_matmul(a, b, a_scales, b_scales)
     expected = _a4w4_reference(a, b, a_scales, b_scales)
@@ -3195,18 +3198,14 @@ def test_a4w4_inter_wave_256tile_correctness_gfx950(device, k):
 
 @pytest.mark.parametrize("m, n", [(256, 16640), (512, 8448)])
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
-def test_a4w4_inter_wave_256tile_single_trip_stress_gfx950(device, m, n):
-    # K=1024 has four K tiles: two are prefetched and one two-tile main-loop
-    # step consumes/refills the ring before the two-tile drain.
+def test_a4w4_short_k_dispatch_stress_gfx950(device, m, n):
     # Both public shapes exceed the skinny threshold by the smallest possible
-    # grid margins and cover different multi-CTA grids through the dispatcher.
+    # grid margins. K=1024 must dispatch to the measured 4-wave path.
     k = _A4W4_INTER_WAVE_MIN_K
     grid_mn = triton.cdiv(m, _A4W4_INTER_WAVE_BLOCK_M) * triton.cdiv(n, _A4W4_INTER_WAVE_BLOCK_N)
-    iter_max = k // _A4W4_INTER_WAVE_BLOCK_K
-    main_trips = len(range(0, iter_max - 2, 2))
     assert grid_mn in (65, 66)
-    assert _select_a4w4_inter_wave_path(m, n, k) == "inter_wave_256x256"
-    assert (k, iter_max, main_trips) == (1024, 4, 1)
+    assert _select_a4w4_inter_wave_path(m, n, k) == "intra_wave_256x256"
+    assert k == 1024
 
     a, b, a_scales, b_scales = _generate_a4w4_inputs(m, n, k)
     expected = _a4w4_reference(a, b, a_scales, b_scales)

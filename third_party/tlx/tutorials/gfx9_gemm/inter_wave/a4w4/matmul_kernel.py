@@ -67,6 +67,9 @@ import torch
 import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
+from triton.language.extra.tlx.tutorials.gfx9_gemm.intra_wave.a4w4.matmul_kernel import (
+    matmul as intra_wave_matmul,
+)
 from triton.language.extra.tlx.tutorials.gfx9_gemm.skinny.a4w4 import is_skinny, skinny_matmul
 
 BLOCK_M = 256
@@ -91,6 +94,7 @@ _A4W4_8WAVE_LLVM_FN_ATTRS = (
 # the pinned operand layouts.
 MIN_K = 4 * BLOCK_K
 KERNEL_NAME = "a4w4_8wave"
+INTRA_WAVE_MAX_K = 1536
 
 
 @triton.jit
@@ -632,7 +636,8 @@ def _matmul_256tile(a, b, a_scales, b_scales, SPLIT_K=None):
         num_warps=NUM_WARPS,
         num_stages=1,
         matrix_instr_nonkdim=16,
-        # Forbid AGPRs: f32 accumulators write VGPRs directly (packs tighter, no spills).
+        # Keep f32 accumulators in VGPRs. Allowing AGPR allocation increases
+        # private-segment spills and regresses this 8-wave ownership model.
         llvm_fn_attrs=_A4W4_8WAVE_LLVM_FN_ATTRS,
     )
     if SPLIT_K > 1:
@@ -654,9 +659,11 @@ def _matmul_256tile(a, b, a_scales, b_scales, SPLIT_K=None):
 
 
 def select_matmul_path(M, N, K):
-    """Select the measured small-M path without changing the existing fallback."""
+    """Select the measured gfx950 tile and wave-ownership strategy."""
     if is_skinny(M, N, K):
         return "skinny"
+    if K <= INTRA_WAVE_MAX_K:
+        return "intra_wave_256x256"
     return "inter_wave_256x256"
 
 
@@ -664,7 +671,8 @@ def matmul(a, b, a_scales, b_scales):
     """A @ B.T for packed MXFP4 A/B using measured gfx950 dispatch.
 
     * occupancy-starved grids use measured 32/64/128x128 tiles and bounded split-K;
-    * other grids retain the existing 8-wave 256x256 inter-wave path.
+    * well-filled K=1024/1536 grids use the lower-overhead 4-wave 256x256 path;
+    * K >= 2048 well-filled grids use the 8-wave 256x256 inter-wave pipeline.
     """
     M = a.shape[0]
     K = a.shape[1] * 2
@@ -672,4 +680,6 @@ def matmul(a, b, a_scales, b_scales):
     path = select_matmul_path(M, N, K)
     if path == "skinny":
         return skinny_matmul(a, b, a_scales, b_scales)
+    if path == "intra_wave_256x256":
+        return intra_wave_matmul(a, b, a_scales, b_scales)
     return _matmul_256tile(a, b, a_scales, b_scales)
