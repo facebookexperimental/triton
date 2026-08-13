@@ -409,10 +409,10 @@ def _a4w4_8wave_kernel(
     tl.assume(iter_max > 3)
 
     # ---- Prologue: prefetch K-steps 0,1 into buffers 0,1 (8 commits) ----
-    tlx.buffer_load_to_local(smem_b_left[0], b_base, b_tile_offsets)
     if MERGED_SCALE_DMA:
         tlx.buffer_load_to_local(smem_sc[0], a_scales_ptr, scale_offsets)
-    else:
+    tlx.buffer_load_to_local(smem_b_left[0], b_base, b_tile_offsets)
+    if not MERGED_SCALE_DMA:
         tlx.buffer_load_to_local(smem_b_sc[0], b_scales_ptr, b_sc_offsets)
     tlx.async_load_commit_group()
     tlx.buffer_load_to_local(smem_a_top[0], a_base, a_tile_offsets)
