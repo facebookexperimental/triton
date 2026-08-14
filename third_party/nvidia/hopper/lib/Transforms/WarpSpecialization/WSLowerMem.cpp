@@ -53,6 +53,36 @@ LogicalResult doConvertDescriptorLoadsToNVWS(triton::FuncOp funcOp) {
     if (load->hasOneUse())
       soleAlloc = dyn_cast<ttg::LocalAllocOp>(*load->getUsers().begin());
 
+    // Fusing the load into `soleAlloc` makes the TMA engine write that buffer
+    // directly, but TMA can only write an NVMMA-shared layout (see
+    // verifyTMAEncoding). A block-scale alloc carries a SharedLinearEncoding
+    // that is layout-equivalent to the descriptor's NVMMA encoding yet is a
+    // different attribute, so reusing it verbatim produces an illegal copy.
+    // Re-spell the fused buffer with the descriptor's encoding when the two
+    // describe the same layout; otherwise skip the fusion and stage through a
+    // TMA-compatible buffer. (Upstream applies the same LinearLayout
+    // equivalence rule in PartitionScheduling.cpp; the Meta autoWS path was
+    // never updated to match.)
+    Attribute fusedEncoding;
+    if (soleAlloc) {
+      auto allocType = cast<ttg::MemDescType>(soleAlloc.getType());
+      fusedEncoding = allocType.getEncoding();
+      if (!isa<ttg::NVMMASharedEncodingAttr>(fusedEncoding)) {
+        Attribute descEncoding =
+            ttng::getEncodingFromDescriptor(load, tensorType, load.getDesc());
+        auto descLayout =
+            dyn_cast_or_null<ttg::LayoutEncodingTrait>(descEncoding);
+        auto allocLayout = dyn_cast<ttg::LayoutEncodingTrait>(fusedEncoding);
+        if (descLayout && allocLayout &&
+            ttg::areLayoutsEquivalent(allocType.getShape(), descLayout,
+                                      allocLayout)) {
+          fusedEncoding = descEncoding;
+        } else {
+          soleAlloc = nullptr;
+        }
+      }
+    }
+
     OpBuilderWithAsyncTaskIds builder(load);
     builder.setInsertionPoint(load);
     Value buffer;
@@ -61,7 +91,7 @@ LogicalResult doConvertDescriptorLoadsToNVWS(triton::FuncOp funcOp) {
     } else if (soleAlloc) {
       auto oldType = cast<ttg::MemDescType>(soleAlloc.getType());
       auto bufferType = ttg::MemDescType::get(
-          oldType.getShape(), oldType.getElementType(), oldType.getEncoding(),
+          oldType.getShape(), oldType.getElementType(), fusedEncoding,
           oldType.getMemorySpace(), /*mutableMemory=*/true);
       auto newAlloc = builder.createWithAsyncTaskIds<ttg::LocalAllocOp>(
           soleAlloc.getLoc(), bufferType);
