@@ -7,6 +7,9 @@ import pytest
 import pathlib
 import uuid
 from triton._internal_testing import is_cuda, is_hip_cdna2, is_rubin
+from triton.backends.amd.compiler import HIPBackend
+from triton.backends.compiler import GPUTarget
+from triton.backends.nvidia.compiler import CUDABackend
 from triton.runtime import autotuner as _autotuner
 
 
@@ -22,6 +25,28 @@ def do_bench(kernel_call, quantiles, use_cuda_graph=False):
 )
 def test_entropy_warmup_sample_budget(probe_ms, expected):
     assert _autotuner._entropy_warmup_sample_limit(probe_ms, 250) == expected
+
+
+def test_config_backend_options():
+    default_config = triton.Config(kwargs={})
+    tree_config = triton.Config(kwargs={}, enable_tree_reduction=True)
+    linear_config = triton.Config(kwargs={}, enable_tree_reduction=False)
+
+    assert "enable_tree_reduction" not in default_config.all_kwargs()
+    assert tree_config.all_kwargs()["enable_tree_reduction"] is True
+    assert linear_config.all_kwargs()["enable_tree_reduction"] is False
+
+    amd_backend = HIPBackend(GPUTarget("hip", "gfx942", 64))
+    assert amd_backend.parse_options(default_config.all_kwargs()).enable_tree_reduction is False
+    assert amd_backend.parse_options(tree_config.all_kwargs()).enable_tree_reduction is True
+    assert amd_backend.parse_options(linear_config.all_kwargs()).enable_tree_reduction is False
+
+    h100_backend = CUDABackend(GPUTarget("cuda", 90, 32))
+    blackwell_backend = CUDABackend(GPUTarget("cuda", 100, 32))
+    assert h100_backend.parse_options(default_config.all_kwargs()).enable_tree_reduction is True
+    assert blackwell_backend.parse_options(default_config.all_kwargs()).enable_tree_reduction is False
+    assert h100_backend.parse_options(linear_config.all_kwargs()).enable_tree_reduction is False
+    assert blackwell_backend.parse_options(tree_config.all_kwargs()).enable_tree_reduction is True
 
 
 @pytest.mark.parametrize('use_cuda_graph', [False, True])

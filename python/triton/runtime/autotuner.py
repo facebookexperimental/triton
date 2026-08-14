@@ -1077,6 +1077,9 @@ class Config:
     :type preferred_ctas_per_cga: tuple[int, int, int]
     :ivar multicast: default policy for compiler-selected TMA multicast loads.
     :type multicast: bool
+    :ivar enable_tree_reduction: use tree-shaped, vectorized in-thread reductions. If unset, use the
+        backend's architecture-specific default.
+    :type enable_tree_reduction: bool | None
     """
 
     @staticmethod
@@ -1107,6 +1110,7 @@ class Config:
         preferred_ctas_per_cga=None,
         multicast=False,
         auto_tma=None,
+        enable_tree_reduction=None,
     ):
         self.kwargs = kwargs
         self.num_warps = num_warps
@@ -1129,6 +1133,7 @@ class Config:
         # Per-config auto-TMA toggle. None -> defer to the global TRITON_AUTO_TMA
         # knob; True/False lets the autotuner A/B auto-TMA per shape.
         self.auto_tma = auto_tma
+        self.enable_tree_reduction = enable_tree_reduction
 
     def __setstate__(self, state):
         self.kwargs = state.get("kwargs", {})
@@ -1148,6 +1153,7 @@ class Config:
         self.preferred_ctas_per_cga = state.get("preferred_ctas_per_cga", None)
         self.multicast = state.get("multicast", False)
         self.auto_tma = state.get("auto_tma", None)
+        self.enable_tree_reduction = state.get("enable_tree_reduction", None)
 
     def all_kwargs(self):
         return {
@@ -1170,6 +1176,7 @@ class Config:
                     ("preferred_ctas_per_cga", self.preferred_ctas_per_cga),
                     ("multicast", self.multicast),
                     ("auto_tma", self.auto_tma),
+                    ("enable_tree_reduction", self.enable_tree_reduction),
                 ) if v is not None
             },
         }
@@ -1192,6 +1199,7 @@ class Config:
         res.append(f"preferred_ctas_per_cga: {self.preferred_ctas_per_cga}")
         res.append(f"multicast: {self.multicast}")
         res.append(f"auto_tma: {self.auto_tma}")
+        res.append(f"enable_tree_reduction: {self.enable_tree_reduction}")
         return ", ".join(res)
 
     def __hash__(self):
