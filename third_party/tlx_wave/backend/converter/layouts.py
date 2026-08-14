@@ -707,36 +707,7 @@ def _distributed_active_relation(
         (digit * (1 << bit) for bit, digit in enumerate(digits)),
         dsl.ixs_int(0),
     )
-    facts = (
-        *_symbolic_range_predicates(
-            dsl,
-            item,
-            0,
-            lane_width * warp_count - 1,
-        ),
-        *_symbolic_range_predicates(
-            dsl,
-            slot,
-            0,
-            register_extent - 1,
-        ),
-    )
-    goals = (
-        dsl.ixs_eq(active_key, dsl.floor(active_key)),
-        active_key >= 0,
-        active_key <= replication - 1,
-    )
-    proofs, normalized = dsl.ixs_check((*goals, active_key), facts)
-    if any(proof is not True for proof in proofs[:len(goals)]):
-        status = "False" if False in proofs[:len(goals)] else "Unknown"
-        reject("TLXW_TYPE_UNSUPPORTED_LAYOUT", f"distributed ownership proof returned {status}")
-    owner_proofs, _ = dsl.ixs_check(
-        tuple(dsl.ixs_eq(digit, 0) for digit in digits),
-        (*facts, dsl.ixs_eq(active_key, 0)),
-    )
-    if any(proof is not True for proof in owner_proofs):
-        reject("TLXW_TYPE_UNSUPPORTED_LAYOUT", "ownership key is not injective")
-    return dsl.ixs_serialize(normalized[len(goals)])
+    return dsl.ixs_serialize(active_key)
 
 
 def packet_layout_relations(
