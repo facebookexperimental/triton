@@ -68,8 +68,7 @@ getWarpSpecializedPartitionType(scf::ForOp forOp) {
   auto wsOp = forOp->getParentOfType<triton::gpu::WarpSpecializeOp>();
   if (!wsOp)
     return std::nullopt;
-  auto typesAttr =
-      wsOp->getAttrOfType<ArrayAttr>("ttg.partition.types");
+  auto typesAttr = wsOp->getAttrOfType<ArrayAttr>("ttg.partition.types");
   if (!typesAttr)
     return std::nullopt;
 
@@ -142,8 +141,9 @@ static void expandLoops(ModuleOp moduleOp) {
   auto metaWS = triton::tools::getBoolEnv("TRITON_USE_META_WS");
 
   for (scf::ForOp forOp : loops) {
+    std::optional<StringRef> partitionType;
     if (metaWS) {
-      auto partitionType = getWarpSpecializedPartitionType(forOp);
+      partitionType = getWarpSpecializedPartitionType(forOp);
       if (partitionType && *partitionType != "gemm")
         continue;
     }
@@ -158,9 +158,20 @@ static void expandLoops(ModuleOp moduleOp) {
 
     std::vector<std::pair<Operation *, unsigned>> finalSchedule =
         schedule.createFinalSchedule(forOp);
+    if (metaWS) {
+      unsigned maxMMAStage = 0;
+      for (auto &[op, stage] : finalSchedule)
+        if (isa<triton::nvidia_gpu::MMAv5OpInterface>(op))
+          maxMMAStage = std::max(maxMMAStage, stage);
+      for (auto &[op, stage] : finalSchedule) {
+        auto wait = dyn_cast<triton::nvidia_gpu::WaitBarrierOp>(op);
+        if (wait && !wait.getDeps().empty() && stage > maxMMAStage)
+          stage = maxMMAStage;
+      }
+    }
     triton::PipeliningOption options;
     options.supportDynamicLoops = true;
-    options.peelEpilogue = false;
+    options.peelEpilogue = metaWS;
     options.predicateFn = wrapInMaskOp;
     options.getScheduleFn =
         [&](scf::ForOp forOp,
@@ -179,8 +190,8 @@ static void expandLoops(ModuleOp moduleOp) {
         !forOp->getParentOfType<triton::gpu::WarpSpecializeOp>() &&
         !keepPredicateStage; // do not peel if we are testing the stage
                              // predication
-    if (metaWS && hasWarpSpec)
-      customEpiloguePeeling = true;
+    if (metaWS)
+      customEpiloguePeeling = false;
 
     if (keepPredicateStage || customEpiloguePeeling) {
       options.emitPredicateStageFn =
