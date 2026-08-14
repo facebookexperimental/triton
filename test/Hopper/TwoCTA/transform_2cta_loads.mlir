@@ -90,6 +90,54 @@ module attributes {"ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32,
 
 // -----
 
+// Test: A single full V descriptor load split between two 2-CTA PV MMAs must
+// become one cooperative half-width load and two zero-copy shared-memory
+// views. This avoids two TMA loads without staging V through registers.
+// CHECK-LABEL: @fa_split_v_load
+// CHECK-SAME: %[[DESC:.*]]: !tt.tensordesc<128x64xbf16>
+// CHECK: %[[V:.*]] = tt.descriptor_load %[[DESC]]{{.*}}two_cta_b{{.*}} : !tt.tensordesc<128x64xbf16>
+// CHECK: %[[FULL:.*]] = ttg.local_alloc %[[V]] : {{.*}} -> !ttg.memdesc<128x64xbf16
+// CHECK: %[[V0:.*]] = ttg.memdesc_subslice %[[FULL]][0, 0] : {{.*}} -> !ttg.memdesc<64x64xbf16, {{.*}}, {{.*}}, 128x64>
+// CHECK: %[[V1:.*]] = ttg.memdesc_subslice %[[FULL]][64, 0] : {{.*}} -> !ttg.memdesc<64x64xbf16, {{.*}}, {{.*}}, 128x64>
+// CHECK-NOT: tt.split
+// CHECK: ttng.tc_gen5_mma %{{.*}}, %[[V0]], {{.*}} {two_ctas}
+// CHECK: ttng.tc_gen5_mma %{{.*}}, %[[V1]], {{.*}} {two_ctas}
+
+#v_blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [2, 16], warpsPerCTA = [4, 1], order = [1, 0]}>
+#v_reshape = #ttg.blocked<{sizePerThread = [1, 1, 8], threadsPerWarp = [1, 2, 16], warpsPerCTA = [1, 4, 1], order = [2, 1, 0]}>
+#v_trans = #ttg.blocked<{sizePerThread = [1, 8, 1], threadsPerWarp = [2, 16, 1], warpsPerCTA = [4, 1, 1], order = [1, 0, 2]}>
+#v_leaf = #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [8, 0], [16, 0], [32, 0]], lane = [[0, 8], [0, 16], [0, 32], [0, 64], [1, 0]], warp = [[2, 0], [4, 0]], block = []}>
+#v_shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#v_smem = #ttg.shared_memory
+#v_tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
+
+module attributes {"ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @fa_split_v_load(
+      %v_desc: !tt.tensordesc<128x128xbf16>,
+      %a0: !ttg.memdesc<256x64xbf16, #v_shared, #v_smem>,
+      %a1: !ttg.memdesc<256x64xbf16, #v_shared, #v_smem>,
+      %acc0: !ttg.memdesc<256x128xf32, #v_tmem, #ttng.tensor_memory, mutable>,
+      %acc1: !ttg.memdesc<256x128xf32, #v_tmem, #ttng.tensor_memory, mutable>,
+      %token0: !ttg.async.token,
+      %token1: !ttg.async.token) attributes {noinline = false} {
+    %true = arith.constant true
+    %c0_i32 = arith.constant 0 : i32
+
+    %v = tt.descriptor_load %v_desc[%c0_i32, %c0_i32] : !tt.tensordesc<128x128xbf16> -> tensor<128x128xbf16, #v_blocked>
+    %v_reshape_value = tt.reshape %v : tensor<128x128xbf16, #v_blocked> -> tensor<2x64x128xbf16, #v_reshape>
+    %v_trans_value = tt.trans %v_reshape_value {order = array<i32: 1, 2, 0>} : tensor<2x64x128xbf16, #v_reshape> -> tensor<64x128x2xbf16, #v_trans>
+    %v0, %v1 = tt.split %v_trans_value : tensor<64x128x2xbf16, #v_trans> -> tensor<64x128xbf16, #v_leaf>
+    %v0_smem = ttg.local_alloc %v0 : (tensor<64x128xbf16, #v_leaf>) -> !ttg.memdesc<64x128xbf16, #v_shared, #v_smem>
+    %v1_smem = ttg.local_alloc %v1 : (tensor<64x128xbf16, #v_leaf>) -> !ttg.memdesc<64x128xbf16, #v_shared, #v_smem>
+
+    %mma0 = ttng.tc_gen5_mma %a0, %v0_smem, %acc0[%token0], %true, %true {two_ctas} : !ttg.memdesc<256x64xbf16, #v_shared, #v_smem>, !ttg.memdesc<64x128xbf16, #v_shared, #v_smem>, !ttg.memdesc<256x128xf32, #v_tmem, #ttng.tensor_memory, mutable>
+    %mma1 = ttng.tc_gen5_mma %a1, %v1_smem, %acc1[%token1], %true, %true {two_ctas} : !ttg.memdesc<256x64xbf16, #v_shared, #v_smem>, !ttg.memdesc<64x128xbf16, #v_shared, #v_smem>, !ttg.memdesc<256x128xf32, #v_tmem, #ttng.tensor_memory, mutable>
+    tt.return
+  }
+}
+
+// -----
+
 // Test: Host-side TMA descriptor (function argument) with 2-CTA.
 // The pass should update the argument's TensorDescType to half-width and
 // transform the load, same as device-side but without cloning MakeTensorDescOp.
