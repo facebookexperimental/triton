@@ -108,12 +108,14 @@ class _OnlineLinearRegression:
 
 class _EntropyCriterion:
 
+    DEFAULT_MIN_WARMUP_SAMPLES = 20
+
     def __init__(
         self,
         max_angle: float = 0.048,
         min_r2: float = 0.36,
         window_size: int = 299,
-        min_warmup_samples: int = 20,
+        min_warmup_samples: int = DEFAULT_MIN_WARMUP_SAMPLES,
         entropy_window_size: int = 500,
     ) -> None:
         self.max_angle = max_angle
@@ -177,13 +179,17 @@ class _EntropyCriterion:
                 self._sum_count_log_count += new_count * math.log2(new_count)
 
 
+def _entropy_warmup_sample_limit(probe_ms: float, budget_ms: int) -> int:
+    """Convert the warmup time budget to a bounded number of kernel launches."""
+    return max(1, min(10000, int(budget_ms / probe_ms)))
+
+
 def _entropy_warmup(kernel_call, clear_cache, torch, entropy_window_size=500, regr_window_size=299, max_samples=10000):
     """Adaptive warmup using entropy convergence. Returns (n_samples, avg_ms)."""
     crit = _EntropyCriterion(
         max_angle=0.048,
         min_r2=0.36,
         window_size=regr_window_size,
-        min_warmup_samples=20,
         entropy_window_size=entropy_window_size,
     )
     rounding_factor = 3
@@ -427,6 +433,8 @@ class Autotuner(KernelInterface):
             return None
 
         rep = knobs.autotuning.rep
+        warmup = knobs.autotuning.warmup
+        fixed_benchmarker = driver.active.get_benchmarker()
         _WARMUP_BUDGET_MS = 250
 
         def entropy_benchmarker(kernel_call, quantiles):
@@ -447,6 +455,16 @@ class Autotuner(KernelInterface):
 
             # Scale windows so wall-clock warmup stays within budget
             probe_ms = max(probe_ms, 0.001)
+            max_samples = _entropy_warmup_sample_limit(probe_ms, _WARMUP_BUDGET_MS)
+            # If the minimum sample count cannot fit in the budget, use the
+            # existing fixed-time benchmarker.
+            if max_samples < _EntropyCriterion.DEFAULT_MIN_WARMUP_SAMPLES:
+                return fixed_benchmarker(
+                    kernel_call,
+                    warmup=warmup,
+                    rep=rep,
+                    quantiles=quantiles,
+                )
             entropy_window = min(500, max(50, int(_WARMUP_BUDGET_MS / probe_ms)))
             regr_window = max(20, int(entropy_window * 0.6))
 
@@ -456,6 +474,7 @@ class Autotuner(KernelInterface):
                 torch,
                 entropy_window_size=entropy_window,
                 regr_window_size=regr_window,
+                max_samples=max_samples,
             )
             avg_ms = n_warmup[1]
             n_repeat = max(10, int(rep / avg_ms)) if avg_ms > 0 else 100

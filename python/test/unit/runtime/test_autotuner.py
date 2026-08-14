@@ -16,6 +16,14 @@ def do_bench(kernel_call, quantiles, use_cuda_graph=False):
     return triton.testing.do_bench(kernel_call, quantiles=quantiles, warmup=1, rep=1)
 
 
+@pytest.mark.parametrize(
+    "probe_ms, expected",
+    [(0.001, 10000), (0.1, 2500), (1.0, 250), (24.0, 10), (100.0, 2)],
+)
+def test_entropy_warmup_sample_budget(probe_ms, expected):
+    assert _autotuner._entropy_warmup_sample_limit(probe_ms, 250) == expected
+
+
 @pytest.mark.parametrize('use_cuda_graph', [False, True])
 def test_kwargs(use_cuda_graph: bool, device: str):
     if use_cuda_graph and not torch.cuda.is_available():
