@@ -162,6 +162,33 @@ findZeroInitOp(Value accUse, scf::ForOp forOp, bool &loopArgIsZero) {
     return std::nullopt;
   }
   if (auto selOp = dyn_cast<arith::SelectOp>(defOp)) {
+    // A select can preserve the same zero-initialized loop accumulator along
+    // both arms without either arm being a literal zero.  Attention's
+    // conditional rescale is the canonical example:
+    //
+    //   scaled = acc * alpha
+    //   acc = select should_rescale, scaled, acc
+    //
+    // Both arms are zero on the first iteration, so the first MMA can
+    // initialize operand D directly.  Trace the arms independently: sharing
+    // loopArgIsZero while visiting the first arm would otherwise make an
+    // unsupported second arm look zero-preserving.
+    bool trueLoopArgIsZero = false;
+    bool falseLoopArgIsZero = false;
+    auto trueOrigin =
+        findZeroInitOp(selOp.getTrueValue(), forOp, trueLoopArgIsZero);
+    auto falseOrigin =
+        findZeroInitOp(selOp.getFalseValue(), forOp, falseLoopArgIsZero);
+    if (!trueOrigin && !falseOrigin && trueLoopArgIsZero &&
+        falseLoopArgIsZero) {
+      loopArgIsZero = true;
+      return std::nullopt;
+    }
+
+    // Rewriting a conditional zero into a scalar use-accumulator flag requires
+    // a scalar condition.  Tensor conditions are nevertheless safe in the
+    // both-arms-preserve-zero case handled above because the condition itself
+    // does not affect first-iteration initialization.
     if (!selOp.getCondition().getType().isInteger(1))
       return std::nullopt;
     if (isConstantZeroTensor(selOp.getTrueValue()) ||
