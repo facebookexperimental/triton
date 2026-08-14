@@ -2,6 +2,7 @@
 // RUN: triton-opt %s -split-input-file --nvgpu-test-ws-memory-planner="num-buffers=3 smem-alloc-algo=1 smem-budget=200000" | FileCheck %s --check-prefix=TIGHT
 // RUN: triton-opt %s -split-input-file --nvgpu-test-ws-memory-planner="num-buffers=3 smem-alloc-algo=1 smem-budget=250000" | FileCheck %s --check-prefix=FULL
 // RUN: triton-opt %s -split-input-file --nvgpu-test-ws-memory-planner="num-buffers=3 smem-alloc-algo=1 smem-budget=220000 smem-plan-search" | FileCheck %s --check-prefix=SEARCH
+// RUN: sed -e '/%%0 = scf.for %%iv = %%c0 to %%c10 step %%c1 iter_args(%%arg0 = %%c0)/c\    %%0 = scf.while (%%arg0 = %%c0) : (i32) -> i32 { scf.condition(%%true) %%arg0 : i32 } do { ^bb0(%%arg0: i32):' -e 's/} {async_task_id = array<i32: 0, 1, 2>, tt.warp_specialize}/} attributes {async_task_id = array<i32: 0, 1, 2>, tt.smem_budget = 200000 : i32, tt.warp_specialize}/' %s | triton-opt - -split-input-file --nvgpu-test-ws-memory-planner="num-buffers=3 smem-alloc-algo=1 smem-budget=220000" | FileCheck %s --check-prefix=WHILE-BUDGET
 
 // Test: TMA-fed MMA operands keep their configured pipeline depth before
 // Phase 3.7 reserves fused epilogue copies from the remaining budget.
@@ -42,6 +43,12 @@
 // SEARCH-LABEL: @epilogue_multicopy
 // SEARCH: ttg.local_alloc {buffer.copy = 3 : i32{{.*}}128x64xf16
 // SEARCH: ttg.local_alloc {buffer.copy = 3 : i32{{.*}}64x256xf16
+
+// A CLC-style scf.while must honor its 200000-byte per-loop override rather
+// than the pass-level 220000-byte budget, leaving one fused epilogue copy.
+// WHILE-BUDGET-LABEL: @epilogue_multicopy
+// WHILE-BUDGET: ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = [[WHILE_ID:[0-9]+]] : i32}{{.*}}128x128xf16
+// WHILE-BUDGET: ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = [[WHILE_ID]] : i32}{{.*}}128x128xf16
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
 #blocked1 = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
