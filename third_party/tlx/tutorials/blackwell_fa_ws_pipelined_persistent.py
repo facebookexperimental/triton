@@ -1392,7 +1392,7 @@ configs_bwd_2cta = [
             "NUM_COMPUTE_SLICES": 2,
             "DQ_REDUCE_STAGES": 2,
             "DQ_REDUCE_NCOL": 32,
-            "EPILOGUE_SUBTILE": 8,
+            "EPILOGUE_SUBTILE": 4,
             "GROUP_SIZE_M": 1,
             "USE_WARP_BARRIER": False,
             "NUM_CTAS": 2,
@@ -2607,7 +2607,8 @@ def _attn_bwd_ws(
     DQ_STORE_M: tl.constexpr = BLOCK_M1 // NUM_CTAS
     DQ_SLICE_N: tl.constexpr = HEAD_DIM // EPILOGUE_SUBTILE
     if USE_2CTA:
-        dq_store_buf = tlx.local_alloc((BLOCK_M1, DQ_SLICE_N), tlx.dtype_of(desc_dq), 2)
+        DQ_STORE_STAGES: tl.constexpr = 1 if EPILOGUE_SUBTILE == 4 else 2
+        dq_store_buf = tlx.local_alloc((BLOCK_M1, DQ_SLICE_N), tlx.dtype_of(desc_dq), DQ_STORE_STAGES)
     else:
         DQ_REDUCE_ITERS: tl.constexpr = HEAD_DIM // DQ_REDUCE_NCOL
         dq_store_buf = tlx.local_alloc((BLOCK_M1, DQ_REDUCE_NCOL), tlx.dtype_of(desc_dq), DQ_REDUCE_STAGES)
@@ -2987,8 +2988,8 @@ def _attn_bwd_ws(
                     dq_full = dq_full * LN2
                     dq_slices = _split_n_2D(dq_full, DQ_PACK_ITERS)
                     for slice_id in tl.static_range(DQ_PACK_ITERS):
-                        dq_smem = dq_store_buf[slice_id % 2]
-                        tlx.async_descriptor_store_wait(1)
+                        dq_smem = dq_store_buf[slice_id % DQ_STORE_STAGES]
+                        tlx.async_descriptor_store_wait(DQ_STORE_STAGES - 1)
                         tlx.local_store(dq_smem, dq_slices[slice_id].to(tlx.dtype_of(desc_dq)))
                         tlx.async_descriptor_store(
                             desc_dq,
