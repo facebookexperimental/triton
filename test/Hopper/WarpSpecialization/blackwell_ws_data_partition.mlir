@@ -65,6 +65,7 @@ module attributes {ttg.max_reg_auto_ws = 152 : i32, ttg.min_reg_auto_ws = 24 : i
         // CHECK-SAME: \22order\22:\220\22
         // CHECK-SAME: \22stage\22:\220\22
         // CHECK: ttng.tmem_load
+        // CHECK: }) : (tensor<128xi1, {{.*}}>) -> i1
         // CHECK: ttng.tmem_load
         // CHECK: ttng.tmem_store
         // CHECK: ttng.tc_gen5_mma
@@ -74,6 +75,7 @@ module attributes {ttg.max_reg_auto_ws = 152 : i32, ttg.min_reg_auto_ws = 24 : i
         // CHECK-SAME: \22order\22:\222\22
         // CHECK-SAME: \22stage\22:\220\22
         // CHECK: ttng.tmem_load
+        // CHECK: }) : (tensor<128xi1, {{.*}}>) -> i1
         // CHECK: ttng.tmem_load
         // CHECK: ttng.tmem_store
         // CHECK: ttng.tc_gen5_mma
@@ -90,6 +92,13 @@ module attributes {ttg.max_reg_auto_ws = 152 : i32, ttg.min_reg_auto_ws = 24 : i
         %mask = arith.cmpf ogt, %arg7, %v_5 : tensor<256xf32, #ttg.slice<{dim = 1, parent = #blocked}>>
         %mask_23 = arith.cmpf une, %arg7, %arg7 : tensor<256xf32, #ttg.slice<{dim = 1, parent = #blocked}>>
         %mask_24 = arith.ori %mask, %mask_23 : tensor<256xi1, #ttg.slice<{dim = 1, parent = #blocked}>>
+        // A scalar vote guarding a partitioned TMEM update must be recomputed
+        // independently from each 128-row slice.
+        %rescale_vote = "tt.reduce"(%mask_24) <{axis = 0 : i32}> ({
+        ^bb0(%lhs: i1, %rhs: i1):
+          %vote = arith.ori %lhs, %rhs : i1
+          tt.reduce.return %vote : i1
+        }) : (tensor<256xi1, #ttg.slice<{dim = 1, parent = #blocked}>>) -> i1
         %v_6 = arith.select %mask_24, %arg7, %v_5 : tensor<256xi1, #ttg.slice<{dim = 1, parent = #blocked}>>, tensor<256xf32, #ttg.slice<{dim = 1, parent = #blocked}>>
         %v_8 = arith.mulf %qk_21, %cst_1 : tensor<256x128xf32, #blocked>
         %subscript = tt.expand_dims %v_6 {axis = 1 : i32} : tensor<256xf32, #ttg.slice<{dim = 1, parent = #blocked}>> -> tensor<256x1xf32, #blocked>
@@ -117,7 +126,7 @@ module attributes {ttg.max_reg_auto_ws = 152 : i32, ttg.min_reg_auto_ws = 24 : i
         %inline_triton_result_3_32 = tt.reshape %inline_triton_result_3_31 : tensor<256x2x64xf32, #blocked2> -> tensor<256x128xf32, #blocked>
         %v_13 = arith.truncf %v_10 : tensor<256x128xf32, #blocked> to tensor<256x128xbf16, #blocked>
         %acc_33 = ttng.tmem_alloc %v_13 : (tensor<256x128xbf16, #blocked>) -> !ttg.memdesc<256x128xbf16, #tmem1, #ttng.tensor_memory>
-        %acc_34 = ttng.tmem_store %inline_triton_result_3_32, %acc[%acc_27], %true : tensor<256x128xf32, #blocked> -> !ttg.memdesc<256x128xf32, #tmem, #ttng.tensor_memory, mutable>
+        %acc_34 = ttng.tmem_store %inline_triton_result_3_32, %acc[%acc_27], %rescale_vote : tensor<256x128xf32, #blocked> -> !ttg.memdesc<256x128xf32, #tmem, #ttng.tensor_memory, mutable>
         %acc_35 = ttng.tc_gen5_mma %acc_33, %v_j_load_18, %acc[%acc_34], %true, %true {tt.autows = "{\22two_cta_interleave_role\22:\22pv\22}"} : !ttg.memdesc<256x128xbf16, #tmem1, #ttng.tensor_memory>, !ttg.memdesc<128x128xbf16, #shared2, #smem>, !ttg.memdesc<256x128xf32, #tmem, #ttng.tensor_memory, mutable>
         %v_14 = arith.mulf %arg8, %v_12 : tensor<256xf32, #ttg.slice<{dim = 1, parent = #blocked}>>
         %v_3 = arith.addf %v_14, %l_ij : tensor<256xf32, #ttg.slice<{dim = 1, parent = #blocked}>>
