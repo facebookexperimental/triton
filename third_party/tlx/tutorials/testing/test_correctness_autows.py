@@ -7,6 +7,8 @@ Run:
     pytest third_party/tlx/tutorials/testing/test_correctness_autows.py
 """
 
+import os
+
 import pytest
 import torch
 import triton
@@ -182,6 +184,57 @@ def test_autows_fa_2cta_persistent_multi_iteration():
     try:
         actual = _autows_fa(q, k, v, False, sm_scale, "ws_persistent", True, 1, False)
         torch.testing.assert_close(actual, reference, atol=1e-2, rtol=0)
+    finally:
+        _attn_fwd_persist.configs = old_configs
+        _attn_fwd_persist.cache = old_cache
+
+
+@pytest.mark.parametrize("N_CTX", [1024, 4096])
+@pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell GPU")
+def test_autows_fa_rescale_opt_long_sequence(N_CTX):
+    """Cover the optimized accumulator update at both target sequence lengths."""
+    num_ctas = int(os.environ.get("AUTOWS_FWD_NUM_CTAS", "1"))
+    config = next(config for config in _autows_fwd_configs if config.kwargs.get("NUM_CTAS", 1) == num_ctas)
+    assert config.kwargs["RESCALE_OPT"]
+
+    old_configs = _attn_fwd_persist.configs
+    old_cache = _attn_fwd_persist.cache
+    _attn_fwd_persist.configs = [config]
+    _attn_fwd_persist.cache = {}
+
+    sm_scale = 0.5
+    q, k, v = FlashAttention.create_inputs(2, 2, N_CTX, 128)
+    reference = FlashAttention.get_reference(q, k, v, sm_scale, causal=False)
+    try:
+        actual = _autows_fa(q, k, v, False, sm_scale, "ws_persistent", True, 1, False)
+        torch.testing.assert_close(actual, reference, atol=1e-2, rtol=0)
+    finally:
+        _attn_fwd_persist.configs = old_configs
+        _attn_fwd_persist.cache = old_cache
+
+
+@pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell GPU")
+@pytest.mark.skipif(
+    os.environ.get("AUTOWS_FWD_CLC") != "1" or os.environ.get("AUTOWS_FWD_NUM_CTAS") != "2",
+    reason="Run with AUTOWS_FWD_CLC=1 and AUTOWS_FWD_NUM_CTAS=2",
+)
+def test_autows_fa_rescale_opt_clc_repeated_high_grid():
+    """Stress repeated 2-CTA CLC launches across many persistent tiles."""
+    config = next(config for config in _autows_fwd_configs if config.kwargs.get("NUM_CTAS") == 2)
+    assert config.kwargs["RESCALE_OPT"]
+
+    old_configs = _attn_fwd_persist.configs
+    old_cache = _attn_fwd_persist.cache
+    _attn_fwd_persist.configs = [config]
+    _attn_fwd_persist.cache = {}
+
+    sm_scale = 0.5
+    q, k, v = FlashAttention.create_inputs(4, 48, 1024, 128)
+    reference = FlashAttention.get_reference(q, k, v, sm_scale, causal=False)
+    try:
+        for _ in range(5):
+            actual = _autows_fa(q, k, v, False, sm_scale, "ws_persistent", True, 1, False)
+            torch.testing.assert_close(actual, reference, atol=1e-2, rtol=0)
     finally:
         _attn_fwd_persist.configs = old_configs
         _attn_fwd_persist.cache = old_cache

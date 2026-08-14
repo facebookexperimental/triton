@@ -3035,6 +3035,43 @@ void PartitionSchedulingMeta::runOnOperation() {
 
       fixupScalarPartitions();
 
+      // A predicated TMEM read-modify-write becomes an scf.if only after code
+      // specialization. Until then, keep its scalar predicate chain in the
+      // same partition as the store: code partitioning does not materialize
+      // scalar channels. Stop at the first tensor value, which can use the
+      // ordinary cross-partition channel machinery. FA forward uses this to
+      // move each partition-local reduce-or vote into the correction task.
+      getLoopBodyRegion(loop).walk([&](ttng::TMEMStoreOp store) {
+        if (!store.getPred().getType().isInteger(1))
+          return;
+        if (store.getPred().getDefiningOp<arith::ConstantOp>())
+          return;
+        SetVector<int> storeIds = safeGetPartitionIds(store);
+        if (storeIds.size() != 1)
+          return;
+        SmallVector<Operation *> worklist;
+        if (Operation *def = store.getPred().getDefiningOp())
+          worklist.push_back(def);
+        DenseSet<Operation *> seen;
+        while (!worklist.empty()) {
+          Operation *op = worklist.pop_back_val();
+          if (!seen.insert(op).second ||
+              op->getParentRegion() != store->getParentRegion())
+            continue;
+          if (llvm::any_of(op->getResults(), [](Value result) {
+                return isa<RankedTensorType>(result.getType());
+              }))
+            continue;
+          op->walk([&](Operation *nested) { setPartition(nested, storeIds); });
+          for (Value operand : op->getOperands()) {
+            if (isa<RankedTensorType>(operand.getType()))
+              continue;
+            if (Operation *def = operand.getDefiningOp())
+              worklist.push_back(def);
+          }
+        }
+      });
+
       // Backstop: verify no two accumulator-chained MMAs were assigned to
       // partitions that cannot be co-located. The data-partition grouping
       // (Layer 1) should keep them together, but any other assignment path
