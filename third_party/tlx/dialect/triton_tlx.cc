@@ -1242,6 +1242,7 @@ void init_triton_tlx_ir(py::module &&m) {
       .def("create_warp_specialize_op",
            [](TritonOpBuilder &self, std::vector<int> partitionNumWarps,
               std::optional<std::vector<int>> requestedRegisters,
+              std::optional<int> defaultRequestedRegisters,
               int numPartitionRegions,
               std::optional<std::vector<int>> warpGroupStartIds)
                -> ttg::WarpSpecializeOp {
@@ -1250,6 +1251,7 @@ void init_triton_tlx_ir(py::module &&m) {
                  dummyTypes, partitionNumWarps, numPartitionRegions);
 
              wsOp.setRequestedRegisters(requestedRegisters);
+             wsOp.setDefaultRequestedRegisters(defaultRequestedRegisters);
              wsOp.setWarpGroupStartIds(warpGroupStartIds);
 
              return wsOp;

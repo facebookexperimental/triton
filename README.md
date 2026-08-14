@@ -814,9 +814,33 @@ Examples: how mbarriers are communicated in warp specialization
 |-----------|-------------|
 | `"default"` | First positional argument to mark this as the default/trunk task |
 | `num_warps` | Number of warps to reserve for this task |
-| `num_regs` | Number of registers per thread (optional, for register allocation tuning). When provided, it must be divisible by 8. |
+| `num_regs` | Number of registers per thread (optional, for register allocation tuning). It is supported by both default and non-default tasks and must be divisible by 8. |
 | `replicate` | Number of replicas for this task (default: 1). Creates multiple copies of the task region |
 | `warp_group_start_id` | Starting warp ID for this task (optional). Allows explicit control over warp assignment |
+
+#### Default Task Register Budget
+
+Register budgets are specified per thread. When the default task does not set
+`num_regs`, register allocation keeps the original donation model: non-default
+warp groups receive their requested budgets, and the default task receives the
+remaining registers.
+
+Setting `num_regs` on the default task selects a fixed budget instead:
+
+```python
+with tlx.async_tasks():
+    with tlx.async_task("default", num_regs=80):
+        ...
+    with tlx.async_task(num_warps=4, num_regs=24):
+        ...
+```
+
+In this example, the default and non-default tasks receive 80 and 24 registers
+per thread, respectively. The default task does not absorb unused registers.
+Non-default warp groups without an explicit budget evenly share the remaining
+register pool. If every task has a fixed budget, any surplus is left unused.
+The compiler may raise a request to the hardware or instrumentation safety
+minimum when required.
 
 #### Explicit Warp Assignment with warp_group_start_id
 

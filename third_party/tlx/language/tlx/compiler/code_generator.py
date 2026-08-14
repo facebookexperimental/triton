@@ -233,12 +233,14 @@ def visit_withAsyncTasks(self, node):
             region_replica_id_stack.append(-1)  # dummy placeholder
 
             num_default = 0
+            default_num_regs = None
             for stmt in stmts:
                 task = _get_async_task(self, stmt)
                 assert task.is_explict
                 assert task.replicate is not None, "Replicate must be non-None task"
                 if task.is_default:
                     num_default += 1
+                    default_num_regs = task.num_regs
                     if task.replicate > 1:
                         task_replicas.append(task.replicate - 1)
                         task_num_warps.extend([self.builder.options.num_warps] * (task.replicate - 1))
@@ -285,6 +287,7 @@ def visit_withAsyncTasks(self, node):
         ws_op = self.builder.create_warp_specialize_op(
             task_num_warps,
             task_num_regs if task_num_regs else None,
+            default_num_regs if default_num_regs else None,
             sum(task_replicas),
             task_warp_group_start_ids if task_warp_group_start_ids else None,
         )

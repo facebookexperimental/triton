@@ -1478,7 +1478,7 @@ void WarpSpecializeOp::build(OpBuilder &builder, OperationState &state,
                              TypeRange resultTypes,
                              ArrayRef<int32_t> partitionNumWarps,
                              unsigned partitionNumRegions) {
-  build(builder, state, resultTypes, partitionNumWarps, {}, {}, {});
+  build(builder, state, resultTypes, partitionNumWarps, {}, {}, {}, {});
   OpBuilder::InsertionGuard guard(builder);
   builder.createBlock(state.regions.back().get());
   WarpSpecializePartitionsOp::create(builder, state.location,
@@ -1489,7 +1489,7 @@ void WarpSpecializeOp::build(OpBuilder &builder, OperationState &state,
 void WarpSpecializeOp::build(OpBuilder &builder, OperationState &state,
                              TypeRange resultTypes,
                              ArrayRef<int32_t> partitionNumWarps) {
-  build(builder, state, resultTypes, partitionNumWarps, {}, {}, {});
+  build(builder, state, resultTypes, partitionNumWarps, {}, {}, {}, {});
 }
 
 ParseResult WarpSpecializeOp::parse(OpAsmParser &p, OperationState &result) {
