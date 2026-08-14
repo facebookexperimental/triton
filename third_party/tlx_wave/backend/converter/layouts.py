@@ -1025,14 +1025,34 @@ def local_memory_bit_offset_relation(
     physical_coords = tuple(coord + origin for coord, origin in zip(logical_coords, logical_origin))
     for coord, extent in zip(physical_coords, physical_shape):
         goals.extend((coord >= 0, coord < extent))
-    if (address_layout is not None and not address_layout.prefix_shape and logical_shape == physical_shape
-            and not any(logical_origin) and all(_is_power_of_two(interval) for interval in intervals)):
+    origin_is_aligned_tile = all(origin % logical == 0 and origin + logical <= physical
+                                 for logical, physical, origin in zip(logical_shape, physical_shape, logical_origin))
+    if (address_layout is not None and not address_layout.prefix_shape and origin_is_aligned_tile
+            and all(_is_power_of_two(extent) for extent in (*logical_shape, *physical_shape))
+            and all(logical <= physical for logical, physical in zip(logical_shape, physical_shape))
+            and all(_is_power_of_two(interval) for interval in intervals)):
+        # A zero-origin power-of-two subview is the restriction of the parent
+        # allocation's LinearLayout to a smaller output domain.  Widen only
+        # the declared output domains before composing with the shared map;
+        # the bases, and therefore every represented coordinate, stay exact.
+        # This keeps allocation addressing in one GF(2) composition instead
+        # of expanding coordinates and rediscovering the same bit relation.
+        if logical_shape != physical_shape:
+            item_linear = LinearLayout.from_bases(
+                tuple((str(name), tuple(tuple(int(value)
+                                              for value in basis)
+                                        for basis in bases))
+                      for name, bases in item_linear.bases),
+                tuple(f"dim{dim}" for dim in range(len(physical_shape))),
+                physical_shape,
+                False,
+            )
         physical_layout = _compose_linear_layouts(
             item_linear,
             address_layout.linear_layout,
         )
         mapped = None
-        if not any(paddings):
+        if not any(paddings) and not any(logical_origin):
             mapped = _symbolic_layout_field_formula(
                 dsl,
                 physical_layout,
@@ -1040,6 +1060,20 @@ def local_memory_bit_offset_relation(
                 combine_with_xor=False,
             )
         physical_bits = (None if mapped is not None else _symbolic_layout_bits(dsl, physical_layout, physical_inputs))
+        if any(logical_origin):
+            origin_address = _symbolic_layout_formula(
+                dsl,
+                address_layout.linear_layout,
+                {f"dim{dim}": dsl.ixs_int(int(origin))
+                 for dim, origin in enumerate(logical_origin)},
+            )
+            origin_block = int(origin_address["block"].eval({}))
+            if origin_block:
+                raise ValueError("symbolic local memory tile origin selects another allocation block")
+            origin_offset = int(origin_address["offset"].eval({}))
+            offset_bits = physical_bits["offset"]
+            physical_bits["offset"] = tuple(
+                dsl.xor(bit, 1) if origin_offset & (1 << index) else bit for index, bit in enumerate(offset_bits))
         goals.append(
             dsl.ixs_eq(
                 mapped["block"] if mapped is not None else _symbolic_bits_to_int(dsl, physical_bits["block"]),
@@ -1510,7 +1544,11 @@ def _symbolic_layout_bits(dsl, linear, inputs):
 def _symbolic_bits_to_int(dsl, bits):
     result = dsl.ixs_int(0)
     for bit, value in enumerate(bits):
-        result = dsl.xor(result, (1 << bit) * value)
+        # Output bits occupy disjoint integer weights.  Reconstructing the
+        # integer with addition is the canonical arithmetic form and exposes
+        # byte adjacency directly; XOR is needed only inside an individual
+        # GF(2) output bit.
+        result += (1 << bit) * value
     return result
 
 
