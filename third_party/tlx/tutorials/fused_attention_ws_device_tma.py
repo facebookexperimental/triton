@@ -157,8 +157,12 @@ def _attn_fwd_subtile(
 
     # -- update output accumulator --
     if RESCALE_OPT:
-        needs_rescale = (~rescale_mask).to(tl.int32)
-        should_rescale = tl.reshape(tl.reduce(needs_rescale, axis=0, combine_fn=_reduce_or), ()) != 0
+        # Derive the correction vote from the finalized alpha tile.  The
+        # correction task already consumes alpha for the accumulator multiply,
+        # so this lets AutoWS compute the vote beside that load instead of
+        # materializing a second cross-partition needs_rescale channel.
+        needs_rescale = alpha < 1.0
+        should_rescale = tl.reshape(tl.reduce(needs_rescale, axis=0, combine_fn=_reduce_or), ())
         scaled_acc = _rescale_accumulator(acc, alpha, SUBTILING, VECT_MUL)
         # Keep this as an eager SSA select until the accumulator is placed in
         # TMEM. HoistTMEMAlloc first folds it into a predicated TMEM store;
