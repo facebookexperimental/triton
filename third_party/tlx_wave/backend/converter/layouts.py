@@ -1005,24 +1005,14 @@ def local_memory_bit_offset_relation(
     goals = []
     element_bits = element_byte_width * 8
     allocation_bits = allocation_bytes * 8
-    item_linear = _packet_item_bit_linear_layout(
+    item_linear = _packet_item_linear_layout(
         linear,
         lane_width,
         warp_count,
     )
-    lane_bits = lane_width.bit_length() - 1
-
-    def item_bit(bit):
-        if bit < lane_bits:
-            return dsl.floor(dsl.mod(item, 1 << (bit + 1)) / (1 << bit))
-        warp_bit = bit - lane_bits
-        warp = dsl.floor(item / lane_width)
-        return dsl.floor(dsl.mod(warp, 1 << (warp_bit + 1)) / (1 << warp_bit))
-
     physical_inputs = {
         "slot": slot,
-        **{f"item{bit}": item_bit(bit)
-           for bit in range((lane_width * warp_count).bit_length() - 1)},
+        "item": item,
     }
     logical_by_name = _symbolic_layout_formula(
         dsl,
@@ -1038,24 +1028,18 @@ def local_memory_bit_offset_relation(
     if (address_layout is not None and not address_layout.prefix_shape and logical_shape == physical_shape
             and not any(logical_origin) and all(_is_power_of_two(interval) for interval in intervals)):
         physical_layout = _compose_linear_layouts(
-            linear,
+            item_linear,
             address_layout.linear_layout,
         )
-        layout_inputs = {
-            "register": slot,
-            "lane": dsl.mod(item, lane_width),
-            "warp": dsl.floor(item / lane_width),
-            "block": dsl.ixs_int(0),
-        }
         mapped = None
         if not any(paddings):
             mapped = _symbolic_layout_field_formula(
                 dsl,
                 physical_layout,
-                layout_inputs,
+                physical_inputs,
                 combine_with_xor=False,
             )
-        physical_bits = (None if mapped is not None else _symbolic_layout_bits(dsl, physical_layout, layout_inputs))
+        physical_bits = (None if mapped is not None else _symbolic_layout_bits(dsl, physical_layout, physical_inputs))
         goals.append(
             dsl.ixs_eq(
                 mapped["block"] if mapped is not None else _symbolic_bits_to_int(dsl, physical_bits["block"]),
