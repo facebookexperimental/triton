@@ -323,7 +323,11 @@ class HIPLauncher(object):
         tensordesc_meta = getattr(metadata, "tensordesc_meta", None)
         launcher = triton.runtime.driver.active.utils.launch
         expanded_signature = expand_signature(signature.values(), tensordesc_meta, "tensordesc")
-        self.arg_annotations = annotate_arguments(expanded_signature)
+        # Most kernels already have a flat, constexpr-free runtime signature.
+        # Let the C launcher consume their argument tuple directly instead of
+        # walking an equivalent annotation tree on every launch.
+        is_flat_signature = all(not isinstance(arg, tuple) and arg != "constexpr" for arg in expanded_signature)
+        self.arg_annotations = None if is_flat_signature else annotate_arguments(expanded_signature)
         self.kernel_signature = make_kernel_signature(expanded_signature)
         self.launch = wrap_handle_tensordesc(launcher, signature, tensordesc_meta)
         self.launch_cooperative_grid = metadata.launch_cooperative_grid
