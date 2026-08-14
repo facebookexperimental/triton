@@ -238,6 +238,7 @@ class CUDAOptions:
     # Emit device-side descriptors (make_tensor_descriptor + descriptor_load/store)
     # instead of host TMA recipes. Falls back to knobs.nvidia.auto_tma_device.
     auto_tma_device: bool = False
+    enable_tree_reduction: bool = False
 
     def __post_init__(self):
         default_libdir = Path(__file__).parent / "lib"
@@ -311,6 +312,11 @@ class CUDABackend(BaseBackend):
         args = {"arch": knobs.runtime.override_arch or f"sm{self.target.arch}"}
         args.update({k: opts[k] for k in CUDAOptions.__dataclass_fields__.keys() if k in opts if opts[k] is not None})
         capability = int(self._parse_arch(args["arch"]))
+
+        if "enable_tree_reduction" not in args:
+            # Preserve the established ordering before Blackwell while using
+            # linear ordering for the Blackwell workloads it targets.
+            args["enable_tree_reduction"] = capability < 100
 
         if args.get("num_ctas", 1) > 1 and capability < 90:
             raise ValueError((f"num_ctas > 1 requires NVIDIA SM90+ (Hopper). "
@@ -1159,7 +1165,13 @@ class CUDABackend(BaseBackend):
         nvidia.passes.ttnvgpuir.add_proxy_fence_insertion(pm, capability)
         nvidia.passes.hopper.add_tma_store_token_wait_lowering(pm)
         nvidia.passes.ttnvgpuir.add_tmem_barrier_insertion(pm)
-        nvidia.passes.ttgpuir.add_to_llvmir(pm, capability, ptx_version, "consan" in options.instrumentation_mode)
+        nvidia.passes.ttgpuir.add_to_llvmir(
+            pm,
+            capability,
+            ptx_version,
+            "consan" in options.instrumentation_mode,
+            options.enable_tree_reduction,
+        )
         nvidia.passes.ttnvgpuir.add_initialize_ws_cluster_barriers(pm, capability, ptx_version)
         passes.ttgpuir.add_canonicalize_llvm_ir(pm)
         passes.common.add_cse(pm)

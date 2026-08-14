@@ -50,6 +50,12 @@ void init_triton_amd_passes_ttgpuir(py::module &&m) {
         [](mlir::PassManager &pm, const std::string &arch, bool ftz) {
           pm.addPass(createConvertTritonAMDGPUToLLVMPass(arch, ftz));
         });
+  m.def("add_to_llvmir",
+        [](mlir::PassManager &pm, const std::string &arch, bool ftz,
+           bool enableTreeReduction) {
+          pm.addPass(createConvertTritonAMDGPUToLLVMPass(
+              arch, ftz, enableTreeReduction));
+        });
   m.def("add_builtin_func_to_llvmir",
         [](mlir::PassManager &pm, const std::string &arch, bool ftz) {
           pm.addPass(createConvertBuiltinFuncToLLVMPass(arch, ftz));

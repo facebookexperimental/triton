@@ -104,6 +104,7 @@ class HIPOptions:
     launch_cooperative_grid: bool = False
     launch_cluster: bool = False  # No-op placeholder
     multicast: bool = False  # No-op placeholder (TMA multicast is NVIDIA-only)
+    enable_tree_reduction: bool = False
     matrix_instr_nonkdim: int = 0
     kpack: int = 1
     allow_flush_denorm: bool = False
@@ -502,7 +503,12 @@ class HIPBackend(BaseBackend):
         ## 3. __HIP_FTZ is default to 1 and not exposed as a kernel argument.
         ##    For now it is used as a controller for developers only.
         __HIP_FTZ = True
-        amd.passes.ttgpuir.add_to_llvmir(pm, options.arch, __HIP_FTZ)
+        amd.passes.ttgpuir.add_to_llvmir(
+            pm,
+            options.arch,
+            __HIP_FTZ,
+            options.enable_tree_reduction,
+        )
         amd.passes.ttgpuir.add_warp_specialize_to_llvm(pm, options.arch)
         passes.common.add_canonicalizer(pm)
         passes.common.add_cse(pm)
