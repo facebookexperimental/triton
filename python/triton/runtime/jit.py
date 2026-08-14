@@ -494,7 +494,7 @@ class KernelInterface(Generic[T]):
     def run(self, *args, grid, warmup, **kwargs):
         raise NotImplementedError("run not implemented")
 
-    def __getitem__(self, grid) -> T:
+    def __getitem__(self: "KernelInterface[Callable[..., R]]", grid) -> Callable[..., R]:
         """
         A JIT function is launched with: fn[grid](*args, **kwargs).
         Hence JITFunction.__getitem__ returns a callable proxy that
@@ -1368,7 +1368,7 @@ class JITFunction(JITCallable, KernelInterface[T]):
                             [attrs], warmup)
         return kernel
 
-    def __call__(self: "JITFunction[Callable[P, R]]", *args: P.args, **kwargs: P.kwargs) -> R:
+    def __call__(self: "JITFunction[Callable[..., R]]", *args: Any, **kwargs: Any) -> R:
         raise RuntimeError("Cannot call @triton.jit'd outside of the scope of a kernel")
 
     if TYPE_CHECKING:

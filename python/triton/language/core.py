@@ -4026,26 +4026,33 @@ class AutoWSLoopOptions(base_value):
     option is one new field), and the code generator emits them identically onto
     ``scf.for`` and ``scf.while``. See ``tl.range`` for the per-option docs.
     """
-    num_stages: Optional[constexpr] = field(default=None, metadata=_loop_attr("tt.num_stages", "int32"))
-    loop_unroll_factor: Optional[constexpr] = field(default=None, metadata=_loop_attr("tt.loop_unroll_factor", "int32"))
-    disallow_acc_multi_buffer: bool = field(default=False, metadata=_loop_attr("tt.disallow_acc_multi_buffer", "unit"))
-    flatten: bool = field(default=False, metadata=_loop_attr("tt.flatten", "unit"))
-    warp_specialize: bool = field(default=False, metadata=_loop_attr("tt.warp_specialize", "unit"))
-    multi_cta: bool = field(default=False, metadata=_loop_attr("tt.multi_cta", "unit"))
-    disable_licm: bool = field(default=False, metadata=_loop_attr("llvm.loop_annotation", "licm"))
-    data_partition_factor: Optional[constexpr] = field(default=None,
-                                                       metadata=_loop_attr("tt.data_partition_factor", "int32"))
-    list_schedule_pick: Optional[constexpr] = field(default=None, metadata=_loop_attr("tt.list_schedule_pick", "int32"))
-    mem_plan_pick: Optional[constexpr] = field(default=None, metadata=_loop_attr("tt.mem_plan_pick", "int32"))
-    merge_epilogue: bool = field(default=False, metadata=_loop_attr("tt.merge_epilogue", "bool"))
-    merge_epilogue_to_computation: bool = field(default=False, metadata=_loop_attr("tt.merge_epilogue_to_computation",
-                                                                                   "bool"))
-    merge_correction: bool = field(default=False, metadata=_loop_attr("tt.merge_correction", "bool"))
-    separate_epilogue_store: bool = field(default=False, metadata=_loop_attr("tt.separate_epilogue_store", "bool"))
-    tmem_alloc_algo: Optional[constexpr] = field(default=None, metadata=_loop_attr("tt.tmem_alloc_algo", "int32"))
-    smem_alloc_algo: Optional[constexpr] = field(default=None, metadata=_loop_attr("tt.smem_alloc_algo", "int32"))
-    smem_budget: Optional[constexpr] = field(default=None, metadata=_loop_attr("tt.smem_budget", "int32"))
-    smem_circular_reuse: Optional[bool] = field(default=None, metadata=_loop_attr("tt.smem_circular_reuse", "bool_opt"))
+    num_stages: int | constexpr | None = field(default=None, metadata=_loop_attr("tt.num_stages", "int32"))
+    loop_unroll_factor: int | constexpr | None = field(default=None,
+                                                       metadata=_loop_attr("tt.loop_unroll_factor", "int32"))
+    disallow_acc_multi_buffer: bool | constexpr = field(default=False,
+                                                        metadata=_loop_attr("tt.disallow_acc_multi_buffer", "unit"))
+    flatten: bool | constexpr = field(default=False, metadata=_loop_attr("tt.flatten", "unit"))
+    warp_specialize: bool | constexpr = field(default=False, metadata=_loop_attr("tt.warp_specialize", "unit"))
+    multi_cta: bool | constexpr = field(default=False, metadata=_loop_attr("tt.multi_cta", "unit"))
+    disable_licm: bool | constexpr = field(default=False, metadata=_loop_attr("llvm.loop_annotation", "licm"))
+    data_partition_factor: int | constexpr | None = field(default=None,
+                                                          metadata=_loop_attr("tt.data_partition_factor", "int32"))
+    list_schedule_pick: int | constexpr | None = field(default=None,
+                                                       metadata=_loop_attr("tt.list_schedule_pick", "int32"))
+    mem_plan_pick: int | constexpr | None = field(default=None, metadata=_loop_attr("tt.mem_plan_pick", "int32"))
+    merge_epilogue: bool | constexpr = field(default=False, metadata=_loop_attr("tt.merge_epilogue", "bool"))
+    merge_epilogue_to_computation: bool | constexpr = field(
+        default=False, metadata=_loop_attr("tt.merge_epilogue_to_computation", "bool"))
+    merge_correction: bool | constexpr = field(default=False, metadata=_loop_attr("tt.merge_correction", "bool"))
+    separate_epilogue_store: bool | constexpr = field(default=False,
+                                                       metadata=_loop_attr("tt.separate_epilogue_store", "bool"))
+    tmem_alloc_algo: int | constexpr | None = field(default=None,
+                                                     metadata=_loop_attr("tt.tmem_alloc_algo", "int32"))
+    smem_alloc_algo: int | constexpr | None = field(default=None,
+                                                     metadata=_loop_attr("tt.smem_alloc_algo", "int32"))
+    smem_budget: int | constexpr | None = field(default=None, metadata=_loop_attr("tt.smem_budget", "int32"))
+    smem_circular_reuse: bool | constexpr | None = field(default=None,
+                                                         metadata=_loop_attr("tt.smem_circular_reuse", "bool_opt"))
 
 
 @dataclass(eq=False)
