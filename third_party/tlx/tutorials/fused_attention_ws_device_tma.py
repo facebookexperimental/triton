@@ -345,6 +345,8 @@ FWD_2CTA_DP_FACTOR = int(os.environ.get("AUTOWS_FWD_DP_FACTOR", "2"))
 FWD_2CTA_MMA_SLICES = int(os.environ.get("AUTOWS_FWD_MMA_SLICES", "2"))
 FWD_2CTA_KV_NUM_STAGES = int(os.environ.get("AUTOWS_FWD_KV_NUM_STAGES", _FWD_CLC_SAFE_STAGES))
 FWD_2CTA_OUTER_NUM_STAGES = int(os.environ.get("AUTOWS_FWD_OUTER_NUM_STAGES", "1"))
+_FWD_2CTA_SMEM_BUDGET = os.environ.get("AUTOWS_FWD_SMEM_BUDGET")
+FWD_2CTA_SMEM_BUDGET = int(_FWD_2CTA_SMEM_BUDGET) if _FWD_2CTA_SMEM_BUDGET is not None else None
 
 configs = [
     triton.Config(
@@ -372,6 +374,7 @@ configs = [
             "MMA_SLICES": FWD_2CTA_MMA_SLICES,
             "KV_NUM_STAGES": FWD_2CTA_KV_NUM_STAGES,
             "OUTER_NUM_STAGES": FWD_2CTA_OUTER_NUM_STAGES,
+            "SMEM_BUDGET": FWD_2CTA_SMEM_BUDGET,
             "RESCALE_OPT": _FWD_RESCALE_OPT,
         },
         num_stages=FWD_2CTA_NUM_STAGES,
@@ -651,6 +654,7 @@ def _attn_fwd_persist(
     KV_NUM_STAGES: tl.constexpr,
     OUTER_NUM_STAGES: tl.constexpr,
     DP_FACTOR: tl.constexpr,
+    SMEM_BUDGET: tl.constexpr = None,
     USE_CLC: tl.constexpr = False,
     NUM_CTAS: tl.constexpr = 1,
     RESCALE_OPT: tl.constexpr = False,
@@ -699,6 +703,7 @@ def _attn_fwd_persist(
                 merge_epilogue=True,
                 separate_epilogue_store=True,
                 data_partition_factor=DP_FACTOR,
+                smem_budget=SMEM_BUDGET,
         ):
             # Preserve the static 2-CTA mapping: adjacent physical CTAs process
             # adjacent M tiles.  The CLC lowering adds the cluster rank to the
@@ -746,6 +751,7 @@ def _attn_fwd_persist(
                 separate_epilogue_store=True,
                 data_partition_factor=DP_FACTOR,
                 num_stages=OUTER_NUM_STAGES if NUM_CTAS == 2 else None,
+                smem_budget=SMEM_BUDGET,
         ):
             pid = tile_idx % n_tile_num
             off_hz = tile_idx // n_tile_num
