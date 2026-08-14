@@ -60,6 +60,34 @@ def _glu_b_layout():
     )
 
 
+def _glu_simple_output_layout():
+    # Exact accumulator LinearLayout consumed by the final local_load in the
+    # simple-async GLU kernel.
+    return _distributed_layout(
+        (
+            (0, 1),
+            (0, 2),
+            (0, 64),
+            (32, 0),
+            (64, 0),
+        ),
+        (
+            (1, 0),
+            (2, 0),
+            (4, 0),
+            (8, 0),
+            (0, 4),
+            (0, 8),
+        ),
+        (
+            (0, 16),
+            (0, 32),
+            (16, 0),
+        ),
+        (128, 128),
+    )
+
+
 def _padded_b_layout():
     return _distributed_layout(
         (
@@ -339,6 +367,31 @@ def _padded_shared_layout():
     )
 
 
+def _glu_simple_shared_layout():
+    inverse = LinearLayout.from_bases(
+        (
+            (
+                "dim0",
+                tuple((128 * (1 << bit), 0) for bit in range(7)),
+            ),
+            (
+                "dim1",
+                tuple((1 << bit, 0) for bit in range(7)),
+            ),
+        ),
+        ("offset", "block"),
+        (128 * 128, 1),
+        False,
+    )
+    return _shared_layout(
+        "padded_shared",
+        inverse,
+        intervals=(128, ),
+        paddings=(4, ),
+        order=(1, 0),
+    )
+
+
 def _bit_offset_relation(
         distributed,
         shared,
@@ -560,6 +613,49 @@ def test_glu_b_layout_to_symbolic_relation_matches_linear_layout():
             swizzled_column = ((column // 8) ^ (row % 16)) * 8 + column % 8
             expected = 16 * (swizzled_column + 128 * row)
             assert int(relation.eval({"item": item, "slot": slot})) == expected
+
+
+def test_glu_simple_output_layout_proves_packet_contiguity():
+    distributed = _glu_simple_output_layout()
+    dsl, relation = _bit_offset_relation(
+        distributed,
+        _glu_simple_shared_layout(),
+        warp_count=8,
+        allocation_bytes=(128 * 128 + 128 * 4) * 2,
+        shape=(128, 128),
+    )
+
+    for physical_item in range(512):
+        for physical_slot in range(32):
+            logical = distributed.linear_layout.apply({
+                "register": physical_slot,
+                "lane": physical_item % 64,
+                "warp": physical_item // 64,
+                "block": 0,
+            })
+            row = int(logical["dim0"])
+            column = int(logical["dim1"])
+            expected = 16 * (column + 132 * row)
+            assert int(relation.eval({
+                "item": physical_item,
+                "slot": physical_slot,
+            })) == expected
+
+    item = dsl.sym("item")
+    slot = dsl.sym("slot")
+    within = dsl.sym("within")
+    facts = (
+        *layouts._symbolic_range_predicates(dsl, item, 0, 511),
+        *layouts._symbolic_range_predicates(dsl, within, 0, 3),
+    )
+    for packet in range(8):
+        point = relation.subs({slot: 4 * packet + within})
+        origin = relation.subs({slot: 4 * packet})
+        checked, _normalized = dsl.ixs_check(
+            (dsl.ixs_eq(point, origin + 16 * within), ),
+            facts,
+        )
+        assert checked == (True, ), packet
 
 
 def test_lane_major_symbolic_relation_proves_b16_contiguity():
