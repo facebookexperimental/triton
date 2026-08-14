@@ -1240,12 +1240,15 @@ class ROCmAddMMWarpPipeTemplateConfigHeuristic(
         # to that case -- unit-scalar addmm and plain mm both qualify. sympy Symbol == 1
         # returns a plain False, so this stays safe for symbolic scalars.
         scalars = getattr(kernel_inputs, "_scalars", None) or {}
-        # Split-K is opt-in via TORCHINDUCTOR_TLX_SPLIT_K=1 (default off). Autotune scores
-        # each addmm candidate on the GEMM kernel's own time only and excludes the separate
-        # reduce_k kernel's latency, so a split-K TLX addmm can beat rocBLAS on the GEMM yet
-        # be net-slower e2e once the reducer is added (observed on HIM). Flip on to A/B; make
-        # it default once autotune costs the reducer during lowering. Correctness also
-        # requires alpha == beta == 1.
+        # Split-K is opt-in via TORCHINDUCTOR_TLX_SPLIT_K=1 (default off). It was gated
+        # because autotune scored each addmm candidate on the GEMM kernel's own time only
+        # and excluded the separate reduce_k kernel, so a split-K TLX addmm could beat
+        # rocBLAS on the GEMM yet be net-slower e2e (HIM: split-K on 46.4K vs off 47.6K
+        # qps T2). TritonTemplateCaller.benchmark now charges every SPLIT_K > 1 candidate
+        # for its measured reducer (see _tlx_caller_benchmark and
+        # reduce_k.reduce_k_cost_ms), which removes that asymmetry -- the default flip is
+        # a follow-up so it can be A/B'd on its own. Correctness also requires
+        # alpha == beta == 1.
         allow_split_k = (
             scalars.get("alpha", 1) == 1
             and scalars.get("beta", 1) == 1
@@ -1607,7 +1610,11 @@ from torch._inductor.codegen.triton import (
     TensorDescriptorOptions,
 )
 from .codegen import codegen_async_tma_store
-from torch._inductor.select_algorithm import TritonTemplate, TritonTemplateKernel
+from torch._inductor.select_algorithm import (
+    TritonTemplate,
+    TritonTemplateCaller,
+    TritonTemplateKernel,
+)
 from torch._inductor.virtualized import V
 
 # -- generate: inject split-K workspace_arg via the standard mechanism ------
@@ -1615,6 +1622,7 @@ from torch._inductor.virtualized import V
 # allocates the workspace tensor.  Creating it in __init__ is too late —
 # generate() has already captured workspace_arg=None for the benchmark request.
 _orig_tt_generate = TritonTemplate.generate
+_WARNED_NO_REDUCE_K_HINT = False
 
 
 def _tlx_tt_generate(self, input_nodes, layout, *args, **kwargs):  # type: ignore[no-untyped-def]
@@ -1638,10 +1646,70 @@ def _tlx_tt_generate(self, input_nodes, layout, *args, **kwargs):  # type: ignor
             inner_name="split_k_ws",
             dtype=torch.float32,
         )
-    return _orig_tt_generate(self, input_nodes, layout, *args, **kwargs)
+    choice = _orig_tt_generate(self, input_nodes, layout, *args, **kwargs)
+    if split_k > 1 and choice is not None:
+        # Tag the ChoiceCaller so benchmark() can add the reducer's cost to this
+        # candidate's score; see _tlx_caller_benchmark. optimization_hint (not int())
+        # because the layout dims can be symbolic under dynamic shapes -- autotune
+        # benchmarks at the hint, so the reducer is costed at the same shape.
+        choice._tlx_split_k = split_k
+        try:
+            from torch._inductor.virtualized import V
+
+            sizevars = V.graph.sizevars
+            choice._tlx_reduce_k_shape = (
+                int(sizevars.optimization_hint(layout.size[0])),
+                int(sizevars.optimization_hint(layout.size[1])),
+                layout.dtype,
+                len(input_nodes) >= 3,  # addmm carries a bias the reducer must add
+            )
+        except Exception as e:
+            # No usable hint -> leave the candidate uncharged rather than fail the
+            # lowering; it just keeps the old GEMM-only score. Warn once: there is one
+            # choice per tile config, so per-choice logging buries the message.
+            global _WARNED_NO_REDUCE_K_HINT
+            if not _WARNED_NO_REDUCE_K_HINT:
+                _WARNED_NO_REDUCE_K_HINT = True
+                log.warning(
+                    "split-K reducer costing disabled (candidates keep the old "
+                    "GEMM-kernel-only score): %s",
+                    e,
+                )
+            choice._tlx_reduce_k_shape = None
+    return choice
 
 
 TritonTemplate.generate = _tlx_tt_generate  # type: ignore[method-assign]
+
+# -- benchmark: charge split-K candidates for their reduce_k tail ------------
+# Autotune scores a template candidate on the GEMM kernel alone. A SPLIT_K > 1
+# candidate is not done when that kernel ends -- _reduce_k_kernel still has to sum
+# the fp32 partials, add the bias and write the output -- but it is compared against
+# SPLIT_K=1 candidates that have no such tail. That asymmetry is what let split-K win
+# selection while losing e2e (HIM: split-K on 46.4K vs off 47.6K qps T2, D114632771),
+# and is why the candidates were gated off by default. Adding the reducer here makes
+# the comparison apples-to-apples so the gate can default on.
+#
+# This is unconditional on purpose: the uncharged score is not a different policy, it
+# is a wrong number, so there is no configuration in which it is the one you want.
+# TORCHINDUCTOR_TLX_SPLIT_K=0 remains the kill switch -- it drops the split-K
+# candidates outright, which is the honest fallback if this costing ever misbehaves.
+_orig_caller_benchmark = TritonTemplateCaller.benchmark
+
+
+def _tlx_caller_benchmark(self, *args, out):  # type: ignore[no-untyped-def]
+    timing = _orig_caller_benchmark(self, *args, out=out)
+    split_k = getattr(self, "_tlx_split_k", 1)
+    shape = getattr(self, "_tlx_reduce_k_shape", None)
+    if split_k > 1 and shape is not None and _math.isfinite(timing):
+        from triton.language.extra.tlx.inductor.reduce_k import reduce_k_cost_ms
+
+        m, n, dtype, has_bias = shape
+        timing += reduce_k_cost_ms(m, n, split_k, dtype, has_bias)
+    return timing
+
+
+TritonTemplateCaller.benchmark = _tlx_caller_benchmark  # type: ignore[method-assign]
 
 # -- __init__: extract TMA_EPILOGUE_STORE from meta, set tma_store=True -----
 _orig_ttk_init = TritonTemplateKernel.__init__
