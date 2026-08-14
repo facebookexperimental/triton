@@ -624,8 +624,14 @@ void init_triton_tlx_ir(py::module &&m) {
                                    {kBlock, std::vector<std::vector<int>>{}}},
                                   outDims,
                                   /*requiresSurjective=*/true);
-             return tlx::wrapNoVerifyLayout(mlir::cast<Attribute>(
-                 ttg::LinearEncodingAttr::get(context, std::move(ll))));
+             Attribute encoding =
+                 ttg::isPermutationMatrixLayout(ll)
+                     ? mlir::cast<Attribute>(
+                           ttg::LinearEncodingAttr::get(context, std::move(ll)))
+                     : mlir::cast<Attribute>(
+                           ttg::GenericLinearEncodingAttr::get(context,
+                                                               std::move(ll)));
+             return tlx::wrapNoVerifyLayout(encoding);
            })
       .def("make_dummy_register_layout_attr",
            [](TritonOpBuilder &self, std::vector<int64_t> shape,
@@ -1379,7 +1385,7 @@ void init_triton_tlx_ir(py::module &&m) {
       .def("create_assume_uniform",
            [](TritonOpBuilder &self, Value value) -> Value {
              return self.create<ttag::AssumeUniformOp>(value.getType(), value);
-           });
+            });
 }
 
 void init_triton_tlx_passes(py::module &&m) {

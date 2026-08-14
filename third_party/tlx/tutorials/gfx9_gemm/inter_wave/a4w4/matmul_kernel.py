@@ -50,23 +50,24 @@ THE THREE CHANGES THAT GOT IT HERE
      conflicts to 0.6% and is 3x SLOWER, because 8 bytes breaks the 16-byte alignment
      ds_read_b128 needs. The pad must be a power of two and >= 16.
 
+The scale tiles now use a derived 8-byte-chunk XOR instead of padding. For
+logical coordinates (row, group), A stores row ^ ((group & 4) << 2), while B
+stores row ^ ((group & 1) << 4) ^ ((group & 4) << 3). The global offset layouts
+encode the same maps, so direct-to-LDS writes the final physical image without
+address arithmetic or reinterpretation. This reaches zero measured bank
+conflicts without ds_bpermute, ds_permute, DPP, or permlane.
+
 STRUCTURAL CEILING: 16 s_barrier per body, 8 carrying a mandatory full lgkmcnt(0) LDS
 drain. The barrier is what forces the drain, not operand granularity, so the only way
 down is to take an operand out of LDS entirely -- which also means chunked local_load
 will not help here.
 """
 
-import os
-
 import torch
 import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
 from triton.language.extra.tlx.tutorials.gfx9_gemm.skinny.a4w4 import is_skinny, skinny_matmul
-
-# Keep the LLVM post-RA machine scheduler from re-ordering the
-# warp_pipeline_stage mem/MFMA interleave.
-os.environ.setdefault("TRITON_DISABLE_POST_MISCHED", "1")
 
 BLOCK_M = 256
 BLOCK_N = 256
@@ -75,13 +76,20 @@ NUM_WARPS = 8
 GROUP_SIZE_M = 4
 NUM_XCDS = 8
 
-# The 2x-unrolled pipeline prefetches 2 K-tiles and drains 2 in the epilogue, so
-# the pipelined loop runs (K/BLOCK_K - 2)/2 trips. At exactly K == 4*BLOCK_K the
-# loop runs a SINGLE trip, which the inter-wave `tritonamdgpu-warp-pipeline`
-# transform mis-schedules on multi-tile grids (correct for grid_mn==1, races for
-# grid_mn>1). Require >= 2 loop trips (K >= 6*BLOCK_K) so the steady state is
-# always non-empty; every production a4w4 shape uses K >= 4096 anyway.
-MIN_K = 6 * BLOCK_K
+# Keep the LLVM post-RA machine scheduler from reordering this kernel's manual
+# warp_pipeline_stage mem/MFMA interleave. The AMD function attribute selects
+# LLVM's no-op post scheduler for this function only.
+_A4W4_8WAVE_LLVM_FN_ATTRS = (
+    ("amdgpu-agpr-alloc", "0,0"),
+    ("amdgpu-post-sched-strategy", "nop"),
+)
+
+# The 2x-unrolled pipeline prefetches two K tiles and drains two in the
+# epilogue, so it requires at least four tiles. The loop trip count stays a
+# runtime scalar so the generic canonicalizer cannot flatten the one-trip
+# K=1024 form and inflate its live ranges; K and KS remain constexpr to preserve
+# the pinned operand layouts.
+MIN_K = 4 * BLOCK_K
 KERNEL_NAME = "a4w4_8wave"
 
 
@@ -96,6 +104,7 @@ def _a4w4_8wave_kernel(
     M,
     N,
     K: tl.constexpr,
+    K_TILES,
     stride_am,
     stride_ak,
     stride_bn,
@@ -131,38 +140,49 @@ def _a4w4_8wave_kernel(
         shape=((2, 2, 2, 2, 2, 2, 2, 2, 2), (2, 2, 2, 2, 2)),
         stride=((16, 32, 64, 128, 4096, 8192, 256, 512, 1024), (1, 2, 4, 8, 2048)),
     )
-    # ---- A scale global-load blocked layout (#blocked, [128,8]) ----
-    blocked_a_scales: tl.constexpr = tlx.layout(
-        shape=((2, 2, 2, 2, 2, 2, 2, 2, 2), (2, 2)),
-        stride=((32, 64, 128, 256, 512, 1, 0, 2, 4), (8, 16)),
-    )
-    # ---- B scale global-load blocked layout (#blocked1, FULL [256,8]) ----
-    blocked_b_scales: tl.constexpr = tlx.layout(
-        shape=((2, 2, 2, 2, 2, 2, 2, 2, 2), (2, 2)),
-        stride=((32, 64, 128, 256, 512, 1024, 1, 2, 4), (8, 16)),
-    )
     # ---- padded shared tile layout ([128,128] fp4, pad 32 @ 1024) ----
     shared_tile: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases(
         [[1024, 32]],
         [
-            [0, 1],
-            [0, 2],
-            [0, 4],
-            [0, 8],
-            [0, 16],
-            [0, 32],
-            [0, 64],
-            [1, 0],
-            [32, 0],
-            [64, 0],
-            [2, 0],
-            [4, 0],
-            [8, 0],
-            [16, 0],
+            [0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64],
+            [1, 0], [32, 0], [64, 0], [2, 0], [4, 0], [8, 0], [16, 0],
         ],
         [HALF_M, HALF_K],
     )
-    shared_scales: tl.constexpr = tlx.swizzled_layout(0, 0, 0, order=[0, 1])
+    # Map A (row, group) to (row ^ ((group & 4) << 2), group), and map B to
+    # (row ^ ((group & 1) << 4) ^ ((group & 4) << 3), group). These are the
+    # smallest row-bit changes that make the five ds_read_b64_tr_b8 bank bases
+    # distinct: A toggles row bit 4 from group bit 2; B additionally toggles
+    # row bit 4 from group bit 0 and row bit 5 from group bit 2. Row bits 0..2
+    # remain unchanged, preserving each contiguous 8-byte global segment.
+    shared_a_scales: tl.constexpr = tlx.shared_linear_layout_encoding(
+        offset_bases=[
+            [1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0], [64, 0],
+            [0, 1], [0, 2], [16, 4],
+        ],
+        block_bases=[],
+        alignment=16,
+    )
+    shared_b_scales: tl.constexpr = tlx.shared_linear_layout_encoding(
+        offset_bases=[
+            [1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0], [64, 0], [128, 0],
+            [16, 1], [0, 2], [32, 4],
+        ],
+        block_bases=[],
+        alignment=16,
+    )
+    # Match each scale tile's physical shared offset order: two 4-byte value
+    # bits, six lane bits, then warp bits. The XOR bases live entirely in the
+    # warp mapping, so TLX resolves these to #ttg.generic_linear and gfx9 can
+    # write the swizzled LDS image directly from ordinary logical offsets.
+    scale_load_a_layout: tl.constexpr = tlx.layout(
+        shape=((2, 2, 2, 2, 2, 2, 2, 2, 2), (2, 2)),
+        stride=((32, 64, 128, 256, 512, 1, 2, 132, 0), (8, 16)),
+    )
+    scale_load_b_layout: tl.constexpr = tlx.layout(
+        shape=((2, 2, 2, 2, 2, 2, 2, 2, 2), (2, 2)),
+        stride=((32, 64, 128, 256, 512, 1024, 129, 2, 260), (8, 16)),
+    )
     # ---- MFMA scale register layouts (get_mfma_scale_layout) ----
     scale_a_layout: tl.constexpr = tlx.layout(
         shape=((2, 2, 2, 2, 2, 2, 2, 2, 2), (2, 2, 2)),
@@ -222,9 +242,9 @@ def _a4w4_8wave_kernel(
     smem_a_bot = tlx.local_alloc((HALF_M, HALF_K), tlx.dtype_of(a_ptr), 2, layout=shared_tile)
     smem_b_left = tlx.local_alloc((HALF_N, HALF_K), tlx.dtype_of(b_ptr), 2, layout=shared_tile)
     smem_b_right = tlx.local_alloc((HALF_N, HALF_K), tlx.dtype_of(b_ptr), 2, layout=shared_tile)
-    smem_a_sc_t = tlx.local_alloc((HALF_M, NG), tlx.dtype_of(a_scales_ptr), 2, layout=shared_scales)
-    smem_a_sc_b = tlx.local_alloc((HALF_M, NG), tlx.dtype_of(a_scales_ptr), 2, layout=shared_scales)
-    smem_b_sc = tlx.local_alloc((BLOCK_N, NG), tlx.dtype_of(b_scales_ptr), 2, layout=shared_scales)
+    smem_a_sc_t = tlx.local_alloc((HALF_M, NG), tlx.dtype_of(a_scales_ptr), 2, layout=shared_a_scales)
+    smem_a_sc_b = tlx.local_alloc((HALF_M, NG), tlx.dtype_of(a_scales_ptr), 2, layout=shared_a_scales)
+    smem_b_sc = tlx.local_alloc((BLOCK_N, NG), tlx.dtype_of(b_scales_ptr), 2, layout=shared_b_scales)
 
     # ---- fp4 tile load offsets ([128,128]) ----
     offs_am = tl.arange(0, HALF_M)
@@ -239,17 +259,17 @@ def _a4w4_8wave_kernel(
 
     # ---- A scale load offsets ([128,8]) ----
     offs_ks_a = tl.arange(0, NG)
-    offs_asm = (pid_m * BLOCK_M + tl.arange(0, HALF_M)) % M
+    offs_asm = pid_m * BLOCK_M + tl.arange(0, HALF_M)
     a_sc_offsets = tl.mul(offs_asm[:, None], stride_asm, sanitize_overflow=False) + tl.mul(
         offs_ks_a[None, :], stride_ask, sanitize_overflow=False)
-    a_sc_offsets = tlx.require_layout(a_sc_offsets, blocked_a_scales)
+    a_sc_offsets = tlx.require_layout(a_sc_offsets, scale_load_a_layout)
 
     # ---- B scale load offsets: FULL [256,8] in one copy ----
     offs_ks_b = tl.arange(0, NG)
-    offs_bsn = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N)) % N
+    offs_bsn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     b_sc_offsets = tl.mul(offs_bsn[:, None], stride_bsn, sanitize_overflow=False) + tl.mul(
         offs_ks_b[None, :], stride_bsk, sanitize_overflow=False)
-    b_sc_offsets = tlx.require_layout(b_sc_offsets, blocked_b_scales)
+    b_sc_offsets = tlx.require_layout(b_sc_offsets, scale_load_b_layout)
 
     # Scalar (uniform) base-pointer deltas for the quadrant / K-buffer variants.
     a_half_m = HALF_M * stride_am  # a_top -> a_bot
@@ -274,8 +294,11 @@ def _a4w4_8wave_kernel(
     acc_tr = tl.zeros((HALF_M, HALF_N), dtype=tl.float32)
     acc_br = tl.zeros((HALF_M, HALF_N), dtype=tl.float32)
 
-    iter_max: tl.constexpr = KS // BLOCK_K
-    tl.assume(iter_max > 5)
+    # _matmul_256tile derives this trusted runtime value from the asserted KS.
+    # The assumption keeps range/liveness analysis as precise as the old
+    # constexpr bound while preserving the one-trip scf.for at K=1024.
+    iter_max = K_TILES
+    tl.assume(iter_max > 3)
 
     # ---- Prologue: prefetch K-steps 0,1 into buffers 0,1 (8 commits) ----
     tlx.buffer_load_to_local(smem_b_left[0], b_base, b_tile_offsets)
@@ -420,7 +443,7 @@ def _a4w4_8wave_kernel(
     tlx.async_load_wait_group(5)
     l_idx: tl.constexpr = 0  # (iter_max - 2) % 2, always 0 (iter_max even)
     a_bot = tlx.local_load(tlx.local_view(smem_a_bot, l_idx), relaxed=True)
-    a_sc_bot = tlx.local_load(tlx.local_view(smem_a_sc_b, l_idx), layout=scale_a_layout)
+    a_sc_bot = tlx.local_load(smem_a_sc_b[l_idx], layout=scale_a_layout)
 
     acc_bl = tl.dot_scaled(a_bot, a_sc_bot, "e2m1", b_left, b_sc_left, "e2m1", acc_bl)
     tlx.async_load_wait_group(4)
@@ -434,8 +457,8 @@ def _a4w4_8wave_kernel(
     acc_br = tl.dot_scaled(a_bot, a_sc_bot, "e2m1", b_right, b_sc_right, "e2m1", acc_br)
     tlx.async_load_wait_group(2)
     a_top = tlx.local_load(tlx.local_view(smem_a_top, g_idx), relaxed=True)
-    a_sc_top = tlx.local_load(tlx.local_view(smem_a_sc_t, g_idx), layout=scale_a_layout)
-    b_sc_comb = tlx.local_load(tlx.local_view(smem_b_sc, g_idx), layout=scale_b_comb_layout)
+    a_sc_top = tlx.local_load(smem_a_sc_t[g_idx], layout=scale_a_layout)
+    b_sc_comb = tlx.local_load(smem_b_sc[g_idx], layout=scale_b_comb_layout)
     b_sc_l, b_sc_r = tl.split(tl.trans(tl.reshape(b_sc_comb, 2, HALF_N, NG), 1, 2, 0))
     b_sc_left = tlx.require_layout(b_sc_l, scale_b_layout)
     b_sc_right = tlx.require_layout(b_sc_r, scale_b_layout)
@@ -444,7 +467,7 @@ def _a4w4_8wave_kernel(
     acc_tl = tl.dot_scaled(a_top, a_sc_top, "e2m1", b_left, b_sc_left, "e2m1", acc_tl)
     tlx.async_load_wait_group(1)
     a_bot = tlx.local_load(tlx.local_view(smem_a_bot, g_idx), relaxed=True)
-    a_sc_bot = tlx.local_load(tlx.local_view(smem_a_sc_b, g_idx), layout=scale_a_layout)
+    a_sc_bot = tlx.local_load(smem_a_sc_b[g_idx], layout=scale_a_layout)
 
     acc_bl = tl.dot_scaled(a_bot, a_sc_bot, "e2m1", b_left, b_sc_left, "e2m1", acc_bl)
     tlx.async_load_wait_group(0)
@@ -523,9 +546,8 @@ def _reduce_k_kernel(workspace_ptr, c_ptr, M, N, SPLIT_K: tl.constexpr, BLOCK_SI
 
 
 NUM_CU = 256  # gfx950 (CDNA4) compute units
-# Each split must be a whole number of BLOCK_K tiles and keep the pipelined loop
-# at >= 2 trips (KS >= 6*BLOCK_K == MIN_K; see the module comment on MIN_K).
-MIN_KTILES_PER_SPLIT = MIN_K // BLOCK_K  # == 6
+# Each split must contain the two-tile prologue plus one two-tile main step.
+MIN_KTILES_PER_SPLIT = MIN_K // BLOCK_K  # == 4
 
 
 def choose_split_k(M, N, K):
@@ -566,7 +588,8 @@ def _matmul_256tile(a, b, a_scales, b_scales, SPLIT_K=None):
 
     assert M % BLOCK_M == 0, "M must be a multiple of 256"
     assert N % BLOCK_N == 0, "N must be a multiple of 256"
-    assert K >= MIN_K and K % (2 * BLOCK_K) == 0, "K must be at least 1536 and a multiple of 512"
+    assert K >= MIN_K and K % (2 * BLOCK_K) == 0, \
+        f"K must be at least {MIN_K} and a multiple of {2 * BLOCK_K}"
 
     if SPLIT_K is None:
         SPLIT_K = choose_split_k(M, N, K)
@@ -588,6 +611,7 @@ def _matmul_256tile(a, b, a_scales, b_scales, SPLIT_K=None):
         M,
         N,
         K,
+        KS // BLOCK_K,
         a.stride(0),
         a.stride(1),
         b.stride(0),
@@ -609,7 +633,7 @@ def _matmul_256tile(a, b, a_scales, b_scales, SPLIT_K=None):
         num_stages=1,
         matrix_instr_nonkdim=16,
         # Forbid AGPRs: f32 accumulators write VGPRs directly (packs tighter, no spills).
-        llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"), ),
+        llvm_fn_attrs=_A4W4_8WAVE_LLVM_FN_ATTRS,
     )
     if SPLIT_K > 1:
         big = (M * N) >= (2048 * 2048)

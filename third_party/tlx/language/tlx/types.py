@@ -614,8 +614,9 @@ class layout(layout_encoding):
     matching tuple of **flat, row-major offsets** into the tile. The author only
     speaks shape/stride; the compiler decomposes each mode `(2^k, s)` into bits
     `s, 2s, ..., 2^(k-1)s`, splits the thread bits into lane (the low
-    `log2(threads_per_warp)`) and warp (the rest), maps the value bits to
-    registers, and builds the corresponding `#linear` encoding to propagate.
+    `log2(threads_per_warp)`) and warp (the rest), and maps the value bits to
+    registers. Permutation layouts resolve to ``#ttg.linear``; layouts with
+    swizzled warp bases resolve to ``#ttg.generic_linear``.
 
     Example (separable QK layout, tile [N=128, M=128], row-major flat offset
     = ``n * 128 + m``):

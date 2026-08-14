@@ -992,9 +992,24 @@ def local_load(
     """
     Loads buffer from local or tensor memory into a distributed tensor.
 
+    ``token`` (optional) carries an explicit async-wait dependency to the load.
+
     ``layout`` (optional) pins the register layout of the loaded value, written
     as a ``tlx.layout(...)`` (Shape:Stride). It is mapped to a ``#linear``
     encoding so the compiler propagates it back and avoids ``convert_layout``.
+
+    ``relaxed=False`` does not infer or insert an async wait. Without a
+    ``token``, AMD lowering retains conservative producer-to-consumer
+    dependency and wait-count tracking. The caller must issue an async wait
+    before consuming a tile produced by asynchronous copies.
+
+    ``relaxed=True`` tells AMD lowering that a preceding async wait already
+    orders the LDS load after its async producer, avoiding a redundant
+    producer-to-consumer dependency and wait count when no ``token`` is
+    threaded to the load. Membar analysis materializes the workgroup barrier
+    required after the memory-wait operation. This marker does not release the
+    tile for a later refill: reusing the same LDS slice still requires the
+    consumer-to-refill workgroup barrier inferred by membar analysis.
 
     ``rematerialize_coordinates=True`` starts fresh lane/warp address live
     ranges at this load. This can avoid keeping a cheap LDS address live
