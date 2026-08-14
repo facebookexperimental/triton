@@ -307,20 +307,23 @@ def _lane_major_relation():
     )
 
 
-def _transpose_frame(dsl, item):
-    group = dsl.sym("group")
-    within = dsl.sym("within")
-    lane = dsl.mod(item, 64)
-    wave_base = 64 * dsl.floor(item / 64)
-    row_base = 16 * dsl.floor(lane / 16)
-    lane_in_row = dsl.mod(lane, 16)
-    source_item = wave_base + row_base + dsl.floor(lane_in_row / 4) + 4 * within
-    source_lane = dsl.mod(source_item, 64)
-    source_lane_in_row = dsl.mod(source_lane, 16)
-    origin_item = (64 * dsl.floor(source_item / 64) + 16 * dsl.floor(source_lane / 16) +
-                   4 * dsl.mod(source_lane_in_row, 4))
-    origin_slot = 4 * group + dsl.floor(source_lane_in_row / 4)
-    return group, within, origin_item, origin_slot
+def _synthesize_b16_source(dsl, relation, item, slot, group, item_count, base_xor, bits_xor):
+    base_slot = 4 * group
+    base = relation.subs({item: 0, slot: base_slot})
+    coefficients = []
+    for bit, bit_value in enumerate(1 << bit for bit in range(item_count.bit_length() - 1)):
+        if bit < 2:
+            sample = relation.subs({item: 4 * bit_value, slot: base_slot})
+        elif bit < 4:
+            sample = relation.subs({item: 0, slot: base_slot + bit_value // 4})
+        else:
+            sample = relation.subs({item: bit_value, slot: base_slot})
+        coefficients.append(dsl.xor(sample, base) if base_xor else sample - base)
+    source = base
+    for bit, coefficient in enumerate(coefficients):
+        contribution = coefficient * dsl.mod(dsl.floor(item / (1 << bit)), 2)
+        source = dsl.xor(source, contribution) if bits_xor else source + contribution
+    return source
 
 
 def _unpack_packet_relation(dsl, relation, slots, items):
@@ -420,7 +423,10 @@ def _prove_b16_transactions(dsl, relation, item_count, packet_count=8):
     item = dsl.sym("item")
     slot = dsl.sym("slot")
     local_slot = dsl.sym("local_slot")
-    group, within, origin_item, origin_slot = _transpose_frame(dsl, item)
+    group = dsl.sym("group")
+    within = dsl.sym("within")
+    lane = dsl.mod(item, 64)
+    source_item = (item - lane + 16 * dsl.floor(lane / 16) + dsl.floor(dsl.mod(lane, 16) / 4) + 4 * within)
     facts = (
         *layouts._symbolic_range_predicates(dsl, item, 0, item_count - 1),
         *layouts._symbolic_range_predicates(dsl, group, 0, 1),
@@ -431,15 +437,21 @@ def _prove_b16_transactions(dsl, relation, item_count, packet_count=8):
             slot: local_slot + packet * _PACKET_WIDTH,
         })
         point = packet_relation.subs({local_slot: 4 * group + within})
-        origin = packet_relation.subs({
-            item: origin_item,
-            local_slot: origin_slot,
-        })
-        checked, _normalized = dsl.ixs_check(
-            (dsl.ixs_eq(point, origin + 16 * dsl.mod(item, 4)), ),
-            facts,
-        )
-        assert checked == (True, )
+        valid = False
+        for base_xor, bits_xor in ((False, False), (False, True), (True, False), (True, True)):
+            source = _synthesize_b16_source(dsl, packet_relation, item, local_slot, group, item_count, base_xor,
+                                            bits_xor)
+            origin = source.subs({item: source_item})
+            if all(
+                    int(point.eval({"item": output_item, "group": group_value, "within": within_value})) ==
+                    int(origin.eval({"item": output_item, "group": group_value, "within": within_value})) + 16 *
+                (output_item % 4)
+                    for output_item in range(item_count)
+                    for group_value in range(2)
+                    for within_value in range(4)):
+                valid = True
+                break
+        assert valid, (packet, facts)
 
 
 def test_glu_b_layout_to_symbolic_relation_matches_linear_layout():
@@ -536,6 +548,66 @@ def test_lane_major_global_relation_proves_direct_to_lds_contiguity():
         facts,
     )
     assert checked == (True, )
+
+
+def test_lane_major_mask_activity_normalizes_before_adjacency_proof():
+    dsl = layouts.load_wave_dsl()
+    item = dsl.sym("item")
+    group = dsl.sym("group")
+    within = dsl.sym("within")
+    limit = dsl.sym("limit")
+    origin = 64 * group + 64 * dsl.floor(item / 64) + dsl.mod(8 * item, 64)
+    point = origin + within
+    origin_difference = layouts.signed_fixed_width_value(origin, 32) - limit
+    point_difference = layouts.signed_fixed_width_value(point, 32) - limit
+    facts = (
+        *layouts._symbolic_range_predicates(dsl, item, 0, 63),
+        *layouts._symbolic_range_predicates(dsl, group, 0, 7),
+        *layouts._symbolic_range_predicates(dsl, within, 0, 7),
+        *layouts._symbolic_range_predicates(dsl, limit, -(1 << 31), (1 << 31) - 1),
+        dsl.ixs_eq(dsl.mod(limit, 16), 0),
+    )
+    _checked, normalized = dsl.ixs_check(
+        (
+            origin_difference,
+            point_difference,
+            point_difference - origin_difference,
+        ),
+        facts,
+    )
+    origin_difference, point_difference, delta = normalized
+    expected_origin = 64 * group - limit + dsl.mod(8 * item, 64)
+    checked, _normalized = dsl.ixs_check(
+        (
+            dsl.ixs_eq(origin_difference, expected_origin),
+            dsl.ixs_eq(point_difference, expected_origin + within),
+            dsl.ixs_eq(delta, within),
+            dsl.ixs_eq(dsl.mod(origin_difference, 8), 0),
+            delta >= 0,
+            delta < 8,
+        ),
+        facts,
+    )
+    assert checked == (True, ) * 6
+
+    aligned = dsl.ixs_eq(dsl.mod(origin_difference, 8), 0)
+    # A negative integer divisible by eight is at most -8. The activity
+    # equivalence proof records this exact discrete consequence after proving
+    # `aligned`; the remaining implications stay ordinary symbolic checks.
+    margin = origin_difference <= -8
+    for point in range(1, 8):
+        point_at = point_difference.subs({within: point})
+        delta_at = point_at - origin_difference
+        forward_checked, _normalized = dsl.ixs_check(
+            (point_at < 0, ),
+            (*facts, aligned, delta_at >= 0, delta_at < 8, origin_difference < 0, margin),
+        )
+        reverse_checked, _normalized = dsl.ixs_check(
+            (origin_difference < 0, ),
+            (*facts, aligned, delta_at >= 0, delta_at < 8, point_at < 0),
+        )
+        assert forward_checked == (True, ), (point, forward_checked)
+        assert reverse_checked == (True, ), (point, reverse_checked)
 
 
 def test_glu_b_global_layout_symbolic_relation_proves_width8_contiguity():
@@ -692,13 +764,13 @@ def test_fa_v_layout_to_symbolic_formula_proves_b16_contiguity():
                 4096 * dsl.mod(dsl.floor(slot / 32), 2) + 32 * dsl.mod(dsl.floor(slot / 64), 2))
     unpadded_formula = dsl.xor(
         dsl.mod(item, 2),
-        2 * dsl.mod(dsl.floor(dsl.mod(item, 64) / 2), 2),
-        4 * dsl.mod(dsl.floor(dsl.mod(item, 64) / 4), 2),
-        8 * dsl.mod(dsl.floor(dsl.mod(item, 64) / 8), 2),
-        16 * dsl.mod(dsl.floor(dsl.mod(item, 64) / 16), 2),
+        2 * dsl.mod(dsl.floor(item / 2), 2),
+        4 * dsl.mod(dsl.floor(item / 4), 2),
+        8 * dsl.mod(dsl.floor(item / 8), 2),
+        16 * dsl.mod(dsl.floor(item / 16), 2),
         32 * dsl.mod(dsl.floor(slot / 64), 2),
         64 * dsl.mod(dsl.floor(slot / 2), 2),
-        128 * dsl.mod(dsl.floor(dsl.mod(item, 64) / 32), 2),
+        128 * dsl.mod(dsl.floor(item / 32), 2),
         256 * dsl.mod(dsl.floor(slot / 4), 2),
         512 * dsl.mod(slot, 2),
         1024 * dsl.mod(dsl.floor(slot / 8), 2),
