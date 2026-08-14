@@ -29,6 +29,7 @@ import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
 from triton._internal_testing import is_hip_cdna4
+from triton.language.extra.subtile_ops import _split_n_2D
 
 # Public equal-head correctness contract for this submission. The kernels
 # have broader D128 and D256 families internally, but these are the two MHA
@@ -65,6 +66,23 @@ def _is_supported_gqa_shape(shape):
 # register pressure for the D-sliced kernels and prevents the accumulator from
 # using AGPRs on gfx950.
 _CDNA4_MATRIX_INSTR_NONKDIM = 16
+
+
+@dataclasses.dataclass(frozen=True)
+class _D128FusedSchedule:
+    block_m: int
+    block_n: int
+    num_warps: int
+    num_stages: int
+    dq_subtile: int
+
+
+# Fixed winners for the B16/H27/N2048/D128 non-causal MHA comparison.  These
+# are explicit schedules, not runtime-autotune candidate lists.  The portable
+# Triton schedule was selected from 49 correctness-gated trials; the TLX
+# bridge was the single fixed baseline in those sweeps.
+_D128_TRITON_FUSED_BF16_BEST = _D128FusedSchedule(32, 128, 4, 2, 2)
+_D128_TLX_FUSED_BEST = _D128FusedSchedule(16, 256, 4, 1, 1)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -781,6 +799,99 @@ def _attn_bwd_dq_d128_kernel(
 
     dq *= SM_SCALE
     tl.store(DQ + qdo_ptrs, dq.to(tl.bfloat16), mask=qdo_mask)
+
+
+@triton.jit
+def _attn_bwd_dkdv_dq_d128_triton_fused_kernel(
+    Q,
+    K,
+    V,
+    DO,
+    LSE,
+    Delta,
+    DQ_ACC,
+    DK,
+    DV,
+    SM_SCALE: tl.constexpr,
+    N: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    DQ_SUBTILE: tl.constexpr,
+    DQ_ACC_BF16: tl.constexpr,
+):
+    """Portable Triton port of the device-TMA fused-dS backward owner.
+
+    One program owns a BLOCK_N K/V tile and streams every Q/dO tile.  The
+    score, probability, dP, and dS tile are formed once; dS feeds both dK and
+    a partial dQ.  Different K/V owners contribute to the same dQ rows, so the
+    partial is accumulated into an FP32 buffer before a row-major BF16
+    epilogue.  DQ_SUBTILE mirrors the source kernel's narrower atomic staging;
+    DQ_ACC_BF16 is an AMD experiment that trades some accuracy for half-sized
+    native accumulation.  Unlike fused_attention_ws_device_tma.py, this path
+    uses only portable pointer loads, ordinary tl.dot, and tl.atomic_add so it
+    lowers on AMD HIP without Blackwell TMA/TMEM or warp specialization.
+    """
+    tl.static_assert(D == 128)
+    tl.static_assert(N % BLOCK_M == 0)
+    tl.static_assert(N % BLOCK_N == 0)
+    tl.static_assert(BLOCK_N % BLOCK_M == 0)
+
+    pid_n = tl.program_id(0)
+    batch_head = tl.program_id(1)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_d = tl.arange(0, D)
+    tensor_base = batch_head * N * D
+    kv_ptrs = tensor_base + offs_n[:, None] * D + offs_d[None, :]
+    k = tl.load(K + kv_ptrs)
+    v = tl.load(V + kv_ptrs)
+
+    dk = tl.zeros((BLOCK_N, D), tl.float32)
+    dv = tl.zeros((BLOCK_N, D), tl.float32)
+    log2e: tl.constexpr = 1.4426950408889634
+    num_m_blocks: tl.constexpr = N // BLOCK_M
+
+    for m_block in tl.range(0, num_m_blocks, loop_unroll_factor=1):
+        offs_m = m_block * BLOCK_M + tl.arange(0, BLOCK_M)
+        qdo_ptrs = tensor_base + offs_m[:, None] * D + offs_d[None, :]
+        q = tl.load(Q + qdo_ptrs)
+        do = tl.load(DO + qdo_ptrs)
+
+        scores_t = tl.dot(k, tl.trans(q))
+        lse = tl.load(LSE + batch_head * N + offs_m)
+        delta = tl.load(Delta + batch_head * N + offs_m)
+        scores_t = scores_t * (SM_SCALE * log2e) - lse[None, :] * log2e
+        p_t = tl.math.exp2(scores_t)
+        dp_t = tl.dot(v, tl.trans(do)).to(tl.float32)
+        ds_t = p_t * (dp_t - delta[None, :])
+        p_bf16 = p_t.to(tl.bfloat16)
+        ds_bf16 = ds_t.to(tl.bfloat16)
+
+        dv = tl.dot(p_bf16, do, dv)
+        # Keep the same ordering as the device-TMA implementation: dK
+        # consumes dS before the dQ dot creates its independent accumulator.
+        dk = tl.dot(ds_bf16, q, dk)
+        dq = tl.dot(tl.trans(ds_bf16), k).to(tl.float32) * SM_SCALE
+        dqs = _split_n_2D(dq, DQ_SUBTILE)
+        dq_slice: tl.constexpr = D // DQ_SUBTILE
+        for slice_id in tl.static_range(0, DQ_SUBTILE):
+            offs_dq = slice_id * dq_slice + tl.arange(0, dq_slice)
+            dq_ptrs = tensor_base + offs_m[:, None] * D + offs_dq[None, :]
+            if DQ_ACC_BF16:
+                tl.atomic_add(DQ_ACC + dq_ptrs, dqs[slice_id].to(tl.bfloat16), sem="relaxed")
+            else:
+                tl.atomic_add(DQ_ACC + dq_ptrs, dqs[slice_id], sem="relaxed")
+
+    tl.store(DK + kv_ptrs, (dk * SM_SCALE).to(tl.bfloat16))
+    tl.store(DV + kv_ptrs, dv.to(tl.bfloat16))
+
+
+@triton.jit
+def _attn_bwd_dq_acc_to_bf16_kernel(DQ_ACC, DQ, NUMEL: tl.constexpr, BLOCK: tl.constexpr):
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < NUMEL
+    dq = tl.load(DQ_ACC + offsets, mask=mask)
+    tl.store(DQ + offsets, dq.to(tl.bfloat16), mask=mask)
 
 
 # TODO: Revisit or remove this generic persistent variant once TLX can express
@@ -3791,11 +3902,19 @@ def _run_bwd_d128_gqa(
     dk,
     dv,
     sm_scale,
+    *,
+    fixed_best=False,
 ):
     batch, hq, n_ctx, head_dim = q.shape
     hk = k.shape[1]
     assert _is_supported_gqa_shape((batch, hq, hk, n_ctx, head_dim))
-    _attn_bwd_dkdv_dq_d128_gqa_kernel[(hk, triton.cdiv(n_ctx, 256), batch)](
+    schedule = _D128_TLX_FUSED_BEST
+    regalloc_options = ({
+        "reverse_local_assignment": False,
+        "sink_insts_to_avoid_spills": False,
+        "regclass_priority_trumps_globalness": False,
+    } if fixed_best else _d128_regalloc_options())
+    _attn_bwd_dkdv_dq_d128_gqa_kernel[(hk, triton.cdiv(n_ctx, schedule.block_n), batch)](
         q,
         k,
         v,
@@ -3810,10 +3929,10 @@ def _run_bwd_d128_gqa(
         HK=hk,
         N=n_ctx,
         D=head_dim,
-        BLOCK_M=16,
-        BLOCK_N=256,
-        num_warps=4,
-        num_stages=1,
+        BLOCK_M=schedule.block_m,
+        BLOCK_N=schedule.block_n,
+        num_warps=schedule.num_warps,
+        num_stages=schedule.num_stages,
         matrix_instr_nonkdim=_matrix_instr_nonkdim(),
         # The source bridge directly emits fragmented persistent current-dK
         # and transient delayed-dQ MFMAs. The chains read different alternating
@@ -3821,9 +3940,7 @@ def _run_bwd_d128_gqa(
         # dot preset is needed because the bridge contains scheduled fragments
         # rather than a pair of ordinary tt.dot operations.
         # Register-allocation experiments remain independent explicit opt-ins.
-        reverse_local_assignment=(os.environ.get(_D128_REVERSE_LOCAL_ENV, "0") == "1"),
-        sink_insts_to_avoid_spills=(os.environ.get(_D128_SINK_INSTS_ENV, "0") == "1"),
-        regclass_priority_trumps_globalness=(os.environ.get(_D128_REGCLASS_PRIORITY_ENV, "") == "1"),
+        **regalloc_options,
     )
     _attn_bwd_dq_native_convert_kernel[(triton.cdiv(n_ctx, 128), batch * hq)](
         dq_acc,
@@ -3833,6 +3950,107 @@ def _run_bwd_d128_gqa(
         BLOCK_M=128,
         num_warps=4,
         matrix_instr_nonkdim=_matrix_instr_nonkdim(),
+    )
+
+
+def _run_bwd_d128_triton_fused(
+    q,
+    k,
+    v,
+    do,
+    lse,
+    delta,
+    dq_acc,
+    dq,
+    dk,
+    dv,
+    sm_scale,
+    *,
+    block_m=32,
+    block_n=128,
+    dq_subtile=4,
+    dq_acc_bf16=False,
+    num_warps=4,
+    num_stages=2,
+    waves_per_eu=0,
+    sink_insts_to_avoid_spills=False,
+    reverse_local_assignment=False,
+):
+    """Run the portable AMD Triton fused-dS experiment.
+
+    The default FP32 accumulator uses the accuracy-oriented DQ_SUBTILE=4
+    schedule.  For the measured performance schedule, pass a BF16 ``dq`` as
+    both ``dq_acc`` and ``dq``, set ``dq_acc_bf16=True``, and use
+    ``dq_subtile=2``.
+    """
+    batch, heads, n_ctx, head_dim = q.shape
+    assert q.shape == k.shape == v.shape == do.shape
+    assert head_dim == 128
+    assert n_ctx % block_m == 0 and n_ctx % block_n == 0
+    assert dq_subtile in (1, 2, 4, 8)
+    assert dq_acc.dtype == (torch.bfloat16 if dq_acc_bf16 else torch.float32)
+    if dq_acc_bf16:
+        assert dq_acc.data_ptr() == dq.data_ptr()
+    dq_acc.zero_()
+    _attn_bwd_dkdv_dq_d128_triton_fused_kernel[(triton.cdiv(n_ctx, block_n), batch * heads)](
+        q,
+        k,
+        v,
+        do,
+        lse,
+        delta,
+        dq_acc,
+        dk,
+        dv,
+        SM_SCALE=sm_scale,
+        N=n_ctx,
+        D=head_dim,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        DQ_SUBTILE=dq_subtile,
+        DQ_ACC_BF16=dq_acc_bf16,
+        num_warps=num_warps,
+        num_stages=num_stages,
+        matrix_instr_nonkdim=_matrix_instr_nonkdim(),
+        waves_per_eu=waves_per_eu,
+        sink_insts_to_avoid_spills=sink_insts_to_avoid_spills,
+        reverse_local_assignment=reverse_local_assignment,
+    )
+    if not dq_acc_bf16:
+        numel = q.numel()
+        _attn_bwd_dq_acc_to_bf16_kernel[(triton.cdiv(numel, 256),)](
+            dq_acc,
+            dq,
+            NUMEL=numel,
+            BLOCK=256,
+            num_warps=4,
+        )
+
+
+def _run_bwd_d128_triton_fused_bf16_best(q, k, v, do, lse, delta, dq, dk, dv, sm_scale):
+    """Run the fixed winning portable-Triton BF16 accumulation schedule."""
+    schedule = _D128_TRITON_FUSED_BF16_BEST
+    _run_bwd_d128_triton_fused(
+        q,
+        k,
+        v,
+        do,
+        lse,
+        delta,
+        dq,
+        dq,
+        dk,
+        dv,
+        sm_scale,
+        block_m=schedule.block_m,
+        block_n=schedule.block_n,
+        dq_subtile=schedule.dq_subtile,
+        dq_acc_bf16=True,
+        num_warps=schedule.num_warps,
+        num_stages=schedule.num_stages,
+        waves_per_eu=0,
+        sink_insts_to_avoid_spills=False,
+        reverse_local_assignment=False,
     )
 
 
@@ -4774,6 +4992,56 @@ def test_gqa_rejects_causal_gfx950():
         fa_backward(q, k, k, q, q, lse, 0.5, True)
 
 
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+@pytest.mark.parametrize("variant", ["triton_fp32", "triton_bf16", "tlx_fused"])
+def test_d128_fixed_fused_winners_n2048_gfx950(variant):
+    case = make_reference_case((1, 1, 2048, 128), False, seed=23)
+    delta = torch.empty(case.q.shape[:-1], device="cuda", dtype=torch.float32)
+    _run_bwd_preprocess(case.o, case.do, delta)
+    actual = tuple(torch.empty_like(case.q) for _ in range(3))
+    if variant == "triton_bf16":
+        _run_bwd_d128_triton_fused_bf16_best(
+            case.q,
+            case.k,
+            case.v,
+            case.do,
+            case.lse,
+            delta,
+            *actual,
+            case.sm_scale,
+        )
+    elif variant == "tlx_fused":
+        dq_acc = torch.zeros_like(case.q)
+        _run_bwd_d128_gqa(
+            case.q,
+            case.k,
+            case.v,
+            case.do,
+            case.lse,
+            delta,
+            dq_acc,
+            *actual,
+            case.sm_scale,
+            fixed_best=True,
+        )
+    else:
+        dq_acc = torch.empty_like(case.q, dtype=torch.float32)
+        _run_bwd_d128_triton_fused(
+            case.q,
+            case.k,
+            case.v,
+            case.do,
+            case.lse,
+            delta,
+            dq_acc,
+            *actual,
+            case.sm_scale,
+        )
+    for value, expected in zip(actual, case.grads):
+        assert torch.isfinite(value).all()
+        assert _snr_db(value, expected) >= 40.0
+
+
 def test_d256_dispatch_uses_one_configured_producer_entry(monkeypatch):
     monkeypatch.delenv("TLX_FA_BWD_FORCE_STAGED", raising=False)
     full = _select_d256_dispatch(False)
@@ -4865,6 +5133,8 @@ def test_shape_specific_launch_configs():
     assert _d128_num_warps(False) == 2
     assert _d128_num_warps(True) == 4
     assert _matrix_instr_nonkdim() == 16
+    assert _D128_TRITON_FUSED_BF16_BEST == _D128FusedSchedule(32, 128, 4, 2, 2)
+    assert _D128_TLX_FUSED_BEST == _D128FusedSchedule(16, 256, 4, 1, 1)
 
 
 def test_d128_regalloc_options_are_independent_opt_ins(monkeypatch):
