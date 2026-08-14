@@ -422,6 +422,15 @@ def test_launcher_src_compiles_with_gcc():
     if cc is None:
         pytest.skip("No C compiler available")
 
+    # Being on PATH is not enough. fbcode's gcc is a wrapper that resolves the
+    # real toolchain through /mnt/gvfs, which is not mounted in every container
+    # the tests run in; there it exits non-zero having compiled nothing, and the
+    # returncode assert below reports it as a launcher_src compile failure. Probe
+    # the compiler so an unusable toolchain skips instead.
+    probe = subprocess.run([cc, "--version"], capture_output=True, timeout=30)
+    if probe.returncode != 0:
+        pytest.skip(f"C compiler {cc} is present but not runnable")
+
     # Find cuda.h include dir
     cuda_include = os.path.join(backend_dir, "include")
     if not os.path.exists(os.path.join(cuda_include, "cuda.h")):
