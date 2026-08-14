@@ -74,6 +74,11 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
 // CHECK: ttg.partition = array<i32: [[COMP0]]>
 // CHECK: "tt.reduce"
 // CHECK: ttg.partition = array<i32: [[COMP1]]>
+// --- In-loop: scalar rescale votes follow the correction stores ---
+// CHECK: "tt.reduce"
+// CHECK: ttg.partition = array<i32: [[CORR]]>
+// CHECK: "tt.reduce"
+// CHECK: ttg.partition = array<i32: [[CORR]]>
 // --- In-loop: rescale acc → correction partition ---
 // CHECK: ttng.tmem_load {{.*}}ttg.partition = array<i32: [[CORR]]>
 // CHECK: ttng.tmem_load {{.*}}ttg.partition = array<i32: [[CORR]]>
@@ -260,6 +265,22 @@ tt.func public @fa_forward_data_partition_split(
       tt.reduce.return %s1 : f32
     }) {loop.cluster = 1 : i32, loop.stage = 2 : i32} : (tensor<128x128xf32, #blocked>) -> tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked}>>
 
+    // Partition-local, warp-uniform votes guard the expensive accumulator
+    // correction. Their tensor masks stay in the computation partitions, but
+    // the scalar reductions must be co-located with the predicated stores.
+    %rescale_mask_0 = arith.cmpf olt, %alpha_0, %alpha_exp_0 {loop.cluster = 3 : i32, loop.stage = 1 : i32} : tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked}>>
+    %rescale_mask_1 = arith.cmpf olt, %alpha_1, %alpha_exp_1 {loop.cluster = 1 : i32, loop.stage = 2 : i32} : tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked}>>
+    %rescale_vote_0 = "tt.reduce"(%rescale_mask_0) <{axis = 0 : i32}> ({
+    ^bb0(%a4: i1, %b4: i1):
+      %v0 = arith.ori %a4, %b4 : i1
+      tt.reduce.return %v0 : i1
+    }) {loop.cluster = 3 : i32, loop.stage = 1 : i32} : (tensor<128xi1, #ttg.slice<{dim = 1, parent = #blocked}>>) -> i1
+    %rescale_vote_1 = "tt.reduce"(%rescale_mask_1) <{axis = 0 : i32}> ({
+    ^bb0(%a5: i1, %b5: i1):
+      %v1 = arith.ori %a5, %b5 : i1
+      tt.reduce.return %v1 : i1
+    }) {loop.cluster = 1 : i32, loop.stage = 2 : i32} : (tensor<128xi1, #ttg.slice<{dim = 1, parent = #blocked}>>) -> i1
+
     // Rescale acc: acc_old * alpha
     %acc_old_0, %acc_old_0_tok = ttng.tmem_load %acc_0[%acc_tok_0] {loop.cluster = 3 : i32, loop.stage = 1 : i32} : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #blocked>
     %acc_old_1, %acc_old_1_tok = ttng.tmem_load %acc_1[%acc_tok_1] {loop.cluster = 1 : i32, loop.stage = 2 : i32} : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #blocked>
@@ -269,8 +290,8 @@ tt.func public @fa_forward_data_partition_split(
     %alpha_2d_1 = tt.broadcast %alpha_1d_1 {loop.cluster = 1 : i32, loop.stage = 2 : i32} : tensor<128x1xf32, #blocked> -> tensor<128x128xf32, #blocked>
     %acc_scaled_0 = arith.mulf %acc_old_0, %alpha_2d_0 {loop.cluster = 3 : i32, loop.stage = 1 : i32} : tensor<128x128xf32, #blocked>
     %acc_scaled_1 = arith.mulf %acc_old_1, %alpha_2d_1 {loop.cluster = 1 : i32, loop.stage = 2 : i32} : tensor<128x128xf32, #blocked>
-    %acc_store_0 = ttng.tmem_store %acc_scaled_0, %acc_0[%acc_old_0_tok], %true {loop.cluster = 3 : i32, loop.stage = 1 : i32} : tensor<128x128xf32, #blocked> -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
-    %acc_store_1 = ttng.tmem_store %acc_scaled_1, %acc_1[%acc_old_1_tok], %true {loop.cluster = 1 : i32, loop.stage = 2 : i32} : tensor<128x128xf32, #blocked> -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+    %acc_store_0 = ttng.tmem_store %acc_scaled_0, %acc_0[%acc_old_0_tok], %rescale_vote_0 {loop.cluster = 3 : i32, loop.stage = 1 : i32} : tensor<128x128xf32, #blocked> -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+    %acc_store_1 = ttng.tmem_store %acc_scaled_1, %acc_1[%acc_old_1_tok], %rescale_vote_1 {loop.cluster = 1 : i32, loop.stage = 2 : i32} : tensor<128x128xf32, #blocked> -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
 
     // p → bf16 → tmem for PV MMA
     %p_bf16_0 = arith.truncf %p_0 {loop.cluster = 3 : i32, loop.stage = 1 : i32} : tensor<128x128xf32, #blocked> to tensor<128x128xbf16, #blocked>
