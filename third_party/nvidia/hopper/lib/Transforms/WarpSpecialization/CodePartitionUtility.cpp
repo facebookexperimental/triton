@@ -3719,42 +3719,45 @@ Operation *getSameLevelOp(Operation *p, Operation *c) {
 };
 
 // When the consumer is a local_alloc loading from shared memory to registers,
-// look ahead for the actual consumers, usually dot ops, that can directly
-// use shared memory. The local_alloc will be removed later.
+// look ahead for the actual consumers, usually dot ops, that can directly use
+// shared memory. Address-only memdesc views are not consumers: follow them to
+// their transitive users so the channel's release is placed after the last
+// operation that reads the buffer. The local_alloc will be removed later.
 SmallVector<Operation *> getActualConsumers(Operation *consumerOp) {
-  // TransOp is not a real consumer. It caculates the shared memory
-  // address for the real consumer. Continue to find its transitive users
-  // recursively. Return all transitive users;
-  auto goThroughTrans = [&](Operation *user) -> DenseSet<Operation *> {
+  auto isView = [](Operation *op) {
+    return isa<tt::TransOp, ttg::MemDescIndexOp, ttg::MemDescSubsliceOp,
+               ttg::MemDescReinterpretOp, ttg::MemDescTransOp>(op);
+  };
+  auto goThroughViews = [&](Operation *user) -> DenseSet<Operation *> {
     DenseSet<Operation *> users;
     DenseSet<Operation *> visited;
-    SmallVector<Operation *> transUsers;
-    transUsers.push_back(user);
-    while (!transUsers.empty()) {
-      auto transUser = transUsers.pop_back_val();
-      visited.insert(transUser);
-      if (isa<tt::TransOp, ttg::MemDescTransOp>(transUser)) {
-        for (auto transitiveUser : transUser->getUsers()) {
+    SmallVector<Operation *> viewUsers;
+    viewUsers.push_back(user);
+    while (!viewUsers.empty()) {
+      auto viewUser = viewUsers.pop_back_val();
+      if (!visited.insert(viewUser).second)
+        continue;
+      if (isView(viewUser)) {
+        for (auto transitiveUser : viewUser->getUsers()) {
           if (!visited.count(transitiveUser))
-            transUsers.push_back(transitiveUser);
+            viewUsers.push_back(transitiveUser);
         }
       } else {
-        users.insert(transUser);
+        users.insert(viewUser);
       }
     }
     return users;
   };
-  if (isa<ttg::MemDescTransOp>(consumerOp)) {
-    auto users = goThroughTrans(consumerOp);
+  if (isView(consumerOp)) {
+    auto users = goThroughViews(consumerOp);
     return SmallVector<Operation *>(users.begin(), users.end());
   }
   if (isa<ttg::LocalAllocOp>(consumerOp)) {
     DenseSet<Operation *> users;
     for (auto user : consumerOp->getUsers()) {
-      if (isa<tt::TransOp, ttg::MemDescTransOp>(user)) {
-        auto transUsers = goThroughTrans(user);
-        for (auto *tUsr : transUsers)
-          users.insert(tUsr);
+      if (isView(user)) {
+        auto viewUsers = goThroughViews(user);
+        users.insert(viewUsers.begin(), viewUsers.end());
       } else {
         users.insert(user);
       }
