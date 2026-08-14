@@ -38,6 +38,11 @@ two K tiles into LDS. Its A image places the four scale register values in the
 low physical bits for one aligned ``ds_read_b128``; bank-group address bits 4..6
 come from lane bits 0..2, keeping that wide read conflict-free.
 
+Canonical, separate-preshuffled, and merged scales each have an independent
+``@triton.jit`` kernel body. Their initial bodies deliberately preserve the
+previous specializations exactly so subsequent tuning can change one ABI's
+prologue, pipeline, or epilogue without coupling the other two.
+
 The Shape:Stride register/blocked/accumulator layouts below encode the gfx950
 16x16x128 scaled-MFMA / dot-operand / scale distributions, and are
 round-trip-verified against the compiler's resolved linear layouts.
@@ -142,9 +147,8 @@ def _a4w4_8wave_kernel(
     NUM_XCDS: tl.constexpr,
     GRID_MN: tl.constexpr,
     SPLIT_K: tl.constexpr,
-    PRESHUFFLED_SCALES: tl.constexpr = False,
-    MERGED_SCALE_DMA: tl.constexpr = False,
 ):
+    """Canonical two-scale-pointer kernel with in-kernel scale swizzling."""
     SCALE_GROUP_SIZE: tl.constexpr = 32
     HALF_M: tl.constexpr = BLOCK_M // 2  # 128
     HALF_N: tl.constexpr = BLOCK_N // 2  # 128
@@ -156,7 +160,6 @@ def _a4w4_8wave_kernel(
     KS: tl.constexpr = K // SPLIT_K
     KS_PACKED: tl.constexpr = KS // 2  # packed fp4 columns per split
     KS_SCALE: tl.constexpr = KS // SCALE_GROUP_SIZE  # scale groups per split
-    SCALE_GROUP_BLOCKS: tl.constexpr = K // BLOCK_K
 
     # ---- fp4 tile global-load register layout (#linear, [128,128]) ----
     g_load_layout: tl.constexpr = tlx.layout(
@@ -194,54 +197,7 @@ def _a4w4_8wave_kernel(
         block_bases=[],
         alignment=16,
     )
-    # The combined A view assigns the four register-value bits to the low four
-    # physical address bits, so one aligned ds_read_b128 produces both 128-row
-    # MFMA scale fragments.  Address bits 4..6 are lane bits 0..2, which gives
-    # each dword phase all 32 LDS banks; the remaining lane and warp ownership
-    # bits select higher 128-byte regions.
-    # The merged layouts add the K-tile selector around the combined A map.
-    # Physical bit 11 is the 2048-byte A/B section selector, so it is unused by
-    # the A view; physical bit 12 selects the second K tile.
-    shared_merged_a_scales_combined: tl.constexpr = tlx.shared_linear_layout_encoding(
-        offset_bases=[
-            [0, 0, 4], [0, 32, 0], [0, 64, 0], [0, 128, 0],
-            [0, 1, 0], [0, 2, 0], [0, 4, 0], [0, 8, 0],
-            [0, 16, 0], [0, 0, 1], [0, 0, 2], [0, 0, 0], [1, 0, 0],
-        ],
-        block_bases=[],
-        alignment=16,
-    )
-    # The merged B layout adds section and K-tile selector bits around its
-    # canonical map so the full raw allocation can be reinterpreted before
-    # slicing.
-    shared_merged_b_scales: tl.constexpr = tlx.shared_linear_layout_encoding(
-        offset_bases=[
-            [0, 1, 0], [0, 2, 0], [0, 4, 0], [0, 8, 0], [0, 16, 0],
-            [0, 32, 0], [0, 64, 0], [0, 128, 0], [0, 16, 1], [0, 0, 2],
-            [0, 32, 4], [1, 0, 0], [2, 0, 0],
-        ],
-        block_bases=[],
-        alignment=16,
-    )
-    # The preshuffled ABIs DMA an already-packed physical image. Keep the raw
-    # destination byte-linear so every wave writes consecutive 4-byte (separate)
-    # or 16-byte (merged) vectors.
-    shared_scale_preshuffled: tl.constexpr = tlx.shared_linear_layout_encoding(
-        offset_bases=[
-            [1], [2], [4], [8], [16], [32], [64], [128], [256], [512], [1024],
-        ],
-        block_bases=[],
-        alignment=16,
-    )
-    shared_scale_merged: tl.constexpr = tlx.shared_linear_layout_encoding(
-        offset_bases=[
-            [1], [2], [4], [8], [16], [32], [64], [128], [256], [512], [1024], [2048], [4096],
-        ],
-        block_bases=[],
-        alignment=16,
-    )
-    # Match each raw scale image's byte-linear shared order: two 4-byte value
-    # bits, six lane bits, then warp bits.
+    # Canonical A/B scale DMA layouts encode the same XOR maps as the LDS views.
     scale_load_a_layout: tl.constexpr = tlx.layout(
         shape=((2, 2, 2, 2, 2, 2, 2, 2, 2), (2, 2)),
         stride=((32, 64, 128, 256, 512, 1, 2, 132, 0), (8, 16)),
@@ -249,6 +205,412 @@ def _a4w4_8wave_kernel(
     scale_load_b_layout: tl.constexpr = tlx.layout(
         shape=((2, 2, 2, 2, 2, 2, 2, 2, 2), (2, 2)),
         stride=((32, 64, 128, 256, 512, 1024, 129, 2, 260), (8, 16)),
+    )
+    # ---- MFMA scale register layouts (get_mfma_scale_layout) ----
+    scale_a_layout: tl.constexpr = tlx.layout(
+        shape=((2, 2, 2, 2, 2, 2, 2, 2, 2), (2, 2, 2)),
+        stride=((8, 16, 32, 64, 1, 2, 0, 0, 128), (4, 256, 512)),
+    )
+    scale_b_layout: tl.constexpr = tlx.layout(
+        shape=((2, 2, 2, 2, 2, 2, 2, 2, 2), (2, 2)),
+        stride=((8, 16, 32, 64, 1, 2, 128, 256, 0), (4, 512)),
+    )
+    scale_b_comb_layout: tl.constexpr = tlx.layout(
+        shape=((2, 2, 2, 2, 2, 2, 2, 2, 2), (2, 2, 2)),
+        stride=((8, 16, 32, 64, 1, 2, 128, 256, 0), (4, 512, 1024)),
+    )
+    # ---- MFMA accumulator layout (#mma 16x16x128 [2,4], one [128,128] quadrant) ----
+    accumulator_layout: tl.constexpr = tlx.layout(
+        shape=((2, 2, 2, 2, 2, 2, 2, 2, 2), (2, 2, 2, 2, 2)),
+        stride=((128, 256, 512, 1024, 4, 8, 16, 32, 2048), (1, 2, 64, 4096, 8192)),
+    )
+    # ---- store layout (#blocked2, [128,128] bf16 quadrant) ----
+    store_layout_c: tl.constexpr = tlx.layout(
+        shape=((2, 2, 2, 2, 2, 2, 2, 2, 2), (2, 2, 2, 2, 2)),
+        stride=((8, 16, 32, 64, 128, 256, 512, 1024, 2048), (1, 2, 4, 4096, 8192)),
+    )
+
+    # Grid is GRID_MN * SPLIT_K; peel the split id, keep the MN pid for the
+    # XCD / GROUP_SIZE_M remap below.
+    split_id = tl.program_id(0) // GRID_MN
+    pid = tl.program_id(0) % GRID_MN
+    num_pid_m = tl.cdiv(M, BLOCK_M)
+    num_pid_n = tl.cdiv(N, BLOCK_N)
+
+    if NUM_XCDS != 1:
+        pids_per_xcd = (GRID_MN + NUM_XCDS - 1) // NUM_XCDS
+        tall_xcds = GRID_MN % NUM_XCDS
+        tall_xcds = NUM_XCDS if tall_xcds == 0 else tall_xcds
+        xcd = pid % NUM_XCDS
+        local_pid = pid // NUM_XCDS
+        if xcd < tall_xcds:
+            pid = xcd * pids_per_xcd + local_pid
+        else:
+            pid = tall_xcds * pids_per_xcd + (xcd - tall_xcds) * (pids_per_xcd - 1) + local_pid
+
+    if GROUP_SIZE_M == 1:
+        pid_m = pid // num_pid_n
+        pid_n = pid % num_pid_n
+    else:
+        num_pid_in_group = GROUP_SIZE_M * num_pid_n
+        group_id = pid // num_pid_in_group
+        first_pid_m = group_id * GROUP_SIZE_M
+        group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+        tl.assume(group_size_m > 0)
+        pid_m = first_pid_m + (pid % num_pid_in_group) % group_size_m
+        pid_n = (pid % num_pid_in_group) // group_size_m
+
+    # Four double-buffered operand half-tiles plus canonical A-top, A-bottom,
+    # and combined-B scale tiles.
+    smem_a_top = tlx.local_alloc((HALF_M, HALF_K), tlx.dtype_of(a_ptr), 2, layout=shared_tile)
+    smem_a_bot = tlx.local_alloc((HALF_M, HALF_K), tlx.dtype_of(a_ptr), 2, layout=shared_tile)
+    smem_b_left = tlx.local_alloc((HALF_N, HALF_K), tlx.dtype_of(b_ptr), 2, layout=shared_tile)
+    smem_b_right = tlx.local_alloc((HALF_N, HALF_K), tlx.dtype_of(b_ptr), 2, layout=shared_tile)
+    smem_a_sc_t = tlx.local_alloc((HALF_M, NG), tlx.dtype_of(a_scales_ptr), 2, layout=shared_a_scales)
+    smem_a_sc_b = tlx.local_alloc((HALF_M, NG), tlx.dtype_of(a_scales_ptr), 2, layout=shared_a_scales)
+    smem_b_sc = tlx.local_alloc((BLOCK_N, NG), tlx.dtype_of(b_scales_ptr), 2, layout=shared_b_scales)
+
+    # ---- fp4 tile load offsets ([128,128]) ----
+    offs_am = tl.arange(0, HALF_M)
+    offs_ak = tl.arange(0, HALF_K)
+    a_tile_offsets = tlx.require_layout(offs_am[:, None] * stride_am + offs_ak[None, :] * stride_ak, g_load_layout)
+    a_base = a_ptr + pid_m * BLOCK_M * stride_am
+
+    offs_bn = tl.arange(0, HALF_N)
+    offs_bk = tl.arange(0, HALF_K)
+    b_tile_offsets = tlx.require_layout(offs_bn[:, None] * stride_bn + offs_bk[None, :] * stride_bk, g_load_layout)
+    b_base = b_ptr + pid_n * BLOCK_N * stride_bn
+
+    # ---- Scale load offsets ----
+    offs_ks_a = tl.arange(0, NG)
+    offs_asm = pid_m * BLOCK_M + tl.arange(0, HALF_M)
+    a_sc_offsets = tl.mul(offs_asm[:, None], stride_asm, sanitize_overflow=False) + tl.mul(
+        offs_ks_a[None, :], stride_ask, sanitize_overflow=False)
+    a_sc_offsets = tlx.require_layout(a_sc_offsets, scale_load_a_layout)
+
+    # ---- B scale load offsets: FULL [256,8] in one copy ----
+    offs_ks_b = tl.arange(0, NG)
+    offs_bsn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    b_sc_offsets = tl.mul(offs_bsn[:, None], stride_bsn, sanitize_overflow=False) + tl.mul(
+        offs_ks_b[None, :], stride_bsk, sanitize_overflow=False)
+    b_sc_offsets = tlx.require_layout(b_sc_offsets, scale_load_b_layout)
+
+    # Scalar (uniform) base-pointer deltas for the quadrant / K-buffer variants.
+    a_half_m = HALF_M * stride_am  # a_top -> a_bot
+    b_half_n = HALF_N * stride_bn  # b_left -> b_right
+    a_k2 = HALF_K * stride_ak  # even -> odd (_next) K-step
+    b_k2 = HALF_K * stride_bk
+    a_sc_half_m = HALF_M * stride_asm
+    a_sc_k = NG * stride_ask
+    b_sc_k = NG * stride_bsk
+
+    # Advance every base to this split's K-slice (no-op when SPLIT_K==1). The
+    # A/B tiles are K-packed (KS_PACKED cols) and the scales are per-group
+    # (KS_SCALE groups). All arith bases; buffer_load_to_local materializes the
+    # fat pointer as it already does for the pid_m/pid_n base offsets.
+    a_base += split_id * KS_PACKED * stride_ak
+    b_base += split_id * KS_PACKED * stride_bk
+    a_scales_ptr += split_id * KS_SCALE * stride_ask
+    b_scales_ptr += split_id * KS_SCALE * stride_bsk
+
+    acc_tl = tl.zeros((HALF_M, HALF_N), dtype=tl.float32)
+    acc_bl = tl.zeros((HALF_M, HALF_N), dtype=tl.float32)
+    acc_tr = tl.zeros((HALF_M, HALF_N), dtype=tl.float32)
+    acc_br = tl.zeros((HALF_M, HALF_N), dtype=tl.float32)
+
+    # _matmul_256tile derives this trusted runtime value from the asserted KS.
+    # The assumption keeps range/liveness analysis as precise as the old
+    # constexpr bound while preserving the one-trip scf.for at K=1024.
+    iter_max = K_TILES
+    tl.assume(iter_max > 3)
+
+    # ---- Prologue: prefetch K-steps 0,1 into buffers 0,1 (8 commits) ----
+    tlx.buffer_load_to_local(smem_b_left[0], b_base, b_tile_offsets)
+    tlx.buffer_load_to_local(smem_b_sc[0], b_scales_ptr, b_sc_offsets)
+    tlx.async_load_commit_group()
+    tlx.buffer_load_to_local(smem_a_top[0], a_base, a_tile_offsets)
+    tlx.buffer_load_to_local(smem_a_sc_t[0], a_scales_ptr, a_sc_offsets)
+    tlx.async_load_commit_group()
+    tlx.buffer_load_to_local(smem_a_bot[0], a_base + a_half_m, a_tile_offsets)
+    tlx.buffer_load_to_local(smem_a_sc_b[0], a_scales_ptr + a_sc_half_m, a_sc_offsets)
+    tlx.async_load_commit_group()
+    tlx.buffer_load_to_local(smem_b_right[0], b_base + b_half_n, b_tile_offsets)
+    tlx.async_load_commit_group()
+
+    tlx.buffer_load_to_local(smem_b_left[1], b_base + b_k2, b_tile_offsets)
+    tlx.buffer_load_to_local(smem_b_sc[1], b_scales_ptr + b_sc_k, b_sc_offsets)
+    tlx.async_load_commit_group()
+    tlx.buffer_load_to_local(smem_a_top[1], a_base + a_k2, a_tile_offsets)
+    tlx.buffer_load_to_local(smem_a_sc_t[1], a_scales_ptr + a_sc_k, a_sc_offsets)
+    tlx.async_load_commit_group()
+    tlx.buffer_load_to_local(smem_a_bot[1], a_base + a_half_m + a_k2, a_tile_offsets)
+    tlx.buffer_load_to_local(smem_a_sc_b[1], a_scales_ptr + a_sc_half_m + a_sc_k, a_sc_offsets)
+    tlx.async_load_commit_group()
+    tlx.buffer_load_to_local(smem_b_right[1], b_base + b_half_n + b_k2, b_tile_offsets)
+    tlx.async_load_commit_group()
+
+    a_base += a_k2 * 2
+    b_base += b_k2 * 2
+    a_scales_ptr += a_sc_k * 2
+    b_scales_ptr += b_sc_k * 2
+
+    tlx.async_load_wait_group(6)
+    b_left = tlx.local_load(tlx.local_trans(smem_b_left[0]), relaxed=True)
+    a_top = tlx.local_load(smem_a_top[0], relaxed=True)
+    a_sc_top = tlx.local_load(smem_a_sc_t[0], layout=scale_a_layout)
+    b_sc_comb = tlx.local_load(smem_b_sc[0], layout=scale_b_comb_layout)
+    b_sc_l, b_sc_r = tl.split(tl.trans(tl.reshape(b_sc_comb, 2, HALF_N, NG), 1, 2, 0))
+    b_sc_left = tlx.require_layout(b_sc_l, scale_b_layout)
+    b_sc_right = tlx.require_layout(b_sc_r, scale_b_layout)
+
+    # ---- Main loop (2x unrolled): 8 (mfma + mem) regions ----
+    for k in tl.range(0, iter_max - 2, 2, num_stages=1):
+        # --- sub-iter 0 (buffer 0) ---
+        tlx.async_load_wait_group(5)
+        with tlx.warp_pipeline_stage("mfma", priority=0):
+            acc_tl = tl.dot_scaled(a_top, a_sc_top, "e2m1", b_left, b_sc_left, "e2m1", acc_tl)
+        with tlx.warp_pipeline_stage("mem", priority=1):
+            a_bot = tlx.local_load(smem_a_bot[0], relaxed=True)
+            a_sc_bot = tlx.local_load(smem_a_sc_b[0], layout=scale_a_layout)
+            tlx.amd_sched_barrier(0)  # keep ds_read(local_load) ahead of the global loads
+            tlx.buffer_load_to_local(smem_b_left[0], b_base, b_tile_offsets)
+            tlx.buffer_load_to_local(smem_b_sc[0], b_scales_ptr, b_sc_offsets)
+            tlx.async_load_commit_group()
+
+        tlx.async_load_wait_group(5)
+        with tlx.warp_pipeline_stage("mfma", priority=0):
+            acc_bl = tl.dot_scaled(a_bot, a_sc_bot, "e2m1", b_left, b_sc_left, "e2m1", acc_bl)
+        with tlx.warp_pipeline_stage("mem", priority=1):
+            b_right = tlx.local_load(tlx.local_trans(smem_b_right[0]), relaxed=True)
+            tlx.amd_sched_barrier(0)  # keep ds_read(local_load) ahead of the global loads
+            tlx.buffer_load_to_local(smem_a_top[0], a_base, a_tile_offsets)
+            tlx.buffer_load_to_local(smem_a_sc_t[0], a_scales_ptr, a_sc_offsets)
+            tlx.async_load_commit_group()
+
+        tlx.async_load_wait_group(5)
+        with tlx.warp_pipeline_stage("mfma", priority=0):
+            acc_tr = tl.dot_scaled(a_top, a_sc_top, "e2m1", b_right, b_sc_right, "e2m1", acc_tr)
+        with tlx.warp_pipeline_stage("mem", priority=1):
+            b_left = tlx.local_load(tlx.local_trans(smem_b_left[1]), relaxed=True)
+            tlx.amd_sched_barrier(0)  # keep ds_read(local_load) ahead of the global loads
+            tlx.buffer_load_to_local(smem_a_bot[0], a_base + a_half_m, a_tile_offsets)
+            tlx.buffer_load_to_local(smem_a_sc_b[0], a_scales_ptr + a_sc_half_m, a_sc_offsets)
+            tlx.async_load_commit_group()
+
+        tlx.async_load_wait_group(5)
+        with tlx.warp_pipeline_stage("mfma", priority=0):
+            acc_br = tl.dot_scaled(a_bot, a_sc_bot, "e2m1", b_right, b_sc_right, "e2m1", acc_br)
+        with tlx.warp_pipeline_stage("mem", priority=1):
+            a_top = tlx.local_load(smem_a_top[1], relaxed=True)
+            a_sc_top = tlx.local_load(smem_a_sc_t[1], layout=scale_a_layout)
+            b_sc_comb = tlx.local_load(smem_b_sc[1], layout=scale_b_comb_layout)
+            b_sc_l, b_sc_r = tl.split(tl.trans(tl.reshape(b_sc_comb, 2, HALF_N, NG), 1, 2, 0))
+            b_sc_left = tlx.require_layout(b_sc_l, scale_b_layout)
+            b_sc_right = tlx.require_layout(b_sc_r, scale_b_layout)
+            tlx.amd_sched_barrier(0)  # keep ds_read(local_load) ahead of the global loads
+            tlx.buffer_load_to_local(smem_b_right[0], b_base + b_half_n, b_tile_offsets)
+            tlx.async_load_commit_group()
+
+        # --- sub-iter 1 (buffer 1, base + one K-step) ---
+        tlx.async_load_wait_group(5)
+        with tlx.warp_pipeline_stage("mfma", priority=0):
+            acc_tl = tl.dot_scaled(a_top, a_sc_top, "e2m1", b_left, b_sc_left, "e2m1", acc_tl)
+        with tlx.warp_pipeline_stage("mem", priority=1):
+            a_bot = tlx.local_load(smem_a_bot[1], relaxed=True)
+            a_sc_bot = tlx.local_load(smem_a_sc_b[1], layout=scale_a_layout)
+            tlx.amd_sched_barrier(0)  # keep ds_read(local_load) ahead of the global loads
+            tlx.buffer_load_to_local(smem_b_left[1], b_base + b_k2, b_tile_offsets)
+            tlx.buffer_load_to_local(smem_b_sc[1], b_scales_ptr + b_sc_k, b_sc_offsets)
+            tlx.async_load_commit_group()
+
+        tlx.async_load_wait_group(5)
+        with tlx.warp_pipeline_stage("mfma", priority=0):
+            acc_bl = tl.dot_scaled(a_bot, a_sc_bot, "e2m1", b_left, b_sc_left, "e2m1", acc_bl)
+        with tlx.warp_pipeline_stage("mem", priority=1):
+            b_right = tlx.local_load(tlx.local_trans(smem_b_right[1]), relaxed=True)
+            tlx.amd_sched_barrier(0)  # keep ds_read(local_load) ahead of the global loads
+            tlx.buffer_load_to_local(smem_a_top[1], a_base + a_k2, a_tile_offsets)
+            tlx.buffer_load_to_local(smem_a_sc_t[1], a_scales_ptr + a_sc_k, a_sc_offsets)
+            tlx.async_load_commit_group()
+
+        tlx.async_load_wait_group(5)
+        with tlx.warp_pipeline_stage("mfma", priority=0):
+            acc_tr = tl.dot_scaled(a_top, a_sc_top, "e2m1", b_right, b_sc_right, "e2m1", acc_tr)
+        with tlx.warp_pipeline_stage("mem", priority=1):
+            b_left = tlx.local_load(tlx.local_trans(smem_b_left[0]), relaxed=True)
+            tlx.amd_sched_barrier(0)  # keep ds_read(local_load) ahead of the global loads
+            tlx.buffer_load_to_local(smem_a_bot[1], a_base + a_half_m + a_k2, a_tile_offsets)
+            tlx.buffer_load_to_local(smem_a_sc_b[1], a_scales_ptr + a_sc_half_m + a_sc_k, a_sc_offsets)
+            tlx.async_load_commit_group()
+
+        tlx.async_load_wait_group(5)
+        with tlx.warp_pipeline_stage("mfma", priority=0):
+            acc_br = tl.dot_scaled(a_bot, a_sc_bot, "e2m1", b_right, b_sc_right, "e2m1", acc_br)
+        with tlx.warp_pipeline_stage("mem", priority=1):
+            a_top = tlx.local_load(smem_a_top[0], relaxed=True)
+            a_sc_top = tlx.local_load(smem_a_sc_t[0], layout=scale_a_layout)
+            b_sc_comb = tlx.local_load(smem_b_sc[0], layout=scale_b_comb_layout)
+            b_sc_l, b_sc_r = tl.split(tl.trans(tl.reshape(b_sc_comb, 2, HALF_N, NG), 1, 2, 0))
+            b_sc_left = tlx.require_layout(b_sc_l, scale_b_layout)
+            b_sc_right = tlx.require_layout(b_sc_r, scale_b_layout)
+            tlx.amd_sched_barrier(0)  # keep ds_read(local_load) ahead of the global loads
+            tlx.buffer_load_to_local(smem_b_right[1], b_base + b_half_n + b_k2, b_tile_offsets)
+            tlx.async_load_commit_group()
+            a_base += a_k2 * 2
+            b_base += b_k2 * 2
+            a_scales_ptr += a_sc_k * 2
+            b_scales_ptr += b_sc_k * 2
+
+    # ---- Epilogue: last 2 K-steps, drain, 4-quadrant store ----
+    # iter iter_max-2 (b_sc_left/right for this step were prefetched at loop tail)
+    acc_tl = tl.dot_scaled(a_top, a_sc_top, "e2m1", b_left, b_sc_left, "e2m1", acc_tl)
+    tlx.async_load_wait_group(5)
+    l_idx: tl.constexpr = 0  # (iter_max - 2) % 2, always 0 (iter_max even)
+    a_bot = tlx.local_load(tlx.local_view(smem_a_bot, l_idx), relaxed=True)
+    a_sc_bot = tlx.local_load(smem_a_sc_b[l_idx], layout=scale_a_layout)
+
+    acc_bl = tl.dot_scaled(a_bot, a_sc_bot, "e2m1", b_left, b_sc_left, "e2m1", acc_bl)
+    tlx.async_load_wait_group(4)
+    b_right = tlx.local_load(tlx.local_trans(tlx.local_view(smem_b_right, l_idx)), relaxed=True)
+
+    acc_tr = tl.dot_scaled(a_top, a_sc_top, "e2m1", b_right, b_sc_right, "e2m1", acc_tr)
+    tlx.async_load_wait_group(3)
+    g_idx: tl.constexpr = 1  # 1 - l_idx
+    b_left = tlx.local_load(tlx.local_trans(tlx.local_view(smem_b_left, g_idx)), relaxed=True)
+
+    acc_br = tl.dot_scaled(a_bot, a_sc_bot, "e2m1", b_right, b_sc_right, "e2m1", acc_br)
+    tlx.async_load_wait_group(2)
+    a_top = tlx.local_load(tlx.local_view(smem_a_top, g_idx), relaxed=True)
+    a_sc_top = tlx.local_load(smem_a_sc_t[g_idx], layout=scale_a_layout)
+    b_sc_comb = tlx.local_load(smem_b_sc[g_idx], layout=scale_b_comb_layout)
+    b_sc_l, b_sc_r = tl.split(tl.trans(tl.reshape(b_sc_comb, 2, HALF_N, NG), 1, 2, 0))
+    b_sc_left = tlx.require_layout(b_sc_l, scale_b_layout)
+    b_sc_right = tlx.require_layout(b_sc_r, scale_b_layout)
+
+    # iter iter_max-1: finish ALL four accumulators, then convert + store.
+    acc_tl = tl.dot_scaled(a_top, a_sc_top, "e2m1", b_left, b_sc_left, "e2m1", acc_tl)
+    tlx.async_load_wait_group(1)
+    a_bot = tlx.local_load(tlx.local_view(smem_a_bot, g_idx), relaxed=True)
+    a_sc_bot = tlx.local_load(smem_a_sc_b[g_idx], layout=scale_a_layout)
+
+    acc_bl = tl.dot_scaled(a_bot, a_sc_bot, "e2m1", b_left, b_sc_left, "e2m1", acc_bl)
+    tlx.async_load_wait_group(0)
+    b_right = tlx.local_load(tlx.local_trans(tlx.local_view(smem_b_right, g_idx)), relaxed=True)
+
+    acc_tr = tl.dot_scaled(a_top, a_sc_top, "e2m1", b_right, b_sc_right, "e2m1", acc_tr)
+    acc_br = tl.dot_scaled(a_bot, a_sc_bot, "e2m1", b_right, b_sc_right, "e2m1", acc_br)
+
+    # ---- 4-quadrant store ----
+    if SPLIT_K == 1:
+        # Direct coalesced store to C (bf16). c_quad_offsets is shared by all four
+        # quadrants (same relative layout, different base).
+        offs_cm = tl.arange(0, HALF_M)
+        offs_cn = tl.arange(0, HALF_N)
+        c_quad_offsets = tl.mul(stride_cm, offs_cm[:, None], sanitize_overflow=False) + tl.mul(
+            stride_cn, offs_cn[None, :], sanitize_overflow=False)
+        c_quad_offsets = tlx.require_layout(c_quad_offsets, store_layout_c)
+        c_tl_base = c_ptr + pid_m * BLOCK_M * stride_cm + pid_n * BLOCK_N * stride_cn
+        c_bl_base = c_tl_base + HALF_M * stride_cm
+        c_tr_base = c_tl_base + HALF_N * stride_cn
+        c_br_base = c_bl_base + HALF_N * stride_cn
+
+        # require(accumulator) -> cast -> require(store): freeze the MFMA register
+        # distribution, cast bf16 register-local in it, then require the coalesced
+        # store layout. The compiler narrows before redistributing (no explicit
+        # release_layout needed).
+        et = c_ptr.dtype.element_ty
+        acc_tl = tlx.require_layout(acc_tl, accumulator_layout)
+        c_tl = tlx.require_layout(acc_tl.to(et), store_layout_c)
+        tlx.buffer_store(c_tl, c_tl_base, c_quad_offsets)
+
+        acc_bl = tlx.require_layout(acc_bl, accumulator_layout)
+        c_bl = tlx.require_layout(acc_bl.to(et), store_layout_c)
+        tlx.buffer_store(c_bl, c_bl_base, c_quad_offsets)
+
+        acc_tr = tlx.require_layout(acc_tr, accumulator_layout)
+        c_tr = tlx.require_layout(acc_tr.to(et), store_layout_c)
+        tlx.buffer_store(c_tr, c_tr_base, c_quad_offsets)
+
+        acc_br = tlx.require_layout(acc_br, accumulator_layout)
+        c_br = tlx.require_layout(acc_br.to(et), store_layout_c)
+        tlx.buffer_store(c_br, c_br_base, c_quad_offsets)
+    else:
+        # Split-K: write this split's fp32 partials into its workspace slice
+        # (rows [split_id*M, split_id*M+M)); a separate fp32 reduce kernel sums
+        # the SPLIT_K slabs into C, keeping the result bit-identical to a single
+        # fp32-accumulated GEMM. Plain tl.store (fp32, no narrowing).
+        rb = split_id * M
+        offs_cm_t = rb + pid_m * BLOCK_M + tl.arange(0, HALF_M)
+        offs_cm_b = offs_cm_t + HALF_M
+        offs_cn_l = pid_n * BLOCK_N + tl.arange(0, HALF_N)
+        offs_cn_r = offs_cn_l + HALF_N
+        tl.store(workspace_ptr + offs_cm_t[:, None] * stride_cm + offs_cn_l[None, :] * stride_cn, acc_tl)
+        tl.store(workspace_ptr + offs_cm_b[:, None] * stride_cm + offs_cn_l[None, :] * stride_cn, acc_bl)
+        tl.store(workspace_ptr + offs_cm_t[:, None] * stride_cm + offs_cn_r[None, :] * stride_cn, acc_tr)
+        tl.store(workspace_ptr + offs_cm_b[:, None] * stride_cm + offs_cn_r[None, :] * stride_cn, acc_br)
+
+
+@triton.jit
+def _a4w4_8wave_preshuffled_scales_kernel(
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    workspace_ptr,
+    a_scales_ptr,
+    b_scales_ptr,
+    M,
+    N,
+    K: tl.constexpr,
+    K_TILES,
+    stride_am,
+    stride_ak,
+    stride_bn,
+    stride_bk,
+    stride_cm,
+    stride_cn,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    NUM_XCDS: tl.constexpr,
+    GRID_MN: tl.constexpr,
+    SPLIT_K: tl.constexpr,
+):
+    """Separate-preshuffled two-scale-pointer kernel."""
+    SCALE_GROUP_SIZE: tl.constexpr = 32
+    HALF_M: tl.constexpr = BLOCK_M // 2  # 128
+    HALF_N: tl.constexpr = BLOCK_N // 2  # 128
+    HALF_K: tl.constexpr = BLOCK_K // 2  # 128 (packed fp4)
+    NG: tl.constexpr = BLOCK_K // SCALE_GROUP_SIZE  # 8 scale groups along K
+    # Split-K: each program owns a contiguous K-slice of length KS (== K when
+    # SPLIT_K==1). KS is constexpr, so every derived offset stays constexpr and
+    # keeps its divisibility (no #linear -> #blocked collapse).
+    KS: tl.constexpr = K // SPLIT_K
+    KS_PACKED: tl.constexpr = KS // 2  # packed fp4 columns per split
+    KS_SCALE: tl.constexpr = KS // SCALE_GROUP_SIZE  # scale groups per split
+    SCALE_GROUP_BLOCKS: tl.constexpr = K // BLOCK_K
+
+    # ---- fp4 tile global-load register layout (#linear, [128,128]) ----
+    g_load_layout: tl.constexpr = tlx.layout(
+        shape=((2, 2, 2, 2, 2, 2, 2, 2, 2), (2, 2, 2, 2, 2)),
+        stride=((16, 32, 64, 128, 4096, 8192, 256, 512, 1024), (1, 2, 4, 8, 2048)),
+    )
+    # ---- padded shared tile layout ([128,128] fp4, pad 32 @ 1024) ----
+    shared_tile: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases(
+        [[1024, 32]],
+        [
+            [0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64],
+            [1, 0], [32, 0], [64, 0], [2, 0], [4, 0], [8, 0], [16, 0],
+        ],
+        [HALF_M, HALF_K],
+    )
+    # Each preshuffled scale allocation is a raw byte-linear LDS image.
+    shared_scale_preshuffled: tl.constexpr = tlx.shared_linear_layout_encoding(
+        offset_bases=[
+            [1], [2], [4], [8], [16], [32], [64], [128], [256], [512], [1024],
+        ],
+        block_bases=[],
+        alignment=16,
     )
     # Four bytes per thread stage each independent 256x8 preshuffled tile.
     scale_load_preshuffled_layout: tl.constexpr = tlx.layout(
@@ -261,13 +623,6 @@ def _a4w4_8wave_kernel(
     preshuffled_scale_shape: tl.constexpr = [2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2]
     preshuffled_a_to_logical: tl.constexpr = (7, 8, 9, 4, 5, 6, 2, 3, 10, 0, 1)
     preshuffled_b_to_logical: tl.constexpr = (8, 9, 2, 4, 5, 6, 7, 3, 10, 0, 1)
-    # One 16-byte vector per thread stages two adjacent A+B scale images.  The
-    # high warp bit selects the second K tile, so all eight waves contribute to
-    # one full-workgroup 8192-byte DMA.
-    scale_load_merged_layout: tl.constexpr = tlx.layout(
-        shape=((2, 2, 2, 2, 2, 2, 2, 2, 2), (2, 2, 2, 2)),
-        stride=((16, 32, 64, 128, 256, 512, 1024, 2048, 4096), (1, 2, 4, 8)),
-    )
     # ---- MFMA scale register layouts (get_mfma_scale_layout) ----
     scale_a_layout: tl.constexpr = tlx.layout(
         shape=((2, 2, 2, 2, 2, 2, 2, 2, 2), (2, 2, 2)),
@@ -326,33 +681,16 @@ def _a4w4_8wave_kernel(
         pid_m = first_pid_m + (pid % num_pid_in_group) % group_size_m
         pid_n = (pid % num_pid_in_group) // group_size_m
 
-    # Four double-buffered operand half-tiles plus scale tiles.  The canonical
-    # path keeps separate scale allocations; the merged ABI uses one 8192-byte
-    # allocation for the two K tiles consumed by an unrolled iteration. It is
-    # refilled after both scale halves have been read, so it needs no second
-    # scale buffer and keeps the total LDS footprint unchanged.
+    # Four double-buffered operand half-tiles plus independent double-buffered
+    # byte-linear A/B scale images.
     smem_a_top = tlx.local_alloc((HALF_M, HALF_K), tlx.dtype_of(a_ptr), 2, layout=shared_tile)
     smem_a_bot = tlx.local_alloc((HALF_M, HALF_K), tlx.dtype_of(a_ptr), 2, layout=shared_tile)
     smem_b_left = tlx.local_alloc((HALF_N, HALF_K), tlx.dtype_of(b_ptr), 2, layout=shared_tile)
     smem_b_right = tlx.local_alloc((HALF_N, HALF_K), tlx.dtype_of(b_ptr), 2, layout=shared_tile)
-    if MERGED_SCALE_DMA:
-        smem_sc = tlx.local_alloc(
-            (2 * (BLOCK_M + BLOCK_N) * NG, ), tlx.dtype_of(a_scales_ptr), 1, layout=shared_scale_merged)
-        smem_sc_a_view = tlx.local_reinterpret(
-            smem_sc[0], tl.uint8, [2, BLOCK_M, NG], layout=shared_merged_a_scales_combined)
-        smem_sc_b_view = tlx.local_reinterpret(
-            smem_sc[0], tl.uint8, [4, BLOCK_N, NG], layout=shared_merged_b_scales)
-    elif PRESHUFFLED_SCALES:
-        smem_a_sc = tlx.local_alloc(
-            (BLOCK_M * NG, ), tlx.dtype_of(a_scales_ptr), 2, layout=shared_scale_preshuffled)
-        smem_b_sc = tlx.local_alloc(
-            (BLOCK_N * NG, ), tlx.dtype_of(b_scales_ptr), 2, layout=shared_scale_preshuffled)
-    else:
-        smem_a_sc_t = tlx.local_alloc((HALF_M, NG), tlx.dtype_of(a_scales_ptr), 2, layout=shared_a_scales)
-        smem_a_sc_b = tlx.local_alloc((HALF_M, NG), tlx.dtype_of(a_scales_ptr), 2, layout=shared_a_scales)
-        smem_b_sc = tlx.local_alloc((BLOCK_N, NG), tlx.dtype_of(b_scales_ptr), 2, layout=shared_b_scales)
-
-    # ---- fp4 tile load offsets ([128,128]) ----
+    smem_a_sc = tlx.local_alloc(
+        (BLOCK_M * NG, ), tlx.dtype_of(a_scales_ptr), 2, layout=shared_scale_preshuffled)
+    smem_b_sc = tlx.local_alloc(
+        (BLOCK_N * NG, ), tlx.dtype_of(b_scales_ptr), 2, layout=shared_scale_preshuffled)
     offs_am = tl.arange(0, HALF_M)
     offs_ak = tl.arange(0, HALF_K)
     a_tile_offsets = tlx.require_layout(offs_am[:, None] * stride_am + offs_ak[None, :] * stride_ak, g_load_layout)
@@ -364,71 +702,20 @@ def _a4w4_8wave_kernel(
     b_base = b_ptr + pid_n * BLOCK_N * stride_bn
 
     # ---- Scale load offsets ----
-    offs_ks_a = tl.arange(0, NG)
-    if MERGED_SCALE_DMA:
-        scale_physical_offsets = tl.arange(0, 2 * (BLOCK_M + BLOCK_N) * NG)
-        scale_k_tile = scale_physical_offsets // ((BLOCK_M + BLOCK_N) * NG)
-        scale_in_tile = scale_physical_offsets % ((BLOCK_M + BLOCK_N) * NG)
-        a_scale_tile_base = pid_m * SCALE_GROUP_BLOCKS * BLOCK_M * NG
-        b_scale_tile_base = num_pid_m * SCALE_GROUP_BLOCKS * BLOCK_M * NG
-        b_scale_tile_base += pid_n * SCALE_GROUP_BLOCKS * BLOCK_N * NG
-        split_scale_base = split_id * (KS_SCALE // NG) * BLOCK_M * NG
-        a_scale_tile_base += split_scale_base
-        b_scale_tile_base += split_scale_base
-        scale_offsets = tl.where(
-            scale_in_tile < BLOCK_M * NG,
-            a_scale_tile_base + scale_k_tile * BLOCK_M * NG + scale_in_tile,
-            b_scale_tile_base + scale_k_tile * BLOCK_N * NG + scale_in_tile - BLOCK_M * NG,
-        )
-        scale_offsets = tlx.require_layout(scale_offsets, scale_load_merged_layout)
-    elif PRESHUFFLED_SCALES:
-        a_sc_offsets = tlx.require_layout(tl.arange(0, BLOCK_M * NG), scale_load_preshuffled_layout)
-    else:
-        offs_asm = pid_m * BLOCK_M + tl.arange(0, HALF_M)
-        a_sc_offsets = tl.mul(offs_asm[:, None], stride_asm, sanitize_overflow=False) + tl.mul(
-            offs_ks_a[None, :], stride_ask, sanitize_overflow=False)
-        a_sc_offsets = tlx.require_layout(a_sc_offsets, scale_load_a_layout)
-
-    # ---- B scale load offsets: FULL [256,8] in one copy ----
-    offs_ks_b = tl.arange(0, NG)
-    if PRESHUFFLED_SCALES and not MERGED_SCALE_DMA:
-        b_sc_offsets = tlx.require_layout(tl.arange(0, BLOCK_N * NG), scale_load_preshuffled_layout)
-    elif not PRESHUFFLED_SCALES:
-        offs_bsn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-        b_sc_offsets = tl.mul(offs_bsn[:, None], stride_bsn, sanitize_overflow=False) + tl.mul(
-            offs_ks_b[None, :], stride_bsk, sanitize_overflow=False)
-        b_sc_offsets = tlx.require_layout(b_sc_offsets, scale_load_b_layout)
-
-    # Scalar (uniform) base-pointer deltas for the quadrant / K-buffer variants.
+    a_sc_offsets = tlx.require_layout(tl.arange(0, BLOCK_M * NG), scale_load_preshuffled_layout)
+    b_sc_offsets = tlx.require_layout(tl.arange(0, BLOCK_N * NG), scale_load_preshuffled_layout)
     a_half_m = HALF_M * stride_am  # a_top -> a_bot
     b_half_n = HALF_N * stride_bn  # b_left -> b_right
     a_k2 = HALF_K * stride_ak  # even -> odd (_next) K-step
     b_k2 = HALF_K * stride_bk
-    if PRESHUFFLED_SCALES:
-        a_sc_k: tl.constexpr = BLOCK_M * NG
-        b_sc_k: tl.constexpr = BLOCK_N * NG
-    else:
-        a_sc_half_m = HALF_M * stride_asm
-        a_sc_k = NG * stride_ask
-        b_sc_k = NG * stride_bsk
-
-    # Advance every base to this split's K-slice (no-op when SPLIT_K==1). The
-    # A/B tiles are K-packed (KS_PACKED cols) and the scales are per-group
-    # (KS_SCALE groups). All arith bases; buffer_load_to_local materializes the
-    # fat pointer as it already does for the pid_m/pid_n base offsets.
+    a_sc_k: tl.constexpr = BLOCK_M * NG
+    b_sc_k: tl.constexpr = BLOCK_N * NG
     a_base += split_id * KS_PACKED * stride_ak
     b_base += split_id * KS_PACKED * stride_bk
-    if MERGED_SCALE_DMA:
-        pass
-    elif PRESHUFFLED_SCALES:
-        a_scales_ptr += pid_m * SCALE_GROUP_BLOCKS * a_sc_k
-        b_scales_ptr += pid_n * SCALE_GROUP_BLOCKS * b_sc_k
-        a_scales_ptr += split_id * (KS_SCALE // NG) * a_sc_k
-        b_scales_ptr += split_id * (KS_SCALE // NG) * b_sc_k
-    else:
-        a_scales_ptr += split_id * KS_SCALE * stride_ask
-        b_scales_ptr += split_id * KS_SCALE * stride_bsk
-
+    a_scales_ptr += pid_m * SCALE_GROUP_BLOCKS * a_sc_k
+    b_scales_ptr += pid_n * SCALE_GROUP_BLOCKS * b_sc_k
+    a_scales_ptr += split_id * (KS_SCALE // NG) * a_sc_k
+    b_scales_ptr += split_id * (KS_SCALE // NG) * b_sc_k
     acc_tl = tl.zeros((HALF_M, HALF_N), dtype=tl.float32)
     acc_bl = tl.zeros((HALF_M, HALF_N), dtype=tl.float32)
     acc_tr = tl.zeros((HALF_M, HALF_N), dtype=tl.float32)
@@ -441,81 +728,47 @@ def _a4w4_8wave_kernel(
     tl.assume(iter_max > 3)
 
     # ---- Prologue: prefetch K-steps 0,1 into buffers 0,1 (8 commits) ----
-    if MERGED_SCALE_DMA:
-        tlx.buffer_load_to_local(smem_sc[0], a_scales_ptr, scale_offsets)
     tlx.buffer_load_to_local(smem_b_left[0], b_base, b_tile_offsets)
-    if not MERGED_SCALE_DMA:
-        tlx.buffer_load_to_local(smem_b_sc[0], b_scales_ptr, b_sc_offsets)
+    tlx.buffer_load_to_local(smem_b_sc[0], b_scales_ptr, b_sc_offsets)
     tlx.async_load_commit_group()
     tlx.buffer_load_to_local(smem_a_top[0], a_base, a_tile_offsets)
-    if PRESHUFFLED_SCALES and not MERGED_SCALE_DMA:
-        tlx.buffer_load_to_local(smem_a_sc[0], a_scales_ptr, a_sc_offsets)
-    elif not PRESHUFFLED_SCALES:
-        tlx.buffer_load_to_local(smem_a_sc_t[0], a_scales_ptr, a_sc_offsets)
+    tlx.buffer_load_to_local(smem_a_sc[0], a_scales_ptr, a_sc_offsets)
     tlx.async_load_commit_group()
     tlx.buffer_load_to_local(smem_a_bot[0], a_base + a_half_m, a_tile_offsets)
-    if not PRESHUFFLED_SCALES:
-        tlx.buffer_load_to_local(smem_a_sc_b[0], a_scales_ptr + a_sc_half_m, a_sc_offsets)
     tlx.async_load_commit_group()
     tlx.buffer_load_to_local(smem_b_right[0], b_base + b_half_n, b_tile_offsets)
     tlx.async_load_commit_group()
 
     tlx.buffer_load_to_local(smem_b_left[1], b_base + b_k2, b_tile_offsets)
-    if not MERGED_SCALE_DMA:
-        tlx.buffer_load_to_local(smem_b_sc[1], b_scales_ptr + b_sc_k, b_sc_offsets)
+    tlx.buffer_load_to_local(smem_b_sc[1], b_scales_ptr + b_sc_k, b_sc_offsets)
     tlx.async_load_commit_group()
     tlx.buffer_load_to_local(smem_a_top[1], a_base + a_k2, a_tile_offsets)
-    if PRESHUFFLED_SCALES and not MERGED_SCALE_DMA:
-        tlx.buffer_load_to_local(smem_a_sc[1], a_scales_ptr + a_sc_k, a_sc_offsets)
-    elif not PRESHUFFLED_SCALES:
-        tlx.buffer_load_to_local(smem_a_sc_t[1], a_scales_ptr + a_sc_k, a_sc_offsets)
+    tlx.buffer_load_to_local(smem_a_sc[1], a_scales_ptr + a_sc_k, a_sc_offsets)
     tlx.async_load_commit_group()
     tlx.buffer_load_to_local(smem_a_bot[1], a_base + a_half_m + a_k2, a_tile_offsets)
-    if not PRESHUFFLED_SCALES:
-        tlx.buffer_load_to_local(smem_a_sc_b[1], a_scales_ptr + a_sc_half_m + a_sc_k, a_sc_offsets)
     tlx.async_load_commit_group()
     tlx.buffer_load_to_local(smem_b_right[1], b_base + b_half_n + b_k2, b_tile_offsets)
     tlx.async_load_commit_group()
 
     a_base += a_k2 * 2
     b_base += b_k2 * 2
-    if MERGED_SCALE_DMA:
-        scale_iter_offset = a_sc_k * 2
-    else:
-        a_scales_ptr += a_sc_k * 2
-        b_scales_ptr += b_sc_k * 2
+    a_scales_ptr += a_sc_k * 2
+    b_scales_ptr += b_sc_k * 2
 
     tlx.async_load_wait_group(6)
     b_left = tlx.local_load(tlx.local_trans(smem_b_left[0]), relaxed=True)
     a_top = tlx.local_load(smem_a_top[0], relaxed=True)
-    if PRESHUFFLED_SCALES:
-        if MERGED_SCALE_DMA:
-            b_sc_view_init = tlx.local_slice(
-                smem_sc_b_view, [1, 0, 0], [1, BLOCK_N, NG])
-            a_sc_view_init = tlx.local_slice(
-                smem_sc_a_view, [0, 0, 0], [1, BLOCK_M, NG])
-            a_sc_comb = tlx.local_load(a_sc_view_init, layout=scale_a_comb_layout, relaxed=True)
-            a_sc_t, a_sc_b = tl.split(tl.trans(tl.reshape(a_sc_comb, 2, HALF_M, NG), 1, 2, 0))
-            a_sc_top = tlx.require_layout(a_sc_t, scale_a_layout)
-            a_sc_bot0 = tlx.require_layout(a_sc_b, scale_a_layout)
-        else:
-            a_sc_view_init = tlx.local_reshape(smem_a_sc[0], preshuffled_scale_shape)
-            a_sc_view_init = tlx.local_trans(a_sc_view_init, preshuffled_a_to_logical)
-            a_sc_view_init = tlx.local_reshape(a_sc_view_init, [BLOCK_M, NG])
-            a_sc_comb = tlx.local_load(a_sc_view_init, layout=scale_a_comb_layout, relaxed=True)
-            a_sc_t, a_sc_b = tl.split(tl.trans(tl.reshape(a_sc_comb, 2, HALF_M, NG), 1, 2, 0))
-            a_sc_top = tlx.require_layout(a_sc_t, scale_a_layout)
-            a_sc_bot0 = tlx.require_layout(a_sc_b, scale_a_layout)
-    else:
-        a_sc_top = tlx.local_load(smem_a_sc_t[0], layout=scale_a_layout)
-    if PRESHUFFLED_SCALES:
-        if not MERGED_SCALE_DMA:
-            b_sc_view_init = tlx.local_reshape(smem_b_sc[0], preshuffled_scale_shape)
-            b_sc_view_init = tlx.local_trans(b_sc_view_init, preshuffled_b_to_logical)
-            b_sc_view_init = tlx.local_reshape(b_sc_view_init, [BLOCK_N, NG])
-        b_sc_comb = tlx.local_load(b_sc_view_init, layout=scale_b_comb_layout, relaxed=True)
-    else:
-        b_sc_comb = tlx.local_load(smem_b_sc[0], layout=scale_b_comb_layout)
+    a_sc_view_init = tlx.local_reshape(smem_a_sc[0], preshuffled_scale_shape)
+    a_sc_view_init = tlx.local_trans(a_sc_view_init, preshuffled_a_to_logical)
+    a_sc_view_init = tlx.local_reshape(a_sc_view_init, [BLOCK_M, NG])
+    a_sc_comb = tlx.local_load(a_sc_view_init, layout=scale_a_comb_layout, relaxed=True)
+    a_sc_t, a_sc_b = tl.split(tl.trans(tl.reshape(a_sc_comb, 2, HALF_M, NG), 1, 2, 0))
+    a_sc_top = tlx.require_layout(a_sc_t, scale_a_layout)
+    a_sc_bot0 = tlx.require_layout(a_sc_b, scale_a_layout)
+    b_sc_view_init = tlx.local_reshape(smem_b_sc[0], preshuffled_scale_shape)
+    b_sc_view_init = tlx.local_trans(b_sc_view_init, preshuffled_b_to_logical)
+    b_sc_view_init = tlx.local_reshape(b_sc_view_init, [BLOCK_N, NG])
+    b_sc_comb = tlx.local_load(b_sc_view_init, layout=scale_b_comb_layout, relaxed=True)
     b_sc_l, b_sc_r = tl.split(tl.trans(tl.reshape(b_sc_comb, 2, HALF_N, NG), 1, 2, 0))
     b_sc_left = tlx.require_layout(b_sc_l, scale_b_layout)
     b_sc_right = tlx.require_layout(b_sc_r, scale_b_layout)
@@ -528,14 +781,10 @@ def _a4w4_8wave_kernel(
             acc_tl = tl.dot_scaled(a_top, a_sc_top, "e2m1", b_left, b_sc_left, "e2m1", acc_tl)
         with tlx.warp_pipeline_stage("mem", priority=1):
             a_bot = tlx.local_load(smem_a_bot[0], relaxed=True)
-            if PRESHUFFLED_SCALES:
-                a_sc_bot = a_sc_bot0
-            else:
-                a_sc_bot = tlx.local_load(smem_a_sc_b[0], layout=scale_a_layout)
+            a_sc_bot = a_sc_bot0
             tlx.amd_sched_barrier(0)  # keep ds_read(local_load) ahead of the global loads
             tlx.buffer_load_to_local(smem_b_left[0], b_base, b_tile_offsets)
-            if not MERGED_SCALE_DMA:
-                tlx.buffer_load_to_local(smem_b_sc[0], b_scales_ptr, b_sc_offsets)
+            tlx.buffer_load_to_local(smem_b_sc[0], b_scales_ptr, b_sc_offsets)
             tlx.async_load_commit_group()
 
         tlx.async_load_wait_group(5)
@@ -545,10 +794,7 @@ def _a4w4_8wave_kernel(
             b_right = tlx.local_load(tlx.local_trans(smem_b_right[0]), relaxed=True)
             tlx.amd_sched_barrier(0)  # keep ds_read(local_load) ahead of the global loads
             tlx.buffer_load_to_local(smem_a_top[0], a_base, a_tile_offsets)
-            if PRESHUFFLED_SCALES and not MERGED_SCALE_DMA:
-                tlx.buffer_load_to_local(smem_a_sc[0], a_scales_ptr, a_sc_offsets)
-            elif not PRESHUFFLED_SCALES:
-                tlx.buffer_load_to_local(smem_a_sc_t[0], a_scales_ptr, a_sc_offsets)
+            tlx.buffer_load_to_local(smem_a_sc[0], a_scales_ptr, a_sc_offsets)
             tlx.async_load_commit_group()
 
         tlx.async_load_wait_group(5)
@@ -558,8 +804,6 @@ def _a4w4_8wave_kernel(
             b_left = tlx.local_load(tlx.local_trans(smem_b_left[1]), relaxed=True)
             tlx.amd_sched_barrier(0)  # keep ds_read(local_load) ahead of the global loads
             tlx.buffer_load_to_local(smem_a_bot[0], a_base + a_half_m, a_tile_offsets)
-            if not PRESHUFFLED_SCALES:
-                tlx.buffer_load_to_local(smem_a_sc_b[0], a_scales_ptr + a_sc_half_m, a_sc_offsets)
             tlx.async_load_commit_group()
 
         tlx.async_load_wait_group(5)
@@ -567,43 +811,22 @@ def _a4w4_8wave_kernel(
             acc_br = tl.dot_scaled(a_bot, a_sc_bot, "e2m1", b_right, b_sc_right, "e2m1", acc_br)
         with tlx.warp_pipeline_stage("mem", priority=1):
             a_top = tlx.local_load(smem_a_top[1], relaxed=True)
-            if PRESHUFFLED_SCALES:
-                if MERGED_SCALE_DMA:
-                    a_sc_view_1 = tlx.local_slice(
-                        smem_sc_a_view, [1, 0, 0], [1, BLOCK_M, NG])
-                    b_sc_view_1 = tlx.local_slice(
-                        smem_sc_b_view, [3, 0, 0], [1, BLOCK_N, NG])
-                else:
-                    a_sc_view_1 = tlx.local_reshape(smem_a_sc[1], preshuffled_scale_shape)
-                    a_sc_view_1 = tlx.local_trans(a_sc_view_1, preshuffled_a_to_logical)
-                    a_sc_view_1 = tlx.local_reshape(a_sc_view_1, [BLOCK_M, NG])
-                if MERGED_SCALE_DMA:
-                    a_sc_comb = tlx.local_load(a_sc_view_1, layout=scale_a_comb_layout, relaxed=True)
-                    a_sc_t, a_sc_b = tl.split(tl.trans(tl.reshape(a_sc_comb, 2, HALF_M, NG), 1, 2, 0))
-                    a_sc_top = tlx.require_layout(a_sc_t, scale_a_layout)
-                    a_sc_bot1 = tlx.require_layout(a_sc_b, scale_a_layout)
-                else:
-                    a_sc_comb = tlx.local_load(a_sc_view_1, layout=scale_a_comb_layout, relaxed=True)
-                    a_sc_t, a_sc_b = tl.split(tl.trans(tl.reshape(a_sc_comb, 2, HALF_M, NG), 1, 2, 0))
-                    a_sc_top = tlx.require_layout(a_sc_t, scale_a_layout)
-                    a_sc_bot1 = tlx.require_layout(a_sc_b, scale_a_layout)
-            else:
-                a_sc_top = tlx.local_load(smem_a_sc_t[1], layout=scale_a_layout)
-            if PRESHUFFLED_SCALES:
-                if not MERGED_SCALE_DMA:
-                    b_sc_view_1 = tlx.local_reshape(smem_b_sc[1], preshuffled_scale_shape)
-                    b_sc_view_1 = tlx.local_trans(b_sc_view_1, preshuffled_b_to_logical)
-                    b_sc_view_1 = tlx.local_reshape(b_sc_view_1, [BLOCK_N, NG])
-                b_sc_comb = tlx.local_load(b_sc_view_1, layout=scale_b_comb_layout, relaxed=True)
-            else:
-                b_sc_comb = tlx.local_load(smem_b_sc[1], layout=scale_b_comb_layout)
+            a_sc_view_1 = tlx.local_reshape(smem_a_sc[1], preshuffled_scale_shape)
+            a_sc_view_1 = tlx.local_trans(a_sc_view_1, preshuffled_a_to_logical)
+            a_sc_view_1 = tlx.local_reshape(a_sc_view_1, [BLOCK_M, NG])
+            a_sc_comb = tlx.local_load(a_sc_view_1, layout=scale_a_comb_layout, relaxed=True)
+            a_sc_t, a_sc_b = tl.split(tl.trans(tl.reshape(a_sc_comb, 2, HALF_M, NG), 1, 2, 0))
+            a_sc_top = tlx.require_layout(a_sc_t, scale_a_layout)
+            a_sc_bot1 = tlx.require_layout(a_sc_b, scale_a_layout)
+            b_sc_view_1 = tlx.local_reshape(smem_b_sc[1], preshuffled_scale_shape)
+            b_sc_view_1 = tlx.local_trans(b_sc_view_1, preshuffled_b_to_logical)
+            b_sc_view_1 = tlx.local_reshape(b_sc_view_1, [BLOCK_N, NG])
+            b_sc_comb = tlx.local_load(b_sc_view_1, layout=scale_b_comb_layout, relaxed=True)
             b_sc_l, b_sc_r = tl.split(tl.trans(tl.reshape(b_sc_comb, 2, HALF_N, NG), 1, 2, 0))
             b_sc_left = tlx.require_layout(b_sc_l, scale_b_layout)
             b_sc_right = tlx.require_layout(b_sc_r, scale_b_layout)
             tlx.amd_sched_barrier(0)  # keep ds_read(local_load) ahead of the global loads
             tlx.buffer_load_to_local(smem_b_right[0], b_base + b_half_n, b_tile_offsets)
-            if MERGED_SCALE_DMA:
-                tlx.buffer_load_to_local(smem_sc[0], a_scales_ptr, scale_offsets + scale_iter_offset)
             tlx.async_load_commit_group()
 
         # --- sub-iter 1 (buffer 1, base + one K-step) ---
@@ -612,14 +835,10 @@ def _a4w4_8wave_kernel(
             acc_tl = tl.dot_scaled(a_top, a_sc_top, "e2m1", b_left, b_sc_left, "e2m1", acc_tl)
         with tlx.warp_pipeline_stage("mem", priority=1):
             a_bot = tlx.local_load(smem_a_bot[1], relaxed=True)
-            if PRESHUFFLED_SCALES:
-                a_sc_bot = a_sc_bot1
-            else:
-                a_sc_bot = tlx.local_load(smem_a_sc_b[1], layout=scale_a_layout)
+            a_sc_bot = a_sc_bot1
             tlx.amd_sched_barrier(0)  # keep ds_read(local_load) ahead of the global loads
             tlx.buffer_load_to_local(smem_b_left[1], b_base + b_k2, b_tile_offsets)
-            if not MERGED_SCALE_DMA:
-                tlx.buffer_load_to_local(smem_b_sc[1], b_scales_ptr + b_sc_k, b_sc_offsets)
+            tlx.buffer_load_to_local(smem_b_sc[1], b_scales_ptr + b_sc_k, b_sc_offsets)
             tlx.async_load_commit_group()
 
         tlx.async_load_wait_group(5)
@@ -629,10 +848,7 @@ def _a4w4_8wave_kernel(
             b_right = tlx.local_load(tlx.local_trans(smem_b_right[1]), relaxed=True)
             tlx.amd_sched_barrier(0)  # keep ds_read(local_load) ahead of the global loads
             tlx.buffer_load_to_local(smem_a_top[1], a_base + a_k2, a_tile_offsets)
-            if PRESHUFFLED_SCALES and not MERGED_SCALE_DMA:
-                tlx.buffer_load_to_local(smem_a_sc[1], a_scales_ptr + a_sc_k, a_sc_offsets)
-            elif not PRESHUFFLED_SCALES:
-                tlx.buffer_load_to_local(smem_a_sc_t[1], a_scales_ptr + a_sc_k, a_sc_offsets)
+            tlx.buffer_load_to_local(smem_a_sc[1], a_scales_ptr + a_sc_k, a_sc_offsets)
             tlx.async_load_commit_group()
 
         tlx.async_load_wait_group(5)
@@ -642,8 +858,6 @@ def _a4w4_8wave_kernel(
             b_left = tlx.local_load(tlx.local_trans(smem_b_left[0]), relaxed=True)
             tlx.amd_sched_barrier(0)  # keep ds_read(local_load) ahead of the global loads
             tlx.buffer_load_to_local(smem_a_bot[1], a_base + a_half_m + a_k2, a_tile_offsets)
-            if not PRESHUFFLED_SCALES:
-                tlx.buffer_load_to_local(smem_a_sc_b[1], a_scales_ptr + a_sc_half_m + a_sc_k, a_sc_offsets)
             tlx.async_load_commit_group()
 
         tlx.async_load_wait_group(5)
@@ -651,36 +865,17 @@ def _a4w4_8wave_kernel(
             acc_br = tl.dot_scaled(a_bot, a_sc_bot, "e2m1", b_right, b_sc_right, "e2m1", acc_br)
         with tlx.warp_pipeline_stage("mem", priority=1):
             a_top = tlx.local_load(smem_a_top[0], relaxed=True)
-            if PRESHUFFLED_SCALES:
-                if MERGED_SCALE_DMA:
-                    a_sc_view_0 = tlx.local_slice(
-                        smem_sc_a_view, [0, 0, 0], [1, BLOCK_M, NG])
-                    b_sc_view_0 = tlx.local_slice(
-                        smem_sc_b_view, [1, 0, 0], [1, BLOCK_N, NG])
-                else:
-                    a_sc_view_0 = tlx.local_reshape(smem_a_sc[0], preshuffled_scale_shape)
-                    a_sc_view_0 = tlx.local_trans(a_sc_view_0, preshuffled_a_to_logical)
-                    a_sc_view_0 = tlx.local_reshape(a_sc_view_0, [BLOCK_M, NG])
-                if MERGED_SCALE_DMA:
-                    a_sc_comb = tlx.local_load(a_sc_view_0, layout=scale_a_comb_layout, relaxed=True)
-                    a_sc_t, a_sc_b = tl.split(tl.trans(tl.reshape(a_sc_comb, 2, HALF_M, NG), 1, 2, 0))
-                    a_sc_top = tlx.require_layout(a_sc_t, scale_a_layout)
-                    a_sc_bot0 = tlx.require_layout(a_sc_b, scale_a_layout)
-                else:
-                    a_sc_comb = tlx.local_load(a_sc_view_0, layout=scale_a_comb_layout, relaxed=True)
-                    a_sc_t, a_sc_b = tl.split(tl.trans(tl.reshape(a_sc_comb, 2, HALF_M, NG), 1, 2, 0))
-                    a_sc_top = tlx.require_layout(a_sc_t, scale_a_layout)
-                    a_sc_bot0 = tlx.require_layout(a_sc_b, scale_a_layout)
-            else:
-                a_sc_top = tlx.local_load(smem_a_sc_t[0], layout=scale_a_layout)
-            if PRESHUFFLED_SCALES:
-                if not MERGED_SCALE_DMA:
-                    b_sc_view_0 = tlx.local_reshape(smem_b_sc[0], preshuffled_scale_shape)
-                    b_sc_view_0 = tlx.local_trans(b_sc_view_0, preshuffled_b_to_logical)
-                    b_sc_view_0 = tlx.local_reshape(b_sc_view_0, [BLOCK_N, NG])
-                b_sc_comb = tlx.local_load(b_sc_view_0, layout=scale_b_comb_layout, relaxed=True)
-            else:
-                b_sc_comb = tlx.local_load(smem_b_sc[0], layout=scale_b_comb_layout)
+            a_sc_view_0 = tlx.local_reshape(smem_a_sc[0], preshuffled_scale_shape)
+            a_sc_view_0 = tlx.local_trans(a_sc_view_0, preshuffled_a_to_logical)
+            a_sc_view_0 = tlx.local_reshape(a_sc_view_0, [BLOCK_M, NG])
+            a_sc_comb = tlx.local_load(a_sc_view_0, layout=scale_a_comb_layout, relaxed=True)
+            a_sc_t, a_sc_b = tl.split(tl.trans(tl.reshape(a_sc_comb, 2, HALF_M, NG), 1, 2, 0))
+            a_sc_top = tlx.require_layout(a_sc_t, scale_a_layout)
+            a_sc_bot0 = tlx.require_layout(a_sc_b, scale_a_layout)
+            b_sc_view_0 = tlx.local_reshape(smem_b_sc[0], preshuffled_scale_shape)
+            b_sc_view_0 = tlx.local_trans(b_sc_view_0, preshuffled_b_to_logical)
+            b_sc_view_0 = tlx.local_reshape(b_sc_view_0, [BLOCK_N, NG])
+            b_sc_comb = tlx.local_load(b_sc_view_0, layout=scale_b_comb_layout, relaxed=True)
             b_sc_l, b_sc_r = tl.split(tl.trans(tl.reshape(b_sc_comb, 2, HALF_N, NG), 1, 2, 0))
             b_sc_left = tlx.require_layout(b_sc_l, scale_b_layout)
             b_sc_right = tlx.require_layout(b_sc_r, scale_b_layout)
@@ -689,11 +884,8 @@ def _a4w4_8wave_kernel(
             tlx.async_load_commit_group()
             a_base += a_k2 * 2
             b_base += b_k2 * 2
-            if MERGED_SCALE_DMA:
-                scale_iter_offset += a_sc_k * 2
-            else:
-                a_scales_ptr += a_sc_k * 2
-                b_scales_ptr += b_sc_k * 2
+            a_scales_ptr += a_sc_k * 2
+            b_scales_ptr += b_sc_k * 2
 
     # ---- Epilogue: last 2 K-steps, drain, 4-quadrant store ----
     # iter iter_max-2 (b_sc_left/right for this step were prefetched at loop tail)
@@ -701,11 +893,7 @@ def _a4w4_8wave_kernel(
     tlx.async_load_wait_group(5)
     l_idx: tl.constexpr = 0  # (iter_max - 2) % 2, always 0 (iter_max even)
     a_bot = tlx.local_load(tlx.local_view(smem_a_bot, l_idx), relaxed=True)
-    if PRESHUFFLED_SCALES:
-        a_sc_bot = a_sc_bot0
-    else:
-        a_sc_bot = tlx.local_load(smem_a_sc_b[l_idx], layout=scale_a_layout)
-
+    a_sc_bot = a_sc_bot0
     acc_bl = tl.dot_scaled(a_bot, a_sc_bot, "e2m1", b_left, b_sc_left, "e2m1", acc_bl)
     tlx.async_load_wait_group(4)
     b_right = tlx.local_load(tlx.local_trans(tlx.local_view(smem_b_right, l_idx)), relaxed=True)
@@ -718,36 +906,17 @@ def _a4w4_8wave_kernel(
     acc_br = tl.dot_scaled(a_bot, a_sc_bot, "e2m1", b_right, b_sc_right, "e2m1", acc_br)
     tlx.async_load_wait_group(2)
     a_top = tlx.local_load(tlx.local_view(smem_a_top, g_idx), relaxed=True)
-    if PRESHUFFLED_SCALES:
-        if MERGED_SCALE_DMA:
-            a_sc_view_epilogue = tlx.local_slice(
-                smem_sc_a_view, [1, 0, 0], [1, BLOCK_M, NG])
-            b_sc_view_epilogue = tlx.local_slice(
-                smem_sc_b_view, [3, 0, 0], [1, BLOCK_N, NG])
-        else:
-            a_sc_view_epilogue = tlx.local_reshape(smem_a_sc[g_idx], preshuffled_scale_shape)
-            a_sc_view_epilogue = tlx.local_trans(a_sc_view_epilogue, preshuffled_a_to_logical)
-            a_sc_view_epilogue = tlx.local_reshape(a_sc_view_epilogue, [BLOCK_M, NG])
-        if MERGED_SCALE_DMA:
-            a_sc_comb = tlx.local_load(a_sc_view_epilogue, layout=scale_a_comb_layout, relaxed=True)
-            a_sc_t, a_sc_b = tl.split(tl.trans(tl.reshape(a_sc_comb, 2, HALF_M, NG), 1, 2, 0))
-            a_sc_top = tlx.require_layout(a_sc_t, scale_a_layout)
-            a_sc_bot1 = tlx.require_layout(a_sc_b, scale_a_layout)
-        else:
-            a_sc_comb = tlx.local_load(a_sc_view_epilogue, layout=scale_a_comb_layout, relaxed=True)
-            a_sc_t, a_sc_b = tl.split(tl.trans(tl.reshape(a_sc_comb, 2, HALF_M, NG), 1, 2, 0))
-            a_sc_top = tlx.require_layout(a_sc_t, scale_a_layout)
-            a_sc_bot1 = tlx.require_layout(a_sc_b, scale_a_layout)
-    else:
-        a_sc_top = tlx.local_load(smem_a_sc_t[g_idx], layout=scale_a_layout)
-    if PRESHUFFLED_SCALES:
-        if not MERGED_SCALE_DMA:
-            b_sc_view_epilogue = tlx.local_reshape(smem_b_sc[g_idx], preshuffled_scale_shape)
-            b_sc_view_epilogue = tlx.local_trans(b_sc_view_epilogue, preshuffled_b_to_logical)
-            b_sc_view_epilogue = tlx.local_reshape(b_sc_view_epilogue, [BLOCK_N, NG])
-        b_sc_comb = tlx.local_load(b_sc_view_epilogue, layout=scale_b_comb_layout, relaxed=True)
-    else:
-        b_sc_comb = tlx.local_load(smem_b_sc[g_idx], layout=scale_b_comb_layout)
+    a_sc_view_epilogue = tlx.local_reshape(smem_a_sc[g_idx], preshuffled_scale_shape)
+    a_sc_view_epilogue = tlx.local_trans(a_sc_view_epilogue, preshuffled_a_to_logical)
+    a_sc_view_epilogue = tlx.local_reshape(a_sc_view_epilogue, [BLOCK_M, NG])
+    a_sc_comb = tlx.local_load(a_sc_view_epilogue, layout=scale_a_comb_layout, relaxed=True)
+    a_sc_t, a_sc_b = tl.split(tl.trans(tl.reshape(a_sc_comb, 2, HALF_M, NG), 1, 2, 0))
+    a_sc_top = tlx.require_layout(a_sc_t, scale_a_layout)
+    a_sc_bot1 = tlx.require_layout(a_sc_b, scale_a_layout)
+    b_sc_view_epilogue = tlx.local_reshape(smem_b_sc[g_idx], preshuffled_scale_shape)
+    b_sc_view_epilogue = tlx.local_trans(b_sc_view_epilogue, preshuffled_b_to_logical)
+    b_sc_view_epilogue = tlx.local_reshape(b_sc_view_epilogue, [BLOCK_N, NG])
+    b_sc_comb = tlx.local_load(b_sc_view_epilogue, layout=scale_b_comb_layout, relaxed=True)
     b_sc_l, b_sc_r = tl.split(tl.trans(tl.reshape(b_sc_comb, 2, HALF_N, NG), 1, 2, 0))
     b_sc_left = tlx.require_layout(b_sc_l, scale_b_layout)
     b_sc_right = tlx.require_layout(b_sc_r, scale_b_layout)
@@ -756,11 +925,7 @@ def _a4w4_8wave_kernel(
     acc_tl = tl.dot_scaled(a_top, a_sc_top, "e2m1", b_left, b_sc_left, "e2m1", acc_tl)
     tlx.async_load_wait_group(1)
     a_bot = tlx.local_load(tlx.local_view(smem_a_bot, g_idx), relaxed=True)
-    if PRESHUFFLED_SCALES:
-        a_sc_bot = a_sc_bot1
-    else:
-        a_sc_bot = tlx.local_load(smem_a_sc_b[g_idx], layout=scale_a_layout)
-
+    a_sc_bot = a_sc_bot1
     acc_bl = tl.dot_scaled(a_bot, a_sc_bot, "e2m1", b_left, b_sc_left, "e2m1", acc_bl)
     tlx.async_load_wait_group(0)
     b_right = tlx.local_load(tlx.local_trans(tlx.local_view(smem_b_right, g_idx)), relaxed=True)
@@ -843,38 +1008,427 @@ def _a4w4_8wave_merged_scales_kernel(
     GRID_MN: tl.constexpr,
     SPLIT_K: tl.constexpr,
 ):
-    """Distinct one-scale-pointer ABI for the merged 16-byte DMA experiment."""
-    _a4w4_8wave_kernel(
-        a_ptr,
-        b_ptr,
-        c_ptr,
-        workspace_ptr,
-        scales_ptr,
-        scales_ptr,
-        M,
-        N,
-        K,
-        K_TILES,
-        stride_am,
-        stride_ak,
-        stride_bn,
-        stride_bk,
-        stride_cm,
-        stride_cn,
-        0,
-        0,
-        0,
-        0,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
-        BLOCK_K=BLOCK_K,
-        GROUP_SIZE_M=GROUP_SIZE_M,
-        NUM_XCDS=NUM_XCDS,
-        GRID_MN=GRID_MN,
-        SPLIT_K=SPLIT_K,
-        PRESHUFFLED_SCALES=True,
-        MERGED_SCALE_DMA=True,
+    """Merged one-scale-pointer kernel with a 16-byte scale DMA."""
+    SCALE_GROUP_SIZE: tl.constexpr = 32
+    HALF_M: tl.constexpr = BLOCK_M // 2  # 128
+    HALF_N: tl.constexpr = BLOCK_N // 2  # 128
+    HALF_K: tl.constexpr = BLOCK_K // 2  # 128 (packed fp4)
+    NG: tl.constexpr = BLOCK_K // SCALE_GROUP_SIZE  # 8 scale groups along K
+    # Split-K: each program owns a contiguous K-slice of length KS (== K when
+    # SPLIT_K==1). KS is constexpr, so every derived offset stays constexpr and
+    # keeps its divisibility (no #linear -> #blocked collapse).
+    KS: tl.constexpr = K // SPLIT_K
+    KS_PACKED: tl.constexpr = KS // 2  # packed fp4 columns per split
+    KS_SCALE: tl.constexpr = KS // SCALE_GROUP_SIZE  # scale groups per split
+    SCALE_GROUP_BLOCKS: tl.constexpr = K // BLOCK_K
+
+    # ---- fp4 tile global-load register layout (#linear, [128,128]) ----
+    g_load_layout: tl.constexpr = tlx.layout(
+        shape=((2, 2, 2, 2, 2, 2, 2, 2, 2), (2, 2, 2, 2, 2)),
+        stride=((16, 32, 64, 128, 4096, 8192, 256, 512, 1024), (1, 2, 4, 8, 2048)),
     )
+    # ---- padded shared tile layout ([128,128] fp4, pad 32 @ 1024) ----
+    shared_tile: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases(
+        [[1024, 32]],
+        [
+            [0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64],
+            [1, 0], [32, 0], [64, 0], [2, 0], [4, 0], [8, 0], [16, 0],
+        ],
+        [HALF_M, HALF_K],
+    )
+    # The combined A view assigns the four register-value bits to the low four
+    # physical address bits, so one aligned ds_read_b128 produces both 128-row
+    # MFMA scale fragments.  Address bits 4..6 are lane bits 0..2, which gives
+    # each dword phase all 32 LDS banks; the remaining lane and warp ownership
+    # bits select higher 128-byte regions.
+    # The merged layouts add the K-tile selector around the combined A map.
+    # Physical bit 11 is the 2048-byte A/B section selector, so it is unused by
+    # the A view; physical bit 12 selects the second K tile.
+    shared_merged_a_scales_combined: tl.constexpr = tlx.shared_linear_layout_encoding(
+        offset_bases=[
+            [0, 0, 4], [0, 32, 0], [0, 64, 0], [0, 128, 0],
+            [0, 1, 0], [0, 2, 0], [0, 4, 0], [0, 8, 0],
+            [0, 16, 0], [0, 0, 1], [0, 0, 2], [0, 0, 0], [1, 0, 0],
+        ],
+        block_bases=[],
+        alignment=16,
+    )
+    # The merged B layout adds section and K-tile selector bits around its
+    # canonical map so the full raw allocation can be reinterpreted before
+    # slicing.
+    shared_merged_b_scales: tl.constexpr = tlx.shared_linear_layout_encoding(
+        offset_bases=[
+            [0, 1, 0], [0, 2, 0], [0, 4, 0], [0, 8, 0], [0, 16, 0],
+            [0, 32, 0], [0, 64, 0], [0, 128, 0], [0, 16, 1], [0, 0, 2],
+            [0, 32, 4], [1, 0, 0], [2, 0, 0],
+        ],
+        block_bases=[],
+        alignment=16,
+    )
+    # The merged DMA writes one raw byte-linear 8192-byte A+B image.
+    shared_scale_merged: tl.constexpr = tlx.shared_linear_layout_encoding(
+        offset_bases=[
+            [1], [2], [4], [8], [16], [32], [64], [128], [256], [512], [1024], [2048], [4096],
+        ],
+        block_bases=[],
+        alignment=16,
+    )
+    # One 16-byte vector per thread stages two adjacent A+B scale images.  The
+    # high warp bit selects the second K tile, so all eight waves contribute to
+    # one full-workgroup 8192-byte DMA.
+    scale_load_merged_layout: tl.constexpr = tlx.layout(
+        shape=((2, 2, 2, 2, 2, 2, 2, 2, 2), (2, 2, 2, 2)),
+        stride=((16, 32, 64, 128, 256, 512, 1024, 2048, 4096), (1, 2, 4, 8)),
+    )
+    # ---- MFMA scale register layouts (get_mfma_scale_layout) ----
+    scale_a_layout: tl.constexpr = tlx.layout(
+        shape=((2, 2, 2, 2, 2, 2, 2, 2, 2), (2, 2, 2)),
+        stride=((8, 16, 32, 64, 1, 2, 0, 0, 128), (4, 256, 512)),
+    )
+    scale_a_comb_layout: tl.constexpr = tlx.layout(
+        shape=((2, 2, 2, 2, 2, 2, 2, 2, 2), (2, 2, 2, 2)),
+        stride=((8, 16, 32, 64, 1, 2, 0, 0, 128), (4, 256, 512, 1024)),
+    )
+    scale_b_layout: tl.constexpr = tlx.layout(
+        shape=((2, 2, 2, 2, 2, 2, 2, 2, 2), (2, 2)),
+        stride=((8, 16, 32, 64, 1, 2, 128, 256, 0), (4, 512)),
+    )
+    scale_b_comb_layout: tl.constexpr = tlx.layout(
+        shape=((2, 2, 2, 2, 2, 2, 2, 2, 2), (2, 2, 2)),
+        stride=((8, 16, 32, 64, 1, 2, 128, 256, 0), (4, 512, 1024)),
+    )
+    # ---- MFMA accumulator layout (#mma 16x16x128 [2,4], one [128,128] quadrant) ----
+    accumulator_layout: tl.constexpr = tlx.layout(
+        shape=((2, 2, 2, 2, 2, 2, 2, 2, 2), (2, 2, 2, 2, 2)),
+        stride=((128, 256, 512, 1024, 4, 8, 16, 32, 2048), (1, 2, 64, 4096, 8192)),
+    )
+    # ---- store layout (#blocked2, [128,128] bf16 quadrant) ----
+    store_layout_c: tl.constexpr = tlx.layout(
+        shape=((2, 2, 2, 2, 2, 2, 2, 2, 2), (2, 2, 2, 2, 2)),
+        stride=((8, 16, 32, 64, 128, 256, 512, 1024, 2048), (1, 2, 4, 4096, 8192)),
+    )
+
+    # Grid is GRID_MN * SPLIT_K; peel the split id, keep the MN pid for the
+    # XCD / GROUP_SIZE_M remap below.
+    split_id = tl.program_id(0) // GRID_MN
+    pid = tl.program_id(0) % GRID_MN
+    num_pid_m = tl.cdiv(M, BLOCK_M)
+    num_pid_n = tl.cdiv(N, BLOCK_N)
+
+    if NUM_XCDS != 1:
+        pids_per_xcd = (GRID_MN + NUM_XCDS - 1) // NUM_XCDS
+        tall_xcds = GRID_MN % NUM_XCDS
+        tall_xcds = NUM_XCDS if tall_xcds == 0 else tall_xcds
+        xcd = pid % NUM_XCDS
+        local_pid = pid // NUM_XCDS
+        if xcd < tall_xcds:
+            pid = xcd * pids_per_xcd + local_pid
+        else:
+            pid = tall_xcds * pids_per_xcd + (xcd - tall_xcds) * (pids_per_xcd - 1) + local_pid
+
+    if GROUP_SIZE_M == 1:
+        pid_m = pid // num_pid_n
+        pid_n = pid % num_pid_n
+    else:
+        num_pid_in_group = GROUP_SIZE_M * num_pid_n
+        group_id = pid // num_pid_in_group
+        first_pid_m = group_id * GROUP_SIZE_M
+        group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+        tl.assume(group_size_m > 0)
+        pid_m = first_pid_m + (pid % num_pid_in_group) % group_size_m
+        pid_n = (pid % num_pid_in_group) // group_size_m
+
+    # Four double-buffered operand half-tiles plus one 8192-byte scale image for
+    # the two K tiles consumed by an unrolled iteration. It is refilled after
+    # both scale halves have been read, so it needs no second scale buffer.
+    smem_a_top = tlx.local_alloc((HALF_M, HALF_K), tlx.dtype_of(a_ptr), 2, layout=shared_tile)
+    smem_a_bot = tlx.local_alloc((HALF_M, HALF_K), tlx.dtype_of(a_ptr), 2, layout=shared_tile)
+    smem_b_left = tlx.local_alloc((HALF_N, HALF_K), tlx.dtype_of(b_ptr), 2, layout=shared_tile)
+    smem_b_right = tlx.local_alloc((HALF_N, HALF_K), tlx.dtype_of(b_ptr), 2, layout=shared_tile)
+    smem_sc = tlx.local_alloc(
+        (2 * (BLOCK_M + BLOCK_N) * NG, ), tlx.dtype_of(scales_ptr), 1, layout=shared_scale_merged)
+    smem_sc_a_view = tlx.local_reinterpret(
+        smem_sc[0], tl.uint8, [2, BLOCK_M, NG], layout=shared_merged_a_scales_combined)
+    smem_sc_b_view = tlx.local_reinterpret(
+        smem_sc[0], tl.uint8, [4, BLOCK_N, NG], layout=shared_merged_b_scales)
+    offs_am = tl.arange(0, HALF_M)
+    offs_ak = tl.arange(0, HALF_K)
+    a_tile_offsets = tlx.require_layout(offs_am[:, None] * stride_am + offs_ak[None, :] * stride_ak, g_load_layout)
+    a_base = a_ptr + pid_m * BLOCK_M * stride_am
+
+    offs_bn = tl.arange(0, HALF_N)
+    offs_bk = tl.arange(0, HALF_K)
+    b_tile_offsets = tlx.require_layout(offs_bn[:, None] * stride_bn + offs_bk[None, :] * stride_bk, g_load_layout)
+    b_base = b_ptr + pid_n * BLOCK_N * stride_bn
+
+    # ---- Scale load offsets ----
+    scale_physical_offsets = tl.arange(0, 2 * (BLOCK_M + BLOCK_N) * NG)
+    scale_k_tile = scale_physical_offsets // ((BLOCK_M + BLOCK_N) * NG)
+    scale_in_tile = scale_physical_offsets % ((BLOCK_M + BLOCK_N) * NG)
+    a_scale_tile_base = pid_m * SCALE_GROUP_BLOCKS * BLOCK_M * NG
+    b_scale_tile_base = num_pid_m * SCALE_GROUP_BLOCKS * BLOCK_M * NG
+    b_scale_tile_base += pid_n * SCALE_GROUP_BLOCKS * BLOCK_N * NG
+    split_scale_base = split_id * (KS_SCALE // NG) * BLOCK_M * NG
+    a_scale_tile_base += split_scale_base
+    b_scale_tile_base += split_scale_base
+    scale_offsets = tl.where(
+        scale_in_tile < BLOCK_M * NG,
+        a_scale_tile_base + scale_k_tile * BLOCK_M * NG + scale_in_tile,
+        b_scale_tile_base + scale_k_tile * BLOCK_N * NG + scale_in_tile - BLOCK_M * NG,
+    )
+    scale_offsets = tlx.require_layout(scale_offsets, scale_load_merged_layout)
+    a_half_m = HALF_M * stride_am  # a_top -> a_bot
+    b_half_n = HALF_N * stride_bn  # b_left -> b_right
+    a_k2 = HALF_K * stride_ak  # even -> odd (_next) K-step
+    b_k2 = HALF_K * stride_bk
+    a_sc_k: tl.constexpr = BLOCK_M * NG
+    a_base += split_id * KS_PACKED * stride_ak
+    b_base += split_id * KS_PACKED * stride_bk
+    acc_tl = tl.zeros((HALF_M, HALF_N), dtype=tl.float32)
+    acc_bl = tl.zeros((HALF_M, HALF_N), dtype=tl.float32)
+    acc_tr = tl.zeros((HALF_M, HALF_N), dtype=tl.float32)
+    acc_br = tl.zeros((HALF_M, HALF_N), dtype=tl.float32)
+
+    # _matmul_256tile derives this trusted runtime value from the asserted KS.
+    # The assumption keeps range/liveness analysis as precise as the old
+    # constexpr bound while preserving the one-trip scf.for at K=1024.
+    iter_max = K_TILES
+    tl.assume(iter_max > 3)
+
+    # ---- Prologue: prefetch K-steps 0,1 into buffers 0,1 (8 commits) ----
+    tlx.buffer_load_to_local(smem_sc[0], scales_ptr, scale_offsets)
+    tlx.buffer_load_to_local(smem_b_left[0], b_base, b_tile_offsets)
+    tlx.async_load_commit_group()
+    tlx.buffer_load_to_local(smem_a_top[0], a_base, a_tile_offsets)
+    tlx.async_load_commit_group()
+    tlx.buffer_load_to_local(smem_a_bot[0], a_base + a_half_m, a_tile_offsets)
+    tlx.async_load_commit_group()
+    tlx.buffer_load_to_local(smem_b_right[0], b_base + b_half_n, b_tile_offsets)
+    tlx.async_load_commit_group()
+
+    tlx.buffer_load_to_local(smem_b_left[1], b_base + b_k2, b_tile_offsets)
+    tlx.async_load_commit_group()
+    tlx.buffer_load_to_local(smem_a_top[1], a_base + a_k2, a_tile_offsets)
+    tlx.async_load_commit_group()
+    tlx.buffer_load_to_local(smem_a_bot[1], a_base + a_half_m + a_k2, a_tile_offsets)
+    tlx.async_load_commit_group()
+    tlx.buffer_load_to_local(smem_b_right[1], b_base + b_half_n + b_k2, b_tile_offsets)
+    tlx.async_load_commit_group()
+
+    a_base += a_k2 * 2
+    b_base += b_k2 * 2
+    scale_iter_offset = a_sc_k * 2
+    tlx.async_load_wait_group(6)
+    b_left = tlx.local_load(tlx.local_trans(smem_b_left[0]), relaxed=True)
+    a_top = tlx.local_load(smem_a_top[0], relaxed=True)
+    b_sc_view_init = tlx.local_slice(
+        smem_sc_b_view, [1, 0, 0], [1, BLOCK_N, NG])
+    a_sc_view_init = tlx.local_slice(
+        smem_sc_a_view, [0, 0, 0], [1, BLOCK_M, NG])
+    a_sc_comb = tlx.local_load(a_sc_view_init, layout=scale_a_comb_layout, relaxed=True)
+    a_sc_t, a_sc_b = tl.split(tl.trans(tl.reshape(a_sc_comb, 2, HALF_M, NG), 1, 2, 0))
+    a_sc_top = tlx.require_layout(a_sc_t, scale_a_layout)
+    a_sc_bot0 = tlx.require_layout(a_sc_b, scale_a_layout)
+    b_sc_comb = tlx.local_load(b_sc_view_init, layout=scale_b_comb_layout, relaxed=True)
+    b_sc_l, b_sc_r = tl.split(tl.trans(tl.reshape(b_sc_comb, 2, HALF_N, NG), 1, 2, 0))
+    b_sc_left = tlx.require_layout(b_sc_l, scale_b_layout)
+    b_sc_right = tlx.require_layout(b_sc_r, scale_b_layout)
+
+    # ---- Main loop (2x unrolled): 8 (mfma + mem) regions ----
+    for k in tl.range(0, iter_max - 2, 2, num_stages=1):
+        # --- sub-iter 0 (buffer 0) ---
+        tlx.async_load_wait_group(5)
+        with tlx.warp_pipeline_stage("mfma", priority=0):
+            acc_tl = tl.dot_scaled(a_top, a_sc_top, "e2m1", b_left, b_sc_left, "e2m1", acc_tl)
+        with tlx.warp_pipeline_stage("mem", priority=1):
+            a_bot = tlx.local_load(smem_a_bot[0], relaxed=True)
+            a_sc_bot = a_sc_bot0
+            tlx.amd_sched_barrier(0)  # keep ds_read(local_load) ahead of the global loads
+            tlx.buffer_load_to_local(smem_b_left[0], b_base, b_tile_offsets)
+            tlx.async_load_commit_group()
+
+        tlx.async_load_wait_group(5)
+        with tlx.warp_pipeline_stage("mfma", priority=0):
+            acc_bl = tl.dot_scaled(a_bot, a_sc_bot, "e2m1", b_left, b_sc_left, "e2m1", acc_bl)
+        with tlx.warp_pipeline_stage("mem", priority=1):
+            b_right = tlx.local_load(tlx.local_trans(smem_b_right[0]), relaxed=True)
+            tlx.amd_sched_barrier(0)  # keep ds_read(local_load) ahead of the global loads
+            tlx.buffer_load_to_local(smem_a_top[0], a_base, a_tile_offsets)
+            tlx.async_load_commit_group()
+
+        tlx.async_load_wait_group(5)
+        with tlx.warp_pipeline_stage("mfma", priority=0):
+            acc_tr = tl.dot_scaled(a_top, a_sc_top, "e2m1", b_right, b_sc_right, "e2m1", acc_tr)
+        with tlx.warp_pipeline_stage("mem", priority=1):
+            b_left = tlx.local_load(tlx.local_trans(smem_b_left[1]), relaxed=True)
+            tlx.amd_sched_barrier(0)  # keep ds_read(local_load) ahead of the global loads
+            tlx.buffer_load_to_local(smem_a_bot[0], a_base + a_half_m, a_tile_offsets)
+            tlx.async_load_commit_group()
+
+        tlx.async_load_wait_group(5)
+        with tlx.warp_pipeline_stage("mfma", priority=0):
+            acc_br = tl.dot_scaled(a_bot, a_sc_bot, "e2m1", b_right, b_sc_right, "e2m1", acc_br)
+        with tlx.warp_pipeline_stage("mem", priority=1):
+            a_top = tlx.local_load(smem_a_top[1], relaxed=True)
+            a_sc_view_1 = tlx.local_slice(
+                smem_sc_a_view, [1, 0, 0], [1, BLOCK_M, NG])
+            b_sc_view_1 = tlx.local_slice(
+                smem_sc_b_view, [3, 0, 0], [1, BLOCK_N, NG])
+            a_sc_comb = tlx.local_load(a_sc_view_1, layout=scale_a_comb_layout, relaxed=True)
+            a_sc_t, a_sc_b = tl.split(tl.trans(tl.reshape(a_sc_comb, 2, HALF_M, NG), 1, 2, 0))
+            a_sc_top = tlx.require_layout(a_sc_t, scale_a_layout)
+            a_sc_bot1 = tlx.require_layout(a_sc_b, scale_a_layout)
+            b_sc_comb = tlx.local_load(b_sc_view_1, layout=scale_b_comb_layout, relaxed=True)
+            b_sc_l, b_sc_r = tl.split(tl.trans(tl.reshape(b_sc_comb, 2, HALF_N, NG), 1, 2, 0))
+            b_sc_left = tlx.require_layout(b_sc_l, scale_b_layout)
+            b_sc_right = tlx.require_layout(b_sc_r, scale_b_layout)
+            tlx.amd_sched_barrier(0)  # keep ds_read(local_load) ahead of the global loads
+            tlx.buffer_load_to_local(smem_b_right[0], b_base + b_half_n, b_tile_offsets)
+            tlx.buffer_load_to_local(smem_sc[0], scales_ptr, scale_offsets + scale_iter_offset)
+            tlx.async_load_commit_group()
+
+        # --- sub-iter 1 (buffer 1, base + one K-step) ---
+        tlx.async_load_wait_group(5)
+        with tlx.warp_pipeline_stage("mfma", priority=0):
+            acc_tl = tl.dot_scaled(a_top, a_sc_top, "e2m1", b_left, b_sc_left, "e2m1", acc_tl)
+        with tlx.warp_pipeline_stage("mem", priority=1):
+            a_bot = tlx.local_load(smem_a_bot[1], relaxed=True)
+            a_sc_bot = a_sc_bot1
+            tlx.amd_sched_barrier(0)  # keep ds_read(local_load) ahead of the global loads
+            tlx.buffer_load_to_local(smem_b_left[1], b_base + b_k2, b_tile_offsets)
+            tlx.async_load_commit_group()
+
+        tlx.async_load_wait_group(5)
+        with tlx.warp_pipeline_stage("mfma", priority=0):
+            acc_bl = tl.dot_scaled(a_bot, a_sc_bot, "e2m1", b_left, b_sc_left, "e2m1", acc_bl)
+        with tlx.warp_pipeline_stage("mem", priority=1):
+            b_right = tlx.local_load(tlx.local_trans(smem_b_right[1]), relaxed=True)
+            tlx.amd_sched_barrier(0)  # keep ds_read(local_load) ahead of the global loads
+            tlx.buffer_load_to_local(smem_a_top[1], a_base + a_k2, a_tile_offsets)
+            tlx.async_load_commit_group()
+
+        tlx.async_load_wait_group(5)
+        with tlx.warp_pipeline_stage("mfma", priority=0):
+            acc_tr = tl.dot_scaled(a_top, a_sc_top, "e2m1", b_right, b_sc_right, "e2m1", acc_tr)
+        with tlx.warp_pipeline_stage("mem", priority=1):
+            b_left = tlx.local_load(tlx.local_trans(smem_b_left[0]), relaxed=True)
+            tlx.amd_sched_barrier(0)  # keep ds_read(local_load) ahead of the global loads
+            tlx.buffer_load_to_local(smem_a_bot[1], a_base + a_half_m + a_k2, a_tile_offsets)
+            tlx.async_load_commit_group()
+
+        tlx.async_load_wait_group(5)
+        with tlx.warp_pipeline_stage("mfma", priority=0):
+            acc_br = tl.dot_scaled(a_bot, a_sc_bot, "e2m1", b_right, b_sc_right, "e2m1", acc_br)
+        with tlx.warp_pipeline_stage("mem", priority=1):
+            a_top = tlx.local_load(smem_a_top[0], relaxed=True)
+            a_sc_view_0 = tlx.local_slice(
+                smem_sc_a_view, [0, 0, 0], [1, BLOCK_M, NG])
+            b_sc_view_0 = tlx.local_slice(
+                smem_sc_b_view, [1, 0, 0], [1, BLOCK_N, NG])
+            a_sc_comb = tlx.local_load(a_sc_view_0, layout=scale_a_comb_layout, relaxed=True)
+            a_sc_t, a_sc_b = tl.split(tl.trans(tl.reshape(a_sc_comb, 2, HALF_M, NG), 1, 2, 0))
+            a_sc_top = tlx.require_layout(a_sc_t, scale_a_layout)
+            a_sc_bot0 = tlx.require_layout(a_sc_b, scale_a_layout)
+            b_sc_comb = tlx.local_load(b_sc_view_0, layout=scale_b_comb_layout, relaxed=True)
+            b_sc_l, b_sc_r = tl.split(tl.trans(tl.reshape(b_sc_comb, 2, HALF_N, NG), 1, 2, 0))
+            b_sc_left = tlx.require_layout(b_sc_l, scale_b_layout)
+            b_sc_right = tlx.require_layout(b_sc_r, scale_b_layout)
+            tlx.amd_sched_barrier(0)  # keep ds_read(local_load) ahead of the global loads
+            tlx.buffer_load_to_local(smem_b_right[1], b_base + b_half_n + b_k2, b_tile_offsets)
+            tlx.async_load_commit_group()
+            a_base += a_k2 * 2
+            b_base += b_k2 * 2
+            scale_iter_offset += a_sc_k * 2
+    acc_tl = tl.dot_scaled(a_top, a_sc_top, "e2m1", b_left, b_sc_left, "e2m1", acc_tl)
+    tlx.async_load_wait_group(5)
+    l_idx: tl.constexpr = 0  # (iter_max - 2) % 2, always 0 (iter_max even)
+    a_bot = tlx.local_load(tlx.local_view(smem_a_bot, l_idx), relaxed=True)
+    a_sc_bot = a_sc_bot0
+    acc_bl = tl.dot_scaled(a_bot, a_sc_bot, "e2m1", b_left, b_sc_left, "e2m1", acc_bl)
+    tlx.async_load_wait_group(4)
+    b_right = tlx.local_load(tlx.local_trans(tlx.local_view(smem_b_right, l_idx)), relaxed=True)
+
+    acc_tr = tl.dot_scaled(a_top, a_sc_top, "e2m1", b_right, b_sc_right, "e2m1", acc_tr)
+    tlx.async_load_wait_group(3)
+    g_idx: tl.constexpr = 1  # 1 - l_idx
+    b_left = tlx.local_load(tlx.local_trans(tlx.local_view(smem_b_left, g_idx)), relaxed=True)
+
+    acc_br = tl.dot_scaled(a_bot, a_sc_bot, "e2m1", b_right, b_sc_right, "e2m1", acc_br)
+    tlx.async_load_wait_group(2)
+    a_top = tlx.local_load(tlx.local_view(smem_a_top, g_idx), relaxed=True)
+    a_sc_view_epilogue = tlx.local_slice(
+        smem_sc_a_view, [1, 0, 0], [1, BLOCK_M, NG])
+    b_sc_view_epilogue = tlx.local_slice(
+        smem_sc_b_view, [3, 0, 0], [1, BLOCK_N, NG])
+    a_sc_comb = tlx.local_load(a_sc_view_epilogue, layout=scale_a_comb_layout, relaxed=True)
+    a_sc_t, a_sc_b = tl.split(tl.trans(tl.reshape(a_sc_comb, 2, HALF_M, NG), 1, 2, 0))
+    a_sc_top = tlx.require_layout(a_sc_t, scale_a_layout)
+    a_sc_bot1 = tlx.require_layout(a_sc_b, scale_a_layout)
+    b_sc_comb = tlx.local_load(b_sc_view_epilogue, layout=scale_b_comb_layout, relaxed=True)
+    b_sc_l, b_sc_r = tl.split(tl.trans(tl.reshape(b_sc_comb, 2, HALF_N, NG), 1, 2, 0))
+    b_sc_left = tlx.require_layout(b_sc_l, scale_b_layout)
+    b_sc_right = tlx.require_layout(b_sc_r, scale_b_layout)
+
+    # iter iter_max-1: finish ALL four accumulators, then convert + store.
+    acc_tl = tl.dot_scaled(a_top, a_sc_top, "e2m1", b_left, b_sc_left, "e2m1", acc_tl)
+    tlx.async_load_wait_group(1)
+    a_bot = tlx.local_load(tlx.local_view(smem_a_bot, g_idx), relaxed=True)
+    a_sc_bot = a_sc_bot1
+    acc_bl = tl.dot_scaled(a_bot, a_sc_bot, "e2m1", b_left, b_sc_left, "e2m1", acc_bl)
+    tlx.async_load_wait_group(0)
+    b_right = tlx.local_load(tlx.local_trans(tlx.local_view(smem_b_right, g_idx)), relaxed=True)
+
+    acc_tr = tl.dot_scaled(a_top, a_sc_top, "e2m1", b_right, b_sc_right, "e2m1", acc_tr)
+    acc_br = tl.dot_scaled(a_bot, a_sc_bot, "e2m1", b_right, b_sc_right, "e2m1", acc_br)
+
+    # ---- 4-quadrant store ----
+    if SPLIT_K == 1:
+        # Direct coalesced store to C (bf16). c_quad_offsets is shared by all four
+        # quadrants (same relative layout, different base).
+        offs_cm = tl.arange(0, HALF_M)
+        offs_cn = tl.arange(0, HALF_N)
+        c_quad_offsets = tl.mul(stride_cm, offs_cm[:, None], sanitize_overflow=False) + tl.mul(
+            stride_cn, offs_cn[None, :], sanitize_overflow=False)
+        c_quad_offsets = tlx.require_layout(c_quad_offsets, store_layout_c)
+        c_tl_base = c_ptr + pid_m * BLOCK_M * stride_cm + pid_n * BLOCK_N * stride_cn
+        c_bl_base = c_tl_base + HALF_M * stride_cm
+        c_tr_base = c_tl_base + HALF_N * stride_cn
+        c_br_base = c_bl_base + HALF_N * stride_cn
+
+        # require(accumulator) -> cast -> require(store): freeze the MFMA register
+        # distribution, cast bf16 register-local in it, then require the coalesced
+        # store layout. The compiler narrows before redistributing (no explicit
+        # release_layout needed).
+        et = c_ptr.dtype.element_ty
+        acc_tl = tlx.require_layout(acc_tl, accumulator_layout)
+        c_tl = tlx.require_layout(acc_tl.to(et), store_layout_c)
+        tlx.buffer_store(c_tl, c_tl_base, c_quad_offsets)
+
+        acc_bl = tlx.require_layout(acc_bl, accumulator_layout)
+        c_bl = tlx.require_layout(acc_bl.to(et), store_layout_c)
+        tlx.buffer_store(c_bl, c_bl_base, c_quad_offsets)
+
+        acc_tr = tlx.require_layout(acc_tr, accumulator_layout)
+        c_tr = tlx.require_layout(acc_tr.to(et), store_layout_c)
+        tlx.buffer_store(c_tr, c_tr_base, c_quad_offsets)
+
+        acc_br = tlx.require_layout(acc_br, accumulator_layout)
+        c_br = tlx.require_layout(acc_br.to(et), store_layout_c)
+        tlx.buffer_store(c_br, c_br_base, c_quad_offsets)
+    else:
+        # Split-K: write this split's fp32 partials into its workspace slice
+        # (rows [split_id*M, split_id*M+M)); a separate fp32 reduce kernel sums
+        # the SPLIT_K slabs into C, keeping the result bit-identical to a single
+        # fp32-accumulated GEMM. Plain tl.store (fp32, no narrowing).
+        rb = split_id * M
+        offs_cm_t = rb + pid_m * BLOCK_M + tl.arange(0, HALF_M)
+        offs_cm_b = offs_cm_t + HALF_M
+        offs_cn_l = pid_n * BLOCK_N + tl.arange(0, HALF_N)
+        offs_cn_r = offs_cn_l + HALF_N
+        tl.store(workspace_ptr + offs_cm_t[:, None] * stride_cm + offs_cn_l[None, :] * stride_cn, acc_tl)
+        tl.store(workspace_ptr + offs_cm_b[:, None] * stride_cm + offs_cn_l[None, :] * stride_cn, acc_bl)
+        tl.store(workspace_ptr + offs_cm_t[:, None] * stride_cm + offs_cn_r[None, :] * stride_cn, acc_tr)
+        tl.store(workspace_ptr + offs_cm_b[:, None] * stride_cm + offs_cn_r[None, :] * stride_cn, acc_br)
 
 
 @triton.jit
@@ -1071,8 +1625,6 @@ def _matmul_256tile(a, b, a_scales, b_scales, SPLIT_K=None):
         NUM_XCDS=NUM_XCDS,
         GRID_MN=grid_mn,
         SPLIT_K=SPLIT_K,
-        PRESHUFFLED_SCALES=False,
-        MERGED_SCALE_DMA=False,
         num_warps=NUM_WARPS,
         num_stages=1,
         matrix_instr_nonkdim=16,
@@ -1136,7 +1688,7 @@ def matmul_preshuffled(a, b, a_scales, b_scales, SPLIT_K=None):
     c = torch.empty((M, N), device=a.device, dtype=torch.bfloat16)
     grid_mn = triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N)
     workspace = torch.empty((SPLIT_K * M, N), device=a.device, dtype=torch.float32) if SPLIT_K > 1 else c
-    _a4w4_8wave_kernel[(grid_mn * SPLIT_K, )](
+    _a4w4_8wave_preshuffled_scales_kernel[(grid_mn * SPLIT_K, )](
         a,
         b,
         c,
@@ -1153,10 +1705,6 @@ def matmul_preshuffled(a, b, a_scales, b_scales, SPLIT_K=None):
         b.stride(1),
         c.stride(0),
         c.stride(1),
-        0,
-        0,
-        0,
-        0,
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         BLOCK_K=BLOCK_K,
@@ -1164,8 +1712,6 @@ def matmul_preshuffled(a, b, a_scales, b_scales, SPLIT_K=None):
         NUM_XCDS=NUM_XCDS,
         GRID_MN=grid_mn,
         SPLIT_K=SPLIT_K,
-        PRESHUFFLED_SCALES=True,
-        MERGED_SCALE_DMA=False,
         num_warps=NUM_WARPS,
         num_stages=1,
         matrix_instr_nonkdim=16,

@@ -43,6 +43,7 @@ from triton.language.extra.tlx.tutorials.gfx9_gemm.inter_wave.a4w4.matmul_kernel
     MIN_K as _A4W4_INTER_WAVE_MIN_K,
     _a4w4_8wave_kernel as _a4w4_inter_wave_256tile_kernel,
     _a4w4_8wave_merged_scales_kernel as _a4w4_inter_wave_merged_scales_kernel,
+    _a4w4_8wave_preshuffled_scales_kernel as _a4w4_inter_wave_preshuffled_scales_kernel,
     _A4W4_8WAVE_LLVM_FN_ATTRS,
     matmul as _a4w4_inter_wave_matmul,
     matmul_merged_scales as _a4w4_inter_wave_matmul_merged_scales,
@@ -3060,10 +3061,16 @@ def _compile_a4w4_inter_wave_256tile(m, n, k, preshuffled_scales=False):
     c = MockTensor(torch.bfloat16, (m, n))
     a_scales = MockTensor(torch.uint8, (m * k // 32, ) if preshuffled_scales else (m, k // 32))
     b_scales = MockTensor(torch.uint8, (n * k // 32, ) if preshuffled_scales else (n, k // 32))
+    kernel = (
+        _a4w4_inter_wave_preshuffled_scales_kernel
+        if preshuffled_scales
+        else _a4w4_inter_wave_256tile_kernel
+    )
+    scale_strides = () if preshuffled_scales else (1, m, 1, n)
 
     with knobs.runtime.scope():
         knobs.runtime.override_arch = "gfx950"
-        return _a4w4_inter_wave_256tile_kernel.warmup(
+        return kernel.warmup(
             a,
             b,
             c,
@@ -3080,10 +3087,7 @@ def _compile_a4w4_inter_wave_256tile(m, n, k, preshuffled_scales=False):
             1,
             n,
             1,
-            1,
-            m,
-            1,
-            n,
+            *scale_strides,
             BLOCK_M=_A4W4_INTER_WAVE_BLOCK_M,
             BLOCK_N=_A4W4_INTER_WAVE_BLOCK_N,
             BLOCK_K=_A4W4_INTER_WAVE_BLOCK_K,
@@ -3091,7 +3095,6 @@ def _compile_a4w4_inter_wave_256tile(m, n, k, preshuffled_scales=False):
             NUM_XCDS=8,
             GRID_MN=grid_mn,
             SPLIT_K=1,
-            PRESHUFFLED_SCALES=preshuffled_scales,
             grid=(grid_mn, ),
             num_warps=8,
             num_stages=1,
