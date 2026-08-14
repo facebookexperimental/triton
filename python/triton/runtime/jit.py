@@ -928,6 +928,9 @@ class JITFunction(JITCallable, KernelInterface[T]):
         from ..compiler import CompiledKernel, compile, ASTSource, make_backend
         target = driver.active.get_current_target()
         backend = make_backend(target)
+        if self.c_cache:
+            get_threshold = getattr(backend, "get_tensor_size_specialization_threshold", None)
+            self._fc_tensor_size_threshold = (get_threshold() if get_threshold else None) or 0
         self.CompiledKernel = CompiledKernel
         self.compile = compile
         self.ASTSource = ASTSource

@@ -12,6 +12,8 @@ import functools
 import warnings
 from pathlib import Path
 
+MAX_INT_32 = 2**31 - 1
+
 
 def get_min_dot_size(target: GPUTarget):
     # We fallback to use FMA and cast arguments if certain configurations is
@@ -259,12 +261,14 @@ class HIPBackend(BaseBackend):
         elif HIPBackend._torch_available:
             import torch
 
-        MAX_INT_32 = 2**31 - 1
         if hasattr(arg, "ptr_range"):
             return arg.ptr_range() <= MAX_INT_32
         if (HIPBackend._torch_available and isinstance(arg, torch.Tensor) and hasattr(arg, "untyped_storage")):
             return arg.untyped_storage().size() <= MAX_INT_32
         return False
+
+    def get_tensor_size_specialization_threshold(self):
+        return MAX_INT_32 if knobs.amd.use_buffer_ops else None
 
     @staticmethod
     def parse_attr(desc):

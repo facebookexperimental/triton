@@ -33,6 +33,8 @@ struct TritonTensorAccessAPI {
   // device, 0 if it is a torch tensor NOT on CUDA (e.g. a cpu tensor), and -1
   // if obj is not a torch tensor at all (device unknown — caller decides).
   int8_t (*is_cuda_tensor)(PyObject *obj);
+  int (*extract_tensor_metadata)(PyObject *obj, uint64_t *out_data_ptr,
+                                 uint64_t *out_storage_size);
 };
 
 // ============================================================================
@@ -63,6 +65,20 @@ static int8_t fast_is_cuda_tensor(PyObject *obj) {
     return -1; // not a torch tensor — device unknown to the bridge
   const auto &tensor = THPVariable_Unpack(obj);
   return tensor.is_cuda() ? 1 : 0;
+}
+
+static int fast_extract_tensor_metadata(PyObject *obj, uint64_t *out_data_ptr,
+                                        uint64_t *out_storage_size) {
+  if (!THPVariable_Check(obj))
+    return -1;
+  try {
+    const auto &tensor = THPVariable_Unpack(obj);
+    *out_data_ptr = reinterpret_cast<uint64_t>(tensor.data_ptr());
+    *out_storage_size = tensor.storage().nbytes();
+    return 0;
+  } catch (...) {
+    return -1;
+  }
 }
 
 // Interned attribute name strings for fast dict lookup
@@ -126,10 +142,9 @@ static int fast_extract_tensordesc(PyObject *td_obj, uint64_t *out_data_ptr,
 
 // Singleton API instance
 static TritonTensorAccessAPI g_api = {
-    fast_get_scalar_type,
-    fast_get_data_ptr,
-    fast_extract_tensordesc,
-    fast_is_cuda_tensor,
+    fast_get_scalar_type,         fast_get_data_ptr,
+    fast_extract_tensordesc,      fast_is_cuda_tensor,
+    fast_extract_tensor_metadata,
 };
 
 // ============================================================================

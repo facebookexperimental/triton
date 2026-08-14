@@ -851,6 +851,25 @@ def test_within_2gb(device, fresh_triton_cache) -> None:
             kernel_add[(1, 0)](torch.empty(2**31 - 1, dtype=torch.int8, device=device))
             assert pointer_range_32 == pointer_range
 
+        with triton.knobs.runtime.scope():
+            # The C cache must distinguish HIP's storage-size specializations.
+            triton.knobs.runtime.jit_cache_hook = None
+            triton.knobs.amd.use_buffer_ops = True
+
+            @triton.jit(c_cache=True)
+            def kernel_add_with_c_cache(a):
+                tl.load(a)
+
+            launch = kernel_add_with_c_cache[(1, 0)]
+            launch(torch.empty(2**31 - 1, dtype=torch.int8, device=device))
+            assert kernel_add_with_c_cache.c_cache is True
+            device_id = getattr(torch, device).current_device()
+            kernel_cache = kernel_add_with_c_cache.device_caches[device_id][0]
+            assert len(kernel_cache) == 1
+
+            launch(torch.empty(2**31, dtype=torch.int8, device=device))
+            assert len(kernel_cache) == 2
+
 
 def test_function_arguments(device):
 
