@@ -74,7 +74,9 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
 // CHECK: ttg.partition = array<i32: [[COMP0]]>
 // CHECK: "tt.reduce"
 // CHECK: ttg.partition = array<i32: [[COMP1]]>
-// --- In-loop: scalar rescale votes follow the correction stores ---
+// --- In-loop: rescale comparisons and scalar votes follow correction stores ---
+// CHECK: arith.cmpf {{.*}}ttg.partition = array<i32: [[CORR]]>
+// CHECK: arith.cmpf {{.*}}ttg.partition = array<i32: [[CORR]]>
 // CHECK: "tt.reduce"
 // CHECK: ttg.partition = array<i32: [[CORR]]>
 // CHECK: "tt.reduce"
@@ -266,8 +268,9 @@ tt.func public @fa_forward_data_partition_split(
     }) {loop.cluster = 1 : i32, loop.stage = 2 : i32} : (tensor<128x128xf32, #blocked>) -> tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked}>>
 
     // Partition-local, warp-uniform votes guard the expensive accumulator
-    // correction. Their tensor masks stay in the computation partitions, but
-    // the scalar reductions must be co-located with the predicated stores.
+    // correction. The single-use comparisons and scalar reductions are
+    // co-located with the predicated stores, while alpha remains a normal
+    // computation-to-correction channel used by both the comparison and mul.
     %rescale_mask_0 = arith.cmpf olt, %alpha_0, %alpha_exp_0 {loop.cluster = 3 : i32, loop.stage = 1 : i32} : tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked}>>
     %rescale_mask_1 = arith.cmpf olt, %alpha_1, %alpha_exp_1 {loop.cluster = 1 : i32, loop.stage = 2 : i32} : tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked}>>
     %rescale_vote_0 = "tt.reduce"(%rescale_mask_0) <{axis = 0 : i32}> ({

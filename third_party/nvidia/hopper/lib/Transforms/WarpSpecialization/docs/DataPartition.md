@@ -148,9 +148,15 @@ that are no longer referenced after partitioning.
 FA forward represents its optional accumulator rescale as an eager SSA select
 before tensor-memory allocation is hoisted. `HoistTMEMAlloc` first folds that
 select into a predicated accumulator `TMEMStoreOp`. M partitioning creates one
-scalar predicate and one accumulator view per partition. After warp
-specialization and software pipelining have materialized each task, the
-post-pipeline `HoistTMEMAlloc` pass rewrites each such update as:
+scalar predicate and one accumulator view per partition. Partition scheduling
+then co-locates the scalar predicate chain with the correction store. It also
+pulls the single-consumer tensor elementwise predicate operation directly
+feeding that chain, such as `alpha < 1`, into the correction partition while
+leaving its tensor operands as channel boundaries. This makes the
+already-required alpha value the channel boundary and avoids materializing a
+redundant tensor predicate channel. After warp specialization and software
+pipelining have materialized each task, the post-pipeline `HoistTMEMAlloc` pass
+rewrites each such update as:
 
 ```mlir
 scf.if %should_rescale {

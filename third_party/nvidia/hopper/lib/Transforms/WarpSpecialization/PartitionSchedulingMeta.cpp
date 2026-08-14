@@ -3036,11 +3036,13 @@ void PartitionSchedulingMeta::runOnOperation() {
       fixupScalarPartitions();
 
       // A predicated TMEM read-modify-write becomes an scf.if only after code
-      // specialization. Until then, keep its scalar predicate chain in the
-      // same partition as the store: code partitioning does not materialize
-      // scalar channels. Stop at the first tensor value, which can use the
-      // ordinary cross-partition channel machinery. FA forward uses this to
-      // move each partition-local reduce-or vote into the correction task.
+      // specialization. Until then, keep its predicate chain in the same
+      // partition as the store: code partitioning does not materialize scalar
+      // channels. Also pull the single-consumer tensor elementwise op directly
+      // feeding the scalar chain into the store partition. FA forward uses
+      // this to compute `alpha < 1` beside the alpha channel load instead of
+      // creating a second tensor channel for the predicate. Its tensor operands
+      // remain ordinary channel boundaries.
       getLoopBodyRegion(loop).walk([&](ttng::TMEMStoreOp store) {
         if (!store.getPred().getType().isInteger(1))
           return;
@@ -3058,13 +3060,20 @@ void PartitionSchedulingMeta::runOnOperation() {
           if (!seen.insert(op).second ||
               op->getParentRegion() != store->getParentRegion())
             continue;
-          if (llvm::any_of(op->getResults(), [](Value result) {
+          bool hasTensorResult =
+              llvm::any_of(op->getResults(), [](Value result) {
                 return isa<RankedTensorType>(result.getType());
-              }))
-            continue;
+              });
+          if (hasTensorResult) {
+            if (!op->hasTrait<OpTrait::Elementwise>() ||
+                llvm::any_of(op->getUsers(), [&](Operation *user) {
+                  return safeGetPartitionIds(user) != storeIds;
+                }))
+              continue;
+          }
           op->walk([&](Operation *nested) { setPartition(nested, storeIds); });
           for (Value operand : op->getOperands()) {
-            if (isa<RankedTensorType>(operand.getType()))
+            if (hasTensorResult && isa<RankedTensorType>(operand.getType()))
               continue;
             if (Operation *def = operand.getDefiningOp())
               worklist.push_back(def);
