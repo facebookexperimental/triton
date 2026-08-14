@@ -114,6 +114,91 @@ def _fa_v_layout():
     )
 
 
+def _f16_v11_a_layout():
+    # Exact #linear layout of the full A async-copy packet in f16 v11.
+    return _distributed_layout(
+        (
+            (0, 0, 0, 0, 0, 1),
+            (0, 0, 0, 0, 0, 2),
+            (0, 0, 0, 0, 0, 4),
+            (0, 0, 0, 0, 4, 0),
+            (0, 0, 0, 0, 8, 0),
+            (0, 0, 0, 0, 0, 0),
+            (0, 0, 0, 0, 0, 0),
+        ),
+        (
+            (0, 0, 0, 0, 0, 8),
+            (0, 0, 0, 0, 0, 16),
+            (0, 1, 0, 0, 0, 0),
+            (0, 0, 0, 1, 0, 0),
+            (0, 0, 0, 2, 0, 0),
+            (0, 0, 0, 4, 0, 0),
+        ),
+        (
+            (0, 0, 0, 0, 1, 0),
+            (0, 0, 0, 0, 2, 0),
+        ),
+        (1, 2, 1, 8, 16, 32),
+    )
+
+
+def _f16_v11_a_tail_layout():
+    return _distributed_layout(
+        (
+            (0, 0, 0, 0, 0, 1),
+            (0, 0, 0, 0, 0, 2),
+            (0, 0, 0, 0, 0, 4),
+            (0, 0, 0, 0, 0, 0),
+            (0, 0, 0, 0, 0, 0),
+            (0, 0, 0, 0, 0, 0),
+            (0, 0, 0, 0, 0, 0),
+        ),
+        (
+            (0, 0, 0, 0, 0, 8),
+            (0, 0, 0, 0, 0, 16),
+            (0, 1, 0, 0, 0, 0),
+            (0, 0, 0, 1, 0, 0),
+            (0, 0, 0, 2, 0, 0),
+            (0, 0, 0, 4, 0, 0),
+        ),
+        (
+            (0, 0, 0, 0, 1, 0),
+            (0, 0, 0, 0, 2, 0),
+        ),
+        (1, 2, 1, 8, 4, 32),
+    )
+
+
+def _f16_v11_a_shared_layout():
+    shape = (2, 2, 2, 8, 16, 32)
+    order = (5, 1, 3, 4, 2, 0)
+    strides = {}
+    stride = 1
+    for dim in order:
+        strides[dim] = stride
+        stride *= shape[dim]
+    inverse = LinearLayout.from_bases(
+        tuple((
+            f"dim{dim}",
+            tuple(
+                tuple((strides[dim] * (1 << bit) if output == 0 else 0)
+                      for output in range(2))
+                for bit in range(shape[dim].bit_length() - 1)),
+        )
+              for dim in range(len(shape))),
+        ("offset", "block"),
+        (stride, 1),
+        False,
+    )
+    return _shared_layout(
+        "padded_shared",
+        inverse,
+        intervals=(512, ),
+        paddings=(8, ),
+        order=order,
+    )
+
+
 def _fa_v_shared_layout():
     inverse = LinearLayout.from_bases(
         (
@@ -762,7 +847,7 @@ def test_fa_v_layout_to_symbolic_formula_proves_b16_contiguity():
                 64 * dsl.mod(dsl.floor(slot / 2), 2) + 256 * dsl.mod(dsl.floor(slot / 4), 2) +
                 1024 * dsl.mod(dsl.floor(slot / 8), 2) + 2048 * dsl.mod(dsl.floor(slot / 16), 2) +
                 4096 * dsl.mod(dsl.floor(slot / 32), 2) + 32 * dsl.mod(dsl.floor(slot / 64), 2))
-    unpadded_formula = dsl.xor(
+    unpadded_formula = sum((
         dsl.mod(item, 2),
         2 * dsl.mod(dsl.floor(item / 2), 2),
         4 * dsl.mod(dsl.floor(item / 4), 2),
@@ -776,13 +861,13 @@ def test_fa_v_layout_to_symbolic_formula_proves_b16_contiguity():
         1024 * dsl.mod(dsl.floor(slot / 8), 2),
         2048 * dsl.mod(dsl.floor(slot / 16), 2),
         4096 * dsl.mod(dsl.floor(slot / 32), 2),
-    )
-    padding_formula = 32 * dsl.xor(
+    ), dsl.ixs_int(0))
+    padding_formula = 32 * sum((
         dsl.mod(slot, 2),
         2 * dsl.mod(dsl.floor(slot / 8), 2),
         4 * dsl.mod(dsl.floor(slot / 16), 2),
         8 * dsl.mod(dsl.floor(slot / 32), 2),
-    )
+    ), dsl.ixs_int(0))
     assert relation == 16 * (unpadded_formula + padding_formula)
     for physical_item in range(256):
         for physical_slot in range(128):
@@ -806,3 +891,105 @@ def test_padded_b_symbolic_relation_proves_b16_contiguity():
         allocation_bytes=(64 * 128 + (64 * 128 // 4) * 16) * 2,
     )
     _prove_b16_transactions(dsl, relation, 512)
+
+
+def test_f16_v11_padded_subview_proves_direct_to_lds_contiguity():
+    distributed = _f16_v11_a_layout()
+    shared = _f16_v11_a_shared_layout()
+    logical_shape = (1, 2, 1, 8, 16, 32)
+    physical_shape = (2, 2, 2, 8, 16, 32)
+    dsl = layouts.load_wave_dsl()
+    relation = dsl.ixs_deserialize(
+        layouts.local_memory_bit_offset_relation(
+            distributed,
+            shared,
+            logical_shape,
+            physical_shape,
+            (0, ) * len(physical_shape),
+            lane_width=_LANE_WIDTH,
+            warp_count=4,
+            element_byte_width=2,
+            allocation_bytes=(2 * 2 * 2 * 8 * 16 * 32 + 128) * 2,
+            stage="test",
+            diagnostic="TLXW_TEST",
+        ))
+
+    # The canonical relation must be the exact composed LinearLayout followed
+    # by the padded allocation encoding, including for this strict subview.
+    for physical_item in range(256):
+        for physical_slot in range(128):
+            logical = distributed.linear_layout.apply({
+                "register": physical_slot,
+                "lane": physical_item % 64,
+                "warp": physical_item // 64,
+                "block": 0,
+            })
+            coords = tuple(int(logical[f"dim{dim}"]) for dim in range(6))
+            order = shared.properties["order"]
+            offset = 0
+            stride = 1
+            for dim in order:
+                offset += coords[dim] * stride
+                stride *= physical_shape[dim]
+            expected = 16 * (offset + 8 * (offset // 512))
+            assert int(relation.eval({
+                "item": physical_item,
+                "slot": physical_slot,
+            })) == expected
+
+    item = dsl.sym("item")
+    slot = dsl.sym("slot")
+    group = dsl.sym("group")
+    within = dsl.sym("within")
+    point = relation.subs({slot: 8 * group + within})
+    origin = relation.subs({slot: 8 * group})
+    facts = (
+        *layouts._symbolic_range_predicates(dsl, item, 0, 255),
+        *layouts._symbolic_range_predicates(dsl, group, 0, 15),
+        *layouts._symbolic_range_predicates(dsl, within, 0, 7),
+    )
+    checked, _normalized = dsl.ixs_check(
+        (dsl.ixs_eq(point, origin + 16 * within), ),
+        facts,
+    )
+    assert checked == (True, )
+
+
+def test_f16_v11_aligned_padded_tile_proves_direct_to_lds_contiguity():
+    distributed = _f16_v11_a_tail_layout()
+    shared = _f16_v11_a_shared_layout()
+    logical_shape = (1, 2, 1, 8, 4, 32)
+    physical_shape = (2, 2, 2, 8, 16, 32)
+    logical_origin = (0, 0, 1, 0, 4, 0)
+    dsl = layouts.load_wave_dsl()
+    relation = dsl.ixs_deserialize(
+        layouts.local_memory_bit_offset_relation(
+            distributed,
+            shared,
+            logical_shape,
+            physical_shape,
+            logical_origin,
+            lane_width=_LANE_WIDTH,
+            warp_count=4,
+            element_byte_width=2,
+            allocation_bytes=(2 * 2 * 2 * 8 * 16 * 32 + 128) * 2,
+            stage="test",
+            diagnostic="TLXW_TEST",
+        ))
+
+    item = dsl.sym("item")
+    slot = dsl.sym("slot")
+    group = dsl.sym("group")
+    within = dsl.sym("within")
+    point = relation.subs({slot: 8 * group + within})
+    origin = relation.subs({slot: 8 * group})
+    facts = (
+        *layouts._symbolic_range_predicates(dsl, item, 0, 255),
+        *layouts._symbolic_range_predicates(dsl, group, 0, 15),
+        *layouts._symbolic_range_predicates(dsl, within, 0, 7),
+    )
+    checked, _normalized = dsl.ixs_check(
+        (dsl.ixs_eq(point, origin + 16 * within), ),
+        facts,
+    )
+    assert checked == (True, )
