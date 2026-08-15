@@ -511,8 +511,8 @@ class SoftmaxState:
                 # from the row maximum continues to propagate through state.
                 row_is_within_headroom = advance <= SOFTMAX_REFERENCE_HEADROOM_LOG2
 
-                # Why the following layout, ballot, and ``-1`` comparison are
-                # an all-row test rather than ad-hoc bit manipulation:
+                # Why the following ballot and ``-1`` comparison are an
+                # all-row test rather than ad-hoc bit manipulation:
                 #
                 # A physical wave owns 32 output rows, while a gfx950 wave has
                 # 64 lanes.  The reductions above first combine each lane's 32
@@ -525,12 +525,11 @@ class SoftmaxState:
                 #
                 #                         64*w + 32*h + j.
                 #
-                # The required layout expresses exactly that mapping.  Its
-                # lane bases are the six binary place values
-                # ``1, 2, 4, 8, 16, 32`` and its warp bases are
-                # ``64, 128, 256``.  Thus physical lanes ``j`` and ``j + 32``
-                # both receive ``b[w,j]``.  No float bits are inspected and no
-                # data-dependent shuffle is hidden in this operation.
+                # The reduction's row-slice layout already expresses exactly
+                # that physical ownership, so warp_ballot consumes it directly:
+                # physical lanes ``j`` and ``j + 32`` both receive ``b[w,j]``.
+                # No float bits are inspected and no data-dependent shuffle is
+                # hidden in this operation.
                 #
                 # ``warp_ballot`` places lane ``l``'s boolean in bit ``l`` of
                 # an i64.  For one wave its unsigned mask is consequently
@@ -552,28 +551,6 @@ class SoftmaxState:
                 # softmax state update for every row (up to normal floating-
                 # point rounding), while avoiding divergent per-row state and
                 # control flow.
-                ballot_layout: tl.constexpr = (tlx.distributed_linear_layout_encoding.make(
-                    reg_bases=[],
-                    lane_bases=[
-                        [1],
-                        [2],
-                        [4],
-                        [8],
-                        [16],
-                        [32],
-                    ],
-                    warp_bases=[
-                        [64],
-                        [128],
-                        [256],
-                    ],
-                    block_bases=[],
-                    shape=[8 * 64],
-                ))
-                row_is_within_headroom = tlx.require_layout(
-                    row_is_within_headroom,
-                    ballot_layout,
-                )
                 needs_rebase = tlx.warp_ballot(row_is_within_headroom) != -1
                 if needs_rebase:
                     reference = candidate
@@ -614,14 +591,7 @@ class SoftmaxState:
             registers1 = _score_packet_to_registers(score1)
 
         registers0 = tl.math.exp2(registers0)
-        lower8, tail8 = _split_last_2(registers1)
-        head4, upper4 = _split_last_2(lower8)
-        lower2, tail2 = _split_last_2(upper4)
-        head1, tail1 = _split_last_2(lower2)
-        middle2 = _join_last_2(tl.math.exp2(head1), tail1)
-        middle4 = _join_last_2(middle2, tail2)
-        lower8 = _join_last_2(tl.math.exp2(head4), middle4)
-        registers1 = _join_last_2(lower8, tail8)
+        registers1 = tl.math.exp2(registers1)
         return (
             state,
             SoftmaxPending(
@@ -659,28 +629,6 @@ class SoftmaxState:
         )
         advance = candidate - self.row_max
         row_is_within_headroom = advance <= SOFTMAX_REFERENCE_HEADROOM_LOG2
-        ballot_layout: tl.constexpr = (tlx.distributed_linear_layout_encoding.make(
-            reg_bases=[],
-            lane_bases=[
-                [1],
-                [2],
-                [4],
-                [8],
-                [16],
-                [32],
-            ],
-            warp_bases=[
-                [64],
-                [128],
-                [256],
-            ],
-            block_bases=[],
-            shape=[8 * 64],
-        ))
-        row_is_within_headroom = tlx.require_layout(
-            row_is_within_headroom,
-            ballot_layout,
-        )
         needs_rebase = tlx.warp_ballot(row_is_within_headroom) != -1
         reference = tl.where(needs_rebase, candidate, self.row_max)
         if qk_scale < 0.0:
@@ -691,14 +639,7 @@ class SoftmaxState:
             registers1 = raw_registers1 * qk_scale - reference[:, None]
 
         registers0 = tl.math.exp2(registers0)
-        lower8, tail8 = _split_last_2(registers1)
-        head4, upper4 = _split_last_2(lower8)
-        lower2, tail2 = _split_last_2(upper4)
-        head1, tail1 = _split_last_2(lower2)
-        middle2 = _join_last_2(tl.math.exp2(head1), tail1)
-        middle4 = _join_last_2(middle2, tail2)
-        lower8 = _join_last_2(tl.math.exp2(head4), middle4)
-        registers1 = _join_last_2(lower8, tail8)
+        registers1 = tl.math.exp2(registers1)
         return (
             SoftmaxPending(
                 registers0,
@@ -735,17 +676,6 @@ class SoftmaxState:
     ):
         registers0 = pending.score0
         registers1 = pending.score1
-        lower8, tail8 = _split_last_2(registers1)
-        head4, upper4 = _split_last_2(lower8)
-        lower2, tail2 = _split_last_2(upper4)
-        head1, tail1 = _split_last_2(lower2)
-        middle2 = _join_last_2(
-            head1,
-            tl.math.exp2(tail1),
-        )
-        middle4 = _join_last_2(middle2, tl.math.exp2(tail2))
-        lower8 = _join_last_2(head4, middle4)
-        registers1 = _join_last_2(lower8, tl.math.exp2(tail8))
         tile_sum = _reduce_score_registers(
             registers0,
             registers1,
