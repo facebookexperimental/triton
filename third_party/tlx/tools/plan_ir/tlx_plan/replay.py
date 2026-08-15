@@ -30,9 +30,18 @@ def compare_plans(expected: PlanBundle, actual: PlanBundle) -> dict[str, Any]:
     }
 
 
-def verify_replay(text: str, expected: PlanBundle) -> dict[str, Any]:
+def verify_replay(
+    text: str,
+    expected: PlanBundle,
+    *,
+    native_value_graph: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Re-extract final TTGIR and verify an exact baseline PlanBundle replay."""
-    actual = extract_plan(text, source_name=expected.provenance.get("source_name", ""))
+    actual = extract_plan(
+        text,
+        source_name=expected.provenance.get("source_name", ""),
+        native_value_graph=native_value_graph,
+    )
     # Provenance and case are external contracts, not properties recoverable
     # from TTGIR. Preserve them before comparing the executable plan layers.
     actual.provenance = expected.provenance
@@ -40,11 +49,18 @@ def verify_replay(text: str, expected: PlanBundle) -> dict[str, Any]:
     return compare_plans(expected, actual)
 
 
-def replay_normalized(text: str, expected: PlanBundle) -> tuple[str, dict[str, Any]]:
+def replay_normalized(
+    text: str,
+    expected: PlanBundle,
+    *,
+    native_value_graph: dict[str, Any] | None = None,
+) -> tuple[str, dict[str, Any]]:
     """Return deterministic IR plus proof that it represents ``expected``.
 
     M1.3 deliberately supports exact replay only. Applying mutated schedules or
     storage placements is a later lowering milestone and must not be confused
     with verification of a captured baseline.
     """
-    return normalize_ttgir(text), verify_replay(text, expected)
+    return normalize_ttgir(text), verify_replay(
+        text, expected, native_value_graph=native_value_graph
+    )

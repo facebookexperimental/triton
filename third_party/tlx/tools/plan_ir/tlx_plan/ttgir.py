@@ -12,7 +12,7 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
-from .model import BaselineManifest, PlanBundle
+from .model import BaselineManifest, PlanBundle, PlanError
 
 
 _SSA = re.compile(r"%[A-Za-z0-9_.$-]+(?:#\d+)?")
@@ -231,12 +231,34 @@ def extract_plan(
     *,
     manifest: BaselineManifest | None = None,
     source_name: str = "",
+    native_value_graph: dict[str, Any] | None = None,
 ) -> PlanBundle:
     ops, definitions = _parse_ops(text)
     layouts = _layout_aliases(text)
     normalized = normalize_ttgir(text)
     function_match = _FUNC.search(text)
     kernel = function_match.group(1) if function_match else "unknown"
+
+    native_function: dict[str, Any] | None = None
+    native_operations: dict[int, dict[str, Any]] = {}
+    if native_value_graph is not None:
+        if native_value_graph.get("schema_version") != "plan-value-graph/0.1":
+            raise PlanError("unsupported native plan-value-graph schema")
+        native_function = next(
+            (
+                function
+                for function in native_value_graph.get("functions", [])
+                if function.get("function") == kernel
+            ),
+            None,
+        )
+        if native_function is None:
+            raise PlanError(f"native value graph does not contain kernel {kernel!r}")
+        native_operations = {operation["ordinal"]: operation for operation in native_function.get("operations", [])}
+        if len(native_operations) != len(ops):
+            raise PlanError(
+                f"native value graph has {len(native_operations)} operations; textual TTGIR has {len(ops)}"
+            )
 
     operation_entries: list[dict[str, Any]] = []
     schedule: list[str] = []
@@ -246,7 +268,13 @@ def extract_plan(
         signature = _operation_signature(op)
         count = signature_counts.get(signature, 0)
         signature_counts[signature] = count + 1
-        op_id = _stable_id("op", signature, count)
+        native_operation = native_operations.get(op.ordinal)
+        if native_operation is not None and native_operation.get("kind") != op.kind:
+            raise PlanError(
+                f"native/text operation mismatch at ordinal {op.ordinal}: "
+                f"{native_operation.get('kind')!r} != {op.kind!r}"
+            )
+        op_id = native_operation["id"] if native_operation is not None else _stable_id("op", signature, count)
         operation_ids[op.ordinal] = op_id
         entry = {
             "id": op_id,
@@ -256,6 +284,9 @@ def extract_plan(
             "result_arity": len(_result_names(op.result)) if op.result else 0,
             "operand_count": len(op.operands),
         }
+        if native_operation is not None:
+            entry["identity_quality"] = native_operation.get("identity_quality", "semantic")
+            entry["stable_locator"] = native_operation.get("locator", "")
         operation_entries.append(entry)
         schedule.append(op_id)
 
@@ -337,6 +368,12 @@ def extract_plan(
         diagnostics.append(f"{unknown} dot fragments have an unresolved output role")
     if not fragments:
         diagnostics.append("no dot or scheduled MFMA operations were found")
+    if native_function is not None:
+        diagnostics.extend(
+            f"native:{item.get('severity', 'note')}:{item.get('code', 'unknown')}:"
+            f"{item.get('message', '')}"
+            for item in native_function.get("diagnostics", [])
+        )
 
     provenance: dict[str, Any] = {"source_name": source_name}
     case: dict[str, Any] = {}
@@ -361,6 +398,11 @@ def extract_plan(
         schedule=schedule,
         layouts=layouts,
         normalized_ir_hash="sha256:" + hashlib.sha256(normalized.encode("utf-8")).hexdigest(),
+        values=native_function.get("values", []) if native_function is not None else [],
+        lineage_edges=native_function.get("lineage_edges", []) if native_function is not None else [],
+        value_graph_fingerprint=(
+            native_function.get("semantic_fingerprint", "") if native_function is not None else ""
+        ),
         diagnostics=diagnostics,
     )
     bundle.refresh_hashes()

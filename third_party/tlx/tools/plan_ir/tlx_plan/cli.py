@@ -35,6 +35,11 @@ def _parser() -> argparse.ArgumentParser:
     extract = commands.add_parser("extract", help="extract PlanBundle JSON from final TTGIR")
     extract.add_argument("--ttgir", type=Path, required=True)
     extract.add_argument("--manifest", type=Path)
+    extract.add_argument(
+        "--value-graph",
+        type=Path,
+        help="native plan-value-graph JSON dumped from final structured TTGIR",
+    )
     extract.add_argument("--output", type=Path, required=True)
 
     normalize = commands.add_parser("normalize", help="remove locations and alpha-rename TTGIR")
@@ -44,11 +49,13 @@ def _parser() -> argparse.ArgumentParser:
     verify = commands.add_parser("verify", help="verify TTGIR against a PlanBundle")
     verify.add_argument("--ttgir", type=Path, required=True)
     verify.add_argument("--plan", type=Path, required=True)
+    verify.add_argument("--value-graph", type=Path)
     verify.add_argument("--output", type=Path)
 
     replay = commands.add_parser("replay", help="normalize TTGIR and prove exact-plan replay")
     replay.add_argument("--ttgir", type=Path, required=True)
     replay.add_argument("--plan", type=Path, required=True)
+    replay.add_argument("--value-graph", type=Path)
     replay.add_argument("--normalized-output", type=Path, required=True)
     replay.add_argument("--report", type=Path, required=True)
 
@@ -82,16 +89,32 @@ def main(argv: Sequence[str] | None = None) -> int:
         args.output.write_text(canonical_json(manifest.to_dict()))
     elif args.command == "extract":
         manifest = read_manifest(args.manifest) if args.manifest else None
-        plan = extract_plan(args.ttgir.read_text(), manifest=manifest, source_name=str(args.ttgir))
+        value_graph = json.loads(args.value_graph.read_text()) if args.value_graph else None
+        plan = extract_plan(
+            args.ttgir.read_text(),
+            manifest=manifest,
+            source_name=str(args.ttgir),
+            native_value_graph=value_graph,
+        )
         plan.write(args.output)
     elif args.command == "normalize":
         args.output.write_text(normalize_ttgir(args.ttgir.read_text()))
     elif args.command == "verify":
-        report = verify_replay(args.ttgir.read_text(), PlanBundle.read(args.plan))
+        value_graph = json.loads(args.value_graph.read_text()) if args.value_graph else None
+        report = verify_replay(
+            args.ttgir.read_text(),
+            PlanBundle.read(args.plan),
+            native_value_graph=value_graph,
+        )
         _emit(report, args.output)
         return 0 if report["semantic_match"] else 1
     elif args.command == "replay":
-        normalized, report = replay_normalized(args.ttgir.read_text(), PlanBundle.read(args.plan))
+        value_graph = json.loads(args.value_graph.read_text()) if args.value_graph else None
+        normalized, report = replay_normalized(
+            args.ttgir.read_text(),
+            PlanBundle.read(args.plan),
+            native_value_graph=value_graph,
+        )
         args.normalized_output.write_text(normalized)
         args.report.write_text(canonical_json(report))
         return 0 if report["semantic_match"] else 1

@@ -88,7 +88,64 @@ def test_round_trip_and_replay_report(tmp_path) -> None:
     report = verify_replay(TTGIR, loaded)
     assert report["exact"]
     assert report["semantic_match"]
-    assert json.loads(path.read_text())["schema_version"] == "0.1"
+    assert json.loads(path.read_text())["schema_version"] == "0.2"
+
+
+def test_native_value_graph_supplies_stable_ids_and_lineage() -> None:
+    textual = extract_plan(TTGIR)
+    operations = [
+        {
+            "id": f"op:native:{index}",
+            "kind": operation["kind"],
+            "ordinal": index,
+            "locator": f"func/kernel/b0/o{index}",
+            "identity_quality": "semantic",
+        }
+        for index, operation in enumerate(textual.operations)
+    ]
+    native = {
+        "schema_version": "plan-value-graph/0.1",
+        "functions": [
+            {
+                "function": textual.kernel,
+                "semantic_fingerprint": "native-fingerprint",
+                "operations": operations,
+                "values": [
+                    {"id": "value:a"},
+                    {"id": "value:b"},
+                ],
+                "lineage_edges": [
+                    {
+                        "source": "value:a",
+                        "destination": "value:b",
+                        "kind": "loop_backedge",
+                        "iteration_distance": 1,
+                    }
+                ],
+                "diagnostics": [],
+            }
+        ],
+    }
+    plan = extract_plan(TTGIR, native_value_graph=native)
+    assert [operation["id"] for operation in plan.operations] == [
+        operation["id"] for operation in operations
+    ]
+    assert plan.value_graph_fingerprint == "native-fingerprint"
+    assert plan.lineage_edges[0]["iteration_distance"] == 1
+    assert verify_replay(TTGIR, plan, native_value_graph=native)["semantic_match"]
+
+
+def test_read_upgrades_plan_bundle_0_1(tmp_path) -> None:
+    plan = extract_plan(TTGIR).to_dict()
+    plan["schema_version"] = "0.1"
+    plan.pop("values")
+    plan.pop("lineage_edges")
+    plan.pop("value_graph_fingerprint")
+    path = tmp_path / "old-plan.json"
+    path.write_text(json.dumps(plan))
+    upgraded = PlanBundle.read(path)
+    assert upgraded.schema_version == "0.2"
+    assert upgraded.values == []
 
 
 def test_layered_diff_localizes_schedule_change() -> None:

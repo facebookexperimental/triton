@@ -1,8 +1,7 @@
 # AMD TLX Plan IR prototype
 
-This directory implements M1.1--M1.3 of the profile-guided TLX scheduling
-design without changing the existing TLX kernels, modulo scheduler, or compiler
-passes.
+This directory implements M1.1--M1.4a of the profile-guided TLX scheduling
+design without changing the existing TLX kernels or modulo scheduler.
 
 ## Implemented milestones
 
@@ -17,6 +16,10 @@ passes.
   layout.
 - **M1.3 — exact replay verification:** location-independent TTGIR
   normalization, layer hashes, PlanBundle diff, and re-extraction verification.
+- **M1.4a — stable native value graph:** an opt-in, analysis-only AMD compiler
+  pass after final structured scheduling and before SCFToCF. It emits stable
+  operation/value IDs, structured-loop iteration-distance edges, derived-value
+  lineage, logical tensor sizes, and explicit identity-quality diagnostics.
 
 M1.3 verifies that a captured baseline is reproducible. It does **not** lower an
 arbitrarily mutated storage or schedule plan back into TTGIR. That mutation path
@@ -37,14 +40,26 @@ python3 -m tlx_plan manifest \
   --output /tmp/baseline.json
 python3 -m tlx_plan extract \
   --ttgir /path/to/final.ttgir \
+  --value-graph /tmp/plan-values/<fingerprint>.plan-values.json \
   --manifest /tmp/baseline.json \
   --output /tmp/plan.json
 python3 -m tlx_plan replay \
   --ttgir /path/to/final.ttgir \
+  --value-graph /tmp/plan-values/<fingerprint>.plan-values.json \
   --plan /tmp/plan.json \
   --normalized-output /tmp/replayed.ttgir \
   --report /tmp/replay.json
 ```
+
+Generate the native sidecar during AMD compilation by setting:
+
+```bash
+export TRITON_TLX_PLAN_ANALYSIS_DIR=/tmp/plan-values
+```
+
+The pass is disabled by default and does not mutate TTGIR. The sidecar reports
+logical tensor bytes only; physical VGPR allocation remains unknown at this
+stage and is serialized as `null`.
 
 Compare two extracted plans with:
 
