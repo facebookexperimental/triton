@@ -1850,7 +1850,8 @@ def _aggregate(cls):
     hash_attrs = [init]
 
     for (name, member) in inspect.getmembers(cls):
-        if inspect.isfunction(member) or inspect.ismethod(member) or isinstance(member, JITCallable):
+        if (inspect.isfunction(member) or inspect.ismethod(member) or isinstance(member, JITCallable)
+                or isinstance(member, property)):
             if name == "__init__":
                 continue
             # __annotate__ is a Python 3.14+ internal; exclude from hash and
@@ -1865,7 +1866,11 @@ def _aggregate(cls):
 
             # Exclude __annotate_func__ from hash — isn't user facing (Python 3.14+).
             if name != "__annotate_func__":
-                hash_attrs.append(member)
+                if isinstance(member, property):
+                    hash_attrs.extend(accessor for accessor in (member.fget, member.fset, member.fdel)
+                                      if accessor is not None)
+                else:
+                    hash_attrs.append(member)
 
     aggregate_value.hash_attrs = hash_attrs
     aggregate_value.__name__ = cls.__name__
@@ -1995,6 +2000,10 @@ class _block_ptr:
     def _tile_shape(self):
         return [_unwrap_if_constexpr(extent) for extent in self.block_shape]
 
+    @property
+    def dtype(self) -> pointer_type:
+        return typing.cast(pointer_type, self.base.dtype)
+
     def _materialize(self, boundary_check=(), _semantic=None):
         tile_shape = self._tile_shape()
         checked_dims = _canonicalize_block_ptr_boundary_check(boundary_check, len(tile_shape))
@@ -2064,7 +2073,6 @@ class _block_ptr:
 
 
 _block_ptr.__triton_block_ptr__ = True
-_block_ptr.dtype = property(lambda self: self.base.dtype)
 
 # -----------------------
 # SPMD Programming Model
