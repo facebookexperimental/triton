@@ -394,8 +394,7 @@ def _set_amd_mma_tiles_per_warp(result, tiles_per_warp, semantic):
 
 
 @tl.builtin
-def dot(input, other, acc=None, input_precision=None, allow_tf32=None, max_num_imprecise_acc=None,
-        out_dtype=tl.float32,
+def dot(input, other, acc=None, input_precision=None, allow_tf32=None, max_num_imprecise_acc=None, out_dtype=tl.float32,
         tiles_per_warp: tl.constexpr = None, _semantic=None):
     """Thin wrapper around :func:`triton.language.dot` with an optional AMD
     per-wave tile-ownership hint.

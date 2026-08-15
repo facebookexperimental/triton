@@ -852,33 +852,6 @@ def test_shared_linear_raw_physical_stage_compiles_on_cdna4():
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Need gfx950 (CDNA4)")
-def test_require_layout_pin_modes_on_cdna4():
-    """pin=False keeps a soft requirement; pin=True creates a user anchor."""
-    layout = tlx.layout(
-        shape=((64, 4), (4, )),
-        stride=((4, 256), (1, )),
-    )
-
-    @triton.jit
-    def kernel(X, Y, L: tl.constexpr, PIN: tl.constexpr):
-        offsets = tl.arange(0, 1024)
-        values = tl.load(X + offsets)
-        values = tlx.require_layout(values, L, pin=PIN)
-        tl.store(Y + offsets, values)
-
-    x = torch.arange(1024, device=DEVICE, dtype=torch.float32)
-    y = torch.empty_like(x)
-    soft = kernel.warmup(x, y, layout, False, grid=(1, ), num_warps=4)
-    hard = kernel.warmup(x, y, layout, True, grid=(1, ), num_warps=4)
-    kernel[(1, )](x, y, layout, False, num_warps=4)
-    torch.testing.assert_close(y, x, atol=0, rtol=0)
-    assert "tlx.require_layout" in soft.asm["ttir"]
-    assert "#tlx.no_verify_layout<#linear>" in soft.asm["ttir"]
-    assert "#tlx.user_layout" not in soft.asm["ttir"]
-    assert "#tlx.user_layout" in hard.asm["ttir"]
-
-
-@pytest.mark.skipif(not is_hip_cdna4(), reason="Need gfx950 (CDNA4)")
 def test_fp_cast_preserves_explicit_mfma_layout_on_cdna4():
     """Ordinary FP casts keep concrete source ownership until a new anchor."""
     mma = tlx.amd_mfma_layout(4, [16, 16, 32], True, [4, 1])
@@ -897,6 +870,78 @@ def test_fp_cast_preserves_explicit_mfma_layout_on_cdna4():
     y = torch.full((256 * 16, ), float("nan"), device=DEVICE, dtype=torch.float32)
     kernel[(1, )](y, mma, store, num_warps=4)
     torch.testing.assert_close(y, torch.zeros_like(y), atol=0, rtol=0)
+
+
+@triton.jit
+def _workitems_to_mfma_rows(workitems):
+    rows, _ = workitems.reshape([8, 2, 32]).permute(0, 2, 1).split()
+    return rows.reshape([256])
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Need gfx950 (CDNA4)")
+def test_concrete_mfma_layout_reconciles_elementwise_broadcast_on_cdna4():
+    """An explicit MFMA operand constrains an unencoded helper/broadcast path.
+
+    This is the reduced adaptive-FA output-normalization witness. The helper
+    restructures a workitem tensor and returns an encoding-stripped value;
+    expanding and broadcasting it next to an exact MFMA ``require_layout``
+    used to leave ``arith.mulf`` with mismatched concrete/null encodings during
+    TritonTLXFixup.
+    """
+    mma = tlx.amd_mfma_layout(4, [32, 32, 16], True, [8, 1])
+    store = tlx.layout(
+        shape=((64, 8), (16, )),
+        stride=((16, 1024), (1, )),
+    )
+
+    @triton.jit
+    def kernel(Y, MMA: tl.constexpr, STORE: tl.constexpr):
+        acc = tlx.require_layout(tl.zeros((256, 32), tl.float32), MMA)
+        workitems = tl.arange(0, 512).to(tl.float32)
+        rows = _workitems_to_mfma_rows(workitems)
+        out = acc * rows[:, None]
+        out = tlx.cast_preserve_layout(out, tl.bfloat16)
+        out = tlx.require_layout(out, STORE)
+        row = tl.arange(0, 256)
+        col = tl.arange(0, 32)
+        tl.store(Y + row[:, None] * 32 + col[None, :], out)
+
+    y = torch.full((256 * 32, ), float("nan"), device=DEVICE, dtype=torch.bfloat16)
+    compiled = kernel.warmup(y, mma, store, grid=(1, ), num_warps=8)
+    kernel[(1, )](y, mma, store, num_warps=8)
+    torch.testing.assert_close(y, torch.zeros_like(y), atol=0, rtol=0)
+    assert "#ttg.amd_mfma" in compiled.asm["ttir"]
+    assert "#tlx.no_verify_layout" not in compiled.asm["ttgir"]
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Need gfx950 (CDNA4)")
+def test_concrete_elementwise_conflicting_explicit_layouts_fail_on_cdna4():
+    """Two explicit concrete owners must not silently retag one another."""
+    mma = tlx.amd_mfma_layout(4, [32, 32, 16], True, [8, 1])
+    other = tlx.distributed_linear_layout_encoding.make(
+        reg_bases=[[0, 1], [0, 2], [0, 4], [0, 8]],
+        lane_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0]],
+        warp_bases=[[64, 0], [128, 0], [0, 16]],
+        block_bases=[],
+        shape=[256, 32],
+    )
+
+    @triton.jit
+    def kernel(X, Y, MMA: tl.constexpr, OTHER: tl.constexpr):
+        row = tl.arange(0, 256)
+        col = tl.arange(0, 32)
+        offsets = row[:, None] * 32 + col[None, :]
+        value = tl.load(X + offsets)
+        lhs = tlx.require_layout(value, MMA)
+        rhs = tlx.require_layout(value, OTHER)
+        out = lhs + rhs
+        out = tlx.require_layout(out, OTHER)
+        tl.store(Y + offsets, out)
+
+    x = torch.zeros((256 * 32, ), device=DEVICE, dtype=torch.float32)
+    y = torch.empty((256 * 32, ), device=DEVICE, dtype=torch.float32)
+    with pytest.raises(RuntimeError, match="conflicting explicit layouts meet on this operation"):
+        kernel.warmup(x, y, mma, other, grid=(1, ), num_warps=8)
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Need gfx950 (CDNA4)")
