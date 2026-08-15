@@ -1,0 +1,50 @@
+{
+  "artifacts": {
+    "amdgcn": "MZHADXUWKCBWZLI22ZDKYFBDDGRPZXD64RBQUZMBZ6T4Q6ZUJCOQ/_attn_bwd_dkdv_dq_d128_gqa_kernel.amdgcn@sha256:1855cf5ae49945c0dfcf7632e7383c888d9a03c609b4b3829471b67663c38537",
+    "compiler_metadata": "MZHADXUWKCBWZLI22ZDKYFBDDGRPZXD64RBQUZMBZ6T4Q6ZUJCOQ/_attn_bwd_dkdv_dq_d128_gqa_kernel.json@sha256:1114ceabd8e510ee045523c97ea9148ec7735ed167f305e72e8bc1bd88ac74b1",
+    "llir": "MZHADXUWKCBWZLI22ZDKYFBDDGRPZXD64RBQUZMBZ6T4Q6ZUJCOQ/_attn_bwd_dkdv_dq_d128_gqa_kernel.llir@sha256:4fb7fbcc32a5b7f60f39e5db17cae72bd3858adcb440793a7282a0b8f72c1017",
+    "ttgir": "MZHADXUWKCBWZLI22ZDKYFBDDGRPZXD64RBQUZMBZ6T4Q6ZUJCOQ/_attn_bwd_dkdv_dq_d128_gqa_kernel.ttgir@sha256:93a50c69af406d4d3544d89c6a5b5694b4a4b8d8dff5e774844e14b69ddaa0ca"
+  },
+  "case": {
+    "causal": false,
+    "dtype": "bf16",
+    "family": "fa_backward",
+    "grouped_query": false,
+    "name": "mha_n2048_d128",
+    "shape": {
+      "batch": 1,
+      "head_dim": 128,
+      "kv_heads": 1,
+      "q_heads": 1,
+      "seq_len": 2048
+    }
+  },
+  "compiler_revision": "d0e4d03225b8889c2f9ddc536109e14d48171cf0",
+  "device": {
+    "arch": "gfx950",
+    "backend": "hip",
+    "shared_memory_bytes": 153888,
+    "warp_size": 64
+  },
+  "measurements": {
+    "accuracy_snr_threshold_db": 40.0,
+    "accuracy_variants_passed": 3.0,
+    "dot_sites": 84.0,
+    "scheduled_mfma_sites": 80.0
+  },
+  "schedule": {
+    "accumulation": "mixed_fp32",
+    "algorithm": "long_fused_bridge",
+    "config": {
+      "block_m": 16,
+      "block_n": 256,
+      "num_stages": 1,
+      "num_warps": 4
+    },
+    "implementation": "tlx",
+    "kernel": "_attn_bwd_dkdv_dq_d128_gqa_kernel",
+    "name": "tlx_fused_bridge"
+  },
+  "schema_version": "0.1",
+  "source_revision": "d0e4d03225b8889c2f9ddc536109e14d48171cf0"
+}

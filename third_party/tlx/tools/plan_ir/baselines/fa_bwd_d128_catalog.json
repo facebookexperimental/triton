@@ -1,0 +1,24 @@
+{
+  "cases": {
+    "gqa_b16_hq64_hkv8_n1024_d128": {"batch": 16, "q_heads": 64, "kv_heads": 8, "seq_len": 1024, "head_dim": 128},
+    "gqa_b16_hq64_hkv8_n2048_d128": {"batch": 16, "q_heads": 64, "kv_heads": 8, "seq_len": 2048, "head_dim": 128},
+    "gqa_b16_hq64_hkv8_n4096_d128": {"batch": 16, "q_heads": 64, "kv_heads": 8, "seq_len": 4096, "head_dim": 128},
+    "gqa_b16_hq64_hkv8_n8192_d128": {"batch": 16, "q_heads": 64, "kv_heads": 8, "seq_len": 8192, "head_dim": 128},
+    "gqa_b16_hq64_hkv8_n16384_d128": {"batch": 16, "q_heads": 64, "kv_heads": 8, "seq_len": 16384, "head_dim": 128},
+    "mha_n2048_d128": {"batch": 1, "q_heads": 1, "kv_heads": 1, "seq_len": 2048, "head_dim": 128}
+  },
+  "common": {"family": "fa_backward", "dtype": "bf16", "causal": false, "head_dim": 128},
+  "schedules": {
+    "tlx_fused_bridge": {
+      "algorithm": "long_fused_bridge",
+      "config": {"block_m": 16, "block_n": 256, "num_stages": 1, "num_warps": 4},
+      "kernel": "_attn_bwd_dkdv_dq_d128_gqa_kernel"
+    },
+    "triton_fused_bf16": {
+      "algorithm": "short_persistent_fused",
+      "config": {"block_m": 32, "block_n": 128, "dq_subtile": 2, "num_stages": 2, "num_warps": 4},
+      "kernel": "_attn_bwd_dkdv_dq_d128_triton_fused_kernel"
+    }
+  },
+  "schema_version": "0.1"
+}
