@@ -8,9 +8,12 @@
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/ErrorHandling.h"
+#include "llvm/Support/MathExtras.h"
 #include "llvm/Support/raw_ostream.h"
 
 #include "tlx/dialect/include/Analysis/LayoutPropagation.h"
+
+#include <numeric>
 
 #define DEBUG_TYPE "tlx-layout-propagation"
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
@@ -22,6 +25,220 @@ namespace ttg = ::mlir::triton::gpu;
 namespace ttng = ::mlir::triton::nvidia_gpu;
 
 namespace mlir::triton::tlx {
+
+static std::optional<SmallVector<unsigned>> getLogicalDimBitWidths(Type type) {
+  auto tensor = dyn_cast<RankedTensorType>(type);
+  if (!tensor)
+    return SmallVector<unsigned>{};
+  SmallVector<unsigned> widths;
+  widths.reserve(tensor.getRank());
+  for (int64_t extent : tensor.getShape()) {
+    if (extent <= 0 || !llvm::isPowerOf2_64(extent))
+      return std::nullopt;
+    widths.push_back(llvm::Log2_64(extent));
+  }
+  return widths;
+}
+
+static unsigned totalLogicalBits(ArrayRef<unsigned> widths) {
+  return llvm::accumulate(widths, 0u);
+}
+
+static LogicalInvariantBits getUnknownInvariantBits(Type type) {
+  auto widths = getLogicalDimBitWidths(type);
+  return LogicalInvariantBits(
+      llvm::SmallBitVector(widths ? totalLogicalBits(*widths) : 0, false));
+}
+
+LogicalInvariantBits
+LogicalInvariantBits::join(const LogicalInvariantBits &lhs,
+                           const LogicalInvariantBits &rhs) {
+  if (lhs.isUninitialized())
+    return rhs;
+  if (rhs.isUninitialized())
+    return lhs;
+  assert(lhs.getBits().size() == rhs.getBits().size() &&
+         "region-carried tensor shapes must agree");
+  llvm::SmallBitVector intersection = lhs.getBits();
+  intersection &= rhs.getBits();
+  return LogicalInvariantBits(std::move(intersection));
+}
+
+void LogicalInvariantBits::print(raw_ostream &os) const {
+  if (isUninitialized()) {
+    os << "<UNINITIALIZED>";
+    return;
+  }
+  os << '[';
+  llvm::interleaveComma(getBits().set_bits(), os);
+  os << ']';
+}
+
+static llvm::SmallBitVector remapDimensionBits(
+    const llvm::SmallBitVector &source, ArrayRef<unsigned> sourceWidths,
+    ArrayRef<unsigned> resultWidths, ArrayRef<int32_t> resultToSource,
+    bool broadcastNewBits = false) {
+  llvm::SmallBitVector result(totalLogicalBits(resultWidths), false);
+  SmallVector<unsigned> sourceOffsets(sourceWidths.size());
+  SmallVector<unsigned> resultOffsets(resultWidths.size());
+  for (unsigned i = 1; i < sourceWidths.size(); ++i)
+    sourceOffsets[i] = sourceOffsets[i - 1] + sourceWidths[i - 1];
+  for (unsigned i = 1; i < resultWidths.size(); ++i)
+    resultOffsets[i] = resultOffsets[i - 1] + resultWidths[i - 1];
+  for (auto [resultDim, sourceDim] : llvm::enumerate(resultToSource)) {
+    if (sourceDim < 0)
+      continue;
+    unsigned copied =
+        std::min(sourceWidths[sourceDim], resultWidths[resultDim]);
+    for (unsigned bit = 0; bit < copied; ++bit)
+      if (source.test(sourceOffsets[sourceDim] + bit))
+        result.set(resultOffsets[resultDim] + bit);
+    if (broadcastNewBits && sourceWidths[sourceDim] == 0)
+      for (unsigned bit = 0; bit < resultWidths[resultDim]; ++bit)
+        result.set(resultOffsets[resultDim] + bit);
+  }
+  return result;
+}
+
+static llvm::SmallBitVector remapReshapeBits(const llvm::SmallBitVector &source,
+                                             ArrayRef<unsigned> sourceWidths,
+                                             ArrayRef<unsigned> resultWidths) {
+  assert(totalLogicalBits(sourceWidths) == totalLogicalBits(resultWidths));
+  llvm::SmallBitVector result(source.size(), false);
+  SmallVector<unsigned> sourceOffsets(sourceWidths.size());
+  SmallVector<unsigned> resultOffsets(resultWidths.size());
+  SmallVector<unsigned> sourceSuffix(sourceWidths.size());
+  SmallVector<unsigned> resultSuffix(resultWidths.size());
+  for (unsigned i = 1; i < sourceWidths.size(); ++i)
+    sourceOffsets[i] = sourceOffsets[i - 1] + sourceWidths[i - 1];
+  for (unsigned i = 1; i < resultWidths.size(); ++i)
+    resultOffsets[i] = resultOffsets[i - 1] + resultWidths[i - 1];
+  for (int i = static_cast<int>(sourceWidths.size()) - 2; i >= 0; --i)
+    sourceSuffix[i] = sourceSuffix[i + 1] + sourceWidths[i + 1];
+  for (int i = static_cast<int>(resultWidths.size()) - 2; i >= 0; --i)
+    resultSuffix[i] = resultSuffix[i + 1] + resultWidths[i + 1];
+
+  for (auto [sourceDim, width] : llvm::enumerate(sourceWidths)) {
+    for (unsigned bit = 0; bit < width; ++bit) {
+      if (!source.test(sourceOffsets[sourceDim] + bit))
+        continue;
+      unsigned linearBit = sourceSuffix[sourceDim] + bit;
+      for (auto [resultDim, resultWidth] : llvm::enumerate(resultWidths)) {
+        if (linearBit < resultSuffix[resultDim] ||
+            linearBit >= resultSuffix[resultDim] + resultWidth)
+          continue;
+        result.set(resultOffsets[resultDim] + linearBit -
+                   resultSuffix[resultDim]);
+        break;
+      }
+    }
+  }
+  return result;
+}
+
+LogicalResult LogicalInvariantBitsAnalysis::visitOperation(
+    Operation *op, ArrayRef<const LogicalInvariantBitsLattice *> operands,
+    ArrayRef<LogicalInvariantBitsLattice *> results) {
+  // Empty is the pessimistic fixpoint for this intersection lattice. Do not
+  // commit to it merely because a loop-carried operand has not reached this
+  // operation yet: once joined, later information could not recover a proven
+  // invariant bit.
+  if (llvm::any_of(operands, [](const LogicalInvariantBitsLattice *operand) {
+        return operand->getValue().isUninitialized();
+      }))
+    return success();
+
+  auto sourceBits = [&](unsigned index) -> const llvm::SmallBitVector * {
+    if (index >= operands.size() ||
+        operands[index]->getValue().isUninitialized())
+      return nullptr;
+    return &operands[index]->getValue().getBits();
+  };
+
+  for (auto [resultIndex, lattice] : llvm::enumerate(results)) {
+    Value resultValue = op->getResult(resultIndex);
+    auto resultWidths = getLogicalDimBitWidths(resultValue.getType());
+    LogicalInvariantBits inferred =
+        getUnknownInvariantBits(resultValue.getType());
+    if (!resultWidths) {
+      propagateIfChanged(lattice, lattice->join(inferred));
+      continue;
+    }
+    unsigned resultBitCount = totalLogicalBits(*resultWidths);
+    llvm::SmallBitVector bits(resultBitCount, false);
+
+    if (auto constant = dyn_cast<arith::ConstantOp>(op)) {
+      auto elements = dyn_cast<ElementsAttr>(constant.getValue());
+      if (elements && elements.isSplat())
+        bits.set();
+    } else if (isa<triton::SplatOp>(op)) {
+      bits.set();
+    } else if (auto broadcast = dyn_cast<triton::BroadcastOp>(op)) {
+      auto sourceWidths = getLogicalDimBitWidths(broadcast.getSrc().getType());
+      if (sourceWidths)
+        if (const auto *source = sourceBits(0)) {
+          SmallVector<int32_t> mapping(resultWidths->size());
+          std::iota(mapping.begin(), mapping.end(), 0);
+          bits = remapDimensionBits(*source, *sourceWidths, *resultWidths,
+                                    mapping, true);
+        }
+    } else if (auto expand = dyn_cast<triton::ExpandDimsOp>(op)) {
+      auto sourceWidths = getLogicalDimBitWidths(expand.getSrc().getType());
+      if (sourceWidths)
+        if (const auto *source = sourceBits(0)) {
+          SmallVector<int32_t> mapping(resultWidths->size());
+          for (unsigned dim = 0; dim < mapping.size(); ++dim)
+            mapping[dim] = dim < expand.getAxis() ? dim : dim - 1;
+          mapping[expand.getAxis()] = -1;
+          bits = remapDimensionBits(*source, *sourceWidths, *resultWidths,
+                                    mapping);
+        }
+    } else if (auto transpose = dyn_cast<triton::TransOp>(op)) {
+      auto sourceWidths = getLogicalDimBitWidths(transpose.getSrc().getType());
+      if (sourceWidths)
+        if (const auto *source = sourceBits(0))
+          bits = remapDimensionBits(*source, *sourceWidths, *resultWidths,
+                                    transpose.getOrder());
+    } else if (auto reshape = dyn_cast<triton::ReshapeOp>(op)) {
+      auto sourceWidths = getLogicalDimBitWidths(reshape.getSrc().getType());
+      if (sourceWidths && totalLogicalBits(*sourceWidths) == resultBitCount)
+        if (const auto *source = sourceBits(0))
+          bits = remapReshapeBits(*source, *sourceWidths, *resultWidths);
+    } else if (isa<RequireLayoutOp, ReleaseLayoutOp, ttg::ConvertLayoutOp>(
+                   op)) {
+      if (const auto *source = sourceBits(0);
+          source && source->size() == resultBitCount)
+        bits = *source;
+    } else if (op->hasTrait<OpTrait::Elementwise>()) {
+      bits.set();
+      bool sawTensor = false;
+      for (auto [operand, operandLattice] :
+           llvm::zip(op->getOperands(), operands)) {
+        if (!isa<RankedTensorType>(operand.getType()))
+          continue;
+        sawTensor = true;
+        const LogicalInvariantBits &value = operandLattice->getValue();
+        if (value.isUninitialized() ||
+            value.getBits().size() != resultBitCount) {
+          bits.reset();
+          break;
+        }
+        bits &= value.getBits();
+      }
+      if (!sawTensor)
+        bits.reset();
+    }
+    inferred = LogicalInvariantBits(std::move(bits));
+    propagateIfChanged(lattice, lattice->join(inferred));
+  }
+  return success();
+}
+
+void LogicalInvariantBitsAnalysis::setToEntryState(
+    LogicalInvariantBitsLattice *lattice) {
+  propagateIfChanged(lattice, lattice->join(getUnknownInvariantBits(
+                                  lattice->getAnchor().getType())));
+}
 
 // Reuse the dialect's transpose inference so TLX propagation stays in sync
 // with verifier/type inference for padded, swizzled, and MMA shared layouts.

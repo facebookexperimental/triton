@@ -1882,6 +1882,85 @@ def test_tlx_wave_packet_relation_preserves_replicated_physical_bits():
     ) == (1, 195, 3)
 
 
+def test_tlx_wave_packet_relation_uses_proven_invariant_logical_bits():
+    source_linear = LinearLayout.from_bases(
+        [
+            ("register", []),
+            ("lane", [[0, 1, 0], [0, 2, 0], [0, 4, 0], [0, 8, 0], [0, 16, 0], [0, 0, 1]]),
+            ("warp", [[1, 0, 0], [2, 0, 0], [4, 0, 0]]),
+            ("block", []),
+        ],
+        ["dim0", "dim1", "dim2"],
+        [8, 32, 2],
+        False,
+    )
+    result_linear = LinearLayout.from_bases(
+        [
+            ("register", [[0, 0, 1]]),
+            ("lane", [[0, 1, 0], [0, 2, 0], [0, 4, 0], [0, 8, 0], [0, 16, 0], [0, 0, 0]]),
+            ("warp", [[1, 0, 0], [2, 0, 0], [4, 0, 0]]),
+            ("block", []),
+        ],
+        ["dim0", "dim1", "dim2"],
+        [8, 32, 2],
+        False,
+    )
+    source = SimpleNamespace(
+        shape=(8, 32, 2),
+        linear_layout=source_linear,
+        value_id=0,
+        lane_width=64,
+        component_count=1,
+    )
+    result = SimpleNamespace(
+        shape=(8, 32, 2),
+        linear_layout=result_linear,
+        value_id=1,
+        lane_width=64,
+        component_count=2,
+    )
+
+    (exact, ) = converter_layouts.packet_layout_relations((source, ), (result, ))
+    (equivalent, ) = converter_layouts.packet_layout_relations(
+        (source, ),
+        (result, ),
+        source_invariant_bits=(8, ),
+    )
+    dsl, _ir = converter_emission._load_wave_dsl()
+    exact_block, exact_item, exact_slot = converter_emission._packet_relation_exprs(
+        SimpleNamespace(dsl=dsl),
+        exact,
+        1,
+        512,
+        destination_blocks=1,
+        destination_items=512,
+        destination_slots=2,
+    )
+    equivalent_block, equivalent_item, equivalent_slot = converter_emission._packet_relation_exprs(
+        SimpleNamespace(dsl=dsl),
+        equivalent,
+        1,
+        512,
+        destination_blocks=1,
+        destination_items=512,
+        destination_slots=2,
+    )
+
+    # Exact conversion must fetch dim2=0 from the lower lane half. Once dim2
+    # is proven constant, both destination registers can use the current lane's
+    # equivalent source value and no cross-lane communication is required.
+    point = {"block": 0, "item": 37, "slot": 0}
+    assert (exact_block.eval(point), exact_item.eval(point), exact_slot.eval(point)) == (0, 5, 0)
+    for item in (5, 37, 261, 293):
+        for slot in (0, 1):
+            point = {"block": 0, "item": item, "slot": slot}
+            assert (equivalent_block.eval(point), equivalent_item.eval(point), equivalent_slot.eval(point)) == (
+                0,
+                item,
+                0,
+            )
+
+
 def test_tlx_wave_packet_relation_normalizes_projected_physical_coordinate():
     source_linear = LinearLayout.from_bases(
         [
