@@ -1,0 +1,294 @@
+{
+ "tlx_bwd_default": {
+  "2048": {
+   "env_probe": {
+    "before": "120 MHz, 195.98 W, 30",
+    "after": "1965 MHz, 566.55 W, 36"
+   },
+   "ok": true,
+   "ms": 2.815040111541748,
+   "lo": 2.810879945755005,
+   "hi": 2.820352077484131,
+   "tflops": 244.11544423203102
+  },
+  "4096": {
+   "env_probe": {
+    "before": "1965 MHz, 558.64 W, 36",
+    "after": "1965 MHz, 563.99 W, 36"
+   },
+   "ok": true,
+   "ms": 10.674288272857666,
+   "lo": 10.666975975036621,
+   "hi": 10.681535720825195,
+   "tflops": 257.51403739296904
+  },
+  "8192": {
+   "env_probe": {
+    "before": "1965 MHz, 552.30 W, 36",
+    "after": "1965 MHz, 448.40 W, 35"
+   },
+   "ok": true,
+   "ms": 41.442304611206055,
+   "lo": 41.42367324829101,
+   "hi": 41.464664459228516,
+   "tflops": 265.311410186076
+  },
+  "16384": {
+   "env_probe": {
+    "before": "120 MHz, 196.00 W, 30",
+    "after": "1965 MHz, 559.40 W, 36"
+   },
+   "ok": true,
+   "ms": 163.3546600341797,
+   "lo": 163.31411132812502,
+   "hi": 163.35467834472655,
+   "tflops": 269.2329995473511
+  }
+ },
+ "jos_bwd": {
+  "2048": {
+   "env_probe": {
+    "before": "1965 MHz, 381.96 W, 35",
+    "after": "1965 MHz, 385.34 W, 35"
+   },
+   "ok": false,
+   "reason": "CompilationError: at 168:33:\n                tlx.barrier_wait(sem6_full[0], (_it & 1))  # intra-WG async result: N21\u2192N25 (tc_gen5_mma\u2192tmem_load, wg1)\n                tmload_24 = tlx.local_load(acc_tmem_7[0])\n                tlx.barrier_wait(sem4_b8_full[0], (_it & 1))\n                chan_sem4_b8_0 = tlx.local_load(L0_smem_8[0])\n                tlx.barrier_arrive(sem4_b8_empty[0], 1)\n                trunc_25 = tl.math.exp2(((chan_sem4_b8_0 * tl.full((128, 64), 1.4427, tl.float32)) - tl.load(addptr_22)[None, :])).to(tl.float16)\n                trunc_26 = (tl.math.exp2(((chan_sem4_b8_0 * tl.full((128, 64), 1.4427, tl.float32)) - tl.load(addptr_22)[None, :])) * (tmload_24 - tl.load(addptr_23)[None, :])).to(tl.float16)\n                tlx.barrier_wait(L0_acc_tmem_2_empty[0], (_it & 1) ^ 1)  # TMEM bridge\n                tlx.local_store(L0_acc_tmem_2[0], trunc_25)\n                tlx.barrier_arrive(L0_acc_tmem_2_full[0], 1)\n                # MMA\n                tlx.barrier_wait(L0_smem_3_full[buf], phase)\n                                 ^\nNameError('L0_smem_3_full is not defined')"
+  },
+  "4096": {
+   "env_probe": {
+    "before": "1965 MHz, 383.16 W, 35",
+    "after": "1965 MHz, 452.74 W, 36"
+   },
+   "ok": false,
+   "reason": "CompilationError: at 168:33:\n                tlx.barrier_wait(sem6_full[0], (_it & 1))  # intra-WG async result: N21\u2192N25 (tc_gen5_mma\u2192tmem_load, wg1)\n                tmload_24 = tlx.local_load(acc_tmem_7[0])\n                tlx.barrier_wait(sem4_b8_full[0], (_it & 1))\n                chan_sem4_b8_0 = tlx.local_load(L0_smem_8[0])\n                tlx.barrier_arrive(sem4_b8_empty[0], 1)\n                trunc_25 = tl.math.exp2(((chan_sem4_b8_0 * tl.full((128, 64), 1.4427, tl.float32)) - tl.load(addptr_22)[None, :])).to(tl.float16)\n                trunc_26 = (tl.math.exp2(((chan_sem4_b8_0 * tl.full((128, 64), 1.4427, tl.float32)) - tl.load(addptr_22)[None, :])) * (tmload_24 - tl.load(addptr_23)[None, :])).to(tl.float16)\n                tlx.barrier_wait(L0_acc_tmem_2_empty[0], (_it & 1) ^ 1)  # TMEM bridge\n                tlx.local_store(L0_acc_tmem_2[0], trunc_25)\n                tlx.barrier_arrive(L0_acc_tmem_2_full[0], 1)\n                # MMA\n                tlx.barrier_wait(L0_smem_3_full[buf], phase)\n                                 ^\nNameError('L0_smem_3_full is not defined')"
+  },
+  "8192": {
+   "env_probe": {
+    "before": "1965 MHz, 449.51 W, 35",
+    "after": "1965 MHz, 580.23 W, 36"
+   },
+   "ok": false,
+   "reason": "CompilationError: at 168:33:\n                tlx.barrier_wait(sem6_full[0], (_it & 1))  # intra-WG async result: N21\u2192N25 (tc_gen5_mma\u2192tmem_load, wg1)\n                tmload_24 = tlx.local_load(acc_tmem_7[0])\n                tlx.barrier_wait(sem4_b8_full[0], (_it & 1))\n                chan_sem4_b8_0 = tlx.local_load(L0_smem_8[0])\n                tlx.barrier_arrive(sem4_b8_empty[0], 1)\n                trunc_25 = tl.math.exp2(((chan_sem4_b8_0 * tl.full((128, 64), 1.4427, tl.float32)) - tl.load(addptr_22)[None, :])).to(tl.float16)\n                trunc_26 = (tl.math.exp2(((chan_sem4_b8_0 * tl.full((128, 64), 1.4427, tl.float32)) - tl.load(addptr_22)[None, :])) * (tmload_24 - tl.load(addptr_23)[None, :])).to(tl.float16)\n                tlx.barrier_wait(L0_acc_tmem_2_empty[0], (_it & 1) ^ 1)  # TMEM bridge\n                tlx.local_store(L0_acc_tmem_2[0], trunc_25)\n                tlx.barrier_arrive(L0_acc_tmem_2_full[0], 1)\n                # MMA\n                tlx.barrier_wait(L0_smem_3_full[buf], phase)\n                                 ^\nNameError('L0_smem_3_full is not defined')"
+  },
+  "16384": {
+   "env_probe": {
+    "before": "120 MHz, 196.01 W, 30",
+    "after": "1965 MHz, 342.81 W, 32"
+   },
+   "ok": false,
+   "reason": "CompilationError: at 168:33:\n                tlx.barrier_wait(sem6_full[0], (_it & 1))  # intra-WG async result: N21\u2192N25 (tc_gen5_mma\u2192tmem_load, wg1)\n                tmload_24 = tlx.local_load(acc_tmem_7[0])\n                tlx.barrier_wait(sem4_b8_full[0], (_it & 1))\n                chan_sem4_b8_0 = tlx.local_load(L0_smem_8[0])\n                tlx.barrier_arrive(sem4_b8_empty[0], 1)\n                trunc_25 = tl.math.exp2(((chan_sem4_b8_0 * tl.full((128, 64), 1.4427, tl.float32)) - tl.load(addptr_22)[None, :])).to(tl.float16)\n                trunc_26 = (tl.math.exp2(((chan_sem4_b8_0 * tl.full((128, 64), 1.4427, tl.float32)) - tl.load(addptr_22)[None, :])) * (tmload_24 - tl.load(addptr_23)[None, :])).to(tl.float16)\n                tlx.barrier_wait(L0_acc_tmem_2_empty[0], (_it & 1) ^ 1)  # TMEM bridge\n                tlx.local_store(L0_acc_tmem_2[0], trunc_25)\n                tlx.barrier_arrive(L0_acc_tmem_2_full[0], 1)\n                # MMA\n                tlx.barrier_wait(L0_smem_3_full[buf], phase)\n                                 ^\nNameError('L0_smem_3_full is not defined')"
+  }
+ },
+ "cudnn_bwd": {
+  "2048": {
+   "env_probe": {
+    "before": "120 MHz, 196.15 W, 31",
+    "after": "1732 MHz, 928.66 W, 40"
+   },
+   "fwd_ms": 0.2303999960422516,
+   "ok": true,
+   "ms": 0.7823680341243744,
+   "lo": 0.762809580564499,
+   "hi": 0.8133376300334931,
+   "tflops": 878.3523065702802
+  },
+  "4096": {
+   "env_probe": {
+    "before": "1965 MHz, 916.30 W, 40",
+    "after": "1965 MHz, 949.21 W, 44"
+   },
+   "fwd_ms": 0.8877760171890259,
+   "ok": true,
+   "ms": 2.8087679147720337,
+   "lo": 2.7829823732376098,
+   "hi": 2.815008044242859,
+   "tflops": 978.6422918687808
+  },
+  "8192": {
+   "env_probe": {
+    "before": "1965 MHz, 918.80 W, 44",
+    "after": "1965 MHz, 935.60 W, 45"
+   },
+   "fwd_ms": 3.5030078887939453,
+   "ok": true,
+   "ms": 10.461343765258789,
+   "lo": 10.32348213195801,
+   "hi": 10.48684196472168,
+   "tflops": 1051.0233220969012
+  },
+  "16384": {
+   "env_probe": {
+    "before": "1965 MHz, 919.80 W, 45",
+    "after": "1425 MHz, 943.98 W, 44"
+   },
+   "fwd_ms": 13.702143669128418,
+   "ok": true,
+   "ms": 40.53910541534424,
+   "lo": 40.41351108551025,
+   "hi": 40.78616428375244,
+   "tflops": 1084.8898775746834
+  }
+ },
+ "fa4_bwd": {
+  "2048": {
+   "env_probe": {
+    "before": "120 MHz, 197.54 W, 32",
+    "after": "1965 MHz, 256.42 W, 34"
+   },
+   "ok": true,
+   "ms": 0.766944020986557,
+   "lo": 0.7638400495052338,
+   "hi": 0.7730432212352754,
+   "fwd_ms": 0.3124159872531891,
+   "tflops": 896.0168520200839
+  },
+  "4096": {
+   "env_probe": {
+    "before": "1965 MHz, 256.36 W, 34",
+    "after": "1965 MHz, 507.33 W, 36"
+   },
+   "ok": true,
+   "ms": 2.6490238904953003,
+   "lo": 2.6347519159317017,
+   "hi": 2.7104960680007935,
+   "fwd_ms": 1.1868480443954468,
+   "tflops": 1037.657334576189
+  },
+  "8192": {
+   "env_probe": {
+    "before": "1965 MHz, 502.87 W, 36",
+    "after": "1965 MHz, 518.06 W, 36"
+   },
+   "ok": true,
+   "ms": 9.93073558807373,
+   "lo": 9.785939311981203,
+   "hi": 10.026015758514404,
+   "fwd_ms": 4.571135997772217,
+   "tflops": 1107.1804480389683
+  },
+  "16384": {
+   "env_probe": {
+    "before": "1965 MHz, 494.09 W, 36",
+    "after": "1965 MHz, 522.32 W, 37"
+   },
+   "ok": true,
+   "ms": 38.55057716369629,
+   "lo": 37.60093879699707,
+   "hi": 40.516705703735354,
+   "fwd_ms": 18.182191848754883,
+   "tflops": 1140.8510156485315
+  }
+ },
+ "skc_bwd_default": {
+  "2048": {
+   "env_probe": {
+    "before": "120 MHz, 195.65 W, 29",
+    "after": "1965 MHz, 524.26 W, 36"
+   },
+   "ok": true,
+   "ms": 3.3065119981765747,
+   "lo": 3.3012351512908937,
+   "hi": 3.3135680198669433,
+   "tflops": 207.83071942244993
+  },
+  "4096": {
+   "env_probe": {
+    "before": "1965 MHz, 513.23 W, 33",
+    "after": "1965 MHz, 524.45 W, 37"
+   },
+   "ok": true,
+   "ms": 12.503135681152344,
+   "lo": 12.466285133361817,
+   "hi": 12.519437026977538,
+   "tflops": 219.84717590352986
+  },
+  "8192": {
+   "env_probe": {
+    "before": "1965 MHz, 513.73 W, 34",
+    "after": "1965 MHz, 531.56 W, 38"
+   },
+   "ok": true,
+   "ms": 47.76041603088379,
+   "lo": 47.74523391723633,
+   "hi": 47.77354202270507,
+   "tflops": 230.21399710274966
+  },
+  "16384": {
+   "env_probe": {
+    "before": "1965 MHz, 525.90 W, 35",
+    "after": "1965 MHz, 533.81 W, 38"
+   },
+   "ok": true,
+   "ms": 186.55438232421875,
+   "lo": 186.53780212402344,
+   "hi": 186.57096252441409,
+   "tflops": 235.75144450160897
+  }
+ },
+ "skc_bwd_q3": {
+  "16384": {
+   "env_probe": {
+    "before": "120 MHz, 195.79 W, 29",
+    "after": "1965 MHz, 257.35 W, 31"
+   },
+   "ok": false,
+   "reason": "OutOfResources: out of resource: shared memory, Required: 246448, Hardware limit: 232448. Reducing block sizes or `num_stages` may help."
+  }
+ },
+ "skc_bwd_q4": {
+  "16384": {
+   "env_probe": {
+    "before": "1965 MHz, 257.39 W, 31",
+    "after": "1965 MHz, 274.51 W, 31"
+   },
+   "ok": false,
+   "reason": "OutOfResources: out of resource: shared memory, Required: 279216, Hardware limit: 232448. Reducing block sizes or `num_stages` may help."
+  }
+ },
+ "skc_bwd_jos": {
+  "2048": {
+   "env_probe": {
+    "before": "120 MHz, 195.59 W, 29",
+    "after": "1965 MHz, 524.29 W, 34"
+   },
+   "ok": true,
+   "ms": 3.307487964630127,
+   "lo": 3.3014336109161375,
+   "hi": 3.3156735420227053,
+   "tflops": 207.76939317959037
+  },
+  "4096": {
+   "env_probe": {
+    "before": "1965 MHz, 513.15 W, 34",
+    "after": "1965 MHz, 523.61 W, 37"
+   },
+   "ok": true,
+   "ms": 12.50716781616211,
+   "lo": 12.483027267456055,
+   "hi": 12.540742492675781,
+   "tflops": 219.77630026583245
+  },
+  "8192": {
+   "env_probe": {
+    "before": "1965 MHz, 518.07 W, 34",
+    "after": "1965 MHz, 533.27 W, 38"
+   },
+   "ok": true,
+   "ms": 47.759904861450195,
+   "lo": 47.75178756713867,
+   "hi": 47.77771530151367,
+   "tflops": 230.2164610598879
+  },
+  "16384": {
+   "env_probe": {
+    "before": "1965 MHz, 527.36 W, 35",
+    "after": "1965 MHz, 535.53 W, 39"
+   },
+   "ok": true,
+   "ms": 186.6291961669922,
+   "lo": 186.62054443359375,
+   "hi": 186.63784790039062,
+   "tflops": 235.65693907660153
+  }
+ }
+}
