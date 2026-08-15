@@ -238,156 +238,18 @@ def _duplicate_rows_to_workitems(rows):
 
 @triton.jit
 def _reduce_score_registers(registers0, registers1):
-    """Match Wave's scalar component reduction before the lane-half exchange."""
-    (
-        value00,
-        value01,
-        value02,
-        value03,
-        value04,
-        value05,
-        value06,
-        value07,
-        value08,
-        value09,
-        value10,
-        value11,
-        value12,
-        value13,
-        value14,
-        value15,
-    ) = _split_last_16(registers0)
-    (
-        value16,
-        value17,
-        value18,
-        value19,
-        value20,
-        value21,
-        value22,
-        value23,
-        value24,
-        value25,
-        value26,
-        value27,
-        value28,
-        value29,
-        value30,
-        value31,
-    ) = _split_last_16(registers1)
-    local_sum = value00 + value01
-    local_sum += value02
-    local_sum += value03
-    local_sum += value04
-    local_sum += value05
-    local_sum += value06
-    local_sum += value07
-    local_sum += value08
-    local_sum += value09
-    local_sum += value10
-    local_sum += value11
-    local_sum += value12
-    local_sum += value13
-    local_sum += value14
-    local_sum += value15
-    local_sum += value16
-    local_sum += value17
-    local_sum += value18
-    local_sum += value19
-    local_sum += value20
-    local_sum += value21
-    local_sum += value22
-    local_sum += value23
-    local_sum += value24
-    local_sum += value25
-    local_sum += value26
-    local_sum += value27
-    local_sum += value28
-    local_sum += value29
-    local_sum += value30
-    local_sum += value31
-
-    # workitem = warp * 64 + lane.  Reshape it so lane bit 5 becomes
-    # the two-element reduction axis, exactly matching Wave's xor-32 exchange.
-    lane_halves = local_sum.reshape([8, 2, 32]).permute(0, 2, 1)
-    lane_halves = lane_halves.reshape([BLOCK_M, 2])
-    return _duplicate_rows_to_workitems(tl.reduce(lane_halves, 1, _sum_combine))
+    scores0 = _registers_to_mfma_packet(registers0)
+    scores1 = _registers_to_mfma_packet(registers1)
+    scores = _join_last_2(scores0, scores1)
+    return _duplicate_rows_to_workitems(tl.sum(scores, axis=1))
 
 
 @triton.jit
 def _reduce_max_score_registers(registers0, registers1):
-    """Compute one NaN-propagating maximum for each 64-column score row."""
-    (
-        value00,
-        value01,
-        value02,
-        value03,
-        value04,
-        value05,
-        value06,
-        value07,
-        value08,
-        value09,
-        value10,
-        value11,
-        value12,
-        value13,
-        value14,
-        value15,
-    ) = _split_last_16(registers0)
-    (
-        value16,
-        value17,
-        value18,
-        value19,
-        value20,
-        value21,
-        value22,
-        value23,
-        value24,
-        value25,
-        value26,
-        value27,
-        value28,
-        value29,
-        value30,
-        value31,
-    ) = _split_last_16(registers1)
-    local_max = tl.maximum(value00, value01, propagate_nan=tl.PropagateNan.ALL)
-    local_max = tl.maximum(local_max, value02, propagate_nan=tl.PropagateNan.ALL)
-    local_max = tl.maximum(local_max, value03, propagate_nan=tl.PropagateNan.ALL)
-    local_max = tl.maximum(local_max, value04, propagate_nan=tl.PropagateNan.ALL)
-    local_max = tl.maximum(local_max, value05, propagate_nan=tl.PropagateNan.ALL)
-    local_max = tl.maximum(local_max, value06, propagate_nan=tl.PropagateNan.ALL)
-    local_max = tl.maximum(local_max, value07, propagate_nan=tl.PropagateNan.ALL)
-    local_max = tl.maximum(local_max, value08, propagate_nan=tl.PropagateNan.ALL)
-    local_max = tl.maximum(local_max, value09, propagate_nan=tl.PropagateNan.ALL)
-    local_max = tl.maximum(local_max, value10, propagate_nan=tl.PropagateNan.ALL)
-    local_max = tl.maximum(local_max, value11, propagate_nan=tl.PropagateNan.ALL)
-    local_max = tl.maximum(local_max, value12, propagate_nan=tl.PropagateNan.ALL)
-    local_max = tl.maximum(local_max, value13, propagate_nan=tl.PropagateNan.ALL)
-    local_max = tl.maximum(local_max, value14, propagate_nan=tl.PropagateNan.ALL)
-    local_max = tl.maximum(local_max, value15, propagate_nan=tl.PropagateNan.ALL)
-    local_max = tl.maximum(local_max, value16, propagate_nan=tl.PropagateNan.ALL)
-    local_max = tl.maximum(local_max, value17, propagate_nan=tl.PropagateNan.ALL)
-    local_max = tl.maximum(local_max, value18, propagate_nan=tl.PropagateNan.ALL)
-    local_max = tl.maximum(local_max, value19, propagate_nan=tl.PropagateNan.ALL)
-    local_max = tl.maximum(local_max, value20, propagate_nan=tl.PropagateNan.ALL)
-    local_max = tl.maximum(local_max, value21, propagate_nan=tl.PropagateNan.ALL)
-    local_max = tl.maximum(local_max, value22, propagate_nan=tl.PropagateNan.ALL)
-    local_max = tl.maximum(local_max, value23, propagate_nan=tl.PropagateNan.ALL)
-    local_max = tl.maximum(local_max, value24, propagate_nan=tl.PropagateNan.ALL)
-    local_max = tl.maximum(local_max, value25, propagate_nan=tl.PropagateNan.ALL)
-    local_max = tl.maximum(local_max, value26, propagate_nan=tl.PropagateNan.ALL)
-    local_max = tl.maximum(local_max, value27, propagate_nan=tl.PropagateNan.ALL)
-    local_max = tl.maximum(local_max, value28, propagate_nan=tl.PropagateNan.ALL)
-    local_max = tl.maximum(local_max, value29, propagate_nan=tl.PropagateNan.ALL)
-    local_max = tl.maximum(local_max, value30, propagate_nan=tl.PropagateNan.ALL)
-    local_max = tl.maximum(local_max, value31, propagate_nan=tl.PropagateNan.ALL)
-
-    lane_halves = local_max.reshape([8, 2, 32]).permute(0, 2, 1)
-    lane_halves = lane_halves.reshape([BLOCK_M, 2])
-    return _duplicate_rows_to_workitems(tl.reduce(lane_halves, 1, _max_combine))
+    scores0 = _registers_to_mfma_packet(registers0)
+    scores1 = _registers_to_mfma_packet(registers1)
+    scores = _join_last_2(scores0, scores1)
+    return _duplicate_rows_to_workitems(tl.max(scores, axis=1))
 
 
 @triton.jit
