@@ -1961,6 +1961,33 @@ def test_tlx_wave_packet_relation_uses_proven_invariant_logical_bits():
             )
 
 
+def test_tlx_wave_emits_exact_and_proven_equivalent_layout_relations(tmp_path):
+    preamble = """
+#source = #ttg.linear<{register = [], lane = [[0, 1, 0], [0, 2, 0], [0, 4, 0], [0, 8, 0], [0, 16, 0], [0, 0, 1]], warp = [[1, 0, 0], [2, 0, 0], [4, 0, 0]], block = []}>
+#result = #ttg.linear<{register = [[0, 0, 1]], lane = [[0, 1, 0], [0, 2, 0], [0, 4, 0], [0, 8, 0], [0, 16, 0], [0, 0, 0]], warp = [[1, 0, 0], [2, 0, 0], [4, 0, 0]], block = []}>
+"""
+    local_func = """
+  tt.func public @converter_proven_equivalent_layout_relation() attributes {noinline = false} {
+    %value = arith.constant dense<1.000000e+00> : tensor<8x32x2xf32, #source>
+    %converted = ttg.convert_layout %value {tlx.source_invariant_bits = array<i32: 8>} : tensor<8x32x2xf32, #source> -> tensor<8x32x2xf32, #result>
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=8, preamble=preamble)
+
+    output = _convert_ttgir_to_wave_keep_dead(mod)
+
+    (convert_op, ) = [op for op in output.target_program.ops if op.kind == "layout_convert"]
+    attrs = converter_target_ir.attrs_dict(convert_op)
+    assert attrs["relation"] != attrs["equivalent_relation"]
+    wave = output.emitted_module.text
+    assert wave.count("wave.redistribute") == 1
+    assert "equivalent_relation = #wave.redistribution" in wave
+    assert 'source_item = "item"' in wave
+    _run_wave_verify(wave)
+    del ctx
+
+
 def test_tlx_wave_packet_relation_normalizes_projected_physical_coordinate():
     source_linear = LinearLayout.from_bases(
         [

@@ -3992,25 +3992,35 @@ def _convert_layout(builder, conversion_input, type_layout_program, op):
         op,
         type_layout_program,
     )
-    source_invariant_bits = op.attrs.get("tlx.source_invariant_bits")
-    if source_invariant_bits is not None:
-        source_invariant_bits = tuple(int(value) for value in source_invariant_bits)
     relation = _packet_relation_attrs(
         type_layout_program,
         op.operands,
         op.results,
-        source_invariant_bits=source_invariant_bits,
         op=op,
     )[0]
+    source_invariant_bits = op.attrs.get("tlx.source_invariant_bits")
+    equivalent_relation = None
+    if source_invariant_bits is not None:
+        source_invariant_bits = tuple(int(value) for value in source_invariant_bits)
+        equivalent_relation = _packet_relation_attrs(
+            type_layout_program,
+            op.operands,
+            op.results,
+            source_invariant_bits=source_invariant_bits,
+            op=op,
+        )[0]
+    attrs = {
+        "fact_policy": "invalidate_layout_sensitive",
+        "relation": relation,
+        "transform": "identity",
+    }
+    if equivalent_relation is not None and equivalent_relation != relation:
+        attrs["equivalent_relation"] = equivalent_relation
     builder.add_op(
         "layout_convert",
         operands=_operand_target_ids(builder, op),
         results=result_target_ids,
-        attrs={
-            "fact_policy": "invalidate_layout_sensitive",
-            "relation": relation,
-            "transform": "identity",
-        },
+        attrs=attrs,
         layout_map_ids=result_layout_map_ids,
         source_op_index=op.index,
     )
