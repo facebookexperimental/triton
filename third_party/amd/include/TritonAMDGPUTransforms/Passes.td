@@ -477,4 +477,32 @@ def TritonAMDGPUSchedGroupBarrierScheduler
                            "mlir::triton::amdgpu::TritonAMDGPUDialect"];
 }
 
+def TritonAMDGPUDumpPlanValueGraph
+    : Pass<"tritonamdgpu-dump-plan-value-graph", "mlir::ModuleOp"> {
+  let summary =
+      "Dump stable TTGIR operation/value identities and value lineage";
+
+  let description = [{
+    Runs after the final structured TTGIR scheduling pass and before SCFToCF.
+    The pass is analysis-only: it does not modify the module. It emits a JSON
+    sidecar containing stable semantic operation/value IDs, structured-loop
+    iteration-distance edges, and lineage through slice/reshape/transpose/
+    layout-conversion operations. Logical tensor byte counts are explicitly
+    not physical VGPR allocation estimates.
+  }];
+
+  let options = [
+    Option<"outputPath", "output-path", "std::string",
+           /*default=*/"\"-\"",
+           "JSON file, directory, or '-' for stdout.">,
+    Option<"strict", "strict", "bool", /*default=*/"false",
+           "Fail when lineage cannot be represented without an error diagnostic.">,
+  ];
+
+  let dependentDialects = ["mlir::triton::TritonDialect",
+                           "mlir::triton::gpu::TritonGPUDialect",
+                           "mlir::triton::amdgpu::TritonAMDGPUDialect",
+                           "mlir::scf::SCFDialect"];
+}
+
 #endif

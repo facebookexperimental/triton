@@ -8,6 +8,7 @@ add_triton_library(TritonAMDGPUTransforms
   ConvertToBufferOps.cpp
   ConvertToTensorOps.cpp
   DotDecomposeAndSchedule.cpp
+  DumpPlanValueGraph.cpp
   SchedGroupBarrierScheduler.cpp
   LowerBarrierOps.cpp
   OptimizeBufferOpPtr.cpp
@@ -40,6 +41,8 @@ add_triton_library(TritonAMDGPUTransforms
   TritonInstrumentTransforms
   TritonInstrumentIR
 )
+
+target_link_libraries(TritonAMDGPUTransforms PUBLIC TritonAnalysis)
 
 target_include_directories(TritonAMDGPUTransforms PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/../../include)
 target_include_directories(TritonAMDGPUTransforms PUBLIC ${CMAKE_CURRENT_BINARY_DIR}/../../include)

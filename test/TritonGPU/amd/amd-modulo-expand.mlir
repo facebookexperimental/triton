@@ -5,6 +5,23 @@
 // RUN:   -tritonamdgpu-dot-decompose-and-schedule=mode=modulo 2>/dev/null \
 // RUN:   | triton-opt -split-input-file -tritonamdgpu-pipeline 2>&1 \
 // RUN:   | FileCheck %s
+// RUN: triton-opt %s -tritonamdgpu-dump-plan-value-graph='output-path=- strict=true' \
+// RUN:   -o /dev/null | FileCheck %s --check-prefix=PLAN
+// RUN: triton-opt %s -tritonamdgpu-dump-plan-value-graph='output-path=- strict=true' \
+// RUN:   -o /dev/null > %t.plan.original
+// RUN: sed 's/%a_ptrs/%renamed_ptrs/g; s/%a_ld/%renamed_load/g' %s \
+// RUN:   | triton-opt -tritonamdgpu-dump-plan-value-graph='output-path=- strict=true' \
+// RUN:     -o /dev/null > %t.plan.renamed
+// RUN: diff %t.plan.original %t.plan.renamed
+// RUN: triton-opt %s -o %t.no-analysis.mlir
+// RUN: triton-opt %s \
+// RUN:   -tritonamdgpu-dump-plan-value-graph='output-path=%t.plan.json strict=true' \
+// RUN:   -o %t.with-analysis.mlir
+// RUN: diff %t.no-analysis.mlir %t.with-analysis.mlir
+// RUN: triton-opt %S/../../Conversion/amd/in_thread_transpose.mlir \
+// RUN:   -split-input-file \
+// RUN:   -tritonamdgpu-dump-plan-value-graph='output-path=- strict=true' \
+// RUN:   -o /dev/null | FileCheck %s --check-prefix=PLAN-TRANSPOSE
 //
 // Modulo runs before the guarded legacy scheduler. A successful modulo schedule
 // is preserved; the standard AMD pipeline lowers and expands it.
@@ -20,6 +37,19 @@
 // CHECK:         tt.load
 // CHECK:         ttg.convert_layout {{.*}}tensor<256x64xf16, #blocked>
 // CHECK:         tt.dot
+
+// PLAN-DAG: "schema_version": "plan-value-graph/0.1"
+// PLAN-DAG: "kind": "loop_init"
+// PLAN-DAG: "iteration_distance": 1
+// PLAN-DAG: "kind": "loop_backedge"
+// PLAN-DAG: "kind": "loop_exit"
+// PLAN-DAG: "kind": "loop_forward"
+// PLAN-DAG: "kind": "branch_yield"
+// PLAN-DAG: "kind": "convert_layout"
+// PLAN-DAG: "logical_bytes": 262144
+// PLAN-DAG: "physical_register_bytes": null
+// PLAN-DAG: "artifact_stage": "final_structured_ttgir"
+// PLAN-TRANSPOSE: "kind": "in_thread_transpose"
 
 #mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [2, 2], instrShape = [16, 16, 32], isTransposed = true}>
 #dot0 = #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 8}>
@@ -42,5 +72,25 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
       scf.yield %d : tensor<256x256xf32, #mma>
     }
     tt.return %res : tensor<256x256xf32, #mma>
+  }
+
+  tt.func @structured_control(%cond: i1, %initial: i32) -> i32 {
+    %c1 = arith.constant 1 : i32
+    %selected = scf.if %cond -> i32 {
+      %then = arith.addi %initial, %c1 : i32
+      scf.yield %then : i32
+    } else {
+      %else = arith.subi %initial, %c1 : i32
+      scf.yield %else : i32
+    }
+    %result = scf.while (%iter = %selected) : (i32) -> i32 {
+      %keep_going = arith.cmpi slt, %iter, %initial : i32
+      scf.condition(%keep_going) %iter : i32
+    } do {
+    ^bb0(%iter: i32):
+      %next = arith.addi %iter, %c1 : i32
+      scf.yield %next : i32
+    }
+    tt.return %result : i32
   }
 }

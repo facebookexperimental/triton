@@ -480,6 +480,9 @@ class HIPBackend(BaseBackend):
         pm.enable_debug()
         amd.passes.ttgpuir.add_update_async_wait_count(pm, options.arch)
         amd.passes.ttgpuir.add_warp_pipeline_conversion(pm, options.arch)
+        plan_analysis_dir = os.environ.get("TRITON_TLX_PLAN_ANALYSIS_DIR")
+        if plan_analysis_dir:
+            amd.passes.ttgpuir.add_dump_plan_value_graph(pm, plan_analysis_dir, True)
         passes.convert.add_scf_to_cf(pm)
         passes.gluon.add_inliner(pm)
         passes.convert.add_index_to_llvmir(pm)

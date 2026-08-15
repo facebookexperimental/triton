@@ -4,6 +4,7 @@ add_triton_library(TritonAnalysis
   BufferRegion.cpp
   Membar.cpp
   Alias.cpp
+  PlanValueGraph.cpp
   Utility.cpp
   ReductionOrder.cpp
 
@@ -18,6 +19,7 @@ add_triton_library(TritonAnalysis
   LINK_LIBS PUBLIC
   MLIRAnalysis
   MLIRLLVMDialect
+  MLIRSCFDialect
   TritonIR
   TritonGPUIR
   GluonIR
