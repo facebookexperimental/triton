@@ -86,6 +86,36 @@ public:
   }
 };
 
+// A warp ballot consumes one physical predicate from every lane; it does not
+// require the predicates to use the default blocked encoding.  Conversion to
+// that encoding is both semantically redundant and potentially expensive: a
+// one-value-per-lane slice of an MMA layout can otherwise be redistributed
+// through shared memory solely to feed the ballot.  Preserve any producer
+// layout that already satisfies the operation's physical ownership contract.
+class FoldWarpBallotLayoutConversion
+    : public mlir::OpRewritePattern<ttg::WarpBallotOp> {
+public:
+  using OpRewritePattern::OpRewritePattern;
+
+  mlir::LogicalResult
+  matchAndRewrite(ttg::WarpBallotOp ballot,
+                  mlir::PatternRewriter &rewriter) const override {
+    auto convert = ballot.getPred().getDefiningOp<ttg::ConvertLayoutOp>();
+    if (!convert)
+      return failure();
+    auto sourceType = dyn_cast<RankedTensorType>(convert.getSrc().getType());
+    if (!sourceType || !sourceType.getEncoding() ||
+        ttg::getTotalElemsPerThread(sourceType) != 1)
+      return failure();
+
+    rewriter.modifyOpInPlace(
+        ballot, [&] { ballot.getPredMutable().assign(convert.getSrc()); });
+    if (convert->use_empty())
+      rewriter.eraseOp(convert);
+    return success();
+  }
+};
+
 // A tensor-backed local_alloc/local_load pair is only a materialization of a
 // register layout conversion.  When the source and load are in the same block,
 // the conversion is unconditionally executed after the source becomes
@@ -881,6 +911,7 @@ public:
     RewritePatternSet patterns(context);
     patterns.add<RequireLayoutPattern>(context);
     patterns.add<ReleaseLayoutPattern>(context);
+    patterns.add<FoldWarpBallotLayoutConversion>(context);
     patterns.add<FoldRetaggedLocalAllocLoad>(context);
     patterns.add<FoldLocalAllocLoadFallback>(context);
     patterns.add<HoistWarpPredicateLayoutConversions>(context);
