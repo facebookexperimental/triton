@@ -3808,6 +3808,79 @@ void insertAsyncComm(
           }
         }
 
+        // A TMEM store that publishes an MMA operand does not need its own
+        // loop-carried empty wait when an overlapping, whole-allocation MMA
+        // overwrite already orders the reuse cycle.  FA fwd's QK/P alias is
+        // the canonical shape:
+        //
+        //   gemm task:    QK MMA(i) ... PV MMA(i)
+        //   softmax task: QK load(i) ... P store(i)
+        //
+        // The two operations in each row are in one task, and the QK-full
+        // channel orders the rows.  Consequently PV MMA(i) -> QK MMA(i+1) ->
+        // QK load(i+1) -> P store(i+1) already protects P from overwrite.
+        // Adding another producer-acquire before P store is redundant and can
+        // wait on a stale phase when the logical QK and P channels have been
+        // folded onto the same physical TMEM allocation.
+        //
+        // Keep this narrowly structural: require an overlapping reuse-group
+        // owner that freshly overwrites the whole slot, both same-task program
+        // order edges, and all four endpoints in the same loop.  Accumulator
+        // read-modify-write cycles do not satisfy these conditions and retain
+        // their producer-acquire.
+        bool orderedByWholeTmemOverwrite = false;
+        if (addCompletionBarrier && !producerAcquireForChannelLoop &&
+            !backwardChannelForLoop && reuseGrp2 >= 0 &&
+            isa<ttng::TMEMStoreOp>(headProducer)) {
+          auto allocRange = [](Operation *alloc) {
+            int64_t offset = 0;
+            if (auto attr = alloc->getAttrOfType<IntegerAttr>("buffer.offset"))
+              offset = attr.getInt();
+            auto type = cast<ttg::MemDescType>(alloc->getResult(0).getType());
+            int64_t columns = ttng::getTmemAllocSizes(type).numCols;
+            return std::pair<int64_t, int64_t>{offset, offset + columns};
+          };
+          auto *group = config->getGroup(reuseGrp2);
+          auto producerLoop = headProducer->getParentOfType<scf::ForOp>();
+          for (Channel *sibling : group->channels) {
+            if (sibling == masterChannel || sibling->defunct ||
+                !isWholeAllocationOverwriteReuseOwner(sibling))
+              continue;
+            auto [masterLo, masterHi] = allocRange(masterChannel->getAllocOp());
+            auto [ownerLo, ownerHi] = allocRange(sibling->getAllocOp());
+            if (masterLo >= ownerHi || ownerLo >= masterHi)
+              continue;
+            auto ownerMma =
+                dyn_cast<ttng::MMAv5OpInterface>(sibling->getSrcOp());
+            Operation *ownerLoad = sibling->getDstOp();
+            if (!ownerMma || !isa<ttng::TMEMLoadOp>(ownerLoad) ||
+                ownerMma.getOperation() == mmaOp.getOperation())
+              continue;
+            if (!producerLoop ||
+                ownerLoad->getParentOfType<scf::ForOp>() != producerLoop ||
+                ownerMma->getParentOfType<scf::ForOp>() != producerLoop ||
+                mmaOp->getParentOfType<scf::ForOp>() != producerLoop)
+              continue;
+            if (ownerMma->getBlock() != mmaOp->getBlock() ||
+                ownerLoad->getBlock() != headProducer->getBlock() ||
+                !withSameTask(ownerMma.getOperation(), mmaOp.getOperation()) ||
+                !withSameTask(ownerLoad, headProducer) ||
+                !appearsBefore(ownerMma.getOperation(), mmaOp.getOperation()) ||
+                !appearsBefore(ownerLoad, headProducer))
+              continue;
+            orderedByWholeTmemOverwrite = true;
+            LLVM_DEBUG({
+              LDBG("operand publication channel " << masterChannel->uniqID
+                                                  << " is ordered by whole "
+                                                     "TMEM overwrite channel "
+                                                  << sibling->uniqID
+                                                  << "; skip redundant "
+                                                     "producer-acquire");
+            });
+            break;
+          }
+        }
+
         if (hasGuardChannel) {
           // The guard channel provides the tmem_load → tmem_store
           // dependency. Create a token-based synchronization:
@@ -3913,10 +3986,13 @@ void insertAsyncComm(
             // writer lets a correction task race the remaining MMAs.
             completionMmaOverride = backwardChannelForLoop->getSrcOp();
           }
-          desyncMMAv5Op(builder, mmaOp, consumerBarrier, bufferIdx, phase,
-                        producerAcquirePoint, true, addCompletionBarrier,
-                        waitConstraints, releaseOnLastIterOnly,
-                        completionMmaOverride);
+          auto waitOp = desyncMMAv5Op(
+              builder, mmaOp, consumerBarrier, bufferIdx, phase,
+              producerAcquirePoint, true, addCompletionBarrier, waitConstraints,
+              releaseOnLastIterOnly, completionMmaOverride);
+          if (orderedByWholeTmemOverwrite)
+            waitOp->setAttr("ttng.redundant_publication_wait",
+                            UnitAttr::get(funcOp.getContext()));
         }
       }
     }
