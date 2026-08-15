@@ -1632,7 +1632,7 @@ def _verify_layout_transform(op, target_program):
         "split": frozenset({"relations"}),
     }
     if op.kind == "layout_convert":
-        allowed = {"equivalent_relation", "fact_policy", "relation", "transform"}
+        allowed = {"fact_policy", "relation", "transform"}
         if attrs.get("transform") == "trans":
             allowed.add("order")
         allowed_attrs["layout_convert"] = frozenset(allowed)
@@ -1652,17 +1652,6 @@ def _verify_layout_transform(op, target_program):
             "TLXW_VERIFY_LAYOUT_RELATION",
             STAGE,
             f"{op.kind} requires one closed serialized relation map per result",
-            target_op_id=op.target_op_id,
-        )
-    equivalent_relation = attrs.get("equivalent_relation")
-    if equivalent_relation is not None and (not isinstance(equivalent_relation, tuple) or not equivalent_relation
-                                            or any(
-                                                type(byte) is not int or not 0 <= byte <= 255
-                                                for byte in equivalent_relation)):
-        fail(
-            "TLXW_VERIFY_LAYOUT_RELATION",
-            STAGE,
-            "layout_convert equivalent relation must be a closed serialized relation map",
             target_op_id=op.target_op_id,
         )
     expected_counts = {
