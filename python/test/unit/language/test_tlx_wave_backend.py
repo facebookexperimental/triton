@@ -11964,8 +11964,8 @@ def test_tlx_wave_converter_keeps_partial_masked_buffer_load_to_local_scalar(tmp
     assert wave.count("wave.scatter") == 2
     assert wave.index("wave.where") < wave.index("wave.gather")
     machine = _run_waveamd_to_machine(wave)
-    assert "waveamdmachine.buffer_load_b16" in machine
-    assert machine.count("waveamdmachine.exec_if") == 1, machine
+    assert machine.count("waveamdmachine.buffer_load_b16") == attrs["component_count"], machine
+    assert machine.count("waveamdmachine.exec_if") == attrs["component_count"], machine
     del ctx
 
 
