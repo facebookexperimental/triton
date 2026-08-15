@@ -301,7 +301,7 @@ def _load_value_fragment(
 
 
 @aggregate
-class SoftmaxPending:
+class ExponentiatedScores:
     registers0: tl.tensor
     registers1: tl.tensor
 
@@ -312,6 +312,48 @@ class ProbabilityFragments:
     p1: tl.tensor
     p2: tl.tensor
     p3: tl.tensor
+
+
+@aggregate
+class ValueFragments:
+    v00: tl.tensor
+    v01: tl.tensor
+    v02: tl.tensor
+    v03: tl.tensor
+    v10: tl.tensor
+    v11: tl.tensor
+    v12: tl.tensor
+    v13: tl.tensor
+    v20: tl.tensor
+    v21: tl.tensor
+    v22: tl.tensor
+    v23: tl.tensor
+    v30: tl.tensor
+    v31: tl.tensor
+    v32: tl.tensor
+    v33: tl.tensor
+
+
+@triton.jit
+def _exponentiate_adaptive_scores(
+    registers0,
+    registers1,
+    reference,
+    qk_scale: tl.constexpr,
+):
+    # Keep the scale and translation as a multiply-add expression.  The global
+    # fast-math policy permits contraction, so Wave can form the same FMA as its
+    # native FA implementation without a kernel-specific bridge operation.
+    if qk_scale < 0.0:
+        logits0 = registers0 - reference[:, None]
+        logits1 = registers1 - reference[:, None]
+    else:
+        logits0 = registers0 * qk_scale - reference[:, None]
+        logits1 = registers1 * qk_scale - reference[:, None]
+    return ExponentiatedScores(
+        tl.math.exp2(logits0),
+        tl.math.exp2(logits1),
+    )
 
 
 @aggregate
@@ -382,32 +424,23 @@ class SoftmaxState:
                     reference,
                     self.row_sum,
                 )
-            # Keep the scale and translation as a multiply-add expression.
-            # The global fast-math policy permits contraction, so Wave can
-            # form the same FMA as its native FA implementation without a
-            # kernel-specific fused operation in the bridge.
-            if qk_scale < 0.0:
-                registers0 = score_registers0 - reference[:, None]
-                registers1 = score_registers1 - reference[:, None]
-            else:
-                registers0 = score_registers0 * qk_scale - reference[:, None]
-                registers1 = score_registers1 * qk_scale - reference[:, None]
+            exponentiated_scores = _exponentiate_adaptive_scores(
+                score_registers0,
+                score_registers1,
+                reference,
+                qk_scale,
+            )
         else:
             score0, score1 = _split_last_2(scores)
             score0 = score0 * qk_scale + (-log2_score_bound)
             score1 = score1 * qk_scale + (-log2_score_bound)
             registers0 = _mfma_packet_to_registers(score0)
             registers1 = _mfma_packet_to_registers(score1)
-
-        registers0 = tl.math.exp2(registers0)
-        registers1 = tl.math.exp2(registers1)
-        return (
-            state,
-            SoftmaxPending(
-                registers0,
-                registers1,
-            ),
-        )
+            exponentiated_scores = ExponentiatedScores(
+                tl.math.exp2(registers0),
+                tl.math.exp2(registers1),
+            )
+        return state, exponentiated_scores
 
     @triton.jit
     def prepare_adaptive_pending(
@@ -431,20 +464,14 @@ class SoftmaxState:
             tile_max,
         )
         reference = tl.where(needs_rebase, candidate, self.row_max)
-        if qk_scale < 0.0:
-            registers0 = score_registers0 - reference[:, None]
-            registers1 = score_registers1 - reference[:, None]
-        else:
-            registers0 = score_registers0 * qk_scale - reference[:, None]
-            registers1 = score_registers1 * qk_scale - reference[:, None]
-
-        registers0 = tl.math.exp2(registers0)
-        registers1 = tl.math.exp2(registers1)
+        exponentiated_scores = _exponentiate_adaptive_scores(
+            score_registers0,
+            score_registers1,
+            reference,
+            qk_scale,
+        )
         return (
-            SoftmaxPending(
-                registers0,
-                registers1,
-            ),
+            exponentiated_scores,
             reference,
             needs_rebase,
         )
@@ -463,11 +490,11 @@ class SoftmaxState:
     @triton.jit
     def finish(
         self,
-        pending,
+        exponentiated_scores,
         out_dtype: tl.constexpr,
     ):
-        registers0 = pending.registers0
-        registers1 = pending.registers1
+        registers0 = exponentiated_scores.registers0
+        registers1 = exponentiated_scores.registers1
         tile_sum = _reduce_score_registers(
             registers0,
             registers1,
@@ -529,7 +556,7 @@ def _load_value_fragments(
     wait_token,
     v_layout: tl.constexpr,
 ):
-    return (
+    return ValueFragments(
         _load_value_fragment(value_view, wait_token, 0, 0, 16, 32, v_layout),
         _load_value_fragment(value_view, wait_token, 0, 32, 16, 32, v_layout),
         _load_value_fragment(value_view, wait_token, 0, 64, 16, 32, v_layout),
@@ -552,7 +579,7 @@ def _load_value_fragments(
 @triton.jit
 def _accumulate_prefix_body(
     state,
-    probabilities,
+    probability_fragments,
     value_fragments,
     next_scores,
     p_layout: tl.constexpr,
@@ -568,55 +595,37 @@ def _accumulate_prefix_body(
     only the three-instruction prefix; Wave remains free to interleave the
     remaining independent MFMAs with the next tile's bounded-softmax work.
     """
-    p0 = probabilities.p0
-    p1 = probabilities.p1
-    p2 = probabilities.p2
-    p3 = probabilities.p3
-    (
-        v00,
-        v01,
-        v02,
-        v03,
-        v10,
-        v11,
-        v12,
-        v13,
-        v20,
-        v21,
-        v22,
-        v23,
-        v30,
-        v31,
-        v32,
-        v33,
-    ) = value_fragments
+    p0 = probability_fragments.p0
+    p1 = probability_fragments.p1
+    p2 = probability_fragments.p2
+    p3 = probability_fragments.p3
     acc0 = state.acc0
     acc1 = state.acc1
     acc2 = state.acc2
     acc3 = state.acc3
 
-    acc0 = _pv_mfma(p0, v00, acc0, p_layout, v_layout, mma_layout)
-    acc1 = _pv_mfma(p0, v01, acc1, p_layout, v_layout, mma_layout)
-    acc2 = _pv_mfma(p0, v02, acc2, p_layout, v_layout, mma_layout)
+    acc0 = _pv_mfma(p0, value_fragments.v00, acc0, p_layout, v_layout, mma_layout)
+    acc1 = _pv_mfma(p0, value_fragments.v01, acc1, p_layout, v_layout, mma_layout)
+    acc2 = _pv_mfma(p0, value_fragments.v02, acc2, p_layout, v_layout, mma_layout)
     tlx.sched_barrier()
-    acc3 = _pv_mfma(p0, v03, acc3, p_layout, v_layout, mma_layout)
-    acc0 = _pv_mfma(p1, v10, acc0, p_layout, v_layout, mma_layout)
-    acc1 = _pv_mfma(p1, v11, acc1, p_layout, v_layout, mma_layout)
-    acc2 = _pv_mfma(p1, v12, acc2, p_layout, v_layout, mma_layout)
-    acc3 = _pv_mfma(p1, v13, acc3, p_layout, v_layout, mma_layout)
+    acc3 = _pv_mfma(p0, value_fragments.v03, acc3, p_layout, v_layout, mma_layout)
+    acc0 = _pv_mfma(p1, value_fragments.v10, acc0, p_layout, v_layout, mma_layout)
+    acc1 = _pv_mfma(p1, value_fragments.v11, acc1, p_layout, v_layout, mma_layout)
+    acc2 = _pv_mfma(p1, value_fragments.v12, acc2, p_layout, v_layout, mma_layout)
+    acc3 = _pv_mfma(p1, value_fragments.v13, acc3, p_layout, v_layout, mma_layout)
     if ADAPTIVE_REFERENCE:
-        pending, reference, needs_rebase = state.prepare_adaptive_pending(
+        exponentiated_scores, reference, needs_rebase = state.prepare_adaptive_pending(
             next_scores,
             qk_scale,
         )
-    acc0 = _pv_mfma(p2, v20, acc0, p_layout, v_layout, mma_layout)
-    acc1 = _pv_mfma(p2, v21, acc1, p_layout, v_layout, mma_layout)
-    acc2 = _pv_mfma(p2, v22, acc2, p_layout, v_layout, mma_layout)
-    acc3 = _pv_mfma(p2, v23, acc3, p_layout, v_layout, mma_layout)
-    acc0 = _pv_mfma(p3, v30, acc0, p_layout, v_layout, mma_layout)
-    acc1 = _pv_mfma(p3, v31, acc1, p_layout, v_layout, mma_layout)
-    acc2 = _pv_mfma(p3, v32, acc2, p_layout, v_layout, mma_layout)
-    acc3 = _pv_mfma(p3, v33, acc3, p_layout, v_layout, mma_layout)
+    acc0 = _pv_mfma(p2, value_fragments.v20, acc0, p_layout, v_layout, mma_layout)
+    acc1 = _pv_mfma(p2, value_fragments.v21, acc1, p_layout, v_layout, mma_layout)
+    acc2 = _pv_mfma(p2, value_fragments.v22, acc2, p_layout, v_layout, mma_layout)
+    acc3 = _pv_mfma(p2, value_fragments.v23, acc3, p_layout, v_layout, mma_layout)
+    acc0 = _pv_mfma(p3, value_fragments.v30, acc0, p_layout, v_layout, mma_layout)
+    acc1 = _pv_mfma(p3, value_fragments.v31, acc1, p_layout, v_layout, mma_layout)
+    acc2 = _pv_mfma(p3, value_fragments.v32, acc2, p_layout, v_layout, mma_layout)
+    acc3 = _pv_mfma(p3, value_fragments.v33, acc3, p_layout, v_layout, mma_layout)
     state = SoftmaxState(
         acc0,
         acc1,
@@ -628,7 +637,7 @@ def _accumulate_prefix_body(
     if ADAPTIVE_REFERENCE:
         return (
             state.commit_adaptive_reference(reference, needs_rebase),
-            pending,
+            exponentiated_scores,
         )
     return state.prepare(
         next_scores,
@@ -642,50 +651,32 @@ def _accumulate_prefix_body(
 @triton.jit
 def _accumulate_value_fragments(
     state,
-    probabilities,
+    probability_fragments,
     value_fragments,
     p_layout: tl.constexpr,
     v_layout: tl.constexpr,
     mma_layout: tl.constexpr,
 ):
-    p0 = probabilities.p0
-    p1 = probabilities.p1
-    p2 = probabilities.p2
-    p3 = probabilities.p3
-    (
-        v00,
-        v01,
-        v02,
-        v03,
-        v10,
-        v11,
-        v12,
-        v13,
-        v20,
-        v21,
-        v22,
-        v23,
-        v30,
-        v31,
-        v32,
-        v33,
-    ) = value_fragments
-    acc0 = _pv_mfma(p0, v00, state.acc0, p_layout, v_layout, mma_layout)
-    acc1 = _pv_mfma(p0, v01, state.acc1, p_layout, v_layout, mma_layout)
-    acc2 = _pv_mfma(p0, v02, state.acc2, p_layout, v_layout, mma_layout)
-    acc3 = _pv_mfma(p0, v03, state.acc3, p_layout, v_layout, mma_layout)
-    acc0 = _pv_mfma(p1, v10, acc0, p_layout, v_layout, mma_layout)
-    acc1 = _pv_mfma(p1, v11, acc1, p_layout, v_layout, mma_layout)
-    acc2 = _pv_mfma(p1, v12, acc2, p_layout, v_layout, mma_layout)
-    acc3 = _pv_mfma(p1, v13, acc3, p_layout, v_layout, mma_layout)
-    acc0 = _pv_mfma(p2, v20, acc0, p_layout, v_layout, mma_layout)
-    acc1 = _pv_mfma(p2, v21, acc1, p_layout, v_layout, mma_layout)
-    acc2 = _pv_mfma(p2, v22, acc2, p_layout, v_layout, mma_layout)
-    acc3 = _pv_mfma(p2, v23, acc3, p_layout, v_layout, mma_layout)
-    acc0 = _pv_mfma(p3, v30, acc0, p_layout, v_layout, mma_layout)
-    acc1 = _pv_mfma(p3, v31, acc1, p_layout, v_layout, mma_layout)
-    acc2 = _pv_mfma(p3, v32, acc2, p_layout, v_layout, mma_layout)
-    acc3 = _pv_mfma(p3, v33, acc3, p_layout, v_layout, mma_layout)
+    p0 = probability_fragments.p0
+    p1 = probability_fragments.p1
+    p2 = probability_fragments.p2
+    p3 = probability_fragments.p3
+    acc0 = _pv_mfma(p0, value_fragments.v00, state.acc0, p_layout, v_layout, mma_layout)
+    acc1 = _pv_mfma(p0, value_fragments.v01, state.acc1, p_layout, v_layout, mma_layout)
+    acc2 = _pv_mfma(p0, value_fragments.v02, state.acc2, p_layout, v_layout, mma_layout)
+    acc3 = _pv_mfma(p0, value_fragments.v03, state.acc3, p_layout, v_layout, mma_layout)
+    acc0 = _pv_mfma(p1, value_fragments.v10, acc0, p_layout, v_layout, mma_layout)
+    acc1 = _pv_mfma(p1, value_fragments.v11, acc1, p_layout, v_layout, mma_layout)
+    acc2 = _pv_mfma(p1, value_fragments.v12, acc2, p_layout, v_layout, mma_layout)
+    acc3 = _pv_mfma(p1, value_fragments.v13, acc3, p_layout, v_layout, mma_layout)
+    acc0 = _pv_mfma(p2, value_fragments.v20, acc0, p_layout, v_layout, mma_layout)
+    acc1 = _pv_mfma(p2, value_fragments.v21, acc1, p_layout, v_layout, mma_layout)
+    acc2 = _pv_mfma(p2, value_fragments.v22, acc2, p_layout, v_layout, mma_layout)
+    acc3 = _pv_mfma(p2, value_fragments.v23, acc3, p_layout, v_layout, mma_layout)
+    acc0 = _pv_mfma(p3, value_fragments.v30, acc0, p_layout, v_layout, mma_layout)
+    acc1 = _pv_mfma(p3, value_fragments.v31, acc1, p_layout, v_layout, mma_layout)
+    acc2 = _pv_mfma(p3, value_fragments.v32, acc2, p_layout, v_layout, mma_layout)
+    acc3 = _pv_mfma(p3, value_fragments.v33, acc3, p_layout, v_layout, mma_layout)
     return SoftmaxState(
         acc0,
         acc1,
@@ -835,7 +826,7 @@ def _wait_stage_end(PENDING: tl.constexpr, tokens):
 @triton.jit
 def _score_phase(
     state,
-    probabilities,
+    exponentiated_scores,
     current_ready,
     q,
     k_buffer,
@@ -851,8 +842,8 @@ def _score_phase(
         layout=k_layout,
         relaxed=True,
     )
-    state, p_dot = state.finish(
-        probabilities,
+    state, probability_fragments = state.finish(
+        exponentiated_scores,
         q.dtype,
     )
     _stage_end()
@@ -864,13 +855,13 @@ def _score_phase(
     next_scores = tl.dot(q, current_k, score_acc)
     next_scores = tlx.release_layout(next_scores)
     q = tlx.release_layout(q)
-    return state, p_dot, next_scores
+    return state, probability_fragments, next_scores
 
 
 @triton.jit
 def _warp_pipeline_phase(
     state,
-    probabilities,
+    exponentiated_scores,
     q,
     k_ptrs,
     v_ptrs,
@@ -910,8 +901,8 @@ def _warp_pipeline_phase(
             layout=k_layout,
             relaxed=True,
         )
-        state, p_dot = state.finish(
-            probabilities,
+        state, probability_fragments = state.finish(
+            exponentiated_scores,
             q.dtype,
         )
 
@@ -941,9 +932,9 @@ def _warp_pipeline_phase(
         )
 
     with tlx.warp_pipeline_stage("pv"):
-        state, probabilities = _accumulate_prefix_body(
+        state, next_exponentiated_scores = _accumulate_prefix_body(
             state,
-            p_dot,
+            probability_fragments,
             value_fragments,
             next_scores,
             p_layout,
@@ -964,7 +955,7 @@ def _warp_pipeline_phase(
 
     return (
         state,
-        probabilities,
+        next_exponentiated_scores,
         next_k_ready,
         prefetched_v_ready,
         future_v_ready,
@@ -1018,7 +1009,7 @@ def _pipeline(
     scores = tl.dot(q, k0, score_acc)
     scores = tlx.release_layout(scores)
     _stage_end()
-    state, probabilities = state.prepare(
+    state, exponentiated_scores = state.prepare(
         scores,
         qk_scale,
         log2_score_bound,
@@ -1046,13 +1037,13 @@ def _pipeline(
     )
     (
         state,
-        probabilities,
+        exponentiated_scores,
         k_ready3,
         previous_v_ready,
         prefetched_v_ready,
     ) = _warp_pipeline_phase(
         state,
-        probabilities,
+        exponentiated_scores,
         q,
         k_ptrs,
         v_ptrs,
@@ -1077,13 +1068,13 @@ def _pipeline(
     for first_tile in tl.range(1, tile_count - 3, 4, num_stages=0):
         (
             state,
-            probabilities,
+            exponentiated_scores,
             k_ready0,
             previous_v_ready,
             prefetched_v_ready,
         ) = _warp_pipeline_phase(
             state,
-            probabilities,
+            exponentiated_scores,
             q,
             k_ptrs,
             v_ptrs,
@@ -1107,13 +1098,13 @@ def _pipeline(
         )
         (
             state,
-            probabilities,
+            exponentiated_scores,
             k_ready1,
             previous_v_ready,
             prefetched_v_ready,
         ) = _warp_pipeline_phase(
             state,
-            probabilities,
+            exponentiated_scores,
             q,
             k_ptrs,
             v_ptrs,
@@ -1137,13 +1128,13 @@ def _pipeline(
         )
         (
             state,
-            probabilities,
+            exponentiated_scores,
             k_ready2,
             previous_v_ready,
             prefetched_v_ready,
         ) = _warp_pipeline_phase(
             state,
-            probabilities,
+            exponentiated_scores,
             q,
             k_ptrs,
             v_ptrs,
@@ -1167,13 +1158,13 @@ def _pipeline(
         )
         (
             state,
-            probabilities,
+            exponentiated_scores,
             k_ready3,
             previous_v_ready,
             prefetched_v_ready,
         ) = _warp_pipeline_phase(
             state,
-            probabilities,
+            exponentiated_scores,
             q,
             k_ptrs,
             v_ptrs,
@@ -1202,9 +1193,9 @@ def _pipeline(
 
     v_ready_nm2 = prefetched_v_ready
     ready_nm3 = _wait_stage_end(2, [k_ready2, previous_v_ready])
-    state, p_dot, next_scores = _score_phase(
+    state, probability_fragments, next_scores = _score_phase(
         state,
-        probabilities,
+        exponentiated_scores,
         ready_nm3,
         q,
         k_buffer,
@@ -1220,9 +1211,9 @@ def _pipeline(
         v_layout,
     )
     _stage_end()
-    state, probabilities = _accumulate_prefix_body(
+    state, exponentiated_scores = _accumulate_prefix_body(
         state,
-        p_dot,
+        probability_fragments,
         value_fragments,
         next_scores,
         p_layout,
@@ -1242,9 +1233,9 @@ def _pipeline(
         32,
     )
     ready_nm2 = _wait_stage_end(1, [k_ready3, v_ready_nm2])
-    state, p_dot, next_scores = _score_phase(
+    state, probability_fragments, next_scores = _score_phase(
         state,
-        probabilities,
+        exponentiated_scores,
         ready_nm2,
         q,
         k_buffer,
@@ -1260,9 +1251,9 @@ def _pipeline(
         v_layout,
     )
     _stage_end()
-    state, probabilities = _accumulate_prefix_body(
+    state, exponentiated_scores = _accumulate_prefix_body(
         state,
-        p_dot,
+        probability_fragments,
         value_fragments,
         next_scores,
         p_layout,
@@ -1273,8 +1264,8 @@ def _pipeline(
         ADAPTIVE_REFERENCE,
     )
 
-    state, p_dot = state.finish(
-        probabilities,
+    state, probability_fragments = state.finish(
+        exponentiated_scores,
         q.dtype,
     )
     ready_nm1 = _wait_stage_end(0, [v_ready_nm1])
@@ -1286,7 +1277,7 @@ def _pipeline(
     _stage_end()
     state = _accumulate_value_fragments(
         state,
-        p_dot,
+        probability_fragments,
         value_fragments,
         p_layout,
         v_layout,
@@ -1500,25 +1491,7 @@ def _storage_ranges_overlap(lhs, rhs):
     return lhs_begin < rhs_end and rhs_begin < lhs_end
 
 
-def attention(
-    q,
-    k,
-    v,
-    sm_scale=None,
-    causal=False,
-    *,
-    qk_max_abs=None,
-    out=None,
-    warmup=False,
-    **compiler_options,
-):
-    """Run the separate eight-wave attention kernel.
-
-    The default adaptive reference is numerically stable for unrestricted
-    inputs.  ``qk_max_abs`` explicitly selects the bounded specialization.
-    ``out`` may be exactly ``q``, but it must not partially overlap ``q`` or
-    overlap any part of ``k`` or ``v``.
-    """
+def _validate_attention_inputs(q, k, v, causal, compiler_options):
     reserved_options = sorted(RESERVED_LAUNCH_OPTIONS.intersection(compiler_options))
     if reserved_options:
         names = ", ".join(reserved_options)
@@ -1552,7 +1525,10 @@ def attention(
         raise ValueError(f"amd_fa_wave batch stride ({batch_stride}) and last element offset "
                          f"({last_element_offset}) must not exceed the signed-i32 address limit "
                          f"({MAX_SIGNED_I32})")
+    return batch, heads, sequence, head_dim
 
+
+def _resolve_softmax_reference(head_dim, sm_scale, qk_max_abs):
     if sm_scale is None:
         sm_scale = 1.0 / math.sqrt(head_dim)
     sm_scale = float(sm_scale)
@@ -1560,18 +1536,22 @@ def attention(
         raise ValueError("sm_scale must be finite")
     adaptive_reference = qk_max_abs is None
     if adaptive_reference:
-        log2_score_bound = 0.0
-    else:
-        if not math.isfinite(qk_max_abs) or qk_max_abs <= 0:
-            raise ValueError("qk_max_abs must be finite and greater than zero")
-        if qk_max_abs >= MAX_QK_ABS_FOR_FINITE_F32_DOT:
-            raise ValueError(f"qk_max_abs ({qk_max_abs:g}) exceeds the conservative raw FP32 QK limit "
-                             f"({MAX_QK_ABS_FOR_FINITE_F32_DOT:g}) for head dimension 128")
-        log2_score_bound = (math.log2(math.e) * head_dim * abs(sm_scale) * qk_max_abs * qk_max_abs)
-        log2_score_span = 2.0 * abs(log2_score_bound)
-        if not math.isfinite(log2_score_span) or log2_score_span >= FIXED_REFERENCE_MAX_LOG2_SPAN:
-            raise ValueError(f"fixed-reference log2 score span ({log2_score_span:g}) must be less than "
-                             f"{FIXED_REFERENCE_MAX_LOG2_SPAN:g}; use qk_max_abs=None for adaptive softmax")
+        return sm_scale, True, 0.0
+
+    if not math.isfinite(qk_max_abs) or qk_max_abs <= 0:
+        raise ValueError("qk_max_abs must be finite and greater than zero")
+    if qk_max_abs >= MAX_QK_ABS_FOR_FINITE_F32_DOT:
+        raise ValueError(f"qk_max_abs ({qk_max_abs:g}) exceeds the conservative raw FP32 QK limit "
+                         f"({MAX_QK_ABS_FOR_FINITE_F32_DOT:g}) for head dimension 128")
+    log2_score_bound = math.log2(math.e) * head_dim * abs(sm_scale) * qk_max_abs * qk_max_abs
+    log2_score_span = 2.0 * abs(log2_score_bound)
+    if not math.isfinite(log2_score_span) or log2_score_span >= FIXED_REFERENCE_MAX_LOG2_SPAN:
+        raise ValueError(f"fixed-reference log2 score span ({log2_score_span:g}) must be less than "
+                         f"{FIXED_REFERENCE_MAX_LOG2_SPAN:g}; use qk_max_abs=None for adaptive softmax")
+    return sm_scale, False, log2_score_bound
+
+
+def _prepare_output(q, k, v, out):
     if out is None:
         output = torch.empty_like(q)
     else:
@@ -1592,7 +1572,10 @@ def attention(
         raise ValueError("amd_fa_wave out must not overlap v")
     if _storage_ranges_overlap(output, q) and not output.is_set_to(q):
         raise ValueError("amd_fa_wave out may overlap q only when it is exactly the same tensor view")
-    grid = (sequence // 256, batch * heads, 1)
+    return output
+
+
+def _build_launch_options(batch, heads, sequence, sm_scale, log2_score_bound, adaptive_reference, compiler_options):
     launch_options = {
         **compiler_options,
         "N_CTX": sequence,
@@ -1606,6 +1589,41 @@ def attention(
     }
     if triton.runtime.driver.active.get_current_target().backend == "tlx_wave":
         launch_options.setdefault("tlx_wave_enable_multi_wave_specialize", False)
+    return launch_options
+
+
+def attention(
+    q,
+    k,
+    v,
+    sm_scale=None,
+    causal=False,
+    *,
+    qk_max_abs=None,
+    out=None,
+    warmup=False,
+    **compiler_options,
+):
+    """Run the separate eight-wave attention kernel.
+
+    The default adaptive reference is numerically stable for unrestricted
+    inputs.  ``qk_max_abs`` explicitly selects the bounded specialization.
+    ``out`` may be exactly ``q``, but it must not partially overlap ``q`` or
+    overlap any part of ``k`` or ``v``.
+    """
+    batch, heads, sequence, head_dim = _validate_attention_inputs(q, k, v, causal, compiler_options)
+    sm_scale, adaptive_reference, log2_score_bound = _resolve_softmax_reference(head_dim, sm_scale, qk_max_abs)
+    output = _prepare_output(q, k, v, out)
+    grid = (sequence // 256, batch * heads, 1)
+    launch_options = _build_launch_options(
+        batch,
+        heads,
+        sequence,
+        sm_scale,
+        log2_score_bound,
+        adaptive_reference,
+        compiler_options,
+    )
 
     args = (q, k, v, output)
     if warmup:
