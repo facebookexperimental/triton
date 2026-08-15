@@ -93,16 +93,6 @@ RESERVED_LAUNCH_OPTIONS = frozenset({
 
 
 @triton.jit
-def _sum_combine(lhs, rhs):
-    return lhs + rhs
-
-
-@triton.jit
-def _max_combine(lhs, rhs):
-    return tl.maximum(lhs, rhs, propagate_nan=tl.PropagateNan.ALL)
-
-
-@triton.jit
 def _split_last_2(value):
     rows: tl.constexpr = value.shape[0]
     columns: tl.constexpr = value.shape[1]
@@ -115,33 +105,6 @@ def _split_last_4(value):
     value0, value1 = _split_last_2(lower)
     value2, value3 = _split_last_2(upper)
     return value0, value1, value2, value3
-
-
-@triton.jit
-def _split_last_16(value):
-    value0, value1, value2, value3 = _split_last_4(value)
-    value00, value01, value02, value03 = _split_last_4(value0)
-    value04, value05, value06, value07 = _split_last_4(value1)
-    value08, value09, value10, value11 = _split_last_4(value2)
-    value12, value13, value14, value15 = _split_last_4(value3)
-    return (
-        value00,
-        value01,
-        value02,
-        value03,
-        value04,
-        value05,
-        value06,
-        value07,
-        value08,
-        value09,
-        value10,
-        value11,
-        value12,
-        value13,
-        value14,
-        value15,
-    )
 
 
 @triton.jit
