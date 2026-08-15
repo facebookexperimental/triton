@@ -589,11 +589,11 @@ def _accumulate_prefix_body(
     log2_score_bound: tl.constexpr,
     ADAPTIVE_REFERENCE: tl.constexpr,
 ):
-    """Accumulate one PV tile using the standalone kernel's 3+13 split.
+    """Accumulate one PV tile with a short scheduling prefix.
 
-    The split exposes individual MFMA candidates to Wave.  The barrier fixes
-    only the three-instruction prefix; Wave remains free to interleave the
-    remaining independent MFMAs with the next tile's bounded-softmax work.
+    Keeping only the first MFMA in the prefix exposes the rest of the PV work
+    to Wave while shortening the following QK/load region.  The barrier is a
+    scheduling boundary only; it does not change workgroup synchronization.
     """
     p0 = probability_fragments.p0
     p1 = probability_fragments.p1
@@ -605,9 +605,9 @@ def _accumulate_prefix_body(
     acc3 = state.acc3
 
     acc0 = _pv_mfma(p0, value_fragments.v00, acc0, p_layout, v_layout, mma_layout)
+    tlx.sched_barrier()
     acc1 = _pv_mfma(p0, value_fragments.v01, acc1, p_layout, v_layout, mma_layout)
     acc2 = _pv_mfma(p0, value_fragments.v02, acc2, p_layout, v_layout, mma_layout)
-    tlx.sched_barrier()
     acc3 = _pv_mfma(p0, value_fragments.v03, acc3, p_layout, v_layout, mma_layout)
     acc0 = _pv_mfma(p1, value_fragments.v10, acc0, p_layout, v_layout, mma_layout)
     acc1 = _pv_mfma(p1, value_fragments.v11, acc1, p_layout, v_layout, mma_layout)
