@@ -1420,6 +1420,7 @@ def _packet_relation_attrs(
         transform="identity",
         axis=None,
         order=(),
+        source_invariant_bits=None,
         op,
 ):
     values = type_layout_program.values
@@ -1441,6 +1442,7 @@ def _packet_relation_attrs(
             transform=transform,
             axis=axis,
             order=order,
+            source_invariant_bits=source_invariant_bits,
         )
     except ValueError as exc:
         fail(
@@ -3990,7 +3992,16 @@ def _convert_layout(builder, conversion_input, type_layout_program, op):
         op,
         type_layout_program,
     )
-    relation = _packet_relation_attrs(type_layout_program, op.operands, op.results, op=op)[0]
+    source_invariant_bits = op.attrs.get("tlx.source_invariant_bits")
+    if source_invariant_bits is not None:
+        source_invariant_bits = tuple(int(value) for value in source_invariant_bits)
+    relation = _packet_relation_attrs(
+        type_layout_program,
+        op.operands,
+        op.results,
+        source_invariant_bits=source_invariant_bits,
+        op=op,
+    )[0]
     builder.add_op(
         "layout_convert",
         operands=_operand_target_ids(builder, op),

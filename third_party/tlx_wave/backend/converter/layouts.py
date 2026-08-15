@@ -717,6 +717,7 @@ def packet_layout_relations(
         transform="identity",
         axis=None,
         order=(),
+        source_invariant_bits=None,
 ):
     sources = tuple(sources)
     results = tuple(results)
@@ -729,6 +730,8 @@ def packet_layout_relations(
     lane_widths = {int(layout.lane_width) for layout in (*sources, *results)}
     if len(lane_widths) != 1:
         raise ValueError("packet redistribution requires equal source/result lane widths")
+    if source_invariant_bits is not None and transform != "identity":
+        raise ValueError("source invariants are supported only for identity packet redistribution")
 
     if transform == "join":
         first, second = sources
@@ -762,6 +765,7 @@ def packet_layout_relations(
             axis=axis,
             order=order,
             selector=selector if transform == "split" else None,
+            source_invariant_bits=source_invariant_bits,
         ) for selector, result in enumerate(results))
 
 
@@ -1305,6 +1309,7 @@ def _packet_relation_blob(
         axis=None,
         order=(),
         selector=None,
+        source_invariant_bits=None,
 ):
     if source is None or result is None:
         raise ValueError("packet redistribution requires distributed linear layouts")
@@ -1381,7 +1386,11 @@ def _packet_relation_blob(
         if same_layout:
             mapped = dict(result_physical)
         elif binary_layouts:
-            relation = _preferred_packet_relation(source, destination)
+            relation = _preferred_packet_relation(
+                source,
+                destination,
+                source_invariant_bits=source_invariant_bits,
+            )
             mapped = _symbolic_layout_formula(dsl, relation, packet)
             for name in _PACKET_PHYSICAL_DIMS:
                 if _packet_relation_output_is_direct(relation, name):
@@ -1968,14 +1977,36 @@ def _preferred_packet_solution(equations, rhs, source_columns, destination_colum
     return solution
 
 
-def _preferred_packet_relation(source, destination):
+def _preferred_packet_relation(
+    source,
+    destination,
+    *,
+    source_invariant_bits=None,
+):
     source_columns = _packet_layout_columns(source)
     equations = _packet_source_equations(source, source_columns)
+    logical_bits = sum(int(extent).bit_length() - 1 for _name, extent in source.out_dims)
+    ignored_bits = set()
+    if source_invariant_bits is not None:
+        source_invariant_bits = tuple(map(int, source_invariant_bits))
+        if len(set(source_invariant_bits)) != len(source_invariant_bits):
+            raise ValueError("source invariant logical bits must be unique")
+        if any(bit < 0 or bit >= logical_bits for bit in source_invariant_bits):
+            raise ValueError("source invariant logical bit is outside the packet layout")
+        ignored_bits.update(source_invariant_bits)
+    active_bits = tuple(bit for bit in range(logical_bits) if bit not in ignored_bits)
+    if ignored_bits:
+        equations = tuple(equations[bit] for bit in active_bits)
     destination_columns = _packet_layout_columns(destination)
+
+    def quotient_coordinate(basis):
+        coordinate = _flatten_packet_coordinate(source, basis)
+        return sum(((coordinate >> bit) & 1) << quotient_bit for quotient_bit, bit in enumerate(active_bits))
+
     solutions = tuple(
         _preferred_packet_solution(
             equations,
-            _flatten_packet_coordinate(source, basis),
+            quotient_coordinate(basis),
             source_columns,
             column,
         ) for column, basis in destination_columns)
