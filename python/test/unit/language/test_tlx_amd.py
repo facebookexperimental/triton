@@ -42,8 +42,15 @@ from triton.language.extra.tlx.tutorials.gfx9_gemm.inter_wave.a4w4.matmul_kernel
     BLOCK_N as _A4W4_INTER_WAVE_BLOCK_N,
     MIN_K as _A4W4_INTER_WAVE_MIN_K,
     _a4w4_8wave_kernel as _a4w4_inter_wave_256tile_kernel,
+    _a4w4_8wave_merged_scales_kernel as _a4w4_inter_wave_merged_scales_kernel,
+    _a4w4_8wave_preshuffled_scales_kernel as _a4w4_inter_wave_preshuffled_scales_kernel,
     _A4W4_8WAVE_LLVM_FN_ATTRS,
     matmul as _a4w4_inter_wave_matmul,
+    matmul_merged_scales as _a4w4_inter_wave_matmul_merged_scales,
+    matmul_preshuffled as _a4w4_inter_wave_matmul_preshuffled,
+    preshuffle_mxfp4_a_scales as _preshuffle_a4w4_a_scales,
+    preshuffle_mxfp4_b_scales as _preshuffle_a4w4_b_scales,
+    preshuffle_mxfp4_scales as _preshuffle_a4w4_scales,
     select_matmul_path as _select_a4w4_inter_wave_path,
 )
 
@@ -3047,17 +3054,23 @@ def test_a4w4_shape_stride_layouts_compile_gfx950(device, tmp_path):
     assert "buffer_store_dwordx4" in amdgcn
 
 
-def _compile_a4w4_inter_wave_256tile(m, n, k):
+def _compile_a4w4_inter_wave_256tile(m, n, k, preshuffled_scales=False):
     grid_mn = triton.cdiv(m, _A4W4_INTER_WAVE_BLOCK_M) * triton.cdiv(n, _A4W4_INTER_WAVE_BLOCK_N)
     a = MockTensor(torch.uint8, (m, k // 2))
     b = MockTensor(torch.uint8, (n, k // 2))
     c = MockTensor(torch.bfloat16, (m, n))
-    a_scales = MockTensor(torch.uint8, (m, k // 32))
-    b_scales = MockTensor(torch.uint8, (n, k // 32))
+    a_scales = MockTensor(torch.uint8, (m * k // 32, ) if preshuffled_scales else (m, k // 32))
+    b_scales = MockTensor(torch.uint8, (n * k // 32, ) if preshuffled_scales else (n, k // 32))
+    kernel = (
+        _a4w4_inter_wave_preshuffled_scales_kernel
+        if preshuffled_scales
+        else _a4w4_inter_wave_256tile_kernel
+    )
+    scale_strides = () if preshuffled_scales else (1, m, 1, n)
 
     with knobs.runtime.scope():
         knobs.runtime.override_arch = "gfx950"
-        return _a4w4_inter_wave_256tile_kernel.warmup(
+        return kernel.warmup(
             a,
             b,
             c,
@@ -3074,10 +3087,47 @@ def _compile_a4w4_inter_wave_256tile(m, n, k):
             1,
             n,
             1,
-            1,
+            *scale_strides,
+            BLOCK_M=_A4W4_INTER_WAVE_BLOCK_M,
+            BLOCK_N=_A4W4_INTER_WAVE_BLOCK_N,
+            BLOCK_K=_A4W4_INTER_WAVE_BLOCK_K,
+            GROUP_SIZE_M=4,
+            NUM_XCDS=8,
+            GRID_MN=grid_mn,
+            SPLIT_K=1,
+            grid=(grid_mn, ),
+            num_warps=8,
+            num_stages=1,
+            matrix_instr_nonkdim=16,
+            llvm_fn_attrs=_A4W4_8WAVE_LLVM_FN_ATTRS,
+        )
+
+
+def _compile_a4w4_inter_wave_merged_scales(m, n, k):
+    grid_mn = triton.cdiv(m, _A4W4_INTER_WAVE_BLOCK_M) * triton.cdiv(n, _A4W4_INTER_WAVE_BLOCK_N)
+    a = MockTensor(torch.uint8, (m, k // 2))
+    b = MockTensor(torch.uint8, (n, k // 2))
+    c = MockTensor(torch.bfloat16, (m, n))
+    scales = MockTensor(torch.uint8, ((m + n) * k // 32, ))
+
+    with knobs.runtime.scope():
+        knobs.runtime.override_arch = "gfx950"
+        return _a4w4_inter_wave_merged_scales_kernel.warmup(
+            a,
+            b,
+            c,
+            c,
+            scales,
             m,
+            n,
+            k,
+            k // _A4W4_INTER_WAVE_BLOCK_K,
+            k // 2,
+            1,
+            k // 2,
             1,
             n,
+            1,
             BLOCK_M=_A4W4_INTER_WAVE_BLOCK_M,
             BLOCK_N=_A4W4_INTER_WAVE_BLOCK_N,
             BLOCK_K=_A4W4_INTER_WAVE_BLOCK_K,
@@ -3170,6 +3220,58 @@ def test_a4w4_inter_wave_256tile_single_trip_codegen_gfx950(device, fresh_triton
     assert ".vgpr_spill_count: 1" in amdgcn
 
 
+def test_a4w4_inter_wave_preshuffled_scale_codegen_gfx950(device, fresh_triton_cache):
+    """The fastest prepacked ABI coalesces both A halves into one b128 read."""
+    compiled = _compile_a4w4_inter_wave_256tile(768, 768, 1536, preshuffled_scales=True)
+    ttgir = compiled.asm["ttgir"]
+    amdgcn = compiled.asm["amdgcn"]
+
+    assert "#tlx.user_layout" not in ttgir
+    assert "#tlx.no_verify_layout" not in ttgir
+    assert ttgir.count("amdg.buffer_load_to_local") == 24
+    assert "buffer_load_dwordx2" not in amdgcn
+    assert len(re.findall(r"^\s*buffer_load_[^\n]*\blds\s*$", amdgcn, re.MULTILINE)) == 40
+    assert "ds_read_b64_tr_b8" not in amdgcn
+    assert len(re.findall(r"^\s*ds_read_b64\b", amdgcn, re.MULTILINE)) == 4
+    assert len(re.findall(r"^\s*ds_read_b128\b", amdgcn, re.MULTILINE)) == 116
+    assert len(re.findall(r"^\s*ds_read", amdgcn, re.MULTILINE)) == 120
+    assert compiled.metadata.shared == 143232
+    assert compiled.metadata.global_scratch_size == 0
+    assert ".private_segment_fixed_size: 0" in amdgcn
+    assert ".vgpr_spill_count: 0" in amdgcn
+
+
+def test_a4w4_inter_wave_merged_scale_codegen_gfx950(device, fresh_triton_cache):
+    """The merged ABI combines wide scale DMA with conflict-free A b128 reads."""
+    compiled = _compile_a4w4_inter_wave_merged_scales(768, 768, 1536)
+    ttgir = compiled.asm["ttgir"]
+    amdgcn = compiled.asm["amdgcn"]
+
+    assert "#tlx.user_layout" not in ttgir
+    assert "#tlx.no_verify_layout" not in ttgir
+    assert ttgir.count("amdg.buffer_load_to_local") == 18
+    assert "ttg.memdesc_reinterpret" in ttgir
+    assert len(re.findall(r"^\s*buffer_load_[^\n]*\blds\s*$", amdgcn, re.MULTILINE)) == 34
+    assert len(re.findall(r"^\s*buffer_load_dwordx4[^\n]*\blds\s*$", amdgcn, re.MULTILINE)) == 34
+    assert len(re.findall(r"^\s*ds_read_b64_tr_b8\b", amdgcn, re.MULTILINE)) == 4
+    assert "ds_read_b64 " not in amdgcn
+    assert len(re.findall(r"^\s*ds_read_b128\b", amdgcn, re.MULTILINE)) == 116
+    assert len(re.findall(r"^\s*ds_read", amdgcn, re.MULTILINE)) == 120
+    assert "v_perm_b32" not in amdgcn
+    # Refilling immediately after the second-half reads starts the next pair one
+    # stage earlier. This deliberately pays a RAW-to-refill wait/barrier; moving
+    # the copy across the next existing barrier shortens DMA latency hiding and
+    # regresses both measured benchmark shapes.
+    assert len(re.findall(r"^\s*s_waitcnt\b", amdgcn, re.MULTILINE)) == 66
+    assert len(re.findall(r"^\s*s_barrier\s*$", amdgcn, re.MULTILINE)) == 42
+    assert compiled.metadata.shared == 143232
+    assert compiled.metadata.global_scratch_size == 0
+    assert ".private_segment_fixed_size: 0" in amdgcn
+    assert ".sgpr_count:     58" in amdgcn
+    assert ".sgpr_spill_count: 0" in amdgcn
+    assert ".vgpr_spill_count: 0" in amdgcn
+
+
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
 def test_a4w4_shape_stride_layouts_correctness_gfx950(device):
     m = n = 256
@@ -3180,13 +3282,40 @@ def test_a4w4_shape_stride_layouts_correctness_gfx950(device):
         torch.testing.assert_close(actual, expected, atol=0.1, rtol=0.0)
 
 
-@pytest.mark.parametrize("k", [1536, 2048])
+@pytest.mark.parametrize("k, split_k", [(1024, 1), (4096, 2)])
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
-def test_a4w4_inter_wave_256tile_correctness_gfx950(device, k):
-    # A 2x33 grid exceeds the skinny-dispatch threshold, so these neighboring K
-    # values exercise the 8-wave 256x256 path with two and three main-loop trips.
+def test_a4w4_inter_wave_preshuffled_scale_correctness_gfx950(device, k, split_k):
+    m = n = 256
+    a, b, a_scales, b_scales = _generate_a4w4_inputs(m, n, k)
+    a_scales_preshuffled = _preshuffle_a4w4_a_scales(a_scales)
+    b_scales_preshuffled = _preshuffle_a4w4_b_scales(b_scales)
+    actual = _a4w4_inter_wave_matmul_preshuffled(
+        a, b, a_scales_preshuffled, b_scales_preshuffled, SPLIT_K=split_k)
+    expected = _a4w4_reference(a, b, a_scales, b_scales)
+    torch.testing.assert_close(actual, expected, atol=0.0, rtol=0.0)
+
+
+@pytest.mark.parametrize("k, split_k", [(1024, 1), (4096, 2)])
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_a4w4_inter_wave_merged_scale_correctness_gfx950(device, k, split_k):
+    m = n = 256
+    a, b, a_scales, b_scales = _generate_a4w4_inputs(m, n, k)
+    scales = _preshuffle_a4w4_scales(a_scales, b_scales)
+    actual = _a4w4_inter_wave_matmul_merged_scales(a, b, scales, SPLIT_K=split_k)
+    expected = _a4w4_reference(a, b, a_scales, b_scales)
+    torch.testing.assert_close(actual, expected, atol=0.0, rtol=0.0)
+
+
+@pytest.mark.parametrize(
+    "k, expected_path",
+    [(1536, "intra_wave_256x256"), (2048, "inter_wave_256x256")],
+)
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_a4w4_inter_wave_large_grid_dispatch_correctness_gfx950(device, k, expected_path):
+    # A 2x33 grid exceeds the skinny threshold. K=1536 selects the measured
+    # lower-overhead 4-wave path; K=2048 selects the 8-wave pipeline.
     m, n = 512, 8448
-    assert _select_a4w4_inter_wave_path(m, n, k) == "inter_wave_256x256"
+    assert _select_a4w4_inter_wave_path(m, n, k) == expected_path
     a, b, a_scales, b_scales = _generate_a4w4_inputs(m, n, k)
     actual = _a4w4_inter_wave_matmul(a, b, a_scales, b_scales)
     expected = _a4w4_reference(a, b, a_scales, b_scales)
@@ -3195,18 +3324,14 @@ def test_a4w4_inter_wave_256tile_correctness_gfx950(device, k):
 
 @pytest.mark.parametrize("m, n", [(256, 16640), (512, 8448)])
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
-def test_a4w4_inter_wave_256tile_single_trip_stress_gfx950(device, m, n):
-    # K=1024 has four K tiles: two are prefetched and one two-tile main-loop
-    # step consumes/refills the ring before the two-tile drain.
+def test_a4w4_short_k_dispatch_stress_gfx950(device, m, n):
     # Both public shapes exceed the skinny threshold by the smallest possible
-    # grid margins and cover different multi-CTA grids through the dispatcher.
+    # grid margins. K=1024 must dispatch to the measured 4-wave path.
     k = _A4W4_INTER_WAVE_MIN_K
     grid_mn = triton.cdiv(m, _A4W4_INTER_WAVE_BLOCK_M) * triton.cdiv(n, _A4W4_INTER_WAVE_BLOCK_N)
-    iter_max = k // _A4W4_INTER_WAVE_BLOCK_K
-    main_trips = len(range(0, iter_max - 2, 2))
     assert grid_mn in (65, 66)
-    assert _select_a4w4_inter_wave_path(m, n, k) == "inter_wave_256x256"
-    assert (k, iter_max, main_trips) == (1024, 4, 1)
+    assert _select_a4w4_inter_wave_path(m, n, k) == "intra_wave_256x256"
+    assert k == 1024
 
     a, b, a_scales, b_scales = _generate_a4w4_inputs(m, n, k)
     expected = _a4w4_reference(a, b, a_scales, b_scales)
