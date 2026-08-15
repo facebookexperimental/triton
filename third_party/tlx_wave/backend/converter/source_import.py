@@ -19,10 +19,10 @@ STAGE = "import"
 
 
 def import_source_program(
-    mod,
-    kernel_name=None,
-    *,
-    compiler_membar_barriers=(),
+        mod,
+        kernel_name=None,
+        *,
+        compiler_membar_barriers=(),
 ):
     compiler_membar_barriers = frozenset(compiler_membar_barriers)
     kernel_name = _resolve_kernel_name(mod, kernel_name)
@@ -87,11 +87,7 @@ def import_source_program(
         func_op.get_bool_attr("noinline"),
         tuple(_value_id(fn.args(index)) for index in range(fn.get_num_args())),
         bool(func_op.get_bool_attr(TLX_WAVE_ENABLE_SPLIT_BARRIERS_ATTR)),
-        bool(
-            func_op.get_bool_attr(
-                TLX_WAVE_ENABLE_MULTI_WAVE_SPECIALIZATION_ATTR
-            )
-        ),
+        bool(func_op.get_bool_attr(TLX_WAVE_ENABLE_MULTI_WAVE_SPECIALIZATION_ATTR)),
     )
     return SourceProgram(
         kernel,
@@ -236,7 +232,7 @@ def _source_attrs(op):
         value = op.get_int_attr(name)
         if value is not None:
             attrs[name] = int(value)
-    for name in ("offsets", "operandSegmentSizes", "order"):
+    for name in ("offsets", "operandSegmentSizes", "order", "tlx.source_invariant_bits"):
         values = op.get_int_array_attr(name)
         if values is not None:
             attrs[name] = tuple(int(value) for value in values)

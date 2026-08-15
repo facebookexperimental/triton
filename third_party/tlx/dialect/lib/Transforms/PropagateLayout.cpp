@@ -3,6 +3,7 @@
 #include "mlir/Analysis/DataFlow/DeadCodeAnalysis.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "tlx/dialect/include/Analysis/LayoutPropagation.h"
+#include "triton/Analysis/Utility.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
@@ -22,6 +23,9 @@ using namespace mlir;
 using namespace mlir::dataflow;
 namespace ttg = ::mlir::triton::gpu;
 namespace ttng = ::mlir::triton::nvidia_gpu;
+
+static constexpr llvm::StringLiteral kSourceInvariantBitsAttr =
+    "tlx.source_invariant_bits";
 
 namespace mlir {
 namespace triton {
@@ -48,6 +52,8 @@ public:
         requireLayoutOp.getSrc());
     if (requireLayoutOp->hasAttr("tlx.rematerialize_coordinates"))
       convert->setAttr("tlx.rematerialize_coordinates", rewriter.getUnitAttr());
+    if (Attribute attr = requireLayoutOp->getAttr(kSourceInvariantBitsAttr))
+      convert->setDiscardableAttr(kSourceInvariantBitsAttr, attr);
     rewriter.replaceOp(requireLayoutOp, convert);
     return success();
   }
@@ -64,8 +70,12 @@ public:
       rewriter.replaceOp(releaseLayoutOp, releaseLayoutOp.getSrc());
       return success();
     }
-    rewriter.replaceOpWithNewOp<ttg::ConvertLayoutOp>(
-        releaseLayoutOp, releaseLayoutOp.getType(), releaseLayoutOp.getSrc());
+    auto convert = ttg::ConvertLayoutOp::create(
+        rewriter, releaseLayoutOp.getLoc(), releaseLayoutOp.getType(),
+        releaseLayoutOp.getSrc());
+    if (Attribute attr = releaseLayoutOp->getAttr(kSourceInvariantBitsAttr))
+      convert->setDiscardableAttr(kSourceInvariantBitsAttr, attr);
+    rewriter.replaceOp(releaseLayoutOp, convert);
     return success();
   }
 };
@@ -609,6 +619,56 @@ public:
   }
 
   void runOnOperation() override {
+    // Layout propagation and downstream cleanup may materialize conversions at
+    // different points in the pipeline. Preserve the producer's proven logical
+    // invariant bits on both TLX boundaries and concrete conversions so the
+    // Wave bridge can select an equivalent physical owner. The dedicated
+    // analysis owns reshape/transpose and region-carrier reasoning; this pass
+    // only serializes its result.
+    bool hasTensorLayoutBoundary = false;
+    getOperation()->walk([&](Operation *op) {
+      if (auto require = dyn_cast<RequireLayoutOp>(op))
+        hasTensorLayoutBoundary |=
+            isa<RankedTensorType>(require.getSrc().getType());
+      if (auto release = dyn_cast<ReleaseLayoutOp>(op))
+        hasTensorLayoutBoundary |=
+            isa<RankedTensorType>(release.getSrc().getType());
+      if (isa<ttg::ConvertLayoutOp>(op))
+        hasTensorLayoutBoundary = true;
+    });
+    if (hasTensorLayoutBoundary) {
+      std::unique_ptr<DataFlowSolver> invariantSolver = createDataFlowSolver();
+      invariantSolver->load<LogicalInvariantBitsAnalysis>();
+      if (failed(invariantSolver->initializeAndRun(getOperation()))) {
+        signalPassFailure();
+        return;
+      }
+      auto annotate = [&](Operation *op, Value source) {
+        op->removeDiscardableAttr(kSourceInvariantBitsAttr);
+        auto *lattice =
+            invariantSolver->lookupState<LogicalInvariantBitsLattice>(source);
+        if (!lattice || lattice->getValue().isUninitialized())
+          return;
+        const llvm::SmallBitVector &bits = lattice->getValue().getBits();
+        if (bits.none())
+          return;
+        SmallVector<int32_t> invariantBits;
+        for (int bit : bits.set_bits())
+          invariantBits.push_back(bit);
+        op->setDiscardableAttr(
+            kSourceInvariantBitsAttr,
+            DenseI32ArrayAttr::get(&getContext(), invariantBits));
+      };
+      getOperation()->walk([&](Operation *op) {
+        if (auto require = dyn_cast<RequireLayoutOp>(op))
+          annotate(op, require.getSrc());
+        else if (auto release = dyn_cast<ReleaseLayoutOp>(op))
+          annotate(op, release.getSrc());
+        else if (auto convert = dyn_cast<ttg::ConvertLayoutOp>(op))
+          annotate(op, convert.getSrc());
+      });
+    }
+
     getOperation()->walk([&](triton::FuncOp funcOp) { runOnFuncOp(funcOp); });
 
     MLIRContext *context = &getContext();

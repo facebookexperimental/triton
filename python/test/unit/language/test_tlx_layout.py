@@ -878,6 +878,12 @@ def _workitems_to_mfma_rows(workitems):
     return rows.reshape([256])
 
 
+@triton.jit
+def _mfma_rows_to_workitems(rows):
+    per_wave_rows = rows.reshape([8, 32])
+    return tl.broadcast_to(per_wave_rows[:, None, :], (8, 2, 32)).reshape([512])
+
+
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Need gfx950 (CDNA4)")
 def test_concrete_mfma_layout_reconciles_elementwise_broadcast_on_cdna4():
     """An explicit MFMA operand constrains an unencoded helper/broadcast path.
@@ -896,8 +902,9 @@ def test_concrete_mfma_layout_reconciles_elementwise_broadcast_on_cdna4():
 
     @triton.jit
     def kernel(Y, MMA: tl.constexpr, STORE: tl.constexpr):
-        acc = tlx.require_layout(tl.zeros((256, 32), tl.float32), MMA)
-        workitems = tl.arange(0, 512).to(tl.float32)
+        acc = tlx.require_layout(tl.full((256, 32), 2.0, tl.float32), MMA)
+        source_rows = tl.arange(0, 256).to(tl.float32) + 1.0
+        workitems = _mfma_rows_to_workitems(source_rows)
         rows = _workitems_to_mfma_rows(workitems)
         out = acc * rows[:, None]
         out = tlx.cast_preserve_layout(out, tl.bfloat16)
@@ -909,7 +916,9 @@ def test_concrete_mfma_layout_reconciles_elementwise_broadcast_on_cdna4():
     y = torch.full((256 * 32, ), float("nan"), device=DEVICE, dtype=torch.bfloat16)
     compiled = kernel.warmup(y, mma, store, grid=(1, ), num_warps=8)
     kernel[(1, )](y, mma, store, num_warps=8)
-    torch.testing.assert_close(y, torch.zeros_like(y), atol=0, rtol=0)
+    expected = (2 * torch.arange(1, 257, device=DEVICE, dtype=torch.float32)).to(torch.bfloat16)
+    expected = expected[:, None].broadcast_to((256, 32)).flatten()
+    torch.testing.assert_close(y, expected, atol=0, rtol=0)
     assert "#ttg.amd_mfma" in compiled.asm["ttir"]
     assert "#tlx.no_verify_layout" not in compiled.asm["ttgir"]
 

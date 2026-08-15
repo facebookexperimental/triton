@@ -100,6 +100,50 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
     %mask = ttg.warp_ballot %converted : tensor<256xi1, #ballot_blocked> -> i64
     tt.return %mask : i64
   }
+
+}
+
+// -----
+
+// Preserve logical equality introduced by broadcast across reshape, transpose,
+// and require_layout so Wave can select an equivalent physical owner.
+
+#constant_source = #ttg.blocked<{sizePerThread = [1, 1, 1], threadsPerWarp = [1, 32, 2], warpsPerCTA = [8, 1, 1], order = [1, 2, 0]}>
+#constant_broadcast = #ttg.blocked<{sizePerThread = [1, 1, 1], threadsPerWarp = [1, 2, 32], warpsPerCTA = [8, 1, 1], order = [2, 1, 0]}>
+#constant_flat = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [8], order = [0]}>
+#constant_result = #ttg.linear<{register = [[0, 0, 1]], lane = [[0, 1, 0], [0, 2, 0], [0, 4, 0], [0, 8, 0], [0, 16, 0], [0, 0, 0]], warp = [[1, 0, 0], [2, 0, 0], [4, 0, 0]], block = []}>
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  // CHECK-LABEL: @require_layout_preserves_logical_invariant_bits
+  tt.func public @require_layout_preserves_logical_invariant_bits(
+      %arg: tensor<8x1x32xf32, #constant_broadcast>)
+      -> tensor<8x32x2xf32, #constant_result> {
+    %duplicated = tt.broadcast %arg : tensor<8x1x32xf32, #constant_broadcast> -> tensor<8x2x32xf32, #constant_broadcast>
+    %transposed = tt.trans %duplicated {order = array<i32: 0, 2, 1>} : tensor<8x2x32xf32, #constant_broadcast> -> tensor<8x32x2xf32, #constant_source>
+    // CHECK: ttg.convert_layout %{{.*}} {tlx.source_invariant_bits = array<i32: 8>}
+    %required = tlx.require_layout %transposed : tensor<8x32x2xf32, #constant_source> -> tensor<8x32x2xf32, #constant_result>
+    tt.return %required : tensor<8x32x2xf32, #constant_result>
+  }
+
+  // CHECK-LABEL: @logical_invariant_bits_cross_loop_carriers
+  tt.func public @logical_invariant_bits_cross_loop_carriers(
+      %arg: tensor<8x1x32xf32, #constant_broadcast>)
+      -> tensor<8x32x2xf32, #constant_result> {
+    %c0 = arith.constant 0 : i32
+    %c1 = arith.constant 1 : i32
+    %c2 = arith.constant 2 : i32
+    %duplicated = tt.broadcast %arg : tensor<8x1x32xf32, #constant_broadcast> -> tensor<8x2x32xf32, #constant_broadcast>
+    %flat = tt.reshape %duplicated : tensor<8x2x32xf32, #constant_broadcast> -> tensor<512xf32, #constant_flat>
+    %carried = scf.for %i = %c0 to %c2 step %c1 iter_args(%state = %flat) -> tensor<512xf32, #constant_flat> : i32 {
+      %updated = arith.addf %state, %flat : tensor<512xf32, #constant_flat>
+      scf.yield %updated : tensor<512xf32, #constant_flat>
+    }
+    %unflat = tt.reshape %carried : tensor<512xf32, #constant_flat> -> tensor<8x2x32xf32, #constant_broadcast>
+    %transposed = tt.trans %unflat {order = array<i32: 0, 2, 1>} : tensor<8x2x32xf32, #constant_broadcast> -> tensor<8x32x2xf32, #constant_source>
+    // CHECK: ttg.convert_layout %{{.*}} {tlx.source_invariant_bits = array<i32: 8>}
+    %required = tlx.require_layout %transposed : tensor<8x32x2xf32, #constant_source> -> tensor<8x32x2xf32, #constant_result>
+    tt.return %required : tensor<8x32x2xf32, #constant_result>
+  }
 }
 
 // -----
