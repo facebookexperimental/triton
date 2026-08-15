@@ -3534,7 +3534,6 @@ def _emit_packet_redistribute(
     relation,
     source_shape,
     result_shape,
-    equivalent_relation=None,
 ):
     source_block, source_item, source_slot = _packet_relation_exprs(
         state,
@@ -3545,17 +3544,6 @@ def _emit_packet_redistribute(
         destination_items=result_shape.item_count,
         destination_slots=result_shape.slot_count,
     )
-    equivalent = None
-    if equivalent_relation is not None:
-        equivalent = _packet_relation_exprs(
-            state,
-            equivalent_relation,
-            source_shape.slot_count,
-            source_shape.item_count,
-            destination_blocks=result_shape.block_count,
-            destination_items=result_shape.item_count,
-            destination_slots=result_shape.slot_count,
-        )
     return state.builder.redistribute(
         source,
         result_type,
@@ -3564,7 +3552,6 @@ def _emit_packet_redistribute(
         source_block=source_block,
         source_item=source_item,
         source_slot=source_slot,
-        equivalent_relation=equivalent,
     )
 
 
@@ -3715,7 +3702,6 @@ def _emit_packet_layout_transform(state, op):
             attrs["relation"],
             source_layout,
             result_layout,
-            attrs.get("equivalent_relation"),
         )
     except ValueError as exc:
         fail(
