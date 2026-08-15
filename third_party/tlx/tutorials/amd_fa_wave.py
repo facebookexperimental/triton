@@ -720,6 +720,12 @@ def _load_query(
 
 
 @triton.jit
+def _workitems_to_rows(workitems):
+    per_wave_rows, _ = workitems.reshape([8, 2, 32]).permute(0, 2, 1).split()
+    return per_wave_rows.reshape([BLOCK_M])
+
+
+@triton.jit
 def _normalize_output_fragment(
     inverse_row_sum,
     acc,
@@ -727,65 +733,9 @@ def _normalize_output_fragment(
     mma_layout: tl.constexpr,
 ):
     acc = tlx.require_layout(acc, mma_layout)
-    register_layout: tl.constexpr = (tlx.distributed_linear_layout_encoding.make(
-        reg_bases=[
-            [0, 1],
-            [0, 2],
-            [0, 4],
-            [0, 8],
-        ],
-        lane_bases=[
-            [1, 0],
-            [2, 0],
-            [4, 0],
-            [8, 0],
-            [16, 0],
-            [32, 0],
-        ],
-        warp_bases=[
-            [64, 0],
-            [128, 0],
-            [256, 0],
-        ],
-        block_bases=[],
-        shape=[8 * 64, 16],
-    ))
-    binary = acc.reshape([2] * 13)
-    registers = binary.permute(
-        0,
-        1,
-        2,
-        10,
-        3,
-        4,
-        5,
-        6,
-        7,
-        8,
-        9,
-        11,
-        12,
-    ).reshape([8 * 64, 16])
-    scale = tl.broadcast_to(inverse_row_sum[:, None], (8 * 64, 16))
-    scale = tlx.require_layout(scale, register_layout)
-    registers = registers * scale
-    registers = tlx.cast_preserve_layout(registers, out_dtype)
-    binary = registers.reshape([2] * 13)
-    output = binary.permute(
-        0,
-        1,
-        2,
-        4,
-        5,
-        6,
-        7,
-        8,
-        9,
-        10,
-        3,
-        11,
-        12,
-    ).reshape([BLOCK_M, BLOCK_N // 2])
+    row_scale = _workitems_to_rows(inverse_row_sum)
+    output = acc * row_scale[:, None]
+    output = tlx.cast_preserve_layout(output, out_dtype)
     return tlx.release_layout(output)
 
 
