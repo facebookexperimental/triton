@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import torch
 from torch._inductor.kernel.mm_common import mm_grid  # noqa: F401
 from torch._inductor.select_algorithm import SymbolicGridFn, TritonTemplate
 from torch._inductor.utils import load_template
@@ -101,6 +102,19 @@ def append_tlx(templates, op_name="mm"):
     # Import registry to trigger heuristic registration via decorators
     from . import registry  # noqa: F401
 
+    # Only propose templates whose heuristic is registered for this device.
+    # registry.py gates registration on arch (amd_* on register=IS_ROCM,
+    # blackwell on register=torch.version.hip is None), so proposing the other
+    # arch's template gets no heuristic, logs a multi-KB "No template heuristic
+    # found ... Using fallback" error, and falls back -- correct, but noisy
+    # enough to look like a failure. Plain mm has no AMD TLX template yet, so on
+    # ROCm it proposes nothing rather than reaching for the Blackwell one.
+    if torch.version.hip is not None:
+        return _append_tlx_amd(templates, op_name)
+    return _append_tlx_cuda(templates, op_name)
+
+
+def _append_tlx_amd(templates, op_name):
     if op_name == "addmm":
         # The warp-pipe addmm competes as an ADDITIONAL candidate alongside the stock
         # mm_template + vendor (aten). tuned_addmm issues several get_template_configs
@@ -126,6 +140,16 @@ def append_tlx(templates, op_name="mm"):
         uids = {getattr(t, "uid", None) for t in templates}
         if bmm_template.uid in uids and amd_bmm_warppipe_template.uid not in uids:
             templates.append(amd_bmm_warppipe_template)
-    else:
-        templates.append(blackwell_gemm_ws_template)
+    # else: no AMD TLX template for plain mm (or any other op) yet. Proposing
+    # the Blackwell one here is the bug reported in P2462423082: it cannot be
+    # selected on gfx9xx and only produces log noise.
+    return templates
+
+
+def _append_tlx_cuda(templates, op_name):
+    # The amd_* warp-pipe templates have no heuristic registered on CUDA, so
+    # addmm/bmm get no TLX candidate here; only plain mm does.
+    if op_name in ("addmm", "bmm"):
+        return templates
+    templates.append(blackwell_gemm_ws_template)
     return templates
