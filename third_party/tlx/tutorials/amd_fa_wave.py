@@ -152,8 +152,8 @@ def _join_last_2(lower, upper):
 
 
 @triton.jit
-def _score_packet_to_registers(scores):
-    """Expose one 32-column MFMA score packet's physical register axis.
+def _mfma_packet_to_registers(packet):
+    """Expose one 32-column MFMA packet's physical register axis.
 
     The binary axes of each transposed 32x32 MFMA accumulator packet are:
 
@@ -165,7 +165,7 @@ def _score_packet_to_registers(scores):
     Wave kernel's ``[workitem, register]`` packet without exchanging values
     between workitems.
     """
-    binary = scores.reshape([2] * 13)
+    binary = packet.reshape([2] * 13)
     workitem_register = binary.permute(
         0,
         1,
@@ -185,8 +185,8 @@ def _score_packet_to_registers(scores):
 
 
 @triton.jit
-def _registers_to_score_packet(registers):
-    """Invert :func:`_score_packet_to_registers`."""
+def _registers_to_mfma_packet(registers):
+    """Invert :func:`_mfma_packet_to_registers`."""
     binary = registers.reshape([2] * 13)
     logical = binary.permute(
         0,
@@ -391,11 +391,48 @@ def _reduce_max_score_registers(registers0, registers1):
 
 
 @triton.jit
+def _prepare_adaptive_score_registers(scores, qk_scale: tl.constexpr):
+    """Expose score registers and compute their scaled row maximum."""
+    score0, score1 = _split_last_2(scores)
+    registers0 = _mfma_packet_to_registers(score0)
+    registers1 = _mfma_packet_to_registers(score1)
+    if qk_scale < 0.0:
+        registers0 = registers0 * qk_scale
+        registers1 = registers1 * qk_scale
+        tile_max = _reduce_max_score_registers(registers0, registers1)
+    else:
+        tile_max = _reduce_max_score_registers(registers0, registers1) * qk_scale
+    return registers0, registers1, tile_max
+
+
+@triton.jit
+def _adaptive_rebase_decision(row_max, tile_max):
+    """Return the next row maximum and one uniform rebase decision per wave.
+
+    Each wave owns 32 rows, duplicated across its two 32-lane halves by the
+    reduction.  ``warp_ballot == -1`` therefore means that all 32 rows remain
+    within the logarithmic headroom.  If any row exceeds it, rebasing every row
+    in the wave is algebraically safe: scaling its old denominator and
+    accumulator by the same factor preserves their ratio.  Ordered comparison
+    also makes a NaN take the rebase path and continue propagating.
+    """
+    candidate = tl.maximum(
+        row_max,
+        tile_max,
+        propagate_nan=tl.PropagateNan.ALL,
+    )
+    advance = candidate - row_max
+    row_is_within_headroom = advance <= SOFTMAX_REFERENCE_HEADROOM_LOG2
+    needs_rebase = tlx.warp_ballot(row_is_within_headroom) != -1
+    return candidate, needs_rebase
+
+
+@triton.jit
 def _scale_accumulator_rows(accumulator, scale):
     """Scale an MFMA accumulator through its physical register packet."""
-    registers = _score_packet_to_registers(accumulator)
+    registers = _mfma_packet_to_registers(accumulator)
     registers = registers * scale[:, None]
-    return _registers_to_score_packet(registers)
+    return _registers_to_mfma_packet(registers)
 
 
 @triton.jit
@@ -440,8 +477,8 @@ def _load_value_fragment(
 
 @aggregate
 class SoftmaxPending:
-    score0: tl.tensor
-    score1: tl.tensor
+    registers0: tl.tensor
+    registers1: tl.tensor
 
 
 @aggregate
@@ -473,96 +510,42 @@ class SoftmaxState:
         )
 
     @triton.jit
+    def rebase(self, reference):
+        alpha_rows = tl.math.exp2(self.row_max - reference)
+        return SoftmaxState(
+            _scale_accumulator_rows(self.acc0, alpha_rows),
+            _scale_accumulator_rows(self.acc1, alpha_rows),
+            _scale_accumulator_rows(self.acc2, alpha_rows),
+            _scale_accumulator_rows(self.acc3, alpha_rows),
+            reference,
+            self.row_sum * alpha_rows,
+        )
+
+    @triton.jit
     def prepare(
         self,
         scores,
         qk_scale: tl.constexpr,
         log2_score_bound: tl.constexpr,
-        mma_layout: tl.constexpr,
         INITIAL: tl.constexpr,
         ADAPTIVE_REFERENCE: tl.constexpr,
     ):
-        score0, score1 = _split_last_2(scores)
         state = self
         if ADAPTIVE_REFERENCE:
-            raw_registers0 = _score_packet_to_registers(score0)
-            raw_registers1 = _score_packet_to_registers(score1)
-            if qk_scale < 0.0:
-                scaled_registers0 = raw_registers0 * qk_scale
-                scaled_registers1 = raw_registers1 * qk_scale
-                tile_max = _reduce_max_score_registers(scaled_registers0, scaled_registers1)
-            else:
-                tile_max = _reduce_max_score_registers(raw_registers0, raw_registers1) * qk_scale
+            score_registers0, score_registers1, tile_max = _prepare_adaptive_score_registers(
+                scores,
+                qk_scale,
+            )
             if INITIAL:
                 reference = tile_max
             else:
-                candidate = tl.maximum(
+                candidate, needs_rebase = _adaptive_rebase_decision(
                     self.row_max,
                     tile_max,
-                    propagate_nan=tl.PropagateNan.ALL,
                 )
-                advance = candidate - self.row_max
-                # This is the direct logarithmic form of the derivation above:
-                # ``advance = c - r`` and monotonicity of exp2 gives
-                # ``2**advance <= 2**H`` exactly when ``advance <= H``.  This
-                # is an ordered floating-point comparison, not a test of the
-                # floating-point representation.  A NaN consequently makes
-                # the predicate false and takes the update path, where the NaN
-                # from the row maximum continues to propagate through state.
-                row_is_within_headroom = advance <= SOFTMAX_REFERENCE_HEADROOM_LOG2
-
-                # Why the following ballot and ``-1`` comparison are an
-                # all-row test rather than ad-hoc bit manipulation:
-                #
-                # A physical wave owns 32 output rows, while a gfx950 wave has
-                # 64 lanes.  The reductions above first combine each lane's 32
-                # register elements, then combine lanes ``j`` and ``j + 32``.
-                # Their row result is duplicated back to both lanes.  Numbering
-                # the wave by ``w``, its row by ``j`` (0 <= j < 32), and the
-                # lane half by ``h`` (0 <= h < 2), the resulting predicate
-                # ``b[w,j] = (candidate[w,j] - reference[w,j] <= H)`` lives at
-                # flat workitem index
-                #
-                #                         64*w + 32*h + j.
-                #
-                # The reduction's row-slice layout already expresses exactly
-                # that physical ownership, so warp_ballot consumes it directly:
-                # physical lanes ``j`` and ``j + 32`` both receive ``b[w,j]``.
-                # No float bits are inspected and no data-dependent shuffle is
-                # hidden in this operation.
-                #
-                # ``warp_ballot`` places lane ``l``'s boolean in bit ``l`` of
-                # an i64.  For one wave its unsigned mask is consequently
-                #
-                #       B = sum_{j=0}^{31} b[w,j] * (2**j + 2**(j+32)).
-                #
-                # Therefore B == 2**64 - 1 iff every one of the 32 row
-                # predicates is true.  The same 64-bit pattern, interpreted as
-                # a signed two's-complement i64, is ``-1``; that is all the
-                # comparison below means.
-                #
-                # If any ``b[w,j]`` is false, every row in the wave takes the
-                # uniform rebase path.  For a row that was still within
-                # headroom this merely chooses its candidate reference early:
-                # multiplying both its old denominator and accumulator by
-                # ``2**(old_reference - candidate)`` preserves their ratio.
-                # The new tile is then accumulated relative to ``candidate``.
-                # Hence the wave-wide decision is algebraically the same
-                # softmax state update for every row (up to normal floating-
-                # point rounding), while avoiding divergent per-row state and
-                # control flow.
-                needs_rebase = tlx.warp_ballot(row_is_within_headroom) != -1
                 if needs_rebase:
                     reference = candidate
-                    alpha_rows = tl.math.exp2(self.row_max - reference)
-                    state = SoftmaxState(
-                        _scale_accumulator_rows(self.acc0, alpha_rows),
-                        _scale_accumulator_rows(self.acc1, alpha_rows),
-                        _scale_accumulator_rows(self.acc2, alpha_rows),
-                        _scale_accumulator_rows(self.acc3, alpha_rows),
-                        reference,
-                        self.row_sum * alpha_rows,
-                    )
+                    state = self.rebase(reference)
                 else:
                     reference = self.row_max
             if INITIAL:
@@ -579,16 +562,17 @@ class SoftmaxState:
             # form the same FMA as its native FA implementation without a
             # kernel-specific fused operation in the bridge.
             if qk_scale < 0.0:
-                registers0 = scaled_registers0 - reference[:, None]
-                registers1 = scaled_registers1 - reference[:, None]
+                registers0 = score_registers0 - reference[:, None]
+                registers1 = score_registers1 - reference[:, None]
             else:
-                registers0 = raw_registers0 * qk_scale - reference[:, None]
-                registers1 = raw_registers1 * qk_scale - reference[:, None]
+                registers0 = score_registers0 * qk_scale - reference[:, None]
+                registers1 = score_registers1 * qk_scale - reference[:, None]
         else:
+            score0, score1 = _split_last_2(scores)
             score0 = score0 * qk_scale + (-log2_score_bound)
             score1 = score1 * qk_scale + (-log2_score_bound)
-            registers0 = _score_packet_to_registers(score0)
-            registers1 = _score_packet_to_registers(score1)
+            registers0 = _mfma_packet_to_registers(score0)
+            registers1 = _mfma_packet_to_registers(score1)
 
         registers0 = tl.math.exp2(registers0)
         registers1 = tl.math.exp2(registers1)
@@ -613,30 +597,21 @@ class SoftmaxState:
         by the same wave-uniform ballot as prepare; only the state scaling
         is deferred until the current PV tile is fully accumulated.
         """
-        score0, score1 = _split_last_2(scores)
-        raw_registers0 = _score_packet_to_registers(score0)
-        raw_registers1 = _score_packet_to_registers(score1)
-        if qk_scale < 0.0:
-            scaled_registers0 = raw_registers0 * qk_scale
-            scaled_registers1 = raw_registers1 * qk_scale
-            tile_max = _reduce_max_score_registers(scaled_registers0, scaled_registers1)
-        else:
-            tile_max = _reduce_max_score_registers(raw_registers0, raw_registers1) * qk_scale
-        candidate = tl.maximum(
+        score_registers0, score_registers1, tile_max = _prepare_adaptive_score_registers(
+            scores,
+            qk_scale,
+        )
+        candidate, needs_rebase = _adaptive_rebase_decision(
             self.row_max,
             tile_max,
-            propagate_nan=tl.PropagateNan.ALL,
         )
-        advance = candidate - self.row_max
-        row_is_within_headroom = advance <= SOFTMAX_REFERENCE_HEADROOM_LOG2
-        needs_rebase = tlx.warp_ballot(row_is_within_headroom) != -1
         reference = tl.where(needs_rebase, candidate, self.row_max)
         if qk_scale < 0.0:
-            registers0 = scaled_registers0 - reference[:, None]
-            registers1 = scaled_registers1 - reference[:, None]
+            registers0 = score_registers0 - reference[:, None]
+            registers1 = score_registers1 - reference[:, None]
         else:
-            registers0 = raw_registers0 * qk_scale - reference[:, None]
-            registers1 = raw_registers1 * qk_scale - reference[:, None]
+            registers0 = score_registers0 * qk_scale - reference[:, None]
+            registers1 = score_registers1 * qk_scale - reference[:, None]
 
         registers0 = tl.math.exp2(registers0)
         registers1 = tl.math.exp2(registers1)
@@ -657,15 +632,7 @@ class SoftmaxState:
     ):
         state = self
         if needs_rebase:
-            alpha_rows = tl.math.exp2(self.row_max - reference)
-            state = SoftmaxState(
-                _scale_accumulator_rows(self.acc0, alpha_rows),
-                _scale_accumulator_rows(self.acc1, alpha_rows),
-                _scale_accumulator_rows(self.acc2, alpha_rows),
-                _scale_accumulator_rows(self.acc3, alpha_rows),
-                reference,
-                self.row_sum * alpha_rows,
-            )
+            state = self.rebase(reference)
         return state
 
     @triton.jit
@@ -674,8 +641,8 @@ class SoftmaxState:
         pending,
         out_dtype: tl.constexpr,
     ):
-        registers0 = pending.score0
-        registers1 = pending.score1
+        registers0 = pending.registers0
+        registers1 = pending.registers1
         tile_sum = _reduce_score_registers(
             registers0,
             registers1,
@@ -708,8 +675,8 @@ class SoftmaxState:
         registers1 = tlx.require_layout(registers1, score_register_layout)
         registers0 = tlx.release_layout(tlx.cast_preserve_layout(registers0, out_dtype))
         registers1 = tlx.release_layout(tlx.cast_preserve_layout(registers1, out_dtype))
-        probabilities0 = _registers_to_score_packet(registers0)
-        probabilities1 = _registers_to_score_packet(registers1)
+        probabilities0 = _registers_to_mfma_packet(registers0)
+        probabilities1 = _registers_to_mfma_packet(registers1)
         p0, p1 = _split_last_2(probabilities0)
         p2, p3 = _split_last_2(probabilities1)
         probabilities = ProbabilityFragments(
@@ -842,7 +809,6 @@ def _accumulate_prefix_body(
         next_scores,
         qk_scale,
         log2_score_bound,
-        mma_layout,
         False,
         ADAPTIVE_REFERENCE,
     )
@@ -1066,6 +1032,10 @@ def _issue_tile(
     slot,
     LDS_PADDING: tl.constexpr,
 ):
+    # The padding value is part of the JIT specialization key.  K and V use
+    # distinct padded memdesc layouts even though issuing the DMA itself does
+    # not inspect the padding value.
+    _ = LDS_PADDING
     tile_offset = tile * BLOCK_N * stride_n
     token = tlx.async_load(
         pointers + tile_offset,
@@ -1277,7 +1247,6 @@ def _pipeline(
         scores,
         qk_scale,
         log2_score_bound,
-        mma_layout,
         True,
         ADAPTIVE_REFERENCE,
     )
