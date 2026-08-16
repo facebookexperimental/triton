@@ -6419,7 +6419,8 @@ def test_tlx_wave_converter_emission_stage_emits_basic_wave_module(tmp_path):
     assert "gpu.kernel" in emitted.text
     assert "wave.binary" in emitted.text
     assert "wave.assume" in emitted.text
-    assert "wave.ptr_add" in emitted.text
+    # The pointer chain has no semantic consumer and is not materialized.
+    assert "wave.ptr_add" not in emitted.text
     assert "wave_bridge" not in emitted.text
     assert output.target_program.kernel.name == "converter_emit"
     del ctx
@@ -11656,7 +11657,44 @@ def test_tlx_wave_converter_pipeline_preserves_pointer_range_through_addptr_dma(
     attrs = converter_target_ir.attrs_dict(dma_op)
     assert attrs["mode"] == "symbolic_copy"
     assert attrs["range_bytes"] == 2147483647
+    assert dma_op.operands[1] == output.target_program.kernel.arg_target_ids[0]
+    assert attrs["index_binding_count"] == 0
+    dsl, _ir = converter_emission._load_wave_dsl()
+    relation = dsl.ixs_deserialize(attrs["bit_offset_relation"])
+    for item in (0, 1, 31, 63):
+        assert relation.eval({"block": 0, "item": item, "slot": 0}) == 16 * (128 + item)
     assert "waveamd.make_buffer" in output.emitted_module.text
+    assert "wave.ptr_add" not in output.emitted_module.text
+    del ctx
+
+
+def test_tlx_wave_converter_preserves_shared_dma_base_materialization(tmp_path):
+    preamble = """
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+"""
+    local_func = """
+  tt.func public @converter_shared_dma_base(%arg0: !tt.ptr<f16> {tt.pointer_range = 32 : i32}) attributes {noinline = false} {
+    %first = ttg.local_alloc : () -> !ttg.memdesc<512xf16, #shared, #smem, mutable>
+    %second = ttg.local_alloc : () -> !ttg.memdesc<512xf16, #shared, #smem, mutable>
+    %base_offset = arith.constant 128 : i32
+    %base = tt.addptr %arg0, %base_offset : !tt.ptr<f16>, i32
+    %range = tt.make_range {end = 512 : i32, start = 0 : i32} : tensor<512xi32, #blocked>
+    %first_token = amdg.buffer_load_to_local %base[%range] into %first : <f16>[tensor<512xi32, #blocked>] -> <512xf16, #shared, #smem, mutable>
+    %second_token = amdg.buffer_load_to_local %base[%range] into %second : <f16>[tensor<512xi32, #blocked>] -> <512xf16, #shared, #smem, mutable>
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1, preamble=preamble)
+
+    output = converter_pipeline.convert_ttgir_to_wave(mod)
+
+    dma_ops = [op for op in output.target_program.ops if op.kind == "buffer_load_to_local"]
+    assert len(dma_ops) == 2
+    assert dma_ops[0].operands[1] == dma_ops[1].operands[1]
+    assert dma_ops[0].operands[1] != output.target_program.kernel.arg_target_ids[0]
+    assert output.emitted_module.text.count("wave.ptr_add") == 1
     del ctx
 
 
@@ -11699,6 +11737,8 @@ def test_tlx_wave_converter_keeps_dma_pointer_conversion_inside_loop(tmp_path):
     dma_attrs = converter_target_ir.attrs_dict(dma_op)
     _assert_mechanical_symbolic_copy(dma_attrs, masked=False)
     assert "source_pointer_mode" not in dma_attrs
+    assert dma_op.operands[1] == output.target_program.kernel.arg_target_ids[0]
+    assert dma_attrs["index_binding_count"] == 1
     pointer_type = output.target_program.values[dma_op.operands[1]].type
     assert pointer_type.representation == "uniform_pointer"
     assert pointer_type.component_count == 1
