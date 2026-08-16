@@ -6,6 +6,7 @@ import json
 import pytest
 
 from tlx_plan.baseline import FA_BWD_D128_CASES, FA_BWD_D128_SCHEDULES, make_manifest
+from tlx_plan.audit import audit_plan
 from tlx_plan.model import PlanBundle, PlanError
 from tlx_plan.replay import compare_plans, verify_replay
 from tlx_plan.ttgir import extract_plan, normalize_ttgir
@@ -88,7 +89,7 @@ def test_round_trip_and_replay_report(tmp_path) -> None:
     report = verify_replay(TTGIR, loaded)
     assert report["exact"]
     assert report["semantic_match"]
-    assert json.loads(path.read_text())["schema_version"] == "0.4"
+    assert json.loads(path.read_text())["schema_version"] == "0.5"
 
 
 def test_native_value_graph_supplies_stable_ids_and_lineage() -> None:
@@ -104,7 +105,7 @@ def test_native_value_graph_supplies_stable_ids_and_lineage() -> None:
         for index, operation in enumerate(textual.operations)
     ]
     native = {
-        "schema_version": "plan-value-graph/0.3",
+        "schema_version": "plan-value-graph/0.4",
         "functions": [
             {
                 "function": textual.kernel,
@@ -214,6 +215,47 @@ def test_native_value_graph_supplies_stable_ids_and_lineage() -> None:
                     }
                 ],
                 "lds_reuse_hazards": [],
+                "dependency_edges": [
+                    {
+                        "id": "dependency:native:0",
+                        "kind": "loop_carried_ssa",
+                        "source_operation": operations[0]["id"],
+                        "destination_operation": operations[1]["id"],
+                        "source_value": "value:a",
+                        "destination_value": "value:b",
+                        "root_value": None,
+                        "iteration_distance": 1,
+                        "precision": "structured_exact",
+                    }
+                ],
+                "peak_live_sets": [
+                    {
+                        "block": "block:native:0",
+                        "operation": operations[0]["id"],
+                        "position": 0,
+                        "logical_tensor_bytes": 0,
+                        "unknown_tensor_value_count": 1,
+                        "logical_lds_bytes": 0,
+                        "tensor_values": ["value:a"],
+                        "lds_root_values": [],
+                    }
+                ],
+                "resource_summary": {
+                    "max_logical_slot_depth": 1,
+                    "logical_tensor_bytes_are_per_wave_vgpr_bytes": False,
+                    "physical_vgpr_peak": None,
+                    "physical_lds_bytes": None,
+                },
+                "unresolved_facts": [
+                    {
+                        "severity": "warning",
+                        "code": "identity_collision",
+                        "importance": "advisory",
+                        "status": "accepted_deterministic_fallback",
+                        "operation": None,
+                        "value": "value:a",
+                    }
+                ],
                 "diagnostics": [],
             }
         ],
@@ -227,6 +269,11 @@ def test_native_value_graph_supplies_stable_ids_and_lineage() -> None:
     assert plan.live_segments[0]["block"] == "block:native:0"
     assert plan.lds_allocations[0]["root_value"] == "value:a"
     assert plan.async_transactions[0]["completion_frontiers"][0]["iteration_distance"] == 1
+    assert plan.dependency_edges[0]["kind"] == "loop_carried_ssa"
+    assert plan.resource_summary["max_logical_slot_depth"] == 1
+    audit = audit_plan(plan)
+    assert audit["passed"]
+    assert audit["summary"]["lds_reuse_hazards"] == 0
     assert verify_replay(TTGIR, plan, native_value_graph=native)["semantic_match"]
 
 
@@ -239,7 +286,7 @@ def test_read_upgrades_plan_bundle_0_1(tmp_path) -> None:
     path = tmp_path / "old-plan.json"
     path.write_text(json.dumps(plan))
     upgraded = PlanBundle.read(path)
-    assert upgraded.schema_version == "0.4"
+    assert upgraded.schema_version == "0.5"
     assert upgraded.values == []
 
 
@@ -257,7 +304,7 @@ def test_read_upgrades_plan_bundle_0_2(tmp_path) -> None:
     path = tmp_path / "old-plan.json"
     path.write_text(json.dumps(plan))
     upgraded = PlanBundle.read(path)
-    assert upgraded.schema_version == "0.4"
+    assert upgraded.schema_version == "0.5"
     assert upgraded.blocks == []
 
 
@@ -275,9 +322,27 @@ def test_read_upgrades_plan_bundle_0_3_without_losing_liveness(tmp_path) -> None
     path = tmp_path / "old-plan.json"
     path.write_text(json.dumps(plan))
     upgraded = PlanBundle.read(path)
-    assert upgraded.schema_version == "0.4"
+    assert upgraded.schema_version == "0.5"
     assert upgraded.blocks[0]["id"] == "preserved"
     assert upgraded.async_transactions == []
+
+
+def test_read_upgrades_plan_bundle_0_4_with_m1_4d_defaults(tmp_path) -> None:
+    plan = extract_plan(TTGIR).to_dict()
+    plan["schema_version"] = "0.4"
+    for field in (
+        "dependency_edges",
+        "peak_live_sets",
+        "resource_summary",
+        "unresolved_facts",
+    ):
+        plan.pop(field)
+    path = tmp_path / "old-plan.json"
+    path.write_text(json.dumps(plan))
+    upgraded = PlanBundle.read(path)
+    assert upgraded.schema_version == "0.5"
+    assert upgraded.dependency_edges == []
+    assert upgraded.resource_summary == {}
 
 
 def test_layered_diff_localizes_schedule_change() -> None:
@@ -296,4 +361,53 @@ def test_validation_rejects_unknown_scheduled_operation() -> None:
     plan.schedule.append("op/missing/0")
     plan.refresh_hashes()
     with pytest.raises(PlanError, match="unknown operations"):
+        plan.validate()
+
+
+def test_audit_rejects_open_important_fact() -> None:
+    plan = extract_plan(TTGIR)
+    plan.unresolved_facts.append(
+        {
+            "severity": "warning",
+            "code": "unresolved_lds_slot",
+            "message": "slot is unknown",
+            "importance": "important",
+            "status": "open",
+            "operation": plan.operations[0]["id"],
+            "value": None,
+        }
+    )
+    plan.refresh_hashes()
+    report = audit_plan(plan)
+    assert not report["passed"]
+    assert report["summary"]["open_important_facts"] == 1
+
+
+def test_validation_rejects_distance_zero_dependency_cycle() -> None:
+    plan = extract_plan(TTGIR)
+    first, second = plan.operations[:2]
+    plan.dependency_edges = [
+        {
+            "id": "a",
+            "kind": "ssa",
+            "source_operation": first["id"],
+            "destination_operation": second["id"],
+            "source_value": None,
+            "destination_value": None,
+            "root_value": None,
+            "iteration_distance": 0,
+        },
+        {
+            "id": "b",
+            "kind": "ssa",
+            "source_operation": second["id"],
+            "destination_operation": first["id"],
+            "source_value": None,
+            "destination_value": None,
+            "root_value": None,
+            "iteration_distance": 0,
+        },
+    ]
+    plan.refresh_hashes()
+    with pytest.raises(PlanError, match="contains a cycle"):
         plan.validate()

@@ -1,6 +1,6 @@
 # AMD TLX Plan IR prototype
 
-This directory implements M1.1--M1.4c of the profile-guided TLX scheduling
+This directory implements M1.1--M1.4d of the profile-guided TLX scheduling
 design without changing the existing TLX kernels or modulo scheduler.
 
 ## Implemented milestones
@@ -27,6 +27,10 @@ design without changing the existing TLX kernels or modulo scheduler.
   commit groups, partial waits, visibility and release barriers, consumers,
   structured-loop iteration distance, symbolic slot overwrite, and explicit
   reuse hazards.
+- **M1.4d — verified audit contract:** explicit SSA, memory, async, barrier,
+  and slot-reuse dependencies; block-local peak logical live sets; logical
+  resource summaries; typed unresolved facts; and a strict machine-readable
+  and Markdown audit for pinned kernels.
 
 M1.3 verifies that a captured baseline is reproducible. It does **not** lower an
 arbitrarily mutated storage or schedule plan back into TTGIR. That mutation path
@@ -74,6 +78,15 @@ Compare two extracted plans with:
 
 ```bash
 python3 -m tlx_plan diff /tmp/baseline-plan.json /tmp/candidate-plan.json
+```
+
+Run the strict M1.4d audit with:
+
+```bash
+python3 -m tlx_plan audit \
+  --plan /tmp/plan.json \
+  --output /tmp/plan-audit.json \
+  --markdown-output /tmp/plan-audit.md
 ```
 
 The fixed configuration names and kernel symbols are sourced from

@@ -209,6 +209,65 @@ struct PlanAsyncLifetimeResult {
   std::vector<PlanDiagnostic> diagnostics;
 };
 
+/// A semantic dependency between stable TTGIR operations. The distance is a
+/// structured-loop iteration distance, not a latency or cycle count.
+struct PlanDependencyEdge {
+  std::string id;
+  std::string kind;
+  std::string sourceOperationId;
+  std::string destinationOperationId;
+  std::string sourceValueId;
+  std::string destinationValueId;
+  std::string rootValueId;
+  std::string precision;
+  std::string reason;
+  int64_t iterationDistance = 0;
+};
+
+/// Maximum block-local overlap at one static TTGIR program point. Logical
+/// tensor bytes are whole distributed tensor bytes, not per-wave VGPR bytes.
+struct PlanPeakLiveSet {
+  std::string blockId;
+  std::string operationId;
+  int64_t position = 0;
+  int64_t logicalTensorBytes = 0;
+  int64_t unknownTensorValueCount = 0;
+  int64_t logicalLdsBytes = 0;
+  std::vector<std::string> tensorValueIds;
+  std::vector<std::string> ldsRootValueIds;
+};
+
+struct PlanResourceSummary {
+  int64_t logicalLdsAllocationBytes = 0;
+  int64_t unknownLdsAllocations = 0;
+  int64_t peakLogicalTensorBytes = 0;
+  int64_t peakLogicalTensorCount = 0;
+  int64_t peakUnknownTensorValueCount = 0;
+  int64_t peakLogicalLdsBytes = 0;
+  int64_t maxAsyncIterationDistance = 0;
+  int64_t maxPossiblyOutstandingGroups = 0;
+  int64_t maxLogicalSlotDepth = 1;
+  std::map<std::string, int64_t> pipelineClassCounts;
+};
+
+struct PlanUnresolvedFact {
+  std::string severity;
+  std::string code;
+  std::string message;
+  std::string operationId;
+  std::string valueId;
+  std::string importance;
+  std::string status;
+};
+
+struct PlanAuditAnalysisResult {
+  std::vector<PlanDependencyEdge> dependencies;
+  std::vector<PlanPeakLiveSet> peakLiveSets;
+  PlanResourceSummary resources;
+  std::vector<PlanUnresolvedFact> unresolvedFacts;
+  std::vector<PlanDiagnostic> diagnostics;
+};
+
 FailureOr<PlanLivenessResult> analyzePlanLiveness(
     FuncOp function,
     const llvm::DenseMap<Operation *, std::string> &operationIds,
@@ -222,10 +281,23 @@ FailureOr<PlanAsyncLifetimeResult> analyzePlanAsyncLifetimes(
     ArrayRef<PlanBlockRecord> blocks, ArrayRef<PlanAliasRecord> aliases,
     ArrayRef<PlanMemoryAccess> memoryAccesses);
 
+FailureOr<PlanAuditAnalysisResult> analyzePlanAudit(
+    ArrayRef<PlanOperationRecord> operations, ArrayRef<PlanValueRecord> values,
+    ArrayRef<PlanLineageEdge> lineageEdges, ArrayRef<PlanBlockRecord> blocks,
+    ArrayRef<PlanLiveSegment> liveSegments,
+    ArrayRef<PlanMemoryAccess> memoryAccesses,
+    ArrayRef<PlanLdsAllocationRecord> ldsAllocations,
+    ArrayRef<PlanAsyncTransaction> asyncTransactions,
+    ArrayRef<PlanAsyncGroup> asyncGroups,
+    ArrayRef<PlanAsyncWaitRecord> asyncWaits,
+    ArrayRef<PlanLdsReuseHazard> ldsReuseHazards,
+    ArrayRef<PlanDiagnostic> diagnostics);
+
 /// Analysis-only description of operation/value identity, value lineage,
-/// static program-order liveness, and logical LDS aliases for one final
-/// structured TTGIR function. It deliberately does not model physical
-/// register allocation, physical LDS offsets, or asynchronous completion.
+/// static program-order liveness, logical LDS aliases, asynchronous lifetime,
+/// semantic dependencies, and logical overlap for one final structured TTGIR
+/// function. It deliberately does not model physical register allocation,
+/// physical LDS offsets, or hardware-cycle lifetime.
 class PlanValueGraph {
 public:
   static FailureOr<PlanValueGraph> build(FuncOp function);
@@ -256,6 +328,16 @@ public:
   ArrayRef<PlanLdsReuseHazard> getLdsReuseHazards() const {
     return ldsReuseHazards;
   }
+  ArrayRef<PlanDependencyEdge> getDependencyEdges() const {
+    return dependencyEdges;
+  }
+  ArrayRef<PlanPeakLiveSet> getPeakLiveSets() const { return peakLiveSets; }
+  const PlanResourceSummary &getResourceSummary() const {
+    return resourceSummary;
+  }
+  ArrayRef<PlanUnresolvedFact> getUnresolvedFacts() const {
+    return unresolvedFacts;
+  }
 
 private:
   std::string functionName;
@@ -273,6 +355,10 @@ private:
   std::vector<PlanAsyncGroup> asyncGroups;
   std::vector<PlanAsyncWaitRecord> asyncWaits;
   std::vector<PlanLdsReuseHazard> ldsReuseHazards;
+  std::vector<PlanDependencyEdge> dependencyEdges;
+  std::vector<PlanPeakLiveSet> peakLiveSets;
+  PlanResourceSummary resourceSummary;
+  std::vector<PlanUnresolvedFact> unresolvedFacts;
 };
 
 /// Serialize a module-level sidecar. The graphs are sorted by function name;

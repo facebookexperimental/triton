@@ -246,6 +246,7 @@ def extract_plan(
             "plan-value-graph/0.1",
             "plan-value-graph/0.2",
             "plan-value-graph/0.3",
+            "plan-value-graph/0.4",
         }:
             raise PlanError("unsupported native plan-value-graph schema")
         native_function = next(
@@ -366,18 +367,26 @@ def extract_plan(
         if op.kind in sync_kinds
     ]
 
-    diagnostics: list[str] = []
+    diagnostics: list[dict[str, Any]] = []
     unknown = sum(fragment["role"] == "unknown" for fragment in fragments)
     if unknown:
-        diagnostics.append(f"{unknown} dot fragments have an unresolved output role")
-    if not fragments:
-        diagnostics.append("no dot or scheduled MFMA operations were found")
-    if native_function is not None:
-        diagnostics.extend(
-            f"native:{item.get('severity', 'note')}:{item.get('code', 'unknown')}:"
-            f"{item.get('message', '')}"
-            for item in native_function.get("diagnostics", [])
+        diagnostics.append(
+            {
+                "severity": "warning",
+                "code": "unresolved_dot_role",
+                "message": f"{unknown} dot fragments have an unresolved output role",
+            }
         )
+    if not fragments:
+        diagnostics.append(
+            {
+                "severity": "warning",
+                "code": "no_dot_fragments",
+                "message": "no dot or scheduled MFMA operations were found",
+            }
+        )
+    if native_function is not None:
+        diagnostics.extend(dict(item) for item in native_function.get("diagnostics", []))
 
     provenance: dict[str, Any] = {"source_name": source_name}
     case: dict[str, Any] = {}
@@ -422,6 +431,18 @@ def extract_plan(
         async_waits=native_function.get("async_waits", []) if native_function is not None else [],
         lds_reuse_hazards=(
             native_function.get("lds_reuse_hazards", []) if native_function is not None else []
+        ),
+        dependency_edges=(
+            native_function.get("dependency_edges", []) if native_function is not None else []
+        ),
+        peak_live_sets=(
+            native_function.get("peak_live_sets", []) if native_function is not None else []
+        ),
+        resource_summary=(
+            native_function.get("resource_summary", {}) if native_function is not None else {}
+        ),
+        unresolved_facts=(
+            native_function.get("unresolved_facts", []) if native_function is not None else []
         ),
         value_graph_fingerprint=(
             native_function.get("semantic_fingerprint", "") if native_function is not None else ""

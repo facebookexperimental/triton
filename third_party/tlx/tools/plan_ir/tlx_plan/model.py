@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 
-SCHEMA_VERSION = "0.4"
+SCHEMA_VERSION = "0.5"
 BASELINE_SCHEMA_VERSION = "0.1"
 
 
@@ -97,8 +97,12 @@ class PlanBundle:
     async_groups: list[dict[str, Any]] = field(default_factory=list)
     async_waits: list[dict[str, Any]] = field(default_factory=list)
     lds_reuse_hazards: list[dict[str, Any]] = field(default_factory=list)
+    dependency_edges: list[dict[str, Any]] = field(default_factory=list)
+    peak_live_sets: list[dict[str, Any]] = field(default_factory=list)
+    resource_summary: dict[str, Any] = field(default_factory=dict)
+    unresolved_facts: list[dict[str, Any]] = field(default_factory=list)
     value_graph_fingerprint: str = ""
-    diagnostics: list[str] = field(default_factory=list)
+    diagnostics: list[dict[str, Any]] = field(default_factory=list)
     schema_version: str = SCHEMA_VERSION
     layer_hashes: dict[str, str] = field(default_factory=dict)
 
@@ -120,6 +124,10 @@ class PlanBundle:
         "async_groups",
         "async_waits",
         "lds_reuse_hazards",
+        "dependency_edges",
+        "peak_live_sets",
+        "resource_summary",
+        "unresolved_facts",
     )
 
     def refresh_hashes(self) -> None:
@@ -284,6 +292,94 @@ class PlanBundle:
                 raise PlanError("LDS reuse hazard refers to an unknown operation")
             if root is not None and root not in value_id_set:
                 raise PlanError("LDS reuse hazard refers to an unknown root")
+
+        dependency_ids = [edge.get("id") for edge in self.dependency_edges]
+        if any(not value for value in dependency_ids) or len(dependency_ids) != len(set(dependency_ids)):
+            raise PlanError("dependency ids must be non-empty and unique")
+        zero_distance_successors: dict[str, set[str]] = {operation: set() for operation in op_id_set}
+        for edge in self.dependency_edges:
+            source = edge.get("source_operation")
+            destination = edge.get("destination_operation")
+            if source not in op_id_set or destination not in op_id_set:
+                raise PlanError("dependency refers to an unknown operation")
+            for field in ("source_value", "destination_value", "root_value"):
+                value = edge.get(field)
+                if value is not None and value not in value_id_set:
+                    raise PlanError("dependency refers to an unknown value")
+            distance = edge.get("iteration_distance", 0)
+            if not isinstance(distance, int) or distance < 0:
+                raise PlanError("dependency iteration distance must be nonnegative")
+            if distance == 0 and source != destination:
+                zero_distance_successors[source].add(destination)
+
+        visiting: set[str] = set()
+        visited: set[str] = set()
+
+        def visit(operation: str) -> None:
+            if operation in visiting:
+                raise PlanError("distance-zero dependency graph contains a cycle")
+            if operation in visited:
+                return
+            visiting.add(operation)
+            for successor in zero_distance_successors[operation]:
+                visit(successor)
+            visiting.remove(operation)
+            visited.add(operation)
+
+        for operation in sorted(op_id_set):
+            visit(operation)
+
+        for peak in self.peak_live_sets:
+            block = peak.get("block")
+            position = peak.get("position")
+            if block not in block_sizes or not isinstance(position, int) or not 0 <= position <= block_sizes[block]:
+                raise PlanError("peak live set has an invalid block position")
+            operation = peak.get("operation")
+            if operation is not None and operation not in op_id_set:
+                raise PlanError("peak live set refers to an unknown operation")
+            if any(value not in value_id_set for value in peak.get("tensor_values", [])):
+                raise PlanError("peak live set refers to an unknown tensor value")
+            if any(value not in value_id_set for value in peak.get("lds_root_values", [])):
+                raise PlanError("peak live set refers to an unknown LDS root")
+            for field in (
+                "logical_tensor_bytes",
+                "unknown_tensor_value_count",
+                "logical_lds_bytes",
+            ):
+                value = peak.get(field, 0)
+                if not isinstance(value, int) or value < 0:
+                    raise PlanError("peak live set resource fields must be nonnegative integers")
+
+        for field in (
+            "logical_lds_allocation_bytes",
+            "unknown_lds_allocations",
+            "peak_logical_tensor_bytes",
+            "peak_logical_tensor_count",
+            "peak_unknown_tensor_value_count",
+            "peak_logical_lds_bytes",
+            "max_async_iteration_distance",
+            "max_possibly_outstanding_groups",
+        ):
+            value = self.resource_summary.get(field, 0)
+            if not isinstance(value, int) or value < 0:
+                raise PlanError("resource summary fields must be nonnegative integers")
+        slot_depth = self.resource_summary.get("max_logical_slot_depth", 1)
+        if not isinstance(slot_depth, int) or slot_depth < 1:
+            raise PlanError("maximum logical slot depth must be positive")
+        if self.resource_summary.get("logical_tensor_bytes_are_per_wave_vgpr_bytes", False):
+            raise PlanError("logical tensor bytes cannot be labeled as physical per-wave VGPR bytes")
+
+        for fact in self.unresolved_facts:
+            operation = fact.get("operation")
+            value = fact.get("value")
+            if operation is not None and operation not in op_id_set:
+                raise PlanError("unresolved fact refers to an unknown operation")
+            if value is not None and value not in value_id_set:
+                raise PlanError("unresolved fact refers to an unknown value")
+            if fact.get("importance") not in {"important", "advisory"}:
+                raise PlanError("unresolved fact has an unknown importance")
+            if fact.get("status") not in {"open", "accepted_deterministic_fallback"}:
+                raise PlanError("unresolved fact has an unknown status")
         fragment_ids = [fragment.get("id") for fragment in self.dot_fragments]
         if len(fragment_ids) != len(set(fragment_ids)):
             raise PlanError("dot fragment ids are not unique")
@@ -300,13 +396,20 @@ class PlanBundle:
     def from_dict(cls, value: dict[str, Any]) -> "PlanBundle":
         value = dict(value)
         schema_version = value.get("schema_version", "0.1")
-        if schema_version in {"0.1", "0.2", "0.3"}:
+        if schema_version in {"0.1", "0.2", "0.3", "0.4"}:
             additions = {
-                "async_transactions": [],
-                "async_groups": [],
-                "async_waits": [],
-                "lds_reuse_hazards": [],
+                "dependency_edges": [],
+                "peak_live_sets": [],
+                "resource_summary": {},
+                "unresolved_facts": [],
             }
+            if schema_version in {"0.1", "0.2", "0.3"}:
+                additions.update(
+                    async_transactions=[],
+                    async_groups=[],
+                    async_waits=[],
+                    lds_reuse_hazards=[],
+                )
             if schema_version in {"0.1", "0.2"}:
                 additions.update(
                     blocks=[],
@@ -326,6 +429,16 @@ class PlanBundle:
                 layer_hashes={},
                 **additions,
             )
+        value["diagnostics"] = [
+            diagnostic
+            if isinstance(diagnostic, dict)
+            else {
+                "severity": "warning",
+                "code": "legacy_diagnostic",
+                "message": str(diagnostic),
+            }
+            for diagnostic in value.get("diagnostics", [])
+        ]
         bundle = cls(**value)
         if not bundle.layer_hashes:
             bundle.refresh_hashes()

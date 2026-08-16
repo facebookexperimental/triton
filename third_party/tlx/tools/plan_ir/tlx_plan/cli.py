@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Sequence
 
 from .baseline import FA_BWD_D128_CASES, FA_BWD_D128_SCHEDULES, make_manifest, read_manifest, write_catalog
+from .audit import audit_markdown, audit_plan
 from .model import PlanBundle, canonical_json
 from .replay import compare_plans, replay_normalized, verify_replay
 from .ttgir import extract_plan, normalize_ttgir
@@ -63,6 +64,11 @@ def _parser() -> argparse.ArgumentParser:
     diff.add_argument("expected", type=Path)
     diff.add_argument("actual", type=Path)
     diff.add_argument("--output", type=Path)
+
+    audit = commands.add_parser("audit", help="run the strict M1.4d PlanBundle audit")
+    audit.add_argument("--plan", type=Path, required=True)
+    audit.add_argument("--output", type=Path)
+    audit.add_argument("--markdown-output", type=Path)
     return parser
 
 
@@ -120,6 +126,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0 if report["semantic_match"] else 1
     elif args.command == "diff":
         _emit(compare_plans(PlanBundle.read(args.expected), PlanBundle.read(args.actual)), args.output)
+    elif args.command == "audit":
+        report = audit_plan(PlanBundle.read(args.plan))
+        _emit(report, args.output)
+        if args.markdown_output:
+            args.markdown_output.write_text(audit_markdown(report))
+        return 0 if report["passed"] else 1
     return 0
 
 

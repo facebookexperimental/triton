@@ -38,7 +38,7 @@
 // CHECK:         ttg.convert_layout {{.*}}tensor<256x64xf16, #blocked>
 // CHECK:         tt.dot
 
-// PLAN-DAG: "schema_version": "plan-value-graph/0.3"
+// PLAN-DAG: "schema_version": "plan-value-graph/0.4"
 // PLAN-DAG: "kind": "loop_init"
 // PLAN-DAG: "iteration_distance": 1
 // PLAN-DAG: "kind": "loop_backedge"
@@ -73,6 +73,21 @@
 // PLAN-DAG: "iteration_distance": 2
 // PLAN-DAG: "precision": "conservative_cross_region"
 // PLAN-DAG: "code": "async_write_without_completion"
+// PLAN-DAG: "kind": "loop_carried_ssa"
+// PLAN-DAG: "kind": "memory_raw"
+// PLAN-DAG: "kind": "memory_war"
+// PLAN-DAG: "kind": "memory_waw"
+// PLAN-DAG: "kind": "async_completion"
+// PLAN-DAG: "kind": "barrier_visibility"
+// PLAN-DAG: "kind": "consumer_release"
+// PLAN-DAG: "kind": "slot_reuse"
+// PLAN-DAG: "peak_live_sets": [
+// PLAN-DAG: "logical_tensor_bytes_are_per_wave_vgpr_bytes": false
+// PLAN-DAG: "physical_vgpr_peak": null
+// PLAN-DAG: "physical_lds_bytes": null
+// PLAN-DAG: "max_logical_slot_depth": 2
+// PLAN-DAG: "importance": "important"
+// PLAN-DAG: "status": "open"
 // PLAN-TRANSPOSE: "kind": "in_thread_transpose"
 
 #mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [2, 2], instrShape = [16, 16, 32], isTransposed = true}>

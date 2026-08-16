@@ -633,6 +633,19 @@ FailureOr<PlanValueGraph> PlanValueGraph::build(FuncOp function) {
   graph.ldsReuseHazards = std::move(asyncLifetimes->hazards);
   llvm::append_range(graph.diagnostics, asyncLifetimes->diagnostics);
 
+  FailureOr<PlanAuditAnalysisResult> audit = analyzePlanAudit(
+      graph.operations, graph.values, graph.lineageEdges, graph.blocks,
+      graph.liveSegments, graph.memoryAccesses, graph.ldsAllocations,
+      graph.asyncTransactions, graph.asyncGroups, graph.asyncWaits,
+      graph.ldsReuseHazards, graph.diagnostics);
+  if (failed(audit))
+    return failure();
+  graph.dependencyEdges = std::move(audit->dependencies);
+  graph.peakLiveSets = std::move(audit->peakLiveSets);
+  graph.resourceSummary = std::move(audit->resources);
+  graph.unresolvedFacts = std::move(audit->unresolvedFacts);
+  llvm::append_range(graph.diagnostics, audit->diagnostics);
+
   llvm::sort(graph.operations,
              [](const auto &lhs, const auto &rhs) { return lhs.id < rhs.id; });
   llvm::sort(graph.values,
@@ -828,6 +841,47 @@ LogicalResult PlanValueGraph::verify(bool strict) const {
         (!hazard.rootValueId.empty() && !valueIds.count(hazard.rootValueId)))
       return failure();
   }
+  std::set<std::string> dependencyIds;
+  for (const PlanDependencyEdge &edge : dependencyEdges) {
+    if (edge.id.empty() || !dependencyIds.insert(edge.id).second ||
+        !operationIds.count(edge.sourceOperationId) ||
+        !operationIds.count(edge.destinationOperationId) ||
+        (!edge.sourceValueId.empty() && !valueIds.count(edge.sourceValueId)) ||
+        (!edge.destinationValueId.empty() &&
+         !valueIds.count(edge.destinationValueId)) ||
+        (!edge.rootValueId.empty() && !valueIds.count(edge.rootValueId)) ||
+        edge.iterationDistance < 0)
+      return failure();
+  }
+  for (const PlanPeakLiveSet &peak : peakLiveSets) {
+    auto block = blockSizes.find(peak.blockId);
+    if (block == blockSizes.end() || peak.position < 0 ||
+        peak.position > block->second || peak.logicalTensorBytes < 0 ||
+        peak.unknownTensorValueCount < 0 || peak.logicalLdsBytes < 0 ||
+        (!peak.operationId.empty() && !operationIds.count(peak.operationId)))
+      return failure();
+    for (StringRef value : peak.tensorValueIds)
+      if (!valueIds.count(value.str()))
+        return failure();
+    for (StringRef root : peak.ldsRootValueIds)
+      if (!valueIds.count(root.str()))
+        return failure();
+  }
+  if (resourceSummary.logicalLdsAllocationBytes < 0 ||
+      resourceSummary.unknownLdsAllocations < 0 ||
+      resourceSummary.peakLogicalTensorBytes < 0 ||
+      resourceSummary.peakLogicalTensorCount < 0 ||
+      resourceSummary.peakUnknownTensorValueCount < 0 ||
+      resourceSummary.peakLogicalLdsBytes < 0 ||
+      resourceSummary.maxAsyncIterationDistance < 0 ||
+      resourceSummary.maxPossiblyOutstandingGroups < 0 ||
+      resourceSummary.maxLogicalSlotDepth < 1)
+    return failure();
+  for (const PlanUnresolvedFact &fact : unresolvedFacts)
+    if ((!fact.operationId.empty() && !operationIds.count(fact.operationId)) ||
+        (!fact.valueId.empty() && !valueIds.count(fact.valueId)) ||
+        fact.importance.empty() || fact.status.empty())
+      return failure();
   if (strict)
     for (const auto &diagnostic : diagnostics)
       if (diagnostic.severity == "error")
@@ -1083,6 +1137,94 @@ llvm::json::Object PlanValueGraph::toJSON() const {
     reuseHazardArray.push_back(std::move(object));
   }
 
+  llvm::json::Array dependencyArray;
+  for (const PlanDependencyEdge &edge : dependencyEdges) {
+    llvm::json::Object object{
+        {"id", edge.id},
+        {"kind", edge.kind},
+        {"source_operation", edge.sourceOperationId},
+        {"destination_operation", edge.destinationOperationId},
+        {"precision", edge.precision},
+        {"reason", edge.reason},
+        {"iteration_distance", edge.iterationDistance},
+    };
+    object["source_value"] = edge.sourceValueId.empty()
+                                 ? llvm::json::Value(nullptr)
+                                 : llvm::json::Value(edge.sourceValueId);
+    object["destination_value"] =
+        edge.destinationValueId.empty()
+            ? llvm::json::Value(nullptr)
+            : llvm::json::Value(edge.destinationValueId);
+    object["root_value"] = edge.rootValueId.empty()
+                               ? llvm::json::Value(nullptr)
+                               : llvm::json::Value(edge.rootValueId);
+    dependencyArray.push_back(std::move(object));
+  }
+
+  llvm::json::Array peakArray;
+  for (const PlanPeakLiveSet &peak : peakLiveSets) {
+    llvm::json::Array tensors;
+    for (StringRef value : peak.tensorValueIds)
+      tensors.push_back(value);
+    llvm::json::Array roots;
+    for (StringRef root : peak.ldsRootValueIds)
+      roots.push_back(root);
+    peakArray.push_back(llvm::json::Object{
+        {"block", peak.blockId},
+        {"operation", peak.operationId.empty()
+                          ? llvm::json::Value(nullptr)
+                          : llvm::json::Value(peak.operationId)},
+        {"position", peak.position},
+        {"logical_tensor_bytes", peak.logicalTensorBytes},
+        {"unknown_tensor_value_count", peak.unknownTensorValueCount},
+        {"logical_lds_bytes", peak.logicalLdsBytes},
+        {"tensor_values", std::move(tensors)},
+        {"lds_root_values", std::move(roots)},
+    });
+  }
+
+  llvm::json::Object pipelineCounts;
+  for (const auto &[pipeline, count] : resourceSummary.pipelineClassCounts)
+    pipelineCounts[pipeline] = count;
+  llvm::json::Object resources{
+      {"logical_lds_allocation_bytes",
+       resourceSummary.logicalLdsAllocationBytes},
+      {"unknown_lds_allocations", resourceSummary.unknownLdsAllocations},
+      {"peak_logical_tensor_bytes", resourceSummary.peakLogicalTensorBytes},
+      {"peak_logical_tensor_count", resourceSummary.peakLogicalTensorCount},
+      {"peak_unknown_tensor_value_count",
+       resourceSummary.peakUnknownTensorValueCount},
+      {"peak_logical_lds_bytes", resourceSummary.peakLogicalLdsBytes},
+      {"max_async_iteration_distance",
+       resourceSummary.maxAsyncIterationDistance},
+      {"max_possibly_outstanding_groups",
+       resourceSummary.maxPossiblyOutstandingGroups},
+      {"max_logical_slot_depth", resourceSummary.maxLogicalSlotDepth},
+      {"pipeline_class_counts", std::move(pipelineCounts)},
+      {"pipeline_model", "ttgir_operation_classification"},
+      {"logical_tensor_bytes_are_per_wave_vgpr_bytes", false},
+      {"physical_vgpr_peak", nullptr},
+      {"physical_lds_bytes", nullptr},
+      {"modeled_res_mii", nullptr},
+      {"modeled_rec_mii", nullptr},
+      {"modeled_min_ii", nullptr},
+  };
+
+  llvm::json::Array unresolvedArray;
+  for (const PlanUnresolvedFact &fact : unresolvedFacts) {
+    llvm::json::Object object{
+        {"severity", fact.severity}, {"code", fact.code},
+        {"message", fact.message},   {"importance", fact.importance},
+        {"status", fact.status},
+    };
+    object["operation"] = fact.operationId.empty()
+                              ? llvm::json::Value(nullptr)
+                              : llvm::json::Value(fact.operationId);
+    object["value"] = fact.valueId.empty() ? llvm::json::Value(nullptr)
+                                           : llvm::json::Value(fact.valueId);
+    unresolvedArray.push_back(std::move(object));
+  }
+
   return llvm::json::Object{
       {"function", functionName},
       {"semantic_fingerprint", semanticFingerprint},
@@ -1098,6 +1240,10 @@ llvm::json::Object PlanValueGraph::toJSON() const {
       {"async_groups", std::move(asyncGroupArray)},
       {"async_waits", std::move(asyncWaitArray)},
       {"lds_reuse_hazards", std::move(reuseHazardArray)},
+      {"dependency_edges", std::move(dependencyArray)},
+      {"peak_live_sets", std::move(peakArray)},
+      {"resource_summary", std::move(resources)},
+      {"unresolved_facts", std::move(unresolvedArray)},
       {"diagnostics", std::move(diagnosticArray)},
   };
 }
@@ -1134,9 +1280,11 @@ std::string serializePlanValueGraphs(ArrayRef<PlanValueGraph> graphs,
       {"async_lifetime_extended_through_wait", true},
       {"async_lifetimes_are_physical_cycles", false},
       {"async_analysis_domain", "commit_count_and_cta_barrier"},
+      {"dependency_distances_are_cycles", false},
+      {"resource_summary_is_physical_allocation", false},
   };
   llvm::json::Object root{
-      {"schema_version", "plan-value-graph/0.3"},
+      {"schema_version", "plan-value-graph/0.4"},
       {"module_semantic_fingerprint", moduleFingerprint},
       {"provenance", std::move(provenance)},
       {"functions", std::move(functions)},

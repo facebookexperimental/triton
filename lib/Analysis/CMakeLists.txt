@@ -5,6 +5,7 @@ add_triton_library(TritonAnalysis
   Membar.cpp
   Alias.cpp
   PlanAsyncLifetime.cpp
+  PlanAudit.cpp
   PlanValueGraph.cpp
   PlanLiveness.cpp
   Utility.cpp

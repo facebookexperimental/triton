@@ -1,4 +1,4 @@
-# PlanBundle schema 0.4
+# PlanBundle schema 0.5
 
 PlanBundle is a canonical JSON sidecar for final AMD Triton/TLX TTGIR. All
 objects are serialized with sorted keys, and every independently comparable
@@ -8,7 +8,7 @@ layer has a SHA-256 hash.
 
 | Field | Meaning |
 |---|---|
-| `schema_version` | Exact reader/writer contract, currently `0.4`; readers upgrade `0.1`, `0.2`, and `0.3`. |
+| `schema_version` | Exact reader/writer contract, currently `0.5`; readers upgrade `0.1` through `0.4`. |
 | `kernel` | TTGIR function symbol. |
 | `case` | Shape, dtype, causal, and MHA/GQA contract from the baseline manifest. |
 | `provenance` | Source/compiler revisions, schedule configuration, and captured artifact references. |
@@ -30,6 +30,10 @@ layer has a SHA-256 hash.
 | `async_groups` | Static commit groups and their transactions. |
 | `async_waits` | Partial-wait retained count, completed groups with iteration distance, and possibly outstanding groups. |
 | `lds_reuse_hazards` | Missing commit, wait, visibility, or consumer-release relationships that prevent proving safe reuse. |
+| `dependency_edges` | SSA, loop-carried, RAW/WAR/WAW, async, barrier, consumer-release, and slot-reuse dependencies with iteration distance and precision. |
+| `peak_live_sets` | Per-block maximum static overlap of logical tensor values and logical LDS roots. |
+| `resource_summary` | Logical overlap, slot depth, async depth, and TTGIR operation-class counts; physical resource fields remain null. |
+| `unresolved_facts` | Typed open or accepted facts with importance and stable operation/value references. |
 | `value_graph_fingerprint` | Semantic fingerprint of the native operation/value graph. |
 | `layer_hashes` | Independent hashes for operation, dot, storage, sync, schedule, layout, value, lineage, liveness, and LDS layers. |
 | `diagnostics` | Unresolved semantic information; never silently discarded. |
@@ -75,3 +79,10 @@ WAR edge. Reuse therefore requires a release barrier after consumption.
 TDM/mbarrier epochs, physical LDS placement, physical VGPR allocation, backend
 instruction order, and cycle timing remain outside this schema and are never
 inferred from TTGIR.
+
+Version 0.5 adds M1.4d. Dependency distance is a structured-loop iteration
+distance, not latency. Peak tensor bytes are whole distributed logical tensor
+bytes, not per-wave VGPR bytes. Peak LDS bytes use logical allocation roots and
+do not imply assigned offsets or allocator overlap. `tlx_plan audit` rejects
+error diagnostics, open important facts, and LDS reuse hazards while allowing
+explicitly classified deterministic identity fallbacks.
