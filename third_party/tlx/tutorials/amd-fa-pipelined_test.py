@@ -323,15 +323,21 @@ def _attn_fwd_async_prefetch(
         kt_cur = tlx.local_load(kt_view, token=wait_tok, relaxed=True)
         v_cur = tlx.local_load(tlx.local_view(v_buf, slot_cur), token=wait_tok, relaxed=True)
 
+        if HEAD_DIM == 64:
+            qk = tl.dot(q, kt_cur)
+            if IS_CAUSAL:
+                qk = tl.where(offs_m[:, None] >= kn[None, :], qk, float("-inf"))
+
         # GLDS_KV_t(i+1), prefetch tile i+1 into the *other* slots.
         tok_k = tlx.async_load(k_ptrs + next_off * stride_kn, tlx.local_view(k_buf, slot_nxt), mask=next_mask)
         tok_v = tlx.async_load(v_ptrs + next_off * stride_vn, tlx.local_view(v_buf, slot_nxt), mask=next_mask)
         tlx.async_load_commit_group([tok_k, tok_v])
 
         # QK_ti
-        qk = tl.dot(q, kt_cur)
-        if IS_CAUSAL:
-            qk = tl.where(offs_m[:, None] >= kn[None, :], qk, float("-inf"))
+        if HEAD_DIM != 64:
+            qk = tl.dot(q, kt_cur)
+            if IS_CAUSAL:
+                qk = tl.where(offs_m[:, None] >= kn[None, :], qk, float("-inf"))
 
         # SM_ti
         m_ij = tl.maximum(m_i, tl.max(qk, 1) * QK_SCALE)

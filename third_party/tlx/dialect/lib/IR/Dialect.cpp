@@ -136,10 +136,11 @@ struct TLXInferLayoutInterface : public triton::DialectInferLayoutInterface {
           wrapNoVerifyLayout(slice.getParent()));
       auto deferredSlice = triton::gpu::SliceEncodingAttr::get(
           result.getContext(), slice.getDim(), parent);
-      // Keep the slice parent deferred for canonical slice inference, and also
-      // defer verification of the whole result while frontend TTIR has no
-      // ttg.num-warps context yet.
-      resultEncoding = wrapNoVerifyLayout(deferredSlice);
+      // Keep the slice parent deferred.  The recursive placeholder query
+      // already defers verification of the result, while leaving the slice at
+      // the top level preserves the encoding shape inferred when the op was
+      // built and avoids no_verify<slice<no_verify<...>>> on re-inference.
+      resultEncoding = deferredSlice;
     } else {
       resultEncoding = wrapNoVerifyLayout(result);
     }
@@ -241,6 +242,23 @@ struct TLXInferLayoutInterface : public triton::DialectInferLayoutInterface {
   LogicalResult
   verifyDotOpEncodingCompatibility(Operation *op, Attribute operandEncodingA,
                                    Attribute operandEncodingB) const override {
+    Attribute resultEncoding;
+    if (op->getNumResults() == 1)
+      if (auto resultType =
+              dyn_cast<RankedTensorType>(op->getResult(0).getType()))
+        resultEncoding = resultType.getEncoding();
+
+    // no_verify denotes an intentionally incomplete frontend layout graph.
+    // In particular, helper boundaries may temporarily leave one dot operand
+    // unencoded while the accumulator/result already carries its pinned MFMA
+    // placeholder. The resolve pass removes every no_verify wrapper before
+    // final layout verification, so validating the partially resolved graph
+    // here rejects states that are both legal and required by that pipeline.
+    if (hasNoVerifyLayout(operandEncodingA) ||
+        hasNoVerifyLayout(operandEncodingB) ||
+        hasNoVerifyLayout(resultEncoding))
+      return success();
+
     // Peel TLX layout wrappers and delegate to the concrete result dialect's
     // verifier, so a pinned dot operand (e.g. no_verify<user<dot_op>>) is
     // actually checked as its concrete dot_op -- mirroring inferDotOpEncoding
@@ -249,10 +267,7 @@ struct TLXInferLayoutInterface : public triton::DialectInferLayoutInterface {
     // lands here, we unwrap, and hand ttg the raw encodings it expects.
     Attribute a = unwrapTlxLayoutWrappers(operandEncodingA);
     Attribute b = unwrapTlxLayoutWrappers(operandEncodingB);
-    Attribute ret;
-    if (op->getNumResults() == 1)
-      if (auto rt = dyn_cast<RankedTensorType>(op->getResult(0).getType()))
-        ret = unwrapTlxLayoutWrappers(rt.getEncoding());
+    Attribute ret = unwrapTlxLayoutWrappers(resultEncoding);
     const triton::DialectInferLayoutInterface *delegate =
         ret ? getInferLayoutInterfaceFor(ret) : nullptr;
     // No concrete result dialect yet (still fully wrapped) -> defer, matching

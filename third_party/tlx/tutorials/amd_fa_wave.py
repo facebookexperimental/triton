@@ -170,6 +170,58 @@ def _registers_to_mfma_packet(registers):
 
 
 @triton.jit
+def _registers_to_probability_fragments(registers):
+    """Invert and split a pinned register packet before releasing it."""
+    binary = registers.reshape([2] * 13)
+    logical = binary.permute(
+        0,
+        1,
+        2,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        3,
+        11,
+        12,
+    )
+    packet = logical.reshape([BLOCK_M, BLOCK_N // 2])
+    lower, upper = packet.reshape([BLOCK_M, 2, BLOCK_N // 4]).permute(0, 2, 1).split()
+    return tlx.release_layout(lower), tlx.release_layout(upper)
+
+
+@triton.jit
+def _pin_score_register_layout(registers):
+    score_register_layout: tl.constexpr = (tlx.distributed_linear_layout_encoding.make(
+        reg_bases=[
+            [0, 1],
+            [0, 2],
+            [0, 4],
+            [0, 8],
+        ],
+        lane_bases=[
+            [1, 0],
+            [2, 0],
+            [4, 0],
+            [8, 0],
+            [16, 0],
+            [32, 0],
+        ],
+        warp_bases=[
+            [64, 0],
+            [128, 0],
+            [256, 0],
+        ],
+        block_bases=[],
+        shape=[8 * 64, 16],
+    ))
+    return tlx.require_layout(registers, score_register_layout)
+
+
+@triton.jit
 def _pin_workitem_layout(value):
     workitem_layout: tl.constexpr = (tlx.distributed_linear_layout_encoding.make(
         reg_bases=[],
@@ -194,6 +246,7 @@ def _pin_workitem_layout(value):
 
 @triton.jit
 def _duplicate_rows_to_workitems(rows):
+    rows = tlx.release_layout(rows)
     per_wave_rows = rows.reshape([8, 32])
     per_workitem = tl.broadcast_to(per_wave_rows[:, None, :], (8, 2, 32))
     return _pin_workitem_layout(per_workitem.reshape([8 * 64]))
@@ -219,8 +272,8 @@ def _reduce_max_score_registers(registers0, registers1):
 def _prepare_adaptive_score_registers(scores, qk_scale: tl.constexpr):
     """Expose score registers and compute their scaled row maximum."""
     score0, score1 = _split_last_2(scores)
-    registers0 = _mfma_packet_to_registers(score0)
-    registers1 = _mfma_packet_to_registers(score1)
+    registers0 = _pin_score_register_layout(_mfma_packet_to_registers(score0))
+    registers1 = _pin_score_register_layout(_mfma_packet_to_registers(score1))
     if qk_scale < 0.0:
         registers0 = registers0 * qk_scale
         registers1 = registers1 * qk_scale
@@ -493,44 +546,14 @@ class SoftmaxState:
         exponentiated_scores,
         out_dtype: tl.constexpr,
     ):
-        registers0 = exponentiated_scores.registers0
-        registers1 = exponentiated_scores.registers1
-        tile_sum = _reduce_score_registers(
-            registers0,
-            registers1,
-        )
+        registers0 = _pin_score_register_layout(exponentiated_scores.registers0)
+        registers1 = _pin_score_register_layout(exponentiated_scores.registers1)
+        tile_sum = _reduce_score_registers(registers0, registers1)
         row_sum = self.row_sum + tile_sum
-        score_register_layout: tl.constexpr = (tlx.distributed_linear_layout_encoding.make(
-            reg_bases=[
-                [0, 1],
-                [0, 2],
-                [0, 4],
-                [0, 8],
-            ],
-            lane_bases=[
-                [1, 0],
-                [2, 0],
-                [4, 0],
-                [8, 0],
-                [16, 0],
-                [32, 0],
-            ],
-            warp_bases=[
-                [64, 0],
-                [128, 0],
-                [256, 0],
-            ],
-            block_bases=[],
-            shape=[8 * 64, 16],
-        ))
-        registers0 = tlx.require_layout(registers0, score_register_layout)
-        registers1 = tlx.require_layout(registers1, score_register_layout)
-        registers0 = tlx.release_layout(tlx.cast_preserve_layout(registers0, out_dtype))
-        registers1 = tlx.release_layout(tlx.cast_preserve_layout(registers1, out_dtype))
-        probabilities0 = _registers_to_mfma_packet(registers0)
-        probabilities1 = _registers_to_mfma_packet(registers1)
-        p0, p1 = _split_last_2(probabilities0)
-        p2, p3 = _split_last_2(probabilities1)
+        registers0 = tlx.cast_preserve_layout(registers0, out_dtype)
+        registers1 = tlx.cast_preserve_layout(registers1, out_dtype)
+        p0, p1 = _registers_to_probability_fragments(registers0)
+        p2, p3 = _registers_to_probability_fragments(registers1)
         probabilities = ProbabilityFragments(
             p0,
             p1,

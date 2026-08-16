@@ -197,7 +197,10 @@ def require_layout(
     assert isinstance(pin, bool), f"pin must be a constexpr bool, got {type(pin).__name__}"
     assert isinstance(late_address_compute, bool), ("late_address_compute must be a constexpr bool, got "
                                                     f"{type(late_address_compute).__name__}")
-    enc = layout.to_ir(_semantic.builder, x.shape, x.dtype)
+    if isinstance(layout, tlx.layout):
+        enc = layout.to_ir(_semantic.builder, x.shape, x.dtype)
+    else:
+        enc = layout.to_ir(_semantic.builder)
     handle = _semantic.builder.create_require_layout(
         x.handle,
         enc,
@@ -350,7 +353,9 @@ def release_layout(src, _semantic=None):
 
     This is the structural counterpart to :func:`require_layout`: it keeps a
     concrete layout local to an operation implementation while preventing the
-    encoded type from escaping through a function or operation boundary.
+    encoded type from escaping through a function or operation boundary.  The
+    source may still be encoding-free while a ``@triton.jit`` helper is built;
+    TLX specializes that helper's input before propagating layouts.
     """
     src = _semantic.to_tensor(src)
     handle = _semantic.builder.create_release_layout(src.handle)

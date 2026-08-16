@@ -3061,11 +3061,7 @@ def _compile_a4w4_inter_wave_256tile(m, n, k, preshuffled_scales=False):
     c = MockTensor(torch.bfloat16, (m, n))
     a_scales = MockTensor(torch.uint8, (m * k // 32, ) if preshuffled_scales else (m, k // 32))
     b_scales = MockTensor(torch.uint8, (n * k // 32, ) if preshuffled_scales else (n, k // 32))
-    kernel = (
-        _a4w4_inter_wave_preshuffled_scales_kernel
-        if preshuffled_scales
-        else _a4w4_inter_wave_256tile_kernel
-    )
+    kernel = (_a4w4_inter_wave_preshuffled_scales_kernel if preshuffled_scales else _a4w4_inter_wave_256tile_kernel)
     scale_strides = () if preshuffled_scales else (1, m, 1, n)
 
     with knobs.runtime.scope():
@@ -3163,7 +3159,7 @@ def test_a4w4_inter_wave_256tile_codegen_gfx950(device, fresh_triton_cache):
     assert ttgir.count("rocdl.sched.barrier 0") == 8
     assert ttgir.count("tt.dot_scaled") == 16
     assert ttgir.count("amdg.buffer_load_to_local") == 28
-    assert "contiguity" not in ttgir
+    assert ttgir.count("contiguity =") == 28
 
     assert len(re.findall(r"^\s*v_mfma_scale_f32_16x16x128_f8f6f4\b", amdgcn, re.MULTILINE)) == 256
     assert len(re.findall(r"^\s*buffer_load_[^\n]*\blds\s*$", amdgcn, re.MULTILINE)) == 44
@@ -3289,8 +3285,7 @@ def test_a4w4_inter_wave_preshuffled_scale_correctness_gfx950(device, k, split_k
     a, b, a_scales, b_scales = _generate_a4w4_inputs(m, n, k)
     a_scales_preshuffled = _preshuffle_a4w4_a_scales(a_scales)
     b_scales_preshuffled = _preshuffle_a4w4_b_scales(b_scales)
-    actual = _a4w4_inter_wave_matmul_preshuffled(
-        a, b, a_scales_preshuffled, b_scales_preshuffled, SPLIT_K=split_k)
+    actual = _a4w4_inter_wave_matmul_preshuffled(a, b, a_scales_preshuffled, b_scales_preshuffled, SPLIT_K=split_k)
     expected = _a4w4_reference(a, b, a_scales, b_scales)
     torch.testing.assert_close(actual, expected, atol=0.0, rtol=0.0)
 
@@ -3475,14 +3470,9 @@ def _explicit_layout_buffer_store_kernel(
         [4, 1],
         [1, 0],
     )
-    store_layout_m: tl.constexpr = tlx.slice_layout_encoding.make(1, store_layout)
-    store_layout_n: tl.constexpr = tlx.slice_layout_encoding.make(0, store_layout)
-
-    offs_m = tl.arange(0, BLOCK_M)
-    offs_n = tl.arange(0, BLOCK_N)
-    row_offsets = tlx.require_layout(tl.mul(stride_m, offs_m, sanitize_overflow=False), store_layout_m)
-    col_offsets = tlx.require_layout(offs_n, store_layout_n)
-    offsets = tl.add(row_offsets[:, None], col_offsets[None, :], sanitize_overflow=False)
+    linear = tl.arange(0, BLOCK_M * BLOCK_N).reshape(BLOCK_M, BLOCK_N)
+    row_offsets = tl.mul(linear // BLOCK_N, stride_m, sanitize_overflow=False)
+    offsets = tl.add(row_offsets, linear % BLOCK_N, sanitize_overflow=False)
     offsets = tlx.require_layout(offsets, store_layout)
     values = tlx.require_layout(
         tl.full((BLOCK_M, BLOCK_N), 1.0, tl.float32).to(tl.bfloat16),

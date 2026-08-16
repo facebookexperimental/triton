@@ -729,10 +729,7 @@ unsigned getContiguity(Value ptr, Value offset,
           dyn_cast<triton::gpu::LinearEncodingTrait>(tensorTy.getEncoding())) {
     contigPerThread = llAttr.getContigPerThread();
   } else {
-    auto linearLayout = triton::gpu::toLinearLayout(tensorTy);
-    auto fallbackAttr = triton::gpu::LinearEncodingAttr::get(
-        tensorTy.getContext(), std::move(linearLayout));
-    contigPerThread = fallbackAttr.getContigPerThread();
+    contigPerThread = triton::gpu::getContigPerThread(tensorTy);
   }
   auto order = triton::gpu::getOrder(tensorTy);
   assert(order[0] < contigPerThread.size() &&

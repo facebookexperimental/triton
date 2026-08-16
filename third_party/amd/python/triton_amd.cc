@@ -54,12 +54,11 @@ void init_triton_amd_passes_ttgpuir(py::module &&m) {
         [](mlir::PassManager &pm, const std::string &arch, bool ftz) {
           pm.addPass(createConvertTritonAMDGPUToLLVMPass(arch, ftz));
         });
-  m.def("add_to_llvmir",
-        [](mlir::PassManager &pm, const std::string &arch, bool ftz,
-           bool enableTreeReduction) {
-          pm.addPass(createConvertTritonAMDGPUToLLVMPass(
-              arch, ftz, enableTreeReduction));
-        });
+  m.def("add_to_llvmir", [](mlir::PassManager &pm, const std::string &arch,
+                            bool ftz, bool enableTreeReduction) {
+    pm.addPass(
+        createConvertTritonAMDGPUToLLVMPass(arch, ftz, enableTreeReduction));
+  });
   m.def("add_builtin_func_to_llvmir",
         [](mlir::PassManager &pm, const std::string &arch, bool ftz) {
           pm.addPass(createConvertBuiltinFuncToLLVMPass(arch, ftz));
@@ -360,7 +359,7 @@ void init_triton_amd(py::module &&m) {
 
   m.def("run_membar", [](mlir::ModuleOp mod, const std::string &arch) {
     mlir::triton::AMD::TargetInfo targetInfo(arch);
-    if (targetInfo.getISAFamily() == mlir::triton::AMD::ISAFamily::Unknown)
+    if (targetInfo.getISAFamily() == mlir::triton::amdgpu::ISAFamily::Unknown)
       throw std::invalid_argument("unsupported AMDGPU target: " + arch);
     auto allocationFn = [&targetInfo](mlir::Operation *op) {
       return mlir::triton::AMD::AMDAllocationAnalysisScratchSizeFn(op,

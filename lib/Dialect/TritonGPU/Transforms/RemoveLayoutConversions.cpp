@@ -152,6 +152,7 @@ private:
 class LayoutRematerialization {
 public:
   LayoutRematerialization(FuncOp F) : funcOp(F) {}
+  ~LayoutRematerialization();
 
   // Map the original value to the remat'ed one.
   void addRematValue(Value old, Attribute encoding, Value newV);
@@ -1081,13 +1082,13 @@ static bool sinkConvertBelowNarrowingOps(ModuleOp module) {
         dyn_cast<RankedTensorType>(narrowOp->getOperand(0).getType());
     auto narrowType =
         dyn_cast<RankedTensorType>(narrowOp->getResult(0).getType());
-    if (!wideType || !narrowType || wideType.getShape() != narrowType.getShape())
+    if (!wideType || !narrowType ||
+        wideType.getShape() != narrowType.getShape())
       continue;
     if (getElementBitWidth(wideType) <= getElementBitWidth(narrowType))
       continue;
 
-    auto srcType =
-        cast<RankedTensorType>(convertOp.getSrc().getType());
+    auto srcType = cast<RankedTensorType>(convertOp.getSrc().getType());
     if (cvtReordersRegisters(srcType, wideType))
       continue;
 
@@ -2014,14 +2015,10 @@ void hoistConvert(ModuleOp module,
                   const DenseSet<Operation *> *forceHoists = nullptr) {
   SmallVector<ConvertLayoutOp> convertOps;
   module.walk([forceHoists](FuncOp funcOp) {
-    LayoutRematerialization layoutRemat(funcOp);
-    layoutRemat.hoistConvertOnTopOfExtOrBroadcast(forceHoists);
-
-    layoutRemat = LayoutRematerialization(funcOp);
-    layoutRemat.hoistConvertIntoConditionals();
-
-    layoutRemat = LayoutRematerialization(funcOp);
-    layoutRemat.hoistConvertDotOperand();
+    LayoutRematerialization(funcOp).hoistConvertOnTopOfExtOrBroadcast(
+        forceHoists);
+    LayoutRematerialization(funcOp).hoistConvertIntoConditionals();
+    LayoutRematerialization(funcOp).hoistConvertDotOperand();
   });
 }
 

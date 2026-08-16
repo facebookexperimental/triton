@@ -884,6 +884,97 @@ def _mfma_rows_to_workitems(rows):
     return tl.broadcast_to(per_wave_rows[:, None, :], (8, 2, 32)).reshape([512])
 
 
+@triton.jit
+def _pin_helper_result(value, layout: tl.constexpr):
+    # The pin originates inside the helper: no call operand carries it, so the
+    # result ABI must be inferred from the helper's return operand.
+    return tlx.require_layout(value, layout)
+
+
+@triton.jit
+def _release_reshaped_helper_input(value):
+    # The frontend builds helper argument types without encodings.  The caller
+    # pin is reconciled into this argument before layout propagation reaches
+    # the explicit release boundary.
+    reshaped = value.reshape([256, 2, 16]).permute(0, 2, 1).reshape([256, 32])
+    return tlx.release_layout(reshaped)
+
+
+@triton.jit
+def _shape_preserving_reduce_broadcast(value):
+    # The result has the same shape as the input but not the same ownership:
+    # reduction produces a slice layout which expand_dims must preserve.
+    rows = tl.sum(value, axis=1)
+    return tl.broadcast_to(rows[:, None], value.shape)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Need gfx950 (CDNA4)")
+def test_internally_pinned_helper_result_specializes_abi_on_cdna4():
+    """An internal pin specializes a helper result and its call sites.
+
+    Triton's frontend strips tensor encodings from @triton.jit signatures.  A
+    helper that creates its own pin therefore has no pinned input from which to
+    infer its result ABI; the return operand is the authoritative witness.
+    """
+    layout = tlx.amd_mfma_layout(4, [32, 32, 16], True, [8, 1])
+
+    @triton.jit
+    def kernel(Y, LAYOUT: tl.constexpr):
+        row = tl.arange(0, 256)
+        col = tl.arange(0, 32)
+        value = tl.full((256, 32), 3.0, tl.float32)
+        pinned = _pin_helper_result(value, LAYOUT)
+        tl.store(Y + row[:, None] * 32 + col[None, :], pinned)
+
+    y = torch.empty((256 * 32, ), device=DEVICE, dtype=torch.float32)
+    compiled = kernel.warmup(y, layout, grid=(1, ), num_warps=8)
+    kernel[(1, )](y, layout, num_warps=8)
+    torch.testing.assert_close(y, torch.full_like(y, 3.0), atol=0, rtol=0)
+    assert "#tlx.no_verify_layout" not in compiled.asm["ttgir"]
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Need gfx950 (CDNA4)")
+def test_release_layout_accepts_deferred_helper_input_on_cdna4():
+    """A helper can release a layout inherited from its caller after a view."""
+    layout = tlx.amd_mfma_layout(4, [32, 32, 16], True, [8, 1])
+
+    @triton.jit
+    def kernel(Y, LAYOUT: tl.constexpr):
+        row = tl.arange(0, 256)
+        col = tl.arange(0, 32)
+        value = tl.full((256, 32), 5.0, tl.float32)
+        pinned = tlx.require_layout(value, LAYOUT)
+        released = _release_reshaped_helper_input(pinned)
+        tl.store(Y + row[:, None] * 32 + col[None, :], released)
+
+    y = torch.empty((256 * 32, ), device=DEVICE, dtype=torch.float32)
+    compiled = kernel.warmup(y, layout, grid=(1, ), num_warps=8)
+    kernel[(1, )](y, layout, num_warps=8)
+    torch.testing.assert_close(y, torch.full_like(y, 5.0), atol=0, rtol=0)
+    assert "#tlx.no_verify_layout" not in compiled.asm["ttgir"]
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Need gfx950 (CDNA4)")
+def test_pinned_helper_does_not_copy_layout_across_shape_cycle_on_cdna4():
+    """Same-shaped helper results still use layout inference after a reduce."""
+    layout = tlx.amd_mfma_layout(4, [32, 32, 16], True, [8, 1])
+
+    @triton.jit
+    def kernel(Y, LAYOUT: tl.constexpr):
+        row = tl.arange(0, 256)
+        col = tl.arange(0, 32)
+        value = tl.full((256, 32), 1.0, tl.float32)
+        pinned = tlx.require_layout(value, LAYOUT)
+        result = _shape_preserving_reduce_broadcast(pinned)
+        tl.store(Y + row[:, None] * 32 + col[None, :], result)
+
+    y = torch.empty((256 * 32, ), device=DEVICE, dtype=torch.float32)
+    compiled = kernel.warmup(y, layout, grid=(1, ), num_warps=8)
+    kernel[(1, )](y, layout, num_warps=8)
+    torch.testing.assert_close(y, torch.full_like(y, 32.0), atol=0, rtol=0)
+    assert "#tlx.no_verify_layout" not in compiled.asm["ttgir"]
+
+
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Need gfx950 (CDNA4)")
 def test_concrete_mfma_layout_reconciles_elementwise_broadcast_on_cdna4():
     """An explicit MFMA operand constrains an unencoded helper/broadcast path.
@@ -949,7 +1040,7 @@ def test_concrete_elementwise_conflicting_explicit_layouts_fail_on_cdna4():
 
     x = torch.zeros((256 * 32, ), device=DEVICE, dtype=torch.float32)
     y = torch.empty((256 * 32, ), device=DEVICE, dtype=torch.float32)
-    with pytest.raises(RuntimeError, match="conflicting explicit layouts meet on this operation"):
+    with pytest.raises(RuntimeError, match="conflicting user-pinned layouts meet on this operation"):
         kernel.warmup(x, y, mma, other, grid=(1, ), num_warps=8)
 
 

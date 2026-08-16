@@ -66,7 +66,6 @@ mlir::FailureOr<bool> liftTritonControlFlowToSCF(mlir::ModuleOp module) {
   return changed;
 }
 
-} // namespace
 void init_triton_analysis(py::module &&m) {
   py::class_<mlir::ModuleAllocation>(m, "allocation", py::module_local())
       .def(py::init<mlir::ModuleOp>());
