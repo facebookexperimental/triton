@@ -197,6 +197,70 @@ def _memory_relation(builder, offset_target_id, element_byte_width, element_cont
     }, tuple(target_id for _name, target_id in relation.bindings)
 
 
+def _buffer_memory_relation(
+    builder,
+    base_target_id,
+    offset_target_id,
+    element_byte_width,
+    element_contiguity,
+):
+    """Compose a uniform pointer displacement into a buffer index relation.
+
+    Direct-to-LDS buffer operations carry a scalar resource base and a
+    distributed element offset.  Keep the resource rooted at the original
+    pointer and serialize any exact ``addptr`` displacement together with the
+    distributed offset.  This avoids materializing an equivalent buffer
+    descriptor for every displaced use while preserving the source address
+    expression exactly.
+    """
+    pointer = builder.pointer_relations.get(int(base_target_id))
+    if pointer is None:
+        attrs, bindings = _memory_relation(
+            builder,
+            offset_target_id,
+            element_byte_width,
+            element_contiguity,
+        )
+        return int(base_target_id), attrs, bindings
+
+    offset = _value_relation(builder, offset_target_id)
+    if offset is None:
+        fail(
+            "TLXW_RELATION_UNREPRESENTABLE_OFFSET",
+            STAGE,
+            "global-memory offset has no exact forward value relation",
+            target_value_id=int(offset_target_id),
+        )
+    value = builder.values[int(offset_target_id)]
+    if value.layout_map_id is None:
+        fail(
+            "TLXW_RELATION_UNREPRESENTABLE_OFFSET",
+            STAGE,
+            "global-memory tensor offset has no distributed layout",
+            target_value_id=int(offset_target_id),
+        )
+    combined = _IndexRelation(
+        pointer.offset.expr + offset.expr,
+        _merge_relation_bindings(pointer.offset, offset),
+    )
+    bit_offset = layouts.global_memory_bit_offset_relation(
+        builder.layouts[int(value.layout_map_id)],
+        combined.expr,
+        element_byte_width=int(element_byte_width),
+        element_contiguity=int(element_contiguity),
+    )
+    return pointer.base_target_id, {
+        "bit_offset_relation": bit_offset,
+        "index_binding_count": len(combined.bindings),
+        "index_binding_names": tuple(name for name, _target_id in combined.bindings),
+    }, tuple(target_id for _name, target_id in combined.bindings)
+
+
+def _source_value_use_count(conversion_input, source_value_id):
+    source_value_id = int(source_value_id)
+    return sum(operand_id == source_value_id for source_op in conversion_input.ops for operand_id in source_op.operands)
+
+
 def _pointer_memory_relation(builder, pointer_target_id, element_byte_width):
     pointer = builder.pointer_relations.get(int(pointer_target_id))
     if pointer is None:
@@ -2769,7 +2833,7 @@ def _convert_buffer_load_to_local(
         result_target_ids,
         (destination_target_id, ),
     )
-    base_target_id = _single_source_target(
+    source_base_target_id = _single_source_target(
         builder,
         fields["base_value_id"],
         op,
@@ -2779,12 +2843,22 @@ def _convert_buffer_load_to_local(
         fields["offset_value_id"],
         op,
     )
-    relation_attrs, relation_bindings = _memory_relation(
-        builder,
-        offset_target_id,
-        memdesc.element_byte_width,
-        contiguity,
-    )
+    if _source_value_use_count(conversion_input, fields["base_value_id"]) == 1:
+        base_target_id, relation_attrs, relation_bindings = _buffer_memory_relation(
+            builder,
+            source_base_target_id,
+            offset_target_id,
+            memdesc.element_byte_width,
+            contiguity,
+        )
+    else:
+        base_target_id = source_base_target_id
+        relation_attrs, relation_bindings = _memory_relation(
+            builder,
+            offset_target_id,
+            memdesc.element_byte_width,
+            contiguity,
+        )
     operands = [destination_target_id, base_target_id, offset_target_id]
     if has_mask:
         operands.append(_single_source_target(
@@ -2818,7 +2892,7 @@ def _convert_buffer_load_to_local(
             "source_issue_dependency_count": len(source_issue_dependency_target_ids),
         },
         fact_ids=(range_fact.fact_id, ),
-        fact_target_ids=(base_target_id, ),
+        fact_target_ids=(source_base_target_id, ),
         layout_map_ids=result_layout_map_ids,
         source_op_index=op.index,
     )

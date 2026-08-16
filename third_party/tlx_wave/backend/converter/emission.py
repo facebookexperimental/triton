@@ -1069,8 +1069,10 @@ def _emit_split(state, op):
 
 
 def _emit_addptr(state, op):
-    base, offset = _operand_values(state, op, 2)
     result_id = _single_result(op)
+    if not _target_value_is_live(state.target_program, result_id):
+        return
+    base, offset = _operand_values(state, op, 2)
     count = _component_count(state, result_id)
     base_components, offset_components = _broadcast_components(state, (base, offset), count, op)
     result_type = _wave_type(state.dsl, state.target_program.values[result_id].type)
@@ -1081,6 +1083,12 @@ def _emit_addptr(state, op):
                 offset_component,
                 result_type=result_type,
             ) for base_component, offset_component in zip(base_components, offset_components)))
+
+
+def _target_value_is_live(target_program, target_value_id):
+    target_value_id = int(target_value_id)
+    return (any(target_value_id in target_op.operands for target_op in target_program.ops)
+            or any(target_value_id in region.yield_value_ids for region in target_program.regions))
 
 
 def _emit_make_buffer(state, op):
