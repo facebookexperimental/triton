@@ -11,6 +11,11 @@ from typing import Sequence
 from .baseline import FA_BWD_D128_CASES, FA_BWD_D128_SCHEDULES, make_manifest, read_manifest, write_catalog
 from .audit import audit_markdown, audit_plan
 from .model import PlanBundle, canonical_json
+from .pipeline_delta import (
+    PlanPipelineDelta,
+    make_identity_pipeline_delta,
+    validate_pipeline_delta,
+)
 from .replay import compare_plans, replay_normalized, verify_replay
 from .schedule_delta import (
     PlanScheduleDelta,
@@ -92,6 +97,19 @@ def _parser() -> argparse.ArgumentParser:
     validate_delta.add_argument("--delta", type=Path, required=True)
     validate_delta.add_argument("--plan", type=Path)
     validate_delta.add_argument("--output", type=Path)
+
+    pipeline_delta = commands.add_parser(
+        "pipeline-delta", help="construct an identity M1.5b pipeline delta"
+    )
+    pipeline_delta.add_argument("--plan", type=Path, required=True)
+    pipeline_delta.add_argument("--output", type=Path, required=True)
+
+    validate_pipeline = commands.add_parser(
+        "validate-pipeline-delta", help="dry-run an M1.5b pipeline delta against Plan IR"
+    )
+    validate_pipeline.add_argument("--delta", type=Path, required=True)
+    validate_pipeline.add_argument("--plan", type=Path, required=True)
+    validate_pipeline.add_argument("--output", type=Path)
     return parser
 
 
@@ -184,6 +202,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "kernel": delta.kernel,
                 "blocks": len(delta.blocks),
             },
+            args.output,
+        )
+    elif args.command == "pipeline-delta":
+        make_identity_pipeline_delta(PlanBundle.read(args.plan)).write(args.output)
+    elif args.command == "validate-pipeline-delta":
+        _emit(
+            validate_pipeline_delta(
+                PlanPipelineDelta.read(args.delta),
+                PlanBundle.read(args.plan),
+            ),
             args.output,
         )
     return 0

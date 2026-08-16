@@ -100,3 +100,30 @@ M1.5a only changes order within an existing block and dynamic iteration. It
 does not change storage, synchronization, loop placement, staging depth, or
 dot decomposition. Positive dependency distance is structured-loop metadata,
 not permission to move an operation into another iteration.
+
+## M1.5b.1 pipeline delta
+
+`plan-pipeline-delta/0.1` is a separate intent contract for changes that cross
+dynamic loop iterations or change iteration-scoped storage. It is pinned to a
+kernel, input value-graph fingerprint, and the compiler position immediately
+before async wait-count adjustment. An empty `loops` list is the identity
+delta.
+
+Each non-empty loop entry names a stable `scf.for` or `scf.while` operation and
+one or both of:
+
+- a complete async group with `set_prefetch_distance`, positive iteration
+  distance, and buffer depth at least that distance;
+- a logical tensor value with `global_to_lds` or `register_to_lds`, explicit
+  in-loop consumers, positive buffer depth, and power-of-two alignment.
+
+Dry-run validation rejects stale fingerprints, unknown or non-loop targets,
+groups committed or produced outside the selected loop, incomplete groups,
+unresolved LDS slot paths, non-tensor staging values, and consumers that do not
+actually use the staged value. The validation report distinguishes iteration
+placement, storage, synchronization, and dot-decomposition effects. Dot
+decomposition is always frozen in M1.5b.
+
+This schema does not encode resolved cycles, physical LDS offsets, inserted
+waits/barriers, a modulo schedule, or prologue/steady-state/epilogue TTGIR.
+Those are outputs of M1.5b.2--b.5, not claims made by an M1.5b.1 request.

@@ -1,6 +1,6 @@
 # AMD TLX Plan IR prototype
 
-This directory implements M1.1--M1.5a of the profile-guided TLX scheduling
+This directory implements M1.1--M1.5b.1 of the profile-guided TLX scheduling
 design without changing the existing TLX kernels or modulo scheduler.
 
 ## Implemented milestones
@@ -36,9 +36,15 @@ design without changing the existing TLX kernels or modulo scheduler.
   validate exact baselines, anchors, and distance-zero dependencies, then
   apply complete block-local permutations without changing iteration,
   staging, synchronization, or dot decomposition.
+- **M1.5b.1 — pipeline-delta contract:** a separate versioned intent schema for
+  cross-iteration async-group placement and global/register-to-LDS staging. A
+  dry-run validator pins the input value graph, resolves structured loops,
+  complete async groups, LDS slot paths, staged tensor uses, depth, and
+  alignment, and reports the changes a later native materializer must make.
 
-M1.5a lowers only verified intra-iteration schedule permutations. Storage and
-cross-iteration schedule mutation remain intentionally deferred to M1.5b.
+M1.5a lowers only verified intra-iteration schedule permutations. M1.5b.1
+validates cross-iteration intent but deliberately does not mutate TTGIR;
+physical scheduling and storage materialization start in M1.5b.2.
 
 ## Reproduction
 
@@ -121,6 +127,24 @@ explicitly requested. The report records stable input/output fingerprints,
 checked dependencies, pinned anchors, moved operation counts, and confirms
 that iteration placement, storage, synchronization, and dot decomposition are
 unchanged.
+
+Create and dry-run an identity M1.5b.1 pipeline delta with:
+
+```bash
+python3 -m tlx_plan pipeline-delta \
+  --plan /tmp/plan.json \
+  --output /tmp/pipeline-delta.json
+python3 -m tlx_plan validate-pipeline-delta \
+  --delta /tmp/pipeline-delta.json \
+  --plan /tmp/plan.json \
+  --output /tmp/pipeline-delta-validation.json
+```
+
+Edit `loops` to request `set_prefetch_distance`, `global_to_lds`, or
+`register_to_lds`. Validation is analysis-only: the report always records
+`materialization_status: not_applied` and never treats a valid request as
+proof that a physical modulo schedule, LDS allocation, or synchronization
+sequence exists.
 
 The fixed configuration names and kernel symbols are sourced from
 `third_party/tlx/tutorials/amd_fa_bwd.py`:

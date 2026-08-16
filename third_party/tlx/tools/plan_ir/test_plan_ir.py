@@ -7,7 +7,16 @@ import pytest
 
 from tlx_plan.baseline import FA_BWD_D128_CASES, FA_BWD_D128_SCHEDULES, make_manifest
 from tlx_plan.audit import audit_plan
+from tlx_plan.cli import main as plan_cli
 from tlx_plan.model import PlanBundle, PlanError
+from tlx_plan.pipeline_delta import (
+    LoopPipelineDelta,
+    PlanPipelineDelta,
+    StagingPipelineIntent,
+    TransactionPipelineIntent,
+    make_identity_pipeline_delta,
+    validate_pipeline_delta,
+)
 from tlx_plan.replay import compare_plans, verify_replay
 from tlx_plan.schedule_delta import (
     PlanScheduleDelta,
@@ -476,3 +485,185 @@ def test_identity_schedule_delta_from_native_value_graph() -> None:
     delta = make_identity_schedule_delta_from_value_graph(native, "kernel")
     assert delta.input_value_graph_fingerprint == "fingerprint"
     assert delta.blocks[0].desired_order == ["op:a", "op:return"]
+
+
+def _plan_with_pipeline_contract() -> tuple[PlanBundle, dict[str, str]]:
+    plan = extract_plan(TTGIR)
+    operation_ids = [operation["id"] for operation in plan.operations]
+    loop, producer, commit, consumer = operation_ids[:4]
+    next(operation for operation in plan.operations if operation["id"] == loop)["kind"] = "scf.for"
+    value = "value:fixture:pipeline"
+    group = "async-group:fixture:pipeline"
+    transaction = "async-tx:fixture:pipeline"
+    block = f"block:{loop}:region:0:index:0"
+    plan.value_graph_fingerprint = "pipeline-fixture-fingerprint"
+    plan.values = [
+        {
+            "id": value,
+            "type": {
+                "mlir": "tensor<16x32xbf16>",
+                "category": "tensor_register_logical",
+            },
+            "uses": [{"operation": consumer, "operand": 0}],
+        }
+    ]
+    plan.blocks = [
+        {
+            "id": block,
+            "parent_operation": loop,
+            "region_number": 0,
+            "block_number": 0,
+            "operations": operation_ids[1:],
+        }
+    ]
+    plan.async_transactions = [
+        {
+            "id": transaction,
+            "producer_operation": producer,
+            "destination_value": value,
+            "commit_group": group,
+            "root_values": [value],
+            "slot_paths": [{"root_value": value, "indices": []}],
+            "completion_frontiers": [],
+            "visibility_frontiers": [],
+            "consumer_frontiers": [],
+            "release_frontiers": [],
+            "overwrite_frontiers": [],
+        }
+    ]
+    plan.async_groups = [
+        {
+            "id": group,
+            "commit_operation": commit,
+            "transactions": [transaction],
+        }
+    ]
+    plan.refresh_hashes()
+    plan.validate()
+    return plan, {
+        "loop": loop,
+        "group": group,
+        "value": value,
+        "consumer": consumer,
+    }
+
+
+def _pipeline_delta(plan: PlanBundle, ids: dict[str, str]) -> PlanPipelineDelta:
+    return PlanPipelineDelta(
+        kernel=plan.kernel,
+        input_value_graph_fingerprint=plan.value_graph_fingerprint,
+        loops=[
+            LoopPipelineDelta(
+                loop=ids["loop"],
+                transactions=[
+                    TransactionPipelineIntent(
+                        group=ids["group"],
+                        action="set_prefetch_distance",
+                        distance=2,
+                        buffer_depth=2,
+                    )
+                ],
+                staging=[
+                    StagingPipelineIntent(
+                        value=ids["value"],
+                        action="register_to_lds",
+                        consumers=[ids["consumer"]],
+                        buffer_depth=2,
+                        alignment=16,
+                    )
+                ],
+            )
+        ],
+    )
+
+
+def test_identity_pipeline_delta_round_trip_and_dry_run(tmp_path) -> None:
+    plan, _ = _plan_with_pipeline_contract()
+    delta = make_identity_pipeline_delta(plan)
+    path = tmp_path / "pipeline-delta.json"
+    delta.write(path)
+    loaded = PlanPipelineDelta.read(path)
+    report = validate_pipeline_delta(loaded, plan)
+    assert loaded.schema_version == "plan-pipeline-delta/0.1"
+    assert report["identity"]
+    assert report["materialization_status"] == "not_applied"
+    assert not report["changes_dot_decomposition"]
+
+
+def test_pipeline_delta_cli_identity_and_validation(tmp_path) -> None:
+    plan, _ = _plan_with_pipeline_contract()
+    plan_path = tmp_path / "plan.json"
+    delta_path = tmp_path / "pipeline-delta.json"
+    report_path = tmp_path / "pipeline-validation.json"
+    plan.write(plan_path)
+    assert plan_cli(
+        ["pipeline-delta", "--plan", str(plan_path), "--output", str(delta_path)]
+    ) == 0
+    assert plan_cli(
+        [
+            "validate-pipeline-delta",
+            "--delta",
+            str(delta_path),
+            "--plan",
+            str(plan_path),
+            "--output",
+            str(report_path),
+        ]
+    ) == 0
+    assert json.loads(report_path.read_text())["identity"]
+
+
+def test_pipeline_delta_validates_cross_iteration_intent() -> None:
+    plan, ids = _plan_with_pipeline_contract()
+    report = validate_pipeline_delta(_pipeline_delta(plan, ids), plan)
+    assert report["transaction_groups"] == 1
+    assert report["staging_values"] == 1
+    assert report["requires_modulo_scheduling"]
+    assert report["changes_iteration_storage"]
+
+
+def test_pipeline_delta_rejects_stale_plan_and_unknown_group() -> None:
+    plan, ids = _plan_with_pipeline_contract()
+    delta = _pipeline_delta(plan, ids)
+    delta.input_value_graph_fingerprint = "stale"
+    with pytest.raises(PlanError, match="fingerprint does not match"):
+        delta.validate(plan)
+    delta.input_value_graph_fingerprint = plan.value_graph_fingerprint
+    delta.loops[0].transactions[0].group = "async-group:missing"
+    with pytest.raises(PlanError, match="unknown async group"):
+        delta.validate(plan)
+
+
+def test_pipeline_delta_rejects_incomplete_group_and_unresolved_slot() -> None:
+    plan, ids = _plan_with_pipeline_contract()
+    delta = _pipeline_delta(plan, ids)
+    plan.async_groups[0]["transactions"] = []
+    plan.refresh_hashes()
+    with pytest.raises(PlanError, match="contains no transactions"):
+        delta.validate(plan)
+    plan, ids = _plan_with_pipeline_contract()
+    delta = _pipeline_delta(plan, ids)
+    plan.async_transactions[0]["slot_paths"][0]["indices"] = [{"kind": "unknown"}]
+    plan.refresh_hashes()
+    with pytest.raises(PlanError, match="unresolved LDS slot index"):
+        delta.validate(plan)
+
+
+def test_pipeline_delta_rejects_invalid_depth_and_alignment() -> None:
+    plan, ids = _plan_with_pipeline_contract()
+    delta = _pipeline_delta(plan, ids)
+    delta.loops[0].transactions[0].buffer_depth = 1
+    with pytest.raises(PlanError, match="cannot be less than prefetch distance"):
+        delta.validate(plan)
+    delta.loops[0].transactions[0].buffer_depth = 2
+    delta.loops[0].staging[0].alignment = 12
+    with pytest.raises(PlanError, match="power of two"):
+        delta.validate(plan)
+
+
+def test_pipeline_delta_rejects_non_use_staging_consumer() -> None:
+    plan, ids = _plan_with_pipeline_contract()
+    delta = _pipeline_delta(plan, ids)
+    delta.loops[0].staging[0].consumers = [plan.blocks[0]["operations"][-1]]
+    with pytest.raises(PlanError, match="does not consume staging value"):
+        delta.validate(plan)
