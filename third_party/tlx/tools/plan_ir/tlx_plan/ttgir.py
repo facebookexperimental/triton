@@ -242,7 +242,10 @@ def extract_plan(
     native_function: dict[str, Any] | None = None
     native_operations: dict[int, dict[str, Any]] = {}
     if native_value_graph is not None:
-        if native_value_graph.get("schema_version") != "plan-value-graph/0.1":
+        if native_value_graph.get("schema_version") not in {
+            "plan-value-graph/0.1",
+            "plan-value-graph/0.2",
+        }:
             raise PlanError("unsupported native plan-value-graph schema")
         native_function = next(
             (
@@ -400,6 +403,17 @@ def extract_plan(
         normalized_ir_hash="sha256:" + hashlib.sha256(normalized.encode("utf-8")).hexdigest(),
         values=native_function.get("values", []) if native_function is not None else [],
         lineage_edges=native_function.get("lineage_edges", []) if native_function is not None else [],
+        blocks=native_function.get("blocks", []) if native_function is not None else [],
+        live_segments=(
+            native_function.get("live_segments", []) if native_function is not None else []
+        ),
+        lds_aliases=native_function.get("lds_aliases", []) if native_function is not None else [],
+        memory_accesses=(
+            native_function.get("memory_accesses", []) if native_function is not None else []
+        ),
+        lds_allocations=(
+            native_function.get("lds_allocations", []) if native_function is not None else []
+        ),
         value_graph_fingerprint=(
             native_function.get("semantic_fingerprint", "") if native_function is not None else ""
         ),

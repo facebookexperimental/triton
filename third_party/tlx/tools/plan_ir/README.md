@@ -1,6 +1,6 @@
 # AMD TLX Plan IR prototype
 
-This directory implements M1.1--M1.4a of the profile-guided TLX scheduling
+This directory implements M1.1--M1.4b of the profile-guided TLX scheduling
 design without changing the existing TLX kernels or modulo scheduler.
 
 ## Implemented milestones
@@ -20,6 +20,9 @@ design without changing the existing TLX kernels or modulo scheduler.
   pass after final structured scheduling and before SCFToCF. It emits stable
   operation/value IDs, structured-loop iteration-distance edges, derived-value
   lineage, logical tensor sizes, and explicit identity-quality diagnostics.
+- **M1.4b — static liveness and logical LDS model:** structured block program
+  points, half-open value intervals, alias roots/views, normalized constant and
+  modulo slot paths, memory effects, and per-allocation alias-union intervals.
 
 M1.3 verifies that a captured baseline is reproducible. It does **not** lower an
 arbitrarily mutated storage or schedule plan back into TTGIR. That mutation path
@@ -58,8 +61,9 @@ export TRITON_TLX_PLAN_ANALYSIS_DIR=/tmp/plan-values
 ```
 
 The pass is disabled by default and does not mutate TTGIR. The sidecar reports
-logical tensor bytes only; physical VGPR allocation remains unknown at this
-stage and is serialized as `null`.
+logical tensor/LDS bytes and static TTGIR program-order intervals only;
+physical VGPR allocation, physical LDS placement, and async lifetime extension
+through waits remain unknown and are explicitly marked as such.
 
 Compare two extracted plans with:
 

@@ -1,4 +1,4 @@
-# PlanBundle schema 0.2
+# PlanBundle schema 0.3
 
 PlanBundle is a canonical JSON sidecar for final AMD Triton/TLX TTGIR. All
 objects are serialized with sorted keys, and every independently comparable
@@ -8,7 +8,7 @@ layer has a SHA-256 hash.
 
 | Field | Meaning |
 |---|---|
-| `schema_version` | Exact reader/writer contract, currently `0.2`; readers upgrade `0.1`. |
+| `schema_version` | Exact reader/writer contract, currently `0.3`; readers upgrade `0.1` and `0.2`. |
 | `kernel` | TTGIR function symbol. |
 | `case` | Shape, dtype, causal, and MHA/GQA contract from the baseline manifest. |
 | `provenance` | Source/compiler revisions, schedule configuration, and captured artifact references. |
@@ -21,8 +21,13 @@ layer has a SHA-256 hash.
 | `normalized_ir_hash` | Hash after removing debug locations and alpha-renaming SSA values. |
 | `values` | Native final-structured-TTGIR values, types, origins, uses, and identity quality. |
 | `lineage_edges` | Derived-value and structured-loop edges, including dynamic iteration distance. |
+| `blocks` | Structured blocks and their direct operation order; positions are local to each block. |
+| `live_segments` | Half-open static TTGIR program-order intervals with live-in/live-out and loop-distance metadata. |
+| `lds_aliases` | Logical LDS roots/views, static offsets/order, and normalized slot paths. |
+| `memory_accesses` | LDS read/write/allocate/free effects, including whether an operation starts pending async work. |
+| `lds_allocations` | Per-root logical size, aliases, and the block-local union of their static intervals. |
 | `value_graph_fingerprint` | Semantic fingerprint of the native operation/value graph. |
-| `layer_hashes` | Independent hashes for operation, dot, storage, sync, schedule, layout, value, and lineage layers. |
+| `layer_hashes` | Independent hashes for operation, dot, storage, sync, schedule, layout, value, lineage, liveness, and LDS layers. |
 | `diagnostics` | Unresolved semantic information; never silently discarded. |
 
 ## Identities
@@ -48,13 +53,15 @@ static fragment without confusing it with a different output tile.
 
 ## Replay levels
 
-`exact` means normalized TTGIR hashes match. `semantic_match` means all eight
+`exact` means normalized TTGIR hashes match. `semantic_match` means all
 PlanBundle layer hashes match. A report can therefore distinguish harmless
 text/debug differences from a dot decomposition, layout, staging,
 synchronization, or final-order change.
 
-Version 0.2 is M1.4a. It encodes stable native identities, loop init/backedge/
-exit edges, branch yields, and lineage through AMD extract-slice, reshape,
-transpose, in-thread-transpose, and layout conversion. It does not yet encode
-complete liveness intervals, alias sets, asynchronous LDS lifetime, or mutation
-lowering. Those belong to M1.4b-d and plan-application milestones.
+Version 0.3 adds M1.4b static liveness and logical LDS modeling. Intervals are
+block-local TTGIR program order, not cycles or physical register allocation.
+LDS sizes and offsets are logical, not the allocator's physical placement.
+`pending_async` identifies operations that initiate asynchronous work, but this
+version deliberately does not extend lifetimes through commit/wait/barrier.
+That dynamic async model and mutation lowering belong to M1.4c-d and later
+plan-application milestones.

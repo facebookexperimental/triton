@@ -88,7 +88,7 @@ def test_round_trip_and_replay_report(tmp_path) -> None:
     report = verify_replay(TTGIR, loaded)
     assert report["exact"]
     assert report["semantic_match"]
-    assert json.loads(path.read_text())["schema_version"] == "0.2"
+    assert json.loads(path.read_text())["schema_version"] == "0.3"
 
 
 def test_native_value_graph_supplies_stable_ids_and_lineage() -> None:
@@ -104,7 +104,7 @@ def test_native_value_graph_supplies_stable_ids_and_lineage() -> None:
         for index, operation in enumerate(textual.operations)
     ]
     native = {
-        "schema_version": "plan-value-graph/0.1",
+        "schema_version": "plan-value-graph/0.2",
         "functions": [
             {
                 "function": textual.kernel,
@@ -122,6 +122,55 @@ def test_native_value_graph_supplies_stable_ids_and_lineage() -> None:
                         "iteration_distance": 1,
                     }
                 ],
+                "blocks": [
+                    {
+                        "id": "block:native:0",
+                        "operations": [operation["id"] for operation in operations],
+                    }
+                ],
+                "live_segments": [
+                    {
+                        "value": "value:a",
+                        "block": "block:native:0",
+                        "start_position": 0,
+                        "end_position": 1,
+                        "crosses_backedge": False,
+                        "iteration_distance": 0,
+                    }
+                ],
+                "lds_aliases": [
+                    {
+                        "value": "value:a",
+                        "source_value": None,
+                        "root_values": ["value:a"],
+                        "slot_paths": [{"root_value": "value:a", "indices": []}],
+                    }
+                ],
+                "memory_accesses": [
+                    {
+                        "operation": operations[0]["id"],
+                        "value": "value:a",
+                        "root_values": ["value:a"],
+                        "slot_paths": [{"root_value": "value:a", "indices": []}],
+                    }
+                ],
+                "lds_allocations": [
+                    {
+                        "root_value": "value:a",
+                        "allocation_operation": operations[0]["id"],
+                        "aliases": ["value:a"],
+                        "live_segments": [
+                            {
+                                "value": "value:a",
+                                "block": "block:native:0",
+                                "start_position": 0,
+                                "end_position": 1,
+                                "crosses_backedge": False,
+                                "iteration_distance": 0,
+                            }
+                        ],
+                    }
+                ],
                 "diagnostics": [],
             }
         ],
@@ -132,6 +181,8 @@ def test_native_value_graph_supplies_stable_ids_and_lineage() -> None:
     ]
     assert plan.value_graph_fingerprint == "native-fingerprint"
     assert plan.lineage_edges[0]["iteration_distance"] == 1
+    assert plan.live_segments[0]["block"] == "block:native:0"
+    assert plan.lds_allocations[0]["root_value"] == "value:a"
     assert verify_replay(TTGIR, plan, native_value_graph=native)["semantic_match"]
 
 
@@ -144,8 +195,26 @@ def test_read_upgrades_plan_bundle_0_1(tmp_path) -> None:
     path = tmp_path / "old-plan.json"
     path.write_text(json.dumps(plan))
     upgraded = PlanBundle.read(path)
-    assert upgraded.schema_version == "0.2"
+    assert upgraded.schema_version == "0.3"
     assert upgraded.values == []
+
+
+def test_read_upgrades_plan_bundle_0_2(tmp_path) -> None:
+    plan = extract_plan(TTGIR).to_dict()
+    plan["schema_version"] = "0.2"
+    for field in (
+        "blocks",
+        "live_segments",
+        "lds_aliases",
+        "memory_accesses",
+        "lds_allocations",
+    ):
+        plan.pop(field)
+    path = tmp_path / "old-plan.json"
+    path.write_text(json.dumps(plan))
+    upgraded = PlanBundle.read(path)
+    assert upgraded.schema_version == "0.3"
+    assert upgraded.blocks == []
 
 
 def test_layered_diff_localizes_schedule_change() -> None:
