@@ -4,6 +4,7 @@
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Support/LLVM.h"
 #include "mlir/Support/LogicalResult.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/Support/JSON.h"
 #include <cstdint>
 #include <map>
@@ -65,9 +66,94 @@ struct PlanDiagnostic {
   std::string valueId;
 };
 
-/// Analysis-only description of operation/value identity and value lineage for
-/// one final structured TTGIR function. It deliberately does not model memory
-/// hazards, liveness, or physical register allocation.
+/// A stable structured block and its direct operation order. Operation
+/// positions are local to the block; they are not machine cycles.
+struct PlanBlockRecord {
+  std::string id;
+  std::string parentOperationId;
+  int64_t regionNumber = -1;
+  int64_t blockNumber = -1;
+  std::vector<std::string> operations;
+};
+
+/// Half-open static TTGIR program-order interval within one block.
+struct PlanLiveSegment {
+  std::string valueId;
+  std::string blockId;
+  std::string startOperationId;
+  std::string endOperationId;
+  int64_t startPosition = 0;
+  int64_t endPosition = 0;
+  bool liveIn = false;
+  bool liveOut = false;
+  bool crossesBackedge = false;
+  int64_t iterationDistance = 0;
+};
+
+/// Normalized index selecting one logical slot of an LDS allocation.
+struct PlanSlotExpression {
+  std::string kind;
+  std::string text;
+  std::string baseValueId;
+  int64_t coefficient = 0;
+  int64_t offset = 0;
+  int64_t modulus = 0;
+  std::vector<int64_t> possibleSlots;
+};
+
+struct PlanSlotPath {
+  std::string rootValueId;
+  std::vector<PlanSlotExpression> indices;
+};
+
+/// Logical relationship between a memdesc value and local_alloc roots.
+struct PlanAliasRecord {
+  std::string valueId;
+  std::string viewKind;
+  std::string sourceValueId;
+  std::vector<std::string> rootValueIds;
+  std::vector<int64_t> staticOffsets;
+  std::vector<int64_t> order;
+  std::vector<PlanSlotPath> slotPaths;
+};
+
+struct PlanMemoryAccess {
+  std::string operationId;
+  std::string valueId;
+  std::string effect;
+  bool pendingAsync = false;
+  std::vector<std::string> rootValueIds;
+  std::vector<PlanSlotPath> slotPaths;
+};
+
+struct PlanLdsAllocationRecord {
+  std::string rootValueId;
+  std::string allocationOperationId;
+  std::optional<int64_t> logicalBytes;
+  std::optional<int64_t> alignment;
+  std::vector<std::string> aliases;
+  std::vector<PlanLiveSegment> liveSegments;
+};
+
+struct PlanLivenessResult {
+  std::vector<PlanBlockRecord> blocks;
+  std::vector<PlanLiveSegment> liveSegments;
+  std::vector<PlanAliasRecord> aliases;
+  std::vector<PlanMemoryAccess> memoryAccesses;
+  std::vector<PlanLdsAllocationRecord> ldsAllocations;
+  std::vector<PlanDiagnostic> diagnostics;
+};
+
+FailureOr<PlanLivenessResult> analyzePlanLiveness(
+    FuncOp function,
+    const llvm::DenseMap<Operation *, std::string> &operationIds,
+    const llvm::DenseMap<Value, std::string> &valueIds,
+    ArrayRef<PlanLineageEdge> lineageEdges);
+
+/// Analysis-only description of operation/value identity, value lineage,
+/// static program-order liveness, and logical LDS aliases for one final
+/// structured TTGIR function. It deliberately does not model physical
+/// register allocation, physical LDS offsets, or asynchronous completion.
 class PlanValueGraph {
 public:
   static FailureOr<PlanValueGraph> build(FuncOp function);
@@ -81,6 +167,15 @@ public:
   ArrayRef<PlanValueRecord> getValues() const { return values; }
   ArrayRef<PlanLineageEdge> getLineageEdges() const { return lineageEdges; }
   ArrayRef<PlanDiagnostic> getDiagnostics() const { return diagnostics; }
+  ArrayRef<PlanBlockRecord> getBlocks() const { return blocks; }
+  ArrayRef<PlanLiveSegment> getLiveSegments() const { return liveSegments; }
+  ArrayRef<PlanAliasRecord> getAliases() const { return aliases; }
+  ArrayRef<PlanMemoryAccess> getMemoryAccesses() const {
+    return memoryAccesses;
+  }
+  ArrayRef<PlanLdsAllocationRecord> getLdsAllocations() const {
+    return ldsAllocations;
+  }
 
 private:
   std::string functionName;
@@ -89,6 +184,11 @@ private:
   std::vector<PlanValueRecord> values;
   std::vector<PlanLineageEdge> lineageEdges;
   std::vector<PlanDiagnostic> diagnostics;
+  std::vector<PlanBlockRecord> blocks;
+  std::vector<PlanLiveSegment> liveSegments;
+  std::vector<PlanAliasRecord> aliases;
+  std::vector<PlanMemoryAccess> memoryAccesses;
+  std::vector<PlanLdsAllocationRecord> ldsAllocations;
 };
 
 /// Serialize a module-level sidecar. The graphs are sorted by function name;

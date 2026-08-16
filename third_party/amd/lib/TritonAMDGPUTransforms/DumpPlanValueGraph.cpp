@@ -22,7 +22,7 @@ struct TritonAMDGPUDumpPlanValueGraphPass
 
   void runOnOperation() override {
     ModuleOp module = getOperation();
-    SmallVector<triton::plan::PlanValueGraph> graphs;
+    SmallVector<triton::plan::PlanValueGraph, 1> graphs;
     for (triton::FuncOp function : module.getOps<triton::FuncOp>()) {
       FailureOr<triton::plan::PlanValueGraph> graph =
           triton::plan::PlanValueGraph::build(function);

@@ -38,7 +38,7 @@
 // CHECK:         ttg.convert_layout {{.*}}tensor<256x64xf16, #blocked>
 // CHECK:         tt.dot
 
-// PLAN-DAG: "schema_version": "plan-value-graph/0.1"
+// PLAN-DAG: "schema_version": "plan-value-graph/0.2"
 // PLAN-DAG: "kind": "loop_init"
 // PLAN-DAG: "iteration_distance": 1
 // PLAN-DAG: "kind": "loop_backedge"
@@ -49,12 +49,28 @@
 // PLAN-DAG: "logical_bytes": 262144
 // PLAN-DAG: "physical_register_bytes": null
 // PLAN-DAG: "artifact_stage": "final_structured_ttgir"
+// PLAN-DAG: "static_intervals_are_physical_cycles": false
+// PLAN-DAG: "lds_logical_bytes_are_physical_allocation": false
+// PLAN-DAG: "async_lifetime_extended_through_wait": false
+// PLAN-DAG: "live_segments": [
+// PLAN-DAG: "view_kind": "ttg.memdesc_index"
+// PLAN-DAG: "kind": "modulo"
+// PLAN-DAG: "modulus": 2
+// PLAN-DAG: "possible_slots": [
+// PLAN-DAG: "effect": "read"
+// PLAN-DAG: "effect": "write"
+// PLAN-DAG: "effect": "allocate"
+// PLAN-DAG: "effect": "free"
+// PLAN-DAG: "physical_lds_offset": null
 // PLAN-TRANSPOSE: "kind": "in_thread_transpose"
 
 #mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [2, 2], instrShape = [16, 16, 32], isTransposed = true}>
 #dot0 = #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 8}>
 #dot1 = #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 8}>
 #blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [8, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
+#slot_blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [8, 8], warpsPerCTA = [2, 2], order = [1, 0]}>
+#slot_shared = #ttg.swizzled_shared<{vec = 2, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#smem = #ttg.shared_memory
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 64 : i32} {
   tt.func @early_lower(
       %a_ptrs: tensor<256x64x!tt.ptr<f16>, #blocked>,
@@ -92,5 +108,25 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
       scf.yield %next : i32
     }
     tt.return %result : i32
+  }
+
+  tt.func @lds_modulo_slots(%data: tensor<16x16xf16, #slot_blocked>) {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c4 = arith.constant 4 : index
+    %c1_i32 = arith.constant 1 : i32
+    %c2_i32 = arith.constant 2 : i32
+    %alloc = ttg.local_alloc : () -> !ttg.memdesc<2x16x16xf16, #slot_shared, #smem, mutable>
+    scf.for %i = %c0 to %c4 step %c1 {
+      %i_i32 = arith.index_cast %i : index to i32
+      %current_index = arith.remsi %i_i32, %c2_i32 : i32
+      %previous_index = arith.subi %c1_i32, %current_index : i32
+      %current = ttg.memdesc_index %alloc[%current_index] : !ttg.memdesc<2x16x16xf16, #slot_shared, #smem, mutable> -> !ttg.memdesc<16x16xf16, #slot_shared, #smem, mutable>
+      %previous = ttg.memdesc_index %alloc[%previous_index] : !ttg.memdesc<2x16x16xf16, #slot_shared, #smem, mutable> -> !ttg.memdesc<16x16xf16, #slot_shared, #smem, mutable>
+      ttg.local_store %data, %current : tensor<16x16xf16, #slot_blocked> -> !ttg.memdesc<16x16xf16, #slot_shared, #smem, mutable>
+      %loaded = ttg.local_load %previous : !ttg.memdesc<16x16xf16, #slot_shared, #smem, mutable> -> tensor<16x16xf16, #slot_blocked>
+    }
+    ttg.local_dealloc %alloc : !ttg.memdesc<2x16x16xf16, #slot_shared, #smem, mutable>
+    tt.return
   }
 }

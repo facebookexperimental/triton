@@ -245,6 +245,49 @@ static llvm::json::Array intArray(ArrayRef<int64_t> values) {
   return result;
 }
 
+static llvm::json::Object
+slotExpressionJSON(const PlanSlotExpression &expression) {
+  return llvm::json::Object{
+      {"kind", expression.kind},
+      {"text", expression.text},
+      {"base_value", expression.baseValueId},
+      {"coefficient", expression.coefficient},
+      {"offset", expression.offset},
+      {"modulus", expression.modulus},
+      {"possible_slots", intArray(expression.possibleSlots)},
+  };
+}
+
+static llvm::json::Object slotPathJSON(const PlanSlotPath &path) {
+  llvm::json::Array indices;
+  for (const PlanSlotExpression &expression : path.indices)
+    indices.push_back(slotExpressionJSON(expression));
+  return llvm::json::Object{{"root_value", path.rootValueId},
+                            {"indices", std::move(indices)}};
+}
+
+static llvm::json::Object liveSegmentJSON(const PlanLiveSegment &segment) {
+  llvm::json::Object object{
+      {"value", segment.valueId},
+      {"block", segment.blockId},
+      {"start_position", segment.startPosition},
+      {"end_position", segment.endPosition},
+      {"live_in", segment.liveIn},
+      {"live_out", segment.liveOut},
+      {"crosses_backedge", segment.crossesBackedge},
+      {"iteration_distance", segment.iterationDistance},
+  };
+  if (!segment.startOperationId.empty())
+    object["start_operation"] = segment.startOperationId;
+  else
+    object["start_operation"] = nullptr;
+  if (!segment.endOperationId.empty())
+    object["end_operation"] = segment.endOperationId;
+  else
+    object["end_operation"] = nullptr;
+  return object;
+}
+
 static LineageParameters parametersFromAttributes(Operation *op,
                                                   ArrayRef<StringRef> names) {
   LineageParameters parameters;
@@ -549,6 +592,17 @@ FailureOr<PlanValueGraph> PlanValueGraph::build(FuncOp function) {
                          graph.diagnostics, operationIds);
   }
 
+  FailureOr<PlanLivenessResult> liveness =
+      analyzePlanLiveness(function, operationIds, valueIds, graph.lineageEdges);
+  if (failed(liveness))
+    return failure();
+  graph.blocks = std::move(liveness->blocks);
+  graph.liveSegments = std::move(liveness->liveSegments);
+  graph.aliases = std::move(liveness->aliases);
+  graph.memoryAccesses = std::move(liveness->memoryAccesses);
+  graph.ldsAllocations = std::move(liveness->ldsAllocations);
+  llvm::append_range(graph.diagnostics, liveness->diagnostics);
+
   llvm::sort(graph.operations,
              [](const auto &lhs, const auto &rhs) { return lhs.id < rhs.id; });
   llvm::sort(graph.values,
@@ -582,12 +636,25 @@ FailureOr<PlanValueGraph> PlanValueGraph::build(FuncOp function) {
 LogicalResult PlanValueGraph::verify(bool strict) const {
   std::set<std::string> operationIds;
   std::set<std::string> valueIds;
+  std::map<std::string, int64_t> blockSizes;
   for (const auto &operation : operations)
     if (operation.id.empty() || !operationIds.insert(operation.id).second)
       return failure();
   for (const auto &value : values)
     if (value.id.empty() || !valueIds.insert(value.id).second)
       return failure();
+
+  for (const PlanBlockRecord &block : blocks) {
+    if (block.id.empty() ||
+        !blockSizes.emplace(block.id, block.operations.size()).second)
+      return failure();
+    if (!block.parentOperationId.empty() &&
+        !operationIds.count(block.parentOperationId))
+      return failure();
+    for (StringRef operationId : block.operations)
+      if (!operationIds.count(operationId.str()))
+        return failure();
+  }
 
   for (const auto &value : values) {
     if (!value.definingOperationId.empty() &&
@@ -606,6 +673,71 @@ LogicalResult PlanValueGraph::verify(bool strict) const {
     } else if (edge.iterationDistance != 0) {
       return failure();
     }
+  }
+  auto verifySegment = [&](const PlanLiveSegment &segment) {
+    auto block = blockSizes.find(segment.blockId);
+    if (!valueIds.count(segment.valueId) || block == blockSizes.end() ||
+        segment.startPosition < 0 ||
+        segment.startPosition > segment.endPosition ||
+        segment.endPosition > block->second || segment.iterationDistance < 0)
+      return failure();
+    if (!segment.startOperationId.empty() &&
+        !operationIds.count(segment.startOperationId))
+      return failure();
+    if (!segment.endOperationId.empty() &&
+        !operationIds.count(segment.endOperationId))
+      return failure();
+    if (segment.crossesBackedge != (segment.iterationDistance > 0))
+      return failure();
+    return success();
+  };
+  for (const PlanLiveSegment &segment : liveSegments)
+    if (failed(verifySegment(segment)))
+      return failure();
+
+  auto verifySlotPaths = [&](ArrayRef<PlanSlotPath> paths) {
+    for (const PlanSlotPath &path : paths) {
+      if (!valueIds.count(path.rootValueId))
+        return failure();
+      for (const PlanSlotExpression &index : path.indices) {
+        if (!index.baseValueId.empty() && !valueIds.count(index.baseValueId))
+          return failure();
+        if (index.modulus < 0)
+          return failure();
+      }
+    }
+    return success();
+  };
+  for (const PlanAliasRecord &alias : aliases) {
+    if (!valueIds.count(alias.valueId) ||
+        (!alias.sourceValueId.empty() &&
+         !valueIds.count(alias.sourceValueId)) ||
+        failed(verifySlotPaths(alias.slotPaths)))
+      return failure();
+    for (StringRef root : alias.rootValueIds)
+      if (!valueIds.count(root.str()))
+        return failure();
+  }
+  for (const PlanMemoryAccess &access : memoryAccesses) {
+    if (!operationIds.count(access.operationId) ||
+        !valueIds.count(access.valueId) ||
+        failed(verifySlotPaths(access.slotPaths)))
+      return failure();
+    for (StringRef root : access.rootValueIds)
+      if (!valueIds.count(root.str()))
+        return failure();
+  }
+  for (const PlanLdsAllocationRecord &allocation : ldsAllocations) {
+    if (!valueIds.count(allocation.rootValueId) ||
+        !operationIds.count(allocation.allocationOperationId))
+      return failure();
+    for (StringRef alias : allocation.aliases)
+      if (!valueIds.count(alias.str()))
+        return failure();
+    for (const PlanLiveSegment &segment : allocation.liveSegments)
+      if (segment.valueId != allocation.rootValueId ||
+          failed(verifySegment(segment)))
+        return failure();
   }
   if (strict)
     for (const auto &diagnostic : diagnostics)
@@ -696,12 +828,102 @@ llvm::json::Object PlanValueGraph::toJSON() const {
     diagnosticArray.push_back(std::move(object));
   }
 
+  llvm::json::Array blockArray;
+  for (const PlanBlockRecord &block : blocks) {
+    llvm::json::Array blockOperations;
+    for (StringRef operation : block.operations)
+      blockOperations.push_back(operation);
+    blockArray.push_back(llvm::json::Object{
+        {"id", block.id},
+        {"parent_operation", block.parentOperationId.empty()
+                                 ? llvm::json::Value(nullptr)
+                                 : llvm::json::Value(block.parentOperationId)},
+        {"region_number", block.regionNumber},
+        {"block_number", block.blockNumber},
+        {"operations", std::move(blockOperations)},
+    });
+  }
+
+  llvm::json::Array liveSegmentArray;
+  for (const PlanLiveSegment &segment : liveSegments)
+    liveSegmentArray.push_back(liveSegmentJSON(segment));
+
+  llvm::json::Array aliasArray;
+  for (const PlanAliasRecord &alias : aliases) {
+    llvm::json::Array roots;
+    for (StringRef root : alias.rootValueIds)
+      roots.push_back(root);
+    llvm::json::Array paths;
+    for (const PlanSlotPath &path : alias.slotPaths)
+      paths.push_back(slotPathJSON(path));
+    aliasArray.push_back(llvm::json::Object{
+        {"value", alias.valueId},
+        {"view_kind", alias.viewKind},
+        {"source_value", alias.sourceValueId.empty()
+                             ? llvm::json::Value(nullptr)
+                             : llvm::json::Value(alias.sourceValueId)},
+        {"root_values", std::move(roots)},
+        {"static_offsets", intArray(alias.staticOffsets)},
+        {"order", intArray(alias.order)},
+        {"slot_paths", std::move(paths)},
+        {"physical_lds_offset", nullptr},
+    });
+  }
+
+  llvm::json::Array accessArray;
+  for (const PlanMemoryAccess &access : memoryAccesses) {
+    llvm::json::Array roots;
+    for (StringRef root : access.rootValueIds)
+      roots.push_back(root);
+    llvm::json::Array paths;
+    for (const PlanSlotPath &path : access.slotPaths)
+      paths.push_back(slotPathJSON(path));
+    accessArray.push_back(llvm::json::Object{
+        {"operation", access.operationId},
+        {"value", access.valueId},
+        {"effect", access.effect},
+        {"pending_async", access.pendingAsync},
+        {"root_values", std::move(roots)},
+        {"slot_paths", std::move(paths)},
+    });
+  }
+
+  llvm::json::Array allocationArray;
+  for (const PlanLdsAllocationRecord &allocation : ldsAllocations) {
+    llvm::json::Array allocationAliases;
+    for (StringRef alias : allocation.aliases)
+      allocationAliases.push_back(alias);
+    llvm::json::Array allocationSegments;
+    for (const PlanLiveSegment &segment : allocation.liveSegments)
+      allocationSegments.push_back(liveSegmentJSON(segment));
+    llvm::json::Object object{
+        {"root_value", allocation.rootValueId},
+        {"allocation_operation", allocation.allocationOperationId},
+        {"aliases", std::move(allocationAliases)},
+        {"live_segments", std::move(allocationSegments)},
+        {"physical_lds_offset", nullptr},
+        {"physical_lds_size", nullptr},
+    };
+    object["logical_bytes"] = allocation.logicalBytes
+                                  ? llvm::json::Value(*allocation.logicalBytes)
+                                  : llvm::json::Value(nullptr);
+    object["alignment"] = allocation.alignment
+                              ? llvm::json::Value(*allocation.alignment)
+                              : llvm::json::Value(nullptr);
+    allocationArray.push_back(std::move(object));
+  }
+
   return llvm::json::Object{
       {"function", functionName},
       {"semantic_fingerprint", semanticFingerprint},
       {"operations", std::move(operationArray)},
       {"values", std::move(valueArray)},
       {"lineage_edges", std::move(lineageArray)},
+      {"blocks", std::move(blockArray)},
+      {"live_segments", std::move(liveSegmentArray)},
+      {"lds_aliases", std::move(aliasArray)},
+      {"memory_accesses", std::move(accessArray)},
+      {"lds_allocations", std::move(allocationArray)},
       {"diagnostics", std::move(diagnosticArray)},
   };
 }
@@ -733,9 +955,12 @@ std::string serializePlanValueGraphs(ArrayRef<PlanValueGraph> graphs,
       {"artifact_stage", "final_structured_ttgir"},
       {"pass_position", "after_warp_pipeline_conversion_before_scf_to_cf"},
       {"logical_tensor_bytes_are_physical_vgpr_bytes", false},
+      {"static_intervals_are_physical_cycles", false},
+      {"lds_logical_bytes_are_physical_allocation", false},
+      {"async_lifetime_extended_through_wait", false},
   };
   llvm::json::Object root{
-      {"schema_version", "plan-value-graph/0.1"},
+      {"schema_version", "plan-value-graph/0.2"},
       {"module_semantic_fingerprint", moduleFingerprint},
       {"provenance", std::move(provenance)},
       {"functions", std::move(functions)},
