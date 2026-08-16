@@ -86,3 +86,17 @@ bytes, not per-wave VGPR bytes. Peak LDS bytes use logical allocation roots and
 do not imply assigned offsets or allocator overlap. `tlx_plan audit` rejects
 error diagnostics, open important facts, and LDS reuse hazards while allowing
 explicitly classified deterministic identity fallbacks.
+
+## M1.5a schedule delta
+
+`plan-schedule-delta/0.1` is a separate mutation request rather than a
+PlanBundle layer. It names the kernel, input value-graph fingerprint, final
+structured-TTGIR pass position, and one or more changed blocks. Each block
+contains its complete baseline operation order and complete desired
+permutation. The compiler rejects kernel, fingerprint, block, baseline-order,
+or permutation mismatches before moving an operation.
+
+M1.5a only changes order within an existing block and dynamic iteration. It
+does not change storage, synchronization, loop placement, staging depth, or
+dot decomposition. Positive dependency distance is structured-loop metadata,
+not permission to move an operation into another iteration.

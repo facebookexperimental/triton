@@ -300,7 +300,12 @@ FailureOr<PlanAuditAnalysisResult> analyzePlanAudit(
 /// physical LDS offsets, or hardware-cycle lifetime.
 class PlanValueGraph {
 public:
-  static FailureOr<PlanValueGraph> build(FuncOp function);
+  /// Build the stable graph. When requested, retain the transient mapping from
+  /// live IR operations to their stable IDs for an immediately following
+  /// analysis or mutation pass.
+  static FailureOr<PlanValueGraph>
+  build(FuncOp function,
+        llvm::DenseMap<Operation *, std::string> *operationBindings = nullptr);
 
   LogicalResult verify(bool strict = false) const;
   llvm::json::Object toJSON() const;

@@ -9,6 +9,11 @@ from tlx_plan.baseline import FA_BWD_D128_CASES, FA_BWD_D128_SCHEDULES, make_man
 from tlx_plan.audit import audit_plan
 from tlx_plan.model import PlanBundle, PlanError
 from tlx_plan.replay import compare_plans, verify_replay
+from tlx_plan.schedule_delta import (
+    PlanScheduleDelta,
+    make_identity_schedule_delta,
+    make_identity_schedule_delta_from_value_graph,
+)
 from tlx_plan.ttgir import extract_plan, normalize_ttgir
 
 
@@ -411,3 +416,63 @@ def test_validation_rejects_distance_zero_dependency_cycle() -> None:
     plan.refresh_hashes()
     with pytest.raises(PlanError, match="contains a cycle"):
         plan.validate()
+
+
+def _plan_with_schedule_block() -> PlanBundle:
+    plan = extract_plan(TTGIR)
+    plan.value_graph_fingerprint = "fixture-fingerprint"
+    plan.blocks = [
+        {
+            "id": "block:fixture:0",
+            "operations": [operation["id"] for operation in plan.operations],
+        }
+    ]
+    plan.refresh_hashes()
+    return plan
+
+
+def test_identity_schedule_delta_round_trip(tmp_path) -> None:
+    plan = _plan_with_schedule_block()
+    delta = make_identity_schedule_delta(plan)
+    path = tmp_path / "schedule-delta.json"
+    delta.write(path)
+    loaded = PlanScheduleDelta.read(path)
+    loaded.validate(plan)
+    assert loaded.schema_version == "plan-schedule-delta/0.1"
+    assert loaded.blocks[0].baseline_order == loaded.blocks[0].desired_order
+
+
+def test_schedule_delta_rejects_incomplete_permutation() -> None:
+    plan = _plan_with_schedule_block()
+    delta = make_identity_schedule_delta(plan)
+    delta.blocks[0].desired_order.pop()
+    with pytest.raises(PlanError, match="complete permutation"):
+        delta.validate(plan)
+
+
+def test_schedule_delta_rejects_baseline_mismatch() -> None:
+    plan = _plan_with_schedule_block()
+    delta = make_identity_schedule_delta(plan)
+    delta.blocks[0].baseline_order[0], delta.blocks[0].baseline_order[1] = (
+        delta.blocks[0].baseline_order[1],
+        delta.blocks[0].baseline_order[0],
+    )
+    delta.blocks[0].desired_order = list(delta.blocks[0].baseline_order)
+    with pytest.raises(PlanError, match="baseline order does not match"):
+        delta.validate(plan)
+
+
+def test_identity_schedule_delta_from_native_value_graph() -> None:
+    native = {
+        "schema_version": "plan-value-graph/0.4",
+        "functions": [
+            {
+                "function": "kernel",
+                "semantic_fingerprint": "fingerprint",
+                "blocks": [{"id": "block:0", "operations": ["op:a", "op:return"]}],
+            }
+        ],
+    }
+    delta = make_identity_schedule_delta_from_value_graph(native, "kernel")
+    assert delta.input_value_graph_fingerprint == "fingerprint"
+    assert delta.blocks[0].desired_order == ["op:a", "op:return"]

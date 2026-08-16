@@ -448,7 +448,9 @@ static void addStructuredLineage(
 
 } // namespace
 
-FailureOr<PlanValueGraph> PlanValueGraph::build(FuncOp function) {
+FailureOr<PlanValueGraph> PlanValueGraph::build(
+    FuncOp function,
+    llvm::DenseMap<Operation *, std::string> *operationBindings) {
   PlanValueGraph graph;
   graph.functionName = function.getName().str();
 
@@ -673,6 +675,8 @@ FailureOr<PlanValueGraph> PlanValueGraph::build(FuncOp function) {
 
   if (failed(graph.verify(/*strict=*/false)))
     return failure();
+  if (operationBindings)
+    *operationBindings = operationIds;
   return graph;
 }
 

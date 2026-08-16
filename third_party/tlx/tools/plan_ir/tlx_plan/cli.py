@@ -12,6 +12,11 @@ from .baseline import FA_BWD_D128_CASES, FA_BWD_D128_SCHEDULES, make_manifest, r
 from .audit import audit_markdown, audit_plan
 from .model import PlanBundle, canonical_json
 from .replay import compare_plans, replay_normalized, verify_replay
+from .schedule_delta import (
+    PlanScheduleDelta,
+    make_identity_schedule_delta,
+    make_identity_schedule_delta_from_value_graph,
+)
 from .ttgir import extract_plan, normalize_ttgir
 
 
@@ -69,6 +74,24 @@ def _parser() -> argparse.ArgumentParser:
     audit.add_argument("--plan", type=Path, required=True)
     audit.add_argument("--output", type=Path)
     audit.add_argument("--markdown-output", type=Path)
+
+    schedule_delta = commands.add_parser(
+        "schedule-delta", help="construct an identity M1.5a block schedule delta"
+    )
+    schedule_source = schedule_delta.add_mutually_exclusive_group(required=True)
+    schedule_source.add_argument("--plan", type=Path)
+    schedule_source.add_argument("--value-graph", type=Path)
+    schedule_delta.add_argument("--kernel")
+    schedule_delta.add_argument("--block", action="append")
+    schedule_delta.add_argument("--reason", default="identity schedule")
+    schedule_delta.add_argument("--output", type=Path, required=True)
+
+    validate_delta = commands.add_parser(
+        "validate-schedule-delta", help="validate an M1.5a schedule delta"
+    )
+    validate_delta.add_argument("--delta", type=Path, required=True)
+    validate_delta.add_argument("--plan", type=Path)
+    validate_delta.add_argument("--output", type=Path)
     return parser
 
 
@@ -132,6 +155,37 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.markdown_output:
             args.markdown_output.write_text(audit_markdown(report))
         return 0 if report["passed"] else 1
+    elif args.command == "schedule-delta":
+        if args.plan:
+            plan = PlanBundle.read(args.plan)
+            delta = make_identity_schedule_delta(
+                plan,
+                args.block,
+                reason=args.reason,
+            )
+        else:
+            if not args.kernel:
+                raise SystemExit("--kernel is required with --value-graph")
+            delta = make_identity_schedule_delta_from_value_graph(
+                json.loads(args.value_graph.read_text()),
+                args.kernel,
+                block_ids=args.block,
+                reason=args.reason,
+            )
+        delta.write(args.output)
+    elif args.command == "validate-schedule-delta":
+        delta = PlanScheduleDelta.read(args.delta)
+        plan = PlanBundle.read(args.plan) if args.plan else None
+        delta.validate(plan)
+        _emit(
+            {
+                "schema_version": "plan-schedule-delta-validation/0.1",
+                "passed": True,
+                "kernel": delta.kernel,
+                "blocks": len(delta.blocks),
+            },
+            args.output,
+        )
     return 0
 
 

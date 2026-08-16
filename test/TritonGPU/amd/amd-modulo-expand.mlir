@@ -22,6 +22,26 @@
 // RUN:   -split-input-file \
 // RUN:   -tritonamdgpu-dump-plan-value-graph='output-path=- strict=true' \
 // RUN:   -o /dev/null | FileCheck %s --check-prefix=PLAN-TRANSPOSE
+// RUN: triton-opt %s \
+// RUN:   -tritonamdgpu-dump-plan-value-graph='output-path=%t.schedule.plan.json strict=true' \
+// RUN:   -o /dev/null
+// RUN: env PYTHONPATH=%S/../../../third_party/tlx/tools/plan_ir \
+// RUN:   python3 -m tlx_plan.cli schedule-delta \
+// RUN:   --value-graph %t.schedule.plan.json --kernel schedule_apply_fixture \
+// RUN:   --output %t.schedule.identity.json
+// RUN: python3 -c "import json; p=json.load(open('%t.schedule.identity.json')); o=p['blocks'][0]['desired_order']; o[0],o[1]=o[1],o[0]; open('%t.schedule.legal.json','w').write(json.dumps(p))"
+// RUN: triton-opt %s \
+// RUN:   -tritonamdgpu-apply-plan-schedule='input-path=%t.schedule.legal.json report-path=%t.schedule.report.json strict=true' \
+// RUN:   | FileCheck %s --check-prefix=APPLY
+// RUN: FileCheck %s --check-prefix=APPLY-REPORT < %t.schedule.report.json
+// RUN: triton-opt %S/../../Conversion/amd/in_thread_transpose.mlir \
+// RUN:   -split-input-file \
+// RUN:   -tritonamdgpu-apply-plan-schedule='input-path=%t.schedule.legal.json strict=true allow-missing-kernel=true' \
+// RUN:   -o /dev/null
+// RUN: python3 -c "import json; p=json.load(open('%t.schedule.identity.json')); o=p['blocks'][0]['desired_order']; o[1],o[2]=o[2],o[1]; open('%t.schedule.invalid.json','w').write(json.dumps(p))"
+// RUN: not triton-opt %s \
+// RUN:   -tritonamdgpu-apply-plan-schedule='input-path=%t.schedule.invalid.json strict=true' \
+// RUN:   2>&1 | FileCheck %s --check-prefix=APPLY-REJECT
 //
 // Modulo runs before the guarded legacy scheduler. A successful modulo schedule
 // is preserved; the standard AMD pipeline lowers and expands it.
@@ -89,6 +109,13 @@
 // PLAN-DAG: "importance": "important"
 // PLAN-DAG: "status": "open"
 // PLAN-TRANSPOSE: "kind": "in_thread_transpose"
+// APPLY-LABEL: tt.func @schedule_apply_fixture
+// APPLY: %[[C2:.*]] = arith.constant 2 : i32
+// APPLY-NEXT: %[[C1:.*]] = arith.constant 1 : i32
+// APPLY-NEXT: arith.addi %[[C1]], %[[C2]]
+// APPLY-REPORT: "accepted": true
+// APPLY-REPORT: "moved_operations": 2
+// APPLY-REJECT: schedule delta reverses distance-zero dependency
 
 #mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [2, 2], instrShape = [16, 16, 32], isTransposed = true}>
 #dot0 = #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 8}>
@@ -196,5 +223,12 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
     ttg.barrier all
     ttg.local_dealloc %alloc : !ttg.memdesc<16x16xf16, #slot_shared, #smem, mutable>
     tt.return
+  }
+
+  tt.func @schedule_apply_fixture() -> i32 {
+    %c1 = arith.constant 1 : i32
+    %c2 = arith.constant 2 : i32
+    %sum = arith.addi %c1, %c2 : i32
+    tt.return %sum : i32
   }
 }

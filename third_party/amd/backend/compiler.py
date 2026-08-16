@@ -480,6 +480,15 @@ class HIPBackend(BaseBackend):
         pm.enable_debug()
         amd.passes.ttgpuir.add_update_async_wait_count(pm, options.arch)
         amd.passes.ttgpuir.add_warp_pipeline_conversion(pm, options.arch)
+        schedule_plan = os.environ.get("TRITON_TLX_SCHEDULE_PLAN")
+        if schedule_plan:
+            amd.passes.ttgpuir.add_apply_plan_schedule(
+                pm,
+                schedule_plan,
+                os.environ.get("TRITON_TLX_PLAN_APPLY_REPORT", ""),
+                True,
+                True,
+            )
         plan_analysis_dir = os.environ.get("TRITON_TLX_PLAN_ANALYSIS_DIR")
         if plan_analysis_dir:
             amd.passes.ttgpuir.add_dump_plan_value_graph(pm, plan_analysis_dir, True)

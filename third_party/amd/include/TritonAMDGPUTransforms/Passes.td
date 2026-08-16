@@ -505,4 +505,35 @@ def TritonAMDGPUDumpPlanValueGraph
                            "mlir::scf::SCFDialect"];
 }
 
+def TritonAMDGPUApplyPlanSchedule
+    : Pass<"tritonamdgpu-apply-plan-schedule", "mlir::ModuleOp"> {
+  let summary = "Apply a verified block-local schedule delta to final AMD TTGIR";
+
+  let description = [{
+    Runs after update_async_wait_count and warp_pipeline_conversion and before
+    SCFToCF. The pass resolves stable PlanValueGraph IDs, validates an exact
+    baseline block order, a complete desired permutation, distance-zero
+    dependencies, and conservative pinned-operation anchors before moving any
+    operation. It cannot move operations between blocks or iterations and does
+    not change storage, synchronization, staging, or dot decomposition.
+  }];
+
+  let options = [
+    Option<"inputPath", "input-path", "std::string", /*default=*/"\"\"",
+           "plan-schedule-delta/0.1 JSON input file.">,
+    Option<"reportPath", "report-path", "std::string", /*default=*/"\"\"",
+           "Optional plan-apply-report/0.1 JSON output file or '-'.">,
+    Option<"strict", "strict", "bool", /*default=*/"true",
+           "Require strict value-graph verification before and after apply.">,
+    Option<"allowMissingKernel", "allow-missing-kernel", "bool",
+           /*default=*/"false",
+           "Silently skip modules that do not contain the delta target kernel.">,
+  ];
+
+  let dependentDialects = ["mlir::triton::TritonDialect",
+                           "mlir::triton::gpu::TritonGPUDialect",
+                           "mlir::triton::amdgpu::TritonAMDGPUDialect",
+                           "mlir::scf::SCFDialect"];
+}
+
 #endif

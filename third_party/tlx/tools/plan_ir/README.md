@@ -1,6 +1,6 @@
 # AMD TLX Plan IR prototype
 
-This directory implements M1.1--M1.4d of the profile-guided TLX scheduling
+This directory implements M1.1--M1.5a of the profile-guided TLX scheduling
 design without changing the existing TLX kernels or modulo scheduler.
 
 ## Implemented milestones
@@ -31,10 +31,14 @@ design without changing the existing TLX kernels or modulo scheduler.
   and slot-reuse dependencies; block-local peak logical live sets; logical
   resource summaries; typed unresolved facts; and a strict machine-readable
   and Markdown audit for pinned kernels.
+- **M1.5a — intra-iteration plan application:** a versioned schedule-delta
+  contract and AMD final-structured-TTGIR pass that resolve stable IDs,
+  validate exact baselines, anchors, and distance-zero dependencies, then
+  apply complete block-local permutations without changing iteration,
+  staging, synchronization, or dot decomposition.
 
-M1.3 verifies that a captured baseline is reproducible. It does **not** lower an
-arbitrarily mutated storage or schedule plan back into TTGIR. That mutation path
-is intentionally left for the later candidate-generation/lowering milestone.
+M1.5a lowers only verified intra-iteration schedule permutations. Storage and
+cross-iteration schedule mutation remain intentionally deferred to M1.5b.
 
 ## Reproduction
 
@@ -88,6 +92,35 @@ python3 -m tlx_plan audit \
   --output /tmp/plan-audit.json \
   --markdown-output /tmp/plan-audit.md
 ```
+
+Create and validate an identity M1.5a block-local schedule delta with:
+
+```bash
+python3 -m tlx_plan schedule-delta \
+  --plan /tmp/plan.json \
+  --output /tmp/schedule-delta.json
+python3 -m tlx_plan validate-schedule-delta \
+  --delta /tmp/schedule-delta.json \
+  --plan /tmp/plan.json
+```
+
+The desired order may then be edited as a complete permutation. Native
+application checks the exact baseline order and all distance-zero dependencies
+before changing final structured TTGIR.
+
+Apply a delta during AMD compilation with:
+
+```bash
+export TRITON_TLX_SCHEDULE_PLAN=/tmp/schedule-delta.json
+export TRITON_TLX_PLAN_APPLY_REPORT=/tmp/plan-apply-report.json
+```
+
+The compiler hook skips unrelated helper-kernel modules, but the standalone
+pass rejects a missing target kernel unless `allow-missing-kernel=true` is
+explicitly requested. The report records stable input/output fingerprints,
+checked dependencies, pinned anchors, moved operation counts, and confirms
+that iteration placement, storage, synchronization, and dot decomposition are
+unchanged.
 
 The fixed configuration names and kernel symbols are sourced from
 `third_party/tlx/tutorials/amd_fa_bwd.py`:
