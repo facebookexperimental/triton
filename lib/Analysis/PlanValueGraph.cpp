@@ -288,6 +288,25 @@ static llvm::json::Object liveSegmentJSON(const PlanLiveSegment &segment) {
   return object;
 }
 
+static llvm::json::Object asyncFrontierJSON(const PlanAsyncFrontier &frontier) {
+  return llvm::json::Object{
+      {"operation", frontier.operationId},
+      {"block", frontier.blockId},
+      {"kind", frontier.kind},
+      {"precision", frontier.precision},
+      {"position", frontier.position},
+      {"iteration_distance", frontier.iterationDistance},
+  };
+}
+
+static llvm::json::Array
+asyncFrontierArray(ArrayRef<PlanAsyncFrontier> frontiers) {
+  llvm::json::Array result;
+  for (const PlanAsyncFrontier &frontier : frontiers)
+    result.push_back(asyncFrontierJSON(frontier));
+  return result;
+}
+
 static LineageParameters parametersFromAttributes(Operation *op,
                                                   ArrayRef<StringRef> names) {
   LineageParameters parameters;
@@ -603,6 +622,17 @@ FailureOr<PlanValueGraph> PlanValueGraph::build(FuncOp function) {
   graph.ldsAllocations = std::move(liveness->ldsAllocations);
   llvm::append_range(graph.diagnostics, liveness->diagnostics);
 
+  FailureOr<PlanAsyncLifetimeResult> asyncLifetimes =
+      analyzePlanAsyncLifetimes(function, operationIds, valueIds, graph.blocks,
+                                graph.aliases, graph.memoryAccesses);
+  if (failed(asyncLifetimes))
+    return failure();
+  graph.asyncTransactions = std::move(asyncLifetimes->transactions);
+  graph.asyncGroups = std::move(asyncLifetimes->groups);
+  graph.asyncWaits = std::move(asyncLifetimes->waits);
+  graph.ldsReuseHazards = std::move(asyncLifetimes->hazards);
+  llvm::append_range(graph.diagnostics, asyncLifetimes->diagnostics);
+
   llvm::sort(graph.operations,
              [](const auto &lhs, const auto &rhs) { return lhs.id < rhs.id; });
   llvm::sort(graph.values,
@@ -738,6 +768,65 @@ LogicalResult PlanValueGraph::verify(bool strict) const {
       if (segment.valueId != allocation.rootValueId ||
           failed(verifySegment(segment)))
         return failure();
+  }
+  std::set<std::string> transactionIds;
+  std::set<std::string> groupIds;
+  for (const PlanAsyncTransaction &transaction : asyncTransactions)
+    if (transaction.id.empty() || !transactionIds.insert(transaction.id).second)
+      return failure();
+  for (const PlanAsyncGroup &group : asyncGroups)
+    if (group.id.empty() || !groupIds.insert(group.id).second)
+      return failure();
+  auto verifyFrontiers = [&](ArrayRef<PlanAsyncFrontier> frontiers) {
+    for (const PlanAsyncFrontier &frontier : frontiers) {
+      auto block = blockSizes.find(frontier.blockId);
+      if (!operationIds.count(frontier.operationId) ||
+          block == blockSizes.end() || frontier.position < 0 ||
+          frontier.position >= block->second || frontier.iterationDistance < 0)
+        return failure();
+    }
+    return success();
+  };
+  for (const PlanAsyncTransaction &transaction : asyncTransactions) {
+    if (!operationIds.count(transaction.producerOperationId) ||
+        !valueIds.count(transaction.destinationValueId) ||
+        (!transaction.commitGroupId.empty() &&
+         !groupIds.count(transaction.commitGroupId)) ||
+        failed(verifySlotPaths(transaction.slotPaths)) ||
+        failed(verifyFrontiers(transaction.completionFrontiers)) ||
+        failed(verifyFrontiers(transaction.visibilityFrontiers)) ||
+        failed(verifyFrontiers(transaction.consumerFrontiers)) ||
+        failed(verifyFrontiers(transaction.releaseFrontiers)) ||
+        failed(verifyFrontiers(transaction.overwriteFrontiers)))
+      return failure();
+    for (StringRef root : transaction.rootValueIds)
+      if (!valueIds.count(root.str()))
+        return failure();
+  }
+  for (const PlanAsyncGroup &group : asyncGroups) {
+    if (!operationIds.count(group.commitOperationId))
+      return failure();
+    for (StringRef transaction : group.transactionIds)
+      if (!transactionIds.count(transaction.str()))
+        return failure();
+  }
+  for (const PlanAsyncWaitRecord &wait : asyncWaits) {
+    if (!operationIds.count(wait.operationId) || wait.retainedGroupCount < 0)
+      return failure();
+    for (const PlanAsyncWaitCompletion &completion : wait.completedGroups)
+      if (!groupIds.count(completion.groupId) ||
+          completion.iterationDistance < 0)
+        return failure();
+    for (StringRef group : wait.possiblyOutstandingGroups)
+      if (!groupIds.count(group.str()))
+        return failure();
+  }
+  for (const PlanLdsReuseHazard &hazard : ldsReuseHazards) {
+    if (!transactionIds.count(hazard.transactionId) ||
+        (!hazard.operationId.empty() &&
+         !operationIds.count(hazard.operationId)) ||
+        (!hazard.rootValueId.empty() && !valueIds.count(hazard.rootValueId)))
+      return failure();
   }
   if (strict)
     for (const auto &diagnostic : diagnostics)
@@ -913,6 +1002,87 @@ llvm::json::Object PlanValueGraph::toJSON() const {
     allocationArray.push_back(std::move(object));
   }
 
+  llvm::json::Array asyncTransactionArray;
+  for (const PlanAsyncTransaction &transaction : asyncTransactions) {
+    llvm::json::Array roots;
+    for (StringRef root : transaction.rootValueIds)
+      roots.push_back(root);
+    llvm::json::Array paths;
+    for (const PlanSlotPath &path : transaction.slotPaths)
+      paths.push_back(slotPathJSON(path));
+    asyncTransactionArray.push_back(llvm::json::Object{
+        {"id", transaction.id},
+        {"producer_operation", transaction.producerOperationId},
+        {"destination_value", transaction.destinationValueId},
+        {"direction", transaction.direction},
+        {"commit_group", transaction.commitGroupId.empty()
+                             ? llvm::json::Value(nullptr)
+                             : llvm::json::Value(transaction.commitGroupId)},
+        {"precision", transaction.precision},
+        {"root_values", std::move(roots)},
+        {"slot_paths", std::move(paths)},
+        {"completion_frontiers",
+         asyncFrontierArray(transaction.completionFrontiers)},
+        {"visibility_frontiers",
+         asyncFrontierArray(transaction.visibilityFrontiers)},
+        {"consumer_frontiers",
+         asyncFrontierArray(transaction.consumerFrontiers)},
+        {"release_frontiers", asyncFrontierArray(transaction.releaseFrontiers)},
+        {"overwrite_frontiers",
+         asyncFrontierArray(transaction.overwriteFrontiers)},
+    });
+  }
+
+  llvm::json::Array asyncGroupArray;
+  for (const PlanAsyncGroup &group : asyncGroups) {
+    llvm::json::Array transactions;
+    for (StringRef transaction : group.transactionIds)
+      transactions.push_back(transaction);
+    asyncGroupArray.push_back(llvm::json::Object{
+        {"id", group.id},
+        {"commit_operation", group.commitOperationId},
+        {"transactions", std::move(transactions)},
+    });
+  }
+
+  llvm::json::Array asyncWaitArray;
+  for (const PlanAsyncWaitRecord &wait : asyncWaits) {
+    llvm::json::Array completed;
+    for (const PlanAsyncWaitCompletion &completion : wait.completedGroups)
+      completed.push_back(llvm::json::Object{
+          {"group", completion.groupId},
+          {"iteration_distance", completion.iterationDistance},
+          {"precision", completion.precision},
+      });
+    llvm::json::Array outstanding;
+    for (StringRef group : wait.possiblyOutstandingGroups)
+      outstanding.push_back(group);
+    asyncWaitArray.push_back(llvm::json::Object{
+        {"operation", wait.operationId},
+        {"retained_group_count", wait.retainedGroupCount},
+        {"completed_groups", std::move(completed)},
+        {"possibly_outstanding_groups", std::move(outstanding)},
+        {"precision", wait.precision},
+    });
+  }
+
+  llvm::json::Array reuseHazardArray;
+  for (const PlanLdsReuseHazard &hazard : ldsReuseHazards) {
+    llvm::json::Object object{
+        {"severity", hazard.severity},
+        {"code", hazard.code},
+        {"message", hazard.message},
+        {"transaction", hazard.transactionId},
+    };
+    object["operation"] = hazard.operationId.empty()
+                              ? llvm::json::Value(nullptr)
+                              : llvm::json::Value(hazard.operationId);
+    object["root_value"] = hazard.rootValueId.empty()
+                               ? llvm::json::Value(nullptr)
+                               : llvm::json::Value(hazard.rootValueId);
+    reuseHazardArray.push_back(std::move(object));
+  }
+
   return llvm::json::Object{
       {"function", functionName},
       {"semantic_fingerprint", semanticFingerprint},
@@ -924,6 +1094,10 @@ llvm::json::Object PlanValueGraph::toJSON() const {
       {"lds_aliases", std::move(aliasArray)},
       {"memory_accesses", std::move(accessArray)},
       {"lds_allocations", std::move(allocationArray)},
+      {"async_transactions", std::move(asyncTransactionArray)},
+      {"async_groups", std::move(asyncGroupArray)},
+      {"async_waits", std::move(asyncWaitArray)},
+      {"lds_reuse_hazards", std::move(reuseHazardArray)},
       {"diagnostics", std::move(diagnosticArray)},
   };
 }
@@ -957,10 +1131,12 @@ std::string serializePlanValueGraphs(ArrayRef<PlanValueGraph> graphs,
       {"logical_tensor_bytes_are_physical_vgpr_bytes", false},
       {"static_intervals_are_physical_cycles", false},
       {"lds_logical_bytes_are_physical_allocation", false},
-      {"async_lifetime_extended_through_wait", false},
+      {"async_lifetime_extended_through_wait", true},
+      {"async_lifetimes_are_physical_cycles", false},
+      {"async_analysis_domain", "commit_count_and_cta_barrier"},
   };
   llvm::json::Object root{
-      {"schema_version", "plan-value-graph/0.2"},
+      {"schema_version", "plan-value-graph/0.3"},
       {"module_semantic_fingerprint", moduleFingerprint},
       {"provenance", std::move(provenance)},
       {"functions", std::move(functions)},

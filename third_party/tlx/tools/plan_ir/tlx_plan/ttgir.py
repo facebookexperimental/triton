@@ -245,6 +245,7 @@ def extract_plan(
         if native_value_graph.get("schema_version") not in {
             "plan-value-graph/0.1",
             "plan-value-graph/0.2",
+            "plan-value-graph/0.3",
         }:
             raise PlanError("unsupported native plan-value-graph schema")
         native_function = next(
@@ -413,6 +414,14 @@ def extract_plan(
         ),
         lds_allocations=(
             native_function.get("lds_allocations", []) if native_function is not None else []
+        ),
+        async_transactions=(
+            native_function.get("async_transactions", []) if native_function is not None else []
+        ),
+        async_groups=native_function.get("async_groups", []) if native_function is not None else [],
+        async_waits=native_function.get("async_waits", []) if native_function is not None else [],
+        lds_reuse_hazards=(
+            native_function.get("lds_reuse_hazards", []) if native_function is not None else []
         ),
         value_graph_fingerprint=(
             native_function.get("semantic_fingerprint", "") if native_function is not None else ""

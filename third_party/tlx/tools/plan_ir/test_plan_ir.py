@@ -88,7 +88,7 @@ def test_round_trip_and_replay_report(tmp_path) -> None:
     report = verify_replay(TTGIR, loaded)
     assert report["exact"]
     assert report["semantic_match"]
-    assert json.loads(path.read_text())["schema_version"] == "0.3"
+    assert json.loads(path.read_text())["schema_version"] == "0.4"
 
 
 def test_native_value_graph_supplies_stable_ids_and_lineage() -> None:
@@ -104,7 +104,7 @@ def test_native_value_graph_supplies_stable_ids_and_lineage() -> None:
         for index, operation in enumerate(textual.operations)
     ]
     native = {
-        "schema_version": "plan-value-graph/0.2",
+        "schema_version": "plan-value-graph/0.3",
         "functions": [
             {
                 "function": textual.kernel,
@@ -171,6 +171,49 @@ def test_native_value_graph_supplies_stable_ids_and_lineage() -> None:
                         ],
                     }
                 ],
+                "async_transactions": [
+                    {
+                        "id": "async-tx:native:0",
+                        "producer_operation": operations[0]["id"],
+                        "destination_value": "value:a",
+                        "commit_group": "async-group:native:0",
+                        "root_values": ["value:a"],
+                        "slot_paths": [{"root_value": "value:a", "indices": []}],
+                        "completion_frontiers": [
+                            {
+                                "operation": operations[1]["id"],
+                                "block": "block:native:0",
+                                "position": 1,
+                                "iteration_distance": 1,
+                            }
+                        ],
+                        "visibility_frontiers": [],
+                        "consumer_frontiers": [],
+                        "release_frontiers": [],
+                        "overwrite_frontiers": [],
+                    }
+                ],
+                "async_groups": [
+                    {
+                        "id": "async-group:native:0",
+                        "commit_operation": operations[0]["id"],
+                        "transactions": ["async-tx:native:0"],
+                    }
+                ],
+                "async_waits": [
+                    {
+                        "operation": operations[1]["id"],
+                        "retained_group_count": 0,
+                        "completed_groups": [
+                            {
+                                "group": "async-group:native:0",
+                                "iteration_distance": 1,
+                            }
+                        ],
+                        "possibly_outstanding_groups": [],
+                    }
+                ],
+                "lds_reuse_hazards": [],
                 "diagnostics": [],
             }
         ],
@@ -183,6 +226,7 @@ def test_native_value_graph_supplies_stable_ids_and_lineage() -> None:
     assert plan.lineage_edges[0]["iteration_distance"] == 1
     assert plan.live_segments[0]["block"] == "block:native:0"
     assert plan.lds_allocations[0]["root_value"] == "value:a"
+    assert plan.async_transactions[0]["completion_frontiers"][0]["iteration_distance"] == 1
     assert verify_replay(TTGIR, plan, native_value_graph=native)["semantic_match"]
 
 
@@ -195,7 +239,7 @@ def test_read_upgrades_plan_bundle_0_1(tmp_path) -> None:
     path = tmp_path / "old-plan.json"
     path.write_text(json.dumps(plan))
     upgraded = PlanBundle.read(path)
-    assert upgraded.schema_version == "0.3"
+    assert upgraded.schema_version == "0.4"
     assert upgraded.values == []
 
 
@@ -213,8 +257,27 @@ def test_read_upgrades_plan_bundle_0_2(tmp_path) -> None:
     path = tmp_path / "old-plan.json"
     path.write_text(json.dumps(plan))
     upgraded = PlanBundle.read(path)
-    assert upgraded.schema_version == "0.3"
+    assert upgraded.schema_version == "0.4"
     assert upgraded.blocks == []
+
+
+def test_read_upgrades_plan_bundle_0_3_without_losing_liveness(tmp_path) -> None:
+    plan = extract_plan(TTGIR).to_dict()
+    plan["schema_version"] = "0.3"
+    plan["blocks"] = [{"id": "preserved", "operations": []}]
+    for field in (
+        "async_transactions",
+        "async_groups",
+        "async_waits",
+        "lds_reuse_hazards",
+    ):
+        plan.pop(field)
+    path = tmp_path / "old-plan.json"
+    path.write_text(json.dumps(plan))
+    upgraded = PlanBundle.read(path)
+    assert upgraded.schema_version == "0.4"
+    assert upgraded.blocks[0]["id"] == "preserved"
+    assert upgraded.async_transactions == []
 
 
 def test_layered_diff_localizes_schedule_change() -> None:

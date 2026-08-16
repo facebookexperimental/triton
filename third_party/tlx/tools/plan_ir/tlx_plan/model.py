@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 
-SCHEMA_VERSION = "0.3"
+SCHEMA_VERSION = "0.4"
 BASELINE_SCHEMA_VERSION = "0.1"
 
 
@@ -93,6 +93,10 @@ class PlanBundle:
     lds_aliases: list[dict[str, Any]] = field(default_factory=list)
     memory_accesses: list[dict[str, Any]] = field(default_factory=list)
     lds_allocations: list[dict[str, Any]] = field(default_factory=list)
+    async_transactions: list[dict[str, Any]] = field(default_factory=list)
+    async_groups: list[dict[str, Any]] = field(default_factory=list)
+    async_waits: list[dict[str, Any]] = field(default_factory=list)
+    lds_reuse_hazards: list[dict[str, Any]] = field(default_factory=list)
     value_graph_fingerprint: str = ""
     diagnostics: list[str] = field(default_factory=list)
     schema_version: str = SCHEMA_VERSION
@@ -112,6 +116,10 @@ class PlanBundle:
         "lds_aliases",
         "memory_accesses",
         "lds_allocations",
+        "async_transactions",
+        "async_groups",
+        "async_waits",
+        "lds_reuse_hazards",
     )
 
     def refresh_hashes(self) -> None:
@@ -208,6 +216,74 @@ class PlanBundle:
                 raise PlanError("LDS allocation refers to an unknown alias")
             for segment in allocation.get("live_segments", []):
                 validate_segment(segment, root)
+
+        def validate_frontiers(frontiers: list[dict[str, Any]]) -> None:
+            for frontier in frontiers:
+                block = frontier.get("block")
+                position = frontier.get("position")
+                distance = frontier.get("iteration_distance", 0)
+                if frontier.get("operation") not in op_id_set or block not in block_sizes:
+                    raise PlanError("async frontier refers to an unknown operation or block")
+                if not isinstance(position, int) or not 0 <= position < block_sizes[block]:
+                    raise PlanError("async frontier position is outside the block")
+                if not isinstance(distance, int) or distance < 0:
+                    raise PlanError("async frontier iteration distance must be nonnegative")
+
+        transaction_ids = [transaction.get("id") for transaction in self.async_transactions]
+        if any(not value for value in transaction_ids) or len(transaction_ids) != len(set(transaction_ids)):
+            raise PlanError("async transaction ids must be non-empty and unique")
+        transaction_id_set = set(transaction_ids)
+        group_ids = [group.get("id") for group in self.async_groups]
+        if any(not value for value in group_ids) or len(group_ids) != len(set(group_ids)):
+            raise PlanError("async group ids must be non-empty and unique")
+        group_id_set = set(group_ids)
+        for transaction in self.async_transactions:
+            if transaction.get("producer_operation") not in op_id_set:
+                raise PlanError("async transaction refers to an unknown producer")
+            if transaction.get("destination_value") not in value_id_set:
+                raise PlanError("async transaction refers to an unknown destination")
+            group = transaction.get("commit_group")
+            if group is not None and group not in group_id_set:
+                raise PlanError("async transaction refers to an unknown commit group")
+            if any(root not in value_id_set for root in transaction.get("root_values", [])):
+                raise PlanError("async transaction refers to an unknown LDS root")
+            validate_paths(transaction.get("slot_paths", []))
+            for field in (
+                "completion_frontiers",
+                "visibility_frontiers",
+                "consumer_frontiers",
+                "release_frontiers",
+                "overwrite_frontiers",
+            ):
+                validate_frontiers(transaction.get(field, []))
+        for group in self.async_groups:
+            if group.get("commit_operation") not in op_id_set:
+                raise PlanError("async group refers to an unknown commit operation")
+            if any(transaction not in transaction_id_set for transaction in group.get("transactions", [])):
+                raise PlanError("async group refers to an unknown transaction")
+        for wait in self.async_waits:
+            if wait.get("operation") not in op_id_set:
+                raise PlanError("async wait refers to an unknown operation")
+            retained = wait.get("retained_group_count")
+            if not isinstance(retained, int) or retained < 0:
+                raise PlanError("async wait retained-group count must be nonnegative")
+            for completion in wait.get("completed_groups", []):
+                if completion.get("group") not in group_id_set:
+                    raise PlanError("async wait completion refers to an unknown group")
+                distance = completion.get("iteration_distance", 0)
+                if not isinstance(distance, int) or distance < 0:
+                    raise PlanError("async completion iteration distance must be nonnegative")
+            if any(group not in group_id_set for group in wait.get("possibly_outstanding_groups", [])):
+                raise PlanError("async wait refers to an unknown outstanding group")
+        for hazard in self.lds_reuse_hazards:
+            if hazard.get("transaction") not in transaction_id_set:
+                raise PlanError("LDS reuse hazard refers to an unknown transaction")
+            operation = hazard.get("operation")
+            root = hazard.get("root_value")
+            if operation is not None and operation not in op_id_set:
+                raise PlanError("LDS reuse hazard refers to an unknown operation")
+            if root is not None and root not in value_id_set:
+                raise PlanError("LDS reuse hazard refers to an unknown root")
         fragment_ids = [fragment.get("id") for fragment in self.dot_fragments]
         if len(fragment_ids) != len(set(fragment_ids)):
             raise PlanError("dot fragment ids are not unique")
@@ -224,14 +300,21 @@ class PlanBundle:
     def from_dict(cls, value: dict[str, Any]) -> "PlanBundle":
         value = dict(value)
         schema_version = value.get("schema_version", "0.1")
-        if schema_version in {"0.1", "0.2"}:
+        if schema_version in {"0.1", "0.2", "0.3"}:
             additions = {
-                "blocks": [],
-                "live_segments": [],
-                "lds_aliases": [],
-                "memory_accesses": [],
-                "lds_allocations": [],
+                "async_transactions": [],
+                "async_groups": [],
+                "async_waits": [],
+                "lds_reuse_hazards": [],
             }
+            if schema_version in {"0.1", "0.2"}:
+                additions.update(
+                    blocks=[],
+                    live_segments=[],
+                    lds_aliases=[],
+                    memory_accesses=[],
+                    lds_allocations=[],
+                )
             if schema_version == "0.1":
                 additions.update(
                     values=[],

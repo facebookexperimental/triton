@@ -144,11 +144,83 @@ struct PlanLivenessResult {
   std::vector<PlanDiagnostic> diagnostics;
 };
 
+/// A static TTGIR program point that participates in an asynchronous LDS
+/// lifetime. iterationDistance is a dynamic structured-loop distance, not a
+/// cycle count.
+struct PlanAsyncFrontier {
+  std::string operationId;
+  std::string blockId;
+  std::string kind;
+  std::string precision;
+  int64_t position = -1;
+  int64_t iterationDistance = 0;
+};
+
+struct PlanAsyncTransaction {
+  std::string id;
+  std::string producerOperationId;
+  std::string destinationValueId;
+  std::string direction;
+  std::string commitGroupId;
+  std::string precision;
+  std::vector<std::string> rootValueIds;
+  std::vector<PlanSlotPath> slotPaths;
+  std::vector<PlanAsyncFrontier> completionFrontiers;
+  std::vector<PlanAsyncFrontier> visibilityFrontiers;
+  std::vector<PlanAsyncFrontier> consumerFrontiers;
+  std::vector<PlanAsyncFrontier> releaseFrontiers;
+  std::vector<PlanAsyncFrontier> overwriteFrontiers;
+};
+
+struct PlanAsyncGroup {
+  std::string id;
+  std::string commitOperationId;
+  std::vector<std::string> transactionIds;
+};
+
+struct PlanAsyncWaitCompletion {
+  std::string groupId;
+  int64_t iterationDistance = 0;
+  std::string precision;
+};
+
+struct PlanAsyncWaitRecord {
+  std::string operationId;
+  int64_t retainedGroupCount = 0;
+  std::vector<PlanAsyncWaitCompletion> completedGroups;
+  std::vector<std::string> possiblyOutstandingGroups;
+  std::string precision;
+};
+
+struct PlanLdsReuseHazard {
+  std::string severity;
+  std::string code;
+  std::string message;
+  std::string transactionId;
+  std::string operationId;
+  std::string rootValueId;
+};
+
+struct PlanAsyncLifetimeResult {
+  std::vector<PlanAsyncTransaction> transactions;
+  std::vector<PlanAsyncGroup> groups;
+  std::vector<PlanAsyncWaitRecord> waits;
+  std::vector<PlanLdsReuseHazard> hazards;
+  std::vector<PlanDiagnostic> diagnostics;
+};
+
 FailureOr<PlanLivenessResult> analyzePlanLiveness(
     FuncOp function,
     const llvm::DenseMap<Operation *, std::string> &operationIds,
     const llvm::DenseMap<Value, std::string> &valueIds,
     ArrayRef<PlanLineageEdge> lineageEdges);
+
+FailureOr<PlanAsyncLifetimeResult> analyzePlanAsyncLifetimes(
+    FuncOp function,
+    const llvm::DenseMap<Operation *, std::string> &operationIds,
+    const llvm::DenseMap<Value, std::string> &valueIds,
+    ArrayRef<PlanBlockRecord> blocks, ArrayRef<PlanAliasRecord> aliases,
+    ArrayRef<PlanMemoryAccess> memoryAccesses);
 
 /// Analysis-only description of operation/value identity, value lineage,
 /// static program-order liveness, and logical LDS aliases for one final
@@ -176,6 +248,14 @@ public:
   ArrayRef<PlanLdsAllocationRecord> getLdsAllocations() const {
     return ldsAllocations;
   }
+  ArrayRef<PlanAsyncTransaction> getAsyncTransactions() const {
+    return asyncTransactions;
+  }
+  ArrayRef<PlanAsyncGroup> getAsyncGroups() const { return asyncGroups; }
+  ArrayRef<PlanAsyncWaitRecord> getAsyncWaits() const { return asyncWaits; }
+  ArrayRef<PlanLdsReuseHazard> getLdsReuseHazards() const {
+    return ldsReuseHazards;
+  }
 
 private:
   std::string functionName;
@@ -189,6 +269,10 @@ private:
   std::vector<PlanAliasRecord> aliases;
   std::vector<PlanMemoryAccess> memoryAccesses;
   std::vector<PlanLdsAllocationRecord> ldsAllocations;
+  std::vector<PlanAsyncTransaction> asyncTransactions;
+  std::vector<PlanAsyncGroup> asyncGroups;
+  std::vector<PlanAsyncWaitRecord> asyncWaits;
+  std::vector<PlanLdsReuseHazard> ldsReuseHazards;
 };
 
 /// Serialize a module-level sidecar. The graphs are sorted by function name;

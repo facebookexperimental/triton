@@ -1,4 +1,4 @@
-# PlanBundle schema 0.3
+# PlanBundle schema 0.4
 
 PlanBundle is a canonical JSON sidecar for final AMD Triton/TLX TTGIR. All
 objects are serialized with sorted keys, and every independently comparable
@@ -8,7 +8,7 @@ layer has a SHA-256 hash.
 
 | Field | Meaning |
 |---|---|
-| `schema_version` | Exact reader/writer contract, currently `0.3`; readers upgrade `0.1` and `0.2`. |
+| `schema_version` | Exact reader/writer contract, currently `0.4`; readers upgrade `0.1`, `0.2`, and `0.3`. |
 | `kernel` | TTGIR function symbol. |
 | `case` | Shape, dtype, causal, and MHA/GQA contract from the baseline manifest. |
 | `provenance` | Source/compiler revisions, schedule configuration, and captured artifact references. |
@@ -26,6 +26,10 @@ layer has a SHA-256 hash.
 | `lds_aliases` | Logical LDS roots/views, static offsets/order, and normalized slot paths. |
 | `memory_accesses` | LDS read/write/allocate/free effects, including whether an operation starts pending async work. |
 | `lds_allocations` | Per-root logical size, aliases, and the block-local union of their static intervals. |
+| `async_transactions` | Async LDS reads/writes with commit, completion, visibility, consumption, release, and overwrite frontiers. |
+| `async_groups` | Static commit groups and their transactions. |
+| `async_waits` | Partial-wait retained count, completed groups with iteration distance, and possibly outstanding groups. |
+| `lds_reuse_hazards` | Missing commit, wait, visibility, or consumer-release relationships that prevent proving safe reuse. |
 | `value_graph_fingerprint` | Semantic fingerprint of the native operation/value graph. |
 | `layer_hashes` | Independent hashes for operation, dot, storage, sync, schedule, layout, value, lineage, liveness, and LDS layers. |
 | `diagnostics` | Unresolved semantic information; never silently discarded. |
@@ -58,10 +62,16 @@ PlanBundle layer hashes match. A report can therefore distinguish harmless
 text/debug differences from a dot decomposition, layout, staging,
 synchronization, or final-order change.
 
-Version 0.3 adds M1.4b static liveness and logical LDS modeling. Intervals are
-block-local TTGIR program order, not cycles or physical register allocation.
-LDS sizes and offsets are logical, not the allocator's physical placement.
-`pending_async` identifies operations that initiate asynchronous work, but this
-version deliberately does not extend lifetimes through commit/wait/barrier.
-That dynamic async model and mutation lowering belong to M1.4c-d and later
-plan-application milestones.
+Version 0.4 adds M1.4c asynchronous LDS lifetime modeling for AMD commit-count
+operations and CTA barriers. A transaction may have multiple completion
+frontiers: for example, a steady-state loop wait and a conservative loop-exit
+wait. `iteration_distance` is a structured-loop distance, not latency.
+
+The five phases are pending write, completed-but-not-visible, readable,
+awaiting consumer release, and reusable/overwritten. An async wait completes a
+producer-to-consumer RAW edge; it does not release a consumer-to-next-producer
+WAR edge. Reuse therefore requires a release barrier after consumption.
+
+TDM/mbarrier epochs, physical LDS placement, physical VGPR allocation, backend
+instruction order, and cycle timing remain outside this schema and are never
+inferred from TTGIR.

@@ -38,7 +38,7 @@
 // CHECK:         ttg.convert_layout {{.*}}tensor<256x64xf16, #blocked>
 // CHECK:         tt.dot
 
-// PLAN-DAG: "schema_version": "plan-value-graph/0.2"
+// PLAN-DAG: "schema_version": "plan-value-graph/0.3"
 // PLAN-DAG: "kind": "loop_init"
 // PLAN-DAG: "iteration_distance": 1
 // PLAN-DAG: "kind": "loop_backedge"
@@ -51,7 +51,8 @@
 // PLAN-DAG: "artifact_stage": "final_structured_ttgir"
 // PLAN-DAG: "static_intervals_are_physical_cycles": false
 // PLAN-DAG: "lds_logical_bytes_are_physical_allocation": false
-// PLAN-DAG: "async_lifetime_extended_through_wait": false
+// PLAN-DAG: "async_lifetime_extended_through_wait": true
+// PLAN-DAG: "async_lifetimes_are_physical_cycles": false
 // PLAN-DAG: "live_segments": [
 // PLAN-DAG: "view_kind": "ttg.memdesc_index"
 // PLAN-DAG: "kind": "modulo"
@@ -62,6 +63,16 @@
 // PLAN-DAG: "effect": "allocate"
 // PLAN-DAG: "effect": "free"
 // PLAN-DAG: "physical_lds_offset": null
+// PLAN-DAG: "direction": "lds_write"
+// PLAN-DAG: "retained_group_count": 1
+// PLAN-DAG: "kind": "completion_wait"
+// PLAN-DAG: "kind": "visibility_barrier"
+// PLAN-DAG: "kind": "lds_consumer"
+// PLAN-DAG: "kind": "reuse_release_barrier"
+// PLAN-DAG: "kind": "slot_overwrite"
+// PLAN-DAG: "iteration_distance": 2
+// PLAN-DAG: "precision": "conservative_cross_region"
+// PLAN-DAG: "code": "async_write_without_completion"
 // PLAN-TRANSPOSE: "kind": "in_thread_transpose"
 
 #mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [2, 2], instrShape = [16, 16, 32], isTransposed = true}>
@@ -127,6 +138,48 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
       %loaded = ttg.local_load %previous : !ttg.memdesc<16x16xf16, #slot_shared, #smem, mutable> -> tensor<16x16xf16, #slot_blocked>
     }
     ttg.local_dealloc %alloc : !ttg.memdesc<2x16x16xf16, #slot_shared, #smem, mutable>
+    tt.return
+  }
+
+  tt.func @async_lds_modulo_slots(
+      %ptrs: tensor<16x16x!tt.ptr<f16>, #slot_blocked>) {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c4 = arith.constant 4 : index
+    %c1_i32 = arith.constant 1 : i32
+    %c2_i32 = arith.constant 2 : i32
+    %alloc = ttg.local_alloc : () -> !ttg.memdesc<2x16x16xf16, #slot_shared, #smem, mutable>
+    scf.for %i = %c0 to %c4 step %c1 {
+      %i_i32 = arith.index_cast %i : index to i32
+      %current_index = arith.remsi %i_i32, %c2_i32 : i32
+      %previous_index = arith.subi %c1_i32, %current_index : i32
+      %current = ttg.memdesc_index %alloc[%current_index] : !ttg.memdesc<2x16x16xf16, #slot_shared, #smem, mutable> -> !ttg.memdesc<16x16xf16, #slot_shared, #smem, mutable>
+      %previous = ttg.memdesc_index %alloc[%previous_index] : !ttg.memdesc<2x16x16xf16, #slot_shared, #smem, mutable> -> !ttg.memdesc<16x16xf16, #slot_shared, #smem, mutable>
+      %copy = ttg.async_copy_global_to_local %ptrs, %current : tensor<16x16x!tt.ptr<f16>, #slot_blocked> -> <16x16xf16, #slot_shared, #smem, mutable>
+      %commit = ttg.async_commit_group tokens %copy
+      %wait = ttg.async_wait {num = 1 : i32}
+      ttg.barrier all
+      %loaded = ttg.local_load %previous token %wait : !ttg.memdesc<16x16xf16, #slot_shared, #smem, mutable> -> tensor<16x16xf16, #slot_blocked>
+      ttg.barrier all
+    }
+    %final_wait = ttg.async_wait {num = 0 : i32}
+    ttg.barrier all
+    ttg.local_dealloc %alloc : !ttg.memdesc<2x16x16xf16, #slot_shared, #smem, mutable>
+    tt.return
+  }
+
+  tt.func @async_branch(
+      %cond: i1, %ptrs: tensor<16x16x!tt.ptr<f16>, #slot_blocked>) {
+    %alloc = ttg.local_alloc : () -> !ttg.memdesc<16x16xf16, #slot_shared, #smem, mutable>
+    %outer_copy = ttg.async_copy_global_to_local %ptrs, %alloc : tensor<16x16x!tt.ptr<f16>, #slot_blocked> -> <16x16xf16, #slot_shared, #smem, mutable>
+    %outer_commit = ttg.async_commit_group tokens %outer_copy
+    scf.if %cond {
+      %inner_copy = ttg.async_copy_global_to_local %ptrs, %alloc : tensor<16x16x!tt.ptr<f16>, #slot_blocked> -> <16x16xf16, #slot_shared, #smem, mutable>
+      %inner_commit = ttg.async_commit_group tokens %inner_copy
+    }
+    %wait = ttg.async_wait %outer_commit {num = 0 : i32}
+    ttg.barrier all
+    ttg.local_dealloc %alloc : !ttg.memdesc<16x16xf16, #slot_shared, #smem, mutable>
     tt.return
   }
 }
