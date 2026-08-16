@@ -515,3 +515,132 @@ complete:
   not recoverable from the baseline graph;
 - its artifacts were self-declared non-paper via a `classification` stamp and
   were always kept in a separate namespace from the paper solutions.
+
+## 9. The prepared regime
+
+The literal path reproduces the paper's mechanism and, on compiler-extracted
+inputs, produces a degenerate schedule (section 2, "Degenerate baseline is the
+finding"). Four controlled experiments localized that gap in the *inputs*
+rather than the solver. This section is the other half of that finding: a
+parallel regime, `prepared`, that carries the input-preparation assumptions the
+published results appear to need. It exists to make those assumptions
+countable and checkable, not to claim they are the paper's.
+
+Everything below is **outside the paper**. The paper's section 5.2 says only
+"let the list of integers C be the original cycle counts" and never enumerates
+C's members, gives no projection from compiler cycle measurements onto its
+reservation table, and states one normalization budget and one objective. Each
+item names where it does come from.
+
+The regime is reached only by `python -m paper_joint_solver.prepared`; the
+literal CLI gains no flag, no file in `schedule_plan._SOLVER_SOURCES` is
+modified, and prepared artifacts carry their own schema
+(`prepared-joint-solution-v1`, `prepared-joint-probe-v1`) so they can never be
+read as paper artifacts. `provenance.model` stays `"paper"` — the solve really
+is the unmodified Fig 4/5/6 system — and everything this regime changed is
+recorded under `provenance.preparation`, including `prepared_sources_sha256`.
+
+### A: cost-pool assembly
+
+- **A1 — one pool entry per node, and only non-zero edges and spills.**
+  Source: this reproduction. The literal pool enumerates every RRT maximal
+  segment, every edge latency and every node's spill including the zeros
+  (176 entries on `fwd_subtiled`); the prepared pool has 129. Zero entries
+  consume a ZLP variable and 2(n-1) pairwise constraints while carrying no
+  ratio, and each node's trailing idle segment duplicates information already
+  held by its out-edges — curation writes every non-streaming edge's latency
+  equal to its producer's latency, so a node's cost here is its RRT occupancy
+  and its result delay reaches the solver through its edges.
+- **A2 — CUDA-pipeline elementwise operators re-priced at
+  `ceil(tile elements / 128)`; scalar and address arithmetic charged zero.**
+  Source: the CUDA issue model (4 warps x 32 lanes), not the paper. The dump
+  records latency 1 — often 0 — for these operators, which is the extractor's
+  warp-parallel hiding convention rather than an issue cost, and is unusable
+  from the RRT's point of view: it prices a 64-wide multiply and a
+  16384-wide multiply identically. Tile extents are read from the raw dump's
+  `result_types`; the curated schema does not carry them, so the raw dump is a
+  second input, bound to the curated file by `curation_source.ddg_sha256`.
+- **A3 — asynchronous MMA results are tokens, not scalars.** Source: the
+  Blackwell programming model. `ttng.tc_gen5_mma` returns
+  `!ttg.async.token`, which a naive "not a tensor, therefore scalar" reading
+  of A2 would price at zero and erase a 128-cycle tensor-core reservation.
+- **A4 — TMEM ports are their own functional unit.** Source: the Blackwell
+  hardware description. Already true of the stock `MachineModel` and of
+  curation's pipeline assignment, so the regime adds a fail-closed check
+  rather than a machine of its own: a curated input that folds TMEM back onto
+  CUDA is rejected instead of silently saturating the ALU column.
+
+### B: normalization stack
+
+- **B1 — 10% relative-tolerance clustering.** Source: this reproduction.
+  Ascending scan over the positive values, the first value of a cluster is its
+  anchor, later values within `anchor * 11/10` join, the representative is the
+  members' integer mean rounded half up. Near-but-coprime measured costs
+  otherwise pin F: the ZLP must reproduce an accidental ratio such as 133:128
+  exactly and pays for it across the whole pool.
+- **B2 — a 1/32 floor.** Source: this reproduction. After clustering, entries
+  below `max/32` are zeroed. A pool spanning three orders of magnitude cannot
+  be represented inside `sum(C') <= 300` at any useful resolution; the floor
+  makes that compression an explicit, disclosed decision instead of one the
+  ZLP takes implicitly by collapsing whatever it likes.
+- **B3 — the paper's own ZLP, unmodified.** `normalize.normalize_costs` is
+  imported, not reimplemented. This is the one step in the stack that *is*
+  paper content.
+- **B4 — a lexicographic second stage maximizing `sum(C')` at `F = F*`.**
+  Source: this reproduction, and the load-bearing assumption of the whole
+  regime. The paper minimizes F and says nothing about which point of the
+  F-optimal face is returned; that face is not a singleton. On the prepared
+  `fwd_subtiled` pool it holds both a degenerate point (`sum(C')=16`, 87.5% of
+  positive entries at zero) and a rich one (`sum(C')=272`, 16.1%), at the same
+  optimal F=348, and SCIP reports the degenerate end. A fresh model is built
+  rather than the solved one re-optimized: changing the objective sense on a
+  solved PySCIPOpt model does not re-solve the problem being asked.
+- **B5 — a per-case normalization budget.** Source: this reproduction. 300 for
+  `fwd_subtiled`, `bwd` and `bwd_lr4096`; 150 for `fwd`, whose formula size
+  explodes at 300. The paper states one budget for all cases.
+
+### What the regime does and does not recover
+
+Measured on the committed golden curated fixtures, artifacts under
+`prepared/`, reproduced by `run_prepared_cases.sh`.
+
+- **Normalization health is recovered.** `fwd_subtiled` collapses 18 of 112
+  positive entries (16.1%) with a surviving-value spread of 22.0, against
+  104/128 and a single-valued spectrum on the literal path. `bwd` collapses
+  1/66. B4 is what does it; B1-B3 alone leave `fwd_subtiled` at `sum(C')=16`
+  and 87.5% collapse, indistinguishable from the literal path.
+- **The II degeneracy is recovered.** `fwd_subtiled` solves at II=26, L=52
+  against the literal II=2, L=5; `bwd` at II=30, L=85. The v6-era anchors
+  record II=66 and II=95, so these are the same order of magnitude but not the
+  same number — the anchors' II unit depends on their own normalization scale
+  and is not expected to reproduce digit for digit.
+- **`fwd` is not recovered and was not tuned around.** It stays degenerate at
+  both U=150 and U=300 (`sum(C')=7`, 89.4% collapse, spread 1.0, II=3), so B5
+  is not the cause: its own F-optimal face is poor at F*=320. Relaxing to
+  `F <= 2F*` would give 24.2% collapse at spread 31 and `F <= 4F*` would give
+  0%, but an F relaxation is a ninth assumption and is left for the plan to
+  decide rather than adopted here.
+- **The published *shapes* are not recovered, for one shared reason.**
+  `fa4_like` is False on `fwd_subtiled` and `bwd_2wg_pingpong` is False on
+  `bwd`; the exact-partition refit is UNSAT across the whole probed window
+  `L in [52, 58]` at II=26; and `bwd_lr4096` uses *fewer* active warps than
+  `bwd` (24 against 25) where the reported direction is more. All four follow
+  from the same fact: the free solutions scatter operations across 18 and 17
+  distinct warp sets respectively, where the reported shapes have five and
+  two. Figure 6 quantifies `opw` over the machine's 32 physical warps and
+  contains nothing that rewards using fewer distinct sets, so the solver has
+  no reason to consolidate and does not. The v6-era anchors carry a `warp`
+  group-*label* map with 4, 5 and 8 groups rather than a physical warp set,
+  which is consistent with a bounded group pool that the literalization
+  removed as un-paper-like. Restoring one would be a ninth assumption about
+  the *model* rather than the inputs, and is out of this regime's scope as
+  specified.
+- **The UNSAT ablations hold, with one of the four carrying no weight.**
+  Probed with the published first-window protocol, since Algorithm 1 does not
+  terminate on a structurally unsatisfiable model. `warps_minus_one` (31
+  warps), `warps_half` (16) and `no_cross_warp` are each UNSAT at every one of
+  the 21 points in the first window of I=25. `no_subtiling` is UNSAT across
+  its whole window too, but that window is a single point at I=2 because the
+  `fwd` pool is the degenerate one above: the verdict is real and the evidence
+  is empty, and it should not be read as support for the sub-tiling claim
+  until `fwd` normalizes.

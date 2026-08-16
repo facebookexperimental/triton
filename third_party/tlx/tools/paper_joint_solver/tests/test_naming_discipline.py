@@ -78,6 +78,9 @@ def test_every_schema_constant_uses_an_approved_prefix():
     """Schema strings are identities; the prefix is what carries the identity."""
     # "jos-" is the permitted alias: HANDOFF bars it from commit messages, not
     # from artifact identities. "oracle-" belongs to the ptxas oracle subsystem.
+    # "prepared-" is the disclosed parallel regime: its artifacts must not be
+    # mistakable for paper ones, so they carry their own identity rather than
+    # a "paper-joint-" version bump.
     approved = (
         "paper-joint-",
         "emitter-",
@@ -85,6 +88,7 @@ def test_every_schema_constant_uses_an_approved_prefix():
         "curation-manifest-",
         "jos-",
         "oracle-",
+        "prepared-joint-",
     )
     pattern = re.compile(r'^([A-Z][A-Z0-9_]*SCHEMA[A-Z0-9_]*)\s*=\s*"([^"]+)"', re.M)
     seen = {}

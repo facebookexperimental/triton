@@ -1,0 +1,34 @@
+[preparation] {"clusters": 10, "collapse_ratio": 0.0152, "collapsed_entries": 1, "distinct_survivors": [1, 2, 3, 6, 11, 14, 22], "first_stage_sum": 259, "objective_f": 370, "pool_size": 80, "positive_entries": 66, "second_stage_sum": 259, "survivor_spread": 22.0, "u": 300}
+[preparation] wrote prepared/bwd_prep1.pool.json
+[attempt] {'ii': 1, 'stage': 'modulo', 'result': 'unsat'}
+[attempt] {'ii': 2, 'stage': 'modulo', 'result': 'unsat'}
+[attempt] {'ii': 3, 'stage': 'modulo', 'result': 'unsat'}
+[attempt] {'ii': 4, 'stage': 'modulo', 'result': 'unsat'}
+[attempt] {'ii': 5, 'stage': 'modulo', 'result': 'unsat'}
+[attempt] {'ii': 6, 'stage': 'modulo', 'result': 'unsat'}
+[attempt] {'ii': 7, 'stage': 'modulo', 'result': 'unsat'}
+[attempt] {'ii': 8, 'stage': 'modulo', 'result': 'unsat'}
+[attempt] {'ii': 9, 'stage': 'modulo', 'result': 'unsat'}
+[attempt] {'ii': 10, 'stage': 'modulo', 'result': 'unsat'}
+[attempt] {'ii': 11, 'stage': 'modulo', 'result': 'unsat'}
+[attempt] {'ii': 12, 'stage': 'modulo', 'result': 'unsat'}
+[attempt] {'ii': 13, 'stage': 'modulo', 'result': 'unsat'}
+[attempt] {'ii': 14, 'stage': 'modulo', 'result': 'unsat'}
+[attempt] {'ii': 15, 'stage': 'modulo', 'result': 'unsat'}
+[attempt] {'ii': 16, 'stage': 'modulo', 'result': 'unsat'}
+[attempt] {'ii': 17, 'stage': 'modulo', 'result': 'unsat'}
+[attempt] {'ii': 18, 'stage': 'modulo', 'result': 'unsat'}
+[attempt] {'ii': 19, 'stage': 'modulo', 'result': 'unsat'}
+[attempt] {'ii': 20, 'stage': 'modulo', 'result': 'unsat'}
+[attempt] {'ii': 21, 'stage': 'modulo', 'result': 'unsat'}
+[attempt] {'ii': 22, 'stage': 'modulo', 'result': 'unsat'}
+[attempt] {'ii': 23, 'stage': 'modulo', 'result': 'unsat'}
+[attempt] {'ii': 24, 'stage': 'modulo', 'result': 'unsat'}
+[attempt] {'ii': 25, 'stage': 'modulo', 'result': 'unsat'}
+[attempt] {'ii': 26, 'stage': 'modulo', 'result': 'unsat'}
+[attempt] {'ii': 27, 'stage': 'modulo', 'result': 'unsat'}
+[attempt] {'ii': 28, 'stage': 'modulo', 'result': 'unsat'}
+[attempt] {'ii': 29, 'stage': 'modulo', 'result': 'unsat'}
+[attempt] {'ii': 30, 'L': 85, 'stage': 'joint', 'result': 'sat', 'seconds': 4.5}
+[prepared] sat after 7.2s -> prepared/bwd_prep1.json
+[prepared] wrote prepared/bwd_prep1.strategy.json
