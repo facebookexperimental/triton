@@ -1202,10 +1202,8 @@ def test_blackwell_fa_ws_pipelined_persistent_mxfp8_bwd(Z, H, N_CTX, causal):
 
     triton.set_allocator(alloc_fn)
 
-    num_sms = torch.cuda.get_device_properties("cuda").multi_processor_count
     fwd_grid = (
-        min(num_sms,
-            triton.cdiv(N_CTX, fwd_config["BLOCK_M"]) * Z * H),
+        triton.cdiv(N_CTX, fwd_config["BLOCK_M"]) * Z * H,
         1,
         1,
     )
