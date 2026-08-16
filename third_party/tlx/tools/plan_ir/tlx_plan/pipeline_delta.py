@@ -189,6 +189,7 @@ def _validate_against_plan(delta: PlanPipelineDelta, plan: PlanBundle) -> None:
         loop_operations = {
             operation for block in loop_blocks for operation in block.get("operations", [])
         }
+        requested_groups = {intent.group for intent in loop_delta.transactions}
 
         for intent in loop_delta.transactions:
             group = groups.get(intent.group)
@@ -230,6 +231,57 @@ def _validate_against_plan(delta: PlanPipelineDelta, plan: PlanBundle) -> None:
                 ):
                     raise PlanError(
                         f"async transaction {transaction_id!r} has an unresolved LDS slot index"
+                    )
+                consumer_distances = {
+                    frontier.get("iteration_distance", 0)
+                    for frontier in transaction.get("consumer_frontiers", [])
+                    if frontier.get("iteration_distance", 0) > 0
+                }
+                if consumer_distances != {intent.distance}:
+                    raise PlanError(
+                        f"async transaction {transaction_id!r} does not have exact prefetch "
+                        f"distance {intent.distance}"
+                    )
+                slot_depths = {
+                    index.get("modulus", 0)
+                    for path in transaction.get("slot_paths", [])
+                    for index in path.get("indices", [])
+                    if index.get("modulus", 0) > 0
+                }
+                if slot_depths != {intent.buffer_depth}:
+                    raise PlanError(
+                        f"async transaction {transaction_id!r} does not have exact buffer "
+                        f"depth {intent.buffer_depth}"
+                    )
+
+            wait_families = []
+            for wait in plan.async_waits:
+                selected_completions = [
+                    completion
+                    for completion in wait.get("completed_groups", [])
+                    if completion.get("group") == intent.group
+                    and completion.get("iteration_distance", 0) > 0
+                ]
+                for selected in selected_completions:
+                    distance = selected["iteration_distance"]
+                    family = {
+                        completion.get("group")
+                        for completion in wait.get("completed_groups", [])
+                        if completion.get("iteration_distance", 0) == distance
+                        and groups.get(completion.get("group"), {}).get("commit_operation")
+                        in loop_operations
+                    }
+                    wait_families.append((wait.get("operation"), family))
+            if not wait_families:
+                raise PlanError(
+                    f"async group {intent.group!r} has no positive-distance completion wait"
+                )
+            for wait_operation, family in wait_families:
+                missing = family - requested_groups
+                if missing:
+                    raise PlanError(
+                        f"pipeline delta omits groups {sorted(missing)} sharing wait "
+                        f"{wait_operation!r}"
                     )
 
         for intent in loop_delta.staging:

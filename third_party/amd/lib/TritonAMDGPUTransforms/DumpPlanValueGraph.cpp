@@ -37,7 +37,8 @@ struct TritonAMDGPUDumpPlanValueGraphPass
       graphs.push_back(std::move(*graph));
     }
 
-    std::string json = triton::plan::serializePlanValueGraphs(graphs, module);
+    std::string json =
+        triton::plan::serializePlanValueGraphs(graphs, module, passPosition);
     if (outputPath == "-") {
       llvm::outs() << json;
       return;

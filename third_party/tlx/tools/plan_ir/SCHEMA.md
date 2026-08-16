@@ -101,7 +101,7 @@ does not change storage, synchronization, loop placement, staging depth, or
 dot decomposition. Positive dependency distance is structured-loop metadata,
 not permission to move an operation into another iteration.
 
-## M1.5b.1 pipeline delta
+## M1.5b pipeline delta
 
 `plan-pipeline-delta/0.1` is a separate intent contract for changes that cross
 dynamic loop iterations or change iteration-scoped storage. It is pinned to a
@@ -127,3 +127,29 @@ decomposition is always frozen in M1.5b.
 This schema does not encode resolved cycles, physical LDS offsets, inserted
 waits/barriers, a modulo schedule, or prologue/steady-state/epilogue TTGIR.
 Those are outputs of M1.5b.2--b.5, not claims made by an M1.5b.1 request.
+
+### M1.5b.2 native subset
+
+The first native materializer consumes the same `plan-pipeline-delta/0.1`
+schema immediately before async wait-count adjustment, but accepts only
+existing-LDS transaction entries. It requires:
+
+- the exact input value-graph fingerprint and pass position;
+- complete positive-distance wait families;
+- consumer-frontier distance equal to the requested distance;
+- every resolved modulo slot depth equal to the requested buffer depth; and
+- no `staging` entries.
+
+It projects the verified Plan dependency graph into the selected structured
+loop, preserves baseline ordering for operations outside the selected producer
+slices, adds loop-carried release-to-overwrite constraints, and invokes Meta's
+shared modulo scheduler. A projected distance-zero dependency that contradicts
+the already-valid baseline order is not imported and is counted in
+`skipped_inconsistent_dependencies`; this handles conservative inner-region
+frontiers collapsing onto an outer-loop operation.
+
+`plan-pipeline-apply-report/0.1` records acceptance, resolved groups, modulo II,
+selected/moved operation counts, imported/skipped dependencies, and stable
+pre/post fingerprints. All `changes_*` fields remain false. Materializing new
+LDS allocations, waits/barriers, prefetch distances, or buffer depths is not
+part of M1.5b.2.

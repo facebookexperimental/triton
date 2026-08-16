@@ -368,8 +368,9 @@ private:
 
 /// Serialize a module-level sidecar. The graphs are sorted by function name;
 /// each graph is already deterministically sorted by stable ID.
-std::string serializePlanValueGraphs(ArrayRef<PlanValueGraph> graphs,
-                                     ModuleOp module);
+std::string serializePlanValueGraphs(
+    ArrayRef<PlanValueGraph> graphs, ModuleOp module,
+    StringRef passPosition = "after_warp_pipeline_conversion_before_scf_to_cf");
 
 } // namespace plan
 } // namespace mlir::triton

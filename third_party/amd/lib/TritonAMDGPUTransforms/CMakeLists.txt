@@ -1,5 +1,6 @@
 add_triton_library(TritonAMDGPUTransforms
   AccelerateAMDMatmul.cpp
+  ApplyPlanPipeline.cpp
   ApplyPlanSchedule.cpp
   BlockPingpong.cpp
   CanonicalizePointers.cpp

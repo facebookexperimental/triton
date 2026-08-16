@@ -1,7 +1,8 @@
 # AMD TLX Plan IR prototype
 
-This directory implements M1.1--M1.5b.1 of the profile-guided TLX scheduling
-design without changing the existing TLX kernels or modulo scheduler.
+This directory implements M1.1--M1.5b.2 of the profile-guided TLX scheduling
+design without changing the existing TLX kernels. M1.5b.2 reuses and extends
+Meta's shared modulo-scheduling DDG through backend-neutral APIs.
 
 ## Implemented milestones
 
@@ -41,10 +42,17 @@ design without changing the existing TLX kernels or modulo scheduler.
   dry-run validator pins the input value graph, resolves structured loops,
   complete async groups, LDS slot paths, staged tensor uses, depth, and
   alignment, and reports the changes a later native materializer must make.
+- **M1.5b.2 — existing-LDS pipeline application:** an AMD pass immediately
+  before async wait-count adjustment resolves complete async families, exact
+  loop distance and modulo slot depth, projects Plan dependencies into Meta's
+  shared DDG, and uses constrained modulo scheduling to reorder existing
+  producer slices. It preserves LDS allocations, waits/barriers, iteration
+  storage, prefetch distance, buffer depth, and dot decomposition.
 
 M1.5a lowers only verified intra-iteration schedule permutations. M1.5b.1
-validates cross-iteration intent but deliberately does not mutate TTGIR;
-physical scheduling and storage materialization start in M1.5b.2.
+validates cross-iteration intent. M1.5b.2 applies only schedules already
+representable by the kernel's existing LDS ring and synchronization; new LDS
+staging and distance/depth changes remain later milestones.
 
 ## Reproduction
 
@@ -145,6 +153,23 @@ Edit `loops` to request `set_prefetch_distance`, `global_to_lds`, or
 `materialization_status: not_applied` and never treats a valid request as
 proof that a physical modulo schedule, LDS allocation, or synchronization
 sequence exists.
+
+Dump the exact pre-wait-count sidecar and apply an existing-LDS pipeline delta
+during AMD compilation with:
+
+```bash
+export TRITON_TLX_PIPELINE_ANALYSIS_DIR=/tmp/pipeline-plan-values
+export TRITON_TLX_PIPELINE_PLAN=/tmp/pipeline-delta.json
+export TRITON_TLX_PIPELINE_APPLY_REPORT=/tmp/pipeline-apply-report.json
+```
+
+For M1.5b.2, every requested async group sharing a positive-distance wait must
+be present, and its requested distance/depth must exactly match the analyzed
+consumer frontier and modulo slot path. The native pass rejects staging intents
+and all distance/depth changes. Its report records the modulo II, selected and
+moved operations, imported dependencies, projection-inconsistent dependencies
+skipped against the valid baseline order, and unchanged input/output stable
+fingerprints.
 
 The fixed configuration names and kernel symbols are sourced from
 `third_party/tlx/tutorials/amd_fa_bwd.py`:

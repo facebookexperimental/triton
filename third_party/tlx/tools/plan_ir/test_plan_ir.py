@@ -523,10 +523,22 @@ def _plan_with_pipeline_contract() -> tuple[PlanBundle, dict[str, str]]:
             "destination_value": value,
             "commit_group": group,
             "root_values": [value],
-            "slot_paths": [{"root_value": value, "indices": []}],
+            "slot_paths": [
+                {
+                    "root_value": value,
+                    "indices": [{"kind": "modulo", "modulus": 2}],
+                }
+            ],
             "completion_frontiers": [],
             "visibility_frontiers": [],
-            "consumer_frontiers": [],
+            "consumer_frontiers": [
+                {
+                    "operation": consumer,
+                    "block": block,
+                    "position": operation_ids[1:].index(consumer),
+                    "iteration_distance": 2,
+                }
+            ],
             "release_frontiers": [],
             "overwrite_frontiers": [],
         }
@@ -536,6 +548,19 @@ def _plan_with_pipeline_contract() -> tuple[PlanBundle, dict[str, str]]:
             "id": group,
             "commit_operation": commit,
             "transactions": [transaction],
+        }
+    ]
+    plan.async_waits = [
+        {
+            "operation": commit,
+            "retained_group_count": 0,
+            "completed_groups": [
+                {
+                    "group": group,
+                    "iteration_distance": 1,
+                }
+            ],
+            "possibly_outstanding_groups": [],
         }
     ]
     plan.refresh_hashes()
@@ -646,6 +671,30 @@ def test_pipeline_delta_rejects_incomplete_group_and_unresolved_slot() -> None:
     plan.async_transactions[0]["slot_paths"][0]["indices"] = [{"kind": "unknown"}]
     plan.refresh_hashes()
     with pytest.raises(PlanError, match="unresolved LDS slot index"):
+        delta.validate(plan)
+
+
+def test_pipeline_delta_requires_complete_positive_distance_wait_family() -> None:
+    plan, ids = _plan_with_pipeline_contract()
+    delta = _pipeline_delta(plan, ids)
+    second_group = "async-group:fixture:second"
+    second_transaction = "async-tx:fixture:second"
+    transaction = copy.deepcopy(plan.async_transactions[0])
+    transaction["id"] = second_transaction
+    transaction["commit_group"] = second_group
+    plan.async_transactions.append(transaction)
+    plan.async_groups.append(
+        {
+            "id": second_group,
+            "commit_operation": plan.async_groups[0]["commit_operation"],
+            "transactions": [second_transaction],
+        }
+    )
+    plan.async_waits[0]["completed_groups"].append(
+        {"group": second_group, "iteration_distance": 1}
+    )
+    plan.refresh_hashes()
+    with pytest.raises(PlanError, match="sharing wait"):
         delta.validate(plan)
 
 

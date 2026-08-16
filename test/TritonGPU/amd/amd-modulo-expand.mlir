@@ -42,6 +42,18 @@
 // RUN: not triton-opt %s \
 // RUN:   -tritonamdgpu-apply-plan-schedule='input-path=%t.schedule.invalid.json strict=true' \
 // RUN:   2>&1 | FileCheck %s --check-prefix=APPLY-REJECT
+// RUN: triton-opt %s \
+// RUN:   -tritonamdgpu-dump-plan-value-graph='output-path=%t.pipeline.plan.json strict=true pass-position=before_update_async_wait_count' \
+// RUN:   -o /dev/null
+// RUN: python3 -c "import json; p=json.load(open('%t.pipeline.plan.json')); f=next(x for x in p['functions'] if x['function']=='async_lds_modulo_slots'); l=next(x['id'] for x in f['operations'] if x['kind']=='scf.for'); g=f['async_groups'][0]['id']; d={'schema_version':'plan-pipeline-delta/0.1','kernel':f['function'],'input_value_graph_fingerprint':f['semantic_fingerprint'],'pass_position':'before_update_async_wait_count','loops':[{'loop':l,'transactions':[{'group':g,'action':'set_prefetch_distance','distance':1,'buffer_depth':2}],'staging':[]}]}; open('%t.pipeline.legal.json','w').write(json.dumps(d))"
+// RUN: TRITON_USE_MODULO_SCHEDULE=1 triton-opt %s \
+// RUN:   -tritonamdgpu-apply-plan-pipeline='input-path=%t.pipeline.legal.json report-path=%t.pipeline.report.json strict=true' \
+// RUN:   -o /dev/null
+// RUN: FileCheck %s --check-prefix=PIPELINE-REPORT < %t.pipeline.report.json
+// RUN: python3 -c "import json; p=json.load(open('%t.pipeline.legal.json')); p['loops'][0]['transactions'][0]['buffer_depth']=3; open('%t.pipeline.invalid.json','w').write(json.dumps(p))"
+// RUN: not triton-opt %s \
+// RUN:   -tritonamdgpu-apply-plan-pipeline='input-path=%t.pipeline.invalid.json strict=true' \
+// RUN:   2>&1 | FileCheck %s --check-prefix=PIPELINE-REJECT
 //
 // Modulo runs before the guarded legacy scheduler. A successful modulo schedule
 // is preserved; the standard AMD pipeline lowers and expands it.
@@ -116,6 +128,15 @@
 // APPLY-REPORT: "accepted": true
 // APPLY-REPORT: "moved_operations": 2
 // APPLY-REJECT: schedule delta reverses distance-zero dependency
+// PIPELINE-REPORT: "accepted": true
+// PIPELINE-REPORT: "changes_buffer_depth": false
+// PIPELINE-REPORT: "changes_iteration_storage": false
+// PIPELINE-REPORT: "changes_prefetch_distance": false
+// PIPELINE-REPORT: "changes_synchronization": false
+// PIPELINE-REPORT: "moved_operations": {{[1-9][0-9]*}}
+// PIPELINE-REPORT: "output_value_graph_fingerprint": "{{[0-9a-f]+}}"
+// PIPELINE-REPORT: "skipped_inconsistent_dependencies": 0
+// PIPELINE-REJECT: requests a distance or buffer depth change reserved for M1.5b.3
 
 #mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [2, 2], instrShape = [16, 16, 32], isTransposed = true}>
 #dot0 = #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 8}>

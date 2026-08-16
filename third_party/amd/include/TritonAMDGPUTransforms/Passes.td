@@ -497,6 +497,9 @@ def TritonAMDGPUDumpPlanValueGraph
            "JSON file, directory, or '-' for stdout.">,
     Option<"strict", "strict", "bool", /*default=*/"false",
            "Fail when lineage cannot be represented without an error diagnostic.">,
+    Option<"passPosition", "pass-position", "std::string",
+           /*default=*/"\"after_warp_pipeline_conversion_before_scf_to_cf\"",
+           "Exact compiler position recorded in sidecar provenance.">,
   ];
 
   let dependentDialects = ["mlir::triton::TritonDialect",
@@ -528,6 +531,38 @@ def TritonAMDGPUApplyPlanSchedule
     Option<"allowMissingKernel", "allow-missing-kernel", "bool",
            /*default=*/"false",
            "Silently skip modules that do not contain the delta target kernel.">,
+  ];
+
+  let dependentDialects = ["mlir::triton::TritonDialect",
+                           "mlir::triton::gpu::TritonGPUDialect",
+                           "mlir::triton::amdgpu::TritonAMDGPUDialect",
+                           "mlir::scf::SCFDialect"];
+}
+
+def TritonAMDGPUApplyPlanPipeline
+    : Pass<"tritonamdgpu-apply-plan-pipeline", "mlir::ModuleOp"> {
+  let summary = "Apply an existing-LDS cross-iteration pipeline order";
+
+  let description = [{
+    Runs immediately before update_async_wait_count. It resolves a
+    plan-pipeline-delta/0.1 against the exact structured TTGIR value graph,
+    requires the requested prefetch distance and LDS slot depth to match the
+    existing pipeline, imports Plan IR memory/async/slot dependencies into the
+    AMD modulo scheduler, and changes only the loop-body issue order of the
+    selected producer families. It does not change storage, synchronization,
+    buffer depth, prefetch distance, or dot decomposition.
+  }];
+
+  let options = [
+    Option<"inputPath", "input-path", "std::string", /*default=*/"\"\"",
+           "plan-pipeline-delta/0.1 JSON input file.">,
+    Option<"reportPath", "report-path", "std::string", /*default=*/"\"\"",
+           "Optional plan-pipeline-apply-report/0.1 output file or '-'.">,
+    Option<"strict", "strict", "bool", /*default=*/"true",
+           "Require strict value-graph verification before and after apply.">,
+    Option<"allowMissingKernel", "allow-missing-kernel", "bool",
+           /*default=*/"false",
+           "Silently skip modules that do not contain the target kernel.">,
   ];
 
   let dependentDialects = ["mlir::triton::TritonDialect",

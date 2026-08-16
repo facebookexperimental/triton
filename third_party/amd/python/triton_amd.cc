@@ -130,9 +130,12 @@ void init_triton_amd_passes_ttgpuir(py::module &&m) {
   ADD_PASS_OPTION_WRAPPER_2("add_sched_group_barrier_scheduler",
                             mlir::createTritonAMDGPUSchedGroupBarrierScheduler,
                             unsigned, unsigned);
-  ADD_PASS_OPTION_WRAPPER_2("add_dump_plan_value_graph",
+  ADD_PASS_OPTION_WRAPPER_3("add_dump_plan_value_graph",
                             mlir::createTritonAMDGPUDumpPlanValueGraph,
-                            const std::string &, bool);
+                            const std::string &, bool, const std::string &);
+  ADD_PASS_OPTION_WRAPPER_4(
+      "add_apply_plan_pipeline", mlir::createTritonAMDGPUApplyPlanPipeline,
+      const std::string &, const std::string &, bool, bool);
   ADD_PASS_OPTION_WRAPPER_4(
       "add_apply_plan_schedule", mlir::createTritonAMDGPUApplyPlanSchedule,
       const std::string &, const std::string &, bool, bool);

@@ -478,6 +478,20 @@ class HIPBackend(BaseBackend):
         # TritonGPU -> LLVM-IR (MLIR)
         pm = ir.pass_manager(mod.context)
         pm.enable_debug()
+        pipeline_analysis_dir = os.environ.get("TRITON_TLX_PIPELINE_ANALYSIS_DIR")
+        if pipeline_analysis_dir:
+            amd.passes.ttgpuir.add_dump_plan_value_graph(
+                pm, pipeline_analysis_dir, True, "before_update_async_wait_count"
+            )
+        pipeline_plan = os.environ.get("TRITON_TLX_PIPELINE_PLAN")
+        if pipeline_plan:
+            amd.passes.ttgpuir.add_apply_plan_pipeline(
+                pm,
+                pipeline_plan,
+                os.environ.get("TRITON_TLX_PIPELINE_APPLY_REPORT", ""),
+                True,
+                True,
+            )
         amd.passes.ttgpuir.add_update_async_wait_count(pm, options.arch)
         amd.passes.ttgpuir.add_warp_pipeline_conversion(pm, options.arch)
         schedule_plan = os.environ.get("TRITON_TLX_SCHEDULE_PLAN")
@@ -491,7 +505,12 @@ class HIPBackend(BaseBackend):
             )
         plan_analysis_dir = os.environ.get("TRITON_TLX_PLAN_ANALYSIS_DIR")
         if plan_analysis_dir:
-            amd.passes.ttgpuir.add_dump_plan_value_graph(pm, plan_analysis_dir, True)
+            amd.passes.ttgpuir.add_dump_plan_value_graph(
+                pm,
+                plan_analysis_dir,
+                True,
+                "after_warp_pipeline_conversion_before_scf_to_cf",
+            )
         passes.convert.add_scf_to_cf(pm)
         passes.gluon.add_inliner(pm)
         passes.convert.add_index_to_llvmir(pm)

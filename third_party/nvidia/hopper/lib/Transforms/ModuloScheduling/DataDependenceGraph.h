@@ -5,6 +5,7 @@
 
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Operation.h"
+#include "mlir/Support/LogicalResult.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
@@ -108,11 +109,16 @@ public:
   /// a pass that forces a backend must thread it here too, or the nested
   /// schedules silently fall back to the env-selected one. Empty = resolve
   /// from TRITON_USE_MODULO_SCHEDULE (see getActiveScheduleAlgo).
+  ///
+  /// `scheduleNestedLoops=false` keeps inner loops as opaque super-nodes and
+  /// estimates their latency from their existing body. This is for applying a
+  /// constrained outer-loop plan without attempting to replace an already
+  /// explicit TLX inner schedule.
   static DataDependenceGraph
   build(scf::ForOp loop, const LatencyModel &model,
         const llvm::DenseMap<Operation *, DataPartitionInfo> &partition =
             llvm::DenseMap<Operation *, DataPartitionInfo>(),
-        llvm::StringRef scheduleAlgo = {});
+        llvm::StringRef scheduleAlgo = {}, bool scheduleNestedLoops = true);
 
   llvm::ArrayRef<DDGNode> getNodes() const { return nodes; }
   llvm::ArrayRef<DDGEdge> getEdges() const { return edges; }
@@ -121,6 +127,12 @@ public:
   const llvm::DenseMap<Operation *, unsigned> &getOpToIdx() const {
     return opToIdx;
   }
+
+  /// Add a dependence supplied by a higher-level semantic analysis. Both
+  /// operations must already be nodes in this loop DDG. Duplicate
+  /// source/destination/distance edges retain the strongest latency.
+  LogicalResult addExternalDependence(Operation *source, Operation *destination,
+                                      int latency, unsigned distance);
 
   /// Get all incoming edges for a node.
   llvm::SmallVector<const DDGEdge *> getInEdges(unsigned nodeIdx) const;

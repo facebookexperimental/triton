@@ -21,6 +21,37 @@
 
 namespace mlir::triton::gpu {
 
+static int64_t getStaticTripCount(scf::ForOp loop) {
+  auto lower = loop.getLowerBound().getDefiningOp<arith::ConstantIntOp>();
+  auto upper = loop.getUpperBound().getDefiningOp<arith::ConstantIntOp>();
+  auto step = loop.getStep().getDefiningOp<arith::ConstantIntOp>();
+  if (!lower || !upper || !step || step.value() <= 0)
+    return 32;
+  return std::max<int64_t>(
+      1, (upper.value() - lower.value() + step.value() - 1) / step.value());
+}
+
+static int64_t estimateOpaqueLoopLatency(scf::ForOp loop,
+                                         const LatencyModel &model) {
+  int64_t iterationLatency = 0;
+  for (Operation &operation : loop.getBody()->without_terminator()) {
+    int64_t operationLatency = 1;
+    if (auto nested = dyn_cast<scf::ForOp>(operation)) {
+      operationLatency = estimateOpaqueLoopLatency(nested, model);
+    } else {
+      OpLatencyInfo info = model.getLatency(&operation);
+      operationLatency =
+          std::max<int64_t>({1, info.selfLatency, info.occupancy});
+    }
+    iterationLatency =
+        std::min<int64_t>(INT_MAX, iterationLatency + operationLatency);
+  }
+  int64_t tripCount = getStaticTripCount(loop);
+  if (iterationLatency > INT_MAX / tripCount)
+    return INT_MAX;
+  return iterationLatency * tripCount;
+}
+
 unsigned DataDependenceGraph::addNode(Operation *op,
                                       const LatencyModel &model) {
   auto info = model.getLatency(op);
@@ -49,7 +80,7 @@ void DataDependenceGraph::addEdge(unsigned src, unsigned dst, int latency,
 DataDependenceGraph DataDependenceGraph::build(
     scf::ForOp loop, const LatencyModel &model,
     const llvm::DenseMap<Operation *, DataPartitionInfo> &partition,
-    llvm::StringRef scheduleAlgo) {
+    llvm::StringRef scheduleAlgo, bool scheduleNestedLoops) {
   DataDependenceGraph ddg;
 
   // Phase 1: Create nodes for every op in the loop body (except terminator).
@@ -61,8 +92,20 @@ DataDependenceGraph DataDependenceGraph::build(
     // is the inner loop's total execution time (II × trip_count), and
     // its pipeline is NONE (handles its own internal pipelining).
     if (auto innerLoop = dyn_cast<scf::ForOp>(op)) {
-      auto innerDDG =
-          DataDependenceGraph::build(innerLoop, model, partition, scheduleAlgo);
+      if (!scheduleNestedLoops) {
+        unsigned index = ddg.addNode(&op, model);
+        DDGNode &node = ddg.nodes[index];
+        node.isSuperNode = true;
+        node.innerII = static_cast<int>(std::min<int64_t>(
+            INT_MAX, estimateOpaqueLoopLatency(innerLoop, model)));
+        node.latency = node.innerII;
+        node.selfLatency = 0;
+        node.occupancy = 0;
+        node.pipeline = HWPipeline::NONE;
+        continue;
+      }
+      auto innerDDG = DataDependenceGraph::build(
+          innerLoop, model, partition, scheduleAlgo, scheduleNestedLoops);
       // Pass A.5: the inner MMA may be partitioned; apply the split before
       // scheduling so the super-node's innerII is the partitioned II, not the
       // unpartitioned one (which would dilute the outer loop's cost and could
@@ -251,6 +294,28 @@ DataDependenceGraph DataDependenceGraph::build(
   });
 
   return ddg;
+}
+
+LogicalResult DataDependenceGraph::addExternalDependence(Operation *source,
+                                                         Operation *destination,
+                                                         int latency,
+                                                         unsigned distance) {
+  auto sourceIt = opToIdx.find(source);
+  auto destinationIt = opToIdx.find(destination);
+  if (sourceIt == opToIdx.end() || destinationIt == opToIdx.end())
+    return failure();
+  unsigned sourceIndex = sourceIt->second;
+  unsigned destinationIndex = destinationIt->second;
+  latency = std::max(latency, 1);
+  for (DDGEdge &edge : edges) {
+    if (edge.srcIdx != sourceIndex || edge.dstIdx != destinationIndex ||
+        edge.distance != distance)
+      continue;
+    edge.latency = std::max(edge.latency, latency);
+    return success();
+  }
+  addEdge(sourceIndex, destinationIndex, latency, distance);
+  return success();
 }
 
 llvm::SmallVector<const DDGEdge *>

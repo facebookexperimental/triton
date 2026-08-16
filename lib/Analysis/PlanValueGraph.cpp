@@ -1253,7 +1253,7 @@ llvm::json::Object PlanValueGraph::toJSON() const {
 }
 
 std::string serializePlanValueGraphs(ArrayRef<PlanValueGraph> graphs,
-                                     ModuleOp module) {
+                                     ModuleOp module, StringRef passPosition) {
   std::vector<const PlanValueGraph *> sorted;
   sorted.reserve(graphs.size());
   for (const auto &graph : graphs)
@@ -1277,7 +1277,7 @@ std::string serializePlanValueGraphs(ArrayRef<PlanValueGraph> graphs,
   llvm::json::Object provenance{
       {"target", target},
       {"artifact_stage", "final_structured_ttgir"},
-      {"pass_position", "after_warp_pipeline_conversion_before_scf_to_cf"},
+      {"pass_position", passPosition},
       {"logical_tensor_bytes_are_physical_vgpr_bytes", false},
       {"static_intervals_are_physical_cycles", false},
       {"lds_logical_bytes_are_physical_allocation", false},
