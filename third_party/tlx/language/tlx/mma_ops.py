@@ -425,7 +425,9 @@ def release_layout(src, _semantic=None):
 
     This is the structural counterpart to :func:`require_layout`: it keeps a
     concrete layout local to an operation implementation while preventing the
-    encoded type from escaping through a function or operation boundary.
+    encoded type from escaping through a function or operation boundary.  The
+    source may still be encoding-free while a ``@triton.jit`` helper is built;
+    TLX specializes that helper's input before propagating layouts.
     """
     src = _semantic.to_tensor(src)
     handle = _semantic.builder.create_release_layout(src.handle)

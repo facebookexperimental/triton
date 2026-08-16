@@ -438,7 +438,7 @@ def test_a4w4_inter_wave_256tile_codegen_gfx950(device, fresh_triton_cache):
     assert ttgir.count("rocdl.sched.barrier none") == 8
     assert ttgir.count("tt.dot_scaled") == 16
     assert ttgir.count("amdg.buffer_load_to_local") == 28
-    assert "contiguity" not in ttgir
+    assert ttgir.count("contiguity =") == 28
 
     assert len(re.findall(r"^\s*v_mfma_scale_f32_16x16x128_f8f6f4\b", amdgcn, re.MULTILINE)) == 256
     assert len(re.findall(r"^\s*buffer_load_[^\n]*\blds\s*$", amdgcn, re.MULTILINE)) == 44

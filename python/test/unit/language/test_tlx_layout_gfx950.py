@@ -83,6 +83,18 @@ def _fa_mfma_rows_to_workitems(rows):
     return tl.broadcast_to(per_warp_rows[:, None, :], (8, 2, 32)).reshape([512])
 
 
+@triton.jit
+def _release_reshaped_helper_input(value):
+    reshaped = value.reshape([256, 2, 16]).permute(0, 2, 1).reshape([256, 32])
+    return tlx.release_layout(reshaped)
+
+
+@triton.jit
+def _shape_preserving_reduce_broadcast(value):
+    rows = tl.sum(value, axis=1)
+    return tl.broadcast_to(rows[:, None], value.shape)
+
+
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Need gfx950 (CDNA4)")
 def test_shared_linear_layout_lowers_on_cdna4():
     """The Gluon K-tile mapping lowers to a native shared_linear attribute."""
@@ -735,6 +747,46 @@ def test_internally_pinned_helper_result_specializes_abi_on_cdna4():
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Need gfx950 (CDNA4)")
+def test_release_layout_accepts_deferred_helper_input_on_cdna4():
+    layout = tlx.amd_mfma_layout(4, [32, 32, 16], True, [8, 1])
+
+    @triton.jit
+    def kernel(Y, LAYOUT: tl.constexpr):
+        row = tl.arange(0, 256)
+        col = tl.arange(0, 32)
+        value = tl.full((256, 32), 5.0, tl.float32)
+        pinned = tlx.require_layout(value, LAYOUT)
+        released = _release_reshaped_helper_input(pinned)
+        tl.store(Y + row[:, None] * 32 + col[None, :], released)
+
+    y = torch.empty((256 * 32, ), device=DEVICE, dtype=torch.float32)
+    compiled = kernel.warmup(y, layout, grid=(1, ), num_warps=8)
+    kernel[(1, )](y, layout, num_warps=8)
+    torch.testing.assert_close(y, torch.full_like(y, 5.0), atol=0, rtol=0)
+    assert "#tlx.no_verify_layout" not in compiled.asm["ttgir"]
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Need gfx950 (CDNA4)")
+def test_pinned_helper_does_not_copy_layout_across_shape_cycle_on_cdna4():
+    layout = tlx.amd_mfma_layout(4, [32, 32, 16], True, [8, 1])
+
+    @triton.jit
+    def kernel(Y, LAYOUT: tl.constexpr):
+        row = tl.arange(0, 256)
+        col = tl.arange(0, 32)
+        value = tl.full((256, 32), 1.0, tl.float32)
+        pinned = tlx.require_layout(value, LAYOUT)
+        result = _shape_preserving_reduce_broadcast(pinned)
+        tl.store(Y + row[:, None] * 32 + col[None, :], result)
+
+    y = torch.empty((256 * 32, ), device=DEVICE, dtype=torch.float32)
+    compiled = kernel.warmup(y, layout, grid=(1, ), num_warps=8)
+    kernel[(1, )](y, layout, num_warps=8)
+    torch.testing.assert_close(y, torch.full_like(y, 32.0), atol=0, rtol=0)
+    assert "#tlx.no_verify_layout" not in compiled.asm["ttgir"]
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Need gfx950 (CDNA4)")
 def test_concrete_mfma_layout_reconciles_elementwise_broadcast_on_cdna4():
     mma = tlx.amd_mfma_layout(4, [32, 32, 16], True, [8, 1])
     store = tlx.layout(
@@ -761,3 +813,31 @@ def test_concrete_mfma_layout_reconciles_elementwise_broadcast_on_cdna4():
     expected = expected[:, None].broadcast_to((256, 32)).flatten()
     torch.testing.assert_close(y, expected, atol=0, rtol=0)
     assert "#tlx.no_verify_layout" not in compiled.asm["ttgir"]
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Need gfx950 (CDNA4)")
+def test_concrete_elementwise_conflicting_explicit_layouts_fail_on_cdna4():
+    mma = tlx.amd_mfma_layout(4, [32, 32, 16], True, [8, 1])
+    other = tlx.distributed_linear_layout_encoding.make(
+        reg_bases=[[0, 1], [0, 2], [0, 4], [0, 8]],
+        lane_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0]],
+        warp_bases=[[64, 0], [128, 0], [0, 16]],
+        block_bases=[],
+        shape=[256, 32],
+    )
+
+    @triton.jit
+    def kernel(X, Y, MMA: tl.constexpr, OTHER: tl.constexpr):
+        row = tl.arange(0, 256)
+        col = tl.arange(0, 32)
+        offsets = row[:, None] * 32 + col[None, :]
+        value = tl.load(X + offsets)
+        lhs = tlx.require_layout(value, MMA)
+        rhs = tlx.require_layout(value, OTHER)
+        out = tlx.require_layout(lhs + rhs, OTHER)
+        tl.store(Y + offsets, out)
+
+    x = torch.zeros((256 * 32, ), device=DEVICE, dtype=torch.float32)
+    y = torch.empty_like(x)
+    with pytest.raises(RuntimeError, match="conflicting user-pinned layouts meet on this operation"):
+        kernel.warmup(x, y, mma, other, grid=(1, ), num_warps=8)
