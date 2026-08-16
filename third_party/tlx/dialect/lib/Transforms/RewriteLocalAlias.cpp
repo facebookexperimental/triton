@@ -68,7 +68,13 @@ FailureOr<Value> emitAliasView(OpBuilder &builder, Operation *errorOp,
   int64_t srcBits = getMemDescStorageBits(srcTy);
   int64_t dstBits = getMemDescStorageBits(dstTy);
 
-  if (srcBits == dstBits)
+  // Shared-memory reinterpretation explicitly permits a view no larger than
+  // its backing allocation. Keep the destination's leading pipeline copies
+  // intact instead of manufacturing a unit-batch subview. Tensor memory still
+  // requires equal-sized reinterprets and therefore uses structural slicing
+  // below for a smaller alias.
+  if (srcBits == dstBits ||
+      isa<ttg::SharedMemorySpaceAttr>(srcTy.getMemorySpace()))
     return createAliasReinterpret(builder, loc, dstTy, base).getResult();
 
   if (srcBits < dstBits || srcBits % dstBits != 0)

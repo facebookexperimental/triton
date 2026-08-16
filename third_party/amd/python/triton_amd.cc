@@ -362,7 +362,7 @@ void init_triton_amd(py::module_ &m) {
 
   m.def("run_membar", [](mlir::ModuleOp mod, const std::string &arch) {
     mlir::triton::AMD::TargetInfo targetInfo(arch);
-    if (targetInfo.getISAFamily() == mlir::triton::AMD::ISAFamily::Unknown)
+    if (targetInfo.getISAFamily() == mlir::triton::amdgpu::ISAFamily::Unknown)
       throw std::invalid_argument("unsupported AMDGPU target: " + arch);
     auto allocationFn = [&targetInfo](mlir::Operation *op) {
       return mlir::triton::AMD::AMDAllocationAnalysisScratchSizeFn(op,

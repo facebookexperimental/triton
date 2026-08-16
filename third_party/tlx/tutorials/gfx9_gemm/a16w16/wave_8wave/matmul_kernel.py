@@ -15,8 +15,7 @@ import triton.language.extra.tlx as tlx
 
 
 @triton.jit
-def _load_a_fragment(smem_a, buffer, phase: tl.constexpr,
-                     tile: tl.constexpr):
+def _load_a_fragment(smem_a, buffer, phase: tl.constexpr, tile: tl.constexpr):
     # Keep Wave's physical LDS slot order: within each K phase, the eight
     # instruction-M tiles are contiguous inside each of the two M-wave
     # groups.  Select the tile structurally while retaining the M-wave group
@@ -49,15 +48,13 @@ def _load_a_fragment(smem_a, buffer, phase: tl.constexpr,
         block_bases=[],
         shape=[1, 1, 2, 1, 16, 32],
     )
-    fragment = tlx.require_layout(
-        tlx.local_load(fragment_view), fragment_layout)
+    fragment = tlx.require_layout(tlx.local_load(fragment_view), fragment_layout)
     fragment = tl.reshape(fragment, (32, 32))
     return tlx.release_layout(fragment)
 
 
 @triton.jit
-def _load_b_fragment(smem_b, buffer, phase: tl.constexpr,
-                     tile: tl.constexpr):
+def _load_b_fragment(smem_b, buffer, phase: tl.constexpr, tile: tl.constexpr):
     # Likewise group the four instruction-N tiles within each N-wave group,
     # matching the producer slot order used by Wave's direct-to-LDS DMA.
     region = smem_b[buffer]
@@ -91,8 +88,7 @@ def _load_b_fragment(smem_b, buffer, phase: tl.constexpr,
         block_bases=[],
         shape=[1, 1, 4, 1, 32, 16],
     )
-    fragment = tlx.require_layout(
-        tlx.local_load(fragment_view), fragment_layout)
+    fragment = tlx.require_layout(tlx.local_load(fragment_view), fragment_layout)
     fragment = tl.permute(fragment, (0, 1, 4, 3, 2, 5))
     fragment = tl.reshape(fragment, (32, 64))
     return tlx.release_layout(fragment)
@@ -129,10 +125,8 @@ def _mma_phase(a, b, acc):
         transposed=True,
         warps_per_cta=[2, 4],
     )
-    a_fragment_layout: tl.constexpr = tlx.dot_operand_layout_encoding.make(
-        0, mma_layout, 8)
-    b_fragment_layout: tl.constexpr = tlx.dot_operand_layout_encoding.make(
-        1, mma_layout, 8)
+    a_fragment_layout: tl.constexpr = tlx.dot_operand_layout_encoding.make(0, mma_layout, 8)
+    b_fragment_layout: tl.constexpr = tlx.dot_operand_layout_encoding.make(1, mma_layout, 8)
     a = (
         tlx.require_layout(a[0], a_fragment_layout),
         tlx.require_layout(a[1], a_fragment_layout),
@@ -216,22 +210,38 @@ def _mma_phase(a, b, acc):
     c72 = tlx.dot(a[7], b[2], acc[30], tiles_per_warp=[1, 1])
     c73 = tlx.dot(a[7], b[3], acc[31], tiles_per_warp=[1, 1])
     return (
-        tlx.release_layout(c00), tlx.release_layout(c01),
-        tlx.release_layout(c02), tlx.release_layout(c03),
-        tlx.release_layout(c10), tlx.release_layout(c11),
-        tlx.release_layout(c12), tlx.release_layout(c13),
-        tlx.release_layout(c20), tlx.release_layout(c21),
-        tlx.release_layout(c22), tlx.release_layout(c23),
-        tlx.release_layout(c30), tlx.release_layout(c31),
-        tlx.release_layout(c32), tlx.release_layout(c33),
-        tlx.release_layout(c40), tlx.release_layout(c41),
-        tlx.release_layout(c42), tlx.release_layout(c43),
-        tlx.release_layout(c50), tlx.release_layout(c51),
-        tlx.release_layout(c52), tlx.release_layout(c53),
-        tlx.release_layout(c60), tlx.release_layout(c61),
-        tlx.release_layout(c62), tlx.release_layout(c63),
-        tlx.release_layout(c70), tlx.release_layout(c71),
-        tlx.release_layout(c72), tlx.release_layout(c73),
+        tlx.release_layout(c00),
+        tlx.release_layout(c01),
+        tlx.release_layout(c02),
+        tlx.release_layout(c03),
+        tlx.release_layout(c10),
+        tlx.release_layout(c11),
+        tlx.release_layout(c12),
+        tlx.release_layout(c13),
+        tlx.release_layout(c20),
+        tlx.release_layout(c21),
+        tlx.release_layout(c22),
+        tlx.release_layout(c23),
+        tlx.release_layout(c30),
+        tlx.release_layout(c31),
+        tlx.release_layout(c32),
+        tlx.release_layout(c33),
+        tlx.release_layout(c40),
+        tlx.release_layout(c41),
+        tlx.release_layout(c42),
+        tlx.release_layout(c43),
+        tlx.release_layout(c50),
+        tlx.release_layout(c51),
+        tlx.release_layout(c52),
+        tlx.release_layout(c53),
+        tlx.release_layout(c60),
+        tlx.release_layout(c61),
+        tlx.release_layout(c62),
+        tlx.release_layout(c63),
+        tlx.release_layout(c70),
+        tlx.release_layout(c71),
+        tlx.release_layout(c72),
+        tlx.release_layout(c73),
     )
 
 
@@ -246,10 +256,8 @@ def _mma_phase_with_next_reads(a, b, acc, smem_a, smem_b, next_buffer):
         transposed=True,
         warps_per_cta=[2, 4],
     )
-    a_fragment_layout: tl.constexpr = tlx.dot_operand_layout_encoding.make(
-        0, mma_layout, 8)
-    b_fragment_layout: tl.constexpr = tlx.dot_operand_layout_encoding.make(
-        1, mma_layout, 8)
+    a_fragment_layout: tl.constexpr = tlx.dot_operand_layout_encoding.make(0, mma_layout, 8)
+    b_fragment_layout: tl.constexpr = tlx.dot_operand_layout_encoding.make(1, mma_layout, 8)
     a = (
         tlx.require_layout(a[0], a_fragment_layout),
         tlx.require_layout(a[1], a_fragment_layout),
@@ -369,35 +377,57 @@ def _mma_phase_with_next_reads(a, b, acc, smem_a, smem_b, next_buffer):
     next_a1 = (na8, na9, na10, na11, na12, na13, na14, na15)
     next_b1 = (nb4, nb5, nb6, nb7)
     next_acc = (
-        tlx.release_layout(c00), tlx.release_layout(c01),
-        tlx.release_layout(c02), tlx.release_layout(c03),
-        tlx.release_layout(c10), tlx.release_layout(c11),
-        tlx.release_layout(c12), tlx.release_layout(c13),
-        tlx.release_layout(c20), tlx.release_layout(c21),
-        tlx.release_layout(c22), tlx.release_layout(c23),
-        tlx.release_layout(c30), tlx.release_layout(c31),
-        tlx.release_layout(c32), tlx.release_layout(c33),
-        tlx.release_layout(c40), tlx.release_layout(c41),
-        tlx.release_layout(c42), tlx.release_layout(c43),
-        tlx.release_layout(c50), tlx.release_layout(c51),
-        tlx.release_layout(c52), tlx.release_layout(c53),
-        tlx.release_layout(c60), tlx.release_layout(c61),
-        tlx.release_layout(c62), tlx.release_layout(c63),
-        tlx.release_layout(c70), tlx.release_layout(c71),
-        tlx.release_layout(c72), tlx.release_layout(c73),
+        tlx.release_layout(c00),
+        tlx.release_layout(c01),
+        tlx.release_layout(c02),
+        tlx.release_layout(c03),
+        tlx.release_layout(c10),
+        tlx.release_layout(c11),
+        tlx.release_layout(c12),
+        tlx.release_layout(c13),
+        tlx.release_layout(c20),
+        tlx.release_layout(c21),
+        tlx.release_layout(c22),
+        tlx.release_layout(c23),
+        tlx.release_layout(c30),
+        tlx.release_layout(c31),
+        tlx.release_layout(c32),
+        tlx.release_layout(c33),
+        tlx.release_layout(c40),
+        tlx.release_layout(c41),
+        tlx.release_layout(c42),
+        tlx.release_layout(c43),
+        tlx.release_layout(c50),
+        tlx.release_layout(c51),
+        tlx.release_layout(c52),
+        tlx.release_layout(c53),
+        tlx.release_layout(c60),
+        tlx.release_layout(c61),
+        tlx.release_layout(c62),
+        tlx.release_layout(c63),
+        tlx.release_layout(c70),
+        tlx.release_layout(c71),
+        tlx.release_layout(c72),
+        tlx.release_layout(c73),
     )
     return next_acc, next_a0, next_b0, next_a1, next_b1
 
 
 @triton.jit
-def _store_acc_tile(c_ptr, acc, pid_m, pid_n, stride_cm, stride_cn,
-                    local_m: tl.constexpr, local_n: tl.constexpr):
+def _store_acc_tile(c_ptr, acc, pid_m, pid_n, stride_cm, stride_cn, local_m: tl.constexpr, local_n: tl.constexpr):
+    store_layout: tl.constexpr = tlx.amd_mfma_layout_encoding.make(
+        version=4,
+        instr_shape=[16, 16, 32],
+        transposed=True,
+        warps_per_cta=[2, 4],
+    )
     m = tl.arange(0, 32)
     n = tl.arange(0, 64)
     offs_m = pid_m * 256 + (m // 16) * 128 + local_m * 16 + m % 16
     offs_n = pid_n * 256 + (n // 16) * 64 + local_n * 16 + n % 16
-    tl.store(c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn,
-             acc.to(tl.float16))
+    offsets = offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    offsets = tlx.require_layout(offsets, store_layout)
+    tl.store(c_ptr + offsets, acc.to(tl.float16))
 
 
 @triton.jit
@@ -512,30 +542,21 @@ def wave_8wave(
     K_PHASE: tl.constexpr = BLOCK_K // 2
     MMA_M: tl.constexpr = 16
     MMA_N: tl.constexpr = 16
-    A_M_TILES: tl.constexpr = BLOCK_M // MMA_M
-    B_N_TILES: tl.constexpr = BLOCK_N // MMA_N
     K_PHASES: tl.constexpr = BLOCK_K // K_PHASE
-    ring_layout: tl.constexpr = tlx.swizzled_shared_layout_encoding.with_order(
-        [2, 1, 0], vectorSize=8, perPhase=2, maxPhase=8)
-    a_load_layout: tl.constexpr = tlx.swizzled_shared_layout_encoding.with_order(
-        [5, 4, 3, 2, 1, 0], vectorSize=8, perPhase=2, maxPhase=8)
-    b_load_layout: tl.constexpr = tlx.swizzled_shared_layout_encoding.with_order(
-        [4, 5, 3, 2, 1, 0], vectorSize=8, perPhase=2, maxPhase=8)
+    ring_layout: tl.constexpr = tlx.swizzled_shared_layout_encoding.with_order([2, 1, 0], vectorSize=8, perPhase=2,
+                                                                               maxPhase=8)
+    a_load_layout: tl.constexpr = tlx.swizzled_shared_layout_encoding.with_order([5, 4, 3, 2, 1, 0], vectorSize=8,
+                                                                                 perPhase=2, maxPhase=8)
+    b_load_layout: tl.constexpr = tlx.swizzled_shared_layout_encoding.with_order([4, 5, 3, 2, 1, 0], vectorSize=8,
+                                                                                 perPhase=2, maxPhase=8)
 
     # Match Wave's single 128 KiB double-buffered ring.  Every descriptor below
     # spans the complete allocation, so lowering can express each as a pure
     # same-size reinterpret.  Each ring is [A 32 KiB, B 32 KiB].
-    smem_a = tlx.local_alloc(
-        (2, 2, 2, 8, 16, 32), tl.float16, 2, layout=a_load_layout)
-    smem_b = tlx.local_alloc(
-        (2, 2, 4, 4, 32, 16), tl.float16, 2, reuse=smem_a,
-        layout=b_load_layout)
-    smem_a_dma = tlx.local_alloc(
-        (16, 32, 32), tl.float16, 4, reuse=smem_a,
-        layout=ring_layout)
-    smem_b_dma = tlx.local_alloc(
-        (8, 64, 32), tl.float16, 4, reuse=smem_a,
-        layout=ring_layout)
+    smem_a = tlx.local_alloc((2, 2, 2, 8, 16, 32), tl.float16, 2, layout=a_load_layout)
+    smem_b = tlx.local_alloc((2, 2, 4, 4, 32, 16), tl.float16, 2, reuse=smem_a, layout=b_load_layout)
+    smem_a_dma = tlx.local_alloc((16, 32, 32), tl.float16, 4, reuse=smem_a, layout=ring_layout)
+    smem_b_dma = tlx.local_alloc((8, 64, 32), tl.float16, 4, reuse=smem_a, layout=ring_layout)
 
     offs_a_slot = tl.arange(0, K_PHASES * 8)
     offs_b_slot = tl.arange(0, K_PHASES * 4)
@@ -552,35 +573,49 @@ def wave_8wave(
     # [0, 8, 1, 9, ...] across waves while LDS slots expect [0, 1, 2, 3, ...]).
     a_component = offs_a_slot[:, None] // 4
     a_m_tile = wave_id + (a_component % 2) * 8
-    offs_am = (
-        pid_m * BLOCK_M
-        + a_m_tile * MMA_M
-        + offs_a_m[None, :] % MMA_M
-    )
+    offs_am = (pid_m * BLOCK_M + a_m_tile * MMA_M + offs_a_m[None, :] % MMA_M)
 
     b_component = offs_b_slot[:, None] // 2
     b_n_tile = wave_id + (b_component % 2) * 8
-    offs_bn = (
-        pid_n * BLOCK_N
-        + b_n_tile * MMA_N
-        + offs_b_n[None, :] % MMA_N
-    )
-    a_off = (
-        offs_am[:, :, None] * stride_am
-        + ((a_component[:, :, None] // 2) * K_PHASE
-           + offs_k_inner[None, None, :]) * stride_ak
-    )
-    b_off = (
-        ((b_component[:, :, None] // 2) * K_PHASE
-         + offs_k_inner[None, None, :]) * stride_bk
-        + offs_bn[:, :, None] * stride_bn
-    )
+    offs_bn = (pid_n * BLOCK_N + b_n_tile * MMA_N + offs_b_n[None, :] % MMA_N)
+    a_off = (offs_am[:, :, None] * stride_am +
+             ((a_component[:, :, None] // 2) * K_PHASE + offs_k_inner[None, None, :]) * stride_ak)
+    b_off = (((b_component[:, :, None] // 2) * K_PHASE + offs_k_inner[None, None, :]) * stride_bk +
+             offs_bn[:, :, None] * stride_bn)
     zero = tl.zeros((32, 64), dtype=tl.float32)
     acc = (
-        zero, zero, zero, zero, zero, zero, zero, zero,
-        zero, zero, zero, zero, zero, zero, zero, zero,
-        zero, zero, zero, zero, zero, zero, zero, zero,
-        zero, zero, zero, zero, zero, zero, zero, zero,
+        zero,
+        zero,
+        zero,
+        zero,
+        zero,
+        zero,
+        zero,
+        zero,
+        zero,
+        zero,
+        zero,
+        zero,
+        zero,
+        zero,
+        zero,
+        zero,
+        zero,
+        zero,
+        zero,
+        zero,
+        zero,
+        zero,
+        zero,
+        zero,
+        zero,
+        zero,
+        zero,
+        zero,
+        zero,
+        zero,
+        zero,
+        zero,
     )
     iter_max: tl.constexpr = K // BLOCK_K
 
@@ -592,10 +627,8 @@ def wave_8wave(
 
     initial_a_dma1 = smem_a_dma[2]
     initial_b_dma1 = smem_b_dma[3]
-    tlx.buffer_load_to_local(
-        initial_a_dma1, a_ptr, a_off + BLOCK_K * stride_ak)
-    tlx.buffer_load_to_local(
-        initial_b_dma1, b_ptr, b_off + BLOCK_K * stride_bk)
+    tlx.buffer_load_to_local(initial_a_dma1, a_ptr, a_off + BLOCK_K * stride_ak)
+    tlx.buffer_load_to_local(initial_b_dma1, b_ptr, b_off + BLOCK_K * stride_bk)
     tlx.async_load_commit_group(issue_group_size=7, issue_delay_cycles=68)
 
     tlx.async_load_wait_group(1)
@@ -611,10 +644,8 @@ def wave_8wave(
         # operands read LDS written by all eight waves.
         refill_a_dma = smem_a_dma[consumed * 2]
         refill_b_dma = smem_b_dma[consumed * 2 + 1]
-        tlx.buffer_load_to_local(
-            refill_a_dma, a_ptr, a_off + refill_k * stride_ak)
-        tlx.buffer_load_to_local(
-            refill_b_dma, b_ptr, b_off + refill_k * stride_bk)
+        tlx.buffer_load_to_local(refill_a_dma, a_ptr, a_off + refill_k * stride_ak)
+        tlx.buffer_load_to_local(refill_b_dma, b_ptr, b_off + refill_k * stride_bk)
         tlx.async_load_commit_group(
             issue_group_size=7,
             issue_delay_cycles=46,
@@ -629,8 +660,7 @@ def wave_8wave(
         # phase, exactly as required by wait_group(1).
         tlx.async_load_wait_group(1)
 
-        acc, a0, b0, a1, b1 = _mma_phase_with_next_reads(
-            a1, b1, acc, smem_a, smem_b, next_buffer)
+        acc, a0, b0, a1, b1 = _mma_phase_with_next_reads(a1, b1, acc, smem_a, smem_b, next_buffer)
 
     acc = _mma_phase(a0, b0, acc)
     acc = _mma_phase(a1, b1, acc)

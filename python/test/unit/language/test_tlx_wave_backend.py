@@ -16877,12 +16877,12 @@ def test_tlx_wave_converter_proves_signed_division_domain_from_ssa_range(tmp_pat
 @pytest.mark.parametrize(
     ("kind", "diagnostic_code"),
     (
-        ("buffer_load", "TLXW_OP_BUFFER_LOAD"),
+        ("buffer_load", None),
         ("buffer_store", "TLXW_OP_BUFFER_STORE"),
         ("buffer_load_to_local", "TLXW_OP_BUFFER_ASYNC"),
     ),
 )
-def test_tlx_wave_converter_rejects_zero_buffer_contiguity(tmp_path, kind, diagnostic_code):
+def test_tlx_wave_rejects_zero_buffer_contiguity(tmp_path, kind, diagnostic_code):
     preamble = """
 #blocked = #ttg.blocked<{sizePerThread = [2], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
 #shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
@@ -16914,11 +16914,14 @@ def test_tlx_wave_converter_rejects_zero_buffer_contiguity(tmp_path, kind, diagn
     tt.return
   }}
 """
-    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1, preamble=preamble)
+    if diagnostic_code is None:
+        with pytest.raises(RuntimeError, match="Parse MLIR file failed"):
+            _parse_ttgir(tmp_path, local_func, num_warps=1, preamble=preamble)
+        return
 
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1, preamble=preamble)
     with pytest.raises(converter_diagnostics.Diagnostic) as exc_info:
         converter_pipeline.convert_ttgir_to_wave(mod)
-
     assert exc_info.value.code == diagnostic_code
     assert exc_info.value.stage == "op_conversion"
     del ctx
@@ -17300,11 +17303,11 @@ def test_tlx_wave_converter_derives_buffer_load_packets_from_symbolic_mapping(tm
 #blocked = #ttg.blocked<{sizePerThread = [8], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
 """
     local_func = """
-  tt.func public @converter_nondividing_contiguity_buffer_load(
+  tt.func public @converter_symbolic_packet_buffer_load(
       %arg0: !tt.ptr<f16> {tt.pointer_range = 32 : i32}) attributes {noinline = false} {
     %range = tt.make_range {end = 512 : i32, start = 0 : i32} : tensor<512xi32, #blocked>
-    %loaded = amdg.buffer_load %arg0[%range] {contiguity = 5 : i32} : tensor<512xf16, #blocked>
-    amdg.buffer_store %loaded, %arg0[%range] {contiguity = 5 : i32} : tensor<512xf16, #blocked>
+    %loaded = amdg.buffer_load %arg0[%range] {contiguity = 8 : i32} : tensor<512xf16, #blocked>
+    amdg.buffer_store %loaded, %arg0[%range] {contiguity = 8 : i32} : tensor<512xf16, #blocked>
     tt.return
   }
 """

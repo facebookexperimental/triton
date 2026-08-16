@@ -74,6 +74,7 @@ def launch_matmul(a, b, a_scales, b_scales, out=None):
         M,
         N,
         K,
+        K // BLOCK_K,
         a.stride(0),
         a.stride(1),
         b.stride(0),
@@ -93,7 +94,7 @@ def launch_matmul(a, b, a_scales, b_scales, out=None):
         SPLIT_K=1,
         num_warps=NUM_WARPS,
         num_stages=1,
-        matrix_instr_nonkdim=32,
+        matrix_instr_nonkdim=16,
         llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"), ),
     )
     return c
