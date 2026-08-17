@@ -94,6 +94,7 @@ from triton.language.extra.tlx.tutorials.amd_addmm_glu import (
     M as _amd_addmm_glu_M,
     N as _amd_addmm_glu_N,
 )
+from triton.language.extra.tlx.tutorials.amd_addmm_gfx950 import addmm as _amd_addmm
 from triton.language.extra.tlx.tutorials import amd_hstu_attn as _hstu
 from triton.tools.mxfp import MXScaleTensor
 
@@ -1743,6 +1744,56 @@ def test_amd_mxfp_gemm_tdm_pipelined(TRANSPOSE_B):
     config["TRANSPOSE_B"] = TRANSPOSE_B
     out = _amd_mxfp_gemm_tdm_pipelined(a_d, b_d, a_scale.to(DEVICE), b_scale.to(DEVICE), config=config)
     torch.testing.assert_close(out.cpu(), ref, rtol=1e-5, atol=2e-2)
+
+
+# =============================================================================
+# AMD addmm Tests (gfx950)
+# =============================================================================
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
+@pytest.mark.parametrize("bias_2d,split_k", [(False, 1), (True, 2)], ids=["1d-direct", "2d-split-k"])
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware (CDNA4)")
+def test_amd_standalone_addmm(dtype, bias_2d, split_k):
+    M, N, K = 256, 256, 2048
+    torch.manual_seed(0)
+    a = (torch.randn(M, K, device=DEVICE, dtype=dtype) + 1) / K
+    b = ((torch.randn(N, K, device=DEVICE, dtype=dtype) + 1) / K).T
+    bias_shape = (1, N) if bias_2d else (N, )
+    bias = torch.randn(bias_shape, device=DEVICE, dtype=dtype)
+
+    out = _amd_addmm(bias, a, b, SPLIT_K=split_k)
+    ref = torch.addmm(bias, a, b)
+    torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize(
+    "M,N,K,supported",
+    [
+        pytest.param(1024, 896, 1840, False, id="1024x896x1840"),
+        pytest.param(1024, 896, 24, False, id="1024x896x24"),
+        pytest.param(1024, 896, 104, False, id="1024x896x104"),
+        pytest.param(1024, 1536, 2048, True, id="1024x1536x2048"),
+        pytest.param(1024, 6144, 512, True, id="1024x6144x512"),
+        pytest.param(7000, 256, 256, True, id="7000x256x256"),
+        pytest.param(32768, 256, 256, True, id="32768x256x256"),
+    ],
+)
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware (CDNA4)")
+def test_amd_standalone_addmm_stock_triton_shapes(M, N, K, supported):
+    torch.manual_seed(0)
+    a = (torch.randn(M, K, device=DEVICE, dtype=torch.float16) + 1) / K
+    b = ((torch.randn(N, K, device=DEVICE, dtype=torch.float16) + 1) / K).T
+    bias = torch.randn(N, device=DEVICE, dtype=torch.float16)
+
+    if not supported:
+        with pytest.raises(ValueError, match=rf"K={K} must be"):
+            _amd_addmm(bias, a, b)
+        return
+
+    out = _amd_addmm(bias, a, b)
+    ref = torch.addmm(bias, a, b)
+    torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
 
 
 # =============================================================================

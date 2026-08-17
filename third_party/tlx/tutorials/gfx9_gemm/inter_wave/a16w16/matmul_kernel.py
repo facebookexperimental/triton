@@ -95,6 +95,7 @@ _B_BASES_128 = tl.constexpr(_swz_offset_bases([BLOCK_K, _HALF_128], 0))
 def a16w16_8wave(
     a_ptr,
     b_ptr,
+    bias_ptr,
     c_ptr,
     workspace_ptr,
     M,
@@ -105,6 +106,8 @@ def a16w16_8wave(
     stride_ak,
     stride_bk,
     stride_bn,
+    stride_bias_m,
+    stride_bias_n,
     stride_cm,
     stride_cn,
     BLOCK_M: tl.constexpr,
@@ -114,6 +117,7 @@ def a16w16_8wave(
     NUM_XCDS: tl.constexpr,
     GRID_MN: tl.constexpr,
     SPLIT_K: tl.constexpr,
+    ADD_BIAS: tl.constexpr,
 ):
     # ── Split-K: grid is GRID_MN*SPLIT_K. Peel off split_id, keep the MN pid for
     # the XCD/group remap below. Each split owns a contiguous K-slice of size KS.
@@ -186,10 +190,10 @@ def a16w16_8wave(
     b_bases: tl.constexpr = _B_BASES_256 if BLOCK_N == 256 else _B_BASES_128
     a_shared: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases([(512, 16)], a_bases, [HALF_M, BLOCK_K])
     b_shared: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases([(512, 16)], b_bases, [BLOCK_K, HALF_N])
-    smem_a_top = tlx.local_alloc((HALF_M, BLOCK_K), tl.float16, 2, layout=a_shared)
-    smem_a_bot = tlx.local_alloc((HALF_M, BLOCK_K), tl.float16, 2, layout=a_shared)
-    smem_b_left = tlx.local_alloc((BLOCK_K, HALF_N), tl.float16, 2, layout=b_shared)
-    smem_b_right = tlx.local_alloc((BLOCK_K, HALF_N), tl.float16, 2, layout=b_shared)
+    smem_a_top = tlx.local_alloc((HALF_M, BLOCK_K), tlx.dtype_of(a_ptr), 2, layout=a_shared)
+    smem_a_bot = tlx.local_alloc((HALF_M, BLOCK_K), tlx.dtype_of(a_ptr), 2, layout=a_shared)
+    smem_b_left = tlx.local_alloc((BLOCK_K, HALF_N), tlx.dtype_of(b_ptr), 2, layout=b_shared)
+    smem_b_right = tlx.local_alloc((BLOCK_K, HALF_N), tlx.dtype_of(b_ptr), 2, layout=b_shared)
 
     # The direct-to-LDS buffer_load write is coalesced only when each offset
     # tensor's #linear layout matches the swizzled LDS layout above. We pin only
@@ -391,7 +395,29 @@ def a16w16_8wave(
     n_right = offs_cn_right[None, :] < N
 
     if SPLIT_K == 1:
-        # Direct store to C -- exact no-op vs the champion kernel.
+        if ADD_BIAS:
+            acc_tl += tl.load(
+                bias_ptr + stride_bias_m * offs_cm_top[:, None] + stride_bias_n * offs_cn_left[None, :],
+                mask=m_top & n_left,
+                other=0.0,
+            ).to(tl.float32)
+            acc_bl += tl.load(
+                bias_ptr + stride_bias_m * offs_cm_bot[:, None] + stride_bias_n * offs_cn_left[None, :],
+                mask=m_bot & n_left,
+                other=0.0,
+            ).to(tl.float32)
+            acc_tr += tl.load(
+                bias_ptr + stride_bias_m * offs_cm_top[:, None] + stride_bias_n * offs_cn_right[None, :],
+                mask=m_top & n_right,
+                other=0.0,
+            ).to(tl.float32)
+            acc_br += tl.load(
+                bias_ptr + stride_bias_m * offs_cm_bot[:, None] + stride_bias_n * offs_cn_right[None, :],
+                mask=m_bot & n_right,
+                other=0.0,
+            ).to(tl.float32)
+
+        # Direct store to C.
         et = c_ptr.dtype.element_ty
         if HALF_M == 128 and HALF_N == 128:
             # Pin each 128x128 quadrant to the coalesced SIMD #linear layout (no LDS
@@ -441,8 +467,9 @@ _TORCH_TO_TL = {torch.float16: tl.float16, torch.bfloat16: tl.bfloat16, torch.fl
 
 
 @triton.jit
-def _reduce_k_kernel(workspace_ptr, c_ptr, M, N, SPLIT_K: tl.constexpr, BLOCK_SIZE_M: tl.constexpr,
-                     BLOCK_SIZE_N: tl.constexpr, OUTPUT_DTYPE: tl.constexpr):
+def _reduce_k_kernel(workspace_ptr, bias_ptr, c_ptr, M, N, stride_bias_m, stride_bias_n,
+                     SPLIT_K: tl.constexpr, BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr,
+                     OUTPUT_DTYPE: tl.constexpr, ADD_BIAS: tl.constexpr):
     # Sum the SPLIT_K partials (each a contiguous (M, N) slab in workspace) into
     # C with fp32 accumulation. Small tiles (32x32) so small outputs still spawn
     # many CTAs -- else the reduce is CTA-starved and dominates (D97513062).
@@ -456,6 +483,13 @@ def _reduce_k_kernel(workspace_ptr, c_ptr, M, N, SPLIT_K: tl.constexpr, BLOCK_SI
     for s in range(SPLIT_K):
         partial = tl.load(workspace_ptr + base_offs + s * M * N, mask=mask, other=0.0)
         acc += partial.to(tl.float32)
+    if ADD_BIAS:
+        bias = tl.load(
+            bias_ptr + offs_m[:, None] * stride_bias_m + offs_n[None, :] * stride_bias_n,
+            mask=mask,
+            other=0.0,
+        )
+        acc += bias.to(tl.float32)
     tl.store(c_ptr + base_offs, acc.to(OUTPUT_DTYPE), mask=mask)
 
 
@@ -522,21 +556,15 @@ def choose_split_k(M, N, K):
     return choose_tile(M, N, K)[2]
 
 
-def matmul(a, b, SPLIT_K=None):
-    """C = A @ B. `a` is (M, K), `b` is (K, N).
-
-    SPLIT_K partitions the K reduction across SPLIT_K programs per output tile
-    (grid = GRID_MN*SPLIT_K), landing fp32 partials in a (SPLIT_K*M, N) workspace
-    that a separate fp32 reduce kernel sums into C. This fills the CUs on small-N /
-    small-tile-count shapes where the M/N tile grid alone can't. SPLIT_K is chosen
-    automatically from the shape (pass an int to override); SPLIT_K=1 launches the
-    plain kernel (no workspace, no reduce). The fp32 workspace keeps the result
-    numerically identical to the non-split-K kernel; only an int-free fp32 sum is
-    added, so there is no precision loss and the result is deterministic.
-    """
+def _launch(a, b, bias=None, SPLIT_K=None):
+    """Launch the shared gfx950 GEMM core, optionally with a fused bias."""
     assert a.shape[1] == b.shape[0], "Incompatible dimensions"
     M, K = a.shape
     K, N = b.shape
+    if bias is not None:
+        assert bias.shape == (M, N), f"Bias must expand to ({M}, {N}), got {tuple(bias.shape)}"
+        assert bias.device == a.device, "Bias and matrix operands must be on the same device"
+        assert bias.dtype == a.dtype, "Bias and matrix operands must have the same dtype"
     if SPLIT_K is None:
         BM, BN, SPLIT_K = choose_tile(M, N, K)
     else:
@@ -555,9 +583,13 @@ def matmul(a, b, SPLIT_K=None):
         workspace = torch.empty((SPLIT_K * M, N), device=a.device, dtype=torch.float32)
     else:
         workspace = c  # dummy; the kernel writes c_ptr directly when SPLIT_K==1
+    bias_ptr = bias if bias is not None else c
+    stride_bias_m = bias.stride(0) if bias is not None else 0
+    stride_bias_n = bias.stride(1) if bias is not None else 0
     a16w16_8wave[(GRID_MN * SPLIT_K, )](
         a,
         b,
+        bias_ptr,
         c,
         workspace,
         M,
@@ -568,6 +600,8 @@ def matmul(a, b, SPLIT_K=None):
         a.stride(1),
         b.stride(0),
         b.stride(1),
+        stride_bias_m,
+        stride_bias_n,
         c.stride(0),
         c.stride(1),
         BLOCK_M=BM,
@@ -577,6 +611,7 @@ def matmul(a, b, SPLIT_K=None):
         NUM_XCDS=NUM_XCDS,
         GRID_MN=GRID_MN,
         SPLIT_K=SPLIT_K,
+        ADD_BIAS=bias is not None,
         num_warps=NUM_WARPS,
         num_stages=1,
         matrix_instr_nonkdim=16,
@@ -593,13 +628,32 @@ def matmul(a, b, SPLIT_K=None):
         reduce_grid = (triton.cdiv(M, rbm), triton.cdiv(N, rbn))
         _reduce_k_kernel[reduce_grid](
             workspace,
+            bias_ptr,
             c,
             M,
             N,
+            stride_bias_m,
+            stride_bias_n,
             SPLIT_K=SPLIT_K,
             BLOCK_SIZE_M=rbm,
             BLOCK_SIZE_N=rbn,
             OUTPUT_DTYPE=_TORCH_TO_TL[a.dtype],
+            ADD_BIAS=bias is not None,
             num_warps=rw,
         )
     return c
+
+
+def matmul(a, b, SPLIT_K=None):
+    """C = A @ B. `a` is (M, K), `b` is (K, N).
+
+    SPLIT_K partitions the K reduction across SPLIT_K programs per output tile
+    (grid = GRID_MN*SPLIT_K), landing fp32 partials in a (SPLIT_K*M, N) workspace
+    that a separate fp32 reduce kernel sums into C. This fills the CUs on small-N /
+    small-tile-count shapes where the M/N tile grid alone can't. SPLIT_K is chosen
+    automatically from the shape (pass an int to override); SPLIT_K=1 launches the
+    plain kernel (no workspace, no reduce). The fp32 workspace keeps the result
+    numerically identical to the non-split-K kernel; only an int-free fp32 sum is
+    added, so there is no precision loss and the result is deterministic.
+    """
+    return _launch(a, b, SPLIT_K=SPLIT_K)
