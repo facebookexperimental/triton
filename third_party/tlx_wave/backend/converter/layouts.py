@@ -1532,11 +1532,6 @@ def _symbolic_bits_to_int(dsl, bits):
     return result
 
 
-def _symbolic_layout_bit_formula(dsl, linear, inputs):
-    """Serialize each GF(2) output bit before forming its integer value."""
-    return {name: _symbolic_bits_to_int(dsl, bits) for name, bits in _symbolic_layout_bits(dsl, linear, inputs).items()}
-
-
 def _symbolic_shared_element_offset(
         dsl,
         address_layout,
@@ -1715,40 +1710,6 @@ def _packet_item_linear_layout(
             "block",
             [basis(block=1 << bit) for bit in range(physical_extents["block"].bit_length() - 1)],
         ))
-    adapter = LinearLayout.from_bases(
-        adapter_bases,
-        physical_names,
-        [physical_extents[name] for name in physical_names],
-        False,
-    )
-    return _compose_linear_layouts(adapter, linear)
-
-
-def _packet_item_bit_linear_layout(linear, lane_width, warp_count):
-    """Rebase packet ownership onto individual bits of the physical item."""
-    lane_width = int(lane_width)
-    warp_count = int(warp_count)
-    physical_extents = {name: linear_layout_in_dim_size(linear, name) for name in _PACKET_PHYSICAL_DIMS}
-    lane_bits = lane_width.bit_length() - 1
-    warp_bits = warp_count.bit_length() - 1
-    if 1 << lane_bits != lane_width or 1 << warp_bits != warp_count:
-        raise ValueError("packet item layout requires power-of-two hardware extents")
-    physical_names = list(_PACKET_PHYSICAL_DIMS)
-
-    def basis(**values):
-        return [int(values.get(name, 0)) for name in physical_names]
-
-    register_bits = physical_extents["register"].bit_length() - 1
-    adapter_bases = [
-        ("slot", [basis(register=1 << bit) for bit in range(register_bits)]),
-    ]
-    adapter_bases.extend((
-        f"item{bit}",
-        [
-            basis(lane=(1 << bit) if (1 << bit) < physical_extents["lane"] else 0, ) if bit < lane_bits else basis(
-                warp=(1 << (bit - lane_bits)) if (1 << (bit - lane_bits)) < physical_extents["warp"] else 0, )
-        ],
-    ) for bit in range(lane_bits + warp_bits))
     adapter = LinearLayout.from_bases(
         adapter_bases,
         physical_names,
