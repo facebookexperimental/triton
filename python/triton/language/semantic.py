@@ -1113,6 +1113,8 @@ class TritonSemantic(Generic[TensorTy]):
         offsets = self._convert_to_ir_values(offsets, require_i64=False)
         if multicast is not None and not isinstance(multicast, bool):
             raise TypeError(f"multicast must be a constexpr bool or None, got {multicast}")
+        if multicast is None:
+            multicast = getattr(self.builder.options, "multicast", False)
         x = self.builder.create_descriptor_load(
             desc.handle,
             offsets,

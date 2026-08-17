@@ -1747,10 +1747,8 @@ void init_triton_ir(py::module &&m) {
              auto descTy = cast<triton::TensorDescType>(desc.getType());
              auto resTy = descTy.getSignlessBlockType();
              auto op = self.create<DescriptorLoadOp>(
-                 resTy, desc, indices, cacheModifier, evictionPolicy);
-             if (multicast)
-               op->setAttr("tt.multicast",
-                           self.getBuilder().getBoolAttr(*multicast));
+                 resTy, desc, indices, cacheModifier, evictionPolicy,
+                 multicast.value_or(false));
              return op;
            })
       .def("create_descriptor_gather",
