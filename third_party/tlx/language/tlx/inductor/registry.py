@@ -1460,6 +1460,15 @@ class ROCmAddMMPersistentWarpPipeTemplateConfigHeuristic(
         for template_kwargs in super()._get_template_configs_impl(
             kernel_inputs, op_name
         ):
+            # The persistent template has NO split-K body -- it never peels split_id and
+            # never writes split_k_ws; it stores straight through store_output. But
+            # SPLIT_K > 1 alone makes _tlx_tt_generate allocate the UNINITIALIZED
+            # split_k_ws and _tlx_emit_post_kernel_code emit _reduce_k after the kernel,
+            # and that reducer then sums the never-written workspace over the output.
+            # Inheriting the per-tile heuristic's split-K candidates therefore yields
+            # silently WRONG results whenever autotune happens to pick one. Drop them.
+            if int(template_kwargs.get("SPLIT_K", 1)) > 1:
+                continue
             yield {**template_kwargs, "NUM_SMS": num_sms}
 
 
