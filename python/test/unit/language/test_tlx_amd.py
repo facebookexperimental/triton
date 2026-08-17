@@ -408,13 +408,16 @@ def test_pinned_buffer_load_layout_survives_optimization_gfx950():
     assert amdgcn.count("v_permlane16_swap_b32") == 16
 
 
-def test_gqa_oversized_batches_rebase_buffer_offsets_gfx950():
+@pytest.mark.parametrize("causal", [False, True], ids=["full", "causal"])
+def test_gqa_oversized_batches_rebase_buffer_offsets_gfx950(causal):
     from triton.language.extra.tlx.tutorials.amd_fa_bwd import (
         _attn_bwd_dkdv_dq_d128_gqa_kernel, )
 
     # At N=16384 and D=128, 512 BF16 heads exactly fill the signed 32-bit
     # byte-offset range; 520 exercises the per-tile 64-bit pointer rebasing
     # path without allocating multi-gigabyte test tensors.
+    block_m = 16
+    block_n = 256
     compiled = compile_for_gfx950(
         _attn_bwd_dkdv_dq_d128_gqa_kernel,
         signature={
@@ -430,15 +433,32 @@ def test_gqa_oversized_batches_rebase_buffer_offsets_gfx950():
         },
         constexprs={
             "SM_SCALE": 0.125,
+            "IS_CAUSAL": causal,
             "HQ": 520,
             "HK": 520,
             "N": 16384,
             "D": 128,
-            "BLOCK_M": 16,
-            "BLOCK_N": 256,
+            "BLOCK_M": block_m,
+            "BLOCK_N": block_n,
         },
     )
 
+    ttir = compiled.asm["ttir"]
+    ttgir = compiled.asm["ttgir"]
+    dummy_clamps = re.findall(r"arith\.maxsi %dq_step, (?P<floor>%[\w_]+)", ttir)
+    assert len(dummy_clamps) == 1
+    if causal:
+        assert dummy_clamps[0] != "%c0_i32"
+        first_active_stride = block_n // block_m
+        assert re.search(
+            rf"^\s*{re.escape(dummy_clamps[0])} = arith\.muli "
+            rf"%pid_n(?:_\d+)?, %c{first_active_stride}_i32",
+            ttir,
+            re.MULTILINE,
+        )
+    else:
+        assert dummy_clamps[0] == "%c0_i32"
+    assert ttgir.count("tlx.rematerialize_coordinates_group = 21 : i32") == (9 if causal else 0)
     assert "amdgcn" in compiled.asm
 
 

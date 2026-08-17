@@ -1,7 +1,7 @@
 """BF16 Flash-Attention backward kernel families for AMD gfx950.
 
 The public ``fa_backward`` wrapper supports the two validated equal-head
-configurations in ``SUPPORTED_SHAPES`` and the non-causal HipKittens GQA
+configurations in ``SUPPORTED_SHAPES`` and the causal/non-causal HipKittens GQA
 contract: positive B/Hq/Hkv, Hkv dividing Hq, N a positive multiple of 256,
 and D=128. ``GQA_BENCHMARK_SHAPES`` records the published performance series;
 it is not an allow-list. Other configurations are not part of this
@@ -125,7 +125,7 @@ def make_reference_case(shape, causal, seed=0):
     return ReferenceCase(q, k, v, o, do, lse, sm_scale, causal, (dq, dk, dv))
 
 
-def _make_gqa_smoke_case(shape=(1, 8, 1, 512, 128), seed=0):
+def _make_gqa_smoke_case(shape=(1, 8, 1, 512, 128), causal=False, seed=0, sm_scale=None):
     """Build a small supported GQA reference case."""
     assert _is_supported_gqa_shape(shape)
     batch, hq, hk, n_ctx, head_dim = shape
@@ -160,7 +160,11 @@ def _make_gqa_smoke_case(shape=(1, 8, 1, 512, 128), seed=0):
     dq = torch.empty_like(q, dtype=torch.float32)
     dk = torch.zeros_like(k, dtype=torch.float32)
     dv = torch.zeros_like(v, dtype=torch.float32)
-    sm_scale = head_dim**-0.5
+    if sm_scale is None:
+        sm_scale = head_dim**-0.5
+    causal_mask = None
+    if causal:
+        causal_mask = torch.ones((n_ctx, n_ctx), device="cuda", dtype=torch.bool).triu(1)
     group_size = hq // hk
 
     for batch_idx in range(batch):
@@ -170,6 +174,8 @@ def _make_gqa_smoke_case(shape=(1, 8, 1, 512, 128), seed=0):
             k_ref = k[batch_idx, kv_head].float().requires_grad_(True)
             v_ref = v[batch_idx, kv_head].float().requires_grad_(True)
             scores = torch.matmul(q_ref, k_ref.transpose(0, 1)) * sm_scale
+            if causal_mask is not None:
+                scores = scores.masked_fill(causal_mask, float("-inf"))
             lse_ref = torch.logsumexp(scores, dim=-1)
             o_ref = torch.matmul(torch.softmax(scores, dim=-1), v_ref)
             grads = torch.autograd.grad(
@@ -184,17 +190,7 @@ def _make_gqa_smoke_case(shape=(1, 8, 1, 512, 128), seed=0):
                 dk[batch_idx, kv_head].add_(grads[1])
                 dv[batch_idx, kv_head].add_(grads[2])
 
-    return ReferenceCase(
-        q,
-        k,
-        v,
-        o,
-        do,
-        lse,
-        sm_scale,
-        False,
-        (dq, dk, dv),
-    )
+    return ReferenceCase(q, k, v, o, do, lse, sm_scale, causal, (dq, dk, dv))
 
 
 @triton.jit
@@ -1067,25 +1063,30 @@ def _attn_bwd_gqa_issue_qdo_async(
     LSE,
     Delta,
     off_h_kv,
+    pid_n,
     step,
     HQ: tl.constexpr,
     HK: tl.constexpr,
     N: tl.constexpr,
     D: tl.constexpr,
     BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
     OUTER_M: tl.constexpr,
     ASYNC_LAYOUT: tl.constexpr,
     STATS_ASYNC_LAYOUT: tl.constexpr,
     Q_BATCH_FITS_BUFFER: tl.constexpr,
+    IS_CAUSAL: tl.constexpr,
 ):
-    """Issue one valid 64-row Q/dO/stats tile as two async groups."""
+    """Map a compact step to one absolute Q/dO/stats tile and issue it."""
     buffer_base_alignment_bytes: tl.constexpr = 16
     group_size: tl.constexpr = HQ // HK
     n_outer_blocks: tl.constexpr = N // OUTER_M
-    total_outer_steps: tl.constexpr = group_size * n_outer_blocks
+    first_outer_block = pid_n * (BLOCK_N // OUTER_M) if IS_CAUSAL else 0
+    active_outer_blocks = n_outer_blocks - first_outer_block
+    total_outer_steps = group_size * active_outer_blocks
     refill_step = step % total_outer_steps
-    group_idx = refill_step // n_outer_blocks
-    outer_block = refill_step % n_outer_blocks
+    group_idx = refill_step // active_outer_blocks
+    outer_block = first_outer_block + refill_step % active_outer_blocks
     off_h_q = off_h_kv * group_size + group_idx
 
     outer_slice = tl.arange(0, OUTER_M // BLOCK_M)
@@ -1250,9 +1251,13 @@ def _attn_bwd_gqa_front(
     ds_stage,
     lse_values,
     delta_values,
+    pid_n,
+    step,
     SM_SCALE: tl.constexpr,
+    N: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    IS_CAUSAL: tl.constexpr,
     MMA_NM: tl.constexpr,
     MMA_ND: tl.constexpr,
     K_NM_LAYOUT: tl.constexpr,
@@ -1260,7 +1265,7 @@ def _attn_bwd_gqa_front(
     P_ND_LAYOUT: tl.constexpr,
     Q_OUT_LAYOUT: tl.constexpr,
 ):
-    """Compute score, dP, dS and dV, publishing current dS to LDS."""
+    """Apply the optional causal scaled-score mask, then publish current dS to LDS."""
     dv = tlx.require_layout(dv, MMA_ND, pin=False)
     v_operand = tlx.require_layout(v_operand, K_NM_LAYOUT, pin=False)
     k_nm = tlx.local_load(
@@ -1279,6 +1284,47 @@ def _attn_bwd_gqa_front(
         tlx.zeros((BLOCK_N, BLOCK_M), tl.float32, layout=MMA_NM),
     )
     scores = tlx.amd_register_resident(scores, register_class="vgpr", registers_per_group=16)
+    if IS_CAUSAL:
+        # Mask after scaling so custom zero or negative scales cannot turn an
+        # invalid raw-score sentinel into a NaN or a finite probability.
+        lse_log2 = tl.inline_asm_elementwise(
+            "v_mul_f32_e32 $0, 0x3fb8aa3b, $1;",
+            "=v,v",
+            [lse_values],
+            dtype=tl.float32,
+            is_pure=True,
+            pack=1,
+        )
+        lse_full = tlx.require_layout(
+            tl.broadcast_to(lse_log2[None, :], (BLOCK_N, BLOCK_M)),
+            MMA_NM,
+            pin=False,
+        )
+        scale_full = tlx.require_layout(
+            tl.full(
+                (BLOCK_N, BLOCK_M),
+                SM_SCALE * 1.4426950408889634,
+                tl.float32,
+            ),
+            MMA_NM,
+            pin=False,
+        )
+        scaled_scores = scores * scale_full - lse_full
+        n_m_blocks: tl.constexpr = N // BLOCK_M
+        m_block = step % n_m_blocks
+        query_fragment = m_block - pid_n * (BLOCK_N // BLOCK_M)
+        if query_fragment < BLOCK_N // BLOCK_M:
+            offs_n = pid_n * BLOCK_N + tlx.rematerialized_range(0, BLOCK_N, 32, placement=step)
+            offs_m = m_block * BLOCK_M + tlx.rematerialized_range(0, BLOCK_M, 33, placement=step)
+            valid = offs_n[:, None] <= offs_m[None, :]
+            valid = tlx.require_layout(valid, MMA_NM, pin=False)
+            neg_inf = tlx.require_layout(
+                tl.full((BLOCK_N, BLOCK_M), float("-inf"), dtype=tl.float32),
+                MMA_NM,
+                pin=False,
+            )
+            scaled_scores = tl.where(valid, scaled_scores, neg_inf)
+            scaled_scores = tlx.require_layout(scaled_scores, MMA_NM, pin=False)
     do_t = tlx.local_load(
         tlx.local_trans(do_slice),
         layout=QT_LAYOUT,
@@ -1294,34 +1340,36 @@ def _attn_bwd_gqa_front(
     q_out = tlx.local_load(q_slice, layout=Q_OUT_LAYOUT, relaxed=True)
     q_out = tlx.amd_register_resident(q_out, register_class="vgpr", registers_per_group=4)
     do_out = tlx.local_load(do_slice, layout=Q_OUT_LAYOUT, relaxed=True)
-    # Keep LSE scaling on an independent scalar VALU chain.  Broadcasting the
-    # multiply lets LLVM pair an LSE lane with a score fragment in a packed
-    # multiply and creates a false cross-fragment dependency.
-    lse_log2 = tl.inline_asm_elementwise(
-        "v_mul_f32_e32 $0, 0x3fb8aa3b, $1;",
-        "=v,v",
-        [lse_values],
-        dtype=tl.float32,
-        is_pure=True,
-        pack=1,
-    )
-    # These are soft requirements. Layout propagation does not yet infer the
-    # score MFMA layout for broadcast/full operands from elementwise users.
-    lse_full = tlx.require_layout(
-        tl.broadcast_to(lse_log2[None, :], (BLOCK_N, BLOCK_M)),
-        MMA_NM,
-        pin=False,
-    )
-    scale_full = tlx.require_layout(
-        tl.full(
-            (BLOCK_N, BLOCK_M),
-            SM_SCALE * 1.4426950408889634,
-            tl.float32,
-        ),
-        MMA_NM,
-        pin=False,
-    )
-    p = tl.math.exp2(scores * scale_full - lse_full)
+    if not IS_CAUSAL:
+        # Keep LSE scaling on an independent scalar VALU chain.  Broadcasting
+        # the multiply lets LLVM pair an LSE lane with a score fragment in a
+        # packed multiply and creates a false cross-fragment dependency.
+        lse_log2 = tl.inline_asm_elementwise(
+            "v_mul_f32_e32 $0, 0x3fb8aa3b, $1;",
+            "=v,v",
+            [lse_values],
+            dtype=tl.float32,
+            is_pure=True,
+            pack=1,
+        )
+        # These are soft requirements. Layout propagation does not yet infer
+        # the score MFMA layout for broadcast/full operands from elementwise users.
+        lse_full = tlx.require_layout(
+            tl.broadcast_to(lse_log2[None, :], (BLOCK_N, BLOCK_M)),
+            MMA_NM,
+            pin=False,
+        )
+        scale_full = tlx.require_layout(
+            tl.full(
+                (BLOCK_N, BLOCK_M),
+                SM_SCALE * 1.4426950408889634,
+                tl.float32,
+            ),
+            MMA_NM,
+            pin=False,
+        )
+        scaled_scores = scores * scale_full - lse_full
+    p = tl.math.exp2(scaled_scores)
     delta_full = tlx.require_layout(
         tl.broadcast_to(delta_values[None, :], (BLOCK_N, BLOCK_M)),
         MMA_NM,
@@ -1433,6 +1481,7 @@ def _attn_bwd_gqa_dq_prefetched(
     DS_MD_LAYOUT: tl.constexpr,
     K_MD_LAYOUT: tl.constexpr,
     V_LAYOUT: tl.constexpr,
+    COORDINATE_GROUP: tl.constexpr = None,
 ):
     """Reduce eight K=32 bands into two independent native dQ chains."""
     ds0 = tlx.require_layout(ds0, DS_MD_LAYOUT, pin=False)
@@ -1448,11 +1497,13 @@ def _attn_bwd_gqa_dq_prefetched(
         tlx.local_slice(prev_ds, [0, 64], [16, 32]),
         layout=DS_MD_LAYOUT,
         relaxed=True,
+        rematerialize_coordinates_group=COORDINATE_GROUP,
     )
     k7 = tlx.local_load(
         tlx.local_slice(k_buffer, [224, 0], [32, 128]),
         layout=K_MD_LAYOUT,
         relaxed=True,
+        rematerialize_coordinates_group=COORDINATE_GROUP,
     )
     k00 = tlx.extract_slice(k_resident_lo, [32, 64], [0, 0])
     k01 = tlx.extract_slice(k_resident_lo, [32, 64], [0, 64])
@@ -1479,6 +1530,7 @@ def _attn_bwd_gqa_dq_prefetched(
         tlx.local_slice(prev_ds, [0, 96], [16, 32]),
         layout=DS_MD_LAYOUT,
         relaxed=True,
+        rematerialize_coordinates_group=COORDINATE_GROUP,
     )
     dq0 = tlx.amd_scheduled_mfma(ds1, k10, dq0, resident_operand=1, accumulator_role="transient")
     dq1 = tlx.amd_scheduled_mfma(ds1, k11, dq1, resident_operand=1, accumulator_role="transient")
@@ -1491,6 +1543,7 @@ def _attn_bwd_gqa_dq_prefetched(
         tlx.local_slice(prev_ds, [0, 128], [16, 32]),
         layout=DS_MD_LAYOUT,
         relaxed=True,
+        rematerialize_coordinates_group=COORDINATE_GROUP,
     )
     k30 = tlx.extract_slice(k_resident_lo, [32, 64], [96, 0])
     k31 = tlx.extract_slice(k_resident_lo, [32, 64], [96, 64])
@@ -1501,6 +1554,7 @@ def _attn_bwd_gqa_dq_prefetched(
         tlx.local_slice(prev_ds, [0, 160], [16, 32]),
         layout=DS_MD_LAYOUT,
         relaxed=True,
+        rematerialize_coordinates_group=COORDINATE_GROUP,
     )
     k40 = tlx.extract_slice(k_resident_mid, [32, 64], [0, 0])
     k41 = tlx.extract_slice(k_resident_mid, [32, 64], [0, 64])
@@ -1511,6 +1565,7 @@ def _attn_bwd_gqa_dq_prefetched(
         tlx.local_slice(prev_ds, [0, 192], [16, 32]),
         layout=DS_MD_LAYOUT,
         relaxed=True,
+        rematerialize_coordinates_group=COORDINATE_GROUP,
     )
     k50 = tlx.extract_slice(k_resident_mid, [32, 64], [32, 0])
     k51 = tlx.extract_slice(k_resident_mid, [32, 64], [32, 64])
@@ -1521,6 +1576,7 @@ def _attn_bwd_gqa_dq_prefetched(
         tlx.local_slice(prev_ds, [0, 224], [16, 32]),
         layout=DS_MD_LAYOUT,
         relaxed=True,
+        rematerialize_coordinates_group=COORDINATE_GROUP,
     )
     k60 = tlx.extract_slice(k_resident_band6, [32, 64], [0, 0])
     k61 = tlx.extract_slice(k_resident_band6, [32, 64], [0, 64])
@@ -1550,17 +1606,20 @@ def _attn_bwd_gqa_dq(
     DS_MD_LAYOUT: tl.constexpr,
     K_MD_LAYOUT: tl.constexpr,
     V_LAYOUT: tl.constexpr,
+    COORDINATE_GROUP: tl.constexpr = None,
 ):
     """Drain entry when no dK work is available to hide the first dS reads."""
     ds0 = tlx.local_load(
         tlx.local_slice(prev_ds, [0, 0], [16, 32]),
         layout=DS_MD_LAYOUT,
         relaxed=True,
+        rematerialize_coordinates_group=COORDINATE_GROUP,
     )
     ds1 = tlx.local_load(
         tlx.local_slice(prev_ds, [0, 32], [16, 32]),
         layout=DS_MD_LAYOUT,
         relaxed=True,
+        rematerialize_coordinates_group=COORDINATE_GROUP,
     )
     return _attn_bwd_gqa_dq_prefetched(
         prev_ds,
@@ -1575,6 +1634,7 @@ def _attn_bwd_gqa_dq(
         DS_MD_LAYOUT,
         K_MD_LAYOUT,
         V_LAYOUT,
+        COORDINATE_GROUP,
     )
 
 
@@ -1706,6 +1766,7 @@ def _attn_bwd_gqa_phase(
     dv,
     DQ_ACC,
     off_h_kv,
+    pid_n,
     outer_step,
     phase,
     SM_SCALE: tl.constexpr,
@@ -1715,6 +1776,7 @@ def _attn_bwd_gqa_phase(
     D: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    IS_CAUSAL: tl.constexpr,
     MMA_NM: tl.constexpr,
     MMA_ND: tl.constexpr,
     MMA_MD: tl.constexpr,
@@ -1728,7 +1790,7 @@ def _attn_bwd_gqa_phase(
     REDIRECT_DUMMY_DQ: tl.constexpr,
     Q_BATCH_FITS_BUFFER: tl.constexpr,
 ):
-    """Run one front/dV phase and either direct dK or the lagged bridge.
+    """Run one absolute outer-step phase with direct dK or the lagged bridge.
 
     ``REDIRECT_DUMMY_DQ`` is used only by MHA phase 0, whose seeded zero dS
     produces a harmless dQ before any real previous phase exists.
@@ -1765,9 +1827,13 @@ def _attn_bwd_gqa_phase(
         tlx.local_view(ds_buffers, cur_stage),
         lse_values,
         delta_values,
+        pid_n,
+        step,
         SM_SCALE,
+        N,
         BLOCK_M,
         BLOCK_N,
+        IS_CAUSAL,
         MMA_NM,
         MMA_ND,
         K_NM_LAYOUT,
@@ -1811,7 +1877,12 @@ def _attn_bwd_gqa_phase(
             K_NM_LAYOUT,
         )
         if REDIRECT_DUMMY_DQ:
-            dq_step = tl.maximum(step - 1, 0)
+            # Full attention starts at step zero.  Causal workgroups after KV
+            # tile zero start later, so keep the seeded dummy atomic inside
+            # this workgroup's first active query tile instead of touching the
+            # preceding (wholly masked) tile.
+            first_active_dq_step = pid_n * (BLOCK_N // BLOCK_M) if IS_CAUSAL else 0
+            dq_step = tl.maximum(step - 1, first_active_dq_step)
         else:
             dq_step = step - 1
         _attn_bwd_gqa_store_dq_native(
@@ -1847,6 +1918,7 @@ def _attn_bwd_dkdv_dq_d128_gqa_kernel(
     DK,
     DV,
     SM_SCALE: tl.constexpr,
+    IS_CAUSAL: tl.constexpr,
     HQ: tl.constexpr,
     HK: tl.constexpr,
     N: tl.constexpr,
@@ -1854,7 +1926,7 @@ def _attn_bwd_dkdv_dq_d128_gqa_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
-    """Four-wave outer64 GQA backward bridge."""
+    """Four-wave outer64 causal/full GQA backward bridge."""
     tl.static_assert(D == 128)
     tl.static_assert(BLOCK_M == 16)
     tl.static_assert(BLOCK_N == 256)
@@ -2148,16 +2220,19 @@ def _attn_bwd_dkdv_dq_d128_gqa_kernel(
         LSE,
         Delta,
         off_h_kv,
+        pid_n,
         0,
         HQ,
         HK,
         N,
         D,
         BLOCK_M,
+        BLOCK_N,
         OUTER_M,
         qdo_async_layout,
         stats_async_layout,
         q_batch_fits_buffer,
+        IS_CAUSAL,
     )
     _attn_bwd_gqa_issue_qdo_async(
         tlx.local_view(q_buffers, 1),
@@ -2169,16 +2244,19 @@ def _attn_bwd_dkdv_dq_d128_gqa_kernel(
         LSE,
         Delta,
         off_h_kv,
+        pid_n,
         1,
         HQ,
         HK,
         N,
         D,
         BLOCK_M,
+        BLOCK_N,
         OUTER_M,
         qdo_async_layout,
         stats_async_layout,
         q_batch_fits_buffer,
+        IS_CAUSAL,
     )
     initial_wait = tlx.async_load_wait_group(2)
     tl.debug_barrier()
@@ -2210,7 +2288,10 @@ def _attn_bwd_dkdv_dq_d128_gqa_kernel(
     )
     dk = tlx.zeros((BLOCK_N, D), tl.float32, layout=mma_nd)
     dv = tlx.zeros((BLOCK_N, D), tl.float32, layout=mma_nd)
-    total_outer_steps: tl.constexpr = (HQ // HK) * (N // OUTER_M)
+    n_outer_blocks: tl.constexpr = N // OUTER_M
+    first_outer_block = pid_n * (BLOCK_N // OUTER_M) if IS_CAUSAL else 0
+    active_outer_blocks = n_outer_blocks - first_outer_block
+    total_outer_steps = (HQ // HK) * active_outer_blocks
     continuous_bridge: tl.constexpr = HQ == HK
     if continuous_bridge:
         # Seed delayed dQ so MHA phase 0 can use the steady bridge.  The dummy
@@ -2225,6 +2306,9 @@ def _attn_bwd_dkdv_dq_d128_gqa_kernel(
     # retain the per-group prologue/drain, which better overlaps Q/dO refill.
     for outer_step in tl.range(0, total_outer_steps, loop_unroll_factor=1):
         outer_stage = outer_step % 2
+        group_idx = outer_step // active_outer_blocks
+        outer_block = first_outer_block + outer_step % active_outer_blocks
+        global_outer_step = group_idx * n_outer_blocks + outer_block
         q_outer = tlx.local_view(q_buffers, outer_stage)
         do_outer = tlx.local_view(do_buffers, outer_stage)
         lse_outer = tlx.local_view(lse_buffers, outer_stage)
@@ -2271,7 +2355,8 @@ def _attn_bwd_dkdv_dq_d128_gqa_kernel(
             dv,
             DQ_ACC,
             off_h_kv,
-            outer_step,
+            pid_n,
+            global_outer_step,
             phase0,
             SM_SCALE,
             HQ,
@@ -2280,6 +2365,7 @@ def _attn_bwd_dkdv_dq_d128_gqa_kernel(
             D,
             BLOCK_M,
             BLOCK_N,
+            IS_CAUSAL,
             mma_nm,
             mma_nd,
             mma_md,
@@ -2310,7 +2396,8 @@ def _attn_bwd_dkdv_dq_d128_gqa_kernel(
                 dv,
                 DQ_ACC,
                 off_h_kv,
-                outer_step,
+                pid_n,
+                global_outer_step,
                 phase,
                 SM_SCALE,
                 HQ,
@@ -2319,6 +2406,7 @@ def _attn_bwd_dkdv_dq_d128_gqa_kernel(
                 D,
                 BLOCK_M,
                 BLOCK_N,
+                IS_CAUSAL,
                 mma_nm,
                 mma_nd,
                 mma_md,
@@ -2343,16 +2431,19 @@ def _attn_bwd_dkdv_dq_d128_gqa_kernel(
             LSE,
             Delta,
             off_h_kv,
+            pid_n,
             outer_step + 2,
             HQ,
             HK,
             N,
             D,
             BLOCK_M,
+            BLOCK_N,
             OUTER_M,
             qdo_async_layout,
             stats_async_layout,
             q_batch_fits_buffer,
+            IS_CAUSAL,
         )
         if not continuous_bridge:
             # Grouped-query reuse makes this drain useful work while the next
@@ -2373,7 +2464,7 @@ def _attn_bwd_dkdv_dq_d128_gqa_kernel(
                 dq,
                 DQ_ACC,
                 off_h_kv,
-                outer_step * 4 + 3,
+                global_outer_step * 4 + 3,
                 SM_SCALE,
                 HQ,
                 HK,
@@ -2388,6 +2479,8 @@ def _attn_bwd_dkdv_dq_d128_gqa_kernel(
 
     if continuous_bridge:
         # Only the last MHA dS has no following dK with which to braid dQ.
+        # Re-anchor this standalone drain after the causal outer loop; 21 is
+        # only a local equivalence tag shared by its LDS loads.
         dq, v_operand = _attn_bwd_gqa_dq(
             tlx.local_view(ds_buffers, 1),
             k_buffer,
@@ -2399,12 +2492,13 @@ def _attn_bwd_dkdv_dq_d128_gqa_kernel(
             ds_md_layout,
             k_md_layout,
             k_nm_layout,
+            21 if IS_CAUSAL else None,
         )
         _attn_bwd_gqa_store_dq_native(
             dq,
             DQ_ACC,
             off_h_kv,
-            total_outer_steps * 4 - 1,
+            N // BLOCK_M - 1,
             SM_SCALE,
             HQ,
             HK,
@@ -3791,6 +3885,7 @@ def _run_bwd_d128_gqa(
     dk,
     dv,
     sm_scale,
+    causal,
 ):
     batch, hq, n_ctx, head_dim = q.shape
     hk = k.shape[1]
@@ -3806,6 +3901,7 @@ def _run_bwd_d128_gqa(
         dk,
         dv,
         SM_SCALE=sm_scale,
+        IS_CAUSAL=causal,
         HQ=hq,
         HK=hk,
         N=n_ctx,
@@ -4578,8 +4674,6 @@ def fa_backward(q, k, v, o, do, lse, sm_scale, causal):
         q.shape[3],
     )
     if _is_supported_gqa_shape(gqa_signature):
-        if causal:
-            raise ValueError("the GQA TLX specialization is non-causal")
         dq_acc = torch.zeros_like(q)
         dq = torch.empty_like(q)
         dk = torch.empty_like(k)
@@ -4598,6 +4692,7 @@ def fa_backward(q, k, v, o, do, lse, sm_scale, causal):
             dk,
             dv,
             sm_scale,
+            causal,
         )
         return dq, dk, dv
     if q.shape[-1] == 128:
@@ -4746,6 +4841,7 @@ def test_gqa_unsupported_shape_constraint(shape):
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+@pytest.mark.parametrize("causal", [False, True], ids=["full", "causal"])
 @pytest.mark.parametrize(
     "shape",
     [
@@ -4755,23 +4851,114 @@ def test_gqa_unsupported_shape_constraint(shape):
         pytest.param((2, 3, 1, 256, 128), id="group3-batch2"),
         pytest.param((1, 4, 1, 256, 128), id="group4"),
         pytest.param((1, 8, 1, 512, 128), id="group8-two-kv-tiles"),
+        pytest.param((2, 2, 2, 512, 128), id="mha-hkv2-batch2"),
+        pytest.param((1, 4, 2, 256, 128), id="group2-hkv2"),
+        pytest.param((2, 6, 3, 512, 128), id="group2-hkv3-batch2"),
     ],
 )
-def test_gqa_supported_shapes_end_to_end_gfx950(shape):
-    case = _make_gqa_smoke_case(shape, seed=17)
+def test_gqa_supported_shapes_end_to_end_gfx950(shape, causal):
+    case = _make_gqa_smoke_case(shape, causal=causal, seed=17)
     actual_grads = fa_backward(*case.kernel_args)
+    assert len(actual_grads) == len(case.grads) == 3
     for actual, expected in zip(actual_grads, case.grads):
         assert torch.isfinite(actual).all()
         assert _snr_db(actual, expected) >= 40.0
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
-def test_gqa_rejects_causal_gfx950():
-    q = torch.empty((1, 2, 256, 128), device="cuda", dtype=torch.bfloat16)
-    k = torch.empty((1, 1, 256, 128), device="cuda", dtype=torch.bfloat16)
-    lse = torch.empty(q.shape[:-1], device="cuda", dtype=torch.float32)
-    with pytest.raises(ValueError, match="non-causal"):
-        fa_backward(q, k, k, q, q, lse, 0.5, True)
+def test_gqa_causal_zero_scale_gfx950():
+    case = _make_gqa_smoke_case((1, 2, 1, 256, 128), causal=True, seed=17, sm_scale=0.0)
+    actual_grads = fa_backward(*case.kernel_args)
+    assert len(actual_grads) == len(case.grads) == 3
+    for actual, expected in zip(actual_grads, case.grads):
+        assert torch.isfinite(actual).all()
+        if torch.count_nonzero(expected).item() == 0:
+            assert torch.count_nonzero(actual).item() == 0
+        else:
+            assert _snr_db(actual, expected) >= 40.0
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_gqa_causal_negative_scale_gfx950():
+    case = _make_gqa_smoke_case((1, 2, 1, 256, 128), causal=True, seed=17, sm_scale=-0.125)
+    actual_grads = fa_backward(*case.kernel_args)
+    assert len(actual_grads) == len(case.grads) == 3
+    for actual, expected in zip(actual_grads, case.grads):
+        assert torch.isfinite(actual).all()
+        assert _snr_db(actual, expected) >= 40.0
+
+
+@pytest.mark.parametrize("causal", [False, True], ids=["full", "causal"])
+@pytest.mark.parametrize(
+    ("q_shape", "k_shape"),
+    [
+        pytest.param((1, 6, 256, 128), (1, 4, 256, 128), id="nondivisible-heads"),
+        pytest.param((1, 8, 384, 128), (1, 1, 384, 128), id="nonmultiple-sequence"),
+    ],
+)
+def test_fa_backward_rejects_unsupported_gqa_signature(q_shape, k_shape, causal):
+    q = torch.empty(q_shape, device="cuda", dtype=torch.bfloat16)
+    k = torch.empty(k_shape, device="cuda", dtype=torch.bfloat16)
+    lse = torch.empty(q_shape[:-1], device="cuda", dtype=torch.float32)
+    with pytest.raises(ValueError, match="supported GQA shapes"):
+        fa_backward(q, k, k, q, q, lse, 0.5, causal)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+@pytest.mark.parametrize("causal", [False, True], ids=["full", "causal"])
+@pytest.mark.parametrize(
+    "shape",
+    [
+        pytest.param((1, 1, 1, 256, 128), id="group1"),
+        pytest.param((1, 1, 1, 512, 128), id="group1-two-kv-tiles"),
+        pytest.param((1, 64, 8, 4096, 128), id="group8"),
+    ],
+)
+def test_gqa_main_kernel_is_spill_free_gfx950(shape, causal, monkeypatch):
+    batch, hq, hk, n_ctx, head_dim = shape
+    q = torch.zeros((batch, hq, n_ctx, head_dim), device="cuda", dtype=torch.bfloat16)
+    k = torch.zeros((batch, hk, n_ctx, head_dim), device="cuda", dtype=torch.bfloat16)
+    lse = torch.zeros((batch, hq, n_ctx), device="cuda", dtype=torch.float32)
+    delta = torch.zeros_like(lse)
+    dq_acc = torch.zeros_like(q)
+    dq = torch.empty_like(q)
+    dk = torch.empty_like(k)
+    dv = torch.empty_like(k)
+
+    monkeypatch.delenv(_D128_REVERSE_LOCAL_ENV, raising=False)
+    monkeypatch.delenv(_D128_SINK_INSTS_ENV, raising=False)
+    monkeypatch.delenv(_D128_REGCLASS_PRIORITY_ENV, raising=False)
+    _attn_bwd_dkdv_dq_d128_gqa_kernel.device_caches.clear()
+    _run_bwd_d128_gqa(
+        q,
+        k,
+        k,
+        q,
+        lse,
+        delta,
+        dq_acc,
+        dq,
+        dk,
+        dv,
+        head_dim**-0.5,
+        causal,
+    )
+    device = torch.cuda.current_device()
+    compiled = tuple(_attn_bwd_dkdv_dq_d128_gqa_kernel.device_caches[device][0].values())
+    assert len(compiled) == 1
+    assert compiled[0].n_spills == 0
+    ttir = compiled[0].asm["ttir"]
+    amdgcn = compiled[0].asm["amdgcn"]
+    assert "scratch_load" not in amdgcn
+    assert "scratch_store" not in amdgcn
+    expected_mask_regions = 2 if causal else 0
+    assert ttir.count("amdg.rematerialized_range 0 to 256 identity 32") == expected_mask_regions
+    assert ttir.count("amdg.rematerialized_range 0 to 16 identity 33") == expected_mask_regions
+    if causal:
+        llir = compiled[0].asm["llir"]
+        for mask in ("0x1fff01ff", "0x3fff03ff", "0x7fff07ff", "0xffff0fff"):
+            assert mask not in amdgcn
+        assert "~{vcc},~{scc}" not in llir
 
 
 def test_d256_dispatch_uses_one_configured_producer_entry(monkeypatch):
