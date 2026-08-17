@@ -80,7 +80,6 @@ from .mma_ops import (
     async_dot_scaled,
     async_dot_wait,
     cast_preserve_layout,
-    dot,
     dot_scaled,
     extract_slice,
     release_layout,
@@ -251,7 +250,6 @@ __all__ = [
     "named_barrier_arrive",
     "amd_sched_barrier",
     # mma_ops
-    "dot",
     "dot_scaled",
     "release_layout",
     "cast_preserve_layout",

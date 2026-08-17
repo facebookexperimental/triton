@@ -13,7 +13,6 @@ import subprocess
 import sys
 import tempfile
 
-
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parents[2]
 DEFAULT_COMPILE_WORKERS = max(1, min(8, os.cpu_count() or 1))
@@ -65,9 +64,7 @@ def positive_int(text):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Run all TLX LLVM-versus-Wave performance sweeps sequentially.",
-    )
+    parser = argparse.ArgumentParser(description="Run all TLX LLVM-versus-Wave performance sweeps sequentially.", )
     parser.add_argument(
         "--sweeps",
         nargs="+",
@@ -166,11 +163,6 @@ def parse_args():
         type=Path,
         help="cache and log root; defaults to a fresh timestamped directory under the system temp directory",
     )
-    parser.add_argument(
-        "--wave-split-barriers",
-        action="store_true",
-        help="enable split barriers for Wave runs only",
-    )
     parser.add_argument("--wave-opt", type=Path, help="wave-opt binary to use for all Wave compilations")
     parser.add_argument("--fail-fast", action="store_true", help="stop after the first failed sweep")
     parser.add_argument("--dry-run", action="store_true", help="print commands without running them")
@@ -215,8 +207,6 @@ def build_run_specs(args, cache_root):
             "--cache-dir",
             str(cache_dir),
         )
-        if args.wave_split_barriers:
-            command += ("--wave-split-barriers", )
         specs.append(RunSpec("f16", "f16 v9: LLVM vs Wave", "both", command, cache_dir))
 
         # Keep the Wave-derived eight-wave kernel as a stable 8K baseline while
@@ -249,17 +239,13 @@ def build_run_specs(args, cache_root):
             "--cache-dir",
             str(cache_dir),
         )
-        if args.wave_split_barriers:
-            command += ("--wave-split-barriers", )
-        specs.append(
-            RunSpec(
-                "f16-v10",
-                "f16 v10 8192x8192x8192 baseline: LLVM vs Wave",
-                "both",
-                command,
-                cache_dir,
-            )
-        )
+        specs.append(RunSpec(
+            "f16-v10",
+            "f16 v10 8192x8192x8192 baseline: LLVM vs Wave",
+            "both",
+            command,
+            cache_dir,
+        ))
 
         # The four-wave variant is the specialized counterpart of the v10
         # eight-wave baseline.  Keep the shape, selected inputs, timing, and
@@ -292,8 +278,6 @@ def build_run_specs(args, cache_root):
             "--cache-dir",
             str(cache_dir),
         )
-        if args.wave_split_barriers:
-            command += ("--wave-split-barriers", )
         specs.append(
             RunSpec(
                 "f16-v11",
@@ -301,8 +285,7 @@ def build_run_specs(args, cache_root):
                 "both",
                 command,
                 cache_dir,
-            )
-        )
+            ))
 
         script = str(SCRIPT_DIR / "gfx9_gemm/inter_wave/a16w16/bench.py")
         for backend in ("llvm", "wave"):
@@ -325,8 +308,7 @@ def build_run_specs(args, cache_root):
                     backend,
                     command,
                     cache_dir,
-                )
-            )
+                ))
 
     if "mxfp" in args.sweeps:
         script = str(SCRIPT_DIR / "gfx9_gemm/intra_wave/a4w4/bench.py")
@@ -348,8 +330,6 @@ def build_run_specs(args, cache_root):
                 "--cache-dir",
                 str(cache_dir),
             )
-            if backend == "wave" and args.wave_split_barriers:
-                command += ("--wave-split-barriers", )
             specs.append(RunSpec(f"mxfp-{backend}", f"MXFP: {backend.upper()}", backend, command, cache_dir))
 
         script = str(SCRIPT_DIR / "gfx9_gemm/inter_wave/a4w4/bench.py")
@@ -377,8 +357,7 @@ def build_run_specs(args, cache_root):
                     backend,
                     command,
                     cache_dir,
-                )
-            )
+                ))
 
     if "glu" in args.sweeps:
         script = str(SCRIPT_DIR / "amd-addmm-glu-opt_test.py")
@@ -408,8 +387,7 @@ def build_run_specs(args, cache_root):
                         backend,
                         command,
                         cache_dir,
-                    )
-                )
+                    ))
 
     return specs
 
@@ -428,10 +406,8 @@ def child_environment(args, spec):
 
     if spec.backend == "wave":
         env["TRITON_DEFAULT_BACKEND"] = "tlx_wave"
-        env["TRITON_TLX_WAVE_ENABLE_SPLIT_BARRIERS"] = "1" if args.wave_split_barriers else "0"
     else:
         env.pop("TRITON_DEFAULT_BACKEND", None)
-        env.pop("TRITON_TLX_WAVE_ENABLE_SPLIT_BARRIERS", None)
     return env
 
 
@@ -441,7 +417,6 @@ def print_run(args, spec):
         settings.insert(0, f"ROCR_VISIBLE_DEVICES={shlex.quote(args.device)}")
     if spec.backend == "wave":
         settings.append("TRITON_DEFAULT_BACKEND=tlx_wave")
-        settings.append(f"TRITON_TLX_WAVE_ENABLE_SPLIT_BARRIERS={int(args.wave_split_barriers)}")
     print(f"\n{'=' * 80}\n{spec.label}\n{'=' * 80}", flush=True)
     print(" ".join((*settings, shlex.join(spec.command))), flush=True)
 
@@ -500,14 +475,11 @@ def main():
     specs = build_run_specs(args, cache_root)
     print(f"Cache/log root: {cache_root}")
     print(f"Compilation workers: {args.compile_workers}")
-    print(f"Wave split barriers: {'enabled' if args.wave_split_barriers else 'disabled'}")
     if "mxfp" in args.sweeps:
         if args.mxfp_timing_mode == "batched":
-            print(
-                f"MXFP timing: batched median, {args.mxfp_timing_repeats}x"
-                f"{args.mxfp_timed_launches} timed launches, "
-                f"{args.mxfp_warmup_launches} warmups/repeat"
-            )
+            print(f"MXFP timing: batched median, {args.mxfp_timing_repeats}x"
+                  f"{args.mxfp_timed_launches} timed launches, "
+                  f"{args.mxfp_warmup_launches} warmups/repeat")
         else:
             print(f"MXFP timing: triton median, {args.warmup}ms warmup/{args.rep}ms timed")
 

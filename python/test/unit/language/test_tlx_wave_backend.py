@@ -28,8 +28,6 @@ if "tlx_wave" in backends:
     from triton.backends.tlx_wave.converter import (
         barrier_order as converter_barrier_order, )
     from triton.backends.tlx_wave.converter import boundary as converter_boundary
-    from triton.backends.tlx_wave.converter import (
-        canonicalize as converter_canonicalize, )
     from triton.backends.tlx_wave.converter import diagnostics as converter_diagnostics
     from triton.backends.tlx_wave.converter import domains as converter_domains
     from triton.backends.tlx_wave.converter import emission as converter_emission
@@ -53,7 +51,6 @@ else:
     wave_bridge_tools = None
     converter_barrier_order = None
     converter_boundary = None
-    converter_canonicalize = None
     converter_diagnostics = None
     converter_domains = None
     converter_emission = None
@@ -147,35 +144,6 @@ def _identity_target_layout(layout_map_id=0, *, shape=(64, ), element_type="i32"
     )
 
 
-def _cross_wave_target_layouts():
-    source = converter_target_ir.TargetLinearLayout(
-        ("lane", "warp"),
-        (("dim0", 128), ),
-        (
-            ("lane", ((1, ), (2, ), (4, ), (8, ), (16, ), (32, ))),
-            ("warp", ((64, ), )),
-        ),
-    )
-    result = converter_target_ir.TargetLinearLayout(
-        ("lane", "warp"),
-        (("dim0", 128), ),
-        (
-            ("lane", ((1, ), (2, ), (4, ), (8, ), (16, ), (64, ))),
-            ("warp", ((32, ), )),
-        ),
-    )
-    return tuple(
-        converter_target_ir.TargetLayout(
-            layout_map_id,
-            "linear",
-            (128, ),
-            "f32",
-            1,
-            64,
-            linear_layout=linear,
-        ) for layout_map_id, linear in enumerate((source, result)))
-
-
 def _asm_text(compiled, artifact):
     text = compiled.asm[artifact]
     if isinstance(text, bytes):
@@ -193,27 +161,6 @@ def _tlx_wave_runtime_skip_reason(arch):
             f"got {arch or 'unknown'}; this is a runtime launch guard, not a "
             "Wave HSACO generation failure. Compile-only TLX Wave tests may target "
             "gfx942/gfx950 without matching local hardware.")
-
-
-def _with_target_op_attrs(target_program, target_op_id, **attrs):
-    updated_ops = []
-    found = False
-    for op in target_program.ops:
-        if op.target_op_id != target_op_id:
-            updated_ops.append(op)
-            continue
-        found = True
-        updated_attrs = converter_target_ir.attrs_dict(op)
-        updated_attrs.update(attrs)
-        updated_ops.append(replace(
-            op,
-            attrs=converter_target_ir._attrs_tuple(
-                updated_attrs,
-                op.target_op_id,
-            ),
-        ))
-    assert found, target_op_id
-    return replace(target_program, ops=tuple(updated_ops))
 
 
 def _target_value_producer(target_program, target_value_id, *, kind=None):
@@ -1301,7 +1248,6 @@ def test_tlx_perf_sweep_forwards_compile_workers_to_fa(tmp_path):
         rep=1,
         warmup=0,
         compile_workers=3,
-        wave_split_barriers=False,
     )
 
     specs = runner.build_run_specs(args, tmp_path)
@@ -1421,7 +1367,6 @@ def test_tlx_perf_sweep_forwards_f16_input_and_timing_options(tmp_path):
         f16_warmup_launches=11,
         f16_timed_launches=101,
         f16_timing_repeats=3,
-        wave_split_barriers=False,
     )
 
     v9_spec, v10_spec, v11_spec, inter_wave_llvm_spec, inter_wave_wave_spec = runner.build_run_specs(args, tmp_path)
@@ -1507,7 +1452,6 @@ def test_tlx_perf_sweep_forwards_mxfp_batched_timing_options(tmp_path):
         mxfp_warmup_launches=13,
         mxfp_timed_launches=103,
         mxfp_timing_repeats=5,
-        wave_split_barriers=False,
     )
 
     specs = runner.build_run_specs(args, tmp_path)
@@ -5166,161 +5110,6 @@ def test_tlx_wave_converter_preserves_async_wait_source_order():
     ]
 
 
-def test_tlx_wave_converter_orders_compiler_membar_between_dma_epochs():
-    builder = converter_target_ir.TargetBuilder()
-    token_type = converter_target_ir.TargetType("token", "token")
-    first_completion = builder.add_value(
-        token_type,
-        event_domain=converter_target_ir.EVENT_DOMAIN_DMA_COMPLETION,
-    )
-    second_completion = builder.add_value(
-        token_type,
-        event_domain=converter_target_ir.EVENT_DOMAIN_DMA_COMPLETION,
-    )
-    first_group = builder.add_value(
-        token_type,
-        event_domain=converter_target_ir.EVENT_DOMAIN_DMA_GROUP,
-    )
-    first_dma_id = builder.add_op(
-        "buffer_load_to_local",
-        results=(first_completion, ),
-        attrs={"mode": "symbolic_copy"},
-    )
-    first_commit_id = builder.add_op(
-        "async_commit_group",
-        operands=(first_completion, ),
-        results=(first_group, ),
-    )
-    barrier_id = builder.add_op(
-        "barrier",
-        attrs={
-            "address_space": 1,
-            "compiler_membar_barrier": True,
-            "dependency_count": 0,
-            "orders_memory_issue": True,
-        },
-    )
-    second_dma_id = builder.add_op(
-        "buffer_load_to_local",
-        results=(second_completion, ),
-        attrs={"mode": "symbolic_copy"},
-    )
-
-    target = converter_canonicalize.eliminate_redundant_compiler_membar_barriers(builder.build())
-    target = converter_barrier_order.thread_barrier_issue_order(target)
-
-    ordered_ops = [target.ops[op_id] for op_id in target.regions[0].op_ids]
-    assert [op.kind for op in ordered_ops] == [
-        "buffer_load_to_local",
-        "async_commit_group",
-        "issue_token",
-        "barrier",
-        "issue_token",
-        "buffer_load_to_local",
-    ]
-    first_dma = target.ops[first_dma_id]
-    assert target.ops[first_commit_id] == ordered_ops[1]
-    pre_issue = ordered_ops[2]
-    barrier = target.ops[barrier_id]
-    post_issue = ordered_ops[4]
-    second_dma = target.ops[second_dma_id]
-    assert pre_issue.operands == (first_dma.results[0], )
-    assert barrier.operands == pre_issue.results
-    assert post_issue.operands == barrier.results
-    assert second_dma.operands == post_issue.results
-    assert (target.values[barrier.results[0]].event_domain == converter_target_ir.EVENT_DOMAIN_MEMORY_BARRIER)
-
-
-def test_tlx_wave_converter_elides_compiler_membar_within_open_dma_group():
-    builder = converter_target_ir.TargetBuilder()
-    token_type = converter_target_ir.TargetType("token", "token")
-    completions = tuple(
-        builder.add_value(
-            token_type,
-            event_domain=converter_target_ir.EVENT_DOMAIN_DMA_COMPLETION,
-        ) for _ in range(2))
-    group = builder.add_value(
-        token_type,
-        event_domain=converter_target_ir.EVENT_DOMAIN_DMA_GROUP,
-    )
-    builder.add_op(
-        "buffer_load_to_local",
-        results=(completions[0], ),
-        attrs={"mode": "symbolic_copy"},
-    )
-    builder.add_op(
-        "barrier",
-        attrs={
-            "address_space": 1,
-            "compiler_membar_barrier": True,
-            "dependency_count": 0,
-            "orders_memory_issue": True,
-        },
-    )
-    builder.add_op(
-        "buffer_load_to_local",
-        results=(completions[1], ),
-        attrs={"mode": "symbolic_copy"},
-    )
-    builder.add_op(
-        "async_commit_group",
-        operands=completions,
-        results=(group, ),
-    )
-
-    target = converter_canonicalize.eliminate_redundant_compiler_membar_barriers(builder.build())
-
-    assert [target.ops[op_id].kind for op_id in target.regions[0].op_ids] == [
-        "buffer_load_to_local",
-        "buffer_load_to_local",
-        "async_commit_group",
-    ]
-
-
-def test_tlx_wave_converter_elides_compiler_membar_before_wait_ready_load():
-    builder = converter_target_ir.TargetBuilder()
-    token_type = converter_target_ir.TargetType("token", "token")
-    completion = builder.add_value(
-        token_type,
-        event_domain=converter_target_ir.EVENT_DOMAIN_DMA_COMPLETION,
-    )
-    group = builder.add_value(
-        token_type,
-        event_domain=converter_target_ir.EVENT_DOMAIN_DMA_GROUP,
-    )
-    builder.add_op(
-        "buffer_load_to_local",
-        results=(completion, ),
-        attrs={"mode": "symbolic_copy"},
-    )
-    builder.add_op(
-        "async_commit_group",
-        operands=(completion, ),
-        results=(group, ),
-    )
-    builder.add_op(
-        "barrier",
-        attrs={
-            "address_space": 1,
-            "compiler_membar_barrier": True,
-            "dependency_count": 0,
-            "orders_memory_issue": True,
-        },
-    )
-    builder.add_op(
-        "local_load",
-        attrs={"synced_via_async_wait": True},
-    )
-
-    target = converter_canonicalize.eliminate_redundant_compiler_membar_barriers(builder.build())
-
-    assert [target.ops[op_id].kind for op_id in target.regions[0].op_ids] == [
-        "buffer_load_to_local",
-        "async_commit_group",
-        "local_load",
-    ]
-
-
 def _target_async_wait_local_load_program(load_kind):
     builder = converter_target_ir.TargetBuilder()
     token_type = converter_target_ir.TargetType("token", "token")
@@ -7117,13 +6906,6 @@ def _ssa_value_is_used(line, value):
     ) is not None
 
 
-def _ssa_after_uses(line, value):
-    return re.search(
-        rf"\bafter\s+{re.escape(value)}(?![A-Za-z0-9_])",
-        line,
-    ) is not None
-
-
 def test_tlx_wave_converter_emission_does_not_infer_distinct_lds_dependencies():
     emitted = converter_emission.emit_wave_module(_build_two_lds_store_target())
     lines = emitted.text.splitlines()
@@ -7683,28 +7465,6 @@ def test_tlx_wave_backend_wave_stage_forwards_waves_per_eu(tmp_path):
     del ctx
 
 
-def test_tlx_wave_backend_wave_stage_emits_split_barrier_attr(tmp_path):
-    local_func = """
-  tt.func public @backend_wave_split_barriers() attributes {noinline = false} {
-    tt.return
-  }
-"""
-    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=8)
-    metadata = {}
-
-    wave_artifact = tlx_wave_compiler.TLXWaveBackend.make_wave(
-        mod,
-        metadata,
-        _tlx_wave_options(tlx_wave_enable_split_barriers=True),
-    )
-
-    assert "waveamdmachine.enable_split_barriers" in wave_artifact
-    assert "waveamdmachine.enable_multi_wave_specialization" not in wave_artifact
-    assert metadata["tlx_wave_enable_split_barriers"] is True
-    _run_wave_verify(wave_artifact)
-    del ctx
-
-
 def test_tlx_wave_backend_wave_stage_emits_multi_wave_specialization_attr(tmp_path):
     local_func = """
   tt.func public @backend_wave_multi_wave_specialization() attributes {noinline = false} {
@@ -7721,52 +7481,27 @@ def test_tlx_wave_backend_wave_stage_emits_multi_wave_specialization_attr(tmp_pa
     )
 
     assert "waveamdmachine.enable_multi_wave_specialization" in wave_artifact
-    assert "waveamdmachine.enable_split_barriers" not in wave_artifact
     assert metadata["tlx_wave_enable_multi_wave_specialize"] is True
     _run_wave_verify(wave_artifact)
     del ctx
 
 
-@pytest.mark.parametrize(
-    "source_attr,kernel_field,wave_attr,other_wave_attr",
-    [
-        (
-            "tlx_wave.enable_split_barriers",
-            "enable_split_barriers",
-            "waveamdmachine.enable_split_barriers",
-            "waveamdmachine.enable_multi_wave_specialization",
-        ),
-        (
-            "tlx_wave.enable_multi_wave_specialization",
-            "enable_multi_wave_specialization",
-            "waveamdmachine.enable_multi_wave_specialization",
-            "waveamdmachine.enable_split_barriers",
-        ),
-    ],
-)
-def test_tlx_wave_converter_carries_function_policy_attr(
-    tmp_path,
-    source_attr,
-    kernel_field,
-    wave_attr,
-    other_wave_attr,
-):
-    local_func = f"""
-  tt.func public @backend_wave_function_policy() attributes {{
+def test_tlx_wave_converter_carries_function_policy_attr(tmp_path):
+    local_func = """
+  tt.func public @backend_wave_function_policy() attributes {
     noinline = false,
-    {source_attr} = true
-  }} {{
+    tlx_wave.enable_multi_wave_specialization = true
+  } {
     tt.return
-  }}
+  }
 """
     mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=8)
 
     output = converter_pipeline.convert_ttgir_to_wave(mod)
 
-    assert getattr(output.source_program.kernel, kernel_field) is True
-    assert getattr(output.target_program.kernel, kernel_field) is True
-    assert wave_attr in output.emitted_module.text
-    assert other_wave_attr not in output.emitted_module.text
+    assert output.source_program.kernel.enable_multi_wave_specialization is True
+    assert output.target_program.kernel.enable_multi_wave_specialization is True
+    assert "waveamdmachine.enable_multi_wave_specialization" in output.emitted_module.text
     _run_wave_verify(output.emitted_module.text)
     del ctx
 
@@ -8116,7 +7851,7 @@ def test_tlx_gfx9_gemm_bench_enables_four_wave_specialization_only_for_wave():
     module = SimpleNamespace(wave_4wave_specialized=FakeKernel())
     a = torch.empty((256, 128), dtype=torch.float16)
     b = torch.empty((256, 128), dtype=torch.float16).T
-    args = SimpleNamespace(wave_split_barriers=False)
+    args = SimpleNamespace()
 
     bench.provider_matmul(args, "wave", module, "wave_4wave_specialized", a, b)
     bench.provider_matmul(args, "tlx", module, "wave_4wave_specialized", a, b)
@@ -9023,7 +8758,6 @@ def test_tlx_wave_fa_forwards_compiler_options(monkeypatch):
         out=output,
         warmup=True,
         waves_per_eu=2,
-        tlx_wave_enable_split_barriers=True,
         tlx_wave_enable_multi_wave_specialize=True,
         schedule_hint="none",
         llvm_fn_attrs=("amdgpu-waves-per-eu=2", ),
@@ -9034,7 +8768,6 @@ def test_tlx_wave_fa_forwards_compiler_options(monkeypatch):
     assert captured["grid"] == (1, 1, 1)
     assert captured["options"] == {
         "waves_per_eu": 2,
-        "tlx_wave_enable_split_barriers": True,
         "tlx_wave_enable_multi_wave_specialize": True,
         "schedule_hint": "none",
         "llvm_fn_attrs": ("amdgpu-waves-per-eu=2", ),
@@ -10203,13 +9936,6 @@ def _dma_after_dependency_count(wave, dependency):
 
 def _barrier_mentions_any(wave, dependencies):
     for match in re.finditer(r"%\d+ = wave\.barrier (?P<operands>[^\n]+)", wave):
-        operands = match.group("operands")
-        if any(dependency in operands for dependency in dependencies):
-            yield match
-
-
-def _after_mentions_any(wave, dependencies):
-    for match in re.finditer(r"%\d+ = wave\.after (?P<operands>[^\n]+)", wave):
         operands = match.group("operands")
         if any(dependency in operands for dependency in dependencies):
             yield match
@@ -19649,14 +19375,12 @@ module attributes {{tlx.has_explicit_local_mem_access = true, "ttg.num-ctas" = {
 def _tlx_wave_options(
     arch="gfx950",
     warp_size=64,
-    tlx_wave_enable_split_barriers=False,
     tlx_wave_enable_multi_wave_specialize=False,
     waves_per_eu=0,
 ):
     return SimpleNamespace(
         arch=arch,
         warp_size=warp_size,
-        tlx_wave_enable_split_barriers=tlx_wave_enable_split_barriers,
         tlx_wave_enable_multi_wave_specialize=tlx_wave_enable_multi_wave_specialize,
         waves_per_eu=waves_per_eu,
     )
@@ -19697,22 +19421,13 @@ def _convert_ttgir_to_wave_keep_dead(
 
 def test_tlx_wave_backend_defaults_and_accepts_mfma_options(monkeypatch):
     backend = make_backend(GFX950_WAVE)
-    monkeypatch.delenv("TRITON_TLX_WAVE_ENABLE_SPLIT_BARRIERS", raising=False)
     monkeypatch.delenv("TRITON_TLX_WAVE_ENABLE_MULTI_WAVE_SPECIALIZE", raising=False)
 
     default_options = backend.parse_options({})
     assert default_options.matrix_instr_nonkdim == 0
     assert not hasattr(backend.parse_options({}), "tlx_wave_schedule_max_region_ops")
-    assert default_options.tlx_wave_enable_split_barriers is False
     assert default_options.tlx_wave_enable_multi_wave_specialize is False
     assert backend.parse_options({"matrix_instr_nonkdim": 32}).matrix_instr_nonkdim == 32
-    assert backend.parse_options({"tlx_wave_enable_split_barriers": True}).tlx_wave_enable_split_barriers is True
-    assert backend.parse_options({"tlx_wave_enable_split_barriers": "off"}).tlx_wave_enable_split_barriers is False
-    monkeypatch.setenv("TRITON_TLX_WAVE_ENABLE_SPLIT_BARRIERS", "1")
-    assert backend.parse_options({}).tlx_wave_enable_split_barriers is True
-    assert backend.parse_options({"tlx_wave_enable_split_barriers": False}).tlx_wave_enable_split_barriers is False
-    with pytest.raises(ValueError, match="tlx_wave_enable_split_barriers"):
-        backend.parse_options({"tlx_wave_enable_split_barriers": "maybe"})
     enabled_multi_wave = backend.parse_options({"tlx_wave_enable_multi_wave_specialize": True})
     disabled_multi_wave = backend.parse_options({"tlx_wave_enable_multi_wave_specialize": "off"})
     assert enabled_multi_wave.tlx_wave_enable_multi_wave_specialize is True

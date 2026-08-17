@@ -220,11 +220,10 @@ kernel function before bridge import:
 
 | Compile option | Environment default | Effect |
 | --- | --- | --- |
-| `tlx_wave_enable_split_barriers=True` | `TRITON_TLX_WAVE_ENABLE_SPLIT_BARRIERS=1` | Enables WaveAMDMachine split-barrier lowering for eligible barriers. |
 | `tlx_wave_enable_multi_wave_specialize=True` | `TRITON_TLX_WAVE_ENABLE_MULTI_WAVE_SPECIALIZE=1` | Enables Wave's joint multi-wave specialization for that kernel. |
 
-An explicit compile option overrides its environment default. Both settings
-default to disabled.
+An explicit compile option overrides its environment default. The setting
+defaults to disabled.
 
 Tool discovery normally uses the standalone build under `third_party/wave`.
 Development builds can override it with:
