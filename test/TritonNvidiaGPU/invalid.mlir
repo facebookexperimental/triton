@@ -128,7 +128,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.shar
 #tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
 module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, ttg.shared = 65536 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
   tt.func public @tmem_layout_cta_mismatch() {
-    // expected-error @+1 {{Layout has 1 CTAs per CGA, but the context requires 2 CTAs per CGA.}}
+    // expected-error @+1 {{Layout has 1 CTAs per CGA, but the context requires either 2 logical or 2 physical CTAs per CGA.}}
     %0 = ttng.tmem_alloc : () -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
     tt.return
   }
@@ -221,6 +221,34 @@ tt.func @async_tma_gather(%desc: !tt.tensordesc<1x128xbf16, #shared>, %x_offsets
   ttng.async_tma_gather %desc[%x_offsets, %y_offset] %result, %bar, %pred : !tt.tensordesc<1x128xbf16, #shared>, tensor<32xi32, #blocked>, i32, !ttg.memdesc<2xi32, #shared1, #ttg.shared_memory, mutable>, !ttg.memdesc<32x128xbf16, #shared, #ttg.shared_memory, mutable>, i1
   tt.return
 }
+}
+
+// -----
+
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [1, 4], order = [1, 0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @descriptor_load_invalid_multicast_axis(
+      %desc: !tt.tensordesc<128x64xf16, #shared>) {
+    %c0 = arith.constant 0 : i32
+    // expected-error @+1 {{tt.multicast_axes values must be in [0, 2]}}
+    %0 = tt.descriptor_load %desc[%c0, %c0] {tt.multicast_axes = array<i32: 3>} : !tt.tensordesc<128x64xf16, #shared> -> tensor<128x64xf16, #blocked>
+    tt.return
+  }
+}
+
+// -----
+
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [1, 4], order = [1, 0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @descriptor_load_empty_multicast_axes(
+      %desc: !tt.tensordesc<128x64xf16, #shared>) {
+    %c0 = arith.constant 0 : i32
+    // expected-error @+1 {{tt.multicast_axes must not be empty}}
+    %0 = tt.descriptor_load %desc[%c0, %c0] {tt.multicast_axes = array<i32>} : !tt.tensordesc<128x64xf16, #shared> -> tensor<128x64xf16, #blocked>
+    tt.return
+  }
 }
 
 // -----
@@ -539,6 +567,24 @@ module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, "ttng.tw
 
 // -----
 
+#nvmma = #ttg.nvmma_shared<{swizzlingByteWidth = 32, transposed = false, elementBitWidth = 16, CGALayout = [[1, 0]]}>
+#barrier = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0], CGALayout = [[0]]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @planned_multicast_requires_local_barrier_layout(
+      %arg0: !tt.tensordesc<64x128xf16, #nvmma>) {
+    %true = arith.constant true
+    %c0_i32 = arith.constant 0 : i32
+    %0 = ttg.local_alloc : () -> !ttg.memdesc<64x128xf16, #nvmma, #smem, mutable>
+    %1 = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #barrier, #smem, mutable>
+    // expected-error @below {{TMA barrier cga_layout must be [[1]], got [[0]]}}
+    ttng.async_tma_copy_global_to_local %arg0[%c0_i32, %c0_i32] %0, %1, %true {tt.multicast_axes = array<i32: 0>} : !tt.tensordesc<64x128xf16, #nvmma>, !ttg.memdesc<1xi64, #barrier, #smem, mutable> -> !ttg.memdesc<64x128xf16, #nvmma, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
 #nvmma = #ttg.nvmma_shared<{swizzlingByteWidth = 32, transposed = false, elementBitWidth = 16, CGALayout = [[1, 0], [0, 1]]}>
 #barrier = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0], CGALayout = [[0], [0]]}>
 #smem = #ttg.shared_memory
@@ -789,15 +835,15 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 
 // -----
 
-// NOTE: Meta Triton intentionally does NOT reject ttng.cluster_arrive / ttng.cluster_wait
-// inside ttg.warp_specialize (Meta Triton's autows/TLX pipelines place them there and the
-// conversion lowers them with all-warps wrapping). Only ttng.cluster_barrier is
-// rejected. The arrive/wait warp-specialize invalid cases from upstream #9456 are
-// therefore omitted here.
+// Meta Triton does not reject ttng.cluster_arrive, ttng.cluster_wait, or
+// ttng.cluster_barrier inside ttg.warp_specialize. AutoWS and TLX place them
+// there, and their conversions lower them with all-warps wrapping. The
+// warp-specialize invalid cases from upstream #9456 are therefore omitted. A
+// cluster barrier must still execute in a multi-CTA cluster.
 
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90"} {
   tt.func @cluster_barrier_invalid() {
-    // expected-error @below {{requires ttg.num-ctas > 1}}
+    // expected-error @below {{requires a multi-CTA cluster}}
     ttng.cluster_barrier
     tt.return
   }

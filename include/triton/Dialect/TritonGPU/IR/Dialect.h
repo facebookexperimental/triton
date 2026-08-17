@@ -77,6 +77,7 @@ std::optional<int> maybeLookupNumWarps(Block *block);
 int lookupThreadsPerWarp(OpBuilder &rewriter);
 int lookupNumCTAs(OpBuilder &rewriter);
 int lookupNumCTAs(Operation *op);
+int lookupPhysicalNumCTAs(Operation *op);
 
 // Record/query whether the module contains exactly one `ttg.warp_specialize`
 // op via the `ttg.single-warp-specialize` module attribute. `hasSingle...`

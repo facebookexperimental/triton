@@ -3,6 +3,7 @@
 #include "triton/Analysis/AxisInfo.h"
 #include "triton/Analysis/Utility.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
+#include "triton/Dialect/Triton/IR/TMAMulticast.h"
 #include "triton/Dialect/Triton/IR/Types.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
@@ -233,14 +234,19 @@ void createTMAAsyncLoad(scf::ForOp forOp, tt::DescriptorLoadOp loadOp,
                         Value alloc, Value insertIdx, Value extractIdx,
                         Value barrier, Operation *waitOp,
                         CoarseSchedule &schedule) {
-  return createTMAAsyncCopy(forOp, loadOp, loadOp.getDesc(), alloc, insertIdx,
-                            extractIdx, barrier, waitOp, schedule,
-                            [&](OpBuilderForStage &builder, Value desc,
-                                Value barrier, Value view, Value pred) {
-                              ttng::AsyncTMACopyGlobalToLocalOp::create(
-                                  builder, loadOp.getLoc(), desc,
-                                  loadOp.getIndices(), barrier, view, pred);
-                            });
+  return createTMAAsyncCopy(
+      forOp, loadOp, loadOp.getDesc(), alloc, insertIdx, extractIdx, barrier,
+      waitOp, schedule,
+      [&](OpBuilderForStage &builder, Value desc, Value barrier, Value view,
+          Value pred) {
+        if (loadOp->hasAttr(tt::kMulticastAxesAttrName))
+          ttng::ClusterBarrierOp::create(builder, loadOp.getLoc());
+        auto copy = ttng::AsyncTMACopyGlobalToLocalOp::create(
+            builder, loadOp.getLoc(), desc, loadOp.getIndices(), barrier, view,
+            pred);
+        if (Attribute axes = loadOp->getAttr(tt::kMulticastAxesAttrName))
+          copy->setAttr(tt::kMulticastAxesAttrName, axes);
+      });
 }
 
 void createTMAAsyncGather(scf::ForOp forOp, tt::DescriptorGatherOp gatherOp,
@@ -360,6 +366,9 @@ void createTMABarrierAndWait(
       if (isTMALoad(nextOp) && asyncLoads.count(nextOp)) {
         if (asyncLoads[nextOp].stageDiff != numBuffers)
           break;
+        if (nextOp->getAttr(tt::kMulticastAxesAttrName) !=
+            group.front()->getAttr(tt::kMulticastAxesAttrName))
+          break;
         if (group.size() > 0 && schedule[group[0]] == schedule[nextOp]) {
           addToGroup(nextOp);
         }
@@ -395,11 +404,14 @@ void createTMABarrierAndWait(
         builder, barrierAlloc, loadGroup.extractIdx);
     auto wait =
         ttng::WaitBarrierOp::create(builder, barrierViewWait, loadGroup.phase);
+    Operation *completion = wait;
+    if (group.front()->hasAttr(tt::kMulticastAxesAttrName))
+      completion = ttng::ClusterBarrierOp::create(builder, forOp.getLoc());
 
     // Update the async loads info.
     for (Operation *op : group) {
       asyncLoads[op].barrier = barrier;
-      asyncLoads[op].waitOp = wait;
+      asyncLoads[op].waitOp = completion;
     }
   }
 }
