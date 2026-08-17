@@ -237,10 +237,10 @@ def _validate_against_plan(delta: PlanPipelineDelta, plan: PlanBundle) -> None:
                     for frontier in transaction.get("consumer_frontiers", [])
                     if frontier.get("iteration_distance", 0) > 0
                 }
-                if consumer_distances != {intent.distance}:
+                if len(consumer_distances) != 1:
                     raise PlanError(
-                        f"async transaction {transaction_id!r} does not have exact prefetch "
-                        f"distance {intent.distance}"
+                        f"async transaction {transaction_id!r} does not have one exact "
+                        "positive consumer distance"
                     )
                 slot_depths = {
                     index.get("modulus", 0)
@@ -248,10 +248,10 @@ def _validate_against_plan(delta: PlanPipelineDelta, plan: PlanBundle) -> None:
                     for index in path.get("indices", [])
                     if index.get("modulus", 0) > 0
                 }
-                if slot_depths != {intent.buffer_depth}:
+                if len(slot_depths) > 1:
                     raise PlanError(
-                        f"async transaction {transaction_id!r} does not have exact buffer "
-                        f"depth {intent.buffer_depth}"
+                        f"async transaction {transaction_id!r} has inconsistent existing "
+                        "buffer depths"
                     )
 
             wait_families = []
@@ -336,6 +336,29 @@ def validate_pipeline_delta(
     ) or any(
         staging.buffer_depth > 1 for loop in delta.loops for staging in loop.staging
     )
+    groups = {group["id"]: group for group in plan.async_groups}
+    transactions = {
+        transaction["id"]: transaction for transaction in plan.async_transactions
+    }
+    changes_prefetch_distance = False
+    changes_buffer_depth = False
+    for loop in delta.loops:
+        for intent in loop.transactions:
+            for transaction_id in groups[intent.group].get("transactions", []):
+                transaction = transactions[transaction_id]
+                distances = {
+                    frontier.get("iteration_distance", 0)
+                    for frontier in transaction.get("consumer_frontiers", [])
+                    if frontier.get("iteration_distance", 0) > 0
+                }
+                depths = {
+                    index.get("modulus", 0)
+                    for path in transaction.get("slot_paths", [])
+                    for index in path.get("indices", [])
+                    if index.get("modulus", 0) > 0
+                }
+                changes_prefetch_distance |= distances != {intent.distance}
+                changes_buffer_depth |= bool(depths) and depths != {intent.buffer_depth}
     return {
         "schema_version": PIPELINE_DELTA_VALIDATION_SCHEMA_VERSION,
         "passed": True,
@@ -346,8 +369,10 @@ def validate_pipeline_delta(
         "staging_values": staging_count,
         "requires_modulo_scheduling": requires_modulo_scheduling,
         "changes_iteration_placement": bool(transaction_count or staging_count),
-        "changes_iteration_storage": bool(staging_count),
+        "changes_iteration_storage": bool(staging_count) or changes_buffer_depth,
         "changes_synchronization": bool(transaction_count or staging_count),
+        "changes_prefetch_distance": changes_prefetch_distance,
+        "changes_buffer_depth": changes_buffer_depth,
         "changes_dot_decomposition": False,
         "materialization_status": "not_applied",
     }

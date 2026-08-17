@@ -50,7 +50,31 @@
 // RUN:   -tritonamdgpu-apply-plan-pipeline='input-path=%t.pipeline.legal.json report-path=%t.pipeline.report.json strict=true' \
 // RUN:   -o /dev/null
 // RUN: FileCheck %s --check-prefix=PIPELINE-REPORT < %t.pipeline.report.json
-// RUN: python3 -c "import json; p=json.load(open('%t.pipeline.legal.json')); p['loops'][0]['transactions'][0]['buffer_depth']=3; open('%t.pipeline.invalid.json','w').write(json.dumps(p))"
+// RUN: python3 -c "import json; p=json.load(open('%t.pipeline.legal.json')); p['loops'][0]['transactions'][0]['buffer_depth']=3; open('%t.pipeline.depth3.json','w').write(json.dumps(p))"
+// RUN: TRITON_USE_MODULO_SCHEDULE=1 triton-opt %s \
+// RUN:   -tritonamdgpu-apply-plan-pipeline='input-path=%t.pipeline.depth3.json report-path=%t.pipeline.depth3.report.json strict=true' \
+// RUN:   | FileCheck %s --check-prefix=PIPELINE-DEPTH3
+// RUN: FileCheck %s --check-prefix=PIPELINE-DEPTH3-REPORT < %t.pipeline.depth3.report.json
+// RUN: python3 -c "import json; p=json.load(open('%t.pipeline.legal.json')); p['loops'][0]['transactions'][0].update(distance=1,buffer_depth=1); open('%t.pipeline.depth1.json','w').write(json.dumps(p))"
+// RUN: TRITON_USE_MODULO_SCHEDULE=1 triton-opt %s \
+// RUN:   -tritonamdgpu-apply-plan-pipeline='input-path=%t.pipeline.depth1.json report-path=%t.pipeline.depth1.report.json strict=true' \
+// RUN:   | FileCheck %s --check-prefix=PIPELINE-DEPTH1
+// RUN: FileCheck %s --check-prefix=PIPELINE-DEPTH1-REPORT < %t.pipeline.depth1.report.json
+// RUN: python3 -c "import json; p=json.load(open('%t.pipeline.depth3.json')); p['loops'][0]['transactions'][0]['distance']=2; open('%t.pipeline.distance2.json','w').write(json.dumps(p))"
+// RUN: TRITON_USE_MODULO_SCHEDULE=1 triton-opt %s \
+// RUN:   -tritonamdgpu-apply-plan-pipeline='input-path=%t.pipeline.distance2.json report-path=%t.pipeline.distance2.report.json strict=true' \
+// RUN:   | FileCheck %s --check-prefix=PIPELINE-DISTANCE2
+// RUN: FileCheck %s --check-prefix=PIPELINE-DISTANCE2-REPORT < %t.pipeline.distance2.report.json
+// RUN: python3 -c "p=open('%s').read(); a=p.rindex('  tt.func @async_lds_modulo_slots'); b=p.index('\n  tt.func ',a+1); s=p[a:b].replace('      ttg.barrier all\n','',2); open('%t.pipeline.no-barriers.mlir','w').write(p[:a]+s+p[b:])"
+// RUN: triton-opt %t.pipeline.no-barriers.mlir \
+// RUN:   -tritonamdgpu-dump-plan-value-graph='output-path=%t.pipeline.no-barriers.plan.json strict=true pass-position=before_update_async_wait_count' \
+// RUN:   -o /dev/null
+// RUN: python3 -c "import json; p=json.load(open('%t.pipeline.no-barriers.plan.json')); f=next(x for x in p['functions'] if x['function']=='async_lds_modulo_slots'); l=next(x['id'] for x in f['operations'] if x['kind']=='scf.for'); g=f['async_groups'][0]['id']; d={'schema_version':'plan-pipeline-delta/0.1','kernel':f['function'],'input_value_graph_fingerprint':f['semantic_fingerprint'],'pass_position':'before_update_async_wait_count','loops':[{'loop':l,'transactions':[{'group':g,'action':'set_prefetch_distance','distance':1,'buffer_depth':3}],'staging':[]}]}; open('%t.pipeline.no-barriers.json','w').write(json.dumps(d))"
+// RUN: TRITON_USE_MODULO_SCHEDULE=1 triton-opt %t.pipeline.no-barriers.mlir \
+// RUN:   -tritonamdgpu-apply-plan-pipeline='input-path=%t.pipeline.no-barriers.json report-path=%t.pipeline.no-barriers.report.json strict=true' \
+// RUN:   -o /dev/null
+// RUN: FileCheck %s --check-prefix=PIPELINE-NO-BARRIERS-REPORT < %t.pipeline.no-barriers.report.json
+// RUN: python3 -c "import json; p=json.load(open('%t.pipeline.legal.json')); p['loops'][0]['transactions'][0]['buffer_depth']=400; open('%t.pipeline.invalid.json','w').write(json.dumps(p))"
 // RUN: not triton-opt %s \
 // RUN:   -tritonamdgpu-apply-plan-pipeline='input-path=%t.pipeline.invalid.json strict=true' \
 // RUN:   2>&1 | FileCheck %s --check-prefix=PIPELINE-REJECT
@@ -136,7 +160,42 @@
 // PIPELINE-REPORT: "moved_operations": {{[1-9][0-9]*}}
 // PIPELINE-REPORT: "output_value_graph_fingerprint": "{{[0-9a-f]+}}"
 // PIPELINE-REPORT: "skipped_inconsistent_dependencies": 0
-// PIPELINE-REJECT: requests a distance or buffer depth change reserved for M1.5b.3
+// PIPELINE-DEPTH3-LABEL: tt.func @async_lds_modulo_slots
+// PIPELINE-DEPTH3: ttg.local_alloc : () -> !ttg.memdesc<3x16x16xf16
+// PIPELINE-DEPTH3: arith.constant 3 : i32
+// PIPELINE-DEPTH3: ttg.memdesc_index
+// PIPELINE-DEPTH3-REPORT: "accepted": true
+// PIPELINE-DEPTH3-REPORT: "changes_buffer_depth": true
+// PIPELINE-DEPTH3-REPORT: "changes_iteration_storage": true
+// PIPELINE-DEPTH3-REPORT: "changes_synchronization": true
+// PIPELINE-DEPTH3-REPORT: "post_rewrite_ddg_verified": true
+// PIPELINE-DEPTH3-REPORT: "rewritten_slot_indices": 2
+// PIPELINE-DEPTH3-REPORT: "ring_mutations": 1
+// PIPELINE-DEPTH3-REPORT: "post_rewrite_audit_passed": true
+// PIPELINE-DEPTH1-LABEL: tt.func @async_lds_modulo_slots
+// PIPELINE-DEPTH1: ttg.local_alloc : () -> !ttg.memdesc<1x16x16xf16
+// PIPELINE-DEPTH1: ttg.async_wait {num = 0 : i32}
+// PIPELINE-DEPTH1: ttg.barrier
+// PIPELINE-DEPTH1: ttg.local_load
+// PIPELINE-DEPTH1: ttg.barrier
+// PIPELINE-DEPTH1: ttg.async_copy_global_to_local
+// PIPELINE-DEPTH1: ttg.async_commit_group
+// PIPELINE-DEPTH1-REPORT: "accepted": true
+// PIPELINE-DEPTH1-REPORT: "logical_lds_bytes_after": 512
+// PIPELINE-DEPTH1-REPORT: "post_rewrite_audit_passed": true
+// PIPELINE-DISTANCE2-LABEL: tt.func @async_lds_modulo_slots
+// PIPELINE-DISTANCE2: arith.constant 1 : i32
+// PIPELINE-DISTANCE2: arith.addi
+// PIPELINE-DISTANCE2: arith.constant 3 : i32
+// PIPELINE-DISTANCE2: arith.remui
+// PIPELINE-DISTANCE2: ttg.async_wait {num = 2 : i32}
+// PIPELINE-DISTANCE2-REPORT: "accepted": true
+// PIPELINE-DISTANCE2-REPORT: "changes_prefetch_distance": true
+// PIPELINE-DISTANCE2-REPORT: "updated_waits": 1
+// PIPELINE-NO-BARRIERS-REPORT: "accepted": true
+// PIPELINE-NO-BARRIERS-REPORT: "inserted_barriers": 2
+// PIPELINE-NO-BARRIERS-REPORT: "post_rewrite_audit_passed": true
+// PIPELINE-REJECT: requested LDS ring depths exceed the target LDS capacity
 
 #mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [2, 2], instrShape = [16, 16, 32], isTransposed = true}>
 #dot0 = #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 8}>

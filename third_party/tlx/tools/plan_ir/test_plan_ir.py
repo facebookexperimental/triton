@@ -647,6 +647,19 @@ def test_pipeline_delta_validates_cross_iteration_intent() -> None:
     assert report["changes_iteration_storage"]
 
 
+def test_pipeline_delta_reports_existing_ring_depth_and_distance_changes() -> None:
+    plan, ids = _plan_with_pipeline_contract()
+    delta = _pipeline_delta(plan, ids)
+    delta.loops[0].staging = []
+    delta.loops[0].transactions[0].distance = 1
+    delta.loops[0].transactions[0].buffer_depth = 3
+    report = validate_pipeline_delta(delta, plan)
+    assert report["changes_prefetch_distance"]
+    assert report["changes_buffer_depth"]
+    assert report["changes_iteration_storage"]
+    assert report["changes_synchronization"]
+
+
 def test_pipeline_delta_rejects_stale_plan_and_unknown_group() -> None:
     plan, ids = _plan_with_pipeline_contract()
     delta = _pipeline_delta(plan, ids)

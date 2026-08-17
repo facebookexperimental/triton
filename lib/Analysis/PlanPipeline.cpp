@@ -84,13 +84,13 @@ FailureOr<PlanPipelineDelta> parsePlanPipelineDelta(StringRef payload,
     }
     const llvm::json::Array *staging = loopObject->getArray("staging");
     if (staging && !staging->empty()) {
-      error = "M1.5b.2 does not materialize new staging";
+      error = "M1.5b.3 does not materialize new staging";
       return failure();
     }
     const llvm::json::Array *transactions =
         loopObject->getArray("transactions");
     if (!transactions || transactions->empty()) {
-      error = "M1.5b.2 loop must contain at least one transaction group";
+      error = "M1.5b.3 loop must contain at least one transaction group";
       return failure();
     }
     std::set<std::string> groupIds;
@@ -148,6 +148,13 @@ serializePlanPipelineApplyReport(const PlanPipelineApplyResult &result) {
         {"moved_operations", loop.movedOperationCount},
         {"imported_dependencies", loop.importedDependencyCount},
         {"skipped_inconsistent_dependencies", loop.skippedDependencyCount},
+        {"ring_mutations", loop.ringMutationCount},
+        {"rewritten_slot_indices", loop.rewrittenSlotIndexCount},
+        {"updated_waits", loop.updatedWaitCount},
+        {"inserted_barriers", loop.insertedBarrierCount},
+        {"logical_lds_bytes_before", loop.logicalLdsBytesBefore},
+        {"logical_lds_bytes_after", loop.logicalLdsBytesAfter},
+        {"post_rewrite_ddg_verified", loop.postRewriteDdgVerified},
         {"groups", std::move(groups)},
     });
   }
@@ -163,12 +170,16 @@ serializePlanPipelineApplyReport(const PlanPipelineApplyResult &result) {
       {"imported_dependencies", result.importedDependencyCount},
       {"skipped_inconsistent_dependencies", result.skippedDependencyCount},
       {"loops", std::move(loops)},
-      {"changes_iteration_storage", false},
-      {"changes_synchronization", false},
-      {"changes_prefetch_distance", false},
-      {"changes_buffer_depth", false},
+      {"changes_iteration_storage", result.changesIterationStorage},
+      {"changes_synchronization", result.changesSynchronization},
+      {"changes_prefetch_distance", result.changesPrefetchDistance},
+      {"changes_buffer_depth", result.changesBufferDepth},
       {"changes_dot_decomposition", false},
-      {"materialization_scope", "existing_lds_operation_order"},
+      {"post_rewrite_audit_passed", result.postRewriteAuditPassed},
+      {"materialization_scope",
+       result.changesIterationStorage || result.changesSynchronization
+           ? "existing_lds_ring_and_sync"
+           : "existing_lds_operation_order"},
   };
   std::string payload;
   llvm::raw_string_ostream stream(payload);

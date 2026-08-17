@@ -42,6 +42,13 @@ struct PlanPipelineLoopApplyRecord {
   int64_t movedOperationCount = 0;
   int64_t importedDependencyCount = 0;
   int64_t skippedDependencyCount = 0;
+  int64_t ringMutationCount = 0;
+  int64_t rewrittenSlotIndexCount = 0;
+  int64_t updatedWaitCount = 0;
+  int64_t insertedBarrierCount = 0;
+  int64_t logicalLdsBytesBefore = 0;
+  int64_t logicalLdsBytesAfter = 0;
+  bool postRewriteDdgVerified = false;
   std::vector<std::string> groups;
 };
 
@@ -54,6 +61,11 @@ struct PlanPipelineApplyResult {
   int64_t movedOperationCount = 0;
   int64_t importedDependencyCount = 0;
   int64_t skippedDependencyCount = 0;
+  bool changesIterationStorage = false;
+  bool changesSynchronization = false;
+  bool changesPrefetchDistance = false;
+  bool changesBufferDepth = false;
+  bool postRewriteAuditPassed = false;
   std::vector<PlanPipelineLoopApplyRecord> loops;
 };
 

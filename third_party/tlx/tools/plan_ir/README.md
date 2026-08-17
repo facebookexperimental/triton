@@ -1,6 +1,6 @@
 # AMD TLX Plan IR prototype
 
-This directory implements M1.1--M1.5b.2 of the profile-guided TLX scheduling
+This directory implements M1.1--M1.5b.3 of the profile-guided TLX scheduling
 design without changing the existing TLX kernels. M1.5b.2 reuses and extends
 Meta's shared modulo-scheduling DDG through backend-neutral APIs.
 
@@ -48,11 +48,19 @@ Meta's shared modulo-scheduling DDG through backend-neutral APIs.
   shared DDG, and uses constrained modulo scheduling to reorder existing
   producer slices. It preserves LDS allocations, waits/barriers, iteration
   storage, prefetch distance, buffer depth, and dot decomposition.
+- **M1.5b.3 — existing-ring depth and synchronization:** the native pass
+  resolves complete existing-LDS roots, checks target capacity, rewrites a
+  canonical leading ring dimension and producer/consumer modulo indices,
+  derives retained counts for complete or partial waits, and inserts missing
+  visibility/release barriers. It then re-extracts aliases, async lifetimes,
+  hazards, resources, and a second DDG; acceptance requires the requested
+  depth/distance, no open important fact, no LDS reuse hazard, a legal modulo
+  schedule, and an unchanged dot contract.
 
 M1.5a lowers only verified intra-iteration schedule permutations. M1.5b.1
-validates cross-iteration intent. M1.5b.2 applies only schedules already
-representable by the kernel's existing LDS ring and synchronization; new LDS
-staging and distance/depth changes remain later milestones.
+validates cross-iteration intent. M1.5b.2 applies schedules already represented
+by an existing ring. M1.5b.3 changes depth/distance and synchronization only
+for that existing ring. Creating new LDS staging remains M1.5b.4.
 
 ## Reproduction
 
@@ -163,13 +171,13 @@ export TRITON_TLX_PIPELINE_PLAN=/tmp/pipeline-delta.json
 export TRITON_TLX_PIPELINE_APPLY_REPORT=/tmp/pipeline-apply-report.json
 ```
 
-For M1.5b.2, every requested async group sharing a positive-distance wait must
-be present, and its requested distance/depth must exactly match the analyzed
-consumer frontier and modulo slot path. The native pass rejects staging intents
-and all distance/depth changes. Its report records the modulo II, selected and
-moved operations, imported dependencies, projection-inconsistent dependencies
-skipped against the valid baseline order, and unchanged input/output stable
-fingerprints.
+Every requested async group sharing a positive-distance wait must be present.
+The M1.5b.2 identity path requires exact analyzed distance/depth and preserves
+the stable fingerprint. M1.5b.3 accepts a changed depth/distance only when all
+readers and writers of the existing root are selected and directly indexed. It
+rejects capacity overflow and new-staging intents. Its report records LDS bytes,
+rewritten slots, waits/barriers, pre/post fingerprints, the post-rewrite audit,
+and second-DDG verification.
 
 The fixed configuration names and kernel symbols are sourced from
 `third_party/tlx/tutorials/amd_fa_bwd.py`:

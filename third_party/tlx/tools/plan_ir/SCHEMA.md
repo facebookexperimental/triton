@@ -153,3 +153,21 @@ selected/moved operation counts, imported/skipped dependencies, and stable
 pre/post fingerprints. All `changes_*` fields remain false. Materializing new
 LDS allocations, waits/barriers, prefetch distances, or buffer depths is not
 part of M1.5b.2.
+
+### M1.5b.3 existing-ring materialization
+
+The native materializer may change `distance` and `buffer_depth` for an
+existing canonical LDS ring. All in-loop readers and writers of the allocation
+must belong to the selected complete transaction/wait family. The materializer
+resizes the allocation's leading ring dimension, rewrites producer and consumer
+`memdesc_index` expressions to the requested modulo depth and distance, derives
+retained counts while preserving unrelated partial-wait groups, and inserts
+missing local visibility and consumer-release barriers.
+
+Before mutation it rejects unknown allocation sizes, inconsistent requests for
+one root, unsupported indirect/nested views, and target LDS-capacity overflow.
+After mutation it rebuilds Plan IR and the physical DDG. Acceptance requires
+the requested slot depth and consumer distance, completion/visibility/release
+and overwrite frontiers, no open important fact, no LDS reuse hazard, a legal
+second modulo schedule, and an unchanged dot/scheduled-MFMA contract. New
+`global_to_lds` or `register_to_lds` staging remains M1.5b.4.
