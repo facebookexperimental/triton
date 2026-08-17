@@ -242,8 +242,6 @@ def provider_matmul(args, provider, module, version_dir, a, b, out=None):
     if provider == "rocblas":
         return torch.matmul(a, b, out=out)
     extra_compile_options = {}
-    if provider == "wave" and args.wave_split_barriers:
-        extra_compile_options["tlx_wave_enable_split_barriers"] = True
     if provider == "wave" and version_dir in MULTI_WAVE_SPECIALIZED_VERSIONS:
         extra_compile_options["tlx_wave_enable_multi_wave_specialize"] = True
     return launch_tutorial_matmul(
@@ -365,7 +363,7 @@ def compile_cache_dir(cache_root, version_dir, provider, M, N, K):
     return Path(cache_root) / version_dir / provider / f"M{M}_N{N}_K{K}"
 
 
-def compile_provider_shape(provider, version_dir, shape, b_layout, cache_root, arch, wave_split_barriers=False):
+def compile_provider_shape(provider, version_dir, shape, b_layout, cache_root, arch):
     if provider == "rocblas":
         return shape, provider, 0.0
 
@@ -395,8 +393,6 @@ def compile_provider_shape(provider, version_dir, shape, b_layout, cache_root, a
             "NUM_XCDS": 8,
             "GRID_MN": grid_mn,
         })
-    if provider == "wave" and wave_split_barriers:
-        compile_kwargs["tlx_wave_enable_split_barriers"] = True
     if provider == "wave" and version_dir in MULTI_WAVE_SPECIALIZED_VERSIONS:
         compile_kwargs["tlx_wave_enable_multi_wave_specialize"] = True
 
@@ -431,12 +427,7 @@ def precompile_shapes(args, version_dir, providers, sizes):
     if args.compile_workers == 0:
         return
 
-    jobs = [
-        (provider, shape)
-        for shape in sizes
-        for provider in providers
-        if provider != "rocblas"
-    ]
+    jobs = [(provider, shape) for shape in sizes for provider in providers if provider != "rocblas"]
     if not jobs:
         return
 
@@ -445,8 +436,9 @@ def precompile_shapes(args, version_dir, providers, sizes):
 
     if workers == 1:
         for provider, shape in jobs:
-            compiled_shape, compiled_provider, elapsed = compile_provider_shape(
-                provider, version_dir, shape, args.b_layout, args.cache_dir, args.arch, args.wave_split_barriers)
+            compiled_shape, compiled_provider, elapsed = compile_provider_shape(provider, version_dir, shape,
+                                                                                args.b_layout, args.cache_dir,
+                                                                                args.arch)
             M, N, K = compiled_shape
             print(f"  compiled {compiled_provider} {M}x{N}x{K} in {elapsed:.1f}s", flush=True)
         return
@@ -462,9 +454,7 @@ def precompile_shapes(args, version_dir, providers, sizes):
                 args.b_layout,
                 args.cache_dir,
                 args.arch,
-                args.wave_split_barriers,
-            )
-            for provider, shape in jobs
+            ) for provider, shape in jobs
         ]
         for future in concurrent.futures.as_completed(futures):
             compiled_shape, compiled_provider, elapsed = future.result()
@@ -563,11 +553,6 @@ def main():
     parser.add_argument("--cache-dir", default=None, help="optional Triton cache root")
     parser.add_argument("--wave-opt", default=None, help="optional path to wave-opt")
     parser.add_argument(
-        "--wave-split-barriers",
-        action="store_true",
-        help="compile Wave provider kernels with tlx_wave_enable_split_barriers=True",
-    )
-    parser.add_argument(
         "--compile-workers",
         type=nonnegative_int,
         default=DEFAULT_COMPILE_WORKERS,
@@ -600,10 +585,8 @@ def main():
         timing_summary = (f"batched median, {args.timing_repeats}x"
                           f"{args.timed_launches} timed launches, "
                           f"{args.warmup_launches} warmups/repeat")
-    print(
-        f"\n{version_dir} ({args.b_layout} B, input={args.input_mode}, seed={args.seed}; "
-        f"{timing_summary}):"
-    )
+    print(f"\n{version_dir} ({args.b_layout} B, input={args.input_mode}, seed={args.seed}; "
+          f"{timing_summary}):")
     header = f"{'M':>6s} {'N':>6s} {'K':>6s}"
     for provider in providers:
         label = PROVIDER_LABELS[provider]

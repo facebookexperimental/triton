@@ -131,7 +131,6 @@ def test_read_env(truthy, falsey, fresh_knobs_including_libraries, monkeypatch):
     assert not fresh_knobs.runtime.debug
     # bool defaulting to True
     assert fresh_knobs.language.default_fp_fusion
-    assert fresh_knobs.nvidia.use_autotune_c_cache
     # str defaulting to None
     assert fresh_knobs.compilation.use_ir_loc is None
     # str defaulting to not None
@@ -149,12 +148,10 @@ def test_read_env(truthy, falsey, fresh_knobs_including_libraries, monkeypatch):
     monkeypatch.setenv("TRITON_CACHE_MANAGER", "triton.runtime.cache:FileCacheManager")
     monkeypatch.setenv("TRITON_CUDACRT_PATH", "/tmp/cuda/crt")
     monkeypatch.setenv("TRITON_CUDART_PATH", "/tmp/cuda/rt")
-    monkeypatch.setenv("TRITON_AUTOTUNE_USE_C_CACHE", falsey)
 
     triton.knobs.refresh_knobs()
     assert fresh_knobs.runtime.debug
     assert not fresh_knobs.language.default_fp_fusion
-    assert not fresh_knobs.nvidia.use_autotune_c_cache
     assert fresh_knobs.compilation.use_ir_loc == "ttir"
     assert fresh_knobs.cache.home_dir == "/tmp/triton_home"
     assert fresh_knobs.cache.dir == "/tmp/triton_cache"

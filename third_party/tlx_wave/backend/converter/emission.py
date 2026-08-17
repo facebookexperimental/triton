@@ -2887,28 +2887,6 @@ def _deserialize_relation_expr(state, relation, op):
         )
 
 
-def _simd_binary_const(state, operation, value, constant, lane_width, *, nsw=False):
-    constant = int(constant)
-    simd = state.dsl.SimdType(value.type)
-    element_type = simd.element_type
-    lane_width = int(simd.width)
-    if operation == "divui" and constant == 1:
-        return value
-    if operation == "remui" and constant == 1:
-        return state.builder.splat(
-            state.builder.constant(element_type, 0),
-            element_type,
-            lane_width,
-        )
-    operation_kind = _binary_kind(state.dsl, operation)
-    rhs = state.builder.splat(
-        state.builder.constant(element_type, constant),
-        element_type,
-        lane_width,
-    )
-    return state.builder.binary(operation_kind, value, rhs, nsw=bool(nsw))
-
-
 def _is_power_of_two(value):
     value = int(value)
     return value > 0 and (value & (value - 1)) == 0
@@ -4935,27 +4913,6 @@ def _scalar_type(dsl, element_type):
     }[element_type]()
 
 
-def _element_byte_width(element_type, op):
-    widths = {
-        "i8": 1,
-        "i16": 2,
-        "i32": 4,
-        "i64": 8,
-        "f16": 2,
-        "bf16": 2,
-        "f32": 4,
-    }
-    width = widths.get(element_type)
-    if width is None:
-        fail(
-            "TLXW_EMIT_UNSUPPORTED_TYPE",
-            STAGE,
-            f"cannot determine byte width for {element_type}",
-            target_op_id=op.target_op_id,
-        )
-    return int(width)
-
-
 def _binary_kind(dsl, operation):
     return {
         "addi": dsl.BinaryKind.AddI,
@@ -5086,8 +5043,6 @@ def _function_attrs(
         # requested CTA waves as the resident wave target per SIMD.
         "waveamdmachine.target_waves": dsl.i64_attr(target_waves),
     }
-    if kernel.enable_split_barriers:
-        attrs["waveamdmachine.enable_split_barriers"] = ir.UnitAttr.get()
     if kernel.enable_multi_wave_specialization:
         attrs["waveamdmachine.enable_multi_wave_specialization"] = ir.UnitAttr.get()
     return attrs

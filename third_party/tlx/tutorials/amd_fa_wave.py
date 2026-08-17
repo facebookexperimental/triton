@@ -100,14 +100,6 @@ def _split_last_2(value):
 
 
 @triton.jit
-def _split_last_4(value):
-    lower, upper = _split_last_2(value)
-    value0, value1 = _split_last_2(lower)
-    value2, value3 = _split_last_2(upper)
-    return value0, value1, value2, value3
-
-
-@triton.jit
 def _join_last_2(lower, upper):
     rows: tl.constexpr = lower.shape[0]
     columns: tl.constexpr = lower.shape[1]
