@@ -197,7 +197,10 @@ def require_layout(
     assert isinstance(pin, bool), f"pin must be a constexpr bool, got {type(pin).__name__}"
     assert isinstance(late_address_compute, bool), ("late_address_compute must be a constexpr bool, got "
                                                     f"{type(late_address_compute).__name__}")
-    enc = layout.to_ir(_semantic.builder, x.shape, x.dtype)
+    if isinstance(layout, tlx.layout):
+        enc = layout.to_ir(_semantic.builder, x.shape, x.dtype)
+    else:
+        enc = layout.to_ir(_semantic.builder)
     handle = _semantic.builder.create_require_layout(
         x.handle,
         enc,
@@ -342,6 +345,43 @@ def dot_scaled(
             _semantic.builder.make_i32_array_attr(tiles_per_warp),
         )
     return result
+
+
+@tl.builtin
+def release_layout(src, _semantic=None):
+    """Return an ordinary tensor view of an explicitly laid-out tensor.
+
+    This is the structural counterpart to :func:`require_layout`: it keeps a
+    concrete layout local to an operation implementation while preventing the
+    encoded type from escaping through a function or operation boundary.  The
+    source may still be encoding-free while a ``@triton.jit`` helper is built;
+    TLX specializes that helper's input before propagating layouts.
+    """
+    src = _semantic.to_tensor(src)
+    handle = _semantic.builder.create_release_layout(src.handle)
+    return tl.tensor(handle, src.type)
+
+
+@tl.builtin
+def cast_preserve_layout(src, dtype: tl.constexpr, fp_downcast_rounding: tl.constexpr = None,
+                         bitcast: tl.constexpr = False, _semantic=None):
+    """Cast a tensor while preserving its current IR layout encoding."""
+    src = _semantic.to_tensor(src)
+    dtype = tl._unwrap_if_constexpr(dtype)
+    fp_downcast_rounding = tl._unwrap_if_constexpr(fp_downcast_rounding)
+    bitcast = tl._unwrap_if_constexpr(bitcast)
+    if src.type.is_block():
+        dst_ty = src.type.with_element_ty(dtype)
+    else:
+        dst_ty = dtype
+    rounding = None if bitcast else _semantic._str_to_rounding_mode(fp_downcast_rounding)
+    handle = _semantic.builder.create_layout_preserving_cast(
+        src.handle,
+        dst_ty.to_ir(_semantic.builder),
+        rounding,
+        bitcast,
+    )
+    return tl.tensor(handle, dst_ty)
 
 
 def _get_use_acc_handle(use_acc: tl.constexpr | tl.tensor | None, _builder):

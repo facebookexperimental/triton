@@ -302,3 +302,65 @@ tt.func @async_copy_fp16_padded_unsupported_vec(%input: tensor<256x!tt.ptr<f16>,
   tt.return
 }
 }
+
+// -----
+
+#linear = #ttg.linear<{register = [[1, 0], [2, 0]], lane = [[4, 0], [8, 0], [16, 0], [32, 0], [64, 0], [128, 0]], warp = [[0, 1], [0, 2], [0, 4]], block = []}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0, 1]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, "ttg.target" = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+// Preserve the AxisInfo vector-width proof on an explicit buffer-to-LDS copy.
+// The modulo remains contiguous in aligned groups of four because both its
+// base and divisor are divisible by 16.
+// CHECK-LABEL: annotate_buffer_load_to_local_contiguity
+tt.func @annotate_buffer_load_to_local_contiguity(
+    %ptr: !tt.ptr<i8> {tt.divisibility = 16 : i32, tt.pointer_range = 32 : i32},
+    %base: i32 {tt.divisibility = 16 : i32},
+    %n: i32 {tt.divisibility = 16 : i32},
+    %dst: !ttg.memdesc<256x8xi8, #shared, #smem, mutable>) {
+  %rows = tt.make_range {end = 256 : i32, start = 0 : i32} : tensor<256xi32, #ttg.slice<{dim = 1, parent = #linear}>>
+  %base_s = tt.splat %base : i32 -> tensor<256xi32, #ttg.slice<{dim = 1, parent = #linear}>>
+  %raw = arith.addi %base_s, %rows : tensor<256xi32, #ttg.slice<{dim = 1, parent = #linear}>>
+  %n_s = tt.splat %n : i32 -> tensor<256xi32, #ttg.slice<{dim = 1, parent = #linear}>>
+  %wrapped = arith.remsi %raw, %n_s : tensor<256xi32, #ttg.slice<{dim = 1, parent = #linear}>>
+  %row = tt.expand_dims %wrapped {axis = 1 : i32} : tensor<256xi32, #ttg.slice<{dim = 1, parent = #linear}>> -> tensor<256x1xi32, #linear>
+  %offset = tt.broadcast %row : tensor<256x1xi32, #linear> -> tensor<256x8xi32, #linear>
+  // CHECK: amdg.buffer_load_to_local {{.*}} {contiguity = 4 : i32}
+  %token = amdg.buffer_load_to_local %ptr[%offset] into %dst : <i8>[tensor<256x8xi32, #linear>] -> <256x8xi8, #shared, #smem, mutable>
+  tt.return
+}
+}
+
+// -----
+
+#linear = #ttg.linear<{register = [[1, 0], [2, 0]], lane = [[4, 0], [8, 0], [16, 0], [32, 0], [64, 0], [0, 1]], warp = [[0, 0], [0, 2], [0, 4]], block = []}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0, 1]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, "ttg.target" = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+// Pass the same canonical-warp assumption used by LLVM lowering through
+// TTGIR. Warp bit zero is a free input variable in this replicated layout.
+// CHECK-LABEL: annotate_buffer_load_to_local_redundant_waves
+tt.func @annotate_buffer_load_to_local_redundant_waves(
+    %ptr: !tt.ptr<i8> {tt.divisibility = 16 : i32, tt.pointer_range = 32 : i32},
+    %base: i32 {tt.divisibility = 16 : i32},
+    %m: i32 {tt.divisibility = 16 : i32},
+    %stride: i32 {tt.divisibility = 16 : i32},
+    %dst: !ttg.memdesc<128x8xi8, #shared, #smem, mutable>) {
+  %rows = tt.make_range {end = 128 : i32, start = 0 : i32} : tensor<128xi32, #ttg.slice<{dim = 1, parent = #linear}>>
+  %base_s = tt.splat %base : i32 -> tensor<128xi32, #ttg.slice<{dim = 1, parent = #linear}>>
+  %raw = arith.addi %base_s, %rows : tensor<128xi32, #ttg.slice<{dim = 1, parent = #linear}>>
+  %m_s = tt.splat %m : i32 -> tensor<128xi32, #ttg.slice<{dim = 1, parent = #linear}>>
+  %wrapped = arith.remsi %raw, %m_s : tensor<128xi32, #ttg.slice<{dim = 1, parent = #linear}>>
+  %row = tt.expand_dims %wrapped {axis = 1 : i32} : tensor<128xi32, #ttg.slice<{dim = 1, parent = #linear}>> -> tensor<128x1xi32, #linear>
+  %rows_b = tt.broadcast %row : tensor<128x1xi32, #linear> -> tensor<128x8xi32, #linear>
+  %cols = tt.make_range {end = 8 : i32, start = 0 : i32} : tensor<8xi32, #ttg.slice<{dim = 0, parent = #linear}>>
+  %cols_2d = tt.expand_dims %cols {axis = 0 : i32} : tensor<8xi32, #ttg.slice<{dim = 0, parent = #linear}>> -> tensor<1x8xi32, #linear>
+  %stride_s = tt.splat %stride : i32 -> tensor<1x8xi32, #linear>
+  %col_offset = arith.muli %cols_2d, %stride_s : tensor<1x8xi32, #linear>
+  %cols_b = tt.broadcast %col_offset : tensor<1x8xi32, #linear> -> tensor<128x8xi32, #linear>
+  %offset = arith.addi %rows_b, %cols_b : tensor<128x8xi32, #linear>
+  // CHECK: amdg.buffer_load_to_local {{.*}} {amdgpu.redundant_wave_mask = 1 : i32, contiguity = 4 : i32}
+  %token = amdg.buffer_load_to_local %ptr[%offset] into %dst : <i8>[tensor<128x8xi32, #linear>] -> <128x8xi8, #shared, #smem, mutable>
+  tt.return
+}
+}

@@ -1,13 +1,17 @@
+#include "Analysis/AMDGPUAllocation.h"
 #include "Dialect/TritonAMDGPU/IR/Dialect.h"
+#include "TritonAMDGPUToLLVM/MembarUtility.h"
 #include "TritonAMDGPUToLLVM/Passes.h"
 #include "TritonAMDGPUTransforms/Passes.h"
 #include "amd/include/hipblas_instance.h"
 #include "amd/include/hipblas_types.h"
+#include "amd/lib/TritonAMDGPUToLLVM/AsyncUtility.h"
 #include "lib/TritonAMDGPUToLLVM/TargetInfo.h"
 #include "lld/Common/Driver.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Target/LLVMIR/Dialect/ROCDL/ROCDLToLLVMIRTranslation.h"
 #include "passes.h"
+#include "triton/Analysis/Membar.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/IR/Constants.h"
@@ -50,12 +54,11 @@ void init_triton_amd_passes_ttgpuir(py::module &&m) {
         [](mlir::PassManager &pm, const std::string &arch, bool ftz) {
           pm.addPass(createConvertTritonAMDGPUToLLVMPass(arch, ftz));
         });
-  m.def("add_to_llvmir",
-        [](mlir::PassManager &pm, const std::string &arch, bool ftz,
-           bool enableTreeReduction) {
-          pm.addPass(createConvertTritonAMDGPUToLLVMPass(
-              arch, ftz, enableTreeReduction));
-        });
+  m.def("add_to_llvmir", [](mlir::PassManager &pm, const std::string &arch,
+                            bool ftz, bool enableTreeReduction) {
+    pm.addPass(
+        createConvertTritonAMDGPUToLLVMPass(arch, ftz, enableTreeReduction));
+  });
   m.def("add_builtin_func_to_llvmir",
         [](mlir::PassManager &pm, const std::string &arch, bool ftz) {
           pm.addPass(createConvertBuiltinFuncToLLVMPass(arch, ftz));
@@ -353,6 +356,23 @@ void init_triton_amd(py::module &&m) {
 
   auto passes = m.def_submodule("passes");
   init_triton_amd_passes_ttgpuir(passes.def_submodule("ttgpuir"));
+
+  m.def("run_membar", [](mlir::ModuleOp mod, const std::string &arch) {
+    mlir::triton::AMD::TargetInfo targetInfo(arch);
+    if (targetInfo.getISAFamily() == mlir::triton::amdgpu::ISAFamily::Unknown)
+      throw std::invalid_argument("unsupported AMDGPU target: " + arch);
+    auto allocationFn = [&targetInfo](mlir::Operation *op) {
+      return mlir::triton::AMD::AMDAllocationAnalysisScratchSizeFn(op,
+                                                                   targetInfo);
+    };
+    mlir::ModuleAllocation allocation(
+        mod, allocationFn, targetInfo.getSharedMemoryPartitionSize());
+    if (targetInfo.requiresAliasInfoForAsyncOps())
+      mlir::triton::AMD::annotateLocalLoadsSyncedViaAsyncWait(mod);
+    mlir::ModuleMembarAnalysis analysis(&allocation,
+                                        mlir::triton::AMD::membarFilter);
+    analysis.run();
+  });
 
   m.attr("TARGET_TRIPLE") = amdTargetTriple;
   m.attr("CALLING_CONV_AMDGPU_KERNEL") =

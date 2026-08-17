@@ -16,6 +16,7 @@ import triton
 from triton.backends.compiler import GPUTarget
 
 GFX1250_TARGET = GPUTarget("hip", "gfx1250", 32)
+GFX950_TARGET = GPUTarget("hip", "gfx950", 64)
 TTIR_PATH = str(Path(__file__).parent / "attn_fwd.ttir")
 
 
@@ -79,3 +80,16 @@ def test_gfx1250_v_pk_fma_f32_in_asm(gfx1250_kernel):
                                           f"{counts['v_pk_fma_f32']}")
     assert counts["v_fma_f32"] < 20, (f"Expected scalar v_fma_f32 instructions to stay low, got "
                                       f"{counts['v_fma_f32']}")
+
+
+def test_disable_vector_combine_is_per_kernel():
+    baseline = triton.compile(TTIR_PATH, target=GFX950_TARGET)
+    disabled = triton.compile(
+        TTIR_PATH,
+        target=GFX950_TARGET,
+        options={"disable_vector_combine": True},
+    )
+
+    assert baseline.asm["llir"] != disabled.asm["llir"]
+    assert baseline.metadata.disable_vector_combine is False
+    assert disabled.metadata.disable_vector_combine is True

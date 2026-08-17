@@ -88,8 +88,8 @@ ensureLayoutNotLargerThan(const LinearLayout &layout,
 
   for (auto outDim : llvm::enumerate(layout.getOutDimNames())) {
     auto outDimName = outDim.value();
-    // actualSize/desiredSize are the true (possibly NPOT) sizes; span/
-    // shrinkTarget are their pow2-rounded counterparts used for basis counting.
+    // actualSize/desiredSize are the true (possibly NPOT) sizes, while
+    // shrinkTarget is the pow2-rounded bound used for basis filtering.
     int32_t actualSize = layout.getOutDimSize(outDimName);
     int32_t desiredSize = shape.lookup(outDimName);
     if (actualSize <= desiredSize) {
@@ -102,42 +102,22 @@ ensureLayoutNotLargerThan(const LinearLayout &layout,
         llvm::isPowerOf2_32(desiredSize)
             ? desiredSize
             : static_cast<int32_t>(llvm::NextPowerOf2(desiredSize));
-    // Count the shrink against the pow2 basis span, not the NPOT out-dim size
-    // (else a basis terminates early). Identity for pow2 actualSize.
-    int32_t span = llvm::isPowerOf2_32(actualSize)
-                       ? actualSize
-                       : static_cast<int32_t>(llvm::NextPowerOf2(actualSize));
-    assert(span % shrinkTarget == 0);
-    // <inDimName, basisIdx, outValue>
-    std::vector<std::tuple<StringAttr, int, int>> sortedBases;
-    for (auto [inDimName, basis] : bases) {
-      for (size_t basisIdx = 0; basisIdx < basis.size(); basisIdx++) {
-        auto outValue = basis[basisIdx][outDim.index()];
-        if (outValue == 0) {
+    // Every remaining basis must fit in the shrunken codomain. Filtering by
+    // value, rather than by the number of bases to remove, also handles
+    // generic linear layouts with duplicate or dependent bases.
+    for (auto &[inDimName, inDimBases] : bases) {
+      for (auto [basisIdx, basis] : llvm::enumerate(inDimBases)) {
+        auto outValue = basis[outDim.index()];
+        if (outValue == 0)
           continue;
-        }
         assert(llvm::isPowerOf2_32(outValue));
-        sortedBases.emplace_back(inDimName, basisIdx, outValue);
-      }
-    }
-    // From the largest basis to the smallest.
-    llvm::sort(sortedBases,
-               [](auto a, auto b) { return std::get<2>(a) > std::get<2>(b); });
-    for (size_t i = 0; i < sortedBases.size() && span > shrinkTarget;) {
-      int outValue = std::get<2>(sortedBases[i]);
-      do {
-        auto inDimName = std::get<0>(sortedBases[i]);
-        auto basisIdx = std::get<1>(sortedBases[i++]);
-        if (!broadcastRegisters && inDimName == kRegister) {
+        if (outValue < shrinkTarget)
+          continue;
+        if (!broadcastRegisters && inDimName == kRegister)
           broadcastedDims.insert(basisIdx);
-        } else {
-          bases[inDimName][basisIdx][outDim.index()] = 0;
-        }
-      } while (i < sortedBases.size() &&
-               std::get<2>(sortedBases[i]) == outValue);
-      // Duplicate bases encode the same output bit and shrink the span only
-      // after every copy has been removed.
-      span >>= 1;
+        else
+          basis[outDim.index()] = 0;
+      }
     }
   }
   if (!broadcastRegisters) {
@@ -197,8 +177,6 @@ LinearLayout ensureLayoutNotSmallerThan(
         llvm::isPowerOf2_32(desiredSize)
             ? desiredSize
             : static_cast<int32_t>(llvm::NextPowerOf2(desiredSize));
-    if (actualSize >= growTarget)
-      continue;
     assert(growTarget % actualSize == 0);
     ret *= LinearLayout::identity1D(growTarget / actualSize, kDim, outDimName);
     assert(ret.getOutDimSize(outDimName) >= desiredSize);

@@ -554,7 +554,6 @@ struct ConvertTritonLoadToBufferLoad : public mlir::OpRewritePattern<SourceOp> {
       }();
 
       assert(bufferLoadOp);
-
       rewriter.replaceOp(op, bufferLoadOp);
       return success();
     }

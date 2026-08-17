@@ -3081,11 +3081,7 @@ def _compile_a4w4_inter_wave_256tile(m, n, k, preshuffled_scales=False):
     c = MockTensor(torch.bfloat16, (m, n))
     a_scales = MockTensor(torch.uint8, (m * k // 32, ) if preshuffled_scales else (m, k // 32))
     b_scales = MockTensor(torch.uint8, (n * k // 32, ) if preshuffled_scales else (n, k // 32))
-    kernel = (
-        _a4w4_inter_wave_preshuffled_scales_kernel
-        if preshuffled_scales
-        else _a4w4_inter_wave_256tile_kernel
-    )
+    kernel = (_a4w4_inter_wave_preshuffled_scales_kernel if preshuffled_scales else _a4w4_inter_wave_256tile_kernel)
     scale_strides = () if preshuffled_scales else (1, m, 1, n)
 
     with knobs.runtime.scope():
@@ -3183,7 +3179,7 @@ def test_a4w4_inter_wave_256tile_codegen_gfx950(device, fresh_triton_cache):
     assert ttgir.count("rocdl.sched.barrier 0") == 8
     assert ttgir.count("tt.dot_scaled") == 16
     assert ttgir.count("amdg.buffer_load_to_local") == 28
-    assert "contiguity" not in ttgir
+    assert ttgir.count("contiguity =") == 28
 
     assert len(re.findall(r"^\s*v_mfma_scale_f32_16x16x128_f8f6f4\b", amdgcn, re.MULTILINE)) == 256
     assert len(re.findall(r"^\s*buffer_load_[^\n]*\blds\s*$", amdgcn, re.MULTILINE)) == 44
@@ -3309,8 +3305,7 @@ def test_a4w4_inter_wave_preshuffled_scale_correctness_gfx950(device, k, split_k
     a, b, a_scales, b_scales = _generate_a4w4_inputs(m, n, k)
     a_scales_preshuffled = _preshuffle_a4w4_a_scales(a_scales)
     b_scales_preshuffled = _preshuffle_a4w4_b_scales(b_scales)
-    actual = _a4w4_inter_wave_matmul_preshuffled(
-        a, b, a_scales_preshuffled, b_scales_preshuffled, SPLIT_K=split_k)
+    actual = _a4w4_inter_wave_matmul_preshuffled(a, b, a_scales_preshuffled, b_scales_preshuffled, SPLIT_K=split_k)
     expected = _a4w4_reference(a, b, a_scales, b_scales)
     torch.testing.assert_close(actual, expected, atol=0.0, rtol=0.0)
 
@@ -3480,3 +3475,46 @@ def test_amd_sched_barrier_compiles_gfx950():
         constexprs={"BLOCK": 64},
     )
     assert "llvm.amdgcn.sched.barrier" in compiled.asm["llir"]
+
+
+@triton.jit
+def _explicit_layout_buffer_store_kernel(
+    output_ptr,
+    stride_m,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    store_layout: tl.constexpr = tlx.blocked_layout_encoding.make(
+        [1, 8],
+        [4, 16],
+        [4, 1],
+        [1, 0],
+    )
+    linear = tl.arange(0, BLOCK_M * BLOCK_N).reshape(BLOCK_M, BLOCK_N)
+    row_offsets = tl.mul(linear // BLOCK_N, stride_m, sanitize_overflow=False)
+    offsets = tl.add(row_offsets, linear % BLOCK_N, sanitize_overflow=False)
+    offsets = tlx.require_layout(offsets, store_layout)
+    values = tlx.require_layout(
+        tl.full((BLOCK_M, BLOCK_N), 1.0, tl.float32).to(tl.bfloat16),
+        store_layout,
+    )
+    tlx.buffer_store(values, output_ptr, offsets)
+
+
+def test_explicit_layout_buffer_store_survives_coalescing_gfx950(device):
+    """Explicit TLX buffer_store layouts should not be replaced by AMD coalescing."""
+    compiled = compile_for_gfx950(
+        _explicit_layout_buffer_store_kernel,
+        signature={"output_ptr": "*bf16", "stride_m": "i32"},
+        constexprs={"BLOCK_M": 256, "BLOCK_N": 128},
+    )
+    ttgir = compiled.asm["ttgir"]
+    store_line = next(line for line in ttgir.splitlines() if "amdg.buffer_store" in line)
+    store_encoding_match = re.search(r": tensor<256x128xbf16, (#[a-zA-Z0-9_]+)>", store_line)
+    assert store_encoding_match is not None
+    store_encoding = store_encoding_match.group(1)
+    encoding_line = next(line for line in ttgir.splitlines() if line.startswith(f"{store_encoding} = "))
+    assert "tlx.layout_is_explicit" in store_line
+    assert "sizePerThread = [1, 8]" in encoding_line
+    assert "threadsPerWarp = [4, 16]" in encoding_line
+    assert "warpsPerCTA = [4, 1]" in encoding_line

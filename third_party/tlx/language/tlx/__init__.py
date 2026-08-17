@@ -11,6 +11,8 @@ from .barrier import (
     named_barrier_arrive,
     named_barrier_wait,
     amd_sched_barrier,
+    sched_barrier,
+    set_priority,
 )
 from .dynamic_launch import (
     _alloc_clc_responses,
@@ -73,8 +75,10 @@ from .mma_ops import (
     async_dot,
     async_dot_scaled,
     async_dot_wait,
+    cast_preserve_layout,
     dot_scaled,
     extract_slice,
+    release_layout,
     rematerialized_range,
     require_amd_wmma_layout,
     require_layout,
@@ -82,11 +86,15 @@ from .mma_ops import (
 )
 from .types import (
     async_token,
+    amd_mfma_layout_encoding,
+    blocked_layout_encoding,
     buffered_tensor,
     buffered_tensor_type,
     clc_response,
     clc_response_type,
     CLCPipelineContext,
+    distributed_linear_layout_encoding,
+    dot_operand_layout_encoding,
     DummyRegisterLayoutEncoding,
     layout_encoding,
     mbarrier,
@@ -99,6 +107,7 @@ from .types import (
     reuse_group,
     reuse_group_ir_type,
     reuse_group_type,
+    slice_layout_encoding,
     storage_alias_spec as storage_alias_spec_type_class,
     storage_alias_spec_type,
     shared_layout_encoding,
@@ -121,9 +130,10 @@ from .utility import (
     size_of,
     stoch_round,
     thread_id,
+    warp_id,
 )
 from .mxfp8_utils import _to_mxfp8_block
-from .warp_ops import vote_ballot_sync, warp_redux
+from .warp_ops import vote_ballot_sync, warp_ballot, warp_redux
 from .warp_pipeline import warp_pipeline_stage
 
 __all__ = [
@@ -132,6 +142,11 @@ __all__ = [
     "async_task",
     # types
     "layout_encoding",
+    "blocked_layout_encoding",
+    "slice_layout_encoding",
+    "distributed_linear_layout_encoding",
+    "amd_mfma_layout_encoding",
+    "dot_operand_layout_encoding",
     "shared_layout_encoding",
     "swizzled_layout",
     "swizzled_shared_layout_encoding",
@@ -220,6 +235,8 @@ __all__ = [
     "amd_sched_barrier",
     # mma_ops
     "dot_scaled",
+    "release_layout",
+    "cast_preserve_layout",
     "require_amd_wmma_layout",
     "async_dot",
     "async_dot_scaled",
@@ -230,6 +247,7 @@ __all__ = [
     "cluster_cta_rank",
     "cluster_size_1d",
     "thread_id",
+    "warp_id",
     "async_task_replica_id",
     "dtype_of",
     "get_fp8_format_name",
@@ -248,7 +266,11 @@ __all__ = [
     # MXFP8
     "_to_mxfp8_block",
     # warp_ops
+    "warp_ballot",
     "vote_ballot_sync",
     # warp_pipeline
     "warp_pipeline_stage",
+    # scheduling
+    "sched_barrier",
+    "set_priority",
 ]

@@ -2,6 +2,7 @@
 
 import argparse
 import importlib.util
+import os
 from pathlib import Path
 
 import torch
@@ -53,15 +54,16 @@ def main():
     parser.add_argument("--K", type=int, default=None)
     parser.add_argument("--shape", type=int, nargs=3, action="append", metavar=("M", "N", "K"),
                         help="Custom M N K shape (repeatable). Overrides default sizes.")
-    parser.add_argument("--rep", type=positive_int, default=200, help="timed duration in milliseconds; default: 200")
+    parser.add_argument("--rep", type=positive_int, default=200,
+                        help="timed duration in milliseconds; default: 200")
     parser.add_argument("--warmup", type=nonnegative_int, default=25,
                         help="warmup duration in milliseconds; default: 25")
     parser.add_argument(
         "--input-mode",
         choices=INPUT_MODES,
         default="normal",
-        help=("input distribution; hpl and rand-int reproduce hipBLASLt seed-zero data, "
-              "and rand-int applies its alternating sign to B"),
+        help=("input distribution; hpl and rand-int reproduce hipBLASLt/Wave "
+              "seed-zero data, and rand-int applies their alternating sign to B"),
     )
     parser.add_argument("--seed", type=nonnegative_int, default=DEFAULT_INPUT_SEED,
                         help=f"deterministic input seed; default: {DEFAULT_INPUT_SEED}")
@@ -108,9 +110,10 @@ def main():
         )
         measurements.append((M, N, K, ms_ref, ms_tlx))
 
-    print(f"\n{KERNEL_NAME} (LLVM, input={args.input_mode}, seed={args.seed}; "
+    backend = "Wave" if os.environ.get("TRITON_DEFAULT_BACKEND") == "tlx_wave" else "LLVM"
+    print(f"\n{KERNEL_NAME} ({backend}, input={args.input_mode}, seed={args.seed}; "
           f"triton median, {args.warmup}ms warmup/{args.rep}ms timed):")
-    print(f"{'M':>6s} {'N':>6s} {'K':>6s}  {'rocBLAS':>8s}  {'TLX':>8s}")
+    print(f"{'M':>6s} {'N':>6s} {'K':>6s}  {'rocBLAS':>8s}  {backend:>8s}")
     for M, N, K, ms_ref, ms_tlx in measurements:
         print(f"{M:6d} {N:6d} {K:6d}  {tflops(ms_ref,M,N,K):7.1f}T  {tflops(ms_tlx,M,N,K):7.1f}T")
 

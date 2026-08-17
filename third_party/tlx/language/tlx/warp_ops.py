@@ -10,6 +10,21 @@ import triton.language as tl_module
 import triton.language.core as tl
 
 
+@tl.builtin
+def warp_ballot(pred: tl.tensor, _semantic=None) -> tl.tensor:
+    """Collect one boolean predicate per lane into a uniform i64 mask.
+
+    ``pred`` must have an explicit layout that assigns exactly one element to
+    each hardware lane. Bit N of the result corresponds to lane N. Wave32
+    targets leave the upper 32 bits clear.
+    """
+    if pred.dtype != tl.int1:
+        pred = pred != 0
+    if not pred.type.is_block():
+        raise TypeError("warp_ballot expects a distributed tensor predicate")
+    return _semantic.tensor(_semantic.builder.create_warp_ballot(pred.handle), tl.int64)
+
+
 @triton.jit
 def warp_redux(x, op: tl.constexpr):
     """Warp-level reduction with implicit broadcast.

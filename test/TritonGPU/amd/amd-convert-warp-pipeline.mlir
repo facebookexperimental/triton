@@ -790,6 +790,46 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
 
 // -----
 
+// ---- A pre-existing wait does not replace a required LOCAL fence ----
+
+#wait_blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [8, 8], warpsPerCTA = [8, 1], order = [1, 0]}>
+#wait_shared = #ttg.swizzled_shared<{vec = 4, perPhase = 1, maxPhase = 16, order = [1, 0]}>
+#wait_smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @flat_pipeline_wait_needs_local(
+      %data: tensor<64x64xf16, #wait_blocked>,
+      %ptr: tensor<64x64x!tt.ptr<f16>, #wait_blocked>) {
+    %smem = ttg.local_alloc : () -> !ttg.memdesc<64x64xf16, #wait_shared, #wait_smem, mutable>
+
+    scf.execute_region no_inline {
+      ttg.local_store %data, %smem : tensor<64x64xf16, #wait_blocked> -> !ttg.memdesc<64x64xf16, #wait_shared, #wait_smem, mutable>
+      scf.yield
+    } {triton.warp_pipeline.stage = "store"}
+
+    amdg.async_wait {num_inst = 0 : i32}
+
+    scf.execute_region no_inline {
+      %loaded = ttg.local_load %smem : !ttg.memdesc<64x64xf16, #wait_shared, #wait_smem, mutable> -> tensor<64x64xf16, #wait_blocked>
+      tt.store %ptr, %loaded : tensor<64x64x!tt.ptr<f16>, #wait_blocked>
+      scf.yield
+    } {triton.warp_pipeline.stage = "load"}
+
+    ttg.local_dealloc %smem : !ttg.memdesc<64x64xf16, #wait_shared, #wait_smem, mutable>
+    tt.return
+  }
+}
+
+// CHECK-LABEL: tt.func @flat_pipeline_wait_needs_local
+// CHECK: ttg.local_store
+// CHECK: rocdl.sched.barrier
+// CHECK-NEXT: amdg.async_wait
+// CHECK-NEXT: ttg.barrier local
+// CHECK-NEXT: rocdl.sched.barrier
+// CHECK: ttg.local_load
+// CHECK: tt.return
+
+// -----
+
 // ---- Back-to-back: no cross-pipeline LDS dep → barriers eliminated ----
 //
 // Loop 1 reads+writes shared memory.  Loop 2 only does global ops (no LDS).

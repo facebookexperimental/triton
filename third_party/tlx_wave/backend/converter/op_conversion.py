@@ -1,0 +1,6454 @@
+"""Source-op to target-program conversion."""
+
+from dataclasses import dataclass, replace
+import re
+import struct
+
+from .diagnostics import Diagnostic, fail
+from . import domains
+from . import layouts
+from . import target_ir
+
+STAGE = "op_conversion"
+_BINARY_OPS = {
+    "arith.addi": "addi",
+    "arith.subi": "subi",
+    "arith.muli": "muli",
+    "arith.andi": "andi",
+    "arith.ori": "ori",
+    "arith.xori": "xori",
+    "arith.divsi": "divsi",
+    "arith.divui": "divui",
+    "arith.remsi": "remsi",
+    "arith.remui": "remui",
+}
+
+
+@dataclass(frozen=True)
+class _IndexRelation:
+    expr: object
+    bindings: tuple[tuple[str, int], ...] = ()
+    join_branches: tuple[object, object] | None = None
+
+
+@dataclass(frozen=True)
+class _PointerRelation:
+    base_target_id: int
+    offset: _IndexRelation
+
+
+def _integer_target_type(target_type):
+    element_type = target_type.element_type
+    return element_type == "index" or (isinstance(element_type, str) and element_type.startswith("i"))
+
+
+def _value_relation(builder, target_id):
+    target_id = int(target_id)
+    relation = builder.value_relations.get(target_id)
+    if relation is not None:
+        return relation
+    value = builder.values[target_id]
+    if value.type.representation != "scalar" or not _integer_target_type(value.type):
+        return None
+    dsl = layouts.load_wave_dsl()
+    name = f"t{target_id}"
+    return _IndexRelation(dsl.sym(name), ((name, target_id), ))
+
+
+def _merge_relation_bindings(*relations):
+    bindings = {}
+    for relation in relations:
+        for name, target_id in relation.bindings:
+            previous = bindings.setdefault(str(name), int(target_id))
+            if previous != int(target_id):
+                raise ValueError(f"conflicting symbolic binding {name}")
+    return tuple(sorted(bindings.items()))
+
+
+def _set_binary_relation(builder, view, operation):
+    if len(view.result_target_ids) != 1 or len(view.operand_target_ids) != 2:
+        return
+    lhs = _value_relation(builder, view.operand_target_ids[0])
+    rhs = _value_relation(builder, view.operand_target_ids[1])
+    result = builder.values[view.result_target_ids[0]]
+    if lhs is None or rhs is None or not _integer_target_type(result.type):
+        return
+    dsl = layouts.load_wave_dsl()
+    if operation == "addi":
+        expr = lhs.expr + rhs.expr
+    elif operation == "subi":
+        expr = lhs.expr - rhs.expr
+    elif operation == "muli":
+        expr = lhs.expr * rhs.expr
+    elif operation == "andi":
+        expr = lhs.expr & rhs.expr
+    elif operation == "ori":
+        expr = lhs.expr | rhs.expr
+    elif operation == "xori":
+        expr = dsl.xor(lhs.expr, rhs.expr)
+    elif operation in {"divsi", "remsi"}:
+        width = int(target_ir.attrs_dict(builder.ops[-1]).get("source_width", 0))
+        if width <= 0 or width >= 63:
+            return
+        signed_lhs = layouts.signed_fixed_width_value(lhs.expr, width)
+        signed_rhs = layouts.signed_fixed_width_value(rhs.expr, width)
+        quotient = dsl.trunc(signed_lhs / signed_rhs)
+        expr = quotient if operation == "divsi" else signed_lhs - signed_rhs * quotient
+    elif operation in {"divui", "remui"}:
+        width = int(target_ir.attrs_dict(builder.ops[-1]).get("source_width", 0))
+        if width <= 0 or width >= 63:
+            return
+        unsigned_lhs = dsl.mod(lhs.expr, 1 << width)
+        unsigned_rhs = dsl.mod(rhs.expr, 1 << width)
+        quotient = dsl.trunc(unsigned_lhs / unsigned_rhs)
+        value = quotient if operation == "divui" else dsl.mod(unsigned_lhs, unsigned_rhs)
+        bias = 1 << (width - 1)
+        expr = dsl.mod(value + bias, 1 << width) - bias
+    else:
+        return
+    builder.value_relations[int(view.result_target_ids[0])] = _IndexRelation(expr, _merge_relation_bindings(lhs, rhs))
+
+
+def _logical_relation_transform(builder, source_id, result_id, substitutions):
+    source = _value_relation(builder, source_id)
+    if source is None:
+        return
+    dsl = layouts.load_wave_dsl()
+    expr = source.expr.subs({dsl.sym(name): value for name, value in substitutions.items()})
+    builder.value_relations[int(result_id)] = _IndexRelation(expr, source.bindings)
+
+
+def _logical_view_substitutions(source_shape, result_shape, *, transform, axis=None, order=(), selector=None):
+    dsl = layouts.load_wave_dsl()
+    source_shape = tuple(map(int, source_shape))
+    result_shape = tuple(map(int, result_shape))
+    result_dims = tuple(dsl.sym(f"dim{dim}") for dim in range(len(result_shape)))
+    if transform == "expand_dims":
+        return {f"dim{dim}": result_dims[dim + (dim >= int(axis))] for dim in range(len(source_shape))}
+    if transform == "broadcast":
+        return {
+            f"dim{dim}": (dsl.ixs_int(0) if source_shape[dim] == 1 else result_dims[dim])
+            for dim in range(len(source_shape))
+        }
+    if transform == "reshape":
+        flat = dsl.ixs_int(0)
+        for coord, extent in zip(result_dims, result_shape):
+            flat = flat * extent + coord
+        substitutions = {}
+        for dim in reversed(range(len(source_shape))):
+            substitutions[f"dim{dim}"] = dsl.mod(flat, source_shape[dim])
+            flat = dsl.floor(flat / source_shape[dim])
+        return substitutions
+    if transform == "trans":
+        substitutions = {}
+        for result_dim, source_dim in enumerate(map(int, order)):
+            substitutions[f"dim{source_dim}"] = result_dims[result_dim]
+        return substitutions
+    if transform == "split":
+        substitutions = {f"dim{dim}": result_dims[dim] for dim in range(len(result_shape))}
+        substitutions[f"dim{len(result_shape)}"] = dsl.ixs_int(int(selector))
+        return substitutions
+    return {f"dim{dim}": result_dims[dim] for dim in range(min(len(source_shape), len(result_shape)))}
+
+
+def _join_value_relation(builder, source_ids, result_id):
+    first = _value_relation(builder, source_ids[0])
+    second = _value_relation(builder, source_ids[1])
+    if first is None or second is None:
+        return
+    dsl = layouts.load_wave_dsl()
+    first_value = builder.values[int(source_ids[0])]
+    first_layout = builder.layouts[int(first_value.layout_map_id)]
+    selector = dsl.sym(f"dim{len(first_layout.shape)}")
+    builder.value_relations[int(result_id)] = _IndexRelation(
+        (1 - selector) * first.expr + selector * second.expr,
+        _merge_relation_bindings(first, second),
+        (first, second),
+    )
+
+
+def _memory_relation(builder, offset_target_id, element_byte_width, element_contiguity):
+    relation = _value_relation(builder, offset_target_id)
+    if relation is None:
+        fail(
+            "TLXW_RELATION_UNREPRESENTABLE_OFFSET",
+            STAGE,
+            "global-memory offset has no exact forward value relation",
+            target_value_id=int(offset_target_id),
+        )
+    value = builder.values[int(offset_target_id)]
+    if value.layout_map_id is None:
+        fail(
+            "TLXW_RELATION_UNREPRESENTABLE_OFFSET",
+            STAGE,
+            "global-memory tensor offset has no distributed layout",
+            target_value_id=int(offset_target_id),
+        )
+    bit_offset = layouts.global_memory_bit_offset_relation(
+        builder.layouts[int(value.layout_map_id)],
+        relation.expr,
+        element_byte_width=int(element_byte_width),
+        element_contiguity=int(element_contiguity),
+    )
+    return {
+        "bit_offset_relation": bit_offset,
+        "index_binding_count": len(relation.bindings),
+        "index_binding_names": tuple(name for name, _target_id in relation.bindings),
+    }, tuple(target_id for _name, target_id in relation.bindings)
+
+
+def _buffer_memory_relation(
+    builder,
+    base_target_id,
+    offset_target_id,
+    element_byte_width,
+    element_contiguity,
+):
+    """Compose a uniform pointer displacement into a buffer index relation.
+
+    Direct-to-LDS buffer operations carry a scalar resource base and a
+    distributed element offset.  Keep the resource rooted at the original
+    pointer and serialize any exact ``addptr`` displacement together with the
+    distributed offset.  This avoids materializing an equivalent buffer
+    descriptor for every displaced use while preserving the source address
+    expression exactly.
+    """
+    pointer = builder.pointer_relations.get(int(base_target_id))
+    if pointer is None:
+        attrs, bindings = _memory_relation(
+            builder,
+            offset_target_id,
+            element_byte_width,
+            element_contiguity,
+        )
+        return int(base_target_id), attrs, bindings
+
+    offset = _value_relation(builder, offset_target_id)
+    if offset is None:
+        fail(
+            "TLXW_RELATION_UNREPRESENTABLE_OFFSET",
+            STAGE,
+            "global-memory offset has no exact forward value relation",
+            target_value_id=int(offset_target_id),
+        )
+    value = builder.values[int(offset_target_id)]
+    if value.layout_map_id is None:
+        fail(
+            "TLXW_RELATION_UNREPRESENTABLE_OFFSET",
+            STAGE,
+            "global-memory tensor offset has no distributed layout",
+            target_value_id=int(offset_target_id),
+        )
+    combined = _IndexRelation(
+        pointer.offset.expr + offset.expr,
+        _merge_relation_bindings(pointer.offset, offset),
+    )
+    bit_offset = layouts.global_memory_bit_offset_relation(
+        builder.layouts[int(value.layout_map_id)],
+        combined.expr,
+        element_byte_width=int(element_byte_width),
+        element_contiguity=int(element_contiguity),
+    )
+    return pointer.base_target_id, {
+        "bit_offset_relation": bit_offset,
+        "index_binding_count": len(combined.bindings),
+        "index_binding_names": tuple(name for name, _target_id in combined.bindings),
+    }, tuple(target_id for _name, target_id in combined.bindings)
+
+
+def _source_value_use_count(conversion_input, source_value_id):
+    source_value_id = int(source_value_id)
+    return sum(operand_id == source_value_id for source_op in conversion_input.ops for operand_id in source_op.operands)
+
+
+def _pointer_memory_relation(builder, pointer_target_id, element_byte_width):
+    pointer = builder.pointer_relations.get(int(pointer_target_id))
+    if pointer is None:
+        fail(
+            "TLXW_RELATION_UNREPRESENTABLE_POINTER",
+            STAGE,
+            "tensor pointer has no exact forward base-offset relation",
+            target_value_id=int(pointer_target_id),
+        )
+    value = builder.values[int(pointer_target_id)]
+    if value.layout_map_id is None:
+        fail(
+            "TLXW_RELATION_UNREPRESENTABLE_POINTER",
+            STAGE,
+            "tensor pointer has no distributed layout",
+            target_value_id=int(pointer_target_id),
+        )
+    relation = layouts.global_memory_bit_offset_relation(
+        builder.layouts[int(value.layout_map_id)],
+        pointer.offset.expr,
+        element_byte_width=int(element_byte_width),
+        wrap_i32=False,
+    )
+    return pointer.base_target_id, {
+        "bit_offset_relation": relation,
+        "index_binding_count": len(pointer.offset.bindings),
+        "index_binding_names": tuple(name for name, _ in pointer.offset.bindings),
+    }, tuple(target_id for _name, target_id in pointer.offset.bindings)
+
+
+_FLOAT_BINARY_OPS = {
+    "arith.addf": "addf",
+    "arith.divf": "divf",
+    "arith.maximumf": "maximumf",
+    "arith.maxnumf": "maxnumf",
+    "arith.subf": "subf",
+    "arith.mulf": "mulf",
+}
+
+_FLOAT_UNARY_OPS = {
+    "math.exp2": "exp2",
+}
+
+_FASTMATH_FLAG_ORDER = (
+    "reassoc",
+    "nnan",
+    "ninf",
+    "nsz",
+    "arcp",
+    "contract",
+    "afn",
+    "fast",
+)
+
+_FLOAT_CAST_OPS = {
+    "arith.extf": "fp_convert",
+    "arith.truncf": "fp_convert",
+}
+
+_MMA_PACKET_REPRESENTATIONS = frozenset({
+    "simd_packet",
+    "simd_packet_tuple",
+})
+
+_LAYOUT_PRESERVING_SIMPLE_OPS = frozenset((
+    *_BINARY_OPS,
+    *_FLOAT_BINARY_OPS,
+    *_FLOAT_UNARY_OPS,
+    *_FLOAT_CAST_OPS,
+    "arith.cmpf",
+    "arith.cmpi",
+    "arith.maxsi",
+    "arith.minsi",
+    "tt.addptr",
+))
+
+_MMA_PACKET_RESULT_SOURCE_OPS = frozenset({
+    "arith.constant",
+    "arith.addf",
+    "arith.divf",
+    "arith.extf",
+    "arith.maximumf",
+    "arith.maxnumf",
+    "arith.mulf",
+    "arith.select",
+    "arith.subf",
+    "arith.truncf",
+    "amdg.buffer_load",
+    "tt.broadcast",
+    "tt.join",
+    "tt.reshape",
+    "tt.split",
+    "tt.trans",
+    "ttg.local_load",
+    "ttg.convert_layout",
+    "tt.expand_dims",
+    "tt.dot",
+    "tt.dot_scaled",
+    "math.exp2",
+    "scf.if",
+    "scf.for",
+})
+
+
+@dataclass(frozen=True)
+class OpConversionView:
+    op_index: int
+    op_name: str
+    attrs: dict
+    operand_target_ids: tuple[int, ...]
+    result_target_ids: tuple[int, ...]
+    result_layout_map_ids: tuple[int, ...]
+    fact_ids: tuple[int, ...]
+    fact_target_ids: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class MemdescInfo:
+    value_id: int
+    element_type: str | None
+    element_byte_width: int | None
+    shape: tuple[int, ...]
+    alloc_shape: tuple[int, ...]
+    allocation_bytes: int
+
+
+@dataclass(frozen=True)
+class MemdescViewInfo:
+    value_id: int
+    logical_origin: tuple[int, ...]
+    physical_shape: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class ConversionInput:
+    kernel: target_ir.TargetKernel
+    kernel_arg_ids: tuple[int, ...]
+    top_region_id: int
+    ops: tuple
+    regions: tuple
+    num_warps: int
+    threads_per_warp: int
+    value_element_byte_widths: dict[int, int | None]
+    value_divisibilities: dict[int, int | None]
+    memdescs: dict[int, MemdescInfo]
+    memdesc_views: dict[int, MemdescViewInfo | None]
+    memdesc_physical_allocation_bytes: dict[int, int]
+    fact_ids_by_op: dict[int, tuple[int, ...]]
+    token_nodes_by_op: dict[int, object]
+    token_groups_by_commit: dict[int, object]
+    token_groups_by_id: dict[int, object]
+    loop_token_carries_by_op: dict[int, tuple[object, ...]]
+    if_token_carries_by_op: dict[int, tuple[object, ...]]
+    implicit_wait_readiness_value_ids_by_op: dict[int, tuple[int, ...]]
+    async_issue_dependency_target_ids_by_op: dict[int, tuple[int, ...]]
+    async_wait_entry_dependency_target_ids_by_value_id: dict[int, tuple[int, ...]]
+
+
+def convert_ops(
+    source_program,
+    type_layout_program,
+    fact_program,
+    token_program,
+    *,
+    contract=None,
+):
+    conversion_input = _build_conversion_input(
+        source_program,
+        type_layout_program,
+        fact_program,
+        token_program,
+    )
+    builder = target_ir.TargetBuilder(
+        conversion_input.kernel,
+        layouts=tuple(target_ir.target_layout_from_converted(layout) for layout in type_layout_program.layouts),
+        contract=contract,
+    )
+    _seed_kernel_arguments(builder, conversion_input, type_layout_program)
+    _seed_kernel_argument_facts(
+        builder,
+        conversion_input,
+        fact_program,
+    )
+
+    _convert_region(
+        builder,
+        conversion_input,
+        type_layout_program,
+        fact_program,
+        conversion_input.top_region_id,
+        allow_yield=False,
+    )
+
+    builder.set_assumptions(
+        target_ir.target_assumptions_from_facts(
+            fact_program,
+            builder.source_value_targets,
+            builder.ops,
+        ))
+    return builder.build()
+
+
+def _build_conversion_input(source_program, type_layout_program, fact_program, token_program):
+    memdescs = _memdesc_infos(source_program)
+    memdesc_views = _compute_memdesc_view_infos(
+        source_program.values,
+        source_program.ops,
+        source_program.kernel.arg_ids,
+        memdescs,
+        source_program.regions,
+    )
+    memdesc_physical_allocation_bytes = _compute_memdesc_physical_allocation_bytes(
+        source_program.values,
+        source_program.ops,
+        type_layout_program,
+        memdescs,
+    )
+    kernel = target_ir.TargetKernel(
+        source_program.kernel.name,
+        source_program.kernel.target,
+        source_program.kernel.num_ctas,
+        source_program.kernel.num_warps,
+        source_program.kernel.threads_per_warp,
+        source_program.kernel.noinline,
+        enable_multi_wave_specialization=(source_program.kernel.enable_multi_wave_specialization),
+    )
+    return ConversionInput(
+        kernel,
+        tuple(source_program.kernel.arg_ids),
+        int(source_program.top_region_id),
+        tuple(source_program.ops),
+        tuple(source_program.regions),
+        int(source_program.kernel.num_warps or 1),
+        int(source_program.kernel.threads_per_warp or 64),
+        {value_id: value.type.element_byte_width
+         for value_id, value in source_program.values.items()},
+        {value_id: value.type.divisibility
+         for value_id, value in source_program.values.items()},
+        memdescs,
+        memdesc_views,
+        memdesc_physical_allocation_bytes,
+        _fact_ids_by_source_op(fact_program),
+        {node.op_index: node
+         for node in token_program.nodes},
+        {group.commit_op_index: group
+         for group in token_program.groups},
+        {group.group_id: group
+         for group in token_program.groups},
+        token_program.loop_token_carries_by_op,
+        token_program.if_token_carries_by_op,
+        token_program.implicit_wait_readiness_value_ids_by_op,
+        {},
+        {},
+    )
+
+
+def _convert_region(
+        builder,
+        conversion_input,
+        type_layout_program,
+        fact_program,
+        region_id,
+        *,
+        allow_yield,
+        yield_op_names=("scf.yield", ),
+):
+    for op_index in conversion_input.regions[region_id].op_indices:
+        op = conversion_input.ops[op_index]
+        if op.name in {"scf.yield", "tt.reduce.return"}:
+            if not allow_yield or op.name not in yield_op_names:
+                fail(
+                    "TLXW_OP_UNEXPECTED_YIELD",
+                    STAGE,
+                    f"{op.name} is not valid in this converted region",
+                    source_op_index=op.index,
+                )
+            return op.operands
+        _convert_source_op(
+            builder,
+            conversion_input,
+            type_layout_program,
+            fact_program,
+            op,
+        )
+    # Result-free SCF regions can use an implicit terminator.  The importer sees
+    # a genuinely empty region for the absent else arm of a one-sided scf.if.
+    # Callers validate the returned count, so a missing value yield still gets
+    # rejected as a for/if yield mismatch.
+    return ()
+
+
+def _convert_source_op(
+    builder,
+    conversion_input,
+    type_layout_program,
+    fact_program,
+    op,
+):
+    _require_allowed_mma_packet_results(type_layout_program, op)
+    if op.name == "scf.for":
+        _convert_for(
+            builder,
+            conversion_input,
+            type_layout_program,
+            fact_program,
+            op,
+        )
+        return
+    if op.name == "scf.if":
+        _convert_if(
+            builder,
+            conversion_input,
+            type_layout_program,
+            fact_program,
+            op,
+        )
+        return
+    if op.name == "tt.reduce":
+        _convert_reduce(
+            builder,
+            conversion_input,
+            type_layout_program,
+            fact_program,
+            op,
+        )
+        return
+    if op.name == "arith.constant" and _has_mma_packet_result(type_layout_program, op):
+        _convert_mma_packet_constant(builder, type_layout_program, op)
+        return
+    if op.name == "arith.extf" and _has_mma_packet_result(type_layout_program, op):
+        _convert_mma_packet_float_cast(builder, type_layout_program, op)
+        return
+    if op.name == "arith.truncf" and _has_mma_packet_result(type_layout_program, op):
+        _convert_mma_packet_truncf(builder, type_layout_program, op)
+        return
+    if op.name == "ttg.local_alloc":
+        _convert_local_alloc(
+            builder,
+            conversion_input,
+            type_layout_program,
+            op,
+        )
+        return
+    if op.name == "ttg.memdesc_index":
+        _convert_memdesc_index(
+            builder,
+            conversion_input,
+            type_layout_program,
+            op,
+        )
+        return
+    if op.name == "ttg.memdesc_reshape":
+        _convert_memdesc_reshape(builder, type_layout_program, op)
+        return
+    if op.name == "ttg.memdesc_reinterpret":
+        _convert_memdesc_reinterpret(builder, type_layout_program, op)
+        return
+    if op.name == "ttg.memdesc_subslice":
+        _convert_memdesc_subslice(
+            builder,
+            conversion_input,
+            type_layout_program,
+            op,
+        )
+        return
+    if op.name == "ttg.memdesc_trans":
+        _convert_memdesc_trans(builder, type_layout_program, op)
+        return
+    if op.name == "ttg.local_load":
+        _convert_local_load(builder, conversion_input, type_layout_program, op)
+        return
+    if op.name == "ttg.local_store":
+        _convert_local_store(builder, conversion_input, type_layout_program, op)
+        return
+    if op.name == "ttg.convert_layout":
+        _convert_layout(builder, conversion_input, type_layout_program, op)
+        return
+    if op.name in {"tt.reshape", "tt.trans"}:
+        _convert_structural_tensor_view(
+            builder,
+            conversion_input,
+            type_layout_program,
+            op,
+        )
+        return
+    if op.name == "tt.dot":
+        _convert_dot(builder, conversion_input, type_layout_program, op)
+        return
+    if op.name == "tt.dot_scaled":
+        _convert_dot_scaled(builder, conversion_input, type_layout_program, op)
+        return
+    if op.name == "amdg.buffer_load_to_local":
+        _convert_buffer_load_to_local(
+            builder,
+            conversion_input,
+            type_layout_program,
+            fact_program,
+            op,
+        )
+        return
+    if op.name == "amdg.buffer_load":
+        _convert_buffer_load(
+            builder,
+            conversion_input,
+            type_layout_program,
+            fact_program,
+            op,
+        )
+        return
+    if op.name == "amdg.buffer_store":
+        _convert_buffer_store(
+            builder,
+            conversion_input,
+            type_layout_program,
+            fact_program,
+            op,
+        )
+        return
+    if op.name == "tt.load":
+        _convert_load(builder, conversion_input, type_layout_program, op)
+        return
+    if op.name == "tt.store":
+        _convert_store(builder, conversion_input, type_layout_program, op)
+        return
+    if op.name == "ttg.async_commit_group":
+        _convert_async_commit_group(
+            builder,
+            type_layout_program,
+            conversion_input.token_groups_by_commit,
+            op,
+        )
+        return
+    if op.name == "ttg.async_wait":
+        _convert_async_wait(
+            builder,
+            conversion_input,
+            type_layout_program,
+            op,
+        )
+        return
+    if op.name == "rocdl.sched.barrier":
+        _convert_sched_barrier(builder, op)
+        return
+    if op.name in {"ttg.barrier", "rocdl.s.barrier"}:
+        _convert_barrier(builder, conversion_input, op)
+        return
+    if op.name == "amdg.cond_barrier":
+        _convert_cond_barrier(builder, op)
+        return
+    if op.name == "rocdl.s.setprio":
+        _convert_set_priority(builder, op)
+        return
+    if op.name == "tt.make_range":
+        _convert_make_range(
+            builder,
+            conversion_input,
+            type_layout_program,
+            op,
+        )
+        return
+    if op.name == "tt.expand_dims":
+        _convert_expand_dims(builder, type_layout_program, op)
+        return
+    if op.name == "tt.broadcast":
+        _convert_broadcast(builder, type_layout_program, op)
+        return
+    if op.name == "tt.join":
+        _convert_join(builder, type_layout_program, op)
+        return
+    if op.name == "tt.split":
+        _convert_split(builder, type_layout_program, op)
+        return
+    if op.name == "arith.cmpi":
+        _convert_cmpi(
+            builder,
+            conversion_input,
+            type_layout_program,
+            fact_program,
+            op,
+        )
+        return
+    if op.name == "arith.cmpf":
+        _convert_cmpf(builder, type_layout_program, op)
+        return
+    if op.name == "ttg.warp_ballot":
+        _convert_warp_ballot(builder, type_layout_program, op)
+        return
+    if op.name == "arith.select":
+        _convert_select(
+            builder,
+            conversion_input,
+            type_layout_program,
+            fact_program,
+            op,
+        )
+        return
+    converter = _converter_for_op(op.name)
+    if converter is None:
+        fail(
+            "TLXW_OP_UNSUPPORTED",
+            STAGE,
+            f"no op conversion for {op.name}",
+            source_op_index=op.index,
+        )
+    _require_simple_op_layout_contract(type_layout_program, op)
+    operand_target_ids = _operand_target_ids(builder, op)
+    result_target_ids, result_layout_map_ids = _declare_results(
+        builder,
+        op,
+        type_layout_program,
+    )
+    fact_ids = conversion_input.fact_ids_by_op.get(op.index, ())
+    view = OpConversionView(
+        op.index,
+        op.name,
+        dict(op.attrs),
+        operand_target_ids,
+        result_target_ids,
+        result_layout_map_ids,
+        fact_ids,
+        _fact_target_ids(builder, fact_program, fact_ids, op),
+    )
+    converter(builder, view)
+
+
+def _seed_kernel_arguments(builder, conversion_input, type_layout_program):
+    arg_target_ids = []
+    for source_value_id in conversion_input.kernel_arg_ids:
+        converted = type_layout_program.values[source_value_id]
+        if converted.type.representation in _MMA_PACKET_REPRESENTATIONS:
+            fail(
+                "TLXW_OP_MMA_PACKET_PRODUCER",
+                STAGE,
+                "MMA packet layouts cannot be kernel arguments; packet values "
+                "must be materialized inside the kernel",
+                source_value_id=source_value_id,
+            )
+        target_id = builder.add_value(
+            target_ir.target_type_from_converted(converted.type),
+            source_value_id=source_value_id,
+            debug_name=f"arg{source_value_id}",
+            layout_map_id=converted.layout_map_id,
+        )
+        arg_target_ids.append(target_id)
+        if converted.type.representation == "uniform_pointer":
+            builder.pointer_relations[target_id] = _PointerRelation(target_id,
+                                                                    _IndexRelation(layouts.load_wave_dsl().ixs_int(0)))
+    builder.set_kernel_arg_targets(tuple(arg_target_ids))
+
+
+def _seed_kernel_argument_facts(builder, conversion_input, fact_program):
+    for source_value_id in conversion_input.kernel_arg_ids:
+        target_ids = builder.source_value_targets.get(source_value_id, ())
+        if len(target_ids) != 1:
+            continue
+        target_id = target_ids[0]
+        target_type = builder.values[target_id].type
+        integer_shaped = target_type.kind in {"scalar", "tensor"} and (target_type.element_type == "index" or
+                                                                       _int_width(target_type.element_type) is not None)
+        fact_ids = tuple(
+            fact_id for fact_id in fact_program.by_value.get(source_value_id, ())
+            if fact_program.facts[fact_id].source_op_index is None and (fact_program.facts[fact_id].kind == "range" or (
+                fact_program.facts[fact_id].kind == "divisible" and integer_shaped)))
+        if not fact_ids:
+            continue
+        _refine_assumed_values(
+            builder,
+            fact_ids,
+            (target_id, ) * len(fact_ids),
+        )
+
+
+def _refine_assumed_values(
+    builder,
+    fact_ids,
+    fact_target_ids,
+    *,
+    source_op_index=None,
+):
+    fact_ids = tuple(int(fact_id) for fact_id in fact_ids)
+    fact_target_ids = tuple(int(target_id) for target_id in fact_target_ids)
+    if len(fact_ids) != len(fact_target_ids) or not fact_ids:
+        fail(
+            "TLXW_OP_ASSUME_FACT_TARGETS",
+            STAGE,
+            "assume refinement requires one target value per fact",
+            source_op_index=source_op_index,
+        )
+
+    operand_ids = tuple(dict.fromkeys(fact_target_ids))
+    result_by_operand = {}
+    for operand_id in operand_ids:
+        value = builder.values[operand_id]
+        if value.source_value_id is None:
+            fail(
+                "TLXW_OP_ASSUME_SSA",
+                STAGE,
+                "assume refinement requires a source-backed SSA value",
+                source_op_index=source_op_index,
+                target_value_id=operand_id,
+            )
+        result_id = builder.add_value(
+            value.type,
+            source_value_id=value.source_value_id,
+            debug_name=value.debug_name,
+            event_domain=value.event_domain,
+            layout_map_id=value.layout_map_id,
+            resource_target_ids=value.resource_target_ids,
+        )
+        builder.source_value_targets[int(value.source_value_id)] = (result_id, )
+        result_by_operand[operand_id] = result_id
+
+    result_ids = tuple(result_by_operand[operand_id] for operand_id in operand_ids)
+    builder.add_op(
+        "assume",
+        operands=operand_ids,
+        results=result_ids,
+        fact_ids=fact_ids,
+        fact_target_ids=tuple(result_by_operand[target_id] for target_id in fact_target_ids),
+        source_op_index=source_op_index,
+    )
+    return result_ids
+
+
+def _declare_results(builder, op, type_layout_program):
+    result_target_ids = []
+    result_layout_map_ids = []
+    for source_value_id in op.results:
+        converted = type_layout_program.values[source_value_id]
+        result_target_ids.append(
+            builder.add_value(
+                target_ir.target_type_from_converted(converted.type),
+                source_value_id=source_value_id,
+                debug_name=f"v{source_value_id}",
+                layout_map_id=converted.layout_map_id,
+            ))
+        if converted.layout_map_id is not None:
+            result_layout_map_ids.append(converted.layout_map_id)
+    return tuple(result_target_ids), tuple(result_layout_map_ids)
+
+
+def _protocol_token_type():
+    return target_ir.TargetType("token", "token")
+
+
+def _declare_protocol_token(
+        builder,
+        *,
+        event_domain,
+        debug_name,
+        source_value_id=None,
+        resource_target_ids=(),
+):
+    target_id = builder.add_value(
+        _protocol_token_type(),
+        source_value_id=source_value_id,
+        debug_name=debug_name,
+        event_domain=event_domain,
+        resource_target_ids=resource_target_ids,
+    )
+    return target_id
+
+
+def _operand_target_ids(builder, op):
+    operand_target_ids = []
+    for source_value_id in op.operands:
+        targets = builder.source_value_targets.get(source_value_id)
+        if not targets:
+            fail(
+                "TLXW_OP_UNCONVERTED_OPERAND",
+                STAGE,
+                f"operand {source_value_id} has no converted target value",
+                source_op_index=op.index,
+                source_value_id=source_value_id,
+            )
+        if len(targets) != 1:
+            fail(
+                "TLXW_OP_MULTI_VALUE_OPERAND",
+                STAGE,
+                f"operand {source_value_id} maps to multiple target values {targets}",
+                source_op_index=op.index,
+                source_value_id=source_value_id,
+            )
+        operand_target_ids.append(targets[0])
+    return tuple(operand_target_ids)
+
+
+def _resource_target_ids(builder, target_value_ids):
+    return tuple(
+        dict.fromkeys(resource_target_id for target_value_id in target_value_ids
+                      for resource_target_id in builder.values[int(target_value_id)].resource_target_ids))
+
+
+def _set_result_resource_targets(builder, result_target_ids, operand_target_ids):
+    resources = _resource_target_ids(builder, operand_target_ids)
+    for result_target_id in result_target_ids:
+        builder.set_value_resource_targets(result_target_id, resources)
+
+
+def _propagate_structural_event_domain(
+    builder,
+    destination_target_ids,
+    source_target_ids,
+    op,
+    description,
+):
+    domains = tuple(
+        dict.fromkeys(builder.values[int(target_id)].event_domain
+                      for target_id in source_target_ids
+                      if builder.values[int(target_id)].event_domain is not None))
+    if len(domains) > 1:
+        fail(
+            "TLXW_OP_STRUCTURAL_TOKEN_DOMAIN_MISMATCH",
+            STAGE,
+            f"{description} has incompatible explicit token domains {domains}",
+            source_op_index=op.index,
+        )
+    if not domains:
+        return
+    for target_id in destination_target_ids:
+        builder.set_value_event_domain(target_id, domains[0])
+
+
+def _converter_for_op(op_name):
+    return _SIMPLE_OP_CONVERTERS.get(op_name)
+
+
+def _convert_constant(builder, view):
+    (result_target_id, ) = view.result_target_ids
+    literal = _constant_literal(
+        view.attrs.get("value"),
+        source_op_index=view.op_index,
+        element_type=builder.values[result_target_id].type.element_type,
+    )
+    builder.add_op(
+        "constant",
+        results=view.result_target_ids,
+        attrs={"value": literal},
+        source_op_index=view.op_index,
+    )
+    if type(literal) in {bool, int} and _integer_target_type(builder.values[result_target_id].type):
+        builder.value_relations[int(result_target_id)] = _IndexRelation(layouts.load_wave_dsl().ixs_int(int(literal)))
+
+
+def _convert_binary(builder, view):
+    operation = _BINARY_OPS[view.op_name]
+    source_width = _target_int_width(builder, view.result_target_ids)
+    attrs = {
+        "operation": operation,
+        "source_width": source_width,
+    }
+    nsw, nuw = _arith_overflow_flags(view)
+    if nsw:
+        attrs["nsw"] = True
+    if nuw:
+        attrs["nuw"] = True
+    builder.add_op(
+        "binary",
+        operands=view.operand_target_ids,
+        results=view.result_target_ids,
+        attrs=attrs,
+        layout_map_ids=view.result_layout_map_ids,
+        source_op_index=view.op_index,
+    )
+    _set_binary_relation(builder, view, operation)
+
+
+def _convert_float_binary(builder, view):
+    result_type = builder.values[view.result_target_ids[0]].type
+    attrs = _float_binary_attrs(builder, view)
+    if result_type.representation in _MMA_PACKET_REPRESENTATIONS:
+        _require_mma_packet_float_binary_type(builder, view, result_type)
+        builder.add_op(
+            "float_binary",
+            operands=view.operand_target_ids,
+            results=view.result_target_ids,
+            attrs=attrs,
+            layout_map_ids=view.result_layout_map_ids,
+            source_op_index=view.op_index,
+        )
+        return
+    for target_value_id in (*view.operand_target_ids, *view.result_target_ids):
+        target_type = builder.values[target_value_id].type
+        if not _supports_float_binary_type(view.op_name, target_type, result_type):
+            fail(
+                "TLXW_OP_UNSUPPORTED_FLOAT_BINARY",
+                STAGE,
+                f"{view.op_name} requires supported Wave SIMD float operands",
+                source_op_index=view.op_index,
+                target_value_id=target_value_id,
+            )
+    builder.add_op(
+        "float_binary",
+        operands=view.operand_target_ids,
+        results=view.result_target_ids,
+        attrs=attrs,
+        layout_map_ids=view.result_layout_map_ids,
+        source_op_index=view.op_index,
+    )
+
+
+def _convert_float_unary(builder, view):
+    if len(view.operand_target_ids) != 1 or len(view.result_target_ids) != 1:
+        fail(
+            "TLXW_OP_UNSUPPORTED_FLOAT_UNARY",
+            STAGE,
+            f"{view.op_name} requires one operand and one result",
+            source_op_index=view.op_index,
+        )
+    operand_type = builder.values[view.operand_target_ids[0]].type
+    result_type = builder.values[view.result_target_ids[0]].type
+    supported_representations = {
+        "simd",
+        "simd_tuple",
+        *_MMA_PACKET_REPRESENTATIONS,
+    }
+    if (operand_type.representation not in supported_representations
+            or result_type.representation not in supported_representations
+            or operand_type.representation != result_type.representation or operand_type.element_type != "f32"
+            or result_type.element_type != "f32"
+            or int(operand_type.component_count) != int(result_type.component_count)):
+        fail(
+            "TLXW_OP_UNSUPPORTED_FLOAT_UNARY",
+            STAGE,
+            f"{view.op_name} requires matching f32 SIMD or MMA packet payloads",
+            source_op_index=view.op_index,
+        )
+    attrs = {"operation": _FLOAT_UNARY_OPS[view.op_name]}
+    fastmath = _translated_fastmath_flags(
+        view.attrs,
+        source_op_index=view.op_index,
+        enable_fp_fusion=builder.contract.enable_fp_fusion,
+    )
+    if fastmath:
+        attrs["fastmath"] = fastmath
+    builder.add_op(
+        "float_unary",
+        operands=view.operand_target_ids,
+        results=view.result_target_ids,
+        attrs=attrs,
+        layout_map_ids=view.result_layout_map_ids,
+        source_op_index=view.op_index,
+    )
+
+
+def _float_binary_attrs(builder, view):
+    attrs = {"operation": _FLOAT_BINARY_OPS[view.op_name]}
+    flags = _translated_fastmath_flags(
+        view.attrs,
+        source_op_index=view.op_index,
+        enable_fp_fusion=builder.contract.enable_fp_fusion,
+    )
+    if flags:
+        attrs["fastmath"] = flags
+    return attrs
+
+
+def _translated_fastmath_flags(source_attrs, *, source_op_index, enable_fp_fusion):
+    flags = ()
+    if "fastmath" in source_attrs:
+        flags = _normalize_fastmath_flags(
+            source_attrs["fastmath"],
+            source_op_index=source_op_index,
+        )
+    if not enable_fp_fusion or "fast" in flags:
+        return flags
+    enabled = {*flags, "contract"}
+    return tuple(flag for flag in _FASTMATH_FLAG_ORDER if flag in enabled)
+
+
+def _normalize_fastmath_flags(value, *, source_op_index):
+    text = str(value)
+    match = re.search(r"fastmath<([^>]*)>", text)
+    if match is None:
+        fail(
+            "TLXW_OP_UNSUPPORTED_FASTMATH",
+            STAGE,
+            f"unsupported arith fastmath attribute {text}",
+            source_op_index=source_op_index,
+        )
+    flag_text = match.group(1).strip()
+    if flag_text in {"", "none"}:
+        return ()
+    flags = tuple(part.strip() for part in flag_text.split(",") if part.strip())
+    unknown = sorted(set(flags) - set(_FASTMATH_FLAG_ORDER))
+    if unknown:
+        fail(
+            "TLXW_OP_UNSUPPORTED_FASTMATH",
+            STAGE,
+            f"unsupported arith fastmath flags {', '.join(unknown)}",
+            source_op_index=source_op_index,
+        )
+    if "fast" in flags:
+        return ("fast", )
+    return tuple(flag for flag in _FASTMATH_FLAG_ORDER if flag in flags)
+
+
+def _supports_float_binary_type(op_name, target_type, result_type):
+    if target_type.representation not in {"simd", "simd_tuple"}:
+        return False
+    if target_type.element_type != result_type.element_type:
+        return False
+    if op_name in {"arith.divf", "arith.maximumf", "arith.maxnumf", "arith.subf"}:
+        return target_type.element_type == "f32"
+    return target_type.element_type in {"f16", "f32"}
+
+
+def _require_mma_packet_float_binary_type(builder, view, result_type):
+    if result_type.element_type != "f32":
+        fail(
+            "TLXW_OP_UNSUPPORTED_FLOAT_BINARY",
+            STAGE,
+            "fragment float binary ops are only supported for f32 MFMA payloads",
+            source_op_index=view.op_index,
+        )
+    for target_value_id in (*view.operand_target_ids, *view.result_target_ids):
+        target_type = builder.values[target_value_id].type
+        if target_type.representation not in _MMA_PACKET_REPRESENTATIONS:
+            fail(
+                "TLXW_OP_UNSUPPORTED_FLOAT_BINARY",
+                STAGE,
+                f"{view.op_name} MMA packet arithmetic requires packet operands and result",
+                source_op_index=view.op_index,
+                target_value_id=target_value_id,
+            )
+        if target_type.element_type != result_type.element_type:
+            fail(
+                "TLXW_OP_UNSUPPORTED_FLOAT_BINARY",
+                STAGE,
+                f"{view.op_name} MMA packet arithmetic requires matching element types",
+                source_op_index=view.op_index,
+                target_value_id=target_value_id,
+            )
+
+
+def _convert_float_cast(builder, view):
+    result_type = builder.values[view.result_target_ids[0]].type
+    operand_type = builder.values[view.operand_target_ids[0]].type
+    for target_value_id in (*view.operand_target_ids, *view.result_target_ids):
+        target_type = builder.values[target_value_id].type
+        if target_type.representation not in {"simd", "simd_tuple"}:
+            fail(
+                "TLXW_OP_UNSUPPORTED_FLOAT_CAST",
+                STAGE,
+                f"{view.op_name} requires Wave SIMD float values",
+                source_op_index=view.op_index,
+                target_value_id=target_value_id,
+            )
+    if view.op_name == "arith.extf":
+        supported = operand_type.element_type in {"f16", "bf16"} and result_type.element_type == "f32"
+        description = "f16/bf16 to f32"
+    else:
+        supported = operand_type.element_type == "f32" and result_type.element_type in {"f16", "bf16"}
+        description = "f32 to f16/bf16"
+    if not supported:
+        fail(
+            "TLXW_OP_UNSUPPORTED_FLOAT_CAST",
+            STAGE,
+            f"only {description} {view.op_name} is converted yet",
+            source_op_index=view.op_index,
+        )
+    builder.add_op(
+        "float_cast",
+        operands=view.operand_target_ids,
+        results=view.result_target_ids,
+        attrs={"operation": _FLOAT_CAST_OPS[view.op_name]},
+        layout_map_ids=view.result_layout_map_ids,
+        source_op_index=view.op_index,
+    )
+
+
+def _convert_mma_packet_float_cast(builder, type_layout_program, op):
+    if len(op.operands) != 1 or len(op.results) != 1:
+        fail(
+            "TLXW_OP_UNSUPPORTED_FLOAT_CAST",
+            STAGE,
+            "MMA packet arith.extf requires one operand and one result",
+            source_op_index=op.index,
+        )
+    operand = type_layout_program.values[op.operands[0]]
+    result = type_layout_program.values[op.results[0]]
+    if operand.type.representation not in _MMA_PACKET_REPRESENTATIONS:
+        fail(
+            "TLXW_OP_UNSUPPORTED_FLOAT_CAST",
+            STAGE,
+            "MMA packet arith.extf requires a packet operand",
+            source_op_index=op.index,
+            source_value_id=operand.value_id,
+        )
+    if operand.type.element_type not in {"f16", "bf16"} or result.type.element_type != "f32":
+        fail(
+            "TLXW_OP_UNSUPPORTED_FLOAT_CAST",
+            STAGE,
+            "only f16/bf16 to f32 MMA packet arith.extf is converted yet",
+            source_op_index=op.index,
+        )
+    if int(operand.type.component_count) != int(result.type.component_count):
+        fail(
+            "TLXW_OP_UNSUPPORTED_FLOAT_CAST",
+            STAGE,
+            "MMA packet arith.extf component counts must match",
+            source_op_index=op.index,
+        )
+    _require_same_layout_except_element_type(
+        type_layout_program,
+        operand,
+        result,
+        "MMA packet arith.extf operand and result",
+        op,
+    )
+    result_target_ids, result_layout_map_ids = _declare_results(
+        builder,
+        op,
+        type_layout_program,
+    )
+    builder.add_op(
+        "float_cast",
+        operands=_operand_target_ids(builder, op),
+        results=result_target_ids,
+        attrs={
+            "operation": _FLOAT_CAST_OPS[op.name],
+            "result_value_mode": "mma_packet_payload",
+            "registers": _mma_packet_registers(type_layout_program, result, op),
+        },
+        layout_map_ids=result_layout_map_ids,
+        source_op_index=op.index,
+    )
+
+
+def _convert_cmpi(
+    builder,
+    conversion_input,
+    type_layout_program,
+    fact_program,
+    op,
+):
+    del conversion_input, fact_program
+    _require_simple_op_layout_contract(type_layout_program, op)
+    if len(op.operands) != 2 or len(op.results) != 1:
+        fail(
+            "TLXW_OP_CMPI",
+            STAGE,
+            "arith.cmpi requires two operands and one result",
+            source_op_index=op.index,
+        )
+    operand_target_ids = _operand_target_ids(builder, op)
+    result_target_ids, result_layout_map_ids = _declare_results(
+        builder,
+        op,
+        type_layout_program,
+    )
+    builder.add_op(
+        "cmpi",
+        operands=operand_target_ids,
+        results=result_target_ids,
+        attrs={
+            "predicate": _cmpi_predicate(op.attrs.get("predicate")),
+            "source_width": _target_int_width(builder, operand_target_ids),
+        },
+        layout_map_ids=result_layout_map_ids,
+        source_op_index=op.index,
+    )
+
+
+def _convert_cmpf(builder, type_layout_program, op):
+    _require_simple_op_layout_contract(type_layout_program, op)
+    if len(op.operands) != 2 or len(op.results) != 1:
+        fail(
+            "TLXW_OP_CMPF",
+            STAGE,
+            "arith.cmpf requires two operands and one result",
+            source_op_index=op.index,
+        )
+    result_target_ids, result_layout_map_ids = _declare_results(
+        builder,
+        op,
+        type_layout_program,
+    )
+    builder.add_op(
+        "cmpf",
+        operands=_operand_target_ids(builder, op),
+        results=result_target_ids,
+        attrs={"predicate": _cmpf_predicate(op.attrs.get("predicate"))},
+        layout_map_ids=result_layout_map_ids,
+        source_op_index=op.index,
+    )
+
+
+def _convert_minsi(builder, view):
+    builder.add_op(
+        "minsi",
+        operands=view.operand_target_ids,
+        results=view.result_target_ids,
+        attrs={"source_width": _target_int_width(builder, view.result_target_ids)},
+        layout_map_ids=view.result_layout_map_ids,
+        source_op_index=view.op_index,
+    )
+
+
+def _convert_maxsi(builder, view):
+    builder.add_op(
+        "maxsi",
+        operands=view.operand_target_ids,
+        results=view.result_target_ids,
+        attrs={"source_width": _target_int_width(builder, view.result_target_ids)},
+        layout_map_ids=view.result_layout_map_ids,
+        source_op_index=view.op_index,
+    )
+
+
+def _convert_assume(builder, view):
+    if not view.fact_ids:
+        return
+    _refine_assumed_values(
+        builder,
+        view.fact_ids,
+        view.fact_target_ids,
+        source_op_index=view.op_index,
+    )
+
+
+def _arith_overflow_flags(view):
+    if view.op_name not in {"arith.addi", "arith.muli", "arith.subi"}:
+        return False, False
+    attr = view.attrs.get("overflowFlags")
+    if attr is None:
+        return False, False
+    text = str(attr)
+    return "nsw" in text, "nuw" in text
+
+
+def _convert_make_range(
+    builder,
+    conversion_input,
+    type_layout_program,
+    op,
+):
+    result_target_ids, result_layout_map_ids = _declare_results(
+        builder,
+        op,
+        type_layout_program,
+    )
+    attrs = {
+        "start": _int_attr(op.attrs, "start"),
+        "end": _int_attr(op.attrs, "end"),
+    }
+    attrs.update(_make_range_coordinate_attrs(
+        type_layout_program,
+        op,
+    ))
+    builder.add_op(
+        "make_range",
+        results=result_target_ids,
+        attrs=attrs,
+        layout_map_ids=result_layout_map_ids,
+        source_op_index=op.index,
+    )
+    layout = type_layout_program.layouts[int(result_layout_map_ids[0])]
+    dsl = layouts.load_wave_dsl()
+    logical_index = dsl.ixs_int(0)
+    for dim, extent in enumerate(layout.shape):
+        logical_index = logical_index * int(extent) + dsl.sym(f"dim{dim}")
+    builder.value_relations[int(result_target_ids[0])] = _IndexRelation(int(attrs["start"]) + logical_index)
+
+
+def _make_range_coordinate_attrs(
+    type_layout_program,
+    op,
+):
+    if len(op.results) != 1:
+        fail(
+            "TLXW_OP_MAKE_RANGE",
+            STAGE,
+            "tt.make_range requires one result",
+            source_op_index=op.index,
+        )
+    result = type_layout_program.values[op.results[0]]
+    if result.layout_map_id is None:
+        fail(
+            "TLXW_OP_MAKE_RANGE_LAYOUT",
+            STAGE,
+            "tt.make_range requires a distributed layout",
+            source_op_index=op.index,
+            source_value_id=result.value_id,
+        )
+    layout = type_layout_program.layouts[int(result.layout_map_id)]
+    lane_width = int(result.type.lane_width or layout.lane_width)
+    warp_count = _layout_warp_count(layout)
+    try:
+        relation = layouts.make_range_relation(
+            layout,
+            int(result.type.component_count),
+            lane_width,
+            warp_count,
+            _int_attr(op.attrs, "start"),
+            _int_attr(op.attrs, "end"),
+            source_op_index=op.index,
+            source_value_id=result.value_id,
+        )
+    except ValueError as exc:
+        fail(
+            "TLXW_OP_MAKE_RANGE_LAYOUT",
+            STAGE,
+            str(exc),
+            source_op_index=op.index,
+            source_value_id=result.value_id,
+        )
+    return {"relation": relation}
+
+
+def _layout_warp_count(layout):
+    return layouts.layout_warp_count(layout)
+
+
+def _packet_relation_attrs(
+        type_layout_program,
+        source_value_ids,
+        result_value_ids,
+        *,
+        transform="identity",
+        axis=None,
+        order=(),
+        source_invariant_bits=None,
+        op,
+):
+    values = type_layout_program.values
+    sources = tuple(
+        _layout_for_converted_value(type_layout_program, values[int(value_id)]) for value_id in source_value_ids)
+    results = tuple(
+        _layout_for_converted_value(type_layout_program, values[int(value_id)]) for value_id in result_value_ids)
+    if any(layout is None for layout in (*sources, *results)):
+        fail(
+            "TLXW_OP_UNSUPPORTED_REMAP",
+            STAGE,
+            "layout conversion requires distributed linear layouts",
+            source_op_index=op.index,
+        )
+    try:
+        return layouts.packet_layout_relations(
+            sources,
+            results,
+            transform=transform,
+            axis=axis,
+            order=order,
+            source_invariant_bits=source_invariant_bits,
+        )
+    except ValueError as exc:
+        fail(
+            "TLXW_OP_UNSUPPORTED_REMAP",
+            STAGE,
+            str(exc),
+            source_op_index=op.index,
+        )
+
+
+def _convert_splat(builder, view):
+    builder.add_op(
+        "splat",
+        operands=view.operand_target_ids,
+        results=view.result_target_ids,
+        layout_map_ids=view.result_layout_map_ids,
+        source_op_index=view.op_index,
+    )
+    if len(view.result_target_ids) == 1 and len(view.operand_target_ids) == 1:
+        pointer = builder.pointer_relations.get(int(view.operand_target_ids[0]))
+        if pointer is not None:
+            builder.pointer_relations[int(view.result_target_ids[0])] = pointer
+        operand_target_id = int(view.operand_target_ids[0])
+        operand = builder.values[operand_target_id]
+        if operand.type.representation == "scalar" and _integer_target_type(operand.type):
+            relation = builder.value_relations.get(operand_target_id)
+            if relation is None or relation.bindings:
+                dsl = layouts.load_wave_dsl()
+                name = f"t{operand_target_id}"
+                relation = _IndexRelation(
+                    dsl.sym(name),
+                    ((name, operand_target_id), ),
+                )
+        else:
+            relation = _value_relation(builder, operand_target_id)
+        if relation is not None:
+            builder.value_relations[int(view.result_target_ids[0])] = relation
+
+
+def _convert_addptr(builder, view):
+    builder.add_op(
+        "addptr",
+        operands=view.operand_target_ids,
+        results=view.result_target_ids,
+        layout_map_ids=view.result_layout_map_ids,
+        source_op_index=view.op_index,
+    )
+    if len(view.operand_target_ids) != 2 or len(view.result_target_ids) != 1:
+        return
+    pointer = builder.pointer_relations.get(int(view.operand_target_ids[0]))
+    offset = _value_relation(builder, view.operand_target_ids[1])
+    if pointer is None or offset is None:
+        return
+    builder.pointer_relations[int(view.result_target_ids[0])] = _PointerRelation(
+        pointer.base_target_id,
+        _IndexRelation(
+            pointer.offset.expr + offset.expr,
+            _merge_relation_bindings(pointer.offset, offset),
+        ),
+    )
+
+
+def _convert_expand_dims(builder, type_layout_program, op):
+    if len(op.operands) != 1 or len(op.results) != 1:
+        fail(
+            "TLXW_OP_UNSUPPORTED_REMAP",
+            STAGE,
+            "tt.expand_dims requires one operand and one result",
+            source_op_index=op.index,
+        )
+    result_target_ids, result_layout_map_ids = _declare_results(
+        builder,
+        op,
+        type_layout_program,
+    )
+    axis = _int_attr(op.attrs, "axis")
+    relation = _packet_relation_attrs(
+        type_layout_program,
+        op.operands,
+        op.results,
+        transform="expand_dims",
+        axis=axis,
+        op=op,
+    )[0]
+    builder.add_op(
+        "expand_dims",
+        operands=_operand_target_ids(builder, op),
+        results=result_target_ids,
+        attrs={"axis": axis, "relation": relation},
+        layout_map_ids=result_layout_map_ids,
+        source_op_index=op.index,
+    )
+    source_shape = type_layout_program.layouts[int(type_layout_program.values[op.operands[0]].layout_map_id)].shape
+    result_shape = type_layout_program.layouts[int(result_layout_map_ids[0])].shape
+    _logical_relation_transform(
+        builder,
+        _operand_target_ids(builder, op)[0],
+        result_target_ids[0],
+        _logical_view_substitutions(source_shape, result_shape, transform="expand_dims", axis=axis),
+    )
+
+
+def _convert_broadcast(builder, type_layout_program, op):
+    if len(op.operands) != 1 or len(op.results) != 1:
+        fail(
+            "TLXW_OP_BROADCAST",
+            STAGE,
+            "tt.broadcast requires one operand and one result",
+            source_op_index=op.index,
+        )
+    result_target_ids, result_layout_map_ids = _declare_results(
+        builder,
+        op,
+        type_layout_program,
+    )
+    relation = _packet_relation_attrs(type_layout_program, op.operands, op.results, transform="broadcast", op=op)[0]
+    builder.add_op(
+        "broadcast",
+        operands=_operand_target_ids(builder, op),
+        results=result_target_ids,
+        attrs={"relation": relation},
+        layout_map_ids=result_layout_map_ids,
+        source_op_index=op.index,
+    )
+    source_shape = type_layout_program.layouts[int(type_layout_program.values[op.operands[0]].layout_map_id)].shape
+    result_shape = type_layout_program.layouts[int(result_layout_map_ids[0])].shape
+    _logical_relation_transform(
+        builder,
+        _operand_target_ids(builder, op)[0],
+        result_target_ids[0],
+        _logical_view_substitutions(source_shape, result_shape, transform="broadcast"),
+    )
+
+
+def _convert_join(builder, type_layout_program, op):
+    if len(op.operands) != 2 or len(op.results) != 1:
+        fail(
+            "TLXW_OP_STRUCTURAL_JOIN",
+            STAGE,
+            "tt.join requires two operands and one result",
+            source_op_index=op.index,
+        )
+    result_target_ids, result_layout_map_ids = _declare_results(
+        builder,
+        op,
+        type_layout_program,
+    )
+    relation = _packet_relation_attrs(type_layout_program, op.operands, op.results, transform="join", op=op)[0]
+    builder.add_op(
+        "join",
+        operands=_operand_target_ids(builder, op),
+        results=result_target_ids,
+        attrs={"relation": relation},
+        layout_map_ids=result_layout_map_ids,
+        source_op_index=op.index,
+    )
+    _join_value_relation(builder, _operand_target_ids(builder, op), result_target_ids[0])
+
+
+def _convert_split(builder, type_layout_program, op):
+    if len(op.operands) != 1 or len(op.results) != 2:
+        fail(
+            "TLXW_OP_STRUCTURAL_SPLIT",
+            STAGE,
+            "tt.split requires one operand and two results",
+            source_op_index=op.index,
+        )
+    result_target_ids, result_layout_map_ids = _declare_results(
+        builder,
+        op,
+        type_layout_program,
+    )
+    relations = _packet_relation_attrs(type_layout_program, op.operands, op.results, transform="split", op=op)
+    builder.add_op(
+        "split",
+        operands=_operand_target_ids(builder, op),
+        results=result_target_ids,
+        attrs={"relations": relations},
+        layout_map_ids=result_layout_map_ids,
+        source_op_index=op.index,
+    )
+    source_id = _operand_target_ids(builder, op)[0]
+    source_relation = _value_relation(builder, source_id)
+    for index, (result_target_id, relation) in enumerate(zip(result_target_ids, relations)):
+        if source_relation is not None and source_relation.join_branches is not None:
+            builder.value_relations[int(result_target_id)] = (source_relation.join_branches[index])
+            continue
+        source_shape = type_layout_program.layouts[int(type_layout_program.values[op.operands[0]].layout_map_id)].shape
+        result_shape = type_layout_program.layouts[int(result_layout_map_ids[index])].shape
+        _logical_relation_transform(
+            builder,
+            source_id,
+            result_target_id,
+            _logical_view_substitutions(
+                source_shape,
+                result_shape,
+                transform="split",
+                selector=index,
+            ),
+        )
+
+
+def _convert_program_id(builder, view):
+    builder.add_op(
+        "program_id",
+        results=view.result_target_ids,
+        attrs={"axis": _int_attr(view.attrs, "axis")},
+        source_op_index=view.op_index,
+    )
+
+
+def _convert_warp_id(builder, view):
+    builder.add_op(
+        "warp_id",
+        results=view.result_target_ids,
+        source_op_index=view.op_index,
+    )
+
+
+def _convert_warp_ballot(builder, type_layout_program, op):
+    if len(op.operands) != 1 or len(op.results) != 1:
+        fail(
+            "TLXW_OP_WARP_BALLOT",
+            STAGE,
+            "ttg.warp_ballot requires one predicate and one result",
+            source_op_index=op.index,
+        )
+    predicate = type_layout_program.values[op.operands[0]]
+    result = type_layout_program.values[op.results[0]]
+    if (predicate.type.representation != "mask" or int(predicate.type.component_count) != 1):
+        fail(
+            "TLXW_OP_WARP_BALLOT",
+            STAGE,
+            "ttg.warp_ballot predicate must map exactly one i1 element to each lane",
+            source_op_index=op.index,
+            source_value_id=predicate.value_id,
+        )
+    if (result.type.representation != "scalar" or result.type.element_type != "i64"):
+        fail(
+            "TLXW_OP_WARP_BALLOT",
+            STAGE,
+            "ttg.warp_ballot result must be a scalar i64",
+            source_op_index=op.index,
+            source_value_id=result.value_id,
+        )
+    result_target_ids, _ = _declare_results(builder, op, type_layout_program)
+    builder.add_op(
+        "ballot",
+        operands=_operand_target_ids(builder, op),
+        results=result_target_ids,
+        source_op_index=op.index,
+    )
+
+
+def _convert_thread_id(builder, view):
+    builder.add_op(
+        "thread_id",
+        results=view.result_target_ids,
+        attrs={"axis": _int_attr(view.attrs, "axis")},
+        source_op_index=view.op_index,
+    )
+
+
+def _convert_workitem_id_x(builder, view):
+    builder.add_op(
+        "thread_id",
+        results=view.result_target_ids,
+        attrs={"axis": 0},
+        source_op_index=view.op_index,
+    )
+
+
+def _convert_index_cast(builder, view):
+    if len(view.operand_target_ids) != 1 or len(view.result_target_ids) != 1:
+        fail(
+            "TLXW_OP_INDEX_CAST",
+            STAGE,
+            "arith.index_cast requires one operand and one result",
+            source_op_index=view.op_index,
+        )
+    operand_type = builder.values[view.operand_target_ids[0]].type
+    result_type = builder.values[view.result_target_ids[0]].type
+    if (operand_type.representation != result_type.representation
+            or operand_type.component_count != result_type.component_count
+            or operand_type.lane_width != result_type.lane_width
+            or {operand_type.element_type, result_type.element_type} not in ({"index", "i32"}, {"index", "i64"})):
+        fail(
+            "TLXW_OP_INDEX_CAST",
+            STAGE,
+            "arith.index_cast requires a structural index/integer cast with "
+            "unchanged value distribution",
+            source_op_index=view.op_index,
+        )
+    builder.add_op(
+        "type_convert",
+        operands=view.operand_target_ids,
+        results=view.result_target_ids,
+        attrs={"mode": "index_cast"},
+        source_op_index=view.op_index,
+    )
+    relation = _value_relation(builder, view.operand_target_ids[0])
+    if relation is not None and result_type.representation != "scalar":
+        expr = relation.expr
+        if result_type.element_type == "i32" and operand_type.element_type != "i32":
+            dsl = layouts.load_wave_dsl()
+            expr = dsl.mod(expr + (1 << 31), 1 << 32) - (1 << 31)
+        builder.value_relations[int(view.result_target_ids[0])] = _IndexRelation(expr, relation.bindings)
+
+
+def _convert_if(
+    builder,
+    conversion_input,
+    type_layout_program,
+    fact_program,
+    op,
+):
+    if len(op.operands) != 1 or len(op.region_ids) != 2:
+        fail(
+            "TLXW_OP_UNSUPPORTED_IF",
+            STAGE,
+            "scf.if conversion requires one condition and then/else regions",
+            source_op_index=op.index,
+        )
+    token_carries = conversion_input.if_token_carries_by_op.get(op.index, ())
+    condition_targets = _operand_target_ids(builder, op)
+    data_result_target_ids, result_layout_map_ids = _declare_results(
+        builder,
+        op,
+        type_layout_program,
+    )
+    token_result_target_ids = tuple(
+        builder.add_value(
+            target_ir.target_type_from_converted(type_layout_program.values[_if_token_carry_type_source_value_id(
+                carry)].type),
+            debug_name=f"if_token_result_{op.index}_{index}",
+        ) for index, carry in enumerate(token_carries))
+    result_target_ids = (*data_result_target_ids, *token_result_target_ids)
+    then_region_id = builder.add_region()
+    else_region_id = builder.add_region()
+    outer_source_targets = dict(builder.source_value_targets)
+    with builder.insertion_region(then_region_id):
+        try:
+            then_yields = _convert_region(
+                builder,
+                conversion_input,
+                type_layout_program,
+                fact_program,
+                op.region_ids[0],
+                allow_yield=True,
+            )
+            if len(then_yields) != len(data_result_target_ids):
+                fail(
+                    "TLXW_OP_IF_YIELD_MISMATCH",
+                    STAGE,
+                    "scf.if then yield count must match result count",
+                    source_op_index=op.index,
+                )
+            _require_yield_layouts(
+                type_layout_program,
+                then_yields,
+                op.results,
+                "scf.if then yield and result",
+                op,
+            )
+            then_data_target_ids = tuple(
+                _single_source_target(builder, source_value_id, op) for source_value_id in then_yields)
+            then_token_yields = tuple(
+                _if_token_yield_target_id(
+                    builder,
+                    type_layout_program,
+                    op,
+                    carry,
+                    carry.then_source_value_id,
+                    "then",
+                ) for carry in token_carries)
+        finally:
+            _restore_source_target_snapshot(builder, outer_source_targets)
+    with builder.insertion_region(else_region_id):
+        try:
+            else_yields = _convert_region(
+                builder,
+                conversion_input,
+                type_layout_program,
+                fact_program,
+                op.region_ids[1],
+                allow_yield=True,
+            )
+            if len(else_yields) != len(data_result_target_ids):
+                fail(
+                    "TLXW_OP_IF_YIELD_MISMATCH",
+                    STAGE,
+                    "scf.if else yield count must match result count",
+                    source_op_index=op.index,
+                )
+            _require_yield_layouts(
+                type_layout_program,
+                else_yields,
+                op.results,
+                "scf.if else yield and result",
+                op,
+            )
+            else_data_target_ids = tuple(
+                _single_source_target(builder, source_value_id, op) for source_value_id in else_yields)
+            else_token_yields = tuple(
+                _if_token_yield_target_id(
+                    builder,
+                    type_layout_program,
+                    op,
+                    carry,
+                    carry.else_source_value_id,
+                    "else",
+                ) for carry in token_carries)
+        finally:
+            _restore_source_target_snapshot(builder, outer_source_targets)
+    for _carry, result_target_id, then_target_id, else_target_id in zip(
+            token_carries,
+            token_result_target_ids,
+            then_token_yields,
+            else_token_yields,
+    ):
+        branch_domains = tuple(
+            dict.fromkeys(builder.values[int(target_id)].event_domain
+                          for target_id in (then_target_id, else_target_id)
+                          if builder.values[int(target_id)].event_domain not in {None, target_ir.EVENT_DOMAIN_EMPTY}))
+        if len(branch_domains) == 1:
+            builder.set_value_event_domain(result_target_id, branch_domains[0])
+    for result_target_id, then_target_id, else_target_id in zip(
+            data_result_target_ids,
+            then_data_target_ids,
+            else_data_target_ids,
+    ):
+        _propagate_structural_event_domain(
+            builder,
+            (result_target_id, ),
+            (then_target_id, else_target_id),
+            op,
+            "scf.if result",
+        )
+        builder.set_value_resource_targets(
+            result_target_id,
+            _resource_target_ids(
+                builder,
+                (then_target_id, else_target_id),
+            ),
+        )
+    for result_target_id, then_target_id, else_target_id in zip(
+            token_result_target_ids,
+            then_token_yields,
+            else_token_yields,
+    ):
+        builder.set_value_resource_targets(
+            result_target_id,
+            _resource_target_ids(
+                builder,
+                (then_target_id, else_target_id),
+            ),
+        )
+    builder.set_region_yields(
+        then_region_id,
+        (*then_data_target_ids, *then_token_yields),
+    )
+    builder.set_region_yields(
+        else_region_id,
+        (*else_data_target_ids, *else_token_yields),
+    )
+    data_result_packet_registers = tuple(
+        _mma_packet_registers(type_layout_program, type_layout_program.values[source_value_id], op)
+        if type_layout_program.values[source_value_id].type.representation in _MMA_PACKET_REPRESENTATIONS else 0
+        for source_value_id in op.results)
+    result_packet_registers = ((*data_result_packet_registers,
+                                *((0, ) * len(token_carries))) if data_result_packet_registers else ())
+    builder.add_op(
+        "if",
+        operands=condition_targets,
+        results=result_target_ids,
+        attrs={
+            "result_packet_registers":
+            result_packet_registers,
+            "token_carry_target_mappings":
+            tuple((
+                -1 if carry.then_source_value_id is None else then_target_id,
+                -1 if carry.else_source_value_id is None else else_target_id,
+                token_result_target_id,
+            ) for carry, then_target_id, else_target_id, token_result_target_id in zip(
+                token_carries,
+                then_token_yields,
+                else_token_yields,
+                token_result_target_ids,
+            )),
+        },
+        layout_map_ids=result_layout_map_ids,
+        region_ids=(then_region_id, else_region_id),
+        source_op_index=op.index,
+    )
+    _replace_source_targets(
+        builder,
+        tuple((source_value_id, token_result_target_id)
+              for carry, token_result_target_id in zip(token_carries, token_result_target_ids)
+              for source_value_id in (carry.then_source_value_id, carry.else_source_value_id)
+              if source_value_id is not None),
+    )
+
+
+def _if_token_yield_target_id(
+    builder,
+    type_layout_program,
+    op,
+    carry,
+    source_value_id,
+    branch_name,
+):
+    if source_value_id is not None:
+        return _single_source_target(builder, source_value_id, op)
+    token_target_id = builder.add_value(
+        target_ir.target_type_from_converted(
+            type_layout_program.values[_if_token_carry_type_source_value_id(carry)].type),
+        debug_name=f"if_token_{branch_name}_yield_{op.index}",
+        event_domain=target_ir.EVENT_DOMAIN_EMPTY,
+    )
+    builder.add_op(
+        "token",
+        results=(token_target_id, ),
+        attrs={"event_domain": target_ir.EVENT_DOMAIN_EMPTY},
+        source_op_index=op.index,
+    )
+    return token_target_id
+
+
+def _if_token_carry_type_source_value_id(carry):
+    if carry.then_source_value_id is not None:
+        return int(carry.then_source_value_id)
+    if carry.else_source_value_id is not None:
+        return int(carry.else_source_value_id)
+    raise AssertionError("if token carry requires a token from at least one branch")
+
+
+def _convert_for(
+    builder,
+    conversion_input,
+    type_layout_program,
+    fact_program,
+    op,
+):
+    if len(op.region_ids) != 1 or len(op.operands) < 3:
+        fail(
+            "TLXW_OP_UNSUPPORTED_FOR",
+            STAGE,
+            "scf.for conversion requires lower, upper, step, and one body region",
+            source_op_index=op.index,
+        )
+    data_init_arg_count = len(op.operands) - 3
+    if len(op.results) != data_init_arg_count:
+        fail(
+            "TLXW_OP_FOR_RESULT_MISMATCH",
+            STAGE,
+            "scf.for result count must match iter_args count",
+            source_op_index=op.index,
+        )
+    source_region = conversion_input.regions[op.region_ids[0]]
+    if len(source_region.block_arg_ids) != 1 + data_init_arg_count:
+        fail(
+            "TLXW_OP_FOR_REGION_ARGS",
+            STAGE,
+            "scf.for body must have induction variable plus iter_arg block args",
+            source_op_index=op.index,
+        )
+    _require_for_iter_layouts(
+        type_layout_program,
+        op.operands[3:],
+        op.results,
+        source_region.block_arg_ids[1:],
+        op,
+    )
+    source_region_op_names = frozenset(conversion_input.ops[int(op_index)].name
+                                       for op_index in source_region.op_indices)
+    explicit_warp_pipeline_protocol = ("rocdl.sched.barrier" in source_region_op_names
+                                       and "rocdl.s.setprio" in source_region_op_names)
+    token_carries = conversion_input.loop_token_carries_by_op.get(op.index, ())
+    source_loop_operands = _operand_target_ids(builder, op)
+    token_init_target_ids = tuple(
+        _loop_token_init_target_id(
+            builder,
+            type_layout_program,
+            op,
+            carry,
+        ) for carry in token_carries)
+    loop_operands = (
+        *source_loop_operands,
+        *token_init_target_ids,
+    )
+    result_target_ids, result_layout_map_ids = _declare_results(
+        builder,
+        op,
+        type_layout_program,
+    )
+    data_result_target_ids = result_target_ids
+    token_result_target_ids = tuple(
+        builder.add_value(
+            target_ir.target_type_from_converted(type_layout_program.values[_loop_token_carry_type_source_value_id(
+                carry)].type),
+            debug_name=f"loop_token_result_{op.index}_{index}",
+            event_domain=_loop_token_carry_event_domain(builder, carry),
+        ) for index, carry in enumerate(token_carries))
+    result_target_ids = (
+        *data_result_target_ids,
+        *token_result_target_ids,
+    )
+    block_arg_target_ids = tuple(
+        builder.add_value(
+            target_ir.target_type_from_converted(type_layout_program.values[source_value_id].type),
+            source_value_id=source_value_id,
+            debug_name=f"r{op.region_ids[0]}_arg{index}",
+            layout_map_id=type_layout_program.values[source_value_id].layout_map_id,
+        ) for index, source_value_id in enumerate(source_region.block_arg_ids))
+    data_block_arg_target_ids = block_arg_target_ids
+    token_block_arg_target_ids = tuple(
+        builder.add_value(
+            target_ir.target_type_from_converted(type_layout_program.values[_loop_token_carry_type_source_value_id(
+                carry)].type),
+            debug_name=f"loop_token_arg_{op.index}_{index}",
+            event_domain=_loop_token_carry_event_domain(builder, carry),
+        ) for index, carry in enumerate(token_carries))
+    block_arg_target_ids = (
+        *data_block_arg_target_ids,
+        *token_block_arg_target_ids,
+    )
+    for block_arg_target_id, init_target_id in zip(
+            data_block_arg_target_ids[1:],
+            source_loop_operands[3:],
+    ):
+        builder.set_value_resource_targets(
+            block_arg_target_id,
+            builder.values[int(init_target_id)].resource_target_ids,
+        )
+    for block_arg_target_id, init_target_id in zip(
+            token_block_arg_target_ids,
+            token_init_target_ids,
+    ):
+        builder.set_value_resource_targets(
+            block_arg_target_id,
+            builder.values[int(init_target_id)].resource_target_ids,
+        )
+    target_region_id = builder.add_region(block_arg_ids=block_arg_target_ids)
+    induction_fact_ids = tuple(fact_id for fact_id in fact_program.by_value.get(source_region.block_arg_ids[0], ())
+                               if fact_program.facts[fact_id].source_op_index == op.index
+                               and fact_program.facts[fact_id].kind in {"range", "divisible"})
+    token_issue_dependency_pairs = _loop_token_carry_issue_dependencies(
+        token_carries,
+        token_block_arg_target_ids,
+    )
+    issue_dependencies = _loop_async_issue_dependencies(
+        tuple(carry for carry, _token_block_arg_target_id in token_issue_dependency_pairs),
+        tuple(token_block_arg_target_id for _carry, token_block_arg_target_id in token_issue_dependency_pairs),
+    )
+    body_conversion_input = replace(
+        conversion_input,
+        async_issue_dependency_target_ids_by_op={
+            **conversion_input.async_issue_dependency_target_ids_by_op,
+            **issue_dependencies,
+        },
+        async_wait_entry_dependency_target_ids_by_value_id={
+            **(conversion_input.async_wait_entry_dependency_target_ids_by_value_id),
+            **{
+                int(carry.init_source_value_id):
+                tuple(
+                    dict.fromkeys((
+                        *(conversion_input.async_wait_entry_dependency_target_ids_by_value_id.get(
+                            int(carry.init_source_value_id),
+                            (),
+                        )),
+                        int(init_target_id),
+                    )))
+                for carry, init_target_id in zip(
+                    token_carries,
+                    token_init_target_ids,
+                ) if (carry.init_source_value_id is not None and not carry.readiness_carry)
+            },
+        },
+    )
+    body_source_targets = dict(builder.source_value_targets)
+    _replace_source_targets(
+        builder,
+        tuple((carry.init_source_value_id, token_block_arg_target_id) for carry, token_block_arg_target_id in zip(
+            token_carries,
+            token_block_arg_target_ids,
+        ) if carry.init_source_value_id is not None),
+    )
+    with builder.insertion_region(target_region_id):
+        try:
+            if induction_fact_ids:
+                _refine_assumed_values(
+                    builder,
+                    induction_fact_ids,
+                    (block_arg_target_ids[0], ) * len(induction_fact_ids),
+                    source_op_index=op.index,
+                )
+            yielded_source_values = _convert_region(
+                builder,
+                body_conversion_input,
+                type_layout_program,
+                fact_program,
+                op.region_ids[0],
+                allow_yield=True,
+            )
+            if len(yielded_source_values) != data_init_arg_count:
+                fail(
+                    "TLXW_OP_FOR_YIELD_MISMATCH",
+                    STAGE,
+                    "scf.for yield count must match iter_args count",
+                    source_op_index=op.index,
+                )
+            _require_yield_layouts(
+                type_layout_program,
+                yielded_source_values,
+                op.results,
+                "scf.for yield and result",
+                op,
+            )
+            yielded_target_ids = tuple(
+                _single_source_target(builder, source_value_id, op) for source_value_id in yielded_source_values)
+            yielded_token_target_ids = tuple(
+                _loop_token_yield_target_id(
+                    builder,
+                    type_layout_program,
+                    op,
+                    carry,
+                    token_block_arg_target_id,
+                ) for carry, token_block_arg_target_id in zip(
+                    token_carries,
+                    token_block_arg_target_ids,
+                ))
+        finally:
+            _restore_source_target_snapshot(builder, body_source_targets)
+    for result_target_id, block_arg_target_id, init_target_id, yield_target_id in zip(
+            data_result_target_ids,
+            data_block_arg_target_ids[1:],
+            source_loop_operands[3:],
+            yielded_target_ids,
+    ):
+        _propagate_structural_event_domain(
+            builder,
+            (block_arg_target_id, result_target_id),
+            (init_target_id, yield_target_id),
+            op,
+            "scf.for iter_arg",
+        )
+        resources = _resource_target_ids(
+            builder,
+            (init_target_id, yield_target_id),
+        )
+        builder.set_value_resource_targets(block_arg_target_id, resources)
+        builder.set_value_resource_targets(result_target_id, resources)
+    for result_target_id, block_arg_target_id, init_target_id, yield_target_id in zip(
+            token_result_target_ids,
+            token_block_arg_target_ids,
+            token_init_target_ids,
+            yielded_token_target_ids,
+    ):
+        resources = _resource_target_ids(
+            builder,
+            (init_target_id, yield_target_id),
+        )
+        builder.set_value_resource_targets(block_arg_target_id, resources)
+        builder.set_value_resource_targets(result_target_id, resources)
+    builder.set_region_yields(
+        target_region_id,
+        (
+            *yielded_target_ids,
+            *yielded_token_target_ids,
+        ),
+    )
+    builder.add_op(
+        "for_loop",
+        operands=loop_operands,
+        results=result_target_ids,
+        attrs={
+            "init_arg_count": data_init_arg_count + len(token_carries),
+            "source_result_count": data_init_arg_count,
+            "explicit_warp_pipeline_protocol": explicit_warp_pipeline_protocol,
+        },
+        layout_map_ids=result_layout_map_ids,
+        region_ids=(target_region_id, ),
+        source_op_index=op.index,
+    )
+    _replace_source_targets(
+        builder,
+        tuple((carry.yield_source_value_id, token_result_target_id) for carry, token_result_target_id in zip(
+            token_carries,
+            token_result_target_ids,
+        ) if carry.yield_source_value_id is not None),
+    )
+
+
+def _loop_token_init_target_id(builder, type_layout_program, op, carry):
+    init_source_value_id = carry.init_source_value_id
+    if init_source_value_id is not None:
+        return _single_source_target(builder, init_source_value_id, op)
+    yield_source_value_id = carry.yield_source_value_id
+    token_target_id = builder.add_value(
+        target_ir.target_type_from_converted(type_layout_program.values[yield_source_value_id].type),
+        debug_name=f"loop_token_init_{op.index}",
+        event_domain=target_ir.EVENT_DOMAIN_EMPTY,
+    )
+    builder.add_op(
+        "token",
+        results=(token_target_id, ),
+        attrs={"event_domain": target_ir.EVENT_DOMAIN_EMPTY},
+        source_op_index=op.index,
+    )
+    return token_target_id
+
+
+def _loop_token_yield_target_id(
+    builder,
+    type_layout_program,
+    op,
+    carry,
+    token_block_arg_target_id,
+):
+    yield_source_value_id = carry.yield_source_value_id
+    if yield_source_value_id is not None:
+        yield_target_id = _single_source_target(
+            builder,
+            yield_source_value_id,
+            op,
+        )
+        if not carry.cumulative_completion:
+            return yield_target_id
+        event_domain = _loop_token_carry_event_domain(builder, carry)
+        cumulative_target_id = _declare_protocol_token(
+            builder,
+            event_domain=event_domain,
+            debug_name=f"loop_completion_yield_{op.index}",
+            resource_target_ids=_resource_target_ids(
+                builder,
+                (token_block_arg_target_id, yield_target_id),
+            ),
+        )
+        builder.add_op(
+            "token_join",
+            operands=(token_block_arg_target_id, yield_target_id),
+            results=(cumulative_target_id, ),
+            attrs={
+                "event_domain": event_domain,
+                "input_count": 2,
+            },
+            source_op_index=op.index,
+        )
+        return cumulative_target_id
+    init_source_value_id = carry.init_source_value_id
+    if init_source_value_id is None:
+        fail(
+            "TLXW_OP_UNSUPPORTED_FOR_TOKENS",
+            STAGE,
+            "scf.for async token carry has neither an initial nor yielded token",
+            source_op_index=op.index,
+        )
+    token_target_id = builder.add_value(
+        target_ir.target_type_from_converted(type_layout_program.values[init_source_value_id].type),
+        debug_name=f"loop_token_yield_{op.index}",
+        event_domain=target_ir.EVENT_DOMAIN_EMPTY,
+    )
+    builder.add_op(
+        "token",
+        results=(token_target_id, ),
+        attrs={"event_domain": target_ir.EVENT_DOMAIN_EMPTY},
+        source_op_index=op.index,
+    )
+    return token_target_id
+
+
+def _loop_token_carry_type_source_value_id(carry):
+    if carry.yield_source_value_id is not None:
+        return int(carry.yield_source_value_id)
+    if carry.init_source_value_id is not None:
+        return int(carry.init_source_value_id)
+    raise AssertionError("loop token carry requires an initial or yielded source token")
+
+
+def _loop_token_carry_event_domain(builder, carry):
+    if carry.readiness_carry:
+        return target_ir.EVENT_DOMAIN_WAVE_LOCAL_READY
+    for source_value_id in (
+            carry.init_source_value_id,
+            carry.yield_source_value_id,
+    ):
+        if source_value_id is None:
+            continue
+        targets = builder.source_value_targets.get(int(source_value_id), ())
+        if len(targets) != 1:
+            continue
+        domain = builder.values[int(targets[0])].event_domain
+        if domain is not None:
+            return domain
+    return None
+
+
+def _loop_token_carry_issue_dependencies(token_carries, token_block_arg_target_ids):
+    return tuple((carry, token_block_arg_target_id) for carry, token_block_arg_target_id in zip(
+        token_carries,
+        token_block_arg_target_ids,
+    ) if carry.add_issue_dependency)
+
+
+def _loop_async_issue_dependencies(token_carries, token_block_arg_target_ids):
+    dependencies_by_op = {}
+    for carry, token_block_arg_target_id in zip(token_carries, token_block_arg_target_ids):
+        for op_index in carry.issue_dependency_op_indices:
+            existing = dependencies_by_op.setdefault(op_index, tuple())
+            dependencies_by_op[op_index] = (
+                *existing,
+                int(token_block_arg_target_id),
+            )
+    return dependencies_by_op
+
+
+def _replace_source_targets(builder, replacements):
+    for source_value_id, target_value_id in replacements:
+        source_value_id = int(source_value_id)
+        builder.source_value_targets[source_value_id] = (int(target_value_id), )
+
+
+def _restore_source_target_snapshot(builder, snapshot):
+    for source_value_id, target_value_ids in snapshot.items():
+        builder.source_value_targets[source_value_id] = target_value_ids
+
+
+def _convert_local_alloc(
+    builder,
+    conversion_input,
+    type_layout_program,
+    op,
+):
+    if len(op.results) != 1:
+        fail(
+            "TLXW_OP_LOCAL_ALLOC_RESULT",
+            STAGE,
+            "ttg.local_alloc must produce one memdesc result",
+            source_op_index=op.index,
+        )
+    result_target_ids, result_layout_map_ids = _declare_results(
+        builder,
+        op,
+        type_layout_program,
+    )
+    for result_target_id in result_target_ids:
+        builder.set_value_resource_targets(
+            result_target_id,
+            (result_target_id, ),
+        )
+    memdesc = _memdesc_info(conversion_input, op.results[0], op)
+    shape = tuple(memdesc.shape or memdesc.alloc_shape)
+    builder.add_op(
+        "local_alloc",
+        results=result_target_ids,
+        attrs={
+            "allocation_bytes":
+            int(conversion_input.memdesc_physical_allocation_bytes.get(
+                op.results[0],
+                memdesc.allocation_bytes,
+            )),
+            "align":
+            16,
+            "element_type":
+            memdesc.element_type,
+            "shape":
+            tuple(int(dim) for dim in shape),
+        },
+        layout_map_ids=result_layout_map_ids,
+        source_op_index=op.index,
+    )
+
+
+def _convert_memdesc_index(
+    builder,
+    conversion_input,
+    type_layout_program,
+    op,
+):
+    if len(op.operands) != 2 or len(op.results) != 1:
+        fail(
+            "TLXW_OP_MEMDESC_INDEX",
+            STAGE,
+            "ttg.memdesc_index requires memdesc/index operands and one result",
+            source_op_index=op.index,
+        )
+    result_target_ids, result_layout_map_ids = _declare_results(
+        builder,
+        op,
+        type_layout_program,
+    )
+    parent_memdesc = _memdesc_info(conversion_input, op.operands[0], op)
+    memdesc = _memdesc_info(conversion_input, op.results[0], op)
+    if (memdesc.element_byte_width is None or parent_memdesc.element_byte_width != memdesc.element_byte_width
+            or parent_memdesc.element_type != memdesc.element_type):
+        fail(
+            "TLXW_OP_MEMDESC_INDEX",
+            STAGE,
+            "ttg.memdesc_index must preserve a known memdesc element type",
+            source_op_index=op.index,
+            source_value_id=op.results[0],
+        )
+    parent_shape = tuple(int(dim) for dim in (parent_memdesc.alloc_shape or parent_memdesc.shape))
+    child_shape = tuple(int(dim) for dim in (memdesc.alloc_shape or memdesc.shape))
+    parent_layout = _layout_for_value(
+        type_layout_program,
+        op.operands[0],
+    )
+    child_layout = _layout_for_value(
+        type_layout_program,
+        op.results[0],
+    )
+    try:
+        element_offset_relation, slot_count = (layouts.memdesc_index_element_offset_relation(
+            parent_layout,
+            child_layout,
+            parent_shape,
+            child_shape,
+            element_byte_width=int(memdesc.element_byte_width),
+            allocation_bytes=int(
+                conversion_input.memdesc_physical_allocation_bytes.get(
+                    op.operands[0],
+                    parent_memdesc.allocation_bytes,
+                )),
+            stage=STAGE,
+            diagnostic="TLXW_OP_MEMDESC_INDEX",
+            source_op_index=op.index,
+            source_value_id=op.results[0],
+        ))
+    except ValueError as exc:
+        fail(
+            "TLXW_OP_MEMDESC_INDEX",
+            STAGE,
+            str(exc),
+            source_op_index=op.index,
+            source_value_id=op.results[0],
+        )
+    operand_target_ids = _operand_target_ids(builder, op)
+    _set_result_resource_targets(
+        builder,
+        result_target_ids,
+        operand_target_ids[:1],
+    )
+    builder.add_op(
+        "memdesc_index",
+        operands=operand_target_ids,
+        results=result_target_ids,
+        attrs={
+            "element_offset_relation": tuple(int(value) for value in element_offset_relation),
+            "slot_count": int(slot_count),
+        },
+        layout_map_ids=result_layout_map_ids,
+        source_op_index=op.index,
+    )
+
+
+def _convert_memdesc_trans(builder, type_layout_program, op):
+    if len(op.operands) != 1 or len(op.results) != 1:
+        fail(
+            "TLXW_OP_MEMDESC_TRANS",
+            STAGE,
+            "ttg.memdesc_trans requires one memdesc operand and one result",
+            source_op_index=op.index,
+        )
+    operand = type_layout_program.values[op.operands[0]]
+    result = type_layout_program.values[op.results[0]]
+    if operand.type.representation != "memdesc" or result.type.representation != "memdesc":
+        fail(
+            "TLXW_OP_MEMDESC_TRANS",
+            STAGE,
+            "ttg.memdesc_trans requires memdesc operand and result types",
+            source_op_index=op.index,
+        )
+    result_target_ids, result_layout_map_ids = _declare_results(
+        builder,
+        op,
+        type_layout_program,
+    )
+    operand_target_ids = _operand_target_ids(builder, op)
+    _set_result_resource_targets(builder, result_target_ids, operand_target_ids)
+    builder.add_op(
+        "memdesc_view",
+        operands=operand_target_ids,
+        results=result_target_ids,
+        attrs={"view": "transpose"},
+        layout_map_ids=result_layout_map_ids,
+        source_op_index=op.index,
+    )
+
+
+def _convert_memdesc_reshape(builder, type_layout_program, op):
+    if len(op.operands) != 1 or len(op.results) != 1:
+        fail(
+            "TLXW_OP_MEMDESC_RESHAPE",
+            STAGE,
+            "ttg.memdesc_reshape requires one memdesc operand and one result",
+            source_op_index=op.index,
+        )
+    operand = type_layout_program.values[op.operands[0]]
+    result = type_layout_program.values[op.results[0]]
+    if operand.type.representation != "memdesc" or result.type.representation != "memdesc":
+        fail(
+            "TLXW_OP_MEMDESC_RESHAPE",
+            STAGE,
+            "ttg.memdesc_reshape requires memdesc operand and result types",
+            source_op_index=op.index,
+        )
+    result_target_ids, result_layout_map_ids = _declare_results(
+        builder,
+        op,
+        type_layout_program,
+    )
+    operand_target_ids = _operand_target_ids(builder, op)
+    _set_result_resource_targets(builder, result_target_ids, operand_target_ids)
+    builder.add_op(
+        "memdesc_view",
+        operands=operand_target_ids,
+        results=result_target_ids,
+        attrs={"view": "reshape"},
+        layout_map_ids=result_layout_map_ids,
+        source_op_index=op.index,
+    )
+
+
+def _convert_memdesc_reinterpret(builder, type_layout_program, op):
+    if len(op.operands) != 1 or len(op.results) != 1:
+        fail(
+            "TLXW_OP_MEMDESC_REINTERPRET",
+            STAGE,
+            "ttg.memdesc_reinterpret requires one memdesc operand and one result",
+            source_op_index=op.index,
+        )
+    operand = type_layout_program.values[op.operands[0]]
+    result = type_layout_program.values[op.results[0]]
+    if operand.type.representation != "memdesc" or result.type.representation != "memdesc":
+        fail(
+            "TLXW_OP_MEMDESC_REINTERPRET",
+            STAGE,
+            "ttg.memdesc_reinterpret requires memdesc operand and result types",
+            source_op_index=op.index,
+        )
+    result_target_ids, result_layout_map_ids = _declare_results(
+        builder,
+        op,
+        type_layout_program,
+    )
+    operand_target_ids = _operand_target_ids(builder, op)
+    _set_result_resource_targets(builder, result_target_ids, operand_target_ids)
+    builder.add_op(
+        "memdesc_view",
+        operands=operand_target_ids,
+        results=result_target_ids,
+        attrs={"view": "reinterpret"},
+        layout_map_ids=result_layout_map_ids,
+        source_op_index=op.index,
+    )
+
+
+def _convert_memdesc_subslice(
+    builder,
+    conversion_input,
+    type_layout_program,
+    op,
+):
+    if len(op.operands) != 1 or len(op.results) != 1:
+        fail(
+            "TLXW_OP_MEMDESC_SUBSLICE",
+            STAGE,
+            "ttg.memdesc_subslice requires one memdesc operand and one result",
+            source_op_index=op.index,
+        )
+    view = _memdesc_view_info(conversion_input, op.results[0], op)
+    result_target_ids, result_layout_map_ids = _declare_results(
+        builder,
+        op,
+        type_layout_program,
+    )
+    operand_target_ids = _operand_target_ids(builder, op)
+    _set_result_resource_targets(builder, result_target_ids, operand_target_ids)
+    builder.add_op(
+        "memdesc_view",
+        operands=operand_target_ids,
+        results=result_target_ids,
+        attrs={
+            "view": "subslice",
+            "logical_origin": tuple(int(value) for value in view.logical_origin),
+            "physical_shape": tuple(int(value) for value in view.physical_shape),
+        },
+        layout_map_ids=result_layout_map_ids,
+        source_op_index=op.index,
+    )
+
+
+def _convert_buffer_load_to_local(
+    builder,
+    conversion_input,
+    type_layout_program,
+    fact_program,
+    op,
+):
+    """Translate the async copy into source and destination symbolic mappings.
+
+    The bridge preserves the source packet, destination layout, masks, and token
+    protocol. Wave/iXSimpl decides whether those mappings admit direct-to-LDS
+    DMA transactions or require the ordinary gather/scatter fallback.
+    """
+    fields = _buffer_load_to_local_fields(op)
+    if fields["other_value_id"] is not None:
+        fail(
+            "TLXW_OP_UNSUPPORTED_BUFFER_ASYNC",
+            STAGE,
+            "amdg.buffer_load_to_local other fallback is not converted yet",
+            source_op_index=op.index,
+        )
+    _require_default_cache(fields["cache"], op)
+    token_node = conversion_input.token_nodes_by_op.get(op.index)
+    if token_node is None or token_node.value_id not in op.results:
+        fail(
+            "TLXW_OP_BUFFER_ASYNC_TOKEN",
+            STAGE,
+            "amdg.buffer_load_to_local requires a token graph node",
+            source_op_index=op.index,
+        )
+    async_group_ids = tuple(
+        int(group.group_id)
+        for group in conversion_input.token_groups_by_id.values()
+        if token_node.value_id in group.member_token_ids)
+    if len(async_group_ids) > 1:
+        fail(
+            "TLXW_OP_BUFFER_ASYNC_GROUP",
+            STAGE,
+            "amdg.buffer_load_to_local token belongs to multiple commit groups",
+            source_op_index=op.index,
+        )
+    async_group_id = async_group_ids[0] if async_group_ids else -1
+
+    memdesc = _memdesc_info(conversion_input, fields["memdesc_value_id"], op)
+    if memdesc.element_byte_width is None:
+        fail(
+            "TLXW_OP_UNSUPPORTED_BUFFER_ASYNC",
+            STAGE,
+            "amdg.buffer_load_to_local requires a known element byte width",
+            source_op_index=op.index,
+            source_value_id=fields["memdesc_value_id"],
+        )
+    offsets = type_layout_program.values[fields["offset_value_id"]]
+    if offsets.type.representation not in {"simd", "simd_tuple"}:
+        fail(
+            "TLXW_OP_UNSUPPORTED_BUFFER_ASYNC",
+            STAGE,
+            "amdg.buffer_load_to_local requires SIMD offset components",
+            source_op_index=op.index,
+            source_value_id=fields["offset_value_id"],
+        )
+    component_count = int(offsets.type.component_count)
+    lane_width = int(offsets.type.lane_width or conversion_input.threads_per_warp)
+    contiguity = int(fields["contiguity"])
+    if contiguity <= 0:
+        fail(
+            "TLXW_OP_BUFFER_ASYNC",
+            STAGE,
+            "amdg.buffer_load_to_local contiguity must be positive",
+            source_op_index=op.index,
+        )
+    has_mask = fields["mask_value_id"] is not None
+    mask_component_count = 0
+    if has_mask:
+        mask = type_layout_program.values[fields["mask_value_id"]]
+        mask_component_count = int(mask.type.component_count)
+        if mask_component_count not in (1, component_count):
+            fail(
+                "TLXW_OP_UNSUPPORTED_BUFFER_ASYNC",
+                STAGE,
+                "amdg.buffer_load_to_local mask must be scalar or match "
+                "offset components",
+                source_op_index=op.index,
+                source_value_id=fields["mask_value_id"],
+            )
+        _require_mask_layout_compatible(
+            type_layout_program,
+            mask,
+            offsets,
+            "amdg.buffer_load_to_local mask",
+            op,
+        )
+
+    destination_plan = _local_component_store_plan(
+        conversion_input,
+        type_layout_program,
+        fields["memdesc_value_id"],
+        fields["offset_value_id"],
+        component_count,
+        lane_width,
+        op,
+    )
+    range_fact = _pointer_byte_range_fact(
+        fact_program,
+        fields["base_value_id"],
+        op,
+    )
+    result_target_ids, result_layout_map_ids = _declare_results(
+        builder,
+        op,
+        type_layout_program,
+    )
+    for result_target_id in result_target_ids:
+        builder.set_value_event_domain(
+            result_target_id,
+            target_ir.EVENT_DOMAIN_DMA_COMPLETION,
+        )
+
+    source_issue_dependency_target_ids = tuple(
+        dict.fromkeys(conversion_input.async_issue_dependency_target_ids_by_op.get(
+            op.index,
+            (),
+        )))
+    destination_target_id = _single_source_target(
+        builder,
+        fields["memdesc_value_id"],
+        op,
+    )
+    _set_result_resource_targets(
+        builder,
+        result_target_ids,
+        (destination_target_id, ),
+    )
+    source_base_target_id = _single_source_target(
+        builder,
+        fields["base_value_id"],
+        op,
+    )
+    offset_target_id = _single_source_target(
+        builder,
+        fields["offset_value_id"],
+        op,
+    )
+    if _source_value_use_count(conversion_input, fields["base_value_id"]) == 1:
+        base_target_id, relation_attrs, relation_bindings = _buffer_memory_relation(
+            builder,
+            source_base_target_id,
+            offset_target_id,
+            memdesc.element_byte_width,
+            contiguity,
+        )
+    else:
+        base_target_id = source_base_target_id
+        relation_attrs, relation_bindings = _memory_relation(
+            builder,
+            offset_target_id,
+            memdesc.element_byte_width,
+            contiguity,
+        )
+    operands = [destination_target_id, base_target_id, offset_target_id]
+    if has_mask:
+        operands.append(_single_source_target(
+            builder,
+            fields["mask_value_id"],
+            op,
+        ))
+    operands.extend(relation_bindings)
+    operands.extend(source_issue_dependency_target_ids)
+    builder.add_op(
+        "buffer_load_to_local",
+        operands=tuple(operands),
+        results=result_target_ids,
+        attrs={
+            "async_group_id": int(async_group_id),
+            "cache_modifier": int(fields["cache"] or 1),
+            "component_count": component_count,
+            "contiguity": contiguity,
+            **_local_component_store_plan_attrs(destination_plan),
+            "element_byte_width": int(memdesc.element_byte_width),
+            "element_type": memdesc.element_type,
+            "has_mask": has_mask,
+            "has_stride_operand": fields["stride_value_id"] is not None,
+            "issue_dependency_count": len(source_issue_dependency_target_ids),
+            "lane_width": lane_width,
+            "mask_component_count": mask_component_count,
+            "mask_mode": "exec_where" if has_mask else "none",
+            "mode": "symbolic_copy",
+            "range_bytes": int(range_fact.upper),
+            **relation_attrs,
+            "source_issue_dependency_count": len(source_issue_dependency_target_ids),
+        },
+        fact_ids=(range_fact.fact_id, ),
+        fact_target_ids=(source_base_target_id, ),
+        layout_map_ids=result_layout_map_ids,
+        source_op_index=op.index,
+    )
+
+
+def _local_component_store_plan_attrs(destination_plan):
+    return {
+        "destination_bit_offset_relation": tuple(int(value) for value in destination_plan["bit_offset_relation"]),
+    }
+
+
+def _local_tensor_access_attrs(
+    conversion_input,
+    type_layout_program,
+    memdesc_value_id,
+    tensor_value,
+    description,
+    op,
+):
+    memdesc = _memdesc_info(conversion_input, memdesc_value_id, op)
+    if memdesc.element_byte_width is None:
+        fail(
+            "TLXW_OP_LOCAL_MEMORY",
+            STAGE,
+            "ttg local memory access requires known memdesc element byte width",
+            source_op_index=op.index,
+            source_value_id=memdesc_value_id,
+        )
+    if tensor_value.type.element_type != memdesc.element_type:
+        fail(
+            "TLXW_OP_LOCAL_MEMORY",
+            STAGE,
+            f"{description} element type must match the memdesc element type",
+            source_op_index=op.index,
+            source_value_id=tensor_value.value_id,
+        )
+    tensor_layout = _require_layout(type_layout_program, tensor_value.layout_map_id, op)
+    if tensor_layout.linear_layout is None:
+        fail(
+            "TLXW_OP_LOCAL_MEMORY",
+            STAGE,
+            f"{description} requires a distributed LinearLayout model",
+            source_op_index=op.index,
+            source_value_id=tensor_value.value_id,
+        )
+    shape = tuple(int(dim) for dim in (memdesc.shape or memdesc.alloc_shape))
+    if tuple(int(dim) for dim in tensor_layout.shape) != shape:
+        fail(
+            "TLXW_OP_LOCAL_MEMORY",
+            STAGE,
+            f"{description} shape must match the memdesc shape",
+            source_op_index=op.index,
+            source_value_id=tensor_value.value_id,
+        )
+    memdesc_layout_id = type_layout_program.values[memdesc_value_id].layout_map_id
+    memdesc_layout = (None if memdesc_layout_id is None else type_layout_program.layouts[int(memdesc_layout_id)])
+    view = _memdesc_view_info(conversion_input, memdesc_value_id, op)
+    lane_width = int(tensor_value.type.lane_width or tensor_layout.lane_width or conversion_input.threads_per_warp)
+    warp_count = _layout_warp_count(tensor_layout)
+    packet_count = (int(tensor_value.type.component_count)
+                    if tensor_value.type.representation in _MMA_PACKET_REPRESENTATIONS else 1)
+    packet_width = (_mma_packet_registers(type_layout_program, tensor_value, op) if tensor_value.type.representation
+                    in _MMA_PACKET_REPRESENTATIONS else int(tensor_value.type.component_count))
+    try:
+        bit_offset_relation = layouts.local_memory_bit_offset_relation(
+            tensor_layout,
+            memdesc_layout,
+            shape,
+            view.physical_shape,
+            view.logical_origin,
+            lane_width=lane_width,
+            warp_count=warp_count,
+            element_byte_width=memdesc.element_byte_width,
+            allocation_bytes=conversion_input.memdesc_physical_allocation_bytes.get(
+                memdesc_value_id,
+                memdesc.allocation_bytes,
+            ),
+            stage=STAGE,
+            diagnostic="TLXW_OP_LOCAL_MEMORY",
+            source_op_index=op.index,
+            source_value_id=tensor_value.value_id,
+        )
+    except ValueError as exc:
+        fail(
+            "TLXW_OP_LOCAL_MEMORY",
+            STAGE,
+            str(exc),
+            source_op_index=op.index,
+            source_value_id=tensor_value.value_id,
+        )
+    return {
+        "component_count": int(tensor_value.type.component_count),
+        "bit_offset_relation": tuple(int(value) for value in bit_offset_relation),
+        "packet_count": int(packet_count),
+        "packet_width": int(packet_width),
+        "element_byte_width": int(memdesc.element_byte_width),
+        "element_type": memdesc.element_type,
+        "lane_width": int(lane_width),
+    }
+
+
+def _buffer_load_mma_packet_result_value_attrs(type_layout_program, loaded, has_other, op):
+    if loaded.type.representation not in _MMA_PACKET_REPRESENTATIONS:
+        return {}
+    if has_other:
+        fail(
+            "TLXW_OP_UNSUPPORTED_BUFFER_LOAD",
+            STAGE,
+            "MMA packet amdg.buffer_load does not support an other operand",
+            source_op_index=op.index,
+        )
+    if loaded.type.element_type not in {"f16", "bf16", "f32"}:
+        fail(
+            "TLXW_OP_UNSUPPORTED_BUFFER_LOAD",
+            STAGE,
+            "MMA packet amdg.buffer_load requires f16, bf16, or f32 results",
+            source_op_index=op.index,
+            source_value_id=loaded.value_id,
+        )
+    registers = _mma_packet_registers(type_layout_program, loaded, op)
+    return {
+        "result_packet_width": int(registers),
+        "result_value_mode": "mma_packet_payload",
+        "registers": int(registers),
+    }
+
+
+def _convert_buffer_load(builder, conversion_input, type_layout_program, fact_program, op):
+    fields = _buffer_load_fields(op)
+    _require_supported_direct_buffer_cache(fields["cache"], op, is_store=False)
+    if fields["other_value_id"] is not None and fields["mask_value_id"] is None:
+        fail(
+            "TLXW_OP_UNSUPPORTED_BUFFER_LOAD",
+            STAGE,
+            "amdg.buffer_load other operand requires a mask operand",
+            source_op_index=op.index,
+        )
+    range_fact = _pointer_byte_range_fact(fact_program, fields["base_value_id"], op)
+    loaded = type_layout_program.values[op.results[0]]
+    offsets = type_layout_program.values[fields["offset_value_id"]]
+    has_other = fields["other_value_id"] is not None
+    fragment_result_value_attrs = _buffer_load_mma_packet_result_value_attrs(
+        type_layout_program,
+        loaded,
+        has_other,
+        op,
+    )
+    result_payload_width = int(fragment_result_value_attrs.get("registers", 1))
+    access_component_count = (int(loaded.type.component_count) * result_payload_width)
+    if int(offsets.type.component_count) != access_component_count:
+        fail(
+            "TLXW_OP_BUFFER_LOAD",
+            STAGE,
+            "amdg.buffer_load offsets must match the scalar result payload",
+            source_op_index=op.index,
+        )
+    _require_same_layout_except_element_type(
+        type_layout_program,
+        offsets,
+        loaded,
+        "amdg.buffer_load result and offsets",
+        op,
+    )
+    base_target_id = _single_source_target(builder, fields["base_value_id"], op)
+    if fields["mask_value_id"] is not None:
+        mask = type_layout_program.values[fields["mask_value_id"]]
+        if int(mask.type.component_count) != access_component_count:
+            fail(
+                "TLXW_OP_BUFFER_LOAD",
+                STAGE,
+                "amdg.buffer_load mask must match the scalar result payload",
+                source_op_index=op.index,
+            )
+        _require_mask_layout_compatible(
+            type_layout_program,
+            mask,
+            loaded,
+            "amdg.buffer_load mask",
+            op,
+        )
+    other_target_id = None
+    if fields["other_value_id"] is not None:
+        other = type_layout_program.values[fields["other_value_id"]]
+        if int(other.type.component_count) not in (
+                1,
+                int(loaded.type.component_count),
+        ):
+            fail(
+                "TLXW_OP_BUFFER_LOAD",
+                STAGE,
+                "amdg.buffer_load other must be scalar or match result components",
+                source_op_index=op.index,
+            )
+        if other.layout_map_id is not None:
+            _require_same_layout_except_element_type(
+                type_layout_program,
+                other,
+                loaded,
+                "amdg.buffer_load other and result",
+                op,
+            )
+        other_target_id = _single_source_target(
+            builder,
+            fields["other_value_id"],
+            op,
+        )
+    element_byte_width = conversion_input.value_element_byte_widths.get(op.results[0])
+    if element_byte_width is None:
+        fail(
+            "TLXW_OP_BUFFER_LOAD",
+            STAGE,
+            "amdg.buffer_load requires known result element byte width",
+            source_op_index=op.index,
+            source_value_id=op.results[0],
+        )
+    contiguity = int(fields["contiguity"])
+    if contiguity <= 0:
+        fail(
+            "TLXW_OP_BUFFER_LOAD",
+            STAGE,
+            "amdg.buffer_load contiguity must be positive",
+            source_op_index=op.index,
+        )
+    has_mask = fields["mask_value_id"] is not None
+    runtime_offset_target_id = _single_source_target(
+        builder,
+        int(fields["offset_value_id"]),
+        op,
+    )
+    runtime_mask_target_id = None
+    if has_mask:
+        runtime_mask_target_id = _single_source_target(
+            builder,
+            int(fields["mask_value_id"]),
+            op,
+        )
+    result_target_ids, result_layout_map_ids = _declare_results(
+        builder,
+        op,
+        type_layout_program,
+    )
+    result_value_attrs = fragment_result_value_attrs
+    runtime_operands = [base_target_id, runtime_offset_target_id]
+    if runtime_mask_target_id is not None:
+        runtime_operands.append(runtime_mask_target_id)
+    if other_target_id is not None:
+        runtime_operands.append(other_target_id)
+    relation_attrs, relation_bindings = _memory_relation(
+        builder,
+        runtime_offset_target_id,
+        element_byte_width,
+        contiguity,
+    )
+    runtime_operands.extend(relation_bindings)
+    builder.add_op(
+        "buffer_load",
+        operands=tuple(runtime_operands),
+        results=result_target_ids,
+        attrs={
+            "access_component_count": access_component_count,
+            "cache_modifier": int(fields["cache"] or 1),
+            "component_count": int(loaded.type.component_count),
+            "contiguity": contiguity,
+            "element_byte_width": int(element_byte_width),
+            "element_type": loaded.type.element_type,
+            "has_mask": has_mask,
+            "has_other": has_other,
+            "has_stride_operand": fields["stride_value_id"] is not None,
+            "lane_width": int(loaded.type.lane_width or offsets.type.lane_width or 64),
+            "mask_mode": "exec_where" if has_mask else "none",
+            "range_bytes": int(range_fact.upper),
+            **result_value_attrs,
+            **relation_attrs,
+        },
+        fact_ids=(range_fact.fact_id, ),
+        fact_target_ids=(base_target_id, ),
+        layout_map_ids=result_layout_map_ids,
+        source_op_index=op.index,
+    )
+
+
+def _convert_buffer_store(builder, conversion_input, type_layout_program, fact_program, op):
+    fields = _buffer_store_fields(op)
+    _require_supported_direct_buffer_cache(fields["cache"], op, is_store=True)
+    range_fact = _pointer_byte_range_fact(fact_program, fields["base_value_id"], op)
+    value = type_layout_program.values[fields["value_value_id"]]
+    offsets = type_layout_program.values[fields["offset_value_id"]]
+    value_payload_width = 1
+    if value.type.representation in _MMA_PACKET_REPRESENTATIONS:
+        value_payload_width = _mma_packet_registers(
+            type_layout_program,
+            value,
+            op,
+        )
+    access_component_count = (int(value.type.component_count) * int(value_payload_width))
+    if int(offsets.type.component_count) != access_component_count:
+        fail(
+            "TLXW_OP_BUFFER_STORE",
+            STAGE,
+            "amdg.buffer_store offsets must match the scalar value payload",
+            source_op_index=op.index,
+        )
+    _require_same_layout_except_element_type(
+        type_layout_program,
+        value,
+        offsets,
+        "amdg.buffer_store value and offsets",
+        op,
+    )
+    store_component_count = int(value.type.component_count)
+    store_lane_width = int(value.type.lane_width or offsets.type.lane_width or 64)
+    base_target_id = _single_source_target(builder, fields["base_value_id"], op)
+    value_target_id = _single_source_target(
+        builder,
+        fields["value_value_id"],
+        op,
+    )
+    if fields["mask_value_id"] is not None:
+        mask = type_layout_program.values[fields["mask_value_id"]]
+        if int(mask.type.component_count) != access_component_count:
+            fail(
+                "TLXW_OP_BUFFER_STORE",
+                STAGE,
+                "amdg.buffer_store mask must match the scalar value payload",
+                source_op_index=op.index,
+            )
+        _require_mask_layout_compatible(
+            type_layout_program,
+            mask,
+            offsets,
+            "amdg.buffer_store mask",
+            op,
+        )
+    element_byte_width = conversion_input.value_element_byte_widths.get(fields["value_value_id"])
+    if element_byte_width is None:
+        fail(
+            "TLXW_OP_BUFFER_STORE",
+            STAGE,
+            "amdg.buffer_store requires known value element byte width",
+            source_op_index=op.index,
+            source_value_id=fields["value_value_id"],
+        )
+    contiguity = int(fields["contiguity"])
+    if contiguity <= 0:
+        fail(
+            "TLXW_OP_BUFFER_STORE",
+            STAGE,
+            "amdg.buffer_store contiguity must be positive",
+            source_op_index=op.index,
+        )
+    has_mask = fields["mask_value_id"] is not None
+    runtime_offset_target_id = _single_source_target(
+        builder,
+        int(fields["offset_value_id"]),
+        op,
+    )
+    runtime_mask_target_id = None
+    if has_mask:
+        runtime_mask_target_id = _single_source_target(
+            builder,
+            int(fields["mask_value_id"]),
+            op,
+        )
+    runtime_operands = [
+        value_target_id,
+        base_target_id,
+        runtime_offset_target_id,
+    ]
+    if runtime_mask_target_id is not None:
+        runtime_operands.append(runtime_mask_target_id)
+    relation_attrs, relation_bindings = _memory_relation(
+        builder,
+        runtime_offset_target_id,
+        element_byte_width,
+        contiguity,
+    )
+    runtime_operands.extend(relation_bindings)
+    builder.add_op(
+        "buffer_store",
+        operands=tuple(runtime_operands),
+        attrs={
+            "access_component_count": access_component_count,
+            "cache_modifier": int(fields["cache"] or 1),
+            "component_count": int(store_component_count),
+            "contiguity": contiguity,
+            "element_byte_width": int(element_byte_width),
+            "element_type": value.type.element_type,
+            "has_boundary_check_operand": fields["boundary_check_value_id"] is not None,
+            "has_mask": has_mask,
+            "lane_width": int(store_lane_width),
+            "mask_mode": "exec_where" if has_mask else "none",
+            "range_bytes": int(range_fact.upper),
+            "wave_count": int(conversion_input.num_warps),
+            **relation_attrs,
+        },
+        fact_ids=(range_fact.fact_id, ),
+        fact_target_ids=(base_target_id, ),
+        source_op_index=op.index,
+    )
+
+
+def _convert_load(builder, conversion_input, type_layout_program, op):
+    fields = _load_fields(op)
+    _require_default_tt_memory_attrs(op)
+    pointer = type_layout_program.values[fields["pointer_value_id"]]
+    loaded = type_layout_program.values[op.results[0]]
+    if pointer.type.representation not in {"per_lane_pointer", "pointer_tuple"}:
+        fail(
+            "TLXW_OP_LOAD",
+            STAGE,
+            "tt.load requires a tensor pointer operand",
+            source_op_index=op.index,
+            source_value_id=fields["pointer_value_id"],
+        )
+    if loaded.type.representation not in {"simd", "simd_tuple"}:
+        fail(
+            "TLXW_OP_LOAD",
+            STAGE,
+            "tt.load requires a tensor result",
+            source_op_index=op.index,
+            source_value_id=op.results[0],
+        )
+    if pointer.type.element_type != loaded.type.element_type:
+        fail(
+            "TLXW_OP_LOAD",
+            STAGE,
+            "tt.load pointer/result element types must match",
+            source_op_index=op.index,
+            source_value_id=op.results[0],
+        )
+    component_count = int(loaded.type.component_count)
+    if int(pointer.type.component_count) != component_count:
+        fail(
+            "TLXW_OP_LOAD",
+            STAGE,
+            "tt.load pointer/result component counts must match",
+            source_op_index=op.index,
+        )
+    _require_same_layout_except_element_type(
+        type_layout_program,
+        pointer,
+        loaded,
+        "tt.load pointer and result",
+        op,
+    )
+    pointer_target_id = _single_source_target(builder, fields["pointer_value_id"], op)
+    operands = [pointer_target_id]
+    if fields["mask_value_id"] is not None:
+        mask = type_layout_program.values[fields["mask_value_id"]]
+        if int(mask.type.component_count) not in (1, component_count):
+            fail(
+                "TLXW_OP_LOAD",
+                STAGE,
+                "tt.load mask must be scalar or match result components",
+                source_op_index=op.index,
+                source_value_id=fields["mask_value_id"],
+            )
+        _require_mask_layout_compatible(
+            type_layout_program,
+            mask,
+            loaded,
+            "tt.load mask",
+            op,
+        )
+        operands.append(_single_source_target(builder, fields["mask_value_id"], op))
+    if fields["other_value_id"] is not None:
+        if fields["mask_value_id"] is None:
+            fail(
+                "TLXW_OP_LOAD",
+                STAGE,
+                "tt.load other operand requires a mask operand",
+                source_op_index=op.index,
+                source_value_id=fields["other_value_id"],
+            )
+        other = type_layout_program.values[fields["other_value_id"]]
+        if other.type.representation not in {"scalar", "simd", "simd_tuple"}:
+            fail(
+                "TLXW_OP_LOAD",
+                STAGE,
+                "tt.load other requires a scalar or tensor value operand",
+                source_op_index=op.index,
+                source_value_id=fields["other_value_id"],
+            )
+        if other.type.element_type != loaded.type.element_type:
+            fail(
+                "TLXW_OP_LOAD",
+                STAGE,
+                "tt.load other/result element types must match",
+                source_op_index=op.index,
+                source_value_id=fields["other_value_id"],
+            )
+        if int(other.type.component_count) not in (1, component_count):
+            fail(
+                "TLXW_OP_LOAD",
+                STAGE,
+                "tt.load other must be scalar or match result components",
+                source_op_index=op.index,
+                source_value_id=fields["other_value_id"],
+            )
+        if other.layout_map_id is not None:
+            _require_same_layout_except_element_type(
+                type_layout_program,
+                other,
+                loaded,
+                "tt.load other and result",
+                op,
+            )
+        operands.append(_single_source_target(builder, fields["other_value_id"], op))
+    element_byte_width = conversion_input.value_element_byte_widths.get(fields["pointer_value_id"], )
+    if element_byte_width is None:
+        fail(
+            "TLXW_OP_LOAD",
+            STAGE,
+            "tt.load pointer requires a statically sized element type",
+            source_op_index=op.index,
+            source_value_id=fields["pointer_value_id"],
+        )
+    relation_attrs = {}
+    if pointer_target_id in builder.pointer_relations:
+        base_target_id, relation_attrs, relation_bindings = _pointer_memory_relation(
+            builder, pointer_target_id, element_byte_width)
+        operands[0] = base_target_id
+        operands.extend(relation_bindings)
+    result_target_ids, result_layout_map_ids = _declare_results(
+        builder,
+        op,
+        type_layout_program,
+    )
+    builder.add_op(
+        "load",
+        operands=tuple(operands),
+        results=result_target_ids,
+        attrs={
+            "component_count": component_count,
+            "element_byte_width": int(element_byte_width),
+            "element_type": loaded.type.element_type,
+            "has_mask": fields["mask_value_id"] is not None,
+            "has_other": fields["other_value_id"] is not None,
+            "lane_width": int(loaded.type.lane_width or pointer.type.lane_width or 64),
+            "mask_mode": "exec_where" if fields["mask_value_id"] is not None else "none",
+            **relation_attrs,
+        },
+        layout_map_ids=result_layout_map_ids,
+        source_op_index=op.index,
+    )
+
+
+def _convert_store(builder, conversion_input, type_layout_program, op):
+    fields = _store_fields(op)
+    _require_default_tt_memory_attrs(op)
+    pointer = type_layout_program.values[fields["pointer_value_id"]]
+    value = type_layout_program.values[fields["value_value_id"]]
+    if pointer.type.representation not in {"per_lane_pointer", "pointer_tuple"}:
+        fail(
+            "TLXW_OP_STORE",
+            STAGE,
+            "tt.store requires a tensor pointer operand",
+            source_op_index=op.index,
+            source_value_id=fields["pointer_value_id"],
+        )
+    if value.type.representation not in {"scalar", "simd", "simd_tuple"}:
+        fail(
+            "TLXW_OP_STORE",
+            STAGE,
+            "tt.store requires a scalar or tensor value operand",
+            source_op_index=op.index,
+            source_value_id=fields["value_value_id"],
+        )
+    if pointer.type.element_type != value.type.element_type:
+        fail(
+            "TLXW_OP_STORE",
+            STAGE,
+            "tt.store pointer/value element types must match",
+            source_op_index=op.index,
+            source_value_id=fields["value_value_id"],
+        )
+    component_count = int(pointer.type.component_count)
+    if int(value.type.component_count) not in (1, component_count):
+        fail(
+            "TLXW_OP_STORE",
+            STAGE,
+            "tt.store value must be scalar or match pointer components",
+            source_op_index=op.index,
+            source_value_id=fields["value_value_id"],
+        )
+    if value.layout_map_id is not None:
+        _require_same_layout_except_element_type(
+            type_layout_program,
+            value,
+            pointer,
+            "tt.store value and pointer",
+            op,
+        )
+    pointer_target_id = _single_source_target(builder, fields["pointer_value_id"], op)
+    operands = [
+        pointer_target_id,
+        _single_source_target(builder, fields["value_value_id"], op),
+    ]
+    if fields["mask_value_id"] is not None:
+        mask = type_layout_program.values[fields["mask_value_id"]]
+        if int(mask.type.component_count) not in (1, component_count):
+            fail(
+                "TLXW_OP_STORE",
+                STAGE,
+                "tt.store mask must be scalar or match pointer components",
+                source_op_index=op.index,
+                source_value_id=fields["mask_value_id"],
+            )
+        _require_mask_layout_compatible(
+            type_layout_program,
+            mask,
+            pointer,
+            "tt.store mask",
+            op,
+        )
+        operands.append(_single_source_target(builder, fields["mask_value_id"], op))
+    element_byte_width = conversion_input.value_element_byte_widths.get(fields["pointer_value_id"], )
+    if element_byte_width is None:
+        fail(
+            "TLXW_OP_STORE",
+            STAGE,
+            "tt.store pointer requires a statically sized element type",
+            source_op_index=op.index,
+            source_value_id=fields["pointer_value_id"],
+        )
+    relation_attrs = {}
+    if pointer_target_id in builder.pointer_relations:
+        base_target_id, relation_attrs, relation_bindings = _pointer_memory_relation(
+            builder, pointer_target_id, element_byte_width)
+        operands[0] = base_target_id
+        operands.extend(relation_bindings)
+    builder.add_op(
+        "store",
+        operands=tuple(operands),
+        attrs={
+            "component_count": component_count,
+            "element_byte_width": int(element_byte_width),
+            "element_type": pointer.type.element_type,
+            "has_mask": fields["mask_value_id"] is not None,
+            "lane_width": int(pointer.type.lane_width or value.type.lane_width or 64),
+            "mask_mode": "exec_where" if fields["mask_value_id"] is not None else "none",
+            **relation_attrs,
+        },
+        source_op_index=op.index,
+    )
+
+
+def _convert_local_load(builder, conversion_input, type_layout_program, op):
+    if len(op.operands) not in {1, 2} or len(op.results) != 1:
+        fail(
+            "TLXW_OP_LOCAL_LOAD",
+            STAGE,
+            "ttg.local_load requires one memdesc operand, an optional token, and one result",
+            source_op_index=op.index,
+        )
+    result_value_id = op.results[0]
+    result = type_layout_program.values[result_value_id]
+    result_layout = (None if result.layout_map_id is None else type_layout_program.layouts[int(result.layout_map_id)])
+    memdesc_value_id = op.operands[0]
+    token_value_id = None if len(op.operands) == 1 else op.operands[1]
+    if token_value_id is not None and type_layout_program.values[token_value_id].type.representation != "token":
+        fail(
+            "TLXW_OP_LOCAL_LOAD",
+            STAGE,
+            "ttg.local_load optional second operand must be an async token",
+            source_op_index=op.index,
+            source_value_id=token_value_id,
+        )
+    dependency_source_value_ids = ((token_value_id, ) if token_value_id is not None else
+                                   conversion_input.implicit_wait_readiness_value_ids_by_op.get(
+                                       op.index,
+                                       (),
+                                   ))
+    dependency_target_ids = tuple(
+        dict.fromkeys(
+            _single_source_target(builder, source_value_id, op) for source_value_id in dependency_source_value_ids))
+    target_operands = (
+        _single_source_target(builder, memdesc_value_id, op),
+        *dependency_target_ids,
+    )
+    synced_via_async_wait = bool(token_value_id is not None or _attr_bool(op.attrs.get("ttg.amdg.syncedViaAsyncWait")))
+    if result_layout is None:
+        fail(
+            "TLXW_OP_UNSUPPORTED_LOCAL_LOAD",
+            STAGE,
+            "ttg.local_load requires a structural result layout",
+            source_op_index=op.index,
+            source_value_id=result_value_id,
+        )
+    result_target_ids, result_layout_map_ids = _declare_results(
+        builder,
+        op,
+        type_layout_program,
+    )
+    attrs = _local_tensor_access_attrs(
+        conversion_input,
+        type_layout_program,
+        memdesc_value_id,
+        result,
+        "ttg.local_load result",
+        op,
+    )
+    attrs["synced_via_async_wait"] = synced_via_async_wait
+    attrs["explicit_dependency_count"] = len(dependency_target_ids)
+    attrs["data_result_count"] = len(result_target_ids)
+    attrs["completion_result_count"] = 0
+    builder.add_op(
+        "local_load",
+        operands=target_operands,
+        results=result_target_ids,
+        attrs=attrs,
+        layout_map_ids=result_layout_map_ids,
+        source_op_index=op.index,
+    )
+
+
+def _convert_local_store(builder, conversion_input, type_layout_program, op):
+    if len(op.operands) != 2 or op.results:
+        fail(
+            "TLXW_OP_LOCAL_STORE",
+            STAGE,
+            "ttg.local_store requires value and memdesc operands and no results",
+            source_op_index=op.index,
+        )
+    value_id = op.operands[0]
+    memdesc_value_id = op.operands[1]
+    value = type_layout_program.values[value_id]
+    if value.type.representation not in {
+            "simd",
+            "simd_tuple",
+            "mask",
+            "mask_tuple",
+            *_MMA_PACKET_REPRESENTATIONS,
+    }:
+        fail(
+            "TLXW_OP_LOCAL_STORE",
+            STAGE,
+            f"ttg.local_store cannot store {value.type.representation} values",
+            source_op_index=op.index,
+            source_value_id=value_id,
+        )
+    memdesc_target_id = _single_source_target(builder, memdesc_value_id, op)
+    attrs = _local_tensor_access_attrs(
+        conversion_input,
+        type_layout_program,
+        memdesc_value_id,
+        value,
+        "ttg.local_store value",
+        op,
+    )
+    attrs["explicit_dependency_count"] = 0
+    attrs["data_result_count"] = 0
+    attrs["completion_result_count"] = 0
+    builder.add_op(
+        "local_store",
+        operands=(
+            _single_source_target(builder, value_id, op),
+            memdesc_target_id,
+        ),
+        attrs=attrs,
+        source_op_index=op.index,
+    )
+
+
+def _convert_mma_packet_constant(builder, type_layout_program, op):
+    if len(op.results) != 1:
+        fail(
+            "TLXW_OP_MMA_PACKET_CONSTANT",
+            STAGE,
+            "MMA packet constants must have one result",
+            source_op_index=op.index,
+        )
+    result = type_layout_program.values[op.results[0]]
+    result_layout = type_layout_program.layouts[int(result.layout_map_id)]
+    if result_layout.kind != "amd_mfma":
+        fail(
+            "TLXW_OP_MMA_PACKET_CONSTANT",
+            STAGE,
+            "only amd_mfma accumulator constants are converted as MMA packets",
+            source_op_index=op.index,
+            source_value_id=op.results[0],
+        )
+    value = _constant_literal(
+        op.attrs.get("value"),
+        source_op_index=op.index,
+        element_type=result.type.element_type,
+    )
+    result_target_ids, result_layout_map_ids = _declare_results(
+        builder,
+        op,
+        type_layout_program,
+    )
+    registers = _acc_fragment_registers(result_layout, op)
+    instr_shape = tuple(result_layout.properties.get("instr_shape", ()))
+    fragment_rows, fragment_columns = _acc_fragment_shape(instr_shape, op)
+    builder.add_op(
+        "mma_packet_constant",
+        results=result_target_ids,
+        attrs={
+            "columns": int(fragment_columns),
+            "component_count": int(result.type.component_count),
+            "element_type": result_layout.element_type,
+            "value": value,
+            "lane_width": int(result.type.lane_width or 64),
+            "registers": int(registers),
+            "role": 2,
+            "rows": int(fragment_rows),
+        },
+        layout_map_ids=result_layout_map_ids,
+        source_op_index=op.index,
+    )
+
+
+def _convert_dot(builder, conversion_input, type_layout_program, op):
+    if len(op.operands) != 3 or len(op.results) != 1:
+        fail(
+            "TLXW_OP_DOT",
+            STAGE,
+            "tt.dot requires lhs, rhs, accumulator, and one result",
+            source_op_index=op.index,
+        )
+    lhs = type_layout_program.values[op.operands[0]]
+    rhs = type_layout_program.values[op.operands[1]]
+    acc = type_layout_program.values[op.operands[2]]
+    result = type_layout_program.values[op.results[0]]
+    result_layout = type_layout_program.layouts[int(result.layout_map_id)]
+    if result_layout.kind != "amd_mfma":
+        fail(
+            "TLXW_OP_DOT",
+            STAGE,
+            "tt.dot result must use an amd_mfma layout",
+            source_op_index=op.index,
+            source_value_id=op.results[0],
+        )
+    instr_shape = tuple(result_layout.properties.get("instr_shape", ()))
+    if instr_shape not in {(16, 16, 32), (32, 32, 16)}:
+        fail(
+            "TLXW_OP_DOT",
+            STAGE,
+            f"unsupported MFMA instruction shape {instr_shape}",
+            source_op_index=op.index,
+            source_value_id=op.results[0],
+        )
+    if lhs.type.element_type != rhs.type.element_type:
+        fail(
+            "TLXW_OP_DOT",
+            STAGE,
+            "tt.dot lhs/rhs element types must match",
+            source_op_index=op.index,
+        )
+    kind = _mma_kind(lhs.type.element_type, instr_shape, op)
+    is_transposed = bool(result_layout.properties.get("is_transposed", False))
+    if is_transposed and int(instr_shape[0]) != int(instr_shape[1]):
+        fail(
+            "TLXW_OP_DOT",
+            STAGE,
+            "transposed MFMA dot lowering requires a symmetric instruction "
+            f"shape, got {instr_shape}",
+            source_op_index=op.index,
+            source_value_id=op.results[0],
+        )
+    acc_layout = _require_layout(type_layout_program, acc.layout_map_id, op)
+    if not _same_layout_alias(acc, result, acc_layout, result_layout):
+        fail(
+            "TLXW_OP_DOT",
+            STAGE,
+            "tt.dot accumulator layout must match the result layout",
+            source_op_index=op.index,
+            source_value_id=op.operands[2],
+        )
+    lhs_layout = _require_layout(type_layout_program, lhs.layout_map_id, op)
+    rhs_layout = _require_layout(type_layout_program, rhs.layout_map_id, op)
+    _require_dot_operand_layout(lhs_layout, 0, op)
+    _require_dot_operand_layout(rhs_layout, 1, op)
+    _require_dot_operand_parent_layout(lhs_layout, result_layout, 0, op)
+    _require_dot_operand_parent_layout(rhs_layout, result_layout, 1, op)
+    (
+        m_tiles,
+        n_tiles,
+        k_tiles,
+    ) = _mma_tile_grid(
+        result_layout,
+        lhs_layout,
+        rhs_layout,
+        op,
+    )
+    if (int(lhs.type.component_count) != m_tiles * k_tiles or int(rhs.type.component_count) != n_tiles * k_tiles):
+        fail(
+            "TLXW_OP_DOT",
+            STAGE,
+            "tt.dot operand fragment component counts do not match "
+            "the result MFMA tile grid",
+            source_op_index=op.index,
+        )
+    if int(acc.type.component_count) != m_tiles * n_tiles:
+        fail(
+            "TLXW_OP_DOT",
+            STAGE,
+            "tt.dot accumulator component count does not match "
+            "the result MFMA tile grid",
+            source_op_index=op.index,
+        )
+    operand_rows, operand_columns = _operand_fragment_shape(instr_shape, op)
+    acc_rows, acc_columns = _acc_fragment_shape(instr_shape, op)
+    lhs_registers = _fragment_registers(lhs.type.element_type, lhs_layout, op)
+    rhs_registers = _fragment_registers(rhs.type.element_type, rhs_layout, op)
+    acc_registers = _acc_fragment_registers(result_layout, op)
+    lane_width = int(result.type.lane_width or lhs.type.lane_width or rhs.type.lane_width or acc.type.lane_width or 64)
+    result_target_ids, result_layout_map_ids = _declare_results(
+        builder,
+        op,
+        type_layout_program,
+    )
+    mma_operand_target_ids = list(_operand_target_ids(builder, op))
+    builder.add_op(
+        "mma",
+        operands=tuple(mma_operand_target_ids),
+        results=result_target_ids,
+        attrs={
+            "acc_columns": int(acc_columns),
+            "acc_element_type": acc.type.element_type,
+            "acc_registers": int(acc_registers),
+            "acc_role": 2,
+            "acc_rows": int(acc_rows),
+            "kind": kind,
+            "k_tiles": int(k_tiles),
+            "lane_width": int(lane_width),
+            "lhs_columns": int(operand_columns),
+            "lhs_element_type": lhs.type.element_type,
+            "lhs_registers": int(lhs_registers),
+            "lhs_role": 0,
+            "lhs_rows": int(operand_rows),
+            "m_tiles": int(m_tiles),
+            "n_tiles": int(n_tiles),
+            "rhs_columns": int(operand_columns),
+            "rhs_element_type": rhs.type.element_type,
+            "rhs_registers": int(rhs_registers),
+            "rhs_role": 1,
+            "rhs_rows": int(operand_rows),
+            "swap_operands_for_transposed_result": bool(is_transposed),
+        },
+        layout_map_ids=result_layout_map_ids,
+        source_op_index=op.index,
+    )
+
+
+def _convert_dot_scaled(builder, conversion_input, type_layout_program, op):
+    if len(op.results) != 1 or len(op.operands) not in (3, 5):
+        fail(
+            "TLXW_OP_DOT_SCALED",
+            STAGE,
+            "tt.dot_scaled requires lhs, rhs, accumulator, optional lhs/rhs "
+            "scales, and one result",
+            source_op_index=op.index,
+        )
+    lhs = type_layout_program.values[op.operands[0]]
+    rhs = type_layout_program.values[op.operands[1]]
+    acc = type_layout_program.values[op.operands[2]]
+    lhs_scale = (type_layout_program.values[op.operands[3]] if len(op.operands) == 5 else None)
+    rhs_scale = (type_layout_program.values[op.operands[4]] if len(op.operands) == 5 else None)
+    result = type_layout_program.values[op.results[0]]
+    result_layout = type_layout_program.layouts[int(result.layout_map_id)]
+    if result_layout.kind != "amd_mfma":
+        fail(
+            "TLXW_OP_DOT_SCALED",
+            STAGE,
+            "tt.dot_scaled result must use an amd_mfma layout",
+            source_op_index=op.index,
+            source_value_id=op.results[0],
+        )
+    instr_shape = tuple(result_layout.properties.get("instr_shape", ()))
+    a_elem_type = _scale_dot_elem_type(op.attrs.get("a_elem_type"), op)
+    b_elem_type = _scale_dot_elem_type(op.attrs.get("b_elem_type"), op)
+    kind = _scaled_mma_kind(a_elem_type, b_elem_type, instr_shape, op)
+    if (lhs_scale is None) != (rhs_scale is None):
+        fail(
+            "TLXW_OP_DOT_SCALED",
+            STAGE,
+            "single-scale tt.dot_scaled lowering is not supported; upstream "
+            "must materialize the missing constant scale",
+            source_op_index=op.index,
+        )
+    is_transposed = bool(result_layout.properties.get("is_transposed", False))
+    if is_transposed and int(instr_shape[0]) != int(instr_shape[1]):
+        fail(
+            "TLXW_OP_DOT_SCALED",
+            STAGE,
+            "transposed scaled MFMA lowering requires a symmetric instruction "
+            f"shape, got {instr_shape}",
+            source_op_index=op.index,
+            source_value_id=op.results[0],
+        )
+    acc_layout = _require_layout(type_layout_program, acc.layout_map_id, op)
+    if not _same_layout_alias(acc, result, acc_layout, result_layout):
+        fail(
+            "TLXW_OP_DOT_SCALED",
+            STAGE,
+            "tt.dot_scaled accumulator layout must match the result layout",
+            source_op_index=op.index,
+            source_value_id=op.operands[2],
+        )
+    lhs_layout = _require_layout(type_layout_program, lhs.layout_map_id, op)
+    rhs_layout = _require_layout(type_layout_program, rhs.layout_map_id, op)
+    _require_dot_operand_layout(lhs_layout, 0, op)
+    _require_dot_operand_layout(rhs_layout, 1, op)
+    _require_dot_operand_parent_layout(lhs_layout, result_layout, 0, op)
+    _require_dot_operand_parent_layout(rhs_layout, result_layout, 1, op)
+    (
+        m_tiles,
+        n_tiles,
+        k_tiles,
+    ) = _mma_tile_grid(
+        result_layout,
+        lhs_layout,
+        rhs_layout,
+        op,
+    )
+    if (int(lhs.type.component_count) != m_tiles * k_tiles or int(rhs.type.component_count) != n_tiles * k_tiles):
+        fail(
+            "TLXW_OP_DOT_SCALED",
+            STAGE,
+            "tt.dot_scaled operand fragment component counts do not match "
+            "the result MFMA tile grid",
+            source_op_index=op.index,
+        )
+    if int(acc.type.component_count) != m_tiles * n_tiles:
+        fail(
+            "TLXW_OP_DOT_SCALED",
+            STAGE,
+            "tt.dot_scaled accumulator component count does not match "
+            "the result MFMA tile grid",
+            source_op_index=op.index,
+        )
+    if lhs.type.element_type != "i8" or rhs.type.element_type != "i8":
+        fail(
+            "TLXW_OP_DOT_SCALED",
+            STAGE,
+            "native scaled MFMA lowering expects packed i8 dot operands",
+            source_op_index=op.index,
+        )
+    scale_attrs = {"has_scales": lhs_scale is not None}
+    scale_operands = ()
+    if lhs_scale is not None and rhs_scale is not None:
+        _require_scaled_mma_scale(type_layout_program, lhs_scale, 0, op)
+        _require_scaled_mma_scale(type_layout_program, rhs_scale, 1, op)
+        scale_attrs.update(
+            _scaled_mma_scale_pack_attrs(
+                m_tiles,
+                n_tiles,
+                k_tiles,
+                int(lhs_scale.type.component_count),
+                int(rhs_scale.type.component_count),
+                op,
+            ))
+        scale_operands = (
+            _single_source_target(builder, op.operands[3], op),
+            _single_source_target(builder, op.operands[4], op),
+        )
+    operand_rows, operand_columns = _operand_fragment_shape(instr_shape, op)
+    acc_rows, acc_columns = _acc_fragment_shape(instr_shape, op)
+    lhs_registers = _fragment_registers(lhs.type.element_type, lhs_layout, op)
+    rhs_registers = _fragment_registers(rhs.type.element_type, rhs_layout, op)
+    acc_registers = _acc_fragment_registers(result_layout, op)
+    lane_width = int(result.type.lane_width or lhs.type.lane_width or rhs.type.lane_width or acc.type.lane_width or 64)
+    result_target_ids, result_layout_map_ids = _declare_results(
+        builder,
+        op,
+        type_layout_program,
+    )
+    builder.add_op(
+        "mma_scaled",
+        operands=(
+            _single_source_target(builder, op.operands[0], op),
+            _single_source_target(builder, op.operands[1], op),
+            _single_source_target(builder, op.operands[2], op),
+            *scale_operands,
+        ),
+        results=result_target_ids,
+        attrs={
+            "acc_columns": int(acc_columns),
+            "acc_element_type": acc.type.element_type,
+            "acc_registers": int(acc_registers),
+            "acc_role": 2,
+            "acc_rows": int(acc_rows),
+            "kind": kind,
+            "k_tiles": int(k_tiles),
+            "lane_width": int(lane_width),
+            "lhs_columns": int(operand_columns),
+            "lhs_element_type": lhs.type.element_type,
+            "lhs_registers": int(lhs_registers),
+            "lhs_role": 0,
+            "lhs_rows": int(operand_rows),
+            "m_tiles": int(m_tiles),
+            "n_tiles": int(n_tiles),
+            "rhs_columns": int(operand_columns),
+            "rhs_element_type": rhs.type.element_type,
+            "rhs_registers": int(rhs_registers),
+            "rhs_role": 1,
+            "rhs_rows": int(operand_rows),
+            "swap_operands_for_transposed_result": bool(is_transposed),
+            **scale_attrs,
+        },
+        layout_map_ids=result_layout_map_ids,
+        source_op_index=op.index,
+    )
+
+
+def _convert_mma_packet_truncf(builder, type_layout_program, op):
+    if len(op.operands) != 1 or len(op.results) != 1:
+        fail(
+            "TLXW_OP_MMA_PACKET_TRUNCF",
+            STAGE,
+            "MMA packet arith.truncf requires one operand and one result",
+            source_op_index=op.index,
+        )
+    operand = type_layout_program.values[op.operands[0]]
+    result = type_layout_program.values[op.results[0]]
+    if operand.type.element_type != "f32" or result.type.element_type not in {"f16", "bf16"}:
+        fail(
+            "TLXW_OP_MMA_PACKET_TRUNCF",
+            STAGE,
+            "only f32 to f16/bf16 MMA packet truncf is converted yet",
+            source_op_index=op.index,
+        )
+    if int(operand.type.component_count) != int(result.type.component_count):
+        fail(
+            "TLXW_OP_MMA_PACKET_TRUNCF",
+            STAGE,
+            "MMA packet truncf component counts must match",
+            source_op_index=op.index,
+        )
+    _require_same_layout_except_element_type(
+        type_layout_program,
+        operand,
+        result,
+        "MMA packet truncf operand and result",
+        op,
+    )
+    registers = _mma_packet_registers(type_layout_program, operand, op)
+    result_target_ids, result_layout_map_ids = _declare_results(
+        builder,
+        op,
+        type_layout_program,
+    )
+    builder.add_op(
+        "mma_packet_truncf",
+        operands=_operand_target_ids(builder, op),
+        results=result_target_ids,
+        attrs={
+            "component_count": int(result.type.component_count),
+            "lane_width": int(result.type.lane_width or 64),
+            "registers": int(registers),
+            "result_element_type": result.type.element_type,
+        },
+        layout_map_ids=result_layout_map_ids,
+        source_op_index=op.index,
+    )
+
+
+def _convert_layout(builder, conversion_input, type_layout_program, op):
+    del conversion_input
+    if len(op.operands) != 1 or len(op.results) != 1:
+        fail(
+            "TLXW_OP_CONVERT_LAYOUT",
+            STAGE,
+            "ttg.convert_layout requires one operand and one result",
+            source_op_index=op.index,
+        )
+    result_target_ids, result_layout_map_ids = _declare_results(
+        builder,
+        op,
+        type_layout_program,
+    )
+    source_invariant_bits = op.attrs.get("tlx.source_invariant_bits")
+    if source_invariant_bits is not None:
+        source_invariant_bits = tuple(int(value) for value in source_invariant_bits)
+    relation = _packet_relation_attrs(
+        type_layout_program,
+        op.operands,
+        op.results,
+        source_invariant_bits=source_invariant_bits,
+        op=op,
+    )[0]
+    builder.add_op(
+        "layout_convert",
+        operands=_operand_target_ids(builder, op),
+        results=result_target_ids,
+        attrs={
+            "fact_policy": "invalidate_layout_sensitive",
+            "relation": relation,
+            "transform": "identity",
+        },
+        layout_map_ids=result_layout_map_ids,
+        source_op_index=op.index,
+    )
+    source_shape = type_layout_program.layouts[int(type_layout_program.values[op.operands[0]].layout_map_id)].shape
+    result_shape = type_layout_program.layouts[int(result_layout_map_ids[0])].shape
+    _logical_relation_transform(
+        builder,
+        _operand_target_ids(builder, op)[0],
+        result_target_ids[0],
+        _logical_view_substitutions(source_shape, result_shape, transform="identity"),
+    )
+
+
+def _convert_structural_tensor_view(
+    builder,
+    conversion_input,
+    type_layout_program,
+    op,
+):
+    """Translate reshape/transpose as a literal structural target operation."""
+    del conversion_input
+    if len(op.operands) != 1 or len(op.results) != 1:
+        fail(
+            "TLXW_OP_STRUCTURAL_VIEW",
+            STAGE,
+            f"{op.name} requires one operand and one result",
+            source_op_index=op.index,
+        )
+    result_target_ids, result_layout_map_ids = _declare_results(
+        builder,
+        op,
+        type_layout_program,
+    )
+    transform = op.name.removeprefix("tt.")
+    order = tuple(int(dim) for dim in op.attrs.get("order", ()))
+    relation = _packet_relation_attrs(
+        type_layout_program,
+        op.operands,
+        op.results,
+        transform=transform,
+        order=order,
+        op=op,
+    )[0]
+    attrs = {
+        "fact_policy": "invalidate_layout_sensitive",
+        "relation": relation,
+        "transform": transform,
+    }
+    if op.name == "tt.trans":
+        attrs["order"] = order
+    builder.add_op(
+        "layout_convert",
+        operands=_operand_target_ids(builder, op),
+        results=result_target_ids,
+        attrs=attrs,
+        layout_map_ids=result_layout_map_ids,
+        source_op_index=op.index,
+    )
+    source_shape = type_layout_program.layouts[int(type_layout_program.values[op.operands[0]].layout_map_id)].shape
+    result_shape = type_layout_program.layouts[int(result_layout_map_ids[0])].shape
+    _logical_relation_transform(
+        builder,
+        _operand_target_ids(builder, op)[0],
+        result_target_ids[0],
+        _logical_view_substitutions(
+            source_shape,
+            result_shape,
+            transform=transform,
+            order=order,
+        ),
+    )
+
+
+def _same_layout_alias(operand, result, operand_layout, result_layout):
+    if int(operand.type.component_count) != int(result.type.component_count):
+        return False
+    if operand.type.element_type != result.type.element_type:
+        return False
+    if operand_layout is None or result_layout is None:
+        return operand_layout is result_layout
+    return (operand_layout.kind == result_layout.kind and tuple(operand_layout.shape) == tuple(result_layout.shape)
+            and operand_layout.element_type == result_layout.element_type
+            and operand_layout.properties == result_layout.properties)
+
+
+def _same_layout_except_element_type(operand_layout, result_layout):
+    if operand_layout is None or result_layout is None:
+        return operand_layout is result_layout
+    return (operand_layout.kind == result_layout.kind and tuple(operand_layout.shape) == tuple(result_layout.shape)
+            and int(operand_layout.component_count) == int(result_layout.component_count)
+            and int(operand_layout.lane_width) == int(result_layout.lane_width)
+            and operand_layout.properties == result_layout.properties)
+
+
+def _layout_for_converted_value(type_layout_program, value):
+    if value.layout_map_id is None:
+        return None
+    return type_layout_program.layouts[int(value.layout_map_id)]
+
+
+def _require_same_layout_except_element_type(
+    type_layout_program,
+    operand,
+    result,
+    description,
+    op,
+):
+    operand_layout = _layout_for_converted_value(type_layout_program, operand)
+    result_layout = _layout_for_converted_value(type_layout_program, result)
+    if _same_layout_except_element_type(operand_layout, result_layout):
+        return
+    fail(
+        "TLXW_OP_LAYOUT_MISMATCH",
+        STAGE,
+        f"{description} layouts must match; use ttg.convert_layout for layout changes",
+        source_op_index=op.index,
+        source_value_id=result.value_id,
+    )
+
+
+def _require_simple_op_layout_contract(type_layout_program, op):
+    if op.name not in _LAYOUT_PRESERVING_SIMPLE_OPS or not op.results:
+        return
+    result = type_layout_program.values[op.results[0]]
+    for operand_id in op.operands:
+        operand = type_layout_program.values[operand_id]
+        _require_same_layout_except_element_type(
+            type_layout_program,
+            operand,
+            result,
+            f"{op.name} operand and result",
+            op,
+        )
+
+
+def _require_yield_layouts(
+    type_layout_program,
+    yielded_source_value_ids,
+    result_value_ids,
+    description,
+    op,
+):
+    for index, (yielded_source_value_id, result_value_id) in enumerate(zip(yielded_source_value_ids, result_value_ids)):
+        _require_same_layout_except_element_type(
+            type_layout_program,
+            type_layout_program.values[yielded_source_value_id],
+            type_layout_program.values[result_value_id],
+            f"{description} {index}",
+            op,
+        )
+
+
+def _require_for_iter_layouts(
+    type_layout_program,
+    init_value_ids,
+    result_value_ids,
+    block_arg_value_ids,
+    op,
+):
+    for index, (init_value_id, result_value_id) in enumerate(zip(init_value_ids, result_value_ids)):
+        _require_same_layout_except_element_type(
+            type_layout_program,
+            type_layout_program.values[init_value_id],
+            type_layout_program.values[result_value_id],
+            f"scf.for iter_arg and result {index}",
+            op,
+        )
+    for index, (block_arg_value_id, result_value_id) in enumerate(zip(block_arg_value_ids, result_value_ids)):
+        _require_same_layout_except_element_type(
+            type_layout_program,
+            type_layout_program.values[block_arg_value_id],
+            type_layout_program.values[result_value_id],
+            f"scf.for block argument and result {index}",
+            op,
+        )
+
+
+def _require_mask_layout_compatible(
+    type_layout_program,
+    mask,
+    reference,
+    description,
+    op,
+):
+    if mask.layout_map_id is None:
+        return
+    _require_same_layout_except_element_type(
+        type_layout_program,
+        mask,
+        reference,
+        description,
+        op,
+    )
+
+
+def _convert_async_commit_group(builder, type_layout_program, token_groups_by_commit, op):
+    group = token_groups_by_commit.get(op.index)
+    if group is None:
+        fail(
+            "TLXW_OP_ASYNC_COMMIT_TOKEN",
+            STAGE,
+            "ttg.async_commit_group requires a token group",
+            source_op_index=op.index,
+        )
+    result_target_ids, _ = _declare_results(builder, op, type_layout_program)
+    for result_target_id in result_target_ids:
+        builder.set_value_event_domain(
+            result_target_id,
+            target_ir.EVENT_DOMAIN_DMA_GROUP,
+        )
+    operands = tuple(_single_source_target(builder, token_value_id, op) for token_value_id in group.member_token_ids)
+    _set_result_resource_targets(
+        builder,
+        result_target_ids,
+        operands,
+    )
+    issue_group_size = _int_attr_or_default(op.attrs, "tlx.async_issue_group_size", 0)
+    issue_delay_cycles = _int_attr_or_default(op.attrs, "tlx.async_issue_delay_cycles", 0)
+    issue_delay_overlap_cycles = _int_attr_or_default(op.attrs, "tlx.async_issue_delay_overlap_cycles", 0)
+    issue_delay_skip_thread_threshold = _int_attr_or_default(op.attrs, "tlx.async_issue_delay_skip_thread_threshold", 0)
+    if bool(issue_group_size) != bool(issue_delay_cycles):
+        fail(
+            "TLXW_OP_ASYNC_COMMIT_TOKEN",
+            STAGE,
+            "async commit issue delay requires both a group size and delay cycles",
+            source_op_index=op.index,
+        )
+    if issue_group_size < 0 or issue_delay_cycles < 0:
+        fail(
+            "TLXW_OP_ASYNC_COMMIT_TOKEN",
+            STAGE,
+            "async commit issue delay fields must be non-negative",
+            source_op_index=op.index,
+        )
+    if not 0 <= issue_delay_overlap_cycles <= issue_delay_cycles:
+        fail(
+            "TLXW_OP_ASYNC_COMMIT_TOKEN",
+            STAGE,
+            "async commit issue delay overlap exceeds the delay",
+            source_op_index=op.index,
+        )
+    if issue_delay_skip_thread_threshold < 0:
+        fail(
+            "TLXW_OP_ASYNC_COMMIT_TOKEN",
+            STAGE,
+            "async commit issue delay thread threshold must be non-negative",
+            source_op_index=op.index,
+        )
+    builder.add_op(
+        "async_commit_group",
+        operands=operands,
+        results=result_target_ids,
+        attrs={
+            "group_id": int(group.group_id),
+            "member_count": len(group.member_token_ids),
+            "issue_group_size": int(issue_group_size),
+            "issue_delay_cycles": int(issue_delay_cycles),
+            "issue_delay_overlap_cycles": int(issue_delay_overlap_cycles),
+            "issue_delay_skip_thread_threshold": int(issue_delay_skip_thread_threshold),
+        },
+        source_op_index=op.index,
+    )
+
+
+def _convert_async_wait(
+    builder,
+    conversion_input,
+    type_layout_program,
+    op,
+):
+    node = conversion_input.token_nodes_by_op.get(op.index)
+    if node is None:
+        fail(
+            "TLXW_OP_ASYNC_WAIT_TOKEN",
+            STAGE,
+            "ttg.async_wait requires a token graph node",
+            source_op_index=op.index,
+        )
+    result_target_ids, _ = _declare_results(builder, op, type_layout_program)
+    retained_group_operand_ids = tuple(
+        dict.fromkeys(
+            _single_source_target(
+                builder,
+                conversion_input.token_groups_by_id[group_id].token_value_id,
+                op,
+            ) for group_id in node.retained_group_ids if
+            (conversion_input.token_groups_by_id[group_id].token_value_id is not None and _implicit_group_is_reachable(
+                conversion_input,
+                conversion_input.token_groups_by_id[group_id],
+                op,
+            ))))
+    wait_token_ids = (node.input_token_ids if node.input_token_ids else _implicit_wait_token_ids(
+        conversion_input, node, op))
+    group_operand_ids = tuple(target_id for target_id in dict.fromkeys(
+        _single_source_target(builder, token_value_id, op) for token_value_id in wait_token_ids)
+                              if target_id not in retained_group_operand_ids)
+    entry_group_operand_ids = tuple(target_id for target_id in dict.fromkeys(
+        target_id for token_value_id in wait_token_ids
+        for target_id in (conversion_input.async_wait_entry_dependency_target_ids_by_value_id.get(
+            int(token_value_id),
+            (),
+        ))) if (target_id not in group_operand_ids and target_id not in retained_group_operand_ids))
+    retained_issue_operand_ids = ()
+    if retained_group_operand_ids:
+        retained_issue_target_id = _declare_protocol_token(
+            builder,
+            event_domain=target_ir.EVENT_DOMAIN_DMA_ISSUE,
+            debug_name=f"retained_issue_{op.index}",
+            resource_target_ids=_resource_target_ids(
+                builder,
+                retained_group_operand_ids,
+            ),
+        )
+        builder.add_op(
+            "issue_token",
+            operands=retained_group_operand_ids,
+            results=(retained_issue_target_id, ),
+            attrs={
+                "input_count": len(retained_group_operand_ids),
+                "projection_domain": target_ir.EVENT_DOMAIN_DMA_ISSUE,
+                "projection_provenance": "partial_wait_retained_group",
+                "retained_group_ids": tuple(int(group_id) for group_id in node.retained_group_ids),
+            },
+            source_op_index=op.index,
+        )
+        retained_issue_operand_ids = (retained_issue_target_id, )
+    for result_target_id in result_target_ids:
+        builder.set_value_event_domain(
+            result_target_id,
+            target_ir.EVENT_DOMAIN_WAVE_LOCAL_READY,
+        )
+        builder.set_value_resource_targets(
+            result_target_id,
+            _resource_target_ids(
+                builder,
+                (*group_operand_ids, *entry_group_operand_ids),
+            ),
+        )
+    builder.add_op(
+        "async_wait",
+        operands=(
+            *group_operand_ids,
+            *entry_group_operand_ids,
+            *retained_issue_operand_ids,
+        ),
+        results=result_target_ids,
+        attrs={
+            "wait_group": -1 if node.wait_group is None else int(node.wait_group),
+            "waited_group_ids": tuple(int(group_id) for group_id in node.waited_group_ids),
+            "retained_group_ids": tuple(int(group_id) for group_id in node.retained_group_ids),
+            "completed_group_dependency_count": len(group_operand_ids) + len(entry_group_operand_ids),
+            "retained_issue_dependency_count": len(retained_issue_operand_ids),
+        },
+        source_op_index=op.index,
+    )
+
+
+def _implicit_wait_token_ids(conversion_input, node, op):
+    wait_token_ids = []
+    for group_id in node.waited_group_ids:
+        group = conversion_input.token_groups_by_id[group_id]
+        if group.token_value_id is None:
+            continue
+        if not _implicit_group_is_reachable(conversion_input, group, op):
+            continue
+        wait_token_ids.append(group.token_value_id)
+    return tuple(wait_token_ids)
+
+
+def _implicit_group_is_reachable(conversion_input, group, op):
+    return (not _source_token_crosses_if_branch_path(
+        conversion_input,
+        group.commit_op_index,
+        op.index,
+    ) or _source_token_has_if_merge(
+        conversion_input,
+        group.token_value_id,
+    ))
+
+
+def _source_token_has_if_merge(conversion_input, source_value_id):
+    return any(source_value_id in (carry.then_source_value_id, carry.else_source_value_id)
+               for carries in conversion_input.if_token_carries_by_op.values()
+               for carry in carries)
+
+
+def _convert_return(builder, view):
+    builder.add_op(
+        "return",
+        operands=view.operand_target_ids,
+        source_op_index=view.op_index,
+    )
+
+
+def _convert_reduce(
+    builder,
+    conversion_input,
+    type_layout_program,
+    fact_program,
+    op,
+):
+    if len(op.operands) != 1 or len(op.results) != 1 or len(op.region_ids) != 1:
+        fail(
+            "TLXW_OP_REDUCTION",
+            STAGE,
+            "tt.reduce currently requires one input, one result, and one combiner region",
+            source_op_index=op.index,
+        )
+    operand = type_layout_program.values[op.operands[0]]
+    result = type_layout_program.values[op.results[0]]
+    if operand.type.representation not in (_MMA_PACKET_REPRESENTATIONS | {"simd", "simd_tuple"}):
+        fail(
+            "TLXW_OP_REDUCTION",
+            STAGE,
+            "tt.reduce input must be a distributed SIMD payload",
+            source_op_index=op.index,
+            source_value_id=operand.value_id,
+        )
+    if result.type.representation not in {"simd", "simd_tuple"}:
+        fail(
+            "TLXW_OP_REDUCTION",
+            STAGE,
+            "tt.reduce result must be a distributed SIMD payload",
+            source_op_index=op.index,
+            source_value_id=result.value_id,
+        )
+    if operand.type.element_type != result.type.element_type:
+        fail(
+            "TLXW_OP_REDUCTION",
+            STAGE,
+            "tt.reduce input and result element types must match",
+            source_op_index=op.index,
+        )
+    axis = _int_attr(op.attrs, "axis")
+    reduction_ordering = op.attrs.get("reduction_ordering") or "unordered"
+    if reduction_ordering not in {"inner_tree", "unordered"}:
+        fail(
+            "TLXW_OP_REDUCTION_ORDERING",
+            STAGE,
+            f"unsupported tt.reduce ordering {reduction_ordering}",
+            source_op_index=op.index,
+        )
+
+    source_region = conversion_input.regions[op.region_ids[0]]
+    if len(source_region.block_arg_ids) != 2:
+        fail(
+            "TLXW_OP_REDUCTION",
+            STAGE,
+            "tt.reduce combiner region must have two block arguments",
+            source_op_index=op.index,
+        )
+    lane_width = int(result.type.lane_width or operand.type.lane_width or 64)
+    combiner_type_layout_program = _lift_reduction_region_types(
+        conversion_input,
+        type_layout_program,
+        op.region_ids[0],
+        lane_width,
+        op,
+    )
+    block_arg_target_ids = tuple(
+        builder.add_value(
+            target_ir.target_type_from_converted(combiner_type_layout_program.values[source_value_id].type),
+            source_value_id=source_value_id,
+            debug_name=f"reduce_{op.index}_arg{index}",
+        ) for index, source_value_id in enumerate(source_region.block_arg_ids))
+    target_region_id = builder.add_region(block_arg_ids=block_arg_target_ids)
+    combiner_source_targets = dict(builder.source_value_targets)
+    with builder.insertion_region(target_region_id):
+        try:
+            yielded_source_values = _convert_region(
+                builder,
+                conversion_input,
+                combiner_type_layout_program,
+                fact_program,
+                op.region_ids[0],
+                allow_yield=True,
+                yield_op_names=("tt.reduce.return", ),
+            )
+            if len(yielded_source_values) != 1:
+                fail(
+                    "TLXW_OP_REDUCTION",
+                    STAGE,
+                    "tt.reduce combiner region must return one value",
+                    source_op_index=op.index,
+                )
+            yielded_target_id = _single_source_target(
+                builder,
+                yielded_source_values[0],
+                op,
+            )
+        finally:
+            _restore_source_target_snapshot(builder, combiner_source_targets)
+    builder.set_region_yields(target_region_id, (yielded_target_id, ))
+
+    result_target_ids, result_layout_map_ids = _declare_results(
+        builder,
+        op,
+        type_layout_program,
+    )
+    relation = _packet_relation_attrs(
+        type_layout_program,
+        op.operands,
+        op.results,
+        transform="reduction",
+        axis=int(axis),
+        op=op,
+    )[0]
+    builder.add_op(
+        "reduction",
+        operands=(_single_source_target(builder, operand.value_id, op), ),
+        results=result_target_ids,
+        attrs={
+            "axis": int(axis),
+            "relation": relation,
+            "reduction_ordering": reduction_ordering,
+        },
+        layout_map_ids=result_layout_map_ids,
+        region_ids=(target_region_id, ),
+        source_op_index=op.index,
+    )
+
+
+def _lift_reduction_region_types(
+    conversion_input,
+    type_layout_program,
+    region_id,
+    lane_width,
+    parent_op,
+):
+    values = dict(type_layout_program.values)
+    for source_value_id in _reduction_region_value_ids(
+            conversion_input,
+            region_id,
+    ):
+        converted = values[source_value_id]
+        if converted.type.representation != "scalar":
+            fail(
+                "TLXW_OP_REDUCTION",
+                STAGE,
+                "tt.reduce combiner values must have scalar source types",
+                source_op_index=parent_op.index,
+                source_value_id=source_value_id,
+            )
+        element_type = converted.type.element_type
+        if element_type == "i1":
+            lifted_type = replace(
+                converted.type,
+                kind="mask",
+                representation="mask",
+                lane_width=int(lane_width),
+                component_count=1,
+            )
+        else:
+            lifted_type = replace(
+                converted.type,
+                kind="tensor",
+                representation="simd",
+                lane_width=int(lane_width),
+                component_count=1,
+            )
+        values[source_value_id] = replace(
+            converted,
+            type=lifted_type,
+            layout_map_id=None,
+        )
+    return replace(type_layout_program, values=values)
+
+
+def _reduction_region_value_ids(conversion_input, region_id):
+    region = conversion_input.regions[int(region_id)]
+    value_ids = list(region.block_arg_ids)
+    for op_index in region.op_indices:
+        nested_op = conversion_input.ops[int(op_index)]
+        value_ids.extend(nested_op.results)
+        for child_region_id in nested_op.region_ids:
+            value_ids.extend(_reduction_region_value_ids(
+                conversion_input,
+                child_region_id,
+            ))
+    return tuple(dict.fromkeys(int(value_id) for value_id in value_ids))
+
+
+def _convert_select(
+    builder,
+    conversion_input,
+    type_layout_program,
+    fact_program,
+    op,
+):
+    if len(op.operands) != 3 or len(op.results) != 1:
+        fail(
+            "TLXW_OP_SELECT",
+            STAGE,
+            "arith.select requires one condition, two values, and one result",
+            source_op_index=op.index,
+        )
+    true_value = type_layout_program.values[int(op.operands[1])]
+    false_value = type_layout_program.values[int(op.operands[2])]
+    result = type_layout_program.values[int(op.results[0])]
+    _require_same_layout_except_element_type(
+        type_layout_program,
+        true_value,
+        result,
+        "arith.select true value and result",
+        op,
+    )
+    _require_same_layout_except_element_type(
+        type_layout_program,
+        false_value,
+        result,
+        "arith.select false value and result",
+        op,
+    )
+    condition = type_layout_program.values[int(op.operands[0])]
+    if condition.type.element_type != "i1":
+        fail(
+            "TLXW_OP_SELECT",
+            STAGE,
+            "arith.select condition must have i1 element type",
+            source_op_index=op.index,
+            source_value_id=int(op.operands[0]),
+        )
+    condition_target_id = _single_source_target(
+        builder,
+        int(op.operands[0]),
+        op,
+    )
+    true_target_id = _single_source_target(builder, int(op.operands[1]), op)
+    false_target_id = _single_source_target(builder, int(op.operands[2]), op)
+    result_target_ids, result_layout_map_ids = _declare_results(
+        builder,
+        op,
+        type_layout_program,
+    )
+    result_target_id = result_target_ids[0]
+
+    if result.type.representation in _MMA_PACKET_REPRESENTATIONS:
+        true_target_id, scalar_type = _unpack_mma_packet_edge(
+            builder,
+            type_layout_program,
+            true_value,
+            true_target_id,
+            op,
+        )
+        false_target_id, false_scalar_type = _unpack_mma_packet_edge(
+            builder,
+            type_layout_program,
+            false_value,
+            false_target_id,
+            op,
+        )
+        if scalar_type != false_scalar_type:
+            fail(
+                "TLXW_OP_SELECT",
+                STAGE,
+                "arith.select packet operands require identical structural "
+                "scalar edge types",
+                source_op_index=op.index,
+            )
+        if int(condition.type.component_count) not in {
+                1,
+                int(scalar_type.component_count),
+        }:
+            fail(
+                "TLXW_OP_SELECT",
+                STAGE,
+                "arith.select condition components must match the unpacked "
+                "packet payload",
+                source_op_index=op.index,
+                source_value_id=int(op.operands[0]),
+            )
+        scalar_result_target_id = builder.add_value(
+            scalar_type,
+            debug_name=f"select_scalar_result_{op.index}",
+        )
+        builder.add_op(
+            "select",
+            operands=(condition_target_id, true_target_id, false_target_id),
+            results=(scalar_result_target_id, ),
+            source_op_index=op.index,
+        )
+        _pack_mma_packet_edge(
+            builder,
+            type_layout_program,
+            result,
+            scalar_result_target_id,
+            result_target_id,
+            op,
+        )
+        return
+
+    _set_result_resource_targets(
+        builder,
+        result_target_ids,
+        (true_target_id, false_target_id),
+    )
+    builder.add_op(
+        "select",
+        operands=(condition_target_id, true_target_id, false_target_id),
+        results=result_target_ids,
+        layout_map_ids=result_layout_map_ids,
+        source_op_index=op.index,
+    )
+    result_type = builder.values[int(result_target_id)].type
+    condition_relation = _value_relation(builder, condition_target_id)
+    true_relation = _value_relation(builder, true_target_id)
+    false_relation = _value_relation(builder, false_target_id)
+    if (result_type.representation != "scalar"
+            and all(relation is not None for relation in (condition_relation, true_relation, false_relation))):
+        expr = (condition_relation.expr * true_relation.expr + (1 - condition_relation.expr) * false_relation.expr)
+        builder.value_relations[int(result_target_id)] = _IndexRelation(
+            expr,
+            _merge_relation_bindings(condition_relation, true_relation, false_relation),
+        )
+
+
+def _unpack_mma_packet_edge(
+    builder,
+    type_layout_program,
+    value,
+    target_value_id,
+    op,
+):
+    if value.type.representation not in _MMA_PACKET_REPRESENTATIONS:
+        fail(
+            "TLXW_OP_SELECT",
+            STAGE,
+            "packet select requires packet operands on both value edges",
+            source_op_index=op.index,
+            source_value_id=value.value_id,
+        )
+    packet_width = _mma_packet_registers(type_layout_program, value, op)
+    scalar_component_count = int(value.type.component_count) * int(packet_width)
+    scalar_type = target_ir.TargetType(
+        "tensor",
+        "simd" if scalar_component_count == 1 else "simd_tuple",
+        value.type.element_type,
+        int(value.type.lane_width or 64),
+        scalar_component_count,
+    )
+    result_target_id = builder.add_value(
+        scalar_type,
+        debug_name=f"packet_unpack_{op.index}_{value.value_id}",
+    )
+    builder.add_op(
+        "type_convert",
+        operands=(int(target_value_id), ),
+        results=(result_target_id, ),
+        attrs={
+            "mode": "packet_to_scalar_components",
+            "packet_component_count": int(value.type.component_count),
+            "packet_width": int(packet_width),
+        },
+        layout_map_ids=(() if value.layout_map_id is None else (value.layout_map_id, )),
+        source_op_index=op.index,
+    )
+    return result_target_id, scalar_type
+
+
+def _pack_mma_packet_edge(
+    builder,
+    type_layout_program,
+    result,
+    scalar_target_id,
+    result_target_id,
+    op,
+):
+    packet_width = _mma_packet_registers(type_layout_program, result, op)
+    builder.add_op(
+        "type_convert",
+        operands=(int(scalar_target_id), ),
+        results=(int(result_target_id), ),
+        attrs={
+            "mode": "scalar_components_to_packet",
+            "packet_component_count": int(result.type.component_count),
+            "packet_width": int(packet_width),
+        },
+        layout_map_ids=(() if result.layout_map_id is None else (result.layout_map_id, )),
+        source_op_index=op.index,
+    )
+
+
+_SIMPLE_OP_CONVERTERS = {
+    "arith.constant": _convert_constant,
+    **{op_name: _convert_binary
+       for op_name in _BINARY_OPS},
+    **{op_name: _convert_float_binary
+       for op_name in _FLOAT_BINARY_OPS},
+    **{op_name: _convert_float_unary
+       for op_name in _FLOAT_UNARY_OPS},
+    **{op_name: _convert_float_cast
+       for op_name in _FLOAT_CAST_OPS},
+    "arith.maxsi": _convert_maxsi,
+    "arith.minsi": _convert_minsi,
+    "llvm.intr.assume": _convert_assume,
+    "tt.splat": _convert_splat,
+    "tt.addptr": _convert_addptr,
+    "tt.get_program_id": _convert_program_id,
+    "ttg.warp_id": _convert_warp_id,
+    "gpu.thread_id": _convert_thread_id,
+    "rocdl.workitem.id.x": _convert_workitem_id_x,
+    "arith.index_cast": _convert_index_cast,
+    "tt.return": _convert_return,
+}
+
+_SPECIALIZED_SOURCE_OPS = frozenset({
+    "arith.cmpf",
+    "arith.cmpi",
+    "arith.select",
+    "arith.truncf",
+    "amdg.cond_barrier",
+    "rocdl.s.barrier",
+    "rocdl.s.setprio",
+    "rocdl.sched.barrier",
+    "ttg.barrier",
+    "ttg.warp_ballot",
+    "scf.for",
+    "scf.if",
+    "tt.broadcast",
+    "tt.expand_dims",
+    "tt.join",
+    "tt.split",
+    "tt.reshape",
+    "tt.trans",
+    "tt.make_range",
+    "tt.reduce",
+    "ttg.local_alloc",
+    "ttg.memdesc_index",
+    "ttg.memdesc_reinterpret",
+    "ttg.memdesc_reshape",
+    "ttg.memdesc_subslice",
+    "ttg.memdesc_trans",
+    "amdg.buffer_load_to_local",
+    "amdg.buffer_load",
+    "amdg.buffer_store",
+    "tt.load",
+    "tt.store",
+    "ttg.local_load",
+    "ttg.local_store",
+    "ttg.convert_layout",
+    "tt.dot",
+    "tt.dot_scaled",
+    "ttg.async_commit_group",
+    "ttg.async_wait",
+})
+
+_SUPPORTED_SOURCE_OPS = frozenset(_SIMPLE_OP_CONVERTERS) | _SPECIALIZED_SOURCE_OPS
+_UNOWNED_SOURCE_OPS = _SUPPORTED_SOURCE_OPS - domains.all_source_ops()
+if _UNOWNED_SOURCE_OPS:
+    raise RuntimeError(f"unsupported source op domains: {sorted(_UNOWNED_SOURCE_OPS)}")
+
+
+def _convert_sched_barrier(builder, op):
+    if op.results:
+        fail(
+            "TLXW_OP_UNEXPECTED_RESULT",
+            STAGE,
+            "rocdl.sched.barrier must not produce values",
+            source_op_index=op.index,
+        )
+    border = op.attrs.get("triton.warp_pipeline.border")
+    builder.add_op(
+        "sched_barrier",
+        attrs={
+            "border": "" if border is None else str(border),
+            "mask": int(op.attrs.get("mask", 0) or 0),
+        },
+        source_op_index=op.index,
+    )
+
+
+def _convert_barrier(builder, conversion_input, op):
+    if op.operands or op.results:
+        fail(
+            "TLXW_OP_UNSUPPORTED_BARRIER",
+            STAGE,
+            f"{op.name} must not have operands or results",
+            source_op_index=op.index,
+        )
+    readiness_target_ids = tuple(
+        dict.fromkeys(
+            _single_source_target(builder, source_value_id, op)
+            for source_value_id in conversion_input.implicit_wait_readiness_value_ids_by_op.get(
+                op.index,
+                (),
+            )))
+    attrs = {
+        "address_space":
+        int(op.attrs.get("addrSpace", 0)),
+        "dependency_count":
+        len(readiness_target_ids),
+        "orders_memory_issue":
+        bool(int(op.attrs.get("addrSpace", 0)) == 31 or op.attrs.get("tlx.orders_memory_issue", False)),
+    }
+    if bool(op.attrs.get("tlx.compiler_membar_barrier", False)):
+        attrs["compiler_membar_barrier"] = True
+    builder.add_op(
+        "barrier",
+        operands=readiness_target_ids,
+        attrs=attrs,
+        source_op_index=op.index,
+    )
+
+
+def _convert_cond_barrier(builder, op):
+    if len(op.operands) != 1 or op.results:
+        fail(
+            "TLXW_OP_UNSUPPORTED_COND_BARRIER",
+            STAGE,
+            "amdg.cond_barrier requires one predicate and no results",
+            source_op_index=op.index,
+        )
+    builder.add_op(
+        "cond_barrier",
+        operands=_operand_target_ids(builder, op),
+        source_op_index=op.index,
+    )
+
+
+def _convert_set_priority(builder, op):
+    if op.operands or op.results:
+        fail(
+            "TLXW_OP_UNSUPPORTED_SET_PRIORITY",
+            STAGE,
+            "rocdl.s.setprio must not have operands or results",
+            source_op_index=op.index,
+        )
+    priority = int(op.attrs.get("priority", -1))
+    if priority < 0 or priority > 3:
+        fail(
+            "TLXW_OP_UNSUPPORTED_SET_PRIORITY",
+            STAGE,
+            f"rocdl.s.setprio priority must be in [0, 3], got {priority}",
+            source_op_index=op.index,
+        )
+    builder.add_op(
+        "set_priority",
+        attrs={"priority": priority},
+        source_op_index=op.index,
+    )
+
+
+def _fact_ids_by_source_op(fact_program):
+    result = {}
+    for fact in fact_program.facts:
+        if fact.source_op_index is None:
+            continue
+        result.setdefault(fact.source_op_index, tuple())
+        result[fact.source_op_index] = (*result[fact.source_op_index], fact.fact_id)
+    return result
+
+
+def _fact_target_ids(builder, fact_program, fact_ids, op):
+    target_ids = []
+    for fact_id in fact_ids:
+        try:
+            fact = fact_program.facts[fact_id]
+        except IndexError:
+            fail(
+                "TLXW_OP_UNKNOWN_FACT",
+                STAGE,
+                f"op references missing fact {fact_id}",
+                source_op_index=op.index,
+                fact_id=fact_id,
+            )
+        target_ids.append(_fact_target_id(builder, fact, op))
+    return tuple(target_ids)
+
+
+def _fact_target_id(builder, fact, op):
+    targets = builder.source_value_targets.get(fact.subject_value_id)
+    if not targets:
+        fail(
+            "TLXW_OP_FACT_TARGET",
+            STAGE,
+            f"fact {fact.fact_id} subject has no converted target value",
+            source_op_index=op.index,
+            source_value_id=fact.subject_value_id,
+            fact_id=fact.fact_id,
+        )
+    if len(targets) != 1:
+        fail(
+            "TLXW_OP_FACT_TARGET",
+            STAGE,
+            f"fact {fact.fact_id} subject maps to multiple target values {targets}",
+            source_op_index=op.index,
+            source_value_id=fact.subject_value_id,
+            fact_id=fact.fact_id,
+        )
+    return targets[0]
+
+
+def _source_token_crosses_if_branch_path(conversion_input, commit_op_index, wait_op_index):
+    commit_branches = _enclosing_if_branch_regions(conversion_input, commit_op_index)
+    if not commit_branches:
+        return False
+    wait_branches = _enclosing_if_branch_regions(conversion_input, wait_op_index)
+    for if_op_index, commit_branch_region_id in commit_branches.items():
+        wait_branch_region_id = wait_branches.get(if_op_index)
+        if wait_branch_region_id is None:
+            return True
+        if wait_branch_region_id != commit_branch_region_id:
+            return True
+    return False
+
+
+def _enclosing_if_branch_regions(conversion_input, op_index):
+    try:
+        region_id = conversion_input.ops[op_index].parent_region_id
+    except IndexError:
+        return {}
+    result = {}
+    while region_id is not None:
+        try:
+            region = conversion_input.regions[region_id]
+        except IndexError:
+            break
+        parent_op_index = region.parent_op_index
+        if parent_op_index is None:
+            break
+        try:
+            parent_op = conversion_input.ops[parent_op_index]
+        except IndexError:
+            break
+        if parent_op.name == "scf.if":
+            result[parent_op_index] = region_id
+        region_id = parent_op.parent_region_id
+    return result
+
+
+def _pointer_byte_range_fact(fact_program, value_id, op):
+    for fact_id in fact_program.by_value.get(value_id, ()):
+        fact = fact_program.facts[fact_id]
+        if fact.kind == "pointer_byte_range" and fact.upper is not None:
+            return fact
+    fail(
+        "TLXW_OP_MISSING_POINTER_RANGE_FACT",
+        STAGE,
+        "amdg.buffer_load_to_local requires a pointer byte-range fact",
+        source_op_index=op.index,
+        source_value_id=value_id,
+    )
+
+
+def _memdesc_infos(source_program):
+    result = {}
+    for value_id, value in source_program.values.items():
+        if value.type.kind != "memdesc":
+            continue
+        result[value_id] = MemdescInfo(
+            value_id,
+            value.type.element_type,
+            value.type.element_byte_width,
+            tuple(value.type.shape),
+            tuple(value.type.alloc_shape),
+            _memdesc_size_bytes(value.type, value.owner_op_index, value_id),
+        )
+    return result
+
+
+def _compute_memdesc_view_infos(
+        source_values,
+        ops,
+        kernel_arg_ids,
+        memdescs,
+        regions=(),
+):
+    result = {}
+    for_yield_edges = {}
+
+    def base_view(value_id):
+        memdesc = _memdesc_info_from_table(memdescs, value_id, None)
+        physical_shape = tuple(int(dim) for dim in (memdesc.alloc_shape or memdesc.shape))
+        return MemdescViewInfo(
+            int(value_id),
+            tuple(0 for _ in physical_shape),
+            physical_shape,
+        )
+
+    def copy_view(value_id, view):
+        if view is None:
+            return None
+        return MemdescViewInfo(
+            int(value_id),
+            tuple(int(origin) for origin in view.logical_origin),
+            tuple(int(dim) for dim in view.physical_shape),
+        )
+
+    def same_view_geometry(lhs, rhs):
+        return (lhs is not None and rhs is not None and lhs.logical_origin == rhs.logical_origin
+                and lhs.physical_shape == rhs.physical_shape)
+
+    def require_same_memdesc_type(lhs_id, rhs_id, op, description):
+        lhs = source_values[int(lhs_id)].type
+        rhs = source_values[int(rhs_id)].type
+        fields = (
+            "element_type",
+            "element_byte_width",
+            "shape",
+            "alloc_shape",
+            "encoding",
+            "memory_space",
+            "mutable",
+        )
+        mismatches = tuple(field for field in fields if getattr(lhs, field) != getattr(rhs, field))
+        if mismatches:
+            fail(
+                "TLXW_OP_MEMDESC_FOR_CARRY",
+                STAGE,
+                f"{description} must preserve the memdesc type; "
+                f"mismatched_fields={mismatches!r}",
+                source_op_index=op.index,
+                source_value_id=rhs_id,
+            )
+
+    def for_region_and_yield(op):
+        if len(op.region_ids) != 1 or not regions:
+            fail(
+                "TLXW_OP_MEMDESC_FOR_CARRY",
+                STAGE,
+                "memdesc scf.for carry requires one structurally available body region",
+                source_op_index=op.index,
+            )
+        region = regions[int(op.region_ids[0])]
+        if (len(op.operands) < 3 or len(op.results) != len(op.operands) - 3
+                or len(region.block_arg_ids) != 1 + len(op.results)):
+            fail(
+                "TLXW_OP_MEMDESC_FOR_CARRY",
+                STAGE,
+                "memdesc scf.for carry has inconsistent iter-arg structure",
+                source_op_index=op.index,
+            )
+        yield_op = None
+        for op_index in reversed(region.op_indices):
+            candidate = ops[int(op_index)]
+            if candidate.name == "scf.yield":
+                yield_op = candidate
+                break
+        if yield_op is None or len(yield_op.operands) != len(op.results):
+            fail(
+                "TLXW_OP_MEMDESC_FOR_CARRY",
+                STAGE,
+                "memdesc scf.for carry requires a matching structural yield",
+                source_op_index=op.index,
+            )
+        return region, yield_op
+
+    for value_id in kernel_arg_ids:
+        if value_id in memdescs:
+            result[int(value_id)] = base_view(value_id)
+
+    for op in ops:
+        # Validate a loop's provisional result geometry at its backedge before
+        # any operation following the loop consumes that result.  The parent
+        # scf.for precedes its body in source order, so its block arguments can
+        # be seeded from the initial iter-args while body view operations are
+        # analyzed normally.
+        for edge in for_yield_edges.get(int(op.index), ()):
+            init_id, block_arg_id, yielded_id, result_id, for_op = edge
+            init_view = result.get(int(init_id))
+            yielded_view = result.get(int(yielded_id))
+            if init_view is None or yielded_view is None:
+                result[int(result_id)] = None
+                continue
+            if not same_view_geometry(init_view, yielded_view):
+                fail(
+                    "TLXW_OP_MEMDESC_FOR_CARRY",
+                    STAGE,
+                    "scf.for memdesc iter-arg view geometry must be loop invariant",
+                    source_op_index=for_op.index,
+                    source_value_id=yielded_id,
+                )
+            result[int(block_arg_id)] = copy_view(block_arg_id, init_view)
+            result[int(result_id)] = copy_view(result_id, init_view)
+
+        memdesc_results = tuple(result_id for result_id in op.results if result_id in memdescs)
+        if not memdesc_results:
+            continue
+        if op.name == "scf.for":
+            region, yield_op = for_region_and_yield(op)
+            edges = []
+            for index, result_id in enumerate(op.results):
+                if result_id not in memdescs:
+                    continue
+                init_id = int(op.operands[3 + index])
+                block_arg_id = int(region.block_arg_ids[1 + index])
+                yielded_id = int(yield_op.operands[index])
+                if (init_id not in memdescs or block_arg_id not in memdescs or yielded_id not in memdescs):
+                    fail(
+                        "TLXW_OP_MEMDESC_FOR_CARRY",
+                        STAGE,
+                        "scf.for memdesc result must have memdesc init, block, and yield values",
+                        source_op_index=op.index,
+                        source_value_id=result_id,
+                    )
+                require_same_memdesc_type(
+                    init_id,
+                    block_arg_id,
+                    op,
+                    "scf.for memdesc init and block argument",
+                )
+                require_same_memdesc_type(
+                    init_id,
+                    yielded_id,
+                    op,
+                    "scf.for memdesc init and yielded value",
+                )
+                require_same_memdesc_type(
+                    init_id,
+                    result_id,
+                    op,
+                    "scf.for memdesc init and result",
+                )
+                init_view = result.get(init_id)
+                result[block_arg_id] = copy_view(block_arg_id, init_view)
+                result[int(result_id)] = copy_view(result_id, init_view)
+                edges.append((
+                    init_id,
+                    block_arg_id,
+                    yielded_id,
+                    int(result_id),
+                    op,
+                ))
+            if edges:
+                for_yield_edges.setdefault(int(yield_op.index), []).extend(edges)
+            continue
+        if op.name in {"ttg.local_alloc", "ttg.memdesc_index"}:
+            for result_id in memdesc_results:
+                result[int(result_id)] = base_view(result_id)
+            continue
+        if op.name == "ttg.memdesc_reshape":
+            if len(op.operands) != 1 or len(op.results) != 1:
+                fail(
+                    "TLXW_OP_MEMDESC_RESHAPE",
+                    STAGE,
+                    "ttg.memdesc_reshape requires one memdesc operand and one result",
+                    source_op_index=op.index,
+                )
+            parent_id = int(op.operands[0])
+            result_id = int(op.results[0])
+            parent_view = result.get(parent_id)
+            if parent_view is None:
+                fail(
+                    "TLXW_OP_MEMDESC_RESHAPE",
+                    STAGE,
+                    "ttg.memdesc_reshape parent view is not structurally resolvable",
+                    source_op_index=op.index,
+                    source_value_id=parent_id,
+                )
+            parent = _memdesc_info_from_table(memdescs, parent_id, op)
+            child = _memdesc_info_from_table(memdescs, result_id, op)
+            parent_type = source_values[parent_id].type
+            child_type = source_values[result_id].type
+            if (parent.element_type != child.element_type or parent.element_byte_width != child.element_byte_width
+                    or parent_type.memory_space != child_type.memory_space
+                    or parent_type.mutable != child_type.mutable):
+                fail(
+                    "TLXW_OP_MEMDESC_RESHAPE",
+                    STAGE,
+                    "ttg.memdesc_reshape must preserve element type, memory "
+                    "space, and mutability",
+                    source_op_index=op.index,
+                    source_value_id=result_id,
+                )
+            if any(int(origin) for origin in parent_view.logical_origin):
+                fail(
+                    "TLXW_OP_MEMDESC_RESHAPE",
+                    STAGE,
+                    "ttg.memdesc_reshape of a nonzero-origin view requires an "
+                    "explicit structural origin map",
+                    source_op_index=op.index,
+                    source_value_id=result_id,
+                )
+            child_physical_shape = tuple(int(dim) for dim in (child.alloc_shape or child.shape))
+            if (_product(parent.shape) != _product(child.shape)
+                    or _product(parent_view.physical_shape) != _product(child_physical_shape)):
+                fail(
+                    "TLXW_OP_MEMDESC_RESHAPE",
+                    STAGE,
+                    "ttg.memdesc_reshape must preserve logical and physical "
+                    "element counts",
+                    source_op_index=op.index,
+                    source_value_id=result_id,
+                )
+            result[result_id] = MemdescViewInfo(
+                result_id,
+                tuple(0 for _ in child_physical_shape),
+                child_physical_shape,
+            )
+            continue
+        if op.name == "ttg.memdesc_subslice":
+            if len(op.operands) != 1 or len(op.results) != 1:
+                fail(
+                    "TLXW_OP_MEMDESC_SUBSLICE",
+                    STAGE,
+                    "ttg.memdesc_subslice requires one memdesc operand and one result",
+                    source_op_index=op.index,
+                )
+            parent_id = int(op.operands[0])
+            result_id = int(op.results[0])
+            parent_view = result.get(parent_id)
+            if parent_view is None:
+                fail(
+                    "TLXW_OP_MEMDESC_SUBSLICE",
+                    STAGE,
+                    "ttg.memdesc_subslice parent view is not structurally resolvable",
+                    source_op_index=op.index,
+                    source_value_id=parent_id,
+                )
+            parent = _memdesc_info_from_table(memdescs, parent_id, op)
+            child = _memdesc_info_from_table(memdescs, result_id, op)
+            offsets = op.attrs.get("offsets")
+            if not isinstance(offsets, (tuple, list)):
+                fail(
+                    "TLXW_OP_MEMDESC_SUBSLICE",
+                    STAGE,
+                    "ttg.memdesc_subslice requires structural integer offsets",
+                    source_op_index=op.index,
+                    source_value_id=result_id,
+                )
+            offsets = tuple(int(offset) for offset in offsets)
+            parent_shape = tuple(int(dim) for dim in parent.shape)
+            child_shape = tuple(int(dim) for dim in child.shape)
+            rank = len(parent_shape)
+            if len(offsets) != rank or len(child_shape) != rank:
+                fail(
+                    "TLXW_OP_MEMDESC_SUBSLICE",
+                    STAGE,
+                    "ttg.memdesc_subslice offset/result ranks must match the parent rank",
+                    source_op_index=op.index,
+                    source_value_id=result_id,
+                )
+            if (parent.element_type != child.element_type or parent.element_byte_width != child.element_byte_width):
+                fail(
+                    "TLXW_OP_MEMDESC_SUBSLICE",
+                    STAGE,
+                    "ttg.memdesc_subslice must preserve the memdesc element type",
+                    source_op_index=op.index,
+                    source_value_id=result_id,
+                )
+            parent_type = source_values[parent_id].type
+            child_type = source_values[result_id].type
+            if (parent_type.encoding != child_type.encoding or parent_type.memory_space != child_type.memory_space
+                    or parent_type.mutable != child_type.mutable):
+                fail(
+                    "TLXW_OP_MEMDESC_SUBSLICE",
+                    STAGE,
+                    "ttg.memdesc_subslice must preserve layout, memory space, and mutability",
+                    source_op_index=op.index,
+                    source_value_id=result_id,
+                )
+            for offset, child_extent, parent_extent in zip(offsets, child_shape, parent_shape):
+                if int(offset) < 0 or int(child_extent) <= 0 or int(offset) + int(child_extent) > int(parent_extent):
+                    fail(
+                        "TLXW_OP_MEMDESC_SUBSLICE",
+                        STAGE,
+                        "ttg.memdesc_subslice lies outside the parent logical shape",
+                        source_op_index=op.index,
+                        source_value_id=result_id,
+                    )
+            physical_shape = tuple(int(dim) for dim in parent_view.physical_shape)
+            child_alloc_shape = tuple(int(dim) for dim in child.alloc_shape)
+            if child_alloc_shape and child_alloc_shape != physical_shape:
+                fail(
+                    "TLXW_OP_MEMDESC_SUBSLICE",
+                    STAGE,
+                    "ttg.memdesc_subslice allocation shape must preserve the parent allocation",
+                    source_op_index=op.index,
+                    source_value_id=result_id,
+                )
+            logical_origin = tuple(
+                int(origin) + int(offset) for origin, offset in zip(parent_view.logical_origin, offsets))
+            result[result_id] = MemdescViewInfo(
+                result_id,
+                logical_origin,
+                physical_shape,
+            )
+            continue
+        if op.name == "ttg.memdesc_trans" and len(op.operands) == 1 and len(op.results) == 1:
+            parent_view = result.get(int(op.operands[0]))
+            if parent_view is None:
+                result[int(op.results[0])] = None
+                continue
+            result_id = int(op.results[0])
+            child = _memdesc_info_from_table(memdescs, result_id, op)
+            physical_shape = tuple(reversed(parent_view.physical_shape))
+            logical_origin = tuple(reversed(parent_view.logical_origin))
+            child_alloc_shape = tuple(int(dim) for dim in child.alloc_shape)
+            if child_alloc_shape and child_alloc_shape != physical_shape:
+                fail(
+                    "TLXW_OP_MEMDESC_TRANS",
+                    STAGE,
+                    "ttg.memdesc_trans allocation shape is not the reversed parent allocation",
+                    source_op_index=op.index,
+                    source_value_id=result_id,
+                )
+            result[result_id] = MemdescViewInfo(
+                result_id,
+                logical_origin,
+                physical_shape,
+            )
+            continue
+        if op.name == "arith.select" and len(op.operands) == 3 and len(op.results) == 1:
+            lhs = result.get(int(op.operands[1]))
+            rhs = result.get(int(op.operands[2]))
+            if (lhs is not None and rhs is not None and lhs.logical_origin == rhs.logical_origin
+                    and lhs.physical_shape == rhs.physical_shape):
+                result[int(op.results[0])] = MemdescViewInfo(
+                    int(op.results[0]),
+                    lhs.logical_origin,
+                    lhs.physical_shape,
+                )
+            else:
+                result[int(op.results[0])] = None
+            continue
+        for result_id in memdesc_results:
+            result[int(result_id)] = None
+    return result
+
+
+def _compute_memdesc_physical_allocation_bytes(
+    source_values,
+    ops,
+    type_layout_program,
+    memdescs,
+):
+    ops_by_index = {op.index: op for op in ops}
+    result = {}
+    for value_id in memdescs:
+        memdesc = _memdesc_info_from_table(memdescs, value_id, None)
+        value = source_values.get(value_id)
+        op = (None if value is None or value.owner_op_index is None else ops_by_index.get(int(value.owner_op_index)))
+        result[int(value_id)] = int(
+            _memdesc_physical_allocation_bytes(
+                memdesc,
+                _layout_for_value(type_layout_program, value_id),
+                op,
+            ))
+    return result
+
+
+def _layout_for_value(type_layout_program, value_id):
+    converted = type_layout_program.values.get(value_id)
+    if converted is None or converted.layout_map_id is None:
+        return None
+    return type_layout_program.layouts[int(converted.layout_map_id)]
+
+
+def _memdesc_physical_allocation_bytes(memdesc, layout, op):
+    dense_size = int(memdesc.allocation_bytes)
+    element_byte_width = memdesc.element_byte_width
+    shape = tuple(int(dim) for dim in (memdesc.alloc_shape or memdesc.shape or ()))
+    if element_byte_width is None or not shape:
+        fail(
+            "TLXW_OP_UNSUPPORTED_LOCAL_ALLOC",
+            STAGE,
+            "shared allocation requires a ranked element type",
+            source_op_index=None if op is None else op.index,
+            source_value_id=memdesc.value_id,
+        )
+    try:
+        physical_size = layouts.shared_allocation_size_bytes(
+            layout,
+            shape,
+            int(element_byte_width),
+            stage=STAGE,
+            diagnostic="TLXW_OP_UNSUPPORTED_LOCAL_ALLOC",
+            source_op_index=None if op is None else op.index,
+            source_value_id=memdesc.value_id,
+        )
+    except ValueError as exc:
+        fail(
+            "TLXW_OP_UNSUPPORTED_LOCAL_ALLOC",
+            STAGE,
+            str(exc),
+            source_op_index=None if op is None else op.index,
+            source_value_id=memdesc.value_id,
+        )
+    return max(dense_size, physical_size)
+
+
+def _memdesc_size_bytes(source_type, source_op_index, source_value_id):
+    element_byte_width = source_type.element_byte_width
+    if element_byte_width is None:
+        fail(
+            "TLXW_OP_MEMDESC_ELEMENT_SIZE",
+            STAGE,
+            f"cannot size LDS allocation {source_type.raw}: unknown element byte width",
+            source_op_index=source_op_index,
+            source_value_id=source_value_id,
+        )
+    return _product(source_type.alloc_shape or source_type.shape or (1, )) * int(element_byte_width)
+
+
+def _memdesc_info(conversion_input, value_id, op):
+    return _memdesc_info_from_table(conversion_input.memdescs, value_id, op)
+
+
+def _memdesc_view_info(conversion_input, value_id, op):
+    view = conversion_input.memdesc_views.get(int(value_id))
+    if view is not None:
+        return view
+    fail(
+        "TLXW_OP_MEMDESC_VIEW_INFO",
+        STAGE,
+        f"expected structurally resolvable memdesc view metadata for value {value_id}",
+        source_op_index=op.index if op is not None else None,
+        source_value_id=value_id,
+    )
+
+
+def _memdesc_info_from_table(memdescs, value_id, op):
+    memdesc = memdescs.get(value_id)
+    if memdesc is not None:
+        return memdesc
+    fail(
+        "TLXW_OP_MEMDESC_INFO",
+        STAGE,
+        f"expected memdesc metadata for value {value_id}",
+        source_op_index=op.index if op is not None else None,
+        source_value_id=value_id,
+    )
+
+
+def _single_source_target(builder, source_value_id, op):
+    targets = builder.source_value_targets.get(source_value_id)
+    if not targets:
+        fail(
+            "TLXW_OP_UNCONVERTED_OPERAND",
+            STAGE,
+            f"yielded value {source_value_id} has no converted target value",
+            source_op_index=op.index,
+            source_value_id=source_value_id,
+        )
+    if len(targets) != 1:
+        fail(
+            "TLXW_OP_MULTI_VALUE_OPERAND",
+            STAGE,
+            f"yielded value {source_value_id} maps to multiple target values {targets}",
+            source_op_index=op.index,
+            source_value_id=source_value_id,
+        )
+    return targets[0]
+
+
+def _buffer_load_to_local_fields(op):
+    segments = _operand_segments(op, 6, (1, 1, 1, 0, 0, 0))
+    if int(segments[0]) != 1 or int(segments[1]) != 1 or int(segments[2]) != 1:
+        fail(
+            "TLXW_OP_MALFORMED_BUFFER_ASYNC",
+            STAGE,
+            "amdg.buffer_load_to_local requires destination, base, and offsets",
+            source_op_index=op.index,
+        )
+    if any(int(segment) > 1 for segment in segments[3:]):
+        fail(
+            "TLXW_OP_MALFORMED_BUFFER_ASYNC",
+            STAGE,
+            "amdg.buffer_load_to_local optional segments must be scalar",
+            source_op_index=op.index,
+        )
+    _require_operand_count(op, segments)
+    base_index = int(segments[0])
+    offset_index = base_index + int(segments[1])
+    mask_index = offset_index + int(segments[2])
+    other_index = mask_index + int(segments[3])
+    stride_index = other_index + int(segments[4])
+    return {
+        "memdesc_value_id": op.operands[0],
+        "base_value_id": op.operands[base_index],
+        "offset_value_id": op.operands[offset_index],
+        "mask_value_id": op.operands[mask_index] if int(segments[3]) else None,
+        "other_value_id": op.operands[other_index] if int(segments[4]) else None,
+        "stride_value_id": op.operands[stride_index] if int(segments[5]) else None,
+        "cache": _int_attr_or_default(op.attrs, "cache", 1),
+        "contiguity": _int_attr_or_default(op.attrs, "contiguity", 1),
+    }
+
+
+def _load_fields(op):
+    if len(op.results) != 1:
+        fail(
+            "TLXW_OP_MALFORMED_LOAD",
+            STAGE,
+            "tt.load requires one result",
+            source_op_index=op.index,
+        )
+    if len(op.operands) not in (1, 2, 3):
+        fail(
+            "TLXW_OP_MALFORMED_LOAD",
+            STAGE,
+            "tt.load requires pointer plus optional mask/other operands",
+            source_op_index=op.index,
+        )
+    return {
+        "pointer_value_id": op.operands[0],
+        "mask_value_id": op.operands[1] if len(op.operands) >= 2 else None,
+        "other_value_id": op.operands[2] if len(op.operands) >= 3 else None,
+    }
+
+
+def _store_fields(op):
+    if op.results:
+        fail(
+            "TLXW_OP_MALFORMED_STORE",
+            STAGE,
+            "tt.store must not produce results",
+            source_op_index=op.index,
+        )
+    if len(op.operands) not in (2, 3):
+        fail(
+            "TLXW_OP_MALFORMED_STORE",
+            STAGE,
+            "tt.store requires pointer, value, and optional mask operands",
+            source_op_index=op.index,
+        )
+    return {
+        "pointer_value_id": op.operands[0],
+        "value_value_id": op.operands[1],
+        "mask_value_id": op.operands[2] if len(op.operands) == 3 else None,
+    }
+
+
+def _buffer_load_fields(op):
+    segments = _operand_segments(op, 5, None)
+    if int(segments[0]) != 1 or int(segments[1]) != 1:
+        fail(
+            "TLXW_OP_MALFORMED_BUFFER_LOAD",
+            STAGE,
+            "amdg.buffer_load requires base pointer and offsets operands",
+            source_op_index=op.index,
+        )
+    if int(segments[2]) not in (0, 1):
+        fail(
+            "TLXW_OP_MALFORMED_BUFFER_LOAD",
+            STAGE,
+            "amdg.buffer_load supports at most one stride operand",
+            source_op_index=op.index,
+        )
+    if int(segments[3]) not in (0, 1) or int(segments[4]) not in (0, 1):
+        fail(
+            "TLXW_OP_MALFORMED_BUFFER_LOAD",
+            STAGE,
+            "amdg.buffer_load supports at most one mask and one other operand",
+            source_op_index=op.index,
+        )
+    _require_operand_count(op, segments)
+    offset_index = int(segments[0])
+    stride_index = offset_index + int(segments[1])
+    mask_index = stride_index + int(segments[2])
+    other_index = mask_index + int(segments[3])
+    return {
+        "base_value_id": op.operands[0],
+        "offset_value_id": op.operands[offset_index],
+        "stride_value_id": op.operands[stride_index] if int(segments[2]) else None,
+        "mask_value_id": op.operands[mask_index] if int(segments[3]) else None,
+        "other_value_id": op.operands[other_index] if int(segments[4]) else None,
+        "cache": _int_attr_or_default(op.attrs, "cache", 1),
+        "contiguity": _int_attr_or_default(op.attrs, "contiguity", 1),
+    }
+
+
+def _buffer_store_fields(op):
+    segments = _operand_segments(op, 5, None)
+    if int(segments[0]) != 1 or int(segments[1]) != 1 or int(segments[2]) != 1:
+        fail(
+            "TLXW_OP_MALFORMED_BUFFER_STORE",
+            STAGE,
+            "amdg.buffer_store requires value, base pointer, and offsets",
+            source_op_index=op.index,
+        )
+    if int(segments[3]) not in (0, 1):
+        fail(
+            "TLXW_OP_MALFORMED_BUFFER_STORE",
+            STAGE,
+            "amdg.buffer_store supports at most one boundary-check operand",
+            source_op_index=op.index,
+        )
+    if int(segments[4]) not in (0, 1):
+        fail(
+            "TLXW_OP_MALFORMED_BUFFER_STORE",
+            STAGE,
+            "amdg.buffer_store supports at most one mask operand",
+            source_op_index=op.index,
+        )
+    _require_operand_count(op, segments)
+    base_index = int(segments[0])
+    offset_index = base_index + int(segments[1])
+    mask_index = offset_index + int(segments[2]) + int(segments[3])
+    boundary_index = offset_index + int(segments[2])
+    return {
+        "value_value_id": op.operands[0],
+        "base_value_id": op.operands[base_index],
+        "offset_value_id": op.operands[offset_index],
+        "boundary_check_value_id": op.operands[boundary_index] if int(segments[3]) else None,
+        "mask_value_id": op.operands[mask_index] if int(segments[4]) else None,
+        "cache": _int_attr_or_default(op.attrs, "cache", 1),
+        "contiguity": _int_attr_or_default(op.attrs, "contiguity", 1),
+    }
+
+
+def _operand_segments(op, expected_len, default):
+    segments = op.attrs.get("operandSegmentSizes")
+    if segments is None:
+        segments = default
+    segments = tuple(int(segment) for segment in segments)
+    if len(segments) != int(expected_len):
+        fail(
+            "TLXW_OP_MALFORMED_OPERAND_SEGMENTS",
+            STAGE,
+            f"{op.name} expected {expected_len} operand segments, got {segments}",
+            source_op_index=op.index,
+        )
+    if any(segment < 0 for segment in segments):
+        fail(
+            "TLXW_OP_MALFORMED_OPERAND_SEGMENTS",
+            STAGE,
+            f"{op.name} operand segments must be nonnegative, got {segments}",
+            source_op_index=op.index,
+        )
+    return segments
+
+
+def _require_operand_count(op, segments):
+    if sum(int(segment) for segment in segments) != len(op.operands):
+        fail(
+            "TLXW_OP_MALFORMED_OPERAND_SEGMENTS",
+            STAGE,
+            f"{op.name} operand segments {segments} do not match "
+            f"{len(op.operands)} operands",
+            source_op_index=op.index,
+        )
+
+
+def _require_default_cache(cache, op):
+    if cache in (None, 1):
+        return
+    fail(
+        "TLXW_OP_UNSUPPORTED_CACHE_MODIFIER",
+        STAGE,
+        f"Wave lowering does not support {op.name} cacheModifier={cache}",
+        source_op_index=op.index,
+    )
+
+
+def _require_supported_direct_buffer_cache(cache, op, *, is_store):
+    supported = {1, 3, 4, 5, 6} if is_store else {1, 2, 3, 5, 7}
+    if cache is None or cache in supported:
+        return
+    fail(
+        "TLXW_OP_UNSUPPORTED_CACHE_MODIFIER",
+        STAGE,
+        f"Wave lowering does not support {op.name} cacheModifier={cache}",
+        source_op_index=op.index,
+    )
+
+
+def _require_default_tt_memory_attrs(op):
+    cache = op.attrs.get("cache")
+    if cache is not None and int(cache) != 1:
+        fail(
+            "TLXW_OP_UNSUPPORTED_CACHE_MODIFIER",
+            STAGE,
+            f"Wave lowering does not support {op.name} cache={cache}",
+            source_op_index=op.index,
+        )
+    cache_modifier = _attr_text(op.attrs.get("cacheModifier"))
+    if cache_modifier not in {"", "none", "#tt.cache_modifier<none>"}:
+        fail(
+            "TLXW_OP_UNSUPPORTED_CACHE_MODIFIER",
+            STAGE,
+            f"Wave lowering does not support {op.name} cacheModifier={cache_modifier}",
+            source_op_index=op.index,
+        )
+    evict = op.attrs.get("evict")
+    if evict is not None and int(evict) != 1:
+        fail(
+            "TLXW_OP_UNSUPPORTED_EVICTION_POLICY",
+            STAGE,
+            f"Wave lowering does not support {op.name} evict={evict}",
+            source_op_index=op.index,
+        )
+    eviction_policy = _attr_text(op.attrs.get("evictionPolicy"))
+    if eviction_policy not in {"", "none", "evict_normal", "#tt.eviction_policy<normal>"}:
+        fail(
+            "TLXW_OP_UNSUPPORTED_EVICTION_POLICY",
+            STAGE,
+            f"Wave lowering does not support {op.name} evictionPolicy={eviction_policy}",
+            source_op_index=op.index,
+        )
+    if _attr_bool(op.attrs.get("isVolatile")):
+        fail(
+            "TLXW_OP_UNSUPPORTED_VOLATILE",
+            STAGE,
+            f"Wave lowering does not support volatile {op.name}",
+            source_op_index=op.index,
+        )
+
+
+def _attr_text(value):
+    if value is None:
+        return ""
+    return str(value).strip().strip('"')
+
+
+def _attr_bool(value):
+    text = _attr_text(value).lower()
+    return text in {"true", "1"}
+
+
+def _local_component_store_plan(
+    conversion_input,
+    type_layout_program,
+    memdesc_value_id,
+    offset_value_id,
+    component_count,
+    lane_width,
+    op,
+):
+    memdesc = _memdesc_info(conversion_input, memdesc_value_id, op)
+    view = _memdesc_view_info(conversion_input, memdesc_value_id, op)
+    shape = tuple(int(dim) for dim in (memdesc.shape or memdesc.alloc_shape))
+    wave_count = max(1, int(conversion_input.num_warps))
+    memdesc_layout_id = type_layout_program.values[memdesc_value_id].layout_map_id
+    memdesc_layout = (None if memdesc_layout_id is None else type_layout_program.layouts[int(memdesc_layout_id)])
+    offset_layout_id = type_layout_program.values[offset_value_id].layout_map_id
+    offset_layout = (None if offset_layout_id is None else type_layout_program.layouts[int(offset_layout_id)])
+    if (offset_layout is None or offset_layout.linear_layout is None or len(offset_layout.shape) != len(shape)):
+        fail(
+            "TLXW_OP_UNSUPPORTED_BUFFER_ASYNC",
+            STAGE,
+            "scalarized amdg.buffer_load_to_local requires a structural "
+            "distributed offset layout for local destination mapping",
+            source_op_index=op.index,
+            source_value_id=offset_value_id,
+        )
+    linear = offset_layout.linear_layout
+    outputs = {str(name): int(extent) for name, extent in linear.out_dims}
+    expected_outputs = {f"dim{dim}": int(extent) for dim, extent in enumerate(shape)}
+    if (outputs != expected_outputs or layouts.linear_layout_in_dim_size(linear, "block") != 1
+            or layouts.linear_layout_in_dim_size(linear, "register") != int(component_count)
+            or not linear.is_surjective()):
+        fail(
+            "TLXW_OP_UNSUPPORTED_BUFFER_ASYNC",
+            STAGE,
+            "scalarized amdg.buffer_load_to_local requires a surjective "
+            "single-block LinearLayout destination domain",
+            source_op_index=op.index,
+            source_value_id=memdesc_value_id,
+        )
+    return _coordinate_local_component_store_plan(
+        offset_layout,
+        memdesc_layout,
+        shape,
+        view.physical_shape,
+        view.logical_origin,
+        memdesc.element_byte_width,
+        conversion_input.memdesc_physical_allocation_bytes.get(
+            memdesc_value_id,
+            memdesc.allocation_bytes,
+        ),
+        int(lane_width),
+        wave_count,
+        op,
+        offset_value_id,
+    )
+
+
+def _coordinate_local_component_store_plan(
+    offset_layout,
+    memdesc_layout,
+    shape,
+    physical_shape,
+    logical_origin,
+    element_byte_width,
+    allocation_bytes,
+    lane_width,
+    wave_count,
+    op,
+    offset_value_id,
+):
+    try:
+        bit_offset_relation = layouts.local_memory_bit_offset_relation(
+            offset_layout,
+            memdesc_layout,
+            shape,
+            physical_shape,
+            logical_origin,
+            lane_width=lane_width,
+            warp_count=wave_count,
+            element_byte_width=element_byte_width,
+            allocation_bytes=allocation_bytes,
+            stage=STAGE,
+            diagnostic="TLXW_OP_UNSUPPORTED_BUFFER_ASYNC",
+            source_op_index=op.index,
+            source_value_id=offset_value_id,
+        )
+    except ValueError as exc:
+        fail(
+            "TLXW_OP_UNSUPPORTED_BUFFER_ASYNC",
+            STAGE,
+            str(exc),
+            source_op_index=op.index,
+            source_value_id=offset_value_id,
+        )
+    return {
+        "bit_offset_relation": tuple(int(value) for value in bit_offset_relation),
+    }
+
+
+def _fragment_registers(element_type, result_layout, op):
+    parent = result_layout.properties.get("parent_properties", {})
+    instr_shape = tuple(parent.get("instr_shape", ()))
+    spec = layouts.mfma_instruction_spec(instr_shape)
+    if spec is not None and element_type in spec.operand_element_types:
+        return spec.operand_registers
+    fail(
+        "TLXW_OP_UNSUPPORTED_LOCAL_LOAD",
+        STAGE,
+        "ttg.local_load fragment registers are not known for "
+        f"element_type={element_type}, instr_shape={instr_shape}",
+        source_op_index=op.index,
+        source_value_id=result_layout.value_id,
+    )
+
+
+def _mma_packet_registers(type_layout_program, converted, op):
+    layout = _require_layout(type_layout_program, converted.layout_map_id, op)
+    if layout.kind not in {"amd_mfma", "dot_operand"}:
+        fail(
+            "TLXW_OP_UNSUPPORTED_MMA_PACKET",
+            STAGE,
+            "MFMA packets require an amd_mfma or dot_operand layout",
+            source_op_index=op.index,
+            source_value_id=converted.value_id,
+        )
+    linear = layouts.distributed_linear_layout(
+        layout,
+        stage=STAGE,
+        source_op_index=op.index,
+    )
+    register_count = layouts.linear_layout_in_dim_size(linear, "register")
+    component_count = int(layout.component_count)
+    if component_count <= 0 or register_count % component_count:
+        fail(
+            "TLXW_OP_UNSUPPORTED_MMA_PACKET",
+            STAGE,
+            "MFMA payload registers must evenly partition layout components",
+            source_op_index=op.index,
+            source_value_id=converted.value_id,
+        )
+    return register_count // component_count
+
+
+def _acc_fragment_registers(result_layout, op):
+    instr_shape = tuple(result_layout.properties.get("instr_shape", ()))
+    spec = layouts.mfma_instruction_spec(instr_shape)
+    if result_layout.element_type == "f32" and spec is not None:
+        return spec.accumulator_registers
+    fail(
+        "TLXW_OP_FRAGMENT_CONSTANT",
+        STAGE,
+        "accumulator fragment registers are not known for "
+        f"element_type={result_layout.element_type}, instr_shape={instr_shape}",
+        source_op_index=op.index,
+        source_value_id=result_layout.value_id,
+    )
+
+
+def _mma_kind(element_type, instr_shape, op):
+    if instr_shape == (16, 16, 32) and element_type == "f16":
+        return "mfma.f32.16x16x32.f16"
+    if instr_shape == (16, 16, 32) and element_type == "bf16":
+        return "mfma.f32.16x16x32.bf16"
+    if instr_shape == (32, 32, 16) and element_type == "f16":
+        return "mfma.f32.32x32x16.f16"
+    if instr_shape == (32, 32, 16) and element_type == "bf16":
+        return "mfma.f32.32x32x16.bf16"
+    fail(
+        "TLXW_OP_DOT",
+        STAGE,
+        f"unsupported MFMA element type {element_type} for {instr_shape}",
+        source_op_index=op.index,
+    )
+
+
+def _scaled_mma_kind(a_elem_type, b_elem_type, instr_shape, op):
+    kinds = {
+        ((16, 16, 128), "e2m1", "e2m1"): "mfma.scale.f32.16x16x128.f4.f4",
+        ((32, 32, 64), "e2m1", "e2m1"): "mfma.scale.f32.32x32x64.f4.f4",
+    }
+    kind = kinds.get((tuple(instr_shape), a_elem_type, b_elem_type))
+    if kind is not None:
+        return kind
+    fail(
+        "TLXW_OP_DOT_SCALED",
+        STAGE,
+        "unsupported native scaled MFMA element types "
+        f"lhs={a_elem_type}, rhs={b_elem_type}, instr_shape={instr_shape}",
+        source_op_index=op.index,
+    )
+
+
+def _scale_dot_elem_type(attr, op):
+    mapping = {
+        0: "e4m3",
+        1: "e5m2",
+        2: "e2m3",
+        3: "e3m2",
+        4: "e2m1",
+        5: "bf16",
+        6: "f16",
+    }
+    try:
+        return mapping[int(attr)]
+    except (TypeError, ValueError, KeyError):
+        fail(
+            "TLXW_OP_DOT_SCALED",
+            STAGE,
+            f"unknown tt.dot_scaled element type attribute {attr}",
+            source_op_index=op.index,
+        )
+
+
+def _require_scaled_mma_scale(type_layout_program, scale, op_idx, op):
+    if scale.type.element_type != "i8":
+        fail(
+            "TLXW_OP_DOT_SCALED",
+            STAGE,
+            "native scaled MFMA lowering expects i8 scale operands",
+            source_op_index=op.index,
+            source_value_id=scale.value_id,
+        )
+    if scale.type.representation not in {"simd", "simd_tuple"}:
+        fail(
+            "TLXW_OP_DOT_SCALED",
+            STAGE,
+            "native scaled MFMA lowering expects SIMD scale operands",
+            source_op_index=op.index,
+            source_value_id=scale.value_id,
+        )
+    if scale.layout_map_id is None:
+        fail(
+            "TLXW_OP_DOT_SCALED",
+            STAGE,
+            "native scaled MFMA lowering requires scale layout metadata",
+            source_op_index=op.index,
+            source_value_id=scale.value_id,
+        )
+    scale_layout = type_layout_program.layouts[int(scale.layout_map_id)]
+    # The existing AMD lowering requires linear scale layouts. The bridge also
+    # accepts generic_linear because Triton may preserve the same linear map
+    # under the generic spelling when the map is only required to be surjective.
+    if scale_layout.kind not in {"linear", "generic_linear"}:
+        fail(
+            "TLXW_OP_DOT_SCALED",
+            STAGE,
+            "native scaled MFMA lowering expects linear scale layouts",
+            source_op_index=op.index,
+            source_value_id=scale.value_id,
+        )
+    del op_idx
+
+
+def _scaled_mma_scale_pack_attrs(
+    m_tiles,
+    n_tiles,
+    k_tiles,
+    lhs_scale_component_count,
+    rhs_scale_component_count,
+    op,
+):
+    lhs = _scaled_mma_one_scale_pack_attrs(
+        "lhs_scale",
+        m_tiles,
+        k_tiles,
+        lhs_scale_component_count,
+        op,
+    )
+    rhs = _scaled_mma_one_scale_pack_attrs(
+        "rhs_scale",
+        n_tiles,
+        k_tiles,
+        rhs_scale_component_count,
+        op,
+    )
+    return {**lhs, **rhs}
+
+
+def _scaled_mma_one_scale_pack_attrs(prefix, non_k_tiles, k_tiles, component_count, op):
+    scale_pack_width = min(4, int(non_k_tiles) * int(k_tiles))
+    k_packed_vals = min(4, int(k_tiles))
+    if scale_pack_width <= 0 or k_packed_vals <= 0 or scale_pack_width % k_packed_vals:
+        fail(
+            "TLXW_OP_DOT_SCALED",
+            STAGE,
+            "scaled MFMA scale packing requires K packing to evenly divide "
+            f"the scale pack width; non_k_tiles={non_k_tiles}, "
+            f"k_tiles={k_tiles}",
+            source_op_index=op.index,
+        )
+    non_k_packed_vals = scale_pack_width // k_packed_vals
+    k_groups = _ceil_div(int(k_tiles), int(k_packed_vals))
+    non_k_groups = _ceil_div(int(non_k_tiles), int(non_k_packed_vals))
+    group_count = int(k_groups) * int(non_k_groups)
+    required_components = int(group_count) * int(scale_pack_width)
+    if int(component_count) < required_components:
+        fail(
+            "TLXW_OP_DOT_SCALED",
+            STAGE,
+            "scaled MFMA scale operand does not provide enough components "
+            f"for packed scale groups; need {required_components}, got "
+            f"{component_count}",
+            source_op_index=op.index,
+        )
+    return {
+        f"{prefix}_group_count": int(group_count),
+        f"{prefix}_k_groups": int(k_groups),
+        f"{prefix}_k_packed_vals": int(k_packed_vals),
+        f"{prefix}_non_k_groups": int(non_k_groups),
+        f"{prefix}_non_k_packed_vals": int(non_k_packed_vals),
+        f"{prefix}_pack_width": int(scale_pack_width),
+    }
+
+
+def _operand_fragment_shape(instr_shape, op):
+    spec = layouts.mfma_instruction_spec(instr_shape)
+    if spec is not None:
+        return spec.rows, spec.columns
+    fail(
+        "TLXW_OP_UNSUPPORTED_LOCAL_LOAD",
+        STAGE,
+        f"unsupported local_load MFMA instruction shape {instr_shape}",
+        source_op_index=op.index,
+    )
+
+
+def _acc_fragment_shape(instr_shape, op):
+    spec = layouts.mfma_instruction_spec(instr_shape)
+    if spec is not None:
+        return spec.rows, spec.columns
+    fail(
+        "TLXW_OP_FRAGMENT_CONSTANT",
+        STAGE,
+        f"unsupported accumulator MFMA instruction shape {instr_shape}",
+        source_op_index=op.index,
+    )
+
+
+def _has_mma_packet_result(type_layout_program, op):
+    for value_id in op.results:
+        converted = type_layout_program.values[value_id]
+        if converted.type.representation in _MMA_PACKET_REPRESENTATIONS:
+            return True
+    return False
+
+
+def _require_allowed_mma_packet_results(type_layout_program, op):
+    if op.name in _MMA_PACKET_RESULT_SOURCE_OPS:
+        return
+    for value_id in op.results:
+        converted = type_layout_program.values[value_id]
+        if converted.type.representation not in _MMA_PACKET_REPRESENTATIONS:
+            continue
+        fail(
+            "TLXW_OP_MMA_PACKET_PRODUCER",
+            STAGE,
+            "MMA SIMD packets may only be produced by packet-aware ops, "
+            "control-flow carries, or explicit ttg.convert_layout; "
+            f"got {op.name}",
+            source_op_index=op.index,
+            source_value_id=value_id,
+        )
+
+
+def _require_layout(type_layout_program, layout_map_id, op):
+    if layout_map_id is None:
+        fail(
+            "TLXW_OP_MISSING_LAYOUT",
+            STAGE,
+            "operation requires a converted layout map",
+            source_op_index=op.index,
+        )
+    return type_layout_program.layouts[int(layout_map_id)]
+
+
+def _require_dot_operand_layout(layout, op_idx, op):
+    if layout.kind != "dot_operand" or int(layout.properties.get("op_idx", -1)) != int(op_idx):
+        fail(
+            "TLXW_OP_DOT",
+            STAGE,
+            f"tt.dot operand {op_idx} must use matching dot_operand layout",
+            source_op_index=op.index,
+            source_value_id=layout.value_id,
+        )
+
+
+def _require_dot_operand_parent_layout(operand_layout, result_layout, op_idx, op):
+    parent_kind = operand_layout.properties.get("parent_kind")
+    parent_properties = operand_layout.properties.get("parent_properties", {})
+    if parent_kind == result_layout.kind and parent_properties == result_layout.properties:
+        return
+    fail(
+        "TLXW_OP_DOT",
+        STAGE,
+        f"tt.dot operand {op_idx} parent MFMA layout must match the result layout",
+        source_op_index=op.index,
+        source_value_id=operand_layout.value_id,
+    )
+
+
+def _mma_tile_grid(result_layout, lhs_layout, rhs_layout, op):
+    return layouts.mma_tile_grid(
+        result_layout,
+        lhs_layout,
+        rhs_layout,
+        stage=STAGE,
+        diagnostic="TLXW_OP_DOT",
+        source_op_index=op.index,
+    )
+
+
+def _constant_literal(value, *, source_op_index=None, element_type=None):
+    if value is None:
+        return None
+    text = str(value).strip()
+    dense = re.fullmatch(r"dense<([^>]*)>\s*(?::.*)?", text, re.DOTALL)
+    if dense is not None:
+        payload = dense.group(1).strip()
+        if payload.startswith("[") or "," in payload:
+            fail(
+                "TLXW_OP_UNSUPPORTED_CONSTANT",
+                STAGE,
+                "tensor constants are converted only for dense splats",
+                source_op_index=source_op_index,
+            )
+        text = payload
+    else:
+        text = text.split(":", 1)[0].strip()
+    lowered = text.lower()
+    if lowered == "true":
+        return True
+    if lowered == "false":
+        return False
+    match = re.fullmatch(r"([+-]?0[xX][0-9a-fA-F]+)", text)
+    if match is not None and _is_float_element_type(element_type):
+        return _float_bit_pattern_literal(match.group(1), element_type, source_op_index)
+    match = re.fullmatch(r"([+-]?\d+)", text)
+    if match is not None:
+        return int(match.group(1), 0)
+    match = re.fullmatch(
+        r"([+-]?(?:(?:\d+\.\d*)|(?:\.\d+)|(?:\d+))(?:[eE][+-]?\d+)?)",
+        text,
+    )
+    if match is not None:
+        return float(match.group(1))
+    return text
+
+
+def _is_float_element_type(element_type):
+    return element_type in {"f16", "bf16", "f32", "f64"}
+
+
+def _float_bit_pattern_literal(text, element_type, source_op_index):
+    widths = {"f16": 16, "bf16": 16, "f32": 32, "f64": 64}
+    width = widths[element_type]
+    bits = int(text, 0)
+    if bits < 0 or bits >= 1 << width:
+        fail(
+            "TLXW_OP_UNSUPPORTED_CONSTANT",
+            STAGE,
+            f"floating-point bit pattern {text!r} does not fit {element_type}",
+            source_op_index=source_op_index,
+        )
+    if element_type == "f16":
+        return struct.unpack("<e", struct.pack("<H", bits))[0]
+    if element_type == "bf16":
+        return struct.unpack("<f", struct.pack("<I", bits << 16))[0]
+    if element_type == "f32":
+        return struct.unpack("<f", struct.pack("<I", bits))[0]
+    return struct.unpack("<d", struct.pack("<Q", bits))[0]
+
+
+def _cmpi_predicate(value):
+    predicates = {
+        0: "eq",
+        1: "ne",
+        2: "slt",
+        3: "sle",
+        4: "sgt",
+        5: "sge",
+        6: "ult",
+        7: "ule",
+        8: "ugt",
+        9: "uge",
+    }
+    if value is None:
+        return "unknown"
+    if isinstance(value, str) and value in predicates.values():
+        return value
+    return predicates.get(int(value), str(value))
+
+
+def _cmpf_predicate(value):
+    predicates = {
+        0: "false",
+        1: "oeq",
+        2: "ogt",
+        3: "oge",
+        4: "olt",
+        5: "ole",
+        6: "one",
+        7: "ord",
+        8: "ueq",
+        9: "ugt",
+        10: "uge",
+        11: "ult",
+        12: "ule",
+        13: "une",
+        14: "uno",
+        15: "true",
+    }
+    if value is None:
+        return "unknown"
+    if isinstance(value, str) and value in predicates.values():
+        return value
+    return predicates.get(int(value), str(value))
+
+
+def _target_int_width(builder, target_value_ids):
+    for target_value_id in target_value_ids:
+        target_type = builder.values[target_value_id].type
+        width = _int_width(target_type.element_type)
+        if width is not None:
+            return width
+    return None
+
+
+def _int_width(raw_type):
+    match = re.fullmatch(r"i([0-9]+)", str(raw_type))
+    return None if match is None else int(match.group(1))
+
+
+def _product(values):
+    result = 1
+    for value in values:
+        result *= int(value)
+    return result
+
+
+def _ceil_div(lhs, rhs):
+    return (int(lhs) + int(rhs) - 1) // int(rhs)
+
+
+def _int_attr(attrs, name):
+    value = attrs.get(name)
+    if value is None:
+        fail(
+            "TLXW_OP_MISSING_ATTR",
+            STAGE,
+            f"required attr {name} is missing",
+        )
+    return int(value)
+
+
+def _int_attr_or_default(attrs, name, default):
+    value = attrs.get(name)
+    return int(default) if value is None else int(value)

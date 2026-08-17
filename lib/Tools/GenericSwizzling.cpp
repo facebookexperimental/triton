@@ -47,6 +47,10 @@ SmallVector<int32_t> flatten(const LinearLayout &ll, StringAttr dim) {
   return vec;
 };
 
+SmallVector<int32_t> flattenIfPresent(const LinearLayout &ll, StringAttr dim) {
+  return ll.hasInDim(dim) ? flatten(ll, dim) : SmallVector<int32_t>{};
+}
+
 SmallVector<int32_t> removeZeros(ArrayRef<int32_t> vec) {
   SmallVector<int32_t> result;
   for (int32_t r : vec) {
@@ -133,12 +137,14 @@ LinearLayout buildReps(MLIRContext *ctx, const LinearLayout &src,
     }
   }
 
-  auto smemReps = LinearLayout({{kVec, smem.getBases().lookup(kVec)},
-                                {kBank, smem.getBases().lookup(kBank)},
-                                {kSegment, unflatten(to_vector(segment))},
-                                {kBlock, smem.getBases().lookup(kBlock)},
-                                {kReps, unflatten(to_vector(reps))}},
-                               smem.getOutDims(),
+  LinearLayout::BasesT bases;
+  bases[kVec] = smem.getBases().lookup(kVec);
+  bases[kBank] = smem.getBases().lookup(kBank);
+  bases[kSegment] = unflatten(to_vector(segment));
+  if (smem.hasInDim(kBlock))
+    bases[kBlock] = smem.getBases().lookup(kBlock);
+  bases[kReps] = unflatten(to_vector(reps));
+  auto smemReps = LinearLayout(std::move(bases), smem.getOutDims(),
                                /*requireSurjective=*/true);
   return smemReps;
 }
@@ -487,11 +493,14 @@ LinearLayout optimalSwizzling(const LinearLayout &src, const LinearLayout &dst,
   StringAttr blockAttr = StringAttr::get(ctx, "block");
 
   // src has just 1 outDim
-  LinearLayout basis1D({{vecAttr, unflatten(vbasis)},
-                        {bankAttr, unflatten(bbasis)},
-                        {segAttr, unflatten(sbasis)},
-                        {blockAttr, unflatten(nonZeroBlockBases)}},
-                       src.getOutDims(), /*requireSurjective=*/true);
+  LinearLayout::BasesT bases;
+  bases[vecAttr] = unflatten(vbasis);
+  bases[bankAttr] = unflatten(bbasis);
+  bases[segAttr] = unflatten(sbasis);
+  if (src.hasInDim(blockAttr))
+    bases[blockAttr] = unflatten(blockBases);
+  LinearLayout basis1D(std::move(bases), src.getOutDims(),
+                       /*requireSurjective=*/true);
   basis1D = buildReps(ctx, src, dst, basis1D, leaveReps);
 
   return basis1D.reshapeOuts(outDims);
@@ -551,10 +560,8 @@ getVecBasisLdSt(const LinearLayout &srcFlat, const LinearLayout &dstFlat,
   auto kBlock = StringAttr::get(ctx, "block");
   auto regSrc = flatten(srcFlat, kReg);
   auto regDst = flatten(dstFlat, kReg);
-  auto blockSrc = srcFlat.getBases().contains(kBlock) ? flatten(srcFlat, kBlock)
-                                                      : SmallVector<int32_t>{};
-
-  auto dim = srcFlat.getTotalOutDimSizeBits();
+  auto blockSrc = flattenIfPresent(srcFlat, kBlock);
+  auto dim = srcFlat.getTotalOutDimSizeLog2();
   SmallVector<int32_t> vbasis = intersectionBasis(regSrc, regDst, dim);
   // Restrict the vectorisation to the maximum we can use
   auto maxVecBases = llvm::Log2_32(128 / bitwidth);
@@ -662,8 +669,7 @@ LinearLayout optimalSwizzlingLdSt(const LinearLayout &src,
   auto regDst = flatten(dstFlat, kReg);
   auto laneSrc = flatten(srcFlat, kLane);
   auto laneDst = flatten(dstFlat, kLane);
-  auto blockSrc = srcFlat.getBases().contains(kBlock) ? flatten(srcFlat, kBlock)
-                                                      : SmallVector<int32_t>{};
+  auto blockSrc = flattenIfPresent(srcFlat, kBlock);
 
   auto [vbasis, srcFillsBank] = getVecBasisLdSt(srcFlat, dstFlat, bitwidth);
   auto vecSize = 1 << vbasis.size();
@@ -781,9 +787,7 @@ optimalSwizzling(const LinearLayout &src, const LinearLayout &dst,
   auto regDst = flatten(dstFlat, kReg);
   auto laneSrc = flatten(srcFlat, kLane);
   auto laneDst = flatten(dstFlat, kLane);
-  auto blockBases = srcFlat.getBases().contains(kBlock)
-                        ? flatten(srcFlat, kBlock)
-                        : SmallVector<int32_t>{};
+  auto blockBases = flattenIfPresent(srcFlat, kBlock);
   auto blockSrcSet = SetVector<int32_t>(llvm::from_range_t{}, blockBases);
   // Get the associated src/dst tiles for each instruction if they exist
   SmallVector<std::tuple<std::pair<int32_t, int32_t>, SmallVector<int32_t>,

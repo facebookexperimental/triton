@@ -3,6 +3,7 @@
 #include "mlir/Analysis/DataFlow/DeadCodeAnalysis.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "tlx/dialect/include/Analysis/LayoutPropagation.h"
+#include "triton/Analysis/Utility.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
@@ -22,6 +23,9 @@ using namespace mlir;
 using namespace mlir::dataflow;
 namespace ttg = ::mlir::triton::gpu;
 namespace ttng = ::mlir::triton::nvidia_gpu;
+
+static constexpr llvm::StringLiteral kSourceInvariantBitsAttr =
+    "tlx.source_invariant_bits";
 
 namespace mlir {
 namespace triton {
@@ -48,6 +52,8 @@ public:
         requireLayoutOp.getSrc());
     if (requireLayoutOp->hasAttr("tlx.rematerialize_coordinates"))
       convert->setAttr("tlx.rematerialize_coordinates", rewriter.getUnitAttr());
+    if (Attribute attr = requireLayoutOp->getAttr(kSourceInvariantBitsAttr))
+      convert->setDiscardableAttr(kSourceInvariantBitsAttr, attr);
     rewriter.replaceOp(requireLayoutOp, convert);
     return success();
   }
@@ -64,11 +70,64 @@ public:
       rewriter.replaceOp(releaseLayoutOp, releaseLayoutOp.getSrc());
       return success();
     }
-    rewriter.replaceOpWithNewOp<ttg::ConvertLayoutOp>(
-        releaseLayoutOp, releaseLayoutOp.getType(), releaseLayoutOp.getSrc());
+    auto convert = ttg::ConvertLayoutOp::create(
+        rewriter, releaseLayoutOp.getLoc(), releaseLayoutOp.getType(),
+        releaseLayoutOp.getSrc());
+    if (Attribute attr = releaseLayoutOp->getAttr(kSourceInvariantBitsAttr))
+      convert->setDiscardableAttr(kSourceInvariantBitsAttr, attr);
+    rewriter.replaceOp(releaseLayoutOp, convert);
     return success();
   }
 };
+
+// A warp ballot consumes one physical predicate from every lane; it does not
+// require the predicates to use the default blocked encoding.  Conversion to
+// that encoding is both semantically redundant and potentially expensive: a
+// one-value-per-lane slice of an MMA layout can otherwise be redistributed
+// through shared memory solely to feed the ballot.  Preserve any producer
+// layout that already satisfies the operation's physical ownership contract.
+class FoldWarpBallotLayoutConversion
+    : public mlir::OpRewritePattern<ttg::WarpBallotOp> {
+public:
+  using OpRewritePattern::OpRewritePattern;
+
+  mlir::LogicalResult
+  matchAndRewrite(ttg::WarpBallotOp ballot,
+                  mlir::PatternRewriter &rewriter) const override {
+    auto convert = ballot.getPred().getDefiningOp<ttg::ConvertLayoutOp>();
+    if (!convert)
+      return failure();
+    auto sourceType = dyn_cast<RankedTensorType>(convert.getSrc().getType());
+    if (!sourceType || !sourceType.getEncoding() ||
+        ttg::getTotalElemsPerThread(sourceType) != 1)
+      return failure();
+
+    rewriter.modifyOpInPlace(
+        ballot, [&] { ballot.getPredMutable().assign(convert.getSrc()); });
+    if (convert->use_empty())
+      rewriter.eraseOp(convert);
+    return success();
+  }
+};
+
+// A tensor-backed local_alloc/local_load pair is only a materialization of a
+// register layout conversion.  When the source and load are in the same block,
+// the conversion is unconditionally executed after the source becomes
+// available.  Materialize it next to the source so its temporary LDS does not
+// overlap unrelated allocations introduced between the source and the load.
+// Keep conversions in nested regions at the load: moving those to an ancestor
+// could speculatively execute work on paths that do not use the value.
+static Value materializeFoldedConvertLayout(PatternRewriter &rewriter,
+                                            ttg::LocalLoadOp localLoadOp,
+                                            Value src) {
+  OpBuilder::InsertionGuard guard(rewriter);
+  if (src.getParentBlock() == localLoadOp->getBlock())
+    rewriter.setInsertionPointAfterValue(src);
+  else
+    rewriter.setInsertionPoint(localLoadOp);
+  return ttg::ConvertLayoutOp::create(rewriter, localLoadOp.getLoc(),
+                                      localLoadOp.getType(), src);
+}
 
 // Late AMD passes can express a tensor layout conversion as a spill through
 // immutable local memory:
@@ -112,8 +171,9 @@ public:
     // Replace it with a layout conversion: it lowers to register shuffles for
     // the common encoding pairs and is no worse than the spill in the few
     // cases where the conversion itself still goes through LDS.
-    rewriter.replaceOpWithNewOp<ttg::ConvertLayoutOp>(
-        localLoadOp, localLoadOp.getType(), allocOp.getSrc());
+    Value replacement =
+        materializeFoldedConvertLayout(rewriter, localLoadOp, allocOp.getSrc());
+    rewriter.replaceOp(localLoadOp, replacement);
     return success();
   }
 };
@@ -149,8 +209,8 @@ public:
       rewriter.setInsertionPoint(localLoadOp);
       Value replacement = src;
       if (src.getType() != localLoadOp.getType())
-        replacement = ttg::ConvertLayoutOp::create(
-            rewriter, localLoadOp.getLoc(), localLoadOp.getType(), src);
+        replacement =
+            materializeFoldedConvertLayout(rewriter, localLoadOp, src);
       rewriter.replaceOp(localLoadOp, replacement);
     }
     if (allocOp->use_empty())
@@ -170,9 +230,15 @@ static bool isRetaggableTensorProducerValue(Value value) {
     return false;
 
   Operation *definingOp = value.getDefiningOp();
+  // release_layout is a structural boundary: backward propagation must stop
+  // at its source, but its result is explicitly allowed to adopt the layout
+  // selected by downstream consumers.  This is particularly important for
+  // region-carried tensors, where the release result and block argument must
+  // be retagged together to keep RegionBranchOpInterface edges type-correct.
   // Sparse dataflow handles the RegionBranchOpInterface edge consistency; if
   // all incoming values agree, retagging the region result is safe.
-  return isa_and_nonnull<ttg::LocalLoadOp, RegionBranchOpInterface>(definingOp);
+  return isa_and_nonnull<ttg::LocalLoadOp, tlx::ReleaseLayoutOp,
+                         RegionBranchOpInterface>(definingOp);
 }
 
 static Type getTensorCandidateType(Value value, DataFlowSolver &solver,
@@ -553,12 +619,63 @@ public:
   }
 
   void runOnOperation() override {
+    // Layout propagation and downstream cleanup may materialize conversions at
+    // different points in the pipeline. Preserve the producer's proven logical
+    // invariant bits on both TLX boundaries and concrete conversions so the
+    // Wave bridge can select an equivalent physical owner. The dedicated
+    // analysis owns reshape/transpose and region-carrier reasoning; this pass
+    // only serializes its result.
+    bool hasTensorLayoutBoundary = false;
+    getOperation()->walk([&](Operation *op) {
+      if (auto require = dyn_cast<RequireLayoutOp>(op))
+        hasTensorLayoutBoundary |=
+            isa<RankedTensorType>(require.getSrc().getType());
+      if (auto release = dyn_cast<ReleaseLayoutOp>(op))
+        hasTensorLayoutBoundary |=
+            isa<RankedTensorType>(release.getSrc().getType());
+      if (isa<ttg::ConvertLayoutOp>(op))
+        hasTensorLayoutBoundary = true;
+    });
+    if (hasTensorLayoutBoundary) {
+      std::unique_ptr<DataFlowSolver> invariantSolver = createDataFlowSolver();
+      invariantSolver->load<LogicalInvariantBitsAnalysis>();
+      if (failed(invariantSolver->initializeAndRun(getOperation()))) {
+        signalPassFailure();
+        return;
+      }
+      auto annotate = [&](Operation *op, Value source) {
+        op->removeDiscardableAttr(kSourceInvariantBitsAttr);
+        auto *lattice =
+            invariantSolver->lookupState<LogicalInvariantBitsLattice>(source);
+        if (!lattice || lattice->getValue().isUninitialized())
+          return;
+        const llvm::SmallBitVector &bits = lattice->getValue().getBits();
+        if (bits.none())
+          return;
+        SmallVector<int32_t> invariantBits;
+        for (int bit : bits.set_bits())
+          invariantBits.push_back(bit);
+        op->setDiscardableAttr(
+            kSourceInvariantBitsAttr,
+            DenseI32ArrayAttr::get(&getContext(), invariantBits));
+      };
+      getOperation()->walk([&](Operation *op) {
+        if (auto require = dyn_cast<RequireLayoutOp>(op))
+          annotate(op, require.getSrc());
+        else if (auto release = dyn_cast<ReleaseLayoutOp>(op))
+          annotate(op, release.getSrc());
+        else if (auto convert = dyn_cast<ttg::ConvertLayoutOp>(op))
+          annotate(op, convert.getSrc());
+      });
+    }
+
     getOperation()->walk([&](triton::FuncOp funcOp) { runOnFuncOp(funcOp); });
 
     MLIRContext *context = &getContext();
     RewritePatternSet patterns(context);
     patterns.add<RequireLayoutPattern>(context);
     patterns.add<ReleaseLayoutPattern>(context);
+    patterns.add<FoldWarpBallotLayoutConversion>(context);
     patterns.add<FoldRetaggedLocalAllocLoad>(context);
     patterns.add<FoldLocalAllocLoadFallback>(context);
 

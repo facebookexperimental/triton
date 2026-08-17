@@ -1,4 +1,5 @@
 #include "IR/Dialect.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
@@ -25,13 +26,25 @@ namespace tlx {
 
 namespace {
 
-// Keep this calculation in sync with MemDescReinterpretOp::verify. The
-// physical allocation is described by the layout-ranked suffix; leading
-// dimensions represent repeated pipeline copies of that layout.
+static ttg::MemDescReinterpretOp createAliasReinterpret(OpBuilder &builder,
+                                                        Location loc,
+                                                        ttg::MemDescType type,
+                                                        Value source) {
+  auto op = ttg::MemDescReinterpretOp::create(builder, loc, type, source);
+  auto sourceType = cast<ttg::MemDescType>(source.getType());
+  if (ttg::isPaddedEncoding(sourceType.getEncoding()) ||
+      ttg::isPaddedEncoding(type.getEncoding()))
+    op->setAttr("tlx.storage_alias_view", builder.getUnitAttr());
+  return op;
+}
+
+// Total logical storage bits for a memdesc view. This deliberately mirrors
+// MemDescReinterpretOp::verify so aliases are constructed from physical
+// storage sizes rather than logical tensor element counts.
 int64_t getMemDescStorageBits(ttg::MemDescType ty) {
   auto rank = cast<ttg::LayoutEncodingTrait>(ty.getEncoding()).getRank();
   auto shape = ty.getAllocShape().take_back(rank);
-  LinearLayout layout = isa<ttg::PaddedSharedEncodingAttr>(ty.getEncoding())
+  LinearLayout layout = ttg::isPaddedEncoding(ty.getEncoding())
                             ? ttg::paddedLinearLayout(shape, ty.getEncoding())
                             : ttg::toLinearLayout(shape, ty.getEncoding());
   int64_t numLayoutCopies = 1;
@@ -44,11 +57,10 @@ int64_t getMemDescStorageBits(ttg::MemDescType ty) {
          ty.getElementTypeBitWidth();
 }
 
-// Materialize a zero-copy alias view while satisfying the tightened
-// MemDescReinterpret verifier. A destination view may be smaller than the
-// backing allocation; the verifier rejects only views that expose bytes past
-// that allocation. This preserves the existing shared- and tensor-memory
-// aliasing semantics, including non-integral logical element-size ratios.
+// Produce a descriptor of dstTy that views base's backing allocation. A
+// smaller alias cannot be represented by a size-changing reinterpret, so
+// reinterpret the whole allocation as repeated destination-layout slots and
+// select slot zero structurally with memdesc_index.
 FailureOr<Value> emitAliasView(OpBuilder &builder, Operation *errorOp,
                                Location loc, Value base,
                                ttg::MemDescType dstTy) {
@@ -56,19 +68,58 @@ FailureOr<Value> emitAliasView(OpBuilder &builder, Operation *errorOp,
   int64_t srcBits = getMemDescStorageBits(srcTy);
   int64_t dstBits = getMemDescStorageBits(dstTy);
 
-  if (dstBits <= srcBits) {
-    auto view = ttg::MemDescReinterpretOp::create(builder, loc, dstTy, base);
-    // Explicit storage aliases may intentionally expose the same allocation
-    // through a different padded address mapping.
-    if (isa<ttg::PaddedSharedEncodingAttr>(srcTy.getEncoding()) ||
-        isa<ttg::PaddedSharedEncodingAttr>(dstTy.getEncoding()))
-      view->setAttr("tlx.storage_alias_view", builder.getUnitAttr());
-    return view.getResult();
-  }
+  // Shared-memory reinterpretation explicitly permits a view no larger than
+  // its backing allocation. Keep the destination's leading pipeline copies
+  // intact instead of manufacturing a unit-batch subview. Tensor memory still
+  // requires equal-sized reinterprets and therefore uses structural slicing
+  // below for a smaller alias.
+  if (srcBits == dstBits ||
+      isa<ttg::SharedMemorySpaceAttr>(srcTy.getMemorySpace()))
+    return createAliasReinterpret(builder, loc, dstTy, base).getResult();
 
-  return errorOp->emitError()
-         << "TLXRewriteLocalAlias cannot view a " << srcBits
-         << "-bit allocation as a " << dstBits << "-bit alias";
+  if (srcBits < dstBits || srcBits % dstBits != 0)
+    return errorOp->emitError()
+           << "TLXRewriteLocalAlias cannot view a " << srcBits
+           << "-bit allocation as a " << dstBits << "-bit alias";
+  int64_t ratio = srcBits / dstBits;
+  unsigned encRank =
+      cast<ttg::LayoutEncodingTrait>(dstTy.getEncoding()).getRank();
+  int64_t dstRank = dstTy.getRank();
+  assert((dstRank == static_cast<int64_t>(encRank) ||
+          dstRank == static_cast<int64_t>(encRank) + 1) &&
+         "MemDescType rank must equal encoding rank or be one greater");
+  int64_t dstBatch =
+      dstRank == static_cast<int64_t>(encRank) + 1 ? dstTy.getShape()[0] : 1;
+  if (dstBatch != 1)
+    return errorOp->emitError()
+           << "TLXRewriteLocalAlias cannot shrink a size-mismatched alias "
+              "with leading batch dim "
+           << dstBatch << " (only unit batch dim is supported)";
+
+  auto layoutShape = dstTy.getShape().take_back(encRank);
+  SmallVector<int64_t> intermediateShape;
+  intermediateShape.reserve(encRank + 1);
+  intermediateShape.push_back(ratio);
+  intermediateShape.append(layoutShape.begin(), layoutShape.end());
+  auto intermediateTy = ttg::MemDescType::get(
+      intermediateShape, dstTy.getElementType(), dstTy.getEncoding(),
+      dstTy.getMemorySpace(), dstTy.getMutableMemory(), intermediateShape);
+  Value intermediate =
+      createAliasReinterpret(builder, loc, intermediateTy, base).getResult();
+
+  SmallVector<int64_t> slotShape(layoutShape.begin(), layoutShape.end());
+  auto slotTy = ttg::MemDescType::get(
+      slotShape, dstTy.getElementType(), dstTy.getEncoding(),
+      dstTy.getMemorySpace(), dstTy.getMutableMemory(), slotShape);
+  Value zero = arith::ConstantIntOp::create(builder, loc, /*value=*/0,
+                                            /*width=*/32);
+  Value slot =
+      ttg::MemDescIndexOp::create(builder, loc, slotTy, intermediate, zero)
+          .getResult();
+
+  if (dstRank == static_cast<int64_t>(encRank))
+    return slot;
+  return Value(createAliasReinterpret(builder, loc, dstTy, slot).getResult());
 }
 
 } // namespace

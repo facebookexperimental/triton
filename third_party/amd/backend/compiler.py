@@ -113,6 +113,9 @@ class HIPOptions:
     max_num_imprecise_acc_default: int = 0
     backend_name: str = "hip"
     instrumentation_mode: str = ""
+    # Disable LLVM's VectorCombine pass for kernels where its packed rewrites
+    # increase register-transfer pressure. Keep the pass enabled by default.
+    disable_vector_combine: bool = False
 
     # The following option provides hints to the AMDGPU backend regarding instruction scheduling
     # for all `tt.dot` operations in a kernel. Experimental; right now no effect.
@@ -344,6 +347,11 @@ class HIPBackend(BaseBackend):
         # to create the require_layout before tlx.local_local.
         # This layout will then be propagated to the tlx.local_alloc
         amd.passes.ttgpuir.add_accelerate_matmul(pm, options.arch, options.matrix_instr_nonkdim, options.kpack)
+        # Local aliases are structural memory views and may intentionally use
+        # different-rank encodings over the same storage.  Rewrite them to
+        # memdesc views before layout propagation so a consumer's register
+        # layout cannot leak back through the alias to the backing allocation.
+        tlx.tlx_passes.add_tlx_rewrite_local_alias(pm)
         tlx.tlx_passes.add_tlx_insert_require_layout(pm)
         tlx.tlx_passes.add_tlx_propagate_layout(pm)
         tlx.tlx_passes.add_tlx_rewrite_local_alias(pm)
@@ -633,8 +641,10 @@ class HIPBackend(BaseBackend):
                 llvm.link_extern_libs(llvm_mod, paths)
 
         # gfx950 requires VectorCombine for stable BF16 and FP8 code generation.
+        # Keep it enabled by default there, while allowing a kernel with a
+        # measured transfer-pressure problem to opt out explicitly.
         llvm.optimize_module(llvm_mod, llvm.OPTIMIZE_O3, options.arch, "", [], options.enable_fp_fusion,
-                             disable_vector_combine=options.arch != "gfx950")
+                             disable_vector_combine=options.disable_vector_combine or options.arch != "gfx950")
 
         # Architectures with architected SGPRs store the workgroup id in ttmp9 (X) and ttmp7 (Y[15:0], Z[31:16]).
         # These attributes are used to determine if Z should be masked out when loading Y. They are inferred during
