@@ -1,0 +1,6 @@
+ablations_v7/baseline.json: status=sat satisfiable=True
+ablations_v7/warps_minus_one.json: status=sat satisfiable=True
+ablations_v7/warps_half.json: status=sat satisfiable=True
+ablations_v7/no_subtiling.json: status=sat satisfiable=True
+ablations_v7/no_cross_warp.json: status=unsat satisfiable=False
+solver_sources_sha256=42f28efe2e94f97c13fc4c8a7e0326aaf5fe2955d21c8a0793b24b7cf93ef237
