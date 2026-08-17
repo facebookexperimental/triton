@@ -1935,6 +1935,22 @@ findReuseCandidate(WSBuffer &candidate, SmallVector<WSBuffer> &wsBuffers,
       continue;
     }
 
+    // Landing on a host that stays live across the inner loop is only safe
+    // for a TMA-staging candidate: code partition (Step 7.5) emits the WAR
+    // token that keeps the next iteration's producer off the host's SMEM
+    // while the staging store drains. A non-staging candidate (e.g. an
+    // epilogue bias load) gets no such guard, so aliasing it onto an operand
+    // the inner loop is still reading silently corrupts that operand. This
+    // mirrors the candidate-side filter in Phase 3.6.
+    if (candidate.tmaStaging == 0 &&
+        isSmemLiveAcrossInnerLoop(buf.allocOp, channels)) {
+      LDBG("  findReuseCandidate: target bufferId="
+           << buf.bufferId
+           << " is live across the inner loop and candidate bufferId="
+           << candidate.bufferId << " is not TMA staging — skip");
+      continue;
+    }
+
     // Skip targets already claimed by a different buffer group to prevent
     // co-live epilogue buffers from aliasing the same SMEM.
     auto it = claimedTargets.find(buf.bufferId);
@@ -2466,6 +2482,12 @@ static unsigned allocateSmemBuffers(
     if (buf.isPinned)
       nextBufferId = std::max(nextBufferId, buf.bufferId + 1);
 
+  // Buffers whose depth was raised only by the static copy-safety floor, and
+  // the depth they had before that raise. Unlike the cross-stage floor, this
+  // one can be given back if it does not fit (see the relaxation before
+  // Phase 3.6).
+  DenseMap<unsigned, unsigned> preSafetyFloorCopies;
+
   // ── Phase 2: Enforce cross-stage minimum (FIRST, unconditionally) ────
   // The cross-stage depth is a correctness floor dictated by the schedule: a
   // buffer whose consumers span N pipeline stages needs N copies so the
@@ -2517,6 +2539,7 @@ static unsigned allocateSmemBuffers(
       LDBG("CopySafetyValidator: repair buffer "
            << buf.bufferId << " from " << buf.numCopies << " to " << safetyFloor
            << " (missing release -> overwrite ordering)");
+      preSafetyFloorCopies[&buf - wsBuffers.data()] = buf.numCopies;
       buf.minCopies = std::max(buf.minCopies, safetyFloor);
       buf.numCopies = buf.minCopies;
     }
@@ -2574,6 +2597,48 @@ static unsigned allocateSmemBuffers(
   // allocated buffers. Process epilogue (largest) buffers first to maximize
   // the SMEM savings.
   {
+    // The static copy-safety floor is a schedule proof, not a hardware
+    // constraint like the cross-stage floor: it asks for the full configured
+    // depth so a data-partitioned MMA never overlaps a slot. When honoring it
+    // pushes the base plan past the budget, the only currency Phase 3.6 has is
+    // aliasing an allocated buffer -- and the only targets big enough here are
+    // the very operands the inner loop is reading. That trade is not worth
+    // making: it turns a *potential* overlap into silently wrong results (the
+    // DP=2 subtiled-epilogue addmm regression). Give the floor back instead,
+    // largest buffer first, until the plan fits; Phase 4 then re-bumps
+    // whatever the budget actually allows, which is what the planner did
+    // before the floor existed.
+    if (computeTotalSmem(wsBuffers) > smemBudget &&
+        !preSafetyFloorCopies.empty()) {
+      SmallVector<unsigned> relaxOrder;
+      for (auto &entry : preSafetyFloorCopies)
+        relaxOrder.push_back(entry.first);
+      llvm::sort(relaxOrder, [&](unsigned a, unsigned b) {
+        if (wsBuffers[a].sizeBytes != wsBuffers[b].sizeBytes)
+          return wsBuffers[a].sizeBytes > wsBuffers[b].sizeBytes;
+        return a < b;
+      });
+      // Give back one copy at a time, largest buffer first, so the plan keeps
+      // as much of the floor as the budget can pay for.
+      bool relaxed = true;
+      while (computeTotalSmem(wsBuffers) > smemBudget && relaxed) {
+        relaxed = false;
+        for (unsigned idx : relaxOrder) {
+          if (computeTotalSmem(wsBuffers) <= smemBudget)
+            break;
+          auto &buf = wsBuffers[idx];
+          if (buf.numCopies <= std::max(preSafetyFloorCopies[idx], 1u))
+            continue;
+          LDBG("Phase 3.6: copy-safety floor on WSBuffer["
+               << buf.bufferId << "] does not fit the budget — relaxing "
+               << buf.numCopies << " -> " << buf.numCopies - 1);
+          --buf.numCopies;
+          buf.minCopies = std::min(buf.minCopies, buf.numCopies);
+          relaxed = true;
+        }
+      }
+    }
+
     unsigned baseTotal = computeTotalSmem(wsBuffers);
     if (baseTotal > smemBudget) {
       LDBG("Phase 3.6: base SMEM " << baseTotal << " > budget " << smemBudget

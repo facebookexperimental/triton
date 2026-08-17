@@ -1,0 +1,326 @@
+From 2d107a934bfe2f781b4a123c08895bd7673eb2ea Mon Sep 17 00:00:00 2001
+From: mren <mren@meta.com>
+Date: Sat, 1 Aug 2026 19:32:49 -0700
+Subject: [PATCH 1/2] Fix CLC epilogue store-wait rotation
+
+---
+ .../ws_tma_store_annotate.mlir                |  28 +++++
+ .../ws_tma_store_token_wait_reorder.mlir      |  40 ++++++
+ .../WarpSpecialization/WSTMAStoreLowering.cpp | 117 +++++++++++-------
+ .../docs/TMAStoreWaitPipeline.md              |  11 +-
+ .../tutorials/hstu_self_attn/bench_self.py    |   5 +-
+ .../tutorials/test_self_attention_autows.py   |   5 +-
+ 6 files changed, 155 insertions(+), 51 deletions(-)
+
+diff --git a/test/Hopper/WarpSpecialization/ws_tma_store_annotate.mlir b/test/Hopper/WarpSpecialization/ws_tma_store_annotate.mlir
+index 6fff6f9a9..ab70a59de 100644
+--- a/test/Hopper/WarpSpecialization/ws_tma_store_annotate.mlir
++++ b/test/Hopper/WarpSpecialization/ws_tma_store_annotate.mlir
+@@ -25,6 +25,34 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
+ 
+ // -----
+ 
++#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
++#smem = #ttg.shared_memory
++module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
++// CLC epilogues are carried by scf.while rather than scf.for.
++// CHECK-LABEL: while_store_wait
++// CHECK: ttng.async_tma_store_token_wait
++// CHECK-SAME: can_rotate_by_buffer_count = 2
++// CHECK-SAME: planned_pending_count = 1
++  tt.func public @while_store_wait(
++      %desc: !tt.tensordesc<128x64xf16, #shared>,
++      %src: tensor<128x64xf16>, %i: i32) {
++    %buf = ttg.local_alloc {"buffer.copy" = 2 : i32} : () -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
++    %true = arith.constant true
++    %false = arith.constant false
++    scf.while (%valid = %true) : (i1) -> () {
++      scf.condition(%valid)
++    } do {
++      ttg.local_store %src, %buf : tensor<128x64xf16> -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
++      %tok = ttng.async_tma_copy_local_to_global %desc[%i, %i] %buf : !tt.tensordesc<128x64xf16, #shared>, !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> !ttg.async.token
++      ttng.async_tma_store_token_wait %tok : !ttg.async.token
++      scf.yield %false : i1
++    }
++    tt.return
++  }
++}
++
++// -----
++
+ #shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+ #smem = #ttg.shared_memory
+ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
+diff --git a/test/Hopper/WarpSpecialization/ws_tma_store_token_wait_reorder.mlir b/test/Hopper/WarpSpecialization/ws_tma_store_token_wait_reorder.mlir
+index 7744800c8..45f830073 100644
+--- a/test/Hopper/WarpSpecialization/ws_tma_store_token_wait_reorder.mlir
++++ b/test/Hopper/WarpSpecialization/ws_tma_store_token_wait_reorder.mlir
+@@ -29,6 +29,46 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
+ 
+ // -----
+ 
++#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
++#smem = #ttg.shared_memory
++module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
++// CLC keeps planned waits in the while body and drains the issuing task after
++// the persistent scheduler exits.
++// CHECK-LABEL: clc_while_rotation_and_drain
++// CHECK: scf.while
++// CHECK: %[[TOK0:.*]] = ttng.async_tma_copy_local_to_global
++// CHECK: ttng.async_tma_store_token_wait %[[TOK0]]
++// CHECK-SAME: planned_pending_count = 1
++// CHECK-NEXT: ttg.local_store
++// CHECK: %[[TOK1:.*]] = ttng.async_tma_copy_local_to_global
++// CHECK-NEXT: ttng.async_tma_store_token_wait %[[TOK1]]
++// CHECK-SAME: planned_pending_count = 1
++// CHECK: scf.yield
++// CHECK: ttng.async_tma_store_wait {async_task_id = array<i32: 3>, pendings = 0 : i32}
++  tt.func public @clc_while_rotation_and_drain(
++      %desc: !tt.tensordesc<128x64xf16, #shared>,
++      %src0: tensor<128x64xf16>, %src1: tensor<128x64xf16>,
++      %buf0: !ttg.memdesc<128x64xf16, #shared, #smem, mutable>,
++      %buf1: !ttg.memdesc<128x64xf16, #shared, #smem, mutable>, %i: i32) {
++    %true = arith.constant true
++    %false = arith.constant false
++    scf.while (%valid = %true) : (i1) -> () {
++      scf.condition(%valid)
++    } do {
++      ttg.local_store %src0, %buf0 : tensor<128x64xf16> -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
++      %tok0 = ttng.async_tma_copy_local_to_global %desc[%i, %i] %buf0 : !tt.tensordesc<128x64xf16, #shared>, !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> !ttg.async.token
++      ttng.async_tma_store_token_wait %tok0 {async_task_id = array<i32: 3>, can_rotate_by_buffer_count = 2 : i32, planned_pending_count = 1 : i32} : !ttg.async.token
++      ttg.local_store %src1, %buf1 : tensor<128x64xf16> -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
++      %tok1 = ttng.async_tma_copy_local_to_global %desc[%i, %i] %buf1 : !tt.tensordesc<128x64xf16, #shared>, !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> !ttg.async.token
++      ttng.async_tma_store_token_wait %tok1 {async_task_id = array<i32: 3>, can_rotate_by_buffer_count = 2 : i32, planned_pending_count = 1 : i32} : !ttg.async.token
++      scf.yield %false : i1
++    }
++    tt.return
++  }
++}
++
++// -----
++
+ #shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 32}>
+ #smem = #ttg.shared_memory
+ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+diff --git a/third_party/nvidia/hopper/lib/Transforms/WarpSpecialization/WSTMAStoreLowering.cpp b/third_party/nvidia/hopper/lib/Transforms/WarpSpecialization/WSTMAStoreLowering.cpp
+index a992e4535..b11dbb954 100644
+--- a/third_party/nvidia/hopper/lib/Transforms/WarpSpecialization/WSTMAStoreLowering.cpp
++++ b/third_party/nvidia/hopper/lib/Transforms/WarpSpecialization/WSTMAStoreLowering.cpp
+@@ -318,38 +318,39 @@ findLocalStoreWritingBuffer(scf::ForOp forOp, Value buffer, Operation *before,
+ 
+ void doAnnotateTMAStoreWaits(triton::FuncOp funcOp) {
+   MLIRContext *ctx = funcOp.getContext();
+-  // Use walk to find TMAStoreTokenWaitOp ops inside ForOp bodies, including
+-  // those nested inside SubtiledRegionOp regions.
+-  funcOp.walk([&](scf::ForOp forOp) {
+-    forOp.walk([&](ttng::TMAStoreTokenWaitOp waitOp) {
+-      Value buffer;
+-      auto *tmaOp = getDefiningTMAStoreOp(waitOp, buffer);
+-      if (!tmaOp)
+-        return;
++  // Annotate waits in counted loops and CLC persistent while loops, including
++  // waits nested inside SubtiledRegionOp regions.
++  funcOp.walk([&](ttng::TMAStoreTokenWaitOp waitOp) {
++    if (!waitOp->getParentOfType<scf::ForOp>() &&
++        !waitOp->getParentOfType<scf::WhileOp>())
++      return;
++    Value buffer;
++    auto *tmaOp = getDefiningTMAStoreOp(waitOp, buffer);
++    if (!tmaOp)
++      return;
+ 
+-      auto allocOp = buffer.getDefiningOp<ttg::LocalAllocOp>();
+-      if (!allocOp)
+-        return;
++    auto allocOp = buffer.getDefiningOp<ttg::LocalAllocOp>();
++    if (!allocOp)
++      return;
+ 
+-      // Only annotate buffers that have buffer.copy from the memory planner.
+-      // Buffers without buffer.copy were not planned and cannot be rotated.
+-      auto bufferCopy = allocOp->getAttrOfType<IntegerAttr>("buffer.copy");
+-      if (!bufferCopy)
+-        return;
++    // Only annotate buffers that have buffer.copy from the memory planner.
++    // Buffers without buffer.copy were not planned and cannot be rotated.
++    auto bufferCopy = allocOp->getAttrOfType<IntegerAttr>("buffer.copy");
++    if (!bufferCopy)
++      return;
+ 
+-      int k = bufferCopy.getInt();
+-      if (k <= 0)
+-        return;
++    int k = bufferCopy.getInt();
++    if (k <= 0)
++      return;
+ 
+-      waitOp->setAttr(kCanRotateByBufferCount,
+-                      IntegerAttr::get(IntegerType::get(ctx, 32), k));
+-      // The canonical wait_group count for a K-slot same-task staging ring is
+-      // K-1. Keep it as stable lowering metadata: schedule serialization can
+-      // move the token wait through pipeline clusters without leaving enough
+-      // linear IR context for computePendings() to reconstruct the ring depth.
+-      waitOp->setAttr(kPlannedPendingCount,
+-                      IntegerAttr::get(IntegerType::get(ctx, 32), k - 1));
+-    });
++    waitOp->setAttr(kCanRotateByBufferCount,
++                    IntegerAttr::get(IntegerType::get(ctx, 32), k));
++    // The canonical wait_group count for a K-slot same-task staging ring is
++    // K-1. Keep it as stable lowering metadata: schedule serialization can
++    // move the token wait through pipeline clusters without leaving enough
++    // linear IR context for computePendings() to reconstruct the ring depth.
++    waitOp->setAttr(kPlannedPendingCount,
++                    IntegerAttr::get(IntegerType::get(ctx, 32), k - 1));
+   });
+ }
+ 
+@@ -375,26 +376,24 @@ static bool isInMergedEpilogueLoop(scf::ForOp forOp) {
+ // ---------------------------------------------------------------------------
+ 
+ void doValidateTMAStoreAnnotations(triton::FuncOp funcOp) {
+-  funcOp.walk([&](scf::ForOp forOp) {
+-    forOp.walk([&](ttng::TMAStoreTokenWaitOp waitOp) {
+-      if (!waitOp->hasAttr(kCanRotateByBufferCount))
+-        return;
++  funcOp.walk([&](ttng::TMAStoreTokenWaitOp waitOp) {
++    if (!waitOp->hasAttr(kCanRotateByBufferCount))
++      return;
+ 
+-      Value buffer;
+-      auto *tmaOp = getDefiningTMAStoreOp(waitOp, buffer);
+-      if (!tmaOp) {
+-        waitOp->removeAttr(kCanRotateByBufferCount);
+-        waitOp->removeAttr(kPlannedPendingCount);
+-        return;
+-      }
++    Value buffer;
++    auto *tmaOp = getDefiningTMAStoreOp(waitOp, buffer);
++    if (!tmaOp) {
++      waitOp->removeAttr(kCanRotateByBufferCount);
++      waitOp->removeAttr(kPlannedPendingCount);
++      return;
++    }
+ 
+-      auto allocOp = buffer.getDefiningOp<ttg::LocalAllocOp>();
+-      if (!allocOp) {
+-        waitOp->removeAttr(kCanRotateByBufferCount);
+-        waitOp->removeAttr(kPlannedPendingCount);
+-        return;
+-      }
+-    });
++    auto allocOp = buffer.getDefiningOp<ttg::LocalAllocOp>();
++    if (!allocOp) {
++      waitOp->removeAttr(kCanRotateByBufferCount);
++      waitOp->removeAttr(kPlannedPendingCount);
++      return;
++    }
+   });
+ }
+ 
+@@ -454,9 +453,22 @@ void doTMAStoreWaitReorder(triton::FuncOp funcOp) {
+   // This is deliberately limited to direct tokens and staging writers in the
+   // same block. The final use remains a drain.
+   SmallVector<ttng::TMAStoreTokenWaitOp> straightLineWaits;
++  SmallVector<std::pair<scf::WhileOp, Attribute>> whileDrains;
+   funcOp.walk([&](ttng::TMAStoreTokenWaitOp waitOp) {
+-    if (!waitOp->getParentOfType<scf::ForOp>())
++    if (!waitOp->getParentOfType<scf::ForOp>()) {
+       straightLineWaits.push_back(waitOp);
++      auto planned = waitOp->getAttrOfType<IntegerAttr>(kPlannedPendingCount);
++      auto whileOp = waitOp->getParentOfType<scf::WhileOp>();
++      if (!whileOp || !planned || planned.getInt() == 0)
++        return;
++      Attribute taskIds = waitOp->getAttr("async_task_id");
++      bool alreadyTracked = std::any_of(
++          whileDrains.begin(), whileDrains.end(), [&](const auto &entry) {
++            return entry.first == whileOp && entry.second == taskIds;
++          });
++      if (!alreadyTracked)
++        whileDrains.emplace_back(whileOp, taskIds);
++    }
+   });
+   for (ttng::TMAStoreTokenWaitOp waitOp : straightLineWaits) {
+     Operation *tmaStore = waitOp.getToken().getDefiningOp();
+@@ -491,6 +503,17 @@ void doTMAStoreWaitReorder(triton::FuncOp funcOp) {
+     }
+   }
+ 
++  // CLC epilogues live directly in an scf.while rather than an scf.for. Their
++  // planned K-slot waits overlap stores across scheduler iterations, so drain
++  // each issuing task's queue when the persistent loop exits.
++  for (auto [whileOp, taskIds] : whileDrains) {
++    OpBuilder builder(whileOp);
++    builder.setInsertionPointAfter(whileOp);
++    auto drain = ttng::TMAStoreWaitOp::create(builder, whileOp.getLoc(), 0);
++    if (taskIds)
++      drain->setAttr("async_task_id", taskIds);
++  }
++
+   funcOp.walk([&](scf::ForOp forOp) {
+     bool hasNestedFor = false;
+     forOp.getBody()->walk([&](scf::ForOp) { hasNestedFor = true; });
+diff --git a/third_party/nvidia/hopper/lib/Transforms/WarpSpecialization/docs/TMAStoreWaitPipeline.md b/third_party/nvidia/hopper/lib/Transforms/WarpSpecialization/docs/TMAStoreWaitPipeline.md
+index 79ddd176a..e55e32b44 100644
+--- a/third_party/nvidia/hopper/lib/Transforms/WarpSpecialization/docs/TMAStoreWaitPipeline.md
++++ b/third_party/nvidia/hopper/lib/Transforms/WarpSpecialization/docs/TMAStoreWaitPipeline.md
+@@ -210,7 +210,8 @@ the monolithic pipeline.
+ 
+ **Test pass**: `nvgpu-test-annotate-tma-store-waits` (`NVGPUTestAnnotateTMAStoreWaitsPass`)
+ 
+-This pass walks `scf.for` loops and inspects every `TMAStoreTokenWaitOp`.
++This pass inspects every `TMAStoreTokenWaitOp` enclosed by an `scf.for` loop
++or a CLC persistent `scf.while` loop.
+ For each wait, it traces the token back to the defining
+ TMA store-like op (`AsyncTMACopyLocalToGlobalOp` or `AsyncTMAReduceOp`),
+ then looks at the SMEM buffer used by that store:
+@@ -266,6 +267,14 @@ for one output (for example dV) may cross independent preparation for the next
+ output (dK) and stop at dK's staging write. The last wait in the block remains
+ the final drain.
+ 
++CLC epilogues are straight-line regions inside the persistent scheduler's
++`scf.while`. Their annotated waits retain `planned_pending_count = K - 1`, so
++the K-slot staging ring overlaps stores across scheduler iterations. Because
++the loop can terminate with stores still pending, the pass emits one
++queue-wide `wait_group(0)` after the `scf.while` for every issuing async task.
++This is the CLC counterpart of the post-`scf.for` drain used by merged
++epilogues.
++
+ For annotated operations, merged epilogue loops
+ (`tt.merge_epilogue_to_computation`) serialize the
+ same-iteration part of the coarse schedule directly into block order: the pass
+diff --git a/third_party/tlx/tutorials/hstu_self_attn/bench_self.py b/third_party/tlx/tutorials/hstu_self_attn/bench_self.py
+index d2ea6fcff..1f9210b67 100644
+--- a/third_party/tlx/tutorials/hstu_self_attn/bench_self.py
++++ b/third_party/tlx/tutorials/hstu_self_attn/bench_self.py
+@@ -200,9 +200,10 @@ _PERF_ENV = {
+         "HSTU_SELF_AUTOWS": "1", "HSTU_SELF_DQ_REDUCE": "1", "HSTU_SELF_DQ_REUSE": "1",
+         "HSTU_SELF_AUTOWS_CLC": "1", "HSTU_SELF_AUTOWS_CLC_SMEM_ALGO": "2",
+         "HSTU_SELF_DP": "1",
+-        "HSTU_SELF_AUTOWS_BWD_BM": "128", "HSTU_SELF_AUTOWS_BWD_BN": "128",
++        "HSTU_SELF_AUTOWS_BWD_BM": "64", "HSTU_SELF_AUTOWS_BWD_BN": "128",
+         "HSTU_SELF_AUTOWS_BWD_STAGES": "2", "HSTU_SELF_AUTOWS_WARPS": "4",
+-        "HSTU_SELF_PIN": "1", "HSTU_SELF_DQ_ITERS": "4", "TRITON_WS_SMEM_PLAN_SEARCH": "1",
++        "HSTU_SELF_PIN": "1", "HSTU_SELF_DQ_ITERS": "4", "HSTU_SELF_BWD_DKDV_SUBTILE": "2",
++        "TRITON_WS_SMEM_PLAN_SEARCH": "1",
+     },
+ }
+ 
+diff --git a/third_party/tlx/tutorials/test_self_attention_autows.py b/third_party/tlx/tutorials/test_self_attention_autows.py
+index 813d7f8d5..6b41a96ac 100644
+--- a/third_party/tlx/tutorials/test_self_attention_autows.py
++++ b/third_party/tlx/tutorials/test_self_attention_autows.py
+@@ -61,7 +61,10 @@ _DQREDUCE_CFG = dict(
+     autows=True, dq_reduce=True, dq_reuse=True, dp=1,
+     bwd_bm=128, bwd_bn=128, bwd_stages=2, warps=4, dq_iters=4, pin=True,
+ )
+-_CLC_CFG = dict(_DQREDUCE_CFG, clc=True, bwd_stages=2, clc_smem_algo=2)
++_CLC_CFG = dict(
++    _DQREDUCE_CFG, clc=True, bwd_bm=64, bwd_bn=128,
++    bwd_stages=2, dkdv_subtile=2, clc_smem_algo=2,
++)
+ # Manual data-partition fwd: split BLOCK_M=256 into two 128-row halves
+ # sharing one K/V load, warp-specialized (load + 2 MMA groups).
+ _MANUAL_DP_CFG = dict(autows=True, manual_dp=True, dp=2, warps=4, pin=True)
+-- 
+2.53.0-Meta
+

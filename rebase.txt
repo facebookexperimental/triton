@@ -1,0 +1,38 @@
+for 2cta support, some commits landed, some are landing
+missing commits are:
+597266d35 (HEAD -> 2cta-bisect, origin/mren/2cta-bisect) [AutoWS] Elide redundant FA P publication waits
+b97f29e29 [TritonGPU] Fold zero init through conditional rescale
+5e749f7b8 [AutoWS] Match FA forward TLX schedule and P subtiling
+8eec206a2 Support CLC while staging reuse
+0c451ccea Share 2CTA FA V loads across PV slices
+555af1d50 [AutoWS] Reuse alpha channel for FA rescale vote
+c8f91655b [AutoWS] Add conditional FA accumulator rescale
+16760d8a0 [AutoWS] Rotate 2CTA rendezvous across CLC iterations
+811f598ec [AutoWS] Enable clustered CLC persistent scheduling
+ee55fc98c [AutoWS] Align 2-CTA FA forward pipeline with TLX
+146e067c9 Keep 2-CTA FA scheduling knobs off 1-CTA
+032f8c6e1 Match 2-CTA FA forward AutoWS scheduling to TLX
+dd183775b Enable 2-CTA FA forward in TLX and AutoWS
+9750db364 (temp-2cta-bisectable) Support BM64 2-CTA backward on the non-persistent grid
+460ef603a Preserve token initialization barrier coalescing
+5e6ad629e Fix packed TMEM reuse synchronization
+759ca3fcd Prioritize TMEM operands in AutoWS compute
+84dbd430b [doc] Document AutoWS 2CTA backward scheduling
+b5b746517 [kernel] Schedule AutoWS FA backward load wavefronts
+6b99e8761 Support AutoWS load wavefront scheduling
+6a0398bb0 [kernel] Enable direct-grid BM128 2CTA AutoWS backward
+aea4979b7 Add nonempty loop assumption
+fdd12a10c Pipeline BM128 backward GEMM partitions
+706a79a00 Align BM128 backward warp allocation
+f467361b1 Align BM128 backward partition scheduling
+
+0d4b3f8d4 Support BM128 peer exchange for AutoWS 2CTA
+679a679a8 Use cooperative TMA loads for AutoWS 2CTA --> accepted in fbsource as D114254019
+4f03e1cdb AutoWS: enable 2-CTA persistent FA backward
+
+266ad3d2a [WSTMAStoreLowering] [store-wait-fix] Rotate nested one-CTA dQ stores
+--> D114610701 accepted
+c110b1224 [store-wait] Cover idx3 FA backward store-wait rotation end to end
+--> D114610706 accepted
+376da611f [WSTMAStoreLowering] [store-wait] Rotate FA backward TMA store waits by staging slot
+5c10b5334 [store-wait] Schedule and interleave FA backward epilogue memory operations

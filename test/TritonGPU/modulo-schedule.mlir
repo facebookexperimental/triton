@@ -1,5 +1,9 @@
 // RUN: triton-opt %s -split-input-file -allow-unregistered-dialect -nvgpu-modulo-schedule | FileCheck %s
-// RUN: env TRITON_USE_MODULO_SCHEDULE=joint_solver triton-opt %s -split-input-file -allow-unregistered-dialect -nvgpu-modulo-schedule | FileCheck %s --check-prefix=JOINT
+// The JOINT checks pin a schedule that only the native Z3 joint solver
+// produces; in a build with TRITON_ENABLE_Z3_JOINT_SOLVER off (the default)
+// runZ3JointSolver is a stub and the pass falls back to Rau, so this run is
+// gated on the feature rather than failing every default build.
+// RUN: %if z3-joint-solver %{ env TRITON_USE_MODULO_SCHEDULE=joint_solver triton-opt %s -split-input-file -allow-unregistered-dialect -nvgpu-modulo-schedule | FileCheck %s --check-prefix=JOINT %}
 // RUN: env TRITON_MODULO_BASELINE_REPORT=1 triton-opt %s -split-input-file -allow-unregistered-dialect -nvgpu-modulo-schedule 2>&1 | FileCheck %s --check-prefix=BASELINE
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [4, 1], order = [1, 0]}>

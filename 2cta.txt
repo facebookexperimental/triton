@@ -1,0 +1,133 @@
+codex resume 019fc0f9-590c-76c0-a717-1ff39b2d56ab (hstu self attention autoWS
+bwd)
+
+---------------------------------------------------
+t282685712-store-wait-integration (hash d77582156)
+d77582156 (HEAD -> t282685712-store-wait-integration, origin/mren/temp-2cta) store_wait_fix Rotate nested one-CTA dQ stores
+f74f47949 (HEAD -> t282685712-ttgir-match, origin/mren/temp-2cta) Match AutoWS backward load prologue
+--> modify tlx kernel
+f7dc33fe0 Add TLX 2CTA sync ablation
+--> with compiler change
+6b6324725 Add TLX epilogue degradation control (modify tlx kernel for study)
+--> also modify accuracy_bench_bwd_autows_vs_tlx.py
+
+1b5ebbdeb — Fix packed TMEM reuse synchronization
+a46e2651d Prioritize TMEM operands in AutoWS compute <-------------
+375d8c654 Document AutoWS 2CTA backward scheduling
+d8be33a3c Schedule AutoWS load wavefronts
+982f244a9 Subtile FA backward epilogues
+9ba080185 Enable direct-grid BM128 2CTA AutoWS backward <----------------
+3e2827d54 Add nonempty loop assumption
+36465cf8c Interleave FA backward epilogue memory operations
+38d546fec Pipeline AutoWS FA backward TMA stores
+bb5f1fe40 Pipeline BM128 backward GEMM partitions
+cc7cc13a7 Align BM128 backward warp allocation
+df670e1b0 Align BM128 backward partition scheduling
+
+  - d8be33a3…: production accuracy passes
+  - 375d8c65…: production accuracy passes
+  - a46e2651…: production accuracy fails in dQ
+
+• The full incremental sweep completed across all 15 commits from 3525db7c… through f74f4794….
+
+  Main findings:
+
+  - Starting persistent performance: 10.249 ± 0.058 ms.
+  - Performance temporarily regressed to about 15.05 ms.
+  - 9ba08018… introduced working direct-grid BM128 2CTA:
+      - Non-persistent: 5.011 ± 0.032 ms
+      - Persistent: 5.273 ± 0.028 ms
+
+  - Largest later improvement came at a46e2651…:
+      - Non-persistent: 4.409 ± 0.056 ms
+      - Persistent: 4.312 ± 0.077 ms
+
+  - Best stable persistent result: f7dc33fe…, 4.332 ± 0.015 ms.
+  - Final commit f74f4794…:
+      - Non-persistent passes: 4.378 ± 0.021 ms
+      - Persistent is invalid due to a nondeterministic dQ race.
+
+  - 38d546fe… persistent timed out; pre-9ba08018… non-persistent was unsupported.
+
+  Full commands, hashes, raw samples, and failures: /tmp/t282-incremental-zjNBhL/incremental_sweep_report.md.
+  cat  /tmp/t282-incremental-zjNBhL/incremental_sweep_report.md | pastry
+P2444006523
+
+
+origin/mren/temp-2cta
+--------------------------
+Item 3: 2cta on devgpu070 MetaMain2
+• TLX 2CTA latency is 4.159 ± 0.012 ms over eight runs.
+  Raw: 4.1503, 4.1482, 4.1513, 4.1523, 4.1584, 4.1850, 4.1625, 4.1645 ms
+
+  For comparison:
+  - Latest valid AutoWS non-persistent: 4.378 ms — 5.27% slower
+  - Best valid AutoWS persistent: 4.332 ms — 4.17% slower
+
+  • At a46e2651d4fe28099255a971ddf0e7a9ab3edc00, rebuilt TLX 2CTA latency is:
+  4.140 ± 0.011 ms
+  Raw samples: 4.1579, 4.1412, 4.1431, 4.1421, 4.1380, 4.1319, 4.1461, 4.1206 ms
+
+tritonbench: --metrics tflops  --rep 3000 --sleep 1.0 --bwd
+  --------------------------------------------
+  prompt:
+  start subagents to run tests in third_party/nvidia/hopper/run_all.sh, one
+  subagent for each test. Report test/fail for each test, one line per test.
+  follow devmate/step1.txt to build. baseline at 790ab89c8, latest at
+  6126cdf93, run tests on baseline then latest, if no regression, stop; if
+  regression, figure out which commit causes the regression
+
+--------------------------------------------
+  Item 2: if branch + loop peeling devgpu023 on MetaMain
+  Goal is to push this case through autoWS pipelines and make sure final ttgir has WS, verify correctness. For each pass improved, add lit test based on the actual
+  benchmark. File a Meta task to track the progress. Do not stop at checkpoints or intermediate reports.
+  run a full autoWS test suite at the end
+
+  goal is to implement a loop peeling pass within a partition after code partitioning. Search for other loop transformations within Triton and see if there are similar
+  passes. Then implement the peeling pass with lit test based on the actual
+  benchmark. Make sure final ttgir has WS with loop peeled for masked and
+  unmasked path and verify
+  correctness. File a Meta task to track the progress. Do not stop at checkpoints or intermediate reports.
+
+--------------------------------------------
+Item 1: devgpu023 on MetaMain2
+  autoWS gemm has store_wait rotation.
+  Goal is to get FA bwd idx 3 to have the same store_wait rotation for dq/dk/dv. Can check TLX bwd to see the exact staging buffer, op order we want. Focus on the 5
+  passes and make adjustments as needed to reach the goal. Add lit test based
+  on FA bwd idx 3 to check desired output (including op order) after each modified pass. As preparation, get IR
+  pass after each dump for autoWS gemm, and final ttgir from FA bwd TLX 1cta
+  config. File a task to track the progress. Do not stop at checkpoints or
+  intermediate reports. run full autoWS test suite at base and each commit (start subagents to run tests in third_party/nvidia/hopper/run_all.sh, one
+  subagent for each test. Report test/fail for each test, one line per test.
+  follow devmate/step1.txt to build.), make sure commits don't cause
+  regression.
+  5 passes:
+
+  run a full autoWS test suite at the end
+
+  Item 4: contracted search + load schedule (related to 2cta)
+
+--------------------------------------------
+  Item 6: tt.where to loop peeling (related to item 2) ongoing devgpu023
+
+  Item 5: self attention bwd exp/div vs tanh/FMA autoWS vs tlx
+
+  ----------- hstu self
+  cat 0001-Fix-CLC-epilogue-store-wait-rotation.patch | pastry
+P2445295256: https://www.internalfb.com/intern/paste/P2445295256/
+[mren@devgpu023.atn1 ~/local/MetaMain/triton (base-0728-store-wait-v2-review-folded)]$ cat 0002-Render-CLC-loops-in-TTGIR-to-TLX-output.patch | pastry
+P2445295332: https://www.internalfb.com/intern/paste/P2445295332/
+8190aa23c (HEAD -> base-0728-store-wait-v2-review-folded) Render CLC loops in TTGIR-to-TLX output
+d98339eca Fix CLC epilogue store-wait rotation
+c7af7d29b (ssh/mren/self-attn-bwd2) store_wait_fix Rotate nested one-CTA dQ stores
+
+
+-------------- regression check
+MetaMain:
+start from base commit 0f993a9b1, run thirdparty/nvidia/hopper/run_all.sh, save
+the base line results
+File a meta task for regression check
+for each commit on top, make sure there is no regression in thirdparty/nvidia/hopper/run_all.sh
+if there is, try fixing the compiler, update the task with initial test results and the compiler fix commit
+do the same thing for each commit till the top commit
+Do not stop at checkpoints or intermediate reports.
