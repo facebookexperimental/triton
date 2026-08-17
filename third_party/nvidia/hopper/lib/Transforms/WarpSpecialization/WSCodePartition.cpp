@@ -5193,11 +5193,14 @@ void mergeStagingReuseIntoHost(triton::FuncOp funcOp,
 
     // (f) Build one stagingView per viable staging. Propagate planner
     // attributes (including async_task_id) but explicitly OMIT
-    // buffer.tmaStaging — downstream passes walk ttg.local_alloc ops with
-    // that attribute and assume the defining op is castable to
-    // LocalAllocOp; a MemDescReinterpretOp carrying it would be
-    // misclassified. The orphaned staging LocalAllocOp keeps
-    // buffer.tmaStaging so those walks still find it.
+    // buffer.tmaStaging — the passes that consume it walk ttg.local_alloc ops
+    // and assume the defining op is castable to LocalAllocOp; a
+    // MemDescReinterpretOp carrying it would be misclassified.
+    // Dropping it here loses nothing: every consumer of that attribute (Step
+    // 4.5's staging-reuse collection above, getStaggeredAccumCnt via
+    // Channel::getAllocOp) runs earlier in doCodePartition, and step (g)
+    // erases the staging LocalAllocOp outright, so after this loop no
+    // buffer.tmaStaging-tagged local_alloc exists for these buffers at all.
     for (ttg::LocalAllocOp stagingAlloc : viable) {
       auto stagingTy =
           cast<ttg::MemDescType>(stagingAlloc.getResult().getType());
@@ -5216,15 +5219,15 @@ void mergeStagingReuseIntoHost(triton::FuncOp funcOp,
            << "B) onto shared backing alloc for host (buffer.id=" << hostId
            << ", " << hostBytes << "B)");
 
-      // (g) Rewire staging uses. We do NOT erase eagerly: earlier passes
-      // may retain pointers (e.g., Channel::allocOp) to the staging op;
-      // dereferencing them would be a use-after-free. Leave the staging
-      // orphaned (zero users); MLIR's DCE / canonicalization removes it
-      // later, after all consumers of Channel state have run.
+      // (g) Rewire staging uses and erase the old allocation.  This rewrite
+      // runs after the last channel-consuming transformation in
+      // doCodePartition, so retained Channel::allocOp pointers are no longer
+      // observed.  Relying on later DCE is insufficient for subtiled
+      // epilogues: lowerMultiTaskSubtiledRegions can preserve the zero-use
+      // explicit alloc, causing AllocateSharedMemoryNv to charge both the
+      // shared backing and the supposedly-reused staging allocation.
       stagingAlloc.getResult().replaceAllUsesWith(stagingView.getResult());
-      // Drop reuseTarget on the orphaned staging too so any subsequent
-      // walk scanning for the attribute won't re-process it.
-      stagingAlloc->removeAttr("allocation.reuseTarget");
+      stagingAlloc.erase();
     }
   }
 }
