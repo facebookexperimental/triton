@@ -102,6 +102,26 @@ getWarpSpecializedPartitionType(scf::ForOp forOp) {
   return std::nullopt;
 }
 
+static bool needsCustomMetaWSEpiloguePeeling(scf::ForOp forOp) {
+  Operation *scope = forOp.getOperation();
+  if (auto wsOp = forOp->getParentOfType<triton::gpu::WarpSpecializeOp>())
+    scope = wsOp.getOperation();
+
+  // The generic pipeline expander predicates peeled epilogue operations.
+  // Peer gathers cannot be predicated, and predicating a TMA reduction in one
+  // partition independently of its sibling GEMM partitions breaks their
+  // iteration lockstep. Keep the legacy PredicateStage-based peeling for the
+  // entire warp-specialize operation when either operation is present.
+  return scope
+      ->walk([&](Operation *op) {
+        if (isa<triton::nvidia_gpu::TwoCTAPeerGatherOp,
+                triton::nvidia_gpu::AsyncTMAReduceOp>(op))
+          return WalkResult::interrupt();
+        return WalkResult::advance();
+      })
+      .wasInterrupted();
+}
+
 static void expandLoops(ModuleOp moduleOp) {
   DenseSet<MaskOp> peeledMaskOps;
   auto processPeeledEpilogueOp = [&](RewriterBase &rewriter, Operation *op,
@@ -170,8 +190,10 @@ static void expandLoops(ModuleOp moduleOp) {
       }
     }
     triton::PipeliningOption options;
+    bool useCustomMetaWSEpilogue =
+        metaWS && needsCustomMetaWSEpiloguePeeling(forOp);
     options.supportDynamicLoops = true;
-    options.peelEpilogue = metaWS;
+    options.peelEpilogue = metaWS && !useCustomMetaWSEpilogue;
     options.predicateFn = wrapInMaskOp;
     options.getScheduleFn =
         [&](scf::ForOp forOp,
@@ -191,7 +213,7 @@ static void expandLoops(ModuleOp moduleOp) {
         !keepPredicateStage; // do not peel if we are testing the stage
                              // predication
     if (metaWS)
-      customEpiloguePeeling = false;
+      customEpiloguePeeling = useCustomMetaWSEpilogue;
 
     if (keepPredicateStage || customEpiloguePeeling) {
       options.emitPredicateStageFn =
