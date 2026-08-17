@@ -1178,6 +1178,9 @@ class ROCmAddMMWarpPipeTemplateConfigHeuristic(
         (64, 64, 64, 8, 8, 3),
         (128, 128, 64, 8, 8, 2),
         (64, 128, 64, 8, 8, 2),
+        # Deep-K M=1024 shapes need the stock-style 64x128x128 tile with kpack=1.
+        (64, 128, 128, 4, 8, 2),
+        (64, 128, 128, 4, 8, 3),
         (128, 256, 64, 8, 8, 2),
         (128, 256, 64, 8, 8, 3),
         (128, 256, 32, 8, 8, 3),
@@ -1196,6 +1199,21 @@ class ROCmAddMMWarpPipeTemplateConfigHeuristic(
         # small-M tiles (6 + 3)
         (32, 32, 128, 8, 4, 2),
         (32, 64, 64, 8, 4, 2),
+    ]
+
+    # Direct-to-LDS setup and waits dominate short K. Let the same TLX template
+    # also autotune its register branch where that fixed cost is not recovered.
+    SHORT_K_REGISTER_CONFIGS = [
+        (32, 32, 16, 8, 4, 2),
+        (64, 128, 64, 4, 8, 0),
+        (256, 128, 64, 4, 8, 0),
+    ]
+
+    # K=256 prefers kpack=2 for the persistent narrow-N tiles, while the larger-K
+    # winners above prefer kpack=1. Keep both choices instead of fixing one globally.
+    KPACK2_CONFIGS = [
+        (64, 128, 64, 8, 8, 2),
+        (128, 256, 32, 8, 8, 3),
     ]
 
     def adjust_kernel_inputs(
@@ -1338,7 +1356,73 @@ class ROCmAddMMWarpPipeTemplateConfigHeuristic(
                     USE_ASYNC=use_async,
                     matrix_instr_nonkdim=16,
                     waves_per_eu=0,
-                    kpack=get_default_kpack(block_k),
+                    # kpack=1 is required by the deep-K 64x128x128 winner.
+                    kpack=1,
+                )
+                yield self._convert_config_to_template_kwargs(
+                    triton_config, m, n, k, out_dtype
+                )
+        # K=256 only favors the register path once a large M supplies enough
+        # independent output tiles; smaller M keeps the kpack=2 async candidate.
+        use_register_candidate = sizevars.statically_known_true(
+            sympy.Lt(k, 64)
+        ) or (
+            sizevars.statically_known_true(sympy.Gt(k, 256))
+            and sizevars.statically_known_true(sympy.Le(k, 512))
+        ) or (
+            sizevars.statically_known_true(sympy.Eq(k, 256))
+            and sizevars.statically_known_true(sympy.Ge(m, 16384))
+        )
+        if use_async and use_register_candidate:
+            for (
+                block_m,
+                block_n,
+                block_k,
+                group_m,
+                num_warps,
+                waves_per_eu,
+            ) in self.SHORT_K_REGISTER_CONFIGS:
+                triton_config = self.triton_config(
+                    2,
+                    num_warps,
+                    BLOCK_M=block_m,
+                    BLOCK_N=block_n,
+                    BLOCK_K=block_k,
+                    GROUP_M=group_m,
+                    NUM_BUFFERS=1,
+                    NUM_XCDS=1,
+                    SPLIT_K=1,
+                    USE_ASYNC=False,
+                    matrix_instr_nonkdim=16,
+                    waves_per_eu=waves_per_eu,
+                    kpack=1,
+                )
+                yield self._convert_config_to_template_kwargs(
+                    triton_config, m, n, k, out_dtype
+                )
+        if use_async and sizevars.statically_known_true(sympy.Eq(k, 256)):
+            for (
+                block_m,
+                block_n,
+                block_k,
+                group_m,
+                num_warps,
+                num_buffers,
+            ) in self.KPACK2_CONFIGS:
+                triton_config = self.triton_config(
+                    1,
+                    num_warps,
+                    BLOCK_M=block_m,
+                    BLOCK_N=block_n,
+                    BLOCK_K=block_k,
+                    GROUP_M=group_m,
+                    NUM_BUFFERS=num_buffers,
+                    NUM_XCDS=num_xcds,
+                    SPLIT_K=1,
+                    USE_ASYNC=True,
+                    matrix_instr_nonkdim=16,
+                    waves_per_eu=0,
+                    kpack=2,
                 )
                 yield self._convert_config_to_template_kwargs(
                     triton_config, m, n, k, out_dtype
@@ -1489,6 +1573,9 @@ class ROCmAddMMPersistentWarpPipeTemplateConfigHeuristic(
         for template_kwargs in super()._get_template_configs_impl(
             kernel_inputs, op_name
         ):
+            # The persistent body only implements the direct-to-LDS path.
+            if not template_kwargs.get("USE_ASYNC", False):
+                continue
             # The persistent template has NO split-K body -- it never peels split_id and
             # never writes split_k_ws; it stores straight through store_output. But
             # SPLIT_K > 1 alone makes _tlx_tt_generate allocate the UNINITIALIZED
