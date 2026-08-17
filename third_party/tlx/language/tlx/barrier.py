@@ -227,3 +227,40 @@ def amd_sched_barrier(mask: tl.constexpr = 0, _semantic=None):
     assert isinstance(mask, int), f"mask must be a constexpr integer, got {type(mask).__name__}"
     assert 0 <= mask <= 0xFFF, f"mask must use only AMD scheduling-class bits 0..11, got {mask:#x}"
     _semantic.builder.create_amd_sched_barrier(mask)
+
+
+# Reserved sentinel masks that tag an LLIR-scheduler region boundary. They ride
+# on rocdl.sched.barrier (a recognizable, valid op that survives IR opt) but are
+# NOT real machine-scheduler fences: the native LLIR scheduler
+# (python/src/LlirSchedule.cpp, gated by TRITON_ENABLE_LLIR_SCHED) recognizes
+# them, schedules only the enclosed span, leaves everything outside untouched,
+# and deletes the markers before codegen.
+#
+# These must be VALID ROCDL SchedGroupMask bit combinations (<= all = 4095): as of
+# LLVM 850a2b1b the rocdl.sched.barrier mask is a typed SchedGroupMaskAttr, and an
+# out-of-range sentinel (we used to use 0x40000001) fails op verification with
+# "requires attribute 'mask'". transcendental|ldsdma (+ds_write) is never emitted by
+# any other path -- Triton only emits none(0), and BlockPingpong uses 1/4/8. Being
+# in range also means that if the LLIR pass is disabled the markers degrade to a
+# harmless real sched_barrier instead of tripping the backend's bitmask assert.
+_LLIR_SCHED_REGION_BEGIN_MASK: tl.constexpr = 0xc00
+_LLIR_SCHED_REGION_END_MASK: tl.constexpr = 0xe00
+
+
+@tl.builtin
+def sched_region_begin(_semantic=None) -> None:
+    """Mark the START of a region for the native LLIR scheduler
+    (TRITON_ENABLE_LLIR_SCHED). The scheduler reorders/interleaves only the span
+    between a begin/end pair and leaves code outside untouched; the markers are
+    removed before codegen (no residual fence)."""
+    if not is_hip():
+        raise NotImplementedError("tlx.sched_region_begin is AMD (HIP) only")
+    _semantic.builder.create_amd_sched_barrier(_LLIR_SCHED_REGION_BEGIN_MASK)
+
+
+@tl.builtin
+def sched_region_end(_semantic=None) -> None:
+    """Mark the END of a native LLIR-scheduler region (see sched_region_begin)."""
+    if not is_hip():
+        raise NotImplementedError("tlx.sched_region_end is AMD (HIP) only")
+    _semantic.builder.create_amd_sched_barrier(_LLIR_SCHED_REGION_END_MASK)
