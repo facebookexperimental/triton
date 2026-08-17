@@ -151,6 +151,18 @@ class TLXInductorChoices(InductorChoices):
         sparse_q_block_size: int,
         sparse_kv_block_size: int,
     ) -> list[Any]:
+        if config.triton.tlx_mode == "default":
+            return super().append_flex_attention_choices(
+                choices,
+                configs,
+                input_nodes,
+                subgraphs,
+                layout,
+                kernel_options,
+                sparse_q_block_size,
+                sparse_kv_block_size,
+            )
+
         from .flex_attention_templates import (
             append_tlx_flex_attention_choice,
         )
