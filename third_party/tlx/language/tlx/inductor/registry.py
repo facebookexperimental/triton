@@ -1159,6 +1159,20 @@ class ROCmAddMMWarpPipeTemplateConfigHeuristic(
     # (128x256x64,NB3) = 144KB fits gfx950's 160KB (occupancy 1); it is the deeper-
     # prefetch tile that won the standalone split-K sweep on low-occupancy large-K
     # (e.g. 1024x6144x22272 at SK=4), which the NB=2 variant alone could not reach.
+    # The block below closes three systematic holes in the pool above: no BLOCK_M=256,
+    # no BLOCK_N < 64, and no BLOCK_K=256. Measured across three ads merge nets
+    # (AF OC 200x 1116908456_0, HI OC 700x 1080674750_16, HI IG CTR 1087773826_1723),
+    # stock triton_mm beats the best TLX addmm candidate on 129 shapes -- and on 103 of
+    # them the winning stock tile is one this pool cannot express. Narrow-N shapes are
+    # the clearest case: N=48/128/256 outputs want BLOCK_N 16-64, and the smallest tile
+    # here is 64x64. Each entry's GROUP_M/num_warps is the config stock Triton actually
+    # won that tile with (modal value over those 103 shapes), not a guess.
+    # LDS at fp16, (BM*BK + BN*BK) * 2 bytes * NUM_BUFFERS, gfx950 limit 160KB:
+    # 256x256x64 NB2 = 128KB (fits; NB3 = 192KB does not, hence NB2 only),
+    # 64x64x256 NB2 = 128KB, 256x128x32 NB2 = 48KB, the rest <= 40KB.
+    # Two measured winners are deliberately left out: (16,16,256) and (32,16,256) won
+    # with num_warps 1 and 2, and the warp-pipeline splits "mfma"/"mem" stages by
+    # priority within the warp set, which is not meaningful below 4 warps.
     WARPPIPE_CONFIGS = [
         (64, 64, 128, 8, 8, 3),
         (64, 64, 64, 8, 8, 3),
@@ -1167,6 +1181,21 @@ class ROCmAddMMWarpPipeTemplateConfigHeuristic(
         (128, 256, 64, 8, 8, 2),
         (128, 256, 64, 8, 8, 3),
         (128, 256, 32, 8, 8, 3),
+        # BLOCK_M=256 (16 + 11 measured stock wins)
+        (256, 256, 64, 4, 8, 2),
+        (256, 128, 32, 4, 4, 2),
+        # BLOCK_N < 64 -- narrow-N outputs (11 + 3)
+        (64, 16, 128, 8, 4, 2),
+        (64, 16, 256, 4, 4, 2),
+        # BLOCK_K=256 -- deep-K (8); needs K > NUM_BUFFERS*BLOCK_K, guarded above
+        (64, 64, 256, 4, 8, 2),
+        # BLOCK_K=32 / BLOCK_N=64 gaps at BM=128 (8 + 7 + 3)
+        (128, 128, 32, 16, 4, 2),
+        (128, 64, 64, 16, 4, 2),
+        (128, 64, 128, 4, 8, 2),
+        # small-M tiles (6 + 3)
+        (32, 32, 128, 8, 4, 2),
+        (32, 64, 64, 8, 4, 2),
     ]
 
     def adjust_kernel_inputs(
