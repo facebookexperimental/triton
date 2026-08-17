@@ -40,6 +40,14 @@ specialize_arg(PyObject *backend, PyObject *arg, bool is_const,
 
 static bool init_called = false;
 
+static bool is_python_finalizing() {
+#if PY_VERSION_HEX >= 0x030D0000
+  return Py_IsFinalizing() != 0;
+#else
+  return _Py_IsFinalizing() != 0;
+#endif
+}
+
 // --- dispatch/cache stats (opt-in via TRITON_CACHE_STATS=1) ------------------
 // Counts hit vs fallback per dispatch path, per kernel, so owners can find
 // kernels that silently miss the C fast path once the flags are on by default.
@@ -1118,6 +1126,9 @@ static int fc_get_tensor_specialization(PyObject *arg, uint64_t threshold,
 }
 
 static void fc_capsule_destructor(PyObject *capsule) {
+  // Cached Python objects may already be partially finalized at process exit.
+  if (is_python_finalizing())
+    return;
   FastCache *c = (FastCache *)PyCapsule_GetPointer(capsule, "FastCache");
   if (c)
     delete c;
