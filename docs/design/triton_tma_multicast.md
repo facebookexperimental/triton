@@ -234,39 +234,41 @@ tile expressions between CTA ranks.
 
 The implementation flows through the compiler as follows:
 
-1. The Python frontend records a load-local `tt.multicast` boolean when
-   `TensorDescriptor.load(..., multicast=...)` overrides the kernel policy. The
-   NVIDIA backend records the kernel default as `ttg.multicast` and the exact
-   physical cluster shape through `ctas_per_cga` module attributes.
+1. The Python frontend resolves each
+   `TensorDescriptor.load(..., multicast=...)` policy against the selected
+   kernel configuration and records the ODS-declared `multicast` boolean on
+   `tt.descriptor_load`. Every descriptor load therefore has a complete `true`
+   or `false` policy in IR. The planner reads the exact physical shape from the
+   existing cluster dimension attributes.
 2. `TritonNvidiaGPUTMAMulticastPass`, implemented in
    `lib/Dialect/TritonNvidiaGPU/Transforms/TMAMulticast.cpp`, runs after
    descriptor-encoding optimization. For each enabled `tt.descriptor_load`, it
-   computes program-ID dependencies and records the proven broadcast axes in
-   the internal `tt.multicast_axes` attribute.
-3. TMA lowering and software-pipelining preserve that attribute, allocate one
-   completion barrier slot per recipient group, and insert cluster barriers
+   reads the ODS-declared policy, computes program-ID dependencies, and records
+   the proven broadcast axes in the internal `tt.multicast_axes` attribute.
+   The load retains its `multicast` policy and carries `tt.multicast_axes`
+   only when the planner proves a valid multicast plan.
+3. TMA lowering and software-pipelining preserve that attribute, allocate a
+   local completion barrier in every recipient CTA, and insert cluster barriers
    around the multicast transaction. Loads with different broadcast axes are
-   kept in different pipeline groups. Native `tl.range(...,
-   warp_specialize=True)` lowering carries the same plan through its load
-   partitions.
-4. NVIDIA LLVM lowering derives a rank-dependent 16-bit recipient mask from the
-   cluster shape and broadcast axes. Only the lowest-ranked CTA in each group
-   issues `cp.async.bulk.tensor...multicast::cluster` and waits on the
-   corresponding cluster-visible completion barrier; the following cluster
-   barrier releases the other recipients.
+   kept in different pipeline groups. Native and Meta warp-specialized lowering
+   carry the same plan through their load partitions and memory channels.
+4. TMA lowering derives a rank-dependent recipient mask from the cluster shape
+   and broadcast axes, stores it in `multicastTargets`, and predicates the copy
+   on the lowest-ranked CTA in each group. The elected CTA issues
+   `cp.async.bulk.tensor...multicast::cluster`; hardware completes the
+   corresponding local barrier in every target CTA. Each recipient waits on
+   its local barrier before the following cluster rendezvous.
 
 The planner accepts only tiled `tt.descriptor_load` operations, an exact
-power-of-two `ctas_per_cga` shape containing 2 to 16 CTAs, and index/control-flow
-expressions whose program-ID dependencies it can prove. It conservatively
-rejects memory-derived or atomic tile IDs, CLC operations, divergent surrounding
-control flow, unsupported expression kinds, and Meta AutoWS (`ttg.use-meta-ws`).
-CLC and dynamic-persistent schedules are unsupported because their regular
-Triton schedulers do not yet support multi-CTA execution. When those schedulers
-gain multi-CTA support, the multicast analysis must be extended to understand
-their cluster-level work assignment and prove which per-CTA tiles remain shared.
-It currently selects every proven broadcast axis and has no cost model or
-user-facing optimization remarks. Selection can be inspected in TTGIR through
-`tt.multicast_axes` and in PTX through `.multicast::cluster`.
+power-of-two physical cluster shape containing 2 to 16 CTAs, and index/control-flow
+expressions whose program-ID dependencies it can prove. It understands CLC
+schedule results and cluster-uniform `scf.for`/`scf.while` control flow, and it
+preserves plans through Meta AutoWS channels. It conservatively rejects
+memory-derived or atomic tile IDs, cluster-divergent control flow, and
+unsupported expression kinds. It currently selects every proven broadcast axis
+and has no cost model or user-facing optimization remarks. Selection can be
+inspected in TTGIR through `tt.multicast_axes`, on lowered TMA operations through
+`multicastTargets`, and in PTX through `.multicast::cluster`.
 
 The internal attribute is a compiler contract, not a user API. Standard Triton
 users grant permission through the kernel option or load override; they do not

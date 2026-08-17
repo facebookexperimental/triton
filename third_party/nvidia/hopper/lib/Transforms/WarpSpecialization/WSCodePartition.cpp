@@ -19,6 +19,7 @@
 #include "nvidia/hopper/include/Transforms/Passes.h"
 #include "nvidia/include/Dialect/NVWS/IR/Dialect.h"
 #include "triton/Analysis/Utility.h"
+#include "triton/Dialect/Triton/IR/TMAMulticast.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/Partition.h"
@@ -707,7 +708,8 @@ getTaskTopRegion(triton::FuncOp funcOp,
 namespace {
 
 Value createBarrierAlloc(triton::FuncOp funcOp, unsigned distance,
-                         StringRef srcName = "", unsigned arriveCount = 1) {
+                         StringRef srcName = "", unsigned arriveCount = 1,
+                                ttg::CGAEncodingAttr cgaLayout = {}) {
   OpBuilder builder(funcOp);
   builder.setInsertionPointToStart(&(funcOp.getBody().front()));
   Attribute sharedMemorySpace =
@@ -717,16 +719,20 @@ Value createBarrierAlloc(triton::FuncOp funcOp, unsigned distance,
   if (!srcName.empty())
     loc = NameLoc::get(StringAttr::get(context, srcName), loc);
   auto numCTAs = triton::gpu::lookupNumCTAs(funcOp);
-  auto barrierCGALayout = ttg::CGAEncodingAttr::get1DLayout(context, numCTAs);
+  auto barrierCGALayout =
+      cgaLayout ? cgaLayout
+                : ttg::CGAEncodingAttr::get1DLayout(context, numCTAs);
+  auto numBarrierSlots = product(barrierCGALayout.getCTASplitNum());
   auto barrierEncoding = ttg::SwizzledSharedEncodingAttr::get(
       context, 1, 1, 1, {0}, barrierCGALayout);
   Type barrierMemDescType =
-      ttg::MemDescType::get({distance, numCTAs}, builder.getI64Type(),
+      ttg::MemDescType::get({distance, numBarrierSlots}, builder.getI64Type(),
                             barrierEncoding, sharedMemorySpace,
                             /*mutableMemory=*/true);
   Type singleBarrierMemDescType =
-      ttg::MemDescType::get({numCTAs}, builder.getI64Type(), barrierEncoding,
-                            sharedMemorySpace, /*mutableMemory=*/true);
+      ttg::MemDescType::get({numBarrierSlots}, builder.getI64Type(),
+                            barrierEncoding, sharedMemorySpace,
+                            /*mutableMemory=*/true);
   Value barrierAlloc = mlir::triton::gpu::LocalAllocOp::create(
       builder, loc, barrierMemDescType, Value());
   barrierAlloc.getDefiningOp()->setAttr(kWarpSpecializeGeneratedBarrierAttrName,
@@ -1081,29 +1087,65 @@ void createToken(
     CommChannel commChannel;
     auto producerOp = it->second.front()->getSrcOp();
     auto dstOp = it->second.front()->getDstOp();
+    SmallVector<Channel *> channelsForComm;
+    if (reuseGrp >= 0) {
+      auto *group = config->getGroup(reuseGrp);
+      channelsForComm.append(group->channels.begin(), group->channels.end());
+    } else {
+      channelsForComm.push_back(channel);
+    }
 
     // Pre-allocate TMA barrier if any channel in the group has a TMA producer.
     // Also check all channels in the reuse group, not just the consumer group.
-    bool hasTMAProducer = false;
+    SetVector<Operation *> tmaProducerOps;
+    auto collectTMAProducer = [&](Channel *candidate) {
+      if (Operation *load = findTMAProducer(candidate))
+        tmaProducerOps.insert(load);
+    };
     // First check channels grouped by consumer
-    for (auto *c : it->second) {
-      if (findTMAProducer(c)) {
-        hasTMAProducer = true;
-        break;
-      }
-    }
+    for (auto *c : it->second)
+      collectTMAProducer(c);
     // Also check all channels in the reuse group (if applicable)
-    if (!hasTMAProducer && reuseGrp >= 0) {
-      for (auto *c : config->getGroup(reuseGrp)->channels) {
-        if (findTMAProducer(c)) {
-          hasTMAProducer = true;
-          break;
+    if (reuseGrp >= 0)
+      for (auto *c : config->getGroup(reuseGrp)->channels)
+        collectTMAProducer(c);
+    SmallVector<ttnvws::DescriptorLoadOp> tmaProducers =
+        llvm::map_to_vector(tmaProducerOps, [](Operation *load) {
+          return cast<ttnvws::DescriptorLoadOp>(load);
+        });
+    Attribute multicastAxes;
+    if (!tmaProducers.empty()) {
+      multicastAxes =
+          tmaProducers.front()->getAttr(tt::kMulticastAxesAttrName);
+      bool compatible = llvm::all_of(tmaProducers, [&](auto load) {
+        return load->getAttr(tt::kMulticastAxesAttrName) == multicastAxes;
+      });
+      if (!compatible) {
+        for (auto load : tmaProducers)
+          load->removeAttr(tt::kMulticastAxesAttrName);
+        multicastAxes = {};
+      }
+      commChannel.producerBarrier =
+          createBarrierAlloc(funcOp, channel->getNumBuffers(), channel->srcName);
+      if (multicastAxes) {
+        auto dims = ttg::TritonGPUDialect::getClusterDims(
+            tmaProducers.front()->getParentOfType<ModuleOp>());
+        unsigned clusterSize = product(dims);
+        auto identityLayout = getTMAMulticastBarrierLayout(
+            tmaProducers.front(),
+            DenseI32ArrayAttr::get(funcOp.getContext(), {}));
+        commChannel.multicastReuseBarrier = createBarrierAlloc(
+            funcOp, channel->getNumBuffers(), channel->srcName, clusterSize,
+            identityLayout);
+        for (Channel *commSourceChannel : channelsForComm) {
+          for (int taskId : commSourceChannel->relation.second) {
+            if (!commChannel.multicastReadyBarriers.count(taskId))
+              commChannel.multicastReadyBarriers[taskId] = createBarrierAlloc(
+                  funcOp, channel->getNumBuffers(), channel->srcName,
+                  clusterSize, identityLayout);
+          }
         }
       }
-    }
-    if (hasTMAProducer) {
-      commChannel.producerBarrier = createBarrierAlloc(
-          funcOp, channel->getNumBuffers(), channel->srcName);
     }
     // If channel is from an MMAv5 op, pre-allocate the inline barrier used by
     // its commit path.
@@ -1113,14 +1155,6 @@ void createToken(
           funcOp, channel->getNumBuffers(), channel->srcName);
       hasProdBar = true;
     }
-    SmallVector<Channel *> channelsForComm;
-    if (reuseGrp >= 0) {
-      auto *group = config->getGroup(reuseGrp);
-      channelsForComm.append(group->channels.begin(), group->channels.end());
-    } else {
-      channelsForComm.push_back(channel);
-    }
-
     // Check if the channel group needs token-based synchronization.
     // Reuse groups share one CommChannel, so this must consider every channel
     // in the group. Otherwise the representative channel can drop consumer task
@@ -4438,6 +4472,8 @@ void insertAsyncComm(
               WSBarrierAttr::kDirectionForward)
               .build(funcOp.getContext());
       optimizeTMALoads(builder, tmaLoads, *commChannel.producerBarrier,
+                       commChannel.multicastReuseBarrier.value_or(Value()),
+                       commChannel.multicastReadyBarriers,
                        bufferIdx, bufferIdx, phase, tmaHeadProducer,
                        headConsumer, consumerWaitPoint,
                        additionalConsumerTaskIds, waitConstraints);
