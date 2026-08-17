@@ -1,4 +1,5 @@
-// RUN: triton-opt %s  -split-input-file --convert-triton-amdgpu-to-llvm="gfx-arch=gfx950" | FileCheck %s
+// RUN: triton-opt %s -split-input-file --convert-triton-amdgpu-to-llvm="gfx-arch=gfx950" | FileCheck %s
+// RUN: triton-opt %s -split-input-file --cse | FileCheck %s --check-prefix=CSE
 
 // CHECK-LABEL:mfma_16x16x32_f16
 
@@ -187,5 +188,161 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.thr
         : tensor<16x16xf32, #scheduled_mma>,
           tensor<32x16xbf16, #scheduled_rhs>
     tt.return
+  }
+}
+
+// -----
+
+// CHECK-LABEL: llvm.func @scheduled_mfma_kwidth4
+// CHECK: rocdl.mfma.f32.16x16x32.bf16
+// CHECK: llvm.inline_asm has_side_effects
+// CHECK-SAME: "s_nop 5"
+// CHECK-NOT: amdg.
+
+#scheduled_k4_mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [1, 1], instrShape = [16, 16, 32], isTransposed = true}>
+#scheduled_k4_lhs = #ttg.dot_op<{opIdx = 0, parent = #scheduled_k4_mma, kWidth = 4}>
+#scheduled_k4_rhs = #ttg.dot_op<{opIdx = 1, parent = #scheduled_k4_mma, kWidth = 4}>
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 64 : i32} {
+  tt.func public @scheduled_mfma_kwidth4(
+      %a: tensor<16x32xbf16, #scheduled_k4_lhs>,
+      %b: tensor<32x16xbf16, #scheduled_k4_rhs>) {
+    %acc = arith.constant dense<0.000000e+00> :
+        tensor<16x16xf32, #scheduled_k4_mma>
+    %result = amdg.scheduled_mfma %a, %b, %acc
+        resident "none" accumulator "transient"
+        register_class "auto" initialize true
+        : tensor<16x32xbf16, #scheduled_k4_lhs>,
+          tensor<32x16xbf16, #scheduled_k4_rhs>,
+          tensor<16x16xf32, #scheduled_k4_mma>
+          -> tensor<16x16xf32, #scheduled_k4_mma>
+    %committed, %preserved = amdg.mfma_commit %result, %b
+        : tensor<16x16xf32, #scheduled_k4_mma>,
+          tensor<32x16xbf16, #scheduled_k4_rhs>
+    tt.return
+  }
+}
+
+// -----
+
+// CHECK-LABEL: llvm.func @scheduled_mfma_32x32_kwidth4
+// CHECK: rocdl.mfma.f32.32x32x16.bf16
+// CHECK: llvm.inline_asm has_side_effects
+// CHECK-SAME: "s_nop 5"
+// CHECK-NOT: amdg.
+
+#scheduled_32_k4_mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [1, 1], instrShape = [32, 32, 16], isTransposed = true}>
+#scheduled_32_k4_lhs = #ttg.dot_op<{opIdx = 0, parent = #scheduled_32_k4_mma, kWidth = 4}>
+#scheduled_32_k4_rhs = #ttg.dot_op<{opIdx = 1, parent = #scheduled_32_k4_mma, kWidth = 4}>
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 64 : i32} {
+  tt.func public @scheduled_mfma_32x32_kwidth4(
+      %a: tensor<32x16xbf16, #scheduled_32_k4_lhs>,
+      %b: tensor<16x32xbf16, #scheduled_32_k4_rhs>) {
+    %acc = arith.constant dense<0.000000e+00> :
+        tensor<32x32xf32, #scheduled_32_k4_mma>
+    %result = amdg.scheduled_mfma %a, %b, %acc
+        resident "none" accumulator "transient"
+        register_class "auto" initialize true
+        : tensor<32x16xbf16, #scheduled_32_k4_lhs>,
+          tensor<16x32xbf16, #scheduled_32_k4_rhs>,
+          tensor<32x32xf32, #scheduled_32_k4_mma>
+          -> tensor<32x32xf32, #scheduled_32_k4_mma>
+    %committed, %preserved = amdg.mfma_commit %result, %b
+        : tensor<32x32xf32, #scheduled_32_k4_mma>,
+          tensor<16x32xbf16, #scheduled_32_k4_rhs>
+    tt.return
+  }
+}
+
+// -----
+
+// K-major lowering initializes every independent output fragment before
+// returning to any accumulator chain for the second native K slice.
+// CHECK-LABEL: llvm.func @scheduled_mfma_round_robin_k
+// CHECK-COUNT-4: llvm.inline_asm has_side_effects{{.*}}"v_mfma_f32_16x16x32_bf16 $0, $1, $2, 0"
+// CHECK-COUNT-4: llvm.inline_asm has_side_effects{{.*}}"v_mfma_f32_16x16x32_bf16 $0, $1, $2, $0"
+// CHECK-NOT: amdg.
+
+#round_robin_mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [1, 1], instrShape = [16, 16, 32], isTransposed = true}>
+#round_robin_lhs = #ttg.dot_op<{opIdx = 0, parent = #round_robin_mma, kWidth = 8}>
+#round_robin_rhs = #ttg.dot_op<{opIdx = 1, parent = #round_robin_mma, kWidth = 8}>
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 64 : i32} {
+  tt.func public @scheduled_mfma_round_robin_k(
+      %a: tensor<32x64xbf16, #round_robin_lhs>,
+      %b: tensor<64x32xbf16, #round_robin_rhs>) {
+    %acc = arith.constant dense<0.000000e+00> :
+        tensor<32x32xf32, #round_robin_mma>
+    %result = amdg.scheduled_mfma %a, %b, %acc
+        resident "none" accumulator "persistent"
+        register_class "agpr" initialize true
+        : tensor<32x64xbf16, #round_robin_lhs>,
+          tensor<64x32xbf16, #round_robin_rhs>,
+          tensor<32x32xf32, #round_robin_mma>
+          -> tensor<32x32xf32, #round_robin_mma>
+    tt.return
+  }
+}
+
+// -----
+
+// CHECK-LABEL: llvm.func @register_handoff_vgpr_groups
+// CSE-LABEL: tt.func public @register_handoff_vgpr_groups
+// CSE-COUNT-2: amdg.register_handoff
+// CHECK: llvm.inline_asm
+// CHECK-SAME: "=v,=v,0,1"
+// CHECK: llvm.inline_asm
+// CHECK-SAME: "=v,=v,0,1"
+// CHECK: llvm.inline_asm
+// CHECK-SAME: "=v,=v,0,1"
+// CHECK: llvm.inline_asm
+// CHECK-SAME: "=v,=v,0,1"
+// CHECK-NOT: amdg.register_handoff
+
+#handoff_fp32 = #ttg.blocked<{sizePerThread = [4], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 64 : i32} {
+  tt.func public @register_handoff_vgpr_groups(
+      %arg: tensor<256xf32, #handoff_fp32>) -> tensor<256xf32, #handoff_fp32> {
+    %result = amdg.register_handoff %arg class "vgpr" groups 2
+        : tensor<256xf32, #handoff_fp32>
+    %independent = amdg.register_handoff %arg class "vgpr" groups 2
+        : tensor<256xf32, #handoff_fp32>
+    %sum = arith.addf %result, %independent : tensor<256xf32, #handoff_fp32>
+    tt.return %sum : tensor<256xf32, #handoff_fp32>
+  }
+}
+
+// -----
+
+// CHECK-LABEL: llvm.func @register_handoff_vgpr_wide_group
+// CHECK: llvm.inline_asm
+// CHECK-SAME: "=v,=v,=v,=v,0,1,2,3"
+// CHECK-NOT: amdg.register_handoff
+
+#handoff_fp32_wide = #ttg.blocked<{sizePerThread = [4], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 64 : i32} {
+  tt.func public @register_handoff_vgpr_wide_group(
+      %arg: tensor<256xf32, #handoff_fp32_wide>) -> tensor<256xf32, #handoff_fp32_wide> {
+    %result = amdg.register_handoff %arg class "vgpr" groups 4
+        : tensor<256xf32, #handoff_fp32_wide>
+    tt.return %result : tensor<256xf32, #handoff_fp32_wide>
+  }
+}
+
+// -----
+
+// CHECK-LABEL: llvm.func @register_handoff_packs_fp16_registers
+// CHECK: llvm.inline_asm
+// CHECK-SAME: "=a,=a,0,1"
+// CHECK-NOT: amdg.register_handoff
+
+#handoff_fp16 = #ttg.blocked<{sizePerThread = [4], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 64 : i32} {
+  tt.func public @register_handoff_packs_fp16_registers(
+      %arg: tensor<256xf16, #handoff_fp16>) -> tensor<256xf16, #handoff_fp16> {
+    %result = amdg.register_handoff %arg class "agpr" groups 2
+        : tensor<256xf16, #handoff_fp16>
+    tt.return %result : tensor<256xf16, #handoff_fp16>
   }
 }

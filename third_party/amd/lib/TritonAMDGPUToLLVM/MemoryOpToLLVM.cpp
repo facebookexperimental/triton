@@ -745,7 +745,7 @@ packMfmaDotOperandFragments(Value value, RankedTensorType tensorTy,
           ? dyn_cast<triton::gpu::AMDMfmaEncodingAttr>(dotEncoding.getParent())
           : triton::gpu::AMDMfmaEncodingAttr();
   if (!mfmaEncoding || dotEncoding.getOpIdx() != opIdx ||
-      dotEncoding.getKWidth() != 8)
+      !llvm::is_contained({4u, 8u}, dotEncoding.getKWidth()))
     return failure();
 
   SmallVector<int64_t> rep = mfmaEncoding.getRepForOperand(
@@ -953,6 +953,99 @@ public:
       for (unsigned index = 0; index < elementsPerGroup; ++index)
         constrainedElements.push_back(
             b.extract_element(elemTy, restored, b.i32_val(index)));
+    }
+
+    Value result = packTensorElements(loc, typeConverter, constrainedElements,
+                                      rewriter, op.getResult().getType());
+    rewriter.replaceOp(op, result);
+    return success();
+  }
+};
+
+class RegisterHandoffOpConversion
+    : public ConvertOpToLLVMPattern<triton::amdgpu::RegisterHandoffOp> {
+public:
+  using ConvertOpToLLVMPattern<
+      triton::amdgpu::RegisterHandoffOp>::ConvertOpToLLVMPattern;
+  using OpAdaptor = triton::amdgpu::RegisterHandoffOp::Adaptor;
+
+  LogicalResult
+  matchAndRewrite(triton::amdgpu::RegisterHandoffOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    auto *ctx = rewriter.getContext();
+    auto typeConverter = getTypeConverter();
+    auto tensorTy = cast<RankedTensorType>(op.getInput().getType());
+    Type elemTy = typeConverter->convertType(tensorTy.getElementType());
+    unsigned bitWidth = getIntOrFloatOrPtrBitWidth(elemTy);
+    unsigned registersPerGroup = op.getRegistersPerGroup();
+    unsigned elementsPerRegister = 32 / bitWidth;
+    unsigned elementsPerGroup = registersPerGroup * elementsPerRegister;
+    SmallVector<Value> elements =
+        unpackTensorElements(loc, adaptor.getInput(), rewriter, tensorTy);
+    if (elements.empty() || elements.size() % elementsPerGroup != 0)
+      return rewriter.notifyMatchFailure(
+          op, "native tuple does not divide the per-thread elements");
+
+    StringRef outputConstraint = op.getRegisterClass() == "agpr" ? "=a" : "=v";
+    auto asmDialect = LLVM::AsmDialectAttr::get(ctx, LLVM::AsmDialect::AD_ATT);
+    auto operandAttrs = ArrayAttr::get(ctx, {});
+    Type registerTy = elementsPerRegister == 1
+                          ? elemTy
+                          : Type(vec_ty(elemTy, elementsPerRegister));
+    Type asmResultTy = registerTy;
+    if (registersPerGroup != 1)
+      asmResultTy = LLVM::LLVMStructType::getLiteral(
+          ctx, SmallVector<Type>(registersPerGroup, registerTy));
+    TritonLLVMOpBuilder b(loc, rewriter);
+    SmallVector<Value> constrainedElements;
+    constrainedElements.reserve(elements.size());
+
+    std::string constraints;
+    for (unsigned index = 0; index < registersPerGroup; ++index) {
+      if (!constraints.empty())
+        constraints += ",";
+      constraints += outputConstraint;
+    }
+    for (unsigned index = 0; index < registersPerGroup; ++index)
+      constraints += "," + std::to_string(index);
+
+    for (unsigned begin = 0; begin < elements.size();
+         begin += elementsPerGroup) {
+      SmallVector<Value> registerValues;
+      registerValues.reserve(registersPerGroup);
+      for (unsigned reg = 0; reg < registersPerGroup; ++reg) {
+        unsigned elementBegin = begin + reg * elementsPerRegister;
+        if (elementsPerRegister == 1) {
+          registerValues.push_back(elements[elementBegin]);
+          continue;
+        }
+        Value packed = b.undef(registerTy);
+        for (unsigned index = 0; index < elementsPerRegister; ++index)
+          packed = b.insert_element(registerTy, packed,
+                                    elements[elementBegin + index],
+                                    b.i32_val(index));
+        registerValues.push_back(packed);
+      }
+
+      Value asmResult = LLVM::InlineAsmOp::create(
+                            rewriter, loc, asmResultTy, registerValues,
+                            /*asm_string=*/"", constraints,
+                            /*has_side_effects=*/true,
+                            /*is_align_stack=*/false, LLVM::TailCallKind::None,
+                            asmDialect, operandAttrs)
+                            .getRes();
+      for (unsigned reg = 0; reg < registersPerGroup; ++reg) {
+        Value constrained =
+            registersPerGroup == 1 ? asmResult : b.extract_val(asmResult, reg);
+        if (elementsPerRegister == 1) {
+          constrainedElements.push_back(constrained);
+          continue;
+        }
+        for (unsigned index = 0; index < elementsPerRegister; ++index)
+          constrainedElements.push_back(
+              b.extract_element(elemTy, constrained, b.i32_val(index)));
+      }
     }
 
     Value result = packTensorElements(loc, typeConverter, constrainedElements,
@@ -1242,16 +1335,19 @@ public:
                          : ROCDL::mfma_f32_16x16x32_bf16::getOperationName());
     bool useLatencyAwareIntrinsic = op.getAccumulatorRole() == "transient";
 
-    SmallVector<Value> updatedFragments(numRepM * numRepN);
+    SmallVector<Value> updatedFragments = accumulatorFragments;
     // Keep one SSA chain per output fragment while making source order
-    // explicit across the grid. Native intrinsics expose transient chains to
-    // AMDGPU's MFMA hazard recognizer and machine scheduler. Direct inline
-    // assembly preserves the requested register class for persistent chains.
-    for (int64_t n = 0; n < numRepN; ++n) {
-      for (int64_t m = 0; m < numRepM; ++m) {
-        int64_t accumulatorIndex = m * numRepN + n;
-        Value current = accumulatorFragments[accumulatorIndex];
-        for (int64_t k = 0; k < numRepK; ++k) {
+    // explicit across the grid. Round-robin the K slices over independent
+    // output fragments so persistent inline-assembly chains expose enough
+    // distance between dependent MFMAs. Native intrinsics expose transient
+    // chains to AMDGPU's MFMA hazard recognizer and machine scheduler. Direct
+    // inline assembly preserves the requested register class for persistent
+    // chains.
+    for (int64_t k = 0; k < numRepK; ++k) {
+      for (int64_t n = 0; n < numRepN; ++n) {
+        for (int64_t m = 0; m < numRepM; ++m) {
+          int64_t accumulatorIndex = m * numRepN + n;
+          Value current = updatedFragments[accumulatorIndex];
           Value operandA = (*maybeA)[m * numRepK + k];
           Value operandB = (*maybeB)[n * numRepK + k];
           // The MFMA inline asm below already constrains ordinary operands to
@@ -1287,27 +1383,26 @@ public:
             loweredOp.addAttribute("abid", rewriter.getI32IntegerAttr(0));
             loweredOp.addAttribute("blgp", rewriter.getI32IntegerAttr(0));
             current = rewriter.create(loweredOp)->getResult(0);
-            continue;
+          } else {
+            std::string constraints = outputConstraint.str();
+            constraints += "," + inputConstraint(aRegisterClass).str();
+            constraints += "," + inputConstraint(bRegisterClass).str();
+            SmallVector<Value> asmOperands{operandA, operandB};
+            if (!zeroThisInstruction) {
+              asmOperands.push_back(current);
+              constraints += ",0";
+            }
+            std::string mfmaAsm = mfmaAsmPrefix;
+            mfmaAsm += zeroThisInstruction ? "0" : "$0";
+            auto inlineAsm = LLVM::InlineAsmOp::create(
+                rewriter, loc, fragmentTy, asmOperands, mfmaAsm, constraints,
+                /*has_side_effects=*/true,
+                /*is_align_stack=*/false, LLVM::TailCallKind::None, asmDialect,
+                operandAttrs);
+            current = inlineAsm->getResult(0);
           }
-
-          std::string constraints = outputConstraint.str();
-          constraints += "," + inputConstraint(aRegisterClass).str();
-          constraints += "," + inputConstraint(bRegisterClass).str();
-          SmallVector<Value> asmOperands{operandA, operandB};
-          if (!zeroThisInstruction) {
-            asmOperands.push_back(current);
-            constraints += ",0";
-          }
-          std::string mfmaAsm = mfmaAsmPrefix;
-          mfmaAsm += zeroThisInstruction ? "0" : "$0";
-          auto inlineAsm = LLVM::InlineAsmOp::create(
-              rewriter, loc, fragmentTy, asmOperands, mfmaAsm, constraints,
-              /*has_side_effects=*/true,
-              /*is_align_stack=*/false, LLVM::TailCallKind::None, asmDialect,
-              operandAttrs);
-          current = inlineAsm->getResult(0);
+          updatedFragments[accumulatorIndex] = current;
         }
-        updatedFragments[accumulatorIndex] = current;
       }
     }
 
@@ -1519,7 +1614,8 @@ void mlir::triton::AMD::populateMemoryOpToLLVMPatterns(
                                                   benefit.getBenefit() + 1);
   patterns.add<RematerializedRangeOpConversion>(typeConverter, targetInfo,
                                                 transBenefit);
-  patterns.add<RegisterResidentOpConversion>(typeConverter, transBenefit);
+  patterns.add<RegisterResidentOpConversion, RegisterHandoffOpConversion>(
+      typeConverter, transBenefit);
   patterns.add<MfmaCommitOpConversion, ScheduledMfmaOpConversion>(
       typeConverter, targetInfo, transBenefit);
   patterns.add<BarrierOpConversion, MemoryCounterWaitOpConversion>(

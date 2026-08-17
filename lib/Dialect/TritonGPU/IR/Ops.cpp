@@ -1324,6 +1324,46 @@ LogicalResult MemDescSubsliceOp::verify() {
   return success();
 }
 
+LogicalResult MemDescDynamicSubsliceOp::verify() {
+  auto srcTy = getSrc().getType();
+  auto dstTy = getType();
+  if (srcTy.getElementType() != dstTy.getElementType())
+    return emitError("result element type must match descriptor element type");
+  if (srcTy.getEncoding() != dstTy.getEncoding())
+    return emitError("source and result must have the same encoding");
+  if (srcTy.getMemorySpace() != dstTy.getMemorySpace())
+    return emitError("source and result must have the same memory space");
+  if (srcTy.getMutableMemory() != dstTy.getMutableMemory())
+    return emitError("source and result must have the same mutability");
+  if (srcTy.getRank() != dstTy.getRank())
+    return emitError("result rank must equal source rank");
+  if (getOffsets().size() != static_cast<size_t>(srcTy.getRank()))
+    return emitError("offsets must have the same rank as the source");
+  if (srcTy.getAllocShape() != dstTy.getAllocShape())
+    return emitError("result must preserve the source allocation shape");
+
+  Attribute srcEnc = srcTy.getEncoding();
+  if (!isa<SharedEncodingTrait>(srcEnc))
+    return emitError("source and result must use a shared-memory encoding");
+  Attribute concreteSrcEnc = triton::unwrapTlxWrappers(srcEnc);
+  if (isa<PartitionedSharedEncodingAttr>(concreteSrcEnc))
+    return emitError(
+        "dynamic subslices do not support partitioned shared encodings");
+
+  bool slicesAnyDimension = false;
+  for (int dim = 0; dim < srcTy.getRank(); ++dim) {
+    int64_t srcSize = srcTy.getDimSize(dim);
+    int64_t dstSize = dstTy.getDimSize(dim);
+    if (dstSize <= 0 || dstSize > srcSize)
+      return emitError("result dimensions must be positive and no larger than "
+                       "the corresponding source dimensions");
+    slicesAnyDimension |= dstSize != srcSize;
+  }
+  if (!slicesAnyDimension)
+    return emitError("dynamic subslice must narrow at least one dimension");
+  return success();
+}
+
 // -- WarpSpecializeOp --
 
 RegionRange WarpSpecializeOp::getPartitionRegions() {

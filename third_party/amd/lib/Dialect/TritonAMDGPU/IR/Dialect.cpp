@@ -740,32 +740,52 @@ LogicalResult RematerializedRangeOp::verify() {
   return success();
 }
 
-LogicalResult RegisterResidentOp::verify() {
+static LogicalResult verifyRegisterAllocationContract(Operation *op,
+                                                      RankedTensorType tensorTy,
+                                                      StringRef registerClass,
+                                                      int64_t registersPerGroup,
+                                                      bool allowUnencoded) {
   namespace ttg = mlir::triton::gpu;
 
-  auto tensorTy = getInput().getType();
-  if (!isa<ttg::DistributedEncodingTrait>(tensorTy.getEncoding()))
-    return emitOpError("requires a distributed tensor encoding");
+  Attribute encoding = tensorTy.getEncoding();
+  if (!encoding && !allowUnencoded)
+    return op->emitOpError("requires a distributed tensor encoding");
+  if (encoding && !isa<ttg::DistributedEncodingTrait>(encoding))
+    return op->emitOpError("requires a distributed tensor encoding");
   Type elementType = tensorTy.getElementType();
   if (!elementType.isIntOrFloat())
-    return emitOpError("requires an integer or floating-point element type");
+    return op->emitOpError(
+        "requires an integer or floating-point element type");
   unsigned bitWidth = elementType.getIntOrFloatBitWidth();
   if (bitWidth != 16 && bitWidth != 32)
-    return emitOpError("supports only 16-bit and 32-bit element types");
-  if (getRegisterClass() != "agpr" && getRegisterClass() != "vgpr")
-    return emitOpError("register_class must be \"agpr\" or \"vgpr\"");
-  int64_t registersPerGroup = getRegistersPerGroup();
+    return op->emitOpError("supports only 16-bit and 32-bit element types");
+  if (registerClass != "agpr" && registerClass != "vgpr")
+    return op->emitOpError("register_class must be \"agpr\" or \"vgpr\"");
   if (registersPerGroup <= 0 || registersPerGroup > 32 ||
       (registersPerGroup & (registersPerGroup - 1)) != 0)
-    return emitOpError(
+    return op->emitOpError(
         "registers_per_group must be a power of two between 1 and 32");
+  if (!encoding)
+    return success();
   int64_t elementsPerGroup = registersPerGroup * 32 / bitWidth;
   int64_t elementsPerThread = ttg::getTotalElemsPerThread(tensorTy);
   if (elementsPerThread % elementsPerGroup != 0)
-    return emitOpError() << "requires " << elementsPerThread
-                         << " elements per thread to be divisible by the "
-                         << elementsPerGroup << "-element native tuple";
+    return op->emitOpError() << "requires " << elementsPerThread
+                             << " elements per thread to be divisible by the "
+                             << elementsPerGroup << "-element native tuple";
   return success();
+}
+
+LogicalResult RegisterResidentOp::verify() {
+  return verifyRegisterAllocationContract(
+      getOperation(), getInput().getType(), getRegisterClass(),
+      getRegistersPerGroup(), /*allowUnencoded=*/false);
+}
+
+LogicalResult RegisterHandoffOp::verify() {
+  return verifyRegisterAllocationContract(
+      getOperation(), getInput().getType(), getRegisterClass(),
+      getRegistersPerGroup(), /*allowUnencoded=*/true);
 }
 
 LogicalResult MfmaCommitOp::inferReturnTypes(
@@ -821,10 +841,11 @@ LogicalResult MfmaCommitOp::verify() {
       auto dot = dyn_cast<ttg::DotOperandEncodingAttr>(tensorTy.getEncoding());
       auto mfma = dot ? dyn_cast<ttg::AMDMfmaEncodingAttr>(dot.getParent())
                       : ttg::AMDMfmaEncodingAttr();
-      if (!dot || !mfma || mfma.getVersion() != 4 || dot.getKWidth() != 8)
+      if (!dot || !mfma || mfma.getVersion() != 4 ||
+          !llvm::is_contained({4u, 8u}, dot.getKWidth()))
         return emitOpError()
                << "input " << index
-               << " must use a CDNA4 BF16 dot-operand layout with kWidth=8";
+               << " must use a CDNA4 BF16 dot-operand layout with kWidth=4/8";
       ArrayRef<unsigned> instr = mfma.getInstrShape();
       int64_t fragmentElements =
           dot.getOpIdx() == 0 ? instr[0] * instr[2] : instr[2] * instr[1];
@@ -896,14 +917,18 @@ LogicalResult ScheduledMfmaOp::verify() {
 
   auto aDot = dyn_cast<ttg::DotOperandEncodingAttr>(aTy.getEncoding());
   auto bDot = dyn_cast<ttg::DotOperandEncodingAttr>(bTy.getEncoding());
-  if (!aDot || aDot.getOpIdx() != 0 || aDot.getKWidth() != 8 ||
+  if (!aDot || aDot.getOpIdx() != 0 ||
+      !llvm::is_contained({4u, 8u}, aDot.getKWidth()) ||
       aDot.getParent() != mfma)
     return emitOpError(
-        "operand A must use the matching opIdx=0, kWidth=8 dot layout");
-  if (!bDot || bDot.getOpIdx() != 1 || bDot.getKWidth() != 8 ||
+        "operand A must use the matching opIdx=0, kWidth=4/8 dot layout");
+  if (!bDot || bDot.getOpIdx() != 1 ||
+      !llvm::is_contained({4u, 8u}, bDot.getKWidth()) ||
       bDot.getParent() != mfma)
     return emitOpError(
-        "operand B must use the matching opIdx=1, kWidth=8 dot layout");
+        "operand B must use the matching opIdx=1, kWidth=4/8 dot layout");
+  if (aDot.getKWidth() != bDot.getKWidth())
+    return emitOpError("operand dot layouts must use the same kWidth");
 
   SmallVector<int64_t> aRep =
       mfma.getRepForOperand(aTy.getShape(), aDot.getKWidth(), 0);
@@ -912,6 +937,23 @@ LogicalResult ScheduledMfmaOp::verify() {
   if (aRep[0] != 1 || bRep[0] != 1 || aRep[2] <= 0 || aRep[2] != bRep[1])
     return emitOpError(
         "requires one batch and matching nonempty K fragments per wave");
+
+  // Lowering packs dot operands into eight-element BF16 vectors, which are
+  // the per-lane inputs of one native CDNA4 MFMA.  A kWidth=4 layout therefore
+  // needs an even number of logical K repetitions; otherwise the operand only
+  // describes half of a native K fragment and cannot be lowered.
+  constexpr int64_t elementsPerNativeKFragment = 8;
+  int64_t logicalKElements = aRep[2] * aDot.getKWidth();
+  if (logicalKElements % elementsPerNativeKFragment != 0)
+    return emitOpError(
+        "operand K ownership must contain complete native MFMA fragments");
+  int64_t numRepK = logicalKElements / elementsPerNativeKFragment;
+  if (ttg::getTotalElemsPerThread(aTy) !=
+          aRep[0] * aRep[1] * numRepK * elementsPerNativeKFragment ||
+      ttg::getTotalElemsPerThread(bTy) !=
+          bRep[0] * bRep[2] * numRepK * elementsPerNativeKFragment)
+    return emitOpError(
+        "operand ownership does not match the native MFMA K grid");
 
   constexpr int64_t warpSize = 64;
   int64_t elementsPerFragment = instrShape[0] * instrShape[1] / warpSize;

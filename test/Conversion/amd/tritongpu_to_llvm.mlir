@@ -526,6 +526,23 @@ module attributes {"ttg.target" = "hip:gfx942", "ttg.num-ctas" = 1 : i32, "ttg.n
 
 // -----
 
+// CHECK-LABEL: dynamic_subslice_shared_layout
+#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [8, 8], warpsPerCTA = [1, 1], order = [1, 0]}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.target" = "hip:gfx950", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @dynamic_subslice_shared_layout(%arg0: tensor<8x16xf16, #blocked>, %row: i32) {
+    %zero = arith.constant 0 : i32
+    %buffer = ttg.local_alloc %arg0 : (tensor<8x16xf16, #blocked>) -> !ttg.memdesc<8x16xf16, #shared, #smem, mutable>
+    // CHECK: llvm.add %{{.*}}, %{{.*}} : i32
+    // CHECK-NOT: ttg.memdesc_dynamic_subslice
+    %view = ttg.memdesc_dynamic_subslice %buffer[%row, %zero] : !ttg.memdesc<8x16xf16, #shared, #smem, mutable> -> !ttg.memdesc<1x16xf16, #shared, #smem, mutable, 8x16>
+    tt.return
+  }
+}
+
+// -----
+
 // CHECK-LABEL: padded_shared_layout
 #blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [8, 8], warpsPerCTA = [2, 2], order = [1, 0]}>
 #shared = #ttg.padded_shared<[128:+4, 256:+8] {order = [1, 0], shape = [64, 64]}>

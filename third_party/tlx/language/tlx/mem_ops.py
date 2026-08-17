@@ -841,6 +841,36 @@ def local_slice(
 
 
 @tl.builtin
+def local_dynamic_slice(
+    buffer: tlx.buffered_tensor,
+    offset: list[int | tl.tensor],
+    shape: list[int],
+    _semantic=None,
+) -> tlx.buffered_tensor:
+    """Return a same-rank SMEM subview at runtime logical offsets.
+
+    Each offset may be an integer, constexpr, or scalar i32 tensor.  Runtime
+    offsets must keep the view within the source allocation and satisfy the
+    same tile-alignment contract as :func:`local_slice`; violating either
+    condition is undefined behavior.
+    """
+    assert buffer.type.storage == tlx.storage_kind.smem, ("local_dynamic_slice only supports SMEM")
+    unwrapped_shape = [tl._unwrap_if_constexpr(dim) for dim in shape]
+    assert len(offset) == len(
+        buffer.type.shape) == len(unwrapped_shape), ("dynamic slice offset and shape must match the source rank")
+    offset_handles = [_semantic._convert_elem_to_ir_value(value, require_i64=False) for value in offset]
+    slice_handle = _semantic.builder.create_memdesc_dynamic_subslice(buffer.handle, offset_handles, unwrapped_shape)
+    return tlx.buffered_tensor(
+        slice_handle,
+        buffer.type.scalar,
+        unwrapped_shape,
+        0,
+        buffer.type.storage,
+        buffer.type.layout,
+    )
+
+
+@tl.builtin
 def async_load(
     src: tl.tensor,
     result: tlx.buffered_tensor,

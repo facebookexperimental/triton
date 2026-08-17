@@ -2284,7 +2284,8 @@ def load_kernel(inp, xnumel):
     block_layout: ttgl.constexpr = ttgl.BlockedLayout([1], [32], [4], [0])
     xindex = ttgl.arange(0, 128, block_layout)
     mask = xindex < xnumel
-    ttgl.load(inp + xindex, mask=mask, other=0.0)
+    result = ttgl.load(inp + xindex, mask=mask, other=0.0)
+    ttgl.static_assert(result.type.layout == block_layout)
 
 
 @pytest.mark.parametrize("target", ALL_TARGETS)
@@ -2309,6 +2310,39 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 }
 """,
     )
+
+
+@gluon.jit
+def load_cast_reduce_kernel(lhs, rhs):
+    layout: ttgl.constexpr = ttgl.BlockedLayout([1, 1], [1, 32], [4, 1], [1, 0])
+    row_layout: ttgl.constexpr = ttgl.SliceLayout(1, layout)
+    col_layout: ttgl.constexpr = ttgl.SliceLayout(0, layout)
+    rows = ttgl.arange(0, 64, row_layout)
+    cols = ttgl.arange(0, 64, col_layout)
+    offsets = rows[:, None] * 64 + cols[None, :]
+    lhs = ttgl.load(lhs + offsets)
+    rhs = ttgl.load(rhs + offsets)
+    ttgl.static_assert(lhs.type.layout == layout)
+    ttgl.static_assert(rhs.type.layout == layout)
+    lhs = lhs.to(ttgl.float32)
+    rhs = rhs.to(ttgl.float32)
+    ttgl.static_assert(lhs.type.layout == layout)
+    ttgl.static_assert(rhs.type.layout == layout)
+    ttgl.sum(lhs * rhs, axis=1)
+
+
+@pytest.mark.parametrize("target", ALL_TARGETS)
+def test_load_cast_reduce_preserves_layout(target):
+    mod = run_parser(
+        load_cast_reduce_kernel,
+        *make_args(MockTensor(ttgl.bfloat16), MockTensor(ttgl.bfloat16)),
+        target=target,
+    )
+    ir = anonymize_ir(mod.str_nodebug())
+    assert ir.count("tt.load") == 2
+    assert ir.count("arith.extf") == 2
+    assert "arith.mulf" in ir
+    assert "tt.reduce" in ir
 
 
 @gluon.jit
