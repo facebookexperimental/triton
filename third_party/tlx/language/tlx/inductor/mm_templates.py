@@ -102,16 +102,7 @@ def append_tlx(templates, op_name="mm"):
     # Import registry to trigger heuristic registration via decorators
     from . import registry  # noqa: F401
 
-    # Only propose templates whose heuristic is registered for this device.
-    # registry.py gates registration on arch (amd_* on register=IS_ROCM,
-    # blackwell on register=torch.version.hip is None), so proposing the other
-    # arch's template gets no heuristic, logs a multi-KB "No template heuristic
-    # found ... Using fallback" error, and falls back -- correct, but noisy
-    # enough to look like a failure. Plain mm has no AMD TLX template yet, so on
-    # ROCm it proposes nothing rather than reaching for the Blackwell one.
-    if torch.version.hip is not None:
-        return _append_tlx_amd(templates, op_name)
-    return _append_tlx_cuda(templates, op_name)
+    return _append_tlx_nvidia(templates, op_name) if torch.version.hip is None else _append_tlx_amd(templates, op_name)
 
 
 def _append_tlx_amd(templates, op_name):
@@ -146,7 +137,7 @@ def _append_tlx_amd(templates, op_name):
     return templates
 
 
-def _append_tlx_cuda(templates, op_name):
+def _append_tlx_nvidia(templates, op_name):
     # The amd_* warp-pipe templates have no heuristic registered on CUDA, so
     # addmm/bmm get no TLX candidate here; only plain mm does.
     if op_name in ("addmm", "bmm"):
