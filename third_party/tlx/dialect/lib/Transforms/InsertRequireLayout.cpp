@@ -454,6 +454,7 @@ static bool isFedByAnyMemDescUser(Value memdesc) {
 // padded-shared encoding, which the dot-path anchor would clobber.
 static bool isFedByTDM(Value memdesc) {
   return isFedByAnyMemDescUser<amdgpu::AsyncTDMCopyGlobalToLocalOp,
+                               amdgpu::AsyncTDMFusedCopyGlobalToLocalOp,
                                amdgpu::AsyncTDMCopyLocalToGlobalOp>(memdesc);
 }
 
@@ -951,7 +952,30 @@ static void materializeTDMConstraints(ModuleOp m, OpBuilder &builder,
     if (auto load = dyn_cast<amdgpu::AsyncTDMCopyGlobalToLocalOp>(op))
       anchorTDMRequireLayout(load, load.getResult(), load.getResultMutable(),
                              /*allowDotAware=*/true, builder, solver);
-    else if (auto store = dyn_cast<amdgpu::AsyncTDMCopyLocalToGlobalOp>(op))
+    else if (auto fused =
+                 dyn_cast<amdgpu::AsyncTDMFusedCopyGlobalToLocalOp>(op)) {
+      for (size_t i = 0; i < fused.getDescs().size(); ++i) {
+        Value dest = fused.getDests()[i];
+        if (dest.getDefiningOp<tlx::RequireLayoutOp>())
+          continue;
+        auto destType = dyn_cast<ttg::MemDescType>(dest.getType());
+        if (!destType)
+          continue;
+        auto descType = cast<tt::TensorDescType>(fused.getDescs()[i].getType());
+        Attribute encoding = chooseTDMBufEncoding(
+            fused, dest, destType, descType, /*allowDotAware=*/true, solver);
+        if (!encoding)
+          continue;
+        builder.setInsertionPoint(fused);
+        auto requiredType = ttg::MemDescType::get(
+            destType.getShape(), destType.getElementType(), encoding,
+            destType.getMemorySpace(), destType.getMutableMemory(),
+            destType.getAllocShape());
+        auto required = tlx::RequireLayoutOp::create(builder, fused.getLoc(),
+                                                     requiredType, dest);
+        fused.getDestsMutable()[i].assign(required.getResult());
+      }
+    } else if (auto store = dyn_cast<amdgpu::AsyncTDMCopyLocalToGlobalOp>(op))
       anchorTDMRequireLayout(store, store.getSrc(), store.getSrcMutable(),
                              /*allowDotAware=*/false, builder, solver);
   });

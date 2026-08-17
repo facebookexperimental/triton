@@ -284,3 +284,27 @@ tt.func public @tdm_load_partitioned_pinned_inner_encoding(%desc: !tt.tensordesc
   tt.return
 }
 }
+
+// -----
+// Fused TDM assigns each descriptor from its corresponding destination.
+#padded_a = #ttg.padded_shared<[32:+8] {order = [1, 0], shape = [64, 32]}>
+#padded_b = #ttg.padded_shared<[64:+8] {order = [1, 0], shape = [32, 64]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250"} {
+// CHECK-DAG: #[[$FUSED_A:.*]] = #ttg.padded_shared<[32:+8] {order = [1, 0], shape = [64, 32]}>
+// CHECK-DAG: #[[$FUSED_B:.*]] = #ttg.padded_shared<[64:+8] {order = [1, 0], shape = [32, 64]}>
+// CHECK-LABEL: @fused_tdm_allocation_encodings
+tt.func public @fused_tdm_allocation_encodings(
+    %a: !tt.tensordesc<64x32xf16>, %b: !tt.tensordesc<32x64xf16>,
+    %m: i32, %n: i32) {
+  // CHECK-SAME: %[[A:.*]]: !tt.tensordesc<64x32xf16, #[[$FUSED_A]]>
+  // CHECK-SAME: %[[B:.*]]: !tt.tensordesc<32x64xf16, #[[$FUSED_B]]>
+  %da = ttg.local_alloc : () -> !ttg.memdesc<64x32xf16, #padded_a, #smem, mutable>
+  %db = ttg.local_alloc : () -> !ttg.memdesc<32x64xf16, #padded_b, #smem, mutable>
+  %pa = amdg.update_tensor_descriptor %a add_offsets = [%m, %n] : !tt.tensordesc<64x32xf16>
+  %pb = amdg.update_tensor_descriptor %b add_offsets = [%m, %n] : !tt.tensordesc<32x64xf16>
+  // CHECK: amdg.async_tdm_fused_copy_global_to_local %{{.*}}, %{{.*}} into %{{.*}}, %{{.*}} {warp_used_hints = array<i32: 3, 12>} : !tt.tensordesc<64x32xf16, #[[$FUSED_A]]>, !tt.tensordesc<32x64xf16, #[[$FUSED_B]]> -> !ttg.memdesc<64x32xf16, #[[$FUSED_A]], #smem, mutable>, !ttg.memdesc<32x64xf16, #[[$FUSED_B]], #smem, mutable>
+  %token = amdg.async_tdm_fused_copy_global_to_local %pa, %pb into %da, %db {warp_used_hints = array<i32: 3, 12>} : !tt.tensordesc<64x32xf16>, !tt.tensordesc<32x64xf16> -> !ttg.memdesc<64x32xf16, #padded_a, #smem, mutable>, !ttg.memdesc<32x64xf16, #padded_b, #smem, mutable>
+  tt.return
+}
+}

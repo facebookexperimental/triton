@@ -1178,6 +1178,18 @@ void init_gluon_ir(py::module &&m) {
              self.create<ttag::AsyncTDMCopyGlobalToLocalOp>(
                  descPtr, result, barrier, cacheModifier, hintAttr);
            })
+      .def(
+          "create_async_tdm_fused_copy_global_to_local",
+          [](GluonOpBuilder &self, std::vector<Value> &descs,
+             std::vector<Value> &dests, std::vector<int32_t> &warpUsedHints,
+             tt::CacheModifier cacheModifier) {
+            auto tokenType = self.getBuilder().getType<ttg::AsyncTokenType>();
+            auto hints = self.getBuilder().getDenseI32ArrayAttr(warpUsedHints);
+            self.create<ttag::AsyncTDMFusedCopyGlobalToLocalOp>(
+                tokenType, descs, dests, hints, cacheModifier);
+          },
+          py::arg("descs"), py::arg("dests"), py::arg("warpUsedHints"),
+          py::arg("cacheModifier") = tt::CacheModifier::NONE)
       .def("create_async_tdm_copy_local_to_global",
            [](GluonOpBuilder &self, Value descPtr, Value src, Value barrier,
               tt::CacheModifier cacheModifier) {
