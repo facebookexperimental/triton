@@ -1305,11 +1305,27 @@ def test_tlx_fa_wave_bench_forces_every_adaptive_rebase():
     assert program_count % bench.XCD_COUNT == 0
 
 
-def test_tlx_fa_wave_bench_gates_adaptive_full_shape_and_forced_rebases(monkeypatch):
+def test_tlx_fa_wave_bench_forces_sparse_adaptive_rebases():
+    pytest.importorskip("torch")
+    bench = _load_tlx_fa_wave_bench_module("_tlx_wave_test_fa_wave_bench_sparse")
+    shape = (2, 8, 256, 128)
+
+    q, k, v, rebase_count, minimum_advance = bench.sparse_rebase_inputs(shape, "cpu", seed=17)
+
+    assert q.shape == k.shape == v.shape == shape
+    assert q[..., ::bench.ROWS_PER_WAVE, 0].eq(1).all()
+    assert q[..., 0].count_nonzero().item() == 2 * 8 * (256 // bench.ROWS_PER_WAVE)
+    assert q[..., 1:].eq(0).all()
+    assert rebase_count == shape[2] // bench.KV_TILE_SIZE - 1 == 3
+    assert minimum_advance > bench.FORCED_REBASE_LOG2_HEADROOM
+
+
+def test_tlx_fa_wave_bench_gates_adaptive_rebase_patterns(monkeypatch):
     bench = _load_tlx_fa_wave_bench_module("_tlx_wave_test_fa_wave_bench_adaptive_gate")
     correctness_cases = []
     performance_cases = []
     nominal = (object(), object(), object())
+    sparse = (object(), object(), object())
     forced = (object(), object(), object())
 
     monkeypatch.setattr(
@@ -1326,6 +1342,11 @@ def test_tlx_fa_wave_bench_gates_adaptive_full_shape_and_forced_rebases(monkeypa
         ),
     )
     monkeypatch.setattr(bench, "bounded_inputs", lambda shape, device, seed: nominal)
+    monkeypatch.setattr(
+        bench,
+        "sparse_rebase_inputs",
+        lambda shape, device, seed: (*sparse, 127, 8.161),
+    )
     monkeypatch.setattr(
         bench,
         "forced_rebase_inputs",
@@ -1346,10 +1367,12 @@ def test_tlx_fa_wave_bench_gates_adaptive_full_shape_and_forced_rebases(monkeypa
     assert bench.main() == 0
     assert correctness_cases == [
         (nominal, None, "bounded-distribution"),
+        (sparse, None, "sparse-rebase rows=1/32 count=127 min-log2-advance=8.161000"),
         (forced, None, "forced-rebase count=127 min-log2-advance=8.161000"),
     ]
     assert performance_cases == [
         (nominal, 7, 31, None),
+        (sparse, 7, 31, None),
         (forced, 7, 31, None),
     ]
 
