@@ -15,6 +15,8 @@ ADVERTISED_SHAPE = (2, 64, 8192, 128)
 QUERY_TILE_SIZE = amd_fa_wave.BLOCK_M.value
 KV_TILE_SIZE = amd_fa_wave.BLOCK_N.value
 XCD_COUNT = amd_fa_wave.XCDS.value
+WAVES_PER_PROGRAM = 8
+ROWS_PER_WAVE = QUERY_TILE_SIZE // WAVES_PER_PROGRAM
 FORCED_REBASE_K_STEP = 64.0
 FORCED_REBASE_LOG2_HEADROOM = amd_fa_wave.SOFTMAX_REFERENCE_HEADROOM_LOG2.value
 WAVE_PERFORMANCE_FLOOR_TFLOPS = 1000.0
@@ -80,6 +82,18 @@ def forced_rebase_inputs(shape, device, *, seed):
     if not bool(torch.all(advances > FORCED_REBASE_LOG2_HEADROOM)):
         raise ValueError("forced-rebase score construction does not exceed the adaptive headroom")
     return q, k, v, advances.numel(), advances.min().item()
+
+
+def sparse_rebase_inputs(shape, device, *, seed):
+    """Force one row per wave to rebase on every K/V tile."""
+    q, k, v, rebase_count, minimum_advance = forced_rebase_inputs(
+        shape,
+        device,
+        seed=seed,
+    )
+    q.zero_()
+    q[..., ::ROWS_PER_WAVE, 0] = 1.0
+    return q, k, v, rebase_count, minimum_advance
 
 
 def check_correctness(q, k, v, *, qk_max_abs, case):
@@ -160,11 +174,15 @@ def main():
     print(f"Eight-wave {mode} FlashAttention ({backend}, programs={program_count}, XCDs={XCD_COUNT})")
     correctness_ok = True
     performance_ok = True
-    performance_cases = [False, True] if args.qk_max_abs is None else [False]
-    for force_rebases in performance_cases:
-        if force_rebases:
+    performance_cases = ["bounded", "sparse", "forced"] if args.qk_max_abs is None else ["bounded"]
+    for input_case in performance_cases:
+        if input_case == "forced":
             q, k, v, rebase_count, minimum_advance = forced_rebase_inputs(ADVERTISED_SHAPE, device, seed=17)
             case = f"forced-rebase count={rebase_count} min-log2-advance={minimum_advance:.6f}"
+        elif input_case == "sparse":
+            q, k, v, rebase_count, minimum_advance = sparse_rebase_inputs(ADVERTISED_SHAPE, device, seed=17)
+            case = (f"sparse-rebase rows=1/{ROWS_PER_WAVE} count={rebase_count} "
+                    f"min-log2-advance={minimum_advance:.6f}")
         else:
             q, k, v = bounded_inputs(ADVERTISED_SHAPE, device, seed=0)
             case = "bounded-distribution"
