@@ -565,7 +565,7 @@ def _ragged_hstu_attn_fwd(  # noqa C901
     stride_om,
     stride_oh,
     alpha,
-    Z,
+    Z: tl.constexpr,
     H,
     MAX_SEQ_LEN,
     DeltaSize,
