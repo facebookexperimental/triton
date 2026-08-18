@@ -85,8 +85,9 @@ def _attn_fwd_subtile(
     SUBTILING: tl.constexpr,
     VECT_MUL: tl.constexpr,
     FADD2_REDUCE: tl.constexpr,
+    TWO_CTAS: tl.constexpr,
 ):
-    qk = tl.dot(q, k)
+    qk = tl.dot(q, k, two_ctas=TWO_CTAS)
 
     if STAGE == 3 and start_n >= start_m * BLOCK_M:
         col_limit_right = (offs_m - start_n + 1)[:, None]
@@ -132,7 +133,7 @@ def _attn_fwd_subtile(
     # prepare p and v for the dot
     p = p.to(dtype)
     # note that this non transposed v for FP8 is only supported on Blackwell
-    acc = tl.dot(p, v, acc)
+    acc = tl.dot(p, v, acc, two_ctas=TWO_CTAS)
     # update m_i and l_i
     # place this at the end of the loop to reduce register pressure
     if not FADD2_REDUCE:
@@ -167,6 +168,7 @@ def _attn_fwd_inner_oss_dp(
     VECT_MUL: tl.constexpr,
     FADD2_REDUCE: tl.constexpr,
     DP_FACTOR: tl.constexpr,
+    TWO_CTAS: tl.constexpr,
 ):
     # range of values handled by this stage
     if STAGE == 1:  # causal = False
@@ -211,6 +213,7 @@ def _attn_fwd_inner_oss_dp(
             SUBTILING,
             VECT_MUL,
             FADD2_REDUCE,
+            TWO_CTAS,
         )
 
         offsetkv_y += BLOCK_N
@@ -222,6 +225,9 @@ def _host_descriptor_pre_hook(nargs):
     BLOCK_M = nargs["BLOCK_M"]
     BLOCK_N = nargs["BLOCK_N"]
     HEAD_DIM = nargs["HEAD_DIM"]
+    NUM_CTAS = nargs.get("NUM_CTAS", 1)
+    if NUM_CTAS == 2 and nargs["N_CTX"] % (NUM_CTAS * BLOCK_M) != 0:
+        raise ValueError("2-CTA forward requires N_CTX divisible by 2 * BLOCK_M")
     if not isinstance(nargs["desc_q"], TensorDescriptor):
         return
     nargs["desc_q"].block_shape = [BLOCK_M, HEAD_DIM]  # due to data partitioning
@@ -239,6 +245,9 @@ elif supports_host_descriptor():
     NUM_STAGES_OPTIONS = [3]
 else:
     NUM_STAGES_OPTIONS = [3]
+FWD_2CTA_NUM_STAGES = int(os.environ.get("AUTOWS_FWD_NUM_STAGES", "2"))
+FWD_2CTA_BLOCK_M = int(os.environ.get("AUTOWS_FWD_BLOCK_M", "128"))
+FWD_2CTA_DP_FACTOR = int(os.environ.get("AUTOWS_FWD_DP_FACTOR", "1"))
 
 configs = [
     triton.Config(
@@ -246,12 +255,32 @@ configs = [
             "BLOCK_M": BM,
             "BLOCK_N": BN,
             "DP_FACTOR": 2,
+            "NUM_CTAS": 1,
         },
         num_stages=s,
         num_warps=w,
         pre_hook=_host_descriptor_pre_hook,
     ) for BM in [256] for BN in [128] for s in NUM_STAGES_OPTIONS for w in [4]
+] + [
+    triton.Config(
+        {
+            "BLOCK_M": FWD_2CTA_BLOCK_M,
+            "BLOCK_N": 128,
+            "DP_FACTOR": FWD_2CTA_DP_FACTOR,
+            "NUM_CTAS": 2,
+        },
+        num_stages=FWD_2CTA_NUM_STAGES,
+        num_warps=4,
+        pre_hook=_host_descriptor_pre_hook,
+        ctas_per_cga=(2, 1, 1),
+        allowDependentTwoCTA=True,
+    )
 ]
+
+_fwd_num_ctas = os.environ.get("AUTOWS_FWD_NUM_CTAS")
+if _fwd_num_ctas is not None:
+    configs = [config for config in configs if config.kwargs.get("NUM_CTAS", 1) == int(_fwd_num_ctas)]
+configs_fwd = configs
 
 
 def keep(conf):
@@ -263,9 +292,17 @@ def keep(conf):
 
 def prune_invalid_configs(configs, named_args, **kwargs):
     N_CTX = kwargs["N_CTX"]
+    STAGE = kwargs["STAGE"]
+    FP8_OUTPUT = kwargs["FP8_OUTPUT"]
 
-    # Filter out configs where BLOCK_M > N_CTX
-    return [conf for conf in configs if conf.kwargs.get("BLOCK_M", 0) <= N_CTX]
+    # The current 2-CTA mapping gives adjacent CTAs adjacent M tiles. Keep the
+    # pair on the same head and in identical control flow; causal and FP8 paths
+    # need dedicated clustered mappings and remain 1-CTA for now.
+    return [
+        conf for conf in configs if conf.kwargs.get("BLOCK_M", 0) <= N_CTX and (
+            conf.kwargs.get("NUM_CTAS", 1) == 1 or (STAGE == 1 and not FP8_OUTPUT and N_CTX %
+                                                    (2 * conf.kwargs["BLOCK_M"]) == 0))
+    ]
 
 
 @triton.jit
@@ -300,6 +337,7 @@ def _attn_fwd_tma_dp(
     VECT_MUL: tl.constexpr,
     FADD2_REDUCE: tl.constexpr,
     DP_FACTOR: tl.constexpr,
+    NUM_CTAS: tl.constexpr,
 ):
     start_m = pid  # tl.program_id(0)
     # off_hz = tl.program_id(1)
@@ -350,6 +388,7 @@ def _attn_fwd_tma_dp(
         VECT_MUL,
         FADD2_REDUCE,
         DP_FACTOR,
+        NUM_CTAS == 2,
     )
 
     if FADD2_REDUCE:
@@ -365,7 +404,7 @@ def _attn_fwd_tma_dp(
 
 
 @triton.autotune(
-    configs=list(filter(keep, configs)),
+    configs=list(filter(keep, configs_fwd)),
     key=["N_CTX", "HEAD_DIM", "FP8_OUTPUT", "warp_specialize"],
     prune_configs_by={"early_config_prune": prune_invalid_configs},
 )
@@ -391,6 +430,7 @@ def _attn_fwd(
     VECT_MUL: tl.constexpr,
     FADD2_REDUCE: tl.constexpr,
     DP_FACTOR: tl.constexpr,
+    NUM_CTAS: tl.constexpr = 1,
 ):
     pid = tl.program_id(0)
     off_hz = tl.program_id(1)
@@ -443,11 +483,12 @@ def _attn_fwd(
         VECT_MUL,
         FADD2_REDUCE,
         DP_FACTOR,
+        NUM_CTAS,
     )
 
 
 @triton.autotune(
-    configs=list(filter(keep, configs)),
+    configs=list(filter(keep, configs_fwd)),
     key=["N_CTX", "HEAD_DIM", "FP8_OUTPUT", "warp_specialize"],
     prune_configs_by={"early_config_prune": prune_invalid_configs},
 )
@@ -474,6 +515,7 @@ def _attn_fwd_persist(
     VECT_MUL: tl.constexpr,
     FADD2_REDUCE: tl.constexpr,
     DP_FACTOR: tl.constexpr,
+    NUM_CTAS: tl.constexpr = 1,
 ):
     n_tile_num = tl.cdiv(N_CTX, BLOCK_M)
     prog_id = tl.program_id(0)
@@ -545,6 +587,7 @@ def _attn_fwd_persist(
             VECT_MUL,
             FADD2_REDUCE,
             DP_FACTOR,
+            NUM_CTAS,
         )
         tile_idx += num_progs
 
@@ -1562,6 +1605,10 @@ class _attention_opt(torch.autograd.Function):
         assert HEAD_DIM_K in {16, 32, 64, 128, 256}
         o = torch.empty_like(q)
         stage = 3 if causal else 1
+        if "AUTOWS_FWD_SUBTILING" in os.environ:
+            SUBTILING = os.environ["AUTOWS_FWD_SUBTILING"] == "1"
+        if "AUTOWS_FWD_VECT_MUL" in os.environ:
+            VECT_MUL = int(os.environ["AUTOWS_FWD_VECT_MUL"])
         extra_kern_args = {}
 
         M = torch.empty((q.shape[0], q.shape[1], q.shape[2]), device=q.device, dtype=torch.float32)
@@ -1578,26 +1625,31 @@ class _attention_opt(torch.autograd.Function):
         NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
 
         def grid(META):
+            num_ctas = META.get("NUM_CTAS") or 1
+            m_tiles = triton.cdiv(q.shape[2], META["BLOCK_M"])
             return (
-                triton.cdiv(q.shape[2], META["BLOCK_M"]),
+                triton.cdiv(m_tiles, num_ctas) * num_ctas,
                 q.shape[0] * q.shape[1],
                 1,
             )
 
         def grid_persist(META):
+            num_ctas = META.get("NUM_CTAS") or 1
+            total_tiles = triton.cdiv(q.shape[2], META["BLOCK_M"]) * q.shape[0] * q.shape[1]
+            num_clusters = min(NUM_SMS // num_ctas, total_tiles // num_ctas)
             return (
-                min(
-                    NUM_SMS,
-                    triton.cdiv(q.shape[2], META["BLOCK_M"]) * q.shape[0] * q.shape[1],
-                ),
+                num_clusters * num_ctas,
                 1,
                 1,
             )
 
         ctx.grid = grid
         persistent = baseVariant == "persistent" or baseVariant == "ws_persistent"
-        if is_blackwell() and warp_specialize:
-            extra_kern_args["maxnreg"] = 128
+        fwd_maxnreg = os.environ.get("AUTOWS_FWD_MAXNREG")
+        if fwd_maxnreg is None and _fwd_num_ctas != "2":
+            fwd_maxnreg = "128"
+        if is_blackwell() and warp_specialize and fwd_maxnreg is not None:
+            extra_kern_args["maxnreg"] = int(fwd_maxnreg)
         with triton.knobs.nvidia.scope():
             triton.knobs.nvidia.use_meta_ws = True
             triton.knobs.nvidia.use_meta_partition = True
