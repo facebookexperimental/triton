@@ -95,6 +95,11 @@
 // RUN: not triton-opt %s \
 // RUN:   -tritonamdgpu-apply-plan-pipeline='input-path=%t.pipeline.staging.depth.json strict=true' \
 // RUN:   2>&1 | FileCheck %s --check-prefix=PIPELINE-STAGING-DEPTH
+// RUN: python3 -c "import json; p=json.load(open('%t.pipeline.staging.json')); p['input_value_graph_fingerprint']='0'*64; open('%t.pipeline.rollback-early.json','w').write(json.dumps(p))"
+// RUN: not triton-opt %s \
+// RUN:   -tritonamdgpu-apply-plan-pipeline='input-path=%t.pipeline.rollback-early.json report-path=%t.pipeline.rollback-early.report.json strict=true' \
+// RUN:   2>&1 | FileCheck %s --check-prefix=PIPELINE-ROLLBACK-EARLY
+// RUN: FileCheck %s --check-prefix=PIPELINE-ROLLBACK-EARLY-REPORT < %t.pipeline.rollback-early.report.json
 // RUN: python3 -c "import json; p=json.load(open('%t.pipeline.staging.json')); p['loops'][0]['staging'][0]['alignment']=12; open('%t.pipeline.staging.alignment.json','w').write(json.dumps(p))"
 // RUN: not triton-opt %s \
 // RUN:   -tritonamdgpu-apply-plan-pipeline='input-path=%t.pipeline.staging.alignment.json strict=true' \
@@ -118,8 +123,9 @@
 // RUN:   2>&1 | FileCheck %s --check-prefix=PIPELINE-STAGING-DERIVATION-REJECT
 // RUN: python3 -c "import json; p=json.load(open('%t.pipeline.plan.json')); f=next(x for x in p['functions'] if x['function']=='register_to_lds_no_gain'); ops={x['id']:x['kind'] for x in f['operations']}; v=next(x for x in f['values'] if ops.get(x['origin'].get('operation'))=='arith.addf' and any(ops[u['operation']]=='amdg.extract_slice' for u in x['uses'])); s=next(u['operation'] for u in v['uses'] if ops[u['operation']]=='amdg.extract_slice'); sv=next(x for x in f['values'] if x['origin'].get('operation')==s); cs=sorted({u['operation'] for u in sv['uses']}); l=next(x['id'] for x in f['operations'] if x['kind']=='scf.for'); d={'schema_version':'plan-pipeline-delta/0.1','kernel':f['function'],'input_value_graph_fingerprint':f['semantic_fingerprint'],'pass_position':'before_update_async_wait_count','loops':[{'loop':l,'transactions':[],'staging':[{'value':v['id'],'action':'register_to_lds','consumers':cs,'buffer_depth':1,'alignment':16}]}]}; open('%t.pipeline.staging.no-gain.json','w').write(json.dumps(d))"
 // RUN: not triton-opt %s \
-// RUN:   -tritonamdgpu-apply-plan-pipeline='input-path=%t.pipeline.staging.no-gain.json strict=true' \
+// RUN:   -tritonamdgpu-apply-plan-pipeline='input-path=%t.pipeline.staging.no-gain.json report-path=%t.pipeline.staging.no-gain.report.json strict=true' \
 // RUN:   2>&1 | FileCheck %s --check-prefix=PIPELINE-STAGING-NO-GAIN
+// RUN: FileCheck %s --check-prefix=PIPELINE-ROLLBACK-MATERIALIZATION-REPORT < %t.pipeline.staging.no-gain.report.json
 // RUN: python3 -c "import json; p=json.load(open('%t.pipeline.plan.json')); f=next(x for x in p['functions'] if x['function']=='register_to_lds_layout_chain'); ops={x['id']:x['kind'] for x in f['operations']}; v=next(x for x in f['values'] if ops.get(x['origin'].get('operation'))=='arith.addi' and any(ops[u['operation']]=='tt.reshape' for u in x['uses'])); req=next(x for x in f['values'] if ops.get(x['origin'].get('operation'))=='tlx.require_layout'); cs=sorted({u['operation'] for u in req['uses']}); l=next(x['id'] for x in f['operations'] if x['kind']=='scf.for'); d={'schema_version':'plan-pipeline-delta/0.1','kernel':f['function'],'input_value_graph_fingerprint':f['semantic_fingerprint'],'pass_position':'before_update_async_wait_count','loops':[{'loop':l,'transactions':[],'staging':[{'value':v['id'],'action':'register_to_lds','consumers':cs,'buffer_depth':1,'alignment':16}]}]}; open('%t.pipeline.staging.layout-chain.json','w').write(json.dumps(d))"
 // RUN: TRITON_USE_MODULO_SCHEDULE=1 triton-opt %s \
 // RUN:   -tritonamdgpu-apply-plan-pipeline='input-path=%t.pipeline.staging.layout-chain.json report-path=%t.pipeline.staging.layout-chain.report.json strict=true' \
@@ -185,6 +191,11 @@
 // RUN: not triton-opt %s \
 // RUN:   -tritonamdgpu-apply-plan-pipeline='input-path=%t.pipeline.mixed-capacity.json strict=true' \
 // RUN:   2>&1 | FileCheck %s --check-prefix=PIPELINE-MIXED-CAPACITY
+// RUN: python3 -c "import json; p=json.load(open('%t.pipeline.plan.json')); f=next(x for x in p['functions'] if x['function']=='mixed_ring_staging_dead'); ops={x['id']:x['kind'] for x in f['operations']}; l=next(x['id'] for x in f['operations'] if x['kind']=='scf.for'); g=f['async_groups'][0]['id']; v=next(x for x in f['values'] if ops.get(x['origin'].get('operation'))=='tt.load'); cs=sorted({u['operation'] for u in v['uses']}); d={'schema_version':'plan-pipeline-delta/0.1','kernel':f['function'],'input_value_graph_fingerprint':f['semantic_fingerprint'],'pass_position':'before_update_async_wait_count','loops':[{'loop':l,'transactions':[{'group':g,'action':'set_prefetch_distance','distance':1,'buffer_depth':3}],'staging':[{'value':v['id'],'action':'global_to_lds','consumers':cs,'distance':1,'buffer_depth':2,'alignment':16}]}]}; open('%t.pipeline.rollback-expansion.json','w').write(json.dumps(d))"
+// RUN: not triton-opt %s \
+// RUN:   -tritonamdgpu-apply-plan-pipeline='input-path=%t.pipeline.rollback-expansion.json report-path=%t.pipeline.rollback-expansion.report.json strict=true' \
+// RUN:   2>&1 | FileCheck %s --check-prefix=PIPELINE-ROLLBACK-EXPANSION
+// RUN: FileCheck %s --check-prefix=PIPELINE-ROLLBACK-EXPANSION-REPORT < %t.pipeline.rollback-expansion.report.json
 //
 // Modulo runs before the guarded legacy scheduler. A successful modulo schedule
 // is preserved; the standard AMD pipeline lowers and expands it.
@@ -259,14 +270,17 @@
 // APPLY-REPORT: "accepted": true
 // APPLY-REPORT: "moved_operations": 2
 // APPLY-REJECT: schedule delta reverses distance-zero dependency
-// PIPELINE-REPORT: "accepted": true
-// PIPELINE-REPORT: "changes_buffer_depth": false
-// PIPELINE-REPORT: "changes_iteration_storage": false
-// PIPELINE-REPORT: "changes_prefetch_distance": false
-// PIPELINE-REPORT: "changes_synchronization": false
-// PIPELINE-REPORT: "moved_operations": {{[1-9][0-9]*}}
-// PIPELINE-REPORT: "output_value_graph_fingerprint": "{{[0-9a-f]+}}"
-// PIPELINE-REPORT: "skipped_inconsistent_dependencies": 0
+// PIPELINE-REPORT-DAG: "accepted": true
+// PIPELINE-REPORT-DAG: "transactional": true
+// PIPELINE-REPORT-DAG: "committed": true
+// PIPELINE-REPORT-DAG: "rolled_back": false
+// PIPELINE-REPORT-DAG: "changes_buffer_depth": false
+// PIPELINE-REPORT-DAG: "changes_iteration_storage": false
+// PIPELINE-REPORT-DAG: "changes_prefetch_distance": false
+// PIPELINE-REPORT-DAG: "changes_synchronization": false
+// PIPELINE-REPORT-DAG: "moved_operations": {{[1-9][0-9]*}}
+// PIPELINE-REPORT-DAG: "output_value_graph_fingerprint": "{{[0-9a-f]+}}"
+// PIPELINE-REPORT-DAG: "skipped_inconsistent_dependencies": 0
 // PIPELINE-DEPTH3-LABEL: tt.func @async_lds_modulo_slots
 // PIPELINE-DEPTH3: ttg.local_alloc : () -> !ttg.memdesc<3x16x16xf16
 // PIPELINE-DEPTH3: arith.constant 3 : i32
@@ -327,6 +341,11 @@
 // PIPELINE-STAGING-NONUSE: named register-to-LDS consumer does not use the staged value
 // PIPELINE-STAGING-DEPTH: register_to_lds supports only same-iteration single-slot staging
 // PIPELINE-STAGING-ALIGNMENT: pipeline staging alignment must be a power of two
+// PIPELINE-ROLLBACK-EARLY: pipeline delta value-graph fingerprint does not match
+// PIPELINE-ROLLBACK-EARLY-REPORT-DAG: "accepted": false
+// PIPELINE-ROLLBACK-EARLY-REPORT-DAG: "committed": false
+// PIPELINE-ROLLBACK-EARLY-REPORT-DAG: "rolled_back": true
+// PIPELINE-ROLLBACK-EARLY-REPORT-DAG: "failure_phase": "pre_apply_validation"
 // PIPELINE-STAGING-CAPACITY: register-to-LDS staging exceeds the target LDS capacity
 // PIPELINE-STAGING-SCALAR: register-to-LDS staging requires a produced ranked tensor
 // PIPELINE-STAGING-DERIVED-LABEL: tt.func @register_to_lds_derived
@@ -344,6 +363,10 @@
 // PIPELINE-STAGING-DERIVED-REPORT-DAG: "post_rewrite_audit_passed": true
 // PIPELINE-STAGING-DERIVATION-REJECT: named register-to-LDS consumer is reached through an unsupported derived operation
 // PIPELINE-STAGING-NO-GAIN: staging_does_not_shorten_lifetime
+// PIPELINE-ROLLBACK-MATERIALIZATION-REPORT-DAG: "accepted": false
+// PIPELINE-ROLLBACK-MATERIALIZATION-REPORT-DAG: "committed": false
+// PIPELINE-ROLLBACK-MATERIALIZATION-REPORT-DAG: "rolled_back": true
+// PIPELINE-ROLLBACK-MATERIALIZATION-REPORT-DAG: "failure_phase": "post_rewrite_audit"
 // PIPELINE-STAGING-LAYOUT-CHAIN-LABEL: tt.func @register_to_lds_layout_chain
 // PIPELINE-STAGING-LAYOUT-CHAIN: ttg.local_load
 // PIPELINE-STAGING-LAYOUT-CHAIN: tt.reshape
@@ -451,6 +474,17 @@
 // PIPELINE-MIXED-MULTIDISTANCE-REPORT-DAG: "pipeline_expanded": true
 // PIPELINE-MIXED-CONFLICT: mixed existing-ring/staging plan has overlapping or cross-dependent operation families
 // PIPELINE-MIXED-CAPACITY: requested mixed LDS plan exceeds the target LDS capacity
+// PIPELINE-ROLLBACK-EXPANSION: final pipeline audit found an LDS reuse hazard
+// PIPELINE-ROLLBACK-EXPANSION: sym_name = "mixed_ring_staging_dead"
+// PIPELINE-ROLLBACK-EXPANSION: ttg.local_alloc
+// PIPELINE-ROLLBACK-EXPANSION-SAME: memdesc<2x16x16xf16
+// PIPELINE-ROLLBACK-EXPANSION: tt.load
+// PIPELINE-ROLLBACK-EXPANSION-REPORT-DAG: "accepted": false
+// PIPELINE-ROLLBACK-EXPANSION-REPORT-DAG: "transactional": true
+// PIPELINE-ROLLBACK-EXPANSION-REPORT-DAG: "committed": false
+// PIPELINE-ROLLBACK-EXPANSION-REPORT-DAG: "rolled_back": true
+// PIPELINE-ROLLBACK-EXPANSION-REPORT-DAG: "failure_phase": "final_audit"
+// PIPELINE-ROLLBACK-EXPANSION-REPORT-DAG: "candidate_output_value_graph_fingerprint": "{{[0-9a-f]+}}"
 
 #mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [2, 2], instrShape = [16, 16, 32], isTransposed = true}>
 #dot0 = #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 8}>
@@ -770,6 +804,40 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
     ttg.barrier all
     ttg.local_dealloc %alloc : !ttg.memdesc<2x16x16xf16, #slot_shared, #smem, mutable>
     tt.return %results#0, %results#1, %results#2, %results#3 : tensor<16x16xf16, #slot_blocked>, tensor<16x16xf16, #slot_blocked>, tensor<16x16xf16, #slot_blocked>, tensor<16x16xf16, #slot_blocked>
+  }
+
+  tt.func @mixed_ring_staging_dead(
+      %ring_ptrs: tensor<16x16x!tt.ptr<f16>, #slot_blocked>,
+      %stage_ptrs: tensor<16x16x!tt.ptr<f16>, #slot_blocked>,
+      %input: tensor<16x16xf16, #slot_blocked>)
+      -> tensor<16x16xf16, #slot_blocked> {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c4 = arith.constant 4 : index
+    %c1_i32 = arith.constant 1 : i32
+    %c2_i32 = arith.constant 2 : i32
+    %alloc = ttg.local_alloc : () -> !ttg.memdesc<2x16x16xf16, #slot_shared, #smem, mutable>
+    %result = scf.for %i = %c0 to %c4 step %c1
+        iter_args(%acc = %input) -> tensor<16x16xf16, #slot_blocked> {
+      %i_i32 = arith.index_cast %i : index to i32
+      %current_index = arith.remsi %i_i32, %c2_i32 : i32
+      %previous_index = arith.subi %c1_i32, %current_index : i32
+      %current = ttg.memdesc_index %alloc[%current_index] : !ttg.memdesc<2x16x16xf16, #slot_shared, #smem, mutable> -> !ttg.memdesc<16x16xf16, #slot_shared, #smem, mutable>
+      %previous = ttg.memdesc_index %alloc[%previous_index] : !ttg.memdesc<2x16x16xf16, #slot_shared, #smem, mutable> -> !ttg.memdesc<16x16xf16, #slot_shared, #smem, mutable>
+      %copy = ttg.async_copy_global_to_local %ring_ptrs, %current : tensor<16x16x!tt.ptr<f16>, #slot_blocked> -> <16x16xf16, #slot_shared, #smem, mutable>
+      %commit = ttg.async_commit_group tokens %copy
+      %wait = ttg.async_wait {num = 1 : i32}
+      ttg.barrier all
+      %loaded = ttg.local_load %previous token %wait : !ttg.memdesc<16x16xf16, #slot_shared, #smem, mutable> -> tensor<16x16xf16, #slot_blocked>
+      ttg.barrier all
+      %global = tt.load %stage_ptrs : tensor<16x16x!tt.ptr<f16>, #slot_blocked>
+      %consumer = arith.addf %global, %acc : tensor<16x16xf16, #slot_blocked>
+      scf.yield %consumer : tensor<16x16xf16, #slot_blocked>
+    }
+    %final_wait = ttg.async_wait {num = 0 : i32}
+    ttg.barrier all
+    ttg.local_dealloc %alloc : !ttg.memdesc<2x16x16xf16, #slot_shared, #smem, mutable>
+    tt.return %result : tensor<16x16xf16, #slot_blocked>
   }
 
   tt.func @schedule_apply_fixture() -> i32 {

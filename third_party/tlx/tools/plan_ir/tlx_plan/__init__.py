@@ -1,7 +1,10 @@
 """Extract and verify replayable plans from AMD Triton/TLX TTGIR."""
 
 from .model import PlanBundle, PlanError
-from .pipeline_delta import PlanPipelineDelta
+from .pipeline_delta import (
+    PlanPipelineDelta,
+    make_existing_ring_replay_pipeline_delta,
+)
 from .schedule_delta import PlanScheduleDelta
 from .ttgir import extract_plan, normalize_ttgir
 
@@ -11,5 +14,6 @@ __all__ = [
     "PlanPipelineDelta",
     "PlanScheduleDelta",
     "extract_plan",
+    "make_existing_ring_replay_pipeline_delta",
     "normalize_ttgir",
 ]

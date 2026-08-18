@@ -301,9 +301,19 @@ serializePlanPipelineApplyReport(const PlanPipelineApplyResult &result) {
   llvm::json::Object report{
       {"schema_version", "plan-pipeline-apply-report/0.1"},
       {"accepted", result.accepted},
+      {"transactional", result.transactional},
+      {"committed", result.committed},
+      {"rolled_back", result.rolledBack},
       {"kernel", result.kernel},
       {"input_value_graph_fingerprint", result.inputValueGraphFingerprint},
+      {"candidate_output_value_graph_fingerprint",
+       result.candidateOutputValueGraphFingerprint.empty()
+           ? llvm::json::Value(nullptr)
+           : llvm::json::Value(result.candidateOutputValueGraphFingerprint)},
       {"output_value_graph_fingerprint", result.outputValueGraphFingerprint},
+      {"failure_phase", result.failurePhase.empty()
+                            ? llvm::json::Value(nullptr)
+                            : llvm::json::Value(result.failurePhase)},
       {"error", result.error.empty() ? llvm::json::Value(nullptr)
                                      : llvm::json::Value(result.error)},
       {"moved_operations", result.movedOperationCount},

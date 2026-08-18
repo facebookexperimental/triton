@@ -89,9 +89,14 @@ struct PlanPipelineLoopApplyRecord {
 
 struct PlanPipelineApplyResult {
   bool accepted = false;
+  bool transactional = true;
+  bool committed = false;
+  bool rolledBack = false;
   std::string kernel;
   std::string inputValueGraphFingerprint;
+  std::string candidateOutputValueGraphFingerprint;
   std::string outputValueGraphFingerprint;
+  std::string failurePhase;
   std::string error;
   int64_t movedOperationCount = 0;
   int64_t importedDependencyCount = 0;

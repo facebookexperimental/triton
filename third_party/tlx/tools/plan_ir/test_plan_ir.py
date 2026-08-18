@@ -14,6 +14,7 @@ from tlx_plan.pipeline_delta import (
     PlanPipelineDelta,
     StagingPipelineIntent,
     TransactionPipelineIntent,
+    make_existing_ring_replay_pipeline_delta,
     make_identity_pipeline_delta,
     validate_pipeline_delta,
 )
@@ -613,6 +614,37 @@ def test_identity_pipeline_delta_round_trip_and_dry_run(tmp_path) -> None:
     assert report["identity"]
     assert report["materialization_status"] == "not_applied"
     assert not report["changes_dot_decomposition"]
+
+
+def test_existing_ring_replay_pipeline_delta_from_native_value_graph() -> None:
+    plan, ids = _plan_with_pipeline_contract()
+    value_graph = {
+        "schema_version": "plan-value-graph/0.4",
+        "functions": [
+            {
+                "function": plan.kernel,
+                "semantic_fingerprint": plan.value_graph_fingerprint,
+                "operations": plan.operations,
+                "blocks": plan.blocks,
+                "async_transactions": plan.async_transactions,
+                "async_groups": plan.async_groups,
+                "async_waits": plan.async_waits,
+            }
+        ],
+    }
+    delta = make_existing_ring_replay_pipeline_delta(value_graph)
+    assert delta.kernel == plan.kernel
+    assert delta.input_value_graph_fingerprint == plan.value_graph_fingerprint
+    assert delta.loops[0].loop == ids["loop"]
+    assert delta.loops[0].transactions == [
+        TransactionPipelineIntent(
+            group=ids["group"],
+            action="set_prefetch_distance",
+            distance=2,
+            buffer_depth=2,
+        )
+    ]
+    assert delta.provenance["kind"] == "existing_ring_replay"
 
 
 def test_pipeline_delta_cli_identity_and_validation(tmp_path) -> None:

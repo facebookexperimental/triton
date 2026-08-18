@@ -1,6 +1,6 @@
 # AMD TLX Plan IR prototype
 
-This directory implements M1.1--M1.5b.4e of the profile-guided TLX scheduling
+This directory implements M1.1--M1.5b.5 of the profile-guided TLX scheduling
 design without changing the existing TLX kernels. M1.5b.2 reuses and extends
 Meta's shared modulo-scheduling DDG through backend-neutral APIs.
 
@@ -96,6 +96,15 @@ Meta's shared modulo-scheduling DDG through backend-neutral APIs.
   stage, and invokes the shared expander once. The final graph re-proves every
   expanded existing and new ring contract, and adjacent identical barriers are
   conservatively coalesced without merging partial waits.
+- **M1.5b.5 — transactional real-kernel acceptance:** pipeline application runs
+  on a cloned candidate function and commits only after materialization,
+  expansion, strict Plan IR, MLIR, LDS-hazard, and dot-contract checks pass.
+  Failures leave the original function untouched and report rollback state and
+  the failed phase. A deterministic native-Plan-IR helper selects a complete
+  existing-ring wait family for replay. The pinned BF16 non-causal MHA N=2048,
+  D=128 fused-bridge kernel compiles through that non-empty replay at BM=16,
+  BN=256, four warps, one stage; preserves all 80 scheduled-MFMA sites; emits
+  LLVM IR and gfx950 ISA; and passes the 40 dB SNR gate on gfx950.
 
 M1.5a lowers only verified intra-iteration schedule permutations. M1.5b.1
 validates cross-iteration intent. M1.5b.2 applies schedules already represented
@@ -104,7 +113,8 @@ for that existing ring. M1.5b.4a introduces synchronous single-slot
 `register_to_lds`, M1.5b.4b extends it through supported derived register
 paths, M1.5b.4c adds strict same-iteration `global_to_lds`, and M1.5b.4d adds
 buffered cross-iteration `global_to_lds`. M1.5b.4e composes independent
-existing-ring and new-staging intents in one loop.
+existing-ring and new-staging intents in one loop. M1.5b.5 makes every apply
+transactional and closes the milestone on the pinned fused-bridge kernel.
 
 ## Reproduction
 
@@ -216,8 +226,11 @@ export TRITON_TLX_PIPELINE_APPLY_REPORT=/tmp/pipeline-apply-report.json
 ```
 
 Every requested async group sharing a positive-distance wait must be present.
-The M1.5b.2 identity path requires exact analyzed distance/depth and preserves
-the stable fingerprint. M1.5b.3 accepts a changed depth/distance only when all
+The M1.5b.2 replay path requires exact analyzed distance/depth and preserves
+the exact MLIR operations, SSA values, storage/synchronization structure, and
+dot contract. Its output graph fingerprint may change because operation order
+changes liveness and resource layers. M1.5b.3 accepts a changed depth/distance
+only when all
 readers and writers of the existing root are selected and directly indexed. It
 rejects capacity overflow and new-staging intents. Its report records LDS bytes,
 rewritten slots, waits/barriers, pre/post fingerprints, the post-rewrite audit,
@@ -242,6 +255,15 @@ consumers, source lifetime changes, eliminated global loads, direct LDS
 copies, inserted commit/wait operations, requested distance/depth, and whether
 pipeline expansion ran.
 
+Every native apply is transactional. The pass mutates a cloned candidate
+function, verifies the candidate module, and transfers the candidate body into
+the original function only after final acceptance. The report fields
+`transactional`, `committed`, `rolled_back`, `failure_phase`, and
+`candidate_output_value_graph_fingerprint` distinguish a committed plan from a
+rejected candidate. Resolution, materialization, post-rewrite audit, expansion,
+final audit, and candidate-module verification failures leave the original
+function untouched.
+
 ## M1.5b.4e mixed-plan composition
 
 Synchronous mixed plans apply existing-ring mutations first, then new staging,
@@ -261,6 +283,24 @@ async waits, including unrelated retained groups, are not coalesced. Focused
 lit coverage includes ring plus register staging, same-iteration global
 staging, buffered global staging, two distinct staging distances, unified
 capacity rejection, and overlapping-family rejection.
+
+## M1.5b.5 pinned fused-bridge acceptance
+
+`make_existing_ring_replay_pipeline_delta` consumes the native
+`plan-value-graph/0.4` sidecar and deterministically selects one complete
+positive-distance wait family whose transactions have exact consumer distance
+and modulo slot depth. The resulting non-empty delta replays those physical
+contracts and lets the shared modulo scheduler choose a new legal operation
+order without requesting ring or staging materialization.
+
+The pinned acceptance test compiles
+`_attn_bwd_dkdv_dq_d128_gqa_kernel` for BF16, non-causal MHA with B=Hq=Hkv=1,
+N=2048, D=128 and fixed BM=16, BN=256, warps=4, stages=1. It captures native
+Plan IR, constructs the replay delta, and recompiles with
+`TRITON_TLX_PIPELINE_PLAN`. Acceptance requires a committed transaction, a
+strict post-rewrite audit, unchanged storage/synchronization/decomposition
+flags, 80 scheduled-MFMA sites, LLVM IR and gfx950 ISA emission, and at least
+40 dB SNR for dQ, dK, and dV when gfx950 hardware is available.
 
 The fixed configuration names and kernel symbols are sourced from
 `third_party/tlx/tutorials/amd_fa_bwd.py`:

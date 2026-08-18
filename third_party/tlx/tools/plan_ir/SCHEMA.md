@@ -153,9 +153,21 @@ frontiers collapsing onto an outer-loop operation.
 
 `plan-pipeline-apply-report/0.1` records acceptance, resolved groups, modulo II,
 selected/moved operation counts, imported/skipped dependencies, and stable
-pre/post fingerprints. All `changes_*` fields remain false. Materializing new
+pre/post graph fingerprints. An operation-order replay may produce a different
+output fingerprint because liveness and resource layers are order-sensitive;
+acceptance instead requires the exact same MLIR operations, SSA values,
+storage/synchronization structure, and dot contract. All `changes_*` fields
+remain false. Materializing new
 LDS allocations, waits/barriers, prefetch distances, or buffer depths is not
 part of M1.5b.2.
+
+Application is transactional. The pass clones the target function into a
+temporary module, applies and audits the candidate, verifies the candidate
+module, and commits by transferring the accepted body back to the original
+function. `transactional`, `committed`, `rolled_back`, `failure_phase`, and
+`candidate_output_value_graph_fingerprint` expose the outcome. Failures after
+candidate creation roll back without modifying the original function; parse
+failures occur before a candidate transaction exists.
 
 ### M1.5b.3 existing-ring materialization
 
@@ -305,3 +317,22 @@ Focused lit coverage includes existing ring plus register staging, existing
 ring plus same-iteration global staging, existing ring plus buffered global
 staging, two staging distances in one expansion, combined-capacity overflow,
 and overlapping/cross-dependent family rejection.
+
+### M1.5b.5 real-kernel acceptance
+
+The native-sidecar helper `make_existing_ring_replay_pipeline_delta` chooses a
+deterministic complete positive-distance wait family. Every selected group must
+be committed in one structured loop, contain complete transactions, have one
+exact positive consumer distance, and resolve one exact modulo slot depth. The
+generated non-empty delta requests those existing distances and depths, so it
+exercises shared-DDG modulo scheduling without requesting storage,
+synchronization, staging, or dot-decomposition changes.
+
+The acceptance kernel is the fixed BF16 non-causal MHA specialization of
+`_attn_bwd_dkdv_dq_d128_gqa_kernel` at B=Hq=Hkv=1, N=2048, D=128, BM=16,
+BN=256, warps=4, stages=1 on gfx950. The compiler test captures the native
+`plan-value-graph/0.4` sidecar, generates and applies the replay delta, requires
+a committed transaction and strict post-rewrite audit, preserves all 80
+scheduled-MFMA sites, and reaches LLVM IR and AMDGCN. On gfx950 it additionally
+executes the main kernel plus dQ conversion and requires at least 40 dB SNR for
+dQ, dK, and dV.

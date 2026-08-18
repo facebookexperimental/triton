@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from .model import PlanBundle, PlanError, canonical_json
 
@@ -337,6 +337,142 @@ def make_identity_pipeline_delta(plan: PlanBundle) -> PlanPipelineDelta:
         provenance={"source_plan_schema": plan.schema_version},
     )
     delta.validate(plan)
+    return delta
+
+
+def make_existing_ring_replay_pipeline_delta(
+    value_graph: Mapping[str, Any], *, kernel: str | None = None
+) -> PlanPipelineDelta:
+    """Replay one complete existing-ring wait family from native Plan IR.
+
+    The chosen family is deterministic and preserves every analyzed distance
+    and slot depth. Applying the returned non-empty delta therefore exercises
+    operation-order scheduling without requesting storage or synchronization
+    changes.
+    """
+
+    if value_graph.get("schema_version") not in {
+        "plan-value-graph/0.1",
+        "plan-value-graph/0.2",
+        "plan-value-graph/0.3",
+        "plan-value-graph/0.4",
+    }:
+        raise PlanError("unsupported native plan-value-graph schema")
+    functions = value_graph.get("functions", [])
+    if kernel is None:
+        if len(functions) != 1:
+            raise PlanError("native value graph requires an explicit kernel selection")
+        function = functions[0]
+    else:
+        function = next(
+            (entry for entry in functions if entry.get("function") == kernel), None
+        )
+        if function is None:
+            raise PlanError(f"native value graph does not contain kernel {kernel!r}")
+
+    operations = {operation["id"]: operation for operation in function.get("operations", [])}
+    operation_parent = {
+        operation: block.get("parent_operation")
+        for block in function.get("blocks", [])
+        for operation in block.get("operations", [])
+    }
+    groups = {group["id"]: group for group in function.get("async_groups", [])}
+    transactions = {
+        transaction["id"]: transaction
+        for transaction in function.get("async_transactions", [])
+    }
+
+    candidates: list[
+        tuple[str, str, int, tuple[str, ...], list[TransactionPipelineIntent]]
+    ] = []
+    for wait in function.get("async_waits", []):
+        completions_by_distance: dict[int, set[str]] = {}
+        for completion in wait.get("completed_groups", []):
+            distance = completion.get("iteration_distance", 0)
+            if isinstance(distance, int) and distance > 0:
+                completions_by_distance.setdefault(distance, set()).add(
+                    completion.get("group", "")
+                )
+        for completion_distance, family_set in completions_by_distance.items():
+            family = tuple(sorted(family_set))
+            if not family or any(group not in groups for group in family):
+                continue
+            loop_ids = {
+                operation_parent.get(groups[group].get("commit_operation"))
+                for group in family
+            }
+            if len(loop_ids) != 1:
+                continue
+            loop = next(iter(loop_ids))
+            if not loop or operations.get(loop, {}).get("kind") not in LOOP_KINDS:
+                continue
+
+            intents: list[TransactionPipelineIntent] = []
+            valid = True
+            for group_id in family:
+                group = groups[group_id]
+                group_transactions = [
+                    transactions.get(transaction)
+                    for transaction in group.get("transactions", [])
+                ]
+                if not group_transactions or any(
+                    transaction is None for transaction in group_transactions
+                ):
+                    valid = False
+                    break
+                distances = {
+                    frontier.get("iteration_distance", 0)
+                    for transaction in group_transactions
+                    for frontier in transaction.get("consumer_frontiers", [])
+                    if frontier.get("iteration_distance", 0) > 0
+                }
+                depths = {
+                    index.get("modulus", 0)
+                    for transaction in group_transactions
+                    for path in transaction.get("slot_paths", [])
+                    for index in path.get("indices", [])
+                    if index.get("modulus", 0) > 0
+                }
+                if len(distances) != 1 or len(depths) != 1:
+                    valid = False
+                    break
+                intents.append(
+                    TransactionPipelineIntent(
+                        group=group_id,
+                        action="set_prefetch_distance",
+                        distance=next(iter(distances)),
+                        buffer_depth=next(iter(depths)),
+                    )
+                )
+            if valid:
+                candidates.append(
+                    (
+                        loop,
+                        wait.get("operation", ""),
+                        completion_distance,
+                        family,
+                        intents,
+                    )
+                )
+
+    if not candidates:
+        raise PlanError("native value graph has no replayable existing-ring wait family")
+    loop, wait, completion_distance, family, intents = min(
+        candidates, key=lambda candidate: candidate[:4]
+    )
+    delta = PlanPipelineDelta(
+        kernel=function["function"],
+        input_value_graph_fingerprint=function["semantic_fingerprint"],
+        loops=[LoopPipelineDelta(loop=loop, transactions=intents)],
+        provenance={
+            "source_plan_schema": value_graph["schema_version"],
+            "kind": "existing_ring_replay",
+            "wait": wait,
+            "wait_completion_distance": completion_distance,
+            "groups": list(family),
+        },
+    )
+    delta.validate()
     return delta
 
 

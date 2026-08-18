@@ -1680,6 +1680,7 @@ static LogicalResult
 applyPlanPipeline(tt::FuncOp function, const tt::plan::PlanPipelineDelta &delta,
                   tt::plan::PlanPipelineApplyResult &result, std::string &error,
                   bool strict) {
+  result.failurePhase = "pre_apply_validation";
   result.kernel = function.getName().str();
   if (delta.kernel != function.getName())
     return fail(result, error, "pipeline delta kernel does not match function");
@@ -1704,6 +1705,7 @@ applyPlanPipeline(tt::FuncOp function, const tt::plan::PlanPipelineDelta &delta,
   for (const auto &[value, id] : valueBindings)
     valueById[id] = value;
 
+  result.failurePhase = "plan_resolution";
   SmallVector<ResolvedLoopPipeline, 1> resolved;
   for (const tt::plan::PlanLoopPipelineDelta &requested : delta.loops) {
     auto operationIt = operationById.find(requested.loopId);
@@ -1721,6 +1723,7 @@ applyPlanPipeline(tt::FuncOp function, const tt::plan::PlanPipelineDelta &delta,
     resolved.push_back(std::move(current));
   }
 
+  result.failurePhase = "materialization";
   for (ResolvedLoopPipeline &loop : resolved) {
     Operation *terminator = loop.loop.getBody()->getTerminator();
     for (Operation *operation : loop.desiredOrder)
@@ -1766,6 +1769,7 @@ applyPlanPipeline(tt::FuncOp function, const tt::plan::PlanPipelineDelta &delta,
     return fail(result, error,
                 "MLIR verification failed after pipeline schedule apply");
 
+  result.failurePhase = "post_rewrite_audit";
   llvm::DenseMap<Operation *, std::string> postBindings;
   llvm::DenseMap<Value, std::string> postValueBindings;
   FailureOr<tt::plan::PlanValueGraph> postGraph =
@@ -1775,14 +1779,27 @@ applyPlanPipeline(tt::FuncOp function, const tt::plan::PlanPipelineDelta &delta,
       (strict && failed(postGraph->verify(/*strict=*/true))))
     return fail(result, error,
                 "failed to build a strict post-apply value graph");
-  std::string materializedFingerprint =
-      postGraph->getSemanticFingerprint().str();
   bool hasStorageMutation =
       llvm::any_of(resolved, [](const ResolvedLoopPipeline &loop) {
         return !loop.ringMutations.empty() || !loop.stagingMutations.empty();
       });
   if (!hasStorageMutation) {
-    if (materializedFingerprint != result.inputValueGraphFingerprint)
+    if (frozenDotSignature(function) != dotSignatureBefore)
+      return fail(result, error,
+                  "dot decomposition or accumulator contract changed during "
+                  "pipeline scheduling");
+    // An operation-order-only plan deliberately changes block order. That can
+    // change liveness/resource layers and can also renumber stable IDs for
+    // repeated source locations. Require the exact same MLIR operations and
+    // SSA values to survive instead of requiring an unchanged graph digest.
+    if (operationBindings.size() != postBindings.size() ||
+        valueBindings.size() != postValueBindings.size() ||
+        llvm::any_of(operationBindings, [&](const auto &entry) {
+          return !postBindings.contains(entry.first);
+        }) ||
+        llvm::any_of(valueBindings, [&](const auto &entry) {
+          return !postValueBindings.contains(entry.first);
+        }))
       return fail(
           result, error,
           "stable operation/value identity changed after pipeline apply");
@@ -1797,6 +1814,7 @@ applyPlanPipeline(tt::FuncOp function, const tt::plan::PlanPipelineDelta &delta,
       return fail(result, error,
                   "storage or synchronization structure changed after "
                   "pipeline apply");
+    result.postRewriteAuditPassed = true;
   } else {
     if (frozenDotSignature(function) != dotSignatureBefore)
       return fail(result, error,
@@ -1835,6 +1853,7 @@ applyPlanPipeline(tt::FuncOp function, const tt::plan::PlanPipelineDelta &delta,
         return loop.pipelineExpansionRequired;
       });
   if (requiresExpansion) {
+    result.failurePhase = "pipeline_expansion";
     for (ResolvedLoopPipeline &loop : resolved) {
       if (failed(serializeBufferedStagingSchedule(loop, error))) {
         result.error = error;
@@ -1853,6 +1872,7 @@ applyPlanPipeline(tt::FuncOp function, const tt::plan::PlanPipelineDelta &delta,
   }
   coalesceAdjacentBarriers(function);
 
+  result.failurePhase = "final_audit";
   llvm::DenseMap<Operation *, std::string> finalBindings;
   FailureOr<tt::plan::PlanValueGraph> finalGraph =
       tt::plan::PlanValueGraph::build(function, &finalBindings);
@@ -1860,6 +1880,8 @@ applyPlanPipeline(tt::FuncOp function, const tt::plan::PlanPipelineDelta &delta,
       (strict && failed(finalGraph->verify(/*strict=*/true))))
     return fail(result, error,
                 "failed to build a strict final pipeline value graph");
+  result.candidateOutputValueGraphFingerprint =
+      finalGraph->getSemanticFingerprint().str();
   if (!finalGraph->getLdsReuseHazards().empty())
     return fail(result, error,
                 "final pipeline audit found an LDS reuse hazard");
@@ -1879,9 +1901,6 @@ applyPlanPipeline(tt::FuncOp function, const tt::plan::PlanPipelineDelta &delta,
     result.error = error;
     return failure();
   }
-  result.outputValueGraphFingerprint =
-      finalGraph->getSemanticFingerprint().str();
-
   for (ResolvedLoopPipeline &loop : resolved) {
     recordStagingResults(loop);
     result.movedOperationCount += loop.record.movedOperationCount;
@@ -1889,6 +1908,43 @@ applyPlanPipeline(tt::FuncOp function, const tt::plan::PlanPipelineDelta &delta,
     result.skippedDependencyCount += loop.record.skippedDependencyCount;
     result.loops.push_back(std::move(loop.record));
   }
+  result.accepted = true;
+  result.failurePhase.clear();
+  return success();
+}
+
+static LogicalResult
+applyPlanPipelineTransaction(ModuleOp module, tt::FuncOp target,
+                             const tt::plan::PlanPipelineDelta &delta,
+                             tt::plan::PlanPipelineApplyResult &result,
+                             std::string &error, bool strict) {
+  OwningOpRef<ModuleOp> candidateModule = ModuleOp::create(module.getLoc());
+  candidateModule->getOperation()->setAttrs(module->getAttrDictionary());
+  auto candidateTarget = cast<tt::FuncOp>(target->clone());
+  candidateModule->getBody()->push_back(candidateTarget);
+
+  if (failed(
+          applyPlanPipeline(candidateTarget, delta, result, error, strict))) {
+    result.rolledBack = true;
+    result.committed = false;
+    result.accepted = false;
+    return failure();
+  }
+  if (failed(mlir::verify(*candidateModule))) {
+    result.failurePhase = "candidate_module_verification";
+    result.error = error = "candidate module verification failed";
+    result.rolledBack = true;
+    result.committed = false;
+    result.accepted = false;
+    return failure();
+  }
+
+  target->setAttrs(candidateTarget->getAttrDictionary());
+  target.getBody().takeBody(candidateTarget.getBody());
+  result.outputValueGraphFingerprint =
+      result.candidateOutputValueGraphFingerprint;
+  result.committed = true;
+  result.rolledBack = false;
   result.accepted = true;
   return success();
 }
@@ -1939,8 +1995,8 @@ struct TritonAMDGPUApplyPlanPipelinePass
       module.emitError(result.error);
       return signalPassFailure();
     }
-    if (failed(applyPlanPipeline(target, *delta, result, error,
-                                 /*strict=*/strict))) {
+    if (failed(applyPlanPipelineTransaction(module, target, *delta, result,
+                                            error, /*strict=*/strict))) {
       (void)writeReport(module, reportPath,
                         tt::plan::serializePlanPipelineApplyReport(result));
       target.emitError(error);

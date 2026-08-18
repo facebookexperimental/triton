@@ -8,6 +8,7 @@ required for the compilation checks. Correctness checks (actual execution) run
 only when the corresponding hardware is available.
 """
 import importlib.util
+import json
 import re
 import sys
 from pathlib import Path
@@ -110,14 +111,51 @@ def test_amd_sched_group_barrier_options_are_cache_keyed_and_validated():
         amd_compiler.HIPOptions(arch="gfx950", sched_group_barrier_required_region_count=-1)
 
 
-def compile_for_target(fn, signature, constexprs, target):
-    src = ASTSource(fn=fn, signature=signature, constexprs=constexprs)
-    return triton_compile(src, target=target)
+def compile_for_target(fn, signature, constexprs, target, *, attrs=None, options=None):
+    src = ASTSource(fn=fn, signature=signature, constexprs=constexprs, attrs=attrs)
+    return triton_compile(src, target=target, options=options)
 
 
-def compile_for_gfx950(fn, signature, constexprs):
+def compile_for_gfx950(fn, signature, constexprs, *, attrs=None, options=None):
     """Compile a TLX kernel for gfx950 and return the compiled object."""
-    return compile_for_target(fn, signature, constexprs, GFX950)
+    return compile_for_target(
+        fn, signature, constexprs, GFX950, attrs=attrs, options=options
+    )
+
+
+def _compile_fa_bwd_mha_n2048_d128_gfx950():
+    from triton.language.extra.tlx.tutorials.amd_fa_bwd import (
+        _attn_bwd_dkdv_dq_d128_gqa_kernel, )
+
+    pointer_attrs = {
+        (index, ): [["tt.divisibility", 16], ["tt.pointer_range", 32]]
+        for index in range(9)
+    }
+    return compile_for_gfx950(
+        _attn_bwd_dkdv_dq_d128_gqa_kernel,
+        signature={
+            "Q": "*bf16",
+            "K": "*bf16",
+            "V": "*bf16",
+            "DO": "*bf16",
+            "LSE": "*fp32",
+            "Delta": "*fp32",
+            "DQ_ACC": "*bf16",
+            "DK": "*bf16",
+            "DV": "*bf16",
+        },
+        constexprs={
+            "SM_SCALE": 128**-0.5,
+            "HQ": 1,
+            "HK": 1,
+            "N": 2048,
+            "D": 128,
+            "BLOCK_M": 16,
+            "BLOCK_N": 256,
+        },
+        attrs=pointer_attrs,
+        options={"num_warps": 4, "num_stages": 1},
+    )
 
 
 @triton.jit
@@ -433,6 +471,103 @@ def test_gqa_oversized_batches_rebase_buffer_offsets_gfx950():
     )
 
     assert "amdgcn" in compiled.asm
+
+
+def test_fa_bwd_mha_pipeline_plan_replay_gfx950(tmp_path, monkeypatch):
+    plan_tools = Path(__file__).resolve().parents[4] / "third_party/tlx/tools/plan_ir"
+    sys.path.insert(0, str(plan_tools))
+    try:
+        from tlx_plan.pipeline_delta import (
+            make_existing_ring_replay_pipeline_delta, )
+    finally:
+        sys.path.pop(0)
+
+    baseline_analysis = tmp_path / "baseline-plan-values"
+    monkeypatch.setenv("TRITON_CACHE_DIR", str(tmp_path / "baseline-cache"))
+    monkeypatch.setenv("TRITON_TLX_PIPELINE_ANALYSIS_DIR", str(baseline_analysis))
+    monkeypatch.delenv("TRITON_TLX_PIPELINE_PLAN", raising=False)
+    monkeypatch.delenv("TRITON_TLX_PIPELINE_APPLY_REPORT", raising=False)
+    baseline = _compile_fa_bwd_mha_n2048_d128_gfx950()
+
+    sidecars = list(baseline_analysis.glob("*.plan-values.json"))
+    assert len(sidecars) == 1
+    value_graph = json.loads(sidecars[0].read_text())
+    delta = make_existing_ring_replay_pipeline_delta(
+        value_graph, kernel="_attn_bwd_dkdv_dq_d128_gqa_kernel"
+    )
+    delta.provenance.update(
+        milestone="M1.5b.5",
+        case="mha_n2048_d128",
+        config={"block_m": 16, "block_n": 256, "num_warps": 4, "num_stages": 1},
+    )
+    delta_path = tmp_path / "pipeline-delta.json"
+    report_path = tmp_path / "pipeline-apply-report.json"
+    delta.write(delta_path)
+
+    monkeypatch.setenv("TRITON_CACHE_DIR", str(tmp_path / "applied-cache"))
+    monkeypatch.setenv(
+        "TRITON_TLX_PIPELINE_ANALYSIS_DIR", str(tmp_path / "applied-plan-values")
+    )
+    monkeypatch.setenv("TRITON_TLX_PIPELINE_PLAN", str(delta_path))
+    monkeypatch.setenv("TRITON_TLX_PIPELINE_APPLY_REPORT", str(report_path))
+    applied = _compile_fa_bwd_mha_n2048_d128_gfx950()
+    report = json.loads(report_path.read_text())
+
+    baseline_ttgir = str(baseline.asm["ttgir"])
+    applied_ttgir = str(applied.asm["ttgir"])
+    assert baseline_ttgir.count("amdg.scheduled_mfma") == 80
+    assert applied_ttgir.count("amdg.scheduled_mfma") == 80
+    assert baseline_ttgir.count("tt.dot") == applied_ttgir.count("tt.dot")
+    assert applied.asm["llir"]
+    assert applied.asm["amdgcn"]
+    assert report["accepted"]
+    assert report["transactional"]
+    assert report["committed"]
+    assert not report["rolled_back"]
+    assert report["failure_phase"] is None
+    assert report["post_rewrite_audit_passed"]
+    assert report["materialization_scope"] == "existing_lds_operation_order"
+    assert report["moved_operations"] > 0
+    assert report["imported_dependencies"] > 0
+    assert report["candidate_output_value_graph_fingerprint"]
+    assert (
+        report["output_value_graph_fingerprint"]
+        == report["candidate_output_value_graph_fingerprint"]
+    )
+    assert not report["changes_iteration_storage"]
+    assert not report["changes_synchronization"]
+    assert not report["changes_dot_decomposition"]
+
+    if is_hip_cdna4():
+        from triton.language.extra.tlx.tutorials.amd_fa_bwd import (
+            _run_bwd_d128_gqa,
+            _run_bwd_preprocess,
+            _snr_db,
+            make_reference_case,
+        )
+
+        case = make_reference_case((1, 1, 2048, 128), False, seed=23)
+        delta_values = torch.empty(
+            case.q.shape[:-1], device="cuda", dtype=torch.float32
+        )
+        _run_bwd_preprocess(case.o, case.do, delta_values)
+        dq_acc = torch.zeros_like(case.q)
+        actual = tuple(torch.empty_like(case.q) for _ in range(3))
+        _run_bwd_d128_gqa(
+            case.q,
+            case.k,
+            case.v,
+            case.do,
+            case.lse,
+            delta_values,
+            dq_acc,
+            *actual,
+            case.sm_scale,
+            fixed_best=True,
+        )
+        for value, expected in zip(actual, case.grads):
+            assert torch.isfinite(value).all()
+            assert _snr_db(value, expected) >= 40.0
 
 
 def test_gqa_oversized_head_rebases_native_conversion_gfx950():
