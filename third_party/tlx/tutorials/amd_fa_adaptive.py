@@ -283,29 +283,11 @@ def _registers_to_probability_fragments(registers, p_layout: tl.constexpr):
 
 @triton.jit
 def _pin_score_register_layout(registers):
-    score_register_layout: tl.constexpr = (tlx.distributed_linear_layout_encoding.make(
-        reg_bases=[
-            [0, 1],
-            [0, 2],
-            [0, 4],
-            [0, 8],
-        ],
-        lane_bases=[
-            [1, 0],
-            [2, 0],
-            [4, 0],
-            [8, 0],
-            [16, 0],
-            [32, 0],
-        ],
-        warp_bases=[
-            [64, 0],
-            [128, 0],
-            [256, 0],
-        ],
-        block_bases=[],
-        shape=[8 * 64, 16],
-    ))
+    # Threads enumerate rows and each thread's values enumerate columns.
+    score_register_layout: tl.constexpr = tlx.layout(
+        shape=((8 * 64, ), (16, )),
+        stride=((16, ), (1, )),
+    )
     return tlx.require_layout(registers, score_register_layout)
 
 
@@ -1459,31 +1441,12 @@ def _attn_fwd_adaptive_pipeline(
         mma_layout,
         k_width=8,
     )
-    q_load_layout: tl.constexpr = (tlx.distributed_linear_layout_encoding.make(
-        reg_bases=[
-            [0, 1],
-            [0, 2],
-            [0, 4],
-            [0, 16],
-            [0, 32],
-            [0, 64],
-        ],
-        lane_bases=[
-            [1, 0],
-            [2, 0],
-            [4, 0],
-            [8, 0],
-            [16, 0],
-            [0, 8],
-        ],
-        warp_bases=[
-            [32, 0],
-            [64, 0],
-            [128, 0],
-        ],
-        block_bases=[],
-        shape=[256, 128],
-    ))
+    # Lane bits 0..4 and all warp bits select rows; lane bit 5 selects column
+    # 8. The two value modes select columns 0..7 and 16-element groups.
+    q_load_layout: tl.constexpr = tlx.layout(
+        shape=((32, 2, 8), (8, 8)),
+        stride=((128, 8, 4096), (1, 16)),
+    )
     k_layout: tl.constexpr = tlx.dot_operand_layout(
         1,
         mma_layout,

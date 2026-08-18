@@ -1132,35 +1132,6 @@ TLX uses **CUDA-native cluster semantics** which differs from Triton's approach:
     consumer, for example when a dot-operand layout feeds a reduction. This is
     not a conversion request; use another `require_layout` when the replacement
     layout is part of the algorithm.
-
-- `tlx.distributed_linear_layout_encoding.make(reg_bases, lane_bases, warp_bases, block_bases, shape)` **[Hopper+, MI300+]**
-
-    Construct a distributed linear encoding directly from physical input
-    bases. Each basis vector has one component per logical tensor dimension:
-
-    - `reg_bases` maps values held by one lane.
-    - `lane_bases` maps lane-id bits.
-    - `warp_bases` maps warp-id bits.
-    - `block_bases` maps program-block bits.
-    - `shape` gives the logical result dimensions and extents.
-
-    The bases must cover the requested shape; construction fails when the map
-    is not surjective. Use this API only when an instruction ABI or
-    register-level algorithm requires exact physical ownership. Prefer
-    `tlx.layout(shape=..., stride=...)` for ordinary logical layouts so layout
-    inference retains more freedom.
-
-    ```python
-    physical: tl.constexpr = tlx.distributed_linear_layout_encoding.make(
-        reg_bases=[[0, 1], [0, 2]],
-        lane_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0]],
-        warp_bases=[[64, 0], [128, 0], [256, 0]],
-        block_bases=[],
-        shape=[512, 4],
-    )
-    pinned = tlx.require_layout(value, physical)
-    ```
-
 - `tlx.assert_same_layout(lhs, rhs)` **[Hopper+, MI300+]**
 
     Compile-time assertion that two layouts are equivalent after layout

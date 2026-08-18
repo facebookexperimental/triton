@@ -517,30 +517,6 @@ void init_triton_tlx_ir(py::module_ &m) {
              return mlir::cast<Attribute>(ttg::SharedLinearEncodingAttr::get(
                  context, std::move(ll), alignment));
            })
-      .def("make_distributed_linear_encoding_attr",
-           [](TritonOpBuilder &self, std::vector<std::vector<int32_t>> regBases,
-              std::vector<std::vector<int32_t>> laneBases,
-              std::vector<std::vector<int32_t>> warpBases,
-              std::vector<std::vector<int32_t>> blockBases,
-              std::vector<int64_t> shape) -> Attribute {
-             auto ctx = self.getBuilder().getContext();
-             auto kReg = mlir::StringAttr::get(ctx, "register");
-             auto kLane = mlir::StringAttr::get(ctx, "lane");
-             auto kWarp = mlir::StringAttr::get(ctx, "warp");
-             auto kBlock = mlir::StringAttr::get(ctx, "block");
-             auto outDims = tt::standardOutDimPairs(ctx, shape);
-             auto ll = tt::LinearLayout({{kReg, regBases},
-                                         {kLane, laneBases},
-                                         {kWarp, warpBases},
-                                         {kBlock, blockBases}},
-                                        outDims,
-                                        /*requiresSurjective=*/true);
-             if (ttg::isPermutationMatrixLayout(ll))
-               return mlir::cast<Attribute>(
-                   ttg::LinearEncodingAttr::get(ctx, std::move(ll)));
-             return mlir::cast<Attribute>(
-                 ttg::GenericLinearEncodingAttr::get(ctx, std::move(ll)));
-           })
       .def("make_tensor_memory_encoding_attr",
            [](TritonOpBuilder &self, unsigned blockM, unsigned blockN,
               unsigned colStride, unsigned CTASplitM, unsigned CTASplitN,

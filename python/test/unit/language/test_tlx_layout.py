@@ -1274,13 +1274,10 @@ def _fa_mfma_rows_to_workitems(rows):
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Need gfx950 (CDNA4)")
-def test_distributed_linear_layout_with_standard_casts_on_cdna4():
-    physical = tlx.distributed_linear_layout_encoding.make(
-        reg_bases=[],
-        lane_bases=[[1], [2], [4], [8], [16], [32]],
-        warp_bases=[],
-        block_bases=[],
-        shape=[64],
+def test_cute_layout_with_standard_casts_on_cdna4():
+    physical = tlx.layout(
+        shape=((64, ), ()),
+        stride=((1, ), ()),
     )
 
     @triton.jit

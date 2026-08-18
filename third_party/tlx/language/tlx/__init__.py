@@ -91,7 +91,6 @@ from .types import (
     clc_response_type,
     CLCPipelineContext,
     DummyRegisterLayoutEncoding,
-    distributed_linear_layout_encoding,
     layout_encoding,
     mbarrier,
     mbarrier_type,
@@ -252,7 +251,6 @@ __all__ = [
     "clc_consumer",
     "CLCPipelineContext",
     "DummyRegisterLayoutEncoding",
-    "distributed_linear_layout_encoding",
     # MXFP8
     "_to_mxfp8_block",
     # warp_ops
