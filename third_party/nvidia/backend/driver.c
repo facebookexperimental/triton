@@ -1230,6 +1230,7 @@ static inline cuLaunchKernelEx_t ensureLaunchHandle(void) {
 
 static void _launch(int gridX, int gridY, int gridZ, int num_warps,
                     int num_ctas, int launch_cooperative_grid, int launch_pdl,
+                    int clusterDimX, int clusterDimY, int clusterDimZ,
                     int preferredClusterDimX, int preferredClusterDimY,
                     int preferredClusterDimZ, int shared_memory,
                     CUstream stream, CUfunction function, void **params) {
@@ -1277,16 +1278,22 @@ static void _launch(int gridX, int gridY, int gridZ, int num_warps,
       ++num_attrs;
     }
 
-    if (num_ctas != 1 || preferredClusterDimX > 0) {
-      // Only set CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION for Triton's num_ctas
-      // path. For ctas_per_cga path (num_ctas == 1), PTX's .reqnctapercluster
-      // handles it.
+    if (num_ctas != 1 || clusterDimX > 1 || clusterDimY > 1 ||
+        clusterDimZ > 1 || preferredClusterDimX > 0) {
       if (num_ctas > 1) {
         CUlaunchAttribute clusterAttr = {};
         clusterAttr.id = CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION;
         clusterAttr.value.clusterDim.x = num_ctas;
         clusterAttr.value.clusterDim.y = 1;
         clusterAttr.value.clusterDim.z = 1;
+        launchAttr[num_attrs] = clusterAttr;
+        ++num_attrs;
+      } else if (clusterDimX > 1 || clusterDimY > 1 || clusterDimZ > 1) {
+        CUlaunchAttribute clusterAttr = {};
+        clusterAttr.id = CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION;
+        clusterAttr.value.clusterDim.x = clusterDimX;
+        clusterAttr.value.clusterDim.y = clusterDimY;
+        clusterAttr.value.clusterDim.z = clusterDimZ;
         launchAttr[num_attrs] = clusterAttr;
         ++num_attrs;
       }
@@ -1775,7 +1782,8 @@ static PyObject *launchKernel(PyObject *self, PyObject *args) {
   uint64_t _function;
   int launch_cooperative_grid;
   int launch_pdl;
-  int num_warps, num_ctas, shared_memory, preferredClusterDimX,
+  int num_warps, num_ctas, shared_memory, clusterDimX, clusterDimY, clusterDimZ,
+      preferredClusterDimX,
       preferredClusterDimY, preferredClusterDimZ;
   PyObject *launch_metadata = NULL;
   PyObject *launch_enter_hook = NULL;
@@ -1787,9 +1795,10 @@ static PyObject *launchKernel(PyObject *self, PyObject *args) {
   PyObject *kernel_args = NULL;
   PyObject *auto_tma_recipes_obj = NULL;
   if (!PyArg_ParseTuple(
-          args, "iiiKKpp(iiiiii)OOOOOOy*OO", &gridX, &gridY, &gridZ, &_stream,
+          args, "iiiKKpp(iiiiiiiii)OOOOOOy*OO", &gridX, &gridY, &gridZ, &_stream,
           &_function, &launch_cooperative_grid, &launch_pdl, &num_warps,
-          &num_ctas, &shared_memory, &preferredClusterDimX,
+          &num_ctas, &shared_memory, &clusterDimX, &clusterDimY, &clusterDimZ,
+          &preferredClusterDimX,
           &preferredClusterDimY, &preferredClusterDimZ, &launch_metadata,
           &launch_enter_hook, &launch_exit_hook, &global_scratch_obj,
           &profile_scratch_obj, &arg_annotations, &signature,
@@ -1800,6 +1809,27 @@ static PyObject *launchKernel(PyObject *self, PyObject *args) {
   // launch entry hook.
   if (!launchHook(launch_enter_hook, launch_metadata)) {
     goto cleanup;
+  }
+
+  {
+    const uint32_t launch_grid[3] = {(uint32_t)gridX, (uint32_t)gridY,
+                                     (uint32_t)gridZ};
+    CUresult grid_status = triton_validate_exact_cluster_grid(
+        launch_grid, num_ctas,
+        (const int[3]){clusterDimX, clusterDimY, clusterDimZ});
+    if (grid_status != CUDA_SUCCESS) {
+      uint32_t required[3];
+      triton_get_exact_cluster_shape(
+          num_ctas, (const int[3]){clusterDimX, clusterDimY, clusterDimZ},
+          required);
+      PyErr_Format(PyExc_ValueError,
+                   "Triton cluster requirement failed: physical grid "
+                   "(%llu, %d, %d) is not divisible by required cluster "
+                   "shape (%u, %u, %u)",
+                   (unsigned long long)gridX * (unsigned long long)num_ctas,
+                   gridY, gridZ, required[0], required[1], required[2]);
+      goto cleanup;
+    }
   }
 
   uint8_t *extractor_data = (uint8_t *)signature.buf;
@@ -1852,18 +1882,14 @@ static PyObject *launchKernel(PyObject *self, PyObject *args) {
   desc.shared_mem = (unsigned)shared_memory;
   desc.launch_pdl = launch_pdl;
   desc.launch_cooperative_grid = launch_cooperative_grid;
-  /* Behavior-preserving vs the legacy _launch: that path requested cluster
-   * attributes iff (num_ctas != 1 || preferredClusterDimX > 0). Here we only
-   * carry the preferred-dim bit; the shared core also fires on num_ctas > 1,
-   * so the combined condition reproduces the legacy set. (The JIT launcher has
-   * no separate compile-time launch_cluster signal -- unlike TritonCC/AOT-T,
-   * which pass it explicitly from make_launcher_src metadata.) */
-  desc.launch_cluster = (preferredClusterDimX > 0) ? 1 : 0;
-  // JIT variadic launcher uses the 1-D num_ctas cluster + preferred-cluster
-  // hint only; it never emits an explicit multi-dim CLUSTER_DIMENSION.
-  desc.cluster_dims[0] = 0;
-  desc.cluster_dims[1] = 0;
-  desc.cluster_dims[2] = 0;
+  desc.launch_cluster =
+      (clusterDimX > 1 || clusterDimY > 1 || clusterDimZ > 1 ||
+       preferredClusterDimX > 0)
+          ? 1
+          : 0;
+  desc.cluster_dims[0] = clusterDimX;
+  desc.cluster_dims[1] = clusterDimY;
+  desc.cluster_dims[2] = clusterDimZ;
   desc.preferred_cluster_dims[0] = preferredClusterDimX;
   desc.preferred_cluster_dims[1] = preferredClusterDimY;
   desc.preferred_cluster_dims[2] = preferredClusterDimZ;
@@ -2138,8 +2164,9 @@ static PyObject *launchKernel(PyObject *self, PyObject *args) {
         _fb_params[i] = (char *)args_buf + pdescs[i].offset;
       Py_BEGIN_ALLOW_THREADS;
       _launch(gridX, gridY, gridZ, num_warps, num_ctas, launch_cooperative_grid,
-              launch_pdl, preferredClusterDimX, preferredClusterDimY,
-              preferredClusterDimZ, shared_memory, (CUstream)_stream,
+              launch_pdl, clusterDimX, clusterDimY, clusterDimZ,
+              preferredClusterDimX, preferredClusterDimY, preferredClusterDimZ,
+              shared_memory, (CUstream)_stream,
               (CUfunction)_function, _fb_params);
       Py_END_ALLOW_THREADS;
       if (!PyErr_Occurred())
@@ -2253,6 +2280,7 @@ typedef struct {
   PyObject_HEAD vectorcallfunc vectorcall;
   CUfunction function;
   unsigned grid_mult;   /* num_ctas — grid_x multiplied by this */
+  int cluster_dims[3];
   unsigned block_dim_x; /* 32 * num_warps */
   unsigned shared_mem;
   CUlaunchAttribute launch_attrs[6];
@@ -2639,9 +2667,13 @@ static inline CUresult td_relaunch(TritonDispatcher *d, unsigned gx,
    * grids such as (1 << 26, 64, 1), which would silently skip the launch. */
   if (gx == 0 || gy == 0 || gz == 0)
     return CUDA_SUCCESS;
+  const uint32_t grid[3] = {gx, gy, gz};
+  CUresult grid_status = triton_validate_exact_cluster_grid(
+      grid, (int)d->grid_mult, d->cluster_dims);
+  if (grid_status != CUDA_SUCCESS)
+    return grid_status;
   if (d->use_core_launch) {
     /* Converged path: launch through the shared core in launch.h. */
-    const uint32_t grid[3] = {gx, gy, gz};
     return triton_launch_kernel(grid, stream, d->function,
                                 (void *)d->arg_storage, &d->core_desc);
   }
@@ -2718,6 +2750,9 @@ static PyObject *TritonDispatcher_new(PyTypeObject *type, PyObject *args,
   self->vectorcall = TritonDispatcher_vectorcall;
   self->function = (CUfunction)(uintptr_t)func_ptr;
   self->grid_mult = (unsigned)num_ctas;
+  self->cluster_dims[0] = cluster_dim_x;
+  self->cluster_dims[1] = cluster_dim_y;
+  self->cluster_dims[2] = cluster_dim_z;
   self->block_dim_x = 32 * (unsigned)num_warps;
   self->shared_mem = (unsigned)shared_mem;
   self->has_global_scratch = has_global_scratch;
@@ -2982,6 +3017,22 @@ static PyObject *TritonDispatcher_vectorcall(PyObject *callable,
   unsigned gx = (unsigned)gx_l;
   unsigned gy = (unsigned)gy_l;
   unsigned gz = (unsigned)gz_l;
+
+  const uint32_t grid[3] = {gx, gy, gz};
+  CUresult grid_status = triton_validate_exact_cluster_grid(
+      grid, (int)self->grid_mult, self->cluster_dims);
+  if (grid_status != CUDA_SUCCESS) {
+    uint32_t required[3];
+    triton_get_exact_cluster_shape((int)self->grid_mult, self->cluster_dims,
+                                   required);
+    PyErr_Format(PyExc_ValueError,
+                 "Triton cluster requirement failed: physical grid "
+                 "(%llu, %u, %u) is not divisible by required cluster shape "
+                 "(%u, %u, %u)",
+                 (unsigned long long)gx * self->grid_mult, gy, gz, required[0],
+                 required[1], required[2]);
+    return NULL;
+  }
 
   CUstream stream = (CUstream)(uintptr_t)PyLong_AsUnsignedLongLong(args[3]);
 

@@ -345,11 +345,15 @@ class CUDABackend(BaseBackend):
         return CUDAOptions(**args)
 
     def pack_metadata(self, metadata):
+        cluster = getattr(metadata, "cluster_dims", None) or (1, 1, 1)
         preferred = getattr(metadata, "preferred_ctas_per_cga", None) or (0, 0, 0)
         return (
             metadata.num_warps,
             metadata.num_ctas,
             metadata.shared,
+            cluster[0],
+            cluster[1],
+            cluster[2],
             preferred[0],
             preferred[1],
             preferred[2],
@@ -363,8 +367,8 @@ class CUDABackend(BaseBackend):
         alongside the cubin as ``asm["launch_metadata"]`` and is intended to replace the
         implicit metadata bag that downstream consumers currently probe with hasattr guards.
 
-        The schema is purely additive — existing ``pack_metadata()`` / ``make_launcher()``
-        paths are not affected.
+        The schema is purely additive and does not replace the existing packed metadata
+        consumed by the JIT launchers.
         """
 
         def _get(key, default=None):
@@ -878,6 +882,7 @@ class CUDABackend(BaseBackend):
                 and opt.ctas_per_cga is not None):
             nvidia.passes.hopper.add_2cta_transform_loads(pm)
         nvidia.passes.ttnvgpuir.add_optimize_descriptor_encoding(pm)
+        nvidia.passes.ttnvgpuir.add_tma_multicast(pm)
         passes.ttir.add_loop_aware_cse(pm)
         if capability // 10 in [8, 9]:
             passes.ttgpuir.add_fuse_nested_loops(pm)

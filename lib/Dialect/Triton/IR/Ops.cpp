@@ -8,6 +8,7 @@
 #include "mlir/Interfaces/FunctionInterfaces.h"
 #include "mlir/Support/LLVM.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
+#include "triton/Dialect/Triton/IR/TMAMulticast.h"
 #include "triton/Dialect/Triton/IR/Types.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "llvm/Support/ErrorHandling.h"
@@ -1911,6 +1912,16 @@ LogicalResult verifyDescriptorLoadStoreOp(Operation *op,
 }
 
 LogicalResult DescriptorLoadOp::verify() {
+  if (auto axes =
+          getOperation()->getAttrOfType<DenseI32ArrayAttr>(
+              kMulticastAxesAttrName)) {
+    if (axes.empty())
+      return emitOpError("tt.multicast_axes must not be empty");
+    for (int32_t axis : axes.asArrayRef()) {
+      if (axis < 0 || axis >= 3)
+        return emitOpError("tt.multicast_axes values must be in [0, 2]");
+    }
+  }
   return verifyDescriptorLoadStoreOp(*this, getDesc().getType(), getType());
 }
 

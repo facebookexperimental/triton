@@ -15,6 +15,7 @@
 #include "triton/Analysis/AxisInfo.h"
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
+#include "triton/Dialect/Triton/IR/TMAMulticast.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Attributes.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
@@ -1376,6 +1377,11 @@ struct AsyncTMACopyGlobalToLocalOpConversion
       pred = b.and_(pred, b.icmp_eq(ctaIdInGroup, b.i32_val(0)));
     }
 
+    if (op->hasAttr(tt::kMulticastAxesAttrName) &&
+        !op.getMulticastTargets())
+      return op.emitError(
+          "tt.multicast_axes must be materialized before LLVM lowering");
+
     uint32_t barrierMask =
         toLinearLayout(barrierTy).getFreeVariableMasks().lookup(kBlock);
     // Use a cross-CTA mbarrier pointer when the barrier mask is set.
@@ -1422,7 +1428,8 @@ struct AsyncTMACopyGlobalToLocalOpConversion
       // the cluster -- a cluster barrier (#9510), multicast, or a 2-CTA group;
       // otherwise it is CTA-local. The barrier component keys on the barrier
       // layout (not the SMEM layout), matching #9510.
-      auto multicastMask = op.getMulticastTargets();
+      if (Value explicitMask = op.getMulticastTargets())
+        multicastMask = explicitMask;
       // The current Hopper toolchain emits PTX < 8.6, where shared::cta TMA
       // loads are not accepted. Conservatively use cluster scope on Hopper;
       // keep CTA scope on Blackwell.

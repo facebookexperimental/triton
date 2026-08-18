@@ -1,4 +1,5 @@
 // RUN: triton-opt %s -split-input-file -allow-unregistered-dialect
+// RUN: triton-opt %s -split-input-file -allow-unregistered-dialect -verify-diagnostics --tritongpu-hoist-tmem-alloc -tritongpu-partition-scheduling -tritongpu-load-mma-specialization -sccp -int-range-optimizations -canonicalize -cse -tritongpu-remove-layout-conversions | FileCheck %s --check-prefix=MC
 // -tritongpu-hoist-tmem-alloc | FileCheck %s --check-prefix=TMEM
 // --check-prefix=FUNC RUN: triton-opt %s -split-input-file
 // -allow-unregistered-dialect -verify-diagnostics --tritongpu-hoist-tmem-alloc
@@ -66,7 +67,7 @@
     {swizzlingByteWidth = 128, transposed = false, elementBitWidth = 8,        \
     fp4Padded = true }>
 
-module attributes{"ttg.num-warps" = 4 :i32, ttg.target = "cuda:100"} {
+module attributes{"ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 :i32, ttg.target = "cuda:100"} {
 
   // FUNC-LABEL: @warp_specialize_tma_matmul
 
@@ -84,6 +85,7 @@ module attributes{"ttg.num-warps" = 4 :i32, ttg.target = "cuda:100"} {
   // CHECK-SAME: [[OFF_N:%arg[0-9]+]]
   // CHECK-SAME: [[A_DESC:%arg[0-9]+]]
   // CHECK-SAME: [[B_DESC:%arg[0-9]+]]
+  // MC-LABEL: @warp_specialize_tma_matmul
   tt.func @warp_specialize_tma_matmul(
       % k_tiles : i32, % off_m : i32, % off_n : i32,
       % a_desc : !tt.tensordesc<128x64xf16, #shared>,
@@ -145,23 +147,36 @@ module attributes{"ttg.num-warps" = 4 :i32, ttg.target = "cuda:100"} {
     // CHECK-NEXT: [[OPER_MBAR:%.*]] = ttg.memdesc_index [[OPER_MBARS]]{{\[}}[[IDX]]{{\]}}
     // CHECK-NEXT: ttng.barrier_expect [[OPER_MBAR]], 32768 {ttg.partition = array<i32: 2>}
 
+    // MC: ttng.wait_barrier %[[MC_READY:.*]], %[[MC_PHASE:.*]] {ttg.partition = array<i32: 2>}
+    // MC: ttng.barrier_expect %[[MC_OPER:.*]], 32768 {ttg.partition = array<i32: 2>}
+
     // CHECK-NEXT: [[A_BUF:%.*]] = ttg.memdesc_index [[A_BUFS]]{{\[}}[[IDX]]{{\]}}
     // CHECK-NEXT: ttng.async_tma_copy_global_to_local [[A_DESC]][[[OFF_M]], [[OFF_K]]] [[A_BUF]], [[OPER_MBAR]], [[TRUE]] {ttg.partition = array<i32: 2>}
-    %a_reg = tt.descriptor_load %a_desc[%off_m, %off_k] : !tt.tensordesc<128x64xf16, #shared> -> tensor<128x64xf16, #oper_layout>
+    // MC-NEXT: %[[MC_A_BUF:.*]] = ttg.memdesc_index
+    // MC-NEXT: ttng.cluster_barrier {ttg.partition = array<i32: 2>}
+    // MC-NEXT: ttng.async_tma_copy_global_to_local {{.*}} %[[MC_A_BUF]], %[[MC_OPER]], {{.*}} {tt.multicast_axes = array<i32: 0>, ttg.partition = array<i32: 2>}
+    %a_reg = tt.descriptor_load %a_desc[%off_m, %off_k] {tt.multicast_axes = array<i32: 0>} : !tt.tensordesc<128x64xf16, #shared> -> tensor<128x64xf16, #oper_layout>
     // CHECK-NEXT: [[B_BUF:%.*]] = ttg.memdesc_index [[B_BUFS]]{{\[}}[[IDX]]{{\]}}
     // CHECK-NEXT: ttng.async_tma_copy_global_to_local [[B_DESC]][[[OFF_N]], [[OFF_K]]] [[B_BUF]], [[OPER_MBAR]], [[TRUE]] {ttg.partition = array<i32: 2>}
-    %b_reg = tt.descriptor_load %b_desc[%off_n, %off_k] : !tt.tensordesc<128x64xf16, #shared> -> tensor<128x64xf16, #oper_layout>
+    // MC-NEXT: %[[MC_B_BUF:.*]] = ttg.memdesc_index
+    // MC-NEXT: ttng.cluster_barrier {ttg.partition = array<i32: 2>}
+    // MC-NEXT: ttng.async_tma_copy_global_to_local {{.*}} %[[MC_B_BUF]], %[[MC_OPER]], {{.*}} {tt.multicast_axes = array<i32: 0>, ttg.partition = array<i32: 2>}
+    %b_reg = tt.descriptor_load %b_desc[%off_n, %off_k] {tt.multicast_axes = array<i32: 0>} : !tt.tensordesc<128x64xf16, #shared> -> tensor<128x64xf16, #oper_layout>
 
     %a_shared = ttg.local_alloc %a_reg : (tensor<128x64xf16, #oper_layout>) -> !ttg.memdesc<128x64xf16, #shared, #smem>
     %b_shared = ttg.local_alloc %b_reg : (tensor<128x64xf16, #oper_layout>) -> !ttg.memdesc<128x64xf16, #shared, #smem>
     // CHECK-NEXT: [[B_T:%.*]] = ttg.memdesc_trans [[B_BUF]] {order = array<i32: 1, 0>, ttg.partition = array<i32: 1>}
     // CHECK-NEXT: ttng.wait_barrier [[OPER_MBAR]], [[PHASE]] {ttg.partition = array<i32: 1>}
+    // MC: %[[MC_B_T:.*]] = ttg.memdesc_trans %[[MC_B_BUF]]
+    // MC-NEXT: ttng.wait_barrier %[[MC_OPER]], %[[MC_PHASE]] {ttg.partition = array<i32: 1>}
+    // MC-NEXT: ttng.cluster_barrier {ttg.partition = array<i32: 1>}
     %b_T_shared = ttg.memdesc_trans %b_shared {order = array<i32: 1, 0>} : !ttg.memdesc<128x64xf16, #shared, #smem> -> !ttg.memdesc<64x128xf16, #shared_trans, #smem>
     %c_tmem, %c_tok = ttng.tmem_alloc %acc : (tensor<128x128xf32, #acc_layout>) -> (!ttg.memdesc<128x128xf32, #acc_tmem, #ttng.tensor_memory, mutable>, !ttg.async.token)
     // CHECK-NEXT: [[IS_LAST:%.*]] = arith.cmpi eq, [[K]], [[LAST_ITER]]
     // CHECK-NEXT: [[ACC_BUF1:%.*]] = ttg.memdesc_index
     // CHECK-NEXT: [[DONE_MBAR1:%.*]] = ttg.memdesc_index
     // CHECK-NEXT: [[MMA_TOK:%.*]] = ttng.tc_gen5_mma [[A_BUF]], [[B_T]], [[ACC_BUF1]][], [[TRUE]], [[TRUE]], [[READY_MBAR]][%true], [[DONE_MBAR1]][[[IS_LAST]]] {is_async, ttg.partition = array<i32: 1>}
+    // MC: ttng.tc_gen5_mma %[[MC_A_BUF]], %[[MC_B_T]]
     %mma_tok = ttng.tc_gen5_mma %a_shared, %b_T_shared, %c_tmem[%c_tok], %true, %true : !ttg.memdesc<128x64xf16, #shared, #smem>, !ttg.memdesc<64x128xf16, #shared_trans, #smem>, !ttg.memdesc<128x128xf32, #acc_tmem, #ttng.tensor_memory, mutable>
 
     %c, %load_tok = ttng.tmem_load %c_tmem[%mma_tok] : !ttg.memdesc<128x128xf32, #acc_tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #acc_layout>
