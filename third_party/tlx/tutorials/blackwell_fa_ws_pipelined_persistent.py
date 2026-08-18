@@ -1,3 +1,5 @@
+import os
+
 import torch
 import triton
 import triton.language as tl
@@ -77,6 +79,22 @@ configs = [
     for grp_n in [1]
     for (rescale_opt, where) in [(False, False), (True, False), (True, True)]
 ]
+
+_fwd_num_ctas = os.environ.get("TLX_FWD_NUM_CTAS")
+if _fwd_num_ctas is not None:
+    configs = [config for config in configs if config.kwargs.get("NUM_CTAS", 1) == int(_fwd_num_ctas)]
+
+_fwd_num_buffers_kv = os.environ.get("TLX_FWD_NUM_BUFFERS_KV")
+if _fwd_num_buffers_kv is not None:
+    configs = [config for config in configs if config.kwargs["NUM_BUFFERS_KV"] == int(_fwd_num_buffers_kv)]
+
+_fwd_rescale_opt = os.environ.get("TLX_FWD_RESCALE_OPT")
+if _fwd_rescale_opt is not None:
+    configs = [config for config in configs if config.kwargs["RESCALE_OPT"] == bool(int(_fwd_rescale_opt))]
+
+_fwd_use_where = os.environ.get("TLX_FWD_USE_WHERE")
+if _fwd_use_where is not None:
+    configs = [config for config in configs if config.kwargs["USE_WHERE"] == bool(int(_fwd_use_where))]
 
 
 def prune_configs_by_hdim(configs, named_args, **kwargs):
