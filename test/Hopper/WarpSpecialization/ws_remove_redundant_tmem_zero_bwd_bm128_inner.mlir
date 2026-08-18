@@ -1,5 +1,9 @@
 // RUN: triton-opt %s --nvgpu-warp-specialization="capability=100 num-stages=2 smem-budget=232448" | FileCheck %s
 // CHECK-LABEL: tt.func public @_attn_bwd
+// Dead load-task rematerialization clones of m/Di must be removed before
+// descriptor conversion derives the local_load consumer set. Otherwise these
+// loads carry tasks {0, 3} and create an unsafe self-consumer TMA channel.
+// CHECK-COUNT-2: ttg.local_load {{.*}}async_task_id = array<i32: 0>{{.*}}!ttg.memdesc<128xf32
 // CHECK-NOT: ttng.tmem_store %cst
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [8, 4], warpsPerCTA = [8, 1], order = [1, 0]}>
