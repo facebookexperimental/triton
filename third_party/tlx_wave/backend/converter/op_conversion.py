@@ -745,8 +745,8 @@ def _convert_source_op(
     if op.name == "arith.cmpf":
         _convert_cmpf(builder, type_layout_program, op)
         return
-    if op.name == "ttg.warp_ballot":
-        _convert_warp_ballot(builder, type_layout_program, op)
+    if op.name == "ttg.warp_vote":
+        _convert_warp_vote(builder, type_layout_program, op)
         return
     if op.name == "arith.select":
         _convert_select(
@@ -1725,37 +1725,46 @@ def _convert_warp_id(builder, view):
     )
 
 
-def _convert_warp_ballot(builder, type_layout_program, op):
+def _convert_warp_vote(builder, type_layout_program, op):
     if len(op.operands) != 1 or len(op.results) != 1:
         fail(
-            "TLXW_OP_WARP_BALLOT",
+            "TLXW_OP_WARP_VOTE",
             STAGE,
-            "ttg.warp_ballot requires one predicate and one result",
+            "ttg.warp_vote requires one predicate and one result",
             source_op_index=op.index,
         )
     predicate = type_layout_program.values[op.operands[0]]
     result = type_layout_program.values[op.results[0]]
     if (predicate.type.representation != "mask" or int(predicate.type.component_count) != 1):
         fail(
-            "TLXW_OP_WARP_BALLOT",
+            "TLXW_OP_WARP_VOTE",
             STAGE,
-            "ttg.warp_ballot predicate must map exactly one i1 element to each lane",
+            "ttg.warp_vote predicate must map exactly one i1 element to each lane",
             source_op_index=op.index,
             source_value_id=predicate.value_id,
         )
-    if (result.type.representation != "scalar" or result.type.element_type != "i64"):
+    if (result.type.representation != "scalar" or result.type.element_type != "i1"):
         fail(
-            "TLXW_OP_WARP_BALLOT",
+            "TLXW_OP_WARP_VOTE",
             STAGE,
-            "ttg.warp_ballot result must be a scalar i64",
+            "ttg.warp_vote result must be a scalar i1",
             source_op_index=op.index,
             source_value_id=result.value_id,
         )
+    kind = _attr_text(op.attrs.get("kind"))
+    if kind not in {"all", "any"}:
+        fail(
+            "TLXW_OP_WARP_VOTE",
+            STAGE,
+            f"ttg.warp_vote kind must be all or any, got {kind!r}",
+            source_op_index=op.index,
+        )
     result_target_ids, _ = _declare_results(builder, op, type_layout_program)
     builder.add_op(
-        "ballot",
+        "warp_vote",
         operands=_operand_target_ids(builder, op),
         results=result_target_ids,
+        attrs={"kind": kind},
         source_op_index=op.index,
     )
 
@@ -4899,7 +4908,7 @@ _SPECIALIZED_SOURCE_OPS = frozenset({
     "rocdl.s.setprio",
     "rocdl.sched.barrier",
     "ttg.barrier",
-    "ttg.warp_ballot",
+    "ttg.warp_vote",
     "scf.for",
     "scf.if",
     "tt.broadcast",

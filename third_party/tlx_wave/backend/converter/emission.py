@@ -1204,19 +1204,18 @@ def _emit_warp_id(state, op):
     )
 
 
-def _emit_ballot(state, op):
+def _emit_warp_vote(state, op):
     (predicate, ) = _operand_values(state, op, 1)
     if isinstance(predicate, (tuple, list)):
         fail(
-            "TLXW_EMIT_WARP_BALLOT",
+            "TLXW_EMIT_WARP_VOTE",
             STAGE,
-            "warp ballot predicate must contain exactly one mask component",
+            "warp vote predicate must contain exactly one mask component",
             target_op_id=op.target_op_id,
         )
-    state.values[_single_result(op)] = state.builder.ballot(
-        predicate,
-        state.dsl.i64(),
-    )
+    kind = str(target_ir.attrs_dict(op)["kind"])
+    vote_op = state.dsl.wave.MaskAllOp if kind == "all" else state.dsl.wave.MaskAnyOp
+    state.values[_single_result(op)] = vote_op(state.dsl.i1(), predicate).result
 
 
 def _emit_thread_id(state, op):
@@ -4525,7 +4524,7 @@ _TARGET_EMITTERS = {
     "expand_dims": _emit_expand_dims,
     "program_id": _emit_program_id,
     "warp_id": _emit_warp_id,
-    "ballot": _emit_ballot,
+    "warp_vote": _emit_warp_vote,
     "thread_id": _emit_thread_id,
     "barrier": _emit_barrier,
     "cond_barrier": _emit_cond_barrier,
