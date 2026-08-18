@@ -157,6 +157,11 @@ class DynamicPersistent1DScheduler(_CountingTileScheduler):
     are distributed by demand rather than a fixed stride. The host allocates
     ``tile_counter`` (a 1-element int32 device tensor) initialized to the number of
     launched programs. ``is_valid`` is the count-based one from ``_CountingTileScheduler``.
+
+    TODO: Multi-CTA scheduling must claim one cluster-level work item and
+    expand it with the static cluster-local coordinate. Independent per-CTA
+    atomic claims cannot establish the shared tile identity required by TMA
+    multicast.
     """
     _x: tl.tensor
     _y: tl.tensor

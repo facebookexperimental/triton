@@ -6,6 +6,7 @@
 #include "mlir/Pass/Pass.h"
 #include "triton/Analysis/Utility.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
+#include "triton/Dialect/Triton/IR/TMAMulticast.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/MMAv5PipelineUtility.h"
@@ -350,9 +351,13 @@ static void lowerTMACopy(PartitionBuilder &b, Partition &loadPartition,
                          Value barrier, Value view) {
   Value truePred = b.boolCst(true);
   if (auto load = dyn_cast<DescriptorLoadOp>(op)) {
-    b.createInto<ttng::AsyncTMACopyGlobalToLocalOp>(
+    if (load->hasAttr(triton::kMulticastAxesAttrName))
+      b.createInto<ttng::ClusterBarrierOp>(loadPartition, stageCluster);
+    auto copy = b.createInto<ttng::AsyncTMACopyGlobalToLocalOp>(
         loadPartition, stageCluster, load.getDesc(), load.getIndices(), barrier,
         view, truePred);
+    if (Attribute axes = load->getAttr(triton::kMulticastAxesAttrName))
+      copy->setAttr(triton::kMulticastAxesAttrName, axes);
   } else {
     auto gather = cast<DescriptorGatherOp>(op);
     b.createInto<ttng::AsyncTMAGatherOp>(
@@ -395,6 +400,8 @@ LogicalResult PipelinedLoadGroup::lowerLoads(PartitionSet &partitions,
     StageCluster userStageCluster = getStageCluster(liveBeforeOp);
     b.createInto<ttng::WaitBarrierOp>(userPartition, userStageCluster,
                                       curLoadBar, phase);
+    if (firstLoad->loadOp->hasAttr(triton::kMulticastAxesAttrName))
+      b.createInto<ttng::ClusterBarrierOp>(userPartition, userStageCluster);
 
     SmallVector<Operation *> liveUntilOps;
     for (PipelinedLoad &load : loads) {
@@ -868,8 +875,22 @@ LogicalResult lowerLoops(scf::ForOp &loop, MutableArrayRef<PipelinedLoad> loads,
     liveBeforeGroups[load.liveBeforeOps].push_back(std::move(load));
   }
   SmallVector<PipelinedLoadGroup> loadGroups;
-  for (auto &loads : llvm::make_second_range(liveBeforeGroups))
-    loadGroups.push_back({std::move(loads)});
+  for (auto &loads : llvm::make_second_range(liveBeforeGroups)) {
+    SmallVector<PipelinedLoadGroup> axisGroups;
+    for (PipelinedLoad &load : loads) {
+      Attribute axes =
+          load.loadOp->getAttr(triton::kMulticastAxesAttrName);
+      auto group = llvm::find_if(axisGroups, [&](PipelinedLoadGroup &group) {
+        return group.loads.front().loadOp->getAttr(
+                   triton::kMulticastAxesAttrName) == axes;
+      });
+      if (group == axisGroups.end())
+        axisGroups.push_back({{std::move(load)}});
+      else
+        group->loads.push_back(std::move(load));
+    }
+    llvm::append_range(loadGroups, std::move(axisGroups));
+  }
 
   // Multi-buffer and lower the loads.
   for (PipelinedLoadGroup &group : loadGroups)

@@ -10,6 +10,7 @@ numerics and the converged path directly.
 
 import contextlib
 import os
+import re
 
 import pytest
 import torch
@@ -175,16 +176,35 @@ def test_dispatcher_core_multidim_cluster():
     CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION. A wrong/missing cluster dim would
     conflict with the PTX .reqnctapercluster baked into the cubin and fail the
     launch; every program writing its linear id proves all CTAs in the
-    (2,1,3) cluster ran."""
+    (2,2,2) cluster ran."""
     from triton._internal_testing import is_hopper_or_newer
 
     if not is_hopper_or_newer():
         pytest.skip("clusters need Hopper or newer")
 
-    GX, GY, GZ = 4, 2, 3  # each divisible by the (2,1,3) cluster dims
+    GX, GY, GZ = 4, 2, 4
     out = torch.full((GX * GY * GZ, ), -1, device="cuda", dtype=torch.int32)
     with force_dispatcher():
-        _disp_pid_write[(GX, GY, GZ)](out, GX, GY, ctas_per_cga=(2, 1, 3))
+        _disp_pid_write[(GX, GY, GZ)](out, GX, GY, ctas_per_cga=(2, 2, 2))
     torch.cuda.synchronize()
     expected = torch.arange(GX * GY * GZ, device="cuda", dtype=torch.int32)
     torch.testing.assert_close(out, expected)
+
+
+@pytest.mark.skipif(not is_cuda(), reason="Requires CUDA")
+@pytest.mark.parametrize("grid", [(3, 2, 4), (4, 3, 4), (4, 2, 3)])
+def test_dispatcher_rejects_incomplete_exact_cluster(grid):
+    from triton._internal_testing import is_hopper_or_newer
+
+    if not is_hopper_or_newer():
+        pytest.skip("clusters need Hopper or newer")
+
+    GX, GY, GZ = grid
+    out = torch.full((GX * GY * GZ, ), -1, device="cuda", dtype=torch.int32)
+    with force_dispatcher():
+        with pytest.raises(
+                ValueError,
+                match=(rf"physical grid {re.escape(str(grid))}.*required cluster shape "
+                       r"\(2, 2, 2\)"),
+        ):
+            _disp_pid_write[(GX, GY, GZ)](out, GX, GY, ctas_per_cga=(2, 2, 2))

@@ -17,7 +17,7 @@ from triton.backends.nvidia.driver import (
     expand_signature,
     make_kernel_signature,
 )
-from triton._internal_testing import is_cuda
+from triton._internal_testing import is_cuda, is_hopper_or_newer
 from triton.compiler.compiler import ASTSource, compile as triton_compile, make_backend
 from triton.knobs import HookChain
 
@@ -46,11 +46,11 @@ def kernel_with_constant(X, N, BLOCK: tl.constexpr):
     tl.store(X + offs, x + 1, mask=mask)
 
 
-def _compile_kernel(fn, signature, constexprs=None, attrs=None):
+def _compile_kernel(fn, signature, constexprs=None, attrs=None, options=None):
     """Helper to compile a kernel and return the CompiledKernel."""
     target = triton.runtime.driver.active.get_current_target()
     src = ASTSource(fn=fn, signature=signature, constexprs=constexprs, attrs=attrs)
-    return triton_compile(src, target=target)
+    return triton_compile(src, target=target, options=options)
 
 
 @pytest.mark.parametrize("dtype", ["*fp32"])
@@ -322,6 +322,9 @@ def test_launcher_src_emits_cluster_dims():
     shared core can build CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION for the
     ctas_per_cga path (converged onto triton_launch_kernel, not a separate
     launcher)."""
+    if not is_hopper_or_newer():
+        pytest.skip("clusters need Hopper or newer")
+
     import os
     import tempfile
 
@@ -337,6 +340,7 @@ def test_launcher_src_emits_cluster_dims():
                 add_kernel,
                 signature={"X": "*fp32", "Y": "*fp32", "OUT": "*fp32", "N": "i32"},
                 constexprs={"BLOCK": 1024},
+                options={"ctas_per_cga": (2, 2, 2)},
             )
         finally:
             if prev_cache is None:
@@ -344,10 +348,25 @@ def test_launcher_src_emits_cluster_dims():
             else:
                 os.environ["TRITON_CACHE_DIR"] = prev_cache
     src = compiled.asm["launcher_src"]
-    assert ".cluster_dims = {" in src
-    # Sanity: still emits the 1-D num_ctas path inputs too (both are present;
-    # the core gives num_ctas priority over cluster_dims).
-    assert ".num_ctas = " in src
+    assert compiled.metadata.ctas_per_cga == (2, 2, 2)
+    assert compiled.launch_metadata_schema["cluster_dims"] == [2, 2, 2]
+    assert ".cluster_dims = {2, 2, 2}," in src
+    assert ".num_ctas = 1," in src
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"num_ctas": 0},
+        {"cluster_dims": (2, 0, 2)},
+        {"cluster_dims": (2, -1, 2)},
+        {"ctas_per_cga": (2, 2)},
+    ],
+)
+def test_cluster_options_reject_invalid_shapes(options):
+    target = triton.runtime.driver.active.get_current_target()
+    with pytest.raises(ValueError):
+        make_backend(target).parse_options(options)
 
 
 def test_launcher_src_has_abi_version_comment():

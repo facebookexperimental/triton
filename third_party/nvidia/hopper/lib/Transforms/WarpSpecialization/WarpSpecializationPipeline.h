@@ -27,7 +27,8 @@ LogicalResult doTaskIdPropagate(triton::FuncOp funcOp);
 // Cross-partition run-once atomic support. Returns failure() when an atomic
 // forces a graceful warp-specialization reject (kernel already de-specialized).
 LogicalResult doDynamicTileBroadcast(triton::FuncOp funcOp,
-                                     int tilePrefetchDepth);
+                                     int tilePrefetchDepth,
+                                     bool emitRejectionDiagnostics = false);
 
 // Test-only knobs for doMemoryPlanner. The production pipeline uses the
 // defaults; only the -nvgpu-test-ws-memory-planner pass varies them:
@@ -56,7 +57,7 @@ LogicalResult doBufferAllocation(triton::FuncOp funcOp);
 LogicalResult doConvertDescriptorLoadsToNVWS(triton::FuncOp funcOp);
 void doHoistLoopInvariantTMEMStore(triton::FuncOp funcOp);
 void removeRedundantTmemZeroStores(triton::FuncOp funcOp);
-void doCodePartition(triton::FuncOp funcOp, unsigned numBuffers);
+LogicalResult doCodePartition(triton::FuncOp funcOp, unsigned numBuffers);
 void doTokenLowering(triton::FuncOp funcOp, unsigned numConsumerGroups);
 void doPingPongPrep(triton::FuncOp funcOp, unsigned numWarpGroups,
                     int capability, int defaultNumStages);
