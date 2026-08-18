@@ -7,12 +7,10 @@ from .barrier import (
     barrier_expect_bytes,
     barrier_wait,
     cluster_barrier,
-    cond_barrier,
     fence_mbarrier_init_cluster,
     named_barrier_arrive,
     named_barrier_wait,
     amd_sched_barrier,
-    workgroup_barrier,
     sched_barrier,
     set_priority,
 )
@@ -28,7 +26,6 @@ from .mem_ops import (
     allocate_tensor_descriptor,
     amd_descriptor_prefetch_tensor,
     async_amd_descriptor_load,
-    async_amd_descriptor_load_fused,
     async_amd_descriptor_store,
     async_amd_descriptor_wait,
     async_store,
@@ -73,7 +70,6 @@ from .mem_ops import (
 )
 from .mma_ops import (
     amd_mfma_commit,
-    amd_register_class_anchor,
     amd_register_resident,
     amd_scheduled_mfma,
     async_dot,
@@ -86,7 +82,6 @@ from .mma_ops import (
     rematerialized_range,
     require_amd_wmma_layout,
     require_layout,
-    release_layout,
     tcgen05_commit,
 )
 from .types import (
@@ -104,12 +99,10 @@ from .types import (
     layout_encoding,
     mbarrier,
     mbarrier_type,
-    nv_mma_layout,
     nv_mma_shared_layout_encoding,
     padded_shared_layout_encoding,
     shared_linear_layout_encoding,
     amd_mfma_layout,
-    slice_layout,
     dot_operand_layout,
     reuse_group,
     reuse_group_ir_type,
@@ -134,15 +127,13 @@ from .utility import (
     cluster_size_1d,
     dtype_of,
     get_fp8_format_name,
-    num_warps,
     size_of,
     stoch_round,
     thread_id,
-    warp_predicate,
     warp_id,
 )
 from .mxfp8_utils import _to_mxfp8_block
-from .warp_ops import vote_ballot_sync, warp_all, warp_any, warp_ballot, warp_redux
+from .warp_ops import vote_ballot_sync, warp_all, warp_any, warp_redux
 from .warp_pipeline import warp_pipeline_stage
 
 __all__ = [
@@ -162,21 +153,17 @@ __all__ = [
     "padded_shared_layout_encoding",
     "shared_linear_layout_encoding",
     "amd_mfma_layout",
-    "slice_layout",
     "dot_operand_layout",
     "tensor_memory_layout_encoding",
     "TMemCTAMode",
-    "nv_mma_layout",
     "nv_mma_shared_layout_encoding",
     "storage_kind",
     "layout",
     "amd_mfma_commit",
-    "amd_register_class_anchor",
     "amd_register_resident",
     "amd_scheduled_mfma",
     "extract_slice",
     "rematerialized_range",
-    "release_layout",
     "buffered_tensor",
     "buffered_tensor_type",
     "storage_alias_spec",
@@ -220,7 +207,6 @@ __all__ = [
     "allocate_tensor_descriptor",
     "update_tensor_descriptor",
     "async_amd_descriptor_load",
-    "async_amd_descriptor_load_fused",
     "async_amd_descriptor_store",
     "async_amd_descriptor_wait",
     "amd_descriptor_prefetch_tensor",
@@ -238,8 +224,6 @@ __all__ = [
     "prefetch",
     # barriers
     "cluster_barrier",
-    "cond_barrier",
-    "workgroup_barrier",
     "alloc_barriers",
     "alloc_warp_barrier",
     "barrier_expect_bytes",
@@ -258,14 +242,11 @@ __all__ = [
     "async_dot_scaled",
     "async_dot_wait",
     "require_layout",
-    "release_layout",
     "tcgen05_commit",
     # utility
     "cluster_cta_rank",
     "cluster_size_1d",
     "thread_id",
-    "num_warps",
-    "warp_predicate",
     "warp_id",
     "async_task_replica_id",
     "dtype_of",
@@ -287,7 +268,6 @@ __all__ = [
     # warp_ops
     "warp_all",
     "warp_any",
-    "warp_ballot",
     "vote_ballot_sync",
     # warp_pipeline
     "warp_pipeline_stage",
