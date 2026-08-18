@@ -560,8 +560,13 @@ def TritonAMDGPUApplyPlanPipeline
     global staging adds a loop-carried modulo ring, allocates the requested LDS
     depth, serializes the copy at stage zero and consumption at the requested
     distance, and invokes the shared AMD pipeline expander to emit the
-    prologue, steady state, and epilogue. It rebuilds the strict value graph
-    before and after expansion and never changes dot decomposition.
+    prologue, steady state, and epilogue. Existing-ring and independent new
+    staging intents may be composed in one loop under one LDS budget and one
+    rebuilt DDG. Buffered staging families may use different distances in one
+    `max(distance) + 1` schedule while existing-ring operations remain in one
+    logical stage. It rebuilds the strict value graph before and after
+    expansion, conservatively merges adjacent identical barriers, audits every
+    expanded ring contract, and never changes dot decomposition.
   }];
 
   let options = [

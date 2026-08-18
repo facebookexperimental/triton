@@ -157,6 +157,34 @@
 // RUN: not triton-opt %s \
 // RUN:   -tritonamdgpu-apply-plan-pipeline='input-path=%t.pipeline.staging.global-source.json strict=true' \
 // RUN:   2>&1 | FileCheck %s --check-prefix=PIPELINE-STAGING-GLOBAL-SOURCE
+// RUN: python3 -c "import json; p=json.load(open('%t.pipeline.plan.json')); f=next(x for x in p['functions'] if x['function']=='mixed_ring_staging'); ops={x['id']:x['kind'] for x in f['operations']}; l=next(x['id'] for x in f['operations'] if x['kind']=='scf.for'); g=f['async_groups'][0]['id']; v=next(x for x in f['values'] if ops.get(x['origin'].get('operation'))=='arith.addf' and any(ops[u['operation']]=='arith.mulf' for u in x['uses'])); cs=sorted({u['operation'] for u in v['uses']}); d={'schema_version':'plan-pipeline-delta/0.1','kernel':f['function'],'input_value_graph_fingerprint':f['semantic_fingerprint'],'pass_position':'before_update_async_wait_count','loops':[{'loop':l,'transactions':[{'group':g,'action':'set_prefetch_distance','distance':1,'buffer_depth':3}],'staging':[{'value':v['id'],'action':'register_to_lds','consumers':cs,'distance':0,'buffer_depth':1,'alignment':16}]}]}; open('%t.pipeline.mixed-register.json','w').write(json.dumps(d))"
+// RUN: TRITON_USE_MODULO_SCHEDULE=1 triton-opt %s \
+// RUN:   -tritonamdgpu-apply-plan-pipeline='input-path=%t.pipeline.mixed-register.json report-path=%t.pipeline.mixed-register.report.json strict=true' \
+// RUN:   | FileCheck %s --check-prefix=PIPELINE-MIXED-REGISTER
+// RUN: FileCheck %s --check-prefix=PIPELINE-MIXED-REGISTER-REPORT < %t.pipeline.mixed-register.report.json
+// RUN: python3 -c "import json; p=json.load(open('%t.pipeline.plan.json')); f=next(x for x in p['functions'] if x['function']=='mixed_ring_staging'); ops={x['id']:x['kind'] for x in f['operations']}; l=next(x['id'] for x in f['operations'] if x['kind']=='scf.for'); g=f['async_groups'][0]['id']; vs=[x for x in f['values'] if ops.get(x['origin'].get('operation'))=='tt.load']; ss=[]; [(ss.append({'value':v['id'],'action':'global_to_lds','consumers':sorted({u['operation'] for u in v['uses']}),'distance':0,'buffer_depth':1,'alignment':16})) for v in vs[:1]]; d={'schema_version':'plan-pipeline-delta/0.1','kernel':f['function'],'input_value_graph_fingerprint':f['semantic_fingerprint'],'pass_position':'before_update_async_wait_count','loops':[{'loop':l,'transactions':[{'group':g,'action':'set_prefetch_distance','distance':1,'buffer_depth':3}],'staging':ss}]}; open('%t.pipeline.mixed-global.json','w').write(json.dumps(d))"
+// RUN: TRITON_USE_MODULO_SCHEDULE=1 triton-opt %s \
+// RUN:   -tritonamdgpu-apply-plan-pipeline='input-path=%t.pipeline.mixed-global.json report-path=%t.pipeline.mixed-global.report.json strict=true' \
+// RUN:   | FileCheck %s --check-prefix=PIPELINE-MIXED-GLOBAL
+// RUN: FileCheck %s --check-prefix=PIPELINE-MIXED-GLOBAL-REPORT < %t.pipeline.mixed-global.report.json
+// RUN: python3 -c "import json; p=json.load(open('%t.pipeline.mixed-global.json')); p['loops'][0]['staging'][0].update(distance=1,buffer_depth=2); open('%t.pipeline.mixed-buffered.json','w').write(json.dumps(p))"
+// RUN: TRITON_USE_MODULO_SCHEDULE=1 triton-opt %s \
+// RUN:   -tritonamdgpu-apply-plan-pipeline='input-path=%t.pipeline.mixed-buffered.json report-path=%t.pipeline.mixed-buffered.report.json strict=true' \
+// RUN:   | FileCheck %s --check-prefix=PIPELINE-MIXED-BUFFERED
+// RUN: FileCheck %s --check-prefix=PIPELINE-MIXED-BUFFERED-REPORT < %t.pipeline.mixed-buffered.report.json
+// RUN: python3 -c "import json; p=json.load(open('%t.pipeline.plan.json')); f=next(x for x in p['functions'] if x['function']=='mixed_ring_staging'); ops={x['id']:x['kind'] for x in f['operations']}; l=next(x['id'] for x in f['operations'] if x['kind']=='scf.for'); g=f['async_groups'][0]['id']; vs=[x for x in f['values'] if ops.get(x['origin'].get('operation'))=='tt.load']; ss=[{'value':v['id'],'action':'global_to_lds','consumers':sorted({u['operation'] for u in v['uses']}),'distance':i+1,'buffer_depth':i+2,'alignment':16} for i,v in enumerate(vs[:2])]; d={'schema_version':'plan-pipeline-delta/0.1','kernel':f['function'],'input_value_graph_fingerprint':f['semantic_fingerprint'],'pass_position':'before_update_async_wait_count','loops':[{'loop':l,'transactions':[{'group':g,'action':'set_prefetch_distance','distance':1,'buffer_depth':3}],'staging':ss}]}; open('%t.pipeline.mixed-multidistance.json','w').write(json.dumps(d))"
+// RUN: TRITON_USE_MODULO_SCHEDULE=1 triton-opt %s \
+// RUN:   -tritonamdgpu-apply-plan-pipeline='input-path=%t.pipeline.mixed-multidistance.json report-path=%t.pipeline.mixed-multidistance.report.json strict=true' \
+// RUN:   | FileCheck %s --check-prefix=PIPELINE-MIXED-MULTIDISTANCE
+// RUN: FileCheck %s --check-prefix=PIPELINE-MIXED-MULTIDISTANCE-REPORT < %t.pipeline.mixed-multidistance.report.json
+// RUN: python3 -c "import json; p=json.load(open('%t.pipeline.plan.json')); f=next(x for x in p['functions'] if x['function']=='mixed_ring_staging'); ops={x['id']:x['kind'] for x in f['operations']}; l=next(x['id'] for x in f['operations'] if x['kind']=='scf.for'); g=f['async_groups'][0]['id']; v=next(x for x in f['values'] if ops.get(x['origin'].get('operation'))=='ttg.local_load'); cs=sorted({u['operation'] for u in v['uses']}); d={'schema_version':'plan-pipeline-delta/0.1','kernel':f['function'],'input_value_graph_fingerprint':f['semantic_fingerprint'],'pass_position':'before_update_async_wait_count','loops':[{'loop':l,'transactions':[{'group':g,'action':'set_prefetch_distance','distance':1,'buffer_depth':3}],'staging':[{'value':v['id'],'action':'register_to_lds','consumers':cs,'distance':0,'buffer_depth':1,'alignment':16}]}]}; open('%t.pipeline.mixed-conflict.json','w').write(json.dumps(d))"
+// RUN: not triton-opt %s \
+// RUN:   -tritonamdgpu-apply-plan-pipeline='input-path=%t.pipeline.mixed-conflict.json strict=true' \
+// RUN:   2>&1 | FileCheck %s --check-prefix=PIPELINE-MIXED-CONFLICT
+// RUN: python3 -c "import json; p=json.load(open('%t.pipeline.mixed-register.json')); p['loops'][0]['transactions'][0]['buffer_depth']=128; open('%t.pipeline.mixed-capacity.json','w').write(json.dumps(p))"
+// RUN: not triton-opt %s \
+// RUN:   -tritonamdgpu-apply-plan-pipeline='input-path=%t.pipeline.mixed-capacity.json strict=true' \
+// RUN:   2>&1 | FileCheck %s --check-prefix=PIPELINE-MIXED-CAPACITY
 //
 // Modulo runs before the guarded legacy scheduler. A successful modulo schedule
 // is preserved; the standard AMD pipeline lowers and expands it.
@@ -386,6 +414,43 @@
 // PIPELINE-STAGING-GLOBAL-BUFFER-REPORT-DAG: "post_rewrite_audit_passed": true
 // PIPELINE-STAGING-GLOBAL-PARTIAL: global_to_lds requires the complete derived-use closure
 // PIPELINE-STAGING-GLOBAL-SOURCE: global_to_lds requires tt.load or amdg.buffer_load
+// PIPELINE-MIXED-REGISTER-LABEL: tt.func @mixed_ring_staging
+// PIPELINE-MIXED-REGISTER-DAG: ttg.local_alloc : () -> !ttg.memdesc<3x16x16xf16
+// PIPELINE-MIXED-REGISTER-DAG: ttg.local_alloc {{.*}}alignment = 16
+// PIPELINE-MIXED-REGISTER: ttg.local_store
+// PIPELINE-MIXED-REGISTER: ttg.local_load
+// PIPELINE-MIXED-REGISTER-REPORT-DAG: "accepted": true
+// PIPELINE-MIXED-REGISTER-REPORT-DAG: "ring_mutations": 1
+// PIPELINE-MIXED-REGISTER-REPORT-DAG: "staging_mutations": 1
+// PIPELINE-MIXED-REGISTER-REPORT-DAG: "logical_lds_bytes_after": 2048
+// PIPELINE-MIXED-REGISTER-REPORT-DAG: "post_rewrite_ddg_verified": true
+// PIPELINE-MIXED-GLOBAL-LABEL: tt.func @mixed_ring_staging
+// PIPELINE-MIXED-GLOBAL: ttg.async_copy_global_to_local
+// PIPELINE-MIXED-GLOBAL-COUNT-1: tt.load
+// PIPELINE-MIXED-GLOBAL-REPORT-DAG: "accepted": true
+// PIPELINE-MIXED-GLOBAL-REPORT-DAG: "ring_mutations": 1
+// PIPELINE-MIXED-GLOBAL-REPORT-DAG: "staging_mutations": 1
+// PIPELINE-MIXED-BUFFERED-LABEL: tt.func @mixed_ring_staging
+// PIPELINE-MIXED-BUFFERED-DAG: ttg.local_alloc : () -> !ttg.memdesc<3x16x16xf16
+// PIPELINE-MIXED-BUFFERED-DAG: ttg.local_alloc {{.*}}!ttg.memdesc<2x16x16xf16
+// PIPELINE-MIXED-BUFFERED: scf.for
+// PIPELINE-MIXED-BUFFERED-NOT: loop.stage
+// PIPELINE-MIXED-BUFFERED-REPORT-DAG: "accepted": true
+// PIPELINE-MIXED-BUFFERED-REPORT-DAG: "pipeline_expanded": true
+// PIPELINE-MIXED-BUFFERED-REPORT-DAG: "post_rewrite_audit_passed": true
+// PIPELINE-MIXED-MULTIDISTANCE-LABEL: tt.func @mixed_ring_staging
+// PIPELINE-MIXED-MULTIDISTANCE-DAG: !ttg.memdesc<2x16x16xf16
+// PIPELINE-MIXED-MULTIDISTANCE-DAG: !ttg.memdesc<3x16x16xf16
+// PIPELINE-MIXED-MULTIDISTANCE: scf.for
+// PIPELINE-MIXED-MULTIDISTANCE-NOT: loop.stage
+// PIPELINE-MIXED-MULTIDISTANCE-REPORT-DAG: "accepted": true
+// PIPELINE-MIXED-MULTIDISTANCE-REPORT-DAG: "distance": 1
+// PIPELINE-MIXED-MULTIDISTANCE-REPORT-DAG: "buffer_depth": 2
+// PIPELINE-MIXED-MULTIDISTANCE-REPORT-DAG: "distance": 2
+// PIPELINE-MIXED-MULTIDISTANCE-REPORT-DAG: "buffer_depth": 3
+// PIPELINE-MIXED-MULTIDISTANCE-REPORT-DAG: "pipeline_expanded": true
+// PIPELINE-MIXED-CONFLICT: mixed existing-ring/staging plan has overlapping or cross-dependent operation families
+// PIPELINE-MIXED-CAPACITY: requested mixed LDS plan exceeds the target LDS capacity
 
 #mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [2, 2], instrShape = [16, 16, 32], isTransposed = true}>
 #dot0 = #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 8}>
@@ -663,6 +728,48 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
       %right = arith.subf %loaded, %loaded : tensor<16x16xf16, #slot_blocked>
     }
     tt.return
+  }
+
+  tt.func @mixed_ring_staging(
+      %ring_ptrs: tensor<16x16x!tt.ptr<f16>, #slot_blocked>,
+      %stage_ptrs0: tensor<16x16x!tt.ptr<f16>, #slot_blocked>,
+      %stage_ptrs1: tensor<16x16x!tt.ptr<f16>, #slot_blocked>,
+      %input: tensor<16x16xf16, #slot_blocked>)
+      -> (tensor<16x16xf16, #slot_blocked>, tensor<16x16xf16, #slot_blocked>, tensor<16x16xf16, #slot_blocked>, tensor<16x16xf16, #slot_blocked>) {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c4 = arith.constant 4 : index
+    %c1_i32 = arith.constant 1 : i32
+    %c2_i32 = arith.constant 2 : i32
+    %alloc = ttg.local_alloc : () -> !ttg.memdesc<2x16x16xf16, #slot_shared, #smem, mutable>
+    %results:4 = scf.for %i = %c0 to %c4 step %c1
+        iter_args(%ring_acc = %input, %register_acc = %input, %global_acc0 = %input, %global_acc1 = %input)
+        -> (tensor<16x16xf16, #slot_blocked>, tensor<16x16xf16, #slot_blocked>, tensor<16x16xf16, #slot_blocked>, tensor<16x16xf16, #slot_blocked>) {
+      %i_i32 = arith.index_cast %i : index to i32
+      %current_index = arith.remsi %i_i32, %c2_i32 : i32
+      %previous_index = arith.subi %c1_i32, %current_index : i32
+      %current = ttg.memdesc_index %alloc[%current_index] : !ttg.memdesc<2x16x16xf16, #slot_shared, #smem, mutable> -> !ttg.memdesc<16x16xf16, #slot_shared, #smem, mutable>
+      %previous = ttg.memdesc_index %alloc[%previous_index] : !ttg.memdesc<2x16x16xf16, #slot_shared, #smem, mutable> -> !ttg.memdesc<16x16xf16, #slot_shared, #smem, mutable>
+      %copy = ttg.async_copy_global_to_local %ring_ptrs, %current : tensor<16x16x!tt.ptr<f16>, #slot_blocked> -> <16x16xf16, #slot_shared, #smem, mutable>
+      %commit = ttg.async_commit_group tokens %copy
+      %wait = ttg.async_wait {num = 1 : i32}
+      ttg.barrier all
+      %loaded = ttg.local_load %previous token %wait : !ttg.memdesc<16x16xf16, #slot_shared, #smem, mutable> -> tensor<16x16xf16, #slot_blocked>
+      %ring_consumer = arith.addf %loaded, %ring_acc : tensor<16x16xf16, #slot_blocked>
+      ttg.barrier all
+      %register_producer = arith.addf %register_acc, %input : tensor<16x16xf16, #slot_blocked>
+      %padding = arith.subf %input, %input : tensor<16x16xf16, #slot_blocked>
+      %register_consumer = arith.mulf %register_producer, %input : tensor<16x16xf16, #slot_blocked>
+      %global0 = tt.load %stage_ptrs0 : tensor<16x16x!tt.ptr<f16>, #slot_blocked>
+      %global_consumer0 = arith.addf %global0, %global_acc0 : tensor<16x16xf16, #slot_blocked>
+      %global1 = tt.load %stage_ptrs1 : tensor<16x16x!tt.ptr<f16>, #slot_blocked>
+      %global_consumer1 = arith.addf %global1, %global_acc1 : tensor<16x16xf16, #slot_blocked>
+      scf.yield %ring_consumer, %register_consumer, %global_consumer0, %global_consumer1 : tensor<16x16xf16, #slot_blocked>, tensor<16x16xf16, #slot_blocked>, tensor<16x16xf16, #slot_blocked>, tensor<16x16xf16, #slot_blocked>
+    }
+    %final_wait = ttg.async_wait {num = 0 : i32}
+    ttg.barrier all
+    ttg.local_dealloc %alloc : !ttg.memdesc<2x16x16xf16, #slot_shared, #smem, mutable>
+    tt.return %results#0, %results#1, %results#2, %results#3 : tensor<16x16xf16, #slot_blocked>, tensor<16x16xf16, #slot_blocked>, tensor<16x16xf16, #slot_blocked>, tensor<16x16xf16, #slot_blocked>
   }
 
   tt.func @schedule_apply_fixture() -> i32 {

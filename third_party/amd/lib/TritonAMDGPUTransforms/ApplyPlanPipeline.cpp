@@ -78,9 +78,17 @@ public:
 };
 
 struct ResolvedLoopPipeline {
+  struct ExistingRingContract {
+    ttg::LocalAllocOp allocation;
+    int64_t depth = 0;
+    int64_t distance = 0;
+  };
+
   scf::ForOp loop;
   SmallVector<Operation *> desiredOrder;
   SmallVector<tta::PlanExistingLdsRingMutation, 1> ringMutations;
+  SmallVector<ExistingRingContract, 1> existingRings;
+  llvm::DenseSet<Operation *> existingRingOperations;
   SmallVector<tta::PlanAsyncWaitMutation, 2> waitMutations;
   SmallVector<tta::PlanLdsStaging, 1> stagingMutations;
   bool pipelineExpansionRequired = false;
@@ -371,6 +379,34 @@ static void collectMovableBackwardSlice(Operation *root, scf::ForOp loop,
   }
 }
 
+static bool dependsOnOperationSet(Value value, scf::ForOp loop,
+                                  const llvm::DenseSet<Operation *> &operations,
+                                  llvm::DenseSet<Value> &visited) {
+  if (!value || !visited.insert(value).second)
+    return false;
+  Operation *definition = value.getDefiningOp();
+  if (!definition || definition->getBlock() != loop.getBody())
+    return false;
+  if (operations.contains(definition))
+    return true;
+  return llvm::any_of(definition->getOperands(), [&](Value operand) {
+    return dependsOnOperationSet(operand, loop, operations, visited);
+  });
+}
+
+static bool
+operationDependsOnSet(Operation *operation, scf::ForOp loop,
+                      const llvm::DenseSet<Operation *> &operations) {
+  if (!operation)
+    return false;
+  for (Value operand : operation->getOperands()) {
+    llvm::DenseSet<Value> visited;
+    if (dependsOnOperationSet(operand, loop, operations, visited))
+      return true;
+  }
+  return false;
+}
+
 static LogicalResult
 resolveLoopPipeline(const tt::plan::PlanLoopPipelineDelta &requested,
                     scf::ForOp loop, const tt::plan::PlanValueGraph &graph,
@@ -392,12 +428,6 @@ resolveLoopPipeline(const tt::plan::PlanLoopPipelineDelta &requested,
   for (const auto &intent : requested.transactions)
     requestedGroups.insert(intent.groupId);
 
-  if (!requested.transactions.empty() && !requested.staging.empty()) {
-    error = "M1.5b.4 does not combine new staging with existing-ring "
-            "transactions";
-    return failure();
-  }
-
   tta::PlanLdsStagingResolution stagingResolution;
   if (failed(tta::resolveLdsStaging(requested.staging, loop, graph,
                                     operationById, valueById, stagingResolution,
@@ -405,18 +435,43 @@ resolveLoopPipeline(const tt::plan::PlanLoopPipelineDelta &requested,
     return failure();
   int64_t stagingBytes = stagingResolution.logicalBytes;
   resolved.stagingMutations = std::move(stagingResolution.staging);
-  std::optional<int64_t> bufferedStagingDistance;
   for (const tta::PlanLdsStaging &staging : resolved.stagingMutations) {
-    if (staging.bufferDepth == 1)
-      continue;
-    if (bufferedStagingDistance &&
-        *bufferedStagingDistance != staging.distance) {
-      error = "buffered staging intents in one loop must use one distance";
+    resolved.pipelineExpansionRequired |= staging.bufferDepth > 1;
+  }
+
+  struct StagingOperationOwner {
+    int64_t distance = 0;
+    bool exclusive = false;
+  };
+  llvm::DenseMap<Operation *, StagingOperationOwner> stagingOperations;
+  for (const tta::PlanLdsStaging &staging : resolved.stagingMutations) {
+    auto record = [&](Operation *operation, bool exclusive) {
+      if (!operation)
+        return false;
+      auto [owner, inserted] = stagingOperations.try_emplace(
+          operation, StagingOperationOwner{staging.distance, exclusive});
+      if (inserted)
+        return true;
+      return !exclusive && !owner->second.exclusive &&
+             owner->second.distance == staging.distance;
+    };
+    if (!record(staging.source.getDefiningOp(), /*exclusive=*/true)) {
+      error = "new staging intents have incompatible operation families";
       return failure();
     }
-    bufferedStagingDistance = staging.distance;
+    for (Operation *operation : staging.derivedOperations) {
+      if (!record(operation, /*exclusive=*/true)) {
+        error = "new staging intents have incompatible operation families";
+        return failure();
+      }
+    }
+    for (Operation *operation : staging.consumers) {
+      if (!record(operation, /*exclusive=*/false)) {
+        error = "new staging intents have incompatible operation families";
+        return failure();
+      }
+    }
   }
-  resolved.pipelineExpansionRequired = bufferedStagingDistance.has_value();
 
   std::map<std::string, const tt::plan::PlanPipelineTransactionIntent *>
       intentByGroup;
@@ -435,6 +490,7 @@ resolveLoopPipeline(const tt::plan::PlanLoopPipelineDelta &requested,
   SmallVector<std::tuple<Operation *, Operation *, unsigned>> releaseToProducer;
   SmallVector<std::tuple<Operation *, Operation *, unsigned>> requestedEdges;
   std::map<Operation *, unsigned> ringByAllocation;
+  std::map<Operation *, unsigned> contractByAllocation;
   std::map<std::string, SmallVector<Operation *>> consumersByGroup;
   bool hasScheduleMutation = false;
   std::set<std::string> scheduleMutationGroups;
@@ -458,6 +514,8 @@ resolveLoopPipeline(const tt::plan::PlanLoopPipelineDelta &requested,
       return failure();
     }
     collectMovableBackwardSlice(commitIt->second, loop, selected);
+    collectMovableBackwardSlice(commitIt->second, loop,
+                                resolved.existingRingOperations);
     resolved.record.groups.push_back(intent.groupId);
     for (StringRef transactionId : group.transactionIds) {
       auto transactionIt = transactionById.find(transactionId.str());
@@ -513,6 +571,8 @@ resolveLoopPipeline(const tt::plan::PlanLoopPipelineDelta &requested,
         return failure();
       }
       collectMovableBackwardSlice(producerIt->second, loop, selected);
+      collectMovableBackwardSlice(producerIt->second, loop,
+                                  resolved.existingRingOperations);
 
       SmallVector<Operation *> consumers;
       SmallVector<ttg::MemDescIndexOp> consumerViews;
@@ -530,9 +590,27 @@ resolveLoopPipeline(const tt::plan::PlanLoopPipelineDelta &requested,
                 "distance";
         return failure();
       }
+      unsigned contractIndex;
+      auto existingContract = contractByAllocation.find(allocation);
+      if (existingContract == contractByAllocation.end()) {
+        contractIndex = resolved.existingRings.size();
+        contractByAllocation[allocation] = contractIndex;
+        resolved.existingRings.push_back(
+            {allocation, intent.bufferDepth, intent.distance});
+      } else {
+        contractIndex = existingContract->second;
+        const auto &contract = resolved.existingRings[contractIndex];
+        if (contract.depth != intent.bufferDepth ||
+            contract.distance != intent.distance) {
+          error = "one LDS allocation received inconsistent final contracts";
+          return failure();
+        }
+      }
       for (Operation *consumer : consumers)
-        if (!llvm::is_contained(consumersByGroup[intent.groupId], consumer))
+        if (!llvm::is_contained(consumersByGroup[intent.groupId], consumer)) {
           consumersByGroup[intent.groupId].push_back(consumer);
+          resolved.existingRingOperations.insert(consumer);
+        }
 
       bool mutates =
           oldDepth != intent.bufferDepth || *oldDistance != intent.distance;
@@ -593,6 +671,16 @@ resolveLoopPipeline(const tt::plan::PlanLoopPipelineDelta &requested,
       }
       if (!release)
         release = consumers.back();
+      resolved.existingRingOperations.insert(release);
+      for (const tt::plan::PlanAsyncFrontier &frontier :
+           transaction.visibilityFrontiers) {
+        auto operation = operationById.find(frontier.operationId);
+        Operation *inLoop = operation == operationById.end()
+                                ? nullptr
+                                : projectToLoopBody(operation->second, loop);
+        if (inLoop)
+          resolved.existingRingOperations.insert(inLoop);
+      }
       unsigned reuseDistance = static_cast<unsigned>(
           std::max<int64_t>(0, intent.bufferDepth - intent.distance));
       bool requiresScheduleMutation =
@@ -708,6 +796,7 @@ resolveLoopPipeline(const tt::plan::PlanLoopPipelineDelta &requested,
       error = "positive-distance completion wait is not directly in the loop";
       return failure();
     }
+    resolved.existingRingOperations.insert(waitOp);
     int64_t selectedRetained = oldDistance * family.size();
     int64_t unrelatedRetained = wait.retainedGroupCount - selectedRetained;
     if (unrelatedRetained < 0) {
@@ -737,6 +826,27 @@ resolveLoopPipeline(const tt::plan::PlanLoopPipelineDelta &requested,
             requestedEdges.push_back({commit->second, waitOp, 0});
           mutationOperations.insert(commit->second);
         }
+      }
+    }
+  }
+
+  if (!resolved.existingRingOperations.empty() &&
+      !stagingResolution.participatingOperations.empty()) {
+    for (Operation *operation : stagingResolution.participatingOperations) {
+      if (resolved.existingRingOperations.contains(operation) ||
+          operationDependsOnSet(operation, loop,
+                                resolved.existingRingOperations)) {
+        error = "mixed existing-ring/staging plan has overlapping or "
+                "cross-dependent operation families";
+        return failure();
+      }
+    }
+    for (Operation *operation : resolved.existingRingOperations) {
+      if (operationDependsOnSet(operation, loop,
+                                stagingResolution.participatingOperations)) {
+        error = "mixed existing-ring/staging plan has overlapping or "
+                "cross-dependent operation families";
+        return failure();
       }
     }
   }
@@ -792,9 +902,12 @@ resolveLoopPipeline(const tt::plan::PlanLoopPipelineDelta &requested,
   logicalLdsAfter += stagingBytes;
   if (logicalLdsAfter >
       getLdsCapacityBytes(loop->getParentOfType<ModuleOp>())) {
-    error = resolved.stagingMutations.empty()
-                ? "requested LDS ring depths exceed the target LDS capacity"
-                : "register-to-LDS staging exceeds the target LDS capacity";
+    if (!resolved.existingRings.empty() && !resolved.stagingMutations.empty())
+      error = "requested mixed LDS plan exceeds the target LDS capacity";
+    else if (!resolved.stagingMutations.empty())
+      error = "register-to-LDS staging exceeds the target LDS capacity";
+    else
+      error = "requested LDS ring depths exceed the target LDS capacity";
     return failure();
   }
   resolved.record.logicalLdsBytesBefore = logicalLdsBefore;
@@ -869,7 +982,7 @@ resolveLoopPipeline(const tt::plan::PlanLoopPipelineDelta &requested,
     previousPinned = operation;
   }
   if (selected.empty()) {
-    error = "pipeline delta resolved no movable existing-LDS operations";
+    error = "pipeline delta resolved no movable operations";
     return failure();
   }
 
@@ -912,9 +1025,7 @@ serializeBufferedStagingSchedule(ResolvedLoopPipeline &resolved,
   if (!resolved.pipelineExpansionRequired)
     return success();
 
-  std::optional<int64_t> distance;
-  llvm::DenseSet<Operation *> stageZero;
-  llvm::DenseSet<Operation *> waits;
+  int64_t maxDistance = 0;
   for (tta::PlanLdsStaging &staging : resolved.stagingMutations) {
     if (staging.bufferDepth == 1)
       continue;
@@ -924,33 +1035,73 @@ serializeBufferedStagingSchedule(ResolvedLoopPipeline &resolved,
       error = "buffered staging cannot be serialized into a pipeline";
       return failure();
     }
-    if (distance && *distance != staging.distance) {
-      error = "buffered staging schedule has inconsistent distances";
-      return failure();
-    }
-    distance = staging.distance;
-    collectMovableBackwardSlice(staging.asyncCommit, resolved.loop, stageZero);
-    waits.insert(staging.asyncWait);
+    maxDistance = std::max(maxDistance, staging.distance);
   }
-  if (!distance) {
+  if (maxDistance < 1) {
     error = "buffered staging schedule has no positive distance";
     return failure();
   }
 
-  tt::CoarseSchedule schedule(/*numStages=*/static_cast<int>(*distance + 1));
+  tt::CoarseSchedule schedule(
+      /*numStages=*/static_cast<int>(maxDistance + 1));
   auto waitCluster = schedule.clusters.newAtBack();
   auto loadCluster = schedule.clusters.newAtBack();
   auto computeCluster = schedule.clusters.newAtBack();
-  for (Operation &operation : resolved.loop.getBody()->without_terminator()) {
-    if (waits.contains(&operation)) {
-      schedule.insert(&operation, *distance, waitCluster);
-      continue;
+
+  auto insertAt = [&](Operation *operation, int64_t stage,
+                      tt::CoarseSchedule::Cluster cluster) {
+    if (!operation || operation->getBlock() != resolved.loop.getBody())
+      return success();
+    auto existing = schedule.find(operation);
+    if (existing != schedule.end() && existing->second.first != stage) {
+      error = "mixed buffered staging assigns one operation to incompatible "
+              "pipeline stages";
+      return failure();
     }
-    if (stageZero.contains(&operation)) {
-      schedule.insert(&operation, 0, loadCluster);
+    schedule.insert(operation, static_cast<int>(stage), cluster);
+    return success();
+  };
+
+  for (tta::PlanLdsStaging &staging : resolved.stagingMutations) {
+    if (staging.bufferDepth == 1)
       continue;
+    llvm::DenseSet<Operation *> stageZero;
+    collectMovableBackwardSlice(staging.asyncCommit, resolved.loop, stageZero);
+    for (Operation *operation : stageZero)
+      if (failed(insertAt(operation, /*stage=*/0, loadCluster)))
+        return failure();
+    if (failed(insertAt(staging.asyncWait, staging.distance, waitCluster)) ||
+        failed(insertAt(staging.visibilityBarrier, staging.distance,
+                        computeCluster)) ||
+        failed(insertAt(staging.load, staging.distance, computeCluster)))
+      return failure();
+    for (Operation *operation : staging.clonedDerivedOperations)
+      if (failed(insertAt(operation, staging.distance, computeCluster)))
+        return failure();
+    for (Operation *operation : staging.consumers)
+      if (failed(insertAt(operation, staging.distance, computeCluster)))
+        return failure();
+    if (failed(
+            insertAt(staging.releaseBarrier, staging.distance, computeCluster)))
+      return failure();
+  }
+
+  for (Operation *operation : resolved.existingRingOperations) {
+    if (failed(insertAt(operation, maxDistance, computeCluster)))
+      return failure();
+  }
+
+  tt::scheduleDependencies(resolved.loop, schedule);
+  ttg::scheduleRemainingToLastStage(resolved.loop, schedule, computeCluster);
+  for (Operation *operation : resolved.existingRingOperations) {
+    auto placement = schedule.find(operation);
+    if (operation->getBlock() == resolved.loop.getBody() &&
+        (placement == schedule.end() ||
+         placement->second.first != maxDistance)) {
+      error = "mixed buffered schedule moved an existing-ring operation out "
+              "of its logical stage";
+      return failure();
     }
-    schedule.insert(&operation, *distance, computeCluster);
   }
   schedule.serialize(resolved.loop, /*keepExistingMaxStage=*/false);
   return success();
@@ -978,6 +1129,18 @@ static LogicalResult verifyExpandedPipeline(tt::FuncOp function,
     return failure();
   }
   return success();
+}
+
+static void coalesceAdjacentBarriers(tt::FuncOp function) {
+  SmallVector<ttg::BarrierOp> redundant;
+  function.walk([&](ttg::BarrierOp barrier) {
+    auto previous = dyn_cast_or_null<ttg::BarrierOp>(barrier->getPrevNode());
+    if (previous &&
+        previous->getAttrDictionary() == barrier->getAttrDictionary())
+      redundant.push_back(barrier);
+  });
+  for (ttg::BarrierOp barrier : redundant)
+    barrier.erase();
 }
 
 static std::optional<int64_t>
@@ -1091,6 +1254,61 @@ static LogicalResult verifyFinalBufferedStaging(
       }
       if (!proven) {
         error = "final buffered staging graph does not prove the requested "
+                "depth, distance, visibility, release, and overwrite";
+        return failure();
+      }
+    }
+  }
+  return success();
+}
+
+static LogicalResult verifyFinalExistingRings(
+    const tt::plan::PlanValueGraph &graph,
+    const llvm::DenseMap<Operation *, std::string> &bindings,
+    ArrayRef<ResolvedLoopPipeline> resolved, std::string &error) {
+  std::map<std::string, const tt::plan::PlanLdsAllocationRecord *>
+      allocationByOperation;
+  for (const tt::plan::PlanLdsAllocationRecord &allocation :
+       graph.getLdsAllocations())
+    allocationByOperation[allocation.allocationOperationId] = &allocation;
+
+  for (const ResolvedLoopPipeline &loop : resolved) {
+    for (const ResolvedLoopPipeline::ExistingRingContract &contract :
+         loop.existingRings) {
+      auto allocationId = bindings.find(contract.allocation);
+      auto allocation = allocationId == bindings.end()
+                            ? allocationByOperation.end()
+                            : allocationByOperation.find(allocationId->second);
+      if (allocation == allocationByOperation.end()) {
+        error = "final existing-ring allocation lost Plan IR identity";
+        return failure();
+      }
+
+      bool proven = llvm::any_of(
+          graph.getAsyncTransactions(),
+          [&](const tt::plan::PlanAsyncTransaction &transaction) {
+            if (transaction.direction != "lds_write" ||
+                !llvm::is_contained(transaction.rootValueIds,
+                                    allocation->second->rootValueId) ||
+                !hasExactSlotDepth(transaction, contract.depth) ||
+                !hasExactConsumerDistance(transaction, contract.distance))
+              return false;
+            bool hasVisibility = llvm::any_of(
+                transaction.visibilityFrontiers, [&](const auto &frontier) {
+                  return frontier.iterationDistance == contract.distance;
+                });
+            bool hasRelease = llvm::any_of(
+                transaction.releaseFrontiers, [&](const auto &frontier) {
+                  return frontier.iterationDistance == contract.distance;
+                });
+            bool hasOverwrite = llvm::any_of(
+                transaction.overwriteFrontiers, [&](const auto &frontier) {
+                  return frontier.iterationDistance == contract.depth;
+                });
+            return hasVisibility && hasRelease && hasOverwrite;
+          });
+      if (!proven) {
+        error = "final existing-ring graph does not prove the requested "
                 "depth, distance, visibility, release, and overwrite";
         return failure();
       }
@@ -1388,7 +1606,7 @@ verifyPostRewrite(const tt::plan::PlanValueGraph &postGraph,
         return failure();
       }
     }
-    if (!loop.ringMutations.empty()) {
+    if (!loop.ringMutations.empty() && loop.stagingMutations.empty()) {
       ttg::DataDependenceGraph ddg = ttg::DataDependenceGraph::build(
           loop.loop, latencyModel, noPartition, ttg::getActiveScheduleAlgo(),
           /*scheduleNestedLoops=*/false);
@@ -1402,9 +1620,11 @@ verifyPostRewrite(const tt::plan::PlanValueGraph &postGraph,
       }
       loop.record.postRewriteDdgVerified = true;
     } else if (!loop.stagingMutations.empty()) {
-      // Single-slot synchronous staging does not overlap loop iterations, so
-      // it needs a rebuilt DDG but not a modulo schedule. Verify that the
-      // emitted order satisfies every distance-zero edge in that rebuilt DDG.
+      // Staging materialization needs one rebuilt DDG. Mixed plans keep the
+      // existing ring contract explicit and isolate the two operation
+      // families, so verify the emitted order against every distance-zero
+      // dependency here; buffered positive-distance contracts are audited
+      // again after expansion.
       ttg::DataDependenceGraph ddg = ttg::DataDependenceGraph::build(
           loop.loop, latencyModel, noPartition, ttg::getActiveScheduleAlgo(),
           /*scheduleNestedLoops=*/false);
@@ -1631,6 +1851,7 @@ applyPlanPipeline(tt::FuncOp function, const tt::plan::PlanPipelineDelta &delta,
         if (staging.bufferDepth > 1)
           staging.pipelineExpanded = true;
   }
+  coalesceAdjacentBarriers(function);
 
   llvm::DenseMap<Operation *, std::string> finalBindings;
   FailureOr<tt::plan::PlanValueGraph> finalGraph =
@@ -1649,6 +1870,11 @@ applyPlanPipeline(tt::FuncOp function, const tt::plan::PlanPipelineDelta &delta,
                   "final pipeline audit retained an open important fact: " +
                       fact.code);
   if (requiresExpansion && failed(verifyFinalBufferedStaging(
+                               *finalGraph, finalBindings, resolved, error))) {
+    result.error = error;
+    return failure();
+  }
+  if (requiresExpansion && failed(verifyFinalExistingRings(
                                *finalGraph, finalBindings, resolved, error))) {
     result.error = error;
     return failure();

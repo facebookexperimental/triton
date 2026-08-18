@@ -1,6 +1,6 @@
 # AMD TLX Plan IR prototype
 
-This directory implements M1.1--M1.5b.4c of the profile-guided TLX scheduling
+This directory implements M1.1--M1.5b.4e of the profile-guided TLX scheduling
 design without changing the existing TLX kernels. M1.5b.2 reuses and extends
 Meta's shared modulo-scheduling DDG through backend-neutral APIs.
 
@@ -77,15 +77,34 @@ Meta's shared modulo-scheduling DDG through backend-neutral APIs.
   derived paths, and a release barrier. Acceptance proves the original global
   register load is gone, its access semantics are unchanged, and exactly one
   new async LDS transaction/group/wait was introduced.
+- **M1.5b.4d — buffered cross-iteration global-to-LDS staging:** a positive
+  staging distance and a buffer depth greater than that distance create a
+  loop-carried modulo ring and a multi-buffer LDS allocation. The pass places
+  the direct-to-LDS copy in stage zero, places the wait/load/consumer path in
+  the requested stage, and reuses the shared AMD pipeline expander to emit the
+  prologue, steady state, and epilogue. Acceptance proves exact allocation and
+  slot depth before expansion, then proves exact SSA backedge distance,
+  overwrite depth, synchronization, no LDS hazard, and no dot-contract change
+  after expansion.
+- **M1.5b.4e — mixed existing-ring and new-staging plans:** one loop delta may
+  resize/re-time complete existing LDS rings and introduce independent
+  register or global staging families. Resolution rejects overlapping or
+  cross-dependent families, charges resized and new allocations to one LDS
+  budget, and applies one rebuilt DDG audit. Buffered staging families may use
+  different distances; one `max(distance) + 1` coarse schedule keeps existing
+  ring operations together, places each staged copy/consumer at its requested
+  stage, and invokes the shared expander once. The final graph re-proves every
+  expanded existing and new ring contract, and adjacent identical barriers are
+  conservatively coalesced without merging partial waits.
 
 M1.5a lowers only verified intra-iteration schedule permutations. M1.5b.1
 validates cross-iteration intent. M1.5b.2 applies schedules already represented
 by an existing ring. M1.5b.3 changes depth/distance and synchronization only
 for that existing ring. M1.5b.4a introduces synchronous single-slot
 `register_to_lds`, M1.5b.4b extends it through supported derived register
-paths, and M1.5b.4c adds strict same-iteration `global_to_lds`. Buffered and
-cross-iteration staging plus mixed ring/staging plans remain later M1.5b.4
-work.
+paths, M1.5b.4c adds strict same-iteration `global_to_lds`, and M1.5b.4d adds
+buffered cross-iteration `global_to_lds`. M1.5b.4e composes independent
+existing-ring and new-staging intents in one loop.
 
 ## Reproduction
 
@@ -209,11 +228,39 @@ with `buffer_depth: 1`. M1.5b.4 requires a produced ranked tensor and named
 consumers in the selected `scf.for`, known logical bytes, and a power-of-two
 alignment. M1.5b.4b permits selected consumer paths through supported pure
 slice/reshape/transpose/layout operations while preserving unrelated uses.
+M1.5b.4d also accepts `global_to_lds` with positive `distance` and
+`buffer_depth > distance`; it materializes and expands the requested modulo LDS
+pipeline. Register staging remains distance-zero and single-slot. M1.5b.4e
+allows the same loop entry to contain complete existing-ring transaction
+intents and independent staging intents. Their resized/new allocation bytes are
+checked together. Overlapping operations and SSA dependencies between the two
+families are rejected.
 The report uses `materialization_scope: register_to_lds_staging` or
 `global_to_lds_staging` and records the new staging and synchronization
 changes, cloned/pruned derived operation counts, preserved unselected
 consumers, source lifetime changes, eliminated global loads, direct LDS
-copies, and inserted commit/wait operations.
+copies, inserted commit/wait operations, requested distance/depth, and whether
+pipeline expansion ran.
+
+## M1.5b.4e mixed-plan composition
+
+Synchronous mixed plans apply existing-ring mutations first, then new staging,
+and validate the combined IR with one rebuilt DDG. Buffered mixed plans build
+one post-materialization coarse schedule. Existing-ring operations remain in
+the last logical stage, while each new global staging copy is placed in stage
+zero and its wait/load/consumer path is placed at its own requested distance.
+All remaining operations are scheduled in the last stage, dependencies are
+completed once, and the AMD expander runs once.
+
+Acceptance preserves the pre-expansion structure-count and dot-contract
+checks. After expansion it requires no schedule markers, strict Plan IR, no LDS
+reuse hazard or open important fact, exact depth/distance/overwrite contracts
+for every expanded existing and new ring, and unchanged global access
+semantics. Adjacent barriers with identical address-space semantics are merged;
+async waits, including unrelated retained groups, are not coalesced. Focused
+lit coverage includes ring plus register staging, same-iteration global
+staging, buffered global staging, two distinct staging distances, unified
+capacity rejection, and overlapping-family rejection.
 
 The fixed configuration names and kernel symbols are sourced from
 `third_party/tlx/tutorials/amd_fa_bwd.py`:

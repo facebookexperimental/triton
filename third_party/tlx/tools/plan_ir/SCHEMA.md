@@ -115,7 +115,10 @@ one or both of:
 - a complete async group with `set_prefetch_distance`, positive iteration
   distance, and buffer depth at least that distance;
 - a logical tensor value with `global_to_lds` or `register_to_lds`, explicit
-  in-loop consumers, positive buffer depth, and power-of-two alignment.
+  in-loop consumers, non-negative iteration distance, positive buffer depth,
+  and power-of-two alignment. Register staging is currently distance zero and
+  single-slot. Global staging is either distance-zero/single-slot or buffered
+  with positive distance and buffer depth strictly greater than distance.
 
 Dry-run validation rejects stale fingerprints, unknown or non-loop targets,
 groups committed or produced outside the selected loop, incomplete groups,
@@ -184,9 +187,10 @@ The materializer allocates one mutable shared-memory object outside the loop,
 stores the original register value, inserts a local visibility barrier, reloads
 the value in its exact original register layout, rewrites the named consumer
 operands, inserts a consumer-release barrier, and deallocates after the loop.
-It rejects target-capacity overflow, mixed existing-ring/staging requests,
-loop-carried values, and multi-slot staging. Derived uses are added by 4b
-below; nested uses remain unsupported.
+It rejects target-capacity overflow, loop-carried values, and multi-slot
+register staging. Derived uses are added by 4b below; nested uses remain
+unsupported. M1.5b.4e permits this request alongside an independent complete
+existing-ring transaction family.
 
 After mutation it requires strict Plan IR verification, no open important fact
 or LDS reuse hazard, exact requested alignment and logical bytes, a legal
@@ -229,5 +233,75 @@ then removes the original load and dead derived register path.
 Post-rewrite acceptance requires one new LDS allocation, async transaction,
 group, and wait; a proven completion/visibility/consumer/release chain; no old
 source operation/value identity; unchanged dot/scheduled-MFMA contracts; and a
-legal rebuilt distance-zero DDG. Buffered and cross-iteration staging and
-mixed existing-ring/new-staging requests remain later M1.5b.4 work.
+legal rebuilt distance-zero DDG. M1.5b.4e composes this with independent
+existing-ring intents.
+
+### M1.5b.4d buffered cross-iteration global staging
+
+`global_to_lds` may additionally request positive `distance` and
+`buffer_depth > distance`. The same complete-use, non-volatile
+`tt.load`/`amdg.buffer_load`, access-semantics, derived-path, alignment, and
+capacity requirements from 4c still apply. `register_to_lds` remains
+distance-zero and single-slot.
+
+The materializer adds a loop-carried i32 ring counter initialized to `-1`,
+increments it modulo the requested depth, allocates a leading-dimension LDS
+ring, and indexes the direct-to-LDS copy and local load through the resulting
+single-buffer view. It serializes a `CoarseSchedule` with the copy/commit
+backward slice in stage zero, the wait first in the requested consumer stage,
+and the local load, derived path, consumers, and release barrier in that
+consumer stage. The shared AMD pipeline expander then emits the prologue,
+steady-state loop, and peeled epilogue. Distance one/depth two and distance
+two/depth three are covered; depth must be greater than distance so a producer
+cannot overwrite the slot still being consumed.
+
+Acceptance is two-phase. Before expansion, strict Plan IR proves the new
+allocation, modulo slot depth, direct-to-LDS transaction, access semantics,
+completion/visibility/consumer/release chain, source-load elimination, LDS
+capacity, and unchanged dot contract. After expansion, schedule markers must
+be gone, MLIR and strict Plan IR must verify, no important fact or LDS hazard
+may remain, overwrite distance must equal the requested depth, and the
+producer-view to consumer-view SSA path must cross exactly the requested
+number of structured-loop backedges. The apply report records `distance`,
+`buffer_depth`, and `pipeline_expanded`.
+
+### M1.5b.4e mixed-plan composition
+
+One loop entry may contain both `transactions` and `staging`. Each family is
+resolved against the same baseline graph and retains its earlier complete-use,
+complete-wait-family, direct-view, alignment, and depth/distance requirements.
+The implementation requires unique producer/derived paths for each new staging
+family; a consumer may be shared only when every family assigns it the same
+distance. It rejects any operation shared by an existing-ring and staging
+family and any direct SSA dependency in either direction between those
+families. This conservative contract prevents the unified scheduler from
+silently changing an existing ring's producer/consumer relationship.
+
+Capacity is computed once from baseline logical LDS bytes, every resized
+existing-ring delta, and every new staging allocation multiplied by its buffer
+depth. Synchronous mixed plans materialize existing-ring changes followed by
+new staging and rebuild one DDG; acceptance verifies all emitted distance-zero
+edges plus the existing Plan IR ring and staging contracts.
+
+If any new staging entry is buffered, the pass builds one schedule with
+`max(staging distance) + 1` stages. For each buffered family, the direct-to-LDS
+copy/commit backward slice is assigned stage zero and its wait, visibility
+barrier, local load, cloned derived path, named consumers, and release barrier
+are assigned the requested consumer stage. Existing-ring operations and all
+unassigned operations remain in the last logical stage. Dependencies are
+completed once and the shared AMD expander is invoked once, so staging entries
+with different distances share one prologue, steady state, and epilogue.
+
+After materialization the existing structure-count, global-access, staging,
+ring-mutation, DDG, and dot-contract audits still apply. After expansion, the
+pass removes schedule markers, coalesces only adjacent barriers with identical
+address-space semantics, and rebuilds strict Plan IR. Final acceptance requires
+no LDS reuse hazard or open important fact and exact depth, structured SSA
+consumer distance, visibility, release, and overwrite distance for every
+expanded existing-ring and new-staging allocation. Async waits are deliberately
+left separate so unrelated retained groups are preserved.
+
+Focused lit coverage includes existing ring plus register staging, existing
+ring plus same-iteration global staging, existing ring plus buffered global
+staging, two staging distances in one expansion, combined-capacity overflow,
+and overlapping/cross-dependent family rejection.
