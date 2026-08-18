@@ -16,6 +16,12 @@ def test_amd_mfma_tiles_per_warp_uses_warp_rank():
     assert tiled.tiles_per_warp == [2, 2]
 
 
+def test_slice_layout_rejects_negative_dimension():
+    mma = tlx.amd_mfma_layout(4, [32, 32, 16], True, [4, 1])
+    with pytest.raises(ValueError, match="dim must be non-negative"):
+        tlx.slice_layout(mma, dim=-1)
+
+
 # The FA4 "separable" layout for a 128x128 TMEM tile, written purely as
 # shape/stride (a CuTe thread-value layout). The two top-level modes are
 # (thread, value); strides are flat row-major offsets into the tile
@@ -1018,6 +1024,85 @@ def test_tlx_dot_preserves_explicit_accumulator_layout_on_cdna4():
     compiled = kernel.warmup(x, y, shared, dot0, dot1, mma, store, grid=(1, ), num_warps=4)
     assert "#ttg.amd_mfma" in compiled.asm["ttir"]
     assert "#tlx.no_verify_layout" not in compiled.asm["ttgir"]
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Need gfx950 (CDNA4)")
+def test_mfma_split_concat_preserves_logical_columns_on_cdna4():
+    """Order-preserving reshape/split/join reconstructs an MFMA score tile.
+
+    Flash attention carries N8 probability fragments across source stages and
+    later reassembles them for its row sum and P-by-V dot.  Marking these
+    reshapes reorderable changes their logical register interpretation: the
+    shapes still verify, but every reconstructed row can contain wrong values.
+    """
+
+    @triton.jit
+    def split_cols(x):
+        x0, x1 = x.reshape([x.shape[0], 2, x.shape[1] // 2]).permute(0, 2, 1).split()
+        return x0, x1
+
+    @triton.jit
+    def concat_cols(x0, x1):
+        return tl.join(x0, x1).permute(0, 2, 1).reshape([x0.shape[0], x0.shape[1] + x1.shape[1]])
+
+    @triton.jit
+    def sum_rows_chain4(x):
+        x_01, x_23 = split_cols(x)
+        x_0, x_1 = split_cols(x_01)
+        x_2, x_3 = split_cols(x_23)
+        return tl.sum(x_0 + x_1 + x_2 + x_3, 1)
+
+    @triton.jit
+    def kernel(X, Recon, Chain, Direct, MMA: tl.constexpr):
+        rows = tl.arange(0, 256)
+        cols = tl.arange(0, 64)
+        offsets = rows[:, None] * 64 + cols[None, :]
+        x = tlx.require_layout(tl.load(X + offsets), MMA)
+        x_lo, x_hi = split_cols(x)
+        reconstructed = concat_cols(x_lo, x_hi)
+        chain = sum_rows_chain4(x)
+        direct = tl.sum(x, 1)
+        tl.store(Recon + offsets, reconstructed)
+        tl.store(Chain + rows, chain)
+        tl.store(Direct + rows, direct)
+
+    mma = tlx.amd_mfma_layout(4, [32, 32, 16], True, [8, 1])
+    torch.manual_seed(7)
+    x = torch.rand((256, 64), device=DEVICE, dtype=torch.float32)
+    reconstructed = torch.empty_like(x)
+    chain = torch.empty((256, ), device=DEVICE, dtype=torch.float32)
+    direct = torch.empty_like(chain)
+    compiled = kernel[(1, )](x, reconstructed, chain, direct, mma, num_warps=8, enable_tree_reduction=True)
+
+    reference = x.sum(1)
+    torch.testing.assert_close(reconstructed, x, atol=0, rtol=0)
+    torch.testing.assert_close(chain, reference, atol=1e-5, rtol=1e-6)
+    torch.testing.assert_close(direct, reference, atol=1e-5, rtol=1e-6)
+    _assert_no_layout_residue(compiled.asm["ttgir"])
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Need gfx950 (CDNA4)")
+def test_slice_layout_matches_mfma_row_reduction_on_cdna4():
+    """The public slice layout names the rank-1 result of an MFMA row sum."""
+    mma = tlx.amd_mfma_layout(4, [32, 32, 16], True, [8, 1])
+    rows = tlx.slice_layout(mma, dim=1)
+
+    @triton.jit
+    def kernel(X, Y, MMA: tl.constexpr, ROWS: tl.constexpr):
+        offs_m = tl.arange(0, 256)
+        offs_n = tl.arange(0, 64)
+        offsets = offs_m[:, None] * 64 + offs_n[None, :]
+        x = tlx.require_layout(tl.load(X + offsets), MMA)
+        reduced = tl.reduce(x, 1, _pinned_add_combine)
+        reduced = tlx.require_layout(reduced, ROWS)
+        tlx.assert_same_layout(reduced, ROWS)
+        tl.store(Y + offs_m, reduced)
+
+    x = torch.rand((256, 64), device=DEVICE, dtype=torch.float32)
+    y = torch.empty((256, ), device=DEVICE, dtype=torch.float32)
+    compiled = kernel[(1, )](x, y, mma, rows, num_warps=8, enable_tree_reduction=True)
+    torch.testing.assert_close(y, x.sum(1), atol=1e-5, rtol=1e-6)
+    _assert_no_layout_residue(compiled.asm["ttgir"])
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Need gfx950 (CDNA4)")

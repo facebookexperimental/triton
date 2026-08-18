@@ -210,6 +210,20 @@ def require_layout(
     return tl.tensor(handle, x.type)
 
 
+@tl.builtin
+def release_layout(x, _semantic=None):
+    """End an explicit register-layout domain.
+
+    The returned tensor has the same logical shape and element type as ``x``,
+    but downstream operations may choose their own layout.  Use this at a
+    helper or control-flow boundary when a source-scheduled fragment layout is
+    intentionally local to the preceding region.
+    """
+    assert isinstance(x, tl.tensor), "x must be a distributed tensor"
+    handle = _semantic.builder.create_release_layout(x.handle)
+    return tl.tensor(handle, x.type)
+
+
 def require_nv_mma_shared_layout(x: tlx.buffered_tensor, swizzled: bool, _builder=None, fp4Padded: bool = False):
     assert isinstance(x.type.layout, tlx.shared_layout_encoding), "input must be a shared tensor"
     rank = len(x.shape)

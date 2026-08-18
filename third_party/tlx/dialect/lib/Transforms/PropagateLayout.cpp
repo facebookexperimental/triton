@@ -160,6 +160,218 @@ public:
   }
 };
 
+// `ttg.warp_predicate` restricts EXEC before entering its region. A layout
+// conversion that redistributes values across waves therefore cannot remain in
+// the region: a skipped wave would not participate in the shuffle. Layout
+// inference commonly introduces exactly that shape around an MFMA body:
+//
+//   old init -> warp_predicate { ... MFMA value -> old layout -> yield }
+//
+// Move captured conversions before the EXEC restriction and move conversions
+// on yielded values across the region boundary. The latter changes the carried
+// type to the body's native layout and converts back after all waves have
+// reconverged. Since convert_layout preserves the logical tensor, the
+// old->new->old round trip also preserves every inactive lane's init value.
+class HoistWarpPredicateLayoutConversions
+    : public mlir::OpRewritePattern<ttg::WarpPredicateOp> {
+public:
+  using OpRewritePattern::OpRewritePattern;
+
+  mlir::LogicalResult
+  matchAndRewrite(ttg::WarpPredicateOp predicateOp,
+                  mlir::PatternRewriter &rewriter) const override {
+    bool changed = false;
+
+    auto yieldOp = dyn_cast<ttg::PredicateYieldOp>(
+        predicateOp.getRegion().front().getTerminator());
+    if (!yieldOp)
+      return failure();
+
+    auto predicateType =
+        dyn_cast<RankedTensorType>(predicateOp.getPredicate().getType());
+    std::optional<Attribute> predicateEncoding;
+    bool conflictingPredicateEncoding = false;
+    // Determine the physical row ownership before moving or retyping anything.
+    // One execution predicate cannot safely control carried row values whose
+    // native layouts assign those rows to different lanes.
+    for (auto [result, init, yielded] :
+         llvm::zip(predicateOp.getResults(), predicateOp.getInits(),
+                   yieldOp.getValues())) {
+      auto oldType = dyn_cast<RankedTensorType>(result.getType());
+      auto boundaryConvert = yielded.getDefiningOp<ttg::ConvertLayoutOp>();
+      auto bodyType =
+          boundaryConvert
+              ? dyn_cast<RankedTensorType>(boundaryConvert.getSrc().getType())
+              : RankedTensorType();
+      bool hasHoistableBoundary =
+          boundaryConvert && boundaryConvert->hasOneUse() && oldType &&
+          bodyType && oldType != bodyType &&
+          oldType.getShape() == bodyType.getShape() &&
+          oldType.getElementType() == bodyType.getElementType() &&
+          (init.getType() == oldType || init.getType() == bodyType) &&
+          yielded.getType() == oldType;
+      RankedTensorType nativeType = hasHoistableBoundary ? bodyType : oldType;
+      if (predicateType && nativeType &&
+          nativeType.getRank() >= predicateType.getRank() &&
+          llvm::equal(
+              predicateType.getShape(),
+              nativeType.getShape().take_front(predicateType.getRank()))) {
+        Attribute encoding = nativeType.getEncoding();
+        if (!isa<ttg::DistributedEncodingTrait>(encoding))
+          return predicateOp.emitError(
+              "expected distributed encodings on warp_predicate carried "
+              "tensors");
+        for (int rank = nativeType.getRank(); rank > predicateType.getRank();
+             --rank)
+          encoding = ttg::SliceEncodingAttr::get(
+              predicateOp.getContext(), rank - 1,
+              cast<ttg::DistributedEncodingTrait>(encoding));
+        if (!predicateEncoding) {
+          predicateEncoding = encoding;
+        } else {
+          auto selectedType = RankedTensorType::get(
+              predicateType.getShape(), predicateType.getElementType(),
+              *predicateEncoding);
+          auto candidateType =
+              RankedTensorType::get(predicateType.getShape(),
+                                    predicateType.getElementType(), encoding);
+          if (ttg::toLinearLayout(selectedType) !=
+              ttg::toLinearLayout(candidateType))
+            conflictingPredicateEncoding = true;
+        }
+      }
+    }
+    if (conflictingPredicateEncoding)
+      return predicateOp.emitError(
+          "carried row values require conflicting predicate layouts");
+
+    // Captured tensor conversions (for example Q -> dot operand layout) must
+    // execute with the full CTA active. Collect first because moving while
+    // walking the region invalidates the walk.
+    SmallVector<ttg::ConvertLayoutOp> capturedConversions;
+    predicateOp.getRegion().walk([&](ttg::ConvertLayoutOp convertOp) {
+      Region *sourceRegion = convertOp.getSrc().getParentRegion();
+      if (sourceRegion != &predicateOp.getRegion() &&
+          !predicateOp.getRegion().isAncestor(sourceRegion))
+        capturedConversions.push_back(convertOp);
+    });
+    for (ttg::ConvertLayoutOp convertOp : capturedConversions) {
+      rewriter.moveOpBefore(convertOp, predicateOp);
+      changed = true;
+    }
+
+    for (auto [index, result, init, yielded] :
+         llvm::enumerate(predicateOp.getResults(), predicateOp.getInits(),
+                         yieldOp.getValues())) {
+      auto boundaryConvert = yielded.getDefiningOp<ttg::ConvertLayoutOp>();
+      if (!boundaryConvert || !boundaryConvert->hasOneUse())
+        continue;
+
+      auto oldType = dyn_cast<RankedTensorType>(result.getType());
+      auto bodyType =
+          dyn_cast<RankedTensorType>(boundaryConvert.getSrc().getType());
+      if (!oldType || !bodyType || oldType == bodyType ||
+          oldType.getShape() != bodyType.getShape() ||
+          oldType.getElementType() != bodyType.getElementType() ||
+          (init.getType() != oldType && init.getType() != bodyType) ||
+          yielded.getType() != oldType)
+        continue;
+
+      // Convert the false-path value before EXEC is restricted.
+      Value convertedInit = init;
+      if (init.getType() == oldType) {
+        rewriter.setInsertionPoint(predicateOp);
+        convertedInit = ttg::ConvertLayoutOp::create(
+            rewriter, predicateOp.getLoc(), bodyType, init);
+      }
+
+      // Consecutive predicated regions can keep their carried values in the
+      // native body layout. Record ordinary consumers that still require the
+      // old type, and recognize an old->body bridge inserted when the sibling
+      // region happened to be rewritten first.
+      auto siblingAcceptsBodyType = [&](OpOperand &use) {
+        auto sibling = dyn_cast<ttg::WarpPredicateOp>(use.getOwner());
+        // Operand zero is the predicate, not a carried value.
+        if (!sibling || use.getOperandNumber() == 0)
+          return false;
+        unsigned siblingIndex = use.getOperandNumber() - 1;
+        if (siblingIndex >= sibling.getNumResults())
+          return false;
+        if (sibling.getResult(siblingIndex).getType() == bodyType)
+          return true;
+        if (sibling.getResult(siblingIndex).getType() != oldType ||
+            !sibling.getRegion().hasOneBlock())
+          return false;
+        auto siblingYield = dyn_cast<ttg::PredicateYieldOp>(
+            sibling.getRegion().front().getTerminator());
+        if (!siblingYield || siblingIndex >= siblingYield.getNumOperands())
+          return false;
+        auto siblingBoundary = siblingYield.getValues()[siblingIndex]
+                                   .getDefiningOp<ttg::ConvertLayoutOp>();
+        return siblingBoundary && siblingBoundary->hasOneUse() &&
+               siblingBoundary.getSrc().getType() == bodyType;
+      };
+      SmallVector<OpOperand *> oldLayoutUses;
+      SmallVector<ttg::ConvertLayoutOp> siblingBridges;
+      for (OpOperand &use : result.getUses()) {
+        if (siblingAcceptsBodyType(use))
+          continue;
+        auto convert = dyn_cast<ttg::ConvertLayoutOp>(use.getOwner());
+        if (convert && convert.getSrc() == result &&
+            convert.getType() == bodyType) {
+          siblingBridges.push_back(convert);
+          continue;
+        }
+        oldLayoutUses.push_back(&use);
+      }
+
+      rewriter.modifyOpInPlace(predicateOp, [&] {
+        predicateOp->setOperand(index + 1, convertedInit);
+        result.setType(bodyType);
+      });
+      rewriter.modifyOpInPlace(yieldOp, [&] {
+        yieldOp->setOperand(index, boundaryConvert.getSrc());
+      });
+
+      for (ttg::ConvertLayoutOp bridge : siblingBridges) {
+        rewriter.replaceAllUsesWith(bridge.getResult(), result);
+        rewriter.eraseOp(bridge);
+      }
+
+      // Restore the original type only for non-predicate consumers. A sibling
+      // warp_predicate is rewritten to the same body type and consumes the
+      // result directly, avoiding a redundant new->old->new round trip.
+      if (!oldLayoutUses.empty()) {
+        rewriter.setInsertionPointAfter(predicateOp);
+        Value convertedResult = ttg::ConvertLayoutOp::create(
+            rewriter, predicateOp.getLoc(), oldType, result);
+        for (OpOperand *use : oldLayoutUses)
+          use->set(convertedResult);
+      }
+
+      rewriter.eraseOp(boundaryConvert);
+      changed = true;
+    }
+
+    if (predicateType && predicateEncoding) {
+      auto wavePredicateType = RankedTensorType::get(
+          predicateType.getShape(), predicateType.getElementType(),
+          *predicateEncoding);
+      if (wavePredicateType != predicateType) {
+        rewriter.setInsertionPoint(predicateOp);
+        Value wavePredicate = ttg::ConvertLayoutOp::create(
+            rewriter, predicateOp.getLoc(), wavePredicateType,
+            predicateOp.getPredicate());
+        rewriter.modifyOpInPlace(
+            predicateOp, [&] { predicateOp->setOperand(0, wavePredicate); });
+        changed = true;
+      }
+    }
+
+    return success(changed);
+  }
+};
+
 static RankedTensorType getNewTensorType(RankedTensorType origType,
                                          Attribute encoding) {
   return RankedTensorType::get(origType.getShape(), origType.getElementType(),
@@ -625,6 +837,7 @@ public:
     patterns.add<ReleaseLayoutPattern>(context);
     patterns.add<FoldRetaggedLocalAllocLoad>(context);
     patterns.add<FoldLocalAllocLoadFallback>(context);
+    patterns.add<HoistWarpPredicateLayoutConversions>(context);
 
     if (applyPatternsGreedily(getOperation(), std::move(patterns)).failed())
       signalPassFailure();

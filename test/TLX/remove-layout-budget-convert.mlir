@@ -43,3 +43,75 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
     tt.return
   }
 }
+
+// -----
+
+// A predicated accumulator update is a per-result layout carrier. Keep the
+// MFMA layout selected by the surrounding dot chain instead of inserting an
+// MFMA -> blocked -> MFMA redistribution around the EXEC-restricted region.
+// The module marker identifies the deliberately provisional predicate/carried
+// ownership before layout-conversion cleanup selects the MFMA layout.
+
+#wp_mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [1, 1], instrShape = [32, 32, 16], isTransposed = true}>
+#wp_dot0 = #ttg.dot_op<{opIdx = 0, parent = #wp_mma, kWidth = 4}>
+#wp_dot1 = #ttg.dot_op<{opIdx = 1, parent = #wp_mma, kWidth = 4}>
+#wp_blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [8, 8], warpsPerCTA = [1, 1], order = [1, 0]}>
+#wp_row = #ttg.slice<{dim = 1, parent = #wp_mma}>
+
+module attributes {tlx.has_tlx_ops = true, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  // CHECK-DAG: #[[$WP_MMA:.*]] = #ttg.amd_mfma<{version = 4, warpsPerCTA = [1, 1], instrShape = [32, 32, 16], isTransposed = true}>
+  // CHECK-LABEL: tt.func @warp_predicate_keeps_mfma_accumulator
+  tt.func @warp_predicate_keeps_mfma_accumulator(
+      %lhs: tensor<32x32xf16, #wp_dot0>,
+      %rhs: tensor<32x32xf16, #wp_dot1>,
+      %acc: tensor<32x32xf32, #wp_mma>,
+      %predicate: tensor<32xi1, #wp_row>)
+      -> tensor<32x32xf32, #wp_mma> {
+    %dot0 = tt.dot %lhs, %rhs, %acc : tensor<32x32xf16, #wp_dot0> * tensor<32x32xf16, #wp_dot1> -> tensor<32x32xf32, #wp_mma>
+    %blocked = ttg.convert_layout %dot0 : tensor<32x32xf32, #wp_mma> -> tensor<32x32xf32, #wp_blocked>
+    // CHECK-NOT: ttg.convert_layout
+    // CHECK: %[[PREDICATED:.*]] = ttg.warp_predicate %{{.*}}(%[[DOT0:.*]]) {
+    %predicated = ttg.warp_predicate %predicate (%blocked) {
+      // CHECK: %[[SCALED:.*]] = arith.addf %[[DOT0]], %[[DOT0]] : tensor<32x32xf32, #[[$WP_MMA]]>
+      %scaled = arith.addf %blocked, %blocked : tensor<32x32xf32, #wp_blocked>
+      // CHECK: ttg.predicate_yield %[[SCALED]] : tensor<32x32xf32, #[[$WP_MMA]]>
+      ttg.predicate_yield %scaled : tensor<32x32xf32, #wp_blocked>
+    } : (tensor<32xi1, #wp_row>, tensor<32x32xf32, #wp_blocked>) -> tensor<32x32xf32, #wp_blocked>
+    %mma = ttg.convert_layout %predicated : tensor<32x32xf32, #wp_blocked> -> tensor<32x32xf32, #wp_mma>
+    // CHECK: %[[DOT1:.*]] = tt.dot %{{.*}}, %{{.*}}, %[[PREDICATED]]
+    %dot1 = tt.dot %lhs, %rhs, %mma : tensor<32x32xf16, #wp_dot0> * tensor<32x32xf16, #wp_dot1> -> tensor<32x32xf32, #wp_mma>
+    tt.return %dot1 : tensor<32x32xf32, #wp_mma>
+  }
+}
+
+// -----
+
+// A hard register-layout pin may be nested under a deferred-verification
+// wrapper.  It must win conflict resolution even when the producer's linear
+// layout has a higher vectorization score.  Otherwise the FP16 reduction is
+// silently retagged and changes from the MFMA-local reduction tree to a much
+// longer per-thread chain.
+
+#pin_mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [8, 1], instrShape = [32, 32, 16], isTransposed = true}>
+#pin_user = #tlx.user_layout<#pin_mma>
+#pin = #tlx.no_verify_layout<#pin_user>
+#pin_row = #ttg.slice<{dim = 1, parent = #pin}>
+#pin_linear = #ttg.linear<{register = [[0, 32], [0, 16], [0, 8], [0, 1], [0, 2]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [0, 4]], warp = [[32, 0], [64, 0], [128, 0]], block = []}>
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  // CHECK-LABEL: tt.func @nested_pin_keeps_mfma_reduction
+  tt.func @nested_pin_keeps_mfma_reduction(
+      %values: tensor<256x64xf16, #pin_linear>)
+      -> tensor<256xf16, #pin_row> {
+    // CHECK: %[[PINNED:.*]] = ttg.convert_layout %{{.*}} : tensor<256x64xf16, #{{.*}}> -> tensor<256x64xf16, #tlx.no_verify_layout<{{.*}}>>
+    %pinned = ttg.convert_layout %values : tensor<256x64xf16, #pin_linear> -> tensor<256x64xf16, #pin>
+    // CHECK: %[[SUM:.*]] = "tt.reduce"(%[[PINNED]])
+    // CHECK: }) : (tensor<256x64xf16, #tlx.no_verify_layout<{{.*}}>>) -> tensor<256xf16, #ttg.slice<{{.*}}>>
+    %sum = "tt.reduce"(%pinned) <{axis = 1 : i32, reduction_ordering = "unordered"}> ({
+    ^bb0(%lhs: f16, %rhs: f16):
+      %next = arith.addf %lhs, %rhs : f16
+      tt.reduce.return %next : f16
+    }) : (tensor<256x64xf16, #pin>) -> tensor<256xf16, #pin_row>
+    tt.return %sum : tensor<256xf16, #pin_row>
+  }
+}

@@ -27,6 +27,7 @@
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
 #include "triton/Dialect/TritonInstrument/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 
@@ -204,8 +205,49 @@ public:
     addLegalOp<triton::gpu::WarpYieldOp>();
     addLegalOp<triton::gpu::WarpSpecializePartitionsOp>();
     addLegalOp<triton::gpu::WarpReturnOp>();
+    // Predicated regions are lowered after their bodies have been converted
+    // to LLVM by TritonAMDGPUConvertWarpSpecializeToLLVM.
+    addLegalOp<triton::gpu::WarpPredicateOp>();
+    addLegalOp<triton::gpu::PredicateYieldOp>();
   }
 };
+
+// TLX layout propagation is allowed to create captured or yielded
+// convert_layout operations temporarily while it reconciles a predicate
+// body's native layout with its carried values. By LLVM lowering, every such
+// cross-lane conversion must have moved outside a non-wave-uniform region.
+// Otherwise its shuffle would execute after EXEC is restricted and could read
+// inactive lanes.
+static LogicalResult validateFinalWarpPredicateLayouts(ModuleOp mod) {
+  WalkResult result = mod.walk([&](triton::gpu::WarpPredicateOp predicateOp) {
+    if (predicateOp.getWaveUniform().value_or(false))
+      return WalkResult::advance();
+
+    triton::gpu::ConvertLayoutOp unsafeConvert;
+    predicateOp.getRegion().walk([&](Operation *nested) {
+      if (nested != predicateOp.getOperation() &&
+          isa<triton::gpu::WarpPredicateOp>(nested))
+        return WalkResult::skip();
+      auto convert = dyn_cast<triton::gpu::ConvertLayoutOp>(nested);
+      if (!convert)
+        return WalkResult::advance();
+      auto srcType = cast<RankedTensorType>(convert.getSrc().getType());
+      auto dstType = cast<RankedTensorType>(convert.getType());
+      if (triton::gpu::toLinearLayout(srcType) ==
+          triton::gpu::toLinearLayout(dstType))
+        return WalkResult::advance();
+      unsafeConvert = convert;
+      return WalkResult::interrupt();
+    });
+
+    if (!unsafeConvert)
+      return WalkResult::advance();
+    predicateOp.emitError(
+        "non-wave-uniform body still contains cross-lane layout conversion");
+    return WalkResult::interrupt();
+  });
+  return failure(result.wasInterrupted());
+}
 
 struct ConvertTritonAMDGPUToLLVM
     : public triton::impl::ConvertTritonAMDGPUToLLVMBase<
@@ -231,6 +273,9 @@ struct ConvertTritonAMDGPUToLLVM
   void runOnOperation() override {
     MLIRContext *context = &getContext();
     ModuleOp mod = getOperation();
+
+    if (failed(validateFinalWarpPredicateLayouts(mod)))
+      return signalPassFailure();
 
     AMD::TargetInfo targetInfo(this->gfxArch.getValue());
     if (targetInfo.getISAFamily() == triton::amdgpu::ISAFamily::Unknown) {
