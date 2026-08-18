@@ -1,9 +1,9 @@
-import torch
 from torch._inductor.kernel.flex.common import load_flex_template
 from torch._inductor.kernel.flex.flex_attention import flex_attention_grid
 from torch._inductor.select_algorithm import TritonTemplate
 
 from .mm_templates import load_tlx_template
+from .target import current_target
 
 
 def _make_flex_template(name, source):
@@ -31,12 +31,7 @@ tlx_amd_flex_attention_template = _make_flex_template(
 
 def _is_amd_gfx950() -> bool:
     """True on AMD MI350X (gfx950), where the AMD flex template applies."""
-    if torch.version.hip is None:
-        return False
-    try:
-        return "gfx95" in torch.cuda.get_device_properties(0).gcnArchName
-    except Exception:
-        return False
+    return current_target().is_gfx950
 
 
 def append_tlx_flex_attention_choice(
@@ -75,7 +70,7 @@ def append_tlx_flex_attention_choice(
 
     query, logsumexp, max_scores = input_nodes[0], input_nodes[3], input_nodes[4]
     mutated_inputs = [logsumexp, max_scores]
-    num_sms = torch.cuda.get_device_properties(0).multi_processor_count
+    num_sms = current_target().num_sms
 
     # ---- AMD (gfx950/MI350): single-task MFMA/LDS template ----
     if _is_amd_gfx950():

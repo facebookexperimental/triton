@@ -1344,5 +1344,315 @@ class TestFlexAttention(TestCase):
         self.assertIn("tlx_amd_flex_attention", "\n".join(code))
 
 
+class TestResourceModel(TestCase):
+    """Tier 1: the shared SMEM/TMEM model in tlx.inductor.resources.
+
+    Pure arithmetic against the B200 limits — no GPU needed.
+    """
+
+    @staticmethod
+    def _tile(**overrides):
+        from triton.language.extra.tlx.inductor.resources import TileConfig
+
+        kwargs = dict(
+            block_m=128,
+            block_n=128,
+            block_k=64,
+            num_smem_buffers=4,
+            num_tmem_buffers=2,
+            num_mma_groups=1,
+            num_ctas=1,
+            epilogue_subtile=2,
+        )
+        kwargs.update(overrides)
+        return TileConfig(**kwargs)
+
+    def test_smem_matches_hand_computed(self):
+        from triton.language.extra.tlx.inductor.resources import estimate_smem
+
+        tile = self._tile()
+        # A: 128*64*2*4, B: 64*128*2*4, epilog: 128*(128/2)*2, barriers: 4*1*8
+        expected = 65536 + 65536 + 16384 + 32
+        self.assertEqual(estimate_smem(tile, charge_epilogue=True), expected)
+        self.assertEqual(
+            estimate_smem(tile, charge_epilogue=False), expected - 16384
+        )
+
+    def test_smem_two_cta_halves_b_and_doubles_barriers(self):
+        from triton.language.extra.tlx.inductor.resources import estimate_smem
+
+        one = self._tile(block_m=256, num_mma_groups=2, num_ctas=1)
+        two = self._tile(block_m=256, num_mma_groups=2, num_ctas=2)
+        # B is split across the CTA pair; each CTA keeps its own barriers.
+        self.assertEqual(
+            estimate_smem(two, charge_epilogue=True),
+            estimate_smem(one, charge_epilogue=True) - 32768 + 64,
+        )
+
+    def test_smem_split_k_adds_fp32_workspace(self):
+        from triton.language.extra.tlx.inductor.resources import estimate_smem
+
+        tile = self._tile()
+        base = estimate_smem(tile, charge_epilogue=True, split_k=1)
+        # (128/1) * (128/2) * 4 bytes * max(num_mma_groups, 2)
+        self.assertEqual(
+            estimate_smem(tile, charge_epilogue=True, split_k=4),
+            base + 128 * 64 * 4 * 2,
+        )
+
+    def test_tmem_is_columns_not_bytes(self):
+        """TMEM is 128-lane granular, so BLOCK_M must not appear in the model."""
+        from triton.language.extra.tlx.inductor.resources import (
+            estimate_tmem_columns,
+        )
+
+        wide = self._tile(block_m=256, num_mma_groups=2)
+        narrow = self._tile(block_m=64, num_mma_groups=2)
+        self.assertEqual(estimate_tmem_columns(wide), estimate_tmem_columns(narrow))
+        self.assertEqual(estimate_tmem_columns(self._tile()), 128 * 2 * 1)
+        # num_mma_groups multiplies the column count.
+        self.assertEqual(
+            estimate_tmem_columns(self._tile(num_mma_groups=2)), 128 * 2 * 2
+        )
+
+    def test_tmem_limit_rejects_oversized_accumulator(self):
+        from triton.language.extra.tlx.inductor.resources import (
+            DEFAULT_LIMITS,
+            estimate_smem,
+            validate_config,
+        )
+
+        # 256 columns * 2 buffers * 2 groups = 1024 > 512, but SMEM still fits,
+        # so this isolates the TMEM check.
+        tile = self._tile(block_n=256, num_smem_buffers=2, num_mma_groups=2)
+        self.assertLess(
+            estimate_smem(tile, charge_epilogue=True), DEFAULT_LIMITS.smem_bytes
+        )
+        self.assertFalse(validate_config(tile, charge_epilogue=True))
+        self.assertTrue(validate_config(tile, charge_epilogue=True, check_tmem=False))
+
+    def test_tile_rules(self):
+        from triton.language.extra.tlx.inductor.resources import check_tile_rules
+
+        self.assertTrue(check_tile_rules(self._tile()))
+        # Rule 1: more than 128 rows per MMA group.
+        self.assertFalse(check_tile_rules(self._tile(block_m=256)))
+        # Rule 1b: pair-CTA MMA requires exactly 128 rows per group.
+        self.assertFalse(
+            check_tile_rules(self._tile(block_m=128, num_mma_groups=2, num_ctas=2))
+        )
+        self.assertTrue(
+            check_tile_rules(self._tile(block_m=256, num_mma_groups=2, num_ctas=2))
+        )
+        # Rule 2: EPILOGUE_SUBTILE must divide BLOCK_N.
+        self.assertFalse(check_tile_rules(self._tile(block_n=192, epilogue_subtile=128)))
+
+    def test_smem_margin_is_applied(self):
+        from triton.language.extra.tlx.inductor.resources import (
+            DEFAULT_LIMITS,
+            estimate_smem,
+            validate_config,
+        )
+
+        tile = self._tile()
+        smem = estimate_smem(tile, charge_epilogue=True)
+        slack = DEFAULT_LIMITS.smem_bytes - smem
+        self.assertGreater(slack, 0, "pick a tile that still fits without margin")
+        self.assertTrue(
+            validate_config(tile, charge_epilogue=True, smem_margin=slack)
+        )
+        self.assertFalse(
+            validate_config(tile, charge_epilogue=True, smem_margin=slack + 1)
+        )
+
+
+class TestCandidateScorer(TestCase):
+    """Tier 1: the fallback candidate scorer. No GPU needed."""
+
+    #: Shapes covering both saturated and undersaturated regimes.
+    _SHAPES = [
+        (m, n, k)
+        for m in (128, 1024, 4096, 16384)
+        for n in (64, 256, 4096)
+        for k in (512, 4096, 8192)
+    ]
+
+    def test_scorer_never_returns_a_structurally_invalid_config(self):
+        """The scorer must not pick a config the tile rules reject.
+
+        It used to skip the pair-CTA rule that ``_is_config_valid`` enforces,
+        so a violating candidate could win here and be rejected downstream.
+        Because both of ``get_heuristic_config``'s retry paths re-run this same
+        deterministic scorer, the retries returned the identical config and the
+        whole lookup fell through to ``None``.
+        """
+        from triton.language.extra.tlx.inductor.registry import (
+            _candidate_scorer_evaluate,
+        )
+        from triton.language.extra.tlx.inductor.resources import (
+            TileConfig,
+            check_tile_rules,
+        )
+
+        selected = set()
+        for m, n, k in self._SHAPES:
+            cfg = _candidate_scorer_evaluate(m, n, k, 148)
+            if cfg is None:
+                continue
+            selected.add((cfg["BLOCK_SIZE_M"], cfg["BLOCK_SIZE_N"], cfg["NUM_CTAS"]))
+            self.assertTrue(
+                check_tile_rules(TileConfig.from_dict(cfg)),
+                f"scorer returned a structurally invalid config for "
+                f"({m},{n},{k}): {cfg}",
+            )
+        self.assertTrue(selected, "scorer never selected anything")
+        # The pair-CTA violator is still in the candidate table; it is filtered
+        # by the scorer rather than deleted, so pin that it never wins.
+        self.assertNotIn((128, 64, 2), selected)
+
+    def test_pair_cta_candidate_no_longer_strands_the_lookup(self):
+        """Shapes that used to fall through to None now get a config."""
+        from triton.language.extra.tlx.inductor.registry import get_heuristic_config
+
+        # These scored best on the (128,64,128) 2-CTA candidate before the fix,
+        # which _is_config_valid then rejected, stranding the whole lookup.
+        for m, n, k in ((128, 128, 4096), (128, 1024, 2049), (128, 128, 8192)):
+            cfg = get_heuristic_config(m, n, k, num_sms=148, tma_epilogue_store=True)
+            self.assertIsNotNone(cfg, f"({m},{n},{k}) still returns None")
+
+    def test_split_k_workspace_gap_is_still_open(self):
+        """Documents the remaining scorer/validator divergence.
+
+        The scorer picks ``SPLIT_K`` without charging the fp32 partials
+        workspace that ``_is_config_valid`` does charge, so it can still return
+        a config that is rejected downstream -- the same failure shape as the
+        pair-CTA bug, stranding ~84 of the sweep's shapes at ``None``. Closing
+        it changes which split factor real shapes get, so it is deliberately
+        left for its own diff. Flip this test when that lands.
+        """
+        from triton.language.extra.tlx.inductor.registry import (
+            _candidate_scorer_evaluate,
+            _is_config_valid,
+        )
+
+        stranded = [
+            (m, n, k)
+            for m, n, k in self._SHAPES
+            if (cfg := _candidate_scorer_evaluate(m, n, k, 148)) is not None
+            and not _is_config_valid(cfg, tma_epilogue_store=False)
+        ]
+        self.assertTrue(
+            all(
+                _candidate_scorer_evaluate(m, n, k, 148).get("SPLIT_K", 1) > 1
+                for m, n, k in stranded
+            ),
+            "a non-split-K config is now stranded; the scorer and "
+            "_is_config_valid have diverged in a new way",
+        )
+
+
+class TestTargetDetection(TestCase):
+    """Tier 1: arch detection. No GPU needed."""
+
+    def test_is_rocm_does_not_touch_the_device(self):
+        from triton.language.extra.tlx.inductor.target import is_rocm
+
+        with mock.patch.object(
+            torch.cuda, "get_device_properties", side_effect=AssertionError("queried")
+        ):
+            self.assertEqual(is_rocm(), torch.version.hip is not None)
+
+    def test_falls_back_to_b200_when_no_device(self):
+        from triton.language.extra.tlx.inductor import target
+
+        target.current_target.cache_clear()
+        try:
+            with mock.patch.object(
+                torch.cuda, "get_device_properties", side_effect=RuntimeError("no gpu")
+            ):
+                t = target.current_target()
+            self.assertEqual(t.num_sms, target.B200_NUM_SMS)
+            self.assertEqual(t.smem_bytes, target.B200_SMEM_BYTES)
+            self.assertEqual(t.tmem_columns, target.B200_TMEM_COLUMNS)
+            self.assertEqual(t.arch, "")
+            self.assertIsNone(t.capability)
+        finally:
+            target.current_target.cache_clear()
+
+    def test_num_xcds_by_arch(self):
+        from triton.language.extra.tlx.inductor.target import Target
+
+        def mk(arch):
+            return Target(
+                is_rocm=True,
+                arch=arch,
+                capability=None,
+                num_sms=256,
+                smem_bytes=0,
+                tmem_columns=0,
+            )
+
+        self.assertEqual(mk("gfx950:sramecc+").num_xcds, 8)
+        self.assertEqual(mk("gfx942:sramecc+").num_xcds, 8)
+        self.assertEqual(mk("gfx90a").num_xcds, 1)
+        self.assertTrue(mk("gfx950").is_gfx950)
+        self.assertFalse(mk("gfx942").is_gfx950)
+
+    def test_default_kpack_matches_torch(self):
+        from triton.language.extra.tlx.inductor.target import Target
+
+        cuda = Target(
+            is_rocm=False,
+            arch="",
+            capability=(10, 0),
+            num_sms=148,
+            smem_bytes=0,
+            tmem_columns=0,
+        )
+        self.assertEqual(cuda.default_kpack(16), 0)
+        gfx942 = Target(
+            is_rocm=True,
+            arch="gfx942",
+            capability=None,
+            num_sms=304,
+            smem_bytes=0,
+            tmem_columns=0,
+        )
+        self.assertEqual(gfx942.default_kpack(16), 1)
+        self.assertEqual(gfx942.default_kpack(32), 2)
+        gfx950 = Target(
+            is_rocm=True,
+            arch="gfx950",
+            capability=None,
+            num_sms=256,
+            smem_bytes=0,
+            tmem_columns=0,
+        )
+        self.assertEqual(gfx950.default_kpack(16), 2)
+
+    def test_get_heuristic_config_defaults_num_sms_from_target(self):
+        from triton.language.extra.tlx.inductor import target
+        from triton.language.extra.tlx.inductor.registry import get_heuristic_config
+
+        target.current_target.cache_clear()
+        try:
+            with mock.patch.object(
+                target, "current_target", return_value=target.Target(
+                    is_rocm=False,
+                    arch="",
+                    capability=(10, 0),
+                    num_sms=148,
+                    smem_bytes=target.B200_SMEM_BYTES,
+                    tmem_columns=target.B200_TMEM_COLUMNS,
+                )
+            ):
+                self.assertEqual(
+                    get_heuristic_config(4096, 4096, 4096),
+                    get_heuristic_config(4096, 4096, 4096, num_sms=148),
+                )
+        finally:
+            target.current_target.cache_clear()
+
+
 if __name__ == "__main__":
     run_tests()

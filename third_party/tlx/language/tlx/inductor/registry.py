@@ -18,11 +18,16 @@ from torch._inductor.template_heuristics.triton import (
 from torch._inductor.template_heuristics.triton_addmm import AddMMConfigMixin
 from torch._inductor.utils import get_num_sms
 
+from . import resources
+from .resources import DEFAULT_LIMITS, TileConfig, validate_config
+from .target import current_target, is_rocm
+
 # IS_ROCM was dropped from torch._inductor.template_heuristics.triton on newer
 # nightlies (the module now branches on ``torch.version.hip`` inline). Derive it
 # locally so the fork loads across torch versions; matches torch's own definition
-# (CUDA vs ROCm keyed on torch.version.hip).
-IS_ROCM = torch.version.hip is not None
+# (CUDA vs ROCm keyed on torch.version.hip). ``is_rocm()`` does not touch the
+# device, so this stays safe to evaluate at import time.
+IS_ROCM = is_rocm()
 
 try:
     from torch._inductor.utils import get_default_kpack
@@ -31,15 +36,7 @@ except ImportError:
     # wheels). Mirror torch's own definition so the fork loads across versions:
     # 0 on CUDA; on AMD, kpack keyed on arch/block_k.
     def get_default_kpack(block_k: int = 16) -> int:
-        if not torch.version.hip:
-            return 0
-        try:
-            arch = torch.cuda.get_device_properties(0).gcnArchName
-        except Exception:
-            arch = ""
-        if "gfx942" in arch and block_k <= 16:
-            return 1
-        return 2
+        return current_target().default_kpack(block_k)
 
 
 def _sizevar_hint(sizevars, expr, fallback):
@@ -86,16 +83,9 @@ import math as _math
 def _amd_num_xcds() -> int:
     """Number of XCDs (chiplets) on the current ROCm GPU, for the L2 chiplet swizzle.
 
-    gfx942 (MI300X) and gfx950 (MI350X) have 8. Returns 1 -- which makes the swizzle a
-    no-op (identity) -- for non-HIP or arches with no known XCD count, since the template
-    is registered for all ROCm, not just the 8-XCD parts.
+    See ``Target.num_xcds`` for the arch table.
     """
-    if not torch.version.hip:
-        return 1
-    arch = torch.cuda.get_device_properties(0).gcnArchName
-    if "gfx942" in arch or "gfx950" in arch:
-        return 8
-    return 1
+    return current_target().num_xcds
 
 
 def _select_group_size_m(M: int, N: int, block_m: int) -> int:
@@ -128,68 +118,17 @@ def _select_group_size_m(M: int, N: int, block_m: int) -> int:
 def _is_config_valid(
     config: dict[str, Any], tma_epilogue_store: bool = False, smem_margin: int = 0
 ) -> bool:
-    """Check if a config is valid based on hardware constraints."""
-    # Upstream uses 232*1024 as a loose estimate, but the actual Blackwell
-    # hardware limit is 232448 bytes.  We use the real limit because
-    # epilogue fusion can add SMEM beyond what the formula captures.
-    MAX_SHARED_MEMORY = 232448  # B200 SMEM per SM (actual hardware limit)
-    MAX_TMEM_COLUMNS = 512  # TMEM columns per SM (Blackwell hardware limit)
+    """Check if a config is valid based on hardware constraints.
 
-    block_m = config["BLOCK_SIZE_M"]
-    block_n = config["BLOCK_SIZE_N"]
-    block_k = config["BLOCK_SIZE_K"]
-    num_ctas = config["NUM_CTAS"]
-    num_smem_buffers = config["NUM_SMEM_BUFFERS"]
-    num_tmem_buffers = config["NUM_TMEM_BUFFERS"]
-    num_mma_groups = config["NUM_MMA_GROUPS"]
-    epilogue_subtile = config["EPILOGUE_SUBTILE"]
-
-    # Check MMA groups constraint
-    if block_m // num_mma_groups > 128:
-        return False
-
-    # Pair-CTA MMA requires M=128 per MMA group
-    if num_ctas == 2 and block_m // num_mma_groups < 128:
-        return False
-
-    # Check epilogue subtile
-    if block_n % epilogue_subtile != 0:
-        return False
-
-    # Shared memory estimation — matches upstream estimate_smem exactly.
-    # Split-K fp32 workspace overhead is torchTLX-specific: upstream uses output
-    # dtype (bf16) for the workspace, but torchTLX uses fp32 for accuracy.
-    smem_a = block_m * block_k * 2 * num_smem_buffers
-    smem_b_size = block_n // num_ctas
-    smem_b = block_k * smem_b_size * 2 * num_smem_buffers
-    if tma_epilogue_store:
-        smem_epilog = block_m * (block_n // epilogue_subtile) * 2
-    else:
-        smem_epilog = 0
-    smem_barriers = num_smem_buffers * num_mma_groups * 8
-    if num_ctas == 2:
-        smem_barriers += num_smem_buffers * num_mma_groups * 8
-    total_smem = smem_a + smem_b + smem_epilog + smem_barriers
-
-    split_k = config.get("SPLIT_K", 1)
-    if split_k > 1:
-        # torchTLX stores fp32 partials to workspace (upstream uses bf16).
-        # Account for the fp32 ws_smem_buffers allocated in the template.
-        block_m_split = block_m // num_mma_groups
-        slice_size = block_n // epilogue_subtile
-        num_epilogue_smem_buffers = max(num_mma_groups, 2)
-        smem_ws = block_m_split * slice_size * 4 * num_epilogue_smem_buffers
-        total_smem += smem_ws
-
-    if total_smem + smem_margin > MAX_SHARED_MEMORY:
-        return False
-
-    # TMEM estimation (columns, not bytes)
-    total_tmem_columns = block_n * num_tmem_buffers * num_mma_groups
-    if total_tmem_columns > MAX_TMEM_COLUMNS:
-        return False
-
-    return True
+    The epilogue staging buffer is charged only for the TMA store path; see
+    ``resources.estimate_smem``.
+    """
+    return validate_config(
+        TileConfig.from_dict(config),
+        charge_epilogue=tma_epilogue_store,
+        split_k=config.get("SPLIT_K", 1),
+        smem_margin=smem_margin,
+    )
 
 
 def _fix_config_if_needed(
@@ -227,7 +166,7 @@ def get_heuristic_config(
     M: int,
     N: int,
     K: int,
-    num_sms: int = 148,
+    num_sms: int | None = None,
     tma_epilogue_store: bool = False,
 ) -> dict[str, Any] | None:
     """
@@ -280,12 +219,16 @@ def get_heuristic_config(
 
     Args:
         M, N, K: GEMM dimensions (A is MxK, B is KxN, C is MxN)
-        num_sms: Number of SMs on the GPU (default 148 for B200)
+        num_sms: Number of SMs on the GPU. Defaults to the current target's
+            SM count (148 on B200, and on a host with no visible device).
 
     Returns:
         dict: Configuration parameters for the TLX GEMM kernel,
         or None if no valid config can be determined.
     """
+    if num_sms is None:
+        num_sms = current_target().num_sms
+
     # --- Compute derived features ---
     mn_ratio = M / max(N, 1)
     is_tall_m = mn_ratio > 4
@@ -636,39 +579,29 @@ def _candidate_scorer_evaluate(
     M: int, N: int, K: int, num_sms: int
 ) -> dict[str, Any] | None:
     """Score candidates by wave efficiency and return best."""
-    MAX_SMEM = 232448  # B200 SMEM per SM (actual hardware limit)
-    MAX_TMEM = 256 * 1024
-
     best_config = None
     best_score = float("inf")
     best_waves = float("inf")
 
     for cfg in _CANDIDATES:
-        bm = cfg["BLOCK_SIZE_M"]
-        bn = cfg["BLOCK_SIZE_N"]
-        bk = cfg["BLOCK_SIZE_K"]
-        num_ctas = cfg["NUM_CTAS"]
-        num_smem_buffers = cfg["NUM_SMEM_BUFFERS"]
-        num_tmem_buffers = cfg["NUM_TMEM_BUFFERS"]
-        num_mma_groups = cfg["NUM_MMA_GROUPS"]
-        epilogue_subtile = cfg["EPILOGUE_SUBTILE"]
+        tile = TileConfig.from_dict(cfg)
+        bm = tile.block_m
+        bn = tile.block_n
+        bk = tile.block_k
+        num_ctas = tile.num_ctas
 
-        # Constraint checks
-        smem_a = bm * bk * 2 * num_smem_buffers
-        smem_b = bk * (bn // num_ctas) * 2 * num_smem_buffers
-        smem_epilog = bm * (bn // epilogue_subtile) * 2
-        smem_barriers = (
-            num_smem_buffers * num_mma_groups * 8 * (2 if num_ctas == 2 else 1)
-        )
-        total_smem = smem_a + smem_b + smem_epilog + smem_barriers
-        if total_smem > MAX_SMEM:
-            continue
-
-        total_tmem = bm * bn * 4 * num_tmem_buffers
-        if total_tmem > MAX_TMEM:
-            continue
-
-        if bm // num_mma_groups > 128:
+        # Resource + structural validity. The epilogue staging buffer is
+        # charged unconditionally here: the scorer runs before the store path
+        # is known, so the conservative estimate is the right one.
+        #
+        # ``check_tile_rules`` also rejects pair-CTA candidates with fewer than
+        # 128 rows per MMA group. The scorer used to skip that check while
+        # ``_is_config_valid`` enforced it, so such a candidate would win here
+        # and then be rejected downstream -- and because both of
+        # get_heuristic_config's retry paths re-run this same deterministic
+        # scorer, the retries returned the identical config and the whole
+        # lookup fell through to ``None``.
+        if not validate_config(tile, charge_epilogue=True):
             continue
 
         # Block sizes must be strictly less than problem dimensions for correctness
@@ -743,10 +676,34 @@ def _candidate_scorer_evaluate(
 class TLXMatmulWSConfigMixin(TMATemplateConfigMixin):
     """Mixin for TLX Matmul WS template with TLX-specific parameters and config validation."""
 
-    # Blackwell B200A resource limits
-    MAX_SHARED_MEMORY = 232448  # B200 SMEM per SM (actual hardware limit)
-    MAX_TMEM_COLUMNS = 512  # TMEM columns per SM (Blackwell hardware limit)
-    MBARRIER_SIZE = 8  # bytes
+    # Blackwell B200A resource limits. Kept as class attributes for callers
+    # that read them; the values come from the shared device model.
+    MAX_SHARED_MEMORY = DEFAULT_LIMITS.smem_bytes
+    MAX_TMEM_COLUMNS = DEFAULT_LIMITS.tmem_columns
+    MBARRIER_SIZE = resources.MBARRIER_BYTES
+
+    @staticmethod
+    def _tile(
+        block_m: int,
+        block_n: int,
+        block_k: int,
+        num_smem_buffers: int,
+        num_tmem_buffers: int,
+        num_mma_groups: int,
+        num_ctas: int,
+        epilogue_subtile: int,
+    ) -> TileConfig:
+        """Adapt the flat positional signature the validators expose."""
+        return TileConfig(
+            block_m=block_m,
+            block_n=block_n,
+            block_k=block_k,
+            num_smem_buffers=num_smem_buffers,
+            num_tmem_buffers=num_tmem_buffers,
+            num_mma_groups=num_mma_groups,
+            num_ctas=num_ctas,
+            epilogue_subtile=epilogue_subtile,
+        )
 
     @staticmethod
     def _is_valid_config(
@@ -763,49 +720,25 @@ class TLXMatmulWSConfigMixin(TMATemplateConfigMixin):
         Check if config is valid based on hardware constraints.
         Based on preprocess_configs from tritonbench/operators/gemm/tlx_matmul.py
 
+        Prunes the autotuning pool, where the store path is not yet known, so
+        the epilogue staging buffer is charged unconditionally.
+
         Returns:
             True if config is valid, False if should be pruned.
         """
-        # Rule 1: Filter out invalid config that causes wrong hardware MMA
-        if block_m // num_mma_groups > 128:
-            return False
-
-        # Rule 1b: Pair-CTA MMA requires M=128 per MMA group
-        if num_ctas == 2 and block_m // num_mma_groups < 128:
-            return False
-
-        # Rule 2: EPILOGUE_SUBTILE must evenly divide BLOCK_N
-        if block_n % epilogue_subtile != 0:
-            return False
-
-        # Rule 3: Estimate Shared Memory Usage
-        # buffers_A: BLOCK_M x BLOCK_K x float16 x NUM_SMEM_BUFFERS
-        smem_a = block_m * block_k * 2 * num_smem_buffers
-        # buffers_B: BLOCK_K x BLOCK_N x float16 x NUM_SMEM_BUFFERS
-        # In NUM_CTAS=2 mode, each CTA only loads half of B
-        smem_b_size = block_n // num_ctas
-        smem_b = block_k * smem_b_size * 2 * num_smem_buffers
-        # Epilogue staging buffer
-        smem_epilog = block_m * (block_n // epilogue_subtile) * 2
-
-        smem_barriers = (
-            num_smem_buffers * num_mma_groups * TLXMatmulWSConfigMixin.MBARRIER_SIZE
+        return validate_config(
+            TLXMatmulWSConfigMixin._tile(
+                block_m,
+                block_n,
+                block_k,
+                num_smem_buffers,
+                num_tmem_buffers,
+                num_mma_groups,
+                num_ctas,
+                epilogue_subtile,
+            ),
+            charge_epilogue=True,
         )
-        if num_ctas == 2:
-            smem_barriers += (
-                num_smem_buffers * num_mma_groups * TLXMatmulWSConfigMixin.MBARRIER_SIZE
-            )
-
-        total_smem = smem_a + smem_b + smem_epilog + smem_barriers
-        if total_smem > TLXMatmulWSConfigMixin.MAX_SHARED_MEMORY:
-            return False
-
-        # Rule 4: Estimate Tensor Memory (TMEM) Usage
-        total_tmem_columns = block_n * num_tmem_buffers * num_mma_groups
-        if total_tmem_columns > TLXMatmulWSConfigMixin.MAX_TMEM_COLUMNS:
-            return False
-
-        return True
 
     # Safety margin (bytes) added to the static SMEM estimate to account for
     # epilogue fusion overhead (alignment padding, extra barriers, etc.) that
@@ -824,18 +757,28 @@ class TLXMatmulWSConfigMixin(TMATemplateConfigMixin):
         num_ctas: int,
         epilogue_subtile: int,
     ) -> bool:
-        """Like _is_valid_config but with a safety margin on SMEM."""
-        smem_a = block_m * block_k * 2 * num_smem_buffers
-        smem_b_size = block_n // num_ctas
-        smem_b = block_k * smem_b_size * 2 * num_smem_buffers
-        smem_epilog = block_m * (block_n // epilogue_subtile) * 2
+        """Like _is_valid_config but with a safety margin on SMEM.
 
-        smem_barriers = num_smem_buffers * num_mma_groups * cls.MBARRIER_SIZE
-        if num_ctas == 2:
-            smem_barriers += num_smem_buffers * num_mma_groups * cls.MBARRIER_SIZE
-
-        total_smem = smem_a + smem_b + smem_epilog + smem_barriers
-        return total_smem + cls._SMEM_SAFETY_MARGIN <= cls.MAX_SHARED_MEMORY
+        SMEM only: every caller has already run the structural rules and the
+        TMEM check, either via ``_is_valid_config`` when the autotuning pool
+        was built or via ``_fix_config_if_needed`` on the heuristic config.
+        """
+        return validate_config(
+            cls._tile(
+                block_m,
+                block_n,
+                block_k,
+                num_smem_buffers,
+                num_tmem_buffers,
+                num_mma_groups,
+                num_ctas,
+                epilogue_subtile,
+            ),
+            charge_epilogue=True,
+            smem_margin=cls._SMEM_SAFETY_MARGIN,
+            check_rules=False,
+            check_tmem=False,
+        )
 
     def adjust_kernel_inputs(
         self,
@@ -1466,7 +1409,7 @@ class ROCmAddMMPersistentWarpPipeTemplateConfigHeuristic(
 @register_template_heuristic(
     blackwell_gemm_ws_template.uid,
     "cuda",
-    register=torch.version.hip is None,
+    register=not IS_ROCM,
 )
 class TemplateGemmWSConfigHeuristic(TLXMatmulWSConfigMixin, CUDAConfigHeuristic):
     """
