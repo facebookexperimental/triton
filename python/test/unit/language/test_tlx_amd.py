@@ -993,21 +993,23 @@ def _amd_scheduled_mfma_persistent_acc_kernel(
     tl.store(output_offsets, acc)
 
 
-def test_amd_scheduled_mfma_persistent_acc_lowering_gfx950():
+@pytest.mark.parametrize("elem_ty", ["bf16", "fp16"])
+def test_amd_scheduled_mfma_persistent_acc_lowering_gfx950(elem_ty):
     compiled = compile_for_gfx950(
         _amd_scheduled_mfma_persistent_acc_kernel,
         signature={
-            "a_ptr": "*bf16",
-            "b_ptr": "*bf16",
+            "a_ptr": f"*{elem_ty}",
+            "b_ptr": f"*{elem_ty}",
             "output_ptr": "*fp32",
             "USE_VGPR": "constexpr",
         },
         constexprs={"USE_VGPR": False},
     )
     llir = compiled.asm["llir"]
-    assert 'asm sideeffect "v_mfma_f32_16x16x32_bf16' in llir
+    asm_ty = "f16" if elem_ty == "fp16" else elem_ty
+    assert f'asm sideeffect "v_mfma_f32_16x16x32_{asm_ty}' in llir
     assert '"=a,v,v"' in llir
-    assert "@llvm.amdgcn.mfma.f32.16x16x32.bf16" not in llir
+    assert f"@llvm.amdgcn.mfma.f32.16x16x32.{asm_ty}" not in llir
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")

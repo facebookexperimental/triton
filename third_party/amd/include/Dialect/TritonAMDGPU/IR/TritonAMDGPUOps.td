@@ -799,16 +799,15 @@ def RegisterResidentOp : TT_AMDGPU_Op<"register_resident", [
 //===----------------------------------------------------------------------===//
 
 def MfmaCommitOp : TT_AMDGPU_Op<"mfma_commit", [
-    DeclareOpInterfaceMethods<InferTypeOpInterface>,
-    AllTypesMatch<["inputs", "outputs"]>]> {
+    DeclareOpInterfaceMethods<InferTypeOpInterface>]> {
   let summary = "Commit native vector MFMA fragments with live dependencies";
   let description = [{
     Returns every input unchanged after applying the architecture-defined MFMA
-    result hazard. One or more inputs must be direct transient
-    `scheduled_mfma` results. Additional dot operands are non-numerical live
-    dependencies, and their corresponding outputs may be consumed by the
-    following source stage. Multiple independent native results can therefore
-    share one completion boundary without first assembling a logical tensor.
+    result hazard. Inputs may be direct transient `scheduled_mfma` results
+    followed by dot-operand live dependencies, or a set of direct persistent
+    results at an epilogue boundary. Multiple independent native results can
+    therefore share one completion boundary without first assembling a
+    logical tensor.
 
     Distributed MFMA and dot layouts determine storage roles and native
     fragment widths. Source code does not provide physical register classes,
@@ -853,7 +852,7 @@ def ScheduledMfmaOp : TT_AMDGPU_Op<"scheduled_mfma"> {
     an explicit source contract because LLVM inline assembly cannot represent
     a convergent-call attribute on the pinned compiler revision.
 
-    The initial contract supports CDNA4 BF16 inputs, F32 accumulators, one or
+    The contract supports CDNA4 BF16 or F16 inputs, F32 accumulators, one or
     more K fragments per wave, and native 32x32x16 or 16x16x32 instruction
     shapes.
   }];
