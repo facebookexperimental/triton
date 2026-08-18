@@ -1,12 +1,13 @@
-// RUN: TRITON_USE_META_WS=1 triton-opt %s --nvgpu-warp-specialization="capability=100" | FileCheck %s
+// RUN: TRITON_USE_META_WS=1 triton-opt %s --nvgpu-partition-scheduling-meta="merge-epilogue-to-computation" --nvgpu-warp-specialization="capability=100" | FileCheck %s
 
 // Regression guard for the empty-producer assertion (bug #7 in
 // .llms/rules/partition-scheduler-bugs.md): the `producerTaskIds.size() == 1`
 // assertion in CodePartitionUtility.cpp `createChannelPost`.
 //
 // Real FA3 backward kernel (same body as partition-scheduling-meta-fa-bwd.mlir)
-// driven through the full warp-specialization pipeline so it reaches
-// `createChannelPost`. `separateLocalAllocWithSrc` splits a shared alloc that
+// driven through partition scheduling and the full warp-specialization
+// pipeline so it reaches `createChannelPost`. `separateLocalAllocWithSrc`
+// splits a shared alloc that
 // carries no async_task_id, leaving a `local_store` with an empty producer
 // set; the `if (producerTaskIds.empty()) return;` guard skips it (a producer
 // with no partition needs no channel). Without the guard the `else` branch

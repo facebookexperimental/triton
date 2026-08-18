@@ -116,6 +116,13 @@ static Value getClusterBarrierMbarPtr(Location loc, RewriterBase &rewriter,
                b.i32_val(offset));
 }
 
+static int getClusterSize(Operation *op) {
+  ModuleOp mod = op->getParentOfType<ModuleOp>();
+  auto dims = triton::gpu::TritonGPUDialect::getClusterDims(mod);
+  int physicalSize = dims[0] * dims[1] * dims[2];
+  return physicalSize > 1 ? physicalSize : triton::gpu::lookupNumCTAs(op);
+}
+
 template <typename EmitFn>
 void lowerClusterSyncForWarpCounts(Location loc, OpBuilder &rewriter,
                                    int defaultNumWarps, int totalNumWarps,
@@ -317,7 +324,7 @@ struct ClusterBarrierOpConversion
     Value barrierPtr = b.gep(ptrTy, barrierSlotTy, barrierPtr0, barrierIdx);
     Value threadId = getThreadId(rewriter, loc);
     Value pred = b.icmp_eq(threadId, b.i32_val(0));
-    int numCTAs = triton::gpu::lookupNumCTAs(op);
+    int numCTAs = getClusterSize(op);
     bool relaxed = op.getRelaxed() && targetInfo.getPtxVersion() >= 86;
     if (targetInfo.supportsMbarrierMulticast()) {
       Value ctaId = NVVM::ClusterId::create(rewriter, loc, i32_ty);
@@ -431,7 +438,7 @@ struct InitializeWSClusterBarriers
     int64_t count = countAttr.getInt();
     int64_t offset =
         shared - count * triton::nvidia_gpu::kClusterBarrierMbarAllocationSize;
-    int numCTAs = triton::gpu::lookupNumCTAs(kernel);
+    int numCTAs = getClusterSize(kernel);
     for (int64_t i = 0; i < count;
          ++i, offset += triton::nvidia_gpu::kClusterBarrierMbarAllocationSize) {
       Value barrierPtr0 =
