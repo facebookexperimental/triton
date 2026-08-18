@@ -25,6 +25,7 @@
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/TMAUtilities.h"
 #include "triton/Tools/Sys/GetEnv.h"
 #include <list>
+#include <optional>
 #include <unordered_set>
 
 namespace tt = mlir::triton;
@@ -36,6 +37,29 @@ namespace mlir {
 #define DEBUG_TYPE "nvgpu-ws-lower-mem"
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
 #define LDBG(X) LLVM_DEBUG(DBGS() << X << "\n")
+
+// Encoding for a buffer the TMA engine writes directly. TMA only writes
+// NVMMA-shared, so a buffer spelled otherwise is reusable only if it describes
+// the same layout: block scales use a SharedLinear encoding equivalent to the
+// descriptor's NVMMA one, so adopt the descriptor's spelling and move no data.
+// nullopt means the layouts differ and the load must not be fused.
+static std::optional<Attribute>
+getTMAWritableEncoding(tt::DescriptorLoadOp load, RankedTensorType tensorType,
+                       ttg::MemDescType allocType) {
+  Attribute allocEncoding = allocType.getEncoding();
+  if (isa<ttg::NVMMASharedEncodingAttr>(allocEncoding))
+    return allocEncoding;
+
+  Attribute descEncoding =
+      ttng::getEncodingFromDescriptor(load, tensorType, load.getDesc());
+  auto descLayout = dyn_cast_or_null<ttg::LayoutEncodingTrait>(descEncoding);
+  auto allocLayout = dyn_cast<ttg::LayoutEncodingTrait>(allocEncoding);
+  if (descLayout && allocLayout &&
+      ttg::areLayoutsEquivalent(allocType.getShape(), descLayout, allocLayout))
+    return descEncoding;
+
+  return std::nullopt;
+}
 
 LogicalResult doConvertDescriptorLoadsToNVWS(triton::FuncOp funcOp) {
   SmallVector<tt::DescriptorLoadOp> loads;
@@ -53,33 +77,16 @@ LogicalResult doConvertDescriptorLoadsToNVWS(triton::FuncOp funcOp) {
     if (load->hasOneUse())
       soleAlloc = dyn_cast<ttg::LocalAllocOp>(*load->getUsers().begin());
 
-    // Fusing the load into `soleAlloc` makes the TMA engine write that buffer
-    // directly, but TMA can only write an NVMMA-shared layout (see
-    // verifyTMAEncoding). A block-scale alloc carries a SharedLinearEncoding
-    // that is layout-equivalent to the descriptor's NVMMA encoding yet is a
-    // different attribute, so reusing it verbatim produces an illegal copy.
-    // Re-spell the fused buffer with the descriptor's encoding when the two
-    // describe the same layout; otherwise skip the fusion and stage through a
-    // TMA-compatible buffer. (Upstream applies the same LinearLayout
-    // equivalence rule in PartitionScheduling.cpp; the Meta autoWS path was
-    // never updated to match.)
     Attribute fusedEncoding;
     if (soleAlloc) {
-      auto allocType = cast<ttg::MemDescType>(soleAlloc.getType());
-      fusedEncoding = allocType.getEncoding();
-      if (!isa<ttg::NVMMASharedEncodingAttr>(fusedEncoding)) {
-        Attribute descEncoding =
-            ttng::getEncodingFromDescriptor(load, tensorType, load.getDesc());
-        auto descLayout =
-            dyn_cast_or_null<ttg::LayoutEncodingTrait>(descEncoding);
-        auto allocLayout = dyn_cast<ttg::LayoutEncodingTrait>(fusedEncoding);
-        if (descLayout && allocLayout &&
-            ttg::areLayoutsEquivalent(allocType.getShape(), descLayout,
-                                      allocLayout)) {
-          fusedEncoding = descEncoding;
-        } else {
-          soleAlloc = nullptr;
-        }
+      if (auto encoding = getTMAWritableEncoding(
+              load, tensorType, cast<ttg::MemDescType>(soleAlloc.getType()))) {
+        fusedEncoding = *encoding;
+      } else {
+        // Don't fuse. Clearing `soleAlloc` does double duty: the load falls
+        // through to its own TMA-compatible buffer below, and the alloc stays
+        // off the erase list since we no longer consume it.
+        soleAlloc = nullptr;
       }
     }
 
