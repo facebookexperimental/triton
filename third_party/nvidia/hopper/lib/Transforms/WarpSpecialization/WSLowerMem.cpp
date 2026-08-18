@@ -25,6 +25,7 @@
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/TMAUtilities.h"
 #include "triton/Tools/Sys/GetEnv.h"
 #include <list>
+#include <optional>
 #include <unordered_set>
 
 namespace tt = mlir::triton;
@@ -36,6 +37,29 @@ namespace mlir {
 #define DEBUG_TYPE "nvgpu-ws-lower-mem"
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
 #define LDBG(X) LLVM_DEBUG(DBGS() << X << "\n")
+
+// Encoding for a buffer the TMA engine writes directly. TMA only writes
+// NVMMA-shared, so a buffer spelled otherwise is reusable only if it describes
+// the same layout: block scales use a SharedLinear encoding equivalent to the
+// descriptor's NVMMA one, so adopt the descriptor's spelling and move no data.
+// nullopt means the layouts differ and the load must not be fused.
+static std::optional<Attribute>
+getTMAWritableEncoding(tt::DescriptorLoadOp load, RankedTensorType tensorType,
+                       ttg::MemDescType allocType) {
+  Attribute allocEncoding = allocType.getEncoding();
+  if (isa<ttg::NVMMASharedEncodingAttr>(allocEncoding))
+    return allocEncoding;
+
+  Attribute descEncoding =
+      ttng::getEncodingFromDescriptor(load, tensorType, load.getDesc());
+  auto descLayout = dyn_cast_or_null<ttg::LayoutEncodingTrait>(descEncoding);
+  auto allocLayout = dyn_cast<ttg::LayoutEncodingTrait>(allocEncoding);
+  if (descLayout && allocLayout &&
+      ttg::areLayoutsEquivalent(allocType.getShape(), descLayout, allocLayout))
+    return descEncoding;
+
+  return std::nullopt;
+}
 
 LogicalResult doConvertDescriptorLoadsToNVWS(triton::FuncOp funcOp) {
   SmallVector<tt::DescriptorLoadOp> loads;
@@ -53,6 +77,19 @@ LogicalResult doConvertDescriptorLoadsToNVWS(triton::FuncOp funcOp) {
     if (load->hasOneUse())
       soleAlloc = dyn_cast<ttg::LocalAllocOp>(*load->getUsers().begin());
 
+    Attribute fusedEncoding;
+    if (soleAlloc) {
+      if (auto encoding = getTMAWritableEncoding(
+              load, tensorType, cast<ttg::MemDescType>(soleAlloc.getType()))) {
+        fusedEncoding = *encoding;
+      } else {
+        // Don't fuse. Clearing `soleAlloc` does double duty: the load falls
+        // through to its own TMA-compatible buffer below, and the alloc stays
+        // off the erase list since we no longer consume it.
+        soleAlloc = nullptr;
+      }
+    }
+
     OpBuilderWithAsyncTaskIds builder(load);
     builder.setInsertionPoint(load);
     Value buffer;
@@ -61,7 +98,7 @@ LogicalResult doConvertDescriptorLoadsToNVWS(triton::FuncOp funcOp) {
     } else if (soleAlloc) {
       auto oldType = cast<ttg::MemDescType>(soleAlloc.getType());
       auto bufferType = ttg::MemDescType::get(
-          oldType.getShape(), oldType.getElementType(), oldType.getEncoding(),
+          oldType.getShape(), oldType.getElementType(), fusedEncoding,
           oldType.getMemorySpace(), /*mutableMemory=*/true);
       auto newAlloc = builder.createWithAsyncTaskIds<ttg::LocalAllocOp>(
           soleAlloc.getLoc(), bufferType);
