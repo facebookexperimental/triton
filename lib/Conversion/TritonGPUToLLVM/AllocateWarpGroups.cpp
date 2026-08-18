@@ -1,3 +1,4 @@
+#include "lib/Dialect/TritonGPU/Transforms/WarpSpecialization/PartitionAttrs.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "triton/Conversion/TritonGPUToLLVM/Passes.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
@@ -30,6 +31,26 @@ static int32_t minRegistersForRegion(Region &region, bool instrumented,
   return instrumented || regionUsesAssertOrPrint(region)
              ? std::max(minRegisters, kMinRegistersForAssertOrPrint)
              : minRegisters;
+}
+
+// AutoWS emits one persistent warp-specialize region per kernel. Mark that
+// shape for the lower-overhead LLVM lowering without changing manual TLX,
+// which remains explicitly controlled by async_tasks(exclusive=True).
+static void enableSingleWarpSpecializeForAutoWS(ModuleOp mod) {
+  if (mod->hasAttr(AttrSingleWarpSpecializeName))
+    return;
+
+  SmallVector<WarpSpecializeOp> wsOps;
+  mod.walk([&](WarpSpecializeOp op) { wsOps.push_back(op); });
+  if (wsOps.size() != 1)
+    return;
+
+  bool hasAutoWSTag = false;
+  wsOps.front()->walk([&](Operation *op) {
+    hasAutoWSTag |= op->hasAttr(kWarpSpecializeTagAttrName);
+  });
+  if (hasAutoWSTag)
+    setHasSingleWarpSpecialize(mod, true);
 }
 
 // Given a `ttg.warp_specialize` with a certain number of existing warps, pad it
@@ -98,6 +119,7 @@ struct AllocateWarpGroups
   void runOnOperation() override {
     ModuleOp mod = getOperation();
     bool laterInstrumentation = instrumented.getValue();
+    enableSingleWarpSpecializeForAutoWS(mod);
 
     // First determine the maximum number of extra warps.
     int maxExtraWarps = 0;

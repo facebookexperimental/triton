@@ -2138,9 +2138,10 @@ getInitialSchedule(LoopLikeOpInterface mainLoop,
   // full-tile relayout buffer and can exceed the Blackwell SMEM limit.
   ModuleOp module = mainLoop->getParentOfType<ModuleOp>();
   bool preferComputationDefault =
-      module && module->hasAttr("ttng.two-ctas") && layout.relayPartition &&
-      layout.reductionPartition && dataPartitionFactor == 1 &&
-      localSchedOpts.mergeEpilogueToComputation && sharedComputePartition;
+      module && module->hasAttr(ttng::AttrTwoCTAsName) &&
+      layout.relayPartition && layout.reductionPartition &&
+      dataPartitionFactor == 1 && localSchedOpts.mergeEpilogueToComputation &&
+      sharedComputePartition;
   if (preferComputationDefault) {
     layout.makeDefaultPartition(schedule, sharedComputePartition, mainLoop);
     // Match TLX's specialized task order as well: reduction, GEMM, load,

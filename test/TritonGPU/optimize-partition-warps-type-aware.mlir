@@ -97,4 +97,25 @@ tt.func @empty_partition_types(%arg0: i32) {
   tt.return
 }
 
+// Test 5: A truncated type array must not be treated as if it described the
+// first specialized partition. In particular, do not apply the relay register
+// budget to an unrelated partition when role alignment is unknown.
+// CHECK-LABEL: @truncated_partition_types_do_not_mislabel
+// CHECK: ttg.warp_specialize({{.*}}) attributes {requestedRegisters = array<i32: 24, 24>, ttg.partition.types = ["relay"]}
+tt.func @truncated_partition_types_do_not_mislabel(%arg0: i32) {
+  ttg.warp_specialize(%arg0) attributes {"ttg.partition.types" = ["relay"]}
+  default {
+    ttg.warp_yield
+  }
+  partition0(%arg1: i32) num_warps(4) {
+    %0 = arith.addi %arg1, %arg1 : i32
+    ttg.warp_return
+  }
+  partition1(%arg1: i32) num_warps(4) {
+    %0 = arith.subi %arg1, %arg1 : i32
+    ttg.warp_return
+  } : (i32) -> ()
+  tt.return
+}
+
 }

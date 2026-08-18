@@ -17,6 +17,16 @@ using namespace triton::gpu;
 namespace ttng = triton::nvidia_gpu;
 namespace tlx = mlir::triton::tlx;
 
+namespace {
+constexpr StringLiteral kComputationPartitionType = "computation";
+constexpr StringLiteral kReductionPartitionType = "reduction";
+constexpr StringLiteral kRelayPartitionType = "relay";
+constexpr int32_t kRelayPartitionNumWarps = 1;
+// Match TLX's synchronization-only relay budget. This is deliberately smaller
+// than a GEMM partition's budget but remains a legal setmaxnreg multiple.
+constexpr int32_t kRelayPartitionRequestedRegisters = 40;
+} // namespace
+
 //===----------------------------------------------------------------------===//
 // relayoutWarps
 //===----------------------------------------------------------------------===//
@@ -283,24 +293,45 @@ static LogicalResult optimizePartitionNumWarps(ModuleAxisInfoAnalysis &axisInfo,
   // With reduction=4 (TMEM floor), gemm=1, load=1, computation=8,
   // total = 14, within the 16 warp budget.
   //
-  // Note: the types array comes from the scheduler and may be longer than
-  // partitionNumWarps (the WarpSpecializeOp may have fewer regions). We scan
-  // the full types array to detect the BWD pattern, then apply the override
-  // to the last partition (which is computation in BWD).
+  // The types array comes from the scheduler and may be longer than
+  // partitionNumWarps when empty partitions were removed. Match the surviving
+  // regions by type instead of assuming computation is last; dependent 2-CTA
+  // attention appends a one-warp relay partition after computation.
+  std::optional<size_t> partitionTypeOffset;
+  if (partitionTypes.size() >= partitionNumWarps.size())
+    partitionTypeOffset = partitionTypes.size() - partitionNumWarps.size();
+  auto getPartitionType = [&](size_t partitionIdx) -> StringRef {
+    if (!partitionTypeOffset)
+      return {};
+    size_t typeIdx = partitionIdx + *partitionTypeOffset;
+    return typeIdx < partitionTypes.size() ? partitionTypes[typeIdx]
+                                           : StringRef();
+  };
+
   bool hasReduction = false;
   bool hasComputation = false;
+  ModuleOp mod = axisInfo.getModuleOp();
+  bool isTwoCTA = mod->hasAttr(ttng::AttrTwoCTAsName);
+  // The type list also includes the default region, which may carry the only
+  // reduction/computation role. Scan the complete list for pattern detection,
+  // but use getPartitionType() for per-specialized-region assignments.
   for (StringRef type : partitionTypes) {
-    if (type == "reduction")
+    if (type == kReductionPartitionType)
       hasReduction = true;
-    if (type == "computation")
+    if (type == kComputationPartitionType)
       hasComputation = true;
   }
 
   if (hasReduction && hasComputation && !partitionNumWarps.empty()) {
-    partitionNumWarps.back() = 8;
+    for (size_t idx = 0; idx < partitionNumWarps.size(); ++idx) {
+      StringRef type = getPartitionType(idx);
+      if (type == kComputationPartitionType && !isTwoCTA)
+        partitionNumWarps[idx] = 8;
+      else if (type == kRelayPartitionType)
+        partitionNumWarps[idx] = kRelayPartitionNumWarps;
+    }
   }
 
-  ModuleOp mod = axisInfo.getModuleOp();
   auto minRegAttr = mod->getAttrOfType<IntegerAttr>(AttrMinRegAutoWSName);
   auto maxRegAttr = mod->getAttrOfType<IntegerAttr>(AttrMaxRegAutoWSName);
   bool hasMax = !!maxRegAttr;
@@ -308,6 +339,7 @@ static LogicalResult optimizePartitionNumWarps(ModuleAxisInfoAnalysis &axisInfo,
   int maxRegAutoWS = hasMax ? maxRegAttr.getInt() : -1;
 
   SmallVector<int32_t> estRegUsage(partitionNumWarps.size());
+  size_t partitionIdx = 0;
   for (auto [partition, newNumWarps, prevNumWarps, tensorRegs, hasTensor,
              estRegs] : llvm::zip(wsOp.getPartitionRegions(), partitionNumWarps,
                                   wsOp.getPartitionNumWarps(), maxTensorRegs,
@@ -318,6 +350,12 @@ static LogicalResult optimizePartitionNumWarps(ModuleAxisInfoAnalysis &axisInfo,
     // get the fixed minRegAutoWS allocation.
     estRegs = hasMax ? (tensorRegs ? maxRegAutoWS : minRegAutoWS)
                      : (tensorRegs ? -1 : minRegAutoWS);
+    StringRef partitionType = getPartitionType(partitionIdx);
+    ++partitionIdx;
+    // The 2-CTA relay only waits, fences, and publishes completion. Matching
+    // TLX's 40-register relay avoids reserving the GEMM budget for one warp.
+    if (partitionType == kRelayPartitionType)
+      estRegs = kRelayPartitionRequestedRegisters;
 
     // Layouts need to be reassigned if the number of warps changed and the
     // partition contains any tensor (even a single-element broadcast tensor,
