@@ -277,14 +277,14 @@ def _prepare_adaptive_score_registers(scores, qk_scale: tl.constexpr):
 
 @triton.jit
 def _adaptive_rebase_decision(row_max, tile_max):
-    """Return the next row maximum and one uniform rebase decision per wave.
+    """Return the next row maximum and one uniform headroom vote per wave.
 
     Each wave owns 32 rows, duplicated across its two 32-lane halves by the
-    reduction.  ``warp_ballot == -1`` therefore means that all 32 rows remain
-    within the logarithmic headroom.  If any row exceeds it, rebasing every row
-    in the wave is algebraically safe: scaling its old denominator and
-    accumulator by the same factor preserves their ratio.  Ordered comparison
-    also makes a NaN take the rebase path and continue propagating.
+    reduction.  ``warp_all`` therefore tests whether every one of the 32 rows
+    remains within the logarithmic headroom.  If any row exceeds it, rebasing
+    every row in the wave is algebraically safe: scaling its old denominator
+    and accumulator by the same factor preserves their ratio.  Ordered
+    comparison also makes a NaN take the rebase path and continue propagating.
     """
     candidate = tl.maximum(
         row_max,
@@ -293,8 +293,8 @@ def _adaptive_rebase_decision(row_max, tile_max):
     )
     advance = candidate - row_max
     row_is_within_headroom = advance <= SOFTMAX_REFERENCE_HEADROOM_LOG2
-    needs_rebase = tlx.warp_ballot(row_is_within_headroom) != -1
-    return candidate, needs_rebase
+    all_rows_within_headroom = tlx.warp_all(row_is_within_headroom)
+    return candidate, all_rows_within_headroom
 
 
 @triton.jit
@@ -451,15 +451,15 @@ class SoftmaxState:
             if INITIAL:
                 reference = tile_max
             else:
-                candidate, needs_rebase = _adaptive_rebase_decision(
+                candidate, all_rows_within_headroom = _adaptive_rebase_decision(
                     self.row_max,
                     tile_max,
                 )
-                if needs_rebase:
+                if all_rows_within_headroom:
+                    reference = self.row_max
+                else:
                     reference = candidate
                     state = self.rebase(reference)
-                else:
-                    reference = self.row_max
             if INITIAL:
                 state = SoftmaxState(
                     self.acc0,
@@ -497,18 +497,18 @@ class SoftmaxState:
 
         Keeping the rebase commit separate lets Wave overlap this independent
         score work with the remaining PV MFMAs.  The reference is still chosen
-        by the same wave-uniform ballot as prepare; only the state scaling
+        by the same wave-uniform vote as prepare; only the state scaling
         is deferred until the current PV tile is fully accumulated.
         """
         score_registers0, score_registers1, tile_max = _prepare_adaptive_score_registers(
             scores,
             qk_scale,
         )
-        candidate, needs_rebase = _adaptive_rebase_decision(
+        candidate, all_rows_within_headroom = _adaptive_rebase_decision(
             self.row_max,
             tile_max,
         )
-        reference = tl.where(needs_rebase, candidate, self.row_max)
+        reference = tl.where(all_rows_within_headroom, self.row_max, candidate)
         exponentiated_scores = _exponentiate_adaptive_scores(
             score_registers0,
             score_registers1,
@@ -518,17 +518,19 @@ class SoftmaxState:
         return (
             exponentiated_scores,
             reference,
-            needs_rebase,
+            all_rows_within_headroom,
         )
 
     @triton.jit
     def commit_adaptive_reference(
         self,
         reference,
-        needs_rebase,
+        all_rows_within_headroom,
     ):
         state = self
-        if needs_rebase:
+        if all_rows_within_headroom:
+            state = self
+        else:
             state = self.rebase(reference)
         return state
 
@@ -629,7 +631,7 @@ def _accumulate_prefix_body(
     acc2 = _pv_mfma(p1, value_fragments.v12, acc2, p_layout, v_layout, mma_layout)
     acc3 = _pv_mfma(p1, value_fragments.v13, acc3, p_layout, v_layout, mma_layout)
     if ADAPTIVE_REFERENCE:
-        exponentiated_scores, reference, needs_rebase = state.prepare_adaptive_pending(
+        exponentiated_scores, reference, all_rows_within_headroom = state.prepare_adaptive_pending(
             next_scores,
             qk_scale,
         )
@@ -651,7 +653,7 @@ def _accumulate_prefix_body(
     )
     if ADAPTIVE_REFERENCE:
         return (
-            state.commit_adaptive_reference(reference, needs_rebase),
+            state.commit_adaptive_reference(reference, all_rows_within_headroom),
             exponentiated_scores,
         )
     return state.prepare(

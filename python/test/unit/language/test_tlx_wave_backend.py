@@ -16,6 +16,7 @@ from triton._C.libtriton import ir
 from triton._C.libtriton import linear_layout as triton_linear_layout
 from triton._C.libtriton.linear_layout import LinearLayout
 import triton.language as tl
+import triton.language.extra.tlx as tlx
 from triton.backends import backends
 from triton.backends.compiler import GPUTarget
 from triton.compiler.compiler import ASTSource, compile as triton_compile, make_backend
@@ -71,6 +72,14 @@ pytestmark = pytest.mark.skipif("tlx_wave" not in backends, reason="tlx_wave bac
 GFX942_WAVE = GPUTarget("tlx_wave", "gfx942", 64)
 GFX950_WAVE = GPUTarget("tlx_wave", "gfx950", 64)
 _TLX_WAVE_RUNTIME_ARCHES = {"gfx942", "gfx950"}
+
+
+@triton.jit
+def _tlx_wave_warp_vote_kernel(x_ptr, all_ptr, any_ptr, BLOCK: tl.constexpr):
+    offsets = tl.arange(0, BLOCK)
+    predicate = tl.load(x_ptr + offsets) != 0
+    tl.store(all_ptr + offsets, 1, mask=tlx.warp_all(predicate))
+    tl.store(any_ptr + offsets, 1, mask=tlx.warp_any(predicate))
 
 
 def _fake_layout(
@@ -7672,6 +7681,34 @@ def test_tlx_wave_backend_compile_uses_staged_converter():
     binary_module = _run_wave_compile_kernels(wave_artifact)
     assert "gpu.binary @kernels" in binary_module
     assert "gpu.module @kernels" not in binary_module
+
+
+def test_tlx_wave_backend_lowers_semantic_warp_votes():
+    src = ASTSource(
+        fn=_tlx_wave_warp_vote_kernel,
+        signature={
+            "x_ptr": "*i32",
+            "all_ptr": "*i32",
+            "any_ptr": "*i32",
+            "BLOCK": "constexpr",
+        },
+        constexprs={"BLOCK": 64},
+        attrs={
+            (0, ): [["tt.pointer_range", 32]],
+            (1, ): [["tt.pointer_range", 32]],
+            (2, ): [["tt.pointer_range", 32]],
+        },
+    )
+
+    compiled = triton_compile(src, target=GFX950_WAVE, options={"num_warps": 1})
+    wave_artifact = _asm_text(compiled, "wave")
+
+    assert "wave.mask_all" in wave_artifact
+    assert "wave.mask_any" in wave_artifact
+    assert "wave.ballot" not in wave_artifact
+    assert isinstance(compiled.asm["hsaco"], bytes)
+    assert compiled.asm["hsaco"].startswith(b"\x7fELF")
+    _run_wave_verify(wave_artifact)
 
 
 def test_tlx_wave_backend_compile_forwards_waves_per_eu():

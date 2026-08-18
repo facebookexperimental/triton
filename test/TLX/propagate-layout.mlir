@@ -70,35 +70,35 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 
 // -----
 
-// Warp ballot consumes one predicate per physical lane.  A source layout that
+// Warp vote consumes one predicate per physical lane.  A source layout that
 // already provides exactly one value per lane must not be redistributed to the
-// default blocked encoding just to satisfy the ballot.
+// default blocked encoding just to satisfy the vote.
 
-#ballot_blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [8], order = [0]}>
-#ballot_two_per_thread = #ttg.blocked<{sizePerThread = [2], threadsPerWarp = [64], warpsPerCTA = [8], order = [0]}>
-#ballot_mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [8, 1], instrShape = [32, 32, 16], isTransposed = true}>
-#ballot_row = #ttg.slice<{dim = 1, parent = #ballot_mma}>
+#vote_blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [8], order = [0]}>
+#vote_two_per_thread = #ttg.blocked<{sizePerThread = [2], threadsPerWarp = [64], warpsPerCTA = [8], order = [0]}>
+#vote_mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [8, 1], instrShape = [32, 32, 16], isTransposed = true}>
+#vote_row = #ttg.slice<{dim = 1, parent = #vote_mma}>
 
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
-  // CHECK-LABEL: @warp_ballot_preserves_one_value_per_lane_layout
-  tt.func public @warp_ballot_preserves_one_value_per_lane_layout(%pred: tensor<256xi1, #ballot_row>) -> i64 {
+  // CHECK-LABEL: @warp_vote_preserves_one_value_per_lane_layout
+  tt.func public @warp_vote_preserves_one_value_per_lane_layout(%pred: tensor<256xi1, #vote_row>) -> i1 {
     // CHECK-NOT: ttg.convert_layout
-    // CHECK: ttg.warp_ballot %arg0 : tensor<256xi1, #ttg.slice<{{.*}}>> -> i64
-    %converted = ttg.convert_layout %pred : tensor<256xi1, #ballot_row> -> tensor<256xi1, #ballot_blocked>
-    %mask = ttg.warp_ballot %converted : tensor<256xi1, #ballot_blocked> -> i64
-    tt.return %mask : i64
+    // CHECK: ttg.warp_vote %arg0 "all" : tensor<256xi1, #ttg.slice<{{.*}}>> -> i1
+    %converted = ttg.convert_layout %pred : tensor<256xi1, #vote_row> -> tensor<256xi1, #vote_blocked>
+    %result = ttg.warp_vote %converted "all" : tensor<256xi1, #vote_blocked> -> i1
+    tt.return %result : i1
   }
 
   // The fold is deliberately physical, not a general layout-propagation
   // shortcut: a source that owns multiple predicates per lane still needs the
-  // conversion which selects warp_ballot's one physical predicate.
-  // CHECK-LABEL: @warp_ballot_keeps_multi_value_layout_conversion
-  tt.func public @warp_ballot_keeps_multi_value_layout_conversion(%pred: tensor<256xi1, #ballot_two_per_thread>) -> i64 {
+  // conversion which selects warp_vote's one physical predicate.
+  // CHECK-LABEL: @warp_vote_keeps_multi_value_layout_conversion
+  tt.func public @warp_vote_keeps_multi_value_layout_conversion(%pred: tensor<256xi1, #vote_two_per_thread>) -> i1 {
     // CHECK: %[[CONVERTED:.*]] = ttg.convert_layout %arg0
-    // CHECK: ttg.warp_ballot %[[CONVERTED]]
-    %converted = ttg.convert_layout %pred : tensor<256xi1, #ballot_two_per_thread> -> tensor<256xi1, #ballot_blocked>
-    %mask = ttg.warp_ballot %converted : tensor<256xi1, #ballot_blocked> -> i64
-    tt.return %mask : i64
+    // CHECK: ttg.warp_vote %[[CONVERTED]] "any"
+    %converted = ttg.convert_layout %pred : tensor<256xi1, #vote_two_per_thread> -> tensor<256xi1, #vote_blocked>
+    %result = ttg.warp_vote %converted "any" : tensor<256xi1, #vote_blocked> -> i1
+    tt.return %result : i1
   }
 
 }
