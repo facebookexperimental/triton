@@ -225,7 +225,10 @@ def require_layout(
     assert isinstance(pin, bool), f"pin must be a constexpr bool, got {type(pin).__name__}"
     assert isinstance(late_address_compute, bool), ("late_address_compute must be a constexpr bool, got "
                                                     f"{type(late_address_compute).__name__}")
-    enc = layout.to_ir(_semantic.builder, x.shape, x.dtype)
+    if isinstance(layout, tlx.layout):
+        enc = layout.to_ir(_semantic.builder, x.shape, x.dtype)
+    else:
+        enc = layout.to_ir(_semantic.builder)
     handle = _semantic.builder.create_require_layout(
         x.handle,
         enc,
@@ -236,15 +239,33 @@ def require_layout(
 
 
 @tl.builtin
-def release_layout(x, _semantic=None):
-    """Release a register tensor's explicit layout for a flexible consumer.
+def release_layout(src, _semantic=None):
+    """Return an ordinary tensor view of an explicitly laid-out tensor."""
+    src = _semantic.to_tensor(src)
+    handle = _semantic.builder.create_release_layout(src.handle)
+    return tl.tensor(handle, src.type)
 
-    This is the inverse boundary to :func:`require_layout`: layout propagation
-    may select a new encoding after this point without changing tensor values.
-    """
-    assert isinstance(x, tl.tensor) and x.type.is_block(), "x must be a distributed tensor"
-    handle = _semantic.builder.create_release_layout(x.handle)
-    return tl.tensor(handle, x.type)
+
+@tl.builtin
+def cast_preserve_layout(src, dtype: tl.constexpr, fp_downcast_rounding: tl.constexpr = None,
+                         bitcast: tl.constexpr = False, _semantic=None):
+    """Cast a tensor while preserving its current IR layout encoding."""
+    src = _semantic.to_tensor(src)
+    dtype = tl._unwrap_if_constexpr(dtype)
+    fp_downcast_rounding = tl._unwrap_if_constexpr(fp_downcast_rounding)
+    bitcast = tl._unwrap_if_constexpr(bitcast)
+    if src.type.is_block():
+        dst_ty = src.type.with_element_ty(dtype)
+    else:
+        dst_ty = dtype
+    rounding = None if bitcast else _semantic._str_to_rounding_mode(fp_downcast_rounding)
+    handle = _semantic.builder.create_layout_preserving_cast(
+        src.handle,
+        dst_ty.to_ir(_semantic.builder),
+        rounding,
+        bitcast,
+    )
+    return tl.tensor(handle, dst_ty)
 
 
 def require_nv_mma_shared_layout(x: tlx.buffered_tensor, swizzled: bool, _builder=None, fp4Padded: bool = False):

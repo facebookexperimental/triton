@@ -31,6 +31,35 @@ class layout_encoding:
         raise NotImplementedError(f"{self.__class__.__name__}.to_ir() must be overridden in subclasses")
 
 
+class distributed_linear_layout_encoding(layout_encoding):
+
+    def __init__(self, reg_bases, lane_bases, warp_bases, block_bases, shape):
+        super().__init__()
+        self.reg_bases = [list(base) for base in reg_bases]
+        self.lane_bases = [list(base) for base in lane_bases]
+        self.warp_bases = [list(base) for base in warp_bases]
+        self.block_bases = [list(base) for base in block_bases]
+        self.shape = list(shape)
+
+    @staticmethod
+    @constexpr_function
+    def make(reg_bases, lane_bases, warp_bases, block_bases, shape):
+        return distributed_linear_layout_encoding(reg_bases, lane_bases, warp_bases, block_bases, shape)
+
+    def to_ir(self, builder: ir.builder) -> None:
+        return builder.make_distributed_linear_encoding_attr(
+            self.reg_bases,
+            self.lane_bases,
+            self.warp_bases,
+            self.block_bases,
+            [int(s) for s in self.shape],
+        )
+
+    def __repr__(self):
+        return (f"distributed_linear_layout_encoding<{self.reg_bases}, {self.lane_bases}, "
+                f"{self.warp_bases}, {self.block_bases}, {self.shape}>")
+
+
 class shared_layout_encoding(layout_encoding):
 
     def __init__(self):

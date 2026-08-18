@@ -76,6 +76,7 @@ from .mma_ops import (
     async_dot_scaled,
     async_dot_wait,
     dot_scaled,
+    cast_preserve_layout,
     extract_slice,
     rematerialized_range,
     release_layout,
@@ -91,6 +92,7 @@ from .types import (
     clc_response_type,
     CLCPipelineContext,
     DummyRegisterLayoutEncoding,
+    distributed_linear_layout_encoding,
     layout_encoding,
     mbarrier,
     mbarrier_type,
@@ -126,7 +128,7 @@ from .utility import (
     thread_id,
 )
 from .mxfp8_utils import _to_mxfp8_block
-from .warp_ops import vote_ballot_sync, warp_redux
+from .warp_ops import vote_ballot_sync, warp_all, warp_any, warp_redux
 from .warp_pipeline import warp_pipeline_stage
 
 __all__ = [
@@ -226,10 +228,12 @@ __all__ = [
     "amd_sched_barrier",
     # mma_ops
     "dot_scaled",
+    "cast_preserve_layout",
     "require_amd_wmma_layout",
     "async_dot",
     "async_dot_scaled",
     "async_dot_wait",
+    "release_layout",
     "require_layout",
     "tcgen05_commit",
     # utility
@@ -251,9 +255,12 @@ __all__ = [
     "clc_consumer",
     "CLCPipelineContext",
     "DummyRegisterLayoutEncoding",
+    "distributed_linear_layout_encoding",
     # MXFP8
     "_to_mxfp8_block",
     # warp_ops
+    "warp_all",
+    "warp_any",
     "vote_ballot_sync",
     # warp_pipeline
     "warp_pipeline_stage",

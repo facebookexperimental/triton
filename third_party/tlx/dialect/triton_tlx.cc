@@ -101,6 +101,21 @@ static Value materializeConcreteMemDesc(TritonOpBuilder &builder, Value value) {
   return builder.create<tlx::RequireLayoutOp>(concreteType, value);
 }
 
+static Type getElementType(Type type) {
+  if (auto rankedType = dyn_cast<RankedTensorType>(type))
+    return rankedType.getElementType();
+  return type;
+}
+
+static Type getLayoutPreservingType(Value src, Type dstType) {
+  auto srcType = src.getType();
+  auto dstElementType = getElementType(dstType);
+  if (auto srcTensorType = dyn_cast<RankedTensorType>(srcType))
+    return RankedTensorType::get(srcTensorType.getShape(), dstElementType,
+                                 srcTensorType.getEncoding());
+  return dstElementType;
+}
+
 void init_triton_tlx_ir(py::module_ &m) {
   auto *builder_cls = ir::getBuilderClass();
   builder_cls
@@ -296,6 +311,36 @@ void init_triton_tlx_ir(py::module_ &m) {
           },
           py::arg("shape"), py::arg("elementType"), py::arg("encoding"),
           py::arg("scalar"))
+      .def("create_layout_preserving_cast",
+           [](TritonOpBuilder &self, Value &src, Type &dstType,
+              std::optional<tt::RoundingMode> roundingMode,
+              bool bitcast) -> Value {
+             auto resultType = getLayoutPreservingType(src, dstType);
+             auto srcElementType = getElementType(src.getType());
+             auto dstElementType = getElementType(resultType);
+             if (srcElementType == dstElementType)
+               return src;
+             if (bitcast)
+               return self.create<tt::BitcastOp>(resultType, src);
+             if (isa<FloatType>(srcElementType) &&
+                 isa<FloatType>(dstElementType)) {
+               if (roundingMode.has_value()) {
+                 auto roundingAttr = tt::RoundingModeAttr::get(
+                     self.getContext(), roundingMode.value());
+                 return self.create<tt::FpToFpOp>(resultType, src,
+                                                  roundingAttr);
+               }
+               unsigned srcWidth = srcElementType.getIntOrFloatBitWidth();
+               unsigned dstWidth = dstElementType.getIntOrFloatBitWidth();
+               if (srcWidth > dstWidth)
+                 return self.create<arith::TruncFOp>(resultType, src);
+               if (srcWidth < dstWidth)
+                 return self.create<arith::ExtFOp>(resultType, src);
+               return self.create<tt::BitcastOp>(resultType, src);
+             }
+             throw std::runtime_error(
+                 "Unsupported layout-preserving cast element types");
+           })
       .def("create_release_layout",
            [](TritonOpBuilder &self, Value &v) -> Value {
              if (auto type = dyn_cast<RankedTensorType>(v.getType())) {
@@ -516,6 +561,30 @@ void init_triton_tlx_ir(py::module_ &m) {
              tt::LinearLayout ll(std::move(bases), std::move(outDimNames));
              return mlir::cast<Attribute>(ttg::SharedLinearEncodingAttr::get(
                  context, std::move(ll), alignment));
+           })
+      .def("make_distributed_linear_encoding_attr",
+           [](TritonOpBuilder &self, std::vector<std::vector<int32_t>> regBases,
+              std::vector<std::vector<int32_t>> laneBases,
+              std::vector<std::vector<int32_t>> warpBases,
+              std::vector<std::vector<int32_t>> blockBases,
+              std::vector<int64_t> shape) -> Attribute {
+             auto ctx = self.getBuilder().getContext();
+             auto kReg = mlir::StringAttr::get(ctx, "register");
+             auto kLane = mlir::StringAttr::get(ctx, "lane");
+             auto kWarp = mlir::StringAttr::get(ctx, "warp");
+             auto kBlock = mlir::StringAttr::get(ctx, "block");
+             auto outDims = tt::standardOutDimPairs(ctx, shape);
+             auto ll = tt::LinearLayout({{kReg, regBases},
+                                         {kLane, laneBases},
+                                         {kWarp, warpBases},
+                                         {kBlock, blockBases}},
+                                        outDims,
+                                        /*requiresSurjective=*/true);
+             if (ttg::isPermutationMatrixLayout(ll))
+               return mlir::cast<Attribute>(
+                   ttg::LinearEncodingAttr::get(ctx, std::move(ll)));
+             return mlir::cast<Attribute>(
+                 ttg::GenericLinearEncodingAttr::get(ctx, std::move(ll)));
            })
       .def("make_tensor_memory_encoding_attr",
            [](TritonOpBuilder &self, unsigned blockM, unsigned blockN,
@@ -816,6 +885,12 @@ void init_triton_tlx_ir(py::module_ &m) {
       .def("create_amd_sched_barrier",
            [](TritonOpBuilder &self, int32_t mask) {
              self.create<ROCDL::SchedBarrier>(mask);
+           })
+      .def("create_warp_vote",
+           [](TritonOpBuilder &self, Value pred,
+              const std::string &kind) -> mlir::Value {
+             return self.create<ttg::WarpVoteOp>(
+                 pred, self.getBuilder().getStringAttr(kind));
            })
       .def("create_barrier_expect",
            [](TritonOpBuilder &self, Value mbarrerLoc, int expectBytes,
