@@ -204,9 +204,101 @@ bool tmemMayAlias(Value a, Value b) {
   return true;
 }
 
+// Trace SMEM memdesc views to a stable root. Distinct local allocations and
+// block arguments are known not to alias; anything else is treated
+// conservatively by smemMayAlias below.
+Value findSMemBase(Value value) {
+  while (Operation *def = value.getDefiningOp()) {
+    if (!isa<ttg::MemDescIndexOp, ttg::MemDescSubsliceOp,
+             ttg::MemDescReinterpretOp, ttg::MemDescTransOp,
+             ttg::MemDescReshapeOp>(def))
+      break;
+    value = def->getOperand(0);
+  }
+  return value;
+}
+
+bool isKnownSMemBase(Value value) {
+  return isa<BlockArgument>(value) || value.getDefiningOp<ttg::LocalAllocOp>();
+}
+
+bool smemMayAlias(Value a, Value b) {
+  Value aBase = findSMemBase(a);
+  Value bBase = findSMemBase(b);
+  if (aBase == bBase)
+    return true;
+  return !(isKnownSMemBase(aBase) && isKnownSMemBase(bBase));
+}
+
+bool mayWriteOrFreeSMem(Operation *op, Value buffer) {
+  SmallVector<MemoryEffects::EffectInstance> effects;
+  collectEffects(op, effects);
+  for (const auto &effect : effects) {
+    if (!isa<MemoryEffects::Write, MemoryEffects::Free>(effect.getEffect()))
+      continue;
+    if (isa<SideEffects::DefaultResource>(effect.getResource()))
+      return true;
+    if (effect.getResource() == ttg::SharedMemory::get() &&
+        (!effect.getValue() || smemMayAlias(effect.getValue(), buffer)))
+      return true;
+  }
+  return false;
+}
+
 bool isPlainTMAStoreTokenWait(Operation *op) {
   auto wait = dyn_cast<TMAStoreTokenWaitOp>(op);
   return wait && wait.getBarriers().empty();
+}
+
+bool isTMAStoreLike(Operation *op);
+
+void delayPlainTMAStoreTokenWaits(Block &block) {
+  SmallVector<TMAStoreTokenWaitOp> waits;
+  for (Operation &op : block)
+    if (auto wait = dyn_cast<TMAStoreTokenWaitOp>(&op);
+        wait && wait.getBarriers().empty())
+      waits.push_back(wait);
+
+  for (TMAStoreTokenWaitOp wait : waits) {
+    Operation *tmaStore = wait.getToken().getDefiningOp();
+    if (!tmaStore ||
+        !isa<AsyncTMACopyLocalToGlobalOp, AsyncTMAReduceOp>(tmaStore) ||
+        tmaStore->getBlock() != &block)
+      continue;
+    Value staging;
+    if (auto copy = dyn_cast<AsyncTMACopyLocalToGlobalOp>(tmaStore))
+      staging = copy.getSrc();
+    else
+      staging = cast<AsyncTMAReduceOp>(tmaStore).getSrc();
+    for (auto it = std::next(wait->getIterator()); it != block.end(); ++it) {
+      auto localStore = dyn_cast<ttg::LocalStoreOp>(&*it);
+      if (localStore) {
+        if (!smemMayAlias(localStore.getDst(), staging))
+          continue;
+        wait->moveBefore(localStore);
+        break;
+      }
+
+      // Do not make this queue-wide wait cover another async reader, or cross
+      // an operation whose memory effects we cannot prove independent.
+      if (isa<ttg::LocalAllocOp>(&*it))
+        continue;
+      if (isTMAStoreLike(&*it) || mayWriteOrFreeSMem(&*it, staging))
+        break;
+    }
+  }
+}
+
+Operation *findEarliestTMAStoreUser(Value staging, Operation *after) {
+  Operation *earliest = nullptr;
+  for (Operation *user : staging.getUsers()) {
+    if (!isTMAStoreLike(user) || user->getBlock() != after->getBlock() ||
+        !after->isBeforeInBlock(user))
+      continue;
+    if (!earliest || user->isBeforeInBlock(earliest))
+      earliest = user;
+  }
+  return earliest;
 }
 
 // Check whether a movable chain can sink past `next`. When opConstraints is
@@ -224,8 +316,19 @@ bool canSinkUseChainPast(Value buffer, ArrayRef<Operation *> useChain,
       break;
     }
   }
-  if (isWSBarrierReorderEnabled()) {
-    if (!canAdvanceWSBarrier(opConstraints, next))
+  // A TMEM epilogue load can carry the constraints from its own arrive
+  // barrier.  Use those constraints even when the global barrier-reorder
+  // knob is disabled: this moves only the load/use chain (and its matching
+  // arrive), rather than globally raising and sinking every WS barrier in the
+  // block.
+  if (opConstraints || isWSBarrierReorderEnabled()) {
+    // Once the load chain has picked up its own arrive, it may pass another
+    // WS arrive: both operations only delay signals.  This mirrors
+    // sinkWSArrives, but is deliberately limited to the one epilogue chain.
+    bool arrivesCanSwap =
+        isa<ArriveBarrierOp>(useChain.back()) && isa<ArriveBarrierOp>(next) &&
+        hasWSBarrierConstraints(cast<ArriveBarrierOp>(next).getConstraints());
+    if (!arrivesCanSwap && !canAdvanceWSBarrier(opConstraints, next))
       return false;
   } else {
     // Legacy safe behavior: don't sink past barrier signals, since they may
@@ -308,6 +411,35 @@ struct TMemLoadGroup {
   SmallVector<Operation *> loads;
 };
 
+// Trace the value produced by a TMEM load through a single-use pure chain to
+// the local store that materializes it in SMEM. This is the common output
+// epilogue shape: tmem_load -> convert/scale -> local_store -> TMA store.
+ttg::LocalStoreOp findEpilogueLocalStore(Operation *load) {
+  if (load->getNumResults() != 1)
+    return {};
+  Value value = load->getResult(0);
+  while (value.hasOneUse()) {
+    Operation *user = *value.user_begin();
+    if (auto localStore = dyn_cast<ttg::LocalStoreOp>(user))
+      return localStore;
+    if (!isPure(user) || user->getNumResults() != 1)
+      return {};
+    value = user->getResult(0);
+  }
+  return {};
+}
+
+bool isTMAStoreLike(Operation *op) {
+  return isa<AsyncTMACopyLocalToGlobalOp, AsyncTMAReduceOp>(op);
+}
+
+Operation *findEpilogueTMAStore(Operation *load) {
+  auto localStore = findEpilogueLocalStore(load);
+  if (!localStore)
+    return nullptr;
+  return findEarliestTMAStoreUser(localStore.getDst(), localStore);
+}
+
 DenseMap<Operation *, unsigned> getBlockOpPositions(Block &block) {
   DenseMap<Operation *, unsigned> opToPosition;
   unsigned position = 0;
@@ -331,6 +463,17 @@ getTMemLoadLiveRangeEnd(Operation *load,
         end = user;
         endPos = userIt->second;
       }
+    }
+  }
+  // A TMA output epilogue does not become reusable at local_store: the TMA
+  // engine still has to begin reading the staging buffer. Extend the boundary
+  // through that launch so the next TMEM slice can overlap the asynchronous
+  // transfer without extending both register live ranges.
+  if (Operation *tmaStore = findEpilogueTMAStore(load)) {
+    auto tmaIt = opToPosition.find(tmaStore);
+    if (tmaIt != opToPosition.end() && tmaIt->second > endPos) {
+      end = tmaStore;
+      endPos = tmaIt->second;
     }
   }
   return end;
@@ -434,7 +577,14 @@ SmallVector<TMemLoadGroup> buildTMemLoadGroups(
     DictionaryAttr constraints;
     if (auto it = memOpConstraints.find(op); it != memOpConstraints.end())
       constraints = it->second;
-    Value alloc = findBufferAccess(load.getSrc()).first;
+    // Output-epilogue loads may come from distinct TMEM allocations (dV and
+    // dK), but they compete for registers and feed a single ordered TMA-store
+    // stream. Group them together when their WS constraints match so the
+    // interleaver can realize load -> store launch -> next load across tensor
+    // boundaries. Other loads retain allocation-local grouping.
+    Value alloc = findEpilogueTMAStore(op)
+                      ? Value{}
+                      : findBufferAccess(load.getSrc()).first;
 
     auto groupIt = llvm::find_if(groups, [&](const TMemLoadGroup &group) {
       return group.constraints == constraints && group.alloc == alloc;
@@ -629,9 +779,11 @@ void processBlock(BlockInterleaveInfo &info) {
 
   // Step 3: Move TMEM allocs close to their uses, then sink tmem_loads only
   // far enough to start after the previous load's live range.
-  DenseMap<Operation *, DictionaryAttr> memOpConstraints;
-  if (reorderWSBarriers)
-    memOpConstraints = buildTMemLoadConstraints(block);
+  // Constraint-guided TMEM epilogue sinking is safe independently of the
+  // global WS-barrier normalization.  Build the mapping unconditionally so a
+  // load can carry its own arrive across barriers from independent channels.
+  DenseMap<Operation *, DictionaryAttr> memOpConstraints =
+      buildTMemLoadConstraints(block);
   SmallVector<TMemLoadGroup> loadGroups =
       buildTMemLoadGroups(info.tmemLoads, memOpConstraints);
   for (auto [op, buffer] : info.opsToSink) {
@@ -650,6 +802,10 @@ void processBlock(BlockInterleaveInfo &info) {
   // Step 4: Restore barriers to optimal positions near their memory ops.
   if (reorderWSBarriers)
     optimizeWSBarrierLocations(barrierMap);
+  // Barrier restoration and TMEM-load sinking may move a load across a token
+  // wait that was already positioned before staging reuse. Re-establish that
+  // canonical placement so the load/conversion overlaps the prior TMA store.
+  delayPlainTMAStoreTokenWaits(block);
 
   SmallVector<Operation *> currentLivenessOrder = getBlockOpOrder(block);
   currentLivenessOrder.push_back(block.getTerminator());
