@@ -188,3 +188,21 @@ def test_dispatcher_core_multidim_cluster():
     torch.cuda.synchronize()
     expected = torch.arange(GX * GY * GZ, device="cuda", dtype=torch.int32)
     torch.testing.assert_close(out, expected)
+
+
+@pytest.mark.skipif(not is_cuda(), reason="Requires CUDA")
+def test_dispatcher_rejects_incomplete_exact_cluster():
+    from triton._internal_testing import is_hopper_or_newer
+
+    if not is_hopper_or_newer():
+        pytest.skip("clusters need Hopper or newer")
+
+    GX, GY, GZ = 3, 2, 3
+    out = torch.full((GX * GY * GZ, ), -1, device="cuda", dtype=torch.int32)
+    with force_dispatcher():
+        with pytest.raises(
+                ValueError,
+                match=(r"physical grid \(3, 2, 3\).*required cluster shape "
+                       r"\(2, 1, 3\)"),
+        ):
+            _disp_pid_write[(GX, GY, GZ)](out, GX, GY, ctas_per_cga=(2, 1, 3))

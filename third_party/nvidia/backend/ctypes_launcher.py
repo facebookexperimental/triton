@@ -387,6 +387,9 @@ def make_ctypes_launcher(constants, signature, tensordesc_meta):
             num_warps,
             num_ctas,
             shared_memory,
+            clusterDimX,
+            clusterDimY,
+            clusterDimZ,
             _preferredClusterDimX,
             _preferredClusterDimY,
             _preferredClusterDimZ,
@@ -400,6 +403,18 @@ def make_ctypes_launcher(constants, signature, tensordesc_meta):
             if launch_exit_hook is not None:
                 launch_exit_hook(launch_metadata)
             return
+
+        actual_gridX = gridX * num_ctas
+        actual_gridY = gridY
+        actual_gridZ = gridZ
+        has_exact_cluster = num_ctas > 1 or clusterDimX > 1 or clusterDimY > 1 or clusterDimZ > 1
+        if has_exact_cluster:
+            required = (num_ctas, 1, 1) if num_ctas > 1 else (clusterDimX, clusterDimY, clusterDimZ)
+            physical_grid = (actual_gridX, actual_gridY, actual_gridZ)
+            if any(g % c != 0 for g, c in zip(physical_grid, required)):
+                raise ValueError(
+                    f"Triton cluster requirement failed: physical grid {physical_grid} "
+                    f"is not divisible by required cluster shape {required}")
 
         # Process global_scratch
         global_scratch = CUdeviceptr(0)
@@ -430,10 +445,6 @@ def make_ctypes_launcher(constants, signature, tensordesc_meta):
         launch_attrs = (CUlaunchAttribute * 4)()
         num_attrs = 0
 
-        actual_gridX = gridX * num_ctas
-        actual_gridY = gridY
-        actual_gridZ = gridZ
-
         if launch_pdl:
             launch_attrs[num_attrs].id = (CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION)
             launch_attrs[num_attrs].value.value = 1
@@ -444,14 +455,18 @@ def make_ctypes_launcher(constants, signature, tensordesc_meta):
             launch_attrs[num_attrs].value.value = 1
             num_attrs += 1
 
-        if launch_cluster or num_ctas != 1:
-            # Only set CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION for Triton's num_ctas path.
-            # For ctas_per_cga path (num_ctas == 1), PTX's .reqnctapercluster handles it.
+        if launch_cluster or has_exact_cluster:
             if num_ctas > 1:
                 launch_attrs[num_attrs].id = CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION
                 launch_attrs[num_attrs].value.clusterDim.x = num_ctas
                 launch_attrs[num_attrs].value.clusterDim.y = 1
                 launch_attrs[num_attrs].value.clusterDim.z = 1
+                num_attrs += 1
+            elif has_exact_cluster:
+                launch_attrs[num_attrs].id = CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION
+                launch_attrs[num_attrs].value.clusterDim.x = clusterDimX
+                launch_attrs[num_attrs].value.clusterDim.y = clusterDimY
+                launch_attrs[num_attrs].value.clusterDim.z = clusterDimZ
                 num_attrs += 1
 
             launch_attrs[num_attrs].id = (CU_LAUNCH_ATTRIBUTE_CLUSTER_SCHEDULING_POLICY_PREFERENCE)
