@@ -406,6 +406,14 @@ struct NVGPUTestAnnotateTMAStoreWaitsPass
   }
 };
 
+static bool isInMergedEpilogueLoop(scf::ForOp forOp) {
+  for (Operation *op = forOp; op; op = op->getParentOp()) {
+    if (op->hasAttr("tt.merge_epilogue_to_computation"))
+      return true;
+  }
+  return false;
+}
+
 // ---------------------------------------------------------------------------
 // Validate TMA store annotations (safety checks)
 // ---------------------------------------------------------------------------
@@ -709,7 +717,7 @@ void doTMAStoreWaitReorder(triton::FuncOp funcOp) {
           schedule.insert(waitOp, targetStage, waitCluster);
           waitOp->moveBefore(targetWriter);
         } else if (targetWriter && !sameIteration &&
-                   forOp->hasAttr("tt.merge_epilogue_to_computation") &&
+                   isInMergedEpilogueLoop(forOp) &&
                    waitOp.getBarriers().empty() &&
                    waitOp.getBarrierPreds().empty() &&
                    waitOp.getNvwsTokens().empty() &&
