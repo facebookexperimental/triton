@@ -619,6 +619,10 @@ _BWD_DOT_ATTRS_BM128_2CTA = FrozenDotAttrs({
     "dv": {"stage": "0", "order": "3", "channels": ["opndA,tmem,1,2,64", "opndD,tmem,1,7"]},
     "dk": {"stage": "1", "order": "0", "channels": ["opndD,tmem,1,10"]},
     "dq": {"stage": "1", "order": "2", "channels": ["opndA,smem,1,8", "opndD,tmem,1,2"]},
+    # Load-only schedule anchors. These order metadata relative to the MMA
+    # operand prefetch wavefront without changing the dot execution order.
+    "m_load": {"stage": "0", "order": "2"},
+    "delta_load": {"stage": "0", "order": "4"},
 })
 
 # For BM of 128: dpT share with dq, qk share with ppT, dsT share with dpT.
@@ -738,7 +742,7 @@ def _attn_bwd_dkdv_inner(
         q = desc_q.load([(off_bh + curr_m).to(tl.int32), 0])
         qT = tl.trans(q)
     offs_m_start = off_chz + curr_m
-    m = desc_m.load([offs_m_start.to(tl.int32)])
+    m = desc_m.load([offs_m_start.to(tl.int32)], attrs=BWD_DOT_ATTRS.get("m_load") if RESCHED else None)
     if RESCHED:
         qkT = tl.dot(k, qT, attrs=BWD_DOT_ATTRS.get("qkT"), two_ctas=TWO_CTAS)
     else:
@@ -757,7 +761,7 @@ def _attn_bwd_dkdv_inner(
     ppT = ppT.to(dtype)
     if RESCHED:
         dpT = tl.dot(v, tl.trans(dot), attrs=BWD_DOT_ATTRS.get("dpT"), two_ctas=TWO_CTAS).to(tl.float32)
-        Di = desc_delta.load([offs_m_start.to(tl.int32)])
+        Di = desc_delta.load([offs_m_start.to(tl.int32)], attrs=BWD_DOT_ATTRS.get("delta_load"))
         dv += tl.dot(ppT, do, attrs=BWD_DOT_ATTRS.get("dv"), two_ctas=TWO_CTAS)
     else:
         dv += tl.dot(ppT, do)
@@ -1225,12 +1229,12 @@ def _attn_bwd_core(
     cluster_cta_rank = tl.program_id(0) % 2 if TWO_CTAS else 0
 
     k = desc_k.load([(off_bh + start_n).to(tl.int32), 0])
+    v = desc_v.load([(off_bh + start_n).to(tl.int32), 0])
     if TWO_CTAS:
         kt_start_n = start_n - cluster_cta_rank * BLOCK_N1 if TLX_DQ_LAYOUT else start_n
         kt = desc_kt.load([(off_bh + kt_start_n).to(tl.int32), 0])
     else:
         kt = k
-    v = desc_v.load([(off_bh + start_n).to(tl.int32), 0])
     num_steps = (N_CTX - start_m) // BLOCK_M1
     dk, dv = _attn_bwd_dkdv(  #
         dk,
