@@ -903,6 +903,7 @@ def _launch(a, b, bias=None, SPLIT_K=None, TILE=None):
         # Forbid AGPRs: f32 accumulators write VGPRs directly (packs tighter, no
         # v_accvgpr moves around each mfma). Essential to match the reference perf.
         llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"), ),
+        enable_sched_group_barrier_scheduler=True,
     )
     if SPLIT_K > 1:
         # Adaptive reduce tile: small outputs need many small CTAs to fill the CUs;
