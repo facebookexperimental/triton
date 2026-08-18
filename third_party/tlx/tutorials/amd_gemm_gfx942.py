@@ -20,12 +20,15 @@ What is left to tune, and what this kernel does:
   inside the noise -- because the GROUP_M swizzle already captures that reuse.
   It is kept as the standard MI300X grid transform; set ``NUM_XCDS=1`` in
   ``_configs()`` to A/B it.
-* **Autotune the tile per (M, N, K).** With 304 CUs no single tile serves both
+* **Autotune the tile and the LDS ring depth per (M, N, K).** With 304 CUs no single tile serves both
   ends: a 1024^2 output decomposes into only 16 tiles of 256x256 and leaves the
   chip idle (0.35x aten), while the 64x64 tile that wins there collapses to
   0.54x at 4096^3. Picking per shape is the single largest effect in the whole
-  kernel, and it is worth ~1.15x vs 0.35x at 1024^3. ``_prune_configs`` drops
-  tiles that overflow the LDS budget or outrun K before they are compiled.
+  kernel, and it is worth ~1.15x vs 0.35x at 1024^3. NUM_BUFFERS spans 1..3, so
+  a single-buffered ring -- what ``amd_gemm_pipelined`` is fixed at -- is one
+  point in the same search space rather than a separate kernel.
+  ``_prune_configs`` drops tiles that overflow the LDS budget or outrun K
+  before they are compiled.
 * ``matrix_instr_nonkdim=16`` -- gfx942 fp16 MFMA is ``16x16x16`` / ``32x32x8``,
   half the K of CDNA4's ``16x16x32`` / ``32x32x16``.
 
@@ -193,6 +196,23 @@ def _configs():
     4096^2 output before it saturates). BLOCK_K is mostly 32 because the 64 KB
     CDNA3 LDS budget will not hold a deep K tile at the wide end -- 256x256x64
     would want 128 KB. `_prune_configs` drops whatever does not fit.
+
+    NUM_BUFFERS spans 1..3, so the single-buffered ring is in the search space
+    as the degenerate case rather than as a separate kernel. Every iteration
+    reads and refills the same buffer (`buf = k % NUM_BUFFERS`), so depth only
+    controls whether the *next* iteration touches a different buffer and can
+    therefore issue its LDS read without waiting on this iteration's
+    write-after-read barrier.
+
+    Depth 1 turns out to win most shapes -- 8 of the 12 shape/dtype cases in the
+    perf script, including both 8192^3 and both rectangular ones -- with depth 2
+    taking 2048^3 and (fp16) 4096^3. So the extra buffer is not the lever it
+    looks like: it costs LDS linearly, and on a 64 KB budget that LDS is often
+    better spent on a wider tile. Note this also means depth is *not* what
+    separates this kernel from `amd_gemm_pipelined`, whose configs are all
+    NUM_STAGES=2 (NUM_BUFFERS=1) -- the difference is the tile space, which
+    there is sized for a 160 KB-LDS part (128x128x128, 256x256x64) and mostly
+    misfits CDNA3.
     """
     tiles = [
         (64, 64, 64, 4),
@@ -213,7 +233,7 @@ def _configs():
             # The manual LDS ring does the pipelining, so the automatic software
             # pipeliner must bail out -- which it does at num_stages=1.
             num_stages=1,
-        ) for (bm, bn, bk, warps) in tiles for gm in (4, 8) for nb in (2, 3)
+        ) for (bm, bn, bk, warps) in tiles for gm in (4, 8) for nb in (1, 2, 3)
     ]
 
 
@@ -227,9 +247,8 @@ def _prune_configs(configs, named_args, **kwargs):
         bn = config.kwargs["BLOCK_N"]
         bk = config.kwargs["BLOCK_K"]
         nb = config.kwargs["NUM_BUFFERS"]
-        # The ring reads a buffer before refilling it, so it needs >= 2 buffers,
-        # and K must supply at least that many tiles.
-        if nb < 2 or triton.cdiv(K, bk) < nb:
+        # K must supply at least one tile per buffer.
+        if triton.cdiv(K, bk) < nb:
             continue
         if lds_bytes(bm, bn, bk, nb, elem_bytes) > CDNA3_LDS_BYTES:
             continue

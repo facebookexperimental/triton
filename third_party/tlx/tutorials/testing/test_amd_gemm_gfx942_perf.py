@@ -1,11 +1,13 @@
 """Perf benchmark for the TLX MI300X (gfx942 / CDNA3) GEMM tutorial.
 
 Compares ``amd_gemm_gfx942`` against **aten** (``torch.matmul``, which dispatches
-to hipBLASLt / rocBLAS on ROCm) and, for context, the arch-generic TLX
-``amd_gemm_pipelined`` kernel.
+to hipBLASLt / rocBLAS on ROCm). There is one TLX provider, because it is a
+single autotuned TLX kernel: its NUM_BUFFERS search space spans 1..3, so the
+single-buffered ring that ``amd_gemm_pipelined`` is fixed at is one point inside
+it rather than a separate provider -- and one that frequently wins.
 
-Both kernels autotune their tile, so the first call per shape pays for the
-search. Set ``TRITON_PRINT_AUTOTUNING=1`` to see the winning config.
+The kernel autotunes, so the first call per shape pays for the search. Set
+``TRITON_PRINT_AUTOTUNING=1`` to see the winning tile and ring depth.
 
 Recommended:
     third_party/tlx/denoise.sh \
@@ -42,8 +44,6 @@ import triton  # noqa: E402
 
 from triton.language.extra.tlx.tutorials.amd_gemm_gfx942 import (  # noqa: E402
     matmul as _amd_gemm_gfx942, )
-from triton.language.extra.tlx.tutorials.amd_gemm_pipelined import (  # noqa: E402
-    matmul as _amd_gemm_pipelined, )
 
 from triton._internal_testing import is_hip_cdna3  # noqa: E402
 
@@ -52,9 +52,7 @@ DEVICE = triton.runtime.driver.active.get_active_torch_device()
 REF = "aten"
 
 MATMUL_METHODS = {
-    "gfx942": lambda a, b: _amd_gemm_gfx942(a, b),
-    # The arch-generic autotuned TLX kernel, for context.
-    "pipelined": lambda a, b: _amd_gemm_pipelined(a, b),
+    "tlx_gfx942": lambda a, b: _amd_gemm_gfx942(a, b),
 }
 
 # Square shapes plus two skinny/fat cases, which pick different tiles.
