@@ -1009,6 +1009,16 @@ class CUDABackend(BaseBackend):
                     knobs.nvidia.ws_tile_prefetch_depth,
                     tma_store_pipelining,
                 )
+                # AutoWS clones the original partial schedule into each
+                # partition. Re-schedule those cloned loops so newly inserted
+                # partition-local ops receive stages and unused stages are
+                # pruned before software-pipeline expansion.
+                # Restrict it to the 2-CTA path: on the 1-CTA path the post-WS
+                # schedule is already correct and re-running the scheduler
+                # overwrites it, which silently miscompiles kernels that have a
+                # separate epilogue-store partition.
+                if opt.cluster_dims is not None and max(opt.cluster_dims) >= 2:
+                    passes.ttgpuir.add_schedule_loops(pm, opt.num_stages, knobs.nvidia.use_meta_ws)
             passes.ttgpuir.add_pipeline(pm, opt.num_stages, dump_enabled)
             passes.ttgpuir.add_optimize_partition_warps(pm)
             if (opt.cluster_dims is not None and max(opt.cluster_dims) >= 2 and opt.allowDependentTwoCTA):
