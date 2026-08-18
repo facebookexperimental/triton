@@ -2260,6 +2260,56 @@ def test_async_amd_desc_load_correctness_gfx1250(device, M, N):
 
 
 @triton.jit
+def _async_amd_desc_load_fused_kernel(
+    a_ptr,
+    b_ptr,
+    output_ptr,
+    M: tl.constexpr,
+    N: tl.constexpr,
+):
+    a_desc = tl.make_tensor_descriptor(a_ptr, [M, N], [N, 1], [M, N])
+    b_desc = tl.make_tensor_descriptor(b_ptr, [M, N], [N, 1], [M, N])
+    a_buf = tlx.local_alloc((M, N), tl.float16, 1)
+    b_buf = tlx.local_alloc((M, N), tl.float16, 1)
+    a_smem = tlx.local_view(a_buf, 0)
+    b_smem = tlx.local_view(b_buf, 0)
+    a_desc = tlx.update_tensor_descriptor(a_desc, add_offsets=[0, 0], pred=True, clamp_bounds=True)
+    b_desc = tlx.update_tensor_descriptor(b_desc, add_offsets=[0, 0], pred=True, clamp_bounds=True)
+    token = tlx.async_amd_descriptor_load_fused([
+        (a_desc, a_smem, 0b0011),
+        (b_desc, b_smem, 0b1100),
+    ])
+    tlx.async_amd_descriptor_wait(tokens=[token])
+    result = tlx.local_load(a_smem) + tlx.local_load(b_smem)
+    offsets = tl.arange(0, M)[:, None] * N + tl.arange(0, N)[None, :]
+    tl.store(output_ptr + offsets, result)
+
+
+@pytest.mark.skipif(not is_hip(), reason="Requires HIP runtime")
+def test_async_amd_desc_load_fused_compiles_gfx1250(device):
+    """Two positioned TLX descriptors lower to one fused TDM instruction."""
+    compiled = compile_for_gfx1250(
+        _async_amd_desc_load_fused_kernel,
+        signature={"a_ptr": "*fp16", "b_ptr": "*fp16", "output_ptr": "*fp16"},
+        constexprs={"M": 16, "N": 32},
+    )
+    ttgir = compiled.asm["ttgir"]
+    assert "amdg.async_tdm_fused_copy_global_to_local" in ttgir
+    assert "warp_used_hints = array<i32: 3, 12>" in ttgir
+    assert len(re.findall(r"tensor_load_to_lds|tensor\.load\.to\.lds", compiled.asm["amdgcn"])) == 1
+
+
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
+def test_async_amd_desc_load_fused_correctness_gfx1250(device):
+    rows, cols = 16, 32
+    a = torch.randn((rows, cols), device=device, dtype=torch.float16)
+    b = torch.randn((rows, cols), device=device, dtype=torch.float16)
+    output = torch.empty_like(a)
+    _async_amd_desc_load_fused_kernel[(1, )](a, b, output, M=rows, N=cols)
+    torch.testing.assert_close(output, a + b)
+
+
+@triton.jit
 def _async_amd_desc_load_with_token_kernel(
     x_ptr,
     output_ptr,

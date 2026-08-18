@@ -12,8 +12,8 @@ if TYPE_CHECKING:
     from triton.experimental.gluon.language._core import shared_memory_descriptor
 
 __all__ = [
-    "update_tensor_descriptor", "async_load", "async_wait", "make_tensor_descriptor", "tensor_descriptor",
-    "tensor_descriptor_type", "prefetch", "async_scatter"
+    "update_tensor_descriptor", "async_load", "async_load_fused", "async_wait", "make_tensor_descriptor",
+    "tensor_descriptor", "tensor_descriptor_type", "prefetch", "async_scatter"
 ]
 
 
@@ -287,6 +287,46 @@ def async_load(src: tensor_descriptor, offsets: List[ttgl.constexpr | ttgl.tenso
 
     _semantic.builder.create_async_tdm_copy_global_to_local(src.handle, dest.handle, mbarrier_handle, cache_modifier,
                                                             warp_used_hint)
+
+
+@builtin
+def async_load_fused(members: List[Tuple[tensor_descriptor, shared_memory_descriptor, ttgl.constexpr | int]],
+                     cache_modifier="", _semantic=None) -> None:
+    """Emit one explicit fused TDM load for 2-4 descriptor/destination pairs.
+
+    Each member is ``(desc, dest, warp_used_hint)``. Descriptors must already
+    encode their tile offsets, predicates, and bounds. Member hints must be
+    legal, pairwise-disjoint bitmasks. All members share one cache modifier.
+    """
+    members = _unwrap_if_constexpr(members)
+    if not 2 <= len(members) <= 4:
+        raise ValueError(f"tdm.async_load_fused requires 2 to 4 members, got {len(members)}")
+
+    desc_handles = []
+    dest_handles = []
+    warp_used_hints = []
+    rank = None
+    for index, member in enumerate(members):
+        member = _unwrap_if_constexpr(member)
+        if len(member) != 3:
+            raise ValueError("tdm.async_load_fused members must be (desc, dest, warp_used_hint) tuples")
+        desc, dest, warp_used_hint = member
+        if not isinstance(desc, tensor_descriptor):
+            raise TypeError(f"tdm.async_load_fused member {index}: expected tensor_descriptor")
+        if rank is None:
+            rank = len(desc.block_shape)
+        if len(desc.block_shape) != rank:
+            raise ValueError("tdm.async_load_fused requires all descriptors to have the same rank")
+        warp_used_hint = _unwrap_if_constexpr(warp_used_hint)
+        if warp_used_hint is None:
+            raise ValueError(f"tdm.async_load_fused member {index}: warp_used_hint is required")
+        desc_handles.append(desc.handle)
+        dest_handles.append(dest.handle)
+        warp_used_hints.append(int(warp_used_hint))
+
+    cache_modifier = _semantic._str_to_load_cache_modifier(cache_modifier)
+    _semantic.builder.create_async_tdm_fused_copy_global_to_local(desc_handles, dest_handles, warp_used_hints,
+                                                                  cache_modifier)
 
 
 @builtin

@@ -103,6 +103,32 @@ void emitTDMLoadStore(RewriterBase &rewriter, Location loc,
                       std::optional<uint32_t> warpUsedHint = std::nullopt,
                       bool isPureForm = false);
 
+// Information required to materialize one member of a fused TDM load.
+struct TDMFusedLoadMemberInfo {
+  unsigned padInterval = 0;
+  unsigned padAmount = 0;
+  Type elementType;
+  triton::LinearLayout sharedLayout;
+  Attribute sharedEncoding;
+  SmallVector<int64_t> shapePerCTA;
+  Value multicastMask;
+  SmallVector<Value> desc;
+  SmallVector<Value> copyOffsets;
+  SmallVector<Value> dstPtrs;
+  Value pred;
+};
+
+// Emit one fused TDM load intrinsic, selecting the descriptor used by each
+// wave from the verifier-legal, pairwise-disjoint member hints.
+void emitTDMLoadFused(RewriterBase &rewriter, Location loc,
+                      const LLVMTypeConverter *typeConverter,
+                      ArrayRef<TDMFusedLoadMemberInfo> members, int numWarps,
+                      Value ctaId, int32_t auxBits,
+                      ArrayRef<uint32_t> memberHints);
+
+// Effective warp count used to build a hinted TDM descriptor.
+int getTDMEffectiveWarps(int numWarps, std::optional<uint32_t> warpUsedHint);
+
 // Returns (warpsPerCTA, numTDMInstructions) for a given shared encoding.
 // For PartitionedSharedEncodingAttr, computes a partition-aligned warp
 // distribution.  For all other encodings, falls back to the default TDM warp
