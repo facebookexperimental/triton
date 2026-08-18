@@ -11,19 +11,21 @@ What is left to tune, and what this kernel does:
 * **Size the ring to the 64 KB CDNA3 LDS budget**, not CDNA4's 160 KB. The gfx950
   kernels' 256x256 tile with 64-deep K and two buffers wants ~128 KB and cannot
   be made to fit; even 256x128x64 needs 96 KB. ``lds_bytes`` computes the
-  footprint and the launcher rejects anything over budget up front.
+  footprint and ``_prune_configs`` drops anything over budget before it is
+  compiled.
 * **Remap program ids across the 8 XCDs.** MI300X dispatches consecutive
   workgroups round-robin over the chiplets, which scatters tiles that should be
-  sharing B columns in one L2. Measured, this is **neutral** on square shapes --
-  0.86x aten with the remap vs 0.87x without at 4096^3, 0.79x vs 0.79x at
-  8192^3, i.e. inside the noise. It is kept because it is the standard MI300X
-  grid transform and the A/B is one flag away (``NUM_XCDS=1``, exposed as the
-  ``gfx942_noxcd`` provider in the perf script), but do not expect it to carry
-  this kernel -- the GROUP_M swizzle is already capturing the L2 reuse here.
-* **Choose the tile from the output shape** (``pick_config``). With 304 CUs, one
-  fixed tile cannot serve both ends: pinning the 256x256 tile costs 0.35x aten
-  at 1024^3 where the shape-aware pick gets 1.15x, and 0.51x vs 0.88x at
-  2048^3. This is the single largest effect in the whole kernel.
+  sharing B columns in one L2. Measured, this is **neutral** here -- 0.86x aten
+  with the remap vs 0.87x without at 4096^3 and 0.79x vs 0.79x at 8192^3, i.e.
+  inside the noise -- because the GROUP_M swizzle already captures that reuse.
+  It is kept as the standard MI300X grid transform; set ``NUM_XCDS=1`` in
+  ``_configs()`` to A/B it.
+* **Autotune the tile per (M, N, K).** With 304 CUs no single tile serves both
+  ends: a 1024^2 output decomposes into only 16 tiles of 256x256 and leaves the
+  chip idle (0.35x aten), while the 64x64 tile that wins there collapses to
+  0.54x at 4096^3. Picking per shape is the single largest effect in the whole
+  kernel, and it is worth ~1.15x vs 0.35x at 1024^3. ``_prune_configs`` drops
+  tiles that overflow the LDS budget or outrun K before they are compiled.
 * ``matrix_instr_nonkdim=16`` -- gfx942 fp16 MFMA is ``16x16x16`` / ``32x32x8``,
   half the K of CDNA4's ``16x16x32`` / ``32x32x16``.
 
@@ -177,115 +179,88 @@ def matmul_kernel_gfx942(
     tl.store(c_ptrs, c, mask=(offs_cm[:, None] < M) & (offs_cn[None, :] < N))
 
 
-# MI300X has 304 CUs, which is a lot of machine to fill: one 256x256 tile per
-# workgroup means a 4096^2 output is only 256 workgroups and a 1024^2 output is
-# 16. So there is no single best tile -- the default is chosen per shape.
-NUM_CUS = 304
-
-# LDS = (256*32 + 32*256) * 2 B * 2 buffers = exactly 64 KB, the whole CDNA3
-# budget. This is the arch squeeze in one line: the gfx950 kernels run the same
-# 256x256 tile at BLOCK_K=64 with room to spare, but that would want 128 KB
-# here, so K depth is what CDNA3 gives up.
-CONFIG_LARGE = {
-    "BLOCK_M": 256,
-    "BLOCK_N": 256,
-    "BLOCK_K": 32,
-    "GROUP_M": 4,
-    "NUM_BUFFERS": 2,
-    "num_warps": 8,
-    "waves_per_eu": 0,
-}
-
-# 32 KB. The all-rounder: BLOCK_K can go back to 64 once the tile is smaller.
-CONFIG_MEDIUM = {
-    "BLOCK_M": 128,
-    "BLOCK_N": 128,
-    "BLOCK_K": 64,
-    "GROUP_M": 4,
-    "NUM_BUFFERS": 2,
-    "num_warps": 8,
-    "waves_per_eu": 0,
-}
-
-# 16 KB, 4 warps. For outputs too small to fill the chip any other way.
-CONFIG_SMALL = {
-    "BLOCK_M": 64,
-    "BLOCK_N": 64,
-    "BLOCK_K": 64,
-    "GROUP_M": 4,
-    "NUM_BUFFERS": 2,
-    "num_warps": 4,
-    "waves_per_eu": 0,
-}
-
-# Kept as the name the perf script pins when it wants one fixed tile.
-DEFAULT_CONFIG = CONFIG_LARGE
+def lds_bytes(block_m, block_n, block_k, num_buffers, elem_bytes=2):
+    """LDS footprint of a tile, ignoring shared-layout padding."""
+    return (block_m * block_k + block_k * block_n) * elem_bytes * num_buffers
 
 
-def pick_config(M, N):
-    """Choose a tile for an MxN output, keyed on how much of the chip it fills.
+def _configs():
+    """Tiles worth trying on MI300X.
 
-    The threshold is the count of 256x256 tiles the output decomposes into,
-    against the 304 CUs. Measured on MI300X fp16 (TFLOPS as a fraction of aten;
-    the winner per row is what this function returns):
-
-        M     N     K   256-tiles  256x256x32/W8  128x128x64/W8  64x64x64/W4
-      1024  1024  1024         16         0.35x         0.86x        1.20x
-      1536  1536  1536         36         0.38x         0.94x        0.90x
-      2048  2048  2048         64         0.48x         0.86x        0.68x
-      3072  3072  3072        144         0.70x         0.80x        0.64x
-      4096  4096  4096        256         0.82x         0.60x        0.54x
-      8192  8192  8192       1024         0.79x           --           --
-
-    Known gap: on strongly rectangular shapes (1024x8192x8192, 8192x1024x8192,
-    both 128 tiles) this picks the medium tile for ~0.65x, where a 128x128x32
-    tile at 4 warps measures ~0.74x. Rather than special-case the aspect ratio,
-    pass an explicit config -- or run
-    ``test_amd_gemm_gfx942_perf.py --sweep --sweep-shape M N K``.
+    Deliberately small: MI300X has 304 CUs, so the useful range runs from a
+    64x64 tile (enough workgroups to fill the chip on a 1024^2 output, which
+    only decomposes into 16 tiles of 256x256) up to 256x256 (which needs a
+    4096^2 output before it saturates). BLOCK_K is mostly 32 because the 64 KB
+    CDNA3 LDS budget will not hold a deep K tile at the wide end -- 256x256x64
+    would want 128 KB. `_prune_configs` drops whatever does not fit.
     """
-    tiles_256 = triton.cdiv(M, 256) * triton.cdiv(N, 256)
-    if tiles_256 >= NUM_CUS - 48:  # ~a full wave of 256x256 workgroups
-        return CONFIG_LARGE
-    if tiles_256 <= 16:
-        return CONFIG_SMALL
-    return CONFIG_MEDIUM
+    tiles = [
+        (64, 64, 64, 4),
+        (128, 128, 32, 4),
+        (128, 128, 32, 8),
+        (128, 128, 64, 8),
+        (256, 128, 32, 8),
+        (128, 256, 32, 8),
+        (256, 256, 32, 8),
+    ]
+    return [
+        triton.Config(
+            {
+                "BLOCK_M": bm, "BLOCK_N": bn, "BLOCK_K": bk, "GROUP_M": gm, "NUM_BUFFERS": nb, "NUM_XCDS": NUM_XCDS,
+                "waves_per_eu": 0
+            },
+            num_warps=warps,
+            # The manual LDS ring does the pipelining, so the automatic software
+            # pipeliner must bail out -- which it does at num_stages=1.
+            num_stages=1,
+        ) for (bm, bn, bk, warps) in tiles for gm in (4, 8) for nb in (2, 3)
+    ]
 
 
-def lds_bytes(config, elem_bytes=2):
-    """LDS footprint of a config, ignoring shared-layout padding."""
-    per_buffer = (config["BLOCK_M"] * config["BLOCK_K"] + config["BLOCK_K"] * config["BLOCK_N"]) * elem_bytes
-    return per_buffer * config["NUM_BUFFERS"]
+def _prune_configs(configs, named_args, **kwargs):
+    """Drop tiles that cannot run on this shape before anything is compiled."""
+    K = named_args["K"]
+    elem_bytes = named_args["a_ptr"].element_size()
+    kept = []
+    for config in configs:
+        bm = config.kwargs["BLOCK_M"]
+        bn = config.kwargs["BLOCK_N"]
+        bk = config.kwargs["BLOCK_K"]
+        nb = config.kwargs["NUM_BUFFERS"]
+        # The ring reads a buffer before refilling it, so it needs >= 2 buffers,
+        # and K must supply at least that many tiles.
+        if nb < 2 or triton.cdiv(K, bk) < nb:
+            continue
+        if lds_bytes(bm, bn, bk, nb, elem_bytes) > CDNA3_LDS_BYTES:
+            continue
+        kept.append(config)
+    if not kept:
+        raise RuntimeError(f"No config fits K={K} within the {CDNA3_LDS_BYTES} B gfx942 LDS budget")
+    return kept
+
+
+matmul_kernel_gfx942 = triton.autotune(
+    configs=_configs(),
+    key=["M", "N", "K"],
+    prune_configs_by={"early_config_prune": _prune_configs},
+)(matmul_kernel_gfx942)
 
 
 def matmul(a: torch.Tensor, b: torch.Tensor, config=None) -> torch.Tensor:
-    """C = A @ B on AMD MI300X (gfx942). ``config=None`` picks a tile by shape."""
+    """C = A @ B on AMD MI300X (gfx942).
+
+    ``config`` is accepted for a uniform launcher signature across the tutorials
+    and is intentionally unused -- the tile is autotuned per (M, N, K). Set
+    ``TRITON_PRINT_AUTOTUNING=1`` to see which one wins.
+    """
     assert a.shape[1] == b.shape[0], f"K mismatch: A={tuple(a.shape)}, B={tuple(b.shape)}"
     assert a.is_contiguous(), "Matrix A must be contiguous"
     assert a.dtype == b.dtype, "A and B must have the same dtype"
 
     M, K = a.shape
     _, N = b.shape
-    if config is None:
-        config = pick_config(M, N)
-
-    BLOCK_M = config["BLOCK_M"]
-    BLOCK_N = config["BLOCK_N"]
-    BLOCK_K = config["BLOCK_K"]
-    GROUP_M = config.get("GROUP_M", 8)
-    NUM_BUFFERS = config.get("NUM_BUFFERS", 2)
-    num_warps = config.get("num_warps", 8)
-    waves_per_eu = config.get("waves_per_eu", 0)
-    num_xcds = config.get("NUM_XCDS", NUM_XCDS)
-
-    assert NUM_BUFFERS >= 2, "The ring reads a buffer before refilling it, so it needs >= 2 buffers"
-    assert triton.cdiv(K, BLOCK_K) >= NUM_BUFFERS, \
-        f"K={K} has fewer than NUM_BUFFERS={NUM_BUFFERS} tiles of BLOCK_K={BLOCK_K}"
-    used = lds_bytes(config, a.element_size())
-    assert used <= CDNA3_LDS_BYTES, \
-        f"config needs {used} B of LDS, over the {CDNA3_LDS_BYTES} B gfx942 budget"
-
     c = torch.empty((M, N), device=a.device, dtype=a.dtype)
-    grid = (triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N), )
+    grid = lambda META: (triton.cdiv(M, META["BLOCK_M"]) * triton.cdiv(N, META["BLOCK_N"]), )
     matmul_kernel_gfx942[grid](
         a,
         b,
@@ -299,18 +274,7 @@ def matmul(a: torch.Tensor, b: torch.Tensor, config=None) -> torch.Tensor:
         b.stride(1),
         c.stride(0),
         c.stride(1),
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
-        BLOCK_K=BLOCK_K,
-        GROUP_M=GROUP_M,
-        NUM_BUFFERS=NUM_BUFFERS,
-        NUM_XCDS=num_xcds,
-        num_warps=num_warps,
-        # The manual ring does the pipelining, so the automatic software
-        # pipeliner must bail out -- which it does at num_stages=1.
-        num_stages=1,
         # 16x16x16 MFMA on gfx942 fp16.
         matrix_instr_nonkdim=16,
-        waves_per_eu=waves_per_eu,
     )
     return c
