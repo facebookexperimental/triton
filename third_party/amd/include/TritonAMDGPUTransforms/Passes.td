@@ -541,7 +541,7 @@ def TritonAMDGPUApplyPlanSchedule
 
 def TritonAMDGPUApplyPlanPipeline
     : Pass<"tritonamdgpu-apply-plan-pipeline", "mlir::ModuleOp"> {
-  let summary = "Apply an existing-LDS cross-iteration pipeline plan";
+  let summary = "Apply an LDS pipeline or single-slot staging plan";
 
   let description = [{
     Runs immediately before update_async_wait_count. It resolves a
@@ -550,9 +550,10 @@ def TritonAMDGPUApplyPlanPipeline
     scheduler, and reorders selected producer families. For an existing,
     canonical LDS ring it can also resize the leading ring dimension, rewrite
     producer/consumer modulo slots, derive partial-wait counts, and insert
-    missing visibility/release barriers. It rebuilds the strict value graph and
-    DDG after mutation. It never creates new staging or changes dot
-    decomposition.
+    missing visibility/release barriers. M1.5b.4a additionally materializes a
+    single-slot register-to-LDS path for a produced tensor whose complete set
+    of direct in-loop consumers is named by the plan. It rebuilds the strict
+    value graph and DDG after mutation and never changes dot decomposition.
   }];
 
   let options = [

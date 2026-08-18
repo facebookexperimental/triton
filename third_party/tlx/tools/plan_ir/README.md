@@ -1,6 +1,6 @@
 # AMD TLX Plan IR prototype
 
-This directory implements M1.1--M1.5b.3 of the profile-guided TLX scheduling
+This directory implements M1.1--M1.5b.4a of the profile-guided TLX scheduling
 design without changing the existing TLX kernels. M1.5b.2 reuses and extends
 Meta's shared modulo-scheduling DDG through backend-neutral APIs.
 
@@ -56,11 +56,20 @@ Meta's shared modulo-scheduling DDG through backend-neutral APIs.
   hazards, resources, and a second DDG; acceptance requires the requested
   depth/distance, no open important fact, no LDS reuse hazard, a legal modulo
   schedule, and an unchanged dot contract.
+- **M1.5b.4a — single-slot register-to-LDS staging:** the native pass resolves
+  a produced tensor and its complete set of direct in-loop consumers, checks
+  known size, alignment, layout preservation, and target LDS capacity, then
+  inserts a typed mutable LDS allocation, local store/load, and visibility and
+  release barriers. It re-extracts Plan IR, proves that the original register
+  value ends at the store, verifies the rebuilt distance-zero DDG, and freezes
+  the dot/scheduled-MFMA contract.
 
 M1.5a lowers only verified intra-iteration schedule permutations. M1.5b.1
 validates cross-iteration intent. M1.5b.2 applies schedules already represented
 by an existing ring. M1.5b.3 changes depth/distance and synchronization only
-for that existing ring. Creating new LDS staging remains M1.5b.4.
+for that existing ring. M1.5b.4a introduces synchronous single-slot
+`register_to_lds`; buffered staging, derived-use rewriting, mixed ring/staging
+plans, and `global_to_lds` remain later M1.5b.4 work.
 
 ## Reproduction
 
@@ -178,6 +187,13 @@ readers and writers of the existing root are selected and directly indexed. It
 rejects capacity overflow and new-staging intents. Its report records LDS bytes,
 rewritten slots, waits/barriers, pre/post fingerprints, the post-rewrite audit,
 and second-DDG verification.
+
+A staging-only loop may instead contain one or more `register_to_lds` entries
+with `buffer_depth: 1`. M1.5b.4a requires a produced ranked tensor, all direct
+uses and named consumers in the selected `scf.for`, known logical bytes, and a
+power-of-two alignment. The report uses
+`materialization_scope: register_to_lds_staging` and records the new staging
+and synchronization changes.
 
 The fixed configuration names and kernel symbols are sourced from
 `third_party/tlx/tutorials/amd_fa_bwd.py`:

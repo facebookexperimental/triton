@@ -450,7 +450,8 @@ static void addStructuredLineage(
 
 FailureOr<PlanValueGraph> PlanValueGraph::build(
     FuncOp function,
-    llvm::DenseMap<Operation *, std::string> *operationBindings) {
+    llvm::DenseMap<Operation *, std::string> *operationBindings,
+    llvm::DenseMap<Value, std::string> *valueBindings) {
   PlanValueGraph graph;
   graph.functionName = function.getName().str();
 
@@ -677,6 +678,8 @@ FailureOr<PlanValueGraph> PlanValueGraph::build(
     return failure();
   if (operationBindings)
     *operationBindings = operationIds;
+  if (valueBindings)
+    *valueBindings = valueIds;
   return graph;
 }
 

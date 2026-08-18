@@ -78,6 +78,35 @@
 // RUN: not triton-opt %s \
 // RUN:   -tritonamdgpu-apply-plan-pipeline='input-path=%t.pipeline.invalid.json strict=true' \
 // RUN:   2>&1 | FileCheck %s --check-prefix=PIPELINE-REJECT
+// RUN: python3 -c "import json; p=json.load(open('%t.pipeline.plan.json')); f=next(x for x in p['functions'] if x['function']=='register_to_lds_staging'); ops={x['id']:x['kind'] for x in f['operations']}; v=next(x for x in f['values'] if ops.get(x['origin'].get('operation'))=='arith.addf' and {ops[u['operation']] for u in x['uses']}=={'arith.mulf','arith.subf'}); l=next(x['id'] for x in f['operations'] if x['kind']=='scf.for'); cs=sorted({u['operation'] for u in v['uses']}); d={'schema_version':'plan-pipeline-delta/0.1','kernel':f['function'],'input_value_graph_fingerprint':f['semantic_fingerprint'],'pass_position':'before_update_async_wait_count','loops':[{'loop':l,'transactions':[],'staging':[{'value':v['id'],'action':'register_to_lds','consumers':cs,'buffer_depth':1,'alignment':16}]}]}; open('%t.pipeline.staging.json','w').write(json.dumps(d))"
+// RUN: TRITON_USE_MODULO_SCHEDULE=1 triton-opt %s \
+// RUN:   -tritonamdgpu-apply-plan-pipeline='input-path=%t.pipeline.staging.json report-path=%t.pipeline.staging.report.json strict=true' \
+// RUN:   | FileCheck %s --check-prefix=PIPELINE-STAGING
+// RUN: FileCheck %s --check-prefix=PIPELINE-STAGING-REPORT < %t.pipeline.staging.report.json
+// RUN: python3 -c "import json; p=json.load(open('%t.pipeline.staging.json')); p['loops'][0]['staging'][0]['consumers'].pop(); open('%t.pipeline.staging.incomplete.json','w').write(json.dumps(p))"
+// RUN: not triton-opt %s \
+// RUN:   -tritonamdgpu-apply-plan-pipeline='input-path=%t.pipeline.staging.incomplete.json strict=true' \
+// RUN:   2>&1 | FileCheck %s --check-prefix=PIPELINE-STAGING-INCOMPLETE
+// RUN: python3 -c "import json; d=json.load(open('%t.pipeline.staging.json')); p=json.load(open('%t.pipeline.plan.json')); f=next(x for x in p['functions'] if x['function']=='register_to_lds_staging'); value=next(x for x in f['values'] if x['id']==d['loops'][0]['staging'][0]['value']); producer=value['origin']['operation']; selected=set(d['loops'][0]['staging'][0]['consumers']); extra=next(x['id'] for x in f['operations'] if x['kind']=='arith.addf' and x['id'] != producer and x['id'] not in selected); d['loops'][0]['staging'][0]['consumers'].append(extra); open('%t.pipeline.staging.nonuse.json','w').write(json.dumps(d))"
+// RUN: not triton-opt %s \
+// RUN:   -tritonamdgpu-apply-plan-pipeline='input-path=%t.pipeline.staging.nonuse.json strict=true' \
+// RUN:   2>&1 | FileCheck %s --check-prefix=PIPELINE-STAGING-NONUSE
+// RUN: python3 -c "import json; p=json.load(open('%t.pipeline.staging.json')); p['loops'][0]['staging'][0]['buffer_depth']=2; open('%t.pipeline.staging.depth.json','w').write(json.dumps(p))"
+// RUN: not triton-opt %s \
+// RUN:   -tritonamdgpu-apply-plan-pipeline='input-path=%t.pipeline.staging.depth.json strict=true' \
+// RUN:   2>&1 | FileCheck %s --check-prefix=PIPELINE-STAGING-DEPTH
+// RUN: python3 -c "import json; p=json.load(open('%t.pipeline.staging.json')); p['loops'][0]['staging'][0]['alignment']=12; open('%t.pipeline.staging.alignment.json','w').write(json.dumps(p))"
+// RUN: not triton-opt %s \
+// RUN:   -tritonamdgpu-apply-plan-pipeline='input-path=%t.pipeline.staging.alignment.json strict=true' \
+// RUN:   2>&1 | FileCheck %s --check-prefix=PIPELINE-STAGING-ALIGNMENT
+// RUN: python3 -c "import json; p=json.load(open('%t.pipeline.plan.json')); f=next(x for x in p['functions'] if x['function']=='register_to_lds_capacity'); ops={x['id']:x['kind'] for x in f['operations']}; v=next(x for x in f['values'] if ops.get(x['origin'].get('operation'))=='arith.addf'); l=next(x['id'] for x in f['operations'] if x['kind']=='scf.for'); cs=sorted({u['operation'] for u in v['uses']}); d={'schema_version':'plan-pipeline-delta/0.1','kernel':f['function'],'input_value_graph_fingerprint':f['semantic_fingerprint'],'pass_position':'before_update_async_wait_count','loops':[{'loop':l,'transactions':[],'staging':[{'value':v['id'],'action':'register_to_lds','consumers':cs,'buffer_depth':1,'alignment':16}]}]}; open('%t.pipeline.staging.capacity.json','w').write(json.dumps(d))"
+// RUN: not triton-opt %s \
+// RUN:   -tritonamdgpu-apply-plan-pipeline='input-path=%t.pipeline.staging.capacity.json strict=true' \
+// RUN:   2>&1 | FileCheck %s --check-prefix=PIPELINE-STAGING-CAPACITY
+// RUN: python3 -c "import json; p=json.load(open('%t.pipeline.plan.json')); f=next(x for x in p['functions'] if x['function']=='register_to_lds_scalar'); ops={x['id']:x['kind'] for x in f['operations']}; v=next(x for x in f['values'] if ops.get(x['origin'].get('operation'))=='arith.index_cast'); l=next(x['id'] for x in f['operations'] if x['kind']=='scf.for'); cs=sorted({u['operation'] for u in v['uses']}); d={'schema_version':'plan-pipeline-delta/0.1','kernel':f['function'],'input_value_graph_fingerprint':f['semantic_fingerprint'],'pass_position':'before_update_async_wait_count','loops':[{'loop':l,'transactions':[],'staging':[{'value':v['id'],'action':'register_to_lds','consumers':cs,'buffer_depth':1,'alignment':4}]}]}; open('%t.pipeline.staging.scalar.json','w').write(json.dumps(d))"
+// RUN: not triton-opt %s \
+// RUN:   -tritonamdgpu-apply-plan-pipeline='input-path=%t.pipeline.staging.scalar.json strict=true' \
+// RUN:   2>&1 | FileCheck %s --check-prefix=PIPELINE-STAGING-SCALAR
 //
 // Modulo runs before the guarded legacy scheduler. A successful modulo schedule
 // is preserved; the standard AMD pipeline lowers and expands it.
@@ -196,6 +225,32 @@
 // PIPELINE-NO-BARRIERS-REPORT: "inserted_barriers": 2
 // PIPELINE-NO-BARRIERS-REPORT: "post_rewrite_audit_passed": true
 // PIPELINE-REJECT: requested LDS ring depths exceed the target LDS capacity
+// PIPELINE-STAGING-LABEL: tt.func @register_to_lds_staging
+// PIPELINE-STAGING: ttg.local_alloc {{.*}}alignment = 16
+// PIPELINE-STAGING: scf.for
+// PIPELINE-STAGING: arith.addf
+// PIPELINE-STAGING-NEXT: ttg.local_store
+// PIPELINE-STAGING-NEXT: ttg.barrier
+// PIPELINE-STAGING-NEXT: ttg.local_load
+// PIPELINE-STAGING: arith.mulf
+// PIPELINE-STAGING: arith.subf
+// PIPELINE-STAGING-NEXT: ttg.barrier
+// PIPELINE-STAGING: ttg.local_dealloc
+// PIPELINE-STAGING-REPORT-DAG: "accepted": true
+// PIPELINE-STAGING-REPORT-DAG: "changes_iteration_storage": true
+// PIPELINE-STAGING-REPORT-DAG: "changes_synchronization": true
+// PIPELINE-STAGING-REPORT-DAG: "changes_new_staging": true
+// PIPELINE-STAGING-REPORT-DAG: "staging_mutations": 1
+// PIPELINE-STAGING-REPORT-DAG: "inserted_barriers": 2
+// PIPELINE-STAGING-REPORT-DAG: "post_rewrite_ddg_verified": true
+// PIPELINE-STAGING-REPORT-DAG: "post_rewrite_audit_passed": true
+// PIPELINE-STAGING-REPORT-DAG: "materialization_scope": "register_to_lds_staging"
+// PIPELINE-STAGING-INCOMPLETE: M1.5b.4a requires all direct in-loop uses to be selected
+// PIPELINE-STAGING-NONUSE: named register-to-LDS consumer does not use the staged value
+// PIPELINE-STAGING-DEPTH: M1.5b.4a supports only single-slot register staging
+// PIPELINE-STAGING-ALIGNMENT: pipeline staging alignment must be a power of two
+// PIPELINE-STAGING-CAPACITY: register-to-LDS staging exceeds the target LDS capacity
+// PIPELINE-STAGING-SCALAR: register-to-LDS staging requires a produced ranked tensor
 
 #mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [2, 2], instrShape = [16, 16, 32], isTransposed = true}>
 #dot0 = #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 8}>
@@ -302,6 +357,49 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
     %wait = ttg.async_wait %outer_commit {num = 0 : i32}
     ttg.barrier all
     ttg.local_dealloc %alloc : !ttg.memdesc<16x16xf16, #slot_shared, #smem, mutable>
+    tt.return
+  }
+
+  tt.func @register_to_lds_staging(
+      %input: tensor<16x16xf16, #slot_blocked>)
+      -> tensor<16x16xf16, #slot_blocked> {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c4 = arith.constant 4 : index
+    %result = scf.for %i = %c0 to %c4 step %c1
+        iter_args(%iter = %input) -> tensor<16x16xf16, #slot_blocked> {
+      %producer = arith.addf %iter, %input : tensor<16x16xf16, #slot_blocked>
+      %left = arith.mulf %producer, %producer : tensor<16x16xf16, #slot_blocked>
+      %right = arith.subf %producer, %input : tensor<16x16xf16, #slot_blocked>
+      %combined = arith.addf %left, %right : tensor<16x16xf16, #slot_blocked>
+      scf.yield %combined : tensor<16x16xf16, #slot_blocked>
+    }
+    tt.return %result : tensor<16x16xf16, #slot_blocked>
+  }
+
+  tt.func @register_to_lds_capacity(
+      %input: tensor<256x256xf16, #slot_blocked>)
+      -> tensor<256x256xf16, #slot_blocked> {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c4 = arith.constant 4 : index
+    %result = scf.for %i = %c0 to %c4 step %c1
+        iter_args(%iter = %input) -> tensor<256x256xf16, #slot_blocked> {
+      %producer = arith.addf %iter, %input : tensor<256x256xf16, #slot_blocked>
+      %consumer = arith.mulf %producer, %producer : tensor<256x256xf16, #slot_blocked>
+      scf.yield %consumer : tensor<256x256xf16, #slot_blocked>
+    }
+    tt.return %result : tensor<256x256xf16, #slot_blocked>
+  }
+
+  tt.func @register_to_lds_scalar() {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c4 = arith.constant 4 : index
+    scf.for %i = %c0 to %c4 step %c1 {
+      %value = arith.index_cast %i : index to i32
+      %consumer = arith.addi %value, %value : i32
+    }
     tt.return
   }
 

@@ -2,7 +2,9 @@
 
 #include "llvm/Support/FormatVariadic.h"
 #include "llvm/Support/JSON.h"
+#include "llvm/Support/MathExtras.h"
 #include "llvm/Support/raw_ostream.h"
+#include <limits>
 #include <set>
 
 namespace mlir::triton::plan {
@@ -28,6 +30,33 @@ static bool readPositiveInteger(const llvm::json::Object &object, StringRef key,
     return false;
   }
   destination = *value;
+  return true;
+}
+
+static bool readStringArray(const llvm::json::Object &object, StringRef key,
+                            std::vector<std::string> &destination,
+                            std::string &error) {
+  const llvm::json::Array *values = object.getArray(key);
+  if (!values || values->empty()) {
+    error = "pipeline delta field '" + key.str() +
+            "' must be a non-empty string array";
+    return false;
+  }
+  std::set<std::string> unique;
+  for (const llvm::json::Value &value : *values) {
+    std::optional<StringRef> text = value.getAsString();
+    if (!text) {
+      error =
+          "pipeline delta field '" + key.str() + "' must contain only strings";
+      return false;
+    }
+    if (!unique.insert(text->str()).second) {
+      error =
+          "pipeline delta field '" + key.str() + "' contains a duplicate value";
+      return false;
+    }
+    destination.push_back(text->str());
+  }
   return true;
 }
 
@@ -82,51 +111,93 @@ FailureOr<PlanPipelineDelta> parsePlanPipelineDelta(StringRef payload,
       error = "pipeline delta repeats loop '" + loop.loopId + "'";
       return failure();
     }
-    const llvm::json::Array *staging = loopObject->getArray("staging");
-    if (staging && !staging->empty()) {
-      error = "M1.5b.3 does not materialize new staging";
-      return failure();
-    }
     const llvm::json::Array *transactions =
         loopObject->getArray("transactions");
-    if (!transactions || transactions->empty()) {
-      error = "M1.5b.3 loop must contain at least one transaction group";
+    const llvm::json::Array *staging = loopObject->getArray("staging");
+    if ((!transactions || transactions->empty()) &&
+        (!staging || staging->empty())) {
+      error = "pipeline loop must contain a transaction or staging intent";
       return failure();
     }
     std::set<std::string> groupIds;
-    for (const llvm::json::Value &transactionValue : *transactions) {
-      const llvm::json::Object *transactionObject =
-          transactionValue.getAsObject();
-      if (!transactionObject) {
-        error = "pipeline transaction must be a JSON object";
-        return failure();
+    if (transactions) {
+      for (const llvm::json::Value &transactionValue : *transactions) {
+        const llvm::json::Object *transactionObject =
+            transactionValue.getAsObject();
+        if (!transactionObject) {
+          error = "pipeline transaction must be a JSON object";
+          return failure();
+        }
+        PlanPipelineTransactionIntent transaction;
+        if (!readString(*transactionObject, "group", transaction.groupId,
+                        error) ||
+            !readString(*transactionObject, "action", transaction.action,
+                        error) ||
+            !readPositiveInteger(*transactionObject, "distance",
+                                 transaction.distance, error) ||
+            !readPositiveInteger(*transactionObject, "buffer_depth",
+                                 transaction.bufferDepth, error))
+          return failure();
+        if (transaction.action != "set_prefetch_distance") {
+          error = "unsupported pipeline transaction action '" +
+                  transaction.action + "'";
+          return failure();
+        }
+        if (transaction.bufferDepth < transaction.distance) {
+          error = "pipeline transaction buffer depth cannot be less than "
+                  "prefetch distance";
+          return failure();
+        }
+        if (!groupIds.insert(transaction.groupId).second) {
+          error = "pipeline delta repeats async group '" + transaction.groupId +
+                  "'";
+          return failure();
+        }
+        loop.transactions.push_back(std::move(transaction));
       }
-      PlanPipelineTransactionIntent transaction;
-      if (!readString(*transactionObject, "group", transaction.groupId,
-                      error) ||
-          !readString(*transactionObject, "action", transaction.action,
-                      error) ||
-          !readPositiveInteger(*transactionObject, "distance",
-                               transaction.distance, error) ||
-          !readPositiveInteger(*transactionObject, "buffer_depth",
-                               transaction.bufferDepth, error))
-        return failure();
-      if (transaction.action != "set_prefetch_distance") {
-        error = "unsupported pipeline transaction action '" +
-                transaction.action + "'";
-        return failure();
+    }
+    std::set<std::string> stagedValues;
+    if (staging) {
+      for (const llvm::json::Value &stagingValue : *staging) {
+        const llvm::json::Object *stagingObject = stagingValue.getAsObject();
+        if (!stagingObject) {
+          error = "pipeline staging intent must be a JSON object";
+          return failure();
+        }
+        PlanPipelineStagingIntent intent;
+        if (!readString(*stagingObject, "value", intent.valueId, error) ||
+            !readString(*stagingObject, "action", intent.action, error) ||
+            !readStringArray(*stagingObject, "consumers", intent.consumerIds,
+                             error) ||
+            !readPositiveInteger(*stagingObject, "buffer_depth",
+                                 intent.bufferDepth, error) ||
+            !readPositiveInteger(*stagingObject, "alignment", intent.alignment,
+                                 error))
+          return failure();
+        if (intent.action != "register_to_lds") {
+          error = "M1.5b.4a supports only register_to_lds staging";
+          return failure();
+        }
+        if (intent.bufferDepth != 1) {
+          error = "M1.5b.4a supports only single-slot register staging";
+          return failure();
+        }
+        if (!llvm::isPowerOf2_64(intent.alignment)) {
+          error = "pipeline staging alignment must be a power of two";
+          return failure();
+        }
+        if (intent.alignment > std::numeric_limits<int32_t>::max()) {
+          error = "pipeline staging alignment exceeds the native attribute "
+                  "range";
+          return failure();
+        }
+        if (!stagedValues.insert(intent.valueId).second) {
+          error =
+              "pipeline delta repeats staged value '" + intent.valueId + "'";
+          return failure();
+        }
+        loop.staging.push_back(std::move(intent));
       }
-      if (transaction.bufferDepth < transaction.distance) {
-        error = "pipeline transaction buffer depth cannot be less than "
-                "prefetch distance";
-        return failure();
-      }
-      if (!groupIds.insert(transaction.groupId).second) {
-        error =
-            "pipeline delta repeats async group '" + transaction.groupId + "'";
-        return failure();
-      }
-      loop.transactions.push_back(std::move(transaction));
     }
     delta.loops.push_back(std::move(loop));
   }
@@ -149,6 +220,7 @@ serializePlanPipelineApplyReport(const PlanPipelineApplyResult &result) {
         {"imported_dependencies", loop.importedDependencyCount},
         {"skipped_inconsistent_dependencies", loop.skippedDependencyCount},
         {"ring_mutations", loop.ringMutationCount},
+        {"staging_mutations", loop.stagingMutationCount},
         {"rewritten_slot_indices", loop.rewrittenSlotIndexCount},
         {"updated_waits", loop.updatedWaitCount},
         {"inserted_barriers", loop.insertedBarrierCount},
@@ -174,10 +246,12 @@ serializePlanPipelineApplyReport(const PlanPipelineApplyResult &result) {
       {"changes_synchronization", result.changesSynchronization},
       {"changes_prefetch_distance", result.changesPrefetchDistance},
       {"changes_buffer_depth", result.changesBufferDepth},
+      {"changes_new_staging", result.changesNewStaging},
       {"changes_dot_decomposition", false},
       {"post_rewrite_audit_passed", result.postRewriteAuditPassed},
       {"materialization_scope",
-       result.changesIterationStorage || result.changesSynchronization
+       result.changesNewStaging ? "register_to_lds_staging"
+       : result.changesIterationStorage || result.changesSynchronization
            ? "existing_lds_ring_and_sync"
            : "existing_lds_operation_order"},
   };

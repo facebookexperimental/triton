@@ -1,4 +1,5 @@
 #include "PlanRingMaterializer.h"
+#include "PlanStagingMaterializer.h"
 #include "TritonAMDGPUTransforms/Passes.h"
 
 #include "mlir/Dialect/SCF/IR/SCF.h"
@@ -21,6 +22,7 @@
 #include "llvm/Support/Path.h"
 #include "llvm/Support/ToolOutputFile.h"
 #include <algorithm>
+#include <limits>
 #include <map>
 #include <set>
 #include <tuple>
@@ -76,6 +78,7 @@ struct ResolvedLoopPipeline {
   SmallVector<Operation *> desiredOrder;
   SmallVector<tta::PlanExistingLdsRingMutation, 1> ringMutations;
   SmallVector<tta::PlanAsyncWaitMutation, 2> waitMutations;
+  SmallVector<tta::PlanRegisterToLdsStaging, 1> stagingMutations;
   tt::plan::PlanPipelineLoopApplyRecord record;
 };
 
@@ -228,9 +231,9 @@ getRingSlotExpression(ArrayRef<tt::plan::PlanSlotPath> paths, StringRef root,
   return found;
 }
 
-static std::optional<int64_t> getSlotDistance(
-    const tt::plan::PlanSlotExpression &producer,
-    const tt::plan::PlanSlotExpression &consumer, int64_t depth) {
+static std::optional<int64_t>
+getSlotDistance(const tt::plan::PlanSlotExpression &producer,
+                const tt::plan::PlanSlotExpression &consumer, int64_t depth) {
   if (depth <= 1 || producer.baseValueId != consumer.baseValueId ||
       producer.coefficient != consumer.coefficient ||
       producer.modulus != depth || consumer.modulus != depth)
@@ -259,10 +262,9 @@ static FailureOr<int64_t> resolveExistingRingConsumers(
       if (access.effect != "read" || !containsId(access.rootValueIds, root))
         continue;
       auto operationIt = operationById.find(access.operationId);
-      Operation *consumer =
-          operationIt == operationById.end()
-              ? nullptr
-              : projectToLoopBody(operationIt->second, loop);
+      Operation *consumer = operationIt == operationById.end()
+                                ? nullptr
+                                : projectToLoopBody(operationIt->second, loop);
       if (!consumer)
         continue;
       ttg::MemDescIndexOp view = getRootedIndexView(consumer, allocation);
@@ -368,6 +370,7 @@ static LogicalResult
 resolveLoopPipeline(const tt::plan::PlanLoopPipelineDelta &requested,
                     scf::ForOp loop, const tt::plan::PlanValueGraph &graph,
                     const std::map<std::string, Operation *> &operationById,
+                    const std::map<std::string, Value> &valueById,
                     ResolvedLoopPipeline &resolved, std::string &error) {
   resolved.loop = loop;
   resolved.record.loopId = requested.loopId;
@@ -384,6 +387,114 @@ resolveLoopPipeline(const tt::plan::PlanLoopPipelineDelta &requested,
   for (const auto &intent : requested.transactions)
     requestedGroups.insert(intent.groupId);
 
+  if (!requested.transactions.empty() && !requested.staging.empty()) {
+    error = "M1.5b.4a does not combine new staging with existing-ring "
+            "transactions";
+    return failure();
+  }
+
+  std::map<std::string, const tt::plan::PlanValueRecord *> valueRecordById;
+  for (const tt::plan::PlanValueRecord &value : graph.getValues())
+    valueRecordById[value.id] = &value;
+
+  llvm::DenseSet<Operation *> stagingOperations;
+  int64_t stagingBytes = 0;
+  for (const tt::plan::PlanPipelineStagingIntent &intent : requested.staging) {
+    auto valueIt = valueById.find(intent.valueId);
+    auto recordIt = valueRecordById.find(intent.valueId);
+    if (valueIt == valueById.end() || recordIt == valueRecordById.end()) {
+      error = "pipeline staging intent refers to an unknown value";
+      return failure();
+    }
+    Value source = valueIt->second;
+    auto tensorType = dyn_cast<RankedTensorType>(source.getType());
+    Operation *producer = source.getDefiningOp();
+    if (!tensorType || !producer) {
+      error = "register-to-LDS staging requires a produced ranked tensor";
+      return failure();
+    }
+    if (producer->getBlock() != loop.getBody()) {
+      error = "register-to-LDS producer must be directly in the selected loop";
+      return failure();
+    }
+    if (!recordIt->second->logicalBytes ||
+        *recordIt->second->logicalBytes <= 0) {
+      error = "register-to-LDS staging requires a known positive tensor size";
+      return failure();
+    }
+    if (stagingBytes >
+        std::numeric_limits<int64_t>::max() - *recordIt->second->logicalBytes) {
+      error = "register-to-LDS staging byte size overflows";
+      return failure();
+    }
+    stagingBytes += *recordIt->second->logicalBytes;
+
+    llvm::DenseSet<Operation *> requestedConsumers;
+    tta::PlanRegisterToLdsStaging staging;
+    staging.loop = loop;
+    staging.source = source;
+    staging.tensorType = tensorType;
+    staging.logicalBytes = *recordIt->second->logicalBytes;
+    staging.alignment = intent.alignment;
+    for (StringRef consumerId : intent.consumerIds) {
+      auto consumerIt = operationById.find(consumerId.str());
+      if (consumerIt == operationById.end()) {
+        error = "register-to-LDS staging refers to an unknown consumer";
+        return failure();
+      }
+      Operation *consumer = consumerIt->second;
+      if (consumer->getBlock() != loop.getBody() ||
+          consumer->hasTrait<OpTrait::IsTerminator>()) {
+        error = "register-to-LDS consumer must be directly in the selected "
+                "loop";
+        return failure();
+      }
+      if (!producer->isBeforeInBlock(consumer)) {
+        error = "register-to-LDS consumer must follow its producer";
+        return failure();
+      }
+      if (!requestedConsumers.insert(consumer).second) {
+        error = "register-to-LDS staging repeats a resolved consumer";
+        return failure();
+      }
+      staging.consumers.push_back(consumer);
+    }
+
+    for (OpOperand &use : source.getUses()) {
+      Operation *consumer = use.getOwner();
+      if (consumer->getBlock() != loop.getBody() ||
+          consumer->hasTrait<OpTrait::IsTerminator>()) {
+        error = "M1.5b.4a requires every staged value use directly in the "
+                "selected loop";
+        return failure();
+      }
+      if (!requestedConsumers.contains(consumer)) {
+        error = "M1.5b.4a requires all direct in-loop uses to be selected";
+        return failure();
+      }
+      staging.consumerOperands.push_back(&use);
+    }
+    if (staging.consumerOperands.empty()) {
+      error = "register-to-LDS staging value has no selected uses";
+      return failure();
+    }
+    for (Operation *consumer : staging.consumers) {
+      if (llvm::none_of(staging.consumerOperands, [&](OpOperand *operand) {
+            return operand->getOwner() == consumer;
+          })) {
+        error = "named register-to-LDS consumer does not use the staged value";
+        return failure();
+      }
+    }
+    llvm::sort(staging.consumers, [](Operation *left, Operation *right) {
+      return left->isBeforeInBlock(right);
+    });
+    stagingOperations.insert(producer);
+    stagingOperations.insert(staging.consumers.begin(),
+                             staging.consumers.end());
+    resolved.stagingMutations.push_back(std::move(staging));
+  }
+
   std::map<std::string, const tt::plan::PlanPipelineTransactionIntent *>
       intentByGroup;
   for (const auto &intent : requested.transactions)
@@ -395,6 +506,7 @@ resolveLoopPipeline(const tt::plan::PlanLoopPipelineDelta &requested,
     allocationByRoot[allocation.rootValueId] = &allocation;
 
   llvm::DenseSet<Operation *> selected;
+  selected.insert(stagingOperations.begin(), stagingOperations.end());
   llvm::DenseSet<Operation *> mutationOperations;
   SmallVector<std::tuple<Operation *, Operation *, unsigned>> releaseToProducer;
   SmallVector<std::tuple<Operation *, Operation *, unsigned>> requestedEdges;
@@ -749,14 +861,22 @@ resolveLoopPipeline(const tt::plan::PlanLoopPipelineDelta &requested,
       }
     }
   }
+  if (stagingBytes > std::numeric_limits<int64_t>::max() - logicalLdsAfter) {
+    error = "register-to-LDS staging total byte size overflows";
+    return failure();
+  }
+  logicalLdsAfter += stagingBytes;
   if (logicalLdsAfter >
       getLdsCapacityBytes(loop->getParentOfType<ModuleOp>())) {
-    error = "requested LDS ring depths exceed the target LDS capacity";
+    error = resolved.stagingMutations.empty()
+                ? "requested LDS ring depths exceed the target LDS capacity"
+                : "register-to-LDS staging exceeds the target LDS capacity";
     return failure();
   }
   resolved.record.logicalLdsBytesBefore = logicalLdsBefore;
   resolved.record.logicalLdsBytesAfter = logicalLdsAfter;
   resolved.record.ringMutationCount = resolved.ringMutations.size();
+  resolved.record.stagingMutationCount = resolved.stagingMutations.size();
 
   TLXAMDLatencyModel latencyModel;
   llvm::DenseMap<Operation *, ttg::DataPartitionInfo> noPartition;
@@ -862,10 +982,11 @@ resolveLoopPipeline(const tt::plan::PlanLoopPipelineDelta &requested,
   return success();
 }
 
-static LogicalResult verifyPostRewrite(
-    const tt::plan::PlanValueGraph &postGraph,
-    const llvm::DenseMap<Operation *, std::string> &postBindings,
-    MutableArrayRef<ResolvedLoopPipeline> resolved, std::string &error) {
+static LogicalResult
+verifyPostRewrite(const tt::plan::PlanValueGraph &postGraph,
+                  const llvm::DenseMap<Operation *, std::string> &postBindings,
+                  MutableArrayRef<ResolvedLoopPipeline> resolved,
+                  std::string &error) {
   for (const tt::plan::PlanUnresolvedFact &fact :
        postGraph.getUnresolvedFacts()) {
     if (fact.importance == "important" && fact.status == "open") {
@@ -887,11 +1008,18 @@ static LogicalResult verifyPostRewrite(
   std::map<std::string, const tt::plan::PlanAsyncWaitRecord *> waitByOperation;
   for (const tt::plan::PlanAsyncWaitRecord &wait : postGraph.getAsyncWaits())
     waitByOperation[wait.operationId] = &wait;
+  std::map<std::string, const tt::plan::PlanLdsAllocationRecord *>
+      allocationByOperation;
+  for (const tt::plan::PlanLdsAllocationRecord &allocation :
+       postGraph.getLdsAllocations())
+    allocationByOperation[allocation.allocationOperationId] = &allocation;
 
   TLXAMDLatencyModel latencyModel;
   llvm::DenseMap<Operation *, ttg::DataPartitionInfo> noPartition;
   for (ResolvedLoopPipeline &loop : resolved) {
-    if (!loop.ringMutations.empty() &&
+    bool hasStorageMutation =
+        !loop.ringMutations.empty() || !loop.stagingMutations.empty();
+    if (hasStorageMutation &&
         postGraph.getResourceSummary().logicalLdsAllocationBytes !=
             loop.record.logicalLdsBytesAfter) {
       error = "post-rewrite logical LDS usage does not match the capacity plan";
@@ -950,6 +1078,68 @@ static LogicalResult verifyPostRewrite(
         return failure();
       }
     }
+    for (tta::PlanRegisterToLdsStaging &staging : loop.stagingMutations) {
+      if (!staging.allocation || !staging.store || !staging.load ||
+          !staging.visibilityBarrier || !staging.releaseBarrier) {
+        error = "post-rewrite register-to-LDS staging is incomplete";
+        return failure();
+      }
+      auto allocationType =
+          dyn_cast<ttg::MemDescType>(staging.allocation.getType());
+      if (!allocationType ||
+          allocationType.getShape() != staging.tensorType.getShape() ||
+          allocationType.getElementType() !=
+              staging.tensorType.getElementType()) {
+        error = "post-rewrite staging allocation type does not match the "
+                "staged tensor";
+        return failure();
+      }
+      auto alignment =
+          staging.allocation->getAttrOfType<IntegerAttr>("alignment");
+      if (!alignment || alignment.getInt() != staging.alignment) {
+        error = "post-rewrite staging allocation lost its alignment";
+        return failure();
+      }
+      auto allocationId = postBindings.find(staging.allocation);
+      auto allocationRecord =
+          allocationId == postBindings.end()
+              ? allocationByOperation.end()
+              : allocationByOperation.find(allocationId->second);
+      if (allocationRecord == allocationByOperation.end() ||
+          allocationRecord->second->logicalBytes != staging.logicalBytes ||
+          allocationRecord->second->alignment != staging.alignment) {
+        error = "post-rewrite Plan IR does not describe the requested staging "
+                "allocation";
+        return failure();
+      }
+      if (staging.store.getSrc() != staging.source ||
+          staging.store.getDst() != staging.allocation.getResult() ||
+          staging.load.getSrc() != staging.allocation.getResult() ||
+          staging.load.getType() != staging.tensorType) {
+        error = "post-rewrite register-to-LDS data path is inconsistent";
+        return failure();
+      }
+      if (llvm::any_of(staging.source.getUses(), [&](OpOperand &use) {
+            return use.getOwner() != staging.store;
+          })) {
+        error = "post-rewrite staged register value retained an unrequested "
+                "consumer";
+        return failure();
+      }
+      for (OpOperand *operand : staging.consumerOperands) {
+        if (!operand || operand->get() != staging.load.getResult()) {
+          error = "post-rewrite named consumer does not use the staged load";
+          return failure();
+        }
+      }
+      if (!staging.store->isBeforeInBlock(staging.visibilityBarrier) ||
+          !staging.visibilityBarrier->isBeforeInBlock(staging.load) ||
+          !staging.load->isBeforeInBlock(staging.consumers.front()) ||
+          !staging.consumers.back()->isBeforeInBlock(staging.releaseBarrier)) {
+        error = "post-rewrite staging synchronization order is invalid";
+        return failure();
+      }
+    }
     if (!loop.ringMutations.empty()) {
       ttg::DataDependenceGraph ddg = ttg::DataDependenceGraph::build(
           loop.loop, latencyModel, noPartition, ttg::getActiveScheduleAlgo(),
@@ -961,6 +1151,27 @@ static LogicalResult verifyPostRewrite(
       if (failed(schedule) || !ttg::isLegalModuloSchedule(ddg, *schedule)) {
         error = "post-rewrite DDG has no legal modulo schedule";
         return failure();
+      }
+      loop.record.postRewriteDdgVerified = true;
+    } else if (!loop.stagingMutations.empty()) {
+      // Single-slot synchronous staging does not overlap loop iterations, so
+      // it needs a rebuilt DDG but not a modulo schedule. Verify that the
+      // emitted order satisfies every distance-zero edge in that rebuilt DDG.
+      ttg::DataDependenceGraph ddg = ttg::DataDependenceGraph::build(
+          loop.loop, latencyModel, noPartition, ttg::getActiveScheduleAlgo(),
+          /*scheduleNestedLoops=*/false);
+      for (const ttg::DDGEdge &edge : ddg.getEdges()) {
+        if (edge.distance != 0)
+          continue;
+        Operation *source = ddg.getNode(edge.srcIdx).op;
+        Operation *destination = ddg.getNode(edge.dstIdx).op;
+        if (source != destination &&
+            source->getBlock() == destination->getBlock() &&
+            destination->isBeforeInBlock(source)) {
+          error = "post-rewrite staging order violates a distance-zero DDG "
+                  "dependency";
+          return failure();
+        }
       }
       loop.record.postRewriteDdgVerified = true;
     }
@@ -977,8 +1188,9 @@ applyPlanPipeline(tt::FuncOp function, const tt::plan::PlanPipelineDelta &delta,
     return fail(result, error, "pipeline delta kernel does not match function");
 
   llvm::DenseMap<Operation *, std::string> operationBindings;
-  FailureOr<tt::plan::PlanValueGraph> graph =
-      tt::plan::PlanValueGraph::build(function, &operationBindings);
+  llvm::DenseMap<Value, std::string> valueBindings;
+  FailureOr<tt::plan::PlanValueGraph> graph = tt::plan::PlanValueGraph::build(
+      function, &operationBindings, &valueBindings);
   if (failed(graph) || (strict && failed(graph->verify(/*strict=*/true))))
     return fail(result, error,
                 "failed to build a strict pre-apply value graph");
@@ -991,6 +1203,9 @@ applyPlanPipeline(tt::FuncOp function, const tt::plan::PlanPipelineDelta &delta,
   std::map<std::string, Operation *> operationById;
   for (const auto &[operation, id] : operationBindings)
     operationById[id] = operation;
+  std::map<std::string, Value> valueById;
+  for (const auto &[value, id] : valueBindings)
+    valueById[id] = value;
 
   SmallVector<ResolvedLoopPipeline, 1> resolved;
   for (const tt::plan::PlanLoopPipelineDelta &requested : delta.loops) {
@@ -1002,7 +1217,7 @@ applyPlanPipeline(tt::FuncOp function, const tt::plan::PlanPipelineDelta &delta,
       return fail(result, error, "pipeline delta target is not an scf.for");
     ResolvedLoopPipeline current;
     if (failed(resolveLoopPipeline(requested, loop, *graph, operationById,
-                                   current, error))) {
+                                   valueById, current, error))) {
       result.error = error;
       return failure();
     }
@@ -1025,12 +1240,22 @@ applyPlanPipeline(tt::FuncOp function, const tt::plan::PlanPipelineDelta &delta,
     loop.record.insertedBarrierCount =
         materialization.insertedVisibilityBarriers +
         materialization.insertedReleaseBarriers;
+    tta::PlanStagingMaterializationResult stagingMaterialization;
+    if (failed(tta::materializeRegisterToLdsStaging(
+            loop.stagingMutations, stagingMaterialization, error))) {
+      result.error = error;
+      return failure();
+    }
+    loop.record.insertedBarrierCount += stagingMaterialization.insertedBarriers;
     for (const tta::PlanExistingLdsRingMutation &ring : loop.ringMutations) {
       result.changesBufferDepth |= ring.oldDepth != ring.newDepth;
       result.changesPrefetchDistance |= ring.oldDistance != ring.newDistance;
     }
     result.changesIterationStorage |= result.changesBufferDepth;
     result.changesSynchronization |= !loop.ringMutations.empty();
+    result.changesNewStaging |= !loop.stagingMutations.empty();
+    result.changesIterationStorage |= !loop.stagingMutations.empty();
+    result.changesSynchronization |= !loop.stagingMutations.empty();
   }
   if (failed(mlir::verify(function)))
     return fail(result, error,
@@ -1045,11 +1270,11 @@ applyPlanPipeline(tt::FuncOp function, const tt::plan::PlanPipelineDelta &delta,
                 "failed to build a strict post-apply value graph");
   result.outputValueGraphFingerprint =
       postGraph->getSemanticFingerprint().str();
-  bool hasRingMutation =
+  bool hasStorageMutation =
       llvm::any_of(resolved, [](const ResolvedLoopPipeline &loop) {
-        return !loop.ringMutations.empty();
+        return !loop.ringMutations.empty() || !loop.stagingMutations.empty();
       });
-  if (!hasRingMutation) {
+  if (!hasStorageMutation) {
     if (result.outputValueGraphFingerprint != result.inputValueGraphFingerprint)
       return fail(
           result, error,
@@ -1069,18 +1294,20 @@ applyPlanPipeline(tt::FuncOp function, const tt::plan::PlanPipelineDelta &delta,
     if (frozenDotSignature(function) != dotSignatureBefore)
       return fail(result, error,
                   "dot decomposition or accumulator contract changed during "
-                  "ring materialization");
+                  "pipeline materialization");
+    size_t newStagingCount = 0;
+    for (const ResolvedLoopPipeline &loop : resolved)
+      newStagingCount += loop.stagingMutations.size();
     if (postGraph->getLdsAllocations().size() !=
-            graph->getLdsAllocations().size() ||
+            graph->getLdsAllocations().size() + newStagingCount ||
         postGraph->getAsyncGroups().size() != graph->getAsyncGroups().size() ||
         postGraph->getAsyncTransactions().size() !=
             graph->getAsyncTransactions().size() ||
         postGraph->getAsyncWaits().size() != graph->getAsyncWaits().size())
       return fail(result, error,
-                  "M1.5b.3 may resize existing rings but cannot create or "
-                  "remove LDS transactions");
-    if (failed(
-            verifyPostRewrite(*postGraph, postBindings, resolved, error))) {
+                  "pipeline materialization changed an unrequested LDS or "
+                  "async structure");
+    if (failed(verifyPostRewrite(*postGraph, postBindings, resolved, error))) {
       result.error = error;
       return failure();
     }

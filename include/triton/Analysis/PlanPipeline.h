@@ -21,9 +21,18 @@ struct PlanPipelineTransactionIntent {
   int64_t bufferDepth = 0;
 };
 
+struct PlanPipelineStagingIntent {
+  std::string valueId;
+  std::string action;
+  std::vector<std::string> consumerIds;
+  int64_t bufferDepth = 0;
+  int64_t alignment = 0;
+};
+
 struct PlanLoopPipelineDelta {
   std::string loopId;
   std::vector<PlanPipelineTransactionIntent> transactions;
+  std::vector<PlanPipelineStagingIntent> staging;
 };
 
 struct PlanPipelineDelta {
@@ -43,6 +52,7 @@ struct PlanPipelineLoopApplyRecord {
   int64_t importedDependencyCount = 0;
   int64_t skippedDependencyCount = 0;
   int64_t ringMutationCount = 0;
+  int64_t stagingMutationCount = 0;
   int64_t rewrittenSlotIndexCount = 0;
   int64_t updatedWaitCount = 0;
   int64_t insertedBarrierCount = 0;
@@ -65,6 +75,7 @@ struct PlanPipelineApplyResult {
   bool changesSynchronization = false;
   bool changesPrefetchDistance = false;
   bool changesBufferDepth = false;
+  bool changesNewStaging = false;
   bool postRewriteAuditPassed = false;
   std::vector<PlanPipelineLoopApplyRecord> loops;
 };

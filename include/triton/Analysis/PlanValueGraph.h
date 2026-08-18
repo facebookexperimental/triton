@@ -305,7 +305,8 @@ public:
   /// analysis or mutation pass.
   static FailureOr<PlanValueGraph>
   build(FuncOp function,
-        llvm::DenseMap<Operation *, std::string> *operationBindings = nullptr);
+        llvm::DenseMap<Operation *, std::string> *operationBindings = nullptr,
+        llvm::DenseMap<Value, std::string> *valueBindings = nullptr);
 
   LogicalResult verify(bool strict = false) const;
   llvm::json::Object toJSON() const;
