@@ -153,12 +153,19 @@ resolveLdsStaging(ArrayRef<plan::PlanPipelineStagingIntent> intents,
       error = "register-to-LDS staging requires a known positive tensor size";
       return failure();
     }
-    if (result.logicalBytes >
-        std::numeric_limits<int64_t>::max() - *recordIt->second->logicalBytes) {
+    if (*recordIt->second->logicalBytes >
+        std::numeric_limits<int64_t>::max() / intent.bufferDepth) {
       error = "register-to-LDS staging byte size overflows";
       return failure();
     }
-    result.logicalBytes += *recordIt->second->logicalBytes;
+    int64_t allocationBytes =
+        *recordIt->second->logicalBytes * intent.bufferDepth;
+    if (result.logicalBytes >
+        std::numeric_limits<int64_t>::max() - allocationBytes) {
+      error = "register-to-LDS staging byte size overflows";
+      return failure();
+    }
+    result.logicalBytes += allocationBytes;
 
     const plan::PlanLiveSegment *live =
         findUniqueLiveSegment(graph, intent.valueId);
@@ -176,6 +183,8 @@ resolveLdsStaging(ArrayRef<plan::PlanPipelineStagingIntent> intents,
     staging.tensorType = tensorType;
     staging.logicalBytes = *recordIt->second->logicalBytes;
     staging.alignment = intent.alignment;
+    staging.distance = intent.distance;
+    staging.bufferDepth = intent.bufferDepth;
     staging.sourceLiveStartBefore = live->startPosition;
     staging.sourceLiveEndBefore = live->endPosition;
 

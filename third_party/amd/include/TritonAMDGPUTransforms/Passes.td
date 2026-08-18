@@ -556,9 +556,12 @@ def TritonAMDGPUApplyPlanPipeline
     copy. Named consumers may be reached through supported pure
     slice/reshape/transpose/layout DAGs. Register staging preserves unrelated
     branches and shortens the source interval; global staging requires the
-    complete use closure and eliminates the register-producing load. It
-    rebuilds the strict value graph and DDG after mutation and never changes
-    dot decomposition.
+    complete use closure and eliminates the register-producing load. Buffered
+    global staging adds a loop-carried modulo ring, allocates the requested LDS
+    depth, serializes the copy at stage zero and consumption at the requested
+    distance, and invokes the shared AMD pipeline expander to emit the
+    prologue, steady state, and epilogue. It rebuilds the strict value graph
+    before and after expansion and never changes dot decomposition.
   }];
 
   let options = [

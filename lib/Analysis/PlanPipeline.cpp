@@ -33,6 +33,24 @@ static bool readPositiveInteger(const llvm::json::Object &object, StringRef key,
   return true;
 }
 
+static bool readOptionalNonNegativeInteger(const llvm::json::Object &object,
+                                           StringRef key, int64_t &destination,
+                                           std::string &error) {
+  const llvm::json::Value *field = object.get(key);
+  if (!field) {
+    destination = 0;
+    return true;
+  }
+  std::optional<int64_t> value = field->getAsInteger();
+  if (!value || *value < 0) {
+    error = "pipeline delta field '" + key.str() +
+            "' must be a non-negative integer";
+    return false;
+  }
+  destination = *value;
+  return true;
+}
+
 static bool readStringArray(const llvm::json::Object &object, StringRef key,
                             std::vector<std::string> &destination,
                             std::string &error) {
@@ -169,6 +187,8 @@ FailureOr<PlanPipelineDelta> parsePlanPipelineDelta(StringRef payload,
             !readString(*stagingObject, "action", intent.action, error) ||
             !readStringArray(*stagingObject, "consumers", intent.consumerIds,
                              error) ||
+            !readOptionalNonNegativeInteger(*stagingObject, "distance",
+                                            intent.distance, error) ||
             !readPositiveInteger(*stagingObject, "buffer_depth",
                                  intent.bufferDepth, error) ||
             !readPositiveInteger(*stagingObject, "alignment", intent.alignment,
@@ -180,8 +200,26 @@ FailureOr<PlanPipelineDelta> parsePlanPipelineDelta(StringRef payload,
                   "staging";
           return failure();
         }
-        if (intent.bufferDepth != 1) {
-          error = "M1.5b.4 supports only single-slot register staging";
+        if (intent.action == "register_to_lds" &&
+            (intent.bufferDepth != 1 || intent.distance != 0)) {
+          error = "register_to_lds supports only same-iteration single-slot "
+                  "staging";
+          return failure();
+        }
+        if (intent.action == "global_to_lds" && intent.bufferDepth == 1 &&
+            intent.distance != 0) {
+          error = "single-slot global_to_lds staging must have distance zero";
+          return failure();
+        }
+        if (intent.action == "global_to_lds" && intent.bufferDepth > 1 &&
+            intent.distance < 1) {
+          error = "buffered global_to_lds staging requires a positive distance";
+          return failure();
+        }
+        if (intent.action == "global_to_lds" &&
+            intent.bufferDepth <= intent.distance) {
+          error = "buffered global_to_lds staging requires buffer depth "
+                  "greater than distance";
           return failure();
         }
         if (!llvm::isPowerOf2_64(intent.alignment)) {
@@ -218,6 +256,8 @@ serializePlanPipelineApplyReport(const PlanPipelineApplyResult &result) {
       staging.push_back(llvm::json::Object{
           {"value", record.valueId},
           {"action", record.action},
+          {"distance", record.distance},
+          {"buffer_depth", record.bufferDepth},
           {"derived_operations_cloned", record.derivedOperationsCloned},
           {"derived_operations_pruned", record.derivedOperationsPruned},
           {"selected_consumer_operands", record.selectedConsumerOperands},
@@ -235,6 +275,7 @@ serializePlanPipelineApplyReport(const PlanPipelineApplyResult &result) {
           {"global_access_semantics_preserved",
            record.globalAccessSemanticsPreserved},
           {"logical_live_range_shortened", record.logicalLiveRangeShortened},
+          {"pipeline_expanded", record.pipelineExpanded},
       });
     }
     loops.push_back(llvm::json::Object{

@@ -2,6 +2,7 @@
 #include "PlanStagingMaterializer.h"
 #include "PlanStagingResolver.h"
 #include "TritonAMDGPUTransforms/Passes.h"
+#include "amd/lib/TritonAMDGPUTransforms/PipelineUtility.h"
 
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinOps.h"
@@ -15,6 +16,8 @@
 #include "triton/Analysis/PlanValueGraph.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
+#include "triton/Dialect/TritonGPU/Transforms/Schedule.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallString.h"
@@ -80,6 +83,7 @@ struct ResolvedLoopPipeline {
   SmallVector<tta::PlanExistingLdsRingMutation, 1> ringMutations;
   SmallVector<tta::PlanAsyncWaitMutation, 2> waitMutations;
   SmallVector<tta::PlanLdsStaging, 1> stagingMutations;
+  bool pipelineExpansionRequired = false;
   tt::plan::PlanPipelineLoopApplyRecord record;
 };
 
@@ -401,6 +405,18 @@ resolveLoopPipeline(const tt::plan::PlanLoopPipelineDelta &requested,
     return failure();
   int64_t stagingBytes = stagingResolution.logicalBytes;
   resolved.stagingMutations = std::move(stagingResolution.staging);
+  std::optional<int64_t> bufferedStagingDistance;
+  for (const tta::PlanLdsStaging &staging : resolved.stagingMutations) {
+    if (staging.bufferDepth == 1)
+      continue;
+    if (bufferedStagingDistance &&
+        *bufferedStagingDistance != staging.distance) {
+      error = "buffered staging intents in one loop must use one distance";
+      return failure();
+    }
+    bufferedStagingDistance = staging.distance;
+  }
+  resolved.pipelineExpansionRequired = bufferedStagingDistance.has_value();
 
   std::map<std::string, const tt::plan::PlanPipelineTransactionIntent *>
       intentByGroup;
@@ -891,6 +907,199 @@ resolveLoopPipeline(const tt::plan::PlanLoopPipelineDelta &requested,
 }
 
 static LogicalResult
+serializeBufferedStagingSchedule(ResolvedLoopPipeline &resolved,
+                                 std::string &error) {
+  if (!resolved.pipelineExpansionRequired)
+    return success();
+
+  std::optional<int64_t> distance;
+  llvm::DenseSet<Operation *> stageZero;
+  llvm::DenseSet<Operation *> waits;
+  for (tta::PlanLdsStaging &staging : resolved.stagingMutations) {
+    if (staging.bufferDepth == 1)
+      continue;
+    if (staging.action != "global_to_lds" || !staging.globalCopy ||
+        !staging.asyncCommit || !staging.asyncWait || !staging.bufferView ||
+        staging.distance < 1 || staging.bufferDepth <= staging.distance) {
+      error = "buffered staging cannot be serialized into a pipeline";
+      return failure();
+    }
+    if (distance && *distance != staging.distance) {
+      error = "buffered staging schedule has inconsistent distances";
+      return failure();
+    }
+    distance = staging.distance;
+    collectMovableBackwardSlice(staging.asyncCommit, resolved.loop, stageZero);
+    waits.insert(staging.asyncWait);
+  }
+  if (!distance) {
+    error = "buffered staging schedule has no positive distance";
+    return failure();
+  }
+
+  tt::CoarseSchedule schedule(/*numStages=*/static_cast<int>(*distance + 1));
+  auto waitCluster = schedule.clusters.newAtBack();
+  auto loadCluster = schedule.clusters.newAtBack();
+  auto computeCluster = schedule.clusters.newAtBack();
+  for (Operation &operation : resolved.loop.getBody()->without_terminator()) {
+    if (waits.contains(&operation)) {
+      schedule.insert(&operation, *distance, waitCluster);
+      continue;
+    }
+    if (stageZero.contains(&operation)) {
+      schedule.insert(&operation, 0, loadCluster);
+      continue;
+    }
+    schedule.insert(&operation, *distance, computeCluster);
+  }
+  schedule.serialize(resolved.loop, /*keepExistingMaxStage=*/false);
+  return success();
+}
+
+static LogicalResult verifyExpandedPipeline(tt::FuncOp function,
+                                            std::string &error) {
+  function.walk([&](Operation *operation) {
+    operation->removeAttr(tt::kLoopStageAttrName);
+    operation->removeAttr(tt::kLoopClusterAttrName);
+    operation->removeAttr(tt::kScheduledMaxStageAttrName);
+  });
+  bool retainedSchedule = false;
+  function.walk([&](Operation *operation) {
+    retainedSchedule |= operation->hasAttr(tt::kLoopStageAttrName) ||
+                        operation->hasAttr(tt::kLoopClusterAttrName) ||
+                        operation->hasAttr(tt::kScheduledMaxStageAttrName);
+  });
+  if (retainedSchedule) {
+    error = "buffered staging pipeline expansion retained schedule markers";
+    return failure();
+  }
+  if (failed(mlir::verify(function))) {
+    error = "MLIR verification failed after buffered staging expansion";
+    return failure();
+  }
+  return success();
+}
+
+static std::optional<int64_t>
+getStructuredValueDistance(Value source, Value value,
+                           llvm::DenseSet<Value> &path, unsigned depth = 0) {
+  if (value == source)
+    return 0;
+  if (!value || depth > 64 || !path.insert(value).second)
+    return std::nullopt;
+
+  std::optional<int64_t> distance;
+  if (auto argument = dyn_cast<BlockArgument>(value)) {
+    auto loop =
+        dyn_cast_or_null<scf::ForOp>(argument.getOwner()->getParentOp());
+    if (loop && argument != loop.getInductionVar()) {
+      unsigned index = argument.getArgNumber() - 1;
+      auto yield = cast<scf::YieldOp>(loop.getBody()->getTerminator());
+      if (index < yield.getNumOperands())
+        if (std::optional<int64_t> nested = getStructuredValueDistance(
+                source, yield.getOperand(index), path, depth + 1))
+          distance = *nested + 1;
+    }
+  } else if (Operation *definition = value.getDefiningOp()) {
+    if (definition->hasTrait<OpTrait::MemDescViewTrait>()) {
+      for (Value operand : definition->getOperands()) {
+        std::optional<int64_t> nested =
+            getStructuredValueDistance(source, operand, path, depth + 1);
+        if (nested && (!distance || *nested < *distance))
+          distance = nested;
+      }
+    }
+  }
+  path.erase(value);
+  return distance;
+}
+
+static std::optional<int64_t> getStructuredValueDistance(Value source,
+                                                         Value value) {
+  llvm::DenseSet<Value> path;
+  return getStructuredValueDistance(source, value, path);
+}
+
+static LogicalResult verifyFinalBufferedStaging(
+    const tt::plan::PlanValueGraph &graph,
+    const llvm::DenseMap<Operation *, std::string> &bindings,
+    ArrayRef<ResolvedLoopPipeline> resolved, std::string &error) {
+  std::map<std::string, const tt::plan::PlanLdsAllocationRecord *>
+      allocationByOperation;
+  for (const tt::plan::PlanLdsAllocationRecord &allocation :
+       graph.getLdsAllocations())
+    allocationByOperation[allocation.allocationOperationId] = &allocation;
+  std::map<std::string, Operation *> operationById;
+  for (const auto &[operation, id] : bindings)
+    operationById[id] = operation;
+
+  for (const ResolvedLoopPipeline &loop : resolved) {
+    for (const tta::PlanLdsStaging &staging : loop.stagingMutations) {
+      if (staging.bufferDepth == 1)
+        continue;
+      auto allocationId = bindings.find(staging.allocation);
+      auto allocation = allocationId == bindings.end()
+                            ? allocationByOperation.end()
+                            : allocationByOperation.find(allocationId->second);
+      if (allocation == allocationByOperation.end()) {
+        error = "final buffered staging allocation lost Plan IR identity";
+        return failure();
+      }
+
+      bool proven = false;
+      for (const tt::plan::PlanAsyncTransaction &transaction :
+           graph.getAsyncTransactions()) {
+        if (!llvm::is_contained(transaction.rootValueIds,
+                                allocation->second->rootValueId) ||
+            !hasExactSlotDepth(transaction, staging.bufferDepth))
+          continue;
+        auto producerIt = operationById.find(transaction.producerOperationId);
+        if (producerIt == operationById.end())
+          continue;
+        Value producerView;
+        for (Value operand : producerIt->second->getOperands())
+          if (isa<ttg::MemDescType>(operand.getType()) &&
+              getRootAllocation(operand) == staging.allocation) {
+            producerView = operand;
+            break;
+          }
+        if (!producerView)
+          continue;
+
+        bool hasConsumerDistance = false;
+        for (const tt::plan::PlanAsyncFrontier &frontier :
+             transaction.consumerFrontiers) {
+          auto consumerIt = operationById.find(frontier.operationId);
+          if (consumerIt == operationById.end())
+            continue;
+          for (Value operand : consumerIt->second->getOperands()) {
+            if (!isa<ttg::MemDescType>(operand.getType()))
+              continue;
+            hasConsumerDistance |=
+                getStructuredValueDistance(producerView, operand) ==
+                staging.distance;
+          }
+        }
+        bool hasVisibility = !transaction.visibilityFrontiers.empty();
+        bool hasRelease = !transaction.releaseFrontiers.empty();
+        bool hasOverwrite = llvm::any_of(
+            transaction.overwriteFrontiers, [&](const auto &frontier) {
+              return frontier.iterationDistance == staging.bufferDepth;
+            });
+        proven |=
+            hasConsumerDistance && hasVisibility && hasRelease && hasOverwrite;
+      }
+      if (!proven) {
+        error = "final buffered staging graph does not prove the requested "
+                "depth, distance, visibility, release, and overwrite";
+        return failure();
+      }
+    }
+  }
+  return success();
+}
+
+static LogicalResult
 verifyPostRewrite(const tt::plan::PlanValueGraph &postGraph,
                   const llvm::DenseMap<Operation *, std::string> &postBindings,
                   const llvm::DenseMap<Value, std::string> &postValueBindings,
@@ -998,8 +1207,11 @@ verifyPostRewrite(const tt::plan::PlanValueGraph &postGraph,
       }
       auto allocationType =
           dyn_cast<ttg::MemDescType>(staging.allocation.getType());
+      SmallVector<int64_t> expectedShape(staging.tensorType.getShape());
+      if (staging.bufferDepth > 1)
+        expectedShape.insert(expectedShape.begin(), staging.bufferDepth);
       if (!allocationType ||
-          allocationType.getShape() != staging.tensorType.getShape() ||
+          allocationType.getShape() != ArrayRef<int64_t>(expectedShape) ||
           allocationType.getElementType() !=
               staging.tensorType.getElementType()) {
         error = "post-rewrite staging allocation type does not match the "
@@ -1017,14 +1229,15 @@ verifyPostRewrite(const tt::plan::PlanValueGraph &postGraph,
           allocationId == postBindings.end()
               ? allocationByOperation.end()
               : allocationByOperation.find(allocationId->second);
+      int64_t expectedBytes = staging.logicalBytes * staging.bufferDepth;
       if (allocationRecord == allocationByOperation.end() ||
-          allocationRecord->second->logicalBytes != staging.logicalBytes ||
+          allocationRecord->second->logicalBytes != expectedBytes ||
           allocationRecord->second->alignment != staging.alignment) {
         error = "post-rewrite Plan IR does not describe the requested staging "
                 "allocation";
         return failure();
       }
-      if (staging.load.getSrc() != staging.allocation.getResult() ||
+      if (getRootAllocation(staging.load.getSrc()) != staging.allocation ||
           staging.load.getType() != staging.tensorType) {
         error = "post-rewrite LDS-staging data path is inconsistent";
         return failure();
@@ -1119,6 +1332,11 @@ verifyPostRewrite(const tt::plan::PlanValueGraph &postGraph,
           return failure();
         }
         const tt::plan::PlanAsyncTransaction &post = *transaction->second;
+        if (staging.bufferDepth > 1 &&
+            !hasExactSlotDepth(post, staging.bufferDepth)) {
+          error = "post-rewrite buffered staging slot depth is not proven";
+          return failure();
+        }
         auto group = groupById.find(post.commitGroupId);
         auto commitId = postBindings.find(staging.asyncCommit);
         auto waitId = postBindings.find(staging.asyncWait);
@@ -1215,6 +1433,8 @@ static void recordStagingResults(ResolvedLoopPipeline &loop) {
     tt::plan::PlanPipelineStagingApplyRecord record;
     record.valueId = staging.sourceValueId;
     record.action = staging.action;
+    record.distance = staging.distance;
+    record.bufferDepth = staging.bufferDepth;
     record.derivedOperationsCloned = staging.derivedOperationsCloned;
     record.derivedOperationsPruned = staging.derivedOperationsPruned;
     record.selectedConsumerOperands = staging.consumerOperands.size();
@@ -1231,6 +1451,7 @@ static void recordStagingResults(ResolvedLoopPipeline &loop) {
     record.globalAccessSemanticsPreserved =
         staging.globalAccessSemanticsPreserved;
     record.logicalLiveRangeShortened = staging.logicalLiveRangeShortened;
+    record.pipelineExpanded = staging.pipelineExpanded;
     loop.record.staging.push_back(std::move(record));
   }
 }
@@ -1302,6 +1523,8 @@ applyPlanPipeline(tt::FuncOp function, const tt::plan::PlanPipelineDelta &delta,
       result.error = error;
       return failure();
     }
+    if (stagingMaterialization.loop)
+      loop.loop = stagingMaterialization.loop;
     loop.record.insertedBarrierCount += stagingMaterialization.insertedBarriers;
     for (const tta::PlanExistingLdsRingMutation &ring : loop.ringMutations) {
       result.changesBufferDepth |= ring.oldDepth != ring.newDepth;
@@ -1316,6 +1539,8 @@ applyPlanPipeline(tt::FuncOp function, const tt::plan::PlanPipelineDelta &delta,
         });
     result.changesIterationStorage |= !loop.stagingMutations.empty();
     result.changesSynchronization |= !loop.stagingMutations.empty();
+    result.changesBufferDepth |= loop.pipelineExpansionRequired;
+    result.changesPrefetchDistance |= loop.pipelineExpansionRequired;
   }
   if (failed(mlir::verify(function)))
     return fail(result, error,
@@ -1330,14 +1555,14 @@ applyPlanPipeline(tt::FuncOp function, const tt::plan::PlanPipelineDelta &delta,
       (strict && failed(postGraph->verify(/*strict=*/true))))
     return fail(result, error,
                 "failed to build a strict post-apply value graph");
-  result.outputValueGraphFingerprint =
+  std::string materializedFingerprint =
       postGraph->getSemanticFingerprint().str();
   bool hasStorageMutation =
       llvm::any_of(resolved, [](const ResolvedLoopPipeline &loop) {
         return !loop.ringMutations.empty() || !loop.stagingMutations.empty();
       });
   if (!hasStorageMutation) {
-    if (result.outputValueGraphFingerprint != result.inputValueGraphFingerprint)
+    if (materializedFingerprint != result.inputValueGraphFingerprint)
       return fail(
           result, error,
           "stable operation/value identity changed after pipeline apply");
@@ -1384,6 +1609,52 @@ applyPlanPipeline(tt::FuncOp function, const tt::plan::PlanPipelineDelta &delta,
     }
     result.postRewriteAuditPassed = true;
   }
+
+  bool requiresExpansion =
+      llvm::any_of(resolved, [](const ResolvedLoopPipeline &loop) {
+        return loop.pipelineExpansionRequired;
+      });
+  if (requiresExpansion) {
+    for (ResolvedLoopPipeline &loop : resolved) {
+      if (failed(serializeBufferedStagingSchedule(loop, error))) {
+        result.error = error;
+        return failure();
+      }
+    }
+    expandLoops(function->getParentOfType<ModuleOp>());
+    if (failed(verifyExpandedPipeline(function, error))) {
+      result.error = error;
+      return failure();
+    }
+    for (ResolvedLoopPipeline &loop : resolved)
+      for (tta::PlanLdsStaging &staging : loop.stagingMutations)
+        if (staging.bufferDepth > 1)
+          staging.pipelineExpanded = true;
+  }
+
+  llvm::DenseMap<Operation *, std::string> finalBindings;
+  FailureOr<tt::plan::PlanValueGraph> finalGraph =
+      tt::plan::PlanValueGraph::build(function, &finalBindings);
+  if (failed(finalGraph) ||
+      (strict && failed(finalGraph->verify(/*strict=*/true))))
+    return fail(result, error,
+                "failed to build a strict final pipeline value graph");
+  if (!finalGraph->getLdsReuseHazards().empty())
+    return fail(result, error,
+                "final pipeline audit found an LDS reuse hazard");
+  for (const tt::plan::PlanUnresolvedFact &fact :
+       finalGraph->getUnresolvedFacts())
+    if (fact.importance == "important" && fact.status == "open")
+      return fail(result, error,
+                  "final pipeline audit retained an open important fact: " +
+                      fact.code);
+  if (requiresExpansion && failed(verifyFinalBufferedStaging(
+                               *finalGraph, finalBindings, resolved, error))) {
+    result.error = error;
+    return failure();
+  }
+  result.outputValueGraphFingerprint =
+      finalGraph->getSemanticFingerprint().str();
 
   for (ResolvedLoopPipeline &loop : resolved) {
     recordStagingResults(loop);

@@ -130,6 +130,20 @@
 // RUN:   -tritonamdgpu-apply-plan-pipeline='input-path=%t.pipeline.staging.global.json report-path=%t.pipeline.staging.global.report.json strict=true' \
 // RUN:   | FileCheck %s --check-prefix=PIPELINE-STAGING-GLOBAL
 // RUN: FileCheck %s --check-prefix=PIPELINE-STAGING-GLOBAL-REPORT < %t.pipeline.staging.global.report.json
+// RUN: python3 -c "import json; p=json.load(open('%t.pipeline.plan.json')); f=next(x for x in p['functions'] if x['function']=='global_to_lds_buffered'); ops={x['id']:x['kind'] for x in f['operations']}; v=next(x for x in f['values'] if ops.get(x['origin'].get('operation'))=='tt.load'); s=next(u['operation'] for u in v['uses'] if ops[u['operation']]=='amdg.extract_slice'); sv=next(x for x in f['values'] if x['origin'].get('operation')==s); cs=sorted({u['operation'] for u in sv['uses']}); l=next(x['id'] for x in f['operations'] if x['kind']=='scf.for'); d={'schema_version':'plan-pipeline-delta/0.1','kernel':f['function'],'input_value_graph_fingerprint':f['semantic_fingerprint'],'pass_position':'before_update_async_wait_count','loops':[{'loop':l,'transactions':[],'staging':[{'value':v['id'],'action':'global_to_lds','consumers':cs,'distance':1,'buffer_depth':2,'alignment':16}]}]}; open('%t.pipeline.staging.global-buffered.json','w').write(json.dumps(d))"
+// RUN: TRITON_USE_MODULO_SCHEDULE=1 triton-opt %s \
+// RUN:   -tritonamdgpu-apply-plan-pipeline='input-path=%t.pipeline.staging.global-buffered.json report-path=%t.pipeline.staging.global-buffered.report.json strict=true' \
+// RUN:   | FileCheck %s --check-prefix=PIPELINE-STAGING-GLOBAL-BUFFERED
+// RUN: FileCheck %s --check-prefix=PIPELINE-STAGING-GLOBAL-BUFFERED-REPORT < %t.pipeline.staging.global-buffered.report.json
+// RUN: python3 -c "import json; p=json.load(open('%t.pipeline.staging.global-buffered.json')); p['loops'][0]['staging'][0].update(distance=2,buffer_depth=3); open('%t.pipeline.staging.global-buffered-d2.json','w').write(json.dumps(p))"
+// RUN: TRITON_USE_MODULO_SCHEDULE=1 triton-opt %s \
+// RUN:   -tritonamdgpu-apply-plan-pipeline='input-path=%t.pipeline.staging.global-buffered-d2.json report-path=%t.pipeline.staging.global-buffered-d2.report.json strict=true' \
+// RUN:   | FileCheck %s --check-prefix=PIPELINE-STAGING-GLOBAL-BUFFERED-D2
+// RUN: FileCheck %s --check-prefix=PIPELINE-STAGING-GLOBAL-BUFFERED-D2-REPORT < %t.pipeline.staging.global-buffered-d2.report.json
+// RUN: python3 -c "import json; p=json.load(open('%t.pipeline.staging.global-buffered.json')); p['loops'][0]['staging'][0].update(distance=2,buffer_depth=2); open('%t.pipeline.staging.global-buffered-invalid.json','w').write(json.dumps(p))"
+// RUN: not triton-opt %s \
+// RUN:   -tritonamdgpu-apply-plan-pipeline='input-path=%t.pipeline.staging.global-buffered-invalid.json strict=true' \
+// RUN:   2>&1 | FileCheck %s --check-prefix=PIPELINE-STAGING-GLOBAL-BUFFERED-INVALID
 // RUN: python3 -c "import json; p=json.load(open('%t.pipeline.plan.json')); f=next(x for x in p['functions'] if x['function']=='global_to_lds_buffer_load'); ops={x['id']:x['kind'] for x in f['operations']}; v=next(x for x in f['values'] if ops.get(x['origin'].get('operation'))=='amdg.buffer_load'); cs=sorted({u['operation'] for u in v['uses']}); l=next(x['id'] for x in f['operations'] if x['kind']=='scf.for'); d={'schema_version':'plan-pipeline-delta/0.1','kernel':f['function'],'input_value_graph_fingerprint':f['semantic_fingerprint'],'pass_position':'before_update_async_wait_count','loops':[{'loop':l,'transactions':[],'staging':[{'value':v['id'],'action':'global_to_lds','consumers':cs,'buffer_depth':1,'alignment':16}]}]}; open('%t.pipeline.staging.global-buffer.json','w').write(json.dumps(d))"
 // RUN: TRITON_USE_MODULO_SCHEDULE=1 triton-opt %s \
 // RUN:   -tritonamdgpu-apply-plan-pipeline='input-path=%t.pipeline.staging.global-buffer.json report-path=%t.pipeline.staging.global-buffer.report.json strict=true' \
@@ -283,7 +297,7 @@
 // PIPELINE-STAGING-REPORT-DAG: "materialization_scope": "register_to_lds_staging"
 // PIPELINE-STAGING-INCOMPLETE: staging_does_not_shorten_lifetime
 // PIPELINE-STAGING-NONUSE: named register-to-LDS consumer does not use the staged value
-// PIPELINE-STAGING-DEPTH: M1.5b.4 supports only single-slot register staging
+// PIPELINE-STAGING-DEPTH: register_to_lds supports only same-iteration single-slot staging
 // PIPELINE-STAGING-ALIGNMENT: pipeline staging alignment must be a power of two
 // PIPELINE-STAGING-CAPACITY: register-to-LDS staging exceeds the target LDS capacity
 // PIPELINE-STAGING-SCALAR: register-to-LDS staging requires a produced ranked tensor
@@ -331,6 +345,36 @@
 // PIPELINE-STAGING-GLOBAL-REPORT-DAG: "global_access_semantics_preserved": true
 // PIPELINE-STAGING-GLOBAL-REPORT-DAG: "post_rewrite_audit_passed": true
 // PIPELINE-STAGING-GLOBAL-REPORT-DAG: "materialization_scope": "global_to_lds_staging"
+// PIPELINE-STAGING-GLOBAL-BUFFERED-LABEL: tt.func @global_to_lds_buffered
+// PIPELINE-STAGING-GLOBAL-BUFFERED-NOT: tt.load
+// PIPELINE-STAGING-GLOBAL-BUFFERED: ttg.local_alloc {{.*}}!ttg.memdesc<2x64x128xf16
+// PIPELINE-STAGING-GLOBAL-BUFFERED: ttg.async_copy_global_to_local
+// PIPELINE-STAGING-GLOBAL-BUFFERED: scf.for
+// PIPELINE-STAGING-GLOBAL-BUFFERED: ttg.async_wait
+// PIPELINE-STAGING-GLOBAL-BUFFERED: arith.remui
+// PIPELINE-STAGING-GLOBAL-BUFFERED: ttg.async_copy_global_to_local
+// PIPELINE-STAGING-GLOBAL-BUFFERED: ttg.local_load
+// PIPELINE-STAGING-GLOBAL-BUFFERED: tt.return
+// PIPELINE-STAGING-GLOBAL-BUFFERED-NOT: loop.stage
+// PIPELINE-STAGING-GLOBAL-BUFFERED-REPORT-DAG: "accepted": true
+// PIPELINE-STAGING-GLOBAL-BUFFERED-REPORT-DAG: "buffer_depth": 2
+// PIPELINE-STAGING-GLOBAL-BUFFERED-REPORT-DAG: "distance": 1
+// PIPELINE-STAGING-GLOBAL-BUFFERED-REPORT-DAG: "logical_lds_bytes_after": 32768
+// PIPELINE-STAGING-GLOBAL-BUFFERED-REPORT-DAG: "pipeline_expanded": true
+// PIPELINE-STAGING-GLOBAL-BUFFERED-REPORT-DAG: "post_rewrite_audit_passed": true
+// PIPELINE-STAGING-GLOBAL-BUFFERED-D2-LABEL: tt.func @global_to_lds_buffered
+// PIPELINE-STAGING-GLOBAL-BUFFERED-D2: ttg.local_alloc {{.*}}!ttg.memdesc<3x64x128xf16
+// PIPELINE-STAGING-GLOBAL-BUFFERED-D2: ttg.async_copy_global_to_local
+// PIPELINE-STAGING-GLOBAL-BUFFERED-D2: ttg.async_copy_global_to_local
+// PIPELINE-STAGING-GLOBAL-BUFFERED-D2: scf.for
+// PIPELINE-STAGING-GLOBAL-BUFFERED-D2: ttg.local_load
+// PIPELINE-STAGING-GLOBAL-BUFFERED-D2: ttg.local_load
+// PIPELINE-STAGING-GLOBAL-BUFFERED-D2-REPORT-DAG: "accepted": true
+// PIPELINE-STAGING-GLOBAL-BUFFERED-D2-REPORT-DAG: "buffer_depth": 3
+// PIPELINE-STAGING-GLOBAL-BUFFERED-D2-REPORT-DAG: "distance": 2
+// PIPELINE-STAGING-GLOBAL-BUFFERED-D2-REPORT-DAG: "logical_lds_bytes_after": 49152
+// PIPELINE-STAGING-GLOBAL-BUFFERED-D2-REPORT-DAG: "pipeline_expanded": true
+// PIPELINE-STAGING-GLOBAL-BUFFERED-INVALID: buffered global_to_lds staging requires buffer depth greater than distance
 // PIPELINE-STAGING-GLOBAL-BUFFER-LABEL: tt.func @global_to_lds_buffer_load
 // PIPELINE-STAGING-GLOBAL-BUFFER-NOT: amdg.buffer_load %
 // PIPELINE-STAGING-GLOBAL-BUFFER: amdg.buffer_load_to_local
@@ -574,6 +618,25 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
       %consumer = arith.addf %slice, %slice : tensor<32x64xf16, #blocked>
     }
     tt.return
+  }
+
+  tt.func @global_to_lds_buffered(
+      %ptrs: tensor<64x128x!tt.ptr<f16>, #blocked>,
+      %mask: tensor<64x128xi1, #blocked>,
+      %other: tensor<64x128xf16, #blocked>,
+      %initial: tensor<32x64xf16, #blocked>)
+      -> tensor<32x64xf16, #blocked> {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c4 = arith.constant 4 : index
+    %result = scf.for %i = %c0 to %c4 step %c1
+        iter_args(%acc = %initial) -> (tensor<32x64xf16, #blocked>) {
+      %loaded = tt.load %ptrs, %mask, %other : tensor<64x128x!tt.ptr<f16>, #blocked>
+      %slice = amdg.extract_slice %loaded [0, 0] : tensor<64x128xf16, #blocked> to tensor<32x64xf16, #blocked>
+      %consumer = arith.addf %slice, %acc : tensor<32x64xf16, #blocked>
+      scf.yield %consumer : tensor<32x64xf16, #blocked>
+    }
+    tt.return %result : tensor<32x64xf16, #blocked>
   }
 
   tt.func @global_to_lds_buffer_load(

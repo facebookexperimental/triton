@@ -25,6 +25,7 @@ struct PlanPipelineStagingIntent {
   std::string valueId;
   std::string action;
   std::vector<std::string> consumerIds;
+  int64_t distance = 0;
   int64_t bufferDepth = 0;
   int64_t alignment = 0;
 };
@@ -38,6 +39,8 @@ struct PlanLoopPipelineDelta {
 struct PlanPipelineStagingApplyRecord {
   std::string valueId;
   std::string action;
+  int64_t distance = 0;
+  int64_t bufferDepth = 0;
   int64_t derivedOperationsCloned = 0;
   int64_t derivedOperationsPruned = 0;
   int64_t selectedConsumerOperands = 0;
@@ -53,6 +56,7 @@ struct PlanPipelineStagingApplyRecord {
   bool registerSourceEliminated = false;
   bool globalAccessSemanticsPreserved = false;
   bool logicalLiveRangeShortened = false;
+  bool pipelineExpanded = false;
 };
 
 struct PlanPipelineDelta {

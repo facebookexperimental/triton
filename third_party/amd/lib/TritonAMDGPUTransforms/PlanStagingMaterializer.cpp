@@ -1,9 +1,11 @@
 #include "PlanStagingMaterializer.h"
 
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/IR/IRMapping.h"
 #include "third_party/amd/include/Dialect/TritonAMDGPU/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
+#include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include <iterator>
 
 namespace mlir::triton::amdgpu {
@@ -61,9 +63,11 @@ static LogicalResult materializeGlobalCopy(PlanLdsStaging &request,
                                            std::string &error) {
   OpBuilder builder(producer);
   Location loc = producer->getLoc();
+  Value destination = request.bufferView ? request.bufferView.getResult()
+                                         : request.allocation.getResult();
   if (auto load = dyn_cast<triton::LoadOp>(producer)) {
     auto copy = gpu::AsyncCopyGlobalToLocalOp::create(
-        builder, loc, load.getPtr(), request.allocation, load.getMask(),
+        builder, loc, load.getPtr(), destination, load.getMask(),
         load.getOther(), load.getCache(), load.getEvict(), load.getIsVolatile(),
         /*contiguity=*/1);
     request.globalCopy = copy;
@@ -75,7 +79,7 @@ static LogicalResult materializeGlobalCopy(PlanLdsStaging &request,
         copy.getIsVolatile() == load.getIsVolatile();
   } else if (auto load = dyn_cast<BufferLoadOp>(producer)) {
     auto copy = BufferLoadToLocalOp::create(
-        builder, loc, request.allocation, load.getPtr(), load.getOffsets(),
+        builder, loc, destination, load.getPtr(), load.getOffsets(),
         load.getMask(), load.getOther(), load.getStride(), load.getCache(),
         load.getContiguity());
     request.globalCopy = copy;
@@ -102,12 +106,31 @@ static LogicalResult materializeGlobalCopy(PlanLdsStaging &request,
       builder, loc, request.asyncCommit->getResult(0), 0);
   request.visibilityBarrier =
       gpu::BarrierOp::create(builder, loc, gpu::AddrSpace::Local);
-  request.load = gpu::LocalLoadOp::create(
-      builder, loc, request.tensorType, request.allocation, request.asyncWait);
+  request.load = gpu::LocalLoadOp::create(builder, loc, request.tensorType,
+                                          destination, request.asyncWait);
   request.directToLdsCopies = 1;
   request.asyncCommitsInserted = 1;
   request.asyncWaitsInserted = 1;
   return success();
+}
+
+static Value addRingIndex(PlanLdsStaging &request, scf::ForOp &loop) {
+  OpBuilder outerBuilder(loop);
+  Location loc = loop.getLoc();
+  Value one = arith::ConstantIntOp::create(outerBuilder, loc, 1, 32);
+  Value minusOne = arith::ConstantIntOp::create(outerBuilder, loc, -1, 32);
+  Value depth =
+      arith::ConstantIntOp::create(outerBuilder, loc, request.bufferDepth, 32);
+
+  unsigned argumentIndex = loop.getBody()->getNumArguments();
+  loop = ::mlir::addIterArgsToLoop(outerBuilder, loop, {minusOne});
+  Value ring = loop.getBody()->getArgument(argumentIndex);
+  OpBuilder bodyBuilder(loop.getBody(), loop.getBody()->begin());
+  Value incremented = arith::AddIOp::create(bodyBuilder, loc, ring, one);
+  Value wrapped =
+      arith::RemUIOp::create(bodyBuilder, loc, incremented, depth);
+  ::mlir::appendToForOpYield(loop, {wrapped});
+  return wrapped;
 }
 
 } // namespace
@@ -115,10 +138,13 @@ static LogicalResult materializeGlobalCopy(PlanLdsStaging &request,
 LogicalResult materializeLdsStaging(MutableArrayRef<PlanLdsStaging> staging,
                                     PlanStagingMaterializationResult &result,
                                     std::string &error) {
+  if (!staging.empty())
+    result.loop = staging.front().loop;
   for (PlanLdsStaging &request : staging) {
     Operation *producer = request.source.getDefiningOp();
     if (!request.loop || !producer || !request.tensorType ||
         request.logicalBytes <= 0 || request.alignment <= 0 ||
+        request.bufferDepth <= 0 || request.distance < 0 ||
         request.consumers.empty() || request.consumerOperands.empty()) {
       error = "invalid resolved LDS-staging request";
       return failure();
@@ -131,17 +157,37 @@ LogicalResult materializeLdsStaging(MutableArrayRef<PlanLdsStaging> staging,
     auto memdescType = gpu::MemDescType::get(
         request.tensorType.getShape(), request.tensorType.getElementType(),
         sharedEncoding, sharedMemory, /*mutableMemory=*/true);
+    if (request.bufferDepth > 1) {
+      if (request.action != "global_to_lds" || request.distance < 1 ||
+          request.bufferDepth <= request.distance) {
+        error = "invalid buffered global-to-LDS staging request";
+        return failure();
+      }
+      request.ringIndex = addRingIndex(request, result.loop);
+      for (PlanLdsStaging &candidate : staging)
+        candidate.loop = result.loop;
+      memdescType =
+          triton::getMultiBufferedType(memdescType, request.bufferDepth);
+    }
 
-    OpBuilder allocationBuilder(request.loop);
+    OpBuilder allocationBuilder(result.loop);
     request.allocation = gpu::LocalAllocOp::create(
         allocationBuilder, producer->getLoc(), memdescType);
     request.allocation->setAttr(
         "alignment", allocationBuilder.getI32IntegerAttr(request.alignment));
     ++result.newAllocations;
 
-    OpBuilder deallocationBuilder(request.loop->getBlock(),
-                                  std::next(request.loop->getIterator()));
-    gpu::LocalDeallocOp::create(deallocationBuilder, request.loop.getLoc(),
+    if (request.bufferDepth > 1) {
+      OpBuilder viewBuilder(producer);
+      request.bufferView =
+          triton::createSingleBufferView(viewBuilder, request.allocation,
+                                         request.ringIndex)
+              .getDefiningOp<gpu::MemDescIndexOp>();
+    }
+
+    OpBuilder deallocationBuilder(result.loop->getBlock(),
+                                  std::next(result.loop->getIterator()));
+    gpu::LocalDeallocOp::create(deallocationBuilder, result.loop.getLoc(),
                                 request.allocation);
 
     if (request.action == "register_to_lds") {

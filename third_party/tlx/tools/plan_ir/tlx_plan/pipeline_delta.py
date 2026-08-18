@@ -49,6 +49,7 @@ class StagingPipelineIntent:
     consumers: list[str]
     buffer_depth: int
     alignment: int
+    distance: int = 0
 
     def validate(self) -> None:
         if not self.value:
@@ -59,7 +60,25 @@ class StagingPipelineIntent:
             raise PlanError(f"pipeline staging for {self.value!r} must name at least one consumer")
         if len(self.consumers) != len(set(self.consumers)):
             raise PlanError(f"pipeline staging for {self.value!r} repeats a consumer")
-        _require_positive_int(self.buffer_depth, "pipeline staging buffer depth")
+        depth = _require_positive_int(self.buffer_depth, "pipeline staging buffer depth")
+        if (
+            not isinstance(self.distance, int)
+            or isinstance(self.distance, bool)
+            or self.distance < 0
+        ):
+            raise PlanError("pipeline staging distance must be a non-negative integer")
+        if self.action == "register_to_lds" and (depth != 1 or self.distance != 0):
+            raise PlanError(
+                "register_to_lds supports only same-iteration single-slot staging"
+            )
+        if self.action == "global_to_lds" and depth == 1 and self.distance != 0:
+            raise PlanError("single-slot global_to_lds staging must have distance zero")
+        if self.action == "global_to_lds" and depth > 1 and self.distance < 1:
+            raise PlanError("buffered global_to_lds staging requires a positive distance")
+        if self.action == "global_to_lds" and depth <= self.distance:
+            raise PlanError(
+                "buffered global_to_lds staging requires buffer depth greater than distance"
+            )
         alignment = _require_positive_int(self.alignment, "pipeline staging alignment")
         if alignment & (alignment - 1):
             raise PlanError("pipeline staging alignment must be a power of two")
@@ -334,7 +353,9 @@ def validate_pipeline_delta(
         for loop in delta.loops
         for transaction in loop.transactions
     ) or any(
-        staging.buffer_depth > 1 for loop in delta.loops for staging in loop.staging
+        staging.distance > 0 or staging.buffer_depth > 1
+        for loop in delta.loops
+        for staging in loop.staging
     )
     groups = {group["id"]: group for group in plan.async_groups}
     transactions = {
@@ -343,6 +364,8 @@ def validate_pipeline_delta(
     changes_prefetch_distance = False
     changes_buffer_depth = False
     for loop in delta.loops:
+        changes_prefetch_distance |= any(staging.distance > 0 for staging in loop.staging)
+        changes_buffer_depth |= any(staging.buffer_depth > 1 for staging in loop.staging)
         for intent in loop.transactions:
             for transaction_id in groups[intent.group].get("transactions", []):
                 transaction = transactions[transaction_id]

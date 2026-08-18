@@ -9,9 +9,9 @@
 
 namespace mlir::triton::amdgpu {
 
-/// A resolved M1.5b.4 single-slot register-to-LDS staging request. The source,
-/// supported derived-value DAG, and every selected consumer are direct
-/// children of the same scf.for.
+/// A resolved M1.5b.4 register/global-to-LDS staging request. Buffered global
+/// staging is expanded as a cross-iteration software pipeline; register
+/// staging remains same-iteration and single-slot.
 struct PlanLdsStaging {
   scf::ForOp loop;
   std::string action;
@@ -21,6 +21,8 @@ struct PlanLdsStaging {
   RankedTensorType tensorType;
   int64_t logicalBytes = 0;
   int64_t alignment = 0;
+  int64_t distance = 0;
+  int64_t bufferDepth = 1;
   SmallVector<Operation *> consumers;
   SmallVector<OpOperand *> consumerOperands;
   SmallVector<Operation *> derivedOperations;
@@ -40,8 +42,11 @@ struct PlanLdsStaging {
   bool registerSourceEliminated = false;
   bool globalAccessSemanticsPreserved = false;
   bool logicalLiveRangeShortened = false;
+  bool pipelineExpanded = false;
 
   gpu::LocalAllocOp allocation;
+  Value ringIndex;
+  gpu::MemDescIndexOp bufferView;
   gpu::LocalStoreOp store;
   gpu::LocalLoadOp load;
   gpu::BarrierOp visibilityBarrier;
@@ -54,6 +59,7 @@ struct PlanLdsStaging {
 };
 
 struct PlanStagingMaterializationResult {
+  scf::ForOp loop;
   int64_t newAllocations = 0;
   int64_t newStores = 0;
   int64_t newLoads = 0;

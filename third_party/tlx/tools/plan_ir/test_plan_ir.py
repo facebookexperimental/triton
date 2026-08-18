@@ -593,7 +593,7 @@ def _pipeline_delta(plan: PlanBundle, ids: dict[str, str]) -> PlanPipelineDelta:
                         value=ids["value"],
                         action="register_to_lds",
                         consumers=[ids["consumer"]],
-                        buffer_depth=2,
+                        buffer_depth=1,
                         alignment=16,
                     )
                 ],
@@ -660,6 +660,21 @@ def test_pipeline_delta_reports_existing_ring_depth_and_distance_changes() -> No
     assert report["changes_synchronization"]
 
 
+def test_pipeline_delta_reports_buffered_global_staging() -> None:
+    plan, ids = _plan_with_pipeline_contract()
+    delta = _pipeline_delta(plan, ids)
+    delta.loops[0].transactions = []
+    staging = delta.loops[0].staging[0]
+    staging.action = "global_to_lds"
+    staging.distance = 1
+    staging.buffer_depth = 2
+    report = validate_pipeline_delta(delta, plan)
+    assert report["requires_modulo_scheduling"]
+    assert report["changes_prefetch_distance"]
+    assert report["changes_buffer_depth"]
+    assert report["changes_iteration_storage"]
+
+
 def test_pipeline_delta_rejects_stale_plan_and_unknown_group() -> None:
     plan, ids = _plan_with_pipeline_contract()
     delta = _pipeline_delta(plan, ids)
@@ -720,6 +735,14 @@ def test_pipeline_delta_rejects_invalid_depth_and_alignment() -> None:
     delta.loops[0].transactions[0].buffer_depth = 2
     delta.loops[0].staging[0].alignment = 12
     with pytest.raises(PlanError, match="power of two"):
+        delta.validate(plan)
+    delta.loops[0].staging[0].alignment = 16
+    delta.loops[0].staging[0].buffer_depth = 2
+    with pytest.raises(PlanError, match="same-iteration single-slot"):
+        delta.validate(plan)
+    delta.loops[0].staging[0].action = "global_to_lds"
+    delta.loops[0].staging[0].distance = 2
+    with pytest.raises(PlanError, match="greater than distance"):
         delta.validate(plan)
 
 
