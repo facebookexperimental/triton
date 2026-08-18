@@ -744,19 +744,82 @@ scheduleKeyOpsAnnotation(scf::ForOp forOp,
   }
 
   CoarseSchedule schedule(numStages);
+
+  // Schedule latency operations in dedicated prefetch clusters ahead of the
+  // annotated MMA clusters. Rank a load by the wavefront of its earliest
+  // annotated consumer: stage + order, then stage. This keeps stage-0 inputs
+  // for the next contraction ahead of stage-1 inputs for the current
+  // contraction when they share a compute-order cluster (FA backward's dOt
+  // before delayed q), without changing the annotated MMA execution order.
+  DenseMap<Operation *, std::tuple<int, int, int>> latencySchedule;
+  DenseSet<Operation *> explicitlyScheduledLatency;
+  SmallVector<std::tuple<int, int, int>> prefetchKeys;
+  for (auto &[mma, stage, cluster] : annotatedMMAs) {
+    SetVector<Operation *> backwardSlice;
+    BackwardSliceOptions options;
+    options.omitBlockArguments = true;
+    options.omitUsesFromAbove = false;
+    (void)getBackwardSlice(mma, &backwardSlice, options);
+    std::tuple<int, int, int> key = {stage + cluster, stage, cluster};
+    for (Operation *dependency : backwardSlice) {
+      if (!opLatency.count(dependency))
+        continue;
+      if (auto attr = dependency->getAttrOfType<StringAttr>("tt.autows")) {
+        auto parsed = llvm::json::parse(attr.getValue());
+        if (!parsed) {
+          llvm::consumeError(parsed.takeError());
+        } else {
+          if (auto *obj = parsed->getAsObject()) {
+            auto explicitStage = obj->getString("stage");
+            auto explicitOrder = obj->getString("order");
+            if (explicitStage && explicitOrder) {
+              int loadStage = std::stoi(explicitStage->str());
+              int loadOrder = std::stoi(explicitOrder->str());
+              latencySchedule[dependency] = {loadStage + loadOrder, loadStage,
+                                             loadOrder};
+              explicitlyScheduledLatency.insert(dependency);
+              continue;
+            }
+          }
+        }
+      }
+      if (explicitlyScheduledLatency.contains(dependency))
+        continue;
+      auto it = latencySchedule.find(dependency);
+      if (it == latencySchedule.end() || key < it->second)
+        latencySchedule[dependency] = key;
+    }
+  }
+  for (auto &[op, key] : latencySchedule)
+    prefetchKeys.push_back(key);
+  llvm::sort(prefetchKeys);
+  prefetchKeys.erase(std::unique(prefetchKeys.begin(), prefetchKeys.end()),
+                     prefetchKeys.end());
+
+  SmallVector<std::pair<std::tuple<int, int, int>, CoarseSchedule::Cluster>>
+      prefetchClusters;
+  for (auto key : prefetchKeys)
+    prefetchClusters.push_back({key, schedule.clusters.newAtBack()});
+
   SmallVector<CoarseSchedule::Cluster> clusters;
   for (int i = 0; i < numClusters; ++i)
     clusters.push_back(schedule.clusters.newAtBack());
+
+  for (auto &[op, key] : latencySchedule) {
+    auto cluster = llvm::find_if(prefetchClusters, [&](const auto &entry) {
+      return entry.first == key;
+    });
+    assert(cluster != prefetchClusters.end());
+    schedule.insert(op, std::get<1>(key), cluster->second);
+  }
 
   // Assign annotated MMAs to their specified stage/cluster.
   for (auto &[mma, stage, cluster] : annotatedMMAs) {
     schedule.insert(mma, stage, clusters[cluster]);
   }
 
-  // Leave latency ops unscheduled here. scheduleDependencies() places each
-  // load with its annotated consumer. This realizes the qT/dOt prologue and
-  // delayed-q epilogue of FA backward without speculatively prefetching a
-  // single-buffered metadata channel such as delta/Di.
+  // Latency ops outside annotated MMA backward slices remain unscheduled;
+  // scheduleDependencies() places them with their first scheduled consumer.
 
   LDBG("scheduleKeyOpsAnnotation: scheduled "
        << annotatedMMAs.size() << " annotated MMAs with " << numStages
