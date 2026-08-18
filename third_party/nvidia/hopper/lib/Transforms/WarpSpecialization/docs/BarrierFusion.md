@@ -77,6 +77,12 @@ to their sum, a single barrier wait covers all loads.
 4. **Single wait**: The consumer issues a single `WaitBarrierOp` on the ready
    barrier, which completes when all TMA copies have arrived.
 
+Fused loads must also agree on their issue protocol: a barrier group is either
+entirely ordinary per-CTA loads or entirely cooperative 2-CTA loads. Mixing the
+two would route ordinary completion to the pair leader while computing its
+expected byte count with per-CTA semantics. `optimizeTMALoads` asserts this
+invariant before materializing the shared barrier.
+
 ### Where It's Called
 
 `optimizeTMALoads` is called from `insertAsyncComm` in `WSCodePartition.cpp`
