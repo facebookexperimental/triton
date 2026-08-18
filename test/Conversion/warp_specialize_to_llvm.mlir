@@ -191,7 +191,7 @@ llvm.func @generate_switch_loop() attributes {allocation.offset = 32 : i32} {
   // CHECK-NEXT: [[WID:%.*]] = llvm.udiv [[TIDX]], [[C32]]
   // CHECK-NEXT: [[WARP_ID:%.*]] = nvvm.shfl.sync idx [[CNEG1]], [[WID]], [[C0]], [[C31]]
   // CHECK-NEXT: [[IS_DEFAULT:%.*]] = llvm.icmp "ult" [[WARP_ID]], [[C4]]
-  // CHECK-NEXT: llvm.cond_br [[IS_DEFAULT]], [[BODY:\^.*]], [[SWITCH_LOOP:\^.*]]
+  // CHECK-NEXT: llvm.cond_br [[IS_DEFAULT]] weights([4, 7]), [[BODY:\^.*]], [[SWITCH_LOOP:\^.*]]
 
   // CHECK: [[SWITCH_LOOP]]:
   // CHECK-NEXT: "llvm.nvvm.barrier.cta.sync.all"([[C1]])

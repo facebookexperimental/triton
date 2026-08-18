@@ -195,7 +195,11 @@ static LogicalResult lowerWarpSpecialize(LLVM::LLVMFuncOp func,
     auto voidTy = void_ty(ctx);
     ptxBuilder.launch(b, func.getLoc(), voidTy);
   }
-  LLVM::CondBrOp::create(b, b.getLoc(), isDefault, entry, switchLoop);
+  LLVM::CondBrOp::create(
+      b, b.getLoc(), isDefault, entry, ValueRange{}, switchLoop, ValueRange{},
+      std::pair<uint32_t, uint32_t>{
+          static_cast<uint32_t>(defaultNumWarps),
+          static_cast<uint32_t>(totalNumWarpsAttr.getInt() - defaultNumWarps)});
 
   // Forward arguments from the header into the old entry block.
   for (auto [arg, oldArg] :
