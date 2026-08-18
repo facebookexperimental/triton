@@ -300,7 +300,7 @@ elif supports_host_descriptor():
 else:
     NUM_STAGES_OPTIONS = [3]
 _FWD_USE_CLC = os.environ.get("AUTOWS_FWD_CLC", "0") == "1"
-_FWD_CLC_SAFE_STAGES = "1" if _FWD_USE_CLC else "4"
+_FWD_CLC_SAFE_STAGES = "2" if _FWD_USE_CLC else "4"
 FWD_2CTA_NUM_STAGES = int(os.environ.get("AUTOWS_FWD_NUM_STAGES", _FWD_CLC_SAFE_STAGES))
 FWD_2CTA_BLOCK_M = int(os.environ.get("AUTOWS_FWD_BLOCK_M", "256"))
 FWD_2CTA_DP_FACTOR = int(os.environ.get("AUTOWS_FWD_DP_FACTOR", "2"))
