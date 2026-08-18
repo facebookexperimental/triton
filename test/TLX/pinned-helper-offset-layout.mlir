@@ -13,7 +13,8 @@
 // releasing only its operand.
 //
 // CHECK-DAG: #[[$TRANSPOSE_SRC_LINEAR:.*]] = #ttg.linear<{{.*}}register = {{\[\[0, 1\], \[8, 0\], \[0, 8\], \[0, 16\], \[0, 32\]\]}}
-// CHECK-DAG: #[[$TRANSPOSE_SRC_USER:.*]] = #tlx.user_layout<#[[$TRANSPOSE_SRC_LINEAR]]>
+// CHECK-DAG: #[[$TRANSPOSE_DST_LINEAR:.*]] = #ttg.linear<{{.*}}register = {{\[\[1, 0\], \[0, 8\], \[8, 0\], \[16, 0\], \[32, 0\]\]}}
+// CHECK-DAG: #[[$TRANSPOSE_DST_USER:.*]] = #tlx.user_layout<#[[$TRANSPOSE_DST_LINEAR]]>
 // The helper restructures only the loaded value. The pinned offset flows into
 // amdg.buffer_load, which is an ownership boundary for argument dataflow.
 //
@@ -39,9 +40,18 @@
 // CHECK: tt.return
 // CHECK-LABEL: tt.func public @transpose_result_pin
 // CHECK: %[[TRANSPOSE_VALUE:.*]] = arith.constant
-// CHECK-SAME: tensor<128x64xf32, #tlx.no_verify_layout<#[[$TRANSPOSE_SRC_USER]]>>
-// CHECK: tt.trans %[[TRANSPOSE_VALUE]]
+// CHECK-SAME: tensor<128x64xf32, #tlx.no_verify_layout<#[[$TRANSPOSE_SRC_LINEAR]]>>
+// CHECK: %[[TRANSPOSED:.*]] = tt.trans %[[TRANSPOSE_VALUE]]
+// CHECK-SAME: -> tensor<64x128xf32, #tlx.no_verify_layout<#[[$TRANSPOSE_DST_USER]]>>
 // CHECK: tt.return
+// CHECK-LABEL: tt.func public @while_layout
+// CHECK: %[[WHILE_INIT:.*]] = tlx.require_layout
+// CHECK-SAME: -> tensor<4x256xi32, #[[WHILE_LAYOUT:tlx.no_verify_layout<#linear[0-9]*>]]>
+// CHECK: %[[WHILE_RESULT:.*]] = scf.while (%[[BEFORE:.*]] = %[[WHILE_INIT]])
+// CHECK-SAME: (tensor<4x256xi32, #[[WHILE_LAYOUT]]>) -> tensor<4x256xi32, #[[WHILE_LAYOUT]]>
+// CHECK: scf.condition(%{{.*}}) %{{.*}} : tensor<4x256xi32, #[[WHILE_LAYOUT]]>
+// CHECK: ^bb0(%{{.*}}: tensor<4x256xi32, #[[WHILE_LAYOUT]]>):
+// CHECK: scf.yield {{.*}} : tensor<4x256xi32, #[[WHILE_LAYOUT]]>
 //
 // Full post-fixup snapshots follow. The current module uses generic syntax
 // because releasing only the call operand makes the call temporarily invalid.
@@ -164,6 +174,27 @@ module {
     %transposed = tt.trans %value {order = array<i32: 1, 0>}
         : tensor<128x64xf32, #transpose_wrong_src_pin>
           -> tensor<64x128xf32, #transpose_pin>
+    tt.return
+  }
+
+  tt.func public @while_layout(
+      %value: tensor<4x256xi32>, %keep_going: i1) {
+    %result = scf.while (%before = %value)
+        : (tensor<4x256xi32>) -> tensor<4x256xi32> {
+      scf.condition(%keep_going) %before : tensor<4x256xi32>
+    } do {
+    ^bb0(%after: tensor<4x256xi32>):
+      %pinned = tlx.require_layout %after
+          : tensor<4x256xi32> -> tensor<4x256xi32, #pin>
+      // Keep the input module verifiable: the placeholder-aware reshape
+      // verifier permits an encoding-free result. Fixup infers both reshape
+      // results first, then repairs the while edges on its next iteration.
+      %reshaped = tt.reshape %pinned allow_reorder
+          : tensor<4x256xi32, #pin> -> tensor<2x2x256xi32>
+      %restored = tt.reshape %reshaped allow_reorder
+          : tensor<2x2x256xi32> -> tensor<4x256xi32>
+      scf.yield %restored : tensor<4x256xi32>
+    }
     tt.return
   }
 }

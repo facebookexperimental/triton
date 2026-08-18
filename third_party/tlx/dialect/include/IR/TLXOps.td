@@ -289,8 +289,10 @@ def TLX_ReleaseLayoutOp : TLX_Op<"release_layout",
   let description = [{
     `tlx.release_layout` marks the boundary after which tensor layout
     propagation may choose an encoding independently of the source. The
-    source must have an explicit layout; the result may be unencoded in TTIR
-    or carry the layout selected during TTGIR propagation.
+    source normally has an explicit layout. An encoding-free private helper
+    argument or call result is also accepted because TLX Fixup may specialize
+    that helper ABI from a concrete call site. The result may be unencoded in
+    TTIR or carry the layout selected during TTGIR propagation.
   }];
 
   let arguments = (ins TT_Tensor:$src);
