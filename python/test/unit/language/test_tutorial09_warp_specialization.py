@@ -1073,7 +1073,8 @@ def test_tutorial09_matmul_tma_dynamic_persistent_while_loop_warp_specialize(EPI
 
 @pytest.mark.skipif(not is_blackwell(), reason="CLC requires Blackwell (SM100+)")
 @pytest.mark.parametrize("EPILOGUE_SUBTILE", [1, 2, 4])
-def test_tutorial09_matmul_tma_clc_persistent_while_loop_warp_specialize(EPILOGUE_SUBTILE):
+@pytest.mark.parametrize("NUM_CTAS", [1, 2])
+def test_tutorial09_matmul_tma_clc_persistent_while_loop_warp_specialize(EPILOGUE_SUBTILE, NUM_CTAS):
     """Dynamic persistent matmul whose while-loop tile id is claimed via the core
     CLC tile scheduler (tl.clc_tile_scheduler) and warp-specialized (Blackwell)."""
     M, N, K = 2048, 2048, 256
@@ -1109,6 +1110,13 @@ def test_tutorial09_matmul_tma_clc_persistent_while_loop_warp_specialize(EPILOGU
         # cancel/steal pending clusters.
         grid = lambda META: (triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]), )
 
+        launch_options = {}
+        if NUM_CTAS == 2:
+            launch_options = {
+                "ctas_per_cga": (2, 1, 1),
+                "launch_cluster": True,
+            }
+
         kernel = matmul_kernel_tma_clc_persistent_ws_while[grid](
             a_desc,
             b_desc,
@@ -1124,6 +1132,7 @@ def test_tutorial09_matmul_tma_clc_persistent_while_loop_warp_specialize(EPILOGU
             NUM_SMS=NUM_SMS,
             num_stages=num_stages,
             num_warps=num_warps,
+            **launch_options,
         )
 
         ttgir = kernel.asm["ttgir"]

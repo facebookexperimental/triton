@@ -192,6 +192,17 @@
 - **Fix**: two parts. (1) `findReuseCandidate` now applies the co-live filter to the **target** side as well — only a TMA-staging candidate may land on a host that `isSmemLiveAcrossInnerLoop`, mirroring the candidate-side filter Phase 3.6 already had. (2) New `relaxCopySafetyFloorToBudget` gives the copy-safety floor back — it is a schedule proof, unlike the cross-stage floor, which stays unconditional — one copy at a time, largest buffer first, until the plan fits; Phase 4 then re-bumps whatever the budget allows. Relaxing straight back to the pre-floor depth is **not** enough: Phase 3.7 spends the freed slot on staging and Phase 4 can no longer restore the operand.
 - **Tests**: `test_autows_addmm.py` 73 passed (was 4 failed / 69 passed); the resulting plan is 4=2 / 5=3 / 6=3 with no `allocation.reuseTarget`. A dedicated lit test is still missing.
 
+### 22. Clustered CLC state materialized inside an isolated AutoWS partition (2026-08-13, fixed)
+- **Symptom**: A 2-CTA CLC outer-while kernel either fails verification because the CLC response/barriers are referenced from an isolated worker region without captures, or deadlocks when the cluster-init rendezvous executes from only one worker partition.
+- **Root cause** (`CLCLowering.cpp`): CLC materialization runs after physical AutoWS and originally allocated clustered response/completion state beside the CLC loop inside its owner partition. `ttg.warp_specialize` partition regions are isolated from above, and a cluster rendezvous nested in one region is executed by only that region's warps rather than every warp participating in function-entry barrier initialization.
+- **Fix**: Hoist clustered response, full, and empty-barrier state before the enclosing `ttg.warp_specialize`; append each value to the partition op's explicit capture list and replace uses in every isolated region. Rely on the backend's function-entry init fence/cluster rendezvous for hoisted barriers; retain explicit publication for non-hoisted clustered CLC state.
+- **Tests**: `test_tutorial09_matmul_tma_clc_persistent_while_loop_warp_specialize` covers both 1-CTA and clustered 2-CTA launches and asserts physical WS, CLC lowering, and numerical correctness.
+
+### 23. Pipelined 2-CTA FA under a CLC outer while misses a QK MMA completion wait (2026-08-13, open)
+- **Symptom**: CLC 2-CTA FA forward passes repeated correctness with one compiler/KV stage. Two stages hang intermittently; compute-sanitizer synccheck reports `Barrier error detected. Missing wait` at the first QK `tl.dot`. Three and four stages exceed SMEM before launch.
+- **Localization**: Final TTGIR double-buffers the QK completion barrier and carries the inner-loop pipeline through a physically specialized outer `scf.while`. The failure is in completion-barrier phase/reuse across the prologue, steady state, and next outer iteration, not in CLC tile mapping or result broadcast. Static 2-CTA AutoWS with the same inner pipeline is correct.
+- **Safe fallback**: CLC FA defaults `AUTOWS_FWD_NUM_STAGES` and `AUTOWS_FWD_KV_NUM_STAGES` to one; explicit environment overrides remain available for debugging. Do not raise the CLC default until stage-2 passes repeated correctness and synccheck.
+
 ## Debugging Workflow
 - `t.dump` captures IR after each WarpSpec pass (doTaskIdPropagate → doBufferAllocation → doMemoryPlanner → doCodePartition → ...)
 - IR after PartitionSchedulingMeta uses `ttg.partition = array<i32: N>` attributes (not `async_task_id`)

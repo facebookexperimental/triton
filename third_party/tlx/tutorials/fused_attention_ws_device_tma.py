@@ -299,11 +299,13 @@ elif supports_host_descriptor():
     NUM_STAGES_OPTIONS = [3]
 else:
     NUM_STAGES_OPTIONS = [3]
-FWD_2CTA_NUM_STAGES = int(os.environ.get("AUTOWS_FWD_NUM_STAGES", "4"))
+_FWD_USE_CLC = os.environ.get("AUTOWS_FWD_CLC", "0") == "1"
+_FWD_CLC_SAFE_STAGES = "1" if _FWD_USE_CLC else "4"
+FWD_2CTA_NUM_STAGES = int(os.environ.get("AUTOWS_FWD_NUM_STAGES", _FWD_CLC_SAFE_STAGES))
 FWD_2CTA_BLOCK_M = int(os.environ.get("AUTOWS_FWD_BLOCK_M", "256"))
 FWD_2CTA_DP_FACTOR = int(os.environ.get("AUTOWS_FWD_DP_FACTOR", "2"))
 FWD_2CTA_MMA_SLICES = int(os.environ.get("AUTOWS_FWD_MMA_SLICES", "2"))
-FWD_2CTA_KV_NUM_STAGES = int(os.environ.get("AUTOWS_FWD_KV_NUM_STAGES", "4"))
+FWD_2CTA_KV_NUM_STAGES = int(os.environ.get("AUTOWS_FWD_KV_NUM_STAGES", _FWD_CLC_SAFE_STAGES))
 FWD_2CTA_OUTER_NUM_STAGES = int(os.environ.get("AUTOWS_FWD_OUTER_NUM_STAGES", "1"))
 
 configs = [
@@ -603,6 +605,7 @@ def _attn_fwd_persist(
     KV_NUM_STAGES: tl.constexpr,
     OUTER_NUM_STAGES: tl.constexpr,
     DP_FACTOR: tl.constexpr,
+    USE_CLC: tl.constexpr = False,
     NUM_CTAS: tl.constexpr = 1,
 ):
     n_tile_num = tl.cdiv(N_CTX, BLOCK_M)
@@ -641,46 +644,91 @@ def _attn_fwd_persist(
         block_shape=[BLOCK_M, HEAD_DIM],
     )
 
-    # inner loop warpspec vs. outer loop warpspec
-    for _ in tl.range(
-            0,
-            tiles_per_sm,
-            warp_specialize=warp_specialize and OUTER_LOOP,
-            merge_epilogue=True,
-            separate_epilogue_store=True,
-            data_partition_factor=DP_FACTOR,
-            num_stages=OUTER_NUM_STAGES if NUM_CTAS == 2 else None,
-    ):
-        pid = tile_idx % n_tile_num
-        off_hz = tile_idx // n_tile_num
-        _attn_fwd_tma_dp(
-            sm_scale,
-            M,
-            Z,
-            H,
-            desc_q,
-            desc_k,
-            desc_v,
-            desc_o,
-            pid,
-            off_hz,
-            N_CTX,
-            HEAD_DIM,
-            BLOCK_M,
-            BLOCK_N,
-            FP8_OUTPUT,
-            STAGE,
-            warp_specialize and not OUTER_LOOP,
-            dtype,
-            SUBTILING,
-            VECT_MUL,
-            FADD2_REDUCE,
-            MMA_SLICES,
-            KV_NUM_STAGES,
-            DP_FACTOR,
-            NUM_CTAS,
-        )
-        tile_idx += num_progs
+    if USE_CLC:
+        scheduler = tl.clc_tile_scheduler()
+        while tl.condition(
+                scheduler.is_valid(),
+                warp_specialize=warp_specialize,
+                merge_epilogue=True,
+                separate_epilogue_store=True,
+                data_partition_factor=DP_FACTOR,
+        ):
+            # Preserve the static 2-CTA mapping: adjacent physical CTAs process
+            # adjacent M tiles.  The CLC lowering adds the cluster rank to the
+            # canceled cluster's first CTA id, so tile_id is already the
+            # per-CTA tile index expected by _attn_fwd_tma_dp.
+            tile_idx = scheduler.tile_id[0]
+            pid = tile_idx % n_tile_num
+            off_hz = tile_idx // n_tile_num
+            _attn_fwd_tma_dp(
+                sm_scale,
+                M,
+                Z,
+                H,
+                desc_q,
+                desc_k,
+                desc_v,
+                desc_o,
+                pid,
+                off_hz,
+                N_CTX,
+                HEAD_DIM,
+                BLOCK_M,
+                BLOCK_N,
+                FP8_OUTPUT,
+                STAGE,
+                False,
+                dtype,
+                SUBTILING,
+                VECT_MUL,
+                FADD2_REDUCE,
+                MMA_SLICES,
+                KV_NUM_STAGES,
+                DP_FACTOR,
+                NUM_CTAS,
+            )
+            scheduler = scheduler.advance()
+    else:
+        # inner loop warpspec vs. outer loop warpspec
+        for _ in tl.range(
+                0,
+                tiles_per_sm,
+                warp_specialize=warp_specialize and OUTER_LOOP,
+                merge_epilogue=True,
+                separate_epilogue_store=True,
+                data_partition_factor=DP_FACTOR,
+                num_stages=OUTER_NUM_STAGES if NUM_CTAS == 2 else None,
+        ):
+            pid = tile_idx % n_tile_num
+            off_hz = tile_idx // n_tile_num
+            _attn_fwd_tma_dp(
+                sm_scale,
+                M,
+                Z,
+                H,
+                desc_q,
+                desc_k,
+                desc_v,
+                desc_o,
+                pid,
+                off_hz,
+                N_CTX,
+                HEAD_DIM,
+                BLOCK_M,
+                BLOCK_N,
+                FP8_OUTPUT,
+                STAGE,
+                warp_specialize and not OUTER_LOOP,
+                dtype,
+                SUBTILING,
+                VECT_MUL,
+                FADD2_REDUCE,
+                MMA_SLICES,
+                KV_NUM_STAGES,
+                DP_FACTOR,
+                NUM_CTAS,
+            )
+            tile_idx += num_progs
 
 
 def torch_dtype_to_triton(dtype):
@@ -1727,6 +1775,7 @@ class _attention_opt(torch.autograd.Function):
 
         triton.set_allocator(alloc_fn)
         NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
+        use_clc = _FWD_USE_CLC
 
         def grid(META):
             num_ctas = META.get("NUM_CTAS") or 1
@@ -1740,6 +1789,11 @@ class _attention_opt(torch.autograd.Function):
         def grid_persist(META):
             num_ctas = META.get("NUM_CTAS") or 1
             total_tiles = triton.cdiv(q.shape[2], META["BLOCK_M"]) * q.shape[0] * q.shape[1]
+            if use_clc:
+                # One physical CTA per M tile, matching the static 2-CTA
+                # schedule where neighboring CTAs cover neighboring M tiles.
+                assert total_tiles % num_ctas == 0
+                return (total_tiles, 1, 1)
             num_clusters = min(NUM_SMS // num_ctas, total_tiles // num_ctas)
             return (
                 num_clusters * num_ctas,
@@ -1775,6 +1829,7 @@ class _attention_opt(torch.autograd.Function):
                     STAGE=stage,  #
                     warp_specialize=warp_specialize,
                     OUTER_LOOP=True,
+                    USE_CLC=use_clc,
                     dtype=torch_dtype_to_triton(q.dtype),
                     SUBTILING=SUBTILING,
                     VECT_MUL=VECT_MUL,
