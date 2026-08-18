@@ -365,6 +365,7 @@ void MembarAnalysis::update(Operation *op, BlockInfo *blockInfo,
                  allocation->getAllBufferIdsWithAliases(value)) {
               if (bufferId != Allocation::InvalidBufferId) {
                 auto interval = allocation->getAllocatedInterval(bufferId);
+                interval = narrowIntervalForSubview(value, interval);
                 auto slice = AllocationSlice(value, interval, bufferId);
 
                 if (isa<MemoryEffects::Write>(effectInstance.getEffect()))
