@@ -486,6 +486,51 @@ static inline CUresult triton_construct_tma_desc_cached(
  * triton_launch_kernel — THE one function all consumers call.
  * ------------------------------------------------------------------------- */
 
+static inline int triton_get_exact_cluster_shape(
+    int num_ctas, const int cluster_dims[3], uint32_t required[3]) {
+  required[0] = required[1] = required[2] = 1;
+  if (num_ctas > 1) {
+    required[0] = (uint32_t)num_ctas;
+    return 1;
+  }
+  if (cluster_dims[0] <= 0 || cluster_dims[1] <= 0 ||
+      cluster_dims[2] <= 0)
+    return -1;
+  if (cluster_dims[0] == 1 && cluster_dims[1] == 1 &&
+      cluster_dims[2] == 1)
+    return 0;
+  required[0] = (uint32_t)cluster_dims[0];
+  required[1] = (uint32_t)cluster_dims[1];
+  required[2] = (uint32_t)cluster_dims[2];
+  return 1;
+}
+
+static inline CUresult triton_validate_exact_cluster_grid(
+    const uint32_t grid[3], int num_ctas, const int cluster_dims[3]) {
+  uint32_t required[3];
+  int has_exact_cluster =
+      triton_get_exact_cluster_shape(num_ctas, cluster_dims, required);
+  if (has_exact_cluster < 0 || num_ctas <= 0)
+    return CUDA_ERROR_INVALID_VALUE;
+  if (has_exact_cluster == 0)
+    return CUDA_SUCCESS;
+
+  unsigned long long physical[3] = {
+      (unsigned long long)grid[0] * (unsigned long long)num_ctas,
+      (unsigned long long)grid[1], (unsigned long long)grid[2]};
+  for (unsigned axis = 0; axis < 3; ++axis) {
+    if (physical[axis] % required[axis] != 0) {
+      fprintf(stderr,
+              "[triton] ERROR: physical grid (%llu, %llu, %llu) is not "
+              "divisible by required cluster shape (%u, %u, %u)\n",
+              physical[0], physical[1], physical[2], required[0], required[1],
+              required[2]);
+      return CUDA_ERROR_INVALID_VALUE;
+    }
+  }
+  return CUDA_SUCCESS;
+}
+
 /**
  * Shared launch core (NVIDIA/CUDA only): constructs TMA descriptors, builds the
  * params[] array and launch attributes, then issues cuLaunchKernelEx.
@@ -531,6 +576,9 @@ static inline CUresult triton_launch_kernel_impl(
    * avoids cuLaunchKernelEx rejecting a zero-sized grid. */
   if (grid[0] == 0 || grid[1] == 0 || grid[2] == 0)
     return CUDA_SUCCESS;
+
+  TRITON_CUDA_CHECK(triton_validate_exact_cluster_grid(
+      grid, desc->num_ctas, desc->cluster_dims));
 
   triton_cuLaunchKernelEx_fn launch_fn = triton_get_launch_kernel_ex();
   if (!launch_fn)
@@ -652,7 +700,19 @@ static inline CUresult triton_launch_kernel_impl(
   config.attrs = attrs;
   config.numAttrs = num_attrs;
 
-  return launch_fn(&config, function, params, NULL);
+  CUresult result = launch_fn(&config, function, params, NULL);
+  if (result != CUDA_SUCCESS) {
+    uint32_t required[3];
+    if (triton_get_exact_cluster_shape(desc->num_ctas, desc->cluster_dims,
+                                       required) > 0) {
+      fprintf(stderr,
+              "[triton] ERROR: CUDA rejected launch of physical grid "
+              "(%u, %u, %u) with required cluster shape (%u, %u, %u): %d\n",
+              config.gridDimX, config.gridDimY, config.gridDimZ, required[0],
+              required[1], required[2], (int)result);
+    }
+  }
+  return result;
 }
 
 static inline CUresult
