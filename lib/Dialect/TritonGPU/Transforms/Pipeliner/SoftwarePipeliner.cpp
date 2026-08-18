@@ -10,6 +10,7 @@
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/Triton/Transforms/LoopPeeling.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonGPU/Transforms/Partition.h"
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h"
 #include "triton/Dialect/TritonGPU/Transforms/PipelineExpander.h"
 #include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
@@ -68,7 +69,7 @@ getWarpSpecializedPartitionType(scf::ForOp forOp) {
   auto wsOp = forOp->getParentOfType<triton::gpu::WarpSpecializeOp>();
   if (!wsOp)
     return std::nullopt;
-  auto typesAttr = wsOp->getAttrOfType<ArrayAttr>("ttg.partition.types");
+  auto typesAttr = wsOp->getAttrOfType<ArrayAttr>(kPartitionTypesAttrName);
   if (!typesAttr)
     return std::nullopt;
 
@@ -103,6 +104,14 @@ static bool containsMMA(scf::ForOp forOp) {
                    triton::DotOpInterface>(op)
                    ? WalkResult::interrupt()
                    : WalkResult::advance();
+      })
+      .wasInterrupted();
+}
+
+static bool containsMMAv5(scf::ForOp forOp) {
+  return forOp
+      ->walk([](triton::nvidia_gpu::MMAv5OpInterface) {
+        return WalkResult::interrupt();
       })
       .wasInterrupted();
 }
@@ -166,9 +175,10 @@ static void expandLoops(ModuleOp moduleOp) {
   auto metaWS = triton::tools::getBoolEnv("TRITON_USE_META_WS");
 
   for (scf::ForOp forOp : loops) {
+    std::optional<StringRef> partitionType;
     if (metaWS) {
       if (forOp->getParentOfType<triton::gpu::WarpSpecializeOp>()) {
-        auto partitionType = getWarpSpecializedPartitionType(forOp);
+        partitionType = getWarpSpecializedPartitionType(forOp);
         // An untyped partition cannot be proven to be the GEMM worker. Leave
         // it unexpanded instead of applying GEMM-specific lockstep rules to a
         // load/reduction loop. Also require an actual MMA so stale role
@@ -188,6 +198,17 @@ static void expandLoops(ModuleOp moduleOp) {
 
     std::vector<std::pair<Operation *, unsigned>> finalSchedule =
         schedule.createFinalSchedule(forOp);
+    if (metaWS && containsMMAv5(forOp)) {
+      unsigned maxMMAStage = 0;
+      for (auto &[op, stage] : finalSchedule)
+        if (isa<triton::nvidia_gpu::MMAv5OpInterface>(op))
+          maxMMAStage = std::max(maxMMAStage, stage);
+      for (auto &[op, stage] : finalSchedule) {
+        auto wait = dyn_cast<triton::nvidia_gpu::WaitBarrierOp>(op);
+        if (wait && !wait.getDeps().empty() && stage > maxMMAStage)
+          stage = maxMMAStage;
+      }
+    }
     triton::PipeliningOption options;
     bool useCustomMetaWSEpilogue =
         metaWS && needsCustomMetaWSEpiloguePeeling(forOp);
