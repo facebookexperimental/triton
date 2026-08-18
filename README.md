@@ -1161,23 +1161,6 @@ TLX uses **CUDA-native cluster semantics** which differs from Triton's approach:
     pinned = tlx.require_layout(value, physical)
     ```
 
-- `tlx.cast_preserve_layout(x, dtype, fp_downcast_rounding=None, bitcast=False)` **[Hopper+, MI300+]**
-
-    Change the element type while retaining the tensor's current IR encoding.
-    It supports floating-point extension and truncation, floating-point
-    conversion with an explicit `fp_downcast_rounding`, and equal-width
-    bitcasts with `bitcast=True`. Passing the existing dtype is an identity.
-
-    Use this inside a region where physical ownership is intentional, then
-    call `tlx.release_layout` at the ownership boundary. Ordinary frontend
-    casts remain preferable when the result does not have to preserve an
-    instruction-level register layout.
-
-    ```python
-    probability_bf16 = tlx.cast_preserve_layout(probability_f32, tl.bfloat16)
-    bits = tlx.cast_preserve_layout(probability_f32, tl.int32, bitcast=True)
-    ```
-
 - `tlx.assert_same_layout(lhs, rhs)` **[Hopper+, MI300+]**
 
     Compile-time assertion that two layouts are equivalent after layout

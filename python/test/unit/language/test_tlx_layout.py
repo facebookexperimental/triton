@@ -1274,7 +1274,7 @@ def _fa_mfma_rows_to_workitems(rows):
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Need gfx950 (CDNA4)")
-def test_distributed_linear_layout_cast_and_release_apis_on_cdna4():
+def test_distributed_linear_layout_with_standard_casts_on_cdna4():
     physical = tlx.distributed_linear_layout_encoding.make(
         reg_bases=[],
         lane_bases=[[1], [2], [4], [8], [16], [32]],
@@ -1284,31 +1284,25 @@ def test_distributed_linear_layout_cast_and_release_apis_on_cdna4():
     )
 
     @triton.jit
-    def kernel(X, Y, Bits, ReleasedOffsets, PHYSICAL: tl.constexpr):
+    def kernel(X, Y, Bits, PHYSICAL: tl.constexpr):
         offsets = tl.arange(0, 64)
         values = tl.load(X + offsets)
         pinned = tlx.require_layout(values, PHYSICAL)
-        narrowed = tlx.cast_preserve_layout(pinned, tl.bfloat16)
-        widened = tlx.cast_preserve_layout(narrowed, tl.float32)
-        bits = tlx.cast_preserve_layout(pinned, tl.int32, bitcast=True)
-        ordinary = tlx.release_layout(widened)
-        already_ordinary = tlx.release_layout(offsets)
-        tl.store(Y + offsets, ordinary)
+        narrowed = pinned.to(tl.bfloat16)
+        widened = narrowed.to(tl.float32)
+        bits = pinned.to(tl.int32, bitcast=True)
+        tl.store(Y + offsets, widened)
         tl.store(Bits + offsets, bits)
-        tl.store(ReleasedOffsets + offsets, already_ordinary)
 
     x = torch.linspace(-3.0, 3.0, 64, device=DEVICE, dtype=torch.float32)
     y = torch.empty_like(x)
     bits = torch.empty(64, device=DEVICE, dtype=torch.int32)
-    released_offsets = torch.empty_like(bits)
-    compiled = kernel.warmup(x, y, bits, released_offsets, physical, grid=(1, ), num_warps=1)
-    kernel[(1, )](x, y, bits, released_offsets, physical, num_warps=1)
+    compiled = kernel.warmup(x, y, bits, physical, grid=(1, ), num_warps=1)
+    kernel[(1, )](x, y, bits, physical, num_warps=1)
 
     torch.testing.assert_close(y, x.to(torch.bfloat16).float(), atol=0, rtol=0)
     torch.testing.assert_close(bits, x.view(torch.int32), atol=0, rtol=0)
-    torch.testing.assert_close(released_offsets, torch.arange(64, device=DEVICE, dtype=torch.int32), atol=0, rtol=0)
     assert "#ttg.linear" in compiled.asm["ttir"]
-    assert "tlx.release_layout" not in compiled.asm["ttgir"]
     assert "#tlx.no_verify_layout" not in compiled.asm["ttgir"]
 
 
@@ -1345,7 +1339,7 @@ def test_concrete_mfma_layout_reconciles_elementwise_broadcast_on_cdna4():
         source_rows = tl.arange(0, 256).to(tl.float32) + 1.0
         workitems = _fa_mfma_rows_to_workitems(source_rows)
         rows = _fa_workitems_to_mfma_rows(workitems)
-        out = tlx.cast_preserve_layout(acc * rows[:, None], tl.bfloat16)
+        out = (acc * rows[:, None]).to(tl.bfloat16)
         out = tlx.require_layout(out, STORE)
         row = tl.arange(0, 256)
         col = tl.arange(0, 32)

@@ -89,8 +89,9 @@ Pipeline and benchmark variants
 
 QK products use transposed 32x32x16 MFMA fragments.  Score packets are pinned
 to their physical register ownership while maxima, exponentials, and casts are
-performed; ``tlx.release_layout`` deliberately ends those local contracts at
-composition boundaries.  PV is split into a short prefix and thirteen
+performed.  Ordinary casts retain that ownership; compiler-internal release
+boundaries keep the pins local to the register-level helpers.  PV is split
+into a short prefix and thirteen
 remaining MFMAs so independent preparation for the next score tile can be
 scheduled between them.  Direct-to-LDS transfers are consumed only through
 explicit ``wait_group`` token dependencies.  ``tlx.amd_sched_barrier`` is a
@@ -255,7 +256,7 @@ def _registers_to_mfma_packet(registers):
 
 
 @triton.jit
-def _registers_to_probability_fragments(registers):
+def _registers_to_probability_fragments(registers, p_layout: tl.constexpr):
     """Invert and split a pinned register packet before releasing it."""
     binary = registers.reshape([2] * 13)
     logical = binary.permute(
@@ -275,6 +276,8 @@ def _registers_to_probability_fragments(registers):
     )
     packet = logical.reshape([BLOCK_M, BLOCK_N // 2])
     lower, upper = packet.reshape([BLOCK_M, 2, BLOCK_N // 4]).permute(0, 2, 1).split()
+    lower = tlx.require_layout(lower, p_layout)
+    upper = tlx.require_layout(upper, p_layout)
     return tlx.release_layout(lower), tlx.release_layout(upper)
 
 
@@ -308,30 +311,25 @@ def _pin_score_register_layout(registers):
 
 @triton.jit
 def _pin_workitem_layout(value):
-    workitem_layout: tl.constexpr = (tlx.distributed_linear_layout_encoding.make(
-        reg_bases=[],
-        lane_bases=[
-            [1],
-            [2],
-            [4],
-            [8],
-            [16],
-            [32],
-        ],
-        warp_bases=[
-            [64],
-            [128],
-            [256],
-        ],
-        block_bases=[],
-        shape=[8 * 64],
-    ))
+    # One scalar workitem is owned by each of the eight warps' 64 lanes.
+    workitem_layout: tl.constexpr = tlx.layout(
+        shape=((8 * 64, ), ()),
+        stride=((1, ), ()),
+    )
     return tlx.release_layout(tlx.require_layout(value, workitem_layout))
 
 
 @triton.jit
 def _duplicate_rows_to_workitems(rows):
-    rows = tlx.release_layout(rows)
+    # The reduction produces one value per logical row. Lanes enumerate the
+    # 32 rows within each pair, the first two warp bits enumerate the four row
+    # pairs, and the final warp bit duplicates that ownership across the two
+    # warp groups that covered the score columns.
+    row_layout: tl.constexpr = tlx.layout(
+        shape=((2, 32, 4, 2), ()),
+        stride=((32, 1, 64, 0), ()),
+    )
+    rows = tlx.release_layout(tlx.require_layout(rows, row_layout))
     per_warp_rows = rows.reshape([8, 32])
     per_workitem = tl.broadcast_to(per_warp_rows[:, None, :], (8, 2, 32))
     return _pin_workitem_layout(per_workitem.reshape([8 * 64]))
@@ -411,7 +409,7 @@ def _pv_mfma(
     values = tlx.require_layout(values, v_layout)
     accumulator = tlx.require_layout(accumulator, mma_layout)
     accumulator = tl.dot(probabilities, values, accumulator)
-    return tlx.release_layout(accumulator)
+    return accumulator
 
 
 @triton.jit
@@ -435,7 +433,7 @@ def _load_value_fragment(
         layout=v_layout,
         relaxed=True,
     )
-    return tlx.release_layout(fragment)
+    return fragment
 
 
 @aggregate
@@ -632,15 +630,16 @@ class SoftmaxState:
         self,
         exponentiated_scores,
         out_dtype: tl.constexpr,
+        p_layout: tl.constexpr,
     ):
         registers0 = _pin_score_register_layout(exponentiated_scores.registers0)
         registers1 = _pin_score_register_layout(exponentiated_scores.registers1)
         tile_sum = _reduce_score_registers(registers0, registers1)
         row_sum = self.row_sum + tile_sum
-        registers0 = tlx.cast_preserve_layout(registers0, out_dtype)
-        registers1 = tlx.cast_preserve_layout(registers1, out_dtype)
-        p0, p1 = _registers_to_probability_fragments(registers0)
-        p2, p3 = _registers_to_probability_fragments(registers1)
+        registers0 = registers0.to(out_dtype)
+        registers1 = registers1.to(out_dtype)
+        p0, p1 = _registers_to_probability_fragments(registers0, p_layout)
+        p2, p3 = _registers_to_probability_fragments(registers1, p_layout)
         probabilities = ProbabilityFragments(
             p0,
             p1,
@@ -836,7 +835,7 @@ def _normalize_output_fragment(
     acc = tlx.require_layout(acc, mma_layout)
     row_scale = _workitems_to_rows(inverse_row_sum)
     output = acc * row_scale[:, None]
-    output = tlx.cast_preserve_layout(output, out_dtype)
+    output = output.to(out_dtype)
     return tlx.release_layout(output)
 
 
@@ -943,6 +942,7 @@ def _score_phase(
     current_k_slot: tl.constexpr,
     q_layout: tl.constexpr,
     k_layout: tl.constexpr,
+    p_layout: tl.constexpr,
     mma_layout: tl.constexpr,
 ):
     q = tlx.require_layout(q, q_layout)
@@ -955,6 +955,7 @@ def _score_phase(
     state, probability_fragments = state.finish(
         exponentiated_scores,
         q.dtype,
+        p_layout,
     )
     _stage_end()
     score_acc = tlx.zeros(
@@ -1014,6 +1015,7 @@ def _warp_pipeline_phase(
         state, probability_fragments = state.finish(
             exponentiated_scores,
             q.dtype,
+            p_layout,
         )
 
     with tlx.warp_pipeline_stage("qk"):
@@ -1314,6 +1316,7 @@ def _pipeline(
         tile_nm2 % LDS_STAGES,
         q_layout,
         k_layout,
+        p_layout,
         mma_layout,
     )
     _stage_end()
@@ -1354,6 +1357,7 @@ def _pipeline(
         tile_nm1 % LDS_STAGES,
         q_layout,
         k_layout,
+        p_layout,
         mma_layout,
     )
     _stage_end()
@@ -1379,6 +1383,7 @@ def _pipeline(
     state, probability_fragments = state.finish(
         exponentiated_scores,
         q.dtype,
+        p_layout,
     )
     ready_nm1 = _wait_stage_end(0, [v_ready_nm1])
     value_fragments = _load_value_fragments(
