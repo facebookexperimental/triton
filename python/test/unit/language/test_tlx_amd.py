@@ -3135,11 +3135,7 @@ def _compile_a4w4_inter_wave_256tile(m, n, k, preshuffled_scales=False):
     c = MockTensor(torch.bfloat16, (m, n))
     a_scales = MockTensor(torch.uint8, (m * k // 32, ) if preshuffled_scales else (m, k // 32))
     b_scales = MockTensor(torch.uint8, (n * k // 32, ) if preshuffled_scales else (n, k // 32))
-    kernel = (
-        _a4w4_inter_wave_preshuffled_scales_kernel
-        if preshuffled_scales
-        else _a4w4_inter_wave_256tile_kernel
-    )
+    kernel = (_a4w4_inter_wave_preshuffled_scales_kernel if preshuffled_scales else _a4w4_inter_wave_256tile_kernel)
     scale_strides = () if preshuffled_scales else (1, m, 1, n)
 
     with knobs.runtime.scope():
@@ -3363,8 +3359,7 @@ def test_a4w4_inter_wave_preshuffled_scale_correctness_gfx950(device, k, split_k
     a, b, a_scales, b_scales = _generate_a4w4_inputs(m, n, k)
     a_scales_preshuffled = _preshuffle_a4w4_a_scales(a_scales)
     b_scales_preshuffled = _preshuffle_a4w4_b_scales(b_scales)
-    actual = _a4w4_inter_wave_matmul_preshuffled(
-        a, b, a_scales_preshuffled, b_scales_preshuffled, SPLIT_K=split_k)
+    actual = _a4w4_inter_wave_matmul_preshuffled(a, b, a_scales_preshuffled, b_scales_preshuffled, SPLIT_K=split_k)
     expected = _a4w4_reference(a, b, a_scales, b_scales)
     torch.testing.assert_close(actual, expected, atol=0.0, rtol=0.0)
 

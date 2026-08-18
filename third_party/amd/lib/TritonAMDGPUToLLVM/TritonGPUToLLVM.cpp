@@ -152,7 +152,7 @@ static void materializeDeferredSchedGroupBarriers(ModuleOp mod) {
           unsigned cover = anchor.mask == (1 << 5)   ? anchor.mfmaCover
                            : anchor.mask == (1 << 8) ? 1
                            : anchor.mask == (1 << 9) ? writeCover
-                                                    : 0;
+                                                     : 0;
           for (unsigned i = 0; i < anchor.count; ++i)
             groups.push_back({anchor.mask, mfmas ? cover : 0});
         }
@@ -436,8 +436,8 @@ createConvertTritonAMDGPUToLLVMPass(StringRef gfxArch, bool ftz) {
 std::unique_ptr<OperationPass<ModuleOp>>
 createConvertTritonAMDGPUToLLVMPass(StringRef gfxArch, bool ftz,
                                     bool enableTreeReduction) {
-  return std::make_unique<ConvertTritonAMDGPUToLLVM>(
-      gfxArch, ftz, enableTreeReduction);
+  return std::make_unique<ConvertTritonAMDGPUToLLVM>(gfxArch, ftz,
+                                                     enableTreeReduction);
 }
 
 } // namespace mlir::triton

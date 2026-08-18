@@ -224,8 +224,8 @@ priceBufferAccess(Value ptr, Value offset, unsigned contiguityHint,
   return {/*count=*/std::max(1u, (elems + vec - 1) / vec),
           /*accessBytes=*/std::max(1u, vec * elemBytes)};
 }
-static VMEMPrice
-priceVMEM(Operation *op, triton::AMD::ModuleAxisInfoAnalysis &axisInfo) {
+static VMEMPrice priceVMEM(Operation *op,
+                           triton::AMD::ModuleAxisInfoAnalysis &axisInfo) {
   if (auto load = dyn_cast<triton::amdgpu::BufferLoadOp>(op))
     return priceBufferAccess(load.getPtr(), load.getOffsets(),
                              load.getContiguity(), axisInfo);
@@ -241,8 +241,7 @@ priceVMEM(Operation *op, triton::AMD::ModuleAxisInfoAnalysis &axisInfo) {
       int64_t e = 1;
       for (int64_t d : md.getShape())
         e *= d;
-      return {/*count=*/std::max<unsigned>(
-                  1, (unsigned)((e * eb) / 256) / 16),
+      return {/*count=*/std::max<unsigned>(1, (unsigned)((e * eb) / 256) / 16),
               /*accessBytes=*/16};
     }
     if (isa<RankedTensorType>(r.getType()))
@@ -255,8 +254,7 @@ priceVMEM(Operation *op, triton::AMD::ModuleAxisInfoAnalysis &axisInfo) {
       int64_t e = 1;
       for (int64_t d : md.getShape())
         e *= d;
-      return {/*count=*/std::max<unsigned>(
-                  1, (unsigned)((e * eb) / 256) / 16),
+      return {/*count=*/std::max<unsigned>(1, (unsigned)((e * eb) / 256) / 16),
               /*accessBytes=*/16};
     }
   return {/*count=*/1, /*accessBytes=*/16};
@@ -308,9 +306,9 @@ struct TritonAMDGPUSchedGroupBarrierSchedulerPass
 
     Builder b(&getContext());
     mod->setAttr("ttg.amd.sched_group_barrier.enabled", b.getUnitAttr());
-    mod->setAttr("ttg.amd.sched_group_barrier.required_region_count",
-                 b.getI32IntegerAttr(
-                     static_cast<unsigned>(requiredRegionCount)));
+    mod->setAttr(
+        "ttg.amd.sched_group_barrier.required_region_count",
+        b.getI32IntegerAttr(static_cast<unsigned>(requiredRegionCount)));
   }
 };
 
