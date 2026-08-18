@@ -782,25 +782,27 @@ LogicalResult MfmaCommitOp::verify() {
 
   if (failed(verifyCDNA4Only(getOperation())))
     return failure();
+  if (getInputs().size() != getOutputs().size())
+    return emitOpError("requires one output for every input");
+  for (auto [index, input] : llvm::enumerate(getInputs())) {
+    if (input.getType() != getOutputs()[index].getType())
+      return emitOpError() << "input/output pair " << index
+                           << " must have identical types";
+  }
 
   constexpr int64_t warpSize = 64;
-  bool hasTransientResult = false;
-  bool hasLiveDependency = false;
+  bool hasMfmaResult = false;
   for (auto [index, input] : llvm::enumerate(getInputs())) {
     auto tensorTy = cast<RankedTensorType>(input.getType());
     if (tensorTy.getRank() != 2)
       return emitOpError() << "input " << index << " must be rank two";
 
     if (tensorTy.getElementType().isF32()) {
-      auto mfma = dyn_cast<ttg::AMDMfmaEncodingAttr>(tensorTy.getEncoding());
+      auto mfma =
+          dyn_cast_or_null<ttg::AMDMfmaEncodingAttr>(tensorTy.getEncoding());
       if (!mfma || mfma.getVersion() != 4 || !mfma.hasUnitTilesPerWarp())
         return emitOpError() << "input " << index
                              << " must use a unit-tile CDNA4 MFMA layout";
-      auto producer = input.getDefiningOp<ScheduledMfmaOp>();
-      if (!producer || producer.getAccumulatorRole() != "transient")
-        return emitOpError()
-               << "input " << index
-               << " must be a direct transient scheduled_mfma result";
       if (!input.hasOneUse())
         return emitOpError()
                << "input " << index
@@ -811,7 +813,7 @@ LogicalResult MfmaCommitOp::verify() {
         return emitOpError()
                << "input " << index
                << " ownership must divide into native MFMA result fragments";
-      hasTransientResult = true;
+      hasMfmaResult = true;
       continue;
     }
 
@@ -843,7 +845,6 @@ LogicalResult MfmaCommitOp::verify() {
         return emitOpError()
                << "input " << index
                << " ownership must divide into native dot fragments";
-      hasLiveDependency = true;
       continue;
     }
 
@@ -851,10 +852,8 @@ LogicalResult MfmaCommitOp::verify() {
            << "input " << index
            << " must be an F32 MFMA result or BF16 dot-operand dependency";
   }
-  if (!hasTransientResult)
-    return emitOpError("requires at least one transient MFMA result");
-  if (!hasLiveDependency)
-    return emitOpError("requires at least one live dot-operand dependency");
+  if (!hasMfmaResult)
+    return emitOpError("requires at least one MFMA result");
   return success();
 }
 
@@ -870,9 +869,12 @@ LogicalResult ScheduledMfmaOp::verify() {
   auto resultTy = getResult().getType();
   if (aTy.getRank() != 2 || bTy.getRank() != 2 || accTy.getRank() != 2)
     return emitOpError("requires rank-2 operands and accumulator");
-  if (!aTy.getElementType().isBF16() || !bTy.getElementType().isBF16() ||
+  Type aElemTy = aTy.getElementType();
+  Type bElemTy = bTy.getElementType();
+  if ((!aElemTy.isBF16() && !aElemTy.isF16()) || aElemTy != bElemTy ||
       !accTy.getElementType().isF32())
-    return emitOpError("requires BF16 operands and an F32 accumulator");
+    return emitOpError(
+        "requires matching BF16 or F16 operands and an F32 accumulator");
   if (resultTy != accTy)
     return emitOpError("result type must exactly match the accumulator type");
   if (aTy.getShape()[0] != accTy.getShape()[0] ||

@@ -1003,6 +1003,11 @@ public:
     SmallVector<Type> outputTypes;
     std::string constraints;
     constexpr unsigned warpSize = 64;
+    bool hasLiveDependency = llvm::any_of(op.getInputs(), [](Value input) {
+      return !cast<RankedTensorType>(input.getType())
+                  .getElementType()
+                  .isF32();
+    });
     for (auto [source, converted] :
          llvm::zip(op.getInputs(), adaptor.getInputs())) {
       auto tensorTy = cast<RankedTensorType>(source.getType());
@@ -1016,7 +1021,7 @@ public:
             cast<triton::gpu::AMDMfmaEncodingAttr>(tensorTy.getEncoding());
         ArrayRef<unsigned> instr = mfma.getInstrShape();
         registersPerGroup = instr[0] * instr[1] / warpSize;
-        outputConstraint = "=v";
+        outputConstraint = hasLiveDependency ? "=v" : "=a";
       } else {
         auto dot =
             cast<triton::gpu::DotOperandEncodingAttr>(tensorTy.getEncoding());
@@ -1205,13 +1210,18 @@ public:
     auto *ctx = rewriter.getContext();
     auto asmDialect = LLVM::AsmDialectAttr::get(ctx, LLVM::AsmDialect::AD_ATT);
     auto operandAttrs = ArrayAttr::get(ctx, {});
-    std::string mfmaAsmPrefix = instrShape == ArrayRef<unsigned>({32, 32, 16})
-                                    ? "v_mfma_f32_32x32x16_bf16 $0, $1, $2, "
-                                    : "v_mfma_f32_16x16x32_bf16 $0, $1, $2, ";
+    bool isF16 = aTy.getElementType().isF16();
+    bool is32x32 = instrShape == ArrayRef<unsigned>({32, 32, 16});
+    std::string mfmaAsmPrefix =
+        is32x32 ? (isF16 ? "v_mfma_f32_32x32x16_f16 $0, $1, $2, "
+                         : "v_mfma_f32_32x32x16_bf16 $0, $1, $2, ")
+                : (isF16 ? "v_mfma_f32_16x16x32_f16 $0, $1, $2, "
+                         : "v_mfma_f32_16x16x32_bf16 $0, $1, $2, ");
     StringRef mfmaIntrinsicName =
-        instrShape == ArrayRef<unsigned>({32, 32, 16})
-            ? ROCDL::mfma_f32_32x32x16_bf16::getOperationName()
-            : ROCDL::mfma_f32_16x16x32_bf16::getOperationName();
+        is32x32 ? (isF16 ? ROCDL::mfma_f32_32x32x16_f16::getOperationName()
+                         : ROCDL::mfma_f32_32x32x16_bf16::getOperationName())
+                : (isF16 ? ROCDL::mfma_f32_16x16x32_f16::getOperationName()
+                         : ROCDL::mfma_f32_16x16x32_bf16::getOperationName());
     bool useLatencyAwareIntrinsic = op.getAccumulatorRole() == "transient";
 
     SmallVector<Value> updatedFragments(numRepM * numRepN);
@@ -1226,7 +1236,11 @@ public:
         for (int64_t k = 0; k < numRepK; ++k) {
           Value operandA = (*maybeA)[m * numRepK + k];
           Value operandB = (*maybeB)[n * numRepK + k];
-          if (!useLatencyAwareIntrinsic) {
+          // The MFMA inline asm below already constrains ordinary operands to
+          // VGPRs.  Pre-constrain only the resident-operand path, where one
+          // input must be moved to AGPRs before issuing the instruction.
+          if (!useLatencyAwareIntrinsic &&
+              (aStorage == "agpr" || bStorage == "agpr")) {
             FailureOr<Value> constrainedA = constrainMfmaFragmentRegisterClass(
                 operandA, aStorage, rewriter, loc);
             FailureOr<Value> constrainedB = constrainMfmaFragmentRegisterClass(
