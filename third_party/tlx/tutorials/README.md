@@ -1,7 +1,7 @@
 # TLX extensions used by adaptive FlashAttention
 
 The adaptive FlashAttention tutorial at
-[`tutorials/amd_fa_adaptive.py`](tutorials/amd_fa_adaptive.py) demonstrates four
+[`amd_fa_adaptive.py`](amd_fa_adaptive.py) demonstrates four
 APIs for expressing physical ownership without exposing a lane-mask ballot.
 These APIs are general TLX facilities; none is specific to attention.
 
