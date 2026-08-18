@@ -204,6 +204,12 @@
 - **Fix**: Read SMEM allocation attributes from both `scf.for` and `scf.while`, preserving outer-to-inner override precedence. Step 7.5 now accepts either persistent loop form; for a while it finds the AutoWS after-region counter whose mapped yield recurrence is `arg + 1` and uses that counter for the token phase. The load task acquires the same single-buffer token at the while-body top and the epilogue-store task releases it at the bottom.
 - **Validation**: The four-stage configuration now passes selected BF16 correctness and 50+20 repeated FP16 launches. Locked A/B rejects it for performance: stage-2 samples 1.436320/1.442272/1.438304 ms versus stage-4 1.486352/1.486304/1.489472 ms (medians 1.438304 vs 1.486352, 3.34% slower), so the shipped CLC default remains two stages. `ws_memory_planner_epilogue_multicopy.mlir` checks the while-loop budget override; `ws_code_partition_bwd_persist_staging_war.mlir` synthesizes a persistent while and checks the matching one-token acquire/release edge.
 
+### 29. Dead scalar rematerialization clones create descriptor-load self-consumers (2026-08-18, fixed)
+- **Symptom**: BM128 2-CTA FA backward is nondeterministically numerically wrong after rebasing; dV reports first, but dK/dQ are also corrupted.
+- **Root cause**: partition scheduling clones the `m`/`delta` convert-layout chain into the load task, but those clones are dead. Descriptor-load conversion counted the dead task-3 users when assigning the replacement `local_load`, creating a producer-task self-consumer channel and unsafe TMA-buffer rotation.
+- **Fix**: before converting each descriptor load, recursively erase only dead `convert_layout`/`broadcast`/`expand_dims` rematerialization chains, then derive consumer task IDs from the remaining users. Whole-function DCE is intentionally avoided because test/debug IR may contain unrelated dead consumers.
+- **Regression**: `ws_remove_redundant_tmem_zero_bwd_bm128_inner.mlir` requires both rank-1 statistic `local_load`s to belong only to computation task 0.
+
 ## Debugging Workflow
 - `t.dump` captures IR after each WarpSpec pass (doTaskIdPropagate → doBufferAllocation → doMemoryPlanner → doCodePartition → ...)
 - IR after PartitionSchedulingMeta uses `ttg.partition = array<i32: N>` attributes (not `async_task_id`)
