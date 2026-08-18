@@ -3,6 +3,7 @@ add_triton_library(TritonAMDGPUTransforms
   ApplyPlanPipeline.cpp
   PlanRingMaterializer.cpp
   PlanStagingMaterializer.cpp
+  PlanStagingResolver.cpp
   ApplyPlanSchedule.cpp
   BlockPingpong.cpp
   CanonicalizePointers.cpp

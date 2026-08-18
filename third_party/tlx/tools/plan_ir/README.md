@@ -1,6 +1,6 @@
 # AMD TLX Plan IR prototype
 
-This directory implements M1.1--M1.5b.4a of the profile-guided TLX scheduling
+This directory implements M1.1--M1.5b.4b of the profile-guided TLX scheduling
 design without changing the existing TLX kernels. M1.5b.2 reuses and extends
 Meta's shared modulo-scheduling DDG through backend-neutral APIs.
 
@@ -63,13 +63,21 @@ Meta's shared modulo-scheduling DDG through backend-neutral APIs.
   release barriers. It re-extracts Plan IR, proves that the original register
   value ends at the store, verifies the rebuilt distance-zero DDG, and freezes
   the dot/scheduled-MFMA contract.
+- **M1.5b.4b — derived register staging:** named consumers may now be reached
+  through a direct, side-effect-free DAG of `extract_slice`, reshape,
+  transpose, register layout conversion, and TLX layout-requirement ops. The
+  materializer reloads the original tensor layout, clones only the selected
+  derived paths, shares common prefixes, preserves unselected branches, and
+  removes dead original derived ops. Acceptance additionally requires a
+  strictly shorter static Plan IR live interval for the staged source.
 
 M1.5a lowers only verified intra-iteration schedule permutations. M1.5b.1
 validates cross-iteration intent. M1.5b.2 applies schedules already represented
 by an existing ring. M1.5b.3 changes depth/distance and synchronization only
 for that existing ring. M1.5b.4a introduces synchronous single-slot
-`register_to_lds`; buffered staging, derived-use rewriting, mixed ring/staging
-plans, and `global_to_lds` remain later M1.5b.4 work.
+`register_to_lds`, and M1.5b.4b extends it through supported derived register
+paths. Buffered staging, mixed ring/staging plans, and `global_to_lds` remain
+later M1.5b.4 work.
 
 ## Reproduction
 
@@ -189,11 +197,14 @@ rewritten slots, waits/barriers, pre/post fingerprints, the post-rewrite audit,
 and second-DDG verification.
 
 A staging-only loop may instead contain one or more `register_to_lds` entries
-with `buffer_depth: 1`. M1.5b.4a requires a produced ranked tensor, all direct
-uses and named consumers in the selected `scf.for`, known logical bytes, and a
-power-of-two alignment. The report uses
+with `buffer_depth: 1`. M1.5b.4 requires a produced ranked tensor and named
+consumers in the selected `scf.for`, known logical bytes, and a power-of-two
+alignment. M1.5b.4b permits selected consumer paths through supported pure
+slice/reshape/transpose/layout operations while preserving unrelated uses.
+The report uses
 `materialization_scope: register_to_lds_staging` and records the new staging
-and synchronization changes.
+and synchronization changes, cloned/pruned derived operation counts,
+preserved unselected consumers, and before/after source live intervals.
 
 The fixed configuration names and kernel symbols are sourced from
 `third_party/tlx/tutorials/amd_fa_bwd.py`:

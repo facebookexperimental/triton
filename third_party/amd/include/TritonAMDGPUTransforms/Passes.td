@@ -550,10 +550,12 @@ def TritonAMDGPUApplyPlanPipeline
     scheduler, and reorders selected producer families. For an existing,
     canonical LDS ring it can also resize the leading ring dimension, rewrite
     producer/consumer modulo slots, derive partial-wait counts, and insert
-    missing visibility/release barriers. M1.5b.4a additionally materializes a
-    single-slot register-to-LDS path for a produced tensor whose complete set
-    of direct in-loop consumers is named by the plan. It rebuilds the strict
-    value graph and DDG after mutation and never changes dot decomposition.
+    missing visibility/release barriers. M1.5b.4 additionally materializes a
+    single-slot register-to-LDS path for a produced tensor. Named consumers
+    may be reached through supported pure slice/reshape/transpose/layout DAGs;
+    unrelated branches are preserved and the source live interval must become
+    strictly shorter. It rebuilds the strict value graph and DDG after
+    mutation and never changes dot decomposition.
   }];
 
   let options = [

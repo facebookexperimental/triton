@@ -35,6 +35,19 @@ struct PlanLoopPipelineDelta {
   std::vector<PlanPipelineStagingIntent> staging;
 };
 
+struct PlanPipelineStagingApplyRecord {
+  std::string valueId;
+  int64_t derivedOperationsCloned = 0;
+  int64_t derivedOperationsPruned = 0;
+  int64_t selectedConsumerOperands = 0;
+  int64_t unselectedConsumersPreserved = 0;
+  int64_t sourceLiveStartBefore = -1;
+  int64_t sourceLiveEndBefore = -1;
+  int64_t sourceLiveStartAfter = -1;
+  int64_t sourceLiveEndAfter = -1;
+  bool logicalLiveRangeShortened = false;
+};
+
 struct PlanPipelineDelta {
   std::string schemaVersion;
   std::string kernel;
@@ -60,6 +73,7 @@ struct PlanPipelineLoopApplyRecord {
   int64_t logicalLdsBytesAfter = 0;
   bool postRewriteDdgVerified = false;
   std::vector<std::string> groups;
+  std::vector<PlanPipelineStagingApplyRecord> staging;
 };
 
 struct PlanPipelineApplyResult {

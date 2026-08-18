@@ -174,7 +174,7 @@ staging remains M1.5b.4.
 
 ### M1.5b.4a single-slot register staging
 
-The native reader accepts a staging-only loop with `register_to_lds`,
+The original 4a subset accepts a staging-only loop with `register_to_lds`,
 `buffer_depth: 1`, a power-of-two alignment, and one or more stable consumer
 operation IDs. The staged value must be a produced ranked tensor with known
 logical bytes. Its producer, every direct use, and every named consumer must be
@@ -185,10 +185,30 @@ stores the original register value, inserts a local visibility barrier, reloads
 the value in its exact original register layout, rewrites the named consumer
 operands, inserts a consumer-release barrier, and deallocates after the loop.
 It rejects target-capacity overflow, mixed existing-ring/staging requests,
-derived or nested uses, loop-carried values, and multi-slot staging.
+loop-carried values, and multi-slot staging. Derived uses are added by 4b
+below; nested uses remain unsupported.
 
 After mutation it requires strict Plan IR verification, no open important fact
-or LDS reuse hazard, exact requested alignment and logical bytes, no remaining
-unrequested use of the original register value, a legal rebuilt distance-zero
-DDG order, and an unchanged dot/scheduled-MFMA signature. Buffered staging,
-derived-use rewriting, and `global_to_lds` remain later M1.5b.4 work.
+or LDS reuse hazard, exact requested alignment and logical bytes, a legal
+rebuilt distance-zero DDG order, and an unchanged dot/scheduled-MFMA signature.
+
+### M1.5b.4b derived register staging
+
+Named consumer operands may be reached from the staged source through a DAG of
+pure direct-loop operations: `amdg.extract_slice`, `tt.reshape`, `tt.trans`,
+`ttg.convert_layout`, `amdg.in_thread_transpose`, `tlx.require_layout`, and
+`tlx.release_layout`. Unsupported, nested, side-effecting, or ambiguous
+derived paths are rejected.
+
+The materializer inserts the same single-slot synchronous LDS path as 4a,
+reloads the exact source register type, clones the union of selected derived
+paths in original program order, maps shared prefixes once, rewrites only the
+named consumer operands, and erases original pure derived operations that
+become dead. Unselected branches keep their original SSA operands. The apply
+report records cloned/pruned operation counts, selected operands, preserved
+unselected consumers, and source live-range endpoints. Acceptance requires the
+post-rewrite Plan IR interval length to be strictly smaller than the baseline;
+otherwise it rejects with `staging_does_not_shorten_lifetime`.
+
+Buffered staging, mixed ring/staging requests, and `global_to_lds` remain later
+M1.5b.4 work.

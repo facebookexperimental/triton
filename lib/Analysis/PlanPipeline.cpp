@@ -175,11 +175,11 @@ FailureOr<PlanPipelineDelta> parsePlanPipelineDelta(StringRef payload,
                                  error))
           return failure();
         if (intent.action != "register_to_lds") {
-          error = "M1.5b.4a supports only register_to_lds staging";
+          error = "M1.5b.4 supports only register_to_lds staging";
           return failure();
         }
         if (intent.bufferDepth != 1) {
-          error = "M1.5b.4a supports only single-slot register staging";
+          error = "M1.5b.4 supports only single-slot register staging";
           return failure();
         }
         if (!llvm::isPowerOf2_64(intent.alignment)) {
@@ -211,6 +211,22 @@ serializePlanPipelineApplyReport(const PlanPipelineApplyResult &result) {
     llvm::json::Array groups;
     for (StringRef group : loop.groups)
       groups.push_back(group);
+    llvm::json::Array staging;
+    for (const PlanPipelineStagingApplyRecord &record : loop.staging) {
+      staging.push_back(llvm::json::Object{
+          {"value", record.valueId},
+          {"derived_operations_cloned", record.derivedOperationsCloned},
+          {"derived_operations_pruned", record.derivedOperationsPruned},
+          {"selected_consumer_operands", record.selectedConsumerOperands},
+          {"unselected_consumers_preserved",
+           record.unselectedConsumersPreserved},
+          {"source_live_start_before", record.sourceLiveStartBefore},
+          {"source_live_end_before", record.sourceLiveEndBefore},
+          {"source_live_start_after", record.sourceLiveStartAfter},
+          {"source_live_end_after", record.sourceLiveEndAfter},
+          {"logical_live_range_shortened", record.logicalLiveRangeShortened},
+      });
+    }
     loops.push_back(llvm::json::Object{
         {"loop", loop.loopId},
         {"initiation_interval", loop.initiationInterval},
@@ -228,6 +244,7 @@ serializePlanPipelineApplyReport(const PlanPipelineApplyResult &result) {
         {"logical_lds_bytes_after", loop.logicalLdsBytesAfter},
         {"post_rewrite_ddg_verified", loop.postRewriteDdgVerified},
         {"groups", std::move(groups)},
+        {"staging", std::move(staging)},
     });
   }
   llvm::json::Object report{

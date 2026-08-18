@@ -1,5 +1,6 @@
 #include "PlanStagingMaterializer.h"
 
+#include "mlir/IR/IRMapping.h"
 #include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
 #include <iterator>
 
@@ -16,6 +17,14 @@ LogicalResult materializeRegisterToLdsStaging(
       error = "invalid resolved register-to-LDS staging request";
       return failure();
     }
+
+    llvm::sort(request.consumers, [](Operation *left, Operation *right) {
+      return left->isBeforeInBlock(right);
+    });
+    llvm::sort(request.derivedOperations,
+               [](Operation *left, Operation *right) {
+                 return left->isBeforeInBlock(right);
+               });
 
     auto sharedEncoding = getSharedEncoding(request.tensorType);
     auto sharedMemory =
@@ -53,14 +62,49 @@ LogicalResult materializeRegisterToLdsStaging(
       if (lastConsumer->isBeforeInBlock(consumer))
         lastConsumer = consumer;
     }
+    Operation *firstUse = firstConsumer;
+    if (!request.derivedOperations.empty() &&
+        request.derivedOperations.front()->isBeforeInBlock(firstUse))
+      firstUse = request.derivedOperations.front();
 
-    OpBuilder loadBuilder(firstConsumer);
+    OpBuilder loadBuilder(firstUse);
     request.load =
-        gpu::LocalLoadOp::create(loadBuilder, firstConsumer->getLoc(),
+        gpu::LocalLoadOp::create(loadBuilder, firstUse->getLoc(),
                                  request.tensorType, request.allocation);
     ++result.newLoads;
-    for (OpOperand *operand : request.consumerOperands)
-      operand->set(request.load);
+
+    IRMapping mapping;
+    mapping.map(request.source, request.load.getResult());
+    for (Operation *operation : request.derivedOperations) {
+      OpBuilder cloneBuilder(operation);
+      Operation *clone = cloneBuilder.clone(*operation, mapping);
+      request.clonedDerivedOperations.push_back(clone);
+      ++request.derivedOperationsCloned;
+      if (clone->getName() != operation->getName() ||
+          clone->getAttrDictionary() != operation->getAttrDictionary() ||
+          clone->getOperandTypes() != operation->getOperandTypes() ||
+          clone->getResultTypes() != operation->getResultTypes()) {
+        error = "cloned register-to-LDS derived operation changed contract";
+        return failure();
+      }
+    }
+    for (OpOperand *operand : request.consumerOperands) {
+      Value replacement = mapping.lookupOrNull(operand->get());
+      if (!replacement) {
+        error = "register-to-LDS derived path did not map a named consumer";
+        return failure();
+      }
+      operand->set(replacement);
+      request.consumerReplacementValues.push_back(replacement);
+    }
+
+    for (Operation *operation : llvm::reverse(request.derivedOperations)) {
+      if (llvm::all_of(operation->getResults(),
+                       [](Value result) { return result.use_empty(); })) {
+        operation->erase();
+        ++request.derivedOperationsPruned;
+      }
+    }
 
     OpBuilder releaseBuilder(lastConsumer->getBlock(),
                              std::next(lastConsumer->getIterator()));

@@ -1,5 +1,6 @@
 #include "PlanRingMaterializer.h"
 #include "PlanStagingMaterializer.h"
+#include "PlanStagingResolver.h"
 #include "TritonAMDGPUTransforms/Passes.h"
 
 #include "mlir/Dialect/SCF/IR/SCF.h"
@@ -388,112 +389,18 @@ resolveLoopPipeline(const tt::plan::PlanLoopPipelineDelta &requested,
     requestedGroups.insert(intent.groupId);
 
   if (!requested.transactions.empty() && !requested.staging.empty()) {
-    error = "M1.5b.4a does not combine new staging with existing-ring "
+    error = "M1.5b.4 does not combine new staging with existing-ring "
             "transactions";
     return failure();
   }
 
-  std::map<std::string, const tt::plan::PlanValueRecord *> valueRecordById;
-  for (const tt::plan::PlanValueRecord &value : graph.getValues())
-    valueRecordById[value.id] = &value;
-
-  llvm::DenseSet<Operation *> stagingOperations;
-  int64_t stagingBytes = 0;
-  for (const tt::plan::PlanPipelineStagingIntent &intent : requested.staging) {
-    auto valueIt = valueById.find(intent.valueId);
-    auto recordIt = valueRecordById.find(intent.valueId);
-    if (valueIt == valueById.end() || recordIt == valueRecordById.end()) {
-      error = "pipeline staging intent refers to an unknown value";
-      return failure();
-    }
-    Value source = valueIt->second;
-    auto tensorType = dyn_cast<RankedTensorType>(source.getType());
-    Operation *producer = source.getDefiningOp();
-    if (!tensorType || !producer) {
-      error = "register-to-LDS staging requires a produced ranked tensor";
-      return failure();
-    }
-    if (producer->getBlock() != loop.getBody()) {
-      error = "register-to-LDS producer must be directly in the selected loop";
-      return failure();
-    }
-    if (!recordIt->second->logicalBytes ||
-        *recordIt->second->logicalBytes <= 0) {
-      error = "register-to-LDS staging requires a known positive tensor size";
-      return failure();
-    }
-    if (stagingBytes >
-        std::numeric_limits<int64_t>::max() - *recordIt->second->logicalBytes) {
-      error = "register-to-LDS staging byte size overflows";
-      return failure();
-    }
-    stagingBytes += *recordIt->second->logicalBytes;
-
-    llvm::DenseSet<Operation *> requestedConsumers;
-    tta::PlanRegisterToLdsStaging staging;
-    staging.loop = loop;
-    staging.source = source;
-    staging.tensorType = tensorType;
-    staging.logicalBytes = *recordIt->second->logicalBytes;
-    staging.alignment = intent.alignment;
-    for (StringRef consumerId : intent.consumerIds) {
-      auto consumerIt = operationById.find(consumerId.str());
-      if (consumerIt == operationById.end()) {
-        error = "register-to-LDS staging refers to an unknown consumer";
-        return failure();
-      }
-      Operation *consumer = consumerIt->second;
-      if (consumer->getBlock() != loop.getBody() ||
-          consumer->hasTrait<OpTrait::IsTerminator>()) {
-        error = "register-to-LDS consumer must be directly in the selected "
-                "loop";
-        return failure();
-      }
-      if (!producer->isBeforeInBlock(consumer)) {
-        error = "register-to-LDS consumer must follow its producer";
-        return failure();
-      }
-      if (!requestedConsumers.insert(consumer).second) {
-        error = "register-to-LDS staging repeats a resolved consumer";
-        return failure();
-      }
-      staging.consumers.push_back(consumer);
-    }
-
-    for (OpOperand &use : source.getUses()) {
-      Operation *consumer = use.getOwner();
-      if (consumer->getBlock() != loop.getBody() ||
-          consumer->hasTrait<OpTrait::IsTerminator>()) {
-        error = "M1.5b.4a requires every staged value use directly in the "
-                "selected loop";
-        return failure();
-      }
-      if (!requestedConsumers.contains(consumer)) {
-        error = "M1.5b.4a requires all direct in-loop uses to be selected";
-        return failure();
-      }
-      staging.consumerOperands.push_back(&use);
-    }
-    if (staging.consumerOperands.empty()) {
-      error = "register-to-LDS staging value has no selected uses";
-      return failure();
-    }
-    for (Operation *consumer : staging.consumers) {
-      if (llvm::none_of(staging.consumerOperands, [&](OpOperand *operand) {
-            return operand->getOwner() == consumer;
-          })) {
-        error = "named register-to-LDS consumer does not use the staged value";
-        return failure();
-      }
-    }
-    llvm::sort(staging.consumers, [](Operation *left, Operation *right) {
-      return left->isBeforeInBlock(right);
-    });
-    stagingOperations.insert(producer);
-    stagingOperations.insert(staging.consumers.begin(),
-                             staging.consumers.end());
-    resolved.stagingMutations.push_back(std::move(staging));
-  }
+  tta::PlanRegisterToLdsResolution stagingResolution;
+  if (failed(tta::resolveRegisterToLdsStaging(requested.staging, loop, graph,
+                                              operationById, valueById,
+                                              stagingResolution, error)))
+    return failure();
+  int64_t stagingBytes = stagingResolution.logicalBytes;
+  resolved.stagingMutations = std::move(stagingResolution.staging);
 
   std::map<std::string, const tt::plan::PlanPipelineTransactionIntent *>
       intentByGroup;
@@ -506,7 +413,8 @@ resolveLoopPipeline(const tt::plan::PlanLoopPipelineDelta &requested,
     allocationByRoot[allocation.rootValueId] = &allocation;
 
   llvm::DenseSet<Operation *> selected;
-  selected.insert(stagingOperations.begin(), stagingOperations.end());
+  selected.insert(stagingResolution.participatingOperations.begin(),
+                  stagingResolution.participatingOperations.end());
   llvm::DenseSet<Operation *> mutationOperations;
   SmallVector<std::tuple<Operation *, Operation *, unsigned>> releaseToProducer;
   SmallVector<std::tuple<Operation *, Operation *, unsigned>> requestedEdges;
@@ -985,6 +893,7 @@ resolveLoopPipeline(const tt::plan::PlanLoopPipelineDelta &requested,
 static LogicalResult
 verifyPostRewrite(const tt::plan::PlanValueGraph &postGraph,
                   const llvm::DenseMap<Operation *, std::string> &postBindings,
+                  const llvm::DenseMap<Value, std::string> &postValueBindings,
                   MutableArrayRef<ResolvedLoopPipeline> resolved,
                   std::string &error) {
   for (const tt::plan::PlanUnresolvedFact &fact :
@@ -1119,18 +1028,55 @@ verifyPostRewrite(const tt::plan::PlanValueGraph &postGraph,
         error = "post-rewrite register-to-LDS data path is inconsistent";
         return failure();
       }
-      if (llvm::any_of(staging.source.getUses(), [&](OpOperand &use) {
-            return use.getOwner() != staging.store;
-          })) {
-        error = "post-rewrite staged register value retained an unrequested "
-                "consumer";
-        return failure();
-      }
-      for (OpOperand *operand : staging.consumerOperands) {
-        if (!operand || operand->get() != staging.load.getResult()) {
-          error = "post-rewrite named consumer does not use the staged load";
+      for (const auto &[operand, value] : staging.preservedOperands) {
+        if (!operand || operand->get() != value) {
+          error = "post-rewrite staging changed an unselected consumer";
           return failure();
         }
+      }
+      if (staging.consumerOperands.size() !=
+          staging.consumerReplacementValues.size()) {
+        error = "post-rewrite staging lost a named consumer replacement";
+        return failure();
+      }
+      for (auto [operand, replacement] : llvm::zip(
+               staging.consumerOperands, staging.consumerReplacementValues)) {
+        if (!operand || operand->get() != replacement) {
+          error = "post-rewrite named consumer does not use its staged "
+                  "derived value";
+          return failure();
+        }
+      }
+      auto sourceId = postValueBindings.find(staging.source);
+      if (sourceId == postValueBindings.end()) {
+        error = "post-rewrite staged source lost stable Plan IR identity";
+        return failure();
+      }
+      const tt::plan::PlanLiveSegment *sourceSegment = nullptr;
+      for (const tt::plan::PlanLiveSegment &segment :
+           postGraph.getLiveSegments()) {
+        if (segment.valueId != sourceId->second)
+          continue;
+        if (sourceSegment) {
+          error = "post-rewrite staged source has multiple live segments";
+          return failure();
+        }
+        sourceSegment = &segment;
+      }
+      if (!sourceSegment) {
+        error = "post-rewrite staged source has no live segment";
+        return failure();
+      }
+      staging.sourceLiveStartAfter = sourceSegment->startPosition;
+      staging.sourceLiveEndAfter = sourceSegment->endPosition;
+      int64_t beforeLength =
+          staging.sourceLiveEndBefore - staging.sourceLiveStartBefore;
+      int64_t afterLength =
+          staging.sourceLiveEndAfter - staging.sourceLiveStartAfter;
+      staging.logicalLiveRangeShortened = afterLength < beforeLength;
+      if (!staging.logicalLiveRangeShortened) {
+        error = "staging_does_not_shorten_lifetime";
+        return failure();
       }
       if (!staging.store->isBeforeInBlock(staging.visibilityBarrier) ||
           !staging.visibilityBarrier->isBeforeInBlock(staging.load) ||
@@ -1177,6 +1123,24 @@ verifyPostRewrite(const tt::plan::PlanValueGraph &postGraph,
     }
   }
   return success();
+}
+
+static void recordStagingResults(ResolvedLoopPipeline &loop) {
+  loop.record.staging.clear();
+  for (const tta::PlanRegisterToLdsStaging &staging : loop.stagingMutations) {
+    tt::plan::PlanPipelineStagingApplyRecord record;
+    record.valueId = staging.sourceValueId;
+    record.derivedOperationsCloned = staging.derivedOperationsCloned;
+    record.derivedOperationsPruned = staging.derivedOperationsPruned;
+    record.selectedConsumerOperands = staging.consumerOperands.size();
+    record.unselectedConsumersPreserved = staging.unselectedConsumersPreserved;
+    record.sourceLiveStartBefore = staging.sourceLiveStartBefore;
+    record.sourceLiveEndBefore = staging.sourceLiveEndBefore;
+    record.sourceLiveStartAfter = staging.sourceLiveStartAfter;
+    record.sourceLiveEndAfter = staging.sourceLiveEndAfter;
+    record.logicalLiveRangeShortened = staging.logicalLiveRangeShortened;
+    loop.record.staging.push_back(std::move(record));
+  }
 }
 
 static LogicalResult
@@ -1262,8 +1226,10 @@ applyPlanPipeline(tt::FuncOp function, const tt::plan::PlanPipelineDelta &delta,
                 "MLIR verification failed after pipeline schedule apply");
 
   llvm::DenseMap<Operation *, std::string> postBindings;
+  llvm::DenseMap<Value, std::string> postValueBindings;
   FailureOr<tt::plan::PlanValueGraph> postGraph =
-      tt::plan::PlanValueGraph::build(function, &postBindings);
+      tt::plan::PlanValueGraph::build(function, &postBindings,
+                                      &postValueBindings);
   if (failed(postGraph) ||
       (strict && failed(postGraph->verify(/*strict=*/true))))
     return fail(result, error,
@@ -1307,7 +1273,8 @@ applyPlanPipeline(tt::FuncOp function, const tt::plan::PlanPipelineDelta &delta,
       return fail(result, error,
                   "pipeline materialization changed an unrequested LDS or "
                   "async structure");
-    if (failed(verifyPostRewrite(*postGraph, postBindings, resolved, error))) {
+    if (failed(verifyPostRewrite(*postGraph, postBindings, postValueBindings,
+                                 resolved, error))) {
       result.error = error;
       return failure();
     }
@@ -1315,6 +1282,7 @@ applyPlanPipeline(tt::FuncOp function, const tt::plan::PlanPipelineDelta &delta,
   }
 
   for (ResolvedLoopPipeline &loop : resolved) {
+    recordStagingResults(loop);
     result.movedOperationCount += loop.record.movedOperationCount;
     result.importedDependencyCount += loop.record.importedDependencyCount;
     result.skippedDependencyCount += loop.record.skippedDependencyCount;

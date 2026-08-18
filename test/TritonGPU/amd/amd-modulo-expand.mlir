@@ -107,6 +107,24 @@
 // RUN: not triton-opt %s \
 // RUN:   -tritonamdgpu-apply-plan-pipeline='input-path=%t.pipeline.staging.scalar.json strict=true' \
 // RUN:   2>&1 | FileCheck %s --check-prefix=PIPELINE-STAGING-SCALAR
+// RUN: python3 -c "import json; p=json.load(open('%t.pipeline.plan.json')); f=next(x for x in p['functions'] if x['function']=='register_to_lds_derived'); ops={x['id']:x['kind'] for x in f['operations']}; v=next(x for x in f['values'] if ops.get(x['origin'].get('operation'))=='arith.addf' and any(ops[u['operation']]=='amdg.extract_slice' for u in x['uses'])); s=next(u['operation'] for u in v['uses'] if ops[u['operation']]=='amdg.extract_slice'); sv=next(x for x in f['values'] if x['origin'].get('operation')==s); cs=sorted({u['operation'] for u in sv['uses']}); l=next(x['id'] for x in f['operations'] if x['kind']=='scf.for'); d={'schema_version':'plan-pipeline-delta/0.1','kernel':f['function'],'input_value_graph_fingerprint':f['semantic_fingerprint'],'pass_position':'before_update_async_wait_count','loops':[{'loop':l,'transactions':[],'staging':[{'value':v['id'],'action':'register_to_lds','consumers':cs,'buffer_depth':1,'alignment':16}]}]}; open('%t.pipeline.staging.derived.json','w').write(json.dumps(d))"
+// RUN: TRITON_USE_MODULO_SCHEDULE=1 triton-opt %s \
+// RUN:   -tritonamdgpu-apply-plan-pipeline='input-path=%t.pipeline.staging.derived.json report-path=%t.pipeline.staging.derived.report.json strict=true' \
+// RUN:   | FileCheck %s --check-prefix=PIPELINE-STAGING-DERIVED
+// RUN: FileCheck %s --check-prefix=PIPELINE-STAGING-DERIVED-REPORT < %t.pipeline.staging.derived.report.json
+// RUN: python3 -c "import json; p=json.load(open('%t.pipeline.plan.json')); f=next(x for x in p['functions'] if x['function']=='register_to_lds_unsupported'); ops={x['id']:x['kind'] for x in f['operations']}; v=next(x for x in f['values'] if ops.get(x['origin'].get('operation'))=='arith.addf' and any(ops[u['operation']]=='arith.mulf' for u in x['uses'])); c=next(x['id'] for x in f['operations'] if x['kind']=='arith.subf'); l=next(x['id'] for x in f['operations'] if x['kind']=='scf.for'); d={'schema_version':'plan-pipeline-delta/0.1','kernel':f['function'],'input_value_graph_fingerprint':f['semantic_fingerprint'],'pass_position':'before_update_async_wait_count','loops':[{'loop':l,'transactions':[],'staging':[{'value':v['id'],'action':'register_to_lds','consumers':[c],'buffer_depth':1,'alignment':16}]}]}; open('%t.pipeline.staging.unsupported.json','w').write(json.dumps(d))"
+// RUN: not triton-opt %s \
+// RUN:   -tritonamdgpu-apply-plan-pipeline='input-path=%t.pipeline.staging.unsupported.json strict=true' \
+// RUN:   2>&1 | FileCheck %s --check-prefix=PIPELINE-STAGING-DERIVATION-REJECT
+// RUN: python3 -c "import json; p=json.load(open('%t.pipeline.plan.json')); f=next(x for x in p['functions'] if x['function']=='register_to_lds_no_gain'); ops={x['id']:x['kind'] for x in f['operations']}; v=next(x for x in f['values'] if ops.get(x['origin'].get('operation'))=='arith.addf' and any(ops[u['operation']]=='amdg.extract_slice' for u in x['uses'])); s=next(u['operation'] for u in v['uses'] if ops[u['operation']]=='amdg.extract_slice'); sv=next(x for x in f['values'] if x['origin'].get('operation')==s); cs=sorted({u['operation'] for u in sv['uses']}); l=next(x['id'] for x in f['operations'] if x['kind']=='scf.for'); d={'schema_version':'plan-pipeline-delta/0.1','kernel':f['function'],'input_value_graph_fingerprint':f['semantic_fingerprint'],'pass_position':'before_update_async_wait_count','loops':[{'loop':l,'transactions':[],'staging':[{'value':v['id'],'action':'register_to_lds','consumers':cs,'buffer_depth':1,'alignment':16}]}]}; open('%t.pipeline.staging.no-gain.json','w').write(json.dumps(d))"
+// RUN: not triton-opt %s \
+// RUN:   -tritonamdgpu-apply-plan-pipeline='input-path=%t.pipeline.staging.no-gain.json strict=true' \
+// RUN:   2>&1 | FileCheck %s --check-prefix=PIPELINE-STAGING-NO-GAIN
+// RUN: python3 -c "import json; p=json.load(open('%t.pipeline.plan.json')); f=next(x for x in p['functions'] if x['function']=='register_to_lds_layout_chain'); ops={x['id']:x['kind'] for x in f['operations']}; v=next(x for x in f['values'] if ops.get(x['origin'].get('operation'))=='arith.addi' and any(ops[u['operation']]=='tt.reshape' for u in x['uses'])); req=next(x for x in f['values'] if ops.get(x['origin'].get('operation'))=='tlx.require_layout'); cs=sorted({u['operation'] for u in req['uses']}); l=next(x['id'] for x in f['operations'] if x['kind']=='scf.for'); d={'schema_version':'plan-pipeline-delta/0.1','kernel':f['function'],'input_value_graph_fingerprint':f['semantic_fingerprint'],'pass_position':'before_update_async_wait_count','loops':[{'loop':l,'transactions':[],'staging':[{'value':v['id'],'action':'register_to_lds','consumers':cs,'buffer_depth':1,'alignment':16}]}]}; open('%t.pipeline.staging.layout-chain.json','w').write(json.dumps(d))"
+// RUN: TRITON_USE_MODULO_SCHEDULE=1 triton-opt %s \
+// RUN:   -tritonamdgpu-apply-plan-pipeline='input-path=%t.pipeline.staging.layout-chain.json report-path=%t.pipeline.staging.layout-chain.report.json strict=true' \
+// RUN:   | FileCheck %s --check-prefix=PIPELINE-STAGING-LAYOUT-CHAIN
+// RUN: FileCheck %s --check-prefix=PIPELINE-STAGING-LAYOUT-CHAIN-REPORT < %t.pipeline.staging.layout-chain.report.json
 //
 // Modulo runs before the guarded legacy scheduler. A successful modulo schedule
 // is preserved; the standard AMD pipeline lowers and expands it.
@@ -231,7 +249,7 @@
 // PIPELINE-STAGING: arith.addf
 // PIPELINE-STAGING-NEXT: ttg.local_store
 // PIPELINE-STAGING-NEXT: ttg.barrier
-// PIPELINE-STAGING-NEXT: ttg.local_load
+// PIPELINE-STAGING: ttg.local_load
 // PIPELINE-STAGING: arith.mulf
 // PIPELINE-STAGING: arith.subf
 // PIPELINE-STAGING-NEXT: ttg.barrier
@@ -245,18 +263,46 @@
 // PIPELINE-STAGING-REPORT-DAG: "post_rewrite_ddg_verified": true
 // PIPELINE-STAGING-REPORT-DAG: "post_rewrite_audit_passed": true
 // PIPELINE-STAGING-REPORT-DAG: "materialization_scope": "register_to_lds_staging"
-// PIPELINE-STAGING-INCOMPLETE: M1.5b.4a requires all direct in-loop uses to be selected
+// PIPELINE-STAGING-INCOMPLETE: staging_does_not_shorten_lifetime
 // PIPELINE-STAGING-NONUSE: named register-to-LDS consumer does not use the staged value
-// PIPELINE-STAGING-DEPTH: M1.5b.4a supports only single-slot register staging
+// PIPELINE-STAGING-DEPTH: M1.5b.4 supports only single-slot register staging
 // PIPELINE-STAGING-ALIGNMENT: pipeline staging alignment must be a power of two
 // PIPELINE-STAGING-CAPACITY: register-to-LDS staging exceeds the target LDS capacity
 // PIPELINE-STAGING-SCALAR: register-to-LDS staging requires a produced ranked tensor
+// PIPELINE-STAGING-DERIVED-LABEL: tt.func @register_to_lds_derived
+// PIPELINE-STAGING-DERIVED: %[[PRODUCER:.*]] = arith.addf
+// PIPELINE-STAGING-DERIVED-NEXT: ttg.local_store %[[PRODUCER]]
+// PIPELINE-STAGING-DERIVED: ttg.local_load
+// PIPELINE-STAGING-DERIVED-COUNT-1: amdg.extract_slice
+// PIPELINE-STAGING-DERIVED: arith.mulf
+// PIPELINE-STAGING-DERIVED: arith.subf
+// PIPELINE-STAGING-DERIVED-REPORT-DAG: "derived_operations_cloned": 1
+// PIPELINE-STAGING-DERIVED-REPORT-DAG: "derived_operations_pruned": 1
+// PIPELINE-STAGING-DERIVED-REPORT-DAG: "logical_live_range_shortened": true
+// PIPELINE-STAGING-DERIVED-REPORT-DAG: "selected_consumer_operands": 4
+// PIPELINE-STAGING-DERIVED-REPORT-DAG: "unselected_consumers_preserved": 1
+// PIPELINE-STAGING-DERIVED-REPORT-DAG: "post_rewrite_audit_passed": true
+// PIPELINE-STAGING-DERIVATION-REJECT: named register-to-LDS consumer is reached through an unsupported derived operation
+// PIPELINE-STAGING-NO-GAIN: staging_does_not_shorten_lifetime
+// PIPELINE-STAGING-LAYOUT-CHAIN-LABEL: tt.func @register_to_lds_layout_chain
+// PIPELINE-STAGING-LAYOUT-CHAIN: ttg.local_load
+// PIPELINE-STAGING-LAYOUT-CHAIN: tt.reshape
+// PIPELINE-STAGING-LAYOUT-CHAIN: tt.trans
+// PIPELINE-STAGING-LAYOUT-CHAIN: ttg.convert_layout
+// PIPELINE-STAGING-LAYOUT-CHAIN: tlx.require_layout
+// PIPELINE-STAGING-LAYOUT-CHAIN-REPORT-DAG: "derived_operations_cloned": 4
+// PIPELINE-STAGING-LAYOUT-CHAIN-REPORT-DAG: "derived_operations_pruned": 4
+// PIPELINE-STAGING-LAYOUT-CHAIN-REPORT-DAG: "logical_live_range_shortened": true
+// PIPELINE-STAGING-LAYOUT-CHAIN-REPORT-DAG: "selected_consumer_operands": 2
 
 #mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [2, 2], instrShape = [16, 16, 32], isTransposed = true}>
 #dot0 = #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 8}>
 #dot1 = #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 8}>
 #blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [8, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
 #slot_blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [8, 8], warpsPerCTA = [2, 2], order = [1, 0]}>
+#reshape_src = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [1, 64], warpsPerCTA = [4, 1], order = [0, 1]}>
+#reshape_dst = #ttg.blocked<{sizePerThread = [2, 2], threadsPerWarp = [64, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
+#reshape_trans = #ttg.blocked<{sizePerThread = [2, 2], threadsPerWarp = [1, 64], warpsPerCTA = [1, 4], order = [1, 0]}>
 #slot_shared = #ttg.swizzled_shared<{vec = 2, perPhase = 1, maxPhase = 1, order = [1, 0]}>
 #smem = #ttg.shared_memory
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 64 : i32} {
@@ -369,6 +415,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
     %result = scf.for %i = %c0 to %c4 step %c1
         iter_args(%iter = %input) -> tensor<16x16xf16, #slot_blocked> {
       %producer = arith.addf %iter, %input : tensor<16x16xf16, #slot_blocked>
+      %unrelated = arith.addf %input, %input : tensor<16x16xf16, #slot_blocked>
       %left = arith.mulf %producer, %producer : tensor<16x16xf16, #slot_blocked>
       %right = arith.subf %producer, %input : tensor<16x16xf16, #slot_blocked>
       %combined = arith.addf %left, %right : tensor<16x16xf16, #slot_blocked>
@@ -399,6 +446,69 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
     scf.for %i = %c0 to %c4 step %c1 {
       %value = arith.index_cast %i : index to i32
       %consumer = arith.addi %value, %value : i32
+    }
+    tt.return
+  }
+
+  tt.func @register_to_lds_derived(
+      %input: tensor<64x128xf16, #blocked>) {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c4 = arith.constant 4 : index
+    scf.for %i = %c0 to %c4 step %c1 {
+      %producer = arith.addf %input, %input : tensor<64x128xf16, #blocked>
+      %unselected = arith.addf %producer, %input : tensor<64x128xf16, #blocked>
+      %pad0 = arith.mulf %unselected, %input : tensor<64x128xf16, #blocked>
+      %pad1 = arith.addf %pad0, %input : tensor<64x128xf16, #blocked>
+      %slice = amdg.extract_slice %producer [0, 0] : tensor<64x128xf16, #blocked> to tensor<32x64xf16, #blocked>
+      %left = arith.mulf %slice, %slice : tensor<32x64xf16, #blocked>
+      %right = arith.subf %slice, %slice : tensor<32x64xf16, #blocked>
+    }
+    tt.return
+  }
+
+  tt.func @register_to_lds_unsupported(
+      %input: tensor<16x16xf16, #slot_blocked>) {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c4 = arith.constant 4 : index
+    scf.for %i = %c0 to %c4 step %c1 {
+      %producer = arith.addf %input, %input : tensor<16x16xf16, #slot_blocked>
+      %derived = arith.mulf %producer, %input : tensor<16x16xf16, #slot_blocked>
+      %consumer = arith.subf %derived, %input : tensor<16x16xf16, #slot_blocked>
+    }
+    tt.return
+  }
+
+  tt.func @register_to_lds_no_gain(
+      %input: tensor<64x128xf16, #blocked>) {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c4 = arith.constant 4 : index
+    scf.for %i = %c0 to %c4 step %c1 {
+      %producer = arith.addf %input, %input : tensor<64x128xf16, #blocked>
+      %slice = amdg.extract_slice %producer [0, 0] : tensor<64x128xf16, #blocked> to tensor<32x64xf16, #blocked>
+      %pad0 = arith.mulf %input, %input : tensor<64x128xf16, #blocked>
+      %pad1 = arith.addf %pad0, %input : tensor<64x128xf16, #blocked>
+      %consumer = arith.subf %slice, %slice : tensor<32x64xf16, #blocked>
+    }
+    tt.return
+  }
+
+  tt.func @register_to_lds_layout_chain(
+      %input: tensor<1x16xi32, #reshape_src>) {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c4 = arith.constant 4 : index
+    scf.for %i = %c0 to %c4 step %c1 {
+      %producer = arith.addi %input, %input : tensor<1x16xi32, #reshape_src>
+      %pad0 = arith.muli %input, %input : tensor<1x16xi32, #reshape_src>
+      %pad1 = arith.addi %pad0, %input : tensor<1x16xi32, #reshape_src>
+      %reshape = tt.reshape %producer allow_reorder : tensor<1x16xi32, #reshape_src> -> tensor<2x8xi32, #reshape_trans>
+      %trans = tt.trans %reshape {order = array<i32: 1, 0>} : tensor<2x8xi32, #reshape_trans> -> tensor<8x2xi32, #reshape_dst>
+      %convert = ttg.convert_layout %trans : tensor<8x2xi32, #reshape_dst> -> tensor<8x2xi32, #reshape_dst>
+      %required = tlx.require_layout %convert : tensor<8x2xi32, #reshape_dst> -> tensor<8x2xi32, #reshape_dst>
+      %consumer = arith.addi %required, %required : tensor<8x2xi32, #reshape_dst>
     }
     tt.return
   }
