@@ -169,6 +169,12 @@
 - **Fix**: two parts. (1) `findReuseCandidate` now applies the co-live filter to the **target** side as well — only a TMA-staging candidate may land on a host that `isSmemLiveAcrossInnerLoop`, mirroring the candidate-side filter Phase 3.6 already had. (2) New `relaxCopySafetyFloorToBudget` gives the copy-safety floor back — it is a schedule proof, unlike the cross-stage floor, which stays unconditional — one copy at a time, largest buffer first, until the plan fits; Phase 4 then re-bumps whatever the budget allows. Relaxing straight back to the pre-floor depth is **not** enough: Phase 3.7 spends the freed slot on staging and Phase 4 can no longer restore the operand.
 - **Tests**: `test_autows_addmm.py` 73 passed (was 4 failed / 69 passed); the resulting plan is 4=2 / 5=3 / 6=3 with no `allocation.reuseTarget`. A dedicated lit test is still missing.
 
+### 29. Dead scalar rematerialization clones create descriptor-load self-consumers (2026-08-18, fixed)
+- **Symptom**: BM128 2-CTA FA backward is nondeterministically numerically wrong after rebasing; dV reports first, but dK/dQ are also corrupted.
+- **Root cause**: partition scheduling clones the `m`/`delta` convert-layout chain into the load task, but those clones are dead. Descriptor-load conversion counted the dead task-3 users when assigning the replacement `local_load`, creating a producer-task self-consumer channel and unsafe TMA-buffer rotation.
+- **Fix**: before converting each descriptor load, recursively erase only dead `convert_layout`/`broadcast`/`expand_dims` rematerialization chains, then derive consumer task IDs from the remaining users. Whole-function DCE is intentionally avoided because test/debug IR may contain unrelated dead consumers.
+- **Regression**: `ws_remove_redundant_tmem_zero_bwd_bm128_inner.mlir` requires both rank-1 statistic `local_load`s to belong only to computation task 0.
+
 ## Debugging Workflow
 - `t.dump` captures IR after each WarpSpec pass (doTaskIdPropagate → doBufferAllocation → doMemoryPlanner → doCodePartition → ...)
 - IR after PartitionSchedulingMeta uses `ttg.partition = array<i32: N>` attributes (not `async_task_id`)
