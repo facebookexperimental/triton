@@ -68,6 +68,14 @@ static SmallVector<AsyncTaskId> getAllPartitions(scf::WhileOp whileOp) {
   return getAsyncTaskIds(whileOp.getOperation());
 }
 
+static bool hasExplicitCluster(Operation *op) {
+  ModuleOp mod = op->getParentOfType<ModuleOp>();
+  if (ttg::TritonGPUDialect::getNumCTAs(mod) != 1)
+    return false;
+  auto dims = ttg::TritonGPUDialect::getClusterDims(mod);
+  return dims[0] * dims[1] * dims[2] > 1;
+}
+
 // Return the enclosing persistent `scf.while` whose after-region terminator
 // (`scf.yield`) directly forwards `result` as a loop-carried value, or nullptr.
 // This is what makes the atomic result "loop-carried": its value drives the
@@ -259,7 +267,20 @@ enum class CLCWSCase {
   Reject       // unsupported -> bail out of WS
 };
 
-static CLCWSCase classifyCLC(ttng::CLCReadOp readOp, scf::WhileOp &whileOut) {
+static CLCWSCase classifyCLC(ttng::CLCReadOp readOp, scf::WhileOp &whileOut,
+                             bool emitRejectionDiagnostics) {
+  if (hasExplicitCluster(readOp)) {
+    if (emitRejectionDiagnostics) {
+      auto dims = ttg::TritonGPUDialect::getClusterDims(
+          readOp->getParentOfType<ModuleOp>());
+      readOp.emitError("clustered CLC AutoWS is unsupported for explicit "
+                       "cluster shape ")
+          << dims[0] << "x" << dims[1] << "x" << dims[2];
+    }
+    LDBG("reject: clustered CLC fetch cannot be warp-specialized");
+    return CLCWSCase::Reject;
+  }
+
   SmallVector<AsyncTaskId> taskIds = getAsyncTaskIds(readOp.getOperation());
   if (taskIds.size() <= 1)
     return CLCWSCase::PassThrough;
@@ -402,7 +423,13 @@ static LogicalResult transformCLC(triton::FuncOp funcOp, ttng::CLCReadOp readOp,
 // async_task_ids), leaving the kernel unspecialized-but-compilable — one source
 // of truth for the reject teardown shared with the other AutoWS bail-outs.
 LogicalResult doDynamicTileBroadcast(triton::FuncOp funcOp,
-                                     int tilePrefetchDepth) {
+                                     int tilePrefetchDepth,
+                                     bool emitRejectionDiagnostics) {
+  SmallVector<std::pair<tt::AtomicRMWOp, scf::WhileOp>> atomicTransforms;
+  SmallVector<std::pair<ttng::CLCReadOp, scf::WhileOp>> clcTransforms;
+
+  // Classify every candidate before mutating the function. A later rejection
+  // must not leave broadcast IR created for an earlier eligible producer.
   // Atomic global tile counter.
   SmallVector<tt::AtomicRMWOp> atomics;
   funcOp.walk([&](tt::AtomicRMWOp op) { atomics.push_back(op); });
@@ -415,11 +442,7 @@ LogicalResult doDynamicTileBroadcast(triton::FuncOp funcOp,
       LDBG("Warp specialization does not support this atomic shape. Skipping.");
       return failure();
     case AtomicWSCase::Transform:
-      if (failed(
-              transformAtomic(funcOp, atomicOp, whileOp, tilePrefetchDepth))) {
-        LDBG("atomic broadcast transform failed; skipping WS.");
-        return failure();
-      }
+      atomicTransforms.emplace_back(atomicOp, whileOp);
       break;
     }
   }
@@ -429,18 +452,29 @@ LogicalResult doDynamicTileBroadcast(triton::FuncOp funcOp,
   funcOp.walk([&](ttng::CLCReadOp op) { reads.push_back(op); });
   for (auto readOp : reads) {
     scf::WhileOp whileOp;
-    switch (classifyCLC(readOp, whileOp)) {
+    switch (classifyCLC(readOp, whileOp, emitRejectionDiagnostics)) {
     case CLCWSCase::PassThrough:
       break;
     case CLCWSCase::Reject:
       LDBG("Warp specialization does not support this CLC fetch. Skipping.");
       return failure();
     case CLCWSCase::Transform:
-      if (failed(transformCLC(funcOp, readOp, whileOp))) {
-        LDBG("CLC broadcast transform failed; skipping WS.");
-        return failure();
-      }
+      clcTransforms.emplace_back(readOp, whileOp);
       break;
+    }
+  }
+
+  for (auto [atomicOp, whileOp] : atomicTransforms) {
+    if (failed(
+            transformAtomic(funcOp, atomicOp, whileOp, tilePrefetchDepth))) {
+      LDBG("atomic broadcast transform failed; skipping WS.");
+      return failure();
+    }
+  }
+  for (auto [readOp, whileOp] : clcTransforms) {
+    if (failed(transformCLC(funcOp, readOp, whileOp))) {
+      LDBG("CLC broadcast transform failed; skipping WS.");
+      return failure();
     }
   }
   return success();
@@ -464,7 +498,8 @@ public:
 
   void runOnOperation() override {
     getOperation()->walk([&](triton::FuncOp funcOp) {
-      if (failed(doDynamicTileBroadcast(funcOp, tilePrefetchDepth)))
+      if (failed(doDynamicTileBroadcast(funcOp, tilePrefetchDepth,
+                                        /*emitRejectionDiagnostics=*/true)))
         signalPassFailure();
     });
   }
