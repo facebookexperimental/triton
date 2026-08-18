@@ -7,6 +7,50 @@ module attributes {"ttg.num-warps" = 4 : i32} {
 
 // -----
 
+// A single AutoWS-generated warp-specialize region enables direct warp-ID
+// dispatch. The tag is placed on an operation in the region, matching the IR
+// emitted by AutoWS.
+// CHECK-LABEL: module attributes {
+// CHECK-SAME: "ttg.single-warp-specialize" = true
+module attributes {"ttg.num-warps" = 4 : i32} {
+
+tt.func @single_autows_region() {
+  ttg.warp_specialize()
+  default {
+    %c0 = arith.constant {ttg.warp_specialize.tag = 0 : i32} 0 : i32
+    ttg.warp_yield
+  }
+  partition0() num_warps(4) {
+    ttg.warp_return
+  } : () -> ()
+  tt.return
+}
+
+}
+
+// -----
+
+// A manual warp-specialize region has no AutoWS tag and must remain under the
+// frontend's explicit exclusive-task control.
+// CHECK-LABEL: module attributes {"ttg.num-warps" = 4 : i32, "ttg.total-num-warps" = 8 : i32}{{$}}
+// CHECK: tt.func @single_manual_region
+module attributes {"ttg.num-warps" = 4 : i32} {
+
+tt.func @single_manual_region() {
+  ttg.warp_specialize()
+  default {
+    ttg.warp_yield
+  }
+  partition0() num_warps(4) {
+    ttg.warp_return
+  } : () -> ()
+  tt.return
+}
+
+}
+
+// -----
+
 // CHECK: module attributes {"ttg.num-warps" = 4 : i32, "ttg.total-num-warps" = 20 : i32}
 module attributes {"ttg.num-warps" = 4 : i32} {
 

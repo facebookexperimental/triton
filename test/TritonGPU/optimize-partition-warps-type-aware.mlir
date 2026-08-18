@@ -1,4 +1,4 @@
-// RUN: triton-opt %s -allow-unregistered-dialect -tritongpu-optimize-partition-warps | FileCheck %s
+// RUN: triton-opt %s -split-input-file -allow-unregistered-dialect -tritongpu-optimize-partition-warps | FileCheck %s
 
 // Tests for type-aware warp assignment in OptimizePartitionWarps pass.
 // When partition types are specified via ttg.partition.types attribute:
@@ -97,4 +97,65 @@ tt.func @empty_partition_types(%arg0: i32) {
   tt.return
 }
 
+// Test 5: A truncated type array must not be treated as if it described the
+// specialized partitions. In particular, do not apply the computation warp
+// override when role alignment is unknown.
+// CHECK-LABEL: @truncated_partition_types_do_not_mislabel
+// CHECK: ttg.warp_specialize({{.*}}) attributes {requestedRegisters = array<i32: 24, 24, 24>, ttg.partition.types = ["reduction", "computation"]}
+// CHECK: partition0({{.*}}) num_warps(1)
+// CHECK: partition1({{.*}}) num_warps(1)
+// CHECK: partition2({{.*}}) num_warps(1)
+tt.func @truncated_partition_types_do_not_mislabel(%arg0: i32) {
+  ttg.warp_specialize(%arg0) attributes {"ttg.partition.types" = ["reduction", "computation"]}
+  default {
+    ttg.warp_yield
+  }
+  partition0(%arg1: i32) num_warps(4) {
+    %0 = arith.addi %arg1, %arg1 : i32
+    ttg.warp_return
+  }
+  partition1(%arg1: i32) num_warps(4) {
+    %0 = arith.subi %arg1, %arg1 : i32
+    ttg.warp_return
+  }
+  partition2(%arg1: i32) num_warps(4) {
+    %0 = arith.muli %arg1, %arg1 : i32
+    ttg.warp_return
+  } : (i32) -> ()
+  tt.return
+}
+
+}
+
+// -----
+
+// The 2-CTA backward schedule keeps computation in the default region. The
+// four specialized scalar partitions map to reduction, GEMM, load, and relay;
+// all shrink through the normal heuristic and use min_reg_auto_ws.
+// CHECK-LABEL: @two_cta_bwd_specialized_partitions
+// CHECK: ttg.warp_specialize() attributes {requestedRegisters = array<i32: 88, 88, 88, 88>, ttg.partition.types = ["computation", "reduction", "gemm", "load", "relay"]}
+// CHECK: partition0() num_warps(1)
+// CHECK: partition1() num_warps(1)
+// CHECK: partition2() num_warps(1)
+// CHECK: partition3() num_warps(1)
+module attributes {ttg.max_reg_auto_ws = 88 : i32, ttg.min_reg_auto_ws = 88 : i32, "ttg.num-warps" = 8 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32, "ttng.two-ctas" = true} {
+tt.func @two_cta_bwd_specialized_partitions() {
+  ttg.warp_specialize() attributes {"ttg.partition.types" = ["computation", "reduction", "gemm", "load", "relay"]}
+  default {
+    ttg.warp_yield
+  }
+  partition0() num_warps(8) {
+    ttg.warp_return
+  }
+  partition1() num_warps(8) {
+    ttg.warp_return
+  }
+  partition2() num_warps(8) {
+    ttg.warp_return
+  }
+  partition3() num_warps(8) {
+    ttg.warp_return
+  } : () -> ()
+  tt.return
+}
 }
