@@ -1715,7 +1715,7 @@ class TritonSemantic(Generic[TensorTy]):
                 acc_handle,
                 input_precision,
                 max_num_imprecise_acc,
-                two_ctas,
+                bool(two_ctas),
             ),
             result_type,
         )

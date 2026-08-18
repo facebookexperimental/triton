@@ -461,11 +461,14 @@ private:
           ArrayRef<Value>(permutedInVals).slice(i * tileSize, tileSize);
       lowerLdStShared(loc, ctx, storeCvt, tileInVals, llvmElemTy, smemBase,
                       /*paddingShifts=*/{}, affineOffset, maskSpanAffineOffset,
+                      /*affineBlockOffset=*/Value(),
+                      /*maskSpanAffineBlock=*/0,
                       rewriter, targetInfo);
       emitBarrier();
       auto tileOutVals = lowerLdStShared(
           loc, ctx, loadCvt, {}, llvmElemTy, smemBase, /*paddingShifts=*/{},
-          affineOffset, maskSpanAffineOffset, rewriter, targetInfo);
+          affineOffset, maskSpanAffineOffset, /*affineBlockOffset=*/Value(),
+          /*maskSpanAffineBlock=*/0, rewriter, targetInfo);
       llvm::append_range(outVals, tileOutVals);
     }
 

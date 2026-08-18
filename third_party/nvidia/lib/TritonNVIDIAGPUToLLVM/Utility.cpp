@@ -223,6 +223,7 @@ LogicalResult lowerLdStMatrix(
   auto kLane = S("lane");
   auto kWarp = S("warp");
   auto kOffset = S("offset");
+  auto kBlock = S("block");
   auto kAddr = S("addr");
   auto smemPtrTy = ptr_ty(ctx, 3);
   auto bitwidth = getIntOrFloatOrPtrBitWidth(llvmElemTy);
@@ -368,12 +369,19 @@ LogicalResult lowerLdStMatrix(
       LinearLayout({{kLane, addrToOffset.getBases().lookup(kAddr)},
                     {kWarp, reps.getBases().lookup(kWarp)}},
                    {{kOffset, reps.getOutDimSize(kOffset)}}, false);
+
+  // Matrix accesses are CTA-local. Model that with a trivial block output so
+  // additive stride analysis always compares (offset, block) components.
+  reps =
+      reps.reshapeOuts({{kOffset, reps.getOutDimSize(kOffset)}, {kBlock, 1}});
+  addrLayout = addrLayout.reshapeOuts(reps.getOutDims());
   // Compute the bits that are moved by one instruction
   // Compute elements for which we can swap the xor by an add
   // Pass the full ldmatrix/stmatrix vector width because the shared helper
   // classifies its low register bases as one indivisible instruction group.
   auto [nAdditive, permStrides] = actionAdditiveStrides(
-      reps, addrLayout, maskSpanAffineOffset, fullTileVec.getInDimSize(kReg));
+      reps, addrLayout, maskSpanAffineOffset, /*maskSpanBlocks=*/0,
+      fullTileVec.getInDimSize(kReg));
   reps = permStrides.apply(reps);
   if (isStore) {
     vals = permStrides.apply(vals);

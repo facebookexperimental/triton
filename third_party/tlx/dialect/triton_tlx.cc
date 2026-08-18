@@ -15,15 +15,16 @@
 #include "triton/Tools/LayoutUtils.h"
 #include "triton/Tools/LinearLayout.h"
 #include "llvm/Support/Casting.h"
-#include <pybind11/pybind11.h>
-#include <pybind11/stl.h>
-#include <pybind11/stl_bind.h>
+#include <nanobind/nanobind.h>
+#include <nanobind/stl/optional.h>
+#include <nanobind/stl/pair.h>
+#include <nanobind/stl/string.h>
+#include <nanobind/stl/vector.h>
 
-namespace py = pybind11;
+namespace py = nanobind;
 
-// Defined in ir.cc. Declared here rather than in ir.h so ir.h stays
-// pybind11-free and matches upstream; the pybind11 builder class is only
-// needed by this python-binding TU and ir.cc.
+// Defined in ir.cc. Declared here rather than in ir.h so ir.h stays free of
+// Python binding implementation details and matches upstream.
 namespace ir {
 extern py::class_<TritonOpBuilder> *getBuilderClass();
 } // namespace ir
@@ -100,7 +101,7 @@ static Value materializeConcreteMemDesc(TritonOpBuilder &builder, Value value) {
   return builder.create<tlx::RequireLayoutOp>(concreteType, value);
 }
 
-void init_triton_tlx_ir(py::module &&m) {
+void init_triton_tlx_ir(py::module_ &m) {
   auto *builder_cls = ir::getBuilderClass();
   builder_cls
       ->def(
@@ -1420,7 +1421,7 @@ void init_triton_tlx_ir(py::module &&m) {
            });
 }
 
-void init_triton_tlx_passes(py::module &&m) {
+void init_triton_tlx_passes(py::module_ &m) {
   ADD_PASS_WRAPPER_0("add_tlx_propagate_layout", tlx::createTlxPropagateLayout);
   ADD_PASS_WRAPPER_0("add_tlx_insert_require_layout",
                      tlx::createTLXInsertRequireLayout);
@@ -1452,7 +1453,7 @@ void init_triton_tlx_passes(py::module &&m) {
         });
 }
 
-void init_triton_tlx(py::module &&m) {
+void init_triton_tlx(py::module_ &m) {
   // load dialects
   m.def("load_dialects", [](mlir::MLIRContext &context) {
     mlir::DialectRegistry registry;
@@ -1462,6 +1463,8 @@ void init_triton_tlx(py::module &&m) {
     context.loadAllAvailableDialects();
   });
 
-  init_triton_tlx_ir(m.def_submodule("tlx_ir"));
-  init_triton_tlx_passes(m.def_submodule("tlx_passes"));
+  auto ir = m.def_submodule("tlx_ir");
+  init_triton_tlx_ir(ir);
+  auto passes = m.def_submodule("tlx_passes");
+  init_triton_tlx_passes(passes);
 }

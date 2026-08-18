@@ -446,8 +446,8 @@ def async_dot(
         handles = [t.handle for t in mBarriers]
         is_async = force_async or len(handles) > 0
         use_acc_handle = _get_use_acc_handle(use_acc, _semantic.builder)
-        output = _semantic.builder.create_tcgen5_dot(A_handle, B_handle, acc_handle, use_acc_handle, pred, two_ctas,
-                                                     handles, is_async)
+        output = _semantic.builder.create_tcgen5_dot(A_handle, B_handle, acc_handle, use_acc_handle, pred, bool(two_ctas),
+                                                     handles, bool(is_async))
         return tl.tensor(output, tl.void)
     else:
         mma_layout = _semantic.builder.make_nv_mma_encoding_attr(A_handle, acc_handle, version, 0,
@@ -621,9 +621,9 @@ def async_dot_scaled(
         B_type,
         use_acc_handle,
         pred,
-        two_ctas,
+        bool(two_ctas),
         bar_handles,
-        is_async,
+        bool(is_async),
     )
     return tl.tensor(output, tl.void)
 
