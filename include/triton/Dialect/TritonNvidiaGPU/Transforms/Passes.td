@@ -127,8 +127,18 @@ def TritonNvidiaGPUTMALoweringPass : Pass<"triton-nvidia-tma-lowering", "mlir::M
   }];
 
   let dependentDialects = [
-    "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"
+    "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect",
+    "mlir::triton::nvgpu::NVGPUDialect",
+    "mlir::arith::ArithDialect"
   ];
+}
+
+def TritonNvidiaGPUTMAMulticastPass : Pass<"triton-nvidia-plan-tma-multicast", "mlir::ModuleOp"> {
+  let summary = "Plan compiler-selected TMA multicast groups";
+  let description = [{
+    Annotates eligible descriptor loads with cluster axes across which their
+    source tile is statically invariant.
+  }];
 }
 
 def TritonNvidiaGPUTMAStoreBufferReusePass

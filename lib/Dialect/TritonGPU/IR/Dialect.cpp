@@ -3858,10 +3858,13 @@ struct TritonGPUVerifyTensorLayoutInterface
 
     int moduleCTAsPerCGA = lookupNumCTAs(op);
     int layoutCTAsPerCGA = getNumCTAs(layout);
-    if (layoutCTAsPerCGA != moduleCTAsPerCGA) {
+    int physicalCTAsPerCGA = lookupPhysicalNumCTAs(op);
+    if (layoutCTAsPerCGA != moduleCTAsPerCGA &&
+        layoutCTAsPerCGA != physicalCTAsPerCGA) {
       return makeErr() << layout << ".\nLayout has " << layoutCTAsPerCGA
-                       << " CTAs per CGA, but the context requires "
-                       << moduleCTAsPerCGA << " CTAs per CGA.";
+                       << " CTAs per CGA, but the context requires either "
+                       << moduleCTAsPerCGA << " logical or "
+                       << physicalCTAsPerCGA << " physical CTAs per CGA.";
     }
     return success();
   }
@@ -4489,6 +4492,17 @@ int triton::gpu::lookupNumCTAs(OpBuilder &rewriter) {
       rewriter.getInsertionBlock()->getParentOp()->getParentOfType<ModuleOp>();
   assert(op && "cannot check number of CTAs outside of module");
   return triton::gpu::TritonGPUDialect::getNumCTAs(cast<ModuleOp>(op));
+}
+
+int triton::gpu::lookupPhysicalNumCTAs(Operation *op) {
+  auto mod = dyn_cast<ModuleOp>(op);
+  if (!mod)
+    mod = op->getParentOfType<ModuleOp>();
+  if (!mod)
+    return lookupNumCTAs(op);
+  auto dims = TritonGPUDialect::getClusterDims(mod);
+  int physicalNumCTAs = dims[0] * dims[1] * dims[2];
+  return physicalNumCTAs > 1 ? physicalNumCTAs : lookupNumCTAs(op);
 }
 
 bool triton::gpu::areLayoutsEquivalent(ArrayRef<int64_t> shape,

@@ -11,7 +11,7 @@
 //                               mbarrier + low-level try_cancel/expect (issue)
 //                               and wait/load/decode (read), with a
 //                               loop-carried phase. Explicit clusters also get
-//                               an empty barrier that guards response reuse.
+//                               a ready barrier that guards response reuse.
 //
 // Stage 3 (AutoWS handling) is intentionally NOT here; it lands in a follow-up
 // branch and slots between Stage 2 and Stage 4. The CUDA-style ctas_per_cga
@@ -158,7 +158,8 @@ struct CLCMaterializePass
     Location loc = read.getLoc();
     OpBuilder b(whileOp);
     Type i32 = b.getI32Type();
-    int clusterSize = getExplicitClusterSize(read->getParentOfType<ModuleOp>());
+    ModuleOp mod = read->getParentOfType<ModuleOp>();
+    int clusterSize = getExplicitClusterSize(mod);
 
     // Loop-carried phase, initialized to 0.
     Value zero =
@@ -172,13 +173,65 @@ struct CLCMaterializePass
     // Explicit clusters also use a second barrier to rendezvous before reuse.
     b.setInsertionPoint(newLoop);
     Value resp = createClcResponseAlloc(b, loc);
-    Value barAlloc = createBarrierAlloc(newLoop, /*numBarriers=*/1);
-    Value bar = createSingleBufferView(b, barAlloc, 0);
-    Value emptyBar;
-    if (clusterSize > 1) {
-      Value emptyBarAlloc =
-          createBarrierAlloc(newLoop, /*numBarriers=*/1, clusterSize);
-      emptyBar = createSingleBufferView(b, emptyBarAlloc, 0);
+    Value bar;
+    Value readyBar;
+    bool readyArrivePerThread = false;
+    auto wsOp = issue->getParentOfType<ttg::WarpSpecializeOp>();
+    if (clusterSize > 1 && wsOp) {
+      int threadsPerWarp = ttg::TritonGPUDialect::getThreadsPerWarp(mod);
+      int readyArriveCount =
+          clusterSize * ttg::lookupNumWarps(issue) * threadsPerWarp;
+      readyArrivePerThread = true;
+
+      ImplicitLocOpBuilder wb(wsOp.getLoc(), wsOp);
+      Value barriers = createScalarAlloc(wb, wb.getI64Type(), 2);
+      Value completionInit = createSingleBufferView(wb, barriers, 0);
+      InitBarrierOp::create(wb, completionInit, /*count=*/1);
+      Value readyInit = createSingleBufferView(wb, barriers, 1);
+      InitBarrierOp::create(wb, readyInit, readyArriveCount);
+
+      wb.setInsertionPointAfter(wsOp);
+      for (int i = 0; i < 2; ++i) {
+        Value invalView = createSingleBufferView(wb, barriers, i);
+        InvalBarrierOp::create(wb, invalView);
+      }
+      ttg::LocalDeallocOp::create(wb, barriers);
+
+      if (!wsOp.getDefaultRegion().isAncestor(issue->getParentRegion())) {
+        Region *issuePartition = nullptr;
+        for (Region *region : wsOp.getPartitionRegions())
+          if (region->isAncestor(issue->getParentRegion())) {
+            issuePartition = region;
+            break;
+          }
+        if (!issuePartition)
+          return issue.emitError("CLC issue not found in a warp-specialize "
+                                 "partition region");
+
+        auto partOp = wsOp.getPartitionOp();
+        partOp->insertOperands(partOp->getNumOperands(), barriers);
+        Value captured;
+        for (Region *region : wsOp.getPartitionRegions()) {
+          BlockArgument arg =
+              region->addArgument(barriers.getType(), wsOp.getLoc());
+          if (region == issuePartition)
+            captured = arg;
+        }
+        OpBuilder vb(issue);
+        bar = createSingleBufferView(vb, captured, 0);
+        readyBar = createSingleBufferView(vb, captured, 1);
+      } else {
+        bar = createSingleBufferView(b, barriers, 0);
+        readyBar = createSingleBufferView(b, barriers, 1);
+      }
+    } else {
+      Value barAlloc = createBarrierAlloc(newLoop, /*numBarriers=*/1);
+      bar = createSingleBufferView(b, barAlloc, 0);
+      if (clusterSize > 1) {
+        Value readyBarAlloc =
+            createBarrierAlloc(newLoop, /*numBarriers=*/1, clusterSize);
+        readyBar = createSingleBufferView(b, readyBarAlloc, 0);
+      }
     }
 
     // Forward the phase from the before-region into the after-region and read
@@ -191,23 +244,32 @@ struct CLCMaterializePass
 
     // Materialize the issue: barrier_expect + clc_try_cancel.
     OpBuilder ib(issue);
-    if (emptyBar) {
-      // The first wait passes immediately because an initialized mbarrier has
-      // phase 0. Later waits block until every CTA has consumed the previous
-      // multicast response and arrived on the lead CTA's empty barrier.
+    Value pred = arith::ConstantIntOp::create(ib, issue.getLoc(), /*value=*/1,
+                                              /*width=*/1);
+    BarrierExpectOp::create(ib, issue.getLoc(), bar, kClcResponseBytes, pred);
+    if (readyBar) {
+      // Every peer completion barrier must be armed before rank zero issues
+      // the multicast request. Under warp specialization, every thread in the
+      // owner partition contributes one arrival.
+      FenceAsyncSharedOp::create(ib, issue.getLoc(), /*bCluster=*/false);
       Value rank =
           mlir::triton::nvgpu::ClusterCTAIdOp::create(ib, issue.getLoc(), i32);
       Value zero = arith::ConstantIntOp::create(ib, issue.getLoc(), 0, 32);
       Value isLeader = arith::CmpIOp::create(
           ib, issue.getLoc(), arith::CmpIPredicate::eq, rank, zero);
-      Value one = arith::ConstantIntOp::create(ib, issue.getLoc(), 1, 32);
-      Value emptyPhase =
-          arith::XOrIOp::create(ib, issue.getLoc(), phaseAfter, one);
-      WaitBarrierOp::create(ib, issue.getLoc(), emptyBar, emptyPhase, isLeader);
+      auto readyBarTy = cast<ttg::MemDescType>(readyBar.getType());
+      auto remoteBarTy = ttg::MemDescType::get(
+          readyBarTy.getShape(), readyBarTy.getElementType(),
+          readyBarTy.getEncoding(),
+          SharedClusterMemorySpaceAttr::get(ib.getContext()),
+          readyBarTy.getMutableMemory(), readyBarTy.getAllocShape());
+      Value remoteReadyBar = MapToRemoteBufferOp::create(
+          ib, issue.getLoc(), remoteBarTy, readyBar, zero);
+      ArriveBarrierOp::create(ib, issue.getLoc(), remoteReadyBar,
+                              /*count=*/1,
+                              /*perThread=*/readyArrivePerThread);
+      WaitBarrierOp::create(ib, issue.getLoc(), readyBar, phaseAfter, isLeader);
     }
-    Value pred = arith::ConstantIntOp::create(ib, issue.getLoc(), /*value=*/1,
-                                              /*width=*/1);
-    BarrierExpectOp::create(ib, issue.getLoc(), bar, kClcResponseBytes, pred);
     CLCTryCancelOp::create(ib, issue.getLoc(), resp, bar);
 
     // Materialize the read: wait_barrier + clc_load_result + decode.
@@ -218,25 +280,6 @@ struct CLCMaterializePass
     Value x = CLCGetProgramIdOp::create(rb, loc, clcResult, 0);
     Value y = CLCGetProgramIdOp::create(rb, loc, clcResult, 1);
     Value z = CLCGetProgramIdOp::create(rb, loc, clcResult, 2);
-    if (emptyBar) {
-      // Remote mbarrier waits are illegal, so all CTAs arrive on rank zero's
-      // empty barrier and only rank zero waits on its local view above. Skip
-      // the final arrival when cancellation failed because the loop exits and
-      // the response storage will not be reused.
-      // TODO: Represent this response-buffer release with an explicit op that
-      // links resp and emptyBar, then let ProxyFenceInsertion place the fence.
-      FenceAsyncSharedOp::create(rb, loc, /*bCluster=*/false);
-      Value zero = arith::ConstantIntOp::create(rb, loc, 0, 32);
-      auto emptyBarTy = cast<ttg::MemDescType>(emptyBar.getType());
-      auto remoteBarTy = ttg::MemDescType::get(
-          emptyBarTy.getShape(), emptyBarTy.getElementType(),
-          emptyBarTy.getEncoding(),
-          SharedClusterMemorySpaceAttr::get(rb.getContext()),
-          emptyBarTy.getMutableMemory(), emptyBarTy.getAllocShape());
-      Value remoteEmptyBar =
-          MapToRemoteBufferOp::create(rb, loc, remoteBarTy, emptyBar, zero);
-      ArriveBarrierOp::create(rb, loc, remoteEmptyBar, /*count=*/1, isValid);
-    }
     read->replaceAllUsesWith(ValueRange{isValid, x, y, z});
     read->erase();
     issue->erase();
