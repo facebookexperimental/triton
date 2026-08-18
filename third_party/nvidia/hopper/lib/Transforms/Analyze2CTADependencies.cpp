@@ -59,8 +59,16 @@ static bool requiresPeerGather(Value value) {
     Operation *def = current.getDefiningOp();
     if (!def)
       continue;
-    if (isa<triton::TransOp>(def))
-      return true;
+    if (auto trans = dyn_cast<triton::TransOp>(def)) {
+      // Rank-3 transposes are also used to expose a size-two axis to tt.split
+      // when a collective contraction is statically subtiled. They only
+      // repack the contraction dimension and do not transpose the logical MMA
+      // operand across CTAs. Peer gathering is required for the rank-2 matrix
+      // transpose used by dQ-style dependent MMAs.
+      auto resultType = dyn_cast<RankedTensorType>(trans.getType());
+      if (resultType && resultType.getRank() == 2)
+        return true;
+    }
     if (isa<ttng::TCGen5MMAOp>(def))
       continue;
     llvm::append_range(worklist, def->getOperands());

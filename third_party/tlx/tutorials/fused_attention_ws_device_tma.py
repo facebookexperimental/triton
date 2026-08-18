@@ -79,15 +79,25 @@ def _attn_fwd_subtile(
     l_i1,  # used when FADD2_REDUCE is true
     m_i,
     acc,
-    v,
+    v0,
+    v1,
     dtype: tl.constexpr,
     STAGE: tl.constexpr,
     SUBTILING: tl.constexpr,
     VECT_MUL: tl.constexpr,
     FADD2_REDUCE: tl.constexpr,
+    MMA_SLICES: tl.constexpr,
     TWO_CTAS: tl.constexpr,
 ):
-    qk = tl.dot(q, k, two_ctas=TWO_CTAS)
+    qk = tl.dot(
+        q,
+        k,
+        attrs=({"channels": [
+            "opndA,smem,1,2",
+            "opndD,tmem,1,0",
+        ]} if MMA_SLICES == 2 else None),
+        two_ctas=TWO_CTAS,
+    )
 
     if STAGE == 3 and start_n >= start_m * BLOCK_M:
         col_limit_right = (offs_m - start_n + 1)[:, None]
@@ -133,7 +143,24 @@ def _attn_fwd_subtile(
     # prepare p and v for the dot
     p = p.to(dtype)
     # note that this non transposed v for FP8 is only supported on Blackwell
-    acc = tl.dot(p, v, acc, two_ctas=TWO_CTAS)
+    if MMA_SLICES == 1:
+        acc = tl.dot(p, v0, acc, two_ctas=TWO_CTAS)
+    else:
+        ps = _split_n_2D(p, MMA_SLICES)
+        acc = tl.dot(
+            ps[0],
+            v0,
+            acc,
+            attrs={"channels": ["opndA,tmem,1,0,0"]},
+            two_ctas=TWO_CTAS,
+        )
+        acc = tl.dot(
+            ps[1],
+            v1,
+            acc,
+            attrs={"channels": ["opndA,tmem,1,0,64"]},
+            two_ctas=TWO_CTAS,
+        )
     # update m_i and l_i
     # place this at the end of the loop to reduce register pressure
     if not FADD2_REDUCE:
@@ -167,6 +194,8 @@ def _attn_fwd_inner_oss_dp(
     SUBTILING: tl.constexpr,
     VECT_MUL: tl.constexpr,
     FADD2_REDUCE: tl.constexpr,
+    MMA_SLICES: tl.constexpr,
+    KV_NUM_STAGES: tl.constexpr,
     DP_FACTOR: tl.constexpr,
     TWO_CTAS: tl.constexpr,
 ):
@@ -185,13 +214,19 @@ def _attn_fwd_inner_oss_dp(
             warp_specialize=warp_specialize,
             merge_epilogue=True,
             separate_epilogue_store=True,
-            # disallow_acc_multi_buffer=True,
+            assume_nonempty=TWO_CTAS,
+            disallow_acc_multi_buffer=TWO_CTAS,
             data_partition_factor=DP_FACTOR,
+            num_stages=KV_NUM_STAGES if TWO_CTAS else None,
     ):
         start_n = tl.multiple_of(start_n, BLOCK_N)
 
         k = desc_k.load([offsetkv_y, 0]).T
-        v = desc_v.load([offsetkv_y, 0])
+        v0 = desc_v.load([offsetkv_y, 0])
+        if MMA_SLICES == 2:
+            v1 = desc_v.load([offsetkv_y + BLOCK_N // 2, 0])
+        else:
+            v1 = v0
 
         l_i0, l_i0_1, m_i0, acc0 = _attn_fwd_subtile(
             q0,
@@ -207,12 +242,14 @@ def _attn_fwd_inner_oss_dp(
             l_i0_1,
             m_i0,
             acc0,
-            v,
+            v0,
+            v1,
             dtype,
             STAGE,
             SUBTILING,
             VECT_MUL,
             FADD2_REDUCE,
+            MMA_SLICES,
             TWO_CTAS,
         )
 
@@ -226,6 +263,7 @@ def _host_descriptor_pre_hook(nargs):
     BLOCK_N = nargs["BLOCK_N"]
     HEAD_DIM = nargs["HEAD_DIM"]
     NUM_CTAS = nargs.get("NUM_CTAS", 1)
+    MMA_SLICES = nargs.get("MMA_SLICES", 1)
     if NUM_CTAS == 2 and nargs["N_CTX"] % (NUM_CTAS * BLOCK_M) != 0:
         raise ValueError("2-CTA forward requires N_CTX divisible by 2 * BLOCK_M")
     if not isinstance(nargs["desc_q"], TensorDescriptor):
@@ -234,7 +272,7 @@ def _host_descriptor_pre_hook(nargs):
     if nargs["FP8_OUTPUT"]:
         nargs["desc_v"].block_shape = [HEAD_DIM, BLOCK_N]
     else:
-        nargs["desc_v"].block_shape = [BLOCK_N, HEAD_DIM]
+        nargs["desc_v"].block_shape = [BLOCK_N // MMA_SLICES, HEAD_DIM]
     nargs["desc_k"].block_shape = [BLOCK_N, HEAD_DIM]
     nargs["desc_o"].block_shape = [BLOCK_M, HEAD_DIM]
 
@@ -245,9 +283,12 @@ elif supports_host_descriptor():
     NUM_STAGES_OPTIONS = [3]
 else:
     NUM_STAGES_OPTIONS = [3]
-FWD_2CTA_NUM_STAGES = int(os.environ.get("AUTOWS_FWD_NUM_STAGES", "2"))
-FWD_2CTA_BLOCK_M = int(os.environ.get("AUTOWS_FWD_BLOCK_M", "128"))
-FWD_2CTA_DP_FACTOR = int(os.environ.get("AUTOWS_FWD_DP_FACTOR", "1"))
+FWD_2CTA_NUM_STAGES = int(os.environ.get("AUTOWS_FWD_NUM_STAGES", "5"))
+FWD_2CTA_BLOCK_M = int(os.environ.get("AUTOWS_FWD_BLOCK_M", "256"))
+FWD_2CTA_DP_FACTOR = int(os.environ.get("AUTOWS_FWD_DP_FACTOR", "2"))
+FWD_2CTA_MMA_SLICES = int(os.environ.get("AUTOWS_FWD_MMA_SLICES", "2"))
+FWD_2CTA_KV_NUM_STAGES = int(os.environ.get("AUTOWS_FWD_KV_NUM_STAGES", "5"))
+FWD_2CTA_OUTER_NUM_STAGES = int(os.environ.get("AUTOWS_FWD_OUTER_NUM_STAGES", "1"))
 
 configs = [
     triton.Config(
@@ -256,6 +297,9 @@ configs = [
             "BLOCK_N": BN,
             "DP_FACTOR": 2,
             "NUM_CTAS": 1,
+            "MMA_SLICES": 1,
+            "KV_NUM_STAGES": s,
+            "OUTER_NUM_STAGES": s,
         },
         num_stages=s,
         num_warps=w,
@@ -268,9 +312,14 @@ configs = [
             "BLOCK_N": 128,
             "DP_FACTOR": FWD_2CTA_DP_FACTOR,
             "NUM_CTAS": 2,
+            "MMA_SLICES": FWD_2CTA_MMA_SLICES,
+            "KV_NUM_STAGES": FWD_2CTA_KV_NUM_STAGES,
+            "OUTER_NUM_STAGES": FWD_2CTA_OUTER_NUM_STAGES,
         },
         num_stages=FWD_2CTA_NUM_STAGES,
         num_warps=4,
+        minRegAutoWS=24,
+        maxRegAutoWS=168,
         pre_hook=_host_descriptor_pre_hook,
         ctas_per_cga=(2, 1, 1),
         allowDependentTwoCTA=True,
@@ -336,6 +385,8 @@ def _attn_fwd_tma_dp(
     SUBTILING: tl.constexpr,
     VECT_MUL: tl.constexpr,
     FADD2_REDUCE: tl.constexpr,
+    MMA_SLICES: tl.constexpr,
+    KV_NUM_STAGES: tl.constexpr,
     DP_FACTOR: tl.constexpr,
     NUM_CTAS: tl.constexpr,
 ):
@@ -387,6 +438,8 @@ def _attn_fwd_tma_dp(
         SUBTILING,
         VECT_MUL,
         FADD2_REDUCE,
+        MMA_SLICES,
+        KV_NUM_STAGES,
         DP_FACTOR,
         NUM_CTAS == 2,
     )
@@ -429,6 +482,9 @@ def _attn_fwd(
     SUBTILING: tl.constexpr,
     VECT_MUL: tl.constexpr,
     FADD2_REDUCE: tl.constexpr,
+    MMA_SLICES: tl.constexpr,
+    KV_NUM_STAGES: tl.constexpr,
+    OUTER_NUM_STAGES: tl.constexpr,
     DP_FACTOR: tl.constexpr,
     NUM_CTAS: tl.constexpr = 1,
 ):
@@ -445,7 +501,7 @@ def _attn_fwd(
         desc_v,
         shape=[y_dim, HEAD_DIM],
         strides=[HEAD_DIM, 1],
-        block_shape=[BLOCK_N, HEAD_DIM],
+        block_shape=[BLOCK_N // MMA_SLICES, HEAD_DIM],
     )
     desc_k = _maybe_make_tensor_desc(
         desc_k,
@@ -482,6 +538,8 @@ def _attn_fwd(
         SUBTILING,
         VECT_MUL,
         FADD2_REDUCE,
+        MMA_SLICES,
+        KV_NUM_STAGES,
         DP_FACTOR,
         NUM_CTAS,
     )
@@ -514,6 +572,9 @@ def _attn_fwd_persist(
     SUBTILING: tl.constexpr,
     VECT_MUL: tl.constexpr,
     FADD2_REDUCE: tl.constexpr,
+    MMA_SLICES: tl.constexpr,
+    KV_NUM_STAGES: tl.constexpr,
+    OUTER_NUM_STAGES: tl.constexpr,
     DP_FACTOR: tl.constexpr,
     NUM_CTAS: tl.constexpr = 1,
 ):
@@ -544,7 +605,7 @@ def _attn_fwd_persist(
         desc_v,
         shape=[Z * H * N_CTX, HEAD_DIM],
         strides=[HEAD_DIM, 1],
-        block_shape=[BLOCK_N, HEAD_DIM],
+        block_shape=[BLOCK_N // MMA_SLICES, HEAD_DIM],
     )
     desc_o = tl.make_tensor_descriptor(
         desc_o,
@@ -561,6 +622,7 @@ def _attn_fwd_persist(
             merge_epilogue=True,
             separate_epilogue_store=True,
             data_partition_factor=DP_FACTOR,
+            num_stages=OUTER_NUM_STAGES if NUM_CTAS == 2 else None,
     ):
         pid = tile_idx % n_tile_num
         off_hz = tile_idx // n_tile_num
@@ -586,6 +648,8 @@ def _attn_fwd_persist(
             SUBTILING,
             VECT_MUL,
             FADD2_REDUCE,
+            MMA_SLICES,
+            KV_NUM_STAGES,
             DP_FACTOR,
             NUM_CTAS,
         )
@@ -1612,7 +1676,7 @@ class _attention_opt(torch.autograd.Function):
         extra_kern_args = {}
 
         M = torch.empty((q.shape[0], q.shape[1], q.shape[2]), device=q.device, dtype=torch.float32)
-        warp_specialize = True
+        warp_specialize = os.environ.get("AUTOWS_FWD_WARP_SPECIALIZE", "1") == "1"
         desc_q = q
         desc_v = v
         desc_k = k

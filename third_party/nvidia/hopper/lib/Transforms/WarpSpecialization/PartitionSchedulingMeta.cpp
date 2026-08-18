@@ -531,17 +531,6 @@ private:
       mmaToSlice[mmaOp] = collectMMABackwardSlice(innermostLoop, mmaOp);
     }
 
-    // Find shared ops (appear in multiple slices)
-    DenseMap<Operation *, unsigned> opCount;
-    for (auto &[mma, slice] : mmaToSlice) {
-      for (Operation *op : slice)
-        opCount[op]++;
-    }
-    for (auto &[op, count] : opCount) {
-      if (count > 1)
-        sharedOps.insert(op);
-    }
-
     // Group dependent MMAs using union-find.
     // MMA B depends on MMA A if A's result feeds (directly or via iter args
     // and intermediate ops) into B's operands.
@@ -637,6 +626,22 @@ private:
         accBufToMma[buf] = i;
       else
         unite(i, it->second);
+    }
+
+    // An op is shared only when it feeds MMAs in different dependency groups.
+    // Counting raw MMA slices incorrectly marks common producers of a serial
+    // MMA chain as shared. For example, two K-sliced PV MMAs consume the same
+    // softmax P tile and accumulate into the same output; their P chain must
+    // remain local to that compute group rather than being moved to the
+    // default/correction partition and staged back through SMEM.
+    DenseMap<Operation *, unsigned> opToFirstGroup;
+    for (unsigned i = 0; i < n; ++i) {
+      unsigned group = find(i);
+      for (Operation *op : mmaToSlice[loopMmas[i]]) {
+        auto [it, inserted] = opToFirstGroup.try_emplace(op, group);
+        if (!inserted && it->second != group)
+          sharedOps.insert(op);
+      }
     }
 
     // Count distinct groups that have exclusive (non-shared) ops
@@ -1380,7 +1385,7 @@ struct ScheduleResult {
   DenseMap<unsigned, Partition *> dpIdToPartition;
   bool createComputePartitions;
   // True for no-MMA in-register reduction kernels (RMS/LayerNorm). Enables the
-  // scalar-offset partition fixup in runOnOperation; inert for MMA kernels.
+  // scalar-offset partition fixup in runOnOperation.
   bool noMMACompute = false;
 };
 
@@ -1852,26 +1857,39 @@ getInitialSchedule(LoopLikeOpInterface mainLoop,
     }
   }
 
-  // Correction ops (cross-iteration MMA users) go to correction partition
-  // (which is aliased to default for fwd).
-  // Skip entirely when no correction partition is available.
-  Partition *corrDest =
+  // Correction ops (cross-iteration MMA users) normally go to the correction
+  // partition (which is aliased to default for fwd). When ordinary correction
+  // merging is requested for data-partitioned attention, keep each correction
+  // chain with the computation partition that owns its accumulator. Routing
+  // every chain through a single fallback partition both serializes independent
+  // DP groups and makes all of their full accumulator tiles live at once.
+  Partition *sharedCorrDest =
       correctionPartition ? correctionPartition : defaultPartition;
-  if (corrDest) {
-    for (auto mmaOp : mmas) {
-      for (OpOperand &use : mmaOp->getUses()) {
-        auto loop = getEnclosingSupportedLoop(mmaOp);
-        if (use.getOwner() != getLoopBodyTerminator(loop))
-          continue;
-        BlockArgument arg = getLoopCarriedBodyArg(loop, use.getOperandNumber());
-        if (!arg)
-          continue;
-        for (OpOperand &use : arg.getUses()) {
-          tryScheduleOp(corrDest, use.getOwner());
-          scheduleUsers(loop, schedule, corrDest, use.getOwner());
-        }
-        break;
+  for (auto mmaOp : mmas) {
+    Partition *corrDest = sharedCorrDest;
+    if (localSchedOpts.mergeCorrection && dataPartitionFactor > 1) {
+      unsigned dpId = categorizer.getDpId(mmaOp);
+      if (dpId != SHARED_DPID) {
+        auto it = dpIdToPartition.find(dpId);
+        if (it != dpIdToPartition.end())
+          corrDest = it->second;
       }
+    }
+    if (!corrDest)
+      continue;
+    for (OpOperand &mmaUse : mmaOp->getUses()) {
+      auto loop = getEnclosingSupportedLoop(mmaOp);
+      if (mmaUse.getOwner() != getLoopBodyTerminator(loop))
+        continue;
+      BlockArgument arg =
+          getLoopCarriedBodyArg(loop, mmaUse.getOperandNumber());
+      if (!arg)
+        continue;
+      for (OpOperand &argUse : arg.getUses()) {
+        tryScheduleOp(corrDest, argUse.getOwner());
+        scheduleUsers(loop, schedule, corrDest, argUse.getOwner());
+      }
+      break;
     }
   }
 
@@ -2462,6 +2480,41 @@ void propagatePartitions(LoopLikeOpInterface loop, PartitionSet &schedule,
         }
         continue;
       }
+
+      // A persistent outer loop can contain an inner loop whose body is
+      // already partitioned across all worker roles.  The wrapper then has
+      // multiple defining and sink partitions, but giving it a new partition
+      // only creates a wrapper-only task.  Code partitioning clones the inner
+      // loop into its body partitions and leaves that task empty; the empty
+      // task still consumes a barrier slot and a warp.  Co-own the wrapper by
+      // the partitions already present in its body instead.
+      Operation *nestedLoopOp = nullptr;
+      bool hasOtherNonScalarOp = false;
+      for (Operation *op : cluster.ops) {
+        if (isScalarOp(op) || op->hasTrait<OpTrait::IsTerminator>())
+          continue;
+        if (isa<LoopLikeOpInterface>(op) && !nestedLoopOp) {
+          nestedLoopOp = op;
+          continue;
+        }
+        hasOtherNonScalarOp = true;
+        break;
+      }
+      if (nestedLoopOp && !hasOtherNonScalarOp) {
+        SetVector<Partition *> bodyPartitions;
+        nestedLoopOp->walk([&](Operation *nestedOp) {
+          if (nestedOp == nestedLoopOp)
+            return;
+          for (int id : safeGetPartitionIds(nestedOp))
+            if (Partition *partition = schedule.getPartition(id))
+              bodyPartitions.insert(partition);
+        });
+        if (bodyPartitions.size() > 1) {
+          setPartition(nestedLoopOp, bodyPartitions);
+          continue;
+        }
+      }
+
       Partition *newPartition = schedule.addPartition(0);
       newPartition->setType("computation");
       for (Operation *op : cluster.ops) {
@@ -2949,9 +3002,38 @@ void PartitionSchedulingMeta::runOnOperation() {
     }
     {
       PartitionSet &schedule = result->schedule;
+      // Scalar index/offset ops are rematerializable, so propagatePartitions
+      // skips them. No-MMA reductions have no MMA slice to anchor them. Assign
+      // each still-unannotated value-producing op the union of its partitioned
+      // users' ids, iterating to a fixpoint so chains
+      // (muli -> addi -> descriptor_load) resolve.
+      auto fixupScalarPartitions = [&]() {
+        if (!result->noMMACompute)
+          return;
+        bool changed = true;
+        while (changed) {
+          changed = false;
+          getLoopBodyRegion(loop).walk([&](Operation *op) {
+            if (op->getNumResults() == 0 || hasPartition(op))
+              return;
+            SetVector<int> unionIds;
+            for (Operation *user : op->getUsers()) {
+              SetVector<int> userIds = safeGetPartitionIds(user);
+              unionIds.insert(userIds.begin(), userIds.end());
+            }
+            if (!unionIds.empty()) {
+              setPartition(op, unionIds);
+              changed = true;
+            }
+          });
+        }
+      };
+      fixupScalarPartitions();
+
       currentPhase = "propagate";
       propagatePartitions(loop, schedule, result->createComputePartitions,
                           result->layout.defaultPartition);
+      fixupScalarPartitions();
 
       // Assign partition to TMAStoreTokenWaitOp ops that have no partition.
       // These arise from early TMA reduce lowering: the wait's token comes
@@ -2978,37 +3060,7 @@ void PartitionSchedulingMeta::runOnOperation() {
       // propagatePartitions + optimizeSchedule) but before serialization.
       splitDataPartitionedIfOps(loop, schedule);
 
-      // No-MMA reduction kernels (RMS norm / LayerNorm) have no MMA backward
-      // slice to anchor partition assignment for scalar index/offset ops
-      // (e.g. offs_m = tile_id * 64) that feed the descriptor loads/stores.
-      // propagatePartitions skips these (isScalarOp), yet the
-      // tt.warp_specialize verifier requires every op in the loop to carry
-      // ttg.partition. Assign each still-unannotated value-producing op the
-      // union of its partitioned users' ids, iterating to a fixpoint so chains
-      // (muli -> addi -> descriptor_load) resolve. setPartition sorts/dedups
-      // and propagates to region terminators. An offset feeding both load and
-      // store gets both ids and is replicated by code partition (no
-      // cross-partition scalar channel). Gated to the no-MMA case so MMA
-      // kernels are untouched.
-      if (result->noMMACompute) {
-        bool changed = true;
-        while (changed) {
-          changed = false;
-          getLoopBodyRegion(loop).walk([&](Operation *op) {
-            if (op->getNumResults() == 0 || hasPartition(op))
-              return;
-            SetVector<int> unionIds;
-            for (Operation *user : op->getUsers()) {
-              SetVector<int> userIds = safeGetPartitionIds(user);
-              unionIds.insert(userIds.begin(), userIds.end());
-            }
-            if (!unionIds.empty()) {
-              setPartition(op, unionIds);
-              changed = true;
-            }
-          });
-        }
-      }
+      fixupScalarPartitions();
 
       // Scalar values are rematerializable and must not become cross-partition
       // channels: WS buffer allocation only materializes ranked tensor values.
