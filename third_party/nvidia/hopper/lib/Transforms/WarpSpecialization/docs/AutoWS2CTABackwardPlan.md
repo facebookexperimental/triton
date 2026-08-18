@@ -147,12 +147,33 @@ partition scheduling and memory planning. BM128 also receives a
 `ttng.two_cta_peer_relay` marker. Inserting these operations early makes the
 dependency and destination lifetime visible to AutoWS.
 
+They are operations rather than pass-private annotations because AutoWS must
+treat the exchange as real scheduled work: the gather result has a lifetime
+and storage requirement, and the relay is a synchronization-only consumer that
+needs its own channel and warp allocation. Hiding either until final lowering
+would let partitioning or memory planning erase ordering and liveness
+constraints required by the DSMEM protocol.
+
 After software pipelining, `Materialize2CTAExchange` lowers the plan to packed
 local stores, asynchronous remote DSMEM copies, fences, and barrier
 publication. The BM128 one-warp relay waits for peer-copy completion and then
 publishes the existing dQ consumer channel. It is not a CTA-wide cluster
 rendezvous; placing a cluster barrier inside a warp-specialized partition can
 deadlock because not every CTA warp participates.
+
+The exchange uses two distinct empty/full lifetimes:
+
+- the final dQ destination keeps its existing AutoWS empty wait before either
+  CTA overwrites the slot, and its full barrier remains the MMA consumer's
+  readiness condition;
+- the temporary peer-exchange allocation has its own empty/full channel. The
+  producer waits for that staging slot to become empty, remote DSMEM completion
+  satisfies its full side, and the relay converts that completion into an
+  arrival on the final dQ full barrier.
+
+Both sides are required. Reusing only the destination barrier would not protect
+the temporary exchange slot, while publishing only the exchange full barrier
+would leave the dQ consumer disconnected from peer completion.
 
 ## Cooperative TMA loads
 
@@ -195,6 +216,14 @@ The relay is a typed one-warp partition. The computation partition retains the
 softmax work; the GEMM partition owns the software-pipelined collective MMAs;
 the load partition owns descriptor loads; and the reduction partition owns
 dQ's TMA reduction path.
+
+The separate relay partition lets exactly one warp wait on the exchange
+channel and publish dQ readiness without requiring every compute warp to enter
+a cluster-wide rendezvous. The planner recognizes the rank-two dependent-MMA
+gather shapes described above; this is a reusable two-CTA exchange mechanism,
+but it is not a claim to support arbitrary kernels or arbitrary dependent-MMA
+graphs. Unsupported shapes fail planning rather than receiving an FA-specific
+fallback.
 
 Important storage relationships are:
 

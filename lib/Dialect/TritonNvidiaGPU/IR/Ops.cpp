@@ -487,8 +487,43 @@ LogicalResult ClusterWaitOp::verify() {
   return success();
 }
 
+// -- TwoCTAPeerGatherOp --
+LogicalResult TwoCTAPeerGatherOp::verify() {
+  auto sourceType = dyn_cast<RankedTensorType>(getSrc().getType());
+  auto resultType = dyn_cast<RankedTensorType>(getResult().getType());
+  if (!sourceType || !resultType || sourceType.getRank() != 2 ||
+      resultType.getRank() != 2)
+    return emitOpError("requires rank-two source and result tensors");
+  if (getNumCTAs() != 2)
+    return emitOpError("currently supports exactly two CTAs");
+  if (getSplitDim() < 0 || getSplitDim() >= sourceType.getRank())
+    return emitOpError("split_dim must name a source dimension");
+  if (sourceType.getShape()[getSplitDim()] % getNumCTAs() != 0)
+    return emitOpError("split dimension must be evenly divisible by num_ctas");
+  if (sourceType.getElementType() != resultType.getElementType() ||
+      sourceType.getNumElements() != resultType.getNumElements())
+    return emitOpError(
+        "source and result must preserve element type and element count");
+  return success();
+}
+
+// -- TwoCTAPeerRelayOp --
+LogicalResult TwoCTAPeerRelayOp::verify() {
+  auto type = getSrc().getType();
+  if (!isa<SharedMemorySpaceAttr>(type.getMemorySpace()))
+    return emitOpError("requires a shared-memory source");
+  return success();
+}
+
 static LogicalResult verifyClusterIsMultiCTA(Operation *op) {
   int numCTAs = triton::gpu::lookupNumCTAs(op);
+  // A two-CTA AutoWS kernel forms its pair through the module's cluster dims
+  // rather than ttg.num-ctas, so take the larger of the two: the op is legal
+  // whenever the launch actually has more than one CTA per cluster.
+  if (auto mod = op->getParentOfType<ModuleOp>()) {
+    auto dims = triton::gpu::TritonGPUDialect::getClusterDims(mod);
+    numCTAs = std::max(numCTAs, dims[0] * dims[1] * dims[2]);
+  }
   if (numCTAs <= 1)
     return op->emitOpError("requires ttg.num-ctas > 1");
   return success();

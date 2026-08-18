@@ -296,8 +296,40 @@ struct Insert2CTASync : public impl::NVGPUInsert2CTASyncBase<Insert2CTASync> {
 
     // Process standalone MMAs (rare: single-iteration epilogue).
     for (auto mma : nonLoopMMAs) {
-      Value barrierAlloc =
-          triton::createBarrierAlloc(mma, /*numBarriers=*/1, /*arriveCount=*/2);
+      Value barrierAlloc;
+      auto wsOp = mma->getParentOfType<ttg::WarpSpecializeOp>();
+      if (wsOp) {
+        // A software-pipelined loop can leave prologue/epilogue MMA copies
+        // directly in a partition region.  They still need a barrier created
+        // at kernel-entry scope; a partition-local init can race a peer CTA's
+        // first remote arrival. Find the top-level operation containing the
+        // WarpSpecializeOp so a surrounding loop, when present, is included in
+        // the barrier lifetime.
+        Location loc = wsOp->getLoc();
+        Operation *lifetimeAnchor = wsOp;
+        auto funcOp = wsOp->getParentOfType<triton::FuncOp>();
+        while (lifetimeAnchor->getParentOp() != funcOp)
+          lifetimeAnchor = lifetimeAnchor->getParentOp();
+        barrierAlloc = triton::createBarrierAlloc(
+            lifetimeAnchor, /*numBarriers=*/1, /*arriveCount=*/2);
+
+        if (!isInDefaultRegion(mma, wsOp)) {
+          auto partOp = wsOp.getPartitionOp();
+          partOp->insertOperands(partOp->getNumOperands(), barrierAlloc);
+          Value capturedBarrier;
+          for (Region *region : wsOp.getPartitionRegions()) {
+            BlockArgument arg =
+                region->addArgument(barrierAlloc.getType(), loc);
+            if (region->isAncestor(mma->getParentRegion()))
+              capturedBarrier = arg;
+          }
+          assert(capturedBarrier && "MMA not found in any partition region");
+          barrierAlloc = capturedBarrier;
+        }
+      } else {
+        barrierAlloc = triton::createBarrierAlloc(mma, /*numBarriers=*/1,
+                                                  /*arriveCount=*/2);
+      }
       insertSyncBeforeMMA(mma, barrierAlloc);
     }
   }
