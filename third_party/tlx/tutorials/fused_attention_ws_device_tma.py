@@ -109,6 +109,7 @@ def _attn_fwd_subtile(
     FADD2_REDUCE: tl.constexpr,
     MMA_SLICES: tl.constexpr,
     TWO_CTAS: tl.constexpr,
+    INNER_WARP_SPECIALIZE: tl.constexpr,
     RESCALE_OPT: tl.constexpr,
 ):
     qk = tl.dot(
@@ -205,10 +206,12 @@ def _attn_fwd_subtile(
             attrs={
                 "two_cta_interleave_role": "pv" if TWO_CTAS else None,
                 "channels": ["opndA,tmem,1,0,64"],
-                # ps[0] and ps[1] are adjacent slices of the same QK tile.
-                # The immediately preceding contraction has already
-                # rendezvoused both CTAs after that tile was produced.
-                "two_cta_sync_covered_by_prior": TWO_CTAS,
+                # Inner-warp-specialized (non-persistent) schedules keep both
+                # slices adjacent in one partition, so the first rendezvous
+                # covers the second.  Persistent schedules pipeline the
+                # shared V allocation across iterations and need the second
+                # rendezvous before that slot can rotate.
+                "two_cta_sync_covered_by_prior": TWO_CTAS and INNER_WARP_SPECIALIZE,
             },
             two_ctas=TWO_CTAS,
         )
@@ -274,11 +277,12 @@ def _attn_fwd_inner_oss_dp(
         start_n = tl.multiple_of(start_n, BLOCK_N)
 
         k = desc_k.load([offsetkv_y, 0]).T
-        v0 = desc_v.load([offsetkv_y, 0])
+        v = desc_v.load([offsetkv_y, 0])
         if MMA_SLICES == 2:
-            v1 = desc_v.load([offsetkv_y + BLOCK_N // 2, 0])
+            v0, v1 = v.reshape([2, BLOCK_N // 2, HEAD_DIM]).permute(1, 2, 0).split()
         else:
-            v1 = v0
+            v0 = v
+            v1 = v
 
         l_i0, l_i0_1, m_i0, acc0 = _attn_fwd_subtile(
             q0,
@@ -303,6 +307,7 @@ def _attn_fwd_inner_oss_dp(
             FADD2_REDUCE,
             MMA_SLICES,
             TWO_CTAS,
+            warp_specialize,
             RESCALE_OPT,
         )
 
@@ -316,7 +321,6 @@ def _host_descriptor_pre_hook(nargs):
     BLOCK_N = nargs["BLOCK_N"]
     HEAD_DIM = nargs["HEAD_DIM"]
     NUM_CTAS = nargs.get("NUM_CTAS", 1)
-    MMA_SLICES = nargs.get("MMA_SLICES", 1)
     if NUM_CTAS == 2 and nargs["N_CTX"] % (NUM_CTAS * BLOCK_M) != 0:
         raise ValueError("2-CTA forward requires N_CTX divisible by 2 * BLOCK_M")
     if not isinstance(nargs["desc_q"], TensorDescriptor):
@@ -325,7 +329,7 @@ def _host_descriptor_pre_hook(nargs):
     if nargs["FP8_OUTPUT"]:
         nargs["desc_v"].block_shape = [HEAD_DIM, BLOCK_N]
     else:
-        nargs["desc_v"].block_shape = [BLOCK_N // MMA_SLICES, HEAD_DIM]
+        nargs["desc_v"].block_shape = [BLOCK_N, HEAD_DIM]
     nargs["desc_k"].block_shape = [BLOCK_N, HEAD_DIM]
     nargs["desc_o"].block_shape = [BLOCK_M, HEAD_DIM]
 
@@ -388,6 +392,15 @@ _fwd_num_ctas = os.environ.get("AUTOWS_FWD_NUM_CTAS")
 if _fwd_num_ctas is not None:
     configs = [config for config in configs if config.kwargs.get("NUM_CTAS", 1) == int(_fwd_num_ctas)]
 configs_fwd = configs
+# Keep the clustered forward path opt-in.  The production 2-CTA schedule uses
+# the persistent CLC wrapper, while the generic entry points below also cover
+# non-persistent and static-persistent schedules.  Letting their unpinned
+# autotuner select the clustered config can exercise a different rotating-V
+# lifetime and corrupt long sequences.  Explicit tests still pin the 2-CTA
+# config from configs_fwd, and AUTOWS_FWD_NUM_CTAS=2 selects it unchanged for
+# the production/performance path.
+configs_fwd_autotune = (configs_fwd if _fwd_num_ctas is not None else
+                        [config for config in configs_fwd if config.kwargs.get("NUM_CTAS", 1) == 1])
 
 
 def keep(conf):
@@ -530,7 +543,7 @@ def _attn_fwd_tma_dp(
 
 
 @triton.autotune(
-    configs=list(filter(keep, configs_fwd)),
+    configs=list(filter(keep, configs_fwd_autotune)),
     key=["N_CTX", "HEAD_DIM", "FP8_OUTPUT", "warp_specialize"],
     prune_configs_by={"early_config_prune": prune_invalid_configs},
 )
@@ -561,6 +574,7 @@ def _attn_fwd(
     DP_FACTOR: tl.constexpr,
     NUM_CTAS: tl.constexpr = 1,
     RESCALE_OPT: tl.constexpr = False,
+    SMEM_BUDGET: tl.constexpr = None,
 ):
     pid = tl.program_id(0)
     off_hz = tl.program_id(1)
@@ -575,7 +589,7 @@ def _attn_fwd(
         desc_v,
         shape=[y_dim, HEAD_DIM],
         strides=[HEAD_DIM, 1],
-        block_shape=[BLOCK_N // MMA_SLICES, HEAD_DIM],
+        block_shape=[BLOCK_N, HEAD_DIM],
     )
     desc_k = _maybe_make_tensor_desc(
         desc_k,
@@ -621,7 +635,7 @@ def _attn_fwd(
 
 
 @triton.autotune(
-    configs=list(filter(keep, configs_fwd)),
+    configs=list(filter(keep, configs_fwd_autotune)),
     key=["N_CTX", "HEAD_DIM", "FP8_OUTPUT", "warp_specialize"],
     prune_configs_by={"early_config_prune": prune_invalid_configs},
 )
@@ -682,7 +696,7 @@ def _attn_fwd_persist(
         desc_v,
         shape=[Z * H * N_CTX, HEAD_DIM],
         strides=[HEAD_DIM, 1],
-        block_shape=[BLOCK_N // MMA_SLICES, HEAD_DIM],
+        block_shape=[BLOCK_N, HEAD_DIM],
     )
     desc_o = _maybe_make_tensor_desc(
         desc_o,
