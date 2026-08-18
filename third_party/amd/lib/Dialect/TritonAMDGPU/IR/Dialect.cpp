@@ -1028,6 +1028,13 @@ LogicalResult AsyncTDMCopyGlobalToLocalOp::verify() {
   if (!paddedEnc && !swizzledEnc && !partitionedEnc)
     return emitOpError("Invalid shared memory layout for TDM");
 
+  if (auto effectivePadded = gpu::getPaddedEncoding(enc)) {
+    if (effectivePadded.getIntervals().size() != 1 ||
+        effectivePadded.getPaddings().size() != 1)
+      return emitOpError(
+          "TDM load only supports a single interval-padding pair");
+  }
+
   Type elementType = smemTy.getElementType();
   auto elementBitWidth = elementType.getIntOrFloatBitWidth();
   if (paddedEnc) {
