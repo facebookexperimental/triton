@@ -78,6 +78,8 @@ from triton.language.extra.tlx.tutorials.amd_gemm_warp_pipeline import (
     matmul as _amd_gemm_warp_pipeline, )
 from triton.language.extra.tlx.tutorials.amd_gemm_pipelined import (
     matmul as _amd_gemm_pipelined, )
+from triton.language.extra.tlx.tutorials.amd_gemm_gfx942 import (
+    matmul as _amd_gemm_gfx942, )
 from triton.language.extra.tlx.tutorials.gfx9_gemm.inter_wave.a16w16.matmul_kernel_split_m import (
     matmul as _amd_gemm_pingpong, )
 from triton.language.extra.tlx.tutorials.amd_bmm import (
@@ -114,7 +116,8 @@ from triton.language.extra.tlx.tutorials.testing.multi_cta_layer_norm import (
     multi_cta_layernorm_2d as _multi_cta_layernorm_2d,
 )
 
-from triton._internal_testing import is_blackwell, is_hopper, is_hopper_or_newer, is_hip, is_hip_cdna4, is_hip_gfx1250
+from triton._internal_testing import (is_blackwell, is_hopper, is_hopper_or_newer, is_hip, is_hip_cdna3, is_hip_cdna4,
+                                      is_hip_gfx1250)
 from triton.language.extra.tlx.tutorials.testing.gemm_shapes import (
     BLACKWELL_GEMM_WS as _BLACKWELL_GEMM_WS_MORE_SHAPES, )
 
@@ -243,6 +246,16 @@ class Gemm:
             "BLOCK_K": 32,
             "GROUP_M": 8,
             "NUM_BUFFERS": 3,
+            "num_warps": 8,
+        },
+        # The shipped default: exactly the 64 KB gfx942 LDS budget. See
+        # amd_gemm_gfx942.DEFAULT_CONFIG / lds_bytes.
+        "amd_gemm_gfx942": {
+            "BLOCK_M": 256,
+            "BLOCK_N": 256,
+            "BLOCK_K": 32,
+            "GROUP_M": 4,
+            "NUM_BUFFERS": 2,
             "num_warps": 8,
         },
         "amd_mxfp_gemm_tdm_pipelined": {
@@ -1684,6 +1697,39 @@ def test_amd_gemm_pingpong(dtype):
 def test_amd_gemm_pipelined(dtype):
     # Autotuned kernel: no fixed config (config=None).
     Gemm.run_test(_amd_gemm_pipelined, None, dtype=dtype)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
+@pytest.mark.skipif(not is_hip_cdna3(), reason="Requires gfx942 hardware (MI300X / CDNA3)")
+def test_amd_gemm_gfx942(dtype):
+    # config=None is the shipped path: pick_config() chooses the tile per shape.
+    Gemm.run_test(_amd_gemm_gfx942, None, dtype=dtype)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
+@pytest.mark.skipif(not is_hip_cdna3(), reason="Requires gfx942 hardware (MI300X / CDNA3)")
+def test_amd_gemm_gfx942_pinned_config(dtype):
+    # The largest tile, i.e. the whole 64 KB LDS budget, on a shape small enough
+    # that pick_config() would not have chosen it.
+    Gemm.run_test(_amd_gemm_gfx942, Gemm.CONFIGS["amd_gemm_gfx942"], shapes=[(1024, 1024, 1024)], dtype=dtype)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
+@pytest.mark.skipif(not is_hip_cdna3(), reason="Requires gfx942 hardware (MI300X / CDNA3)")
+def test_amd_gemm_gfx942_odd_shapes(dtype):
+    # M/N wraparound + masked store, and a partial K tile -- none of which the
+    # block-aligned Gemm.SHAPES exercise. Left on the shape-aware default so the
+    # small/medium tiles get covered too.
+    shapes = [(255, 129, 130), (1000, 1000, 200), (64, 64, 4096), (3000, 500, 700)]
+    Gemm.run_test(_amd_gemm_gfx942, None, shapes=shapes, dtype=dtype)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
+@pytest.mark.skipif(not is_hip_cdna3(), reason="Requires gfx942 hardware (MI300X / CDNA3)")
+def test_amd_gemm_gfx942_no_xcd_remap(dtype):
+    # NUM_XCDS=1 disables the chiplet remap; it must not change the result.
+    config = {**Gemm.CONFIGS["amd_gemm_gfx942"], "NUM_XCDS": 1}
+    Gemm.run_test(_amd_gemm_gfx942, config, shapes=[(2048, 2048, 2048)], dtype=dtype)
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
