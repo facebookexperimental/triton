@@ -3,7 +3,7 @@ from torch._inductor.kernel.flex.flex_attention import flex_attention_grid
 from torch._inductor.select_algorithm import TritonTemplate
 
 from .mm_templates import load_tlx_template
-from .target import current_target
+from ..hw.target import current_target
 
 
 def _make_flex_template(name, source):
@@ -16,25 +16,36 @@ def _make_flex_template(name, source):
         return TritonTemplate(name=name, grid=flex_attention_grid, source=source)
 
 
-tlx_flex_attention_template = _make_flex_template(
+blackwell_flex_attention_template = _make_flex_template(
     "tlx_blackwell_flex_attention_ws",
-    load_tlx_template("tlx_flex_attention") + load_flex_template("utilities"),
+    load_tlx_template("blackwell_flex_attention") + load_flex_template("utilities"),
 )
 
-# AMD CDNA4 (gfx950/MI350) flex-attention: single-task MFMA + LDS async_load body
-# (no warp specialization / TMEM / TMA). Shares the flex scaffolding + utilities.
-tlx_amd_flex_attention_template = _make_flex_template(
-    "tlx_amd_flex_attention",
-    load_tlx_template("tlx_amd_flex_attention") + load_flex_template("utilities"),
+# MI350X/gfx950 flex-attention: single-task MFMA + LDS async_load body (no warp
+# specialization / TMEM / TMA). Shares the flex scaffolding + utilities. Named
+# for the arch it was tuned on, as blackwell_* above is; see _AMD_FLEX_ARCHES
+# for where it is actually offered.
+gfx950_flex_attention_template = _make_flex_template(
+    "tlx_gfx950_flex_attention",
+    load_tlx_template("gfx950_flex_attention") + load_flex_template("utilities"),
 )
 
 
-def _is_amd_gfx950() -> bool:
-    """True on AMD MI350X (gfx950), where the AMD flex template applies."""
-    return current_target().is_gfx950
+#: Arches offered the gfx950 flex-attention template.
+#:
+#: Unlike the warp-pipe GEMM templates, this one is gated to exactly the arch
+#: it was tuned on. The body is portable across CDNA in principle, but gfx942
+#: (MI300X) and gfx1250 (MI450X) each need their own pass -- MFMA tile shape,
+#: LDS budget and num_warps all differ -- so add them here once that lands.
+_AMD_FLEX_ARCHES = frozenset({"gfx950"})
 
 
-def append_tlx_flex_attention_choice(
+def _use_amd_flex_template() -> bool:
+    """True where the AMD flex-attention template applies."""
+    return current_target().key in _AMD_FLEX_ARCHES
+
+
+def append_tlx_flex(
     choices,
     configs,
     input_nodes,
@@ -44,17 +55,16 @@ def append_tlx_flex_attention_choice(
     sparse_q_block_size,
     sparse_kv_block_size,
 ):
-    """Add Blackwell TLX flex-attention template choices to ``choices``.
+    """Add TLX flex-attention template choices to ``choices``.
+
+    Dispatches on the target, mirroring ``mm_templates.append_tlx``: arches in
+    ``_AMD_FLEX_ARCHES`` go to :func:`_append_tlx_flex_amd`, everything else to
+    :func:`_append_tlx_flex_nvidia`.
 
     Gated by ``config.triton.tlx_mode``:
       - None (disabled): no-op.
       - "allow":   add TLX candidates alongside the standard template.
       - "force":   drop the standard choices and use only TLX.
-
-    One 2-MMA-group warp-specialization candidate is offered per base config.
-    The kernel body hard-codes NUM_MMA_GROUPS=2 and splits BLOCK_M across the two
-    groups, so only base configs whose per-group tile meets the tcgen05 MMA
-    minimum (M >= 64, i.e. BLOCK_M >= 128) yield a candidate.
 
     ``input_nodes`` is the standard flex-attention forward input list:
     (query, key, value, logsumexp, max_scores, kv_num_blocks, kv_indices,
@@ -70,16 +80,37 @@ def append_tlx_flex_attention_choice(
 
     query, logsumexp, max_scores = input_nodes[0], input_nodes[3], input_nodes[4]
     mutated_inputs = [logsumexp, max_scores]
-    num_sms = current_target().num_sms
 
-    # ---- AMD (gfx950/MI350): single-task MFMA/LDS template ----
-    if _is_amd_gfx950():
-        _append_amd_flex_choices(
-            choices, configs, input_nodes, subgraphs, layout,
-            original_kernel_options, sparse_q_block_size, sparse_kv_block_size,
-            query, mutated_inputs,
-        )
-        return
+    appender = (
+        _append_tlx_flex_amd if _use_amd_flex_template() else _append_tlx_flex_nvidia
+    )
+    appender(
+        choices, configs, input_nodes, subgraphs, layout,
+        original_kernel_options, sparse_q_block_size, sparse_kv_block_size,
+        query, mutated_inputs,
+    )
+
+
+def _append_tlx_flex_nvidia(
+    choices,
+    configs,
+    input_nodes,
+    subgraphs,
+    layout,
+    original_kernel_options,
+    sparse_q_block_size,
+    sparse_kv_block_size,
+    query,
+    mutated_inputs,
+):
+    """Append Blackwell flex-attention candidates: 4-task WS, 2 MMA groups.
+
+    One candidate per base config. The kernel body hard-codes NUM_MMA_GROUPS=2
+    and splits BLOCK_M across the two groups, so only base configs whose
+    per-group tile meets the tcgen05 MMA minimum (M >= 64, i.e. BLOCK_M >= 128)
+    yield a candidate.
+    """
+    num_sms = current_target().num_sms
 
     def tlx_options():
         opts = original_kernel_options.copy()
@@ -95,7 +126,7 @@ def append_tlx_flex_attention_choice(
         return opts
 
     def append(opts):
-        tlx_flex_attention_template.maybe_append_choice(
+        blackwell_flex_attention_template.maybe_append_choice(
             choices=choices,
             input_nodes=input_nodes,
             layout=layout,
@@ -105,10 +136,8 @@ def append_tlx_flex_attention_choice(
             **opts,
         )
 
-    # 4-task warp specialization, 2 MMA groups: one candidate per base config.
-    # The kernel body hard-codes NUM_MMA_GROUPS=2 and splits BLOCK_M across the
-    # two groups (BLOCK_M_SPLIT = BLOCK_M // 2). The Blackwell tcgen05 MMA
-    # requires M >= 64, so skip base configs whose per-group tile is smaller.
+    # BLOCK_M_SPLIT = BLOCK_M // 2 per MMA group; skip base configs whose
+    # per-group tile falls below the tcgen05 minimum.
     NUM_MMA_GROUPS = 2
     MIN_MMA_M = 64
     for conf in configs:
@@ -122,7 +151,7 @@ def append_tlx_flex_attention_choice(
         append(opts)
 
 
-def _append_amd_flex_choices(
+def _append_tlx_flex_amd(
     choices,
     configs,
     input_nodes,
@@ -160,7 +189,7 @@ def _append_amd_flex_choices(
         opts["num_warps"] = min(8, max(1, conf.block_m // mfma_m))
         # TLX is hand-pipelined; disable Triton software pipelining.
         opts["num_stages"] = 1
-        tlx_amd_flex_attention_template.maybe_append_choice(
+        gfx950_flex_attention_template.maybe_append_choice(
             choices=choices,
             input_nodes=input_nodes,
             layout=layout,

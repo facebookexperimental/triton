@@ -20,6 +20,54 @@ TorchTLX templates are jinja-based kernel definitions that encode our best-perfo
 
 Our performance strategy operates on two parallel tracks: improving standalone TLX kernels upstream and closing any remaining gap when running through the Inductor template path.
 
+## Naming Conventions
+
+Names carry the architecture, because in this codebase "which GPU" is the question
+that decides almost everything: which template is offered, which config table is
+valid, and how much on-chip memory a tile may use. A name that hides the arch
+invites a config tuned for one part to be applied to another.
+
+**Arch ids** follow `triton._internal_testing`, so the two agree on what "the same
+target" means: `sm90`, `sm100`, `sm107` on NVIDIA (compute capability) and
+`gfx942`, `gfx950`, `gfx1250` on AMD. One caution that module documents — match
+`gfx1250` before any `gfx12` prefix rule, or an RDNA4 check swallows it.
+
+**Templates are named for the arch they were tuned and validated on**, and the same
+name appears at all three layers:
+
+| jinja file | uid (appears in generated kernel names) | Python object |
+|---|---|---|
+| `blackwell_gemm_ws.py.jinja` | `tlx_blackwell_gemm_ws` | `blackwell_gemm_ws_template` |
+| `gfx950_addmm_warppipe.py.jinja` | `tlx_gfx950_addmm_warppipe` | `gfx950_addmm_warppipe_template` |
+
+The file drops the `tlx_` prefix (the directory is already TLX); the uid keeps it.
+Heuristic classes follow the template they serve: `BlackwellGemmWSConfigHeuristic`,
+`Gfx950AddMMWarpPipeConfigHeuristic`.
+
+Note that **registration is deliberately broader than the name**. The warp-pipe
+heuristics register for all of ROCm and the Blackwell GEMM for all of CUDA, so a
+config still has to fit the *actual* target's budget — gfx942 has a quarter of
+gfx950's LDS. Validate against that target's limits rather than assuming the one
+in the name.
+
+**Vendor names are for the dispatch layer only** — the code that branches on
+vendor rather than on part: `append_tlx` → `_append_tlx_{nvidia,amd}`,
+`_AmdArch`, `IS_ROCM`. Say `amd`, not `ROCm`, for the vendor; ROCm is the build.
+
+**Each vendor keeps its own vocabulary** in the arch classes, with two
+vendor-agnostic accessors so callers need not care:
+
+| concept | NVIDIA | AMD | vendor-agnostic |
+|---|---|---|---|
+| on-chip memory | `smem_bytes` | `lds_bytes` | `on_chip_bytes()` |
+| processors | `num_sms` | `num_cus` | `processor_count()` |
+
+Finally, **an absent attribute means the concept does not exist there, or is not
+yet measured** — there are no sentinel values. `tmem_columns` appears first on
+`Sm100`, `num_xcds` only on AMD, and `Gfx1250` declares neither an LDS size nor a
+CU count. Reading one is an `AttributeError` at the call site that should have
+gated, never a plausible-looking `0` or a neighbouring part's number.
+
 ## TorchTLX Fusions
 
 TorchTLX supports epilogue fusion through two store mechanisms.

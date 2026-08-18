@@ -1,3 +1,23 @@
+"""Inductor template heuristics for the torchTLX templates.
+
+This module owns shape-to-config selection (``get_heuristic_config``, the
+candidate table and its scorer), the Inductor heuristic classes that feed those
+configs to autotuning, and a layer of monkey-patches over Inductor internals.
+
+Two things it deliberately no longer owns:
+
+- **Architecture detection** lives in ``tlx.hw.target``. Query
+  ``current_target()`` rather than reading ``torch.version.hip`` or
+  ``gcnArchName`` here.
+- **Hardware facts and on-chip memory models** live in ``tlx.hw.resources``:
+  one arch class per part, and one resource model per template family
+  (``BLACKWELL_WS_GEMM``, ``AMD_WARP_PIPE``). The validators below are thin
+  wrappers over those; do not re-derive an SMEM/TMEM formula in this file.
+
+Both live outside this subpackage so the standalone tutorial kernels can share
+them without importing torch._inductor.
+"""
+
 import dataclasses
 import logging
 import os
@@ -18,9 +38,9 @@ from torch._inductor.template_heuristics.triton import (
 from torch._inductor.template_heuristics.triton_addmm import AddMMConfigMixin
 from torch._inductor.utils import get_num_sms
 
-from . import resources
-from .resources import DEFAULT_LIMITS, TileConfig, validate_config
-from .target import current_target, is_rocm
+from ..hw import resources
+from ..hw.resources import BLACKWELL_LIMITS, BlackwellWSGemmConfig, validate_config
+from ..hw.target import current_target, is_rocm
 
 # IS_ROCM was dropped from torch._inductor.template_heuristics.triton on newer
 # nightlies (the module now branches on ``torch.version.hip`` inline). Derive it
@@ -49,9 +69,9 @@ def _sizevar_hint(sizevars, expr, fallback):
 
 from . import tlx_config
 from .mm_templates import (
-    amd_addmm_persistent_warppipe_template,
-    amd_addmm_warppipe_template,
-    amd_bmm_warppipe_template,
+    gfx950_addmm_persistent_warppipe_template,
+    gfx950_addmm_warppipe_template,
+    gfx950_bmm_warppipe_template,
     blackwell_gemm_ws_template,
 )
 
@@ -81,9 +101,12 @@ import math as _math
 
 
 def _amd_num_xcds() -> int:
-    """Number of XCDs (chiplets) on the current ROCm GPU, for the L2 chiplet swizzle.
+    """Number of XCDs (chiplets) on the current ROCm GPU, for the L2 swizzle.
 
-    See ``Target.num_xcds`` for the arch table.
+    AMD only: the NVIDIA arch classes do not declare ``num_xcds`` at all, so
+    calling this on a CUDA target is an AttributeError rather than a silent 1.
+    Both callers are ROCm-registered heuristics. Counts live on the arch
+    classes in ``tlx.hw.resources``.
     """
     return current_target().num_xcds
 
@@ -124,7 +147,7 @@ def _is_config_valid(
     ``resources.estimate_smem``.
     """
     return validate_config(
-        TileConfig.from_dict(config),
+        BlackwellWSGemmConfig.from_dict(config),
         charge_epilogue=tma_epilogue_store,
         split_k=config.get("SPLIT_K", 1),
         smem_margin=smem_margin,
@@ -135,8 +158,11 @@ def _fix_config_if_needed(
     config: dict[str, Any], tma_epilogue_store: bool = False
 ) -> dict[str, Any] | None:
     """
-    Fix config to stay within shared memory limits.
-    Returns None if config cannot be fixed.
+    Return the config if it fits the hardware, else None.
+
+    Despite the name this does not modify the config -- there is no repair
+    step. It is a pass/reject gate, and every rejection falls through to the
+    candidate scorer in get_heuristic_config.
     """
     if _is_config_valid(config, tma_epilogue_store=tma_epilogue_store):
         return config
@@ -584,7 +610,7 @@ def _candidate_scorer_evaluate(
     best_waves = float("inf")
 
     for cfg in _CANDIDATES:
-        tile = TileConfig.from_dict(cfg)
+        tile = BlackwellWSGemmConfig.from_dict(cfg)
         bm = tile.block_m
         bn = tile.block_n
         bk = tile.block_k
@@ -673,13 +699,14 @@ def _candidate_scorer_evaluate(
     return best_config
 
 
-class TLXMatmulWSConfigMixin(TMATemplateConfigMixin):
+class BlackwellGemmWSConfigMixin(TMATemplateConfigMixin):
     """Mixin for TLX Matmul WS template with TLX-specific parameters and config validation."""
 
-    # Blackwell B200A resource limits. Kept as class attributes for callers
-    # that read them; the values come from the shared device model.
-    MAX_SHARED_MEMORY = DEFAULT_LIMITS.smem_bytes
-    MAX_TMEM_COLUMNS = DEFAULT_LIMITS.tmem_columns
+    # Blackwell resource limits, re-exported as class attributes for callers
+    # that read them directly. Sourced from the shared arch model rather than
+    # respelled here -- see tlx.hw.resources.
+    MAX_SHARED_MEMORY = BLACKWELL_LIMITS.on_chip_bytes
+    MAX_TMEM_COLUMNS = BLACKWELL_LIMITS.tmem_columns
     MBARRIER_SIZE = resources.MBARRIER_BYTES
 
     @staticmethod
@@ -692,9 +719,9 @@ class TLXMatmulWSConfigMixin(TMATemplateConfigMixin):
         num_mma_groups: int,
         num_ctas: int,
         epilogue_subtile: int,
-    ) -> TileConfig:
+    ) -> BlackwellWSGemmConfig:
         """Adapt the flat positional signature the validators expose."""
-        return TileConfig(
+        return BlackwellWSGemmConfig(
             block_m=block_m,
             block_n=block_n,
             block_k=block_k,
@@ -727,7 +754,7 @@ class TLXMatmulWSConfigMixin(TMATemplateConfigMixin):
             True if config is valid, False if should be pruned.
         """
         return validate_config(
-            TLXMatmulWSConfigMixin._tile(
+            BlackwellGemmWSConfigMixin._tile(
                 block_m,
                 block_n,
                 block_k,
@@ -1079,9 +1106,9 @@ class TLXMatmulWSConfigMixin(TMATemplateConfigMixin):
 
 
 @register_template_heuristic(
-    amd_addmm_warppipe_template.uid, "cuda", register=IS_ROCM, op_name="addmm"
+    gfx950_addmm_warppipe_template.uid, "cuda", register=IS_ROCM, op_name="addmm"
 )
-class ROCmAddMMWarpPipeTemplateConfigHeuristic(
+class Gfx950AddMMWarpPipeConfigHeuristic(
     AddMMConfigMixin, ROCmMMTemplateConfigHeuristic
 ):
     """TLX warp-pipelined addmm heuristic for ROCm (col-major B, MI350X/gfx950).
@@ -1098,10 +1125,17 @@ class ROCmAddMMWarpPipeTemplateConfigHeuristic(
     # BLOCK_N=256 tiles mirror the amd_addmm_glu tutorial winners for the M=1024
     # regime; on gfx950 they beat the BLOCK_N<=128 tiles on large-N shapes (e.g.
     # 1024x22272x1024 reaches ~98% of rocBLAS, up from ~92%). LDS: (128x256x64,NB2)
-    # = 96KB, (128x256x32,NB3) = 72KB -- both fit gfx950 (256x256x64 does not).
+    # = 96KB, (128x256x32,NB3) = 72KB -- both fit gfx950 (256x256x64 does not at
+    # NB3, where it needs 192KB; at NB2 it would fit).
     # (128x256x64,NB3) = 144KB fits gfx950's 160KB (occupancy 1); it is the deeper-
     # prefetch tile that won the standalone split-K sweep on low-occupancy large-K
     # (e.g. 1024x6144x22272 at SK=4), which the NB=2 variant alone could not reach.
+    #
+    # These LDS figures are no longer hand-arithmetic only: resources.AMD_WARP_PIPE
+    # models the same allocation and reproduces all three, and
+    # test_every_shipped_warppipe_config_fits_gfx950 asserts no entry below
+    # exceeds the budget. Use resources.AMD_WARP_PIPE.estimate_smem when adding a
+    # config rather than recomputing by hand.
     WARPPIPE_CONFIGS = [
         (64, 64, 128, 8, 8, 3),
         (64, 64, 64, 8, 8, 3),
@@ -1260,9 +1294,9 @@ class ROCmAddMMWarpPipeTemplateConfigHeuristic(
 
 
 @register_template_heuristic(
-    amd_bmm_warppipe_template.uid, "cuda", register=IS_ROCM, op_name="bmm"
+    gfx950_bmm_warppipe_template.uid, "cuda", register=IS_ROCM, op_name="bmm"
 )
-class ROCmBMMWarpPipeTemplateConfigHeuristic(ROCmMMTemplateConfigHeuristic):
+class Gfx950BMMWarpPipeConfigHeuristic(ROCmMMTemplateConfigHeuristic):
     """TLX warp-pipelined bmm heuristic for ROCm (MI350X/gfx950).
 
     Same warp-pipe core as the addmm (async_load prefetch into multi-buffered LDS + MFMA via
@@ -1289,7 +1323,8 @@ class ROCmBMMWarpPipeTemplateConfigHeuristic(ROCmMMTemplateConfigHeuristic):
         # Finer K granularity cuts the K%BLOCK_K tail waste and schedules the register
         # path better. (NUM_BUFFERS is moot on the register path -- it allocates no LDS
         # multi-buffer; matters only if the async branch selects these on an aligned-K
-        # shape, where LDS still fits gfx950's 160KB.)
+        # shape, where LDS still fits gfx950's 160KB. resources.AMD_WARP_PIPE models
+        # both branches: AmdWarpPipeConfig(use_async=False) estimates 0 bytes.)
         (256, 256, 32, 8, 8, 2),
         (128, 256, 32, 8, 8, 2),
         (256, 128, 32, 8, 8, 2),
@@ -1380,13 +1415,13 @@ class ROCmBMMWarpPipeTemplateConfigHeuristic(ROCmMMTemplateConfigHeuristic):
 
 
 @register_template_heuristic(
-    amd_addmm_persistent_warppipe_template.uid,
+    gfx950_addmm_persistent_warppipe_template.uid,
     "cuda",
     register=IS_ROCM,
     op_name="addmm",
 )
-class ROCmAddMMPersistentWarpPipeTemplateConfigHeuristic(
-    ROCmAddMMWarpPipeTemplateConfigHeuristic
+class Gfx950AddMMPersistentWarpPipeConfigHeuristic(
+    Gfx950AddMMWarpPipeConfigHeuristic
 ):
     """Persistent variant of the AMD warp-pipe addmm heuristic (MI350X / gfx950).
 
@@ -1411,7 +1446,7 @@ class ROCmAddMMPersistentWarpPipeTemplateConfigHeuristic(
     "cuda",
     register=not IS_ROCM,
 )
-class TemplateGemmWSConfigHeuristic(TLXMatmulWSConfigMixin, CUDAConfigHeuristic):
+class BlackwellGemmWSConfigHeuristic(BlackwellGemmWSConfigMixin, CUDAConfigHeuristic):
     """
     Blackwell TLX Warp-Specialized GEMM template from tritonbench.
 
@@ -1472,7 +1507,7 @@ class TemplateGemmWSConfigHeuristic(TLXMatmulWSConfigMixin, CUDAConfigHeuristic)
             )
             for BM, BN, BK, s, t, m, subtile, num_ctas in _AUTOTUNE_CONFIGS
             # Prune invalid configs based on hardware constraints
-            if TLXMatmulWSConfigMixin._is_valid_config(
+            if BlackwellGemmWSConfigMixin._is_valid_config(
                 block_m=BM,
                 block_n=BN,
                 block_k=BK,
