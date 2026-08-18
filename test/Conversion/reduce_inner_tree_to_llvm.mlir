@@ -7,6 +7,7 @@
 // warp reduction and combines the groups later when packing the result.
 
 #linear = #ttg.linear<{register = [[0, 2], [2, 0]], lane = [[0, 8], [8, 0], [1, 0], [4, 0], [16, 0]], warp = [[0, 1], [0, 4]], block = []}>
+#lane_interleaved = #ttg.linear<{register = [[0, 1]], lane = [[1, 0], [0, 2], [2, 0], [0, 4], [4, 0]], warp = [[0, 8], [0, 16]], block = []}>
 
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
 
@@ -63,10 +64,33 @@ tt.func private @reduce_inner_tree(%arg0: tensor<32x16xi32, #linear>) -> tensor<
   tt.return %0 : tensor<16xi32, #ttg.slice<{dim = 0, parent = #linear}>>
 }
 
-tt.func @anchor(%ptr: !llvm.ptr, %arg0: tensor<32x16xi32, #linear>) {
+// A lane distribution may interleave reduction and non-reduction lane-id
+// bits. Reduce exactly the bits that move axis 0: 4, 2, and 0, corresponding
+// to XOR masks 16, 4, and 1 in the established count-down order.
+// CHECK-LABEL: @reduce_lane_interleaved
+tt.func private @reduce_lane_interleaved(%arg0: tensor<8x32xi32, #lane_interleaved>) -> tensor<32xi32, #ttg.slice<{dim = 0, parent = #lane_interleaved}>> {
+  // CHECK: call i32 @llvm.nvvm.shfl.sync.bfly.i32({{.*}}i32 16, i32 31)
+  // CHECK: call i32 @llvm.nvvm.shfl.sync.bfly.i32({{.*}}i32 4, i32 31)
+  // CHECK: call i32 @llvm.nvvm.shfl.sync.bfly.i32({{.*}}i32 1, i32 31)
+  // CHECK: call i32 @llvm.nvvm.shfl.sync.bfly.i32({{.*}}i32 16, i32 31)
+  // CHECK: call i32 @llvm.nvvm.shfl.sync.bfly.i32({{.*}}i32 4, i32 31)
+  // CHECK: call i32 @llvm.nvvm.shfl.sync.bfly.i32({{.*}}i32 1, i32 31)
+  // CHECK-NOT: call i32 @llvm.nvvm.shfl.sync.bfly.i32
+  %0 = "tt.reduce"(%arg0) ({
+  ^bb0(%arg1: i32, %arg2: i32):
+    %1 = arith.addi %arg1, %arg2 : i32
+    tt.reduce.return %1 : i32
+  }) {axis = 0 : i32} : (tensor<8x32xi32, #lane_interleaved>) -> tensor<32xi32, #ttg.slice<{dim = 0, parent = #lane_interleaved}>>
+  tt.return %0 : tensor<32xi32, #ttg.slice<{dim = 0, parent = #lane_interleaved}>>
+}
+
+tt.func @anchor(%ptr: !llvm.ptr, %lane_ptr: !llvm.ptr, %arg0: tensor<32x16xi32, #linear>, %arg1: tensor<8x32xi32, #lane_interleaved>) {
   %0 = tt.call @reduce_inner_tree(%arg0) : (tensor<32x16xi32, #linear>) -> tensor<16xi32, #ttg.slice<{dim = 0, parent = #linear}>>
   %1 = builtin.unrealized_conversion_cast %0 : tensor<16xi32, #ttg.slice<{dim = 0, parent = #linear}>> to !llvm.struct<(i32, i32)>
   llvm.store volatile %1, %ptr : !llvm.struct<(i32, i32)>, !llvm.ptr
+  %2 = tt.call @reduce_lane_interleaved(%arg1) : (tensor<8x32xi32, #lane_interleaved>) -> tensor<32xi32, #ttg.slice<{dim = 0, parent = #lane_interleaved}>>
+  %3 = builtin.unrealized_conversion_cast %2 : tensor<32xi32, #ttg.slice<{dim = 0, parent = #lane_interleaved}>> to !llvm.struct<(i32, i32)>
+  llvm.store volatile %3, %lane_ptr : !llvm.struct<(i32, i32)>, !llvm.ptr
   tt.return
 }
 

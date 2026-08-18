@@ -34,6 +34,8 @@
 // PartitionedSharedEncoding attributes for testing
 #PARTITIONED_SHARED_SWIZZLE = #ttg.partitioned_shared<{numPartitions = 2, numGroups = 2, partitionDim = 0, partitionLayout = #A_SHARED}>
 #PARTITIONED_SHARED_PADDED = #ttg.partitioned_shared<{numPartitions = 4, numGroups = 1, partitionDim = 1, partitionLayout = #PADDED_SHARED_0_16x32}>
+#LANE_INTERLEAVED = #ttg.linear<{register = [[0, 1]], lane = [[1, 0], [0, 2], [2, 0], [0, 4], [4, 0]], warp = [[0, 8], [0, 16]], block = []}>
+#LANE_INTERLEAVED_SLICE = #ttg.slice<{dim = 0, parent = #LANE_INTERLEAVED}>
 
 #smem = #ttg.shared_memory
 #barrier = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
@@ -45,6 +47,19 @@ module attributes {"ttg.num-warps" = 4 : i32, "ttg.num-ctas" = 1 : i32} {
 tt.func @empty(%A : !tt.ptr<f16>) {
   %cst_2 = arith.constant dense<0.000000e+00> : tensor<16x32xf16, #AL>
   %0 = ttg.convert_layout %cst_2 : tensor<16x32xf16, #AL> -> tensor<16x32xf16, #AL>
+  tt.return
+}
+
+// A warp-synchronous reduction is completed by lane shuffles and reserves no
+// shared-memory scratch, even when its lane-id bits are non-contiguous.
+// expected-remark @below {{lane_reduction_no_scratch}}
+// expected-remark @below {{size = 0}}
+tt.func @lane_reduction_no_scratch(%arg0: tensor<8x32xf32, #LANE_INTERLEAVED>) {
+  %0 = "tt.reduce"(%arg0) ({
+  ^bb0(%arg1: f32, %arg2: f32):
+    %1 = arith.addf %arg1, %arg2 : f32
+    tt.reduce.return %1 : f32
+  }) {axis = 0 : i32} : (tensor<8x32xf32, #LANE_INTERLEAVED>) -> tensor<32xf32, #LANE_INTERLEAVED_SLICE>
   tt.return
 }
 
