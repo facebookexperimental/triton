@@ -427,6 +427,35 @@ def test_amd_warp_votes_lower_without_public_ballot_gfx950():
     assert "llvm.amdgcn.ballot" in compiled.asm["llir"]
 
 
+@triton.jit
+def _warp_vote_scalar_predicate_kernel(output):
+    predicate = tl.program_id(0) == 0
+    tl.store(output, tlx.warp_all(predicate).to(tl.int32))
+
+
+def test_amd_warp_vote_rejects_scalar_predicate():
+    with pytest.raises(CompilationError, match="warp_all expects a distributed tensor predicate"):
+        compile_for_gfx950(
+            _warp_vote_scalar_predicate_kernel,
+            signature={"output": "*i32"},
+            constexprs={},
+        )
+
+
+def test_amd_warp_vote_rejects_multiple_elements_per_lane_gfx950():
+    with pytest.raises(RuntimeError, match="predicate must distribute exactly one element per lane"):
+        compile_for_gfx950(
+            _warp_vote_kernel,
+            signature={
+                "x_ptr": "*i32",
+                "all_ptr": "*i32",
+                "any_ptr": "*i32",
+                "BLOCK": "constexpr",
+            },
+            constexprs={"BLOCK": 512},
+        )
+
+
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
 def test_amd_warp_votes_correct_gfx950():
     values = torch.ones(64, device="cuda", dtype=torch.int32)

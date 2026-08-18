@@ -1716,6 +1716,13 @@ unsigned WarpSpecializeOp::getTotalPartitionWarps() {
 LogicalResult WarpVoteOp::verify() {
   if (getKind() != "all" && getKind() != "any")
     return emitOpError("kind must be \"all\" or \"any\"");
+  // Frontend TTIR is intentionally unencoded. TritonGPU conversion preserves
+  // this op while assigning its predicate a concrete distributed encoding, at
+  // which point the verifier can enforce physical per-lane cardinality.
+  auto predType = getPred().getType();
+  if (predType.getEncoding() && getTotalElemsPerThread(predType) != 1)
+    return emitOpError(
+        "predicate must distribute exactly one element per lane");
   return success();
 }
 

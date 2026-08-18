@@ -1269,8 +1269,47 @@ def _fa_workitems_to_mfma_rows(workitems):
 
 @triton.jit
 def _fa_mfma_rows_to_workitems(rows):
-    per_wave_rows = rows.reshape([8, 32])
-    return tl.broadcast_to(per_wave_rows[:, None, :], (8, 2, 32)).reshape([512])
+    per_warp_rows = rows.reshape([8, 32])
+    return tl.broadcast_to(per_warp_rows[:, None, :], (8, 2, 32)).reshape([512])
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Need gfx950 (CDNA4)")
+def test_distributed_linear_layout_cast_and_release_apis_on_cdna4():
+    physical = tlx.distributed_linear_layout_encoding.make(
+        reg_bases=[],
+        lane_bases=[[1], [2], [4], [8], [16], [32]],
+        warp_bases=[],
+        block_bases=[],
+        shape=[64],
+    )
+
+    @triton.jit
+    def kernel(X, Y, Bits, ReleasedOffsets, PHYSICAL: tl.constexpr):
+        offsets = tl.arange(0, 64)
+        values = tl.load(X + offsets)
+        pinned = tlx.require_layout(values, PHYSICAL)
+        narrowed = tlx.cast_preserve_layout(pinned, tl.bfloat16)
+        widened = tlx.cast_preserve_layout(narrowed, tl.float32)
+        bits = tlx.cast_preserve_layout(pinned, tl.int32, bitcast=True)
+        ordinary = tlx.release_layout(widened)
+        already_ordinary = tlx.release_layout(offsets)
+        tl.store(Y + offsets, ordinary)
+        tl.store(Bits + offsets, bits)
+        tl.store(ReleasedOffsets + offsets, already_ordinary)
+
+    x = torch.linspace(-3.0, 3.0, 64, device=DEVICE, dtype=torch.float32)
+    y = torch.empty_like(x)
+    bits = torch.empty(64, device=DEVICE, dtype=torch.int32)
+    released_offsets = torch.empty_like(bits)
+    compiled = kernel.warmup(x, y, bits, released_offsets, physical, grid=(1, ), num_warps=1)
+    kernel[(1, )](x, y, bits, released_offsets, physical, num_warps=1)
+
+    torch.testing.assert_close(y, x.to(torch.bfloat16).float(), atol=0, rtol=0)
+    torch.testing.assert_close(bits, x.view(torch.int32), atol=0, rtol=0)
+    torch.testing.assert_close(released_offsets, torch.arange(64, device=DEVICE, dtype=torch.int32), atol=0, rtol=0)
+    assert "#ttg.linear" in compiled.asm["ttir"]
+    assert "tlx.release_layout" not in compiled.asm["ttgir"]
+    assert "#tlx.no_verify_layout" not in compiled.asm["ttgir"]
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Need gfx950 (CDNA4)")

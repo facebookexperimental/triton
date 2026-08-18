@@ -1,16 +1,110 @@
-"""Eight-wave gfx950 FlashAttention shaped after the standalone Wave kernel.
+"""Adaptive non-causal FlashAttention for BF16 tensors on gfx950.
 
-This remains separate from ``amd_fa_cluster`` because its packetized score and
-output state is arranged specifically for two four-wave cohorts.  Four physical
-K and V LDS slots let those cohorts run as a ping-pong pipeline without reusing
-a slot that the other cohort still consumes.
+Public contract
+---------------
 
-The normal path uses an adaptive softmax reference.  A reference is retained
-while new row maxima remain numerically safe and the accumulators are rescaled
-only when it must advance.  Callers with a tight input bound may still request
-the fixed-reference specialization explicitly through ``qk_max_abs``.  Bounds
-whose full score span can leave the normal exponent range are rejected; those
-inputs must use the adaptive path.
+``attention(q, k, v, sm_scale=None, *, qk_max_abs=None, out=None)`` computes
+
+    S[i, j] = sm_scale * sum_d Q[i, d] K[j, d]
+    P[i, j] = exp(S[i, j]) / sum_t exp(S[i, t])
+    O[i, d] = sum_j P[i, j] V[j, d].
+
+``q``, ``k``, and ``v`` must be contiguous BF16 tensors with shape
+``(batch, heads, sequence, 128)``.  The sequence length must be at least 256
+and divisible by 256.  The kernel is non-causal and uses eight 64-lane AMD
+warps per program.  One program computes a 256-row query tile; K and V advance
+in 64-row tiles through four explicitly synchronized LDS stages.
+
+The implementation uses base-2 exponentials.  Defining
+``x = log2(e) * S`` gives ``exp(S) = 2**x``, so this change of base does not
+alter the result.
+
+Online-softmax state
+--------------------
+
+For each query row, the kernel carries a reference ``r``, denominator ``l``,
+and unnormalized output accumulator ``a``:
+
+    l = sum_j 2**(x_j - r)
+    a = sum_j 2**(x_j - r) V_j
+    O = a / l.
+
+Changing the reference from ``r`` to ``r_new`` is exact in real arithmetic:
+
+    alpha = 2**(r - r_new)
+    l_new = alpha * l + sum_{j in tile} 2**(x_j - r_new)
+    a_new = alpha * a + sum_{j in tile} 2**(x_j - r_new) V_j.
+
+Scaling both accumulated terms by ``alpha`` preserves their ratio.  The two
+specializations differ only in how they choose ``r``.
+
+Adaptive-reference variant (the default)
+----------------------------------------
+
+Let ``m`` be the maximum of the next score tile and ``c = max(r, m)``.  The
+kernel keeps the old reference while ``c - r <= 8`` for every row owned by a
+warp.  This permits weights up to ``2**8`` and avoids repeatedly scaling the
+64 FP32 output accumulators.  If any owned row exceeds that headroom, the
+warp-uniform branch rebases all of its rows to ``c``.  Rebasing extra rows is
+algebraically harmless and a uniform vote avoids divergent control flow.
+
+Use this default for ordinary model inputs, unknown or loose activation
+ranges, and any workload whose Q/K bound cannot be proved.  It is the robust
+general-purpose variant: the reference adapts to the data and does not depend
+on a caller assertion.
+
+Fixed-reference bounded variant
+-------------------------------
+
+Passing ``qk_max_abs=A`` asserts ``abs(Q) <= A`` and ``abs(K) <= A``.  For
+head dimension ``D`` this proves
+
+    abs(S[i, j]) <= D * abs(sm_scale) * A**2
+
+and therefore the base-2 score bound
+
+    B = log2(e) * D * abs(sm_scale) * A**2.
+
+The specialization fixes ``r = B``.  Every exponent argument is non-positive,
+and the full possible span is ``2*B``.  The API rejects non-finite bounds,
+bounds that can overflow the FP32 dot product, and spans greater than or equal
+to 126 where the smallest weights could flush below the normal FP32 range.
+The API cannot inspect every tensor element, so understating ``A`` violates the
+contract and can invalidate the numerical guarantee.
+
+Use the bounded variant only when the input producer already guarantees a
+tight finite magnitude bound.  It removes adaptive maximum tracking, voting,
+and rebasing at the algorithm level, but that does not guarantee faster
+machine code.  The current gfx950 LLVM compilation of the advertised shape
+spills its fixed-path live state and is substantially slower than the adaptive
+specialization.  Adaptive reference tracking is therefore the production
+choice for this implementation today; retain the bounded path for numerical
+comparison, compiler work, or a target where repeated measurements prove a
+benefit.  Do not derive ``A`` by scanning Q and K at launch time: that extra
+pass generally costs more than the saved work and introduces another global
+synchronization point.
+
+Pipeline and benchmark variants
+-------------------------------
+
+QK products use transposed 32x32x16 MFMA fragments.  Score packets are pinned
+to their physical register ownership while maxima, exponentials, and casts are
+performed; ``tlx.release_layout`` deliberately ends those local contracts at
+composition boundaries.  PV is split into a short prefix and thirteen
+remaining MFMAs so independent preparation for the next score tile can be
+scheduled between them.  Direct-to-LDS transfers are consumed only through
+explicit ``wait_group`` token dependencies.  ``tlx.amd_sched_barrier`` is a
+compiler scheduling boundary, not memory synchronization.
+
+``amd_fa_adaptive_bench.py`` reports three input distributions for the default
+variant.  ``bounded-distribution`` is representative bounded random data but
+still exercises adaptive reference tracking.  ``sparse-rebase`` makes one of
+each warp's 32 logical rows exceed the headroom on every K/V tile; it tests
+that one row correctly triggers the uniform group rebase.  ``forced-rebase``
+makes every row exceed the headroom on every tile and measures the worst-case
+rebase arithmetic.  The latter two are adversarial test distributions, not
+additional APIs or recommended application modes.  Supplying ``--qk-max-abs``
+instead benchmarks the fixed-reference specialization on bounded data.
 """
 
 import math
@@ -70,9 +164,9 @@ _FP32_UNIT_ROUNDOFF = 2.0**-24
 _QK_ACCUMULATION_ERROR = (128 * _FP32_UNIT_ROUNDOFF) / (1.0 - 128 * _FP32_UNIT_ROUNDOFF)
 MAX_QK_ABS_FOR_FINITE_F32_DOT = math.sqrt(torch.finfo(torch.float32).max / (128 * (1.0 + _QK_ACCUMULATION_ERROR)))
 
-# The current symbolic address expressions are signed i32 through the Wave
-# bridge.  Keep both the materialized tensor stride and every flattened element
-# offset representable until the kernel migrates those expressions to i64.
+# The current symbolic address expressions are signed i32.  Keep both the
+# materialized tensor stride and every flattened element offset representable
+# until the kernel migrates those expressions to i64.
 MAX_SIGNED_I32 = (1 << 31) - 1
 
 RESERVED_LAUNCH_OPTIONS = frozenset({
@@ -116,9 +210,8 @@ def _mfma_packet_to_registers(packet):
         = warp[2:0], lane[4:0], register[3:2],
           lane[5], register[1:0].
 
-    Moving lane[5] next to the other workitem bits produces the standalone
-    Wave kernel's ``[workitem, register]`` packet without exchanging values
-    between workitems.
+    Moving lane[5] next to the other workitem bits produces a
+    ``[workitem, register]`` packet without exchanging values between lanes.
     """
     binary = packet.reshape([2] * 13)
     workitem_register = binary.permute(
@@ -239,8 +332,8 @@ def _pin_workitem_layout(value):
 @triton.jit
 def _duplicate_rows_to_workitems(rows):
     rows = tlx.release_layout(rows)
-    per_wave_rows = rows.reshape([8, 32])
-    per_workitem = tl.broadcast_to(per_wave_rows[:, None, :], (8, 2, 32))
+    per_warp_rows = rows.reshape([8, 32])
+    per_workitem = tl.broadcast_to(per_warp_rows[:, None, :], (8, 2, 32))
     return _pin_workitem_layout(per_workitem.reshape([8 * 64]))
 
 
@@ -277,12 +370,12 @@ def _prepare_adaptive_score_registers(scores, qk_scale: tl.constexpr):
 
 @triton.jit
 def _adaptive_rebase_decision(row_max, tile_max):
-    """Return the next row maximum and one uniform headroom vote per wave.
+    """Return the next row maximum and one uniform headroom vote per warp.
 
-    Each wave owns 32 rows, duplicated across its two 32-lane halves by the
+    Each 64-lane warp owns 32 rows, duplicated across its two lane halves by the
     reduction.  ``warp_all`` therefore tests whether every one of the 32 rows
     remains within the logarithmic headroom.  If any row exceeds it, rebasing
-    every row in the wave is algebraically safe: scaling its old denominator
+    every row in the warp is algebraically safe: scaling its old denominator
     and accumulator by the same factor preserves their ratio.  Ordered
     comparison also makes a NaN take the rebase path and continue propagating.
     """
@@ -387,8 +480,8 @@ def _exponentiate_adaptive_scores(
     qk_scale: tl.constexpr,
 ):
     # Keep the scale and translation as a multiply-add expression.  The global
-    # fast-math policy permits contraction, so Wave can form the same FMA as its
-    # native FA implementation without a kernel-specific bridge operation.
+    # fast-math policy permits contraction, so the backend can form one FMA
+    # without a kernel-specific operation.
     if qk_scale < 0.0:
         logits0 = registers0 - reference[:, None]
         logits1 = registers1 - reference[:, None]
@@ -495,9 +588,9 @@ class SoftmaxState:
     ):
         """Prepare the next score tile without rebasing the current PV state.
 
-        Keeping the rebase commit separate lets Wave overlap this independent
+        Keeping the rebase commit separate lets the scheduler overlap this independent
         score work with the remaining PV MFMAs.  The reference is still chosen
-        by the same wave-uniform vote as prepare; only the state scaling
+        by the same warp-uniform vote as prepare; only the state scaling
         is deferred until the current PV tile is fully accumulated.
         """
         score_registers0, score_registers1, tile_max = _prepare_adaptive_score_registers(
@@ -606,11 +699,11 @@ def _accumulate_prefix_body(
     log2_score_bound: tl.constexpr,
     ADAPTIVE_REFERENCE: tl.constexpr,
 ):
-    """Accumulate one PV tile using the standalone kernel's 3+13 split.
+    """Accumulate one PV tile using a 3+13 MFMA split.
 
-    The split exposes individual MFMA candidates to Wave.  The barrier fixes
-    only the three-instruction prefix; Wave remains free to interleave the
-    remaining independent MFMAs with the next tile's bounded-softmax work.
+    The split exposes individual MFMA candidates to the scheduler.  The
+    barrier fixes only the three-instruction prefix; later independent MFMAs
+    may interleave with preparation of the next score tile.
     """
     p0 = probability_fragments.p0
     p1 = probability_fragments.p1
@@ -729,8 +822,8 @@ def _load_query(
 
 @triton.jit
 def _workitems_to_rows(workitems):
-    per_wave_rows, _ = workitems.reshape([8, 2, 32]).permute(0, 2, 1).split()
-    return per_wave_rows.reshape([BLOCK_M])
+    per_warp_rows, _ = workitems.reshape([8, 2, 32]).permute(0, 2, 1).split()
+    return per_warp_rows.reshape([BLOCK_M])
 
 
 @triton.jit
@@ -829,7 +922,7 @@ def _issue_tile(
 
 @triton.jit
 def _stage_end():
-    """Match standalone Wave's CTA-convergence boundary."""
+    """Converge the program before advancing to the next pipeline stage."""
     tl.debug_barrier()
 
 
@@ -948,7 +1041,7 @@ def _warp_pipeline_phase(
             v_layout,
         )
 
-    # PV is the longest phase. Favor its waves so the companion pipeline group
+    # PV is the longest phase. Favor its warps so the companion pipeline group
     # reaches the phase barriers with less skew.
     with tlx.warp_pipeline_stage("pv", priority=1):
         state, next_exponentiated_scores = _accumulate_prefix_body(
@@ -1041,9 +1134,9 @@ def _pipeline(
     k_ready2 = _issue_tile(k_ptrs, 2, stride_kn, k_buffer, 2, 8)
     # Tile i consumes V[i] and K[i+1], reads K[i+2], and publishes K[i+3] and
     # V[i+2].  Spell out all four ring phases so each physical slot remains
-    # static in the generated Wave program.
+    # static in the generated program.
     # Peel phase zero so the loop enters with real PV accumulator values.  In
-    # addition to matching the four-slot ring, this lets Wave keep the MFMA
+    # addition to matching the four-slot ring, this keeps the MFMA
     # accumulator register groups intact across the loop backedge.
     q = tlx.release_layout(q)
     v_ready1 = _issue_tile(
@@ -1306,7 +1399,7 @@ def _pipeline(
 
 
 @triton.jit
-def _attn_fwd_wave_pipeline(
+def _attn_fwd_adaptive_pipeline(
     Q,
     K,
     V,
@@ -1514,9 +1607,9 @@ def _validate_attention_inputs(q, k, v, causal, compiler_options):
     reserved_options = sorted(RESERVED_LAUNCH_OPTIONS.intersection(compiler_options))
     if reserved_options:
         names = ", ".join(reserved_options)
-        raise TypeError(f"amd_fa_wave compiler options must not override reserved launch keys: {names}")
+        raise TypeError(f"amd_fa_adaptive compiler options must not override reserved launch keys: {names}")
     if causal:
-        raise ValueError("amd_fa_wave only implements non-causal attention")
+        raise ValueError("amd_fa_adaptive only implements non-causal attention")
     for name, tensor in (("q", q), ("k", k), ("v", v)):
         if tensor.ndim != 4:
             raise ValueError(f"{name} must be rank 4 (B, H, N, D), got rank {tensor.ndim}")
@@ -1541,7 +1634,7 @@ def _validate_attention_inputs(q, k, v, causal, compiler_options):
     batch_stride = heads * sequence * head_dim
     last_element_offset = batch * batch_stride - 1
     if batch_stride > MAX_SIGNED_I32 or last_element_offset > MAX_SIGNED_I32:
-        raise ValueError(f"amd_fa_wave batch stride ({batch_stride}) and last element offset "
+        raise ValueError(f"amd_fa_adaptive batch stride ({batch_stride}) and last element offset "
                          f"({last_element_offset}) must not exceed the signed-i32 address limit "
                          f"({MAX_SIGNED_I32})")
     return batch, heads, sequence, head_dim
@@ -1586,16 +1679,16 @@ def _prepare_output(q, k, v, out):
         if not output.is_contiguous():
             raise ValueError("out must be contiguous")
     if _storage_ranges_overlap(output, k):
-        raise ValueError("amd_fa_wave out must not overlap k")
+        raise ValueError("amd_fa_adaptive out must not overlap k")
     if _storage_ranges_overlap(output, v):
-        raise ValueError("amd_fa_wave out must not overlap v")
+        raise ValueError("amd_fa_adaptive out must not overlap v")
     if _storage_ranges_overlap(output, q) and not output.is_set_to(q):
-        raise ValueError("amd_fa_wave out may overlap q only when it is exactly the same tensor view")
+        raise ValueError("amd_fa_adaptive out may overlap q only when it is exactly the same tensor view")
     return output
 
 
 def _build_launch_options(batch, heads, sequence, sm_scale, log2_score_bound, adaptive_reference, compiler_options):
-    launch_options = {
+    return {
         **compiler_options,
         "N_CTX": sequence,
         "BATCH": batch,
@@ -1606,9 +1699,6 @@ def _build_launch_options(batch, heads, sequence, sm_scale, log2_score_bound, ad
         "ADAPTIVE_REFERENCE": adaptive_reference,
         "num_warps": 8,
     }
-    if triton.runtime.driver.active.get_current_target().backend == "tlx_wave":
-        launch_options.setdefault("tlx_wave_enable_multi_wave_specialize", False)
-    return launch_options
 
 
 def attention(
@@ -1623,7 +1713,7 @@ def attention(
     warmup=False,
     **compiler_options,
 ):
-    """Run the separate eight-wave attention kernel.
+    """Run adaptive or fixed-reference FlashAttention.
 
     The default adaptive reference is numerically stable for unrestricted
     inputs.  ``qk_max_abs`` explicitly selects the bounded specialization.
@@ -1646,12 +1736,12 @@ def attention(
 
     args = (q, k, v, output)
     if warmup:
-        return _attn_fwd_wave_pipeline.warmup(
+        return _attn_fwd_adaptive_pipeline.warmup(
             *args,
             grid=grid,
             **launch_options,
         )
-    _attn_fwd_wave_pipeline[grid](*args, **launch_options)
+    _attn_fwd_adaptive_pipeline[grid](*args, **launch_options)
     return output
 
 

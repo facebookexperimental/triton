@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
-"""Correctness and performance driver for the separate eight-wave FA kernel."""
+"""Correctness and performance driver for adaptive FlashAttention.
+
+With no bound, the driver runs bounded random data plus sparse- and
+forced-rebase stress distributions through the adaptive-reference variant.
+``--qk-max-abs`` selects the fixed-reference specialization and runs only data
+that satisfies the asserted magnitude bound.  See ``amd_fa_adaptive.py`` for
+the equations and selection guidance.
+"""
 
 import argparse
 import math
@@ -9,17 +16,17 @@ import torch.nn.functional as F
 
 import triton
 
-import amd_fa_wave
+import amd_fa_adaptive
 
 ADVERTISED_SHAPE = (2, 64, 8192, 128)
-QUERY_TILE_SIZE = amd_fa_wave.BLOCK_M.value
-KV_TILE_SIZE = amd_fa_wave.BLOCK_N.value
-XCD_COUNT = amd_fa_wave.XCDS.value
-WAVES_PER_PROGRAM = 8
-ROWS_PER_WAVE = QUERY_TILE_SIZE // WAVES_PER_PROGRAM
+QUERY_TILE_SIZE = amd_fa_adaptive.BLOCK_M.value
+KV_TILE_SIZE = amd_fa_adaptive.BLOCK_N.value
+XCD_COUNT = amd_fa_adaptive.XCDS.value
+WARPS_PER_PROGRAM = 8
+ROWS_PER_WARP = QUERY_TILE_SIZE // WARPS_PER_PROGRAM
 FORCED_REBASE_K_STEP = 64.0
-FORCED_REBASE_LOG2_HEADROOM = amd_fa_wave.SOFTMAX_REFERENCE_HEADROOM_LOG2.value
-WAVE_PERFORMANCE_FLOOR_TFLOPS = 1000.0
+FORCED_REBASE_LOG2_HEADROOM = amd_fa_adaptive.SOFTMAX_REFERENCE_HEADROOM_LOG2.value
+ADAPTIVE_PERFORMANCE_FLOOR_TFLOPS = 1000.0
 
 
 def nonnegative_int(text):
@@ -85,19 +92,19 @@ def forced_rebase_inputs(shape, device, *, seed):
 
 
 def sparse_rebase_inputs(shape, device, *, seed):
-    """Force one row per wave to rebase on every K/V tile."""
+    """Force one logical row per warp to rebase on every K/V tile."""
     q, k, v, rebase_count, minimum_advance = forced_rebase_inputs(
         shape,
         device,
         seed=seed,
     )
     q.zero_()
-    q[..., ::ROWS_PER_WAVE, 0] = 1.0
+    q[..., ::ROWS_PER_WARP, 0] = 1.0
     return q, k, v, rebase_count, minimum_advance
 
 
 def check_correctness(q, k, v, *, qk_max_abs, case):
-    output = amd_fa_wave.attention(q, k, v, qk_max_abs=qk_max_abs)
+    output = amd_fa_adaptive.attention(q, k, v, qk_max_abs=qk_max_abs)
     with torch.nn.attention.sdpa_kernel(torch.nn.attention.SDPBackend.FLASH_ATTENTION):
         reference = F.scaled_dot_product_attention(
             q,
@@ -123,8 +130,8 @@ def check_correctness(q, k, v, *, qk_max_abs, case):
 def measure_performance(q, k, v, *, warmup, rep, qk_max_abs):
     batch, heads, sequence, head_dim = ADVERTISED_SHAPE
     output = torch.empty_like(q)
-    amd_fa_wave.attention(q, k, v, qk_max_abs=qk_max_abs, out=output, warmup=True)
-    launch = lambda: amd_fa_wave.attention(q, k, v, qk_max_abs=qk_max_abs, out=output)
+    amd_fa_adaptive.attention(q, k, v, qk_max_abs=qk_max_abs, out=output, warmup=True)
+    launch = lambda: amd_fa_adaptive.attention(q, k, v, qk_max_abs=qk_max_abs, out=output)
     launch()
     torch.cuda.synchronize()
     milliseconds = triton.testing.do_bench(
@@ -138,13 +145,13 @@ def measure_performance(q, k, v, *, warmup, rep, qk_max_abs):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(prog="AMD TLX eight-wave FA")
+    parser = argparse.ArgumentParser(prog="AMD TLX adaptive FlashAttention")
     parser.add_argument("--warmup", type=nonnegative_int, default=50)
     parser.add_argument("--rep", type=positive_int, default=500)
     parser.add_argument(
         "--min-tflops",
         type=float,
-        help="required performance; defaults to 1000 for TLX Wave and 0 for LLVM",
+        help="required performance in TFLOPS; defaults to 1000 for adaptive reference tracking and 0 for bounded",
     )
     parser.add_argument(
         "--qk-max-abs",
@@ -161,17 +168,17 @@ def parse_args():
 def main():
     args = parse_args()
     device = triton.runtime.driver.active.get_active_torch_device()
-    backend = triton.runtime.driver.active.get_current_target().backend
     minimum = args.min_tflops
     if minimum is None:
-        minimum = WAVE_PERFORMANCE_FLOOR_TFLOPS if backend == "tlx_wave" else 0.0
+        minimum = ADAPTIVE_PERFORMANCE_FLOOR_TFLOPS if args.qk_max_abs is None else 0.0
 
     mode = "adaptive" if args.qk_max_abs is None else f"bounded (|Q|, |K| <= {args.qk_max_abs:g})"
     batch, heads, sequence, _ = ADVERTISED_SHAPE
     program_count = batch * heads * (sequence // QUERY_TILE_SIZE)
     if program_count != 4096 or program_count % XCD_COUNT != 0:
         raise RuntimeError("advertised FA shape must exercise all 4096 programs across the eight-XCD swizzle")
-    print(f"Eight-wave {mode} FlashAttention ({backend}, programs={program_count}, XCDs={XCD_COUNT})")
+    backend = triton.runtime.driver.active.get_current_target().backend
+    print(f"Adaptive FA {mode} ({backend}, programs={program_count}, XCDs={XCD_COUNT})")
     correctness_ok = True
     performance_ok = True
     performance_cases = ["bounded", "sparse", "forced"] if args.qk_max_abs is None else ["bounded"]
@@ -181,7 +188,7 @@ def main():
             case = f"forced-rebase count={rebase_count} min-log2-advance={minimum_advance:.6f}"
         elif input_case == "sparse":
             q, k, v, rebase_count, minimum_advance = sparse_rebase_inputs(ADVERTISED_SHAPE, device, seed=17)
-            case = (f"sparse-rebase rows=1/{ROWS_PER_WAVE} count={rebase_count} "
+            case = (f"sparse-rebase rows=1/{ROWS_PER_WARP} count={rebase_count} "
                     f"min-log2-advance={minimum_advance:.6f}")
         else:
             q, k, v = bounded_inputs(ADVERTISED_SHAPE, device, seed=0)
