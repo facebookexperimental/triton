@@ -176,6 +176,20 @@ public:
     }
     dumpAfter(moduleOp, "doTaskIdPropagate");
 
+    bool hasAssignedTask = false;
+    funcOp->walk([&](Operation *op) {
+      if (op->hasAttr(kAsyncTaskIdAttrName) ||
+          op->hasAttr(triton::gpu::kPartitionAttrName)) {
+        hasAssignedTask = true;
+        return WalkResult::interrupt();
+      }
+      return WalkResult::advance();
+    });
+    if (!hasAssignedTask) {
+      LDBG("Warp specialization has no assigned tasks. Skipping.");
+      return bailOut(funcOp);
+    }
+
     // Cross-partition run-once, loop-carried "claim the next tile" support for
     // dynamic-persistent kernels. Handles both the `tt.atomic_rmw` tile counter
     // and the CLC tile-scheduler fetch (`ttng.clc_read`) with the same idea:
