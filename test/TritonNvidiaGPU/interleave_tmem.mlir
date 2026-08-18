@@ -1,4 +1,5 @@
-// RUN: triton-opt %s --triton-nvidia-interleave-tmem --allow-unregistered-dialect | FileCheck %s
+// RUN: triton-opt %s -split-input-file --triton-nvidia-interleave-tmem --allow-unregistered-dialect | FileCheck %s
+// RUN: env TRITON_DISABLE_WSBARRIER_REORDER=1 triton-opt %s -split-input-file --triton-nvidia-interleave-tmem --allow-unregistered-dialect | FileCheck %s --check-prefix=TARGETED
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [4, 2], order = [1, 0]}>
 #linear64 = #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], warp = [[32, 0], [64, 0], [0, 32]], block = []}>
@@ -358,9 +359,9 @@ tt.func @plain_tma_store_token_wait_does_not_block_tmem_load(
   %s1 = ttng.tmem_subslice %alloc {N = 64 : i32} : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x64xf32, #tmem, #ttng.tensor_memory, mutable, 128x128>
   %v1 = ttng.tmem_load %s1 : !ttg.memdesc<128x64xf32, #tmem, #ttng.tensor_memory, mutable, 128x128> -> tensor<128x64xf32, #linear64>
   // CHECK:      ttng.async_tma_copy_local_to_global
-  // CHECK-NEXT: ttng.async_tma_store_token_wait
   // CHECK-NEXT: arith.truncf
   // CHECK-NEXT: ttng.tmem_load
+  // CHECK-NEXT: ttng.async_tma_store_token_wait
   // CHECK-NEXT: ttg.local_store
   // CHECK-NEXT: arith.truncf
   // CHECK-NEXT: ttg.local_store
@@ -486,6 +487,7 @@ tt.func @tmem_load_does_not_sink_with_later_wait_region(
 // All split tmem_loads should inherit the channelGraph from their arrive
 // barrier and sink past store-channel barriers independently.
 // CHECK-LABEL: @split_tmem_loads_all_sink
+// TARGETED-LABEL: @split_tmem_loads_all_sink
 tt.func @split_tmem_loads_all_sink(
     %tmem_wait_bar: !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>,
     %store_bar0: !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>,
@@ -528,6 +530,14 @@ tt.func @split_tmem_loads_all_sink(
   // CHECK-NEXT: arith.truncf
   // CHECK-NEXT: ttg.local_store
   // CHECK-NEXT: ttng.arrive_barrier {{.*}}channelGraph = array<i32: 2>
+  // With global barrier normalization disabled, the load chain still carries
+  // its own arrive across the independent store-channel wait. This covers the
+  // targeted epilogue path used by FA backward.
+  // TARGETED:      ttng.tmem_load
+  // TARGETED-NEXT: ttng.wait_barrier {{.*}}channelGraph = array<i32: 2>
+  // TARGETED-NEXT: arith.truncf
+  // TARGETED-NEXT: ttng.tmem_load
+  // TARGETED-NEXT: ttng.arrive_barrier {{.*}}channelGraph = array<i32: 1, 3>
   tt.return
 }
 
@@ -583,6 +593,90 @@ tt.func @restore_ws_arrive_stops_at_named_barrier(
   ttng.wait_barrier_named %c9, %c128 : i32, i32
   ttng.arrive_barrier %bar, 1 {constraints = {WSBarrier = {channelGraph = array<i32: 4>}}} : !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>
   tt.return %out0, %out1 : tensor<128x64xf32, #linear64>, tensor<128x64xf32, #linear64>
+}
+
+// Materialize a wide TMEM operand before the independent SMEM operand that
+// feeds the same elementwise operation. This keeps the SMEM broadcast from
+// spanning the TMEM load while preserving the channel waits and releases.
+// CHECK-LABEL: @prioritize_tmem_operand
+// CHECK:      ttng.wait_barrier %[[TMEM_FULL:.*]], %{{.*}}
+// CHECK-NEXT: %[[TV:.*]] = ttng.tmem_load
+// CHECK-NEXT: ttng.arrive_barrier %[[TMEM_EMPTY:.*]], 1
+// CHECK-NEXT: %[[TC:.*]] = ttg.convert_layout %[[TV]]
+// CHECK-NEXT: ttng.wait_barrier %[[LOCAL_FULL:.*]], %{{.*}}
+// CHECK-NEXT: %[[LV:.*]] = ttg.local_load
+// CHECK-NEXT: ttng.arrive_barrier %[[LOCAL_EMPTY:.*]], 1
+// CHECK-NEXT: %[[LE:.*]] = arith.extf %[[LV]]
+// CHECK-NEXT: %[[SUM:.*]] = arith.addf %[[TC]], %[[LE]]
+tt.func @prioritize_tmem_operand(
+    %smem: !ttg.memdesc<128x64xf16, #shared, #smem, mutable>,
+    %tmem: !ttg.memdesc<128x64xf32, #tmem, #ttng.tensor_memory, mutable, 128x128>,
+    %local_full: !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>,
+    %local_empty: !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>,
+    %tmem_full: !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>,
+    %tmem_empty: !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>)
+    -> tensor<128x64xf32, #blocked> {
+  %phase = arith.constant 0 : i32
+  ttng.wait_barrier %local_full, %phase {constraints = {WSBarrier = {channelGraph = array<i32: 1, 2>, parentId = 1 : i32, minRegionId = 1 : i32, maxRegionId = 1 : i32}}} : !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>
+  %local = ttg.local_load %smem : !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> tensor<128x64xf16, #blocked>
+  ttng.arrive_barrier %local_empty, 1 {constraints = {WSBarrier = {channelGraph = array<i32: 1, 2>, parentId = 1 : i32, minRegionId = 2 : i32, maxRegionId = 2 : i32}}} : !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>
+  %local_f32 = arith.extf %local : tensor<128x64xf16, #blocked> to tensor<128x64xf32, #blocked>
+  ttng.wait_barrier %tmem_full, %phase {constraints = {WSBarrier = {channelGraph = array<i32: 1, 2>, parentId = 1 : i32, minRegionId = 1 : i32, maxRegionId = 1 : i32}}} : !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>
+  %tmem_value = ttng.tmem_load %tmem : !ttg.memdesc<128x64xf32, #tmem, #ttng.tensor_memory, mutable, 128x128> -> tensor<128x64xf32, #linear64>
+  ttng.arrive_barrier %tmem_empty, 1 {constraints = {WSBarrier = {channelGraph = array<i32: 1, 2>, parentId = 1 : i32, minRegionId = 2 : i32, maxRegionId = 2 : i32}}} : !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>
+  %tmem_blocked = ttg.convert_layout %tmem_value : tensor<128x64xf32, #linear64> -> tensor<128x64xf32, #blocked>
+  %sum = arith.addf %tmem_blocked, %local_f32 : tensor<128x64xf32, #blocked>
+  tt.return %sum : tensor<128x64xf32, #blocked>
+}
+
+}
+
+// -----
+
+// The temporal-reuse EMPTY-acquire repair is 2-CTA only: the acquire is placed
+// relative to the hardware 2-CTA issue handshake, so this module carries the
+// cluster dimensions that select that path.
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#barrier_shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+#tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 64, colStride = 1>
+
+module attributes {"ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.target = "cuda:100"} {
+
+// A whole-allocation MMA overwrite must also acquire an EMPTY barrier from a
+// narrower temporal-reuse sibling at the same TMEM offset. The acquire uses
+// the sibling's ring phase, cloned before the overwrite.
+// CHECK-LABEL: @acquire_narrow_tmem_reuse_before_whole_overwrite
+// CHECK:      ttng.wait_barrier %[[QBAR:.*]], %[[QPHASE:.*]] {{.*}}constraints
+// CHECK-NEXT: %[[SIBLING_I1:.*]] = arith.xori %{{.*}}, %{{.*}}
+// CHECK-NEXT: %[[SIBLING_PHASE:.*]] = arith.extui %[[SIBLING_I1]]
+// CHECK-NEXT: ttng.wait_barrier %[[DBAR:.*]], %[[SIBLING_PHASE]]
+// CHECK-NEXT: ttng.arrive_barrier %[[ISSUE:.*]], 1
+// CHECK-NEXT: ttng.wait_barrier %[[ISSUE]], %[[QPHASE]]
+// CHECK-NEXT: ttng.tc_gen5_mma
+tt.func @acquire_narrow_tmem_reuse_before_whole_overwrite(
+    %a: !ttg.memdesc<128x128xf16, #shared, #smem, mutable>,
+    %b_wide: !ttg.memdesc<128x128xf16, #shared, #smem, mutable>,
+    %b_narrow: !ttg.memdesc<128x64xf16, #shared, #smem, mutable>,
+    %acc: !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>,
+    %qbar: !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>,
+    %dbar: !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>,
+    %issue: !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>,
+    %ring: i1) {
+  %true = arith.constant true
+  %false = arith.constant false
+  %qphase = arith.extui %ring : i1 to i32
+  ttng.wait_barrier %qbar, %qphase {constraints = {WSBarrier = {channelGraph = array<i32: 0>, dstTask = 0 : i32}}} : !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable> loc("qk")
+  ttng.arrive_barrier %issue, 1 : !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>
+  ttng.wait_barrier %issue, %qphase : !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>
+  ttng.tc_gen5_mma %a, %b_wide, %acc, %false, %true {is_async} : !ttg.memdesc<128x128xf16, #shared, #smem, mutable>, !ttg.memdesc<128x128xf16, #shared, #smem, mutable>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> loc("qk")
+
+  %narrow = ttng.tmem_subslice %acc {N = 0 : i32} : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x64xf32, #tmem, #ttng.tensor_memory, mutable, 128x128>
+  %sibling_i1 = arith.xori %ring, %true : i1
+  %sibling_phase = arith.extui %sibling_i1 : i1 to i32
+  ttng.wait_barrier %dbar, %sibling_phase {constraints = {WSBarrier = {channelGraph = array<i32: 1>, dstTask = 1 : i32}}} : !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable> loc("dq")
+  ttng.tc_gen5_mma %a, %b_narrow, %narrow, %false, %true {is_async} : !ttg.memdesc<128x128xf16, #shared, #smem, mutable>, !ttg.memdesc<128x64xf16, #shared, #smem, mutable>, !ttg.memdesc<128x64xf32, #tmem, #ttng.tensor_memory, mutable, 128x128> loc("dq")
+  tt.return
 }
 
 }

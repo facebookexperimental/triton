@@ -1,11 +1,17 @@
 import copy
 import json
+import os
+
 import pytest
 import torch
 
 import triton
 import triton.language as tl
-from triton.language.extra.cuda.inline_ptx_lib import _mul_f32x2, _fma_f32x2, _reduce_fadd2
+from triton.language.extra.cuda.inline_ptx_lib import (
+    _fma_f32x2,
+    _mul_f32x2,
+    _sub_f32x2,
+)
 from triton.language.extra.subtile_ops import _split_n_2D
 from triton.tools.tensor_descriptor import TensorDescriptor
 
@@ -31,6 +37,27 @@ def is_blackwell():
 
 def is_hopper():
     return is_cuda() and torch.cuda.get_device_capability()[0] == 9
+
+
+@triton.jit
+def _reduce_or(x, y):
+    return x | y
+
+
+@triton.jit
+def _rescale_accumulator(acc, alpha, SUBTILING: tl.constexpr, VECT_MUL: tl.constexpr):
+    BM: tl.constexpr = acc.shape[0]
+    BN: tl.constexpr = acc.shape[1]
+    if SUBTILING:
+        acc0, acc1 = acc.reshape([BM, 2, BN // 2]).permute(0, 2, 1).split()
+        if VECT_MUL == 1 or VECT_MUL == 3:
+            acc0 = _mul_f32x2(acc0, alpha[:, None])
+            acc1 = _mul_f32x2(acc1, alpha[:, None])
+        else:
+            acc0 = acc0 * alpha[:, None]
+            acc1 = acc1 * alpha[:, None]
+        return tl.join(acc0, acc1).permute(0, 2, 1).reshape([BM, BN])
+    return acc * alpha[:, None]
 
 
 @triton.jit
@@ -69,67 +96,135 @@ def _attn_fwd_subtile(
     offs_n,
     qk_scale,
     l_i0,
-    l_i1,  # used when FADD2_REDUCE is true
+    l_i1,  # retained for the shared forward-loop interface
     m_i,
     acc,
-    v,
+    v0,
+    v1,
     dtype: tl.constexpr,
     STAGE: tl.constexpr,
     SUBTILING: tl.constexpr,
     VECT_MUL: tl.constexpr,
     FADD2_REDUCE: tl.constexpr,
+    MMA_SLICES: tl.constexpr,
+    TWO_CTAS: tl.constexpr,
+    INNER_WARP_SPECIALIZE: tl.constexpr,
+    RESCALE_OPT: tl.constexpr,
 ):
-    qk = tl.dot(q, k)
+    qk = tl.dot(
+        q,
+        k,
+        attrs=({
+            "channels": [
+                "opndA,smem,1,2",
+                "opndD,tmem,1,0",
+            ],
+            "two_cta_interleave_role": "qk" if TWO_CTAS else None,
+            "two_cta_tma_direct_wait": TWO_CTAS,
+            "two_cta_fuse_final_stats": TWO_CTAS,
+            "two_cta_fuse_acc_slices": TWO_CTAS,
+        } if MMA_SLICES == 2 else None),
+        two_ctas=TWO_CTAS,
+    )
 
     if STAGE == 3 and start_n >= start_m * BLOCK_M:
         col_limit_right = (offs_m - start_n + 1)[:, None]
         qk = _apply_causal_mask(qk, col_limit_right, BLOCK_N)
 
-    m_ij = tl.maximum(m_i, tl.max(qk, 1) * qk_scale)
-
-    if VECT_MUL == 2 or VECT_MUL == 3:
-        qk = _fma_f32x2(qk, qk_scale, -m_ij[:, None])
+    if RESCALE_OPT:
+        m_ij = tl.maximum(m_i, tl.max(qk, 1))
+        alpha_ = (m_i - m_ij) * qk_scale
+        alpha = tl.math.exp2(alpha_)
+        rescale_mask = alpha_ >= -8.0
+        alpha = tl.where(rescale_mask, 1.0, alpha)
+        m_ij = tl.where(rescale_mask, m_i, m_ij)
+        m_scaled = m_ij * qk_scale
+        if VECT_MUL == 2 or VECT_MUL == 3:
+            qk = _fma_f32x2(qk, qk_scale, -m_scaled[:, None])
+        else:
+            qk = qk * qk_scale - m_scaled[:, None]
     else:
-        qk = qk * qk_scale - m_ij[:, None]
+        m_ij = tl.maximum(m_i, tl.max(qk, 1) * qk_scale)
+        if VECT_MUL == 2 or VECT_MUL == 3:
+            qk = _fma_f32x2(qk, qk_scale, -m_ij[:, None])
+        else:
+            qk = qk * qk_scale - m_ij[:, None]
+        alpha = tl.math.exp2(m_i - m_ij)
 
-    p = tl.math.exp2(qk)
-    # -- compute correction factor
-    alpha = tl.math.exp2(m_i - m_ij)
-    if not FADD2_REDUCE:
+    if FADD2_REDUCE:
+        tl.static_assert(MMA_SLICES == 2)
+        # Compute P at the same 64-column granularity consumed by the two PV
+        # MMAs, and combine the independent row sums afterwards.
+        qks = _split_n_2D(qk, MMA_SLICES)
+        p0 = tl.math.exp2(qks[0])
+        p0_dot = p0.to(dtype)
+        l_ij0 = tl.sum(p0, 1)
+        p1 = tl.math.exp2(qks[1])
+        p1_dot = p1.to(dtype)
+        l_ij1 = tl.sum(p1, 1)
+        l_ij = l_ij0 + l_ij1
+    else:
+        p = tl.math.exp2(qk)
         l_ij = tl.sum(p, 1)
 
     # -- update output accumulator --
-    BM: tl.constexpr = acc.shape[0]
-    BN: tl.constexpr = acc.shape[1]
-
-    if SUBTILING:
-        acc0, acc1 = acc.reshape([BM, 2, BN // 2]).permute(0, 2, 1).split()
-        if VECT_MUL == 1 or VECT_MUL == 3:
-            acc0 = _mul_f32x2(acc0, alpha[:, None])
-            acc1 = _mul_f32x2(acc1, alpha[:, None])
-        else:
-            acc0 = acc0 * alpha[:, None]
-            acc1 = acc1 * alpha[:, None]
-        acc = tl.join(acc0, acc1).permute(0, 2, 1).reshape([BM, BN])
+    if RESCALE_OPT:
+        # Derive the correction vote from the finalized alpha tile.  The
+        # correction task already consumes alpha for the accumulator multiply,
+        # so this lets AutoWS compute the vote beside that load instead of
+        # materializing a second cross-partition needs_rescale channel.
+        needs_rescale = alpha < 1.0
+        should_rescale = tl.reshape(tl.reduce(needs_rescale, axis=0, combine_fn=_reduce_or), ())
+        scaled_acc = _rescale_accumulator(acc, alpha, SUBTILING, VECT_MUL)
+        # Keep this as an eager SSA select until the accumulator is placed in
+        # TMEM. HoistTMEMAlloc first folds it into a predicated TMEM store;
+        # after AutoWS has materialized each data-partition task, the
+        # post-pipeline invocation turns that store into a side-effecting
+        # conditional load/rescale/store.
+        acc = tl.where(should_rescale, scaled_acc, acc)
     else:
-        acc = acc * alpha[:, None]
-
-    PM: tl.constexpr = p.shape[0]
-    PN: tl.constexpr = p.shape[1]
-    if FADD2_REDUCE:
-        p0, p1 = p.reshape([PM, 2, PN // 2]).permute(0, 2, 1).split()
-        l_ij0, l_ij1 = tl.reduce((p0, p1), axis=1, combine_fn=_reduce_fadd2)
-        l_i0 = l_i0 * alpha + l_ij0
-        l_i1 = l_i1 * alpha + l_ij1
+        acc = _rescale_accumulator(acc, alpha, SUBTILING, VECT_MUL)
 
     # prepare p and v for the dot
-    p = p.to(dtype)
     # note that this non transposed v for FP8 is only supported on Blackwell
-    acc = tl.dot(p, v, acc)
+    if MMA_SLICES == 1:
+        p = p.to(dtype)
+        acc = tl.dot(p, v0, acc, two_ctas=TWO_CTAS)
+    else:
+        if FADD2_REDUCE:
+            ps = (p0_dot, p1_dot)
+        else:
+            p = p.to(dtype)
+            ps = _split_n_2D(p, MMA_SLICES)
+        acc = tl.dot(
+            ps[0],
+            v0,
+            acc,
+            attrs={
+                "two_cta_interleave_role": "pv" if TWO_CTAS else None,
+                "channels": ["opndA,tmem,1,0,0"],
+            },
+            two_ctas=TWO_CTAS,
+        )
+        acc = tl.dot(
+            ps[1],
+            v1,
+            acc,
+            attrs={
+                "two_cta_interleave_role": "pv" if TWO_CTAS else None,
+                "channels": ["opndA,tmem,1,0,64"],
+                # Inner-warp-specialized (non-persistent) schedules keep both
+                # slices adjacent in one partition, so the first rendezvous
+                # covers the second.  Persistent schedules pipeline the
+                # shared V allocation across iterations and need the second
+                # rendezvous before that slot can rotate.
+                "two_cta_sync_covered_by_prior": TWO_CTAS and INNER_WARP_SPECIALIZE,
+            },
+            two_ctas=TWO_CTAS,
+        )
     # update m_i and l_i
     # place this at the end of the loop to reduce register pressure
-    if not FADD2_REDUCE:
-        l_i0 = l_i0 * alpha + l_ij
+    l_i0 = l_i0 * alpha + l_ij
     m_i = m_ij
 
     return l_i0, l_i1, m_i, acc
@@ -159,7 +254,11 @@ def _attn_fwd_inner_oss_dp(
     SUBTILING: tl.constexpr,
     VECT_MUL: tl.constexpr,
     FADD2_REDUCE: tl.constexpr,
+    MMA_SLICES: tl.constexpr,
+    KV_NUM_STAGES: tl.constexpr,
     DP_FACTOR: tl.constexpr,
+    TWO_CTAS: tl.constexpr,
+    RESCALE_OPT: tl.constexpr,
 ):
     # range of values handled by this stage
     if STAGE == 1:  # causal = False
@@ -176,13 +275,20 @@ def _attn_fwd_inner_oss_dp(
             warp_specialize=warp_specialize,
             merge_epilogue=True,
             separate_epilogue_store=True,
-            # disallow_acc_multi_buffer=True,
+            assume_nonempty=TWO_CTAS,
+            disallow_acc_multi_buffer=TWO_CTAS,
             data_partition_factor=DP_FACTOR,
+            num_stages=KV_NUM_STAGES if TWO_CTAS else None,
     ):
         start_n = tl.multiple_of(start_n, BLOCK_N)
 
         k = desc_k.load([offsetkv_y, 0]).T
         v = desc_v.load([offsetkv_y, 0])
+        if MMA_SLICES == 2:
+            v0, v1 = v.reshape([2, BLOCK_N // 2, HEAD_DIM]).permute(1, 2, 0).split()
+        else:
+            v0 = v
+            v1 = v
 
         l_i0, l_i0_1, m_i0, acc0 = _attn_fwd_subtile(
             q0,
@@ -198,12 +304,17 @@ def _attn_fwd_inner_oss_dp(
             l_i0_1,
             m_i0,
             acc0,
-            v,
+            v0,
+            v1,
             dtype,
             STAGE,
             SUBTILING,
             VECT_MUL,
             FADD2_REDUCE,
+            MMA_SLICES,
+            TWO_CTAS,
+            warp_specialize,
+            RESCALE_OPT,
         )
 
         offsetkv_y += BLOCK_N
@@ -215,6 +326,9 @@ def _host_descriptor_pre_hook(nargs):
     BLOCK_M = nargs["BLOCK_M"]
     BLOCK_N = nargs["BLOCK_N"]
     HEAD_DIM = nargs["HEAD_DIM"]
+    NUM_CTAS = nargs.get("NUM_CTAS", 1)
+    if NUM_CTAS == 2 and nargs["N_CTX"] % (NUM_CTAS * BLOCK_M) != 0:
+        raise ValueError("2-CTA forward requires N_CTX divisible by 2 * BLOCK_M")
     if not isinstance(nargs["desc_q"], TensorDescriptor):
         return
     nargs["desc_q"].block_shape = [BLOCK_M, HEAD_DIM]  # due to data partitioning
@@ -232,6 +346,17 @@ elif supports_host_descriptor():
     NUM_STAGES_OPTIONS = [3]
 else:
     NUM_STAGES_OPTIONS = [3]
+_FWD_USE_CLC = os.environ.get("AUTOWS_FWD_CLC", "0") == "1"
+_FWD_RESCALE_OPT = os.environ.get("AUTOWS_FWD_RESCALE_OPT", "1") == "1"
+_FWD_CLC_SAFE_STAGES = "2" if _FWD_USE_CLC else "4"
+FWD_2CTA_NUM_STAGES = int(os.environ.get("AUTOWS_FWD_NUM_STAGES", _FWD_CLC_SAFE_STAGES))
+FWD_2CTA_BLOCK_M = int(os.environ.get("AUTOWS_FWD_BLOCK_M", "256"))
+FWD_2CTA_DP_FACTOR = int(os.environ.get("AUTOWS_FWD_DP_FACTOR", "2"))
+FWD_2CTA_MMA_SLICES = int(os.environ.get("AUTOWS_FWD_MMA_SLICES", "2"))
+FWD_2CTA_KV_NUM_STAGES = int(os.environ.get("AUTOWS_FWD_KV_NUM_STAGES", _FWD_CLC_SAFE_STAGES))
+FWD_2CTA_OUTER_NUM_STAGES = int(os.environ.get("AUTOWS_FWD_OUTER_NUM_STAGES", "1"))
+_FWD_2CTA_SMEM_BUDGET = os.environ.get("AUTOWS_FWD_SMEM_BUDGET")
+FWD_2CTA_SMEM_BUDGET = int(_FWD_2CTA_SMEM_BUDGET) if _FWD_2CTA_SMEM_BUDGET is not None else None
 
 configs = [
     triton.Config(
@@ -239,12 +364,52 @@ configs = [
             "BLOCK_M": BM,
             "BLOCK_N": BN,
             "DP_FACTOR": 2,
+            "NUM_CTAS": 1,
+            "MMA_SLICES": 1,
+            "KV_NUM_STAGES": s,
+            "OUTER_NUM_STAGES": s,
+            "RESCALE_OPT": _FWD_RESCALE_OPT,
         },
         num_stages=s,
         num_warps=w,
         pre_hook=_host_descriptor_pre_hook,
     ) for BM in [256] for BN in [128] for s in NUM_STAGES_OPTIONS for w in [4]
+] + [
+    triton.Config(
+        {
+            "BLOCK_M": FWD_2CTA_BLOCK_M,
+            "BLOCK_N": 128,
+            "DP_FACTOR": FWD_2CTA_DP_FACTOR,
+            "NUM_CTAS": 2,
+            "MMA_SLICES": FWD_2CTA_MMA_SLICES,
+            "KV_NUM_STAGES": FWD_2CTA_KV_NUM_STAGES,
+            "OUTER_NUM_STAGES": FWD_2CTA_OUTER_NUM_STAGES,
+            "SMEM_BUDGET": FWD_2CTA_SMEM_BUDGET,
+            "RESCALE_OPT": _FWD_RESCALE_OPT,
+        },
+        num_stages=FWD_2CTA_NUM_STAGES,
+        num_warps=4,
+        minRegAutoWS=24,
+        maxRegAutoWS=168,
+        pre_hook=_host_descriptor_pre_hook,
+        ctas_per_cga=(2, 1, 1),
+        allowDependentTwoCTA=True,
+    )
 ]
+
+_fwd_num_ctas = os.environ.get("AUTOWS_FWD_NUM_CTAS")
+if _fwd_num_ctas is not None:
+    configs = [config for config in configs if config.kwargs.get("NUM_CTAS", 1) == int(_fwd_num_ctas)]
+configs_fwd = configs
+# Keep the clustered forward path opt-in.  The production 2-CTA schedule uses
+# the persistent CLC wrapper, while the generic entry points below also cover
+# non-persistent and static-persistent schedules.  Letting their unpinned
+# autotuner select the clustered config can exercise a different rotating-V
+# lifetime and corrupt long sequences.  Explicit tests still pin the 2-CTA
+# config from configs_fwd, and AUTOWS_FWD_NUM_CTAS=2 selects it unchanged for
+# the production/performance path.
+configs_fwd_autotune = (configs_fwd if _fwd_num_ctas is not None else
+                        [config for config in configs_fwd if config.kwargs.get("NUM_CTAS", 1) == 1])
 
 
 def keep(conf):
@@ -256,9 +421,17 @@ def keep(conf):
 
 def prune_invalid_configs(configs, named_args, **kwargs):
     N_CTX = kwargs["N_CTX"]
+    STAGE = kwargs["STAGE"]
+    FP8_OUTPUT = kwargs["FP8_OUTPUT"]
 
-    # Filter out configs where BLOCK_M > N_CTX
-    return [conf for conf in configs if conf.kwargs.get("BLOCK_M", 0) <= N_CTX]
+    # The current 2-CTA mapping gives adjacent CTAs adjacent M tiles. Keep the
+    # pair on the same head and in identical control flow; causal and FP8 paths
+    # need dedicated clustered mappings and remain 1-CTA for now.
+    return [
+        conf for conf in configs if conf.kwargs.get("BLOCK_M", 0) <= N_CTX and (
+            conf.kwargs.get("NUM_CTAS", 1) == 1 or (STAGE == 1 and not FP8_OUTPUT and N_CTX %
+                                                    (2 * conf.kwargs["BLOCK_M"]) == 0))
+    ]
 
 
 @triton.jit
@@ -292,7 +465,11 @@ def _attn_fwd_tma_dp(
     SUBTILING: tl.constexpr,
     VECT_MUL: tl.constexpr,
     FADD2_REDUCE: tl.constexpr,
+    MMA_SLICES: tl.constexpr,
+    KV_NUM_STAGES: tl.constexpr,
     DP_FACTOR: tl.constexpr,
+    NUM_CTAS: tl.constexpr,
+    RESCALE_OPT: tl.constexpr,
 ):
     start_m = pid  # tl.program_id(0)
     # off_hz = tl.program_id(1)
@@ -314,10 +491,7 @@ def _attn_fwd_tma_dp(
 
     q0 = desc_q.load([qo_offset_y, 0])
 
-    if FADD2_REDUCE:
-        l_i0_1 = tl.zeros([BLOCK_M // 2], dtype=tl.float32)
-    else:
-        l_i0_1 = 0
+    l_i0_1 = 0
 
     acc0, l_i0_0, l_i0_1, m_i0 = _attn_fwd_inner_oss_dp(
         acc0,
@@ -342,23 +516,37 @@ def _attn_fwd_tma_dp(
         SUBTILING,
         VECT_MUL,
         FADD2_REDUCE,
+        MMA_SLICES,
+        KV_NUM_STAGES,
         DP_FACTOR,
+        NUM_CTAS == 2,
+        RESCALE_OPT,
     )
 
-    if FADD2_REDUCE:
-        l_i0 = l_i0_0 + l_i0_1
-    else:
-        l_i0 = l_i0_0
+    l_i0 = l_i0_0
 
+    if RESCALE_OPT:
+        m_i0 *= qk_scale
     m_i0 += tl.math.log2(l_i0)
-    acc0 = acc0 / l_i0[:, None]
+    if NUM_CTAS == 2:
+        # Match the TLX epilogue's packed-f32 normalization. Keeping adjacent
+        # output columns paired avoids scalarizing the large accumulator tile.
+        BM: tl.constexpr = acc0.shape[0]
+        BN: tl.constexpr = acc0.shape[1]
+        scale = 1.0 / l_i0
+        acc0_0, acc0_1 = acc0.reshape([BM, 2, BN // 2]).permute(0, 2, 1).split()
+        acc0_0 = _mul_f32x2(acc0_0, scale[:, None])
+        acc0_1 = _mul_f32x2(acc0_1, scale[:, None])
+        acc0 = tl.join(acc0_0, acc0_1).permute(0, 2, 1).reshape([BM, BN])
+    else:
+        acc0 = acc0 / l_i0[:, None]
     m_ptrs0 = M + off_hz * N_CTX + offs_m0
     tl.store(m_ptrs0, m_i0)
     desc_o.store([qo_offset_y, 0], acc0.to(dtype))
 
 
 @triton.autotune(
-    configs=list(filter(keep, configs)),
+    configs=list(filter(keep, configs_fwd_autotune)),
     key=["N_CTX", "HEAD_DIM", "FP8_OUTPUT", "warp_specialize"],
     prune_configs_by={"early_config_prune": prune_invalid_configs},
 )
@@ -383,7 +571,13 @@ def _attn_fwd(
     SUBTILING: tl.constexpr,
     VECT_MUL: tl.constexpr,
     FADD2_REDUCE: tl.constexpr,
+    MMA_SLICES: tl.constexpr,
+    KV_NUM_STAGES: tl.constexpr,
+    OUTER_NUM_STAGES: tl.constexpr,
     DP_FACTOR: tl.constexpr,
+    NUM_CTAS: tl.constexpr = 1,
+    RESCALE_OPT: tl.constexpr = False,
+    SMEM_BUDGET: tl.constexpr = None,
 ):
     pid = tl.program_id(0)
     off_hz = tl.program_id(1)
@@ -435,12 +629,16 @@ def _attn_fwd(
         SUBTILING,
         VECT_MUL,
         FADD2_REDUCE,
+        MMA_SLICES,
+        KV_NUM_STAGES,
         DP_FACTOR,
+        NUM_CTAS,
+        RESCALE_OPT,
     )
 
 
 @triton.autotune(
-    configs=list(filter(keep, configs)),
+    configs=list(filter(keep, configs_fwd_autotune)),
     key=["N_CTX", "HEAD_DIM", "FP8_OUTPUT", "warp_specialize"],
     prune_configs_by={"early_config_prune": prune_invalid_configs},
 )
@@ -466,7 +664,14 @@ def _attn_fwd_persist(
     SUBTILING: tl.constexpr,
     VECT_MUL: tl.constexpr,
     FADD2_REDUCE: tl.constexpr,
+    MMA_SLICES: tl.constexpr,
+    KV_NUM_STAGES: tl.constexpr,
+    OUTER_NUM_STAGES: tl.constexpr,
     DP_FACTOR: tl.constexpr,
+    SMEM_BUDGET: tl.constexpr = None,
+    USE_CLC: tl.constexpr = False,
+    NUM_CTAS: tl.constexpr = 1,
+    RESCALE_OPT: tl.constexpr = False,
 ):
     n_tile_num = tl.cdiv(N_CTX, BLOCK_M)
     prog_id = tl.program_id(0)
@@ -479,67 +684,120 @@ def _attn_fwd_persist(
 
     tile_idx = prog_id
 
-    desc_q = tl.make_tensor_descriptor(
+    desc_q = _maybe_make_tensor_desc(
         desc_q,
         shape=[Z * H * N_CTX, HEAD_DIM],
         strides=[HEAD_DIM, 1],
         block_shape=[BLOCK_M, HEAD_DIM],
     )
-    desc_k = tl.make_tensor_descriptor(
+    desc_k = _maybe_make_tensor_desc(
         desc_k,
         shape=[Z * H * N_CTX, HEAD_DIM],
         strides=[HEAD_DIM, 1],
         block_shape=[BLOCK_N, HEAD_DIM],
     )
-    desc_v = tl.make_tensor_descriptor(
+    desc_v = _maybe_make_tensor_desc(
         desc_v,
         shape=[Z * H * N_CTX, HEAD_DIM],
         strides=[HEAD_DIM, 1],
         block_shape=[BLOCK_N, HEAD_DIM],
     )
-    desc_o = tl.make_tensor_descriptor(
+    desc_o = _maybe_make_tensor_desc(
         desc_o,
         shape=[Z * H * N_CTX, HEAD_DIM],
         strides=[HEAD_DIM, 1],
         block_shape=[BLOCK_M, HEAD_DIM],
     )
 
-    # inner loop warpspec vs. outer loop warpspec
-    for _ in tl.range(
-            0,
-            tiles_per_sm,
-            warp_specialize=warp_specialize and OUTER_LOOP,
-            merge_epilogue=True,
-            separate_epilogue_store=True,
-            data_partition_factor=DP_FACTOR,
-    ):
-        pid = tile_idx % n_tile_num
-        off_hz = tile_idx // n_tile_num
-        _attn_fwd_tma_dp(
-            sm_scale,
-            M,
-            Z,
-            H,
-            desc_q,
-            desc_k,
-            desc_v,
-            desc_o,
-            pid,
-            off_hz,
-            N_CTX,
-            HEAD_DIM,
-            BLOCK_M,
-            BLOCK_N,
-            FP8_OUTPUT,
-            STAGE,
-            warp_specialize and not OUTER_LOOP,
-            dtype,
-            SUBTILING,
-            VECT_MUL,
-            FADD2_REDUCE,
-            DP_FACTOR,
-        )
-        tile_idx += num_progs
+    if USE_CLC:
+        scheduler = tl.clc_tile_scheduler()
+        while tl.condition(
+                scheduler.is_valid(),
+                warp_specialize=warp_specialize,
+                merge_epilogue=True,
+                separate_epilogue_store=True,
+                data_partition_factor=DP_FACTOR,
+                smem_budget=SMEM_BUDGET,
+        ):
+            # Preserve the static 2-CTA mapping: adjacent physical CTAs process
+            # adjacent M tiles.  The CLC lowering adds the cluster rank to the
+            # canceled cluster's first CTA id, so tile_id is already the
+            # per-CTA tile index expected by _attn_fwd_tma_dp.
+            tile_idx = scheduler.tile_id[0]
+            pid = tile_idx % n_tile_num
+            off_hz = tile_idx // n_tile_num
+            _attn_fwd_tma_dp(
+                sm_scale,
+                M,
+                Z,
+                H,
+                desc_q,
+                desc_k,
+                desc_v,
+                desc_o,
+                pid,
+                off_hz,
+                N_CTX,
+                HEAD_DIM,
+                BLOCK_M,
+                BLOCK_N,
+                FP8_OUTPUT,
+                STAGE,
+                False,
+                dtype,
+                SUBTILING,
+                VECT_MUL,
+                FADD2_REDUCE,
+                MMA_SLICES,
+                KV_NUM_STAGES,
+                DP_FACTOR,
+                NUM_CTAS,
+                RESCALE_OPT,
+            )
+            scheduler = scheduler.advance()
+    else:
+        # inner loop warpspec vs. outer loop warpspec
+        for _ in tl.range(
+                0,
+                tiles_per_sm,
+                warp_specialize=warp_specialize and OUTER_LOOP,
+                merge_epilogue=True,
+                separate_epilogue_store=True,
+                data_partition_factor=DP_FACTOR,
+                num_stages=OUTER_NUM_STAGES if NUM_CTAS == 2 else None,
+                smem_budget=SMEM_BUDGET,
+        ):
+            pid = tile_idx % n_tile_num
+            off_hz = tile_idx // n_tile_num
+            _attn_fwd_tma_dp(
+                sm_scale,
+                M,
+                Z,
+                H,
+                desc_q,
+                desc_k,
+                desc_v,
+                desc_o,
+                pid,
+                off_hz,
+                N_CTX,
+                HEAD_DIM,
+                BLOCK_M,
+                BLOCK_N,
+                FP8_OUTPUT,
+                STAGE,
+                warp_specialize and not OUTER_LOOP,
+                dtype,
+                SUBTILING,
+                VECT_MUL,
+                FADD2_REDUCE,
+                MMA_SLICES,
+                KV_NUM_STAGES,
+                DP_FACTOR,
+                NUM_CTAS,
+                RESCALE_OPT,
+            )
+            tile_idx += num_progs
 
 
 def torch_dtype_to_triton(dtype):
@@ -601,6 +859,21 @@ _DEFAULT_BWD_DOT_ATTRS = FrozenDotAttrs({
     "dv": {"stage": "0", "order": "2", "channels": ["opndA,tmem,1,2", "opndD,tmem,1,7"]},
     "dq": {"stage": "1", "order": "1", "channels": ["opndA,smem,1,8", "opndD,tmem,1,5"]},
     "dk": {"stage": "1", "order": "1", "channels": ["opndD,tmem,1,10"]},
+})
+
+# BM128 2-CTA uses TLX's qK -> dK -> dP -> dQ -> dV dot order. dK reads
+# dS from the reused dP slot before the next dP write. dQ reuses qK's lower
+# 64 columns, while P stays live for dV in qK's upper 64 columns.
+_BWD_DOT_ATTRS_BM128_2CTA = FrozenDotAttrs({
+    "qkT": {"stage": "0", "order": "0", "channels": ["opndA,smem,1,0", "opndB,smem,1,1", "opndD,tmem,1,2"]},
+    "dpT": {"stage": "0", "order": "1", "channels": ["opndA,smem,1,3", "opndB,smem,1,4", "opndD,tmem,1,5"]},
+    "dv": {"stage": "0", "order": "3", "channels": ["opndA,tmem,1,2,64", "opndD,tmem,1,7"]},
+    "dk": {"stage": "1", "order": "0", "channels": ["opndD,tmem,1,10"]},
+    "dq": {"stage": "1", "order": "2", "channels": ["opndA,smem,1,8", "opndD,tmem,1,2"]},
+    # Load-only schedule anchors. These order metadata relative to the MMA
+    # operand prefetch wavefront without changing the dot execution order.
+    "m_load": {"stage": "0", "order": "2"},
+    "delta_load": {"stage": "0", "order": "4"},
 })
 
 # For BM of 128: dpT share with dq, qk share with ppT, dsT share with dpT.
@@ -674,13 +947,22 @@ _BWD_DOT_ATTRS_BM128_MEMTYPE = FrozenDotAttrs({
 
 
 @triton.jit
+def _take_m_half_2D(x, rank):
+    x0, x1 = x.reshape([2, x.shape[0] // 2, x.shape[1]]).permute(1, 2, 0).split()
+    return tl.where(rank == 0, x0, x1)
+
+
+@triton.jit
 def _attn_bwd_dkdv_inner(
     dk,
     dv,
     desc_q,
+    desc_qt,
     k,
+    kt,
     v,
     desc_do,
+    desc_dot,
     desc_dq,
     desc_m,
     desc_delta,
@@ -697,49 +979,90 @@ def _attn_bwd_dkdv_inner(
     DQ_SUBTILE: tl.constexpr,
     LN2: tl.constexpr,
     RESCHED: tl.constexpr,
+    TWO_CTAS: tl.constexpr = False,
+    TLX_DQ_LAYOUT: tl.constexpr = False,
     BWD_DOT_ATTRS: tl.constexpr = None,
 ):
-    q = desc_q.load([(off_bh + curr_m).to(tl.int32), 0])
-    qT = tl.trans(q)
+    if TWO_CTAS:
+        # Keep qT ahead of q in the load partition. With one qT slot, loading q
+        # first can wait on the late dK consumer while qK waits for the next qT.
+        qt = desc_qt.load([(off_bh + curr_m).to(tl.int32), 0])
+        qT = tl.trans(qt)
+        q = desc_q.load([(off_bh + curr_m).to(tl.int32), 0])
+    else:
+        q = desc_q.load([(off_bh + curr_m).to(tl.int32), 0])
+        qT = tl.trans(q)
     offs_m_start = off_chz + curr_m
-    m = desc_m.load([offs_m_start.to(tl.int32)])
+    m = desc_m.load([offs_m_start.to(tl.int32)], attrs=BWD_DOT_ATTRS.get("m_load") if RESCHED else None)
     if RESCHED:
-        qkT = tl.dot(k, qT, attrs=BWD_DOT_ATTRS.get("qkT"))
+        qkT = tl.dot(k, qT, attrs=BWD_DOT_ATTRS.get("qkT"), two_ctas=TWO_CTAS)
     else:
         qkT = tl.dot(k, qT)
-    pT = tl.math.exp2(qkT - m[None, :])
+    pT = tl.math.exp2(_sub_f32x2(qkT, m[None, :]))
     if MASK:
         offs_m = curr_m + tl.arange(0, BLOCK_M1)
         mask = offs_m[None, :] >= offs_n[:, None]
         pT = tl.where(mask, pT, 0.0)
     do = desc_do.load([(off_bh + curr_m).to(tl.int32), 0])
+    if TWO_CTAS:
+        dot = desc_dot.load([(off_bh + curr_m).to(tl.int32), 0])
+    else:
+        dot = do
     ppT = pT
     ppT = ppT.to(dtype)
     if RESCHED:
-        dpT = tl.dot(v, tl.trans(do), attrs=BWD_DOT_ATTRS.get("dpT")).to(tl.float32)
-        Di = desc_delta.load([offs_m_start.to(tl.int32)])
-        dv += tl.dot(ppT, do, attrs=BWD_DOT_ATTRS.get("dv"))
+        dpT = tl.dot(v, tl.trans(dot), attrs=BWD_DOT_ATTRS.get("dpT"), two_ctas=TWO_CTAS).to(tl.float32)
+        Di = desc_delta.load([offs_m_start.to(tl.int32)], attrs=BWD_DOT_ATTRS.get("delta_load") if RESCHED else None)
+        dv += tl.dot(ppT, do, attrs=BWD_DOT_ATTRS.get("dv"), two_ctas=TWO_CTAS)
     else:
         dv += tl.dot(ppT, do)
-        Di = desc_delta.load([offs_m_start.to(tl.int32)])
+        Di = desc_delta.load([offs_m_start.to(tl.int32)], attrs=BWD_DOT_ATTRS.get("delta_load") if RESCHED else None)
         dpT = tl.dot(v, tl.trans(do)).to(tl.float32)
-    dsT = pT * (dpT - Di[None, :])
+    dsT = _mul_f32x2(pT, _sub_f32x2(dpT, Di[None, :]))
     dsT = dsT.to(dtype)
     if RESCHED:
         # dk reads dsT from the reused TMEM buffer-5; dq writes the same buffer.
         # dk must read before dq overwrites (cf. TLX
         # blackwell_fa_ws_pipelined_persistent: "dk must read dsT_tmem BEFORE
         # dq writes ... same TMEM slot"). Emit dk first.
-        dk += tl.dot(dsT, tl.trans(qT), attrs=BWD_DOT_ATTRS.get("dk"))
-        dq = tl.dot(tl.trans(dsT), k, attrs=BWD_DOT_ATTRS.get("dq"))
+        dk += tl.dot(dsT, q, attrs=BWD_DOT_ATTRS.get("dk"), two_ctas=TWO_CTAS)
+        if TLX_DQ_LAYOUT:
+            # Physical BM128 2-CTA dQ. The compiler peer-gather rewrite replaces
+            # this local packed view with the rank-owned M half from both CTA N
+            # domains: [64, 256] @ [256, 64] -> [64, 128].
+            dsT_dq = tl.reshape(tl.trans(dsT), (BLOCK_M1 // 2, dsT.shape[0] * 2))
+            dq = tl.dot(dsT_dq, kt, attrs=BWD_DOT_ATTRS.get("dq"), two_ctas=TWO_CTAS)
+        else:
+            dq = tl.dot(tl.trans(dsT), kt, attrs=BWD_DOT_ATTRS.get("dq"), two_ctas=TWO_CTAS)
     else:
         dk += tl.dot(dsT, tl.trans(qT))
         dq = tl.dot(tl.trans(dsT), k)
-    dqs = _split_n_2D(dq, DQ_SUBTILE)
     slice_size: tl.constexpr = HEAD_DIM // DQ_SUBTILE
-    for slice_id in tl.static_range(0, DQ_SUBTILE):
-        dqN = dqs[slice_id] * LN2
-        desc_dq.atomic_add([(off_bh + curr_m).to(tl.int32), slice_id * slice_size], dqN)
+    if TWO_CTAS:
+        cluster_cta_rank = tl.program_id(0) % 2
+        if TLX_DQ_LAYOUT:
+            # TwoCTA_RHS stores logical [BM/2, H] as physical [BM, H/2].
+            # Load/store that physical view directly; slicing the logical H
+            # dimension makes both halves address the same local TMEM bank.
+            dq_local = tl.reshape(dq, (BLOCK_M1, HEAD_DIM // 2))
+            dq_subtiles: tl.constexpr = DQ_SUBTILE // 2
+            dqs = _split_n_2D(dq_local, dq_subtiles)
+            dq_row = 2 * (off_bh + curr_m + cluster_cta_rank * (BLOCK_M1 // 2))
+        else:
+            # Native two-CTA dQ retains the full logical M extent; select the
+            # rank-owned half for the global update.
+            dq_local = _take_m_half_2D(dq, cluster_cta_rank)
+            dq_subtiles: tl.constexpr = DQ_SUBTILE
+            dqs = _split_n_2D(dq_local, dq_subtiles)
+            dq_row = off_bh + curr_m + cluster_cta_rank * (BLOCK_M1 // 2)
+        for slice_id in tl.static_range(0, dq_subtiles):
+            dqN = dqs[slice_id] * LN2
+            desc_dq.atomic_add([dq_row.to(tl.int32), slice_id * slice_size], dqN)
+    else:
+        dqs = _split_n_2D(dq, DQ_SUBTILE)
+        for slice_id in tl.static_range(0, DQ_SUBTILE):
+            dqN = dqs[slice_id] * LN2
+            desc_dq.atomic_add([(off_bh + curr_m).to(tl.int32), slice_id * slice_size], dqN)
     curr_m += step_m
     return dk, dv, curr_m
 
@@ -749,10 +1072,13 @@ def _attn_bwd_dkdv(
     dk,
     dv,  #
     desc_q,
+    desc_qt,
     k,
+    kt,
     v,
     sm_scale,  #
     desc_do,  #
+    desc_dot,
     desc_dq,
     desc_m,
     desc_delta,  #
@@ -777,6 +1103,8 @@ def _attn_bwd_dkdv(
     DQ_SUBTILE: tl.constexpr,
     BWD_DOT_ATTRS: tl.constexpr = None,
     SMEM_BUDGET: tl.constexpr = 200000,
+    TWO_CTAS: tl.constexpr = False,
+    TLX_DQ_LAYOUT: tl.constexpr = False,
 ):
     offs_n = start_n + tl.arange(0, BLOCK_N1)
 
@@ -791,6 +1119,7 @@ def _attn_bwd_dkdv(
                 0,
                 num_steps,
                 warp_specialize=True,
+                assume_nonempty=TWO_CTAS,
                 merge_epilogue_to_computation=True,
                 tmem_alloc_algo=2,
                 smem_alloc_algo=1,
@@ -800,9 +1129,12 @@ def _attn_bwd_dkdv(
                 dk,
                 dv,
                 desc_q,
+                desc_qt,
                 k,
+                kt,
                 v,
                 desc_do,
+                desc_dot,
                 desc_dq,
                 desc_m,
                 desc_delta,
@@ -819,6 +1151,8 @@ def _attn_bwd_dkdv(
                 DQ_SUBTILE,
                 LN2,
                 True,
+                TWO_CTAS,
+                TLX_DQ_LAYOUT,
                 BWD_DOT_ATTRS,
             )
     else:
@@ -827,9 +1161,12 @@ def _attn_bwd_dkdv(
                 dk,
                 dv,
                 desc_q,
+                desc_qt,
                 k,
+                kt,
                 v,
                 desc_do,
+                desc_dot,
                 desc_dq,
                 desc_m,
                 desc_delta,
@@ -846,6 +1183,8 @@ def _attn_bwd_dkdv(
                 DQ_SUBTILE,
                 LN2,
                 True,
+                TWO_CTAS,
+                TLX_DQ_LAYOUT,
                 BWD_DOT_ATTRS,
             )
 
@@ -860,6 +1199,14 @@ def _bwd_host_descriptor_pre_hook(nargs):
     # DQ_SUBTILE controls dq atomic_add staging only; defaults to
     # EPILOGUE_SUBTILE so existing configs continue to behave the same.
     DQ_SUBTILE = nargs.get("DQ_SUBTILE", EPILOGUE_SUBTILE)
+    NUM_CTAS = nargs.get("NUM_CTAS", 1)
+    # BM128 2-CTA assigns adjacent N tiles to the CTA pair. Keep this initial
+    # implementation to complete pairs: a CTA cannot independently skip a
+    # collective MMA when the sequence has an odd trailing N tile.
+    if NUM_CTAS == 2 and BLOCK_M1 == 128:
+        N_CTX = nargs["N_CTX"]
+        if N_CTX % (BLOCK_N1 * NUM_CTAS) != 0:
+            raise ValueError("BM128 2-CTA requires N_CTX divisible by 2 * BLOCK_N1")
     if not isinstance(nargs["desc_q"], TensorDescriptor):
         return
 
@@ -869,10 +1216,28 @@ def _bwd_host_descriptor_pre_hook(nargs):
     nargs["desc_dq"].base.zero_()
 
     nargs["desc_q"].block_shape = [BLOCK_M1, HEAD_DIM]
+    if "desc_qt" in nargs:
+        nargs["desc_qt"].block_shape = [BLOCK_M1, HEAD_DIM]
     nargs["desc_do"].block_shape = [BLOCK_M1, HEAD_DIM]
-    nargs["desc_dq"].block_shape = [BLOCK_M1, HEAD_DIM // DQ_SUBTILE]
+    if "desc_dot" in nargs:
+        nargs["desc_dot"].block_shape = [BLOCK_M1, HEAD_DIM]
+    packed_dq = NUM_CTAS == 2 and BLOCK_M1 == 128
+    if packed_dq:
+        N_CTX = nargs["N_CTX"]
+        nargs["desc_dq"].shape = [2 * nargs["BATCH"] * nargs["H"] * N_CTX, HEAD_DIM // 2]
+        nargs["desc_dq"].strides = [HEAD_DIM // 2, 1]
+    else:
+        nargs["desc_dq"].shape = [nargs["BATCH"] * nargs["H"] * nargs["N_CTX"], HEAD_DIM]
+        nargs["desc_dq"].strides = [HEAD_DIM, 1]
+    dq_rows = BLOCK_M1 if packed_dq else BLOCK_M1 // NUM_CTAS
+    nargs["desc_dq"].block_shape = [dq_rows, HEAD_DIM // DQ_SUBTILE]
     nargs["desc_v"].block_shape = [BLOCK_N1, HEAD_DIM]
     nargs["desc_k"].block_shape = [BLOCK_N1, HEAD_DIM]
+    if "desc_kt" in nargs:
+        if NUM_CTAS == 2 and BLOCK_M1 == 128:
+            nargs["desc_kt"].block_shape = [BLOCK_N1 * NUM_CTAS, HEAD_DIM]
+        else:
+            nargs["desc_kt"].block_shape = [BLOCK_N1, HEAD_DIM]
     nargs["desc_dv"].block_shape = [BLOCK_N1, HEAD_DIM // EPILOGUE_SUBTILE]
     nargs["desc_dk"].block_shape = [BLOCK_N1, HEAD_DIM // EPILOGUE_SUBTILE]
     nargs["desc_m"].block_shape = [BLOCK_M1]
@@ -965,10 +1330,54 @@ configs_bwd_persist = [
             "EPILOGUE_SUBTILE": 2,
             "DQ_SUBTILE": 4,
             "BWD_DOT_ATTRS": _BWD_DOT_ATTRS_BM64_TMEM,
+            "NUM_CTAS": 1,
         },
         num_warps=4,
         num_stages=2,
         pre_hook=_bwd_host_descriptor_pre_hook,
+    ),
+    triton.Config(
+        {
+            "BLOCK_M1": 64,
+            "BLOCK_N1": 128,
+            "BLOCK_M2": 128,
+            "BLOCK_N2": 128,
+            "EPILOGUE_SUBTILE": 2,
+            "DQ_SUBTILE": 4,
+            "BWD_DOT_ATTRS": _BWD_DOT_ATTRS_BM64_TMEM,
+            "NUM_CTAS": 2,
+        },
+        num_warps=4,
+        num_stages=2,
+        pre_hook=_bwd_host_descriptor_pre_hook,
+        ctas_per_cga=(2, 1, 1),
+        allowDependentTwoCTA=True,
+    ),
+    triton.Config(  # BM128 2-CTA: adjacent N tiles per CTA cluster.
+        {
+            "BLOCK_M1": 128,
+            "BLOCK_N1": 128,
+            "BLOCK_M2": 128,
+            "BLOCK_N2": 128,
+            "EPILOGUE_SUBTILE": 8,
+            "DQ_SUBTILE": 8,
+            # Permit the allocated dQ reduction staging group to use two slots
+            # (224004 + 8192 = 232196 physical bytes). Fully reused dK/dV
+            # staging groups remain at one slot in the memory planner.
+            "SMEM_BUDGET": 230400,
+            "BWD_DOT_ATTRS": _BWD_DOT_ATTRS_BM128_2CTA,
+            "NUM_CTAS": 2,
+        },
+        # Match TLX: the default computation/epilogue group starts with eight
+        # warps; AutoWS specializes reduction, GEMM, load, and relay from it.
+        num_warps=8,
+        num_stages=2,
+        minRegAutoWS=88,
+        maxRegAutoWS=88,
+        pre_hook=_bwd_host_descriptor_pre_hook,
+        ctas_per_cga=(2, 1, 1),
+        allowDependentTwoCTA=True,
+        generate_subtiled_region=True,
     ),
     triton.Config(
         {
@@ -1014,14 +1423,26 @@ configs_bwd_persist = [
     ),
 ]
 
+# Keep register options config-owned so the autotuner passes each option once.
+# Existing configs retain the historical 24/192 bounds; the dedicated BM128
+# 2-CTA config uses the TLX-aligned 88-register budget. Environment overrides
+# remain global and are applied uniformly for debugging sweeps.
+for _config in configs_bwd_persist:
+    _is_bm128_2cta = (_config.kwargs.get("NUM_CTAS", 1) == 2 and _config.kwargs["BLOCK_M1"] == 128)
+    _config.minRegAutoWS = int(os.environ.get("AUTOWS_BWD_MIN_REG", "88" if _is_bm128_2cta else "24"))
+    _config.maxRegAutoWS = int(os.environ.get("AUTOWS_BWD_MAX_REG", "88" if _is_bm128_2cta else "192"))
+
 
 @triton.jit
 def _attn_bwd_core(
     desc_q,
+    desc_qt,
     desc_k,
+    desc_kt,
     desc_v,
     sm_scale,  #
     desc_do,  #
+    desc_dot,
     desc_dq,
     desc_dk,
     desc_dv,  #
@@ -1045,6 +1466,7 @@ def _attn_bwd_core(
     DQ_SUBTILE: tl.constexpr,
     BWD_DOT_ATTRS: tl.constexpr = None,
     SMEM_BUDGET: tl.constexpr = 200000,
+    TWO_CTAS: tl.constexpr = False,
 ):
     off_chz = (bhid * N_CTX).to(tl.int64)
     off_bh = ((stride_h * (bhid % H) + stride_z * (bhid // H)).to(tl.int64)) // stride_tok
@@ -1054,18 +1476,28 @@ def _attn_bwd_core(
 
     start_n = pid * BLOCK_N1
     start_m = 0
+    TLX_DQ_LAYOUT: tl.constexpr = TWO_CTAS and BLOCK_M1 == 128
+    cluster_cta_rank = tl.program_id(0) % 2 if TWO_CTAS else 0
 
     k = desc_k.load([(off_bh + start_n).to(tl.int32), 0])
     v = desc_v.load([(off_bh + start_n).to(tl.int32), 0])
+    if TWO_CTAS:
+        kt_start_n = start_n - cluster_cta_rank * BLOCK_N1 if TLX_DQ_LAYOUT else start_n
+        kt = desc_kt.load([(off_bh + kt_start_n).to(tl.int32), 0])
+    else:
+        kt = k
     num_steps = (N_CTX - start_m) // BLOCK_M1
     dk, dv = _attn_bwd_dkdv(  #
         dk,
         dv,  #
         desc_q,
+        desc_qt,
         k,
+        kt,
         v,
         sm_scale,  #
         desc_do,  #
+        desc_dot,
         desc_dq,
         desc_m,
         desc_delta,  #
@@ -1088,6 +1520,8 @@ def _attn_bwd_core(
         DQ_SUBTILE=DQ_SUBTILE,
         BWD_DOT_ATTRS=BWD_DOT_ATTRS,
         SMEM_BUDGET=SMEM_BUDGET,
+        TWO_CTAS=TWO_CTAS,
+        TLX_DQ_LAYOUT=TLX_DQ_LAYOUT,
     )
 
     dvs = _split_n_2D(dv, EPILOGUE_SUBTILE)
@@ -1112,10 +1546,13 @@ def _attn_bwd_core(
 @triton.jit
 def _attn_bwd(
     desc_q,
+    desc_qt,
     desc_k,
+    desc_kt,
     desc_v,
     sm_scale,  #
     desc_do,  #
+    desc_dot,
     desc_dq,
     desc_dk,
     desc_dv,  #
@@ -1141,16 +1578,25 @@ def _attn_bwd(
     DQ_SUBTILE: tl.constexpr,
     BWD_DOT_ATTRS: tl.constexpr = None,
     SMEM_BUDGET: tl.constexpr = 200000,
+    NUM_CTAS: tl.constexpr = 1,
 ):
     bhid = tl.program_id(2)
-    pid = tl.program_id(0)
+    # BM128 2-CTA gives each CTA of the cluster its own adjacent N tile, so the
+    # tile index is the CTA index. BM64 2-CTA instead has the pair cooperate on
+    # a single N tile (TwoCTA_RHS splits the accumulator), so the tile index is
+    # the cluster index -- the same mapping the persistent grid uses.
+    ADJACENT_N: tl.constexpr = NUM_CTAS == 2 and BLOCK_M1 == 128
+    pid = tl.program_id(0) if ADJACENT_N else tl.program_id(0) // NUM_CTAS
 
     _attn_bwd_core(
         desc_q,
+        desc_qt,
         desc_k,
+        desc_kt,
         desc_v,
         sm_scale,
         desc_do,
+        desc_dot,
         desc_dq,
         desc_dk,
         desc_dv,
@@ -1174,6 +1620,7 @@ def _attn_bwd(
         DQ_SUBTILE,
         BWD_DOT_ATTRS,
         SMEM_BUDGET,
+        NUM_CTAS == 2,
     )
 
 
@@ -1181,10 +1628,13 @@ def _attn_bwd(
 @triton.jit
 def _attn_bwd_persist(
     desc_q,
+    desc_qt,
     desc_k,
+    desc_kt,
     desc_v,
     sm_scale,  #
     desc_do,  #
+    desc_dot,
     desc_dq,
     desc_dk,
     desc_dv,  #
@@ -1210,11 +1660,17 @@ def _attn_bwd_persist(
     DQ_SUBTILE: tl.constexpr,
     BWD_DOT_ATTRS: tl.constexpr = None,
     SMEM_BUDGET: tl.constexpr = 200000,
+    NUM_CTAS: tl.constexpr = 1,
 ):
     n_tile_num = tl.cdiv(N_CTX, BLOCK_N1)
-    prog_id = tl.program_id(0)
-    num_progs = tl.num_programs(0)
-    total_tiles = n_tile_num * BATCH * H
+    cluster_rank = tl.program_id(0) % NUM_CTAS
+    prog_id = tl.program_id(0) // NUM_CTAS
+    num_progs = tl.num_programs(0) // NUM_CTAS
+    # BM64 retains its validated same-N direct protocol. BM128 matches TLX
+    # ownership: one persistent cluster tile covers two adjacent N tiles.
+    ADJACENT_N: tl.constexpr = NUM_CTAS == 2 and BLOCK_M1 == 128
+    scheduled_n_tiles = n_tile_num // NUM_CTAS if ADJACENT_N else n_tile_num
+    total_tiles = scheduled_n_tiles * BATCH * H
 
     tiles_per_sm = total_tiles // num_progs
     if prog_id < total_tiles % num_progs:
@@ -1229,8 +1685,20 @@ def _attn_bwd_persist(
         strides=[HEAD_DIM, 1],
         block_shape=[BLOCK_M1, HEAD_DIM],
     )
+    desc_qt = _maybe_make_tensor_desc(
+        desc_qt,
+        shape=[y_dim, HEAD_DIM],
+        strides=[HEAD_DIM, 1],
+        block_shape=[BLOCK_M1, HEAD_DIM],
+    )
     desc_do = _maybe_make_tensor_desc(
         desc_do,
+        shape=[y_dim, HEAD_DIM],
+        strides=[HEAD_DIM, 1],
+        block_shape=[BLOCK_M1, HEAD_DIM],
+    )
+    desc_dot = _maybe_make_tensor_desc(
+        desc_dot,
         shape=[y_dim, HEAD_DIM],
         strides=[HEAD_DIM, 1],
         block_shape=[BLOCK_M1, HEAD_DIM],
@@ -1252,6 +1720,12 @@ def _attn_bwd_persist(
         shape=[y_dim, HEAD_DIM],
         strides=[HEAD_DIM, 1],
         block_shape=[BLOCK_N1, HEAD_DIM],
+    )
+    desc_kt = _maybe_make_tensor_desc(
+        desc_kt,
+        shape=[y_dim, HEAD_DIM],
+        strides=[HEAD_DIM, 1],
+        block_shape=[BLOCK_N1 * NUM_CTAS if NUM_CTAS == 2 and BLOCK_M1 == 128 else BLOCK_N1, HEAD_DIM],
     )
     desc_dv = _maybe_make_tensor_desc(
         desc_dv,
@@ -1287,14 +1761,18 @@ def _attn_bwd_persist(
             smem_alloc_algo=1,
             smem_budget=SMEM_BUDGET,
     ):
-        pid = tile_idx % n_tile_num
-        bhid = tile_idx // n_tile_num
+        scheduled_pid = tile_idx % scheduled_n_tiles
+        bhid = tile_idx // scheduled_n_tiles
+        pid = scheduled_pid * NUM_CTAS + cluster_rank if ADJACENT_N else scheduled_pid
         _attn_bwd_core(
             desc_q,
+            desc_qt,
             desc_k,
+            desc_kt,
             desc_v,
             sm_scale,
             desc_do,
+            desc_dot,
             desc_dq,
             desc_dk,
             desc_dv,
@@ -1318,6 +1796,7 @@ def _attn_bwd_persist(
             DQ_SUBTILE,
             BWD_DOT_ATTRS,
             SMEM_BUDGET,
+            NUM_CTAS == 2,
         )
         tile_idx += num_progs
 
@@ -1334,46 +1813,75 @@ class _attention_opt(torch.autograd.Function):
         assert HEAD_DIM_K in {16, 32, 64, 128, 256}
         o = torch.empty_like(q)
         stage = 3 if causal else 1
+        if "AUTOWS_FWD_SUBTILING" in os.environ:
+            SUBTILING = os.environ["AUTOWS_FWD_SUBTILING"] == "1"
+        if "AUTOWS_FWD_VECT_MUL" in os.environ:
+            VECT_MUL = int(os.environ["AUTOWS_FWD_VECT_MUL"])
+        elif _fwd_num_ctas == "2":
+            VECT_MUL = 3
         extra_kern_args = {}
 
         M = torch.empty((q.shape[0], q.shape[1], q.shape[2]), device=q.device, dtype=torch.float32)
-        warp_specialize = True
-        desc_q = q
-        desc_v = v
-        desc_k = k
-        desc_o = o
+        warp_specialize = os.environ.get("AUTOWS_FWD_WARP_SPECIALIZE", "1") == "1"
+        # The non-persistent 1-CTA schedule still relies on the in-kernel
+        # descriptor creation path. Use host descriptors only for the focused
+        # 2-CTA configuration until that independent schedule is converted.
+        if supports_host_descriptor() and _fwd_num_ctas == "2":
+            y_dim = q.shape[0] * q.shape[1] * q.shape[2]
+            dummy_block = [1, 1]
+            desc_q = TensorDescriptor(q, shape=[y_dim, HEAD_DIM_K], strides=[HEAD_DIM_K, 1], block_shape=dummy_block)
+            desc_v = TensorDescriptor(v, shape=[y_dim, HEAD_DIM_K], strides=[HEAD_DIM_K, 1], block_shape=dummy_block)
+            desc_k = TensorDescriptor(k, shape=[y_dim, HEAD_DIM_K], strides=[HEAD_DIM_K, 1], block_shape=dummy_block)
+            desc_o = TensorDescriptor(o, shape=[y_dim, HEAD_DIM_K], strides=[HEAD_DIM_K, 1], block_shape=dummy_block)
+        else:
+            desc_q = q
+            desc_v = v
+            desc_k = k
+            desc_o = o
 
         def alloc_fn(size: int, align: int, _):
             return torch.empty(size, dtype=torch.int8, device="cuda")
 
         triton.set_allocator(alloc_fn)
         NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
+        use_clc = _FWD_USE_CLC
 
         def grid(META):
+            num_ctas = META.get("NUM_CTAS") or 1
+            m_tiles = triton.cdiv(q.shape[2], META["BLOCK_M"])
             return (
-                triton.cdiv(q.shape[2], META["BLOCK_M"]),
+                triton.cdiv(m_tiles, num_ctas) * num_ctas,
                 q.shape[0] * q.shape[1],
                 1,
             )
 
         def grid_persist(META):
+            num_ctas = META.get("NUM_CTAS") or 1
+            total_tiles = triton.cdiv(q.shape[2], META["BLOCK_M"]) * q.shape[0] * q.shape[1]
+            if use_clc:
+                # One physical CTA per M tile, matching the static 2-CTA
+                # schedule where neighboring CTAs cover neighboring M tiles.
+                assert total_tiles % num_ctas == 0
+                return (total_tiles, 1, 1)
+            num_clusters = min(NUM_SMS // num_ctas, total_tiles // num_ctas)
             return (
-                min(
-                    NUM_SMS,
-                    triton.cdiv(q.shape[2], META["BLOCK_M"]) * q.shape[0] * q.shape[1],
-                ),
+                num_clusters * num_ctas,
                 1,
                 1,
             )
 
         ctx.grid = grid
         persistent = baseVariant == "persistent" or baseVariant == "ws_persistent"
-        if is_blackwell() and warp_specialize:
-            extra_kern_args["maxnreg"] = 128
+        fwd_maxnreg = os.environ.get("AUTOWS_FWD_MAXNREG")
+        if fwd_maxnreg is None and _fwd_num_ctas != "2":
+            fwd_maxnreg = "128"
+        if is_blackwell() and warp_specialize and fwd_maxnreg is not None:
+            extra_kern_args["maxnreg"] = int(fwd_maxnreg)
         with triton.knobs.nvidia.scope():
             triton.knobs.nvidia.use_meta_ws = True
             triton.knobs.nvidia.use_meta_partition = True
-            triton.knobs.nvidia.disable_wsbarrier_reorder = True
+            triton.knobs.nvidia.disable_wsbarrier_reorder = (os.environ.get("AUTOWS_ENABLE_WSBARRIER_REORDER", "0")
+                                                             != "1")
             if persistent:
                 _attn_fwd_persist[grid_persist](
                     sm_scale,
@@ -1390,6 +1898,7 @@ class _attention_opt(torch.autograd.Function):
                     STAGE=stage,  #
                     warp_specialize=warp_specialize,
                     OUTER_LOOP=True,
+                    USE_CLC=use_clc,
                     dtype=torch_dtype_to_triton(q.dtype),
                     SUBTILING=SUBTILING,
                     VECT_MUL=VECT_MUL,
@@ -1473,6 +1982,12 @@ class _attention_opt(torch.autograd.Function):
             strides=[HEAD_DIM, 1],
             block_shape=dummy_block,
         )
+        desc_kt = TensorDescriptor(
+            arg_k,
+            shape=[BATCH * N_HEAD * N_CTX, HEAD_DIM],
+            strides=[HEAD_DIM, 1],
+            block_shape=dummy_block,
+        )
         desc_v = TensorDescriptor(
             v,
             shape=[BATCH * N_HEAD * N_CTX, HEAD_DIM],
@@ -1485,7 +2000,19 @@ class _attention_opt(torch.autograd.Function):
             strides=[HEAD_DIM, 1],
             block_shape=dummy_block,
         )
+        desc_qt = TensorDescriptor(
+            q,
+            shape=[BATCH * N_HEAD * N_CTX, HEAD_DIM],
+            strides=[HEAD_DIM, 1],
+            block_shape=dummy_block,
+        )
         desc_do = TensorDescriptor(
+            do,
+            shape=[BATCH * N_HEAD * N_CTX, HEAD_DIM],
+            strides=[HEAD_DIM, 1],
+            block_shape=dummy_block,
+        )
+        desc_dot = TensorDescriptor(
             do,
             shape=[BATCH * N_HEAD * N_CTX, HEAD_DIM],
             strides=[HEAD_DIM, 1],
@@ -1524,8 +2051,16 @@ class _attention_opt(torch.autograd.Function):
         )
 
         def grid(meta):
+            num_ctas = meta.get("NUM_CTAS") or 1
+            n_tiles = triton.cdiv(N_CTX, meta["BLOCK_N1"])
+            if num_ctas == 2 and meta["BLOCK_M1"] != 128:
+                # BM64 2-CTA: the CTA pair cooperates on a single N tile, so
+                # launch one cluster (two CTAs) per tile.
+                return (n_tiles * num_ctas, 1, BATCH * N_HEAD)
+            if num_ctas == 2:
+                assert n_tiles % num_ctas == 0
             return (
-                triton.cdiv(N_CTX, meta["BLOCK_N1"]),  # tiles along N (K/V)
+                n_tiles,
                 1,  # (or cdiv over M if you need)
                 BATCH * N_HEAD,
             )  # batch*heads
@@ -1534,11 +2069,18 @@ class _attention_opt(torch.autograd.Function):
             NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
 
             def grid_persist_bwd(meta):
+                num_ctas = meta.get("NUM_CTAS") or 1
+                n_tiles = triton.cdiv(N_CTX, meta["BLOCK_N1"])
+                if num_ctas == 2 and meta["BLOCK_M1"] == 128:
+                    assert n_tiles % num_ctas == 0
+                    n_tiles //= num_ctas
+                total_tiles = n_tiles * BATCH * N_HEAD
+                if os.environ.get("AUTOWS_BWD_FULL_GRID", "0") == "1":
+                    num_clusters = total_tiles
+                else:
+                    num_clusters = min(NUM_SMS // num_ctas, total_tiles)
                 return (
-                    min(
-                        NUM_SMS,
-                        triton.cdiv(N_CTX, meta["BLOCK_N1"]) * BATCH * N_HEAD,
-                    ),
+                    num_clusters * num_ctas,
                     1,
                     1,
                 )
@@ -1546,14 +2088,18 @@ class _attention_opt(torch.autograd.Function):
         with triton.knobs.nvidia.scope():
             triton.knobs.nvidia.use_meta_ws = True
             triton.knobs.nvidia.use_meta_partition = True
-            triton.knobs.nvidia.disable_wsbarrier_reorder = True
+            triton.knobs.nvidia.disable_wsbarrier_reorder = (os.environ.get("AUTOWS_ENABLE_WSBARRIER_REORDER", "0")
+                                                             != "1")
             if ctx.persistent:
                 _attn_bwd_persist[grid_persist_bwd](
                     desc_q,
+                    desc_qt,
                     desc_k,
+                    desc_kt,
                     desc_v,
                     ctx.sm_scale,
                     desc_do,
+                    desc_dot,
                     desc_dq,
                     desc_dk,
                     desc_dv,  #
@@ -1570,15 +2116,17 @@ class _attention_opt(torch.autograd.Function):
                     HEAD_DIM=ctx.HEAD_DIM,  #
                     dtype=torch_dtype_to_triton(q.dtype),
                     warp_specialize=warp_specialize,
-                    maxRegAutoWS=192,
                 )
             else:
                 _attn_bwd[grid](
                     desc_q,
+                    desc_qt,
                     desc_k,
+                    desc_kt,
                     desc_v,
                     ctx.sm_scale,
                     desc_do,
+                    desc_dot,
                     desc_dq,
                     desc_dk,
                     desc_dv,  #
@@ -1595,7 +2143,6 @@ class _attention_opt(torch.autograd.Function):
                     HEAD_DIM=ctx.HEAD_DIM,  #
                     dtype=torch_dtype_to_triton(q.dtype),
                     warp_specialize=warp_specialize,
-                    maxRegAutoWS=192,
                 )
 
         return dq, dk, dv, None, None, None, None, None, None, None
@@ -1656,6 +2203,12 @@ def test_op(
     # (dedicated coverage: test_bwd_tmem_dsT_reuse_3group / _persistent).
     if mode == "bwd":
         chosen_cfg = configs_bwd_persist[bwd_config_idx]
+        cfg_num_ctas = chosen_cfg.kwargs.get("NUM_CTAS", 1)
+        cfg_block_m1 = chosen_cfg.kwargs["BLOCK_M1"]
+        # BM128 2-CTA packs dQ as [2 * N_CTX, HEAD_DIM // 2] and subtiles the
+        # epilogue by 8, which is only defined for HEAD_DIM=128.
+        if cfg_num_ctas == 2 and cfg_block_m1 == 128 and HEAD_DIM == 64:
+            pytest.skip("BM128 2-CTA backward requires HEAD_DIM=128")
         # Optional per-test SMEM budget override (e.g. force depth-2 early-TMA
         # store staging for the T277224987 regression). Copy so we never mutate
         # the shared global config.
@@ -1721,6 +2274,120 @@ def test_op(
     torch.testing.assert_close(tri_dv, ref_dv, atol=1e-2, rtol=rtol)
     torch.testing.assert_close(tri_dk, ref_dk, atol=1e-2, rtol=rtol)
     torch.testing.assert_close(tri_dq, ref_dq, atol=1e-2, rtol=rtol)
+
+
+@pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell (sm100) for the device-TMA bwd kernel")
+def test_bwd_bm64_1cta_persistent_store_wait_drain():
+    # Regression for rotating a one-CTA dQ TMA-reduction wait across the
+    # persistent loop. At the production shape, the missing final queue drain
+    # raced the next tile and produced nondeterministic dQ. Smaller N_CTX=1024
+    # tests did not reliably expose the race.
+    import blackwell_fa_ws_pipelined_persistent as tlx
+
+    config = next(config for config in configs_bwd_persist
+                  if config.kwargs.get("BWD_DOT_ATTRS") == _BWD_DOT_ATTRS_BM64_MEMTYPE)
+    config = copy.copy(config)
+    config.kwargs = dict(config.kwargs)
+    # Make the legacy one-CTA default explicit: the persistent grid consumes
+    # NUM_CTAS before Triton's config defaults are applied.
+    config.kwargs["NUM_CTAS"] = 1
+
+    tlx_configs = [
+        config for config in tlx.configs_bwd_tlx if config.kwargs.get("NUM_CTAS", 1) == 1
+        and config.kwargs.get("BLOCK_M1") == 64 and config.kwargs.get("USE_WARP_BARRIER") is False
+    ]
+    assert len(tlx_configs) == 1
+
+    old_autows_configs = _attn_bwd_persist.configs
+    old_autows_cache = _attn_bwd_persist.cache
+    old_tlx_configs = tlx._attn_bwd_ws.configs
+    old_tlx_cache = tlx._attn_bwd_ws.cache
+    _attn_bwd_persist.configs = [config]
+    _attn_bwd_persist.cache = {}
+    tlx._attn_bwd_ws.configs = tlx_configs
+    tlx._attn_bwd_ws.cache = {}
+
+    torch.manual_seed(20)
+    shape = (4, 48, 4096, 128)
+    q = torch.empty(shape, dtype=torch.float16, device=DEVICE).normal_(0.0, 0.5)
+    k = torch.empty_like(q).normal_(0.0, 0.5)
+    v = torch.empty_like(q).normal_(0.0, 0.5)
+    dout = torch.randn_like(q)
+
+    def run(attention_fn):
+        qq = q.clone().requires_grad_()
+        kk = k.clone().requires_grad_()
+        vv = v.clone().requires_grad_()
+        out = attention_fn(qq, kk, vv).half()
+        out.backward(dout)
+        return qq.grad, kk.grad, vv.grad
+
+    try:
+        reference = run(lambda qq, kk, vv: tlx.attention(qq, kk, vv, 0.5, False))
+        first = None
+        for _ in range(10):
+            actual = run(lambda qq, kk, vv: attention(qq, kk, vv, False, 0.5, "ws_persistent", False, 0, False))
+            for actual_grad, reference_grad in zip(actual, reference):
+                torch.testing.assert_close(actual_grad, reference_grad, atol=1e-2, rtol=0)
+            if first is None:
+                first = actual
+            else:
+                for actual_grad, first_grad in zip(actual, first):
+                    torch.testing.assert_close(actual_grad, first_grad, atol=1e-2, rtol=0)
+    finally:
+        _attn_bwd_persist.configs = old_autows_configs
+        _attn_bwd_persist.cache = old_autows_cache
+        tlx._attn_bwd_ws.configs = old_tlx_configs
+        tlx._attn_bwd_ws.cache = old_tlx_cache
+
+
+@pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell (sm100) for the device-TMA bwd kernel")
+def test_bwd_bm128_2cta_packed_dq():
+    # TwoCTA_RHS stores logical [64,128] dQ as physical [128,64]. Loading the
+    # logical H slices duplicates the local physical bank into both H halves.
+    idx = next(i for i, config in enumerate(configs_bwd_persist)
+               if config.kwargs.get("NUM_CTAS") == 2 and config.kwargs.get("BLOCK_M1") == 128)
+    test_op(
+        Z=2,
+        H=2,
+        N_CTX=256,
+        HEAD_DIM=128,
+        causal=False,
+        mode="bwd",
+        baseVariant="ws_persistent",
+        provider="triton-fp16",
+        SUBTILING=False,
+        VECT_MUL=0,
+        FADD2_REDUCE=False,
+        bwd_config_idx=idx,
+    )
+
+
+@pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell (sm100) for the device-TMA bwd kernel")
+def test_bwd_bm128_2cta_nonpersistent():
+    idx = next(i for i, config in enumerate(configs_bwd_persist)
+               if config.kwargs.get("NUM_CTAS") == 2 and config.kwargs.get("BLOCK_M1") == 128)
+    config = copy.copy(configs_bwd_persist[idx])
+    config.kwargs = dict(config.kwargs)
+    config.kwargs["EPILOGUE_SUBTILE"] = 2
+    configs_bwd_persist.append(config)
+    try:
+        test_op(
+            Z=2,
+            H=2,
+            N_CTX=256,
+            HEAD_DIM=128,
+            causal=False,
+            mode="bwd",
+            baseVariant="ws",
+            provider="triton-fp16",
+            SUBTILING=False,
+            VECT_MUL=0,
+            FADD2_REDUCE=False,
+            bwd_config_idx=len(configs_bwd_persist) - 1,
+        )
+    finally:
+        configs_bwd_persist.pop()
 
 
 @pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell (sm100) for the device-TMA bwd kernel")

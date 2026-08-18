@@ -63,6 +63,65 @@ static bool hasMMAv5WaitsInLastStage(scf::ForOp forOp,
   return hasMMAv5 && hasWaitInLastStage;
 }
 
+static std::optional<StringRef>
+getWarpSpecializedPartitionType(scf::ForOp forOp) {
+  auto wsOp = forOp->getParentOfType<triton::gpu::WarpSpecializeOp>();
+  if (!wsOp)
+    return std::nullopt;
+  auto typesAttr = wsOp->getAttrOfType<ArrayAttr>("ttg.partition.types");
+  if (!typesAttr)
+    return std::nullopt;
+
+  Operation *ancestor = forOp;
+  while (ancestor && ancestor->getParentOp() != wsOp)
+    ancestor = ancestor->getParentOp();
+  if (!ancestor)
+    return std::nullopt;
+
+  SmallVector<StringRef> partitionTypes;
+  for (Attribute attr : typesAttr) {
+    auto type = dyn_cast<StringAttr>(attr);
+    if (!type)
+      return std::nullopt;
+    partitionTypes.push_back(type.getValue());
+  }
+
+  Region *region = ancestor->getParentRegion();
+  if (region == &wsOp.getDefaultRegion())
+    return partitionTypes.empty() ? std::nullopt
+                                  : std::optional(partitionTypes.front());
+
+  auto partitionRegions = wsOp.getPartitionRegions();
+  if (partitionTypes.size() < partitionRegions.size())
+    return std::nullopt;
+  size_t typeOffset = partitionTypes.size() - partitionRegions.size();
+  for (auto [idx, partitionRegion] : llvm::enumerate(partitionRegions)) {
+    if (region == partitionRegion)
+      return partitionTypes[idx + typeOffset];
+  }
+  return std::nullopt;
+}
+
+static bool needsCustomMetaWSEpiloguePeeling(scf::ForOp forOp) {
+  Operation *scope = forOp.getOperation();
+  if (auto wsOp = forOp->getParentOfType<triton::gpu::WarpSpecializeOp>())
+    scope = wsOp.getOperation();
+
+  // The generic pipeline expander predicates peeled epilogue operations.
+  // Peer gathers cannot be predicated, and predicating a TMA reduction in one
+  // partition independently of its sibling GEMM partitions breaks their
+  // iteration lockstep. Keep the legacy PredicateStage-based peeling for the
+  // entire warp-specialize operation when either operation is present.
+  return scope
+      ->walk([&](Operation *op) {
+        if (isa<triton::nvidia_gpu::TwoCTAPeerGatherOp,
+                triton::nvidia_gpu::AsyncTMAReduceOp>(op))
+          return WalkResult::interrupt();
+        return WalkResult::advance();
+      })
+      .wasInterrupted();
+}
+
 static void expandLoops(ModuleOp moduleOp) {
   DenseSet<MaskOp> peeledMaskOps;
   auto processPeeledEpilogueOp = [&](RewriterBase &rewriter, Operation *op,
@@ -102,6 +161,12 @@ static void expandLoops(ModuleOp moduleOp) {
   auto metaWS = triton::tools::getBoolEnv("TRITON_USE_META_WS");
 
   for (scf::ForOp forOp : loops) {
+    std::optional<StringRef> partitionType;
+    if (metaWS) {
+      partitionType = getWarpSpecializedPartitionType(forOp);
+      if (partitionType && *partitionType != "gemm")
+        continue;
+    }
     CoarseSchedule schedule;
     if (failed(schedule.deSerialize(forOp))) {
       continue;
@@ -113,9 +178,22 @@ static void expandLoops(ModuleOp moduleOp) {
 
     std::vector<std::pair<Operation *, unsigned>> finalSchedule =
         schedule.createFinalSchedule(forOp);
+    if (metaWS) {
+      unsigned maxMMAStage = 0;
+      for (auto &[op, stage] : finalSchedule)
+        if (isa<triton::nvidia_gpu::MMAv5OpInterface>(op))
+          maxMMAStage = std::max(maxMMAStage, stage);
+      for (auto &[op, stage] : finalSchedule) {
+        auto wait = dyn_cast<triton::nvidia_gpu::WaitBarrierOp>(op);
+        if (wait && !wait.getDeps().empty() && stage > maxMMAStage)
+          stage = maxMMAStage;
+      }
+    }
     triton::PipeliningOption options;
+    bool useCustomMetaWSEpilogue =
+        metaWS && needsCustomMetaWSEpiloguePeeling(forOp);
     options.supportDynamicLoops = true;
-    options.peelEpilogue = false;
+    options.peelEpilogue = metaWS && !useCustomMetaWSEpilogue;
     options.predicateFn = wrapInMaskOp;
     options.getScheduleFn =
         [&](scf::ForOp forOp,
@@ -134,8 +212,8 @@ static void expandLoops(ModuleOp moduleOp) {
         !forOp->getParentOfType<triton::gpu::WarpSpecializeOp>() &&
         !keepPredicateStage; // do not peel if we are testing the stage
                              // predication
-    if (metaWS && hasWarpSpec)
-      customEpiloguePeeling = true;
+    if (metaWS)
+      customEpiloguePeeling = useCustomMetaWSEpilogue;
 
     if (keepPredicateStage || customEpiloguePeeling) {
       options.emitPredicateStageFn =

@@ -1538,7 +1538,8 @@ class tensor_descriptor_base(base_value):
         return str(self.type)
 
     @builtin
-    def load(self, offsets: Sequence[constexpr | tensor], latency=None, multicast=None, _semantic=None) -> tensor:
+    def load(self, offsets: Sequence[constexpr | tensor], latency=None, multicast=None, attrs=None,
+             _semantic=None) -> tensor:
         """Load a block from the descriptor starting at the given element offsets.
 
         Values outside of the tensor bounds will be filled with zeros.
@@ -1549,11 +1550,14 @@ class tensor_descriptor_base(base_value):
             permission to use multicast when it can prove a legal recipient
             group; it does not guarantee multicast emission. See
             :doc:`the TMA multicast design </design/triton_tma_multicast>`.
+        :param attrs: optional compiler scheduling attributes. AutoWS accepts
+            ``stage`` and ``order`` to place the load in a prefetch wavefront.
         :note: Offset must be a multiple of 16-bytes
         """
         latency = _unwrap_if_constexpr(latency)
         multicast = _unwrap_if_constexpr(multicast)
-        return _semantic.descriptor_load(self, offsets, "", "", latency, multicast)
+        attrs = _unwrap_if_constexpr(attrs)
+        return _semantic.descriptor_load(self, offsets, "", "", latency, multicast, attrs)
 
     @builtin
     def store(
@@ -4041,6 +4045,7 @@ class AutoWSLoopOptions(base_value):
                                                         metadata=_loop_attr("tt.disallow_acc_multi_buffer", "unit"))
     flatten: bool | constexpr = field(default=False, metadata=_loop_attr("tt.flatten", "unit"))
     warp_specialize: bool | constexpr = field(default=False, metadata=_loop_attr("tt.warp_specialize", "unit"))
+    assume_nonempty: bool | constexpr = field(default=False, metadata=_loop_attr("tt.assume_nonempty", "unit"))
     multi_cta: bool | constexpr = field(default=False, metadata=_loop_attr("tt.multi_cta", "unit"))
     disable_licm: bool | constexpr = field(default=False, metadata=_loop_attr("llvm.loop_annotation", "licm"))
     data_partition_factor: int | constexpr | None = field(default=None,
@@ -4097,6 +4102,10 @@ class range(AutoWSLoopOptions):
         The compiler will attempt to partition memory, MMA, and vector
         operations in the loop into separate async partitions. This will
         increase the total number of warps required by the kernel.
+    :param assume_nonempty: Assert that the loop executes at least once. This
+        permits AutoWS to remove an explicit accumulator initialization when
+        the first MMA iteration initializes the same accumulator itself.
+        Violating this contract produces undefined results.
     :param multi_cta: Enable multi-CTA reduction on the loop. The compiler
         will partition loop iterations across CTAs in a cluster and
         automatically generate cross-CTA reduction (via Distributed Shared

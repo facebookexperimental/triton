@@ -254,6 +254,28 @@ void TargetInfo::storeDShared(RewriterBase &rewriter, Location loc, Value ptr,
     return;
   }
 
+  // st.async.mbarrier::complete_tx::bytes does not accept b8/b16 element
+  // types, including vector forms such as v2.b16. Pack sub-32-bit values into
+  // b32 units before selecting the PTX instruction. Unlike ordinary DSMEM
+  // stores, this applies even when the original vector has four or fewer
+  // elements.
+  if (barrierPtr.has_value() && elemBitwidth < 32) {
+    int elemsPerPack = 32 / elemBitwidth;
+    assert(vec % elemsPerPack == 0 &&
+           "async DSMEM store must contain whole b32 units");
+    SmallVector<Value> oldVals = unpackLLVector(loc, val, rewriter);
+    SmallVector<Value> newVals;
+    for (int i = 0; i < vec / elemsPerPack; ++i) {
+      Value packed = packLLVector(
+          loc, ArrayRef(oldVals).slice(i * elemsPerPack, elemsPerPack),
+          rewriter);
+      newVals.push_back(b.bitcast(packed, i32_ty));
+    }
+    storeDShared(rewriter, loc, ptr, ctaId,
+                 packLLVector(loc, newVals, rewriter), pred, barrierPtr);
+    return;
+  }
+
   // load/store ops only support v2 and v4.  If the vector width is larger than
   // 4, we have two strategies for dealing with it.
   //  1. If the element type is smaller than b32, store b32's instead.

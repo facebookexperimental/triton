@@ -14,7 +14,7 @@
 #include "mlir/Support/LogicalResult.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "mlir/Transforms/Passes.h"
-#include "mlir/Transforms/RegionUtils.h"
+#include "nvidia/include/Dialect/NVGPU/IR/Dialect.h"
 #include "nvidia/include/Dialect/NVWS/IR/Dialect.h"
 #include "triton/Analysis/Utility.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
@@ -24,6 +24,8 @@
 #include "triton/Dialect/TritonGPU/Transforms/TritonGPUConversion.h"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/TMAUtilities.h"
 #include "triton/Tools/Sys/GetEnv.h"
+#include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/Support/JSON.h"
 #include <list>
 #include <unordered_set>
 
@@ -31,6 +33,7 @@ namespace tt = mlir::triton;
 namespace ttg = mlir::triton::gpu;
 namespace ttng = ::mlir::triton::nvidia_gpu;
 namespace ttnvws = ::mlir::triton::nvws;
+namespace nvgpu = ::mlir::triton::nvgpu;
 namespace mlir {
 
 #define DEBUG_TYPE "nvgpu-ws-lower-mem"
@@ -59,15 +62,56 @@ static bool isValidTMADestEncoding(Attribute bufferEnc, Attribute descEnc) {
          descNvmma.getFp4Padded() == nvmma.getFp4Padded();
 }
 
+static bool isScheduleRematerialization(Operation *op) {
+  return isa<ttg::ConvertLayoutOp, tt::BroadcastOp, tt::ExpandDimsOp>(op);
+}
+
+static void eraseDeadScheduleRematerializations(Value value) {
+  SmallVector<Operation *> worklist(value.getUsers());
+  SmallVector<Operation *> candidates;
+  llvm::SmallPtrSet<Operation *, 8> visited;
+  while (!worklist.empty()) {
+    Operation *op = worklist.pop_back_val();
+    if (!isScheduleRematerialization(op))
+      continue;
+    if (!visited.insert(op).second)
+      continue;
+    candidates.push_back(op);
+    for (Value result : op->getResults())
+      llvm::append_range(worklist, result.getUsers());
+  }
+
+  bool changed = true;
+  while (changed) {
+    changed = false;
+    for (Operation *&op : llvm::reverse(candidates)) {
+      if (op && op->use_empty()) {
+        op->erase();
+        op = nullptr;
+        changed = true;
+      }
+    }
+  }
+}
+
 LogicalResult doConvertDescriptorLoadsToNVWS(triton::FuncOp funcOp) {
+  // Schedule rematerialization can leave dead per-task clones attached to a
+  // descriptor load. Remove only dead layout-rematerialization chains before
+  // deriving the replacement local_load's consumer task IDs; whole-function
+  // DCE would also erase intentionally dead consumers in test/debug IR.
   SmallVector<tt::DescriptorLoadOp> loads;
   funcOp.walk([&](tt::DescriptorLoadOp load) { loads.push_back(load); });
 
   for (tt::DescriptorLoadOp load : loads) {
+    eraseDeadScheduleRematerializations(load.getResult());
+    if (load.getResult().use_empty()) {
+      load.erase();
+      continue;
+    }
+
     auto tensorType = dyn_cast<RankedTensorType>(load.getType());
     if (!tensorType)
       return load.emitError("expected a ranked tensor descriptor load result");
-
     Attribute descEnc =
         cast<tt::TensorDescType>(load.getDesc().getType()).getSharedLayout();
 
@@ -191,6 +235,58 @@ Value getTMALoadBufferForStage(OpBuilderWithAsyncTaskIds &builder, Value buffer,
 
 } // namespace
 
+static Value mapBarrierTo2CTALeader(OpBuilderWithAsyncTaskIds &builder,
+                                    Location loc, Value barrier) {
+  MLIRContext *ctx = builder.getContext();
+  Value ctaId = builder.createWithAsyncTaskIds<nvgpu::ClusterCTAIdOp>(
+      loc, builder.getI32Type());
+  Value negTwo =
+      builder.createWithAsyncTaskIds<arith::ConstantIntOp>(loc, -2, 32);
+  Value leaderRank =
+      builder.createWithAsyncTaskIds<arith::AndIOp>(loc, ctaId, negTwo);
+  auto barrierTy = cast<ttg::MemDescType>(barrier.getType());
+  auto remoteTy = ttg::MemDescType::get(
+      barrierTy.getShape(), barrierTy.getElementType(), barrierTy.getEncoding(),
+      ttng::SharedClusterMemorySpaceAttr::get(ctx),
+      barrierTy.getMutableMemory(), barrierTy.getAllocShape());
+  return builder.createWithAsyncTaskIds<ttng::MapToRemoteBufferOp>(
+      loc, remoteTy, barrier, leaderRank);
+}
+
+static Value mapBarrierTo2CTAPeer(OpBuilderWithAsyncTaskIds &builder,
+                                  Location loc, Value barrier, Value ctaId) {
+  MLIRContext *ctx = builder.getContext();
+  Value one = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(loc, 1, 32);
+  Value peerRank =
+      builder.createWithAsyncTaskIds<arith::XOrIOp>(loc, ctaId, one);
+  auto barrierTy = cast<ttg::MemDescType>(barrier.getType());
+  auto remoteTy = ttg::MemDescType::get(
+      barrierTy.getShape(), barrierTy.getElementType(), barrierTy.getEncoding(),
+      ttng::SharedClusterMemorySpaceAttr::get(ctx),
+      barrierTy.getMutableMemory(), barrierTy.getAllocShape());
+  return builder.createWithAsyncTaskIds<ttng::MapToRemoteBufferOp>(
+      loc, remoteTy, barrier, peerRank);
+}
+
+static bool useDirectTwoCTAWait(Operation *anchor) {
+  auto funcOp = anchor->getParentOfType<tt::FuncOp>();
+  bool enabled = false;
+  funcOp.walk([&](Operation *op) {
+    auto attr = op->getAttrOfType<StringAttr>("tt.autows");
+    if (!attr)
+      return;
+    auto parsed = llvm::json::parse(attr.getValue());
+    if (!parsed) {
+      llvm::consumeError(parsed.takeError());
+      return;
+    }
+    auto *object = parsed->getAsObject();
+    if (object)
+      enabled |= object->getBoolean("two_cta_tma_direct_wait").value_or(false);
+  });
+  return enabled;
+}
+
 Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
                             SmallVector<ttnvws::DescriptorLoadOp> &tmaLoads,
                             Value barrierAlloc, Value bufferIdx,
@@ -202,9 +298,21 @@ Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
   auto loc = barrierAlloc.getLoc();
 
   // Compute the total size of the loads.
+  // A cooperative two-CTA load moves the pair's bytes through the leader's
+  // barrier, so the leader must expect twice the per-CTA transaction count.
+  // The group must be homogeneous: mixing protocols would give the fused
+  // barrier inconsistent completion routing and expected-byte semantics.
   int64_t sizeInBytes = 0;
-  for (auto tmaLoad : tmaLoads)
-    sizeInBytes += tmaLoad.getTxCount();
+  bool twoCTA = tmaLoads.front()->hasAttr("two_cta_load");
+  assert(llvm::all_of(tmaLoads,
+                      [twoCTA](ttnvws::DescriptorLoadOp load) {
+                        return load->hasAttr("two_cta_load") == twoCTA;
+                      }) &&
+         "TMA barrier fusion cannot mix cooperative and per-CTA loads");
+  for (auto tmaLoad : tmaLoads) {
+    bool cooperative = tmaLoad->hasAttr("two_cta_load");
+    sizeInBytes += tmaLoad.getTxCount() * (cooperative ? 2 : 1);
+  }
 
   // Create a barrier_expect with the appropriate size and insert it before the
   // first load.
@@ -213,9 +321,26 @@ Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
   builder.setLoopScheduleInfoFromOp(headProducer);
   auto prodBarrier =
       getBarrierForPipelineStage(builder, barrierAlloc, bufferIdx);
+  Value tmaBarrier =
+      twoCTA ? mapBarrierTo2CTALeader(builder, loc, prodBarrier) : prodBarrier;
   auto pred = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(loc, 1, 1);
-  builder.createWithAsyncTaskIds<ttng::BarrierExpectOp>(loc, prodBarrier,
-                                                        sizeInBytes, pred);
+  // Only the pair leader publishes the expected byte count; the follower's
+  // completion is relayed to the leader's barrier.
+  Value expectPred = pred;
+  if (twoCTA) {
+    Value ctaId = builder.createWithAsyncTaskIds<nvgpu::ClusterCTAIdOp>(
+        loc, builder.getI32Type());
+    Value two =
+        builder.createWithAsyncTaskIds<arith::ConstantIntOp>(loc, 2, 32);
+    Value rankInPair =
+        builder.createWithAsyncTaskIds<arith::RemUIOp>(loc, ctaId, two);
+    Value zero =
+        builder.createWithAsyncTaskIds<arith::ConstantIntOp>(loc, 0, 32);
+    expectPred = builder.createWithAsyncTaskIds<arith::CmpIOp>(
+        loc, arith::CmpIPredicate::eq, rankInPair, zero);
+  }
+  builder.createWithAsyncTaskIds<ttng::BarrierExpectOp>(
+      loc, prodBarrier, sizeInBytes, expectPred);
 
   // Convert all the producers to async_tma_copy_global_to_local
   Operation *copy = nullptr;
@@ -225,9 +350,13 @@ Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
     builder.setLoopScheduleInfoFromOp(tmaLoad);
     Value pipelineBuffer =
         getTMALoadBufferForStage(builder, tmaLoad.getResult(), bufferIdx);
-    copy = builder.createWithAsyncTaskIds<ttng::AsyncTMACopyGlobalToLocalOp>(
-        tmaLoad.getLoc(), tmaLoad.getDesc(), tmaLoad.getIndices(), prodBarrier,
-        pipelineBuffer, pred);
+    auto copyOp =
+        builder.createWithAsyncTaskIds<ttng::AsyncTMACopyGlobalToLocalOp>(
+            tmaLoad.getLoc(), tmaLoad.getDesc(), tmaLoad.getIndices(),
+            tmaBarrier, pipelineBuffer, pred);
+    if (tmaLoad->hasAttr("two_cta_load"))
+      copyOp.setTwoCta(true);
+    copy = copyOp;
   }
 
   // Create a wait_barrier before the first consumer.
@@ -247,17 +376,60 @@ Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
       loc, builder.getI32Type(), phase);
   Value waitPred =
       builder.createWithAsyncTaskIds<arith::ConstantIntOp>(loc, 1, 1);
+  bool directTwoCTAWait = twoCTA && useDirectTwoCTAWait(headConsumer);
+  Value followerWaitPred;
+  Value peerBarrier;
+  if (twoCTA) {
+    Value ctaId = builder.createWithAsyncTaskIds<nvgpu::ClusterCTAIdOp>(
+        loc, builder.getI32Type());
+    Value two =
+        builder.createWithAsyncTaskIds<arith::ConstantIntOp>(loc, 2, 32);
+    Value rankInPair =
+        builder.createWithAsyncTaskIds<arith::RemUIOp>(loc, ctaId, two);
+    Value zero =
+        builder.createWithAsyncTaskIds<arith::ConstantIntOp>(loc, 0, 32);
+    waitPred = builder.createWithAsyncTaskIds<arith::CmpIOp>(
+        loc, arith::CmpIPredicate::eq, rankInPair, zero);
+    if (!directTwoCTAWait) {
+      followerWaitPred = builder.createWithAsyncTaskIds<arith::CmpIOp>(
+          loc, arith::CmpIPredicate::ne, rankInPair, zero);
+      peerBarrier = mapBarrierTo2CTAPeer(builder, loc, consBarrier, ctaId);
+    }
+  }
 
   // Create one WaitBarrierOp per consumer task ID.
   builder.setAsyncTaskIdsFromOp(headConsumer);
   builder.createWithAsyncTaskIds<ttng::WaitBarrierOp>(
       loc, consBarrier, phase, waitPred, /*deps=*/ValueRange{},
       consumerWaitConstraints);
+  if (twoCTA && !directTwoCTAWait) {
+    // The hardware CTA-group TMA transaction completes the leader's local
+    // mbarrier. Relay that completion to the follower's corresponding local
+    // barrier, then let the follower wait on it. A cluster barrier is not
+    // valid here: only this warp-specialized consumer partition executes the
+    // handoff, while cluster barriers require participation from every warp.
+    builder.createWithAsyncTaskIds<ttng::FenceAsyncSharedOp>(
+        loc, /*bCluster=*/false);
+    builder.createWithAsyncTaskIds<ttng::ArriveBarrierOp>(
+        loc, peerBarrier, /*count=*/1, waitPred);
+    builder.createWithAsyncTaskIds<ttng::WaitBarrierOp>(
+        loc, consBarrier, phase, followerWaitPred, /*deps=*/ValueRange{},
+        consumerWaitConstraints);
+  }
   for (int extraTaskId : additionalConsumerTaskIds) {
     builder.setAsynTaskIdsFromArray({extraTaskId});
     builder.createWithAsyncTaskIds<ttng::WaitBarrierOp>(
         loc, consBarrier, phase, waitPred,
         /*deps=*/ValueRange{}, consumerWaitConstraints);
+    if (twoCTA && !directTwoCTAWait) {
+      builder.createWithAsyncTaskIds<ttng::FenceAsyncSharedOp>(
+          loc, /*bCluster=*/false);
+      builder.createWithAsyncTaskIds<ttng::ArriveBarrierOp>(
+          loc, peerBarrier, /*count=*/1, waitPred);
+      builder.createWithAsyncTaskIds<ttng::WaitBarrierOp>(
+          loc, consBarrier, phase, followerWaitPred, /*deps=*/ValueRange{},
+          consumerWaitConstraints);
+    }
   }
 
   for (auto tmaLoad : tmaLoads)

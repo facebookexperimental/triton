@@ -143,6 +143,38 @@ matching while result and after-region argument, and the after-region
 After rewriting, runs dead code elimination and removes orphaned operations
 that are no longer referenced after partitioning.
 
+### Step 7: Conditional TMEM rescale materialization
+
+FA forward represents its optional accumulator rescale as an eager SSA select
+before tensor-memory allocation is hoisted. `HoistTMEMAlloc` first folds that
+select into a predicated accumulator `TMEMStoreOp`. M partitioning creates one
+scalar predicate and one accumulator view per partition. Partition scheduling
+then co-locates the scalar predicate chain with the correction store. It also
+pulls the single-consumer tensor elementwise predicate operation directly
+feeding that chain, such as `alpha < 1`, into the correction partition while
+leaving its tensor operands as channel boundaries. This makes the
+already-required alpha value the channel boundary and avoids materializing a
+redundant tensor predicate channel. After warp specialization and software
+pipelining have materialized each task, the post-pipeline `HoistTMEMAlloc` pass
+rewrites each such update as:
+
+```mlir
+scf.if %should_rescale {
+  %acc = ttng.tmem_load %buffer
+  %scaled = arith.mulf %acc, %alpha
+  ttng.tmem_store %scaled, %buffer, %true
+}
+```
+
+Delaying the rewrite until each task has been materialized keeps the
+branch within the accumulator task instead of creating an unsupported
+cross-task async-token channel. At that point synchronization is normally
+barrier-managed and the TMEM ops are tokenless; if explicit tokens remain, the
+then branch yields the written token and the else branch yields the incoming
+token. The side-effecting branch cannot be canonicalized back to an eager
+select, so a false predicate skips the accumulator TMEM load, arithmetic, and
+store.
+
 ## Key Design Points
 
 ### Partition Dimension Tracking
@@ -249,6 +281,27 @@ ttng.tc_gen5_mma_scaled %a1, %b, %acc1[%tok1], %a_scale1, %b_scale, ...
 Data partitioning operates **after** task ID assignment. The offset parameter
 selects which task ID from the original array. This is how N consumer warp
 groups each get their slice of the data.
+
+### Partition-aware contraction schedules
+
+Most `tt.autows` annotations are cloned unchanged, except for channel buffer
+IDs, which are remapped to keep partitions disjoint. A two-group FA forward
+pipeline additionally needs a partition-aware contraction order to safely
+reuse its single-buffer QK tiles while overlapping adjacent iterations. The
+frontend marks QK and PV contractions with `two_cta_interleave_role`; after
+slicing gives each clone a concrete partition index, data partitioning emits:
+
+```text
+QK partition 0: stage 0, order 0
+PV partition 1: stage 1, order 1
+QK partition 1: stage 0, order 2
+PV partition 0: stage 0, order 3
+```
+
+This puts `QK0`, `QK1`, and `PV0` in the prologue, matches TLX's steady-state
+`QK0(next) -> PV1(previous) -> QK1(next) -> PV0(current)` issue order, and
+leaves `PV1` in the epilogue. The rewrite is opt-in and only applies when there
+are exactly two data partitions.
 
 ## Regression Tests
 

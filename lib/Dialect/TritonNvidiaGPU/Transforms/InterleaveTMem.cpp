@@ -1,3 +1,4 @@
+#include "mlir/IR/Dominance.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "nvidia/hopper/include/Transforms/WSBarrierReorder.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
@@ -140,7 +141,16 @@ std::pair<Value, AccessRange> findBufferAccess(Value a) {
       return findBufferAccess(wsOp.getExplicitCaptures()[arg.getArgNumber()]);
     }
 
-    // Unknown block argument.
+    // Partition outlining turns captured TMEM allocations into block
+    // arguments. Within one partition the argument remains a stable alias root
+    // for all of its views, so retain its full range for local analysis.
+    if (auto type = dyn_cast<ttg::MemDescType>(arg.getType());
+        type && isa<TensorMemorySpaceAttr>(type.getMemorySpace())) {
+      AccessRange access;
+      for (uint64_t dim : type.getShape())
+        access.ranges.push_back({{0, dim}});
+      return {arg, std::move(access)};
+    }
     return {};
   }
 
@@ -154,7 +164,8 @@ std::pair<Value, AccessRange> findBufferAccess(Value a) {
   }
 
   // Trans and Reshape views don't change the access size.
-  if (isa<ttg::MemDescTransOp, ttg::MemDescReshapeOp>(defOp)) {
+  if (isa<ttg::MemDescTransOp, ttg::MemDescReshapeOp,
+          ttg::MemDescReinterpretOp>(defOp)) {
     return findBufferAccess(defOp->getOperand(0));
   }
 
@@ -204,9 +215,49 @@ bool tmemMayAlias(Value a, Value b) {
   return true;
 }
 
+bool tmemHasSameBaseAndStart(Value a, Value b) {
+  auto [aAlloc, aRanges] = findBufferAccess(a);
+  auto [bAlloc, bRanges] = findBufferAccess(b);
+  if (!aAlloc || !bAlloc || aAlloc != bAlloc)
+    return false;
+  for (auto [aRange, bRange] : llvm::zip(aRanges.ranges, bRanges.ranges)) {
+    if (!aRange || !bRange || aRange->start() != bRange->start())
+      return false;
+  }
+  return true;
+}
+
 bool isPlainTMAStoreTokenWait(Operation *op) {
   auto wait = dyn_cast<TMAStoreTokenWaitOp>(op);
   return wait && wait.getBarriers().empty();
+}
+
+void delayPlainTMAStoreTokenWaits(Block &block) {
+  SmallVector<TMAStoreTokenWaitOp> waits;
+  for (Operation &op : block)
+    if (auto wait = dyn_cast<TMAStoreTokenWaitOp>(&op);
+        wait && wait.getBarriers().empty())
+      waits.push_back(wait);
+
+  for (TMAStoreTokenWaitOp wait : waits) {
+    Operation *tmaStore = wait.getToken().getDefiningOp();
+    if (!tmaStore ||
+        !isa<AsyncTMACopyLocalToGlobalOp, AsyncTMAReduceOp>(tmaStore) ||
+        tmaStore->getBlock() != &block)
+      continue;
+    Value staging;
+    if (auto copy = dyn_cast<AsyncTMACopyLocalToGlobalOp>(tmaStore))
+      staging = copy.getSrc();
+    else
+      staging = cast<AsyncTMAReduceOp>(tmaStore).getSrc();
+    for (auto it = std::next(wait->getIterator()); it != block.end(); ++it) {
+      auto localStore = dyn_cast<ttg::LocalStoreOp>(&*it);
+      if (!localStore || localStore.getDst() != staging)
+        continue;
+      wait->moveBefore(localStore);
+      break;
+    }
+  }
 }
 
 // Check whether a movable chain can sink past `next`. When opConstraints is
@@ -224,8 +275,19 @@ bool canSinkUseChainPast(Value buffer, ArrayRef<Operation *> useChain,
       break;
     }
   }
-  if (isWSBarrierReorderEnabled()) {
-    if (!canAdvanceWSBarrier(opConstraints, next))
+  // A TMEM epilogue load can carry the constraints from its own arrive
+  // barrier.  Use those constraints even when the global barrier-reorder
+  // knob is disabled: this moves only the load/use chain (and its matching
+  // arrive), rather than globally raising and sinking every WS barrier in the
+  // block.
+  if (opConstraints || isWSBarrierReorderEnabled()) {
+    // Once the load chain has picked up its own arrive, it may pass another
+    // WS arrive: both operations only delay signals.  This mirrors
+    // sinkWSArrives, but is deliberately limited to the one epilogue chain.
+    bool arrivesCanSwap =
+        isa<ArriveBarrierOp>(useChain.back()) && isa<ArriveBarrierOp>(next) &&
+        hasWSBarrierConstraints(cast<ArriveBarrierOp>(next).getConstraints());
+    if (!arrivesCanSwap && !canAdvanceWSBarrier(opConstraints, next))
       return false;
   } else {
     // Legacy safe behavior: don't sink past barrier signals, since they may
@@ -308,6 +370,42 @@ struct TMemLoadGroup {
   SmallVector<Operation *> loads;
 };
 
+// Trace the value produced by a TMEM load through a single-use pure chain to
+// the local store that materializes it in SMEM. This is the common output
+// epilogue shape: tmem_load -> convert/scale -> local_store -> TMA store.
+ttg::LocalStoreOp findEpilogueLocalStore(Operation *load) {
+  if (load->getNumResults() != 1)
+    return {};
+  Value value = load->getResult(0);
+  while (value.hasOneUse()) {
+    Operation *user = *value.user_begin();
+    if (auto localStore = dyn_cast<ttg::LocalStoreOp>(user))
+      return localStore;
+    if (!isPure(user) || user->getNumResults() != 1)
+      return {};
+    value = user->getResult(0);
+  }
+  return {};
+}
+
+bool isTMAStoreLike(Operation *op) {
+  return isa<AsyncTMACopyLocalToGlobalOp, AsyncTMAReduceOp>(op);
+}
+
+Operation *findEpilogueTMAStore(Operation *load) {
+  auto localStore = findEpilogueLocalStore(load);
+  if (!localStore)
+    return nullptr;
+  Value staging = localStore.getDst();
+  for (Operation *user : staging.getUsers()) {
+    if (!isTMAStoreLike(user) || user->getBlock() != load->getBlock() ||
+        !localStore->isBeforeInBlock(user))
+      continue;
+    return user;
+  }
+  return nullptr;
+}
+
 DenseMap<Operation *, unsigned> getBlockOpPositions(Block &block) {
   DenseMap<Operation *, unsigned> opToPosition;
   unsigned position = 0;
@@ -331,6 +429,17 @@ getTMemLoadLiveRangeEnd(Operation *load,
         end = user;
         endPos = userIt->second;
       }
+    }
+  }
+  // A TMA output epilogue does not become reusable at local_store: the TMA
+  // engine still has to begin reading the staging buffer. Extend the boundary
+  // through that launch so the next TMEM slice can overlap the asynchronous
+  // transfer without extending both register live ranges.
+  if (Operation *tmaStore = findEpilogueTMAStore(load)) {
+    auto tmaIt = opToPosition.find(tmaStore);
+    if (tmaIt != opToPosition.end() && tmaIt->second > endPos) {
+      end = tmaStore;
+      endPos = tmaIt->second;
     }
   }
   return end;
@@ -434,7 +543,14 @@ SmallVector<TMemLoadGroup> buildTMemLoadGroups(
     DictionaryAttr constraints;
     if (auto it = memOpConstraints.find(op); it != memOpConstraints.end())
       constraints = it->second;
-    Value alloc = findBufferAccess(load.getSrc()).first;
+    // Output-epilogue loads may come from distinct TMEM allocations (dV and
+    // dK), but they compete for registers and feed a single ordered TMA-store
+    // stream. Group them together when their WS constraints match so the
+    // interleaver can realize load -> store launch -> next load across tensor
+    // boundaries. Other loads retain allocation-local grouping.
+    Value alloc = findEpilogueTMAStore(op)
+                      ? Value{}
+                      : findBufferAccess(load.getSrc()).first;
 
     auto groupIt = llvm::find_if(groups, [&](const TMemLoadGroup &group) {
       return group.constraints == constraints && group.alloc == alloc;
@@ -606,6 +722,267 @@ DenseMap<Operation *, DictionaryAttr> buildTMemLoadConstraints(Block &block) {
   return memOpConstraints;
 }
 
+// Prefer materializing a TMEM operand before an independent SMEM operand when
+// both feed the same pure operation.  Code partitioning places each channel
+// consumer immediately before its first use, which can otherwise leave the
+// SMEM load/broadcast live across a wide TMEM load.  Delay the complete SMEM
+// consumer channel until the TMEM channel has completed.  Both the wait and
+// release are allowed to cross the intervening channel only when the WS
+// ordered-region metadata proves that reordering safe.
+bool prioritizeTMemOperand(Block &block) {
+  bool changed = false;
+  SmallVector<TMEMLoadOp> tmemLoads;
+  for (Operation &op : block)
+    if (auto load = dyn_cast<TMEMLoadOp>(&op))
+      tmemLoads.push_back(load);
+
+  for (TMEMLoadOp tmemLoad : tmemLoads) {
+    Value tmemValue = tmemLoad.getResult();
+    Operation *commonUser = nullptr;
+    while (tmemValue.hasOneUse()) {
+      Operation *user = *tmemValue.user_begin();
+      if (!isPure(user))
+        break;
+      if (user->getNumOperands() != 1 || user->getNumResults() != 1) {
+        commonUser = user;
+        break;
+      }
+      tmemValue = user->getResult(0);
+    }
+    if (!commonUser || !isPure(commonUser) || commonUser->getBlock() != &block)
+      continue;
+
+    for (Value operand : commonUser->getOperands()) {
+      if (operand == tmemValue)
+        continue;
+
+      SmallVector<Operation *> reverseChain;
+      Value current = operand;
+      ttg::LocalLoadOp localLoad;
+      while (Operation *def = current.getDefiningOp()) {
+        if (def->getBlock() != &block || !def->hasOneUse())
+          break;
+        if (auto load = dyn_cast<ttg::LocalLoadOp>(def)) {
+          localLoad = load;
+          break;
+        }
+        if (!isPure(def) || def->getNumOperands() != 1 ||
+            def->getNumResults() != 1)
+          break;
+        reverseChain.push_back(def);
+        current = def->getOperand(0);
+      }
+      if (!localLoad || !localLoad->isBeforeInBlock(tmemLoad))
+        continue;
+
+      auto acquire = dyn_cast_or_null<WaitBarrierOp>(localLoad->getPrevNode());
+      if (!acquire || !hasWSBarrierConstraints(acquire.getConstraints()))
+        continue;
+      SmallVector<Operation *> acquirePrefix;
+      llvm::SmallPtrSet<Operation *, 8> movingOps{acquire, localLoad};
+      for (Operation *op = acquire->getPrevNode(); op && isPure(op);
+           op = op->getPrevNode()) {
+        bool usedOnlyByMovingOps =
+            llvm::all_of(op->getUsers(), [&](Operation *user) {
+              return movingOps.contains(user);
+            });
+        if (!usedOnlyByMovingOps)
+          break;
+        acquirePrefix.push_back(op);
+        movingOps.insert(op);
+      }
+
+      SmallVector<Operation *> releasePrefix;
+      Operation *releaseCandidate = localLoad->getNextNode();
+      while (releaseCandidate && isPure(releaseCandidate)) {
+        releasePrefix.push_back(releaseCandidate);
+        releaseCandidate = releaseCandidate->getNextNode();
+      }
+      auto release = dyn_cast_or_null<ArriveBarrierOp>(releaseCandidate);
+      if (!release || !hasWSBarrierConstraints(release.getConstraints()))
+        continue;
+
+      bool safe = true;
+      for (Operation *op = release->getNextNode(); op && op != commonUser;
+           op = op->getNextNode()) {
+        if (auto arrive = dyn_cast<ArriveBarrierOp>(op)) {
+          if (!hasWSBarrierConstraints(arrive.getConstraints()) ||
+              !canAdvanceWSBarrierArrivePastWait(arrive.getConstraints(),
+                                                 acquire.getConstraints())) {
+            safe = false;
+            break;
+          }
+          continue;
+        }
+        if (auto wait = dyn_cast<WaitBarrierOp>(op)) {
+          if (!hasWSBarrierConstraints(wait.getConstraints())) {
+            safe = false;
+            break;
+          }
+          continue;
+        }
+        if (!canAdvanceWSBarrier(release.getConstraints(), op)) {
+          safe = false;
+          break;
+        }
+      }
+      if (!safe)
+        continue;
+
+      for (Operation *op : llvm::reverse(acquirePrefix))
+        op->moveBefore(commonUser);
+      acquire->moveBefore(commonUser);
+      localLoad->moveBefore(commonUser);
+      for (Operation *op : releasePrefix)
+        op->moveBefore(commonUser);
+      release->moveBefore(commonUser);
+      for (Operation *op : llvm::reverse(reverseChain))
+        op->moveBefore(commonUser);
+      changed = true;
+      break;
+    }
+  }
+  return changed;
+}
+
+// Code partitioning may relocate a temporal-reuse sibling's empty acquire in
+// front of an earlier whole-allocation overwrite. Modulo expansion places the
+// acquire correctly, but an inner-loop copy can retain the overwrite channel's
+// phase instead of the later sibling's phase. Repair the steady-state copy
+// after expansion, and add the corresponding loop-entry acquire.
+//
+// FA-bwd's mixed qkT/ppT/dQ allocation is the motivating shape: qkT and dQ
+// both write offset 0 while ppT is packed at offset 64. The qkT useD=false MMA
+// must wait on dQ's EMPTY barrier with dQ's phase before overwriting the slot.
+bool repairWholeOverwriteReuseWaitPhases(Block &block) {
+  DominanceInfo dominance(block.getParentOp());
+  SmallVector<TCGen5MMAOp> mmas;
+  for (Operation &op : block)
+    if (auto mma = dyn_cast<TCGen5MMAOp>(&op))
+      mmas.push_back(mma);
+
+  auto findChannelWait = [](TCGen5MMAOp mma) -> WaitBarrierOp {
+    for (Operation *op = mma->getPrevNode(); op; op = op->getPrevNode()) {
+      auto wait = dyn_cast<WaitBarrierOp>(op);
+      if (!wait || !hasWSBarrierConstraints(wait.getConstraints()))
+        continue;
+      if (wait.getLoc() == mma.getLoc())
+        return wait;
+    }
+    return {};
+  };
+  auto isNarrowReuse = [](TCGen5MMAOp whole, TCGen5MMAOp sibling) {
+    return cast<ShapedType>(whole.getD().getType()).getShape() !=
+           cast<ShapedType>(sibling.getD().getType()).getShape();
+  };
+
+  auto cloneValueBefore = [&](Value value, Operation *insertBefore,
+                              OpBuilder &builder) -> Value {
+    if (!value || dominance.dominates(value, insertBefore))
+      return value;
+    Operation *def = value.getDefiningOp();
+    if (!def || !isPure(def) || def->getNumResults() != 1)
+      return {};
+    IRMapping mapping;
+    for (Value operand : def->getOperands()) {
+      Value mapped = operand;
+      if (!dominance.dominates(operand, insertBefore)) {
+        Operation *operandDef = operand.getDefiningOp();
+        if (!operandDef || !isPure(operandDef) ||
+            operandDef->getNumResults() != 1 ||
+            !llvm::all_of(operandDef->getOperands(), [&](Value input) {
+              return dominance.dominates(input, insertBefore);
+            }))
+          return {};
+        mapped = builder.clone(*operandDef)->getResult(0);
+      }
+      mapping.map(operand, mapped);
+    }
+    return builder.clone(*def, mapping)->getResult(0);
+  };
+
+  auto insertReuseWait = [&](TCGen5MMAOp earlyMma,
+                             WaitBarrierOp earlyChannelWait,
+                             WaitBarrierOp lateWait, Value phase, Value pred) {
+    for (Operation *op = earlyMma->getPrevNode(); op; op = op->getPrevNode()) {
+      if (isa<TCGen5MMAOp>(op))
+        break;
+      if (auto wait = dyn_cast<WaitBarrierOp>(op);
+          wait && wait.getLoc() == lateWait.getLoc() &&
+          !hasWSBarrierConstraints(wait.getConstraints()))
+        return false;
+    }
+    // Insert immediately after the overwrite channel's acquire, before the
+    // hardware 2CTA issue protocol. Inserting immediately before the MMA is
+    // too late: a CTA can complete the peer issue handshake while its peer has
+    // not yet acquired the temporal-reuse EMPTY barrier.
+    OpBuilder builder(earlyChannelWait);
+    builder.setInsertionPointAfter(earlyChannelWait);
+    Value alloc = cloneValueBefore(lateWait.getAlloc(), earlyMma, builder);
+    phase = cloneValueBefore(phase, earlyMma, builder);
+    pred = cloneValueBefore(pred, earlyMma, builder);
+    if (!alloc || !phase || (lateWait.getPred() && !pred))
+      return false;
+    WaitBarrierOp cloned =
+        pred ? WaitBarrierOp::create(builder, lateWait.getLoc(), alloc, phase,
+                                     pred)
+             : WaitBarrierOp::create(builder, lateWait.getLoc(), alloc, phase);
+    if (Attribute taskIds = lateWait->getAttr("async_task_id"))
+      cloned->setAttr("async_task_id", taskIds);
+    return true;
+  };
+
+  bool changed = false;
+  for (auto [lateIdx, lateMma] : llvm::enumerate(mmas)) {
+    WaitBarrierOp lateWait = findChannelWait(lateMma);
+    if (!lateWait)
+      continue;
+    for (TCGen5MMAOp earlyMma :
+         ArrayRef<TCGen5MMAOp>(mmas).take_front(lateIdx)) {
+      auto useD = getConstantIntValue(earlyMma.getUseD());
+      if (!useD || *useD != 0)
+        continue;
+      if (!isNarrowReuse(earlyMma, lateMma) ||
+          !tmemHasSameBaseAndStart(earlyMma.getD(), lateMma.getD()))
+        continue;
+      WaitBarrierOp earlyWait = findChannelWait(earlyMma);
+      if (!earlyWait)
+        continue;
+
+      // The sibling phase is based on the current TMEM ring slot. Clone its
+      // pure phase calculation before the earlier overwrite.
+      changed |= insertReuseWait(earlyMma, earlyWait, lateWait,
+                                 lateWait.getPhase(), lateWait.getPred());
+      break;
+    }
+  }
+
+  // The first overwrite is outside the modulo loop while the sibling producer
+  // is nested inside it. Its completion-channel phase is the loop-entry phase
+  // for the same ring slot, and its predicate suppresses an empty loop.
+  for (TCGen5MMAOp earlyMma : mmas) {
+    auto useD = getConstantIntValue(earlyMma.getUseD());
+    if (!useD || *useD != 0)
+      continue;
+    WaitBarrierOp earlyWait = findChannelWait(earlyMma);
+    if (!earlyWait)
+      continue;
+    WalkResult result = block.walk([&](TCGen5MMAOp lateMma) {
+      if (lateMma->getBlock() == &block || !isNarrowReuse(earlyMma, lateMma) ||
+          !tmemHasSameBaseAndStart(earlyMma.getD(), lateMma.getD()))
+        return WalkResult::advance();
+      WaitBarrierOp lateWait = findChannelWait(lateMma);
+      if (!lateWait)
+        return WalkResult::advance();
+      changed |= insertReuseWait(earlyMma, earlyWait, lateWait,
+                                 earlyWait.getPhase(), earlyWait.getPred());
+      return WalkResult::interrupt();
+    });
+    (void)result;
+  }
+  return changed;
+}
+
 void processBlock(BlockInterleaveInfo &info) {
   Block &block = *info.block;
   SmallVector<Operation *> originalOrder = getBlockOpOrder(block);
@@ -629,9 +1006,11 @@ void processBlock(BlockInterleaveInfo &info) {
 
   // Step 3: Move TMEM allocs close to their uses, then sink tmem_loads only
   // far enough to start after the previous load's live range.
-  DenseMap<Operation *, DictionaryAttr> memOpConstraints;
-  if (reorderWSBarriers)
-    memOpConstraints = buildTMemLoadConstraints(block);
+  // Constraint-guided TMEM epilogue sinking is safe independently of the
+  // global WS-barrier normalization.  Build the mapping unconditionally so a
+  // load can carry its own arrive across barriers from independent channels.
+  DenseMap<Operation *, DictionaryAttr> memOpConstraints =
+      buildTMemLoadConstraints(block);
   SmallVector<TMemLoadGroup> loadGroups =
       buildTMemLoadGroups(info.tmemLoads, memOpConstraints);
   for (auto [op, buffer] : info.opsToSink) {
@@ -650,6 +1029,10 @@ void processBlock(BlockInterleaveInfo &info) {
   // Step 4: Restore barriers to optimal positions near their memory ops.
   if (reorderWSBarriers)
     optimizeWSBarrierLocations(barrierMap);
+  // Barrier restoration and TMEM-load sinking may move a load across a token
+  // wait that was already positioned before staging reuse. Re-establish that
+  // canonical placement so the load/conversion overlaps the prior TMA store.
+  delayPlainTMAStoreTokenWaits(block);
 
   SmallVector<Operation *> currentLivenessOrder = getBlockOpOrder(block);
   currentLivenessOrder.push_back(block.getTerminator());
@@ -690,12 +1073,34 @@ struct TritonNvidiaGPUInterleaveTMemPass
     SmallVector<BlockInterleaveInfo> blocksToProcess;
     m.walk([&](Block *block) {
       BlockInterleaveInfo info = collectBlockInterleaveInfo(block);
+      if (info.tmemLoadCount > 0)
+        prioritizeTMemOperand(*block);
       if (info.tmemLoadCount < 2)
         return;
       blocksToProcess.push_back(std::move(info));
     });
     for (auto &info : blocksToProcess)
       processBlock(info);
+    // The temporal-reuse EMPTY acquire this repair clones is placed relative
+    // to the hardware 2-CTA issue handshake, and the packed qkT/dQ TMEM reuse
+    // it targets only arises in the 2-CTA backward. On a 1-CTA kernel the
+    // extra acquire waits on a barrier no partition arrives on, which
+    // deadlocks the kernel, so restrict the repair to 2-CTA modules.
+    if (is2CTA(m))
+      m.walk([](Block *block) { repairWholeOverwriteReuseWaitPhases(*block); });
+
+    // WS code partitioning keeps a structurally redundant P-publication wait
+    // long enough for loop scheduling and TMEM interleaving to observe its
+    // cross-partition ordering edge.  Erase it only after those transformations
+    // have fixed the operation order; removing it in WSCodePartition changes
+    // the schedule and does not reproduce the proven final-IR ablation.
+    SmallVector<WaitBarrierOp> redundantPublicationWaits;
+    m.walk([&](WaitBarrierOp wait) {
+      if (wait->hasAttr("ttng.redundant_publication_wait"))
+        redundantPublicationWaits.push_back(wait);
+    });
+    for (WaitBarrierOp wait : redundantPublicationWaits)
+      wait.erase();
   }
 };
 

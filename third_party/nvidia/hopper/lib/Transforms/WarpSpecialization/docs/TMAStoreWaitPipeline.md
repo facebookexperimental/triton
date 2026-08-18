@@ -102,12 +102,35 @@ into a reinterpret view of the host alloc (see
 [CodePartition: Realizing `allocation.reuseTarget`](#code-partition-realizing-allocationreuetarget)
 below).
 
-### Phase 4.5: Epilogue Group Copy Increase
+### Phase 3.7: Epilogue Group Copy Increase
 
 Each fused P2_Other group (including TMA staging groups) is treated as
 an epilogue group. `increaseFusedEpilogueCopies` iteratively bumps
 `numCopies` from the current value up to `numBuffers`, accepting each
 bump as long as `computeTotalSmem ≤ smemBudget`.
+
+This reservation runs before the general Phase 4 P0/P1 copy increase. TMA
+store/reduce staging is on the output critical path and must get first claim on
+the discretionary budget; otherwise small operand buffers can consume the last
+few KiB before a high-value staging ring (for example FA-bwd dQ) is considered.
+
+TMA-fed operands of a compiler data-partitioned MMA loop with
+`tt.disallow_acc_multi_buffer` are not discretionary: before Phase 3.7, the
+planner pins them to the configured pipeline depth. Their acquire/release
+schedule assumes that depth, and shortening the ring can overwrite an operand
+while a partitioned, pipelined MMA still consumes it.
+Phase 3.7 therefore reserves output staging only from the budget remaining
+after these operand correctness floors. Ordinary single-group MMA operands and
+TMA-fed metadata used only by elementwise computation remain discretionary, so
+FA-backward dQ/dK/dV staging stays prioritized over their extra copies.
+
+Groups whose members all reuse another allocation (`isAllocated=false`) are
+bumped only when every Phase 3.6 host has enough physical capacity for the
+enlarged ring (`stagingSize × copies ≤ hostSize × hostCopies`). Their apparent
+cost in `computeTotalSmem` is zero, so omitting this capacity check makes an
+increase look free even when reuse realization must reject the alias and
+materialize a separate allocation, which can make the final physical layout
+exceed the planner budget.
 
 #### `K | S` cap for same-partition (wait_group-drained) staging
 
@@ -127,7 +150,7 @@ are *correct* — depends on the channel's producer/consumer topology:
   `desc_o`): the slot/phase come from a continuous `accumCnt` producer/consumer
   mbarrier rotation and tolerate **any** K.
 
-Phase 4.5 therefore detects same-partition staging via
+Phase 3.7 therefore detects same-partition staging via
 `getAsyncTaskIds(ch->getSrcOp()) == getAsyncTaskIds(ch->getDstOp())` and, for
 those groups, only accepts a `tryCopies` that divides S (others are skipped).
 This is a **defensive backstop**: in all shipped configs `num_stages = 2` and
@@ -198,12 +221,19 @@ then looks at the SMEM buffer used by that store:
 2. Read the `buffer.copy` attribute (set earlier by the memory planner),
    which records how many physical copies of this buffer exist.
 3. If `buffer.copy = K`, set `can_rotate_by_buffer_count = K`
-   on the wait op.
+   and `planned_pending_count = K - 1` on the wait op.
 
 The attribute means: "K buffer copies exist, so this wait can be delayed
 until the K-th subsequent TMA store to the same buffer — at that point
 the buffer slot is about to be overwritten and the earlier store must
 have finished reading."
+
+`planned_pending_count` is stable lowering metadata for the equivalent
+`cp.async.bulk.wait_group(K-1)` protocol. Software-pipeline schedule
+serialization can move token waits through clusters without retaining enough
+linear IR context to reconstruct K reliably; final wait lowering therefore
+uses this explicit count when present and falls back to program-order counting
+for unplanned waits.
 
 ### Token Tracing
 
@@ -229,6 +259,31 @@ and reordering that might invalidate assumptions.
 This pass runs **after** `scheduleLoops` has assigned pipeline stages and
 clusters to every op. It uses the SWP `CoarseSchedule` to move waits
 forward in the linearized pipeline order.
+
+Straight-line epilogues use the same reuse-point rule without a coarse
+schedule. A direct-token wait moves to immediately before the next
+`local_store` that feeds any TMA store in the block. TMA `wait_group` is
+queue-wide rather than descriptor- or allocation-specific, so the final wait
+for one output (for example dV) may cross independent preparation for the next
+output (dK) and stop at dK's staging write. The last wait in the block remains
+the final drain.
+
+For annotated operations, merged epilogue loops
+(`tt.merge_epilogue_to_computation`) serialize the
+same-iteration part of the coarse schedule directly into block order: the pass
+selects the nearest matching writer before the chosen future TMA operation, so
+a two-slot dQ ring maps store 0's wait to store 2 rather than the earlier
+equivalent slot-0 writer. These loops are intentionally not expanded by the GPU
+pipeliner. Barrier-free wraparound token waits are therefore materialized as
+queue-wide `wait_group(K-1)` operations before the next iteration's staging
+writers, followed by one `wait_group(0)` drain after the loop. Ordinary
+software-pipelined loops retain their loop-carried token schedule.
+
+The merge attribute can be on an enclosing persistent loop rather than the
+loop containing the dQ stores. The pass therefore searches the loop ancestry:
+an inner reduction loop inherits the merged-epilogue realization and receives
+its final drain immediately after that inner loop. Checking only the immediate
+loop leaves loop-carried token waits in final TTGIR and loses the drain.
 
 ### Algorithm
 

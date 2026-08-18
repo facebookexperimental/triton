@@ -7,6 +7,8 @@
 #include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
+#include "llvm/Support/JSON.h"
+#include "llvm/Support/raw_ostream.h"
 
 #include <optional>
 
@@ -21,6 +23,76 @@ namespace mlir {
 #define LDBG(X) LLVM_DEBUG(DBGS() << X << "\n")
 
 static const char *kDataPartitionAttrName = "tt.data_partition_factor";
+static const char *kDataPartitionIdAttrName = "tt.data_partition_id";
+
+static void remapAutoWSAnnotations(Operation *op, unsigned partition,
+                                   unsigned numPartitions) {
+  auto attr = op->getAttrOfType<StringAttr>("tt.autows");
+  if (!attr)
+    return;
+  auto parsed = llvm::json::parse(attr.getValue());
+  if (!parsed) {
+    llvm::consumeError(parsed.takeError());
+    return;
+  }
+  auto *object = parsed->getAsObject();
+  if (!object)
+    return;
+
+  bool changed = false;
+  if (auto *channels = object->getArray("channels")) {
+    for (llvm::json::Value &channel : *channels) {
+      auto channelString = channel.getAsString();
+      if (!channelString)
+        continue;
+      SmallVector<StringRef, 5> fields;
+      StringRef(*channelString).split(fields, ',');
+      if (fields.size() != 4 && fields.size() != 5)
+        continue;
+      unsigned oldId;
+      if (fields[3].getAsInteger(10, oldId))
+        continue;
+      SmallVector<std::string, 5> remappedFields;
+      remappedFields.reserve(fields.size());
+      for (auto [index, field] : llvm::enumerate(fields)) {
+        if (index == 3)
+          remappedFields.push_back(
+              std::to_string(oldId * numPartitions + partition));
+        else
+          remappedFields.push_back(field.str());
+      }
+      channel = llvm::join(remappedFields, ",");
+      changed = true;
+    }
+  }
+
+  // A two-group FA forward pipeline alternates the single-buffer QK tiles:
+  // QK0(next), PV1(previous), QK1(next), PV0(current).  The frontend marks
+  // each contraction's role before data partitioning; once each contraction
+  // has a concrete partition index, materialize its distinct stage/order.
+  // This mirrors the hand-written TLX schedule without affecting other
+  // data-partitioned kernels.
+  if (numPartitions == 2) {
+    if (auto role = object->getString("two_cta_interleave_role")) {
+      if (*role == "qk") {
+        (*object)["stage"] = "0";
+        (*object)["order"] = partition == 0 ? "0" : "2";
+        changed = true;
+      } else if (*role == "pv") {
+        (*object)["stage"] = partition == 0 ? "0" : "1";
+        (*object)["order"] = partition == 0 ? "3" : "1";
+        changed = true;
+      }
+    }
+  }
+
+  if (changed) {
+    std::string serialized;
+    llvm::raw_string_ostream stream(serialized);
+    stream << *parsed;
+    op->setAttr("tt.autows", StringAttr::get(op->getContext(), stream.str()));
+  }
+}
 
 static bool containsAll(const SmallVector<AsyncTaskId> &superset,
                         const SmallVector<AsyncTaskId> &subset) {
@@ -504,8 +576,40 @@ static bool shapedResultsCanRepresentDim(Operation *op, unsigned dim) {
 
 static bool getBackwardSliceToPartition(Value v,
                                         DataPartitionScheme &partitionScheme,
-                                        unsigned currentDim) {
+                                        unsigned currentDim,
+                                        bool partitionDependentScalar = false) {
   assert(partitionScheme.isValidPartitionDim(currentDim) && "invalid dim");
+  bool isScalar = getShape(v).empty() && !isa<AsyncTokenType>(v.getType());
+  if (partitionDependentScalar && isScalar) {
+    Operation *op = v.getDefiningOp();
+    if (!op)
+      return true;
+    if (!partitionScheme.ops.insert(op)) {
+      if (!isControlFlowOp(op) &&
+          partitionScheme.opPartitionDims[op] != currentDim)
+        return false;
+      return true;
+    }
+    partitionScheme.opPartitionDims[op] = currentDim;
+    if (auto reduceOp = dyn_cast<ReduceOp>(op)) {
+      if (reduceOp.getAxis() != currentDim)
+        return false;
+      for (Value operand : reduceOp.getOperands())
+        if (!getBackwardSliceToPartition(operand, partitionScheme, currentDim))
+          return false;
+      return true;
+    }
+    if (!op->hasTrait<OpTrait::Elementwise>() && !isa<arith::ConstantOp>(op))
+      return false;
+    for (Value operand : op->getOperands()) {
+      bool operandIsScalar =
+          getShape(operand).empty() && !isa<AsyncTokenType>(operand.getType());
+      if (!getBackwardSliceToPartition(operand, partitionScheme, currentDim,
+                                       operandIsScalar))
+        return false;
+    }
+    return true;
+  }
   if (!needToSlice(v, currentDim, partitionScheme.numPartitions))
     return true;
   if (auto op = v.getDefiningOp()) {
@@ -602,6 +706,11 @@ static bool getBackwardSliceToPartition(Value v,
         partitionScheme.opPartitionDims[storeOp] = currentDim;
         if (!getBackwardSliceToPartition(storeOp.getSrc(), partitionScheme,
                                          currentDim))
+          return false;
+        if (!storeOp.getPred().getDefiningOp<arith::ConstantOp>() &&
+            !getBackwardSliceToPartition(storeOp.getPred(), partitionScheme,
+                                         currentDim,
+                                         /*partitionDependentScalar=*/true))
           return false;
       }
     } else if (op->hasTrait<OpTrait::Elementwise>() ||
@@ -979,6 +1088,11 @@ static bool getSliceToPartition(Value root,
       if (!getBackwardSliceToPartition(tmemStoreOp.getSrc(), partitionScheme,
                                        currentDim))
         return false;
+      if (!tmemStoreOp.getPred().getDefiningOp<arith::ConstantOp>() &&
+          !getBackwardSliceToPartition(tmemStoreOp.getPred(), partitionScheme,
+                                       currentDim,
+                                       /*partitionDependentScalar=*/true))
+        return false;
     } else if (op->hasTrait<OpTrait::Elementwise>() ||
                isa<StoreOp, AtomicRMWOp, MapElementwiseOp>(op)) {
       for (OpOperand &operand : op->getOpOperands()) {
@@ -1269,10 +1383,14 @@ static Operation *sliceOp(Operation *op, int offset, IRMapping &mappings,
 
   OpBuilderWithAsyncTaskIds builder(op->getContext());
   builder.setAsynTaskIdsFromArray(sliceTaskIds);
-  auto cloneAndSetResultType = [&](Operation *op) {
+  auto cloneAndSetResultType = [&](Operation *op,
+                                   bool preserveResultTypes = false) {
     builder.setInsertionPoint(op);
     auto newOp = builder.clone(*op, mappings);
     setAsyncTaskIds(newOp, sliceTaskIds);
+    newOp->setAttr(kDataPartitionIdAttrName, builder.getI32IntegerAttr(offset));
+    if (numOfPartitions > 1 && isDotOrMMAv5Op(newOp))
+      remapAutoWSAnnotations(newOp, offset, numOfPartitions);
     if (numOfPartitions > 1 && isa<LocalAllocOp, ttng::TMEMAllocOp>(newOp)) {
       newOp->setLoc(appendToNameLoc(
           newOp->getLoc(), "_" + std::to_string(offset), op->getContext()));
@@ -1281,7 +1399,9 @@ static Operation *sliceOp(Operation *op, int offset, IRMapping &mappings,
     reverseMappings.map(newOp, op);
     // set result shape for all results
     for (auto [v, newV] : llvm::zip(op->getResults(), newOp->getResults())) {
-      bool needRetype = true;
+      bool needRetype = !preserveResultTypes;
+      if (getShape(v).empty() && !isa<AsyncTokenType>(v.getType()))
+        needRetype = false;
       if (dim == DataPartitionScheme::noOpPartitionDim) {
         // Just duplicate the op for noOpPartitionDim
         needRetype = false;
@@ -1413,6 +1533,9 @@ static Operation *sliceOp(Operation *op, int offset, IRMapping &mappings,
             partitionScheme);
     sliceOp(tmemStOp.getDep(), offset, mappings, reverseMappings,
             partitionScheme);
+    if (!tmemStOp.getPred().getDefiningOp<arith::ConstantOp>())
+      sliceOp(tmemStOp.getPred(), offset, mappings, reverseMappings,
+              partitionScheme);
 
     // Slice retype the source operand with a tmem compatible layout.
     auto dstTy = mappings.lookupOrNull(tmemStOp.getDst()).getType();
@@ -1534,6 +1657,10 @@ static Operation *sliceOp(Operation *op, int offset, IRMapping &mappings,
     } else
       newOp = cloneAndSetResultType(op);
   } else if (auto constOp = dyn_cast<arith::ConstantOp>(op)) {
+    if (!isa<ShapedType>(constOp.getType())) {
+      newOp = cloneAndSetResultType(op, /*preserveResultTypes=*/true);
+      return newOp;
+    }
     builder.setInsertionPoint(op);
     auto valAttr = cast<DenseElementsAttr>(constOp.getValueAttr());
     auto valType = cast<ShapedType>(valAttr.getType());
@@ -2001,11 +2128,15 @@ static Operation *sliceOp(Operation *op, int offset, IRMapping &mappings,
     }
     newOp = op;
   } else if (auto reduceOp = dyn_cast<ReduceOp>(op)) {
-    assert(reduceOp.getAxis() != dim &&
-           "reduce should not happen on the partitioned dimension");
     for (Value operand : op->getOperands())
       sliceOp(operand, offset, mappings, reverseMappings, partitionScheme);
-    newOp = cloneAndSetResultType(op);
+    // A reduction over the partitioned dimension becomes one independent
+    // reduction per data partition. Its operands are sliced, but the reduced
+    // dimension no longer exists in its results, so those result types must
+    // remain unchanged. This is used by FA forward to form one scalar,
+    // warp-uniform accumulator-rescale predicate per M partition.
+    bool reducesPartitionedDim = reduceOp.getAxis() == dim;
+    newOp = cloneAndSetResultType(op, reducesPartitionedDim);
     // recursively set async task ids for child ops
     newOp->walk(
         [&](Operation *childOp) { setAsyncTaskIds(childOp, sliceTaskIds); });
@@ -2019,6 +2150,14 @@ static Operation *sliceOp(Operation *op, int offset, IRMapping &mappings,
   } else {
     llvm_unreachable("unsupported op type");
   }
+
+  // Some slicing paths construct the replacement explicitly rather than via
+  // cloneAndSetResultType (notably TMEM loads, transposes, and ranges).  Mark
+  // every replacement uniformly so the post-slice scheduler can serialize
+  // the complete partition chain instead of hoisting unmarked TMEM loads from
+  // both partitions together.
+  if (newOp != op)
+    newOp->setAttr(kDataPartitionIdAttrName, builder.getI32IntegerAttr(offset));
 
   LLVM_DEBUG({
     LDBG("resulting");
@@ -2261,6 +2400,124 @@ static void reorderLoadsToFirstUse(triton::FuncOp &funcOp) {
   });
 }
 
+// Recursive slicing inserts each clone beside its source operation.  With two
+// data partitions this leaves independent chains interleaved operation by
+// operation, extending the live ranges of both partitions.  In FA forward the
+// correction task then holds both BM256 accumulator halves live and ptxas
+// spills them.  Group the clones by partition while the graph is still purely
+// data-partitioned, before scheduling and channel construction capture any
+// operation identities.  This matches TLX's complete DP0-then-DP1 execution.
+static void serializeDataPartitionedOps(triton::FuncOp &funcOp) {
+  funcOp.walk([&](Block *block) {
+    auto serializeSegment = [&](SmallVector<Operation *> &candidates) {
+      if (candidates.empty())
+        return;
+
+      DenseMap<Operation *, unsigned> originalOrder;
+      DenseMap<Operation *, int64_t> partitionId;
+      for (auto [index, op] : llvm::enumerate(candidates)) {
+        originalOrder[op] = index;
+        if (auto id = op->getAttrOfType<IntegerAttr>(kDataPartitionIdAttrName))
+          partitionId[op] = id.getInt();
+      }
+
+      DenseSet<int64_t> ids;
+      for (auto [op, id] : partitionId)
+        ids.insert(id);
+      if (ids.size() < 2)
+        return;
+
+      // Auxiliary layout conversions are sometimes built explicitly instead
+      // of through cloneAndSetResultType. Infer their partition from a unique
+      // marked operand so users move with their producer.
+      bool changed = true;
+      while (changed) {
+        changed = false;
+        for (Operation *op : candidates) {
+          if (partitionId.count(op))
+            continue;
+          std::optional<int64_t> inferred;
+          bool conflicting = false;
+          for (Value operand : op->getOperands()) {
+            Operation *def = operand.getDefiningOp();
+            auto it = def ? partitionId.find(def) : partitionId.end();
+            if (it == partitionId.end())
+              continue;
+            if (inferred && *inferred != it->second) {
+              conflicting = true;
+              break;
+            }
+            inferred = it->second;
+          }
+          if (inferred && !conflicting) {
+            partitionId[op] = *inferred;
+            changed = true;
+          }
+        }
+      }
+
+      // Rebuild the straight-line segment, not just marked operations.
+      // Region-bearing dataflow operations such as tt.reduce can be
+      // definitions or users of a marked value. Keeping them in the
+      // topological schedule guarantees SSA dominance while the partition id
+      // remains the primary ordering key whenever dependencies permit it.
+      DenseSet<Operation *> candidateSet(candidates.begin(), candidates.end());
+      DenseSet<Operation *> emitted;
+      SmallVector<Operation *> ordered;
+      ordered.reserve(candidates.size());
+      while (ordered.size() != candidates.size()) {
+        Operation *best = nullptr;
+        auto key = [&](Operation *op) {
+          int64_t id = partitionId.count(op) ? partitionId.lookup(op) : -1;
+          return std::pair(id, originalOrder.lookup(op));
+        };
+        for (Operation *candidate : candidates) {
+          if (emitted.contains(candidate))
+            continue;
+          bool ready =
+              llvm::all_of(candidate->getOperands(), [&](Value operand) {
+                Operation *def = operand.getDefiningOp();
+                return !def || !candidateSet.contains(def) ||
+                       emitted.contains(def);
+              });
+          if (ready && (!best || key(candidate) < key(best)))
+            best = candidate;
+        }
+        assert(best && "cycle while serializing data-partition operations");
+        emitted.insert(best);
+        ordered.push_back(best);
+      }
+
+      Operation *anchor = candidates.back()->getNextNode();
+      for (Operation *op : ordered) {
+        if (anchor)
+          op->moveBefore(anchor);
+        else
+          op->moveBefore(block, block->end());
+      }
+    };
+
+    // Control-flow operations may capture values in nested regions without
+    // listing those captures as parent-op operands. Keep each such operation
+    // fixed and independently serialize the straight-line segments around it.
+    // This covers both the body of a partitioned loop and the post-loop FA
+    // epilogue without moving the loop itself.
+    SmallVector<Operation *> segment;
+    for (Operation &op : llvm::make_early_inc_range(*block)) {
+      if (op.hasTrait<OpTrait::IsTerminator>() ||
+          isa<LoopLikeOpInterface, scf::IfOp>(&op)) {
+        serializeSegment(segment);
+        segment.clear();
+        continue;
+      }
+      segment.push_back(&op);
+    }
+    serializeSegment(segment);
+  });
+
+  funcOp.walk([&](Operation *op) { op->removeAttr(kDataPartitionIdAttrName); });
+}
+
 bool doDataPartition(triton::FuncOp &funcOp, unsigned numConsumerGroups) {
   DataPartitionScheme partitionScheme;
   partitionScheme.numPartitions = numConsumerGroups;
@@ -2340,6 +2597,8 @@ bool doDataPartition(triton::FuncOp &funcOp, unsigned numConsumerGroups) {
     LDBG("final cleanup failed");
     return false;
   }
+
+  serializeDataPartitionedOps(funcOp);
 
   // Make sure original ops are not used
   LLVM_DEBUG({
