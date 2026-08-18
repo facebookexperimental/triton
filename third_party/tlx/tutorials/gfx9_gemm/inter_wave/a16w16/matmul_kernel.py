@@ -23,16 +23,10 @@ the result numerically identical to the non-split-K path. `choose_split_k`
 returns 1 for shapes that already fill the machine, making split-K a no-op there.
 """
 
-import os
-
 import torch
 import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
-
-# Keep the LLVM post-RA machine scheduler from re-ordering the
-# warp_pipeline_stage mem/MFMA interleave (equivalent to TRITON_DISABLE_POST_MISCHED=1).
-os.environ.setdefault("TRITON_DISABLE_POST_MISCHED", "1")
 
 BLOCK_M = 256
 BLOCK_N = 256
@@ -43,6 +37,170 @@ NUM_XCDS = 8
 
 MIN_K = 2 * BLOCK_K  # pipeline prefetches 2 whole K-tiles; the rest goes to the masked tail
 KERNEL_NAME = "a16w16_8wave"
+
+
+def _prune_register_configs(configs, named_args, **_):
+    k = named_args["K"]
+    if 128 <= k < 256 and named_args["M"] >= 16384 and named_args["N"] <= 128:
+        preferred = [
+            config
+            for config in configs
+            if config.kwargs["NUM_XCDS"] == 1
+            and config.kwargs["BLOCK_M"] == 128
+            and config.kwargs["BLOCK_N"] == 64
+            and config.kwargs["BLOCK_K"] == 64
+            and config.kwargs["GROUP_M"] == 4
+            and config.kwargs["waves_per_eu"] == 0
+            and config.num_warps == 4
+            and config.num_stages == 2
+        ]
+        if preferred:
+            return preferred
+    if k == 1536 and named_args["M"] == 3072 and named_args["N"] == 3072:
+        preferred = [
+            config
+            for config in configs
+            if config.kwargs["NUM_XCDS"] == 8
+            and config.kwargs["BLOCK_M"] == 128
+            and config.kwargs["BLOCK_N"] == 128
+            and config.kwargs["BLOCK_K"] == 64
+            and config.kwargs["GROUP_M"] == 16
+            and config.kwargs["waves_per_eu"] == 0
+            and config.num_warps == 4
+            and config.num_stages == 2
+        ]
+        if preferred:
+            return preferred
+    if k == 256 and named_args["M"] <= 1024 and named_args["N"] >= 16384:
+        preferred = [
+            config
+            for config in configs
+            if config.kwargs["BLOCK_M"] == 256
+            and config.kwargs["BLOCK_N"] == 128
+            and config.kwargs["BLOCK_K"] == 32
+            and config.kwargs["GROUP_M"] == 4
+            and config.kwargs["waves_per_eu"] == 2
+            and config.num_warps == 4
+        ]
+        if preferred:
+            return preferred
+    return configs
+
+
+# Triton TR001: autotune the register path across stock ROCm tiles and the
+# deeper software-pipelined tiles used by the TorchTLX register path.
+_REGISTER_CONFIGS = [
+    triton.Config(
+        {
+            "BLOCK_M": block_m,
+            "BLOCK_N": block_n,
+            "BLOCK_K": block_k,
+            "GROUP_M": group_m,
+            "NUM_XCDS": 1,
+            "matrix_instr_nonkdim": 16,
+            "waves_per_eu": waves_per_eu,
+            "kpack": 1,
+        },
+        num_warps=num_warps,
+        num_stages=2,
+    )
+    for block_m, block_n, block_k, group_m, num_warps, waves_per_eu in (
+        (16, 16, 256, 4, 4, 2),
+        (32, 16, 256, 4, 4, 0),
+        (32, 32, 16, 8, 4, 2),
+        (32, 32, 128, 8, 4, 0),
+        (32, 64, 64, 8, 4, 0),
+        (64, 16, 128, 8, 4, 2),
+        (64, 32, 32, 8, 4, 0),
+        (64, 32, 64, 8, 4, 0),
+        (64, 32, 64, 8, 8, 0),
+        (64, 32, 128, 8, 4, 0),
+        (64, 64, 16, 8, 4, 0),
+        (64, 64, 64, 4, 4, 0),
+        (64, 64, 128, 16, 8, 0),
+        (64, 64, 256, 4, 8, 0),
+        (64, 128, 32, 4, 4, 2),
+        (64, 128, 32, 8, 8, 0),
+        (64, 128, 64, 4, 8, 0),
+        (64, 128, 128, 4, 8, 0),
+        (128, 32, 32, 8, 4, 0),
+        (128, 32, 64, 8, 4, 0),
+        (128, 64, 32, 8, 4, 2),
+        (128, 64, 64, 16, 4, 0),
+        (128, 64, 128, 4, 8, 0),
+        (128, 128, 32, 16, 4, 2),
+        (128, 128, 32, 16, 8, 0),
+        (128, 128, 32, 16, 8, 2),
+        (128, 128, 64, 16, 4, 0),
+        (128, 128, 64, 8, 8, 0),
+        (128, 128, 128, 16, 8, 0),
+        (128, 256, 32, 16, 4, 2),
+        (128, 256, 64, 4, 8, 0),
+        (256, 64, 64, 4, 8, 0),
+        (256, 128, 32, 4, 4, 2),
+        (256, 128, 32, 16, 8, 0),
+        (256, 128, 64, 4, 8, 0),
+        (256, 256, 64, 4, 8, 0),
+    )
+]
+
+_REGISTER_CONFIGS += [
+    triton.Config(
+        {
+            "BLOCK_M": block_m,
+            "BLOCK_N": block_n,
+            "BLOCK_K": block_k,
+            "GROUP_M": group_m,
+            "NUM_XCDS": 1,
+            "matrix_instr_nonkdim": 16,
+            "waves_per_eu": waves_per_eu,
+            "kpack": 1,
+        },
+        num_warps=num_warps,
+        num_stages=num_stages,
+    )
+    for block_m, block_n, block_k, group_m, num_warps, num_stages, waves_per_eu in (
+        (128, 64, 64, 4, 4, 2, 0),
+        (128, 64, 64, 4, 4, 3, 0),
+        (128, 64, 64, 16, 4, 3, 0),
+        (128, 128, 64, 8, 4, 2, 0),
+        (128, 128, 64, 8, 4, 3, 0),
+        (128, 128, 64, 16, 4, 3, 0),
+        (128, 256, 64, 8, 8, 3, 0),
+        (128, 256, 64, 8, 8, 3, 1),
+        (256, 128, 32, 4, 4, 3, 2),
+        (256, 128, 32, 4, 4, 4, 2),
+        (256, 256, 64, 4, 8, 3, 0),
+        (256, 256, 64, 4, 8, 4, 0),
+        (128, 256, 32, 8, 8, 3, 0),
+    )
+]
+
+_REGISTER_CONFIGS += [
+    triton.Config(
+        {
+            "BLOCK_M": block_m,
+            "BLOCK_N": block_n,
+            "BLOCK_K": block_k,
+            "GROUP_M": group_m,
+            "NUM_XCDS": 8,
+            "matrix_instr_nonkdim": 16,
+            "waves_per_eu": waves_per_eu,
+            "kpack": 1,
+        },
+        num_warps=num_warps,
+        num_stages=num_stages,
+    )
+    for block_m, block_n, block_k, group_m, num_warps, num_stages, waves_per_eu in (
+        (128, 64, 64, 4, 4, 2, 0),
+        (128, 64, 64, 4, 4, 3, 0),
+        (128, 128, 64, 8, 4, 2, 0),
+        (128, 128, 64, 8, 4, 3, 0),
+        (128, 128, 64, 16, 4, 2, 0),
+        (128, 128, 64, 16, 4, 3, 0),
+        (256, 128, 32, 4, 4, 3, 2),
+    )
+]
 
 # Coalesced SIMD register layout for the [HALF_M, HALF_N] = [128, 128] fp16 quadrant
 # store (num_warps=8, warp_size=64): each thread holds 8 contiguous N elements ->
@@ -89,6 +247,127 @@ _A_BASES_256 = tl.constexpr(_swz_offset_bases([_HALF_256, BLOCK_K], 1))
 _A_BASES_128 = tl.constexpr(_swz_offset_bases([_HALF_128, BLOCK_K], 1))
 _B_BASES_256 = tl.constexpr(_swz_offset_bases([BLOCK_K, _HALF_256], 0))
 _B_BASES_128 = tl.constexpr(_swz_offset_bases([BLOCK_K, _HALF_128], 0))
+
+
+@triton.autotune(
+    configs=_REGISTER_CONFIGS,
+    key=["M", "N", "K"],
+    prune_configs_by={"early_config_prune": _prune_register_configs},
+)
+@triton.jit
+def _register_kernel(
+    a_ptr,
+    b_ptr,
+    bias_ptr,
+    c_ptr,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    stride_am: tl.constexpr,
+    stride_ak: tl.constexpr,
+    stride_bk: tl.constexpr,
+    stride_bn: tl.constexpr,
+    stride_bias_m: tl.constexpr,
+    stride_bias_n: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    GROUP_M: tl.constexpr,
+    NUM_XCDS: tl.constexpr,
+    ADD_BIAS: tl.constexpr,
+):
+    pid = tl.program_id(0).to(tl.int32)
+    grid_m = (M + BLOCK_M - 1) // BLOCK_M
+    grid_n = (N + BLOCK_N - 1) // BLOCK_N
+    grid_mn = grid_m * grid_n
+
+    xcd_chunk: tl.constexpr = 4
+    if NUM_XCDS != 1:
+        aligned = (grid_mn // (NUM_XCDS * xcd_chunk)) * (NUM_XCDS * xcd_chunk)
+        if pid < aligned:
+            xcd = pid % NUM_XCDS
+            local_pid = pid // NUM_XCDS
+            pid = (local_pid // xcd_chunk) * NUM_XCDS * xcd_chunk + xcd * xcd_chunk + local_pid % xcd_chunk
+
+    width = GROUP_M * grid_n
+    group_id = pid // width
+    group_size = min(grid_m - group_id * GROUP_M, GROUP_M)
+    pid_m = group_id * GROUP_M + pid % group_size
+    pid_n = pid % width // group_size
+    tl.assume(pid_m >= 0)
+    tl.assume(pid_n >= 0)
+
+    offs_m = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M).to(tl.int32)) % M
+    offs_n = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N).to(tl.int32)) % N
+    offs_k = tl.arange(0, BLOCK_K).to(tl.int32)
+    tl.assume(stride_am > 0)
+    tl.assume(stride_ak > 0)
+    tl.assume(stride_bk > 0)
+    tl.assume(stride_bn > 0)
+    reg_m = tl.max_contiguous(tl.multiple_of(offs_m, BLOCK_M), BLOCK_M)
+    reg_n = tl.max_contiguous(tl.multiple_of(offs_n, BLOCK_N), BLOCK_N)
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for k_idx in range(0, tl.cdiv(K, BLOCK_K)):
+        k = k_idx * BLOCK_K
+        a_ptrs = a_ptr + reg_m[:, None] * stride_am + (k + offs_k[None, :]) * stride_ak
+        b_ptrs = b_ptr + (k + offs_k[:, None]) * stride_bk + reg_n[None, :] * stride_bn
+        if K % BLOCK_K == 0:
+            a = tl.load(a_ptrs)
+            b = tl.load(b_ptrs)
+        else:
+            a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k, other=0.0)
+            b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k, other=0.0)
+        acc += tl.dot(a, b, allow_tf32=False, out_dtype=tl.float32)
+
+    rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M).to(tl.int32)
+    cols = pid_n * BLOCK_N + tl.arange(0, BLOCK_N).to(tl.int32)
+    idx_m = rows[:, None]
+    idx_n = cols[None, :]
+    mask = (idx_m < M) & (idx_n < N)
+    if ADD_BIAS:
+        bias_offsets = idx_m * stride_bias_m + idx_n * stride_bias_n
+        bias = tl.load(bias_ptr + bias_offsets, mask=mask, eviction_policy="evict_last")
+        acc += bias.to(tl.float32)
+    output_offsets = idx_m * N + idx_n
+    tl.store(c_ptr + output_offsets, acc, mask=mask)
+
+
+def _launch_register(a, b, bias=None):
+    """Launch the autotuned register-resident gfx950 GEMM path."""
+    M, K = a.shape
+    b_k, N = b.shape
+    if K != b_k:
+        raise ValueError(f"Incompatible matrix dimensions: {tuple(a.shape)} and {tuple(b.shape)}")
+    if bias is not None:
+        if bias.shape != (M, N):
+            raise ValueError(f"Bias must expand to ({M}, {N}), got {tuple(bias.shape)}")
+        if bias.device != a.device or bias.dtype != a.dtype:
+            raise ValueError("Bias and matrix operands must have matching device and dtype")
+    out = torch.empty((M, N), device=a.device, dtype=a.dtype)
+    grid = lambda meta: (triton.cdiv(M, meta["BLOCK_M"]) * triton.cdiv(N, meta["BLOCK_N"]),)
+    disable_agpr = (K == 256 and N > 256) or (
+        K > 512 and (K % BLOCK_K != 0 or M * N <= 2 * 1024 * 1024)
+    )
+    launch_options = {"llvm_fn_attrs": (("amdgpu-agpr-alloc", "0,0"),)} if disable_agpr else {}
+    bias_ptr = bias if bias is not None else out
+    _register_kernel[grid](
+        a,
+        b,
+        bias_ptr,
+        out,
+        M,
+        N,
+        K,
+        a.stride(0),
+        a.stride(1),
+        b.stride(0),
+        b.stride(1),
+        bias.stride(0) if bias is not None else 0,
+        bias.stride(1) if bias is not None else 0,
+        ADD_BIAS=bias is not None,
+        **launch_options,
+    )
+    return out
 
 
 @triton.jit
@@ -556,7 +835,7 @@ def choose_split_k(M, N, K):
     return choose_tile(M, N, K)[2]
 
 
-def _launch(a, b, bias=None, SPLIT_K=None):
+def _launch(a, b, bias=None, SPLIT_K=None, TILE=None):
     """Launch the shared gfx950 GEMM core, optionally with a fused bias."""
     assert a.shape[1] == b.shape[0], "Incompatible dimensions"
     M, K = a.shape
@@ -565,15 +844,21 @@ def _launch(a, b, bias=None, SPLIT_K=None):
         assert bias.shape == (M, N), f"Bias must expand to ({M}, {N}), got {tuple(bias.shape)}"
         assert bias.device == a.device, "Bias and matrix operands must be on the same device"
         assert bias.dtype == a.dtype, "Bias and matrix operands must have the same dtype"
-    if SPLIT_K is None:
+    if TILE is not None:
+        BM, BN = TILE
+        grid_mn = triton.cdiv(M, BM) * triton.cdiv(N, BN)
+        SPLIT_K = _split_k_for(grid_mn, K) if SPLIT_K is None else SPLIT_K
+    elif SPLIT_K is None:
         BM, BN, SPLIT_K = choose_tile(M, N, K)
     else:
         BM, BN = BLOCK_M, BLOCK_N  # explicit SPLIT_K override keeps the default tile
     KS = K // SPLIT_K
-    # Each split is a whole number of K-tiles, big enough for the 2-tile prologue.
+    # Each split is big enough for the 2-tile prologue and starts on a 16-byte
+    # boundary. Full BLOCK_K tiles use direct-to-LDS; the remainder is handled by
+    # the masked register tail in the kernel.
     assert K % SPLIT_K == 0, f"K={K} must be divisible by SPLIT_K={SPLIT_K}"
     assert KS >= 2 * BLOCK_K, f"K/SPLIT_K={KS} must be at least {2 * BLOCK_K}"
-    assert KS % BLOCK_K == 0, f"K/SPLIT_K={KS} must be a multiple of BLOCK_K={BLOCK_K} (split base alignment)"
+    assert KS * a.element_size() % 16 == 0, f"K/SPLIT_K={KS} must preserve 16-byte split alignment"
     c = torch.empty((M, N), device=a.device, dtype=a.dtype)
     GRID_MN = triton.cdiv(M, BM) * triton.cdiv(N, BN)
     if SPLIT_K > 1:
@@ -607,8 +892,8 @@ def _launch(a, b, bias=None, SPLIT_K=None):
         BLOCK_M=BM,
         BLOCK_N=BN,
         BLOCK_K=BLOCK_K,
-        GROUP_SIZE_M=GROUP_SIZE_M,
-        NUM_XCDS=NUM_XCDS,
+        GROUP_SIZE_M=4 if M == N and K >= 8192 else (2 if M <= 1024 and N >= 16384 else GROUP_SIZE_M),
+        NUM_XCDS=1 if M == N and K >= 8192 else NUM_XCDS,
         GRID_MN=GRID_MN,
         SPLIT_K=SPLIT_K,
         ADD_BIAS=bias is not None,
