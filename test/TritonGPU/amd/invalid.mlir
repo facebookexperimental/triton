@@ -1,5 +1,21 @@
 // RUN: triton-opt --split-input-file %s --verify-diagnostics
 
+// A pinned layout is still subject to the physical TDM layout constraints.
+#tdm_bad_swizzle = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 2, order = [1, 0]}>
+#tdm_bad_pinned = #tlx.user_layout<#tdm_bad_swizzle>
+#tdm_bad_smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @tdm_pinned_layout_still_validated(
+      %desc: !tt.tensordesc<32x32xf16>,
+      %buf: !ttg.memdesc<32x32xf16, #tdm_bad_pinned, #tdm_bad_smem, mutable>) {
+    // expected-error @+1 {{TDM does not support swizzling}}
+    %token = amdg.async_tdm_copy_global_to_local %desc into %buf : !tt.tensordesc<32x32xf16> -> !ttg.memdesc<32x32xf16, #tdm_bad_pinned, #tdm_bad_smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
 // expected-error @+1 {{WMMA version must be in the [1, 3] range}}
 #wmma = #ttg.amd_wmma<{version = 0, isTranspose = false, ctaLayout = {warp = [[0, 1], [1, 0]]}}>
 module attributes {"ttg.num-warps" = 4 : i32, "ttg.num-ctas" = 1 : i32, "ttg.threads-per-warp" = 32 : i32} {

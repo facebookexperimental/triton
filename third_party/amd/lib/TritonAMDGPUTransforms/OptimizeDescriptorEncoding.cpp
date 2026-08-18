@@ -185,9 +185,13 @@ Attribute AMDGPUAssignDescriptorMemoryLayouts::getDesiredDescriptorEncoding(
         continue;
 
       Attribute encoding = memoryType.getEncoding();
+      while (auto pinned = dyn_cast<ttg::PinnedEncodingTrait>(encoding))
+        encoding = pinned.getPinnedLayout();
       if (auto partitioned =
               dyn_cast<ttg::PartitionedSharedEncodingAttr>(encoding))
         encoding = partitioned.getPartitionLayout();
+      while (auto pinned = dyn_cast<ttg::PinnedEncodingTrait>(encoding))
+        encoding = pinned.getPinnedLayout();
       encoding = getCompatibleSharedEncoding(encoding, memoryType.getShape(),
                                              memoryType.getElementType());
       if (!encoding)

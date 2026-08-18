@@ -2617,6 +2617,60 @@ def test_async_amd_desc_load_auto_propagates_padded_layout_gfx1250(device):
     assert "padded_shared" in ttgir
 
 
+@triton.jit
+def _pinned_tdm_memdesc_view_kernel(
+    input_ptr,
+    output_ptr,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    VIEW: tl.constexpr,
+):
+    smem_layout: tl.constexpr = tlx.padded_shared_layout_encoding.with_identity_for([(N, 128 // 16)], [M, N])
+    desc = tl.make_tensor_descriptor(input_ptr, [M, N], [N, 1], [M, N])
+    buffers = tlx.local_alloc((M, N), tl.float16, 1, layout=smem_layout)
+    full = tlx.local_view(buffers, 0)
+
+    token = tlx.async_amd_descriptor_load(desc, full, [0, 0])
+    tlx.async_amd_descriptor_wait(tokens=[token])
+
+    if VIEW == 0:
+        view = tlx.local_slice(full, [0, 32], [M, 32])
+        rows = tl.arange(0, M)
+        cols = tl.arange(0, 32)
+        width: tl.constexpr = 32
+    else:
+        view = tlx.local_reshape(full, [N, M])
+        rows = tl.arange(0, N)
+        cols = tl.arange(0, M)
+        width: tl.constexpr = M
+
+    values = tlx.local_load(view)
+    tl.store(output_ptr + rows[:, None] * width + cols[None, :], values)
+
+
+@pytest.mark.skipif(not is_hip(), reason="Requires HIP runtime")
+@pytest.mark.parametrize(
+    "view, expected_op",
+    [(0, "ttg.memdesc_subslice"), (1, "ttg.memdesc_reshape")],
+    ids=["slice", "reshape"],
+)
+def test_pinned_tdm_memdesc_views_compile_gfx1250(device, view, expected_op):
+    compiled = compile_for_gfx1250(
+        _pinned_tdm_memdesc_view_kernel,
+        signature={"input_ptr": "*fp16", "output_ptr": "*fp16"},
+        constexprs={"M": 32, "N": 128, "VIEW": view},
+    )
+    ttgir = compiled.asm["ttgir"]
+    assert ttgir.count("amdg.async_tdm_copy_global_to_local") == 1
+    assert expected_op in ttgir
+    assert "#ttg.padded_shared<[128:+8]" in ttgir
+    assert "#tlx.user_layout" not in ttgir
+    assert "#tlx.no_verify_layout" not in ttgir
+    assert "tlx.require_layout" not in ttgir
+    amdgcn = compiled.asm["amdgcn"]
+    assert "tensor_load_to_lds" in amdgcn or "tensor.load.to.lds" in amdgcn
+
+
 # ---------------------------------------------------------------------------
 # TDM GEMM tutorial compile test
 # ---------------------------------------------------------------------------
