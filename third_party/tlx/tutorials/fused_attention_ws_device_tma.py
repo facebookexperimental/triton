@@ -1330,7 +1330,12 @@ def _attn_bwd(
     NUM_CTAS: tl.constexpr = 1,
 ):
     bhid = tl.program_id(2)
-    pid = tl.program_id(0)
+    # BM128 2-CTA gives each CTA of the cluster its own adjacent N tile, so the
+    # tile index is the CTA index. BM64 2-CTA instead has the pair cooperate on
+    # a single N tile (TwoCTA_RHS splits the accumulator), so the tile index is
+    # the cluster index -- the same mapping the persistent grid uses.
+    ADJACENT_N: tl.constexpr = NUM_CTAS == 2 and BLOCK_M1 == 128
+    pid = tl.program_id(0) if ADJACENT_N else tl.program_id(0) // NUM_CTAS
 
     _attn_bwd_core(
         desc_q,
@@ -1768,8 +1773,11 @@ class _attention_opt(torch.autograd.Function):
         def grid(meta):
             num_ctas = meta.get("NUM_CTAS") or 1
             n_tiles = triton.cdiv(N_CTX, meta["BLOCK_N1"])
+            if num_ctas == 2 and meta["BLOCK_M1"] != 128:
+                # BM64 2-CTA: the CTA pair cooperates on a single N tile, so
+                # launch one cluster (two CTAs) per tile.
+                return (n_tiles * num_ctas, 1, BATCH * N_HEAD)
             if num_ctas == 2:
-                assert meta["BLOCK_M1"] == 128
                 assert n_tiles % num_ctas == 0
             return (
                 n_tiles,
@@ -1917,11 +1925,6 @@ def test_op(
         chosen_cfg = configs_bwd_persist[bwd_config_idx]
         cfg_num_ctas = chosen_cfg.kwargs.get("NUM_CTAS", 1)
         cfg_block_m1 = chosen_cfg.kwargs["BLOCK_M1"]
-        # The 2-CTA backward only implements the BM128 adjacent-N-tile grid on
-        # the non-persistent path -- grid() asserts BLOCK_M1 == 128 there --
-        # so BM64 2-CTA is persistent-only.
-        if cfg_num_ctas == 2 and cfg_block_m1 != 128 and baseVariant == "ws":
-            pytest.skip("BM64 2-CTA backward is persistent-only")
         # BM128 2-CTA packs dQ as [2 * N_CTX, HEAD_DIM // 2] and subtiles the
         # epilogue by 8, which is only defined for HEAD_DIM=128.
         if cfg_num_ctas == 2 and cfg_block_m1 == 128 and HEAD_DIM == 64:
