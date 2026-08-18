@@ -4053,11 +4053,9 @@ class AutoWSLoopOptions(base_value):
         default=False, metadata=_loop_attr("tt.merge_epilogue_to_computation", "bool"))
     merge_correction: bool | constexpr = field(default=False, metadata=_loop_attr("tt.merge_correction", "bool"))
     separate_epilogue_store: bool | constexpr = field(default=False,
-                                                       metadata=_loop_attr("tt.separate_epilogue_store", "bool"))
-    tmem_alloc_algo: int | constexpr | None = field(default=None,
-                                                     metadata=_loop_attr("tt.tmem_alloc_algo", "int32"))
-    smem_alloc_algo: int | constexpr | None = field(default=None,
-                                                     metadata=_loop_attr("tt.smem_alloc_algo", "int32"))
+                                                      metadata=_loop_attr("tt.separate_epilogue_store", "bool"))
+    tmem_alloc_algo: int | constexpr | None = field(default=None, metadata=_loop_attr("tt.tmem_alloc_algo", "int32"))
+    smem_alloc_algo: int | constexpr | None = field(default=None, metadata=_loop_attr("tt.smem_alloc_algo", "int32"))
     smem_budget: int | constexpr | None = field(default=None, metadata=_loop_attr("tt.smem_budget", "int32"))
     smem_circular_reuse: bool | constexpr | None = field(default=None,
                                                          metadata=_loop_attr("tt.smem_circular_reuse", "bool_opt"))

@@ -768,9 +768,9 @@ _TORCH_TO_TL = {torch.float16: tl.float16, torch.bfloat16: tl.bfloat16, torch.fl
 
 
 @triton.jit
-def _reduce_k_kernel(workspace_ptr, bias_ptr, c_ptr, M, N, stride_bias_m, stride_bias_n,
-                     SPLIT_K: tl.constexpr, BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr,
-                     OUTPUT_DTYPE: tl.constexpr, ADD_BIAS: tl.constexpr):
+def _reduce_k_kernel(workspace_ptr, bias_ptr, c_ptr, M, N, stride_bias_m, stride_bias_n, SPLIT_K: tl.constexpr,
+                     BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, OUTPUT_DTYPE: tl.constexpr,
+                     ADD_BIAS: tl.constexpr):
     # Sum the SPLIT_K partials (each a contiguous (M, N) slab in workspace) into
     # C with fp32 accumulation. Small tiles (32x32) so small outputs still spawn
     # many CTAs -- else the reduce is CTA-starved and dominates (D97513062).
