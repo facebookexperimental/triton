@@ -1915,11 +1915,17 @@ def test_op(
     # (dedicated coverage: test_bwd_tmem_dsT_reuse_3group / _persistent).
     if mode == "bwd":
         chosen_cfg = configs_bwd_persist[bwd_config_idx]
-        # The 2-CTA backward is still being built out over the following
-        # commits; it is exercised by its own dedicated tests until it is
-        # numerically correct, not through this autotune matrix.
-        if chosen_cfg.kwargs.get("NUM_CTAS", 1) == 2:
-            pytest.skip("2-CTA backward is under construction")
+        cfg_num_ctas = chosen_cfg.kwargs.get("NUM_CTAS", 1)
+        cfg_block_m1 = chosen_cfg.kwargs["BLOCK_M1"]
+        # The 2-CTA backward only implements the BM128 adjacent-N-tile grid on
+        # the non-persistent path -- grid() asserts BLOCK_M1 == 128 there --
+        # so BM64 2-CTA is persistent-only.
+        if cfg_num_ctas == 2 and cfg_block_m1 != 128 and baseVariant == "ws":
+            pytest.skip("BM64 2-CTA backward is persistent-only")
+        # BM128 2-CTA packs dQ as [2 * N_CTX, HEAD_DIM // 2] and subtiles the
+        # epilogue by 8, which is only defined for HEAD_DIM=128.
+        if cfg_num_ctas == 2 and cfg_block_m1 == 128 and HEAD_DIM == 64:
+            pytest.skip("BM128 2-CTA backward requires HEAD_DIM=128")
         # Optional per-test SMEM budget override (e.g. force depth-2 early-TMA
         # store staging for the T277224987 regression). Copy so we never mutate
         # the shared global config.
