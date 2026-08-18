@@ -37,14 +37,21 @@ struct PlanLoopPipelineDelta {
 
 struct PlanPipelineStagingApplyRecord {
   std::string valueId;
+  std::string action;
   int64_t derivedOperationsCloned = 0;
   int64_t derivedOperationsPruned = 0;
   int64_t selectedConsumerOperands = 0;
   int64_t unselectedConsumersPreserved = 0;
+  int64_t globalLoadsEliminated = 0;
+  int64_t directToLdsCopies = 0;
+  int64_t asyncCommitsInserted = 0;
+  int64_t asyncWaitsInserted = 0;
   int64_t sourceLiveStartBefore = -1;
   int64_t sourceLiveEndBefore = -1;
   int64_t sourceLiveStartAfter = -1;
   int64_t sourceLiveEndAfter = -1;
+  bool registerSourceEliminated = false;
+  bool globalAccessSemanticsPreserved = false;
   bool logicalLiveRangeShortened = false;
 };
 
@@ -90,6 +97,7 @@ struct PlanPipelineApplyResult {
   bool changesPrefetchDistance = false;
   bool changesBufferDepth = false;
   bool changesNewStaging = false;
+  bool changesGlobalStaging = false;
   bool postRewriteAuditPassed = false;
   std::vector<PlanPipelineLoopApplyRecord> loops;
 };

@@ -1,6 +1,8 @@
 #include "PlanStagingResolver.h"
 
 #include "mlir/Interfaces/SideEffectInterfaces.h"
+#include "third_party/amd/include/Dialect/TritonAMDGPU/IR/Dialect.h"
+#include "triton/Dialect/Triton/IR/Dialect.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include <limits>
@@ -104,12 +106,12 @@ findUniqueLiveSegment(const plan::PlanValueGraph &graph, StringRef valueId) {
 
 } // namespace
 
-LogicalResult resolveRegisterToLdsStaging(
-    ArrayRef<plan::PlanPipelineStagingIntent> intents, scf::ForOp loop,
-    const plan::PlanValueGraph &graph,
-    const std::map<std::string, Operation *> &operationById,
-    const std::map<std::string, Value> &valueById,
-    PlanRegisterToLdsResolution &result, std::string &error) {
+LogicalResult
+resolveLdsStaging(ArrayRef<plan::PlanPipelineStagingIntent> intents,
+                  scf::ForOp loop, const plan::PlanValueGraph &graph,
+                  const std::map<std::string, Operation *> &operationById,
+                  const std::map<std::string, Value> &valueById,
+                  PlanLdsStagingResolution &result, std::string &error) {
   std::map<std::string, const plan::PlanValueRecord *> valueRecordById;
   for (const plan::PlanValueRecord &value : graph.getValues())
     valueRecordById[value.id] = &value;
@@ -124,13 +126,27 @@ LogicalResult resolveRegisterToLdsStaging(
     Value source = valueIt->second;
     auto tensorType = dyn_cast<RankedTensorType>(source.getType());
     Operation *producer = source.getDefiningOp();
+    bool isGlobalToLds = intent.action == "global_to_lds";
     if (!tensorType || !producer) {
-      error = "register-to-LDS staging requires a produced ranked tensor";
+      error = isGlobalToLds
+                  ? "global_to_lds staging requires a produced ranked tensor"
+                  : "register-to-LDS staging requires a produced ranked tensor";
       return failure();
     }
     if (producer->getBlock() != loop.getBody()) {
       error = "register-to-LDS producer must be directly in the selected loop";
       return failure();
+    }
+    if (isGlobalToLds) {
+      if (auto load = dyn_cast<triton::LoadOp>(producer)) {
+        if (load.getIsVolatile()) {
+          error = "global_to_lds does not support volatile loads";
+          return failure();
+        }
+      } else if (!isa<BufferLoadOp>(producer)) {
+        error = "global_to_lds requires tt.load or amdg.buffer_load";
+        return failure();
+      }
     }
     if (!recordIt->second->logicalBytes ||
         *recordIt->second->logicalBytes <= 0) {
@@ -151,10 +167,12 @@ LogicalResult resolveRegisterToLdsStaging(
       return failure();
     }
 
-    PlanRegisterToLdsStaging staging;
+    PlanLdsStaging staging;
     staging.loop = loop;
+    staging.action = intent.action;
     staging.source = source;
     staging.sourceValueId = intent.valueId;
+    staging.sourceProducerId = recordIt->second->definingOperationId;
     staging.tensorType = tensorType;
     staging.logicalBytes = *recordIt->second->logicalBytes;
     staging.alignment = intent.alignment;
@@ -237,6 +255,10 @@ LogicalResult resolveRegisterToLdsStaging(
       }
     }
     staging.unselectedConsumersPreserved = unselectedConsumers.size();
+    if (isGlobalToLds && !staging.preservedOperands.empty()) {
+      error = "global_to_lds requires the complete derived-use closure";
+      return failure();
+    }
 
     result.participatingOperations.insert(producer);
     result.participatingOperations.insert(staging.consumers.begin(),

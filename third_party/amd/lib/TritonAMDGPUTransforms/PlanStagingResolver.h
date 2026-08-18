@@ -9,18 +9,18 @@
 
 namespace mlir::triton::amdgpu {
 
-struct PlanRegisterToLdsResolution {
-  SmallVector<PlanRegisterToLdsStaging, 1> staging;
+struct PlanLdsStagingResolution {
+  SmallVector<PlanLdsStaging, 1> staging;
   llvm::DenseSet<Operation *> participatingOperations;
   int64_t logicalBytes = 0;
 };
 
-LogicalResult resolveRegisterToLdsStaging(
-    ArrayRef<plan::PlanPipelineStagingIntent> intents, scf::ForOp loop,
-    const plan::PlanValueGraph &graph,
-    const std::map<std::string, Operation *> &operationById,
-    const std::map<std::string, Value> &valueById,
-    PlanRegisterToLdsResolution &result, std::string &error);
+LogicalResult
+resolveLdsStaging(ArrayRef<plan::PlanPipelineStagingIntent> intents,
+                  scf::ForOp loop, const plan::PlanValueGraph &graph,
+                  const std::map<std::string, Operation *> &operationById,
+                  const std::map<std::string, Value> &valueById,
+                  PlanLdsStagingResolution &result, std::string &error);
 
 } // namespace mlir::triton::amdgpu
 

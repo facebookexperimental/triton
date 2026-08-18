@@ -1,6 +1,6 @@
 # AMD TLX Plan IR prototype
 
-This directory implements M1.1--M1.5b.4b of the profile-guided TLX scheduling
+This directory implements M1.1--M1.5b.4c of the profile-guided TLX scheduling
 design without changing the existing TLX kernels. M1.5b.2 reuses and extends
 Meta's shared modulo-scheduling DDG through backend-neutral APIs.
 
@@ -70,14 +70,22 @@ Meta's shared modulo-scheduling DDG through backend-neutral APIs.
   derived paths, shares common prefixes, preserves unselected branches, and
   removes dead original derived ops. Acceptance additionally requires a
   strictly shorter static Plan IR live interval for the staged source.
+- **M1.5b.4c — same-iteration global-to-LDS staging:** a complete-use
+  `tt.load` or `amdg.buffer_load` may be replaced by
+  `ttg.async_copy_global_to_local` or `amdg.buffer_load_to_local`, followed by
+  commit, wait, visibility barrier, exact-layout local reload, selected
+  derived paths, and a release barrier. Acceptance proves the original global
+  register load is gone, its access semantics are unchanged, and exactly one
+  new async LDS transaction/group/wait was introduced.
 
 M1.5a lowers only verified intra-iteration schedule permutations. M1.5b.1
 validates cross-iteration intent. M1.5b.2 applies schedules already represented
 by an existing ring. M1.5b.3 changes depth/distance and synchronization only
 for that existing ring. M1.5b.4a introduces synchronous single-slot
-`register_to_lds`, and M1.5b.4b extends it through supported derived register
-paths. Buffered staging, mixed ring/staging plans, and `global_to_lds` remain
-later M1.5b.4 work.
+`register_to_lds`, M1.5b.4b extends it through supported derived register
+paths, and M1.5b.4c adds strict same-iteration `global_to_lds`. Buffered and
+cross-iteration staging plus mixed ring/staging plans remain later M1.5b.4
+work.
 
 ## Reproduction
 
@@ -201,10 +209,11 @@ with `buffer_depth: 1`. M1.5b.4 requires a produced ranked tensor and named
 consumers in the selected `scf.for`, known logical bytes, and a power-of-two
 alignment. M1.5b.4b permits selected consumer paths through supported pure
 slice/reshape/transpose/layout operations while preserving unrelated uses.
-The report uses
-`materialization_scope: register_to_lds_staging` and records the new staging
-and synchronization changes, cloned/pruned derived operation counts,
-preserved unselected consumers, and before/after source live intervals.
+The report uses `materialization_scope: register_to_lds_staging` or
+`global_to_lds_staging` and records the new staging and synchronization
+changes, cloned/pruned derived operation counts, preserved unselected
+consumers, source lifetime changes, eliminated global loads, direct LDS
+copies, and inserted commit/wait operations.
 
 The fixed configuration names and kernel symbols are sourced from
 `third_party/tlx/tutorials/amd_fa_bwd.py`:

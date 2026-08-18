@@ -551,11 +551,14 @@ def TritonAMDGPUApplyPlanPipeline
     canonical LDS ring it can also resize the leading ring dimension, rewrite
     producer/consumer modulo slots, derive partial-wait counts, and insert
     missing visibility/release barriers. M1.5b.4 additionally materializes a
-    single-slot register-to-LDS path for a produced tensor. Named consumers
-    may be reached through supported pure slice/reshape/transpose/layout DAGs;
-    unrelated branches are preserved and the source live interval must become
-    strictly shorter. It rebuilds the strict value graph and DDG after
-    mutation and never changes dot decomposition.
+    single-slot register-to-LDS path for a produced tensor, or replace a
+    complete-use `tt.load`/`amdg.buffer_load` with a same-iteration direct LDS
+    copy. Named consumers may be reached through supported pure
+    slice/reshape/transpose/layout DAGs. Register staging preserves unrelated
+    branches and shortens the source interval; global staging requires the
+    complete use closure and eliminates the register-producing load. It
+    rebuilds the strict value graph and DDG after mutation and never changes
+    dot decomposition.
   }];
 
   let options = [

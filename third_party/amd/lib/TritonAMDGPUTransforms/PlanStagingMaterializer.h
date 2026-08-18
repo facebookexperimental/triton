@@ -12,10 +12,12 @@ namespace mlir::triton::amdgpu {
 /// A resolved M1.5b.4 single-slot register-to-LDS staging request. The source,
 /// supported derived-value DAG, and every selected consumer are direct
 /// children of the same scf.for.
-struct PlanRegisterToLdsStaging {
+struct PlanLdsStaging {
   scf::ForOp loop;
+  std::string action;
   Value source;
   std::string sourceValueId;
+  std::string sourceProducerId;
   RankedTensorType tensorType;
   int64_t logicalBytes = 0;
   int64_t alignment = 0;
@@ -31,6 +33,12 @@ struct PlanRegisterToLdsStaging {
   int64_t derivedOperationsCloned = 0;
   int64_t derivedOperationsPruned = 0;
   int64_t unselectedConsumersPreserved = 0;
+  int64_t globalLoadsEliminated = 0;
+  int64_t directToLdsCopies = 0;
+  int64_t asyncCommitsInserted = 0;
+  int64_t asyncWaitsInserted = 0;
+  bool registerSourceEliminated = false;
+  bool globalAccessSemanticsPreserved = false;
   bool logicalLiveRangeShortened = false;
 
   gpu::LocalAllocOp allocation;
@@ -38,6 +46,9 @@ struct PlanRegisterToLdsStaging {
   gpu::LocalLoadOp load;
   gpu::BarrierOp visibilityBarrier;
   gpu::BarrierOp releaseBarrier;
+  Operation *globalCopy = nullptr;
+  gpu::AsyncCommitGroupOp asyncCommit;
+  gpu::AsyncWaitOp asyncWait;
   SmallVector<Operation *> clonedDerivedOperations;
   SmallVector<Value> consumerReplacementValues;
 };
@@ -49,9 +60,9 @@ struct PlanStagingMaterializationResult {
   int64_t insertedBarriers = 0;
 };
 
-LogicalResult materializeRegisterToLdsStaging(
-    MutableArrayRef<PlanRegisterToLdsStaging> staging,
-    PlanStagingMaterializationResult &result, std::string &error);
+LogicalResult materializeLdsStaging(MutableArrayRef<PlanLdsStaging> staging,
+                                    PlanStagingMaterializationResult &result,
+                                    std::string &error);
 
 } // namespace mlir::triton::amdgpu
 

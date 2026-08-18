@@ -125,6 +125,24 @@
 // RUN:   -tritonamdgpu-apply-plan-pipeline='input-path=%t.pipeline.staging.layout-chain.json report-path=%t.pipeline.staging.layout-chain.report.json strict=true' \
 // RUN:   | FileCheck %s --check-prefix=PIPELINE-STAGING-LAYOUT-CHAIN
 // RUN: FileCheck %s --check-prefix=PIPELINE-STAGING-LAYOUT-CHAIN-REPORT < %t.pipeline.staging.layout-chain.report.json
+// RUN: python3 -c "import json; p=json.load(open('%t.pipeline.plan.json')); f=next(x for x in p['functions'] if x['function']=='global_to_lds_load'); ops={x['id']:x['kind'] for x in f['operations']}; v=next(x for x in f['values'] if ops.get(x['origin'].get('operation'))=='tt.load'); s=next(u['operation'] for u in v['uses'] if ops[u['operation']]=='amdg.extract_slice'); sv=next(x for x in f['values'] if x['origin'].get('operation')==s); cs=sorted({u['operation'] for u in sv['uses']}); l=next(x['id'] for x in f['operations'] if x['kind']=='scf.for'); d={'schema_version':'plan-pipeline-delta/0.1','kernel':f['function'],'input_value_graph_fingerprint':f['semantic_fingerprint'],'pass_position':'before_update_async_wait_count','loops':[{'loop':l,'transactions':[],'staging':[{'value':v['id'],'action':'global_to_lds','consumers':cs,'buffer_depth':1,'alignment':16}]}]}; open('%t.pipeline.staging.global.json','w').write(json.dumps(d))"
+// RUN: TRITON_USE_MODULO_SCHEDULE=1 triton-opt %s \
+// RUN:   -tritonamdgpu-apply-plan-pipeline='input-path=%t.pipeline.staging.global.json report-path=%t.pipeline.staging.global.report.json strict=true' \
+// RUN:   | FileCheck %s --check-prefix=PIPELINE-STAGING-GLOBAL
+// RUN: FileCheck %s --check-prefix=PIPELINE-STAGING-GLOBAL-REPORT < %t.pipeline.staging.global.report.json
+// RUN: python3 -c "import json; p=json.load(open('%t.pipeline.plan.json')); f=next(x for x in p['functions'] if x['function']=='global_to_lds_buffer_load'); ops={x['id']:x['kind'] for x in f['operations']}; v=next(x for x in f['values'] if ops.get(x['origin'].get('operation'))=='amdg.buffer_load'); cs=sorted({u['operation'] for u in v['uses']}); l=next(x['id'] for x in f['operations'] if x['kind']=='scf.for'); d={'schema_version':'plan-pipeline-delta/0.1','kernel':f['function'],'input_value_graph_fingerprint':f['semantic_fingerprint'],'pass_position':'before_update_async_wait_count','loops':[{'loop':l,'transactions':[],'staging':[{'value':v['id'],'action':'global_to_lds','consumers':cs,'buffer_depth':1,'alignment':16}]}]}; open('%t.pipeline.staging.global-buffer.json','w').write(json.dumps(d))"
+// RUN: TRITON_USE_MODULO_SCHEDULE=1 triton-opt %s \
+// RUN:   -tritonamdgpu-apply-plan-pipeline='input-path=%t.pipeline.staging.global-buffer.json report-path=%t.pipeline.staging.global-buffer.report.json strict=true' \
+// RUN:   | FileCheck %s --check-prefix=PIPELINE-STAGING-GLOBAL-BUFFER
+// RUN: FileCheck %s --check-prefix=PIPELINE-STAGING-GLOBAL-BUFFER-REPORT < %t.pipeline.staging.global-buffer.report.json
+// RUN: python3 -c "import json; p=json.load(open('%t.pipeline.plan.json')); f=next(x for x in p['functions'] if x['function']=='global_to_lds_partial'); ops={x['id']:x['kind'] for x in f['operations']}; v=next(x for x in f['values'] if ops.get(x['origin'].get('operation'))=='tt.load'); cs=sorted({u['operation'] for u in v['uses']})[:1]; l=next(x['id'] for x in f['operations'] if x['kind']=='scf.for'); d={'schema_version':'plan-pipeline-delta/0.1','kernel':f['function'],'input_value_graph_fingerprint':f['semantic_fingerprint'],'pass_position':'before_update_async_wait_count','loops':[{'loop':l,'transactions':[],'staging':[{'value':v['id'],'action':'global_to_lds','consumers':cs,'buffer_depth':1,'alignment':16}]}]}; open('%t.pipeline.staging.global-partial.json','w').write(json.dumps(d))"
+// RUN: not triton-opt %s \
+// RUN:   -tritonamdgpu-apply-plan-pipeline='input-path=%t.pipeline.staging.global-partial.json strict=true' \
+// RUN:   2>&1 | FileCheck %s --check-prefix=PIPELINE-STAGING-GLOBAL-PARTIAL
+// RUN: python3 -c "import json; p=json.load(open('%t.pipeline.staging.json')); p['loops'][0]['staging'][0]['action']='global_to_lds'; open('%t.pipeline.staging.global-source.json','w').write(json.dumps(p))"
+// RUN: not triton-opt %s \
+// RUN:   -tritonamdgpu-apply-plan-pipeline='input-path=%t.pipeline.staging.global-source.json strict=true' \
+// RUN:   2>&1 | FileCheck %s --check-prefix=PIPELINE-STAGING-GLOBAL-SOURCE
 //
 // Modulo runs before the guarded legacy scheduler. A successful modulo schedule
 // is preserved; the standard AMD pipeline lowers and expands it.
@@ -294,6 +312,36 @@
 // PIPELINE-STAGING-LAYOUT-CHAIN-REPORT-DAG: "derived_operations_pruned": 4
 // PIPELINE-STAGING-LAYOUT-CHAIN-REPORT-DAG: "logical_live_range_shortened": true
 // PIPELINE-STAGING-LAYOUT-CHAIN-REPORT-DAG: "selected_consumer_operands": 2
+// PIPELINE-STAGING-GLOBAL-LABEL: tt.func @global_to_lds_load
+// PIPELINE-STAGING-GLOBAL-NOT: tt.load
+// PIPELINE-STAGING-GLOBAL: ttg.async_copy_global_to_local {{.*}} mask {{.*}} other
+// PIPELINE-STAGING-GLOBAL-NEXT: ttg.async_commit_group
+// PIPELINE-STAGING-GLOBAL-NEXT: ttg.async_wait
+// PIPELINE-STAGING-GLOBAL-NEXT: ttg.barrier
+// PIPELINE-STAGING-GLOBAL-NEXT: ttg.local_load
+// PIPELINE-STAGING-GLOBAL: amdg.extract_slice
+// PIPELINE-STAGING-GLOBAL-REPORT-DAG: "action": "global_to_lds"
+// PIPELINE-STAGING-GLOBAL-REPORT-DAG: "global_loads_eliminated": 1
+// PIPELINE-STAGING-GLOBAL-REPORT-DAG: "direct_to_lds_copies": 1
+// PIPELINE-STAGING-GLOBAL-REPORT-DAG: "async_commits_inserted": 1
+// PIPELINE-STAGING-GLOBAL-REPORT-DAG: "async_waits_inserted": 1
+// PIPELINE-STAGING-GLOBAL-REPORT-DAG: "derived_operations_cloned": 1
+// PIPELINE-STAGING-GLOBAL-REPORT-DAG: "derived_operations_pruned": 1
+// PIPELINE-STAGING-GLOBAL-REPORT-DAG: "register_source_eliminated": true
+// PIPELINE-STAGING-GLOBAL-REPORT-DAG: "global_access_semantics_preserved": true
+// PIPELINE-STAGING-GLOBAL-REPORT-DAG: "post_rewrite_audit_passed": true
+// PIPELINE-STAGING-GLOBAL-REPORT-DAG: "materialization_scope": "global_to_lds_staging"
+// PIPELINE-STAGING-GLOBAL-BUFFER-LABEL: tt.func @global_to_lds_buffer_load
+// PIPELINE-STAGING-GLOBAL-BUFFER-NOT: amdg.buffer_load %
+// PIPELINE-STAGING-GLOBAL-BUFFER: amdg.buffer_load_to_local
+// PIPELINE-STAGING-GLOBAL-BUFFER: ttg.async_commit_group
+// PIPELINE-STAGING-GLOBAL-BUFFER: ttg.async_wait
+// PIPELINE-STAGING-GLOBAL-BUFFER: ttg.local_load
+// PIPELINE-STAGING-GLOBAL-BUFFER-REPORT-DAG: "action": "global_to_lds"
+// PIPELINE-STAGING-GLOBAL-BUFFER-REPORT-DAG: "global_loads_eliminated": 1
+// PIPELINE-STAGING-GLOBAL-BUFFER-REPORT-DAG: "post_rewrite_audit_passed": true
+// PIPELINE-STAGING-GLOBAL-PARTIAL: global_to_lds requires the complete derived-use closure
+// PIPELINE-STAGING-GLOBAL-SOURCE: global_to_lds requires tt.load or amdg.buffer_load
 
 #mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [2, 2], instrShape = [16, 16, 32], isTransposed = true}>
 #dot0 = #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 8}>
@@ -509,6 +557,47 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
       %convert = ttg.convert_layout %trans : tensor<8x2xi32, #reshape_dst> -> tensor<8x2xi32, #reshape_dst>
       %required = tlx.require_layout %convert : tensor<8x2xi32, #reshape_dst> -> tensor<8x2xi32, #reshape_dst>
       %consumer = arith.addi %required, %required : tensor<8x2xi32, #reshape_dst>
+    }
+    tt.return
+  }
+
+  tt.func @global_to_lds_load(
+      %ptrs: tensor<64x128x!tt.ptr<f16>, #blocked>,
+      %mask: tensor<64x128xi1, #blocked>,
+      %other: tensor<64x128xf16, #blocked>) {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c4 = arith.constant 4 : index
+    scf.for %i = %c0 to %c4 step %c1 {
+      %loaded = tt.load %ptrs, %mask, %other : tensor<64x128x!tt.ptr<f16>, #blocked>
+      %slice = amdg.extract_slice %loaded [0, 0] : tensor<64x128xf16, #blocked> to tensor<32x64xf16, #blocked>
+      %consumer = arith.addf %slice, %slice : tensor<32x64xf16, #blocked>
+    }
+    tt.return
+  }
+
+  tt.func @global_to_lds_buffer_load(
+      %base: !tt.ptr<f16> {tt.divisibility = 16 : i32, tt.pointer_range = 32 : i32},
+      %offsets: tensor<16x16xi32, #slot_blocked>) {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c4 = arith.constant 4 : index
+    scf.for %i = %c0 to %c4 step %c1 {
+      %loaded = amdg.buffer_load %base[%offsets] cacheModifier = cg : tensor<16x16xf16, #slot_blocked>
+      %consumer = arith.addf %loaded, %loaded : tensor<16x16xf16, #slot_blocked>
+    }
+    tt.return
+  }
+
+  tt.func @global_to_lds_partial(
+      %ptrs: tensor<16x16x!tt.ptr<f16>, #slot_blocked>) {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c4 = arith.constant 4 : index
+    scf.for %i = %c0 to %c4 step %c1 {
+      %loaded = tt.load %ptrs : tensor<16x16x!tt.ptr<f16>, #slot_blocked>
+      %left = arith.addf %loaded, %loaded : tensor<16x16xf16, #slot_blocked>
+      %right = arith.subf %loaded, %loaded : tensor<16x16xf16, #slot_blocked>
     }
     tt.return
   }

@@ -174,8 +174,10 @@ FailureOr<PlanPipelineDelta> parsePlanPipelineDelta(StringRef payload,
             !readPositiveInteger(*stagingObject, "alignment", intent.alignment,
                                  error))
           return failure();
-        if (intent.action != "register_to_lds") {
-          error = "M1.5b.4 supports only register_to_lds staging";
+        if (intent.action != "register_to_lds" &&
+            intent.action != "global_to_lds") {
+          error = "M1.5b.4 supports only register_to_lds or global_to_lds "
+                  "staging";
           return failure();
         }
         if (intent.bufferDepth != 1) {
@@ -215,15 +217,23 @@ serializePlanPipelineApplyReport(const PlanPipelineApplyResult &result) {
     for (const PlanPipelineStagingApplyRecord &record : loop.staging) {
       staging.push_back(llvm::json::Object{
           {"value", record.valueId},
+          {"action", record.action},
           {"derived_operations_cloned", record.derivedOperationsCloned},
           {"derived_operations_pruned", record.derivedOperationsPruned},
           {"selected_consumer_operands", record.selectedConsumerOperands},
           {"unselected_consumers_preserved",
            record.unselectedConsumersPreserved},
+          {"global_loads_eliminated", record.globalLoadsEliminated},
+          {"direct_to_lds_copies", record.directToLdsCopies},
+          {"async_commits_inserted", record.asyncCommitsInserted},
+          {"async_waits_inserted", record.asyncWaitsInserted},
           {"source_live_start_before", record.sourceLiveStartBefore},
           {"source_live_end_before", record.sourceLiveEndBefore},
           {"source_live_start_after", record.sourceLiveStartAfter},
           {"source_live_end_after", record.sourceLiveEndAfter},
+          {"register_source_eliminated", record.registerSourceEliminated},
+          {"global_access_semantics_preserved",
+           record.globalAccessSemanticsPreserved},
           {"logical_live_range_shortened", record.logicalLiveRangeShortened},
       });
     }
@@ -264,13 +274,15 @@ serializePlanPipelineApplyReport(const PlanPipelineApplyResult &result) {
       {"changes_prefetch_distance", result.changesPrefetchDistance},
       {"changes_buffer_depth", result.changesBufferDepth},
       {"changes_new_staging", result.changesNewStaging},
+      {"changes_global_staging", result.changesGlobalStaging},
       {"changes_dot_decomposition", false},
       {"post_rewrite_audit_passed", result.postRewriteAuditPassed},
       {"materialization_scope",
-       result.changesNewStaging ? "register_to_lds_staging"
+       result.changesGlobalStaging ? llvm::json::Value("global_to_lds_staging")
+       : result.changesNewStaging ? llvm::json::Value("register_to_lds_staging")
        : result.changesIterationStorage || result.changesSynchronization
-           ? "existing_lds_ring_and_sync"
-           : "existing_lds_operation_order"},
+           ? llvm::json::Value("existing_lds_ring_and_sync")
+           : llvm::json::Value("existing_lds_operation_order")},
   };
   std::string payload;
   llvm::raw_string_ostream stream(payload);

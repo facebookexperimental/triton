@@ -79,7 +79,7 @@ struct ResolvedLoopPipeline {
   SmallVector<Operation *> desiredOrder;
   SmallVector<tta::PlanExistingLdsRingMutation, 1> ringMutations;
   SmallVector<tta::PlanAsyncWaitMutation, 2> waitMutations;
-  SmallVector<tta::PlanRegisterToLdsStaging, 1> stagingMutations;
+  SmallVector<tta::PlanLdsStaging, 1> stagingMutations;
   tt::plan::PlanPipelineLoopApplyRecord record;
 };
 
@@ -394,10 +394,10 @@ resolveLoopPipeline(const tt::plan::PlanLoopPipelineDelta &requested,
     return failure();
   }
 
-  tta::PlanRegisterToLdsResolution stagingResolution;
-  if (failed(tta::resolveRegisterToLdsStaging(requested.staging, loop, graph,
-                                              operationById, valueById,
-                                              stagingResolution, error)))
+  tta::PlanLdsStagingResolution stagingResolution;
+  if (failed(tta::resolveLdsStaging(requested.staging, loop, graph,
+                                    operationById, valueById, stagingResolution,
+                                    error)))
     return failure();
   int64_t stagingBytes = stagingResolution.logicalBytes;
   resolved.stagingMutations = std::move(stagingResolution.staging);
@@ -917,6 +917,9 @@ verifyPostRewrite(const tt::plan::PlanValueGraph &postGraph,
   std::map<std::string, const tt::plan::PlanAsyncWaitRecord *> waitByOperation;
   for (const tt::plan::PlanAsyncWaitRecord &wait : postGraph.getAsyncWaits())
     waitByOperation[wait.operationId] = &wait;
+  std::map<std::string, const tt::plan::PlanAsyncGroup *> groupById;
+  for (const tt::plan::PlanAsyncGroup &group : postGraph.getAsyncGroups())
+    groupById[group.id] = &group;
   std::map<std::string, const tt::plan::PlanLdsAllocationRecord *>
       allocationByOperation;
   for (const tt::plan::PlanLdsAllocationRecord &allocation :
@@ -987,10 +990,10 @@ verifyPostRewrite(const tt::plan::PlanValueGraph &postGraph,
         return failure();
       }
     }
-    for (tta::PlanRegisterToLdsStaging &staging : loop.stagingMutations) {
-      if (!staging.allocation || !staging.store || !staging.load ||
-          !staging.visibilityBarrier || !staging.releaseBarrier) {
-        error = "post-rewrite register-to-LDS staging is incomplete";
+    for (tta::PlanLdsStaging &staging : loop.stagingMutations) {
+      if (!staging.allocation || !staging.load || !staging.visibilityBarrier ||
+          !staging.releaseBarrier) {
+        error = "post-rewrite LDS staging is incomplete";
         return failure();
       }
       auto allocationType =
@@ -1021,11 +1024,9 @@ verifyPostRewrite(const tt::plan::PlanValueGraph &postGraph,
                 "allocation";
         return failure();
       }
-      if (staging.store.getSrc() != staging.source ||
-          staging.store.getDst() != staging.allocation.getResult() ||
-          staging.load.getSrc() != staging.allocation.getResult() ||
+      if (staging.load.getSrc() != staging.allocation.getResult() ||
           staging.load.getType() != staging.tensorType) {
-        error = "post-rewrite register-to-LDS data path is inconsistent";
+        error = "post-rewrite LDS-staging data path is inconsistent";
         return failure();
       }
       for (const auto &[operand, value] : staging.preservedOperands) {
@@ -1047,39 +1048,122 @@ verifyPostRewrite(const tt::plan::PlanValueGraph &postGraph,
           return failure();
         }
       }
-      auto sourceId = postValueBindings.find(staging.source);
-      if (sourceId == postValueBindings.end()) {
-        error = "post-rewrite staged source lost stable Plan IR identity";
-        return failure();
-      }
-      const tt::plan::PlanLiveSegment *sourceSegment = nullptr;
-      for (const tt::plan::PlanLiveSegment &segment :
-           postGraph.getLiveSegments()) {
-        if (segment.valueId != sourceId->second)
-          continue;
-        if (sourceSegment) {
-          error = "post-rewrite staged source has multiple live segments";
+      if (staging.action == "register_to_lds") {
+        if (!staging.store || staging.store.getSrc() != staging.source ||
+            staging.store.getDst() != staging.allocation.getResult()) {
+          error = "post-rewrite register-to-LDS store path is inconsistent";
           return failure();
         }
-        sourceSegment = &segment;
-      }
-      if (!sourceSegment) {
-        error = "post-rewrite staged source has no live segment";
+        auto sourceId = postValueBindings.find(staging.source);
+        if (sourceId == postValueBindings.end()) {
+          error = "post-rewrite staged source lost stable Plan IR identity";
+          return failure();
+        }
+        const tt::plan::PlanLiveSegment *sourceSegment = nullptr;
+        for (const tt::plan::PlanLiveSegment &segment :
+             postGraph.getLiveSegments()) {
+          if (segment.valueId != sourceId->second)
+            continue;
+          if (sourceSegment) {
+            error = "post-rewrite staged source has multiple live segments";
+            return failure();
+          }
+          sourceSegment = &segment;
+        }
+        if (!sourceSegment) {
+          error = "post-rewrite staged source has no live segment";
+          return failure();
+        }
+        staging.sourceLiveStartAfter = sourceSegment->startPosition;
+        staging.sourceLiveEndAfter = sourceSegment->endPosition;
+        int64_t beforeLength =
+            staging.sourceLiveEndBefore - staging.sourceLiveStartBefore;
+        int64_t afterLength =
+            staging.sourceLiveEndAfter - staging.sourceLiveStartAfter;
+        staging.logicalLiveRangeShortened = afterLength < beforeLength;
+        if (!staging.logicalLiveRangeShortened) {
+          error = "staging_does_not_shorten_lifetime";
+          return failure();
+        }
+        if (!staging.store->isBeforeInBlock(staging.visibilityBarrier)) {
+          error = "post-rewrite register staging store order is invalid";
+          return failure();
+        }
+      } else if (staging.action == "global_to_lds") {
+        if (!staging.globalCopy || !staging.asyncCommit || !staging.asyncWait ||
+            staging.load.getToken() != staging.asyncWait ||
+            !staging.registerSourceEliminated ||
+            !staging.globalAccessSemanticsPreserved) {
+          error = "post-rewrite global-to-LDS path is incomplete";
+          return failure();
+        }
+        if (llvm::any_of(postGraph.getOperations(),
+                         [&](const auto &operation) {
+                           return operation.id == staging.sourceProducerId;
+                         }) ||
+            llvm::any_of(postGraph.getValues(), [&](const auto &value) {
+              return value.id == staging.sourceValueId;
+            })) {
+          error = "post-rewrite global register load was not eliminated";
+          return failure();
+        }
+        auto copyId = postBindings.find(staging.globalCopy);
+        auto transaction = copyId == postBindings.end()
+                               ? transactionByProducer.end()
+                               : transactionByProducer.find(copyId->second);
+        if (transaction == transactionByProducer.end() ||
+            transaction->second->direction != "lds_write" ||
+            !llvm::is_contained(transaction->second->rootValueIds,
+                                allocationRecord->second->rootValueId)) {
+          error = "post-rewrite global-to-LDS transaction is not proven";
+          return failure();
+        }
+        const tt::plan::PlanAsyncTransaction &post = *transaction->second;
+        auto group = groupById.find(post.commitGroupId);
+        auto commitId = postBindings.find(staging.asyncCommit);
+        auto waitId = postBindings.find(staging.asyncWait);
+        auto wait = waitId == postBindings.end()
+                        ? waitByOperation.end()
+                        : waitByOperation.find(waitId->second);
+        bool waitCompletesGroup =
+            wait != waitByOperation.end() &&
+            llvm::any_of(wait->second->completedGroups,
+                         [&](const auto &completion) {
+                           return completion.groupId == post.commitGroupId &&
+                                  completion.iterationDistance == 0;
+                         });
+        bool hasVisibility =
+            llvm::any_of(post.visibilityFrontiers, [](const auto &frontier) {
+              return frontier.iterationDistance == 0;
+            });
+        bool hasConsumer =
+            llvm::any_of(post.consumerFrontiers, [](const auto &frontier) {
+              return frontier.iterationDistance == 0;
+            });
+        bool hasRelease =
+            llvm::any_of(post.releaseFrontiers, [](const auto &frontier) {
+              return frontier.iterationDistance == 0;
+            });
+        bool commitOwnsTransaction =
+            group != groupById.end() && commitId != postBindings.end() &&
+            group->second->commitOperationId == commitId->second &&
+            llvm::is_contained(group->second->transactionIds, post.id);
+        if (!commitOwnsTransaction || !waitCompletesGroup || !hasVisibility ||
+            !hasConsumer || !hasRelease) {
+          error = "post-rewrite global-to-LDS synchronization is not proven";
+          return failure();
+        }
+        if (!staging.globalCopy->isBeforeInBlock(staging.asyncCommit) ||
+            !staging.asyncCommit->isBeforeInBlock(staging.asyncWait) ||
+            !staging.asyncWait->isBeforeInBlock(staging.visibilityBarrier)) {
+          error = "post-rewrite global staging async order is invalid";
+          return failure();
+        }
+      } else {
+        error = "post-rewrite staging has an unknown action";
         return failure();
       }
-      staging.sourceLiveStartAfter = sourceSegment->startPosition;
-      staging.sourceLiveEndAfter = sourceSegment->endPosition;
-      int64_t beforeLength =
-          staging.sourceLiveEndBefore - staging.sourceLiveStartBefore;
-      int64_t afterLength =
-          staging.sourceLiveEndAfter - staging.sourceLiveStartAfter;
-      staging.logicalLiveRangeShortened = afterLength < beforeLength;
-      if (!staging.logicalLiveRangeShortened) {
-        error = "staging_does_not_shorten_lifetime";
-        return failure();
-      }
-      if (!staging.store->isBeforeInBlock(staging.visibilityBarrier) ||
-          !staging.visibilityBarrier->isBeforeInBlock(staging.load) ||
+      if (!staging.visibilityBarrier->isBeforeInBlock(staging.load) ||
           !staging.load->isBeforeInBlock(staging.consumers.front()) ||
           !staging.consumers.back()->isBeforeInBlock(staging.releaseBarrier)) {
         error = "post-rewrite staging synchronization order is invalid";
@@ -1127,17 +1211,25 @@ verifyPostRewrite(const tt::plan::PlanValueGraph &postGraph,
 
 static void recordStagingResults(ResolvedLoopPipeline &loop) {
   loop.record.staging.clear();
-  for (const tta::PlanRegisterToLdsStaging &staging : loop.stagingMutations) {
+  for (const tta::PlanLdsStaging &staging : loop.stagingMutations) {
     tt::plan::PlanPipelineStagingApplyRecord record;
     record.valueId = staging.sourceValueId;
+    record.action = staging.action;
     record.derivedOperationsCloned = staging.derivedOperationsCloned;
     record.derivedOperationsPruned = staging.derivedOperationsPruned;
     record.selectedConsumerOperands = staging.consumerOperands.size();
     record.unselectedConsumersPreserved = staging.unselectedConsumersPreserved;
+    record.globalLoadsEliminated = staging.globalLoadsEliminated;
+    record.directToLdsCopies = staging.directToLdsCopies;
+    record.asyncCommitsInserted = staging.asyncCommitsInserted;
+    record.asyncWaitsInserted = staging.asyncWaitsInserted;
     record.sourceLiveStartBefore = staging.sourceLiveStartBefore;
     record.sourceLiveEndBefore = staging.sourceLiveEndBefore;
     record.sourceLiveStartAfter = staging.sourceLiveStartAfter;
     record.sourceLiveEndAfter = staging.sourceLiveEndAfter;
+    record.registerSourceEliminated = staging.registerSourceEliminated;
+    record.globalAccessSemanticsPreserved =
+        staging.globalAccessSemanticsPreserved;
     record.logicalLiveRangeShortened = staging.logicalLiveRangeShortened;
     loop.record.staging.push_back(std::move(record));
   }
@@ -1205,8 +1297,8 @@ applyPlanPipeline(tt::FuncOp function, const tt::plan::PlanPipelineDelta &delta,
         materialization.insertedVisibilityBarriers +
         materialization.insertedReleaseBarriers;
     tta::PlanStagingMaterializationResult stagingMaterialization;
-    if (failed(tta::materializeRegisterToLdsStaging(
-            loop.stagingMutations, stagingMaterialization, error))) {
+    if (failed(tta::materializeLdsStaging(loop.stagingMutations,
+                                          stagingMaterialization, error))) {
       result.error = error;
       return failure();
     }
@@ -1218,6 +1310,10 @@ applyPlanPipeline(tt::FuncOp function, const tt::plan::PlanPipelineDelta &delta,
     result.changesIterationStorage |= result.changesBufferDepth;
     result.changesSynchronization |= !loop.ringMutations.empty();
     result.changesNewStaging |= !loop.stagingMutations.empty();
+    result.changesGlobalStaging |= llvm::any_of(
+        loop.stagingMutations, [](const tta::PlanLdsStaging &staging) {
+          return staging.action == "global_to_lds";
+        });
     result.changesIterationStorage |= !loop.stagingMutations.empty();
     result.changesSynchronization |= !loop.stagingMutations.empty();
   }
@@ -1262,14 +1358,22 @@ applyPlanPipeline(tt::FuncOp function, const tt::plan::PlanPipelineDelta &delta,
                   "dot decomposition or accumulator contract changed during "
                   "pipeline materialization");
     size_t newStagingCount = 0;
-    for (const ResolvedLoopPipeline &loop : resolved)
+    size_t newGlobalStagingCount = 0;
+    for (const ResolvedLoopPipeline &loop : resolved) {
       newStagingCount += loop.stagingMutations.size();
+      newGlobalStagingCount += llvm::count_if(
+          loop.stagingMutations, [](const tta::PlanLdsStaging &staging) {
+            return staging.action == "global_to_lds";
+          });
+    }
     if (postGraph->getLdsAllocations().size() !=
             graph->getLdsAllocations().size() + newStagingCount ||
-        postGraph->getAsyncGroups().size() != graph->getAsyncGroups().size() ||
+        postGraph->getAsyncGroups().size() !=
+            graph->getAsyncGroups().size() + newGlobalStagingCount ||
         postGraph->getAsyncTransactions().size() !=
-            graph->getAsyncTransactions().size() ||
-        postGraph->getAsyncWaits().size() != graph->getAsyncWaits().size())
+            graph->getAsyncTransactions().size() + newGlobalStagingCount ||
+        postGraph->getAsyncWaits().size() !=
+            graph->getAsyncWaits().size() + newGlobalStagingCount)
       return fail(result, error,
                   "pipeline materialization changed an unrequested LDS or "
                   "async structure");

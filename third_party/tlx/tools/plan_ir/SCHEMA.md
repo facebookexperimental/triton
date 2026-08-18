@@ -210,5 +210,24 @@ unselected consumers, and source live-range endpoints. Acceptance requires the
 post-rewrite Plan IR interval length to be strictly smaller than the baseline;
 otherwise it rejects with `staging_does_not_shorten_lifetime`.
 
-Buffered staging, mixed ring/staging requests, and `global_to_lds` remain later
-M1.5b.4 work.
+### M1.5b.4c same-iteration global staging
+
+The native reader also accepts `global_to_lds` with `buffer_depth: 1` when the
+staged tensor is produced directly by `tt.load` or `amdg.buffer_load` in the
+selected loop. Every use reachable through the supported 4b derived DAG must
+terminate at a named consumer; partial-use plans are rejected so the rewrite
+cannot duplicate global memory traffic. Volatile and unsupported load forms
+are rejected.
+
+The materializer replaces the register-producing load with
+`ttg.async_copy_global_to_local` or `amdg.buffer_load_to_local`, preserving
+pointer/offset, mask, `other`, stride, cache, eviction, and contiguity semantics
+represented by the source and destination ops. It inserts one commit, wait,
+visibility barrier, exact-layout local load, and consumer-release barrier,
+then removes the original load and dead derived register path.
+
+Post-rewrite acceptance requires one new LDS allocation, async transaction,
+group, and wait; a proven completion/visibility/consumer/release chain; no old
+source operation/value identity; unchanged dot/scheduled-MFMA contracts; and a
+legal rebuilt distance-zero DDG. Buffered and cross-iteration staging and
+mixed existing-ring/new-staging requests remain later M1.5b.4 work.
