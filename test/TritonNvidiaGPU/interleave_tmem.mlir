@@ -617,4 +617,38 @@ tt.func @restore_ws_arrive_stops_at_named_barrier(
   tt.return %out0, %out1 : tensor<128x64xf32, #linear64>, tensor<128x64xf32, #linear64>
 }
 
+// Materialize a wide TMEM operand before the independent SMEM operand that
+// feeds the same elementwise operation. This keeps the SMEM broadcast from
+// spanning the TMEM load while preserving the channel waits and releases.
+// CHECK-LABEL: @prioritize_tmem_operand
+// CHECK:      ttng.wait_barrier %[[TMEM_FULL:.*]], %{{.*}}
+// CHECK-NEXT: %[[TV:.*]] = ttng.tmem_load
+// CHECK-NEXT: ttng.arrive_barrier %[[TMEM_EMPTY:.*]], 1
+// CHECK-NEXT: %[[TC:.*]] = ttg.convert_layout %[[TV]]
+// CHECK-NEXT: ttng.wait_barrier %[[LOCAL_FULL:.*]], %{{.*}}
+// CHECK-NEXT: %[[LV:.*]] = ttg.local_load
+// CHECK-NEXT: ttng.arrive_barrier %[[LOCAL_EMPTY:.*]], 1
+// CHECK-NEXT: %[[LE:.*]] = arith.extf %[[LV]]
+// CHECK-NEXT: %[[SUM:.*]] = arith.addf %[[TC]], %[[LE]]
+tt.func @prioritize_tmem_operand(
+    %smem: !ttg.memdesc<128x64xf16, #shared, #smem, mutable>,
+    %tmem: !ttg.memdesc<128x64xf32, #tmem, #ttng.tensor_memory, mutable, 128x128>,
+    %local_full: !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>,
+    %local_empty: !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>,
+    %tmem_full: !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>,
+    %tmem_empty: !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>)
+    -> tensor<128x64xf32, #blocked> {
+  %phase = arith.constant 0 : i32
+  ttng.wait_barrier %local_full, %phase {constraints = {WSBarrier = {channelGraph = array<i32: 1, 2>, parentId = 1 : i32, minRegionId = 1 : i32, maxRegionId = 1 : i32}}} : !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>
+  %local = ttg.local_load %smem : !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> tensor<128x64xf16, #blocked>
+  ttng.arrive_barrier %local_empty, 1 {constraints = {WSBarrier = {channelGraph = array<i32: 1, 2>, parentId = 1 : i32, minRegionId = 2 : i32, maxRegionId = 2 : i32}}} : !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>
+  %local_f32 = arith.extf %local : tensor<128x64xf16, #blocked> to tensor<128x64xf32, #blocked>
+  ttng.wait_barrier %tmem_full, %phase {constraints = {WSBarrier = {channelGraph = array<i32: 1, 2>, parentId = 1 : i32, minRegionId = 1 : i32, maxRegionId = 1 : i32}}} : !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>
+  %tmem_value = ttng.tmem_load %tmem : !ttg.memdesc<128x64xf32, #tmem, #ttng.tensor_memory, mutable, 128x128> -> tensor<128x64xf32, #linear64>
+  ttng.arrive_barrier %tmem_empty, 1 {constraints = {WSBarrier = {channelGraph = array<i32: 1, 2>, parentId = 1 : i32, minRegionId = 2 : i32, maxRegionId = 2 : i32}}} : !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>
+  %tmem_blocked = ttg.convert_layout %tmem_value : tensor<128x64xf32, #linear64> -> tensor<128x64xf32, #blocked>
+  %sum = arith.addf %tmem_blocked, %local_f32 : tensor<128x64xf32, #blocked>
+  tt.return %sum : tensor<128x64xf32, #blocked>
+}
+
 }
