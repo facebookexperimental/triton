@@ -752,7 +752,7 @@ namespace {
 
 Value createBarrierAlloc(triton::FuncOp funcOp, unsigned distance,
                          StringRef srcName = "", unsigned arriveCount = 1,
-                                ttg::CGAEncodingAttr cgaLayout = {}) {
+                         ttg::CGAEncodingAttr cgaLayout = {}) {
   OpBuilder builder(funcOp);
   builder.setInsertionPointToStart(&(funcOp.getBody().front()));
   Attribute sharedMemorySpace =
@@ -1158,8 +1158,7 @@ void createToken(
         });
     Attribute multicastAxes;
     if (!tmaProducers.empty()) {
-      multicastAxes =
-          tmaProducers.front()->getAttr(tt::kMulticastAxesAttrName);
+      multicastAxes = tmaProducers.front()->getAttr(tt::kMulticastAxesAttrName);
       bool compatible = llvm::all_of(tmaProducers, [&](auto load) {
         return load->getAttr(tt::kMulticastAxesAttrName) == multicastAxes;
       });
@@ -1168,8 +1167,8 @@ void createToken(
           load->removeAttr(tt::kMulticastAxesAttrName);
         multicastAxes = {};
       }
-      commChannel.producerBarrier =
-          createBarrierAlloc(funcOp, channel->getNumBuffers(), channel->srcName);
+      commChannel.producerBarrier = createBarrierAlloc(
+          funcOp, channel->getNumBuffers(), channel->srcName);
       if (multicastAxes) {
         auto dims = ttg::TritonGPUDialect::getClusterDims(
             tmaProducers.front()->getParentOfType<ModuleOp>());
@@ -1177,9 +1176,9 @@ void createToken(
         auto identityLayout = getTMAMulticastBarrierLayout(
             tmaProducers.front(),
             DenseI32ArrayAttr::get(funcOp.getContext(), {}));
-        commChannel.multicastReuseBarrier = createBarrierAlloc(
-            funcOp, channel->getNumBuffers(), channel->srcName, clusterSize,
-            identityLayout);
+        commChannel.multicastReuseBarrier =
+            createBarrierAlloc(funcOp, channel->getNumBuffers(),
+                               channel->srcName, clusterSize, identityLayout);
         for (Channel *commSourceChannel : channelsForComm) {
           for (int taskId : commSourceChannel->relation.second) {
             if (!commChannel.multicastReadyBarriers.count(taskId))
@@ -2544,28 +2543,10 @@ void insertAsyncComm(
       }
       op = op->getParentOp();
     }
-    llvm_unreachable("Failed to find consumer's same level Op with producer");
-  };
-
-  // 0: same scope, -1: A in nested scope, 1: B in nested scope
-  auto isAinNestedRegion = [&](Operation *A, Operation *B) -> int {
-    if (A->getBlock() == B->getBlock())
-      return 0;
-    Operation *op = A;
-    while (!isa<triton::FuncOp>(op)) {
-      if (getEffectiveParentOp(op) == getEffectiveParentOp(B)) {
-        return -1;
-      }
-      op = op->getParentOp();
-    }
-    op = B;
-    while (!isa<triton::FuncOp>(op)) {
-      if (getEffectiveParentOp(op) == getEffectiveParentOp(A)) {
-        return 1;
-      }
-      op = op->getParentOp();
-    }
-    llvm_unreachable("error in isAinNestedRegion");
+    Operation *anchor = getCommonBlockAnchors(p, c).second;
+    if (anchor)
+      return anchor;
+    llvm_unreachable("failed to find a same-level channel endpoint");
   };
 
   mlir::DominanceInfo dom(funcOp);
@@ -2934,12 +2915,14 @@ void insertAsyncComm(
       return false;
     };
     Operation *nestedInsertionTarget = nullptr;
+    Operation *siblingConsumerAnchor = nullptr;
     // Check to see if producer and consumer are in the same block.
     bool producerInNestedRegion = false, consumerInNestedRegion = false;
     if (headProducer->getBlock() != headConsumer->getBlock()) {
       LDBG("different blocks for channel " << masterChannel->uniqID);
-      int regionCmp = isAinNestedRegion(headProducer, headConsumer);
-      if (regionCmp < 0) {
+      RegionRelationInfo regionInfo =
+          getRegionRelationInfo(headProducer, headConsumer);
+      if (regionInfo.relation == RegionRelation::AIsNested) {
         // A/producer in nested region. Lift up headProducer till it is
         // in the same scope as headConsumer.
         //
@@ -2973,11 +2956,19 @@ void insertAsyncComm(
                "producers supported");
         nestedInsertionTarget = getSameLevelOp(headConsumer, headProducer);
         producerInNestedRegion = true;
-      } else if (regionCmp > 0) {
+      } else if (regionInfo.relation == RegionRelation::BIsNested) {
         // B/consumer in nested region. Lift up headConsumer till it is
         // in the same scope as headProducer.
         nestedInsertionTarget = getSameLevelOp(tmaHeadProducer, headConsumer);
         consumerInNestedRegion = true;
+      } else if (regionInfo.relation == RegionRelation::Siblings) {
+        assert(isSupportedCrossRegionChannel(headProducer, headConsumer) &&
+               "sibling channel must pass preflight validation");
+        nestedInsertionTarget = regionInfo.aAnchor;
+        siblingConsumerAnchor = regionInfo.bAnchor;
+        producerInNestedRegion = true;
+      } else {
+        llvm_unreachable("cross-region channel must pass preflight validation");
       }
     } else {
       // Check to see if consumer appears later than producer (loop-carried).
@@ -3715,8 +3706,10 @@ void insertAsyncComm(
                 funcOp.getContext(), masterChannel->relation.first,
                 WSBarrierAttr::kDirectionForward)
                 .build(funcOp.getContext());
+        Operation *completionConsumer =
+            siblingConsumerAnchor ? siblingConsumerAnchor : headConsumer;
         desyncMMAv5Op(builder, mmaOp, *commChannel.producerBarrier, bufferIdx,
-                      phase, headConsumer, false, addCompletionBarrier,
+                      phase, completionConsumer, false, addCompletionBarrier,
                       waitConstraints);
       }
     }
@@ -4516,9 +4509,8 @@ void insertAsyncComm(
               .build(funcOp.getContext());
       optimizeTMALoads(builder, tmaLoads, *commChannel.producerBarrier,
                        commChannel.multicastReuseBarrier.value_or(Value()),
-                       commChannel.multicastReadyBarriers,
-                       bufferIdx, bufferIdx, phase, tmaHeadProducer,
-                       headConsumer, consumerWaitPoint,
+                       commChannel.multicastReadyBarriers, bufferIdx, bufferIdx,
+                       phase, tmaHeadProducer, headConsumer, consumerWaitPoint,
                        additionalConsumerTaskIds, waitConstraints);
     }
   }
@@ -5328,18 +5320,41 @@ static void lowerMultiTaskSubtiledRegions(triton::FuncOp funcOp) {
     ttng::lowerSubtiledRegion(op);
 }
 
+static LogicalResult validateCrossRegionChannels(
+    triton::FuncOp funcOp,
+    const SmallVector<std::unique_ptr<Channel>> &channels) {
+  for (const auto &channel : channels) {
+    Operation *producer = channel->getSrcOp();
+    Operation *consumer = channel->getDstOp();
+    if (!producer || !consumer) {
+      return funcOp.emitError()
+             << "warp specialization could not resolve channel #"
+             << channel->uniqID << " endpoints";
+    }
+    if (!isSupportedCrossRegionChannel(producer, consumer)) {
+      return funcOp.emitError()
+             << "warp specialization does not support cross-region channel #"
+             << channel->uniqID << " (" << to_string(channel->channelKind)
+             << ")";
+    }
+  }
+  return success();
+}
+
 } // namespace
 
-void doCodePartition(triton::FuncOp funcOp, unsigned numBuffers) {
+LogicalResult doCodePartition(triton::FuncOp funcOp, unsigned numBuffers) {
   // Step 1: collect all communications between producers and consumers.
   SmallVector<std::unique_ptr<Channel>> channelsOrigin;
   collectAllocChannels(channelsOrigin, funcOp);
+  if (failed(validateCrossRegionChannels(funcOp, channelsOrigin)))
+    return failure();
   SmallVector<Channel *> channels;
   for (const auto &c : channelsOrigin) {
     channels.push_back(c.get());
   }
   if (channels.empty()) {
-    return;
+    return success();
   }
   SmallVector<Channel *> orderedChannels;
   orderedChannels = channels;
@@ -5771,6 +5786,7 @@ void doCodePartition(triton::FuncOp funcOp, unsigned numBuffers) {
     LDBG("\n\nwith specializeRegion");
     funcOp.dump();
   });
+  return success();
 }
 
 #define GEN_PASS_DEF_NVGPUTESTWSCODEPARTITION
@@ -5805,7 +5821,10 @@ public:
         signalPassFailure();
         return;
       }
-      doCodePartition(funcOp, numBuffers);
+      if (failed(doCodePartition(funcOp, numBuffers))) {
+        signalPassFailure();
+        return;
+      }
     }
     // Set NameLoc("accum_cnt") on ForOp block arguments whose corresponding
     // yield operand already has an "accum_cnt" NameLoc. This must be done at

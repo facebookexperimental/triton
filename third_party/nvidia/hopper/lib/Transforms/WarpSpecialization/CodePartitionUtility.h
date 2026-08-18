@@ -35,6 +35,31 @@ constexpr llvm::StringLiteral kAtomicBroadcastCopiesAttrName =
 // the single canonical set consumed by all reject paths.
 void removeWarpSpecMetadata(triton::FuncOp funcOp);
 
+// Return the nearest ancestors of two operations that reside in a common
+// block. Returns null anchors when no such block exists below the function.
+std::pair<Operation *, Operation *> getCommonBlockAnchors(Operation *a,
+                                                          Operation *b);
+
+enum class RegionRelation {
+  SameBlock,
+  AIsNested,
+  BIsNested,
+  Siblings,
+  Unsupported,
+};
+
+struct RegionRelationInfo {
+  RegionRelation relation;
+  Operation *aAnchor = nullptr;
+  Operation *bAnchor = nullptr;
+};
+
+RegionRelationInfo getRegionRelationInfo(Operation *a, Operation *b);
+
+// Return whether the code partitioner supports a channel between these
+// endpoints without changing their relative control-flow placement.
+bool isSupportedCrossRegionChannel(Operation *producer, Operation *consumer);
+
 enum class DataChannelKind : int {
   SMEM = 0,
   TMEM = 1,

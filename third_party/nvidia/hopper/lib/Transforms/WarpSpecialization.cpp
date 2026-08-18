@@ -46,6 +46,70 @@ static OpPrintingFlags getOpPrintingFlagsWithLoc() {
   return flags;
 }
 
+static bool hasUnsupportedCrossRegionTmemChannel(triton::FuncOp funcOp) {
+  bool unsupported = false;
+  funcOp.walk([&](triton::nvidia_gpu::TMEMAllocOp alloc) {
+    SmallVector<Value> worklist{alloc.getResult()};
+    DenseSet<Value> visited;
+    SmallVector<Operation *> producers;
+    SmallVector<Operation *> consumers;
+    DenseSet<Operation *> seenProducers;
+    DenseSet<Operation *> seenConsumers;
+    while (!worklist.empty()) {
+      Value value = worklist.pop_back_val();
+      if (!visited.insert(value).second)
+        continue;
+      for (Operation *user : value.getUsers()) {
+        if (auto mma = dyn_cast<triton::nvidia_gpu::MMAv5OpInterface>(user)) {
+          if (mma.getAccumulator() == value) {
+            if (seenProducers.insert(user).second)
+              producers.push_back(user);
+            // An accumulator MMA may also read the preceding value. Treat it
+            // conservatively as a consumer; self-pairs are ignored below.
+            if (seenConsumers.insert(user).second)
+              consumers.push_back(user);
+          } else if (seenConsumers.insert(user).second) {
+            consumers.push_back(user);
+          }
+        } else if (auto load = dyn_cast<triton::nvidia_gpu::TMEMLoadOp>(user)) {
+          if (load.getSrc() == value && seenConsumers.insert(user).second)
+            consumers.push_back(user);
+        } else if (auto store =
+                       dyn_cast<triton::nvidia_gpu::TMEMStoreOp>(user)) {
+          if (store.getDst() == value && seenProducers.insert(user).second)
+            producers.push_back(user);
+        }
+        if (!isa<triton::gpu::MemDescIndexOp, triton::gpu::MemDescSubsliceOp,
+                 triton::gpu::MemDescReinterpretOp, triton::gpu::MemDescTransOp,
+                 triton::gpu::MemDescReshapeOp>(user))
+          continue;
+        for (Value result : user->getResults())
+          if (isa<triton::gpu::MemDescType>(result.getType()))
+            worklist.push_back(result);
+      }
+    }
+
+    for (Operation *producer : producers) {
+      for (Operation *consumer : consumers) {
+        if (producer == consumer ||
+            producer->getBlock() == consumer->getBlock())
+          continue;
+        SmallVector<AsyncTaskId> producerTasks = getAsyncTaskIds(producer);
+        SmallVector<AsyncTaskId> consumerTasks = getAsyncTaskIds(consumer);
+        if (producerTasks.empty() || consumerTasks.empty() ||
+            producerTasks == consumerTasks)
+          continue;
+        if (!isSupportedCrossRegionChannel(producer, consumer)) {
+          unsupported = true;
+          return WalkResult::interrupt();
+        }
+      }
+    }
+    return WalkResult::advance();
+  });
+  return unsupported;
+}
+
 static LogicalResult cleanupWarpSpecializedLoops(Operation *op) {
   runDeadIterArgElimination(op);
   RewritePatternSet patterns(op->getContext());
@@ -190,6 +254,12 @@ public:
       return bailOut(funcOp);
     }
 
+    if (hasUnsupportedCrossRegionTmemChannel(funcOp)) {
+      LDBG("Warp specialization does not support this cross-region TMEM "
+           "channel topology. Skipping.");
+      return bailOut(funcOp);
+    }
+
     // Cross-partition run-once, loop-carried "claim the next tile" support for
     // dynamic-persistent kernels. Handles both the `tt.atomic_rmw` tile counter
     // and the CLC tile-scheduler fetch (`ttng.clc_read`) with the same idea:
@@ -259,7 +329,10 @@ public:
       dumpAfter(moduleOp, "doValidateTMAStoreAnnotations");
     }
 
-    doCodePartition(funcOp, numStages);
+    if (failed(doCodePartition(funcOp, numStages))) {
+      signalPassFailure();
+      return;
+    }
     dumpAfter(moduleOp, "doCodePartition");
 
     if (pingpongAutoWS) {

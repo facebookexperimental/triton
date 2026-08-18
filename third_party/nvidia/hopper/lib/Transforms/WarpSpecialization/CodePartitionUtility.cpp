@@ -42,6 +42,62 @@ void removeWarpSpecMetadata(triton::FuncOp funcOp) {
   });
 }
 
+std::pair<Operation *, Operation *> getCommonBlockAnchors(Operation *a,
+                                                          Operation *b) {
+  DenseMap<Block *, Operation *> aAnchors;
+  for (Operation *op = a; op && !isa<triton::FuncOp>(op);
+       op = op->getParentOp())
+    aAnchors.try_emplace(op->getBlock(), op);
+  for (Operation *op = b; op && !isa<triton::FuncOp>(op);
+       op = op->getParentOp()) {
+    auto it = aAnchors.find(op->getBlock());
+    if (it != aAnchors.end())
+      return {it->second, op};
+  }
+  return {nullptr, nullptr};
+}
+
+static Operation *getEffectiveParentOp(Operation *op) {
+  Operation *parent = op->getParentOp();
+  while (parent && isa<ttng::SubtiledRegionOp>(parent))
+    parent = parent->getParentOp();
+  return parent;
+}
+
+RegionRelationInfo getRegionRelationInfo(Operation *a, Operation *b) {
+  if (a->getBlock() == b->getBlock())
+    return {RegionRelation::SameBlock};
+
+  for (Operation *op = a; op && !isa<triton::FuncOp>(op);
+       op = op->getParentOp()) {
+    if (getEffectiveParentOp(op) == getEffectiveParentOp(b))
+      return {RegionRelation::AIsNested};
+  }
+  for (Operation *op = b; op && !isa<triton::FuncOp>(op);
+       op = op->getParentOp()) {
+    if (getEffectiveParentOp(op) == getEffectiveParentOp(a))
+      return {RegionRelation::BIsNested};
+  }
+
+  auto [aAnchor, bAnchor] = getCommonBlockAnchors(a, b);
+  if (aAnchor && bAnchor && aAnchor != bAnchor &&
+      aAnchor->getBlock() == bAnchor->getBlock())
+    return {RegionRelation::Siblings, aAnchor, bAnchor};
+  return {RegionRelation::Unsupported};
+}
+
+bool isSupportedCrossRegionChannel(Operation *producer, Operation *consumer) {
+  if (!producer || !consumer)
+    return false;
+  RegionRelationInfo info = getRegionRelationInfo(producer, consumer);
+  if (info.relation == RegionRelation::Unsupported)
+    return false;
+  if (info.relation != RegionRelation::Siblings)
+    return true;
+  return isa<ttng::MMAv5OpInterface>(producer) && info.aAnchor &&
+         info.bAnchor && !info.bAnchor->isBeforeInBlock(info.aAnchor);
+}
+
 // Check whether two channels belong to the same consumer group.
 // Mirrors the merge conditions in insertAsyncComm (WSCodePartition.cpp):
 //   same getDstOp(), same consumer task IDs, same full consumer set.
