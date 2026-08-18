@@ -24,6 +24,18 @@ BM128 has no known deadlock. Its final TTGIR matches TLX in the primary
 structural counts: loops, MMAs, TMEM allocations, TMEM loads, output TMA
 stores, and dQ TMA reductions.
 
+The software-pipelined steady-state load sequence also matches TLX:
+
+```text
+qT -> dOt -> q -> M -> dO -> D
+```
+
+The kernel's dot `stage`/`order` annotations define the contraction schedule,
+and explicit metadata-load annotations place M and D in the corresponding
+prefetch wavefront. The remaining ordering differences are confined to the
+one-time prologue: AutoWS currently issues Kt before the generated pipeline
+prologue and places dOt before M/dO there.
+
 The implementation supports:
 
 - all five backward MMAs (`qK`, `dK`, `dP`, `dQ`, and `dV`) as two-CTA
