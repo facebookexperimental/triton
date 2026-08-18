@@ -1013,6 +1013,28 @@ TLX uses **CUDA-native cluster semantics** which differs from Triton's approach:
         ballot_result = tlx.vote_ballot_sync(0xFFFFFFFF, pred)
     ```
 
+- `tlx.warp_all(pred)` / `tlx.warp_any(pred)` **[Hopper+, MI300+]**
+
+    Reduce one distributed predicate per physical lane to a warp-uniform
+    scalar `i1`. Non-boolean inputs are compared with zero first. `warp_all`
+    is true only if every lane contributes true; `warp_any` is true if at
+    least one lane contributes true.
+
+    These are physical-lane votes, not logical tensor-axis reductions.
+    `tl.all` and `tl.max` reduce a tensor dimension and retain tensor layout
+    semantics, whereas these operations produce a scalar suitable for a
+    uniform branch. The predicate must distribute exactly one element per
+    lane; compilation fails if its resolved layout gives a lane zero or
+    multiple elements.
+
+    ```python
+    all_safe = tlx.warp_all(per_lane_safe)
+    any_active = tlx.warp_any(per_lane_active)
+    ```
+
+    Prefer these semantic reductions when code only needs an all/any result.
+    They do not expose a hardware ballot bit mask.
+
 - `tlx.prefetch(pointer, level="L2", mask=None, tensormap=False)` **[Hopper+]** issues a non-blocking prefetch hint for pointer-based scattered/gather loads. This complements `tlx.async_descriptor_prefetch_tensor` (which works on TMA tensor descriptors) by supporting raw pointer tensors.
   Additionally, if `tensormap` is specified to `True`, the API instead does a prefetch of tensor map object (TMA descriptor) and ignores other parameters other than `pointer`.
 
@@ -1110,6 +1132,51 @@ TLX uses **CUDA-native cluster semantics** which differs from Triton's approach:
     consumer, for example when a dot-operand layout feeds a reduction. This is
     not a conversion request; use another `require_layout` when the replacement
     layout is part of the algorithm.
+
+- `tlx.distributed_linear_layout_encoding.make(reg_bases, lane_bases, warp_bases, block_bases, shape)` **[Hopper+, MI300+]**
+
+    Construct a distributed linear encoding directly from physical input
+    bases. Each basis vector has one component per logical tensor dimension:
+
+    - `reg_bases` maps values held by one lane.
+    - `lane_bases` maps lane-id bits.
+    - `warp_bases` maps warp-id bits.
+    - `block_bases` maps program-block bits.
+    - `shape` gives the logical result dimensions and extents.
+
+    The bases must cover the requested shape; construction fails when the map
+    is not surjective. Use this API only when an instruction ABI or
+    register-level algorithm requires exact physical ownership. Prefer
+    `tlx.layout(shape=..., stride=...)` for ordinary logical layouts so layout
+    inference retains more freedom.
+
+    ```python
+    physical: tl.constexpr = tlx.distributed_linear_layout_encoding.make(
+        reg_bases=[[0, 1], [0, 2]],
+        lane_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0]],
+        warp_bases=[[64, 0], [128, 0], [256, 0]],
+        block_bases=[],
+        shape=[512, 4],
+    )
+    pinned = tlx.require_layout(value, physical)
+    ```
+
+- `tlx.cast_preserve_layout(x, dtype, fp_downcast_rounding=None, bitcast=False)` **[Hopper+, MI300+]**
+
+    Change the element type while retaining the tensor's current IR encoding.
+    It supports floating-point extension and truncation, floating-point
+    conversion with an explicit `fp_downcast_rounding`, and equal-width
+    bitcasts with `bitcast=True`. Passing the existing dtype is an identity.
+
+    Use this inside a region where physical ownership is intentional, then
+    call `tlx.release_layout` at the ownership boundary. Ordinary frontend
+    casts remain preferable when the result does not have to preserve an
+    instruction-level register layout.
+
+    ```python
+    probability_bf16 = tlx.cast_preserve_layout(probability_f32, tl.bfloat16)
+    bits = tlx.cast_preserve_layout(probability_f32, tl.int32, bitcast=True)
+    ```
 
 - `tlx.assert_same_layout(lhs, rhs)` **[Hopper+, MI300+]**
 
