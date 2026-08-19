@@ -394,6 +394,7 @@ configs = [
         pre_hook=_host_descriptor_pre_hook,
         ctas_per_cga=(2, 1, 1),
         allowDependentTwoCTA=True,
+        enable_tree_reduction=True,
     )
 ]
 
