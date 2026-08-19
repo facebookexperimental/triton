@@ -32,8 +32,14 @@ tile, and the producer/consumer barriers never match → **runtime deadlock**.
 > every partition, so — exactly like the atomic counter — the pass runs the fetch
 > once in the owner (producer) partition and broadcasts the decoded results
 > through SMEM (the `is_valid` i1 is widened to i32 for the SMEM round-trip). The
-> owner-local CLC completion mbarrier is materialized separately, after AutoWS, by
-> the `clc-materialize` pass (see `docs/design/triton-clc-tile-scheduler.md`).
+> CLC response and completion mbarriers are materialized separately, after
+> AutoWS, by the `clc-materialize` pass (see
+> `docs/design/triton-clc-tile-scheduler.md`). For clustered launches this state
+> is hoisted before the enclosing specialization and threaded through every
+> isolated worker region as an explicit capture. The backend's function-entry
+> barrier-init publication rendezvous then makes the shared/cluster state
+> visible to every CTA without executing a cluster rendezvous from only one
+> worker partition.
 > `doDynamicTileBroadcast` is the single merged entry that processes both
 > `tt.atomic_rmw` and `ttng.clc_read`.
 
