@@ -1124,11 +1124,11 @@ class TritonSemantic(Generic[TensorTy]):
             if not isinstance(latency, int) or latency < 0:
                 raise TypeError(
                     f"If provided, latency argument to load must be a non-negative integer. Found: {latency}")
-            x.handle.set_attr("tt.latency", self.builder.get_int32_attr(latency))
+            x.set_attr("tt.latency", self.builder.get_int32_attr(latency))
         if attrs is not None:
             if not isinstance(attrs, dict):
                 raise TypeError(f"attrs must be a dict, got {type(attrs).__name__}")
-            x.handle.set_attr("tt.autows", self.builder.get_string_attr(json.dumps(attrs)))
+            x.set_attr("tt.autows", self.builder.get_string_attr(json.dumps(attrs)))
         return self.tensor(x, desc.block_type)
 
     def validate_store_like(self, desc: tl.tensor_descriptor_base, value: TensorTy, offsets) -> None:
