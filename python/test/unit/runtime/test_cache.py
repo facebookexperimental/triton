@@ -798,8 +798,9 @@ def test_within_2gb(device, fresh_triton_cache) -> None:
     default_buffer_ops = os.environ.get("AMDGCN_USE_BUFFER_OPS", "0")
     try:
         use_buffer_ops_opts = ["1", "0"]
-        # The ranges should only be available when buffer ops are enabled
-        pointer_ranges = [[(0, )], []]
+        # Pointer-range specialization also enables the i32 address path for
+        # direct-to-LDS loads, so it is independent of buffer-op selection.
+        pointer_ranges = [[(0, )], [(0, )]]
         for use_buffer_ops, pointer_range in zip(use_buffer_ops_opts, pointer_ranges):
             # Set AMDGCN_USE_BUFFER_OPS
             os.environ["AMDGCN_USE_BUFFER_OPS"] = use_buffer_ops
