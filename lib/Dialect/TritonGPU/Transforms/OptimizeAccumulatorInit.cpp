@@ -129,11 +129,28 @@ bool isConstantZeroTensor(Value v) {
   return (matchPattern(v, m_Zero()) || matchPattern(v, m_AnyZeroFloat()));
 }
 
+// Packed f32 multiplication is emitted as elementwise inline PTX by kernels
+// that want to preserve paired arithmetic through lowering.  It has the same
+// zero-propagation property as arith.mulf, so look through the narrowly
+// recognized pure mul.f32x2 form when finding an accumulator's zero origin.
+bool isPackedF32Mul(Operation *op) {
+  auto inlineAsm = dyn_cast<ElementwiseInlineAsmOp>(op);
+  return inlineAsm && inlineAsm.getPure() &&
+         inlineAsm.getPackedElement() == 2 && op->getNumOperands() == 2 &&
+         op->getNumResults() == 1 &&
+         inlineAsm.getAsmString().contains("mul.f32x2");
+}
+
 std::optional<std::pair<Operation *, int>>
 findZeroInitOp(Value accUse, scf::ForOp forOp, bool &loopArgIsZero) {
   Value v = accUse;
   if (auto arg = dyn_cast<BlockArgument>(v)) {
-    assert(arg.getOwner() == forOp.getBody());
+    // A zero-preserving op can also consume a value captured from an outer
+    // block (for example the scale operand of a packed multiply).  Such a
+    // value is not the accumulator loop argument and does not establish a
+    // zero origin.
+    if (arg.getOwner() != forOp.getBody())
+      return std::nullopt;
     if (isConstantZeroTensor(forOp.getInitArgs()[arg.getArgNumber() - 1])) {
       loopArgIsZero = true;
     }
@@ -145,6 +162,33 @@ findZeroInitOp(Value accUse, scf::ForOp forOp, bool &loopArgIsZero) {
     return std::nullopt;
   }
   if (auto selOp = dyn_cast<arith::SelectOp>(defOp)) {
+    // A select can preserve the same zero-initialized loop accumulator along
+    // both arms without either arm being a literal zero.  Attention's
+    // conditional rescale is the canonical example:
+    //
+    //   scaled = acc * alpha
+    //   acc = select should_rescale, scaled, acc
+    //
+    // Both arms are zero on the first iteration, so the first MMA can
+    // initialize operand D directly.  Trace the arms independently: sharing
+    // loopArgIsZero while visiting the first arm would otherwise make an
+    // unsupported second arm look zero-preserving.
+    bool trueLoopArgIsZero = false;
+    bool falseLoopArgIsZero = false;
+    auto trueOrigin =
+        findZeroInitOp(selOp.getTrueValue(), forOp, trueLoopArgIsZero);
+    auto falseOrigin =
+        findZeroInitOp(selOp.getFalseValue(), forOp, falseLoopArgIsZero);
+    if (!trueOrigin && !falseOrigin && trueLoopArgIsZero &&
+        falseLoopArgIsZero) {
+      loopArgIsZero = true;
+      return std::nullopt;
+    }
+
+    // Rewriting a conditional zero into a scalar use-accumulator flag requires
+    // a scalar condition.  Tensor conditions are nevertheless safe in the
+    // both-arms-preserve-zero case handled above because the condition itself
+    // does not affect first-iteration initialization.
     if (!selOp.getCondition().getType().isInteger(1))
       return std::nullopt;
     if (isConstantZeroTensor(selOp.getTrueValue()) ||
@@ -166,7 +210,7 @@ findZeroInitOp(Value accUse, scf::ForOp forOp, bool &loopArgIsZero) {
       return std::make_pair(ifOp, resultIndex);
     }
   }
-  if (auto multOp = dyn_cast<arith::MulFOp>(defOp)) {
+  if (isa<arith::MulFOp>(defOp) || isPackedF32Mul(defOp)) {
     auto output1 = findZeroInitOp(defOp->getOperand(0), forOp, loopArgIsZero);
     if (output1.has_value()) {
       return output1;
