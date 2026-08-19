@@ -1229,7 +1229,8 @@ struct AsyncCopyGlobalToLocalOpConversion
     auto [laneId, warpId] = getLaneAndWarpId(rewriter, loc);
     SmallVector<Value> smemBases = {smemObj.getBase()};
     lowerLdSt(loc, ctx, cvt, vals, resElemTy, smemBases,
-              /*paddingShifts=*/{}, affineOffset, maskSpanAffineOffset, laneId,
+              /*paddingShifts=*/{}, affineOffset, maskSpanAffineOffset,
+              /*affineBlockOffset=*/Value(), /*maskSpanAffineBlock=*/0, laneId,
               warpId, rewriter, targetInfo, maxVec, emitCpAsync);
 
     // Drop the result token.

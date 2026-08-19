@@ -593,8 +593,14 @@ private:
       ImplicitLocOpBuilder b(op->getLoc(), op);
       b.setInsertionPointAfter(op);
       Value alloc = op->getResult(0);
-      if (canInitializeAllocation(alloc))
+      if (canInitializeAllocation(alloc)) {
         initializeAllocation(b, alloc);
+        auto allocType = cast<ttg::MemDescType>(alloc.getType());
+        bool isShared =
+            isa<ttg::SharedMemorySpaceAttr>(allocType.getMemorySpace());
+        if (isShared && auxData.hasAsyncProxyFenceTracking)
+          ttng::FenceAsyncSharedOp::create(b, /*bCluster=*/false);
+      }
     }
   }
 
@@ -632,14 +638,21 @@ private:
         return WalkResult::interrupt();
       }
       b.setLoc(op->getLoc());
+      if (auto info = hooks.getAsyncProxyFenceInfo(op)) {
+        funcBuilder.createFenceProxyAccessesCall(
+            b, baseThread, info->cluster, hooks.getIssuerCTAPred(b, op), op);
+      }
       if (auto wsOp = dyn_cast<ttg::WarpSpecializeOp>(op)) {
         funcBuilder.createSetActiveMaskCall(b, getActiveMask(wsOp), op);
         auto partitionRegions = wsOp.getNonEmptyPartitionRegions();
         if (!partitionRegions.empty()) {
           uint64_t destMask = 0;
+          uint64_t baseDestMask = 0;
           for (Region *region : partitionRegions)
             destMask |= getThreadPeersMask(region->getRegionNumber() + 1,
                                            auxData.threadLayout);
+          for (Region *region : partitionRegions)
+            baseDestMask |= 1ULL << (region->getRegionNumber() + 1);
           if (destMask) {
             for (MemType memType : {MemType::SHARED_MEM, MemType::TENSOR_MEM}) {
               funcBuilder.createCopyWriteVisibilityCall(b, thread, destMask,
@@ -648,6 +661,9 @@ private:
                                                        nullptr, memType, op);
             }
           }
+          if (baseDestMask)
+            funcBuilder.createCopyProxyAccessesCall(b, baseThread, baseDestMask,
+                                                    nullptr, op);
         }
       }
       if (auto info = hooks.getBarrierInitInfo(op)) {
@@ -669,6 +685,8 @@ private:
           funcBuilder.createClearBarrierReadTrackingCall(b, barrier, pred,
                                                          memType, op);
         }
+        funcBuilder.createClearBarrierProxyAccessTrackingCall(b, barrier, pred,
+                                                              op);
       }
       if (auto asyncCommitGroupOp = dyn_cast<ttg::AsyncCommitGroupOp>(op)) {
         if (!auxData.commits[CommitKind::AsyncCp].empty())
@@ -800,6 +818,8 @@ private:
           wb, alloc, getThreadPeersMask(thread, auxData.threadLayout), pred,
           memType, op);
     }
+    funcBuilder.createTransferProxyAccessesCall(wb, alloc, baseThread, pred,
+                                                op);
     funcBuilder.createClearWaitingCall(wb, alloc, baseThread, pred, op);
     tti::ExperimentalLockReleaseOp::create(wb, lock, pred);
   }
@@ -853,6 +873,16 @@ private:
       Value bufferMask = materialized.bufferMask;
       Value effectCTAs = materialized.effectCTAs;
       MemType memType = materialized.memType;
+      if (memType == MemType::SHARED_MEM) {
+        if (effect.proxy == MemEffectsOpInfo::Effects::Proxy::Async) {
+          funcBuilder.createVerifyProxyAccessCall(
+              b, bufferMask, baseThread, effect.operandName, pred, op,
+              effectCTAs);
+        } else {
+          funcBuilder.createSetProxyAccessCall(
+              b, bufferMask, baseThread, pred, op, effectCTAs);
+        }
+      }
       if (effect.rw == MemEffectsOpInfo::Effects::Read) {
         // For op that is reading, we only need to check if anything else
         // is writing to the same buffer.
@@ -912,6 +942,8 @@ private:
           funcBuilder.createTrackVisibleReadsCall(
               b, barrier, thread, combinedPred, memType, op, recipientCTAs);
         }
+        funcBuilder.createTrackProxyAccessesCall(
+            b, barrier, baseThread, combinedPred, op, recipientCTAs);
       } else if (barrierInfo.trackingMode ==
                  MemEffectsOpInfo::BarrierTrackingMode::EffectWrites) {
         for (auto [effect, materialized] :

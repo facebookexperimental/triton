@@ -1412,7 +1412,7 @@ def async_descriptor_load(
         cache,
         eviction,
         False,
-        two_ctas,
+        bool(two_ctas),
     )
 
 
