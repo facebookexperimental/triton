@@ -6,6 +6,11 @@
 
 namespace mlir::triton::gpu {
 
+// Marks the scalar first-iteration branch that peeling materializes for a
+// tensor causal mask, so cloneIteration can fold it away again.
+constexpr inline llvm::StringLiteral kSyntheticMaskBranchAttrName =
+    "ttg.loop_peeling.synthetic_mask";
+
 // The warp-specialization task attribute. Named here because core transforms
 // cannot include the NVIDIA backend's WarpSpecialization/Utility.h, which
 // declares the same name for backend passes.
