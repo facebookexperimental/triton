@@ -54,6 +54,10 @@ pytest python/test/unit/language/test_autows_addmm.py
 pytest python/test/unit/language/test_autows_quantized_matmul.py
 pytest third_party/tlx/tutorials/testing/test_correctness_autows.py
 
+echo "Verifying repeated high-grid 2-CTA CLC FA forward"
+AUTOWS_FWD_CLC=1 AUTOWS_FWD_NUM_CTAS=2 \
+    pytest third_party/tlx/tutorials/testing/test_correctness_autows.py::test_autows_fa_rescale_opt_clc_repeated_high_grid
+
 echo "Run autoWS tutorial kernels"
 echo "Verifying correctness of FA tutorial kernels"
 pytest third_party/tlx/tutorials/fused_attention_ws_device_tma.py
