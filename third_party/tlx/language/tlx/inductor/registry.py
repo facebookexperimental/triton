@@ -1159,6 +1159,20 @@ class ROCmAddMMWarpPipeTemplateConfigHeuristic(
     # (128x256x64,NB3) = 144KB fits gfx950's 160KB (occupancy 1); it is the deeper-
     # prefetch tile that won the standalone split-K sweep on low-occupancy large-K
     # (e.g. 1024x6144x22272 at SK=4), which the NB=2 variant alone could not reach.
+    # The block below closes three systematic holes in the pool above: no BLOCK_M=256,
+    # no BLOCK_N < 64, and no BLOCK_K=256. Measured across three ads merge nets
+    # (AF OC 200x 1116908456_0, HI OC 700x 1080674750_16, HI IG CTR 1087773826_1723),
+    # stock triton_mm beats the best TLX addmm candidate on 129 shapes -- and on 103 of
+    # them the winning stock tile is one this pool cannot express. Narrow-N shapes are
+    # the clearest case: N=48/128/256 outputs want BLOCK_N 16-64, and the smallest tile
+    # here is 64x64. Each entry's GROUP_M/num_warps is the config stock Triton actually
+    # won that tile with (modal value over those 103 shapes), not a guess.
+    # LDS at fp16, (BM*BK + BN*BK) * 2 bytes * NUM_BUFFERS, gfx950 limit 160KB:
+    # 256x256x64 NB2 = 128KB (fits; NB3 = 192KB does not, hence NB2 only),
+    # 64x64x256 NB2 = 128KB, 256x128x32 NB2 = 48KB, the rest <= 40KB.
+    # Two measured winners are deliberately left out: (16,16,256) and (32,16,256) won
+    # with num_warps 1 and 2, and the warp-pipeline splits "mfma"/"mem" stages by
+    # priority within the warp set, which is not meaningful below 4 warps.
     WARPPIPE_CONFIGS = [
         (64, 64, 128, 8, 8, 3),
         (64, 64, 64, 8, 8, 3),
@@ -1167,6 +1181,21 @@ class ROCmAddMMWarpPipeTemplateConfigHeuristic(
         (128, 256, 64, 8, 8, 2),
         (128, 256, 64, 8, 8, 3),
         (128, 256, 32, 8, 8, 3),
+        # BLOCK_M=256 (16 + 11 measured stock wins)
+        (256, 256, 64, 4, 8, 2),
+        (256, 128, 32, 4, 4, 2),
+        # BLOCK_N < 64 -- narrow-N outputs (11 + 3)
+        (64, 16, 128, 8, 4, 2),
+        (64, 16, 256, 4, 4, 2),
+        # BLOCK_K=256 -- deep-K (8); needs K > NUM_BUFFERS*BLOCK_K, guarded above
+        (64, 64, 256, 4, 8, 2),
+        # BLOCK_K=32 / BLOCK_N=64 gaps at BM=128 (8 + 7 + 3)
+        (128, 128, 32, 16, 4, 2),
+        (128, 64, 64, 16, 4, 2),
+        (128, 64, 128, 4, 8, 2),
+        # small-M tiles (6 + 3)
+        (32, 32, 128, 8, 4, 2),
+        (32, 64, 64, 8, 4, 2),
     ]
 
     def adjust_kernel_inputs(
@@ -1240,19 +1269,19 @@ class ROCmAddMMWarpPipeTemplateConfigHeuristic(
         # to that case -- unit-scalar addmm and plain mm both qualify. sympy Symbol == 1
         # returns a plain False, so this stays safe for symbolic scalars.
         scalars = getattr(kernel_inputs, "_scalars", None) or {}
-        # Split-K is opt-in via TORCHINDUCTOR_TLX_SPLIT_K=1 (default off). It was gated
-        # because autotune scored each addmm candidate on the GEMM kernel's own time only
-        # and excluded the separate reduce_k kernel, so a split-K TLX addmm could beat
-        # rocBLAS on the GEMM yet be net-slower e2e (HIM: split-K on 46.4K vs off 47.6K
-        # qps T2). TritonTemplateCaller.benchmark now charges every SPLIT_K > 1 candidate
-        # for its measured reducer (see _tlx_caller_benchmark and
-        # reduce_k.reduce_k_cost_ms), which removes that asymmetry -- the default flip is
-        # a follow-up so it can be A/B'd on its own. Correctness also requires
-        # alpha == beta == 1.
+        # Split-K is on by default; TORCHINDUCTOR_TLX_SPLIT_K=0 suppresses the candidates.
+        # It was gated off because autotune scored each addmm candidate on the GEMM
+        # kernel's own time only and excluded the separate reduce_k kernel, so a split-K
+        # TLX addmm could beat rocBLAS on the GEMM yet be net-slower e2e (HIM: split-K on
+        # 46.4K vs off 47.6K qps T2). TritonTemplateCaller.benchmark now charges every
+        # SPLIT_K > 1 candidate for its measured reducer (see _tlx_caller_benchmark and
+        # reduce_k.reduce_k_cost_ms), so the comparison against SPLIT_K=1 candidates is
+        # apples-to-apples and the candidates can compete on their true cost.
+        # Correctness also requires alpha == beta == 1.
         allow_split_k = (
             scalars.get("alpha", 1) == 1
             and scalars.get("beta", 1) == 1
-            and os.environ.get("TORCHINDUCTOR_TLX_SPLIT_K", "0") == "1"
+            and os.environ.get("TORCHINDUCTOR_TLX_SPLIT_K", "1") == "1"
         )
         m_hint = sizevars.optimization_hint(m, fallback=NUM_SMS)
         n_hint = sizevars.optimization_hint(n, fallback=NUM_SMS)
@@ -1460,6 +1489,15 @@ class ROCmAddMMPersistentWarpPipeTemplateConfigHeuristic(
         for template_kwargs in super()._get_template_configs_impl(
             kernel_inputs, op_name
         ):
+            # The persistent template has NO split-K body -- it never peels split_id and
+            # never writes split_k_ws; it stores straight through store_output. But
+            # SPLIT_K > 1 alone makes _tlx_tt_generate allocate the UNINITIALIZED
+            # split_k_ws and _tlx_emit_post_kernel_code emit _reduce_k after the kernel,
+            # and that reducer then sums the never-written workspace over the output.
+            # Inheriting the per-tile heuristic's split-K candidates therefore yields
+            # silently WRONG results whenever autotune happens to pick one. Drop them.
+            if int(template_kwargs.get("SPLIT_K", 1)) > 1:
+                continue
             yield {**template_kwargs, "NUM_SMS": num_sms}
 
 
