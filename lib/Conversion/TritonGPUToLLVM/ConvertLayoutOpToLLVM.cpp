@@ -375,7 +375,8 @@ struct ConvertLayoutOpConversion
       // Store
       lowerLdStShared(loc, ctx, storeCvt, tileInVals, llvmElemTy, smemBase,
                       /*paddingShifts=*/{}, affineOffset, maskSpanAffineOffset,
-                      rewriter, targetInfo,
+                      /*affineBlockOffset=*/Value(),
+                      /*maskSpanAffineBlock=*/0, rewriter, targetInfo,
                       /*maybeMaxVecElems=*/{},
                       /*localLoadOp=*/nullptr,
                       /*ctaRank=*/{},
@@ -384,7 +385,8 @@ struct ConvertLayoutOpConversion
       // Load
       auto tileOutVals = lowerLdStShared(
           loc, ctx, loadCvt, {}, llvmElemTy, smemBase, /*paddingShifts=*/{},
-          affineOffset, maskSpanAffineOffset, rewriter, targetInfo,
+          affineOffset, maskSpanAffineOffset, /*affineBlockOffset=*/Value(),
+          /*maskSpanAffineBlock=*/0, rewriter, targetInfo,
           /*maybeMaxVecElems=*/{},
           /*localLoadOp=*/nullptr,
           /*ctaRank=*/{},

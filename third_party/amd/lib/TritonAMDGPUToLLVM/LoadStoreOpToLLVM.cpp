@@ -500,8 +500,9 @@ struct DirectToLdsLoadConversionBase : public LoadStoreConversionBase {
 
     SmallVector<Value> smemBases = {smemObj.getBase()};
     lowerLdSt(loc, ctx, cvt, vals, resElemTy, smemBases, paddingShifts,
-              affineOffset, maskSpanAffineOffset, laneId, warpId, rewriter,
-              targetInfo, vec, lowerInstForwardMulticastMask);
+              affineOffset, maskSpanAffineOffset, /*affineBlockOffset=*/Value(),
+              /*maskSpanAffineBlock=*/0, laneId, warpId, rewriter, targetInfo,
+              vec, lowerInstForwardMulticastMask);
     return success();
   }
 
