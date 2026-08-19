@@ -60,9 +60,12 @@ its node id) — use `-k "amd or ikbo"`.
 ## Perf
 
 Never run perf unless explicitly asked. Use the `kernel-perf-testing` skill for
-run mechanics. `denoise.sh` works on AMD (it runs the command with NUMA pinning);
-its GPU clock/power lock is `nvidia-smi`-based and is skipped on AMD, so expect
-slightly higher run-to-run variance. Pick a free GPU with `rocm-smi`.
+run mechanics. `denoise.sh` **does** lock clocks on AMD: it identifies the part by
+PCI id (MI300X `0x74a0`/`0x74a1`/gfx942, MI350X, MI355X), then applies
+`rocm-smi --setperfdeterminism` (default 2100 MHz, override `DETERMINISM_CLK`) and
+`--setpoweroverdrive` (750 W on MI300X, override `DESIRED_POWER`), NUMA-binds to
+the GPU's node, and resets both on exit. It needs sudo and is best-effort. It
+defaults `HIP_VISIBLE_DEVICES` to 4 — set it to a free GPU (`rocm-smi`) yourself.
 
 ## CI
 
