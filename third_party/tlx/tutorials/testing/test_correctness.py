@@ -94,6 +94,12 @@ from triton.language.extra.tlx.tutorials.amd_addmm_glu import (
     M as _amd_addmm_glu_M,
     N as _amd_addmm_glu_N,
 )
+from triton.language.extra.tlx.tutorials.gfx950_gdpa import (
+    gdpa as _gfx950_gdpa,
+    gdpa_ref as _gfx950_gdpa_ref,
+    generate_gdpa_data as _gfx950_gdpa_gen,
+    gelu_approx_error as _gfx950_gdpa_approx_error,
+)
 from triton.language.extra.tlx.tutorials.amd_addmm_gfx950 import addmm as _amd_addmm
 from triton.language.extra.tlx.tutorials import amd_hstu_attn as _hstu
 from triton.tools.mxfp import MXScaleTensor
@@ -1809,6 +1815,58 @@ def test_amd_addmm_glu(kernel_name, K):
     ref = _amd_addmm_glu_baseline(bias, a, b, y)
     out = _amd_addmm_glu_registry[kernel_name](a, b, bias, y)
     torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
+
+
+# =============================================================================
+# gfx950 GDPA (Generalized Dot-Product Attention) Tests
+# =============================================================================
+#
+# The kernel computes gelu via ads_mkl's AMD `fast_gelu`, which is the tanh
+# approximation rewritten as x * sigmoid(k*x*(1 + c*x^2)) so it lowers to
+# fast_expf/fast_dividef; gfx950 has no tanh.approx.f32. The reference uses exact
+# erf gelu, so the tolerance has to absorb the approximation error and is looser
+# than the other AMD attention tests. `gelu_approx_error` reports the
+# approximation's own contribution -- if a failure is at or near that floor it
+# is the approximation, not the kernel.
+
+# Threshold: the measured gelu-approximation floor is rel_l2 ~2.3e-3 across all
+# cases below, and bf16 output rounding adds ~2e-3. 1e-2 leaves ~3x headroom
+# over that combined floor while still catching a real kernel bug. Compared via
+# relative L2 rather than elementwise max-rel: the reference has near-zero
+# elements (max_rel reaches 5e3 on them) which make elementwise ratios useless.
+
+
+@pytest.mark.parametrize(
+    "B,max_M,H,dff,sparsity,seq_len_mode",
+    [(8, 500, 4, 256, 0.68, "uniform"),  # prod geometry, small batch
+     (8, 500, 4, 256, 0.68, "random"),  # genuinely ragged sequence lengths
+     (8, 500, 4, 256, 1.0, "uniform"),  # dense Q
+     (4, 137, 4, 256, 0.68, "random"),  # ragged max_M (not a multiple of BLOCK_M)
+     (4, 500, 4, 192, 0.68, "random"),  # dff not a power of two
+     (1, 64, 2, 256, 1.0, "uniform"),  # single batch, short Q
+     ],
+    ids=["uniform", "jagged", "dense", "ragged_m", "npot_dff", "single"],
+)
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware (CDNA4)")
+def test_amd_gfx950_gdpa(B, max_M, H, dff, sparsity, seq_len_mode):
+    """GDPA forward: jagged Q x dense KV, out = gelu(q @ k.T) @ v per sequence."""
+    D = H * 64  # head_dim = 64, matching the production shape
+    data = _gfx950_gdpa_gen(B, max_M, D, H, dff, sparsity=sparsity, dtype=torch.bfloat16, device=DEVICE, seed=42,
+                            seq_len_mode=seq_len_mode)
+    q, k, v, q_offsets = data["q"], data["k"], data["v"], data["q_offsets"]
+
+    ref = _gfx950_gdpa_ref(q, k, v, q_offsets, dff, qk_scale=1.0)
+    out = _gfx950_gdpa(q, k, v, q_offsets, dff, qk_scale=1.0)
+
+    assert out.shape == q.shape and out.dtype == q.dtype
+    diff = (out.float() - ref.float()).abs()
+    rel_l2 = (diff.norm() / ref.float().norm().clamp_min(1e-6)).item()
+    if rel_l2 >= 1e-2:
+        floor = _gfx950_gdpa_approx_error(q, k, v, q_offsets, dff, qk_scale=1.0)
+        pytest.fail(f"GDPA rel_l2={rel_l2:.4e} exceeds 1e-2; "
+                    f"gelu-approximation floor is rel_l2={floor['rel_l2']:.4e} "
+                    f"(max_abs={floor['max_abs']:.4e}) -- a result near the floor "
+                    f"means the approximation, not the kernel")
 
 
 # =============================================================================
