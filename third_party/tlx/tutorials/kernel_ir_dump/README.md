@@ -1,0 +1,6 @@
+  - before_pointer_canonicalization includes the zero-fill fix but not D116546146.
+  - after_pointer_canonicalization includes D116546146.
+  - Both were generated with AMDGCN_USE_BUFFER_OPS=0.
+  - The same kernel configuration and inputs were used.
+  - Before: finite accuracy mismatches.
+  - After: accuracy passes.

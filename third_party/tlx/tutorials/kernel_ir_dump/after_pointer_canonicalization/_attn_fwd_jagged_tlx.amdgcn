@@ -1,0 +1,2239 @@
+	.amdgcn_target "amdgcn-amd-amdhsa--gfx950"
+	.amdhsa_code_object_version 5
+	.text
+	.globl	_attn_fwd_jagged_tlx            ; -- Begin function _attn_fwd_jagged_tlx
+	.p2align	8
+	.type	_attn_fwd_jagged_tlx,@function
+_attn_fwd_jagged_tlx:                   ; @_attn_fwd_jagged_tlx
+.Lfunc_begin0:
+	.cfi_sections .debug_frame
+	.cfi_startproc
+; %bb.89:
+	.file	1 "/home/aocai/OSS/triton/third_party/tlx/tutorials" "amd_ikbo_fa_accuracy_debug.py"
+	.loc	1 64 0 prologue_end             ; amd_ikbo_fa_accuracy_debug.py:64:0
+	s_load_dwordx8 s[8:15], s[4:5], 0x0
+	s_waitcnt lgkmcnt(0)
+	s_branch .LBB0_0
+	.loc	1 0 0 is_stmt 0                 ; :0:0
+.Ltmp0:
+	.p2align	8
+; %bb.90:
+.LBB0_0:
+	.cfi_escape 0x0f, 0x04, 0x30, 0x36, 0xe9, 0x02 ; CFA is 0 in private_wave aspace
+	.cfi_undefined 16
+	s_mov_b32 s0, s17
+.Ltmp1:
+	.loc	1 97 15 is_stmt 1               ; amd_ikbo_fa_accuracy_debug.py:97:15
+	s_ashr_i32 s1, s17, 31
+	s_lshl_b64 s[6:7], s[0:1], 3
+	s_add_u32 s0, s10, s6
+	s_addc_u32 s1, s11, s7
+	s_load_dwordx4 s[20:23], s[0:1], 0x0
+	v_and_b32_e32 v57, 0x3ff, v0
+	.loc	1 99 17                         ; amd_ikbo_fa_accuracy_debug.py:99:17
+	s_waitcnt lgkmcnt(0)
+	s_sub_u32 s10, s22, s20
+	s_subb_u32 s11, s23, s21
+	.loc	1 106 8                         ; amd_ikbo_fa_accuracy_debug.py:106:8
+	s_lshl_b32 s19, s16, 5
+	s_ashr_i32 s0, s19, 31
+	v_mov_b32_e32 v0, s19
+	v_mov_b32_e32 v1, s0
+	v_cmp_gt_i64_e32 vcc, s[10:11], v[0:1]
+	.loc	1 199 13                        ; amd_ikbo_fa_accuracy_debug.py:199:13
+	v_readfirstlane_b32 s17, v57
+	.loc	1 106 8                         ; amd_ikbo_fa_accuracy_debug.py:106:8
+	s_cbranch_vccz .LBB0_88
+; %bb.1:
+	.loc	1 0 8 is_stmt 0                 ; amd_ikbo_fa_accuracy_debug.py:0:8
+	s_load_dwordx4 s[0:3], s[4:5], 0x30
+	.loc	1 223 5 is_stmt 1               ; amd_ikbo_fa_accuracy_debug.py:223:5
+	s_bfe_u32 s21, s17, 0x10006
+	.loc	1 109 34                        ; amd_ikbo_fa_accuracy_debug.py:109:34
+	v_and_b32_e32 v60, 63, v57
+	v_lshl_or_b32 v5, s21, 6, v60
+	v_lshrrev_b32_e32 v0, 4, v5
+	.loc	1 101 15                        ; amd_ikbo_fa_accuracy_debug.py:101:15
+	s_waitcnt lgkmcnt(0)
+	s_add_u32 s0, s0, s6
+	s_addc_u32 s1, s1, s7
+	.loc	1 102 23                        ; amd_ikbo_fa_accuracy_debug.py:102:23
+	s_load_dword s0, s[0:1], 0x0
+	.loc	1 109 14                        ; amd_ikbo_fa_accuracy_debug.py:109:14
+	v_or_b32_e32 v0, s19, v0
+	.loc	1 109 34 is_stmt 0              ; amd_ikbo_fa_accuracy_debug.py:109:34
+	v_and_b32_e32 v58, 15, v57
+	.loc	1 116 12 is_stmt 1              ; amd_ikbo_fa_accuracy_debug.py:116:12
+	v_ashrrev_i32_e32 v1, 31, v0
+	.loc	1 94 16                         ; amd_ikbo_fa_accuracy_debug.py:94:16
+	s_mul_i32 s3, s3, s18
+	.loc	1 102 15                        ; amd_ikbo_fa_accuracy_debug.py:102:15
+	s_waitcnt lgkmcnt(0)
+	s_ashr_i32 s1, s0, 31
+	s_lshl_b64 s[0:1], s[0:1], 3
+	s_add_u32 s0, s14, s0
+	s_addc_u32 s1, s15, s1
+	s_load_dwordx4 s[24:27], s[0:1], 0x0
+	.loc	1 114 9                         ; amd_ikbo_fa_accuracy_debug.py:114:9
+	s_mul_i32 s0, s20, s2
+	s_add_u32 s3, s0, s3
+	.loc	1 117 11                        ; amd_ikbo_fa_accuracy_debug.py:117:11
+	v_lshlrev_b32_e32 v4, 3, v58
+	.loc	1 119 30                        ; amd_ikbo_fa_accuracy_debug.py:119:30
+	v_cmp_gt_i64_e32 vcc, s[10:11], v[0:1]
+	v_mov_b32_e32 v6, 0
+	v_mov_b32_e32 v10, 0
+	v_mov_b32_e32 v11, 0
+	v_mov_b32_e32 v12, 0
+	v_mov_b32_e32 v13, 0
+	.loc	1 119 9 is_stmt 0               ; amd_ikbo_fa_accuracy_debug.py:119:9
+	s_and_saveexec_b64 s[0:1], vcc
+	s_cbranch_execz .LBB0_3
+; %bb.2:
+	.loc	1 114 9 is_stmt 1               ; amd_ikbo_fa_accuracy_debug.py:114:9
+	v_mul_lo_u32 v1, v0, s2
+	v_add3_u32 v2, s3, v1, v4
+	.loc	1 119 9                         ; amd_ikbo_fa_accuracy_debug.py:119:9
+	v_ashrrev_i32_e32 v3, 31, v2
+	v_lshl_add_u64 v[2:3], v[2:3], 1, s[8:9]
+	global_load_dwordx4 v[10:13], v[2:3], off
+.LBB0_3:
+	.loc	1 0 9 is_stmt 0                 ; amd_ikbo_fa_accuracy_debug.py:0:9
+	s_or_b64 exec, exec, s[0:1]
+	.loc	1 109 14 is_stmt 1              ; amd_ikbo_fa_accuracy_debug.py:109:14
+	v_or_b32_e32 v2, 8, v0
+	.loc	1 116 12                        ; amd_ikbo_fa_accuracy_debug.py:116:12
+	v_ashrrev_i32_e32 v3, 31, v2
+	.loc	1 119 30                        ; amd_ikbo_fa_accuracy_debug.py:119:30
+	v_cmp_gt_i64_e32 vcc, s[10:11], v[2:3]
+	v_mov_b32_e32 v7, 0
+	v_mov_b32_e32 v8, 0
+	v_mov_b32_e32 v9, 0
+	.loc	1 119 9 is_stmt 0               ; amd_ikbo_fa_accuracy_debug.py:119:9
+	s_and_saveexec_b64 s[0:1], vcc
+	s_cbranch_execz .LBB0_5
+; %bb.4:
+	.loc	1 114 9 is_stmt 1               ; amd_ikbo_fa_accuracy_debug.py:114:9
+	v_mul_lo_u32 v1, v2, s2
+	v_add3_u32 v2, s3, v1, v4
+	.loc	1 119 9                         ; amd_ikbo_fa_accuracy_debug.py:119:9
+	v_ashrrev_i32_e32 v3, 31, v2
+	v_lshl_add_u64 v[2:3], v[2:3], 1, s[8:9]
+	global_load_dwordx4 v[6:9], v[2:3], off
+.LBB0_5:
+	.loc	1 0 9 is_stmt 0                 ; amd_ikbo_fa_accuracy_debug.py:0:9
+	s_or_b64 exec, exec, s[0:1]
+	.loc	1 109 14 is_stmt 1              ; amd_ikbo_fa_accuracy_debug.py:109:14
+	v_or_b32_e32 v2, 16, v0
+	.loc	1 116 12                        ; amd_ikbo_fa_accuracy_debug.py:116:12
+	v_ashrrev_i32_e32 v3, 31, v2
+	.loc	1 119 30                        ; amd_ikbo_fa_accuracy_debug.py:119:30
+	v_cmp_gt_i64_e32 vcc, s[10:11], v[2:3]
+	v_mov_b32_e32 v33, 0
+	v_mov_b32_e32 v14, 0
+	v_mov_b32_e32 v15, 0
+	v_mov_b32_e32 v16, 0
+	v_mov_b32_e32 v17, 0
+	.loc	1 119 9 is_stmt 0               ; amd_ikbo_fa_accuracy_debug.py:119:9
+	s_and_saveexec_b64 s[0:1], vcc
+	s_cbranch_execz .LBB0_7
+; %bb.6:
+	.loc	1 114 9 is_stmt 1               ; amd_ikbo_fa_accuracy_debug.py:114:9
+	v_mul_lo_u32 v1, v2, s2
+	v_add3_u32 v2, s3, v1, v4
+	.loc	1 119 9                         ; amd_ikbo_fa_accuracy_debug.py:119:9
+	v_ashrrev_i32_e32 v3, 31, v2
+	v_lshl_add_u64 v[2:3], v[2:3], 1, s[8:9]
+	global_load_dwordx4 v[14:17], v[2:3], off
+.LBB0_7:
+	.loc	1 0 9 is_stmt 0                 ; amd_ikbo_fa_accuracy_debug.py:0:9
+	s_or_b64 exec, exec, s[0:1]
+	s_load_dwordx2 s[16:17], s[4:5], 0x40
+	.loc	1 109 14 is_stmt 1              ; amd_ikbo_fa_accuracy_debug.py:109:14
+	v_or_b32_e32 v0, 24, v0
+	.loc	1 116 12                        ; amd_ikbo_fa_accuracy_debug.py:116:12
+	v_ashrrev_i32_e32 v1, 31, v0
+	.loc	1 119 30                        ; amd_ikbo_fa_accuracy_debug.py:119:30
+	v_cmp_gt_i64_e32 vcc, s[10:11], v[0:1]
+	v_mov_b32_e32 v18, 0
+	v_mov_b32_e32 v19, 0
+	v_mov_b32_e32 v20, 0
+	v_mov_b32_e32 v21, 0
+	.loc	1 119 9 is_stmt 0               ; amd_ikbo_fa_accuracy_debug.py:119:9
+	s_and_saveexec_b64 s[0:1], vcc
+	s_cbranch_execz .LBB0_9
+; %bb.8:
+	.loc	1 114 9 is_stmt 1               ; amd_ikbo_fa_accuracy_debug.py:114:9
+	v_mul_lo_u32 v0, v0, s2
+	v_add3_u32 v0, s3, v0, v4
+	.loc	1 119 9                         ; amd_ikbo_fa_accuracy_debug.py:119:9
+	v_ashrrev_i32_e32 v1, 31, v0
+	v_lshl_add_u64 v[0:1], v[0:1], 1, s[8:9]
+	global_load_dwordx4 v[18:21], v[0:1], off
+.LBB0_9:
+	.loc	1 0 9 is_stmt 0                 ; amd_ikbo_fa_accuracy_debug.py:0:9
+	s_or_b64 exec, exec, s[0:1]
+	.loc	1 109 34 is_stmt 1              ; amd_ikbo_fa_accuracy_debug.py:109:34
+	v_and_b32_e32 v59, 48, v57
+	.loc	1 104 18                        ; amd_ikbo_fa_accuracy_debug.py:104:18
+	s_waitcnt lgkmcnt(0)
+	s_sub_u32 s8, s26, s24
+	.loc	1 119 9                         ; amd_ikbo_fa_accuracy_debug.py:119:9
+	v_lshlrev_b32_e32 v0, 6, v59
+	v_lshlrev_b32_e32 v1, 4, v58
+	.loc	1 104 18                        ; amd_ikbo_fa_accuracy_debug.py:104:18
+	s_subb_u32 s9, s27, s25
+	.loc	1 119 9                         ; amd_ikbo_fa_accuracy_debug.py:119:9
+	v_lshlrev_b32_e32 v2, 1, v59
+	s_lshl_b32 s0, s21, 8
+	v_or_b32_e32 v3, v0, v1
+	v_bitop3_b32 v0, v0, v2, v1 bitop3:0x36
+	v_bitop3_b32 v1, s0, v3, v2 bitop3:0xf6
+	v_add_u32_e32 v1, 0, v1
+	s_waitcnt vmcnt(0)
+	ds_write_b128 v1, v[10:13]
+	ds_write_b128 v1, v[14:17] offset:512
+	v_mov_b32_e32 v1, 0x1080
+	v_bitop3_b32 v0, s0, v1, v0 bitop3:0x36
+	v_add_u32_e32 v0, 0, v0
+	v_lshlrev_b32_e32 v2, 6, v57
+	ds_write_b128 v0, v[6:9]
+	ds_write_b128 v0, v[18:21] offset:512
+	v_and_b32_e32 v0, 3, v57
+	v_and_b32_e32 v2, 0x100, v2
+	v_bfe_i32 v3, v57, 3, 1
+	v_lshlrev_b32_e32 v1, 5, v0
+	v_and_b32_e32 v3, 0x1080, v3
+	s_lshl_b32 s0, s21, 9
+	v_lshl_or_b32 v0, v0, 10, v2
+	v_or3_b32 v0, s0, v3, v0
+	v_bitop3_b32 v1, v1, v57, 48 bitop3:0x78
+	v_or_b32_e32 v2, v0, v1
+	v_add_u32_e32 v3, 0, v2
+	v_xad_u32 v2, v2, 64, 0
+	s_movk_i32 s0, 0x80
+	s_waitcnt lgkmcnt(0)
+	s_barrier
+	ds_read_b128 v[74:77], v3
+	ds_read_b128 v[66:69], v2
+	v_bitop3_b32 v2, v0, s0, v1 bitop3:0x36
+	s_movk_i32 s0, 0xc0
+	v_add_u32_e32 v2, 0, v2
+	v_bitop3_b32 v0, v0, s0, v1 bitop3:0x36
+	v_add_u32_e32 v0, 0, v0
+	ds_read_b128 v[70:73], v2
+	ds_read_b128 v[62:65], v0
+	.loc	1 129 9                         ; amd_ikbo_fa_accuracy_debug.py:129:9
+	v_lshl_add_u32 v0, v5, 1, 0
+	v_mov_b32_e32 v1, 0x7e00
+	s_waitcnt lgkmcnt(0)
+	s_barrier
+	ds_write_b16 v0, v1
+	ds_write_b16 v0, v1 offset:1056
+	ds_write_b16 v0, v1 offset:2112
+	ds_write_b16 v0, v1 offset:3168
+	ds_write_b16 v0, v1 offset:4224
+	ds_write_b16 v0, v1 offset:5280
+	ds_write_b16 v0, v1 offset:6336
+	ds_write_b16 v0, v1 offset:7392
+	ds_write_b16 v0, v1 offset:256
+	ds_write_b16 v0, v1 offset:1312
+	ds_write_b16 v0, v1 offset:2368
+	ds_write_b16 v0, v1 offset:3424
+	ds_write_b16 v0, v1 offset:4480
+	ds_write_b16 v0, v1 offset:5536
+	ds_write_b16 v0, v1 offset:6592
+	ds_write_b16 v0, v1 offset:7648
+	ds_write_b16 v0, v1 offset:512
+	ds_write_b16 v0, v1 offset:1568
+	ds_write_b16 v0, v1 offset:2624
+	ds_write_b16 v0, v1 offset:3680
+	ds_write_b16 v0, v1 offset:4736
+	ds_write_b16 v0, v1 offset:5792
+	ds_write_b16 v0, v1 offset:6848
+	ds_write_b16 v0, v1 offset:7904
+	ds_write_b16 v0, v1 offset:768
+	ds_write_b16 v0, v1 offset:1824
+	ds_write_b16 v0, v1 offset:2880
+	ds_write_b16 v0, v1 offset:3936
+	ds_write_b16 v0, v1 offset:4992
+	ds_write_b16 v0, v1 offset:6048
+	ds_write_b16 v0, v1 offset:7104
+	ds_write_b16 v0, v1 offset:8160
+	.loc	1 130 9                         ; amd_ikbo_fa_accuracy_debug.py:130:9
+	ds_write_b16 v0, v1 offset:16864
+	ds_write_b16 v0, v1 offset:17920
+	ds_write_b16 v0, v1 offset:18976
+	ds_write_b16 v0, v1 offset:20032
+	ds_write_b16 v0, v1 offset:21088
+	ds_write_b16 v0, v1 offset:22144
+	ds_write_b16 v0, v1 offset:23200
+	ds_write_b16 v0, v1 offset:24256
+	ds_write_b16 v0, v1 offset:17120
+	ds_write_b16 v0, v1 offset:18176
+	ds_write_b16 v0, v1 offset:19232
+	ds_write_b16 v0, v1 offset:20288
+	ds_write_b16 v0, v1 offset:21344
+	ds_write_b16 v0, v1 offset:22400
+	ds_write_b16 v0, v1 offset:23456
+	ds_write_b16 v0, v1 offset:24512
+	ds_write_b16 v0, v1 offset:17376
+	ds_write_b16 v0, v1 offset:18432
+	ds_write_b16 v0, v1 offset:19488
+	ds_write_b16 v0, v1 offset:20544
+	ds_write_b16 v0, v1 offset:21600
+	ds_write_b16 v0, v1 offset:22656
+	ds_write_b16 v0, v1 offset:23712
+	ds_write_b16 v0, v1 offset:24768
+	ds_write_b16 v0, v1 offset:17632
+	ds_write_b16 v0, v1 offset:18688
+	ds_write_b16 v0, v1 offset:19744
+	ds_write_b16 v0, v1 offset:20800
+	ds_write_b16 v0, v1 offset:21856
+	ds_write_b16 v0, v1 offset:22912
+	ds_write_b16 v0, v1 offset:23968
+	ds_write_b16 v0, v1 offset:25024
+	.loc	1 129 9                         ; amd_ikbo_fa_accuracy_debug.py:129:9
+	s_waitcnt lgkmcnt(0)
+	s_barrier
+	ds_write_b16 v0, v1 offset:8448
+	ds_write_b16 v0, v1 offset:9504
+	ds_write_b16 v0, v1 offset:10560
+	ds_write_b16 v0, v1 offset:11616
+	ds_write_b16 v0, v1 offset:12672
+	ds_write_b16 v0, v1 offset:13728
+	ds_write_b16 v0, v1 offset:14784
+	ds_write_b16 v0, v1 offset:15840
+	ds_write_b16 v0, v1 offset:8704
+	ds_write_b16 v0, v1 offset:9760
+	ds_write_b16 v0, v1 offset:10816
+	ds_write_b16 v0, v1 offset:11872
+	ds_write_b16 v0, v1 offset:12928
+	ds_write_b16 v0, v1 offset:13984
+	ds_write_b16 v0, v1 offset:15040
+	ds_write_b16 v0, v1 offset:16096
+	ds_write_b16 v0, v1 offset:8960
+	ds_write_b16 v0, v1 offset:10016
+	ds_write_b16 v0, v1 offset:11072
+	ds_write_b16 v0, v1 offset:12128
+	ds_write_b16 v0, v1 offset:13184
+	ds_write_b16 v0, v1 offset:14240
+	ds_write_b16 v0, v1 offset:15296
+	ds_write_b16 v0, v1 offset:16352
+	ds_write_b16 v0, v1 offset:9216
+	ds_write_b16 v0, v1 offset:10272
+	ds_write_b16 v0, v1 offset:11328
+	ds_write_b16 v0, v1 offset:12384
+	ds_write_b16 v0, v1 offset:13440
+	ds_write_b16 v0, v1 offset:14496
+	ds_write_b16 v0, v1 offset:15552
+	ds_write_b16 v0, v1 offset:16608
+	.loc	1 130 9                         ; amd_ikbo_fa_accuracy_debug.py:130:9
+	ds_write_b16 v0, v1 offset:25312
+	ds_write_b16 v0, v1 offset:26368
+	ds_write_b16 v0, v1 offset:27424
+	ds_write_b16 v0, v1 offset:28480
+	ds_write_b16 v0, v1 offset:29536
+	ds_write_b16 v0, v1 offset:30592
+	ds_write_b16 v0, v1 offset:31648
+	ds_write_b16 v0, v1 offset:32704
+	ds_write_b16 v0, v1 offset:25568
+	ds_write_b16 v0, v1 offset:26624
+	ds_write_b16 v0, v1 offset:27680
+	ds_write_b16 v0, v1 offset:28736
+	ds_write_b16 v0, v1 offset:29792
+	ds_write_b16 v0, v1 offset:30848
+	ds_write_b16 v0, v1 offset:31904
+	ds_write_b16 v0, v1 offset:32960
+	ds_write_b16 v0, v1 offset:25824
+	ds_write_b16 v0, v1 offset:26880
+	ds_write_b16 v0, v1 offset:27936
+	ds_write_b16 v0, v1 offset:28992
+	ds_write_b16 v0, v1 offset:30048
+	ds_write_b16 v0, v1 offset:31104
+	ds_write_b16 v0, v1 offset:32160
+	ds_write_b16 v0, v1 offset:33216
+	ds_write_b16 v0, v1 offset:26080
+	ds_write_b16 v0, v1 offset:27136
+	ds_write_b16 v0, v1 offset:28192
+	ds_write_b16 v0, v1 offset:29248
+	ds_write_b16 v0, v1 offset:30304
+	ds_write_b16 v0, v1 offset:31360
+	ds_write_b16 v0, v1 offset:32416
+	ds_write_b16 v0, v1 offset:33472
+	.loc	1 136 22                        ; amd_ikbo_fa_accuracy_debug.py:136:22
+	v_lshrrev_b32_e32 v0, 1, v59
+	.loc	1 95 17                         ; amd_ikbo_fa_accuracy_debug.py:95:17
+	s_mul_i32 s22, s17, s18
+	.loc	1 136 22                        ; amd_ikbo_fa_accuracy_debug.py:136:22
+	v_or_b32_e32 v32, s21, v0
+	.loc	1 134 9                         ; amd_ikbo_fa_accuracy_debug.py:134:9
+	s_mul_i32 s0, s24, s16
+	.loc	1 152 16                        ; amd_ikbo_fa_accuracy_debug.py:152:16
+	s_mul_i32 s17, s21, 0x420
+	.loc	1 134 9                         ; amd_ikbo_fa_accuracy_debug.py:134:9
+	v_mul_lo_u32 v1, v32, s16
+	s_add_u32 s25, s0, s22
+	.loc	1 152 55                        ; amd_ikbo_fa_accuracy_debug.py:152:55
+	v_cmp_le_i64_e32 vcc, s[8:9], v[32:33]
+	v_lshl_add_u32 v0, v60, 4, s17
+	.loc	1 131 5                         ; amd_ikbo_fa_accuracy_debug.py:131:5
+	s_waitcnt lgkmcnt(0)
+	s_barrier
+	.loc	1 152 16                        ; amd_ikbo_fa_accuracy_debug.py:152:16
+	s_and_saveexec_b64 s[0:1], vcc
+	s_xor_b64 s[0:1], exec, s[0:1]
+; %bb.10:                               ; %.critedge
+	v_mov_b32_e32 v6, 0
+	v_mov_b32_e32 v7, v6
+	v_mov_b32_e32 v8, v6
+	v_mov_b32_e32 v9, v6
+	ds_write_b128 v0, v[6:9]
+; %bb.11:                               ; %Flow214
+	.loc	1 0 16 is_stmt 0                ; amd_ikbo_fa_accuracy_debug.py:0:16
+	s_or_saveexec_b64 s[0:1], s[0:1]
+	v_add3_u32 v34, s25, v1, v4
+	s_xor_b64 exec, exec, s[0:1]
+	s_cbranch_execz .LBB0_13
+; %bb.12:
+	.loc	1 152 16 is_stmt 1              ; amd_ikbo_fa_accuracy_debug.py:152:16
+	v_ashrrev_i32_e32 v35, 31, v34
+	v_lshl_add_u64 v[2:3], v[34:35], 1, s[12:13]
+	s_mov_b32 m0, s17
+	s_nop 0
+	global_load_lds_dwordx4 v[2:3], off
+.LBB0_13:
+	.loc	1 0 16 is_stmt 0                ; amd_ikbo_fa_accuracy_debug.py:0:16
+	s_or_b64 exec, exec, s[0:1]
+	.loc	1 136 22 is_stmt 1              ; amd_ikbo_fa_accuracy_debug.py:136:22
+	v_or_b32_e32 v36, 2, v32
+	.loc	1 136 12 is_stmt 0              ; amd_ikbo_fa_accuracy_debug.py:136:12
+	v_mov_b32_e32 v37, 0
+	.loc	1 134 9 is_stmt 1               ; amd_ikbo_fa_accuracy_debug.py:134:9
+	v_mul_lo_u32 v1, v36, s16
+	.loc	1 152 55                        ; amd_ikbo_fa_accuracy_debug.py:152:55
+	v_cmp_le_i64_e64 s[0:1], s[8:9], v[36:37]
+	.loc	1 152 16 is_stmt 0              ; amd_ikbo_fa_accuracy_debug.py:152:16
+	s_and_saveexec_b64 s[2:3], s[0:1]
+	s_xor_b64 s[2:3], exec, s[2:3]
+; %bb.14:                               ; %.critedge12
+	v_mov_b32_e32 v6, v37
+	v_mov_b32_e32 v7, v37
+	v_mov_b32_e32 v8, v37
+	v_mov_b32_e32 v9, v37
+	ds_write_b128 v0, v[6:9] offset:2112
+; %bb.15:                               ; %Flow213
+	.loc	1 0 16                          ; amd_ikbo_fa_accuracy_debug.py:0:16
+	s_or_saveexec_b64 s[2:3], s[2:3]
+	v_add3_u32 v38, s25, v1, v4
+	s_xor_b64 exec, exec, s[2:3]
+	s_cbranch_execz .LBB0_17
+; %bb.16:
+	.loc	1 152 16 is_stmt 1              ; amd_ikbo_fa_accuracy_debug.py:152:16
+	v_ashrrev_i32_e32 v39, 31, v38
+	v_lshl_add_u64 v[2:3], v[38:39], 1, s[12:13]
+	s_add_i32 m0, s17, 0x840
+	s_nop 0
+	global_load_lds_dwordx4 v[2:3], off
+.LBB0_17:
+	.loc	1 0 16 is_stmt 0                ; amd_ikbo_fa_accuracy_debug.py:0:16
+	s_or_b64 exec, exec, s[2:3]
+	.loc	1 136 22 is_stmt 1              ; amd_ikbo_fa_accuracy_debug.py:136:22
+	v_or_b32_e32 v40, 4, v32
+	.loc	1 136 12 is_stmt 0              ; amd_ikbo_fa_accuracy_debug.py:136:12
+	v_mov_b32_e32 v41, 0
+	.loc	1 134 9 is_stmt 1               ; amd_ikbo_fa_accuracy_debug.py:134:9
+	v_mul_lo_u32 v1, v40, s16
+	.loc	1 152 55                        ; amd_ikbo_fa_accuracy_debug.py:152:55
+	v_cmp_le_i64_e64 s[2:3], s[8:9], v[40:41]
+	.loc	1 152 16 is_stmt 0              ; amd_ikbo_fa_accuracy_debug.py:152:16
+	s_and_saveexec_b64 s[6:7], s[2:3]
+	s_xor_b64 s[6:7], exec, s[6:7]
+; %bb.18:                               ; %.critedge14
+	v_mov_b32_e32 v6, v41
+	v_mov_b32_e32 v7, v41
+	v_mov_b32_e32 v8, v41
+	v_mov_b32_e32 v9, v41
+	ds_write_b128 v0, v[6:9] offset:4224
+; %bb.19:                               ; %Flow212
+	.loc	1 0 16                          ; amd_ikbo_fa_accuracy_debug.py:0:16
+	s_or_saveexec_b64 s[6:7], s[6:7]
+	v_add3_u32 v42, s25, v1, v4
+	s_xor_b64 exec, exec, s[6:7]
+	s_cbranch_execz .LBB0_21
+; %bb.20:
+	.loc	1 152 16 is_stmt 1              ; amd_ikbo_fa_accuracy_debug.py:152:16
+	v_ashrrev_i32_e32 v43, 31, v42
+	v_lshl_add_u64 v[2:3], v[42:43], 1, s[12:13]
+	s_add_i32 m0, s17, 0x1080
+	s_nop 0
+	global_load_lds_dwordx4 v[2:3], off
+.LBB0_21:
+	.loc	1 0 16 is_stmt 0                ; amd_ikbo_fa_accuracy_debug.py:0:16
+	s_or_b64 exec, exec, s[6:7]
+	.loc	1 136 22 is_stmt 1              ; amd_ikbo_fa_accuracy_debug.py:136:22
+	v_or_b32_e32 v44, 6, v32
+	.loc	1 136 12 is_stmt 0              ; amd_ikbo_fa_accuracy_debug.py:136:12
+	v_mov_b32_e32 v45, 0
+	.loc	1 134 9 is_stmt 1               ; amd_ikbo_fa_accuracy_debug.py:134:9
+	v_mul_lo_u32 v1, v44, s16
+	.loc	1 152 55                        ; amd_ikbo_fa_accuracy_debug.py:152:55
+	v_cmp_le_i64_e64 s[6:7], s[8:9], v[44:45]
+	.loc	1 152 16 is_stmt 0              ; amd_ikbo_fa_accuracy_debug.py:152:16
+	s_and_saveexec_b64 s[14:15], s[6:7]
+	s_xor_b64 s[14:15], exec, s[14:15]
+; %bb.22:                               ; %.critedge16
+	v_mov_b32_e32 v6, v45
+	v_mov_b32_e32 v7, v45
+	v_mov_b32_e32 v8, v45
+	v_mov_b32_e32 v9, v45
+	ds_write_b128 v0, v[6:9] offset:6336
+; %bb.23:                               ; %Flow211
+	.loc	1 0 16                          ; amd_ikbo_fa_accuracy_debug.py:0:16
+	s_or_saveexec_b64 s[14:15], s[14:15]
+	s_load_dword s23, s[4:5], 0x48
+	v_add3_u32 v46, s25, v1, v4
+	s_xor_b64 exec, exec, s[14:15]
+	s_cbranch_execz .LBB0_25
+; %bb.24:
+	.loc	1 152 16 is_stmt 1              ; amd_ikbo_fa_accuracy_debug.py:152:16
+	v_ashrrev_i32_e32 v47, 31, v46
+	v_lshl_add_u64 v[2:3], v[46:47], 1, s[12:13]
+	s_add_i32 m0, s17, 0x18c0
+	s_nop 0
+	global_load_lds_dwordx4 v[2:3], off
+.LBB0_25:
+	.loc	1 0 16 is_stmt 0                ; amd_ikbo_fa_accuracy_debug.py:0:16
+	s_or_b64 exec, exec, s[14:15]
+	s_load_dwordx2 s[26:27], s[4:5], 0x20
+	.loc	1 140 9 is_stmt 1               ; amd_ikbo_fa_accuracy_debug.py:140:9
+	s_waitcnt lgkmcnt(0)
+	s_mul_i32 s14, s24, s23
+	v_mul_lo_u32 v1, v32, s23
+	s_add_u32 s22, s14, s22
+	.loc	1 154 16                        ; amd_ikbo_fa_accuracy_debug.py:154:16
+	s_and_saveexec_b64 s[14:15], vcc
+	s_xor_b64 s[14:15], exec, s[14:15]
+; %bb.26:                               ; %.critedge18
+	v_mov_b32_e32 v6, 0
+	v_mov_b32_e32 v7, v6
+	v_mov_b32_e32 v8, v6
+	v_mov_b32_e32 v9, v6
+	ds_write_b128 v0, v[6:9] offset:16864
+; %bb.27:                               ; %Flow210
+	.loc	1 0 16 is_stmt 0                ; amd_ikbo_fa_accuracy_debug.py:0:16
+	s_or_saveexec_b64 s[14:15], s[14:15]
+	v_add3_u32 v48, s22, v1, v4
+	s_xor_b64 exec, exec, s[14:15]
+	s_cbranch_execz .LBB0_29
+; %bb.28:
+	.loc	1 154 16 is_stmt 1              ; amd_ikbo_fa_accuracy_debug.py:154:16
+	v_ashrrev_i32_e32 v49, 31, v48
+	v_lshl_add_u64 v[2:3], v[48:49], 1, s[26:27]
+	s_add_i32 m0, s17, 0x41e0
+	s_nop 0
+	global_load_lds_dwordx4 v[2:3], off
+.LBB0_29:
+	.loc	1 0 16 is_stmt 0                ; amd_ikbo_fa_accuracy_debug.py:0:16
+	s_or_b64 exec, exec, s[14:15]
+	.loc	1 140 9 is_stmt 1               ; amd_ikbo_fa_accuracy_debug.py:140:9
+	v_mul_lo_u32 v1, v36, s23
+	.loc	1 154 16                        ; amd_ikbo_fa_accuracy_debug.py:154:16
+	s_and_saveexec_b64 s[14:15], s[0:1]
+	s_xor_b64 s[0:1], exec, s[14:15]
+; %bb.30:                               ; %.critedge20
+	v_mov_b32_e32 v6, 0
+	v_mov_b32_e32 v7, v6
+	v_mov_b32_e32 v8, v6
+	v_mov_b32_e32 v9, v6
+	ds_write_b128 v0, v[6:9] offset:18976
+; %bb.31:                               ; %Flow209
+	.loc	1 0 16 is_stmt 0                ; amd_ikbo_fa_accuracy_debug.py:0:16
+	s_or_saveexec_b64 s[0:1], s[0:1]
+	v_add3_u32 v50, s22, v1, v4
+	s_xor_b64 exec, exec, s[0:1]
+	s_cbranch_execz .LBB0_33
+; %bb.32:
+	.loc	1 154 16 is_stmt 1              ; amd_ikbo_fa_accuracy_debug.py:154:16
+	v_ashrrev_i32_e32 v51, 31, v50
+	v_lshl_add_u64 v[2:3], v[50:51], 1, s[26:27]
+	s_add_i32 m0, s17, 0x4a20
+	s_nop 0
+	global_load_lds_dwordx4 v[2:3], off
+.LBB0_33:
+	.loc	1 0 16 is_stmt 0                ; amd_ikbo_fa_accuracy_debug.py:0:16
+	s_or_b64 exec, exec, s[0:1]
+	.loc	1 140 9 is_stmt 1               ; amd_ikbo_fa_accuracy_debug.py:140:9
+	v_mul_lo_u32 v1, v40, s23
+	.loc	1 154 16                        ; amd_ikbo_fa_accuracy_debug.py:154:16
+	s_and_saveexec_b64 s[0:1], s[2:3]
+	s_xor_b64 s[0:1], exec, s[0:1]
+; %bb.34:                               ; %.critedge22
+	v_mov_b32_e32 v6, 0
+	v_mov_b32_e32 v7, v6
+	v_mov_b32_e32 v8, v6
+	v_mov_b32_e32 v9, v6
+	ds_write_b128 v0, v[6:9] offset:21088
+; %bb.35:                               ; %Flow208
+	.loc	1 0 16 is_stmt 0                ; amd_ikbo_fa_accuracy_debug.py:0:16
+	s_or_saveexec_b64 s[0:1], s[0:1]
+	v_add3_u32 v52, s22, v1, v4
+	s_xor_b64 exec, exec, s[0:1]
+	s_cbranch_execz .LBB0_37
+; %bb.36:
+	.loc	1 154 16 is_stmt 1              ; amd_ikbo_fa_accuracy_debug.py:154:16
+	v_ashrrev_i32_e32 v53, 31, v52
+	v_lshl_add_u64 v[2:3], v[52:53], 1, s[26:27]
+	s_add_i32 m0, s17, 0x5260
+	s_nop 0
+	global_load_lds_dwordx4 v[2:3], off
+.LBB0_37:
+	.loc	1 0 16 is_stmt 0                ; amd_ikbo_fa_accuracy_debug.py:0:16
+	s_or_b64 exec, exec, s[0:1]
+	.loc	1 140 9 is_stmt 1               ; amd_ikbo_fa_accuracy_debug.py:140:9
+	v_mul_lo_u32 v1, v44, s23
+	.loc	1 154 16                        ; amd_ikbo_fa_accuracy_debug.py:154:16
+	s_and_saveexec_b64 s[0:1], s[6:7]
+	s_xor_b64 s[0:1], exec, s[0:1]
+; %bb.38:                               ; %.critedge24
+	v_mov_b32_e32 v6, 0
+	v_mov_b32_e32 v7, v6
+	v_mov_b32_e32 v8, v6
+	v_mov_b32_e32 v9, v6
+	ds_write_b128 v0, v[6:9] offset:23200
+; %bb.39:                               ; %Flow207
+	.loc	1 0 16 is_stmt 0                ; amd_ikbo_fa_accuracy_debug.py:0:16
+	s_or_saveexec_b64 s[0:1], s[0:1]
+	v_add3_u32 v54, s22, v1, v4
+	s_xor_b64 exec, exec, s[0:1]
+	s_cbranch_execz .LBB0_41
+; %bb.40:
+	.loc	1 154 16 is_stmt 1              ; amd_ikbo_fa_accuracy_debug.py:154:16
+	v_ashrrev_i32_e32 v55, 31, v54
+	v_lshl_add_u64 v[0:1], v[54:55], 1, s[26:27]
+	s_add_i32 m0, s17, 0x5aa0
+	s_nop 0
+	global_load_lds_dwordx4 v[0:1], off
+.LBB0_41:
+	.loc	1 0 16 is_stmt 0                ; amd_ikbo_fa_accuracy_debug.py:0:16
+	s_or_b64 exec, exec, s[0:1]
+.Ltmp2:
+	.file	2 "/home/aocai/OSS/triton/python/triton/language" "standard.py"
+	.loc	2 43 13 is_stmt 1               ; standard.py:43:13 @[ amd_ikbo_fa_accuracy_debug.py:157:14 ]
+	s_add_u32 s2, s8, 31
+	s_addc_u32 s3, s9, 0
+	.loc	2 43 12 is_stmt 0               ; standard.py:43:12 @[ amd_ikbo_fa_accuracy_debug.py:157:14 ]
+	s_ashr_i32 s0, s3, 31
+	s_lshr_b32 s0, s0, 27
+	s_add_u32 s0, s2, s0
+	s_addc_u32 s1, s3, 0
+	s_ashr_i64 s[0:1], s[0:1], 5
+	s_load_dword s22, s[4:5], 0x58
+.Ltmp3:
+	.loc	1 158 14 is_stmt 1              ; amd_ikbo_fa_accuracy_debug.py:158:14
+	v_cmp_gt_i64_e64 s[6:7], s[0:1], 1
+	s_and_b64 s[6:7], s[6:7], exec
+	s_cselect_b32 s7, s0, 1
+	s_cselect_b32 s6, s1, 0
+	s_add_u32 s24, s7, -1
+	.loc	1 159 5                         ; amd_ikbo_fa_accuracy_debug.py:159:5
+	v_cmp_gt_i64_e64 s[2:3], s[2:3], 63
+	v_lshlrev_b32_e32 v1, 10, v57
+	v_and_b32_e32 v0, 8, v57
+	s_mov_b32 s33, 0
+	s_mov_b64 s[0:1], -1
+	.loc	1 158 14                        ; amd_ikbo_fa_accuracy_debug.py:158:14
+	s_addc_u32 s25, s6, -1
+	v_and_b32_e32 v33, 0x1c00, v1
+	.loc	1 159 5                         ; amd_ikbo_fa_accuracy_debug.py:159:5
+	s_and_b64 vcc, exec, s[2:3]
+	v_lshlrev_b32_e32 v1, 8, v57
+	v_lshlrev_b32_e32 v2, 3, v57
+	; asyncmark
+	s_cbranch_vccnz .LBB0_43
+; %bb.42:                               ; %.._crit_edge_crit_edge
+	.loc	1 199 13                        ; amd_ikbo_fa_accuracy_debug.py:199:13
+	v_and_b32_e32 v35, 0x1c00, v1
+	v_and_b32_e32 v37, 0x118, v2
+	v_lshrrev_b32_e32 v39, 5, v35
+	s_mov_b64 s[0:1], 0
+	s_branch .LBB0_44
+.LBB0_43:
+                                        ; implicit-def: $vgpr35
+                                        ; implicit-def: $vgpr37
+                                        ; implicit-def: $vgpr39
+.LBB0_44:                               ; %Flow205
+	.loc	1 0 13 is_stmt 0                ; amd_ikbo_fa_accuracy_debug.py:0:13
+	s_load_dwordx2 s[14:15], s[4:5], 0x28
+	v_lshlrev_b32_e32 v41, 5, v0
+	v_lshrrev_b32_e32 v43, 5, v33
+	s_andn2_b64 vcc, exec, s[0:1]
+	v_mov_b32_e32 v51, 1.0
+	v_mov_b32_e32 v56, 0xff800000
+	s_cbranch_vccnz .LBB0_79
+; %bb.45:                               ; %.lr.ph
+	.loc	1 159 5 is_stmt 1               ; amd_ikbo_fa_accuracy_debug.py:159:5
+	v_add3_u32 v0, 0, v33, v41
+	v_and_b32_e32 v35, 0x1c00, v1
+	v_and_b32_e32 v37, 0x118, v2
+	v_cmp_gt_u64_e64 s[0:1], s[24:25], 1
+	v_add3_u32 v45, v0, v59, v43
+	v_lshrrev_b32_e32 v39, 5, v35
+	v_add_u32_e32 v0, 0, v37
+	s_and_b64 s[0:1], s[0:1], exec
+	v_mov_b32_e32 v78, 0
+	s_mov_b32 s38, 0
+	v_add3_u32 v47, v0, v39, v35
+	s_cselect_b32 s29, s25, 0
+	s_cselect_b32 s28, s24, 1
+	s_mov_b64 s[30:31], 0
+	v_mov_b32_e32 v49, 1.0
+	v_mov_b32_e32 v53, 0xff800000
+	v_mov_b32_e32 v79, v78
+	v_mov_b32_e32 v80, v78
+	v_mov_b32_e32 v81, v78
+	v_mov_b32_e32 v30, v78
+	v_mov_b32_e32 v31, v78
+	v_mov_b32_e32 v28, v78
+	v_mov_b32_e32 v29, v78
+	v_mov_b32_e32 v26, v78
+	v_mov_b32_e32 v27, v78
+	v_mov_b32_e32 v24, v78
+	v_mov_b32_e32 v25, v78
+	v_mov_b32_e32 v22, v78
+	v_mov_b32_e32 v23, v78
+	v_mov_b32_e32 v20, v78
+	v_mov_b32_e32 v21, v78
+	v_mov_b32_e32 v18, v78
+	v_mov_b32_e32 v19, v78
+	v_mov_b32_e32 v16, v78
+	v_mov_b32_e32 v17, v78
+	v_mov_b32_e32 v14, v78
+	v_mov_b32_e32 v15, v78
+	v_mov_b32_e32 v12, v78
+	v_mov_b32_e32 v13, v78
+	v_mov_b32_e32 v10, v78
+	v_mov_b32_e32 v11, v78
+	v_mov_b32_e32 v8, v78
+	v_mov_b32_e32 v9, v78
+	v_mov_b32_e32 v6, v78
+	v_mov_b32_e32 v7, v78
+	v_mov_b32_e32 v4, v78
+	v_mov_b32_e32 v5, v78
+	v_mov_b32_e32 v2, v78
+	v_mov_b32_e32 v3, v78
+	v_mov_b32_e32 v0, v78
+	v_mov_b32_e32 v1, v78
+	s_branch .LBB0_47
+.LBB0_46:                               ;   in Loop: Header=BB0_47 Depth=1
+	.loc	1 0 5 is_stmt 0                 ; amd_ikbo_fa_accuracy_debug.py:0:5
+	s_or_b64 exec, exec, s[0:1]
+	.loc	1 182 14 is_stmt 1              ; amd_ikbo_fa_accuracy_debug.py:182:14
+	v_mfma_f32_16x16x32_f16 v[130:133], v[130:133], v[74:77], 0
+	.loc	1 159 5                         ; amd_ikbo_fa_accuracy_debug.py:159:5
+	s_cmp_lg_u64 s[30:31], s[28:29]
+	; asyncmark
+	.loc	1 182 14                        ; amd_ikbo_fa_accuracy_debug.py:182:14
+	v_mfma_f32_16x16x32_f16 v[126:129], v[126:129], v[74:77], 0
+	v_mfma_f32_16x16x32_f16 v[130:133], v[134:137], v[66:69], v[130:133]
+	v_mfma_f32_16x16x32_f16 v[118:121], v[118:121], v[66:69], v[126:129]
+	v_mfma_f32_16x16x32_f16 v[130:133], v[138:141], v[70:73], v[130:133]
+	v_mfma_f32_16x16x32_f16 v[118:121], v[122:125], v[70:73], v[118:121]
+	v_mfma_f32_16x16x32_f16 v[130:133], v[142:145], v[62:65], v[130:133]
+	v_mfma_f32_16x16x32_f16 v[114:117], v[114:117], v[62:65], v[118:121]
+.Ltmp4:
+	.loc	2 170 12                        ; standard.py:170:12 @[ standard.py:191:16 @[ amd_ikbo_fa_accuracy_debug.py:183:32 ] ]
+	s_nop 6
+	v_max_f32_e32 v51, v131, v131
+	v_max_f32_e32 v55, v130, v130
+	v_max_f32_e32 v51, v55, v51
+	v_max3_f32 v55, v133, v114, v115
+	v_max3_f32 v51, v51, v132, v55
+	v_max3_f32 v51, v51, v116, v117
+.Ltmp5:
+	.loc	2 191 16                        ; standard.py:191:16 @[ amd_ikbo_fa_accuracy_debug.py:183:32 ]
+	v_mov_b32_e32 v55, v51
+	s_nop 1
+	v_permlane32_swap_b32_e32 v51, v55
+.Ltmp6:
+	.loc	2 170 12                        ; standard.py:170:12 @[ standard.py:191:16 @[ amd_ikbo_fa_accuracy_debug.py:183:32 ] ]
+	v_max_f32_e32 v55, v55, v55
+	v_max_f32_e32 v51, v51, v51
+	v_max_f32_e32 v51, v51, v55
+.Ltmp7:
+	.loc	2 191 16                        ; standard.py:191:16 @[ amd_ikbo_fa_accuracy_debug.py:183:32 ]
+	v_mov_b32_e32 v55, v51
+	s_nop 1
+	v_permlane16_swap_b32_e32 v51, v55
+.Ltmp8:
+	.loc	2 170 12                        ; standard.py:170:12 @[ standard.py:191:16 @[ amd_ikbo_fa_accuracy_debug.py:183:32 ] ]
+	v_max_f32_e32 v55, v55, v55
+	v_max_f32_e32 v51, v51, v51
+	v_max_f32_e32 v51, v51, v55
+.Ltmp9:
+	.loc	1 183 32                        ; amd_ikbo_fa_accuracy_debug.py:183:32
+	v_mul_f32_e32 v51, s22, v51
+	.loc	1 183 16 is_stmt 0              ; amd_ikbo_fa_accuracy_debug.py:183:16
+	v_max_f32_e32 v55, v53, v53
+	v_max_f32_e32 v56, v55, v51
+	.loc	1 184 14 is_stmt 1              ; amd_ikbo_fa_accuracy_debug.py:184:14
+	v_pk_fma_f32 v[118:119], s[22:23], v[130:131], v[56:57] op_sel_hi:[0,1,0] neg_lo:[0,0,1] neg_hi:[0,0,1]
+	v_pk_fma_f32 v[120:121], s[22:23], v[132:133], v[56:57] op_sel_hi:[0,1,0] neg_lo:[0,0,1] neg_hi:[0,0,1]
+	v_pk_fma_f32 v[114:115], s[22:23], v[114:115], v[56:57] op_sel_hi:[0,1,0] neg_lo:[0,0,1] neg_hi:[0,0,1]
+	v_pk_fma_f32 v[116:117], s[22:23], v[116:117], v[56:57] op_sel_hi:[0,1,0] neg_lo:[0,0,1] neg_hi:[0,0,1]
+	.loc	1 185 13                        ; amd_ikbo_fa_accuracy_debug.py:185:13
+	v_exp_f32_e32 v118, v118
+	v_exp_f32_e32 v119, v119
+	v_exp_f32_e32 v120, v120
+	v_exp_f32_e32 v121, v121
+	v_exp_f32_e32 v122, v114
+	v_exp_f32_e32 v123, v115
+	v_exp_f32_e32 v124, v116
+	v_exp_f32_e32 v125, v117
+.Ltmp10:
+	.loc	2 293 12                        ; standard.py:293:12 @[ amd_ikbo_fa_accuracy_debug.py:187:16 ]
+	v_pk_add_f32 v[114:115], v[118:119], v[120:121]
+.Ltmp11:
+	.loc	1 186 30                        ; amd_ikbo_fa_accuracy_debug.py:186:30
+	v_sub_f32_e32 v51, v53, v56
+	.loc	1 186 17 is_stmt 0              ; amd_ikbo_fa_accuracy_debug.py:186:17
+	v_exp_f32_e32 v126, v51
+.Ltmp12:
+	.loc	2 293 12 is_stmt 1              ; standard.py:293:12 @[ amd_ikbo_fa_accuracy_debug.py:187:16 ]
+	v_pk_add_f32 v[116:117], v[122:123], v[124:125]
+.Ltmp13:
+	.loc	1 188 15                        ; amd_ikbo_fa_accuracy_debug.py:188:15
+	v_pk_mul_f32 v[28:29], v[28:29], v[126:127] op_sel_hi:[1,0]
+.Ltmp14:
+	.loc	2 293 12                        ; standard.py:293:12 @[ amd_ikbo_fa_accuracy_debug.py:187:16 ]
+	v_pk_add_f32 v[114:115], v[114:115], v[116:117]
+.Ltmp15:
+	.loc	1 188 15                        ; amd_ikbo_fa_accuracy_debug.py:188:15
+	v_pk_mul_f32 v[30:31], v[30:31], v[126:127] op_sel_hi:[1,0]
+.Ltmp16:
+	.loc	2 263 12                        ; standard.py:263:12 @[ standard.py:293:12 @[ amd_ikbo_fa_accuracy_debug.py:187:16 ] ]
+	v_add_f32_e32 v51, v114, v115
+.Ltmp17:
+	.loc	2 293 12                        ; standard.py:293:12 @[ amd_ikbo_fa_accuracy_debug.py:187:16 ]
+	v_mov_b32_e32 v53, v51
+	s_nop 1
+	v_permlane32_swap_b32_e32 v51, v53
+.Ltmp18:
+	.loc	2 263 12                        ; standard.py:263:12 @[ standard.py:293:12 @[ amd_ikbo_fa_accuracy_debug.py:187:16 ] ]
+	v_add_f32_e32 v51, v51, v53
+.Ltmp19:
+	.loc	1 191 22                        ; amd_ikbo_fa_accuracy_debug.py:191:22
+	v_cvt_pk_f16_f32 v114, v118, v119
+	v_cvt_pk_f16_f32 v115, v120, v121
+	v_cvt_pk_f16_f32 v116, v122, v123
+	v_cvt_pk_f16_f32 v117, v124, v125
+	.loc	1 188 15                        ; amd_ikbo_fa_accuracy_debug.py:188:15
+	v_pk_mul_f32 v[24:25], v[24:25], v[126:127] op_sel_hi:[1,0]
+	v_pk_mul_f32 v[26:27], v[26:27], v[126:127] op_sel_hi:[1,0]
+	v_pk_mul_f32 v[20:21], v[20:21], v[126:127] op_sel_hi:[1,0]
+	v_pk_mul_f32 v[22:23], v[22:23], v[126:127] op_sel_hi:[1,0]
+	v_pk_mul_f32 v[16:17], v[16:17], v[126:127] op_sel_hi:[1,0]
+	v_pk_mul_f32 v[18:19], v[18:19], v[126:127] op_sel_hi:[1,0]
+.Ltmp20:
+	.loc	2 293 12                        ; standard.py:293:12 @[ amd_ikbo_fa_accuracy_debug.py:187:16 ]
+	v_mov_b32_e32 v53, v51
+.Ltmp21:
+	.loc	1 188 15                        ; amd_ikbo_fa_accuracy_debug.py:188:15
+	v_pk_mul_f32 v[12:13], v[12:13], v[126:127] op_sel_hi:[1,0]
+	v_pk_mul_f32 v[14:15], v[14:15], v[126:127] op_sel_hi:[1,0]
+	v_pk_mul_f32 v[8:9], v[8:9], v[126:127] op_sel_hi:[1,0]
+	v_pk_mul_f32 v[10:11], v[10:11], v[126:127] op_sel_hi:[1,0]
+	v_pk_mul_f32 v[4:5], v[4:5], v[126:127] op_sel_hi:[1,0]
+	v_pk_mul_f32 v[6:7], v[6:7], v[126:127] op_sel_hi:[1,0]
+	v_pk_mul_f32 v[0:1], v[0:1], v[126:127] op_sel_hi:[1,0]
+	v_pk_mul_f32 v[2:3], v[2:3], v[126:127] op_sel_hi:[1,0]
+	.loc	1 191 15                        ; amd_ikbo_fa_accuracy_debug.py:191:15
+	v_mfma_f32_16x16x32_f16 v[28:31], v[110:113], v[114:117], v[28:31]
+.Ltmp22:
+	.loc	2 293 12                        ; standard.py:293:12 @[ amd_ikbo_fa_accuracy_debug.py:187:16 ]
+	v_permlane16_swap_b32_e32 v51, v53
+.Ltmp23:
+	.loc	2 263 12                        ; standard.py:263:12 @[ standard.py:293:12 @[ amd_ikbo_fa_accuracy_debug.py:187:16 ] ]
+	v_add_f32_e32 v51, v51, v53
+.Ltmp24:
+	.loc	1 189 15                        ; amd_ikbo_fa_accuracy_debug.py:189:15
+	v_fmac_f32_e32 v51, v49, v126
+	.loc	1 191 15                        ; amd_ikbo_fa_accuracy_debug.py:191:15
+	v_mfma_f32_16x16x32_f16 v[24:27], v[106:109], v[114:117], v[24:27]
+	v_mov_b32_e32 v49, v51
+	v_mov_b32_e32 v53, v56
+	v_mfma_f32_16x16x32_f16 v[20:23], v[102:105], v[114:117], v[20:23]
+	v_mfma_f32_16x16x32_f16 v[16:19], v[98:101], v[114:117], v[16:19]
+	v_mfma_f32_16x16x32_f16 v[12:15], v[94:97], v[114:117], v[12:15]
+	v_mfma_f32_16x16x32_f16 v[8:11], v[90:93], v[114:117], v[8:11]
+	v_mfma_f32_16x16x32_f16 v[4:7], v[86:89], v[114:117], v[4:7]
+	v_mfma_f32_16x16x32_f16 v[0:3], v[82:85], v[114:117], v[0:3]
+	.loc	1 159 5                         ; amd_ikbo_fa_accuracy_debug.py:159:5
+	s_cbranch_scc0 .LBB0_80
+.LBB0_47:                               ; =>This Inner Loop Header: Depth=1
+	.loc	1 0 5 is_stmt 0                 ; amd_ikbo_fa_accuracy_debug.py:0:5
+	s_mov_b32 s0, s38
+	.loc	1 167 18 is_stmt 1              ; amd_ikbo_fa_accuracy_debug.py:167:18
+	s_mulk_i32 s0, 0x2100
+	v_add_u32_e32 v51, s0, v45
+	; wait_asyncmark(0)
+	.loc	1 164 9                         ; amd_ikbo_fa_accuracy_debug.py:164:9
+	s_waitcnt vmcnt(0) lgkmcnt(0)
+	s_barrier
+	.loc	1 167 18                        ; amd_ikbo_fa_accuracy_debug.py:167:18
+	ds_read_b128 v[130:133], v51
+	ds_read_b128 v[134:137], v51 offset:64
+	ds_read_b128 v[138:141], v51 offset:128
+	ds_read_b128 v[142:145], v51 offset:192
+	ds_read_b128 v[126:129], v51 offset:512
+	ds_read_b128 v[118:121], v51 offset:576
+	ds_read_b128 v[122:125], v51 offset:640
+	ds_read_b128 v[114:117], v51 offset:704
+	.loc	1 169 17                        ; amd_ikbo_fa_accuracy_debug.py:169:17
+	v_add_u32_e32 v51, s0, v47
+	ds_read_b64_tr_b16 v[110:111], v51 offset:16864
+	ds_read_b64_tr_b16 v[106:107], v51 offset:16896
+	ds_read_b64_tr_b16 v[102:103], v51 offset:16928
+	ds_read_b64_tr_b16 v[98:99], v51 offset:16960
+	ds_read_b64_tr_b16 v[112:113], v51 offset:17376
+	ds_read_b64_tr_b16 v[108:109], v51 offset:17408
+	ds_read_b64_tr_b16 v[104:105], v51 offset:17440
+	ds_read_b64_tr_b16 v[100:101], v51 offset:17472
+	ds_read_b64_tr_b16 v[94:95], v51 offset:16992
+	ds_read_b64_tr_b16 v[90:91], v51 offset:17024
+	ds_read_b64_tr_b16 v[86:87], v51 offset:17056
+	ds_read_b64_tr_b16 v[82:83], v51 offset:17088
+	ds_read_b64_tr_b16 v[96:97], v51 offset:17504
+	ds_read_b64_tr_b16 v[92:93], v51 offset:17536
+	ds_read_b64_tr_b16 v[88:89], v51 offset:17568
+	ds_read_b64_tr_b16 v[84:85], v51 offset:17600
+	.loc	1 160 21                        ; amd_ikbo_fa_accuracy_debug.py:160:21
+	s_add_u32 s30, s30, 1
+	s_addc_u32 s31, s31, 0
+	.loc	1 162 26                        ; amd_ikbo_fa_accuracy_debug.py:162:26
+	s_xor_b32 s38, s38, 1
+	.loc	1 160 20                        ; amd_ikbo_fa_accuracy_debug.py:160:20
+	s_lshl_b64 s[34:35], s[30:31], 5
+	.loc	1 172 22                        ; amd_ikbo_fa_accuracy_debug.py:172:22
+	s_mul_i32 s33, s38, 0x1080
+	.loc	1 171 22                        ; amd_ikbo_fa_accuracy_debug.py:171:22
+	v_mov_b32_e32 v147, s35
+	v_or_b32_e32 v146, s34, v32
+	.loc	1 173 19                        ; amd_ikbo_fa_accuracy_debug.py:173:19
+	s_lshl1_add_u32 s39, s33, s17
+	.loc	1 171 21                        ; amd_ikbo_fa_accuracy_debug.py:171:21
+	v_cmp_le_i64_e32 vcc, s[8:9], v[146:147]
+	v_lshl_add_u32 v51, v60, 4, s39
+	.loc	1 173 19                        ; amd_ikbo_fa_accuracy_debug.py:173:19
+	s_waitcnt lgkmcnt(0)
+	s_barrier
+	s_and_saveexec_b64 s[0:1], vcc
+	s_xor_b64 s[0:1], exec, s[0:1]
+; %bb.48:                               ; %.critedge26
+                                        ;   in Loop: Header=BB0_47 Depth=1
+	ds_write_b128 v51, v[78:81]
+; %bb.49:                               ; %Flow203
+                                        ;   in Loop: Header=BB0_47 Depth=1
+	.loc	1 0 19 is_stmt 0                ; amd_ikbo_fa_accuracy_debug.py:0:19
+	s_or_saveexec_b64 s[0:1], s[0:1]
+	s_mul_i32 s40, s16, s34
+	s_xor_b64 exec, exec, s[0:1]
+	s_cbranch_execz .LBB0_51
+; %bb.50:                               ;   in Loop: Header=BB0_47 Depth=1
+	.loc	1 174 13 is_stmt 1              ; amd_ikbo_fa_accuracy_debug.py:174:13
+	v_add_u32_e32 v146, s40, v34
+	.loc	1 173 19                        ; amd_ikbo_fa_accuracy_debug.py:173:19
+	v_ashrrev_i32_e32 v147, 31, v146
+	v_lshl_add_u64 v[146:147], v[146:147], 1, s[12:13]
+	s_mov_b32 m0, s39
+	s_nop 0
+	global_load_lds_dwordx4 v[146:147], off
+.LBB0_51:                               ;   in Loop: Header=BB0_47 Depth=1
+	.loc	1 0 19 is_stmt 0                ; amd_ikbo_fa_accuracy_debug.py:0:19
+	s_or_b64 exec, exec, s[0:1]
+	.loc	1 171 22 is_stmt 1              ; amd_ikbo_fa_accuracy_debug.py:171:22
+	v_mov_b32_e32 v147, s35
+	v_or_b32_e32 v146, s34, v36
+	.loc	1 171 21 is_stmt 0              ; amd_ikbo_fa_accuracy_debug.py:171:21
+	v_cmp_le_i64_e64 s[0:1], s[8:9], v[146:147]
+	.loc	1 173 19 is_stmt 1              ; amd_ikbo_fa_accuracy_debug.py:173:19
+	s_and_saveexec_b64 s[2:3], s[0:1]
+	s_xor_b64 s[2:3], exec, s[2:3]
+; %bb.52:                               ; %.critedge28
+                                        ;   in Loop: Header=BB0_47 Depth=1
+	ds_write_b128 v51, v[78:81] offset:2112
+; %bb.53:                               ; %Flow202
+                                        ;   in Loop: Header=BB0_47 Depth=1
+	.loc	1 0 19 is_stmt 0                ; amd_ikbo_fa_accuracy_debug.py:0:19
+	s_andn2_saveexec_b64 s[2:3], s[2:3]
+	s_cbranch_execz .LBB0_55
+; %bb.54:                               ;   in Loop: Header=BB0_47 Depth=1
+	.loc	1 174 13 is_stmt 1              ; amd_ikbo_fa_accuracy_debug.py:174:13
+	v_add_u32_e32 v146, s40, v38
+	.loc	1 173 19                        ; amd_ikbo_fa_accuracy_debug.py:173:19
+	v_ashrrev_i32_e32 v147, 31, v146
+	v_lshl_add_u64 v[146:147], v[146:147], 1, s[12:13]
+	s_add_i32 m0, s39, 0x840
+	s_nop 0
+	global_load_lds_dwordx4 v[146:147], off
+.LBB0_55:                               ;   in Loop: Header=BB0_47 Depth=1
+	.loc	1 0 19 is_stmt 0                ; amd_ikbo_fa_accuracy_debug.py:0:19
+	s_or_b64 exec, exec, s[2:3]
+	.loc	1 171 22 is_stmt 1              ; amd_ikbo_fa_accuracy_debug.py:171:22
+	v_mov_b32_e32 v147, s35
+	v_or_b32_e32 v146, s34, v40
+	.loc	1 171 21 is_stmt 0              ; amd_ikbo_fa_accuracy_debug.py:171:21
+	v_cmp_le_i64_e64 s[2:3], s[8:9], v[146:147]
+	.loc	1 173 19 is_stmt 1              ; amd_ikbo_fa_accuracy_debug.py:173:19
+	s_and_saveexec_b64 s[6:7], s[2:3]
+	s_xor_b64 s[6:7], exec, s[6:7]
+; %bb.56:                               ; %.critedge30
+                                        ;   in Loop: Header=BB0_47 Depth=1
+	ds_write_b128 v51, v[78:81] offset:4224
+; %bb.57:                               ; %Flow201
+                                        ;   in Loop: Header=BB0_47 Depth=1
+	.loc	1 0 19 is_stmt 0                ; amd_ikbo_fa_accuracy_debug.py:0:19
+	s_andn2_saveexec_b64 s[6:7], s[6:7]
+	s_cbranch_execz .LBB0_59
+; %bb.58:                               ;   in Loop: Header=BB0_47 Depth=1
+	.loc	1 174 13 is_stmt 1              ; amd_ikbo_fa_accuracy_debug.py:174:13
+	v_add_u32_e32 v146, s40, v42
+	.loc	1 173 19                        ; amd_ikbo_fa_accuracy_debug.py:173:19
+	v_ashrrev_i32_e32 v147, 31, v146
+	v_lshl_add_u64 v[146:147], v[146:147], 1, s[12:13]
+	s_add_i32 m0, s39, 0x1080
+	s_nop 0
+	global_load_lds_dwordx4 v[146:147], off
+.LBB0_59:                               ;   in Loop: Header=BB0_47 Depth=1
+	.loc	1 0 19 is_stmt 0                ; amd_ikbo_fa_accuracy_debug.py:0:19
+	s_or_b64 exec, exec, s[6:7]
+	.loc	1 171 22 is_stmt 1              ; amd_ikbo_fa_accuracy_debug.py:171:22
+	v_mov_b32_e32 v147, s35
+	v_or_b32_e32 v146, s34, v44
+	.loc	1 171 21 is_stmt 0              ; amd_ikbo_fa_accuracy_debug.py:171:21
+	v_cmp_le_i64_e64 s[6:7], s[8:9], v[146:147]
+	.loc	1 173 19 is_stmt 1              ; amd_ikbo_fa_accuracy_debug.py:173:19
+	s_and_saveexec_b64 s[36:37], s[6:7]
+	s_xor_b64 s[36:37], exec, s[36:37]
+	s_cbranch_execnz .LBB0_69
+; %bb.60:                               ; %Flow200
+                                        ;   in Loop: Header=BB0_47 Depth=1
+	.loc	1 0 19 is_stmt 0                ; amd_ikbo_fa_accuracy_debug.py:0:19
+	s_andn2_saveexec_b64 s[36:37], s[36:37]
+	s_cbranch_execnz .LBB0_70
+.LBB0_61:                               ;   in Loop: Header=BB0_47 Depth=1
+	s_or_b64 exec, exec, s[36:37]
+	.loc	1 177 19 is_stmt 1              ; amd_ikbo_fa_accuracy_debug.py:177:19
+	s_and_saveexec_b64 s[36:37], vcc
+	s_xor_b64 s[36:37], exec, s[36:37]
+	s_cbranch_execnz .LBB0_71
+.LBB0_62:                               ; %Flow199
+                                        ;   in Loop: Header=BB0_47 Depth=1
+	.loc	1 0 19 is_stmt 0                ; amd_ikbo_fa_accuracy_debug.py:0:19
+	s_or_saveexec_b64 s[36:37], s[36:37]
+	s_mul_i32 s34, s23, s34
+	s_xor_b64 exec, exec, s[36:37]
+	s_cbranch_execnz .LBB0_72
+.LBB0_63:                               ;   in Loop: Header=BB0_47 Depth=1
+	s_or_b64 exec, exec, s[36:37]
+	.loc	1 177 19 is_stmt 1              ; amd_ikbo_fa_accuracy_debug.py:177:19
+	s_and_saveexec_b64 s[36:37], s[0:1]
+	s_xor_b64 s[0:1], exec, s[36:37]
+	s_cbranch_execnz .LBB0_73
+.LBB0_64:                               ; %Flow198
+                                        ;   in Loop: Header=BB0_47 Depth=1
+	.loc	1 0 19 is_stmt 0                ; amd_ikbo_fa_accuracy_debug.py:0:19
+	s_andn2_saveexec_b64 s[0:1], s[0:1]
+	s_cbranch_execnz .LBB0_74
+.LBB0_65:                               ;   in Loop: Header=BB0_47 Depth=1
+	s_or_b64 exec, exec, s[0:1]
+	.loc	1 177 19 is_stmt 1              ; amd_ikbo_fa_accuracy_debug.py:177:19
+	s_and_saveexec_b64 s[0:1], s[2:3]
+	s_xor_b64 s[0:1], exec, s[0:1]
+	s_cbranch_execnz .LBB0_75
+.LBB0_66:                               ; %Flow197
+                                        ;   in Loop: Header=BB0_47 Depth=1
+	.loc	1 0 19 is_stmt 0                ; amd_ikbo_fa_accuracy_debug.py:0:19
+	s_andn2_saveexec_b64 s[0:1], s[0:1]
+	s_cbranch_execnz .LBB0_76
+.LBB0_67:                               ;   in Loop: Header=BB0_47 Depth=1
+	s_or_b64 exec, exec, s[0:1]
+	.loc	1 177 19 is_stmt 1              ; amd_ikbo_fa_accuracy_debug.py:177:19
+	s_and_saveexec_b64 s[0:1], s[6:7]
+	s_xor_b64 s[0:1], exec, s[0:1]
+	s_cbranch_execnz .LBB0_77
+.LBB0_68:                               ; %Flow196
+                                        ;   in Loop: Header=BB0_47 Depth=1
+	.loc	1 0 19 is_stmt 0                ; amd_ikbo_fa_accuracy_debug.py:0:19
+	s_andn2_saveexec_b64 s[0:1], s[0:1]
+	s_cbranch_execz .LBB0_46
+	s_branch .LBB0_78
+.LBB0_69:                               ; %.critedge32
+                                        ;   in Loop: Header=BB0_47 Depth=1
+	.loc	1 173 19 is_stmt 1              ; amd_ikbo_fa_accuracy_debug.py:173:19
+	ds_write_b128 v51, v[78:81] offset:6336
+	s_andn2_saveexec_b64 s[36:37], s[36:37]
+	s_cbranch_execz .LBB0_61
+.LBB0_70:                               ;   in Loop: Header=BB0_47 Depth=1
+	.loc	1 174 13                        ; amd_ikbo_fa_accuracy_debug.py:174:13
+	v_add_u32_e32 v146, s40, v46
+	.loc	1 173 19                        ; amd_ikbo_fa_accuracy_debug.py:173:19
+	v_ashrrev_i32_e32 v147, 31, v146
+	v_lshl_add_u64 v[146:147], v[146:147], 1, s[12:13]
+	s_add_i32 m0, s39, 0x18c0
+	s_nop 0
+	global_load_lds_dwordx4 v[146:147], off
+	s_or_b64 exec, exec, s[36:37]
+	.loc	1 177 19                        ; amd_ikbo_fa_accuracy_debug.py:177:19
+	s_and_saveexec_b64 s[36:37], vcc
+	s_xor_b64 s[36:37], exec, s[36:37]
+	s_cbranch_execz .LBB0_62
+.LBB0_71:                               ; %.critedge34
+                                        ;   in Loop: Header=BB0_47 Depth=1
+	ds_write_b128 v51, v[78:81] offset:16864
+	s_or_saveexec_b64 s[36:37], s[36:37]
+	s_mul_i32 s34, s23, s34
+	s_xor_b64 exec, exec, s[36:37]
+	s_cbranch_execz .LBB0_63
+.LBB0_72:                               ;   in Loop: Header=BB0_47 Depth=1
+	.loc	1 178 13                        ; amd_ikbo_fa_accuracy_debug.py:178:13
+	v_add_u32_e32 v146, s34, v48
+	.loc	1 177 19                        ; amd_ikbo_fa_accuracy_debug.py:177:19
+	v_ashrrev_i32_e32 v147, 31, v146
+	v_lshl_add_u64 v[146:147], v[146:147], 1, s[26:27]
+	s_add_i32 m0, s39, 0x41e0
+	s_nop 0
+	global_load_lds_dwordx4 v[146:147], off
+	s_or_b64 exec, exec, s[36:37]
+	s_and_saveexec_b64 s[36:37], s[0:1]
+	s_xor_b64 s[0:1], exec, s[36:37]
+	s_cbranch_execz .LBB0_64
+.LBB0_73:                               ; %.critedge36
+                                        ;   in Loop: Header=BB0_47 Depth=1
+	ds_write_b128 v51, v[78:81] offset:18976
+	s_andn2_saveexec_b64 s[0:1], s[0:1]
+	s_cbranch_execz .LBB0_65
+.LBB0_74:                               ;   in Loop: Header=BB0_47 Depth=1
+	.loc	1 178 13                        ; amd_ikbo_fa_accuracy_debug.py:178:13
+	v_add_u32_e32 v146, s34, v50
+	.loc	1 177 19                        ; amd_ikbo_fa_accuracy_debug.py:177:19
+	v_ashrrev_i32_e32 v147, 31, v146
+	v_lshl_add_u64 v[146:147], v[146:147], 1, s[26:27]
+	s_add_i32 m0, s39, 0x4a20
+	s_nop 0
+	global_load_lds_dwordx4 v[146:147], off
+	s_or_b64 exec, exec, s[0:1]
+	s_and_saveexec_b64 s[0:1], s[2:3]
+	s_xor_b64 s[0:1], exec, s[0:1]
+	s_cbranch_execz .LBB0_66
+.LBB0_75:                               ; %.critedge38
+                                        ;   in Loop: Header=BB0_47 Depth=1
+	ds_write_b128 v51, v[78:81] offset:21088
+	s_andn2_saveexec_b64 s[0:1], s[0:1]
+	s_cbranch_execz .LBB0_67
+.LBB0_76:                               ;   in Loop: Header=BB0_47 Depth=1
+	.loc	1 178 13                        ; amd_ikbo_fa_accuracy_debug.py:178:13
+	v_add_u32_e32 v146, s34, v52
+	.loc	1 177 19                        ; amd_ikbo_fa_accuracy_debug.py:177:19
+	v_ashrrev_i32_e32 v147, 31, v146
+	v_lshl_add_u64 v[146:147], v[146:147], 1, s[26:27]
+	s_add_i32 m0, s39, 0x5260
+	s_nop 0
+	global_load_lds_dwordx4 v[146:147], off
+	s_or_b64 exec, exec, s[0:1]
+	s_and_saveexec_b64 s[0:1], s[6:7]
+	s_xor_b64 s[0:1], exec, s[0:1]
+	s_cbranch_execz .LBB0_68
+.LBB0_77:                               ; %.critedge40
+                                        ;   in Loop: Header=BB0_47 Depth=1
+	ds_write_b128 v51, v[78:81] offset:23200
+	s_andn2_saveexec_b64 s[0:1], s[0:1]
+	s_cbranch_execz .LBB0_46
+.LBB0_78:                               ;   in Loop: Header=BB0_47 Depth=1
+	.loc	1 178 13                        ; amd_ikbo_fa_accuracy_debug.py:178:13
+	v_add_u32_e32 v146, s34, v54
+	.loc	1 177 19                        ; amd_ikbo_fa_accuracy_debug.py:177:19
+	v_ashrrev_i32_e32 v147, 31, v146
+	v_lshl_add_u64 v[146:147], v[146:147], 1, s[26:27]
+	s_add_i32 m0, s39, 0x5aa0
+	s_nop 0
+	global_load_lds_dwordx4 v[146:147], off
+	s_branch .LBB0_46
+.LBB0_79:
+	.loc	1 0 19 is_stmt 0                ; amd_ikbo_fa_accuracy_debug.py:0:19
+	v_mov_b32_e32 v1, 0
+	v_mov_b32_e32 v0, v1
+	v_mov_b32_e32 v3, v1
+	v_mov_b32_e32 v2, v1
+	v_mov_b32_e32 v5, v1
+	v_mov_b32_e32 v4, v1
+	v_mov_b32_e32 v7, v1
+	v_mov_b32_e32 v6, v1
+	v_mov_b32_e32 v9, v1
+	v_mov_b32_e32 v8, v1
+	v_mov_b32_e32 v11, v1
+	v_mov_b32_e32 v10, v1
+	v_mov_b32_e32 v13, v1
+	v_mov_b32_e32 v12, v1
+	v_mov_b32_e32 v15, v1
+	v_mov_b32_e32 v14, v1
+	v_mov_b32_e32 v17, v1
+	v_mov_b32_e32 v16, v1
+	v_mov_b32_e32 v19, v1
+	v_mov_b32_e32 v18, v1
+	v_mov_b32_e32 v21, v1
+	v_mov_b32_e32 v20, v1
+	v_mov_b32_e32 v23, v1
+	v_mov_b32_e32 v22, v1
+	v_mov_b32_e32 v25, v1
+	v_mov_b32_e32 v24, v1
+	v_mov_b32_e32 v27, v1
+	v_mov_b32_e32 v26, v1
+	v_mov_b32_e32 v29, v1
+	v_mov_b32_e32 v28, v1
+	v_mov_b32_e32 v31, v1
+	v_mov_b32_e32 v30, v1
+.LBB0_80:                               ; %Flow206
+	.loc	1 195 17 is_stmt 1              ; amd_ikbo_fa_accuracy_debug.py:195:17
+	s_lshl1_add_u32 s7, s33, 0
+	.loc	1 197 14                        ; amd_ikbo_fa_accuracy_debug.py:197:14
+	v_add3_u32 v33, s7, v33, v41
+	v_add3_u32 v36, v33, v59, v43
+	; wait_asyncmark(0)
+	.loc	1 194 5                         ; amd_ikbo_fa_accuracy_debug.py:194:5
+	s_waitcnt vmcnt(0) lgkmcnt(0)
+	s_barrier
+	.loc	1 197 14                        ; amd_ikbo_fa_accuracy_debug.py:197:14
+	ds_read_b128 v[40:43], v36
+	.loc	1 109 34                        ; amd_ikbo_fa_accuracy_debug.py:109:34
+	v_lshl_or_b32 v32, s21, 4, v58
+	v_lshrrev_b32_e32 v34, 2, v59
+	.loc	1 197 14                        ; amd_ikbo_fa_accuracy_debug.py:197:14
+	ds_read_b128 v[58:61], v36 offset:64
+	ds_read_b128 v[78:81], v36 offset:128
+	ds_read_b128 v[82:85], v36 offset:192
+	.loc	1 202 10                        ; amd_ikbo_fa_accuracy_debug.py:202:10
+	s_waitcnt lgkmcnt(3)
+	v_mfma_f32_16x16x32_f16 v[40:43], v[40:43], v[74:77], 0
+	.loc	1 109 14                        ; amd_ikbo_fa_accuracy_debug.py:109:14
+	v_or_b32_e32 v32, s19, v32
+	s_load_dwordx2 s[2:3], s[4:5], 0x50
+	s_load_dword s6, s[4:5], 0x5c
+	.loc	1 201 15                        ; amd_ikbo_fa_accuracy_debug.py:201:15
+	s_lshl_b64 s[4:5], s[24:25], 5
+	.loc	1 202 10                        ; amd_ikbo_fa_accuracy_debug.py:202:10
+	s_waitcnt lgkmcnt(0)
+	v_mfma_f32_16x16x32_f16 v[40:43], v[58:61], v[66:69], v[40:43]
+	.loc	1 197 14                        ; amd_ikbo_fa_accuracy_debug.py:197:14
+	ds_read_b128 v[58:61], v36 offset:512
+	ds_read_b128 v[86:89], v36 offset:576
+	.loc	1 116 12                        ; amd_ikbo_fa_accuracy_debug.py:116:12
+	v_ashrrev_i32_e32 v33, 31, v32
+	.loc	1 109 34                        ; amd_ikbo_fa_accuracy_debug.py:109:34
+	v_or_b32_e32 v44, s4, v34
+	.loc	1 202 10                        ; amd_ikbo_fa_accuracy_debug.py:202:10
+	v_mfma_f32_16x16x32_f16 v[40:43], v[78:81], v[70:73], v[40:43]
+	.loc	1 109 34                        ; amd_ikbo_fa_accuracy_debug.py:109:34
+	v_or_b32_e32 v48, 3, v34
+	v_or_b32_e32 v49, 2, v34
+	v_or_b32_e32 v50, 17, v34
+	v_or_b32_e32 v52, 16, v34
+	v_or_b32_e32 v53, 19, v34
+	v_or_b32_e32 v54, 18, v34
+	.loc	1 117 11                        ; amd_ikbo_fa_accuracy_debug.py:117:11
+	v_and_b32_e32 v34, 16, v57
+	v_lshrrev_b32_e32 v38, 2, v57
+	.loc	1 119 30                        ; amd_ikbo_fa_accuracy_debug.py:119:30
+	v_cmp_gt_i64_e64 s[0:1], s[10:11], v[32:33]
+	.loc	1 199 13                        ; amd_ikbo_fa_accuracy_debug.py:199:13
+	v_add_u32_e32 v33, s7, v37
+	.loc	1 117 11                        ; amd_ikbo_fa_accuracy_debug.py:117:11
+	v_and_or_b32 v34, v38, 8, v34
+	.loc	1 197 14                        ; amd_ikbo_fa_accuracy_debug.py:197:14
+	ds_read_b128 v[78:81], v36 offset:640
+	ds_read_b128 v[90:93], v36 offset:704
+	.loc	1 199 13                        ; amd_ikbo_fa_accuracy_debug.py:199:13
+	v_add3_u32 v33, v33, v39, v35
+	.loc	1 202 10                        ; amd_ikbo_fa_accuracy_debug.py:202:10
+	v_mfma_f32_16x16x32_f16 v[36:39], v[82:85], v[62:65], v[40:43]
+	.loc	1 201 15                        ; amd_ikbo_fa_accuracy_debug.py:201:15
+	v_or_b32_e32 v46, 1, v44
+	v_mov_b32_e32 v47, s5
+	.loc	1 199 13                        ; amd_ikbo_fa_accuracy_debug.py:199:13
+	ds_read_b64_tr_b16 v[82:83], v33 offset:16864
+	ds_read_b64_tr_b16 v[94:95], v33 offset:16896
+	ds_read_b64_tr_b16 v[98:99], v33 offset:16928
+	ds_read_b64_tr_b16 v[102:103], v33 offset:16960
+	.loc	1 202 10                        ; amd_ikbo_fa_accuracy_debug.py:202:10
+	s_waitcnt lgkmcnt(7)
+	v_mfma_f32_16x16x32_f16 v[40:43], v[58:61], v[74:77], 0
+	.loc	1 199 13                        ; amd_ikbo_fa_accuracy_debug.py:199:13
+	ds_read_b64_tr_b16 v[84:85], v33 offset:17376
+	ds_read_b64_tr_b16 v[96:97], v33 offset:17408
+	ds_read_b64_tr_b16 v[100:101], v33 offset:17440
+	ds_read_b64_tr_b16 v[104:105], v33 offset:17472
+	.loc	1 201 15                        ; amd_ikbo_fa_accuracy_debug.py:201:15
+	v_mov_b32_e32 v45, s5
+	.loc	1 203 19                        ; amd_ikbo_fa_accuracy_debug.py:203:19
+	v_cmp_gt_i64_e32 vcc, s[8:9], v[46:47]
+	.loc	1 202 10                        ; amd_ikbo_fa_accuracy_debug.py:202:10
+	s_waitcnt lgkmcnt(10)
+	v_mfma_f32_16x16x32_f16 v[40:43], v[86:89], v[66:69], v[40:43]
+	.loc	1 199 13                        ; amd_ikbo_fa_accuracy_debug.py:199:13
+	ds_read_b64_tr_b16 v[58:59], v33 offset:16992
+	ds_read_b64_tr_b16 v[66:67], v33 offset:17024
+	ds_read_b64_tr_b16 v[74:75], v33 offset:17056
+	ds_read_b64_tr_b16 v[86:87], v33 offset:17088
+	ds_read_b64_tr_b16 v[60:61], v33 offset:17504
+	ds_read_b64_tr_b16 v[68:69], v33 offset:17536
+	ds_read_b64_tr_b16 v[76:77], v33 offset:17568
+	ds_read_b64_tr_b16 v[88:89], v33 offset:17600
+	.loc	1 203 10                        ; amd_ikbo_fa_accuracy_debug.py:203:10
+	v_mov_b32_e32 v33, 0xd01502f9
+	.loc	1 202 10                        ; amd_ikbo_fa_accuracy_debug.py:202:10
+	s_waitcnt lgkmcnt(14)
+	v_mfma_f32_16x16x32_f16 v[40:43], v[78:81], v[70:73], v[40:43]
+	.loc	1 203 10                        ; amd_ikbo_fa_accuracy_debug.py:203:10
+	v_cndmask_b32_e32 v37, v33, v37, vcc
+	.loc	1 203 19 is_stmt 0              ; amd_ikbo_fa_accuracy_debug.py:203:19
+	v_cmp_gt_i64_e32 vcc, s[8:9], v[44:45]
+.Ltmp25:
+	.loc	2 170 12 is_stmt 1              ; standard.py:170:12 @[ standard.py:191:16 @[ amd_ikbo_fa_accuracy_debug.py:204:28 ] ]
+	v_max_f32_e32 v35, v37, v37
+.Ltmp26:
+	.loc	1 202 10                        ; amd_ikbo_fa_accuracy_debug.py:202:10
+	v_mfma_f32_16x16x32_f16 v[40:43], v[90:93], v[62:65], v[40:43]
+	.loc	1 203 10                        ; amd_ikbo_fa_accuracy_debug.py:203:10
+	v_cndmask_b32_e32 v36, v33, v36, vcc
+.Ltmp27:
+	.loc	2 170 12                        ; standard.py:170:12 @[ standard.py:191:16 @[ amd_ikbo_fa_accuracy_debug.py:204:28 ] ]
+	v_max_f32_e32 v44, v36, v36
+	v_max_f32_e32 v35, v44, v35
+.Ltmp28:
+	.loc	1 201 15                        ; amd_ikbo_fa_accuracy_debug.py:201:15
+	v_or_b32_e32 v44, s4, v48
+	v_or_b32_e32 v46, s4, v49
+	.loc	1 203 19                        ; amd_ikbo_fa_accuracy_debug.py:203:19
+	v_cmp_gt_i64_e32 vcc, s[8:9], v[44:45]
+	.loc	1 201 15                        ; amd_ikbo_fa_accuracy_debug.py:201:15
+	v_or_b32_e32 v44, s4, v50
+	.loc	1 194 5                         ; amd_ikbo_fa_accuracy_debug.py:194:5
+	s_mov_b32 s23, s22
+	.loc	1 203 10                        ; amd_ikbo_fa_accuracy_debug.py:203:10
+	v_cndmask_b32_e32 v39, v33, v39, vcc
+	.loc	1 203 19 is_stmt 0              ; amd_ikbo_fa_accuracy_debug.py:203:19
+	v_cmp_gt_i64_e32 vcc, s[8:9], v[46:47]
+	.loc	1 201 15 is_stmt 1              ; amd_ikbo_fa_accuracy_debug.py:201:15
+	v_or_b32_e32 v46, s4, v52
+	.loc	1 203 10                        ; amd_ikbo_fa_accuracy_debug.py:203:10
+	s_nop 0
+	v_cndmask_b32_e32 v38, v33, v38, vcc
+	.loc	1 203 19 is_stmt 0              ; amd_ikbo_fa_accuracy_debug.py:203:19
+	v_cmp_gt_i64_e32 vcc, s[8:9], v[44:45]
+	.loc	1 203 10                        ; amd_ikbo_fa_accuracy_debug.py:203:10
+	s_nop 1
+	v_cndmask_b32_e32 v41, v33, v41, vcc
+	.loc	1 203 19                        ; amd_ikbo_fa_accuracy_debug.py:203:19
+	v_cmp_gt_i64_e32 vcc, s[8:9], v[46:47]
+	.loc	1 201 15 is_stmt 1              ; amd_ikbo_fa_accuracy_debug.py:201:15
+	v_or_b32_e32 v46, s4, v54
+	.loc	1 203 10                        ; amd_ikbo_fa_accuracy_debug.py:203:10
+	s_nop 0
+	v_cndmask_b32_e32 v40, v33, v40, vcc
+.Ltmp29:
+	.loc	2 170 12                        ; standard.py:170:12 @[ standard.py:191:16 @[ amd_ikbo_fa_accuracy_debug.py:204:28 ] ]
+	v_max3_f32 v44, v39, v40, v41
+	v_max3_f32 v35, v35, v38, v44
+.Ltmp30:
+	.loc	1 201 15                        ; amd_ikbo_fa_accuracy_debug.py:201:15
+	v_or_b32_e32 v44, s4, v53
+	.loc	1 203 19                        ; amd_ikbo_fa_accuracy_debug.py:203:19
+	v_cmp_gt_i64_e32 vcc, s[8:9], v[44:45]
+	.loc	1 203 10 is_stmt 0              ; amd_ikbo_fa_accuracy_debug.py:203:10
+	s_nop 1
+	v_cndmask_b32_e32 v43, v33, v43, vcc
+	.loc	1 203 19                        ; amd_ikbo_fa_accuracy_debug.py:203:19
+	v_cmp_gt_i64_e32 vcc, s[8:9], v[46:47]
+	.loc	1 203 10                        ; amd_ikbo_fa_accuracy_debug.py:203:10
+	s_nop 1
+	v_cndmask_b32_e32 v42, v33, v42, vcc
+.Ltmp31:
+	.loc	2 170 12 is_stmt 1              ; standard.py:170:12 @[ standard.py:191:16 @[ amd_ikbo_fa_accuracy_debug.py:204:28 ] ]
+	v_max3_f32 v33, v35, v42, v43
+.Ltmp32:
+	.loc	2 191 16                        ; standard.py:191:16 @[ amd_ikbo_fa_accuracy_debug.py:204:28 ]
+	v_mov_b32_e32 v35, v33
+	s_nop 1
+	v_permlane32_swap_b32_e32 v33, v35
+.Ltmp33:
+	.loc	2 170 12                        ; standard.py:170:12 @[ standard.py:191:16 @[ amd_ikbo_fa_accuracy_debug.py:204:28 ] ]
+	v_max_f32_e32 v35, v35, v35
+	v_max_f32_e32 v33, v33, v33
+	v_max_f32_e32 v33, v33, v35
+.Ltmp34:
+	.loc	2 191 16                        ; standard.py:191:16 @[ amd_ikbo_fa_accuracy_debug.py:204:28 ]
+	v_mov_b32_e32 v35, v33
+	s_nop 1
+	v_permlane16_swap_b32_e32 v33, v35
+.Ltmp35:
+	.loc	2 170 12                        ; standard.py:170:12 @[ standard.py:191:16 @[ amd_ikbo_fa_accuracy_debug.py:204:28 ] ]
+	v_max_f32_e32 v35, v35, v35
+	v_max_f32_e32 v33, v33, v33
+	v_max_f32_e32 v33, v33, v35
+.Ltmp36:
+	.loc	1 204 28                        ; amd_ikbo_fa_accuracy_debug.py:204:28
+	v_mul_f32_e32 v33, s22, v33
+	.loc	1 204 12 is_stmt 0              ; amd_ikbo_fa_accuracy_debug.py:204:12
+	v_max_f32_e32 v35, v56, v56
+	v_max_f32_e32 v44, v35, v33
+	.loc	1 205 10 is_stmt 1              ; amd_ikbo_fa_accuracy_debug.py:205:10
+	v_pk_fma_f32 v[36:37], s[22:23], v[36:37], v[44:45] op_sel_hi:[1,1,0] neg_lo:[0,0,1] neg_hi:[0,0,1]
+	v_pk_fma_f32 v[38:39], s[22:23], v[38:39], v[44:45] op_sel_hi:[1,1,0] neg_lo:[0,0,1] neg_hi:[0,0,1]
+	v_pk_fma_f32 v[40:41], s[22:23], v[40:41], v[44:45] op_sel_hi:[1,1,0] neg_lo:[0,0,1] neg_hi:[0,0,1]
+	v_pk_fma_f32 v[42:43], s[22:23], v[42:43], v[44:45] op_sel_hi:[1,1,0] neg_lo:[0,0,1] neg_hi:[0,0,1]
+	.loc	1 206 9                         ; amd_ikbo_fa_accuracy_debug.py:206:9
+	v_exp_f32_e32 v36, v36
+	v_exp_f32_e32 v37, v37
+	v_exp_f32_e32 v38, v38
+	v_exp_f32_e32 v39, v39
+	v_exp_f32_e32 v40, v40
+	v_exp_f32_e32 v41, v41
+	v_exp_f32_e32 v42, v42
+	v_exp_f32_e32 v43, v43
+.Ltmp37:
+	.loc	2 293 12                        ; standard.py:293:12 @[ amd_ikbo_fa_accuracy_debug.py:208:12 ]
+	v_pk_add_f32 v[46:47], v[36:37], v[38:39]
+.Ltmp38:
+	.loc	1 207 26                        ; amd_ikbo_fa_accuracy_debug.py:207:26
+	v_sub_f32_e32 v33, v56, v44
+	.loc	1 207 13 is_stmt 0              ; amd_ikbo_fa_accuracy_debug.py:207:13
+	v_exp_f32_e32 v44, v33
+.Ltmp39:
+	.loc	2 293 12 is_stmt 1              ; standard.py:293:12 @[ amd_ikbo_fa_accuracy_debug.py:208:12 ]
+	v_pk_add_f32 v[48:49], v[40:41], v[42:43]
+.Ltmp40:
+	.loc	1 212 18                        ; amd_ikbo_fa_accuracy_debug.py:212:18
+	v_cvt_pk_f16_f32 v36, v36, v37
+.Ltmp41:
+	.loc	2 293 12                        ; standard.py:293:12 @[ amd_ikbo_fa_accuracy_debug.py:208:12 ]
+	v_pk_add_f32 v[46:47], v[46:47], v[48:49]
+.Ltmp42:
+	.loc	1 209 11                        ; amd_ikbo_fa_accuracy_debug.py:209:11
+	v_pk_mul_f32 v[28:29], v[28:29], v[44:45] op_sel_hi:[1,0]
+.Ltmp43:
+	.loc	2 263 12                        ; standard.py:263:12 @[ standard.py:293:12 @[ amd_ikbo_fa_accuracy_debug.py:208:12 ] ]
+	v_add_f32_e32 v33, v46, v47
+.Ltmp44:
+	.loc	2 293 12                        ; standard.py:293:12 @[ amd_ikbo_fa_accuracy_debug.py:208:12 ]
+	v_mov_b32_e32 v35, v33
+	s_nop 1
+	v_permlane32_swap_b32_e32 v33, v35
+.Ltmp45:
+	.loc	2 263 12                        ; standard.py:263:12 @[ standard.py:293:12 @[ amd_ikbo_fa_accuracy_debug.py:208:12 ] ]
+	v_add_f32_e32 v33, v33, v35
+.Ltmp46:
+	.loc	2 293 12                        ; standard.py:293:12 @[ amd_ikbo_fa_accuracy_debug.py:208:12 ]
+	v_mov_b32_e32 v35, v33
+	s_nop 1
+	v_permlane16_swap_b32_e32 v33, v35
+.Ltmp47:
+	.loc	2 263 12                        ; standard.py:263:12 @[ standard.py:293:12 @[ amd_ikbo_fa_accuracy_debug.py:208:12 ] ]
+	v_add_f32_e32 v33, v33, v35
+.Ltmp48:
+	.loc	1 210 11                        ; amd_ikbo_fa_accuracy_debug.py:210:11
+	v_fmac_f32_e32 v33, v51, v44
+	.loc	1 213 14                        ; amd_ikbo_fa_accuracy_debug.py:213:14
+	v_div_scale_f32 v35, s[4:5], v33, v33, 1.0
+	.loc	1 209 11                        ; amd_ikbo_fa_accuracy_debug.py:209:11
+	v_pk_mul_f32 v[30:31], v[30:31], v[44:45] op_sel_hi:[1,0]
+	v_pk_mul_f32 v[24:25], v[24:25], v[44:45] op_sel_hi:[1,0]
+	v_pk_mul_f32 v[26:27], v[26:27], v[44:45] op_sel_hi:[1,0]
+	v_pk_mul_f32 v[20:21], v[20:21], v[44:45] op_sel_hi:[1,0]
+	v_pk_mul_f32 v[22:23], v[22:23], v[44:45] op_sel_hi:[1,0]
+	v_pk_mul_f32 v[16:17], v[16:17], v[44:45] op_sel_hi:[1,0]
+	v_pk_mul_f32 v[18:19], v[18:19], v[44:45] op_sel_hi:[1,0]
+	v_pk_mul_f32 v[12:13], v[12:13], v[44:45] op_sel_hi:[1,0]
+	v_pk_mul_f32 v[14:15], v[14:15], v[44:45] op_sel_hi:[1,0]
+	v_pk_mul_f32 v[8:9], v[8:9], v[44:45] op_sel_hi:[1,0]
+	v_pk_mul_f32 v[10:11], v[10:11], v[44:45] op_sel_hi:[1,0]
+	v_pk_mul_f32 v[4:5], v[4:5], v[44:45] op_sel_hi:[1,0]
+	v_pk_mul_f32 v[6:7], v[6:7], v[44:45] op_sel_hi:[1,0]
+	.loc	1 213 14                        ; amd_ikbo_fa_accuracy_debug.py:213:14
+	v_rcp_f32_e32 v45, v35
+	.loc	1 212 18                        ; amd_ikbo_fa_accuracy_debug.py:212:18
+	v_cvt_pk_f16_f32 v37, v38, v39
+	v_cvt_pk_f16_f32 v38, v40, v41
+	v_cvt_pk_f16_f32 v39, v42, v43
+	.loc	1 209 11                        ; amd_ikbo_fa_accuracy_debug.py:209:11
+	v_pk_mul_f32 v[40:41], v[0:1], v[44:45] op_sel_hi:[1,0]
+	v_pk_mul_f32 v[42:43], v[2:3], v[44:45] op_sel_hi:[1,0]
+	.loc	1 212 11                        ; amd_ikbo_fa_accuracy_debug.py:212:11
+	s_waitcnt lgkmcnt(2)
+	v_mfma_f32_16x16x32_f16 v[0:3], v[66:69], v[36:39], v[8:11]
+	.loc	1 213 14                        ; amd_ikbo_fa_accuracy_debug.py:213:14
+	s_nop 2
+	v_fma_f32 v8, -v35, v45, 1.0
+	v_fmac_f32_e32 v45, v8, v45
+	v_div_scale_f32 v8, vcc, 1.0, v33, 1.0
+	v_mul_f32_e32 v9, v8, v45
+	v_fma_f32 v10, -v35, v9, v8
+	.loc	1 212 11                        ; amd_ikbo_fa_accuracy_debug.py:212:11
+	v_mfma_f32_16x16x32_f16 v[28:31], v[82:85], v[36:39], v[28:31]
+	.loc	1 213 14                        ; amd_ikbo_fa_accuracy_debug.py:213:14
+	v_fmac_f32_e32 v9, v10, v45
+	v_fma_f32 v8, -v35, v9, v8
+	v_div_fmas_f32 v8, v8, v45, v9
+	.loc	1 212 11                        ; amd_ikbo_fa_accuracy_debug.py:212:11
+	v_mfma_f32_16x16x32_f16 v[24:27], v[94:97], v[36:39], v[24:27]
+	.loc	1 213 14                        ; amd_ikbo_fa_accuracy_debug.py:213:14
+	v_div_fixup_f32 v33, v8, v33, 1.0
+	.loc	1 214 5                         ; amd_ikbo_fa_accuracy_debug.py:214:5
+	s_nop 2
+	v_mul_f32_e32 v8, v28, v33
+	v_mul_f32_e32 v9, v29, v33
+	.loc	1 212 11                        ; amd_ikbo_fa_accuracy_debug.py:212:11
+	v_mfma_f32_16x16x32_f16 v[20:23], v[98:101], v[36:39], v[20:23]
+	.loc	1 215 20                        ; amd_ikbo_fa_accuracy_debug.py:215:20
+	v_cmp_gt_i64_e64 vcc, s[8:9], 0
+	.loc	1 214 5                         ; amd_ikbo_fa_accuracy_debug.py:214:5
+	v_mul_f32_e32 v24, v24, v33
+	v_mul_f32_e32 v25, v25, v33
+	.loc	1 212 11                        ; amd_ikbo_fa_accuracy_debug.py:212:11
+	v_mfma_f32_16x16x32_f16 v[12:15], v[58:61], v[36:39], v[12:15]
+	.loc	1 214 5                         ; amd_ikbo_fa_accuracy_debug.py:214:5
+	v_mul_f32_e32 v10, v30, v33
+	v_mul_f32_e32 v11, v31, v33
+	v_mul_f32_e32 v26, v26, v33
+	.loc	1 212 11                        ; amd_ikbo_fa_accuracy_debug.py:212:11
+	s_waitcnt lgkmcnt(1)
+	v_mfma_f32_16x16x32_f16 v[4:7], v[74:77], v[36:39], v[4:7]
+	.loc	1 214 5                         ; amd_ikbo_fa_accuracy_debug.py:214:5
+	v_mul_f32_e32 v27, v27, v33
+	v_mul_f32_e32 v20, v20, v33
+	v_mul_f32_e32 v21, v21, v33
+	v_mul_f32_e32 v22, v22, v33
+	v_mul_f32_e32 v23, v23, v33
+	v_mul_f32_e32 v12, v12, v33
+	v_mul_f32_e32 v13, v13, v33
+	v_mul_f32_e32 v28, v14, v33
+	v_mul_f32_e32 v14, v0, v33
+	v_mul_f32_e32 v1, v1, v33
+	v_mul_f32_e32 v30, v2, v33
+	v_mul_f32_e32 v31, v3, v33
+	.loc	1 215 11                        ; amd_ikbo_fa_accuracy_debug.py:215:11
+	v_cndmask_b32_e32 v0, 0, v8, vcc
+	v_cndmask_b32_e32 v2, 0, v9, vcc
+	v_cndmask_b32_e32 v3, 0, v24, vcc
+	v_cndmask_b32_e32 v8, 0, v25, vcc
+	.loc	1 212 11                        ; amd_ikbo_fa_accuracy_debug.py:212:11
+	v_mfma_f32_16x16x32_f16 v[16:19], v[102:105], v[36:39], v[16:19]
+	.loc	1 214 5                         ; amd_ikbo_fa_accuracy_debug.py:214:5
+	v_mul_f32_e32 v29, v15, v33
+	.loc	1 225 9                         ; amd_ikbo_fa_accuracy_debug.py:225:9
+	v_cvt_pk_f16_f32 v0, v0, v2
+	v_cvt_pk_f16_f32 v2, v3, v8
+	.loc	1 214 5                         ; amd_ikbo_fa_accuracy_debug.py:214:5
+	v_mul_f32_e32 v24, v4, v33
+	v_mul_f32_e32 v25, v6, v33
+	.loc	1 215 11                        ; amd_ikbo_fa_accuracy_debug.py:215:11
+	v_cndmask_b32_e32 v3, 0, v10, vcc
+	v_cndmask_b32_e32 v4, 0, v11, vcc
+	v_cndmask_b32_e32 v6, 0, v26, vcc
+	v_cndmask_b32_e32 v8, 0, v27, vcc
+	v_cndmask_b32_e32 v9, 0, v20, vcc
+	v_cndmask_b32_e32 v10, 0, v21, vcc
+	v_cndmask_b32_e32 v11, 0, v22, vcc
+	v_cndmask_b32_e32 v15, 0, v23, vcc
+	v_cndmask_b32_e32 v12, 0, v12, vcc
+	v_cndmask_b32_e32 v13, 0, v13, vcc
+	v_cndmask_b32_e32 v14, 0, v14, vcc
+	v_cndmask_b32_e32 v20, 0, v1, vcc
+	.loc	1 225 9                         ; amd_ikbo_fa_accuracy_debug.py:225:9
+	v_cvt_pk_f16_f32 v1, v3, v4
+	v_cvt_pk_f16_f32 v3, v6, v8
+	v_cvt_pk_f16_f32 v8, v9, v10
+	v_cvt_pk_f16_f32 v9, v11, v15
+	v_cvt_pk_f16_f32 v4, v12, v13
+	v_cvt_pk_f16_f32 v6, v14, v20
+	.loc	1 212 11                        ; amd_ikbo_fa_accuracy_debug.py:212:11
+	s_waitcnt lgkmcnt(0)
+	v_mfma_f32_16x16x32_f16 v[12:15], v[86:89], v[36:39], v[40:43]
+	.loc	1 214 5                         ; amd_ikbo_fa_accuracy_debug.py:214:5
+	v_mul_f32_e32 v16, v16, v33
+	v_mul_f32_e32 v17, v17, v33
+	v_mul_f32_e32 v18, v18, v33
+	v_mul_f32_e32 v19, v19, v33
+	v_mul_f32_e32 v5, v5, v33
+	v_mul_f32_e32 v7, v7, v33
+	.loc	1 215 11                        ; amd_ikbo_fa_accuracy_debug.py:215:11
+	v_cndmask_b32_e32 v16, 0, v16, vcc
+	v_cndmask_b32_e32 v17, 0, v17, vcc
+	v_cndmask_b32_e32 v18, 0, v18, vcc
+	v_cndmask_b32_e32 v19, 0, v19, vcc
+	.loc	1 214 5                         ; amd_ikbo_fa_accuracy_debug.py:214:5
+	v_mul_f32_e32 v12, v33, v12
+	v_mul_f32_e32 v13, v33, v13
+	v_mul_f32_e32 v14, v33, v14
+	v_mul_f32_e32 v15, v33, v15
+	.loc	1 215 11                        ; amd_ikbo_fa_accuracy_debug.py:215:11
+	v_cndmask_b32_e32 v21, 0, v5, vcc
+	.loc	1 218 9                         ; amd_ikbo_fa_accuracy_debug.py:218:9
+	v_add_u32_e32 v5, s20, v32
+	.loc	1 225 9                         ; amd_ikbo_fa_accuracy_debug.py:225:9
+	v_cvt_pk_f16_f32 v10, v16, v17
+	v_cvt_pk_f16_f32 v11, v18, v19
+	.loc	1 215 11                        ; amd_ikbo_fa_accuracy_debug.py:215:11
+	v_cndmask_b32_e32 v16, 0, v28, vcc
+	v_cndmask_b32_e32 v17, 0, v29, vcc
+	v_cndmask_b32_e32 v18, 0, v30, vcc
+	v_cndmask_b32_e32 v19, 0, v31, vcc
+	v_cndmask_b32_e32 v20, 0, v24, vcc
+	v_cndmask_b32_e32 v22, 0, v25, vcc
+	v_cndmask_b32_e32 v23, 0, v7, vcc
+	v_cndmask_b32_e32 v24, 0, v12, vcc
+	v_cndmask_b32_e32 v25, 0, v13, vcc
+	v_cndmask_b32_e32 v26, 0, v14, vcc
+	v_cndmask_b32_e32 v15, 0, v15, vcc
+	.loc	1 218 9                         ; amd_ikbo_fa_accuracy_debug.py:218:9
+	v_mul_lo_u32 v12, v5, s2
+	.loc	1 219 11                        ; amd_ikbo_fa_accuracy_debug.py:219:11
+	s_mul_i32 s2, s3, s18
+	.loc	1 225 9                         ; amd_ikbo_fa_accuracy_debug.py:225:9
+	v_cvt_pk_f16_f32 v5, v16, v17
+	v_cvt_pk_f16_f32 v7, v18, v19
+	.loc	1 218 9                         ; amd_ikbo_fa_accuracy_debug.py:218:9
+	v_add_u32_e32 v16, s2, v12
+	.loc	1 226 47                        ; amd_ikbo_fa_accuracy_debug.py:226:47
+	v_cmp_gt_i32_e32 vcc, s6, v34
+	.loc	1 225 9                         ; amd_ikbo_fa_accuracy_debug.py:225:9
+	v_cvt_pk_f16_f32 v12, v20, v21
+	v_cvt_pk_f16_f32 v13, v22, v23
+	v_cvt_pk_f16_f32 v14, v24, v25
+	v_cvt_pk_f16_f32 v15, v26, v15
+	v_permlane16_swap_b32_e32 v0, v2
+	v_permlane16_swap_b32_e32 v1, v3
+	v_permlane16_swap_b32_e32 v8, v10
+	v_permlane16_swap_b32_e32 v9, v11
+	v_permlane16_swap_b32_e32 v4, v6
+	v_permlane16_swap_b32_e32 v5, v7
+	v_permlane16_swap_b32_e32 v12, v14
+	.loc	1 226 14                        ; amd_ikbo_fa_accuracy_debug.py:226:14
+	s_and_b64 s[4:5], vcc, s[0:1]
+	.loc	1 225 9                         ; amd_ikbo_fa_accuracy_debug.py:225:9
+	v_permlane16_swap_b32_e32 v13, v15
+	.loc	1 223 5                         ; amd_ikbo_fa_accuracy_debug.py:223:5
+	s_and_saveexec_b64 s[2:3], s[4:5]
+	s_cbranch_execz .LBB0_82
+; %bb.81:
+	.loc	1 218 9                         ; amd_ikbo_fa_accuracy_debug.py:218:9
+	v_add_u32_e32 v18, v16, v34
+	.loc	1 223 5                         ; amd_ikbo_fa_accuracy_debug.py:223:5
+	v_ashrrev_i32_e32 v19, 31, v18
+	v_lshl_add_u64 v[18:19], v[18:19], 1, s[14:15]
+	global_store_dwordx4 v[18:19], v[0:3], off
+.LBB0_82:
+	.loc	1 0 5 is_stmt 0                 ; amd_ikbo_fa_accuracy_debug.py:0:5
+	s_or_b64 exec, exec, s[2:3]
+	.loc	1 117 11 is_stmt 1              ; amd_ikbo_fa_accuracy_debug.py:117:11
+	s_nop 0
+	v_or_b32_e32 v0, 32, v34
+	.loc	1 226 47                        ; amd_ikbo_fa_accuracy_debug.py:226:47
+	v_cmp_gt_i32_e32 vcc, s6, v0
+	.loc	1 226 14 is_stmt 0              ; amd_ikbo_fa_accuracy_debug.py:226:14
+	s_and_b64 s[4:5], vcc, s[0:1]
+	.loc	1 223 5 is_stmt 1               ; amd_ikbo_fa_accuracy_debug.py:223:5
+	s_and_saveexec_b64 s[2:3], s[4:5]
+	s_cbranch_execz .LBB0_84
+; %bb.83:
+	.loc	1 218 9                         ; amd_ikbo_fa_accuracy_debug.py:218:9
+	v_add_u32_e32 v0, v16, v0
+	.loc	1 223 5                         ; amd_ikbo_fa_accuracy_debug.py:223:5
+	v_ashrrev_i32_e32 v1, 31, v0
+	v_lshl_add_u64 v[0:1], v[0:1], 1, s[14:15]
+	global_store_dwordx4 v[0:1], v[8:11], off
+.LBB0_84:
+	.loc	1 0 5 is_stmt 0                 ; amd_ikbo_fa_accuracy_debug.py:0:5
+	s_or_b64 exec, exec, s[2:3]
+	.loc	1 117 11 is_stmt 1              ; amd_ikbo_fa_accuracy_debug.py:117:11
+	v_or_b32_e32 v0, 64, v34
+	.loc	1 226 47                        ; amd_ikbo_fa_accuracy_debug.py:226:47
+	v_cmp_gt_i32_e32 vcc, s6, v0
+	.loc	1 226 14 is_stmt 0              ; amd_ikbo_fa_accuracy_debug.py:226:14
+	s_and_b64 s[4:5], vcc, s[0:1]
+	.loc	1 223 5 is_stmt 1               ; amd_ikbo_fa_accuracy_debug.py:223:5
+	s_and_saveexec_b64 s[2:3], s[4:5]
+	s_cbranch_execz .LBB0_86
+; %bb.85:
+	.loc	1 218 9                         ; amd_ikbo_fa_accuracy_debug.py:218:9
+	v_add_u32_e32 v0, v16, v0
+	.loc	1 223 5                         ; amd_ikbo_fa_accuracy_debug.py:223:5
+	v_ashrrev_i32_e32 v1, 31, v0
+	v_lshl_add_u64 v[0:1], v[0:1], 1, s[14:15]
+	global_store_dwordx4 v[0:1], v[4:7], off
+.LBB0_86:
+	.loc	1 0 5 is_stmt 0                 ; amd_ikbo_fa_accuracy_debug.py:0:5
+	s_or_b64 exec, exec, s[2:3]
+	.loc	1 117 11 is_stmt 1              ; amd_ikbo_fa_accuracy_debug.py:117:11
+	v_or_b32_e32 v0, 0x60, v34
+	.loc	1 226 47                        ; amd_ikbo_fa_accuracy_debug.py:226:47
+	v_cmp_gt_i32_e32 vcc, s6, v0
+	.loc	1 226 14 is_stmt 0              ; amd_ikbo_fa_accuracy_debug.py:226:14
+	s_and_b64 s[0:1], vcc, s[0:1]
+	.loc	1 223 5 is_stmt 1               ; amd_ikbo_fa_accuracy_debug.py:223:5
+	s_and_saveexec_b64 s[2:3], s[0:1]
+	s_xor_b64 s[2:3], exec, s[2:3]
+	s_cbranch_execz .LBB0_88
+; %bb.87:
+	.loc	1 218 9                         ; amd_ikbo_fa_accuracy_debug.py:218:9
+	v_add_u32_e32 v0, v16, v0
+	.loc	1 223 5                         ; amd_ikbo_fa_accuracy_debug.py:223:5
+	v_ashrrev_i32_e32 v1, 31, v0
+	v_lshl_add_u64 v[0:1], v[0:1], 1, s[14:15]
+	global_store_dwordx4 v[0:1], v[12:15], off
+.LBB0_88:                               ; %common.ret
+	.loc	1 0 0 is_stmt 0                 ; amd_ikbo_fa_accuracy_debug.py:0
+	s_endpgm
+.Ltmp49:
+.Lfunc_end0:
+	.size	_attn_fwd_jagged_tlx, .Lfunc_end0-_attn_fwd_jagged_tlx
+	.cfi_endproc
+	.section	.rodata,"a",@progbits
+	.p2align	6, 0x0
+	.amdhsa_kernel _attn_fwd_jagged_tlx
+		.amdhsa_group_segment_fixed_size 0
+		.amdhsa_private_segment_fixed_size 0
+		.amdhsa_kernarg_size 368
+		.amdhsa_user_sgpr_count 16
+		.amdhsa_user_sgpr_dispatch_ptr 1
+		.amdhsa_user_sgpr_queue_ptr 1
+		.amdhsa_user_sgpr_kernarg_segment_ptr 1
+		.amdhsa_user_sgpr_dispatch_id 1
+		.amdhsa_user_sgpr_kernarg_preload_length 8
+		.amdhsa_user_sgpr_kernarg_preload_offset 0
+		.amdhsa_user_sgpr_private_segment_size 0
+		.amdhsa_uses_dynamic_stack 0
+		.amdhsa_enable_private_segment 0
+		.amdhsa_system_sgpr_workgroup_id_x 1
+		.amdhsa_system_sgpr_workgroup_id_y 1
+		.amdhsa_system_sgpr_workgroup_id_z 1
+		.amdhsa_system_sgpr_workgroup_info 0
+		.amdhsa_system_vgpr_workitem_id 2
+		.amdhsa_next_free_vgpr 148
+		.amdhsa_next_free_sgpr 41
+		.amdhsa_accum_offset 148
+		.amdhsa_reserve_vcc 1
+		.amdhsa_reserve_xnack_mask 1
+		.amdhsa_float_round_mode_32 0
+		.amdhsa_float_round_mode_16_64 0
+		.amdhsa_float_denorm_mode_32 3
+		.amdhsa_float_denorm_mode_16_64 3
+		.amdhsa_dx10_clamp 1
+		.amdhsa_ieee_mode 1
+		.amdhsa_fp16_overflow 0
+		.amdhsa_tg_split 0
+		.amdhsa_exception_fp_ieee_invalid_op 0
+		.amdhsa_exception_fp_denorm_src 0
+		.amdhsa_exception_fp_ieee_div_zero 0
+		.amdhsa_exception_fp_ieee_overflow 0
+		.amdhsa_exception_fp_ieee_underflow 0
+		.amdhsa_exception_fp_ieee_inexact 0
+		.amdhsa_exception_int_div_zero 0
+	.end_amdhsa_kernel
+	.text
+                                        ; -- End function
+	.set .L_attn_fwd_jagged_tlx.num_vgpr, 148
+	.set .L_attn_fwd_jagged_tlx.num_agpr, 0
+	.set .L_attn_fwd_jagged_tlx.numbered_sgpr, 41
+	.set .L_attn_fwd_jagged_tlx.num_named_barrier, 0
+	.set .L_attn_fwd_jagged_tlx.private_seg_size, 0
+	.set .L_attn_fwd_jagged_tlx.uses_vcc, 1
+	.set .L_attn_fwd_jagged_tlx.uses_flat_scratch, 0
+	.set .L_attn_fwd_jagged_tlx.has_dyn_sized_stack, 0
+	.set .L_attn_fwd_jagged_tlx.has_recursion, 0
+	.set .L_attn_fwd_jagged_tlx.has_indirect_call, 0
+	.section	.AMDGPU.csdata,"",@progbits
+; Kernel info:
+; codeLenInByte = 6748
+; TotalNumSgprs: 47
+; NumVgprs: 148
+; NumAgprs: 0
+; TotalNumVgprs: 148
+; ScratchSize: 0
+; MemoryBound: 0
+; FloatMode: 240
+; IeeeMode: 1
+; LDSByteSize: 0 bytes/workgroup (compile time only)
+; SGPRBlocks: 5
+; VGPRBlocks: 18
+; NumSGPRsForWavesPerEU: 47
+; NumVGPRsForWavesPerEU: 148
+; AccumOffset: 148
+; Occupancy: 3
+; WaveLimiterHint : 1
+; COMPUTE_PGM_RSRC2:SCRATCH_EN: 0
+; COMPUTE_PGM_RSRC2:USER_SGPR: 16
+; COMPUTE_PGM_RSRC2:TRAP_HANDLER: 0
+; COMPUTE_PGM_RSRC2:TGID_X_EN: 1
+; COMPUTE_PGM_RSRC2:TGID_Y_EN: 1
+; COMPUTE_PGM_RSRC2:TGID_Z_EN: 1
+; COMPUTE_PGM_RSRC2:TIDIG_COMP_CNT: 2
+; COMPUTE_PGM_RSRC3_GFX90A:ACCUM_OFFSET: 36
+; COMPUTE_PGM_RSRC3_GFX90A:TG_SPLIT: 0
+	.text
+	.p2alignl 6, 3212836864
+	.fill 256, 4, 3212836864
+	.section	.AMDGPU.gpr_maximums,"",@progbits
+	.set amdgpu.max_num_vgpr, 0
+	.set amdgpu.max_num_agpr, 0
+	.set amdgpu.max_num_sgpr, 0
+	.set amdgpu.max_num_named_barrier, 0
+	.text
+	.section	.debug_abbrev,"",@progbits
+	.byte	1                               ; Abbreviation Code
+	.byte	17                              ; DW_TAG_compile_unit
+	.byte	1                               ; DW_CHILDREN_yes
+	.byte	37                              ; DW_AT_producer
+	.byte	14                              ; DW_FORM_strp
+	.byte	19                              ; DW_AT_language
+	.byte	5                               ; DW_FORM_data2
+	.byte	3                               ; DW_AT_name
+	.byte	14                              ; DW_FORM_strp
+	.byte	16                              ; DW_AT_stmt_list
+	.byte	23                              ; DW_FORM_sec_offset
+	.byte	27                              ; DW_AT_comp_dir
+	.byte	14                              ; DW_FORM_strp
+	.byte	17                              ; DW_AT_low_pc
+	.byte	1                               ; DW_FORM_addr
+	.byte	18                              ; DW_AT_high_pc
+	.byte	6                               ; DW_FORM_data4
+	.byte	0                               ; EOM(1)
+	.byte	0                               ; EOM(2)
+	.byte	2                               ; Abbreviation Code
+	.byte	46                              ; DW_TAG_subprogram
+	.byte	0                               ; DW_CHILDREN_no
+	.byte	3                               ; DW_AT_name
+	.byte	14                              ; DW_FORM_strp
+	.byte	32                              ; DW_AT_inline
+	.byte	11                              ; DW_FORM_data1
+	.byte	0                               ; EOM(1)
+	.byte	0                               ; EOM(2)
+	.byte	3                               ; Abbreviation Code
+	.byte	46                              ; DW_TAG_subprogram
+	.byte	1                               ; DW_CHILDREN_yes
+	.byte	17                              ; DW_AT_low_pc
+	.byte	1                               ; DW_FORM_addr
+	.byte	18                              ; DW_AT_high_pc
+	.byte	6                               ; DW_FORM_data4
+	.byte	49                              ; DW_AT_abstract_origin
+	.byte	19                              ; DW_FORM_ref4
+	.byte	0                               ; EOM(1)
+	.byte	0                               ; EOM(2)
+	.byte	4                               ; Abbreviation Code
+	.byte	29                              ; DW_TAG_inlined_subroutine
+	.byte	0                               ; DW_CHILDREN_no
+	.byte	49                              ; DW_AT_abstract_origin
+	.byte	19                              ; DW_FORM_ref4
+	.byte	17                              ; DW_AT_low_pc
+	.byte	1                               ; DW_FORM_addr
+	.byte	18                              ; DW_AT_high_pc
+	.byte	6                               ; DW_FORM_data4
+	.byte	88                              ; DW_AT_call_file
+	.byte	11                              ; DW_FORM_data1
+	.byte	89                              ; DW_AT_call_line
+	.byte	11                              ; DW_FORM_data1
+	.byte	87                              ; DW_AT_call_column
+	.byte	11                              ; DW_FORM_data1
+	.byte	0                               ; EOM(1)
+	.byte	0                               ; EOM(2)
+	.byte	5                               ; Abbreviation Code
+	.byte	29                              ; DW_TAG_inlined_subroutine
+	.byte	1                               ; DW_CHILDREN_yes
+	.byte	49                              ; DW_AT_abstract_origin
+	.byte	19                              ; DW_FORM_ref4
+	.byte	17                              ; DW_AT_low_pc
+	.byte	1                               ; DW_FORM_addr
+	.byte	18                              ; DW_AT_high_pc
+	.byte	6                               ; DW_FORM_data4
+	.byte	88                              ; DW_AT_call_file
+	.byte	11                              ; DW_FORM_data1
+	.byte	89                              ; DW_AT_call_line
+	.byte	11                              ; DW_FORM_data1
+	.byte	87                              ; DW_AT_call_column
+	.byte	11                              ; DW_FORM_data1
+	.byte	0                               ; EOM(1)
+	.byte	0                               ; EOM(2)
+	.byte	6                               ; Abbreviation Code
+	.byte	29                              ; DW_TAG_inlined_subroutine
+	.byte	0                               ; DW_CHILDREN_no
+	.byte	49                              ; DW_AT_abstract_origin
+	.byte	19                              ; DW_FORM_ref4
+	.byte	85                              ; DW_AT_ranges
+	.byte	23                              ; DW_FORM_sec_offset
+	.byte	88                              ; DW_AT_call_file
+	.byte	11                              ; DW_FORM_data1
+	.byte	89                              ; DW_AT_call_line
+	.byte	11                              ; DW_FORM_data1
+	.byte	87                              ; DW_AT_call_column
+	.byte	11                              ; DW_FORM_data1
+	.byte	0                               ; EOM(1)
+	.byte	0                               ; EOM(2)
+	.byte	7                               ; Abbreviation Code
+	.byte	29                              ; DW_TAG_inlined_subroutine
+	.byte	1                               ; DW_CHILDREN_yes
+	.byte	49                              ; DW_AT_abstract_origin
+	.byte	19                              ; DW_FORM_ref4
+	.byte	85                              ; DW_AT_ranges
+	.byte	23                              ; DW_FORM_sec_offset
+	.byte	88                              ; DW_AT_call_file
+	.byte	11                              ; DW_FORM_data1
+	.byte	89                              ; DW_AT_call_line
+	.byte	11                              ; DW_FORM_data1
+	.byte	87                              ; DW_AT_call_column
+	.byte	11                              ; DW_FORM_data1
+	.byte	0                               ; EOM(1)
+	.byte	0                               ; EOM(2)
+	.byte	8                               ; Abbreviation Code
+	.byte	29                              ; DW_TAG_inlined_subroutine
+	.byte	0                               ; DW_CHILDREN_no
+	.byte	49                              ; DW_AT_abstract_origin
+	.byte	19                              ; DW_FORM_ref4
+	.byte	85                              ; DW_AT_ranges
+	.byte	23                              ; DW_FORM_sec_offset
+	.byte	88                              ; DW_AT_call_file
+	.byte	11                              ; DW_FORM_data1
+	.byte	89                              ; DW_AT_call_line
+	.byte	5                               ; DW_FORM_data2
+	.byte	87                              ; DW_AT_call_column
+	.byte	11                              ; DW_FORM_data1
+	.byte	0                               ; EOM(1)
+	.byte	0                               ; EOM(2)
+	.byte	0                               ; EOM(3)
+	.section	.debug_info,"",@progbits
+.Lcu_begin0:
+	.long	.Ldebug_info_end0-.Ldebug_info_start0 ; Length of Unit
+.Ldebug_info_start0:
+	.short	4                               ; DWARF version number
+	.long	.debug_abbrev                   ; Offset Into Abbrev. Section
+	.byte	8                               ; Address Size (in bytes)
+	.byte	1                               ; Abbrev [1] 0xb:0xba DW_TAG_compile_unit
+	.long	.Linfo_string0                  ; DW_AT_producer
+	.short	2                               ; DW_AT_language
+	.long	.Linfo_string1                  ; DW_AT_name
+	.long	.Lline_table_start0             ; DW_AT_stmt_list
+	.long	.Linfo_string2                  ; DW_AT_comp_dir
+	.quad	.Lfunc_begin0                   ; DW_AT_low_pc
+	.long	.Lfunc_end0-.Lfunc_begin0       ; DW_AT_high_pc
+	.byte	2                               ; Abbrev [2] 0x2a:0x6 DW_TAG_subprogram
+	.long	.Linfo_string3                  ; DW_AT_name
+	.byte	1                               ; DW_AT_inline
+	.byte	3                               ; Abbrev [3] 0x30:0x94 DW_TAG_subprogram
+	.quad	.Lfunc_begin0                   ; DW_AT_low_pc
+	.long	.Lfunc_end0-.Lfunc_begin0       ; DW_AT_high_pc
+	.long	42                              ; DW_AT_abstract_origin
+	.byte	4                               ; Abbrev [4] 0x41:0x14 DW_TAG_inlined_subroutine
+	.long	42                              ; DW_AT_abstract_origin
+	.quad	.Ltmp2                          ; DW_AT_low_pc
+	.long	.Ltmp3-.Ltmp2                   ; DW_AT_high_pc
+	.byte	1                               ; DW_AT_call_file
+	.byte	157                             ; DW_AT_call_line
+	.byte	14                              ; DW_AT_call_column
+	.byte	5                               ; Abbrev [5] 0x55:0x21 DW_TAG_inlined_subroutine
+	.long	42                              ; DW_AT_abstract_origin
+	.quad	.Ltmp4                          ; DW_AT_low_pc
+	.long	.Ltmp9-.Ltmp4                   ; DW_AT_high_pc
+	.byte	1                               ; DW_AT_call_file
+	.byte	183                             ; DW_AT_call_line
+	.byte	32                              ; DW_AT_call_column
+	.byte	6                               ; Abbrev [6] 0x69:0xc DW_TAG_inlined_subroutine
+	.long	42                              ; DW_AT_abstract_origin
+	.long	.Ldebug_ranges0                 ; DW_AT_ranges
+	.byte	2                               ; DW_AT_call_file
+	.byte	191                             ; DW_AT_call_line
+	.byte	16                              ; DW_AT_call_column
+	.byte	0                               ; End Of Children Mark
+	.byte	7                               ; Abbrev [7] 0x76:0x1a DW_TAG_inlined_subroutine
+	.long	42                              ; DW_AT_abstract_origin
+	.long	.Ldebug_ranges1                 ; DW_AT_ranges
+	.byte	1                               ; DW_AT_call_file
+	.byte	187                             ; DW_AT_call_line
+	.byte	16                              ; DW_AT_call_column
+	.byte	8                               ; Abbrev [8] 0x82:0xd DW_TAG_inlined_subroutine
+	.long	42                              ; DW_AT_abstract_origin
+	.long	.Ldebug_ranges2                 ; DW_AT_ranges
+	.byte	2                               ; DW_AT_call_file
+	.short	293                             ; DW_AT_call_line
+	.byte	12                              ; DW_AT_call_column
+	.byte	0                               ; End Of Children Mark
+	.byte	7                               ; Abbrev [7] 0x90:0x19 DW_TAG_inlined_subroutine
+	.long	42                              ; DW_AT_abstract_origin
+	.long	.Ldebug_ranges3                 ; DW_AT_ranges
+	.byte	1                               ; DW_AT_call_file
+	.byte	204                             ; DW_AT_call_line
+	.byte	28                              ; DW_AT_call_column
+	.byte	6                               ; Abbrev [6] 0x9c:0xc DW_TAG_inlined_subroutine
+	.long	42                              ; DW_AT_abstract_origin
+	.long	.Ldebug_ranges4                 ; DW_AT_ranges
+	.byte	2                               ; DW_AT_call_file
+	.byte	191                             ; DW_AT_call_line
+	.byte	16                              ; DW_AT_call_column
+	.byte	0                               ; End Of Children Mark
+	.byte	7                               ; Abbrev [7] 0xa9:0x1a DW_TAG_inlined_subroutine
+	.long	42                              ; DW_AT_abstract_origin
+	.long	.Ldebug_ranges5                 ; DW_AT_ranges
+	.byte	1                               ; DW_AT_call_file
+	.byte	208                             ; DW_AT_call_line
+	.byte	12                              ; DW_AT_call_column
+	.byte	8                               ; Abbrev [8] 0xb5:0xd DW_TAG_inlined_subroutine
+	.long	42                              ; DW_AT_abstract_origin
+	.long	.Ldebug_ranges6                 ; DW_AT_ranges
+	.byte	2                               ; DW_AT_call_file
+	.short	293                             ; DW_AT_call_line
+	.byte	12                              ; DW_AT_call_column
+	.byte	0                               ; End Of Children Mark
+	.byte	0                               ; End Of Children Mark
+	.byte	0                               ; End Of Children Mark
+.Ldebug_info_end0:
+	.section	.debug_ranges,"",@progbits
+.Ldebug_ranges0:
+	.quad	.Ltmp4-.Lfunc_begin0
+	.quad	.Ltmp5-.Lfunc_begin0
+	.quad	.Ltmp6-.Lfunc_begin0
+	.quad	.Ltmp7-.Lfunc_begin0
+	.quad	.Ltmp8-.Lfunc_begin0
+	.quad	.Ltmp9-.Lfunc_begin0
+	.quad	0
+	.quad	0
+.Ldebug_ranges1:
+	.quad	.Ltmp10-.Lfunc_begin0
+	.quad	.Ltmp11-.Lfunc_begin0
+	.quad	.Ltmp12-.Lfunc_begin0
+	.quad	.Ltmp13-.Lfunc_begin0
+	.quad	.Ltmp14-.Lfunc_begin0
+	.quad	.Ltmp15-.Lfunc_begin0
+	.quad	.Ltmp16-.Lfunc_begin0
+	.quad	.Ltmp19-.Lfunc_begin0
+	.quad	.Ltmp20-.Lfunc_begin0
+	.quad	.Ltmp21-.Lfunc_begin0
+	.quad	.Ltmp22-.Lfunc_begin0
+	.quad	.Ltmp24-.Lfunc_begin0
+	.quad	0
+	.quad	0
+.Ldebug_ranges2:
+	.quad	.Ltmp16-.Lfunc_begin0
+	.quad	.Ltmp17-.Lfunc_begin0
+	.quad	.Ltmp18-.Lfunc_begin0
+	.quad	.Ltmp19-.Lfunc_begin0
+	.quad	.Ltmp23-.Lfunc_begin0
+	.quad	.Ltmp24-.Lfunc_begin0
+	.quad	0
+	.quad	0
+.Ldebug_ranges3:
+	.quad	.Ltmp25-.Lfunc_begin0
+	.quad	.Ltmp26-.Lfunc_begin0
+	.quad	.Ltmp27-.Lfunc_begin0
+	.quad	.Ltmp28-.Lfunc_begin0
+	.quad	.Ltmp29-.Lfunc_begin0
+	.quad	.Ltmp30-.Lfunc_begin0
+	.quad	.Ltmp31-.Lfunc_begin0
+	.quad	.Ltmp36-.Lfunc_begin0
+	.quad	0
+	.quad	0
+.Ldebug_ranges4:
+	.quad	.Ltmp25-.Lfunc_begin0
+	.quad	.Ltmp26-.Lfunc_begin0
+	.quad	.Ltmp27-.Lfunc_begin0
+	.quad	.Ltmp28-.Lfunc_begin0
+	.quad	.Ltmp29-.Lfunc_begin0
+	.quad	.Ltmp30-.Lfunc_begin0
+	.quad	.Ltmp31-.Lfunc_begin0
+	.quad	.Ltmp32-.Lfunc_begin0
+	.quad	.Ltmp33-.Lfunc_begin0
+	.quad	.Ltmp34-.Lfunc_begin0
+	.quad	.Ltmp35-.Lfunc_begin0
+	.quad	.Ltmp36-.Lfunc_begin0
+	.quad	0
+	.quad	0
+.Ldebug_ranges5:
+	.quad	.Ltmp37-.Lfunc_begin0
+	.quad	.Ltmp38-.Lfunc_begin0
+	.quad	.Ltmp39-.Lfunc_begin0
+	.quad	.Ltmp40-.Lfunc_begin0
+	.quad	.Ltmp41-.Lfunc_begin0
+	.quad	.Ltmp42-.Lfunc_begin0
+	.quad	.Ltmp43-.Lfunc_begin0
+	.quad	.Ltmp48-.Lfunc_begin0
+	.quad	0
+	.quad	0
+.Ldebug_ranges6:
+	.quad	.Ltmp43-.Lfunc_begin0
+	.quad	.Ltmp44-.Lfunc_begin0
+	.quad	.Ltmp45-.Lfunc_begin0
+	.quad	.Ltmp46-.Lfunc_begin0
+	.quad	.Ltmp47-.Lfunc_begin0
+	.quad	.Ltmp48-.Lfunc_begin0
+	.quad	0
+	.quad	0
+	.section	.debug_str,"MS",@progbits,1
+.Linfo_string0:
+	.asciz	"triton"                        ; string offset=0 ; triton
+.Linfo_string1:
+	.asciz	"amd_ikbo_fa_accuracy_debug.py" ; string offset=7 ; amd_ikbo_fa_accuracy_debug.py
+.Linfo_string2:
+	.asciz	"/home/aocai/OSS/triton/third_party/tlx/tutorials" ; string offset=37 ; /home/aocai/OSS/triton/third_party/tlx/tutorials
+.Linfo_string3:
+	.asciz	"_attn_fwd_jagged_tlx"          ; string offset=86 ; _attn_fwd_jagged_tlx
+	.section	".note.GNU-stack","",@progbits
+	.amdgpu_metadata
+---
+amdhsa.kernels:
+  - .agpr_count:     0
+    .args:
+      - .address_space:  global
+        .offset:         0
+        .size:           8
+        .value_kind:     global_buffer
+      - .address_space:  global
+        .offset:         8
+        .size:           8
+        .value_kind:     global_buffer
+      - .address_space:  global
+        .offset:         16
+        .size:           8
+        .value_kind:     global_buffer
+      - .address_space:  global
+        .offset:         24
+        .size:           8
+        .value_kind:     global_buffer
+      - .address_space:  global
+        .offset:         32
+        .size:           8
+        .value_kind:     global_buffer
+      - .address_space:  global
+        .offset:         40
+        .size:           8
+        .value_kind:     global_buffer
+      - .address_space:  global
+        .offset:         48
+        .size:           8
+        .value_kind:     global_buffer
+      - .offset:         56
+        .size:           4
+        .value_kind:     by_value
+      - .offset:         60
+        .size:           4
+        .value_kind:     by_value
+      - .offset:         64
+        .size:           4
+        .value_kind:     by_value
+      - .offset:         68
+        .size:           4
+        .value_kind:     by_value
+      - .offset:         72
+        .size:           4
+        .value_kind:     by_value
+      - .offset:         76
+        .size:           4
+        .value_kind:     by_value
+      - .offset:         80
+        .size:           4
+        .value_kind:     by_value
+      - .offset:         84
+        .size:           4
+        .value_kind:     by_value
+      - .offset:         88
+        .size:           4
+        .value_kind:     by_value
+      - .offset:         92
+        .size:           4
+        .value_kind:     by_value
+      - .address_space:  global
+        .offset:         96
+        .size:           8
+        .value_kind:     global_buffer
+      - .address_space:  global
+        .offset:         104
+        .size:           8
+        .value_kind:     global_buffer
+      - .offset:         112
+        .size:           4
+        .value_kind:     hidden_block_count_x
+      - .offset:         116
+        .size:           4
+        .value_kind:     hidden_block_count_y
+      - .offset:         120
+        .size:           4
+        .value_kind:     hidden_block_count_z
+      - .offset:         124
+        .size:           2
+        .value_kind:     hidden_group_size_x
+      - .offset:         126
+        .size:           2
+        .value_kind:     hidden_group_size_y
+      - .offset:         128
+        .size:           2
+        .value_kind:     hidden_group_size_z
+      - .offset:         130
+        .size:           2
+        .value_kind:     hidden_remainder_x
+      - .offset:         132
+        .size:           2
+        .value_kind:     hidden_remainder_y
+      - .offset:         134
+        .size:           2
+        .value_kind:     hidden_remainder_z
+      - .offset:         152
+        .size:           8
+        .value_kind:     hidden_global_offset_x
+      - .offset:         160
+        .size:           8
+        .value_kind:     hidden_global_offset_y
+      - .offset:         168
+        .size:           8
+        .value_kind:     hidden_global_offset_z
+      - .offset:         176
+        .size:           2
+        .value_kind:     hidden_grid_dims
+      - .offset:         192
+        .size:           8
+        .value_kind:     hidden_hostcall_buffer
+      - .offset:         200
+        .size:           8
+        .value_kind:     hidden_multigrid_sync_arg
+      - .offset:         208
+        .size:           8
+        .value_kind:     hidden_heap_v1
+      - .offset:         216
+        .size:           8
+        .value_kind:     hidden_default_queue
+      - .offset:         224
+        .size:           8
+        .value_kind:     hidden_completion_action
+      - .offset:         232
+        .size:           4
+        .value_kind:     hidden_dynamic_lds_size
+      - .offset:         312
+        .size:           8
+        .value_kind:     hidden_queue_ptr
+    .group_segment_fixed_size: 0
+    .kernarg_segment_align: 8
+    .kernarg_segment_size: 368
+    .max_flat_workgroup_size: 128
+    .name:           _attn_fwd_jagged_tlx
+    .private_segment_fixed_size: 0
+    .sgpr_count:     47
+    .sgpr_spill_count: 0
+    .symbol:         _attn_fwd_jagged_tlx.kd
+    .uniform_work_group_size: 1
+    .uses_dynamic_stack: false
+    .vgpr_count:     148
+    .vgpr_spill_count: 0
+    .wavefront_size: 64
+amdhsa.target:   amdgcn-amd-amdhsa--gfx950
+amdhsa.version:
+  - 1
+  - 2
+...
+
+	.end_amdgpu_metadata
+	.section	.debug_line,"",@progbits
+.Lline_table_start0:
