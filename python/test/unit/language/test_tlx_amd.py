@@ -20,8 +20,9 @@ import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
 from triton import knobs
+from triton._C.libtriton import ir
 from triton._internal_testing import is_hip, is_hip_cdna4, is_hip_gfx1250
-from triton.compiler.compiler import ASTSource, compile as triton_compile
+from triton.compiler.compiler import ASTSource, compile as triton_compile, make_backend
 from triton.compiler.errors import CompilationError
 from triton.backends.amd import compiler as amd_compiler
 from triton.backends.compiler import GPUTarget
@@ -120,6 +121,24 @@ def test_amd_sched_group_barrier_options_are_cache_keyed_and_validated():
 def compile_for_target(fn, signature, constexprs, target):
     src = ASTSource(fn=fn, signature=signature, constexprs=constexprs)
     return triton_compile(src, target=target)
+
+
+def make_ttir_for_target(fn, signature, constexprs, target):
+    """Generate frontend TTIR without running target lowering passes."""
+    backend = make_backend(target)
+    options = backend.parse_options({})
+    context = ir.context()
+    ir.load_dialects(context)
+    backend.load_dialects(context)
+    src = ASTSource(fn=fn, signature=signature, constexprs=constexprs)
+    return str(
+        src.make_ir(
+            target,
+            options,
+            backend.get_codegen_implementation(options),
+            backend.get_module_map(),
+            context,
+        ))
 
 
 def compile_for_gfx950(fn, signature, constexprs):
@@ -267,6 +286,30 @@ def test_buffer_load_contiguity_vectorizes_gfx950():
     assert "amdg.buffer_load" in ttgir
     assert "contiguity = 4" in ttgir
     assert "buffer_load_dwordx2" in compiled.asm["amdgcn"]
+
+
+@triton.jit
+def _optional_none_buffer_ops_kernel(x_ptr, y_ptr):
+    offsets = tl.arange(0, 64).to(tl.int32)
+    tlx.prefetch(x_ptr + offsets)
+    values = tlx.buffer_load(x_ptr, offsets)
+    tlx.buffer_store(values, y_ptr, offsets)
+    tlx.buffer_atomic_add(y_ptr, offsets, values, sem="relaxed")
+
+
+def test_optional_none_buffer_ops_emit_ttir_gfx950():
+    """Optional builder operands accept the public APIs' default None values."""
+    ttir = make_ttir_for_target(
+        _optional_none_buffer_ops_kernel,
+        signature={"x_ptr": "*fp32", "y_ptr": "*fp32"},
+        constexprs={},
+        target=GFX950,
+    )
+
+    assert "ttng.prefetch" in ttir
+    assert "amdg.buffer_load" in ttir
+    assert "amdg.buffer_store" in ttir
+    assert "amdg.buffer_atomic_rmw" in ttir
 
 
 @triton.jit
