@@ -165,6 +165,64 @@ def matmul_kernel_tma_persistent_ws(
 
 
 # ============================================================================
+# Kernel 2a: persistent TMA matmul with a guarded epilogue
+# Programs are arranged into 2-D tile groups. The same program shape can run as
+# independent CTAs or as CUDA clusters that multicast the A and B TMA loads.
+# ============================================================================
+@triton.jit
+def matmul_kernel_tma_persistent_guarded_epilogue_ws(
+    a_desc,
+    b_desc,
+    c_desc,
+    M,
+    N,
+    K,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    CTA_GROUP_M: tl.constexpr,
+    CTA_GROUP_N: tl.constexpr,
+):
+    dtype = tl.float16
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    k_tiles = tl.cdiv(K, BLOCK_SIZE_K)
+
+    program_m = tl.program_id(0)
+    program_n = tl.program_id(1)
+    group_m = program_m // CTA_GROUP_M
+    group_n = program_n // CTA_GROUP_N
+    local_m = program_m % CTA_GROUP_M
+    local_n = program_n % CTA_GROUP_N
+
+    num_group_m = tl.cdiv(num_pid_m, CTA_GROUP_M)
+    num_group_n = tl.cdiv(num_pid_n, CTA_GROUP_N)
+    group_id = group_m * num_group_n + group_n
+    num_groups = num_group_m * num_group_n
+    group_stride = (tl.num_programs(0) // CTA_GROUP_M) * (tl.num_programs(1) // CTA_GROUP_N)
+
+    for tile_group_id in tl.range(group_id, num_groups, group_stride, warp_specialize=True):
+        tile_group_m = tile_group_id // num_group_n
+        tile_group_n = tile_group_id % num_group_n
+        pid_m = tile_group_m * CTA_GROUP_M + local_m
+        pid_n = tile_group_n * CTA_GROUP_N + local_n
+        offs_am = pid_m * BLOCK_SIZE_M
+        offs_bn = pid_n * BLOCK_SIZE_N
+
+        accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+        for ki in range(k_tiles):
+            offs_k = ki * BLOCK_SIZE_K
+            a = a_desc.load([offs_am, offs_k])
+            b = b_desc.load([offs_bn, offs_k])
+            accumulator = tl.dot(a, b.T, accumulator)
+
+        # Padded programs must remain on the collective path; only externally
+        # visible output is predicated on the logical tile being in bounds.
+        if (pid_m < num_pid_m) & (pid_n < num_pid_n):
+            c_desc.store([offs_am, offs_bn], accumulator.to(dtype))
+
+
+# ============================================================================
 # Kernel 2b: matmul_kernel_tma_static_persistent_ws_while
 # Static persistent TMA matmul whose persistent outer loop is a while loop.
 # Work assignment is still static: each CTA processes tile_id += NUM_SMS.
@@ -919,6 +977,83 @@ def test_tutorial09_matmul_tma_persistent_warp_specialize(
         # Verify correctness
         ref_out = torch.matmul(A.to(torch.float32), B.T.to(torch.float32)).to(dtype)
         torch.testing.assert_close(ref_out, C, atol=0.03, rtol=0.03)
+
+
+# ============================================================================
+# Test 2a: Padded persistent groups keep their guarded epilogue with and without
+# being bound into a physical CUDA cluster.
+# ============================================================================
+@pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell")
+@pytest.mark.parametrize("clustered", [False, True], ids=["independent-ctas", "2x2-cluster"])
+def test_tutorial09_matmul_tma_persistent_guarded_epilogue_warp_specialize(clustered):
+    block_m = 128
+    block_n = 128
+    block_k = 64
+    cta_group_m = 2
+    cta_group_n = 2
+    M = 5 * block_m
+    N = 3 * block_n
+    K = 256
+    dtype = torch.float16
+    device = "cuda"
+
+    torch.manual_seed(42)
+    a = torch.randn((M, K), dtype=dtype, device=device)
+    b = torch.randn((N, K), dtype=dtype, device=device)
+    c = torch.empty((M, N), dtype=dtype, device=device)
+
+    def alloc_fn(size, align, stream):
+        return torch.empty(size, dtype=torch.int8, device=device)
+
+    triton.set_allocator(alloc_fn)
+    a_desc = TensorDescriptor(a, a.shape, a.stride(), [block_m, block_k])
+    b_desc = TensorDescriptor(b, b.shape, b.stride(), [block_n, block_k])
+    c_desc = TensorDescriptor(c, c.shape, c.stride(), [block_m, block_n])
+
+    num_group_m = triton.cdiv(triton.cdiv(M, block_m), cta_group_m)
+    num_group_n = triton.cdiv(triton.cdiv(N, block_n), cta_group_n)
+    launched_group_m = min(num_group_m, 2)
+    grid = (launched_group_m * cta_group_m, num_group_n * cta_group_n)
+    launch_options = {"num_stages": 3, "num_warps": 4, "multicast": clustered}
+    if clustered:
+        launch_options["ctas_per_cga"] = (cta_group_m, cta_group_n, 1)
+
+    with triton.knobs.nvidia.scope():
+        triton.knobs.nvidia.use_meta_ws = True
+        triton.knobs.nvidia.use_meta_partition = True
+        kernel = matmul_kernel_tma_persistent_guarded_epilogue_ws[grid](
+            a_desc,
+            b_desc,
+            c_desc,
+            M,
+            N,
+            K,
+            BLOCK_SIZE_M=block_m,
+            BLOCK_SIZE_N=block_n,
+            BLOCK_SIZE_K=block_k,
+            CTA_GROUP_M=cta_group_m,
+            CTA_GROUP_N=cta_group_n,
+            **launch_options,
+        )
+
+    ttir = kernel.asm["ttir"]
+    ttir_dot_pos = ttir.index("tt.dot")
+    ttir_guard_pos = ttir.index("scf.if", ttir_dot_pos)
+    ttir_store_pos = ttir.index("tt.descriptor_store", ttir_guard_pos)
+    assert ttir_dot_pos < ttir_guard_pos < ttir_store_pos
+
+    ttgir = kernel.asm["ttgir"]
+    store_pos = ttgir.index("ttng.async_tma_copy_local_to_global")
+    epilogue_guard_pos = ttgir.rindex("scf.if", 0, store_pos)
+    tmem_load_pos = ttgir.index("ttng.tmem_load", epilogue_guard_pos, store_pos)
+    completion_wait_pos = ttgir.rindex("ttng.wait_barrier", 0, epilogue_guard_pos)
+    completion_arrive_pos = ttgir.index("ttng.arrive_barrier", store_pos)
+    assert completion_wait_pos < epilogue_guard_pos < tmem_load_pos < store_pos < completion_arrive_pos
+    assert ("multicast::cluster" in kernel.asm["ptx"]) == clustered
+
+    torch.cuda.synchronize()
+    ref = torch.matmul(a.to(torch.float32), b.T.to(torch.float32)).to(dtype)
+    torch.testing.assert_close(c, ref, atol=0.03, rtol=0.03)
 
 
 # ============================================================================
