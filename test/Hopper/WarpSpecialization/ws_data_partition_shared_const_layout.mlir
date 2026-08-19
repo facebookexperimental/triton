@@ -21,14 +21,18 @@
 // The shared 0.0 constant stays in the original (sliced) #linear layout.
 // CHECK: %[[CST:.*]] = arith.constant dense<0.000000e+00> : tensor<128x64xf32, #linear>
 // Each partition's tmem_store gets its own *local* convert to the
-// TMEM-compatible #linear1 layout, sourced from the original constant.
-// CHECK: ttg.convert_layout %[[CST]] : tensor<128x64xf32, #linear> -> tensor<128x64xf32, #linear1>
-// CHECK: ttng.tmem_store
-// CHECK: ttg.convert_layout %[[CST]] : tensor<128x64xf32, #linear> -> tensor<128x64xf32, #linear1>
-// CHECK: ttng.tmem_store
+// TMEM-compatible #linear1 layout, sourced from the original constant. The
+// converts carry no tt.data_partition_id, so serializeDataPartitionedOps sorts
+// both of them ahead of the partitioned stores instead of leaving each next to
+// its consumer; bind them by SSA value so each store still uses its own.
+// CHECK: %[[CVT0:.*]] = ttg.convert_layout %[[CST]] : tensor<128x64xf32, #linear> -> tensor<128x64xf32, #linear1>
+// CHECK: %[[CVT1:.*]] = ttg.convert_layout %[[CST]] : tensor<128x64xf32, #linear> -> tensor<128x64xf32, #linear1>
 // Both partitioned subf ops consume the constant in the ORIGINAL #linear layout
-// (not the tmem-compatible #linear1), so operand/result encodings agree.
+// (not the tmem-compatible #linear1), so operand/result encodings agree. Each
+// partition's store/epilogue pair still stays together.
+// CHECK: ttng.tmem_store %[[CVT0]]
 // CHECK: arith.subf %[[CST]], %{{.*}} : tensor<128x64xf32, #linear>
+// CHECK: ttng.tmem_store %[[CVT1]]
 // CHECK: arith.subf %[[CST]], %{{.*}} : tensor<128x64xf32, #linear>
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
