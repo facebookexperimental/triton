@@ -179,12 +179,16 @@ static void expandLoops(ModuleOp moduleOp) {
     if (metaWS) {
       if (forOp->getParentOfType<triton::gpu::WarpSpecializeOp>()) {
         partitionType = getWarpSpecializedPartitionType(forOp);
-        // An untyped partition cannot be proven to be the GEMM worker. Leave
-        // it unexpanded instead of applying GEMM-specific lockstep rules to a
-        // load/reduction loop. Also require an actual MMA so stale role
-        // metadata cannot opt an unrelated loop into this path.
-        if (!partitionType || *partitionType != "gemm" || !containsMMA(forOp))
+        if (!partitionType)
           continue;
+        if (*partitionType == "gemm") {
+          if (!containsMMA(forOp))
+            continue;
+        } else if (*partitionType != "load") {
+          // Load-worker loops carry their own software-pipeline schedule and
+          // must be expanded to materialize the TMA prologue.
+          continue;
+        }
       }
     }
     CoarseSchedule schedule;

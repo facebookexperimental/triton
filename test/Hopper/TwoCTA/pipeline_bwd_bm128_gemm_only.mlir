@@ -9,6 +9,10 @@
 // CHECK-NOT: ttng.tc_gen5_mma
 // CHECK-LABEL: partition2({{.*}}) num_warps(4)
 // CHECK-NOT: ttng.tc_gen5_mma
+// The load worker must still pass through the pipeline expander. Leaving its
+// scheduled loop unexpanded keeps loop.stage metadata on the steady-state TMA
+// loads and loses the prologue/steady-state overlap.
+// CHECK: ttng.async_tma_copy_global_to_local %arg107{{.*}} {async_task_id = array<i32: 3>}
 // CHECK-LABEL: partition3({{.*}}) num_warps(4)
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [8, 4], warpsPerCTA = [4, 1], order = [1, 0]}>
