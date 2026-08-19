@@ -686,11 +686,11 @@ class TestUnhashableKwargs(TestCase):
         out = torch.zeros(32, device=device)
 
         # Normal call — warmup (populates cache with options_hash=0).
-        nop_kernel[(1,)](out, 32)
+        nop_kernel[(1, )](out, 32)
 
         # Call with extern_libs dict — the fast path must hash this without
         # raising ``TypeError: unhashable type: 'dict'``.
-        nop_kernel[(1,)](out, 32, extern_libs={"libdevice": "/dev/null"})
+        nop_kernel[(1, )](out, 32, extern_libs={"libdevice": "/dev/null"})
 
     def test_extern_libs_empty_dict_no_crash(self):
         """extern_libs={} (empty dict) must not crash the fast path hash."""
@@ -703,9 +703,9 @@ class TestUnhashableKwargs(TestCase):
         device = _get_device()
         out = torch.zeros(32, device=device)
 
-        nop_kernel2[(1,)](out, 32)
+        nop_kernel2[(1, )](out, 32)
         # Empty dict is still a dict — must not crash.
-        nop_kernel2[(1,)](out, 32, extern_libs={})
+        nop_kernel2[(1, )](out, 32, extern_libs={})
 
     def test_multi_entry_extern_libs_no_crash(self):
         """Multi-entry extern_libs dict must not crash the fast path hash."""
@@ -718,11 +718,9 @@ class TestUnhashableKwargs(TestCase):
         device = _get_device()
         out = torch.zeros(32, device=device)
 
-        nop_kernel3[(1,)](out, 32)
+        nop_kernel3[(1, )](out, 32)
         # Multi-entry extern_libs dict — must not crash the hash.
-        nop_kernel3[(1,)](
-            out, 32, extern_libs={"libA": "/dev/null", "libB": "/dev/null"}
-        )
+        nop_kernel3[(1, )](out, 32, extern_libs={"libA": "/dev/null", "libB": "/dev/null"})
 
     def test_make_hashable_produces_different_hashes(self):
         """_make_hashable must produce different hashes for different dicts."""
@@ -730,9 +728,7 @@ class TestUnhashableKwargs(TestCase):
         h2 = _hash_fc_opts({"extern_libs": {"libB": "/path/b"}})
         h3 = _hash_fc_opts({"extern_libs": {"libA": "/path/a"}})
 
-        self.assertNotEqual(
-            h1, h2, "Different dict values must produce different hashes"
-        )
+        self.assertNotEqual(h1, h2, "Different dict values must produce different hashes")
         self.assertEqual(h1, h3, "Same dict values must produce the same hash")
 
     def test_different_none_pattern_different_cache_entry(self):

@@ -993,21 +993,23 @@ def _amd_scheduled_mfma_persistent_acc_kernel(
     tl.store(output_offsets, acc)
 
 
-def test_amd_scheduled_mfma_persistent_acc_lowering_gfx950():
+@pytest.mark.parametrize("elem_ty", ["bf16", "fp16"])
+def test_amd_scheduled_mfma_persistent_acc_lowering_gfx950(elem_ty):
     compiled = compile_for_gfx950(
         _amd_scheduled_mfma_persistent_acc_kernel,
         signature={
-            "a_ptr": "*bf16",
-            "b_ptr": "*bf16",
+            "a_ptr": f"*{elem_ty}",
+            "b_ptr": f"*{elem_ty}",
             "output_ptr": "*fp32",
             "USE_VGPR": "constexpr",
         },
         constexprs={"USE_VGPR": False},
     )
     llir = compiled.asm["llir"]
-    assert 'asm sideeffect "v_mfma_f32_16x16x32_bf16' in llir
+    asm_ty = "f16" if elem_ty == "fp16" else elem_ty
+    assert f'asm sideeffect "v_mfma_f32_16x16x32_{asm_ty}' in llir
     assert '"=a,v,v"' in llir
-    assert "@llvm.amdgcn.mfma.f32.16x16x32.bf16" not in llir
+    assert f"@llvm.amdgcn.mfma.f32.16x16x32.{asm_ty}" not in llir
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
@@ -2260,6 +2262,56 @@ def test_async_amd_desc_load_correctness_gfx1250(device, M, N):
 
 
 @triton.jit
+def _async_amd_desc_load_fused_kernel(
+    a_ptr,
+    b_ptr,
+    output_ptr,
+    M: tl.constexpr,
+    N: tl.constexpr,
+):
+    a_desc = tl.make_tensor_descriptor(a_ptr, [M, N], [N, 1], [M, N])
+    b_desc = tl.make_tensor_descriptor(b_ptr, [M, N], [N, 1], [M, N])
+    a_buf = tlx.local_alloc((M, N), tl.float16, 1)
+    b_buf = tlx.local_alloc((M, N), tl.float16, 1)
+    a_smem = tlx.local_view(a_buf, 0)
+    b_smem = tlx.local_view(b_buf, 0)
+    a_desc = tlx.update_tensor_descriptor(a_desc, add_offsets=[0, 0], pred=True, clamp_bounds=True)
+    b_desc = tlx.update_tensor_descriptor(b_desc, add_offsets=[0, 0], pred=True, clamp_bounds=True)
+    token = tlx.async_amd_descriptor_load_fused([
+        (a_desc, a_smem, 0b0011),
+        (b_desc, b_smem, 0b1100),
+    ])
+    tlx.async_amd_descriptor_wait(tokens=[token])
+    result = tlx.local_load(a_smem) + tlx.local_load(b_smem)
+    offsets = tl.arange(0, M)[:, None] * N + tl.arange(0, N)[None, :]
+    tl.store(output_ptr + offsets, result)
+
+
+@pytest.mark.skipif(not is_hip(), reason="Requires HIP runtime")
+def test_async_amd_desc_load_fused_compiles_gfx1250(device):
+    """Two positioned TLX descriptors lower to one fused TDM instruction."""
+    compiled = compile_for_gfx1250(
+        _async_amd_desc_load_fused_kernel,
+        signature={"a_ptr": "*fp16", "b_ptr": "*fp16", "output_ptr": "*fp16"},
+        constexprs={"M": 16, "N": 32},
+    )
+    ttgir = compiled.asm["ttgir"]
+    assert "amdg.async_tdm_fused_copy_global_to_local" in ttgir
+    assert "warp_used_hints = array<i32: 3, 12>" in ttgir
+    assert len(re.findall(r"tensor_load_to_lds|tensor\.load\.to\.lds", compiled.asm["amdgcn"])) == 1
+
+
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
+def test_async_amd_desc_load_fused_correctness_gfx1250(device):
+    rows, cols = 16, 32
+    a = torch.randn((rows, cols), device=device, dtype=torch.float16)
+    b = torch.randn((rows, cols), device=device, dtype=torch.float16)
+    output = torch.empty_like(a)
+    _async_amd_desc_load_fused_kernel[(1, )](a, b, output, M=rows, N=cols)
+    torch.testing.assert_close(output, a + b)
+
+
+@triton.jit
 def _async_amd_desc_load_with_token_kernel(
     x_ptr,
     output_ptr,
@@ -3135,11 +3187,7 @@ def _compile_a4w4_inter_wave_256tile(m, n, k, preshuffled_scales=False):
     c = MockTensor(torch.bfloat16, (m, n))
     a_scales = MockTensor(torch.uint8, (m * k // 32, ) if preshuffled_scales else (m, k // 32))
     b_scales = MockTensor(torch.uint8, (n * k // 32, ) if preshuffled_scales else (n, k // 32))
-    kernel = (
-        _a4w4_inter_wave_preshuffled_scales_kernel
-        if preshuffled_scales
-        else _a4w4_inter_wave_256tile_kernel
-    )
+    kernel = (_a4w4_inter_wave_preshuffled_scales_kernel if preshuffled_scales else _a4w4_inter_wave_256tile_kernel)
     scale_strides = () if preshuffled_scales else (1, m, 1, n)
 
     with knobs.runtime.scope():
@@ -3363,8 +3411,7 @@ def test_a4w4_inter_wave_preshuffled_scale_correctness_gfx950(device, k, split_k
     a, b, a_scales, b_scales = _generate_a4w4_inputs(m, n, k)
     a_scales_preshuffled = _preshuffle_a4w4_a_scales(a_scales)
     b_scales_preshuffled = _preshuffle_a4w4_b_scales(b_scales)
-    actual = _a4w4_inter_wave_matmul_preshuffled(
-        a, b, a_scales_preshuffled, b_scales_preshuffled, SPLIT_K=split_k)
+    actual = _a4w4_inter_wave_matmul_preshuffled(a, b, a_scales_preshuffled, b_scales_preshuffled, SPLIT_K=split_k)
     expected = _a4w4_reference(a, b, a_scales, b_scales)
     torch.testing.assert_close(actual, expected, atol=0.0, rtol=0.0)
 

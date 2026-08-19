@@ -166,6 +166,18 @@ Attribute AMDGPUAssignDescriptorMemoryLayouts::getDesiredDescriptorEncoding(
               dyn_cast<triton::amdgpu::AsyncTDMCopyGlobalToLocalOp>(user)) {
         if (load.getDesc() == value)
           memoryType = load.getResult().getType();
+      } else if (auto fused =
+                     dyn_cast<triton::amdgpu::AsyncTDMFusedCopyGlobalToLocalOp>(
+                         user)) {
+        for (auto [desc, dest] :
+             llvm::zip_equal(fused.getDescs(), fused.getDests())) {
+          if (desc != value)
+            continue;
+          auto candidate = cast<ttg::MemDescType>(dest.getType());
+          if (memoryType && memoryType != candidate)
+            return {};
+          memoryType = candidate;
+        }
       } else if (auto store =
                      dyn_cast<triton::amdgpu::AsyncTDMCopyLocalToGlobalOp>(
                          user)) {

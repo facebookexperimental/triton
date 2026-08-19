@@ -247,6 +247,11 @@ _A_BASES_256 = tl.constexpr(_swz_offset_bases([_HALF_256, BLOCK_K], 1))
 _A_BASES_128 = tl.constexpr(_swz_offset_bases([_HALF_128, BLOCK_K], 1))
 _B_BASES_256 = tl.constexpr(_swz_offset_bases([BLOCK_K, _HALF_256], 0))
 _B_BASES_128 = tl.constexpr(_swz_offset_bases([BLOCK_K, _HALF_128], 0))
+# Direct-to-LDS offset layouts inferred by the aligned 256x256 path. Pinning
+# these keeps a merely 16-byte-aligned leading stride from falling back to a
+# blocked layout that the AMD buffer-load lowering cannot consume.
+_A_OFFSET_LAYOUT_256 = tlx.layout(shape=((8, 8, 8), (8, 2)), stride=((8, 1024, 64), (1, 512)))
+_B_OFFSET_LAYOUT_256 = tlx.layout(shape=((8, 8, 8), (8, 2)), stride=((1024, 16, 1), (128, 8)))
 
 
 @triton.autotune(
@@ -397,6 +402,9 @@ def a16w16_8wave(
     GRID_MN: tl.constexpr,
     SPLIT_K: tl.constexpr,
     ADD_BIAS: tl.constexpr,
+    HAS_REGISTER_TAIL: tl.constexpr,
+    PIN_OFFSET_LAYOUT: tl.constexpr,
+    DEFER_EPILOGUE: tl.constexpr,
 ):
     # ── Split-K: grid is GRID_MN*SPLIT_K. Peel off split_id, keep the MN pid for
     # the XCD/group remap below. Each split owns a contiguous K-slice of size KS.
@@ -446,6 +454,9 @@ def a16w16_8wave(
     tl.assume(stride_ak > 0)
     tl.assume(stride_bn > 0)
     tl.assume(stride_bk > 0)
+    if PIN_OFFSET_LAYOUT:
+        stride_am = tl.multiple_of(stride_am, 8)
+        stride_bn = tl.multiple_of(stride_bn, 8)
 
     HALF_M: tl.constexpr = BLOCK_M // 2
     HALF_N: tl.constexpr = BLOCK_N // 2
@@ -482,10 +493,20 @@ def a16w16_8wave(
     offs_bn = pid_n * BLOCK_N + tl.arange(0, HALF_N)
     offs_k = tl.arange(0, BLOCK_K)
 
-    a_top_off = offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak
+    a_row_off = offs_am[:, None] * stride_am
+    b_col_off = offs_bn[None, :] * stride_bn
+    if PIN_OFFSET_LAYOUT:
+        a_row_off = tl.multiple_of(a_row_off, (8, 8))
+        b_col_off = tl.multiple_of(b_col_off, (8, 8))
+    a_top_off = a_row_off + offs_k[None, :] * stride_ak
     a_bot_off = a_top_off + HALF_M * stride_am
-    b_left_off = offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn
+    b_left_off = offs_k[:, None] * stride_bk + b_col_off
     b_right_off = b_left_off + HALF_N * stride_bn
+    if PIN_OFFSET_LAYOUT:
+        a_top_off = tlx.require_layout(a_top_off, _A_OFFSET_LAYOUT_256)
+        a_bot_off = tlx.require_layout(a_bot_off, _A_OFFSET_LAYOUT_256)
+        b_left_off = tlx.require_layout(b_left_off, _B_OFFSET_LAYOUT_256)
+        b_right_off = tlx.require_layout(b_right_off, _B_OFFSET_LAYOUT_256)
 
     # _next = the K+1 buffer (offset one BLOCK_K along K).
     a_top_off_n = a_top_off + BLOCK_K * stride_ak
@@ -646,23 +667,24 @@ def a16w16_8wave(
     # no pipeline. The K-mask zeros the missing contraction elements (they add 0
     # to C = sum_k A*B), so this is correct for arbitrary K. Runs 0-2 iterations;
     # the whole-tile even hot path (n_pipe*BLOCK_K == K) skips it entirely.
-    offs_am_bot = offs_am + HALF_M
-    offs_bn_right = offs_bn + HALF_N
-    for kk in tl.range(n_pipe * BLOCK_K, KS, BLOCK_K, num_stages=1):
-        offs_kt = kk + offs_k
-        k_mask = offs_kt < KS
-        a_top_t = tl.load(a_ptr + ak_split + offs_am[:, None] * stride_am + offs_kt[None, :] * stride_ak,
-                          mask=(offs_am[:, None] < M) & k_mask[None, :], other=0.0)
-        a_bot_t = tl.load(a_ptr + ak_split + offs_am_bot[:, None] * stride_am + offs_kt[None, :] * stride_ak,
-                          mask=(offs_am_bot[:, None] < M) & k_mask[None, :], other=0.0)
-        b_left_t = tl.load(b_ptr + bk_split + offs_kt[:, None] * stride_bk + offs_bn[None, :] * stride_bn,
-                           mask=k_mask[:, None] & (offs_bn[None, :] < N), other=0.0)
-        b_right_t = tl.load(b_ptr + bk_split + offs_kt[:, None] * stride_bk + offs_bn_right[None, :] * stride_bn,
-                            mask=k_mask[:, None] & (offs_bn_right[None, :] < N), other=0.0)
-        acc_tl = tl.dot(a_top_t, b_left_t, acc_tl)
-        acc_bl = tl.dot(a_bot_t, b_left_t, acc_bl)
-        acc_tr = tl.dot(a_top_t, b_right_t, acc_tr)
-        acc_br = tl.dot(a_bot_t, b_right_t, acc_br)
+    if HAS_REGISTER_TAIL:
+        offs_am_bot = offs_am + HALF_M
+        offs_bn_right = offs_bn + HALF_N
+        for kk in tl.range(n_pipe * BLOCK_K, KS, BLOCK_K, num_stages=1):
+            offs_kt = kk + offs_k
+            k_mask = offs_kt < KS
+            a_top_t = tl.load(a_ptr + ak_split + offs_am[:, None] * stride_am + offs_kt[None, :] * stride_ak,
+                              mask=(offs_am[:, None] < M) & k_mask[None, :], other=0.0)
+            a_bot_t = tl.load(a_ptr + ak_split + offs_am_bot[:, None] * stride_am + offs_kt[None, :] * stride_ak,
+                              mask=(offs_am_bot[:, None] < M) & k_mask[None, :], other=0.0)
+            b_left_t = tl.load(b_ptr + bk_split + offs_kt[:, None] * stride_bk + offs_bn[None, :] * stride_bn,
+                               mask=k_mask[:, None] & (offs_bn[None, :] < N), other=0.0)
+            b_right_t = tl.load(b_ptr + bk_split + offs_kt[:, None] * stride_bk + offs_bn_right[None, :] * stride_bn,
+                                mask=k_mask[:, None] & (offs_bn_right[None, :] < N), other=0.0)
+            acc_tl = tl.dot(a_top_t, b_left_t, acc_tl)
+            acc_bl = tl.dot(a_bot_t, b_left_t, acc_bl)
+            acc_tr = tl.dot(a_top_t, b_right_t, acc_tr)
+            acc_br = tl.dot(a_bot_t, b_right_t, acc_br)
 
     offs_cm_top = pid_m * BLOCK_M + tl.arange(0, HALF_M)
     offs_cm_bot = offs_cm_top + HALF_M
@@ -673,7 +695,7 @@ def a16w16_8wave(
     n_left = offs_cn_left[None, :] < N
     n_right = offs_cn_right[None, :] < N
 
-    if SPLIT_K == 1:
+    if SPLIT_K == 1 and not DEFER_EPILOGUE:
         if ADD_BIAS:
             acc_tl += tl.load(
                 bias_ptr + stride_bias_m * offs_cm_top[:, None] + stride_bias_n * offs_cn_left[None, :],
@@ -746,9 +768,9 @@ _TORCH_TO_TL = {torch.float16: tl.float16, torch.bfloat16: tl.bfloat16, torch.fl
 
 
 @triton.jit
-def _reduce_k_kernel(workspace_ptr, bias_ptr, c_ptr, M, N, stride_bias_m, stride_bias_n,
-                     SPLIT_K: tl.constexpr, BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr,
-                     OUTPUT_DTYPE: tl.constexpr, ADD_BIAS: tl.constexpr):
+def _reduce_k_kernel(workspace_ptr, bias_ptr, c_ptr, M, N, stride_bias_m, stride_bias_n, SPLIT_K: tl.constexpr,
+                     BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, OUTPUT_DTYPE: tl.constexpr,
+                     ADD_BIAS: tl.constexpr):
     # Sum the SPLIT_K partials (each a contiguous (M, N) slab in workspace) into
     # C with fp32 accumulation. Small tiles (32x32) so small outputs still spawn
     # many CTAs -- else the reduce is CTA-starved and dominates (D97513062).
@@ -835,11 +857,13 @@ def choose_split_k(M, N, K):
     return choose_tile(M, N, K)[2]
 
 
-def _launch(a, b, bias=None, SPLIT_K=None, TILE=None):
+def _launch(a, b, bias=None, SPLIT_K=None, TILE=None, K_LIMIT=None, DEFER_EPILOGUE=False):
     """Launch the shared gfx950 GEMM core, optionally with a fused bias."""
-    assert a.shape[1] == b.shape[0], "Incompatible dimensions"
-    M, K = a.shape
-    K, N = b.shape
+    M, input_k = a.shape
+    b_k, N = b.shape
+    assert input_k == b_k, "Incompatible dimensions"
+    K = input_k if K_LIMIT is None else K_LIMIT
+    assert 0 < K <= input_k, f"K_LIMIT={K} must be in (0, {input_k}]"
     if bias is not None:
         assert bias.shape == (M, N), f"Bias must expand to ({M}, {N}), got {tuple(bias.shape)}"
         assert bias.device == a.device, "Bias and matrix operands must be on the same device"
@@ -861,7 +885,7 @@ def _launch(a, b, bias=None, SPLIT_K=None, TILE=None):
     assert KS * a.element_size() % 16 == 0, f"K/SPLIT_K={KS} must preserve 16-byte split alignment"
     c = torch.empty((M, N), device=a.device, dtype=a.dtype)
     GRID_MN = triton.cdiv(M, BM) * triton.cdiv(N, BN)
-    if SPLIT_K > 1:
+    if SPLIT_K > 1 or DEFER_EPILOGUE:
         # fp32 workspace: partials are stored without a rounding step, so the
         # split-K result matches a single fp32-accumulated GEMM (an fp16 workspace
         # would lose ~1e-1 near cancellation). The reduce sums in fp32 too.
@@ -897,12 +921,16 @@ def _launch(a, b, bias=None, SPLIT_K=None, TILE=None):
         GRID_MN=GRID_MN,
         SPLIT_K=SPLIT_K,
         ADD_BIAS=bias is not None,
+        HAS_REGISTER_TAIL=KS % (2 * BLOCK_K) != 0,
+        PIN_OFFSET_LAYOUT=K_LIMIT is not None,
+        DEFER_EPILOGUE=DEFER_EPILOGUE,
         num_warps=NUM_WARPS,
         num_stages=1,
         matrix_instr_nonkdim=16,
         # Forbid AGPRs: f32 accumulators write VGPRs directly (packs tighter, no
         # v_accvgpr moves around each mfma). Essential to match the reference perf.
         llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"), ),
+        enable_sched_group_barrier_scheduler=True,
     )
     if SPLIT_K > 1:
         # Adaptive reduce tile: small outputs need many small CTAs to fill the CUs;
@@ -926,6 +954,8 @@ def _launch(a, b, bias=None, SPLIT_K=None, TILE=None):
             ADD_BIAS=bias is not None,
             num_warps=rw,
         )
+    if DEFER_EPILOGUE:
+        return workspace, c
     return c
 
 

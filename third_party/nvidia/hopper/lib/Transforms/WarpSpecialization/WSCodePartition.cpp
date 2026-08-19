@@ -554,6 +554,49 @@ void reorderEpilogOps(const SmallVector<Channel *> &channels,
       }
     };
 
+    // Streamlining reorders ops by their SSA operands alone. That is safe for
+    // a register chain, but a memory consumer has no SSA edge to its producer
+    // when the producer writes into a buffer instead of returning a value
+    // (nvws.descriptor_load fills an SMEM buffer and yields nothing). Hoisting
+    // such a consumer next to its last operand can lift it *above* its
+    // producer, inverting the channel; insertAsyncComm then sees a
+    // consumer-before-producer pair it has no way to synchronize. Refuse to
+    // hoist an op above another op that touches one of the same underlying
+    // buffers. Sinking, and ops with no memdesc operand, are unaffected.
+    auto isMemDescView = [](Operation *op) {
+      return isa<ttg::MemDescIndexOp, ttg::MemDescTransOp,
+                 ttg::MemDescReshapeOp, ttg::MemDescReinterpretOp,
+                 ttg::MemDescSubsliceOp>(op);
+    };
+    auto memDescRoot = [&](Value v) {
+      while (Operation *def = v.getDefiningOp()) {
+        if (!isMemDescView(def))
+          break;
+        v = def->getOperand(0);
+      }
+      return v;
+    };
+    auto hoistsAcrossMemoryOp = [&](Operation *op, Operation *insertAfter) {
+      if (!insertAfter->isBeforeInBlock(op))
+        return false;
+      DenseSet<Value> roots;
+      for (Value v : op->getOperands())
+        if (isa<ttg::MemDescType>(v.getType()))
+          roots.insert(memDescRoot(v));
+      if (roots.empty())
+        return false;
+      for (Operation *cur = insertAfter->getNextNode(); cur && cur != op;
+           cur = cur->getNextNode()) {
+        if (isMemDescView(cur))
+          continue;
+        for (Value v : cur->getOperands())
+          if (isa<ttg::MemDescType>(v.getType()) &&
+              roots.contains(memDescRoot(v)))
+            return true;
+      }
+      return false;
+    };
+
     // Streamline ops on a channel chain.
     // Starting with producers with smaller task ids, moving forward
     // dependencies of the consumer ops close to the them.
@@ -566,7 +609,7 @@ void reorderEpilogOps(const SmallVector<Channel *> &channels,
             continue;
           // push depOp to be right after its operands
           auto lastOpndOp = lastInBlockOperand(depOp);
-          if (lastOpndOp)
+          if (lastOpndOp && !hoistsAcrossMemoryOp(depOp, lastOpndOp))
             depOp->moveAfter(lastOpndOp);
         }
       }

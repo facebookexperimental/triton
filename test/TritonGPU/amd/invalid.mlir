@@ -256,6 +256,82 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 
 // -----
 
+// Fused TDM verifier coverage.
+#fused = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @fused_tdm_overlapping_hints(
+      %a: !tt.tensordesc<64x64xf16>, %b: !tt.tensordesc<64x64xf16>,
+      %da: !ttg.memdesc<64x64xf16, #fused, #smem, mutable>,
+      %db: !ttg.memdesc<64x64xf16, #fused, #smem, mutable>) {
+    // expected-error @+1 {{requires pairwise-disjoint warp_used_hint values}}
+    %0 = amdg.async_tdm_fused_copy_global_to_local %a, %b into %da, %db {warp_used_hints = array<i32: 3, 3>} : !tt.tensordesc<64x64xf16>, !tt.tensordesc<64x64xf16> -> !ttg.memdesc<64x64xf16, #fused, #smem, mutable>, !ttg.memdesc<64x64xf16, #fused, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+#fused = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @fused_tdm_rank_mismatch(
+      %a: !tt.tensordesc<64x64xf16>, %b: !tt.tensordesc<64x64x1xf16>,
+      %da: !ttg.memdesc<64x64xf16, #fused, #smem, mutable>,
+      %db: !ttg.memdesc<64x64x1xf16, #fused, #smem, mutable>) {
+    // expected-error @+1 {{requires all member descriptors to have the same rank}}
+    %0 = amdg.async_tdm_fused_copy_global_to_local %a, %b into %da, %db {warp_used_hints = array<i32: 3, 12>} : !tt.tensordesc<64x64xf16>, !tt.tensordesc<64x64x1xf16> -> !ttg.memdesc<64x64xf16, #fused, #smem, mutable>, !ttg.memdesc<64x64x1xf16, #fused, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+#fused = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @fused_tdm_element_width_mismatch(
+      %a: !tt.tensordesc<64x64xf16>, %b: !tt.tensordesc<64x64xf16>,
+      %da: !ttg.memdesc<64x64xf32, #fused, #smem, mutable>,
+      %db: !ttg.memdesc<64x64xf16, #fused, #smem, mutable>) {
+    // expected-error @+1 {{requires each descriptor and its destination to have the same element bitwidth}}
+    %0 = amdg.async_tdm_fused_copy_global_to_local %a, %b into %da, %db {warp_used_hints = array<i32: 3, 12>} : !tt.tensordesc<64x64xf16>, !tt.tensordesc<64x64xf16> -> !ttg.memdesc<64x64xf32, #fused, #smem, mutable>, !ttg.memdesc<64x64xf16, #fused, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+#fused = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @fused_tdm_one_member(
+      %desc: !tt.tensordesc<64x64xf16>,
+      %dst: !ttg.memdesc<64x64xf16, #fused, #smem, mutable>) {
+    // expected-error @+1 {{requires 2 to 4 members}}
+    %0 = amdg.async_tdm_fused_copy_global_to_local %desc into %dst {warp_used_hints = array<i32: 15>} : !tt.tensordesc<64x64xf16> -> !ttg.memdesc<64x64xf16, #fused, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+#multi_pad = #ttg.padded_shared<[32:+4, 64:+4] {order = [1, 0], shape = [64, 64]}>
+#fused = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @fused_tdm_multi_padding_pairs(
+      %a: !tt.tensordesc<64x64xf16>, %b: !tt.tensordesc<64x64xf16>,
+      %da: !ttg.memdesc<64x64xf16, #multi_pad, #smem, mutable>,
+      %db: !ttg.memdesc<64x64xf16, #fused, #smem, mutable>) {
+    // expected-error @+1 {{TDM load only supports a single interval-padding pair}}
+    %0 = amdg.async_tdm_fused_copy_global_to_local %a, %b into %da, %db {warp_used_hints = array<i32: 3, 12>} : !tt.tensordesc<64x64xf16>, !tt.tensordesc<64x64xf16> -> !ttg.memdesc<64x64xf16, #multi_pad, #smem, mutable>, !ttg.memdesc<64x64xf16, #fused, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
 #nondistributed = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 64 : i32} {
   tt.func @register_resident_requires_distributed_encoding(

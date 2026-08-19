@@ -925,6 +925,18 @@ void init_triton_tlx_ir(py::module &&m) {
              return self.create<amdgpu::AsyncTDMCopyGlobalToLocalOp>(
                  desc, result, barrier.value_or(Value()));
            })
+      .def(
+          "create_async_tdm_fused_copy_global_to_local",
+          [](TritonOpBuilder &self, std::vector<Value> descs,
+             std::vector<Value> dests, std::vector<int32_t> warpUsedHints,
+             tt::CacheModifier cacheModifier) -> mlir::Value {
+            auto tokenType = self.getBuilder().getType<ttg::AsyncTokenType>();
+            auto hints = self.getBuilder().getDenseI32ArrayAttr(warpUsedHints);
+            return self.create<amdgpu::AsyncTDMFusedCopyGlobalToLocalOp>(
+                tokenType, descs, dests, hints, cacheModifier);
+          },
+          py::arg("descs"), py::arg("dests"), py::arg("warpUsedHints"),
+          py::arg("cacheModifier") = tt::CacheModifier::NONE)
       .def("create_async_tdm_copy_local_to_global",
            [](TritonOpBuilder &self, Value desc, Value src,
               std::optional<Value> barrier) {
@@ -1405,7 +1417,7 @@ void init_triton_tlx_ir(py::module &&m) {
       .def("create_assume_uniform",
            [](TritonOpBuilder &self, Value value) -> Value {
              return self.create<ttag::AssumeUniformOp>(value.getType(), value);
-            });
+           });
 }
 
 void init_triton_tlx_passes(py::module &&m) {

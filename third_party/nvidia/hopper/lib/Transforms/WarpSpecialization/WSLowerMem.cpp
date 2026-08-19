@@ -37,6 +37,28 @@ namespace mlir {
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
 #define LDBG(X) LLVM_DEBUG(DBGS() << X << "\n")
 
+// Can a TMA copy land directly in a buffer with this encoding? Mirrors
+// verifyTMAEncoding() in TritonNvidiaGPU/IR/Ops.cpp: the destination of an
+// async_tma_copy_global_to_local must be NVMMA shared, untransposed, and (once
+// the descriptor carries an encoding) agree with it. A consumer-owned buffer
+// can legitimately fail this -- a block-scale load is consumed through a
+// #ttg.shared_linear alloc that a memdesc_reshape/trans chain feeds to
+// tmem_copy -- in which case the load needs its own NVMMA landing buffer.
+static bool isValidTMADestEncoding(Attribute bufferEnc, Attribute descEnc) {
+  auto nvmma = dyn_cast_or_null<ttg::NVMMASharedEncodingAttr>(bufferEnc);
+  if (!nvmma || nvmma.getTransposed())
+    return false;
+  // No descriptor encoding yet: only the NVMMA requirement is checked.
+  if (!descEnc)
+    return true;
+  auto descNvmma = dyn_cast<ttg::NVMMASharedEncodingAttr>(descEnc);
+  // Encodings may differ in rank for rank-reducing loads, so compare fields.
+  return descNvmma && descNvmma.getTransposed() == nvmma.getTransposed() &&
+         descNvmma.getSwizzlingByteWidth() == nvmma.getSwizzlingByteWidth() &&
+         descNvmma.getElementBitWidth() == nvmma.getElementBitWidth() &&
+         descNvmma.getFp4Padded() == nvmma.getFp4Padded();
+}
+
 LogicalResult doConvertDescriptorLoadsToNVWS(triton::FuncOp funcOp) {
   SmallVector<tt::DescriptorLoadOp> loads;
   funcOp.walk([&](tt::DescriptorLoadOp load) { loads.push_back(load); });
@@ -46,12 +68,26 @@ LogicalResult doConvertDescriptorLoadsToNVWS(triton::FuncOp funcOp) {
     if (!tensorType)
       return load.emitError("expected a ranked tensor descriptor load result");
 
+    Attribute descEnc =
+        cast<tt::TensorDescType>(load.getDesc().getType()).getSharedLayout();
+
     ttg::LocalStoreOp soleStore;
     ttg::LocalAllocOp soleAlloc;
     if (load->hasOneUse())
       soleStore = dyn_cast<ttg::LocalStoreOp>(*load->getUsers().begin());
     if (load->hasOneUse())
       soleAlloc = dyn_cast<ttg::LocalAllocOp>(*load->getUsers().begin());
+
+    // Only reuse the consumer's buffer when the TMA copy can actually target
+    // it; otherwise fall through to the register-consumed path below, which
+    // allocates an NVMMA buffer and local_loads out of it (what the upstream
+    // tt.descriptor_load lowering does for every load).
+    if (soleStore && !isValidTMADestEncoding(
+                         soleStore.getDst().getType().getEncoding(), descEnc))
+      soleStore = nullptr;
+    if (soleAlloc &&
+        !isValidTMADestEncoding(soleAlloc.getType().getEncoding(), descEnc))
+      soleAlloc = nullptr;
 
     OpBuilderWithAsyncTaskIds builder(load);
     builder.setInsertionPoint(load);

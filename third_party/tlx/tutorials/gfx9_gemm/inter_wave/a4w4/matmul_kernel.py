@@ -87,8 +87,7 @@ import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
 from triton.language.extra.tlx.tutorials.gfx9_gemm.intra_wave.a4w4.matmul_kernel import (
-    matmul as intra_wave_matmul,
-)
+    matmul as intra_wave_matmul, )
 from triton.language.extra.tlx.tutorials.gfx9_gemm.skinny.a4w4 import is_skinny, skinny_matmul
 
 BLOCK_M = 256
@@ -170,8 +169,20 @@ def _a4w4_8wave_kernel(
     shared_tile: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases(
         [[1024, 32]],
         [
-            [0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64],
-            [1, 0], [32, 0], [64, 0], [2, 0], [4, 0], [8, 0], [16, 0],
+            [0, 1],
+            [0, 2],
+            [0, 4],
+            [0, 8],
+            [0, 16],
+            [0, 32],
+            [0, 64],
+            [1, 0],
+            [32, 0],
+            [64, 0],
+            [2, 0],
+            [4, 0],
+            [8, 0],
+            [16, 0],
         ],
         [HALF_M, HALF_K],
     )
@@ -183,16 +194,33 @@ def _a4w4_8wave_kernel(
     # remain unchanged, preserving each contiguous 8-byte global segment.
     shared_a_scales: tl.constexpr = tlx.shared_linear_layout_encoding(
         offset_bases=[
-            [1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0], [64, 0],
-            [0, 1], [0, 2], [16, 4],
+            [1, 0],
+            [2, 0],
+            [4, 0],
+            [8, 0],
+            [16, 0],
+            [32, 0],
+            [64, 0],
+            [0, 1],
+            [0, 2],
+            [16, 4],
         ],
         block_bases=[],
         alignment=16,
     )
     shared_b_scales: tl.constexpr = tlx.shared_linear_layout_encoding(
         offset_bases=[
-            [1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0], [64, 0], [128, 0],
-            [16, 1], [0, 2], [32, 4],
+            [1, 0],
+            [2, 0],
+            [4, 0],
+            [8, 0],
+            [16, 0],
+            [32, 0],
+            [64, 0],
+            [128, 0],
+            [16, 1],
+            [0, 2],
+            [32, 4],
         ],
         block_bases=[],
         alignment=16,
@@ -599,15 +627,37 @@ def _a4w4_8wave_preshuffled_scales_kernel(
     shared_tile: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases(
         [[1024, 32]],
         [
-            [0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64],
-            [1, 0], [32, 0], [64, 0], [2, 0], [4, 0], [8, 0], [16, 0],
+            [0, 1],
+            [0, 2],
+            [0, 4],
+            [0, 8],
+            [0, 16],
+            [0, 32],
+            [0, 64],
+            [1, 0],
+            [32, 0],
+            [64, 0],
+            [2, 0],
+            [4, 0],
+            [8, 0],
+            [16, 0],
         ],
         [HALF_M, HALF_K],
     )
     # Each preshuffled scale allocation is a raw byte-linear LDS image.
     shared_scale_preshuffled: tl.constexpr = tlx.shared_linear_layout_encoding(
         offset_bases=[
-            [1], [2], [4], [8], [16], [32], [64], [128], [256], [512], [1024],
+            [1],
+            [2],
+            [4],
+            [8],
+            [16],
+            [32],
+            [64],
+            [128],
+            [256],
+            [512],
+            [1024],
         ],
         block_bases=[],
         alignment=16,
@@ -687,10 +737,8 @@ def _a4w4_8wave_preshuffled_scales_kernel(
     smem_a_bot = tlx.local_alloc((HALF_M, HALF_K), tlx.dtype_of(a_ptr), 2, layout=shared_tile)
     smem_b_left = tlx.local_alloc((HALF_N, HALF_K), tlx.dtype_of(b_ptr), 2, layout=shared_tile)
     smem_b_right = tlx.local_alloc((HALF_N, HALF_K), tlx.dtype_of(b_ptr), 2, layout=shared_tile)
-    smem_a_sc = tlx.local_alloc(
-        (BLOCK_M * NG, ), tlx.dtype_of(a_scales_ptr), 2, layout=shared_scale_preshuffled)
-    smem_b_sc = tlx.local_alloc(
-        (BLOCK_N * NG, ), tlx.dtype_of(b_scales_ptr), 2, layout=shared_scale_preshuffled)
+    smem_a_sc = tlx.local_alloc((BLOCK_M * NG, ), tlx.dtype_of(a_scales_ptr), 2, layout=shared_scale_preshuffled)
+    smem_b_sc = tlx.local_alloc((BLOCK_N * NG, ), tlx.dtype_of(b_scales_ptr), 2, layout=shared_scale_preshuffled)
     offs_am = tl.arange(0, HALF_M)
     offs_ak = tl.arange(0, HALF_K)
     a_tile_offsets = tlx.require_layout(offs_am[:, None] * stride_am + offs_ak[None, :] * stride_ak, g_load_layout)
@@ -1031,8 +1079,20 @@ def _a4w4_8wave_merged_scales_kernel(
     shared_tile: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases(
         [[1024, 32]],
         [
-            [0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64],
-            [1, 0], [32, 0], [64, 0], [2, 0], [4, 0], [8, 0], [16, 0],
+            [0, 1],
+            [0, 2],
+            [0, 4],
+            [0, 8],
+            [0, 16],
+            [0, 32],
+            [0, 64],
+            [1, 0],
+            [32, 0],
+            [64, 0],
+            [2, 0],
+            [4, 0],
+            [8, 0],
+            [16, 0],
         ],
         [HALF_M, HALF_K],
     )
@@ -1046,9 +1106,19 @@ def _a4w4_8wave_merged_scales_kernel(
     # the A view; physical bit 12 selects the second K tile.
     shared_merged_a_scales_combined: tl.constexpr = tlx.shared_linear_layout_encoding(
         offset_bases=[
-            [0, 0, 4], [0, 32, 0], [0, 64, 0], [0, 128, 0],
-            [0, 1, 0], [0, 2, 0], [0, 4, 0], [0, 8, 0],
-            [0, 16, 0], [0, 0, 1], [0, 0, 2], [0, 0, 0], [1, 0, 0],
+            [0, 0, 4],
+            [0, 32, 0],
+            [0, 64, 0],
+            [0, 128, 0],
+            [0, 1, 0],
+            [0, 2, 0],
+            [0, 4, 0],
+            [0, 8, 0],
+            [0, 16, 0],
+            [0, 0, 1],
+            [0, 0, 2],
+            [0, 0, 0],
+            [1, 0, 0],
         ],
         block_bases=[],
         alignment=16,
@@ -1058,9 +1128,19 @@ def _a4w4_8wave_merged_scales_kernel(
     # slicing.
     shared_merged_b_scales: tl.constexpr = tlx.shared_linear_layout_encoding(
         offset_bases=[
-            [0, 1, 0], [0, 2, 0], [0, 4, 0], [0, 8, 0], [0, 16, 0],
-            [0, 32, 0], [0, 64, 0], [0, 128, 0], [0, 16, 1], [0, 0, 2],
-            [0, 32, 4], [1, 0, 0], [2, 0, 0],
+            [0, 1, 0],
+            [0, 2, 0],
+            [0, 4, 0],
+            [0, 8, 0],
+            [0, 16, 0],
+            [0, 32, 0],
+            [0, 64, 0],
+            [0, 128, 0],
+            [0, 16, 1],
+            [0, 0, 2],
+            [0, 32, 4],
+            [1, 0, 0],
+            [2, 0, 0],
         ],
         block_bases=[],
         alignment=16,
@@ -1068,7 +1148,19 @@ def _a4w4_8wave_merged_scales_kernel(
     # The merged DMA writes one raw byte-linear 8192-byte A+B image.
     shared_scale_merged: tl.constexpr = tlx.shared_linear_layout_encoding(
         offset_bases=[
-            [1], [2], [4], [8], [16], [32], [64], [128], [256], [512], [1024], [2048], [4096],
+            [1],
+            [2],
+            [4],
+            [8],
+            [16],
+            [32],
+            [64],
+            [128],
+            [256],
+            [512],
+            [1024],
+            [2048],
+            [4096],
         ],
         block_bases=[],
         alignment=16,
@@ -1145,12 +1237,10 @@ def _a4w4_8wave_merged_scales_kernel(
     smem_a_bot = tlx.local_alloc((HALF_M, HALF_K), tlx.dtype_of(a_ptr), 2, layout=shared_tile)
     smem_b_left = tlx.local_alloc((HALF_N, HALF_K), tlx.dtype_of(b_ptr), 2, layout=shared_tile)
     smem_b_right = tlx.local_alloc((HALF_N, HALF_K), tlx.dtype_of(b_ptr), 2, layout=shared_tile)
-    smem_sc = tlx.local_alloc(
-        (2 * (BLOCK_M + BLOCK_N) * NG, ), tlx.dtype_of(scales_ptr), 1, layout=shared_scale_merged)
-    smem_sc_a_view = tlx.local_reinterpret(
-        smem_sc[0], tl.uint8, [2, BLOCK_M, NG], layout=shared_merged_a_scales_combined)
-    smem_sc_b_view = tlx.local_reinterpret(
-        smem_sc[0], tl.uint8, [4, BLOCK_N, NG], layout=shared_merged_b_scales)
+    smem_sc = tlx.local_alloc((2 * (BLOCK_M + BLOCK_N) * NG, ), tlx.dtype_of(scales_ptr), 1, layout=shared_scale_merged)
+    smem_sc_a_view = tlx.local_reinterpret(smem_sc[0], tl.uint8, [2, BLOCK_M, NG],
+                                           layout=shared_merged_a_scales_combined)
+    smem_sc_b_view = tlx.local_reinterpret(smem_sc[0], tl.uint8, [4, BLOCK_N, NG], layout=shared_merged_b_scales)
     offs_am = tl.arange(0, HALF_M)
     offs_ak = tl.arange(0, HALF_K)
     a_tile_offsets = tlx.require_layout(offs_am[:, None] * stride_am + offs_ak[None, :] * stride_ak, g_load_layout)
@@ -1221,10 +1311,8 @@ def _a4w4_8wave_merged_scales_kernel(
     tlx.async_load_wait_group(6)
     b_left = tlx.local_load(tlx.local_trans(smem_b_left[0]), relaxed=True)
     a_top = tlx.local_load(smem_a_top[0], relaxed=True)
-    b_sc_view_init = tlx.local_slice(
-        smem_sc_b_view, [1, 0, 0], [1, BLOCK_N, NG])
-    a_sc_view_init = tlx.local_slice(
-        smem_sc_a_view, [0, 0, 0], [1, BLOCK_M, NG])
+    b_sc_view_init = tlx.local_slice(smem_sc_b_view, [1, 0, 0], [1, BLOCK_N, NG])
+    a_sc_view_init = tlx.local_slice(smem_sc_a_view, [0, 0, 0], [1, BLOCK_M, NG])
     a_sc_comb = tlx.local_load(a_sc_view_init, layout=scale_a_comb_layout, relaxed=True)
     a_sc_t, a_sc_b = tl.split(tl.trans(tl.reshape(a_sc_comb, 2, HALF_M, NG), 1, 2, 0))
     a_sc_top = tlx.require_layout(a_sc_t, scale_a_layout)
@@ -1270,10 +1358,8 @@ def _a4w4_8wave_merged_scales_kernel(
             acc_br = tl.dot_scaled(a_bot, a_sc_bot, "e2m1", b_right, b_sc_right, "e2m1", acc_br)
         with tlx.warp_pipeline_stage("mem", priority=1):
             a_top = tlx.local_load(smem_a_top[1], relaxed=True)
-            a_sc_view_1 = tlx.local_slice(
-                smem_sc_a_view, [1, 0, 0], [1, BLOCK_M, NG])
-            b_sc_view_1 = tlx.local_slice(
-                smem_sc_b_view, [3, 0, 0], [1, BLOCK_N, NG])
+            a_sc_view_1 = tlx.local_slice(smem_sc_a_view, [1, 0, 0], [1, BLOCK_M, NG])
+            b_sc_view_1 = tlx.local_slice(smem_sc_b_view, [3, 0, 0], [1, BLOCK_N, NG])
             a_sc_comb = tlx.local_load(a_sc_view_1, layout=scale_a_comb_layout, relaxed=True)
             a_sc_t, a_sc_b = tl.split(tl.trans(tl.reshape(a_sc_comb, 2, HALF_M, NG), 1, 2, 0))
             a_sc_top = tlx.require_layout(a_sc_t, scale_a_layout)
@@ -1321,10 +1407,8 @@ def _a4w4_8wave_merged_scales_kernel(
             acc_br = tl.dot_scaled(a_bot, a_sc_bot, "e2m1", b_right, b_sc_right, "e2m1", acc_br)
         with tlx.warp_pipeline_stage("mem", priority=1):
             a_top = tlx.local_load(smem_a_top[0], relaxed=True)
-            a_sc_view_0 = tlx.local_slice(
-                smem_sc_a_view, [0, 0, 0], [1, BLOCK_M, NG])
-            b_sc_view_0 = tlx.local_slice(
-                smem_sc_b_view, [1, 0, 0], [1, BLOCK_N, NG])
+            a_sc_view_0 = tlx.local_slice(smem_sc_a_view, [0, 0, 0], [1, BLOCK_M, NG])
+            b_sc_view_0 = tlx.local_slice(smem_sc_b_view, [1, 0, 0], [1, BLOCK_N, NG])
             a_sc_comb = tlx.local_load(a_sc_view_0, layout=scale_a_comb_layout, relaxed=True)
             a_sc_t, a_sc_b = tl.split(tl.trans(tl.reshape(a_sc_comb, 2, HALF_M, NG), 1, 2, 0))
             a_sc_top = tlx.require_layout(a_sc_t, scale_a_layout)
@@ -1356,10 +1440,8 @@ def _a4w4_8wave_merged_scales_kernel(
     acc_br = tl.dot_scaled(a_bot, a_sc_bot, "e2m1", b_right, b_sc_right, "e2m1", acc_br)
     tlx.async_load_wait_group(2)
     a_top = tlx.local_load(tlx.local_view(smem_a_top, g_idx), relaxed=True)
-    a_sc_view_epilogue = tlx.local_slice(
-        smem_sc_a_view, [1, 0, 0], [1, BLOCK_M, NG])
-    b_sc_view_epilogue = tlx.local_slice(
-        smem_sc_b_view, [3, 0, 0], [1, BLOCK_N, NG])
+    a_sc_view_epilogue = tlx.local_slice(smem_sc_a_view, [1, 0, 0], [1, BLOCK_M, NG])
+    b_sc_view_epilogue = tlx.local_slice(smem_sc_b_view, [3, 0, 0], [1, BLOCK_N, NG])
     a_sc_comb = tlx.local_load(a_sc_view_epilogue, layout=scale_a_comb_layout, relaxed=True)
     a_sc_t, a_sc_b = tl.split(tl.trans(tl.reshape(a_sc_comb, 2, HALF_M, NG), 1, 2, 0))
     a_sc_top = tlx.require_layout(a_sc_t, scale_a_layout)
@@ -1498,40 +1580,22 @@ def preshuffle_mxfp4_a_scales(scales):
     value (0x7f).
     """
     padded, padded_rows, padded_groups = _pad_mxfp4_scales(scales)
-    return (
-        padded.reshape(
-            padded_rows // 256, 2, 2, 2, 2, 2, 2, 2, 2,
-            padded_groups // 8, 2, 2, 2)
-        .permute(0, 9, 11, 12, 7, 8, 4, 5, 6, 1, 2, 3, 10)
-        .contiguous()
-        .reshape(-1)
-    )
+    return (padded.reshape(padded_rows // 256, 2, 2, 2, 2, 2, 2, 2, 2, padded_groups // 8, 2, 2,
+                           2).permute(0, 9, 11, 12, 7, 8, 4, 5, 6, 1, 2, 3, 10).contiguous().reshape(-1))
 
 
 def _preshuffle_mxfp4_a_scales_b128(scales):
     """Pack A scales for the merged ABI's conflict-free 128-bit LDS read."""
     padded, padded_rows, padded_groups = _pad_mxfp4_scales(scales)
-    return (
-        padded.reshape(
-            padded_rows // 256, 2, 2, 2, 2, 2, 2, 2, 2,
-            padded_groups // 8, 2, 2, 2)
-        .permute(0, 9, 11, 12, 4, 5, 6, 7, 8, 1, 2, 3, 10)
-        .contiguous()
-        .reshape(-1)
-    )
+    return (padded.reshape(padded_rows // 256, 2, 2, 2, 2, 2, 2, 2, 2, padded_groups // 8, 2, 2,
+                           2).permute(0, 9, 11, 12, 4, 5, 6, 7, 8, 1, 2, 3, 10).contiguous().reshape(-1))
 
 
 def preshuffle_mxfp4_b_scales(scales):
     """Pack B scales into the ordinary 64-bit LDS consumer order."""
     padded, padded_rows, padded_groups = _pad_mxfp4_scales(scales)
-    return (
-        padded.reshape(
-            padded_rows // 256, 2, 2, 2, 2, 2, 2, 2, 2,
-            padded_groups // 8, 2, 2, 2)
-        .permute(0, 9, 11, 12, 3, 8, 4, 5, 6, 7, 1, 2, 10)
-        .contiguous()
-        .reshape(-1)
-    )
+    return (padded.reshape(padded_rows // 256, 2, 2, 2, 2, 2, 2, 2, 2, padded_groups // 8, 2, 2,
+                           2).permute(0, 9, 11, 12, 3, 8, 4, 5, 6, 7, 1, 2, 10).contiguous().reshape(-1))
 
 
 def _preshuffle_mxfp4_b_scales_conflict_free(scales):

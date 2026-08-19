@@ -1320,34 +1320,25 @@ the same reason. Both operations are available on TDM-capable AMD targets
 (`gfx1250+`) and should be synchronized with
 `tlx.async_amd_descriptor_wait`.
 
-`tlx.async_amd_descriptor_load_group(descs, results, offsets, warp_masks,
-preds=None)` groups multiple AMD TDM descriptor loads behind one static hardware
-TDM instruction. Each list entry is one arm:
-
-| Argument | Description |
-|----------|-------------|
-| `descs[i]` | Tensor descriptor for arm `i`. |
-| `results[i]` | Local buffer or local view receiving arm `i`. |
-| `offsets[i]` | Offset list for arm `i`; all arms must have the same rank. |
-| `warp_masks[i]` | Bitmask selecting the waves that use arm `i`. |
-| `preds[i]` | Optional predicate for arm `i`; defaults to true. |
-
-The warp masks must be non-empty, disjoint, axis-aligned, and cover all waves in
-the CTA exactly once. The grouped operation currently requires one CTA, the same
-rank and element bitwidth for every arm, one shared cache modifier, and shared
-layouts supported by AMD TDM lowering. This is useful for kernels where
-different wave groups load different inputs, such as A/B GEMM tiles or A/B plus
-scale tiles in MXFP GEMM, while keeping the assembly to one TDM instruction per
-load group.
+`tlx.async_amd_descriptor_load_fused(members, cache_modifier="")` fuses two to
+four AMD TDM descriptor loads behind one static hardware instruction. Each
+member is a `(positioned_desc, destination, warp_used_hint)` tuple. Position
+descriptors with `tlx.update_tensor_descriptor` before issuing the fused load.
+The hints must be non-empty, pairwise disjoint, and legal axis-aligned subsets
+of the CTA's waves; they do not need to cover every wave. Members must have the
+same descriptor rank but may have different shapes and element types. All
+members share one cache modifier.
 
 Example:
 ```python
-a_tok = tlx.async_amd_descriptor_load_group(
-    [a_desc, b_desc],
-    [tlx.local_view(a_buf, slot), tlx.local_view(b_buf, slot)],
-    [[off_m, k * BLOCK_K], [k * BLOCK_K, off_n]],
-    [0b0011, 0b1100],
-)
+a_load_desc = tlx.update_tensor_descriptor(
+    a_desc, add_offsets=[off_m, k * BLOCK_K], pred=True, clamp_bounds=True)
+b_load_desc = tlx.update_tensor_descriptor(
+    b_desc, add_offsets=[k * BLOCK_K, off_n], pred=True, clamp_bounds=True)
+a_tok = tlx.async_amd_descriptor_load_fused([
+    (a_load_desc, tlx.local_view(a_buf, slot), 0b0011),
+    (b_load_desc, tlx.local_view(b_buf, slot), 0b1100),
+])
 tlx.async_amd_descriptor_wait(0, [a_tok])
 ```
 

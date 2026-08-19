@@ -150,22 +150,25 @@ def amd_scheduled_mfma(
 
 
 @tl.builtin
-def amd_mfma_commit(value, preserve, _semantic=None):
-    """Commit transient MFMA results and thread a live dot operand.
+def amd_mfma_commit(value, preserve=None, _semantic=None):
+    """Commit MFMA results and optionally thread a live dot operand.
 
     ``value`` may be one tensor or a tuple of independent transient
     ``amd_scheduled_mfma`` results. The returned copy of ``preserve`` can be
-    consumed by the next source stage to make its residency explicit.
+    consumed by the next source stage to make its residency explicit. With no
+    ``preserve``, the values form one persistent-AGPR epilogue boundary.
     """
     single_value = isinstance(value, tl.tensor)
     values = (value, ) if single_value else value
     assert isinstance(values,
                       (tuple, tl.tuple)) and len(values) > 0, ("value must be a tensor or nonempty tensor tuple")
     assert all(isinstance(item, tl.tensor) for item in values), ("value must contain only tensors")
-    assert isinstance(preserve, tl.tensor), "preserve must be a tensor"
-    inputs = tuple(values) + (preserve, )
+    assert preserve is None or isinstance(preserve, tl.tensor), ("preserve must be None or a tensor")
+    inputs = tuple(values) + (() if preserve is None else (preserve, ))
     handles = _semantic.builder.create_amd_mfma_commit([item.handle for item in inputs])
     outputs = tuple(tl.tensor(handle, item.type) for handle, item in zip(handles, inputs))
+    if preserve is None:
+        return outputs[0] if single_value else outputs
     if single_value:
         return outputs[0], outputs[-1]
     return outputs

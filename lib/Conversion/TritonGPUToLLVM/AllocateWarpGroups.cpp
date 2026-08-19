@@ -221,9 +221,8 @@ struct AllocateWarpGroups
 
       // Group the partitions into warpgroups.
       SmallVector<WarpGroupPartition> orderedPartitions;
-      for (auto [startId, partition, estRegs, numWarps] :
-           llvm::zip(startIds, op.getPartitionRegions(), requestedRegisters,
-                     arr)) {
+      for (auto [startId, partition, estRegs, numWarps] : llvm::zip(
+               startIds, op.getPartitionRegions(), requestedRegisters, arr)) {
         int minRegs =
             minRegistersForRegion(*partition, laterInstrumentation, estRegs);
         orderedPartitions.push_back({startId, partition, minRegs, numWarps});
@@ -271,8 +270,7 @@ struct AllocateWarpGroups
       for (const WarpGroupInfo &wg : warpGroups) {
         assert(wg.numWarps % 4 == 0);
         if (wg.maxRequestedRegs > 0)
-          remainingRegs -=
-              wg.maxRequestedRegs * wg.numWarps * threadsPerWarp;
+          remainingRegs -= wg.maxRequestedRegs * wg.numWarps * threadsPerWarp;
         else
           sharingThreads += wg.numWarps * threadsPerWarp;
       }
@@ -291,11 +289,9 @@ struct AllocateWarpGroups
           return;
       }
 
-      maxnregsPerPartition.front() =
-          defaultRegs > 0 ? defaultRegs : sharedRegs;
+      maxnregsPerPartition.front() = defaultRegs > 0 ? defaultRegs : sharedRegs;
       for (const WarpGroupInfo &wg : warpGroups) {
-        int regs =
-            wg.maxRequestedRegs > 0 ? wg.maxRequestedRegs : sharedRegs;
+        int regs = wg.maxRequestedRegs > 0 ? wg.maxRequestedRegs : sharedRegs;
         for (Region *region : wg.partitions)
           maxnregsPerPartition[1 + region->getRegionNumber()] = regs;
       }
