@@ -182,8 +182,8 @@
     b_tail = tl.load(B + b_offs.to(tl.int32), mask=offs_k[:, None] < tail_width, other=0.0)
     acc = tl.dot(a_tail, b_tail, acc, allow_tf32=ALLOW_TF32, out_dtype=ACC_TYPE)
 {% else %}
-    # --- register-path fallback (USE_ASYNC=0: (K*itemsize) % 16 != 0, e.g. odd/sliced/small K) ---
-    # buffer_load (tl.load) is element-granular, so it lowers for ANY row-stride alignment where the
+    # --- register path (USE_ASYNC=0: unaligned K, or a short-K autotune candidate) ---
+    # tl.load is element-granular, so it lowers for ANY row-stride alignment where the
     # direct-to-LDS async_load cannot -- same mechanism as the bmm register branch (T280910119).
     # A is loaded [BLOCK_M, BLOCK_K]; col-major B [K,N] is loaded [BLOCK_K, BLOCK_N] with K along rows
     # (same index as the sync-tail above) so it feeds tl.dot directly (no local_trans). The masked
