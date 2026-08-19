@@ -179,6 +179,11 @@ struct CommChannel {
   // Producer barrier is only needed when the producer op itself can update the
   // barrier inline, such as the TMA load.
   std::optional<Value> producerBarrier;
+  // Full-cluster rendezvous used before a multicast producer reuses a slot.
+  std::optional<Value> multicastReuseBarrier;
+  // Each consumer partition needs an independent ready rendezvous after the
+  // multicast completion wait.
+  DenseMap<int, Value> multicastReadyBarriers;
   // Consumer barrier is only needed when the consumer op itself can update the
   // barrier inline, such as MMAv5 ops.
   DenseMap<int, Value> consumerBarriers;
@@ -311,8 +316,10 @@ Value getBarrierForPipelineStage(OpBuilderWithAsyncTaskIds &builder,
 Operation *
 optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
                  SmallVector<triton::nvws::DescriptorLoadOp> &tmaLoads,
-                 Value barrierAlloc, Value bufferIdx, Value bufferIdxExtract,
-                 Value phase, Operation *headProducer, Operation *headConsumer,
+                 Value barrierAlloc, Value multicastReuseBarrier,
+                 const DenseMap<int, Value> &multicastReadyBarriers,
+                 Value bufferIdx, Value bufferIdxExtract, Value phase,
+                 Operation *headProducer, Operation *headConsumer,
                  Operation *headConsumerSameLevel,
                  ArrayRef<int> additionalConsumerTaskIds = {},
                  DictionaryAttr consumerWaitConstraints = {});

@@ -1,4 +1,4 @@
-// RUN: triton-opt -split-input-file --allocate-shared-memory-nv --convert-triton-gpu-to-llvm=compute-capability=100 --verify-diagnostics %s| FileCheck %s
+// RUN: triton-opt -split-input-file --triton-nvidia-tma-lowering --allocate-shared-memory-nv --convert-triton-gpu-to-llvm=compute-capability=100 --verify-diagnostics %s| FileCheck %s
 
 
 #shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
@@ -238,6 +238,40 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
 
     %2 = ttng.map_to_remote_buffer %1, %c0_i32 : !ttg.memdesc<1xi64, #shared, #smem, mutable> -> !ttg.memdesc<1xi64, #shared, #ttng.shared_cluster_memory, mutable>
     ttng.arrive_barrier %2, 1 : !ttg.memdesc<1xi64, #shared, #ttng.shared_cluster_memory, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+#tma = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#barrier = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+module attributes {
+  "ttg.cluster-dim-x" = 2 : i32,
+  "ttg.cluster-dim-y" = 1 : i32,
+  "ttg.cluster-dim-z" = 1 : i32,
+  "ttg.num-ctas" = 1 : i32,
+  "ttg.num-warps" = 4 : i32,
+  ttg.target = "cuda:100",
+  "ttg.threads-per-warp" = 32 : i32
+} {
+  // CHECK-LABEL: @planned_multicast_bar_init
+  tt.func public @planned_multicast_bar_init(
+      %desc: !tt.tensordesc<64x64xf16, #tma>) attributes {noinline = false} {
+    %c0 = arith.constant 0 : i32
+    %true = arith.constant true
+    %buffer = ttg.local_alloc : () -> !ttg.memdesc<64x64xf16, #tma, #smem, mutable>
+    %bar = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #barrier, #smem, mutable>
+    // CHECK: mbarrier.init.shared::cta.b64
+    // CHECK: fence.mbarrier_init.release.cluster
+    // CHECK-NEXT: nvvm.cluster.arrive.relaxed {aligned}
+    // CHECK-NEXT: nvvm.cluster.wait {aligned}
+    // CHECK: mbarrier.arrive.expect_tx.shared::cta
+    // CHECK: cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes.multicast::cluster
+    ttng.init_barrier %bar, 1 : !ttg.memdesc<1xi64, #barrier, #smem, mutable>
+    ttng.barrier_expect %bar, 8192, %true : !ttg.memdesc<1xi64, #barrier, #smem, mutable>
+    ttng.async_tma_copy_global_to_local %desc[%c0, %c0] %buffer, %bar, %true {tt.multicast_axes = array<i32: 0>} : !tt.tensordesc<64x64xf16, #tma>, !ttg.memdesc<1xi64, #barrier, #smem, mutable> -> !ttg.memdesc<64x64xf16, #tma, #smem, mutable>
     tt.return
   }
 }
