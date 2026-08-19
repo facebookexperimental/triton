@@ -143,6 +143,38 @@ matching while result and after-region argument, and the after-region
 After rewriting, runs dead code elimination and removes orphaned operations
 that are no longer referenced after partitioning.
 
+### Step 7: Conditional TMEM rescale materialization
+
+FA forward represents its optional accumulator rescale as an eager SSA select
+before tensor-memory allocation is hoisted. `HoistTMEMAlloc` first folds that
+select into a predicated accumulator `TMEMStoreOp`. M partitioning creates one
+scalar predicate and one accumulator view per partition. Partition scheduling
+then co-locates the scalar predicate chain with the correction store. It also
+pulls the single-consumer tensor elementwise predicate operation directly
+feeding that chain, such as `alpha < 1`, into the correction partition while
+leaving its tensor operands as channel boundaries. This makes the
+already-required alpha value the channel boundary and avoids materializing a
+redundant tensor predicate channel. After warp specialization and software
+pipelining have materialized each task, the post-pipeline `HoistTMEMAlloc` pass
+rewrites each such update as:
+
+```mlir
+scf.if %should_rescale {
+  %acc = ttng.tmem_load %buffer
+  %scaled = arith.mulf %acc, %alpha
+  ttng.tmem_store %scaled, %buffer, %true
+}
+```
+
+Delaying the rewrite until each task has been materialized keeps the
+branch within the accumulator task instead of creating an unsupported
+cross-task async-token channel. At that point synchronization is normally
+barrier-managed and the TMEM ops are tokenless; if explicit tokens remain, the
+then branch yields the written token and the else branch yields the incoming
+token. The side-effecting branch cannot be canonicalized back to an eager
+select, so a false predicate skips the accumulator TMEM load, arithmetic, and
+store.
+
 ## Key Design Points
 
 ### Partition Dimension Tracking
