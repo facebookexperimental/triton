@@ -48,19 +48,50 @@ def matmul_kernel_tma_ws(
     B_COL_MAJOR: tl.constexpr,
     DATA_PARTITION_FACTOR: tl.constexpr,
     SEPARATE_EPILOGUE_STORE: tl.constexpr,
+    GROUP_SIZE_N: tl.constexpr = 1,
+    MULTICAST_MAPPING: tl.constexpr = False,
+    PADDED_MAPPING: tl.constexpr = False,
+    SWIZZLE_MN: tl.constexpr = False,
 ):
     """TMA-based matmul with warp specialization in K-loop (always enabled)."""
     dtype = tl.float16
 
-    pid = tl.program_id(axis=0)
     num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
-    num_pid_in_group = GROUP_SIZE_M * num_pid_n
-    group_id = pid // num_pid_in_group
-    first_pid_m = group_id * GROUP_SIZE_M
-    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
-    pid_m = first_pid_m + (pid % group_size_m)
-    pid_n = (pid % num_pid_in_group) // group_size_m
+    if MULTICAST_MAPPING:
+        pid_m = tl.program_id(axis=0)
+        pid_n = tl.program_id(axis=1)
+    elif PADDED_MAPPING:
+        pid = tl.program_id(axis=0)
+        group_size = GROUP_SIZE_N if SWIZZLE_MN else GROUP_SIZE_M
+        cluster_id = pid // group_size
+        cluster_local = pid % group_size
+        if SWIZZLE_MN:
+            num_group_n = tl.cdiv(num_pid_n, GROUP_SIZE_N)
+            group_n = cluster_id % num_group_n
+            pid_m = cluster_id // num_group_n
+            pid_n = group_n * GROUP_SIZE_N + cluster_local
+        else:
+            num_group_m = tl.cdiv(num_pid_m, GROUP_SIZE_M)
+            group_m = cluster_id % num_group_m
+            pid_m = group_m * GROUP_SIZE_M + cluster_local
+            pid_n = cluster_id // num_group_m
+    else:
+        pid = tl.program_id(axis=0)
+        if SWIZZLE_MN:
+            num_pid_in_group = GROUP_SIZE_N * num_pid_m
+            group_id = pid // num_pid_in_group
+            first_pid_n = group_id * GROUP_SIZE_N
+            group_size_n = min(num_pid_n - first_pid_n, GROUP_SIZE_N)
+            pid_n = first_pid_n + (pid % group_size_n)
+            pid_m = (pid % num_pid_in_group) // group_size_n
+        else:
+            num_pid_in_group = GROUP_SIZE_M * num_pid_n
+            group_id = pid // num_pid_in_group
+            first_pid_m = group_id * GROUP_SIZE_M
+            group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+            pid_m = first_pid_m + (pid % group_size_m)
+            pid_n = (pid % num_pid_in_group) // group_size_m
 
     k_tiles = tl.cdiv(K, BLOCK_SIZE_K)
 
@@ -91,7 +122,11 @@ def matmul_kernel_tma_ws(
 
     offs_cm = pid_m * BLOCK_SIZE_M
     offs_cn = pid_n * BLOCK_SIZE_N
-    c_desc.store([offs_cm, offs_cn], c)
+    if MULTICAST_MAPPING or PADDED_MAPPING:
+        if (pid_m < num_pid_m) & (pid_n < num_pid_n):
+            c_desc.store([offs_cm, offs_cn], c)
+    else:
+        c_desc.store([offs_cm, offs_cn], c)
 
 
 # ============================================================================
@@ -117,14 +152,29 @@ def matmul_kernel_tma_persistent_ws(
     B_COL_MAJOR: tl.constexpr,
     DATA_PARTITION_FACTOR: tl.constexpr,
     SEPARATE_EPILOGUE_STORE: tl.constexpr,
+    MULTICAST_MAPPING: tl.constexpr = False,
+    CLUSTER_SIZE_M: tl.constexpr = 1,
+    CLUSTER_SIZE_N: tl.constexpr = 1,
 ):
     """Persistent TMA matmul with warp specialization (always enabled)."""
     dtype = tl.float16
-    start_pid = tl.program_id(axis=0)
     num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
     k_tiles = tl.cdiv(K, BLOCK_SIZE_K)
-    num_tiles = num_pid_m * num_pid_n
+    if MULTICAST_MAPPING:
+        local_m = tl.program_id(axis=0) % CLUSTER_SIZE_M
+        local_n = tl.program_id(axis=1) % CLUSTER_SIZE_N
+        cluster_m = tl.program_id(axis=0) // CLUSTER_SIZE_M
+        cluster_n = tl.program_id(axis=1) // CLUSTER_SIZE_N
+        num_cluster_m = tl.cdiv(num_pid_m, CLUSTER_SIZE_M)
+        num_cluster_n = tl.cdiv(num_pid_n, CLUSTER_SIZE_N)
+        start_pid = cluster_m * num_cluster_n + cluster_n
+        num_tiles = num_cluster_m * num_cluster_n
+        tile_stride = (tl.num_programs(0) // CLUSTER_SIZE_M) * (tl.num_programs(1) // CLUSTER_SIZE_N)
+    else:
+        start_pid = tl.program_id(axis=0)
+        num_tiles = num_pid_m * num_pid_n
+        tile_stride = NUM_SMS
 
     num_pid_in_group = GROUP_SIZE_M * num_pid_n
 
@@ -132,13 +182,17 @@ def matmul_kernel_tma_persistent_ws(
     for tile_id in tl.range(
             start_pid,
             num_tiles,
-            NUM_SMS,
+            tile_stride,
             flatten=FLATTEN,
             warp_specialize=True,
             data_partition_factor=DATA_PARTITION_FACTOR,
             separate_epilogue_store=SEPARATE_EPILOGUE_STORE,
     ):
-        pid_m, pid_n = _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS)
+        if MULTICAST_MAPPING:
+            pid_m = (tile_id // num_cluster_n) * CLUSTER_SIZE_M + local_m
+            pid_n = (tile_id % num_cluster_n) * CLUSTER_SIZE_N + local_n
+        else:
+            pid_m, pid_n = _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS)
         offs_am = pid_m * BLOCK_SIZE_M
         offs_bn = pid_n * BLOCK_SIZE_N
 
@@ -158,10 +212,133 @@ def matmul_kernel_tma_persistent_ws(
         acc_slices = _split_n_2D(accumulator, EPILOGUE_SUBTILE)
         slice_size: tl.constexpr = BLOCK_SIZE_N // EPILOGUE_SUBTILE
         for slice_id in tl.static_range(0, EPILOGUE_SUBTILE):
-            c_desc.store(
-                [offs_am, offs_bn + slice_id * slice_size],
-                acc_slices[slice_id].to(dtype),
-            )
+            if MULTICAST_MAPPING:
+                if (pid_m < num_pid_m) & (pid_n < num_pid_n):
+                    c_desc.store(
+                        [offs_am, offs_bn + slice_id * slice_size],
+                        acc_slices[slice_id].to(dtype),
+                    )
+            else:
+                c_desc.store(
+                    [offs_am, offs_bn + slice_id * slice_size],
+                    acc_slices[slice_id].to(dtype),
+                )
+
+
+# ============================================================================
+# Kernel 2a: persistent TMA matmul with a guarded epilogue
+# Programs are arranged into 2-D tile groups. The same program shape can run as
+# independent CTAs or as CUDA clusters that multicast the A and B TMA loads.
+# ============================================================================
+@triton.jit
+def matmul_kernel_tma_persistent_guarded_epilogue_ws(
+    a_desc,
+    b_desc,
+    c_desc,
+    M,
+    N,
+    K,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    CTA_GROUP_M: tl.constexpr,
+    CTA_GROUP_N: tl.constexpr,
+):
+    dtype = tl.float16
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    k_tiles = tl.cdiv(K, BLOCK_SIZE_K)
+
+    program_m = tl.program_id(0)
+    program_n = tl.program_id(1)
+    group_m = program_m // CTA_GROUP_M
+    group_n = program_n // CTA_GROUP_N
+    local_m = program_m % CTA_GROUP_M
+    local_n = program_n % CTA_GROUP_N
+
+    num_group_m = tl.cdiv(num_pid_m, CTA_GROUP_M)
+    num_group_n = tl.cdiv(num_pid_n, CTA_GROUP_N)
+    group_id = group_m * num_group_n + group_n
+    num_groups = num_group_m * num_group_n
+    group_stride = (tl.num_programs(0) // CTA_GROUP_M) * (tl.num_programs(1) // CTA_GROUP_N)
+
+    for tile_group_id in tl.range(group_id, num_groups, group_stride, warp_specialize=True):
+        tile_group_m = tile_group_id // num_group_n
+        tile_group_n = tile_group_id % num_group_n
+        pid_m = tile_group_m * CTA_GROUP_M + local_m
+        pid_n = tile_group_n * CTA_GROUP_N + local_n
+        offs_am = pid_m * BLOCK_SIZE_M
+        offs_bn = pid_n * BLOCK_SIZE_N
+
+        accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+        for ki in range(k_tiles):
+            offs_k = ki * BLOCK_SIZE_K
+            a = a_desc.load([offs_am, offs_k])
+            b = b_desc.load([offs_bn, offs_k])
+            accumulator = tl.dot(a, b.T, accumulator)
+
+        # Padded programs must remain on the collective path; only externally
+        # visible output is predicated on the logical tile being in bounds.
+        if (pid_m < num_pid_m) & (pid_n < num_pid_n):
+            c_desc.store([offs_am, offs_bn], accumulator.to(dtype))
+
+
+# ============================================================================
+# Kernel 2a-surviving: guarded clustered matmul with a persistent while loop.
+# ============================================================================
+@triton.jit
+def matmul_kernel_tma_persistent_guarded_epilogue_surviving_while_ws(
+    a_desc,
+    b_desc,
+    c_desc,
+    M,
+    N,
+    K,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    CTA_GROUP_M: tl.constexpr,
+    CTA_GROUP_N: tl.constexpr,
+):
+    dtype = tl.float16
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    k_tiles = tl.cdiv(K, BLOCK_SIZE_K)
+
+    program_m = tl.program_id(0)
+    program_n = tl.program_id(1)
+    group_m = program_m // CTA_GROUP_M
+    group_n = program_n // CTA_GROUP_N
+    local_m = program_m % CTA_GROUP_M
+    local_n = program_n % CTA_GROUP_N
+
+    num_group_m = tl.cdiv(num_pid_m, CTA_GROUP_M)
+    num_group_n = tl.cdiv(num_pid_n, CTA_GROUP_N)
+    tile_group_id = group_m * num_group_n + group_n
+    num_groups = num_group_m * num_group_n
+    group_stride = (tl.num_programs(0) // CTA_GROUP_M) * (tl.num_programs(1) // CTA_GROUP_N)
+    valid = tile_group_id < num_groups
+
+    while tl.condition(valid, warp_specialize=True):
+        tile_group_m = tile_group_id // num_group_n
+        tile_group_n = tile_group_id % num_group_n
+        pid_m = tile_group_m * CTA_GROUP_M + local_m
+        pid_n = tile_group_n * CTA_GROUP_N + local_n
+        offs_am = pid_m * BLOCK_SIZE_M
+        offs_bn = pid_n * BLOCK_SIZE_N
+
+        accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+        for ki in range(k_tiles):
+            offs_k = ki * BLOCK_SIZE_K
+            a = a_desc.load([offs_am, offs_k])
+            b = b_desc.load([offs_bn, offs_k])
+            accumulator = tl.dot(a, b.T, accumulator)
+
+        if (pid_m < num_pid_m) & (pid_n < num_pid_n):
+            c_desc.store([offs_am, offs_bn], accumulator.to(dtype))
+
+        tile_group_id += group_stride
+        valid = tile_group_id < num_groups
 
 
 # ============================================================================
@@ -183,19 +360,38 @@ def matmul_kernel_tma_static_persistent_ws_while(
     GROUP_SIZE_M: tl.constexpr,
     EPILOGUE_SUBTILE: tl.constexpr,
     NUM_SMS: tl.constexpr,
+    MULTICAST_MAPPING: tl.constexpr = False,
+    CLUSTER_SIZE_M: tl.constexpr = 1,
+    CLUSTER_SIZE_N: tl.constexpr = 1,
 ):
     dtype = tl.float16
-    start_pid = tl.program_id(axis=0)
     num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
     k_tiles = tl.cdiv(K, BLOCK_SIZE_K)
-    num_tiles = num_pid_m * num_pid_n
+    if MULTICAST_MAPPING:
+        local_m = tl.program_id(axis=0) % CLUSTER_SIZE_M
+        local_n = tl.program_id(axis=1) % CLUSTER_SIZE_N
+        cluster_m = tl.program_id(axis=0) // CLUSTER_SIZE_M
+        cluster_n = tl.program_id(axis=1) // CLUSTER_SIZE_N
+        num_cluster_m = tl.cdiv(num_pid_m, CLUSTER_SIZE_M)
+        num_cluster_n = tl.cdiv(num_pid_n, CLUSTER_SIZE_N)
+        start_pid = cluster_m * num_cluster_n + cluster_n
+        num_tiles = num_cluster_m * num_cluster_n
+        tile_stride = (tl.num_programs(0) // CLUSTER_SIZE_M) * (tl.num_programs(1) // CLUSTER_SIZE_N)
+    else:
+        start_pid = tl.program_id(axis=0)
+        num_tiles = num_pid_m * num_pid_n
+        tile_stride = NUM_SMS
 
     num_pid_in_group = GROUP_SIZE_M * num_pid_n
     tile_id = start_pid
 
     while tl.condition(tile_id < num_tiles, warp_specialize=True):
-        pid_m, pid_n = _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS)
+        if MULTICAST_MAPPING:
+            pid_m = (tile_id // num_cluster_n) * CLUSTER_SIZE_M + local_m
+            pid_n = (tile_id % num_cluster_n) * CLUSTER_SIZE_N + local_n
+        else:
+            pid_m, pid_n = _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS)
         offs_am = pid_m * BLOCK_SIZE_M
         offs_bn = pid_n * BLOCK_SIZE_N
 
@@ -209,11 +405,18 @@ def matmul_kernel_tma_static_persistent_ws_while(
         acc_slices = _split_n_2D(accumulator, EPILOGUE_SUBTILE)
         slice_size: tl.constexpr = BLOCK_SIZE_N // EPILOGUE_SUBTILE
         for slice_id in tl.static_range(0, EPILOGUE_SUBTILE):
-            c_desc.store(
-                [offs_am, offs_bn + slice_id * slice_size],
-                acc_slices[slice_id].to(dtype),
-            )
-        tile_id += NUM_SMS
+            if MULTICAST_MAPPING:
+                if (pid_m < num_pid_m) & (pid_n < num_pid_n):
+                    c_desc.store(
+                        [offs_am, offs_bn + slice_id * slice_size],
+                        acc_slices[slice_id].to(dtype),
+                    )
+            else:
+                c_desc.store(
+                    [offs_am, offs_bn + slice_id * slice_size],
+                    acc_slices[slice_id].to(dtype),
+                )
+        tile_id += tile_stride
 
 
 # ============================================================================
@@ -360,6 +563,7 @@ def matmul_kernel_tma_clc_persistent_ws_while(
     GROUP_SIZE_M: tl.constexpr,
     EPILOGUE_SUBTILE: tl.constexpr,
     NUM_SMS: tl.constexpr,
+    MULTICAST_MAPPING: tl.constexpr = False,
 ):
     dtype = tl.float16
     num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
@@ -369,8 +573,12 @@ def matmul_kernel_tma_clc_persistent_ws_while(
 
     sched = tl.clc_tile_scheduler()
     while sched.is_valid():
-        tile_id = sched.tile_id[0]
-        pid_m, pid_n = _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS)
+        if MULTICAST_MAPPING:
+            pid_m = sched.tile_id[0]
+            pid_n = sched.tile_id[1]
+        else:
+            tile_id = sched.tile_id[0]
+            pid_m, pid_n = _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS)
         offs_am = pid_m * BLOCK_SIZE_M
         offs_bn = pid_n * BLOCK_SIZE_N
 
@@ -384,10 +592,17 @@ def matmul_kernel_tma_clc_persistent_ws_while(
         acc_slices = _split_n_2D(accumulator, EPILOGUE_SUBTILE)
         slice_size: tl.constexpr = BLOCK_SIZE_N // EPILOGUE_SUBTILE
         for slice_id in tl.static_range(0, EPILOGUE_SUBTILE):
-            c_desc.store(
-                [offs_am, offs_bn + slice_id * slice_size],
-                acc_slices[slice_id].to(dtype),
-            )
+            if MULTICAST_MAPPING:
+                if (pid_m < num_pid_m) & (pid_n < num_pid_n):
+                    c_desc.store(
+                        [offs_am, offs_bn + slice_id * slice_size],
+                        acc_slices[slice_id].to(dtype),
+                    )
+            else:
+                c_desc.store(
+                    [offs_am, offs_bn + slice_id * slice_size],
+                    acc_slices[slice_id].to(dtype),
+                )
         # Claim the next tile via CLC hardware work-stealing.
         sched = sched.advance()
 
@@ -922,6 +1137,151 @@ def test_tutorial09_matmul_tma_persistent_warp_specialize(
 
 
 # ============================================================================
+# Test 2a: Padded persistent groups keep their guarded epilogue with and without
+# being bound into a physical CUDA cluster.
+# ============================================================================
+@pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell")
+@pytest.mark.parametrize("clustered", [False, True], ids=["independent-ctas", "2x2-cluster"])
+def test_tutorial09_matmul_tma_persistent_guarded_epilogue_warp_specialize(clustered):
+    block_m = 128
+    block_n = 128
+    block_k = 64
+    cta_group_m = 2
+    cta_group_n = 2
+    M = 5 * block_m
+    N = 3 * block_n
+    K = 256
+    dtype = torch.float16
+    device = "cuda"
+
+    torch.manual_seed(42)
+    a = torch.randn((M, K), dtype=dtype, device=device)
+    b = torch.randn((N, K), dtype=dtype, device=device)
+    c = torch.empty((M, N), dtype=dtype, device=device)
+
+    def alloc_fn(size, align, stream):
+        return torch.empty(size, dtype=torch.int8, device=device)
+
+    triton.set_allocator(alloc_fn)
+    a_desc = TensorDescriptor(a, a.shape, a.stride(), [block_m, block_k])
+    b_desc = TensorDescriptor(b, b.shape, b.stride(), [block_n, block_k])
+    c_desc = TensorDescriptor(c, c.shape, c.stride(), [block_m, block_n])
+
+    num_group_m = triton.cdiv(triton.cdiv(M, block_m), cta_group_m)
+    num_group_n = triton.cdiv(triton.cdiv(N, block_n), cta_group_n)
+    launched_group_m = min(num_group_m, 2)
+    grid = (launched_group_m * cta_group_m, num_group_n * cta_group_n)
+    launch_options = {"num_stages": 3, "num_warps": 4, "multicast": clustered}
+    if clustered:
+        launch_options["ctas_per_cga"] = (cta_group_m, cta_group_n, 1)
+
+    with triton.knobs.nvidia.scope():
+        triton.knobs.nvidia.use_meta_ws = True
+        triton.knobs.nvidia.use_meta_partition = True
+        kernel = matmul_kernel_tma_persistent_guarded_epilogue_ws[grid](
+            a_desc,
+            b_desc,
+            c_desc,
+            M,
+            N,
+            K,
+            BLOCK_SIZE_M=block_m,
+            BLOCK_SIZE_N=block_n,
+            BLOCK_SIZE_K=block_k,
+            CTA_GROUP_M=cta_group_m,
+            CTA_GROUP_N=cta_group_n,
+            **launch_options,
+        )
+
+    ttir = kernel.asm["ttir"]
+    ttir_dot_pos = ttir.index("tt.dot")
+    ttir_guard_pos = ttir.index("scf.if", ttir_dot_pos)
+    ttir_store_pos = ttir.index("tt.descriptor_store", ttir_guard_pos)
+    assert ttir_dot_pos < ttir_guard_pos < ttir_store_pos
+
+    ttgir = kernel.asm["ttgir"]
+    store_pos = ttgir.index("ttng.async_tma_copy_local_to_global")
+    epilogue_guard_pos = ttgir.rindex("scf.if", 0, store_pos)
+    tmem_load_pos = ttgir.index("ttng.tmem_load", epilogue_guard_pos, store_pos)
+    completion_wait_pos = ttgir.rindex("ttng.wait_barrier", 0, epilogue_guard_pos)
+    completion_arrive_pos = ttgir.index("ttng.arrive_barrier", store_pos)
+    assert completion_wait_pos < epilogue_guard_pos < tmem_load_pos < store_pos < completion_arrive_pos
+    assert ("multicast::cluster" in kernel.asm["ptx"]) == clustered
+
+    torch.cuda.synchronize()
+    ref = torch.matmul(a.to(torch.float32), b.T.to(torch.float32)).to(dtype)
+    torch.testing.assert_close(c, ref, atol=0.03, rtol=0.03)
+
+
+# ============================================================================
+# Test 2a-surviving: clustered multicast with a persistent while loop.
+# ============================================================================
+@pytest.mark.skipif(not (is_hopper() or is_blackwell()), reason="Requires Hopper or Blackwell")
+def test_tutorial09_matmul_tma_persistent_guarded_epilogue_surviving_while_autows():
+    block_m = 128
+    block_n = 128
+    block_k = 64
+    cta_group_m = 2
+    cta_group_n = 2
+    M = 5 * block_m
+    N = 3 * block_n
+    K = 256
+    dtype = torch.float16
+    device = "cuda"
+
+    torch.manual_seed(42)
+    a = torch.randn((M, K), dtype=dtype, device=device)
+    b = torch.randn((N, K), dtype=dtype, device=device)
+    c = torch.empty((M, N), dtype=dtype, device=device)
+
+    def alloc_fn(size, align, stream):
+        return torch.empty(size, dtype=torch.int8, device=device)
+
+    triton.set_allocator(alloc_fn)
+    a_desc = TensorDescriptor(a, a.shape, a.stride(), [block_m, block_k])
+    b_desc = TensorDescriptor(b, b.shape, b.stride(), [block_n, block_k])
+    c_desc = TensorDescriptor(c, c.shape, c.stride(), [block_m, block_n])
+
+    with triton.knobs.nvidia.scope():
+        triton.knobs.nvidia.use_meta_ws = True
+        triton.knobs.nvidia.use_meta_partition = True
+        kernel = matmul_kernel_tma_persistent_guarded_epilogue_surviving_while_ws[(cta_group_m, cta_group_n)](
+            a_desc,
+            b_desc,
+            c_desc,
+            M,
+            N,
+            K,
+            BLOCK_SIZE_M=block_m,
+            BLOCK_SIZE_N=block_n,
+            BLOCK_SIZE_K=block_k,
+            CTA_GROUP_M=cta_group_m,
+            CTA_GROUP_N=cta_group_n,
+            num_stages=3,
+            num_warps=4,
+            ctas_per_cga=(cta_group_m, cta_group_n, 1),
+            multicast=True,
+        )
+
+    ttir = kernel.asm["ttir"]
+    ttir_dot_pos = ttir.index("tt.dot")
+    ttir_guard_pos = ttir.index("scf.if", ttir_dot_pos)
+    assert "scf.while" in ttir
+    assert ttir_dot_pos < ttir_guard_pos
+
+    ttgir = kernel.asm["ttgir"]
+    assert "scf.while" in ttgir
+    assert "ttg.warp_specialize" in ttgir
+    assert "ttng.tc_gen5_mma" in ttgir or "ttng.warp_group_dot" in ttgir
+    assert "ttng.async_tma_copy_global_to_local" in ttgir
+    assert "multicast::cluster" in kernel.asm["ptx"]
+
+    torch.cuda.synchronize()
+    ref = torch.matmul(a.to(torch.float32), b.T.to(torch.float32)).to(dtype)
+    torch.testing.assert_close(c, ref, atol=0.03, rtol=0.03)
+
+
+# ============================================================================
 # Test 2b: Static persistent matmul with a while-loop outer loop
 # ============================================================================
 @pytest.mark.skipif(not (is_hopper() or is_blackwell()), reason="Requires Hopper or Blackwell")
@@ -991,6 +1351,246 @@ def test_tutorial09_matmul_tma_static_persistent_while_loop_warp_specialize(EPIL
         assert "ttng.async_tma_copy_global_to_local" in ttgir, "Expected TMA copy"
         assert "ttng.clc_" not in ttgir, "Expected static persistent scheduling, not CLC"
 
+        ref_out = torch.matmul(A.to(torch.float32), B.T.to(torch.float32)).to(dtype)
+        torch.testing.assert_close(ref_out, C, atol=0.03, rtol=0.03)
+
+
+@pytest.mark.skipif(not (is_hopper() or is_blackwell()), reason="Requires Hopper or Blackwell")
+@pytest.mark.parametrize(
+    "kernel_kind,use_meta_ws,multicast,cluster_size_m,cluster_size_n,swizzle_mn,K",
+    [
+        pytest.param("nonpersistent", False, True, 2, 2, False, 128, id="nonpersistent-2x2"),
+        pytest.param("nonpersistent", False, False, 2, 2, False, 128, id="multicast-disabled"),
+        pytest.param("nonpersistent_grouped", False, True, 2, 1, False, 128, id="group-m"),
+        pytest.param("nonpersistent_grouped", False, True, 2, 1, True, 128, id="group-n"),
+        pytest.param("nonpersistent", True, True, 2, 2, False, 128, id="nonpersistent-autows"),
+        pytest.param("persistent_for", False, True, 2, 2, False, 128, id="persistent-for"),
+        pytest.param("persistent_for", True, True, 2, 2, False, 512, id="persistent-for-autows-k8"),
+        pytest.param("persistent_while", False, True, 2, 2, False, 128, id="persistent-source-while"),
+        pytest.param("persistent_while", True, True, 2, 2, False, 512, id="persistent-source-while-autows"),
+        pytest.param("surviving_while", True, True, 2, 2, False, 256, id="surviving-while-autows"),
+        pytest.param("clc", False, True, 2, 2, False, 128, id="clc-no-autows"),
+        pytest.param("clc", True, True, 2, 2, False, 128, id="clc-autows"),
+        pytest.param("persistent_for", True, True, 2, 4, False, 128,
+                     id="rectangular-persistent-for-autows"),
+    ],
+)
+def test_tutorial09_tma_multicast_gemm_variants(kernel_kind, use_meta_ws, multicast, cluster_size_m, cluster_size_n,
+                                                swizzle_mn, K):
+    """Exercise compiler-selected multicast across scheduling and WS modes.
+
+    The grouped cases use the same one-dimensional grid and 2-CTA cluster.
+    Grouping adjacent programs along M makes only B invariant; grouping along
+    N makes only A invariant. Every case pads at least one logical grid
+    dimension, so dead CTAs execute the collectives and suppress their stores.
+    """
+    if kernel_kind == "clc" and not is_blackwell():
+        pytest.skip("CLC requires Blackwell")
+    assert kernel_kind in ("nonpersistent", "nonpersistent_grouped") or not swizzle_mn
+
+    BLOCK_SIZE_M = 128
+    BLOCK_SIZE_N = 128
+    BLOCK_SIZE_K = 64
+    M = 5 * BLOCK_SIZE_M
+    N = 5 * BLOCK_SIZE_N
+    GROUP_SIZE_M = 8
+    num_stages = 2
+    num_warps = 4
+
+    with triton.knobs.nvidia.scope():
+        triton.knobs.nvidia.use_meta_ws = use_meta_ws
+        triton.knobs.nvidia.use_meta_partition = use_meta_ws
+        device = "cuda"
+        dtype = torch.float16
+        torch.manual_seed(42)
+        A = torch.randn((M, K), dtype=dtype, device=device)
+        B = torch.randn((N, K), dtype=dtype, device=device)
+        C = torch.empty((M, N), dtype=dtype, device=device)
+
+        triton.set_allocator(lambda size, align, stream: torch.empty(size, dtype=torch.int8, device=device))
+        a_desc = TensorDescriptor(A, A.shape, A.stride(), [BLOCK_SIZE_M, BLOCK_SIZE_K])
+        b_desc = TensorDescriptor(B, B.shape, B.stride(), [BLOCK_SIZE_N, BLOCK_SIZE_K])
+        c_desc = TensorDescriptor(C, C.shape, C.stride(), [BLOCK_SIZE_M, BLOCK_SIZE_N])
+
+        num_pid_m = triton.cdiv(M, BLOCK_SIZE_M)
+        num_pid_n = triton.cdiv(N, BLOCK_SIZE_N)
+        grid_m = triton.cdiv(num_pid_m, cluster_size_m) * cluster_size_m
+        grid_n = triton.cdiv(num_pid_n, cluster_size_n) * cluster_size_n
+        grid_extent = max(grid_m, grid_n)
+        physical_grid = (grid_extent, grid_extent)
+        physical_cluster = (cluster_size_m, cluster_size_n, 1)
+        assert physical_grid[0] > num_pid_m and physical_grid[1] > num_pid_n
+        common = dict(
+            BLOCK_SIZE_M=BLOCK_SIZE_M,
+            BLOCK_SIZE_N=BLOCK_SIZE_N,
+            BLOCK_SIZE_K=BLOCK_SIZE_K,
+            GROUP_SIZE_M=GROUP_SIZE_M,
+            MULTICAST_MAPPING=True,
+            num_stages=num_stages,
+            num_warps=num_warps,
+            ctas_per_cga=physical_cluster,
+            multicast=multicast,
+        )
+
+        if kernel_kind == "nonpersistent_grouped":
+            grouped_grid_m = triton.cdiv(num_pid_m, cluster_size_m) * cluster_size_m * num_pid_n
+            grouped_grid_n = triton.cdiv(num_pid_n, cluster_size_m) * cluster_size_m * num_pid_m
+            assert grouped_grid_m == grouped_grid_n
+            grouped_grid = (grouped_grid_m, )
+            assert grouped_grid[0] > num_pid_m * num_pid_n
+            matmul_kernel_tma_ws.device_caches.clear()
+            kernel = matmul_kernel_tma_ws[grouped_grid](
+                a_desc,
+                b_desc,
+                c_desc,
+                M,
+                N,
+                K,
+                BLOCK_SIZE_M=BLOCK_SIZE_M,
+                BLOCK_SIZE_N=BLOCK_SIZE_N,
+                BLOCK_SIZE_K=BLOCK_SIZE_K,
+                GROUP_SIZE_M=cluster_size_m,
+                GROUP_SIZE_N=cluster_size_m,
+                A_COL_MAJOR=False,
+                B_COL_MAJOR=False,
+                DATA_PARTITION_FACTOR=1,
+                SEPARATE_EPILOGUE_STORE=False,
+                PADDED_MAPPING=True,
+                SWIZZLE_MN=swizzle_mn,
+                num_stages=num_stages,
+                num_warps=num_warps,
+                ctas_per_cga=physical_cluster,
+                multicast=multicast,
+            )
+        elif kernel_kind == "nonpersistent":
+            matmul_kernel_tma_ws.device_caches.clear()
+            kernel = matmul_kernel_tma_ws[physical_grid](
+                a_desc,
+                b_desc,
+                c_desc,
+                M,
+                N,
+                K,
+                A_COL_MAJOR=False,
+                B_COL_MAJOR=False,
+                DATA_PARTITION_FACTOR=1,
+                SEPARATE_EPILOGUE_STORE=False,
+                SWIZZLE_MN=swizzle_mn,
+                **common,
+            )
+        elif kernel_kind == "persistent_for":
+            matmul_kernel_tma_persistent_ws.device_caches.clear()
+            kernel = matmul_kernel_tma_persistent_ws[(cluster_size_m, cluster_size_n)](
+                a_desc,
+                b_desc,
+                c_desc,
+                M,
+                N,
+                K,
+                EPILOGUE_SUBTILE=1,
+                NUM_SMS=cluster_size_m * cluster_size_n,
+                FLATTEN=False,
+                A_COL_MAJOR=False,
+                B_COL_MAJOR=False,
+                DATA_PARTITION_FACTOR=1,
+                SEPARATE_EPILOGUE_STORE=False,
+                CLUSTER_SIZE_M=cluster_size_m,
+                CLUSTER_SIZE_N=cluster_size_n,
+                **common,
+            )
+        elif kernel_kind == "persistent_while":
+            matmul_kernel_tma_static_persistent_ws_while.device_caches.clear()
+            kernel = matmul_kernel_tma_static_persistent_ws_while[(cluster_size_m, cluster_size_n)](
+                a_desc,
+                b_desc,
+                c_desc,
+                M,
+                N,
+                K,
+                EPILOGUE_SUBTILE=1,
+                NUM_SMS=cluster_size_m * cluster_size_n,
+                CLUSTER_SIZE_M=cluster_size_m,
+                CLUSTER_SIZE_N=cluster_size_n,
+                **common,
+            )
+        elif kernel_kind == "surviving_while":
+            matmul_kernel_tma_persistent_guarded_epilogue_surviving_while_ws.device_caches.clear()
+            kernel = matmul_kernel_tma_persistent_guarded_epilogue_surviving_while_ws[(cluster_size_m,
+                                                                                       cluster_size_n)](
+                a_desc,
+                b_desc,
+                c_desc,
+                M,
+                N,
+                K,
+                BLOCK_SIZE_M=BLOCK_SIZE_M,
+                BLOCK_SIZE_N=BLOCK_SIZE_N,
+                BLOCK_SIZE_K=BLOCK_SIZE_K,
+                CTA_GROUP_M=cluster_size_m,
+                CTA_GROUP_N=cluster_size_n,
+                num_stages=num_stages,
+                num_warps=num_warps,
+                ctas_per_cga=physical_cluster,
+                multicast=multicast,
+            )
+        else:
+            matmul_kernel_tma_clc_persistent_ws_while.device_caches.clear()
+            kernel = matmul_kernel_tma_clc_persistent_ws_while[physical_grid](
+                a_desc,
+                b_desc,
+                c_desc,
+                M,
+                N,
+                K,
+                EPILOGUE_SUBTILE=1,
+                NUM_SMS=grid_extent * grid_extent,
+                **common,
+            )
+
+        ttir = kernel.asm["ttir"]
+        ttir_loads = [line for line in ttir.splitlines() if "tt.descriptor_load" in line]
+        assert len(ttir_loads) >= 2
+        assert all(("multicast = true" in line) == multicast for line in ttir_loads[:2])
+
+        ttgir = kernel.asm["ttgir"]
+        ptx = kernel.asm["ptx"]
+        a_axis = 0 if swizzle_mn else 1
+        b_axis = 1 if swizzle_mn else 0
+        cluster_shape = (cluster_size_m, cluster_size_n, 1)
+        expected_axes = {
+            axis for axis in (a_axis, b_axis)
+            if multicast and cluster_shape[axis] > 1
+        }
+        lowered_tma = [line for line in ttgir.splitlines() if "ttng.async_tma_copy_global_to_local" in line]
+        if kernel_kind == "nonpersistent_grouped":
+            a_lowered = [line for line in lowered_tma if "%a_desc[" in line]
+            b_lowered = [line for line in lowered_tma if "%b_desc[" in line]
+            assert a_lowered and b_lowered
+            expected_a_multicast = multicast and swizzle_mn
+            expected_b_multicast = multicast and not swizzle_mn
+            assert any("tt.multicast_axes = array<i32: 0>" in line
+                       for line in a_lowered) == expected_a_multicast
+            assert any("tt.multicast_axes = array<i32: 0>" in line
+                       for line in b_lowered) == expected_b_multicast
+        lowered_axes = {
+            axis for axis in range(3)
+            if any(f"tt.multicast_axes = array<i32: {axis}>" in line for line in lowered_tma)
+        }
+        assert lowered_axes == expected_axes
+        assert ("ttng.clc_" in ttgir) == (kernel_kind == "clc")
+        if kernel_kind in ("persistent_for", "persistent_while") and use_meta_ws:
+            assert "ttg.warp_specialize" in ttgir
+        if kernel_kind == "persistent_while" and use_meta_ws:
+            assert "scf.while" not in ttgir
+        if kernel_kind == "surviving_while":
+            assert "scf.while" in ttgir
+            assert "ttg.warp_specialize" in ttgir
+        if kernel_kind == "clc" and use_meta_ws:
+            assert "ttg.warp_specialize" in ttgir
+            assert "ttng.clc_try_cancel" in ttgir
+            assert "ttng.async_tma_copy_local_to_global" in ttgir
+        multicast_tma = "cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes.multicast::cluster"
+        assert (multicast_tma in ptx) == bool(expected_axes)
         ref_out = torch.matmul(A.to(torch.float32), B.T.to(torch.float32)).to(dtype)
         torch.testing.assert_close(ref_out, C, atol=0.03, rtol=0.03)
 

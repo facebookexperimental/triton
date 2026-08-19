@@ -259,9 +259,18 @@ enum class CLCWSCase {
   Reject       // unsupported -> bail out of WS
 };
 
-static CLCWSCase classifyCLC(ttng::CLCReadOp readOp, scf::WhileOp &whileOut) {
+static bool hasExplicitCluster(Operation *op) {
+  ModuleOp mod = op->getParentOfType<ModuleOp>();
+  if (ttg::TritonGPUDialect::getNumCTAs(mod) != 1)
+    return false;
+  auto dims = ttg::TritonGPUDialect::getClusterDims(mod);
+  return dims[0] * dims[1] * dims[2] > 1;
+}
+
+static CLCWSCase classifyCLC(ttng::CLCReadOp readOp,
+                             scf::WhileOp &whileOut) {
   SmallVector<AsyncTaskId> taskIds = getAsyncTaskIds(readOp.getOperation());
-  if (taskIds.size() <= 1)
+  if (taskIds.size() <= 1 && !hasExplicitCluster(readOp))
     return CLCWSCase::PassThrough;
 
   auto whileOp = readOp->getParentOfType<scf::WhileOp>();
@@ -274,6 +283,12 @@ static CLCWSCase classifyCLC(ttng::CLCReadOp readOp, scf::WhileOp &whileOut) {
     return CLCWSCase::Reject;
   }
   SmallVector<AsyncTaskId> allParts = getAllPartitions(whileOp);
+  if (allParts.size() <= 1)
+    return CLCWSCase::PassThrough;
+  if (hasExplicitCluster(readOp) && taskIds.size() == 1 && allParts.size() > 1) {
+    whileOut = whileOp;
+    return CLCWSCase::Transform;
+  }
   if (taskIds.size() != allParts.size()) {
     LDBG("reject: clc_read replicated to a strict subset of partitions");
     return CLCWSCase::Reject;
@@ -353,7 +368,10 @@ static LogicalResult transformCLC(triton::FuncOp funcOp, ttng::CLCReadOp readOp,
                                   scf::WhileOp whileOp) {
   MLIRContext *ctx = funcOp.getContext();
   SmallVector<AsyncTaskId> allParts = getAllPartitions(whileOp);
-  AsyncTaskId owner = getOwnerPartition(whileOp, allParts);
+  SmallVector<AsyncTaskId> readTaskIds = getAsyncTaskIds(readOp.getOperation());
+  AsyncTaskId owner = readTaskIds.size() == 1
+      ? readTaskIds.front()
+      : getOwnerPartition(whileOp, allParts);
   Location loc = readOp.getLoc();
 
   auto issue = readOp.getToken().getDefiningOp<ttng::CLCTryCancelAsyncOp>();
@@ -403,6 +421,11 @@ static LogicalResult transformCLC(triton::FuncOp funcOp, ttng::CLCReadOp readOp,
 // of truth for the reject teardown shared with the other AutoWS bail-outs.
 LogicalResult doDynamicTileBroadcast(triton::FuncOp funcOp,
                                      int tilePrefetchDepth) {
+  SmallVector<std::pair<tt::AtomicRMWOp, scf::WhileOp>> atomicTransforms;
+  SmallVector<std::pair<ttng::CLCReadOp, scf::WhileOp>> clcTransforms;
+
+  // Classify every candidate before mutating the function. A later rejection
+  // must not leave broadcast IR created for an earlier eligible producer.
   // Atomic global tile counter.
   SmallVector<tt::AtomicRMWOp> atomics;
   funcOp.walk([&](tt::AtomicRMWOp op) { atomics.push_back(op); });
@@ -415,11 +438,7 @@ LogicalResult doDynamicTileBroadcast(triton::FuncOp funcOp,
       LDBG("Warp specialization does not support this atomic shape. Skipping.");
       return failure();
     case AtomicWSCase::Transform:
-      if (failed(
-              transformAtomic(funcOp, atomicOp, whileOp, tilePrefetchDepth))) {
-        LDBG("atomic broadcast transform failed; skipping WS.");
-        return failure();
-      }
+      atomicTransforms.emplace_back(atomicOp, whileOp);
       break;
     }
   }
@@ -436,11 +455,22 @@ LogicalResult doDynamicTileBroadcast(triton::FuncOp funcOp,
       LDBG("Warp specialization does not support this CLC fetch. Skipping.");
       return failure();
     case CLCWSCase::Transform:
-      if (failed(transformCLC(funcOp, readOp, whileOp))) {
-        LDBG("CLC broadcast transform failed; skipping WS.");
-        return failure();
-      }
+      clcTransforms.emplace_back(readOp, whileOp);
       break;
+    }
+  }
+
+  for (auto [atomicOp, whileOp] : atomicTransforms) {
+    if (failed(
+            transformAtomic(funcOp, atomicOp, whileOp, tilePrefetchDepth))) {
+      LDBG("atomic broadcast transform failed; skipping WS.");
+      return failure();
+    }
+  }
+  for (auto [readOp, whileOp] : clcTransforms) {
+    if (failed(transformCLC(funcOp, readOp, whileOp))) {
+      LDBG("CLC broadcast transform failed; skipping WS.");
+      return failure();
     }
   }
   return success();

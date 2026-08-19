@@ -17,6 +17,7 @@
 #include "mlir/Transforms/RegionUtils.h"
 #include "nvidia/include/Dialect/NVWS/IR/Dialect.h"
 #include "triton/Analysis/Utility.h"
+#include "triton/Dialect/Triton/IR/TMAMulticast.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h"
@@ -191,11 +192,33 @@ Value getTMALoadBufferForStage(OpBuilderWithAsyncTaskIds &builder, Value buffer,
 
 } // namespace
 
+static void createMulticastRendezvous(OpBuilderWithAsyncTaskIds &builder,
+                                      Location loc, Value barrierAlloc,
+                                      Value bufferIdx, Value phase,
+                                      Operation *clusterOp) {
+  auto module = clusterOp->getParentOfType<ModuleOp>();
+  auto dims = ttg::TritonGPUDialect::getClusterDims(module);
+  unsigned clusterSize = product(dims);
+  assert(clusterSize > 1 && llvm::isPowerOf2_32(clusterSize));
+
+  Value barrier =
+      getBarrierForPipelineStage(builder, barrierAlloc, bufferIdx);
+  builder.createWithAsyncTaskIds<ttng::ArriveBarrierOp>(
+      loc, barrier, /*count=*/1, /*ctaMask=*/clusterSize - 1,
+      /*pred=*/Value());
+  if (!phase.getType().isInteger(32))
+    phase = builder.createWithAsyncTaskIds<arith::ExtUIOp>(
+        loc, builder.getI32Type(), phase);
+  builder.createWithAsyncTaskIds<ttng::WaitBarrierOp>(loc, barrier, phase);
+}
+
 Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
                             SmallVector<ttnvws::DescriptorLoadOp> &tmaLoads,
-                            Value barrierAlloc, Value bufferIdx,
-                            Value bufferIdxExtract, Value phase,
-                            Operation *headProducer, Operation *headConsumer,
+                            Value barrierAlloc, Value multicastReuseBarrier,
+                            const DenseMap<int, Value> &multicastReadyBarriers,
+                            Value bufferIdx, Value bufferIdxExtract,
+                            Value phase, Operation *headProducer,
+                            Operation *headConsumer,
                             Operation *headConsumerSameLevel,
                             ArrayRef<int> additionalConsumerTaskIds,
                             DictionaryAttr consumerWaitConstraints) {
@@ -217,6 +240,16 @@ Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
   builder.createWithAsyncTaskIds<ttng::BarrierExpectOp>(loc, prodBarrier,
                                                         sizeInBytes, pred);
 
+  bool hasMulticast = llvm::any_of(
+      tmaLoads,
+      [](auto load) { return load->hasAttr(tt::kMulticastAxesAttrName); });
+  if (hasMulticast) {
+    assert(multicastReuseBarrier &&
+           "multicast producer requires a reuse rendezvous");
+    createMulticastRendezvous(builder, loc, multicastReuseBarrier, bufferIdx,
+                              phase, headProducer);
+  }
+
   // Convert all the producers to async_tma_copy_global_to_local
   Operation *copy = nullptr;
   for (auto tmaLoad : tmaLoads) {
@@ -228,6 +261,8 @@ Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
     copy = builder.createWithAsyncTaskIds<ttng::AsyncTMACopyGlobalToLocalOp>(
         tmaLoad.getLoc(), tmaLoad.getDesc(), tmaLoad.getIndices(), prodBarrier,
         pipelineBuffer, pred);
+    if (Attribute axes = tmaLoad->getAttr(tt::kMulticastAxesAttrName))
+      copy->setAttr(tt::kMulticastAxesAttrName, axes);
   }
 
   // Create a wait_barrier before the first consumer.
@@ -253,11 +288,28 @@ Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
   builder.createWithAsyncTaskIds<ttng::WaitBarrierOp>(
       loc, consBarrier, phase, waitPred, /*deps=*/ValueRange{},
       consumerWaitConstraints);
+  if (hasMulticast) {
+    for (int taskId : getAsyncTaskIds(headConsumer)) {
+      auto it = multicastReadyBarriers.find(taskId);
+      assert(it != multicastReadyBarriers.end() &&
+             "multicast consumer requires a ready rendezvous");
+      builder.setAsynTaskIdsFromArray({taskId});
+      createMulticastRendezvous(builder, loc, it->second, bufferIdxExtract,
+                                phase, headConsumer);
+    }
+  }
   for (int extraTaskId : additionalConsumerTaskIds) {
     builder.setAsynTaskIdsFromArray({extraTaskId});
     builder.createWithAsyncTaskIds<ttng::WaitBarrierOp>(
         loc, consBarrier, phase, waitPred,
         /*deps=*/ValueRange{}, consumerWaitConstraints);
+    if (hasMulticast) {
+      auto it = multicastReadyBarriers.find(extraTaskId);
+      assert(it != multicastReadyBarriers.end() &&
+             "multicast consumer requires a ready rendezvous");
+      createMulticastRendezvous(builder, loc, it->second, bufferIdxExtract,
+                                phase, headConsumer);
+    }
   }
 
   for (auto tmaLoad : tmaLoads)
