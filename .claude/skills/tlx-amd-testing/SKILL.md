@@ -22,7 +22,9 @@ Each kernel is an importable module under `third_party/tlx/tutorials/`.
 |---|---|---|---|---|
 | `amd_gemm_warp_pipeline.py` | GEMM | `test_amd_gemm_warp_pipeline` | `test_amd_gemm_perf.py` (`warp_pipeline`) | `is_hip_cdna4` |
 | `amd_gemm_pipelined.py` | GEMM (LDS pipeline) | `test_amd_gemm_pipelined` | `test_amd_gemm_perf.py` (`pipelined`) | `is_hip` |
-| `amd_gemm_gfx942.py` | GEMM (MI300X; `regs` + `async` staging) | `test_amd_gemm_gfx942`, `test_amd_gemm_gfx942_odd_shapes` | `test_amd_gemm_gfx942_perf.py` | `is_hip_cdna3` |
+| `amd_gemm_gfx942.py` | GEMM (MI300X, autotuned) | `test_amd_gemm_gfx942`, `test_amd_gemm_gfx942_odd_shapes` | `test_amd_gemm_gfx942_perf.py` | `is_hip_cdna3` |
+| `amd_addmm_gfx942.py` | addmm (MI300X, autotuned) | `test_amd_addmm_gfx942` | `test_amd_addmm_gfx942_perf.py` | `is_hip_cdna3` |
+| `amd_bmm_gfx942.py` | BMM (MI300X, autotuned) | `test_amd_bmm_gfx942`, `test_amd_bmm_gfx942_distinct_a` | `test_amd_bmm_gfx942_perf.py` | `is_hip_cdna3` |
 | `amd_fa_pipelined.py` | Flash Attention | `test_amd_fa_pipelined` | `test_amd_fa_perf.py` (`simple`, `prefetch`) | `is_hip_cdna4` |
 | `amd_fa_persistent.py` | Flash Attention (persistent) | `test_amd_fa_persistent`, `test_amd_fa_persistent_cross_attention` | `test_amd_fa_perf.py` (`persistent`) | `is_hip_cdna4` |
 | `amd_addmm_glu.py` | addmm + GLU (gated linear unit, **not** GELU) | `test_amd_addmm_glu` | `test_amd_addmm_glu_perf.py` | `is_hip_cdna4` |
