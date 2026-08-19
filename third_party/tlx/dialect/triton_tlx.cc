@@ -1323,6 +1323,23 @@ void init_triton_tlx_ir(py::module_ &m) {
                  self.getBuilder().getI32Type(), threadId);
              return threadId;
            })
+      .def("create_cond_barrier",
+           [](TritonOpBuilder &self, Value pred) -> void {
+             // Conditional s_barrier: only lanes with pred==true participate.
+             // Deliberately diverges the two warp-halves to phase-shift a
+             // hand-rolled ping-pong; caller must pair cond_barrier(pred) with
+             // cond_barrier(~pred) so all threads cross the same barrier count.
+             self.create<amdgpu::CondBarrierOp>(pred);
+           })
+      .def("create_workgroup_barrier",
+           [](TritonOpBuilder &self) -> void {
+             // Fenced full-workgroup barrier: a local (LDS-fenced) ttg.barrier
+             // bracketed by SchedBarrier(0) guards so the scheduler cannot hoist
+             // ops across the ping-pong cluster border.
+             self.create<ROCDL::SchedBarrier>(0);
+             self.create<ttg::BarrierOp>(ttg::AddrSpace::Local);
+             self.create<ROCDL::SchedBarrier>(0);
+           })
       .def("create_cvt_rs",
            [](TritonOpBuilder &self, Value &src, Type &dstType,
               Value rbits) -> Value {

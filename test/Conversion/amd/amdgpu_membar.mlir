@@ -330,4 +330,38 @@ tt.func @missing_barrier_reused_allocation(%A: !tt.ptr<f16>, %B: !tt.ptr<f16>) {
   tt.return
 }
 
+// tlx.workgroup_barrier lowers to `rocdl.sched.barrier 0; ttg.barrier local;
+// rocdl.sched.barrier 0`. When Membar scans forward for a sync point before a
+// memory effect it must look THROUGH the scheduling-only sched fences to the real
+// ttg.barrier; otherwise it treats the sched fence as a stopping point and inserts
+// a redundant barrier right after the async wait, doubling the workgroup barrier in
+// a hand-rolled ping-pong.
+// CHECK-LABEL: sched_barrier_is_not_a_sync_point
+tt.func @sched_barrier_is_not_a_sync_point(%A: !tt.ptr<f16>, %B: !tt.ptr<f16>) {
+  %offset = arith.constant dense<0> : tensor<128x32xi32, #AL>
+  %alloc = ttg.local_alloc {allocation.offset = 0 : i32} : () -> !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  // Load + wait + read the buffer.
+  %async1 = amdg.buffer_load_to_local %A[%offset] into %alloc : <f16>[tensor<128x32xi32, #AL>] -> <128x32xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  %token1 = ttg.async_commit_group tokens %async1
+  %wait1 = amdg.async_wait %token1 {num_inst = 0 : i32}
+  %read = ttg.local_load %alloc token %wait1 {ttg.amdg.syncedViaAsyncWait = true} : !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable> -> tensor<128x32xf16, #AL>
+  // workgroup_barrier: sched fence, real barrier, sched fence.
+  rocdl.sched.barrier 0
+  ttg.barrier local
+  rocdl.sched.barrier 0
+  // WAR: rewrite the same buffer. The ttg.barrier above already synchronizes the
+  // prior read, so Membar must NOT add another barrier after the wait/read.
+  // CHECK: ttg.local_load
+  // CHECK-NOT: ttg.barrier local
+  // CHECK: rocdl.sched.barrier
+  // CHECK-NEXT: ttg.barrier local
+  // CHECK-NEXT: rocdl.sched.barrier
+  // CHECK-NOT: ttg.barrier local
+  // CHECK: amdg.buffer_load_to_local
+  %async2 = amdg.buffer_load_to_local %B[%offset] into %alloc : <f16>[tensor<128x32xi32, #AL>] -> <128x32xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  %token2 = ttg.async_commit_group tokens %async2
+  %wait2 = amdg.async_wait %token2 {num_inst = 0 : i32}
+  tt.return
+}
+
 }

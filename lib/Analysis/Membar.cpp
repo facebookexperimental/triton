@@ -295,6 +295,14 @@ bool containsLocalBarrier(Operation *op) {
 // memory effect or nested control flow.
 static bool hasSyncPointBeforeMemoryEffect(Operation *op) {
   for (Operation *next = op->getNextNode(); next; next = next->getNextNode()) {
+    // Skip scheduling-only fences (rocdl.sched.*) that tlx.workgroup_barrier /
+    // tlx.sched_barrier interpose before the real ttg.barrier. They carry no
+    // cross-wave memory semantics, so treating one as a stopping point makes
+    // Membar insert a redundant barrier right after the async wait -- doubling
+    // the workgroup barrier and stalling a hand-written ping-pong schedule.
+    if (next->getName().getStringRef().starts_with("rocdl.sched."))
+      continue;
+
     if (containsLocalBarrier(next) ||
         next->hasTrait<mlir::OpTrait::MemWaitOpTrait>())
       return true;

@@ -467,3 +467,67 @@ def test_named_barrier_wait_1warp_async_deadlock_single_proc(device):
     result = output.cpu().tolist()
     assert result[0] == 5, f"Expected output[0]=5, got {result[0]}"
     assert result[1] == 99, f"Expected output[1]=99, got {result[1]}"
+
+
+# ---- AMD CDNA workgroup / cond barriers (tlx.workgroup_barrier, tlx.cond_barrier) ----
+
+
+@triton.jit
+def _workgroup_barrier_sum_kernel(x_ptr, out_ptr, BLOCK: tl.constexpr):
+    # One workgroup, BLOCK lanes across several warps. Each lane publishes its input
+    # into its own LDS slot, then every lane sums the WHOLE buffer -- so each lane
+    # must observe every other (cross-warp) lane's store. workgroup_barrier provides
+    # the LDS fence + rendezvous; without it the sum races and drops cross-warp
+    # stores.
+    off = tl.arange(0, BLOCK)
+    smem = tlx.local_alloc((BLOCK,), tl.int32, 1)
+    buf = tlx.local_view(smem, 0)
+    tlx.local_store(buf, tl.load(x_ptr + off))
+    tlx.workgroup_barrier()
+    total = tl.sum(tlx.local_load(buf))
+    tl.store(out_ptr + off, total + tl.zeros((BLOCK,), tl.int32))
+
+
+@pytest.mark.skipif(not is_hip(), reason="Requires AMD (HIP)")
+def test_amd_workgroup_barrier(device):
+    BLOCK = 256  # 4 warps x 64 lanes -> exercises cross-warp LDS visibility
+    x = torch.randint(-(2**20), 2**20, (BLOCK,), device=device, dtype=torch.int32)
+    out = torch.empty_like(x)
+    compiled = _workgroup_barrier_sum_kernel[(1,)](x, out, BLOCK=BLOCK, num_warps=4)
+    torch.cuda.synchronize()
+    expected = torch.full((BLOCK,), int(x.sum().item()), device=device, dtype=torch.int32)
+    torch.testing.assert_close(out, expected, atol=0, rtol=0)
+    # Lowers to a fenced ttg.barrier bracketed by rocdl.sched.barrier fences.
+    ttgir = compiled.asm["ttgir"]
+    assert ttgir.count("ttg.barrier") >= 1, f"TTGIR {ttgir}"
+    assert ttgir.count("rocdl.sched.barrier") >= 2, f"TTGIR {ttgir}"
+
+
+@triton.jit
+def _cond_barrier_kernel(x_ptr, out_ptr, BLOCK: tl.constexpr):
+    # Exercise the cond_barrier phase-shift bracket (cond_barrier(wg != 0) ...
+    # cond_barrier(wg == 0), the split-M ping-pong pattern) around a
+    # workgroup_barrier. The payload is a per-lane copy -- independent of the
+    # (deliberately out-of-phase) barriers -- so the assertion checks what a unit
+    # test can: the paired bracket compiles and RECONVERGES without deadlock (a
+    # broken barrier-count contract would hang or drop the stores). cond_barrier's
+    # cross-warp phase-shift correctness is covered by the grouped-gemm integration.
+    off = tl.arange(0, BLOCK)
+    wg = tlx.thread_id(0) // 256
+    tlx.cond_barrier(wg != 0)
+    tlx.workgroup_barrier()
+    tlx.cond_barrier(wg == 0)
+    tl.store(out_ptr + off, tl.load(x_ptr + off))
+
+
+@pytest.mark.skipif(not is_hip(), reason="Requires AMD (HIP)")
+def test_amd_cond_barrier(device):
+    BLOCK = 512  # 8 warps -> two 256-lane warp-groups for the cond_barrier phase shift
+    x = torch.randint(-(2**20), 2**20, (BLOCK,), device=device, dtype=torch.int32)
+    out = torch.empty_like(x)
+    compiled = _cond_barrier_kernel[(1,)](x, out, BLOCK=BLOCK, num_warps=8)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out, x, atol=0, rtol=0)
+    # The paired bracket lowers to two amdg.cond_barrier ops.
+    ttgir = compiled.asm["ttgir"]
+    assert ttgir.count("amdg.cond_barrier") == 2, f"TTGIR {ttgir}"
