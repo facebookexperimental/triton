@@ -38,6 +38,105 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 
 // -----
 
+// The direct TMA wait optimization is independent of collective contraction
+// synchronization. Enabling it must not suppress the cross-CTA MMA barrier.
+
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#shared1 = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = true, elementBitWidth = 16}>
+#smem = #ttg.shared_memory
+#tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
+
+// CHECK-LABEL: @test_direct_tma_wait_keeps_collective_sync
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32, "ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32} {
+  tt.func @test_direct_tma_wait_keeps_collective_sync(
+      %a: !ttg.memdesc<128x64xf16, #shared, #smem>,
+      %b: !ttg.memdesc<64x128xf16, #shared1, #smem>,
+      %acc: !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>,
+      %acc_tok: !ttg.async.token) {
+    %true = arith.constant true
+    // CHECK: ttng.init_barrier
+    // CHECK: ttng.arrive_barrier
+    // CHECK: ttng.wait_barrier
+    // CHECK: ttng.tc_gen5_mma
+    %tok = ttng.tc_gen5_mma %a, %b, %acc[%acc_tok], %true, %true {
+      tt.autows = "{\22two_cta_tma_direct_wait\22: true}",
+      ttng.two_cta_dependency = "collective_contraction", two_ctas} :
+      !ttg.memdesc<128x64xf16, #shared, #smem>,
+      !ttg.memdesc<64x128xf16, #shared1, #smem>,
+      !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#shared1 = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = true, elementBitWidth = 16}>
+#smem = #ttg.shared_memory
+#tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
+
+// CHECK-LABEL: @test_explicitly_skip_collective_sync
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32, "ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32} {
+  tt.func @test_explicitly_skip_collective_sync(
+      %a: !ttg.memdesc<128x64xf16, #shared, #smem>,
+      %b: !ttg.memdesc<64x128xf16, #shared1, #smem>,
+      %acc: !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>,
+      %acc_tok: !ttg.async.token) {
+    %true = arith.constant true
+    // CHECK-NOT: ttng.init_barrier
+    // CHECK-NOT: ttng.arrive_barrier
+    // CHECK-NOT: ttng.wait_barrier
+    // CHECK: ttng.tc_gen5_mma
+    %tok = ttng.tc_gen5_mma %a, %b, %acc[%acc_tok], %true, %true {
+      tt.autows = "{\22two_cta_skip_collective_sync\22: true}",
+      ttng.two_cta_dependency = "collective_contraction", two_ctas} :
+      !ttg.memdesc<128x64xf16, #shared, #smem>,
+      !ttg.memdesc<64x128xf16, #shared1, #smem>,
+      !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+// Adjacent contraction slices may explicitly reuse the rendezvous performed
+// by the preceding slice. Keep one sync while retaining both MMAs.
+
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#shared1 = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = true, elementBitWidth = 16}>
+#smem = #ttg.shared_memory
+#tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
+
+// CHECK-LABEL: @test_collective_sync_covered_by_prior
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32, "ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32} {
+  tt.func @test_collective_sync_covered_by_prior(
+      %a: !ttg.memdesc<128x64xf16, #shared, #smem>,
+      %b0: !ttg.memdesc<64x128xf16, #shared1, #smem>,
+      %b1: !ttg.memdesc<64x128xf16, #shared1, #smem>,
+      %acc: !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>,
+      %acc_tok: !ttg.async.token) {
+    %true = arith.constant true
+    // CHECK-COUNT-1: ttng.init_barrier
+    // CHECK-COUNT-1: ttng.arrive_barrier
+    // CHECK-COUNT-1: ttng.wait_barrier
+    // CHECK-COUNT-2: ttng.tc_gen5_mma
+    %tok0 = ttng.tc_gen5_mma %a, %b0, %acc[%acc_tok], %true, %true {
+      ttng.two_cta_dependency = "collective_contraction", two_ctas} :
+      !ttg.memdesc<128x64xf16, #shared, #smem>,
+      !ttg.memdesc<64x128xf16, #shared1, #smem>,
+      !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+    %tok1 = ttng.tc_gen5_mma %a, %b1, %acc[%tok0], %true, %true {
+      tt.autows = "{\22two_cta_sync_covered_by_prior\22: true}",
+      ttng.two_cta_dependency = "collective_contraction", two_ctas} :
+      !ttg.memdesc<128x64xf16, #shared, #smem>,
+      !ttg.memdesc<64x128xf16, #shared1, #smem>,
+      !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+    tt.return
+  }
+}
+
+// -----
+
 // Test that the pass skips when no cluster (cluster_dim < 2).
 
 #shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
