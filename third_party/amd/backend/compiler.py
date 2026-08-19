@@ -235,7 +235,7 @@ class HIPBackend(BaseBackend):
     @staticmethod
     def get_tensor_specialization(arg, **kwargs):
         ret = BaseBackend.get_tensor_specialization(arg, **kwargs)
-        if knobs.amd.use_buffer_ops and HIPBackend.is_within_2gb(arg):
+        if HIPBackend.is_within_2gb(arg):
             ret += "S"
         return ret
 
@@ -315,9 +315,13 @@ class HIPBackend(BaseBackend):
         if use_block_pingpong and options.num_stages > 1:
             amd.passes.ttgpuir.add_block_pingpong(pm, options.num_stages)
 
+        # Canonicalize pointer expressions even when buffer ops are disabled.
+        # Masked GFX9 direct-to-LDS copies otherwise retain a predicated i64
+        # address path that can produce nondeterministic source addresses.
+        amd.passes.ttgpuir.add_canonicalize_pointers(pm)
+        passes.common.add_canonicalizer(pm)
+
         if knobs.amd.use_buffer_ops:
-            amd.passes.ttgpuir.add_canonicalize_pointers(pm)
-            passes.common.add_canonicalizer(pm)
             amd.passes.ttgpuir.add_convert_to_buffer_ops(
                 pm,
                 options.arch,
