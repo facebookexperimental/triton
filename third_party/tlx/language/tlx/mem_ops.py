@@ -677,6 +677,9 @@ def async_load(
     """
     Loads buffer from global to local memory asynchronously.
 
+    When ``mask`` is provided and ``other`` is omitted, masked destination
+    elements are filled with zero.
+
     When ``bulk=True``, emits a single ``cp.async.bulk`` instruction instead of
     per-thread ``cp.async`` copies. Requirements for bulk mode:
 
@@ -738,9 +741,11 @@ def async_load(
     assert bulk_size is None, "bulk_size requires bulk=True"
     assert barrier is None, "barrier requires bulk=True"
 
-    # Unwrap constexpr and convert to tensor (same as tl.load)
+    # Unwrap constexpr, apply the TLX zero-fill default, and convert to tensor.
     mask = tl._unwrap_if_constexpr(mask)
     other = tl._unwrap_if_constexpr(other)
+    if mask is not None and other is None:
+        other = 0.0
     if mask is not None:
         mask = _semantic.to_tensor(mask)
     if other is not None:
