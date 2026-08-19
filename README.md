@@ -1,18 +1,22 @@
 # fbtriton
 
-fbtriton is Meta's downstream fork of
-[Triton](https://github.com/triton-lang/triton), consolidating GPU compiler and
-DSL innovations we develop for our own workloads while keeping the delta from
-upstream as small as possible. It is continuously synchronized with upstream and
-powers GPU training and inference workloads across Meta's services.
+fbtriton is Meta's fork of [Triton](https://github.com/triton-lang/triton). It
+tracks upstream closely and adds compiler and language work aimed at one thing:
+giving kernel authors real control over warp-level execution on modern GPUs.
 
-## Components
+That capability is offered at three levels, from "change nothing" to "write it
+yourself":
 
-| | | Docs |
-|---|---|---|
-| **TLX** | A low-level, warp-aware, hardware-near extension of the Triton DSL | [docs/tlx.md](docs/tlx.md) |
-| **AutoWS** | A compiler optimization that partitions a kernel's operations into specialized warp groups | [docs/compiler.md](docs/compiler.md) |
-| **torchTLX** | TLX primitives pushed into Inductor's template and fusion infrastructure | [docs/torchtlx.md](docs/torchtlx.md) |
+| | You write | You get | Docs |
+|---|---|---|---|
+| **AutoWS** | ordinary Triton, plus `warp_specialize=True` on a loop | the compiler partitions the loop into producer/consumer warp groups | [docs/compiler.md](docs/compiler.md) |
+| **torchTLX** | ordinary PyTorch | Inductor selects TLX-backed templates and fuses epilogues into them | [docs/torchtlx.md](docs/torchtlx.md) |
+| **TLX** | the kernel, explicitly | direct access to barriers, TMA, MMA, TMEM, clusters, warp specialization | [docs/tlx.md](docs/tlx.md) |
+
+Beyond warp specialization, the fork also adds **deterministic reductions** —
+`reduction_ordering` on `tl.sum` / `tl.reduce` for bitwise-reproducible results
+independent of `num_warps` and layout. See
+[docs/compiler.md](docs/compiler.md#reduction-ordering).
 
 ## Install
 
@@ -39,6 +43,11 @@ are retained for ~30 days. Formal releases remain on PyPI.
 
 Binary wheels are available for CPython 3.10-3.14.
 
+**Compatibility.** fbtriton is intended as a drop-in replacement for upstream
+Triton on a best-effort basis: it tracks upstream closely and existing Triton
+kernels are expected to work unchanged. This is not a formal guarantee — if
+something that works upstream breaks here, please file an issue.
+
 ## Build from source
 
 ```bash
@@ -59,8 +68,9 @@ C++ changes require a rebuild to take effect; Python-only changes do not. Run
 | NVIDIA | Hopper (`sm90`), Blackwell (`sm100`) |
 | AMD | MI300 / CDNA3 (`gfx942`), MI350 / CDNA4 (`gfx950`), RDNA4 (`gfx1250`) |
 
-Support varies per feature: each operation in [docs/tlx.md](docs/tlx.md) carries
-a hardware tag, and [AutoWS](docs/compiler.md) requires sm90 or newer.
+Support varies per feature — each operation in [docs/tlx.md](docs/tlx.md) is
+tagged with the targets it runs on, and [AutoWS](docs/compiler.md) requires sm90 or
+newer.
 
 ## Also in this repo
 
@@ -90,11 +100,12 @@ documented in [docs/ci.md](docs/ci.md).
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md).
+See [CONTRIBUTING.md](CONTRIBUTING.md). Bugs and feature requests for TLX,
+AutoWS, and torchTLX belong here; anything in core Triton or Gluon belongs
+[upstream](https://github.com/triton-lang/triton).
 
 ## Further reading
 
-- [FBTriton infra: upstream ingestion, hierarchical validation — ideals vs. realities](https://pytorch.org/blog/fbtriton-infra-upstream-ingestion-hierarchical-validation-ideals-vs-realities/)
 - [TLX paper](https://arxiv.org/abs/2605.10905)
 - [TLX talk, 2025 Triton Developer Conference](third_party/tlx/doc/TLX-triton-conference.pdf)
 - [TLX talk, 2026 GPU Mode](third_party/tlx/doc/PerformanceOptimizationWithTLX.pdf)
