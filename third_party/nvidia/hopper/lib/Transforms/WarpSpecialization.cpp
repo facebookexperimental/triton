@@ -176,6 +176,37 @@ public:
     }
     dumpAfter(moduleOp, "doTaskIdPropagate");
 
+    // Final eligibility gate, and the last one before the pipeline starts
+    // rewriting ops. `enabled` above only proves someone *asked* for warp
+    // specialization (a `tt.warp_specialize` loop marker). Whether there is
+    // anything to specialize is decided by the partitions, which
+    // PartitionSchedulingMeta assigns as `ttg.partition` and doTaskIdPropagate
+    // materializes as `async_task_id`. With none at all there is no partition
+    // to place anything in, so doCodePartition creates no channels,
+    // insertAsyncComm never calls optimizeTMALoads, and every subsequent step
+    // is a no-op.
+    //
+    // That is not merely wasted work. doConvertDescriptorLoadsToNVWS below
+    // rewrites every `tt.descriptor_load` into `nvws.descriptor_load`
+    // unconditionally, and optimizeTMALoads (during code partitioning) is the
+    // only thing that ever erases one -- there is no rollback path. Converting
+    // a function we are not going to specialize therefore strands the NVWS op
+    // in the IR, where it survives to LLVM translation and fails as
+    // "LLVM Translation failed for operation:
+    // builtin.unrealized_conversion_cast" on the backward casts feeding it.
+    //
+    // PartitionSchedulingMeta assigns no partitions when it finds no MMA to
+    // build producer/consumer roles around -- e.g. a GEMM whose `tt.dot` is an
+    // IEEE fp32 dot, which lowers to FMA rather than wgmma/tcgen5. Note this
+    // gate is deliberately phrased as "no partitions" and not "no MMA": the
+    // no-MMA reduction kernels (RMS norm / LayerNorm / softmax) DO get
+    // partitions from PSM's no-MMA path and must keep specializing.
+    if (getNestedAsyncTaskIds(funcOp).empty()) {
+      LDBG("Warp specialization found no partitions to specialize. "
+           "Skipping.");
+      return bailOut(funcOp);
+    }
+
     // Cross-partition run-once, loop-carried "claim the next tile" support for
     // dynamic-persistent kernels. Handles both the `tt.atomic_rmw` tile counter
     // and the CLC tile-scheduler fetch (`ttng.clc_read`) with the same idea:
