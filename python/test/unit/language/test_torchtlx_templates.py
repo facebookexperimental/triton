@@ -13,6 +13,7 @@ from torch.testing._internal.common_utils import (
 from torch.testing._internal.inductor_utils import GPU_TYPE
 from torch.utils._triton import has_datacenter_blackwell_tma_device
 from triton.language.extra.tlx.inductor import tlx_config
+from triton.language.extra.tlx.hw.target import current_target
 
 
 def has_tlx() -> bool:
@@ -25,14 +26,20 @@ def has_tlx() -> bool:
         return False
 
 
+# Arch gates. All of these go through the one shared target model, so adding
+# MI300X/MI450X coverage is a change to the arch classes rather than to every
+# gate in the suite. With no GPU visible current_target() resolves to no arch
+# at all, so each predicate is already False on a build host.
+
+
 def is_gfx950() -> bool:
     """True on AMD MI350X (gfx950), where the TLX warp-pipe addmm template runs."""
-    if torch.version.hip is None:
-        return False
-    try:
-        return "gfx95" in torch.cuda.get_device_properties(0).gcnArchName
-    except Exception:
-        return False
+    return current_target().is_gfx950
+
+
+def is_blackwell() -> bool:
+    """True on a Blackwell device, where the TLX WS GEMM template runs."""
+    return current_target().is_blackwell
 
 
 def flex_choices_hook_available() -> bool:
@@ -503,7 +510,7 @@ class TestTLXTemplates(TestCase):
         no GPU needed."""
         from triton.language.extra.tlx.inductor.mm_templates import load_tlx_template
 
-        src = load_tlx_template("amd_bmm_warppipe")
+        src = load_tlx_template("gfx950_bmm_warppipe")
         self.assertIn("USE_ASYNC", src)  # dual-path selector constexpr
         self.assertIn("tlx.async_load", src)  # aligned-K async path
         self.assertIn("a_reg = tl.load", src)  # register-path fallback load
@@ -542,8 +549,8 @@ class TestTLXTemplates(TestCase):
 
             uids = {getattr(t, "uid", None) for t in templates}
             if op_name == "addmm" and mm_template.uid in uids:
-                if _tlx_mm.amd_addmm_persistent_warppipe_template.uid not in uids:
-                    templates.append(_tlx_mm.amd_addmm_persistent_warppipe_template)
+                if _tlx_mm.gfx950_addmm_persistent_warppipe_template.uid not in uids:
+                    templates.append(_tlx_mm.gfx950_addmm_persistent_warppipe_template)
             return templates
 
         with (
@@ -572,7 +579,7 @@ class TestWarpPipeSplitKCodegen(TestCase):
 
     The e2e test above relies on autotune *selecting* a SPLIT_K > 1 config (highly
     reliable on a 2-tile shape, but a timing decision). This test renders the
-    `amd_addmm_warppipe` jinja template directly with SPLIT_K=2 vs SPLIT_K=1 -- no
+    `gfx950_addmm_warppipe` jinja template directly with SPLIT_K=2 vs SPLIT_K=1 -- no
     GPU, no autotune -- so the split-K branches are *guaranteed* covered even if
     autotune ever stops picking split-K, and it runs on any host (not gfx950-gated).
     """
@@ -582,7 +589,7 @@ class TestWarpPipeSplitKCodegen(TestCase):
         import jinja2
         from triton.language.extra.tlx.inductor.mm_templates import load_tlx_template
 
-        source = load_tlx_template("amd_addmm_warppipe")
+        source = load_tlx_template("gfx950_addmm_warppipe")
 
         # Stub the Inductor render hooks; the split-K branches are pure jinja that
         # only depends on SPLIT_K, so the stubs just need to be present + callable.
@@ -944,7 +951,7 @@ class TestMaybeOverrideBestChoice(TestCase):
 # fires for each case (verified by tracing through the rule logic with
 # num_sms=148).
 
-# Tier 1: (rule, M, N, K, expected_config_subset)
+# (rule, M, N, K, expected_config_subset)
 # Calls get_heuristic_config() directly — no GPU needed.
 HEURISTIC_CONFIG_CASES = [
     # Rule 1a: tall_m, saturated, AI>1.5, alt-tiling, m_tiles<=74
@@ -1088,7 +1095,7 @@ HEURISTIC_CONFIG_CASES = [
 
 @instantiate_parametrized_tests
 class TestHeuristicConfigSelection(TestCase):
-    """Tier 1: Verify get_heuristic_config() picks the right config for each rule."""
+    """Verify get_heuristic_config() picks the right config for each rule."""
 
     @parametrize("case", HEURISTIC_CONFIG_CASES, name_fn=lambda c: c[0])
     def test_config_selection(self, case):
@@ -1229,7 +1236,7 @@ class TestFlexAttention(TestCase):
     """AMD (gfx950/MI350) FlexAttention Inductor template.
 
     Exercises torch.compile(flex_attention) under tlx_mode and asserts the
-    tlx_amd_flex_attention template is selected and numerically correct across
+    tlx_gfx950_flex_attention template is selected and numerically correct across
     score_mod / mask_mod / logsumexp. Gated on the torch flex-choices hook, which
     the current ROCm nightly lacks, so these skip there and are validated on a
     newer torch (e.g. fbsource).
@@ -1264,7 +1271,7 @@ class TestFlexAttention(TestCase):
         out, code = self._run(lambda q, k, v: flex_attention(q, k, v, scale=sm), q, k, v)
         ref = flex_attention(q, k, v, scale=sm)
         torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
-        self.assertIn("tlx_amd_flex_attention", code)
+        self.assertIn("tlx_gfx950_flex_attention", code)
 
     @unittest.skipIf(not is_gfx950(), "Need AMD MI350X (gfx950)")
     @unittest.skipIf(not has_tlx(), "TLX not available")
@@ -1285,7 +1292,7 @@ class TestFlexAttention(TestCase):
         out, code = self._run(lambda q, k, v: flex_attention(q, k, v, block_mask=bm, scale=sm), q, k, v)
         ref = flex_attention(q, k, v, block_mask=bm, scale=sm)
         torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
-        self.assertIn("tlx_amd_flex_attention", code)
+        self.assertIn("tlx_gfx950_flex_attention", code)
 
     @unittest.skipIf(not is_gfx950(), "Need AMD MI350X (gfx950)")
     @unittest.skipIf(not has_tlx(), "TLX not available")
@@ -1309,7 +1316,7 @@ class TestFlexAttention(TestCase):
         )
         ref = flex_attention(q, k, v, score_mod=score_mod, scale=sm)
         torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
-        self.assertIn("tlx_amd_flex_attention", code)
+        self.assertIn("tlx_gfx950_flex_attention", code)
 
     @unittest.skipIf(not is_gfx950(), "Need AMD MI350X (gfx950)")
     @unittest.skipIf(not has_tlx(), "TLX not available")
@@ -1341,7 +1348,563 @@ class TestFlexAttention(TestCase):
         ref_o, ref_lse = flex_attention(q, k, v, block_mask=bm, scale=sm, return_lse=True)
         torch.testing.assert_close(out, ref_o, atol=2e-2, rtol=2e-2)
         torch.testing.assert_close(lse, ref_lse, atol=3e-2, rtol=3e-2)
-        self.assertIn("tlx_amd_flex_attention", "\n".join(code))
+        self.assertIn("tlx_gfx950_flex_attention", "\n".join(code))
+
+
+class TestResourceModel(TestCase):
+    """Pure arithmetic against GPU arch to calc HW limiter
+    """
+
+    @staticmethod
+    def _tile(**overrides):
+        from triton.language.extra.tlx.hw.resources import BlackwellWSGemmConfig
+
+        kwargs = dict(
+            block_m=128,
+            block_n=128,
+            block_k=64,
+            num_smem_buffers=4,
+            num_tmem_buffers=2,
+            num_mma_groups=1,
+            num_ctas=1,
+            epilogue_subtile=2,
+        )
+        kwargs.update(overrides)
+        return BlackwellWSGemmConfig(**kwargs)
+
+    def test_hw_package_does_not_pull_in_inductor(self):
+        """tlx.hw must not import torch._inductor.
+
+        Primarily this prevents an import cycle. torch's shim
+        (torch/_inductor/template_heuristics/tlx.py) does::
+
+            import triton.language.extra.tlx.inductor.registry
+
+        so the chain is torch._inductor -> tlx.inductor.registry -> tlx.hw. An
+        import of torch._inductor from tlx.hw would re-enter a
+        partially-initialized torch._inductor.
+
+        Secondarily it keeps tlx.hw shareable with the standalone tutorial
+        kernels, which is why the hardware model was split out of tlx/inductor/
+        in the first place. Note this is not a torch-free guarantee -- target.py
+        imports torch -- and tlx/__init__.py imports neither subpackage, so a
+        triton-only consumer is unaffected either way.
+
+        Checked in a subprocess because this module has already imported
+        torch._inductor itself.
+        """
+        import subprocess
+        import sys
+
+        script = ("import sys; "
+                  "import triton.language.extra.tlx.hw.resources; "
+                  "import triton.language.extra.tlx.hw.target; "
+                  "leaked = [m for m in sys.modules if m.startswith('torch._inductor')]; "
+                  "print(len(leaked))")
+        proc = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(
+            proc.stdout.strip(),
+            "0",
+            "tlx.hw imported torch._inductor; keep the hardware model free of "
+            "Inductor so the tutorials can share it",
+        )
+
+    # --- Blackwell WS GEMM model ----------------------------------------
+
+    def test_blackwell_smem_matches_hand_computed(self):
+        from triton.language.extra.tlx.hw.resources import BLACKWELL_WS_GEMM
+
+        tile = self._tile()
+        # A: 128*64*2*4, B: 64*128*2*4, epilog: 128*(128/2)*2, barriers: 4*1*8
+        expected = 65536 + 65536 + 16384 + 32
+        self.assertEqual(BLACKWELL_WS_GEMM.estimate_smem(tile, charge_epilogue=True), expected)
+        self.assertEqual(
+            BLACKWELL_WS_GEMM.estimate_smem(tile, charge_epilogue=False),
+            expected - 16384,
+        )
+
+    def test_blackwell_smem_two_cta_halves_b_and_doubles_barriers(self):
+        from triton.language.extra.tlx.hw.resources import BLACKWELL_WS_GEMM
+
+        one = self._tile(block_m=256, num_mma_groups=2, num_ctas=1)
+        two = self._tile(block_m=256, num_mma_groups=2, num_ctas=2)
+        # B is split across the CTA pair; each CTA keeps its own barriers.
+        self.assertEqual(
+            BLACKWELL_WS_GEMM.estimate_smem(two, charge_epilogue=True),
+            BLACKWELL_WS_GEMM.estimate_smem(one, charge_epilogue=True) - 32768 + 64,
+        )
+
+    def test_blackwell_smem_split_k_adds_fp32_workspace(self):
+        from triton.language.extra.tlx.hw.resources import BLACKWELL_WS_GEMM
+
+        tile = self._tile()
+        base = BLACKWELL_WS_GEMM.estimate_smem(tile, charge_epilogue=True, split_k=1)
+        # (128/1) * (128/2) * 4 bytes * max(num_mma_groups, 2)
+        self.assertEqual(
+            BLACKWELL_WS_GEMM.estimate_smem(tile, charge_epilogue=True, split_k=4),
+            base + 128 * 64 * 4 * 2,
+        )
+
+    def test_blackwell_tmem_is_columns_not_bytes(self):
+        """TMEM is 128-lane granular, so BLOCK_M must not appear in the model."""
+        from triton.language.extra.tlx.hw.resources import BLACKWELL_WS_GEMM
+
+        cols = BLACKWELL_WS_GEMM.estimate_tmem_columns
+        self.assertEqual(
+            cols(self._tile(block_m=256, num_mma_groups=2)),
+            cols(self._tile(block_m=64, num_mma_groups=2)),
+        )
+        self.assertEqual(cols(self._tile()), 128 * 2 * 1)
+        # num_mma_groups multiplies the column count.
+        self.assertEqual(cols(self._tile(num_mma_groups=2)), 128 * 2 * 2)
+
+    def test_blackwell_tmem_limit_rejects_oversized_accumulator(self):
+        from triton.language.extra.tlx.hw.resources import (
+            BLACKWELL_WS_GEMM,
+            DeviceLimits,
+        )
+
+        limits = DeviceLimits.for_arch("sm100")
+        # 256 columns * 2 buffers * 2 groups = 1024 > 512, but SMEM still fits,
+        # so this isolates the TMEM check.
+        tile = self._tile(block_n=256, num_smem_buffers=2, num_mma_groups=2)
+        self.assertLess(
+            BLACKWELL_WS_GEMM.estimate_smem(tile, charge_epilogue=True),
+            limits.on_chip_bytes,
+        )
+        self.assertFalse(BLACKWELL_WS_GEMM.validate(tile, charge_epilogue=True, limits=limits))
+        self.assertTrue(BLACKWELL_WS_GEMM.validate(tile, charge_epilogue=True, check_tmem=False, limits=limits))
+
+    def test_blackwell_tile_rules(self):
+        from triton.language.extra.tlx.hw.resources import BLACKWELL_WS_GEMM
+
+        rules = BLACKWELL_WS_GEMM.check_tile_rules
+        self.assertTrue(rules(self._tile()))
+        # Rule 1: more than 128 rows per MMA group.
+        self.assertFalse(rules(self._tile(block_m=256)))
+        # Rule 1b: pair-CTA MMA requires exactly 128 rows per group.
+        self.assertFalse(rules(self._tile(block_m=128, num_mma_groups=2, num_ctas=2)))
+        self.assertTrue(rules(self._tile(block_m=256, num_mma_groups=2, num_ctas=2)))
+        # Rule 2: EPILOGUE_SUBTILE must divide BLOCK_N.
+        self.assertFalse(rules(self._tile(block_n=192, epilogue_subtile=128)))
+
+    def test_blackwell_smem_margin_is_applied(self):
+        from triton.language.extra.tlx.hw.resources import (
+            BLACKWELL_WS_GEMM,
+            DeviceLimits,
+        )
+
+        limits = DeviceLimits.for_arch("sm100")
+        tile = self._tile()
+        smem = BLACKWELL_WS_GEMM.estimate_smem(tile, charge_epilogue=True)
+        slack = limits.on_chip_bytes - smem
+        self.assertGreater(slack, 0, "pick a tile that still fits without margin")
+        self.assertTrue(BLACKWELL_WS_GEMM.validate(tile, charge_epilogue=True, smem_margin=slack, limits=limits))
+        self.assertFalse(BLACKWELL_WS_GEMM.validate(tile, charge_epilogue=True, smem_margin=slack + 1, limits=limits))
+
+    # --- AMD warp-pipe model (budgets pinned at gfx950) -------------------
+
+    def test_gfx950_warppipe_lds_matches_documented_budget(self):
+        """Cross-check against the hand-verified figures on WARPPIPE_CONFIGS."""
+        from triton.language.extra.tlx.hw.resources import (
+            AMD_WARP_PIPE,
+            AmdWarpPipeConfig,
+        )
+
+        for block_m, block_n, block_k, num_buffers, want_kb in (
+            (128, 256, 64, 2, 96),
+            (128, 256, 32, 3, 72),
+            (128, 256, 64, 3, 144),
+        ):
+            cfg = AmdWarpPipeConfig(block_m, block_n, block_k, num_buffers)
+            self.assertEqual(
+                AMD_WARP_PIPE.estimate_smem(cfg),
+                want_kb * 1024,
+                f"({block_m}x{block_n}x{block_k}, NB{num_buffers})",
+            )
+
+    def test_gfx950_warppipe_register_path_allocates_no_lds(self):
+        from triton.language.extra.tlx.hw.resources import (
+            AMD_WARP_PIPE,
+            AmdWarpPipeConfig,
+        )
+
+        cfg = AmdWarpPipeConfig(128, 256, 64, 3, use_async=False)
+        self.assertEqual(AMD_WARP_PIPE.estimate_smem(cfg), 0)
+
+    def test_gfx950_warppipe_has_no_tensor_memory(self):
+        from triton.language.extra.tlx.hw.resources import (
+            AMD_WARP_PIPE,
+            AmdWarpPipeConfig,
+        )
+
+        self.assertEqual(AMD_WARP_PIPE.estimate_tmem_columns(AmdWarpPipeConfig(128, 256, 64, 3)), 0)
+
+    def test_every_shipped_warppipe_config_fits_gfx950(self):
+        """The tuned AMD pool must not contain a config the model rejects."""
+        from triton.language.extra.tlx.inductor.registry import (
+            Gfx950AddMMWarpPipeConfigHeuristic as H, )
+        from triton.language.extra.tlx.hw.resources import (
+            AMD_WARP_PIPE,
+            DeviceLimits,
+            AmdWarpPipeConfig,
+        )
+
+        limits = DeviceLimits.for_arch("gfx950")
+        for block_m, block_n, block_k, _gm, _nw, num_buffers in H.WARPPIPE_CONFIGS:
+            cfg = AmdWarpPipeConfig(block_m, block_n, block_k, num_buffers)
+            self.assertTrue(
+                AMD_WARP_PIPE.validate(cfg, limits=limits),
+                f"shipped config ({block_m}x{block_n}x{block_k}, "
+                f"NB{num_buffers}) = {AMD_WARP_PIPE.estimate_smem(cfg)} B "
+                f"exceeds the gfx950 LDS budget of {limits.on_chip_bytes} B",
+            )
+
+    def test_models_are_registered_for_every_tlx_template(self):
+        from triton.language.extra.tlx.inductor import mm_templates
+        from triton.language.extra.tlx.hw.resources import MODELS
+
+        for name in (
+                "blackwell_gemm_ws_template",
+                "gfx950_addmm_warppipe_template",
+                "gfx950_addmm_persistent_warppipe_template",
+                "gfx950_bmm_warppipe_template",
+        ):
+            uid = getattr(mm_templates, name).uid
+            self.assertIn(uid, MODELS, f"{name} ({uid}) has no resource model")
+
+
+class TestCandidateScorer(TestCase):
+    """The fallback candidate scorer.
+
+    The scorer and its ``_CANDIDATES`` table are specific to the Blackwell
+    warp-specialized GEMM template -- the configs carry NUM_TMEM_BUFFERS and
+    pair-CTA counts, neither of which exists on the AMD warp-pipe. The pure
+    functions are exercised everywhere by pinning Blackwell limits explicitly;
+    only the end-to-end lookup, which reads the live target, is device-gated.
+    """
+
+    #: Shapes covering both saturated and undersaturated regimes.
+    _SHAPES = [(m, n, k) for m in (128, 1024, 4096, 16384) for n in (64, 256, 4096) for k in (512, 4096, 8192)]
+
+    def test_candidates_are_blackwell_shaped(self):
+        """Guard the assumption the rest of this class rests on."""
+        from triton.language.extra.tlx.inductor.registry import _CANDIDATES
+        from triton.language.extra.tlx.hw.resources import (
+            BLACKWELL_WS_GEMM,
+            DeviceLimits,
+            BlackwellWSGemmConfig,
+        )
+
+        limits = DeviceLimits.for_arch("sm100")
+        self.assertTrue(_CANDIDATES)
+        for cfg in _CANDIDATES:
+            tile = BlackwellWSGemmConfig.from_dict(cfg)
+            # Every candidate needs tensor memory, so this table cannot be
+            # scored against a non-Blackwell target.
+            self.assertGreater(BLACKWELL_WS_GEMM.estimate_tmem_columns(tile), 0)
+            self.assertLessEqual(BLACKWELL_WS_GEMM.estimate_tmem_columns(tile), limits.tmem_columns)
+
+    def test_scorer_never_returns_a_structurally_invalid_config(self):
+        """The scorer must not pick a config the tile rules reject.
+
+        It used to skip the pair-CTA rule that ``_is_config_valid`` enforces,
+        so a violating candidate could win here and be rejected downstream.
+        Because both of ``get_heuristic_config``'s retry paths re-run this same
+        deterministic scorer, the retries returned the identical config and the
+        whole lookup fell through to ``None``.
+        """
+        from triton.language.extra.tlx.inductor.registry import (
+            _candidate_scorer_evaluate, )
+        from triton.language.extra.tlx.hw.resources import (
+            BLACKWELL_WS_GEMM,
+            BlackwellWSGemmConfig,
+        )
+
+        selected = set()
+        for m, n, k in self._SHAPES:
+            cfg = _candidate_scorer_evaluate(m, n, k, 148)
+            if cfg is None:
+                continue
+            selected.add((cfg["BLOCK_SIZE_M"], cfg["BLOCK_SIZE_N"], cfg["NUM_CTAS"]))
+            self.assertTrue(
+                BLACKWELL_WS_GEMM.check_tile_rules(BlackwellWSGemmConfig.from_dict(cfg)),
+                f"scorer returned a structurally invalid config for "
+                f"({m},{n},{k}): {cfg}",
+            )
+        self.assertTrue(selected, "scorer never selected anything")
+        # The pair-CTA violator is still in the candidate table; it is filtered
+        # by the scorer rather than deleted, so pin that it never wins.
+        self.assertNotIn((128, 64, 2), selected)
+
+    @unittest.skipUnless(is_blackwell(), "the scorer's candidate table is Blackwell-specific")
+    def test_pair_cta_candidate_no_longer_strands_the_lookup(self):
+        """Shapes that used to fall through to None now get a config.
+
+        Device-gated: get_heuristic_config resolves limits from the live
+        target, so on a non-Blackwell part these shapes legitimately produce
+        no config.
+        """
+        from triton.language.extra.tlx.inductor.registry import get_heuristic_config
+
+        # These scored best on the (128,64,128) 2-CTA candidate before the fix,
+        # which _is_config_valid then rejected, stranding the whole lookup.
+        for m, n, k in ((128, 128, 4096), (128, 1024, 2049), (128, 128, 8192)):
+            cfg = get_heuristic_config(m, n, k, num_sms=148, tma_epilogue_store=True)
+            self.assertIsNotNone(cfg, f"({m},{n},{k}) still returns None")
+
+    def test_split_k_workspace_gap_is_still_open(self):
+        """Documents the remaining scorer/validator divergence.
+
+        The scorer picks ``SPLIT_K`` without charging the fp32 partials
+        workspace that ``_is_config_valid`` does charge, so it can still return
+        a config that is rejected downstream -- the same failure shape as the
+        pair-CTA bug, stranding ~84 of the sweep's shapes at ``None``. Closing
+        it changes which split factor real shapes get, so it is deliberately
+        left for its own diff. Flip this test when that lands.
+        """
+        from triton.language.extra.tlx.inductor.registry import (
+            _candidate_scorer_evaluate,
+            _is_config_valid,
+        )
+
+        stranded = [(m, n, k)
+                    for m, n, k in self._SHAPES
+                    if (cfg := _candidate_scorer_evaluate(m, n, k, 148)) is not None
+                    and not _is_config_valid(cfg, tma_epilogue_store=False)]
+        self.assertTrue(
+            all(_candidate_scorer_evaluate(m, n, k, 148).get("SPLIT_K", 1) > 1 for m, n, k in stranded),
+            "a non-split-K config is now stranded; the scorer and "
+            "_is_config_valid have diverged in a new way",
+        )
+
+
+class TestTargetDetection(TestCase):
+    """Arch detection. No GPU needed."""
+
+    def test_is_rocm_does_not_touch_the_device(self):
+        from triton.language.extra.tlx.hw.target import is_rocm
+
+        with mock.patch.object(torch.cuda, "get_device_properties", side_effect=AssertionError("queried")):
+            self.assertEqual(is_rocm(), torch.version.hip is not None)
+
+    @staticmethod
+    def _target(arch_key, *, arch="", capability=None, num_sms=1):
+        """Build a Target for a named arch without touching a device."""
+        from triton.language.extra.tlx.hw.resources import ARCH_SPECS, has_tmem
+        from triton.language.extra.tlx.hw.target import Target
+
+        spec = ARCH_SPECS[arch_key]
+        return Target(
+            spec=spec,
+            is_rocm=spec.vendor == "amd",
+            arch=arch,
+            capability=capability,
+            num_sms=num_sms,
+            smem_bytes=getattr(spec, "lds_bytes", None) or getattr(spec, "smem_bytes", 0) or 0,
+            tmem_columns=spec.tmem_columns() if has_tmem(spec) else None,
+        )
+
+    def test_no_device_resolves_to_no_arch(self):
+        """A build host must not look like a B200.
+
+        current_target() still returns a Target so the pure-Python heuristics
+        stay callable, but with spec=None: every arch predicate is False and
+        has_device says why.
+        """
+        from triton.language.extra.tlx.hw import target
+
+        target.current_target.cache_clear()
+        try:
+            with mock.patch.object(torch.cuda, "get_device_properties", side_effect=RuntimeError("no gpu")):
+                t = target.current_target()
+            self.assertIsNone(t.spec)
+            self.assertFalse(t.has_device)
+            self.assertEqual(t.key, "")
+            self.assertFalse(t.is_blackwell)
+            self.assertFalse(t.is_hopper)
+            self.assertFalse(t.is_gfx950)
+            self.assertFalse(t.has_tmem)
+            self.assertIsNone(t.tmem_columns)
+            with self.assertRaises(AttributeError):
+                t.num_xcds
+            # Numbers still usable, from the documented reference arch.
+            self.assertEqual(t.num_sms, target.REFERENCE_ARCH.processor_count())
+            self.assertEqual(t.smem_bytes, target.REFERENCE_ARCH.on_chip_bytes())
+        finally:
+            target.current_target.cache_clear()
+
+    # --- arch resolution ---------------------------------------------------
+
+    def test_each_hierarchy_answers_the_vendor_agnostic_accessors(self):
+        """Both hierarchies implement on_chip_bytes/processor_count.
+
+        They have no common base, so this duck-typed pair is the only contract
+        a vendor-agnostic caller can rely on.
+        """
+        from triton.language.extra.tlx.hw.resources import ARCH_SPECS
+
+        for key, spec in ARCH_SPECS.items():
+            self.assertTrue(callable(spec.on_chip_bytes), key)
+            self.assertTrue(callable(spec.processor_count), key)
+            if spec.vendor == "nvidia":
+                self.assertEqual(spec.on_chip_bytes(), spec.smem_bytes, key)
+                self.assertEqual(spec.processor_count(), spec.num_sms, key)
+                self.assertFalse(hasattr(spec, "lds_bytes"), key)
+                self.assertFalse(hasattr(spec, "num_xcds"), key)
+            else:
+                self.assertFalse(hasattr(spec, "smem_bytes"), key)
+                if hasattr(spec, "lds_bytes"):
+                    self.assertEqual(spec.on_chip_bytes(), spec.lds_bytes, key)
+                    self.assertEqual(spec.processor_count(), spec.num_cus, key)
+
+    def test_newer_arch_inherits_from_its_predecessor(self):
+        """Blackwell is Hopper plus TMEM; CDNA4 is CDNA3 with a bigger LDS."""
+        from triton.language.extra.tlx.hw.resources import (
+            Gfx942,
+            Gfx950,
+            Gfx1250,
+            Sm90,
+            Sm100,
+        )
+
+        self.assertTrue(issubclass(Sm100, Sm90))
+        self.assertTrue(issubclass(Gfx950, Gfx942))
+        # gfx1250 is a separate lineage, so it cannot inherit CDNA4's facts.
+        self.assertFalse(issubclass(Gfx1250, Gfx950))
+        # The vendors stay disjoint: no shared parent across them.
+        self.assertFalse(issubclass(Sm100, Gfx942))
+        self.assertFalse(issubclass(Gfx942, Sm90))
+        # TMEM is introduced at Blackwell, so it is absent everywhere else --
+        # reaching for it is an AttributeError, not a plausible 0.
+        from triton.language.extra.tlx.hw.resources import has_tmem
+
+        self.assertTrue(has_tmem(Sm100))
+        for spec in (Sm90, Gfx942, Gfx950, Gfx1250):  # Rubin inherits Sm100's
+            self.assertFalse(has_tmem(spec), spec.__name__)
+            with self.assertRaises(AttributeError):
+                spec.tmem_columns()
+
+        # An uncharacterized fact is absent, not None and not inherited.
+        for missing in ("lds_bytes", "num_cus"):
+            self.assertFalse(hasattr(Gfx1250, missing), missing)
+        with self.assertRaises(AttributeError):
+            Gfx1250.on_chip_bytes()
+        with self.assertRaises(AttributeError):
+            Gfx1250.processor_count()
+
+    def test_unrecognized_amd_arch_raises_rather_than_inheriting(self):
+        """An unknown gfx must not silently pick up gfx950's LDS and XCDs."""
+        from triton.language.extra.tlx.hw import target
+
+        props = mock.Mock(
+            gcnArchName="gfx90a:sramecc+",
+            multi_processor_count=104,
+            shared_memory_per_block_optin=65536,
+            major=0,
+            minor=0,
+        )
+        target.current_target.cache_clear()
+        try:
+            with mock.patch.object(target, "is_rocm", return_value=True), \
+                 mock.patch.object(
+                     torch.cuda, "get_device_properties", return_value=props
+                 ):
+                with self.assertRaises(ValueError) as cm:
+                    target.current_target()
+            self.assertIn("gfx90a", str(cm.exception))
+        finally:
+            target.current_target.cache_clear()
+
+    def test_arch_gates_are_false_without_a_device(self):
+        """The module-level gates must not fire off the CPU-only fallback."""
+        from triton.language.extra.tlx.hw import target
+
+        target.current_target.cache_clear()
+        try:
+            with mock.patch.object(torch.cuda, "get_device_properties", side_effect=RuntimeError("no gpu")):
+                self.assertFalse(is_blackwell())
+                self.assertFalse(is_gfx950())
+        finally:
+            target.current_target.cache_clear()
+
+    def test_arch_gates_agree_with_the_live_target(self):
+        """One model answers both gates; they cannot both be true."""
+        target = current_target()
+        self.assertEqual(is_blackwell(), target.has_device and target.is_blackwell)
+        self.assertEqual(is_gfx950(), target.has_device and target.is_gfx950)
+        self.assertFalse(is_blackwell() and is_gfx950())
+
+    def test_gfx1250_is_not_shadowed_by_a_gfx12_prefix(self):
+        """triton._internal_testing documents this exact footgun."""
+        from triton.language.extra.tlx.hw.target import _spec_for_rocm
+
+        self.assertEqual(_spec_for_rocm("gfx1250").key, "gfx1250")
+        self.assertEqual(_spec_for_rocm("gfx950:sramecc+:xnack-").key, "gfx950")
+        self.assertEqual(_spec_for_rocm("gfx942:sramecc+").key, "gfx942")
+        self.assertIsNone(_spec_for_rocm("gfx90a"))
+
+    # --- resolved target -------------------------------------------------
+
+    def test_num_xcds_absent_on_nvidia(self):
+        """Chiplets are an AMD concept; asking on NVIDIA is a caller bug."""
+        for key in ("sm90", "sm100", "sm107"):
+            with self.assertRaises(AttributeError):
+                self._target(key).num_xcds
+
+    def test_num_xcds_on_amd(self):
+        for key in ("gfx942", "gfx950", "gfx1250"):
+            self.assertEqual(self._target(key).num_xcds, 8, key)
+
+    def test_arch_predicates_are_mutually_exclusive(self):
+        for key in ("sm90", "sm100", "sm107", "gfx942", "gfx950", "gfx1250"):
+            t = self._target(key)
+            flags = [
+                t.is_hopper,
+                t.is_blackwell,
+                t.is_rubin,
+                t.is_gfx942,
+                t.is_gfx950,
+                t.is_gfx1250,
+            ]
+            self.assertEqual(sum(flags), 1, f"{key} matched {sum(flags)} predicates")
+            self.assertEqual(t.is_rocm, key.startswith("gfx"))
+            # Blackwell and everything descended from it.
+            self.assertEqual(t.has_tmem, key in ("sm100", "sm107"))
+
+    def test_default_kpack_matches_torch(self):
+        self.assertEqual(self._target("sm100").default_kpack(16), 0)
+        self.assertEqual(self._target("gfx942").default_kpack(16), 1)
+        self.assertEqual(self._target("gfx942").default_kpack(32), 2)
+        self.assertEqual(self._target("gfx950").default_kpack(16), 2)
+
+    def test_capability_maps_to_arch(self):
+        from triton.language.extra.tlx.hw.target import _spec_for_cuda
+
+        self.assertEqual(_spec_for_cuda((9, 0)).key, "sm90")
+        self.assertEqual(_spec_for_cuda((10, 0)).key, "sm100")
+        # Rubin has its own placeholder class.
+        self.assertEqual(_spec_for_cuda((10, 7)).key, "sm107")
+        # Blackwell Ultra / newer resolve forward, not back to Hopper.
+        self.assertEqual(_spec_for_cuda((10, 3)).key, "sm100")
+        self.assertEqual(_spec_for_cuda((11, 0)).key, "sm100")
+
+    def test_get_heuristic_config_defaults_num_sms_from_target(self):
+        from triton.language.extra.tlx.hw import target
+        from triton.language.extra.tlx.inductor import registry
+        from triton.language.extra.tlx.inductor.registry import get_heuristic_config
+
+        stub = self._target("sm100", capability=(10, 0), num_sms=148)
+        target.current_target.cache_clear()
+        try:
+            with mock.patch.object(registry, "current_target", return_value=stub):
+                self.assertEqual(
+                    get_heuristic_config(4096, 4096, 4096),
+                    get_heuristic_config(4096, 4096, 4096, num_sms=148),
+                )
+        finally:
+            target.current_target.cache_clear()
 
 
 if __name__ == "__main__":

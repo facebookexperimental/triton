@@ -1,6 +1,6 @@
 {{def_kernel("A", "B")}}
     # PERSISTENT TLX warp-pipelined addmm for AMD (MI350X / gfx950), COL-MAJOR B (stride_bk == 1).
-    # Persistent variant of amd_addmm_warppipe: the grid is capped at NUM_SMS (see
+    # Persistent variant of gfx950_addmm_warppipe: the grid is capped at NUM_SMS (see
     # _persistent_mm_grid_split_k) and each program strides over output tiles by NUM_SMS.
     # The per-tile body (col-major B loaded as (BLOCK_N, BLOCK_K) + tlx.local_trans, XCD chiplet
     # swizzle, "mfma"/"mem" warp-pipeline stages, single combined A+B commit, loop-tail wait) is

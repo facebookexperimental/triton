@@ -2,7 +2,7 @@
     # TLX warp-pipelined bmm for AMD (MI350X / gfx950). C[b] = A[b] @ B[b].
     # A:[BATCH,M,K] row-major, B:[BATCH,K,N] row-major (the standard torch.bmm layout, so B is
     # loaded as (BLOCK_K, BLOCK_N) tiles directly -- no transpose, unlike the col-major addmm).
-    # Same warp-pipe compute core as amd_addmm_warppipe (async_load prefetch into multi-buffered
+    # Same warp-pipe compute core as gfx950_addmm_warppipe (async_load prefetch into multi-buffered
     # LDS + tlx.warp_pipeline_stage); the only differences are a batch axis on the grid and a
     # per-batch int64 base advance. num_stages=1.
     #
@@ -40,7 +40,7 @@
     batch_id = pid // grid_mn      # 1-D grid: BATCH * grid_mn programs
     pid = pid % grid_mn
 
-    # L2 chiplet swizzle on the within-batch pid (same as amd_addmm_warppipe). NUM_XCDS is injected
+    # L2 chiplet swizzle on the within-batch pid (same as gfx950_addmm_warppipe). NUM_XCDS is injected
     # by the heuristic (8 for gfx942/gfx950, else 1 -> identity). Trailing remainder passes through.
     XCD_CHUNK: tl.constexpr = 8
     aligned = (grid_mn // (NUM_XCDS * XCD_CHUNK)) * (NUM_XCDS * XCD_CHUNK)
