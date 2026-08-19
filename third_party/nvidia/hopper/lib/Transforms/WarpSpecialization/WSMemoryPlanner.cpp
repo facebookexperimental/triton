@@ -5606,20 +5606,20 @@ LogicalResult doMemoryPlanner(triton::FuncOp funcOp, unsigned numBuffers,
   unsigned effectiveSmemBudget = smemBudget;
   bool effectiveSmemCircularReuse = options.smemCircularReuse;
   bool hasSmemAllocAlgoAttr = false;
-  funcOp->walk([&](scf::ForOp forOp) {
-    if (!forOp->hasAttr("tt.warp_specialize"))
+  funcOp->walk([&](Operation *op) {
+    if (!isa<scf::ForOp, scf::WhileOp>(op) ||
+        !op->hasAttr("tt.warp_specialize"))
       return;
-    // Walk from the WS ForOp up through parent ForOps, collecting
-    // attributes. The innermost (WS) loop has highest priority.
-    SmallVector<scf::ForOp> loopChain;
-    loopChain.push_back(forOp);
-    for (auto parent = forOp->getParentOfType<scf::ForOp>(); parent;
-         parent = parent->getParentOfType<scf::ForOp>()) {
-      loopChain.push_back(parent);
-    }
+    // Walk from the WS loop up through parent loops, collecting attributes.
+    // CLC persistent loops remain scf.while here, while countable loops are
+    // commonly represented as scf.for. The innermost WS loop has priority.
+    SmallVector<Operation *> loopChain;
+    for (Operation *loop = op; loop; loop = loop->getParentOp())
+      if (isa<scf::ForOp, scf::WhileOp>(loop))
+        loopChain.push_back(loop);
     // Apply from outermost to innermost (innermost wins).
     for (auto it = loopChain.rbegin(); it != loopChain.rend(); ++it) {
-      auto loop = *it;
+      Operation *loop = *it;
       if (auto attr = loop->getAttrOfType<IntegerAttr>("tt.smem_alloc_algo")) {
         effectiveSmemAllocAlgo = attr.getInt();
         hasSmemAllocAlgoAttr = true;
