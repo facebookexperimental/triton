@@ -100,6 +100,21 @@ _cuCtxSetCurrent = None
 _cuPointerGetAttribute = None
 
 
+def _validate_exact_cluster_grid(
+    grid: tuple[int, int, int], num_ctas: int, cluster_dims: tuple[int, ...]
+) -> None:
+    if num_ctas <= 0 or len(cluster_dims) != 3 or any(dim <= 0 for dim in cluster_dims):
+        raise ValueError(f"Invalid Triton cluster metadata: num_ctas={num_ctas}, cluster_dims={cluster_dims}")
+    required = (num_ctas, 1, 1) if num_ctas > 1 else tuple(cluster_dims)
+    if required == (1, 1, 1):
+        return
+    physical_grid = (grid[0] * num_ctas, grid[1], grid[2])
+    if any(size % cluster != 0 for size, cluster in zip(physical_grid, required)):
+        raise ValueError(
+            f"Triton cluster requirement failed: physical grid {physical_grid} "
+            f"is not divisible by required cluster shape {required}")
+
+
 def _ensure_cuda_context():
     global _libcuda, _cuCtxGetCurrent, _cuDeviceGet, _cuDevicePrimaryCtxRetain, _cuCtxSetCurrent
     if _libcuda is None:
@@ -387,6 +402,9 @@ def make_ctypes_launcher(constants, signature, tensordesc_meta):
             num_warps,
             num_ctas,
             shared_memory,
+            clusterDimX,
+            clusterDimY,
+            clusterDimZ,
             _preferredClusterDimX,
             _preferredClusterDimY,
             _preferredClusterDimZ,
@@ -400,6 +418,14 @@ def make_ctypes_launcher(constants, signature, tensordesc_meta):
             if launch_exit_hook is not None:
                 launch_exit_hook(launch_metadata)
             return
+
+        _validate_exact_cluster_grid(
+            (gridX, gridY, gridZ), num_ctas, (clusterDimX, clusterDimY, clusterDimZ))
+        has_exact_cluster = num_ctas > 1 or clusterDimX > 1 or clusterDimY > 1 or clusterDimZ > 1
+
+        actual_gridX = gridX * num_ctas
+        actual_gridY = gridY
+        actual_gridZ = gridZ
 
         # Process global_scratch
         global_scratch = CUdeviceptr(0)
@@ -430,10 +456,6 @@ def make_ctypes_launcher(constants, signature, tensordesc_meta):
         launch_attrs = (CUlaunchAttribute * 4)()
         num_attrs = 0
 
-        actual_gridX = gridX * num_ctas
-        actual_gridY = gridY
-        actual_gridZ = gridZ
-
         if launch_pdl:
             launch_attrs[num_attrs].id = (CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION)
             launch_attrs[num_attrs].value.value = 1
@@ -444,14 +466,18 @@ def make_ctypes_launcher(constants, signature, tensordesc_meta):
             launch_attrs[num_attrs].value.value = 1
             num_attrs += 1
 
-        if launch_cluster or num_ctas != 1:
-            # Only set CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION for Triton's num_ctas path.
-            # For ctas_per_cga path (num_ctas == 1), PTX's .reqnctapercluster handles it.
+        if launch_cluster or has_exact_cluster:
             if num_ctas > 1:
                 launch_attrs[num_attrs].id = CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION
                 launch_attrs[num_attrs].value.clusterDim.x = num_ctas
                 launch_attrs[num_attrs].value.clusterDim.y = 1
                 launch_attrs[num_attrs].value.clusterDim.z = 1
+                num_attrs += 1
+            elif has_exact_cluster:
+                launch_attrs[num_attrs].id = CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION
+                launch_attrs[num_attrs].value.clusterDim.x = clusterDimX
+                launch_attrs[num_attrs].value.clusterDim.y = clusterDimY
+                launch_attrs[num_attrs].value.clusterDim.z = clusterDimZ
                 num_attrs += 1
 
             launch_attrs[num_attrs].id = (CU_LAUNCH_ATTRIBUTE_CLUSTER_SCHEDULING_POLICY_PREFERENCE)

@@ -7,6 +7,8 @@ produce identical results to the default C-compiled launcher. Tests cover:
 3. Device-side TMA tensor descriptors (tensordesc_meta entries are dicts)
 """
 
+import re
+
 import pytest
 import torch
 
@@ -15,8 +17,10 @@ import triton.language as tl
 from triton import knobs
 from triton._internal_testing import (
     is_cuda,
+    is_hopper_or_newer,
     requires_tma,
 )
+from triton.backends.nvidia.ctypes_launcher import _validate_exact_cluster_grid
 from triton.tools.tensor_descriptor import TensorDescriptor
 
 
@@ -63,6 +67,61 @@ def test_no_compile_launcher_add(device, fresh_triton_cache):
 
     torch.testing.assert_close(out_ctypes, expected)
     torch.testing.assert_close(out_ctypes, out_c)
+
+
+@triton.jit
+def _pid_write(out_ptr, GX: tl.constexpr, GY: tl.constexpr):
+    pid_x = tl.program_id(0)
+    pid_y = tl.program_id(1)
+    pid_z = tl.program_id(2)
+    offset = pid_x + GX * (pid_y + GY * pid_z)
+    tl.store(out_ptr + offset, offset)
+
+
+@pytest.mark.parametrize(
+    "num_ctas,cluster_dims",
+    [
+        (0, (1, 1, 1)),
+        (1, (2, 0, 2)),
+        (1, (2, -1, 2)),
+        (1, (2, 2)),
+    ],
+)
+def test_no_compile_launcher_rejects_invalid_cluster_metadata(num_ctas, cluster_dims):
+    with pytest.raises(ValueError, match="Invalid Triton cluster metadata"):
+        _validate_exact_cluster_grid((4, 2, 4), num_ctas, cluster_dims)
+
+
+def test_no_compile_launcher_multidim_cluster(device, fresh_triton_cache):
+    _skip_if_not_cuda()
+    if not is_hopper_or_newer():
+        pytest.skip("clusters need Hopper or newer")
+
+    grid = (4, 2, 4)
+    out = torch.full((grid[0] * grid[1] * grid[2], ), -1, device=device, dtype=torch.int32)
+    _pid_write.device_caches.clear()
+    with knobs.nvidia.scope():
+        knobs.nvidia.use_no_compile_launcher = True
+        _pid_write[grid](out, grid[0], grid[1], ctas_per_cga=(2, 2, 2))
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out, torch.arange(out.numel(), device=device, dtype=torch.int32))
+
+
+@pytest.mark.parametrize("grid", [(3, 2, 4), (4, 3, 4), (4, 2, 3)])
+def test_no_compile_launcher_rejects_incomplete_cluster(device, fresh_triton_cache, grid):
+    _skip_if_not_cuda()
+    if not is_hopper_or_newer():
+        pytest.skip("clusters need Hopper or newer")
+
+    out = torch.empty((grid[0] * grid[1] * grid[2], ), device=device, dtype=torch.int32)
+    _pid_write.device_caches.clear()
+    with knobs.nvidia.scope():
+        knobs.nvidia.use_no_compile_launcher = True
+        with pytest.raises(
+            ValueError,
+            match=rf"physical grid {re.escape(str(grid))}.*required cluster shape \(2, 2, 2\)",
+        ):
+            _pid_write[grid](out, grid[0], grid[1], ctas_per_cga=(2, 2, 2))
 
 
 # ---------------------------------------------------------------------------
