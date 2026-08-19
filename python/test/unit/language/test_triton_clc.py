@@ -225,9 +225,19 @@ def test_clc_cluster_materializes_multicast_request():
     counts = torch.zeros(1024, device="cuda", dtype=torch.int32)
     steals = torch.zeros(1, device="cuda", dtype=torch.int32)
     delay = torch.zeros(1, device="cuda", dtype=torch.int32)
-    kernel = _clc_cluster_count_kernel[(1024, 1, 1)](counts, steals, delay, 1024, 1, ctas_per_cga=(2, 1, 1),
+    kernel = _clc_cluster_count_kernel[(512, 2, 1)](counts, steals, delay, 512, 2, ctas_per_cga=(2, 2, 1),
                                                      launch_cluster=True)
+    ttgir = kernel.asm["ttgir"]
     ptx = kernel.asm["ptx"]
+    expect_pos = ttgir.index("ttng.barrier_expect")
+    rendezvous_pos = ttgir.index("ttng.arrive_barrier", expect_pos)
+    ready_pos = ttgir.index("ttng.wait_barrier", rendezvous_pos)
+    request_pos = ttgir.index("ttng.clc_try_cancel", rendezvous_pos)
+    assert expect_pos < rendezvous_pos < ready_pos < request_pos
+    assert "perThread" not in ttgir[rendezvous_pos:ready_pos]
     assert "multicast::cluster::all" in ptx
     assert "mapa.shared::cluster" in ptx
     assert "mbarrier.arrive.shared::cluster" in ptx
+    assert counts.min().item() == 1, "some CTA in a canceled cluster was never claimed"
+    assert counts.max().item() == 1, "some CTA in a canceled cluster was claimed more than once"
+    assert steals.item() > 0, "the test did not exercise a successful cluster cancellation"

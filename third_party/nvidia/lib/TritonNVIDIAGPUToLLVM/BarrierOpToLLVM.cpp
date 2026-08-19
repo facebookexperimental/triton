@@ -427,8 +427,9 @@ struct ArriveBarrierOpConversion
 
     if (isPerThread) {
       // Warp arrive: every thread arrives independently, no leader pattern.
-      // perThread arrives are warp-specialization (single CTA) and never
-      // broadcast across CTAs, so no lead-CTA redirection applies here.
+      // perThread arrives do not use ctaMask multicast or lead-CTA
+      // redirection, but the barrier itself may be mapped into remote shared
+      // memory.
       bool hasPred = !!op.getPred();
       std::stringstream ptxAsm;
       if (hasPred) {

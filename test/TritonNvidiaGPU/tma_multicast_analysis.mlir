@@ -184,6 +184,22 @@ module attributes {
     }
     tt.return
   }
+
+  // CHECK-LABEL: @clc_read_cluster_schedule
+  tt.func public @clc_read_cluster_schedule(
+      %a: !tt.tensordesc<128x64xf16, #shared>,
+      %b: !tt.tensordesc<128x64xf16, #shared>) {
+    %k = arith.constant 0 : i32
+    %token = ttng.clc_try_cancel_async : !ttg.async.token
+    %valid, %x, %y, %z = ttng.clc_read %token : !ttg.async.token -> i1, i32, i32, i32
+    scf.if %valid {
+      // CHECK: tt.descriptor_load {{.*}}multicast = true{{.*}}tt.multicast_axes = array<i32: 1>}
+      %av = tt.descriptor_load %a[%x, %k] {multicast = true} : !tt.tensordesc<128x64xf16, #shared> -> tensor<128x64xf16, #blocked>
+      // CHECK: tt.descriptor_load {{.*}}multicast = true{{.*}}tt.multicast_axes = array<i32: 0>}
+      %bv = tt.descriptor_load %b[%y, %k] {multicast = true} : !tt.tensordesc<128x64xf16, #shared> -> tensor<128x64xf16, #blocked>
+    }
+    tt.return
+  }
 }
 
 module attributes {

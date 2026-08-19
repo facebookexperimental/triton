@@ -293,9 +293,11 @@ only handles the CLC-response completion barrier local to the producer.
 Materialization (producer partition, depth-1):
 
 1. Allocate the response buffer (`memdesc<2xi64>`) and one **completion mbarrier**
-   at function scope; init / inval. For explicit clusters, also allocate an
-   **empty mbarrier** on which all CTAs arrive after consuming a response.
-2. `clc_try_cancel_async` → `ttng.clc_try_cancel(resp, bar)` + `barrier_expect(bar, 16)`.
+   at function scope; init / inval. For explicit clusters, also allocate a
+   **ready mbarrier**.
+2. `clc_try_cancel_async` → `barrier_expect(bar, 16)`; for explicit clusters,
+   each producer task signals rank zero's ready mbarrier and rank zero waits;
+   then `ttng.clc_try_cancel(resp, bar)` issues the request.
 3. `clc_read %tok` → `wait_barrier(bar, phase)` + `ttng.clc_load_result(resp)` +
    `ttng.clc_is_canceled` (→ `isValid`) + `ttng.clc_get_program_id` (→ x/y/z).
 
@@ -306,14 +308,14 @@ ensures the response is read before the next iteration reuses its buffer, so onl
 the full (data-ready) completion mbarrier is needed.
 
 With `ctas_per_cga`, program order within one CTA does not prevent rank zero
-from starting the next request before peer CTAs have consumed the multicast
-response. Materialization therefore adds an empty mbarrier initialized with the
-physical cluster size. After a successful `clc_read`, every CTA arrives on rank
-zero's empty barrier through a remote view. Before the next request, only rank
-zero waits on its local empty barrier. The first wait uses the opposite phase
-and passes immediately; subsequent waits prevent response-buffer reuse until
-all cluster members have finished. The final failed cancellation skips the
-remote arrivals because no later request will reuse the buffer.
+from issuing a multicast request before peer CTAs have armed their completion
+mbarriers. Materialization therefore adds a ready mbarrier initialized with the
+physical cluster size. Before every request, each CTA executes
+`barrier_expect`, fences its shared state, and performs one task-local arrival
+on rank zero's ready mbarrier. Rank zero waits with the current carried phase
+before issuing the request. This rendezvous also proves every CTA consumed the
+previous response before its completion barrier is reused. The task-local
+arrival deliberately omits an additional implicit CTA-wide synchronization.
 
 **Require the phase to be a loop-carried variable, toggled before each advance.**
 Materialization adds an `i32`/`i1` phase iter_arg to the persistent `scf.while`,
@@ -415,14 +417,15 @@ requires drain-on-exit because the CLC claim is destructive.
   `third_party/nvidia/hopper/lib/Transforms/WarpSpecialization/WSAtomicBroadcast.cpp`.
   Wired into the NVIDIA Blackwell `make_ttgir` — split + hoist before WS,
   materialize after; the AutoWS broadcast runs inside WS.
-- **Restriction:** explicit `ctas_per_cga` clusters are supported, while
+- **Restriction:** explicit `ctas_per_cga` clusters are supported without
+  AutoWS. Clustered CLC AutoWS falls back to the unspecialized CLC path;
   Triton's distinct `num_ctas > 1` program-id model remains unsupported.
 - **Tests:** `python/test/unit/language/test_triton_clc.py` (frontend IR checks +
   non-WS Blackwell execution + materialized-TTGIR) and, in
   `test_tutorial09_warp_specialization.py`,
-  `test_tutorial09_matmul_tma_clc_persistent_while_loop_warp_specialize` (Blackwell
-  warp-specialized CLC GEMM: asserts `ttg.warp_specialize` + `ttng.clc_try_cancel`
-  and correctness).
+  `test_tutorial09_matmul_tma_clc_persistent_while_loop_warp_specialize`
+  (single-CTA Blackwell warp-specialized CLC GEMM) plus clustered non-AutoWS and
+  AutoWS-fallback correctness cases.
 
 ## Future work
 
