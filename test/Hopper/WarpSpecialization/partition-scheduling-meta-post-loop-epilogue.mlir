@@ -1,6 +1,6 @@
 // RUN: triton-opt %s --nvgpu-partition-scheduling-meta | FileCheck %s
 
-// Tests that post-loop tmem_load and arithmetic ops are scheduled to the
+// Tests that nested post-loop tmem_load and arithmetic ops are scheduled to the
 // default partition (not the epilogue), while only epilogue store ops go to
 // the epilogue partition. This prevents TMEM ops from landing in the epilogue,
 // which would force it to use 4 warps (TMEM lane coverage hardware constraint).
@@ -108,14 +108,14 @@ tt.func public @post_loop_tmem_load_not_in_epilogue(
     scf.yield %true, %store_tok, %mma_tok1, %scale : i1, !ttg.async.token, !ttg.async.token, tensor<128x128xf32, #blocked>
   } {tt.warp_specialize}
 
-  // Post-loop epilogue: tmem_load → truncf → TMA store
-  // The tmem_load should go to default partition (not epilogue)
-  // Only the TMA store should go to epilogue partition
-  %result, %result_tok = ttng.tmem_load %acc0_mem[%loop_out#1] : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #blocked>
-  %result_f16 = arith.truncf %result : tensor<128x128xf32, #blocked> to tensor<128x128xf16, #blocked>
-  %result_smem = ttg.local_alloc %result_f16 : (tensor<128x128xf16, #blocked>) -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
-  %store_tok = ttng.async_tma_copy_local_to_global %C_desc[%c0_i32, %c0_i32] %result_smem : !tt.tensordesc<128x128xf16, #shared>, !ttg.memdesc<128x128xf16, #shared, #smem, mutable> -> !ttg.async.token
-  ttng.async_tma_store_token_wait %store_tok : !ttg.async.token
+  // Post-loop epilogue nested in a result-less sibling region.
+  scf.if %true {
+    %result, %result_tok = ttng.tmem_load %acc0_mem[%loop_out#1] : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #blocked>
+    %result_f16 = arith.truncf %result : tensor<128x128xf32, #blocked> to tensor<128x128xf16, #blocked>
+    %result_smem = ttg.local_alloc %result_f16 : (tensor<128x128xf16, #blocked>) -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
+    %store_tok = ttng.async_tma_copy_local_to_global %C_desc[%c0_i32, %c0_i32] %result_smem : !tt.tensordesc<128x128xf16, #shared>, !ttg.memdesc<128x128xf16, #shared, #smem, mutable> -> !ttg.async.token
+    ttng.async_tma_store_token_wait %store_tok : !ttg.async.token
+  }
 
   tt.return
 }
