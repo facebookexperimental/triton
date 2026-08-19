@@ -1,5 +1,7 @@
 # TorchTLX
 
+[fbtriton](../README.md) &rsaquo; TorchTLX
+
 We introduce torchTLX to boost PT2 performance by pushing TLX primitives deeper into inductor template and fusion infra.
 
 This work runs in parallel with our ongoing Triton compiler investments. TorchTLX lets us rapidly validate hardware-specific optimizations and bring forward wins while feeding proven techniques back to the Triton compiler.
@@ -13,6 +15,15 @@ However, low-level hardware primitives such as tile shapes, warp spec roles and 
 Meanwhile, standalone TLX matmul kernels are matching or slightly exceeding cuBLAS. Unlike opaque cuBLAS kernels, a TLX kernel at parity opens the door to richer epilogue fusions.
 
 In summary, torchTLX integrates TLX as a low-level backend for Inductor, introducing significant changes to template selection, fusion logic and kernel codegen.
+
+## Knob
+
+`TORCHINDUCTOR_TLX_MODE` (unset by default)
+- unset / any other value - TLX not considered (standard inductor behavior; the config value is `None`)
+- allow - TLX added to candidates, competes via autotuning
+- force - TLX templates enabled + forced epilogue fusion
+
+Only `allow` and `force` engage TLX; every other value (including an unset env var or a legacy `default`) maps to `None`, leaving TLX off. TLX is additionally a no-op unless the active Triton is the fbtriton fork.
 
 ## TorchTLX Templates
 
@@ -123,11 +134,15 @@ First, it streamlines access to state-of-the-art hardware intrinsics. Given that
 
 Second, it scales better than manual agentic kernel authoring. There is growing interest across the industry in agentic kernel authoring at scale. We believe making the PT2 stack natively aware of hardware architecture features might be a more scalable path. Once the plumbing is in place, every new kernel and fusion pattern benefits automatically.
 
-## Knob
+## Source and tests
 
-`TORCHINDUCTOR_TLX_MODE` (unset by default)
-- unset / any other value - TLX not considered (standard inductor behavior; the config value is `None`)
-- allow - TLX added to candidates, competes via autotuning
-- force - TLX templates enabled + forced epilogue fusion
+Templates, heuristics and codegen live in
+[`third_party/tlx/language/tlx/inductor/`](../third_party/tlx/language/tlx/inductor/).
 
-Only `allow` and `force` engage TLX; every other value (including an unset env var or a legacy `default`) maps to `None`, leaving TLX off. TLX is additionally a no-op unless the active Triton is the fbtriton fork.
+```bash
+pytest python/test/unit/language/test_torchtlx_templates.py
+pytest python/test/unit/language/test_torchtlx_fusions.py
+```
+
+In an fbtriton git checkout, [`scripts/run_torchtlx_tests.sh`](../scripts/run_torchtlx_tests.sh)
+runs both. CI coverage is described in [CI](ci.md).

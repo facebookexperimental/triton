@@ -206,7 +206,7 @@ qk = tlx.async_dot(q, k)
 
 ## Deep-dive docs
 
-- API reference: `third_party/tlx/README.md`
+- API reference: `docs/tlx.md`
 - Barriers: `third_party/tlx/doc/tlx_barriers.md`
 - Placeholder layouts: `third_party/tlx/doc/PlaceholderLayouts.md`
 - Storage alias design: `third_party/tlx/doc/storage_alias_spec_design.md`
