@@ -369,6 +369,44 @@ def test_nvidia_tool_error_lists_all_candidates(fresh_knobs, tmp_path, monkeypat
     assert "boom" in broken_reason
 
 
+def test_nvidia_tool_env_hook(fresh_knobs, tmp_path, monkeypatch):
+    # A tool that dies unless a specific variable is scrubbed from its
+    # environment -- the shape of an inherited LD_PRELOAD that only resolves
+    # inside the host interpreter.
+    poison = "TRITON_TEST_POISONED_ENV"
+    tool = _fake_tool(
+        tmp_path / "ptxas", 'import os\n'
+        f'if os.environ.get("{poison}"):\n'
+        '    sys.stderr.write("undefined symbol: unw_backtrace\\n"); sys.exit(127)\n'
+        'print("Cuda compilation tools, release 12.8, V12.8.93")')
+    monkeypatch.setenv(poison, "1")
+
+    # Drive both directions explicitly rather than relying on the ambient value:
+    # `fresh_knobs` deliberately does not reset `nvidia`, and a packager may have
+    # installed a hook at import (fbcode's `set_configs()` does). `scope()`
+    # snapshots `nvidia.__dict__` and restores it on exit, so whatever was
+    # installed survives this test.
+    with fresh_knobs.nvidia.scope():
+        # No hook: the environment is inherited as-is, so the tool dies.
+        fresh_knobs.nvidia.tool_env = None
+        assert fresh_knobs.nvidia.get_tool_env() is None
+        triton.knobs.NvidiaTool.probe.cache_clear()
+        tool_obj, reason = triton.knobs.NvidiaTool.probe(str(tool))
+        assert tool_obj is None
+        assert "unw_backtrace" in reason
+
+        # With a hook that scrubs the marker, the same tool resolves.
+        fresh_knobs.nvidia.tool_env = lambda: {k: v for k, v in os.environ.items() if k != poison}
+        triton.knobs.NvidiaTool.probe.cache_clear()
+        tool_obj, reason = triton.knobs.NvidiaTool.probe(str(tool))
+        assert reason is None
+        assert tool_obj.version == "12.8"
+
+    # `probe` is lru_cached per path and the cache is process-wide; don't leave
+    # entries behind that were resolved under this test's hook.
+    triton.knobs.NvidiaTool.probe.cache_clear()
+
+
 def test_opt_bool(fresh_knobs_including_libraries, monkeypatch):
     fresh_knobs = fresh_knobs_including_libraries
     assert fresh_knobs.amd.use_block_pingpong is None

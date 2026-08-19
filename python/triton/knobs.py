@@ -209,7 +209,7 @@ class NvidiaTool:
         executed is indistinguishable from a missing one otherwise.
         """
         try:
-            result = subprocess.check_output([path, "--version"], stderr=subprocess.STDOUT)
+            result = subprocess.check_output([path, "--version"], stderr=subprocess.STDOUT, env=nvidia.get_tool_env())
         except OSError as e:
             if e.errno in (errno.ENOENT, errno.ENOTDIR):
                 return None, "no such file"
@@ -598,6 +598,17 @@ class nvidia_knobs(base_knobs):
     libdevice_path: env_opt_str = env_opt_str("TRITON_LIBDEVICE_PATH")
     libcuda_path: env_opt_str = env_opt_str("TRITON_LIBCUDA_PATH")
     use_meta_ws: env_bool = env_bool("TRITON_USE_META_WS")
+
+    # Environment used to spawn the NVIDIA tools above. `None` inherits the
+    # current environment. Packagers whose interpreter runs with an environment
+    # that is hostile to standalone binaries -- e.g. an LD_PRELOAD'd allocator
+    # that only resolves its own symbols inside the host interpreter -- can
+    # install a callable here to sanitize it. Set it before the first tool
+    # lookup: `NvidiaTool.probe` caches per path.
+    tool_env: Union[Callable[[], Optional[dict[str, str]]], None] = None
+
+    def get_tool_env(self) -> Optional[dict[str, str]]:
+        return self.tool_env() if self.tool_env is not None else None
     # Number of buffers for the dynamic-persistent tile-id broadcast channel
     # (cross-partition run-once atomic support). 1 = single-stage.
     ws_tile_prefetch_depth: env_int = env_int("TRITON_WS_TILE_PREFETCH_DEPTH", 1)
