@@ -245,22 +245,6 @@ void AutomaticWarpSpecialization::runOnOperation() {
   if (failed(runPipeline(pm, getOperation())))
     return signalPassFailure();
 
-  // META_WS_CHANGE: Preserve Meta's post-WS cleanup and partition-warp
-  // optimization pipeline.
-  runDeadIterArgElimination(getOperation());
-  RewritePatternSet patterns(&getContext());
-  scf::ForOp::getCanonicalizationPatterns(patterns, &getContext());
-  scf::IfOp::getCanonicalizationPatterns(patterns, &getContext());
-  WarpSpecializeOp::getCanonicalizationPatterns(patterns, &getContext());
-  if (failed(applyPatternsGreedily(getOperation(), std::move(patterns))))
-    return signalPassFailure();
-
-  pm.clear();
-  pm.addPass(createTritonGPUOptimizePartitionWarps());
-  pm.addPass(createTritonGPUScheduleLoops(scheduleLoopsOptions));
-  if (failed(runPipeline(pm, getOperation())))
-    return signalPassFailure();
-
   // Multi-buffer TMA descriptors. We cannot rely on SWP to do it, to support
   // desc updates in nested loops.
   multiBufferTMADescriptors(getOperation(), numStages);
