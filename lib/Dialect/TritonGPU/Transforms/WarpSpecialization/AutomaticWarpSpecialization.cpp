@@ -19,8 +19,8 @@ using namespace triton::gpu;
 namespace tlx = mlir::triton::tlx;
 
 namespace mlir {
-void removeRedundantTmemZeroStores(triton::FuncOp &funcOp);
-void doValidateTMAStoreAnnotations(triton::FuncOp &funcOp);
+void removeRedundantTmemZeroStores(triton::FuncOp funcOp);
+void doValidateTMAStoreAnnotations(triton::FuncOp funcOp);
 } // namespace mlir
 
 //===----------------------------------------------------------------------===//

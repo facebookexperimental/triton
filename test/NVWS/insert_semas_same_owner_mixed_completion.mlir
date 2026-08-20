@@ -17,7 +17,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
   // LOWER: ttng.barrier_expect %{{.*}}, 16384
   // LOWER: ttng.async_tma_copy_global_to_local
   // LOWER: ttng.arrive_barrier %{{.*}}, 1
-  tt.func @same_owner_mixed_completion(%desc: !tt.tensordesc<tensor<128x64xf16, #shared>>, %i: i32, %lb: i32, %ub: i32, %step: i32) {
+  tt.func @same_owner_mixed_completion(%desc: !tt.tensordesc<128x64xf16, #shared>, %i: i32, %lb: i32, %ub: i32, %step: i32) {
     %tma = ttg.local_alloc {buffer.id = 610 : i32, buffer.offset = 0 : i32} : () -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
     %sync = ttg.local_alloc {buffer.id = 610 : i32, buffer.offset = 0 : i32} : () -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
     %value = arith.constant dense<0.000000e+00> : tensor<128x64xf16, #blocked>
@@ -31,7 +31,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
       // CHECK: [[PRODUCER_TOKEN:%.*]] = nvws.semaphore.acquire [[EMPTY]] {ttg.partition = array<i32: 0>}
       // CHECK: [[PRODUCER_BUFFERS:%.*]]:2 = nvws.semaphore.buffer [[EMPTY]], [[PRODUCER_TOKEN]] {ttg.partition = array<i32: 0>}
       // CHECK: nvws.descriptor_load %{{.*}}[%{{.*}}, %{{.*}}] 16384 [[PRODUCER_BUFFERS]]#0 {ttg.partition = array<i32: 0>}
-      nvws.descriptor_load %desc[%i, %i] 16384 %tma {ttg.partition = array<i32: 0>} : !tt.tensordesc<tensor<128x64xf16, #shared>>, i32, i32, !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+      nvws.descriptor_load %desc[%i, %i] 16384 %tma {ttg.partition = array<i32: 0>} : !tt.tensordesc<128x64xf16, #shared>, i32, i32, !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
       // CHECK: ttg.local_store %{{.*}}, [[PRODUCER_BUFFERS]]#1 {ttg.partition = array<i32: 0>}
       ttg.local_store %value, %sync {ttg.partition = array<i32: 0>} : tensor<128x64xf16, #blocked> -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
       // CHECK: nvws.semaphore.release [[FULL]], [[PRODUCER_TOKEN]] [#nvws.async_op<none>, #nvws.async_op<tma_load>] {arrive_count = 1 : i32, ttg.partition = array<i32: 0>}
@@ -57,7 +57,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
   // LOWER: ttng.barrier_expect %{{.*}}, 16384
   // LOWER: ttng.async_tma_copy_global_to_local
   // LOWER: ttng.arrive_barrier %{{.*}}, 1
-  tt.func @same_owner_partial_overlap_mixed_completion(%desc: !tt.tensordesc<tensor<128x64xf16, #shared>>, %i: i32, %lb: i32, %ub: i32, %step: i32) {
+  tt.func @same_owner_partial_overlap_mixed_completion(%desc: !tt.tensordesc<128x64xf16, #shared>, %i: i32, %lb: i32, %ub: i32, %step: i32) {
     %tma = ttg.local_alloc {buffer.id = 611 : i32, buffer.offset = 0 : i32} : () -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
     %sync = ttg.local_alloc {buffer.id = 611 : i32, buffer.offset = 0 : i32} : () -> !ttg.memdesc<256x64xf16, #shared, #smem, mutable>
     %value = arith.constant dense<0.000000e+00> : tensor<256x64xf16, #blocked>
@@ -71,7 +71,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
       // CHECK: [[PARTIAL_PRODUCER_TOKEN:%.*]] = nvws.semaphore.acquire [[PARTIAL_EMPTY]] {ttg.partition = array<i32: 0>}
       // CHECK: [[PARTIAL_PRODUCER_BUFFERS:%.*]]:2 = nvws.semaphore.buffer [[PARTIAL_EMPTY]], [[PARTIAL_PRODUCER_TOKEN]] {ttg.partition = array<i32: 0>}
       // CHECK: nvws.descriptor_load %{{.*}}[%{{.*}}, %{{.*}}] 16384 [[PARTIAL_PRODUCER_BUFFERS]]#0 {ttg.partition = array<i32: 0>}
-      nvws.descriptor_load %desc[%i, %i] 16384 %tma {ttg.partition = array<i32: 0>} : !tt.tensordesc<tensor<128x64xf16, #shared>>, i32, i32, !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+      nvws.descriptor_load %desc[%i, %i] 16384 %tma {ttg.partition = array<i32: 0>} : !tt.tensordesc<128x64xf16, #shared>, i32, i32, !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
       // CHECK: ttg.local_store %{{.*}}, [[PARTIAL_PRODUCER_BUFFERS]]#1 {ttg.partition = array<i32: 0>}
       ttg.local_store %value, %sync {ttg.partition = array<i32: 0>} : tensor<256x64xf16, #blocked> -> !ttg.memdesc<256x64xf16, #shared, #smem, mutable>
       // CHECK: nvws.semaphore.release [[PARTIAL_FULL]], [[PARTIAL_PRODUCER_TOKEN]] [#nvws.async_op<none>, #nvws.async_op<tma_load>] {arrive_count = 1 : i32, ttg.partition = array<i32: 0>}

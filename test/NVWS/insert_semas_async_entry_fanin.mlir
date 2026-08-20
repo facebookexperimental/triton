@@ -10,7 +10,7 @@
 module attributes {"ttg.num-warps" = 4 : i32} {
   // CHECK-LABEL: @async_entry_fanin
   tt.func @async_entry_fanin(
-      %desc: !tt.tensordesc<tensor<128x128xf16, #shared>>,
+      %desc: !tt.tensordesc<128x128xf16, #shared>,
       %lb: i32, %ub: i32, %step: i32) {
     // CHECK: [[ALLOC:%.*]] = ttg.local_alloc {buffer.id = 1701 : i32}
     // CHECK: [[OUTER_EMPTY:%.*]] = nvws.semaphore.create [[ALLOC]] released = 1 {pending_count = 1 : i32}
@@ -23,7 +23,7 @@ module attributes {"ttg.num-warps" = 4 : i32} {
       // CHECK-NEXT: nvws.descriptor_load %{{.*}}[%{{.*}}, %{{.*}}] 32768 [[OUTER_BUFFER]] {ttg.partition = array<i32: 3>}
       // CHECK-NEXT: nvws.semaphore.release [[INNER_READY]], [[OUTER_TOKEN]] [#nvws.async_op<tma_load>] {arrive_count = 1 : i32, ttg.partition = array<i32: 3>}
       // CHECK-NEXT: nvws.semaphore.release [[INNER_READY]], [[OUTER_TOKEN]] [#nvws.async_op<none>] {arrive_count = 1 : i32, ttg.partition = array<i32: 3>}
-      nvws.descriptor_load %desc[%i, %i] 32768 %alloc {ttg.partition = array<i32: 3>} : !tt.tensordesc<tensor<128x128xf16, #shared>>, i32, i32, !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
+      nvws.descriptor_load %desc[%i, %i] 32768 %alloc {ttg.partition = array<i32: 3>} : !tt.tensordesc<128x128xf16, #shared>, i32, i32, !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
       // CHECK-NEXT: scf.for %{{[-A-Za-z0-9_.$#]+}} = %{{[-A-Za-z0-9_.$#]+}} to %{{[-A-Za-z0-9_.$#]+}} step %{{[-A-Za-z0-9_.$#]+}} : i32 {
       scf.for %j = %lb to %ub step %step : i32 {
         // CHECK-NEXT: [[INNER_TOKEN:%.*]] = nvws.semaphore.acquire [[INNER_READY]] {ttg.partition = array<i32: 2>}

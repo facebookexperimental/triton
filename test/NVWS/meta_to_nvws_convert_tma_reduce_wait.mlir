@@ -6,7 +6,7 @@
 module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
   // CHECK-LABEL: @direct_tma_reduce_wait
   tt.func @direct_tma_reduce_wait(
-      %desc: !tt.tensordesc<tensor<128x128xf32, #shared>>,
+      %desc: !tt.tensordesc<128x128xf32, #shared>,
       %lb: i32, %ub: i32, %step: i32) {
     %c0 = arith.constant 0 : i32
     scf.for %i = %lb to %ub step %step : i32 {
@@ -17,7 +17,7 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
       // CHECK-SAME: {ttg.partition = array<i32: 0>}
       %token = ttng.async_tma_reduce add, %desc[%c0, %c0] %staging
           {async_task_id = array<i32: 0>} :
-          !tt.tensordesc<tensor<128x128xf32, #shared>>,
+          !tt.tensordesc<128x128xf32, #shared>,
           !ttg.memdesc<128x128xf32, #shared, #smem, mutable>
           -> !ttg.async.token
 

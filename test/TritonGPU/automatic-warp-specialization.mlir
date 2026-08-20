@@ -1,8 +1,6 @@
 // RUN: triton-opt %s -split-input-file -allow-unregistered-dialect -tritongpu-hoist-tmem-alloc -tritongpu-assign-latencies -tritongpu-schedule-loops -tritongpu-automatic-warp-specialization=num-stages=2 | FileCheck %s --check-prefix=CHECK --check-prefix=BASE --check-prefix=CLEAN
 // RUN: triton-opt %s -split-input-file -allow-unregistered-dialect -tritongpu-hoist-tmem-alloc -tritongpu-assign-latencies -tritongpu-schedule-loops -tritongpu-automatic-warp-specialization=num-stages=2 -tritongpu-pipeline | FileCheck %s --check-prefix=CHECK --check-prefix=PIPELINE --check-prefix=CLEAN
 // RUN: triton-opt %s -split-input-file -allow-unregistered-dialect -tritongpu-hoist-tmem-alloc -tritongpu-assign-latencies -tritongpu-schedule-loops -tritongpu-automatic-warp-specialization=num-stages=2 -tritongpu-pipeline -tritongpu-optimize-partition-warps | FileCheck %s --check-prefix=OPT --check-prefix=CLEAN
-// XFAIL: *
-
 // CLEAN: module
 // CLEAN-NOT: ttg.partition
 // CLEAN-NOT: ttg.warp_specialize.tag

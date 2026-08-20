@@ -10,7 +10,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32,
                    ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
   // CHECK-LABEL: tt.func @pack_two_slices
   tt.func @pack_two_slices(
-      %desc: !tt.tensordesc<tensor<64x64xf32, #shared>>,
+      %desc: !tt.tensordesc<64x64xf32, #shared>,
       %lb: i32, %ub: i32, %step: i32,
       %x0: tensor<64x64xf32, #blocked>,
       %x1: tensor<64x64xf32, #blocked>,
@@ -39,8 +39,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32,
       // CHECK-NEXT:   ttg.local_store %[[B1]], %[[BUF1:.*]]
       ttg.local_store %b0, %buf0 : tensor<64x64xf32, #blocked> -> !ttg.memdesc<64x64xf32, #shared, #smem, mutable>
       ttg.local_store %b1, %buf1 : tensor<64x64xf32, #blocked> -> !ttg.memdesc<64x64xf32, #shared, #smem, mutable>
-      %tok0 = ttng.async_tma_copy_local_to_global %desc[%i, %i] %buf0 : !tt.tensordesc<tensor<64x64xf32, #shared>>, !ttg.memdesc<64x64xf32, #shared, #smem, mutable> -> !ttg.async.token
-      %tok1 = ttng.async_tma_copy_local_to_global %desc[%i, %i] %buf1 : !tt.tensordesc<tensor<64x64xf32, #shared>>, !ttg.memdesc<64x64xf32, #shared, #smem, mutable> -> !ttg.async.token
+      %tok0 = ttng.async_tma_copy_local_to_global %desc[%i, %i] %buf0 : !tt.tensordesc<64x64xf32, #shared>, !ttg.memdesc<64x64xf32, #shared, #smem, mutable> -> !ttg.async.token
+      %tok1 = ttng.async_tma_copy_local_to_global %desc[%i, %i] %buf1 : !tt.tensordesc<64x64xf32, #shared>, !ttg.memdesc<64x64xf32, #shared, #smem, mutable> -> !ttg.async.token
       ttng.async_tma_store_token_wait %tok0 : !ttg.async.token
       ttng.async_tma_store_token_wait %tok1 : !ttg.async.token
       scf.yield
