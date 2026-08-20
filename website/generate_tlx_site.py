@@ -336,12 +336,8 @@ def render_page(page: Page, source: str) -> str:
 
 def main() -> None:
     chunks = split_readme(read_readme())
-    content_dir = SITE_ROOT / "content"
-    content_dir.mkdir(exist_ok=True)
 
     for page, source in chunks:
-        markdown = source.rstrip() + "\n"
-        (content_dir / f"{page.slug}.md").write_text(markdown, encoding="utf-8")
         output = (
             REPOSITORY_ROOT / "index.html"
             if page.slug == "overview"
