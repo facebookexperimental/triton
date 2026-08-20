@@ -21,6 +21,11 @@ SPLIT_K that partitions the K reduction across more workgroups. Partials land in
 an fp32 workspace and a separate fp32 reduce kernel sums them into C -- keeping
 the result numerically identical to the non-split-K path. `choose_split_k`
 returns 1 for shapes that already fill the machine, making split-K a no-op there.
+
+The additive FP16/BF16 `streamk_matmul` schedule shares the extracted
+`matmul_tile` load/LDS/MFMA pipeline with the original data-centric kernel. It
+uses persistent full tiles plus a TritonBLAS-style variable-work Stream-K tail,
+with an even-work fast path for the two performance-critical production shapes.
 """
 
 import torch
@@ -37,6 +42,8 @@ NUM_XCDS = 8
 
 MIN_K = 2 * BLOCK_K  # pipeline prefetches 2 whole K-tiles; the rest goes to the masked tail
 KERNEL_NAME = "a16w16_8wave"
+_LLVM_ATTRS = (("amdgpu-agpr-alloc", "0,0"),)
+_READY_VALUE = 3
 
 
 def _prune_register_configs(configs, named_args, **_):
@@ -352,6 +359,191 @@ def _launch_register(a, b, bias=None):
 
 
 @triton.jit
+def matmul_tile(a_ptr, b_ptr, smem_a_top, smem_a_bot, smem_b_left, smem_b_right,
+                a_top_off, a_bot_off, b_left_off, b_right_off, ka, kb, n_steps,
+                stride_ak, stride_bk, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+                BLOCK_K: tl.constexpr):
+    """Compute one output tile over an even contiguous range of K64 steps.
+
+    ``ka`` and ``kb`` are the initial element offsets along K. ``n_steps`` must
+    be even and at least two. Both the original data-centric kernel and the new
+    Stream-K kernel use this same LDS/MFMA pipeline.
+    """
+    HALF_M: tl.constexpr = BLOCK_M // 2
+    HALF_N: tl.constexpr = BLOCK_N // 2
+
+    k_step_a = BLOCK_K * stride_ak
+    k_step_b = BLOCK_K * stride_bk
+    a_top_off_n = a_top_off + k_step_a
+    a_bot_off_n = a_bot_off + k_step_a
+    b_left_off_n = b_left_off + k_step_b
+    b_right_off_n = b_right_off + k_step_b
+    acc_tl = tl.zeros((HALF_M, HALF_N), dtype=tl.float32)
+    acc_bl = tl.zeros((HALF_M, HALF_N), dtype=tl.float32)
+    acc_tr = tl.zeros((HALF_M, HALF_N), dtype=tl.float32)
+    acc_br = tl.zeros((HALF_M, HALF_N), dtype=tl.float32)
+
+    # ── Prologue: prefetch K-steps 0,1 into buffers 0,1 (8 commits) ──
+    tlx.buffer_load_to_local(smem_b_left[0], b_ptr, b_left_off + kb)
+    tlx.async_load_commit_group()
+    tlx.buffer_load_to_local(smem_a_top[0], a_ptr, a_top_off + ka)
+    tlx.async_load_commit_group()
+    tlx.buffer_load_to_local(smem_a_bot[0], a_ptr, a_bot_off + ka)
+    tlx.async_load_commit_group()
+    tlx.buffer_load_to_local(smem_b_right[0], b_ptr, b_right_off + kb)
+    tlx.async_load_commit_group()
+
+    tlx.buffer_load_to_local(smem_b_left[1], b_ptr, b_left_off_n + kb)
+    tlx.async_load_commit_group()
+    tlx.buffer_load_to_local(smem_a_top[1], a_ptr, a_top_off_n + ka)
+    tlx.async_load_commit_group()
+    tlx.buffer_load_to_local(smem_a_bot[1], a_ptr, a_bot_off_n + ka)
+    tlx.async_load_commit_group()
+    tlx.buffer_load_to_local(smem_b_right[1], b_ptr, b_right_off_n + kb)
+    tlx.async_load_commit_group()
+
+    ka += BLOCK_K * stride_ak * 2
+    kb += BLOCK_K * stride_bk * 2
+
+    tlx.async_load_wait_group(6)
+    b_left = tlx.local_load(smem_b_left[0], relaxed=True)
+    a_top = tlx.local_load(smem_a_top[0], relaxed=True)
+
+    # ── Main loop (2x unrolled): 8 (mfma + local_load + async refill) regions ──
+    for k in tl.range(0, n_steps - 2, 2, num_stages=1):
+        # --- sub-iter 0 (buffer 0) ---
+        tlx.async_load_wait_group(5)
+        with tlx.warp_pipeline_stage("mfma", priority=0):
+            acc_tl = tl.dot(a_top, b_left, acc_tl)
+        with tlx.warp_pipeline_stage("mem", priority=1):
+            a_bot = tlx.local_load(smem_a_bot[0], relaxed=True)
+            tlx.buffer_load_to_local(smem_b_left[0], b_ptr, b_left_off + kb)
+            tlx.async_load_commit_group()
+
+        tlx.async_load_wait_group(5)
+        with tlx.warp_pipeline_stage("mfma", priority=0):
+            acc_bl = tl.dot(a_bot, b_left, acc_bl)
+        with tlx.warp_pipeline_stage("mem", priority=1):
+            b_right = tlx.local_load(smem_b_right[0], relaxed=True)
+            tlx.buffer_load_to_local(smem_a_top[0], a_ptr, a_top_off + ka)
+            tlx.async_load_commit_group()
+
+        tlx.async_load_wait_group(5)
+        with tlx.warp_pipeline_stage("mfma", priority=0):
+            acc_tr = tl.dot(a_top, b_right, acc_tr)
+        with tlx.warp_pipeline_stage("mem", priority=1):
+            b_left = tlx.local_load(smem_b_left[1], relaxed=True)
+            tlx.buffer_load_to_local(smem_a_bot[0], a_ptr, a_bot_off + ka)
+            tlx.async_load_commit_group()
+
+        tlx.async_load_wait_group(5)
+        with tlx.warp_pipeline_stage("mfma", priority=0):
+            acc_br = tl.dot(a_bot, b_right, acc_br)
+        with tlx.warp_pipeline_stage("mem", priority=1):
+            a_top = tlx.local_load(smem_a_top[1], relaxed=True)
+            tlx.buffer_load_to_local(smem_b_right[0], b_ptr, b_right_off + kb)
+            tlx.async_load_commit_group()
+
+        # --- sub-iter 1 (buffer 1, _next offsets) ---
+        tlx.async_load_wait_group(5)
+        with tlx.warp_pipeline_stage("mfma", priority=0):
+            acc_tl = tl.dot(a_top, b_left, acc_tl)
+        with tlx.warp_pipeline_stage("mem", priority=1):
+            a_bot = tlx.local_load(smem_a_bot[1], relaxed=True)
+            tlx.buffer_load_to_local(smem_b_left[1], b_ptr, b_left_off_n + kb)
+            tlx.async_load_commit_group()
+
+        tlx.async_load_wait_group(5)
+        with tlx.warp_pipeline_stage("mfma", priority=0):
+            acc_bl = tl.dot(a_bot, b_left, acc_bl)
+        with tlx.warp_pipeline_stage("mem", priority=1):
+            b_right = tlx.local_load(smem_b_right[1], relaxed=True)
+            tlx.buffer_load_to_local(smem_a_top[1], a_ptr, a_top_off_n + ka)
+            tlx.async_load_commit_group()
+
+        tlx.async_load_wait_group(5)
+        with tlx.warp_pipeline_stage("mfma", priority=0):
+            acc_tr = tl.dot(a_top, b_right, acc_tr)
+        with tlx.warp_pipeline_stage("mem", priority=1):
+            b_left = tlx.local_load(smem_b_left[0], relaxed=True)
+            tlx.buffer_load_to_local(smem_a_bot[1], a_ptr, a_bot_off_n + ka)
+            tlx.async_load_commit_group()
+
+        tlx.async_load_wait_group(5)
+        with tlx.warp_pipeline_stage("mfma", priority=0):
+            acc_br = tl.dot(a_bot, b_right, acc_br)
+        with tlx.warp_pipeline_stage("mem", priority=1):
+            a_top = tlx.local_load(smem_a_top[0], relaxed=True)
+            tlx.buffer_load_to_local(smem_b_right[1], b_ptr, b_right_off_n + kb)
+            tlx.async_load_commit_group()
+            ka += BLOCK_K * stride_ak * 2
+            kb += BLOCK_K * stride_bk * 2
+
+    # ── Epilogue: last 2 pipelined K-steps, drain LDS loads ──
+    # iter n_steps-2
+    acc_tl = tl.dot(a_top, b_left, acc_tl)
+    tlx.async_load_wait_group(5)
+    l_idx: tl.constexpr = 0  # (n_steps - 2) % 2, always 0 since n_steps is even
+    a_bot = tlx.local_load(tlx.local_view(smem_a_bot, l_idx), relaxed=True)
+
+    acc_bl = tl.dot(a_bot, b_left, acc_bl)
+    tlx.async_load_wait_group(4)
+    b_right = tlx.local_load(tlx.local_view(smem_b_right, l_idx), relaxed=True)
+
+    acc_tr = tl.dot(a_top, b_right, acc_tr)
+    tlx.async_load_wait_group(3)
+    g_idx: tl.constexpr = 1  # 1 - l_idx
+    b_left = tlx.local_load(tlx.local_view(smem_b_left, g_idx), relaxed=True)
+
+    acc_br = tl.dot(a_bot, b_right, acc_br)
+    tlx.async_load_wait_group(2)
+    a_top = tlx.local_load(tlx.local_view(smem_a_top, g_idx), relaxed=True)
+
+    # iter n_steps-1: finish ALL four mfmas before returning so the dot operands
+    # die and the caller holds only the four f32 accumulators.
+    acc_tl = tl.dot(a_top, b_left, acc_tl)
+    tlx.async_load_wait_group(1)
+    a_bot = tlx.local_load(tlx.local_view(smem_a_bot, g_idx), relaxed=True)
+
+    acc_bl = tl.dot(a_bot, b_left, acc_bl)
+    tlx.async_load_wait_group(0)
+    b_right = tlx.local_load(tlx.local_view(smem_b_right, g_idx), relaxed=True)
+
+    acc_tr = tl.dot(a_top, b_right, acc_tr)
+    acc_br = tl.dot(a_bot, b_right, acc_br)
+    return acc_tl, acc_bl, acc_tr, acc_br
+
+def _streamk_schedule(M, N, K, block_m=BLOCK_M, block_n=BLOCK_N):
+    """Build a persistent or variable-work Stream-K schedule."""
+    num_pid_m = M // block_m
+    num_pid_n = N // block_n
+    total_tiles = num_pid_m * num_pid_n
+    n_full = K // BLOCK_K
+    k_pipe_steps = (n_full // 2) * 2
+    k_pipe_pairs = k_pipe_steps // 2
+    streamk_tiles = total_tiles % NUM_CU
+    total_streamk_units = streamk_tiles * k_pipe_pairs
+    use_streamk = (K == k_pipe_steps * BLOCK_K and total_tiles > NUM_CU and
+                   streamk_tiles > 0 and
+                   total_streamk_units >= NUM_CU)
+    units_per_program = total_streamk_units // NUM_CU if use_streamk else 0
+    remainder_units = total_streamk_units % NUM_CU if use_streamk else 0
+
+    return {
+        "HAS_STREAMK": use_streamk,
+        "HAS_K_TAIL": K != k_pipe_steps * BLOCK_K,
+        "NUM_PROGRAMS": NUM_CU if use_streamk else min(NUM_CU, total_tiles),
+        "NUM_FULL_TILES": total_tiles - streamk_tiles if use_streamk else total_tiles,
+        "NUM_PID_M": num_pid_m,
+        "NUM_PID_N": num_pid_n,
+        "K_PIPE_STEPS": k_pipe_steps,
+        "K_PIPE_PAIRS": k_pipe_pairs,
+        "UNITS_PER_PROGRAM": units_per_program,
+        "REMAINDER_UNITS": remainder_units,
+    }
+
+
+@triton.jit
 def a16w16_8wave(
     a_ptr,
     b_ptr,
@@ -484,159 +676,21 @@ def a16w16_8wave(
         b_left_off = tlx.require_layout(b_left_off, _B_OFFSET_LAYOUT_256)
         b_right_off = tlx.require_layout(b_right_off, _B_OFFSET_LAYOUT_256)
 
-    # _next = the K+1 buffer (offset one BLOCK_K along K).
-    a_top_off_n = a_top_off + BLOCK_K * stride_ak
-    a_bot_off_n = a_bot_off + BLOCK_K * stride_ak
-    b_left_off_n = b_left_off + BLOCK_K * stride_bk
-    b_right_off_n = b_right_off + BLOCK_K * stride_bk
-
-    # Start the running K-offset at this split's slice (0 when SPLIT_K==1).
-    ka = ak_split
-    kb = bk_split
-
-    acc_tl = tl.zeros((HALF_M, HALF_N), dtype=tl.float32)
-    acc_bl = tl.zeros((HALF_M, HALF_N), dtype=tl.float32)
-    acc_tr = tl.zeros((HALF_M, HALF_N), dtype=tl.float32)
-    acc_br = tl.zeros((HALF_M, HALF_N), dtype=tl.float32)
-
     # The pipeline consumes K in pairs of BLOCK_K tiles (prologue prefetches 2,
     # the loop 2/iter, the epilogue drains 2), so it covers only an EVEN number of
     # whole K-tiles: n_pipe. Any leftover -- an odd whole tile and/or a partial
     # final tile (K not a multiple of BLOCK_K) -- is handled by the masked scalar
     # tail after the epilogue. K is a runtime arg (not constexpr) so distinct K
-    # values reuse one compile; n_pipe even keeps the epilogue's buffer parity
-    # fixed (reads buffer 0 first (l_idx) then buffer 1 (g_idx), constexpr below).
+    # values reuse one compile; n_pipe even keeps matmul_tile's epilogue buffer
+    # parity fixed (reads buffer 0 first, then buffer 1).
     n_full = KS // BLOCK_K
     n_pipe = (n_full // 2) * 2
 
-    # ── Prologue: prefetch K-steps 0,1 into buffers 0,1 (8 commits) ──
-    tlx.buffer_load_to_local(smem_b_left[0], b_ptr, b_left_off + kb)
-    tlx.async_load_commit_group()
-    tlx.buffer_load_to_local(smem_a_top[0], a_ptr, a_top_off + ka)
-    tlx.async_load_commit_group()
-    tlx.buffer_load_to_local(smem_a_bot[0], a_ptr, a_bot_off + ka)
-    tlx.async_load_commit_group()
-    tlx.buffer_load_to_local(smem_b_right[0], b_ptr, b_right_off + kb)
-    tlx.async_load_commit_group()
-
-    tlx.buffer_load_to_local(smem_b_left[1], b_ptr, b_left_off_n + kb)
-    tlx.async_load_commit_group()
-    tlx.buffer_load_to_local(smem_a_top[1], a_ptr, a_top_off_n + ka)
-    tlx.async_load_commit_group()
-    tlx.buffer_load_to_local(smem_a_bot[1], a_ptr, a_bot_off_n + ka)
-    tlx.async_load_commit_group()
-    tlx.buffer_load_to_local(smem_b_right[1], b_ptr, b_right_off_n + kb)
-    tlx.async_load_commit_group()
-
-    ka += BLOCK_K * stride_ak * 2
-    kb += BLOCK_K * stride_bk * 2
-
-    tlx.async_load_wait_group(6)
-    b_left = tlx.local_load(smem_b_left[0], relaxed=True)
-    a_top = tlx.local_load(smem_a_top[0], relaxed=True)
-
-    # ── Main loop (2x unrolled): 8 (mfma + local_load + async refill) regions ──
-    for k in tl.range(0, n_pipe - 2, 2, num_stages=1):
-        # --- sub-iter 0 (buffer 0) ---
-        tlx.async_load_wait_group(5)
-        with tlx.warp_pipeline_stage("mfma", priority=0):
-            acc_tl = tl.dot(a_top, b_left, acc_tl)
-        with tlx.warp_pipeline_stage("mem", priority=1):
-            a_bot = tlx.local_load(smem_a_bot[0], relaxed=True)
-            tlx.buffer_load_to_local(smem_b_left[0], b_ptr, b_left_off + kb)
-            tlx.async_load_commit_group()
-
-        tlx.async_load_wait_group(5)
-        with tlx.warp_pipeline_stage("mfma", priority=0):
-            acc_bl = tl.dot(a_bot, b_left, acc_bl)
-        with tlx.warp_pipeline_stage("mem", priority=1):
-            b_right = tlx.local_load(smem_b_right[0], relaxed=True)
-            tlx.buffer_load_to_local(smem_a_top[0], a_ptr, a_top_off + ka)
-            tlx.async_load_commit_group()
-
-        tlx.async_load_wait_group(5)
-        with tlx.warp_pipeline_stage("mfma", priority=0):
-            acc_tr = tl.dot(a_top, b_right, acc_tr)
-        with tlx.warp_pipeline_stage("mem", priority=1):
-            b_left = tlx.local_load(smem_b_left[1], relaxed=True)
-            tlx.buffer_load_to_local(smem_a_bot[0], a_ptr, a_bot_off + ka)
-            tlx.async_load_commit_group()
-
-        tlx.async_load_wait_group(5)
-        with tlx.warp_pipeline_stage("mfma", priority=0):
-            acc_br = tl.dot(a_bot, b_right, acc_br)
-        with tlx.warp_pipeline_stage("mem", priority=1):
-            a_top = tlx.local_load(smem_a_top[1], relaxed=True)
-            tlx.buffer_load_to_local(smem_b_right[0], b_ptr, b_right_off + kb)
-            tlx.async_load_commit_group()
-
-        # --- sub-iter 1 (buffer 1, _next offsets) ---
-        tlx.async_load_wait_group(5)
-        with tlx.warp_pipeline_stage("mfma", priority=0):
-            acc_tl = tl.dot(a_top, b_left, acc_tl)
-        with tlx.warp_pipeline_stage("mem", priority=1):
-            a_bot = tlx.local_load(smem_a_bot[1], relaxed=True)
-            tlx.buffer_load_to_local(smem_b_left[1], b_ptr, b_left_off_n + kb)
-            tlx.async_load_commit_group()
-
-        tlx.async_load_wait_group(5)
-        with tlx.warp_pipeline_stage("mfma", priority=0):
-            acc_bl = tl.dot(a_bot, b_left, acc_bl)
-        with tlx.warp_pipeline_stage("mem", priority=1):
-            b_right = tlx.local_load(smem_b_right[1], relaxed=True)
-            tlx.buffer_load_to_local(smem_a_top[1], a_ptr, a_top_off_n + ka)
-            tlx.async_load_commit_group()
-
-        tlx.async_load_wait_group(5)
-        with tlx.warp_pipeline_stage("mfma", priority=0):
-            acc_tr = tl.dot(a_top, b_right, acc_tr)
-        with tlx.warp_pipeline_stage("mem", priority=1):
-            b_left = tlx.local_load(smem_b_left[0], relaxed=True)
-            tlx.buffer_load_to_local(smem_a_bot[1], a_ptr, a_bot_off_n + ka)
-            tlx.async_load_commit_group()
-
-        tlx.async_load_wait_group(5)
-        with tlx.warp_pipeline_stage("mfma", priority=0):
-            acc_br = tl.dot(a_bot, b_right, acc_br)
-        with tlx.warp_pipeline_stage("mem", priority=1):
-            a_top = tlx.local_load(smem_a_top[0], relaxed=True)
-            tlx.buffer_load_to_local(smem_b_right[1], b_ptr, b_right_off_n + kb)
-            tlx.async_load_commit_group()
-            ka += BLOCK_K * stride_ak * 2
-            kb += BLOCK_K * stride_bk * 2
-
-    # ── Epilogue: last 2 pipelined K-steps, drain LDS loads ──
-    # iter n_pipe-2
-    acc_tl = tl.dot(a_top, b_left, acc_tl)
-    tlx.async_load_wait_group(5)
-    l_idx: tl.constexpr = 0  # (n_pipe - 2) % 2, always 0 since n_pipe is even
-    a_bot = tlx.local_load(tlx.local_view(smem_a_bot, l_idx), relaxed=True)
-
-    acc_bl = tl.dot(a_bot, b_left, acc_bl)
-    tlx.async_load_wait_group(4)
-    b_right = tlx.local_load(tlx.local_view(smem_b_right, l_idx), relaxed=True)
-
-    acc_tr = tl.dot(a_top, b_right, acc_tr)
-    tlx.async_load_wait_group(3)
-    g_idx: tl.constexpr = 1  # 1 - l_idx
-    b_left = tlx.local_load(tlx.local_view(smem_b_left, g_idx), relaxed=True)
-
-    acc_br = tl.dot(a_bot, b_right, acc_br)
-    tlx.async_load_wait_group(2)
-    a_top = tlx.local_load(tlx.local_view(smem_a_top, g_idx), relaxed=True)
-
-    # iter n_pipe-1: finish ALL four mfmas before the tail/store so the dot
-    # operands die and the store phase holds only the four f32 accumulators.
-    acc_tl = tl.dot(a_top, b_left, acc_tl)
-    tlx.async_load_wait_group(1)
-    a_bot = tlx.local_load(tlx.local_view(smem_a_bot, g_idx), relaxed=True)
-
-    acc_bl = tl.dot(a_bot, b_left, acc_bl)
-    tlx.async_load_wait_group(0)
-    b_right = tlx.local_load(tlx.local_view(smem_b_right, g_idx), relaxed=True)
-
-    acc_tr = tl.dot(a_top, b_right, acc_tr)
-    acc_br = tl.dot(a_bot, b_right, acc_br)
+    acc_tl, acc_bl, acc_tr, acc_br = matmul_tile(
+        a_ptr, b_ptr, smem_a_top, smem_a_bot, smem_b_left, smem_b_right,
+        a_top_off, a_bot_off, b_left_off, b_right_off,
+        ak_split, bk_split, n_pipe, stride_ak, stride_bk,
+        BLOCK_M, BLOCK_N, BLOCK_K)
 
     # ── Masked scalar tail: K columns past the pipelined region (an odd leftover
     # tile and/or a partial final tile). Plain masked tl.load + tl.dot -- no LDS,
@@ -697,6 +751,16 @@ def a16w16_8wave(
         # Direct store to C.
         et = c_ptr.dtype.element_ty
         if HALF_M == 128 and HALF_N == 128:
+            # Stop the wide epilogue-store layout from propagating backward
+            # through the extracted tile function. Split-K and the 128 tile keep
+            # the original inferred accumulator layout.
+            acc_layout: tl.constexpr = tlx.amd_mfma_layout(
+                version=4, instr_shape=[16, 16, 32], transposed=True,
+                warps_per_cta=[2, 4])
+            acc_tl = tlx.require_layout(acc_tl, acc_layout, pin=False)
+            acc_bl = tlx.require_layout(acc_bl, acc_layout, pin=False)
+            acc_tr = tlx.require_layout(acc_tr, acc_layout, pin=False)
+            acc_br = tlx.require_layout(acc_br, acc_layout, pin=False)
             # Pin each 128x128 quadrant to the coalesced SIMD #linear layout (no LDS
             # staging) so OptimizeEpilogue keeps the wide dwordx4 store.
             # _C_STORE_SIMD_LAYOUT is derived for the 128x128 quadrant, so it only
@@ -739,6 +803,366 @@ def a16w16_8wave(
         tl.store(workspace_ptr + stride_cm * (rb + offs_cm_bot)[:, None] + stride_cn * offs_cn_right[None, :], acc_br,
                  mask=m_bot & n_right)
 
+
+@triton.jit
+def _matmul_full_tile(a_ptr, b_ptr, c_ptr,
+                     smem_a_top, smem_a_bot, smem_b_left, smem_b_right,
+                     pid_m, pid_n, K,
+                     stride_am, stride_ak, stride_bk, stride_bn,
+                     stride_cm, stride_cn,
+                     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+                     BLOCK_K: tl.constexpr, K_PIPE_STEPS: tl.constexpr,
+                     HAS_K_TAIL: tl.constexpr, c_layout: tl.constexpr):
+    """Compute and store one complete output tile."""
+    HALF_M: tl.constexpr = BLOCK_M // 2
+    HALF_N: tl.constexpr = BLOCK_N // 2
+    offs_m = tl.arange(0, HALF_M)
+    offs_n = tl.arange(0, HALF_N)
+    offs_k = tl.arange(0, BLOCK_K)
+    offs_m_top = pid_m * BLOCK_M + offs_m
+    offs_m_bot = offs_m_top + HALF_M
+    offs_n_left = pid_n * BLOCK_N + offs_n
+    offs_n_right = offs_n_left + HALF_N
+    a_top_off = offs_m_top[:, None] * stride_am + offs_k[None, :] * stride_ak
+    a_bot_off = offs_m_bot[:, None] * stride_am + offs_k[None, :] * stride_ak
+    b_left_off = offs_k[:, None] * stride_bk + offs_n_left[None, :] * stride_bn
+    b_right_off = offs_k[:, None] * stride_bk + offs_n_right[None, :] * stride_bn
+    acc_tl, acc_bl, acc_tr, acc_br = matmul_tile(
+        a_ptr, b_ptr, smem_a_top, smem_a_bot, smem_b_left, smem_b_right,
+        a_top_off, a_bot_off, b_left_off, b_right_off,
+        0, 0, K_PIPE_STEPS, stride_ak, stride_bk, BLOCK_M, BLOCK_N, BLOCK_K)
+    if HAS_K_TAIL:
+        # Mask odd full and/or partial K64 steps left after the even pipelined prefix.
+        for kk in tl.range(K_PIPE_STEPS * BLOCK_K, K, BLOCK_K, num_stages=1):
+            offs_kt = kk + offs_k
+            k_mask = offs_kt < K
+            a_top = tl.load(
+                a_ptr + offs_m_top[:, None] * stride_am + offs_kt[None, :] * stride_ak,
+                mask=k_mask[None, :], other=0.0)
+            a_bot = tl.load(
+                a_ptr + offs_m_bot[:, None] * stride_am + offs_kt[None, :] * stride_ak,
+                mask=k_mask[None, :], other=0.0)
+            b_left = tl.load(
+                b_ptr + offs_kt[:, None] * stride_bk + offs_n_left[None, :] * stride_bn,
+                mask=k_mask[:, None], other=0.0)
+            b_right = tl.load(
+                b_ptr + offs_kt[:, None] * stride_bk + offs_n_right[None, :] * stride_bn,
+                mask=k_mask[:, None], other=0.0)
+            acc_tl = tl.dot(a_top, b_left, acc_tl)
+            acc_bl = tl.dot(a_bot, b_left, acc_bl)
+            acc_tr = tl.dot(a_top, b_right, acc_tr)
+            acc_br = tl.dot(a_bot, b_right, acc_br)
+    et: tl.constexpr = c_ptr.dtype.element_ty
+    tl.store(c_ptr + offs_m_top[:, None] * stride_cm + offs_n_left[None, :] * stride_cn,
+             tlx.require_layout(acc_tl.to(et), c_layout))
+    tl.store(c_ptr + offs_m_bot[:, None] * stride_cm + offs_n_left[None, :] * stride_cn,
+             tlx.require_layout(acc_bl.to(et), c_layout))
+    tl.store(c_ptr + offs_m_top[:, None] * stride_cm + offs_n_right[None, :] * stride_cn,
+             tlx.require_layout(acc_tr.to(et), c_layout))
+    tl.store(c_ptr + offs_m_bot[:, None] * stride_cm + offs_n_right[None, :] * stride_cn,
+             tlx.require_layout(acc_br.to(et), c_layout))
+
+
+@triton.jit
+def _grouped_tile_coords(tile_id,
+                         NUM_PID_M: tl.constexpr, NUM_PID_N: tl.constexpr,
+                         GROUP_SIZE_M: tl.constexpr):
+    """Map a linear tile ID to the grouped M-major output grid."""
+    tiles_per_group: tl.constexpr = GROUP_SIZE_M * NUM_PID_N
+    group_id = tile_id // tiles_per_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(NUM_PID_M - first_pid_m, GROUP_SIZE_M)
+    tile_in_group = tile_id % tiles_per_group
+    pid_m = first_pid_m + tile_in_group % group_size_m
+    pid_n = tile_in_group // group_size_m
+    return pid_m, pid_n
+
+
+@triton.jit
+def _wait_for_streamk_partial(locks_ptr, slot, ready_value):
+    """Wait until one producer has published its partial tile."""
+    while tl.load(locks_ptr + slot,
+                  cache_modifier=".cv", volatile=True) != ready_value:
+        pass
+
+
+@triton.jit
+def _reduce_and_store_streamk_quadrant(
+    partials_ptr, c_ptrs, first_contributor,
+    num_contributors: tl.constexpr, partial_off,
+    tile_elems: tl.constexpr, acc_layout: tl.constexpr,
+    c_layout: tl.constexpr,
+):
+    """Reduce one quadrant across a tile's contributors and store it."""
+    acc = tlx.require_layout(
+        tl.load(partials_ptr + first_contributor * tile_elems + partial_off,
+                cache_modifier=".cv"), acc_layout, pin=False)
+    for peer in range(1, num_contributors):
+        acc += tlx.require_layout(
+            tl.load(partials_ptr + (first_contributor + peer) * tile_elems + partial_off,
+                    cache_modifier=".cv"), acc_layout, pin=False)
+    tl.store(c_ptrs, tlx.require_layout(acc.to(c_ptrs.dtype.element_ty), c_layout))
+
+
+@triton.jit
+def streamk_kernel(a_ptr, b_ptr, c_ptr, partials_ptr, locks_ptr,
+                   ready_value, K,
+                   stride_am, stride_ak, stride_bk, stride_bn,
+                   stride_cm, stride_cn,
+                   BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+                   BLOCK_K: tl.constexpr, NUM_XCDS: tl.constexpr,
+                   NUM_CU: tl.constexpr, NUM_PROGRAMS: tl.constexpr,
+                   HAS_STREAMK: tl.constexpr, NUM_FULL_TILES: tl.constexpr,
+                   HAS_K_TAIL: tl.constexpr,
+                   NUM_PID_M: tl.constexpr, NUM_PID_N: tl.constexpr,
+                   GROUP_SIZE_M: tl.constexpr, K_PIPE_STEPS: tl.constexpr,
+                   K_PIPE_PAIRS: tl.constexpr,
+                   UNITS_PER_PROGRAM: tl.constexpr, REMAINDER_UNITS: tl.constexpr):
+    """Persistent full tiles plus owner or distributed Stream-K fixup."""
+    pid = tl.program_id(0)
+    contributors_per_tile: tl.constexpr = K_PIPE_PAIRS // max(UNITS_PER_PROGRAM, 1)
+    # When every flattened interval is one equal segment of one tile, all
+    # contributors can participate in fixup instead of serializing it in the
+    # tile owner. This is a reduction optimization, not a separate schedule.
+    DISTRIBUTED_FIXUP: tl.constexpr = (
+        HAS_STREAMK and NUM_FULL_TILES == NUM_PROGRAMS and
+        REMAINDER_UNITS == 0 and
+        K_PIPE_PAIRS % max(UNITS_PER_PROGRAM, 1) == 0 and
+        (contributors_per_tile == 2 or contributors_per_tile == 4))
+    HALF_M: tl.constexpr = BLOCK_M // 2
+    HALF_N: tl.constexpr = BLOCK_N // 2
+    acc_layout: tl.constexpr = tlx.amd_mfma_layout(
+        version=4, instr_shape=[16, 16, 32], transposed=True,
+        warps_per_cta=[2, 4])
+    a_bases: tl.constexpr = _A_BASES_256 if BLOCK_M == 256 else _A_BASES_128
+    b_bases: tl.constexpr = _B_BASES_256 if BLOCK_N == 256 else _B_BASES_128
+    a_layout: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases(
+        [(512, 16)], a_bases, [HALF_M, BLOCK_K])
+    b_layout: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases(
+        [(512, 16)], b_bases, [BLOCK_K, HALF_N])
+    et: tl.constexpr = a_ptr.dtype.element_ty
+    smem_a_top = tlx.local_alloc((HALF_M, BLOCK_K), et, 2, layout=a_layout)
+    smem_a_bot = tlx.local_alloc((HALF_M, BLOCK_K), et, 2, layout=a_layout)
+    smem_b_left = tlx.local_alloc((BLOCK_K, HALF_N), et, 2, layout=b_layout)
+    smem_b_right = tlx.local_alloc((BLOCK_K, HALF_N), et, 2, layout=b_layout)
+    offs_m = tl.arange(0, HALF_M)
+    offs_n = tl.arange(0, HALF_N)
+    offs_k = tl.arange(0, BLOCK_K)
+    C: tl.constexpr = _C_STORE_SIMD_LAYOUT if BLOCK_M == 256 and BLOCK_N == 256 else acc_layout
+    tile_elems: tl.constexpr = BLOCK_M * BLOCK_N
+    partial_tl_off = offs_m[:, None] * BLOCK_N + offs_n[None, :]
+    partial_bl_off = partial_tl_off + HALF_M * BLOCK_N
+    partial_tr_off = partial_tl_off + HALF_N
+    partial_br_off = partial_bl_off + HALF_N
+    stream_pid = pid
+    if HAS_STREAMK:
+        stream_pid = (pid % NUM_XCDS) * (NUM_CU // NUM_XCDS) + pid // NUM_XCDS
+        # Fuse TritonBLAS-style lock initialization into the resident kernel;
+        # each program clears the slot it may later publish.
+        tl.store(locks_ptr + stream_pid, 0, cache_modifier=".wt")
+        tl.debug_barrier()
+
+    if HAS_STREAMK and NUM_FULL_TILES == NUM_PROGRAMS:
+        # Fast path: each Stream-K program owns one full tile, so no loop is needed.
+        head_pid_m = stream_pid % NUM_PID_M
+        head_pid_n = stream_pid // NUM_PID_M
+        _matmul_full_tile(
+            a_ptr, b_ptr, c_ptr,
+            smem_a_top, smem_a_bot, smem_b_left, smem_b_right,
+            head_pid_m, head_pid_n, K,
+            stride_am, stride_ak, stride_bk, stride_bn, stride_cm, stride_cn,
+            BLOCK_M, BLOCK_N, BLOCK_K, K_PIPE_STEPS, HAS_K_TAIL, C)
+    else:
+        # General path for both persistent and generic Stream-K.
+        pids_per_xcd: tl.constexpr = (NUM_FULL_TILES + NUM_XCDS - 1) // NUM_XCDS
+        remainder_xcds: tl.constexpr = NUM_FULL_TILES % NUM_XCDS
+        tall_xcds: tl.constexpr = NUM_XCDS if remainder_xcds == 0 else remainder_xcds
+        for virtual_pid in range(pid, NUM_FULL_TILES, NUM_PROGRAMS):
+            xcd = virtual_pid % NUM_XCDS
+            local_pid = virtual_pid // NUM_XCDS
+            if xcd < tall_xcds:
+                tile_id = xcd * pids_per_xcd + local_pid
+            else:
+                tile_id = (tall_xcds * pids_per_xcd +
+                           (xcd - tall_xcds) * (pids_per_xcd - 1) + local_pid)
+            pid_m, pid_n = _grouped_tile_coords(
+                tile_id, NUM_PID_M, NUM_PID_N, GROUP_SIZE_M)
+            _matmul_full_tile(
+                a_ptr, b_ptr, c_ptr,
+                smem_a_top, smem_a_bot, smem_b_left, smem_b_right,
+                pid_m, pid_n, K,
+                stride_am, stride_ak, stride_bk, stride_bn, stride_cm, stride_cn,
+                BLOCK_M, BLOCK_N, BLOCK_K, K_PIPE_STEPS, HAS_K_TAIL, C)
+    if not HAS_STREAMK:
+        return
+
+    if DISTRIBUTED_FIXUP:
+        # Unlike owner-based (standard Stream-K) fixup, every contributor publishes
+        # its partial tile, synchronizes, and reduces a disjoint output region.
+        # This lets all contributing CTAs actively reduce instead of relying on a
+        # single owner CTA, as in standard Stream-K.
+        contributor_id = stream_pid % contributors_per_tile
+        tail_tile = NUM_FULL_TILES + stream_pid // contributors_per_tile
+
+        tail_pid_m, tail_pid_n = _grouped_tile_coords(
+            tail_tile, NUM_PID_M, NUM_PID_N, GROUP_SIZE_M)
+        tail_offs_m_top = tail_pid_m * BLOCK_M + offs_m
+        tail_offs_m_bot = tail_offs_m_top + HALF_M
+        tail_offs_n_left = tail_pid_n * BLOCK_N + offs_n
+        tail_offs_n_right = tail_offs_n_left + HALF_N
+        tail_a_top_off = tail_offs_m_top[:, None] * stride_am + offs_k[None, :] * stride_ak
+        tail_a_bot_off = tail_offs_m_bot[:, None] * stride_am + offs_k[None, :] * stride_ak
+        tail_b_left_off = offs_k[:, None] * stride_bk + tail_offs_n_left[None, :] * stride_bn
+        tail_b_right_off = offs_k[:, None] * stride_bk + tail_offs_n_right[None, :] * stride_bn
+        segment_k_steps: tl.constexpr = UNITS_PER_PROGRAM * 2
+        segment_k_offset = contributor_id * segment_k_steps * BLOCK_K
+        acc_tl, acc_bl, acc_tr, acc_br = matmul_tile(
+            a_ptr, b_ptr, smem_a_top, smem_a_bot, smem_b_left, smem_b_right,
+            tail_a_top_off, tail_a_bot_off, tail_b_left_off, tail_b_right_off,
+            segment_k_offset * stride_ak, segment_k_offset * stride_bk,
+            segment_k_steps, stride_ak, stride_bk,
+            BLOCK_M, BLOCK_N, BLOCK_K)
+
+        # Pin and publish all four partial quadrants before any contributor waits.
+        # This avoids cyclic dependencies and lets the MFMA accumulators die before
+        # fixup. Publishing a runtime-selected quadrant instead costs more VGPR and
+        # select work than it saves in workspace traffic on gfx950.
+        acc_tl = tlx.require_layout(acc_tl, acc_layout, pin=False)
+        acc_bl = tlx.require_layout(acc_bl, acc_layout, pin=False)
+        acc_tr = tlx.require_layout(acc_tr, acc_layout, pin=False)
+        acc_br = tlx.require_layout(acc_br, acc_layout, pin=False)
+        partial_base = partials_ptr + stream_pid * tile_elems
+        partial_tl_ptr = tlx.require_layout(
+            partial_base + partial_tl_off, acc_layout, pin=False)
+        partial_bl_ptr = tlx.require_layout(
+            partial_base + partial_bl_off, acc_layout, pin=False)
+        partial_tr_ptr = tlx.require_layout(
+            partial_base + partial_tr_off, acc_layout, pin=False)
+        partial_br_ptr = tlx.require_layout(
+            partial_base + partial_br_off, acc_layout, pin=False)
+        tl.store(partial_tl_ptr, acc_tl, cache_modifier=".wt")
+        tl.store(partial_bl_ptr, acc_bl, cache_modifier=".wt")
+        tl.store(partial_tr_ptr, acc_tr, cache_modifier=".wt")
+        tl.store(partial_br_ptr, acc_br, cache_modifier=".wt")
+        tl.debug_barrier()
+        tl.store(locks_ptr + stream_pid, ready_value, cache_modifier=".wt")
+
+        # Cooperatively reduce the tile, assigning consecutive output quadrants to
+        # each contributor so all programs remain useful during fixup.
+        first_contributor = stream_pid - contributor_id
+        for peer in range(contributors_per_tile):
+            _wait_for_streamk_partial(locks_ptr, first_contributor + peer, ready_value)
+        # Two contributors own the left and right halves; four contributors
+        # own one quadrant each.
+        bottom_left_owner: tl.constexpr = 0 if contributors_per_tile == 2 else 1
+        top_right_owner: tl.constexpr = 1 if contributors_per_tile == 2 else 2
+        bottom_right_owner: tl.constexpr = 1 if contributors_per_tile == 2 else 3
+        if contributor_id == 0:
+            _reduce_and_store_streamk_quadrant(
+                partials_ptr,
+                c_ptr + tail_offs_m_top[:, None] * stride_cm + tail_offs_n_left[None, :] * stride_cn,
+                first_contributor, contributors_per_tile, partial_tl_off, tile_elems, acc_layout, C)
+        if contributor_id == bottom_left_owner:
+            _reduce_and_store_streamk_quadrant(
+                partials_ptr,
+                c_ptr + tail_offs_m_bot[:, None] * stride_cm + tail_offs_n_left[None, :] * stride_cn,
+                first_contributor, contributors_per_tile, partial_bl_off, tile_elems, acc_layout, C)
+        if contributor_id == top_right_owner:
+            _reduce_and_store_streamk_quadrant(
+                partials_ptr,
+                c_ptr + tail_offs_m_top[:, None] * stride_cm + tail_offs_n_right[None, :] * stride_cn,
+                first_contributor, contributors_per_tile, partial_tr_off, tile_elems, acc_layout, C)
+        if contributor_id == bottom_right_owner:
+            _reduce_and_store_streamk_quadrant(
+                partials_ptr,
+                c_ptr + tail_offs_m_bot[:, None] * stride_cm + tail_offs_n_right[None, :] * stride_cn,
+                first_contributor, contributors_per_tile, partial_br_off, tile_elems, acc_layout, C)
+    else:
+        # Standard Stream-K fixup path: Divide remaining flattened pairs of K
+        # pipeline steps almost evenly across CUs.
+        logical_pid = stream_pid
+        streamk_base = NUM_FULL_TILES * K_PIPE_PAIRS
+        start_unit = (streamk_base + logical_pid * UNITS_PER_PROGRAM +
+                      min(logical_pid, REMAINDER_UNITS))
+        last_unit = (streamk_base + (logical_pid + 1) * UNITS_PER_PROGRAM +
+                     min(logical_pid + 1, REMAINDER_UNITS))
+
+        while start_unit < last_unit:
+            tile_id = start_unit // K_PIPE_PAIRS
+            tile_start = tile_id * K_PIPE_PAIRS
+            tile_end = tile_start + K_PIPE_PAIRS
+            segment_end = min(last_unit, tile_end)
+            pid_m, pid_n = _grouped_tile_coords(
+                tile_id, NUM_PID_M, NUM_PID_N, GROUP_SIZE_M)
+            tile_offs_m_top = pid_m * BLOCK_M + offs_m
+            tile_offs_m_bot = tile_offs_m_top + HALF_M
+            tile_offs_n_left = pid_n * BLOCK_N + offs_n
+            tile_offs_n_right = tile_offs_n_left + HALF_N
+            tile_a_top_off = tile_offs_m_top[:, None] * stride_am + offs_k[None, :] * stride_ak
+            tile_a_bot_off = tile_offs_m_bot[:, None] * stride_am + offs_k[None, :] * stride_ak
+            tile_b_left_off = offs_k[:, None] * stride_bk + tile_offs_n_left[None, :] * stride_bn
+            tile_b_right_off = offs_k[:, None] * stride_bk + tile_offs_n_right[None, :] * stride_bn
+            k_step = (start_unit - tile_start) * 2 * BLOCK_K
+            acc_tl, acc_bl, acc_tr, acc_br = matmul_tile(
+                a_ptr, b_ptr, smem_a_top, smem_a_bot, smem_b_left, smem_b_right,
+                tile_a_top_off, tile_a_bot_off, tile_b_left_off, tile_b_right_off,
+                k_step * stride_ak, k_step * stride_bk,
+                (segment_end - start_unit) * 2, stride_ak, stride_bk,
+                BLOCK_M, BLOCK_N, BLOCK_K)
+            acc_tl = tlx.require_layout(acc_tl, acc_layout, pin=False)
+            acc_bl = tlx.require_layout(acc_bl, acc_layout, pin=False)
+            acc_tr = tlx.require_layout(acc_tr, acc_layout, pin=False)
+            acc_br = tlx.require_layout(acc_br, acc_layout, pin=False)
+
+            if start_unit != tile_start:
+                # A contributor publishes one partial. Its range can then start
+                # the next tile, so continue instead of returning immediately.
+                base = logical_pid * tile_elems
+                partial_tl_ptr = tlx.require_layout(
+                    partials_ptr + base + partial_tl_off, acc_layout, pin=False)
+                partial_bl_ptr = tlx.require_layout(
+                    partials_ptr + base + partial_bl_off, acc_layout, pin=False)
+                partial_tr_ptr = tlx.require_layout(
+                    partials_ptr + base + partial_tr_off, acc_layout, pin=False)
+                partial_br_ptr = tlx.require_layout(
+                    partials_ptr + base + partial_br_off, acc_layout, pin=False)
+                tl.store(partial_tl_ptr, acc_tl, cache_modifier=".wt")
+                tl.store(partial_bl_ptr, acc_bl, cache_modifier=".wt")
+                tl.store(partial_tr_ptr, acc_tr, cache_modifier=".wt")
+                tl.store(partial_br_ptr, acc_br, cache_modifier=".wt")
+                tl.debug_barrier()
+                tl.store(locks_ptr + logical_pid, ready_value, cache_modifier=".wt")
+            else:
+                # The program owning the first work unit of a tile collects the
+                # following contributors, exactly as the TritonBLAS fixup does.
+                covered_end = segment_end
+                next_pid = logical_pid + 1
+                while covered_end < tile_end:
+                    _wait_for_streamk_partial(locks_ptr, next_pid, ready_value)
+                    peer_base = next_pid * tile_elems
+                    acc_tl += tlx.require_layout(
+                        tl.load(partials_ptr + peer_base + partial_tl_off, cache_modifier=".cv"),
+                        acc_layout, pin=False)
+                    acc_bl += tlx.require_layout(
+                        tl.load(partials_ptr + peer_base + partial_bl_off, cache_modifier=".cv"),
+                        acc_layout, pin=False)
+                    acc_tr += tlx.require_layout(
+                        tl.load(partials_ptr + peer_base + partial_tr_off, cache_modifier=".cv"),
+                        acc_layout, pin=False)
+                    acc_br += tlx.require_layout(
+                        tl.load(partials_ptr + peer_base + partial_br_off, cache_modifier=".cv"),
+                        acc_layout, pin=False)
+                    covered_end += UNITS_PER_PROGRAM + (next_pid < REMAINDER_UNITS)
+                    next_pid += 1
+                tl.store(c_ptr + tile_offs_m_top[:, None] * stride_cm + tile_offs_n_left[None, :] * stride_cn,
+                         tlx.require_layout(acc_tl.to(et), C))
+                tl.store(c_ptr + tile_offs_m_bot[:, None] * stride_cm + tile_offs_n_left[None, :] * stride_cn,
+                         tlx.require_layout(acc_bl.to(et), C))
+                tl.store(c_ptr + tile_offs_m_top[:, None] * stride_cm + tile_offs_n_right[None, :] * stride_cn,
+                         tlx.require_layout(acc_tr.to(et), C))
+                tl.store(c_ptr + tile_offs_m_bot[:, None] * stride_cm + tile_offs_n_right[None, :] * stride_cn,
+                         tlx.require_layout(acc_br.to(et), C))
+            start_unit = segment_end
 
 _TORCH_TO_TL = {torch.float16: tl.float16, torch.bfloat16: tl.bfloat16, torch.float32: tl.float32}
 
@@ -948,3 +1372,51 @@ def matmul(a, b, SPLIT_K=None):
     added, so there is no precision loss and the result is deterministic.
     """
     return _launch(a, b, SPLIT_K=SPLIT_K)
+
+
+def _validate_streamk(a, b):
+    assert a.is_cuda and b.is_cuda
+    assert a.dtype == b.dtype and a.dtype in (torch.float16, torch.bfloat16), \
+        "streamk_matmul requires matching FP16 or BF16 operands"
+    assert a.ndim == 2 and b.ndim == 2 and a.shape[1] == b.shape[0]
+    M, K = a.shape
+    _, N = b.shape
+    assert M % BLOCK_M == 0 and N % BLOCK_N == 0, \
+        f"M and N must be multiples of {BLOCK_M}"
+    assert K >= MIN_K, f"K must be at least {MIN_K}"
+    return M, N, K
+
+
+def _choose_streamk_tile(M, N):
+    """Use a smaller persistent tile only when the default grid underfills the GPU."""
+    BM, BN = TILE_CANDIDATES[0]
+    grid_mn = (M // BM) * (N // BN)
+    if grid_mn < NUM_CU // 2:
+        for candidate_m, candidate_n in TILE_CANDIDATES[1:]:
+            candidate_grid = (M // candidate_m) * (N // candidate_n)
+            if grid_mn < candidate_grid <= NUM_CU:
+                BM, BN, grid_mn = candidate_m, candidate_n, candidate_grid
+    return BM, BN
+
+
+def streamk_matmul(a, b):
+    """Run one persistent kernel with a variable-work Stream-K tail when profitable."""
+    M, N, K = _validate_streamk(a, b)
+    BM, BN = _choose_streamk_tile(M, N)
+    schedule = _streamk_schedule(M, N, K, block_m=BM, block_n=BN)
+    c = torch.empty((M, N), device=a.device, dtype=a.dtype)
+    if schedule["HAS_STREAMK"]:
+        partials = torch.empty((NUM_CU, BM, BN), device=a.device, dtype=torch.float32)
+        locks = torch.empty((NUM_CU,), device=a.device, dtype=torch.int32)
+    else:
+        partials = locks = c
+    streamk_kernel[(schedule["NUM_PROGRAMS"],)](
+        a, b, c, partials, locks, _READY_VALUE, K,
+        a.stride(0), a.stride(1), b.stride(0), b.stride(1),
+        c.stride(0), c.stride(1),
+        BLOCK_M=BM, BLOCK_N=BN, BLOCK_K=BLOCK_K,
+        NUM_XCDS=NUM_XCDS, NUM_CU=NUM_CU, GROUP_SIZE_M=GROUP_SIZE_M,
+        **schedule,
+        num_warps=NUM_WARPS, num_stages=1, matrix_instr_nonkdim=16,
+        llvm_fn_attrs=_LLVM_ATTRS)
+    return c
