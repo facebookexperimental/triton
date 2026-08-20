@@ -108,6 +108,23 @@ bool isPrime(int64_t modulus) {
          factors.factors[0].second == 1;
 }
 
+std::optional<int64_t> getSupportedPrimePower(int64_t prime, int exponent) {
+  constexpr int64_t limit = int64_t{1} << 31;
+  int64_t result = 1;
+  for (int i = 0; i < exponent; ++i) {
+    if (result > limit / prime)
+      return std::nullopt;
+    result *= prime;
+  }
+  return result;
+}
+
+bool zeroVariableSystemHasSolution(const std::vector<int64_t> &b,
+                                   int64_t modulus) {
+  return std::all_of(b.begin(), b.end(),
+                     [modulus](int64_t value) { return value % modulus == 0; });
+}
+
 int64_t normalizeMod(__int128 value, int64_t modulus) {
   int64_t normalized = value % modulus;
   return normalized < 0 ? normalized + modulus : normalized;
@@ -280,9 +297,9 @@ int modRREF(ModMatrix &mat) {
 // NB: The `modulus` parameter is the modulus used for the solve, which may
 // differ from A.modulus (the modulus A was originally constructed with).
 // Callers (e.g. modSolveLinearCRT) re-reduce A's entries mod the new modulus.
-std::vector<int64_t> modSolveLinear(const ModMatrix &A,
-                                    const std::vector<int64_t> &b,
-                                    int64_t modulus) {
+static std::vector<int64_t>
+solveLinear(const ModMatrix &A, const std::vector<int64_t> &b,
+            int64_t modulus) {
   int n = A.rows;
   int m = A.cols;
 
@@ -346,7 +363,34 @@ std::vector<int64_t> modSolveLinear(const ModMatrix &A,
     }
   }
 
-  return isSolution(A, b, x, modulus) ? x : std::vector<int64_t>{};
+  return x;
+}
+
+std::vector<int64_t> modSolveLinear(const ModMatrix &A,
+                                    const std::vector<int64_t> &b,
+                                    int64_t modulus) {
+  auto solution = solveLinear(A, b, modulus);
+  return isSolution(A, b, solution, modulus) ? solution
+                                              : std::vector<int64_t>{};
+}
+
+ModularSolveResult tryModSolveLinear(const ModMatrix &A,
+                                     const std::vector<int64_t> &b,
+                                     int64_t modulus) {
+  if (!isPrime(modulus) || static_cast<int>(b.size()) != A.rows)
+    return {ModularSolveStatus::Unsupported, {}};
+  if (A.cols == 0)
+    return {zeroVariableSystemHasSolution(b, modulus)
+                ? ModularSolveStatus::Success
+                : ModularSolveStatus::NoSolution,
+            {}};
+
+  auto solution = solveLinear(A, b, modulus);
+  if (solution.empty())
+    return {ModularSolveStatus::NoSolution, {}};
+  if (!isSolution(A, b, solution, modulus))
+    return {ModularSolveStatus::Unsupported, {}};
+  return {ModularSolveStatus::Success, std::move(solution)};
 }
 
 // Solve Ax = b (mod p^e) by solving mod p then lifting each power via
@@ -437,6 +481,32 @@ std::vector<int64_t> modSolveLinearHensel(const ModMatrix &A,
   return isSolution(A, b, x_k, p_e) ? x_k : std::vector<int64_t>{};
 }
 
+ModularSolveResult tryModSolveLinearHensel(const ModMatrix &A,
+                                           const std::vector<int64_t> &b,
+                                           int64_t prime, int exponent) {
+  if (!isPrime(prime) || exponent < 1 ||
+      static_cast<int>(b.size()) != A.rows)
+    return {ModularSolveStatus::Unsupported, {}};
+
+  auto modulus = getSupportedPrimePower(prime, exponent);
+  if (!modulus)
+    return {ModularSolveStatus::Unsupported, {}};
+  if (A.cols == 0)
+    return {zeroVariableSystemHasSolution(b, *modulus)
+                ? ModularSolveStatus::Success
+                : ModularSolveStatus::NoSolution,
+            {}};
+
+  auto solution = modSolveLinearHensel(A, b, prime, exponent);
+  if (!solution.empty())
+    return {ModularSolveStatus::Success, std::move(solution)};
+
+  auto base = tryModSolveLinear(A, b, prime);
+  if (base.status == ModularSolveStatus::NoSolution)
+    return {ModularSolveStatus::NoSolution, {}};
+  return {ModularSolveStatus::Unsupported, {}};
+}
+
 std::vector<int64_t> modSolveLinearCRT(const ModMatrix &A,
                                        const std::vector<int64_t> &b,
                                        int64_t modulus) {
@@ -509,6 +579,51 @@ std::vector<int64_t> modSolveLinearCRT(const ModMatrix &A,
   }
 
   return isSolution(A, b, x, modulus) ? x : std::vector<int64_t>{};
+}
+
+ModularSolveResult tryModSolveLinearCRT(const ModMatrix &A,
+                                        const std::vector<int64_t> &b,
+                                        int64_t modulus) {
+  if (modulus <= 0 || static_cast<int>(b.size()) != A.rows)
+    return {ModularSolveStatus::Unsupported, {}};
+
+  PrimeFactorization factors = factorize(modulus);
+  if (modulus > 1 && factors.factors.empty())
+    return {ModularSolveStatus::Unsupported, {}};
+  for (const auto &[prime, exponent] : factors.factors)
+    if (exponent > 1 && !getSupportedPrimePower(prime, exponent))
+      return {ModularSolveStatus::Unsupported, {}};
+  if (A.cols == 0)
+    return {zeroVariableSystemHasSolution(b, modulus)
+                ? ModularSolveStatus::Success
+                : ModularSolveStatus::NoSolution,
+            {}};
+
+  auto solution = modSolveLinearCRT(A, b, modulus);
+  if (!solution.empty())
+    return {ModularSolveStatus::Success, std::move(solution)};
+
+  for (const auto &[prime, exponent] : factors.factors) {
+    // Match the factor-reduced system used by modSolveLinearCRT.
+    int64_t factorModulus = intPow(prime, exponent);
+    ModMatrix factorA(A.rows, A.cols, factorModulus);
+    std::vector<int64_t> factorB(A.rows);
+    for (int row = 0; row < A.rows; ++row) {
+      for (int col = 0; col < A.cols; ++col)
+        factorA.at(row, col) = normalizeMod(A.at(row, col), factorModulus);
+      factorB[row] = normalizeMod(b[row], factorModulus);
+    }
+
+    ModularSolveResult factorResult =
+        exponent == 1
+            ? tryModSolveLinear(factorA, factorB, prime)
+            : tryModSolveLinearHensel(factorA, factorB, prime, exponent);
+    if (factorResult.status == ModularSolveStatus::NoSolution)
+      return {ModularSolveStatus::NoSolution, {}};
+    if (!factorResult.succeeded())
+      return {ModularSolveStatus::Unsupported, {}};
+  }
+  return {ModularSolveStatus::Unsupported, {}};
 }
 
 int64_t PrimeFactorization::product() const {

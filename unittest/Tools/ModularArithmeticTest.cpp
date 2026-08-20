@@ -323,6 +323,43 @@ TEST_F(ModularArithmeticTest, ModSolveLinear_ExhaustivePrimeField) {
   }
 }
 
+TEST_F(ModularArithmeticTest, TypedSolveStatus) {
+  ModMatrix identity(1, 1, 3);
+  identity.at(0, 0) = 1;
+  EXPECT_EQ(tryModSolveLinear(identity, {2}, 3).status,
+            ModularSolveStatus::Success);
+
+  ModMatrix zero(1, 1, 3);
+  zero.at(0, 0) = 0;
+  EXPECT_EQ(tryModSolveLinear(zero, {1}, 3).status,
+            ModularSolveStatus::NoSolution);
+
+  ModMatrix noVariables(1, 0, 3);
+  EXPECT_EQ(tryModSolveLinear(noVariables, {0}, 3).status,
+            ModularSolveStatus::Success);
+  EXPECT_EQ(tryModSolveLinear(noVariables, {1}, 3).status,
+            ModularSolveStatus::NoSolution);
+
+  ModMatrix composite(1, 1, 4);
+  composite.at(0, 0) = 2;
+  EXPECT_EQ(tryModSolveLinear(composite, {1}, 4).status,
+            ModularSolveStatus::Unsupported);
+
+  auto singularLift = tryModSolveLinearHensel(composite, {2}, 2, 2);
+  EXPECT_NE(singularLift.status, ModularSolveStatus::NoSolution);
+  EXPECT_TRUE(singularLift.status == ModularSolveStatus::Success ||
+              singularLift.status == ModularSolveStatus::Unsupported);
+}
+
+TEST_F(ModularArithmeticTest, TypedSolveStatus_CRTFactorReduction) {
+  ModMatrix A(1, 1, 135);
+  // The large representative is solvable mod 27 and inconsistent mod 5.
+  A.at(0, 0) = std::numeric_limits<int64_t>::max() - 132;
+
+  EXPECT_EQ(tryModSolveLinearCRT(A, {86}, 135).status,
+            ModularSolveStatus::NoSolution);
+}
+
 TEST_F(ModularArithmeticTest, ModSolveLinearHensel_Mod9) {
   // modulus = 9 = 3^2
   ModMatrix A(2, 2, 9);

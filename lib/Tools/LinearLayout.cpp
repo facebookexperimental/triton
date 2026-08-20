@@ -1245,8 +1245,8 @@ LinearLayout::concatMatrices(const LinearLayout &A, const LinearLayout &B) {
 }
 
 // Modular lstsq implementation delegating to modSolveLinearCRT
-LinearLayout LinearLayout::lstsqModular(const LinearLayout &A,
-                                        const LinearLayout &B) {
+LinearLayoutSolveResult LinearLayout::lstsqModular(const LinearLayout &A,
+                                                   const LinearLayout &B) {
   assertDimsEqualIgnoringOrder(A.getOutDimNames(), B.getOutDimNames());
 
   int numRowsA = A.getTotalInDimSizeLog2();
@@ -1276,10 +1276,10 @@ LinearLayout LinearLayout::lstsqModular(const LinearLayout &A,
     for (int outIdx = 0; outIdx < numOutDims; outIdx++)
       rhs[outIdx] = matB_data[bCol * numOutDims + outIdx];
 
-    resultCols[bCol] = modSolveLinearCRT(matA_mod, rhs, workingModulus);
-    assert(!resultCols[bCol].empty() &&
-           "Precondition broken in lstsqModular: modSolveLinearCRT failed. "
-           "Im(B) not contained in Im(A)?");
+    auto result = tryModSolveLinearCRT(matA_mod, rhs, workingModulus);
+    if (!result.succeeded())
+      return {result.status, std::nullopt};
+    resultCols[bCol] = std::move(result.solution);
   }
 
   // Build result layout from solution
@@ -1317,10 +1317,12 @@ LinearLayout LinearLayout::lstsqModular(const LinearLayout &A,
   for (StringAttr dim : A.getInDimNames()) {
     retOutDims.push_back({dim, A.getInDimSize(dim)});
   }
-  return retFlattened.reshapeIns(retInDims).reshapeOuts(retOutDims);
+  return {ModularSolveStatus::Success,
+          retFlattened.reshapeIns(retInDims).reshapeOuts(retOutDims)};
 }
 
-LinearLayout LinearLayout::lstsq(const LinearLayout &A, const LinearLayout &B) {
+LinearLayoutSolveResult LinearLayout::lstsq(const LinearLayout &A,
+                                            const LinearLayout &B) {
   // Dispatch to modular solver if needed.
   // Only use the modular solver when A (the layout being inverted) is modular.
   // When only B is modular (e.g., NPOT output dim from msgToPackedOffset) but A
@@ -1348,12 +1350,17 @@ LinearLayout LinearLayout::lstsq(const LinearLayout &A, const LinearLayout &B) {
 
       auto C_pow2 = lstsq(A.sublayout(inDimNames, pow2OutDims),
                           B.sublayout(bInDimNames, pow2OutDims));
+      if (!C_pow2.succeeded())
+        return C_pow2;
+
       auto C_npot = lstsqModular(A.sublayout(inDimNames, npotOutDims),
                                  B.sublayout(bInDimNames, npotOutDims));
+      if (!C_npot.succeeded())
+        return C_npot;
 
       // Combine: OR the per-basis coefficients (disjoint by S=0 decoupling).
-      auto C_pow2_flat = C_pow2.flattenIns().flattenOuts();
-      auto C_npot_flat = C_npot.flattenIns().flattenOuts();
+      auto C_pow2_flat = C_pow2.layout->flattenIns().flattenOuts();
+      auto C_npot_flat = C_npot.layout->flattenIns().flattenOuts();
       StringAttr flatIn = *C_pow2_flat.getInDimNames().begin();
       StringAttr flatOut = *C_pow2_flat.getOutDimNames().begin();
 
@@ -1383,7 +1390,8 @@ LinearLayout LinearLayout::lstsq(const LinearLayout &A, const LinearLayout &B) {
         retInDims.push_back({dim, B.getInDimSize(dim)});
       for (StringAttr dim : inDimNames)
         retOutDims.push_back({dim, A.getInDimSize(dim)});
-      return ret.reshapeIns(retInDims).reshapeOuts(retOutDims);
+      return {ModularSolveStatus::Success,
+              ret.reshapeIns(retInDims).reshapeOuts(retOutDims)};
     }
 
     return lstsqModular(A, B);
@@ -1459,10 +1467,20 @@ LinearLayout LinearLayout::lstsq(const LinearLayout &A, const LinearLayout &B) {
   for (StringAttr dim : A.getInDimNames()) {
     retOutDims.push_back({dim, A.getInDimSize(dim)});
   }
-  return retFlattened.reshapeIns(retInDims).reshapeOuts(retOutDims);
+  return {ModularSolveStatus::Success,
+          retFlattened.reshapeIns(retInDims).reshapeOuts(retOutDims)};
 }
 
 LinearLayout LinearLayout::invertAndCompose(const LinearLayout &outer) const {
+  auto result = tryInvertAndCompose(outer);
+  if (!result.succeeded())
+    llvm::report_fatal_error(
+        "invertAndCompose failed; use tryInvertAndCompose for recovery");
+  return std::move(*result.layout);
+}
+
+LinearLayoutSolveResult
+LinearLayout::tryInvertAndCompose(const LinearLayout &outer) const {
   // TODO(Lezcano) Make friend and perhaps rename to `convertFrom` or `lstsq`
   // For this, we need to implement our LLVM lowerings by inverting the "outer"
   // layout, and then iterating over the elements from the "this" layout and
@@ -1527,7 +1545,13 @@ LinearLayout LinearLayout::invertAndCompose(const LinearLayout &outer) const {
   assert((ANonIdentityInDims.empty()) == (BNonIdentityInDims.empty()));
   bool isEmpty = ANonIdentityInDims.empty();
 
-  auto ret = isEmpty ? LinearLayout::empty() : lstsq(AReduced, BReduced);
+  LinearLayoutSolveResult solve =
+      isEmpty ? LinearLayoutSolveResult{ModularSolveStatus::Success,
+                                        LinearLayout::empty()}
+              : lstsq(AReduced, BReduced);
+  if (!solve.succeeded())
+    return solve;
+  LinearLayout ret = std::move(*solve.layout);
 
   // --- NPOT kernel equivalence fix ---
   //
@@ -1604,8 +1628,9 @@ LinearLayout LinearLayout::invertAndCompose(const LinearLayout &outer) const {
 
   // Reorder the dimensions in the result to match the order expected by the
   // current and outer layouts.
-  return ret.transposeIns(llvm::to_vector(B.getInDimNames()))
-      .transposeOuts(llvm::to_vector(A.getInDimNames()));
+  return {ModularSolveStatus::Success,
+          ret.transposeIns(llvm::to_vector(B.getInDimNames()))
+              .transposeOuts(llvm::to_vector(A.getInDimNames()))};
 }
 
 LinearLayout LinearLayout::invert() const {
@@ -1615,6 +1640,14 @@ LinearLayout LinearLayout::invert() const {
 }
 
 LinearLayout LinearLayout::pseudoinvert() const {
+  auto result = tryPseudoinvert();
+  if (!result.succeeded())
+    llvm::report_fatal_error(
+        "pseudoinvert failed; use tryPseudoinvert for recovery");
+  return std::move(*result.layout);
+}
+
+LinearLayoutSolveResult LinearLayout::tryPseudoinvert() const {
   LinearLayout identity = LinearLayout::empty();
   for (auto outDim : getOutDimNames()) {
     auto size = getOutDimSize(outDim);
@@ -1624,7 +1657,7 @@ LinearLayout LinearLayout::pseudoinvert() const {
       identity *= LinearLayout::modularIdentity1D(size, outDim, outDim);
     }
   }
-  return identity.invertAndCompose(*this);
+  return identity.tryInvertAndCompose(*this);
 }
 
 LinearLayout LinearLayout::squeezeIns(StringAttr dim) const {
