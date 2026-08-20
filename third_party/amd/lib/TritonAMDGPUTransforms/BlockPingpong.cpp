@@ -992,8 +992,7 @@ void Pingponger::getDotPingponged() {
   // pipeline configured to use pingpong. This pass is the marker's sole
   // consumer and always removes it, even when the transform is later rejected;
   // dot count alone cannot distinguish that layout from a single-dot schedule.
-  bool hasTwoDotSchedule =
-      forOp->hasAttr(triton::AMD::AttrTwoDotSchedule);
+  bool hasTwoDotSchedule = forOp->hasAttr(triton::AMD::AttrTwoDotSchedule);
   forOp->removeAttr(triton::AMD::AttrTwoDotSchedule);
 
   if (numStages <= 1) {

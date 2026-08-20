@@ -134,8 +134,12 @@ struct TLXInferLayoutInterface : public triton::DialectInferLayoutInterface {
     if (auto slice = dyn_cast<triton::gpu::SliceEncodingAttr>(result)) {
       auto parent = cast<triton::gpu::DistributedEncodingTrait>(
           wrapNoVerifyLayout(slice.getParent()));
-      resultEncoding = triton::gpu::SliceEncodingAttr::get(
+      auto deferredSlice = triton::gpu::SliceEncodingAttr::get(
           result.getContext(), slice.getDim(), parent);
+      // Keep the slice parent deferred for canonical slice inference, and also
+      // defer verification of the whole result while frontend TTIR has no
+      // ttg.num-warps context yet.
+      resultEncoding = wrapNoVerifyLayout(deferredSlice);
     } else {
       resultEncoding = wrapNoVerifyLayout(result);
     }

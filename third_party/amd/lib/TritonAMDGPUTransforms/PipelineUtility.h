@@ -11,7 +11,7 @@ namespace mlir {
 namespace triton::AMD {
 constexpr char AttrBypassLDS[] = "amdg.bypass_lds_load";
 constexpr char AttrTwoDotSchedule[] = "amdg.two_dot_schedule";
-}
+} // namespace triton::AMD
 
 // This function will
 // - deserialize schedule and numStages from IR.

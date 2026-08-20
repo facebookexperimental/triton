@@ -424,11 +424,12 @@ buildSchedule(scf::ForOp &forOp, int numStages, const LoadToInfoMap &loadToInfo,
 // places the dots one stage apart and double-buffers their respective loads for
 // pingpong.
 // The dot ops will be scheduled with a distance of one and the ops in between
-// will be split into 2 parts. The first part will be scheduled to the same stage
-// as the first dot so it can interleave with the second dot. The second part
-// will be scheduled to the stage of the second dot so it can be interleaved
-// with the first dot. Loads will be double buffered and placed in between the
-// dot/compute clusters. This pipeliner is meant to be used with pingpong.
+// will be split into 2 parts. The first part will be scheduled to the same
+// stage as the first dot so it can interleave with the second dot. The second
+// part will be scheduled to the stage of the second dot so it can be
+// interleaved with the first dot. Loads will be double buffered and placed in
+// between the dot/compute clusters. This pipeliner is meant to be used with
+// pingpong.
 namespace ChainedDotSchedule {
 using namespace mlir::ChainedDotSchedule;
 // We schedule loads one stage in front of their dots

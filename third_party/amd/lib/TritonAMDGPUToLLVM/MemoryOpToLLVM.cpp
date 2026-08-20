@@ -61,6 +61,8 @@ public:
     auto ldsParamsVec = targetInfo.queryLDSTransLoadParams(bitWidth);
     if (ldsParamsVec.empty())
       return failure();
+    if (SharedMemoryObject::getMaskSpanOffsetsAndBlocks(srcTy).second != 0)
+      return failure();
 
     LinearLayout sharedLL;
     if (triton::gpu::isPaddedEncoding(srcTy.getEncoding())) {
@@ -127,6 +129,7 @@ private:
     auto kLane = S("lane");
     auto kWarp = S("warp");
     auto kOffset = S("offset");
+    auto kBlock = S("block");
     auto kAddr = S("addr");
     auto kPartition = S("partition");
     auto smemPtrTy = ptr_ty(ctx, 3);
@@ -247,10 +250,17 @@ private:
                       {kWarp, reps.getBases().lookup(kWarp)}},
                      {{kOffset, reps.getOutDimSize(kOffset)}}, false);
 
+    // Matrix accesses are CTA-local. Model that with a trivial block output so
+    // additive stride analysis always compares (offset, block) components.
+    reps =
+        reps.reshapeOuts({{kOffset, reps.getOutDimSize(kOffset)}, {kBlock, 1}});
+    addrLayout = addrLayout.reshapeOuts(reps.getOutDims());
+
     // Compute the bits that are moved by one instruction
     // Compute elements for which we can swap the xor by an add
     auto [nAdditive, permStrides] = actionAdditiveStrides(
-        reps, addrLayout, maskSpanAffineOffset, fullTile.getInDimSize(kReg));
+        reps, addrLayout, maskSpanAffineOffset, /*maskSpanBlocks=*/0,
+        fullTile.getInDimSize(kReg));
     reps = permStrides.apply(reps);
     if (isPartitioned) {
       partitionLayout = permStrides.apply(partitionLayout);
@@ -557,6 +567,8 @@ private:
     auto kOffset = str_attr("offset");
     auto dstTy = cast<RankedTensorType>(op.getType());
     auto srcTy = cast<MemDescType>(op.getSrc().getType());
+    if (SharedMemoryObject::getMaskSpanOffsetsAndBlocks(srcTy).second != 0)
+      return failure();
     auto llvmElemTy = typeConverter->convertType(dstTy.getElementType());
     auto bitWidth = llvmElemTy.getIntOrFloatBitWidth();
     auto smemObj = LLVM::getSharedMemoryObjectFromStruct(loc, adaptor.getSrc(),
@@ -630,7 +642,8 @@ private:
     SmallVector<Value> outVals = lowerLdSt(
         loc, rewriter.getContext(), cvt, {}, // Input for store, output for load
         llvmElemTy, smemObj.getBase(), paddingShifts, affineOffset,
-        maskSpanAffineOffset, laneId, warpId, rewriter, targetInfo,
+        maskSpanAffineOffset, /*affineBlockOffset=*/Value(),
+        /*maskSpanAffineBlock=*/0, laneId, warpId, rewriter, targetInfo,
         ldsTransLoadParams->tileSize, lowerInst);
     Value result = packLLElements(loc, typeConverter, outVals, rewriter, retTy);
     rewriter.replaceOp(op, result);
@@ -675,13 +688,20 @@ struct LocalAtomicScatterRMWOpConversion
 
     bool returnOld = !op.getResult().use_empty();
 
+    if (llvm::any_of(info.addrs, [](const LocalSharedMemoryAddress &addr) {
+          return bool(addr.ctaId);
+        })) {
+      return rewriter.notifyMatchFailure(
+          op, "cross-CTA shared atomics are not supported on AMDGPU");
+    }
+
     SmallVector<Value> results;
     if (returnOld)
-      results.reserve(info.ptrs.size());
+      results.reserve(info.addrs.size());
 
-    for (auto [i, ptrAndValue] :
-         llvm::enumerate(llvm::zip(info.ptrs, info.values))) {
-      auto [ptr, value] = ptrAndValue;
+    for (auto [i, addrAndValue] :
+         llvm::enumerate(llvm::zip(info.addrs, info.values))) {
+      auto [addr, value] = addrAndValue;
       Value rmwMask = triton::gpu::maybeAnd(
           rewriter, loc, info.threadPred,
           info.maskValues.empty() ? Value() : info.maskValues[i]);
@@ -689,7 +709,7 @@ struct LocalAtomicScatterRMWOpConversion
       if (!rmwMask)
         rmwMask = b.true_val();
 
-      Value old = emitter.emitAtomicRMW(rewriter, ptr, value, rmwMask,
+      Value old = emitter.emitAtomicRMW(rewriter, addr.ptr, value, rmwMask,
                                         /*sharedMemBase=*/std::nullopt,
                                         /*enableIntraWaveReduce=*/false);
       if (returnOld)
@@ -1003,6 +1023,11 @@ public:
     SmallVector<Type> outputTypes;
     std::string constraints;
     constexpr unsigned warpSize = 64;
+    bool hasLiveDependency = llvm::any_of(op.getInputs(), [](Value input) {
+      return !cast<RankedTensorType>(input.getType())
+                  .getElementType()
+                  .isF32();
+    });
     for (auto [source, converted] :
          llvm::zip(op.getInputs(), adaptor.getInputs())) {
       auto tensorTy = cast<RankedTensorType>(source.getType());
@@ -1016,7 +1041,7 @@ public:
             cast<triton::gpu::AMDMfmaEncodingAttr>(tensorTy.getEncoding());
         ArrayRef<unsigned> instr = mfma.getInstrShape();
         registersPerGroup = instr[0] * instr[1] / warpSize;
-        outputConstraint = "=v";
+        outputConstraint = hasLiveDependency ? "=v" : "=a";
       } else {
         auto dot =
             cast<triton::gpu::DotOperandEncodingAttr>(tensorTy.getEncoding());
@@ -1205,13 +1230,18 @@ public:
     auto *ctx = rewriter.getContext();
     auto asmDialect = LLVM::AsmDialectAttr::get(ctx, LLVM::AsmDialect::AD_ATT);
     auto operandAttrs = ArrayAttr::get(ctx, {});
-    std::string mfmaAsmPrefix = instrShape == ArrayRef<unsigned>({32, 32, 16})
-                                    ? "v_mfma_f32_32x32x16_bf16 $0, $1, $2, "
-                                    : "v_mfma_f32_16x16x32_bf16 $0, $1, $2, ";
+    bool isF16 = aTy.getElementType().isF16();
+    bool is32x32 = instrShape == ArrayRef<unsigned>({32, 32, 16});
+    std::string mfmaAsmPrefix =
+        is32x32 ? (isF16 ? "v_mfma_f32_32x32x16_f16 $0, $1, $2, "
+                         : "v_mfma_f32_32x32x16_bf16 $0, $1, $2, ")
+                : (isF16 ? "v_mfma_f32_16x16x32_f16 $0, $1, $2, "
+                         : "v_mfma_f32_16x16x32_bf16 $0, $1, $2, ");
     StringRef mfmaIntrinsicName =
-        instrShape == ArrayRef<unsigned>({32, 32, 16})
-            ? ROCDL::mfma_f32_32x32x16_bf16::getOperationName()
-            : ROCDL::mfma_f32_16x16x32_bf16::getOperationName();
+        is32x32 ? (isF16 ? ROCDL::mfma_f32_32x32x16_f16::getOperationName()
+                         : ROCDL::mfma_f32_32x32x16_bf16::getOperationName())
+                : (isF16 ? ROCDL::mfma_f32_16x16x32_f16::getOperationName()
+                         : ROCDL::mfma_f32_16x16x32_bf16::getOperationName());
     bool useLatencyAwareIntrinsic = op.getAccumulatorRole() == "transient";
 
     SmallVector<Value> updatedFragments(numRepM * numRepN);
@@ -1226,7 +1256,11 @@ public:
         for (int64_t k = 0; k < numRepK; ++k) {
           Value operandA = (*maybeA)[m * numRepK + k];
           Value operandB = (*maybeB)[n * numRepK + k];
-          if (!useLatencyAwareIntrinsic) {
+          // The MFMA inline asm below already constrains ordinary operands to
+          // VGPRs.  Pre-constrain only the resident-operand path, where one
+          // input must be moved to AGPRs before issuing the instruction.
+          if (!useLatencyAwareIntrinsic &&
+              (aStorage == "agpr" || bStorage == "agpr")) {
             FailureOr<Value> constrainedA = constrainMfmaFragmentRegisterClass(
                 operandA, aStorage, rewriter, loc);
             FailureOr<Value> constrainedB = constrainMfmaFragmentRegisterClass(

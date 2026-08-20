@@ -285,15 +285,22 @@ public:
 
   void runOnOperation() override {
     ModuleOp m = getOperation();
-    MLIRContext *context = &getContext();
-
     triton::AMD::TargetInfo targetInfo(gfxArch);
-
-    mlir::RewritePatternSet patterns(context);
 
     if (!llvm::is_contained({ISAFamily::CDNA3, ISAFamily::CDNA4},
                             targetInfo.getISAFamily()))
       return; // This pass is CDNA3 and CDNA4 specific.
+
+    if (!useAsyncCopy) {
+      bool hasAsyncCopy = m->walk([](ttg::AsyncCopyGlobalToLocalOp) {
+                             return WalkResult::interrupt();
+                           }).wasInterrupted();
+      if (!hasAsyncCopy)
+        return;
+    }
+
+    MLIRContext *context = &getContext();
+    mlir::RewritePatternSet patterns(context);
 
     // Precompute the contiguity of all AsyncCopy ops based on the src and
     // mask contiguity/alignment to avoid rebuilding ModuleAxisInfoAnalysis

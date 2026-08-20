@@ -361,7 +361,13 @@ struct WaitBarrierOpConversion
 
 struct ArriveBarrierOpConversion
     : public ConvertOpToLLVMPattern<triton::nvidia_gpu::ArriveBarrierOp> {
-  using ConvertOpToLLVMPattern::ConvertOpToLLVMPattern;
+  const NVIDIA::TargetInfo *targetInfo;
+
+  ArriveBarrierOpConversion(LLVMTypeConverter &typeConverter,
+                            PatternBenefit benefit,
+                            const NVIDIA::TargetInfo &targetInfo)
+      : ConvertOpToLLVMPattern(typeConverter, benefit),
+        targetInfo(&targetInfo) {}
 
   LogicalResult
   matchAndRewrite(triton::nvidia_gpu::ArriveBarrierOp op, OpAdaptor adaptor,
@@ -435,42 +441,60 @@ struct ArriveBarrierOpConversion
       Value barrierPtr = LLVM::NVIDIA::getLeaderAddress(
           loc, rewriter, smemObj.getBase(), barrierTy);
 
-      std::stringstream ptxAsm;
-      ptxAsm << "@$0 mbarrier.arrive.";
-      if (op.isMulticast() || isRemoteBarrier)
-        ptxAsm << "release.cluster.";
-      ptxAsm << (isRemoteBarrier || isCrossCluster || op.isMulticast()
-                     ? "shared::cluster"
-                     : "shared::cta");
-      if (op.isMulticast())
-        ptxAsm << ".multicast::cluster::32b";
-      ptxAsm << ".b64 _, [$1]";
-      if (op.getCount() > 1) {
-        ptxAsm << ", " << op.getCount();
-      }
-      if (op.isMulticast())
-        ptxAsm << ", $2";
-      ptxAsm << ";";
-
       Value id = getThreadId(rewriter, loc);
       Value pred = b.icmp_eq(id, b.i32_val(0));
       if (op.getPred())
         pred = b.and_(pred, adaptor.getPred());
 
-      PTXBuilder ptxBuilder;
-      SmallVector<PTXBuilder::Operand *, 3> operands = {
-          ptxBuilder.newOperand(pred, "b"),
-          ptxBuilder.newOperand(barrierPtr, "r")};
-      if (op.isMulticast()) {
+      auto emitArrive = [&](Value targetBarrier, Value multicastMask = {}) {
+        std::stringstream ptxAsm;
+        ptxAsm << "@$0 mbarrier.arrive.";
+        if (op.isMulticast() || isRemoteBarrier)
+          ptxAsm << "release.cluster.";
+        ptxAsm << (isRemoteBarrier || isCrossCluster || op.isMulticast()
+                       ? "shared::cluster"
+                       : "shared::cta");
+        if (multicastMask)
+          ptxAsm << ".multicast::cluster::32b";
+        ptxAsm << ".b64 _, [$1]";
+        if (op.getCount() > 1)
+          ptxAsm << ", " << op.getCount();
+        if (multicastMask)
+          ptxAsm << ", $2";
+        ptxAsm << ";";
+
+        PTXBuilder ptxBuilder;
+        SmallVector<PTXBuilder::Operand *, 3> operands = {
+            ptxBuilder.newOperand(pred, "b"),
+            ptxBuilder.newOperand(targetBarrier, "r")};
+        if (multicastMask)
+          operands.push_back(ptxBuilder.newOperand(multicastMask, "r"));
+        auto arriveOp = *ptxBuilder.create<>(ptxAsm.str());
+        arriveOp(operands, /*onlyAttachMLIRArgs=*/true);
+        ptxBuilder.launch(rewriter, loc, void_ty(getContext()));
+      };
+
+      if (op.isMulticast() && targetInfo->supportsMbarrierMulticast()) {
         Value mask = LLVM::NVIDIA::createTMAMulticastMask(
             loc, rewriter, static_cast<uint16_t>(op.getCtaMask()));
-        operands.push_back(ptxBuilder.newOperand(mask, "r"));
+        emitArrive(barrierPtr, mask);
+      } else if (op.isMulticast()) {
+        Value barrierInt = b.ptrtoint(i32_ty, barrierPtr);
+        uint32_t broadcastMask = op.getCtaMask();
+        uint32_t ctaOffset = broadcastMask;
+        while (true) {
+          Value targetBarrierInt =
+              b.xor_(barrierInt, b.i32_val(ctaOffset << 24));
+          Value targetBarrier =
+              b.inttoptr(barrierPtr.getType(), targetBarrierInt);
+          emitArrive(targetBarrier);
+          if (ctaOffset == 0)
+            break;
+          ctaOffset = (ctaOffset - 1) & broadcastMask;
+        }
+      } else {
+        emitArrive(barrierPtr);
       }
-
-      auto arriveOp = *ptxBuilder.create<>(ptxAsm.str());
-      arriveOp(operands, /*onlyAttachMLIRArgs=*/true);
-      auto voidTy = void_ty(getContext());
-      ptxBuilder.launch(rewriter, loc, voidTy);
     }
 
     rewriter.eraseOp(op);
@@ -872,7 +896,7 @@ void mlir::triton::NVIDIA::populateBarrierOpToLLVMPatterns(
       typeConverter, benefit, targetInfo);
   patterns.add<WaitBarrierOpConversion>(typeConverter, benefit, targetInfo);
   patterns.add<BarrierExpectConversion>(typeConverter, benefit);
-  patterns.add<ArriveBarrierOpConversion>(typeConverter, benefit);
+  patterns.add<ArriveBarrierOpConversion>(typeConverter, benefit, targetInfo);
   // Meta Triton CLC + named-barrier + vote-ballot patterns
   patterns.add<NamedBarrierArriveOpConversion>(typeConverter, benefit);
   patterns.add<NamedBarrierWaitOpConversion>(typeConverter, benefit);

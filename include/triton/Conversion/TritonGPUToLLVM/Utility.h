@@ -444,15 +444,21 @@ public:
   // The offsets are considered to be in the type of the memdesc.
   // For padded layouts, we return the offsets without padding.
   static uint64_t getMaskSpanOffsets(triton::gpu::MemDescType srcTy);
+  static std::pair<uint64_t, uint64_t>
+  getMaskSpanOffsetsAndBlocks(triton::gpu::MemDescType srcTy);
 
   // Returns whether the shared memory access had a memdesc_subslice
   // that is rank-preserving (soon to be called memdesc_slice)
   static bool isAffineSharedMemoryAccess(triton::gpu::MemDescType srcTy) {
-    return getMaskSpanOffsets(srcTy) != 0;
+    auto [offsetMask, blockMask] = getMaskSpanOffsetsAndBlocks(srcTy);
+    return offsetMask != 0 || blockMask != 0;
   }
 
   Value getShmemOffset(Location loc, RewriterBase &rewriter,
                        triton::gpu::MemDescType srcTy) const;
+  std::pair<Value, Value>
+  getShmemOffsetAndBlock(Location loc, RewriterBase &rewriter,
+                         triton::gpu::MemDescType srcTy) const;
   Value getShmemAffineBase(Location loc, RewriterBase &rewriter,
                            triton::gpu::MemDescType srcTy) const;
 
@@ -658,7 +664,7 @@ struct LocalAtomicScatterRMWInfo {
   Value threadPred;
   SmallVector<Value> values;
   SmallVector<Value> maskValues;
-  SmallVector<Value> ptrs;
+  SmallVector<LocalSharedMemoryAddress> addrs;
 };
 
 FailureOr<LocalAtomicScatterRMWInfo> prepareLocalAtomicScatterRMW(
@@ -689,7 +695,8 @@ SmallVector<Value> lowerLdStShared(
     ArrayRef<Value> valsArray, // Input for store, output for load
     Type llvmElemTy, ArrayRef<Value> smemBases,
     ArrayRef<std::pair<unsigned, unsigned>> paddingShifts, Value affineOffset,
-    uint64_t maskSpanAffineOffset, RewriterBase &rewriter,
+    uint64_t maskSpanAffineOffset, Value affineBlockOffset,
+    uint64_t maskSpanAffineBlock, RewriterBase &rewriter,
     const TargetInfoBase &targetInfo, std::optional<int> maybeMaxVecElems = {},
     Operation *localLoadOp = nullptr, std::optional<Value> ctaRank = {},
     std::optional<Value> barrierPtr = {},
@@ -707,7 +714,8 @@ SmallVector<Value> lowerLdSt(
     ArrayRef<Value> valsArray, // Input for store, output for load
     Type llvmElemTy, ArrayRef<Value> smemBases,
     ArrayRef<std::pair<unsigned, unsigned>> paddingShifts, Value affineOffset,
-    uint64_t maskSpanAffineOffset, Value laneId, Value warpId,
+    uint64_t maskSpanAffineOffset, Value affineBlockOffset,
+    uint64_t maskSpanAffineBlock, Value laneId, Value warpId,
     RewriterBase &rewriter, const TargetInfoBase &targetInfo,
     std::optional<int> maybeMaxVecElems,
     std::function<SmallVector<Value>(RewriterBase &, Location, ArrayRef<Value>,

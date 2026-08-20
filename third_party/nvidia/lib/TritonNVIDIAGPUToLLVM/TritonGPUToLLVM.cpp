@@ -100,6 +100,12 @@ struct ConvertTritonGPUToLLVM
                          bool enableConcurrencySanitizer)
       : ConvertTritonGPUToLLVMBase(
             {computeCapability, ptxVersion, enableConcurrencySanitizer}) {}
+  ConvertTritonGPUToLLVM(int32_t computeCapability, int32_t ptxVersion,
+                         bool enableConcurrencySanitizer,
+                         bool enableTreeReduction)
+      : ConvertTritonGPUToLLVMBase({computeCapability, ptxVersion,
+                                    enableConcurrencySanitizer,
+                                    enableTreeReduction}) {}
 
   void runOnOperation() override {
     MLIRContext *context = &getContext();
@@ -178,8 +184,8 @@ struct ConvertTritonGPUToLLVM
     populateLoadStoreOpToLLVMPatterns(typeConverter, targetInfo,
                                       computeCapability, patterns,
                                       axisInfoAnalysis, benefit);
-    mlir::triton::populateReduceOpToLLVMPatterns(typeConverter, patterns,
-                                                 targetInfo, benefit);
+    mlir::triton::populateReduceOpToLLVMPatternsWithOptions(
+        typeConverter, patterns, targetInfo, benefit, enableTreeReduction);
     mlir::triton::populateScanOpToLLVMPatterns(typeConverter, patterns,
                                                targetInfo, benefit);
     mlir::triton::populateGatherOpToLLVMPatterns(typeConverter, patterns,
@@ -553,6 +559,15 @@ createConvertTritonGPUToLLVMPass(int32_t computeCapability, int32_t ptxVersion,
                                  bool enableConcurrencySanitizer) {
   return std::make_unique<ConvertTritonGPUToLLVM>(computeCapability, ptxVersion,
                                                   enableConcurrencySanitizer);
+}
+
+std::unique_ptr<OperationPass<ModuleOp>>
+createConvertTritonGPUToLLVMPass(int32_t computeCapability, int32_t ptxVersion,
+                                 bool enableConcurrencySanitizer,
+                                 bool enableTreeReduction) {
+  return std::make_unique<ConvertTritonGPUToLLVM>(computeCapability, ptxVersion,
+                                                  enableConcurrencySanitizer,
+                                                  enableTreeReduction);
 }
 
 bool NVIDIA::canSkipBarSync(Operation *before, Operation *after,

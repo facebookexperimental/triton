@@ -409,6 +409,10 @@ Binary wheels are available for CPython 3.10-3.14.
 
    The operation returns a token object which can be used to track the completion of the operation.
 
+   **MI350X caveat:** When `mask` is provided, callers should also provide `other`—typically `0.0` for numerical kernels. Elements for which `mask=True` are copied from global memory into the destination local buffer. For elements where `mask=False`, `other` is written only if it is provided. Otherwise, the corresponding LDS locations retain unspecified, potentially stale contents from an earlier use of the buffer.
+
+   For example, in FlashAttention, when the sequence length is not a multiple of `BLOCK_N`, the final `V` tile contains masked-out rows. If `other` is omitted, those rows may contain unspecified values, including bit patterns representing NaN or infinity. These values can propagate through the subsequent matrix multiplication and produce incorrect output. Use `other=0.0` for such padded tiles.
+
 
 - `tlx.async_load_commit_group(tokens)` **[Hopper+, MI350]**
 
@@ -810,9 +814,33 @@ Examples: how mbarriers are communicated in warp specialization
 |-----------|-------------|
 | `"default"` | First positional argument to mark this as the default/trunk task |
 | `num_warps` | Number of warps to reserve for this task |
-| `num_regs` | Number of registers per thread (optional, for register allocation tuning). When provided, it must be divisible by 8. |
+| `num_regs` | Number of registers per thread (optional, for register allocation tuning). It is supported by both default and non-default tasks and must be divisible by 8. |
 | `replicate` | Number of replicas for this task (default: 1). Creates multiple copies of the task region |
 | `warp_group_start_id` | Starting warp ID for this task (optional). Allows explicit control over warp assignment |
+
+#### Default Task Register Budget
+
+Register budgets are specified per thread. When the default task does not set
+`num_regs`, register allocation keeps the original donation model: non-default
+warp groups receive their requested budgets, and the default task receives the
+remaining registers.
+
+Setting `num_regs` on the default task selects a fixed budget instead:
+
+```python
+with tlx.async_tasks():
+    with tlx.async_task("default", num_regs=80):
+        ...
+    with tlx.async_task(num_warps=4, num_regs=24):
+        ...
+```
+
+In this example, the default and non-default tasks receive 80 and 24 registers
+per thread, respectively. The default task does not absorb unused registers.
+Non-default warp groups without an explicit budget evenly share the remaining
+register pool. If every task has a fixed budget, any surplus is left unused.
+The compiler may raise a request to the hardware or instrumentation safety
+minimum when required.
 
 #### Explicit Warp Assignment with warp_group_start_id
 
@@ -1277,39 +1305,40 @@ phases. Neither role changes the numerical matrix operation.
 
 ## AMD TDM Descriptor Loads
 
-`tlx.async_amd_descriptor_load(desc, result, offsets, pred=None)` issues an AMD
-TDM descriptor load from global memory to a TLX local buffer. It is available on
-TDM-capable AMD targets (`gfx1250+`) and should be synchronized with
+`tlx.update_tensor_descriptor(desc, add_offsets=None, set_bounds=None,
+pred=None, clamp_bounds=False)` produces a positioned descriptor SSA value.
+`add_offsets` advances the tile position without changing bounds;
+`set_bounds` rewrites absolute bounds; and `pred` replaces the inherited
+predicate. Use `clamp_bounds=True` with `add_offsets` to derive the remaining
+OOB extent of an advanced tile.
+
+`tlx.async_amd_descriptor_load(desc, result, offsets=None, pred=None,
+clamp_bounds=True)` issues an AMD TDM descriptor load from global memory to a
+TLX local buffer. If `offsets` is omitted, `desc` is used as already positioned
+and its predicate is preserved. The analogous store accepts `offsets=None` for
+the same reason. Both operations are available on TDM-capable AMD targets
+(`gfx1250+`) and should be synchronized with
 `tlx.async_amd_descriptor_wait`.
 
-`tlx.async_amd_descriptor_load_group(descs, results, offsets, warp_masks,
-preds=None)` groups multiple AMD TDM descriptor loads behind one static hardware
-TDM instruction. Each list entry is one arm:
-
-| Argument | Description |
-|----------|-------------|
-| `descs[i]` | Tensor descriptor for arm `i`. |
-| `results[i]` | Local buffer or local view receiving arm `i`. |
-| `offsets[i]` | Offset list for arm `i`; all arms must have the same rank. |
-| `warp_masks[i]` | Bitmask selecting the waves that use arm `i`. |
-| `preds[i]` | Optional predicate for arm `i`; defaults to true. |
-
-The warp masks must be non-empty, disjoint, axis-aligned, and cover all waves in
-the CTA exactly once. The grouped operation currently requires one CTA, the same
-rank and element bitwidth for every arm, one shared cache modifier, and shared
-layouts supported by AMD TDM lowering. This is useful for kernels where
-different wave groups load different inputs, such as A/B GEMM tiles or A/B plus
-scale tiles in MXFP GEMM, while keeping the assembly to one TDM instruction per
-load group.
+`tlx.async_amd_descriptor_load_fused(members, cache_modifier="")` fuses two to
+four AMD TDM descriptor loads behind one static hardware instruction. Each
+member is a `(positioned_desc, destination, warp_used_hint)` tuple. Position
+descriptors with `tlx.update_tensor_descriptor` before issuing the fused load.
+The hints must be non-empty, pairwise disjoint, and legal axis-aligned subsets
+of the CTA's waves; they do not need to cover every wave. Members must have the
+same descriptor rank but may have different shapes and element types. All
+members share one cache modifier.
 
 Example:
 ```python
-a_tok = tlx.async_amd_descriptor_load_group(
-    [a_desc, b_desc],
-    [tlx.local_view(a_buf, slot), tlx.local_view(b_buf, slot)],
-    [[off_m, k * BLOCK_K], [k * BLOCK_K, off_n]],
-    [0b0011, 0b1100],
-)
+a_load_desc = tlx.update_tensor_descriptor(
+    a_desc, add_offsets=[off_m, k * BLOCK_K], pred=True, clamp_bounds=True)
+b_load_desc = tlx.update_tensor_descriptor(
+    b_desc, add_offsets=[k * BLOCK_K, off_n], pred=True, clamp_bounds=True)
+a_tok = tlx.async_amd_descriptor_load_fused([
+    (a_load_desc, tlx.local_view(a_buf, slot), 0b0011),
+    (b_load_desc, tlx.local_view(b_buf, slot), 0b1100),
+])
 tlx.async_amd_descriptor_wait(0, [a_tok])
 ```
 

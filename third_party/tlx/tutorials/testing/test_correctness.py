@@ -78,6 +78,14 @@ from triton.language.extra.tlx.tutorials.amd_gemm_warp_pipeline import (
     matmul as _amd_gemm_warp_pipeline, )
 from triton.language.extra.tlx.tutorials.amd_gemm_pipelined import (
     matmul as _amd_gemm_pipelined, )
+from triton.language.extra.tlx.tutorials.amd_gemm_gfx942 import (
+    matmul as _amd_gemm_gfx942, )
+from triton.language.extra.tlx.tutorials.amd_addmm_gfx942 import (
+    addmm as _amd_addmm_gfx942, )
+from triton.language.extra.tlx.tutorials.amd_bmm_gfx942 import (
+    bmm as _amd_bmm_gfx942,
+    make_bmm_inputs as _amd_bmm_gfx942_inputs,
+)
 from triton.language.extra.tlx.tutorials.gfx9_gemm.inter_wave.a16w16.matmul_kernel_split_m import (
     matmul as _amd_gemm_pingpong, )
 from triton.language.extra.tlx.tutorials.amd_bmm import (
@@ -94,6 +102,7 @@ from triton.language.extra.tlx.tutorials.amd_addmm_glu import (
     M as _amd_addmm_glu_M,
     N as _amd_addmm_glu_N,
 )
+from triton.language.extra.tlx.tutorials.amd_addmm_gfx950 import addmm as _amd_addmm
 from triton.language.extra.tlx.tutorials import amd_hstu_attn as _hstu
 from triton.tools.mxfp import MXScaleTensor
 
@@ -113,7 +122,8 @@ from triton.language.extra.tlx.tutorials.testing.multi_cta_layer_norm import (
     multi_cta_layernorm_2d as _multi_cta_layernorm_2d,
 )
 
-from triton._internal_testing import is_blackwell, is_hopper, is_hopper_or_newer, is_hip, is_hip_cdna4, is_hip_gfx1250
+from triton._internal_testing import (is_blackwell, is_hopper, is_hopper_or_newer, is_hip, is_hip_cdna3, is_hip_cdna4,
+                                      is_hip_gfx1250)
 from triton.language.extra.tlx.tutorials.testing.gemm_shapes import (
     BLACKWELL_GEMM_WS as _BLACKWELL_GEMM_WS_MORE_SHAPES, )
 
@@ -639,13 +649,11 @@ def test_blackwell_gemm_ws_mxfp8_2cta_64_columns_odd_m_tiles():
 @pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell GPU")
 def test_blackwell_gemm_ws_mxfp8_2cta_tall_short_k():
     config = Mxfp8Gemm.CONFIG_2CTA.copy()
-    config.update(
-        {
-            "GROUP_SIZE_M": 4,
-            "NUM_SMEM_BUFFERS": 4,
-            "EPILOGUE_SUBTILE": 1,
-        }
-    )
+    config.update({
+        "GROUP_SIZE_M": 4,
+        "NUM_SMEM_BUFFERS": 4,
+        "EPILOGUE_SUBTILE": 1,
+    })
     Mxfp8Gemm.run_test((512, 256, 256), config=config)
 
 
@@ -1204,10 +1212,8 @@ def test_blackwell_fa_ws_pipelined_persistent_mxfp8_bwd(Z, H, N_CTX, causal):
 
     triton.set_allocator(alloc_fn)
 
-    num_sms = torch.cuda.get_device_properties("cuda").multi_processor_count
     fwd_grid = (
-        min(num_sms,
-            triton.cdiv(N_CTX, fwd_config["BLOCK_M"]) * Z * H),
+        triton.cdiv(N_CTX, fwd_config["BLOCK_M"]) * Z * H,
         1,
         1,
     )
@@ -1690,6 +1696,63 @@ def test_amd_gemm_pipelined(dtype):
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
+@pytest.mark.skipif(not is_hip_cdna3(), reason="Requires gfx942 hardware (MI300X / CDNA3)")
+def test_amd_gemm_gfx942(dtype):
+    # Autotuned kernel: no fixed config (config=None).
+    Gemm.run_test(_amd_gemm_gfx942, None, dtype=dtype)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
+@pytest.mark.parametrize("bias_shape", ["1d", "2d"])
+@pytest.mark.skipif(not is_hip_cdna3(), reason="Requires gfx942 hardware (MI300X / CDNA3)")
+def test_amd_addmm_gfx942(bias_shape, dtype):
+    # Covers both bias layouts: 1-D (N,) broadcast down the rows (stride_biasm == 0,
+    # the Linear case) and a full (M, N).
+    for M, N, K in [(1024, 1024, 1024), (4096, 4096, 4096), (255, 129, 130)]:
+        torch.manual_seed(0)
+        a = (torch.randn((M, K), device=DEVICE, dtype=dtype) + 1) / K
+        b = (torch.randn((K, N), device=DEVICE, dtype=dtype) + 1) / K
+        bias = torch.randn((N, ) if bias_shape == "1d" else (M, N), device=DEVICE, dtype=dtype)
+        torch.testing.assert_close(_amd_addmm_gfx942(bias, a, b), torch.addmm(bias, a, b))
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
+@pytest.mark.skipif(not is_hip_cdna3(), reason="Requires gfx942 hardware (MI300X / CDNA3)")
+def test_amd_bmm_gfx942(dtype):
+    # Shared-A (a.stride(0) == 0) is the benchmark convention; the odd shape also
+    # exercises the M/N wraparound and the partial K tile.
+    for M, N, K, B in [(256, 256, 256, 8), (512, 512, 512, 16), (255, 129, 130, 4)]:
+        a, b = _amd_bmm_gfx942_inputs(B, M, N, K, DEVICE, dtype=dtype)
+        # make_bmm_inputs yields unscaled randn, so the accumulator grows like
+        # sqrt(K) and a different summation order than torch.bmm's costs more
+        # than the default 1e-5 atol allows -- measured worst case here is one
+        # element in 4.2M off by 1.5e-5 (3.3e-3 relative). The gfx950 sibling
+        # uses 2e-2/2e-2 for the same reason; this is an order tighter.
+        torch.testing.assert_close(_amd_bmm_gfx942(a, b), torch.bmm(a, b), atol=1e-3, rtol=1e-2)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
+@pytest.mark.skipif(not is_hip_cdna3(), reason="Requires gfx942 hardware (MI300X / CDNA3)")
+def test_amd_bmm_gfx942_distinct_a(dtype):
+    # Distinct per-batch A, i.e. a non-zero batch stride on both operands.
+    B, M, N, K = 8, 256, 256, 256
+    torch.manual_seed(0)
+    a = (torch.randn((B, M, K), device=DEVICE, dtype=dtype) + 1) / K
+    b = (torch.randn((B, K, N), device=DEVICE, dtype=dtype) + 1) / K
+    torch.testing.assert_close(_amd_bmm_gfx942(a, b), torch.bmm(a, b))
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
+@pytest.mark.skipif(not is_hip_cdna3(), reason="Requires gfx942 hardware (MI300X / CDNA3)")
+def test_amd_gemm_gfx942_odd_shapes(dtype):
+    # M/N wraparound + masked store, and a partial K tile -- none of which the
+    # block-aligned Gemm.SHAPES exercise. Small shapes also make the autotuner
+    # prune down to the narrow tiles, covering that path.
+    shapes = [(255, 129, 130), (1000, 1000, 200), (64, 64, 4096), (3000, 500, 700)]
+    Gemm.run_test(_amd_gemm_gfx942, None, shapes=shapes, dtype=dtype)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires AMD gfx950 (CDNA4)")
 def test_amd_bmm(dtype):
     # a16w16 batched GEMM (col-major B). Covers both load paths of the single kernel:
@@ -1747,6 +1810,51 @@ def test_amd_mxfp_gemm_tdm_pipelined(TRANSPOSE_B):
     config["TRANSPOSE_B"] = TRANSPOSE_B
     out = _amd_mxfp_gemm_tdm_pipelined(a_d, b_d, a_scale.to(DEVICE), b_scale.to(DEVICE), config=config)
     torch.testing.assert_close(out.cpu(), ref, rtol=1e-5, atol=2e-2)
+
+
+# =============================================================================
+# AMD addmm Tests (gfx950)
+# =============================================================================
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
+@pytest.mark.parametrize("bias_2d,split_k", [(False, 1), (True, 2)], ids=["1d-direct", "2d-split-k"])
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware (CDNA4)")
+def test_amd_standalone_addmm(dtype, bias_2d, split_k):
+    M, N, K = 256, 256, 2048
+    torch.manual_seed(0)
+    a = (torch.randn(M, K, device=DEVICE, dtype=dtype) + 1) / K
+    b = ((torch.randn(N, K, device=DEVICE, dtype=dtype) + 1) / K).T
+    bias_shape = (1, N) if bias_2d else (N, )
+    bias = torch.randn(bias_shape, device=DEVICE, dtype=dtype)
+
+    out = _amd_addmm(bias, a, b, SPLIT_K=split_k)
+    ref = torch.addmm(bias, a, b)
+    torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize(
+    "M,N,K",
+    [
+        pytest.param(1024, 896, 1840, id="1024x896x1840"),
+        pytest.param(1024, 896, 24, id="1024x896x24"),
+        pytest.param(1024, 896, 104, id="1024x896x104"),
+        pytest.param(1024, 1536, 2048, id="1024x1536x2048"),
+        pytest.param(1024, 6144, 512, id="1024x6144x512"),
+        pytest.param(7000, 256, 256, id="7000x256x256"),
+        pytest.param(32768, 256, 256, id="32768x256x256"),
+    ],
+)
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware (CDNA4)")
+def test_amd_standalone_addmm_stock_triton_shapes(M, N, K):
+    torch.manual_seed(0)
+    a = (torch.randn(M, K, device=DEVICE, dtype=torch.float16) + 1) / K
+    b = ((torch.randn(N, K, device=DEVICE, dtype=torch.float16) + 1) / K).T
+    bias = torch.randn(N, device=DEVICE, dtype=torch.float16)
+
+    out = _amd_addmm(bias, a, b)
+    ref = torch.addmm(bias, a, b)
+    torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
 
 
 # =============================================================================

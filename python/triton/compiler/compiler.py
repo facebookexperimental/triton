@@ -100,7 +100,7 @@ class IRSource:
         path = Path(path)
         self.ext = path.suffix[1:]
         self.language = Language.TRITON
-        self.src = path.read_text()
+        self.src = path.read_text(encoding="utf-8")
         ir.load_dialects(context)
         backend.load_dialects(context)
 
@@ -150,7 +150,7 @@ def parse(full_name, ext, context):
         module.context = context
         return module
     if ext == "llir" or ext == "ptx" or ext == "amdgcn":
-        return Path(full_name).read_text()
+        return Path(full_name).read_text(encoding="utf-8")
     if ext == "cubin" or ext == "hsaco":
         return Path(full_name).read_bytes()
 
@@ -522,7 +522,7 @@ class CompiledKernel:
     def __init__(self, src, metadata_group, hash):
         from collections import namedtuple
         metadata_path = next((Path(p) for c, p in metadata_group.items() if c.endswith(".json")))
-        metadata = json.loads(metadata_path.read_text())
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
         if metadata.get('ctas_per_cga') is not None:
             metadata['ctas_per_cga'] = tuple(metadata['ctas_per_cga'])
         if metadata.get('preferred_ctas_per_cga') is not None:
@@ -541,7 +541,8 @@ class CompiledKernel:
         asm_files = [Path(p) for c, p in metadata_group.items() if not c.endswith(".json")]
         binary_ext = backend.binary_ext
         self.asm = AsmDict({
-            file.suffix[1:]: file.read_bytes() if file.suffix[1:] == binary_ext else file.read_text()
+            file.suffix[1:]:
+            file.read_bytes() if file.suffix[1:] == binary_ext else file.read_text(encoding="utf-8")
             for file in asm_files
         })
         self.metadata_group = metadata_group

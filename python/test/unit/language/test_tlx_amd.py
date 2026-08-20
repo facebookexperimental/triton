@@ -25,6 +25,7 @@ from triton.compiler.compiler import ASTSource, compile as triton_compile
 from triton.compiler.errors import CompilationError
 from triton.backends.amd import compiler as amd_compiler
 from triton.backends.compiler import GPUTarget
+from triton.runtime.jit import MockTensor
 from triton.language.extra.tlx.tutorials.amd_tdm_gemm_pipelined import (
     matmul_tdm_pipelined_kernel as _amd_tdm_gemm_kernel, )
 from triton.language.extra.tlx.tutorials.amd_mxfp_gemm_tdm_pipelined import (
@@ -36,7 +37,22 @@ from triton.language.extra.tlx.tutorials.gfx9_gemm.intra_wave.a4w4.bench import 
     torch_reference as _a4w4_reference,
 )
 from triton.language.extra.tlx.tutorials.gfx9_gemm.inter_wave.a4w4.matmul_kernel import (
-    matmul as _a4w4_inter_wave_matmul, )
+    BLOCK_K as _A4W4_INTER_WAVE_BLOCK_K,
+    BLOCK_M as _A4W4_INTER_WAVE_BLOCK_M,
+    BLOCK_N as _A4W4_INTER_WAVE_BLOCK_N,
+    MIN_K as _A4W4_INTER_WAVE_MIN_K,
+    _a4w4_8wave_kernel as _a4w4_inter_wave_256tile_kernel,
+    _a4w4_8wave_merged_scales_kernel as _a4w4_inter_wave_merged_scales_kernel,
+    _a4w4_8wave_preshuffled_scales_kernel as _a4w4_inter_wave_preshuffled_scales_kernel,
+    _A4W4_8WAVE_LLVM_FN_ATTRS,
+    matmul as _a4w4_inter_wave_matmul,
+    matmul_merged_scales as _a4w4_inter_wave_matmul_merged_scales,
+    matmul_preshuffled as _a4w4_inter_wave_matmul_preshuffled,
+    preshuffle_mxfp4_a_scales as _preshuffle_a4w4_a_scales,
+    preshuffle_mxfp4_b_scales as _preshuffle_a4w4_b_scales,
+    preshuffle_mxfp4_scales as _preshuffle_a4w4_scales,
+    select_matmul_path as _select_a4w4_inter_wave_path,
+)
 
 # Skip the entire module if no HIP runtime is available.
 pytestmark = pytest.mark.skipif(not is_hip(), reason="Requires HIP runtime")
@@ -46,6 +62,22 @@ GFX942 = GPUTarget("hip", "gfx942", 64)
 GFX1250 = GPUTarget("hip", "gfx1250", 32)
 
 
+def test_amd_ttgir_schedule_env_is_cache_keyed_and_overridable(monkeypatch):
+    backend = amd_compiler.HIPBackend(GFX950)
+    monkeypatch.delenv("TRITON_AMD_TTGIR_SCHEDULE", raising=False)
+    baseline = backend.parse_options({})
+
+    monkeypatch.setenv("TRITON_AMD_TTGIR_SCHEDULE", "1")
+    env_enabled = backend.parse_options({})
+    config_disabled = backend.parse_options({"enable_sched_group_barrier_scheduler": False})
+
+    assert not baseline.enable_sched_group_barrier_scheduler
+    assert env_enabled.enable_sched_group_barrier_scheduler
+    assert env_enabled.hash() != baseline.hash()
+    assert not config_disabled.enable_sched_group_barrier_scheduler
+    assert config_disabled.hash() == baseline.hash()
+
+
 def test_amd_regalloc_codegen_options_are_cache_keyed():
     baseline = amd_compiler.HIPOptions(arch="gfx950")
     tuned = amd_compiler.HIPOptions(
@@ -53,6 +85,7 @@ def test_amd_regalloc_codegen_options_are_cache_keyed():
         reverse_local_assignment=True,
         sink_insts_to_avoid_spills=True,
         regclass_priority_trumps_globalness=True,
+        disable_unclustered_high_rp_reschedule=True,
     )
 
     assert tuned.hash() != baseline.hash()
@@ -61,7 +94,27 @@ def test_amd_regalloc_codegen_options_are_cache_keyed():
         "greedy-reverse-local-assignment",
         "sink-insts-to-avoid-spills",
         "greedy-regclass-priority-trumps-globalness",
+        "amdgpu-disable-unclustered-high-rp-reschedule",
     ]
+
+
+def test_amd_sched_group_barrier_options_are_cache_keyed_and_validated():
+    baseline = amd_compiler.HIPOptions(arch="gfx950")
+    tuned = amd_compiler.HIPOptions(
+        arch="gfx950",
+        enable_sched_group_barrier_scheduler=True,
+        sched_group_barrier_mfma_per_dwordx4=2,
+        sched_group_barrier_required_region_count=4,
+    )
+
+    assert tuned.hash() != baseline.hash()
+    assert tuned.enable_sched_group_barrier_scheduler
+    assert tuned.sched_group_barrier_mfma_per_dwordx4 == 2
+    assert tuned.sched_group_barrier_required_region_count == 4
+    with pytest.raises(ValueError, match="sched_group_barrier_mfma_per_dwordx4 must be positive"):
+        amd_compiler.HIPOptions(arch="gfx950", sched_group_barrier_mfma_per_dwordx4=0)
+    with pytest.raises(ValueError, match="sched_group_barrier_required_region_count must be non-negative"):
+        amd_compiler.HIPOptions(arch="gfx950", sched_group_barrier_required_region_count=-1)
 
 
 def compile_for_target(fn, signature, constexprs, target):
@@ -355,13 +408,16 @@ def test_pinned_buffer_load_layout_survives_optimization_gfx950():
     assert amdgcn.count("v_permlane16_swap_b32") == 16
 
 
-def test_gqa_oversized_batches_rebase_buffer_offsets_gfx950():
+@pytest.mark.parametrize("causal", [False, True], ids=["full", "causal"])
+def test_gqa_oversized_batches_rebase_buffer_offsets_gfx950(causal):
     from triton.language.extra.tlx.tutorials.amd_fa_bwd import (
         _attn_bwd_dkdv_dq_d128_gqa_kernel, )
 
     # At N=16384 and D=128, 512 BF16 heads exactly fill the signed 32-bit
     # byte-offset range; 520 exercises the per-tile 64-bit pointer rebasing
     # path without allocating multi-gigabyte test tensors.
+    block_m = 16
+    block_n = 256
     compiled = compile_for_gfx950(
         _attn_bwd_dkdv_dq_d128_gqa_kernel,
         signature={
@@ -377,15 +433,32 @@ def test_gqa_oversized_batches_rebase_buffer_offsets_gfx950():
         },
         constexprs={
             "SM_SCALE": 0.125,
+            "IS_CAUSAL": causal,
             "HQ": 520,
             "HK": 520,
             "N": 16384,
             "D": 128,
-            "BLOCK_M": 16,
-            "BLOCK_N": 256,
+            "BLOCK_M": block_m,
+            "BLOCK_N": block_n,
         },
     )
 
+    ttir = compiled.asm["ttir"]
+    ttgir = compiled.asm["ttgir"]
+    dummy_clamps = re.findall(r"arith\.maxsi %dq_step, (?P<floor>%[\w_]+)", ttir)
+    assert len(dummy_clamps) == 1
+    if causal:
+        assert dummy_clamps[0] != "%c0_i32"
+        first_active_stride = block_n // block_m
+        assert re.search(
+            rf"^\s*{re.escape(dummy_clamps[0])} = arith\.muli "
+            rf"%pid_n(?:_\d+)?, %c{first_active_stride}_i32",
+            ttir,
+            re.MULTILINE,
+        )
+    else:
+        assert dummy_clamps[0] == "%c0_i32"
+    assert ttgir.count("tlx.rematerialize_coordinates_group = 21 : i32") == (9 if causal else 0)
     assert "amdgcn" in compiled.asm
 
 
@@ -920,21 +993,23 @@ def _amd_scheduled_mfma_persistent_acc_kernel(
     tl.store(output_offsets, acc)
 
 
-def test_amd_scheduled_mfma_persistent_acc_lowering_gfx950():
+@pytest.mark.parametrize("elem_ty", ["bf16", "fp16"])
+def test_amd_scheduled_mfma_persistent_acc_lowering_gfx950(elem_ty):
     compiled = compile_for_gfx950(
         _amd_scheduled_mfma_persistent_acc_kernel,
         signature={
-            "a_ptr": "*bf16",
-            "b_ptr": "*bf16",
+            "a_ptr": f"*{elem_ty}",
+            "b_ptr": f"*{elem_ty}",
             "output_ptr": "*fp32",
             "USE_VGPR": "constexpr",
         },
         constexprs={"USE_VGPR": False},
     )
     llir = compiled.asm["llir"]
-    assert 'asm sideeffect "v_mfma_f32_16x16x32_bf16' in llir
+    asm_ty = "f16" if elem_ty == "fp16" else elem_ty
+    assert f'asm sideeffect "v_mfma_f32_16x16x32_{asm_ty}' in llir
     assert '"=a,v,v"' in llir
-    assert "@llvm.amdgcn.mfma.f32.16x16x32.bf16" not in llir
+    assert f"@llvm.amdgcn.mfma.f32.16x16x32.{asm_ty}" not in llir
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
@@ -1537,6 +1612,45 @@ def test_amd_scheduled_mfma_split_resident_chains_correct_gfx950(
 
 
 # ---------------------------------------------------------------------------
+# Reproducer: restructuring a loaded value must not release its pinned offsets.
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _load_then_restructure(base, offsets):
+    value = tlx.buffer_load(base, offsets)
+    value = tl.reshape(value, [4, 4, 16, 2, 2])
+    value = tl.trans(value, (0, 4, 2, 3, 1))
+    return tl.reshape(value, [128, 8])
+
+
+@triton.jit
+def _pinned_load_helper_kernel(src, dst, PHYSICAL: tl.constexpr):
+    row = tl.arange(0, 4)[:, None]
+    col = tl.arange(0, 256)[None, :]
+    offsets = tlx.require_layout(row * 256 + col, PHYSICAL)
+    value = _load_then_restructure(src, offsets)
+    out_row = tl.arange(0, 128)[:, None]
+    out_col = tl.arange(0, 8)[None, :]
+    tl.store(dst + out_row * 8 + out_col, value)
+
+
+def test_load_helper_preserves_pinned_offset_layout_gfx950():
+    physical = tlx.layout(
+        shape=((16, 4, 4), (2, 2, 4)),
+        stride=((4, 64, 0), (1, 2, 256)),
+    )
+    compiled = compile_for_gfx950(
+        _pinned_load_helper_kernel,
+        signature={"src": "*fp8e4nv", "dst": "*fp8e4nv"},
+        constexprs={"PHYSICAL": physical},
+    )
+
+    # The helper keeps the offset pin and derives layouts for the loaded value.
+    assert "tlx.release_layout" not in compiled.asm["ttir"]
+
+
+# ---------------------------------------------------------------------------
 # Test: warp-pipelined batched matmul (bmm) with a partial-K tail on gfx950.
 #
 # Models the production "compression bmm" (batch, M, prime K=2309, N).
@@ -2130,6 +2244,7 @@ def test_async_amd_desc_load_compiles_gfx1250(device):
     )
     ttgir = compiled.asm["ttgir"]
     assert "async_tdm_copy_global_to_local" in ttgir
+    assert "clamp_bounds" in ttgir
     assert "async_tdm_wait" in ttgir
     assert "local_load" in ttgir
     assert "amdgcn" in compiled.asm
@@ -2144,6 +2259,56 @@ def test_async_amd_desc_load_correctness_gfx1250(device, M, N):
     output = torch.empty_like(x)
     _async_amd_desc_load_kernel[(1, )](x, output, M=M, N=N)
     torch.testing.assert_close(x, output)
+
+
+@triton.jit
+def _async_amd_desc_load_fused_kernel(
+    a_ptr,
+    b_ptr,
+    output_ptr,
+    M: tl.constexpr,
+    N: tl.constexpr,
+):
+    a_desc = tl.make_tensor_descriptor(a_ptr, [M, N], [N, 1], [M, N])
+    b_desc = tl.make_tensor_descriptor(b_ptr, [M, N], [N, 1], [M, N])
+    a_buf = tlx.local_alloc((M, N), tl.float16, 1)
+    b_buf = tlx.local_alloc((M, N), tl.float16, 1)
+    a_smem = tlx.local_view(a_buf, 0)
+    b_smem = tlx.local_view(b_buf, 0)
+    a_desc = tlx.update_tensor_descriptor(a_desc, add_offsets=[0, 0], pred=True, clamp_bounds=True)
+    b_desc = tlx.update_tensor_descriptor(b_desc, add_offsets=[0, 0], pred=True, clamp_bounds=True)
+    token = tlx.async_amd_descriptor_load_fused([
+        (a_desc, a_smem, 0b0011),
+        (b_desc, b_smem, 0b1100),
+    ])
+    tlx.async_amd_descriptor_wait(tokens=[token])
+    result = tlx.local_load(a_smem) + tlx.local_load(b_smem)
+    offsets = tl.arange(0, M)[:, None] * N + tl.arange(0, N)[None, :]
+    tl.store(output_ptr + offsets, result)
+
+
+@pytest.mark.skipif(not is_hip(), reason="Requires HIP runtime")
+def test_async_amd_desc_load_fused_compiles_gfx1250(device):
+    """Two positioned TLX descriptors lower to one fused TDM instruction."""
+    compiled = compile_for_gfx1250(
+        _async_amd_desc_load_fused_kernel,
+        signature={"a_ptr": "*fp16", "b_ptr": "*fp16", "output_ptr": "*fp16"},
+        constexprs={"M": 16, "N": 32},
+    )
+    ttgir = compiled.asm["ttgir"]
+    assert "amdg.async_tdm_fused_copy_global_to_local" in ttgir
+    assert "warp_used_hints = array<i32: 3, 12>" in ttgir
+    assert len(re.findall(r"tensor_load_to_lds|tensor\.load\.to\.lds", compiled.asm["amdgcn"])) == 1
+
+
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
+def test_async_amd_desc_load_fused_correctness_gfx1250(device):
+    rows, cols = 16, 32
+    a = torch.randn((rows, cols), device=device, dtype=torch.float16)
+    b = torch.randn((rows, cols), device=device, dtype=torch.float16)
+    output = torch.empty_like(a)
+    _async_amd_desc_load_fused_kernel[(1, )](a, b, output, M=rows, N=cols)
+    torch.testing.assert_close(output, a + b)
 
 
 @triton.jit
@@ -2239,6 +2404,109 @@ def test_async_amd_desc_store_compiles_gfx1250(device):
     ttgir = compiled.asm["ttgir"]
     assert "async_tdm_copy_global_to_local" in ttgir
     assert "async_tdm_copy_local_to_global" in ttgir
+    assert ttgir.count("clamp_bounds") == 2
+
+
+@triton.jit
+def _update_tensor_descriptor_store_kernel(
+    x_ptr,
+    y_ptr,
+    M: tl.constexpr,
+    N: tl.constexpr,
+):
+    desc_in = tl.make_tensor_descriptor(x_ptr, [M, N], [N, 1], [M, N])
+    desc_out = tl.make_tensor_descriptor(y_ptr, [M, N], [N, 1], [M, N])
+    load_buf = tlx.local_alloc((M, N), tl.float16, 1)
+    store_buf = tlx.local_alloc((M, N), tl.float16, 1)
+    load_view = tlx.local_view(load_buf, 0)
+    store_view = tlx.local_view(store_buf, 0)
+
+    pred = tl.program_id(0) == 0
+    desc_in = tlx.update_tensor_descriptor(desc_in, set_bounds=[M, N], pred=pred)
+    offset_m = desc_in.shape[0] - M
+    offset_n = (desc_in.strides[1] - 1).to(tl.int32)
+    desc_in = tlx.update_tensor_descriptor(desc_in, add_offsets=[offset_m, offset_n])
+    tlx.async_amd_descriptor_load(desc_in, load_view)
+    tlx.async_amd_descriptor_wait(0)
+    tlx.local_store(store_view, tlx.local_load(load_view))
+
+    desc_out = tlx.update_tensor_descriptor(desc_out, add_offsets=[0, 0], clamp_bounds=True)
+    tlx.async_amd_descriptor_store(desc_out, store_view)
+    tlx.async_amd_descriptor_wait(0)
+
+
+@pytest.mark.skipif(not is_hip(), reason="Requires HIP runtime")
+def test_update_tensor_descriptor_store_compiles_gfx1250(device):
+    compiled = compile_for_gfx1250(
+        _update_tensor_descriptor_store_kernel,
+        signature={"x_ptr": "*fp16", "y_ptr": "*fp16"},
+        constexprs={"M": 32, "N": 32},
+    )
+    ttgir = compiled.asm["ttgir"]
+    assert "amdg.update_tensor_descriptor" in ttgir
+    assert "set_bounds =" in ttgir
+    assert "pred =" in ttgir
+    assert "clamp_bounds" in ttgir
+    assert "amdg.async_tdm_copy_local_to_global" in ttgir
+    assert ttgir.count("clamp_bounds") == 1
+    # Two explicit input updates and one output update are the only descriptor
+    # mutations. Neither pre-positioned copy may add a no-op update.
+    assert ttgir.count("amdg.update_tensor_descriptor") == 3
+
+
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
+def test_update_tensor_descriptor_roundtrip_gfx1250(device):
+    x = torch.randn((32, 32), dtype=torch.float16, device=device)
+    y = torch.empty_like(x)
+    _update_tensor_descriptor_store_kernel[(1, )](x, y, M=32, N=32)
+    torch.testing.assert_close(x, y)
+
+
+@triton.jit
+def _invalid_update_tensor_descriptor_kernel(x_ptr, MODE: tl.constexpr):
+    desc = tl.make_tensor_descriptor(x_ptr, [16, 16], [16, 1], [16, 16])
+    if MODE == 0:
+        desc = tlx.update_tensor_descriptor(desc)
+    elif MODE == 1:
+        desc = tlx.update_tensor_descriptor(desc, pred=True, clamp_bounds=True)
+    elif MODE == 2:
+        desc = tlx.update_tensor_descriptor(
+            desc,
+            add_offsets=[0, 0],
+            set_bounds=[16, 16],
+            clamp_bounds=True,
+        )
+    elif MODE == 3:
+        desc = tlx.update_tensor_descriptor(desc, add_offsets=[0])
+    else:
+        desc = tlx.update_tensor_descriptor(desc, add_offsets=[0, 0])
+
+
+@pytest.mark.parametrize(
+    "mode, error",
+    [
+        (0, "requires at least one"),
+        (1, "clamp_bounds requires add_offsets"),
+        (2, "clamp_bounds and set_bounds are mutually exclusive"),
+        (3, "add_offsets must have length 2"),
+    ],
+)
+def test_update_tensor_descriptor_rejects_invalid_gfx1250(mode, error):
+    with pytest.raises(CompilationError, match=error):
+        compile_for_gfx1250(
+            _invalid_update_tensor_descriptor_kernel,
+            signature={"x_ptr": "*fp16"},
+            constexprs={"MODE": mode},
+        )
+
+
+def test_update_tensor_descriptor_rejects_unsupported_target():
+    with pytest.raises(CompilationError, match="only available on AMD TDM-capable targets"):
+        compile_for_gfx950(
+            _invalid_update_tensor_descriptor_kernel,
+            signature={"x_ptr": "*fp16"},
+            constexprs={"MODE": 4},
+        )
 
 
 @pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
@@ -2399,6 +2667,60 @@ def test_async_amd_desc_load_auto_propagates_padded_layout_gfx1250(device):
     )
     ttgir = compiled.asm["ttgir"]
     assert "padded_shared" in ttgir
+
+
+@triton.jit
+def _pinned_tdm_memdesc_view_kernel(
+    input_ptr,
+    output_ptr,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    VIEW: tl.constexpr,
+):
+    smem_layout: tl.constexpr = tlx.padded_shared_layout_encoding.with_identity_for([(N, 128 // 16)], [M, N])
+    desc = tl.make_tensor_descriptor(input_ptr, [M, N], [N, 1], [M, N])
+    buffers = tlx.local_alloc((M, N), tl.float16, 1, layout=smem_layout)
+    full = tlx.local_view(buffers, 0)
+
+    token = tlx.async_amd_descriptor_load(desc, full, [0, 0])
+    tlx.async_amd_descriptor_wait(tokens=[token])
+
+    if VIEW == 0:
+        view = tlx.local_slice(full, [0, 32], [M, 32])
+        rows = tl.arange(0, M)
+        cols = tl.arange(0, 32)
+        width: tl.constexpr = 32
+    else:
+        view = tlx.local_reshape(full, [N, M])
+        rows = tl.arange(0, N)
+        cols = tl.arange(0, M)
+        width: tl.constexpr = M
+
+    values = tlx.local_load(view)
+    tl.store(output_ptr + rows[:, None] * width + cols[None, :], values)
+
+
+@pytest.mark.skipif(not is_hip(), reason="Requires HIP runtime")
+@pytest.mark.parametrize(
+    "view, expected_op",
+    [(0, "ttg.memdesc_subslice"), (1, "ttg.memdesc_reshape")],
+    ids=["slice", "reshape"],
+)
+def test_pinned_tdm_memdesc_views_compile_gfx1250(device, view, expected_op):
+    compiled = compile_for_gfx1250(
+        _pinned_tdm_memdesc_view_kernel,
+        signature={"input_ptr": "*fp16", "output_ptr": "*fp16"},
+        constexprs={"M": 32, "N": 128, "VIEW": view},
+    )
+    ttgir = compiled.asm["ttgir"]
+    assert ttgir.count("amdg.async_tdm_copy_global_to_local") == 1
+    assert expected_op in ttgir
+    assert "#ttg.padded_shared<[128:+8]" in ttgir
+    assert "#tlx.user_layout" not in ttgir
+    assert "#tlx.no_verify_layout" not in ttgir
+    assert "tlx.require_layout" not in ttgir
+    amdgcn = compiled.asm["amdgcn"]
+    assert "tensor_load_to_lds" in amdgcn or "tensor.load.to.lds" in amdgcn
 
 
 # ---------------------------------------------------------------------------
@@ -2858,6 +3180,220 @@ def test_a4w4_shape_stride_layouts_compile_gfx950(device, tmp_path):
     assert "buffer_store_dwordx4" in amdgcn
 
 
+def _compile_a4w4_inter_wave_256tile(m, n, k, preshuffled_scales=False):
+    grid_mn = triton.cdiv(m, _A4W4_INTER_WAVE_BLOCK_M) * triton.cdiv(n, _A4W4_INTER_WAVE_BLOCK_N)
+    a = MockTensor(torch.uint8, (m, k // 2))
+    b = MockTensor(torch.uint8, (n, k // 2))
+    c = MockTensor(torch.bfloat16, (m, n))
+    a_scales = MockTensor(torch.uint8, (m * k // 32, ) if preshuffled_scales else (m, k // 32))
+    b_scales = MockTensor(torch.uint8, (n * k // 32, ) if preshuffled_scales else (n, k // 32))
+    kernel = (_a4w4_inter_wave_preshuffled_scales_kernel if preshuffled_scales else _a4w4_inter_wave_256tile_kernel)
+    scale_strides = () if preshuffled_scales else (1, m, 1, n)
+
+    with knobs.runtime.scope():
+        knobs.runtime.override_arch = "gfx950"
+        return kernel.warmup(
+            a,
+            b,
+            c,
+            c,
+            a_scales,
+            b_scales,
+            m,
+            n,
+            k,
+            k // _A4W4_INTER_WAVE_BLOCK_K,
+            k // 2,
+            1,
+            k // 2,
+            1,
+            n,
+            1,
+            *scale_strides,
+            BLOCK_M=_A4W4_INTER_WAVE_BLOCK_M,
+            BLOCK_N=_A4W4_INTER_WAVE_BLOCK_N,
+            BLOCK_K=_A4W4_INTER_WAVE_BLOCK_K,
+            GROUP_SIZE_M=4,
+            NUM_XCDS=8,
+            GRID_MN=grid_mn,
+            SPLIT_K=1,
+            grid=(grid_mn, ),
+            num_warps=8,
+            num_stages=1,
+            matrix_instr_nonkdim=16,
+            llvm_fn_attrs=_A4W4_8WAVE_LLVM_FN_ATTRS,
+        )
+
+
+def _compile_a4w4_inter_wave_merged_scales(m, n, k):
+    grid_mn = triton.cdiv(m, _A4W4_INTER_WAVE_BLOCK_M) * triton.cdiv(n, _A4W4_INTER_WAVE_BLOCK_N)
+    a = MockTensor(torch.uint8, (m, k // 2))
+    b = MockTensor(torch.uint8, (n, k // 2))
+    c = MockTensor(torch.bfloat16, (m, n))
+    scales = MockTensor(torch.uint8, ((m + n) * k // 32, ))
+
+    with knobs.runtime.scope():
+        knobs.runtime.override_arch = "gfx950"
+        return _a4w4_inter_wave_merged_scales_kernel.warmup(
+            a,
+            b,
+            c,
+            c,
+            scales,
+            m,
+            n,
+            k,
+            k // _A4W4_INTER_WAVE_BLOCK_K,
+            k // 2,
+            1,
+            k // 2,
+            1,
+            n,
+            1,
+            BLOCK_M=_A4W4_INTER_WAVE_BLOCK_M,
+            BLOCK_N=_A4W4_INTER_WAVE_BLOCK_N,
+            BLOCK_K=_A4W4_INTER_WAVE_BLOCK_K,
+            GROUP_SIZE_M=4,
+            NUM_XCDS=8,
+            GRID_MN=grid_mn,
+            SPLIT_K=1,
+            grid=(grid_mn, ),
+            num_warps=8,
+            num_stages=1,
+            matrix_instr_nonkdim=16,
+            llvm_fn_attrs=_A4W4_8WAVE_LLVM_FN_ATTRS,
+        )
+
+
+def test_a4w4_inter_wave_256tile_codegen_gfx950(device, fresh_triton_cache):
+    """Check the performance-sensitive structure of the compiled 256-tile path."""
+    compiled = _compile_a4w4_inter_wave_256tile(768, 768, 1536)
+
+    ttgir = compiled.asm["ttgir"]
+    amdgcn = compiled.asm["amdgcn"]
+
+    # All source layout anchors must be resolved. The scale swizzles use the
+    # generic linear representation and lower directly into shared memory.
+    assert "#tlx.user_layout" not in ttgir
+    assert "#tlx.no_verify_layout" not in ttgir
+    assert "#ttg.generic_linear" in ttgir
+    assert "#ttg.shared_linear" in ttgir
+    assert "ttg.memdesc_reinterpret" not in ttgir
+    assert "arith.xori" not in ttgir
+    assert ttgir.count('triton.warp_pipeline.stage = "mfma"') == 8
+    assert ttgir.count('triton.warp_pipeline.stage = "mem"') == 8
+    assert ttgir.count("rocdl.sched.barrier 0") == 8
+    assert ttgir.count("tt.dot_scaled") == 16
+    assert ttgir.count("amdg.buffer_load_to_local") == 28
+    assert "contiguity" not in ttgir
+
+    assert len(re.findall(r"^\s*v_mfma_scale_f32_16x16x128_f8f6f4\b", amdgcn, re.MULTILINE)) == 256
+    assert len(re.findall(r"^\s*buffer_load_[^\n]*\blds\s*$", amdgcn, re.MULTILINE)) == 44
+    assert len(re.findall(r"^\s*ds_read_b64_tr_b8\b", amdgcn, re.MULTILINE)) == 12
+    assert len(re.findall(r"^\s*ds_read_b128\b", amdgcn, re.MULTILINE)) == 112
+    assert len(re.findall(r"^\s*ds_write_b128\b", amdgcn, re.MULTILINE)) == 16
+    assert len(re.findall(r"^\s*ds_read", amdgcn, re.MULTILINE)) == 124
+    assert len(re.findall(r"^\s*ds_write", amdgcn, re.MULTILINE)) == 16
+    assert "ds_read_u8" not in amdgcn
+    assert "ds_bpermute" not in amdgcn
+    assert "ds_permute" not in amdgcn
+    assert "v_mov_b32_dpp" not in amdgcn
+    assert "v_permlane" not in amdgcn
+    # These are deliberate static goldens for the grid-9, K=1536 specialization.
+    assert len(re.findall(r"^\s*s_barrier\s*$", amdgcn, re.MULTILINE)) == 41
+    assert len(re.findall(r"^\s*s_waitcnt\b", amdgcn, re.MULTILINE)) == 52
+    assert compiled.metadata.shared == 143232
+    assert compiled.metadata.global_scratch_size == 0
+    assert tuple(map(tuple, compiled.metadata.llvm_fn_attrs)) == _A4W4_8WAVE_LLVM_FN_ATTRS
+    assert '"amdgpu-post-sched-strategy"="nop"' in compiled.asm["llir"]
+    assert ".private_segment_fixed_size: 8" in amdgcn
+    assert ".sgpr_spill_count: 0" in amdgcn
+    assert ".vgpr_spill_count: 1" in amdgcn
+    assert ".agpr_count:     0" in amdgcn
+
+    unrelated = compile_for_gfx950(
+        _amd_sched_barrier_kernel,
+        signature={"x_ptr": "*bf16", "y_ptr": "*bf16", "BLOCK": "constexpr"},
+        constexprs={"BLOCK": 64},
+    )
+    assert tuple(map(tuple, unrelated.metadata.llvm_fn_attrs)) == ()
+    assert "amdgpu-post-sched-strategy" not in unrelated.asm["llir"]
+
+
+def test_a4w4_inter_wave_256tile_single_trip_codegen_gfx950(device, fresh_triton_cache):
+    """K=1024 retains the loop pipeline for its single main step."""
+    compiled = _compile_a4w4_inter_wave_256tile(768, 768, 1024)
+    ttgir = compiled.asm["ttgir"]
+    amdgcn = compiled.asm["amdgcn"]
+
+    assert ttgir.count('triton.warp_pipeline.stage = "mfma"') == 8
+    assert ttgir.count('triton.warp_pipeline.stage = "mem"') == 8
+    assert ttgir.count("scf.execute_region") == 16
+    assert ttgir.count("scf.for") == 1
+    assert len(re.findall(r"^\s*v_mfma_scale_f32_16x16x128_f8f6f4\b", amdgcn, re.MULTILINE)) == 256
+    assert len(re.findall(r"^\s*buffer_load_[^\n]*\blds\s*$", amdgcn, re.MULTILINE)) == 44
+    assert len(re.findall(r"^\s*s_barrier\s*$", amdgcn, re.MULTILINE)) == 41
+    assert len(re.findall(r"^\s*s_waitcnt\b", amdgcn, re.MULTILINE)) == 52
+    assert "s_trap" not in amdgcn
+    assert compiled.metadata.shared == 143232
+    assert compiled.metadata.global_scratch_size == 0
+    assert ".private_segment_fixed_size: 8" in amdgcn
+    assert ".sgpr_spill_count: 0" in amdgcn
+    assert ".vgpr_spill_count: 1" in amdgcn
+
+
+def test_a4w4_inter_wave_preshuffled_scale_codegen_gfx950(device, fresh_triton_cache):
+    """The fastest prepacked ABI coalesces both A halves into one b128 read."""
+    compiled = _compile_a4w4_inter_wave_256tile(768, 768, 1536, preshuffled_scales=True)
+    ttgir = compiled.asm["ttgir"]
+    amdgcn = compiled.asm["amdgcn"]
+
+    assert "#tlx.user_layout" not in ttgir
+    assert "#tlx.no_verify_layout" not in ttgir
+    assert ttgir.count("amdg.buffer_load_to_local") == 24
+    assert "buffer_load_dwordx2" not in amdgcn
+    assert len(re.findall(r"^\s*buffer_load_[^\n]*\blds\s*$", amdgcn, re.MULTILINE)) == 40
+    assert "ds_read_b64_tr_b8" not in amdgcn
+    assert len(re.findall(r"^\s*ds_read_b64\b", amdgcn, re.MULTILINE)) == 4
+    assert len(re.findall(r"^\s*ds_read_b128\b", amdgcn, re.MULTILINE)) == 116
+    assert len(re.findall(r"^\s*ds_read", amdgcn, re.MULTILINE)) == 120
+    assert compiled.metadata.shared == 143232
+    assert compiled.metadata.global_scratch_size == 0
+    assert ".private_segment_fixed_size: 0" in amdgcn
+    assert ".vgpr_spill_count: 0" in amdgcn
+
+
+def test_a4w4_inter_wave_merged_scale_codegen_gfx950(device, fresh_triton_cache):
+    """The merged ABI combines wide scale DMA with conflict-free A b128 reads."""
+    compiled = _compile_a4w4_inter_wave_merged_scales(768, 768, 1536)
+    ttgir = compiled.asm["ttgir"]
+    amdgcn = compiled.asm["amdgcn"]
+
+    assert "#tlx.user_layout" not in ttgir
+    assert "#tlx.no_verify_layout" not in ttgir
+    assert ttgir.count("amdg.buffer_load_to_local") == 18
+    assert "ttg.memdesc_reinterpret" in ttgir
+    assert len(re.findall(r"^\s*buffer_load_[^\n]*\blds\s*$", amdgcn, re.MULTILINE)) == 34
+    assert len(re.findall(r"^\s*buffer_load_dwordx4[^\n]*\blds\s*$", amdgcn, re.MULTILINE)) == 34
+    assert len(re.findall(r"^\s*ds_read_b64_tr_b8\b", amdgcn, re.MULTILINE)) == 4
+    assert "ds_read_b64 " not in amdgcn
+    assert len(re.findall(r"^\s*ds_read_b128\b", amdgcn, re.MULTILINE)) == 116
+    assert len(re.findall(r"^\s*ds_read", amdgcn, re.MULTILINE)) == 120
+    assert "v_perm_b32" not in amdgcn
+    # Refilling immediately after the second-half reads starts the next pair one
+    # stage earlier. This deliberately pays a RAW-to-refill wait/barrier; moving
+    # the copy across the next existing barrier shortens DMA latency hiding and
+    # regresses both measured benchmark shapes.
+    assert len(re.findall(r"^\s*s_waitcnt\b", amdgcn, re.MULTILINE)) == 66
+    assert len(re.findall(r"^\s*s_barrier\s*$", amdgcn, re.MULTILINE)) == 42
+    assert compiled.metadata.shared == 143232
+    assert compiled.metadata.global_scratch_size == 0
+    assert ".private_segment_fixed_size: 0" in amdgcn
+    assert ".sgpr_count:     58" in amdgcn
+    assert ".sgpr_spill_count: 0" in amdgcn
+    assert ".vgpr_spill_count: 0" in amdgcn
+
+
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
 def test_a4w4_shape_stride_layouts_correctness_gfx950(device):
     m = n = 256
@@ -2868,16 +3404,61 @@ def test_a4w4_shape_stride_layouts_correctness_gfx950(device):
         torch.testing.assert_close(actual, expected, atol=0.1, rtol=0.0)
 
 
+@pytest.mark.parametrize("k, split_k", [(1024, 1), (4096, 2)])
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
-def test_a4w4_inter_wave_256tile_correctness_gfx950(device):
-    # 768x768x1536 -> 256-tile grid = 3*3 = 9 > NUM_CU/32, so the dispatcher takes
-    # the 8-wave 256x256 inter-wave path (K=1536 -> loop runs >= 2 trips).
-    m = n = 768
-    k = 1536
+def test_a4w4_inter_wave_preshuffled_scale_correctness_gfx950(device, k, split_k):
+    m = n = 256
+    a, b, a_scales, b_scales = _generate_a4w4_inputs(m, n, k)
+    a_scales_preshuffled = _preshuffle_a4w4_a_scales(a_scales)
+    b_scales_preshuffled = _preshuffle_a4w4_b_scales(b_scales)
+    actual = _a4w4_inter_wave_matmul_preshuffled(a, b, a_scales_preshuffled, b_scales_preshuffled, SPLIT_K=split_k)
+    expected = _a4w4_reference(a, b, a_scales, b_scales)
+    torch.testing.assert_close(actual, expected, atol=0.0, rtol=0.0)
+
+
+@pytest.mark.parametrize("k, split_k", [(1024, 1), (4096, 2)])
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_a4w4_inter_wave_merged_scale_correctness_gfx950(device, k, split_k):
+    m = n = 256
+    a, b, a_scales, b_scales = _generate_a4w4_inputs(m, n, k)
+    scales = _preshuffle_a4w4_scales(a_scales, b_scales)
+    actual = _a4w4_inter_wave_matmul_merged_scales(a, b, scales, SPLIT_K=split_k)
+    expected = _a4w4_reference(a, b, a_scales, b_scales)
+    torch.testing.assert_close(actual, expected, atol=0.0, rtol=0.0)
+
+
+@pytest.mark.parametrize(
+    "k, expected_path",
+    [(1536, "intra_wave_256x256"), (2048, "inter_wave_256x256")],
+)
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_a4w4_inter_wave_large_grid_dispatch_correctness_gfx950(device, k, expected_path):
+    # A 2x33 grid exceeds the skinny threshold. K=1536 selects the measured
+    # lower-overhead 4-wave path; K=2048 selects the 8-wave pipeline.
+    m, n = 512, 8448
+    assert _select_a4w4_inter_wave_path(m, n, k) == expected_path
     a, b, a_scales, b_scales = _generate_a4w4_inputs(m, n, k)
     actual = _a4w4_inter_wave_matmul(a, b, a_scales, b_scales)
     expected = _a4w4_reference(a, b, a_scales, b_scales)
     torch.testing.assert_close(actual, expected, atol=0.1, rtol=0.0)
+
+
+@pytest.mark.parametrize("m, n", [(256, 16640), (512, 8448)])
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_a4w4_short_k_dispatch_stress_gfx950(device, m, n):
+    # Both public shapes exceed the skinny threshold by the smallest possible
+    # grid margins. K=1024 must dispatch to the measured 4-wave path.
+    k = _A4W4_INTER_WAVE_MIN_K
+    grid_mn = triton.cdiv(m, _A4W4_INTER_WAVE_BLOCK_M) * triton.cdiv(n, _A4W4_INTER_WAVE_BLOCK_N)
+    assert grid_mn in (65, 66)
+    assert _select_a4w4_inter_wave_path(m, n, k) == "intra_wave_256x256"
+    assert k == 1024
+
+    a, b, a_scales, b_scales = _generate_a4w4_inputs(m, n, k)
+    expected = _a4w4_reference(a, b, a_scales, b_scales)
+    for launch in range(500):
+        actual = _a4w4_inter_wave_matmul(a, b, a_scales, b_scales)
+        torch.testing.assert_close(actual, expected, atol=0.1, rtol=0.0, msg=f"failed on launch {launch}")
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")

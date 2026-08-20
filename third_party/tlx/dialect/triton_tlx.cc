@@ -15,15 +15,16 @@
 #include "triton/Tools/LayoutUtils.h"
 #include "triton/Tools/LinearLayout.h"
 #include "llvm/Support/Casting.h"
-#include <pybind11/pybind11.h>
-#include <pybind11/stl.h>
-#include <pybind11/stl_bind.h>
+#include <nanobind/nanobind.h>
+#include <nanobind/stl/optional.h>
+#include <nanobind/stl/pair.h>
+#include <nanobind/stl/string.h>
+#include <nanobind/stl/vector.h>
 
-namespace py = pybind11;
+namespace py = nanobind;
 
-// Defined in ir.cc. Declared here rather than in ir.h so ir.h stays
-// pybind11-free and matches upstream; the pybind11 builder class is only
-// needed by this python-binding TU and ir.cc.
+// Defined in ir.cc. Declared here rather than in ir.h so ir.h stays free of
+// Python binding implementation details and matches upstream.
 namespace ir {
 extern py::class_<TritonOpBuilder> *getBuilderClass();
 } // namespace ir
@@ -36,6 +37,15 @@ namespace ttng = triton::nvidia_gpu;
 namespace tlx = triton::tlx;
 namespace amdgpu = triton::amdgpu;
 namespace ttag = triton::amdgpu;
+
+// Element type of a CLC (Cluster Launch Control) response buffer. A CLC
+// response is a 16-byte opaque hardware object, so each stage is stored as one
+// `ui128`. Single source of truth: both `create_alloc_clc_responses` and the
+// `get_clc_response_element_ty` binding used by `tlx.clc_response_type.to_ir()`
+// go through here so the allocation and the frontend type can never diverge.
+static mlir::Type getCLCResponseElementType(mlir::OpBuilder &builder) {
+  return builder.getIntegerType(128, /*signed=*/false);
+}
 
 // Construct a CGAEncodingAttr from legacy (CTAsPerCGA, CTASplitNum, CTAOrder)
 // params. The single-CTA case must go through get1CTALayout: feeding all-1
@@ -75,7 +85,23 @@ makeCGALayoutFromBases(mlir::MLIRContext *ctx,
                                    tt::LinearLayout(std::move(bases), outDims));
 }
 
-void init_triton_tlx_ir(py::module &&m) {
+// Memdesc view ops must infer their result from the concrete shared layout,
+// not from a TLX wrapper carrying the user pin. Bridge the source to that
+// concrete encoding while retaining the pin on the allocation itself.
+static Value materializeConcreteMemDesc(TritonOpBuilder &builder, Value value) {
+  auto type = cast<ttg::MemDescType>(value.getType());
+  Attribute encoding = type.getEncoding();
+  Attribute concrete = tlx::getEffectiveEncoding(encoding);
+  if (concrete == encoding)
+    return value;
+
+  auto concreteType = ttg::MemDescType::get(
+      type.getShape(), type.getElementType(), concrete, type.getMemorySpace(),
+      type.getMutableMemory(), type.getAllocShape());
+  return builder.create<tlx::RequireLayoutOp>(concreteType, value);
+}
+
+void init_triton_tlx_ir(py::module_ &m) {
   auto *builder_cls = ir::getBuilderClass();
   builder_cls
       ->def(
@@ -103,6 +129,7 @@ void init_triton_tlx_ir(py::module &&m) {
            [](TritonOpBuilder &self, Value localAlloc,
               std::vector<int32_t> offsets,
               std::vector<int64_t> newShape) -> mlir::Value {
+             localAlloc = materializeConcreteMemDesc(self, localAlloc);
              auto localAllocType = cast<ttg::MemDescType>(localAlloc.getType());
              auto localAllocShape = localAllocType.getShape();
              assert(localAllocShape.size() == offsets.size() &&
@@ -615,8 +642,14 @@ void init_triton_tlx_ir(py::module &&m) {
                                    {kBlock, std::vector<std::vector<int>>{}}},
                                   outDims,
                                   /*requiresSurjective=*/true);
-             return tlx::wrapNoVerifyLayout(mlir::cast<Attribute>(
-                 ttg::LinearEncodingAttr::get(context, std::move(ll))));
+             Attribute encoding =
+                 ttg::isPermutationMatrixLayout(ll)
+                     ? mlir::cast<Attribute>(
+                           ttg::LinearEncodingAttr::get(context, std::move(ll)))
+                     : mlir::cast<Attribute>(
+                           ttg::GenericLinearEncodingAttr::get(context,
+                                                               std::move(ll)));
+             return tlx::wrapNoVerifyLayout(encoding);
            })
       .def("make_dummy_register_layout_attr",
            [](TritonOpBuilder &self, std::vector<int64_t> shape,
@@ -893,6 +926,18 @@ void init_triton_tlx_ir(py::module &&m) {
              return self.create<amdgpu::AsyncTDMCopyGlobalToLocalOp>(
                  desc, result, barrier.value_or(Value()));
            })
+      .def(
+          "create_async_tdm_fused_copy_global_to_local",
+          [](TritonOpBuilder &self, std::vector<Value> descs,
+             std::vector<Value> dests, std::vector<int32_t> warpUsedHints,
+             tt::CacheModifier cacheModifier) -> mlir::Value {
+            auto tokenType = self.getBuilder().getType<ttg::AsyncTokenType>();
+            auto hints = self.getBuilder().getDenseI32ArrayAttr(warpUsedHints);
+            return self.create<amdgpu::AsyncTDMFusedCopyGlobalToLocalOp>(
+                tokenType, descs, dests, hints, cacheModifier);
+          },
+          py::arg("descs"), py::arg("dests"), py::arg("warpUsedHints"),
+          py::arg("cacheModifier") = tt::CacheModifier::NONE)
       .def("create_async_tdm_copy_local_to_global",
            [](TritonOpBuilder &self, Value desc, Value src,
               std::optional<Value> barrier) {
@@ -938,7 +983,8 @@ void init_triton_tlx_ir(py::module &&m) {
       .def("create_memdesc_reshape",
            [](TritonOpBuilder &self, Value &src,
               std::vector<int64_t> shape) -> mlir::Value {
-             return self.create<ttg::MemDescReshapeOp>(src, shape);
+             Value reshapeSrc = materializeConcreteMemDesc(self, src);
+             return self.create<ttg::MemDescReshapeOp>(reshapeSrc, shape);
            })
       .def(
           "create_memdesc_reinterpret",
@@ -1074,14 +1120,25 @@ void init_triton_tlx_ir(py::module &&m) {
              // This links the storage_alias_spec to the reuse_group tree
              self.create<tlx::SetBufferOverlapOp>(storageAliasSpec, overlapDef);
            })
+      // The element type of a CLC response buffer. A CLC response is a 16-byte
+      // opaque hardware object, so it is stored as one `ui128` per stage. This
+      // is exposed to Python so that `tlx.clc_response_type.to_ir()` rebuilds
+      // the exact same memdesc type as `create_alloc_clc_responses` below --
+      // any divergence only shows up when a CLC context crosses a `tt.call`
+      // (a CLC context passed into a @triton.jit helper), where the callee's
+      // parameter type is rebuilt from the frontend type and TTIR verification
+      // then fails with a `tt.call` operand type mismatch.
+      .def("get_clc_response_element_ty",
+           [](TritonOpBuilder &self) -> Type {
+             return getCLCResponseElementType(self.getBuilder());
+           })
       .def("create_alloc_clc_responses",
            [](TritonOpBuilder &self, int numResponses,
               Attribute clcResEncoding) -> mlir::Value {
              auto context = self.getBuilder().getContext();
              auto memorySpace = ttg::SharedMemorySpaceAttr::get(context);
              auto memDescType = ttg::MemDescType::get(
-                 {numResponses},
-                 self.getBuilder().getIntegerType(128, /*signed=*/false),
+                 {numResponses}, getCLCResponseElementType(self.getBuilder()),
                  clcResEncoding, memorySpace, /*mutableMemory=*/true);
 
              mlir::Value bufferViews =
@@ -1216,6 +1273,7 @@ void init_triton_tlx_ir(py::module &&m) {
       .def("create_warp_specialize_op",
            [](TritonOpBuilder &self, std::vector<int> partitionNumWarps,
               std::optional<std::vector<int>> requestedRegisters,
+              std::optional<int> defaultRequestedRegisters,
               int numPartitionRegions,
               std::optional<std::vector<int>> warpGroupStartIds)
                -> ttg::WarpSpecializeOp {
@@ -1224,6 +1282,7 @@ void init_triton_tlx_ir(py::module &&m) {
                  dummyTypes, partitionNumWarps, numPartitionRegions);
 
              wsOp.setRequestedRegisters(requestedRegisters);
+             wsOp.setDefaultRequestedRegisters(defaultRequestedRegisters);
              wsOp.setWarpGroupStartIds(warpGroupStartIds);
 
              return wsOp;
@@ -1362,7 +1421,7 @@ void init_triton_tlx_ir(py::module &&m) {
            });
 }
 
-void init_triton_tlx_passes(py::module &&m) {
+void init_triton_tlx_passes(py::module_ &m) {
   ADD_PASS_WRAPPER_0("add_tlx_propagate_layout", tlx::createTlxPropagateLayout);
   ADD_PASS_WRAPPER_0("add_tlx_insert_require_layout",
                      tlx::createTLXInsertRequireLayout);
@@ -1394,7 +1453,7 @@ void init_triton_tlx_passes(py::module &&m) {
         });
 }
 
-void init_triton_tlx(py::module &&m) {
+void init_triton_tlx(py::module_ &m) {
   // load dialects
   m.def("load_dialects", [](mlir::MLIRContext &context) {
     mlir::DialectRegistry registry;
@@ -1404,6 +1463,8 @@ void init_triton_tlx(py::module &&m) {
     context.loadAllAvailableDialects();
   });
 
-  init_triton_tlx_ir(m.def_submodule("tlx_ir"));
-  init_triton_tlx_passes(m.def_submodule("tlx_passes"));
+  auto ir = m.def_submodule("tlx_ir");
+  init_triton_tlx_ir(ir);
+  auto passes = m.def_submodule("tlx_passes");
+  init_triton_tlx_passes(passes);
 }

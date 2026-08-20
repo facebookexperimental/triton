@@ -2,8 +2,8 @@ import pytest
 import torch
 import triton
 import triton.language as tl
-from test_mxfp import MXFP4Tensor
 from triton._internal_testing import is_blackwell
+from triton.tools.mxfp import MXFP4Tensor
 from triton.tools.tensor_descriptor import TensorDescriptor
 
 

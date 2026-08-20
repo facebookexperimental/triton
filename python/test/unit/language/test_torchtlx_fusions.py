@@ -56,13 +56,17 @@ def has_tlx():
 
 
 def is_gfx950():
-    """True on AMD MI350X (gfx950), where the TLX warp-pipe addmm template runs."""
-    if torch.version.hip is None:
-        return False
+    """True on AMD MI350X (gfx950), where the TLX warp-pipe addmm template runs.
+
+    Delegates to the shared target model so adding MI300X/MI450X coverage is a
+    change to the arch table rather than to every gate in the test suite. Falls
+    back to False when TLX is not importable at all, matching has_tlx().
+    """
     try:
-        return "gfx95" in torch.cuda.get_device_properties(0).gcnArchName
-    except Exception:
+        from triton.language.extra.tlx.hw.target import current_target
+    except ImportError:
         return False
+    return current_target().is_gfx950
 
 
 def supports_template_epilogue_fusion():

@@ -1,33 +1,47 @@
 // RUN: triton-opt %s -split-input-file --nvgpu-test-ws-memory-planner="num-buffers=3 smem-alloc-algo=1 smem-budget=220000" | FileCheck %s --check-prefix=LARGE
 // RUN: triton-opt %s -split-input-file --nvgpu-test-ws-memory-planner="num-buffers=3 smem-alloc-algo=1 smem-budget=200000" | FileCheck %s --check-prefix=TIGHT
+// RUN: triton-opt %s -split-input-file --nvgpu-test-ws-memory-planner="num-buffers=3 smem-alloc-algo=1 smem-budget=250000" | FileCheck %s --check-prefix=FULL
+// RUN: triton-opt %s -split-input-file --nvgpu-test-ws-memory-planner="num-buffers=3 smem-alloc-algo=1 smem-budget=220000 smem-plan-search" | FileCheck %s --check-prefix=SEARCH
 
-// Test: Phase 4.5 multi-copy for fused epilogue buffers.
+// Test: TMA-fed MMA operands keep their configured pipeline depth before
+// Phase 3.7 reserves fused epilogue copies from the remaining budget.
 // Two epilogue SMEM buffers (128x128xf16 = 32768 bytes each) are fused into
-// the same buffer.id by Phase 3.5. Phase 4 gives innermost-loop buffers
-// (A: 128x64xf16 = 16384, B: 64x256xf16 = 32768) up to 3 copies.
+// the same buffer.id by Phase 3.5. The operands need all 3 copies for correct
+// pipelined MMA execution; the epilogue receives as many copies as still fit.
 //
 // With a large budget (220000):
-//   Innermost: (16384 + 32768) * 3 = 147456
-//   Epilogue fused (2 copies): 32768 * 2 = 65536
-//   Total: 212992 ≤ 220000 → epilogue gets buffer.copy=2.
+//   MMA operands: (16384 + 32768) * 3 = 147456
+//   Epilogue fused: 32768 * 2 = 65536
+//   Total: 212992 ≤ 220000.
 //
 // With a tight budget (200000):
-//   Innermost: 147456
-//   Epilogue fused (1 copy): 32768
-//   Total: 180224 ≤ 200000, but 2 copies → 212992 > 200000
-//   → epilogue stays at buffer.copy=1.
+//   MMA operands: 147456
+//   Epilogue fused: 32768 * 1 = 32768
+//   Total: 180224 ≤ 200000.
 
 // LARGE-LABEL: @epilogue_multicopy
-// LARGE: ttg.local_alloc {buffer.copy = 2 : i32, buffer.id = [[ID:[0-9]+]] : i32}
-// LARGE-SAME: 128x128xf16
-// LARGE: ttg.local_alloc {buffer.copy = 2 : i32, buffer.id = [[ID]] : i32}
-// LARGE-SAME: 128x128xf16
+// LARGE: ttg.local_alloc {buffer.copy = 3 : i32{{.*}}128x64xf16
+// LARGE: ttg.local_alloc {buffer.copy = 3 : i32{{.*}}64x256xf16
+// LARGE: ttg.local_alloc {buffer.copy = 2 : i32, buffer.id = [[ID:[0-9]+]] : i32}{{.*}}128x128xf16
+// LARGE: ttg.local_alloc {buffer.copy = 2 : i32, buffer.id = [[ID]] : i32}{{.*}}128x128xf16
 
 // TIGHT-LABEL: @epilogue_multicopy
-// TIGHT: ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = [[ID:[0-9]+]] : i32}
-// TIGHT-SAME: 128x128xf16
-// TIGHT: ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = [[ID]] : i32}
-// TIGHT-SAME: 128x128xf16
+// TIGHT: ttg.local_alloc {buffer.copy = 3 : i32{{.*}}128x64xf16
+// TIGHT: ttg.local_alloc {buffer.copy = 3 : i32{{.*}}64x256xf16
+// TIGHT: ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = [[ID:[0-9]+]] : i32}{{.*}}128x128xf16
+// TIGHT: ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = [[ID]] : i32}{{.*}}128x128xf16
+
+// FULL-LABEL: @epilogue_multicopy
+// FULL: ttg.local_alloc {buffer.copy = 3 : i32{{.*}}128x64xf16
+// FULL: ttg.local_alloc {buffer.copy = 3 : i32{{.*}}64x256xf16
+// FULL: ttg.local_alloc {buffer.copy = 3 : i32, buffer.id = [[ID:[0-9]+]] : i32}{{.*}}128x128xf16
+// FULL: ttg.local_alloc {buffer.copy = 3 : i32, buffer.id = [[ID]] : i32}{{.*}}128x128xf16
+
+// Search uses separate SMEM blocks today, but must derive the same static
+// three-copy safety floor as the heuristic planner for both MMA operands.
+// SEARCH-LABEL: @epilogue_multicopy
+// SEARCH: ttg.local_alloc {buffer.copy = 3 : i32{{.*}}128x64xf16
+// SEARCH: ttg.local_alloc {buffer.copy = 3 : i32{{.*}}64x256xf16
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
 #blocked1 = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
@@ -69,7 +83,7 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
         ttg.local_store %b, %B_smem {async_task_id = array<i32: 1>} : tensor<64x256xf16, #blocked2> -> !ttg.memdesc<64x256xf16, #shared, #smem, mutable>
         %mma = ttng.tc_gen5_mma %A_smem, %B_smem, %result[%acc_tok], %acc_flag, %true {async_task_id = array<i32: 0>} : !ttg.memdesc<128x64xf16, #shared, #smem, mutable>, !ttg.memdesc<64x256xf16, #shared, #smem, mutable>, !ttg.memdesc<128x256xf32, #tmem, #ttng.tensor_memory, mutable>
         scf.yield {async_task_id = array<i32: 0, 1>} %true, %mma : i1, !ttg.async.token
-      } {async_task_id = array<i32: 0, 1>}
+      } {async_task_id = array<i32: 0, 1>, tt.data_partition_factor = 2 : i32, tt.disallow_acc_multi_buffer}
       // Epilogue: tmem_load → reshape → trans → split → truncf → local_store.
       %res, %res_tok = ttng.tmem_load %result[%1#1] {async_task_id = array<i32: 2>} : !ttg.memdesc<128x256xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x256xf32, #blocked>
       %reshaped = tt.reshape %res {async_task_id = array<i32: 2>} : tensor<128x256xf32, #blocked> -> tensor<128x2x128xf32, #blocked3>

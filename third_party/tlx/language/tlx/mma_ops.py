@@ -150,22 +150,25 @@ def amd_scheduled_mfma(
 
 
 @tl.builtin
-def amd_mfma_commit(value, preserve, _semantic=None):
-    """Commit transient MFMA results and thread a live dot operand.
+def amd_mfma_commit(value, preserve=None, _semantic=None):
+    """Commit MFMA results and optionally thread a live dot operand.
 
     ``value`` may be one tensor or a tuple of independent transient
     ``amd_scheduled_mfma`` results. The returned copy of ``preserve`` can be
-    consumed by the next source stage to make its residency explicit.
+    consumed by the next source stage to make its residency explicit. With no
+    ``preserve``, the values form one persistent-AGPR epilogue boundary.
     """
     single_value = isinstance(value, tl.tensor)
     values = (value, ) if single_value else value
     assert isinstance(values,
                       (tuple, tl.tuple)) and len(values) > 0, ("value must be a tensor or nonempty tensor tuple")
     assert all(isinstance(item, tl.tensor) for item in values), ("value must contain only tensors")
-    assert isinstance(preserve, tl.tensor), "preserve must be a tensor"
-    inputs = tuple(values) + (preserve, )
+    assert preserve is None or isinstance(preserve, tl.tensor), ("preserve must be None or a tensor")
+    inputs = tuple(values) + (() if preserve is None else (preserve, ))
     handles = _semantic.builder.create_amd_mfma_commit([item.handle for item in inputs])
     outputs = tuple(tl.tensor(handle, item.type) for handle, item in zip(handles, inputs))
+    if preserve is None:
+        return outputs[0] if single_value else outputs
     if single_value:
         return outputs[0], outputs[-1]
     return outputs
@@ -443,8 +446,8 @@ def async_dot(
         handles = [t.handle for t in mBarriers]
         is_async = force_async or len(handles) > 0
         use_acc_handle = _get_use_acc_handle(use_acc, _semantic.builder)
-        output = _semantic.builder.create_tcgen5_dot(A_handle, B_handle, acc_handle, use_acc_handle, pred, two_ctas,
-                                                     handles, is_async)
+        output = _semantic.builder.create_tcgen5_dot(A_handle, B_handle, acc_handle, use_acc_handle, pred, bool(two_ctas),
+                                                     handles, bool(is_async))
         return tl.tensor(output, tl.void)
     else:
         mma_layout = _semantic.builder.make_nv_mma_encoding_attr(A_handle, acc_handle, version, 0,
@@ -618,9 +621,9 @@ def async_dot_scaled(
         B_type,
         use_acc_handle,
         pred,
-        two_ctas,
+        bool(two_ctas),
         bar_handles,
-        is_async,
+        bool(is_async),
     )
     return tl.tensor(output, tl.void)
 

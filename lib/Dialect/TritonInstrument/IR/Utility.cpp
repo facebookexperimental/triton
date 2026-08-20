@@ -633,7 +633,6 @@ LogicalResult AuxDataMap::populateAndPassToWarpSpecialize(
             64, fb));
     passValueToWarpSpecialize(readVisibility[iMemType].at(entryRegion),
                               readVisibility[iMemType]);
-
     if (memType == MemType::SHARED_MEM && hasAsyncProxyFenceTracking) {
       proxyAccessVisibility.insert(
           entryRegion,

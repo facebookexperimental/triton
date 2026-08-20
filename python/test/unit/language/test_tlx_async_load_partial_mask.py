@@ -47,6 +47,10 @@ if has_tlx():
         offs = offs_m[:, None] * BLOCK_K + offs_k[None, :]
         smem = tlx.local_alloc((BLOCK_M, BLOCK_K), tlx.dtype_of(a_ptr), 1)
         if USE_MASK:
+            # Ensure masked lanes must be overwritten rather than relying on
+            # freshly allocated shared memory happening to contain zero.
+            poison = tl.full((BLOCK_M, BLOCK_K), 7.0, tlx.dtype_of(a_ptr))
+            tlx.local_store(tlx.local_view(smem, 0), poison)
             tok = tlx.async_load(a_ptr + offs, tlx.local_view(smem, 0), mask=offs_k[None, :] < VALID_K)
         else:
             tok = tlx.async_load(a_ptr + offs, tlx.local_view(smem, 0))
@@ -122,6 +126,7 @@ class TlxAsyncLoadPartialMaskTest(unittest.TestCase):
         )
         torch.cuda.synchronize()
         torch.testing.assert_close(out[:, :5], a[:, :5])
+        torch.testing.assert_close(out[:, 5:], torch.zeros_like(out[:, 5:]))
 
     def test_sync_load_partial_mask_fix_ok(self):
         # THE FIX: the same partial mask via a synchronous tl.load compiles and is correct.

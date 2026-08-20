@@ -6,6 +6,27 @@
 // so `tlx-propagate-layout` can rewrite the source `local_alloc` to a
 // descriptor-compatible padded encoding from `buildDefaultTDMDescriptorEncoding`.
 
+// Fused TDM loads constrain every destination independently.
+// CHECK-DAG: #[[$FUSED_A:.*]] = #ttg.padded_shared<[32:+8] {order = [1, 0], shape = [64, 32]}>
+// CHECK-DAG: #[[$FUSED_B:.*]] = #ttg.padded_shared<[64:+8] {order = [1, 0], shape = [32, 64]}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#smem = #ttg.shared_memory
+module attributes {tlx.has_explicit_local_mem_access = true, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: @fused_tdm_constraints
+  tt.func public @fused_tdm_constraints(
+      %a: !tt.tensordesc<64x32xf16>, %b: !tt.tensordesc<32x64xf16>) {
+    %da = ttg.local_alloc : () -> !ttg.memdesc<64x32xf16, #shared, #smem, mutable>
+    %db = ttg.local_alloc : () -> !ttg.memdesc<32x64xf16, #shared, #smem, mutable>
+    // CHECK: %[[RA:.*]] = tlx.require_layout %{{.*}} : !ttg.memdesc<64x32xf16, #shared, #smem, mutable> -> !ttg.memdesc<64x32xf16, #[[$FUSED_A]], #smem, mutable>
+    // CHECK: %[[RB:.*]] = tlx.require_layout %{{.*}} : !ttg.memdesc<32x64xf16, #shared, #smem, mutable> -> !ttg.memdesc<32x64xf16, #[[$FUSED_B]], #smem, mutable>
+    // CHECK: amdg.async_tdm_fused_copy_global_to_local %{{.*}}, %{{.*}} into %[[RA]], %[[RB]]
+    %token = amdg.async_tdm_fused_copy_global_to_local %a, %b into %da, %db {warp_used_hints = array<i32: 3, 12>} : !tt.tensordesc<64x32xf16>, !tt.tensordesc<32x64xf16> -> !ttg.memdesc<64x32xf16, #shared, #smem, mutable>, !ttg.memdesc<32x64xf16, #shared, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
 // =============================================================================
 // 1. TDM copy with no consumer. Default fallback fires.
 // For block_shape [128, 32] fp16: pad_interval=32, pad_amount=128/16=8.

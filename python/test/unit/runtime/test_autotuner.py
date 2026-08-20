@@ -7,6 +7,9 @@ import pytest
 import pathlib
 import uuid
 from triton._internal_testing import is_cuda, is_hip_cdna2, is_rubin
+from triton.backends.amd.compiler import HIPBackend
+from triton.backends.compiler import GPUTarget
+from triton.backends.nvidia.compiler import CUDABackend
 from triton.runtime import autotuner as _autotuner
 
 
@@ -14,6 +17,36 @@ def do_bench(kernel_call, quantiles, use_cuda_graph=False):
     if use_cuda_graph:
         return triton.testing.do_bench_cudagraph(kernel_call, quantiles=quantiles)
     return triton.testing.do_bench(kernel_call, quantiles=quantiles, warmup=1, rep=1)
+
+
+@pytest.mark.parametrize(
+    "probe_ms, expected",
+    [(0.001, 10000), (0.1, 2500), (1.0, 250), (24.0, 10), (100.0, 2)],
+)
+def test_entropy_warmup_sample_budget(probe_ms, expected):
+    assert _autotuner._entropy_warmup_sample_limit(probe_ms, 250) == expected
+
+
+def test_config_backend_options():
+    default_config = triton.Config(kwargs={})
+    tree_config = triton.Config(kwargs={}, enable_tree_reduction=True)
+    linear_config = triton.Config(kwargs={}, enable_tree_reduction=False)
+
+    assert "enable_tree_reduction" not in default_config.all_kwargs()
+    assert tree_config.all_kwargs()["enable_tree_reduction"] is True
+    assert linear_config.all_kwargs()["enable_tree_reduction"] is False
+
+    amd_backend = HIPBackend(GPUTarget("hip", "gfx942", 64))
+    assert amd_backend.parse_options(default_config.all_kwargs()).enable_tree_reduction is False
+    assert amd_backend.parse_options(tree_config.all_kwargs()).enable_tree_reduction is True
+    assert amd_backend.parse_options(linear_config.all_kwargs()).enable_tree_reduction is False
+
+    h100_backend = CUDABackend(GPUTarget("cuda", 90, 32))
+    blackwell_backend = CUDABackend(GPUTarget("cuda", 100, 32))
+    assert h100_backend.parse_options(default_config.all_kwargs()).enable_tree_reduction is True
+    assert blackwell_backend.parse_options(default_config.all_kwargs()).enable_tree_reduction is False
+    assert h100_backend.parse_options(linear_config.all_kwargs()).enable_tree_reduction is False
+    assert blackwell_backend.parse_options(tree_config.all_kwargs()).enable_tree_reduction is True
 
 
 @pytest.mark.parametrize('use_cuda_graph', [False, True])
@@ -235,6 +268,32 @@ def test_prune_configs(with_perf_model: bool, device: str):
         assert records['run_early_config_prune']
         assert records['capture_kwargs']
         assert records['capture_named_args']
+
+
+def test_prune_configs_fractional_top_k_keeps_one(device: str):
+    # A fractional top_k that rounds down to zero for a small config set must
+    # still keep one config instead of pruning them all and crashing the later
+    # min() on an empty set: here int(2 * 0.3) == 0.
+    N = 1024
+    src = torch.randn(N, device=device)
+    dst = torch.empty(N, device=device)
+
+    def perf_model(*args, **kwargs):
+        return kwargs['BLOCK_SIZE']
+
+    configs = [triton.Config(kwargs={'BLOCK_SIZE': 32}), triton.Config(kwargs={'BLOCK_SIZE': 128})]
+    prune_configs_by = {'perf_model': perf_model, 'top_k': 0.3}
+
+    @triton.autotune(configs=configs, key=['N'], prune_configs_by=prune_configs_by, do_bench=do_bench)
+    @triton.jit
+    def _kernel(dst, src, N, BLOCK_SIZE: tl.constexpr):
+        offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        x = tl.load(src + offsets, mask=offsets < N)
+        tl.store(dst + offsets, x, mask=offsets < N)
+
+    grid = lambda META: (triton.cdiv(N, META['BLOCK_SIZE']), )
+    _kernel[grid](dst, src, N=N)
+    torch.testing.assert_close(src, dst)
 
 
 @pytest.mark.parametrize("prune_kind", ["early_config_prune", "perf_model"])

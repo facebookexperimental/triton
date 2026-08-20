@@ -219,7 +219,18 @@ __device__ bool areAtomicScopesCompatible(AtomicScope lhs, thread_id_t lhsTid,
          scopeCoversPair(rhs, lhsTid, rhsTid, globals);
 }
 
-__device__ void initThread(GlobalState *globals, Location loc) {
+GSAN_DEVICE bool canAccumulateReleaseRmw(ThreadState *state, AtomicScope scope,
+                                         const ScalarClock &previousWrite) {
+  // A propagated snapshot currently carries only one scope. Only combine
+  // concurrent releases when that scope remains unchanged.
+  if (!previousWrite.isRelease || scope != previousWrite.scope)
+    return false;
+  return areAtomicScopesCompatible(scope, state->threadId, previousWrite.scope,
+                                   previousWrite.threadId,
+                                   getGlobalState(state));
+}
+
+GSAN_DEVICE void initThread(GlobalState *globals, Location loc) {
   auto *state = getThreadState(globals);
 
   if (threadIdx.x == 0) {
@@ -303,9 +314,32 @@ __device__ const epoch_t *getSnapshotForWrite(ThreadState *state,
   return getClockBufferSlot(writerState, write.epoch, loc);
 }
 
-__device__ epoch_t propagateClockBufferSnapshot(ThreadState *state,
-                                                const ScalarClock &write,
-                                                Location loc) {
+GSAN_DEVICE epoch_t publishCurrentVectorClockWithPriorRelease(
+    ThreadState *state, const ScalarClock &previousWrite, Location loc) {
+  const auto *previousSnapshot = getSnapshotForWrite(state, previousWrite, loc);
+  auto *globals = getGlobalState(state);
+  assert_msg(loc, globals->clockBufferSize != 0,
+             "GSan clock buffer size must be non-zero");
+  uint32_t nextHead = state->clockBufferHead + 1;
+  assert_msg(loc, nextHead <= std::numeric_limits<epoch_t>::max(),
+             "GSan clock buffer token overflowed");
+  auto *slot = getClockBufferBase(state) +
+               (nextHead % globals->clockBufferSize) * globals->numThreads;
+  for (int i = 0; i < globals->numThreads; ++i) {
+    auto current = state->vectorClock[i];
+    auto previous = previousSnapshot[i];
+    slot[i] = current > previous ? current : previous;
+  }
+  state->clockBufferHead = nextHead;
+  // The joined snapshot extends the release sequence without acquiring the
+  // prior writer into this thread's vector clock.
+  state->clockBufferDirty = 1;
+  return static_cast<epoch_t>(nextHead);
+}
+
+GSAN_DEVICE epoch_t propagateClockBufferSnapshot(ThreadState *state,
+                                                 const ScalarClock &write,
+                                                 Location loc) {
   auto *snapshot = getSnapshotForWrite(state, write, loc);
   assert_msg(loc, snapshot != nullptr, "Invalid GSan propagated clock token");
   auto token = appendClockBufferSnapshot(state, snapshot, loc);
@@ -468,6 +502,8 @@ __device__ void readRange(ThreadState *state, uintptr_t read_addr, int nBytes,
   auto range = roundRange(Range{read_addr, read_addr + nBytes});
 
   auto reserveBase = state->reserveBase;
+  if (range.start >= reserveBase + kReserveSize || reserveBase >= range.end)
+    return;
   rwLockAcquireRead(state->lock);
 
   for (uintptr_t addr = range.start; addr < range.end;
@@ -594,12 +630,25 @@ __device__ void endAtomicAccess(AtomicEventState *event, bool pred,
                                 "Write after write race detected");
     }
 
+    auto previousWrite = event->cells[0]->writeClock;
     ScalarClock newWriteClock;
     if (hasRelease(sem)) {
-      auto token = publishCurrentVectorClock(state, loc);
+      epoch_t token;
+      if (canAccumulateReleaseRmw(state, scope, previousWrite))
+        token = publishCurrentVectorClockWithPriorRelease(state, previousWrite,
+                                                          loc);
+      else if (previousWrite.isRelease) {
+        const auto *previousSnapshot =
+            getSnapshotForWrite(state, previousWrite, loc);
+        assert_msg(loc, dominatesSnapshot(state, previousSnapshot),
+                   "GSan detected atomic release accumulation with mixed "
+                   "scopes, which is not supported.");
+        token = publishCurrentVectorClock(state, loc);
+      } else {
+        token = publishCurrentVectorClock(state, loc);
+      }
       newWriteClock = makePublishedClock(state, scope, token);
     } else {
-      auto previousWrite = event->cells[0]->writeClock;
       if (previousWrite.isRelease) {
         auto token = propagateClockBufferSnapshot(state, previousWrite, loc);
         newWriteClock = makePublishedClock(state, scope, token);

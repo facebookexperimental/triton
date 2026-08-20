@@ -39,6 +39,142 @@ using namespace mlir;
 
 namespace {
 
+// Materialize the schedule-group program at real LDS hazard boundaries. The
+// TTGIR pass provides the scheduling decision and exact machine counts; this
+// stage only gains the boundaries after ModuleMembarAnalysis.
+static void materializeDeferredSchedGroupBarriers(ModuleOp mod) {
+  if (!mod->hasAttr("ttg.amd.sched_group_barrier.enabled"))
+    return;
+
+  unsigned requiredRegionCount = 0;
+  if (auto attr = mod->getAttrOfType<IntegerAttr>(
+          "ttg.amd.sched_group_barrier.required_region_count"))
+    requiredRegionCount = static_cast<unsigned>(attr.getInt());
+
+  unsigned nextSyncId = 1;
+  mod.walk([&](triton::FuncOp func) {
+    for (Block &block : func.getBody()) {
+      SmallVector<Operation *> boundaries;
+      for (Operation &op : block.without_terminator())
+        if (isa<triton::gpu::BarrierOp>(op))
+          boundaries.push_back(&op);
+
+      SmallVector<SmallVector<Operation *>, 4> regions(1);
+      unsigned totalMFMA = 0;
+      unsigned totalAnchors = 0;
+      for (Operation &op : block.without_terminator()) {
+        if (isa<triton::gpu::BarrierOp>(op)) {
+          regions.emplace_back();
+          continue;
+        }
+        auto mask = op.getAttrOfType<IntegerAttr>(
+            "ttg.amd.sched_group_barrier.machine_mask");
+        auto count = op.getAttrOfType<IntegerAttr>(
+            "ttg.amd.sched_group_barrier.machine_count");
+        if (!mask || !count)
+          continue;
+        regions.back().push_back(&op);
+        if (mask.getInt() == (1 << 3))
+          totalMFMA += static_cast<unsigned>(count.getInt());
+        else
+          totalAnchors += static_cast<unsigned>(count.getInt());
+      }
+      if (totalMFMA == 0 || totalAnchors == 0 ||
+          (requiredRegionCount && regions.size() != requiredRegionCount))
+        continue;
+      boundaries.push_back(block.getTerminator());
+
+      Location loc = block.front().getLoc();
+      OpBuilder startBuilder(&block.front());
+      ROCDL::SchedBarrier::create(startBuilder, loc, /*mask=*/0);
+
+      for (auto [regionIndex, pair] :
+           llvm::enumerate(llvm::zip(regions, boundaries))) {
+        auto &[ops, boundary] = pair;
+        struct Anchor {
+          int32_t mask;
+          unsigned count;
+          unsigned mfmaCover;
+        };
+        SmallVector<Anchor> anchors;
+        unsigned mfmas = 0;
+        unsigned numWrites = 0;
+        for (Operation *op : ops) {
+          auto mask = op->getAttrOfType<IntegerAttr>(
+              "ttg.amd.sched_group_barrier.machine_mask");
+          auto count = op->getAttrOfType<IntegerAttr>(
+              "ttg.amd.sched_group_barrier.machine_count");
+          unsigned n = static_cast<unsigned>(count.getInt());
+          if (mask.getInt() == (1 << 3)) {
+            mfmas += n;
+            continue;
+          }
+          unsigned mfmaCover = 0;
+          if (auto attr = op->getAttrOfType<IntegerAttr>(
+                  "ttg.amd.sched_group_barrier.mfma_cover"))
+            mfmaCover = static_cast<unsigned>(attr.getInt());
+          anchors.push_back(
+              {static_cast<int32_t>(mask.getInt()), n, mfmaCover});
+          if (mask.getInt() == (1 << 9))
+            numWrites += n;
+        }
+
+        // In a memory-only prologue, issue the first global load after the
+        // first local-load operation instead of after every LDS read.
+        if (mfmas == 0 && anchors.size() > 2) {
+          auto firstGlobal = llvm::find_if(
+              anchors, [](const Anchor &a) { return a.mask == (1 << 5); });
+          if (firstGlobal != anchors.end() &&
+              firstGlobal != anchors.begin() + 1) {
+            Anchor global = *firstGlobal;
+            anchors.erase(firstGlobal);
+            anchors.insert(anchors.begin() + 1, global);
+          }
+        }
+
+        unsigned fixedCover = 0;
+        for (const Anchor &anchor : anchors) {
+          if (anchor.mask == (1 << 5))
+            fixedCover += anchor.mfmaCover * anchor.count;
+          else if (anchor.mask == (1 << 8))
+            fixedCover += anchor.count;
+        }
+        unsigned writeCover = 1;
+        if (numWrites && mfmas > fixedCover)
+          writeCover = std::max(1u, (mfmas - fixedCover) / numWrites);
+
+        struct Group {
+          int32_t mask;
+          unsigned cover;
+        };
+        SmallVector<Group> groups;
+        for (const Anchor &anchor : anchors) {
+          unsigned cover = anchor.mask == (1 << 5)   ? anchor.mfmaCover
+                           : anchor.mask == (1 << 8) ? 1
+                           : anchor.mask == (1 << 9) ? writeCover
+                                                     : 0;
+          for (unsigned i = 0; i < anchor.count; ++i)
+            groups.push_back({anchor.mask, mfmas ? cover : 0});
+        }
+
+        OpBuilder builder(boundary);
+        unsigned syncId = nextSyncId++;
+        for (const Group &group : groups) {
+          ROCDL::SchedGroupBarrier::create(builder, loc, group.mask, 1, syncId);
+          if (group.cover)
+            ROCDL::SchedGroupBarrier::create(builder, loc, 1 << 3, group.cover,
+                                             syncId);
+        }
+        if (regionIndex + 1 < regions.size())
+          ROCDL::SchedBarrier::create(builder, loc, /*mask=*/0);
+      }
+
+      OpBuilder endBuilder(block.getTerminator());
+      ROCDL::SchedBarrier::create(endBuilder, loc, /*mask=*/0);
+    }
+  });
+}
+
 class TritonLLVMFunctionConversionTarget : public ConversionTarget {
 public:
   explicit TritonLLVMFunctionConversionTarget(MLIRContext &ctx)
@@ -79,6 +215,13 @@ struct ConvertTritonAMDGPUToLLVM
     this->ftz = ftz;
   }
 
+  ConvertTritonAMDGPUToLLVM(StringRef gfxArch, bool ftz,
+                            bool enableTreeReduction) {
+    this->gfxArch = gfxArch.str();
+    this->ftz = ftz;
+    this->enableTreeReduction = enableTreeReduction;
+  }
+
   void getDependentDialects(DialectRegistry &registry) const override {
     registry
         .insert<LLVM::LLVMDialect, NVVM::NVVMDialect, mlir::ROCDL::ROCDLDialect,
@@ -114,6 +257,7 @@ struct ConvertTritonAMDGPUToLLVM
     ModuleMembarAnalysis membarPass(&allocation,
                                     mlir::triton::AMD::membarFilter);
     membarPass.run();
+    materializeDeferredSchedGroupBarriers(mod);
 
     // Lower functions
     {
@@ -184,8 +328,9 @@ struct ConvertTritonAMDGPUToLLVM
     AMD::populateTensorPtrOpsToLLVMPatterns(typeConverter, patterns,
                                             AMDBenefit);
 
-    populatePatterns7(mlir::triton::populateReduceOpToLLVMPatterns,
-                      commonBenefit);
+    mlir::triton::populateReduceOpToLLVMPatternsWithOptions(
+        typeConverter, patterns, targetInfo, commonBenefit,
+        enableTreeReduction);
     populatePatterns7(mlir::triton::populateScanOpToLLVMPatterns,
                       commonBenefit);
     populatePatterns5(mlir::triton::populateViewOpToLLVMPatterns,
@@ -286,6 +431,13 @@ namespace mlir::triton {
 std::unique_ptr<OperationPass<ModuleOp>>
 createConvertTritonAMDGPUToLLVMPass(StringRef gfxArch, bool ftz) {
   return std::make_unique<ConvertTritonAMDGPUToLLVM>(gfxArch, ftz);
+}
+
+std::unique_ptr<OperationPass<ModuleOp>>
+createConvertTritonAMDGPUToLLVMPass(StringRef gfxArch, bool ftz,
+                                    bool enableTreeReduction) {
+  return std::make_unique<ConvertTritonAMDGPUToLLVM>(gfxArch, ftz,
+                                                     enableTreeReduction);
 }
 
 } // namespace mlir::triton

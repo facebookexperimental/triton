@@ -1050,6 +1050,7 @@ static PyObject *launchKernel(PyObject *self, PyObject *args) {
   PyObject *arg_annotations = NULL;
   Py_buffer signature;
   PyObject *kernel_args = NULL;
+  PyObject *fast_kernel_args = NULL;
   if (!PyArg_ParseTuple(args, "piiiKKOO(iii)OOOiOy*O", &launch_cooperative_grid,
                         &gridX, &gridY, &gridZ, &_stream, &_function,
                         &global_scratch_obj, &profile_scratch_obj, &num_warps,
@@ -1067,14 +1068,31 @@ static PyObject *launchKernel(PyObject *self, PyObject *args) {
   uint8_t *extractor_data = (uint8_t *)signature.buf;
   Py_ssize_t num_args = signature.len;
 
-  // Extract kernel parameters - flatten tuples & remove constexpr.
-  PyObject **args_data = (PyObject **)alloca(num_args * sizeof(PyObject *));
-  if (args_data == NULL) {
-    goto cleanup;
-  }
-  int list_idx = 0;
-  if (!extractArgs(args_data, &list_idx, kernel_args, arg_annotations)) {
-    goto cleanup;
+  // Flat runtime signatures need no constexpr filtering or tuple flattening.
+  // Keep the annotation walk for structured signatures only.
+  PyObject **args_data;
+  if (arg_annotations == Py_None) {
+    fast_kernel_args = PySequence_Fast(
+        kernel_args, "Expected kernel_args to be a sequence or iterable");
+    if (!fast_kernel_args) {
+      goto cleanup;
+    }
+    if (PySequence_Fast_GET_SIZE(fast_kernel_args) != num_args) {
+      PyErr_Format(PyExc_TypeError,
+                   "Expected %zd kernel arguments, received %zd", num_args,
+                   PySequence_Fast_GET_SIZE(fast_kernel_args));
+      goto cleanup;
+    }
+    args_data = PySequence_Fast_ITEMS(fast_kernel_args);
+  } else {
+    args_data = (PyObject **)alloca(num_args * sizeof(PyObject *));
+    if (args_data == NULL) {
+      goto cleanup;
+    }
+    int list_idx = 0;
+    if (!extractArgs(args_data, &list_idx, kernel_args, arg_annotations)) {
+      goto cleanup;
+    }
   }
 
   // Number of parameters passed to kernel. + 2 for global & profile scratch.
@@ -1119,10 +1137,12 @@ static PyObject *launchKernel(PyObject *self, PyObject *args) {
   if (PyErr_Occurred()) {
     goto cleanup;
   }
+  Py_XDECREF(fast_kernel_args);
   PyBuffer_Release(&signature);
   Py_RETURN_NONE;
 
 cleanup:
+  Py_XDECREF(fast_kernel_args);
   PyBuffer_Release(&signature);
   return NULL;
 }

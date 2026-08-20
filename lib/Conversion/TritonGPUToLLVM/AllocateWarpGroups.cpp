@@ -170,7 +170,7 @@ struct AllocateWarpGroups
 
     bool needsRegisterOptimization = false;
     mod.walk([&](WarpSpecializeOp op) {
-      if (op.getRequestedRegisters())
+      if (op.getRequestedRegisters() || op.getDefaultRequestedRegisters())
         needsRegisterOptimization = true;
     });
 
@@ -210,13 +210,19 @@ struct AllocateWarpGroups
 
       // Require that an estimate has been set and that we have even warpgroups.
       auto regsAttr = op.getRequestedRegisters();
-      if (!regsAttr || op.getTotalPartitionWarps() % 4 != 0)
+      auto defaultRegsAttr = op.getDefaultRequestedRegisters();
+      if ((!regsAttr && !defaultRegsAttr) ||
+          op.getTotalPartitionWarps() % 4 != 0)
         return;
+
+      SmallVector<int32_t> requestedRegisters(arr.size(), -1);
+      if (regsAttr)
+        llvm::copy(*regsAttr, requestedRegisters.begin());
 
       // Group the partitions into warpgroups.
       SmallVector<WarpGroupPartition> orderedPartitions;
-      for (auto [startId, partition, estRegs, numWarps] :
-           llvm::zip(startIds, op.getPartitionRegions(), *regsAttr, arr)) {
+      for (auto [startId, partition, estRegs, numWarps] : llvm::zip(
+               startIds, op.getPartitionRegions(), requestedRegisters, arr)) {
         int minRegs =
             minRegistersForRegion(*partition, laterInstrumentation, estRegs);
         orderedPartitions.push_back({startId, partition, minRegs, numWarps});
@@ -244,77 +250,50 @@ struct AllocateWarpGroups
         warpGroups.back().numWarps += numWarps;
       }
 
-      // Check if any warp groups have the sentinel value (-1).
-      bool hasSentinelGroups =
-          llvm::any_of(warpGroups, [](const WarpGroupInfo &wg) {
-            return wg.maxRequestedRegs < 0;
-          });
-
       SmallVector<int32_t> maxnregsPerPartition(1 + arr.size());
 
-      if (!hasSentinelGroups) {
-        // All partitions have fixed register requests. Give leftover to
-        // the default partition (original behavior).
-        int registerBudget = maxnreg * baseNumWarps * threadsPerWarp;
-        for (const WarpGroupInfo &wg : warpGroups) {
-          assert(wg.numWarps % 4 == 0);
-          registerBudget +=
-              (maxnreg - wg.maxRequestedRegs) * wg.numWarps * threadsPerWarp;
-        }
-        if (registerBudget <= 0)
-          return;
+      int totalWarps = baseNumWarps;
+      for (const WarpGroupInfo &wg : warpGroups)
+        totalWarps += wg.numWarps;
+      int remainingRegs = maxnreg * totalWarps * threadsPerWarp;
+      int sharingThreads = 0;
 
-        int leftover = registerBudget / (baseNumWarps * threadsPerWarp);
-        leftover = leftover / 8 * 8;
-        if (leftover < minRegistersForRegion(op.getDefaultRegion(),
-                                             laterInstrumentation,
-                                             /*minRegisters=*/24))
-          return;
-
-        for (const WarpGroupInfo &wg : warpGroups) {
-          for (Region *region : wg.partitions)
-            maxnregsPerPartition[1 + region->getRegionNumber()] =
-                wg.maxRequestedRegs;
-        }
-        maxnregsPerPartition.front() = leftover;
+      int defaultRegs = -1;
+      if (defaultRegsAttr) {
+        defaultRegs = minRegistersForRegion(
+            op.getDefaultRegion(), laterInstrumentation, *defaultRegsAttr);
+        remainingRegs -= defaultRegs * baseNumWarps * threadsPerWarp;
       } else {
-        // Some warp groups are sentinel (-1). Fixed groups get their
-        // requested amount; sentinel groups and the default partition
-        // evenly split the remaining registers.
-        int totalWarps = baseNumWarps;
-        for (const WarpGroupInfo &wg : warpGroups)
-          totalWarps += wg.numWarps;
-        int totalRegs = maxnreg * totalWarps * threadsPerWarp;
+        sharingThreads += baseNumWarps * threadsPerWarp;
+      }
 
-        int fixedRegs = 0;
-        for (const WarpGroupInfo &wg : warpGroups) {
-          if (wg.maxRequestedRegs > 0)
-            fixedRegs += wg.maxRequestedRegs * wg.numWarps * threadsPerWarp;
-        }
-        int remainingRegs = totalRegs - fixedRegs;
-        if (remainingRegs <= 0)
+      for (const WarpGroupInfo &wg : warpGroups) {
+        assert(wg.numWarps % 4 == 0);
+        if (wg.maxRequestedRegs > 0)
+          remainingRegs -= wg.maxRequestedRegs * wg.numWarps * threadsPerWarp;
+        else
+          sharingThreads += wg.numWarps * threadsPerWarp;
+      }
+      if (remainingRegs < 0)
+        return;
+
+      int sharedRegs = -1;
+      if (sharingThreads > 0) {
+        sharedRegs = remainingRegs / sharingThreads;
+        sharedRegs = sharedRegs / 8 * 8;
+        int minSharedRegs = 24;
+        if (defaultRegs < 0)
+          minSharedRegs = minRegistersForRegion(
+              op.getDefaultRegion(), laterInstrumentation, minSharedRegs);
+        if (sharedRegs < minSharedRegs)
           return;
+      }
 
-        int leftoverThreads = baseNumWarps * threadsPerWarp;
-        for (const WarpGroupInfo &wg : warpGroups) {
-          if (wg.maxRequestedRegs < 0)
-            leftoverThreads += wg.numWarps * threadsPerWarp;
-        }
-
-        int leftoverRegsPerThread = remainingRegs / leftoverThreads;
-        leftoverRegsPerThread = leftoverRegsPerThread / 8 * 8;
-        if (leftoverRegsPerThread < minRegistersForRegion(op.getDefaultRegion(),
-                                                          laterInstrumentation,
-                                                          /*minRegisters=*/24))
-          return;
-
-        for (const WarpGroupInfo &wg : warpGroups) {
-          int regs = wg.maxRequestedRegs > 0 ? wg.maxRequestedRegs
-                                             : leftoverRegsPerThread;
-          for (Region *region : wg.partitions)
-            maxnregsPerPartition[1 + region->getRegionNumber()] = regs;
-        }
-        maxnregsPerPartition.front() = leftoverRegsPerThread;
+      maxnregsPerPartition.front() = defaultRegs > 0 ? defaultRegs : sharedRegs;
+      for (const WarpGroupInfo &wg : warpGroups) {
+        int regs = wg.maxRequestedRegs > 0 ? wg.maxRequestedRegs : sharedRegs;
+        for (Region *region : wg.partitions)
+          maxnregsPerPartition[1 + region->getRegionNumber()] = regs;
       }
 
       op.setActualRegisters(maxnregsPerPartition);

@@ -193,8 +193,14 @@ def matmul_kernel_pipelined_mi300(a_ptr, b_ptr, c_ptr, M, N, K, stride_am, strid
         b_k_smem_view = tlx.local_view(buffers_B, k % NUM_BUFFERS)
         a_load_reg = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K)
 
-        # do compute on data fetched ahead by NUM_STAGES - 1
-        buf = (k - NUM_STAGES - 1) % NUM_BUFFERS
+        # Compute on the tile fetched NUM_STAGES - 1 iterations ago, i.e. tile
+        #   k - (NUM_STAGES - 1) == k - NUM_BUFFERS
+        # since NUM_BUFFERS is defined as NUM_STAGES - 1 above. Buffers rotate
+        # modulo NUM_BUFFERS, so that tile sits in buffer
+        #   (k - NUM_BUFFERS) % NUM_BUFFERS == k % NUM_BUFFERS
+        # and it is read here before the local_store below refills the same
+        # buffer with tile k.
+        buf = k % NUM_BUFFERS
         a_k_prev_shmem = tlx.local_view(buffers_A, buf)
         b_k_prev_shmem = tlx.local_view(buffers_B, buf)
         a_k_prev_reg = tlx.local_load(a_k_prev_shmem)

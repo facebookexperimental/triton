@@ -87,6 +87,31 @@ if _CACHE_STATS_ON:
             print(f"  {kname}: {summary}", file=_sys.stderr, flush=True)
 
 
+def _make_hashable(v):
+    """Convert unhashable types to hashable equivalents for options hashing.
+
+    The C fast-path hashes non-parameter kwargs (e.g. ``extern_libs``) via
+    ``hash(tuple(sorted(opts.items())))``.  Dict/list/set values are not
+    hashable, so we recursively convert them:
+    - dicts  -> tuple of (key, transformed-value) pairs sorted by key
+    - sets   -> sorted tuple (order-independent hash)
+    - lists  -> tuple preserving order
+    """
+    if isinstance(v, dict):
+        return tuple((k, _make_hashable(val)) for k, val in sorted(v.items(), key=lambda kv: kv[0]))
+    if isinstance(v, (set, frozenset)):
+        return tuple(sorted(_make_hashable(x) for x in v))
+    if isinstance(v, list):
+        return tuple(_make_hashable(x) for x in v)
+    return v
+
+
+def _hash_fc_opts(opts):
+    """Compute a stable uint64 hash over non-parameter kwargs for the C fast cache."""
+    return hash(tuple(
+        (k, _make_hashable(v)) for k, v in sorted(opts.items(), key=lambda kv: kv[0]))) & 0xFFFFFFFFFFFFFFFF
+
+
 # Fast tensor access API — lazily registered on first use.
 # Provides ~10x faster dtype/data_ptr extraction via direct C struct access.
 _torch_bridge_loaded = False
@@ -469,7 +494,7 @@ class KernelInterface(Generic[T]):
     def run(self, *args, grid, warmup, **kwargs):
         raise NotImplementedError("run not implemented")
 
-    def __getitem__(self, grid) -> T:
+    def __getitem__(self: "KernelInterface[Callable[..., R]]", grid) -> Callable[..., R]:
         """
         A JIT function is launched with: fn[grid](*args, **kwargs).
         Hence JITFunction.__getitem__ returns a callable proxy that
@@ -903,6 +928,9 @@ class JITFunction(JITCallable, KernelInterface[T]):
         from ..compiler import CompiledKernel, compile, ASTSource, make_backend
         target = driver.active.get_current_target()
         backend = make_backend(target)
+        if self.c_cache:
+            get_threshold = getattr(backend, "get_tensor_size_specialization_threshold", None)
+            self._fc_tensor_size_threshold = (get_threshold() if get_threshold else None) or 0
         self.CompiledKernel = CompiledKernel
         self.compile = compile
         self.ASTSource = ASTSource
@@ -973,8 +1001,7 @@ class JITFunction(JITCallable, KernelInterface[T]):
                     else:
                         _fc_opts[k] = v
                 _fc_args = tuple(_fc_args)
-                _fc_hash = (hash(tuple(sorted(_fc_opts.items())))
-                            & 0xFFFFFFFFFFFFFFFF) if _fc_opts else self._fc_options_hash
+                _fc_hash = _hash_fc_opts(_fc_opts) if _fc_opts else self._fc_options_hash
             else:
                 _fc_args = args
                 _fc_hash = self._fc_options_hash
@@ -1029,6 +1056,8 @@ class JITFunction(JITCallable, KernelInterface[T]):
                 reasons.append("pre_run_hooks active")
             if knobs.compilation.always_compile:
                 reasons.append("always_compile=True")
+            if self.used_global_vals:
+                reasons.append("used_global_vals non-empty")
             if knobs.runtime.add_stages_inspection_hook is not None:
                 reasons.append("add_stages_inspection_hook active")
             if knobs.runtime.launch_enter_hook:
@@ -1043,6 +1072,18 @@ class JITFunction(JITCallable, KernelInterface[T]):
                 stacklevel=2,
             )
         _user_kwargs = dict(kwargs) if kwargs else {}
+        # When the autotuner seeds the C fast-dispatch cache it stores the
+        # winning config's compilation options (num_warps, ctas_per_cga, …) in
+        # _fc_meta_kwargs. The steady-state autotuner path dispatches via
+        # self.fn[grid](*args) WITHOUT those kwargs. If the C cache misses (new
+        # argument specialization), we fall through to here and need the options
+        # for a correct recompilation. Merge them as defaults so callers that
+        # explicitly pass kwargs still win.
+        _fc_meta = getattr(self, '_fc_meta_kwargs', None)
+        if _fc_meta:
+            for k, v in _fc_meta.items():
+                if k not in kwargs:
+                    kwargs[k] = v
         kwargs["debug"] = kwargs.get("debug", self.debug) or knobs.runtime.debug
         # Enable sanitize_overflow if explicitly set via kwarg, env var (TRITON_SANITIZE_OVERFLOW), or if debug is enabled
         kwargs["sanitize_overflow"] = kwargs.get("sanitize_overflow",
@@ -1178,8 +1219,7 @@ class JITFunction(JITCallable, KernelInterface[T]):
                         else:
                             _ins_opts[k] = v
                     _ins_args = tuple(_ins_args)
-                    _ins_hash = (hash(tuple(sorted(_ins_opts.items())))
-                                 & 0xFFFFFFFFFFFFFFFF) if _ins_opts else self._fc_options_hash
+                    _ins_hash = _hash_fc_opts(_ins_opts) if _ins_opts else self._fc_options_hash
                 else:
                     _ins_args = args
                     _ins_hash = self._fc_options_hash
@@ -1331,7 +1371,7 @@ class JITFunction(JITCallable, KernelInterface[T]):
                             [attrs], warmup)
         return kernel
 
-    def __call__(self: "JITFunction[Callable[P, R]]", *args: P.args, **kwargs: P.kwargs) -> R:
+    def __call__(self: "JITFunction[Callable[..., R]]", *args: Any, **kwargs: Any) -> R:
         raise RuntimeError("Cannot call @triton.jit'd outside of the scope of a kernel")
 
     if TYPE_CHECKING:

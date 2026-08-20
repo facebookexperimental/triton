@@ -195,21 +195,13 @@ def _validate_config(meta: dict[str, object], M: int, N: int, K: int) -> None:
 
     assert block_m == 128, "scaled MMA requires BLOCK_SIZE_M=128"
     assert num_ctas in SUPPORTED_NUM_CTAS, "NUM_CTAS must be 1 or 2"
-    assert (
-        block_n % num_ctas == 0 and block_n // num_ctas <= 256
-    ), "scaled MMA supports at most 256 B columns per CTA"
+    assert (block_n % num_ctas == 0 and block_n // num_ctas <= 256), "scaled MMA supports at most 256 B columns per CTA"
     assert block_k % 128 == 0, "BLOCK_SIZE_K must cover complete scale tiles"
     assert meta["EPILOGUE_SUBTILE"] in (1, 2, 4), "unsupported epilogue subtile"
-    assert (
-        meta.get("NUM_MMA_GROUPS", 1) == SUPPORTED_NUM_MMA_GROUPS
-    ), "scaled MMA requires one 128-row MMA group"
-    assert (
-        int(meta.get("GROUP_SIZE_M", 1)) % num_ctas == 0
-    ), "GROUP_SIZE_M must be a multiple of NUM_CTAS"
+    assert (meta.get("NUM_MMA_GROUPS", 1) == SUPPORTED_NUM_MMA_GROUPS), "scaled MMA requires one 128-row MMA group"
+    assert (int(meta.get("GROUP_SIZE_M", 1)) % num_ctas == 0), "GROUP_SIZE_M must be a multiple of NUM_CTAS"
     if num_ctas == 2:
-        assert (
-            int(meta.get("NUM_TMEM_BUFFERS", 1)) == 1
-        ), "2-CTA MXFP8 requires one TMEM buffer"
+        assert (int(meta.get("NUM_TMEM_BUFFERS", 1)) == 1), "2-CTA MXFP8 requires one TMEM buffer"
 
     split_k = int(meta.get("SPLIT_K", 1))
     k_tiles = triton.cdiv(K, block_k)
@@ -276,39 +268,16 @@ def preprocess_configs(configs, named_args, **kwargs):
         k_tiles = math.ceil(K / BLOCK_K)
         logical_mn_tiles = math.ceil(M / 128) * math.ceil(N / 128)
         if logical_mn_tiles <= 8 and K <= 512:
-            if not (
-                BLOCK_N == 128
-                and BLOCK_K == 128
-                and NUM_SMEM_BUFFERS in (3, 4)
-                and NUM_TMEM_BUFFERS in (1, 2)
-                and EPILOGUE_SUBTILE in (1, 4)
-                and NUM_CTAS == 1
-                and SPLIT_K == 1
-            ):
+            if not (BLOCK_N == 128 and BLOCK_K == 128 and NUM_SMEM_BUFFERS in (3, 4) and NUM_TMEM_BUFFERS in (1, 2)
+                    and EPILOGUE_SUBTILE in (1, 4) and NUM_CTAS == 1 and SPLIT_K == 1):
                 continue
         elif logical_mn_tiles <= 64 and N <= 512 and K <= 512:
-            if not (
-                BLOCK_N == 128
-                and BLOCK_K == 128
-                and conf.kwargs["GROUP_SIZE_M"] == 4
-                and NUM_SMEM_BUFFERS == 4
-                and NUM_TMEM_BUFFERS == 1
-                and EPILOGUE_SUBTILE == 1
-                and NUM_CTAS == 1
-                and SPLIT_K == 1
-            ):
+            if not (BLOCK_N == 128 and BLOCK_K == 128 and conf.kwargs["GROUP_SIZE_M"] == 4 and NUM_SMEM_BUFFERS == 4
+                    and NUM_TMEM_BUFFERS == 1 and EPILOGUE_SUBTILE == 1 and NUM_CTAS == 1 and SPLIT_K == 1):
                 continue
         elif logical_mn_tiles <= 16 and K <= 2048:
-            if not (
-                BLOCK_N == 128
-                and BLOCK_K == 128
-                and conf.kwargs["GROUP_SIZE_M"] == 4
-                and NUM_SMEM_BUFFERS == 4
-                and NUM_TMEM_BUFFERS == 1
-                and EPILOGUE_SUBTILE == 1
-                and NUM_CTAS == 1
-                and SPLIT_K == 1
-            ):
+            if not (BLOCK_N == 128 and BLOCK_K == 128 and conf.kwargs["GROUP_SIZE_M"] == 4 and NUM_SMEM_BUFFERS == 4
+                    and NUM_TMEM_BUFFERS == 1 and EPILOGUE_SUBTILE == 1 and NUM_CTAS == 1 and SPLIT_K == 1):
                 continue
         if SPLIT_K > 1:
             if num_mn_tiles >= NUM_SMS:
@@ -345,11 +314,8 @@ def preprocess_configs(configs, named_args, **kwargs):
         return pruned_configs
 
     def _total_tiles(c):
-        return (
-            math.ceil(M / c.kwargs["BLOCK_SIZE_M"])
-            * math.ceil(N / c.kwargs["BLOCK_SIZE_N"])
-            * c.kwargs.get("SPLIT_K", 1)
-        )
+        return (math.ceil(M / c.kwargs["BLOCK_SIZE_M"]) * math.ceil(N / c.kwargs["BLOCK_SIZE_N"]) *
+                c.kwargs.get("SPLIT_K", 1))
 
     def _num_waves(c):
         return math.ceil(_total_tiles(c) / NUM_SMS)
@@ -370,9 +336,7 @@ def preprocess_configs(configs, named_args, **kwargs):
         min_waves = min(_num_waves(conf) for conf in group_configs)
         best = [conf for conf in group_configs if _num_waves(conf) == min_waves]
         max_split_k = max(conf.kwargs.get("SPLIT_K", 1) for conf in best)
-        result.extend(
-            conf for conf in best if conf.kwargs.get("SPLIT_K", 1) == max_split_k
-        )
+        result.extend(conf for conf in best if conf.kwargs.get("SPLIT_K", 1) == max_split_k)
     pruned_configs = result
 
     # Keep the traversal families that win in both the BF16 tutorial and ADS
@@ -381,131 +345,67 @@ def preprocess_configs(configs, named_args, **kwargs):
     imbalance_threshold = 10
     if M > N * imbalance_threshold:
         if K <= 512:
-            target_tmem_buffers = (1,)
+            target_tmem_buffers = (1, )
             pruned_configs = [
-                conf
-                for conf in pruned_configs
-                if conf.kwargs["BLOCK_SIZE_K"] == 128
-                and conf.kwargs["GROUP_SIZE_M"] == 4
-                and conf.kwargs["NUM_SMEM_BUFFERS"] == 4
-                and conf.kwargs["NUM_TMEM_BUFFERS"]
-                in (
-                    target_tmem_buffers
-                    if conf.kwargs["NUM_CTAS"] == 1
-                    else (1,)
-                )
-                and conf.kwargs["EPILOGUE_SUBTILE"] == 1
-                and (
-                    (
-                        N > 256
-                        and conf.kwargs["BLOCK_SIZE_N"] == 128
-                        and conf.kwargs["NUM_CTAS"] == 1
-                    )
-                    or (
-                        N <= 256
-                        and conf.kwargs["BLOCK_SIZE_N"] == 256
-                        and conf.kwargs["NUM_CTAS"] == 2
-                    )
-                )
+                conf for conf in pruned_configs
+                if conf.kwargs["BLOCK_SIZE_K"] == 128 and conf.kwargs["GROUP_SIZE_M"] == 4
+                and conf.kwargs["NUM_SMEM_BUFFERS"] == 4 and conf.kwargs["NUM_TMEM_BUFFERS"] in (
+                    target_tmem_buffers if conf.kwargs["NUM_CTAS"] == 1 else (
+                        1, )) and conf.kwargs["EPILOGUE_SUBTILE"] == 1 and (
+                            (N > 256 and conf.kwargs["BLOCK_SIZE_N"] == 128 and conf.kwargs["NUM_CTAS"] == 1) or
+                            (N <= 256 and conf.kwargs["BLOCK_SIZE_N"] == 256 and conf.kwargs["NUM_CTAS"] == 2))
             ]
-        pruned_configs = [
-            conf
-            for conf in pruned_configs
-            if conf.kwargs["GROUP_SIZE_M"] in (4, 64)
-        ]
+        pruned_configs = [conf for conf in pruned_configs if conf.kwargs["GROUP_SIZE_M"] in (4, 64)]
         if 512 < K <= 2048:
             pruned_configs = [
-                conf
-                for conf in pruned_configs
-                if conf.kwargs["BLOCK_SIZE_N"] == 128
-                and conf.kwargs["BLOCK_SIZE_K"] == 128
-                and conf.kwargs["GROUP_SIZE_M"] == 4
-                and conf.kwargs["NUM_SMEM_BUFFERS"] == 5
-                and conf.kwargs["NUM_TMEM_BUFFERS"] == 3
-                and conf.kwargs["EPILOGUE_SUBTILE"] == 4
-                and conf.kwargs["NUM_CTAS"] == 1
+                conf for conf in pruned_configs
+                if conf.kwargs["BLOCK_SIZE_N"] == 128 and conf.kwargs["BLOCK_SIZE_K"] == 128 and conf.
+                kwargs["GROUP_SIZE_M"] == 4 and conf.kwargs["NUM_SMEM_BUFFERS"] == 5 and conf.kwargs["NUM_TMEM_BUFFERS"]
+                == 3 and conf.kwargs["EPILOGUE_SUBTILE"] == 4 and conf.kwargs["NUM_CTAS"] == 1
             ]
     elif N > M * imbalance_threshold:
-        pruned_configs = [
-            conf for conf in pruned_configs if conf.kwargs["GROUP_SIZE_M"] >= 32
-        ]
+        pruned_configs = [conf for conf in pruned_configs if conf.kwargs["GROUP_SIZE_M"] >= 32]
         min_logical_tiles = math.ceil(M / 128) * math.ceil(N / 256)
         if N > M * 16 and 512 < K < 2048:
             pruned_configs = [
-                conf
-                for conf in pruned_configs
-                if conf.kwargs["BLOCK_SIZE_N"] == 128
-                and conf.kwargs["BLOCK_SIZE_K"] == 128
-                and conf.kwargs["GROUP_SIZE_M"] == 64
-                and conf.kwargs["NUM_SMEM_BUFFERS"] == 6
-                and conf.kwargs["NUM_TMEM_BUFFERS"] == 3
-                and conf.kwargs["EPILOGUE_SUBTILE"] == 4
-                and conf.kwargs["NUM_CTAS"] == 1
+                conf for conf in pruned_configs if conf.kwargs["BLOCK_SIZE_N"] == 128
+                and conf.kwargs["BLOCK_SIZE_K"] == 128 and conf.kwargs["GROUP_SIZE_M"] == 64
+                and conf.kwargs["NUM_SMEM_BUFFERS"] == 6 and conf.kwargs["NUM_TMEM_BUFFERS"] == 3
+                and conf.kwargs["EPILOGUE_SUBTILE"] == 4 and conf.kwargs["NUM_CTAS"] == 1
             ]
         elif 8192 < K < 16384:
             pruned_configs = [
-                conf
-                for conf in pruned_configs
-                if conf.kwargs["BLOCK_SIZE_N"] == 256
-                and conf.kwargs["BLOCK_SIZE_K"] == 128
-                and conf.kwargs["GROUP_SIZE_M"] == 64
-                and conf.kwargs["NUM_SMEM_BUFFERS"] == 6
-                and conf.kwargs["NUM_TMEM_BUFFERS"] == 1
-                and conf.kwargs["EPILOGUE_SUBTILE"] == 4
-                and conf.kwargs["NUM_CTAS"] == 2
+                conf for conf in pruned_configs if conf.kwargs["BLOCK_SIZE_N"] == 256
+                and conf.kwargs["BLOCK_SIZE_K"] == 128 and conf.kwargs["GROUP_SIZE_M"] == 64
+                and conf.kwargs["NUM_SMEM_BUFFERS"] == 6 and conf.kwargs["NUM_TMEM_BUFFERS"] == 1
+                and conf.kwargs["EPILOGUE_SUBTILE"] == 4 and conf.kwargs["NUM_CTAS"] == 2
             ]
         elif N > M * 32 and 2048 <= K <= 8192:
             pruned_configs = [
-                conf
-                for conf in pruned_configs
-                if conf.kwargs["BLOCK_SIZE_N"] == 256
-                and conf.kwargs["BLOCK_SIZE_K"] == 128
-                and conf.kwargs["GROUP_SIZE_M"] == 64
-                and conf.kwargs["NUM_SMEM_BUFFERS"] == 6
-                and conf.kwargs["NUM_TMEM_BUFFERS"] == 1
-                and conf.kwargs["EPILOGUE_SUBTILE"] == 4
-                and conf.kwargs["NUM_CTAS"] == 2
+                conf for conf in pruned_configs if conf.kwargs["BLOCK_SIZE_N"] == 256
+                and conf.kwargs["BLOCK_SIZE_K"] == 128 and conf.kwargs["GROUP_SIZE_M"] == 64
+                and conf.kwargs["NUM_SMEM_BUFFERS"] == 6 and conf.kwargs["NUM_TMEM_BUFFERS"] == 1
+                and conf.kwargs["EPILOGUE_SUBTILE"] == 4 and conf.kwargs["NUM_CTAS"] == 2
             ]
         elif K >= 16384 and min_logical_tiles <= 4 * NUM_SMS:
             pruned_configs = [
-                conf
-                for conf in pruned_configs
-                if conf.kwargs["BLOCK_SIZE_K"] == 128
-                and conf.kwargs["GROUP_SIZE_M"] == 64
-                and conf.kwargs["NUM_SMEM_BUFFERS"] == 6
-                and conf.kwargs["EPILOGUE_SUBTILE"] == 4
-                and (
-                    (
-                        conf.kwargs["BLOCK_SIZE_N"] == 128
-                        and conf.kwargs["NUM_TMEM_BUFFERS"] == 2
-                        and conf.kwargs["NUM_CTAS"] == 1
-                    )
-                    or (
-                        conf.kwargs["BLOCK_SIZE_N"] == 256
-                        and conf.kwargs["NUM_TMEM_BUFFERS"] == 1
-                        and conf.kwargs["NUM_CTAS"] == 2
-                    )
-                )
+                conf for conf in pruned_configs
+                if conf.kwargs["BLOCK_SIZE_K"] == 128 and conf.kwargs["GROUP_SIZE_M"] == 64
+                and conf.kwargs["NUM_SMEM_BUFFERS"] == 6 and conf.kwargs["EPILOGUE_SUBTILE"] == 4 and (
+                    (conf.kwargs["BLOCK_SIZE_N"] == 128 and conf.kwargs["NUM_TMEM_BUFFERS"] == 2 and conf.
+                     kwargs["NUM_CTAS"] == 1) or (conf.kwargs["BLOCK_SIZE_N"] == 256 and conf.kwargs["NUM_TMEM_BUFFERS"]
+                                                  == 1 and conf.kwargs["NUM_CTAS"] == 2))
             ]
     else:
         if M >= 2048 and N >= 2048 and 2048 <= K <= 8192:
             pruned_configs = [
-                conf
-                for conf in pruned_configs
-                if conf.kwargs["BLOCK_SIZE_N"] == 128
-                and conf.kwargs["BLOCK_SIZE_K"] == 256
-                and conf.kwargs["GROUP_SIZE_M"] == 4
-                and conf.kwargs["NUM_SMEM_BUFFERS"] == 4
-                and conf.kwargs["NUM_TMEM_BUFFERS"] == 1
-                and conf.kwargs["EPILOGUE_SUBTILE"] == 2
-                and conf.kwargs["NUM_CTAS"] == 2
+                conf for conf in pruned_configs
+                if conf.kwargs["BLOCK_SIZE_N"] == 128 and conf.kwargs["BLOCK_SIZE_K"] == 256 and conf.
+                kwargs["GROUP_SIZE_M"] == 4 and conf.kwargs["NUM_SMEM_BUFFERS"] == 4 and conf.kwargs["NUM_TMEM_BUFFERS"]
+                == 1 and conf.kwargs["EPILOGUE_SUBTILE"] == 2 and conf.kwargs["NUM_CTAS"] == 2
             ]
         else:
-            pruned_configs = [
-                conf
-                for conf in pruned_configs
-                if conf.kwargs["GROUP_SIZE_M"] in (4, 8, 64)
-            ]
+            pruned_configs = [conf for conf in pruned_configs if conf.kwargs["GROUP_SIZE_M"] in (4, 8, 64)]
 
     # Match BF16's Pareto filter across pipeline resource dimensions.
     def _pipeline_key(conf):
@@ -529,9 +429,7 @@ def preprocess_configs(configs, named_args, **kwargs):
     def _dominates(lhs, rhs):
         lhs_value = _pipeline_value(lhs)
         rhs_value = _pipeline_value(rhs)
-        return all(x >= y for x, y in zip(lhs_value, rhs_value)) and any(
-            x > y for x, y in zip(lhs_value, rhs_value)
-        )
+        return all(x >= y for x, y in zip(lhs_value, rhs_value)) and any(x > y for x, y in zip(lhs_value, rhs_value))
 
     pipeline_groups = {}
     for conf in pruned_configs:
@@ -545,16 +443,9 @@ def preprocess_configs(configs, named_args, **kwargs):
     result = []
     for group_configs in pipeline_groups.values():
         result.extend(
-            conf
-            for conf in group_configs
-            if (conf.kwargs["NUM_SMEM_BUFFERS"], conf.kwargs["NUM_TMEM_BUFFERS"])
-            in pipeline_anchors
-            or not any(
-                _dominates(other, conf)
-                for other in group_configs
-                if other is not conf
-            )
-        )
+            conf for conf in group_configs
+            if (conf.kwargs["NUM_SMEM_BUFFERS"], conf.kwargs["NUM_TMEM_BUFFERS"]) in pipeline_anchors or not any(
+                _dominates(other, conf) for other in group_configs if other is not conf))
     return result
 
 
@@ -824,9 +715,7 @@ def _reduce_k_kernel(  # noqa: TR001
 
     acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for split_id in range(SPLIT_K):
-        partial = tl.load(
-            workspace_ptr + base_offs + split_id * M * N, mask=mask, other=0.0
-        )
+        partial = tl.load(workspace_ptr + base_offs + split_id * M * N, mask=mask, other=0.0)
         acc += partial.to(tl.float32)
 
     tl.store(out_ptr + base_offs, acc.to(REDUCE_OUTPUT_DTYPE), mask=mask)
@@ -893,9 +782,7 @@ def _gemm_mxfp8_ws_kernel(  # noqa: TR001
         BLOCK_SIZE_N % NUM_CTAS == 0 and BLOCK_SIZE_N // NUM_CTAS <= 256,
         "scaled MMA supports at most 256 B columns per CTA",
     )
-    tl.static_assert(
-        BLOCK_SIZE_K % 128 == 0, "BLOCK_SIZE_K must cover complete scale tiles"
-    )
+    tl.static_assert(BLOCK_SIZE_K % 128 == 0, "BLOCK_SIZE_K must cover complete scale tiles")
     tl.static_assert(NUM_CTAS == 1 or NUM_CTAS == 2, "NUM_CTAS must be 1 or 2")
     tl.static_assert(NUM_MMA_GROUPS == 1, "scaled MMA uses one 128-row MMA group")
 
@@ -948,9 +835,9 @@ def _gemm_mxfp8_ws_kernel(  # noqa: TR001
     else:
         cta_bars = smem_full
     with tlx.async_tasks(
-        exclusive=True,
-        no_ending_cluster_sync=True,
-        mbarrier_try_wait_suspend_ns=50000,
+            exclusive=True,
+            no_ending_cluster_sync=True,
+            mbarrier_try_wait_suspend_ns=50000,
     ):
         with tlx.async_task("default"):
             (
@@ -976,13 +863,9 @@ def _gemm_mxfp8_ws_kernel(  # noqa: TR001
             tmem_count = 0
             tile_id = start_tile_id
             while tile_id < num_tiles:
-                k_tile_start, k_tile_end = _compute_k_range(
-                    tile_id, num_mn_tiles, k_tiles_total, SPLIT_K
-                )
+                k_tile_start, k_tile_end = _compute_k_range(tile_id, num_mn_tiles, k_tiles_total, SPLIT_K)
                 if SPLIT_K == 1 or k_tile_end > k_tile_start:
-                    tmem_buf, tmem_phase = get_bufidx_phase(
-                        tmem_count, NUM_TMEM_BUFFERS
-                    )
+                    tmem_buf, tmem_phase = get_bufidx_phase(tmem_count, NUM_TMEM_BUFFERS)
                     _process_tile_epilogue_inner(
                         tile_id=tile_id,
                         num_pid_in_group=num_pid_in_group,
@@ -1031,24 +914,16 @@ def _gemm_mxfp8_ws_kernel(  # noqa: TR001
             tmem_count = 0
             tile_id = start_tile_id
             while tile_id < num_tiles:
-                k_tile_start, k_tile_end = _compute_k_range(
-                    tile_id, num_mn_tiles, k_tiles_total, SPLIT_K
-                )
+                k_tile_start, k_tile_end = _compute_k_range(tile_id, num_mn_tiles, k_tiles_total, SPLIT_K)
                 if SPLIT_K == 1 or k_tile_end > k_tile_start:
-                    tmem_buf, tmem_phase = get_bufidx_phase(
-                        tmem_count, NUM_TMEM_BUFFERS
-                    )
+                    tmem_buf, tmem_phase = get_bufidx_phase(tmem_count, NUM_TMEM_BUFFERS)
                     if PEELED_FIRST_K:
-                        smem_buf, smem_phase = get_bufidx_phase(
-                            smem_count, NUM_SMEM_BUFFERS
-                        )
+                        smem_buf, smem_phase = get_bufidx_phase(smem_count, NUM_SMEM_BUFFERS)
                         tlx.barrier_wait(smem_full[smem_buf], smem_phase)
                         tlx.barrier_wait(tmem_empty[tmem_buf], tmem_phase ^ 1)
                         if NUM_CTAS == 2:
                             pred_cta0 = cluster_cta_rank == 0
-                            tlx.barrier_arrive(
-                                cta_bars[smem_buf], arrive_count=1, remote_cta_rank=0
-                            )
+                            tlx.barrier_arrive(cta_bars[smem_buf], arrive_count=1, remote_cta_rank=0)
                             tlx.barrier_wait(
                                 cta_bars[smem_buf],
                                 phase=smem_phase,
@@ -1090,12 +965,8 @@ def _gemm_mxfp8_ws_kernel(  # noqa: TR001
                         DO_MMA=True,
                         USE_ACC_INITIAL=PEELED_FIRST_K,
                     )
-                    last_smem_buf, last_smem_phase = get_bufidx_phase(
-                        smem_count - 1, NUM_SMEM_BUFFERS
-                    )
-                    tlx.barrier_wait(
-                        smem_empty[last_smem_buf], last_smem_phase
-                    )
+                    last_smem_buf, last_smem_phase = get_bufidx_phase(smem_count - 1, NUM_SMEM_BUFFERS)
+                    tlx.barrier_wait(smem_empty[last_smem_buf], last_smem_phase)
                     tlx.barrier_arrive(tmem_full[tmem_buf], arrive_count=1)
                     tmem_count += 1
                 tile_id += num_programs
@@ -1124,9 +995,7 @@ def _gemm_mxfp8_ws_kernel(  # noqa: TR001
             smem_count = 0
             tile_id = start_tile_id
             while tile_id < num_tiles:
-                k_tile_start, k_tile_end = _compute_k_range(
-                    tile_id, num_mn_tiles, k_tiles_total, SPLIT_K
-                )
+                k_tile_start, k_tile_end = _compute_k_range(tile_id, num_mn_tiles, k_tiles_total, SPLIT_K)
                 if SPLIT_K == 1 or k_tile_end > k_tile_start:
                     smem_count = _process_tile_producer_inner(
                         tile_id=tile_id,
@@ -1160,9 +1029,7 @@ def _gemm_mxfp8_ws_kernel(  # noqa: TR001
 
 def _reshape_scale(scale: torch.Tensor, rows: int, k: int) -> torch.Tensor:
     expected_elements = rows * k // VEC_SIZE
-    assert (
-        scale.numel() == expected_elements
-    ), f"Expected {expected_elements} E8M0 scales, got {scale.numel()}"
+    assert (scale.numel() == expected_elements), f"Expected {expected_elements} E8M0 scales, got {scale.numel()}"
     return scale.reshape(1, rows // 128, k // 128, 2, 256)
 
 
@@ -1183,20 +1050,16 @@ _BEST_CONFIG_CACHE: dict[tuple[int, int, int, int], dict[str, object]] = {}
 
 def _config_to_meta(config) -> dict[str, object]:
     meta = dict(config.kwargs)
-    meta.update(
-        {
-            "num_warps": config.num_warps,
-            "num_stages": config.num_stages,
-            "ctas_per_cga": config.ctas_per_cga,
-            "pre_hook": config.pre_hook,
-        }
-    )
+    meta.update({
+        "num_warps": config.num_warps,
+        "num_stages": config.num_stages,
+        "ctas_per_cga": config.ctas_per_cga,
+        "pre_hook": config.pre_hook,
+    })
     return meta
 
 
-def _launch_with_config(
-    a_desc, a_scale_desc, b_desc, b_scale_desc, out_desc, M, N, K, meta
-):
+def _launch_with_config(a_desc, a_scale_desc, b_desc, b_scale_desc, out_desc, M, N, K, meta):
     meta = dict(meta)
     ctas_per_cga = meta.pop("ctas_per_cga", None)
     pre_hook = meta.pop("pre_hook", None)
@@ -1208,9 +1071,7 @@ def _launch_with_config(
         ctas_per_cga = expected_ctas_per_cga
     assert ctas_per_cga == expected_ctas_per_cga, "ctas_per_cga must match NUM_CTAS"
 
-    workspace_desc = TensorDescriptor(
-        out_desc.base, out_desc.shape, out_desc.strides, [1, 1]
-    )
+    workspace_desc = TensorDescriptor(out_desc.base, out_desc.shape, out_desc.strides, [1, 1])
     hook_args = {
         "a_desc": a_desc,
         "a_scale_desc": a_scale_desc,
@@ -1232,7 +1093,7 @@ def _launch_with_config(
     num_pid_m = triton.cdiv(M, meta["BLOCK_SIZE_M"])
     num_pid_m = ((num_pid_m + num_ctas - 1) // num_ctas) * num_ctas
     total_tiles = num_pid_m * triton.cdiv(N, meta["BLOCK_SIZE_N"]) * split_k
-    grid = (min(_get_num_sms(), total_tiles),)
+    grid = (min(_get_num_sms(), total_tiles), )
     _gemm_mxfp8_ws_kernel.fn[grid](
         a_desc,
         a_scale_desc,
@@ -1288,9 +1149,7 @@ def matmul(
     assert b.dtype == torch.float8_e4m3fn, "B must use E4M3 data"
     assert a.is_contiguous() and b.is_contiguous(), "A and B must be contiguous"
     assert a.device == b.device, "A and B must be on the same device"
-    assert (
-        a_scale.device == a.device and b_scale.device == a.device
-    ), "Data and scales must be on the same device"
+    assert (a_scale.device == a.device and b_scale.device == a.device), "Data and scales must be on the same device"
     assert a_scale.dtype == torch.float8_e8m0fnu
     assert b_scale.dtype == torch.float8_e8m0fnu
 
@@ -1303,9 +1162,7 @@ def matmul(
     a_scale = _reshape_scale(a_scale, M, K)
     b_scale = _reshape_scale(b_scale, N, K)
     out = torch.empty((M, N), device=a.device, dtype=torch.bfloat16)
-    a_desc, a_scale_desc, b_desc, b_scale_desc, out_desc = _make_descriptors(
-        a, b, a_scale, b_scale, out
-    )
+    a_desc, a_scale_desc, b_desc, b_scale_desc, out_desc = _make_descriptors(a, b, a_scale, b_scale, out)
 
     def alloc_fn(size: int, _alignment: int, _stream: int | None):
         return torch.empty(size, dtype=torch.int8, device=a.device)
@@ -1338,7 +1195,7 @@ def matmul(
             num_pid_m = triton.cdiv(M, META["BLOCK_SIZE_M"])
             num_pid_m = ((num_pid_m + num_ctas - 1) // num_ctas) * num_ctas
             total_tiles = num_pid_m * triton.cdiv(N, META["BLOCK_SIZE_N"]) * split_k
-            return (min(_get_num_sms(), total_tiles),)
+            return (min(_get_num_sms(), total_tiles), )
 
         workspace_desc = TensorDescriptor(out, out.shape, out.stride(), [1, 1])
         _gemm_mxfp8_ws_kernel[grid](
@@ -1372,7 +1229,5 @@ def matmul(
 
     meta = _normalize_config(config)
     _validate_config(meta, M, N, K)
-    _launch_with_config(
-        a_desc, a_scale_desc, b_desc, b_scale_desc, out_desc, M, N, K, meta
-    )
+    _launch_with_config(a_desc, a_scale_desc, b_desc, b_scale_desc, out_desc, M, N, K, meta)
     return out

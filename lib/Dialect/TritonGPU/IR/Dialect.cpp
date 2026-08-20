@@ -2099,11 +2099,18 @@ SharedLinearEncodingAttr::toLinearLayout(ArrayRef<int64_t> shape) const {
   const auto &ll = getLinearLayout();
   auto outDimNames = llvm::to_vector(ll.getOutDimNames());
   assert(shape.size() == outDimNames.size());
-  // We don't support automatic broadcasting for shared linear layouts
-  for (auto [size, llSize] : llvm::zip(shape, ll.getOutDimSizes())) {
-    assert(size == llSize);
+  LinearLayout result = ll;
+  // A memdesc_subslice retains its parent's encoding and carries its physical
+  // base separately.  Permit the logical tile to shrink by dropping bases
+  // outside the subview; growing would be implicit broadcasting and remains
+  // unsupported.
+  for (auto [dim, size, llSize] :
+       llvm::zip(outDimNames, shape, ll.getOutDimSizes())) {
+    assert(size <= llSize);
+    if (size < llSize)
+      result = result.resizeOutDim(dim, size);
   }
-  return ll;
+  return result;
 }
 
 //===----------------------------------------------------------------------===//

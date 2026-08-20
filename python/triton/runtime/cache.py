@@ -76,7 +76,7 @@ class FileCacheManager(CacheManager):
             return None
         grp_filepath = self._make_path(grp_filename)
         try:
-            with open(grp_filepath) as f:
+            with open(grp_filepath, encoding="utf-8") as f:
                 grp_data = json.load(f)
         except Exception:
             # exit on corrupted cache.
@@ -117,9 +117,12 @@ class FileCacheManager(CacheManager):
         os.makedirs(temp_dir, exist_ok=True)
         temp_path = os.path.join(temp_dir, filename)
 
-        mode = "wb" if binary else "w"
-        with open(temp_path, mode) as f:
-            f.write(data)
+        if binary:
+            with open(temp_path, "wb") as f:
+                f.write(data)
+        else:
+            with open(temp_path, "w", encoding="utf-8") as f:
+                f.write(data)
         # Replace is guaranteed to be atomic on POSIX systems if it succeeds
         # so filepath cannot see a partial write
         os.replace(temp_path, filepath)

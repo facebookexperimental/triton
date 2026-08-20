@@ -165,7 +165,8 @@ struct ConvertLayoutOpConversion
     std::pair<Value, Value> coordinates = distributedCoordinates
                                               ? *distributedCoordinates
                                               : getLaneAndWarpId(rewriter, loc);
-    auto [laneId, warpId] = coordinates;
+    Value laneId = coordinates.first;
+    Value warpId = coordinates.second;
     auto elemPtrTy = ptr_ty(ctx, targetInfo.getSharedAddressSpace());
     smemBase = b.bitcast(smemBase, elemPtrTy);
 
@@ -374,7 +375,8 @@ struct ConvertLayoutOpConversion
       // Store
       lowerLdStShared(loc, ctx, storeCvt, tileInVals, llvmElemTy, smemBase,
                       /*paddingShifts=*/{}, affineOffset, maskSpanAffineOffset,
-                      rewriter, targetInfo,
+                      /*affineBlockOffset=*/Value(),
+                      /*maskSpanAffineBlock=*/0, rewriter, targetInfo,
                       /*maybeMaxVecElems=*/{},
                       /*localLoadOp=*/nullptr,
                       /*ctaRank=*/{},
@@ -383,7 +385,8 @@ struct ConvertLayoutOpConversion
       // Load
       auto tileOutVals = lowerLdStShared(
           loc, ctx, loadCvt, {}, llvmElemTy, smemBase, /*paddingShifts=*/{},
-          affineOffset, maskSpanAffineOffset, rewriter, targetInfo,
+          affineOffset, maskSpanAffineOffset, /*affineBlockOffset=*/Value(),
+          /*maskSpanAffineBlock=*/0, rewriter, targetInfo,
           /*maybeMaxVecElems=*/{},
           /*localLoadOp=*/nullptr,
           /*ctaRank=*/{},

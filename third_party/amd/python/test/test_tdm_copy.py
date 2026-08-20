@@ -162,6 +162,35 @@ def vector_add_tdm_kernel(
     ttgl.store(c_ptr + offs, c, mask=mask)
 
 
+@gluon.jit
+def vector_add_tdm_fused_kernel(a_ptr, b_ptr, c_ptr, M, N, BLOCK_M: ttgl.constexpr, BLOCK_N: ttgl.constexpr):
+    """Two positioned descriptors selected by disjoint warp subsets."""
+    BLOCKED_LAYOUT: ttgl.constexpr = ttgl.BlockedLayout([1, 8], [4, 8], [4, 1], [1, 0])
+    SHARED_LAYOUT: ttgl.constexpr = ttgl.PaddedSharedLayout.with_identity_for([[32, 4]], [BLOCK_M, BLOCK_N], [1, 0])
+    off_m = ttgl.program_id(axis=0) * BLOCK_M
+    off_n = ttgl.program_id(axis=1) * BLOCK_N
+    a_desc = ttgl.amd.gfx1250.tdm.make_tensor_descriptor(base=a_ptr, shape=(M, N), strides=(N, 1),
+                                                         block_shape=(BLOCK_M, BLOCK_N), layout=SHARED_LAYOUT)
+    b_desc = ttgl.amd.gfx1250.tdm.make_tensor_descriptor(base=b_ptr, shape=(M, N), strides=(N, 1),
+                                                         block_shape=(BLOCK_M, BLOCK_N), layout=SHARED_LAYOUT)
+    a_desc = ttgl.amd.gfx1250.tdm.update_tensor_descriptor(a_desc, add_offsets=[off_m, off_n], pred=True,
+                                                           clamp_bounds=True)
+    b_desc = ttgl.amd.gfx1250.tdm.update_tensor_descriptor(b_desc, add_offsets=[off_m, off_n], pred=True,
+                                                           clamp_bounds=True)
+    a_buf = ttgl.allocate_shared_memory(a_desc.dtype, a_desc.block_shape, a_desc.layout)
+    b_buf = ttgl.allocate_shared_memory(b_desc.dtype, b_desc.block_shape, b_desc.layout)
+    ttgl.amd.gfx1250.tdm.async_load_fused([
+        (a_desc, a_buf, 0b0011),
+        (b_desc, b_buf, 0b1100),
+    ])
+    ttgl.amd.gfx1250.tdm.async_wait(0)
+    c = a_buf.load(layout=BLOCKED_LAYOUT) + b_buf.load(layout=BLOCKED_LAYOUT)
+    offs_m = off_m + ttgl.arange(0, BLOCK_M, layout=ttgl.SliceLayout(1, BLOCKED_LAYOUT))
+    offs_n = off_n + ttgl.arange(0, BLOCK_N, layout=ttgl.SliceLayout(0, BLOCKED_LAYOUT))
+    offsets = offs_m[:, None] * N + offs_n[None, :]
+    ttgl.store(c_ptr + offsets, c, mask=(offs_m[:, None] < M) & (offs_n[None, :] < N))
+
+
 # Hint cookbook for `vector_add_tdm_kernel`.  Layout: (HINT_A, HINT_B,
 # id).  Bit `i` => warp `i`; `0` selects the kwarg-free load (an
 # explicit zero is rejected by the verifier).  All entries below are
@@ -229,6 +258,29 @@ def test_compile_vector_add_tdm(BLOCK_M, BLOCK_N, HINT_A, HINT_B):
     n_tdm = len(re.findall(r"tensor_load_to_lds", amdgcn))
     assert n_tdm == 2, (f"expected two tensor_load_to_lds for HINT_A=0b{HINT_A:08b}, "
                         f"HINT_B=0b{HINT_B:08b}, got {n_tdm}\n{amdgcn}")
+
+
+def test_compile_vector_add_tdm_fused():
+    signature = {
+        "a_ptr": "*fp16",
+        "b_ptr": "*fp16",
+        "c_ptr": "*fp16",
+        "M": "i32",
+        "N": "i32",
+        "BLOCK_M": "constexpr",
+        "BLOCK_N": "constexpr",
+    }
+    kernel = triton.compile(
+        gluon._runtime.GluonASTSource(
+            fn=vector_add_tdm_fused_kernel,
+            signature=signature,
+            constexprs={"BLOCK_M": 16, "BLOCK_N": 32},
+        ),
+        target=GPUTarget("hip", "gfx1250", 32),
+        options={"num_warps": 4},
+    )
+    assert "amdg.async_tdm_fused_copy_global_to_local" in kernel.asm["ttgir"]
+    assert len(re.findall(r"tensor_load_to_lds", kernel.asm["amdgcn"])) == 1
 
 
 @gluon.jit

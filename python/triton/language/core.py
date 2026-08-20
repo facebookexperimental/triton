@@ -1850,7 +1850,8 @@ def _aggregate(cls):
     hash_attrs = [init]
 
     for (name, member) in inspect.getmembers(cls):
-        if inspect.isfunction(member) or inspect.ismethod(member) or isinstance(member, JITCallable):
+        if (inspect.isfunction(member) or inspect.ismethod(member) or isinstance(member, JITCallable)
+                or isinstance(member, property)):
             if name == "__init__":
                 continue
             # __annotate__ is a Python 3.14+ internal; exclude from hash and
@@ -1865,7 +1866,11 @@ def _aggregate(cls):
 
             # Exclude __annotate_func__ from hash — isn't user facing (Python 3.14+).
             if name != "__annotate_func__":
-                hash_attrs.append(member)
+                if isinstance(member, property):
+                    hash_attrs.extend(accessor for accessor in (member.fget, member.fset, member.fdel)
+                                      if accessor is not None)
+                else:
+                    hash_attrs.append(member)
 
     aggregate_value.hash_attrs = hash_attrs
     aggregate_value.__name__ = cls.__name__
@@ -1995,6 +2000,10 @@ class _block_ptr:
     def _tile_shape(self):
         return [_unwrap_if_constexpr(extent) for extent in self.block_shape]
 
+    @property
+    def dtype(self) -> pointer_type:
+        return typing.cast(pointer_type, self.base.dtype)
+
     def _materialize(self, boundary_check=(), _semantic=None):
         tile_shape = self._tile_shape()
         checked_dims = _canonicalize_block_ptr_boundary_check(boundary_check, len(tile_shape))
@@ -2064,7 +2073,6 @@ class _block_ptr:
 
 
 _block_ptr.__triton_block_ptr__ = True
-_block_ptr.dtype = property(lambda self: self.base.dtype)
 
 # -----------------------
 # SPMD Programming Model
@@ -2407,6 +2415,7 @@ def reshape(input, *shape, can_reorder=False, _semantic=None, _generator=None):
         reshape(x, 32, 32)
     """
     shape = _shape_check_impl(_unwrap_iterable(shape))
+    can_reorder = _unwrap_if_constexpr(can_reorder)
     if len(shape) == 0:
         return _unsplat(input, _semantic=_semantic, _generator=_generator)
     return _semantic.reshape(input, shape, can_reorder)
@@ -3787,6 +3796,7 @@ def device_print(prefix, *args, hex=False, _semantic=None):
     import string
 
     prefix = _unwrap_if_constexpr(prefix)
+    hex = _unwrap_if_constexpr(hex)
     assert isinstance(prefix, str), f"{prefix} is not string"
     b_ascii = True
     for ch in prefix:
@@ -4026,26 +4036,31 @@ class AutoWSLoopOptions(base_value):
     option is one new field), and the code generator emits them identically onto
     ``scf.for`` and ``scf.while``. See ``tl.range`` for the per-option docs.
     """
-    num_stages: Optional[constexpr] = field(default=None, metadata=_loop_attr("tt.num_stages", "int32"))
-    loop_unroll_factor: Optional[constexpr] = field(default=None, metadata=_loop_attr("tt.loop_unroll_factor", "int32"))
-    disallow_acc_multi_buffer: bool = field(default=False, metadata=_loop_attr("tt.disallow_acc_multi_buffer", "unit"))
-    flatten: bool = field(default=False, metadata=_loop_attr("tt.flatten", "unit"))
-    warp_specialize: bool = field(default=False, metadata=_loop_attr("tt.warp_specialize", "unit"))
-    multi_cta: bool = field(default=False, metadata=_loop_attr("tt.multi_cta", "unit"))
-    disable_licm: bool = field(default=False, metadata=_loop_attr("llvm.loop_annotation", "licm"))
-    data_partition_factor: Optional[constexpr] = field(default=None,
-                                                       metadata=_loop_attr("tt.data_partition_factor", "int32"))
-    list_schedule_pick: Optional[constexpr] = field(default=None, metadata=_loop_attr("tt.list_schedule_pick", "int32"))
-    mem_plan_pick: Optional[constexpr] = field(default=None, metadata=_loop_attr("tt.mem_plan_pick", "int32"))
-    merge_epilogue: bool = field(default=False, metadata=_loop_attr("tt.merge_epilogue", "bool"))
-    merge_epilogue_to_computation: bool = field(default=False, metadata=_loop_attr("tt.merge_epilogue_to_computation",
-                                                                                   "bool"))
-    merge_correction: bool = field(default=False, metadata=_loop_attr("tt.merge_correction", "bool"))
-    separate_epilogue_store: bool = field(default=False, metadata=_loop_attr("tt.separate_epilogue_store", "bool"))
-    tmem_alloc_algo: Optional[constexpr] = field(default=None, metadata=_loop_attr("tt.tmem_alloc_algo", "int32"))
-    smem_alloc_algo: Optional[constexpr] = field(default=None, metadata=_loop_attr("tt.smem_alloc_algo", "int32"))
-    smem_budget: Optional[constexpr] = field(default=None, metadata=_loop_attr("tt.smem_budget", "int32"))
-    smem_circular_reuse: Optional[bool] = field(default=None, metadata=_loop_attr("tt.smem_circular_reuse", "bool_opt"))
+    num_stages: int | constexpr | None = field(default=None, metadata=_loop_attr("tt.num_stages", "int32"))
+    loop_unroll_factor: int | constexpr | None = field(default=None,
+                                                       metadata=_loop_attr("tt.loop_unroll_factor", "int32"))
+    disallow_acc_multi_buffer: bool | constexpr = field(default=False,
+                                                        metadata=_loop_attr("tt.disallow_acc_multi_buffer", "unit"))
+    flatten: bool | constexpr = field(default=False, metadata=_loop_attr("tt.flatten", "unit"))
+    warp_specialize: bool | constexpr = field(default=False, metadata=_loop_attr("tt.warp_specialize", "unit"))
+    multi_cta: bool | constexpr = field(default=False, metadata=_loop_attr("tt.multi_cta", "unit"))
+    disable_licm: bool | constexpr = field(default=False, metadata=_loop_attr("llvm.loop_annotation", "licm"))
+    data_partition_factor: int | constexpr | None = field(default=None,
+                                                          metadata=_loop_attr("tt.data_partition_factor", "int32"))
+    list_schedule_pick: int | constexpr | None = field(default=None,
+                                                       metadata=_loop_attr("tt.list_schedule_pick", "int32"))
+    mem_plan_pick: int | constexpr | None = field(default=None, metadata=_loop_attr("tt.mem_plan_pick", "int32"))
+    merge_epilogue: bool | constexpr = field(default=False, metadata=_loop_attr("tt.merge_epilogue", "bool"))
+    merge_epilogue_to_computation: bool | constexpr = field(
+        default=False, metadata=_loop_attr("tt.merge_epilogue_to_computation", "bool"))
+    merge_correction: bool | constexpr = field(default=False, metadata=_loop_attr("tt.merge_correction", "bool"))
+    separate_epilogue_store: bool | constexpr = field(default=False,
+                                                      metadata=_loop_attr("tt.separate_epilogue_store", "bool"))
+    tmem_alloc_algo: int | constexpr | None = field(default=None, metadata=_loop_attr("tt.tmem_alloc_algo", "int32"))
+    smem_alloc_algo: int | constexpr | None = field(default=None, metadata=_loop_attr("tt.smem_alloc_algo", "int32"))
+    smem_budget: int | constexpr | None = field(default=None, metadata=_loop_attr("tt.smem_budget", "int32"))
+    smem_circular_reuse: bool | constexpr | None = field(default=None,
+                                                         metadata=_loop_attr("tt.smem_circular_reuse", "bool_opt"))
 
 
 @dataclass(eq=False)

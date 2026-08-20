@@ -38,6 +38,9 @@ def ConvertTritonAMDGPUToLLVM
               "Specify the GFX architecture name, e.g., gfx942, gfx950, etc.">,
        Option<"ftz", "ftz", "bool", /*default*/ "true",
               "flush denorms for math functions">,
+       Option<"enableTreeReduction", "enable-tree-reduction",
+              "bool", /*default*/ "false",
+              "use tree-shaped, vectorized in-thread reductions">,
   ];
 }
 

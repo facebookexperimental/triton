@@ -34,6 +34,8 @@ public:
   Value loadDShared(RewriterBase &rewriter, Location loc, Value ptr,
                     Value ctaId, Type elemTy, Value pred,
                     Operation *localLoadOp = nullptr) const override;
+  Value mapDShared(RewriterBase &rewriter, Location loc, Value ptr, Value ctaId,
+                   Value pred) const;
 
   void copyBulkSharedToRemoteShared(RewriterBase &rewriter, Location loc,
                                     Value srcPtr, Value dstPtr,
@@ -97,6 +99,10 @@ public:
   int getPtxVersion() const { return ptxVersion; }
   int getComputeCapability() const {
     return targetFeatures.getComputeCapability();
+  }
+  bool supportsMbarrierMulticast() const {
+    // mbarrier.arrive.multicast was introduced in PTX 9.4 for Rubin.
+    return targetFeatures.supportsMbarMulticast() && ptxVersion >= 94;
   }
   const triton::nvidia_gpu::TargetFeatures &getTargetFeatures() const {
     return targetFeatures;

@@ -6,6 +6,8 @@ import re
 import gc
 import shutil
 import pathlib
+import subprocess
+import sys
 from concurrent.futures import Executor, Future, ThreadPoolExecutor
 
 import pytest
@@ -15,6 +17,29 @@ import triton
 import triton.language as tl
 from triton._internal_testing import is_hip
 from triton.runtime.cache import FileCacheManager, RemoteCacheManager
+
+
+def test_file_cache_manager_writes_utf8_under_ascii_locale(tmp_path):
+    env = os.environ.copy()
+    env.update({
+        "LANG": "C",
+        "LC_ALL": "C",
+        "PYTHONCOERCECLOCALE": "0",
+        "PYTHONUTF8": "0",
+        "TRITON_CACHE_DIR": str(tmp_path),
+    })
+    script = """
+import locale
+from pathlib import Path
+
+from triton.runtime.cache import FileCacheManager
+
+assert locale.getpreferredencoding(False) == "ANSI_X3.4-1968"
+text = "generated launcher " + chr(0x2014)
+path = FileCacheManager("unicode").put(text, "launcher.c", binary=False)
+assert Path(path).read_text(encoding="utf-8") == text
+"""
+    subprocess.run([sys.executable, "-c", script], check=True, env=env)
 
 
 def test_file_cache_manager_get_group_rejects_missing_child(fresh_knobs, tmp_path):
@@ -825,6 +850,25 @@ def test_within_2gb(device, fresh_triton_cache) -> None:
             # Torch tensor <= 2GB
             kernel_add[(1, 0)](torch.empty(2**31 - 1, dtype=torch.int8, device=device))
             assert pointer_range_32 == pointer_range
+
+        with triton.knobs.runtime.scope():
+            # The C cache must distinguish HIP's storage-size specializations.
+            triton.knobs.runtime.jit_cache_hook = None
+            triton.knobs.amd.use_buffer_ops = True
+
+            @triton.jit(c_cache=True)
+            def kernel_add_with_c_cache(a):
+                tl.load(a)
+
+            launch = kernel_add_with_c_cache[(1, 0)]
+            launch(torch.empty(2**31 - 1, dtype=torch.int8, device=device))
+            assert kernel_add_with_c_cache.c_cache is True
+            device_id = getattr(torch, device).current_device()
+            kernel_cache = kernel_add_with_c_cache.device_caches[device_id][0]
+            assert len(kernel_cache) == 1
+
+            launch(torch.empty(2**31, dtype=torch.int8, device=device))
+            assert len(kernel_cache) == 2
 
 
 def test_function_arguments(device):

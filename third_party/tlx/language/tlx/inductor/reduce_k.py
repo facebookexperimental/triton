@@ -14,6 +14,7 @@ Ported from upstream:
 
 from __future__ import annotations
 
+import logging
 import textwrap
 from typing import Any, TYPE_CHECKING
 
@@ -24,6 +25,8 @@ import triton.language as tl
 
 if TYPE_CHECKING:
     from torch._inductor.codegen.wrapper import WrapperCodeGen
+
+log: logging.Logger = logging.getLogger(__name__)
 
 
 @triton.jit
@@ -61,6 +64,98 @@ def _reduce_k_kernel(
         acc += tl.load(bias_ptr + bias_offs, mask=mask, other=0.0).to(tl.float32)
 
     tl.store(c_ptr + base_offs, acc.to(OUTPUT_DTYPE), mask=mask)
+
+
+_TRITON_DTYPE = {
+    torch.float16: tl.float16,
+    torch.bfloat16: tl.bfloat16,
+    torch.float32: tl.float32,
+}
+
+# Above this the partial-results workspace is too big to allocate just for a
+# measurement; fall back to the bandwidth model.
+_MEASURE_WS_BYTES_LIMIT = 2 * 1024**3
+
+_reduce_k_cost_cache: dict[tuple, float] = {}
+
+
+def _modelled_cost_ms(M: int, N: int, split_k: int, itemsize: int) -> float:
+    """Bandwidth model for the reducer: it is purely streaming."""
+    read = split_k * M * N * 4  # fp32 partials
+    write = M * N * itemsize
+    try:
+        props = torch.cuda.get_device_properties(torch.cuda.current_device())
+        # memory_clock_rate is kHz, bus width is bits; fall back to a gfx950-ish
+        # 5 TB/s if the attributes are unavailable.
+        bw = 2 * props.memory_clock_rate * 1e3 * props.memory_bus_width / 8
+    except Exception:
+        bw = 0.0
+    if bw <= 0:
+        bw = 5.0e12
+    # ~70% of peak is what a pure streaming kernel achieves in practice.
+    return (read + write) / (0.7 * bw) * 1e3
+
+
+def reduce_k_cost_ms(
+    M: int, N: int, split_k: int, out_dtype: torch.dtype, has_bias: bool
+) -> float:
+    """Measured wall time of the split-K reducer for this output shape, in ms.
+
+    Autotune scores a template candidate on the GEMM kernel alone. A SPLIT_K > 1
+    candidate additionally needs `_reduce_k_kernel` to run before its output is
+    valid, so its true cost is main + reducer. Selection compares it against
+    SPLIT_K=1 candidates that carry no such tail, which is why split-K used to be
+    picked while being net-slower e2e. This returns the missing term.
+
+    Cached on (M, N, SPLIT_K, dtype, has_bias) so the many tile configs that share
+    one SPLIT_K pay a single measurement.
+    """
+    if split_k <= 1:
+        return 0.0
+    key = (M, N, split_k, out_dtype, has_bias)
+    hit = _reduce_k_cost_cache.get(key)
+    if hit is not None:
+        return hit
+
+    itemsize = torch.empty((), dtype=out_dtype).element_size()
+    ws_bytes = split_k * M * N * 4
+    cost = None
+    if ws_bytes <= _MEASURE_WS_BYTES_LIMIT and out_dtype in _TRITON_DTYPE:
+        try:
+            from torch._inductor.runtime.benchmarking import benchmarker
+
+            dev = torch.cuda.current_device()
+            ws = torch.empty(split_k * M * N, dtype=torch.float32, device=dev)
+            c = torch.empty((M, N), dtype=out_dtype, device=dev)
+            bias = torch.empty(N, dtype=out_dtype, device=dev) if has_bias else c
+            grid = (triton.cdiv(M, 32), triton.cdiv(N, 32))
+
+            def run() -> None:
+                _reduce_k_kernel[grid](
+                    ws, c, bias, M, N,
+                    SPLIT_K=split_k,
+                    BLOCK_SIZE_M=32,
+                    BLOCK_SIZE_N=32,
+                    OUTPUT_DTYPE=_TRITON_DTYPE[out_dtype],
+                    HAS_BIAS=has_bias,
+                    STRIDE_BIAS_M=0,
+                    STRIDE_BIAS_N=1,
+                )
+
+            cost = benchmarker.benchmark_gpu(run)
+            del ws, c, bias
+        except Exception as e:  # OOM, compile failure, API drift
+            log.warning(
+                "split-K reducer cost measurement failed for M=%s N=%s SPLIT_K=%s "
+                "(%s); falling back to the bandwidth model",
+                M, N, split_k, e,
+            )
+            cost = None
+    if cost is None:
+        cost = _modelled_cost_ms(M, N, split_k, itemsize)
+
+    _reduce_k_cost_cache[key] = cost
+    return cost
 
 
 def emit_reduce_k_call(
