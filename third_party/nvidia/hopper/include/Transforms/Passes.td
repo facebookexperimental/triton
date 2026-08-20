@@ -377,6 +377,63 @@ def NVGPUInsert2CTASync : Pass<"nvgpu-insert-2cta-sync", "mlir::ModuleOp"> {
   ];
 }
 
+def NVGPUAnalyze2CTADependencies : Pass<"nvgpu-analyze-2cta-dependencies", "mlir::ModuleOp"> {
+  let summary = "Classify dependencies between 2-CTA MMA operations";
+
+  let description = [{
+    Traces the SSA inputs of each 2-CTA TCGen5 MMA and classifies dependent
+    operand-A chains. A transposed dependent operand requires a peer gather;
+    an untransposed dependent operand is a collective contraction. The
+    resulting metadata is consumed by later exchange planning and is attached
+    before warp specialization so scheduling and memory planning can account
+    for the exchange.
+  }];
+
+  let dependentDialects = [
+    "mlir::triton::gpu::TritonGPUDialect",
+    "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"
+  ];
+}
+
+def NVGPUPlan2CTAExchange : Pass<"nvgpu-plan-2cta-exchange", "mlir::ModuleOp"> {
+  let summary = "Plan peer exchanges for dependent 2-CTA MMA operations";
+
+  let description = [{
+    Consumes dependency classifications produced by
+    nvgpu-analyze-2cta-dependencies. For each requires_peer_gather operand,
+    inserts an abstract ttng.two_cta_peer_gather before the shared-memory
+    allocation feeding the MMA. Hardware DSMEM operations are materialized
+    after warp specialization by a separate lowering pass.
+  }];
+
+  let dependentDialects = [
+    "mlir::triton::gpu::TritonGPUDialect",
+    "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"
+  ];
+}
+
+def NVGPUMaterialize2CTAExchange : Pass<"nvgpu-materialize-2cta-exchange", "mlir::ModuleOp"> {
+  let summary = "Materialize planned 2-CTA peer exchanges with DSMEM stores";
+
+  let description = [{
+    Lowers ttng.two_cta_peer_gather after warp specialization and software
+    pipelining. The lowering reuses the AutoWS-planned shared destination,
+    writes the CTA-owned half locally, and sends that half to the peer CTA's
+    matching slot with an async remote shared-memory store. Remote completion extends the
+    existing AutoWS full barrier, so its consumer wait observes the completed
+    tile without another shared allocation or cluster rendezvous.
+  }];
+
+  let dependentDialects = [
+    "mlir::arith::ArithDialect",
+    "mlir::scf::SCFDialect",
+    "mlir::triton::TritonDialect",
+    "mlir::triton::gpu::TritonGPUDialect",
+    "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect",
+    "mlir::triton::nvgpu::NVGPUDialect"
+  ];
+}
+
 def NVGPU2CTATransformLoads : Pass<"nvgpu-2cta-transform-loads", "mlir::ModuleOp"> {
   let summary = "Transform B matrix loads for 2-CTA MMA operations";
 
