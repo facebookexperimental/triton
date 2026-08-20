@@ -1066,10 +1066,9 @@ SmallVector<Value> lowerLdSt(
   bool blockIsBroadcast =
       !hasBlockInput ||
       cvt.sublayoutIsZero({kBlock}, to_vector(cvt.getOutDimNames()));
-  bool crossCTA =
-      hasBlockOutput &&
-      (maskSpanAffineBlock != 0 ||
-       (!blockIsBroadcast && !cvt.isIdentityOnOutDim(kBlock)));
+  bool crossCTA = hasBlockOutput &&
+                  (maskSpanAffineBlock != 0 ||
+                   (!blockIsBroadcast && !cvt.isIdentityOnOutDim(kBlock)));
 
   // Either we have multiple bases with a matching partition dimension,
   // or we have a single base.
@@ -1312,9 +1311,9 @@ SmallVector<Value> lowerLocalLdSt(
                                smemObj.getBases().end());
   return lowerLdStShared(loc, ctx, cvt, valsArray, llvmElemTy, smemBases,
                          paddingShifts, affineOffset, maskSpanAffineOffset,
-                         affineBlockOffset, maskSpanAffineBlock,
-                         rewriter, targetInfo, maybeMaxVecElems, localLoadOp,
-                         ctaRank, barrierPtr, distributedCoordinates);
+                         affineBlockOffset, maskSpanAffineBlock, rewriter,
+                         targetInfo, maybeMaxVecElems, localLoadOp, ctaRank,
+                         barrierPtr, distributedCoordinates);
 }
 
 SmallVector<Value> unpackLLElements(Location loc, Value llvmStruct,
