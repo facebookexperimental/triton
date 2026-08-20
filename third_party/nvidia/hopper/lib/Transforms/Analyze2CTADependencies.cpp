@@ -1,6 +1,14 @@
+// Classify dependent 2-CTA MMA operand chains before warp specialization.
+//
+// A collective contraction keeps its CTA-local operand; an operand that is a
+// transposed view of another 2-CTA MMA result cannot be re-loaded and must be
+// gathered from the peer CTA. See
+// WarpSpecialization/docs/AutoWS2CTABackwardPlan.md, "Dependency
+// classification and peer exchange".
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Pass/Pass.h"
 #include "nvidia/hopper/include/Transforms/Passes.h"
+#include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 
@@ -39,10 +47,32 @@ static bool dependsOnTwoCTAMMA(Value root, Operation *consumer) {
   return false;
 }
 
-static bool isTransposedMemDesc(Value value) {
+static bool requiresPeerGather(Value value) {
   while (auto subview = value.getDefiningOp<ttg::MemDescSubsliceOp>())
     value = subview.getSrc();
-  return value.getDefiningOp<ttg::MemDescTransOp>() != nullptr;
+  if (value.getDefiningOp<ttg::MemDescTransOp>())
+    return true;
+
+  auto alloc = value.getDefiningOp<ttg::LocalAllocOp>();
+  if (!alloc || !alloc.getSrc())
+    return false;
+
+  SmallVector<Value> worklist{alloc.getSrc()};
+  DenseSet<Value> visited;
+  while (!worklist.empty()) {
+    Value current = worklist.pop_back_val();
+    if (!visited.insert(current).second)
+      continue;
+    Operation *def = current.getDefiningOp();
+    if (!def)
+      continue;
+    if (isa<triton::TransOp>(def))
+      return true;
+    if (isa<ttng::TCGen5MMAOp>(def))
+      continue;
+    llvm::append_range(worklist, def->getOperands());
+  }
+  return false;
 }
 
 class Analyze2CTADependencies
@@ -60,8 +90,8 @@ public:
       if (!mma.getTwoCtas() || !dependsOnTwoCTAMMA(mma.getA(), mma))
         return;
 
-      StringRef kind = isTransposedMemDesc(mma.getA()) ? RequiresPeerGather
-                                                       : CollectiveContraction;
+      StringRef kind = requiresPeerGather(mma.getA()) ? RequiresPeerGather
+                                                      : CollectiveContraction;
       mma->setAttr(DependencyAttr, StringAttr::get(mma.getContext(), kind));
     });
   }

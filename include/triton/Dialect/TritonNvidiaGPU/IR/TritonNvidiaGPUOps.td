@@ -127,16 +127,21 @@ def TTNG_ClusterArriveOp : TTNG_Op<"cluster_arrive", []> {
 }
 
 def TTNG_TwoCTAPeerGatherOp : TTNG_Op<"two_cta_peer_gather", [
-    SameOperandsAndResultType,
     MemoryEffects<[MemRead<SharedMemory>, MemWrite<SharedMemory>]>
   ]> {
   let summary = "Abstract peer gather for a dependent 2-CTA MMA operand";
 
   let description = [{
     Represents the cross-CTA exchange needed to reconstruct a complete logical
-    tensor from two CTA-owned slices. This operation is inserted before warp
-    specialization so partition scheduling sees the dependency. A later pass
-    materializes DSMEM staging and synchronization.
+    tensor from two CTA-owned slices. This is an explicit operation, rather
+    than hidden transformation state, because its producer-consumer edge and
+    result lifetime must be visible to partition scheduling, channel creation,
+    and memory planning before the concrete DSMEM protocol can be selected.
+    A later pass materializes local/remote stores and synchronization.
+
+    `src` and `result` are rank-two tensors with the same element count and
+    element type. The result may have a different shape to represent the
+    physical layout consumed by the dependent MMA.
   }];
 
   let arguments = (ins
@@ -148,8 +153,33 @@ def TTNG_TwoCTAPeerGatherOp : TTNG_Op<"two_cta_peer_gather", [
 
   let assemblyFormat = [{
     $src `split_dim` `=` $splitDim `num_ctas` `=` $numCTAs attr-dict
-    `:` type($src)
+    `:` type($src) `->` type($result)
   }];
+  let hasVerifier = 1;
+}
+
+def TTNG_TwoCTAPeerRelayOp : TTNG_Op<"two_cta_peer_relay", [
+    MemoryEffects<[MemRead<SharedMemory>, MemWrite<SharedMemory>]>
+  ]> {
+  let summary = "Relay completion of a dependent 2-CTA peer gather";
+
+  let description = [{
+    Marks the shared-memory destination of a two-CTA peer gather for a
+    dedicated one-warp relay partition. AutoWS creates an independent channel
+    from the gather producer to this consumer. The post-WS materialization
+    pass redirects remote DSMEM completion to that channel and lowers this op
+    to publication on the MMA consumer channel. Keeping the relay as an
+    explicit operation makes that otherwise synchronization-only task visible
+    to partition allocation and prevents it from being folded into a compute
+    partition whose other warps do not participate.
+  }];
+
+  let arguments = (ins
+    Arg<TTG_MemDescType, "", [MemRead<SharedMemory>]>:$src
+  );
+
+  let assemblyFormat = "$src attr-dict `:` type($src)";
+  let hasVerifier = 1;
 }
 
 def TTNG_ClusterWaitOp : TTNG_Op<"cluster_wait", []> {
