@@ -1602,6 +1602,8 @@ static PyObject *JITCacheProxy_vectorcall(PyObject *callable,
   PyObject **merged_args = nullptr;
   PyObject *const *effective_args = args;
   int effective_nargs = (int)nargs;
+  uint64_t effective_options_hash = self->options_hash;
+  PyObject *option_items = nullptr;
 
   // When kwargs are present, merge them into positional args in C.
   // This mirrors the Python-side logic in jit.py run() c_cache path.
@@ -1616,7 +1618,10 @@ static PyObject *JITCacheProxy_vectorcall(PyObject *callable,
     // Copy positional args
     for (int i = 0; i < total; i++)
       merged_args[i] = (i < (int)nargs) ? (PyObject *)args[i] : Py_None;
-    // Merge kwargs by name lookup
+    // Merge kernel kwargs by name lookup.  Keywords that are not kernel
+    // parameters are compiler options (for example num_warps and
+    // waves_per_eu).  Hash those exactly like JITFunction.run() instead of
+    // forcing every fixed-option launch back through Python specialization.
     for (Py_ssize_t ki = 0; ki < nkw; ki++) {
       PyObject *name = PyTuple_GET_ITEM(kwnames, ki);
       PyObject *idx_obj = PyDict_GetItem(self->param_name_to_idx, name);
@@ -1625,11 +1630,31 @@ static PyObject *JITCacheProxy_vectorcall(PyObject *callable,
         if (idx >= 0 && idx < total)
           merged_args[idx] = (PyObject *)args[nargs + ki];
       }
-      // kwargs not in param_name_to_idx are "options" — affect hash only.
-      // For now, treat them as cache-miss (different options_hash) and
-      // fallback.
-      else
-        goto fallback;
+      else {
+        if (!option_items) {
+          option_items = PyList_New(0);
+          if (!option_items)
+            goto error;
+        }
+        PyObject *item = PyTuple_Pack(2, name, args[nargs + ki]);
+        if (!item || PyList_Append(option_items, item) < 0) {
+          Py_XDECREF(item);
+          goto error;
+        }
+        Py_DECREF(item);
+      }
+    }
+    if (option_items) {
+      if (PyList_Sort(option_items) < 0)
+        goto error;
+      PyObject *option_tuple = PyList_AsTuple(option_items);
+      if (!option_tuple)
+        goto error;
+      Py_hash_t option_hash = PyObject_Hash(option_tuple);
+      Py_DECREF(option_tuple);
+      if (option_hash == -1)
+        goto error;
+      effective_options_hash = (uint64_t)option_hash;
     }
     effective_args = merged_args;
     effective_nargs = total;
@@ -1656,7 +1681,7 @@ static PyObject *JITCacheProxy_vectorcall(PyObject *callable,
 
     FCCacheKey key;
     if (!fc_build_key(key, cache, effective_args, effective_nargs,
-                      self->options_hash))
+                      effective_options_hash))
       goto fallback;
 
     FCEntry *entry = cache->lookup(key, effective_args);
@@ -1724,20 +1749,27 @@ static PyObject *JITCacheProxy_vectorcall(PyObject *callable,
     if (!result) {
       // Propagate error — dispatcher may have partially launched.
       // Do NOT fallback (would risk double-launch).
+      Py_XDECREF(option_items);
       return nullptr;
     }
     Py_DECREF(result);
     Py_INCREF(kernel);
     if (g_cache_stats)
       cache_stats_record(self->kernel_name, "jit_proxy_hit");
+    Py_XDECREF(option_items);
     return kernel;
   }
+
+error:
+  Py_XDECREF(option_items);
+  return nullptr;
 
 fallback:
   // Fall through to Python: self.run(*args, grid=grid, warmup=False, **kwargs)
   // Use Vectorcall to preserve any keyword arguments from kwnames.
   if (g_cache_stats)
     cache_stats_record(self->kernel_name, "jit_proxy_fallback");
+  Py_XDECREF(option_items);
   return PyObject_Vectorcall(self->run_partial, args, nargsf, kwnames);
 }
 

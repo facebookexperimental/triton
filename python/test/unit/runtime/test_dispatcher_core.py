@@ -153,6 +153,37 @@ def test_hip_dispatcher_add_numerics_and_direct_call():
 
 
 @pytest.mark.skipif(not is_hip(), reason="Requires HIP")
+def test_hip_jit_proxy_accepts_fixed_compiler_options(monkeypatch):
+    """Fixed launch-option kwargs must not force repeat Python dispatch."""
+    N = 4096
+    BLOCK = 256
+    x = torch.randn(N, device="cuda")
+    y = torch.randn(N, device="cuda")
+    out = torch.empty(N, device="cuda")
+
+    with force_dispatcher():
+        # Populate the compiled-kernel and C specialization caches.
+        _disp_add[(17, )](
+            x, y, out, N, BLOCK=BLOCK, num_warps=4, waves_per_eu=0
+        )
+        torch.cuda.synchronize()
+
+        # Use a fresh static-grid proxy with the same specialization. If the
+        # compiler-option kwargs make the proxy miss, its fallback calls this
+        # replacement and fails the test. A C-cache hit bypasses run().
+        def fail_python_dispatch(*args, **kwargs):
+            raise AssertionError("fixed compiler options fell back to JITFunction.run")
+
+        monkeypatch.setattr(_disp_add, "run", fail_python_dispatch)
+        _disp_add[(19, )](
+            x, y, out, N, BLOCK=BLOCK, num_warps=4, waves_per_eu=0
+        )
+
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out, x + y)
+
+
+@pytest.mark.skipif(not is_hip(), reason="Requires HIP")
 def test_hip_dispatcher_rejects_pageable_cpu_pointer():
     N = 256
     x = torch.randn(N, device="cpu")

@@ -8,8 +8,10 @@ import torch
 import triton
 
 from triton.language.extra.tlx.ops.amd_pa_decode import (
+    allocate_pa_decode_workspace as _allocate_pa_decode_workspace,
     pa_decode_tlx as _pa_decode_tlx,
     build_inputs as _build_inputs,
+    get_pa_decode_config as _get_pa_decode_config,
 )
 
 from triton._internal_testing import is_hip
@@ -28,6 +30,7 @@ DECODE_METHODS = (
     "aiter_gluon",
     "tlx_5d",
     "tlx_5d_streaming",
+    "tlx_gluon_compat",
     "tlx",
 )
 # PR #2306 target comparison: standalone AITER common/HIP, SGLang's actual
@@ -52,7 +55,22 @@ def _make_decode_fn(
 ):
     expected_ndim = 4 if provider == "tlx" else 5
     assert kc.ndim == vc.ndim == expected_ndim
-    if provider in ("tlx", "tlx_5d", "tlx_5d_streaming"):
+    if provider in ("tlx", "tlx_5d", "tlx_5d_streaming", "tlx_gluon_compat"):
+        streaming_kv = True if provider == "tlx_5d_streaming" else None
+        # None lets the production TLX provider select its tuned B1 path;
+        # True retains an explicit provider for controlled comparisons.
+        gluon_compat = True if provider == "tlx_gluon_compat" else None
+        config = _get_pa_decode_config(
+            q,
+            kc,
+            vc,
+            bt,
+            query_length=qlen,
+            max_context_len=max_context_len,
+            streaming_kv=streaming_kv,
+            gluon_compat=gluon_compat,
+        )
+        workspace = _allocate_pa_decode_workspace(q, kc, config)
 
         def _run_tlx():
             return _pa_decode_tlx(
@@ -65,7 +83,10 @@ def _make_decode_fn(
                 sm_scale,
                 query_length=qlen,
                 max_context_len=max_context_len,
-                streaming_kv=True if provider == "tlx_5d_streaming" else None,
+                streaming_kv=streaming_kv,
+                gluon_compat=gluon_compat,
+                workspace=workspace,
+                config=config,
             )
 
         return _run_tlx

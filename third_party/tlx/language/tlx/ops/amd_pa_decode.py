@@ -11,8 +11,9 @@ plain ``@triton.jit`` kernel that merges the per-split partials for each output
 ``(token, query_head)`` via the standard LSE trick.
 
 For tuned D64 saturated shapes, phase 1 instead vector-loads packed K and V
-directly into their MFMA register ownership while QK/softmax remains
-register-distributed. This avoids both KV LDS round trips and scalar VMEM.
+while QK/softmax remains register-distributed.  Its qlen1/group8
+``gluon_compat`` specialization pins Gluon's exact packed load ownership, so
+the final K/V MFMA conversions are register-only rather than LDS round trips.
 
 Scope: bf16/fp16 KV cache, GQA, and MTP query_length in 1..4 (causal across the
 query positions). Not covered: FP8, sliding window, ALiBi, sinks, per-token
@@ -41,6 +42,7 @@ import triton.language.extra.tlx as tlx
 BUF_DEPTH = tl.constexpr(2)
 
 
+@lru_cache(maxsize=None)
 def _make_qk_softmax_layout(block_n, m_pow2, num_warps=4):
     """Build lane/register ownership for a register-resident ``[M, N]`` QK tile."""
     assert block_n in (64, 128, 256, 512)
@@ -57,6 +59,70 @@ def _make_qk_softmax_layout(block_n, m_pow2, num_warps=4):
         shape=((2, ) * (4 + len(thread_column_strides)), (2, ) * len(value_strides)),
         stride=((block_n, 2 * block_n, 4 * block_n, 8 * block_n) + thread_column_strides, value_strides),
     )
+
+
+@lru_cache(maxsize=None)
+def _make_gluon_qk_layout(block_n):
+    """Gluon's qlen1/group8 blocked score ownership for a four-wave CTA.
+
+    Lanes 0..1 select one of eight query rows, lanes 1..5 span 32
+    consecutive score columns, and the four warps own adjacent 2-row groups.
+    Each thread retains eight columns in registers for ``BLOCK_N=256``.
+    """
+    assert block_n == 256
+    return tlx.layout(
+        shape=((2, 32, 4), (8, )),
+        stride=((block_n, 1, 2 * block_n), (32, )),
+    )
+
+
+@lru_cache(maxsize=None)
+def _make_gluon_k_load_layout(page_size):
+    """Exact Gluon blocked packed-K ownership for page sizes 16 and 64."""
+    if page_size == 16:
+        return tlx.layout(
+            shape=((64, 4), (8, 2, 4)),
+            stride=((8, 1024), (1, 512, 4096)),
+        )
+    assert page_size == 64
+    return tlx.layout(
+        shape=((16, 4, 4), (8, 2, 4)),
+        stride=((8, 512, 128), (1, 2048, 4096)),
+    )
+
+
+@lru_cache(maxsize=None)
+def _make_gluon_v_load_layout(page_size):
+    """Exact Gluon blocked packed-V ownership for page sizes 16 and 64."""
+    if page_size == 16:
+        return tlx.layout(
+            shape=((16, 4, 4), (8, 2, 4)),
+            stride=((8, 1024, 128), (1, 512, 4096)),
+        )
+    assert page_size == 64
+    return tlx.layout(
+        shape=((16, 4, 4), (8, 2, 4)),
+        stride=((8, 512, 128), (1, 2048, 4096)),
+    )
+
+
+@lru_cache(maxsize=None)
+def _make_gluon_shared_layout(vector_size, max_phase):
+    return tlx.swizzled_shared_layout_encoding(
+        vectorSize=vector_size,
+        perPhase=1,
+        maxPhase=max_phase,
+        order=[1, 0],
+        numCTAs=[1, 1],
+        numCTAsPerCGA=[1, 1],
+        numCTASplit=[1, 1],
+        numCTAOrder=[1, 0],
+    )
+
+
+@lru_cache(maxsize=1)
+def _make_v_shared_layout():
+    return tlx.swizzled_shared_layout_encoding.make_default(2).make_permute((1, 0))
 
 
 @triton.jit
@@ -115,6 +181,11 @@ def _pa_decode_partition_kernel(
     QK_SOFTMAX_LAYOUT: tl.constexpr,
     STREAMING_KV: tl.constexpr,
     STREAM_WARPS: tl.constexpr,
+    GLUON_COMPAT: tl.constexpr,
+    GLUON_K_LOAD_LAYOUT: tl.constexpr,
+    GLUON_V_LOAD_LAYOUT: tl.constexpr,
+    GLUON_Q_SHARED_LAYOUT: tl.constexpr,
+    GLUON_P_SHARED_LAYOUT: tl.constexpr,
 ):
     seq = tl.program_id(0)
     kv_head = tl.program_id(1)
@@ -142,26 +213,31 @@ def _pa_decode_partition_kernel(
     q = tl.reshape(q, (M_POW2, HEAD_DIM))
 
     QK_SCALE = sm_scale * 1.44269504089  # 1/log(2), for exp2-based softmax
-    # Pre-scale q once (M_POW2 x HEAD_DIM) so the q@k^T dot already yields
-    # scaled scores, instead of scaling the M_POW2 x BLOCK_N score matrix per tile.
-    q = (q.to(tl.float32) * QK_SCALE).to(Kc.dtype.element_ty)
+    # The general path pre-scales Q once.  The compatibility path deliberately
+    # follows Gluon and scales the score tile after QK.
+    if GLUON_COMPAT:
+        q = q.to(Kc.dtype.element_ty)
+    else:
+        q = (q.to(tl.float32) * QK_SCALE).to(Kc.dtype.element_ty)
     m_qpos = offs_m // GROUP_POW2  # query position per row
     vis_limit = ctx_len - QLEN  # min visible abs key index over rows (m_qpos >= 0)
 
     m_i = tl.full([M_POW2], float("-inf"), tl.float32)
     l_i = tl.zeros([M_POW2], tl.float32)
     if STREAMING_KV:
-        # SGLang/AITER-style ownership: K and V arrive in their final MFMA
-        # operand registers. QK softmax stays distributed across lanes/waves,
-        # avoiding a full score-tile LDS spill and both K/V LDS->VGPR reads.
-        qk_mfma_layout: tl.constexpr = tlx.amd_mfma_layout(version=4, instr_shape=[16, 16, 32], transposed=True,
+        # QK softmax stays distributed across lanes/waves, avoiding a full
+        # score-tile LDS spill.  GLUON_COMPAT additionally pins the packed K/V
+        # load ownership so their MFMA conversions require no LDS traffic.
+        mfma_k: tl.constexpr = 16 if GLUON_COMPAT else 32
+        pv_k_width: tl.constexpr = 8 if GLUON_COMPAT else 16
+        qk_mfma_layout: tl.constexpr = tlx.amd_mfma_layout(version=4, instr_shape=[16, 16, mfma_k], transposed=True,
                                                            warps_per_cta=[1, STREAM_WARPS])
         qk_lhs_layout: tl.constexpr = tlx.dot_operand_layout(0, qk_mfma_layout, k_width=8)
         qk_rhs_layout: tl.constexpr = tlx.dot_operand_layout(1, qk_mfma_layout, k_width=8)
-        pv_mfma_layout: tl.constexpr = tlx.amd_mfma_layout(version=4, instr_shape=[16, 16, 32], transposed=True,
+        pv_mfma_layout: tl.constexpr = tlx.amd_mfma_layout(version=4, instr_shape=[16, 16, mfma_k], transposed=True,
                                                            warps_per_cta=[1, STREAM_WARPS])
-        pv_lhs_layout: tl.constexpr = tlx.dot_operand_layout(0, pv_mfma_layout, k_width=16)
-        pv_rhs_layout: tl.constexpr = tlx.dot_operand_layout(1, pv_mfma_layout, k_width=16)
+        pv_lhs_layout: tl.constexpr = tlx.dot_operand_layout(0, pv_mfma_layout, k_width=pv_k_width)
+        pv_rhs_layout: tl.constexpr = tlx.dot_operand_layout(1, pv_mfma_layout, k_width=pv_k_width)
         # Cooperative packed-V VMEM ownership. Lanes span D, warps span
         # adjacent token groups, and each lane owns the contiguous X=8 bf16
         # values. The two-wave N128 ownership is the short-context qlen1 path;
@@ -175,7 +251,13 @@ def _pa_decode_partition_kernel(
         else:
             v_load_layout: tl.constexpr = tlx.layout(shape=((64, 4), (8, 8)), stride=((8, 512), (1, 2048)))
         qk_softmax_layout: tl.constexpr = QK_SOFTMAX_LAYOUT
-        q_register = tlx.require_layout(q, qk_lhs_layout, pin=False)
+        if GLUON_COMPAT:
+            q_buf = tlx.local_alloc((M_POW2, HEAD_DIM), Kc.dtype.element_ty, 1, layout=GLUON_Q_SHARED_LAYOUT)
+            p_buf = tlx.local_alloc((M_POW2, BLOCK_N), Kc.dtype.element_ty, 1, layout=GLUON_P_SHARED_LAYOUT)
+            tlx.local_store(tlx.local_view(q_buf, 0), q)
+            q_register = tlx.local_load(tlx.local_view(q_buf, 0), layout=qk_lhs_layout)
+        else:
+            q_register = tlx.require_layout(q, qk_lhs_layout, pin=False)
         acc = tlx.zeros((M_POW2, HEAD_DIM), tl.float32, layout=pv_mfma_layout)
     else:
         acc = tl.zeros([M_POW2, HEAD_DIM], tl.float32)
@@ -203,27 +285,43 @@ def _pa_decode_partition_kernel(
         offs_value_group = tl.arange(0, PAGE_SIZE // CACHE_PACK_X)
         offs_page = tl.arange(0, PAGE_SIZE)
         offs_x = tl.arange(0, CACHE_PACK_X)
-        for tidx in tl.range(0, num_tiles):
-            tile_page0 = start_page + tidx * PAGES_PER_TILE
-            tile_pages = tile_page0 + offs_tile_page
+        if GLUON_COMPAT:
+            # Match Gluon's loop-carried K pipeline: fetch tile zero before the
+            # loop, then fetch K[i+1] after softmax and before the current PV.
+            tile_pages = start_page + offs_tile_page
             tile_physical = tl.load(BlockTables + seq * stride_bt_s +
                                     tl.where(tile_pages < end_page, tile_pages, end_page - 1) * stride_bt_p)
-            # Keep the native packed cache axes through the global load so X=8
-            # bf16 values form one 16-byte vector. Flattening to [D,N] before
-            # this point makes the MFMA ownership scalarize VMEM.
             k_offsets_4d = (tile_physical[:, None, None, None] * stride_kc_b + kv_head * stride_kc_h +
                             offs_head_group[None, :, None, None] * stride_kc_d +
-                            offs_page[None, None, :, None] * stride_kc_p + offs_x[None, None, None, :] * stride_kc_x)
+                            offs_page[None, None, :, None] * stride_kc_p +
+                            offs_x[None, None, None, :] * stride_kc_x)
             k_offsets_4d = tl.multiple_of(k_offsets_4d, (1, 1, 1, CACHE_PACK_X))
             k_offsets_4d = tl.max_contiguous(k_offsets_4d, (1, 1, 1, CACHE_PACK_X))
-            if QLEN == 4:
-                # At M=32/N=128, inheriting QK-dot ownership at the load
-                # scalarizes packed X. Preserve the coalesced packed ownership
-                # through VMEM, then convert the loaded registers to QK RHS.
-                k_offsets_4d = tlx.require_layout(k_offsets_4d.to(tl.int32), v_load_layout)
-                k_raw = tlx.buffer_load(Kc, k_offsets_4d, cache=".cg")
-            else:
-                k_raw = tlx.buffer_load(Kc, k_offsets_4d.to(tl.int32), cache=".cg")
+            k_offsets_4d = tlx.require_layout(k_offsets_4d.to(tl.int32), GLUON_K_LOAD_LAYOUT)
+            k_raw = tlx.buffer_load(Kc, k_offsets_4d, cache=".cg")
+        for tidx in tl.range(0, num_tiles):
+            tile_page0 = start_page + tidx * PAGES_PER_TILE
+            if not GLUON_COMPAT:
+                tile_pages = tile_page0 + offs_tile_page
+                tile_physical = tl.load(BlockTables + seq * stride_bt_s +
+                                        tl.where(tile_pages < end_page, tile_pages, end_page - 1) * stride_bt_p)
+                # Keep the native packed cache axes through the global load so X=8
+                # bf16 values form one 16-byte vector. Flattening to [D,N] before
+                # this point makes the MFMA ownership scalarize VMEM.
+                k_offsets_4d = (tile_physical[:, None, None, None] * stride_kc_b + kv_head * stride_kc_h +
+                                offs_head_group[None, :, None, None] * stride_kc_d +
+                                offs_page[None, None, :, None] * stride_kc_p +
+                                offs_x[None, None, None, :] * stride_kc_x)
+                k_offsets_4d = tl.multiple_of(k_offsets_4d, (1, 1, 1, CACHE_PACK_X))
+                k_offsets_4d = tl.max_contiguous(k_offsets_4d, (1, 1, 1, CACHE_PACK_X))
+                if QLEN == 4:
+                    # At M=32/N=128, inheriting QK-dot ownership at the load
+                    # scalarizes packed X. Preserve the coalesced packed ownership
+                    # through VMEM, then convert the loaded registers to QK RHS.
+                    k_offsets_4d = tlx.require_layout(k_offsets_4d.to(tl.int32), v_load_layout)
+                    k_raw = tlx.buffer_load(Kc, k_offsets_4d, cache=".cg")
+                else:
+                    k_raw = tlx.buffer_load(Kc, k_offsets_4d.to(tl.int32), cache=".cg")
             kt = tl.permute(k_raw, (1, 3, 0, 2))
             kt = tl.reshape(kt, (HEAD_DIM, BLOCK_N))
             kt = tlx.require_layout(kt, qk_rhs_layout, pin=False)
@@ -237,7 +335,10 @@ def _pa_decode_partition_kernel(
                             offs_d[None, None, :, None] * stride_vc_d + offs_x[None, None, None, :] * stride_vc_x)
             v_offsets_4d = tl.multiple_of(v_offsets_4d, (1, 1, 1, CACHE_PACK_X))
             v_offsets_4d = tl.max_contiguous(v_offsets_4d, (1, 1, 1, CACHE_PACK_X))
-            v_offsets_4d = tlx.require_layout(v_offsets_4d.to(tl.int32), v_load_layout)
+            if GLUON_COMPAT:
+                v_offsets_4d = tlx.require_layout(v_offsets_4d.to(tl.int32), GLUON_V_LOAD_LAYOUT)
+            else:
+                v_offsets_4d = tlx.require_layout(v_offsets_4d.to(tl.int32), v_load_layout)
             v_raw = tlx.buffer_load(Vc, v_offsets_4d, cache=".cg")
             v = tl.permute(v_raw, (0, 1, 3, 2))
             v = tl.reshape(v, (BLOCK_N, HEAD_DIM))
@@ -246,6 +347,8 @@ def _pa_decode_partition_kernel(
             qk_acc = tlx.zeros((M_POW2, BLOCK_N), tl.float32, layout=qk_mfma_layout)
             qk = tl.dot(q_register, kt, acc=qk_acc, out_dtype=tl.float32)
             qk = tlx.require_layout(qk, qk_softmax_layout, pin=False)
+            if GLUON_COMPAT:
+                qk = qk * QK_SCALE
 
             tile_max_abs = tile_page0 * PAGE_SIZE + (BLOCK_N - 1)
             is_full = (tile_max_abs <= vis_limit) & ((tile_page0 + PAGES_PER_TILE) <= end_page)
@@ -261,7 +364,9 @@ def _pa_decode_partition_kernel(
             # Reduce register-local column bits, then same-row lanes, then the
             # four wave partials. Only row scalars cross waves; the QK tile never
             # makes a round trip through LDS.
-            if BLOCK_N == 64:
+            if GLUON_COMPAT:
+                m_ij = tl.max(qks, axis=1)
+            elif BLOCK_N == 64:
                 qk_reduce = tl.reshape(qks, (M_POW2, 4, 4, 4))
                 qk_reduce = tlx.require_layout(qk_reduce, qk_softmax_layout, pin=False)
                 qk_reduce = tl.max(qk_reduce, axis=3)
@@ -280,15 +385,18 @@ def _pa_decode_partition_kernel(
                 qk_reduce = tlx.require_layout(qk_reduce, qk_softmax_layout, pin=False)
                 qk_reduce = tl.max(qk_reduce, axis=4)
                 qk_reduce = tl.max(qk_reduce, axis=1)
-            qk_reduce = tl.max(qk_reduce, axis=2)
-            m_ij = tl.max(qk_reduce, axis=1)
+            if not GLUON_COMPAT:
+                qk_reduce = tl.max(qk_reduce, axis=2)
+                m_ij = tl.max(qk_reduce, axis=1)
             m_new = tl.maximum(m_i, m_ij)
             m_new_qk = tl.broadcast_to(m_new[:, None], (M_POW2, BLOCK_N))
             m_new_qk = tlx.require_layout(m_new_qk, qk_softmax_layout, pin=False)
             p = tl.math.exp2(qks - m_new_qk)
             alpha = tl.math.exp2(m_i - m_new)
 
-            if BLOCK_N == 64:
+            if GLUON_COMPAT:
+                p_sum = tl.sum(p, axis=1)
+            elif BLOCK_N == 64:
                 p_reduce = tl.reshape(p, (M_POW2, 4, 4, 4))
                 p_reduce = tlx.require_layout(p_reduce, qk_softmax_layout, pin=False)
                 p_reduce = tl.sum(p_reduce, axis=3)
@@ -307,11 +415,35 @@ def _pa_decode_partition_kernel(
                 p_reduce = tlx.require_layout(p_reduce, qk_softmax_layout, pin=False)
                 p_reduce = tl.sum(p_reduce, axis=4)
                 p_reduce = tl.sum(p_reduce, axis=1)
-            p_reduce = tl.sum(p_reduce, axis=2)
-            p_sum = tl.sum(p_reduce, axis=1)
+            if not GLUON_COMPAT:
+                p_reduce = tl.sum(p_reduce, axis=2)
+                p_sum = tl.sum(p_reduce, axis=1)
             l_i = l_i * alpha + p_sum
 
-            p_operand = tlx.require_layout(p.to(Vc.dtype.element_ty), pv_lhs_layout, pin=False)
+            if GLUON_COMPAT:
+                tlx.local_store(tlx.local_view(p_buf, 0), p.to(Vc.dtype.element_ty))
+                p_operand = tlx.local_load(tlx.local_view(p_buf, 0), layout=pv_lhs_layout)
+                # Keep next-K below softmax while allowing the backend to braid
+                # its VMEM instructions through the following PV MFMA sequence.
+                if tidx + 1 < num_tiles:
+                    tlx.amd_sched_barrier()
+                    next_tile_page0 = tile_page0 + PAGES_PER_TILE
+                    next_tile_pages = next_tile_page0 + offs_tile_page
+                    next_tile_physical = tl.load(
+                        BlockTables + seq * stride_bt_s +
+                        tl.where(next_tile_pages < end_page, next_tile_pages, end_page - 1) * stride_bt_p)
+                    next_k_offsets_4d = (
+                        next_tile_physical[:, None, None, None] * stride_kc_b + kv_head * stride_kc_h +
+                        offs_head_group[None, :, None, None] * stride_kc_d +
+                        offs_page[None, None, :, None] * stride_kc_p +
+                        offs_x[None, None, None, :] * stride_kc_x)
+                    next_k_offsets_4d = tl.multiple_of(next_k_offsets_4d, (1, 1, 1, CACHE_PACK_X))
+                    next_k_offsets_4d = tl.max_contiguous(next_k_offsets_4d, (1, 1, 1, CACHE_PACK_X))
+                    next_k_offsets_4d = tlx.require_layout(next_k_offsets_4d.to(tl.int32), GLUON_K_LOAD_LAYOUT)
+                    k_raw = tlx.buffer_load(Kc, next_k_offsets_4d, cache=".cg")
+                    tile_physical = next_tile_physical
+            else:
+                p_operand = tlx.require_layout(p.to(Vc.dtype.element_ty), pv_lhs_layout, pin=False)
             pv_acc = tlx.zeros((M_POW2, HEAD_DIM), tl.float32, layout=pv_mfma_layout)
             pv = tl.dot(p_operand, v, acc=pv_acc, out_dtype=tl.float32)
             alpha_acc = tlx.require_layout(alpha[:, None], pv_mfma_layout, pin=False)
@@ -739,6 +871,7 @@ class PagedDecodeConfig:
     num_warps: int
     waves_per_eu: int
     streaming_kv: bool
+    gluon_compat: bool
     query_group_size: int
     qlen_pow2: int
     group_pow2: int
@@ -808,7 +941,7 @@ def can_use_pa_decode_tlx(query, key_cache, value_cache, query_length=1, sliding
 
 def get_pa_decode_config(query, key_cache, value_cache, block_tables, query_length=1, num_splits=None,
                          max_context_len=None, num_warps=None, waves_per_eu=None, streaming_kv=None,
-                         block_n=None):
+                         block_n=None, gluon_compat=None):
     """Select the exact launch and workspace configuration without launching."""
     num_tokens, num_q_heads, head_dim = query.shape
     assert key_cache.ndim == value_cache.ndim and key_cache.ndim in (4, 5)
@@ -828,6 +961,24 @@ def get_pa_decode_config(query, key_cache, value_cache, block_tables, query_leng
     num_seqs = num_tokens // query_length
     assert num_q_heads % num_kv_heads == 0
     query_group_size = num_q_heads // num_kv_heads
+    # B1 needs 32 independent partitions to fill all 256 MI350 CUs
+    # (1 sequence * 8 KV heads * 32 splits).  The compact probability-LDS
+    # pipeline is faster than the generic full-tile LDS path at both short
+    # production contexts.  Keep this tri-state so an explicit False remains
+    # a useful debugging/benchmark override.
+    if gluon_compat is None:
+        gluon_compat = (
+            cache_5d and head_dim == 64 and query_length == 1 and query_group_size == 8 and
+            num_seqs == 1 and page_size in (16, 64) and max_context_len in (8192, 32768) and
+            num_splits is None and num_warps is None and streaming_kv is None and block_n is None
+        )
+    if gluon_compat:
+        assert cache_5d and head_dim == 64
+        assert query_length == 1 and query_group_size == 8
+        assert page_size in (16, 64)
+        streaming_kv = True
+        block_n = 256
+        num_warps = 4
     short_qlen1 = query_length == 1 and num_seqs == 32 and max_context_len == 8192
     if streaming_kv is None:
         streaming_kv = (cache_5d and head_dim == 64 and max_context_len is not None
@@ -848,9 +999,10 @@ def get_pa_decode_config(query, key_cache, value_cache, block_tables, query_leng
             f"for BLOCK_N={block_n or (128 if query_length == 4 or short_streaming else 256)}")
 
     qlen_pow2 = _next_pow2(query_length)
-    group_pow2 = max(16 // qlen_pow2, _next_pow2(query_group_size))
+    group_pow2 = _next_pow2(query_group_size) if gluon_compat else max(16 // qlen_pow2,
+                                                                     _next_pow2(query_group_size))
     m_pow2 = qlen_pow2 * group_pow2
-    assert m_pow2 >= 16, f"M_POW2={m_pow2} must be >= 16 for MFMA"
+    assert m_pow2 >= (8 if gluon_compat else 16), f"M_POW2={m_pow2} is too small for the selected MFMA path"
     assert query_length * query_group_size <= 64
 
     if block_n is None:
@@ -874,11 +1026,15 @@ def get_pa_decode_config(query, key_cache, value_cache, block_tables, query_leng
             f"packed qlen={query_length} path is specialized for a {expected_block_n}x64 KV tile")
 
     if num_splits is None:
-        if streaming_kv:
+        if gluon_compat and num_seqs == 1 and max_context_len in (8192, 32768):
+            num_splits = 32
+        elif streaming_kv:
             medium_decode = (query_length == 1 and num_seqs == 8 and max_context_len is not None
                              and 32768 <= max_context_len < 131072)
             short_decode = query_length == 1 and short_qlen1
-            if short_decode:
+            if gluon_compat:
+                split_cap, target_waves = 8, 2
+            elif short_decode:
                 split_cap, target_waves = 4, 4
             elif medium_decode:
                 split_cap, target_waves = 16, 4
@@ -889,7 +1045,8 @@ def get_pa_decode_config(query, key_cache, value_cache, block_tables, query_leng
         else:
             num_splits = get_num_splits(num_seqs, num_kv_heads, max_context_len, page_size, pages_per_tile,
                                         target_waves=2 if query_length > 1 else 1)
-        if cache_5d and head_dim == 64 and query_length == 1 and num_seqs == 1 and max_context_len == 8192:
+        if (not gluon_compat and cache_5d and head_dim == 64 and query_length == 1 and num_seqs == 1 and
+                max_context_len == 8192):
             num_splits = 8 if page_size == 16 else 4
         max_pages = block_tables.shape[1]
         max_useful_splits = max(1, (max_pages + pages_per_tile - 1) // pages_per_tile)
@@ -912,6 +1069,7 @@ def get_pa_decode_config(query, key_cache, value_cache, block_tables, query_leng
         num_warps=num_warps,
         waves_per_eu=waves_per_eu,
         streaming_kv=streaming_kv,
+        gluon_compat=gluon_compat,
         query_group_size=query_group_size,
         qlen_pow2=qlen_pow2,
         group_pow2=group_pow2,
@@ -951,6 +1109,7 @@ def pa_decode_tlx(output,  # [num_tokens, num_q_heads, HEAD_DIM]
                   sm_scale, query_length=1, num_splits=None, max_context_len=None, num_warps=None, waves_per_eu=None,
                   streaming_kv=None,  # None auto-selects the tuned packed K/V register path
                   block_n=None,  # Experimental tile-width override; defaults to ~8192 KV elements
+                  gluon_compat=None,  # None auto-selects the tuned qlen1/group8 probability-LDS path
                   workspace=None,  # Optional reusable (mid, lse) float32 tensors for split decode
                   config=None,  # Optional cached PagedDecodeConfig; bypasses host-side reselection
                   ):
@@ -971,6 +1130,7 @@ def pa_decode_tlx(output,  # [num_tokens, num_q_heads, HEAD_DIM]
             waves_per_eu=waves_per_eu,
             streaming_kv=streaming_kv,
             block_n=block_n,
+            gluon_compat=gluon_compat,
         )
     else:
         assert isinstance(config, PagedDecodeConfig)
@@ -980,6 +1140,7 @@ def pa_decode_tlx(output,  # [num_tokens, num_q_heads, HEAD_DIM]
         assert waves_per_eu is None or config.waves_per_eu == waves_per_eu
         assert streaming_kv is None or config.streaming_kv == streaming_kv
         assert block_n is None or config.block_n == block_n
+        assert not gluon_compat or config.gluon_compat
 
     page_size = config.page_size
     cache_pack_x = config.cache_pack_x
@@ -990,6 +1151,7 @@ def pa_decode_tlx(output,  # [num_tokens, num_q_heads, HEAD_DIM]
     num_warps = config.num_warps
     waves_per_eu = config.waves_per_eu
     streaming_kv = config.streaming_kv
+    gluon_compat = config.gluon_compat
     query_group_size = config.query_group_size
     qlen_pow2 = config.qlen_pow2
     group_pow2 = config.group_pow2
@@ -1084,14 +1246,17 @@ def pa_decode_tlx(output,  # [num_tokens, num_q_heads, HEAD_DIM]
         FUSED=fused,
         CACHE_5D=cache_5d,
         CACHE_PACK_X=cache_pack_x,
-        V_LAYOUT=tlx.swizzled_shared_layout_encoding.make_default(2).make_permute((1, 0)),
+        V_LAYOUT=_make_v_shared_layout(),
         QK_SOFTMAX_LAYOUT=_make_qk_softmax_layout(
-            block_n if streaming_kv else 64,
-            m_pow2,
-            num_warps if streaming_kv else 4,
-        ),
+            block_n if streaming_kv else 64, m_pow2, num_warps if streaming_kv else 4
+        ) if not gluon_compat else _make_gluon_qk_layout(block_n),
         STREAMING_KV=streaming_kv,
         STREAM_WARPS=num_warps,
+        GLUON_COMPAT=gluon_compat,
+        GLUON_K_LOAD_LAYOUT=_make_gluon_k_load_layout(page_size),
+        GLUON_V_LOAD_LAYOUT=_make_gluon_v_load_layout(page_size),
+        GLUON_Q_SHARED_LAYOUT=_make_gluon_shared_layout(8, 16),
+        GLUON_P_SHARED_LAYOUT=_make_gluon_shared_layout(8, 8),
         num_warps=num_warps,
         waves_per_eu=waves_per_eu,
     )

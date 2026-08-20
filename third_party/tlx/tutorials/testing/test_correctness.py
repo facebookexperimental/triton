@@ -1507,6 +1507,88 @@ def test_amd_pa_decode_5d_streaming_register(page_size, num_splits, query_length
     torch.testing.assert_close(out.float(), ref, atol=2e-2, rtol=2e-2)
 
 
+@pytest.mark.parametrize("num_splits", [1, 2, 32], ids=["fused", "split2", "split32"])
+@pytest.mark.parametrize("page_size", [16, 64], ids=["p16", "p64"])
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware (CDNA4)")
+def test_amd_pa_decode_gluon_compat(page_size, num_splits):
+    """The qlen1/group8 Gluon-compatible ownership and K prefetch path is correct."""
+    num_kv_heads, group, head_dim = 2, 8, 64
+    num_q_heads = num_kv_heads * group
+    ctx_lens = [257, 513]
+    sm_scale = 1.0 / math.sqrt(head_dim)
+    query, key_cache, value_cache, context_lens, block_tables = _amd_pa_decode_build_inputs(
+        len(ctx_lens),
+        ctx_lens,
+        num_q_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        device=DEVICE,
+        cache_layout="5d",
+    )
+    ref = _amd_pa_decode_ref(
+        query,
+        key_cache,
+        value_cache,
+        context_lens,
+        block_tables,
+        sm_scale,
+        num_q_heads,
+        num_kv_heads,
+        1,
+    )
+    out = torch.empty_like(query)
+    _amd_pa_decode(
+        out,
+        query,
+        key_cache,
+        value_cache,
+        context_lens,
+        block_tables,
+        sm_scale,
+        query_length=1,
+        num_splits=num_splits,
+        gluon_compat=True,
+    )
+    torch.testing.assert_close(out.float(), ref, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize("context", [8192, 32768], ids=["8k", "32k"])
+@pytest.mark.parametrize("page_size", [16, 64], ids=["p16", "p64"])
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware (CDNA4)")
+def test_amd_pa_decode_b1_auto_probability_lds_config(page_size, context):
+    """Production B1 shapes select the 32-split compact probability-LDS path."""
+    num_kv_heads, group, head_dim = 8, 8, 64
+    x = 8
+    query = torch.empty((1, num_kv_heads * group, head_dim), dtype=torch.bfloat16, device=DEVICE)
+    key_cache = torch.empty((1, num_kv_heads, head_dim // x, page_size, x), dtype=torch.bfloat16, device=DEVICE)
+    value_cache = torch.empty((1, num_kv_heads, page_size // x, head_dim, x), dtype=torch.bfloat16, device=DEVICE)
+    block_tables = torch.empty((1, context // page_size), dtype=torch.int32, device=DEVICE)
+
+    config = _amd_pa_decode_get_config(
+        query,
+        key_cache,
+        value_cache,
+        block_tables,
+        max_context_len=context,
+    )
+    assert config.gluon_compat
+    assert config.streaming_kv
+    assert config.num_splits == 32
+    assert config.block_n == 256
+    assert config.num_warps == 4
+
+    control = _amd_pa_decode_get_config(
+        query,
+        key_cache,
+        value_cache,
+        block_tables,
+        max_context_len=context,
+        gluon_compat=False,
+    )
+    assert not control.gluon_compat
+
+
 # =============================================================================
 # AMD HSTU Attention Tests (gfx950)
 # =============================================================================
