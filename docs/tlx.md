@@ -837,11 +837,16 @@ Currently consumed only by the scaled-WMMA pattern (gfx1250). Regular
 
 - `tlx.named_barrier_wait(bar_id, num_threads)` **[sm90+]**
 
-    Wait until `num_threads` threads have reached the specified named mbarrier phase.
+    Wait until `num_threads` total threads have reached the specified named
+    mbarrier phase.
 
 - `tlx.named_barrier_arrive(bar_id, num_threads)` **[sm90+]**
 
-    Signal arrival at a named mbarrier with the given thread count.
+    Signal arrival at a named mbarrier.
+
+    For both APIs, `num_threads` is the total number of threads required to flip
+    the barrier phase: `num_waiting_threads + num_arriving_threads`. Wait and
+    Arrive calls for the same barrier phase must use the same value.
 
 - `tlx.barrier_expect_bytes(bar, bytes)` **[sm90+]**
 

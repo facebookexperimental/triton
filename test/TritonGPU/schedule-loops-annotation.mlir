@@ -8,11 +8,11 @@
 // CHECK-LABEL: @_attn_bwd_annotated
 // CHECK: scf.for
 
-// --- Cluster 1: loads and address computation (stage 0) ---
+// --- Cluster 1: qk operand loads and address computation (stage 0) ---
 // CHECK: tt.descriptor_load {{.*}} {loop.cluster = 1 : i32, loop.stage = 0 : i32}
 // CHECK: ttg.local_alloc {{.*}} {loop.cluster = 1 : i32, loop.stage = 0 : i32}
 // CHECK: ttg.memdesc_trans {{.*}} {loop.cluster = 1 : i32, loop.stage = 0 : i32
-// CHECK: tt.load {{.*}} {loop.cluster = 1 : i32, loop.stage = 0 : i32}
+// CHECK: tt.load {{.*}} {loop.cluster = 4 : i32, loop.stage = 0 : i32}
 
 // --- qkT MMA: stage 0, cluster 1 ---
 // CHECK: ttng.tc_gen5_mma {{.*}} {loop.cluster = 1 : i32, loop.stage = 0 : i32
@@ -23,7 +23,7 @@
 // CHECK: arith.subf {{.*}} {loop.cluster = 4 : i32, loop.stage = 0 : i32}
 // CHECK: math.exp2 {{.*}} {loop.cluster = 4 : i32, loop.stage = 0 : i32}
 
-// CHECK: tt.descriptor_load {{.*}} {loop.cluster = 1 : i32, loop.stage = 0 : i32}
+// CHECK: tt.descriptor_load {{.*}} {loop.cluster = 4 : i32, loop.stage = 0 : i32}
 // CHECK: ttg.local_alloc {{.*}} {loop.cluster = 4 : i32, loop.stage = 0 : i32}
 // CHECK: arith.truncf {{.*}} {loop.cluster = 4 : i32, loop.stage = 0 : i32}
 // CHECK: ttng.tmem_alloc {{.*}} {loop.cluster = 4 : i32, loop.stage = 0 : i32}
@@ -31,7 +31,7 @@
 // --- dv MMA: stage 0, cluster 4 ---
 // CHECK: ttng.tc_gen5_mma {{.*}} {loop.cluster = 4 : i32, loop.stage = 0 : i32
 
-// CHECK: tt.load {{.*}} {loop.cluster = 1 : i32, loop.stage = 0 : i32}
+// CHECK: tt.load {{.*}} {loop.cluster = 2 : i32, loop.stage = 1 : i32}
 // CHECK: ttg.memdesc_trans {{.*}} {loop.cluster = 4 : i32, loop.stage = 0 : i32
 
 // --- dpT MMA: stage 0, cluster 4 ---

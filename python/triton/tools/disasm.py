@@ -81,11 +81,14 @@ def path_to_cuobjdump():
 
 
 def extract(file_path, fun):
+    from triton import knobs
     cuobjdump = path_to_cuobjdump()
+    # Same environment the tool was probed with; see knobs.nvidia.tool_env.
+    env = knobs.nvidia.get_tool_env()
     if fun is None:
-        sass_str = subprocess.check_output([cuobjdump, "-sass", file_path])
+        sass_str = subprocess.check_output([cuobjdump, "-sass", file_path], env=env)
     else:
-        sass_str = subprocess.check_output([cuobjdump, "-fun", fun, "-sass", file_path])
+        sass_str = subprocess.check_output([cuobjdump, "-fun", fun, "-sass", file_path], env=env)
     sass_lines = sass_str.splitlines()
     line_idx = 0
     while line_idx < len(sass_lines):

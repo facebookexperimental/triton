@@ -147,22 +147,6 @@ public:
       return bailOut(funcOp);
     }
 
-    // FIXME: skip warpspec if there is else block. Need to improve
-    // CodePartitioning to correctly handle channels in else block.
-    bool hasElse = false;
-    funcOp->walk([&](scf::IfOp ifOp) {
-      if (ifOp.elseBlock()) {
-        for (Operation &op : ifOp.elseBlock()->getOperations()) {
-          if (!isa<scf::YieldOp>(&op))
-            hasElse = true;
-        }
-      }
-    });
-    if (hasElse) {
-      LDBG("Warp specialization does not support else blocks. Skipping.");
-      return bailOut(funcOp);
-    }
-
     OpBuilder builder(funcOp);
     auto moduleOp = funcOp->getParentOfType<ModuleOp>();
     // FIXME: skip data partitioning for Blackwell.
@@ -204,6 +188,29 @@ public:
     if (getNestedAsyncTaskIds(funcOp).empty()) {
       LDBG("Warp specialization found no partitions to specialize. "
            "Skipping.");
+      return bailOut(funcOp);
+    }
+
+    // Code partitioning cannot yet place communication channels in both sides
+    // of an IfOp. An IfOp whose complete then/else region belongs to one task
+    // does not need such a channel, however, and specialization already knows
+    // how to clone both regions and their yields. Check this after task ID
+    // propagation so the decision uses the materialized nested task IDs.
+    bool hasUnsupportedElse = false;
+    funcOp->walk([&](scf::IfOp ifOp) {
+      if (!ifOp.elseBlock() || hasUnsupportedElse)
+        return;
+      bool hasNonTrivialElse =
+          llvm::any_of(ifOp.elseBlock()->getOperations(),
+                       [](Operation &op) { return !isa<scf::YieldOp>(op); });
+      if (!hasNonTrivialElse)
+        return;
+      SmallVector<AsyncTaskId> taskIds = getNestedAsyncTaskIds(ifOp);
+      hasUnsupportedElse = taskIds.size() != 1;
+    });
+    if (hasUnsupportedElse) {
+      LDBG("Warp specialization only supports else blocks contained in one "
+           "task. Skipping.");
       return bailOut(funcOp);
     }
 

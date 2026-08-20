@@ -56,10 +56,13 @@ with tlx.async_tasks():
 
 | Function | Description | Arch |
 |---|---|---|
-| `tlx.named_barrier_wait(bar_id, num_threads)` | Wait until num_threads arrive at bar_id | NVIDIA |
-| `tlx.named_barrier_arrive(bar_id, num_threads)` | Signal arrival at bar_id | NVIDIA |
+| `tlx.named_barrier_wait(bar_id, num_threads)` | Wait until the total participant count reaches bar_id | NVIDIA |
+| `tlx.named_barrier_arrive(bar_id, num_threads)` | Signal arrival at bar_id using the total participant count | NVIDIA |
 
-`num_threads` must be a multiple of 32 (warp size). Typically `num_warp_groups * warps_per_group * 32`.
+`num_threads` is the total number of threads required to flip the barrier phase:
+`num_waiting_threads + num_arriving_threads`. Wait and Arrive calls for the same
+barrier phase must use the same value. The count must be a multiple of 32 (warp
+size); it is typically `num_warp_groups * warps_per_group * 32`.
 
 Used for PingPong scheduling to prevent tensor core contention between consumer warp groups.
 
