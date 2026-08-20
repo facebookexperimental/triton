@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Build TLX and run its correctness and performance scripts.">
+  <title>Build, install, and test · TLX</title>
+  <link rel="stylesheet" href="assets/tlx.css">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="./"><span>TLX</span> Triton Low-level Language Extensions</a>
+    <a class="repo-link" href="https://github.com/facebookexperimental/triton" target="_blank" rel="noreferrer">View on GitHub ↗</a>
+  </header>
+  <div class="shell">
+    <aside class="sidebar">
+      <p class="eyebrow">Documentation</p>
+      <nav><a href="./">Overview</a>
+<a href="buffers.html">Local and remote buffers</a>
+<a href="async-memory.html">Async memory access</a>
+<a href="async-compute.html">Async tensor core operations</a>
+<a href="synchronization.html">Barriers and Cluster Launch Control</a>
+<a href="warp-specialization.html">Warp specialization and clustering</a>
+<a href="utilities.html">Other operations</a>
+<a href="kernels.html">Example kernels</a>
+<a href="install-and-test.html" aria-current="page">Build, install, and test</a>
+<a href="resources.html">More reading</a></nav>
+    </aside>
+    <main>
+      <p class="eyebrow">TLX documentation</p>
+      <h1>Build, install, and test</h1>
+      <p class="lede">Build TLX and run its correctness and performance scripts.</p>
+      <article><pre><code>git clone https://github.com/facebookexperimental/triton.git
+cd triton
+
+pip install -r python/requirements.txt # build-time dependencies
+pip install -e .</code></pre>
+<p>Run the tutorials after the build finishes, e.g,</p>
+<pre><code>python third_party/tlx/tutorials/hopper_fa_ws_pipelined_pingpong_test.py</code></pre>
+<p>To run Blackwell GEMM tutorial kernels, you can use the following command:</p>
+<h2 id="change-2-one-correctness-test-script">Change 2: One correctness test script</h2>
+<p><code>[TLX_VERSION=&lt;kernel_name&gt;] pytest third_party/tlx/tutorials/testing/test_correctness.py</code></p>
+<p>By default only one autotune config will be used by correctness test.</p>
+<h2 id="change-3-one-performance-test-script-for-each-op-gemm-matmul-x-hopper-blackwell">Change 3: One performance test script for each op {gemm, matmul} x {hopper, blackwell}</h2>
+<p><code>third_party/tlx/denoise.sh third_party/tlx/tutorials/testing/test_hopper_gemm_perf.py [--version {ws|pipelined}]</code></p>
+<p><code>third_party/tlx/denoise.sh third_party/tlx/tutorials/testing/test_hopper_fa_perf.py [--version {ws|ws_pipelined|ws_pipelined_pingpong|ws_pipelined_pingpong_persistent}]</code></p>
+<p><code>third_party/tlx/denoise.sh third_party/tlx/tutorials/testing/test_blackwell_gemm_perf.py [--version {ws|pipelined|clc|2cta}]</code></p>
+<p><code>third_party/tlx/denoise.sh third_party/tlx/tutorials/testing/test_blackwell_fa_perf.py [--version {ws|ws_pipelined|ws_pipelined_pingpong|ws_pipelined_pingpong_persistent}]</code></p></article>
+      <footer class="pager"><a href="kernels.html">← Example kernels</a><a class="next" href="resources.html">More reading →</a></footer>
+    </main>
+  </div>
+</body>
+</html>

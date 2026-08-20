@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Allocate, view, load, store, and share hardware-near buffers.">
+  <title>Local and remote buffers · TLX</title>
+  <link rel="stylesheet" href="assets/tlx.css">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="./"><span>TLX</span> Triton Low-level Language Extensions</a>
+    <a class="repo-link" href="https://github.com/facebookexperimental/triton" target="_blank" rel="noreferrer">View on GitHub ↗</a>
+  </header>
+  <div class="shell">
+    <aside class="sidebar">
+      <p class="eyebrow">Documentation</p>
+      <nav><a href="./">Overview</a>
+<a href="buffers.html" aria-current="page">Local and remote buffers</a>
+<a href="async-memory.html">Async memory access</a>
+<a href="async-compute.html">Async tensor core operations</a>
+<a href="synchronization.html">Barriers and Cluster Launch Control</a>
+<a href="warp-specialization.html">Warp specialization and clustering</a>
+<a href="utilities.html">Other operations</a>
+<a href="kernels.html">Example kernels</a>
+<a href="install-and-test.html">Build, install, and test</a>
+<a href="resources.html">More reading</a></nav>
+    </aside>
+    <main>
+      <p class="eyebrow">TLX documentation</p>
+      <h1>Local and remote buffers</h1>
+      <p class="lede">Allocate, view, load, store, and share hardware-near buffers.</p>
+      <article><h3 id="local-buffer-operations">Local buffer operations</h3>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>buffers = tlx.local_alloc(shape, dtype, NUM_BUFFERS)</code></div></div>
+<p>Allocate <code>NUM_BUFFERS</code> buffers in local memory per thread block, each of size size. The memory layout is inferred from its consumers.</p>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>buffers = tlx.local_alloc(shape, dtype, NUM_BUFFERS, tlx.storage_kind.tmem)</code></div></div>
+<p>Allocate <code>NUM_BUFFERS</code> of buffers in the tensor memory per thread block, each with size size. The memory layout is inferred from its consumers.</p>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>buffers = tlx.local_alloc(shape, dtype, NUM_BUFFERS, reuse=other_buffers)</code></div></div>
+<p>Alias this allocation to an existing <code>buffered_tensor</code> so multiple logical buffers reuse the same underlying local storage (SMEM or TMEM) without reallocation.</p>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>buffer = tlx.local_view(buffers, buffer_idx)</code> or <code>buffer = buffers[buffer_idx]</code></div></div>
+<p>Return a subview of the buffer indexed by <code>buffer_idx</code> from <code>buffers</code>. Both the explicit <code>local_view()</code> call and the indexing syntax <code>[]</code> are supported.</p>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>distributed_tensor = tlx.local_load(buffer, optional_token)</code></div></div>
+<p>Loads the buffer from local memory or tensor memory into a distributed tensor.</p>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.local_store(buffer, distributed_tensor)</code></div></div>
+<p>Store a distributed tensor into a buffer in local memory or tensor memory.</p>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>buffer = tlx.local_trans(buffer, dims)</code></div></div>
+<p>Permutes the dimensions of a tensor.</p>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>buffer = tlx.local_slice(buffer, offsets=[m, n], shapes=[M, N])</code></div></div>
+<p>Slice a <code>M x N</code> tensor at a <code>m x n</code> offset.</p>
+<h3 id="remote-buffer-operations">Remote buffer operations</h3>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>buffer = tlx.remote_view(buffer, remote_cta_rank)</code></div></div>
+<p>Return a remote view of the <code>buffer</code> living in another CTA in the same cluster with ID <code>remote_cta_rank</code>. NOTE: for now we only support barrier as <code>buffer</code>, not general SMEM.</p>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.remote_shmem_store(dst, src, remote_cta_rank)</code></div></div>
+<p>Store a distributed tensor into a buffer in the remote shared memory of a cluster (synchronous).</p>
+<p><strong>Parameters:</strong></p>
+<div class="list-item depth-1"><span aria-hidden="true">•</span><div><code>dst</code>: The destination buffer in local shared memory (will be internally mapped to the remote CTA)</div></div>
+<div class="list-item depth-1"><span aria-hidden="true">•</span><div><code>src</code>: The source distributed tensor to store</div></div>
+<div class="list-item depth-1"><span aria-hidden="true">•</span><div><code>remote_cta_rank</code>: The rank (unique ID) of the remote CTA within the cluster</div></div>
+<p><strong>Example:</strong></p>
+<pre><code class="language-python">  # Allocate shared memory buffer
+  buffer = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float16, 1)
+
+  # Store to remote CTA&#x27;s shared memory (synchronous)
+  tlx.remote_shmem_store(buffer[0], src_tensor, remote_cta_rank=1)</code></pre></article>
+      <footer class="pager"><a href="./">← Overview</a><a class="next" href="async-memory.html">Async memory access →</a></footer>
+    </main>
+  </div>
+</body>
+</html>

@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Thread, type, timing, and stochastic-rounding utilities.">
+  <title>Other operations · TLX</title>
+  <link rel="stylesheet" href="assets/tlx.css">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="./"><span>TLX</span> Triton Low-level Language Extensions</a>
+    <a class="repo-link" href="https://github.com/facebookexperimental/triton" target="_blank" rel="noreferrer">View on GitHub ↗</a>
+  </header>
+  <div class="shell">
+    <aside class="sidebar">
+      <p class="eyebrow">Documentation</p>
+      <nav><a href="./">Overview</a>
+<a href="buffers.html">Local and remote buffers</a>
+<a href="async-memory.html">Async memory access</a>
+<a href="async-compute.html">Async tensor core operations</a>
+<a href="synchronization.html">Barriers and Cluster Launch Control</a>
+<a href="warp-specialization.html">Warp specialization and clustering</a>
+<a href="utilities.html" aria-current="page">Other operations</a>
+<a href="kernels.html">Example kernels</a>
+<a href="install-and-test.html">Build, install, and test</a>
+<a href="resources.html">More reading</a></nav>
+    </aside>
+    <main>
+      <p class="eyebrow">TLX documentation</p>
+      <h1>Other operations</h1>
+      <p class="lede">Thread, type, timing, and stochastic-rounding utilities.</p>
+      <article><div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.cluster_cta_rank()</code></div></div>
+<p>Returns the rank (unique ID) of the current CTA within the cluster.</p>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.thread_id(axis)</code></div></div>
+<p>Returns the id of the current thread instance along the given <code>axis</code>.</p>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.dtype_of(v)</code></div></div>
+<p>Returns the dtype of a tensor or tensor descriptor.</p>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.size_of(dtype)</code></div></div>
+<p>Returns the size in bytes of a given Triton dtype. This is useful for dynamically computing memory sizes based on dtype, especially in barrier synchronization code.</p>
+<p>Example:</p>
+<pre><code class="language-python">    # Instead of hardcoding size values
+    tlx.barrier_expect_bytes(barrier, 2 * BLOCK_M * BLOCK_K)  # Assumes float16
+
+    # Use size_of for dtype-aware computation
+    tlx.barrier_expect_bytes(barrier,
+                           tlx.size_of(tlx.dtype_of(desc)) * BLOCK_M * BLOCK_K)</code></pre>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.clock64()</code></div></div>
+<p>Returns the current 64-bit hardware clock value. E.g,</p>
+<pre><code>        start = tlx.clock64()
+        # ... kernel code ...
+        end = tlx.clock64()
+        elapsed = end - start  # Number of clock cycles elapsed</code></pre>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.stoch_round(src, dst_dtype, rand_bits)</code></div></div>
+<p>Performs hardware-accelerated stochastic rounding for FP32→FP8/BF16/F16 conversions on Blackwell GPUs (compute capability ≥ 100). Uses PTX <code>cvt.rs.satfinite</code> instructions for probabilistic rounding.</p>
+<p><strong>Why Use Stochastic Rounding:</strong></p>
+<div class="list-item depth-2"><span aria-hidden="true">•</span><div>Reduces bias in low-precision training/inference by randomly rounding up or down</div></div>
+<div class="list-item depth-2"><span aria-hidden="true">•</span><div>Improves numerical accuracy compared to deterministic rounding (e.g., round-to-nearest-even)</div></div>
+<div class="list-item depth-2"><span aria-hidden="true">•</span><div>Particularly beneficial when accumulating many small updates in FP8/FP16</div></div>
+<p><strong>Performance Characteristics:</strong></p>
+<div class="list-item depth-2"><span aria-hidden="true">•</span><div>Hardware-accelerated: Uses native Blackwell instructions (cvt.rs.satfinite)</div></div>
+<div class="list-item depth-2"><span aria-hidden="true">•</span><div>Minimal overhead: Similar throughput to deterministic rounding</div></div>
+<div class="list-item depth-2"><span aria-hidden="true">•</span><div>Memory bandwidth: Requires additional random bits (uint32 per element)</div></div>
+<p>Parameters:</p>
+<div class="list-item depth-2"><span aria-hidden="true">•</span><div><code>src</code>: Source FP32 tensor</div></div>
+<div class="list-item depth-2"><span aria-hidden="true">•</span><div><code>dst_dtype</code>: Destination dtype (FP8 E5M2, FP8 E4M3FN, BF16, or FP16)</div></div>
+<div class="list-item depth-2"><span aria-hidden="true">•</span><div><code>rand_bits</code>: Random bits (uint32 tensor) for entropy, same shape as src</div></div>
+<div class="list-item depth-3"><span aria-hidden="true">•</span><div><strong>Important:</strong> Use <code>n_rounds=7</code> with <code>tl.randint4x()</code> for sufficient entropy</div></div>
+<div class="list-item depth-3"><span aria-hidden="true">•</span><div>Fewer rounds may result in biased rounding behavior</div></div>
+<div class="list-item depth-3"><span aria-hidden="true">•</span><div>Different seeds produce different rounding decisions for better statistical properties</div></div>
+<p>Example:</p>
+<pre><code class="language-python">        # Generate random bits for entropy
+        # n_rounds=7 provides sufficient randomness for unbiased stochastic rounding
+        offsets = tl.arange(0, BLOCK_SIZE // 4)
+        r0, r1, r2, r3 = tl.randint4x(seed, offsets, n_rounds=7)
+        rbits = tl.join(tl.join(r0, r1), tl.join(r2, r3)).reshape(x.shape)
+
+        # Apply stochastic rounding
+        y = tlx.stoch_round(x, tlx.dtype_of(y_ptr), rbits)</code></pre></article>
+      <footer class="pager"><a href="warp-specialization.html">← Warp specialization and clustering</a><a class="next" href="kernels.html">Example kernels →</a></footer>
+    </main>
+  </div>
+</body>
+</html>

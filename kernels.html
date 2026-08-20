@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="GEMM and attention kernels implemented with TLX.">
+  <title>Example kernels · TLX</title>
+  <link rel="stylesheet" href="assets/tlx.css">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="./"><span>TLX</span> Triton Low-level Language Extensions</a>
+    <a class="repo-link" href="https://github.com/facebookexperimental/triton" target="_blank" rel="noreferrer">View on GitHub ↗</a>
+  </header>
+  <div class="shell">
+    <aside class="sidebar">
+      <p class="eyebrow">Documentation</p>
+      <nav><a href="./">Overview</a>
+<a href="buffers.html">Local and remote buffers</a>
+<a href="async-memory.html">Async memory access</a>
+<a href="async-compute.html">Async tensor core operations</a>
+<a href="synchronization.html">Barriers and Cluster Launch Control</a>
+<a href="warp-specialization.html">Warp specialization and clustering</a>
+<a href="utilities.html">Other operations</a>
+<a href="kernels.html" aria-current="page">Example kernels</a>
+<a href="install-and-test.html">Build, install, and test</a>
+<a href="resources.html">More reading</a></nav>
+    </aside>
+    <main>
+      <p class="eyebrow">TLX documentation</p>
+      <h1>Example kernels</h1>
+      <p class="lede">GEMM and attention kernels implemented with TLX.</p>
+      <article><h3 id="gemm-kernels">GEMM kernels</h3>
+<p><a href="https://github.com/facebookexperimental/triton/blob/main/third_party/tlx/tutorials/hopper_gemm_pipelined_test.py" target="_blank" rel="noreferrer">Pipelined GEMM on Hopper</a></p>
+<p><a href="https://github.com/facebookexperimental/triton/blob/main/third_party/tlx/tutorials/hopper_gemm_ws_test.py" target="_blank" rel="noreferrer">Warp-specialized GEMM on Hopper</a></p>
+<p><a href="https://github.com/facebookexperimental/triton/blob/main/third_party/tlx/tutorials/blackwell_gemm_ws.py" target="_blank" rel="noreferrer">Warp-specialized GEMM on Blackwell</a></p>
+<p><a href="https://github.com/facebookexperimental/triton/blob/main/third_party/tlx/tutorials/blackwell_grouped_gemm_test.py" target="_blank" rel="noreferrer">Grouped GEMM on Blackwell</a></p>
+<p><a href="https://github.com/facebookexperimental/triton/blob/main/third_party/tlx/tutorials/blackwell_gemm_pipelined.py" target="_blank" rel="noreferrer">Pipelined GEMM on Blackwell</a></p>
+<p><a href="https://github.com/facebookexperimental/triton/blob/main/third_party/tlx/tutorials/blackwell_gemm_clc.py" target="_blank" rel="noreferrer">CLC GEMM on Blackwell</a></p>
+<p><a href="https://github.com/facebookexperimental/triton/blob/main/third_party/tlx/tutorials/blackwell_gemm_2cta.py" target="_blank" rel="noreferrer">2-CTA GEMM on Blackwell</a></p>
+<h3 id="attention-kernels">Attention kernels</h3>
+<p><a href="https://github.com/facebookexperimental/triton/blob/main/third_party/tlx/tutorials/blackwell_fa_ws_pipelined_persistent_test.py" target="_blank" rel="noreferrer">Warp-specialized pipelined persistent FA fwd/bwd on Blackwell</a></p>
+<p><a href="https://github.com/facebookexperimental/triton/blob/main/third_party/tlx/tutorials/hopper_fa_ws_pipelined_pingpong_test.py" target="_blank" rel="noreferrer">Warp-Specialized computation-pipelined pingpong FA fwd on Hopper</a></p></article>
+      <footer class="pager"><a href="utilities.html">← Other operations</a><a class="next" href="install-and-test.html">Build, install, and test →</a></footer>
+    </main>
+  </div>
+</body>
+</html>
