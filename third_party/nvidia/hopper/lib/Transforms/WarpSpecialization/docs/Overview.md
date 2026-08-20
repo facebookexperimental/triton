@@ -49,6 +49,15 @@ elementwise users. This keeps broadcasts and their value materialization, such
 as a descriptor load followed by an extend, associated with their use after
 other operands, such as TMEM loads, have been prepared.
 
+For explicitly enabled dependent 2-CTA matmul graphs, the backend runs
+`nvgpu-analyze-2cta-dependencies` after matmul acceleration and before 2-CTA
+descriptor-load rewriting. It follows the SSA chain into each collaborative
+MMA and marks collective contractions separately from operands that require a
+peer gather. `nvgpu-plan-2cta-exchange` then inserts an abstract gather before
+buffer allocation. After AutoWS and software pipelining,
+`nvgpu-materialize-2cta-exchange` reuses the planned dQ shared buffer for the
+local and remote halves and lowers the gather to DSMEM stores and barriers.
+
 The TMA store wait pipeline is enabled by default and can be disabled with the
 `nvgpu-warp-specialization` pass option `tma-store-pipelining=false`. Disabling
 it skips wait annotation, annotation validation, and wait reordering; it does
@@ -82,6 +91,9 @@ recognizes the `scf.while` outer loop (same doc).
 | `WarpSpecialization.cpp` | `NVGPUWarpSpecialization` | Top-level pipeline orchestration |
 | `SinkBroadcast.cpp` | `nvgpu-sink-broadcast` | Pre-partition peephole that sinks `tt.broadcast` producer chains to elementwise users |
 | `PartitionSchedulingMeta.cpp` | `nvgpu-partition-scheduling-meta` | Partition scheduling for Blackwell (assigns `ttg.partition` attributes), including ordered-subset-carry `scf.while`. See [PartitionSchedulingMeta.md](PartitionSchedulingMeta.md); downstream dynamic/CLC validation is tracked in [WarpSpecializeWhileLoops.md](WarpSpecializeWhileLoops.md) |
+| `../../Analyze2CTADependencies.cpp` | `nvgpu-analyze-2cta-dependencies` | Classifies dependent 2-CTA MMA operand chains as collective contractions or peer gathers before AutoWS; see [AutoWS2CTABackwardPlan.md](AutoWS2CTABackwardPlan.md) |
+| `../../Plan2CTAExchange.cpp` | `nvgpu-plan-2cta-exchange` | Inserts an abstract peer-gather SSA dependency before AutoWS scheduling and memory planning |
+| `../../Materialize2CTAExchange.cpp` | `nvgpu-materialize-2cta-exchange` | Lowers planned peer gathers after pipelining to local stores and async peer stores completed on the existing AutoWS full barrier |
 | (frontend) | `tl.range` / `tl.condition` → `tt.*` loop attrs | The user-facing AutoWS/pipelining annotations, their IR attributes and consumers, and what works on `scf.while` today: [AutoWSAnnotations.md](AutoWSAnnotations.md) |
 | `WSTaskPartition.cpp` | `doTaskPartition` | Assigns `async_task_id` to anchor ops (loads, dots, stores) — Hopper only |
 | `TaskIdPropagation.cpp` | — | `TaskIdBackwardPropagation` sparse dataflow analysis |
