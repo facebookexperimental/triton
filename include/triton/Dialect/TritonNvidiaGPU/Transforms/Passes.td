@@ -277,6 +277,53 @@ def TritonNvidiaGPUCheckMatmulTwoCTAPass : Pass<"triton-nvidia-check-matmul-two-
   }];
 }
 
+def TritonNvidiaGPUAtomicTileSchedulerPreparePass
+    : Pass<"triton-nvidia-gpu-atomic-tile-scheduler-prepare", "mlir::ModuleOp"> {
+  let summary = "Recognize clustered dynamic-persistent atomic tile claims";
+
+  let description = [{
+    Recognize the canonical DynamicPersistent1DScheduler scf.while shape in an
+    explicit multi-CTA cluster, mark its scalar atomic tile claim for later
+    cluster materialization, and replace the initial physical X program id with
+    an X-major linear program id over the physical CTA grid. The frontend IR is
+    otherwise unchanged. Required clustered schedules that do not match the
+    canonical shape are rejected before collective synchronization is added.
+  }];
+
+  let dependentDialects = [
+    "mlir::triton::TritonDialect",
+    "mlir::triton::gpu::TritonGPUDialect",
+    "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect",
+    "mlir::triton::nvgpu::NVGPUDialect",
+    "mlir::arith::ArithDialect",
+    "mlir::scf::SCFDialect"
+  ];
+}
+
+def TritonNvidiaGPUAtomicTileSchedulerMaterializePass
+    : Pass<"triton-nvidia-gpu-atomic-tile-scheduler-materialize", "mlir::ModuleOp"> {
+  let summary = "Materialize clustered atomic tile claims";
+
+  let description = [{
+    Lower a prepared clustered atomic tile claim into one leader-only
+    atomic_add by the physical cluster size, distribute the returned base PID
+    through generic-proxy DSM stores, and derive each CTA's logical PID as
+    base + cluster_cta_rank. Full and empty remote mbarriers provide data-ready
+    and reuse synchronization with a loop-carried phase. This pass runs after
+    optional warp specialization, so the marked claim is already in its owner
+    partition and generic code partitioning remains unchanged.
+  }];
+
+  let dependentDialects = [
+    "mlir::triton::TritonDialect",
+    "mlir::triton::gpu::TritonGPUDialect",
+    "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect",
+    "mlir::triton::nvgpu::NVGPUDialect",
+    "mlir::arith::ArithDialect",
+    "mlir::scf::SCFDialect"
+  ];
+}
+
 def TritonNvidiaGPUCLCSplitPass : Pass<"triton-nvidia-gpu-clc-split", "mlir::ModuleOp"> {
   let summary = "Split ttng.clc_advance into the token form (clc_try_cancel_async + clc_read)";
 

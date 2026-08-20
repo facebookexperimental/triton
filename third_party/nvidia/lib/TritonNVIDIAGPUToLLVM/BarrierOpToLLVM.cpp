@@ -52,27 +52,6 @@ void mlir::triton::NVIDIA::createFenceMBarrierInitReleaseCluster(
 
 namespace {
 
-struct PhysicalClusterInfo {
-  SmallVector<int, 3> dims;
-  int size;
-  bool hasPerCTAProgramIds;
-};
-
-// num-ctas describes Triton's logical/layout cluster model. ctas_per_cga keeps
-// num-ctas == 1 and records the physical CUDA cluster in ttg.cluster-dim-*.
-// Keep those concepts separate: changing lookupNumCTAs would alter layout and
-// program-id semantics throughout the compiler.
-PhysicalClusterInfo getPhysicalClusterInfo(Operation *op) {
-  ModuleOp mod = op->getParentOfType<ModuleOp>();
-  assert(mod && "expected CLC op inside a module");
-  int numCTAs = ttg::TritonGPUDialect::getNumCTAs(mod);
-  SmallVector<int, 3> dims = ttg::TritonGPUDialect::getClusterDims(mod);
-  int explicitSize = dims[0] * dims[1] * dims[2];
-  if (explicitSize > 1)
-    return {std::move(dims), explicitSize, numCTAs == 1};
-  return {{numCTAs, 1, 1}, numCTAs, false};
-}
-
 Value getElectWarp0OrThread0(const NVIDIA::TargetInfo &targetInfo,
                              TritonLLVMOpBuilder &b) {
   if (targetInfo.getComputeCapability() >= 90) {
@@ -337,11 +316,10 @@ struct WaitBarrierOpConversion
     } else {
       // SM90+ polls with try_wait in a spin loop. Blackwell can opt into the
       // four-operand form, whose suspend hint lowers to NANOSLEEP.SYNCS.
+      std::string waitOp = "mbarrier.try_wait.parity.shared::cta.b64";
       std::string tryWait = useSuspendHint
-                                ? "\tmbarrier.try_wait.parity.shared::cta.b64 "
-                                  "complete, [$0], $1, $2;\n"
-                                : "\tmbarrier.try_wait.parity.shared::cta.b64 "
-                                  "complete, [$0], $1;\n";
+                                ? "\t" + waitOp + " complete, [$0], $1, $2;\n"
+                                : "\t" + waitOp + " complete, [$0], $1;\n";
       if (!predicated) {
         ptx = std::string(R"(
 {
@@ -471,7 +449,7 @@ struct ArriveBarrierOpConversion
       auto emitArrive = [&](Value targetBarrier, Value multicastMask = {}) {
         std::stringstream ptxAsm;
         ptxAsm << "@$0 mbarrier.arrive.";
-        if (op.isMulticast())
+        if (op.isMulticast() || isRemoteBarrier)
           ptxAsm << "release.cluster.";
         ptxAsm << (isRemoteBarrier || isCrossCluster || op.isMulticast()
                        ? "shared::cluster"
@@ -741,7 +719,7 @@ struct CLCTryCancelOpConversion
     // Use elect predicate - only one thread should issue CLC
     Value pred = LLVM::NVIDIA::createElectPredicateWarp0(loc, rewriter);
 
-    PhysicalClusterInfo cluster = getPhysicalClusterInfo(op);
+    auto cluster = triton::nvidia_gpu::getPhysicalClusterInfo(op);
     if (cluster.size > 1) {
       TritonLLVMOpBuilder b(loc, rewriter);
       auto clusterCtaId =
@@ -875,7 +853,7 @@ struct CLCGetProgramIdOpConversion
     Value result =
         ptxBuilder.launch(rewriter, loc, i32_ty, /*hasSideEffects=*/false);
 
-    PhysicalClusterInfo cluster = getPhysicalClusterInfo(op);
+    auto cluster = triton::nvidia_gpu::getPhysicalClusterInfo(op);
     if (cluster.hasPerCTAProgramIds) {
       // CLC returns the first CTA coordinate of the canceled cluster. Under
       // ctas_per_cga, every CTA is a distinct Triton program, so reconstruct

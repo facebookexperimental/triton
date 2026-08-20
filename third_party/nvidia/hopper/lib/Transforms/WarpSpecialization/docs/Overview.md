@@ -30,6 +30,18 @@ doTaskPartition          (Hopper only; skipped on Blackwell)
   → SoftwarePipeliner::expandLoops
 ```
 
+For an atomic dynamic scheduler used by a physical multi-CTA cluster, the
+NVIDIA backend wraps this pipeline with compiler-only preparation and
+materialization. Before AutoWS, `atomic-tile-scheduler-prepare` proves the
+canonical loop shape, linearizes the seed PID in physical-cluster order, and
+tags the claim. AutoWS assigns and clones the run-once owner without changing
+generic code partitioning. The late materialization pass then makes cluster
+rank zero reserve `K` PIDs and distributes the base through DSM; the same pass
+handles non-WS kernels. AutoWS's existing
+`doDynamicTileBroadcast` remains the separate, intra-CTA broadcast from the
+owner warp partition to the other partitions. The frontend scheduler API and
+TTIR shape do not change.
+
 On Blackwell, task assignments are expected to come from an earlier partition
 scheduling pass (`PartitionSchedulingMeta`) rather than `doTaskPartition`.
 Data partitioning is not Hopper-only; it can run as the separate
@@ -87,6 +99,8 @@ recognizes the `scf.while` outer loop (same doc).
 | `TaskIdPropagation.cpp` | — | `TaskIdBackwardPropagation` sparse dataflow analysis |
 | `WSTaskIdPropagate.cpp` | `doTaskIdPropagate` | Runs analysis and materializes task IDs |
 | `WSAtomicBroadcast.cpp` | `doDynamicTileBroadcast` | Cross-partition run-once "claim next tile" support: run a dynamic-persistent tile-id producer once and broadcast it, for both a `tt.atomic_rmw` counter and a CLC tile-scheduler fetch (`ttng.clc_read`) — or gracefully reject unsupported shapes. See [CrossPartitionAtomicSupport.md](CrossPartitionAtomicSupport.md) |
+| [`lib/Dialect/TritonNvidiaGPU/Transforms/AtomicTileScheduler.cpp`](AtomicTileScheduler.md) | `atomic-tile-scheduler-prepare` / `atomic-tile-scheduler-materialize` | Backend-only physical-cluster extension for the atomic dynamic scheduler: prove and tag before AutoWS, then reserve and distribute `K` PIDs in one late pass after optional warp specialization |
+| [`lib/Dialect/TritonNvidiaGPU/Transforms/ClusterHandoff.cpp`](ClusterHandoff.md) | shared utility | Captures function-lifetime atomic/CLC handoff storage into an already-isolated AutoWS owner partition and builds TLX-style remote mbarrier arrivals |
 | `WSDataPartition.cpp` | `doDataPartition` / `nvgpu-ws-data-partition` | Splits ops along M/N dimensions across warp groups |
 | `PingPong.cpp` | `doPingPongPrep` / `doPingPongSync` | Named barrier insertion for ping-pong scheduling |
 | `WSCodePartition.cpp` | `doBufferAllocation` | Channel discovery and SMEM/TMEM allocation hoisting (pre-pass) |
@@ -135,6 +149,8 @@ recognizes the `scf.while` outer loop (same doc).
 
 - [Task Partitioning & ID Propagation](TaskPartitionAndPropagation.md) — how ops are assigned to partitions
 - [Cross-Partition Run-Once Atomic Support](CrossPartitionAtomicSupport.md) — dynamic-persistent tile-id `atomic_add` broadcast
+- [Atomic Tile Scheduler](AtomicTileScheduler.md) — physical-cluster preparation, AutoWS interaction, and late PID handoff materialization
+- [Cluster Handoff Utilities](ClusterHandoff.md) — shared persistent mbarrier allocation, warp-partition capture, and remote-arrive builders
 - [Dynamic Persistent AutoWS Gaps](DynamicPersistentAutoWSGaps.md) — current inner-loop support, outer-while blockers, and completion criteria
 - [Data Partitioning](DataPartition.md) — splitting tensor dimensions across consumer warp groups
 - [Code Partitioning](CodePartition.md) — channel discovery, buffer creation, sync insertion

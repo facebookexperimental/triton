@@ -134,7 +134,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
 
   // CHECK-LABEL: arrive_barrier_remote
   tt.func @arrive_barrier_remote(%alloc: !ttg.memdesc<1xi64, #shared0, #ttng.shared_cluster_memory>, %pred: i1) {
-    // CHECK: "@$0 mbarrier.arrive.shared::cluster.b64 _, [$1], 2;", "b,r" %{{.*}}
+    // CHECK: "@$0 mbarrier.arrive.release.cluster.shared::cluster.b64 _, [$1], 2;", "b,r" %{{.*}}
     ttng.arrive_barrier %alloc, 2, %pred : !ttg.memdesc<1xi64, #shared0, #ttng.shared_cluster_memory>
     tt.return
   }
