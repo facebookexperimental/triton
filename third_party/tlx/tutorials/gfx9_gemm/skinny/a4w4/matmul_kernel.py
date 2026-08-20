@@ -5,6 +5,7 @@ module imports this implementation and retains the public shape dispatcher.
 """
 
 import os
+from typing import Optional
 
 import torch
 import triton
@@ -12,10 +13,6 @@ import triton.language as tl
 import triton.language.extra.tlx as tlx
 
 __all__ = ["is_skinny", "skinny_matmul"]
-
-# Preserve the scheduling contract when this module is imported directly,
-# rather than through the inter-wave dispatcher.
-os.environ.setdefault("TRITON_DISABLE_POST_MISCHED", "1")
 
 BLOCK_K = 256
 NUM_WARPS = 8
@@ -428,75 +425,102 @@ def choose_skinny_buffer_count(M, N, K):
     } else 2
 
 
+def setup_env() -> Optional[str]:
+    # Preserve the scheduling contract (LLVM post-RA machine scheduler off)
+    # only when the kernel is actually used, not as an import side effect.
+    # Returns the prior value so the caller can restore it afterwards.
+    #
+    # The save/restore around os.environ is not synchronized: skinny_matmul is
+    # expected to be driven from a single thread (as the inter-wave dispatcher
+    # does). Concurrent invocations from multiple threads would race on the
+    # shared TRITON_DISABLE_POST_MISCHED value and are not supported.
+    prev = os.environ.get("TRITON_DISABLE_POST_MISCHED")
+    os.environ.setdefault("TRITON_DISABLE_POST_MISCHED", "1")
+    return prev
+
+
+def teardown_env(prev: Optional[str]) -> None:
+    # Restore the process environment so the scheduling override does not leak
+    # to other kernels compiled later in the same process.
+    if prev is None:
+        os.environ.pop("TRITON_DISABLE_POST_MISCHED", None)
+    else:
+        os.environ["TRITON_DISABLE_POST_MISCHED"] = prev
+
+
 def skinny_matmul(a, b, a_scales, b_scales, SPLIT_K=None, BLOCK_M=None):
     """32/64/128x128 TLX path for occupancy-starved shapes."""
-    M = a.shape[0]
-    K = a.shape[1] * 2
-    N = b.shape[0]
-    BM = choose_skinny_block_m(M, N, K) if BLOCK_M is None else BLOCK_M
-    if BM == SKINNY_TINY_BLOCK_M:
-        # The dword view requires four contiguous, aligned M-scale bytes and a
-        # dword-expressible K-group stride. Fall back for exotic strided views.
-        if (a_scales.stride(0) != 1 or a_scales.stride(1) % 4 != 0 or a_scales.data_ptr() % 4 != 0):
-            BM = SKINNY_SMALL_BLOCK_M
-    BN = SKINNY_BLOCK_N
-    if SPLIT_K is None:
-        SPLIT_K = choose_split_k_skinny(M, N, K, BM)
-    KS = K // SPLIT_K
-    assert K % SPLIT_K == 0 and KS % BLOCK_K == 0
-    c = torch.empty((M, N), device=a.device, dtype=torch.bfloat16)
-    grid_mn = triton.cdiv(M, BM) * triton.cdiv(N, BN)
-    workspace = torch.empty((SPLIT_K * M, N), device=a.device, dtype=torch.float32) if SPLIT_K > 1 else c
-    buffer_count = choose_skinny_buffer_count(M, N, K)
-    group_size_m = GROUP_SIZE_M
-    num_xcds = NUM_XCDS
-    # The tiny tile is memory-clause limited; larger skinny tiles prefer ILP.
-    sched_strategy = "max-memory-clause" if BM == SKINNY_TINY_BLOCK_M else "max-ilp"
-    _a4w4_skinny_kernel[(grid_mn * SPLIT_K, )](
-        a,
-        b,
-        c,
-        workspace,
-        a_scales,
-        b_scales,
-        M,
-        N,
-        K,
-        a.stride(0),
-        a.stride(1),
-        b.stride(0),
-        b.stride(1),
-        c.stride(0),
-        c.stride(1),
-        a_scales.stride(0),
-        a_scales.stride(1),
-        b_scales.stride(0),
-        b_scales.stride(1),
-        BLOCK_M=BM,
-        BLOCK_N=BN,
-        BLOCK_K=BLOCK_K,
-        GROUP_SIZE_M=group_size_m,
-        NUM_XCDS=num_xcds,
-        GRID_MN=grid_mn,
-        SPLIT_K=SPLIT_K,
-        BUFFER_COUNT=buffer_count,
-        num_warps=4 if BM <= SKINNY_SMALL_BLOCK_M else NUM_WARPS,
-        num_stages=1,
-        matrix_instr_nonkdim=32,
-        llvm_fn_attrs=(
-            ("amdgpu-agpr-alloc", "0,0"),
-            (
-                "amdgpu-sched-strategy",
-                sched_strategy,
+    prev_env = setup_env()
+    try:
+        M = a.shape[0]
+        K = a.shape[1] * 2
+        N = b.shape[0]
+        BM = choose_skinny_block_m(M, N, K) if BLOCK_M is None else BLOCK_M
+        if BM == SKINNY_TINY_BLOCK_M:
+            # The dword view requires four contiguous, aligned M-scale bytes and a
+            # dword-expressible K-group stride. Fall back for exotic strided views.
+            if (a_scales.stride(0) != 1 or a_scales.stride(1) % 4 != 0 or a_scales.data_ptr() % 4 != 0):
+                BM = SKINNY_SMALL_BLOCK_M
+        BN = SKINNY_BLOCK_N
+        if SPLIT_K is None:
+            SPLIT_K = choose_split_k_skinny(M, N, K, BM)
+        KS = K // SPLIT_K
+        assert K % SPLIT_K == 0 and KS % BLOCK_K == 0
+        c = torch.empty((M, N), device=a.device, dtype=torch.bfloat16)
+        grid_mn = triton.cdiv(M, BM) * triton.cdiv(N, BN)
+        workspace = torch.empty((SPLIT_K * M, N), device=a.device, dtype=torch.float32) if SPLIT_K > 1 else c
+        buffer_count = choose_skinny_buffer_count(M, N, K)
+        group_size_m = GROUP_SIZE_M
+        num_xcds = NUM_XCDS
+        # The tiny tile is memory-clause limited; larger skinny tiles prefer ILP.
+        sched_strategy = "max-memory-clause" if BM == SKINNY_TINY_BLOCK_M else "max-ilp"
+        _a4w4_skinny_kernel[(grid_mn * SPLIT_K, )](
+            a,
+            b,
+            c,
+            workspace,
+            a_scales,
+            b_scales,
+            M,
+            N,
+            K,
+            a.stride(0),
+            a.stride(1),
+            b.stride(0),
+            b.stride(1),
+            c.stride(0),
+            c.stride(1),
+            a_scales.stride(0),
+            a_scales.stride(1),
+            b_scales.stride(0),
+            b_scales.stride(1),
+            BLOCK_M=BM,
+            BLOCK_N=BN,
+            BLOCK_K=BLOCK_K,
+            GROUP_SIZE_M=group_size_m,
+            NUM_XCDS=num_xcds,
+            GRID_MN=grid_mn,
+            SPLIT_K=SPLIT_K,
+            BUFFER_COUNT=buffer_count,
+            num_warps=4 if BM <= SKINNY_SMALL_BLOCK_M else NUM_WARPS,
+            num_stages=1,
+            matrix_instr_nonkdim=32,
+            llvm_fn_attrs=(
+                ("amdgpu-agpr-alloc", "0,0"),
+                (
+                    "amdgpu-sched-strategy",
+                    sched_strategy,
+                ),
             ),
-        ),
-    )
-    if SPLIT_K > 1:
-        rbm, rbn, rw = (32, 32, 4)
-        _reduce_k_kernel[(triton.cdiv(M, rbm), triton.cdiv(N, rbn))](workspace, c, M, N, SPLIT_K=SPLIT_K,
-                                                                     BLOCK_SIZE_M=rbm, BLOCK_SIZE_N=rbn,
-                                                                     OUTPUT_DTYPE=tl.bfloat16, num_warps=rw)
-    return c
+        )
+        if SPLIT_K > 1:
+            rbm, rbn, rw = (32, 32, 4)
+            _reduce_k_kernel[(triton.cdiv(M, rbm), triton.cdiv(N, rbn))](workspace, c, M, N, SPLIT_K=SPLIT_K,
+                                                                         BLOCK_SIZE_M=rbm, BLOCK_SIZE_N=rbn,
+                                                                         OUTPUT_DTYPE=tl.bfloat16, num_warps=rw)
+        return c
+    finally:
+        teardown_env(prev_env)
 
 
 def is_skinny(M, N, K):
