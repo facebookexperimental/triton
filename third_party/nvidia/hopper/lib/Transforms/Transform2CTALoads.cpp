@@ -28,6 +28,7 @@
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
+#include "triton/Tools/Sys/GetEnv.h"
 #include "llvm/Support/Debug.h"
 
 using namespace mlir;
@@ -87,6 +88,37 @@ getCompatibleEncoding(ttg::BlockedEncodingAttr origEncoding,
   }
 
   return ttg::BlockedEncodingAttr::get(ctx, spt, tpw, wpc, order, ctaLayout);
+}
+
+// Halving the block along the contiguous dimension can leave the original
+// swizzle byte width illegal: an NVMMASharedLayout requires the contiguous
+// dimension to hold at least 8 * swizzleByteWidth / elementBitWidth elements.
+// A 128-byte-swizzled fp16 B tile that is 64 elements wide (HEAD_DIM=64) is
+// legal, but its 32-element half is not. Recompute the widest swizzle that is
+// legal for the halved shape instead of carrying the original one over.
+static Attribute shrinkSwizzleForShape(Attribute layout,
+                                       ArrayRef<int64_t> newBlockShape) {
+  auto nvmma = dyn_cast_if_present<ttg::NVMMASharedEncodingAttr>(layout);
+  if (!nvmma || nvmma.getSwizzlingByteWidth() == 0 || newBlockShape.size() < 2)
+    return layout;
+
+  unsigned contigDim = nvmma.getTransposed() ? 0 : newBlockShape.size() - 1;
+  unsigned eltBitWidth = nvmma.getElementBitWidth();
+  int64_t packingFactor = nvmma.getFp4Padded() ? 2 : 1;
+  int64_t contigBytes =
+      newBlockShape[contigDim] * packingFactor * eltBitWidth / 8;
+
+  unsigned swizzle = nvmma.getSwizzlingByteWidth();
+  while (swizzle >= 32 && contigBytes < static_cast<int64_t>(swizzle))
+    swizzle /= 2;
+  if (swizzle < 32)
+    swizzle = 0;
+  if (swizzle == nvmma.getSwizzlingByteWidth())
+    return layout;
+
+  return ttg::NVMMASharedEncodingAttr::get(
+      layout.getContext(), swizzle, nvmma.getTransposed(), eltBitWidth,
+      nvmma.getFp4Padded(), nvmma.getCGALayout());
 }
 
 struct BLoadTrace {
@@ -180,6 +212,29 @@ struct Transform2CTALoads
         LDBG("Skipped MMA at " << mma.getLoc()
                                << " (B not from descriptor load)");
     }
+
+    // A 2-CTA TMA load is issued by both CTAs as one hardware CTA-group
+    // transaction. Mark every rank-2 descriptor load in the cooperative
+    // kernel, including A operands (K/V) that are not visited by B splitting.
+    // Rank-1 metadata loads remain ordinary per-CTA loads, matching TLX's raw
+    // M/D bulk-copy path.
+    //
+    // Cooperative marking is a performance choice, not a correctness
+    // requirement: leaving a load unmarked keeps the pre-existing per-CTA
+    // path, where each CTA issues its own transaction. Setting
+    // TRITON_DISABLE_2CTA_COOPERATIVE_LOADS=1 selects that path for the whole
+    // module so the two protocols can be benchmarked against each other on a
+    // given kernel. Marking stays all-or-nothing per module because barrier
+    // fusion requires a homogeneous group; optimizeTMALoads rejects a mixed
+    // group rather than silently miscounting expected bytes.
+    if (!triton::tools::getBoolEnv("TRITON_DISABLE_2CTA_COOPERATIVE_LOADS")) {
+      moduleOp.walk([&](tt::DescriptorLoadOp descLoad) {
+        auto resultTy = dyn_cast<RankedTensorType>(descLoad.getType());
+        if (resultTy && resultTy.getRank() == 2)
+          descLoad->setAttr(ttng::AttrTwoCTALoadName,
+                            UnitAttr::get(moduleOp.getContext()));
+      });
+    }
   }
 
   LogicalResult transformBLoad(ttng::TCGen5MMAOp mma) {
@@ -214,7 +269,8 @@ struct Transform2CTALoads
 
     MLIRContext *ctx = mma.getContext();
     auto elemType = descType.getElementType();
-    auto sharedLayout = descType.getSharedLayout();
+    auto sharedLayout =
+        shrinkSwizzleForShape(descType.getSharedLayout(), newBlockShape);
     auto newDescType =
         tt::TensorDescType::get(newBlockShape, elemType, sharedLayout);
 
@@ -293,8 +349,10 @@ struct Transform2CTALoads
 
     auto origMemDescType = cast<ttg::MemDescType>(localAlloc.getType());
     auto allocSrcType = cast<RankedTensorType>(allocSrc.getType());
+    auto newMemDescEncoding = shrinkSwizzleForShape(
+        origMemDescType.getEncoding(), allocSrcType.getShape());
     auto newMemDescType = ttg::MemDescType::get(
-        allocSrcType.getShape(), elemType, origMemDescType.getEncoding(),
+        allocSrcType.getShape(), elemType, newMemDescEncoding,
         origMemDescType.getMemorySpace(), origMemDescType.getMutableMemory());
 
     builder.setInsertionPoint(localAlloc);
