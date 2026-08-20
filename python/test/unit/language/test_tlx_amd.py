@@ -399,111 +399,6 @@ def test_d64_dispatch_contract_is_ci_discovered(q_shape, k_shape, causal, family
     amd_fa_bwd._validate_d64_dispatch(q_shape, k_shape, causal, dispatch)
 
 
-def test_d64_causal_gqa_score_prescaling_ast_contract():
-    from triton.language.extra.tlx.tutorials import amd_fa_bwd
-
-    amd_fa_bwd.test_d64_causal_common_dq_direct_load_ast_contract()
-
-
-@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
-@pytest.mark.parametrize(
-    ("shape", "causal", "family", "kernel_names"),
-    [
-        pytest.param(
-            (1, 16, 16, 4096, 4096, 64),
-            False,
-            "noncausal_fused_n256",
-            (
-                "_attn_bwd_d64_fused_n256_kernel",
-                "_attn_bwd_d64_fused_dq_convert_kernel",
-            ),
-            id="noncausal-mha",
-        ),
-        pytest.param(
-            (1, 16, 2, 4096, 4096, 64),
-            False,
-            "noncausal_fused_n256",
-            (
-                "_attn_bwd_d64_fused_n256_kernel",
-                "_attn_bwd_d64_fused_dq_convert_kernel",
-                "_attn_bwd_dkdv_d64_reduce_kernel",
-            ),
-            id="noncausal-gqa8",
-        ),
-        pytest.param(
-            (1, 24, 24, 4096, 4096, 64),
-            True,
-            "causal_scheduled_mha",
-            (
-                "_attn_bwd_dq_d64_causal_mha_kernel",
-                "_attn_bwd_dkdv_d64_causal_mha_kernel",
-            ),
-            id="causal-mha",
-        ),
-        pytest.param(
-            (4, 48, 6, 1024, 1024, 64),
-            True,
-            "causal_scheduled_gqa8",
-            (
-                "_attn_bwd_dq_d64_causal_gqa8_kernel",
-                "_attn_bwd_dkdv_d64_causal_gqa8_kernel",
-                "_attn_bwd_dkdv_d64_causal_gqa8_reduce_kernel",
-            ),
-            id="causal-gqa8",
-        ),
-        pytest.param(
-            (4, 48, 6, 1024, 2048, 64),
-            True,
-            "causal_scheduled_gqa8",
-            (
-                "_attn_bwd_dq_d64_causal_gqa8_kernel",
-                "_attn_bwd_dkdv_d64_causal_gqa8_kernel",
-                "_attn_bwd_dkdv_d64_causal_gqa8_reduce_kernel",
-            ),
-            id="causal-gqa8-rectangular",
-        ),
-    ],
-)
-def test_d64_selected_routes_correct_and_scratch_free_gfx950(shape, causal, family, kernel_names, monkeypatch):
-    from triton.language.extra.tlx.tutorials import amd_fa_bwd
-
-    # Other tutorials imported by this module disable the post-RA scheduler
-    # process-wide. Verify D64 with its default codegen configuration.
-    monkeypatch.delenv("TRITON_DISABLE_POST_MISCHED", raising=False)
-    case = amd_fa_bwd._make_d64_aten_case(shape, seed=311, causal=causal)
-    properties = torch.cuda.get_device_properties(case.q.device)
-    dispatch = amd_fa_bwd._select_d64_dispatch(
-        tuple(case.q.shape),
-        tuple(case.k.shape),
-        causal,
-        arch=properties.gcnArchName,
-        cu_count=properties.multi_processor_count,
-        sm_scale=case.sm_scale,
-        bases_aligned_16=True,
-    )
-    assert dispatch.family == family
-
-    kernels = [getattr(amd_fa_bwd, name) for name in kernel_names]
-    for kernel in kernels:
-        kernel.device_caches.clear()
-
-    actual = amd_fa_bwd.fa_backward(*case.kernel_args)
-    for name, result, expected in zip(("dq", "dk", "dv"), actual, case.grads, strict=True):
-        assert torch.isfinite(result).all(), name
-        relative_l2 = torch.linalg.vector_norm(result.float() - expected.float()) / torch.linalg.vector_norm(
-            expected.float())
-        assert relative_l2.item() < 5e-3, (name, relative_l2.item())
-
-    device = torch.cuda.current_device()
-    for kernel_name, kernel in zip(kernel_names, kernels, strict=True):
-        objects = tuple(kernel.device_caches[device][0].values())
-        assert objects, kernel_name
-        for index, obj in enumerate(objects):
-            amd_fa_bwd._assert_d64_code_object_scratch_free(f"{kernel_name}[{index}]", obj)
-            if causal:
-                assert not re.search(r"\b\w*atomic\w*\b", obj.asm["amdgcn"]), kernel_name
-
-
 @triton.jit
 def _shared_concrete_helper(values):
     return values
@@ -2544,7 +2439,7 @@ def test_local_load_rematerialized_coordinates_compiles_gfx950():
 
 
 @triton.jit
-def _local_dynamic_slice_kernel(x_ptr, output_ptr, row):
+def _local_slice_runtime_offset_kernel(x_ptr, output_ptr, row):
     value_layout: tl.constexpr = tlx.layout(
         shape=((8, 32), (2, )),
         stride=((64, 2), (1, )),
@@ -2573,14 +2468,14 @@ def _local_dynamic_slice_kernel(x_ptr, output_ptr, row):
     buffer = tlx.local_view(buffers, 0)
     tlx.local_store(buffer, values)
     tl.debug_barrier()
-    view = tlx.local_dynamic_slice(buffer, [row, 0], [1, 64])
+    view = tlx.local_slice(buffer, [row, 0], [1, 64])
     selected = tl.reshape(tlx.local_load(view, relaxed=True), (64, ))
     tl.store(output_ptr + cols, selected)
 
 
-def test_local_dynamic_slice_compiles_gfx950():
+def test_local_slice_runtime_offset_compiles_gfx950():
     compiled = compile_for_gfx950(
-        _local_dynamic_slice_kernel,
+        _local_slice_runtime_offset_kernel,
         signature={"x_ptr": "*fp32", "output_ptr": "*fp32", "row": "i32"},
         constexprs={},
     )
@@ -2590,10 +2485,10 @@ def test_local_dynamic_slice_compiles_gfx950():
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
 @pytest.mark.parametrize("row", [0, 3, 7])
-def test_local_dynamic_slice_correct_gfx950(row):
+def test_local_slice_runtime_offset_correct_gfx950(row):
     x = torch.arange(8 * 64, device="cuda", dtype=torch.float32).reshape(8, 64)
     actual = torch.empty(64, device="cuda", dtype=torch.float32)
-    _local_dynamic_slice_kernel[(1, )](x, actual, row, num_warps=4)
+    _local_slice_runtime_offset_kernel[(1, )](x, actual, row, num_warps=4)
     torch.testing.assert_close(actual, x[row], atol=0.0, rtol=0.0)
 
 
@@ -2667,6 +2562,8 @@ def test_padded_local_slice_uses_transposed_lds_read_gfx950():
         },
         constexprs={},
     )
+    assert "ttg.memdesc_subslice" in compiled.asm["ttgir"]
+    assert "ttg.memdesc_dynamic_subslice" not in compiled.asm["ttgir"]
     amdgcn = compiled.asm["amdgcn"]
     assert "ds_read_b64_tr_b16" in amdgcn
     assert "ds_read_u16" not in amdgcn

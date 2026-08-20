@@ -1056,7 +1056,8 @@ class TritonSemantic(Generic[TensorTy]):
 
         # Create loaded result type `dst_ty`
         if ptr.type.is_block():
-            dst_ty = ptr.type.with_element_ty(elt_ty)
+            shape = ptr.type.get_block_shapes()
+            dst_ty = tl.block_type(elt_ty, shape)
         else:
             # Load by de-referencing the pointer of scalar
             dst_ty = elt_ty

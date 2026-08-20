@@ -112,9 +112,13 @@ the re-sync.
 
     Permutes the dimensions of a tensor.
 
-- `buffer = tlx.local_slice(buffer, offsets=[m, n], shapes=[M, N])` **[Hopper+, MI300+]**
+- `buffer = tlx.local_slice(buffer, offset=[m, n], shape=[M, N])` **[Hopper+, MI300+]**
 
-    Slice a `M x N` tensor at a `m x n` offset.
+    Slice a tensor at the given logical offset. On MI300+, SMEM offsets may be
+    runtime scalar i32 tensors; `shape` remains constexpr. The caller must keep
+    a runtime-offset view within the allocation and satisfy the same
+    tile-alignment contract as a static slice; violating either condition is
+    undefined behavior.
 
 #### Buffer Reuse
 
@@ -1099,6 +1103,14 @@ TLX uses **CUDA-native cluster semantics** which differs from Triton's approach:
     Pair with `tlx.assert_same_layout(x, layout)` (below) to statically verify the
     pin survived to the final TTGIR.
 
+- `x = tlx.release_layout(x)` **[Hopper+, MI300+]**
+
+    End an explicit register-layout requirement without changing the tensor's
+    value. Downstream layout propagation may select a layout preferred by the
+    consumer, for example when a dot-operand layout feeds a reduction. This is
+    not a conversion request; use another `require_layout` when the replacement
+    layout is part of the algorithm.
+
 - `tlx.assert_same_layout(lhs, rhs)` **[Hopper+, MI300+]**
 
     Compile-time assertion that two layouts are equivalent after layout
@@ -1289,7 +1301,14 @@ Lowers to `amdg.assume_uniform`, which is eventually lowered to `llvm.amdgcn.rea
   inexpensive distributed coordinates near a use instead of carrying them
   through a long software pipeline.
 - `tlx.amd_register_resident(value, register_class="agpr", registers_per_group=1)`
-  keeps a distributed value in allocator-visible native register tuples.
+  keeps every native-register group in one allocator-visible whole-tensor
+  residency interval.
+- `tlx.amd_register_handoff(value, register_class="vgpr", registers_per_group=1)`
+  starts an independent allocation interval for each native-register group,
+  shortening a local live range without requiring simultaneous whole-tensor
+  residency. Both register-boundary operations accept `"vgpr"` or `"agpr"`;
+  `registers_per_group` is a power-of-two count of 32-bit register values from
+  1 through 32.
 - `tlx.amd_scheduled_mfma(...)` exposes independent native MFMA accumulator
   chains in deterministic N-major, M-minor, K-reduction source order.
 - `tlx.amd_mfma_commit(value, preserve)` applies the CDNA4 MFMA result hazard
