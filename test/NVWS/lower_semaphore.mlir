@@ -50,7 +50,7 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
   }
 
   // CHECK-LABEL: @tma_load
-  tt.func @tma_load(%desc: !tt.tensordesc<tensor<128x64xf16, #shared_desc>>) {
+  tt.func @tma_load(%desc: !tt.tensordesc<128x64xf16, #shared_desc>) {
     %c0_i32 = arith.constant 0 : i32
     %cm1_i32 = arith.constant -1 : i32
     %c1_i32 = arith.constant 1 : i32
@@ -68,7 +68,7 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
     // CHECK: ttng.async_tma_copy_global_to_local %arg0[%c0_i32, %c0_i32] [[BUF_TMA]], [[MBAR_TMA_EXP]], {{%.*}} {loop.cluster = 1 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 2>}
     %tok = nvws.semaphore.acquire %sem {loop.cluster = 1 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 2>} : !nvws.semaphore<[!ttg.memdesc<1x128x64xf16, #shared_desc, #smem, mutable>]> -> !ttg.async.token
     %view = nvws.semaphore.buffer %sem, %tok {loop.cluster = 1 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 2>} : !nvws.semaphore<[!ttg.memdesc<1x128x64xf16, #shared_desc, #smem, mutable>]>, !ttg.async.token -> !ttg.memdesc<128x64xf16, #shared_desc, #smem, mutable>
-    nvws.descriptor_load %desc[%c0_i32, %c0_i32] 4096 %view {loop.cluster = 1 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 2>} : !tt.tensordesc<tensor<128x64xf16, #shared_desc>>, i32, i32, !ttg.memdesc<128x64xf16, #shared_desc, #smem, mutable>
+    nvws.descriptor_load %desc[%c0_i32, %c0_i32] 4096 %view {loop.cluster = 1 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 2>} : !tt.tensordesc<128x64xf16, #shared_desc>, i32, i32, !ttg.memdesc<128x64xf16, #shared_desc, #smem, mutable>
     // Cleanup
     // CHECK-COUNT-3: ttng.inval_barrier %{{.*}} : !ttg.memdesc<1xi64, #shared, #smem, mutable>
     // CHECK: ttg.local_dealloc [[MBAR_TMA]]
@@ -81,14 +81,14 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
   // CHECK: [[ZERO_BUF:%.*]] = ttg.local_alloc : () -> !ttg.memdesc<1x128x64xf16, {{#[^,]+}}, #smem, mutable>
   // CHECK: [[ZERO_MBAR:%.*]] = ttg.local_alloc : () -> !ttg.memdesc<1x1xi64, #shared, #smem, mutable>
   // CHECK: ttng.init_barrier {{%.*}}, 1 : !ttg.memdesc<1xi64, #shared, #smem, mutable>
-  tt.func @tma_load_num_stages_zero(%desc: !tt.tensordesc<tensor<128x64xf16, #shared_desc>>, %lb: i32, %ub: i32, %step: i32) {
+  tt.func @tma_load_num_stages_zero(%desc: !tt.tensordesc<128x64xf16, #shared_desc>, %lb: i32, %ub: i32, %step: i32) {
     %c0_i32 = arith.constant 0 : i32
     %buf = ttg.local_alloc : () -> !ttg.memdesc<1x128x64xf16, #shared_desc, #smem, mutable>
     %sem = nvws.semaphore.create %buf {pending_count = 1 : i32} : !nvws.semaphore<[!ttg.memdesc<1x128x64xf16, #shared_desc, #smem, mutable>]>
     scf.for %iv = %lb to %ub step %step : i32 {
       %tok = nvws.semaphore.acquire %sem {ttg.partition = array<i32: 2>} : !nvws.semaphore<[!ttg.memdesc<1x128x64xf16, #shared_desc, #smem, mutable>]> -> !ttg.async.token
       %view = nvws.semaphore.buffer %sem, %tok {ttg.partition = array<i32: 2>} : !nvws.semaphore<[!ttg.memdesc<1x128x64xf16, #shared_desc, #smem, mutable>]>, !ttg.async.token -> !ttg.memdesc<128x64xf16, #shared_desc, #smem, mutable>
-      nvws.descriptor_load %desc[%iv, %c0_i32] 4096 %view {ttg.partition = array<i32: 2>} : !tt.tensordesc<tensor<128x64xf16, #shared_desc>>, i32, i32, !ttg.memdesc<128x64xf16, #shared_desc, #smem, mutable>
+      nvws.descriptor_load %desc[%iv, %c0_i32] 4096 %view {ttg.partition = array<i32: 2>} : !tt.tensordesc<128x64xf16, #shared_desc>, i32, i32, !ttg.memdesc<128x64xf16, #shared_desc, #smem, mutable>
       nvws.semaphore.release %sem, %tok [#nvws.async_op<tma_load>] {arrive_count = 1 : i32, ttg.partition = array<i32: 2>} : !nvws.semaphore<[!ttg.memdesc<1x128x64xf16, #shared_desc, #smem, mutable>]>, !ttg.async.token
     } {tt.num_stages = 0 : i32, tt.warp_specialize, ttg.partition = array<i32: 2>, ttg.partition.outputs = []}
     ttg.local_dealloc %buf : !ttg.memdesc<1x128x64xf16, #shared_desc, #smem, mutable>
@@ -96,7 +96,7 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
   }
 
   // CHECK-LABEL: @tma_gather
-  tt.func @tma_gather(%desc: !tt.tensordesc<tensor<1x128xf16, #shared_desc>>) {
+  tt.func @tma_gather(%desc: !tt.tensordesc<1x128xf16, #shared_desc>) {
     %c0_i32 = arith.constant 0 : i32
     %cm1_i32 = arith.constant -1 : i32
     %c1_i32 = arith.constant 1 : i32
@@ -114,7 +114,7 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
     // CHECK: ttng.async_tma_gather %arg0[{{%.*}}, %c0_i32] [[BUF_GAT]], [[MBAR_GAT_EXP]], {{%.*}} {loop.cluster = 2 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 2>}
     %tok = nvws.semaphore.acquire %sem {loop.cluster = 2 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 2>} : !nvws.semaphore<[!ttg.memdesc<1x8x128xf16, #shared_desc, #smem, mutable>]> -> !ttg.async.token
     %view = nvws.semaphore.buffer %sem, %tok {loop.cluster = 2 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 2>} : !nvws.semaphore<[!ttg.memdesc<1x8x128xf16, #shared_desc, #smem, mutable>]>, !ttg.async.token -> !ttg.memdesc<8x128xf16, #shared_desc, #smem, mutable>
-    nvws.descriptor_gather %desc[%xoffs, %c0_i32] 2048 %view {loop.cluster = 2 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 2>} : !tt.tensordesc<tensor<1x128xf16, #shared_desc>>, tensor<8xi32>, i32, !ttg.memdesc<8x128xf16, #shared_desc, #smem, mutable>
+    nvws.descriptor_gather %desc[%xoffs, %c0_i32] 2048 %view {loop.cluster = 2 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 2>} : !tt.tensordesc<1x128xf16, #shared_desc>, tensor<8xi32>, i32, !ttg.memdesc<8x128xf16, #shared_desc, #smem, mutable>
     // CHECK-COUNT-3: ttng.inval_barrier %{{.*}} : !ttg.memdesc<1xi64, #shared, #smem, mutable>
     // CHECK: ttg.local_dealloc [[MBAR_GAT]]
     nvws.semaphore.release %sem, %tok [#nvws.async_op<tma_load>] {loop.cluster = 2 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 2>, arrive_count = 1 : i32} : !nvws.semaphore<[!ttg.memdesc<1x8x128xf16, #shared_desc, #smem, mutable>]>, !ttg.async.token
@@ -602,7 +602,7 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
 #tmem_ws_port = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
 module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
   // CHECK-LABEL: @warp_specialize_tma_matmul
-  tt.func @warp_specialize_tma_matmul(%desc_a: !tt.tensordesc<tensor<128x64xf16, #shared_ws_port>>, %desc_b: !tt.tensordesc<tensor<128x64xf16, #shared_ws_port>>, %lb: i32, %ub: i32, %step: i32) {
+  tt.func @warp_specialize_tma_matmul(%desc_a: !tt.tensordesc<128x64xf16, #shared_ws_port>, %desc_b: !tt.tensordesc<128x64xf16, #shared_ws_port>, %lb: i32, %ub: i32, %step: i32) {
     %true = arith.constant true
     %alloc_a = ttg.local_alloc : () -> !ttg.memdesc<1x128x64xf16, #shared_ws_port, #smem_ws_port, mutable>
     %alloc_b = ttg.local_alloc : () -> !ttg.memdesc<1x128x64xf16, #shared_ws_port, #smem_ws_port, mutable>
@@ -632,11 +632,11 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
       // CHECK: ttng.async_tma_copy_global_to_local %arg1[{{.*}}] [[BUF_B_SLICE]], [[TMA_FULL_SLICE]], {{.*}} {ttg.partition = array<i32: 0>}
       %tok_a = nvws.semaphore.acquire %empty_a {ttg.partition = array<i32: 0>} : !nvws.semaphore<[!ttg.memdesc<1x128x64xf16, #shared_ws_port, #smem_ws_port, mutable>]> -> !ttg.async.token
       %buf_a = nvws.semaphore.buffer %empty_a, %tok_a {ttg.partition = array<i32: 0>} : !nvws.semaphore<[!ttg.memdesc<1x128x64xf16, #shared_ws_port, #smem_ws_port, mutable>]>, !ttg.async.token -> !ttg.memdesc<128x64xf16, #shared_ws_port, #smem_ws_port, mutable>
-      nvws.descriptor_load %desc_a[%iv, %iv] 16384 %buf_a {ttg.partition = array<i32: 0>} : !tt.tensordesc<tensor<128x64xf16, #shared_ws_port>>, i32, i32, !ttg.memdesc<128x64xf16, #shared_ws_port, #smem_ws_port, mutable>
+      nvws.descriptor_load %desc_a[%iv, %iv] 16384 %buf_a {ttg.partition = array<i32: 0>} : !tt.tensordesc<128x64xf16, #shared_ws_port>, i32, i32, !ttg.memdesc<128x64xf16, #shared_ws_port, #smem_ws_port, mutable>
       nvws.semaphore.release %full_a, %tok_a [#nvws.async_op<tma_load>] {ttg.partition = array<i32: 0>, arrive_count = 1 : i32} : !nvws.semaphore<[!ttg.memdesc<1x128x64xf16, #shared_ws_port, #smem_ws_port, mutable>]>, !ttg.async.token
       %tok_b = nvws.semaphore.acquire %empty_b {ttg.partition = array<i32: 0>} : !nvws.semaphore<[!ttg.memdesc<1x128x64xf16, #shared_ws_port, #smem_ws_port, mutable>]> -> !ttg.async.token
       %buf_b = nvws.semaphore.buffer %empty_b, %tok_b {ttg.partition = array<i32: 0>} : !nvws.semaphore<[!ttg.memdesc<1x128x64xf16, #shared_ws_port, #smem_ws_port, mutable>]>, !ttg.async.token -> !ttg.memdesc<128x64xf16, #shared_ws_port, #smem_ws_port, mutable>
-      nvws.descriptor_load %desc_b[%iv, %iv] 16384 %buf_b {ttg.partition = array<i32: 0>} : !tt.tensordesc<tensor<128x64xf16, #shared_ws_port>>, i32, i32, !ttg.memdesc<128x64xf16, #shared_ws_port, #smem_ws_port, mutable>
+      nvws.descriptor_load %desc_b[%iv, %iv] 16384 %buf_b {ttg.partition = array<i32: 0>} : !tt.tensordesc<128x64xf16, #shared_ws_port>, i32, i32, !ttg.memdesc<128x64xf16, #shared_ws_port, #smem_ws_port, mutable>
       nvws.semaphore.release %full_b, %tok_b [#nvws.async_op<tma_load>] {ttg.partition = array<i32: 0>, arrive_count = 1 : i32} : !nvws.semaphore<[!ttg.memdesc<1x128x64xf16, #shared_ws_port, #smem_ws_port, mutable>]>, !ttg.async.token
       // Consumer: wait the combined FULL semaphore, use both buffers, and
       // release the combined EMPTY semaphore once.
@@ -670,7 +670,7 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
 #smem_mixed = #ttg.shared_memory
 module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
   // CHECK-LABEL: @load_used_as_reg_and_smem
-  tt.func @load_used_as_reg_and_smem(%arg0: !tt.tensordesc<tensor<128x64xf16, #shared_mixed>>, %arg1: i32) {
+  tt.func @load_used_as_reg_and_smem(%arg0: !tt.tensordesc<128x64xf16, #shared_mixed>, %arg1: i32) {
     %c1_i32 = arith.constant 1 : i32
     %c0_i32 = arith.constant 0 : i32
     // CHECK: ttng.init_barrier {{.*}}, 2
@@ -682,7 +682,7 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
       %ptok = nvws.semaphore.acquire %empty {loop.cluster = 1 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 2>} : !nvws.semaphore<[!ttg.memdesc<1x128x64xf16, #shared_mixed, #smem_mixed, mutable>]> -> !ttg.async.token
       %pbuf = nvws.semaphore.buffer %empty, %ptok {loop.cluster = 1 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 2>} : !nvws.semaphore<[!ttg.memdesc<1x128x64xf16, #shared_mixed, #smem_mixed, mutable>]>, !ttg.async.token -> !ttg.memdesc<128x64xf16, #shared_mixed, #smem_mixed, mutable>
       // CHECK: ttng.barrier_expect {{.*}}, 16384 {loop.cluster = 1 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 2>}
-      nvws.descriptor_load %arg0[%arg2, %arg2] 16384 %pbuf {loop.cluster = 1 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 2>} : !tt.tensordesc<tensor<128x64xf16, #shared_mixed>>, i32, i32, !ttg.memdesc<128x64xf16, #shared_mixed, #smem_mixed, mutable>
+      nvws.descriptor_load %arg0[%arg2, %arg2] 16384 %pbuf {loop.cluster = 1 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 2>} : !tt.tensordesc<128x64xf16, #shared_mixed>, i32, i32, !ttg.memdesc<128x64xf16, #shared_mixed, #smem_mixed, mutable>
       nvws.semaphore.release %full, %ptok [#nvws.async_op<tma_load>] {loop.cluster = 1 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 2>, arrive_count = 1 : i32} : !nvws.semaphore<[!ttg.memdesc<1x128x64xf16, #shared_mixed, #smem_mixed, mutable>]>, !ttg.async.token
       %gtok0 = nvws.semaphore.acquire %full {loop.cluster = 0 : i32, loop.stage = 1 : i32, ttg.partition = array<i32: 0>} : !nvws.semaphore<[!ttg.memdesc<1x128x64xf16, #shared_mixed, #smem_mixed, mutable>]> -> !ttg.async.token
       %gbuf0 = nvws.semaphore.buffer %full, %gtok0 {loop.cluster = 0 : i32, loop.stage = 1 : i32, ttg.partition = array<i32: 0>} : !nvws.semaphore<[!ttg.memdesc<1x128x64xf16, #shared_mixed, #smem_mixed, mutable>]>, !ttg.async.token -> !ttg.memdesc<128x64xf16, #shared_mixed, #smem_mixed, mutable>
@@ -709,7 +709,7 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
 #smem_mixed = #ttg.shared_memory
 module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
   // CHECK-LABEL: @load_used_as_reg_and_smem_same_partition
-  tt.func @load_used_as_reg_and_smem_same_partition(%arg0: !tt.tensordesc<tensor<128x64xf16, #shared_mixed>>, %arg1: i32) {
+  tt.func @load_used_as_reg_and_smem_same_partition(%arg0: !tt.tensordesc<128x64xf16, #shared_mixed>, %arg1: i32) {
     %c1_i32 = arith.constant 1 : i32
     %c0_i32 = arith.constant 0 : i32
     // CHECK: [[EMPTY:%.*]] = ttg.local_alloc : () -> !ttg.memdesc<2x1xi64,
@@ -721,7 +721,7 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
     scf.for %arg2 = %c0_i32 to %arg1 step %c1_i32 : i32 {
       %ptok = nvws.semaphore.acquire %empty {loop.cluster = 1 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 1>} : !nvws.semaphore<[!ttg.memdesc<1x128x64xf16, #shared_mixed, #smem_mixed, mutable>]> -> !ttg.async.token
       %pbuf = nvws.semaphore.buffer %empty, %ptok {loop.cluster = 1 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 1>} : !nvws.semaphore<[!ttg.memdesc<1x128x64xf16, #shared_mixed, #smem_mixed, mutable>]>, !ttg.async.token -> !ttg.memdesc<128x64xf16, #shared_mixed, #smem_mixed, mutable>
-      nvws.descriptor_load %arg0[%arg2, %arg2] 16384 %pbuf {loop.cluster = 1 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 1>} : !tt.tensordesc<tensor<128x64xf16, #shared_mixed>>, i32, i32, !ttg.memdesc<128x64xf16, #shared_mixed, #smem_mixed, mutable>
+      nvws.descriptor_load %arg0[%arg2, %arg2] 16384 %pbuf {loop.cluster = 1 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 1>} : !tt.tensordesc<128x64xf16, #shared_mixed>, i32, i32, !ttg.memdesc<128x64xf16, #shared_mixed, #smem_mixed, mutable>
       nvws.semaphore.release %full, %ptok [#nvws.async_op<tma_load>] {loop.cluster = 1 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 1>, arrive_count = 1 : i32} : !nvws.semaphore<[!ttg.memdesc<1x128x64xf16, #shared_mixed, #smem_mixed, mutable>]>, !ttg.async.token
       %gtok = nvws.semaphore.acquire %full {loop.cluster = 0 : i32, loop.stage = 1 : i32, ttg.partition = array<i32: 0>} : !nvws.semaphore<[!ttg.memdesc<1x128x64xf16, #shared_mixed, #smem_mixed, mutable>]> -> !ttg.async.token
       %gbuf = nvws.semaphore.buffer %full, %gtok {loop.cluster = 0 : i32, loop.stage = 1 : i32, ttg.partition = array<i32: 0>} : !nvws.semaphore<[!ttg.memdesc<1x128x64xf16, #shared_mixed, #smem_mixed, mutable>]>, !ttg.async.token -> !ttg.memdesc<128x64xf16, #shared_mixed, #smem_mixed, mutable>
@@ -750,7 +750,7 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
 #tmem7 = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
 module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
   // CHECK-LABEL: @semaphore_buffer
-  tt.func @semaphore_buffer(%arg0: !tt.tensordesc<tensor<128x64xf16, #shared7>>, %arg1: !tt.tensordesc<tensor<64x128xf16, #shared7>>) {
+  tt.func @semaphore_buffer(%arg0: !tt.tensordesc<128x64xf16, #shared7>, %arg1: !tt.tensordesc<64x128xf16, #shared7>) {
     %c32_i32 = arith.constant 32 : i32
     %cst = arith.constant dense<1.000000e+00> : tensor<128x128xf32, #blocked7>
     %cst_0 = arith.constant dense<0.000000e+00> : tensor<128x128xf32, #blocked7>
@@ -767,8 +767,8 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
     // CHECK: scf.for
     %3 = scf.for %arg2 = %c0_i32 to %c32_i32 step %c1_i32 iter_args(%arg3 = %tok) -> (!ttg.async.token) : i32 {
       %4:3 = "get_offsets"(%arg2) {ttg.partition = array<i32: 2>} : (i32) -> (i32, i32, i32)
-      %5 = tt.descriptor_load %arg0[%4#0, %4#2] {ttg.partition = array<i32: 2>} : !tt.tensordesc<tensor<128x64xf16, #shared7>> -> tensor<128x64xf16, #blocked8>
-      %6 = tt.descriptor_load %arg1[%4#1, %4#2] {ttg.partition = array<i32: 2>} : !tt.tensordesc<tensor<64x128xf16, #shared7>> -> tensor<64x128xf16, #blocked8>
+      %5 = tt.descriptor_load %arg0[%4#0, %4#2] {ttg.partition = array<i32: 2>} : !tt.tensordesc<128x64xf16, #shared7> -> tensor<128x64xf16, #blocked8>
+      %6 = tt.descriptor_load %arg1[%4#1, %4#2] {ttg.partition = array<i32: 2>} : !tt.tensordesc<64x128xf16, #shared7> -> tensor<64x128xf16, #blocked8>
       %7 = ttg.local_alloc %5 {ttg.partition = array<i32: 2>} : (tensor<128x64xf16, #blocked8>) -> !ttg.memdesc<128x64xf16, #shared7, #smem7>
       %8 = ttg.local_alloc %6 {ttg.partition = array<i32: 2>} : (tensor<64x128xf16, #blocked8>) -> !ttg.memdesc<64x128xf16, #shared7, #smem7>
       // CHECK: local_alloc
@@ -820,7 +820,7 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
 #tmem5 = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
 module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
   // CHECK-LABEL: @semaphore_not_in_loop
-  tt.func @semaphore_not_in_loop(%arg0: i32, %arg1: i32, %arg2: i32, %arg3: !tt.tensordesc<tensor<128x64xf16, #shared5>>, %arg4: !tt.tensordesc<tensor<128x64xf16, #shared5>>) {
+  tt.func @semaphore_not_in_loop(%arg0: i32, %arg1: i32, %arg2: i32, %arg3: !tt.tensordesc<128x64xf16, #shared5>, %arg4: !tt.tensordesc<128x64xf16, #shared5>) {
     %cst = arith.constant dense<0.000000e+00> : tensor<128x128xf32, #blocked5>
     %c64_i32 = arith.constant 64 : i32
     %c1_i32 = arith.constant 1 : i32
@@ -847,8 +847,8 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
     // CHECK: scf.for
     scf.for %arg5 = %c0_i32 to %arg0 step %c1_i32 : i32 {
       %4 = arith.muli %arg5, %c64_i32 {ttg.partition = array<i32: 2>} : i32
-      %5 = tt.descriptor_load %arg3[%arg1, %4] {ttg.partition = array<i32: 2>} : !tt.tensordesc<tensor<128x64xf16, #shared5>> -> tensor<128x64xf16, #blocked6>
-      %6 = tt.descriptor_load %arg4[%arg2, %4] {ttg.partition = array<i32: 2>} : !tt.tensordesc<tensor<128x64xf16, #shared5>> -> tensor<128x64xf16, #blocked6>
+      %5 = tt.descriptor_load %arg3[%arg1, %4] {ttg.partition = array<i32: 2>} : !tt.tensordesc<128x64xf16, #shared5> -> tensor<128x64xf16, #blocked6>
+      %6 = tt.descriptor_load %arg4[%arg2, %4] {ttg.partition = array<i32: 2>} : !tt.tensordesc<128x64xf16, #shared5> -> tensor<128x64xf16, #blocked6>
       %7 = ttg.local_alloc %5 {ttg.partition = array<i32: 2>} : (tensor<128x64xf16, #blocked6>) -> !ttg.memdesc<128x64xf16, #shared5, #smem5>
       %8 = ttg.local_alloc %6 {ttg.partition = array<i32: 2>} : (tensor<128x64xf16, #blocked6>) -> !ttg.memdesc<128x64xf16, #shared5, #smem5>
       // CHECK: [[BUF_LOOP:%.*]] = ttg.memdesc_index [[TMEM]][{{.*}}] {ttg.partition = array<i32: 1>}
@@ -885,7 +885,7 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
 #tmem_scales9 = #ttng.tensor_memory_scales_encoding<>
 module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
   // CHECK-LABEL: @semaphore_scale_mma_user
-  tt.func @semaphore_scale_mma_user(%arg0: !ttg.memdesc<128x64xf16, #shared9, #smem9>, %arg1: !ttg.memdesc<64x128xf16, #shared9, #smem9>, %arg2: !tt.tensordesc<tensor<8x128xi8, #shared9>>, %arg3: !ttg.memdesc<128x8xi8, #tmem_scales9, #ttng.tensor_memory>, %arg4: i32) {
+  tt.func @semaphore_scale_mma_user(%arg0: !ttg.memdesc<128x64xf16, #shared9, #smem9>, %arg1: !ttg.memdesc<64x128xf16, #shared9, #smem9>, %arg2: !tt.tensordesc<8x128xi8, #shared9>, %arg3: !ttg.memdesc<128x8xi8, #tmem_scales9, #ttng.tensor_memory>, %arg4: i32) {
     %cst = arith.constant dense<0.000000e+00> : tensor<128x128xf32, #blocked9>
     %true = arith.constant true
     %c1_i32 = arith.constant 1 : i32
@@ -898,7 +898,7 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
     %2 = ttng.tmem_store %cst, %buf0[], %true : tensor<128x128xf32, #blocked9> -> !ttg.memdesc<128x128xf32, #tmem9, #ttng.tensor_memory, mutable, 1x128x128>
     // CHECK: scf.for
     %3 = scf.for %arg5 = %c0_i32 to %arg4 step %c1_i32 iter_args(%arg6 = %tok) -> (!ttg.async.token) : i32 {
-      %5 = tt.descriptor_load %arg2[%arg5, %arg5] {ttg.partition = array<i32: 2>} : !tt.tensordesc<tensor<8x128xi8, #shared9>> -> tensor<8x128xi8, #blocked10>
+      %5 = tt.descriptor_load %arg2[%arg5, %arg5] {ttg.partition = array<i32: 2>} : !tt.tensordesc<8x128xi8, #shared9> -> tensor<8x128xi8, #blocked10>
       %6 = ttg.local_alloc %5 {ttg.partition = array<i32: 2>} : (tensor<8x128xi8, #blocked10>) -> !ttg.memdesc<8x128xi8, #shared9, #smem9>
       %7 = ttg.local_load %6 {ttg.partition = array<i32: 0>} : !ttg.memdesc<8x128xi8, #shared9, #smem9> -> tensor<8x128xi8, #linear10>
       %8 = tt.trans %7 {order = array<i32: 1, 0>, ttg.partition = array<i32: 0>} : tensor<8x128xi8, #linear10> -> tensor<128x8xi8, #linear9>
@@ -945,7 +945,7 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
 #tmem_attn = #ttng.tensor_memory_encoding<blockM = 128, blockN = 64, colStride = 1>
 module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
   // CHECK-LABEL: @attention_forward
-  tt.func public @attention_forward(%arg0: !ttg.memdesc<256x64xf16, #shared_attn, #smem_attn>, %arg1: !tt.tensordesc<tensor<64x64xf16, #shared_attn>>, %arg2: f32, %arg3: i32) {
+  tt.func public @attention_forward(%arg0: !ttg.memdesc<256x64xf16, #shared_attn, #smem_attn>, %arg1: !tt.tensordesc<64x64xf16, #shared_attn>, %arg2: f32, %arg3: i32) {
     %cst = arith.constant dense<0.000000e+00> : tensor<256x64xf32, #blocked_attn>
     %c64_i32 = arith.constant 64 : i32
     %c0_i32 = arith.constant 0 : i32
@@ -967,7 +967,7 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
     scf.for %iv = %c0_i32 to %arg3 step %c64_i32 : i32 {
       %k_ptok = nvws.semaphore.acquire %k_empty {loop.cluster = 4 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 2>} : !nvws.semaphore<[!ttg.memdesc<1x64x64xf16, #shared_attn, #smem_attn, mutable>]> -> !ttg.async.token
       %k_pbuf = nvws.semaphore.buffer %k_empty, %k_ptok {loop.cluster = 4 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 2>} : !nvws.semaphore<[!ttg.memdesc<1x64x64xf16, #shared_attn, #smem_attn, mutable>]>, !ttg.async.token -> !ttg.memdesc<64x64xf16, #shared_attn, #smem_attn, mutable>
-      nvws.descriptor_load %arg1[%iv, %c0_i32] 8192 %k_pbuf {loop.cluster = 4 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 2>} : !tt.tensordesc<tensor<64x64xf16, #shared_attn>>, i32, i32, !ttg.memdesc<64x64xf16, #shared_attn, #smem_attn, mutable>
+      nvws.descriptor_load %arg1[%iv, %c0_i32] 8192 %k_pbuf {loop.cluster = 4 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 2>} : !tt.tensordesc<64x64xf16, #shared_attn>, i32, i32, !ttg.memdesc<64x64xf16, #shared_attn, #smem_attn, mutable>
       nvws.semaphore.release %k_full, %k_ptok [#nvws.async_op<tma_load>] {loop.cluster = 4 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 2>, arrive_count = 1 : i32} : !nvws.semaphore<[!ttg.memdesc<1x64x64xf16, #shared_attn, #smem_attn, mutable>]>, !ttg.async.token
 
       %k_gtok = nvws.semaphore.acquire %k_full {loop.cluster = 2 : i32, loop.stage = 2 : i32, ttg.partition = array<i32: 1>} : !nvws.semaphore<[!ttg.memdesc<1x64x64xf16, #shared_attn, #smem_attn, mutable>]> -> !ttg.async.token
@@ -1052,7 +1052,7 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
   // Regression: semaphore.buffer with allocShape-bearing shared buffers feeding
   // memdesc_trans inside a warp-specialized TMA/MMA pipeline must lower to the
   // same stage slice shape that aref lowering uses.
-  tt.func @ws_multibuffer_trans_chain(%desc_a: !tt.tensordesc<tensor<128x64xf16, #shared_ws>>, %desc_b: !tt.tensordesc<tensor<128x64xf16, #shared_ws>>, %lb: i32, %ub: i32, %step: i32) {
+  tt.func @ws_multibuffer_trans_chain(%desc_a: !tt.tensordesc<128x64xf16, #shared_ws>, %desc_b: !tt.tensordesc<128x64xf16, #shared_ws>, %lb: i32, %ub: i32, %step: i32) {
     %true = arith.constant true
     %c0_i32 = arith.constant 0 : i32
     %c1_i32 = arith.constant 1 : i32
@@ -1075,11 +1075,11 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
       // Producer side: wait EMPTY and issue TMA loads.
       %tok_a = nvws.semaphore.acquire %empty_a[%c0_i32, %c1_i32] {ttg.partition = array<i32: 0>} : !nvws.semaphore<[!ttg.memdesc<2x128x64xf16, #shared_ws, #smem_ws, mutable>]> -> !ttg.async.token
       %buf_a = nvws.semaphore.buffer %empty_a[%c0_i32], %tok_a {ttg.partition = array<i32: 0>} : !nvws.semaphore<[!ttg.memdesc<2x128x64xf16, #shared_ws, #smem_ws, mutable>]>, !ttg.async.token -> !ttg.memdesc<128x64xf16, #shared_ws, #smem_ws, mutable, 1x128x64>
-      nvws.descriptor_load %desc_a[%iv, %iv] 16384 %buf_a {ttg.partition = array<i32: 0>} : !tt.tensordesc<tensor<128x64xf16, #shared_ws>>, i32, i32, !ttg.memdesc<128x64xf16, #shared_ws, #smem_ws, mutable, 1x128x64>
+      nvws.descriptor_load %desc_a[%iv, %iv] 16384 %buf_a {ttg.partition = array<i32: 0>} : !tt.tensordesc<128x64xf16, #shared_ws>, i32, i32, !ttg.memdesc<128x64xf16, #shared_ws, #smem_ws, mutable, 1x128x64>
       nvws.semaphore.release %full_a[%c0_i32], %tok_a [#nvws.async_op<tma_load>] {ttg.partition = array<i32: 0>, arrive_count = 1 : i32} : !nvws.semaphore<[!ttg.memdesc<2x128x64xf16, #shared_ws, #smem_ws, mutable>]>, !ttg.async.token
       %tok_b = nvws.semaphore.acquire %empty_b[%c0_i32, %c1_i32] {ttg.partition = array<i32: 0>} : !nvws.semaphore<[!ttg.memdesc<2x128x64xf16, #shared_ws, #smem_ws, mutable>]> -> !ttg.async.token
       %buf_b = nvws.semaphore.buffer %empty_b[%c0_i32], %tok_b {ttg.partition = array<i32: 0>} : !nvws.semaphore<[!ttg.memdesc<2x128x64xf16, #shared_ws, #smem_ws, mutable>]>, !ttg.async.token -> !ttg.memdesc<128x64xf16, #shared_ws, #smem_ws, mutable, 1x128x64>
-      nvws.descriptor_load %desc_b[%iv, %iv] 16384 %buf_b {ttg.partition = array<i32: 0>} : !tt.tensordesc<tensor<128x64xf16, #shared_ws>>, i32, i32, !ttg.memdesc<128x64xf16, #shared_ws, #smem_ws, mutable, 1x128x64>
+      nvws.descriptor_load %desc_b[%iv, %iv] 16384 %buf_b {ttg.partition = array<i32: 0>} : !tt.tensordesc<128x64xf16, #shared_ws>, i32, i32, !ttg.memdesc<128x64xf16, #shared_ws, #smem_ws, mutable, 1x128x64>
       nvws.semaphore.release %full_b[%c0_i32], %tok_b [#nvws.async_op<tma_load>] {ttg.partition = array<i32: 0>, arrive_count = 1 : i32} : !nvws.semaphore<[!ttg.memdesc<2x128x64xf16, #shared_ws, #smem_ws, mutable>]>, !ttg.async.token
       // Consumer side: same stage-sliced shared buffers feed memdesc_trans/MMA.
       %tok_ca = nvws.semaphore.acquire %full_a[%c0_i32, %c1_i32] {ttg.partition = array<i32: 1>} : !nvws.semaphore<[!ttg.memdesc<2x128x64xf16, #shared_ws, #smem_ws, mutable>]> -> !ttg.async.token
@@ -1112,7 +1112,7 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
   // CHECK-LABEL: @dual_tma_load_order
   // Tests that barrier_expect is emitted before both rewritten async TMA
   // loads and that both loads use the same mbar/predicate operands.
-  tt.func @dual_tma_load_order(%desc_a: !tt.tensordesc<tensor<128x64xf16, #shared_desc>>, %desc_b: !tt.tensordesc<tensor<128x64xf16, #shared_desc>>) {
+  tt.func @dual_tma_load_order(%desc_a: !tt.tensordesc<128x64xf16, #shared_desc>, %desc_b: !tt.tensordesc<128x64xf16, #shared_desc>) {
     %c0_i32 = arith.constant 0 : i32
     %cm1_i32 = arith.constant -1 : i32
     %c1_i32 = arith.constant 1 : i32
@@ -1121,8 +1121,8 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
     %sem = nvws.semaphore.create %buf_a, %buf_b {pending_count = 1 : i32} : !nvws.semaphore<[!ttg.memdesc<2x128x64xf16, #shared_desc, #smem, mutable>, !ttg.memdesc<2x128x64xf16, #shared_desc, #smem, mutable>]>
     %tok = nvws.semaphore.acquire %sem {loop.cluster = 7 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 2>} : !nvws.semaphore<[!ttg.memdesc<2x128x64xf16, #shared_desc, #smem, mutable>, !ttg.memdesc<2x128x64xf16, #shared_desc, #smem, mutable>]> -> !ttg.async.token
     %views:2 = nvws.semaphore.buffer %sem, %tok {loop.cluster = 7 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 2>} : !nvws.semaphore<[!ttg.memdesc<2x128x64xf16, #shared_desc, #smem, mutable>, !ttg.memdesc<2x128x64xf16, #shared_desc, #smem, mutable>]>, !ttg.async.token -> !ttg.memdesc<128x64xf16, #shared_desc, #smem, mutable, 1x128x64>, !ttg.memdesc<128x64xf16, #shared_desc, #smem, mutable, 1x128x64>
-    nvws.descriptor_load %desc_a[%c0_i32, %c0_i32] 4096 %views#0 {loop.cluster = 7 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 2>} : !tt.tensordesc<tensor<128x64xf16, #shared_desc>>, i32, i32, !ttg.memdesc<128x64xf16, #shared_desc, #smem, mutable, 1x128x64>
-    nvws.descriptor_load %desc_b[%c0_i32, %c0_i32] 4096 %views#1 {loop.cluster = 7 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 2>} : !tt.tensordesc<tensor<128x64xf16, #shared_desc>>, i32, i32, !ttg.memdesc<128x64xf16, #shared_desc, #smem, mutable, 1x128x64>
+    nvws.descriptor_load %desc_a[%c0_i32, %c0_i32] 4096 %views#0 {loop.cluster = 7 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 2>} : !tt.tensordesc<128x64xf16, #shared_desc>, i32, i32, !ttg.memdesc<128x64xf16, #shared_desc, #smem, mutable, 1x128x64>
+    nvws.descriptor_load %desc_b[%c0_i32, %c0_i32] 4096 %views#1 {loop.cluster = 7 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 2>} : !tt.tensordesc<128x64xf16, #shared_desc>, i32, i32, !ttg.memdesc<128x64xf16, #shared_desc, #smem, mutable, 1x128x64>
     // CHECK-COUNT-2: ttg.memdesc_index %{{.*}}[%{{.*}}] {loop.cluster = 7 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 2>} : !ttg.memdesc<3x128x64xf16, #shared, #smem, mutable> -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
     // CHECK: [[TMA_MBAR:%.*]] = ttg.memdesc_index %{{.*}}[%{{.*}}] {loop.cluster = 7 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 2>} : !ttg.memdesc<3x1xi64, #shared1, #smem, mutable> -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
     // CHECK: [[TMA_PRED:%.*]] = arith.constant {loop.cluster = 7 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 2>} true
@@ -1147,7 +1147,7 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
 
 module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
   // CHECK-LABEL: @phase2_multibuffer
-  tt.func @phase2_multibuffer(%desc: !tt.tensordesc<tensor<128x64xf16, #shared_desc2>>, %lb: i32, %ub: i32, %step: i32) {
+  tt.func @phase2_multibuffer(%desc: !tt.tensordesc<128x64xf16, #shared_desc2>, %lb: i32, %ub: i32, %step: i32) {
     // Multi-buffered alloc: 1x → 3x
     // CHECK: [[BUF:%.*]] = ttg.local_alloc : () -> !ttg.memdesc<3x128x64xf16,
     // EMPTY mbar: 3 slots, init_barrier on each
@@ -1173,7 +1173,7 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
       // CHECK: ttng.async_tma_copy_global_to_local {{.*}} [[PBUF]], {{.*}} {ttg.partition = array<i32: 0>}
       %ptok = nvws.semaphore.acquire %sem_empty {ttg.partition = array<i32: 0>} : !nvws.semaphore<[!ttg.memdesc<1x128x64xf16, #shared_desc2, #smem2, mutable>]> -> !ttg.async.token
       %pbuf = nvws.semaphore.buffer %sem_empty, %ptok {ttg.partition = array<i32: 0>} : !nvws.semaphore<[!ttg.memdesc<1x128x64xf16, #shared_desc2, #smem2, mutable>]>, !ttg.async.token -> !ttg.memdesc<128x64xf16, #shared_desc2, #smem2, mutable>
-      nvws.descriptor_load %desc[%i, %i] 16384 %pbuf {ttg.partition = array<i32: 0>} : !tt.tensordesc<tensor<128x64xf16, #shared_desc2>>, i32, i32, !ttg.memdesc<128x64xf16, #shared_desc2, #smem2, mutable>
+      nvws.descriptor_load %desc[%i, %i] 16384 %pbuf {ttg.partition = array<i32: 0>} : !tt.tensordesc<128x64xf16, #shared_desc2>, i32, i32, !ttg.memdesc<128x64xf16, #shared_desc2, #smem2, mutable>
       nvws.semaphore.release %sem_full, %ptok [#nvws.async_op<tma_load>] {ttg.partition = array<i32: 0>, arrive_count = 1 : i32} : !nvws.semaphore<[!ttg.memdesc<1x128x64xf16, #shared_desc2, #smem2, mutable>]>, !ttg.async.token
       // Consumer: wait_barrier on FULL, local_load, fence, arrive on EMPTY
       // CHECK: ttng.wait_barrier {{.*}} {ttg.partition = array<i32: 1>}
@@ -1217,7 +1217,7 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
 
 module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
   // CHECK-LABEL: @combine_two_tma_loads
-  tt.func @combine_two_tma_loads(%desc_a: !tt.tensordesc<tensor<128x64xf16, #shared3>>, %desc_b: !tt.tensordesc<tensor<128x64xf16, #shared3>>, %lb: i32, %ub: i32, %step: i32) {
+  tt.func @combine_two_tma_loads(%desc_a: !tt.tensordesc<128x64xf16, #shared3>, %desc_b: !tt.tensordesc<128x64xf16, #shared3>, %lb: i32, %ub: i32, %step: i32) {
     %true = arith.constant true
     // Two allocs multi-buffered to 3x.
     // CHECK: [[ALLOC_A:%.*]] = ttg.local_alloc : () -> !ttg.memdesc<3x128x64xf16,
@@ -1253,11 +1253,11 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
       // CHECK: ttng.async_tma_copy_global_to_local %arg1[{{.*}}] [[PBUF_B]], [[TMA_MBAR]], [[TMA_PRED]] {ttg.partition = array<i32: 0>}
       %tok_a = nvws.semaphore.acquire %empty_a {ttg.partition = array<i32: 0>} : !nvws.semaphore<[!ttg.memdesc<1x128x64xf16, #shared3, #smem3, mutable>]> -> !ttg.async.token
       %buf_a = nvws.semaphore.buffer %empty_a, %tok_a {ttg.partition = array<i32: 0>} : !nvws.semaphore<[!ttg.memdesc<1x128x64xf16, #shared3, #smem3, mutable>]>, !ttg.async.token -> !ttg.memdesc<128x64xf16, #shared3, #smem3, mutable>
-      nvws.descriptor_load %desc_a[%iv, %iv] 16384 %buf_a {ttg.partition = array<i32: 0>} : !tt.tensordesc<tensor<128x64xf16, #shared3>>, i32, i32, !ttg.memdesc<128x64xf16, #shared3, #smem3, mutable>
+      nvws.descriptor_load %desc_a[%iv, %iv] 16384 %buf_a {ttg.partition = array<i32: 0>} : !tt.tensordesc<128x64xf16, #shared3>, i32, i32, !ttg.memdesc<128x64xf16, #shared3, #smem3, mutable>
       nvws.semaphore.release %full_a, %tok_a [#nvws.async_op<tma_load>] {ttg.partition = array<i32: 0>, arrive_count = 1 : i32} : !nvws.semaphore<[!ttg.memdesc<1x128x64xf16, #shared3, #smem3, mutable>]>, !ttg.async.token
       %tok_b = nvws.semaphore.acquire %empty_b {ttg.partition = array<i32: 0>} : !nvws.semaphore<[!ttg.memdesc<1x128x64xf16, #shared3, #smem3, mutable>]> -> !ttg.async.token
       %buf_b = nvws.semaphore.buffer %empty_b, %tok_b {ttg.partition = array<i32: 0>} : !nvws.semaphore<[!ttg.memdesc<1x128x64xf16, #shared3, #smem3, mutable>]>, !ttg.async.token -> !ttg.memdesc<128x64xf16, #shared3, #smem3, mutable>
-      nvws.descriptor_load %desc_b[%iv, %iv] 16384 %buf_b {ttg.partition = array<i32: 0>} : !tt.tensordesc<tensor<128x64xf16, #shared3>>, i32, i32, !ttg.memdesc<128x64xf16, #shared3, #smem3, mutable>
+      nvws.descriptor_load %desc_b[%iv, %iv] 16384 %buf_b {ttg.partition = array<i32: 0>} : !tt.tensordesc<128x64xf16, #shared3>, i32, i32, !ttg.memdesc<128x64xf16, #shared3, #smem3, mutable>
       nvws.semaphore.release %full_b, %tok_b [#nvws.async_op<tma_load>] {ttg.partition = array<i32: 0>, arrive_count = 1 : i32} : !nvws.semaphore<[!ttg.memdesc<1x128x64xf16, #shared3, #smem3, mutable>]>, !ttg.async.token
       // Consumer: wait the combined FULL mbar, then use both buffer views.
       // CHECK: ttng.wait_barrier {{.*}} {ttg.partition = array<i32: 1>}
@@ -1294,7 +1294,7 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
   }
 
   // CHECK-LABEL: @do_not_combine_mixed_depth_tma_loads
-  tt.func @do_not_combine_mixed_depth_tma_loads(%desc_a: !tt.tensordesc<tensor<128x64xf16, #shared3>>, %desc_b: !tt.tensordesc<tensor<128x64xf16, #shared3>>, %lb: i32, %ub: i32, %step: i32) {
+  tt.func @do_not_combine_mixed_depth_tma_loads(%desc_a: !tt.tensordesc<128x64xf16, #shared3>, %desc_b: !tt.tensordesc<128x64xf16, #shared3>, %lb: i32, %ub: i32, %step: i32) {
     %true = arith.constant true
     // The same MMA consumes both buffers, but their authored ring depths
     // differ. Keep two independent EMPTY/FULL semaphore pairs.
@@ -1315,11 +1315,11 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
     %0 = scf.for %iv = %lb to %ub step %step iter_args(%acc = %token) -> (!ttg.async.token) : i32 {
       %tok_a = nvws.semaphore.acquire %empty_a {ttg.partition = array<i32: 0>} : !nvws.semaphore<[!ttg.memdesc<3x128x64xf16, #shared3, #smem3, mutable>]> -> !ttg.async.token
       %buf_a = nvws.semaphore.buffer %empty_a, %tok_a {ttg.partition = array<i32: 0>} : !nvws.semaphore<[!ttg.memdesc<3x128x64xf16, #shared3, #smem3, mutable>]>, !ttg.async.token -> !ttg.memdesc<128x64xf16, #shared3, #smem3, mutable>
-      nvws.descriptor_load %desc_a[%iv, %iv] 16384 %buf_a {ttg.partition = array<i32: 0>} : !tt.tensordesc<tensor<128x64xf16, #shared3>>, i32, i32, !ttg.memdesc<128x64xf16, #shared3, #smem3, mutable>
+      nvws.descriptor_load %desc_a[%iv, %iv] 16384 %buf_a {ttg.partition = array<i32: 0>} : !tt.tensordesc<128x64xf16, #shared3>, i32, i32, !ttg.memdesc<128x64xf16, #shared3, #smem3, mutable>
       nvws.semaphore.release %full_a, %tok_a [#nvws.async_op<tma_load>] {ttg.partition = array<i32: 0>, arrive_count = 1 : i32} : !nvws.semaphore<[!ttg.memdesc<3x128x64xf16, #shared3, #smem3, mutable>]>, !ttg.async.token
       %tok_b = nvws.semaphore.acquire %empty_b {ttg.partition = array<i32: 0>} : !nvws.semaphore<[!ttg.memdesc<2x128x64xf16, #shared3, #smem3, mutable>]> -> !ttg.async.token
       %buf_b = nvws.semaphore.buffer %empty_b, %tok_b {ttg.partition = array<i32: 0>} : !nvws.semaphore<[!ttg.memdesc<2x128x64xf16, #shared3, #smem3, mutable>]>, !ttg.async.token -> !ttg.memdesc<128x64xf16, #shared3, #smem3, mutable>
-      nvws.descriptor_load %desc_b[%iv, %iv] 16384 %buf_b {ttg.partition = array<i32: 0>} : !tt.tensordesc<tensor<128x64xf16, #shared3>>, i32, i32, !ttg.memdesc<128x64xf16, #shared3, #smem3, mutable>
+      nvws.descriptor_load %desc_b[%iv, %iv] 16384 %buf_b {ttg.partition = array<i32: 0>} : !tt.tensordesc<128x64xf16, #shared3>, i32, i32, !ttg.memdesc<128x64xf16, #shared3, #smem3, mutable>
       nvws.semaphore.release %full_b, %tok_b [#nvws.async_op<tma_load>] {ttg.partition = array<i32: 0>, arrive_count = 1 : i32} : !nvws.semaphore<[!ttg.memdesc<2x128x64xf16, #shared3, #smem3, mutable>]>, !ttg.async.token
       %tok_ca = nvws.semaphore.acquire %full_a {ttg.partition = array<i32: 1>} : !nvws.semaphore<[!ttg.memdesc<3x128x64xf16, #shared3, #smem3, mutable>]> -> !ttg.async.token
       %cbuf_a = nvws.semaphore.buffer %full_a, %tok_ca {ttg.partition = array<i32: 1>} : !nvws.semaphore<[!ttg.memdesc<3x128x64xf16, #shared3, #smem3, mutable>]>, !ttg.async.token -> !ttg.memdesc<128x64xf16, #shared3, #smem3, mutable>

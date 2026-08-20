@@ -24,6 +24,7 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
     // CHECK: ttg.local_store
     scf.for %iv = %lb to %ub step %step : i32 {
       "loop_body"(%iv) {ttg.partition = array<i32: 0>} : (i32) -> ()
+      scf.yield {ttg.partition = array<i32: 0>}
     } {tt.warp_specialize, ttg.partition = array<i32: 0, 1, 2, 3>, ttg.partition.outputs = [], ttg.partition.stages = [0 : i32, 0 : i32, 0 : i32, 0 : i32], ttg.warp_specialize.tag = 0 : i32}
 
     // CHECK: ttng.inval_barrier

@@ -132,10 +132,11 @@ static LogicalResult promoteMetaWarpSpecializeRoots(FuncOp func) {
           "MetaToNVWSConvert found multiple Meta warp-specialize loops for "
           "one promoted root");
 
-    for (StringRef name : {kWarpSpecializeAttrName,
-                           kWarpSpecializeTagAttrName,
-                           kPartitionStagesAttrName,
-                           kPartitionTypesAttrName}) {
+    const StringRef rootAttrs[] = {kWarpSpecializeAttrName,
+                                   kWarpSpecializeTagAttrName,
+                                   kPartitionStagesAttrName,
+                                   kPartitionTypesAttrName};
+    for (StringRef name : rootAttrs) {
       if (Attribute attr = scheduled->getAttr(name)) {
         root->setAttr(name, attr);
         scheduled->removeAttr(name);

@@ -12,11 +12,11 @@
 
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
   // SEMA-LABEL: @direct_descriptor_store_completion
-  // LOWER-LABEL: sym_name = "direct_descriptor_store_completion"
+  // LOWER-LABEL: tt.func @direct_descriptor_store_completion
   // LOWER: ttng.async_tma_copy_local_to_global
   // LOWER-NEXT: ttng.async_tma_store_wait
   // LOWER: ttng.arrive_barrier
-  tt.func @direct_descriptor_store_completion(%desc: !tt.tensordesc<tensor<128x64xf16, #shared>>, %i: i32, %lb: i32, %ub: i32, %step: i32) {
+  tt.func @direct_descriptor_store_completion(%desc: !tt.tensordesc<128x64xf16, #shared>, %i: i32, %lb: i32, %ub: i32, %step: i32) {
     // SEMA: [[V1:%.*]] = ttg.local_alloc {buffer.id = 600 : i32} : () -> !ttg.memdesc<1x128x64xf16, #shared, #smem, mutable>
     // SEMA: [[EMPTY:%.*]] = nvws.semaphore.create [[V1]] released = 1 {pending_count = 1 : i32}
     // SEMA-NEXT: [[FULL:%.*]] = nvws.semaphore.create [[V1]] {pending_count = 1 : i32}
@@ -36,7 +36,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
       // The consumer release comes AFTER the descriptor store it must cover.
       // SEMA-NEXT: tt.descriptor_store %{{.*}}[%{{.*}}, %{{.*}}], [[LOADED]] {ttg.partition = array<i32: 1>}
       // SEMA-NEXT: nvws.semaphore.release [[EMPTY]], [[READ]] [#nvws.async_op<none>] {arrive_count = 1 : i32, ttg.partition = array<i32: 1>}
-      tt.descriptor_store %desc[%i, %i], %loaded {ttg.partition = array<i32: 1>} : !tt.tensordesc<tensor<128x64xf16, #shared>>, tensor<128x64xf16, #blocked>
+      tt.descriptor_store %desc[%i, %i], %loaded {ttg.partition = array<i32: 1>} : !tt.tensordesc<128x64xf16, #shared>, tensor<128x64xf16, #blocked>
       %next = "producer"() {ttg.partition = array<i32: 0>} : () -> tensor<128x64xf16, #blocked>
       // SEMA: [[NEXT_WRITE:%.*]] = nvws.semaphore.acquire [[EMPTY]] {ttg.partition = array<i32: 0>}
       // SEMA-NEXT: [[NEXT_BUF:%.*]] = nvws.semaphore.buffer [[EMPTY]], [[NEXT_WRITE]] {ttg.partition = array<i32: 0>}
@@ -58,7 +58,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
   // SEMA-LABEL: @already_lowered_tma_store_handoffs
   tt.func @already_lowered_tma_store_handoffs(
-      %desc: !tt.tensordesc<tensor<128x64xf32, #shared>>,
+      %desc: !tt.tensordesc<128x64xf32, #shared>,
       %lb: i32, %ub: i32, %step: i32) {
     %v0 = arith.constant dense<0.000000e+00> : tensor<128x64xf32, #blocked>
     %v1 = arith.constant dense<1.000000e+00> : tensor<128x64xf32, #blocked>
@@ -87,7 +87,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
       // SEMA-NEXT: ttng.async_tma_store_token_wait [[COPY]]
       // SEMA-NEXT: [[TO_M1:%.*]] = arith.constant {{.*}} 1 : i32
       // SEMA-NEXT: nvws.semaphore.release [[M1_READY]][[[TO_M1]]], [[COPY_TOKEN]]
-      %copy = ttng.async_tma_copy_local_to_global %desc[%i, %i] %m0 {ttg.partition = array<i32: 1>} : !tt.tensordesc<tensor<128x64xf32, #shared>>, !ttg.memdesc<128x64xf32, #shared, #smem, mutable> -> !ttg.async.token
+      %copy = ttng.async_tma_copy_local_to_global %desc[%i, %i] %m0 {ttg.partition = array<i32: 1>} : !tt.tensordesc<128x64xf32, #shared>, !ttg.memdesc<128x64xf32, #shared, #smem, mutable> -> !ttg.async.token
       ttng.async_tma_store_token_wait %copy {ttg.partition = array<i32: 1>} : !ttg.async.token
       // SEMA-NEXT: [[W1_TOKEN:%.*]] = nvws.semaphore.acquire [[M1_READY]][[[ZERO_P0]]]
       // SEMA-NEXT: [[W1_BUFFER:%.*]]:2 = nvws.semaphore.buffer [[M1_READY]], [[W1_TOKEN]]
@@ -101,7 +101,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
       // SEMA-NEXT: [[REDUCE:%.*]] = ttng.async_tma_reduce add, %{{.*}} [[REDUCE_BUFFER]]#1
       // SEMA-NEXT: ttng.async_tma_store_token_wait [[REDUCE]]
       // SEMA-NEXT: nvws.semaphore.release [[ENTRY]][[[TO_M1]]], [[REDUCE_TOKEN]]
-      %reduce = ttng.async_tma_reduce add, %desc[%i, %i] %m1 {ttg.partition = array<i32: 1>} : !tt.tensordesc<tensor<128x64xf32, #shared>>, !ttg.memdesc<128x64xf32, #shared, #smem, mutable> -> !ttg.async.token
+      %reduce = ttng.async_tma_reduce add, %desc[%i, %i] %m1 {ttg.partition = array<i32: 1>} : !tt.tensordesc<128x64xf32, #shared>, !ttg.memdesc<128x64xf32, #shared, #smem, mutable> -> !ttg.async.token
       ttng.async_tma_store_token_wait %reduce {ttg.partition = array<i32: 1>} : !ttg.async.token
     } {tt.warp_specialize, ttg.partition = array<i32: 0, 1>, ttg.partition.outputs = [], ttg.warp_specialize.tag = 0 : i32}
     tt.return
@@ -117,7 +117,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
   // SEMA-LABEL: @converted_descriptor_store_completion
-  tt.func @converted_descriptor_store_completion(%desc: !tt.tensordesc<tensor<128x64xf16, #shared>>, %i: i32, %lb: i32, %ub: i32, %step: i32) {
+  tt.func @converted_descriptor_store_completion(%desc: !tt.tensordesc<128x64xf16, #shared>, %i: i32, %lb: i32, %ub: i32, %step: i32) {
     // SEMA: [[V1:%.*]] = ttg.local_alloc {buffer.id = 601 : i32} : () -> !ttg.memdesc<1x128x64xf16, #shared, #smem, mutable>
     // SEMA: [[EMPTY:%.*]] = nvws.semaphore.create [[V1]] released = 1 {pending_count = 1 : i32}
     // SEMA-NEXT: [[FULL:%.*]] = nvws.semaphore.create [[V1]] {pending_count = 1 : i32}
@@ -140,7 +140,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
       // intervening layout conversion between the load and the store.
       // SEMA-NEXT: tt.descriptor_store %{{.*}}[%{{.*}}, %{{.*}}], [[CONVERTED]] {ttg.partition = array<i32: 1>}
       // SEMA-NEXT: nvws.semaphore.release [[EMPTY]], [[READ]] [#nvws.async_op<none>] {arrive_count = 1 : i32, ttg.partition = array<i32: 1>}
-      tt.descriptor_store %desc[%i, %i], %converted {ttg.partition = array<i32: 1>} : !tt.tensordesc<tensor<128x64xf16, #shared>>, tensor<128x64xf16, #blocked>
+      tt.descriptor_store %desc[%i, %i], %converted {ttg.partition = array<i32: 1>} : !tt.tensordesc<128x64xf16, #shared>, tensor<128x64xf16, #blocked>
       %next = "producer"() {ttg.partition = array<i32: 0>} : () -> tensor<128x64xf16, #linear>
       // SEMA: [[NEXT_WRITE:%.*]] = nvws.semaphore.acquire [[EMPTY]] {ttg.partition = array<i32: 0>}
       // SEMA-NEXT: [[NEXT_BUF:%.*]] = nvws.semaphore.buffer [[EMPTY]], [[NEXT_WRITE]] {ttg.partition = array<i32: 0>}

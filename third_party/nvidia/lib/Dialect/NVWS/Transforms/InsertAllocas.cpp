@@ -19,7 +19,7 @@
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/TMAUtilities.h"
-#include "triton/Tools/Sys/GetEnv.hpp"
+#include "triton/Tools/Sys/GetEnv.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallVector.h"
 
@@ -486,6 +486,18 @@ CommunicationBuffer createCommunicationBuffer(
     InsertCommunicationOptions options) {
   auto result = producedValue.result;
 
+  auto getDescriptorBackedMemDescType =
+      [](Value result, triton::DescriptorOpInterface descOp) {
+        auto allocTy = cast<MemDescType>(result.getType());
+        auto tensorType =
+            cast<RankedTensorType>(descOp->getResult(0).getType());
+        auto encoding =
+            getEncodingFromDescriptor(descOp, tensorType, descOp.getDesc());
+        return MemDescType::get(
+            tensorType.getShape(), tensorType.getElementType(), encoding,
+            allocTy.getMemorySpace(), allocTy.getMutableMemory());
+      };
+
   auto getSmemDescType = [](RankedTensorType tensorType, Value tensorResult,
                             Attribute encodingOverride = {}) {
     Attribute SharedMemorySpace =
@@ -501,7 +513,9 @@ CommunicationBuffer createCommunicationBuffer(
   };
 
   MemDescType memDescType;
-  if (result.getDefiningOp<LocalAllocOp>()) {
+  if (auto opt = isDescLoadAndAlloc<LocalAllocOp>(result)) {
+    memDescType = getDescriptorBackedMemDescType(result, opt->second);
+  } else if (result.getDefiningOp<LocalAllocOp>()) {
     memDescType = dyn_cast<MemDescType>(result.getType());
   } else if (auto tensorType = dyn_cast<RankedTensorType>(result.getType())) {
     if (useSsaTmemChannel(result, tensorType)) {

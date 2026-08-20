@@ -27,7 +27,6 @@ module attributes {"ttg.num-warps" = 4 : i32, "ttg.num-ctas" = 1 : i32} {
 tt.func @wait_then_arrive_barrier(%phase: i32) {
   %barrier = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>
   // CHECK: ttng.wait_barrier
-  // CHECK-NEXT: ttg.barrier local
   // CHECK-NEXT: ttng.arrive_barrier
   ttng.wait_barrier %barrier, %phase : !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>
   ttng.arrive_barrier %barrier, 1 : !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>
