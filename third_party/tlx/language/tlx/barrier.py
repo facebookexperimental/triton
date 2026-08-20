@@ -183,11 +183,13 @@ def named_barrier_wait(
     _semantic=None,
 ) -> None:
     """
-    Wait until `arrive_count` threads have reached the specified named barrier.
+    Wait until the total participant count reaches the specified named barrier.
 
     Arguments:
         bar (tl.constexpr): Identifier for the named barrier (e.g. from a buffer view).
-        arrive_count (tl.constexpr): Number of threads arriving at the barrier.
+        arrive_count (tl.constexpr): Total number of threads required to flip the
+            barrier phase, including threads executing both `named_barrier_wait`
+            and `named_barrier_arrive`. Both calls must use the same count.
     """
 
     bar_handle = _semantic._convert_elem_to_ir_value(bar, require_i64=False)
@@ -202,11 +204,13 @@ def named_barrier_arrive(
     _semantic=None,
 ) -> None:
     """
-    Signal arrival at a named mbarrier with the given thread count.
+    Signal arrival at a named mbarrier.
 
     Arguments:
         bar (tl.constexpr): Identifier for the named barrier (e.g. from a buffer view).
-        arrive_count (tl.constexpr): Number of threads arriving at the barrier.
+        arrive_count (tl.constexpr): Total number of threads required to flip the
+            barrier phase, including threads executing both `named_barrier_wait`
+            and `named_barrier_arrive`. Both calls must use the same count.
     """
     bar_handle = _semantic._convert_elem_to_ir_value(bar, require_i64=False)
     arrive_count_handle = _semantic._convert_elem_to_ir_value(arrive_count, require_i64=False)

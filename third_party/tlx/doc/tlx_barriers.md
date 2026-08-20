@@ -110,8 +110,11 @@ barriers.
 
 - Named barriers do not have to be allocated or initialized.
 
-- Wait and Arrive are called with the count of expected threads to
-  arrive at the barrier.
+- Wait and Arrive are called with the total number of threads required
+  to flip the barrier phase. This includes threads that execute Wait
+  and threads that execute Arrive: *num_waiting_threads +
+  num_arriving_threads*. Wait and Arrive calls for the same barrier
+  phase must use the same thread count.
 
 - All threads in the warp participate in the arrive operation, so the
   thread count should be *number of warps \* threads per warp*.
@@ -122,14 +125,17 @@ barriers.
 #### APIs
 
 - ***tlx.named_barrier_wait(bar_id, num_threads)***
-  Wait until num_threads threads have reached the phase of the *bar_id*
-  named barrier. num_threads has to be a multiple of warp size, i.e.,
-  a multiple of 32.
+  Wait until *num_threads* total threads have reached the phase of the
+  *bar_id* named barrier. The waiting threads contribute to this total,
+  so *num_threads* is the number of waiting threads plus the number of
+  arriving threads. It must match the count passed to Arrive and be a
+  multiple of warp size, i.e., a multiple of 32.
 
 - ***tlx.named_barrier_arrive(bar_id, num_threads)***
-  Signal arrival at *bar_id* named barrier with an arrival count of
-  *num_threads*. num_threads has to be a multiple of warp size, i.e.,
-  a multiple of 32.
+  Signal arrival at the *bar_id* named barrier. *num_threads* is the
+  total number of threads required to flip the barrier phase, including
+  both waiting and arriving threads. It must match the count passed to
+  Wait and be a multiple of warp size, i.e., a multiple of 32.
 
 | TLX | MLIR | PTX |
 |----|----|----|
