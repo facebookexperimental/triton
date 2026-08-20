@@ -4,7 +4,9 @@
 The benchmark gives every implementation the same deterministic BF16 tensors
 and computes non-causal square attention with ``D=128``.  These constraints are
 the intersection of the public adaptive, async, persistent, and cluster
-contracts.  Each result is checked against PyTorch SDPA before timing.
+contracts.  The default bounded-input sweep compares every implementation.
+Two additional adaptive-only cases exercise sparse and forced reference
+rebasing.  Each result is checked against PyTorch SDPA before timing.
 
 Timing uses alternating forward/reverse variant order so that temperature and
 clock drift do not consistently favor one implementation.  The reported time
@@ -41,11 +43,13 @@ import torch.nn.functional as F
 import triton
 
 import amd_fa_adaptive
+import amd_fa_adaptive_bench
 import amd_fa_cluster
 import amd_fa_persistent
 import amd_fa_pipelined
 
 DEFAULT_SHAPES = ((1, 64, 4096, 128), (2, 64, 8192, 128), (1, 64, 16384, 128))
+DEFAULT_INPUT_CASES = ("bounded", "sparse_rebase", "forced_rebase")
 DEFAULT_VARIANTS = (
     "adaptive",
     "adaptive_bounded",
@@ -64,6 +68,7 @@ class Measurement:
     heads: int
     sequence: int
     head_dim: int
+    input_case: str
     variant: str
     correct: bool
     max_abs: float
@@ -118,6 +123,26 @@ def _bounded_inputs(shape, device, seed):
     return q, k, v
 
 
+def _inputs(input_case, shape, device, seed):
+    if input_case == "bounded":
+        return _bounded_inputs(shape, device, seed)
+    if input_case == "sparse_rebase":
+        q, k, v, _, _ = amd_fa_adaptive_bench.sparse_rebase_inputs(
+            shape,
+            device,
+            seed=seed,
+        )
+        return q, k, v
+    if input_case == "forced_rebase":
+        q, k, v, _, _ = amd_fa_adaptive_bench.forced_rebase_inputs(
+            shape,
+            device,
+            seed=seed,
+        )
+        return q, k, v
+    raise ValueError(f"unsupported input case: {input_case}")
+
+
 def _variant_launchers(q, k, v, scale):
     return {
         "adaptive":
@@ -160,9 +185,9 @@ def _reference(q, k, v, scale):
     return result
 
 
-def _measure_shape(shape, variants, device, seed, warmup, rep, rounds):
+def _measure_shape(shape, input_case, variants, device, seed, warmup, rep, rounds):
     batch, heads, sequence, head_dim = shape
-    q, k, v = _bounded_inputs(shape, device, seed)
+    q, k, v = _inputs(input_case, shape, device, seed)
     scale = 1.0 / math.sqrt(head_dim)
     all_launchers = _variant_launchers(q, k, v, scale)
     launchers = {name: all_launchers[name] for name in variants}
@@ -176,13 +201,14 @@ def _measure_shape(shape, variants, device, seed, warmup, rep, rounds):
         correct = bool(torch.isfinite(output).all()) and torch.allclose(output, reference, atol=2e-2, rtol=2e-2)
         correctness[name] = (correct, difference.max().item(), difference.mean().item())
         print(
-            f"correctness shape={shape} variant={name} pass={correct} "
+            f"correctness shape={shape} input_case={input_case} "
+            f"variant={name} pass={correct} "
             f"max_abs={correctness[name][1]:.6g} mean_abs={correctness[name][2]:.6g}",
             file=sys.stderr,
             flush=True,
         )
         if not correct:
-            raise RuntimeError(f"correctness failed for {name} at shape {shape}")
+            raise RuntimeError(f"correctness failed for {name} with {input_case} inputs at shape {shape}")
 
     orders = []
     forward = list(launchers)
@@ -196,7 +222,8 @@ def _measure_shape(shape, variants, device, seed, warmup, rep, rounds):
             milliseconds = float(triton.testing.do_bench(launchers[name], warmup=warmup, rep=rep, return_mode="median"))
             samples[name].append(milliseconds)
             print(
-                f"timing shape={shape} round={round_index}/{rounds} "
+                f"timing shape={shape} input_case={input_case} "
+                f"round={round_index}/{rounds} "
                 f"variant={name} ms={milliseconds:.6f}",
                 file=sys.stderr,
                 flush=True,
@@ -214,6 +241,7 @@ def _measure_shape(shape, variants, device, seed, warmup, rep, rounds):
                 heads,
                 sequence,
                 head_dim,
+                input_case,
                 name,
                 correct,
                 max_abs,
@@ -250,6 +278,13 @@ def _parse_args():
         help="B,H,N,D; repeat for multiple shapes (default: production comparison sweep)",
     )
     parser.add_argument(
+        "--input-case",
+        dest="input_cases",
+        action="append",
+        choices=DEFAULT_INPUT_CASES,
+        help="input distribution; repeat as needed (default: all)",
+    )
+    parser.add_argument(
         "--variant",
         dest="variants",
         action="append",
@@ -271,10 +306,17 @@ def main():
         raise RuntimeError(f"AMD FA comparison requires gfx950, got {target}")
 
     shapes = tuple(args.shapes) if args.shapes else DEFAULT_SHAPES
+    input_cases = tuple(args.input_cases) if args.input_cases else DEFAULT_INPUT_CASES
     variants = tuple(args.variants) if args.variants else DEFAULT_VARIANTS
+    if args.input_cases and "adaptive" not in variants:
+        adaptive_cases = set(input_cases) - {"bounded"}
+        if adaptive_cases:
+            cases = ", ".join(sorted(adaptive_cases))
+            raise ValueError(f"input cases {cases} require --variant adaptive")
     device = triton.runtime.driver.active.get_active_torch_device()
     print(
-        f"target={target} device={device} shapes={shapes} variants={variants} "
+        f"target={target} device={device} shapes={shapes} input_cases={input_cases} "
+        f"variants={variants} "
         f"warmup={args.warmup} rep={args.rep} rounds={args.rounds} seed={args.seed}",
         file=sys.stderr,
         flush=True,
@@ -282,15 +324,21 @@ def main():
 
     measurements = []
     for shape in shapes:
-        measurements.extend(_measure_shape(
-            shape,
-            variants,
-            device,
-            args.seed,
-            args.warmup,
-            args.rep,
-            args.rounds,
-        ))
+        for input_case in input_cases:
+            if input_case != "bounded" and "adaptive" not in variants:
+                continue
+            case_variants = variants if input_case == "bounded" else ("adaptive", )
+            measurements.extend(
+                _measure_shape(
+                    shape,
+                    input_case,
+                    case_variants,
+                    device,
+                    args.seed,
+                    args.warmup,
+                    args.rep,
+                    args.rounds,
+                ))
 
     _write_csv(measurements, sys.stdout)
     if args.output:
