@@ -273,8 +273,17 @@ def TritonNvidiaGPUCheckMatmulTwoCTAPass : Pass<"triton-nvidia-check-matmul-two-
     Inspect all matmul operations and ensure they agree on the `two_ctas`
     setting. Propagate the chosen value to the module so later lowering steps
     can access it. Compilation fails if mixed configurations are detected, or if
-    one 2-CTA `tt.dot` consumes a value derived from another 2-CTA `tt.dot`.
+    one 2-CTA `tt.dot` consumes a value derived from another 2-CTA `tt.dot`
+    unless dependent chains are explicitly enabled.
   }];
+
+  let options = [
+    Option<"allowDependentChains", "allow-dependent-chains", "bool",
+           /*default=*/"false",
+           "Allow dependent 2-CTA matmul chains. This is an implementation "
+           "gate for kernels whose later 2-CTA distribution passes make the "
+           "dependent operands legal.">
+  ];
 }
 
 def TritonNvidiaGPUCLCSplitPass : Pass<"triton-nvidia-gpu-clc-split", "mlir::ModuleOp"> {

@@ -1115,6 +1115,7 @@ class Config:
         multicast=False,
         auto_tma=None,
         enable_tree_reduction=None,
+        allowDependentTwoCTA=None,
     ):
         self.kwargs = kwargs
         self.num_warps = num_warps
@@ -1134,6 +1135,7 @@ class Config:
         self.generate_subtiled_region = generate_subtiled_region
         self.preferred_ctas_per_cga = preferred_ctas_per_cga
         self.multicast = multicast
+        self.allowDependentTwoCTA = allowDependentTwoCTA
         # Per-config auto-TMA toggle. None -> defer to the global TRITON_AUTO_TMA
         # knob; True/False lets the autotuner A/B auto-TMA per shape.
         self.auto_tma = auto_tma
@@ -1156,6 +1158,7 @@ class Config:
         self.generate_subtiled_region = state.get("generate_subtiled_region", None)
         self.preferred_ctas_per_cga = state.get("preferred_ctas_per_cga", None)
         self.multicast = state.get("multicast", False)
+        self.allowDependentTwoCTA = state.get("allowDependentTwoCTA", None)
         self.auto_tma = state.get("auto_tma", None)
         self.enable_tree_reduction = state.get("enable_tree_reduction", None)
 
@@ -1181,6 +1184,7 @@ class Config:
                     ("multicast", self.multicast),
                     ("auto_tma", self.auto_tma),
                     ("enable_tree_reduction", self.enable_tree_reduction),
+                    ("allowDependentTwoCTA", self.allowDependentTwoCTA),
                 ) if v is not None
             },
         }
