@@ -1032,8 +1032,8 @@ void init_triton_ir(py::module_ &m) {
   // The builder binding is static so it persists throughout compilation,
   // letting DSL plugins (registerCustomOps) and third-party backends (TLX,
   // via getBuilderClass) register their ops on it separately.
-  static py::class_<TritonOpBuilder> TritonOpBuilderBinding(
-      m, "builder", py::dynamic_attr());
+  static py::class_<TritonOpBuilder> TritonOpBuilderBinding(m, "builder",
+                                                            py::dynamic_attr());
   builderClassPtr = &TritonOpBuilderBinding;
   TritonOpBuilderBinding.def(py::init<MLIRContext *>())
       .def("get_op_builder", &TritonOpBuilder::getBuilder, ret::reference)
@@ -1762,19 +1762,22 @@ void init_triton_ir(py::module_ &m) {
              return self.create<ttng::ReinterpretTensorDescOp>(resultTy,
                                                                desc_ptr);
            })
-      .def("create_descriptor_load",
-           [](TritonOpBuilder &self, Value desc, std::vector<Value> &indices,
-              CacheModifier cacheModifier, EvictionPolicy evictionPolicy,
-              std::optional<bool> multicast) -> Value {
-             auto descTy = cast<triton::TensorDescType>(desc.getType());
-             auto resTy = descTy.getSignlessBlockType();
-             auto op = self.create<DescriptorLoadOp>(
-                 resTy, desc, indices, cacheModifier, evictionPolicy);
-             if (multicast)
-               op->setAttr("tt.multicast",
-                           self.getBuilder().getBoolAttr(*multicast));
-             return op;
-           })
+      .def(
+          "create_descriptor_load",
+          [](TritonOpBuilder &self, Value desc, std::vector<Value> &indices,
+             CacheModifier cacheModifier, EvictionPolicy evictionPolicy,
+             std::optional<bool> multicast) -> Value {
+            auto descTy = cast<triton::TensorDescType>(desc.getType());
+            auto resTy = descTy.getSignlessBlockType();
+            auto op = self.create<DescriptorLoadOp>(
+                resTy, desc, indices, cacheModifier, evictionPolicy);
+            if (multicast)
+              op->setAttr("tt.multicast",
+                          self.getBuilder().getBoolAttr(*multicast));
+            return op;
+          },
+          py::arg("desc"), py::arg("indices"), py::arg("cacheModifier"),
+          py::arg("evictionPolicy"), py::arg("multicast").none())
       .def("create_descriptor_gather",
            [](TritonOpBuilder &self, Value desc, Value x_indices, Value y_index,
               Type type) -> Value {
