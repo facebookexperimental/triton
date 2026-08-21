@@ -817,6 +817,66 @@ constrainMfmaFragmentRegisterClass(Value fragment, StringRef registerClass,
   return constrained;
 }
 
+// Build an asm snippet providing `waitStates` MFMA wait states. `s_nop N`
+// provides N+1 wait states and N saturates at 15, so a longer requirement is
+// split across several `s_nop`s.
+static std::string mfmaWaitStateAsm(int waitStates) {
+  std::string asmStr;
+  for (int remaining = waitStates; remaining > 0;) {
+    int chunk = std::min(remaining, 16);
+    if (!asmStr.empty())
+      asmStr += "\n";
+    asmStr += "s_nop " + std::to_string(chunk - 1);
+    remaining -= chunk;
+  }
+  return asmStr;
+}
+
+// Drain the MFMA pipeline before `fragment` is read by anything else.
+//
+// The scheduled-MFMA lowering emits `v_mfma_*` inside an `asm sideeffect`
+// block so it can pin the accumulator's register class. AMDGPU's hazard
+// recognizer matches on `SIInstrInfo::isMAI()` and therefore cannot see an
+// MFMA hidden inside `INLINEASM`: it never inserts the mandatory wait states
+// between the MFMA writing its destination and the first consumer reading it.
+// (The `transient` path lowers to the ROCDL intrinsic and gets them for free --
+// LLVM emits e.g. `s_nop 7` before a `buffer_store` of a 16x16x32 result.)
+// Without this drain the consumer reads the destination registers before the
+// MFMA has written them, yielding garbage or NaN.
+//
+// This is emitted once per accumulator chain, not per MFMA: back-to-back MFMAs
+// forwarding srcC need no padding, so the chain itself is not serialized.
+//
+// `waitStates` mirrors LLVM's MFMA*WritesAGPRAccVgprReadWaitStates for gfx950.
+static FailureOr<Value>
+drainMfmaPipeline(Value fragment, StringRef registerClass, int waitStates,
+                  ConversionPatternRewriter &rewriter, Location loc) {
+  auto fragmentTy = cast<VectorType>(fragment.getType());
+  unsigned elementBitWidth =
+      getIntOrFloatOrPtrBitWidth(fragmentTy.getElementType());
+  int64_t totalBitWidth = fragmentTy.getNumElements() * elementBitWidth;
+  if (totalBitWidth <= 0 || totalBitWidth % 32 != 0)
+    return failure();
+
+  std::string waitAsm = mfmaWaitStateAsm(waitStates);
+  auto registerVectorTy = vec_ty(i32_ty, totalBitWidth / 32);
+  TritonLLVMOpBuilder b(loc, rewriter);
+  Value packed = b.bitcast(fragment, registerVectorTy);
+  auto *ctx = rewriter.getContext();
+  auto asmDialect = LLVM::AsmDialectAttr::get(ctx, LLVM::AsmDialect::AD_ATT);
+  // Tie the result to the input so the drain stays on the accumulator's SSA
+  // chain and keeps the accumulator in its pinned register class.
+  std::string constraints =
+      (registerClass == "agpr" ? std::string("=a") : std::string("=v")) + ",0";
+  auto drain = LLVM::InlineAsmOp::create(
+      rewriter, loc, registerVectorTy, ValueRange{packed}, waitAsm, constraints,
+      /*has_side_effects=*/true,
+      /*is_align_stack=*/false, LLVM::TailCallKind::None, asmDialect,
+      ArrayAttr::get(ctx, {}));
+  Value drained = b.bitcast(drain->getResult(0), fragmentTy);
+  return drained;
+}
+
 class RematerializedRangeOpConversion
     : public ConvertOpToLLVMPattern<triton::amdgpu::RematerializedRangeOp> {
 public:
@@ -1024,9 +1084,7 @@ public:
     std::string constraints;
     constexpr unsigned warpSize = 64;
     bool hasLiveDependency = llvm::any_of(op.getInputs(), [](Value input) {
-      return !cast<RankedTensorType>(input.getType())
-                  .getElementType()
-                  .isF32();
+      return !cast<RankedTensorType>(input.getType()).getElementType().isF32();
     });
     for (auto [source, converted] :
          llvm::zip(op.getInputs(), adaptor.getInputs())) {
@@ -1300,7 +1358,16 @@ public:
             asmOperands.push_back(current);
             constraints += ",0";
           }
-          std::string mfmaAsm = mfmaAsmPrefix;
+          // The hazard recognizer cannot see this MFMA (it lives inside an
+          // `asm sideeffect` block), so it will not pad a preceding VALU write
+          // of srcA/srcB or of EXEC. Per LLVM's checkMAIHazards90A that needs
+          // `LegacyVALUNotDotWritesVGPRWaitStates` (2) and
+          // `VALUWritesExecWaitStates` (4) respectively; 4 covers both. An
+          // exact same-register srcC forward from the previous MFMA in the
+          // chain is explicitly not a hazard, so this does not serialize the
+          // accumulation chain.
+          std::string mfmaAsm =
+              mfmaWaitStateAsm(/*waitStates=*/4) + "\n" + mfmaAsmPrefix;
           mfmaAsm += zeroThisInstruction ? "0" : "$0";
           auto inlineAsm = LLVM::InlineAsmOp::create(
               rewriter, loc, fragmentTy, asmOperands, mfmaAsm, constraints,
@@ -1308,6 +1375,20 @@ public:
               /*is_align_stack=*/false, LLVM::TailCallKind::None, asmDialect,
               operandAttrs);
           current = inlineAsm->getResult(0);
+        }
+        if (!useLatencyAwareIntrinsic) {
+          // The consumer is unknown here, so use the largest requirement LLVM
+          // models for reading an MFMA destination:
+          // `MFMA32x32WritesAGPRAccVgprReadWaitStates`. Its pass-count switch
+          // also routes anything other than 2 or 8 passes -- including the
+          // 4-pass 16x16x32 -- to this same value.
+          FailureOr<Value> drained = drainMfmaPipeline(
+              current, accumulatorStorage, /*waitStates=*/18, rewriter, loc);
+          if (failed(drained))
+            return rewriter.notifyMatchFailure(
+                op, "MFMA accumulator fragment must pack into complete 32-bit "
+                    "registers");
+          current = *drained;
         }
         updatedFragments[accumulatorIndex] = current;
       }
