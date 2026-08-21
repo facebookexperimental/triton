@@ -285,7 +285,6 @@ void BufferEmitter::fillCommonArgs(Type type, Value rsrcDesc,
   // 2. Set the sgprOffset to 0
   Value sgprOffset = b.int_val(32, 0);
 
-  // 3. Create the cache modifiers word
   int32_t aux =
       getCtrlBitsForCacheModifierOnTarget(cm, isBufferLoad, targetInfo);
   Value cacheModifiers = b.int_val(32, aux);
@@ -317,7 +316,6 @@ void BufferEmitter::fillCommonArgsAtomics(Type type, Value rsrcDesc,
   // 2. Set the sgprOffset to 0
   Value sgprOffset = b.int_val(32, 0);
 
-  // 3. Create the cache modifiers word
   int32_t aux = targetInfo.getBufferAtomicCachePolicy(hasUsers);
   Value cacheModifiers = b.int_val(32, aux);
 

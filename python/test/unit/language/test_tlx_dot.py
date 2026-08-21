@@ -602,18 +602,19 @@ def test_async_dot_blackwell_2cta_tma(device, A_TMEM, SAMPLE_M):
 
     ptx = kernel.asm["ptx"]
     assert ptx.count("fence.mbarrier_init.release.cluster") == 1
-    # Verify ordering: fences → cluster sync → tmem alloc. The entry-block arrive
-    # is relaxed; the cleanup arrive before tmem dealloc stays non-relaxed.
+    # Verify ordering: fences → cluster syncs → tmem alloc. The entry-block
+    # arrive is relaxed, and TMEM allocation adds a non-relaxed sync. The cleanup
+    # arrive before TMEM deallocation stays non-relaxed.
     fence_mbar_pos = ptx.index("fence.mbarrier_init.release.cluster")
     cluster_arrive_pos = ptx.index("barrier.cluster.arrive.relaxed.aligned")
     cluster_wait_pos = ptx.index("barrier.cluster.wait.aligned")
     tmem_alloc_pos = ptx.index("tcgen05.alloc.cta_group::2")
     assert fence_mbar_pos < cluster_arrive_pos < cluster_wait_pos < tmem_alloc_pos
-    # 2 cluster syncs: 1 relaxed init (before tmem alloc) + 1 non-relaxed cleanup
-    # (before tmem dealloc)
+    # 3 cluster syncs: 1 relaxed init + 1 non-relaxed TMEM allocation sync +
+    # 1 non-relaxed cleanup before TMEM deallocation.
     assert ptx.count("barrier.cluster.arrive.relaxed.aligned") == 1
-    assert ptx.count("barrier.cluster.arrive.aligned") == 1
-    assert ptx.count("barrier.cluster.wait.aligned") == 2
+    assert ptx.count("barrier.cluster.arrive.aligned") == 2
+    assert ptx.count("barrier.cluster.wait.aligned") == 3
     assert ptx.count("tcgen05.dealloc.cta_group::2") == 1
     assert ptx.count("mapa.shared::cluster") == 1  # address mapping for remote_view
     assert ptx.count("tcgen05.mma.cta_group::2") == 8  # BK=128 divided into steps of 16
@@ -780,11 +781,13 @@ def test_async_dot_blackwell_2cta_tma_ws(device, no_ending_cluster_sync):
     if no_ending_cluster_sync:
         # The user declares they handle the post-WS sync, so the compiler emits
         # no non-relaxed cluster arrive before TMEM dealloc (default + the
-        # non-default per-partition-end cleanups are all skipped). This kernel
-        # does not add its own sync, so correctness is not checked here.
+        # non-default per-partition-end cleanups are all skipped). The generic
+        # TMEM allocation sync is also skipped because only default warps reach
+        # the allocation site. This kernel does not add its own cleanup sync, so
+        # correctness is not checked here.
         assert ptx.count("barrier.cluster.arrive.aligned") == 0
     else:
-        # 4 non-relaxed cleanup arrives: 1 default (before tmem dealloc) + 3
+        # 4 non-relaxed cleanup arrives: 1 default (before TMEM dealloc) + 3
         # non-default warps (MMA/producer/idle) at partition end.
         assert ptx.count("barrier.cluster.arrive.aligned") == 4
         assert ptx.count("barrier.cluster.wait.aligned") == 2

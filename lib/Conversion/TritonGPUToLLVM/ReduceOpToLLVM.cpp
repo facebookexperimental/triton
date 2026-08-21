@@ -141,8 +141,8 @@ private:
     for (unsigned i = 0; i < op.getNumOperands(); ++i) {
       if (auto resultTy =
               dyn_cast<RankedTensorType>(op.getResult()[i].getType())) {
-        results[i] = packLLElements(loc, getTypeConverter(), accs[i], rewriter,
-                                    resultTy);
+        results[i] = packTensorElements(loc, getTypeConverter(), accs[i],
+                                        rewriter, resultTy);
       } else {
         assert(accs[i].size() == 1 && "expected scalar reduce result");
         results[i] = accs[i][0];
@@ -318,7 +318,7 @@ private:
     unsigned srcElems = getTotalElemsPerThread(types[0]);
     SmallVector<SmallVector<Value>> srcValues(srcElems);
     for (unsigned i = 0; i < op.getNumOperands(); ++i) {
-      auto values = unpackLLElements(loc, operands[i], rewriter);
+      auto values = unpackTensorElements(loc, operands[i], rewriter, types[i]);
 
       assert(values.size() == srcValues.size());
       for (unsigned j = 0; j < srcValues.size(); ++j) {
@@ -334,8 +334,10 @@ private:
     auto operands = adaptor.getOperands();
     SmallVector<SmallVector<Value>> srcValues;
     srcValues.reserve(op.getNumOperands());
-    for (unsigned i = 0; i < op.getNumOperands(); ++i)
-      srcValues.push_back(unpackLLElements(loc, operands[i], rewriter));
+    for (unsigned i = 0; i < op.getNumOperands(); ++i) {
+      srcValues.push_back(unpackTensorElements(loc, operands[i], rewriter,
+                                               op.getInputTypes()[i]));
+    }
     return srcValues;
   }
 
@@ -784,7 +786,7 @@ private:
     }
 
     layout = ReduceOpHelper::zeroBasesAlongDimAndReorder(layout, axis, kReg);
-    layout = actionRemoveBroadcastedRegs(layout).apply(layout);
+    layout = layout.removeZeroBasesAlongDim(kReg);
     return {std::move(layout), std::move(accs)};
   }
 
@@ -941,8 +943,8 @@ private:
 
       for (unsigned i = 0; i < op.getNumOperands(); ++i) {
         auto resultTy = cast<RankedTensorType>(op.getResult()[i].getType());
-        results[i] = packLLElements(loc, getTypeConverter(), resultVals[i],
-                                    rewriter, resultTy);
+        results[i] = packTensorElements(loc, getTypeConverter(), resultVals[i],
+                                        rewriter, resultTy);
       }
     } else {
       SmallVector<SmallVector<Value>> groupVals;
@@ -1189,8 +1191,8 @@ private:
 
         for (unsigned i = 0; i < op.getNumOperands(); ++i) {
           auto resultTy = cast<RankedTensorType>(op.getResult()[i].getType());
-          results[i] = packLLElements(loc, getTypeConverter(), resultVals[i],
-                                      rewriter, resultTy);
+          results[i] = packTensorElements(loc, getTypeConverter(),
+                                          resultVals[i], rewriter, resultTy);
         }
       } else {
         SmallVector<Value> vals = loadAndReduceScalarRegGroups(
@@ -1233,8 +1235,8 @@ private:
           resultVals[j] = b.load(elemTy, readPtr);
         }
 
-        results[i] = packLLElements(loc, getTypeConverter(), resultVals,
-                                    rewriter, resultTy);
+        results[i] = packTensorElements(loc, getTypeConverter(), resultVals,
+                                        rewriter, resultTy);
       } else {
         // 0d-tensor -> scalar
         results[i] = b.load(elemTy, smemBases[i]);

@@ -248,7 +248,10 @@ def test_async_tma_multicast_kernel(FAILURE, TWO_CTA_BARRIER, device, run_wrappe
                                 (FAILURE, TWO_CTA_BARRIER, device, False, monkeypatch, num_ctas))
         if FAILURE or TWO_CTA_BARRIER:
             assert_expected_cuda_failure(result.exc)
-            assert "Buffer being accessed has outstanding writes" in result.driver_stderr_output
+            assert any(msg in result.driver_stderr_output for msg in [
+                "Buffer being accessed has outstanding writes",
+                "Buffer being accessed has outstanding reads",
+            ])
         else:
             assert result.exc is None
             assert result.driver_stderr_output == ""
@@ -382,8 +385,11 @@ def test_clc_result_visibility(FAILURE, device, run_wrapper, monkeypatch, num_ct
         result = run_in_process(test_clc_result_visibility, (FAILURE, device, False, monkeypatch, num_ctas))
         if FAILURE:
             assert_expected_cuda_failure(result.exc)
-            assert ("Buffer being accessed has outstanding writes" in result.driver_stderr_output
-                    or "Buffer being read before any write" in result.driver_stderr_output)
+            assert any(msg in result.driver_stderr_output for msg in [
+                "Buffer being accessed has outstanding writes",
+                "Buffer being accessed has outstanding reads",
+                "Buffer being read before any write",
+            ])
         else:
             assert result.exc is None
             assert result.driver_stderr_output == ""
@@ -609,6 +615,76 @@ def test_cluster_barrier_does_not_publish_later_read(device, run_wrapper, monkey
                                            cga_layout=multicast_cga_layout(4, 2))
     input_desc = gluon.nvidia.hopper.TensorDescriptor.from_tensor(input, [XBLOCK.value, XBLOCK.value], shared_layout)
     kernel[(1, )](input_desc, num_warps=4, num_ctas=4)
+
+
+@pytest.mark.skipif(not is_cuda() or torch.cuda.get_device_capability()[0] < 9, reason="Requires hopper or newer")
+@pytest.mark.parametrize(
+    "OP,FAILURE",
+    [
+        pytest.param("gather", True, id="gather-missing-barrier"),
+        pytest.param("gather", False, id="gather-synchronized"),
+        pytest.param("scatter", False, id="scatter-synchronized"),
+        pytest.param("atomic", False, id="atomic-synchronized"),
+    ],
+)
+def test_local_indexed_cross_cta_visibility(OP, FAILURE, device, run_wrapper, monkeypatch):
+    if run_wrapper:
+        result = run_in_process(test_local_indexed_cross_cta_visibility, (OP, FAILURE, device, False, monkeypatch))
+        if FAILURE:
+            assert_expected_cuda_failure(result.exc)
+            assert "Buffer being accessed has outstanding reads" in result.driver_stderr_output
+        else:
+            assert result.exc is None
+            assert result.driver_stderr_output == ""
+        return
+
+    monkeypatch.setenv("TRITON_INSTRUMENTATION_MODE", "consan")
+    monkeypatch.setenv("CUDA_LAUNCH_BLOCKING", "1")
+    knobs.refresh_knobs()
+
+    @gluon.jit
+    def kernel(inp, out, layout: ttgl.constexpr, OP: ttgl.constexpr, FAILURE: ttgl.constexpr):
+        shared_layout: ttgl.constexpr = ttgl.SwizzledSharedLayout(1, 1, 1, order=[1, 0], cga_layout=[[0, 1]])
+        rows = ttgl.arange(0, 2, layout=ttgl.SliceLayout(1, layout))
+        cols = ttgl.arange(0, 32, layout=ttgl.SliceLayout(0, layout))
+        offsets = rows[:, None] * 32 + cols[None, :]
+        values = ttgl.load(inp + offsets)
+        smem = ttgl.allocate_shared_memory(ttgl.int32, [2, 32], shared_layout)
+        peer_cols = (cols ^ 16)[None, :] + rows[:, None] * 0
+        # Finish ConSan's untracked poison initialization before peer DSM access.
+        ttgl.barrier(cluster=True)
+
+        if FAILURE:
+            result = smem.gather(peer_cols, axis=1)
+            ttgl.store(out + offsets, result)
+            # Order every peer read before the stores without publishing it.
+            hopper.cluster.barrier(relaxed=True)
+            smem.store(values)
+        else:
+            smem.store(values)
+            ttgl.barrier(cluster=True)
+            if OP == "gather":
+                result = smem.gather(peer_cols, axis=1)
+                # Order peer DSM reads and keep allocations alive until they finish.
+                ttgl.barrier(cluster=True)
+            elif OP == "scatter":
+                smem.scatter(values, peer_cols, axis=1)
+                ttgl.barrier(cluster=True)
+                result = smem.load(layout)
+            else:
+                smem.atomic_scatter_add(values, peer_cols, axis=1)
+                ttgl.barrier(cluster=True)
+                result = smem.load(layout)
+            ttgl.store(out + offsets, result)
+
+    inp = torch.arange(64, dtype=torch.int32, device=device).reshape(2, 32)
+    out = torch.empty_like(inp)
+    layout = ttgl.BlockedLayout([1, 1], [1, 32], [1, 4], [1, 0], cga_layout=[[0, 1]])
+    kernel[(1, )](inp, out, layout, OP=OP, FAILURE=FAILURE, num_warps=4, num_ctas=2)
+    if not FAILURE:
+        peer = inp.reshape(2, 2, 16).flip(1).reshape(2, 32)
+        expected = inp + peer if OP == "atomic" else peer
+        torch.testing.assert_close(out, expected)
 
 
 @pytest.mark.skipif(not is_cuda() or torch.cuda.get_device_capability()[0] < 9, reason="Requires hopper or newer")
@@ -2623,15 +2699,25 @@ def test_deadlock_with_padded_warp_specialize_partition(device, run_wrapper, mon
 
 
 @pytest.mark.skipif(not is_cuda() or torch.cuda.get_device_capability()[0] < 9, reason="Requires hopper")
-@pytest.mark.parametrize("TWO_CTAS", [False, True], ids=["single-cta-barrier", "two-cta-barrier"])
-def test_deadlock_after_other_partition_returns(TWO_CTAS, device, run_wrapper, monkeypatch, num_ctas):
+@pytest.mark.parametrize("TWO_CTAS,CLUSTER_BARRIER,FAILURE", [
+    pytest.param(False, False, True, id="single-cta-mbarrier"),
+    pytest.param(True, False, True, id="two-cta-mbarrier"),
+    pytest.param(True, True, True, id="cluster-deadlock"),
+    pytest.param(True, True, False, id="cluster-no-deadlock"),
+])
+def test_deadlock_after_other_partition_returns(TWO_CTAS, CLUSTER_BARRIER, FAILURE, device, run_wrapper, monkeypatch,
+                                                num_ctas):
     if TWO_CTAS and num_ctas == 1:
         pytest.skip("two-CTA barriers require at least two CTAs")
     if run_wrapper:
         result = run_in_process(test_deadlock_after_other_partition_returns,
-                                (TWO_CTAS, device, False, monkeypatch, num_ctas))
-        assert_expected_cuda_failure(result.exc)
-        assert "Deadlock detected" in result.driver_stderr_output
+                                (TWO_CTAS, CLUSTER_BARRIER, FAILURE, device, False, monkeypatch, num_ctas))
+        if FAILURE:
+            assert_expected_cuda_failure(result.exc)
+            assert "Deadlock detected" in result.driver_stderr_output
+        else:
+            assert result.exc is None
+            assert result.driver_stderr_output == ""
         return
     monkeypatch.setenv("TRITON_INSTRUMENTATION_MODE", "consan")
     monkeypatch.setenv("CUDA_LAUNCH_BLOCKING", "1")
@@ -2642,25 +2728,86 @@ def test_deadlock_after_other_partition_returns(TWO_CTAS, device, run_wrapper, m
         pass
 
     @gluon.jit
-    def wait_forever(bar):
-        mbarrier.wait(bar.index(0), phase=0)
+    def wait_forever(bar, FAILURE: ttgl.constexpr):
+        if FAILURE:
+            mbarrier.wait(bar.index(0), phase=0)
 
     @gluon.jit
     def complete_and_return(bar):
         mbarrier.arrive(bar.index(1), count=1)
 
     @gluon.jit
-    def kernel(TWO_CTAS: ttgl.constexpr):
+    def kernel(TWO_CTAS: ttgl.constexpr, CLUSTER_BARRIER: ttgl.constexpr, FAILURE: ttgl.constexpr):
         bar = mbarrier.allocate_mbarrier(batch=2, two_ctas=TWO_CTAS)
         mbarrier.init(bar.index(0), count=1)
         mbarrier.init(bar.index(1), count=1)
         ttgl.warp_specialize([
             (done, (bar, )),
-            (wait_forever, (bar, )),
+            (wait_forever, (bar, FAILURE)),
             (complete_and_return, (bar, )),
         ], [4, 4], [32, 32])
+        if CLUSTER_BARRIER:
+            for _ in range(2):
+                ttgl.barrier(cluster=True)
 
-    kernel[(1, )](TWO_CTAS, num_warps=4, num_ctas=num_ctas)
+    kernel[(1, )](TWO_CTAS, CLUSTER_BARRIER, FAILURE, num_warps=4, num_ctas=num_ctas)
+
+
+@pytest.mark.skipif(not is_cuda() or torch.cuda.get_device_capability()[0] < 9, reason="Requires hopper")
+@pytest.mark.parametrize("CLUSTER_PARTITION", [False, True], ids=["default-region", "partition-region"])
+@pytest.mark.parametrize("FAILURE", [True, False], ids=["deadlock", "no-deadlock"])
+def test_deadlock_user_cluster_barrier_inside_warp_specialize(CLUSTER_PARTITION, FAILURE, device, run_wrapper,
+                                                              monkeypatch, num_ctas):
+    if num_ctas == 1:
+        pytest.skip("two-CTA barriers require at least two CTAs")
+    if run_wrapper:
+        result = run_in_process(test_deadlock_user_cluster_barrier_inside_warp_specialize,
+                                (CLUSTER_PARTITION, FAILURE, device, False, monkeypatch, num_ctas))
+        if FAILURE:
+            assert_expected_cuda_failure(result.exc)
+            assert "Deadlock detected" in result.driver_stderr_output
+        else:
+            assert result.exc is None
+            assert result.driver_stderr_output == ""
+        return
+
+    monkeypatch.setenv("TRITON_INSTRUMENTATION_MODE", "consan")
+    monkeypatch.setenv("CUDA_LAUNCH_BLOCKING", "1")
+    knobs.refresh_knobs()
+
+    @gluon.jit
+    def wait_local(local_bar, paired_bar):
+        mbarrier.wait(local_bar, phase=0)
+
+    @gluon.jit
+    def wait_paired_then_cluster(local_bar, paired_bar):
+        ttgl.barrier(cluster=True)
+        mbarrier.wait(paired_bar, phase=0)
+        ttgl.barrier(cluster=True)
+
+    @gluon.jit
+    def kernel(FAILURE: ttgl.constexpr, CLUSTER_PARTITION: ttgl.constexpr):
+        local_bar = mbarrier.allocate_mbarrier()
+        paired_bar = mbarrier.allocate_mbarrier(two_ctas=True)
+        mbarrier.init(local_bar, count=1)
+        mbarrier.init(paired_bar, count=1)
+        if not FAILURE:
+            mbarrier.arrive(local_bar, count=1)
+            mbarrier.arrive(paired_bar, count=1)
+        if CLUSTER_PARTITION:
+            ttgl.warp_specialize([
+                (wait_local, (local_bar, paired_bar)),
+                (wait_paired_then_cluster, (local_bar, paired_bar)),
+            ], [4], [32])
+        else:
+            ttgl.warp_specialize([
+                (wait_paired_then_cluster, (local_bar, paired_bar)),
+                (wait_local, (local_bar, paired_bar)),
+            ], [4], [32])
+
+    compiled = kernel[(1, )](FAILURE, CLUSTER_PARTITION, num_warps=4, num_ctas=num_ctas)
+    if not FAILURE:
+        assert compiled.asm["ptx"].count("mbarrier.arrive.release.cluster.shared::cluster.b64") >= 2
 
 
 @pytest.mark.skipif(not is_cuda() or torch.cuda.get_device_capability()[0] < 9, reason="Requires hopper")
