@@ -291,9 +291,20 @@ static Attribute computeSharedEncFromDotEnc(ttg::DotOperandEncodingAttr dotEnc,
       using amdgpu::ISAFamily;
       if (llvm::is_contained({ISAFamily::CDNA4, ISAFamily::GFX1250},
                              targetFeatures.getISAFamily())) {
+        // A subview retains the parent allocation shape in its MemDescType.
+        // Build inferred padding against that allocation, because the padded
+        // encoding's linear component is verified against allocShape even
+        // when the local_load consumes only a smaller logical view.
+        auto composeType = type;
+        if (!isBufferLoadToLocal && type.getShape() != type.getAllocShape()) {
+          auto allocShape = type.getAllocShape();
+          composeType = ttg::MemDescType::get(
+              allocShape, type.getElementType(), type.getEncoding(),
+              type.getMemorySpace(), type.getMutableMemory(), allocShape);
+        }
         if (auto padded = composePaddedLayout(
                 targetFeatures, dotEnc.getOpIdx(), dotEnc.getKWidth(),
-                cast<ttg::TensorOrMemDesc>(type), paddedOrder, dotEnc,
+                cast<ttg::TensorOrMemDesc>(composeType), paddedOrder, dotEnc,
                 /*useAsyncCopy=*/true)) {
           // `composePaddedLayout` returns the bank-conflict-avoiding padded
           // layout, derived from the DOT (read) order. Its linear component is

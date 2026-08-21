@@ -3,6 +3,7 @@
 #include "mlir/IR/AttrTypeSubElements.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "mlir/Transforms/Passes.h"
+#include "triton/Analysis/Utility.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Types.h"
@@ -401,6 +402,60 @@ static Attribute deepUnwrapTlxWrappers(Attribute attr) {
   return attr;
 }
 
+// A reshape may be built while its source still carries a deferred TLX
+// wrapper. Layout optimization can then retag the source while the wrapper
+// keeps the reshape's previously inferred destination stable. Once wrappers
+// are removed below, the concrete reshape must satisfy Triton's normal layout
+// inference again. Preserve the destination expected by existing consumers
+// with a register-only conversion, which is the TLX equivalent of Gluon's
+// convert_layout(..., assert_trivial=True).
+static LogicalResult repairUnwrappedReshapes(ModuleOp moduleOp) {
+  SmallVector<::mlir::triton::ReshapeOp> reshapes;
+  moduleOp.walk(
+      [&](::mlir::triton::ReshapeOp reshape) { reshapes.push_back(reshape); });
+
+  for (auto reshape : reshapes) {
+    RankedTensorType srcTy = reshape.getSrc().getType();
+    RankedTensorType oldDstTy = reshape.getType();
+    Attribute srcEnc = srcTy.getEncoding();
+    Attribute oldDstEnc = oldDstTy.getEncoding();
+    if (!srcEnc || !oldDstEnc)
+      continue;
+
+    auto *layout = dyn_cast<::mlir::triton::DialectInferLayoutInterface>(
+        &srcEnc.getDialect());
+    if (!layout)
+      return reshape.emitError(
+          "source layout does not support reshape inference after TLX layout "
+          "finalization");
+
+    Attribute inferredDstEnc = oldDstEnc;
+    if (failed(layout->inferReshapeOpEncoding(
+            srcTy.getShape(), srcEnc, oldDstTy.getShape(), inferredDstEnc,
+            reshape.getAllowReorder(), reshape.getLoc())))
+      return failure();
+    if (succeeded(layout->verifyLayoutsAreEqual(oldDstTy.getShape(),
+                                                inferredDstEnc, oldDstEnc,
+                                                /*loc=*/std::nullopt)))
+      continue;
+
+    RankedTensorType inferredDstTy = RankedTensorType::get(
+        oldDstTy.getShape(), oldDstTy.getElementType(), inferredDstEnc);
+    if (!cvtReordersRegisters(inferredDstTy, oldDstTy))
+      return reshape.emitError(
+          "removing TLX layout wrappers would require a non-trivial reshape "
+          "layout conversion");
+
+    reshape.getResult().setType(inferredDstTy);
+    OpBuilder builder(reshape);
+    builder.setInsertionPointAfter(reshape);
+    auto convert = ttg::ConvertLayoutOp::create(builder, reshape.getLoc(),
+                                                oldDstTy, reshape.getResult());
+    reshape.getResult().replaceAllUsesExcept(convert.getResult(), convert);
+  }
+  return success();
+}
+
 static LogicalResult finalizeUserLayouts(ModuleOp moduleOp) {
   mlir::AttrTypeReplacer replacer;
   replacer.addReplacement([](UserLayoutAttr wrapper) -> Attribute {
@@ -432,6 +487,9 @@ static LogicalResult finalizeUserLayouts(ModuleOp moduleOp) {
     if (resultType && dense.getType() != resultType)
       cst.setValueAttr(dense.reshape(resultType));
   });
+
+  if (failed(repairUnwrappedReshapes(moduleOp)))
+    return failure();
 
   SmallVector<ttg::ConvertLayoutOp> identityConversions;
   moduleOp.walk([&](ttg::ConvertLayoutOp convert) {

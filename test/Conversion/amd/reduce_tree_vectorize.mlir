@@ -122,3 +122,30 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.thr
     tt.return
   }
 }
+
+// -----
+
+// An MFMA [256,64] tile gives each thread several disjoint register groups
+// along N, but all of those groups contribute to the same reduced row.  An
+// unordered reduction may merge the groups before vectorization: all 32
+// register values become 16 packed pairs and one vector tree (15 adds), with
+// only one final horizontal scalar add.  Reducing each group independently
+// emitted only eight vector adds and repeatedly unpacked partial results.
+#mma = #ttg.amd_mfma<{versionMajor = 4, versionMinor = 0, warpsPerCTA = [8, 1], instrShape = [32, 32, 16], isTransposed = true}>
+#rows = #ttg.slice<{dim = 1, parent = #mma}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, "ttg.threads-per-warp" = 64 : i32} {
+  // GFX950-LABEL: reduce_mfma_256x64_unordered
+  // GFX950-COUNT-15: llvm.fadd {{.*}} : vector<2xf32>
+  // GFX950-NOT: llvm.fadd {{.*}} : vector<2xf32>
+  // GFX950: llvm.extractelement
+  // GFX950: llvm.extractelement
+  // GFX950: llvm.fadd {{.*}} : f32
+  tt.func public @reduce_mfma_256x64_unordered(%arg0: tensor<256x64xf32, #mma>) {
+    %0 = "tt.reduce"(%arg0) <{axis = 1 : i32, reduction_ordering = "unordered"}> ({
+    ^bb0(%a: f32, %b: f32):
+      %sum = arith.addf %a, %b : f32
+      tt.reduce.return %sum : f32
+    }) : (tensor<256x64xf32, #mma>) -> tensor<256xf32, #rows>
+    tt.return
+  }
+}

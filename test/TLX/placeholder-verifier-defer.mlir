@@ -63,20 +63,18 @@ module attributes {"ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32,
 #linear = #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], warp = [[32, 0], [64, 0]], block = []}>
 #ph = #tlx.no_verify_layout<#tlx.user_layout<#linear>>
 #slice = #ttg.slice<{dim = 1, parent = #ph}>
-#deferred_slice = #tlx.no_verify_layout<#slice>
 module {
-  // The nested placeholder keeps canonical slice-parent inference stable. The
-  // outer placeholder defers verification of the complete slice while frontend
-  // IR has no ttg.num-warps context and keeps later inference in the TLX dialect.
+  // The placeholder remains on the slice parent, matching canonical reduction
+  // inference while frontend IR has no ttg.num-warps context.
   // CHECK-LABEL: @nested_placeholder_slice
-  tt.func @nested_placeholder_slice(%x: tensor<128x128xf32, #ph>) -> tensor<128xf32, #deferred_slice> {
+  tt.func @nested_placeholder_slice(%x: tensor<128x128xf32, #ph>) -> tensor<128xf32, #slice> {
     // CHECK: "tt.reduce"
     %m = "tt.reduce"(%x) <{axis = 1 : i32}> ({
     ^bb0(%lhs: f32, %rhs: f32):
       %max = arith.maxnumf %lhs, %rhs : f32
       tt.reduce.return %max : f32
-    }) : (tensor<128x128xf32, #ph>) -> tensor<128xf32, #deferred_slice>
-    tt.return %m : tensor<128xf32, #deferred_slice>
+    }) : (tensor<128x128xf32, #ph>) -> tensor<128xf32, #slice>
+    tt.return %m : tensor<128xf32, #slice>
   }
 }
 

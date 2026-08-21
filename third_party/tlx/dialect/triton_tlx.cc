@@ -273,7 +273,11 @@ void init_triton_tlx_ir(py::module_ &m) {
       .def("create_release_layout",
            [](TritonOpBuilder &self, Value &v) -> Value {
              if (auto type = dyn_cast<RankedTensorType>(v.getType())) {
-               assert(type.getEncoding() && "Expect layout encoding");
+               // A @triton.jit call result can still be encoding-free while
+               // the frontend builds the caller, then acquire a concrete
+               // layout when TritonTLXFixup specializes the helper ABI.  Keep
+               // the release boundary in the IR so it can end that delayed
+               // layout domain after specialization.
                auto newType = RankedTensorType::get(type.getShape(),
                                                     type.getElementType());
                return self.create<tlx::ReleaseLayoutOp>(newType, v);
@@ -624,6 +628,29 @@ void init_triton_tlx_ir(py::module_ &m) {
                  context, version, warpsPerCta, instrShape, transposed,
                  cgaLayout, tilesPerWarp, elementBitWidth));
            })
+      .def(
+          "make_slice_encoding_attr",
+          [](TritonOpBuilder &self, unsigned dim,
+             Attribute parentEnc) -> Attribute {
+            auto context = self.getBuilder().getContext();
+            auto parent = dyn_cast<ttg::DistributedEncodingTrait>(parentEnc);
+            auto parentLayout = dyn_cast<ttg::LayoutEncodingTrait>(parentEnc);
+            if (!parent || !parentLayout)
+              throw std::runtime_error(
+                  "make_slice_encoding_attr: parent must be a ranked "
+                  "distributed layout");
+            unsigned rank = parentLayout.getRank();
+            if (rank <= 1)
+              throw std::runtime_error(
+                  "make_slice_encoding_attr: parent layout must have at "
+                  "least rank >= 2");
+            if (dim >= rank)
+              throw std::runtime_error(
+                  "make_slice_encoding_attr: slice dim=" + std::to_string(dim) +
+                  " must be less than the parent rank=" + std::to_string(rank));
+            return mlir::cast<Attribute>(
+                ttg::SliceEncodingAttr::get(context, dim, parent));
+          })
       .def("make_linear_encoding_attr",
            [](TritonOpBuilder &self, std::vector<std::vector<int>> regBases,
               std::vector<std::vector<int>> laneBases,
@@ -1327,6 +1354,21 @@ void init_triton_tlx_ir(py::module_ &m) {
       .def("create_warp_return_op",
            [](TritonOpBuilder &self) -> void {
              self.create<ttg::WarpReturnOp>();
+           })
+      .def(
+          "create_warp_predicate_op",
+          [](TritonOpBuilder &self, std::vector<Type> &resultTypes,
+             Value predicate, std::vector<Value> &inits,
+             bool waveUniform) -> Operation * {
+            UnitAttr waveUniformAttr =
+                waveUniform ? self.getBuilder().getUnitAttr() : UnitAttr();
+            return self.create<ttg::WarpPredicateOp>(resultTypes, predicate,
+                                                     inits, waveUniformAttr);
+          },
+          py::rv_policy::reference)
+      .def("create_predicate_yield_op",
+           [](TritonOpBuilder &self, std::vector<Value> &values) -> void {
+             self.create<ttg::PredicateYieldOp>(values);
            })
       .def(
           "create_async_load",
