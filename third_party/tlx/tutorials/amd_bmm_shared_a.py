@@ -71,8 +71,8 @@ def _bmm_direct(a_ptr, b_ptr, c_ptr, M, N, K, sab, sam, sak, sbb, sbk, sbn, scb,
     pn = pid % npn
     ash: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases([(512, 16)], AB, [BM, BK])
     bsh: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases([(512, 16)], BB, [BK, BN])
-    sA = tlx.local_alloc((BM, BK), tl.float16, NB, layout=ash)
-    sB = tlx.local_alloc((BK, BN), tl.float16, NB, layout=bsh)
+    sA = tlx.local_alloc((BM, BK), tlx.dtype_of(a_ptr), NB, layout=ash)
+    sB = tlx.local_alloc((BK, BN), tlx.dtype_of(b_ptr), NB, layout=bsh)
     om = (pm * BM + tl.arange(0, BM)) % M
     on = (pn * BN + tl.arange(0, BN)) % N
     ok = tl.arange(0, BK)
@@ -124,8 +124,8 @@ def _bmm_register(a_ptr, b_ptr, c_ptr, M, N, K, sab, sam, sak, sbb, sbk, sbn, sc
     pid = pidf % GMN
     pm = pid // npn
     pn = pid % npn
-    sA = tlx.local_alloc((BM, BK), tl.float16, NB)
-    sB = tlx.local_alloc((BK, BN), tl.float16, NB)
+    sA = tlx.local_alloc((BM, BK), tlx.dtype_of(a_ptr), NB)
+    sB = tlx.local_alloc((BK, BN), tlx.dtype_of(b_ptr), NB)
     om = (pm * BM + tl.arange(0, BM)) % M
     on = (pn * BN + tl.arange(0, BN)) % N
     ok = tl.arange(0, BK)
@@ -171,6 +171,9 @@ def _bmm_register(a_ptr, b_ptr, c_ptr, M, N, K, sab, sam, sak, sbb, sbk, sbn, sc
 
 def bmm(a, b):
     """C = A @ B, shared-A, ROW-major B (stride_bn == 1). nw=8, mfma=32."""
+    # sA / sB take their element type from a_ptr / b_ptr independently, so a dtype
+    # mismatch would silently give the two LDS buffers different types.
+    assert a.dtype == b.dtype, f"A and B must have the same dtype, got {a.dtype} and {b.dtype}"
     Bs, M, K = a.shape
     N = b.shape[-1]
     bm = 64 if M <= 64 else 128
