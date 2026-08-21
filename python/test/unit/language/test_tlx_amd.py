@@ -1429,9 +1429,10 @@ def test_amd_scheduled_mfma_persistent_acc_lowering_gfx950(elem_ty):
     )
     llir = compiled.asm["llir"]
     asm_ty = "f16" if elem_ty == "fp16" else elem_ty
-    assert f'asm sideeffect "v_mfma_f32_16x16x32_{asm_ty}' in llir
+    assert f'asm sideeffect "s_nop 3\\0Av_mfma_f32_16x16x32_{asm_ty}' in llir
     assert '"=a,v,v"' in llir
     assert f"@llvm.amdgcn.mfma.f32.16x16x32.{asm_ty}" not in llir
+    assert 'asm sideeffect "s_nop 15\\0As_nop 3"' in llir
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")

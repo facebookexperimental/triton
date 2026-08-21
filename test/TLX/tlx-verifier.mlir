@@ -87,28 +87,10 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 #release_shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
 #release_user_shared = #tlx.user_layout<#release_shared>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
-  tt.func public @release_layout_rejects_shared_source(
+  tt.func public @release_layout_accepts_encoded_source(
       %arg: tensor<128xf32, #release_user_shared>) -> tensor<128xf32> {
-    // expected-error @+1 {{requires the source tensor to use a distributed register layout}}
     %result = tlx.release_layout %arg
         : tensor<128xf32, #release_user_shared> -> tensor<128xf32>
     tt.return %result : tensor<128xf32>
-  }
-}
-
-// -----
-
-#release_blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
-#release_shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
-#release_user_shared = #tlx.user_layout<#release_shared>
-module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
-  tt.func public @release_layout_rejects_shared_result(
-      %arg: tensor<128xf32, #release_blocked>)
-      -> tensor<128xf32, #release_user_shared> {
-    // expected-error @+1 {{requires the result tensor to be unencoded or use a distributed register layout}}
-    %result = tlx.release_layout %arg
-        : tensor<128xf32, #release_blocked>
-          -> tensor<128xf32, #release_user_shared>
-    tt.return %result : tensor<128xf32, #release_user_shared>
   }
 }

@@ -44,18 +44,6 @@ LogicalResult ReleaseLayoutOp::verify() {
   Attribute srcEncoding = srcType.getEncoding();
   if (!srcEncoding)
     return emitOpError("requires the source tensor to have a layout encoding");
-  if (!isa<triton::gpu::DistributedEncodingTrait>(
-          getEffectiveEncoding(srcEncoding)))
-    return emitOpError(
-        "requires the source tensor to use a distributed register layout");
-
-  auto resultType = cast<RankedTensorType>(getResult().getType());
-  Attribute resultEncoding = resultType.getEncoding();
-  if (resultEncoding && !isa<triton::gpu::DistributedEncodingTrait>(
-                            getEffectiveEncoding(resultEncoding)))
-    return emitOpError(
-        "requires the result tensor to be unencoded or use a distributed "
-        "register layout");
   return success();
 }
 
