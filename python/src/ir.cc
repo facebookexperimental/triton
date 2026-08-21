@@ -1032,8 +1032,8 @@ void init_triton_ir(py::module_ &m) {
   // The builder binding is static so it persists throughout compilation,
   // letting DSL plugins (registerCustomOps) and third-party backends (TLX,
   // via getBuilderClass) register their ops on it separately.
-  static py::class_<TritonOpBuilder> TritonOpBuilderBinding(
-      m, "builder", py::dynamic_attr());
+  static py::class_<TritonOpBuilder> TritonOpBuilderBinding(m, "builder",
+                                                            py::dynamic_attr());
   builderClassPtr = &TritonOpBuilderBinding;
   TritonOpBuilderBinding.def(py::init<MLIRContext *>())
       .def("get_op_builder", &TritonOpBuilder::getBuilder, ret::reference)

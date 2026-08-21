@@ -462,8 +462,7 @@ private:
       lowerLdStShared(loc, ctx, storeCvt, tileInVals, llvmElemTy, smemBase,
                       /*paddingShifts=*/{}, affineOffset, maskSpanAffineOffset,
                       /*affineBlockOffset=*/Value(),
-                      /*maskSpanAffineBlock=*/0,
-                      rewriter, targetInfo);
+                      /*maskSpanAffineBlock=*/0, rewriter, targetInfo);
       emitBarrier();
       auto tileOutVals = lowerLdStShared(
           loc, ctx, loadCvt, {}, llvmElemTy, smemBase, /*paddingShifts=*/{},

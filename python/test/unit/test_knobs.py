@@ -309,8 +309,7 @@ def test_nvidia_tool_probe_reports_reason(tmp_path):
     assert reason == "no such file"
 
     # The case that motivated this: present and executable, but killed at exec.
-    broken = _fake_tool(tmp_path / "broken",
-                        'sys.stderr.write("undefined symbol: unw_backtrace\\n"); sys.exit(127)')
+    broken = _fake_tool(tmp_path / "broken", 'sys.stderr.write("undefined symbol: unw_backtrace\\n"); sys.exit(127)')
     tool, reason = probe(str(broken))
     assert tool is None
     assert "exited with status 127" in reason

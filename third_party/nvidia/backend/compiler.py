@@ -1385,8 +1385,7 @@ class CUDABackend(BaseBackend):
                 fbin,
             ]
             try:
-                subprocess.run(ptxas_cmd, check=True, close_fds=False, stderr=flog,
-                               env=knobs.nvidia.get_tool_env())
+                subprocess.run(ptxas_cmd, check=True, close_fds=False, stderr=flog, env=knobs.nvidia.get_tool_env())
                 if knobs.nvidia.dump_ptxas_log:
                     with open(flog.name) as log_file:
                         print(log_file.read())
