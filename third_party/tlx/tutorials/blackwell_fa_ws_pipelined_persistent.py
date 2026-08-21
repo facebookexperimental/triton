@@ -1,11 +1,25 @@
+from enum import IntEnum
+
 import torch
 import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
+from triton.language import core
 from triton.language.extra.tlx.warp_spec import get_bufidx_phase
 from triton.language.extra.cuda.inline_ptx_lib import _mul_f32x2, _fma_f32x2, _sub_f32x2
-from triton.language.extra.subtile_ops import _split_n_2D
+from triton.language.extra.subtile_ops import _join_n_2D, _split_n_2D
 from triton.tools.tensor_descriptor import TensorDescriptor
+
+
+class ExpMode(IntEnum):
+    DEG2_50_BREADTH = 13
+    DEG2_TRIPLE = 14
+    DEG1_PHASE7 = 15
+
+
+EXP_DEG2_50_BREADTH = tl.constexpr(int(ExpMode.DEG2_50_BREADTH))
+EXP_DEG2_TRIPLE = tl.constexpr(int(ExpMode.DEG2_TRIPLE))
+EXP_DEG1_PHASE7 = tl.constexpr(int(ExpMode.DEG1_PHASE7))
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
@@ -99,6 +113,341 @@ def prune_configs_by_hdim(configs, named_args, **kwargs):
                 continue
         pruned.append(conf)
     return pruned
+
+
+@core.builtin
+def _add_rm_f32x2(a, b, _semantic=None):
+    return core.inline_asm_elementwise(
+        """
+        {
+            .reg .b64 ra, rb, rc;
+            mov.b64 ra, { $2, $3 };
+            mov.b64 rb, { $4, $5 };
+            add.rm.f32x2 rc, ra, rb;
+            mov.b64 { $0, $1 }, rc;
+        }
+        """,
+        "=r,=r,r,r,r,r",
+        [a, b],
+        dtype=core.float32,
+        is_pure=True,
+        pack=2,
+        _semantic=_semantic,
+    )
+
+
+@core.builtin
+def _s2_exp2_bf16(x, a2, b2m, _semantic=None):
+    return core.inline_asm_elementwise(
+        """
+        {
+            .reg .b64 ra, rb, rc, rd;
+            .reg .b32 v0, v1, pk, zz, uu, mk, c0;
+            mov.b64 ra, { $1, $2 };
+            mov.b64 rb, { $3, $4 };
+            mov.b64 rc, { $5, $6 };
+            fma.rn.f32x2 rd, ra, rb, rc;
+            mov.b64 { v0, v1 }, rd;
+            prmt.b32 pk, v0, v1, 0x5410;
+            mov.b32 zz, 0;
+            mov.b32 mk, 0x00400040;
+            add.s16x2 uu, pk, mk;
+            mov.b32 c0, 0x3f3b3f3b;
+            fma.rn.bf16x2 pk, uu, c0, pk;
+            max.bf16x2 pk, pk, zz;
+            mov.b32 $0, pk;
+        }
+        """,
+        "=r,r,r,r,r,r,r",
+        [x, a2, b2m],
+        dtype=core.bfloat16,
+        is_pure=True,
+        pack=2,
+        _semantic=_semantic,
+    )
+
+
+@triton.jit
+def _reduce_bf16(a, b):
+    return (a + b).to(tl.bfloat16)
+
+
+@core.builtin
+def _combine_int_frac_ex2(x_rounded, frac_ex2, _semantic=None):
+    return core.inline_asm_elementwise(
+        """
+        {
+            .reg .s32 x_rounded_i, frac_ex_i, x_rounded_e, out_i;
+            mov.b32 x_rounded_i, $1;
+            mov.b32 frac_ex_i, $2;
+            shl.b32 x_rounded_e, x_rounded_i, 23;
+            add.s32 out_i, x_rounded_e, frac_ex_i;
+            mov.b32 $0, out_i;
+        }
+        """,
+        "=f,f,f",
+        [x_rounded, frac_ex2],
+        dtype=core.float32,
+        is_pure=True,
+        pack=1,
+        _semantic=_semantic,
+    )
+
+
+@triton.jit
+def _poly_exp2_deg2_dense_quad(x1, x3, x5, x7):
+    safe1 = x1
+    safe3 = x3
+    safe5 = x5
+    safe7 = x7
+    magic = 12582912.0
+    rounded1 = _add_rm_f32x2(safe1, magic)
+    rounded3 = _add_rm_f32x2(safe3, magic)
+    rounded5 = _add_rm_f32x2(safe5, magic)
+    rounded7 = _add_rm_f32x2(safe7, magic)
+    back1 = _sub_f32x2(rounded1, magic)
+    back3 = _sub_f32x2(rounded3, magic)
+    back5 = _sub_f32x2(rounded5, magic)
+    back7 = _sub_f32x2(rounded7, magic)
+    frac1 = _sub_f32x2(safe1, back1)
+    frac3 = _sub_f32x2(safe3, back3)
+    frac5 = _sub_f32x2(safe5, back5)
+    frac7 = _sub_f32x2(safe7, back7)
+    poly1 = _fma_f32x2(0.33718943, frac1, 0.65763628)
+    poly3 = _fma_f32x2(0.33718943, frac3, 0.65763628)
+    poly5 = _fma_f32x2(0.33718943, frac5, 0.65763628)
+    poly7 = _fma_f32x2(0.33718943, frac7, 0.65763628)
+    poly1 = _fma_f32x2(poly1, frac1, 1.0017247632060873)
+    poly3 = _fma_f32x2(poly3, frac3, 1.0017247632060873)
+    poly5 = _fma_f32x2(poly5, frac5, 1.0017247632060873)
+    poly7 = _fma_f32x2(poly7, frac7, 1.0017247632060873)
+    return (
+        _combine_int_frac_ex2(rounded1, poly1),
+        _combine_int_frac_ex2(rounded3, poly3),
+        _combine_int_frac_ex2(rounded5, poly5),
+        _combine_int_frac_ex2(rounded7, poly7),
+    )
+
+
+@triton.jit
+def _fragment_exp2(x, EXP_MODE: tl.constexpr, MASKED: tl.constexpr):
+    if EXP_MODE == EXP_DEG2_50_BREADTH:
+        if MASKED:
+            return tl.math.exp2(x)
+        phases = _split_n_2D(x, 8)
+        poly1, poly3, poly5, poly7 = _poly_exp2_deg2_dense_quad(
+            phases[1], phases[3], phases[5], phases[7]
+        )
+        return _join_n_2D(
+            (
+                tl.math.exp2(phases[0]),
+                poly1,
+                tl.math.exp2(phases[2]),
+                poly3,
+                tl.math.exp2(phases[4]),
+                poly5,
+                tl.math.exp2(phases[6]),
+                poly7,
+            )
+        )
+    if EXP_MODE == EXP_DEG2_TRIPLE:
+        if MASKED:
+            return tl.math.exp2(x)
+        phases = _split_n_2D(x, 8)
+        poly1, poly3, poly5 = _poly_exp2_deg2_dense_triple(
+            phases[1], phases[3], phases[5]
+        )
+        return _join_n_2D(
+            (
+                tl.math.exp2(phases[0]),
+                poly1,
+                tl.math.exp2(phases[2]),
+                poly3,
+                tl.math.exp2(phases[4]),
+                poly5,
+                tl.math.exp2(phases[6]),
+                tl.math.exp2(phases[7]),
+            )
+        )
+    if MASKED:
+        return tl.math.exp2(x)
+    phases = _split_n_2D(x, 8)
+    poly1, poly3, poly5 = _poly_exp2_deg2_dense_triple(phases[1], phases[3], phases[5])
+    poly7 = _poly_exp2_d1_single(phases[7])
+    return _join_n_2D(
+        (
+            tl.math.exp2(phases[0]),
+            poly1,
+            tl.math.exp2(phases[2]),
+            poly3,
+            tl.math.exp2(phases[4]),
+            poly5,
+            tl.math.exp2(phases[6]),
+            poly7,
+        )
+    )
+
+
+@triton.jit
+def _poly_exp2_deg2_dense_triple(x1, x3, x5):
+    safe1 = x1
+    safe3 = x3
+    safe5 = x5
+    magic = 12582912.0
+    rounded1 = _add_rm_f32x2(safe1, magic)
+    rounded3 = _add_rm_f32x2(safe3, magic)
+    rounded5 = _add_rm_f32x2(safe5, magic)
+    back1 = _sub_f32x2(rounded1, magic)
+    back3 = _sub_f32x2(rounded3, magic)
+    back5 = _sub_f32x2(rounded5, magic)
+    frac1 = _sub_f32x2(safe1, back1)
+    frac3 = _sub_f32x2(safe3, back3)
+    frac5 = _sub_f32x2(safe5, back5)
+    poly1 = _fma_f32x2(0.33718943, frac1, 0.65763628)
+    poly3 = _fma_f32x2(0.33718943, frac3, 0.65763628)
+    poly5 = _fma_f32x2(0.33718943, frac5, 0.65763628)
+    poly1 = _fma_f32x2(poly1, frac1, 1.0017247632060873)
+    poly3 = _fma_f32x2(poly3, frac3, 1.0017247632060873)
+    poly5 = _fma_f32x2(poly5, frac5, 1.0017247632060873)
+    return (
+        _combine_int_frac_ex2(rounded1, poly1),
+        _combine_int_frac_ex2(rounded3, poly3),
+        _combine_int_frac_ex2(rounded5, poly5),
+    )
+
+
+@triton.jit
+def _poly_exp2_d1_single(x):
+    magic = 12582912.0
+    rounded = _add_rm_f32x2(x, magic)
+    back = _sub_f32x2(rounded, magic)
+    frac = _sub_f32x2(x, back)
+    poly = _fma_f32x2(0.97017879, frac, 0.96567879)
+    return _combine_int_frac_ex2(rounded, poly)
+
+
+@core.builtin
+def _combine_int_frac_ex2_shf(x_rounded, frac_ex2, _semantic=None):
+    return core.inline_asm_elementwise(
+        """
+        {
+            .reg .s32 x_rounded_i, frac_ex_i, x_rounded_e, out_i;
+            mov.b32 x_rounded_i, $1;
+            mov.b32 frac_ex_i, $2;
+            shf.l.clamp.b32 x_rounded_e, 0, x_rounded_i, 23;
+            add.s32 out_i, x_rounded_e, frac_ex_i;
+            mov.b32 $0, out_i;
+        }
+        """,
+        "=f,f,f",
+        [x_rounded, frac_ex2],
+        dtype=core.float32,
+        is_pure=True,
+        pack=1,
+        _semantic=_semantic,
+    )
+
+
+@triton.jit
+def _a3_fragment_exp2(x, EXP_MODE: tl.constexpr, MASKED: tl.constexpr):
+    if MASKED:
+        return tl.math.exp2(x)
+    if EXP_MODE == EXP_DEG2_TRIPLE:
+        ph = _split_n_2D(x, 8)
+        r1 = _add_rm_f32x2(ph[1], 12582912.0)
+        r3 = _add_rm_f32x2(ph[3], 12582912.0)
+        r5 = _add_rm_f32x2(ph[5], 12582912.0)
+        b1 = _sub_f32x2(r1, 12582912.0)
+        b3 = _sub_f32x2(r3, 12582912.0)
+        b5 = _sub_f32x2(r5, 12582912.0)
+        f1 = _sub_f32x2(ph[1], b1)
+        f3 = _sub_f32x2(ph[3], b3)
+        f5 = _sub_f32x2(ph[5], b5)
+        p1 = _fma_f32x2(0.97017879, f1, 0.96567879)
+        p3 = _fma_f32x2(0.97017879, f3, 0.96567879)
+        p5 = _fma_f32x2(0.97017879, f5, 0.96567879)
+        e1 = _combine_int_frac_ex2_shf(r1, p1)
+        e3 = _combine_int_frac_ex2_shf(r3, p3)
+        e5 = _combine_int_frac_ex2_shf(r5, p5)
+        return _join_n_2D(
+            (
+                tl.math.exp2(ph[0]),
+                e1,
+                tl.math.exp2(ph[2]),
+                e3,
+                tl.math.exp2(ph[4]),
+                e5,
+                tl.math.exp2(ph[6]),
+                tl.math.exp2(ph[7]),
+            )
+        )
+    if EXP_MODE == EXP_DEG2_50_BREADTH:
+        ph = _split_n_2D(x, 8)
+        r1 = _add_rm_f32x2(ph[1], 12582912.0)
+        r3 = _add_rm_f32x2(ph[3], 12582912.0)
+        r5 = _add_rm_f32x2(ph[5], 12582912.0)
+        r7 = _add_rm_f32x2(ph[7], 12582912.0)
+        b1 = _sub_f32x2(r1, 12582912.0)
+        b3 = _sub_f32x2(r3, 12582912.0)
+        b5 = _sub_f32x2(r5, 12582912.0)
+        b7 = _sub_f32x2(r7, 12582912.0)
+        f1 = _sub_f32x2(ph[1], b1)
+        f3 = _sub_f32x2(ph[3], b3)
+        f5 = _sub_f32x2(ph[5], b5)
+        f7 = _sub_f32x2(ph[7], b7)
+        p1 = _fma_f32x2(0.97017879, f1, 0.96567879)
+        p3 = _fma_f32x2(0.97017879, f3, 0.96567879)
+        p5 = _fma_f32x2(0.97017879, f5, 0.96567879)
+        p7 = _fma_f32x2(0.97017879, f7, 0.96567879)
+        e1 = _combine_int_frac_ex2_shf(r1, p1)
+        e3 = _combine_int_frac_ex2_shf(r3, p3)
+        e5 = _combine_int_frac_ex2_shf(r5, p5)
+        e7 = _combine_int_frac_ex2_shf(r7, p7)
+        return _join_n_2D(
+            (
+                tl.math.exp2(ph[0]),
+                e1,
+                tl.math.exp2(ph[2]),
+                e3,
+                tl.math.exp2(ph[4]),
+                e5,
+                tl.math.exp2(ph[6]),
+                e7,
+            )
+        )
+    ph = _split_n_2D(x, 8)
+    r1 = _add_rm_f32x2(ph[1], 12582912.0)
+    r3 = _add_rm_f32x2(ph[3], 12582912.0)
+    r5 = _add_rm_f32x2(ph[5], 12582912.0)
+    r7 = _add_rm_f32x2(ph[7], 12582912.0)
+    b1 = _sub_f32x2(r1, 12582912.0)
+    b3 = _sub_f32x2(r3, 12582912.0)
+    b5 = _sub_f32x2(r5, 12582912.0)
+    b7 = _sub_f32x2(r7, 12582912.0)
+    f1 = _sub_f32x2(ph[1], b1)
+    f3 = _sub_f32x2(ph[3], b3)
+    f5 = _sub_f32x2(ph[5], b5)
+    f7 = _sub_f32x2(ph[7], b7)
+    p1 = _fma_f32x2(0.97017879, f1, 0.96567879)
+    p3 = _fma_f32x2(0.97017879, f3, 0.96567879)
+    p5 = _fma_f32x2(0.97017879, f5, 0.96567879)
+    p7 = _fma_f32x2(0.97017879, f7, 0.96567879)
+    e1 = _combine_int_frac_ex2(r1, p1)
+    e3 = _combine_int_frac_ex2(r3, p3)
+    e5 = _combine_int_frac_ex2(r5, p5)
+    e7 = _combine_int_frac_ex2(r7, p7)
+    return _join_n_2D(
+        (
+            tl.math.exp2(ph[0]),
+            e1,
+            tl.math.exp2(ph[2]),
+            e3,
+            tl.math.exp2(ph[4]),
+            e5,
+            tl.math.exp2(ph[6]),
+            e7,
+        )
+    )
 
 
 @triton.jit
