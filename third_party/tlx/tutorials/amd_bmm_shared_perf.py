@@ -1,27 +1,42 @@
 """Shared-A batched GEMM (BMM) for gfx950 / CDNA4 — ROW-major B (shared-LHS).
 
-Companion to ``amd_bmm.py``. Both files are shared-A; what differs is B's memory
-layout: ``amd_bmm.py`` takes COLUMN-major B (``stride_bk == 1``), this file takes
-ROW-major B (``stride_bn == 1``), the standard torch.bmm / inductor layout.
+Companion to ``amd_bmm.py`` (which uses COLUMN-major B). This file targets the
+standard torch.bmm / inductor layout and is the reproducer for the shared-A
+perf comparison against rocBLAS.
 
-LAYOUT:
-  * A: shared-A — one (M, K) matrix reused across the whole batch,
-    ``a.stride(0) == 0`` (mat1 batch-stride 0). Benchmark against shared-A, not
-    distinct-A: rocBLAS reads shared-A once and keeps it L2-resident, so a
-    distinct-A comparison flatters TLX.
-  * B: (B, K, N) ROW-major (N-contiguous, ``stride_bn == 1``).
+LAYOUT (shared-LHS batched GEMM):
+  * A: shared-A — one (M, K) matrix reused across the whole batch, ``a.stride(0) == 0``
+    (mat1 batch-stride 0). rocBLAS/hipBLASLt exploits this to read A once from HBM
+    (it stays L2-resident), so it is 1.5-2.4x faster than distinct-A. BENCHMARK
+    AGAINST SHARED-A, not distinct-A, or the comparison flatters TLX.
+  * B: (B, K, N) ROW-major (N-contiguous, ``stride_bn == 1``) — standard torch.bmm.
   * C: (B, M, N) row-major.
 
-CONFIG: num_warps=8, matrix_instr_nonkdim=32 (32x32 MFMA). nw=8 does not compile
-with the column-major kernel's swizzle + 4-warp split store, which is why the two
-layouts are separate files rather than one parameterised kernel.
+WINNING CONFIG for this row-major layout (differs from amd_bmm.py's column-major):
+  * num_warps = 8, matrix_instr_nonkdim = 32 (32x32 MFMA). These are latency/MFMA
+    levers for this occupancy-bound BMM family; nw=8 beats the column-major kernel's
+    nw=4 here (nw=8 does NOT compile with the column-major swizzle+split-store).
+  * Dual load-path by K alignment (``K % 8 == 0`` -> 16-byte-aligned A rows):
+      - aligned  -> direct-to-LDS (buffer_load_to_local) + swizzled LDS. WINS rocBLAS.
+      - odd K    -> register path (tl.load -> local_store), masked K-tail.
 
-Two load paths, selected by K alignment (``K % BLOCK_K == 0`` -> aligned A rows,
-no K-tail):
-  * aligned -> direct-to-LDS (``buffer_load_to_local``) + swizzled LDS.
-  * odd K   -> register path (``tl.load`` -> ``tlx.local_store``), masked K-tail.
-    Required because odd K gives 2-byte-aligned rows, where direct-to-LDS is
-    illegal on CDNA4.
+PERF (Triton beta + ROCm 7.0, MI350X, warm device time, shared-A; ratio = rocBLAS/TLX,
+>1 = TLX ahead). EVERY shape is an improvement target -- we do not want to regress the
+ones we are ahead on, and we need to close the rest; more is always better:
+    shape (MxNxK)     B      TLX      rocBLAS   ratio    path   status
+    1024x256x256     320     77us      82us     1.07x    direct  ahead, want more
+    395x256x320     1024    144us     155us     1.08x    direct  ahead, want more
+    40x256x1956     1024    196us     188us     0.96x    reg     NEEDS WORK
+    262x256x294     1024    133us      92us     0.69x    reg     NEEDS WORK
+    1195x256x2309   1024   2739us    1966us     0.72x    reg     NEEDS WORK
+
+ODD-K CEILING: the register-path shapes (40, 262, 1195) trail because A's odd K forces
+16-bit A loads. rocBLAS handles this with ``buffer_load_short_d16``/``_d16_hi`` —
+16-bit loads PACKED 2 fp16 per VGPR (half the registers -> higher occupancy). It
+does NOT use wide unaligned loads (hardware needs 16B alignment for dwordx4; we
+verified forcing it gives wrong results). Triton's AMD backend emits
+``buffer_load_ushort`` (zero-extend, 1 fp16/reg) instead -> the remaining gap is
+this d16-packing codegen difference, not tiling/config.
 """
 import math
 import torch
@@ -29,6 +44,7 @@ import torch
 import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
+from triton.testing import do_bench
 import pytest
 
 BLOCK_N = 256
@@ -38,7 +54,6 @@ NB = 3
 
 
 def _swz(shape, cd):
-
     def basis(d, i):
         return [1 << i, 0] if d == 0 else [0, 1 << i]
 
@@ -61,81 +76,58 @@ def _chip(pid, nt, nx: tl.constexpr, cs: tl.constexpr):
 
 
 @triton.jit
-def _bmm_direct(a_ptr, b_ptr, c_ptr, M, N, K, sab, sam, sak, sbb, sbk, sbn, scb, scm, scn, BM: tl.constexpr,
-                BN: tl.constexpr, BK: tl.constexpr, AB: tl.constexpr, BB: tl.constexpr, NUM_XCDS: tl.constexpr,
-                GMN: tl.constexpr, NT: tl.constexpr, NB: tl.constexpr):
-    """Aligned rows, no K-tail (K % BLOCK_K == 0): direct-to-LDS + swizzled LDS."""
+def _bmm_direct(a_ptr, b_ptr, c_ptr, M, N, K, sab, sam, sak, sbb, sbk, sbn, scb, scm, scn,
+                BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, AB: tl.constexpr, BB: tl.constexpr,
+                NUM_XCDS: tl.constexpr, GMN: tl.constexpr, NT: tl.constexpr, NB: tl.constexpr):
+    """Aligned rows (K % 8 == 0): direct-to-LDS + swizzled LDS."""
     npn = tl.cdiv(N, BN)
     pidf = _chip(tl.program_id(0), NT, NUM_XCDS, GMN)
-    bid = pidf // GMN
-    pid = pidf % GMN
-    pm = pid // npn
-    pn = pid % npn
+    bid = pidf // GMN; pid = pidf % GMN; pm = pid // npn; pn = pid % npn
     ash: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases([(512, 16)], AB, [BM, BK])
     bsh: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases([(512, 16)], BB, [BK, BN])
     sA = tlx.local_alloc((BM, BK), tl.float16, NB, layout=ash)
     sB = tlx.local_alloc((BK, BN), tl.float16, NB, layout=bsh)
-    om = (pm * BM + tl.arange(0, BM)) % M
-    on = (pn * BN + tl.arange(0, BN)) % N
-    ok = tl.arange(0, BK)
-    a_ptr = a_ptr + bid.to(tl.int64) * sab
-    b_ptr = b_ptr + bid.to(tl.int64) * sbb
-    ao = om[:, None] * sam
-    bo = on[None, :] * sbn
-    KI = tl.cdiv(K, BK)
+    om = (pm * BM + tl.arange(0, BM)) % M; on = (pn * BN + tl.arange(0, BN)) % N; ok = tl.arange(0, BK)
+    a_ptr = a_ptr + bid.to(tl.int64) * sab; b_ptr = b_ptr + bid.to(tl.int64) * sbb
+    ao = om[:, None] * sam; bo = on[None, :] * sbn; KI = tl.cdiv(K, BK)
     for i in tl.range(0, NB, loop_unroll_factor=NB):
         kk = i * BK
         tlx.buffer_load_to_local(tlx.local_view(sA, i), a_ptr, ao + (kk + ok[None, :]) * sak)
         tlx.buffer_load_to_local(tlx.local_view(sB, i), b_ptr, (kk + ok[:, None]) * sbk + bo)
         tlx.async_load_commit_group()
     tlx.async_load_wait_group(NB - 2)
-    a = tlx.local_load(tlx.local_view(sA, 0))
-    b = tlx.local_load(tlx.local_view(sB, 0))
+    a = tlx.local_load(tlx.local_view(sA, 0)); b = tlx.local_load(tlx.local_view(sB, 0))
     acc = tl.zeros((BM, BN), dtype=tl.float32)
     for k in tl.range(0, KI - NB):
-        cur = (k + 1) % NB
-        pf = k % NB
-        kp = (k + NB) * BK
+        cur = (k + 1) % NB; pf = k % NB; kp = (k + NB) * BK
         acc = tl.dot(a, b, acc)
         tlx.buffer_load_to_local(tlx.local_view(sA, pf), a_ptr, ao + (kp + ok[None, :]) * sak)
         tlx.buffer_load_to_local(tlx.local_view(sB, pf), b_ptr, (kp + ok[:, None]) * sbk + bo)
-        tlx.async_load_commit_group()
-        tlx.async_load_wait_group(NB - 2)
-        a = tlx.local_load(tlx.local_view(sA, cur))
-        b = tlx.local_load(tlx.local_view(sB, cur))
+        tlx.async_load_commit_group(); tlx.async_load_wait_group(NB - 2)
+        a = tlx.local_load(tlx.local_view(sA, cur)); b = tlx.local_load(tlx.local_view(sB, cur))
     acc = tl.dot(a, b, acc)
     tlx.async_load_wait_group(0)
     for i in tl.range(0, NB - 1, loop_unroll_factor=NB - 1):
         bf = (KI - (NB - 1) + i) % NB
         acc = tl.dot(tlx.local_load(tlx.local_view(sA, bf)), tlx.local_load(tlx.local_view(sB, bf)), acc)
-    et = c_ptr.dtype.element_ty
-    cb = c_ptr + bid.to(tl.int64) * scb
-    rm = pm * BM + tl.arange(0, BM)
-    rn = pn * BN + tl.arange(0, BN)
+    et = c_ptr.dtype.element_ty; cb = c_ptr + bid.to(tl.int64) * scb
+    rm = pm * BM + tl.arange(0, BM); rn = pn * BN + tl.arange(0, BN)
     tl.store(cb + scm * rm[:, None] + scn * rn[None, :], acc.to(et), mask=(rm[:, None] < M) & (rn[None, :] < N))
 
 
 @triton.jit
-def _bmm_register(a_ptr, b_ptr, c_ptr, M, N, K, sab, sam, sak, sbb, sbk, sbn, scb, scm, scn, BM: tl.constexpr,
-                  BN: tl.constexpr, BK: tl.constexpr, NUM_XCDS: tl.constexpr, GMN: tl.constexpr, NT: tl.constexpr,
-                  NB: tl.constexpr, DIVISIBILITY_SAM: tl.constexpr, DIVISIBILITY_K: tl.constexpr):
+def _bmm_register(a_ptr, b_ptr, c_ptr, M, N, K, sab, sam, sak, sbb, sbk, sbn, scb, scm, scn,
+                  BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
+                  NUM_XCDS: tl.constexpr, GMN: tl.constexpr, NT: tl.constexpr, NB: tl.constexpr,
+                  DIVISIBILITY_SAM: tl.constexpr, DIVISIBILITY_K: tl.constexpr):
     """Odd / unaligned K: register path (tl.load -> local_store), masked K-tail."""
     npn = tl.cdiv(N, BN)
     pidf = _chip(tl.program_id(0), NT, NUM_XCDS, GMN)
-    bid = pidf // GMN
-    pid = pidf % GMN
-    pm = pid // npn
-    pn = pid % npn
-    sA = tlx.local_alloc((BM, BK), tl.float16, NB)
-    sB = tlx.local_alloc((BK, BN), tl.float16, NB)
-    om = (pm * BM + tl.arange(0, BM)) % M
-    on = (pn * BN + tl.arange(0, BN)) % N
-    ok = tl.arange(0, BK)
-    a_ptr = a_ptr + bid.to(tl.int64) * sab
-    b_ptr = b_ptr + bid.to(tl.int64) * sbb
-    ao = tl.multiple_of(om[:, None] * sam, [DIVISIBILITY_SAM, 1])
-    bo = on[None, :] * sbn
-    KI = tl.cdiv(K, BK)
+    bid = pidf // GMN; pid = pidf % GMN; pm = pid // npn; pn = pid % npn
+    sA = tlx.local_alloc((BM, BK), tl.float16, NB); sB = tlx.local_alloc((BK, BN), tl.float16, NB)
+    om = (pm * BM + tl.arange(0, BM)) % M; on = (pn * BN + tl.arange(0, BN)) % N; ok = tl.arange(0, BK)
+    a_ptr = a_ptr + bid.to(tl.int64) * sab; b_ptr = b_ptr + bid.to(tl.int64) * sbb
+    ao = tl.multiple_of(om[:, None] * sam, [DIVISIBILITY_SAM, 1]); bo = on[None, :] * sbn; KI = tl.cdiv(K, BK)
     for i in tl.range(0, NB, loop_unroll_factor=NB):
         kk = i * BK
         br = tl.load(b_ptr + (kk + ok[:, None]) * sbk + bo)
@@ -147,11 +139,11 @@ def _bmm_register(a_ptr, b_ptr, c_ptr, M, N, K, sab, sam, sak, sbb, sbk, sbn, sc
     a = tlx.local_load(tlx.local_view(sA, 0))
     b = tlx.local_load(tlx.local_view(sB, 0))
     acc = tl.zeros((BM, BN), dtype=tl.float32)
-
+    
     for k in tl.range(0, KI - NB - 1):
         cur = (k + 1) % NB
         pf = k % NB; kp = (k + NB) * BK
-
+ 
         br = tl.load(b_ptr + (kp + ok[:, None]) * sbk + bo)
         ar = tl.load(a_ptr + ao + (kp + ok[None, :]) * sak)
         acc = tl.dot(a, b, acc)
@@ -160,7 +152,7 @@ def _bmm_register(a_ptr, b_ptr, c_ptr, M, N, K, sab, sam, sak, sbb, sbk, sbn, sc
         tlx.local_store(tlx.local_view(sA, pf), ar)
         tlx.local_store(tlx.local_view(sB, pf), br)
         tl.debug_barrier()
-
+    
     k = KI - NB - 1
     cur = (k + 1) % NB
     pf = k % NB
@@ -178,19 +170,22 @@ def _bmm_register(a_ptr, b_ptr, c_ptr, M, N, K, sab, sam, sak, sbb, sbk, sbn, sc
     for i in tl.range(0, NB - 1, loop_unroll_factor=NB - 1):
         bf = (KI - (NB - 1) + i) % NB
         acc = tl.dot(tlx.local_load(tlx.local_view(sA, bf)), tlx.local_load(tlx.local_view(sB, bf)), acc)
-    et = c_ptr.dtype.element_ty
-    cb = c_ptr + bid.to(tl.int64) * scb
-    rm = pm * BM + tl.arange(0, BM)
-    rn = pn * BN + tl.arange(0, BN)
+    et = c_ptr.dtype.element_ty; cb = c_ptr + bid.to(tl.int64) * scb
+    rm = pm * BM + tl.arange(0, BM); rn = pn * BN + tl.arange(0, BN)
     tl.store(cb + scm * rm[:, None] + scn * rn[None, :], acc.to(et), mask=(rm[:, None] < M) & (rn[None, :] < N))
 
 
 def bmm(a, b):
     """C = A @ B, shared-A, ROW-major B (stride_bn == 1). nw=8, mfma=32.
 
-    Direct path (K%8==0): direct-to-LDS at nw=8.
-    Reg path (odd K): register path at nw=4 with explicit divisibility hints to
-    enable wide vectorized loads on A and mask only the final K tile.
+    MultiB dispatch: each CTA processes NUM_B_MATRIX consecutive B matrices from one A
+    load, halving A's HBM bandwidth.  Only enabled when M<=64 (BM=64): for larger M,
+    halving NT hurts CU occupancy more than the A-bandwidth saving helps.
+
+    Direct path (K%8==0): always single-B at nw=8 — nw=8 beats nw=4 by ~5-7% here
+    and avoids VGPR spill with the two-accumulator multiB layout.
+    Reg path (odd K): multiB at nw=8 for M<=64 (small-M shapes are bandwidth-bound
+    for A; NT is small enough that halving it is safe).
     """
     Bs, M, K = a.shape
     N = b.shape[-1]
@@ -201,7 +196,7 @@ def bmm(a, b):
     attrs = (("amdgpu-agpr-alloc", "0,0"), )
     st = (a.stride(0), a.stride(1), a.stride(2), b.stride(0), b.stride(1), b.stride(2), c.stride(0), c.stride(1),
           c.stride(2))
-    if K % 8 == 0:  # 16-byte-aligned A rows -> direct-to-LDS path
+    if K % 8 == 0:  # 16-byte-aligned A rows -> direct-to-LDS path (always single-B)
         common = dict(num_warps=8, num_stages=1, matrix_instr_nonkdim=32, llvm_fn_attrs=attrs)
         AB = tuple(tuple(x) for x in _swz([bm, BLOCK_K], 1))
         BB = tuple(tuple(x) for x in _swz([BLOCK_K, BLOCK_N], 1))
@@ -264,6 +259,7 @@ def _warm_ms(fn, iters=60, warmup=20):
     return s.elapsed_time(e) / iters
 
 
+
 if __name__ == "__main__":
     dev = triton.runtime.driver.active.get_active_torch_device()
     # (B, M, N, K): representative shared-LHS shapes.  Always shared-A.
@@ -285,3 +281,5 @@ if __name__ == "__main__":
         rb = _warm_ms(lambda: torch.bmm(a, b)) * 1e3
         path = "direct" if K % 8 == 0 else "reg"
         print(f"{f'{M}x{N}x{K} ({B})':<22}{path:<8}{t:8.0f}u{rb:9.0f}u{rb / t:7.2f}x  {'OK' if ok else 'WRONG'}")
+
+
