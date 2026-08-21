@@ -26,6 +26,13 @@ namespace mlir::triton::tlx {
 #define GEN_PASS_DEF_TRITONTLXFIXUP
 #include "tlx/dialect/include/Transforms/Passes.h.inc"
 
+static SmallVector<int32_t> invertPermutation(ArrayRef<int32_t> order) {
+  SmallVector<int32_t> inverse(order.size());
+  for (auto [i, dim] : llvm::enumerate(order))
+    inverse[dim] = i;
+  return inverse;
+}
+
 // ---------------------------------------------------------------------------
 // Placeholder (no_verify) layout propagation across encoding-uniform ops.
 //
@@ -660,6 +667,24 @@ static LogicalResult propagatePlaceholderLayouts(ModuleOp mod) {
             bridgeOrRetype(elseY.getOperand(i), enc, elseY, i);
         }
         return;
+      }
+      // A result-side user pin on transpose must be reflected through the
+      // inverse permutation before normal forward type inference runs.
+      if (auto trans = dyn_cast<::mlir::triton::TransOp>(op)) {
+        auto resultType = cast<RankedTensorType>(trans.getType());
+        Attribute resultEnc = resultType.getEncoding();
+        if (isPlaceholderEncoding(resultEnc)) {
+          auto inverseOrder = invertPermutation(trans.getOrder());
+          Attribute srcEnc;
+          auto *layout = cast<::mlir::triton::DialectInferLayoutInterface>(
+              &resultEnc.getDialect());
+          if (succeeded(layout->inferTransOpEncoding(
+                  resultEnc, resultType.getShape(), inverseOrder, srcEnc,
+                  trans.getLoc()))) {
+            changed |= retypeWithEncoding(trans.getSrc(), srcEnc);
+            return;
+          }
+        }
       }
       // Re-infer any op whose operands acquired a placeholder after frontend
       // construction. This covers trans/split/reduce/expand-dims and future ops
