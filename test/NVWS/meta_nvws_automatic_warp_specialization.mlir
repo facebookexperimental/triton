@@ -12,6 +12,9 @@
 module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
   // CHECK-LABEL: @regular_load_alloc_mma_operand
   // CHECK: ttg.warp_specialize
+  // CHECK-NOT: tt.descriptor_gather
+  // CHECK-NOT: nvws.descriptor_gather
+  // CHECK: ttng.async_tma_gather
   // CHECK: tt.load
   // CHECK: ttg.local_store
   // CHECK: ttng.tc_gen5_mma

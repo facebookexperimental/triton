@@ -1768,7 +1768,7 @@ static bool isKeyOp(Operation *op) {
     return true;
 
   // Load operations
-  if (isa<ttnvws::DescriptorLoadOp, tt::LoadOp, ttng::TMEMLoadOp,
+  if (isa<ttnvws::DescriptorLoadOpInterface, tt::LoadOp, ttng::TMEMLoadOp,
           ttg::LocalLoadOp>(op))
     return true;
 
@@ -1874,10 +1874,13 @@ static std::string getKeyOpDescription(Operation *op) {
   }
 
   // For loads, show source and result
-  if (auto loadOp = dyn_cast<ttnvws::DescriptorLoadOp>(op)) {
+  if (auto loadOp = dyn_cast<ttnvws::DescriptorLoadOpInterface>(op)) {
     // NVWS "result" is the destination memdesc operand, not an SSA result.
+    Value buffer = isa<ttnvws::DescriptorLoadOp>(op)
+                       ? cast<ttnvws::DescriptorLoadOp>(op).getResult()
+                       : cast<ttnvws::DescriptorGatherOp>(op).getResult();
     ss << opName << " " << formatInput(loadOp.getDesc()) << " -> "
-       << formatInput(loadOp.getResult());
+       << formatInput(buffer);
     return result;
   }
   if (auto loadOp = dyn_cast<tt::LoadOp>(op)) {
@@ -2098,7 +2101,8 @@ static std::string getKeyOpLabel(Operation *op) {
     std::string aName = getValueDisplayName(mmaOp.getA());
     std::string bName = getValueDisplayName(mmaOp.getB());
     label += outputName + " = " + opName + "(" + aName + ", " + bName + ")";
-  } else if (isa<ttnvws::DescriptorLoadOp, tt::LoadOp, ttng::TMEMLoadOp,
+  } else if (isa<ttnvws::DescriptorLoadOpInterface, tt::LoadOp,
+                 ttng::TMEMLoadOp,
                  ttg::LocalLoadOp>(op)) {
     // Load: out = load(src)
     std::string inputs = getTensorInputs(op);
