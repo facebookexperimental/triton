@@ -188,7 +188,7 @@ jobs:
           # Full Gluon unit-test coverage: every python/test/gluon/test_*.py. This spans
           # the compile-only frontend tests plus the GPU-execution suites (core, lowerings,
           # consan, fpsan, layout_format_view). Known-failing cases and their root causes
-          # are tracked in README.md ("Gluon support" -> TODO gluon-ci).
+          # are tracked in docs/ci.md ("Gluon" -> TODO gluon-ci).
           python -m pytest python/test/gluon/ -v --junitxml=/tmp/gluon.xml
       - name: Collect nightly failures (Gluon)
         id: parse
