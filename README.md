@@ -1303,12 +1303,12 @@ Lowers to `amdg.assume_uniform`, which is eventually lowered to `llvm.amdgcn.rea
 - `tlx.amd_register_resident(value, register_class="agpr", registers_per_group=1)`
   keeps every native-register group in one allocator-visible whole-tensor
   residency interval.
-- `tlx.amd_register_handoff(value, register_class="vgpr", registers_per_group=1)`
-  starts an independent allocation interval for each native-register group,
+- `tlx.amd_register_handoff(value, register_class="vgpr")` starts an
+  independent allocation interval for each 32-bit native register value,
   shortening a local live range without requiring simultaneous whole-tensor
   residency. Both register-boundary operations accept `"vgpr"` or `"agpr"`;
-  `registers_per_group` is a power-of-two count of 32-bit register values from
-  1 through 32.
+  `amd_register_resident` additionally accepts a power-of-two
+  `registers_per_group` from 1 through 32.
 - `tlx.amd_scheduled_mfma(...)` exposes independent native MFMA accumulator
   chains in deterministic N-major, M-minor, K-reduction source order.
 - `tlx.amd_mfma_commit(value, preserve)` applies the CDNA4 MFMA result hazard

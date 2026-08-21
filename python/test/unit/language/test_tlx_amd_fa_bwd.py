@@ -1064,15 +1064,6 @@ def test_d64_causal_gqa8_helper_ast_contract():
     assert ast.unparse(vgpr_handoffs[0].args[0]) == "ds"
     assert ast.literal_eval(
         next(keyword.value for keyword in vgpr_handoffs[0].keywords if keyword.arg == "register_class")) == "vgpr"
-    assert ast.unparse(
-        next(keyword.value
-             for keyword in vgpr_handoffs[0].keywords
-             if keyword.arg == "registers_per_group")) == "handoff_group"
-    handoff_assignment = next(
-        node for node in signed_front.body
-        if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.target.id == "handoff_group")
-    assert ast.unparse(handoff_assignment.annotation) == "tl.constexpr"
-    assert ast.unparse(handoff_assignment.value) == "2 if LATE_DO_T else 1"
 
     def assignment_call(statement, target, call_name):
         return (isinstance(statement, ast.Assign) and len(statement.targets) == 1
@@ -2557,8 +2548,6 @@ def test_d64_causal_common_dq_direct_load_ast_contract():
         and isinstance(statement.targets[0], ast.Name) and statement.targets[0].id == "scores"
         and isinstance(statement.value, ast.Call) and dotted_name(statement.value) == "tlx.amd_register_handoff")
     assert ast.unparse(score_tie.args[0]) == "scores"
-    assert ast.literal_eval(
-        next(keyword.value for keyword in score_tie.keywords if keyword.arg == "registers_per_group")) == 2
     n32_handoff = next(statement for statement in step.body
                        if isinstance(statement, ast.If) and ast.unparse(statement.test) == "BLOCK_N == 32")
     assert not any(
@@ -2572,8 +2561,6 @@ def test_d64_causal_common_dq_direct_load_ast_contract():
         and isinstance(statement.targets[0], ast.Name) and statement.targets[0].id == "ds"
         and isinstance(statement.value, ast.Call) and dotted_name(statement.value) == "tlx.amd_register_handoff")
     assert ast.unparse(ds_handoff.args[0]) == "p * dp"
-    assert ast.literal_eval(
-        next(keyword.value for keyword in ds_handoff.keywords if keyword.arg == "registers_per_group")) == 2
     assert not any(isinstance(node, ast.Call) and dotted_name(node) == "tlx.local_load" for node in ast.walk(step))
     score_scale_guard = next(statement for statement in step.body
                              if isinstance(statement, ast.If) and ast.unparse(statement.test) == "not SCORE_PRE_SCALED")
@@ -2604,8 +2591,6 @@ def test_d64_causal_common_dq_direct_load_ast_contract():
     assert ast.unparse(finish32_handoff.args[0]) == "p * dp"
     assert ast.literal_eval(
         next(keyword.value for keyword in finish32_handoff.keywords if keyword.arg == "register_class")) == "vgpr"
-    assert ast.literal_eval(
-        next(keyword.value for keyword in finish32_handoff.keywords if keyword.arg == "registers_per_group")) == 2
 
     def positional_argument(call, function, name):
         parameter_names = [argument.arg for argument in function.args.args]

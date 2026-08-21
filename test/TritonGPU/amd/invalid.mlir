@@ -363,21 +363,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.thr
   tt.func @register_handoff_requires_complete_native_groups(
       %arg0: tensor<64xf16, #handoff_distributed>) {
     // expected-error @+1 {{requires 1 elements per thread to be divisible by the 2-element native tuple}}
-    %0 = amdg.register_handoff %arg0 class "vgpr" groups 1
+    %0 = amdg.register_handoff %arg0 class "vgpr"
         : tensor<64xf16, #handoff_distributed>
-    tt.return
-  }
-}
-
-// -----
-
-#handoff_distributed = #ttg.blocked<{sizePerThread = [4], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
-module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 64 : i32} {
-  tt.func @register_handoff_rejects_invalid_group_size(
-      %arg0: tensor<256xf32, #handoff_distributed>) {
-    // expected-error @+1 {{registers_per_group must be a power of two between 1 and 32}}
-    %0 = amdg.register_handoff %arg0 class "vgpr" groups 3
-        : tensor<256xf32, #handoff_distributed>
     tt.return
   }
 }

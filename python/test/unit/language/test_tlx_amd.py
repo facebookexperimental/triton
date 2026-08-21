@@ -1086,12 +1086,8 @@ def test_amd_late_address_compute_compiles_gfx950():
 def _amd_register_handoff_kernel(x_ptr, y_ptr, REGISTER_CLASS: tl.constexpr):
     offsets = tl.arange(0, 2048)
     values = tl.load(x_ptr + offsets)
-    singles = tlx.amd_register_handoff(values, register_class=REGISTER_CLASS, registers_per_group=1)
-    grouped0 = tlx.amd_register_handoff(values, register_class=REGISTER_CLASS, registers_per_group=2)
-    grouped1 = tlx.amd_register_handoff(values, register_class=REGISTER_CLASS, registers_per_group=2)
-    wide0 = tlx.amd_register_handoff(values, register_class=REGISTER_CLASS, registers_per_group=4)
-    wide1 = tlx.amd_register_handoff(values, register_class=REGISTER_CLASS, registers_per_group=4)
-    tl.store(y_ptr + offsets, singles + (grouped0 - grouped1) + (wide0 - wide1))
+    values = tlx.amd_register_handoff(values, register_class=REGISTER_CLASS)
+    tl.store(y_ptr + offsets, values)
 
 
 @pytest.mark.parametrize(
@@ -1109,26 +1105,19 @@ def test_amd_register_handoff_compiles_gfx950(register_class, element_type):
         constexprs={"REGISTER_CLASS": register_class},
     )
     ttir = compiled.asm["ttir"]
-    assert ttir.count("amdg.register_handoff") == 5
-    assert f'class "{register_class}" groups 1' in ttir
-    assert ttir.count(f'class "{register_class}" groups 2') == 2
-    assert ttir.count(f'class "{register_class}" groups 4') == 2
+    assert ttir.count("amdg.register_handoff") == 1
+    assert f'class "{register_class}"' in ttir
+    assert "groups" not in ttir
     assert "tt.elementwise_inline_asm" not in ttir
     assert "amdg.register_resident" not in ttir
     llir = compiled.asm["llir"]
     assert "amdg.register_handoff" not in llir
     register_constraint = "a" if register_class == "agpr" else "v"
-    grouped_constraint = f'"={register_constraint},={register_constraint},0,1"'
-    grouped_asm = [line for line in llir.splitlines() if grouped_constraint in line]
-    expected_grouped_asm = 4 if element_type == "fp16" else 8
-    assert len(grouped_asm) == expected_grouped_asm
-    assert all("sideeffect" in line for line in grouped_asm)
-    wide_constraint = (
-        f'"={register_constraint},={register_constraint},={register_constraint},={register_constraint},0,1,2,3"')
-    wide_asm = [line for line in llir.splitlines() if wide_constraint in line]
-    expected_wide_asm = 2 if element_type == "fp16" else 4
-    assert len(wide_asm) == expected_wide_asm
-    assert all("sideeffect" in line for line in wide_asm)
+    constraint = f'"={register_constraint},0"'
+    handoff_asm = [line for line in llir.splitlines() if constraint in line]
+    expected_asm = 4 if element_type == "fp16" else 8
+    assert len(handoff_asm) == expected_asm
+    assert all("sideeffect" in line for line in handoff_asm)
 
 
 @triton.jit
@@ -1136,34 +1125,30 @@ def _invalid_amd_register_handoff_kernel(
     x_ptr,
     y_ptr,
     REGISTER_CLASS: tl.constexpr,
-    REGISTERS_PER_GROUP: tl.constexpr,
 ):
     offsets = tl.arange(0, 1024)
     values = tl.load(x_ptr + offsets)
     values = tlx.amd_register_handoff(
         values,
         register_class=REGISTER_CLASS,
-        registers_per_group=REGISTERS_PER_GROUP,
     )
     tl.store(y_ptr + offsets, values)
 
 
 @pytest.mark.parametrize(
-    ("register_class", "registers_per_group", "element_type", "message"),
+    ("register_class", "element_type", "message"),
     [
-        pytest.param("sgpr", 1, "fp32", 'register_class must be either "agpr" or "vgpr"', id="register-class"),
-        pytest.param("vgpr", 3, "fp32", "registers_per_group must be a power of two", id="group-size"),
-        pytest.param("vgpr", 1, "i8", "value elements must be 16 or 32 bits", id="element-width"),
+        pytest.param("sgpr", "fp32", 'register_class must be either "agpr" or "vgpr"', id="register-class"),
+        pytest.param("vgpr", "i8", "value elements must be 16 or 32 bits", id="element-width"),
     ],
 )
-def test_amd_register_handoff_rejects_invalid_contract(register_class, registers_per_group, element_type, message):
+def test_amd_register_handoff_rejects_invalid_contract(register_class, element_type, message):
     with pytest.raises(CompilationError, match=message):
         compile_for_gfx950(
             _invalid_amd_register_handoff_kernel,
             signature={"x_ptr": f"*{element_type}", "y_ptr": f"*{element_type}"},
             constexprs={
                 "REGISTER_CLASS": register_class,
-                "REGISTERS_PER_GROUP": registers_per_group,
             },
         )
 

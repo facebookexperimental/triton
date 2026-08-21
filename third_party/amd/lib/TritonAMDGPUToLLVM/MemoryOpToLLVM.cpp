@@ -978,74 +978,49 @@ public:
     auto tensorTy = cast<RankedTensorType>(op.getInput().getType());
     Type elemTy = typeConverter->convertType(tensorTy.getElementType());
     unsigned bitWidth = getIntOrFloatOrPtrBitWidth(elemTy);
-    unsigned registersPerGroup = op.getRegistersPerGroup();
     unsigned elementsPerRegister = 32 / bitWidth;
-    unsigned elementsPerGroup = registersPerGroup * elementsPerRegister;
     SmallVector<Value> elements =
         unpackTensorElements(loc, adaptor.getInput(), rewriter, tensorTy);
-    if (elements.empty() || elements.size() % elementsPerGroup != 0)
+    if (elements.empty() || elements.size() % elementsPerRegister != 0)
       return rewriter.notifyMatchFailure(
-          op, "native tuple does not divide the per-thread elements");
+          op, "native register does not divide the per-thread elements");
 
     StringRef outputConstraint = op.getRegisterClass() == "agpr" ? "=a" : "=v";
+    std::string constraints = outputConstraint.str() + ",0";
     auto asmDialect = LLVM::AsmDialectAttr::get(ctx, LLVM::AsmDialect::AD_ATT);
     auto operandAttrs = ArrayAttr::get(ctx, {});
     Type registerTy = elementsPerRegister == 1
                           ? elemTy
                           : Type(vec_ty(elemTy, elementsPerRegister));
-    Type asmResultTy = registerTy;
-    if (registersPerGroup != 1)
-      asmResultTy = LLVM::LLVMStructType::getLiteral(
-          ctx, SmallVector<Type>(registersPerGroup, registerTy));
     TritonLLVMOpBuilder b(loc, rewriter);
     SmallVector<Value> constrainedElements;
     constrainedElements.reserve(elements.size());
 
-    std::string constraints;
-    for (unsigned index = 0; index < registersPerGroup; ++index) {
-      if (!constraints.empty())
-        constraints += ",";
-      constraints += outputConstraint;
-    }
-    for (unsigned index = 0; index < registersPerGroup; ++index)
-      constraints += "," + std::to_string(index);
-
     for (unsigned begin = 0; begin < elements.size();
-         begin += elementsPerGroup) {
-      SmallVector<Value> registerValues;
-      registerValues.reserve(registersPerGroup);
-      for (unsigned reg = 0; reg < registersPerGroup; ++reg) {
-        unsigned elementBegin = begin + reg * elementsPerRegister;
-        if (elementsPerRegister == 1) {
-          registerValues.push_back(elements[elementBegin]);
-          continue;
-        }
-        Value packed = b.undef(registerTy);
+         begin += elementsPerRegister) {
+      Value registerValue = elements[begin];
+      if (elementsPerRegister != 1) {
+        registerValue = b.undef(registerTy);
         for (unsigned index = 0; index < elementsPerRegister; ++index)
-          packed = b.insert_element(registerTy, packed,
-                                    elements[elementBegin + index],
-                                    b.i32_val(index));
-        registerValues.push_back(packed);
+          registerValue =
+              b.insert_element(registerTy, registerValue,
+                               elements[begin + index], b.i32_val(index));
       }
 
       Value asmResult = LLVM::InlineAsmOp::create(
-                            rewriter, loc, asmResultTy, registerValues,
+                            rewriter, loc, registerTy, registerValue,
                             /*asm_string=*/"", constraints,
                             /*has_side_effects=*/true,
                             /*is_align_stack=*/false, LLVM::TailCallKind::None,
                             asmDialect, operandAttrs)
                             .getRes();
-      for (unsigned reg = 0; reg < registersPerGroup; ++reg) {
-        Value constrained =
-            registersPerGroup == 1 ? asmResult : b.extract_val(asmResult, reg);
-        if (elementsPerRegister == 1) {
-          constrainedElements.push_back(constrained);
-          continue;
-        }
-        for (unsigned index = 0; index < elementsPerRegister; ++index)
-          constrainedElements.push_back(
-              b.extract_element(elemTy, constrained, b.i32_val(index)));
+      if (elementsPerRegister == 1) {
+        constrainedElements.push_back(asmResult);
+        continue;
       }
+      for (unsigned index = 0; index < elementsPerRegister; ++index)
+        constrainedElements.push_back(
+            b.extract_element(elemTy, asmResult, b.i32_val(index)));
     }
 
     Value result = packTensorElements(loc, typeConverter, constrainedElements,

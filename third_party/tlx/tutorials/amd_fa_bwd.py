@@ -6274,8 +6274,8 @@ def _attn_bwd_dq_d64_causal_step(
     scores = scores + row_lse_full
     scores = tl.dot(q, kt, acc=scores, out_dtype=tl.float32)
     if BLOCK_N == 64:
-        # End the two-group score-MFMA allocation interval before the exp tail.
-        scores = tlx.amd_register_handoff(scores, register_class="vgpr", registers_per_group=2)
+        # End the score-MFMA allocation interval before the exp tail.
+        scores = tlx.amd_register_handoff(scores, register_class="vgpr")
         scores = tlx.require_layout(scores, mma_mn, pin=False)
 
     # Match the independent MFMA cadence used by the tuned reference: issue
@@ -6314,7 +6314,6 @@ def _attn_bwd_dq_d64_causal_step(
     ds = tlx.amd_register_handoff(
         p * dp,
         register_class="vgpr",
-        registers_per_group=2,
     )
     ds = tlx.require_layout(ds.to(tl.bfloat16), ds_op0_md, pin=False)
     dq = tl.dot(ds, k_nd, acc=dq, out_dtype=tl.float32)
@@ -6379,7 +6378,6 @@ def _attn_bwd_dq_d64_causal_finish32(
     ds = tlx.amd_register_handoff(
         p * dp,
         register_class="vgpr",
-        registers_per_group=2,
     )
     ds = tlx.require_layout(ds.to(tl.bfloat16), ds_op0_md, pin=False)
     dq = tl.dot(ds, k_nd, acc=dq, out_dtype=tl.float32)
@@ -8036,13 +8034,9 @@ def _d64_gqa8_signed_front(
         do_t = tlx.local_load(tlx.local_trans(do_view), token=stage_wait, layout=q_t_op1_nm)
     dp = tl.dot(v_nm, do_t, acc=dp, out_dtype=tl.float32)
     ds = p * dp
-    # Direct D64 keeps each native pair together; split D32 starts independent
-    # intervals so its narrower recurrences retain scheduler flexibility.
-    handoff_group: tl.constexpr = 2 if LATE_DO_T else 1
     ds = tlx.amd_register_handoff(
         ds,
         register_class="vgpr",
-        registers_per_group=handoff_group,
     )
     p_nd = tlx.require_layout(p.to(tl.bfloat16), p_op0_nd, pin=False)
     ds_nd = tlx.require_layout(ds.to(tl.bfloat16), p_op0_nd, pin=False)
@@ -8114,7 +8108,6 @@ def _d64_gqa8_signed_front_loaded_stats(
     ds = tlx.amd_register_handoff(
         p * dp,
         register_class="vgpr",
-        registers_per_group=2,
     )
     p_nd = tlx.require_layout(p.to(tl.bfloat16), p_op0_nd, pin=False)
     ds_nd = tlx.require_layout(ds.to(tl.bfloat16), p_op0_nd, pin=False)

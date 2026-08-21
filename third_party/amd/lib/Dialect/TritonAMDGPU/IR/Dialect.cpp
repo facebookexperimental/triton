@@ -785,7 +785,7 @@ LogicalResult RegisterResidentOp::verify() {
 LogicalResult RegisterHandoffOp::verify() {
   return verifyRegisterAllocationContract(
       getOperation(), getInput().getType(), getRegisterClass(),
-      getRegistersPerGroup(), /*allowUnencoded=*/true);
+      /*registersPerGroup=*/1, /*allowUnencoded=*/true);
 }
 
 LogicalResult MfmaCommitOp::inferReturnTypes(
