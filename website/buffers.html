@@ -4,18 +4,21 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="description" content="Allocate, view, load, store, and share hardware-near buffers.">
-  <title>Local and remote buffers · TLX</title>
-  <link rel="stylesheet" href="assets/tlx.css">
+  <title>Local and remote buffers · FBTriton</title>
+  <link rel="stylesheet" href="assets/tlx.css?v=20260821b">
 </head>
 <body>
   <header class="topbar">
-    <a class="brand" href="../"><span>TLX</span> Triton Low-level Language Extensions</a>
+    <a class="brand" href="../"><span>FB</span>Triton</a>
+    <nav class="topnav" aria-label="Top-level sections"><a href="triton.html">Triton</a>
+<a href="tlx.html" data-current="true">TLX</a>
+<a href="tooling.html">Tooling</a></nav>
     <a class="repo-link" href="https://github.com/facebookexperimental/triton" target="_blank" rel="noreferrer">View on GitHub ↗</a>
   </header>
   <div class="shell">
-    <aside class="sidebar">
-      <p class="eyebrow">Documentation</p>
-      <nav><a href="../">Overview</a>
+<aside class="sidebar">
+      <p class="eyebrow">TLX documentation</p>
+      <nav><a href="tlx.html">Overview</a>
 <a href="getting-started.html">Getting started</a>
 <a href="hardware-support.html">Hardware support</a>
 <a href="buffers.html" aria-current="page">Local and remote buffers</a>
@@ -129,7 +132,7 @@ triton.knobs.runtime.add_stages_inspection_hook = inspect_stages</code></pre>
 
   # Store to remote CTA&#x27;s shared memory (synchronous)
   tlx.remote_shmem_store(buffer[0], src_tensor, remote_cta_rank=1)</code></pre></article>
-      <footer class="pager"><a href="hardware-support.html">← Hardware support</a><a class="next" href="async-memory.html">Async memory access →</a></footer>
+<footer class="pager"><a href="hardware-support.html">← Hardware support</a><a class="next" href="async-memory.html">Async memory access →</a></footer>
     </main>
   </div>
 </body>

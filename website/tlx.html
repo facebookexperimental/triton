@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="What TLX is and when to use it.">
+  <title>TLX · FBTriton</title>
+  <link rel="stylesheet" href="assets/tlx.css?v=20260821b">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="../"><span>FB</span>Triton</a>
+    <nav class="topnav" aria-label="Top-level sections"><a href="triton.html">Triton</a>
+<a href="tlx.html" data-current="true">TLX</a>
+<a href="tooling.html">Tooling</a></nav>
+    <a class="repo-link" href="https://github.com/facebookexperimental/triton" target="_blank" rel="noreferrer">View on GitHub ↗</a>
+  </header>
+  <div class="shell">
+<aside class="sidebar">
+      <p class="eyebrow">TLX documentation</p>
+      <nav><a href="tlx.html" aria-current="page">Overview</a>
+<a href="getting-started.html">Getting started</a>
+<a href="hardware-support.html">Hardware support</a>
+<a href="buffers.html">Local and remote buffers</a>
+<a href="async-memory.html">Async memory access</a>
+<a href="async-compute.html">Async tensor core operations</a>
+<a href="synchronization.html">Barriers and Cluster Launch Control</a>
+<a href="warp-specialization.html">Warp specialization and clustering</a>
+<a href="utilities.html">Other operations</a>
+<a href="performance-optimization.html">Performance optimization</a>
+<a href="debugging.html">Debugging performance and numerics</a>
+<a href="kernels.html">Example kernels</a>
+<a href="production-case-studies.html">Production case studies</a>
+<a href="install-and-test.html">Build, install, and test</a>
+<a href="resources.html">More reading</a></nav>
+    </aside>
+    <main>
+      <p class="eyebrow">TLX documentation</p>
+      <h1>TLX</h1>
+      <p class="lede">What TLX is and when to use it.</p>
+      <article><h2 id="introduction">Introduction</h2>
+<p>TLX (Triton Low-level Language Extensions) is a low-level, warp-aware, hardware-near extension of the Triton DSL. It offers intrinsics and warp-specialized operations for fine-grained GPU control, hardware-oriented primitives for advanced kernel development, and explicit constructs for GPU memory, computation, and asynchronous control flow. TLX is designed for expert users pushing Triton closer to the metal.</p>
+<p>TLX targets NVIDIA and AMD GPUs and supports:</p>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div>Hardware-specific intrinsics (e.g., wgmma, async_copy, barrier)</div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div>Shared and local memory allocation</div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div>Instruction-level scheduling and control</div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div>Cross-warpgroup synchronization</div></div>
+<p>While this approach places more responsibility on the user, it reduces the compiler's role as a performance bottleneck. Although it may introduce divergence across hardware platforms, it empowers users to perform deeper, architecture-specific optimizations without relying solely on compiler heuristics.</p>
+<h2 id="architecture-the-mimw-programming-model">Architecture: the MIMW programming model</h2>
+<p>TLX uses a <strong>Multiple Instructions, Multiple Warps (MIMW)</strong> model. A warp group is an explicit execution agent: one group can move data, another can issue tensor-core work, and another can run an epilogue. The groups communicate through shared or tensor memory and synchronize with hardware barriers.</p>
+<p>This fills the gap between CUDA's thread-level SIMT model and Triton's program-level blocked model. Regular tensor expressions still look like Triton; orchestration becomes explicit only where hardware-aware control matters.</p>
+<table><thead><tr><th>Layer</th><th>Primary unit</th><th>Best fit</th></tr></thead><tbody><tr><td>CUDA / PTX</td><td>Thread and warp</td><td>Maximum control, with manual scheduling and synchronization</td></tr><tr><td>Triton</td><td>Program instance / block</td><td>Productive blocked tensor programs and compiler-managed layouts</td></tr><tr><td>TLX</td><td>Cooperating warp groups</td><td>Explicit pipelines, async engines, tensor memory, and cluster execution</td></tr></tbody></table>
+<h3 id="orchestration-surfaces">Orchestration surfaces</h3>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><strong>Warp groups:</strong> <code>tlx.async_tasks()</code> and <code>tlx.async_task()</code> define producer, consumer, and epilogue roles.</div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><strong>Synchronization:</strong> mbarriers express phase-based dependencies between warp groups and asynchronous engines.</div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><strong>Memory:</strong> local buffers, TMA-style descriptor operations, and Blackwell tensor memory keep data close to compute.</div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><strong>Clusters:</strong> CTA rank, cluster barriers, and remote shared-memory operations enable multi-CTA cooperation.</div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><strong>Scheduling:</strong> Cluster Launch Control supports hardware-assisted persistent work distribution on Blackwell.</div></div>
+<h3 id="why-this-level-of-abstraction">Why this level of abstraction?</h3>
+<p>Modern GPUs increasingly depend on features that sit between individual threads and whole thread blocks: warp specialization, asynchronous data movement, tensor-memory accumulators, and clustered execution. TLX exposes those features without requiring a kernel to be written directly in CUDA or PTX, while keeping layouts compiler-inferred unless an expert needs to override them.</p>
+<h2 id="nightly-builds-fbtriton">Nightly builds (fbtriton)</h2>
+<p>Nightly <code>.dev</code> wheels are published to a self-managed index (not PyPI):</p>
+<p>pip install --pre fbtriton \ --index-url https://facebookexperimental.github.io/triton/nightly/simple/</p>
+<p>Each nightly is built from the newest <code>main</code> commit whose GPU/CI checks are all green. <code>triton.__version__</code> reports <code>3.8.0.dev&lt;YYYYMMDD&gt;+fb.git&lt;hash&gt;</code>. Nightlies are retained for ~30 days. Formal releases remain on PyPI (<code>pip install fbtriton</code>).</p>
+<h2 id="gluon-support">Gluon support</h2>
+<p><a href="https://github.com/triton-lang/triton/tree/main/python/triton/experimental/gluon" target="_blank" rel="noreferrer">Gluon</a> (<code>python/triton/experimental/gluon/</code>) is <strong>upstream-synced and not a first-class DSL</strong> here (TLX is the focus) — do Gluon feature/bug work upstream, not in this fork. But since fbtriton is a secondary Triton, we run <strong>fundamental Gluon CI</strong> so we don't silently break it.</p>
+<p><strong>CI:</strong> the <code>b200-gluon-test</code> / <code>mi350-gluon-test</code> jobs run <code>pytest python/test/gluon/</code> (every <code>test_*.py</code>). It is <strong>green</strong>: ~200 passed, ~1600 skipped, 0 failed. The real signal is the compile-only, target-agnostic frontend suite (<code>test_frontend.py</code>, one run covers NVIDIA + AMD codegen via mock <code>GPUTarget</code>); the version-skewed cases below are skipped via <code>python/test/gluon/conftest.py</code> rather than failing the job.</p>
+<p><strong>Fork-side fixes</strong> (Gluon frontend itself unmodified): <code>core.py</code> reduce <code>reduction_ordering</code> compat, <code>semantic.py</code> <code>dot()</code> <code>allow_tf32</code> default, a <code>test_core.py</code> collection fix (a bad cherry-pick left an <code>IndentationError</code>), and regenerated <code>test_frontend.py</code> goldens (upstream-synced — overwritten on next sync).</p>
+<p><strong>Skipped, needs upstream Gluon re-sync — TODO(gluon-ci):</strong> the GPU-execution suites (<code>test_core</code>, <code>test_lowerings</code>, <code>test_consan</code>, <code>test_fpsan</code>, one kernel in <code>test_layout_format_view</code>) were synced from much newer upstream (e.g. <code>test_fpsan.py</code> via bundle #1956) than the pinned Gluon frontend (<code>_semantic.py</code> ~2026-06-29). They require Gluon behavior the frontend doesn't have yet — raw pointer <code>gl.load</code>/<code>gl.store</code> inferring a *distributed* layout — so they fail wholesale with <code>expected ... distributed_type but got block_type</code>. The fix is to sync the Gluon frontend forward (upstream cherry-pick / re-sync), not a local patch. Also skipped: ~9 frontend per-target golden tests (single inline golden can't match every parametrized target) and the <code>create_lds_barrier_wait</code> pybind mismatch. <code>conftest.py</code> lists these; remove/trim it after the re-sync.</p></article>
+<footer class="pager"><a class="next" href="getting-started.html">Getting started →</a></footer>
+    </main>
+  </div>
+</body>
+</html>
