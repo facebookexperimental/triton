@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Compiler-managed performance portability and automatic warp specialization.">
+  <title>Triton · FBTriton</title>
+  <link rel="stylesheet" href="assets/tlx.css?v=20260821b">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="../"><span>FB</span>Triton</a>
+    <nav class="topnav" aria-label="Top-level sections"><a href="triton.html" data-current="true">Triton</a>
+<a href="tlx.html">TLX</a>
+<a href="tooling.html">Tooling</a></nav>
+    <a class="repo-link" href="https://github.com/facebookexperimental/triton" target="_blank" rel="noreferrer">View on GitHub ↗</a>
+  </header>
+  <div class="shell">
+<aside class="sidebar">
+      <p class="eyebrow">Triton documentation</p>
+      <nav><a href="triton.html" aria-current="page">Overview</a>
+<a href="#automatic-warp-specialization">Automatic warp specialization</a>
+<a href="#the-compiler-pipeline-today">Compiler pipeline</a>
+<a href="#tlx-and-autows">TLX and AutoWS</a>
+<a href="#roadmap">Roadmap</a>
+<a href="#read-the-design-article">Design article</a></nav>
+    </aside>
+    <main>
+      <p class="eyebrow">Triton compiler</p>
+      <h1>Triton</h1>
+      <p class="lede">Compiler-managed performance portability and automatic warp specialization.</p>
+      <article><p>Triton is a compiler and language for writing performance-portable AI kernels with a productive blocked programming model. This FBTriton repository is Meta's development branch, where compiler-managed features such as automatic warp specialization are developed alongside lower-level TLX kernels that provide an expert-written performance reference.</p>
+<p>The central goal is to keep ordinary Triton kernels productive while allowing the compiler to discover schedules that use modern GPU pipelines efficiently.</p>
+<h2 id="automatic-warp-specialization">Automatic warp specialization</h2>
+<p>Warp specialization assigns different groups of warps to different roles inside one kernel. A data partition can issue asynchronous loads, compute partitions can drive tensor cores, and epilogue or correction partitions can run concurrently when dependencies allow.</p>
+<p>Specialization helps by:</p>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div>Reducing control-flow divergence between unrelated roles.</div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div>Hiding memory and instruction latency through concurrent execution.</div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div>Keeping independent hardware units busy at the same time.</div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div>Allowing different tasks to receive different register and scheduling resources.</div></div>
+<p>Triton's AutoWS pipeline makes these decisions at JIT compilation time rather than requiring every partition and barrier to be handwritten.</p>
+<h2 id="the-compiler-pipeline-today">The compiler pipeline today</h2>
+<p>The current design separates decision-making passes from the transformations that materialize those decisions:</p>
+<table><thead><tr><th>Stage</th><th>Responsibility</th></tr></thead><tbody><tr><td>Data partitioning</td><td>Expose independent GEMMs or operation chains that can execute concurrently</td></tr><tr><td>Loop scheduler</td><td>Build a software-pipeline schedule and attach scheduling decisions to the IR</td></tr><tr><td>Partition scheduler</td><td>Assign operations to data, compute, correction, reduction, or epilogue warp partitions</td></tr><tr><td>Buffer creation</td><td>Identify cross-partition values and choose SMEM or TMEM communication buffers</td></tr><tr><td>Memory planner</td><td>Choose buffer depth and reuse based on liveness, dependencies, and hardware limits</td></tr><tr><td>Code partitioner</td><td>Create channels, barriers, buffer rotation, and physically outlined warp-group regions</td></tr></tbody></table>
+<h3 id="partition-scheduling">Partition scheduling</h3>
+<p>The partition scheduler propagates task decisions as operation attributes. Current strategies recognize roles such as TMA data movement, tensor-core computation, softmax correction, reductions, and epilogue stores. Once operations are assigned, cross-partition SSA dependencies become explicit communication channels.</p>
+<h3 id="software-pipelining">Software pipelining</h3>
+<p>The loop scheduler reorders independent chains from adjacent iterations to maximize producer-consumer distance. In attention, for example, a dot product from one iteration can overlap softmax and value accumulation from another. Data partitioning gives the scheduler more independent work to interleave.</p>
+<h3 id="channels-and-memory-planning">Channels and memory planning</h3>
+<p>A channel represents both the storage and synchronization needed to move a value between partitions. The memory planner decides:</p>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div>Whether the channel belongs in shared memory or Blackwell tensor memory.</div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div>How many cyclic buffer copies are required to cover pipeline distance.</div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div>Which buffers can safely reuse storage when live ranges do not overlap.</div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div>How to stay within register, SMEM, and TMEM capacity.</div></div>
+<h3 id="code-partitioning">Code partitioning</h3>
+<p>The code partitioner turns abstract channels into executable regions. It derives rotating buffer indices and barrier phases from loop iteration counts, reuses hardware completion barriers where possible, and performs local instruction ordering to reduce live ranges and register pressure.</p>
+<h2 id="tlx-and-autows">TLX and AutoWS</h2>
+<p>TLX and AutoWS solve related problems at different levels:</p>
+<table><thead><tr><th>TLX</th><th>Triton AutoWS</th></tr></thead><tbody><tr><td>Kernel author explicitly defines warp-group tasks and synchronization</td><td>Compiler derives partitions, communication, and synchronization from Triton IR</td></tr><tr><td>Best for expert control, new hardware mechanisms, and hand-tuned reference kernels</td><td>Best for applying warp specialization broadly without rewriting kernels in a lower-level DSL</td></tr><tr><td>Exposes the intended pipeline directly in Python</td><td>Keeps the source close to ordinary Triton and specializes during compilation</td></tr></tbody></table>
+<p>The <a href="tlx.html">TLX documentation</a> covers the explicit programming model used to validate and refine many of these compiler strategies.</p>
+<h2 id="roadmap">Roadmap</h2>
+<h3 id="profile-guided-partition-scheduling">Profile-guided partition scheduling</h3>
+<p>Near-term work uses measured operation and region costs to rank partition choices. Communication overhead between partitions must be weighed against the concurrency gained by separating them.</p>
+<h3 id="model-based-global-optimization">Model-based global optimization</h3>
+<p>Scheduling, partitioning, synchronization, layouts, and memory planning form a joint combinatorial search problem. The roadmap calls for hardware cost models—specified statically or learned from profiling—to guide a global planner that can choose software-pipeline schedules, channel depths, buffer reuse, partitions, and memory placement together.</p>
+<h3 id="kernel-fusion-and-megakernels">Kernel fusion and megakernels</h3>
+<p>IR-level fusion could combine handwritten and generated Triton kernels at tile granularity. The long-term goal is to optimize dependent and independent kernels together, reducing launch overhead and global-memory traffic while retaining provable correctness for algorithmic transformations.</p>
+<h3 id="broader-kernel-and-hardware-coverage">Broader kernel and hardware coverage</h3>
+<p>Current AutoWS focuses on Hopper and Blackwell. Continued work aims to generalize beyond attention-style independent dot chains, reduce target-specific heuristics, and make measured hardware models the main ingredient needed to support new architectures.</p>
+<h2 id="read-the-design-article">Read the design article</h2>
+<p>This page is a condensed guide to the published design. See <a href="https://pytorch.org/blog/warp-specialization-in-triton-design-and-roadmap/" target="_blank" rel="noreferrer">Warp Specialization in Triton: Design and Roadmap</a> for the full discussion.</p></article>
+<footer class="pager"><a class="next" href="tlx.html">TLX →</a></footer>
+    </main>
+  </div>
+</body>
+</html>

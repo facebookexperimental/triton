@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Structure pipelines, buffers, fusion, and scheduling for high utilization.">
+  <title>Performance optimization · FBTriton</title>
+  <link rel="stylesheet" href="assets/tlx.css?v=20260821b">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="../"><span>FB</span>Triton</a>
+    <nav class="topnav" aria-label="Top-level sections"><a href="triton.html">Triton</a>
+<a href="tlx.html" data-current="true">TLX</a>
+<a href="tooling.html">Tooling</a></nav>
+    <a class="repo-link" href="https://github.com/facebookexperimental/triton" target="_blank" rel="noreferrer">View on GitHub ↗</a>
+  </header>
+  <div class="shell">
+<aside class="sidebar">
+      <p class="eyebrow">TLX documentation</p>
+      <nav><a href="tlx.html">Overview</a>
+<a href="getting-started.html">Getting started</a>
+<a href="hardware-support.html">Hardware support</a>
+<a href="buffers.html">Local and remote buffers</a>
+<a href="async-memory.html">Async memory access</a>
+<a href="async-compute.html">Async tensor core operations</a>
+<a href="synchronization.html">Barriers and Cluster Launch Control</a>
+<a href="warp-specialization.html">Warp specialization and clustering</a>
+<a href="utilities.html">Other operations</a>
+<a href="performance-optimization.html" aria-current="page">Performance optimization</a>
+<a href="debugging.html">Debugging performance and numerics</a>
+<a href="kernels.html">Example kernels</a>
+<a href="production-case-studies.html">Production case studies</a>
+<a href="install-and-test.html">Build, install, and test</a>
+<a href="resources.html">More reading</a></nav>
+    </aside>
+    <main>
+      <p class="eyebrow">TLX documentation</p>
+      <h1>Performance optimization</h1>
+      <p class="lede">Structure pipelines, buffers, fusion, and scheduling for high utilization.</p>
+      <article><p>Correctness comes first. Once a kernel is stable, TLX performance work is mainly about overlapping independent engines, keeping operands on chip, and assigning enough work to each warp group to hide latency without exhausting registers or shared memory.</p>
+<h2 id="warp-specialized-producer-consumer-pipelines">Warp-specialized producer/consumer pipelines</h2>
+<p>The highest-leverage transformation is to separate memory movement from tensor-core execution. A producer group fills local buffers while a consumer group computes on a previous stage.</p>
+<pre><code class="language-python">with tlx.async_tasks():
+    with tlx.async_task(&quot;default&quot;):
+        for k in range(K_TILES):
+            slot = k % NUM_STAGES
+            tlx.barrier_expect_bytes(load_bars[slot], TILE_BYTES)
+            tlx.async_descriptor_load(a_desc, a_smem[slot], offsets, load_bars[slot])
+
+    with tlx.async_task(num_warps=1):
+        for k in range(K_TILES):
+            slot = k % NUM_STAGES
+            tlx.barrier_wait(load_bars[slot], phase)
+            acc = tlx.async_dot(a_smem[slot], b_smem[slot], acc)</code></pre>
+<p>Balance the groups: an under-provisioned producer starves compute, while too many producer warps reduce occupancy and register budget for the consumer.</p>
+<h2 id="multi-stage-buffering">Multi-stage buffering</h2>
+<p>Double or triple buffering lets one stage compute while another loads. The useful depth depends on load latency, tile size, shared-memory capacity, and the number of in-flight operations supported by the target.</p>
+<pre><code class="language-python">buffers = tlx.local_alloc((BLOCK_M, BLOCK_K), dtype, NUM_STAGES)
+slot = iteration % NUM_STAGES
+tile = tlx.local_view(buffers, slot)</code></pre>
+<p>More stages are not automatically better: they consume shared memory and may reduce occupancy. Tune stage count together with tile size and warp allocation.</p>
+<h2 id="fusion-and-layout-management">Fusion and layout management</h2>
+<p>Fuse operations when an intermediate would otherwise round-trip through global memory. TLX normally infers local layouts from consumers, so a fused pipeline can combine attention, normalization, activation, or projection stages without manually reconciling every layout.</p>
+<p>Use explicit layouts only when measurement shows that inference cannot express the required hardware mapping or avoid a bank conflict.</p>
+<h2 id="persistent-scheduling">Persistent scheduling</h2>
+<p>Persistent kernels amortize launch and scheduling overhead by keeping CTAs resident and acquiring multiple work tiles. Blackwell CLC provides hardware-assisted work acquisition; other targets can use software tile schedulers.</p>
+<p>Persistence is most useful for short or irregular work where launch overhead and load imbalance are visible. It can hurt when a large regular grid already saturates the GPU.</p>
+<h2 id="amd-warp-pipelining">AMD warp pipelining</h2>
+<p>On gfx950, explicit warp-pipeline stages guide instruction arbitration between memory-heavy and MFMA-heavy work:</p>
+<pre><code class="language-python">for tile in tl.range(0, K_ITERS):
+    with tlx.warp_pipeline_stage(&quot;mfma&quot;, priority=0):
+        acc = tl.dot(a_tile, b_tile, acc)
+
+    with tlx.warp_pipeline_stage(&quot;memory&quot;, priority=1):
+        token = tlx.async_load(ptrs, next_buffer)
+        tlx.async_load_commit_group([token])</code></pre>
+<p>The marker does not create a correct pipeline by itself. Buffer rotation, waits, and producer/consumer ownership must already be valid.</p>
+<h2 id="autotuning-dimensions">Autotuning dimensions</h2>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>BLOCK_M</code>, <code>BLOCK_N</code>, and <code>BLOCK_K</code>: work and reuse per CTA.</div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>NUM_STAGES</code>: latency hiding versus shared-memory footprint.</div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>num_warps</code>: execution resources assigned to the default task.</div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>num_warps</code> and <code>num_regs</code> on async tasks: per-role resource allocation.</div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>ctas_per_cga</code>: cluster geometry for cooperative kernels.</div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div>Target-specific layouts and instruction shapes.</div></div>
+<h2 id="optimization-checklist">Optimization checklist</h2>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div>Profile before changing the schedule; classify compute, memory, or latency limits.</div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div>Confirm tensor-core instructions are selected for the intended shapes and dtypes.</div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div>Check occupancy, register spills, shared-memory use, and barrier stalls together.</div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div>Tune one structural choice at a time and retain a correctness reference for every configuration.</div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div>Re-measure full workloads: a faster kernel can still lose end-to-end through launch count, synchronization, or fusion boundaries.</div></div>
+<p>Reported end-to-end examples are summarized in <a href="production-case-studies.html">Production case studies</a>.</p></article>
+<footer class="pager"><a href="utilities.html">← Other operations</a><a class="next" href="debugging.html">Debugging performance and numerics →</a></footer>
+    </main>
+  </div>
+</body>
+</html>
