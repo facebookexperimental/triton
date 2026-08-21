@@ -4,25 +4,33 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="description" content="Build TLX and run its correctness and performance scripts.">
-  <title>Build, install, and test · TLX</title>
-  <link rel="stylesheet" href="assets/tlx.css">
+  <title>Build, install, and test · FBTriton</title>
+  <link rel="stylesheet" href="assets/tlx.css?v=20260821b">
 </head>
 <body>
   <header class="topbar">
-    <a class="brand" href="../"><span>TLX</span> Triton Low-level Language Extensions</a>
+    <a class="brand" href="../"><span>FB</span>Triton</a>
+    <nav class="topnav" aria-label="Top-level sections"><a href="triton.html">Triton</a>
+<a href="tlx.html" data-current="true">TLX</a>
+<a href="tooling.html">Tooling</a></nav>
     <a class="repo-link" href="https://github.com/facebookexperimental/triton" target="_blank" rel="noreferrer">View on GitHub ↗</a>
   </header>
   <div class="shell">
-    <aside class="sidebar">
-      <p class="eyebrow">Documentation</p>
-      <nav><a href="../">Overview</a>
+<aside class="sidebar">
+      <p class="eyebrow">TLX documentation</p>
+      <nav><a href="tlx.html">Overview</a>
+<a href="getting-started.html">Getting started</a>
+<a href="hardware-support.html">Hardware support</a>
 <a href="buffers.html">Local and remote buffers</a>
 <a href="async-memory.html">Async memory access</a>
 <a href="async-compute.html">Async tensor core operations</a>
 <a href="synchronization.html">Barriers and Cluster Launch Control</a>
 <a href="warp-specialization.html">Warp specialization and clustering</a>
 <a href="utilities.html">Other operations</a>
+<a href="performance-optimization.html">Performance optimization</a>
+<a href="debugging.html">Debugging performance and numerics</a>
 <a href="kernels.html">Example kernels</a>
+<a href="production-case-studies.html">Production case studies</a>
 <a href="install-and-test.html" aria-current="page">Build, install, and test</a>
 <a href="resources.html">More reading</a></nav>
     </aside>
@@ -65,7 +73,7 @@ pip install -e .</code></pre>
 <div class="list-item depth-0"><span aria-hidden="true">•</span><div><strong><code>mi350-meta-triton-test</code></strong> — TritonBench performance coverage (the AMD perf</div></div>
 <p>scripts above are for local runs; perf-regression tracking lives in TritonBench).</p>
 <p>Both run on push, PR, and the nightly schedule; nightly failures are filed as issues via <code>report-nightly-failure.yml</code>.</p></article>
-      <footer class="pager"><a href="kernels.html">← Example kernels</a><a class="next" href="resources.html">More reading →</a></footer>
+<footer class="pager"><a href="production-case-studies.html">← Production case studies</a><a class="next" href="resources.html">More reading →</a></footer>
     </main>
   </div>
 </body>

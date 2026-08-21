@@ -433,6 +433,16 @@ static LogicalResult finalizeUserLayouts(ModuleOp moduleOp) {
       cst.setValueAttr(dense.reshape(resultType));
   });
 
+  SmallVector<ttg::ConvertLayoutOp> identityConversions;
+  moduleOp.walk([&](ttg::ConvertLayoutOp convert) {
+    if (convert.getSrc().getType() == convert.getType())
+      identityConversions.push_back(convert);
+  });
+  for (ttg::ConvertLayoutOp convert : identityConversions) {
+    convert.getResult().replaceAllUsesWith(convert.getSrc());
+    convert.erase();
+  }
+
   bool residual = false;
   moduleOp.walk([&](Operation *op) {
     for (Type type : op->getResultTypes())

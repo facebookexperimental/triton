@@ -607,6 +607,12 @@ LogicalResult BufferRegionAnalysis::visitOperation(
           view.affineCTAOffset ^ relativeOffset.ctaOffset));
     return propagateRegions(regionInfo);
   }
+  if (isa<ttg::MemDescDynamicSubsliceOp>(op)) {
+    // The runtime offset prevents selecting one exact affine region.  Keep
+    // the source allocation's regions so alias and membar analyses remain
+    // conservative without degrading every shared-memory access to unknown.
+    return propagateRegions(operands[0]->getValue());
+  }
   if (auto tmemSubsliceOp = dyn_cast<ttng::TMEMSubSliceOp>(op)) {
     const RegionInfo &in = operands[0]->getValue();
     if (in.isUnknown())

@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="See how TLX has been applied to large-scale training and inference workloads.">
+  <title>Production case studies · FBTriton</title>
+  <link rel="stylesheet" href="assets/tlx.css?v=20260821b">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="../"><span>FB</span>Triton</a>
+    <nav class="topnav" aria-label="Top-level sections"><a href="triton.html">Triton</a>
+<a href="tlx.html" data-current="true">TLX</a>
+<a href="tooling.html">Tooling</a></nav>
+    <a class="repo-link" href="https://github.com/facebookexperimental/triton" target="_blank" rel="noreferrer">View on GitHub ↗</a>
+  </header>
+  <div class="shell">
+<aside class="sidebar">
+      <p class="eyebrow">TLX documentation</p>
+      <nav><a href="tlx.html">Overview</a>
+<a href="getting-started.html">Getting started</a>
+<a href="hardware-support.html">Hardware support</a>
+<a href="buffers.html">Local and remote buffers</a>
+<a href="async-memory.html">Async memory access</a>
+<a href="async-compute.html">Async tensor core operations</a>
+<a href="synchronization.html">Barriers and Cluster Launch Control</a>
+<a href="warp-specialization.html">Warp specialization and clustering</a>
+<a href="utilities.html">Other operations</a>
+<a href="performance-optimization.html">Performance optimization</a>
+<a href="debugging.html">Debugging performance and numerics</a>
+<a href="kernels.html">Example kernels</a>
+<a href="production-case-studies.html" aria-current="page">Production case studies</a>
+<a href="install-and-test.html">Build, install, and test</a>
+<a href="resources.html">More reading</a></nav>
+    </aside>
+    <main>
+      <p class="eyebrow">TLX documentation</p>
+      <h1>Production case studies</h1>
+      <p class="lede">See how TLX has been applied to large-scale training and inference workloads.</p>
+      <article><p>These reported deployments illustrate where TLX's explicit scheduling model has mattered beyond an isolated microbenchmark.</p>
+<h2 id="gem-model-training-on-blackwell">GEM model training on Blackwell</h2>
+<p>Recommendation-system foundation models combine smaller matrix shapes, frequent normalization, and heterogeneous modules that make dense hardware utilization difficult.</p>
+<p>Reported results on B200 include:</p>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div>Dense model FLOP utilization increasing from 17.5% to 37.5%, with a 1.6× improvement over the H100 generation.</div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div>More than ten TLX kernels covering grouped or jagged attention, rotary embedding, group index selection, and normalization.</div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div>More than 20% end-to-end QPS improvement while remaining numerically equivalent for the deployment target.</div></div>
+<p>The practical lesson was not just peak throughput: the team could express hardware-aware kernels in roughly 2.6K lines where an equivalent deeply templated implementation could exceed 10K lines, preserving iteration speed during model development.</p>
+<h2 id="in-kernel-broadcast-optimization-on-hopper">In-kernel broadcast optimization on Hopper</h2>
+<p>RecSys inference can replicate user features across many candidates, wasting memory bandwidth and launch overhead. The IKBO implementation fused broadcast, compression, and attention work into persistent warp-specialized kernels.</p>
+<p>Reported highlights include:</p>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div>A 4× speedup for the linear-compression component.</div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div>621 BF16 TFLOP/s for the Flash Attention component, 2.4× over its baseline.</div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div>Up to 70% latency reduction for the optimized inference path.</div></div>
+<p>Producer and consumer warp groups use ping-pong buffers so memory movement, tensor-core work, and epilogue processing remain overlapped inside one resident kernel.</p>
+<h2 id="distributed-grouped-gemm-for-llm-training">Distributed grouped GEMM for LLM training</h2>
+<p>Expert-parallel mixture-of-experts layers need grouped matrix multiplication while tokens and weights move across nodes. A TLX implementation integrates computation and communication to reduce exposed end-to-end latency.</p>
+<p>The kernel has been reported running continuously across more than 56K GB200 GPUs for large-scale LLM pretraining. The central benefit is operational: a Python-level kernel remains inspectable and tunable while still exposing the cluster, memory, and warp-group controls required at that scale.</p>
+<h2 id="what-transfers-to-other-workloads">What transfers to other workloads</h2>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div>Optimize the full pipeline rather than one operator in isolation.</div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div>Fuse when intermediate global-memory traffic or launch overhead dominates.</div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div>Use persistent scheduling for irregular or short tiles, not as a default for every grid.</div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div>Preserve a high-level numerical reference and production-shaped benchmark throughout development.</div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div>Prefer the smallest amount of hardware-specific control that closes the measured performance gap.</div></div></article>
+<footer class="pager"><a href="kernels.html">← Example kernels</a><a class="next" href="install-and-test.html">Build, install, and test →</a></footer>
+    </main>
+  </div>
+</body>
+</html>
