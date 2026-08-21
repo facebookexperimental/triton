@@ -788,6 +788,182 @@ DenseMap<Operation *, DictionaryAttr> buildTMemLoadConstraints(Block &block) {
   return memOpConstraints;
 }
 
+// Prefer materializing a TMEM operand before an independent SMEM operand when
+// both feed the same pure operation.  Code partitioning places each channel
+// consumer immediately before its first use, which can otherwise leave the
+// SMEM load/broadcast live across the TMEM load.  Delay the complete SMEM
+// consumer channel until the TMEM channel has completed.  Both the wait and
+// release are allowed to cross the intervening channel only when the WS
+// ordered-region metadata proves that reordering safe.
+//
+// This does not shorten a live range on its own; it swaps which of the two
+// values is live across the other's channel.  It pays off when the SMEM value
+// is the cheaper one to hold, which is the shape this was written for (a
+// narrow scalar broadcast against a wide TMEM tile).  The selection below is
+// purely structural and does not compare the two footprints or chain lengths,
+// so a wide SMEM operand or a long SMEM consumer chain can raise peak
+// register pressure instead of lowering it.  Adding a width or length guard
+// needs a policy decision and ideally evidence that the adverse shape occurs
+// in practice; until then the qualifying conditions are the structural ones
+// only, and this comment states the intent rather than an enforced invariant.
+bool prioritizeTMemOperand(Block &block) {
+  bool changed = false;
+  SmallVector<TMEMLoadOp> tmemLoads;
+  for (Operation &op : block)
+    if (auto load = dyn_cast<TMEMLoadOp>(&op))
+      tmemLoads.push_back(load);
+
+  // Positional adjacency is not enough to conclude that the wait before the
+  // local_load and the arrive after it belong to that load's channel: an
+  // unrelated channel's barrier can sit in either slot. Reuse the pass's own
+  // barrier-to-memory-op mapping so only barriers that actually guard this
+  // load are moved with it.
+  DenseMap<Operation *, Operation *> barrierMap =
+      buildBarrierToMemoryOpMap(block);
+
+  for (TMEMLoadOp tmemLoad : tmemLoads) {
+    Value tmemValue = tmemLoad.getResult();
+    Operation *commonUser = nullptr;
+    while (tmemValue.hasOneUse()) {
+      Operation *user = *tmemValue.user_begin();
+      if (!isPure(user))
+        break;
+      if (user->getNumOperands() != 1 || user->getNumResults() != 1) {
+        commonUser = user;
+        break;
+      }
+      tmemValue = user->getResult(0);
+    }
+    if (!commonUser || !isPure(commonUser) || commonUser->getBlock() != &block)
+      continue;
+
+    for (Value operand : commonUser->getOperands()) {
+      if (operand == tmemValue)
+        continue;
+
+      SmallVector<Operation *> reverseChain;
+      Value current = operand;
+      ttg::LocalLoadOp localLoad;
+      while (Operation *def = current.getDefiningOp()) {
+        if (def->getBlock() != &block || !def->hasOneUse())
+          break;
+        if (auto load = dyn_cast<ttg::LocalLoadOp>(def)) {
+          localLoad = load;
+          break;
+        }
+        if (!isPure(def) || def->getNumOperands() != 1 ||
+            def->getNumResults() != 1)
+          break;
+        reverseChain.push_back(def);
+        current = def->getOperand(0);
+      }
+      if (!localLoad || !localLoad->isBeforeInBlock(tmemLoad))
+        continue;
+
+      auto acquire = dyn_cast_or_null<WaitBarrierOp>(localLoad->getPrevNode());
+      if (!acquire || !hasWSBarrierConstraints(acquire.getConstraints()))
+        continue;
+      if (barrierMap.lookup(acquire) != localLoad.getOperation())
+        continue;
+      SmallVector<Operation *> acquirePrefix;
+      llvm::SmallPtrSet<Operation *, 8> movingOps{acquire, localLoad};
+      for (Operation *op = acquire->getPrevNode(); op && isPure(op);
+           op = op->getPrevNode()) {
+        bool usedOnlyByMovingOps =
+            llvm::all_of(op->getUsers(), [&](Operation *user) {
+              return movingOps.contains(user);
+            });
+        if (!usedOnlyByMovingOps)
+          break;
+        acquirePrefix.push_back(op);
+        movingOps.insert(op);
+      }
+
+      // Every pure op between the load and the arrive must move too: it is
+      // defined after the load, so leaving one behind while the load moves
+      // forward would break dominance. A user that stays put and precedes
+      // `commonUser` would end up before its definition, so bail out instead
+      // of collecting such an op. Users at or after `commonUser` are fine,
+      // since that is where the group is reinserted.
+      SmallVector<Operation *> releasePrefix;
+      Operation *releaseCandidate = localLoad->getNextNode();
+      bool releasePrefixMovable = true;
+      while (releaseCandidate && isPure(releaseCandidate)) {
+        for (Operation *user : releaseCandidate->getUsers()) {
+          if (movingOps.contains(user) || user == commonUser)
+            continue;
+          if (user->getBlock() == &block && !user->isBeforeInBlock(commonUser))
+            continue;
+          releasePrefixMovable = false;
+          break;
+        }
+        if (!releasePrefixMovable)
+          break;
+        releasePrefix.push_back(releaseCandidate);
+        movingOps.insert(releaseCandidate);
+        releaseCandidate = releaseCandidate->getNextNode();
+      }
+      if (!releasePrefixMovable)
+        continue;
+      auto release = dyn_cast_or_null<ArriveBarrierOp>(releaseCandidate);
+      if (!release || !hasWSBarrierConstraints(release.getConstraints()))
+        continue;
+      if (barrierMap.lookup(release) != localLoad.getOperation())
+        continue;
+
+      // Both the acquire and the release move forward past every intervening
+      // op, so each direction needs its own rule.
+      bool safe = true;
+      for (Operation *op = release->getNextNode(); op && op != commonUser;
+           op = op->getNextNode()) {
+        if (auto arrive = dyn_cast<ArriveBarrierOp>(op)) {
+          // The acquire is a wait that ends up after this arrive.
+          if (!hasWSBarrierConstraints(arrive.getConstraints()) ||
+              !canAdvanceWSBarrierArrivePastWait(arrive.getConstraints(),
+                                                 acquire.getConstraints())) {
+            safe = false;
+            break;
+          }
+          continue;
+        }
+        if (auto wait = dyn_cast<WaitBarrierOp>(op)) {
+          // The release is an arrive that ends up after this wait. Delaying
+          // an arrive past a wait is the cycle sinkWSArrives guards with the
+          // same predicate; requiring only that the wait carries constraints
+          // would let the SMEM empty-arrive sink past a wait whose producer
+          // is blocked on it.
+          if (!hasWSBarrierConstraints(wait.getConstraints()) ||
+              !canAdvanceWSBarrierArrivePastWait(release.getConstraints(),
+                                                 wait.getConstraints())) {
+            safe = false;
+            break;
+          }
+          continue;
+        }
+        if (!canAdvanceWSBarrier(release.getConstraints(), op)) {
+          safe = false;
+          break;
+        }
+      }
+      if (!safe)
+        continue;
+
+      for (Operation *op : llvm::reverse(acquirePrefix))
+        op->moveBefore(commonUser);
+      acquire->moveBefore(commonUser);
+      localLoad->moveBefore(commonUser);
+      for (Operation *op : releasePrefix)
+        op->moveBefore(commonUser);
+      release->moveBefore(commonUser);
+      for (Operation *op : llvm::reverse(reverseChain))
+        op->moveBefore(commonUser);
+      changed = true;
+      break;
+    }
+  }
+  return changed;
+}
+
 void processBlock(BlockInterleaveInfo &info) {
   Block &block = *info.block;
   SmallVector<Operation *> originalOrder = getBlockOpOrder(block);
@@ -878,6 +1054,12 @@ struct TritonNvidiaGPUInterleaveTMemPass
     SmallVector<BlockInterleaveInfo> blocksToProcess;
     m.walk([&](Block *block) {
       BlockInterleaveInfo info = collectBlockInterleaveInfo(block);
+      // This reorders WS barriers, so it honors the same disable knob as the
+      // barrier movement in processBlock. Unlike that path it also runs for
+      // single-tmem_load blocks, which never reach the overlap-profile
+      // rollback, so the knob is the only way to turn it off.
+      if (info.tmemLoadCount > 0 && isWSBarrierReorderEnabled())
+        (void)prioritizeTMemOperand(*block);
       if (info.tmemLoadCount < 2)
         return;
       blocksToProcess.push_back(std::move(info));
