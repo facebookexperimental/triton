@@ -16,15 +16,13 @@ from triton.language.extra.tlx.tutorials.gfx9_gemm.inter_wave.a16w16.matmul_kern
     _launch_register,
 )
 
-
 _PATH_AUTOTUNE_WARMUP = 25
 _PATH_AUTOTUNE_REP = 100
 _PATH_CACHE: dict[tuple[object, ...], str] = {}
 _TAIL_BLOCK_K = 2 * BLOCK_K
 _MAX_DEFERRED_EPILOGUE_ELEMENTS = 16 * 1024 * 1024
 _TAIL_CONFIGS = [
-    triton.Config({"BLOCK_M": block_m, "BLOCK_N": block_n}, num_warps=num_warps)
-    for block_m, block_n, num_warps in (
+    triton.Config({"BLOCK_M": block_m, "BLOCK_N": block_n}, num_warps=num_warps) for block_m, block_n, num_warps in (
         (64, 64, 4),
         (64, 128, 4),
         (128, 64, 4),
@@ -41,13 +39,8 @@ def _can_use_inter_wave_tail(a: torch.Tensor, b: torch.Tensor) -> bool:
     M, K = a.shape
     N = b.shape[1]
     output_elements = M * N
-    return (
-        K > 1536
-        and K % BLOCK_K != 0
-        and K * a.element_size() % 16 == 0
-        and a.element_size() == 2
-        and 2 * 1024 * 1024 < output_elements <= _MAX_DEFERRED_EPILOGUE_ELEMENTS
-    )
+    return (K > 1536 and K % BLOCK_K != 0 and K * a.element_size() % 16 == 0 and a.element_size() == 2
+            and 2 * 1024 * 1024 < output_elements <= _MAX_DEFERRED_EPILOGUE_ELEMENTS)
 
 
 def _path_key(
@@ -122,7 +115,7 @@ def _launch_inter_wave_with_tail(bias: torch.Tensor, a: torch.Tensor, b: torch.T
     _, N = b.shape
     k_main = K // _TAIL_BLOCK_K * _TAIL_BLOCK_K
     main, out = _launch(a, b, SPLIT_K=1, TILE=(256, 256), K_LIMIT=k_main, DEFER_EPILOGUE=True)
-    grid = lambda meta: (triton.cdiv(M, meta["BLOCK_M"]) * triton.cdiv(N, meta["BLOCK_N"]),)
+    grid = lambda meta: (triton.cdiv(M, meta["BLOCK_M"]) * triton.cdiv(N, meta["BLOCK_N"]), )
     _addmm_tail_kernel[grid](
         a,
         b,
@@ -168,7 +161,8 @@ def _autotune_path(
         if torch.allclose(register_output, inter_wave_tail_output, rtol=1e-2, atol=1e-2):
             candidates["inter_wave_tail"] = inter_wave_tail
     timings = {
-        name: triton.testing.do_bench(
+        name:
+        triton.testing.do_bench(
             candidate,
             warmup=_PATH_AUTOTUNE_WARMUP,
             rep=_PATH_AUTOTUNE_REP,

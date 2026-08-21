@@ -13,7 +13,6 @@ import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
 
-
 TILE = tl.constexpr(32)
 BLOCK_K = tl.constexpr(64)
 K_BLOCKS = tl.constexpr(96)
@@ -42,9 +41,7 @@ _MT256X160_B_PUBLISH_PLAN = (
     ((4, 0, 3), (-1, 0, 0)),
     ((1, 0, 2), (4, 3, 2)),
 )
-_MT256X160_FINISH_MFMA_PLAN = (
-    7, 8, 9, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34
-)
+_MT256X160_FINISH_MFMA_PLAN = (7, 8, 9, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34)
 _MT256X160_PIPELINE_SPEC = (
     _M8_A1_READ_PLAN,
     4,
@@ -90,32 +87,24 @@ _SHAPE_DEFAULTS = {
 
 # Every complete group of four N32 fragments shares one N128 LDS image.  Any
 # remaining fragments use separate N32 images, avoiding power-of-two padding.
-_B_BASES = tl.constexpr(
-    [[1 << bit, 0] for bit in range(6)]
-    + [[0, 1 << bit] for bit in (4, 5, 6, 0, 1, 2, 3)]
-)
+_B_BASES = tl.constexpr([[1 << bit, 0] for bit in range(6)] + [[0, 1 << bit] for bit in (4, 5, 6, 0, 1, 2, 3)])
 
 # Four waves jointly own the first four N32 accumulator fragments as one 32x128
 # region.  Each lane gets sixteen contiguous N values, allowing four narrow
 # stores to become two 128-bit stores after one layout conversion.
 _C_STORE_32X128_LAYOUT = tlx.layout(
-    shape=((16, 4, 2, 2), (16,)),
-    stride=((128, 16, 2048, 64), (1,)),
+    shape=((16, 4, 2, 2), (16, )),
+    stride=((128, 16, 2048, 64), (1, )),
 )
+
 
 @triton.jit
 def _global_loads(source, kb, tile_spec: tl.constexpr):
     a_ptr, b_ptr, stride_ak, stride_bk, a_offsets, b_offsets = source
     a_ptr += kb * BLOCK_K * stride_ak
     b_ptr += kb * BLOCK_K * stride_bk
-    a = [
-        tlx.buffer_load(a_ptr, a_offsets[mi], contiguity=8)
-        for mi in range(tl.constexpr(tile_spec[0] // TILE))
-    ]
-    b = [
-        tlx.buffer_load(b_ptr, b_offsets[nj], contiguity=8)
-        for nj in range(tl.constexpr(tile_spec[1] // TILE))
-    ]
+    a = [tlx.buffer_load(a_ptr, a_offsets[mi], contiguity=8) for mi in range(tl.constexpr(tile_spec[0] // TILE))]
+    b = [tlx.buffer_load(b_ptr, b_offsets[nj], contiguity=8) for nj in range(tl.constexpr(tile_spec[1] // TILE))]
     return tl.tuple(a + b)
 
 
@@ -132,18 +121,12 @@ def _local_store_one(stage, value, index: tl.constexpr, tile_spec: tl.constexpr)
         nj: tl.constexpr = index - m_fragments
         view = tlx.local_slice(
             tlx.local_view(
-                b_buffers[
-                    nj // N_GROUP_FRAGMENTS
-                    if nj < n_main_fragments
-                    else n_main_groups + nj - n_main_fragments
-                ],
+                b_buffers[nj // N_GROUP_FRAGMENTS if nj < n_main_fragments else n_main_groups + nj - n_main_fragments],
                 0,
             ),
             [
                 0,
-                (nj % N_GROUP_FRAGMENTS) * TILE
-                if nj < n_main_fragments
-                else 0,
+                (nj % N_GROUP_FRAGMENTS) * TILE if nj < n_main_fragments else 0,
             ],
             [BLOCK_K, TILE],
         )
@@ -152,17 +135,13 @@ def _local_store_one(stage, value, index: tl.constexpr, tile_spec: tl.constexpr)
 
 @triton.jit
 def _local_store_all(stage, values, tile_spec: tl.constexpr):
-    load_groups: tl.constexpr = tl.constexpr(
-        tile_spec[0] // TILE + tile_spec[1] // TILE
-    )
+    load_groups: tl.constexpr = tl.constexpr(tile_spec[0] // TILE + tile_spec[1] // TILE)
     for index in tl.static_range(load_groups):
         _local_store_one(stage, values[index], index, tile_spec)
 
 
 @triton.jit
-def _local_load_a(
-    stage, kh: tl.constexpr, mi: tl.constexpr, dot_a: tl.constexpr
-):
+def _local_load_a(stage, kh: tl.constexpr, mi: tl.constexpr, dot_a: tl.constexpr):
     a_buffers = stage[0]
     view = tlx.local_slice(
         tlx.local_view(a_buffers[mi], 0),
@@ -186,18 +165,12 @@ def _local_load_b(
     n_main_fragments: tl.constexpr = n_main_groups * N_GROUP_FRAGMENTS
     view = tlx.local_slice(
         tlx.local_view(
-            b_buffers[
-                nj // N_GROUP_FRAGMENTS
-                if nj < n_main_fragments
-                else n_main_groups + nj - n_main_fragments
-            ],
+            b_buffers[nj // N_GROUP_FRAGMENTS if nj < n_main_fragments else n_main_groups + nj - n_main_fragments],
             0,
         ),
         [
             kh * TILE,
-            (nj % N_GROUP_FRAGMENTS) * TILE
-            if nj < n_main_fragments
-            else 0,
+            (nj % N_GROUP_FRAGMENTS) * TILE if nj < n_main_fragments else 0,
         ],
         [TILE, TILE],
     )
@@ -212,10 +185,8 @@ def _local_load_b_row(
     dot_b: tl.constexpr,
     tile_spec: tl.constexpr,
 ):
-    return tl.tuple([
-        _local_load_b(stage, kh, nj, dot_b, tile_spec)
-        for nj in range(tl.constexpr(tile_spec[1] // TILE))
-    ])
+    return tl.tuple(
+        [_local_load_b(stage, kh, nj, dot_b, tile_spec) for nj in range(tl.constexpr(tile_spec[1] // TILE))])
 
 
 @triton.jit
@@ -233,27 +204,17 @@ def _mfma_part(
     tile_spec: tl.constexpr,
 ):
     n_fragments: tl.constexpr = tl.constexpr(tile_spec[1] // TILE)
-    accumulators: tl.constexpr = tl.constexpr(
-        tile_spec[0] // TILE * tile_spec[1] // TILE
-    )
+    accumulators: tl.constexpr = tl.constexpr(tile_spec[0] // TILE * tile_spec[1] // TILE)
     return tl.tuple([
         tlx.amd_scheduled_mfma(
             tlx.require_layout(a_operand, dot_a, pin=False),
-            tlx.require_layout(
-                b_operands[index % n_fragments], dot_b, pin=False
-            ),
+            tlx.require_layout(b_operands[index % n_fragments], dot_b, pin=False),
             tlx.require_layout(acc[index], mma, pin=False),
             accumulator_role="persistent",
             resident_operand=None,
             initialize=initialize,
-        )
-        if (
-            index // n_fragments == mi
-            and index % n_fragments >= first_nj
-            and index % n_fragments < first_nj + count
-        )
-        else acc[index]
-        for index in range(accumulators)
+        ) if (index // n_fragments == mi and index % n_fragments >= first_nj and index % n_fragments < first_nj + count)
+        else acc[index] for index in range(accumulators)
     ])
 
 
@@ -270,16 +231,22 @@ def _mfma_row(
     tile_spec: tl.constexpr,
 ):
     return _mfma_part(
-        a_operand, b_operands, acc, mi, 0,
+        a_operand,
+        b_operands,
+        acc,
+        mi,
+        0,
         tl.constexpr(tile_spec[1] // TILE),
-        mma, dot_a, dot_b, initialize, tile_spec,
+        mma,
+        dot_a,
+        dot_b,
+        initialize,
+        tile_spec,
     )
 
 
 @triton.jit
-def _global_prefetch_one(
-    source, kb, index: tl.constexpr, tile_spec: tl.constexpr
-):
+def _global_prefetch_one(source, kb, index: tl.constexpr, tile_spec: tl.constexpr):
     a_ptr, b_ptr, stride_ak, stride_bk, a_offsets, b_offsets = source
     m_fragments: tl.constexpr = tl.constexpr(tile_spec[0] // TILE)
     if index < m_fragments:
@@ -330,9 +297,17 @@ def _publish_a_row(
 
     # K(t): compute columns [0, mfmas_before_prefetch) of accumulator row mi.
     acc = _mfma_part(
-        a_operand, b_operands, acc, mi, 0,
+        a_operand,
+        b_operands,
+        acc,
+        mi,
+        0,
         tl.constexpr(pipeline_spec[1]),
-        mma, dot_a, dot_b, initialize, tile_spec,
+        mma,
+        dot_a,
+        dot_b,
+        initialize,
+        tile_spec,
     )
 
     # K(t+2): issue this row's next global A[32, 64] load into VGPRs.
@@ -342,10 +317,17 @@ def _publish_a_row(
     # [mfmas_before_prefetch, n_fragments).  For N160 the split is 4 + 1;
     # for N192 it is 5 + 1.
     acc = _mfma_part(
-        a_operand, b_operands, acc, mi,
+        a_operand,
+        b_operands,
+        acc,
+        mi,
         tl.constexpr(pipeline_spec[1]),
         n_fragments - tl.constexpr(pipeline_spec[1]),
-        mma, dot_a, dot_b, initialize, tile_spec,
+        mma,
+        dot_a,
+        dot_b,
+        initialize,
+        tile_spec,
     )
     return acc, future
 
@@ -370,17 +352,24 @@ def _publish_b_fragment(
     index: tl.constexpr = m_fragments + nj
     _local_store_one(next_stage, prefetched[index], index, tile_spec)
     acc = _mfma_part(
-        a_operands[0], b_operands, acc,
-        0, nj, 1, mma, dot_a, dot_b, False, tile_spec,
+        a_operands[0],
+        b_operands,
+        acc,
+        0,
+        nj,
+        1,
+        mma,
+        dot_a,
+        dot_b,
+        False,
+        tile_spec,
     )
 
     future = _global_prefetch_one(source, future_kb, index, tile_spec)
 
     # Spread the MFMA rows across publish groups according to a tile-specific
     # compile-time plan, so the pipeline core itself is independent of 8x5.
-    for part in tl.static_range(
-        tl.constexpr(len(pipeline_spec[2][nj]))
-    ):
+    for part in tl.static_range(tl.constexpr(len(pipeline_spec[2][nj]))):
         if tl.constexpr(pipeline_spec[2][nj][part][2]) > 0:
             acc = _mfma_part(
                 a_operands[tl.constexpr(pipeline_spec[2][nj][part][0])],
@@ -417,9 +406,19 @@ def _publish_b_rows(
     future = tl.tuple([])
     for nj in tl.static_range(tl.constexpr(tile_spec[1] // TILE)):
         acc, value = _publish_b_fragment(
-            a_operands, b_operands, acc, prefetched,
-            next_stage, source, future_kb, nj, mma, dot_a, dot_b,
-            pipeline_spec, tile_spec,
+            a_operands,
+            b_operands,
+            acc,
+            prefetched,
+            next_stage,
+            source,
+            future_kb,
+            nj,
+            mma,
+            dot_a,
+            dot_b,
+            pipeline_spec,
+            tile_spec,
         )
         future += tl.tuple([value])
     return acc, future
@@ -445,9 +444,17 @@ def _finish_read(
         value = _local_load_a(next_stage, 0, read - n_fragments, dot_a)
     flat: tl.constexpr = tl.constexpr(pipeline_spec[3][read])
     acc = _mfma_part(
-        a_operands[flat // n_fragments], b_operands, acc,
-        flat // n_fragments, flat % n_fragments, 1,
-        mma, dot_a, dot_b, False, tile_spec,
+        a_operands[flat // n_fragments],
+        b_operands,
+        acc,
+        flat // n_fragments,
+        flat % n_fragments,
+        1,
+        mma,
+        dot_a,
+        dot_b,
+        False,
+        tile_spec,
     )
     return acc, value
 
@@ -473,16 +480,31 @@ def _finish_iteration(
     n_fragments: tl.constexpr = tl.constexpr(tile_spec[1] // TILE)
     for read in tl.static_range(m_fragments + n_fragments):
         acc, value = _finish_read(
-            next_stage, a_operands, b_operands,
-            acc, read, mma, dot_a, dot_b, pipeline_spec, tile_spec,
+            next_stage,
+            a_operands,
+            b_operands,
+            acc,
+            read,
+            mma,
+            dot_a,
+            dot_b,
+            pipeline_spec,
+            tile_spec,
         )
         if read < n_fragments:
             next_b += tl.tuple([value])
         else:
             next_a += tl.tuple([value])
     acc = _mfma_row(
-        a_operands[m_fragments - 1], b_operands, acc, m_fragments - 1,
-        mma, dot_a, dot_b, False, tile_spec,
+        a_operands[m_fragments - 1],
+        b_operands,
+        acc,
+        m_fragments - 1,
+        mma,
+        dot_a,
+        dot_b,
+        False,
+        tile_spec,
     )
     return acc, early_prefetched + late_prefetched, next_a, next_b
 
@@ -528,16 +550,25 @@ def _pipeline(
         # K(t).kh1: spread the smaller B operand window across the first
         # n_fragments loop iterations instead of issuing one late LDS burst.
         if mi < n_fragments:
-            b1 += tl.tuple([
-                _local_load_b(current_stage, 1, mi, dot_b, tile_spec)
-            ])
+            b1 += tl.tuple([_local_load_b(current_stage, 1, mi, dot_b, tile_spec)])
 
         # In one interleaved step: publish A(mi,K(t+1)) from VGPRs to the next
         # LDS stage, compute row mi of K(t).kh0, and prefetch A(mi,K(t+2)).
         acc, future = _publish_a_row(
-            current_a[mi], current_b, acc, prefetched[mi],
-            next_stage, source, future_kb,
-            mi, mma, dot_a, dot_b, initialize, pipeline_spec, tile_spec,
+            current_a[mi],
+            current_b,
+            acc,
+            prefetched[mi],
+            next_stage,
+            source,
+            future_kb,
+            mi,
+            mma,
+            dot_a,
+            dot_b,
+            initialize,
+            pipeline_spec,
+            tile_spec,
         )
         future_a += tl.tuple([future])
 
@@ -545,19 +576,27 @@ def _pipeline(
         # plan covers every A fragment exactly once while controlling lifetime.
         if tl.constexpr(pipeline_spec[0][mi][1]) > 0:
             a1 += tl.tuple([
-                _local_load_a(current_stage, 1, index, dot_a)
-                for index in range(
+                _local_load_a(current_stage, 1, index, dot_a) for index in range(
                     tl.constexpr(pipeline_spec[0][mi][0]),
-                    tl.constexpr(pipeline_spec[0][mi][0])
-                    + tl.constexpr(pipeline_spec[0][mi][1]),
+                    tl.constexpr(pipeline_spec[0][mi][0]) + tl.constexpr(pipeline_spec[0][mi][1]),
                 )
             ])
 
     # Publish B(K(t+1)) to next LDS and prefetch B(K(t+2)), while a1/b1
     # compute most of the current K(t).kh1 accumulator updates.
     acc, late_prefetched = _publish_b_rows(
-        a1, b1, acc, prefetched, next_stage,
-        source, future_kb, mma, dot_a, dot_b, pipeline_spec, tile_spec,
+        a1,
+        b1,
+        acc,
+        prefetched,
+        next_stage,
+        source,
+        future_kb,
+        mma,
+        dot_a,
+        dot_b,
+        pipeline_spec,
+        tile_spec,
     )
 
     # All A/B fragments of K(t+1) are now in next_stage.  Make them visible
@@ -565,8 +604,17 @@ def _pipeline(
     # K(t).kh1 MFMA updates in _finish_iteration.
     tl.debug_barrier()
     return _finish_iteration(
-        next_stage, a1, b1, acc, future_a, late_prefetched,
-        mma, dot_a, dot_b, pipeline_spec, tile_spec,
+        next_stage,
+        a1,
+        b1,
+        acc,
+        future_a,
+        late_prefetched,
+        mma,
+        dot_a,
+        dot_b,
+        pipeline_spec,
+        tile_spec,
     )
 
 
@@ -597,16 +645,38 @@ def _pipeline_pair(
     """
     # Consume K(kb), publish K(kb+1) into stage1, and prefetch K(kb+2).
     acc, prefetched, current_a, current_b = _pipeline(
-        source, kb + 2, stage0, stage1, current_a, current_b,
-        prefetched, acc, mma, dot_a, dot_b, initialize,
-        pipeline_spec, tile_spec,
+        source,
+        kb + 2,
+        stage0,
+        stage1,
+        current_a,
+        current_b,
+        prefetched,
+        acc,
+        mma,
+        dot_a,
+        dot_b,
+        initialize,
+        pipeline_spec,
+        tile_spec,
     )
     # Consume K(kb+1), publish K(kb+2) into stage0, and prefetch K(kb+3).
     # Accumulators were initialized by the first call, so initialize=False.
     return _pipeline(
-        source, kb + 3, stage1, stage0, current_a, current_b,
-        prefetched, acc, mma, dot_a, dot_b, False,
-        pipeline_spec, tile_spec,
+        source,
+        kb + 3,
+        stage1,
+        stage0,
+        current_a,
+        current_b,
+        prefetched,
+        acc,
+        mma,
+        dot_a,
+        dot_b,
+        False,
+        pipeline_spec,
+        tile_spec,
     )
 
 
@@ -633,13 +703,11 @@ def _make_global_tile_load_addresses(
     block_m_offset = pid_m * block_m
     block_n_offset = pid_n * block_n
     a_offsets = tl.tuple([
-        (block_m_offset + mi * TILE + tl.arange(0, TILE))[:, None] * stride_am
-        + rk[None, :] * stride_ak
+        (block_m_offset + mi * TILE + tl.arange(0, TILE))[:, None] * stride_am + rk[None, :] * stride_ak
         for mi in range(m_fragments)
     ])
     b_offsets = tl.tuple([
-        rk[:, None] * stride_bk
-        + (block_n_offset + nj * TILE + tl.arange(0, TILE))[None, :] * stride_bn
+        rk[:, None] * stride_bk + (block_n_offset + nj * TILE + tl.arange(0, TILE))[None, :] * stride_bn
         for nj in range(n_fragments)
     ])
     return tl.tuple([a_ptr, b_ptr, stride_ak, stride_bk, a_offsets, b_offsets])
@@ -647,15 +715,26 @@ def _make_global_tile_load_addresses(
 
 @triton.jit
 def _consume_k32(
-    stage, kh: tl.constexpr, acc,
-    mma: tl.constexpr, dot_a: tl.constexpr, dot_b: tl.constexpr,
+    stage,
+    kh: tl.constexpr,
+    acc,
+    mma: tl.constexpr,
+    dot_a: tl.constexpr,
+    dot_b: tl.constexpr,
     tile_spec: tl.constexpr,
 ):
     b_operands = _local_load_b_row(stage, kh, dot_b, tile_spec)
     for mi in tl.static_range(tl.constexpr(tile_spec[0] // TILE)):
         acc = _mfma_row(
-            _local_load_a(stage, kh, mi, dot_a), b_operands, acc,
-            mi, mma, dot_a, dot_b, False, tile_spec,
+            _local_load_a(stage, kh, mi, dot_a),
+            b_operands,
+            acc,
+            mi,
+            mma,
+            dot_a,
+            dot_b,
+            False,
+            tile_spec,
         )
     return acc
 
@@ -688,10 +767,7 @@ def _compute_full_tile(
     _local_store_all(stage0, preloaded_k0, tile_spec)
     tl.debug_barrier()
     current_b = _local_load_b_row(stage0, 0, dot_b, tile_spec)
-    current_a = tl.tuple([
-        _local_load_a(stage0, 0, mi, dot_a)
-        for mi in range(m_fragments)
-    ])
+    current_a = tl.tuple([_local_load_a(stage0, 0, mi, dot_a) for mi in range(m_fragments)])
     prefetched = _global_loads(source, 1, tile_spec)
 
     # Create one persistent FP32 accumulator for every logical C[32, 32]
@@ -699,9 +775,20 @@ def _compute_full_tile(
     zero = tlx.zeros((TILE, TILE), tl.float32, layout=mma)
     acc = tl.tuple([zero for _ in range(m_fragments * n_fragments)])
     acc, prefetched, current_a, current_b = _pipeline_pair(
-        0, source,
-        stage0, stage1, current_a, current_b, prefetched, acc,
-        mma, dot_a, dot_b, True, pipeline_spec, tile_spec,
+        0,
+        source,
+        stage0,
+        stage1,
+        current_a,
+        current_b,
+        prefetched,
+        acc,
+        mma,
+        dot_a,
+        dot_b,
+        True,
+        pipeline_spec,
+        tile_spec,
     )
 
     # Steady state: pair(kb) consumes K(kb)/K(kb+1) and prepares
@@ -709,9 +796,20 @@ def _compute_full_tile(
     # exits with K94 in stage0/current operands plus K95 in prefetch VGPRs.
     for kb in tl.range(2, K_BLOCKS - 2, 2, num_stages=1):
         acc, prefetched, current_a, current_b = _pipeline_pair(
-            kb, source,
-            stage0, stage1, current_a, current_b, prefetched, acc,
-            mma, dot_a, dot_b, False, pipeline_spec, tile_spec,
+            kb,
+            source,
+            stage0,
+            stage1,
+            current_a,
+            current_b,
+            prefetched,
+            acc,
+            mma,
+            dot_a,
+            dot_b,
+            False,
+            pipeline_spec,
+            tile_spec,
         )
 
     # Epilogue: publish K95 into stage1 while consuming the already-resident
@@ -720,15 +818,20 @@ def _compute_full_tile(
     _local_store_all(stage1, prefetched, tile_spec)
     for mi in tl.static_range(m_fragments):
         acc = _mfma_row(
-            current_a[mi], current_b, acc, mi,
-            mma, dot_a, dot_b, False, tile_spec,
+            current_a[mi],
+            current_b,
+            acc,
+            mi,
+            mma,
+            dot_a,
+            dot_b,
+            False,
+            tile_spec,
         )
     acc = _consume_k32(stage0, 1, acc, mma, dot_a, dot_b, tile_spec)
     tl.debug_barrier()
     for kh in tl.static_range(2):
-        acc = _consume_k32(
-            stage1, kh, acc, mma, dot_a, dot_b, tile_spec
-        )
+        acc = _consume_k32(stage1, kh, acc, mma, dot_a, dot_b, tile_spec)
     return acc
 
 
@@ -756,31 +859,16 @@ def _global_store_output(
     rn = pid_n * block_n + tl.arange(0, TILE)
     for mi in tl.static_range(m_fragments):
         for group in tl.static_range(n_main_groups):
-            rn_wide = (
-                pid_n * block_n
-                + group * N_GROUP_FRAGMENTS * TILE
-                + tl.arange(0, N_GROUP_FRAGMENTS * TILE)
-            )
-            offsets = (
-                c_ptr
-                + (rm + mi * TILE)[:, None] * stride_cm
-                + rn_wide[None, :] * stride_cn
-            )
+            rn_wide = (pid_n * block_n + group * N_GROUP_FRAGMENTS * TILE + tl.arange(0, N_GROUP_FRAGMENTS * TILE))
+            offsets = (c_ptr + (rm + mi * TILE)[:, None] * stride_cm + rn_wide[None, :] * stride_cn)
             lo = tl.cat(
                 tlx.require_layout(
-                    acc[
-                        mi * n_fragments
-                        + group * N_GROUP_FRAGMENTS
-                    ],
+                    acc[mi * n_fragments + group * N_GROUP_FRAGMENTS],
                     mma,
                     pin=False,
                 ),
                 tlx.require_layout(
-                    acc[
-                        mi * n_fragments
-                        + group * N_GROUP_FRAGMENTS
-                        + 1
-                    ],
+                    acc[mi * n_fragments + group * N_GROUP_FRAGMENTS + 1],
                     mma,
                     pin=False,
                 ),
@@ -788,39 +876,25 @@ def _global_store_output(
             )
             hi = tl.cat(
                 tlx.require_layout(
-                    acc[
-                        mi * n_fragments
-                        + group * N_GROUP_FRAGMENTS
-                        + 2
-                    ],
+                    acc[mi * n_fragments + group * N_GROUP_FRAGMENTS + 2],
                     mma,
                     pin=False,
                 ),
                 tlx.require_layout(
-                    acc[
-                        mi * n_fragments
-                        + group * N_GROUP_FRAGMENTS
-                        + 3
-                    ],
+                    acc[mi * n_fragments + group * N_GROUP_FRAGMENTS + 3],
                     mma,
                     pin=False,
                 ),
                 dim=1,
             )
             value = tl.cat(lo, hi, dim=1)
-            value = tlx.require_layout(
-                value.to(c_ptr.dtype.element_ty), _C_STORE_32X128_LAYOUT
-            )
+            value = tlx.require_layout(value.to(c_ptr.dtype.element_ty), _C_STORE_32X128_LAYOUT)
             tlx.assert_same_layout(value, _C_STORE_32X128_LAYOUT)
             tl.store(offsets, value)
         for tail in tl.static_range(n_tail_fragments):
             offsets = tlx.require_layout(
-                c_ptr
-                + (rm + mi * TILE)[:, None] * stride_cm
-                + (
-                    rn
-                    + (n_main_fragments + tail) * TILE
-                )[None, :] * stride_cn,
+                c_ptr + (rm + mi * TILE)[:, None] * stride_cm + (rn +
+                                                                 (n_main_fragments + tail) * TILE)[None, :] * stride_cn,
                 mma,
                 pin=False,
             )
@@ -834,13 +908,8 @@ def _global_store_output(
 
 @triton.jit
 def _commit_accumulators(acc, mma: tl.constexpr, tile_spec: tl.constexpr):
-    accumulators: tl.constexpr = tl.constexpr(
-        tile_spec[0] // TILE * tile_spec[1] // TILE
-    )
-    values = [
-        tlx.require_layout(acc[index], mma, pin=False)
-        for index in range(accumulators)
-    ]
+    accumulators: tl.constexpr = tl.constexpr(tile_spec[0] // TILE * tile_spec[1] // TILE)
+    values = [tlx.require_layout(acc[index], mma, pin=False) for index in range(accumulators)]
     return tlx.amd_mfma_commit(tl.tuple(values))
 
 
@@ -854,30 +923,16 @@ def _local_alloc_stage(
     m_fragments: tl.constexpr = tl.constexpr(tile_spec[0] // TILE)
     n_fragments: tl.constexpr = tl.constexpr(tile_spec[1] // TILE)
     n_main_groups: tl.constexpr = n_fragments // N_GROUP_FRAGMENTS
-    n_tail_fragments: tl.constexpr = (
-        n_fragments - n_main_groups * N_GROUP_FRAGMENTS
-    )
-    a_buffers = tl.tuple([
-        tlx.local_alloc((TILE, BLOCK_K), tl.float16, 1, layout=a_layout)
-        for _ in range(m_fragments)
-    ])
-    b_buffers = tl.tuple(
-        [
-            tlx.local_alloc(
-                (BLOCK_K, N_GROUP_FRAGMENTS * TILE),
-                tl.float16,
-                1,
-                layout=b_main_layout,
-            )
-            for _ in range(n_main_groups)
-        ]
-        + [
-            tlx.local_alloc(
-                (BLOCK_K, TILE), tl.float16, 1, layout=b_tail_layout
-            )
-            for _ in range(n_tail_fragments)
-        ]
-    )
+    n_tail_fragments: tl.constexpr = (n_fragments - n_main_groups * N_GROUP_FRAGMENTS)
+    a_buffers = tl.tuple([tlx.local_alloc((TILE, BLOCK_K), tl.float16, 1, layout=a_layout) for _ in range(m_fragments)])
+    b_buffers = tl.tuple([
+        tlx.local_alloc(
+            (BLOCK_K, N_GROUP_FRAGMENTS * TILE),
+            tl.float16,
+            1,
+            layout=b_main_layout,
+        ) for _ in range(n_main_groups)
+    ] + [tlx.local_alloc((BLOCK_K, TILE), tl.float16, 1, layout=b_tail_layout) for _ in range(n_tail_fragments)])
     return tl.tuple([a_buffers, b_buffers])
 
 
@@ -903,27 +958,13 @@ def _kernel(
     )
     dot_a: tl.constexpr = tlx.dot_operand_layout(0, mma, k_width=8)
     dot_b: tl.constexpr = tlx.dot_operand_layout(1, mma, k_width=8)
-    a_layout: tl.constexpr = (
-        tlx.padded_shared_layout_encoding.with_identity_for(
-            [(64, 16)], [TILE, BLOCK_K], order=[1, 0]
-        )
-    )
-    b_main_layout: tl.constexpr = (
-        tlx.padded_shared_layout_encoding.with_bases(
-            [(512, 16)], _B_BASES, [BLOCK_K, 128]
-        )
-    )
-    b_tail_layout: tl.constexpr = (
-        tlx.padded_shared_layout_encoding.with_identity_for(
-            [(256, 16)], [BLOCK_K, TILE], order=[0, 1]
-        )
-    )
-    stage0 = _local_alloc_stage(
-        a_layout, b_main_layout, b_tail_layout, TILE_SPEC
-    )
-    stage1 = _local_alloc_stage(
-        a_layout, b_main_layout, b_tail_layout, TILE_SPEC
-    )
+    a_layout: tl.constexpr = (tlx.padded_shared_layout_encoding.with_identity_for([(64, 16)], [TILE, BLOCK_K],
+                                                                                  order=[1, 0]))
+    b_main_layout: tl.constexpr = (tlx.padded_shared_layout_encoding.with_bases([(512, 16)], _B_BASES, [BLOCK_K, 128]))
+    b_tail_layout: tl.constexpr = (tlx.padded_shared_layout_encoding.with_identity_for([(256, 16)], [BLOCK_K, TILE],
+                                                                                       order=[0, 1]))
+    stage0 = _local_alloc_stage(a_layout, b_main_layout, b_tail_layout, TILE_SPEC)
+    stage1 = _local_alloc_stage(a_layout, b_main_layout, b_tail_layout, TILE_SPEC)
 
     # Persistently assign a compile-time group of adjacent N tiles to each
     # program.  For example, 128 N tiles with two tiles/program produce 64
@@ -936,22 +977,33 @@ def _kernel(
     programs_per_m = num_pid_n // tiles_per_program
     program_m = program // programs_per_m
     program_n = program % programs_per_m
-    first_tile = (
-        program_m * num_pid_n + program_n * tiles_per_program
-    )
+    first_tile = (program_m * num_pid_n + program_n * tiles_per_program)
 
     # Prime the persistent traversal with the first tile's complete K0 slice.
     tile_load_addresses = _make_global_tile_load_addresses(
-        a_ptr, b_ptr, stride_am, stride_ak,
-        stride_bk, stride_bn, first_tile, TILE_SPEC,
+        a_ptr,
+        b_ptr,
+        stride_am,
+        stride_ak,
+        stride_bk,
+        stride_bn,
+        first_tile,
+        TILE_SPEC,
     )
     prefetched_k0 = _global_loads(tile_load_addresses, 0, TILE_SPEC)
 
     for tile_offset in tl.static_range(tiles_per_program):
         tile_id = first_tile + tile_offset
         acc_tile = _compute_full_tile(
-            tile_load_addresses, prefetched_k0, stage0, stage1,
-            mma, dot_a, dot_b, PIPELINE_SPEC, TILE_SPEC,
+            tile_load_addresses,
+            prefetched_k0,
+            stage0,
+            stage1,
+            mma,
+            dot_a,
+            dot_b,
+            PIPELINE_SPEC,
+            TILE_SPEC,
         )
 
         # Before the current tile's epilogue, issue the next tile's K0 loads.
@@ -959,17 +1011,26 @@ def _kernel(
         # live together, independent of tiles_per_program.
         if tile_offset + 1 < tiles_per_program:
             next_tile_load_addresses = _make_global_tile_load_addresses(
-                a_ptr, b_ptr, stride_am, stride_ak,
-                stride_bk, stride_bn, tile_id + 1, TILE_SPEC,
+                a_ptr,
+                b_ptr,
+                stride_am,
+                stride_ak,
+                stride_bk,
+                stride_bn,
+                tile_id + 1,
+                TILE_SPEC,
             )
-            next_prefetched_k0 = _global_loads(
-                next_tile_load_addresses, 0, TILE_SPEC
-            )
+            next_prefetched_k0 = _global_loads(next_tile_load_addresses, 0, TILE_SPEC)
 
         acc_tile = _commit_accumulators(acc_tile, mma, TILE_SPEC)
         _global_store_output(
-            c_ptr, acc_tile, stride_cm, stride_cn,
-            tile_id, mma, TILE_SPEC,
+            c_ptr,
+            acc_tile,
+            stride_cm,
+            stride_cn,
+            tile_id,
+            mma,
+            TILE_SPEC,
         )
 
         if tile_offset + 1 < tiles_per_program:
@@ -981,9 +1042,7 @@ def _validate_specialization(m, n, tile_spec, pipeline_spec):
     block_m, block_n, num_pid_n, num_programs, tiles_per_program = tile_spec
     m_fragments = block_m // int(TILE)
     n_fragments = block_n // int(TILE)
-    a1_read_plan, mfmas_before_prefetch, b_publish_plan, finish_plan = (
-        pipeline_spec
-    )
+    a1_read_plan, mfmas_before_prefetch, b_publish_plan, finish_plan = (pipeline_spec)
     assert m % block_m == 0 and n % block_n == 0
     assert num_pid_n == n // block_n
     assert tiles_per_program > 0
@@ -1010,15 +1069,10 @@ def _validate_specialization(m, n, tile_spec, pipeline_spec):
             assert 0 <= mi < m_fragments
             assert 0 <= first_nj < n_fragments
             assert first_nj + count <= n_fragments
-            mfma_coverage.extend(
-                mi * n_fragments + nj
-                for nj in range(first_nj, first_nj + count)
-            )
+            mfma_coverage.extend(mi * n_fragments + nj for nj in range(first_nj, first_nj + count))
     assert all(0 <= flat < m_fragments * n_fragments for flat in finish_plan)
     mfma_coverage.extend(finish_plan)
-    mfma_coverage.extend(
-        range((m_fragments - 1) * n_fragments, m_fragments * n_fragments)
-    )
+    mfma_coverage.extend(range((m_fragments - 1) * n_fragments, m_fragments * n_fragments))
     assert sorted(mfma_coverage) == list(range(m_fragments * n_fragments))
 
 
@@ -1028,11 +1082,7 @@ def supports(a, b):
         return False
     m, k = a.shape
     _, n = b.shape
-    return (
-        a.dtype == torch.float16
-        and b.dtype == torch.float16
-        and (m, n, k) in _SHAPE_DEFAULTS
-    )
+    return (a.dtype == torch.float16 and b.dtype == torch.float16 and (m, n, k) in _SHAPE_DEFAULTS)
 
 
 def matmul(a, b, out=None, specialization=None):
@@ -1053,7 +1103,7 @@ def matmul(a, b, out=None, specialization=None):
     expected_shape, tile_spec, pipeline_spec = _SPECIALIZATIONS[specialization]
     assert (m, n, k) == expected_shape
     _validate_specialization(m, n, tile_spec, pipeline_spec)
-    _kernel[(tile_spec[3],)](
+    _kernel[(tile_spec[3], )](
         a,
         b,
         out,

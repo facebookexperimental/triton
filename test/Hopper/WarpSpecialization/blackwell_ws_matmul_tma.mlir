@@ -5,19 +5,28 @@
 // and has partition annotations on key operations.
 
 // CHECK-LABEL: @matmul_kernel_tma_ws
+// CHECK: ttg.barrier local
+// CHECK-NOT: ttg.barrier local
 // CHECK: ttg.warp_specialize
 // Default group: MMA operations
 // CHECK: default
 // CHECK: ttng.wait_barrier {{.*}}channelGraph = array<i32: {{.*}}direction = "forward"{{.*}}dstTask = {{[0-9]+}} : i32{{.*}}parentId = {{[0-9]+}} : i32
+// Each consumer CTA relays completion to its peer after consuming the load.
+// CHECK: ttng.arrive_barrier {{.*}}shared_cluster_memory
+// CHECK: ttng.arrive_barrier {{.*}}shared_cluster_memory
 // CHECK: ttng.tc_gen5_mma
 // Group 0: Descriptor load operations (producer)
 // CHECK: partition0
+// Cooperative loads map completion to the pair leader and relay it to the
+// follower after the hardware CTA-group transaction completes.
+// CHECK: ttng.wait_barrier {{.*}}channelGraph = array<i32: {{.*}}direction = "backward"{{.*}}dstTask = {{[0-9]+}} : i32{{.*}}parentId = {{[0-9]+}} : i32
+// CHECK: nvg.cluster_id
+// CHECK: ttng.map_to_remote
+// CHECK: ttng.barrier_expect
+// CHECK: ttng.async_tma_copy_global_to_local {{.*}}two_cta = true
 // CHECK: ttng.wait_barrier {{.*}}channelGraph = array<i32: {{.*}}direction = "backward"{{.*}}dstTask = {{[0-9]+}} : i32{{.*}}parentId = {{[0-9]+}} : i32
 // CHECK: ttng.barrier_expect
-// CHECK: ttng.async_tma_copy_global_to_local
-// CHECK: ttng.wait_barrier {{.*}}channelGraph = array<i32: {{.*}}direction = "backward"{{.*}}dstTask = {{[0-9]+}} : i32{{.*}}parentId = {{[0-9]+}} : i32
-// CHECK: ttng.barrier_expect
-// CHECK: ttng.async_tma_copy_global_to_local
+// CHECK: ttng.async_tma_copy_global_to_local {{.*}}two_cta = true
 // Group 1: Epilogue operations
 // CHECK: partition1
 // CHECK: ttng.tmem_load
@@ -30,7 +39,7 @@
 #shared1 = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = true, elementBitWidth = 16}>
 #smem = #ttg.shared_memory
 #tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
-module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32, ttg.max_reg_auto_ws = 152 : i32, ttg.min_reg_auto_ws = 24 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+module attributes {"ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32, ttg.max_reg_auto_ws = 152 : i32, ttg.min_reg_auto_ws = 24 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32, "ttng.two-ctas" = true} {
   tt.func public @matmul_kernel_tma_ws(%a_desc: !tt.tensordesc<128x64xf16, #shared>, %a_desc_0: i32, %a_desc_1: i32, %a_desc_2: i64, %a_desc_3: i64, %b_desc: !tt.tensordesc<128x64xf16, #shared>, %b_desc_4: i32, %b_desc_5: i32, %b_desc_6: i64, %b_desc_7: i64, %c_desc: !tt.tensordesc<128x128xf16, #shared>, %c_desc_8: i32, %c_desc_9: i32, %c_desc_10: i64, %c_desc_11: i64, %M: i32 {tt.divisibility = 16 : i32}, %N: i32 {tt.divisibility = 16 : i32}, %K: i32 {tt.divisibility = 16 : i32}) attributes {noinline = false} {
     %accumulator = arith.constant false
     %true = arith.constant true
@@ -63,9 +72,9 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
     %accumulator_20, %accumulator_21 = ttng.tmem_alloc : () -> (!ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.async.token)
     %accumulator_23:2 = scf.for %accumulator_27 = %c0_i32 to %k_tiles_19 step %c1_i32 iter_args(%accumulator_28 = %accumulator, %accumulator_29 = %accumulator_21) -> (i1, !ttg.async.token)  : i32 {
       %offs_k = arith.muli %accumulator_27, %c64_i32 {loop.cluster = 1 : i32, loop.stage = 0 : i32} : i32
-      %a = tt.descriptor_load %a_desc[%offs_am, %offs_k] {loop.cluster = 1 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 2>} : !tt.tensordesc<128x64xf16, #shared> -> tensor<128x64xf16, #blocked1>
+      %a = tt.descriptor_load %a_desc[%offs_am, %offs_k] {loop.cluster = 1 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 2>, two_cta_load} : !tt.tensordesc<128x64xf16, #shared> -> tensor<128x64xf16, #blocked1>
       %a_30 = ttg.local_alloc %a {loop.cluster = 0 : i32, loop.stage = 1 : i32, ttg.partition = array<i32: 2>} : (tensor<128x64xf16, #blocked1>) -> !ttg.memdesc<128x64xf16, #shared, #smem>
-      %b = tt.descriptor_load %b_desc[%offs_bn, %offs_k] {loop.cluster = 1 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 2>} : !tt.tensordesc<128x64xf16, #shared> -> tensor<128x64xf16, #blocked1>
+      %b = tt.descriptor_load %b_desc[%offs_bn, %offs_k] {loop.cluster = 1 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 2>, two_cta_load} : !tt.tensordesc<128x64xf16, #shared> -> tensor<128x64xf16, #blocked1>
       %accumulator_31 = ttg.local_alloc %b {loop.cluster = 0 : i32, loop.stage = 1 : i32, ttg.partition = array<i32: 2>} : (tensor<128x64xf16, #blocked1>) -> !ttg.memdesc<128x64xf16, #shared, #smem>
       %accumulator_32 = ttg.memdesc_trans %accumulator_31 {loop.cluster = 0 : i32, loop.stage = 1 : i32, order = array<i32: 1, 0>, ttg.partition = array<i32: 1>} : !ttg.memdesc<128x64xf16, #shared, #smem> -> !ttg.memdesc<64x128xf16, #shared1, #smem>
       %accumulator_33 = ttng.tc_gen5_mma %a_30, %accumulator_32, %accumulator_20[%accumulator_29], %accumulator_28, %true {loop.cluster = 0 : i32, loop.stage = 1 : i32, tt.self_latency = 1 : i32, ttg.partition = array<i32: 1>} : !ttg.memdesc<128x64xf16, #shared, #smem>, !ttg.memdesc<64x128xf16, #shared1, #smem>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
