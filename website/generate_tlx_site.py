@@ -8,6 +8,8 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
+from guide_content import GUIDE_CONTENT
+
 
 SITE_ROOT = Path(__file__).resolve().parent
 REPOSITORY_ROOT = SITE_ROOT.parent
@@ -23,7 +25,7 @@ class Page:
     summary: str
 
 
-PAGES = (
+README_PAGES = (
     Page(
         "overview",
         "Overview",
@@ -96,6 +98,54 @@ PAGES = (
     ),
 )
 
+GETTING_STARTED_PAGE = Page(
+    "getting-started",
+    "Getting started",
+    None,
+    None,
+    "Start with TLX imports, tutorials, and a minimal warp-specialized kernel.",
+)
+HARDWARE_SUPPORT_PAGE = Page(
+    "hardware-support",
+    "Hardware support",
+    None,
+    None,
+    "Understand TLX capabilities across Hopper, Blackwell, and AMD CDNA GPUs.",
+)
+PERFORMANCE_PAGE = Page(
+    "performance-optimization",
+    "Performance optimization",
+    None,
+    None,
+    "Structure pipelines, buffers, fusion, and scheduling for high utilization.",
+)
+DEBUGGING_PAGE = Page(
+    "debugging",
+    "Debugging performance and numerics",
+    None,
+    None,
+    "Diagnose compiler, runtime, performance, and numerical issues systematically.",
+)
+CASE_STUDIES_PAGE = Page(
+    "production-case-studies",
+    "Production case studies",
+    None,
+    None,
+    "See how TLX has been applied to large-scale training and inference workloads.",
+)
+
+PAGES = (
+    README_PAGES[0],
+    GETTING_STARTED_PAGE,
+    HARDWARE_SUPPORT_PAGE,
+    *README_PAGES[1:7],
+    PERFORMANCE_PAGE,
+    DEBUGGING_PAGE,
+    README_PAGES[7],
+    CASE_STUDIES_PAGE,
+    *README_PAGES[8:],
+)
+
 
 def read_readme() -> str:
     return (REPOSITORY_ROOT / "README.md").read_text(encoding="utf-8")
@@ -103,7 +153,7 @@ def read_readme() -> str:
 
 def split_readme(source: str) -> list[tuple[Page, str]]:
     chunks: list[tuple[Page, str]] = []
-    for page in PAGES:
+    for page in README_PAGES:
         start = source.index(page.start) if page.start else 0
         end = source.index(page.end) if page.end else len(source)
         chunks.append((page, source[start:end]))
@@ -111,6 +161,30 @@ def split_readme(source: str) -> list[tuple[Page, str]]:
     if "".join(chunk for _, chunk in chunks) != source:
         raise RuntimeError("Page boundaries do not reproduce README.md exactly")
     return chunks
+
+
+def collect_page_sources(source: str) -> list[tuple[Page, str]]:
+    sources = {page.slug: chunk for page, chunk in split_readme(source)}
+    sources["overview"] = sources["overview"].replace(
+        "Primarily targeting NVIDIA GPUs (for now), TLX extends Triton to support:",
+        "TLX targets NVIDIA and AMD GPUs and supports:",
+        1,
+    )
+    overview_marker = "## Nightly builds (fbtriton)"
+    if overview_marker not in sources["overview"]:
+        raise RuntimeError(f"Missing overview insertion point: {overview_marker}")
+    overview_addition = GUIDE_CONTENT["overview"].strip()
+    sources["overview"] = sources["overview"].replace(
+        overview_marker,
+        f"{overview_addition}\n\n{overview_marker}",
+        1,
+    )
+
+    for slug, content in GUIDE_CONTENT.items():
+        if slug != "overview":
+            sources[slug] = content.strip() + "\n"
+
+    return [(page, sources[page.slug]) for page in PAGES]
 
 
 def slugify(value: str) -> str:
@@ -121,8 +195,12 @@ def slugify(value: str) -> str:
 
 def repository_link(target: str) -> str:
     target = target.strip()
-    if target.startswith(("http://", "https://", "#", "mailto:")):
+    if target.startswith(("http://", "https://", "#", "mailto:", "./", "../")):
         return target
+    if target.endswith(".html"):
+        return target
+    if target.endswith("/"):
+        return f"{REPOSITORY_URL}/tree/main/{target.lstrip('./')}"
     return f"{REPOSITORY_URL}/blob/main/{target.lstrip('./')}"
 
 
@@ -205,6 +283,17 @@ def render_markdown(source: str) -> str:
         if in_code:
             code_lines.append(line)
             index += 1
+            continue
+
+        if line.startswith(">"):
+            flush_paragraph()
+            quote_lines = []
+            while index < len(lines) and lines[index].startswith(">"):
+                quote_lines.append(lines[index][1:].strip())
+                index += 1
+            output.append(
+                f"<blockquote><p>{render_inline(' '.join(quote_lines))}</p></blockquote>"
+            )
             continue
 
         heading = re.match(r"^(#{1,6})\s+(.+)$", line)
@@ -335,7 +424,7 @@ def render_page(page: Page, source: str) -> str:
 
 
 def main() -> None:
-    chunks = split_readme(read_readme())
+    chunks = collect_page_sources(read_readme())
 
     for page, source in chunks:
         output = (
@@ -345,7 +434,7 @@ def main() -> None:
         )
         output.write_text(render_page(page, source), encoding="utf-8")
 
-    print(f"Generated {len(chunks)} pages from main:README.md")
+    print(f"Generated {len(chunks)} pages from README.md and guide content")
 
 
 if __name__ == "__main__":

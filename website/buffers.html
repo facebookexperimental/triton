@@ -16,13 +16,18 @@
     <aside class="sidebar">
       <p class="eyebrow">Documentation</p>
       <nav><a href="../">Overview</a>
+<a href="getting-started.html">Getting started</a>
+<a href="hardware-support.html">Hardware support</a>
 <a href="buffers.html" aria-current="page">Local and remote buffers</a>
 <a href="async-memory.html">Async memory access</a>
 <a href="async-compute.html">Async tensor core operations</a>
 <a href="synchronization.html">Barriers and Cluster Launch Control</a>
 <a href="warp-specialization.html">Warp specialization and clustering</a>
 <a href="utilities.html">Other operations</a>
+<a href="performance-optimization.html">Performance optimization</a>
+<a href="debugging.html">Debugging performance and numerics</a>
 <a href="kernels.html">Example kernels</a>
+<a href="production-case-studies.html">Production case studies</a>
 <a href="install-and-test.html">Build, install, and test</a>
 <a href="resources.html">More reading</a></nav>
     </aside>
@@ -30,7 +35,7 @@
       <p class="eyebrow">TLX documentation</p>
       <h1>Local and remote buffers</h1>
       <p class="lede">Allocate, view, load, store, and share hardware-near buffers.</p>
-      <article><p>&gt; <strong>Hardware availability tags.</strong> Each op below is tagged with the targets it runs on: &gt; <code>**[Hopper+]**</code> = NVIDIA Hopper and newer; <code>**[MI300+]**</code> = AMD MI300 (CDNA3) and MI350 (CDNA4); &gt; <code>**[MI350]**</code> = AMD MI350 (CDNA4) only. A trailing <code>?</code> (e.g. <code>**[MI300+?]**</code>) marks AMD availability &gt; that has <strong>not been confirmed yet</strong> and needs verification. &gt; Note: async copies (<code>async_load</code> and its commit/wait groups) and the AMD buffer ops require <strong>MI350</strong> — &gt; they are <strong>not</strong> available on MI300. <code>barrier_arrive</code> on AMD requires <code>arrive_count == 1</code>.</p>
+      <article><blockquote><p><strong>Hardware availability tags.</strong> Each op below is tagged with the targets it runs on: <code>**[Hopper+]**</code> = NVIDIA Hopper and newer; <code>**[MI300+]**</code> = AMD MI300 (CDNA3) and MI350 (CDNA4); <code>**[MI350]**</code> = AMD MI350 (CDNA4) only. A trailing <code>?</code> (e.g. <code>**[MI300+?]**</code>) marks AMD availability that has <strong>not been confirmed yet</strong> and needs verification. Note: async copies (<code>async_load</code> and its commit/wait groups) and the AMD buffer ops require <strong>MI350</strong> — they are <strong>not</strong> available on MI300. <code>barrier_arrive</code> on AMD requires <code>arrive_count == 1</code>.</p></blockquote>
 <h3 id="local-buffer-operations">Local buffer operations</h3>
 <div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>buffers = tlx.local_alloc(shape, dtype, NUM_BUFFERS)</code> <strong>[Hopper+, MI300+]</strong></div></div>
 <p>Allocate <code>NUM_BUFFERS</code> buffers in local memory per thread block, each of the specified size. The memory layout is inferred from its consumers.</p>
@@ -124,7 +129,7 @@ triton.knobs.runtime.add_stages_inspection_hook = inspect_stages</code></pre>
 
   # Store to remote CTA&#x27;s shared memory (synchronous)
   tlx.remote_shmem_store(buffer[0], src_tensor, remote_cta_rank=1)</code></pre></article>
-      <footer class="pager"><a href="../">← Overview</a><a class="next" href="async-memory.html">Async memory access →</a></footer>
+      <footer class="pager"><a href="hardware-support.html">← Hardware support</a><a class="next" href="async-memory.html">Async memory access →</a></footer>
     </main>
   </div>
 </body>
