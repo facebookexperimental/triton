@@ -329,23 +329,6 @@ static LogicalResult materializePartitionOutputs(
   return success();
 }
 
-static int getTxCount(Operation *descOp) {
-  RankedTensorType tensorType;
-  Value desc;
-  if (auto load = dyn_cast<DescriptorLoadOp>(descOp)) {
-    tensorType = load.getType();
-    desc = load.getDesc();
-  } else {
-    auto gather = cast<DescriptorGatherOp>(descOp);
-    tensorType = gather.getType();
-    desc = gather.getDesc();
-  }
-  Attribute encoding = getEncodingFromDescriptor(descOp, tensorType, desc);
-  auto shapePerCTA = getShapePerCTA(encoding, tensorType.getShape());
-  return product(shapePerCTA) *
-         getIntOrFloatOrPtrBitWidth(tensorType.getElementType()) / 8;
-}
-
 static std::optional<int> getEnclosingWarpSpecializeTag(Operation *op) {
   for (Operation *parent = op->getParentOp(); parent;
        parent = parent->getParentOp()) {
@@ -530,55 +513,13 @@ static LogicalResult tagExternalPartitionedOps(FuncOp func,
   return success();
 }
 
-static LogicalResult convertDescriptorGathers(FuncOp func) {
-  SmallVector<LocalStoreOp> stores;
+static void assertNoLegacyDescriptorStores(FuncOp func) {
   func.walk([&](LocalStoreOp store) {
     Operation *producer = store.getSrc().getDefiningOp();
-    assert(!isa_and_nonnull<DescriptorLoadOp>(producer) &&
-           "tt.descriptor_load must be converted to nvws.descriptor_load "
-           "before MetaToNVWSConvert");
-    if (isa_and_nonnull<DescriptorGatherOp>(producer))
-      stores.push_back(store);
+    assert((!isa_and_nonnull<DescriptorLoadOp, DescriptorGatherOp>(producer)) &&
+           "tt.descriptor_load/gather must be converted to NVWS descriptor "
+           "operations before MetaToNVWSConvert");
   });
-
-  for (LocalStoreOp store : stores) {
-    Operation *descOp = store.getSrc().getDefiningOp();
-    FailureOr<SmallVector<int>> descIds = getNormalizedTaskIds(descOp);
-    if (failed(descIds))
-      return descOp->emitError(
-          "MetaToNVWSConvert descriptor producer is missing its Meta task "
-          "assignment");
-    SetVector<int> expectedPartitions;
-    expectedPartitions.insert(descIds->begin(), descIds->end());
-    SetVector<int> storePartitions;
-    if (hasPartition(store)) {
-      storePartitions = getPartitionIds(store);
-    } else if (FailureOr<SmallVector<int>> storeIds =
-                   getNormalizedTaskIds(store);
-               succeeded(storeIds)) {
-      storePartitions.insert(storeIds->begin(), storeIds->end());
-    }
-    if (storePartitions != expectedPartitions)
-      return store.emitError(
-          "MetaToNVWSConvert descriptor producer and planned local_store "
-          "have different task assignments");
-
-    OpBuilder builder(store);
-    int txCount = getTxCount(descOp);
-    auto gather = cast<DescriptorGatherOp>(descOp);
-    Operation *newOp = triton::nvws::DescriptorGatherOp::create(
-        builder, gather.getLoc(), gather.getDesc(), gather.getXOffsets(),
-        gather.getYOffset(), txCount, store.getDst());
-    newOp->setAttrs(descOp->getAttrs());
-    newOp->setAttr(kPartitionAttrName,
-                   DenseI32ArrayAttr::get(store.getContext(), *descIds));
-    newOp->removeAttr("async_task_id");
-
-    store.erase();
-    if (descOp->use_empty())
-      descOp->erase();
-  }
-  return success();
 }
 
 struct SmemPlanPolicy {
@@ -1007,14 +948,14 @@ static LogicalResult convertFunc(FuncOp func) {
   DenseSet<Operation *> consumedExternalTaskIds;
   WalkResult partitionResult = func.walk([&](Operation *op) {
     if (!isWarpSpecializeLoop(op) && !isNestedInWarpSpecializeLoop(op)) {
-      // Descriptor loads are converted before this bridge by current Meta
-      // memory planning or NVWSInsertAllocas. A root-scope descriptor load is a
-      // partitioned sibling of the WS loop, just like an external managed
-      // alias. Preserve its Meta ownership, including on repeated bridge
-      // conversion after async_task_id has already been consumed.
-      bool isPreconvertedDescriptorLoad =
-          isa<triton::nvws::DescriptorLoadOp>(op);
-      if (externalAliases->contains(op) || isPreconvertedDescriptorLoad) {
+      // Descriptor operations are converted before this bridge by current
+      // Meta memory planning or NVWSInsertAllocas. A root-scope descriptor
+      // producer is a partitioned sibling of the WS loop, just like an external
+      // managed alias. Preserve its Meta ownership, including on repeated
+      // bridge conversion after async_task_id has already been consumed.
+      bool isPreconvertedDescriptor =
+          isa<triton::nvws::DescriptorLoadOpInterface>(op);
+      if (externalAliases->contains(op) || isPreconvertedDescriptor) {
         if (failed(materializePartition(op)))
           return WalkResult::interrupt();
         consumedExternalTaskIds.insert(op);
@@ -1046,8 +987,8 @@ static LogicalResult convertFunc(FuncOp func) {
   if (outputResult.wasInterrupted())
     return failure();
 
-  if (failed(convertDescriptorGathers(func)) ||
-      failed(tagExternalPartitionedOps(func, wsLoops)) ||
+  assertNoLegacyDescriptorStores(func);
+  if (failed(tagExternalPartitionedOps(func, wsLoops)) ||
       failed(translateBufferPlan(func)) ||
       failed(localizeManagedAllocGroups(func)))
     return failure();
