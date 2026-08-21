@@ -81,5 +81,6 @@ exclude: |
     ^python/triton/experimental/gluon/|
     ^third_party/tlx/tools/|
     ^third_party/nvidia/hopper/lib/Transforms/ModuloScheduling/|
+    ^lib/Tools/ModularArithmetic\.cpp$|
     ^bitequiv/
   )

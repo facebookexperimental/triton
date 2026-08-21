@@ -1,89 +1,17 @@
 """Tests for triton_dispatcher_factory.py — tensordesc expansion logic.
 
-These tests verify the pure-Python type expansion and wrapper logic without
-needing a GPU or the full compiled triton module. We mock the heavy triton
-imports and load the module under test directly via importlib.
+These tests verify the pure-Python type expansion and wrapper logic. Importing
+the factory is cheap and does not initialize a GPU: its only module-level
+dependencies are triton.runtime._allocation and the lazy triton.runtime.driver
+proxy.
 """
 
-import importlib.util
-import os
-import sys
 import unittest
-from unittest.mock import MagicMock
 
+from triton.backends.nvidia import triton_dispatcher_factory as factory  # pyre-ignore[21]
 
-def _load_factory_module():
-    """Load triton_dispatcher_factory.py with mocked triton deps."""
-    # Save original state
-    saved = {}
-    mock_keys = [
-        "triton.runtime",
-        "triton.runtime._allocation",
-        "triton.runtime.driver",
-    ]
-    for key in mock_keys:
-        if key in sys.modules:
-            saved[key] = sys.modules[key]
-
-    # Mock only the specific submodules the factory needs (not "triton" itself)
-    mock_runtime = MagicMock()
-    sys.modules["triton.runtime"] = mock_runtime
-    sys.modules["triton.runtime._allocation"] = mock_runtime._allocation
-    sys.modules["triton.runtime.driver"] = mock_runtime.driver
-
-    try:
-        # Try multiple locations for the source file
-        candidates = [
-            # Direct path (devserver)
-            os.path.join(
-                os.environ.get(
-                    "FBSOURCE_DIR",
-                    "/data/users/{}/fbsource".format(os.environ.get("USER", "")),
-                ),
-                "third-party/triton/beta/triton/third_party/nvidia/backend/triton_dispatcher_factory.py",
-            ),
-            # Buck resource (relative to this test file)
-            os.path.join(
-                os.path.dirname(os.path.abspath(__file__)),
-                "triton_dispatcher_factory.py",
-            ),
-        ]
-
-        for factory_path in candidates:
-            if os.path.exists(factory_path):
-                spec = importlib.util.spec_from_file_location("triton_dispatcher_factory", factory_path)
-                assert spec is not None and spec.loader is not None
-                mod = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(mod)
-                return mod
-
-        raise FileNotFoundError(f"Cannot find triton_dispatcher_factory.py. Tried: {candidates}")
-    finally:
-        # Restore original state
-        for key in mock_keys:
-            if key in saved:
-                sys.modules[key] = saved[key]
-            else:
-                sys.modules.pop(key, None)
-
-
-_factory_cache = None
-
-
-def _get_factory():
-    """Lazy-load factory module (avoids side effects at import time)."""
-    global _factory_cache
-    if _factory_cache is None:
-        _factory_cache = _load_factory_module()
-    return _factory_cache
-
-
-def _expand_schema_arg_types(schema):
-    return _get_factory()._expand_schema_arg_types(schema)
-
-
-def _TensorDescDispatcherWrapper(*args, **kwargs):
-    return _get_factory()._TensorDescDispatcherWrapper(*args, **kwargs)
+_expand_schema_arg_types = factory._expand_schema_arg_types
+_TensorDescDispatcherWrapper = factory._TensorDescDispatcherWrapper
 
 
 def _make_schema(args, tensordesc_meta=None):
@@ -360,8 +288,6 @@ class TestMakeTritonDispatcherClusterDims(unittest.TestCase):
     def test_cluster_dims_forwarded_to_dispatcher(self):
         """make_triton_dispatcher passes cluster_dims kwargs to _TritonDispatcher."""
         import unittest.mock as mock
-
-        factory = _get_factory()
 
         # Mock _load_module to return a mock with _TritonDispatcher and build_signature_metadata
         mock_module = mock.MagicMock()

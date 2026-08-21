@@ -297,9 +297,9 @@ int modRREF(ModMatrix &mat) {
 // NB: The `modulus` parameter is the modulus used for the solve, which may
 // differ from A.modulus (the modulus A was originally constructed with).
 // Callers (e.g. modSolveLinearCRT) re-reduce A's entries mod the new modulus.
-static std::vector<int64_t>
-solveLinear(const ModMatrix &A, const std::vector<int64_t> &b,
-            int64_t modulus) {
+static std::vector<int64_t> solveLinear(const ModMatrix &A,
+                                        const std::vector<int64_t> &b,
+                                        int64_t modulus) {
   int n = A.rows;
   int m = A.cols;
 
@@ -371,7 +371,7 @@ std::vector<int64_t> modSolveLinear(const ModMatrix &A,
                                     int64_t modulus) {
   auto solution = solveLinear(A, b, modulus);
   return isSolution(A, b, solution, modulus) ? solution
-                                              : std::vector<int64_t>{};
+                                             : std::vector<int64_t>{};
 }
 
 ModularSolveResult tryModSolveLinear(const ModMatrix &A,
@@ -484,8 +484,7 @@ std::vector<int64_t> modSolveLinearHensel(const ModMatrix &A,
 ModularSolveResult tryModSolveLinearHensel(const ModMatrix &A,
                                            const std::vector<int64_t> &b,
                                            int64_t prime, int exponent) {
-  if (!isPrime(prime) || exponent < 1 ||
-      static_cast<int>(b.size()) != A.rows)
+  if (!isPrime(prime) || exponent < 1 || static_cast<int>(b.size()) != A.rows)
     return {ModularSolveStatus::Unsupported, {}};
 
   auto modulus = getSupportedPrimePower(prime, exponent);
