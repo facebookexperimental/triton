@@ -1007,17 +1007,9 @@ def test_amd_scheduled_mfma_persistent_acc_lowering_gfx950(elem_ty):
     )
     llir = compiled.asm["llir"]
     asm_ty = "f16" if elem_ty == "fp16" else elem_ty
-    # A persistent accumulator lowers to inline asm so the accumulator's
-    # register class is preserved. AMDGPU's hazard recognizer cannot see an
-    # MFMA inside `asm sideeffect`, so the required wait states are part of the
-    # asm: `s_nop 3` before the MFMA covers a preceding VALU write of srcA/srcB
-    # or EXEC. Without it the MFMA reads stale operands and the kernel silently
-    # computes garbage.
     assert f'asm sideeffect "s_nop 3\\0Av_mfma_f32_16x16x32_{asm_ty}' in llir
     assert '"=a,v,v"' in llir
     assert f"@llvm.amdgcn.mfma.f32.16x16x32.{asm_ty}" not in llir
-    # ...and the chain is drained (18 wait states) before anything reads the
-    # accumulator back.
     assert 'asm sideeffect "s_nop 15\\0As_nop 1"' in llir
 
 
