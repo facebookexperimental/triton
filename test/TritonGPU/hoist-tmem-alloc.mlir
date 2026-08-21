@@ -44,6 +44,31 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 
 // -----
 
+// A post-specialization, tokenless predicated TMEM read-modify-write must
+// become real control flow. Otherwise the accumulator load and multiply still
+// execute when the store predicate is false.
+#blocked = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [1, 0]}>
+#tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  // POST-PIPELINE-LABEL: @materialize_tokenless_conditional_tmem_update
+  // POST-PIPELINE: scf.if %[[PRED:.*]] {
+  // POST-PIPELINE-NEXT: %[[ACC:.*]] = ttng.tmem_load
+  // POST-PIPELINE-NEXT: %[[SCALED:.*]] = arith.mulf %[[ACC]],
+  // POST-PIPELINE-NEXT: ttng.tmem_store %[[SCALED]],
+  // POST-PIPELINE-NEXT: }
+  tt.func public @materialize_tokenless_conditional_tmem_update(
+      %mem: !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>,
+      %pred: i1,
+      %alpha: tensor<128x128xf32, #blocked>) {
+    %acc = ttng.tmem_load %mem : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #blocked>
+    %scaled = arith.mulf %acc, %alpha : tensor<128x128xf32, #blocked>
+    ttng.tmem_store %scaled, %mem, %pred : tensor<128x128xf32, #blocked> -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+    tt.return
+  }
+}
+
+// -----
+
 #blocked = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [1, 0]}>
 #blocked1 = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [2, 16], warpsPerCTA = [4, 1], order = [1, 0]}>
 #shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
