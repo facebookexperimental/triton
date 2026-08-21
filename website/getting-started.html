@@ -4,18 +4,21 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="description" content="Start with TLX imports, tutorials, and a minimal warp-specialized kernel.">
-  <title>Getting started · TLX</title>
-  <link rel="stylesheet" href="assets/tlx.css">
+  <title>Getting started · FBTriton</title>
+  <link rel="stylesheet" href="assets/tlx.css?v=20260821b">
 </head>
 <body>
   <header class="topbar">
-    <a class="brand" href="../"><span>TLX</span> Triton Low-level Language Extensions</a>
+    <a class="brand" href="../"><span>FB</span>Triton</a>
+    <nav class="topnav" aria-label="Top-level sections"><a href="triton.html">Triton</a>
+<a href="tlx.html" data-current="true">TLX</a>
+<a href="tooling.html">Tooling</a></nav>
     <a class="repo-link" href="https://github.com/facebookexperimental/triton" target="_blank" rel="noreferrer">View on GitHub ↗</a>
   </header>
   <div class="shell">
-    <aside class="sidebar">
-      <p class="eyebrow">Documentation</p>
-      <nav><a href="../">Overview</a>
+<aside class="sidebar">
+      <p class="eyebrow">TLX documentation</p>
+      <nav><a href="tlx.html">Overview</a>
 <a href="getting-started.html" aria-current="page">Getting started</a>
 <a href="hardware-support.html">Hardware support</a>
 <a href="buffers.html">Local and remote buffers</a>
@@ -68,7 +71,7 @@ def add2_kernel(x, y, out_xy, a, b, out_ab, n_elements, BLOCK_SIZE: tl.constexpr
 <div class="list-item depth-0"><span aria-hidden="true">•</span><div>Add phase-based handoffs using the <a href="synchronization.html">barrier and CLC</a> APIs.</div></div>
 <div class="list-item depth-0"><span aria-hidden="true">•</span><div>Compare Hopper, Blackwell, and AMD tutorial implementations of the same operation.</div></div>
 <div class="list-item depth-0"><span aria-hidden="true">•</span><div>Use the <a href="performance-optimization.html">performance optimization</a> checklist only after correctness is established.</div></div></article>
-      <footer class="pager"><a href="../">← Overview</a><a class="next" href="hardware-support.html">Hardware support →</a></footer>
+<footer class="pager"><a href="tlx.html">← TLX</a><a class="next" href="hardware-support.html">Hardware support →</a></footer>
     </main>
   </div>
 </body>

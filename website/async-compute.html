@@ -4,18 +4,21 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="description" content="Issue and coordinate asynchronous tensor-core work.">
-  <title>Async tensor core operations · TLX</title>
-  <link rel="stylesheet" href="assets/tlx.css">
+  <title>Async tensor core operations · FBTriton</title>
+  <link rel="stylesheet" href="assets/tlx.css?v=20260821b">
 </head>
 <body>
   <header class="topbar">
-    <a class="brand" href="../"><span>TLX</span> Triton Low-level Language Extensions</a>
+    <a class="brand" href="../"><span>FB</span>Triton</a>
+    <nav class="topnav" aria-label="Top-level sections"><a href="triton.html">Triton</a>
+<a href="tlx.html" data-current="true">TLX</a>
+<a href="tooling.html">Tooling</a></nav>
     <a class="repo-link" href="https://github.com/facebookexperimental/triton" target="_blank" rel="noreferrer">View on GitHub ↗</a>
   </header>
   <div class="shell">
-    <aside class="sidebar">
-      <p class="eyebrow">Documentation</p>
-      <nav><a href="../">Overview</a>
+<aside class="sidebar">
+      <p class="eyebrow">TLX documentation</p>
+      <nav><a href="tlx.html">Overview</a>
 <a href="getting-started.html">Getting started</a>
 <a href="hardware-support.html">Hardware support</a>
 <a href="buffers.html">Local and remote buffers</a>
@@ -137,7 +140,7 @@
 <pre><code class="language-python">    acc = tlx.async_dot(a_smem, b_smem)
     acc = tlx.async_dot_wait(tl.constexpr(0), acc)
     tl.store(C_ptrs, acc)</code></pre></article>
-      <footer class="pager"><a href="async-memory.html">← Async memory access</a><a class="next" href="synchronization.html">Barriers and Cluster Launch Control →</a></footer>
+<footer class="pager"><a href="async-memory.html">← Async memory access</a><a class="next" href="synchronization.html">Barriers and Cluster Launch Control →</a></footer>
     </main>
   </div>
 </body>

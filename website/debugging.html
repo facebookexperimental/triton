@@ -4,18 +4,21 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="description" content="Diagnose compiler, runtime, performance, and numerical issues systematically.">
-  <title>Debugging performance and numerics · TLX</title>
-  <link rel="stylesheet" href="assets/tlx.css">
+  <title>Debugging performance and numerics · FBTriton</title>
+  <link rel="stylesheet" href="assets/tlx.css?v=20260821b">
 </head>
 <body>
   <header class="topbar">
-    <a class="brand" href="../"><span>TLX</span> Triton Low-level Language Extensions</a>
+    <a class="brand" href="../"><span>FB</span>Triton</a>
+    <nav class="topnav" aria-label="Top-level sections"><a href="triton.html">Triton</a>
+<a href="tlx.html" data-current="true">TLX</a>
+<a href="tooling.html">Tooling</a></nav>
     <a class="repo-link" href="https://github.com/facebookexperimental/triton" target="_blank" rel="noreferrer">View on GitHub ↗</a>
   </header>
   <div class="shell">
-    <aside class="sidebar">
-      <p class="eyebrow">Documentation</p>
-      <nav><a href="../">Overview</a>
+<aside class="sidebar">
+      <p class="eyebrow">TLX documentation</p>
+      <nav><a href="tlx.html">Overview</a>
 <a href="getting-started.html">Getting started</a>
 <a href="hardware-support.html">Hardware support</a>
 <a href="buffers.html">Local and remote buffers</a>
@@ -42,8 +45,7 @@
 <div class="list-item depth-0"><span aria-hidden="true">•</span><div><strong>Inspect every compilation stage.</strong> Compare TTIR, TTGIR, LLVM IR, and PTX or AMDGPU output rather than reasoning only from Python source.</div></div>
 <div class="list-item depth-0"><span aria-hidden="true">•</span><div><strong>Diff known-good and regressed builds.</strong> Hold shapes and launch metadata constant while comparing generated IR and selected autotune configurations.</div></div>
 <div class="list-item depth-0"><span aria-hidden="true">•</span><div><strong>Inspect runtime scheduling.</strong> Warp traces reveal barrier stalls, load/compute imbalance, deadlocks, and instruction issue gaps that static IR cannot.</div></div>
-<h3 id="diagnostic-tools">Diagnostic tools</h3>
-<table><thead><tr><th>Tool</th><th>Use</th></tr></thead><tbody><tr><td>TritonParse</td><td>Capture and compare compilation and launch events; extract standalone reproductions and bisect regressions</td></tr><tr><td>Triton-MPP</td><td>Classify bottlenecks and collect occupancy, tensor-core, TMA, barrier, and per-operation latency data</td></tr><tr><td>CUTracer</td><td>Inspect SASS-level execution, reconstruct TMA/MMA activity, and investigate deadlocks or races</td></tr><tr><td>Compute Sanitizer</td><td>Check memory access, initialization, synchronization, and shared-memory races on a concrete kernel run</td></tr></tbody></table>
+<p>The <a href="tooling.html">Tooling</a> section summarizes the profiling, tracing, sanitizing, and benchmarking tools used in this workflow.</p>
 <h3 id="common-performance-symptoms">Common performance symptoms</h3>
 <table><thead><tr><th>Symptom</th><th>Likely cause</th><th>First checks</th></tr></thead><tbody><tr><td>Low tensor-core utilization</td><td>Unsupported dot shape/dtype or gaps between MMA issues</td><td>Inspect lowered MMA instructions and producer readiness</td></tr><tr><td>Register spills</td><td>Tiles or live ranges are too large</td><td>Reduce tile size, shorten live ranges, or rebalance registers across tasks</td></tr><tr><td>Memory bandwidth saturation</td><td>Too little reuse or compute overlap</td><td>Increase useful fusion or pipeline overlap; verify coalescing</td></tr><tr><td>Barrier stalls</td><td>Producer/consumer imbalance or incorrect stage cadence</td><td>Compare arrive/wait phases and time spent by each task</td></tr><tr><td>Low occupancy</td><td>Shared-memory, register, or cluster footprint is too large</td><td>Reduce stages, buffers, registers, or cluster size</td></tr><tr><td>Launch overhead dominates</td><td>Work is short or fragmented</td><td>Fuse stages or consider persistent scheduling</td></tr><tr><td>AMD LDS bank conflicts</td><td>Incompatible access pattern and layout</td><td>Try padded or swizzled LDS layouts and re-measure</td></tr></tbody></table>
 <h3 id="useful-compiler-controls">Useful compiler controls</h3>
@@ -90,7 +92,7 @@ error = (output - reference).abs()
 print(&quot;max abs:&quot;, error.max().item())
 print(&quot;mean abs:&quot;, error.mean().item())</code></pre>
 <p>Tolerance is workload-specific. Typical starting points are around <code>1e-5</code> for FP32, <code>1e-3</code> to <code>1e-2</code> for FP16/BF16, and wider for FP8-family inputs, always with FP32 reference accumulation where practical.</p></article>
-      <footer class="pager"><a href="performance-optimization.html">← Performance optimization</a><a class="next" href="kernels.html">Example kernels →</a></footer>
+<footer class="pager"><a href="performance-optimization.html">← Performance optimization</a><a class="next" href="kernels.html">Example kernels →</a></footer>
     </main>
   </div>
 </body>

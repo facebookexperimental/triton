@@ -4,18 +4,21 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="description" content="Thread, type, timing, and stochastic-rounding utilities.">
-  <title>Other operations · TLX</title>
-  <link rel="stylesheet" href="assets/tlx.css">
+  <title>Other operations · FBTriton</title>
+  <link rel="stylesheet" href="assets/tlx.css?v=20260821b">
 </head>
 <body>
   <header class="topbar">
-    <a class="brand" href="../"><span>TLX</span> Triton Low-level Language Extensions</a>
+    <a class="brand" href="../"><span>FB</span>Triton</a>
+    <nav class="topnav" aria-label="Top-level sections"><a href="triton.html">Triton</a>
+<a href="tlx.html" data-current="true">TLX</a>
+<a href="tooling.html">Tooling</a></nav>
     <a class="repo-link" href="https://github.com/facebookexperimental/triton" target="_blank" rel="noreferrer">View on GitHub ↗</a>
   </header>
   <div class="shell">
-    <aside class="sidebar">
-      <p class="eyebrow">Documentation</p>
-      <nav><a href="../">Overview</a>
+<aside class="sidebar">
+      <p class="eyebrow">TLX documentation</p>
+      <nav><a href="tlx.html">Overview</a>
 <a href="getting-started.html">Getting started</a>
 <a href="hardware-support.html">Hardware support</a>
 <a href="buffers.html">Local and remote buffers</a>
@@ -295,7 +298,7 @@ acc = tlx.dot_scaled(
 <h3 id="explicit-wmma-layout-pinning">Explicit WMMA layout pinning</h3>
 <p><code>tlx.require_amd_wmma_layout(x, version=3, transposed=True, warp_bases=..., reg_bases=..., instr_shape=(16, 16, 128))</code> pins a tensor to an explicit AMD WMMA register/warp layout. This is useful for tuned gfx1250 epilogues that must retain the accumulator ownership chosen by <code>tiles_per_warp</code> across otherwise layout-neutral tensor operations. The bases contain one linear-layout basis vector per register or warp bit and must match the tensor rank.</p>
 <p>The helper lowers to a pinned <code>tlx.require_layout</code>; omit it when automatic layout propagation is sufficient.</p></article>
-      <footer class="pager"><a href="warp-specialization.html">← Warp specialization and clustering</a><a class="next" href="performance-optimization.html">Performance optimization →</a></footer>
+<footer class="pager"><a href="warp-specialization.html">← Warp specialization and clustering</a><a class="next" href="performance-optimization.html">Performance optimization →</a></footer>
     </main>
   </div>
 </body>
