@@ -3842,8 +3842,16 @@ class _attention(torch.autograd.Function):
         assert q.is_contiguous() and k.is_contiguous() and v.is_contiguous()
         assert o.is_contiguous() and do.is_contiguous()
         direct_dq_output = ctx.HEAD_DIM == 128
+        bf16_dq_output = (
+            direct_dq_output
+            and q.dtype == torch.bfloat16
+            and not ctx.causal
+        )
         if direct_dq_output:
-            dq = torch.zeros(q.shape, device=q.device, dtype=torch.float32)
+            if bf16_dq_output:
+                dq = torch.zeros(q.shape, device=q.device, dtype=torch.bfloat16)
+            else:
+                dq = torch.zeros(q.shape, device=q.device, dtype=torch.float32)
         else:
             dq = torch.empty(q.shape, device=q.device, dtype=torch.float32)
         dk = torch.empty_like(k)
