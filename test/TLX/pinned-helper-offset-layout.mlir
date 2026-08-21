@@ -12,6 +12,8 @@
 // passes is disabled because the current bug makes the call invalid again by
 // releasing only its operand.
 //
+// CHECK-DAG: #[[$TRANSPOSE_SRC_LINEAR:.*]] = #ttg.linear<{{.*}}register = {{\[\[0, 1\], \[8, 0\], \[0, 8\], \[0, 16\], \[0, 32\]\]}}
+// CHECK-DAG: #[[$TRANSPOSE_SRC_USER:.*]] = #tlx.user_layout<#[[$TRANSPOSE_SRC_LINEAR]]>
 // The helper restructures only the loaded value. The pinned offset flows into
 // amdg.buffer_load, which is an ownership boundary for argument dataflow.
 //
@@ -34,6 +36,11 @@
 // CHECK: %[[EXPLICIT_PIN:.*]] = tlx.require_layout
 // CHECK: %[[UNPINNED:.*]] = tt.call @explicit_release(%[[EXPLICIT_PIN]])
 // CHECK-SAME: -> tensor<4x256xi32>
+// CHECK: tt.return
+// CHECK-LABEL: tt.func public @transpose_result_pin
+// CHECK: %[[TRANSPOSE_VALUE:.*]] = arith.constant
+// CHECK-SAME: tensor<128x64xf32, #tlx.no_verify_layout<#[[$TRANSPOSE_SRC_USER]]>>
+// CHECK: tt.trans %[[TRANSPOSE_VALUE]]
 // CHECK: tt.return
 //
 // Full post-fixup snapshots follow. The current module uses generic syntax
@@ -107,6 +114,14 @@
   block = []
 }>
 #pin = #tlx.no_verify_layout<#tlx.user_layout<#tlx.no_verify_layout<#physical>>>
+#transpose_physical = #ttg.linear<{
+  register = [[1, 0], [0, 8], [8, 0], [16, 0], [32, 0]],
+  lane = [[2, 0], [4, 0], [0, 1], [0, 2], [0, 4]],
+  warp = [[0, 32], [0, 64], [0, 16]],
+  block = []
+}>
+#transpose_pin = #tlx.no_verify_layout<#tlx.user_layout<#transpose_physical>>
+#transpose_wrong_src_pin = #tlx.no_verify_layout<#tlx.user_layout<#transpose_physical>>
 
 module {
   tt.func private @load_then_restructure(
@@ -141,6 +156,14 @@ module {
         : tensor<4x256xi32> -> tensor<4x256xi32, #pin>
     %released = tt.call @explicit_release(%pinned)
         : (tensor<4x256xi32, #pin>) -> tensor<4x256xi32>
+    tt.return
+  }
+
+  tt.func public @transpose_result_pin() {
+    %value = arith.constant dense<0.0> : tensor<128x64xf32, #transpose_wrong_src_pin>
+    %transposed = tt.trans %value {order = array<i32: 1, 0>}
+        : tensor<128x64xf32, #transpose_wrong_src_pin>
+          -> tensor<64x128xf32, #transpose_pin>
     tt.return
   }
 }
