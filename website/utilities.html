@@ -16,13 +16,18 @@
     <aside class="sidebar">
       <p class="eyebrow">Documentation</p>
       <nav><a href="../">Overview</a>
+<a href="getting-started.html">Getting started</a>
+<a href="hardware-support.html">Hardware support</a>
 <a href="buffers.html">Local and remote buffers</a>
 <a href="async-memory.html">Async memory access</a>
 <a href="async-compute.html">Async tensor core operations</a>
 <a href="synchronization.html">Barriers and Cluster Launch Control</a>
 <a href="warp-specialization.html">Warp specialization and clustering</a>
 <a href="utilities.html" aria-current="page">Other operations</a>
+<a href="performance-optimization.html">Performance optimization</a>
+<a href="debugging.html">Debugging performance and numerics</a>
 <a href="kernels.html">Example kernels</a>
+<a href="production-case-studies.html">Production case studies</a>
 <a href="install-and-test.html">Build, install, and test</a>
 <a href="resources.html">More reading</a></nav>
     </aside>
@@ -135,7 +140,7 @@
     tlx.assert_same_layout(x, y)                # value/value
     tlx.assert_same_layout(x, REGISTER_LAYOUT)  # value/layout</code></pre>
 <h2 id="buffer-operations-amd">Buffer Operations (AMD)</h2>
-<p>&gt; <strong>[MI350]</strong> — available on AMD MI350 (CDNA4) only; not available on MI300.</p>
+<blockquote><p><strong>[MI350]</strong> — available on AMD MI350 (CDNA4) only; not available on MI300.</p></blockquote>
 <p>Buffer operations access global memory via a scalar base pointer and a tensor of i32 element offsets, rather than a tensor of pointers. This maps directly to AMD's hardware buffer instructions, which use a resource descriptor and byte offsets, enabling the hardware to do out-of-bounds checking and cache optimization.</p>
 <h3 id="tlx-buffer-load"><code>tlx.buffer_load</code></h3>
 <p>Load a tensor of values from global memory.</p>
@@ -193,7 +198,7 @@ base = tlx.assume_uniform(base)
 data = tlx.buffer_load(base, offsets)</code></pre>
 <p>Lowers to <code>amdg.assume_uniform</code>, which is eventually lowered to <code>llvm.amdgcn.readfirstlane</code> — that makes the result uniform by construction as far as LLVM's uniformity analysis is concerned. On non-AMD backends it is a no-op that returns its argument. Nothing verifies the assertion: if the value is not actually uniform, every lane silently gets lane 0's value.</p>
 <h2 id="explicit-mfma-scheduling-amd">Explicit MFMA Scheduling (AMD)</h2>
-<p>&gt; <strong>[MI350]</strong> — the source-scheduled operations are restricted to CDNA4 &gt; (<code>gfx950</code>) native BF16 MFMA layouts.</p>
+<blockquote><p><strong>[MI350]</strong> — the source-scheduled operations are restricted to CDNA4 (<code>gfx950</code>) native BF16 MFMA layouts.</p></blockquote>
 <div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tl.dot(a, b, acc)</code> preserves a TLX-pinned accumulator layout, so whole dots</div></div>
 <p>need no AMD-specific wrapper.</p>
 <div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.extract_slice(source, shape, offsets)</code> selects an aligned register</div></div>
@@ -225,7 +230,7 @@ a_tok = tlx.async_amd_descriptor_load_fused([
 ])
 tlx.async_amd_descriptor_wait(0, [a_tok])</code></pre>
 <h2 id="warp-pipeline-amd">Warp Pipeline (AMD)</h2>
-<p>&gt; <strong>[MI350]</strong> — AMD MI350 (CDNA4); not available on MI300.</p>
+<blockquote><p><strong>[MI350]</strong> — AMD MI350 (CDNA4); not available on MI300.</p></blockquote>
 <p><code>tlx.warp_pipeline_stage(label, *, priority=None)</code> is a context manager that marks explicit pipeline stage boundaries inside a loop. The compiler partitions the loop body at these boundaries and inserts conditional barriers so that one warp group executes one stage ahead of the other, overlapping memory latency with compute.</p>
 <p><strong>This is an explicit partitioning marker, not an automatic optimization.</strong> Correctness depends on the user's buffering and synchronization structure. In particular:</p>
 <div class="list-item depth-0"><span aria-hidden="true">•</span><div>Use multi-buffered shared memory (typically triple buffering with <code>NUM_BUFFERS=3</code>) to prevent data races between warp groups accessing the same buffer.</div></div>
@@ -290,7 +295,7 @@ acc = tlx.dot_scaled(
 <h3 id="explicit-wmma-layout-pinning">Explicit WMMA layout pinning</h3>
 <p><code>tlx.require_amd_wmma_layout(x, version=3, transposed=True, warp_bases=..., reg_bases=..., instr_shape=(16, 16, 128))</code> pins a tensor to an explicit AMD WMMA register/warp layout. This is useful for tuned gfx1250 epilogues that must retain the accumulator ownership chosen by <code>tiles_per_warp</code> across otherwise layout-neutral tensor operations. The bases contain one linear-layout basis vector per register or warp bit and must match the tensor rank.</p>
 <p>The helper lowers to a pinned <code>tlx.require_layout</code>; omit it when automatic layout propagation is sufficient.</p></article>
-      <footer class="pager"><a href="warp-specialization.html">← Warp specialization and clustering</a><a class="next" href="kernels.html">Example kernels →</a></footer>
+      <footer class="pager"><a href="warp-specialization.html">← Warp specialization and clustering</a><a class="next" href="performance-optimization.html">Performance optimization →</a></footer>
     </main>
   </div>
 </body>

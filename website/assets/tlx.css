@@ -87,6 +87,9 @@ a:hover {
 
 .sidebar {
   align-self: start;
+  max-height: calc(100vh - 132px);
+  overflow-y: auto;
+  padding-bottom: 16px;
   position: sticky;
   top: 112px;
 }
@@ -164,6 +167,19 @@ article h4 {
 
 article p {
   max-width: 78ch;
+}
+
+blockquote {
+  background: var(--surface);
+  border-left: 3px solid var(--accent);
+  border-radius: 0 8px 8px 0;
+  color: var(--muted);
+  margin: 1.5rem 0;
+  padding: 12px 18px;
+}
+
+blockquote p {
+  margin: 0;
 }
 
 code {
@@ -269,7 +285,9 @@ th {
   }
 
   .sidebar {
+    max-height: none;
     margin-bottom: 48px;
+    overflow: visible;
     position: static;
   }
 

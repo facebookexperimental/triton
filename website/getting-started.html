@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Start with TLX imports, tutorials, and a minimal warp-specialized kernel.">
+  <title>Getting started · TLX</title>
+  <link rel="stylesheet" href="assets/tlx.css">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="../"><span>TLX</span> Triton Low-level Language Extensions</a>
+    <a class="repo-link" href="https://github.com/facebookexperimental/triton" target="_blank" rel="noreferrer">View on GitHub ↗</a>
+  </header>
+  <div class="shell">
+    <aside class="sidebar">
+      <p class="eyebrow">Documentation</p>
+      <nav><a href="../">Overview</a>
+<a href="getting-started.html" aria-current="page">Getting started</a>
+<a href="hardware-support.html">Hardware support</a>
+<a href="buffers.html">Local and remote buffers</a>
+<a href="async-memory.html">Async memory access</a>
+<a href="async-compute.html">Async tensor core operations</a>
+<a href="synchronization.html">Barriers and Cluster Launch Control</a>
+<a href="warp-specialization.html">Warp specialization and clustering</a>
+<a href="utilities.html">Other operations</a>
+<a href="performance-optimization.html">Performance optimization</a>
+<a href="debugging.html">Debugging performance and numerics</a>
+<a href="kernels.html">Example kernels</a>
+<a href="production-case-studies.html">Production case studies</a>
+<a href="install-and-test.html">Build, install, and test</a>
+<a href="resources.html">More reading</a></nav>
+    </aside>
+    <main>
+      <p class="eyebrow">TLX documentation</p>
+      <h1>Getting started</h1>
+      <p class="lede">Start with TLX imports, tutorials, and a minimal warp-specialized kernel.</p>
+      <article><p>TLX is imported alongside Triton's standard language module. Start with ordinary Triton indexing and tensor operations, then introduce TLX only for the parts that need explicit warp-group, memory, or synchronization control.</p>
+<pre><code class="language-python">import triton
+import triton.language as tl
+import triton.language.extra.tlx as tlx</code></pre>
+<h2 id="quick-reference">Quick reference</h2>
+<table><thead><tr><th>Item</th><th>Repository location</th></tr></thead><tbody><tr><td>TLX implementation</td><td><a href="https://github.com/facebookexperimental/triton/tree/main/third_party/tlx/language/tlx/" target="_blank" rel="noreferrer">third_party/tlx/language/tlx</a></td></tr><tr><td>Exported API</td><td><a href="https://github.com/facebookexperimental/triton/blob/main/third_party/tlx/language/tlx/__init__.py" target="_blank" rel="noreferrer">third_party/tlx/language/tlx/__init__.py</a></td></tr><tr><td>Tutorials</td><td><a href="https://github.com/facebookexperimental/triton/tree/main/third_party/tlx/tutorials/" target="_blank" rel="noreferrer">third_party/tlx/tutorials</a></td></tr><tr><td>Design notes</td><td><a href="https://github.com/facebookexperimental/triton/tree/main/third_party/tlx/doc/" target="_blank" rel="noreferrer">third_party/tlx/doc</a></td></tr><tr><td>Correctness suite</td><td><a href="https://github.com/facebookexperimental/triton/blob/main/third_party/tlx/tutorials/testing/test_correctness.py" target="_blank" rel="noreferrer">third_party/tlx/tutorials/testing/test_correctness.py</a></td></tr></tbody></table>
+<p>Build instructions and test commands live on the <a href="install-and-test.html">Build, install, and test</a> page.</p>
+<h2 id="choose-a-first-tutorial">Choose a first tutorial</h2>
+<table><thead><tr><th>Target</th><th>Suggested starting point</th></tr></thead><tbody><tr><td>Simple warp specialization</td><td><a href="https://github.com/facebookexperimental/triton/blob/main/third_party/tlx/tutorials/vector-add2.py" target="_blank" rel="noreferrer">vector-add2.py</a></td></tr><tr><td>NVIDIA Hopper</td><td><a href="https://github.com/facebookexperimental/triton/blob/main/third_party/tlx/tutorials/hopper_fa_ws_pipelined.py" target="_blank" rel="noreferrer">hopper_fa_ws_pipelined.py</a></td></tr><tr><td>NVIDIA Blackwell</td><td><a href="https://github.com/facebookexperimental/triton/blob/main/third_party/tlx/tutorials/blackwell_fa_ws_pipelined.py" target="_blank" rel="noreferrer">blackwell_fa_ws_pipelined.py</a></td></tr><tr><td>AMD CDNA</td><td><a href="https://github.com/facebookexperimental/triton/blob/main/third_party/tlx/tutorials/amd_fa_pipelined.py" target="_blank" rel="noreferrer">amd_fa_pipelined.py</a></td></tr></tbody></table>
+<h2 id="minimal-warp-specialized-example">Minimal warp-specialized example</h2>
+<p>The starter tutorial computes two independent additions in parallel. The default task uses the kernel's normal warps; the second task reserves four additional warps.</p>
+<pre><code class="language-python">@triton.jit
+def add2_kernel(x, y, out_xy, a, b, out_ab, n_elements, BLOCK_SIZE: tl.constexpr):
+    offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets &lt; n_elements
+
+    with tlx.async_tasks():
+        with tlx.async_task(&quot;default&quot;):
+            lhs = tl.load(x + offsets, mask=mask)
+            rhs = tl.load(y + offsets, mask=mask)
+            tl.store(out_xy + offsets, lhs + rhs, mask=mask)
+
+        with tlx.async_task(num_warps=4):
+            lhs = tl.load(a + offsets, mask=mask)
+            rhs = tl.load(b + offsets, mask=mask)
+            tl.store(out_ab + offsets, lhs + rhs, mask=mask)</code></pre>
+<p>The tasks are independent here. Pipelined GEMM and attention kernels add shared buffers and mbarriers so producer and consumer groups can safely reuse storage across iterations.</p>
+<h2 id="a-practical-learning-path">A practical learning path</h2>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div>Run <code>vector-add2.py</code> to see task creation without synchronization.</div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div>Study <a href="buffers.html">local and remote buffers</a> and <a href="async-memory.html">async memory access</a>.</div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div>Add phase-based handoffs using the <a href="synchronization.html">barrier and CLC</a> APIs.</div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div>Compare Hopper, Blackwell, and AMD tutorial implementations of the same operation.</div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div>Use the <a href="performance-optimization.html">performance optimization</a> checklist only after correctness is established.</div></div></article>
+      <footer class="pager"><a href="../">← Overview</a><a class="next" href="hardware-support.html">Hardware support →</a></footer>
+    </main>
+  </div>
+</body>
+</html>
