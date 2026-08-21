@@ -400,6 +400,84 @@ def test_d64_dispatch_contract_is_ci_discovered(q_shape, k_shape, causal, family
 
 
 @triton.jit
+def _warp_vote_kernel(x_ptr, all_ptr, any_ptr, BLOCK: tl.constexpr):
+    offsets = tl.arange(0, BLOCK)
+    predicate = tl.load(x_ptr + offsets) != 0
+    all_value = tlx.warp_all(predicate).to(tl.int32)
+    any_value = tlx.warp_any(predicate).to(tl.int32)
+    tl.store(all_ptr + offsets, all_value)
+    tl.store(any_ptr + offsets, any_value)
+
+
+def test_amd_warp_votes_lower_without_public_ballot_gfx950():
+    compiled = compile_for_gfx950(
+        _warp_vote_kernel,
+        signature={
+            "x_ptr": "*i32",
+            "all_ptr": "*i32",
+            "any_ptr": "*i32",
+            "BLOCK": "constexpr",
+        },
+        constexprs={"BLOCK": 64},
+    )
+    assert 'ttg.warp_vote' in compiled.asm["ttgir"]
+    assert '"all"' in compiled.asm["ttgir"]
+    assert '"any"' in compiled.asm["ttgir"]
+    assert "warp_ballot" not in compiled.asm["ttgir"]
+    assert "llvm.amdgcn.ballot" in compiled.asm["llir"]
+
+
+@triton.jit
+def _warp_vote_scalar_predicate_kernel(output):
+    predicate = tl.program_id(0) == 0
+    tl.store(output, tlx.warp_all(predicate).to(tl.int32))
+
+
+def test_amd_warp_vote_rejects_scalar_predicate():
+    with pytest.raises(CompilationError, match="warp_all expects a distributed tensor predicate"):
+        compile_for_gfx950(
+            _warp_vote_scalar_predicate_kernel,
+            signature={"output": "*i32"},
+            constexprs={},
+        )
+
+
+def test_amd_warp_vote_rejects_multiple_elements_per_lane_gfx950():
+    with pytest.raises(RuntimeError, match="predicate must distribute exactly one element per lane"):
+        compile_for_gfx950(
+            _warp_vote_kernel,
+            signature={
+                "x_ptr": "*i32",
+                "all_ptr": "*i32",
+                "any_ptr": "*i32",
+                "BLOCK": "constexpr",
+            },
+            constexprs={"BLOCK": 512},
+        )
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_amd_warp_votes_correct_gfx950():
+    values = torch.ones(64, device="cuda", dtype=torch.int32)
+    all_output = torch.empty_like(values)
+    any_output = torch.empty_like(values)
+
+    _warp_vote_kernel[(1, )](values, all_output, any_output, BLOCK=64, num_warps=1)
+    torch.testing.assert_close(all_output, torch.ones_like(values))
+    torch.testing.assert_close(any_output, torch.ones_like(values))
+
+    values[17] = 0
+    _warp_vote_kernel[(1, )](values, all_output, any_output, BLOCK=64, num_warps=1)
+    torch.testing.assert_close(all_output, torch.zeros_like(values))
+    torch.testing.assert_close(any_output, torch.ones_like(values))
+
+    values.zero_()
+    _warp_vote_kernel[(1, )](values, all_output, any_output, BLOCK=64, num_warps=1)
+    torch.testing.assert_close(all_output, torch.zeros_like(values))
+    torch.testing.assert_close(any_output, torch.zeros_like(values))
+
+
+@triton.jit
 def _shared_concrete_helper(values):
     return values
 
