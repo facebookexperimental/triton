@@ -1,6 +1,9 @@
 #pragma once
 #include "amd/include/Dialect/TritonAMDGPU/IR/Dialect.h"
 #include "amd/include/TritonAMDGPUTransforms/Passes.h"
+#ifdef TRITON_ENABLE_CPU_BACKEND
+#include "cpu/include/TritonCPU/Registration.h"
+#endif
 #include "mlir/Dialect/LLVMIR/Transforms/InlinerInterfaceImpl.h"
 #include "nvidia/include/Dialect/NVGPU/IR/Dialect.h"
 #include "nvidia/include/Dialect/NVWS/IR/Dialect.h"
@@ -173,6 +176,10 @@ inline void registerTritonDialects(mlir::DialectRegistry &registry) {
 
   // TLX passes
   mlir::triton::tlx::registerPasses();
+
+#ifdef TRITON_ENABLE_CPU_BACKEND
+  mlir::triton::cpu::registerTritonCPU(registry);
+#endif
 
   // Register plugin passes and dialects.
   for (const auto &plugin : mlir::triton::plugin::loadPlugins()) {
