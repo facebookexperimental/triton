@@ -101,8 +101,15 @@ PROD_CONFIG: dict[str, Any] = {
 # attributed to either the kernel or the approximation rather than guessed at.
 
 # k = 2 * sqrt(2/pi), matching ads_mkl.
-GELU_TANH_K = 2.0 * 0.7978845608
-GELU_TANH_C = 0.044715
+#
+# Two spellings on purpose: `_fast_gelu` is @triton.jit and reads these as
+# module globals, which the code generator only permits for constexpr values
+# (plain floats raise NameError at compile time), while the torch mirror below
+# needs real Python floats to combine with tensors.
+_GELU_TANH_K = 2.0 * 0.7978845608
+_GELU_TANH_C = 0.044715
+GELU_TANH_K = tl.constexpr(_GELU_TANH_K)
+GELU_TANH_C = tl.constexpr(_GELU_TANH_C)
 
 
 def gelu_exact(x: torch.Tensor) -> torch.Tensor:
@@ -114,7 +121,7 @@ def gelu_exact(x: torch.Tensor) -> torch.Tensor:
 def fast_gelu_ref(x: torch.Tensor) -> torch.Tensor:
     """Torch mirror of the kernel's fast_gelu -- the ads_mkl AMD formula."""
     x = x.float()
-    return x * torch.sigmoid(GELU_TANH_K * x * (1.0 + GELU_TANH_C * x * x))
+    return x * torch.sigmoid(_GELU_TANH_K * x * (1.0 + _GELU_TANH_C * x * x))
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -526,11 +533,7 @@ _FWD_WAVES_PER_EU = (0, 2, 4)
 
 def _get_fwd_configs() -> list[triton.Config]:
     if FULL_TUNING:
-        tiles = [(bm, bn, nw, nb)
-                 for bm in (64, 128, 256)
-                 for bn in (32, 64, 128)
-                 for nw in (4, 8)
-                 for nb in (2, 3, 4)]
+        tiles = [(bm, bn, nw, nb) for bm in (64, 128, 256) for bn in (32, 64, 128) for nw in (4, 8) for nb in (2, 3, 4)]
         waves = (0, 1, 2, 4)
         nonkdims = (16, 32)
     else:
@@ -569,7 +572,7 @@ def _check_and_prepare(q, k, v, q_offsets, dff):
     return total_q, H, d, B
 
 
-def _launch(kernel, q, k, v, q_offsets, dff, qk_scale, max_M, num_xcds, kw):
+def _launch(kernel, q, k, v, q_offsets, dff, qk_scale, max_M, num_xcds, kw, config=None):
     total_q, H, d, B = _check_and_prepare(q, k, v, q_offsets, dff)
     out = torch.empty_like(q)
     if total_q == 0:
@@ -581,7 +584,13 @@ def _launch(kernel, q, k, v, q_offsets, dff, qk_scale, max_M, num_xcds, kw):
     if max_M == 0:
         return out
 
-    grid = lambda meta: (triton.cdiv(max_M, meta["BLOCK_M"]) * B * H, )  # noqa: E731
+    if config is not None:
+        # Pinned config: launch the JIT function directly, skipping the sweep.
+        grid = (triton.cdiv(max_M, config["BLOCK_M"]) * B * H, )
+        kernel = kernel.fn
+        kw = {**kw, **config}
+    else:
+        grid = lambda meta: (triton.cdiv(max_M, meta["BLOCK_M"]) * B * H, )  # noqa: E731
     kernel[grid](
         q,
         k,
@@ -617,6 +626,7 @@ def gdpa_forward(
     qk_scale: float = 1.0,
     max_M: Optional[int] = None,
     num_xcds: int = 8,
+    config=None,
     **kw,
 ) -> torch.Tensor:
     """GDPA forward, jagged Q x dense KV.
@@ -630,11 +640,13 @@ def gdpa_forward(
         max_M:     longest sequence, used to size the grid. Derived from
                    `q_offsets` when omitted, which costs a host sync -- pass it
                    explicitly from any benchmarked path.
+        config:    Pin a kernel config and bypass the autotuner
+                   (Blackwell/Hopper tutorial convention). None autotunes.
 
     Returns:
         [total_q, H, d], same dtype/layout as q.
     """
-    return _launch(_gdpa_fwd_pipelined_tuned, q, k, v, q_offsets, dff, qk_scale, max_M, num_xcds, kw)
+    return _launch(_gdpa_fwd_pipelined_tuned, q, k, v, q_offsets, dff, qk_scale, max_M, num_xcds, kw, config=config)
 
 
 KERNEL_REGISTRY = {

@@ -136,6 +136,32 @@ def _launch_inter_wave_with_tail(bias: torch.Tensor, a: torch.Tensor, b: torch.T
     return out
 
 
+def available_paths(bias: torch.Tensor, a: torch.Tensor, b: torch.Tensor) -> tuple[str, ...]:
+    """Return the paths that are valid for these operands, in registry order.
+
+    Correctness tests iterate this and assert every path against a reference,
+    rather than letting `_autotune_path` race them and check only the winner.
+    That matters for more than wall clock: the race admits a candidate only if
+    it already agrees with `register`, so a genuinely wrong `inter_wave` would
+    be dropped from the timing pool and the suite would still pass green.
+    """
+    if _can_use_inter_wave(a):
+        return ("register", "inter_wave")
+    if _can_use_inter_wave_tail(a, b):
+        return ("register", "inter_wave_tail")
+    return ("register", )
+
+
+def _dispatch(path: str, bias: torch.Tensor, a: torch.Tensor, b: torch.Tensor, split_k, config=None):
+    if path == "inter_wave":
+        return _launch(a, b, bias=bias, SPLIT_K=split_k)
+    if path == "inter_wave_tail":
+        return _launch_inter_wave_with_tail(bias, a, b)
+    if path == "register":
+        return _launch_register(a, b, bias=bias, config=config)
+    raise ValueError(f"Unknown addmm path {path!r}; expected one of {available_paths(bias, a, b)}")
+
+
 def _autotune_path(
     bias: torch.Tensor,
     a: torch.Tensor,
@@ -175,8 +201,15 @@ def _autotune_path(
     return winner
 
 
-def addmm(bias: torch.Tensor, a: torch.Tensor, b: torch.Tensor, SPLIT_K=None):
-    """Return ``bias + a @ b`` using the fastest valid gfx950 TLX path."""
+def addmm(bias: torch.Tensor, a: torch.Tensor, b: torch.Tensor, SPLIT_K=None, path=None, config=None):
+    """Return ``bias + a @ b`` using a gfx950 TLX path.
+
+    ``path`` pins one of `available_paths`; the default (None) times the valid
+    paths against each other and keeps the winner per shape. ``config`` pins
+    the register path's kernel config, bypassing its autotuner. Correctness
+    tests should pass both: neither the path race nor the config sweep tells
+    them anything, and together they dominate the suite's wall clock.
+    """
     if a.ndim != 2 or b.ndim != 2:
         raise ValueError("addmm expects two-dimensional matrix operands")
     if a.shape[1] != b.shape[0]:
@@ -195,10 +228,12 @@ def addmm(bias: torch.Tensor, a: torch.Tensor, b: torch.Tensor, SPLIT_K=None):
     if SPLIT_K not in (None, 1):
         if not _can_use_inter_wave(a):
             raise ValueError("SPLIT_K is only supported by the inter-wave kernel")
+        if path not in (None, "inter_wave"):
+            raise ValueError(f"SPLIT_K > 1 requires the inter_wave path, got {path!r}")
         return _launch(a, b, bias=bias_2d, SPLIT_K=SPLIT_K)
-    winner = _autotune_path(bias_2d, a, b, SPLIT_K)
-    if winner == "inter_wave":
-        return _launch(a, b, bias=bias_2d, SPLIT_K=SPLIT_K)
-    if winner == "inter_wave_tail":
-        return _launch_inter_wave_with_tail(bias_2d, a, b)
-    return _launch_register(a, b, bias=bias_2d)
+    if path is not None:
+        valid = available_paths(bias_2d, a, b)
+        if path not in valid:
+            raise ValueError(f"Path {path!r} is not valid for this shape; valid paths are {valid}")
+        return _dispatch(path, bias_2d, a, b, SPLIT_K, config=config)
+    return _dispatch(_autotune_path(bias_2d, a, b, SPLIT_K), bias_2d, a, b, SPLIT_K, config=config)
