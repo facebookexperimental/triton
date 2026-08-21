@@ -25,6 +25,7 @@
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/TMAUtilities.h"
 #include "triton/Tools/Sys/GetEnv.h"
 #include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/Support/JSON.h"
 #include <list>
 #include <unordered_set>
 
@@ -267,6 +268,25 @@ static Value mapBarrierTo2CTAPeer(OpBuilderWithAsyncTaskIds &builder,
       loc, remoteTy, barrier, peerRank);
 }
 
+static bool useDirectTwoCTAWait(Operation *anchor) {
+  auto funcOp = anchor->getParentOfType<tt::FuncOp>();
+  bool enabled = false;
+  funcOp.walk([&](Operation *op) {
+    auto attr = op->getAttrOfType<StringAttr>("tt.autows");
+    if (!attr)
+      return;
+    auto parsed = llvm::json::parse(attr.getValue());
+    if (!parsed) {
+      llvm::consumeError(parsed.takeError());
+      return;
+    }
+    auto *object = parsed->getAsObject();
+    if (object)
+      enabled |= object->getBoolean("two_cta_tma_direct_wait").value_or(false);
+  });
+  return enabled;
+}
+
 Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
                             SmallVector<ttnvws::DescriptorLoadOp> &tmaLoads,
                             Value barrierAlloc, Value bufferIdx,
@@ -358,6 +378,7 @@ Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
       loc, builder.getI32Type(), phase);
   Value waitPred =
       builder.createWithAsyncTaskIds<arith::ConstantIntOp>(loc, 1, 1);
+  bool directTwoCTAWait = twoCTA && useDirectTwoCTAWait(headConsumer);
   Value followerWaitPred;
   Value peerBarrier;
   if (twoCTA) {
@@ -371,9 +392,11 @@ Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
         builder.createWithAsyncTaskIds<arith::ConstantIntOp>(loc, 0, 32);
     waitPred = builder.createWithAsyncTaskIds<arith::CmpIOp>(
         loc, arith::CmpIPredicate::eq, rankInPair, zero);
-    followerWaitPred = builder.createWithAsyncTaskIds<arith::CmpIOp>(
-        loc, arith::CmpIPredicate::ne, rankInPair, zero);
-    peerBarrier = mapBarrierTo2CTAPeer(builder, loc, consBarrier, ctaId);
+    if (!directTwoCTAWait) {
+      followerWaitPred = builder.createWithAsyncTaskIds<arith::CmpIOp>(
+          loc, arith::CmpIPredicate::ne, rankInPair, zero);
+      peerBarrier = mapBarrierTo2CTAPeer(builder, loc, consBarrier, ctaId);
+    }
   }
 
   // Create one WaitBarrierOp per consumer task ID.
@@ -381,7 +404,7 @@ Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
   builder.createWithAsyncTaskIds<ttng::WaitBarrierOp>(
       loc, consBarrier, phase, waitPred, /*deps=*/ValueRange{},
       consumerWaitConstraints);
-  if (twoCTA) {
+  if (twoCTA && !directTwoCTAWait) {
     // The hardware CTA-group TMA transaction completes the leader's local
     // mbarrier. Relay that completion to the follower's corresponding local
     // barrier, then let the follower wait on it. A cluster barrier is not
@@ -400,7 +423,7 @@ Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
     builder.createWithAsyncTaskIds<ttng::WaitBarrierOp>(
         loc, consBarrier, phase, waitPred,
         /*deps=*/ValueRange{}, consumerWaitConstraints);
-    if (twoCTA) {
+    if (twoCTA && !directTwoCTAWait) {
       builder.createWithAsyncTaskIds<ttng::FenceAsyncSharedOp>(
           loc, /*bCluster=*/false);
       builder.createWithAsyncTaskIds<ttng::ArriveBarrierOp>(
