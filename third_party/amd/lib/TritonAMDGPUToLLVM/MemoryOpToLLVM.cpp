@@ -596,6 +596,8 @@ private:
     if (!ldsTransLayout) {
       return failure();
     }
+    auto regLayout =
+        ldsTransLayout->removeZeroBasesAlongDim(str_attr("register"));
 
     auto smemPtrTy = ptr_ty(ctx, 3);
     auto paddedEnc =
@@ -603,10 +605,10 @@ private:
     LinearLayout cvt = LinearLayout::empty();
     if (paddedEnc) {
       const auto &sharedLL = paddedEnc.getLinearComponent();
-      cvt = ldsTransLayout->invertAndCompose(sharedLL);
+      cvt = regLayout.invertAndCompose(sharedLL);
     } else {
       auto sharedLL = triton::gpu::toLinearLayout(srcTy);
-      cvt = ldsTransLayout->invertAndCompose(sharedLL);
+      cvt = regLayout.invertAndCompose(sharedLL);
     }
     // Check that we will be able to vectorize the load.
     // Need to have exactly ldsTransLoadParams->tileSize,
@@ -645,7 +647,8 @@ private:
         maskSpanAffineOffset, /*affineBlockOffset=*/Value(),
         /*maskSpanAffineBlock=*/0, laneId, warpId, rewriter, targetInfo,
         ldsTransLoadParams->tileSize, lowerInst);
-    Value result = packLLElements(loc, typeConverter, outVals, rewriter, retTy);
+    Value result =
+        packUniqueTensorElements(loc, typeConverter, outVals, rewriter, retTy);
     rewriter.replaceOp(op, result);
     return success();
   }
@@ -721,8 +724,6 @@ struct LocalAtomicScatterRMWOpConversion
       return success();
     }
 
-    if (!info.removeBroadcast.isIdentity())
-      results = broadcastAs(results, info.regLayout);
     finalizeTensorAtomicResults(op, info.valuesTy, rewriter, results,
                                 info.llvmElemTy, b, info.threadPred, targetInfo,
                                 getTypeConverter());
