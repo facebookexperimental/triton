@@ -526,11 +526,7 @@ _FWD_WAVES_PER_EU = (0, 2, 4)
 
 def _get_fwd_configs() -> list[triton.Config]:
     if FULL_TUNING:
-        tiles = [(bm, bn, nw, nb)
-                 for bm in (64, 128, 256)
-                 for bn in (32, 64, 128)
-                 for nw in (4, 8)
-                 for nb in (2, 3, 4)]
+        tiles = [(bm, bn, nw, nb) for bm in (64, 128, 256) for bn in (32, 64, 128) for nw in (4, 8) for nb in (2, 3, 4)]
         waves = (0, 1, 2, 4)
         nonkdims = (16, 32)
     else:
