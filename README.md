@@ -653,26 +653,26 @@ CLC (Cluster Launch Control) is a Blackwell-specific feature **[Blackwell]** tha
     **Parameters:**
     - `num_consumers`: Number of consumers that will signal completion per tile (typically 3 async tasks × num_CTAs)
 
-- `tlx.clc_producer(context, p_producer=phase, multi_ctas=False)` **[Blackwell]**
+- `tlx.clc_producer(context, p_producer=phase, multi_ctas=True)` **[Blackwell]**
 
     Issue a CLC try_cancel request to acquire a new tile ID.
 
     **Parameters:**
     - `context`: CLC pipeline context from `clc_create_context`
     - `phase`: Current barrier phase (0 or 1, alternates each iteration)
-    - `multi_ctas`: Set to `True` for 2-CTA mode (cluster of 2 CTAs). When enabled, `pred_cta0` is computed internally from `cluster_cta_rank()`.
+    - `multi_ctas`: Enables cluster-aware synchronization by default when the compilation options specify multiple CTAs. For a `(1, 1, 1)` cluster, the frontend emits the local single-CTA path. Set to `False` to request the local-only path explicitly.
 
-- `tile_id = tlx.clc_consumer(context, p_consumer=phase, multi_ctas=False, k=0, return_3d=False)` **[Blackwell]**
+- `tile_id = tlx.clc_consumer(context, p_consumer=phase, multi_ctas=True, k=0, return_3d=False)` **[Blackwell]**
 
     Decode the tile ID from a CLC response and signal completion.
 
     **Parameters:**
     - `context`: CLC pipeline context from `clc_create_context`
     - `phase`: Current barrier phase
-    - `multi_ctas`: Set to `True` for 2-CTA mode. When enabled, `pred_cta0` is computed internally.
+    - `multi_ctas`: Enables cluster-aware synchronization by default when the compilation options specify multiple CTAs. For a `(1, 1, 1)` cluster, the frontend emits a local barrier arrival. Set to `False` to request the local-only path explicitly.
     - `return_3d`: Set to `True` to return `(ctaIdX, ctaIdY, ctaIdZ)` tuple instead of scalar tile_id.
 
-    **Returns:** The tile ID (already offset by `cluster_cta_rank()` for unique tile assignments), or -1 if no work available. With `return_3d=True`, returns `(ctaIdX, ctaIdY, ctaIdZ)` tuple.
+    **Returns:** The tile ID (offset by `cluster_cta_rank()` for unique tile assignments), or -1 if no work is available. With `return_3d=True`, returns `(ctaIdX, ctaIdY, ctaIdZ)`.
 
 #### How CLC Works
 
