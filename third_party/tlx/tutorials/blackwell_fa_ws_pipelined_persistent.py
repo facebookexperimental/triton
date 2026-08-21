@@ -1993,93 +1993,67 @@ def _attn_bwd_dq_postprocess(DQ_ACCUM, DQ_OUT,  #
     tl.store(dst, val.to(DQ_OUT.dtype.element_ty))
 
 
-@triton.jit
-def bwd_calculate_offsets(
-    tile_idx,
-    n_tile_num,
-    num_pid_m,
-    H,
-    N_CTX,  #
-    BLOCK_M1: tl.constexpr,
-    BLOCK_N1: tl.constexpr,
-    GROUP_SIZE_M: tl.constexpr,
-    STAGE: tl.constexpr,
-):
-    bhid = tile_idx // n_tile_num
-    pid = tile_idx % n_tile_num
-    pid, bhid = tl.swizzle2d(pid, bhid, n_tile_num, num_pid_m, GROUP_SIZE_M)
-    batch = bhid // H
-    head = bhid % H
-    off_chz = (bhid * N_CTX).to(tl.int64)
-    start_n = pid
-    start_m = _get_start_m_bwd(start_n, BLOCK_N1, STAGE)
-    num_steps = (N_CTX - start_m) // BLOCK_M1
-    return off_chz, batch, head, start_m, start_n, num_steps
-
-
+#
 _bwd_selected_meta = {}
 
 
 def _bwd_host_descriptor_pre_hook_tlx(nargs):
-    BLOCK_M1 = nargs["BLOCK_M1"]
-    BLOCK_N1 = nargs["BLOCK_N1"]
-    HEAD_DIM = nargs["HEAD_DIM"]
-    NUM_CTAS = nargs.get("NUM_CTAS", 1)
-
-    _bwd_selected_meta["BLOCK_M1"] = BLOCK_M1
-    _bwd_selected_meta["NUM_CTAS"] = NUM_CTAS
-
+    block_m = nargs["BLOCK_M1"]
+    block_n = nargs["BLOCK_N1"]
+    head_dim = nargs["HEAD_DIM"]
+    num_ctas = nargs.get("NUM_CTAS", 1)
+    _bwd_selected_meta["BLOCK_M1"] = block_m
+    _bwd_selected_meta["NUM_CTAS"] = num_ctas
     # Reset dq accumulator to zeros before each autotuner warmup run.
     # dq uses TMA reduce-add, so stale values accumulate across runs.
     # dk/dv don't need zeroing — they use use_acc=False on the first iteration.
     nargs["desc_dq"].base.zero_()
-
-    nargs["desc_q"].block_shape = [1, 1, BLOCK_M1, HEAD_DIM // NUM_CTAS]
-    nargs["desc_do"].block_shape = [1, 1, BLOCK_M1, HEAD_DIM // NUM_CTAS]
-    nargs["desc_v"].block_shape = [1, 1, BLOCK_N1, HEAD_DIM]
-    nargs["desc_k"].block_shape = [1, 1, BLOCK_N1, HEAD_DIM]
-    if NUM_CTAS > 1:
-        EPILOGUE_SUBTILE = nargs["EPILOGUE_SUBTILE"]
-        DQ_SLICE_N = HEAD_DIM // EPILOGUE_SUBTILE
-        nargs["desc_dq"].block_shape = [1, 1, BLOCK_M1, DQ_SLICE_N]
+    nargs["desc_q"].block_shape = [1, 1, block_m, head_dim // num_ctas]
+    nargs["desc_do"].block_shape = [1, 1, block_m, head_dim // num_ctas]
+    nargs["desc_v"].block_shape = [1, 1, block_n, head_dim]
+    nargs["desc_k"].block_shape = [1, 1, block_n, head_dim]
+    if num_ctas > 1:
+        dq_slice = head_dim // nargs["EPILOGUE_SUBTILE"]
     else:
-        DQ_REDUCE_NCOL = nargs["DQ_REDUCE_NCOL"]
-        nargs["desc_dq"].block_shape = [1, 1, BLOCK_M1, DQ_REDUCE_NCOL]
-    DKV_STORE_NCOL = nargs["DKV_STORE_NCOL"]
-    nargs["desc_dv"].block_shape = [1, 1, BLOCK_N1, DKV_STORE_NCOL]
-    nargs["desc_dk"].block_shape = [1, 1, BLOCK_N1, DKV_STORE_NCOL]
-    nargs["desc_m"].block_shape = [BLOCK_M1]
-    nargs["desc_delta"].block_shape = [BLOCK_M1]
+        dq_slice = nargs["DQ_REDUCE_NCOL"]
+    nargs["desc_dq"].block_shape = [1, 1, block_m, dq_slice]
+    dkv_slice = nargs["DKV_STORE_NCOL"]
+    nargs["desc_dv"].block_shape = [1, 1, block_n, dkv_slice]
+    nargs["desc_dk"].block_shape = [1, 1, block_n, dkv_slice]
+    if "desc_m" in nargs:
+        nargs["desc_m"].block_shape = [block_m]
+        nargs["desc_delta"].block_shape = [block_m]
     # 2-CTA: separate B-operand descriptors for the transposed views.
     if "desc_kt" in nargs and "desc_qt" in nargs:
-        nargs["desc_kt"].block_shape = [1, 1, BLOCK_N1 * NUM_CTAS, HEAD_DIM // NUM_CTAS]
-        nargs["desc_qt"].block_shape = [1, 1, BLOCK_M1 // NUM_CTAS, HEAD_DIM]
-        nargs["desc_dot"].block_shape = [1, 1, BLOCK_M1 // NUM_CTAS, HEAD_DIM]
+        nargs["desc_kt"].block_shape = [1, 1, block_n * num_ctas, head_dim // num_ctas]
+        nargs["desc_qt"].block_shape = [1, 1, block_m // num_ctas, head_dim]
+        nargs["desc_dot"].block_shape = [1, 1, block_m // num_ctas, head_dim]
 
 
 configs_bwd_1cta = [
     triton.Config(
         {
-            "BLOCK_M1": bm1,
+            "BLOCK_M1": 64,
             "BLOCK_N1": 128,
             "NUM_BUFFERS_KV": 1,
             "NUM_BUFFERS_Q": 2,
             "NUM_BUFFERS_DO": 1,
             "NUM_BUFFERS_DS": 1,
             "NUM_BUFFERS_TMEM": 1,
-            "DKV_STORE_NCOL": 64,
             "NUM_COMPUTE_SLICES": 2,
+            "DKV_STORE_NCOL": 64,
             "DQ_REDUCE_STAGES": 2,
             "DQ_REDUCE_NCOL": 32,
             "EPILOGUE_SUBTILE": 4,
             "GROUP_SIZE_M": 1,
-            "USE_WARP_BARRIER": uwb,
+            "USE_WARP_BARRIER": use_warp_barrier,
             "NUM_CTAS": 1,
         },
         num_warps=8,
         num_stages=1,
         pre_hook=_bwd_host_descriptor_pre_hook_tlx,
-    ) for bm1 in [64] for uwb in [False, True]
+    )
+    for use_warp_barrier in (False, True)
 ]
 
 configs_bwd_2cta = [
@@ -2093,8 +2067,8 @@ configs_bwd_2cta = [
             "NUM_BUFFERS_DO": 1,
             "NUM_BUFFERS_DS": 1,
             "NUM_BUFFERS_TMEM": 1,
-            "DKV_STORE_NCOL": 64,
             "NUM_COMPUTE_SLICES": 2,
+            "DKV_STORE_NCOL": 64,
             "DQ_REDUCE_STAGES": 2,
             "DQ_REDUCE_NCOL": 32,
             "EPILOGUE_SUBTILE": 4,
@@ -2106,10 +2080,10 @@ configs_bwd_2cta = [
         num_stages=1,
         pre_hook=_bwd_host_descriptor_pre_hook_tlx,
         ctas_per_cga=(2, 1, 1),
-    ),
+    )
 ]
 
-configs_bwd_tlx = configs_bwd_1cta + configs_bwd_2cta
+BWD_CONFIGS = configs_bwd_1cta + configs_bwd_2cta
 
 
 @triton.jit
@@ -3144,7 +3118,7 @@ def _bwd_compute_inner_loop(
     return curr_m, blk_idx
 
 
-@triton.autotune(configs=configs_bwd_tlx, key=["N_CTX", "HEAD_DIM"])
+@triton.autotune(configs=BWD_CONFIGS, key=["N_CTX", "HEAD_DIM"])
 @triton.jit
 def _attn_bwd_ws(
     desc_q,
