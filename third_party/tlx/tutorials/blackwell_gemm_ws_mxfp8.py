@@ -646,6 +646,10 @@ def _process_tile_producer_inner(
 
     REP_M: tl.constexpr = BLOCK_SIZE_M // 128
     REP_N: tl.constexpr = BLOCK_SIZE_N // 128
+    # Local shadow of the module-level VEC_SIZE: the frontend rejects reads of
+    # non-constexpr globals, and making that global tl.constexpr would disable
+    # this kernel's fast dispatch path.
+    VEC_SIZE: tl.constexpr = 32
     REP_K: tl.constexpr = BLOCK_SIZE_K // VEC_SIZE // 4
     BLOCK_N_PER_CTA: tl.constexpr = BLOCK_SIZE_N // NUM_CTAS
     A_BYTES: tl.constexpr = BLOCK_SIZE_M * BLOCK_SIZE_K
@@ -793,6 +797,10 @@ def _gemm_mxfp8_ws_kernel(  # noqa: TR001
 
     REP_M: tl.constexpr = BLOCK_SIZE_M // 128
     REP_N: tl.constexpr = BLOCK_SIZE_N // 128
+    # Local shadow of the module-level VEC_SIZE: the frontend rejects reads of
+    # non-constexpr globals, and making that global tl.constexpr would disable
+    # this kernel's fast dispatch path.
+    VEC_SIZE: tl.constexpr = 32
     REP_K: tl.constexpr = BLOCK_SIZE_K // VEC_SIZE // 4
     BLOCK_N_PER_CTA: tl.constexpr = BLOCK_SIZE_N // NUM_CTAS
 
