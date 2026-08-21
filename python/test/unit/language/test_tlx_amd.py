@@ -117,6 +117,23 @@ def test_amd_sched_group_barrier_options_are_cache_keyed_and_validated():
         amd_compiler.HIPOptions(arch="gfx950", sched_group_barrier_required_region_count=-1)
 
 
+def test_amd_async_copy_config_override(monkeypatch):
+    monkeypatch.setattr(knobs.amd, "use_async_copy", None)
+    assert amd_compiler.is_async_copy_enabled("gfx950")
+    assert not amd_compiler.is_async_copy_enabled("gfx942")
+    assert not amd_compiler._resolve_async_copy_enabled("gfx950", False)
+    assert amd_compiler._resolve_async_copy_enabled("gfx942", True)
+
+    # The process-wide knob remains an authoritative debugging override.
+    monkeypatch.setattr(knobs.amd, "use_async_copy", True)
+    assert amd_compiler._resolve_async_copy_enabled("gfx950", False)
+    monkeypatch.setattr(knobs.amd, "use_async_copy", False)
+    assert not amd_compiler._resolve_async_copy_enabled("gfx942", True)
+
+    assert amd_compiler.HIPOptions(arch="gfx950",
+                                   use_async_copy=False).hash() != amd_compiler.HIPOptions(arch="gfx950").hash()
+
+
 def compile_for_target(fn, signature, constexprs, target):
     src = ASTSource(fn=fn, signature=signature, constexprs=constexprs)
     return triton_compile(src, target=target)

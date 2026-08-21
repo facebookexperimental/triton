@@ -35,6 +35,12 @@ def is_async_copy_enabled(arch):
     return ((arch in ["gfx950", "gfx1250"]) if knobs.amd.use_async_copy is None else knobs.amd.use_async_copy)
 
 
+def _resolve_async_copy_enabled(arch, config_use_async_copy=None):
+    if knobs.amd.use_async_copy is None and config_use_async_copy is not None:
+        return config_use_async_copy
+    return is_async_copy_enabled(arch)
+
+
 def is_coexec_scheduler_supported(arch):
     return arch in ["gfx1250"]
 
@@ -107,6 +113,7 @@ class HIPOptions:
     launch_cluster: bool = False  # No-op placeholder
     multicast: bool = False  # No-op placeholder (TMA multicast is NVIDIA-only)
     enable_tree_reduction: bool = False
+    use_async_copy: bool | None = None
     matrix_instr_nonkdim: int = 0
     kpack: int = 1
     allow_flush_denorm: bool = False
@@ -359,7 +366,7 @@ class HIPBackend(BaseBackend):
         passes.ttir.add_triton_licm(pm)
         passes.common.add_canonicalizer(pm)
 
-        use_async_copy = is_async_copy_enabled(options.arch)
+        use_async_copy = _resolve_async_copy_enabled(options.arch, options.use_async_copy)
         use_block_pingpong = is_pingpong_schedule_enabled(options.arch, use_async_copy)
         amd.passes.ttgpuir.add_optimize_descriptor_encoding(pm)
 

@@ -52,6 +52,7 @@ jobs:
           # Install the fork Triton on top of nightly torch's pinned pytorch-triton.
           install_triton $PWD
           uv pip install pytest expecttest
+          python scripts/_torchtlx_torch_shim.py
       - name: Run TorchTLX template + fusion tests
         id: run_torchtlx_tests
         timeout-minutes: 40
@@ -142,6 +143,7 @@ jobs:
     needs: b200-torchtlx-test
     if: always() && github.event_name == 'schedule' && needs.b200-torchtlx-test.outputs.failures != '' && needs.b200-torchtlx-test.outputs.failures != '[]'
     permissions:
+      actions: read
       contents: read
       issues: write
     strategy:
@@ -167,6 +169,7 @@ jobs:
     needs: mi350-torchtlx-test
     if: always() && github.event_name == 'schedule' && needs.mi350-torchtlx-test.outputs.failures != '' && needs.mi350-torchtlx-test.outputs.failures != '[]'
     permissions:
+      actions: read
       contents: read
       issues: write
     strategy:
