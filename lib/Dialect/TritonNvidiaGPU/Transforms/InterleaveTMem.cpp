@@ -1,3 +1,4 @@
+#include "mlir/IR/Dominance.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "nvidia/hopper/include/Transforms/WSBarrierReorder.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
@@ -140,7 +141,16 @@ std::pair<Value, AccessRange> findBufferAccess(Value a) {
       return findBufferAccess(wsOp.getExplicitCaptures()[arg.getArgNumber()]);
     }
 
-    // Unknown block argument.
+    // Partition outlining turns captured TMEM allocations into block
+    // arguments. Within one partition the argument remains a stable alias root
+    // for all of its views, so retain its full range for local analysis.
+    if (auto type = dyn_cast<ttg::MemDescType>(arg.getType());
+        type && isa<TensorMemorySpaceAttr>(type.getMemorySpace())) {
+      AccessRange access;
+      for (uint64_t dim : type.getShape())
+        access.ranges.push_back({{0, dim}});
+      return {arg, std::move(access)};
+    }
     return {};
   }
 
@@ -154,7 +164,8 @@ std::pair<Value, AccessRange> findBufferAccess(Value a) {
   }
 
   // Trans and Reshape views don't change the access size.
-  if (isa<ttg::MemDescTransOp, ttg::MemDescReshapeOp>(defOp)) {
+  if (isa<ttg::MemDescTransOp, ttg::MemDescReshapeOp,
+          ttg::MemDescReinterpretOp>(defOp)) {
     return findBufferAccess(defOp->getOperand(0));
   }
 
@@ -187,9 +198,14 @@ bool tmemMayAlias(Value a, Value b) {
   // If the underlying buffer was not identified, assume mayalias.
   if (!aAlloc || !bAlloc)
     return true;
-  // If the buffers are different, they don't alias.
+  // If the buffers are different, they don't alias -- but only a distinct
+  // allocation proves that. findBufferAccess also roots a TMEM access at a
+  // block argument so the reuse repair can compare views within one outlined
+  // partition; two such arguments (for example memdesc iter args of the same
+  // loop) may still be the same underlying allocation, so they are not
+  // evidence of disjointness. Mirrors the rule findSMemBase documents.
   if (aAlloc != bAlloc)
-    return false;
+    return isa<BlockArgument>(aAlloc) || isa<BlockArgument>(bAlloc);
   // If the access ranges along any dimension are known to not overlap, then the
   // accesses don't alias.
   for (auto [aRange, bRange] : llvm::zip(aRanges.ranges, bRanges.ranges)) {
@@ -199,6 +215,18 @@ bool tmemMayAlias(Value a, Value b) {
       continue;
     // The access ranges are known and don't overlap.
     if (!aRange->intersects(*bRange))
+      return false;
+  }
+  return true;
+}
+
+bool tmemHasSameBaseAndStart(Value a, Value b) {
+  auto [aAlloc, aRanges] = findBufferAccess(a);
+  auto [bAlloc, bRanges] = findBufferAccess(b);
+  if (!aAlloc || !bAlloc || aAlloc != bAlloc)
+    return false;
+  for (auto [aRange, bRange] : llvm::zip(aRanges.ranges, bRanges.ranges)) {
+    if (!aRange || !bRange || aRange->start() != bRange->start())
       return false;
   }
   return true;
@@ -964,6 +992,149 @@ bool prioritizeTMemOperand(Block &block) {
   return changed;
 }
 
+// Code partitioning may relocate a temporal-reuse sibling's empty acquire in
+// front of an earlier whole-allocation overwrite. Modulo expansion places the
+// acquire correctly, but an inner-loop copy can retain the overwrite channel's
+// phase instead of the later sibling's phase. Repair the steady-state copy
+// after expansion, and add the corresponding loop-entry acquire.
+//
+// FA-bwd's mixed qkT/ppT/dQ allocation is the motivating shape: qkT and dQ
+// both write offset 0 while ppT is packed at offset 64. The qkT useD=false MMA
+// must wait on dQ's EMPTY barrier with dQ's phase before overwriting the slot.
+bool repairWholeOverwriteReuseWaitPhases(Block &block) {
+  DominanceInfo dominance(block.getParentOp());
+  SmallVector<TCGen5MMAOp> mmas;
+  for (Operation &op : block)
+    if (auto mma = dyn_cast<TCGen5MMAOp>(&op))
+      mmas.push_back(mma);
+
+  auto findChannelWait = [](TCGen5MMAOp mma) -> WaitBarrierOp {
+    for (Operation *op = mma->getPrevNode(); op; op = op->getPrevNode()) {
+      auto wait = dyn_cast<WaitBarrierOp>(op);
+      if (!wait || !hasWSBarrierConstraints(wait.getConstraints()))
+        continue;
+      if (wait.getLoc() == mma.getLoc())
+        return wait;
+    }
+    return {};
+  };
+  auto isNarrowReuse = [](TCGen5MMAOp whole, TCGen5MMAOp sibling) {
+    return cast<ShapedType>(whole.getD().getType()).getShape() !=
+           cast<ShapedType>(sibling.getD().getType()).getShape();
+  };
+
+  auto cloneValueBefore = [&](Value value, Operation *insertBefore,
+                              OpBuilder &builder) -> Value {
+    if (!value || dominance.dominates(value, insertBefore))
+      return value;
+    Operation *def = value.getDefiningOp();
+    if (!def || !isPure(def) || def->getNumResults() != 1)
+      return {};
+    IRMapping mapping;
+    for (Value operand : def->getOperands()) {
+      Value mapped = operand;
+      if (!dominance.dominates(operand, insertBefore)) {
+        Operation *operandDef = operand.getDefiningOp();
+        if (!operandDef || !isPure(operandDef) ||
+            operandDef->getNumResults() != 1 ||
+            !llvm::all_of(operandDef->getOperands(), [&](Value input) {
+              return dominance.dominates(input, insertBefore);
+            }))
+          return {};
+        mapped = builder.clone(*operandDef)->getResult(0);
+      }
+      mapping.map(operand, mapped);
+    }
+    return builder.clone(*def, mapping)->getResult(0);
+  };
+
+  auto insertReuseWait = [&](TCGen5MMAOp earlyMma,
+                             WaitBarrierOp earlyChannelWait,
+                             WaitBarrierOp lateWait, Value phase, Value pred) {
+    for (Operation *op = earlyMma->getPrevNode(); op; op = op->getPrevNode()) {
+      if (isa<TCGen5MMAOp>(op))
+        break;
+      if (auto wait = dyn_cast<WaitBarrierOp>(op);
+          wait && wait.getLoc() == lateWait.getLoc() &&
+          !hasWSBarrierConstraints(wait.getConstraints()))
+        return false;
+    }
+    // Insert immediately after the overwrite channel's acquire, before the
+    // hardware 2CTA issue protocol. Inserting immediately before the MMA is
+    // too late: a CTA can complete the peer issue handshake while its peer has
+    // not yet acquired the temporal-reuse EMPTY barrier.
+    OpBuilder builder(earlyChannelWait);
+    builder.setInsertionPointAfter(earlyChannelWait);
+    // `pred` comes from the caller and is not always lateWait's -- the
+    // loop-entry caller passes earlyWait's. Test the predicate that was
+    // actually handed in, otherwise a source predicate that fails to clone
+    // would silently produce an unpredicated wait.
+    bool hadPred = static_cast<bool>(pred);
+    Value alloc = cloneValueBefore(lateWait.getAlloc(), earlyMma, builder);
+    phase = cloneValueBefore(phase, earlyMma, builder);
+    pred = cloneValueBefore(pred, earlyMma, builder);
+    if (!alloc || !phase || (hadPred && !pred))
+      return false;
+    WaitBarrierOp cloned =
+        pred ? WaitBarrierOp::create(builder, lateWait.getLoc(), alloc, phase,
+                                     pred)
+             : WaitBarrierOp::create(builder, lateWait.getLoc(), alloc, phase);
+    if (Attribute taskIds = lateWait->getAttr("async_task_id"))
+      cloned->setAttr("async_task_id", taskIds);
+    return true;
+  };
+
+  bool changed = false;
+  for (auto [lateIdx, lateMma] : llvm::enumerate(mmas)) {
+    WaitBarrierOp lateWait = findChannelWait(lateMma);
+    if (!lateWait)
+      continue;
+    for (TCGen5MMAOp earlyMma :
+         ArrayRef<TCGen5MMAOp>(mmas).take_front(lateIdx)) {
+      auto useD = getConstantIntValue(earlyMma.getUseD());
+      if (!useD || *useD != 0)
+        continue;
+      if (!isNarrowReuse(earlyMma, lateMma) ||
+          !tmemHasSameBaseAndStart(earlyMma.getD(), lateMma.getD()))
+        continue;
+      WaitBarrierOp earlyWait = findChannelWait(earlyMma);
+      if (!earlyWait)
+        continue;
+
+      // The sibling phase is based on the current TMEM ring slot. Clone its
+      // pure phase calculation before the earlier overwrite.
+      changed |= insertReuseWait(earlyMma, earlyWait, lateWait,
+                                 lateWait.getPhase(), lateWait.getPred());
+      break;
+    }
+  }
+
+  // The first overwrite is outside the modulo loop while the sibling producer
+  // is nested inside it. Its completion-channel phase is the loop-entry phase
+  // for the same ring slot, and its predicate suppresses an empty loop.
+  for (TCGen5MMAOp earlyMma : mmas) {
+    auto useD = getConstantIntValue(earlyMma.getUseD());
+    if (!useD || *useD != 0)
+      continue;
+    WaitBarrierOp earlyWait = findChannelWait(earlyMma);
+    if (!earlyWait)
+      continue;
+    WalkResult result = block.walk([&](TCGen5MMAOp lateMma) {
+      if (lateMma->getBlock() == &block || !isNarrowReuse(earlyMma, lateMma) ||
+          !tmemHasSameBaseAndStart(earlyMma.getD(), lateMma.getD()))
+        return WalkResult::advance();
+      WaitBarrierOp lateWait = findChannelWait(lateMma);
+      if (!lateWait)
+        return WalkResult::advance();
+      changed |= insertReuseWait(earlyMma, earlyWait, lateWait,
+                                 earlyWait.getPhase(), earlyWait.getPred());
+      return WalkResult::interrupt();
+    });
+    (void)result;
+  }
+  return changed;
+}
+
 void processBlock(BlockInterleaveInfo &info) {
   Block &block = *info.block;
   SmallVector<Operation *> originalOrder = getBlockOpOrder(block);
@@ -1066,6 +1237,15 @@ struct TritonNvidiaGPUInterleaveTMemPass
     });
     for (auto &info : blocksToProcess)
       processBlock(info);
+    // The temporal-reuse EMPTY acquire this repair clones is placed relative
+    // to the hardware 2-CTA issue handshake, and the packed qkT/dQ TMEM reuse
+    // it targets only arises in the 2-CTA backward. On a 1-CTA kernel the
+    // extra acquire waits on a barrier no partition arrives on, which
+    // deadlocks the kernel, so restrict the repair to 2-CTA modules.
+    if (is2CTA(m))
+      m.walk([](Block *block) {
+        (void)repairWholeOverwriteReuseWaitPhases(*block);
+      });
   }
 };
 
