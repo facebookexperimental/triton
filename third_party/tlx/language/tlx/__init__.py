@@ -69,6 +69,7 @@ from .mem_ops import (
 )
 from .mma_ops import (
     amd_mfma_commit,
+    amd_register_handoff,
     amd_register_resident,
     amd_scheduled_mfma,
     async_dot,
@@ -77,6 +78,7 @@ from .mma_ops import (
     dot_scaled,
     extract_slice,
     rematerialized_range,
+    release_layout,
     require_amd_wmma_layout,
     require_layout,
     tcgen05_commit,
@@ -146,10 +148,12 @@ __all__ = [
     "storage_kind",
     "layout",
     "amd_mfma_commit",
+    "amd_register_handoff",
     "amd_register_resident",
     "amd_scheduled_mfma",
     "extract_slice",
     "rematerialized_range",
+    "release_layout",
     "buffered_tensor",
     "buffered_tensor_type",
     "storage_alias_spec",

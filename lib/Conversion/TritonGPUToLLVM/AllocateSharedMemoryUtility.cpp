@@ -80,7 +80,9 @@ void addSharedMemoryAnnotations(ModuleOp mod) {
 
   mod.walk([&](Operation *op) {
     if (isa<triton::gpu::LocalStoreOp, triton::gpu::LocalLoadOp,
-            triton::gpu::MemDescSubsliceOp, triton::gpu::MemDescIndexOp>(op)) {
+            triton::gpu::MemDescSubsliceOp,
+            triton::gpu::MemDescDynamicSubsliceOp, triton::gpu::MemDescIndexOp>(
+            op)) {
       addAllocationAnnotations(op);
     }
   });

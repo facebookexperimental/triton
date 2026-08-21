@@ -818,26 +818,46 @@ def subslice(
 @tl.builtin
 def local_slice(
     buffer: tlx.buffered_tensor,
-    offset: list[int],
+    offset: list[int | tl.tensor],
     shape: list[int],
     _semantic=None,
 ) -> tlx.buffered_tensor:
+    """Return a same-rank local-memory subview.
+
+    SMEM offsets may be integers, constexprs, or runtime scalar i32 tensors.
+    When any offset is runtime-valued, the dynamic subslice IR operation is
+    used. Runtime offsets must keep the view within the source allocation and
+    satisfy the same tile-alignment contract as static offsets; violating
+    either condition is undefined behavior.
+    """
+    has_runtime_offset = any(isinstance(value, tl.tensor) for value in offset)
     if buffer.type.storage == tlx.storage_kind.tmem:
         # TMEM can only slice along the innermost dimension
+        assert not has_runtime_offset, "runtime local_slice offsets are only supported for SMEM"
         assert len(offset) == 2 and len(shape) == 2
         assert offset[0] == 0
         assert shape[0] == buffer.type.shape[0]
         return subslice(buffer, offset[1], shape[1], _semantic=_semantic)
+
+    if has_runtime_offset:
+        assert buffer.type.storage == tlx.storage_kind.smem, "runtime local_slice offsets are only supported for SMEM"
+        unwrapped_shape = [tl._unwrap_if_constexpr(dim) for dim in shape]
+        assert len(offset) == len(
+            buffer.type.shape) == len(unwrapped_shape), "local_slice offset and shape must match the source rank"
+        offset_handles = [_semantic._convert_elem_to_ir_value(value, require_i64=False) for value in offset]
+        slice_handle = _semantic.builder.create_memdesc_dynamic_subslice(buffer.handle, offset_handles, unwrapped_shape)
+        shape = unwrapped_shape
     else:
         slice_handle = _semantic.builder.create_memdesc_subslice(buffer.handle, offset, shape)
-        return tlx.buffered_tensor(
-            slice_handle,
-            buffer.type.scalar,
-            shape,
-            0,
-            buffer.type.storage,
-            buffer.type.layout,
-        )
+
+    return tlx.buffered_tensor(
+        slice_handle,
+        buffer.type.scalar,
+        shape,
+        0,
+        buffer.type.storage,
+        buffer.type.layout,
+    )
 
 
 @tl.builtin

@@ -302,6 +302,32 @@ def TTG_MemDescSubsliceOp
   let hasVerifier = 1;
 }
 
+def TTG_MemDescDynamicSubsliceOp
+    : TTG_Op<"memdesc_dynamic_subslice", [Pure, MemDescViewTrait]> {
+  let summary = "take a runtime-offset subview of a shared-memory descriptor";
+
+  let description = [{
+    This operation returns a descriptor for a same-rank subview whose logical
+    offsets are runtime i32 values.  It is the dynamic counterpart of
+    `ttg.memdesc_subslice`.  The caller must guarantee that runtime offsets
+    keep the result in bounds and satisfy the same tile-alignment contract as
+    static subslice offsets; violating either condition is undefined behavior.
+
+    Dynamic partition selection is not supported, so partitioned shared
+    encodings are rejected by the verifier.
+  }];
+
+  let arguments = (ins TTG_MemDescType:$src, Variadic<I32>:$offsets);
+  let results = (outs TTG_MemDescType:$result);
+
+  let assemblyFormat = [{
+    $src `[` $offsets `]` attr-dict `:` qualified(type($src))
+    `->` qualified(type($result))
+  }];
+
+  let hasVerifier = 1;
+}
+
 def TTG_MemDescTransOp
     : TTG_Op<"memdesc_trans", [Pure, MemDescViewTrait, TransposeOpInterface,
                                InferMemDescTypeOpWithLayoutEquivalence,

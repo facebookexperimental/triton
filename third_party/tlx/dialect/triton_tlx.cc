@@ -146,6 +146,24 @@ void init_triton_tlx_ir(py::module_ &m) {
              return self.create<ttg::MemDescSubsliceOp>(memDescType, localAlloc,
                                                         offsets);
            })
+      .def("create_memdesc_dynamic_subslice",
+           [](TritonOpBuilder &self, Value localAlloc,
+              std::vector<Value> offsets,
+              std::vector<int64_t> newShape) -> mlir::Value {
+             auto localAllocType = cast<ttg::MemDescType>(localAlloc.getType());
+             auto localAllocShape = localAllocType.getShape();
+             if (localAllocShape.size() != offsets.size() ||
+                 localAllocShape.size() != newShape.size())
+               throw std::runtime_error(
+                   "dynamic subslice offsets and shape must match source rank");
+             auto memDescType = ttg::MemDescType::get(
+                 newShape, localAllocType.getElementType(),
+                 localAllocType.getEncoding(), localAllocType.getMemorySpace(),
+                 /*mutableMemory=*/localAllocType.getMutableMemory(),
+                 localAllocType.getAllocShape());
+             return self.create<ttg::MemDescDynamicSubsliceOp>(
+                 memDescType, localAlloc, offsets);
+           })
       .def("create_amd_extract_slice",
            [](TritonOpBuilder &self, Value source, std::vector<int64_t> shape,
               std::vector<int64_t> offsets) -> Value {
@@ -184,6 +202,14 @@ void init_triton_tlx_ir(py::module_ &m) {
              return self.create<amdgpu::RegisterResidentOp>(
                  input.getType(), input, registerClassAttr,
                  registersPerGroupAttr);
+           })
+      .def("create_amd_register_handoff",
+           [](TritonOpBuilder &self, Value input,
+              const std::string &registerClass) -> Value {
+             auto registerClassAttr =
+                 self.getBuilder().getStringAttr(registerClass);
+             return self.create<amdgpu::RegisterHandoffOp>(
+                 input.getType(), input, registerClassAttr);
            })
       .def("create_amd_mfma_commit",
            [](TritonOpBuilder &self,
@@ -273,7 +299,9 @@ void init_triton_tlx_ir(py::module_ &m) {
       .def("create_release_layout",
            [](TritonOpBuilder &self, Value &v) -> Value {
              if (auto type = dyn_cast<RankedTensorType>(v.getType())) {
-               assert(type.getEncoding() && "Expect layout encoding");
+               if (!type.getEncoding())
+                 throw std::runtime_error(
+                     "release_layout requires an explicit source layout");
                auto newType = RankedTensorType::get(type.getShape(),
                                                     type.getElementType());
                return self.create<tlx::ReleaseLayoutOp>(newType, v);
