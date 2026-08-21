@@ -126,6 +126,32 @@ def TTNG_ClusterArriveOp : TTNG_Op<"cluster_arrive", []> {
   let hasVerifier = 1;
 }
 
+def TTNG_TwoCTAPeerGatherOp : TTNG_Op<"two_cta_peer_gather", [
+    SameOperandsAndResultType,
+    MemoryEffects<[MemRead<SharedMemory>, MemWrite<SharedMemory>]>
+  ]> {
+  let summary = "Abstract peer gather for a dependent 2-CTA MMA operand";
+
+  let description = [{
+    Represents the cross-CTA exchange needed to reconstruct a complete logical
+    tensor from two CTA-owned slices. This operation is inserted before warp
+    specialization so partition scheduling sees the dependency. A later pass
+    materializes DSMEM staging and synchronization.
+  }];
+
+  let arguments = (ins
+    TT_Tensor:$src,
+    I32Attr:$splitDim,
+    I32Attr:$numCTAs
+  );
+  let results = (outs TT_Tensor:$result);
+
+  let assemblyFormat = [{
+    $src `split_dim` `=` $splitDim `num_ctas` `=` $numCTAs attr-dict
+    `:` type($src)
+  }];
+}
+
 def TTNG_ClusterWaitOp : TTNG_Op<"cluster_wait", []> {
   let assemblyFormat = "attr-dict";
   let hasVerifier = 1;

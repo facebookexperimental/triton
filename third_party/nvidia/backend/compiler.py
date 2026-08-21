@@ -233,6 +233,7 @@ class CUDAOptions:
     tma_store_pipelining: Optional[bool] = None
     generate_subtiled_region: bool = False
     multicast: bool = False
+    allowDependentTwoCTA: bool = False
     # Per-config auto-TMA toggle (autotunable). Falls back to the global
     # TRITON_AUTO_TMA knob when left at the default in make_ttir.
     auto_tma: bool = False
@@ -849,7 +850,7 @@ class CUDABackend(BaseBackend):
         # dot dependencies into TMEM alloc/load/store chains.
         if (capability // 10 >= 10 and opt.cluster_dims is not None and max(opt.cluster_dims) >= 2
                 and opt.ctas_per_cga is not None):
-            nvidia.passes.ttnvgpuir.add_check_matmul_two_cta(pm)
+            nvidia.passes.ttnvgpuir.add_check_matmul_two_cta(pm, opt.allowDependentTwoCTA)
         # optimize TTGIR
         ptx_version = get_ptx_version_from_options(opt, capability)
         max_vec_bits = 256 if capability >= 100 and ptx_version >= 88 else 128
@@ -869,6 +870,9 @@ class CUDABackend(BaseBackend):
         passes.ttgpuir.add_accelerate_matmul(pm)
         passes.ttgpuir.add_remove_layout_conversions(pm, 0)
         passes.ttgpuir.add_optimize_dot_operands(pm, capability >= 80)
+        if (capability // 10 >= 10 and opt.cluster_dims is not None and max(opt.cluster_dims) >= 2
+                and opt.ctas_per_cga is not None and opt.allowDependentTwoCTA):
+            nvidia.passes.hopper.add_analyze_2cta_dependencies(pm)
         # 2-CTA: Split B descriptor loads before optimize_descriptor_encoding
         # so the cloned half-width descriptor gets its encoding set properly.
         # NOT gated on use_meta_ws: the ctas_per_cga approach bypasses PlanCTA
@@ -878,6 +882,9 @@ class CUDABackend(BaseBackend):
         if (capability // 10 >= 10 and opt.cluster_dims is not None and max(opt.cluster_dims) >= 2
                 and opt.ctas_per_cga is not None):
             nvidia.passes.hopper.add_2cta_transform_loads(pm)
+        if (capability // 10 >= 10 and opt.cluster_dims is not None and max(opt.cluster_dims) >= 2
+                and opt.ctas_per_cga is not None and opt.allowDependentTwoCTA):
+            nvidia.passes.hopper.add_plan_2cta_exchange(pm)
         nvidia.passes.ttnvgpuir.add_optimize_descriptor_encoding(pm)
         passes.ttir.add_loop_aware_cse(pm)
         if capability // 10 in [8, 9]:
@@ -1005,6 +1012,8 @@ class CUDABackend(BaseBackend):
                 )
             passes.ttgpuir.add_pipeline(pm, opt.num_stages, dump_enabled)
             passes.ttgpuir.add_optimize_partition_warps(pm)
+            if (opt.cluster_dims is not None and max(opt.cluster_dims) >= 2 and opt.allowDependentTwoCTA):
+                nvidia.passes.hopper.add_materialize_2cta_exchange(pm)
             passes.ttgpuir.add_combine_tensor_select_and_if(pm)
             # hoist again and allow hoisting out of if statements
             passes.ttgpuir.add_hoist_tmem_alloc(pm, True)
@@ -1016,7 +1025,7 @@ class CUDABackend(BaseBackend):
             # 2-CTA: Insert cross-CTA sync AFTER all WS passes.
             # Only for Meta WS path — non-WS 2-CTA sync is handled by
             # MMAv5.cpp's inline ClusterArriveOp.
-            if (opt.cluster_dims is not None and max(opt.cluster_dims) >= 2 and knobs.nvidia.use_meta_ws):
+            if opt.cluster_dims is not None and max(opt.cluster_dims) >= 2 and knobs.nvidia.use_meta_ws:
                 nvidia.passes.hopper.add_insert_2cta_sync(pm)
         else:
             passes.ttir.add_triton_licm(pm)
@@ -1147,7 +1156,12 @@ class CUDABackend(BaseBackend):
             passes.ttgpuir.add_prepare_consan_captures(pm, "nvidia")
         nvidia.passes.ttnvgpuir.add_allocate_tensor_memory(pm)
         nvidia.passes.ttgpuir.add_allocate_shared_memory_nv(pm, capability, ptx_version)
-        nvidia.passes.ttnvgpuir.add_check_matmul_two_cta(pm)
+        nvidia.passes.ttnvgpuir.add_check_matmul_two_cta(pm, options.allowDependentTwoCTA)
+        if "consan" in options.instrumentation_mode:
+            # Call ConcurrencySanitizerPass here, before allocating global scratch memory but after allocating tensor and shared
+            passes.ttgpuir.add_concurrency_sanitizer(pm)
+            passes.gluon.add_canonicalizer(pm)
+            passes.common.add_cse(pm)
         if "gsan" in options.instrumentation_mode:
             passes.ttgpuir.add_global_sanitizer(pm)
         # Print TTGIR to TLX mapping before final emission (for debugging/analysis)
@@ -1371,8 +1385,7 @@ class CUDABackend(BaseBackend):
                 fbin,
             ]
             try:
-                subprocess.run(ptxas_cmd, check=True, close_fds=False, stderr=flog,
-                               env=knobs.nvidia.get_tool_env())
+                subprocess.run(ptxas_cmd, check=True, close_fds=False, stderr=flog, env=knobs.nvidia.get_tool_env())
                 if knobs.nvidia.dump_ptxas_log:
                     with open(flog.name) as log_file:
                         print(log_file.read())

@@ -1024,9 +1024,7 @@ public:
     std::string constraints;
     constexpr unsigned warpSize = 64;
     bool hasLiveDependency = llvm::any_of(op.getInputs(), [](Value input) {
-      return !cast<RankedTensorType>(input.getType())
-                  .getElementType()
-                  .isF32();
+      return !cast<RankedTensorType>(input.getType()).getElementType().isF32();
     });
     for (auto [source, converted] :
          llvm::zip(op.getInputs(), adaptor.getInputs())) {

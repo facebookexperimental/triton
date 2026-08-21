@@ -609,6 +609,7 @@ class nvidia_knobs(base_knobs):
 
     def get_tool_env(self) -> Optional[dict[str, str]]:
         return self.tool_env() if self.tool_env is not None else None
+
     # Number of buffers for the dynamic-persistent tile-id broadcast channel
     # (cross-partition run-once atomic support). 1 = single-stage.
     ws_tile_prefetch_depth: env_int = env_int("TRITON_WS_TILE_PREFETCH_DEPTH", 1)
