@@ -212,6 +212,12 @@ void AutomaticWarpSpecialization::runOnOperation() {
     memoryPlannerOptions.smemAllocAlgo = 1;
     memoryPlannerOptions.smemBudget = std::max<int32_t>(smemBudget, 0);
     memoryPlannerOptions.smemCircularReuse = false;
+    // The Meta-NVWS suffix materializes its own synchronization storage, which
+    // the final shared-memory allocator accounts exactly. Do not also apply
+    // Meta code partition's conservative auxiliary reservation here: it can
+    // force a different data-buffer plan from an estimate that does not model
+    // the NVWS suffix, including unsupported allocation.reuseTarget relations.
+    memoryPlannerOptions.reserveAuxiliarySmem = false;
     metaPM.addPass(createNVGPUTestWSMemoryPlanner(memoryPlannerOptions));
     metaPM.addPass(createNVGPUTestAnnotateTMAStoreWaits());
     metaPM.addPass(std::make_unique<MetaValidateTMAStoreAnnotations>());
