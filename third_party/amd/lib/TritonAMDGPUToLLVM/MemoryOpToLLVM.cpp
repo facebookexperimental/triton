@@ -817,19 +817,26 @@ constrainMfmaFragmentRegisterClass(Value fragment, StringRef registerClass,
   return constrained;
 }
 
-// Build an asm snippet providing `waitStates` MFMA wait states. `s_nop N`
-// provides N+1 wait states and N saturates at 15, so a longer requirement is
-// split across several `s_nop`s.
+// Build an asm snippet providing exactly `waitStates` MFMA wait states.
+//
+// `s_nop N` provides N+1 wait states, and N is a 4-bit field, so a single
+// instruction covers at most 16. Two are always enough here: the largest
+// requirement LLVM models for gfx950 is 20 wait states
+// (GFX940_XDL_N_PassWritesVGPROverlappedSrcABWaitStates for a 16-pass MFMA).
+//
+//    1  ->  "s_nop 0"
+//    4  ->  "s_nop 3"
+//   16  ->  "s_nop 15"
+//   18  ->  "s_nop 15\ns_nop 1"
+//   20  ->  "s_nop 15\ns_nop 3"
 static std::string mfmaWaitStateAsm(int waitStates) {
-  std::string asmStr;
-  for (int remaining = waitStates; remaining > 0;) {
-    int chunk = std::min(remaining, 16);
-    if (!asmStr.empty())
-      asmStr += "\n";
-    asmStr += "s_nop " + std::to_string(chunk - 1);
-    remaining -= chunk;
-  }
-  return asmStr;
+  // A non-positive count would silently emit no padding at all, which is the
+  // exact hazard this padding exists to prevent.
+  assert(waitStates > 0 && waitStates <= 32 &&
+         "MFMA wait states must be positive and fit in two s_nops");
+  if (waitStates <= 16)
+    return "s_nop " + std::to_string(waitStates - 1);
+  return "s_nop 15\ns_nop " + std::to_string(waitStates - 16 - 1);
 }
 
 // Drain the MFMA pipeline before `fragment` is read by anything else.
