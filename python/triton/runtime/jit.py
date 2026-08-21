@@ -494,12 +494,7 @@ class KernelInterface(Generic[T]):
     def run(self, *args, grid, warmup, **kwargs):
         raise NotImplementedError("run not implemented")
 
-    def __getitem__(self: "KernelInterface[Callable[..., R]]", grid) -> Callable[..., R]:
-        """
-        A JIT function is launched with: fn[grid](*args, **kwargs).
-        Hence JITFunction.__getitem__ returns a callable proxy that
-        memorizes the grid.
-        """
+    def _get_jit_cache_proxy(self, grid):
         # Fast C proxy: bypasses Python run() entirely for cache hits.
         # Only useful when dispatcher is available — without it the proxy
         # does a redundant C cache lookup then falls back to run() anyway.
@@ -540,13 +535,24 @@ class KernelInterface(Generic[T]):
                         stacklevel=2,
                     )
             if proxy is not None:
-                # For pure positional calls, return proxy directly — avoids
-                # the overhead of an intermediate Python *args/**kwargs closure
-                # (~5-10us per dispatch due to tuple reallocation).
-                # Kernels called with kwargs (e.g., mm.py) will hit the proxy
-                # and get TypeError, so those callers should use the autotuner
-                # path which merges kwargs→positional before calling the proxy.
                 return proxy
+        return None
+
+    def __getitem__(self: "KernelInterface[Callable[..., R]]", grid) -> Callable[..., R]:
+        """
+        A JIT function is launched with: fn[grid](*args, **kwargs).
+        Hence JITFunction.__getitem__ returns a callable proxy that
+        memorizes the grid.
+        """
+        proxy = self._get_jit_cache_proxy(grid)
+        if proxy is not None:
+            # For pure positional calls, return proxy directly — avoids
+            # the overhead of an intermediate Python *args/**kwargs closure
+            # (~5-10us per dispatch due to tuple reallocation).
+            # Kernels called with kwargs (e.g., mm.py) will hit the proxy
+            # and get TypeError, so those callers should use the autotuner
+            # path which merges kwargs→positional before calling the proxy.
+            return proxy
         return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)
         # return cast(T, functools.partial(cast(Callable, self.run), grid=grid))
 
