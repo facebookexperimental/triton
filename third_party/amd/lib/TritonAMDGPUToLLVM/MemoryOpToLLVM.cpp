@@ -1384,13 +1384,16 @@ public:
           current = inlineAsm->getResult(0);
         }
         if (!useLatencyAwareIntrinsic) {
-          // The consumer is unknown here, so use the largest requirement LLVM
-          // models for reading an MFMA destination:
-          // `MFMA32x32WritesAGPRAccVgprReadWaitStates`. Its pass-count switch
-          // also routes anything other than 2 or 8 passes -- including the
-          // 4-pass 16x16x32 -- to this same value.
+          // The consumer is unknown at this point, so use the largest
+          // requirement LLVM models for reading an MFMA destination on gfx950:
+          // `GFX940_XDL_N_PassWritesVGPROverlappedSrcABWaitStates` is
+          // `NumPasses + 3 + 1` = 20 for a 16-pass MFMA, which exceeds both
+          // `MFMA32x32WritesAGPRAccVgprReadWaitStates` (18) and the function's
+          // own `MaxWaitStates` (19). Sizing the drain for the worst consumer
+          // keeps it sufficient on its own, rather than relying on the next
+          // MFMA's input padding to make up a shortfall.
           FailureOr<Value> drained = drainMfmaPipeline(
-              current, accumulatorStorage, /*waitStates=*/18, rewriter, loc);
+              current, accumulatorStorage, /*waitStates=*/20, rewriter, loc);
           if (failed(drained))
             return rewriter.notifyMatchFailure(
                 op, "MFMA accumulator fragment must pack into complete 32-bit "
