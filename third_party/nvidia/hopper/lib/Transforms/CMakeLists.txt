@@ -32,6 +32,9 @@ if(TRITON_ENABLE_Z3_JOINT_SOLVER)
 endif()
 
 add_triton_library(NVHopperTransforms
+  Analyze2CTADependencies.cpp
+  Plan2CTAExchange.cpp
+  Materialize2CTAExchange.cpp
   MultiCTAReduction.cpp
   WarpSpecialization.cpp
   WarpSpecialization/CodePartitionUtility.cpp

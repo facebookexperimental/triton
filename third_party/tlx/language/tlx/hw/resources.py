@@ -49,7 +49,7 @@ class Sm90:
     #: class is pinned to one. Resolution walks ARCH_SPECS in order and takes
     #: the first match, so a pinned entry must precede the broader one it
     #: overlaps (Sm107 before Sm100).
-    cuda_majors: tuple[int, ...] = (9,)
+    cuda_majors: tuple[int, ...] = (9, )
     cuda_minor: int | None = None
     #: 228KB SMEM per SM; 227KB is the max opt-in per block.
     smem_bytes: int = 232448
@@ -111,7 +111,7 @@ class Sm107(Sm100):
     product = "Rubin"
     #: Pinned to (10, 7), so this must precede Sm100 in ARCH_SPECS -- major 10
     #: alone would otherwise match Blackwell first.
-    cuda_majors = (10,)
+    cuda_majors = (10, )
     cuda_minor = 7
 
 

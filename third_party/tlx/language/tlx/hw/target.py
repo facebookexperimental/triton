@@ -236,12 +236,10 @@ def current_target() -> Target:
             # Do NOT fall through to Blackwell. A consumer part (major 12) has
             # a far smaller SMEM budget, so claiming it is a B200 would hand
             # out configs that cannot launch.
-            raise ValueError(
-                f"unrecognized CUDA compute capability {capability}. torchTLX "
-                f"targets "
-                f"{sorted(k for k, s in ARCH_SPECS.items() if s.vendor == 'nvidia')}; "
-                f"add a class to ARCH_SPECS to support it"
-            )
+            raise ValueError(f"unrecognized CUDA compute capability {capability}. torchTLX "
+                             f"targets "
+                             f"{sorted(k for k, s in ARCH_SPECS.items() if s.vendor == 'nvidia')}; "
+                             f"add a class to ARCH_SPECS to support it")
 
     # Prefer what the driver reports; the table is the fallback. This is what
     # lets a part we have not tuned for yet report its own limits.

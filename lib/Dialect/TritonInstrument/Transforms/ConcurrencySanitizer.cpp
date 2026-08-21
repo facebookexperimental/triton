@@ -875,12 +875,12 @@ private:
       MemType memType = materialized.memType;
       if (memType == MemType::SHARED_MEM) {
         if (effect.proxy == MemEffectsOpInfo::Effects::Proxy::Async) {
-          funcBuilder.createVerifyProxyAccessCall(
-              b, bufferMask, baseThread, effect.operandName, pred, op,
-              effectCTAs);
+          funcBuilder.createVerifyProxyAccessCall(b, bufferMask, baseThread,
+                                                  effect.operandName, pred, op,
+                                                  effectCTAs);
         } else {
-          funcBuilder.createSetProxyAccessCall(
-              b, bufferMask, baseThread, pred, op, effectCTAs);
+          funcBuilder.createSetProxyAccessCall(b, bufferMask, baseThread, pred,
+                                               op, effectCTAs);
         }
       }
       if (effect.rw == MemEffectsOpInfo::Effects::Read) {

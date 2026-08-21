@@ -43,44 +43,25 @@ def _prune_register_configs(configs, named_args, **_):
     k = named_args["K"]
     if 128 <= k < 256 and named_args["M"] >= 16384 and named_args["N"] <= 128:
         preferred = [
-            config
-            for config in configs
-            if config.kwargs["NUM_XCDS"] == 1
-            and config.kwargs["BLOCK_M"] == 128
-            and config.kwargs["BLOCK_N"] == 64
-            and config.kwargs["BLOCK_K"] == 64
-            and config.kwargs["GROUP_M"] == 4
-            and config.kwargs["waves_per_eu"] == 0
-            and config.num_warps == 4
-            and config.num_stages == 2
+            config for config in configs if config.kwargs["NUM_XCDS"] == 1 and config.kwargs["BLOCK_M"] == 128
+            and config.kwargs["BLOCK_N"] == 64 and config.kwargs["BLOCK_K"] == 64 and config.kwargs["GROUP_M"] == 4
+            and config.kwargs["waves_per_eu"] == 0 and config.num_warps == 4 and config.num_stages == 2
         ]
         if preferred:
             return preferred
     if k == 1536 and named_args["M"] == 3072 and named_args["N"] == 3072:
         preferred = [
-            config
-            for config in configs
-            if config.kwargs["NUM_XCDS"] == 8
-            and config.kwargs["BLOCK_M"] == 128
-            and config.kwargs["BLOCK_N"] == 128
-            and config.kwargs["BLOCK_K"] == 64
-            and config.kwargs["GROUP_M"] == 16
-            and config.kwargs["waves_per_eu"] == 0
-            and config.num_warps == 4
-            and config.num_stages == 2
+            config for config in configs if config.kwargs["NUM_XCDS"] == 8 and config.kwargs["BLOCK_M"] == 128
+            and config.kwargs["BLOCK_N"] == 128 and config.kwargs["BLOCK_K"] == 64 and config.kwargs["GROUP_M"] == 16
+            and config.kwargs["waves_per_eu"] == 0 and config.num_warps == 4 and config.num_stages == 2
         ]
         if preferred:
             return preferred
     if k == 256 and named_args["M"] <= 1024 and named_args["N"] >= 16384:
         preferred = [
-            config
-            for config in configs
-            if config.kwargs["BLOCK_M"] == 256
-            and config.kwargs["BLOCK_N"] == 128
-            and config.kwargs["BLOCK_K"] == 32
-            and config.kwargs["GROUP_M"] == 4
-            and config.kwargs["waves_per_eu"] == 2
-            and config.num_warps == 4
+            config for config in configs
+            if config.kwargs["BLOCK_M"] == 256 and config.kwargs["BLOCK_N"] == 128 and config.kwargs["BLOCK_K"] == 32
+            and config.kwargs["GROUP_M"] == 4 and config.kwargs["waves_per_eu"] == 2 and config.num_warps == 4
         ]
         if preferred:
             return preferred
@@ -103,8 +84,7 @@ _REGISTER_CONFIGS = [
         },
         num_warps=num_warps,
         num_stages=2,
-    )
-    for block_m, block_n, block_k, group_m, num_warps, waves_per_eu in (
+    ) for block_m, block_n, block_k, group_m, num_warps, waves_per_eu in (
         (16, 16, 256, 4, 4, 2),
         (32, 16, 256, 4, 4, 0),
         (32, 32, 16, 8, 4, 2),
@@ -158,8 +138,7 @@ _REGISTER_CONFIGS += [
         },
         num_warps=num_warps,
         num_stages=num_stages,
-    )
-    for block_m, block_n, block_k, group_m, num_warps, num_stages, waves_per_eu in (
+    ) for block_m, block_n, block_k, group_m, num_warps, num_stages, waves_per_eu in (
         (128, 64, 64, 4, 4, 2, 0),
         (128, 64, 64, 4, 4, 3, 0),
         (128, 64, 64, 16, 4, 3, 0),
@@ -190,8 +169,7 @@ _REGISTER_CONFIGS += [
         },
         num_warps=num_warps,
         num_stages=num_stages,
-    )
-    for block_m, block_n, block_k, group_m, num_warps, num_stages, waves_per_eu in (
+    ) for block_m, block_n, block_k, group_m, num_warps, num_stages, waves_per_eu in (
         (128, 64, 64, 4, 4, 2, 0),
         (128, 64, 64, 4, 4, 3, 0),
         (128, 128, 64, 8, 4, 2, 0),
@@ -349,11 +327,9 @@ def _launch_register(a, b, bias=None):
         if bias.device != a.device or bias.dtype != a.dtype:
             raise ValueError("Bias and matrix operands must have matching device and dtype")
     out = torch.empty((M, N), device=a.device, dtype=a.dtype)
-    grid = lambda meta: (triton.cdiv(M, meta["BLOCK_M"]) * triton.cdiv(N, meta["BLOCK_N"]),)
-    disable_agpr = (K == 256 and N > 256) or (
-        K > 512 and (K % BLOCK_K != 0 or M * N <= 2 * 1024 * 1024)
-    )
-    launch_options = {"llvm_fn_attrs": (("amdgpu-agpr-alloc", "0,0"),)} if disable_agpr else {}
+    grid = lambda meta: (triton.cdiv(M, meta["BLOCK_M"]) * triton.cdiv(N, meta["BLOCK_N"]), )
+    disable_agpr = (K == 256 and N > 256) or (K > 512 and (K % BLOCK_K != 0 or M * N <= 2 * 1024 * 1024))
+    launch_options = {"llvm_fn_attrs": (("amdgpu-agpr-alloc", "0,0"), )} if disable_agpr else {}
     bias_ptr = bias if bias is not None else out
     _register_kernel[grid](
         a,

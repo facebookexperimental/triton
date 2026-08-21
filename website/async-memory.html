@@ -1,0 +1,171 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Move data asynchronously with descriptors, TMA, and copy groups.">
+  <title>Async memory access · TLX</title>
+  <link rel="stylesheet" href="assets/tlx.css">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="../"><span>TLX</span> Triton Low-level Language Extensions</a>
+    <a class="repo-link" href="https://github.com/facebookexperimental/triton" target="_blank" rel="noreferrer">View on GitHub ↗</a>
+  </header>
+  <div class="shell">
+    <aside class="sidebar">
+      <p class="eyebrow">Documentation</p>
+      <nav><a href="../">Overview</a>
+<a href="buffers.html">Local and remote buffers</a>
+<a href="async-memory.html" aria-current="page">Async memory access</a>
+<a href="async-compute.html">Async tensor core operations</a>
+<a href="synchronization.html">Barriers and Cluster Launch Control</a>
+<a href="warp-specialization.html">Warp specialization and clustering</a>
+<a href="utilities.html">Other operations</a>
+<a href="kernels.html">Example kernels</a>
+<a href="install-and-test.html">Build, install, and test</a>
+<a href="resources.html">More reading</a></nav>
+    </aside>
+    <main>
+      <p class="eyebrow">TLX documentation</p>
+      <h1>Async memory access</h1>
+      <p class="lede">Move data asynchronously with descriptors, TMA, and copy groups.</p>
+      <article><div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.async_descriptor_load(desc, buffer, offsets, barrier, pred=None, cache_modifier=&quot;&quot;, eviction_policy=&quot;&quot;, multicast_targets=[])</code> <strong>[Hopper+]</strong></div></div>
+<p>Load a chunk of data from global memory into a local memory buffer using TMA. The global address, strides, and buffer size are defined by the tensor descriptor. A barrier object is provided and signaled upon completion of the operation.</p>
+<p><strong>Parameters:</strong></p>
+<div class="list-item depth-1"><span aria-hidden="true">•</span><div><code>desc</code>: Tensor descriptor for the source</div></div>
+<div class="list-item depth-1"><span aria-hidden="true">•</span><div><code>buffer</code>: Destination buffer in shared memory</div></div>
+<div class="list-item depth-1"><span aria-hidden="true">•</span><div><code>offsets</code>: List of offsets for each dimension</div></div>
+<div class="list-item depth-1"><span aria-hidden="true">•</span><div><code>barrier</code>: mbarrier to signal upon completion</div></div>
+<div class="list-item depth-1"><span aria-hidden="true">•</span><div><code>pred</code>: Optional predicate to guard the load</div></div>
+<div class="list-item depth-1"><span aria-hidden="true">•</span><div><code>cache_modifier</code>: Cache modifier hint (e.g., <code>&quot;&quot;</code>, <code>&quot;evict_first&quot;</code>)</div></div>
+<div class="list-item depth-1"><span aria-hidden="true">•</span><div><code>eviction_policy</code>: L2 cache eviction policy (<code>&quot;&quot;</code>, <code>&quot;evict_first&quot;</code>, <code>&quot;evict_last&quot;</code>)</div></div>
+<div class="list-item depth-1"><span aria-hidden="true">•</span><div><code>multicast_targets</code>: Optional list of multicast targets for cluster-wide loads</div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.async_descriptor_prefetch_tensor(memdesc, [offsets], pred, eviction_policy)</code> <strong>[Hopper+]</strong></div></div>
+<p>Hint hardware to load a chunk of data from global memory into a L2 cache to prepare for upcoming <code>async_descriptor_load</code> operations.</p>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.async_descriptor_store(desc, source, offsets, eviction_policy=&quot;&quot;, store_reduce=&quot;&quot;)</code> <strong>[Hopper+]</strong></div></div>
+<p>Store a chunk of data from shared memory into global memory using TMA. The global address, strides, and buffer size are defined by the tensor descriptor.</p>
+<p>Supports optional atomic reduction (<code>store_reduce</code>) and L2 cache eviction hints (<code>eviction_policy</code>). Both regular stores and atomic reduce stores support cache eviction policies.</p>
+<p><strong>Parameters:</strong></p>
+<div class="list-item depth-1"><span aria-hidden="true">•</span><div><code>desc</code>: Tensor descriptor for the destination</div></div>
+<div class="list-item depth-1"><span aria-hidden="true">•</span><div><code>source</code>: Source buffer in shared memory</div></div>
+<div class="list-item depth-1"><span aria-hidden="true">•</span><div><code>offsets</code>: List of offsets for each dimension</div></div>
+<div class="list-item depth-1"><span aria-hidden="true">•</span><div><code>eviction_policy</code>: L2 cache eviction policy (<code>&quot;&quot;</code>, <code>&quot;evict_first&quot;</code>, <code>&quot;evict_last&quot;</code>)</div></div>
+<div class="list-item depth-1"><span aria-hidden="true">•</span><div><code>store_reduce</code>: Atomic reduction kind (<code>&quot;&quot;</code>, <code>&quot;add&quot;</code>, <code>&quot;min&quot;</code>, <code>&quot;max&quot;</code>, <code>&quot;and&quot;</code>, <code>&quot;or&quot;</code>, <code>&quot;xor&quot;</code>)</div></div>
+<p><strong>Example:</strong></p>
+<pre><code class="language-python">   # Regular TMA store with L2 evict_first hint
+   tlx.async_descriptor_store(desc_c, c_buf[0], [offs_m, offs_n], eviction_policy=&quot;evict_first&quot;)
+
+   # TMA atomic reduce-add with L2 evict_first hint
+   tlx.async_descriptor_store(desc_c, c_buf[0], [offs_m, offs_n],
+                              eviction_policy=&quot;evict_first&quot;, store_reduce=&quot;add&quot;)</code></pre>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.async_remote_shmem_store(dst, src, remote_cta_rank, barrier)</code> <strong>[Hopper+]</strong></div></div>
+<p>Store a distributed tensor into a buffer in the remote shared memory of a cluster asynchronously. Signals the provided mbarrier when the store completes.</p>
+<p><strong>Parameters:</strong></p>
+<div class="list-item depth-1"><span aria-hidden="true">•</span><div><code>dst</code>: The destination buffer in local shared memory (will be internally mapped to the remote CTA)</div></div>
+<div class="list-item depth-1"><span aria-hidden="true">•</span><div><code>src</code>: The source distributed tensor to store</div></div>
+<div class="list-item depth-1"><span aria-hidden="true">•</span><div><code>remote_cta_rank</code>: The rank (unique ID) of the remote CTA within the cluster</div></div>
+<div class="list-item depth-1"><span aria-hidden="true">•</span><div><code>barrier</code>: mbarrier to signal when the store completes</div></div>
+<p><strong>Example:</strong></p>
+<pre><code class="language-python">   # Allocate shared memory buffer and barrier
+   buffer = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float16, 1)
+   barrier = tlx.alloc_barriers(num_barriers=1, arrive_count=1)
+
+   # Store to remote CTA&#x27;s shared memory
+   tlx.async_remote_shmem_store(buffer[0], src_tensor, remote_cta_rank=1, barrier=barrier[0])</code></pre>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.remote_shmem_copy(dst, src, remote_cta_rank)</code> <strong>[Hopper+]</strong></div></div>
+<p>Store a local shared memory buffer into a buffer in the remote shared memory of a cluster asynchronously.</p>
+<p><strong>Parameters:</strong></p>
+<div class="list-item depth-1"><span aria-hidden="true">•</span><div><code>dst</code>: The destination buffer in local shared memory (will be internally mapped to the remote CTA)</div></div>
+<div class="list-item depth-1"><span aria-hidden="true">•</span><div><code>src</code>: The source distributed tensor to store</div></div>
+<div class="list-item depth-1"><span aria-hidden="true">•</span><div><code>remote_cta_rank</code>: The rank (unique ID) of the remote CTA within the cluster</div></div>
+<div class="list-item depth-1"><span aria-hidden="true">•</span><div><code>barrier</code>: mbarrier to signal when the store completes (will be internally mapped to the remote CTA)</div></div>
+<p><strong>Example:</strong></p>
+<pre><code class="language-python">  # Allocate shared memory buffer
+  buffer0 = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float16, 1)
+  buffer1 = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float16, 1)
+  barrier = tlx.alloc_barriers(num_barriers=1, arrive_count=1)
+
+  # Copy to remote CTA&#x27;s shared memory
+  tlx.remote_shmem_store(buffer0[0], buffer1[0], remote_cta_rank=1, barrier=barrier[0])</code></pre>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>desc_ptrs = tlx.allocate_tensor_descriptor(num)</code> <strong>[Hopper+]</strong></div></div>
+<p>Allocates global memory for tensor descriptor storage with built-in parameters (nbytes=128, alignment=128 per descriptor). Returns a <code>tensor_descriptor_ptr</code> with 128-byte stride semantics that supports indexing.</p>
+<p><strong>Parameters:</strong></p>
+<div class="list-item depth-1"><span aria-hidden="true">•</span><div><code>num</code>: Number of tensor descriptors to allocate (must be a constexpr)</div></div>
+<p><strong>Returns:</strong></p>
+<div class="list-item depth-1"><span aria-hidden="true">•</span><div>A <code>tensor_descriptor_ptr</code> where indexing (e.g., <code>desc_ptrs[0]</code>, <code>desc_ptrs[1]</code>) advances by 128 bytes per index</div></div>
+<p><strong>Example:</strong></p>
+<pre><code class="language-python">   # Allocate storage for 4 tensor descriptors
+   desc_ptrs = tlx.allocate_tensor_descriptor(num=4)
+
+   # Access individual descriptors using indexing
+   desc_ptr_0 = desc_ptrs[0]  # First descriptor
+   desc_ptr_1 = desc_ptrs[1]  # Second descriptor (128 bytes offset)</code></pre>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.make_tensor_descriptor(desc_ptr, base, shape, strides, block_shape, padding_option)</code> <strong>[Hopper+]</strong></div></div>
+<p>Create a TMA (Tensor Memory Accelerator) descriptor for efficient asynchronous data movement on Hopper and Blackwell GPUs.</p>
+<p><strong>Parameters:</strong></p>
+<div class="list-item depth-1"><span aria-hidden="true">•</span><div><code>desc_ptr</code> (optional): Tensor descriptor pointer from <code>allocate_tensor_descriptor()</code>. Pass <code>None</code> for automatic allocation.</div></div>
+<div class="list-item depth-1"><span aria-hidden="true">•</span><div><code>base</code>: Base pointer to the tensor in global memory</div></div>
+<div class="list-item depth-1"><span aria-hidden="true">•</span><div><code>shape</code>: List of tensor dimensions (dynamic, runtime values)</div></div>
+<div class="list-item depth-1"><span aria-hidden="true">•</span><div><code>strides</code>: List of tensor strides (dynamic, runtime values)</div></div>
+<div class="list-item depth-1"><span aria-hidden="true">•</span><div><code>block_shape</code>: Shape of the block to be loaded/stored (compile-time constants)</div></div>
+<div class="list-item depth-1"><span aria-hidden="true">•</span><div><code>padding_option</code>: Padding option for out-of-bounds accesses (default: "zero")</div></div>
+<p><strong>Example:</strong></p>
+<pre><code class="language-python">   # Create a 2D tensor descriptor with automatic scratch allocation
+   desc = tlx.make_tensor_descriptor(
+       desc_ptr=None,  # Compiler allocates scratch memory automatically
+       base=tensor_ptr,
+       shape=[M, N],
+       strides=[N, tl.constexpr(1)],
+       block_shape=[64, 64],
+   )
+
+   # Or with explicit descriptor allocation for advanced use cases (e.g., pipelining)
+   desc_ptrs = tlx.allocate_tensor_descriptor(num=2)
+
+   # Create descriptor at index 0
+   tlx.make_tensor_descriptor(
+       desc_ptr=desc_ptrs[0],
+       base=tensor_ptr,
+       shape=[M, N],
+       strides=[N, tl.constexpr(1)],
+       block_shape=[64, 64],
+   )
+
+   # Reinterpret the descriptor for TMA operations
+   desc = tlx.reinterpret_tensor_descriptor(
+       desc_ptr=desc_ptrs[0],
+       block_shape=[64, 64],
+       dtype=tl.float16,
+   )
+
+   # Use with async TMA operations
+   tlx.async_descriptor_load(desc, buffer, offsets=[m_offset, n_offset], barrier=mbar)</code></pre>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>desc = tlx.reinterpret_tensor_descriptor(desc_ptr, block_shape, dtype)</code> <strong>[Hopper+, MI300+]</strong></div></div>
+<p>Reinterpret a tensor descriptor pointer as a TMA-backed tensor descriptor object.</p>
+<p><strong>Parameters:</strong></p>
+<div class="list-item depth-1"><span aria-hidden="true">•</span><div><code>desc_ptr</code>: A <code>tensor_descriptor_ptr</code> pointing to the TMA descriptor (from <code>allocate_tensor_descriptor</code>)</div></div>
+<div class="list-item depth-1"><span aria-hidden="true">•</span><div><code>block_shape</code>: Shape of the block to be loaded/stored (compile-time constants)</div></div>
+<div class="list-item depth-1"><span aria-hidden="true">•</span><div><code>dtype</code>: Data type of the tensor elements</div></div>
+<p><strong>Example:</strong></p>
+<pre><code class="language-python">   # Allocate and create descriptor
+   desc_ptrs = tlx.allocate_tensor_descriptor(num=2)
+   tlx.make_tensor_descriptor(desc_ptr=desc_ptrs[0], base=a_ptr, shape=[M, K], strides=[K, 1], block_shape=[128, 64])
+
+   # Reinterpret for use with TMA
+   a_desc = tlx.reinterpret_tensor_descriptor(desc_ptr=desc_ptrs[0], block_shape=[128, 64], dtype=tl.float16)
+   tlx.async_descriptor_load(a_desc, buffer, offsets=[offs_m, offs_k], barrier=mbar)</code></pre>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.async_load(tensor_ptr, buffer, optional_mask, optional_other, cache_modifier, eviction_policy, is_volatile)</code> <strong>[Hopper+, MI350]</strong></div></div>
+<p>Load a chunk of data from global memory into a local memory buffer asynchronously.</p>
+<p>The operation returns a token object which can be used to track the completion of the operation.</p>
+<p><strong>MI350X caveat:</strong> When <code>mask</code> is provided, callers should also provide <code>other</code>—typically <code>0.0</code> for numerical kernels. Elements for which <code>mask=True</code> are copied from global memory into the destination local buffer. For elements where <code>mask=False</code>, <code>other</code> is written only if it is provided. Otherwise, the corresponding LDS locations retain unspecified, potentially stale contents from an earlier use of the buffer.</p>
+<p>For example, in FlashAttention, when the sequence length is not a multiple of <code>BLOCK_N</code>, the final <code>V</code> tile contains masked-out rows. If <code>other</code> is omitted, those rows may contain unspecified values, including bit patterns representing NaN or infinity. These values can propagate through the subsequent matrix multiplication and produce incorrect output. Use <code>other=0.0</code> for such padded tiles.</p>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.async_load_commit_group(tokens)</code> <strong>[Hopper+, MI350]</strong></div></div>
+<p>Commits all prior initiated but uncommitted async_load ops an async group. Optionally, each token represents a tracked async load operation.</p>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.async_load_wait_group(pendings, tokens)</code> <strong>[Hopper+, MI350]</strong></div></div>
+<p>Wait for completion of prior asynchronous copy operations. The <code>pendings</code> argument indicates the number of in-flight operations not completed. Optionally, each token represents a tracked async commit group operation.</p></article>
+      <footer class="pager"><a href="buffers.html">← Local and remote buffers</a><a class="next" href="async-compute.html">Async tensor core operations →</a></footer>
+    </main>
+  </div>
+</body>
+</html>

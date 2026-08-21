@@ -164,8 +164,8 @@ struct GluonLayouts {
         py::module_::import_("triton.experimental.gluon.language.amd._layouts");
     auto blackwellLayouts = py::module_::import_(
         "triton.experimental.gluon.language.nvidia.blackwell");
-    auto rubinLayouts = py::module_::import_(
-        "triton.experimental.gluon.language.nvidia.rubin");
+    auto rubinLayouts =
+        py::module_::import_("triton.experimental.gluon.language.nvidia.rubin");
     AutoLayout = py::object(layouts.attr("AutoLayout")).release();
     CoalescedLayout = py::object(layouts.attr("CoalescedLayout")).release();
     BlockedLayout = py::object(layouts.attr("BlockedLayout")).release();
@@ -1052,21 +1052,22 @@ void init_gluon_ir(py::module_ &m) {
              self.create<ttng::TCGen5CommitOp>(barrier, pred, descs);
            })
 
-      .def("create_async_tma_copy_global_to_local",
-           [](GluonOpBuilder &self, Value descPtr, std::vector<Value> &coord,
-              Value barrier, Value result, Value pred, bool multicast,
-              std::optional<std::vector<Value>> offsets) {
-             multicast &= ttng::hasCGABroadcast(
-                 cast<ttg::MemDescType>(result.getType()));
-             ValueRange offsetsRange =
-                 offsets.has_value() ? ValueRange(*offsets) : ValueRange{};
-             self.create<ttng::AsyncTMACopyGlobalToLocalOp>(
-                 /*multicastTargets=*/Value(), descPtr, coord, offsetsRange,
-                 barrier, result, pred, multicast);
-           },
-           py::arg("descPtr"), py::arg("coord"), py::arg("barrier"),
-           py::arg("result"), py::arg("pred"), py::arg("multicast"),
-           py::arg("offsets").none())
+      .def(
+          "create_async_tma_copy_global_to_local",
+          [](GluonOpBuilder &self, Value descPtr, std::vector<Value> &coord,
+             Value barrier, Value result, Value pred, bool multicast,
+             std::optional<std::vector<Value>> offsets) {
+            multicast &=
+                ttng::hasCGABroadcast(cast<ttg::MemDescType>(result.getType()));
+            ValueRange offsetsRange =
+                offsets.has_value() ? ValueRange(*offsets) : ValueRange{};
+            self.create<ttng::AsyncTMACopyGlobalToLocalOp>(
+                /*multicastTargets=*/Value(), descPtr, coord, offsetsRange,
+                barrier, result, pred, multicast);
+          },
+          py::arg("descPtr"), py::arg("coord"), py::arg("barrier"),
+          py::arg("result"), py::arg("pred"), py::arg("multicast"),
+          py::arg("offsets").none())
       .def("create_async_tma_copy_local_to_global",
            [](GluonOpBuilder &self, Value descPtr, std::vector<Value> &coord,
               Value src) {

@@ -3209,19 +3209,19 @@ public:
 
     TmemScratchManager scratch(twoCTAs);
     RewritePatternSet patterns(&getContext());
-    patterns
-        .add<BinaryFloatToIntPattern<arith::AddFOp, arith::AddIOp>,
-             BinaryFloatToIntPattern<arith::SubFOp, arith::SubIOp>,
-             BinaryFloatToIntPattern<arith::MulFOp, arith::MulIOp>,
-             BinaryFloatToIntPattern<arith::MinimumFOp, arith::MinSIOp>,
-             BinaryFloatToIntPattern<arith::MaximumFOp, arith::MaxSIOp>,
-             BinaryFloatToIntPattern<arith::MinNumFOp, arith::MinSIOp>,
-             BinaryFloatToIntPattern<arith::MaxNumFOp, arith::MaxSIOp>,
-             NegFOpPattern, DivFOpPattern, PreciseDivFOpPattern, RemFOpPattern,
-             ClampFOpPattern, FmaPattern, ExpOpPattern, Exp2OpPattern,
-             CosOpPattern, SinOpPattern, ExtFOpPattern, TruncFOpPattern,
-             FpToFpPattern, Fp4ToFpPattern, PackedArithPattern, DotPattern,
-             DotScaledPattern>(&getContext());
+    patterns.add<BinaryFloatToIntPattern<arith::AddFOp, arith::AddIOp>,
+                 BinaryFloatToIntPattern<arith::SubFOp, arith::SubIOp>,
+                 BinaryFloatToIntPattern<arith::MulFOp, arith::MulIOp>,
+                 BinaryFloatToIntPattern<arith::MinimumFOp, arith::MinSIOp>,
+                 BinaryFloatToIntPattern<arith::MaximumFOp, arith::MaxSIOp>,
+                 BinaryFloatToIntPattern<arith::MinNumFOp, arith::MinSIOp>,
+                 BinaryFloatToIntPattern<arith::MaxNumFOp, arith::MaxSIOp>,
+                 NegFOpPattern, DivFOpPattern, PreciseDivFOpPattern,
+                 RemFOpPattern, ClampFOpPattern, FmaPattern, ExpOpPattern,
+                 Exp2OpPattern, CosOpPattern, SinOpPattern, ExtFOpPattern,
+                 TruncFOpPattern, FpToFpPattern, Fp4ToFpPattern,
+                 PackedArithPattern, DotPattern, DotScaledPattern>(
+        &getContext());
     patterns.add<UnaryPattern<math::LogOp>>(&getContext(), UnaryOpId::Log);
     patterns.add<UnaryPattern<math::Log2Op>>(&getContext(), UnaryOpId::Log2);
     patterns.add<UnaryPattern<math::SqrtOp>>(&getContext(), UnaryOpId::Sqrt);
