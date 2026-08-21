@@ -20,6 +20,7 @@
 #include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/SetVector.h"
 #include <algorithm>
+#include <cassert>
 
 using namespace mlir;
 using namespace mlir::triton;
@@ -529,11 +530,14 @@ static LogicalResult tagExternalPartitionedOps(FuncOp func,
   return success();
 }
 
-static LogicalResult convertDescriptorStores(FuncOp func) {
+static LogicalResult convertDescriptorGathers(FuncOp func) {
   SmallVector<LocalStoreOp> stores;
   func.walk([&](LocalStoreOp store) {
-    if (isa_and_nonnull<DescriptorLoadOp, DescriptorGatherOp>(
-            store.getSrc().getDefiningOp()))
+    Operation *producer = store.getSrc().getDefiningOp();
+    assert(!isa_and_nonnull<DescriptorLoadOp>(producer) &&
+           "tt.descriptor_load must be converted to nvws.descriptor_load "
+           "before MetaToNVWSConvert");
+    if (isa_and_nonnull<DescriptorGatherOp>(producer))
       stores.push_back(store);
   });
 
@@ -561,17 +565,10 @@ static LogicalResult convertDescriptorStores(FuncOp func) {
 
     OpBuilder builder(store);
     int txCount = getTxCount(descOp);
-    Operation *newOp = nullptr;
-    if (auto load = dyn_cast<DescriptorLoadOp>(descOp)) {
-      newOp = triton::nvws::DescriptorLoadOp::create(
-          builder, load.getLoc(), load.getDesc(), load.getIndices(), txCount,
-          store.getDst(), load.getCache(), load.getEvict());
-    } else {
-      auto gather = cast<DescriptorGatherOp>(descOp);
-      newOp = triton::nvws::DescriptorGatherOp::create(
-          builder, gather.getLoc(), gather.getDesc(), gather.getXOffsets(),
-          gather.getYOffset(), txCount, store.getDst());
-    }
+    auto gather = cast<DescriptorGatherOp>(descOp);
+    Operation *newOp = triton::nvws::DescriptorGatherOp::create(
+        builder, gather.getLoc(), gather.getDesc(), gather.getXOffsets(),
+        gather.getYOffset(), txCount, store.getDst());
     newOp->setAttrs(descOp->getAttrs());
     newOp->setAttr(kPartitionAttrName,
                    DenseI32ArrayAttr::get(store.getContext(), *descIds));
@@ -1010,7 +1007,14 @@ static LogicalResult convertFunc(FuncOp func) {
   DenseSet<Operation *> consumedExternalTaskIds;
   WalkResult partitionResult = func.walk([&](Operation *op) {
     if (!isWarpSpecializeLoop(op) && !isNestedInWarpSpecializeLoop(op)) {
-      if (externalAliases->contains(op)) {
+      // Descriptor loads are converted before this bridge by current Meta
+      // memory planning or NVWSInsertAllocas. A root-scope descriptor load is a
+      // partitioned sibling of the WS loop, just like an external managed
+      // alias. Preserve its Meta ownership, including on repeated bridge
+      // conversion after async_task_id has already been consumed.
+      bool isPreconvertedDescriptorLoad =
+          isa<triton::nvws::DescriptorLoadOp>(op);
+      if (externalAliases->contains(op) || isPreconvertedDescriptorLoad) {
         if (failed(materializePartition(op)))
           return WalkResult::interrupt();
         consumedExternalTaskIds.insert(op);
@@ -1042,7 +1046,7 @@ static LogicalResult convertFunc(FuncOp func) {
   if (outputResult.wasInterrupted())
     return failure();
 
-  if (failed(convertDescriptorStores(func)) ||
+  if (failed(convertDescriptorGathers(func)) ||
       failed(tagExternalPartitionedOps(func, wsLoops)) ||
       failed(translateBufferPlan(func)) ||
       failed(localizeManagedAllocGroups(func)))
