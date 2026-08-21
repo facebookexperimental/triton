@@ -1,5 +1,6 @@
 #include "ReduceScanCommon.h"
 
+#include <iterator>
 #include <map>
 #include <memory>
 #include <numeric>
@@ -755,8 +756,14 @@ private:
     Operation &combinerOp = combineRegion.front().front();
     unsigned arity =
         enableTreeReduction ? targetInfo.getReductionTreeArity(&combinerOp) : 1;
+    // A linear fold still needs bounded dependency chains. The contiguous
+    // register span is the lowering contract used by the legacy path: reduce
+    // one span, immediately merge it into the running result, then continue.
+    // Flattening all spans into one chain prevents LLVM from packing adjacent
+    // loop-carried values and sharply increases register pressure.
+    unsigned linearChunkSize = helper.getContigPerThreadOnReductionAxis();
 
-    // Perform a tree reduction
+    // Perform the in-thread reduction.
     unsigned numOperands = accs.size();
     SmallVector<SmallVector<Value>> reduced(numOperands);
     unsigned regs = accs.front().size();
@@ -768,8 +775,23 @@ private:
           cur[opIdx] = accs[opIdx][regBase + i];
         vals.push_back(std::move(cur));
       }
-      auto acc =
-          treeReduce(loc, rewriter, combineRegion, std::move(vals), arity);
+      SmallVector<Value> acc;
+      if (arity == 1 && linearChunkSize < vals.size()) {
+        auto numChunks =
+            llvm::divideCeil(vals.size(), static_cast<size_t>(linearChunkSize));
+        for (size_t chunkIdx : llvm::seq(numChunks)) {
+          size_t begin = chunkIdx * linearChunkSize;
+          size_t end = std::min(begin + linearChunkSize, vals.size());
+          SmallVector<SmallVector<Value>> chunk(
+              std::make_move_iterator(vals.begin() + begin),
+              std::make_move_iterator(vals.begin() + end));
+          auto partial =
+              treeReduce(loc, rewriter, combineRegion, std::move(chunk), 1);
+          accumulate(loc, rewriter, combineRegion, acc, partial);
+        }
+      } else {
+        acc = treeReduce(loc, rewriter, combineRegion, std::move(vals), arity);
+      }
       for (unsigned opIdx = 0; opIdx < numOperands; ++opIdx)
         reduced[opIdx].push_back(acc[opIdx]);
     }
