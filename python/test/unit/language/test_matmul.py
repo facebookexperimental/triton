@@ -473,7 +473,9 @@ def fp8e8m0_to_float32(scale):
 
 
 @pytest.mark.interpreter
-@pytest.mark.parametrize("M, N, K", [(1024, 512, 256), (128, 256, 256), (128, 128, 128), (2, 4, 64)])
+# NOTE: M/N/K are fixed in the body (see #8172); there is deliberately no
+# parametrize for them. A stale one here makes pytest fail collection for the
+# whole file with "In test_mxfp: function uses no argument 'M'".
 @pytest.mark.parametrize(
     "BLOCK_M, BLOCK_N, BLOCK_K",
     [(128, 128, 128), (256, 128, 128), (128, 256, 128), (128, 256, 256), (128, 128, 64), (128, 64, 128), (128, 16, 256),
