@@ -1362,6 +1362,16 @@ void init_triton_tlx_ir(py::module_ &m) {
                  self.getBuilder().getI32Type(), threadId);
              return threadId;
            })
+      .def("create_workgroup_barrier",
+           [](TritonOpBuilder &self) -> void {
+             // Fenced full-workgroup barrier, matching the AMD warp-pipeline
+             // emitClusterBarrier(needLocal=true): a local (LDS-fenced) barrier
+             // bracketed by SchedBarrier(0) guards so the instruction scheduler
+             // cannot hoist ops across the ping-pong cluster border.
+             self.create<ROCDL::SchedBarrier>(0);
+             self.create<ttg::BarrierOp>(ttg::AddrSpace::Local);
+             self.create<ROCDL::SchedBarrier>(0);
+           })
       .def("create_cvt_rs",
            [](TritonOpBuilder &self, Value &src, Type &dstType,
               Value rbits) -> Value {
