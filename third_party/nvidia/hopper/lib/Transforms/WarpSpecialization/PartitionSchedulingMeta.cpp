@@ -1402,16 +1402,21 @@ preScheduleDpOps(SmallVector<CategorizedOp> &dpOps,
 static std::optional<ScheduleResult>
 getInitialSchedule(LoopLikeOpInterface mainLoop,
                    const SchedulingOptions &schedOpts) {
-  // Check for an existing schedule.
-  if (FailureOr<PartitionSet> scheduleOr = PartitionSet::fromLoop(mainLoop);
-      succeeded(scheduleOr))
-    // Deserialized schedule: layout/options unknown, use defaults.
-    return ScheduleResult{std::move(*scheduleOr),
-                          PartitionLayout{},
-                          schedOpts,
-                          DenseMap<Operation *, unsigned>(),
-                          DenseMap<unsigned, Partition *>(),
-                          /*createComputePartitions=*/true};
+  // A bare tt.warp_specialize marks a request for PSM to create a schedule;
+  // only stages + tag identify an already serialized schedule. Do not call
+  // fromLoop (and its strict verifier) on the expected unpartitioned input IR.
+  if (mainLoop->hasAttr(kPartitionStagesAttrName) &&
+      mainLoop->hasAttr(kWarpSpecializeTagAttrName)) {
+    if (FailureOr<PartitionSet> scheduleOr = PartitionSet::fromLoop(mainLoop);
+        succeeded(scheduleOr))
+      // Deserialized schedule: layout/options unknown, use defaults.
+      return ScheduleResult{std::move(*scheduleOr),
+                            PartitionLayout{},
+                            schedOpts,
+                            DenseMap<Operation *, unsigned>(),
+                            DenseMap<unsigned, Partition *>(),
+                            /*createComputePartitions=*/true};
+  }
 
   // Modulo path is authoritative for partitioning. If the loop was modulo-
   // scheduled (carries tt.modulo_ii) but fromLoop() above found no honorable
