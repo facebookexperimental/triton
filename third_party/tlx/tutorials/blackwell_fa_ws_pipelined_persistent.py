@@ -1,11 +1,25 @@
+from enum import IntEnum
+
 import torch
 import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
+from triton.language import core
 from triton.language.extra.tlx.warp_spec import get_bufidx_phase
 from triton.language.extra.cuda.inline_ptx_lib import _mul_f32x2, _fma_f32x2, _sub_f32x2
-from triton.language.extra.subtile_ops import _split_n_2D
+from triton.language.extra.subtile_ops import _join_n_2D, _split_n_2D
 from triton.tools.tensor_descriptor import TensorDescriptor
+
+
+class ExpMode(IntEnum):
+    DEG2_50_BREADTH = 13
+    DEG2_TRIPLE = 14
+    DEG1_PHASE7 = 15
+
+
+EXP_DEG2_50_BREADTH = tl.constexpr(int(ExpMode.DEG2_50_BREADTH))
+EXP_DEG2_TRIPLE = tl.constexpr(int(ExpMode.DEG2_TRIPLE))
+EXP_DEG1_PHASE7 = tl.constexpr(int(ExpMode.DEG1_PHASE7))
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
@@ -99,6 +113,341 @@ def prune_configs_by_hdim(configs, named_args, **kwargs):
                 continue
         pruned.append(conf)
     return pruned
+
+
+@core.builtin
+def _add_rm_f32x2(a, b, _semantic=None):
+    return core.inline_asm_elementwise(
+        """
+        {
+            .reg .b64 ra, rb, rc;
+            mov.b64 ra, { $2, $3 };
+            mov.b64 rb, { $4, $5 };
+            add.rm.f32x2 rc, ra, rb;
+            mov.b64 { $0, $1 }, rc;
+        }
+        """,
+        "=r,=r,r,r,r,r",
+        [a, b],
+        dtype=core.float32,
+        is_pure=True,
+        pack=2,
+        _semantic=_semantic,
+    )
+
+
+@core.builtin
+def _s2_exp2_bf16(x, a2, b2m, _semantic=None):
+    return core.inline_asm_elementwise(
+        """
+        {
+            .reg .b64 ra, rb, rc, rd;
+            .reg .b32 v0, v1, pk, zz, uu, mk, c0;
+            mov.b64 ra, { $1, $2 };
+            mov.b64 rb, { $3, $4 };
+            mov.b64 rc, { $5, $6 };
+            fma.rn.f32x2 rd, ra, rb, rc;
+            mov.b64 { v0, v1 }, rd;
+            prmt.b32 pk, v0, v1, 0x5410;
+            mov.b32 zz, 0;
+            mov.b32 mk, 0x00400040;
+            add.s16x2 uu, pk, mk;
+            mov.b32 c0, 0x3f3b3f3b;
+            fma.rn.bf16x2 pk, uu, c0, pk;
+            max.bf16x2 pk, pk, zz;
+            mov.b32 $0, pk;
+        }
+        """,
+        "=r,r,r,r,r,r,r",
+        [x, a2, b2m],
+        dtype=core.bfloat16,
+        is_pure=True,
+        pack=2,
+        _semantic=_semantic,
+    )
+
+
+@triton.jit
+def _reduce_bf16(a, b):
+    return (a + b).to(tl.bfloat16)
+
+
+@core.builtin
+def _combine_int_frac_ex2(x_rounded, frac_ex2, _semantic=None):
+    return core.inline_asm_elementwise(
+        """
+        {
+            .reg .s32 x_rounded_i, frac_ex_i, x_rounded_e, out_i;
+            mov.b32 x_rounded_i, $1;
+            mov.b32 frac_ex_i, $2;
+            shl.b32 x_rounded_e, x_rounded_i, 23;
+            add.s32 out_i, x_rounded_e, frac_ex_i;
+            mov.b32 $0, out_i;
+        }
+        """,
+        "=f,f,f",
+        [x_rounded, frac_ex2],
+        dtype=core.float32,
+        is_pure=True,
+        pack=1,
+        _semantic=_semantic,
+    )
+
+
+@triton.jit
+def _poly_exp2_deg2_dense_quad(x1, x3, x5, x7):
+    safe1 = x1
+    safe3 = x3
+    safe5 = x5
+    safe7 = x7
+    magic = 12582912.0
+    rounded1 = _add_rm_f32x2(safe1, magic)
+    rounded3 = _add_rm_f32x2(safe3, magic)
+    rounded5 = _add_rm_f32x2(safe5, magic)
+    rounded7 = _add_rm_f32x2(safe7, magic)
+    back1 = _sub_f32x2(rounded1, magic)
+    back3 = _sub_f32x2(rounded3, magic)
+    back5 = _sub_f32x2(rounded5, magic)
+    back7 = _sub_f32x2(rounded7, magic)
+    frac1 = _sub_f32x2(safe1, back1)
+    frac3 = _sub_f32x2(safe3, back3)
+    frac5 = _sub_f32x2(safe5, back5)
+    frac7 = _sub_f32x2(safe7, back7)
+    poly1 = _fma_f32x2(0.33718943, frac1, 0.65763628)
+    poly3 = _fma_f32x2(0.33718943, frac3, 0.65763628)
+    poly5 = _fma_f32x2(0.33718943, frac5, 0.65763628)
+    poly7 = _fma_f32x2(0.33718943, frac7, 0.65763628)
+    poly1 = _fma_f32x2(poly1, frac1, 1.0017247632060873)
+    poly3 = _fma_f32x2(poly3, frac3, 1.0017247632060873)
+    poly5 = _fma_f32x2(poly5, frac5, 1.0017247632060873)
+    poly7 = _fma_f32x2(poly7, frac7, 1.0017247632060873)
+    return (
+        _combine_int_frac_ex2(rounded1, poly1),
+        _combine_int_frac_ex2(rounded3, poly3),
+        _combine_int_frac_ex2(rounded5, poly5),
+        _combine_int_frac_ex2(rounded7, poly7),
+    )
+
+
+@triton.jit
+def _fragment_exp2(x, EXP_MODE: tl.constexpr, MASKED: tl.constexpr):
+    if EXP_MODE == EXP_DEG2_50_BREADTH:
+        if MASKED:
+            return tl.math.exp2(x)
+        phases = _split_n_2D(x, 8)
+        poly1, poly3, poly5, poly7 = _poly_exp2_deg2_dense_quad(
+            phases[1], phases[3], phases[5], phases[7]
+        )
+        return _join_n_2D(
+            (
+                tl.math.exp2(phases[0]),
+                poly1,
+                tl.math.exp2(phases[2]),
+                poly3,
+                tl.math.exp2(phases[4]),
+                poly5,
+                tl.math.exp2(phases[6]),
+                poly7,
+            )
+        )
+    if EXP_MODE == EXP_DEG2_TRIPLE:
+        if MASKED:
+            return tl.math.exp2(x)
+        phases = _split_n_2D(x, 8)
+        poly1, poly3, poly5 = _poly_exp2_deg2_dense_triple(
+            phases[1], phases[3], phases[5]
+        )
+        return _join_n_2D(
+            (
+                tl.math.exp2(phases[0]),
+                poly1,
+                tl.math.exp2(phases[2]),
+                poly3,
+                tl.math.exp2(phases[4]),
+                poly5,
+                tl.math.exp2(phases[6]),
+                tl.math.exp2(phases[7]),
+            )
+        )
+    if MASKED:
+        return tl.math.exp2(x)
+    phases = _split_n_2D(x, 8)
+    poly1, poly3, poly5 = _poly_exp2_deg2_dense_triple(phases[1], phases[3], phases[5])
+    poly7 = _poly_exp2_d1_single(phases[7])
+    return _join_n_2D(
+        (
+            tl.math.exp2(phases[0]),
+            poly1,
+            tl.math.exp2(phases[2]),
+            poly3,
+            tl.math.exp2(phases[4]),
+            poly5,
+            tl.math.exp2(phases[6]),
+            poly7,
+        )
+    )
+
+
+@triton.jit
+def _poly_exp2_deg2_dense_triple(x1, x3, x5):
+    safe1 = x1
+    safe3 = x3
+    safe5 = x5
+    magic = 12582912.0
+    rounded1 = _add_rm_f32x2(safe1, magic)
+    rounded3 = _add_rm_f32x2(safe3, magic)
+    rounded5 = _add_rm_f32x2(safe5, magic)
+    back1 = _sub_f32x2(rounded1, magic)
+    back3 = _sub_f32x2(rounded3, magic)
+    back5 = _sub_f32x2(rounded5, magic)
+    frac1 = _sub_f32x2(safe1, back1)
+    frac3 = _sub_f32x2(safe3, back3)
+    frac5 = _sub_f32x2(safe5, back5)
+    poly1 = _fma_f32x2(0.33718943, frac1, 0.65763628)
+    poly3 = _fma_f32x2(0.33718943, frac3, 0.65763628)
+    poly5 = _fma_f32x2(0.33718943, frac5, 0.65763628)
+    poly1 = _fma_f32x2(poly1, frac1, 1.0017247632060873)
+    poly3 = _fma_f32x2(poly3, frac3, 1.0017247632060873)
+    poly5 = _fma_f32x2(poly5, frac5, 1.0017247632060873)
+    return (
+        _combine_int_frac_ex2(rounded1, poly1),
+        _combine_int_frac_ex2(rounded3, poly3),
+        _combine_int_frac_ex2(rounded5, poly5),
+    )
+
+
+@triton.jit
+def _poly_exp2_d1_single(x):
+    magic = 12582912.0
+    rounded = _add_rm_f32x2(x, magic)
+    back = _sub_f32x2(rounded, magic)
+    frac = _sub_f32x2(x, back)
+    poly = _fma_f32x2(0.97017879, frac, 0.96567879)
+    return _combine_int_frac_ex2(rounded, poly)
+
+
+@core.builtin
+def _combine_int_frac_ex2_shf(x_rounded, frac_ex2, _semantic=None):
+    return core.inline_asm_elementwise(
+        """
+        {
+            .reg .s32 x_rounded_i, frac_ex_i, x_rounded_e, out_i;
+            mov.b32 x_rounded_i, $1;
+            mov.b32 frac_ex_i, $2;
+            shf.l.clamp.b32 x_rounded_e, 0, x_rounded_i, 23;
+            add.s32 out_i, x_rounded_e, frac_ex_i;
+            mov.b32 $0, out_i;
+        }
+        """,
+        "=f,f,f",
+        [x_rounded, frac_ex2],
+        dtype=core.float32,
+        is_pure=True,
+        pack=1,
+        _semantic=_semantic,
+    )
+
+
+@triton.jit
+def _a3_fragment_exp2(x, EXP_MODE: tl.constexpr, MASKED: tl.constexpr):
+    if MASKED:
+        return tl.math.exp2(x)
+    if EXP_MODE == EXP_DEG2_TRIPLE:
+        ph = _split_n_2D(x, 8)
+        r1 = _add_rm_f32x2(ph[1], 12582912.0)
+        r3 = _add_rm_f32x2(ph[3], 12582912.0)
+        r5 = _add_rm_f32x2(ph[5], 12582912.0)
+        b1 = _sub_f32x2(r1, 12582912.0)
+        b3 = _sub_f32x2(r3, 12582912.0)
+        b5 = _sub_f32x2(r5, 12582912.0)
+        f1 = _sub_f32x2(ph[1], b1)
+        f3 = _sub_f32x2(ph[3], b3)
+        f5 = _sub_f32x2(ph[5], b5)
+        p1 = _fma_f32x2(0.97017879, f1, 0.96567879)
+        p3 = _fma_f32x2(0.97017879, f3, 0.96567879)
+        p5 = _fma_f32x2(0.97017879, f5, 0.96567879)
+        e1 = _combine_int_frac_ex2_shf(r1, p1)
+        e3 = _combine_int_frac_ex2_shf(r3, p3)
+        e5 = _combine_int_frac_ex2_shf(r5, p5)
+        return _join_n_2D(
+            (
+                tl.math.exp2(ph[0]),
+                e1,
+                tl.math.exp2(ph[2]),
+                e3,
+                tl.math.exp2(ph[4]),
+                e5,
+                tl.math.exp2(ph[6]),
+                tl.math.exp2(ph[7]),
+            )
+        )
+    if EXP_MODE == EXP_DEG2_50_BREADTH:
+        ph = _split_n_2D(x, 8)
+        r1 = _add_rm_f32x2(ph[1], 12582912.0)
+        r3 = _add_rm_f32x2(ph[3], 12582912.0)
+        r5 = _add_rm_f32x2(ph[5], 12582912.0)
+        r7 = _add_rm_f32x2(ph[7], 12582912.0)
+        b1 = _sub_f32x2(r1, 12582912.0)
+        b3 = _sub_f32x2(r3, 12582912.0)
+        b5 = _sub_f32x2(r5, 12582912.0)
+        b7 = _sub_f32x2(r7, 12582912.0)
+        f1 = _sub_f32x2(ph[1], b1)
+        f3 = _sub_f32x2(ph[3], b3)
+        f5 = _sub_f32x2(ph[5], b5)
+        f7 = _sub_f32x2(ph[7], b7)
+        p1 = _fma_f32x2(0.97017879, f1, 0.96567879)
+        p3 = _fma_f32x2(0.97017879, f3, 0.96567879)
+        p5 = _fma_f32x2(0.97017879, f5, 0.96567879)
+        p7 = _fma_f32x2(0.97017879, f7, 0.96567879)
+        e1 = _combine_int_frac_ex2_shf(r1, p1)
+        e3 = _combine_int_frac_ex2_shf(r3, p3)
+        e5 = _combine_int_frac_ex2_shf(r5, p5)
+        e7 = _combine_int_frac_ex2_shf(r7, p7)
+        return _join_n_2D(
+            (
+                tl.math.exp2(ph[0]),
+                e1,
+                tl.math.exp2(ph[2]),
+                e3,
+                tl.math.exp2(ph[4]),
+                e5,
+                tl.math.exp2(ph[6]),
+                e7,
+            )
+        )
+    ph = _split_n_2D(x, 8)
+    r1 = _add_rm_f32x2(ph[1], 12582912.0)
+    r3 = _add_rm_f32x2(ph[3], 12582912.0)
+    r5 = _add_rm_f32x2(ph[5], 12582912.0)
+    r7 = _add_rm_f32x2(ph[7], 12582912.0)
+    b1 = _sub_f32x2(r1, 12582912.0)
+    b3 = _sub_f32x2(r3, 12582912.0)
+    b5 = _sub_f32x2(r5, 12582912.0)
+    b7 = _sub_f32x2(r7, 12582912.0)
+    f1 = _sub_f32x2(ph[1], b1)
+    f3 = _sub_f32x2(ph[3], b3)
+    f5 = _sub_f32x2(ph[5], b5)
+    f7 = _sub_f32x2(ph[7], b7)
+    p1 = _fma_f32x2(0.97017879, f1, 0.96567879)
+    p3 = _fma_f32x2(0.97017879, f3, 0.96567879)
+    p5 = _fma_f32x2(0.97017879, f5, 0.96567879)
+    p7 = _fma_f32x2(0.97017879, f7, 0.96567879)
+    e1 = _combine_int_frac_ex2(r1, p1)
+    e3 = _combine_int_frac_ex2(r3, p3)
+    e5 = _combine_int_frac_ex2(r5, p5)
+    e7 = _combine_int_frac_ex2(r7, p7)
+    return _join_n_2D(
+        (
+            tl.math.exp2(ph[0]),
+            e1,
+            tl.math.exp2(ph[2]),
+            e3,
+            tl.math.exp2(ph[4]),
+            e5,
+            tl.math.exp2(ph[6]),
+            e7,
+        )
+    )
 
 
 @triton.jit
@@ -323,6 +672,143 @@ def _softmax_inner_loop(
 
 
 @triton.jit
+def _fwd_control_tile(
+    tile_id,
+    tile_count,
+    accum_cnt,
+    sm_scale,
+    M,
+    H,
+    num_pid_n,
+    num_pid_in_group,
+    N_CTX,
+    desc_o,
+    alpha_empties,
+    alpha_fulls,
+    alpha_tiles,
+    acc_empties,
+    acc_fulls,
+    acc_tiles,
+    l_fulls,
+    l_tiles,
+    m_tiles,
+    qk_empties,
+    o_empties,
+    o_fulls,
+    o_tiles,
+    cluster_cta_rank,
+    BLOCK_M_SPLIT,
+    BLOCK_N,
+    EFFECTIVE_BLOCK_M,
+    GROUP_SIZE_N,
+    HEAD_DIM,
+    NUM_CTAS,
+    NUM_GROUPS_PER_CTA,
+    NUM_MMA_SLICES,
+    RESCALE_OPT,
+    SCALAR_N,
+    STAGE,
+    USE_2CTA,
+    USE_WHERE,
+):
+    start_m, off_hz, lo, hi, qo_offset_y, kv_offset_y = _compute_offsets(
+        tile_id // NUM_CTAS,
+        H,
+        num_pid_n,
+        num_pid_in_group,
+        N_CTX,
+        EFFECTIVE_BLOCK_M,
+        STAGE,
+        GROUP_SIZE_N,
+    )
+    for _ in tl.range(lo, hi, BLOCK_N):
+        _, phase = get_bufidx_phase(accum_cnt, 1)
+        for cid in tl.static_range(0, NUM_GROUPS_PER_CTA):
+            tlx.barrier_wait(alpha_fulls[cid], phase)
+            alpha_loaded = tlx.local_load(alpha_tiles[cid])
+            alpha_1 = tl.split(alpha_loaded)[0][:, None] if SCALAR_N == 2 else alpha_loaded
+            tlx.barrier_arrive(alpha_empties[cid])
+            if RESCALE_OPT:
+                pred = alpha_1 < 1.0
+                ballot_result = tlx.vote_ballot_sync(0xFFFFFFFF, pred)
+                should_rescale = ballot_result != 0
+
+            if USE_WHERE:
+                for slice_id in tl.static_range(0, NUM_MMA_SLICES):
+                    subslice = tlx.subslice(
+                        acc_tiles[cid],
+                        HEAD_DIM * slice_id // NUM_MMA_SLICES,
+                        HEAD_DIM // NUM_MMA_SLICES,
+                    )
+                    acc = tlx.local_load(subslice)
+                    if RESCALE_OPT:
+                        scaled_acc = _mul_f32x2(acc, alpha_1)
+                        acc = tl.where(should_rescale, scaled_acc, acc)
+                    else:
+                        acc = _mul_f32x2(acc, alpha_1)
+                    tlx.local_store(subslice, acc)
+            else:
+                if RESCALE_OPT:
+                    should_rescale_red = tl.reduce(should_rescale, axis=0, combine_fn=_reduce_or)
+                    should_rescale_scalar = tl.reshape(should_rescale_red, ())
+                if not RESCALE_OPT or (RESCALE_OPT and should_rescale_scalar):
+                    for slice_id in tl.static_range(0, NUM_MMA_SLICES):
+                        subslice = tlx.subslice(
+                            acc_tiles[cid],
+                            HEAD_DIM * slice_id // NUM_MMA_SLICES,
+                            HEAD_DIM // NUM_MMA_SLICES,
+                        )
+                        acc = tlx.local_load(subslice)
+                        acc = _mul_f32x2(acc, alpha_1)
+                        tlx.local_store(subslice, acc)
+            if USE_2CTA:
+                tlx.barrier_arrive(acc_fulls[cid], 1, remote_cta_rank=0)
+            else:
+                tlx.barrier_arrive(acc_fulls[cid])
+        accum_cnt += 1
+
+    _, phase = get_bufidx_phase(tile_count, 1)
+    for cid in tl.static_range(0, NUM_GROUPS_PER_CTA):
+        group_id = cid * NUM_CTAS + cluster_cta_rank
+        tlx.barrier_wait(l_fulls[cid], phase)
+        l_loaded = tlx.local_load(l_tiles[cid])
+        m_loaded = tlx.local_load(m_tiles[cid])
+        l = tl.split(l_loaded)[0][:, None] if SCALAR_N == 2 else l_loaded
+        m = tl.split(m_loaded)[0][:, None] if SCALAR_N == 2 else m_loaded
+        if USE_2CTA:
+            tlx.barrier_arrive(qk_empties[cid], 1, remote_cta_rank=0)
+        else:
+            tlx.barrier_arrive(qk_empties[cid])
+        if RESCALE_OPT:
+            m = m * sm_scale * 1.44269504
+        m += tl.math.log2(l)
+        offs_m = start_m * EFFECTIVE_BLOCK_M + group_id * BLOCK_M_SPLIT + tl.arange(0, BLOCK_M_SPLIT)
+        m_ptrs = M + off_hz * N_CTX + offs_m
+        tl.store(m_ptrs, tl.reshape(m, [BLOCK_M_SPLIT]))
+
+        tlx.barrier_wait(acc_empties[cid], phase)
+        tlx.barrier_wait(o_empties[cid], phase ^ 1)
+        scale = 1 / l
+        for slice_id in tl.static_range(0, NUM_MMA_SLICES):
+            subslice = tlx.subslice(
+                acc_tiles[cid],
+                HEAD_DIM * slice_id // NUM_MMA_SLICES,
+                HEAD_DIM // NUM_MMA_SLICES,
+            )
+            acc = tlx.local_load(subslice)
+            acc = _mul_f32x2(acc, scale)
+            acc = acc.to(tlx.dtype_of(desc_o))
+            subslice_o = tlx.local_slice(
+                o_tiles[cid],
+                [0, HEAD_DIM * slice_id // NUM_MMA_SLICES],
+                [BLOCK_M_SPLIT, HEAD_DIM // NUM_MMA_SLICES],
+            )
+            tlx.local_store(subslice_o, acc)
+        tlx.barrier_arrive(o_fulls[cid])
+    return accum_cnt
+
+
+@triton.jit
 def _fwd_load_1cta(
     tile_count,
     accum_cnt_kv,
@@ -411,7 +897,7 @@ def _fwd_load_1cta(
 
 
 @triton.jit
-def _fwd_mma_dots_1cta(
+def _fwd_mma_tile(
     tile_count,
     accum_cnt_kv,
     accum_cnt_qk,
@@ -436,10 +922,17 @@ def _fwd_mma_dots_1cta(
     NUM_BUFFERS_Q: tl.constexpr,
     NUM_BUFFERS_KV: tl.constexpr,
     NUM_MMA_SLICES: tl.constexpr,
+    v_tiles=None,
+    v_fulls=None,
+    v_empties=None,
+    USE_2CTA: tl.constexpr = False,
 ):
+    v_tiles = v_tiles if USE_2CTA else kv_tiles
+    v_fulls = v_fulls if USE_2CTA else kv_fulls
+    v_empties = v_empties if USE_2CTA else kv_empties
     q_bufIdx, q_phase = get_bufidx_phase(tile_count, NUM_BUFFERS_Q)
     k_bufIdx, k_phase = get_bufidx_phase(accum_cnt_kv, NUM_BUFFERS_KV)
-    v_bufIdx, v_phase = get_bufidx_phase(accum_cnt_kv + 1, NUM_BUFFERS_KV)
+    v_bufIdx, v_phase = get_bufidx_phase(accum_cnt_kv if USE_2CTA else accum_cnt_kv + 1, NUM_BUFFERS_KV)
 
     # wait for the K buffer to be populated by the producer
     tlx.barrier_wait(kv_fulls[k_bufIdx], k_phase)
@@ -456,6 +949,7 @@ def _fwd_mma_dots_1cta(
         qk_tiles[0],
         use_acc=False,
         mBarriers=[qk_fulls[0]],
+        two_ctas=USE_2CTA,
     )
 
     # -- compute q1 @ k ----
@@ -467,19 +961,20 @@ def _fwd_mma_dots_1cta(
         qk_tiles[1],
         use_acc=False,
         mBarriers=[qk_fulls[1], kv_empties[k_bufIdx]],
+        two_ctas=USE_2CTA,
     )
 
     _, qk_phase = get_bufidx_phase(accum_cnt_qk, 1)
 
     # -- compute p0 @ v ----
     # wait for the V buffer to be populated by the producer
-    tlx.barrier_wait(kv_fulls[v_bufIdx], v_phase)
+    tlx.barrier_wait(v_fulls[v_bufIdx], v_phase)
     tlx.barrier_wait(acc_fulls[0], qk_phase)
     for slice_id in tl.static_range(0, NUM_MMA_SLICES):
         p_bufIdx = slice_id
         tlx.barrier_wait(p_fulls[p_bufIdx], qk_phase)
         kv_slice = tlx.local_slice(
-            kv_tiles[v_bufIdx],
+            v_tiles[v_bufIdx],
             [BLOCK_N * slice_id // NUM_MMA_SLICES, 0],
             [BLOCK_N // NUM_MMA_SLICES, HEAD_DIM_KV],
         )
@@ -489,6 +984,7 @@ def _fwd_mma_dots_1cta(
             acc_tiles[0],
             use_acc=slice_id > 0,
             force_async=True,
+            two_ctas=USE_2CTA,
         )
 
     acc1_init = False
@@ -498,9 +994,9 @@ def _fwd_mma_dots_1cta(
         qk_phase_prev = qk_phase
 
         accum_cnt_qk += 1
-        accum_cnt_kv += 2
+        accum_cnt_kv += 1 if USE_2CTA else 2
         k_bufIdx, k_phase = get_bufidx_phase(accum_cnt_kv, NUM_BUFFERS_KV)
-        v_bufIdx, v_phase = get_bufidx_phase(accum_cnt_kv + 1, NUM_BUFFERS_KV)
+        v_bufIdx, v_phase = get_bufidx_phase(accum_cnt_kv if USE_2CTA else accum_cnt_kv + 1, NUM_BUFFERS_KV)
 
         # -- compute q0 @ k ----
         # wait for the K buffer to be populated by the producer
@@ -514,6 +1010,7 @@ def _fwd_mma_dots_1cta(
             qk_tiles[0],
             use_acc=False,
             mBarriers=[qk_fulls[0]],
+            two_ctas=USE_2CTA,
         )
 
         # -- compute p1 @ v from the previous iteration----
@@ -522,18 +1019,19 @@ def _fwd_mma_dots_1cta(
             p_bufIdx = slice_id + NUM_MMA_SLICES
             tlx.barrier_wait(p_fulls[p_bufIdx], qk_phase_prev)
             kv_slice = tlx.local_slice(
-                kv_tiles[v_bufIdx_prev],
+                v_tiles[v_bufIdx_prev],
                 [BLOCK_N * slice_id // NUM_MMA_SLICES, 0],
                 [BLOCK_N // NUM_MMA_SLICES, HEAD_DIM_KV],
             )
             use_acc = acc1_init if slice_id == 0 else True
-            mBarriers = [kv_empties[v_bufIdx_prev]] if slice_id == NUM_MMA_SLICES - 1 else []
+            mBarriers = [v_empties[v_bufIdx_prev]] if slice_id == NUM_MMA_SLICES - 1 else []
             tlx.async_dot(
                 p_tiles[p_bufIdx],
                 kv_slice,
                 acc_tiles[1],
                 use_acc=use_acc,
                 mBarriers=mBarriers,
+                two_ctas=USE_2CTA,
             )
 
         acc1_init = True
@@ -545,18 +1043,19 @@ def _fwd_mma_dots_1cta(
             qk_tiles[1],
             use_acc=False,
             mBarriers=[qk_fulls[1], kv_empties[k_bufIdx]],
+            two_ctas=USE_2CTA,
         )
 
         # -- compute p0 @ v ----
         # wait for the V buffer to be populated by the producer
-        tlx.barrier_wait(kv_fulls[v_bufIdx], v_phase)
+        tlx.barrier_wait(v_fulls[v_bufIdx], v_phase)
 
         tlx.barrier_wait(acc_fulls[0], qk_phase)
         for slice_id in tl.static_range(0, NUM_MMA_SLICES):
             p_bufIdx = slice_id
             tlx.barrier_wait(p_fulls[p_bufIdx], qk_phase)
             kv_slice = tlx.local_slice(
-                kv_tiles[v_bufIdx],
+                v_tiles[v_bufIdx],
                 [BLOCK_N * slice_id // NUM_MMA_SLICES, 0],
                 [BLOCK_N // NUM_MMA_SLICES, HEAD_DIM_KV],
             )
@@ -566,11 +1065,12 @@ def _fwd_mma_dots_1cta(
                 acc_tiles[0],
                 use_acc=True,
                 force_async=True,
+                two_ctas=USE_2CTA,
             )
 
-    tlx.tcgen05_commit(q_empties[q_bufIdx])
-    tlx.tcgen05_commit(q_empties[q_bufIdx + NUM_BUFFERS_Q])
-    tlx.tcgen05_commit(acc_empties[0])
+    tlx.tcgen05_commit(q_empties[q_bufIdx], two_ctas=USE_2CTA)
+    tlx.tcgen05_commit(q_empties[q_bufIdx + NUM_BUFFERS_Q], two_ctas=USE_2CTA)
+    tlx.tcgen05_commit(acc_empties[0], two_ctas=USE_2CTA)
 
     # -- compute p1 @ v ----
     tlx.barrier_wait(acc_fulls[1], qk_phase)
@@ -578,22 +1078,23 @@ def _fwd_mma_dots_1cta(
         p_bufIdx = slice_id + NUM_MMA_SLICES
         tlx.barrier_wait(p_fulls[p_bufIdx], qk_phase)
         kv_slice = tlx.local_slice(
-            kv_tiles[v_bufIdx],
+            v_tiles[v_bufIdx],
             [BLOCK_N * slice_id // NUM_MMA_SLICES, 0],
             [BLOCK_N // NUM_MMA_SLICES, HEAD_DIM_KV],
         )
         use_acc = acc1_init if slice_id == 0 else True
-        mBarriers = [acc_empties[1], kv_empties[v_bufIdx]] if slice_id == NUM_MMA_SLICES - 1 else []
+        mBarriers = [acc_empties[1], v_empties[v_bufIdx]] if slice_id == NUM_MMA_SLICES - 1 else []
         tlx.async_dot(
             p_tiles[p_bufIdx],
             kv_slice,
             acc_tiles[1],
             use_acc=use_acc,
             mBarriers=mBarriers,
+            two_ctas=USE_2CTA,
         )
 
     accum_cnt_qk += 1
-    accum_cnt_kv += 2
+    accum_cnt_kv += 1 if USE_2CTA else 2
     return accum_cnt_kv, accum_cnt_qk
 
 
@@ -792,127 +1293,69 @@ def _attn_fwd_ws_kernel(sm_scale, M,  #
         # correction group
         with tlx.async_task("default"):
             accum_cnt = 0
-            phase = 0
             tile_count = 0
             tile_id = start_pid
             clc_phase_producer = 1
             clc_phase_consumer = 0
             while tile_id != -1:
                 # CLC producer: announce work to all consumer tasks
+                # initialize offsets
+                # -- update output accumulator --
+                # Perform warp-level ballot vote to check if any thread needs rescaling
+                # 0xFFFFFFFF means all 32 threads in the warp participate
+                # ballot_result is a tensor with the same shape as pred
+                # All elements contain the same warp-level ballot value
+                # Non-zero means at least one thread has alpha_1 < 1.0
+                # Use tl.where to conditionally apply rescaling
+                # acc = acc * alpha_1 where should_rescale, else acc unchanged
+                # option 2: use a single scalar IfOp
+                # epilogue
+                # Signal qk_empties after both l and m loads complete,
+                # since both tiles share the same synchronization group.
+                # RESCALE_OPT stores unscaled row-max in m_tiles.
+                # The bwd kernel expects scaled values (m * qk_scale),
+                # so we scale here before storing M.
                 tlx.clc_producer(clc_context, clc_phase_producer, multi_ctas=USE_2CTA)
                 clc_phase_producer ^= 1
-
-                # initialize offsets
-                start_m, off_hz, lo, hi, qo_offset_y, kv_offset_y = _compute_offsets(
-                    tile_id // NUM_CTAS,
+                accum_cnt = _fwd_control_tile(
+                    tile_id,
+                    tile_count,
+                    accum_cnt,
+                    sm_scale,
+                    M,
                     H,
                     num_pid_n,
                     num_pid_in_group,
                     N_CTX,
+                    desc_o,
+                    alpha_empties,
+                    alpha_fulls,
+                    alpha_tiles,
+                    acc_empties,
+                    acc_fulls,
+                    acc_tiles,
+                    l_fulls,
+                    l_tiles,
+                    m_tiles,
+                    qk_empties,
+                    o_empties,
+                    o_fulls,
+                    o_tiles,
+                    cluster_cta_rank,
+                    BLOCK_M_SPLIT,
+                    BLOCK_N,
                     EFFECTIVE_BLOCK_M,
-                    STAGE,
                     GROUP_SIZE_N,
+                    HEAD_DIM,
+                    NUM_CTAS,
+                    NUM_GROUPS_PER_CTA,
+                    NUM_MMA_SLICES,
+                    RESCALE_OPT,
+                    SCALAR_N,
+                    STAGE,
+                    USE_2CTA,
+                    USE_WHERE,
                 )
-                for _ in tl.range(lo, hi, BLOCK_N):
-                    _, phase = get_bufidx_phase(accum_cnt, 1)
-                    for cid in tl.static_range(0, NUM_GROUPS_PER_CTA):
-                        # -- update output accumulator --
-                        tlx.barrier_wait(alpha_fulls[cid], phase)
-                        alpha_loaded = tlx.local_load(alpha_tiles[cid])
-                        alpha_1 = tl.split(alpha_loaded)[0][:, None] if SCALAR_N == 2 else alpha_loaded
-                        tlx.barrier_arrive(alpha_empties[cid])
-                        # Perform warp-level ballot vote to check if any thread needs rescaling
-                        # 0xFFFFFFFF means all 32 threads in the warp participate
-                        if RESCALE_OPT:
-                            pred = alpha_1 < 1.0
-                            # ballot_result is a tensor with the same shape as pred
-                            # All elements contain the same warp-level ballot value
-                            # Non-zero means at least one thread has alpha_1 < 1.0
-                            ballot_result = tlx.vote_ballot_sync(0xFFFFFFFF, pred)
-                            should_rescale = ballot_result != 0
-
-                        if USE_WHERE:
-                            for slice_id in tl.static_range(0, NUM_MMA_SLICES):
-                                subslice = tlx.subslice(
-                                    acc_tiles[cid],
-                                    HEAD_DIM * slice_id // NUM_MMA_SLICES,
-                                    HEAD_DIM // NUM_MMA_SLICES,
-                                )
-                                acc = tlx.local_load(subslice)
-                                # Use tl.where to conditionally apply rescaling
-                                # acc = acc * alpha_1 where should_rescale, else acc unchanged
-                                if RESCALE_OPT:
-                                    scaled_acc = _mul_f32x2(acc, alpha_1)
-                                    acc = tl.where(should_rescale, scaled_acc, acc)
-                                else:
-                                    acc = _mul_f32x2(acc, alpha_1)
-                                tlx.local_store(subslice, acc)
-                        else:
-                            # option 2: use a single scalar IfOp
-                            if RESCALE_OPT:
-                                should_rescale_red = tl.reduce(should_rescale, axis=0, combine_fn=_reduce_or)
-                                should_rescale_scalar = tl.reshape(should_rescale_red, ())
-                            if not RESCALE_OPT or (RESCALE_OPT and should_rescale_scalar):
-                                for slice_id in tl.static_range(0, NUM_MMA_SLICES):
-                                    subslice = tlx.subslice(
-                                        acc_tiles[cid],
-                                        HEAD_DIM * slice_id // NUM_MMA_SLICES,
-                                        HEAD_DIM // NUM_MMA_SLICES,
-                                    )
-                                    acc = tlx.local_load(subslice)
-                                    acc = _mul_f32x2(acc, alpha_1)
-                                    tlx.local_store(subslice, acc)
-                        if USE_2CTA:
-                            tlx.barrier_arrive(acc_fulls[cid], 1, remote_cta_rank=0)
-                        else:
-                            tlx.barrier_arrive(acc_fulls[cid])
-                    accum_cnt += 1
-
-                _, phase = get_bufidx_phase(tile_count, 1)
-                for cid in tl.static_range(0, NUM_GROUPS_PER_CTA):
-                    group_id = cid * NUM_CTAS + cluster_cta_rank
-                    # epilogue
-                    tlx.barrier_wait(l_fulls[cid], phase)
-                    l_loaded = tlx.local_load(l_tiles[cid])
-                    m_loaded = tlx.local_load(m_tiles[cid])
-                    l = tl.split(l_loaded)[0][:, None] if SCALAR_N == 2 else l_loaded
-                    m = tl.split(m_loaded)[0][:, None] if SCALAR_N == 2 else m_loaded
-                    # Signal qk_empties after both l and m loads complete,
-                    # since both tiles share the same synchronization group.
-                    if USE_2CTA:
-                        tlx.barrier_arrive(qk_empties[cid], 1, remote_cta_rank=0)
-                    else:
-                        tlx.barrier_arrive(qk_empties[cid])
-                    if RESCALE_OPT:
-                        # RESCALE_OPT stores unscaled row-max in m_tiles.
-                        # The bwd kernel expects scaled values (m * qk_scale),
-                        # so we scale here before storing M.
-                        m = m * sm_scale * 1.44269504
-                    m += tl.math.log2(l)
-                    offs_m = start_m * EFFECTIVE_BLOCK_M + group_id * BLOCK_M_SPLIT + tl.arange(0, BLOCK_M_SPLIT)
-                    m_ptrs = M + off_hz * N_CTX + offs_m
-                    tl.store(m_ptrs, tl.reshape(m, [BLOCK_M_SPLIT]))
-
-                    tlx.barrier_wait(acc_empties[cid], phase)
-                    tlx.barrier_wait(o_empties[cid], phase ^ 1)
-                    scale = 1 / l
-                    for slice_id in tl.static_range(0, NUM_MMA_SLICES):
-                        subslice = tlx.subslice(
-                            acc_tiles[cid],
-                            HEAD_DIM * slice_id // NUM_MMA_SLICES,
-                            HEAD_DIM // NUM_MMA_SLICES,
-                        )
-                        acc = tlx.local_load(subslice)
-                        acc = _mul_f32x2(acc, scale)
-                        acc = acc.to(tlx.dtype_of(desc_o))
-                        subslice_o = tlx.local_slice(
-                            o_tiles[cid],
-                            [0, HEAD_DIM * slice_id // NUM_MMA_SLICES],
-                            [BLOCK_M_SPLIT, HEAD_DIM // NUM_MMA_SLICES],
-                        )
-                        tlx.local_store(subslice_o, acc)
-                    tlx.barrier_arrive(o_fulls[cid])
-
                 tile_count += 1
                 tile_id = tlx.clc_consumer(clc_context, clc_phase_consumer, multi_ctas=USE_2CTA)
                 clc_phase_consumer ^= 1
@@ -1021,110 +1464,29 @@ def _attn_fwd_ws_kernel(sm_scale, M,  #
             tile_id = start_pid
             clc_phase_consumer = 0
             while tile_id != -1:
+                _, _, lo, hi, _, _ = _compute_offsets(
+                    tile_id // NUM_CTAS, H, num_pid_n, num_pid_in_group,
+                    N_CTX, EFFECTIVE_BLOCK_M, STAGE, GROUP_SIZE_N,
+                )
                 if USE_2CTA:
                     if is_leader:
-                        _, _, lo2, hi2, _, _ = _compute_offsets(tile_id // NUM_CTAS, H, num_pid_n, num_pid_in_group,
-                                                                N_CTX, EFFECTIVE_BLOCK_M, STAGE, GROUP_SIZE_N)
-                        q_bufIdx, q_phase = get_bufidx_phase(tile_count, NUM_BUFFERS_Q)
-                        k_bufIdx, k_phase = get_bufidx_phase(accum_cnt_kv, NUM_BUFFERS_KV)
-                        v_bufIdx, v_phase = get_bufidx_phase(accum_cnt_kv, NUM_BUFFERS_KV)
-
-                        tlx.barrier_wait(k_fulls[k_bufIdx], k_phase)
-                        tlx.barrier_wait(q_fulls[q_bufIdx], q_phase)
-
-                        k_tile = tlx.local_trans(k_tiles[k_bufIdx])
-                        tlx.barrier_wait(qk_empties[0], q_phase ^ 1)
-                        tlx.async_dot(q_tiles[0], k_tile, qk_tiles[0], use_acc=False, mBarriers=[qk_fulls[0]],
-                                      two_ctas=True)
-
-                        tlx.barrier_wait(q_fulls[q_bufIdx + NUM_BUFFERS_Q], q_phase)
-                        tlx.barrier_wait(qk_empties[1], q_phase ^ 1)
-                        tlx.async_dot(q_tiles[1], k_tile, qk_tiles[1], use_acc=False,
-                                      mBarriers=[qk_fulls[1], k_empties[k_bufIdx]], two_ctas=True)
-
-                        _, qk_phase = get_bufidx_phase(accum_cnt_qk, 1)
-
-                        tlx.barrier_wait(v_fulls[v_bufIdx], v_phase)
-                        tlx.barrier_wait(acc_fulls[0], qk_phase)
-                        for slice_id in tl.static_range(0, NUM_MMA_SLICES):
-                            p_bufIdx = slice_id
-                            tlx.barrier_wait(p_fulls[p_bufIdx], qk_phase)
-                            kv_slice = tlx.local_slice(v_tiles[v_bufIdx], [BLOCK_N * slice_id // NUM_MMA_SLICES, 0],
-                                                       [BLOCK_N // NUM_MMA_SLICES, HEAD_DIM_KV])
-                            tlx.async_dot(p_tiles[p_bufIdx], kv_slice, acc_tiles[0], use_acc=slice_id > 0,
-                                          force_async=True, two_ctas=True)
-
-                        acc1_init = False
-
-                        for i in tl.range(lo2 + BLOCK_N, hi2, BLOCK_N):
-                            v_bufIdx_prev = v_bufIdx
-                            qk_phase_prev = qk_phase
-
-                            accum_cnt_qk += 1
-                            accum_cnt_kv += 1
-                            k_bufIdx, k_phase = get_bufidx_phase(accum_cnt_kv, NUM_BUFFERS_KV)
-                            v_bufIdx, v_phase = get_bufidx_phase(accum_cnt_kv, NUM_BUFFERS_KV)
-
-                            tlx.barrier_wait(k_fulls[k_bufIdx], k_phase)
-                            k_tile = tlx.local_trans(k_tiles[k_bufIdx])
-                            _, qk_phase = get_bufidx_phase(accum_cnt_qk, 1)
-
-                            tlx.async_dot(q_tiles[0], k_tile, qk_tiles[0], use_acc=False, mBarriers=[qk_fulls[0]],
-                                          two_ctas=True)
-
-                            tlx.barrier_wait(acc_fulls[1], qk_phase_prev)
-                            for slice_id in tl.static_range(0, NUM_MMA_SLICES):
-                                p_bufIdx = slice_id + NUM_MMA_SLICES
-                                tlx.barrier_wait(p_fulls[p_bufIdx], qk_phase_prev)
-                                kv_slice = tlx.local_slice(v_tiles[v_bufIdx_prev],
-                                                           [BLOCK_N * slice_id // NUM_MMA_SLICES, 0],
-                                                           [BLOCK_N // NUM_MMA_SLICES, HEAD_DIM_KV])
-                                use_acc = acc1_init if slice_id == 0 else True
-                                mBarriers = [v_empties[v_bufIdx_prev]] if slice_id == NUM_MMA_SLICES - 1 else []
-                                tlx.async_dot(p_tiles[p_bufIdx], kv_slice, acc_tiles[1], use_acc=use_acc,
-                                              mBarriers=mBarriers, two_ctas=True)
-
-                            acc1_init = True
-
-                            tlx.async_dot(q_tiles[1], k_tile, qk_tiles[1], use_acc=False,
-                                          mBarriers=[qk_fulls[1], k_empties[k_bufIdx]], two_ctas=True)
-
-                            tlx.barrier_wait(v_fulls[v_bufIdx], v_phase)
-                            tlx.barrier_wait(acc_fulls[0], qk_phase)
-                            for slice_id in tl.static_range(0, NUM_MMA_SLICES):
-                                p_bufIdx = slice_id
-                                tlx.barrier_wait(p_fulls[p_bufIdx], qk_phase)
-                                kv_slice = tlx.local_slice(v_tiles[v_bufIdx], [BLOCK_N * slice_id // NUM_MMA_SLICES, 0],
-                                                           [BLOCK_N // NUM_MMA_SLICES, HEAD_DIM_KV])
-                                tlx.async_dot(p_tiles[p_bufIdx], kv_slice, acc_tiles[0], use_acc=True, force_async=True,
-                                              two_ctas=True)
-
-                        tlx.tcgen05_commit(q_empties[q_bufIdx], two_ctas=True)
-                        tlx.tcgen05_commit(q_empties[q_bufIdx + NUM_BUFFERS_Q], two_ctas=True)
-                        tlx.tcgen05_commit(acc_empties[0], two_ctas=True)
-
-                        tlx.barrier_wait(acc_fulls[1], qk_phase)
-                        for slice_id in tl.static_range(0, NUM_MMA_SLICES):
-                            p_bufIdx = slice_id + NUM_MMA_SLICES
-                            tlx.barrier_wait(p_fulls[p_bufIdx], qk_phase)
-                            kv_slice = tlx.local_slice(v_tiles[v_bufIdx], [BLOCK_N * slice_id // NUM_MMA_SLICES, 0],
-                                                       [BLOCK_N // NUM_MMA_SLICES, HEAD_DIM_KV])
-                            use_acc = acc1_init if slice_id == 0 else True
-                            mBarriers = [acc_empties[1], v_empties[v_bufIdx]] if slice_id == NUM_MMA_SLICES - 1 else []
-                            tlx.async_dot(p_tiles[p_bufIdx], kv_slice, acc_tiles[1], use_acc=use_acc,
-                                          mBarriers=mBarriers, two_ctas=True)
-
-                        accum_cnt_qk += 1
-                        accum_cnt_kv += 1
+                        accum_cnt_kv, accum_cnt_qk = _fwd_mma_tile(
+                            tile_count, accum_cnt_kv, accum_cnt_qk, lo, hi,
+                            q_tiles, k_tiles, qk_tiles, p_tiles, acc_tiles,
+                            q_fulls, q_empties, k_fulls, k_empties, qk_fulls,
+                            qk_empties, p_fulls, acc_fulls, acc_empties,
+                            BLOCK_N, HEAD_DIM_KV, NUM_BUFFERS_Q, NUM_BUFFERS_KV,
+                            NUM_MMA_SLICES, v_tiles, v_fulls, v_empties, True,
+                        )
                 else:
-                    _, _, lo, hi, _, _ = _compute_offsets(tile_id, H, num_pid_n, num_pid_in_group, N_CTX, BLOCK_M,
-                                                          STAGE, GROUP_SIZE_N)
-                    accum_cnt_kv, accum_cnt_qk = _fwd_mma_dots_1cta(tile_count, accum_cnt_kv, accum_cnt_qk, lo, hi,
-                                                                    q_tiles, kv_tiles, qk_tiles, p_tiles, acc_tiles,
-                                                                    q_fulls, q_empties, kv_fulls, kv_empties, qk_fulls,
-                                                                    qk_empties, p_fulls, acc_fulls, acc_empties,
-                                                                    BLOCK_N, HEAD_DIM_KV, NUM_BUFFERS_Q, NUM_BUFFERS_KV,
-                                                                    NUM_MMA_SLICES)
+                    accum_cnt_kv, accum_cnt_qk = _fwd_mma_tile(
+                        tile_count, accum_cnt_kv, accum_cnt_qk, lo, hi,
+                        q_tiles, kv_tiles, qk_tiles, p_tiles, acc_tiles,
+                        q_fulls, q_empties, kv_fulls, kv_empties, qk_fulls,
+                        qk_empties, p_fulls, acc_fulls, acc_empties,
+                        BLOCK_N, HEAD_DIM_KV, NUM_BUFFERS_Q, NUM_BUFFERS_KV,
+                        NUM_MMA_SLICES,
+                    )
                 tile_count += 1
                 tile_id = tlx.clc_consumer(clc_context, clc_phase_consumer, multi_ctas=USE_2CTA)
                 clc_phase_consumer ^= 1
