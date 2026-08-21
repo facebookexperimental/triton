@@ -315,8 +315,14 @@ def _register_kernel(
     tl.store(c_ptr + output_offsets, acc, mask=mask)
 
 
-def _launch_register(a, b, bias=None):
-    """Launch the autotuned register-resident gfx950 GEMM path."""
+def _launch_register(a, b, bias=None, config=None):
+    """Launch the register-resident gfx950 GEMM path.
+
+    ``config=None`` autotunes over `_REGISTER_CONFIGS`. Passing an explicit
+    config dict bypasses the autotuner and launches that config directly --
+    the same convention the Blackwell/Hopper tutorials use so correctness
+    tests can pin a config instead of paying for a sweep.
+    """
     M, K = a.shape
     b_k, N = b.shape
     if K != b_k:
@@ -327,11 +333,10 @@ def _launch_register(a, b, bias=None):
         if bias.device != a.device or bias.dtype != a.dtype:
             raise ValueError("Bias and matrix operands must have matching device and dtype")
     out = torch.empty((M, N), device=a.device, dtype=a.dtype)
-    grid = lambda meta: (triton.cdiv(M, meta["BLOCK_M"]) * triton.cdiv(N, meta["BLOCK_N"]), )
     disable_agpr = (K == 256 and N > 256) or (K > 512 and (K % BLOCK_K != 0 or M * N <= 2 * 1024 * 1024))
     launch_options = {"llvm_fn_attrs": (("amdgpu-agpr-alloc", "0,0"), )} if disable_agpr else {}
     bias_ptr = bias if bias is not None else out
-    _register_kernel[grid](
+    args = (
         a,
         b,
         bias_ptr,
@@ -345,9 +350,13 @@ def _launch_register(a, b, bias=None):
         b.stride(1),
         bias.stride(0) if bias is not None else 0,
         bias.stride(1) if bias is not None else 0,
-        ADD_BIAS=bias is not None,
-        **launch_options,
     )
+    if config is not None:
+        grid = (triton.cdiv(M, config["BLOCK_M"]) * triton.cdiv(N, config["BLOCK_N"]), )
+        _register_kernel.fn[grid](*args, ADD_BIAS=bias is not None, **config, **launch_options)
+    else:
+        grid = lambda meta: (triton.cdiv(M, meta["BLOCK_M"]) * triton.cdiv(N, meta["BLOCK_N"]), )
+        _register_kernel[grid](*args, ADD_BIAS=bias is not None, **launch_options)
     return out
 
 

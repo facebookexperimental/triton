@@ -324,6 +324,7 @@ def ikbo_fa(
     num_heads,
     d_head,
     max_seq_len,
+    config=None,
 ):
     """IKBO Flash Attention with in-kernel user broadcast.
 
@@ -337,19 +338,28 @@ def ikbo_fa(
         num_heads: Number of attention heads.
         d_head: Head dimension.
         max_seq_len: KV sequence length per user.
+        config: Pin a kernel config and bypass the autotuner (Blackwell/Hopper
+            tutorial convention). None autotunes.
 
     Returns:
         output: [B_cand, num_heads, n_seed, d_head] (SDPA-compatible layout)
     """
     output = torch.empty_like(query)
 
-    grid = lambda META: (
-        cand_grid.shape[0],
-        num_heads,
-        triton.cdiv(n_seed, META["BLOCK_M"]),
-    )
+    if config is not None:
+        grid = (cand_grid.shape[0], num_heads, triton.cdiv(n_seed, config["BLOCK_M"]))
+        kernel = _ikbo_fa_kernel.fn
+        extra = config
+    else:
+        grid = lambda META: (
+            cand_grid.shape[0],
+            num_heads,
+            triton.cdiv(n_seed, META["BLOCK_M"]),
+        )
+        kernel = _ikbo_fa_kernel
+        extra = {}
 
-    _ikbo_fa_kernel[grid](
+    kernel[grid](
         query,
         key,
         value,
@@ -375,6 +385,7 @@ def ikbo_fa(
         total_q_tokens=query.shape[0],
         total_kv_tokens=key.shape[0],
         ALLOW_TF32=not _is_hip,
+        **extra,
     )
 
     return output.view(-1, n_seed, num_heads, d_head).permute(0, 2, 1, 3)
