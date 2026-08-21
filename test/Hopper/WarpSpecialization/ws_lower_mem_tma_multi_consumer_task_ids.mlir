@@ -18,6 +18,8 @@
 // CHECK-NOT: nvws.descriptor_load
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [4, 1], order = [1, 0]}>
+#offsets_parent = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [32, 1], warpsPerCTA = [1, 4], order = [1, 0]}>
+#offsets = #ttg.slice<{dim = 0, parent = #offsets_parent}>
 #shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
 #smem = #ttg.shared_memory
 
@@ -43,6 +45,30 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
       tt.store %ptrs1, %consumer1 {async_task_id = array<i32: 2>} : tensor<128x64x!tt.ptr<f16>, #blocked>
       scf.yield
     } {async_task_id = array<i32: 0, 1, 2>, tt.warp_specialize}
+    tt.return
+  }
+
+  // CHECK-LABEL: @tma_gather_code_partition
+  // CHECK: ttng.async_tma_gather
+  // CHECK-NOT: tt.descriptor_gather
+  // CHECK-NOT: nvws.descriptor_gather
+  tt.func public @tma_gather_code_partition(
+      %desc: !tt.tensordesc<1x64xf16, #shared>,
+      %x_offsets: tensor<128xi32, #offsets>, %out: !tt.ptr<f16>) {
+    %c0 = arith.constant {async_task_id = array<i32: 0, 1>} 0 : i32
+    %ptrs = tt.splat %out {async_task_id = array<i32: 1>} : !tt.ptr<f16> -> tensor<128x64x!tt.ptr<f16>, #blocked>
+    %i0 = arith.constant {async_task_id = array<i32: 0, 1>} 0 : index
+    %i1 = arith.constant {async_task_id = array<i32: 0, 1>} 1 : index
+    %i4 = arith.constant {async_task_id = array<i32: 0, 1>} 4 : index
+    %buffer = ttg.local_alloc {buffer.copy = 2 : i32, buffer.id = 1 : i32} : () -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+    scf.for %iv = %i0 to %i4 step %i1 {
+      %tile = tt.descriptor_gather %desc[%x_offsets, %c0] {async_task_id = array<i32: 0>, loop.cluster = 0 : i32, loop.stage = 0 : i32} : (!tt.tensordesc<1x64xf16, #shared>, tensor<128xi32, #offsets>, i32) -> tensor<128x64xf16, #blocked>
+      ttg.local_store %tile, %buffer {async_task_id = array<i32: 0>, loop.cluster = 0 : i32, loop.stage = 0 : i32} : tensor<128x64xf16, #blocked> -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+      %local = ttg.local_load %buffer {async_task_id = array<i32: 1>, loop.cluster = 1 : i32, loop.stage = 0 : i32} : !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> tensor<128x64xf16, #blocked>
+      %consumer = arith.addf %local, %local {async_task_id = array<i32: 1>, loop.cluster = 1 : i32, loop.stage = 0 : i32} : tensor<128x64xf16, #blocked>
+      tt.store %ptrs, %consumer {async_task_id = array<i32: 1>} : tensor<128x64x!tt.ptr<f16>, #blocked>
+      scf.yield
+    } {async_task_id = array<i32: 0, 1>, tt.warp_specialize}
     tt.return
   }
 }

@@ -805,12 +805,13 @@ static Operation *ProducerIsGen5(Operation *producerOp) {
   return nullptr;
 }
 
-// Return the buffered TMA descriptor load producing this allocation-backed
+// Return the buffered TMA descriptor operation producing this allocation-backed
 // channel.
 static Operation *findTMAProducer(Channel *ch) {
   Operation *producerOp = ch->getSrcOp();
-  return dyn_cast_or_null<ttnvws::DescriptorLoadOp>(producerOp) ? producerOp
-                                                                : nullptr;
+  return isa_and_nonnull<ttnvws::DescriptorLoadOpInterface>(producerOp)
+             ? producerOp
+             : nullptr;
 }
 
 // Handle buffer index and phase computation for operations outside loops
@@ -1354,12 +1355,13 @@ static Value hoistLocalAlloc(
 // the pre-conversion `tt::DescriptorLoadOp` -- otherwise these paths silently
 // dead-end (wrong SMEM encoding / spurious TMEM promotion) once the conversion
 // runs ahead of buffer allocation.
-static ttnvws::DescriptorLoadOp getConvertedDescriptorLoad(Operation *srcOp) {
+static ttnvws::DescriptorLoadOpInterface
+getConvertedDescriptorLoad(Operation *srcOp) {
   auto localLoad = dyn_cast_or_null<ttg::LocalLoadOp>(srcOp);
   if (!localLoad)
     return nullptr;
   for (Operation *user : localLoad.getSrc().getUsers())
-    if (auto nvwsLoad = dyn_cast<ttnvws::DescriptorLoadOp>(user))
+    if (auto nvwsLoad = dyn_cast<ttnvws::DescriptorLoadOpInterface>(user))
       return nvwsLoad;
   return nullptr;
 }
@@ -1371,6 +1373,15 @@ static ttnvws::DescriptorLoadOp getConvertedDescriptorLoad(Operation *srcOp) {
 /// are rejected conservatively because this analysis does not follow their
 /// control-flow aliases.
 static bool hasTransitiveInvalidatingEffect(Value root);
+
+static Value
+getDescriptorLoadBuffer(ttnvws::DescriptorLoadOpInterface descriptorOp) {
+  if (auto load =
+          dyn_cast<ttnvws::DescriptorLoadOp>(descriptorOp.getOperation()))
+    return load.getResult();
+  return cast<ttnvws::DescriptorGatherOp>(descriptorOp.getOperation())
+      .getResult();
+}
 
 // Create a local buffer for register channels. Return the allocated buffer and
 // the new producer (reloaded value).
@@ -2812,11 +2823,11 @@ void insertAsyncComm(
     }
     builder.setAsynTaskIdsFromArray(asyncTasksPC);
 
-    SmallVector<ttnvws::DescriptorLoadOp> tmaLoads;
+    SmallVector<ttnvws::DescriptorLoadOpInterface> tmaLoads;
     // Go through all channels in this channel group.
     for (auto &c : kv.second) {
       if (auto *tmaLoadOp = findTMAProducer(c)) {
-        auto tmaLoad = cast<ttnvws::DescriptorLoadOp>(tmaLoadOp);
+        auto tmaLoad = cast<ttnvws::DescriptorLoadOpInterface>(tmaLoadOp);
         tmaLoads.push_back(tmaLoad);
       }
     }
@@ -5350,8 +5361,8 @@ void removeRedundantTmemZeroStores(triton::FuncOp funcOp) {
 static LogicalResult hoistDescriptorLoadBuffers(triton::FuncOp funcOp) {
   SmallVector<ttg::LocalAllocOp> buffers;
   DenseSet<Operation *> seen;
-  WalkResult result = funcOp.walk([&](ttnvws::DescriptorLoadOp load) {
-    Value buffer = load.getResult();
+  WalkResult result = funcOp.walk([&](ttnvws::DescriptorLoadOpInterface load) {
+    Value buffer = getDescriptorLoadBuffer(load);
     while (Operation *def = buffer.getDefiningOp()) {
       if (!isa<ttg::MemDescIndexOp, ttg::MemDescSubsliceOp, ttg::MemDescTransOp,
                ttg::MemDescReshapeOp, ttg::MemDescReinterpretOp>(def))
@@ -5360,8 +5371,8 @@ static LogicalResult hoistDescriptorLoadBuffers(triton::FuncOp funcOp) {
     }
     auto alloc = buffer.getDefiningOp<ttg::LocalAllocOp>();
     if (!alloc) {
-      load.emitError("expected descriptor load destination to be backed by "
-                     "ttg.local_alloc before buffer hoisting");
+      load->emitError("expected descriptor operation destination to be backed "
+                      "by ttg.local_alloc before buffer hoisting");
       return WalkResult::interrupt();
     }
     if (!isa<triton::FuncOp>(alloc->getParentOp()) && seen.insert(alloc).second)
@@ -6199,7 +6210,7 @@ public:
     // Disable code partitioning when numBuffers is 0.
     if (numBuffers > 0) {
       bool descriptorBuffersArePlanned = true;
-      funcOp.walk([&](tt::DescriptorLoadOp load) {
+      funcOp.walk([&](tt::DescriptorLoadLikeOpInterface load) {
         if (!load->hasOneUse()) {
           descriptorBuffersArePlanned = false;
           return;
