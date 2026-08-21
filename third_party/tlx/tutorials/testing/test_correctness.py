@@ -812,6 +812,109 @@ def test_blackwell_fa_ws_pipelined_persistent_2cta(RESCALE_OPT, USE_WHERE):
         torch.testing.assert_close(tri_out, ref_out, atol=1e-2, rtol=0)
 
 
+def _run_blackwell_fa_fast_fixed(q, k, v, sm_scale):
+    Z, H, N_CTX, HEAD_DIM = q.shape
+    config = FlashAttention.CONFIGS["blackwell_fa_ws_pipelined_persistent_2cta"].copy()
+    config.update({
+        "NUM_BUFFERS_KV": 3,
+        "RESCALE_OPT": False,
+        "USE_WHERE": False,
+        "USE_WARP_BARRIER": True,
+        "PIPELINED": True,
+        "DENSE_REGS": 176,
+    })
+
+    o = torch.full_like(q, float("nan"))
+    m = torch.full((Z, H, N_CTX), float("nan"), device=q.device, dtype=torch.float32)
+    y_dim = Z * H * N_CTX
+    dummy_block = [1, 1]
+    desc_q = TensorDescriptor(q, shape=[y_dim, HEAD_DIM], strides=[HEAD_DIM, 1], block_shape=dummy_block)
+    desc_k = TensorDescriptor(k, shape=[y_dim, HEAD_DIM], strides=[HEAD_DIM, 1], block_shape=dummy_block)
+    desc_v = TensorDescriptor(v, shape=[y_dim, HEAD_DIM], strides=[HEAD_DIM, 1], block_shape=dummy_block)
+    desc_o = TensorDescriptor(o, shape=[y_dim, HEAD_DIM], strides=[HEAD_DIM, 1], block_shape=dummy_block)
+    nargs = {
+        **config,
+        "HEAD_DIM": HEAD_DIM,
+        "desc_q": desc_q,
+        "desc_k": desc_k,
+        "desc_v": desc_v,
+        "desc_o": desc_o,
+    }
+    _blackwell_fa_fwd_pre_hook(nargs)
+
+    def alloc_fn(size: int, align: int, _):
+        return torch.empty(size, dtype=torch.int8, device="cuda")
+
+    triton.set_allocator(alloc_fn)
+    num_ctas = config["NUM_CTAS"]
+    work_ctas = triton.cdiv(N_CTX, config["BLOCK_M"] * num_ctas) * Z * H * num_ctas
+    _blackwell_fa_fwd_ws.fn[(work_ctas, 1, 1)](
+        sm_scale,
+        m,
+        Z,
+        H,
+        desc_q,
+        desc_k,
+        desc_v,
+        desc_o,
+        N_CTX=N_CTX,
+        HEAD_DIM=HEAD_DIM,
+        STAGE=1,
+        num_stages=1,
+        num_warps=4,
+        ctas_per_cga=(2, 1, 1),
+        **config,
+    )
+    return o, m
+
+
+@pytest.mark.parametrize("distribution", ["uniform_random", "normal_random", "far_apart"])
+@pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell GPU")
+def test_blackwell_fa_ws_pipelined_persistent_fast_fixed_bf16_numerics(distribution):
+    Z, H, N_CTX, HEAD_DIM = 4, 8, 1024, 128
+    shape = (Z, H, N_CTX, HEAD_DIM)
+    sm_scale = 0.5
+    torch.manual_seed(20)
+    if distribution == "uniform_random":
+        q = torch.empty(shape, device=DEVICE, dtype=torch.bfloat16).uniform_(-0.5, 0.5)
+        k = torch.empty(shape, device=DEVICE, dtype=torch.bfloat16).uniform_(-0.5, 0.5)
+        v = torch.empty(shape, device=DEVICE, dtype=torch.bfloat16).uniform_(-0.5, 0.5)
+    elif distribution == "normal_random":
+        q = torch.empty(shape, device=DEVICE, dtype=torch.bfloat16).normal_(mean=0.0, std=0.5)
+        k = torch.empty(shape, device=DEVICE, dtype=torch.bfloat16).normal_(mean=0.0, std=0.5)
+        v = torch.empty(shape, device=DEVICE, dtype=torch.bfloat16).normal_(mean=0.0, std=0.5)
+    else:
+        # Half the rows encounter a later score 80 natural-log units above the
+        # first 128-key block; the other half exercise the inverse range.
+        q = torch.ones(shape, device=DEVICE, dtype=torch.bfloat16)
+        q[:, :, N_CTX // 2:, :] = -1
+        k = torch.full(shape, 0.625, device=DEVICE, dtype=torch.bfloat16)
+        k[:, :, :128, :] = -0.625
+        v = torch.empty(shape, device=DEVICE, dtype=torch.bfloat16).normal_(mean=0.0, std=0.5)
+
+    scores = torch.matmul(q.float(), k.float().transpose(-2, -1)) * sm_scale
+    ref_o = torch.matmul(torch.softmax(scores, dim=-1), v.float())
+    ref_m = torch.logsumexp(scores, dim=-1) * math.log2(math.e)
+
+    outputs = [_run_blackwell_fa_fast_fixed(q, k, v, sm_scale) for _ in range(3)]
+    tri_o, tri_m = outputs[0]
+    for repeat_o, repeat_m in outputs:
+        assert torch.isfinite(repeat_o).all()
+        assert torch.isfinite(repeat_m).all()
+        torch.testing.assert_close(repeat_o, tri_o, atol=0, rtol=0)
+        torch.testing.assert_close(repeat_m, tri_m, atol=0, rtol=0)
+    o_error = (tri_o.float() - ref_o).abs()
+    m_error = (tri_m - ref_m).abs()
+    print(
+        f"{distribution}: O max/RMSE={o_error.max().item():.8g}/{o_error.square().mean().sqrt().item():.8g}, "
+        f"M max/RMSE={m_error.max().item():.8g}/{m_error.square().mean().sqrt().item():.8g}"
+    )
+    torch.testing.assert_close(tri_o.float(), ref_o, atol=1e-2, rtol=0)
+    # The fixed-gauge BF16 exp approximation has a bounded bias in the saved
+    # base-2 log-sum-exp; backward consumes the matching value from forward.
+    torch.testing.assert_close(tri_m, ref_m, atol=0.125, rtol=0)
+
+
 @pytest.mark.parametrize("Z,H", [(4, 8), (4, 48), (24, 8)])
 @pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell GPU")
 def test_blackwell_fa_ws_pipelined_persistent_2cta_probe(Z, H):
