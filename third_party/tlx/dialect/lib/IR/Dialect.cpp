@@ -134,12 +134,16 @@ struct TLXInferLayoutInterface : public triton::DialectInferLayoutInterface {
     if (auto slice = dyn_cast<triton::gpu::SliceEncodingAttr>(result)) {
       auto parent = cast<triton::gpu::DistributedEncodingTrait>(
           wrapNoVerifyLayout(slice.getParent()));
-      auto deferredSlice = triton::gpu::SliceEncodingAttr::get(
+      // Keep the deferred pin on the slice's *parent* only, with no extra outer
+      // wrapper. `hasNoVerifyLayout` is recursive, so the nested pin already
+      // defers verification of the whole result while frontend TTIR has no
+      // ttg.num-warps context yet. An outer wrapper would instead disagree with
+      // the TritonGPU transform helpers -- `inferDstEncoding(ReduceOp, ...)`
+      // builds the result as a bare `slice<parent=...>` -- so a pass such as
+      // RemoveLayoutConversions writes that bare form onto the op and the op's
+      // own inference then reports an inferred/declared type mismatch.
+      resultEncoding = triton::gpu::SliceEncodingAttr::get(
           result.getContext(), slice.getDim(), parent);
-      // Keep the slice parent deferred for canonical slice inference, and also
-      // defer verification of the whole result while frontend TTIR has no
-      // ttg.num-warps context yet.
-      resultEncoding = wrapNoVerifyLayout(deferredSlice);
     } else {
       resultEncoding = wrapNoVerifyLayout(result);
     }
