@@ -743,7 +743,7 @@ def _attn_bwd_dkdv_inner(
         q = desc_q.load([(off_bh + curr_m).to(tl.int32), 0])
         qT = tl.trans(q)
     offs_m_start = off_chz + curr_m
-    m = desc_m.load([offs_m_start.to(tl.int32)])
+    m = desc_m.load([offs_m_start.to(tl.int32)], attrs=BWD_DOT_ATTRS.get("m_load") if RESCHED else None)
     if RESCHED:
         qkT = tl.dot(k, qT, attrs=BWD_DOT_ATTRS.get("qkT"), two_ctas=TWO_CTAS)
     else:
@@ -762,7 +762,7 @@ def _attn_bwd_dkdv_inner(
     ppT = ppT.to(dtype)
     if RESCHED:
         dpT = tl.dot(v, tl.trans(dot), attrs=BWD_DOT_ATTRS.get("dpT"), two_ctas=TWO_CTAS).to(tl.float32)
-        Di = desc_delta.load([offs_m_start.to(tl.int32)])
+        Di = desc_delta.load([offs_m_start.to(tl.int32)], attrs=BWD_DOT_ATTRS.get("delta_load"))
         dv += tl.dot(ppT, do, attrs=BWD_DOT_ATTRS.get("dv"), two_ctas=TWO_CTAS)
     else:
         dv += tl.dot(ppT, do)
@@ -869,6 +869,11 @@ def _attn_bwd_dkdv(
                 0,
                 num_steps,
                 warp_specialize=True,
+                # Only the BM128 2-CTA path has a pre-hook guaranteeing a
+                # non-empty loop (it asserts N_CTX % (BLOCK_N1 * NUM_CTAS) == 0).
+                # BM64 2-CTA has no such guard, so promising non-emptiness
+                # there would be a false promise when num_steps is 0.
+                assume_nonempty=TWO_CTAS and BLOCK_M1 == 128,
                 merge_epilogue_to_computation=True,
                 tmem_alloc_algo=2,
                 smem_alloc_algo=1,
