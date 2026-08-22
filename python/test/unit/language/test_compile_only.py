@@ -6,6 +6,38 @@ import re
 from triton.compiler import ASTSource
 
 
+@pytest.mark.parametrize("assume_nonempty, expect_attr", [(True, True), (False, False), (None, False)])
+def test_range_assume_nonempty_attr(assume_nonempty, expect_attr) -> None:
+    # Assert both presence and absence. A presence-only check cannot tell a
+    # correctly wired kwarg from a string that shows up in the TTIR regardless.
+
+    if assume_nonempty is None:
+
+        @triton.jit
+        def kernel(out, n: tl.constexpr):
+            for i in tl.range(0, n):
+                tl.store(out + i, i)
+    else:
+
+        @triton.jit
+        def kernel(out, n: tl.constexpr, flag: tl.constexpr):
+            for i in tl.range(0, n, assume_nonempty=flag):
+                tl.store(out + i, i)
+
+    signature = {"out": "*i32", "n": "constexpr"}
+    constexprs = {"n": 4}
+    if assume_nonempty is not None:
+        signature["flag"] = "constexpr"
+        constexprs["flag"] = assume_nonempty
+
+    src = ASTSource(fn=kernel, signature=signature, constexprs=constexprs)
+    compiled = triton.compile(src, target=GPUTarget("cuda", 100, 32))
+    if expect_attr:
+        assert "tt.assume_nonempty" in compiled.asm["ttir"]
+    else:
+        assert "tt.assume_nonempty" not in compiled.asm["ttir"]
+
+
 def test_compile_only_sm100() -> None:
 
     @triton.jit
