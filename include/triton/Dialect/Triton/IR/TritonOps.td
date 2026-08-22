@@ -1208,7 +1208,8 @@ def TT_DescriptorLoadOp
           DefaultValuedAttr<TT_CacheModifierAttr,
                             "::mlir::triton::CacheModifier::NONE">:$cache,
           DefaultValuedAttr<TT_EvictionPolicyAttr,
-                            "::mlir::triton::EvictionPolicy::NORMAL">:$evict);
+                            "::mlir::triton::EvictionPolicy::NORMAL">:$evict,
+          DefaultValuedAttr<BoolAttr, "false">:$multicast);
 
   let results = (outs TT_Tensor:$result);
 
