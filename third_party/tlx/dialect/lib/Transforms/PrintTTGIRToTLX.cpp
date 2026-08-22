@@ -657,6 +657,8 @@ std::string getElementTypeName(Type type) {
 struct LocalAllocInfo {
   bool isBarrierAlloc = false;
   int barrierCount = 0;
+  // Arrive count of the barrier (init_barrier's `count`); default 1.
+  int arriveCount = 1;
   // For regular allocs: shape (excluding first dim which is count),
   // element type, count
   SmallVector<int64_t> shape;
@@ -685,13 +687,24 @@ LocalAllocInfo analyzeLocalAlloc(Operation *localAllocOp) {
     int initBarrierCount = 0;
 
     for (Operation *user : allocResult.getUsers()) {
-      if (user->getName().getStringRef() == "ttg.memdesc_index") {
+      StringRef userName = user->getName().getStringRef();
+      // Single-slot barrier, used directly with no memdesc_index.
+      if (userName == "ttng.init_barrier") {
+        foundInitBarrier = true;
+        initBarrierCount++;
+        if (auto cAttr = user->getAttrOfType<IntegerAttr>("count"))
+          info.arriveCount = cAttr.getInt();
+        continue;
+      }
+      if (userName == "ttg.memdesc_index") {
         // Check if memdesc_index result is used by init_barrier
         for (Value result : user->getResults()) {
           for (Operation *indexUser : result.getUsers()) {
             if (indexUser->getName().getStringRef() == "ttng.init_barrier") {
               foundInitBarrier = true;
               initBarrierCount++;
+              if (auto cAttr = indexUser->getAttrOfType<IntegerAttr>("count"))
+                info.arriveCount = cAttr.getInt();
             }
           }
         }
@@ -1373,7 +1386,17 @@ void printSimplifiedOp(
         if (op->getNumResults() > 0) {
           os << getValueName(op->getResult(0), argSubstitutionMap) << " = ";
         }
-        os << "tlx.alloc_barriers(" << info.barrierCount << ")";
+        // An arrive count that is a positive multiple of the warp size is a
+        // warp barrier: every thread arrives, rather than one leader per warp.
+        if (info.arriveCount >= 32 && info.arriveCount % 32 == 0) {
+          os << "tlx.alloc_warp_barrier(" << info.barrierCount << ", "
+             << (info.arriveCount / 32) << ")";
+        } else if (info.arriveCount != 1) {
+          os << "tlx.alloc_barriers(" << info.barrierCount << ", "
+             << info.arriveCount << ")";
+        } else {
+          os << "tlx.alloc_barriers(" << info.barrierCount << ")";
+        }
         printLocComment(op, os);
         return;
       } else {
@@ -1868,6 +1891,60 @@ void printSimplifiedOp(
   printLocComment(op, os);
 }
 
+// tt.map_elementwise carries its per-element computation in a region; pack > 1
+// runs that body over several elements at once, which has no elementwise form.
+bool isInlinableMapElementwise(Operation *op) {
+  auto pack = op->getAttrOfType<IntegerAttr>("pack");
+  return op->getName().getStringRef() == "tt.map_elementwise" &&
+         op->getNumRegions() > 0 && op->getNumResults() > 0 &&
+         !op->getRegion(0).empty() && pack && pack.getInt() == 1;
+}
+
+// Inline a tt.map_elementwise body as elementwise tensor ops, as
+// map_elementwise is only a scheduling hint.
+void printMapElementwise(
+    Operation *op, llvm::raw_ostream &os,
+    const llvm::StringMap<StringRef> &opNameMap,
+    const DenseMap<Operation *, LocalAllocInfo> &allocInfoMap,
+    llvm::DenseSet<Operation *> &skippedOps, unsigned indent,
+    DenseMap<Value, Value> *argSubstitutionMap) {
+  DenseMap<Value, Value> bodySubst;
+  if (argSubstitutionMap)
+    bodySubst = *argSubstitutionMap;
+  Block &bb = op->getRegion(0).front();
+  for (unsigned i = 0; i < bb.getNumArguments() && i < op->getNumOperands();
+       ++i) {
+    Value target = op->getOperand(i);
+    if (argSubstitutionMap) {
+      auto it = argSubstitutionMap->find(target);
+      if (it != argSubstitutionMap->end())
+        target = it->second;
+    }
+    bodySubst[bb.getArgument(i)] = target;
+  }
+  for (Operation &bodyOp : bb) {
+    if (bodyOp.getName().getStringRef() == "tt.map_elementwise.return") {
+      for (unsigned k = 0; k < indent; ++k)
+        os << "  ";
+      // One tuple assignment so a multi-result map binds every result; result i
+      // is named in the enclosing scope, returned operand i in the inlined body.
+      assert(op->getNumResults() == bodyOp.getNumOperands() &&
+             "map_elementwise must return one value per result");
+      unsigned n = std::min(op->getNumResults(), bodyOp.getNumOperands());
+      for (unsigned i = 0; i < n; ++i)
+        os << (i ? ", " : "")
+           << getValueName(op->getResult(i), argSubstitutionMap);
+      os << " = ";
+      for (unsigned i = 0; i < n; ++i)
+        os << (i ? ", " : "") << getValueName(bodyOp.getOperand(i), &bodySubst);
+      printLocComment(op, os);
+    } else if (!shouldSkipOp(&bodyOp, allocInfoMap, skippedOps)) {
+      printSimplifiedOp(&bodyOp, os, opNameMap, allocInfoMap, indent,
+                        &bodySubst);
+    }
+  }
+}
+
 // Print a block
 void printBlock(Block &block, llvm::raw_ostream &os,
                 const llvm::StringMap<StringRef> &opNameMap,
@@ -2020,6 +2097,12 @@ void printBlock(Block &block, llvm::raw_ostream &os,
     if (op.getName().getStringRef() == "scf.while") {
       printWhileOp(&op, os, opNameMap, allocInfoMap, skippedOps, indent,
                    argSubstitutionMap);
+      continue;
+    }
+
+    if (isInlinableMapElementwise(&op)) {
+      printMapElementwise(&op, os, opNameMap, allocInfoMap, skippedOps, indent,
+                          argSubstitutionMap);
       continue;
     }
 
@@ -2176,6 +2259,11 @@ void printBlockOps(Block &block, llvm::raw_ostream &os,
     if (op.getName().getStringRef() == "scf.if") {
       printIfOp(&op, os, opNameMap, allocInfoMap, skippedOps, indent,
                 argSubstitutionMap);
+      continue;
+    }
+    if (isInlinableMapElementwise(&op)) {
+      printMapElementwise(&op, os, opNameMap, allocInfoMap, skippedOps, indent,
+                          argSubstitutionMap);
       continue;
     }
     // Special handling for tt.reduce in CF printer
