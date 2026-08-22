@@ -4047,6 +4047,7 @@ class AutoWSLoopOptions(base_value):
                                                         metadata=_loop_attr("tt.disallow_acc_multi_buffer", "unit"))
     flatten: bool | constexpr = field(default=False, metadata=_loop_attr("tt.flatten", "unit"))
     warp_specialize: bool | constexpr = field(default=False, metadata=_loop_attr("tt.warp_specialize", "unit"))
+    assume_nonempty: bool | constexpr = field(default=False, metadata=_loop_attr("tt.assume_nonempty", "unit"))
     multi_cta: bool | constexpr = field(default=False, metadata=_loop_attr("tt.multi_cta", "unit"))
     disable_licm: bool | constexpr = field(default=False, metadata=_loop_attr("llvm.loop_annotation", "licm"))
     data_partition_factor: int | constexpr | None = field(default=None,
@@ -4103,6 +4104,10 @@ class range(AutoWSLoopOptions):
         The compiler will attempt to partition memory, MMA, and vector
         operations in the loop into separate async partitions. This will
         increase the total number of warps required by the kernel.
+    :param assume_nonempty: Assert that the loop executes at least once. This
+        permits AutoWS to remove an explicit accumulator initialization when
+        the first MMA iteration initializes the same accumulator itself.
+        Violating this contract produces undefined results.
     :param multi_cta: Enable multi-CTA reduction on the loop. The compiler
         will partition loop iterations across CTAs in a cluster and
         automatically generate cross-CTA reduction (via Distributed Shared
