@@ -264,7 +264,8 @@ def do_bench_cudagraph_proton(fn, rep=20, grad_to_none=None, quantiles=None, ret
         return _summarize_statistics(times, quantiles, return_mode)
 
 
-def do_bench(fn, warmup=25, rep=100, grad_to_none=None, quantiles=None, return_mode="mean"):
+def do_bench(fn, warmup=25, rep=100, grad_to_none=None, quantiles=None, return_mode="mean",
+             measure_time_with_hooks=False):
     """
     Benchmark the runtime of the provided function. By default, returns the mean runtime (in milliseconds) of :code:`fn` as a single float.
 
@@ -309,32 +310,41 @@ def do_bench(fn, warmup=25, rep=100, grad_to_none=None, quantiles=None, return_m
     di.synchronize()
     estimate_ms = start_event.elapsed_time(end_event) / 5
 
-    # compute number of warmup and repeat
-    n_warmup = max(1, int(warmup / estimate_ms))
-    n_repeat = max(1, int(rep / estimate_ms))
-    start_event = [di.Event(enable_timing=True) for i in range(n_repeat)]
-    end_event = [di.Event(enable_timing=True) for i in range(n_repeat)]
-    # Warm-up
-    for _ in range(n_warmup):
-        fn()
-    # Benchmark
-    for i in range(n_repeat):
-        # we don't want `fn` to accumulate gradient values
-        # if it contains a backward pass. So we clear the
-        # provided gradients
-        if grad_to_none is not None:
-            for x in grad_to_none:
-                x.grad = None
-        # we clear the L2 cache before each run
-        runtime.driver.active.clear_cache(cache)
-        # record time of `fn`
-        start_event[i].record()
-        fn()
-        end_event[i].record()
-    # Record clocks
-    di.synchronize()
-    times = [s.elapsed_time(e) for s, e in zip(start_event, end_event)]
-    return _summarize_statistics(times, quantiles, return_mode)
+    # CPU launches are synchronous, so entry/exit hooks can measure the kernel
+    # execution more precisely than host-side event timing.
+    if measure_time_with_hooks:
+        di.enable_hook_timing()
+
+    try:
+        # compute number of warmup and repeat
+        n_warmup = max(1, int(warmup / estimate_ms))
+        n_repeat = max(1, int(rep / estimate_ms))
+        start_event = [di.Event(enable_timing=True) for i in range(n_repeat)]
+        end_event = [di.Event(enable_timing=True) for i in range(n_repeat)]
+        # Warm-up
+        for _ in range(n_warmup):
+            fn()
+        # Benchmark
+        for i in range(n_repeat):
+            # we don't want `fn` to accumulate gradient values
+            # if it contains a backward pass. So we clear the
+            # provided gradients
+            if grad_to_none is not None:
+                for x in grad_to_none:
+                    x.grad = None
+            # we clear the L2 cache before each run
+            runtime.driver.active.clear_cache(cache)
+            # record time of `fn`
+            start_event[i].record()
+            fn()
+            end_event[i].record()
+        # Record clocks
+        di.synchronize()
+        times = [s.elapsed_time(e) for s, e in zip(start_event, end_event)]
+        return _summarize_statistics(times, quantiles, return_mode)
+    finally:
+        if measure_time_with_hooks:
+            di.disable_hook_timing()
 
 
 def do_bench_proton(fn, warmup=25, rep=100, grad_to_none=None, quantiles=None, return_mode="mean"):
