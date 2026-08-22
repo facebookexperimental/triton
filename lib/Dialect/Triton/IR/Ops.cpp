@@ -247,8 +247,11 @@ DotOp::inferReturnTypes(MLIRContext *context, std::optional<Location> location,
   auto aEnc = cast<RankedTensorType>(operands[0].getType()).getEncoding();
   auto bEnc = cast<RankedTensorType>(operands[1].getType()).getEncoding();
   auto retEnc = accTy.getEncoding();
-  if (aEnc) {
-    assert(bEnc && retEnc);
+  if (encodingContainsTlxNoVerifyLayout(aEnc) ||
+      encodingContainsTlxNoVerifyLayout(bEnc) ||
+      encodingContainsTlxNoVerifyLayout(retEnc))
+    return success();
+  if (aEnc && bEnc && retEnc) {
     Dialect &dialect = retEnc.getDialect();
     auto interface = cast<DialectInferLayoutInterface>(&dialect);
     if (interface->inferDotOpEncoding(aEnc, 0, retEnc, location).failed())
@@ -268,13 +271,22 @@ LogicalResult DotOp::verify() {
         "element types of operands A and B must have same bit width");
   auto aEncoding = aTy.getEncoding();
   auto bEncoding = bTy.getEncoding();
+  auto accTy = getC().getType();
+  auto retEnc = accTy.getEncoding();
+  // A no_verify layout marks a frontend graph whose layout constraints are
+  // intentionally incomplete until TLX placeholder resolution. Helper ABI
+  // reconciliation can therefore expose a pinned operand/result beside an
+  // unencoded peer. Defer the whole compatibility check; the wrapper is
+  // removed before final layout verification.
+  if (encodingContainsTlxNoVerifyLayout(aEncoding) ||
+      encodingContainsTlxNoVerifyLayout(bEncoding) ||
+      encodingContainsTlxNoVerifyLayout(retEnc))
+    return success();
   if (!aEncoding && !bEncoding)
     return success();
   // Verify that the encodings are valid.
   if (!aEncoding || !bEncoding)
     return emitError("mismatching encoding between A and B operands");
-  auto accTy = getC().getType();
-  auto retEnc = accTy.getEncoding();
   if (!retEnc)
     return emitError("miss encoding of C operand");
   Dialect &dialect = retEnc.getDialect();
