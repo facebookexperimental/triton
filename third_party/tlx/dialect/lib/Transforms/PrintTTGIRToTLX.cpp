@@ -657,6 +657,8 @@ std::string getElementTypeName(Type type) {
 struct LocalAllocInfo {
   bool isBarrierAlloc = false;
   int barrierCount = 0;
+  // Arrive count of the barrier (init_barrier's `count`); default 1.
+  int arriveCount = 1;
   // For regular allocs: shape (excluding first dim which is count),
   // element type, count
   SmallVector<int64_t> shape;
@@ -685,13 +687,24 @@ LocalAllocInfo analyzeLocalAlloc(Operation *localAllocOp) {
     int initBarrierCount = 0;
 
     for (Operation *user : allocResult.getUsers()) {
-      if (user->getName().getStringRef() == "ttg.memdesc_index") {
+      StringRef userName = user->getName().getStringRef();
+      // Single-slot barrier, used directly with no memdesc_index.
+      if (userName == "ttng.init_barrier") {
+        foundInitBarrier = true;
+        initBarrierCount++;
+        if (auto cAttr = user->getAttrOfType<IntegerAttr>("count"))
+          info.arriveCount = cAttr.getInt();
+        continue;
+      }
+      if (userName == "ttg.memdesc_index") {
         // Check if memdesc_index result is used by init_barrier
         for (Value result : user->getResults()) {
           for (Operation *indexUser : result.getUsers()) {
             if (indexUser->getName().getStringRef() == "ttng.init_barrier") {
               foundInitBarrier = true;
               initBarrierCount++;
+              if (auto cAttr = indexUser->getAttrOfType<IntegerAttr>("count"))
+                info.arriveCount = cAttr.getInt();
             }
           }
         }
@@ -1373,7 +1386,17 @@ void printSimplifiedOp(
         if (op->getNumResults() > 0) {
           os << getValueName(op->getResult(0), argSubstitutionMap) << " = ";
         }
-        os << "tlx.alloc_barriers(" << info.barrierCount << ")";
+        // An arrive count that is a positive multiple of the warp size is a
+        // warp barrier: every thread arrives, rather than one leader per warp.
+        if (info.arriveCount >= 32 && info.arriveCount % 32 == 0) {
+          os << "tlx.alloc_warp_barrier(" << info.barrierCount << ", "
+             << (info.arriveCount / 32) << ")";
+        } else if (info.arriveCount != 1) {
+          os << "tlx.alloc_barriers(" << info.barrierCount << ", "
+             << info.arriveCount << ")";
+        } else {
+          os << "tlx.alloc_barriers(" << info.barrierCount << ")";
+        }
         printLocComment(op, os);
         return;
       } else {
