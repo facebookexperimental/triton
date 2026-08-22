@@ -608,7 +608,8 @@ class Autotuner(KernelInterface):
         # Check if we can use the C-level autotune proxy
         if (native_create_autotune_proxy is not None and getattr(self.fn, 'c_cache', False)
                 and knobs.nvidia.use_autotune_c_cache and knobs.nvidia.use_triton_dispatcher and len(self.configs) > 1
-                and knobs.autotuning.listener is None):
+                and knobs.autotuning.listener is None
+                and getattr(driver.active, "is_cpu_backend", False) is not True):
             proxy = getattr(self, '_autotune_proxy', None)
             if proxy is None:
                 # Compute key_indices: positions in arg_names for autotuner key fields
@@ -647,6 +648,8 @@ class Autotuner(KernelInterface):
 
     def _seed_autotune_proxy(self, key, config):
         """Insert a key→config mapping into the C autotune proxy table."""
+        if getattr(driver.active, "is_cpu_backend", False) is True:
+            return
         proxy = getattr(self, '_autotune_proxy', None)
         if proxy is None or native_autotune_proxy_insert is None:
             return
@@ -713,6 +716,9 @@ class Autotuner(KernelInterface):
         Returns None when preconditions aren't met (no c_cache, callable
         grid that can't be evaluated, extra kwargs, etc.).
         """
+        if getattr(driver.active, "is_cpu_backend", False) is True:
+            return None
+
         input_grid = kwargs.get('grid')
         if input_grid is None or not getattr(self.fn, 'c_cache', False):
             return None
