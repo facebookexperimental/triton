@@ -1971,13 +1971,25 @@ void printBlock(Block &block, llvm::raw_ostream &os,
     // targets, otherwise skip entirely
     if (op.getName().getStringRef() == "scf.yield") {
       if (!yieldTargets.empty()) {
-        // Print assignments: yieldTarget = yieldOperand
-        for (unsigned i = 0; i < op.getNumOperands() && i < yieldTargets.size();
-             ++i) {
+        // Emit the iter-arg updates as a single tuple assignment: scf.yield has
+        // parallel-copy semantics, so sequential `t = v` statements would let a
+        // later target read an already-updated one, desyncing barrier phases and
+        // deadlocking warp-specialized kernels.
+        unsigned n = std::min((size_t)op.getNumOperands(), yieldTargets.size());
+        SmallVector<std::string> lhs, rhs;
+        for (unsigned i = 0; i < n; ++i) {
+          lhs.push_back(getValueName(yieldTargets[i], argSubstitutionMap));
+          rhs.push_back(getValueName(op.getOperand(i), argSubstitutionMap));
+        }
+        if (!lhs.empty()) {
           for (unsigned j = 0; j < indent; ++j)
             os << "  ";
-          os << getValueName(yieldTargets[i], argSubstitutionMap) << " = "
-             << getValueName(op.getOperand(i), argSubstitutionMap) << "\n";
+          for (unsigned i = 0; i < lhs.size(); ++i)
+            os << (i ? ", " : "") << lhs[i];
+          os << " = ";
+          for (unsigned i = 0; i < rhs.size(); ++i)
+            os << (i ? ", " : "") << rhs[i];
+          os << "\n";
         }
       }
       // Skip yield in TLX output (either handled above or just skip)
@@ -2253,6 +2265,12 @@ void printBlockArgAssignments(Block *dest, OperandRange operands,
                               llvm::raw_ostream &os, unsigned indent,
                               DenseMap<Value, Value> *argSubstitutionMap,
                               int skipArgIdx = -1) {
+  // Emit block-argument updates as a single tuple assignment so a back-edge to
+  // a loop header follows parallel-copy semantics (all sources read before any
+  // target is updated). Sequential `dest = src` statements would let a later
+  // assignment read an already-updated earlier target; see the scf.yield
+  // handler for the same reasoning.
+  SmallVector<std::string> lhs, rhs;
   for (unsigned i = 0; i < dest->getNumArguments() && i < operands.size();
        ++i) {
     if ((int)i == skipArgIdx)
@@ -2261,11 +2279,20 @@ void printBlockArgAssignments(Block *dest, OperandRange operands,
         getValueName(dest->getArgument(i), argSubstitutionMap);
     std::string srcName = getValueName(operands[i], argSubstitutionMap);
     if (destName != srcName) {
-      for (unsigned j = 0; j < indent; ++j)
-        os << "  ";
-      os << destName << " = " << srcName << "\n";
+      lhs.push_back(destName);
+      rhs.push_back(srcName);
     }
   }
+  if (lhs.empty())
+    return;
+  for (unsigned j = 0; j < indent; ++j)
+    os << "  ";
+  for (unsigned i = 0; i < lhs.size(); ++i)
+    os << (i ? ", " : "") << lhs[i];
+  os << " = ";
+  for (unsigned i = 0; i < rhs.size(); ++i)
+    os << (i ? ", " : "") << rhs[i];
+  os << "\n";
 }
 
 // Detect if a header block represents a for-loop: iter starts at init,
