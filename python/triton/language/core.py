@@ -1538,7 +1538,8 @@ class tensor_descriptor_base(base_value):
         return str(self.type)
 
     @builtin
-    def load(self, offsets: Sequence[constexpr | tensor], latency=None, multicast=None, _semantic=None) -> tensor:
+    def load(self, offsets: Sequence[constexpr | tensor], latency=None, multicast=None, attrs=None,
+             _semantic=None) -> tensor:
         """Load a block from the descriptor starting at the given element offsets.
 
         Values outside of the tensor bounds will be filled with zeros.
@@ -1549,11 +1550,14 @@ class tensor_descriptor_base(base_value):
             permission to use multicast when it can prove a legal recipient
             group; it does not guarantee multicast emission. See
             :doc:`the TMA multicast design </design/triton_tma_multicast>`.
+        :param attrs: optional compiler scheduling attributes. AutoWS accepts
+            ``stage`` and ``order`` to place the load in a prefetch wavefront.
         :note: Offset must be a multiple of 16-bytes
         """
         latency = _unwrap_if_constexpr(latency)
         multicast = _unwrap_if_constexpr(multicast)
-        return _semantic.descriptor_load(self, offsets, "", "", latency, multicast)
+        attrs = _unwrap_if_constexpr(attrs)
+        return _semantic.descriptor_load(self, offsets, "", "", latency, multicast, attrs)
 
     @builtin
     def store(
