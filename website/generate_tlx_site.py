@@ -10,7 +10,6 @@ from pathlib import Path
 
 from guide_content import GUIDE_CONTENT
 
-
 SITE_ROOT = Path(__file__).resolve().parent
 REPOSITORY_ROOT = SITE_ROOT.parent
 REPOSITORY_URL = "https://github.com/facebookexperimental/triton"
@@ -320,9 +319,7 @@ def render_markdown(source: str) -> str:
             while index < len(lines) and lines[index].startswith(">"):
                 quote_lines.append(lines[index][1:].strip())
                 index += 1
-            output.append(
-                f"<blockquote><p>{render_inline(' '.join(quote_lines))}</p></blockquote>"
-            )
+            output.append(f"<blockquote><p>{render_inline(' '.join(quote_lines))}</p></blockquote>")
             continue
 
         heading = re.match(r"^(#{1,6})\s+(.+)$", line)
@@ -489,11 +486,7 @@ def main() -> None:
     chunks = collect_page_sources(read_readme())
 
     for page, source in chunks:
-        output = (
-            REPOSITORY_ROOT / "index.html"
-            if page.slug == "home"
-            else SITE_ROOT / f"{page.slug}.html"
-        )
+        output = (REPOSITORY_ROOT / "index.html" if page.slug == "home" else SITE_ROOT / f"{page.slug}.html")
         output.write_text(render_page(page, source), encoding="utf-8")
 
     print(f"Generated {len(chunks)} pages from README.md and guide content")

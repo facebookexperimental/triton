@@ -1,7 +1,8 @@
 """Curated TLX guide content that supplements the repository README."""
 
 GUIDE_CONTENT = {
-    "home": r"""
+    "home":
+    r"""
 # Overview
 
 This site covers three connected parts of Meta's work: the Triton compiler, the TLX low-level programming model, and the tools used to understand and improve generated GPU kernels.
@@ -26,7 +27,8 @@ TLX is a low-level Triton extension for explicit warp-group orchestration, async
 
 The tooling section covers compilation tracing, profiling, runtime diagnostics, sanitizers, static analysis, and benchmarking utilities used to develop and evaluate Triton and TLX kernels.
 """,
-    "triton": r"""
+    "triton":
+    r"""
 # Triton
 
 Triton is a compiler and language for writing performance-portable AI kernels with a productive blocked programming model. This FBTriton repository is Meta's development branch, where compiler-managed features such as automatic warp specialization are developed alongside lower-level TLX kernels that provide an expert-written performance reference.
@@ -114,7 +116,8 @@ Current AutoWS focuses on Hopper and Blackwell. Continued work aims to generaliz
 
 This page is a condensed guide to the published design. See [Warp Specialization in Triton: Design and Roadmap](https://pytorch.org/blog/warp-specialization-in-triton-design-and-roadmap/) for the full discussion.
 """,
-    "tlx-overview": r"""
+    "tlx-overview":
+    r"""
 ## Architecture: the MIMW programming model
 
 TLX uses a **Multiple Instructions, Multiple Warps (MIMW)** model. A warp group is an explicit execution agent: one group can move data, another can issue tensor-core work, and another can run an epilogue. The groups communicate through shared or tensor memory and synchronize with hardware barriers.
@@ -139,7 +142,8 @@ This fills the gap between CUDA's thread-level SIMT model and Triton's program-l
 
 Modern GPUs increasingly depend on features that sit between individual threads and whole thread blocks: warp specialization, asynchronous data movement, tensor-memory accumulators, and clustered execution. TLX exposes those features without requiring a kernel to be written directly in CUDA or PTX, while keeping layouts compiler-inferred unless an expert needs to override them.
 """,
-    "getting-started": r"""
+    "getting-started":
+    r"""
 # Getting started
 
 TLX is imported alongside Triton's standard language module. Start with ordinary Triton indexing and tensor operations, then introduce TLX only for the parts that need explicit warp-group, memory, or synchronization control.
@@ -203,7 +207,8 @@ The tasks are independent here. Pipelined GEMM and attention kernels add shared 
 - Compare Hopper, Blackwell, and AMD tutorial implementations of the same operation.
 - Use the [performance optimization](performance-optimization.html) checklist only after correctness is established.
 """,
-    "hardware-support": r"""
+    "hardware-support":
+    r"""
 # Hardware support
 
 TLX presents one low-level programming model across NVIDIA and AMD GPUs, but the available mechanisms reflect each architecture. Portable kernel structure is encouraged; hardware-specific fast paths remain explicit.
@@ -251,7 +256,8 @@ gfx950 provides the fullest AMD pipeline support. gfx942 kernels use a smaller s
 - Share launch geometry and correctness references across targets, but tune tile sizes and stage counts independently.
 - Treat hardware availability tags in the API reference as the source of truth for individual operations.
 """,
-    "performance-optimization": r"""
+    "performance-optimization":
+    r"""
 # Performance optimization
 
 Correctness comes first. Once a kernel is stable, TLX performance work is mainly about overlapping independent engines, keeping operands on chip, and assigning enough work to each warp group to hide latency without exhausting registers or shared memory.
@@ -336,7 +342,8 @@ The marker does not create a correct pipeline by itself. Buffer rotation, waits,
 
 Reported end-to-end examples are summarized in [Production case studies](production-case-studies.html).
 """,
-    "debugging": r"""
+    "debugging":
+    r"""
 # Debugging performance and numerics
 
 Performance and numerical failures often have different root causes, but the fastest workflow is the same: create one reproducible configuration, inspect the earliest stage where behavior diverges, and change only one variable at a time.
@@ -432,7 +439,8 @@ print("mean abs:", error.mean().item())
 
 Tolerance is workload-specific. Typical starting points are around `1e-5` for FP32, `1e-3` to `1e-2` for FP16/BF16, and wider for FP8-family inputs, always with FP32 reference accumulation where practical.
 """,
-    "production-case-studies": r"""
+    "production-case-studies":
+    r"""
 # Production case studies
 
 These reported deployments illustrate where TLX's explicit scheduling model has mattered beyond an isolated microbenchmark.
@@ -475,7 +483,8 @@ The kernel has been reported running continuously across more than 56K GB200 GPU
 - Preserve a high-level numerical reference and production-shaped benchmark throughout development.
 - Prefer the smallest amount of hardware-specific control that closes the measured performance gap.
 """,
-    "tooling": r"""
+    "tooling":
+    r"""
 # Tooling
 
 Triton and TLX development use a small set of complementary tools. Start from the question you need to answer rather than collecting every trace at once.
