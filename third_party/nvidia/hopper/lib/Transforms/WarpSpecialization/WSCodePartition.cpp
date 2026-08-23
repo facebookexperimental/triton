@@ -338,6 +338,49 @@ void collectAsyncChannels(SmallVector<std::unique_ptr<Channel>> &channels,
   });
 }
 
+static bool hasUnsupportedPrePartitionChannelsImpl(triton::FuncOp funcOp,
+                                                    unsigned numBuffers) {
+  auto isUnsupported = [](const std::unique_ptr<Channel> &channel) {
+    Operation *producer = channel->getSrcOp();
+    Operation *consumer = channel->getDstOp();
+    if (producer && consumer &&
+        isSupportedCrossRegionChannel(producer, consumer))
+      return false;
+    LDBG("unsupported pre-partition channel " << channel->uniqID << " ("
+                                               << to_string(
+                                                      channel->channelKind)
+                                               << ")");
+    LLVM_DEBUG({
+      if (producer)
+        producer->dump();
+      if (consumer)
+        consumer->dump();
+    });
+    return true;
+  };
+
+  SmallVector<std::unique_ptr<Channel>> asyncChannels;
+  collectAsyncChannels(asyncChannels, funcOp, numBuffers);
+  if (llvm::any_of(asyncChannels, isUnsupported))
+    return true;
+
+  SmallVector<std::unique_ptr<Channel>> allocChannels;
+  collectAllocChannels(allocChannels, funcOp,
+                       /*includeSameTaskSmemChannels=*/false,
+                       /*includeTmemChannels=*/false);
+  for (const auto &channel : allocChannels) {
+    Operation *producer = channel->getSrcOp();
+    // Descriptor-backed and direct-source allocations are normalized before
+    // their final channel endpoints are established. Explicit local stores
+    // already expose the regions that code partitioning will use and can be
+    // checked without mutating the IR.
+    if (isa_and_nonnull<ttg::LocalStoreOp>(producer) &&
+        isUnsupported(channel))
+      return true;
+  }
+  return false;
+}
+
 Operation *getUniqueActualConsumer(Operation *consumerOp) {
   auto consumers = getActualConsumers(consumerOp);
   return consumers.size() == 1 ? consumers[0] : consumerOp;
@@ -752,7 +795,7 @@ namespace {
 
 Value createBarrierAlloc(triton::FuncOp funcOp, unsigned distance,
                          StringRef srcName = "", unsigned arriveCount = 1,
-                                ttg::CGAEncodingAttr cgaLayout = {}) {
+                         ttg::CGAEncodingAttr cgaLayout = {}) {
   OpBuilder builder(funcOp);
   builder.setInsertionPointToStart(&(funcOp.getBody().front()));
   Attribute sharedMemorySpace =
@@ -1164,8 +1207,7 @@ void createToken(
         });
     Attribute multicastAxes;
     if (!tmaProducers.empty()) {
-      multicastAxes =
-          tmaProducers.front()->getAttr(tt::kMulticastAxesAttrName);
+      multicastAxes = tmaProducers.front()->getAttr(tt::kMulticastAxesAttrName);
       bool compatible = llvm::all_of(tmaProducers, [&](auto load) {
         return load->getAttr(tt::kMulticastAxesAttrName) == multicastAxes;
       });
@@ -1221,17 +1263,17 @@ void createToken(
           multicastAxes = {};
         }
       }
-      commChannel.producerBarrier =
-          createBarrierAlloc(funcOp, channel->getNumBuffers(), channel->srcName);
+      commChannel.producerBarrier = createBarrierAlloc(
+          funcOp, channel->getNumBuffers(), channel->srcName);
       if (multicastAxes) {
         auto dims = ttg::TritonGPUDialect::getClusterDims(
             tmaProducers.front()->getParentOfType<ModuleOp>());
         unsigned clusterSize = product(dims);
         auto identityLayout =
             getIdentityClusterBarrierLayout(tmaProducers.front());
-        commChannel.multicastReuseBarrier = createBarrierAlloc(
-            funcOp, channel->getNumBuffers(), channel->srcName, clusterSize,
-            identityLayout);
+        commChannel.multicastReuseBarrier =
+            createBarrierAlloc(funcOp, channel->getNumBuffers(),
+                               channel->srcName, clusterSize, identityLayout);
         for (int taskId : commChannel.consumerTaskIds)
           commChannel.multicastReadyBarriers[taskId] = createBarrierAlloc(
               funcOp, channel->getNumBuffers(), channel->srcName, clusterSize,
@@ -2592,28 +2634,10 @@ LogicalResult insertAsyncComm(
       }
       op = op->getParentOp();
     }
-    llvm_unreachable("Failed to find consumer's same level Op with producer");
-  };
-
-  // 0: same scope, -1: A in nested scope, 1: B in nested scope
-  auto isAinNestedRegion = [&](Operation *A, Operation *B) -> int {
-    if (A->getBlock() == B->getBlock())
-      return 0;
-    Operation *op = A;
-    while (!isa<triton::FuncOp>(op)) {
-      if (getEffectiveParentOp(op) == getEffectiveParentOp(B)) {
-        return -1;
-      }
-      op = op->getParentOp();
-    }
-    op = B;
-    while (!isa<triton::FuncOp>(op)) {
-      if (getEffectiveParentOp(op) == getEffectiveParentOp(A)) {
-        return 1;
-      }
-      op = op->getParentOp();
-    }
-    llvm_unreachable("error in isAinNestedRegion");
+    Operation *anchor = getCommonBlockAnchors(p, c).second;
+    if (anchor)
+      return anchor;
+    llvm_unreachable("failed to find a same-level channel endpoint");
   };
 
   mlir::DominanceInfo dom(funcOp);
@@ -2982,12 +3006,14 @@ LogicalResult insertAsyncComm(
       return false;
     };
     Operation *nestedInsertionTarget = nullptr;
+    Operation *siblingConsumerAnchor = nullptr;
     // Check to see if producer and consumer are in the same block.
     bool producerInNestedRegion = false, consumerInNestedRegion = false;
     if (headProducer->getBlock() != headConsumer->getBlock()) {
       LDBG("different blocks for channel " << masterChannel->uniqID);
-      int regionCmp = isAinNestedRegion(headProducer, headConsumer);
-      if (regionCmp < 0) {
+      RegionRelationInfo regionInfo =
+          getRegionRelationInfo(headProducer, headConsumer);
+      if (regionInfo.relation == RegionRelation::AIsNested) {
         // A/producer in nested region. Lift up headProducer till it is
         // in the same scope as headConsumer.
         //
@@ -3021,11 +3047,19 @@ LogicalResult insertAsyncComm(
                "producers supported");
         nestedInsertionTarget = getSameLevelOp(headConsumer, headProducer);
         producerInNestedRegion = true;
-      } else if (regionCmp > 0) {
+      } else if (regionInfo.relation == RegionRelation::BIsNested) {
         // B/consumer in nested region. Lift up headConsumer till it is
         // in the same scope as headProducer.
         nestedInsertionTarget = getSameLevelOp(tmaHeadProducer, headConsumer);
         consumerInNestedRegion = true;
+      } else if (regionInfo.relation == RegionRelation::Siblings) {
+        assert(isSupportedCrossRegionChannel(headProducer, headConsumer) &&
+               "sibling channel must pass preflight validation");
+        nestedInsertionTarget = regionInfo.aAnchor;
+        siblingConsumerAnchor = regionInfo.bAnchor;
+        producerInNestedRegion = true;
+      } else {
+        llvm_unreachable("cross-region channel must pass preflight validation");
       }
     } else {
       // Check to see if consumer appears later than producer (loop-carried).
@@ -3763,8 +3797,10 @@ LogicalResult insertAsyncComm(
                 funcOp.getContext(), masterChannel->relation.first,
                 WSBarrierAttr::kDirectionForward)
                 .build(funcOp.getContext());
+        Operation *completionConsumer =
+            siblingConsumerAnchor ? siblingConsumerAnchor : headConsumer;
         desyncMMAv5Op(builder, mmaOp, *commChannel.producerBarrier, bufferIdx,
-                      phase, headConsumer, false, addCompletionBarrier,
+                      phase, completionConsumer, false, addCompletionBarrier,
                       waitConstraints);
       }
     }
@@ -5369,12 +5405,44 @@ static void lowerMultiTaskSubtiledRegions(triton::FuncOp funcOp) {
     ttng::lowerSubtiledRegion(op);
 }
 
+static LogicalResult validateCrossRegionChannels(
+    triton::FuncOp funcOp,
+    const SmallVector<std::unique_ptr<Channel>> &channels) {
+  // Production eligibility preflights every channel whose topology is known
+  // before mutation. Reaching this check with an unsupported channel means
+  // channel construction diverged from that preflight and is an internal
+  // compiler error; a metadata-only fallback is no longer safe here.
+  for (const auto &channel : channels) {
+    Operation *producer = channel->getSrcOp();
+    Operation *consumer = channel->getDstOp();
+    if (!producer || !consumer) {
+      return funcOp.emitError()
+             << "warp specialization could not resolve channel #"
+             << channel->uniqID << " endpoints";
+    }
+    if (!isSupportedCrossRegionChannel(producer, consumer)) {
+      return funcOp.emitError()
+             << "warp specialization does not support cross-region channel #"
+             << channel->uniqID << " (" << to_string(channel->channelKind)
+             << ")";
+    }
+  }
+  return success();
+}
+
 } // namespace
+
+bool hasUnsupportedPrePartitionChannels(triton::FuncOp funcOp,
+                                        unsigned numBuffers) {
+  return hasUnsupportedPrePartitionChannelsImpl(funcOp, numBuffers);
+}
 
 LogicalResult doCodePartition(triton::FuncOp funcOp, unsigned numBuffers) {
   // Step 1: collect all communications between producers and consumers.
   SmallVector<std::unique_ptr<Channel>> channelsOrigin;
   collectAllocChannels(channelsOrigin, funcOp);
+  if (failed(validateCrossRegionChannels(funcOp, channelsOrigin)))
+    return failure();
   SmallVector<Channel *> channels;
   for (const auto &c : channelsOrigin) {
     channels.push_back(c.get());
