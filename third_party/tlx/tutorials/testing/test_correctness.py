@@ -67,6 +67,8 @@ from triton.language.extra.tlx.tutorials.amd_fa_cluster import (
     attention as _amd_fa_cluster, )
 from triton.language.extra.tlx.tutorials.amd_fa_cluster import (
     persistent_attention as _amd_fa_cluster_persistent, )
+from triton.language.extra.tlx.tutorials.amd_fa_bwd import (
+    fa_backward as _amd_fa_backward, )
 from triton.language.extra.tlx.tutorials.amd_pa_decode import (
     pa_decode_tlx as _amd_pa_decode,
     build_inputs as _amd_pa_decode_build_inputs,
@@ -1503,6 +1505,39 @@ def test_amd_fa_cluster_persistent_scheduler_knobs(causal, HEAD_DIM):
     ref = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=causal, scale=sm)
     out = _amd_fa_cluster_persistent(q, k, v, sm, causal, config={"NUM_SMS": 16, "NUM_XCDS": 4})
     torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize(
+    ("B", "Hq", "Hkv", "N_CTX"),
+    [(1, 1, 1, 512),  # MHA
+     (1, 8, 1, 512),  # GQA8
+     ],
+    ids=["mha", "gqa8"],
+)
+@pytest.mark.parametrize("causal", [False, True], ids=["nocausal", "causal"])
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware (CDNA4)")
+def test_amd_fa_bwd_d64(B, Hq, Hkv, N_CTX, causal):
+    torch.manual_seed(42)
+    D = 64
+    q = torch.randn(B, Hq, N_CTX, D, device=DEVICE, dtype=torch.bfloat16).contiguous()
+    k = torch.randn(B, Hkv, N_CTX, D, device=DEVICE, dtype=torch.bfloat16).contiguous()
+    v = torch.randn(B, Hkv, N_CTX, D, device=DEVICE, dtype=torch.bfloat16).contiguous()
+    do = torch.randn_like(q)
+    sm_scale = D**-0.5
+
+    state = torch.ops.aten._scaled_dot_product_flash_attention.default(q, k, v, 0.0, causal, False, scale=sm_scale)
+    o, lse = state[0], state[1]
+    cum_q, cum_k, max_q, max_k, rng, unused = state[2:8]
+    ref_dq, ref_dk, ref_dv = torch.ops.aten._scaled_dot_product_flash_attention_backward.default(
+        do, q, k, v, o, lse, cum_q, cum_k, max_q, max_k, 0.0, causal, rng, unused, scale=sm_scale)
+
+    dq, dk, dv = _amd_fa_backward(q, k, v, o.contiguous(), do, lse.contiguous(), sm_scale, causal)
+
+    for name, actual, expected in (("dq", dq, ref_dq), ("dk", dk, ref_dk), ("dv", dv, ref_dv)):
+        assert torch.isfinite(actual).all(), name
+        rel_l2 = torch.linalg.vector_norm(actual.float() - expected.float()) / torch.linalg.vector_norm(
+            expected.float())
+        assert rel_l2.item() < 5e-3, (name, rel_l2.item())
 
 
 # =============================================================================

@@ -4,25 +4,33 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="description" content="Assign warps to concurrent tasks and configure CTA clusters.">
-  <title>Warp specialization and clustering · TLX</title>
-  <link rel="stylesheet" href="assets/tlx.css">
+  <title>Warp specialization and clustering · FBTriton</title>
+  <link rel="stylesheet" href="assets/tlx.css?v=20260821b">
 </head>
 <body>
   <header class="topbar">
-    <a class="brand" href="../"><span>TLX</span> Triton Low-level Language Extensions</a>
+    <a class="brand" href="../"><span>FB</span>Triton</a>
+    <nav class="topnav" aria-label="Top-level sections"><a href="triton.html">Triton</a>
+<a href="tlx.html" data-current="true">TLX</a>
+<a href="tooling.html">Tooling</a></nav>
     <a class="repo-link" href="https://github.com/facebookexperimental/triton" target="_blank" rel="noreferrer">View on GitHub ↗</a>
   </header>
   <div class="shell">
-    <aside class="sidebar">
-      <p class="eyebrow">Documentation</p>
-      <nav><a href="../">Overview</a>
+<aside class="sidebar">
+      <p class="eyebrow">TLX documentation</p>
+      <nav><a href="tlx.html">Overview</a>
+<a href="getting-started.html">Getting started</a>
+<a href="hardware-support.html">Hardware support</a>
 <a href="buffers.html">Local and remote buffers</a>
 <a href="async-memory.html">Async memory access</a>
 <a href="async-compute.html">Async tensor core operations</a>
 <a href="synchronization.html">Barriers and Cluster Launch Control</a>
 <a href="warp-specialization.html" aria-current="page">Warp specialization and clustering</a>
 <a href="utilities.html">Other operations</a>
+<a href="performance-optimization.html">Performance optimization</a>
+<a href="debugging.html">Debugging performance and numerics</a>
 <a href="kernels.html">Example kernels</a>
+<a href="production-case-studies.html">Production case studies</a>
 <a href="install-and-test.html">Build, install, and test</a>
 <a href="resources.html">More reading</a></nav>
     </aside>
@@ -106,7 +114,7 @@ def matmul_kernel(...):
 <h4 id="tlx-vs-triton-semantics">TLX vs Triton Semantics</h4>
 <p>TLX uses <strong>CUDA-native cluster semantics</strong> which differs from Triton's approach:</p>
 <table><thead><tr><th>Aspect</th><th>Triton's way (<code>num_ctas</code>)</th><th>TLX way (<code>ctas_per_cga</code>)</th></tr></thead><tbody><tr><td>Grid interpretation</td><td>Grid × cluster_dims = total CTAs</td><td>Grid = total CTAs</td></tr><tr><td>Cluster definition</td><td>Multiplicative</td><td>Regrouping</td></tr><tr><td><code>num_ctas</code> value</td><td><code>product(cluster_dims)</code></td><td>Always 1</td></tr><tr><td><code>launch_cluster</code></td><td>Can be False (enabled by <code>num_ctas != 1</code>)</td><td>Always True</td></tr></tbody></table></article>
-      <footer class="pager"><a href="synchronization.html">← Barriers and Cluster Launch Control</a><a class="next" href="utilities.html">Other operations →</a></footer>
+<footer class="pager"><a href="synchronization.html">← Barriers and Cluster Launch Control</a><a class="next" href="utilities.html">Other operations →</a></footer>
     </main>
   </div>
 </body>

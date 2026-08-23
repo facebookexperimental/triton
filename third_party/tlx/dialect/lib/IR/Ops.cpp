@@ -39,6 +39,14 @@ OpFoldResult ReleaseLayoutOp::fold(FoldAdaptor) {
   return {};
 }
 
+LogicalResult ReleaseLayoutOp::verify() {
+  auto srcType = cast<RankedTensorType>(getSrc().getType());
+  Attribute srcEncoding = srcType.getEncoding();
+  if (!srcEncoding)
+    return emitOpError("requires the source tensor to have a layout encoding");
+  return success();
+}
+
 //-- StorageAliasSpecOp --
 
 LogicalResult StorageAliasSpecOp::verify() {

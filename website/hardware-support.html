@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Understand TLX capabilities across Hopper, Blackwell, and AMD CDNA GPUs.">
+  <title>Hardware support · FBTriton</title>
+  <link rel="stylesheet" href="assets/tlx.css?v=20260821b">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="../"><span>FB</span>Triton</a>
+    <nav class="topnav" aria-label="Top-level sections"><a href="triton.html">Triton</a>
+<a href="tlx.html" data-current="true">TLX</a>
+<a href="tooling.html">Tooling</a></nav>
+    <a class="repo-link" href="https://github.com/facebookexperimental/triton" target="_blank" rel="noreferrer">View on GitHub ↗</a>
+  </header>
+  <div class="shell">
+<aside class="sidebar">
+      <p class="eyebrow">TLX documentation</p>
+      <nav><a href="tlx.html">Overview</a>
+<a href="getting-started.html">Getting started</a>
+<a href="hardware-support.html" aria-current="page">Hardware support</a>
+<a href="buffers.html">Local and remote buffers</a>
+<a href="async-memory.html">Async memory access</a>
+<a href="async-compute.html">Async tensor core operations</a>
+<a href="synchronization.html">Barriers and Cluster Launch Control</a>
+<a href="warp-specialization.html">Warp specialization and clustering</a>
+<a href="utilities.html">Other operations</a>
+<a href="performance-optimization.html">Performance optimization</a>
+<a href="debugging.html">Debugging performance and numerics</a>
+<a href="kernels.html">Example kernels</a>
+<a href="production-case-studies.html">Production case studies</a>
+<a href="install-and-test.html">Build, install, and test</a>
+<a href="resources.html">More reading</a></nav>
+    </aside>
+    <main>
+      <p class="eyebrow">TLX documentation</p>
+      <h1>Hardware support</h1>
+      <p class="lede">Understand TLX capabilities across Hopper, Blackwell, and AMD CDNA GPUs.</p>
+      <article><p>TLX presents one low-level programming model across NVIDIA and AMD GPUs, but the available mechanisms reflect each architecture. Portable kernel structure is encouraged; hardware-specific fast paths remain explicit.</p>
+<table><thead><tr><th>Target</th><th>Core TLX mechanisms</th><th>Representative tutorials</th></tr></thead><tbody><tr><td>NVIDIA Hopper (H100)</td><td>TMA descriptor loads/stores, WGMMA, mbarriers, warp specialization, CTA clusters</td><td><a href="https://github.com/facebookexperimental/triton/blob/main/third_party/tlx/tutorials/hopper_fa_ws_pipelined.py" target="_blank" rel="noreferrer">Hopper pipelined FA</a></td></tr><tr><td>NVIDIA Blackwell (B200 / GB200)</td><td>Hopper features plus tensor memory, fifth-generation async MMA, CLC, paired-CTA execution, DSMEM</td><td><a href="https://github.com/facebookexperimental/triton/blob/main/third_party/tlx/tutorials/blackwell_gemm_clc.py" target="_blank" rel="noreferrer">Blackwell CLC GEMM</a></td></tr><tr><td>AMD gfx942 (MI300)</td><td>Local buffers, buffer operations, MFMA-oriented kernels, explicit LDS management</td><td><a href="https://github.com/facebookexperimental/triton/blob/main/third_party/tlx/tutorials/amd_gemm_gfx942.py" target="_blank" rel="noreferrer">gfx942 GEMM</a></td></tr><tr><td>AMD gfx950 (MI350 / MI355)</td><td>Direct-to-LDS async loads, warp pipelining, padded LDS layouts, TDM and persistent kernels</td><td><a href="https://github.com/facebookexperimental/triton/blob/main/third_party/tlx/tutorials/amd_gemm_warp_pipeline.py" target="_blank" rel="noreferrer">AMD warp-pipeline GEMM</a></td></tr></tbody></table>
+<h2 id="nvidia-blackwell">NVIDIA Blackwell</h2>
+<p>Blackwell is the broadest TLX target. Tensor Memory (TMEM) holds accumulator tiles outside the normal register file, while <code>tlx.async_dot</code> issues non-blocking tensor-core operations and can signal mbarriers on completion. Cluster Launch Control provides hardware-managed tile acquisition for persistent kernels, including paired-CTA execution.</p>
+<p>Key mechanisms include:</p>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.local_alloc(..., tlx.storage_kind.tmem)</code> for tensor-memory allocations.</div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.async_dot()</code> and <code>tlx.async_dot_scaled()</code> for asynchronous MMA.</div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.clc_create_context()</code> for dynamic persistent scheduling.</div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.async_remote_shmem_store()</code> for cross-CTA shared-memory exchange.</div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>ctas_per_cga</code> for CUDA-native thread-block clustering.</div></div>
+<h2 id="nvidia-hopper">NVIDIA Hopper</h2>
+<p>Hopper kernels typically use a TMA producer warp group, a WGMMA consumer group, and an optional epilogue group. Multiple shared-memory stages overlap global-memory movement with tensor-core execution. The same mbarrier phase model governs both explicit warp-group handoffs and TMA completion.</p>
+<p>The Hopper tutorials are the clearest place to learn producer/consumer pipelines before adding Blackwell TMEM or CLC.</p>
+<h2 id="amd-cdna">AMD CDNA</h2>
+<p>AMD support uses the same local-buffer and task concepts with architecture-native operations:</p>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.buffer_load()</code> and <code>tlx.buffer_store()</code> expose scalar-base-plus-offset buffer addressing.</div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.buffer_load_to_local()</code> and async loads move data directly into LDS where supported.</div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.warp_pipeline_stage()</code> marks explicit load and compute stages and maps priority hints to <code>s_setprio</code>.</div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.padded_shared_layout_encoding</code> describes LDS padding used to avoid bank conflicts.</div></div>
+<p>gfx950 provides the fullest AMD pipeline support. gfx942 kernels use a smaller subset and more explicit LDS staging. Support for newer CDNA generations continues to build on these interfaces.</p>
+<h2 id="portability-guidance">Portability guidance</h2>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div>Keep indexing, masks, and tensor math in standard Triton when possible.</div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div>Isolate TMEM, CLC, direct-to-LDS, and layout-specific code behind compile-time target choices.</div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div>Share launch geometry and correctness references across targets, but tune tile sizes and stage counts independently.</div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div>Treat hardware availability tags in the API reference as the source of truth for individual operations.</div></div></article>
+<footer class="pager"><a href="getting-started.html">← Getting started</a><a class="next" href="buffers.html">Local and remote buffers →</a></footer>
+    </main>
+  </div>
+</body>
+</html>
