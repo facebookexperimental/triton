@@ -100,13 +100,12 @@ private:
     if (isa<arith::ConstantOp, tt::GetNumProgramsOp>(op))
       return llvm::SmallBitVector(3);
 
-    auto analyzeClusterQuotient = [&](Value lhs, Value rhs)
-        -> FailureOr<llvm::SmallBitVector> {
+    auto analyzeClusterQuotient =
+        [&](Value lhs, Value rhs) -> FailureOr<llvm::SmallBitVector> {
       auto pid = lhs.getDefiningOp<tt::GetProgramIdOp>();
       auto constant = rhs.getDefiningOp<arith::ConstantOp>();
-      auto divisor = constant
-                         ? dyn_cast<IntegerAttr>(constant.getValue())
-                         : IntegerAttr();
+      auto divisor =
+          constant ? dyn_cast<IntegerAttr>(constant.getValue()) : IntegerAttr();
       if (!pid || !divisor)
         return failure();
       unsigned axis = static_cast<unsigned>(pid.getAxis());
@@ -130,10 +129,10 @@ private:
 
     // TODO: Model CLC and mutable-memory dependencies using the latest
     // schedule instead of rejecting them conservatively.
-    if (isa<ttng::CLCTryCancelOp, ttng::CLCLoadResultOp,
-            ttng::CLCIsCanceledOp, ttng::CLCGetProgramIdOp,
-            ttng::CLCTryCancelAsyncOp, ttng::CLCQueryCancelOp,
-            tt::AtomicRMWOp, tt::AtomicCASOp, tt::LoadOp>(op))
+    if (isa<ttng::CLCTryCancelOp, ttng::CLCLoadResultOp, ttng::CLCIsCanceledOp,
+            ttng::CLCGetProgramIdOp, ttng::CLCTryCancelAsyncOp,
+            ttng::CLCQueryCancelOp, tt::AtomicRMWOp, tt::AtomicCASOp,
+            tt::LoadOp>(op))
       return failure();
     if (!isa<arith::ArithDialect>(op->getDialect()) &&
         !isa<tt::SplatOp, tt::BroadcastOp, tt::ExpandDimsOp,
@@ -241,12 +240,12 @@ analyzeTMAMulticast(tt::DescriptorLoadOp load) {
   }
 
   // Pid-invariant indices are not sufficient: a descriptor whose base / shape /
-  // strides derive from program_id (e.g. `base + pid * stride`) can be loaded at
-  // identical indices across CTAs yet address different tiles, so multicasting
-  // the leader's tile would corrupt the others. Fold the descriptor operand's
-  // pid-dependence into varyingAxes as well; a computed descriptor whose
-  // invariance the analysis cannot prove fails here and the load is rejected
-  // (no multicast) rather than being assumed broadcastable.
+  // strides derive from program_id (e.g. `base + pid * stride`) can be loaded
+  // at identical indices across CTAs yet address different tiles, so
+  // multicasting the leader's tile would corrupt the others. Fold the
+  // descriptor operand's pid-dependence into varyingAxes as well; a computed
+  // descriptor whose invariance the analysis cannot prove fails here and the
+  // load is rejected (no multicast) rather than being assumed broadcastable.
   auto descDeps = analysis.get(load.getDesc());
   if (failed(descDeps))
     return failure();

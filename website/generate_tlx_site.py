@@ -10,7 +10,6 @@ from pathlib import Path
 
 from guide_content import GUIDE_CONTENT
 
-
 SITE_ROOT = Path(__file__).resolve().parent
 REPOSITORY_ROOT = SITE_ROOT.parent
 REPOSITORY_URL = "https://github.com/facebookexperimental/triton"
@@ -276,11 +275,7 @@ def is_table_separator(line: str) -> bool:
 
 def table_row(line: str, tag: str) -> str:
     cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
-    return (
-        "<tr>"
-        + "".join(f"<{tag}>{render_inline(cell)}</{tag}>" for cell in cells)
-        + "</tr>"
-    )
+    return ("<tr>" + "".join(f"<{tag}>{render_inline(cell)}</{tag}>" for cell in cells) + "</tr>")
 
 
 def render_markdown(source: str) -> str:
@@ -294,9 +289,7 @@ def render_markdown(source: str) -> str:
 
     def flush_paragraph() -> None:
         if paragraph:
-            output.append(
-                f"<p>{render_inline(' '.join(part.strip() for part in paragraph))}</p>"
-            )
+            output.append(f"<p>{render_inline(' '.join(part.strip() for part in paragraph))}</p>")
             paragraph.clear()
 
     while index < len(lines):
@@ -305,14 +298,8 @@ def render_markdown(source: str) -> str:
         if fence:
             flush_paragraph()
             if in_code:
-                language = (
-                    f' class="language-{html.escape(code_language)}"'
-                    if code_language
-                    else ""
-                )
-                output.append(
-                    f"<pre><code{language}>{html.escape(chr(10).join(code_lines))}</code></pre>"
-                )
+                language = (f' class="language-{html.escape(code_language)}"' if code_language else "")
+                output.append(f"<pre><code{language}>{html.escape(chr(10).join(code_lines))}</code></pre>")
                 code_lines.clear()
                 in_code = False
             else:
@@ -332,9 +319,7 @@ def render_markdown(source: str) -> str:
             while index < len(lines) and lines[index].startswith(">"):
                 quote_lines.append(lines[index][1:].strip())
                 index += 1
-            output.append(
-                f"<blockquote><p>{render_inline(' '.join(quote_lines))}</p></blockquote>"
-            )
+            output.append(f"<blockquote><p>{render_inline(' '.join(quote_lines))}</p></blockquote>")
             continue
 
         heading = re.match(r"^(#{1,6})\s+(.+)$", line)
@@ -342,17 +327,11 @@ def render_markdown(source: str) -> str:
             flush_paragraph()
             level = len(heading.group(1))
             title = heading.group(2).strip()
-            output.append(
-                f'<h{level} id="{slugify(title)}">{render_inline(title)}</h{level}>'
-            )
+            output.append(f'<h{level} id="{slugify(title)}">{render_inline(title)}</h{level}>')
             index += 1
             continue
 
-        if (
-            index + 1 < len(lines)
-            and "|" in line
-            and is_table_separator(lines[index + 1])
-        ):
+        if (index + 1 < len(lines) and "|" in line and is_table_separator(lines[index + 1])):
             flush_paragraph()
             rows = ["<table><thead>", table_row(line, "th"), "</thead><tbody>"]
             index += 2
@@ -367,10 +346,8 @@ def render_markdown(source: str) -> str:
         if item:
             flush_paragraph()
             depth = min(len(item.group(1)) // 2, 3)
-            output.append(
-                f'<div class="list-item depth-{depth}"><span aria-hidden="true">•</span>'
-                f"<div>{render_inline(item.group(2))}</div></div>"
-            )
+            output.append(f'<div class="list-item depth-{depth}"><span aria-hidden="true">•</span>'
+                          f"<div>{render_inline(item.group(2))}</div></div>")
             index += 1
             continue
 
@@ -443,9 +420,7 @@ def page_links(page: Page, from_root: bool) -> str:
         links.append(f'<a href="{href}">← {html.escape(previous.title)}</a>')
     if following:
         href = page_href(following, from_root)
-        links.append(
-            f'<a class="next" href="{href}">{html.escape(following.title)} →</a>'
-        )
+        links.append(f'<a class="next" href="{href}">{html.escape(following.title)} →</a>')
     return "".join(links)
 
 
@@ -511,11 +486,7 @@ def main() -> None:
     chunks = collect_page_sources(read_readme())
 
     for page, source in chunks:
-        output = (
-            REPOSITORY_ROOT / "index.html"
-            if page.slug == "home"
-            else SITE_ROOT / f"{page.slug}.html"
-        )
+        output = (REPOSITORY_ROOT / "index.html" if page.slug == "home" else SITE_ROOT / f"{page.slug}.html")
         output.write_text(render_page(page, source), encoding="utf-8")
 
     print(f"Generated {len(chunks)} pages from README.md and guide content")

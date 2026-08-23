@@ -1973,8 +1973,8 @@ void printBlock(Block &block, llvm::raw_ostream &os,
       if (!yieldTargets.empty()) {
         // Emit the iter-arg updates as a single tuple assignment: scf.yield has
         // parallel-copy semantics, so sequential `t = v` statements would let a
-        // later target read an already-updated one, desyncing barrier phases and
-        // deadlocking warp-specialized kernels.
+        // later target read an already-updated one, desyncing barrier phases
+        // and deadlocking warp-specialized kernels.
         unsigned n = std::min((size_t)op.getNumOperands(), yieldTargets.size());
         SmallVector<std::string> lhs, rhs;
         for (unsigned i = 0; i < n; ++i) {
