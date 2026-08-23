@@ -39,6 +39,7 @@
 #include "mlir/Pass/Pass.h"
 #include "nvidia/hopper/include/Transforms/Passes.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
+#include "triton/Dialect/Triton/IR/TMAMulticast.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/Partition.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
@@ -66,14 +67,6 @@ enum class AtomicWSCase {
 // the union of task ids on the enclosing persistent loop.
 static SmallVector<AsyncTaskId> getAllPartitions(scf::WhileOp whileOp) {
   return getAsyncTaskIds(whileOp.getOperation());
-}
-
-static bool hasExplicitCluster(Operation *op) {
-  ModuleOp mod = op->getParentOfType<ModuleOp>();
-  if (ttg::TritonGPUDialect::getNumCTAs(mod) != 1)
-    return false;
-  auto dims = ttg::TritonGPUDialect::getClusterDims(mod);
-  return dims[0] * dims[1] * dims[2] > 1;
 }
 
 // Return the enclosing persistent `scf.while` whose after-region terminator
@@ -267,22 +260,36 @@ enum class CLCWSCase {
   Reject       // unsupported -> bail out of WS
 };
 
-static CLCWSCase classifyCLC(ttng::CLCReadOp readOp, scf::WhileOp &whileOut,
-                             bool emitRejectionDiagnostics) {
-  if (hasExplicitCluster(readOp)) {
-    if (emitRejectionDiagnostics) {
-      auto dims = ttg::TritonGPUDialect::getClusterDims(
-          readOp->getParentOfType<ModuleOp>());
-      readOp.emitError("clustered CLC AutoWS is unsupported for explicit "
-                       "cluster shape ")
-          << dims[0] << "x" << dims[1] << "x" << dims[2];
-    }
-    LDBG("reject: clustered CLC fetch cannot be warp-specialized");
+static bool hasExplicitCluster(Operation *op) {
+  ModuleOp mod = op->getParentOfType<ModuleOp>();
+  if (ttg::TritonGPUDialect::getNumCTAs(mod) != 1)
+    return false;
+  auto dims = ttg::TritonGPUDialect::getClusterDims(mod);
+  return dims[0] * dims[1] * dims[2] > 1;
+}
+
+static bool hasMulticastDescriptorLoad(Operation *op) {
+  bool found = false;
+  op->getParentOfType<triton::FuncOp>().walk([&](tt::DescriptorLoadOp load) {
+    found |= load->hasAttr(tt::kMulticastAxesAttrName);
+  });
+  return found;
+}
+
+static CLCWSCase classifyCLC(ttng::CLCReadOp readOp,
+                             scf::WhileOp &whileOut) {
+  SmallVector<AsyncTaskId> taskIds = getAsyncTaskIds(readOp.getOperation());
+  bool explicitCluster = hasExplicitCluster(readOp);
+  if (explicitCluster && hasMulticastDescriptorLoad(readOp)) {
+    LDBG("reject: clustered CLC multicast requires the unspecialized "
+         "cluster protocol");
     return CLCWSCase::Reject;
   }
-
-  SmallVector<AsyncTaskId> taskIds = getAsyncTaskIds(readOp.getOperation());
-  if (taskIds.size() <= 1)
+  if (explicitCluster && taskIds.empty()) {
+    LDBG("reject: clustered clc_read has no assigned owner partition");
+    return CLCWSCase::Reject;
+  }
+  if (taskIds.size() <= 1 && !explicitCluster)
     return CLCWSCase::PassThrough;
 
   auto whileOp = readOp->getParentOfType<scf::WhileOp>();
@@ -295,6 +302,12 @@ static CLCWSCase classifyCLC(ttng::CLCReadOp readOp, scf::WhileOp &whileOut,
     return CLCWSCase::Reject;
   }
   SmallVector<AsyncTaskId> allParts = getAllPartitions(whileOp);
+  if (allParts.size() <= 1)
+    return CLCWSCase::PassThrough;
+  if (explicitCluster && taskIds.size() == 1 && allParts.size() > 1) {
+    whileOut = whileOp;
+    return CLCWSCase::Transform;
+  }
   if (taskIds.size() != allParts.size()) {
     LDBG("reject: clc_read replicated to a strict subset of partitions");
     return CLCWSCase::Reject;
@@ -374,7 +387,10 @@ static LogicalResult transformCLC(triton::FuncOp funcOp, ttng::CLCReadOp readOp,
                                   scf::WhileOp whileOp) {
   MLIRContext *ctx = funcOp.getContext();
   SmallVector<AsyncTaskId> allParts = getAllPartitions(whileOp);
-  AsyncTaskId owner = getOwnerPartition(whileOp, allParts);
+  SmallVector<AsyncTaskId> readTaskIds = getAsyncTaskIds(readOp.getOperation());
+  AsyncTaskId owner = readTaskIds.size() == 1
+      ? readTaskIds.front()
+      : getOwnerPartition(whileOp, allParts);
   Location loc = readOp.getLoc();
 
   auto issue = readOp.getToken().getDefiningOp<ttng::CLCTryCancelAsyncOp>();
@@ -423,8 +439,7 @@ static LogicalResult transformCLC(triton::FuncOp funcOp, ttng::CLCReadOp readOp,
 // async_task_ids), leaving the kernel unspecialized-but-compilable — one source
 // of truth for the reject teardown shared with the other AutoWS bail-outs.
 LogicalResult doDynamicTileBroadcast(triton::FuncOp funcOp,
-                                     int tilePrefetchDepth,
-                                     bool emitRejectionDiagnostics) {
+                                     int tilePrefetchDepth) {
   SmallVector<std::pair<tt::AtomicRMWOp, scf::WhileOp>> atomicTransforms;
   SmallVector<std::pair<ttng::CLCReadOp, scf::WhileOp>> clcTransforms;
 
@@ -454,7 +469,7 @@ LogicalResult doDynamicTileBroadcast(triton::FuncOp funcOp,
   funcOp.walk([&](ttng::CLCReadOp op) { reads.push_back(op); });
   for (auto readOp : reads) {
     scf::WhileOp whileOp;
-    switch (classifyCLC(readOp, whileOp, emitRejectionDiagnostics)) {
+    switch (classifyCLC(readOp, whileOp)) {
     case CLCWSCase::PassThrough:
       break;
     case CLCWSCase::Reject:
@@ -500,8 +515,7 @@ public:
 
   void runOnOperation() override {
     getOperation()->walk([&](triton::FuncOp funcOp) {
-      if (failed(doDynamicTileBroadcast(funcOp, tilePrefetchDepth,
-                                        /*emitRejectionDiagnostics=*/true)))
+      if (failed(doDynamicTileBroadcast(funcOp, tilePrefetchDepth)))
         signalPassFailure();
     });
   }

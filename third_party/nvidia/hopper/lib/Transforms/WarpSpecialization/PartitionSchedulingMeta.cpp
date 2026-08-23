@@ -879,9 +879,15 @@ private:
         afterLoop = true;
         continue;
       }
-      if (afterLoop && isEpilogueStoreOp(&op)) {
-        addCategorizedOp(&op, epilogueStoreCategoryFor(&op));
-      }
+      if (!afterLoop)
+        continue;
+      op.walk<WalkOrder::PreOrder>([&](Operation *nested) {
+        if (isa<LoopLikeOpInterface>(nested))
+          return WalkResult::skip();
+        if (isEpilogueStoreOp(nested))
+          addCategorizedOp(nested, epilogueStoreCategoryFor(nested));
+        return WalkResult::advance();
+      });
     }
   }
 

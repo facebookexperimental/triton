@@ -77,8 +77,9 @@ construction allocates cluster-wide reuse and consumer-ready barriers, and
 memory lowering executes those rendezvous in the participating task partitions
 before buffer reuse. Blackwell AutoWS currently falls back to per-CTA TMA
 because a multicast issued from its worker partition does not reliably complete
-the remote CTA barriers. Incompatible multicast axes also fall back to per-CTA
-TMA.
+the remote CTA barriers. Clustered CLC kernels with multicast reject AutoWS
+before code partitioning and retain the unspecialized cluster-wide multicast
+protocol instead. Incompatible multicast axes also fall back to per-CTA TMA.
 
 ### `collectAsyncChannels`
 
