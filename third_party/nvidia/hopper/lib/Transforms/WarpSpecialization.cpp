@@ -284,6 +284,12 @@ public:
       return bailOut(funcOp);
     }
 
+    if (hasUnsupportedWhileSpecialization(funcOp)) {
+      LDBG("Warp specialization cannot safely clone a retained while value. "
+           "Skipping.");
+      return bailOut(funcOp);
+    }
+
     if (hasUnsupportedCrossRegionTmemChannel(funcOp) ||
         hasUnsupportedPrePartitionChannels(funcOp, numStages)) {
       LDBG("Warp specialization does not support this cross-region channel "

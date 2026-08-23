@@ -223,6 +223,64 @@ def matmul_kernel_tma_persistent_guarded_epilogue_ws(
 
 
 # ============================================================================
+# Kernel 2a-surviving: guarded clustered matmul with a persistent while loop.
+# ============================================================================
+@triton.jit
+def matmul_kernel_tma_persistent_guarded_epilogue_surviving_while_ws(
+    a_desc,
+    b_desc,
+    c_desc,
+    M,
+    N,
+    K,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    CTA_GROUP_M: tl.constexpr,
+    CTA_GROUP_N: tl.constexpr,
+):
+    dtype = tl.float16
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    k_tiles = tl.cdiv(K, BLOCK_SIZE_K)
+
+    program_m = tl.program_id(0)
+    program_n = tl.program_id(1)
+    group_m = program_m // CTA_GROUP_M
+    group_n = program_n // CTA_GROUP_N
+    local_m = program_m % CTA_GROUP_M
+    local_n = program_n % CTA_GROUP_N
+
+    num_group_m = tl.cdiv(num_pid_m, CTA_GROUP_M)
+    num_group_n = tl.cdiv(num_pid_n, CTA_GROUP_N)
+    tile_group_id = group_m * num_group_n + group_n
+    num_groups = num_group_m * num_group_n
+    group_stride = (tl.num_programs(0) // CTA_GROUP_M) * (tl.num_programs(1) // CTA_GROUP_N)
+    valid = tile_group_id < num_groups
+
+    while tl.condition(valid, warp_specialize=True):
+        tile_group_m = tile_group_id // num_group_n
+        tile_group_n = tile_group_id % num_group_n
+        pid_m = tile_group_m * CTA_GROUP_M + local_m
+        pid_n = tile_group_n * CTA_GROUP_N + local_n
+        offs_am = pid_m * BLOCK_SIZE_M
+        offs_bn = pid_n * BLOCK_SIZE_N
+
+        accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+        for ki in range(k_tiles):
+            offs_k = ki * BLOCK_SIZE_K
+            a = a_desc.load([offs_am, offs_k])
+            b = b_desc.load([offs_bn, offs_k])
+            accumulator = tl.dot(a, b.T, accumulator)
+
+        if (pid_m < num_pid_m) & (pid_n < num_pid_n):
+            c_desc.store([offs_am, offs_bn], accumulator.to(dtype))
+
+        tile_group_id += group_stride
+        valid = tile_group_id < num_groups
+
+
+# ============================================================================
 # Kernel 2b: matmul_kernel_tma_static_persistent_ws_while
 # Static persistent TMA matmul whose persistent outer loop is a while loop.
 # Work assignment is still static: each CTA processes tile_id += NUM_SMS.
@@ -1050,6 +1108,74 @@ def test_tutorial09_matmul_tma_persistent_guarded_epilogue_warp_specialize(clust
     completion_arrive_pos = ttgir.index("ttng.arrive_barrier", store_pos)
     assert completion_wait_pos < epilogue_guard_pos < tmem_load_pos < store_pos < completion_arrive_pos
     assert ("multicast::cluster" in kernel.asm["ptx"]) == clustered
+
+    torch.cuda.synchronize()
+    ref = torch.matmul(a.to(torch.float32), b.T.to(torch.float32)).to(dtype)
+    torch.testing.assert_close(c, ref, atol=0.03, rtol=0.03)
+
+
+# ============================================================================
+# Test 2a-surviving: clustered multicast with a persistent while loop.
+# ============================================================================
+@pytest.mark.skipif(not (is_hopper() or is_blackwell()), reason="Requires Hopper or Blackwell")
+def test_tutorial09_matmul_tma_persistent_guarded_epilogue_surviving_while_autows():
+    block_m = 128
+    block_n = 128
+    block_k = 64
+    cta_group_m = 2
+    cta_group_n = 2
+    M = 5 * block_m
+    N = 3 * block_n
+    K = 256
+    dtype = torch.float16
+    device = "cuda"
+
+    torch.manual_seed(42)
+    a = torch.randn((M, K), dtype=dtype, device=device)
+    b = torch.randn((N, K), dtype=dtype, device=device)
+    c = torch.empty((M, N), dtype=dtype, device=device)
+
+    def alloc_fn(size, align, stream):
+        return torch.empty(size, dtype=torch.int8, device=device)
+
+    triton.set_allocator(alloc_fn)
+    a_desc = TensorDescriptor(a, a.shape, a.stride(), [block_m, block_k])
+    b_desc = TensorDescriptor(b, b.shape, b.stride(), [block_n, block_k])
+    c_desc = TensorDescriptor(c, c.shape, c.stride(), [block_m, block_n])
+
+    with triton.knobs.nvidia.scope():
+        triton.knobs.nvidia.use_meta_ws = True
+        triton.knobs.nvidia.use_meta_partition = True
+        kernel = matmul_kernel_tma_persistent_guarded_epilogue_surviving_while_ws[(cta_group_m, cta_group_n)](
+            a_desc,
+            b_desc,
+            c_desc,
+            M,
+            N,
+            K,
+            BLOCK_SIZE_M=block_m,
+            BLOCK_SIZE_N=block_n,
+            BLOCK_SIZE_K=block_k,
+            CTA_GROUP_M=cta_group_m,
+            CTA_GROUP_N=cta_group_n,
+            num_stages=3,
+            num_warps=4,
+            ctas_per_cga=(cta_group_m, cta_group_n, 1),
+            multicast=True,
+        )
+
+    ttir = kernel.asm["ttir"]
+    ttir_dot_pos = ttir.index("tt.dot")
+    ttir_guard_pos = ttir.index("scf.if", ttir_dot_pos)
+    assert "scf.while" in ttir
+    assert ttir_dot_pos < ttir_guard_pos
+
+    ttgir = kernel.asm["ttgir"]
+    assert "scf.while" in ttgir
+    assert "ttg.warp_specialize" in ttgir
+    assert "ttng.tc_gen5_mma" in ttgir or "ttng.warp_group_dot" in ttgir
+    assert "ttng.async_tma_copy_global_to_local" in ttgir
+    assert "multicast::cluster" in kernel.asm["ptx"]
 
     torch.cuda.synchronize()
     ref = torch.matmul(a.to(torch.float32), b.T.to(torch.float32)).to(dtype)
