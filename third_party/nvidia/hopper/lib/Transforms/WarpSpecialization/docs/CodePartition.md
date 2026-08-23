@@ -65,6 +65,21 @@ Step 4:   separateLocalAllocWithSrc   — split local_alloc(src) → alloc + sto
 
 ## Channel Discovery
 
+## Compiler-Selected TMA Multicast
+
+The standard Triton multicast planner annotates eligible descriptor loads before
+warp-specialization lowering. Native warp specialization preserves the plan,
+groups loads by broadcast axes, and brackets each multicast transaction with
+full-cluster rendezvous.
+
+On Hopper, Meta AutoWS preserves the same plan through NVWS channels. Channel
+construction allocates cluster-wide reuse and consumer-ready barriers, and
+memory lowering executes those rendezvous in the participating task partitions
+before buffer reuse. Blackwell AutoWS currently falls back to per-CTA TMA
+because a multicast issued from its worker partition does not reliably complete
+the remote CTA barriers. Incompatible multicast axes also fall back to per-CTA
+TMA.
+
 ### `collectAsyncChannels`
 
 Walks the function to find all cross-partition data dependencies:

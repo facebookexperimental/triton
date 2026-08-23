@@ -56,6 +56,7 @@ module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32} {
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
   // CHECK-LABEL: wait_barrier
   tt.func @wait_barrier(%alloc: !ttg.memdesc<1xi64, #shared0, #smem>, %phase: i32, %pred: i1) {
+    // An absent predicate is the canonical unconditional form.
     // CHECK: waitLoop:
     // CHECK: mbarrier.try_wait.parity.shared::cta.b64
     // CHECK: @!complete bra.uni waitLoop
@@ -64,6 +65,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
     ttng.wait_barrier %alloc, %phase : !ttg.memdesc<1xi64, #shared0, #smem>
     %true = arith.constant true
 
+    // Explicit true is equivalent but intentionally not required by builders.
     // CHECK: waitLoop:
     // CHECK: mbarrier.try_wait.parity.shared::cta.b64
     // CHECK: @!complete bra.uni waitLoop
@@ -224,10 +226,47 @@ module attributes {"ttg.cluster-dim-x" = 2 : i32, "ttg.num-ctas" = 2 : i32, "ttg
 
 // -----
 
+#shared0 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0], CGALayout = [[1], [2]]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 2 : i32, "ttg.num-ctas" = 4 : i32, "ttg.num-warps" = 4 : i32} {
+  // CHECK-LABEL: arrive_barrier_multicast_2d
+  // CHECK: [[FALLBACK_PRED:%.*]] = llvm.and {{.*}}, %arg1
+  // CHECK: mbarrier.arrive.release.cluster.shared::cluster.b64 _, [${{.*}}], 3;{{.*}}[[FALLBACK_PRED]]
+  // CHECK: mbarrier.arrive.release.cluster.shared::cluster.b64 _, [${{.*}}], 3;{{.*}}[[FALLBACK_PRED]]
+  // CHECK: mbarrier.arrive.release.cluster.shared::cluster.b64 _, [${{.*}}], 3;{{.*}}[[FALLBACK_PRED]]
+  // CHECK: mbarrier.arrive.release.cluster.shared::cluster.b64 _, [${{.*}}], 3;{{.*}}[[FALLBACK_PRED]]
+  // CHECK-NOT: mbarrier.arrive.release.cluster.shared::cluster.b64
+  // CHECK-NOT: multicast::cluster::32b
+  // RUBIN-PTX87-LABEL: arrive_barrier_multicast_2d
+  // RUBIN-PTX87: [[FALLBACK_PRED:%.*]] = llvm.and {{.*}}, %arg1
+  // RUBIN-PTX87: mbarrier.arrive.release.cluster.shared::cluster.b64 _, [${{.*}}], 3;{{.*}}[[FALLBACK_PRED]]
+  // RUBIN-PTX87: mbarrier.arrive.release.cluster.shared::cluster.b64 _, [${{.*}}], 3;{{.*}}[[FALLBACK_PRED]]
+  // RUBIN-PTX87: mbarrier.arrive.release.cluster.shared::cluster.b64 _, [${{.*}}], 3;{{.*}}[[FALLBACK_PRED]]
+  // RUBIN-PTX87: mbarrier.arrive.release.cluster.shared::cluster.b64 _, [${{.*}}], 3;{{.*}}[[FALLBACK_PRED]]
+  // RUBIN-PTX87-NOT: mbarrier.arrive.release.cluster.shared::cluster.b64
+  // RUBIN-PTX87-NOT: multicast::cluster::32b
+  // RUBIN-LABEL: arrive_barrier_multicast_2d
+  // RUBIN: [[NATIVE_PRED:%.*]] = llvm.and {{.*}}, %arg1
+  // RUBIN: [[NATIVE_MASK_BASE:%.*]] = llvm.mlir.constant(15 : i32) : i32
+  // RUBIN: [[NATIVE_MASK:%.*]] = llvm.shl [[NATIVE_MASK_BASE]], %{{.*}} : i32
+  // RUBIN: mbarrier.arrive.release.cluster.shared::cluster.multicast::cluster::32b.b64 _, [$1], 3, $2;{{.*}}[[NATIVE_PRED]]{{.*}}[[NATIVE_MASK]]
+  // RUBIN-NOT: mbarrier.arrive.release.cluster.shared::cluster.multicast::cluster::32b.b64
+  // RUBIN-NOT: mbarrier.arrive.release.cluster.shared::cluster.b64
+  tt.func public @arrive_barrier_multicast_2d(%alloc: !ttg.memdesc<4xi64, #shared0, #smem, mutable>, %pred: i1) {
+    ttng.init_barrier %alloc, 4 : !ttg.memdesc<4xi64, #shared0, #smem, mutable>
+    ttng.arrive_barrier %alloc, 3, %pred {ctaMask = 3 : i32} : !ttg.memdesc<4xi64, #shared0, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
 #shared0 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
 #smem = #ttg.shared_memory
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
   // CHECK-LABEL: async_clc_try_cancel
+  // RUBIN-PTX87-LABEL: async_clc_try_cancel
+  // RUBIN-LABEL: async_clc_try_cancel
   // CHECK: clusterlaunchcontrol.try_cancel.async.shared::cta.mbarrier::complete_tx::bytes.multicast::cluster::all.b128
   tt.func @async_clc_try_cancel(%alloc: !ttg.memdesc<1xi64, #shared0, #smem, mutable>, %clc_response: !ttg.memdesc<1xui128, #shared0, #smem, mutable>) {
     ttng.async_clc_try_cancel %alloc, %clc_response : !ttg.memdesc<1xi64, #shared0, #smem, mutable>, !ttg.memdesc<1xui128, #shared0, #smem, mutable>
@@ -1185,6 +1224,34 @@ module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, ttg.shar
       // CHECK: llvm.and %[[NEXT_COUNTER]]
       // CHECK: st.shared.b32
       // CHECK: nvvm.barrier
+      ttng.cluster_barrier
+      ttg.warp_yield
+    }
+    partition0() num_warps(4) {
+      ttg.warp_return
+    } : () -> ()
+    tt.return
+  }
+}
+
+// -----
+
+module attributes {
+  "ttg.cluster-dim-x" = 2 : i32,
+  "ttg.cluster-dim-y" = 4 : i32,
+  "ttg.cluster-dim-z" = 1 : i32,
+  "ttg.num-ctas" = 1 : i32,
+  "ttg.num-warps" = 4 : i32,
+  ttg.shared = 0 : i32,
+  "ttg.threads-per-warp" = 32 : i32
+} {
+  // CHECK-LABEL: @cluster_barrier_inside_warp_specialize_physical_cluster
+  // CHECK-COUNT-2: mbarrier.init.shared::cta.b64 [$1], 7;
+  // CHECK: llvm.mlir.constant(7 : i32)
+  // CHECK: mbarrier.arrive.release.cluster.shared::cluster.b64
+  tt.func @cluster_barrier_inside_warp_specialize_physical_cluster() {
+    ttg.warp_specialize()
+    default {
       ttng.cluster_barrier
       ttg.warp_yield
     }

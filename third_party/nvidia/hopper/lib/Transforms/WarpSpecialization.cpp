@@ -150,6 +150,11 @@ public:
 
     OpBuilder builder(funcOp);
     auto moduleOp = funcOp->getParentOfType<ModuleOp>();
+    if (triton::gpu::TritonGPUDialect::getNumCTAs(moduleOp) != 1) {
+      LDBG("Warp specialization does not support logical multi-CTA kernels. "
+           "Skipping.");
+      return bailOut(funcOp);
+    }
     // FIXME: skip data partitioning for Blackwell.
     bool isBlackwell = capabilityIsBlackwell(capability);
     unsigned numWarpGroups =
@@ -284,7 +289,10 @@ public:
       dumpAfter(moduleOp, "doValidateTMAStoreAnnotations");
     }
 
-    doCodePartition(funcOp, numStages);
+    if (failed(doCodePartition(funcOp, numStages))) {
+      signalPassFailure();
+      return;
+    }
     dumpAfter(moduleOp, "doCodePartition");
 
     if (pingpongAutoWS) {

@@ -127,7 +127,9 @@ def TritonNvidiaGPUTMALoweringPass : Pass<"triton-nvidia-tma-lowering", "mlir::M
   }];
 
   let dependentDialects = [
-    "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"
+    "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect",
+    "mlir::triton::nvgpu::NVGPUDialect",
+    "mlir::arith::ArithDialect"
   ];
 }
 

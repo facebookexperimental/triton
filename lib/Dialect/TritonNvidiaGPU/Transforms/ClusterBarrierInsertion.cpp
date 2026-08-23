@@ -99,7 +99,7 @@ usesTrackedBarrierInCrossCTAConsumerOp(Operation *op,
     return ttng::getModuleTwoCTAs(op) && aliasesTracked(commit.getBarrier());
   }
   if (auto tma = dyn_cast<ttng::AsyncTMACopyGlobalToLocalOp>(op)) {
-    return tma.getMulticast() && !tma.getMulticastTargets() &&
+    return (tma.getMulticast() || tma.getMulticastTargets()) &&
            aliasesTracked(tma.getBarrier());
   }
   if (auto tma = dyn_cast<ttng::AsyncTMAGatherOp>(op)) {
@@ -421,7 +421,7 @@ void runClusterBarrierInsertion(ModuleAllocation &moduleAllocation,
   ModuleOp mod = moduleAllocation.getModuleOp();
   if (computeCapability < 90)
     return;
-  if (ttg::TritonGPUDialect::getNumCTAs(mod) == 1)
+  if (ttg::lookupPhysicalNumCTAs(mod) == 1)
     return;
 
   MembarFilterFn filterFn = [](Operation *lhs, Operation *rhs, bool lhsIsRead,
@@ -446,8 +446,11 @@ runCrossCTAMBarrierInitSyncInsertion(ModuleAllocation &moduleAllocation,
   ModuleOp mod = moduleAllocation.getModuleOp();
   if (computeCapability < 90)
     return success();
+  // Keep the logical count here so an explicit ctas_per_cga shape does not
+  // make every local barrier cross-CTA. Tracked remote and multicast uses are
+  // classified independently by requiresCrossCTAMBarrierInitSync.
   int numCTAs = ttg::TritonGPUDialect::getNumCTAs(mod);
-  if (numCTAs == 1)
+  if (ttg::lookupPhysicalNumCTAs(mod) == 1)
     return success();
 
   LogicalResult status = success();

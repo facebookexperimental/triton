@@ -8,6 +8,7 @@
 #include "mlir/Interfaces/FunctionInterfaces.h"
 #include "mlir/Support/LLVM.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
+#include "triton/Dialect/Triton/IR/TMAMulticast.h"
 #include "triton/Dialect/Triton/IR/Types.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "llvm/Support/ErrorHandling.h"
@@ -1911,6 +1912,10 @@ LogicalResult verifyDescriptorLoadStoreOp(Operation *op,
 }
 
 LogicalResult DescriptorLoadOp::verify() {
+  if (failed(verifyTMAMulticastAxes(
+          getOperation(), getOperation()->getAttrOfType<DenseI32ArrayAttr>(
+                              kMulticastAxesAttrName))))
+    return failure();
   return verifyDescriptorLoadStoreOp(*this, getDesc().getType(), getType());
 }
 

@@ -18,6 +18,7 @@
 #include "nvidia/include/Dialect/NVGPU/IR/Dialect.h"
 #include "nvidia/include/Dialect/NVWS/IR/Dialect.h"
 #include "triton/Analysis/Utility.h"
+#include "triton/Dialect/Triton/IR/TMAMulticast.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h"
@@ -191,6 +192,14 @@ Value getTMALoadBufferForStage(OpBuilderWithAsyncTaskIds &builder, Value buffer,
   return createBufferView(builder, currentView.getSrc(), bufferIdx);
 }
 
+Value ensureI32Phase(OpBuilderWithAsyncTaskIds &builder, Location loc,
+                     Value phase) {
+  if (phase.getType().isInteger(32))
+    return phase;
+  return builder.createWithAsyncTaskIds<arith::ExtUIOp>(
+      loc, builder.getI32Type(), phase);
+}
+
 } // namespace
 
 static Value mapBarrierTo2CTALeader(OpBuilderWithAsyncTaskIds &builder,
@@ -248,20 +257,63 @@ static TwoCTAPairRank buildTwoCTAPairRank(OpBuilderWithAsyncTaskIds &builder,
   return rank;
 }
 
-Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
-                            SmallVector<ttnvws::DescriptorLoadOp> &tmaLoads,
-                            Value barrierAlloc, Value bufferIdx,
-                            Value bufferIdxExtract, Value phase,
-                            Operation *headProducer, Operation *headConsumer,
-                            Operation *headConsumerSameLevel,
-                            ArrayRef<int> additionalConsumerTaskIds,
-                            DictionaryAttr consumerWaitConstraints) {
+static void createMulticastRendezvous(OpBuilderWithAsyncTaskIds &builder,
+                                      Location loc, Value barrierAlloc,
+                                      Value bufferIdx, Value phase,
+                                      Operation *clusterOp) {
+  auto module = clusterOp->getParentOfType<ModuleOp>();
+  auto dims = ttg::TritonGPUDialect::getClusterDims(module);
+  unsigned clusterSize = product(dims);
+  assert(clusterSize > 1 && llvm::isPowerOf2_32(clusterSize));
+
+  Value barrier =
+      getBarrierForPipelineStage(builder, barrierAlloc, bufferIdx);
+  builder.createWithAsyncTaskIds<ttng::ArriveBarrierOp>(
+      loc, barrier, /*count=*/1, /*ctaMask=*/clusterSize - 1,
+      /*pred=*/Value());
+  phase = ensureI32Phase(builder, loc, phase);
+  builder.createWithAsyncTaskIds<ttng::WaitBarrierOp>(loc, barrier, phase);
+}
+
+LogicalResult
+optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
+                 SmallVector<ttnvws::DescriptorLoadOp> &tmaLoads,
+                 Value barrierAlloc, Value multicastReuseBarrier,
+                 const DenseMap<int, Value> &multicastReadyBarriers,
+                 Value bufferIdx, Value bufferIdxExtract, Value phase,
+                 Operation *headProducer, Operation *headConsumerSameLevel,
+                 ArrayRef<int> consumerTaskIds,
+                 DictionaryAttr consumerWaitConstraints) {
   // Callers group at least one load behind each fused barrier. Make the
   // precondition explicit instead of dereferencing front() blind below.
   if (tmaLoads.empty())
-    return nullptr;
+    return success();
 
   auto loc = barrierAlloc.getLoc();
+
+  bool hasMulticast = llvm::any_of(
+      tmaLoads,
+      [](auto load) { return load->hasAttr(tt::kMulticastAxesAttrName); });
+  if (hasMulticast) {
+    if (!multicastReuseBarrier) {
+      headProducer->emitError(
+          "multicast TMA producer is missing its reuse rendezvous");
+      return failure();
+    }
+    if (consumerTaskIds.empty()) {
+      headProducer->emitError(
+          "multicast TMA producer has no canonical consumer tasks");
+      return failure();
+    }
+    for (int taskId : consumerTaskIds) {
+      if (!multicastReadyBarriers.count(taskId)) {
+        headProducer->emitError("missing multicast ready barrier for consumer "
+                                "task ")
+            << taskId;
+        return failure();
+      }
+    }
+  }
 
   // Compute the total size of the loads.
   // A cooperative two-CTA load moves the pair's bytes through the leader's
@@ -275,7 +327,7 @@ Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
       })) {
     tmaLoads.front().emitError(
         "TMA barrier fusion cannot mix cooperative and per-CTA loads");
-    return nullptr;
+    return failure();
   }
   for (auto tmaLoad : tmaLoads) {
     bool cooperative = tmaLoad->hasAttr(ttng::AttrTwoCTALoadName);
@@ -303,8 +355,12 @@ Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
   builder.createWithAsyncTaskIds<ttng::BarrierExpectOp>(
       loc, prodBarrier, sizeInBytes, expectPred);
 
+  if (hasMulticast) {
+    createMulticastRendezvous(builder, loc, multicastReuseBarrier, bufferIdx,
+                              phase, headProducer);
+  }
+
   // Convert all the producers to async_tma_copy_global_to_local
-  Operation *copy = nullptr;
   for (auto tmaLoad : tmaLoads) {
     builder.setInsertionPoint(tmaLoad);
     builder.setAsyncTaskIdsFromOp(tmaLoad);
@@ -317,24 +373,19 @@ Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
             tmaBarrier, pipelineBuffer, pred);
     if (tmaLoad->hasAttr(ttng::AttrTwoCTALoadName))
       copyOp.setTwoCta(true);
-    copy = copyOp;
+    if (Attribute axes = tmaLoad->getAttr(tt::kMulticastAxesAttrName))
+      copyOp->setAttr(tt::kMulticastAxesAttrName, axes);
   }
 
   // Create a wait_barrier before the first consumer.
   // For data-partitioned channels, shared ops (consBarrier, phase, pred)
   // need ALL consumer task IDs so they survive specializeRegion.
   builder.setInsertionPoint(headConsumerSameLevel);
-  SmallVector<int> consumerTaskIds;
-  for (int id : getAsyncTaskIds(headConsumer))
-    consumerTaskIds.push_back(id);
-  for (int id : additionalConsumerTaskIds)
-    consumerTaskIds.push_back(id);
   builder.setAsynTaskIdsFromArray(consumerTaskIds);
   builder.setLoopScheduleInfoFromOp(headConsumerSameLevel);
   auto consBarrier =
       getBarrierForPipelineStage(builder, barrierAlloc, bufferIdxExtract);
-  phase = builder.createWithAsyncTaskIds<arith::ExtUIOp>(
-      loc, builder.getI32Type(), phase);
+  phase = ensureI32Phase(builder, loc, phase);
   Value waitPred =
       builder.createWithAsyncTaskIds<arith::ConstantIntOp>(loc, 1, 1);
   Value followerWaitPred;
@@ -348,31 +399,19 @@ Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
     peerBarrier = mapBarrierTo2CTAPeer(builder, loc, consBarrier, rank.ctaId);
   }
 
-  // Create one WaitBarrierOp per consumer task ID.
-  builder.setAsyncTaskIdsFromOp(headConsumer);
-  builder.createWithAsyncTaskIds<ttng::WaitBarrierOp>(
-      loc, consBarrier, phase, waitPred, /*deps=*/ValueRange{},
-      consumerWaitConstraints);
-  if (twoCTA) {
-    // The hardware CTA-group TMA transaction completes the leader's local
-    // mbarrier. Relay that completion to the follower's corresponding local
-    // barrier, then let the follower wait on it. A cluster barrier is not
-    // valid here: only this warp-specialized consumer partition executes the
-    // handoff, while cluster barriers require participation from every warp.
-    builder.createWithAsyncTaskIds<ttng::FenceAsyncSharedOp>(
-        loc, /*bCluster=*/false);
-    builder.createWithAsyncTaskIds<ttng::ArriveBarrierOp>(
-        loc, peerBarrier, /*count=*/1, waitPred);
-    builder.createWithAsyncTaskIds<ttng::WaitBarrierOp>(
-        loc, consBarrier, phase, followerWaitPred, /*deps=*/ValueRange{},
-        consumerWaitConstraints);
-  }
-  for (int extraTaskId : additionalConsumerTaskIds) {
-    builder.setAsynTaskIdsFromArray({extraTaskId});
+  // Create one wait, and for multicast one ready rendezvous, per canonical
+  // terminal-consumer task.
+  for (int taskId : consumerTaskIds) {
+    builder.setAsynTaskIdsFromArray({taskId});
     builder.createWithAsyncTaskIds<ttng::WaitBarrierOp>(
         loc, consBarrier, phase, waitPred,
         /*deps=*/ValueRange{}, consumerWaitConstraints);
     if (twoCTA) {
+      // The hardware CTA-group TMA transaction completes the leader's local
+      // mbarrier. Relay that completion to the follower's corresponding local
+      // barrier, then let the follower wait on it. A cluster barrier is not
+      // valid here: only this warp-specialized consumer partition executes the
+      // handoff, while cluster barriers require participation from every warp.
       builder.createWithAsyncTaskIds<ttng::FenceAsyncSharedOp>(
           loc, /*bCluster=*/false);
       builder.createWithAsyncTaskIds<ttng::ArriveBarrierOp>(
@@ -381,12 +420,17 @@ Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
           loc, consBarrier, phase, followerWaitPred, /*deps=*/ValueRange{},
           consumerWaitConstraints);
     }
+    if (hasMulticast)
+      createMulticastRendezvous(builder, loc,
+                                multicastReadyBarriers.lookup(taskId),
+                                bufferIdxExtract, phase,
+                                headConsumerSameLevel);
   }
 
   for (auto tmaLoad : tmaLoads)
     tmaLoad.erase();
   builder.clearLoopScheduleInfo();
-  return copy;
+  return success();
 }
 
 } // namespace mlir

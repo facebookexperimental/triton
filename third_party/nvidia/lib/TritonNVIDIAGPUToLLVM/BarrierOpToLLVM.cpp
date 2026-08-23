@@ -40,8 +40,6 @@ using namespace mlir::triton;
 namespace ttg = mlir::triton::gpu;
 namespace ttng = mlir::triton::nvidia_gpu;
 
-namespace ttg = mlir::triton::gpu;
-
 void mlir::triton::NVIDIA::createFenceMBarrierInitReleaseCluster(
     OpBuilder &builder, Location loc, Value pred) {
   PTXBuilder ptxBuilder;
@@ -71,6 +69,12 @@ PhysicalClusterInfo getPhysicalClusterInfo(Operation *op) {
   if (explicitSize > 1)
     return {std::move(dims), explicitSize, numCTAs == 1};
   return {{numCTAs, 1, 1}, numCTAs, false};
+}
+
+static unsigned getBarrierNumCTAs(ttg::MemDescType barrierTy) {
+  auto cgaLayout = ttg::getCGALayout(barrierTy.getEncoding());
+  auto kBlock = StringAttr::get(barrierTy.getContext(), "block");
+  return cgaLayout.getLinearLayout().getInDimSize(kBlock);
 }
 
 Value getElectWarp0OrThread0(const NVIDIA::TargetInfo &targetInfo,
@@ -172,7 +176,7 @@ struct InitBarrierOpConversion
             LLVM::NVIDIA::getLeaderCTAPredicate(loc, rewriter, barrierTy))
       pred = b.and_(pred, *leaderPred);
 
-    auto numCTAs = triton::gpu::lookupNumCTAs(op);
+    auto numCTAs = getBarrierNumCTAs(barrierTy);
     auto initCount = op.getCount();
     // The lead barrier accounts for all arrives from CTAs that broadcast into
     // the same barrier.
@@ -295,10 +299,13 @@ struct WaitBarrierOpConversion
     auto ctx = op.getContext();
     auto loc = op.getLoc();
     auto b = TritonLLVMOpBuilder(loc, rewriter);
+    // Optional predicates use a null Value to represent an unconditional op.
+    // Preserve that canonical form unless the barrier layout requires a leader
+    // CTA; in that case an absent user predicate becomes the leader predicate.
     auto pred = adaptor.getPred();
     if (auto leaderPred =
             LLVM::NVIDIA::getLeaderCTAPredicate(loc, rewriter, barrierTy))
-      pred = b.and_(pred, *leaderPred);
+      pred = pred ? b.and_(pred, *leaderPred) : *leaderPred;
 
     bool predicated = pred && !matchPattern(pred, m_NonZero());
     int suspendNs = 0;

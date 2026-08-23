@@ -1,4 +1,5 @@
 // RUN: triton-opt %s --triton-nvidia-plan-tma-multicast | FileCheck %s
+// RUN: triton-opt %s --triton-nvidia-plan-tma-multicast --triton-nvidia-tma-lowering | FileCheck %s --check-prefix=LOWERING
 
 #shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
 #blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [1, 4], order = [1, 0]}>
@@ -144,6 +145,20 @@ module attributes {
       %v = tt.descriptor_load %a[%x, %c0] {multicast = true} : !tt.tensordesc<128x64xf16, #shared> -> tensor<128x64xf16, #blocked>
     }
     tt.return
+  }
+
+  // LOWERING-LABEL: @lowering_preserves_plan
+  // CHECK-LABEL: @lowering_preserves_plan
+  tt.func public @lowering_preserves_plan(
+      %b: !tt.tensordesc<128x64xf16, #shared>) -> tensor<128x64xf16, #blocked> {
+    %y = tt.get_program_id y : i32
+    %k = arith.constant 0 : i32
+    // CHECK: tt.descriptor_load {{.*}}tt.multicast_axes = array<i32: 0>}
+    // LOWERING: ttng.cluster_barrier
+    // LOWERING: arith.cmpi eq
+    // LOWERING: ttng.async_tma_copy_global_to_local {{.*}}tt.multicast_axes = array<i32: 0>}
+    %bv = tt.descriptor_load %b[%y, %k] {multicast = true} : !tt.tensordesc<128x64xf16, #shared> -> tensor<128x64xf16, #blocked>
+    tt.return %bv : tensor<128x64xf16, #blocked>
   }
 
   // CHECK-LABEL: @clc_cluster_schedule

@@ -176,9 +176,18 @@ struct ReuseConfig {
 
 struct CommChannel {
   DenseMap<int, Value> tokens;
+  // Canonical terminal-consumer task IDs shared by barrier allocation and
+  // lowering. Do not reconstruct this set from a boundary/head op, whose task
+  // annotation may include non-consuming partitions.
+  SmallVector<int> consumerTaskIds;
   // Producer barrier is only needed when the producer op itself can update the
   // barrier inline, such as the TMA load.
   std::optional<Value> producerBarrier;
+  // Full-cluster rendezvous used before a multicast producer reuses a slot.
+  std::optional<Value> multicastReuseBarrier;
+  // Each consumer partition needs an independent ready rendezvous after the
+  // multicast completion wait.
+  DenseMap<int, Value> multicastReadyBarriers;
   // Consumer barrier is only needed when the consumer op itself can update the
   // barrier inline, such as MMAv5 ops.
   DenseMap<int, Value> consumerBarriers;
@@ -308,13 +317,14 @@ void getBufferIdxAndPhase(OpBuilderWithAsyncTaskIds &builder, Operation *op,
 Value getBarrierForPipelineStage(OpBuilderWithAsyncTaskIds &builder,
                                  Value barrierAlloc, Value bufferIdx);
 
-Operation *
+LogicalResult
 optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
                  SmallVector<triton::nvws::DescriptorLoadOp> &tmaLoads,
-                 Value barrierAlloc, Value bufferIdx, Value bufferIdxExtract,
-                 Value phase, Operation *headProducer, Operation *headConsumer,
-                 Operation *headConsumerSameLevel,
-                 ArrayRef<int> additionalConsumerTaskIds = {},
+                 Value barrierAlloc, Value multicastReuseBarrier,
+                 const DenseMap<int, Value> &multicastReadyBarriers,
+                 Value bufferIdx, Value bufferIdxExtract, Value phase,
+                 Operation *headProducer, Operation *headConsumerSameLevel,
+                 ArrayRef<int> consumerTaskIds,
                  DictionaryAttr consumerWaitConstraints = {});
 void specializeRegion(triton::FuncOp funcOp, unsigned requestedRegisters);
 Value createBufferView(OpBuilderWithAsyncTaskIds &builder, Value alloc,
