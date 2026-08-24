@@ -962,6 +962,39 @@ def _fwd_control_tile(
 
 
 @triton.jit
+def _fwd_load_first_k_tile(
+    accum_cnt_k,
+    lo,
+    hi,
+    kv_offset_y,
+    desc_k,
+    k_tiles,
+    k_fulls,
+    k_empties,
+    K_BYTES_PER_ELEM: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    NUM_BUFFERS_KV: tl.constexpr,
+    cluster_cta_rank,
+    NUM_CTAS: tl.constexpr,
+):
+    buf, phase = get_bufidx_phase(accum_cnt_k, NUM_BUFFERS_KV)
+    tlx.barrier_wait(k_empties[buf], phase ^ 1)
+    if cluster_cta_rank == 0:
+        tlx.barrier_expect_bytes(
+            k_fulls[buf], K_BYTES_PER_ELEM * BLOCK_N * HEAD_DIM
+        )
+    tlx.async_descriptor_load(
+        desc_k,
+        k_tiles[buf],
+        [kv_offset_y + cluster_cta_rank * (BLOCK_N // NUM_CTAS), 0],
+        k_fulls[buf],
+        two_ctas=True,
+    )
+    return accum_cnt_k + (hi - lo) // BLOCK_N
+
+
+@triton.jit
 def _fwd_load_tile(
     tile_count,
     accum_cnt_kv,
@@ -992,6 +1025,7 @@ def _fwd_load_tile(
     v_empties=None,
     NUM_GROUPS_PER_CTA: tl.constexpr = 2,
     NUM_CTAS: tl.constexpr = 1,
+    SKIP_FIRST_K: tl.constexpr = False,
 ):
     USE_2CTA: tl.constexpr = NUM_CTAS == 2
     # load q0
@@ -1007,7 +1041,25 @@ def _fwd_load_tile(
                 [qo_offset_y + (group_id * NUM_CTAS + cluster_cta_rank) * BLOCK_M_SPLIT, 0],
                 q_fulls[q_id], two_ctas=True,
             )
-        for _ in tl.range(lo, hi, BLOCK_N):
+        if SKIP_FIRST_K:
+            buf, phase = get_bufidx_phase(accum_cnt_kv, NUM_BUFFERS_KV)
+            tlx.barrier_wait(v_empties[buf], phase ^ 1)
+            if cluster_cta_rank == 0:
+                tlx.barrier_expect_bytes(
+                    v_fulls[buf], V_BYTES_PER_ELEM * BLOCK_N * HEAD_DIM
+                )
+            tlx.async_descriptor_load(
+                desc_v,
+                v_tiles[buf],
+                [kv_offset_y, cluster_cta_rank * (HEAD_DIM // NUM_CTAS)],
+                v_fulls[buf],
+                two_ctas=True,
+            )
+            kv_offset_y += BLOCK_N
+            accum_cnt_kv += 1
+
+        loop_start = lo + BLOCK_N if SKIP_FIRST_K else lo
+        for _ in tl.range(loop_start, hi, BLOCK_N):
             buf, phase = get_bufidx_phase(accum_cnt_kv, NUM_BUFFERS_KV)
             tlx.barrier_wait(kv_empties[buf], phase ^ 1)
             tlx.barrier_wait(v_empties[buf], phase ^ 1)
@@ -1833,6 +1885,42 @@ def _attn_fwd_ws_kernel(sm_scale, M,  #
                     tile_id = tlx.clc_consumer(clc_context, clc_phase_consumer)
                     clc_phase_consumer ^= 1
 
+        # Use the otherwise idle sixteenth warp to publish K0 independently.
+        if USE_2CTA and USE_FAST_FIXED:
+            with tlx.async_task(num_warps=1, registers=24):
+                accum_cnt_k = 0
+                tile_id = start_pid
+                while tile_id != -1:
+                    _, _, lo, hi, _, kv_offset_y = _compute_offsets(
+                        tile_id,
+                        H,
+                        num_pid_n,
+                        num_pid_in_group,
+                        N_CTX,
+                        EFFECTIVE_BLOCK_M,
+                        STAGE,
+                        GROUP_SIZE_N,
+                    )
+                    accum_cnt_k = _fwd_load_first_k_tile(
+                        accum_cnt_k,
+                        lo,
+                        hi,
+                        kv_offset_y,
+                        desc_k,
+                        k_tiles,
+                        k_fulls,
+                        k_empties,
+                        K_BYTES_PER_ELEM,
+                        BLOCK_N,
+                        HEAD_DIM,
+                        NUM_BUFFERS_KV,
+                        cluster_cta_rank,
+                        NUM_CTAS,
+                    )
+                    tlx.named_barrier_wait(15, 64)
+                    next_tile_id = tile_id + persistent_stride
+                    tile_id = tl.where(next_tile_id < num_tiles, next_tile_id, -1)
+
         # Q/K/V loader role; output publication remains in the epilog task.
         with tlx.async_task(num_warps=1, registers=24):
             accum_cnt_kv = 0
@@ -1853,7 +1941,10 @@ def _attn_fwd_ws_kernel(sm_scale, M,  #
                         NUM_BUFFERS_Q, NUM_BUFFERS_KV, cluster_cta_rank,
                         v_tiles, v_fulls, v_empties,
                         NUM_GROUPS_PER_CTA, NUM_CTAS,
+                        SKIP_FIRST_K=USE_FAST_FIXED,
                     )
+                    if USE_FAST_FIXED:
+                        tlx.named_barrier_arrive(15, 64)
                 else:
                     accum_cnt_kv = _fwd_load_tile(
                         tile_count, accum_cnt_kv, lo, hi, qo_offset_y, kv_offset_y,
@@ -1891,13 +1982,28 @@ def _attn_fwd_ws_kernel(sm_scale, M,  #
                         GROUP_SIZE_N,
                     )
                     _, phase = get_bufidx_phase(tile_count, 1)
-                    for cid in tl.static_range(0, NUM_GROUPS_PER_CTA):
-                        group_id = cid * NUM_CTAS + cluster_cta_rank
-                        tlx.barrier_wait(o_fulls[cid], phase)
-                        qo_offset_y_split = qo_offset_y + group_id * BLOCK_M_SPLIT
-                        tlx.async_descriptor_store(desc_o, o_tiles[cid], [qo_offset_y_split, 0])
+                    if USE_2CTA and USE_FAST_FIXED and NUM_GROUPS_PER_CTA == 2:
+                        for cid in tl.static_range(0, NUM_GROUPS_PER_CTA):
+                            group_id = cid * NUM_CTAS + cluster_cta_rank
+                            tlx.barrier_wait(o_fulls[cid], phase)
+                            qo_offset_y_split = qo_offset_y + group_id * BLOCK_M_SPLIT
+                            tlx.async_descriptor_store(
+                                desc_o, o_tiles[cid], [qo_offset_y_split, 0]
+                            )
+                        tlx.async_descriptor_store_wait(1)
+                        tlx.barrier_arrive(o_empties[0])
                         tlx.async_descriptor_store_wait(0)
-                        tlx.barrier_arrive(o_empties[cid])
+                        tlx.barrier_arrive(o_empties[1])
+                    else:
+                        for cid in tl.static_range(0, NUM_GROUPS_PER_CTA):
+                            group_id = cid * NUM_CTAS + cluster_cta_rank
+                            tlx.barrier_wait(o_fulls[cid], phase)
+                            qo_offset_y_split = qo_offset_y + group_id * BLOCK_M_SPLIT
+                            tlx.async_descriptor_store(
+                                desc_o, o_tiles[cid], [qo_offset_y_split, 0]
+                            )
+                            tlx.async_descriptor_store_wait(0)
+                            tlx.barrier_arrive(o_empties[cid])
 
                     tile_count += 1
                     if DIRECT_SCHED:
