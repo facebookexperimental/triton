@@ -4201,8 +4201,16 @@ class _attention(torch.autograd.Function):
         assert ctx.HEAD_DIM in (64, 128), "backward requires head dimension 64 or 128"
         BATCH, N_HEAD, N_CTX = q.shape[:3]
         direct_dq_output = ctx.HEAD_DIM == 128 and N_CTX % 256 == 0
+        bf16_dq_output = (
+            direct_dq_output
+            and q.dtype == torch.bfloat16
+            and not ctx.causal
+        )
         if direct_dq_output:
-            dq = torch.zeros(q.shape, device=q.device, dtype=torch.float32)
+            if bf16_dq_output:
+                dq = torch.zeros(q.shape, device=q.device, dtype=torch.bfloat16)
+            else:
+                dq = torch.zeros(q.shape, device=q.device, dtype=torch.float32)
         else:
             dq = torch.empty(q.shape, device=q.device, dtype=torch.float32)
         dk = torch.empty_like(k)
