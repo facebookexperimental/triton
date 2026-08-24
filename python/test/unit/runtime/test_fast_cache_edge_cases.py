@@ -778,8 +778,9 @@ class TestUnhashableKwargs(TestCase):
 
 # Module-level global referenced by the 2-CTA test kernel → populates
 # used_global_vals → __getitem__ returns the lambda fallback instead of
-# the C proxy, exercising the buggy path.
-_CLUSTER_SCALE = 1.0
+# the C proxy, exercising the buggy path.  Must be a tl.constexpr: @jit'ed
+# functions may only read globals instantiated as constexpr.
+_CLUSTER_SCALE = tl.constexpr(1.0)
 
 
 class TestCtasPerCgaAutotunerSteadyState(TestCase):
