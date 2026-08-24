@@ -150,6 +150,7 @@ class TLXInductorChoices(InductorChoices):
         kernel_options: dict[str, Any],
         sparse_q_block_size: int,
         sparse_kv_block_size: int,
+        mutated_inputs: list[Any] | None = None,
     ) -> list[Any]:
         from .flex_attention_templates import append_tlx_flex
 
@@ -162,6 +163,7 @@ class TLXInductorChoices(InductorChoices):
             kernel_options,
             sparse_q_block_size,
             sparse_kv_block_size,
+            mutated_inputs=mutated_inputs,
         )
         return choices
 
