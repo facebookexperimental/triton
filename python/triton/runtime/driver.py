@@ -22,8 +22,9 @@ def _create_driver() -> DriverBase:
         # CPU must be selected explicitly. Otherwise, a missing GPU would
         # silently fall back to CPU and hide configuration or entitlement
         # failures in GPU workloads.
-        active_drivers = [backend.driver for name, backend in backends.items()
-                          if name != "cpu" and backend.driver.is_active()]
+        active_drivers = [
+            backend.driver for name, backend in backends.items() if name != "cpu" and backend.driver.is_active()
+        ]
         if len(active_drivers) != 1:
             raise RuntimeError(f"{len(active_drivers)} active drivers ({active_drivers}). There should only be one.")
         return active_drivers[0]()
