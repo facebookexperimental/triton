@@ -20,6 +20,22 @@ TorchTLX templates are jinja-based kernel definitions that encode our best-perfo
 
 Our performance strategy operates on two parallel tracks: improving standalone TLX kernels upstream and closing any remaining gap when running through the Inductor template path.
 
+### gfx950 FlexAttention backward
+
+`gfx950_flex_attention_bwd` is an opt-in gfx950-only BF16 candidate for
+FlexAttention backward when Q, K, and V have equal head dimensions of 64 or
+128. It uses the backward `BlockMask` metadata in both orientations:
+KV/FULL_KV for dQ and Q/FULL_Q for dK/dV, including elementwise `mask_mod` for
+partial blocks. The initial configuration is
+`(BLOCK_M1, BLOCK_N1, BLOCK_M2, BLOCK_N2) = (32, 128, 128, 32)` with four
+warps; it uses LDS async loads and scheduled CDNA4 MFMA for dQ.
+
+`TORCHINDUCTOR_TLX_MODE=allow` adds the eligible candidate beside stock choices;
+`force` uses it only when eligible, otherwise retains the stock choice. The
+PyTorch backward lowering must call `append_flex_attention_choices` and provide
+the complete `mutated_inputs` list; without that hook contract, no backward TLX
+candidate is registered.
+
 ## Naming Conventions
 
 Names carry the architecture, because in this codebase "which GPU" is the question
