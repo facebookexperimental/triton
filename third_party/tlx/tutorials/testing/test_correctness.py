@@ -1118,6 +1118,7 @@ def test_blackwell_fa_ws_pipelined_persistent_bwd(
             BLK_SLICE_FACTOR=BLK_SLICE_FACTOR,
             HEAD_DIM=HEAD_DIM,
             STAGE=stage,
+            DQ_STAGE_COUNT=2,
             SCALE_QK_IN_KERNEL=direct_dq_output,
         )
 
