@@ -12,22 +12,33 @@
 namespace mlir::triton::instrument {
 
 struct MemEffectsOpInfo {
-  // Frontier: snapshot thread-visible frontier into barrier tracking.
-  // EffectWrites: track only buffers written by op effects.
-  // None: perform no visibility tracking for the barrier.
+  // Controls which memory effects become visible to a CTA after it waits on
+  // this barrier.
+  //
+  // Frontier snapshots the issuing thread's current visibility frontier into
+  // the barrier. A later wait publishes whatever shared/tensor memory writes
+  // and reads were visible to that logical thread before the arrive/commit. Use
+  // this for ordering operations whose semantics are a release of prior work.
+  //
+  // EffectWrites does not snapshot the whole thread frontier. Instead, it
+  // attaches only the explicit write effects of this op to the barrier. A later
+  // wait publishes those op-local writes and nothing else. Use this for PTX ops
+  // that perform the write and also signal the barrier via
+  // `mbarrier::complete_tx`.
   enum class BarrierTrackingMode {
     Frontier,
     EffectWrites,
-    None,
   };
   struct Effects {
     enum RW { Read, Write } rw;
+    enum class Proxy { Generic, Async } proxy;
     Value buf;
     std::string operandName = "";
     uint32_t length = 0;
 
-    Effects(RW rw, Value buf, std::string operandName = "")
-        : rw(rw), buf(buf), operandName(operandName),
+    Effects(RW rw, Value buf, std::string operandName = "",
+            Proxy proxy = Proxy::Generic)
+        : rw(rw), proxy(proxy), buf(buf), operandName(operandName),
           length(getMemDescLength(buf)) {}
   };
   struct BarrierInfo {
@@ -35,6 +46,7 @@ struct MemEffectsOpInfo {
     Value pred;
     int count;
     BarrierTrackingMode trackingMode = BarrierTrackingMode::Frontier;
+    int txCount = 0;
   };
   enum class TrackingKind {
     None,
@@ -62,10 +74,24 @@ struct BarrierWaitInfo {
   Value pred;
 };
 
+struct BarrierInvalidateInfo {
+  Value alloc;
+};
+
 struct WaitOpInfo {
   CommitKind::Kind commitKind;
   int pendingCount;
   bool transferWrites;
+  bool transferReads;
+};
+
+struct AsyncProxyFenceInfo {
+  bool cluster;
+};
+
+struct CommitKindDesc {
+  CommitKind::Kind kind;
+  std::string operationDesc;
 };
 
 class ConSanTargetHooks {
@@ -73,7 +99,8 @@ public:
   virtual ~ConSanTargetHooks() = default;
 
   virtual bool isTMAOp(Operation *op) const = 0;
-  virtual bool isPostInstrumentedOp(Operation *op) const = 0;
+
+  virtual bool isCLCOp(Operation *op) const { return false; }
 
   virtual std::optional<BarrierInitInfo>
   getBarrierInitInfo(Operation *op) const = 0;
@@ -81,47 +108,83 @@ public:
   virtual std::optional<BarrierWaitInfo>
   getBarrierWaitInfo(Operation *op) const = 0;
 
-  virtual std::optional<WaitOpInfo> getWaitOpInfo(Operation *op) const = 0;
+  virtual std::optional<BarrierInvalidateInfo>
+  getBarrierInvalidateInfo(Operation *op) const = 0;
+
+  virtual std::optional<WaitOpInfo>
+  getWaitOpInfo(Operation *op, const AuxDataMap &auxData) const = 0;
+
+  virtual std::optional<AsyncProxyFenceInfo>
+  getAsyncProxyFenceInfo(Operation *op) const {
+    return std::nullopt;
+  }
+
+  virtual bool needsAsyncProxyFenceTracking(ModuleOp module) const {
+    return false;
+  }
+
+  virtual Value getIssuerCTAPred(ImplicitLocOpBuilder &b,
+                                 Operation *op) const = 0;
 
   virtual std::optional<MemEffectsOpInfo>
   getMemEffectsOpInfo(Operation *op) const {
     namespace ttg = triton::gpu;
-    std::optional<MemEffectsOpInfo> info;
     if (auto copyOp = dyn_cast<ttg::AsyncCopyGlobalToLocalOp>(op)) {
-      info.emplace();
-      info->trackingKind = MemEffectsOpInfo::TrackingKind::CommitCount;
-      info->commitKind = CommitKind::AsyncCp;
-      info->operandEffects.emplace_back(MemEffectsOpInfo::Effects::Write,
-                                        copyOp.getResult());
+      MemEffectsOpInfo info;
+      info.trackingKind = MemEffectsOpInfo::TrackingKind::CommitCount;
+      info.commitKind = CommitKind::AsyncCp;
+      info.operandEffects.emplace_back(MemEffectsOpInfo::Effects::Write,
+                                       copyOp.getResult());
+      return info;
     }
-    if (auto loadOp = dyn_cast<ttg::LocalLoadOp>(op)) {
-      info.emplace();
-      info->trackingKind = MemEffectsOpInfo::TrackingKind::Barrier;
-      info->operandEffects.emplace_back(MemEffectsOpInfo::Effects::Read,
-                                        loadOp.getSrc());
+
+    MemEffectsOpInfo info;
+    info.trackingKind = MemEffectsOpInfo::TrackingKind::Barrier;
+    auto barrierOp = dyn_cast<ttg::MBarrierOpInterface>(op);
+    for (const auto &access : BufferRegionAnalysis::getMemoryAccesses(op)) {
+      if (barrierOp &&
+          llvm::is_contained(barrierOp.getBarriers(), access.value))
+        continue;
+      info.operandEffects.emplace_back(access.isWrite
+                                           ? MemEffectsOpInfo::Effects::Write
+                                           : MemEffectsOpInfo::Effects::Read,
+                                       access.value);
     }
-    if (auto storeOp = dyn_cast<ttg::LocalStoreOp>(op)) {
-      info.emplace();
-      info->trackingKind = MemEffectsOpInfo::TrackingKind::Barrier;
-      info->operandEffects.emplace_back(MemEffectsOpInfo::Effects::Write,
-                                        storeOp.getDst());
-    }
-    if (auto allocOp = dyn_cast<ttg::LocalAllocOp>(op)) {
-      if (allocOp.getSrc()) {
-        info.emplace();
-        info->trackingKind = MemEffectsOpInfo::TrackingKind::Barrier;
-        info->operandEffects.emplace_back(MemEffectsOpInfo::Effects::Write,
-                                          allocOp.getResult());
-      }
-    }
+    if (info.operandEffects.empty())
+      return std::nullopt;
     return info;
+  }
+
+  // Returns commit kinds used by addWriteChecks to detect outstanding
+  // write accesses to shared memory.
+  virtual SmallVector<CommitKindDesc> getOutstandingWriteCommitKinds() const {
+    return {{CommitKind::AsyncCp, "async_copy_global_to_shared"}};
+  }
+
+  // Returns commit kinds used by addReadChecks to detect outstanding
+  // read accesses to shared memory.
+  virtual SmallVector<CommitKindDesc>
+  getOutstandingReadCommitKinds(const AuxDataMap &auxData) const {
+    return {};
+  }
+
+  // Returns true for commit kinds whose ops complete in issue order within a
+  // warp. ConSan's thread model tracks one logical
+  // thread per WS partition, so it cannot distinguish intra-warp ordering from
+  // cross-warp races inside the same partition. For such kinds, the
+  // outstanding-commit check excludes the calling thread's own column, avoiding
+  // intra-partition false positives while still detecting cross-partition
+  // races.
+  virtual bool isOrderedCommitKind(CommitKind::Kind kind) const {
+    return false;
   }
 
   virtual SmallVector<CommitKind::Kind>
   getRequiredCommitKinds(ModuleOp module) const = 0;
 };
 
-void runConcurrencySanitizer(ModuleOp module, const ConSanTargetHooks *hooks);
+LogicalResult runConcurrencySanitizer(ModuleOp module,
+                                      const ConSanTargetHooks &hooks);
 
 using ConSanHooksFactory = std::function<std::unique_ptr<ConSanTargetHooks>()>;
 void registerConSanHooks(llvm::StringRef key, ConSanHooksFactory factory);

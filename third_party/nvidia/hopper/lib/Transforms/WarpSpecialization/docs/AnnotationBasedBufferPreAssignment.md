@@ -31,7 +31,9 @@ tl.dot(k, qT, attrs={
 
 ### Channel Format
 
-Each channel string: `"operand,memoryType,numCopies,bufferId"`
+Each channel string is `"operand,memoryType,numCopies,bufferId"`. TMEM channels
+may add an explicit column offset:
+`"operand,tmem,numCopies,bufferId,bufferOffset"`.
 
 | Field | Values | Description |
 |-------|--------|-------------|
@@ -39,6 +41,7 @@ Each channel string: `"operand,memoryType,numCopies,bufferId"`
 | `memoryType` | `smem`, `tmem` | Memory backing for the channel |
 | `numCopies` | integer | Multi-buffering depth |
 | `bufferId` | integer | Buffer identity; shared IDs form reuse groups |
+| `bufferOffset` | integer (optional, TMEM only) | Column offset within the shared buffer owner; omitted means temporal reuse at offset 0 |
 
 ### MLIR Representation
 
@@ -77,11 +80,11 @@ The `tt.autows` attribute survives through `AccelerateMatmul` (which propagates 
 
 | Operand | Channel Type | Key Field | Memory |
 |---------|-------------|-----------|--------|
-| A | `ChannelPost` (SMEM) or `TmemDataChannelPost` (TMEM) | `operandIdx` / trace through users | smem or tmem |
-| B | `ChannelPost` (SMEM) or `TmemDataChannelPost` (TMEM) | `operandIdx` / trace through users | smem or tmem |
-| D | `TmemDataChannelPost` | `isOperandD = true` | tmem (always) |
-| A scale | `ChannelPost` (SMEM) or `TmemDataChannelPost` (TMEM) | `operandIdx = 4` (`a_scale`) | smem or tmem |
-| B scale | `ChannelPost` (SMEM) or `TmemDataChannelPost` (TMEM) | `operandIdx = 5` (`b_scale`) | smem or tmem |
+| A | `AllocChannel` (SMEM) or `TmemAllocChannel` (TMEM) | `operandIdx` / trace through users | smem or tmem |
+| B | `AllocChannel` (SMEM) or `TmemAllocChannel` (TMEM) | `operandIdx` / trace through users | smem or tmem |
+| D | `TmemAllocChannel` | `isOperandD = true` | tmem (always) |
+| A scale | `AllocChannel` (SMEM) or `TmemAllocChannel` (TMEM) | `operandIdx = 4` (`a_scale`) | smem or tmem |
+| B scale | `AllocChannel` (SMEM) or `TmemAllocChannel` (TMEM) | `operandIdx = 5` (`b_scale`) | smem or tmem |
 
 For `ttng.tc_gen5_mma_scaled`, the fixed operand order is:
 `a=0`, `b=1`, `d=2`, `acc_dep=3`, `a_scale=4`, `b_scale=5`,
@@ -171,10 +174,10 @@ buildAllocToAnnotationMap(
       continue;
 
     StringRef operandName;
-    if (ch->channelKind == DataChannelKind::TMEMPost) {
-      auto *tmemCh = static_cast<ttng::TmemDataChannelPost*>(ch);
+    if (ch->channelKind == DataChannelKind::TMEMAlloc) {
+      auto *tmemCh = static_cast<ttng::TmemAllocChannel*>(ch);
       operandName = tmemCh->isOperandD ? "opndD" : "opndA"; // TODO: distinguish A vs B
-    } else if (ch->channelKind == DataChannelKind::SMEMPost) {
+    } else if (ch->channelKind == DataChannelKind::SMEMAlloc) {
       operandName = "opndA"; // TODO: distinguish A vs B by tracing operand index
     } else {
       continue;
@@ -396,7 +399,7 @@ TMEM: pre-assign buffer.id/buffer.copy/buffer.offset → validate reuse → excl
 
 | Attribute | Set By | Read By | Pre-assigned? |
 |-----------|--------|---------|---------------|
-| `buffer.id` | WSMemoryPlanner (SMEM Phase 5 / TMEM alloc) | `doCodePartitionPost` (reuse group formation) | ✅ From annotation |
+| `buffer.id` | WSMemoryPlanner (SMEM Phase 5 / TMEM alloc) | `doCodePartition` (reuse group formation) | ✅ From annotation |
 | `buffer.copy` | WSMemoryPlanner (SMEM Phase 5 / TMEM alloc) | Buffer allocation, `needAccumCntForReuse` | ✅ From annotation |
 | `buffer.offset` | WSMemoryPlanner (TMEM only) | `replaceBufferReuse` (TMEM column slice) | ✅ Computed from reuse group |
 

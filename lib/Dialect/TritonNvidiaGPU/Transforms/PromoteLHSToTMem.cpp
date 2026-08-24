@@ -6,6 +6,7 @@
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/Passes.h"
+#include "triton/Dialect/TritonNvidiaGPU/Transforms/TMAUtilities.h"
 #include "triton/Tools/Sys/GetEnv.h"
 #include "llvm/Support/JSON.h"
 
@@ -20,36 +21,38 @@ namespace nvidia_gpu {
 
 namespace {
 
+enum class OpndAMemType { Unspecified, SMem, TMem };
+
 /// Extract the memory type for opndA from a tt.autows annotation.
-/// Returns "tmem", "smem", or "" if no annotation or no opndA entry.
-static StringRef getOpndAMemType(Operation *op) {
+static OpndAMemType getOpndAMemType(Operation *op) {
   auto attr = op->getAttrOfType<StringAttr>("tt.autows");
   if (!attr)
-    return "";
+    return OpndAMemType::Unspecified;
   auto parsed = llvm::json::parse(attr.getValue());
   if (!parsed) {
     llvm::consumeError(parsed.takeError());
-    return "";
+    return OpndAMemType::Unspecified;
   }
   auto *obj = parsed->getAsObject();
   if (!obj)
-    return "";
+    return OpndAMemType::Unspecified;
   auto *channelsArr = obj->getArray("channels");
   if (!channelsArr)
-    return "";
+    return OpndAMemType::Unspecified;
   for (auto &elem : *channelsArr) {
     auto str = elem.getAsString();
     if (!str)
       continue;
-    if (str->starts_with("opndA,")) {
-      // Format: "opndA,memType,numCopies,bufferId"
-      auto comma = str->find(',');
-      auto comma2 = str->find(',', comma + 1);
-      if (comma != StringRef::npos && comma2 != StringRef::npos)
-        return str->slice(comma + 1, comma2);
-    }
+    StringRef channel = *str;
+    if (!channel.consume_front("opndA,"))
+      continue;
+    StringRef memType = channel.take_front(channel.find(','));
+    if (memType == "smem")
+      return OpndAMemType::SMem;
+    if (memType == "tmem")
+      return OpndAMemType::TMem;
   }
-  return "";
+  return OpndAMemType::Unspecified;
 }
 
 template <class MMAOpTy>
@@ -78,10 +81,10 @@ public:
     // If annotated as "smem", skip promotion. If "tmem", promote directly
     // (skip the transposed-shared-source heuristic). If no annotation,
     // fall through to the heuristic.
-    StringRef opndAMem = getOpndAMemType(tcGen5MMAOp);
-    if (opndAMem == "smem")
+    const OpndAMemType opndAMem = getOpndAMemType(tcGen5MMAOp);
+    if (opndAMem == OpndAMemType::SMem)
       return failure();
-    bool annotatedTmem = (opndAMem == "tmem");
+    const bool annotatedTmem = opndAMem == OpndAMemType::TMem;
 
     // If the same source value is also allocated and transposed for use as
     // operand A of another gen5 MMA, skip promotion. The transposed path
@@ -115,12 +118,15 @@ public:
     auto accTMemEncoding = dyn_cast<TensorMemoryEncodingAttr>(
         tcGen5MMAOp.getD().getType().getEncoding());
     auto cgaLayout = triton::gpu::getCGALayout(srcLayout);
-    // TMem encoding for A operand is the same as for D (Acc), but packed for
-    // bitwidth=16
+    // TMem encoding for A operand is the same as for D (Acc), with colStride 1,
+    // i.e. densely packed in TMEM.
     unsigned elemBitWidth =
         lhs.getType().getElementType().getIntOrFloatBitWidth();
-    // We don't currently support fp8 (not sure if we can)
-    if (elemBitWidth != 16 && elemBitWidth != 32) {
+    if (!llvm::is_contained({8, 16, 32}, elemBitWidth)) {
+      return failure();
+    }
+    // Padded fp4 operand cannot be trivially promoted to TMEM.
+    if (isFp4Padded(lhs.getType().getEncoding())) {
       return failure();
     }
     const unsigned colStride = 1;

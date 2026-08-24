@@ -7,7 +7,7 @@ import inspect
 import re
 import warnings
 import textwrap
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from types import ModuleType
 from typing import Any, Callable, Dict, Optional, Tuple, Type, Union, Iterable, List
 
@@ -119,6 +119,8 @@ def _check(cond, msg_fn, category=TypeError):
 def _apply_to_tuple_values(value, fn):
     if is_namedtuple(type(value)):
         fields = value._fields
+    elif isinstance(value, builtins.tuple):
+        fields = None
     elif isinstance(value, language.tuple):
         fields = value.type.fields
     else:
@@ -128,6 +130,14 @@ def _apply_to_tuple_values(value, fn):
     vals = [constexpr(v) if v is None else v for v in vals]
     types = [v.type for v in vals]
     return language.tuple(vals, language.tuple_type(types, fields))
+
+
+def normalize_value(value):
+    if isinstance(value, (builtins.tuple, language.tuple)):
+        return _apply_to_tuple_values(value, normalize_value)
+    if _is_triton_value(value):
+        return value
+    return constexpr(value)
 
 
 def flatten_values_to_ir(values: Iterable[base_value]):
@@ -162,6 +172,7 @@ class enter_sub_region:
         # TODO. TLX. mbarrier doesn't define `_unflatten_ir`
         self.liveins = self.generator.lscope.copy()
         self.prev_defs = self.generator.local_defs.copy()
+        self.prev_pending_annotations = dict(self.generator.pending_annotations)
         self.generator.local_defs = {}
         self.used_vars = self.generator.used_vars.copy()
         self.generator.used_vars = set()
@@ -174,6 +185,7 @@ class enter_sub_region:
         self.generator.lscope = self.liveins
         self.generator.local_defs = self.prev_defs
         self.generator.used_vars |= self.used_vars
+        self.generator.pending_annotations = self.prev_pending_annotations
 
 
 # Check if the given syntax node has an "early" return
@@ -322,7 +334,7 @@ class ASTFunction:
         # > add constexpr values to the template
         constants = self.constants
         for path, val in constants.items():
-            set_iterable_path(vals, path, language.constexpr(val))
+            set_iterable_path(vals, path, normalize_value(val))
         return vals
 
 
@@ -360,7 +372,7 @@ class CodeGenerator(ast.NodeVisitor):
         if is_gluon:
             from triton.experimental.gluon.language._semantic import GluonSemantic
 
-            self.builder = gluon_ir.GluonOpBuilder(context)
+            self.builder = gluon_ir.GluonOpBuilder(context, options.arch)
             self.semantic = GluonSemantic(self.builder)
         else:
             from triton.language.semantic import TritonSemantic
@@ -416,6 +428,8 @@ class CodeGenerator(ast.NodeVisitor):
         # name => language.tensor
         self.local_defs: Dict[str, tensor] = {}
         self.used_vars = set()
+        # Bare local annotations such as `x: tl.constexpr`
+        self.pending_annotations: Dict[str, Any] = {}
         self.dereference_name: Callable[[str], Any] = self._define_name_lookup()
         self.fn = None
         # Are we currently visiting an ast.arg's default value?  These have some
@@ -778,11 +792,15 @@ class CodeGenerator(ast.NodeVisitor):
         annotation = self.visit(node.annotation)
         target = self.visit(node.target)
         value = self.visit(node.value)
+        # Bare annotation, without assigment
+        if node.value is None:
+            self.pending_annotations[target] = annotation
+            return None
         # constexpr
         if annotation == constexpr:
             if target in self.lscope:
                 raise ValueError(f"{target} is already defined. constexpr cannot be reassigned.")
-            value = constexpr(value)
+            value = normalize_value(value)
             self.lscope[target] = value
             return self.lscope[target]
         # default: call visit_Assign
@@ -812,14 +830,26 @@ class CodeGenerator(ast.NodeVisitor):
                 value = self.semantic.to_tensor(value)
             return value
 
+        def _sanitize_target_value(target, value):
+            if isinstance(target, ast.Tuple) and isinstance(value, language.tuple):
+                vals = [_sanitize_target_value(elt, val) for elt, val in zip(target.elts, value.values)]
+                vals = [constexpr(val) if val is None else val for val in vals]
+                types = [val.type for val in vals]
+                return language.tuple(vals, language.tuple_type(types, value.type.fields))
+            if isinstance(target, ast.Name):
+                annotation = self.pending_annotations.pop(target.id, None)
+                if annotation == constexpr:
+                    return normalize_value(value)
+            return _sanitize_value(value)
+
         targets = [node.target] if isinstance(node, ast.AnnAssign) else node.targets
         assert len(targets) == 1
         target = targets[0]
         if isinstance(target, ast.Name):
             with self._name_loc_prefix(target.id):
-                values = _sanitize_value(self.visit(node.value))
+                values = _sanitize_target_value(target, self.visit(node.value))
         else:
-            values = _sanitize_value(self.visit(node.value))
+            values = _sanitize_target_value(target, self.visit(node.value))
         self.assignTarget(target, values)
 
     def visit_AugAssign(self, node):
@@ -834,6 +864,11 @@ class CodeGenerator(ast.NodeVisitor):
                 setattr(assign, x, y)
         self.visit(assign)
         return self.visit(lhs)
+
+    def visit_NamedExpr(self, node: ast.NamedExpr):
+        # Named expressions are simple and can only be of the form x := value
+        self.visit_Assign(ast.Assign(targets=[node.target], value=node.value))
+        return self.dereference_name(node.target.id)
 
     def visit_Name(self, node):
         if type(node.ctx) is ast.Store:
@@ -919,6 +954,7 @@ class CodeGenerator(ast.NodeVisitor):
     }
 
     def visit_then_else_blocks(self, node, liveins, then_block, else_block):
+        pending_annotations = self.pending_annotations.copy()
         # then block
         self.builder.set_insertion_point_to_start(then_block)
         self.visit_compound_statement(node.body)
@@ -932,6 +968,7 @@ class CodeGenerator(ast.NodeVisitor):
             self.builder.set_insertion_point_to_start(else_block)
             self.lscope = liveins.copy()
             self.local_defs = {}
+            self.pending_annotations = pending_annotations.copy()
             self.visit_compound_statement(node.orelse)
             else_defs = self.local_defs.copy()
             else_block = self.builder.get_insertion_block()
@@ -1234,6 +1271,37 @@ class CodeGenerator(ast.NodeVisitor):
         return self.visit_compound_statement(node.body)
         # Facebook ends
 
+    def _apply_loop_options(self, loop_op, opts):
+        """Emit the AutoWS/pipelining loop attributes carried by an
+        ``AutoWSLoopOptions`` (``tl.range`` or ``tl.condition``) onto ``loop_op``
+        (an ``scf.for`` or ``scf.while``). The kwarg->attribute contract lives in
+        the ``AutoWSLoopOptions`` field metadata, so ``for`` and ``while`` loops
+        stay identical."""
+        b = self.builder
+        for f in fields(opts):
+            meta = f.metadata.get("loop_attr")
+            if meta is None:
+                continue
+            ir_name, kind = meta
+            value = _unwrap_if_constexpr(getattr(opts, f.name))
+            if kind == "int32":
+                if value is not None:
+                    loop_op.set_attr(ir_name, b.get_int32_attr(value))
+            elif kind == "unit":
+                if value:
+                    loop_op.set_attr(ir_name, b.get_unit_attr())
+            elif kind == "bool":
+                if value:
+                    loop_op.set_attr(ir_name, b.get_bool_attr(True))
+            elif kind == "bool_opt":
+                if value is not None:
+                    loop_op.set_attr(ir_name, b.get_bool_attr(value))
+            elif kind == "licm":
+                if value:
+                    loop_op.set_attr(ir_name, b.get_disable_loop_licm_attr())
+            else:
+                raise ValueError(f"unknown loop_attr kind {kind!r}")
+
     def visit_While(self, node):
         with enter_sub_region(self) as sr:
             liveins, insert_block = sr
@@ -1248,6 +1316,8 @@ class CodeGenerator(ast.NodeVisitor):
             before_block = self.builder.create_block_with_parent(while_op.get_before(), init_tys)
             self.builder.set_insertion_point_to_start(before_block)
             block_args = [before_block.arg(i) for i in range(len(init_handles))]
+            for arg, init in zip(block_args, init_handles):
+                arg.set_loc(init.get_loc())
             condition_args = unflatten_ir_values(block_args, init_fe_tys)
             for name, val in zip(names, condition_args):
                 self.lscope[name] = val
@@ -1255,11 +1325,7 @@ class CodeGenerator(ast.NodeVisitor):
                 self._maybe_set_loc_to_name(val, name)
             cond = self.visit(node.test)
             if isinstance(cond, language.condition):
-                if cond.disable_licm:
-                    while_op.set_attr(
-                        "llvm.loop_annotation",
-                        self.builder.get_disable_loop_licm_attr(),
-                    )
+                self._apply_loop_options(while_op, cond)
                 cond = cond.condition
             self.builder.set_insertion_point_to_end(before_block)
             # create ConditionOp: e.g., scf.condition(%cond) %arg0, %arg1, ...
@@ -1270,6 +1336,8 @@ class CodeGenerator(ast.NodeVisitor):
             # generate loop body
             self.builder.set_insertion_point_to_start(after_block)
             body_handles = [after_block.arg(i) for i in range(len(init_handles))]
+            for arg, init in zip(body_handles, init_handles):
+                arg.set_loc(init.get_loc())
             body_args = unflatten_ir_values(body_handles, init_fe_tys)
             for name, val in zip(names, body_args):
                 self.lscope[name] = val
@@ -1324,22 +1392,9 @@ class CodeGenerator(ast.NodeVisitor):
                 for stmt in node.orelse:
                     ast.NodeVisitor.generic_visit(self, stmt)
             return
-        num_stages = None
-        loop_unroll_factor = None
-        disallow_acc_multi_buffer = False
-        data_partition_factor = None
-        merge_epilogue = False
-        merge_epilogue_to_computation = False
-        merge_correction = False
-        separate_epilogue_store = False
-        tmem_alloc_algo = None
-        smem_alloc_algo = None
-        smem_budget = None
-        smem_circular_reuse = None
-        flatten = False
-        warp_specialize = False
-        multi_cta = False
-        disable_licm = False
+        # The tl.range object carries the AutoWS/pipelining loop options (shared
+        # with tl.condition via AutoWSLoopOptions); builtin range has none.
+        loop_options = None
         if IteratorClass is language.range:
             iterator = IteratorClass(*iter_args, **iter_kwargs)
             # visit iterator arguments
@@ -1348,22 +1403,7 @@ class CodeGenerator(ast.NodeVisitor):
             lb = iterator.start
             ub = iterator.end
             step = iterator.step
-            num_stages = iterator.num_stages
-            loop_unroll_factor = iterator.loop_unroll_factor
-            disallow_acc_multi_buffer = iterator.disallow_acc_multi_buffer
-            data_partition_factor = iterator.data_partition_factor
-            merge_epilogue = iterator.merge_epilogue
-            merge_epilogue_to_computation = iterator.merge_epilogue_to_computation
-            merge_correction = iterator.merge_correction
-            separate_epilogue_store = iterator.separate_epilogue_store
-            tmem_alloc_algo = iterator.tmem_alloc_algo
-            smem_alloc_algo = iterator.smem_alloc_algo
-            smem_budget = iterator.smem_budget
-            smem_circular_reuse = iterator.smem_circular_reuse
-            flatten = iterator.flatten
-            warp_specialize = iterator.warp_specialize
-            multi_cta = iterator.multi_cta
-            disable_licm = iterator.disable_licm
+            loop_options = iterator
         elif IteratorClass is range:
             # visit iterator arguments
             # note: only `range` iterator is supported now
@@ -1416,47 +1456,8 @@ class CodeGenerator(ast.NodeVisitor):
             # create ForOp
             self._set_insertion_point_and_loc(ip, last_loc)
             for_op = self.builder.create_for_op(lb, ub, step, init_handles)
-            if _unwrap_if_constexpr(num_stages) is not None:
-                for_op.set_attr("tt.num_stages", self.builder.get_int32_attr(num_stages))
-            if _unwrap_if_constexpr(loop_unroll_factor) is not None:
-                for_op.set_attr(
-                    "tt.loop_unroll_factor",
-                    self.builder.get_int32_attr(loop_unroll_factor),
-                )
-            if _unwrap_if_constexpr(data_partition_factor) is not None:
-                for_op.set_attr(
-                    "tt.data_partition_factor",
-                    self.builder.get_int32_attr(data_partition_factor),
-                )
-            if disallow_acc_multi_buffer:
-                for_op.set_attr("tt.disallow_acc_multi_buffer", self.builder.get_unit_attr())
-            if flatten:
-                for_op.set_attr("tt.flatten", self.builder.get_unit_attr())
-            if warp_specialize:
-                for_op.set_attr("tt.warp_specialize", self.builder.get_unit_attr())
-            if multi_cta:
-                for_op.set_attr("tt.multi_cta", self.builder.get_unit_attr())
-            if merge_epilogue:
-                for_op.set_attr("tt.merge_epilogue", self.builder.get_bool_attr(True))
-            if merge_correction:
-                for_op.set_attr("tt.merge_correction", self.builder.get_bool_attr(True))
-            if merge_epilogue_to_computation:
-                for_op.set_attr("tt.merge_epilogue_to_computation", self.builder.get_bool_attr(True))
-            if separate_epilogue_store:
-                for_op.set_attr("tt.separate_epilogue_store", self.builder.get_bool_attr(True))
-            if tmem_alloc_algo is not None:
-                for_op.set_attr("tt.tmem_alloc_algo", self.builder.get_int32_attr(tmem_alloc_algo))
-            if smem_alloc_algo is not None:
-                for_op.set_attr("tt.smem_alloc_algo", self.builder.get_int32_attr(smem_alloc_algo))
-            if smem_budget is not None:
-                for_op.set_attr("tt.smem_budget", self.builder.get_int32_attr(smem_budget))
-            if smem_circular_reuse is not None:
-                for_op.set_attr(
-                    "tt.smem_circular_reuse",
-                    self.builder.get_bool_attr(smem_circular_reuse),
-                )
-            if disable_licm:
-                for_op.set_attr("llvm.loop_annotation", self.builder.get_disable_loop_licm_attr())
+            if loop_options is not None:
+                self._apply_loop_options(for_op, loop_options)
 
             self.scf_stack.append(node)
             for_op_body = for_op.get_body(0)
@@ -1519,9 +1520,17 @@ class CodeGenerator(ast.NodeVisitor):
         bound_args.apply_defaults()
         args = bound_args.arguments
         args = [args[name] for name in fn.arg_names]
+
+        def normalize_arg(arg):
+            if isinstance(arg, language.tuple):
+                return _apply_to_tuple_values(arg, normalize_arg)
+            if not isinstance(arg, base_value) or isinstance(arg, JITCallable):
+                return language.core.constexpr(arg)
+            return arg
+
         for i, arg in enumerate(args):
-            if isinstance(arg, (language.dtype, float, int, bool, JITFunction)):
-                args[i] = language.core.constexpr(arg)
+            args[i] = normalize_arg(arg)
+
         args_cst = find_paths_if(args, lambda _, x: _is_constexpr(x))
         args_cst = {path: get_iterable_path(args, path) for path in args_cst}
         args_path = find_paths_if(args, lambda _, x: not _is_constexpr(x))
@@ -1629,14 +1638,7 @@ class CodeGenerator(ast.NodeVisitor):
             args = map(_unwrap_if_constexpr, args)
         ret = fn(*args, **kws)
 
-        def wrap_constexpr(x):
-            if _is_triton_value(x):
-                return x
-            return constexpr(x)
-
-        if isinstance(ret, (builtins.tuple, language.tuple)):
-            return _apply_to_tuple_values(ret, wrap_constexpr)
-        return wrap_constexpr(ret)
+        return normalize_value(ret)
 
     def call_Method(self, node, fn, fn_self, args, kws):
         if isinstance(fn, JITFunction):
@@ -1655,7 +1657,8 @@ class CodeGenerator(ast.NodeVisitor):
         for arg in node.args:
             if isinstance(arg, ast.Starred):
                 arg = self.visit(arg.value)
-                arg = _unwrap_if_constexpr(arg)
+                if isinstance(arg, constexpr):
+                    arg = arg.value
                 if isinstance(arg, tuple):
                     arg = language.core.tuple(arg)
                 assert isinstance(arg, language.core.tuple)
@@ -1867,13 +1870,19 @@ def ast_to_ttir(fn, src, context, options, codegen_fns, module_map, module=None)
         idx = fn.arg_names.index(k)
         arg_types[idx] = str_to_ty(v, None)
 
+    def constexpr_type(value):
+        if isinstance(value, builtins.tuple):
+            fields = value._fields if is_namedtuple(type(value)) else None
+            return language.tuple_type([constexpr_type(v) for v in value], fields)
+        return constexpr(value).type
+
     def apply_constexpr_types(argument, indices, value):
         index = indices.pop()
         if len(indices) == 0:
             if isinstance(argument, list):
-                argument[index] = constexpr(value).type
+                argument[index] = constexpr_type(value)
             else:
-                argument.types[index] = constexpr(value).type
+                argument.types[index] = constexpr_type(value)
         else:
             apply_constexpr_types(argument[index], indices, value)
 

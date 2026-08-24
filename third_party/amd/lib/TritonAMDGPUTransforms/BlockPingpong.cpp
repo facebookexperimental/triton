@@ -1,6 +1,7 @@
 #include "TritonAMDGPUTransforms/Passes.h"
 #include "mlir/Analysis/SliceAnalysis.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/LLVMIR/ROCDLDialect.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinAttributes.h"
@@ -8,6 +9,7 @@
 #include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassManager.h"
 #include "third_party/amd/include/Dialect/TritonAMDGPU/IR/Dialect.h"
+#include "third_party/amd/lib/TritonAMDGPUTransforms/PipelineUtility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/Schedule.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
@@ -27,6 +29,44 @@ namespace mlir {
 
 namespace {
 
+static LLVM::FenceOp createLocalMMRAFence(OpBuilder &builder, Location loc,
+                                          LLVM::AtomicOrdering ordering) {
+  Attribute mmra =
+      builder.getAttr<LLVM::MMRATagAttr>("amdgpu-synchronize-as", "local");
+  auto fence =
+      LLVM::FenceOp::create(builder, loc, ordering, /*syncscope=*/"workgroup");
+  fence->setDiscardableAttr(LLVM::LLVMDialect::getMmraAttrName(), mmra);
+  return fence;
+}
+
+// Returns true if `val` is not loop-invariant with respect to `forOp`.
+// Traversal stops at values defined outside the loop, which are invariant
+// roots.
+static bool isLoopVariant(Value val, scf::ForOp forOp) {
+  SmallVector<Value> worklist{val};
+  llvm::DenseSet<Value> visited;
+  while (!worklist.empty()) {
+    Value v = worklist.pop_back_val();
+    if (!visited.insert(v).second)
+      continue;
+    if (auto blockArg = dyn_cast<BlockArgument>(v)) {
+      // The induction variable, iter_args, and any nested-region argument
+      // inside the loop are loop-variant. Block arguments owned outside the
+      // loop are invariant roots.
+      if (forOp->isAncestor(blockArg.getOwner()->getParentOp()))
+        return true;
+      continue;
+    }
+    Operation *def = v.getDefiningOp();
+    // Values defined outside the loop are loop-invariant; stop traversing.
+    if (!forOp->isAncestor(def))
+      continue;
+    for (Value operand : def->getOperands())
+      worklist.push_back(operand);
+  }
+  return false;
+}
+
 // This pass transforms a for-loop calculating a GEMM. Main purpose of the
 // transform is improve the efficiency of the GPU dot instruction (mfma)
 // by interleaving the execution of two warps on each SIMD. Especially it groups
@@ -44,6 +84,7 @@ class Pingponger {
   SmallVector<ttg::AsyncCopyGlobalToLocalOp> asyncCopyOps;
   SmallVector<ttg::AsyncWaitOp> asyncWaitOps;
   SmallVector<ttg::AsyncCommitGroupOp> asyncCommitOps;
+  SmallVector<tt::DotOpInterface> dotLikeOps;
   SmallVector<tt::DotOp> dotOps;
   SmallVector<tt::DotScaledOp> scaledDotOps;
   SmallVector<SmallVector<Operation *>> subViewOps;
@@ -721,31 +762,33 @@ LogicalResult Pingponger::transformTwoClusterWithAsyncAndAll(OpBuilder &builder,
 // Typical `s_xxx` instructions include:
 //   - Control flow: `s_cbranch`
 //   - Priority control: `s_setprio`
-//   - Synchronization and dependency: `s_waitcnt`
+//   - Synchronization and dependency: MMRA-tagged local fences, lowered by LLVM
+//     to target-specific wait instructions.
 //
 // These are usually inserted near `s_barrier` boundaries, and the current
 // implementation carefully places them to ensure they belong to the memory
 // cluster, improving overall overlap and utilization.
 //
 //
-// 3. Placement of `s_waitcnt lgkmcnt(0)`
-// --------------------------------------
-// We place `s_waitcnt lgkmcnt(0)` at the *end* of the memory cluster to ensure
-// that all shared-memory load (`ds_read`) instructions have completed before
-// entering the compute cluster.
+// 3. Placement of local MMRA fences
+// ---------------------------------
+// We place local MMRA release fences at the *end* of the memory cluster to
+// ensure that all shared-memory load (`ds_read`) instructions have completed
+// before entering the compute cluster. LLVM lowers these fences to the
+// appropriate target-specific wait instructions.
 //
 // This placement prevents the LLVM backend from inserting additional
-// `s_waitcnt lgkmcnt()` instructions inside the compute cluster based on
+// wait instructions inside the compute cluster based on
 // inferred dependencies between `mfma` and `ds_read` operations.
 //
 // This approach is consistent with the previous design goal: to eliminate all
 // `s_xxx` instructions from the compute cluster so it can run uninterrupted
-// MFMA and VALU operations. Keeping `s_waitcnt lgkmcnt(0)` at the cluster
-// boundary enforces data dependency correctness while preserving the clean
-// separation between memory and compute phases.
+// MFMA and VALU operations. Keeping the local fence at the cluster boundary
+// enforces data dependency correctness while preserving the clean separation
+// between memory and compute phases.
 LogicalResult Pingponger::transformChainedDotSchedule(OpBuilder &builder,
                                                       Location loc) {
-  assert(dotOps.size() == 2);
+  assert(dotLikeOps.size() == 2);
 
   // Memory clusters start with either ttg.async_wait or ttg.local_store
   auto findNextMemoryCluster = [](Operation *op) {
@@ -755,8 +798,9 @@ LogicalResult Pingponger::transformChainedDotSchedule(OpBuilder &builder,
     return op;
   };
 
-  std::array memoryClusterStartOps = {findNextMemoryCluster(dotOps[0]),
-                                      findNextMemoryCluster(dotOps[1])};
+  std::array memoryClusterStartOps = {
+      findNextMemoryCluster(dotLikeOps[0].getOperation()),
+      findNextMemoryCluster(dotLikeOps[1].getOperation())};
 
   if (llvm::is_contained(memoryClusterStartOps, nullptr) ||
       memoryClusterStartOps[0] == memoryClusterStartOps[1]) {
@@ -767,7 +811,7 @@ LogicalResult Pingponger::transformChainedDotSchedule(OpBuilder &builder,
 
   builder.setInsertionPointToStart(forOp.getBody());
   // ComputeCluster 1
-  updateOpInsertion(dotOps[0]);
+  updateOpInsertion(dotLikeOps[0].getOperation());
   prependOp(ROCDL::SBarrierOp::create(builder, loc), false);
   prependOp(ROCDL::SchedBarrier::create(builder, loc, 0), false);
 
@@ -785,10 +829,10 @@ LogicalResult Pingponger::transformChainedDotSchedule(OpBuilder &builder,
   // Ideally we want the memory cluster to start with
   //
   // s_barrier
-  // s_waitcnt vmcnt(x) lgkmcnt(0)
+  // local wait
   // s_setprio 1
   //
-  // However, the membar pass will put s_waitcnt before s_barrier.
+  // However, the membar path will put the local MMRA fence before s_barrier.
   // But we can at least put s_setprio in the memory cluster.
   prependOp(ROCDL::SetPrioOp::create(builder, loc, highPriority), false);
 
@@ -796,19 +840,18 @@ LogicalResult Pingponger::transformChainedDotSchedule(OpBuilder &builder,
   // We want the 2nd compute cluster to start with
   //
   // s_setprio 0
-  // s_waitcnt lgkmcnt(0)
+  // local MMRA release fence
   // s_barrier
   //
   // Check note 2 and 3 for details.
-  updateOpInsertion(dotOps[1]);
+  updateOpInsertion(dotLikeOps[1].getOperation());
   prependOp(ROCDL::SchedBarrier::create(builder, loc, 0), false);
   prependOp(ROCDL::SetPrioOp::create(builder, loc, lowPriority), false);
-  auto dsAttr = builder.getI32IntegerAttr(0);
-  prependOp(tt::amdgpu::MemoryCounterWaitOp::create(
-                builder, loc, /* load= */ nullptr, /* store= */ nullptr,
-                /* ds= */ dsAttr),
+  prependOp(createLocalMMRAFence(builder, loc, LLVM::AtomicOrdering::release),
             false);
   prependOp(ROCDL::SBarrierOp::create(builder, loc), false);
+  prependOp(createLocalMMRAFence(builder, loc, LLVM::AtomicOrdering::acquire),
+            false);
   prependOp(ROCDL::SchedBarrier::create(builder, loc, 0), false);
 
   // MemoryCluster2
@@ -828,7 +871,7 @@ LogicalResult Pingponger::transformChainedDotSchedule(OpBuilder &builder,
   // stays in the memory cluster.
   //
   // s_setprio 0
-  // s_waitcnt lgkmcnt(0)
+  // local MMRA release fence
   // s_cbranch
   // s_barrier
   //
@@ -840,9 +883,7 @@ LogicalResult Pingponger::transformChainedDotSchedule(OpBuilder &builder,
   updateOpInsertion(lastInsertedOp->getBlock()->getTerminator());
   prependOp(ROCDL::SchedBarrier::create(builder, loc, 0), false);
   prependOp(ROCDL::SetPrioOp::create(builder, loc, lowPriority), false);
-  prependOp(tt::amdgpu::MemoryCounterWaitOp::create(
-                builder, loc, /* load= */ nullptr, /* store= */ nullptr,
-                /* ds= */ dsAttr),
+  prependOp(createLocalMMRAFence(builder, loc, LLVM::AtomicOrdering::release),
             false);
 
   return success();
@@ -871,7 +912,10 @@ Pingponger::transformTwoClusterWithLocalLoadAndAll(OpBuilder &builder,
         tokens.push_back(token);
       }
     }
-    newAsyncWaitOp = ttg::AsyncWaitOp::create(builder, loc, tokens, 0);
+    // Drop pre-calculated mark_num and conservatively set 0 before
+    // updateWaits (in runOnOperation) re-evaluates against the token chain
+    // post-reorder.
+    newAsyncWaitOp = ttg::AsyncWaitOp::create(builder, loc, tokens, /*num=*/0);
     for (auto asyncWaitOp : asyncWaitOps) {
       asyncWaitOp.getResult().replaceAllUsesWith(newAsyncWaitOp.getResult());
       asyncWaitOp->erase();
@@ -936,16 +980,21 @@ void Pingponger::addAsymmetricSyncToLoop(OpBuilder &builder, Location loc) {
                                        warpIDX, constZero);
   auto warpHigh = arith::CmpIOp::create(builder, loc, arith::CmpIPredicate::ne,
                                         warpIDX, constZero);
-  auto condBarrierHigh =
-      tt::amdgpu::CondBarrierOp::create(builder, loc, warpHigh);
+  tt::amdgpu::CondBarrierOp::create(builder, loc, warpHigh);
 
   // Insert condbarrier::first_half after the end of the loop
   builder.setInsertionPointAfter(forOp);
-  auto condBarrierLow =
-      tt::amdgpu::CondBarrierOp::create(builder, loc, warpLow);
+  tt::amdgpu::CondBarrierOp::create(builder, loc, warpLow);
 }
 
 void Pingponger::getDotPingponged() {
+  // LowerLoops sets this only when it materializes the two-dot layout for a
+  // pipeline configured to use pingpong. This pass is the marker's sole
+  // consumer and always removes it, even when the transform is later rejected;
+  // dot count alone cannot distinguish that layout from a single-dot schedule.
+  bool hasTwoDotSchedule = forOp->hasAttr(triton::AMD::AttrTwoDotSchedule);
+  forOp->removeAttr(triton::AMD::AttrTwoDotSchedule);
+
   if (numStages <= 1) {
     LDBG("Pingpong pass expect a loop transformed by pipeliner that prefetches "
          "memory and reduces dependencies among the operations in the same "
@@ -954,7 +1003,6 @@ void Pingponger::getDotPingponged() {
   }
 
   OpBuilder builder(forOp);
-  MLIRContext *ctx = forOp.getContext();
   Location loc = forOp.getLoc();
 
   forOp->walk([&](Operation *op) {
@@ -974,10 +1022,6 @@ void Pingponger::getDotPingponged() {
         })
         .Case<ttg::LocalStoreOp>(
             [&](auto lStore) { lStoreOps.push_back(lStore); })
-        .Case<tt::DotOp>(
-            [&](auto pingpongDot) { dotOps.push_back(pingpongDot); })
-        .Case<tt::DotScaledOp>(
-            [&](auto pingpongDot) { scaledDotOps.push_back(pingpongDot); })
         .Case<ttg::AsyncCopyGlobalToLocalOp>(
             [&](auto asyncOp) { asyncCopyOps.push_back(asyncOp); })
         .Case<ttg::AsyncCommitGroupOp>([&](auto asyncCommitGroupOp) {
@@ -987,13 +1031,26 @@ void Pingponger::getDotPingponged() {
             [&](auto asyncOp) { asyncWaitOps.push_back(asyncOp); });
   });
 
+  // Pingpong moves dot and memory clusters within the loop body, so nested dots
+  // are not supported. Use the scheduler's direct-child collector for both the
+  // single-dot and two-dot paths instead of counting nested dots that cannot be
+  // transformed safely.
+  dotLikeOps = ChainedDotSchedule::collectDotLikeOps(forOp);
+  for (tt::DotOpInterface dotLikeOp : dotLikeOps) {
+    if (auto dotOp = dyn_cast<tt::DotOp>(dotLikeOp.getOperation()))
+      dotOps.push_back(dotOp);
+    else if (auto scaledDotOp =
+                 dyn_cast<tt::DotScaledOp>(dotLikeOp.getOperation()))
+      scaledDotOps.push_back(scaledDotOp);
+  }
+
   // Currently, pingpong scheduling is known as helpful under limited condition.
   // Individual conditions are checked while collecting each operation such as
   // software pipelining and dot rank=2. Also only accept the for-loop with
   // supported combination of operations because this transformation is very
   // tightly scheduling the latencies.
 
-  int64_t numOfDotLikeOps = scaledDotOps.size() + dotOps.size();
+  int64_t numOfDotLikeOps = dotLikeOps.size();
 
   if (numOfDotLikeOps < 1 || numOfDotLikeOps > 2) {
     LDBG("Only handle one or two dotlike ops");
@@ -1001,7 +1058,7 @@ void Pingponger::getDotPingponged() {
   }
 
   if (numOfDotLikeOps == 2) {
-    if (numStages != 4)
+    if (numStages != 4 || !hasTwoDotSchedule)
       return;
 
     if (transformChainedDotSchedule(builder, loc).failed()) {
@@ -1010,6 +1067,8 @@ void Pingponger::getDotPingponged() {
       return;
     }
     addAsymmetricSyncToLoop(builder, loc);
+    // The transforms below handle single-dot schedules only.
+    return;
   }
 
   useAsyncCopy = (asyncCopyOps.size() > 0);
@@ -1032,7 +1091,6 @@ void Pingponger::getDotPingponged() {
     auto scaledDotType = scaledDotOps[0].getType();
     auto scaledDotShape = scaledDotType.getShape();
     auto aType = scaledDotOps[0].getA().getType();
-    auto aShape = aType.getShape();
     auto elemWidth = aType.getElementTypeBitWidth();
 
     // MxN = 256x256
@@ -1161,6 +1219,21 @@ void Pingponger::getDotPingponged() {
             << lLoadOps.size() << " local loads in dot computation";
     LDBG(message.str());
     return;
+  }
+
+  // A global load whose mask depends on the loop induction variable (e.g. the
+  // K-bound or im2col spatial-padding predicate of a convolution) is
+  // non-uniform along K, so the reordered schedule corrupts the boundary tiles.
+  // Output-only boundary masks (M/N bounds) are loop-invariant and remain on
+  // the fast path.
+  for (auto load : gLoadOps) {
+    Value mask = load.getMask();
+    if (mask && isLoopVariant(mask, forOp)) {
+      LDBG("Unable to apply ping pong scheduling. Details: a global load has "
+           "a loop-variant mask: "
+           << load);
+      return;
+    }
   }
 
   // Pingpong scheduling tries to form two different types of the instruction

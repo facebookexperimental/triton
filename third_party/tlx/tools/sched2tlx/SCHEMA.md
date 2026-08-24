@@ -11,6 +11,7 @@ not need the original IR or any out-of-band context.
   "schema_version": "0.1",
   "kernel": { ... },
   "ops": { "<id>": { ... }, ... },
+  "data_partition_candidates": [ { ... }, ... ],
   "loops": [ { ... }, ... ]
 }
 ```
@@ -18,6 +19,20 @@ not need the original IR or any out-of-band context.
 - `kernel` — function signature.
 - `ops` — flat **table** (string id → op record) of every op the emitter may
   need: function-scope (preamble/epilogue) ops AND in-loop scheduled ops.
+- `data_partition_candidates` — Pass A.5 candidate surface (may be absent in
+  older dumps). One entry per MMA node with at least one legal M-split:
+
+  ```json
+  {"loop_id": 0, "node_id": 5, "op_kind": "ttng.tc_gen5_mma", "dim": 0,
+   "applied_n": 1, "factors": [{"n": 2, "m_size": 64}]}
+  ```
+
+  `factors` lists every legal split factor (BM % n == 0, BM/n >= max(64,
+  TMEM blockM)); `applied_n` is the factor actually applied in THIS dump
+  (1 = unpartitioned). The emitter ignores this section — it exists so
+  external tooling can re-run the modulo pass with
+  `TRITON_DATA_PARTITION_N=<n>` per candidate and compare the resulting
+  schedules.
 - `loops` — each scheduled loop's schedule graph (nodes + edges) plus its
   bounds and induction variable.
 
@@ -184,6 +199,67 @@ The emitter groups sibling sub-ops by `subtile_count` and emits a single
   "latency": 518
 }
 ```
+
+### `lowering_templates` and `lowering_plan`
+
+These optional loop fields expose the joint solver's fixed-II lowering shadow
+model. Older graphs omit them and parse as an `absent` plan.
+
+`lowering_templates` contains the complete conditional event semantics:
+
+```json
+{
+  "id": 0,
+  "relation": "always",
+  "src_node": 9,
+  "dst_node": 10,
+  "src_cluster": 3,
+  "dst_cluster": 4,
+  "events": [{
+    "id": 0,
+    "kind": "tc_commit",
+    "owner": "src",
+    "anchor_node": 9,
+    "placement": "after",
+    "pipeline": "NONE",
+    "issue_duration": 1,
+    "completion_latency": 559,
+    "blocking": false,
+    "async": true,
+    "distance": 0,
+    "frequency": 1,
+    "buffer_id": null,
+    "bytes": 0,
+    "depth": 1,
+    "semaphore": "full",
+    "fusion_group": null,
+    "dedup_group": null
+  }]
+}
+```
+
+`relation` is `always`, `same_wg`, or `different_wg`. `lowering_plan`
+instantiates the active templates. `issue_duration` is per occurrence, so an
+event occupies `issue_duration * frequency` issue slots. Pipeline `NONE` means
+the event uses only its owner's warp-group issue stream; synchronization events
+do not reserve the anchor operation's chip-wide pipeline.
+
+```json
+{
+  "version": "lowering-plan-0.1",
+  "status": "shadow_verified",
+  "templates": [{
+    "id": 0,
+    "active": true,
+    "events": [{"id": 0, "cycle": 318, "wg": 2, "stream_order": 7}]
+  }]
+}
+```
+
+The statuses are `absent`, `shadow_unmodeled`, `shadow_verified`, and
+`shadow_stale`. None is authoritative for emission yet: sched2tlx parses and
+validates this contract, then continues to lower from `cross_wg_barriers`.
+See `ModuloScheduling/docs/LoweringPlan.md` for coverage and promotion gates.
 
 ## What the emitter does with this
 

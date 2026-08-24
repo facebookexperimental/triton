@@ -38,12 +38,13 @@ namespace mlir::triton {
 std::unique_ptr<OperationPass<ModuleOp>>
 createConvertTritonAMDGPUToLLVMPass(StringRef gfxArch, bool ftz);
 std::unique_ptr<OperationPass<ModuleOp>>
+createConvertTritonAMDGPUToLLVMPass(StringRef gfxArch, bool ftz,
+                                    bool enableTreeReduction);
+std::unique_ptr<OperationPass<ModuleOp>>
 createConvertBuiltinFuncToLLVMPass(StringRef gfxArch, bool ftz);
+
 std::unique_ptr<OperationPass<ModuleOp>>
-createTritonAMDGPUInsertInstructionSchedHintsPass(StringRef variant);
-std::unique_ptr<OperationPass<ModuleOp>>
-createTritonAMDGPULowerInstructionSchedHintsPass(StringRef gfxArch,
-                                                 int32_t numStages);
+createAllocateAMDGPUSharedMemoryPass(StringRef arch);
 
 #define GEN_PASS_REGISTRATION
 #include "TritonAMDGPUToLLVM/Passes.h.inc"

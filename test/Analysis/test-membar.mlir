@@ -88,6 +88,35 @@ tt.func @war_single_block_local_store(%A : !tt.ptr<f16>) {
   tt.return
 }
 
+// CHECK-LABEL: constant_index_same_slice
+tt.func @constant_index_same_slice() {
+  %c0 = arith.constant 0 : i32
+  %alloc = ttg.local_alloc : () -> !ttg.memdesc<2x128x32xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  %slot0 = ttg.memdesc_index %alloc[%c0] : !ttg.memdesc<2x128x32xf16, #A_SHARED, #ttg.shared_memory, mutable> -> !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  // CHECK: ttg.local_load
+  // CHECK-NEXT: ttg.barrier local
+  // CHECK-NEXT: ttg.local_store
+  %value = ttg.local_load %slot0 : !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable> -> tensor<128x32xf16, #AL>
+  ttg.local_store %value, %slot0 : tensor<128x32xf16, #AL> -> !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  tt.return
+}
+
+// Different constant indices have independent ownership and must not receive a
+// false workgroup barrier merely because they share one parent allocation.
+// CHECK-LABEL: constant_index_distinct_slices
+tt.func @constant_index_distinct_slices() {
+  %c0 = arith.constant 0 : i32
+  %c1 = arith.constant 1 : i32
+  %alloc = ttg.local_alloc : () -> !ttg.memdesc<2x128x32xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  %slot0 = ttg.memdesc_index %alloc[%c0] : !ttg.memdesc<2x128x32xf16, #A_SHARED, #ttg.shared_memory, mutable> -> !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  %slot1 = ttg.memdesc_index %alloc[%c1] : !ttg.memdesc<2x128x32xf16, #A_SHARED, #ttg.shared_memory, mutable> -> !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  // CHECK: ttg.local_load
+  // CHECK-NEXT: ttg.local_store
+  %value = ttg.local_load %slot0 : !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable> -> tensor<128x32xf16, #AL>
+  ttg.local_store %value, %slot1 : tensor<128x32xf16, #AL> -> !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  tt.return
+}
+
 // CHECK-LABEL: scratch
 tt.func @scratch(%arg: tensor<16x16xf16, #AL>) {
   %cst0 = ttg.local_alloc %arg : (tensor<16x16xf16, #AL>) -> !ttg.memdesc<16x16xf16, #A_SHARED, #ttg.shared_memory>
@@ -114,6 +143,102 @@ tt.func @async_wait(%arg: tensor<32x16xf16, #AL>) {
   %1 = ttg.local_load %cst0 : !ttg.memdesc<32x16xf16, #A_SHARED, #ttg.shared_memory> -> tensor<32x16xf16, #AL>
   tt.return
 }
+
+// CHECK-LABEL: async_wait_back_to_back
+tt.func @async_wait_back_to_back(%arg: tensor<32x16xf16, #AL>) {
+  %cst0 = ttg.local_alloc %arg : (tensor<32x16xf16, #AL>) -> !ttg.memdesc<32x16xf16, #A_SHARED, #ttg.shared_memory>
+  // CHECK: ttg.async_wait
+  // CHECK-NEXT: ttg.async_wait
+  // CHECK-NEXT: ttg.barrier local
+  // CHECK-NEXT: ttg.local_load
+  ttg.async_wait {num = 4 : i32}
+  ttg.async_wait {num = 0 : i32}
+  %1 = ttg.local_load %cst0 : !ttg.memdesc<32x16xf16, #A_SHARED, #ttg.shared_memory> -> tensor<32x16xf16, #AL>
+  tt.return
+}
+
+// CHECK-LABEL: async_wait_pure_op_between_waits
+tt.func @async_wait_pure_op_between_waits(%arg: tensor<32x16xf16, #AL>) {
+  %c1_i32 = arith.constant 1 : i32
+  %cst0 = ttg.local_alloc %arg : (tensor<32x16xf16, #AL>) -> !ttg.memdesc<32x16xf16, #A_SHARED, #ttg.shared_memory>
+  // CHECK: ttg.async_wait
+  // CHECK-NEXT: arith.addi
+  // CHECK-NEXT: ttg.async_wait
+  // CHECK-NEXT: ttg.barrier local
+  // CHECK-NEXT: ttg.local_load
+  ttg.async_wait {num = 4 : i32}
+  %pure = arith.addi %c1_i32, %c1_i32 : i32
+  ttg.async_wait {num = 0 : i32}
+  %1 = ttg.local_load %cst0 : !ttg.memdesc<32x16xf16, #A_SHARED, #ttg.shared_memory> -> tensor<32x16xf16, #AL>
+  tt.return
+}
+
+// CHECK-LABEL: async_wait_existing_barrier
+tt.func @async_wait_existing_barrier(%arg: tensor<32x16xf16, #AL>) {
+  %cst0 = ttg.local_alloc %arg : (tensor<32x16xf16, #AL>) -> !ttg.memdesc<32x16xf16, #A_SHARED, #ttg.shared_memory>
+  // CHECK: ttg.async_wait
+  // CHECK-NEXT: ttg.barrier local
+  // CHECK-NEXT: ttg.local_load
+  ttg.async_wait {num = 4 : i32}
+  ttg.barrier local
+  %1 = ttg.local_load %cst0 : !ttg.memdesc<32x16xf16, #A_SHARED, #ttg.shared_memory> -> tensor<32x16xf16, #AL>
+  tt.return
+}
+
+// CHECK-LABEL: async_wait_scan_stops_at_memory_effect
+tt.func @async_wait_scan_stops_at_memory_effect(%arg: tensor<32x16xf16, #AL>) {
+  %cst0 = ttg.local_alloc %arg : (tensor<32x16xf16, #AL>) -> !ttg.memdesc<32x16xf16, #A_SHARED, #ttg.shared_memory>
+  // CHECK: ttg.async_wait
+  // CHECK-NEXT: ttg.barrier local
+  // CHECK-NEXT: ttg.local_load
+  ttg.async_wait {num = 4 : i32}
+  %1 = ttg.local_load %cst0 : !ttg.memdesc<32x16xf16, #A_SHARED, #ttg.shared_memory> -> tensor<32x16xf16, #AL>
+  // CHECK: ttg.async_wait
+  // CHECK-NEXT: ttg.barrier local
+  // CHECK-NEXT: ttg.local_load
+  ttg.async_wait {num = 0 : i32}
+  %2 = ttg.local_load %cst0 : !ttg.memdesc<32x16xf16, #A_SHARED, #ttg.shared_memory> -> tensor<32x16xf16, #AL>
+  tt.return
+}
+
+// CHECK-LABEL: async_wait_scan_stops_at_control_flow
+tt.func @async_wait_scan_stops_at_control_flow(%arg: tensor<32x16xf16, #AL>, %cond: i1) {
+  %cst0 = ttg.local_alloc %arg : (tensor<32x16xf16, #AL>) -> !ttg.memdesc<32x16xf16, #A_SHARED, #ttg.shared_memory>
+  // CHECK: ttg.async_wait
+  // CHECK-NEXT: ttg.barrier local
+  // CHECK-NEXT: scf.if
+  ttg.async_wait {num = 4 : i32}
+  scf.if %cond {
+    scf.yield
+  } else {
+    scf.yield
+  }
+  // CHECK: ttg.async_wait
+  // CHECK-NEXT: ttg.barrier local
+  // CHECK-NEXT: ttg.local_load
+  ttg.async_wait {num = 0 : i32}
+  %1 = ttg.local_load %cst0 : !ttg.memdesc<32x16xf16, #A_SHARED, #ttg.shared_memory> -> tensor<32x16xf16, #AL>
+  tt.return
+}
+
+// CHECK-LABEL: async_wait_scan_reaches_block_end
+tt.func @async_wait_scan_reaches_block_end(%arg: tensor<32x16xf16, #AL>, %cond: i1) {
+  %cst0 = ttg.local_alloc %arg : (tensor<32x16xf16, #AL>) -> !ttg.memdesc<32x16xf16, #A_SHARED, #ttg.shared_memory>
+  scf.if %cond {
+    // CHECK: ttg.async_wait
+    // CHECK-NEXT: ttg.barrier local
+    // CHECK-NEXT: } else {
+    ttg.async_wait {num = 4 : i32}
+    scf.yield
+  } else {
+    scf.yield
+  }
+  // CHECK: ttg.async_wait
+  // CHECK-NEXT: ttg.barrier local
+  ttg.async_wait {num = 0 : i32}
+  tt.return
+}
+
 
 // CHECK-LABEL: subview
 tt.func @subview() {
@@ -1041,11 +1166,11 @@ tt.func @layout_changed_reinterpret_subslice() {
   // CHECK: ttg.barrier local
   // CHECK-NEXT: ttg.local_load
   %0 = ttg.local_load %subslice1 : !ttg.memdesc<16x16xf16, #shared, #smem, mutable, 32x16> -> tensor<16x16xf16>
-  %subslice2 = ttg.memdesc_subslice %alloc [16, 0] : !ttg.memdesc<32x16xf16, #shared, #smem, mutable> -> !ttg.memdesc<16x16xf16, #shared, #smem, mutable, 32x16>
-  %reinterpreted = ttg.memdesc_reinterpret %subslice2 : !ttg.memdesc<16x16xf16, #shared, #smem, mutable, 32x16> -> !ttg.memdesc<16x16xf16, #sharedT, #smem, mutable>
+  %reinterpreted_parent = ttg.memdesc_reinterpret %alloc : !ttg.memdesc<32x16xf16, #shared, #smem, mutable> -> !ttg.memdesc<32x16xf16, #sharedT, #smem, mutable>
+  %reinterpreted = ttg.memdesc_subslice %reinterpreted_parent [16, 0] : !ttg.memdesc<32x16xf16, #sharedT, #smem, mutable> -> !ttg.memdesc<16x16xf16, #sharedT, #smem, mutable, 32x16>
   // CHECK: ttg.barrier local
   // CHECK-NEXT: ttg.local_store
-  ttg.local_store %cst_store, %reinterpreted : tensor<16x16xf16> -> !ttg.memdesc<16x16xf16, #sharedT, #smem, mutable>
+  ttg.local_store %cst_store, %reinterpreted : tensor<16x16xf16> -> !ttg.memdesc<16x16xf16, #sharedT, #smem, mutable, 32x16>
   // CHECK: ttg.barrier local
   // CHECK-NEXT: ttg.local_load
   %1 = ttg.local_load %subslice1 : !ttg.memdesc<16x16xf16, #shared, #smem, mutable, 32x16> -> tensor<16x16xf16>
@@ -1214,7 +1339,7 @@ tt.func @loop_memindex_subslice(%arg0: tensor<2x128x128xf16>) {
 
 module attributes {ttg.target = "cuda:90", "ttg.num-warps" = 8 : i32} {
   // CHECK-LABEL: warp_dot_multi_read
-  tt.func @warp_dot_multi_read(%arg0: !tt.tensordesc<tensor<1x256x128xf8E5M2, #shared1>>, %arg1: tensor<128x128x!tt.ptr<f8E5M2>>, %arg2: i32, %arg3: i1, %arg4: tensor<128x256xf32, #mma>, %arg5: tensor<128x128xi1>) {
+  tt.func @warp_dot_multi_read(%arg0: !tt.tensordesc<1x256x128xf8E5M2, #shared1>, %arg1: tensor<128x128x!tt.ptr<f8E5M2>>, %arg2: i32, %arg3: i1, %arg4: tensor<128x256xf32, #mma>, %arg5: tensor<128x128xi1>) {
 
     %a_tile = ttg.local_alloc : () -> !ttg.memdesc<128x128xf8E5M2, #shared1, #smem, mutable>
     %b_tile = ttg.local_alloc : () -> !ttg.memdesc<256x128xf8E5M2, #shared1, #smem, mutable>
@@ -1228,7 +1353,74 @@ module attributes {ttg.target = "cuda:90", "ttg.num-warps" = 8 : i32} {
     // CHECK: ttg.barrier local
     // CHECK-NEXT: ttg.async_copy_global_to_local
     ttg.async_copy_global_to_local %arg1, %a_tile mask %arg5 {contiguity = 16 : i32} : tensor<128x128x!tt.ptr<f8E5M2>> -> <128x128xf8E5M2, #shared1, #smem, mutable>
-    ttng.async_tma_copy_global_to_local %arg0[%arg2, %arg2, %arg2] %b_tile, %barrier, %arg3 : !tt.tensordesc<tensor<1x256x128xf8E5M2, #shared1>>, !ttg.memdesc<1xi64, #shared2, #smem, mutable> -> !ttg.memdesc<256x128xf8E5M2, #shared1, #smem, mutable>
+    ttng.async_tma_copy_global_to_local %arg0[%arg2, %arg2, %arg2] %b_tile, %barrier, %arg3 : !tt.tensordesc<1x256x128xf8E5M2, #shared1>, !ttg.memdesc<1xi64, #shared2, #smem, mutable> -> !ttg.memdesc<256x128xf8E5M2, #shared1, #smem, mutable>
     tt.return
   }
+}
+
+// -----
+
+#blockedLarge = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+#sharedLarge = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#blockedCallSrc = #ttg.blocked<{sizePerThread = [1, 32], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
+#mmaCall = #ttg.nvidia_mma<{versionMajor = 2, versionMinor = 0, warpsPerCTA = [4, 1], instrShape = [16, 8]}>
+#blockedCallDst = #ttg.dot_op<{opIdx = 0, parent = #mmaCall, kWidth = 2}>
+#smem = #ttg.shared_memory
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
+  tt.func private @callee_call_offset_membar() -> tensor<128x32xf16, #blockedCallDst> {
+    %cst = arith.constant dense<0.0> : tensor<128x32xf16, #blockedCallSrc>
+    %cvt = ttg.convert_layout %cst : tensor<128x32xf16, #blockedCallSrc> -> tensor<128x32xf16, #blockedCallDst>
+    tt.return %cvt : tensor<128x32xf16, #blockedCallDst>
+  }
+
+  // The call's virtual buffer is offset by the large allocation. The
+  // subsequent scratch op should alias at the same offset and require a membar.
+  // CHECK-LABEL: @caller_call_offset_membar
+  // CHECK: tt.call @callee_call_offset_membar{{.*}}allocation.offset = [[CALL_OFFSET:[1-9][0-9]*]]
+  // CHECK: ttg.barrier local
+  // CHECK-NEXT: ttg.convert_layout{{.*}}allocation.offset = [[CALL_OFFSET]]
+  tt.func @caller_call_offset_membar() -> tensor<128x32xf16, #blockedCallDst> {
+    %large = arith.constant dense<0> : tensor<65536xi8, #blockedLarge>
+    %buf = ttg.local_alloc : () -> !ttg.memdesc<65536xi8, #sharedLarge, #smem, mutable>
+    ttg.local_store %large, %buf : tensor<65536xi8, #blockedLarge> -> !ttg.memdesc<65536xi8, #sharedLarge, #smem, mutable>
+
+    %call = tt.call @callee_call_offset_membar() : () -> tensor<128x32xf16, #blockedCallDst>
+
+    %cst = arith.constant dense<0.0> : tensor<128x32xf16, #blockedCallSrc>
+    %cvt = ttg.convert_layout %cst : tensor<128x32xf16, #blockedCallSrc> -> tensor<128x32xf16, #blockedCallDst>
+    %sum = arith.addf %call, %cvt : tensor<128x32xf16, #blockedCallDst>
+
+    %ld = ttg.local_load %buf : !ttg.memdesc<65536xi8, #sharedLarge, #smem, mutable> -> tensor<65536xi8, #blockedLarge>
+    ttg.local_dealloc %buf : !ttg.memdesc<65536xi8, #sharedLarge, #smem, mutable>
+    tt.return %sum : tensor<128x32xf16, #blockedCallDst>
+  }
+}
+
+// -----
+
+// A write to one constant subview index followed by a read of a DIFFERENT
+// constant index of the same buffer are disjoint (narrowIntervalForSubview gives
+// each index its own byte interval), so no barrier is required. If the
+// narrowIntervalForSubview call is dropped the two indices alias the whole
+// allocation, the read looks like a RAW hazard, and a spurious barrier appears --
+// the regression a bad merge introduced. The init_barrier/inval_barrier subview
+// tests pass via the init/inval-skip path and never exercise this narrowing,
+// which is why they did not catch the removal.
+#AL = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
+#A_SHARED = #ttg.swizzled_shared<{vec = 2, perPhase = 2, maxPhase = 4, order = [1, 0]}>
+module attributes {"ttg.num-warps" = 4 : i32, "ttg.num-ctas" = 1 : i32} {
+// CHECK-LABEL: subview_different_index_no_barrier
+tt.func @subview_different_index_no_barrier(%A : !tt.ptr<f16>) {
+  %c0 = arith.constant 0 : i32
+  %c1 = arith.constant 1 : i32
+  %a_ptr = tt.splat %A : !tt.ptr<f16> -> tensor<16x16x!tt.ptr<f16>, #AL>
+  %alloc = ttg.local_alloc : () -> !ttg.memdesc<2x16x16xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  %sv0 = ttg.memdesc_index %alloc[%c0] : !ttg.memdesc<2x16x16xf16, #A_SHARED, #ttg.shared_memory, mutable> -> !ttg.memdesc<16x16xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  %sv1 = ttg.memdesc_index %alloc[%c1] : !ttg.memdesc<2x16x16xf16, #A_SHARED, #ttg.shared_memory, mutable> -> !ttg.memdesc<16x16xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  %0 = ttg.async_copy_global_to_local %a_ptr, %sv0 : tensor<16x16x!tt.ptr<f16>, #AL> -> !ttg.memdesc<16x16xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  // CHECK-NOT: ttg.barrier local
+  %1 = ttg.local_load %sv1 : !ttg.memdesc<16x16xf16, #A_SHARED, #ttg.shared_memory, mutable> -> tensor<16x16xf16, #AL>
+  tt.return
+}
 }

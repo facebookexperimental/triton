@@ -17,10 +17,30 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.targ
     // CHECK: %1 = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
     %1 = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
     // CHECK: ttg.async_remote_shmem_store %arg0, rank %arg1, %0 barrier %1 : tensor<1x1xf32, #blocked> -> !ttg.memdesc<1x1xf32, #shared, #smem, mutable> barrier_ty !ttg.memdesc<1xi64, #shared1, #smem, mutable>
-    // CHECK-LLVM: nvvm.mapa
-    // CHECK-LLVM: nvvm.mapa
+    // CHECK-LLVM: mapa.shared::cluster.u32
+    // CHECK-LLVM: mapa.shared::cluster.u32
     // CHECK-LLVM: llvm.inline_asm has_side_effects asm_dialect = att{{.*}}st.async.shared::cluster.mbarrier::complete_tx::bytes
     ttg.async_remote_shmem_store %arg0, rank %arg1, %0 barrier %1 : tensor<1x1xf32, #blocked> -> !ttg.memdesc<1x1xf32, #shared, #smem, mutable> barrier_ty !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1, 2], threadsPerWarp = [32, 1], warpsPerCTA = [1, 1], order = [1, 0]}>
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 0, transposed = false, elementBitWidth = 16}>
+#shared1 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: async_remote_shmem_store_f16
+  // CHECK-LLVM-LABEL: llvm.func @async_remote_shmem_store_f16
+  tt.func @async_remote_shmem_store_f16(%arg0: tensor<1x64xf16, #blocked>, %arg1: i32) {
+    %0 = ttg.local_alloc : () -> !ttg.memdesc<1x64xf16, #shared, #smem, mutable>
+    %1 = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    // CHECK-LLVM: llvm.inline_asm has_side_effects asm_dialect = att{{.*}}st.async.shared::cluster.mbarrier::complete_tx::bytes{{(\.v4)?}}.b32
+    // CHECK-LLVM-NOT: st.async.shared::cluster.mbarrier::complete_tx::bytes{{.*}}b16
+    ttg.async_remote_shmem_store %arg0, rank %arg1, %0 barrier %1 : tensor<1x64xf16, #blocked> -> !ttg.memdesc<1x64xf16, #shared, #smem, mutable> barrier_ty !ttg.memdesc<1xi64, #shared1, #smem, mutable>
     tt.return
   }
 }
@@ -40,7 +60,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.targ
     // CHECK: %0 = ttg.local_alloc : () -> !ttg.memdesc<1x1xf32, #shared, #smem, mutable>
     %0 = ttg.local_alloc : () -> !ttg.memdesc<1x1xf32, #shared, #smem, mutable>
     // CHECK: ttg.remote_shmem_store %arg0, rank %arg1, %0 : tensor<1x1xf32, #blocked> -> !ttg.memdesc<1x1xf32, #shared, #smem, mutable>
-    // CHECK-LLVM: nvvm.mapa
+    // CHECK-LLVM: mapa.shared::cluster.u32
     // CHECK-LLVM-NOT: llvm.inline_asm{{.*}}st.async.shared::cluster.mbarrier
     ttg.remote_shmem_store %arg0, rank %arg1, %0 : tensor<1x1xf32, #blocked> -> !ttg.memdesc<1x1xf32, #shared, #smem, mutable>
     tt.return

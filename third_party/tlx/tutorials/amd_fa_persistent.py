@@ -123,7 +123,7 @@ def _attn_fwd_async_simple(
     k_base = K + k_off + offs_n[:, None] * stride_kn + offs_d[None, :] * stride_kk
     v_base = V + v_off + offs_n[:, None] * stride_vn + offs_d[None, :] * stride_vk
 
-    for start_n in tl.range(0, hi, BLOCK_N, num_stages=0):
+    for start_n in tl.range(0, hi, BLOCK_N, num_stages=1):
         kn = start_n + offs_n
         k_mask = kn[:, None] < N_CTX
         v_mask = kn[:, None] < N_CTX
@@ -270,7 +270,7 @@ def _attn_fwd_async_prefetch(
     [LR_KV]
     [QK, SM0, SM1, PV]  [GLDS_KV],
     """
-    for block_id in tl.range(0, n_main * BLOCK_N, BLOCK_N, num_stages=0):
+    for block_id in tl.range(0, n_main * BLOCK_N, BLOCK_N, num_stages=1):
         next_off = block_id + BLOCK_N
         kn = block_id + offs_n
         next_mask = (next_off + offs_n[:, None]) < N_CTX
@@ -428,7 +428,7 @@ def _async_prefetch_attn_tile(
     """
     Unmasked steady-state loop
     """
-    for block_id in tl.range(0, n_unmasked * BLOCK_N, BLOCK_N, num_stages=0):
+    for block_id in tl.range(0, n_unmasked * BLOCK_N, BLOCK_N, num_stages=1):
         next_off = block_id + BLOCK_N
         i = block_id // BLOCK_N
         slot_cur = i % 2
@@ -456,7 +456,7 @@ def _async_prefetch_attn_tile(
     """
     Masked peeled epilogue
     """
-    for block_id in tl.range(n_unmasked * BLOCK_N, n_blocks * BLOCK_N, BLOCK_N, num_stages=0):
+    for block_id in tl.range(n_unmasked * BLOCK_N, n_blocks * BLOCK_N, BLOCK_N, num_stages=1):
         next_off = block_id + BLOCK_N
         kn = block_id + offs_n
         i = block_id // BLOCK_N
@@ -588,7 +588,7 @@ def _attn_fwd_persistent(
     units_per_hz: tl.constexpr = (NUM_M_BLOCKS + TILES_PER_UNIT - 1) // TILES_PER_UNIT
     hz_per_xcd = (Z * H + NUM_XCDS - 1) // NUM_XCDS
     units = hz_per_xcd * units_per_hz
-    for unit in tl.range(local, units, NUM_LOCAL, num_stages=0):
+    for unit in tl.range(local, units, NUM_LOCAL, num_stages=1):
         local_hz = unit // units_per_hz  # which head-batch id (quotient)
         bundle = unit % units_per_hz  # quer_seq/m tiles within head-batch id (remainder)
         pid_hz = xcd + local_hz * NUM_XCDS  # global head-batch id.

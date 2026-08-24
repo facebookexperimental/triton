@@ -106,13 +106,19 @@ public:
       return;
     }
 
-    result =
-        mod.walk([&](tt::DotOp op) { return checkNoDependentTwoCTADot(op); });
-    if (result.wasInterrupted()) {
-      signalPassFailure();
-      return;
+    if (!allowDependentChains) {
+      result =
+          mod.walk([&](tt::DotOp op) { return checkNoDependentTwoCTADot(op); });
+      if (result.wasInterrupted()) {
+        signalPassFailure();
+        return;
+      }
     }
 
+    // FPSAN rewrites all `tcgen05` MMA ops but sets the flag so it can be
+    // propagated.
+    if (!firstMatmul && mod->hasAttr(AttrTwoCTAsName))
+      return;
     bool twoCTAValue = firstMatmul ? firstTwoCTA : false;
     mod->setAttr(AttrTwoCTAsName, BoolAttr::get(mod.getContext(), twoCTAValue));
   }

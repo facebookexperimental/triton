@@ -51,16 +51,15 @@ constexpr static char AttrNumWarpsName[] = "ttg.num-warps";
 constexpr static char AttrNumCTAsName[] = "ttg.num-ctas";
 constexpr static char AttrTargetName[] = "ttg.target";
 constexpr static char AttrNumThreadsPerWarp[] = "ttg.threads-per-warp";
-// FIXME: rename to match above
-constexpr static char kPartitionAttrName[] = "ttg.partition";
-constexpr static char kPartitionOutputsAttrName[] = "ttg.partition.outputs";
-constexpr static char kPartitionStagesAttrName[] = "ttg.partition.stages";
-constexpr static char kWarpSpecializeTagAttrName[] = "ttg.warp_specialize.tag";
 constexpr static char AttrMinRegAutoWSName[] = "ttg.min_reg_auto_ws";
 constexpr static char AttrMaxRegAutoWSName[] = "ttg.max_reg_auto_ws";
 constexpr static char AttrClusterDimX[] = "ttg.cluster-dim-x";
 constexpr static char AttrClusterDimY[] = "ttg.cluster-dim-y";
 constexpr static char AttrClusterDimZ[] = "ttg.cluster-dim-z";
+// Set when the module contains exactly one `ttg.warp_specialize` op. Used to
+// diverge behavior in the warp specialization lowering to LLVM.
+constexpr static char AttrSingleWarpSpecializeName[] =
+    "ttg.single-warp-specialize";
 
 // Find the contextual number of warps on which this operation is executed.
 int lookupNumWarps(Operation *op);
@@ -78,6 +77,12 @@ std::optional<int> maybeLookupNumWarps(Block *block);
 int lookupThreadsPerWarp(OpBuilder &rewriter);
 int lookupNumCTAs(OpBuilder &rewriter);
 int lookupNumCTAs(Operation *op);
+
+// Record/query whether the module contains exactly one `ttg.warp_specialize`
+// op via the `ttg.single-warp-specialize` module attribute. `hasSingle...`
+// returns false when the attribute is absent.
+void setHasSingleWarpSpecialize(ModuleOp module, bool value);
+bool hasSingleWarpSpecialize(ModuleOp module);
 
 template <typename Key, typename Value> class Cache {
 public:
@@ -114,14 +119,42 @@ struct SharedMemory : public SideEffects::Resource::Base<SharedMemory> {
   SideEffects::Resource *getParent() const override { return nullptr; }
 };
 
+// Returns true iff every non-broadcast basis of `ll`, after flattening in and
+// out dimensions, maps to a single power-of-2 in the flattened output.
+bool hasPowerOfTwoBases(const LinearLayout &ll);
+
+// Check whether after removing broadcast bases the flattened layout is a
+// permutation matrix (each non-broadcast basis maps to a distinct power-of-2
+// and the remaining layout is bijective).
+bool isPermutationMatrixLayout(const LinearLayout &ll);
+
+// Returns whether the attribute is a GenericLinearEncoding, a WMMA with warp
+// swizzling or a slice or DotOp of one of these.
+bool isGenericLinearEncoding(Attribute attr);
+
+// Create a GenericLinearEncoding if the source isGenericLinearEncoding, and a
+// LinearEncoding otherwise.
+Attribute inferEncodingFromLinearLayout(MLIRContext *ctx, LinearLayout ll,
+                                        Attribute srcEnc);
+
 // Convert a distributed layout to a linear encoding
 LinearEncodingAttr toLinearEncoding(RankedTensorType type);
 LinearEncodingAttr toLinearEncoding(DistributedEncodingTrait layout,
                                     ArrayRef<int64_t> shape);
 
+// Convert a distributed layout to a generic linear encoding
+GenericLinearEncodingAttr toGenericLinearEncoding(RankedTensorType type);
+GenericLinearEncodingAttr
+toGenericLinearEncoding(DistributedEncodingTrait layout,
+                        ArrayRef<int64_t> shape);
+
 unsigned getTotalElemsPerThread(Type type);
 
 unsigned getTotalElemsPerThread(Attribute layout, ArrayRef<int64_t> shape);
+
+// Get the number of elements in each thread, ignoring register broadcasting.
+unsigned getUniqueElemsPerThread(Type type);
+unsigned getUniqueElemsPerThread(Attribute layout, ArrayRef<int64_t> shape);
 
 SmallVector<unsigned> getElemsPerThread(Type type);
 
@@ -263,6 +296,12 @@ SmallVector<int64_t> getAllocationShapePerCTA(Type type);
 
 unsigned getNumCTAs(Attribute layout);
 
+// Returns the MMAv2 warp distribution for a matrix tile. This does not apply
+// dot-chain policy and may oversubscribe tiles with fewer instruction
+// repetitions than warps.
+SmallVector<unsigned> getMmaV2WarpsPerCTA(ArrayRef<int64_t> shape,
+                                          int numWarps);
+
 // Return the order that represents that the batch is in row-major or
 // column-major order for a batch of matrices of shape [*, m, n] with
 // len(shape) == rank.
@@ -348,12 +387,6 @@ LogicalResult verifyMemoryOpTypes(Operation *op, ShapedType srcTy,
 // Verify a memory allocation operation.
 LogicalResult verifyAllocOp(Operation *op, Value src, MemDescType dstTy);
 
-SetVector<int> getPartitionIds(Operation *op);
-SmallVector<SetVector<int>, 4> getPartitionOutputs(Operation *op);
-SetVector<int> getPartitionIds(OpOperand *use);
-bool hasPartition(Operation *op);
-bool hasWarpSpecializeTag(Operation *op);
-std::optional<int> getWarpSpecializeTag(Operation *op);
 /// Returns the size in bytes of a scalar type when stored in shared memory.
 size_t getSharedMemorySize(Type type);
 

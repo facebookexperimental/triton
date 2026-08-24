@@ -4,7 +4,7 @@ CLC is a Blackwell (SM100+) feature. The scheduler (`tl.clc_tile_scheduler`)
 emits a single high-level, barrier-free op (`ttng.clc_advance`) into the initial
 TTIR; the TTGIR pipeline then lowers it in stages: split into the async-token
 form (`clc_try_cancel_async` + `clc_read`), hoist the issue for overlap, and
-materialize the token into the completion mbarrier (single-CTA only).
+materialize the token into completion and clustered-reuse mbarriers.
 
 Two kinds of tests:
 - IR-shape tests on the initial TTIR (target-independent, no GPU).
@@ -67,6 +67,25 @@ def _clc_count_kernel(counts_ptr, num_tiles):
     while sched.is_valid():
         tid = sched.tile_id[0]
         tl.atomic_add(counts_ptr + tid, 1, mask=tid < num_tiles)
+        sched = sched.advance()
+
+
+@triton.jit
+def _clc_cluster_count_kernel(counts_ptr, steals_ptr, delay_ptr, grid_x: tl.constexpr, grid_y: tl.constexpr):
+    sched = tl.clc_tile_scheduler()
+    initial_x = tl.program_id(0)
+    initial_y = tl.program_id(1)
+    initial_z = tl.program_id(2)
+    while sched.is_valid():
+        pid_x, pid_y, pid_z = sched.tile_id
+        linear_pid = pid_x + grid_x * (pid_y + grid_y * pid_z)
+        tl.atomic_add(counts_ptr + linear_pid, 1)
+        # clc_try_cancel is hoisted above the body. Keep this cluster resident
+        # long enough for the asynchronous request to cancel pending work.
+        for _ in tl.static_range(64):
+            tl.atomic_add(delay_ptr, 1)
+        is_stolen = (pid_x != initial_x) | (pid_y != initial_y) | (pid_z != initial_z)
+        tl.atomic_add(steals_ptr, 1, mask=is_stolen)
         sched = sched.advance()
 
 
@@ -149,6 +168,28 @@ def test_clc_scheduler_visits_each_tile_once(num_tiles):
 
 
 @requires_blackwell
+@pytest.mark.parametrize(
+    "grid,cluster",
+    [
+        ((8192, 1, 1), (2, 1, 1)),
+        ((2048, 2, 2), (2, 2, 2)),
+    ],
+)
+def test_clc_cluster_scheduler_visits_each_tile_once(grid, cluster):
+    # The grid is deliberately much larger than the machine so at least one
+    # pending physical cluster is canceled and processed by a running cluster.
+    num_tiles = grid[0] * grid[1] * grid[2]
+    counts = torch.zeros(num_tiles, device="cuda", dtype=torch.int32)
+    steals = torch.zeros(1, device="cuda", dtype=torch.int32)
+    delay = torch.zeros(1, device="cuda", dtype=torch.int32)
+    _clc_cluster_count_kernel[grid](counts, steals, delay, grid[0], grid[1], ctas_per_cga=cluster, launch_cluster=True)
+    counts = counts.cpu()
+    assert counts.min().item() == 1, "some clustered tile was never claimed"
+    assert counts.max().item() == 1, "some clustered tile was claimed more than once"
+    assert steals.item() > 0, "test grid did not exercise a successful cluster steal"
+
+
+@requires_blackwell
 @pytest.mark.parametrize("M, N, K", [(256, 256, 128), (512, 512, 256), (1000, 1000, 500)])
 def test_clc_gemm(M, N, K):
     torch.manual_seed(0)
@@ -177,3 +218,16 @@ def test_clc_materialized_ttgir():
         assert op not in ttgir, f"{op} should be lowered away by the TTGIR passes"
     for op in ("ttng.clc_try_cancel", "ttng.clc_load_result", "ttng.barrier_expect", "ttng.wait_barrier"):
         assert op in ttgir, f"expected {op} in the materialized TTGIR"
+
+
+@requires_blackwell
+def test_clc_cluster_materializes_multicast_request():
+    counts = torch.zeros(1024, device="cuda", dtype=torch.int32)
+    steals = torch.zeros(1, device="cuda", dtype=torch.int32)
+    delay = torch.zeros(1, device="cuda", dtype=torch.int32)
+    kernel = _clc_cluster_count_kernel[(1024, 1, 1)](counts, steals, delay, 1024, 1, ctas_per_cga=(2, 1, 1),
+                                                     launch_cluster=True)
+    ptx = kernel.asm["ptx"]
+    assert "multicast::cluster::all" in ptx
+    assert "mapa.shared::cluster" in ptx
+    assert "mbarrier.arrive.shared::cluster" in ptx

@@ -9,6 +9,7 @@
 //    Replaces PartitionScheduling for modulo-scheduled kernels.
 
 #include "DataDependenceGraph.h"
+#include "lib/Dialect/TritonGPU/Transforms/WarpSpecialization/PartitionAttrs.h"
 #include "LatencyModel.h"
 #include "ModuloReservationTable.h"
 
@@ -56,7 +57,10 @@ static int partitionLoopByUtilization(scf::ForOp loop,
 
   auto ddg = ttg::DataDependenceGraph::build(loop, model);
   if (II <= 0) {
-    auto schedResult = ttg::runModuloScheduling(ddg);
+    // No forced backend here: this pass has no schedule-algo option of its
+    // own, so the env var is the only input.
+    auto schedResult =
+        ttg::runModuloScheduling(ddg, ttg::getActiveScheduleAlgo());
     if (failed(schedResult))
       return 0;
     II = schedResult->II;

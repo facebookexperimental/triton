@@ -1,10 +1,13 @@
 #ifndef TRITONINSTRUMENT_UTILITY_H
 #define TRITONINSTRUMENT_UTILITY_H
 
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "triton/Analysis/BufferRegion.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Attributes.h"
+#include "triton/Dialect/TritonInstrument/IR/ConSanConstants.h"
 #include "triton/Dialect/TritonInstrument/IR/Dialect.h"
+#include "llvm/Support/MathExtras.h"
 
 #include <array>
 
@@ -18,14 +21,59 @@ class FunctionBuilder;
 
 constexpr int numMemTypes = getMaxEnumValForMemType() + 1;
 
-constexpr int NUM_THREADS = 16;
-constexpr int TMA_THREAD_OFFSET = NUM_THREADS;
-constexpr int TC_THREAD_OFFSET = TMA_THREAD_OFFSET + NUM_THREADS;
-constexpr int TOTAL_NUM_THREADS = TC_THREAD_OFFSET + NUM_THREADS;
-constexpr int THREADS_BITMASK_SIZE = llvm::NextPowerOf2(TOTAL_NUM_THREADS);
+constexpr int MAX_NUM_BASE_THREADS = 16;
 
 namespace CommitKind {
 enum Kind { None = -1, AsyncCp = 0, Wgmma, TmaStore, NumCommitKinds };
+}
+
+// -- ConSan capture-count constants -----------------------------------------
+// Each constant corresponds to specific passToWarpSpecialize() calls in
+// populateAndPassToWarpSpecialize().  Keep in sync with that function and
+// with estimateConSanCaptureCount() below.
+
+// writeVisibility + readVisibility per active memory type.
+constexpr int kCapturesPerMemType = 2;
+
+// proxyAccessVisibility, plus proxyAccessTracking when mbarriers are present.
+constexpr int kProxyFenceBaseCaptures = 1;
+constexpr int kProxyFenceBarrierCaptures = 1;
+
+// barrierStates + waiting + activeMasks (only when tracked rendezvous exist).
+constexpr int kBarrierBaseCaptures = 3;
+
+// writeTracking + readTracking per active memory type (only when barriers
+// exist and the memory type has buffers).
+constexpr int kBarrierTrackingCapturesPerMemType = 2;
+
+// The lock variable (always present).
+constexpr int kFixedCaptures = 1;
+
+// Size in bytes of each capture (a global-scratch pointer).
+constexpr int kCaptureSizeBytes = 8;
+
+/// Estimate the number of WarpSpecialize captures that the
+/// ConcurrencySanitizer pass will add via passToWarpSpecialize().
+/// \p numActiveMemTypes  Number of memory types with buffers.
+/// \p hasMBarriers       Whether mbarriers exist in the module.
+/// \p hasClusterBarriers Whether cluster barriers exist in the module.
+/// \p numCommitKinds     Number of distinct commit kinds required.
+inline int estimateConSanCaptureCount(int numActiveMemTypes, bool hasMBarriers,
+                                      bool hasClusterBarriers,
+                                      int numCommitKinds,
+                                      bool hasAsyncProxyFenceTracking) {
+  int perMemType = kCapturesPerMemType * numActiveMemTypes;
+  int barrierCaptures =
+      hasMBarriers || hasClusterBarriers ? kBarrierBaseCaptures : 0;
+  if (hasMBarriers)
+    barrierCaptures += kBarrierTrackingCapturesPerMemType * numActiveMemTypes;
+  int proxyFenceCaptures =
+      hasAsyncProxyFenceTracking
+          ? kProxyFenceBaseCaptures +
+                (hasMBarriers ? kProxyFenceBarrierCaptures : 0)
+          : 0;
+  return perMemType + barrierCaptures + proxyFenceCaptures + kFixedCaptures +
+         numCommitKinds;
 }
 
 void createAssertInThread(ImplicitLocOpBuilder &b, Value condition,
@@ -39,7 +87,10 @@ gpu::GlobalScratchAllocOp
 createThirdPartyScratchAlloc(OpBuilder &b, Location loc, Type ptrType,
                              int64_t sizeInBytes, int64_t alignment,
                              bool sharedClusterState = false);
-Value expandOuterSlicedDim(OpBuilder &b, Location loc, Value tensor);
+RankedTensorType getSlicedTensorType(RankedTensorType tensorType,
+                                     ArrayRef<int> keptDims, Type elementType);
+Value reshapeAndBroadcast(OpBuilder &b, Location loc, Value tensor,
+                          ArrayRef<int> keptDims, RankedTensorType dstType);
 RankedTensorType getIntTensorType(Region *region, ArrayRef<int64_t> shape,
                                   unsigned bitWidth);
 TypedValue<RankedTensorType> createConstIntTensor(OpBuilder &builder,
@@ -48,8 +99,14 @@ TypedValue<RankedTensorType> createConstIntTensor(OpBuilder &builder,
                                                   bool isSigned = false);
 uint32_t getMemDescLength(Value buf);
 FuncOp getEntryPoint(ModuleOp module);
-gpu::DistributedEncodingTrait
-getSingleDimSliceEncoding(gpu::DistributedEncodingTrait encoding, int dim);
+
+inline Value maybeAnd(ImplicitLocOpBuilder &b, Value lhs, Value rhs) {
+  if (!lhs)
+    return rhs;
+  if (!rhs)
+    return lhs;
+  return arith::AndIOp::create(b, lhs, rhs);
+}
 
 struct ValueType {
   Value value;
@@ -61,9 +118,41 @@ struct ValueType {
       : value(value.first), type(value.second) {}
 };
 
-// Map from IR region to ConSan auxiliary data. Auxiliary data is a value
-// and an optional type, for values that are stored in the scratch memory.
+struct BufferStateCandidate {
+  uint32_t baseOffset = 0;
+  llvm::SmallBitVector mask;
+  uint32_t ctaMask = 0;
+};
+
+struct BufferStateCandidates {
+  SmallVector<BufferStateCandidate, 2> cases;
+  bool unknown = false;
+};
+
+// Map from IR region to ConSan auxiliary data.
+//
+// Aux data is created in the entry function and then either rematerialized or
+// captured into warp-specialize partition regions. Each map member below is
+// keyed by the IR region that owns the value visible at an instrumentation
+// insertion point. For scratch-backed state, ValueType::value is the scratch
+// pointer and ValueType::type is the logical tensor type loaded from/stored to
+// that pointer. For tensor descriptors and constants, ValueType::value is the
+// tensor itself and ValueType::type is its type.
 struct AuxDataMap {
+  struct ThreadLayout {
+    int numBaseThreads = 1;
+    int numBaseThreadSlots = 1;
+    int tmaThreadOffset = -1;
+    int tcThreadOffset = -1;
+    int clcThreadOffset = -1;
+    int totalNumThreads = 1;
+    int numThreadSlots = 1;
+
+    bool hasTMAThreads() const { return tmaThreadOffset >= 0; }
+    bool hasTCThreads() const { return tcThreadOffset >= 0; }
+    bool hasCLCThreads() const { return clcThreadOffset >= 0; }
+  };
+
   struct RegionToValueMap {
     DenseMap<Region *, ValueType> values;
     ValueType at(Region *region) {
@@ -82,33 +171,134 @@ struct AuxDataMap {
     Region *getEnclosingParitionOrFunctionRegion(Operation *op);
   };
 
-  // Please see TritonInstrumentOps.td for more information on the auxiliary
-  // data structures.
+  // Shape notation:
+  //   C = CTAs in the cluster.
+  //   Cbar, Cbuf, Cthr, Cmask = CTA dimensions qualifying barriers, buffers,
+  //       threads, and thread masks respectively. Each has extent C.
+  //   B = tracked buffers for one memory type, power-of-two padded.
+  //   K = tracked mbarriers and virtual cluster rendezvous slots,
+  //       power-of-two padded.
+  //   T = logical ConSan thread bit slots used by this module, power-of-two
+  //       padded for the distributed layout.
+  //   P = base-thread columns used by commit and proxy state, power-of-two
+  //       padded.
+  //
+  // Storage notation:
+  //   tensor  = distributed tensor value.
+  //   scratch = pointer to shared-cluster global scratch memory.
+
+  // tensor, <B x i64>
+  // Per-memory-type packed buffer descriptors. Each i64 stores the 32-bit base
+  // offset and 32-bit length of one shared-memory or tensor-memory region.
   RegionToValueMap buffers[numMemTypes];
+  // tensor, <K x i64>
+  // Packed descriptors for tracked mbarrier allocations. Barriers are shared
+  // memory descriptors.
   RegionToValueMap barriers;
+
+  // scratch, <Cbar x K x i64>
+  // Packed barrier lifecycle state. Zero means invalid/uninitialized. Bit 0 is
+  // phase, bits [1..20] are the initial arrival count, bits [21..40] are the
+  // current arrival count, and bits [41..61] hold a signed tx-count.
   RegionToValueMap barrierStates;
 
+  // scratch, <Cbuf x B x Cmask x i64>
+  // Per-memory-type write frontier. Bit i means logical ConSan thread i can see
+  // the latest write to the buffer row.
   RegionToValueMap writeVisibility[numMemTypes];
+
+  // scratch, <Cbuf x B x Cbar x K x i8>
+  // Per-memory-type buffer/barrier map for writes that a barrier tracks.
   RegionToValueMap writeTracking[numMemTypes];
+
+  // scratch, <Cbuf x B x Cthr x T x Cmask x i64>
+  // Per-memory-type read frontier. For each buffer and logical thread lane, the
+  // i64 value is a bitmask of reads visible to that lane's thread.
   RegionToValueMap readVisibility[numMemTypes];
+
+  // scratch, <Cbuf x B x Cbar x K x Cmask x i64>
+  // Per-memory-type buffer/barrier map for read visibility masks that a barrier
+  // tracks.
   RegionToValueMap readTracking[numMemTypes];
+
+  // scratch, <Cbuf x B x Cthr x P x Cmask x i64>
+  // Generic-proxy shared-memory accesses visible to each base thread. The low
+  // 16 bits contain source base-thread ids that have accessed the buffer; bits
+  // [16..31] contain the subset covered by fence.proxy.async on the path to
+  // that consumer. CTA dimensions distinguish source and consumer CTAs.
+  RegionToValueMap proxyAccessVisibility;
+
+  // scratch, <Cbuf x B x Cbar x K x Cmask x i64>
+  // Barrier publication table for packed proxyAccessVisibility state.
+  RegionToValueMap proxyAccessTracking;
+
+  // scratch, <C x B x P x i8>
+  // Per-commit-kind outstanding commit counters for shared-memory buffers.
+  // Entries are 0 for none, -1 for staged but uncommitted, and positive for a
+  // committed access with an outstanding-group distance.
+  // Just one C dimension as ampere async_copy, WGMMA and TMA store are
+  // intra-CTA.
   RegionToValueMap commits[CommitKind::NumCommitKinds];
+
+  // State-lane plans and analysis-derived runtime-base, state-mask, and CTA
+  // cases for each memdesc.
+  triton::BufferStatePlan bufferStatePlans[numMemTypes];
+  DenseMap<Value, BufferStateCandidates> bufferCandidates[numMemTypes];
+
+  // Beta compatibility: legacy FunctionBuilder entry points still consume
+  // packed descriptors and an optional alias expansion matrix.
+  // tensor, <B x B x i1>
   RegionToValueMap aliasMatrices[numMemTypes];
+
+  // scratch pointer, i32
+  // Shared-cluster lock used to serialize ConSan instrumentation updates.
   RegionToValueMap lock;
+
+  // ConSan inserts a cluster barrier to publish lock initialization. It runs
+  // before the lock and rendezvous state are ready, so do not instrument it.
+  SmallVector<Operation *> internalClusterBarriers;
+
+  // Virtual barrier slot for each cluster-barrier lowering resource. Cluster
+  // barriers outside warp specialization share the entry-region slot; each
+  // warp-specialize region has its own slot.
+  DenseMap<Region *, int> clusterBarrierSlots;
+  // scratch, <Cbar x K x Cthr x i32>
+  // Deadlock-detection bitfield. Each base thread uses two bits: waiting flag
+  // and stored phase.
   RegionToValueMap waiting;
+
+  // scratch, <C x i32>
+  // Deadlock-detection bitfield. Outside warp specialization this is 1; inside
+  // it, set bits denote base threads that have not yet reached their
+  // terminator.
+  RegionToValueMap activeMasks;
+
+  // True when a memory type has cross-buffer aliasing and therefore requires
+  // aliasMatrices to make visibility and commit checks conservative.
   std::array<bool, numMemTypes> hasNonTrivialAliasing{};
 
-  void populateAndPassToWarpSpecialize(ModuleOp module,
-                                       FunctionBuilder &funcBuilder,
-                                       const ConSanTargetHooks *hooks);
+  // Dense logical-thread numbering for this module. Base threads are always
+  // present; TMA/TC/CLC peer ranges are added only when the module uses them.
+  ThreadLayout threadLayout;
+
+  bool hasAsyncCopyReads = false;
+  bool hasAsyncProxyFenceTracking = false;
+
+  LogicalResult populateAndPassToWarpSpecialize(ModuleOp module,
+                                                FunctionBuilder &funcBuilder,
+                                                const ConSanTargetHooks &hooks);
+
+  int getClusterBarrierSlot(Operation *op) const;
 
 private:
-  void getBuffersAndBarriers(
+  LogicalResult getBuffersAndBarriers(
       ModuleOp module,
       SmallVector<SmallVector<triton::BufferRegion>, 2> &bufRegions,
-      SmallVector<triton::BufferRegion> &barrierRegions);
+      SmallVector<triton::BufferRegion> &barrierRegions,
+      const ConSanTargetHooks &hooks);
   void passToWarpSpecialize(triton::FuncOp func, ValueType value,
-                            RegionToValueMap &map);
+                            RegionToValueMap &map, int &captureCounter,
+                            int64_t &captureBytes);
   void createInWarpSpecialize(
       triton::FuncOp func, RegionToValueMap &map,
       std::function<ValueType(ImplicitLocOpBuilder &)> createFn);

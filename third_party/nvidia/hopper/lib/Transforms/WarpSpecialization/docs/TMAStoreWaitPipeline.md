@@ -43,11 +43,13 @@ The flag drives a special path through three phases:
 
 ### Phase 3.5: TMA Staging Fusion
 
-All TMA staging WSBuffers that feed the same TMA descriptor are merged
-into a single `bufferId` (via `fuseEpilogueWSBuffers`). For example, the
-4 subtile stagings of `desc_dq` (under `EPILOGUE_SUBTILE=4`) all share
-one `bufferId`, as do the dk and dv subtile stagings (each per their own
-descriptor).
+TMA staging WSBuffers are merged by descriptor and originating load (via
+`fuseEpilogueWSBuffers`). If the originating load cannot be traced, as with
+Hopper register accumulators, the producer task is used instead. For example,
+the 4 same-task subtile stagings of `desc_dq` (under `EPILOGUE_SUBTILE=4`) all
+share one `bufferId`, as do the dk and dv subtile stagings (each per their own
+descriptor). Different data-partition tasks targeting the same descriptor stay
+in distinct buffers.
 
 The shared `bufferId` is honored by `doCodePartition` downstream: the
 subtile allocs are physically merged into one `local_alloc` of shape
@@ -166,12 +168,19 @@ functions handle the wait ops after the memory planner:
 doMemoryPlanner
   → doAnnotateTMAStoreWaits      ← annotate waits with buffer count
   → doValidateTMAStoreAnnotations ← safety check
-  → doCodePartitionPost
+  → doCodePartition
   → ...
   → scheduleLoops                 ← SWP assigns pipeline stages
   → cleanupWarpSpecializedLoops   ← prune dead loop-carried values
   → doTMAStoreWaitReorder         ← move waits using the SWP schedule
 ```
+
+This sequence is controlled by the `nvgpu-warp-specialization` pass option
+`tma-store-pipelining`, which defaults to `true`. When set to `false`, AutoWS
+skips all three steps: annotation, validation, and post-schedule reordering.
+This option is independent of `early_tma_store_lowering`, which controls
+whether descriptor stores are lowered into async TMA store operations before
+warp specialization.
 
 Each function is also available as a standalone MLIR pass for use outside
 the monolithic pipeline.
@@ -297,7 +306,7 @@ how TMA stores fit into the WS memory lowering pipeline.
 
 ## Code Partition: Realizing `allocation.reuseTarget`
 
-**File**: `WSCodePartition.cpp::doCodePartitionPost`
+**File**: `WSCodePartition.cpp::doCodePartition`
 
 The planner's `allocation.reuseTarget = N` annotation is a SMEM-accounting
 hint. To actually realize the SMEM overlap in the emitted kernel, two
@@ -352,7 +361,7 @@ coverage: `test_bwd_tmem_dsT_reuse_3group_persistent`.
 `insertAsyncComm`, whose cleanup sweep (`removeTokenfNotUsed`) erases any token
 alloc currently lacking users — the freshly-created reuse token only gains uses
 once the acquire/release are inserted. This is enforced as "Step 7.5" — running
-between `createTokenPost` (Step 7) and `insertAsyncComm` (Step 8). See commit
+between `createToken` (Step 7) and `insertAsyncComm` (Step 8). See commit
 `c67893c25` for the related ordering bug-fix.
 
 ### Step 2: Reinterpret Staging Alloc into Host Alloc

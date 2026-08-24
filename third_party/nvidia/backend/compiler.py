@@ -16,6 +16,44 @@ from triton._C.libtriton import ir, llvm, nvidia, passes, tlx
 from triton.backends.compiler import BaseBackend, GPUTarget, Language
 from triton.runtime.errors import PTXASError
 
+# Auto-TMA host-launcher caps. These MUST stay in lockstep with the C macros of
+# the same name in nvidia/backend/launch.h and nvidia/backend/driver.c: the
+# generated launcher (this file) and the JIT driver share statically-sized
+# recipe/shadow buffers dimensioned by these, so bumping one requires bumping
+# all. Python can't include the C header, so this is the mirrored source of
+# truth on the codegen side -- keep the values identical.
+TRITON_MAX_TMA_DESCS = 8
+TRITON_MAX_TMA_DIMS = 5
+
+_PTX_FILE_DIRECTIVE = re.compile(
+    r"""
+    # Match one complete PTX .file directive and preserve its prefix.
+    ^
+    (?P<directive_prefix>
+        [ \t]* \.file [ \t]+
+        \d+ [ \t]+ "
+    )
+    (?P<path>
+        (?: [^"\\] | \\. )*  # Allow escaped characters in the quoted path.
+    )
+    "
+    (?: [ \t]* , [ \t]* \d+ [ \t]* , [ \t]* \d+ )?  # Optional mtime and size.
+    [ \t]*
+    $
+    """,
+    flags=re.MULTILINE | re.X,
+)
+
+
+def normalize_ptx_file_metadata(src: str) -> str:
+
+    def normalize_file(match: re.Match[str]) -> str:
+        filename = match.group("path").rsplit("/", 1)[-1]
+        virtual_path = f"<source>/{filename}"
+        return f'{match.group("directive_prefix")}{virtual_path}", 0, 0'
+
+    return _PTX_FILE_DIRECTIVE.sub(normalize_file, src)
+
 
 def min_dot_size(target: GPUTarget):
 
@@ -28,6 +66,8 @@ def min_dot_size(target: GPUTarget):
             return (1, 1, 32)
         elif lhs_bitwidth == 64:
             return (1, 1, 4)
+        elif lhs_bitwidth == 32:
+            return (1, 1, 8)
         else:
             return (1, 1, 16)
 
@@ -43,7 +83,8 @@ def get_ptxas_version(arch: int = 80):
     mock_ver = knobs.nvidia.mock_ptx_version
     if mock_ver is not None:
         return mock_ver  # This is not really a version of ptxas, but it is good enough for testing
-    version = subprocess.check_output([get_ptxas(arch).path, "--version"]).decode("utf-8")
+    version = subprocess.check_output([get_ptxas(arch).path, "--version"],
+                                      env=knobs.nvidia.get_tool_env()).decode("utf-8")
     return version
 
 
@@ -189,7 +230,17 @@ class CUDAOptions:
     arch: str = None
     instrumentation_mode: str = ""
     early_tma_store_lowering: Optional[None] = None
+    tma_store_pipelining: Optional[bool] = None
     generate_subtiled_region: bool = False
+    multicast: bool = False
+    allowDependentTwoCTA: bool = False
+    # Per-config auto-TMA toggle (autotunable). Falls back to the global
+    # TRITON_AUTO_TMA knob when left at the default in make_ttir.
+    auto_tma: bool = False
+    # Emit device-side descriptors (make_tensor_descriptor + descriptor_load/store)
+    # instead of host TMA recipes. Falls back to knobs.nvidia.auto_tma_device.
+    auto_tma_device: bool = False
+    enable_tree_reduction: bool = False
 
     def __post_init__(self):
         default_libdir = Path(__file__).parent / "lib"
@@ -263,6 +314,11 @@ class CUDABackend(BaseBackend):
         args = {"arch": knobs.runtime.override_arch or f"sm{self.target.arch}"}
         args.update({k: opts[k] for k in CUDAOptions.__dataclass_fields__.keys() if k in opts if opts[k] is not None})
         capability = int(self._parse_arch(args["arch"]))
+
+        if "enable_tree_reduction" not in args:
+            # Preserve the established ordering before Blackwell while using
+            # linear ordering for the Blackwell workloads it targets.
+            args["enable_tree_reduction"] = capability < 100
 
         if args.get("num_ctas", 1) > 1 and capability < 90:
             raise ValueError((f"num_ctas > 1 requires NVIDIA SM90+ (Hopper). "
@@ -376,6 +432,7 @@ class CUDABackend(BaseBackend):
                 constants_dict[str_key] = str(v)
 
         tensordesc_meta = _get("tensordesc_meta")
+        auto_tma_recipes = _get("auto_tma_recipes")
 
         schema = {
             "abi_version": 1,
@@ -396,6 +453,7 @@ class CUDABackend(BaseBackend):
             "args": args,
             "constants": constants_dict,
             "tensordesc_meta": tensordesc_meta or [],
+            "auto_tma_recipes": auto_tma_recipes or [],
         }
         return schema
 
@@ -466,6 +524,52 @@ class CUDABackend(BaseBackend):
         global_scratch_size = launch_meta["global_scratch_size"]
         profile_scratch_size = launch_meta["profile_scratch_size"]
 
+        # Auto-TMA recipes: compiler-synthesized host-built TMA descriptors. Each
+        # becomes an is_tma kernel param the generated launcher builds via the
+        # launch.h recipe core (triton_construct_tma_desc), positioned
+        # [user args, auto-TMA descriptors, scratch] to match the kernel ABI.
+        auto_tma_recipes = launch_meta.get("auto_tma_recipes", []) or []
+        num_recipes = len(auto_tma_recipes)
+        # int64 shadow slots for shape/stride (the encoder reads int64; user
+        # scalar args may be i32). 2*ndim per recipe (shape[ndim] + stride[ndim]).
+        _shadow_base = []
+        _shadow_slots = 0
+        for _r in auto_tma_recipes:
+            _shadow_base.append(_shadow_slots)
+            _shadow_slots += 2 * len(_r["shape_arg_indices"])
+        # Auto-TMA's arg indices assume the kernel FuncOp arg order matches
+        # `args` (true for eligible kernels: plain ptr/scalar args). Bail to the
+        # no-launcher comment if that doesn't hold or a cap is exceeded.
+        _auto_tma_ok = num_recipes <= TRITON_MAX_TMA_DESCS
+        for _r in auto_tma_recipes:
+            _idxs = [
+                _r["base_ptr_arg_index"], *_r["shape_arg_indices"], *[s for s in _r["stride_arg_indices"] if s >= 0]
+            ]
+            _ndim = len(_r["shape_arg_indices"])
+            # stride list must be 1:1 with the shape list -- the codegen below
+            # (and driver.c) index stride_arg_indices[j] for j in range(_ndim), so
+            # a short/long stride list would IndexError in codegen instead of
+            # hitting this actionable warning.
+            if (any(i < 0 or i >= len(args) for i in _idxs) or _ndim > TRITON_MAX_TMA_DIMS
+                    or len(_r["stride_arg_indices"]) != _ndim):
+                _auto_tma_ok = False
+                break
+        if num_recipes and not _auto_tma_ok:
+            # Surface the reason at compile time (parity with the _c_type warning
+            # on unknown types): without a launcher symbol, any AOT/TritonCC
+            # consumer that links this generated file fails at link time with an
+            # opaque missing-symbol error instead of this actionable message.
+            warnings.warn(
+                f"Auto-TMA: host launcher not generated for kernel {kernel_name!r} "
+                f"-- recipe layout unsupported (non-1:1 arg mapping, >{TRITON_MAX_TMA_DIMS} "
+                f"shape dims, or >{TRITON_MAX_TMA_DESCS} descriptors). The kernel will "
+                "have no host-built TMA launcher symbol.",
+                stacklevel=2,
+            )
+            return ("/* Launcher not generated: auto-TMA recipe layout unsupported "
+                    f"(non-1:1 arg mapping, >{TRITON_MAX_TMA_DIMS} shape dims, or "
+                    f">{TRITON_MAX_TMA_DESCS} descriptors) */\n")
+
         lines = []
         lines.append("/* Generated by Triton compiler — do not edit. */")
         lines.append(f"/* Kernel: {kernel_name} */")
@@ -497,6 +601,9 @@ class CUDABackend(BaseBackend):
         lines.append(f"    {safe_name}_args_t k;")
         lines.append("    CUdeviceptr _global_scratch;")
         lines.append("    CUdeviceptr _profile_scratch;")
+        if _shadow_slots:
+            # int64 shadow for auto-TMA shape/stride (recipe encoder reads int64).
+            lines.append(f"    int64_t _auto_tma_shadow[{_shadow_slots}];")
         lines.append(f"}} {buf_t};")
         lines.append("")
 
@@ -512,6 +619,11 @@ class CUDABackend(BaseBackend):
         for arg in args:
             c_ty = _c_type(arg["type"])
             param_entries.append((_off(arg["name"]), f"(int)sizeof({c_ty})", 0))
+        # Auto-TMA descriptor params (is_tma=1; built from recipes below). Not
+        # read from args_buf -- the launcher binds &tma_descs[k]. Positioned
+        # before scratch to match the kernel ABI [user, auto-TMA, scratch].
+        for _k in range(num_recipes):
+            param_entries.append(("0", 128, 1))
         # Scratch params (device pointers).
         param_entries.append((f"(int)offsetof({buf_t}, _global_scratch)", "(int)sizeof(CUdeviceptr)", 0))
         param_entries.append((f"(int)offsetof({buf_t}, _profile_scratch)", "(int)sizeof(CUdeviceptr)", 0))
@@ -565,13 +677,57 @@ class CUDABackend(BaseBackend):
         lines.append(f"        .preferred_cluster_dims = {{{preferred[0]}, {preferred[1]}, {preferred[2]}}},")
         lines.append(f"        .num_params = {num_params},")
         lines.append("        .params = desc_params,")
-        lines.append("        .num_tma_recipes = 0,")
-        lines.append("        /* tma_recipes zero-initialized by C default */")
+        if num_recipes == 0:
+            lines.append("        .num_tma_recipes = 0,")
+            lines.append("        /* tma_recipes zero-initialized by C default */")
+        else:
+            lines.append(f"        .num_tma_recipes = {num_recipes},")
+            lines.append("        .tma_recipes = {")
+            for _k, _r in enumerate(auto_tma_recipes):
+                _ndim = len(_r["shape_arg_indices"])
+                _b = _shadow_base[_k]
+                _block = ", ".join(str(int(v)) for v in _r["block_shape"])
+                _base_name = args[_r["base_ptr_arg_index"]]["name"]
+                _shape_offs = ", ".join(f"(int)offsetof({buf_t}, _auto_tma_shadow[{_b + j}])" for j in range(_ndim))
+                _stride_offs = ", ".join(
+                    (f"(int)offsetof({buf_t}, _auto_tma_shadow[{_b + _ndim + j}])" if _r["stride_arg_indices"][j] >=
+                     0 else "-1") for j in range(_ndim))
+                lines.append("            {")
+                lines.append(f"                .ndim = {_ndim},")
+                lines.append(f"                .block_shape = {{{_block}}},")
+                lines.append(f"                .swizzle = {int(_r.get('swizzle', -1))},")
+                lines.append(f"                .elem_type = {int(_r['elem_type'])},")
+                lines.append(f"                .elem_size = {int(_r['elem_size'])},")
+                lines.append(f"                .fp4_padded = {int(_r['fp4_padded'])},")
+                lines.append(f"                .fill_mode = {int(_r['fill_mode'])},")
+                lines.append(f"                .ptr_offset = {_off(_base_name)},")
+                lines.append(f"                .shape_offsets = {{{_shape_offs}}},")
+                lines.append(f"                .stride_offsets = {{{_stride_offs}}},")
+                lines.append(f"                .desc_param_idx = {len(args) + _k},")
+                lines.append("            },")
+            lines.append("        },")
         lines.append("    };")
         lines.append("")
         lines.append("    /* Pack args + scratch into one buffer; launcher reads by offset. */")
         lines.append(f"    {buf_t} buf;")
         lines.append("    buf.k = *args;")
+        if num_recipes:
+            lines.append("    /* Widen auto-TMA shape/stride to int64 for the recipe encoder. */")
+            for _k, _r in enumerate(auto_tma_recipes):
+                _ndim = len(_r["shape_arg_indices"])
+                _b = _shadow_base[_k]
+                for j in range(_ndim):
+                    _sn = args[_r["shape_arg_indices"][j]]["name"]
+                    lines.append(f"    buf._auto_tma_shadow[{_b + j}] = (int64_t)buf.k.{_sn};")
+                    _sd = _r["stride_arg_indices"][j]
+                    if _sd >= 0:
+                        _dn = args[_sd]["name"]
+                        lines.append(f"    buf._auto_tma_shadow[{_b + _ndim + j}] = (int64_t)buf.k.{_dn};")
+                    else:
+                        # Contiguous dim: the stride slot is reserved (fixed
+                        # 2*ndim layout) but unused (stride_offsets = -1). Zero it
+                        # so the reserved slot is never left uninitialized.
+                        lines.append(f"    buf._auto_tma_shadow[{_b + _ndim + j}] = 0;")
         lines.append("    buf._global_scratch = global_scratch;")
         lines.append("    buf._profile_scratch = profile_scratch;")
         lines.append("")
@@ -627,12 +783,22 @@ class CUDABackend(BaseBackend):
         # so the backing TMEM allocation is materialized with the resolved
         # 2-CTA (TwoCTA_RHS) storage format. See make_ttgir.
 
+        # Auto-TMA: rewrite eligible masked block loads into descriptor_load so
+        # the standard sm_90+ TMA lowering turns them into real TMA copies. The
+        # per-config option (autotunable) takes precedence; otherwise the global
+        # TRITON_AUTO_TMA knob. (Block pointers are already tensor descriptors in
+        # this dialect, so there is no separate rewrite_tensor_pointer pass.)
+        if (opt.auto_tma or knobs.nvidia.auto_tma) and capability // 10 >= 9:
+            nvidia.passes.ttnvgpuir.add_promote_load_to_tma(pm, opt.auto_tma_device or knobs.nvidia.auto_tma_device)
         if capability // 10 < 9:
             passes.ttir.add_rewrite_tensor_descriptor_to_pointer(pm)
         passes.common.add_canonicalizer(pm)
         passes.ttir.add_combine(pm)
         passes.ttir.add_reorder_broadcast(pm)
         passes.common.add_cse(pm)
+        passes.ttir.add_triton_licm(pm)
+        passes.ttir.add_uplift_while_to_for(pm)
+        passes.common.add_canonicalizer(pm)
         passes.common.add_symbol_dce(pm)
         passes.ttir.add_loop_unroll(pm)
         pm.run(mod, "make_ttir")
@@ -684,9 +850,11 @@ class CUDABackend(BaseBackend):
         # dot dependencies into TMEM alloc/load/store chains.
         if (capability // 10 >= 10 and opt.cluster_dims is not None and max(opt.cluster_dims) >= 2
                 and opt.ctas_per_cga is not None):
-            nvidia.passes.ttnvgpuir.add_check_matmul_two_cta(pm)
+            nvidia.passes.ttnvgpuir.add_check_matmul_two_cta(pm, opt.allowDependentTwoCTA)
         # optimize TTGIR
-        passes.ttgpuir.add_coalesce(pm)
+        ptx_version = get_ptx_version_from_options(opt, capability)
+        max_vec_bits = 256 if capability >= 100 and ptx_version >= 88 else 128
+        passes.ttgpuir.add_coalesce(pm, max_vec_bits)
         tlx.tlx_passes.add_tlx_propagate_layout(pm)
         # Storage alias lowering runs after layout propagation so the backing
         # TMEM allocation is materialized with the resolved 2-CTA storage format.
@@ -702,6 +870,9 @@ class CUDABackend(BaseBackend):
         passes.ttgpuir.add_accelerate_matmul(pm)
         passes.ttgpuir.add_remove_layout_conversions(pm, 0)
         passes.ttgpuir.add_optimize_dot_operands(pm, capability >= 80)
+        if (capability // 10 >= 10 and opt.cluster_dims is not None and max(opt.cluster_dims) >= 2
+                and opt.ctas_per_cga is not None and opt.allowDependentTwoCTA):
+            nvidia.passes.hopper.add_analyze_2cta_dependencies(pm)
         # 2-CTA: Split B descriptor loads before optimize_descriptor_encoding
         # so the cloned half-width descriptor gets its encoding set properly.
         # NOT gated on use_meta_ws: the ctas_per_cga approach bypasses PlanCTA
@@ -711,7 +882,11 @@ class CUDABackend(BaseBackend):
         if (capability // 10 >= 10 and opt.cluster_dims is not None and max(opt.cluster_dims) >= 2
                 and opt.ctas_per_cga is not None):
             nvidia.passes.hopper.add_2cta_transform_loads(pm)
+        if (capability // 10 >= 10 and opt.cluster_dims is not None and max(opt.cluster_dims) >= 2
+                and opt.ctas_per_cga is not None and opt.allowDependentTwoCTA):
+            nvidia.passes.hopper.add_plan_2cta_exchange(pm)
         nvidia.passes.ttnvgpuir.add_optimize_descriptor_encoding(pm)
+        nvidia.passes.ttnvgpuir.add_tma_multicast(pm)
         passes.ttir.add_loop_aware_cse(pm)
         if capability // 10 in [8, 9]:
             passes.ttgpuir.add_fuse_nested_loops(pm)
@@ -721,6 +896,10 @@ class CUDABackend(BaseBackend):
             passes.ttgpuir.add_combine_tensor_select_and_if(pm)
             if knobs.nvidia.use_meta_ws:
                 nvidia.passes.hopper.add_data_partitioning(pm, 1)
+            # Support simplify trip while after data partitioning to
+            # enable using this loop to data partition.
+            passes.ttir.add_simplify_single_trip_while(pm)
+            if knobs.nvidia.use_meta_ws:
                 passes.ttgpuir.add_assign_latencies(pm, opt.num_stages, knobs.nvidia.use_meta_ws)
                 passes.ttgpuir.add_schedule_loops(pm, opt.num_stages, knobs.nvidia.use_meta_ws)
             nvidia.passes.hopper.add_tma_store_lowering(pm)
@@ -729,6 +908,7 @@ class CUDABackend(BaseBackend):
                 nvidia.passes.hopper.add_partition_scheduling_meta(pm)
             smem_budget = _max_shared_mem_for_capability(capability)
             generate_subtiled = (opt.generate_subtiled_region or knobs.nvidia.generate_subtiled_region)
+            tma_store_pipelining = True if opt.tma_store_pipelining is None else opt.tma_store_pipelining
             nvidia.passes.hopper.add_hopper_warpspec(
                 pm,
                 opt.num_stages,
@@ -738,13 +918,14 @@ class CUDABackend(BaseBackend):
                 smem_budget,
                 generate_subtiled,
                 knobs.nvidia.ws_tile_prefetch_depth,
+                tma_store_pipelining,
             )
             if not knobs.nvidia.use_meta_ws:
                 passes.ttgpuir.add_assign_latencies(pm, opt.num_stages, knobs.nvidia.use_meta_ws)
                 passes.ttgpuir.add_schedule_loops(pm, opt.num_stages, knobs.nvidia.use_meta_ws)
             passes.ttgpuir.add_pipeline(pm, opt.num_stages, dump_enabled)
         elif capability // 10 >= 10:
-            if not knobs.nvidia.use_modulo_schedule:
+            if not (knobs.nvidia.use_modulo_schedule or knobs.nvidia.use_joint_schedule):
                 passes.ttgpuir.add_fuse_nested_loops(pm)
             passes.common.add_canonicalizer(pm)
             passes.ttir.add_triton_licm(pm)
@@ -754,28 +935,60 @@ class CUDABackend(BaseBackend):
             # CLC tile scheduler (Stages 1 & 2): split ttng.clc_advance into the
             # async-token form and hoist the issue for compute/CLC overlap. This
             # runs before warp specialization; the token is materialized into the
-            # completion mbarrier after WS (add_clc_materialize below).
+            # completion/reuse mbarriers after WS (add_clc_materialize below).
             nvidia.passes.ttnvgpuir.add_clc_split(pm)
             nvidia.passes.ttnvgpuir.add_clc_hoist(pm)
             if knobs.nvidia.use_llm_schedule:
                 nvidia.passes.hopper.add_llm_schedule(pm)
+            elif knobs.nvidia.use_joint_schedule:
+                # Native Z3 joint solver: schedule + warp-group partition +
+                # buffer depths are decided in one model. Same slot and same
+                # annotation contract as the modulo pass below, so data
+                # partitioning and downstream WS consume it unchanged.
+                # TRITON_USE_JOINT_SCHEDULE=1
+                nvidia.passes.hopper.add_joint_schedule(pm)
             elif knobs.nvidia.use_modulo_schedule is not None:
                 # Modulo schedule runs BEFORE data partitioning so it can
                 # see MMA ops before they're moved into WS regions. It
                 # sets tt.autows annotations (stage/order) on MMA ops.
                 # TRITON_USE_MODULO_SCHEDULE=1 (default algo: rau)
-                # TRITON_USE_MODULO_SCHEDULE=sms|exhaustive|random
+                # TRITON_USE_MODULO_SCHEDULE=joint_solver|sms|exhaustive|random
                 nvidia.passes.hopper.add_modulo_schedule(pm)
+            elif knobs.nvidia.use_list_schedule:
+                # Acyclic list schedule (no software pipelining): a single-stage
+                # per-loop reorder that writes loop.stage/loop.cluster like the
+                # default scheduler. Emits top-K variants for autotuning
+                # (TRITON_LIST_SCHEDULE_TOPK / _BEAM / _TOPK_DUMP) and applies
+                # the picked one (TRITON_LIST_SCHEDULE_PICK, default best).
+                nvidia.passes.hopper.add_list_schedule(pm)
             nvidia.passes.hopper.add_data_partitioning(pm, 1)
-            # The modulo / LLM scheduler above already produced the full loop
-            # schedule (loop.stage / loop.cluster). Re-running assign_latencies +
-            # schedule_loops here would recompute and OVERRIDE it, so only run
-            # them on the default path where no custom scheduler set the schedule.
-            uses_custom_schedule = knobs.nvidia.use_llm_schedule or knobs.nvidia.use_modulo_schedule is not None
+            passes.ttir.add_simplify_single_trip_while(pm)
+            # The modulo / LLM / joint / list scheduler above already produced
+            # the full loop schedule (loop.stage / loop.cluster). Re-running
+            # assign_latencies + schedule_loops here would recompute and OVERRIDE
+            # it, so only run them on the default path where no custom scheduler
+            # set the schedule.
+            uses_custom_schedule = (knobs.nvidia.use_llm_schedule or knobs.nvidia.use_modulo_schedule is not None
+                                    or knobs.nvidia.use_list_schedule or knobs.nvidia.use_joint_schedule)
             if not uses_custom_schedule:
                 passes.ttgpuir.add_assign_latencies(pm, opt.num_stages, knobs.nvidia.use_meta_ws)
                 passes.ttgpuir.add_schedule_loops(pm, opt.num_stages, knobs.nvidia.use_meta_ws)
-            if not knobs.nvidia.use_meta_ws:
+            # The elif chain above gives the llm/joint/modulo schedulers
+            # priority over the list scheduler, so gate the WS skip on the arm
+            # that actually RAN, not on the raw knob — with e.g. joint+list both
+            # set, the joint schedule's partition annotations still need the WS
+            # passes below.
+            ran_list_schedule = (knobs.nvidia.use_list_schedule and not knobs.nvidia.use_llm_schedule
+                                 and not knobs.nvidia.use_joint_schedule and knobs.nvidia.use_modulo_schedule is None)
+            if ran_list_schedule:
+                # List scheduling is a no-warp-specialization transform: it
+                # writes only loop.stage/loop.cluster (+ tt.modulo_ii marker) and
+                # feeds the pipeliner directly. Running either WS path here would
+                # trip PartitionSchedulingMeta (it treats the tt.modulo_ii marker
+                # as a modulo schedule and demands partition attrs the list
+                # scheduler never emits). So skip WS entirely.
+                pass
+            elif not knobs.nvidia.use_meta_ws:
                 # 2-CTA + upstream WS is not supported
                 if opt.cluster_dims is None or max(opt.cluster_dims) < 2:
                     passes.ttgpuir.add_warp_specialize(pm, opt.num_stages)
@@ -786,6 +999,7 @@ class CUDABackend(BaseBackend):
                 nvidia.passes.hopper.add_partition_scheduling_meta(pm)
                 smem_budget = _max_shared_mem_for_capability(capability)
                 generate_subtiled = (opt.generate_subtiled_region or knobs.nvidia.generate_subtiled_region)
+                tma_store_pipelining = True if opt.tma_store_pipelining is None else opt.tma_store_pipelining
                 nvidia.passes.hopper.add_hopper_warpspec(
                     pm,
                     opt.num_stages,
@@ -795,21 +1009,24 @@ class CUDABackend(BaseBackend):
                     smem_budget,
                     generate_subtiled,
                     knobs.nvidia.ws_tile_prefetch_depth,
+                    tma_store_pipelining,
                 )
             passes.ttgpuir.add_pipeline(pm, opt.num_stages, dump_enabled)
             passes.ttgpuir.add_optimize_partition_warps(pm)
+            if (opt.cluster_dims is not None and max(opt.cluster_dims) >= 2 and opt.allowDependentTwoCTA):
+                nvidia.passes.hopper.add_materialize_2cta_exchange(pm)
             passes.ttgpuir.add_combine_tensor_select_and_if(pm)
             # hoist again and allow hoisting out of if statements
             passes.ttgpuir.add_hoist_tmem_alloc(pm, True)
             # CLC tile scheduler (Stage 4): materialize the async-token form into
-            # the response buffer + completion mbarrier (single-CTA only). Runs
-            # after warp specialization.
+            # the response buffer + completion mbarrier. Explicit clusters also
+            # get a reuse rendezvous. Runs after warp specialization.
             nvidia.passes.ttnvgpuir.add_clc_materialize(pm)
             nvidia.passes.ttnvgpuir.add_remove_tmem_tokens(pm)
             # 2-CTA: Insert cross-CTA sync AFTER all WS passes.
             # Only for Meta WS path — non-WS 2-CTA sync is handled by
             # MMAv5.cpp's inline ClusterArriveOp.
-            if (opt.cluster_dims is not None and max(opt.cluster_dims) >= 2 and knobs.nvidia.use_meta_ws):
+            if opt.cluster_dims is not None and max(opt.cluster_dims) >= 2 and knobs.nvidia.use_meta_ws:
                 nvidia.passes.hopper.add_insert_2cta_sync(pm)
         else:
             passes.ttir.add_triton_licm(pm)
@@ -820,6 +1037,7 @@ class CUDABackend(BaseBackend):
         passes.ttgpuir.add_optimize_dot_operands(pm, capability >= 80)
         passes.ttgpuir.add_coalesce_async_copy(pm)
         nvidia.passes.ttnvgpuir.add_optimize_tmem_layouts(pm)
+        nvidia.passes.ttnvgpuir.add_tmem_load_reduce(pm)
         if capability // 10 >= 9:
             nvidia.passes.ttnvgpuir.add_tma_lowering(pm)
             nvidia.passes.ttnvgpuir.add_tma_store_buffer_reuse(pm)
@@ -853,6 +1071,25 @@ class CUDABackend(BaseBackend):
         # after all other passes that may introduce layout conversions.
         terminal_smem_budget = (0 if knobs.nvidia.disable_budget_aware_layout_conversion else smem_budget)
         passes.ttgpuir.add_remove_layout_conversions(pm, terminal_smem_budget)
+        # Retire user-pinned register layout markers (#tlx.user_layout) only after
+        # ALL layout-rewriting passes have run (optimize_tmem_layouts reads the
+        # marker; every remove_layout_conversions / reduce_data_duplication above
+        # would otherwise be free to rewrite the unwrapped pinned layout). Placing
+        # it here keeps the pin an anchor through the whole pipeline.
+        tlx.tlx_passes.add_tlx_finalize_user_layouts(pm)
+
+        # M2 (bitequiv): reduction-layout optimization for inner_tree reduces. Placed
+        # after remove-layout-conversions so its layout choice is not reverted by a later
+        # conversion pass. Gated off by default (TRITON_SET_RED_ORDERING_LAYOUTS=1 to turn
+        # on in-pipeline); the bitequiv eval hook injects it via --opt-passes for a clean
+        # baseline-vs-optimized A/B. Tunables are pass Options driven by knobs.nvidia.*.
+        if knobs.nvidia.set_red_ordering_layouts:
+            passes.ttgpuir.add_optimize_reduction_layout(
+                pm,
+                knobs.nvidia.red_ordering_strategy,
+                knobs.nvidia.red_ordering_min_underparallel,
+                knobs.nvidia.red_ordering_max_elems_per_thread,
+            )
 
         # Print final TTGIR layouts for tlx.dump_layout diagnostics, then erase
         # the ops. Runs last so the reported layouts reflect all optimizations.
@@ -860,6 +1097,12 @@ class CUDABackend(BaseBackend):
 
         pm.run(mod, "make_ttgir")
         metadata["tensordesc_meta"] = mod.get_tensordesc_metadata()
+        # Capture compiler-synthesized auto-TMA descriptors (PromoteLoadToTMA)
+        # here, AFTER WS / 2-CTA / data-partitioning, so each recipe's
+        # block_shape reflects the final (possibly halved) descriptor arg type
+        # rather than the TTIR-time value. get_auto_tma_recipes reads the live
+        # FuncOp arg type for block_shape (see ir.cc).
+        metadata["auto_tma_recipes"] = mod.get_auto_tma_recipes()
         # Track whether ctas_per_cga was explicitly set to distinguish between
         # Triton's way (num_ctas > 1) and TLX/CUDA way (ctas_per_cga set).
         metadata["ctas_per_cga"] = opt.ctas_per_cga
@@ -907,12 +1150,14 @@ class CUDABackend(BaseBackend):
             passes.ttgpuir.add_global_sanitizer(pm)
 
         passes.ttgpuir.add_combine_tensor_select_and_if(pm)
-        passes.ttgpuir.add_allocate_warp_groups(pm)
+        passes.ttgpuir.add_allocate_warp_groups(pm, "consan" in options.instrumentation_mode)
         passes.convert.add_scf_to_cf(pm)
         passes.gluon.add_inliner(pm)
+        if "consan" in options.instrumentation_mode:
+            passes.ttgpuir.add_prepare_consan_captures(pm, "nvidia")
         nvidia.passes.ttnvgpuir.add_allocate_tensor_memory(pm)
         nvidia.passes.ttgpuir.add_allocate_shared_memory_nv(pm, capability, ptx_version)
-        nvidia.passes.ttnvgpuir.add_check_matmul_two_cta(pm)
+        nvidia.passes.ttnvgpuir.add_check_matmul_two_cta(pm, options.allowDependentTwoCTA)
         if "consan" in options.instrumentation_mode:
             # Call ConcurrencySanitizerPass here, before allocating global scratch memory but after allocating tensor and shared
             passes.ttgpuir.add_concurrency_sanitizer(pm)
@@ -933,21 +1178,28 @@ class CUDABackend(BaseBackend):
         # instrumentation point here so we can override IRs above (e.g., ttir and ttgir)
         if CUDABackend.instrumentation:
             CUDABackend.instrumentation.patch("ttgpuir_to_llvmir", pm, mod.context)
-        passes.ttgpuir.add_allocate_global_scratch_memory(pm)
         nvidia.passes.ttnvgpuir.add_proxy_fence_insertion(pm, capability)
         nvidia.passes.hopper.add_tma_store_token_wait_lowering(pm)
-        nvidia.passes.ttgpuir.add_to_llvmir(pm, capability, ptx_version)
+        nvidia.passes.ttnvgpuir.add_tmem_barrier_insertion(pm)
+        nvidia.passes.ttgpuir.add_to_llvmir(
+            pm,
+            capability,
+            ptx_version,
+            "consan" in options.instrumentation_mode,
+            options.enable_tree_reduction,
+        )
+        nvidia.passes.ttnvgpuir.add_initialize_ws_cluster_barriers(pm, capability, ptx_version)
         passes.ttgpuir.add_canonicalize_llvm_ir(pm)
         passes.common.add_cse(pm)
-        # FB/beta divergence: upstream #9535 ("Re-order WS lowering and NVGPU
-        # lowering") is fully reverted for beta. #9535 moved warp-id
+        # Meta Triton divergence: upstream #9535 ("Re-order WS lowering and NVGPU
+        # lowering") is fully reverted for Meta Triton. #9535 moved warp-id
         # relativization out of NVGPUToLLVM into the WS pass and ran WS-to-llvm
-        # before nvgpu-to-llvm. On beta's diverged NVGPU/WS lowering that (a)
+        # before nvgpu-to-llvm. On Meta Triton's diverged NVGPU/WS lowering that (a)
         # crashes ConvertNVGPUToLLVM with "operand #0 does not dominate this use"
         # on every Blackwell warp-specialized/TLX/autows kernel, and (b) leaves
         # the NVGPU WarpIdOp lowering using an absolute (non-relative) tid inside
         # warp-specialize regions, which silently miscompiles warpgroup reductions
-        # (e.g. test_warpgroup_reduction returns 0). Beta keeps the pre-#9535
+        # (e.g. test_warpgroup_reduction returns 0). Meta Triton keeps the pre-#9535
         # behavior: NVGPUToLLVM relativizes the warp-group tid and runs before WS
         # lowering.
         nvidia.passes.ttnvgpuir.add_nvgpu_to_llvm(pm)
@@ -996,8 +1248,13 @@ class CUDABackend(BaseBackend):
             raise RuntimeError(
                 "Address Sanitizer Error: Address sanitizer is currently only supported on the AMD backend")
         llvm_mod = llvm.to_module(mod, context)
-        proc = sm_arch_from_capability(capability)
-        features = get_features(options, self.target.arch)
+        if capability == 107:
+            cap_llvm = 100
+        else:
+            cap_llvm = capability
+
+        proc = sm_arch_from_capability(cap_llvm)
+        features = get_features(options, cap_llvm)
         triple = "nvptx64-nvidia-cuda"
         nvidia.set_short_ptr()
         llvm.attach_datalayout(llvm_mod, triple, proc, features)
@@ -1017,10 +1274,10 @@ class CUDABackend(BaseBackend):
             metadata["num_warps"] = total_num_warps
         metadata["shared"] = src.get_int_attr("ttg.shared")
         metadata["tmem_size"] = src.get_int_attr("ttg.tensor_memory_size")
-        metadata["global_scratch_size"] = src.get_int_attr("ttg.global_scratch_memory_size")
-        metadata["global_scratch_align"] = src.get_int_attr("ttg.global_scratch_memory_alignment")
-        metadata["profile_scratch_size"] = (src.get_int_attr("ttg.profile_scratch_memory_size") or 0)
-        metadata["profile_scratch_align"] = (src.get_int_attr("ttg.profile_scratch_memory_alignment") or 1)
+        metadata["global_scratch_size"] = src.get_int_attr("ttg.global_scratch_memory_size") or 0
+        metadata["global_scratch_align"] = src.get_int_attr("ttg.global_scratch_memory_alignment") or 1
+        metadata["profile_scratch_size"] = src.get_int_attr("ttg.profile_scratch_memory_size") or 0
+        metadata["profile_scratch_align"] = src.get_int_attr("ttg.profile_scratch_memory_alignment") or 1
         ret = str(llvm_mod)
         del llvm_mod
         del context
@@ -1030,10 +1287,17 @@ class CUDABackend(BaseBackend):
         ptx_version = get_ptx_version_from_options(opt, self.target.arch)
 
         triple = "nvptx64-nvidia-cuda"
-        proc = sm_arch_from_capability(capability)
-        features = get_features(opt, self.target.arch)
+
+        if capability == 107:
+            cap_llvm = 100
+        else:
+            cap_llvm = capability
+
+        proc = sm_arch_from_capability(cap_llvm)
+        features = get_features(opt, cap_llvm)
         flags = ["nvptx-mad-wide-opt"]
-        ret = llvm.translate_to_asm(src, triple, proc, features, flags, opt.enable_fp_fusion, False)
+        canonicalize_gep = "fpsan" in opt.instrumentation_mode
+        ret = llvm.translate_to_asm(src, triple, proc, features, flags, opt.enable_fp_fusion, False, canonicalize_gep)
         # Find kernel names (there should only be one)
         names = re.findall(r".visible .entry ([a-zA-Z_][a-zA-Z0-9_]*)", ret)
         assert len(names) == 1
@@ -1047,6 +1311,7 @@ class CUDABackend(BaseBackend):
             # Note: if this flag is removed, the source var name and type info will be lost when ptx was compiled into cubin
             #           and we may not be able to see them in cuda-gdb
             ret = re.sub(r",\s*debug|debug,\s*", "", ret)
+        ret = normalize_ptx_file_metadata(ret)
         if knobs.nvidia.dump_nvptx:
             print("// -----// NVPTX Dump //----- //")
             print(ret)
@@ -1088,9 +1353,11 @@ class CUDABackend(BaseBackend):
             # Accept more ptxas options if provided
             ptx_extra_options = opt.ptx_options.split(" ") if opt.ptx_options else []
 
-            # Use -Ofc mid to compile ConSan code, if nothing else is specified.
-            if any(mode in knobs.compilation.instrumentation_mode for mode in ["consan", "fpsan"]):
-                ptx_extra_options += ["-Ofc", "mid"]
+            # -Ofc mid miscompiles some large ConSan kernels into invalid global
+            # accesses; -O1 keeps compile time reasonable without that ptxas bug.
+            if (not knobs.nvidia.disable_ptxas_opt
+                    and any(mode in opt.instrumentation_mode for mode in ["consan", "fpsan"])):
+                ptx_extra_options += ["--opt-level", "1"]
 
             # Add --regAllocOptLevel=2 to work around ptxas 13.x bug
             reg_alloc = ["--regAllocOptLevel=2"]
@@ -1119,7 +1386,7 @@ class CUDABackend(BaseBackend):
                 fbin,
             ]
             try:
-                subprocess.run(ptxas_cmd, check=True, close_fds=False, stderr=flog)
+                subprocess.run(ptxas_cmd, check=True, close_fds=False, stderr=flog, env=knobs.nvidia.get_tool_env())
                 if knobs.nvidia.dump_ptxas_log:
                     with open(flog.name) as log_file:
                         print(log_file.read())

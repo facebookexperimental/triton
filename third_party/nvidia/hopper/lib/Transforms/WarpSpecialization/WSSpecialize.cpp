@@ -1,4 +1,5 @@
 #include "CodePartitionUtility.h"
+#include "lib/Dialect/TritonGPU/Transforms/WarpSpecialization/PartitionAttrs.h"
 #include "mlir/Analysis/SliceAnalysis.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinAttributes.h"
@@ -37,12 +38,14 @@ namespace mlir {
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
 #define LDBG(X) LLVM_DEBUG(DBGS() << X << "\n")
 
-static bool isWarpSpecializeBarrierAlloc(Value value) {
+namespace {
+
+bool isWarpSpecializeBarrierAlloc(Value value) {
   auto alloc = dyn_cast_or_null<ttg::LocalAllocOp>(value.getDefiningOp());
   return alloc && alloc->hasAttr(kWarpSpecializeGeneratedBarrierAttrName);
 }
 
-static void invalidateBarrierAlloc(OpBuilder &builder, Value barrierAlloc) {
+void invalidateBarrierAlloc(OpBuilder &builder, Value barrierAlloc) {
   auto barrierType = cast<ttg::MemDescType>(barrierAlloc.getType());
   int64_t numBarriers = barrierType.getShape().front();
   assert(numBarriers > 0 && "expected at least one barrier");
@@ -59,7 +62,8 @@ Operation *SpecializeOp(Operation *op, IRMapping &mapping,
 
 /// Check if `value` is transitively needed by an operation with the given
 /// asyncTaskId.
-static bool isValueNeededByTask(Value value, AsyncTaskId asyncTaskId) {
+static bool isValueNeededByTask(Value value, AsyncTaskId asyncTaskId,
+                                bool followBackedge = true) {
   SmallVector<Value> worklist;
   DenseSet<Value> visited;
   worklist.push_back(value);
@@ -67,6 +71,44 @@ static bool isValueNeededByTask(Value value, AsyncTaskId asyncTaskId) {
   while (!worklist.empty()) {
     Value curr = worklist.pop_back_val();
     for (Operation *user : curr.getUsers()) {
+      // Follow only this operand through a shared control-flow yield.
+      if (auto yield = dyn_cast<scf::YieldOp>(user)) {
+        if (auto forOp = dyn_cast<scf::ForOp>(yield->getParentOp())) {
+          for (auto [index, operand] : llvm::enumerate(yield.getOperands())) {
+            if (operand != curr)
+              continue;
+            if (index >= forOp.getNumResults())
+              continue;
+            Value iterArg = forOp.getRegionIterArg(index);
+            if (followBackedge && visited.insert(iterArg).second)
+              worklist.push_back(iterArg);
+            Value result = forOp.getResult(index);
+            if (visited.insert(result).second)
+              worklist.push_back(result);
+          }
+          continue;
+        }
+      }
+      // Follow an init only through its matching loop-carried value.
+      if (auto forOp = dyn_cast<scf::ForOp>(user)) {
+        bool isInit = false;
+        for (auto [index, init] : llvm::enumerate(forOp.getInitArgs())) {
+          if (init != curr)
+            continue;
+          isInit = true;
+          Value iterArg = forOp.getRegionIterArg(index);
+          if (visited.insert(iterArg).second)
+            worklist.push_back(iterArg);
+          Value result = forOp.getResult(index);
+          if (visited.insert(result).second)
+            worklist.push_back(result);
+        }
+        bool isLoopControl = curr == forOp.getLowerBound() ||
+                             curr == forOp.getUpperBound() ||
+                             curr == forOp.getStep();
+        if (isInit && !isLoopControl)
+          continue;
+      }
       if (hasAsyncTaskId(user, asyncTaskId))
         return true;
       for (Value result : user->getResults()) {
@@ -82,9 +124,10 @@ static bool isValueNeededByTask(Value value, AsyncTaskId asyncTaskId) {
 /// with the given asyncTaskId. This handles the case where an op doesn't
 /// have the target asyncTaskId but produces values consumed (directly or
 /// through a chain of ops) by ops that do.
-static bool isNeededByTask(Operation *op, AsyncTaskId asyncTaskId) {
+static bool isNeededByTask(Operation *op, AsyncTaskId asyncTaskId,
+                           bool followBackedge = true) {
   for (Value result : op->getResults()) {
-    if (isValueNeededByTask(result, asyncTaskId))
+    if (isValueNeededByTask(result, asyncTaskId, followBackedge))
       return true;
   }
   return false;
@@ -145,16 +188,16 @@ unsigned scanRegUsage(Block *block, AsyncTaskId asyncTaskId,
 }
 
 // Collect argument indices that are used by the specific taskId.
-static SmallVector<unsigned> collectBlockArgsForTask(scf::ForOp forOp,
-                                                     int asyncTaskId) {
+SmallVector<unsigned> collectBlockArgsForTask(scf::ForOp forOp,
+                                              int asyncTaskId) {
 
   // Collect argument indices that can be reached along the definition chain.
   SetVector<unsigned> argIndices;
   std::function<void(scf::ForOp, Value, unsigned)> dfs =
       [&](scf::ForOp nestedForOp, Value arg, unsigned argIdx) {
         for (auto user : arg.getUsers()) {
-          // Skip ops that are not in the same async task
-          if (!hasAsyncTaskId(user, asyncTaskId))
+          if (!hasAsyncTaskId(user, asyncTaskId) &&
+              !isNeededByTask(user, asyncTaskId))
             continue;
 
           if (isa<scf::YieldOp>(user)) {
@@ -251,21 +294,33 @@ static SmallVector<unsigned> collectBlockArgsForTask(scf::ForOp forOp,
         }
       };
 
-  // check dependency with DFS traversal for loop args and results.
+  // Collect loop arguments and results needed by this task.
   mlir::Block &block = forOp.getRegion().front();
+  DenseSet<unsigned> nonBackedgeArgs;
   for (unsigned i = forOp.getNumInductionVars(); i < block.getNumArguments();
        ++i) {
     auto arg = block.getArgument(i);
-    dfs(forOp, arg, i - forOp.getNumInductionVars());
+    unsigned argIdx = i - forOp.getNumInductionVars();
+    dfs(forOp, arg, argIdx);
+    if (isValueNeededByTask(arg, asyncTaskId, /*followBackedge=*/false))
+      nonBackedgeArgs.insert(argIdx);
   }
+  DenseSet<unsigned> nonBackedgeResults;
   for (unsigned i = 0; i < forOp.getNumResults(); ++i) {
     auto result = forOp->getResult(i);
+    if (isValueNeededByTask(result, asyncTaskId, /*followBackedge=*/false))
+      nonBackedgeResults.insert(i);
     if (isValueNeededByTask(result, asyncTaskId))
       argIndices.insert(i);
     dfs(forOp, result, i);
   }
 
-  SmallVector<unsigned> args(argIndices.begin(), argIndices.end());
+  // Ignore slots whose only path to this task is their own backedge.
+  SmallVector<unsigned> args;
+  for (unsigned i : argIndices) {
+    if (nonBackedgeArgs.count(i) || nonBackedgeResults.count(i))
+      args.push_back(i);
+  }
   llvm::sort(args);
   return args;
 }
@@ -411,8 +466,14 @@ Operation *SpecializeForOp(scf::ForOp forOp, IRMapping &mapping,
   // Create YieldOp for newForOp.
   auto yieldOp = llvm::cast<scf::YieldOp>(forOp.getBody()->getTerminator());
   SmallVector<Value> newYieldOperands;
-  for (unsigned i : usedArgs)
-    newYieldOperands.push_back(mapping.lookup(yieldOp.getOperand(i)));
+  for (unsigned i : usedArgs) {
+    Value operand = yieldOp.getOperand(i);
+    bool isDefinedOutsideLoop =
+        !forOp.getRegion().isAncestor(operand.getParentRegion());
+    Value mapped = isDefinedOutsideLoop ? mapping.lookupOrDefault(operand)
+                                        : mapping.lookup(operand);
+    newYieldOperands.push_back(mapped);
+  }
 
   bool createNewYield = true;
   if (newForOp.getBody()->mightHaveTerminator()) {
@@ -668,6 +729,8 @@ static SmallVector<Operation *> topologicalSort(ArrayRef<Operation *> opList) {
 
   return sortedOpList;
 }
+
+} // namespace
 
 void specializeRegion(triton::FuncOp funcOp, unsigned requestedRegisters) {
 

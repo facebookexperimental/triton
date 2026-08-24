@@ -1,10 +1,13 @@
 import expecttest
 import importlib.util
 import itertools
+import os
 import re
 import gc
 import shutil
 import pathlib
+import subprocess
+import sys
 from concurrent.futures import Executor, Future, ThreadPoolExecutor
 
 import pytest
@@ -13,6 +16,83 @@ import torch
 import triton
 import triton.language as tl
 from triton._internal_testing import is_hip
+from triton.runtime.cache import FileCacheManager, RemoteCacheManager
+
+
+def test_file_cache_manager_writes_utf8_under_ascii_locale(tmp_path):
+    env = os.environ.copy()
+    env.update({
+        "LANG": "C",
+        "LC_ALL": "C",
+        "PYTHONCOERCECLOCALE": "0",
+        "PYTHONUTF8": "0",
+        "TRITON_CACHE_DIR": str(tmp_path),
+    })
+    script = """
+import locale
+from pathlib import Path
+
+from triton.runtime.cache import FileCacheManager
+
+assert locale.getpreferredencoding(False) == "ANSI_X3.4-1968"
+text = "generated launcher " + chr(0x2014)
+path = FileCacheManager("unicode").put(text, "launcher.c", binary=False)
+assert Path(path).read_text(encoding="utf-8") == text
+"""
+    subprocess.run([sys.executable, "-c", script], check=True, env=env)
+
+
+def test_file_cache_manager_get_group_rejects_missing_child(fresh_knobs, tmp_path):
+    fresh_knobs.cache.dir = str(tmp_path)
+    manager = FileCacheManager("key")
+    metadata_path = manager.put("{}", "kernel.json", binary=False)
+    artifact_path = manager.put("binary", "kernel.cubin", binary=False)
+
+    manager.put_group("kernel.json", {
+        "kernel.json": metadata_path,
+        "kernel.cubin": artifact_path,
+    })
+    assert manager.get_group("kernel.json") == {
+        "kernel.json": metadata_path,
+        "kernel.cubin": artifact_path,
+    }
+
+    os.remove(artifact_path)
+    assert manager.get_group("kernel.json") is None
+
+
+def test_remote_cache_manager_get_group_rejects_missing_child(fresh_knobs, tmp_path):
+
+    class DictRemoteCacheBackend:
+        data = {}
+
+        def __init__(self, key):
+            self.key = key
+
+        def get(self, filenames):
+            return {filename: self.data[filename] for filename in filenames if filename in self.data}
+
+        def put(self, filename, data):
+            self.data[filename] = data
+
+    fresh_knobs.cache.dir = str(tmp_path)
+    fresh_knobs.cache.remote_manager_class = DictRemoteCacheBackend
+    DictRemoteCacheBackend.data = {}
+
+    manager = RemoteCacheManager("key")
+    manager.put("{}", "kernel.json", binary=False)
+    manager.put(b"binary", "kernel.cubin")
+    manager.put_group("kernel.json", {
+        "kernel.json": "unused-local-path",
+        "kernel.cubin": "unused-local-path",
+    })
+
+    group = manager.get_group("kernel.json")
+    assert group is not None
+    assert set(group) == {"kernel.json", "kernel.cubin"}
+
+    del DictRemoteCacheBackend.data["kernel.cubin"]
+    assert manager.get_group("kernel.json") is None
 
 
 @triton.jit
@@ -103,6 +183,68 @@ def test_nested2_change():
     baseline = kernel.cache_key
     updated = apply_src_change(kernel, 'i + 1', 'i + 2', function_0)
     assert baseline != updated
+
+
+ORDER_DEPENDENT_CONSTEXPR = tl.constexpr(42)
+
+
+@triton.jit
+def order_dependent_inner():
+    return ORDER_DEPENDENT_CONSTEXPR
+
+
+@triton.jit
+def order_dependent_outer():
+    order_dependent_inner()
+
+
+def test_cache_key_independent_of_dependency_hash_order():
+    functions = (order_dependent_inner, order_dependent_outer)
+
+    for function in functions:
+        function.hash = None
+        function.used_global_vals = {}
+    cold_key = order_dependent_outer.cache_key
+
+    for function in functions:
+        function.hash = None
+        function.used_global_vals = {}
+    order_dependent_inner.cache_key
+    prehashed_key = order_dependent_outer.cache_key
+
+    assert prehashed_key == cold_key
+
+
+def test_cache_key_independent_of_globals_dict_identity():
+
+    def make_child(value):
+        shared = tl.constexpr(value)
+
+        @triton.jit
+        def child():
+            return shared
+
+        return child
+
+    child_a = make_child(1)
+    child_b = make_child(2)
+
+    @triton.jit
+    def parent():
+        child_a()
+        child_b()
+
+    functions = (child_a, child_b, parent)
+
+    def key_after_prehashing(first, second):
+        for function in functions:
+            function.hash = None
+            function.used_global_vals = {}
+        first.cache_key
+        second.cache_key
+        return parent.cache_key
+
+    assert key_after_prehashing(child_a, child_b) == key_after_prehashing(child_b, child_a)
 
 
 def test_combine_fn_change():
@@ -708,6 +850,25 @@ def test_within_2gb(device, fresh_triton_cache) -> None:
             # Torch tensor <= 2GB
             kernel_add[(1, 0)](torch.empty(2**31 - 1, dtype=torch.int8, device=device))
             assert pointer_range_32 == pointer_range
+
+        with triton.knobs.runtime.scope():
+            # The C cache must distinguish HIP's storage-size specializations.
+            triton.knobs.runtime.jit_cache_hook = None
+            triton.knobs.amd.use_buffer_ops = True
+
+            @triton.jit(c_cache=True)
+            def kernel_add_with_c_cache(a):
+                tl.load(a)
+
+            launch = kernel_add_with_c_cache[(1, 0)]
+            launch(torch.empty(2**31 - 1, dtype=torch.int8, device=device))
+            assert kernel_add_with_c_cache.c_cache is True
+            device_id = getattr(torch, device).current_device()
+            kernel_cache = kernel_add_with_c_cache.device_caches[device_id][0]
+            assert len(kernel_cache) == 1
+
+            launch(torch.empty(2**31, dtype=torch.int8, device=device))
+            assert len(kernel_cache) == 2
 
 
 def test_function_arguments(device):

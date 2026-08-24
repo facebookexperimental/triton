@@ -72,7 +72,6 @@ private:
     StringRef calleeName = callOp.getCallee().value();
 
     auto operands = callOp.getOperands();
-    auto result = callOp.getResult();
 
     LLVM::LLVMFunctionType calleeType = callOp.getCalleeFunctionType();
     Type returnType = calleeType.getReturnType();
@@ -170,7 +169,7 @@ private:
                                            posResult->getResult(0),
                                            sign->getResult(0), defaultFlags);
     } else if (calleeName == "__ocml_tanh_f32") {
-      if (targetInfo.getISAFamily() == AMD::ISAFamily::GFX1250) {
+      if (targetInfo.getISAFamily() == triton::amdgpu::ISAFamily::GFX1250) {
         const char *intrinsic = "llvm.amdgcn.tanh.f32";
         replacementOp = LLVM::createLLVMIntrinsicCallOp(
             rewriter, loc, intrinsic, returnType, operands[0]);
@@ -203,7 +202,7 @@ struct ConvertBuiltinFuncToLLVM
     ModuleOp mod = getOperation();
 
     GreedyRewriteConfig config;
-    config.setRegionSimplificationLevel(GreedySimplifyRegionLevel::Aggressive);
+    config.setRegionSimplificationLevel(GreedySimplifyRegionLevel::Normal);
 
     AMD::TargetInfo targetInfo(this->gfxArch.getValue());
     RewritePatternSet patterns(context);

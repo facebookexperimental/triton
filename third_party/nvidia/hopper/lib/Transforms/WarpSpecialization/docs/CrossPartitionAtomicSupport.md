@@ -66,7 +66,7 @@ channel machinery provide synchronization:
 
 The producer→consumer synchronization is **not** hand-synthesized. Because the
 `local_store` (owner) and `local_load` (all partitions) form an ordinary
-cross-partition SMEM dependency, `doCodePartitionPost` turns it into (N) SMEM
+cross-partition SMEM dependency, `doCodePartition` turns it into (N) SMEM
 channels with the correct full/empty mbarriers and phase — i.e. the broadcast is
 expressed in terms of an existing, tested AutoWS channel rather than a bespoke
 handshake.
@@ -74,14 +74,15 @@ handshake.
 ### Case 3 — graceful reject
 
 `doDynamicTileBroadcast` returns `failure()`. The caller then calls the canonical
-`removeWarpSpecializeAttr(funcOp)`, which strips **both** the partition ids
+`removeWarpSpecMetadata(funcOp)`, which strips **both** the partition ids
 (`ttg.partition`) and the task ids (`async_task_id`) from every op, plus the WS
 loop attributes (`tt.warp_specialize`, `ttg.partition.stages`,
-`ttg.partition.types`, `ttg.warp_specialize.tag`) from `scf.for`/`scf.while`
-loops. The kernel is left unspecialized-but-compilable (never a crash/assert).
-This is the same teardown used by the other AutoWS bail-outs (`numWarps < 4`,
-`scf.if` else-block); `removeWarpSpecializeAttr` clears `async_task_id` too
-because this reject runs *after* propagation, unlike the earlier bail-outs.
+`ttg.partition.types`, `ttg.warp_specialize.tag`). The kernel is left
+unspecialized-but-compilable (never a crash/assert). This is the same teardown —
+one shared helper — used by the other AutoWS bail-outs (`numWarps < 4`, `scf.if`
+else-block) and by `PartitionSchedulingMeta`'s warp-budget reject;
+`removeWarpSpecMetadata` clears `async_task_id` too because this reject runs
+*after* propagation, unlike the earlier bail-outs.
 
 ## Two supporting fixes this feature required
 

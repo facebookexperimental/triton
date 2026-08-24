@@ -142,6 +142,14 @@ public:
   AxisInfo
   getAxisInfo(OpTy op,
               ArrayRef<const dataflow::Lattice<AxisInfo> *> operands) override {
+    if (operands.empty()) {
+      if (op->getNumResults() == 0)
+        return AxisInfo();
+      return AxisInfo::getPessimisticValueState(op->getResult(0));
+    }
+    auto tensorType = dyn_cast<RankedTensorType>(op->getResult(0).getType());
+    if (tensorType && tensorType.getRank() != operands[0]->getValue().getRank())
+      return AxisInfo::getPessimisticValueState(op->getResult(0));
     return operands[0]->getValue();
   }
 };
@@ -155,6 +163,11 @@ public:
   AxisInfo
   getAxisInfo(mlir::UnrealizedConversionCastOp op,
               ArrayRef<const dataflow::Lattice<AxisInfo> *> operands) override {
+    if (operands.empty()) {
+      if (op->getNumResults() == 0)
+        return AxisInfo();
+      return AxisInfo::getPessimisticValueState(op->getResult(0));
+    }
     auto tensorType = dyn_cast<RankedTensorType>(op.getResultTypes()[0]);
     if (tensorType &&
         tensorType.getRank() != operands[0]->getValue().getRank()) {
@@ -511,7 +524,6 @@ private:
 
   int64_t getDivisibility(OpTy op, const AxisInfo &lhs, const AxisInfo &rhs,
                           int dim) override {
-    auto resTy = dyn_cast<RankedTensorType>(op.getType());
     if (rhs.getConstancy(dim) > 1) {
       // lhs: d_lhs * k = gcd(d_lhs, d_rhs) * k' * k = gcd(d_lhs, d_rhs) * k''
       // rhs: d_rhs * p = gcd(d_lhs, d_rhs) * p' * p = gcd(d_lhs, d_rhs) * p''
@@ -705,8 +717,14 @@ public:
     auto srcSuffixProducts = getSuffixProducts(srcShape);
     auto dstSuffixProducts = getSuffixProducts(dstShape);
 
+    // Unit contiguity makes every element a group base, so divisibility from
+    // such a dimension applies globally. AxisInfo normalization propagates
+    // this fact within one value, but reshape can lose the source axis that
+    // carries it, so seed every destination axis before refining it below.
+    int64_t globalDivisibility = srcInfo.getGlobalDivisibility();
+
     AxisInfo::DimVectorT contiguity(dstTy.getRank(), 1);
-    AxisInfo::DimVectorT divisibility(dstTy.getRank(), 1);
+    AxisInfo::DimVectorT divisibility(dstTy.getRank(), globalDivisibility);
     AxisInfo::DimVectorT constancy(dstTy.getRank(), 1);
 
     for (int dstDim = 0; dstDim < dstTy.getRank(); ++dstDim) {
@@ -748,9 +766,11 @@ public:
           // unchanged. When the run is truncated, later group bases can start
           // inside the original run, so divisibility must be clamped
           // accordingly.
-          divisibility[dstDim] = dstContiguity == srcContiguity
-                                     ? srcDivisibility
-                                     : std::min(srcDivisibility, dstContiguity);
+          int64_t dstDivisibility =
+              dstContiguity == srcContiguity
+                  ? srcDivisibility
+                  : std::min(srcDivisibility, dstContiguity);
+          divisibility[dstDim] = std::max(globalDivisibility, dstDivisibility);
         }
         continue;
       }
@@ -778,9 +798,6 @@ public:
         }
         constancy[dstDim] = dstConstancy;
       }
-      // Divisibility stays the same when the constant block is split
-      // even for constancy == 1.
-      divisibility[dstDim] = srcDivisibility;
     }
 
     return AxisInfo(contiguity, divisibility, constancy,
@@ -961,8 +978,12 @@ public:
                                   rhsInfo.getConstancy(d), condConstancy[d]));
           contiguity.push_back(gcd(lhsInfo.getContiguity(d),
                                    rhsInfo.getContiguity(d), condConstancy[d]));
+          // getDivisibilityFromContiguity does not see condConstancy; clamp
+          // by the just-computed output contiguity so the result remains
+          // sound when condConstancy reduces it below the input contiguities.
           divisibility.push_back(
-              getDivisibilityFromContiguity(lhsInfo, rhsInfo, d));
+              gcd(getDivisibilityFromContiguity(lhsInfo, rhsInfo, d),
+                  contiguity.back()));
         }
       }
       if (lhsInfo.getConstantValue().has_value() &&
@@ -1379,11 +1400,10 @@ unsigned ModuleAxisInfoAnalysis::getContiguity(Value offsetsValue,
   // the analysis to one dimension. We should determine contiguity on the
   // flattenOuts() layout
   auto tensorTy = cast<RankedTensorType>(offsetsValue.getType());
-  auto linAttr = gpu::toLinearEncoding(tensorTy);
-  auto order = linAttr.getOrder();
+  auto order = gpu::getOrder(tensorTy);
   unsigned align = getAlignment(offsetsValue, elementBitWidth);
 
-  auto uniqueContigPerThread = linAttr.getContigPerThread();
+  auto uniqueContigPerThread = gpu::getContigPerThread(tensorTy);
   assert(order[0] < uniqueContigPerThread.size() &&
          "Unexpected uniqueContigPerThread size");
   unsigned contiguity = uniqueContigPerThread[order[0]];
@@ -1412,8 +1432,7 @@ unsigned ModuleAxisInfoAnalysis::getAlignment(Value offsetsValue,
   auto *axisInfo = getAxisInfo(offsetsValue);
   if (!axisInfo)
     return 1;
-  auto linAttr = gpu::toLinearEncoding(tensorTy);
-  auto order = linAttr.getOrder();
+  auto order = gpu::getOrder(tensorTy);
 
   auto divisibility = axisInfo->getDivisibility(order[0]);
   auto elemNumBytes = std::max<unsigned>(elementBitWidth / 8, 1);
@@ -1444,8 +1463,7 @@ unsigned ModuleAxisInfoAnalysis::getMaskAlignment(Value mask) {
   auto *axisInfo = getAxisInfo(mask);
   if (!axisInfo)
     return 1;
-  auto linAttr = gpu::toLinearEncoding(tensorTy);
-  auto maskOrder = linAttr.getOrder();
+  auto maskOrder = gpu::getOrder(tensorTy);
   auto alignment = std::max<unsigned>(axisInfo->getConstancy(maskOrder[0]), 1);
   LDBG("getMaskAlignment maskOrder[0] " << maskOrder[0] << " alignment "
                                         << alignment);

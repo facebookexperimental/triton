@@ -14,6 +14,7 @@ python/triton_kernels/triton*.egg-info/
 
 python/triton/_C/*.pyd
 python/triton/_C/*.so
+python/triton/_C/*.so.*
 python/triton/_C/*.dylib
 python/triton/_C/*.pdb
 python/triton/_C/*.exe
@@ -73,6 +74,8 @@ third_party/tlx/language/tlx/inductor/bin
 # Third-party include
 third_party/nvidia/backend/include
 third_party/nvidia/backend/lib/cupti
+third_party/nvidia/backend/lib/cupti-blackwell
+third_party/nvidia/backend/lib/gsan.ll
 
 # Docs
 docs/_build/

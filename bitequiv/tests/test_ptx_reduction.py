@@ -67,8 +67,8 @@ def test_each_num_warps_is_a_distinct_ptx_class():
 
 
 def _has_fma(name):
+    from bitequiv.core.treeir import FpOp
     from bitequiv.ptx.builder import build_trees
-    from bitequiv.ptx.treeir import FpOp
     from pyptx.parser import parse
     func = [d for d in parse(_fixture(name)).directives if getattr(d, "is_entry", False)][0]
     seen, stack, found = set(), list(build_trees(func)), False
@@ -117,7 +117,8 @@ _GOLDEN = {
     "sum_nw4": "c6fda1d478b8",
     "sum_nw8": "dca122a2b82e",
     "dot_fuse_on": "80acbd23018a",
-    "dot_fuse_off": "32aa7e471b9a",
+    "dot_fuse_off": "a06e27500cde",  # multi-element leaf mul(a_i,b_i) now collapses its balanced bottom
+    #                                  region (dot num_warps recovery; pairing is config-invariant); still != fuse_on
 }
 
 

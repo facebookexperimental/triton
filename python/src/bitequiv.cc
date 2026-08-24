@@ -9,17 +9,18 @@
 #include "mlir/IR/OwningOpRef.h"
 #include "mlir/Parser/Parser.h"
 
-#include <pybind11/pybind11.h>
-#include <pybind11/stl.h>
+#include <nanobind/nanobind.h>
+#include <nanobind/stl/string.h>
+#include <nanobind/stl/vector.h>
 
 #include <stdexcept>
 #include <string>
 #include <vector>
 
-namespace py = pybind11;
+namespace py = nanobind;
 using namespace mlir;
 
-void init_triton_bitequiv(py::module &&m) {
+void init_triton_bitequiv(py::module_ &m) {
   m.doc() = "Bitwise-equivalence reduction-order analysis (MLIR-native).";
 
   // Parse a TTGIR module from text (the context must already have the dialects

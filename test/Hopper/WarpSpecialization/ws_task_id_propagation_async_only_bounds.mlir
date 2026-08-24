@@ -20,7 +20,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
   // CHECK:       scf.for
   // CHECK:         scf.for %{{.*}} = %[[C0]] to %{{.*}} step %[[C1]]
 
-  tt.func public @nested_for_async_only_constant_bounds(%arg0: !tt.tensordesc<tensor<128x64xf16>>, %arg1: !tt.tensordesc<tensor<64x256xf16>>, %arg2: !tt.tensordesc<tensor<128x256xf16>>, %arg3: i32, %arg4: i32, %arg5: i32) {
+  tt.func public @nested_for_async_only_constant_bounds(%arg0: !tt.tensordesc<128x64xf16>, %arg1: !tt.tensordesc<64x256xf16>, %arg2: !tt.tensordesc<128x256xf16>, %arg3: i32, %arg4: i32, %arg5: i32) {
     %c0 = arith.constant 0 : i32
     %c1 = arith.constant 1 : i32
     %c64 = arith.constant 64 : i32
@@ -31,9 +31,9 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
       // Inner loop: only tasks 1 (loads) and 2 (dot/alloc) are present.
       // Bounds %c0 and %c1 are constants defined at function scope.
       %inner:2 = scf.for %k = %c0 to %arg5 step %c1 iter_args(%acc = %cst, %off = %c0) -> (tensor<128x256xf32, #mma>, i32) : i32 {
-        %a = tt.descriptor_load %arg0[%tile, %off] {async_task_id = array<i32: 1>} : !tt.tensordesc<tensor<128x64xf16>> -> tensor<128x64xf16, #blocked>
+        %a = tt.descriptor_load %arg0[%tile, %off] {async_task_id = array<i32: 1>} : !tt.tensordesc<128x64xf16> -> tensor<128x64xf16, #blocked>
         %a_alloc = ttg.local_alloc %a {async_task_id = array<i32: 2>} : (tensor<128x64xf16, #blocked>) -> !ttg.memdesc<128x64xf16, #shared, #smem>
-        %b = tt.descriptor_load %arg1[%off, %tile] {async_task_id = array<i32: 1>} : !tt.tensordesc<tensor<64x256xf16>> -> tensor<64x256xf16, #blocked1>
+        %b = tt.descriptor_load %arg1[%off, %tile] {async_task_id = array<i32: 1>} : !tt.tensordesc<64x256xf16> -> tensor<64x256xf16, #blocked1>
         %b_alloc = ttg.local_alloc %b {async_task_id = array<i32: 2>} : (tensor<64x256xf16, #blocked1>) -> !ttg.memdesc<64x256xf16, #shared, #smem>
         %dot = ttng.warp_group_dot %a_alloc, %b_alloc, %acc {async_task_id = array<i32: 2>, inputPrecision = 0 : i32} : !ttg.memdesc<128x64xf16, #shared, #smem> * !ttg.memdesc<64x256xf16, #shared, #smem> -> tensor<128x256xf32, #mma>
         %new_off = arith.addi %off, %c64 {async_task_id = array<i32: 1>} : i32
@@ -42,7 +42,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
       // Epilogue: only task 0 ops. This task has no ops inside the inner loop.
       %trunc = arith.truncf %inner#0 {async_task_id = array<i32: 0>} : tensor<128x256xf32, #mma> to tensor<128x256xf16, #mma>
       %cvt = ttg.convert_layout %trunc {async_task_id = array<i32: 0>} : tensor<128x256xf16, #mma> -> tensor<128x256xf16, #blocked1>
-      tt.descriptor_store %arg2[%tile, %tile], %cvt {async_task_id = array<i32: 0>} : !tt.tensordesc<tensor<128x256xf16>>, tensor<128x256xf16, #blocked1>
+      tt.descriptor_store %arg2[%tile, %tile], %cvt {async_task_id = array<i32: 0>} : !tt.tensordesc<128x256xf16>, tensor<128x256xf16, #blocked1>
     }
     tt.return
   }

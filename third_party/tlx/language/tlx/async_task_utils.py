@@ -26,8 +26,8 @@ class async_task:
             if core._unwrap_if_constexpr(args[0]) == "default":
                 self.is_explict = True
                 self.is_default = True
-                assert "num_regs" not in kwargs and "registers" not in kwargs, \
-                    "Cannot specify registers for the default async_task; it receives leftover registers from the partition budget"
+                self.num_regs = core._unwrap_if_constexpr(kwargs.get("num_regs", kwargs.get("registers", None)))
+                _validate_num_regs(self.num_regs)
                 self.replicate = core._unwrap_if_constexpr(kwargs.get("replicate", 1))
                 self.warp_group_start_id = core._unwrap_if_constexpr(kwargs.get("warp_group_start_id", None))
             else:
@@ -48,6 +48,21 @@ class async_task:
 
 
 class async_tasks:
+
+    def __init__(
+        self,
+        *args,
+        exclusive=False,
+        no_ending_cluster_sync=False,
+        mbarrier_try_wait_suspend_ns=None,
+        **kwargs,
+    ):
+        self.exclusive = core._unwrap_if_constexpr(exclusive)
+        self.no_ending_cluster_sync = core._unwrap_if_constexpr(no_ending_cluster_sync)
+        self.mbarrier_try_wait_suspend_ns = core._unwrap_if_constexpr(mbarrier_try_wait_suspend_ns)
+        if self.mbarrier_try_wait_suspend_ns is not None:
+            if not isinstance(self.mbarrier_try_wait_suspend_ns, int) or self.mbarrier_try_wait_suspend_ns < 0:
+                raise ValueError("mbarrier_try_wait_suspend_ns must be a non-negative integer")
 
     def __enter__(self):
         return self

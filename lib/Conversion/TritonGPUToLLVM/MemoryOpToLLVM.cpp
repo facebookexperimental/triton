@@ -6,6 +6,8 @@
 #include "triton/Conversion/TritonGPUToLLVM/TargetInfoBase.h"
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Tools/LayoutUtils.h"
+#include "llvm/ADT/DenseMap.h"
 
 namespace {
 
@@ -13,106 +15,50 @@ using namespace mlir;
 using namespace mlir::triton;
 using namespace mlir::triton::gpu;
 
+static std::pair<LinearLayout, LinearLayout>
+getPhysicalLayouts(LinearLayout regLayout, MemDescType memDescTy) {
+  auto sharedLayout = toLinearLayout(memDescTy);
+  if (!regLayout.isModular())
+    return {std::move(regLayout), std::move(sharedLayout)};
+
+  auto allocShape = getAllocationShapePerCTA(memDescTy);
+  sharedLayout = toLinearLayout(allocShape, memDescTy.getEncoding());
+  SmallVector<std::pair<StringAttr, int32_t>> paddedOutDims;
+  for (auto dim : regLayout.getOutDimNames())
+    paddedOutDims.push_back({dim, sharedLayout.getOutDimSize(dim)});
+  regLayout = LinearLayout(regLayout.getBases(), paddedOutDims,
+                           /*requireSurjective=*/false);
+  return {std::move(regLayout), std::move(sharedLayout)};
+}
+
 // Helper for LocalGather/ScatterOpConversion.
 // For gather: storeVals is empty, returns loaded values.
 // For scatter: storeVals contains values to store, returns empty.
-SmallVector<Value>
-lowerLocalScGt(Location loc, MLIRContext *ctx, MemDescType memDescTy,
-               SharedMemoryObject smemObj, Type llvmElemTy,
-               ArrayRef<Value> idxValues, ArrayRef<SmallVector<Value>> coords,
-               unsigned axis, ArrayRef<Value> storeVals, RewriterBase &rewriter,
-               const TargetInfoBase &targetInfo) {
+SmallVector<Value> lowerLocalScGt(Location loc, MemDescType memDescTy,
+                                  SharedMemoryObject smemObj, Type llvmElemTy,
+                                  const LinearLayout &regLayout,
+                                  ArrayRef<Value> idxValues, unsigned axis,
+                                  ArrayRef<Value> storeVals,
+                                  RewriterBase &rewriter,
+                                  const TargetInfoBase &targetInfo) {
   auto b = TritonLLVMOpBuilder(loc, rewriter);
   bool isScatter = !storeVals.empty();
-
-  // Get the shared memory layout (linear component for padded layouts)
-  auto sharedLayout = isPaddedEncoding(memDescTy.getEncoding())
-                          ? paddedLinearLayout(memDescTy)
-                          : toLinearLayout(memDescTy);
-  LinearLayout invSharedLayout = sharedLayout.invert();
-
-  // Get layout dimension names for all dims
-  SmallVector<StringAttr> allDims;
-  for (unsigned dim = 0, rank = memDescTy.getRank(); dim < rank; ++dim) {
-    allDims.push_back(str_attr("dim" + Twine(dim)));
-  }
-
-  auto kOffset = str_attr("offset");
-
-  // Get the subslice affine offset (non-zero for memdesc subslices)
-  Value affineOffset = smemObj.getShmemOffset(loc, rewriter, memDescTy);
-  auto bitwidth = getIntOrFloatOrPtrBitWidth(llvmElemTy);
+  auto offsetAndBlock = computeBlockLocalOffsets(
+      loc, memDescTy, regLayout, idxValues, axis, rewriter, targetInfo);
+  SmallVector<LocalSharedMemoryAddress> addrs = materializeLocalAddrs(
+      loc, memDescTy, smemObj, llvmElemTy, offsetAndBlock, rewriter);
 
   SmallVector<Value> results;
-  if (!isScatter) {
-    results.resize(coords.size());
-  }
+  if (!isScatter)
+    results.resize(idxValues.size());
 
-  for (auto [i, idxVal] : llvm::enumerate(idxValues)) {
-    // Convert index to i32 if needed
-    Value idx = idxVal;
-    unsigned idxWidth = idx.getType().getIntOrFloatBitWidth();
-    if (idxWidth > 32) {
-      idx = b.trunc(i32_ty, idx);
-    } else if (idxWidth < 32) {
-      idx = b.zext(i32_ty, idx);
-    }
-
-    // Copy coordinates and replace the axis coordinate with the index value
-    SmallVector<Value> indices(coords[i]);
-    indices[axis] = idx;
-
-    // Apply inverted shared layout to compute offset
-    SmallVector<std::pair<StringAttr, Value>> inputs;
-    for (unsigned dim = 0; dim < indices.size(); ++dim) {
-      inputs.push_back({allDims[dim], indices[dim]});
-    }
-
-    auto outputs = applyLinearLayout(loc, rewriter, invSharedLayout, inputs);
-
-    // Extract the offset value
-    Value offset = nullptr;
-    for (auto [name, value] : outputs) {
-      if (name == kOffset) {
-        offset = value;
-        break;
-      }
-    }
-    assert(offset && "expected offset output from inverted shared layout");
-
-    // For subslices, the physical offset is computed as:
-    //   physical_offset = L⁻¹(coords) ⊕ L⁻¹(subslice_logical_offset)
-    //
-    // We use XOR for consistency with lowerLdSt. MemDescSubsliceOp::verify()
-    // enforces:
-    // 1. Subslice offsets must be multiples of the tile size
-    // 2. Subslice offsets must map to power-of-2 physical offsets
-    //
-    // These constraints ensure the bit ranges of L⁻¹(coords) and
-    // L⁻¹(subslice_offset) are disjoint, so XOR and addition are equivalent.
-    offset = b.xor_(offset, affineOffset);
-
-    // Add padding offset for padded layouts (non-linear component)
-    Value ptr;
-    if (isPaddedEncoding(memDescTy.getEncoding())) {
-      // Convert offset to bytes for padding calculation
-      Value offsetBytes = b.mul(offset, b.i32_val(bitwidth / 8));
-      auto shifts = getPaddedSharedShifts(memDescTy.getEncoding(), bitwidth,
-                                          /*offsetInBytes=*/true);
-      // GEP in bytes: base + offset*elemSize + padOffset
-      Value totalOffset = applyPadding(loc, rewriter, offsetBytes, shifts);
-      ptr = b.gep(smemObj.getBase().getType(), i8_ty, smemObj.getBase(),
-                  totalOffset);
-    } else {
-      ptr = b.gep(smemObj.getBase().getType(), llvmElemTy, smemObj.getBase(),
-                  offset);
-    }
-
+  for (auto [i, addr] : llvm::enumerate(addrs)) {
     if (isScatter) {
-      targetInfo.storeShared(rewriter, loc, ptr, storeVals[i], b.true_val());
+      targetInfo.storeDShared(rewriter, loc, addr.ptr, addr.ctaId, storeVals[i],
+                              b.true_val());
     } else {
-      results[i] =
-          targetInfo.loadShared(rewriter, loc, ptr, llvmElemTy, b.true_val());
+      results[i] = targetInfo.loadDShared(rewriter, loc, addr.ptr, addr.ctaId,
+                                          llvmElemTy, b.true_val());
     }
   }
 
@@ -131,29 +77,15 @@ LogicalResult lowerLocalStore(Location loc, MLIRContext *ctx, Value regVal,
   auto llvmElemTy = typeConverter->convertType(memDescTy.getElementType());
 
   auto regLayout = toLinearLayout(regTy);
-  auto kReg = str_attr("register");
-  auto kLane = str_attr("lane");
-  auto kWarp = str_attr("warp");
-  auto kOffset = str_attr("offset");
   LinearLayout cvt = LinearLayout::empty();
   if (isPaddedEncoding(memDescTy.getEncoding())) {
-    cvt = regLayout.invertAndCompose(paddedLinearLayout(memDescTy));
+    cvt = invertAndComposeBlockLocal(paddedLinearLayout(memDescTy), regLayout);
   } else {
-    auto sharedLayout = toLinearLayout(memDescTy);
-    cvt = regLayout.invertAndCompose(sharedLayout);
+    auto [physicalRegLayout, sharedLayout] =
+        getPhysicalLayouts(regLayout, memDescTy);
+    regLayout = std::move(physicalRegLayout);
+    cvt = invertAndComposeBlockLocal(sharedLayout, regLayout);
   }
-  auto kBlock = str_attr("block");
-  // NYI. We would need to emit a map.shared::cluster instruction.
-  if (!cvt.isTrivialOver({kBlock})) {
-    return failure();
-  }
-  // Keep the "partition" output dim (PartitionedSharedEncoding) so lowerLdSt
-  // can select the per-partition base pointer; lowerLdSt strips it afterwards.
-  SmallVector<StringAttr> ldStOutDims = {kOffset};
-  auto kPartition = str_attr("partition");
-  if (cvt.hasOutDim(kPartition))
-    ldStOutDims.push_back(kPartition);
-  cvt = cvt.sublayout({kReg, kLane, kWarp}, ldStOutDims);
   lowerLocalLdSt(loc, ctx, cvt, inVals, llvmElemTy, memDescTy, smemObj,
                  rewriter, targetInfo, nullptr, clusterCTARank, barrierPtr);
 
@@ -255,11 +187,15 @@ struct LocalDeallocOpConversion
 
 struct LocalLoadOpConversion : public ConvertOpToLLVMPattern<LocalLoadOp> {
 public:
-  LocalLoadOpConversion(LLVMTypeConverter &typeConverter,
-                        const TargetInfoBase &targetInfo,
-                        PatternBenefit benefit = 1)
-      : ConvertOpToLLVMPattern(typeConverter, benefit), targetInfo(targetInfo) {
-  }
+  LocalLoadOpConversion(
+      LLVMTypeConverter &typeConverter, const TargetInfoBase &targetInfo,
+      PatternBenefit benefit = 1,
+      std::shared_ptr<DistributedCoordinateGroups> coordinateGroups = nullptr)
+      : ConvertOpToLLVMPattern(typeConverter, benefit), targetInfo(targetInfo),
+        coordinateGroups(
+            coordinateGroups
+                ? std::move(coordinateGroups)
+                : std::make_shared<DistributedCoordinateGroups>()) {}
 
   LogicalResult
   matchAndRewrite(LocalLoadOp op, OpAdaptor adaptor,
@@ -277,33 +213,36 @@ public:
                                                          llvmElemTy, rewriter);
 
     auto regLayout = toLinearLayout(regTy);
-    auto kReg = str_attr("register");
-    auto kLane = str_attr("lane");
-    auto kWarp = str_attr("warp");
-    auto kOffset = str_attr("offset");
     LinearLayout cvt = LinearLayout::empty();
     if (isPaddedEncoding(memDescTy.getEncoding())) {
-      cvt = regLayout.invertAndCompose(paddedLinearLayout(memDescTy));
+      cvt =
+          invertAndComposeBlockLocal(paddedLinearLayout(memDescTy), regLayout);
     } else {
-      auto sharedLayout = toLinearLayout(memDescTy);
-      cvt = regLayout.invertAndCompose(sharedLayout);
+      auto [physicalRegLayout, sharedLayout] =
+          getPhysicalLayouts(regLayout, memDescTy);
+      regLayout = std::move(physicalRegLayout);
+      cvt = invertAndComposeBlockLocal(sharedLayout, regLayout);
     }
-    auto kBlock = str_attr("block");
-    // NYI. We would need to emit a map.shared::cluster instruction.
-    if (!cvt.isTrivialOver({kBlock})) {
-      return failure();
+
+    std::optional<std::pair<Value, Value>> distributedCoordinates;
+    if (auto group = op->getAttrOfType<IntegerAttr>(
+            "tlx.rematerialize_coordinates_group")) {
+      auto kLane = str_attr("lane");
+      auto kWarp = str_attr("warp");
+      auto outDims = to_vector(cvt.getOutDimNames());
+      bool rematerializeLane =
+          cvt.hasInDim(kLane) && !cvt.sublayoutIsZero({kLane}, outDims);
+      bool rematerializeWarp =
+          cvt.hasInDim(kWarp) && !cvt.sublayoutIsZero({kWarp}, outDims);
+      distributedCoordinates = coordinateGroups->getOrCreate(
+          op, group.getInt(), rematerializeLane, rematerializeWarp, rewriter,
+          targetInfo);
     }
-    // Keep the "partition" output dim (PartitionedSharedEncoding) so lowerLdSt
-    // can select the per-partition base pointer; lowerLdSt strips it
-    // afterwards.
-    SmallVector<StringAttr> ldStOutDims = {kOffset};
-    auto kPartition = str_attr("partition");
-    if (cvt.hasOutDim(kPartition))
-      ldStOutDims.push_back(kPartition);
-    cvt = cvt.sublayout({kReg, kLane, kWarp}, ldStOutDims);
 
     auto outVals = lowerLocalLdSt(loc, ctx, cvt, {}, llvmElemTy, memDescTy,
-                                  smemObj, rewriter, targetInfo, op);
+                                  smemObj, rewriter, targetInfo, op,
+                                  /*ctaRank=*/{}, /*barrierPtr=*/{},
+                                  distributedCoordinates);
 
     Value result = packLLElements(loc, typeConverter, outVals, rewriter, regTy);
     rewriter.replaceOp(op, result);
@@ -313,6 +252,7 @@ public:
 
 private:
   const TargetInfoBase &targetInfo;
+  std::shared_ptr<DistributedCoordinateGroups> coordinateGroups;
 };
 
 struct LocalStoreOpConversion
@@ -424,7 +364,6 @@ public:
   matchAndRewrite(LocalGatherOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     auto loc = op.getLoc();
-    auto *ctx = op.getContext();
     auto memDescTy = cast<MemDescType>(op.getSrc().getType());
     // TODO: PartitionedSharedEncoding lowering will be enabled in subsequent
     // PRs.
@@ -442,12 +381,10 @@ public:
 
     SmallVector<Value> idxValues =
         unpackLLElements(loc, adaptor.getIndices(), rewriter);
-    SmallVector<SmallVector<Value>> dstIndices =
-        emitIndices(loc, rewriter, targetInfo, regTy.getEncoding(), regTy,
-                    /*withCTAOffset=*/true);
+    auto regLayout = toLinearLayout(regTy);
 
-    auto results = lowerLocalScGt(loc, ctx, memDescTy, smemObj, llvmElemTy,
-                                  idxValues, dstIndices, op.getAxis(),
+    auto results = lowerLocalScGt(loc, memDescTy, smemObj, llvmElemTy,
+                                  regLayout, idxValues, op.getAxis(),
                                   /*storeVals=*/{}, rewriter, targetInfo);
 
     Value result = packLLElements(loc, typeConverter, results, rewriter, regTy);
@@ -524,7 +461,6 @@ public:
   matchAndRewrite(LocalScatterOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     auto loc = op.getLoc();
-    auto *ctx = op.getContext();
     auto memDescTy = cast<MemDescType>(op.getDst().getType());
     // TODO: PartitionedSharedEncoding lowering will be enabled in subsequent
     // PRs.
@@ -544,12 +480,10 @@ public:
         unpackLLElements(loc, adaptor.getValues(), rewriter);
     SmallVector<Value> idxValues =
         unpackLLElements(loc, adaptor.getIndices(), rewriter);
-    SmallVector<SmallVector<Value>> srcIndices =
-        emitIndices(loc, rewriter, targetInfo, valuesTy.getEncoding(), valuesTy,
-                    /*withCTAOffset=*/true);
+    auto regLayout = toLinearLayout(valuesTy);
 
-    lowerLocalScGt(loc, ctx, memDescTy, smemObj, llvmElemTy, idxValues,
-                   srcIndices, op.getAxis(), values, rewriter, targetInfo);
+    lowerLocalScGt(loc, memDescTy, smemObj, llvmElemTy, regLayout, idxValues,
+                   op.getAxis(), values, rewriter, targetInfo);
 
     rewriter.eraseOp(op);
     return success();
@@ -622,12 +556,14 @@ private:
 
 void mlir::triton::populateMemoryOpToLLVMPatterns(
     LLVMTypeConverter &typeConverter, const TargetInfoBase &targetInfo,
-    RewritePatternSet &patterns, PatternBenefit benefit) {
+    RewritePatternSet &patterns, PatternBenefit benefit,
+    std::shared_ptr<DistributedCoordinateGroups> coordinateGroups) {
   patterns.add<GlobalScratchAllocOpConversion>(typeConverter, targetInfo,
                                                benefit);
   patterns.add<LocalAllocOpConversion>(typeConverter, targetInfo, benefit);
   patterns.add<LocalDeallocOpConversion>(typeConverter, benefit);
-  patterns.add<LocalLoadOpConversion>(typeConverter, targetInfo, benefit);
+  patterns.add<LocalLoadOpConversion>(typeConverter, targetInfo, benefit,
+                                      std::move(coordinateGroups));
   patterns.add<LocalGatherOpConversion>(typeConverter, targetInfo, benefit);
   patterns.add<LocalScatterOpConversion>(typeConverter, targetInfo, benefit);
   patterns.add<LocalStoreOpConversion>(typeConverter, targetInfo, benefit);

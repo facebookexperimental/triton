@@ -1,5 +1,6 @@
 #include "PatternTritonGPUOpToLLVM.h"
 #include "TargetInfo.h"
+#include "TritonNVIDIAGPUToLLVM/AtomicPTXBuilder.h"
 #include "TritonNVIDIAGPUToLLVM/PTXAsmFormat.h"
 #include "Utility.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
@@ -7,6 +8,8 @@
 #include "triton/Conversion/TritonGPUToLLVM/ElementwiseOpToLLVMBase.h"
 #include "triton/Conversion/TritonGPUToLLVM/PatternTritonGPUOpToLLVM.h"
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
+#include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
+#include "triton/Tools/LayoutUtils.h"
 
 using namespace mlir::triton::gpu;
 
@@ -413,7 +416,6 @@ struct FpToFpOpConversion
     auto F16TyID = TypeID::get<Float16Type>();
     auto BF16TyID = TypeID::get<BFloat16Type>();
     auto F32TyID = TypeID::get<Float32Type>();
-    auto F64TyID = TypeID::get<Float64Type>();
 
     auto undefRounding = static_cast<RoundingMode>(-1);
 
@@ -476,8 +478,8 @@ struct FpToFpOpConversion
         computeCapability >= 100 &&
         "Stochastic rounding requires compute capability >= 100 (Blackwell)");
 
-    auto srcElementType = getElementType(op.getSrc());
-    auto dstElementType = getElementType(op.getResult());
+    auto srcElementType = getElementTypeOrSelf(op.getSrc());
+    auto dstElementType = getElementTypeOrSelf(op.getResult());
 
     assert(
         (llvm::isa<Float32Type>(srcElementType) &&
@@ -609,8 +611,8 @@ struct FpToFpOpConversion
                                    Type elemTy, MultipleOperandsRange operands,
                                    Location loc) const {
     auto b = TritonLLVMOpBuilder(loc, rewriter);
-    auto srcElementType = getElementType(op.getSrc());
-    auto dstElementType = getElementType(op.getResult());
+    auto srcElementType = getElementTypeOrSelf(op.getSrc());
+    auto dstElementType = getElementTypeOrSelf(op.getResult());
     auto roundingMode = op.getRounding();
 
     if (roundingMode.has_value() && roundingMode.value() == RoundingMode::RS) {
@@ -736,8 +738,8 @@ struct SIToFPOpConversion
                                    ConversionPatternRewriter &rewriter,
                                    Type elemTy, MultipleOperandsRange operands,
                                    Location loc) const {
-    Type inElemTy = getElementType(op.getIn());
-    Type outElemTy = getElementType(op.getOut());
+    Type inElemTy = getElementTypeOrSelf(op.getIn());
+    Type outElemTy = getElementTypeOrSelf(op.getOut());
     if (outElemTy.isBF16() && inElemTy.isInteger(8) && operands.size() >= 4) {
       auto cvtFunc = makeConverterFromPtx(
           computeCapability >= 90 ? S8_to_Bf16_sm90 : S8_to_Bf16,
@@ -767,7 +769,6 @@ struct FPToSIOpConversion
                                    ConversionPatternRewriter &rewriter,
                                    Type elemTy, MultipleOperandsRange operands,
                                    Location loc) const {
-    auto inElemTy = getElementType(op.getIn());
     return {LLVM::FPToSIOp::create(rewriter, loc, elemTy, operands[0][0])};
   }
 };
@@ -795,6 +796,81 @@ struct ExpOpConversionApprox
     auto callOp =
         LLVM::createLLVMIntrinsicCallOp(rewriter, loc, name, resultTy, {prod});
     return {callOp.getResult(0)};
+  }
+};
+
+struct PackedArithOpConversion
+    : ConvertOpToLLVMPattern<nvidia_gpu::PackedArithOp> {
+  using ConvertOpToLLVMPattern::ConvertOpToLLVMPattern;
+
+  LogicalResult
+  matchAndRewrite(nvidia_gpu::PackedArithOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Location loc = op.getLoc();
+    auto tensorType = op.getResult().getType();
+    auto spec = nvidia_gpu::getPackedArithInstructionSpec(op);
+    const auto &resultInfo = *spec.result;
+    unsigned packWidth = resultInfo.lanes;
+
+    SmallVector<SmallVector<Value>> operandValues;
+    for (auto [operand, converted] :
+         llvm::zip(op.getOperands(), adaptor.getOperands())) {
+      auto values = unpackLLElements(loc, converted, rewriter);
+      auto layout = toLinearLayout(cast<RankedTensorType>(operand.getType()));
+      auto removeBroadcasts = actionRemoveBroadcastedRegs(layout);
+      if (!removeBroadcasts.isIdentity())
+        values = removeBroadcasts.apply(values);
+      operandValues.push_back(std::move(values));
+    }
+    unsigned packCount =
+        operandValues.front().size() / spec.operands.front()->storageLanes();
+
+    Type resultRegisterType = int_ty(resultInfo.registerBits);
+    Type resultVectorType =
+        vec_ty(getTypeConverter()->convertType(tensorType.getElementType()),
+               packWidth);
+    TritonLLVMOpBuilder b(loc, rewriter);
+    SmallVector<Value> packedResults;
+    packedResults.reserve(packCount * packWidth);
+    for (unsigned packIndex = 0; packIndex < packCount; ++packIndex) {
+      PTXBuilder ptxBuilder;
+      SmallVector<PTXBuilder::Operand *> asmOperands;
+      asmOperands.push_back(ptxBuilder.newOperand(
+          "=" +
+          NVIDIA::getPtxRegisterSizeCode(resultInfo.registerBits, false)));
+      for (auto [index, values] : llvm::enumerate(operandValues)) {
+        const auto &info = *spec.operands[index];
+        unsigned width = info.storageLanes();
+        auto lanes = ArrayRef(values).slice(packIndex * width, width);
+        Value packed = b.bitcast(packLLVector(loc, lanes, rewriter),
+                                 int_ty(info.registerBits));
+        asmOperands.push_back(ptxBuilder.newOperand(
+            packed, NVIDIA::getPtxRegisterSizeCode(info.registerBits, false)));
+      }
+
+      auto &instruction =
+          *ptxBuilder.create(stringifyPackedArithOpKind(op.getOpKind()).str());
+      instruction.o(spec.modifiers.str(), !spec.modifiers.empty())
+          .o(resultInfo.suffix.str());
+      for (const auto *info :
+           ArrayRef(spec.operands).take_front(spec.operandSuffixes))
+        instruction.o(info->suffix.str());
+      instruction(asmOperands);
+
+      Value packedResult = ptxBuilder.launch(rewriter, loc, resultRegisterType,
+                                             /*hasSideEffect=*/false);
+      Value resultVector = b.bitcast(packedResult, resultVectorType);
+      llvm::append_range(packedResults,
+                         unpackLLVector(loc, resultVector, rewriter));
+    }
+
+    auto resultLayout = toLinearLayout(tensorType);
+    auto removeResultBroadcasts = actionRemoveBroadcastedRegs(resultLayout);
+    if (!removeResultBroadcasts.isIdentity())
+      packedResults = broadcastAs(packedResults, resultLayout);
+    rewriter.replaceOp(op, packLLElements(loc, getTypeConverter(),
+                                          packedResults, rewriter, tensorType));
+    return success();
   }
 };
 
@@ -844,6 +920,20 @@ struct ClampFOpConversion
       }
       return std::nullopt;
     };
+
+    // clampf %x (negf %max) %max
+    if (auto negOp = op.getOperand(1).getDefiningOp<arith::NegFOp>()) {
+      if (negOp.getOperand() == op.getOperand(2)) {
+        return true;
+      }
+    }
+    auto lowerSplat = op.getOperand(1).getDefiningOp<SplatOp>();
+    auto upperSplat = op.getOperand(2).getDefiningOp<SplatOp>();
+    if (lowerSplat && upperSplat) {
+      auto negOp = lowerSplat.getSrc().getDefiningOp<arith::NegFOp>();
+      if (negOp && negOp.getOperand() == upperSplat.getSrc())
+        return true;
+    }
 
     // clampf %x (sub 0.0 %max) %max
     if (auto subOp = op.getOperand(1).getDefiningOp<arith::SubFOp>()) {
@@ -971,6 +1061,7 @@ void mlir::triton::NVIDIA::populateElementwiseOpToLLVMPatterns(
                                    computeCapability, benefit);
   patterns.add<FpToFpOpConversion>(typeConverter, axisInfoAnalysis,
                                    computeCapability, benefit);
+  patterns.add<PackedArithOpConversion>(typeConverter, benefit);
 
   // ExpOpConversionApprox will try using ex2.approx if the input type is
   // FP32. For other input types, ExpOpConversionApprox will return failure and

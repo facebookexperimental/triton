@@ -43,7 +43,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.targ
   tt.func public @test_sqrt_f32(%arg0: tensor<64xf32, #blocked>) {
     // LLVM_FTZ-LABEL: test_sqrt_f32
     // LLVM_FTZ-NOT: llvm.fcmp "ogt"
-    // LLVM_FTZ: llvm.amdgcn.sqrt.f32
+    // LLVM_FTZ: rocdl.sqrt
     // LLVM_FTZ-NOT: llvm.fmul
     // LLVM_FTZ-NOT: llvm.select
     //
@@ -51,7 +51,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.targ
     // LLVM_NO_FTZ: llvm.fcmp "ogt"
     // LLVM_NO_FTZ: llvm.fmul
     // LLVM_NO_FTZ-NEXT: llvm.select
-    // LLVM_NO_FTZ-NEXT: llvm.amdgcn.sqrt.f32
+    // LLVM_NO_FTZ-NEXT: rocdl.sqrt
     // LLVM_NO_FTZ: llvm.fmul
     // LLVM_NO_FTZ-NEXT: llvm.select
     %0 = math.sqrt %arg0 : tensor<64xf32, #blocked>

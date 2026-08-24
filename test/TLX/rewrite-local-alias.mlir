@@ -4,6 +4,7 @@
 #blocked1 = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [4, 1], order = [1, 0]}>
 #shared = #ttg.nvmma_shared<{swizzlingByteWidth = 32, transposed = false, elementBitWidth = 16}>
 #shared1 = #ttg.nvmma_shared<{swizzlingByteWidth = 64, transposed = false, elementBitWidth = 16}>
+#bar_shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
 #smem = #ttg.shared_memory
 #tmem = #ttng.tensor_memory_encoding<blockM = 64, blockN = 32, colStride = 1>
 #tmem1 = #ttng.tensor_memory_encoding<blockM = 64, blockN = 32, colStride = 1>
@@ -18,6 +19,9 @@ module attributes {tlx.has_explicit_local_mem_access = true, tlx.has_tlx_ops = t
     // CHECK: %[[$LOCAL_ALLOC:.*]] = ttg.local_alloc : () -> !ttg.memdesc<1x64x16xf16, #[[$SHARED]], #smem, mutable>
     %0 = ttg.local_alloc : () -> !ttg.memdesc<1x64x16xf16, #shared, #smem, mutable>
     %1 = ttg.local_alloc : () -> !ttg.memdesc<1x16x32xf16, #shared1, #smem, mutable>
+    // Unrelated NPOT allocations, such as barrier arrays, must not be sized by
+    // storage-alias lowering merely because another allocation has aliases.
+    %barriers = ttg.local_alloc : () -> !ttg.memdesc<3xi64, #bar_shared, #smem, mutable>
 
     // CHECK-NOT: tlx.local_alias
     // CHECK: ttg.memdesc_reinterpret %[[$LOCAL_ALLOC]] : !ttg.memdesc<1x64x16xf16, #[[$SHARED]], #smem, mutable> -> !ttg.memdesc<1x32x32xf16, #[[$SHARED1]], #smem, mutable>
@@ -60,6 +64,51 @@ module attributes {tlx.has_explicit_local_mem_access = true, tlx.has_tlx_ops = t
       ttng.tmem_store %7, %6, %true : tensor<64x32xf16, #blocked> -> !ttg.memdesc<64x32xf16, #tmem1, #ttng.tensor_memory, mutable>
       ttg.warp_return
     } : (!ttg.memdesc<1x64x16xf16, #shared, #smem, mutable>, !ttg.memdesc<1x64x32xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.memdesc<1x16x32xf16, #shared1, #smem, mutable>, !ttg.memdesc<1x32x32xf16, #shared1, #smem, mutable>, !ttg.memdesc<1x64x32xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.memdesc<1x64x32xf16, #tmem1, #ttng.tensor_memory, mutable>) -> ()
+    tt.return
+  }
+}
+
+// -----
+
+// Explicit storage aliases may map a larger padded allocation through a
+// smaller, differently padded multi-stage view. This models the V -> dS
+// lifetime overlay used by the gfx950 Flash Attention backward bridge.
+#v_shared = #ttg.padded_shared<[1024:+32] {offset = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64], [16, 0], [32, 0], [64, 0], [128, 0], [1, 0], [2, 0], [4, 0], [8, 0]], block = []}>
+#ds_shared = #ttg.padded_shared<[128:+16] {offset = [[0, 1], [0, 2], [1, 0], [2, 0], [4, 0], [8, 0], [0, 4], [0, 8], [16, 0], [32, 0], [64, 0], [128, 0]], block = []}>
+#smem = #ttg.shared_memory
+
+module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  // CHECK-LABEL: @padded_multi_stage_alias
+  tt.func @padded_multi_stage_alias() {
+    %0 = ttg.local_alloc : () -> !ttg.memdesc<1x256x128xbf16, #v_shared, #smem, mutable>
+    // CHECK-NOT: tlx.local_alias
+    // CHECK: ttg.memdesc_reinterpret
+    // CHECK-SAME: !ttg.memdesc<1x256x128xbf16
+    // CHECK-SAME: -> !ttg.memdesc<2x256x16xbf16
+    %1 = tlx.local_alias %0 : !ttg.memdesc<1x256x128xbf16, #v_shared, #smem, mutable> -> !ttg.memdesc<2x256x16xbf16, #ds_shared, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+// A padded view can require more physical storage than an unpadded allocation
+// with the same logical element count. The padded type must become the backing
+// allocation; selecting by logical elements makes the alias impossible.
+#plain_shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#padded_shared = #ttg.padded_shared<[128:+16] {offset = [[0, 1], [0, 2], [1, 0], [2, 0], [4, 0], [8, 0], [0, 4], [0, 8], [16, 0], [32, 0], [64, 0], [128, 0]], block = []}>
+#smem = #ttg.shared_memory
+
+module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  // CHECK-LABEL: @padded_alias_chosen_by_physical_span
+  tt.func @padded_alias_chosen_by_physical_span() {
+    // CHECK: %[[BACKING:.*]] = ttg.local_alloc
+    // CHECK-SAME: !ttg.memdesc<1x256x16xbf16
+    %0 = ttg.local_alloc : () -> !ttg.memdesc<1x256x16xbf16, #plain_shared, #smem, mutable>
+    // CHECK-NOT: tlx.local_alias
+    // CHECK: ttg.memdesc_reinterpret %[[BACKING]]
+    // CHECK-SAME: -> !ttg.memdesc<1x256x16xbf16
+    %1 = tlx.local_alias %0 : !ttg.memdesc<1x256x16xbf16, #plain_shared, #smem, mutable> -> !ttg.memdesc<1x256x16xbf16, #padded_shared, #smem, mutable>
     tt.return
   }
 }

@@ -97,7 +97,7 @@ public:
         continue; // Log2_64(0) is UB; nothing to dedup
       int64_t pow2C = c & (-c);
       for (int i = 0; i < llvm::Log2_64(pow2C); i++) {
-        bases_inv[d][i] = {0};
+        bases_inv[d][i][0] = 0;
       }
     }
     auto invBroadcast = LinearLayout(std::move(bases_inv), invReg.getOutDims(),
@@ -122,7 +122,6 @@ public:
     Type elemTy = this->getTypeConverter()->convertType(resultElementTy);
     SmallVector<SmallVector<Value>> allOperands;
     for (auto operand : adaptor.getOperands()) {
-      auto argTy = op->getOperand(0).getType();
       auto subOperands = unpackLLElements(loc, operand, rewriter);
       allOperands.resize(subOperands.size());
       for (auto v : llvm::enumerate(subOperands))

@@ -312,7 +312,7 @@ findLocalStoreWritingBuffer(scf::ForOp forOp, Value buffer,
   return nullptr;
 }
 
-void doAnnotateTMAStoreWaits(triton::FuncOp &funcOp) {
+void doAnnotateTMAStoreWaits(triton::FuncOp funcOp) {
   MLIRContext *ctx = funcOp.getContext();
   // Use walk to find TMAStoreTokenWaitOp ops inside ForOp bodies, including
   // those nested inside SubtiledRegionOp regions.
@@ -356,7 +356,7 @@ struct NVGPUTestAnnotateTMAStoreWaitsPass
 // Validate TMA store annotations (safety checks)
 // ---------------------------------------------------------------------------
 
-void doValidateTMAStoreAnnotations(triton::FuncOp &funcOp) {
+void doValidateTMAStoreAnnotations(triton::FuncOp funcOp) {
   funcOp.walk([&](scf::ForOp forOp) {
     forOp.walk([&](ttng::TMAStoreTokenWaitOp waitOp) {
       if (!waitOp->hasAttr(kCanRotateByBufferCount))
@@ -424,7 +424,7 @@ findScheduledWaitBarrierBetween(Operation *producer, Operation *insertionTarget,
 // wait cannot be repositioned leaves the schedule unchanged for that wait and
 // logs (see the LDBG sites below); there is no failure mode, so this returns
 // void rather than a LogicalResult.
-void doTMAStoreWaitReorder(triton::FuncOp &funcOp) {
+void doTMAStoreWaitReorder(triton::FuncOp funcOp) {
   funcOp.walk([&](scf::ForOp forOp) {
     bool hasNestedFor = false;
     forOp.getBody()->walk([&](scf::ForOp) { hasNestedFor = true; });

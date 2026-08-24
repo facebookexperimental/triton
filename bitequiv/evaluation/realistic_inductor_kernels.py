@@ -11,10 +11,13 @@ questions at once:
      scope (an M3 / future target)?" This makes the corpus concrete evidence of how much the
      project can contribute to real Triton kernels, not just reductions.
 
-    ⚠️  This module is a REFERENCE corpus. It is intentionally NOT wired into ``evaluate.py``:
-        the bodies are inspected, never compiled here (they hard-code shapes and reference
-        Inductor helpers). Treat every kernel as "realistic customer usage → target", not as
-        an in-scope requirement. Each future checker improvement can be measured against it.
+    ⚠️  This module is mainly a REFERENCE corpus, NOT wired into ``evaluate.py``: GROUPS 2+ are
+        inspected, never compiled (they hard-code shapes and reference Inductor helpers). Treat
+        those as "realistic customer usage → target", not an in-scope requirement — each future
+        checker improvement can be measured against them. The EXCEPTION is GROUP 1 (A..H): its
+        six ordered add-reductions are made RUNNABLE (an ``ORD`` reduction_ordering param) and
+        have a self-contained M2 harness at the bottom of the file (this is where the former
+        ``complex_fusion_eval.py`` experiment was merged, to avoid a duplicate kernel copy).
 
 How these kernels were collected (reproducible)
 -----------------------------------------------
@@ -139,22 +142,36 @@ Big-picture takeaway
     tail-masked / accumulate-then-reduce trees; (4) real FMA/welford numerics on TTGIR;
     (5) MMA / tensor-core equivalence for GEMM + attention + warp specialization (M3).
 
-Nothing in this file is meant to be launched here; the bodies are kept faithful (only the
-Inductor ``@triton_heuristics(...)`` decorator was replaced with a plain ``@triton.jit`` and the
-trailing async-compile wrapper stripped) so they stay inspectable and can be wired into
-``evaluate.py`` later if/when the checker grows to cover them.
+GROUPS 2+ are not meant to be launched here; their bodies are kept faithful (only the Inductor
+``@triton_heuristics(...)`` decorator was replaced with a plain ``@triton.jit`` and the trailing
+async-compile wrapper stripped) so they stay inspectable and can be wired into ``evaluate.py``
+later if/when the checker grows to cover them. GROUP 1 is faithful in the same way but ALSO
+runnable: each ordered add-reduction takes an ``ORD`` param and its hard-coded ``xnumel`` /
+``r0_numel`` were made harness arguments, so the M2 harness at the bottom can compile + time it.
 """
+
+import os
+import sys
 
 import triton
 import triton.language as tl
+from triton.runtime.jit import JITFunction
 
-# The Inductor bodies below reference these exactly as emitted. This module is a REFERENCE
-# corpus — the kernels are never compiled here — so tolerate a missing torch/inductor at import.
+# GROUP 1 (A..H) is RUNNABLE via the M2 harness at the bottom of this file; GROUPS 2+ stay a
+# REFERENCE corpus (inspected, not compiled). The harness needs torch, and COMPILING GROUP 1
+# needs the Inductor helpers below (libdevice.rsqrt, welford). Tolerate the absence of either
+# at import time so the corpus still imports in a torch-less / inductor-less environment (only
+# RUNNING the harness then fails, not importing the module).
+try:
+    import torch
+except Exception:  # noqa: BLE001 - reference-only import path; the harness needs torch to run
+    torch = None
+
 try:
     from torch._inductor.runtime import triton_helpers  # welford_reduce / welford
     from torch._inductor.runtime.triton_helpers import libdevice  # rsqrt
     from torch._inductor.runtime.triton_helpers import math as tl_math  # noqa: F401 (some variants use it)
-except Exception:  # noqa: BLE001 - reference-only module; bodies are not compiled at import
+except Exception:  # noqa: BLE001 - some bodies compile only when inductor is present
     triton_helpers = libdevice = tl_math = None
 
 
@@ -181,9 +198,8 @@ def _triton_helper_fn_add0(arg0_0, arg1_0):
 # invariant collapse purely because the one reduction result fans out into TWO stores.
 # ========================================================================================= #
 @triton.jit
-def A_rms_norm_fwd(in_out_ptr0, in_ptr0, in_ptr1, out_ptr0, xnumel, r0_numel, XBLOCK: tl.constexpr):
-    xnumel = 1024
-    r0_numel = 256
+def A_rms_norm_fwd(in_out_ptr0, in_ptr0, in_ptr1, out_ptr0, xnumel, r0_numel, XBLOCK: tl.constexpr,
+                   ORD: tl.constexpr):
     R0_BLOCK: tl.constexpr = 256
     rnumel = r0_numel
     RBLOCK: tl.constexpr = R0_BLOCK
@@ -205,7 +221,7 @@ def A_rms_norm_fwd(in_out_ptr0, in_ptr0, in_ptr1, out_ptr0, xnumel, r0_numel, XB
     tmp2 = tmp1 * tmp1
     tmp3 = tl.broadcast_to(tmp2, [XBLOCK, R0_BLOCK])
     tmp5 = tl.where(xmask, tmp3, 0)
-    tmp6 = tl.sum(tmp5, 1)[:, None].to(tl.float32)  # the one add-reduction (TTGIR: in scope)
+    tmp6 = tl.sum(tmp5, 1, reduction_ordering=ORD)[:, None].to(tl.float32)  # the one add-reduction (TTGIR: in scope)
     tmp7 = tl.full([1, 1], 256.0, tl.float32)
     tmp8 = (tmp6 / tmp7)
     tmp9 = tl.full([1, 1], 1e-05, tl.float32)
@@ -332,8 +348,7 @@ def B_layernorm_welford_gather(in_out_ptr0, in_ptr0, in_ptr1, in_ptr2, in_ptr3, 
 # ========================================================================================= #
 @triton.jit
 def C_rms_norm_bwd_2reduce(in_ptr0, in_ptr1, in_ptr2, in_ptr3, in_ptr4, in_ptr5, out_ptr0, out_ptr1, out_ptr5, xnumel,
-                           r0_numel, XBLOCK: tl.constexpr):
-    r0_numel = 256
+                           r0_numel, XBLOCK: tl.constexpr, ORD: tl.constexpr):
     R0_BLOCK: tl.constexpr = 256
     rnumel = r0_numel
     RBLOCK: tl.constexpr = R0_BLOCK
@@ -373,7 +388,7 @@ def C_rms_norm_bwd_2reduce(in_ptr0, in_ptr1, in_ptr2, in_ptr3, in_ptr4, in_ptr5,
     tmp24 = tl.where(xmask, tmp22, 0)
     # [scope: neither] REDUCTION 1 (add-tree). Handled soundly by both. Its leaf subtree carries a
     # sigmoid (opaque, not pure-elementwise), so PTX cannot layout-invariant-collapse it anyway.
-    tmp25 = tl.sum(tmp24, 1)[:, None].to(tl.float32)
+    tmp25 = tl.sum(tmp24, 1, reduction_ordering=ORD)[:, None].to(tl.float32)
     tmp26 = tl.full([1, 1], 0.00390625, tl.float32)
     tmp27 = tmp5 * tmp26
     tmp28 = tmp27 * tmp25  # <-- reduce-of-reduce: reduction 2's input depends on reduction 1 (tmp25)
@@ -386,7 +401,7 @@ def C_rms_norm_bwd_2reduce(in_ptr0, in_ptr1, in_ptr2, in_ptr3, in_ptr4, in_ptr5,
     # signature (the def-use link to reduce 1 is not tracked, which is conservative/sound). PTX
     # reconstructs the combined DAG soundly but over-splits (reduce-1's shfl/smem partial sits
     # inside reduce-2's leaves -> not layout-invariant). No wrong-merge risk either way.
-    tmp35 = tl.sum(tmp34, 1)[:, None].to(tl.float32)
+    tmp35 = tl.sum(tmp34, 1, reduction_ordering=ORD)[:, None].to(tl.float32)
     tmp36 = tmp14 * tmp10
     tmp37 = tmp36 + tmp30
     tmp38 = tmp35 * tmp26
@@ -407,9 +422,7 @@ def C_rms_norm_bwd_2reduce(in_ptr0, in_ptr1, in_ptr2, in_ptr3, in_ptr4, in_ptr5,
 # subtree; empirically it lowers to `selp` and gives 4 distinct PTX descriptors across num_warps.
 # ========================================================================================= #
 @triton.jit
-def D_masked_global_sum(in_ptr0, out_ptr0, xnumel, r0_numel, XBLOCK: tl.constexpr):
-    xnumel = 1
-    r0_numel = 608
+def D_masked_global_sum(in_ptr0, out_ptr0, xnumel, r0_numel, XBLOCK: tl.constexpr, ORD: tl.constexpr):
     R0_BLOCK: tl.constexpr = 1024
     rnumel = r0_numel
     RBLOCK: tl.constexpr = R0_BLOCK
@@ -429,7 +442,7 @@ def D_masked_global_sum(in_ptr0, out_ptr0, xnumel, r0_numel, XBLOCK: tl.constexp
     # balanced region containing it will not collapse -> the reduction stays layout-bearing (a
     # smaller pure sub-region still collapses). Sound, but not num_warps-invariant.
     tmp3 = tl.where(r0_mask, tmp1, 0)
-    tmp4 = tl.sum(tmp3, 1)[:, None].to(tl.float32)  # the one add-reduction (TTGIR: in scope)
+    tmp4 = tl.sum(tmp3, 1, reduction_ordering=ORD)[:, None].to(tl.float32)  # the one add-reduction (TTGIR: in scope)
     tl.store(out_ptr0 + (tl.full([1, 1], 0, tl.int32).broadcast_to(XBLOCK, 1)), tmp4, None)
 
 
@@ -443,9 +456,7 @@ def D_masked_global_sum(in_ptr0, out_ptr0, xnumel, r0_numel, XBLOCK: tl.constexp
 # (multi-output) single-tile reduce — the pure multi-output-collapse-guard case (no loop fence).
 # ========================================================================================= #
 @triton.jit
-def E_triu_masked_rowsum(in_ptr0, out_ptr0, xnumel, r0_numel, XBLOCK: tl.constexpr):
-    xnumel = 592
-    r0_numel = 235
+def E_triu_masked_rowsum(in_ptr0, out_ptr0, xnumel, r0_numel, XBLOCK: tl.constexpr, ORD: tl.constexpr):
     R0_BLOCK: tl.constexpr = 256
     rnumel = r0_numel
     RBLOCK: tl.constexpr = R0_BLOCK
@@ -464,7 +475,7 @@ def E_triu_masked_rowsum(in_ptr0, out_ptr0, xnumel, r0_numel, XBLOCK: tl.constex
     # [scope: neither] identity-pad of the odd extent 235 into the 256-wide axis (masked lanes add
     # 0.0). Both checkers handle this: TTGIR ignores masks by design, PTX rides it as a per-leaf flag.
     tmp3 = tl.where(r0_mask & xmask, tmp1, 0)
-    tmp4 = tl.sum(tmp3, 1)[:, None].to(tl.float32)  # the one add-reduction (TTGIR: in scope)
+    tmp4 = tl.sum(tmp3, 1, reduction_ordering=ORD)[:, None].to(tl.float32)  # the one add-reduction (TTGIR: in scope)
     # [scope: PTX] (sound; over-splits) per-row store => one st.global root PER row (roots>1 when
     # XBLOCK>1) => the num_warps-invariant collapse is refused (the multi-output G3 guard).
     tl.store(out_ptr0 + (x0), tmp4, xmask)
@@ -527,9 +538,8 @@ def F_cumsum_scan(in_out_ptr0, in_ptr0, out_ptr0, ks0, ks1, xnumel, r0_numel, XB
 # reduce (a different composition), and the R0_BLOCK==128 boundary flips PTX collapse on/off.
 # ========================================================================================= #
 @triton.jit
-def G_plain_sum_looped(in_ptr0, out_ptr0, xnumel, r0_numel, XBLOCK: tl.constexpr, R0_BLOCK: tl.constexpr):
-    xnumel = 5760
-    r0_numel = 128
+def G_plain_sum_looped(in_ptr0, out_ptr0, xnumel, r0_numel, XBLOCK: tl.constexpr, R0_BLOCK: tl.constexpr,
+                       ORD: tl.constexpr):
     rnumel = r0_numel
     RBLOCK: tl.constexpr = R0_BLOCK
     xoffset = tl.program_id(0) * XBLOCK
@@ -561,7 +571,7 @@ def G_plain_sum_looped(in_ptr0, out_ptr0, xnumel, r0_numel, XBLOCK: tl.constexpr
         # loops=). At R0_BLOCK==128 the loop runs once and the final tree CAN collapse.
         tmp6 = _tmp5 + tmp4
         _tmp5 = tl.where(r0_mask & xmask, tmp6, _tmp5)
-    tmp5 = tl.sum(_tmp5, 1)[:, None]  # [scope: neither] the final tree-reduce; in scope for both
+    tmp5 = tl.sum(_tmp5, 1, reduction_ordering=ORD)[:, None]  # [scope: neither] the final tree-reduce; in scope for both
     tl.store(out_ptr0 + (x3), tmp5, xmask)
 
 
@@ -575,8 +585,7 @@ def G_plain_sum_looped(in_ptr0, out_ptr0, xnumel, r0_numel, XBLOCK: tl.constexpr
 # constexpr, so it straddles the single-output vs multi-output boundary of the PTX collapse.
 # ========================================================================================= #
 @triton.jit
-def H_mean_permute(in_ptr0, out_ptr0, xnumel, r0_numel, XBLOCK: tl.constexpr):
-    r0_numel = 256
+def H_mean_permute(in_ptr0, out_ptr0, xnumel, r0_numel, XBLOCK: tl.constexpr, ORD: tl.constexpr):
     R0_BLOCK: tl.constexpr = 256
     rnumel = r0_numel
     RBLOCK: tl.constexpr = R0_BLOCK
@@ -594,7 +603,7 @@ def H_mean_permute(in_ptr0, out_ptr0, xnumel, r0_numel, XBLOCK: tl.constexpr):
     tmp1 = tmp0.to(tl.float32)
     tmp2 = tl.broadcast_to(tmp1, [XBLOCK, R0_BLOCK])
     tmp4 = tl.where(xmask, tmp2, 0)
-    tmp5 = tl.sum(tmp4, 1)[:, None].to(tl.float32)  # the one add-reduction (TTGIR: in scope)
+    tmp5 = tl.sum(tmp4, 1, reduction_ordering=ORD)[:, None].to(tl.float32)  # the one add-reduction (TTGIR: in scope)
     # [scope: PTX] (sound; over-splits) per-row store => multiple st.global roots when XBLOCK>1 =>
     # collapse refused. At the tuned XBLOCK==1 it is single-output and the collapse CAN fire.
     tl.store(out_ptr0 + (x0), tmp5, xmask)
@@ -608,6 +617,7 @@ def H_mean_permute(in_ptr0, out_ptr0, xnumel, r0_numel, XBLOCK: tl.constexpr):
 # ## neither reduction checker models the tensor-core contraction (see per-line tags).
 # #########################################################################################
 
+
 # ========================================================================================= #
 # GEMM-1. Plain tiled matmul  (source: triton_tem_fused_mm_0 | repro: (a@b), fp16 1024x512@512x1024, H100)
 # Kernel type: TEMPLATE / GEMM (grouped-L2 swizzle, K-loop tl.dot accumulate).
@@ -619,16 +629,16 @@ def H_mean_permute(in_ptr0, out_ptr0, xnumel, r0_numel, XBLOCK: tl.constexpr):
 # ========================================================================================= #
 @triton.jit
 def GEMM_plain_mm(arg_A, arg_B, out_ptr0):
-    EVEN_K : tl.constexpr = True
-    USE_FAST_ACCUM : tl.constexpr = False
-    ACC_TYPE : tl.constexpr = tl.float32
-    OUT_DTYPE : tl.constexpr = tl.float16
-    BLOCK_M : tl.constexpr = 64
-    BLOCK_N : tl.constexpr = 128
-    BLOCK_K : tl.constexpr = 128
-    GROUP_M : tl.constexpr = 8
-    ALLOW_TF32 : tl.constexpr = False
-    INDEX_DTYPE : tl.constexpr = tl.int32
+    EVEN_K: tl.constexpr = True
+    USE_FAST_ACCUM: tl.constexpr = False
+    ACC_TYPE: tl.constexpr = tl.float32
+    OUT_DTYPE: tl.constexpr = tl.float16
+    BLOCK_M: tl.constexpr = 64
+    BLOCK_N: tl.constexpr = 128
+    BLOCK_K: tl.constexpr = 128
+    GROUP_M: tl.constexpr = 8
+    ALLOW_TF32: tl.constexpr = False
+    INDEX_DTYPE: tl.constexpr = tl.int32
     A = arg_A
     B = arg_B
 
@@ -677,21 +687,19 @@ def GEMM_plain_mm(arg_A, arg_B, out_ptr0):
 
         idx_m = offs_a_m[:, None]
         idx_n = a_k_idx_vals
-        xindex = idx_n + 512*idx_m
+        xindex = idx_n + 512 * idx_m
         a = tl.load(A + (xindex))
 
         idx_m = b_k_idx_vals
         idx_n = offs_b_n[None, :]
-        xindex = idx_n + 1024*idx_m
+        xindex = idx_n + 1024 * idx_m
         b = tl.load(B + (xindex))
-
 
         # [scope: BOTH] (out - M3) the K-loop tensor-core contraction. Neither reduction checker
         # models tl.dot: PTX fingerprints it as an opaque unanalyzed-mma (the accumulator becomes an
         # opaque node), TTGIR emits only the unanalyzed-mma guard key. Sound today (over-splits); the
         # MMA-equivalence M3 target.
         acc += tl.dot(a, b, allow_tf32=ALLOW_TF32, out_dtype=ACC_TYPE)
-
 
     # rematerialize rm and rn to save registers
     rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M).to(INDEX_DTYPE)
@@ -701,7 +709,7 @@ def GEMM_plain_mm(arg_A, arg_B, out_ptr0):
     mask = (idx_m < M) & (idx_n < N)
 
     # inductor generates a suffix
-    xindex = idx_n + 1024*idx_m
+    xindex = idx_n + 1024 * idx_m
     tl.store(out_ptr0 + (tl.broadcast_to(xindex, [BLOCK_M, BLOCK_N])), acc, mask)
 
 
@@ -716,16 +724,16 @@ def GEMM_plain_mm(arg_A, arg_B, out_ptr0):
 # ========================================================================================= #
 @triton.jit
 def GEMM_addmm_bias(in_ptr0, arg_A, arg_B, out_ptr0):
-    EVEN_K : tl.constexpr = True
-    USE_FAST_ACCUM : tl.constexpr = False
-    ACC_TYPE : tl.constexpr = tl.float32
-    OUT_DTYPE : tl.constexpr = tl.float16
-    BLOCK_M : tl.constexpr = 64
-    BLOCK_N : tl.constexpr = 32
-    BLOCK_K : tl.constexpr = 128
-    GROUP_M : tl.constexpr = 8
-    ALLOW_TF32 : tl.constexpr = False
-    INDEX_DTYPE : tl.constexpr = tl.int32
+    EVEN_K: tl.constexpr = True
+    USE_FAST_ACCUM: tl.constexpr = False
+    ACC_TYPE: tl.constexpr = tl.float32
+    OUT_DTYPE: tl.constexpr = tl.float16
+    BLOCK_M: tl.constexpr = 64
+    BLOCK_N: tl.constexpr = 32
+    BLOCK_K: tl.constexpr = 128
+    GROUP_M: tl.constexpr = 8
+    ALLOW_TF32: tl.constexpr = False
+    INDEX_DTYPE: tl.constexpr = tl.int32
     A = arg_A
     B = arg_B
 
@@ -774,21 +782,19 @@ def GEMM_addmm_bias(in_ptr0, arg_A, arg_B, out_ptr0):
 
         idx_m = offs_a_m[:, None]
         idx_n = a_k_idx_vals
-        xindex = idx_n + 256*idx_m
+        xindex = idx_n + 256 * idx_m
         a = tl.load(A + (xindex))
 
         idx_m = b_k_idx_vals
         idx_n = offs_b_n[None, :]
-        xindex = idx_n + 512*idx_m
+        xindex = idx_n + 512 * idx_m
         b = tl.load(B + (xindex))
-
 
         # [scope: BOTH] (out - M3) the K-loop tensor-core contraction. Neither reduction checker
         # models tl.dot: PTX fingerprints it as an opaque unanalyzed-mma (the accumulator becomes an
         # opaque node), TTGIR emits only the unanalyzed-mma guard key. Sound today (over-splits); the
         # MMA-equivalence M3 target.
         acc += tl.dot(a, b, allow_tf32=ALLOW_TF32, out_dtype=ACC_TYPE)
-
 
     # rematerialize rm and rn to save registers
     rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M).to(INDEX_DTYPE)
@@ -798,8 +804,9 @@ def GEMM_addmm_bias(in_ptr0, arg_A, arg_B, out_ptr0):
     mask = (idx_m < M) & (idx_n < N)
 
     # inductor generates a suffix
-    xindex = idx_n + 512*idx_m
-    tmp0 = tl.load(in_ptr0 + (tl.broadcast_to(idx_n, [BLOCK_M, BLOCK_N])), mask, eviction_policy='evict_last').to(tl.float32)
+    xindex = idx_n + 512 * idx_m
+    tmp0 = tl.load(in_ptr0 + (tl.broadcast_to(idx_n, [BLOCK_M, BLOCK_N])), mask,
+                   eviction_policy='evict_last').to(tl.float32)
     # [scope: neither] the fused bias-add epilogue (a pure per-element add after the dot) is
     # not a reduction; it rides above the unanalyzed-mma root and neither checker constrains it.
     tmp1 = acc + tmp0
@@ -817,16 +824,16 @@ def GEMM_addmm_bias(in_ptr0, arg_A, arg_B, out_ptr0):
 # ========================================================================================= #
 @triton.jit
 def GEMM_batched_bmm(arg_A, arg_B, out_ptr0):
-    EVEN_K : tl.constexpr = True
-    USE_FAST_ACCUM : tl.constexpr = False
-    ACC_TYPE : tl.constexpr = tl.float32
-    OUT_DTYPE : tl.constexpr = tl.float16
-    BLOCK_M : tl.constexpr = 64
-    BLOCK_N : tl.constexpr = 128
-    BLOCK_K : tl.constexpr = 64
-    GROUP_M : tl.constexpr = 8
-    ALLOW_TF32 : tl.constexpr = False
-    INDEX_DTYPE : tl.constexpr = tl.int32
+    EVEN_K: tl.constexpr = True
+    USE_FAST_ACCUM: tl.constexpr = False
+    ACC_TYPE: tl.constexpr = tl.float32
+    OUT_DTYPE: tl.constexpr = tl.float16
+    BLOCK_M: tl.constexpr = 64
+    BLOCK_N: tl.constexpr = 128
+    BLOCK_K: tl.constexpr = 64
+    GROUP_M: tl.constexpr = 8
+    ALLOW_TF32: tl.constexpr = False
+    INDEX_DTYPE: tl.constexpr = tl.int32
     A = arg_A
     B = arg_B
 
@@ -877,8 +884,8 @@ def GEMM_batched_bmm(arg_A, arg_B, out_ptr0):
     # Clamp to valid range for safe pointer arithmetic; out-of-bounds CTAs are
     # masked off at the store below.
     idx_q_clamped = tl.minimum(idx_q, BATCH - 1)
-    A = A + (ram[:, None] * stride_am + rk[None, :] * stride_ak + idx_q_clamped*stride_aq)
-    B = B + (rk[:, None] * stride_bk + rbn[None, :] * stride_bn + idx_q_clamped*stride_bq)
+    A = A + (ram[:, None] * stride_am + rk[None, :] * stride_ak + idx_q_clamped * stride_aq)
+    B = B + (rk[:, None] * stride_bk + rbn[None, :] * stride_bn + idx_q_clamped * stride_bq)
 
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_TYPE)
     for k in range(K, 0, -BLOCK_K):
@@ -907,7 +914,7 @@ def GEMM_batched_bmm(arg_A, arg_B, out_ptr0):
     # cast accumulator to output dtype
     acc = acc.to(OUT_DTYPE)
     # inductor generates a suffix
-    xindex = idx_n + 512*idx_m + 262144*idx_q
+    xindex = idx_n + 512 * idx_m + 262144 * idx_q
     tl.store(out_ptr0 + (tl.broadcast_to(xindex, [BLOCK_M, BLOCK_N])), acc, mask)
 
 
@@ -919,6 +926,7 @@ def GEMM_batched_bmm(arg_A, arg_B, out_ptr0):
 # ## constexprs. It is NOT verbatim Inductor output and NOT runnable on this sm_90 host (needs
 # ## sm_100 / Blackwell for tcgen05 + device TMA); the verify harness SKIPS it.
 # #########################################################################################
+
 
 # ========================================================================================= #
 # WS-1. Blackwell warp-specialized persistent device-TMA matmul  (template-derived; sm_100 only)
@@ -951,7 +959,7 @@ def _subtile_accumulator(
     tl.static_assert(SUBTILE_FACTOR > 0, "SUBTILE_FACTOR must be positive")
     tl.static_assert((SUBTILE_FACTOR & (SUBTILE_FACTOR - 1)) == 0, "SUBTILE_FACTOR must be a power of 2")
     if SUBTILE_FACTOR == 1:
-        return (acc,)
+        return (acc, )
     else:
         tl.static_assert(BLOCK_N % 2 == 0)
         acc = tl.reshape(acc, (BLOCK_M, 2, BLOCK_N // 2))
@@ -1012,9 +1020,7 @@ def WS_blackwell_ws_tma_mm(A, B, out_ptr0):
     # follow the partition/barrier control flow -> extra opaque nodes -> collapse refused.
     # [scope: TTGIR] warp specialization is invisible unless it changes a tt.reduce operand's
     # layout; here there is no tt.reduce at all, only tt.dot (guarded), so it is a no-op key.
-    for tile_id in tl.range(
-        start_pid, num_tiles, NUM_SMS, flatten=FLATTEN, warp_specialize=WARP_SPECIALIZE
-    ):
+    for tile_id in tl.range(start_pid, num_tiles, NUM_SMS, flatten=FLATTEN, warp_specialize=WARP_SPECIALIZE):
         pid_m, pid_n = _compute_pid(tile_id, num_pid_in_group, grid_m, GROUP_M, NUM_SMS)
         offs_am = pid_m * BLOCK_M
         offs_bn = pid_n * BLOCK_N
@@ -1026,15 +1032,11 @@ def WS_blackwell_ws_tma_mm(A, B, out_ptr0):
             offs_k_desc = offs_k.to(tl.int32)
             a = tl.load_tensor_descriptor(
                 a_desc,
-                [offs_am_desc, offs_k_desc]
-                if A_ROW_MAJOR
-                else [offs_k_desc, offs_am_desc],
+                [offs_am_desc, offs_k_desc] if A_ROW_MAJOR else [offs_k_desc, offs_am_desc],
             )
             b = tl.load_tensor_descriptor(
                 b_desc,
-                [offs_k_desc, offs_bn_desc]
-                if B_ROW_MAJOR
-                else [offs_bn_desc, offs_k_desc],
+                [offs_k_desc, offs_bn_desc] if B_ROW_MAJOR else [offs_bn_desc, offs_k_desc],
             )
             # [scope: BOTH] (out - M3) the K-axis tensor-core contraction. On sm_100 this lowers
             # to a tcgen05 MMA with the accumulator living in TMEM; neither checker models it
@@ -1068,6 +1070,7 @@ def WS_blackwell_ws_tma_mm(A, B, out_ptr0):
 # ## tl.sum softmax reduces + the online-softmax rescale recurrence).
 # #########################################################################################
 
+
 # ========================================================================================= #
 # ATTN-1. FlexAttention forward  (source: triton_tem_fused__to_copy_flex_attention_ones_slice_... | repro: flex_attention 2x4x512x64, H100)
 # Kernel type: TEMPLATE / attention = 2 tl.dot (q@k^T, p@v) + online-softmax (tl.max, tl.sum).
@@ -1079,29 +1082,30 @@ def WS_blackwell_ws_tma_mm(A, B, out_ptr0):
 # loop recurrence TTGIR is blind to (safe only by side effect - flagged as a soundness caution).
 # ========================================================================================= #
 @triton.jit
-def ATTN_flex_attention_fwd(arg_Q, arg_K, arg_V, arg_LSE, arg_MAX, arg_KV_NUM_BLKS, arg_KV_IDX, arg_FULL_KV_NUM_BLKS, arg_FULL_KV_IDX, out_ptr0):
-    PRESCALE_QK : tl.constexpr = False
-    ROWS_GUARANTEED_SAFE : tl.constexpr = False
-    BLOCKS_ARE_CONTIGUOUS : tl.constexpr = False
-    WRITE_DQ : tl.constexpr = True
-    OUTPUT_LOGSUMEXP : tl.constexpr = True
-    OUTPUT_MAX : tl.constexpr = False
-    FLOAT32_PRECISION : tl.constexpr = 'ieee'
-    IS_DIVISIBLE : tl.constexpr = True
-    SM_SCALE : tl.constexpr = 0.125
-    GQA_SHARED_HEADS : tl.constexpr = 1
-    HAS_FULL_BLOCKS : tl.constexpr = False
-    QK_HEAD_DIM : tl.constexpr = 64
-    QK_HEAD_DIM_ROUNDED : tl.constexpr = 64
-    V_HEAD_DIM : tl.constexpr = 64
-    V_HEAD_DIM_ROUNDED : tl.constexpr = 64
-    SAFE_HEAD_DIM : tl.constexpr = True
-    USE_TMA : tl.constexpr = False
-    BLOCK_M : tl.constexpr = 64
-    BLOCK_N : tl.constexpr = 128
-    SPARSE_Q_BLOCK_SIZE : tl.constexpr = 1073741824
-    SPARSE_KV_BLOCK_SIZE : tl.constexpr = 1073741824
-    INDEX_DTYPE : tl.constexpr = tl.int32
+def ATTN_flex_attention_fwd(arg_Q, arg_K, arg_V, arg_LSE, arg_MAX, arg_KV_NUM_BLKS, arg_KV_IDX, arg_FULL_KV_NUM_BLKS,
+                            arg_FULL_KV_IDX, out_ptr0):
+    PRESCALE_QK: tl.constexpr = False
+    ROWS_GUARANTEED_SAFE: tl.constexpr = False
+    BLOCKS_ARE_CONTIGUOUS: tl.constexpr = False
+    WRITE_DQ: tl.constexpr = True
+    OUTPUT_LOGSUMEXP: tl.constexpr = True
+    OUTPUT_MAX: tl.constexpr = False
+    FLOAT32_PRECISION: tl.constexpr = 'ieee'
+    IS_DIVISIBLE: tl.constexpr = True
+    SM_SCALE: tl.constexpr = 0.125
+    GQA_SHARED_HEADS: tl.constexpr = 1
+    HAS_FULL_BLOCKS: tl.constexpr = False
+    QK_HEAD_DIM: tl.constexpr = 64
+    QK_HEAD_DIM_ROUNDED: tl.constexpr = 64
+    V_HEAD_DIM: tl.constexpr = 64
+    V_HEAD_DIM_ROUNDED: tl.constexpr = 64
+    SAFE_HEAD_DIM: tl.constexpr = True
+    USE_TMA: tl.constexpr = False
+    BLOCK_M: tl.constexpr = 64
+    BLOCK_N: tl.constexpr = 128
+    SPARSE_Q_BLOCK_SIZE: tl.constexpr = 1073741824
+    SPARSE_KV_BLOCK_SIZE: tl.constexpr = 1073741824
+    INDEX_DTYPE: tl.constexpr = tl.int32
     Q = arg_Q
     K = arg_K
     V = arg_V
@@ -1204,7 +1208,8 @@ def ATTN_flex_attention_fwd(arg_Q, arg_K, arg_V, arg_LSE, arg_MAX, arg_KV_NUM_BL
     # KV_IDX and KV_NUM_BLKS are always contiguous.
     sparse_hz_offset = sparse_idx_z * SPARSE_HQ + sparse_idx_hq
     sparse_kv_num_blks_offset = sparse_hz_offset * stride_kv_num_blks_h + q_start // SPARSE_Q_MULTIPLE
-    sparse_kv_idx_offset = sparse_hz_offset * stride_kv_idx_h + (q_start // SPARSE_Q_MULTIPLE) * stride_kv_idx_m  # noqa: B950
+    sparse_kv_idx_offset = sparse_hz_offset * stride_kv_idx_h + (q_start //
+                                                                 SPARSE_Q_MULTIPLE) * stride_kv_idx_m  # noqa: B950
     offs_m = q_start * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_k = tl.arange(0, QK_HEAD_DIM_ROUNDED)
     q = load_checked_2d(Q, offs_m, offs_k, stride_qm, stride_qk, IS_DIVISIBLE, SAFE_HEAD_DIM, Q_LEN, QK_HEAD_DIM)
@@ -1213,27 +1218,49 @@ def ATTN_flex_attention_fwd(arg_Q, arg_K, arg_V, arg_LSE, arg_MAX, arg_KV_NUM_BL
     # We don't know anything "special" about these blocks, so we need to apply
     # both score_mod and mask_mod to it
     kv_indices = KV_IDX + sparse_kv_idx_offset
-    kv_start = tl.load(kv_indices) * SPARSE_KV_BLOCK_SIZE # first kv block we're loading
+    kv_start = tl.load(kv_indices) * SPARSE_KV_BLOCK_SIZE  # first kv block we're loading
     kv_num_blocks = tl.load(KV_NUM_BLKS + sparse_kv_num_blks_offset)
     block_n_end = tl.minimum(kv_num_blocks * SPARSE_KV_MULTIPLE, tl.maximum(tl.cdiv(KV_LEN, BLOCK_N), 1))
-
 
     # K and V pointers will be passed directly to forward_inner
 
     offs_n = kv_start + tl.arange(0, BLOCK_N)
 
-
     acc, l_i, m_i = forward_inner(
-        arg_Q, arg_K, arg_V, arg_LSE, arg_MAX, arg_KV_NUM_BLKS, arg_KV_IDX, arg_FULL_KV_NUM_BLKS, arg_FULL_KV_IDX, out_ptr0,
-        q, K, V,
-        desc_k, desc_v, Q_LEN, KV_LEN,
-        acc, l_i, m_i,
-        off_zq, off_hq, offs_m[:, None], offs_n[None, :],
+        arg_Q,
+        arg_K,
+        arg_V,
+        arg_LSE,
+        arg_MAX,
+        arg_KV_NUM_BLKS,
+        arg_KV_IDX,
+        arg_FULL_KV_NUM_BLKS,
+        arg_FULL_KV_IDX,
+        out_ptr0,
+        q,
+        K,
+        V,
+        desc_k,
+        desc_v,
+        Q_LEN,
+        KV_LEN,
+        acc,
+        l_i,
+        m_i,
+        off_zq,
+        off_hq,
+        offs_m[:, None],
+        offs_n[None, :],
         kv_start,
-        kv_indices, kv_num_blocks,
-        0, block_n_end,
+        kv_indices,
+        kv_num_blocks,
+        0,
+        block_n_end,
         MATMUL_PRECISION,
-        stride_kk, stride_kn, stride_vn, stride_vk,
+        stride_kk,
+        stride_kn,
+        stride_vn,
+        stride_vk,
         IS_FULL_BLOCKS=False,
     )
 
@@ -1243,26 +1270,49 @@ def ATTN_flex_attention_fwd(arg_Q, arg_K, arg_V, arg_LSE, arg_MAX, arg_KV_NUM_BL
     if HAS_FULL_BLOCKS:
         # FULL_KV_IDX and FULL_KV_NUM_BLKS are always contiguous.
         kv_indices = FULL_KV_IDX + sparse_full_kv_idx_offset
-        kv_start = tl.load(kv_indices) * SPARSE_KV_BLOCK_SIZE # first kv block we're loading
+        kv_start = tl.load(kv_indices) * SPARSE_KV_BLOCK_SIZE  # first kv block we're loading
         kv_num_blocks = tl.load(FULL_KV_NUM_BLKS + sparse_full_kv_num_blks_offset)
         block_n_end = tl.minimum(kv_num_blocks * SPARSE_KV_MULTIPLE, tl.maximum(tl.cdiv(KV_LEN, BLOCK_N), 1))
         # K and V pointers will be passed directly to forward_inner
         offs_n = kv_start + tl.arange(0, BLOCK_N)
 
         acc, l_i, m_i = forward_inner(
-            arg_Q, arg_K, arg_V, arg_LSE, arg_MAX, arg_KV_NUM_BLKS, arg_KV_IDX, arg_FULL_KV_NUM_BLKS, arg_FULL_KV_IDX, out_ptr0,
-            q, K, V,
-            desc_k, desc_v, Q_LEN, KV_LEN,
-            acc, l_i, m_i,
-            off_zq, off_hq, offs_m[:, None], offs_n[None, :],
+            arg_Q,
+            arg_K,
+            arg_V,
+            arg_LSE,
+            arg_MAX,
+            arg_KV_NUM_BLKS,
+            arg_KV_IDX,
+            arg_FULL_KV_NUM_BLKS,
+            arg_FULL_KV_IDX,
+            out_ptr0,
+            q,
+            K,
+            V,
+            desc_k,
+            desc_v,
+            Q_LEN,
+            KV_LEN,
+            acc,
+            l_i,
+            m_i,
+            off_zq,
+            off_hq,
+            offs_m[:, None],
+            offs_n[None, :],
             kv_start,
-            kv_indices, kv_num_blocks,
-            0, block_n_end,
+            kv_indices,
+            kv_num_blocks,
+            0,
+            block_n_end,
             MATMUL_PRECISION,
-            stride_kk, stride_kn, stride_vn, stride_vk,
+            stride_kk,
+            stride_kn,
+            stride_vn,
+            stride_vk,
             IS_FULL_BLOCKS=True,
         )
-
 
     # [Note] Handle fully masked out rows:
     # Li will be the sum(e^(-inf)) == 0.0 for masked out rows, mi will be -inf.
@@ -1278,7 +1328,7 @@ def ATTN_flex_attention_fwd(arg_Q, arg_K, arg_V, arg_LSE, arg_MAX, arg_KV_NUM_BL
     mask = (idx_m < Q_LEN) & (idx_d < V_HEAD_DIM)
 
     tl.static_assert(acc.shape == [BLOCK_M, V_HEAD_DIM_ROUNDED])
-    xindex = idx_d + 64*idx_m + 32768*idx_hq + 131072*idx_zq
+    xindex = idx_d + 64 * idx_m + 32768 * idx_hq + 131072 * idx_zq
     tl.store(out_ptr0 + (tl.broadcast_to(xindex, [BLOCK_M, V_HEAD_DIM_ROUNDED])), acc, mask)
 
     if OUTPUT_LOGSUMEXP:
@@ -1301,35 +1351,36 @@ def ATTN_flex_attention_fwd(arg_Q, arg_K, arg_V, arg_LSE, arg_MAX, arg_KV_NUM_BL
 
 # Utility triton funcs
 @triton.jit
-def get_offset_for_next_block(
-    loop_iter, col_indices, total_blocks,
-    SPARSE_BLOCK, SPARSE_BLOCK_MULTIPLE, BLOCK,
-    BLOCKS_ARE_CONTIGUOUS: tl.constexpr
-):
+def get_offset_for_next_block(loop_iter, col_indices, total_blocks, SPARSE_BLOCK, SPARSE_BLOCK_MULTIPLE, BLOCK,
+                              BLOCKS_ARE_CONTIGUOUS: tl.constexpr):
     if BLOCKS_ARE_CONTIGUOUS:
         return BLOCK
     cur_block_idx = loop_iter // SPARSE_BLOCK_MULTIPLE
     cur_block = tl.load(col_indices + cur_block_idx, eviction_policy="evict_last")
-    next_block = tl.load(col_indices + cur_block_idx + 1, eviction_policy="evict_last", mask=cur_block_idx + 1 < total_blocks)
+    next_block = tl.load(col_indices + cur_block_idx + 1, eviction_policy="evict_last", mask=cur_block_idx + 1
+                         < total_blocks)
     needs_jump = (loop_iter + 1) % SPARSE_BLOCK_MULTIPLE == 0
-    jump_to_block = (next_block - cur_block ) * SPARSE_BLOCK - (SPARSE_BLOCK_MULTIPLE - 1) * BLOCK
+    jump_to_block = (next_block - cur_block) * SPARSE_BLOCK - (SPARSE_BLOCK_MULTIPLE - 1) * BLOCK
     offset = jump_to_block * needs_jump + (1 - needs_jump) * BLOCK
     return offset
+
 
 @triton.jit
 def get_bounded_indices(indices, max_len=None):
     return indices % max_len if max_len is not None else indices
 
+
 @triton.jit
 def load_checked_block(block_ptr, IS_DIVISIBLE: tl.constexpr, SAFE_HEAD_DIM: tl.constexpr):
-  if IS_DIVISIBLE and SAFE_HEAD_DIM:
-    return tl.load(block_ptr)
-  elif IS_DIVISIBLE and not SAFE_HEAD_DIM:
-    return tl.load(block_ptr, boundary_check=(1,), padding_option="zero")
-  elif not IS_DIVISIBLE and SAFE_HEAD_DIM:
-      return tl.load(block_ptr, boundary_check=(0,), padding_option="zero")
-  else:
-      return tl.load(block_ptr, boundary_check=(0, 1), padding_option="zero")
+    if IS_DIVISIBLE and SAFE_HEAD_DIM:
+        return tl.load(block_ptr)
+    elif IS_DIVISIBLE and not SAFE_HEAD_DIM:
+        return tl.load(block_ptr, boundary_check=(1, ), padding_option="zero")
+    elif not IS_DIVISIBLE and SAFE_HEAD_DIM:
+        return tl.load(block_ptr, boundary_check=(0, ), padding_option="zero")
+    else:
+        return tl.load(block_ptr, boundary_check=(0, 1), padding_option="zero")
+
 
 @triton.jit
 def load_checked_2d(
@@ -1361,45 +1412,68 @@ def load_checked_2d(
 # Common Imports
 @triton.jit
 def forward_block_mn(
-    arg_Q, arg_K, arg_V, arg_LSE, arg_MAX, arg_KV_NUM_BLKS, arg_KV_IDX, arg_FULL_KV_NUM_BLKS, arg_FULL_KV_IDX, out_ptr0,
-    q, K, V, desc_k, desc_v, Q_LEN, KV_LEN,
+    arg_Q,
+    arg_K,
+    arg_V,
+    arg_LSE,
+    arg_MAX,
+    arg_KV_NUM_BLKS,
+    arg_KV_IDX,
+    arg_FULL_KV_NUM_BLKS,
+    arg_FULL_KV_IDX,
+    out_ptr0,
+    q,
+    K,
+    V,
+    desc_k,
+    desc_v,
+    Q_LEN,
+    KV_LEN,
     # accumulated values
-    acc, l_i, m_i,
+    acc,
+    l_i,
+    m_i,
     # Offsets
-    off_z, off_h, offs_m, offs_n,
+    off_z,
+    off_h,
+    offs_m,
+    offs_n,
     # Offsets needed for TMA loads
     kv_start,
     kv_offset,
-    MATMUL_PRECISION, RCP_LN2,
+    MATMUL_PRECISION,
+    RCP_LN2,
     # Strides for K and V
-    stride_kk, stride_kn, stride_vn, stride_vk,
-    IS_FULL_BLOCKS, CHECK_BLOCK_BOUNDARY=False,
-
+    stride_kk,
+    stride_kn,
+    stride_vn,
+    stride_vk,
+    IS_FULL_BLOCKS,
+    CHECK_BLOCK_BOUNDARY=False,
 ):
     # Redefines all kernel parameters (BLOCK_M, etc.) so we don't need to plumb them all through
-    PRESCALE_QK : tl.constexpr = False
-    ROWS_GUARANTEED_SAFE : tl.constexpr = False
-    BLOCKS_ARE_CONTIGUOUS : tl.constexpr = False
-    WRITE_DQ : tl.constexpr = True
-    OUTPUT_LOGSUMEXP : tl.constexpr = True
-    OUTPUT_MAX : tl.constexpr = False
-    FLOAT32_PRECISION : tl.constexpr = 'ieee'
-    IS_DIVISIBLE : tl.constexpr = True
-    SM_SCALE : tl.constexpr = 0.125
-    GQA_SHARED_HEADS : tl.constexpr = 1
-    HAS_FULL_BLOCKS : tl.constexpr = False
-    QK_HEAD_DIM : tl.constexpr = 64
-    QK_HEAD_DIM_ROUNDED : tl.constexpr = 64
-    V_HEAD_DIM : tl.constexpr = 64
-    V_HEAD_DIM_ROUNDED : tl.constexpr = 64
-    SAFE_HEAD_DIM : tl.constexpr = True
-    USE_TMA : tl.constexpr = False
-    BLOCK_M : tl.constexpr = 64
-    BLOCK_N : tl.constexpr = 128
-    SPARSE_Q_BLOCK_SIZE : tl.constexpr = 1073741824
-    SPARSE_KV_BLOCK_SIZE : tl.constexpr = 1073741824
-    INDEX_DTYPE : tl.constexpr = tl.int32
-
+    PRESCALE_QK: tl.constexpr = False
+    ROWS_GUARANTEED_SAFE: tl.constexpr = False
+    BLOCKS_ARE_CONTIGUOUS: tl.constexpr = False
+    WRITE_DQ: tl.constexpr = True
+    OUTPUT_LOGSUMEXP: tl.constexpr = True
+    OUTPUT_MAX: tl.constexpr = False
+    FLOAT32_PRECISION: tl.constexpr = 'ieee'
+    IS_DIVISIBLE: tl.constexpr = True
+    SM_SCALE: tl.constexpr = 0.125
+    GQA_SHARED_HEADS: tl.constexpr = 1
+    HAS_FULL_BLOCKS: tl.constexpr = False
+    QK_HEAD_DIM: tl.constexpr = 64
+    QK_HEAD_DIM_ROUNDED: tl.constexpr = 64
+    V_HEAD_DIM: tl.constexpr = 64
+    V_HEAD_DIM_ROUNDED: tl.constexpr = 64
+    SAFE_HEAD_DIM: tl.constexpr = True
+    USE_TMA: tl.constexpr = False
+    BLOCK_M: tl.constexpr = 64
+    BLOCK_N: tl.constexpr = 128
+    SPARSE_Q_BLOCK_SIZE: tl.constexpr = 1073741824
+    SPARSE_KV_BLOCK_SIZE: tl.constexpr = 1073741824
+    INDEX_DTYPE: tl.constexpr = tl.int32
 
     # -- load k --
     # NB reversed order to since K is transposed
@@ -1414,7 +1488,7 @@ def forward_block_mn(
     k = k.to(q.dtype)
     # -- compute qk ---
     # [scope: BOTH] (out - M3) first attention matmul q @ k^T; unanalyzed-mma on both checkers.
-    qk = tl.dot(q, k, input_precision=FLOAT32_PRECISION) # TODO: use cuda matmul when q_len <= 2.
+    qk = tl.dot(q, k, input_precision=FLOAT32_PRECISION)  # TODO: use cuda matmul when q_len <= 2.
     if not PRESCALE_QK:
         qk *= SM_SCALE
     # ~~~~~~~~~~~~~~~~~~~ Apply score modification  ~~~~~~~~~~~~~~~~~~~
@@ -1427,7 +1501,6 @@ def forward_block_mn(
     tmp0 = (qk)
     post_mod_scores = tmp0
 
-
     if CHECK_BLOCK_BOUNDARY:
         # Mask out the elements that are out of the KV_LEN for non divisible seqlen.
         post_mod_scores = tl.where(offs_n < KV_LEN, post_mod_scores, float("-inf"))
@@ -1435,7 +1508,6 @@ def forward_block_mn(
     if not IS_FULL_BLOCKS:
         tmp1 = tl.full([1], True, tl.int1)
         mask_mod_output = tmp1
-
 
         if CHECK_BLOCK_BOUNDARY:
             mask_mod_output = tl.where(offs_n < KV_LEN, mask_mod_output, False)
@@ -1483,51 +1555,75 @@ def forward_block_mn(
 
     return acc, l_i, m_i
 
+
 @triton.jit
 def forward_inner(
-    arg_Q, arg_K, arg_V, arg_LSE, arg_MAX, arg_KV_NUM_BLKS, arg_KV_IDX, arg_FULL_KV_NUM_BLKS, arg_FULL_KV_IDX, out_ptr0,
-    q, K, V,
-    desc_k, desc_v, Q_LEN, KV_LEN,
+    arg_Q,
+    arg_K,
+    arg_V,
+    arg_LSE,
+    arg_MAX,
+    arg_KV_NUM_BLKS,
+    arg_KV_IDX,
+    arg_FULL_KV_NUM_BLKS,
+    arg_FULL_KV_IDX,
+    out_ptr0,
+    q,
+    K,
+    V,
+    desc_k,
+    desc_v,
+    Q_LEN,
+    KV_LEN,
     # accumulated values
-    acc, l_i, m_i,
+    acc,
+    l_i,
+    m_i,
     # Offsets used as inputs to score_mod & mask_mod
     # of size [BLOCK_M, BLOCK_N] or scalar.
-    off_z, off_h, offs_m, offs_n,
+    off_z,
+    off_h,
+    offs_m,
+    offs_n,
     # Offsets needed for TMA loads
     kv_start,
     # blocksparse data
-    kv_indices, kv_num_blocks,
+    kv_indices,
+    kv_num_blocks,
     # start kv and end kv block
-    block_n_start, block_n_end,
+    block_n_start,
+    block_n_end,
     MATMUL_PRECISION,
     # Strides for K and V
-    stride_kk, stride_kn, stride_vn, stride_vk,
+    stride_kk,
+    stride_kn,
+    stride_vn,
+    stride_vk,
     IS_FULL_BLOCKS,
 ):
     # Redefines all kernel parameters (BLOCK_M, etc.) so we don't need to plumb them all through
-    PRESCALE_QK : tl.constexpr = False
-    ROWS_GUARANTEED_SAFE : tl.constexpr = False
-    BLOCKS_ARE_CONTIGUOUS : tl.constexpr = False
-    WRITE_DQ : tl.constexpr = True
-    OUTPUT_LOGSUMEXP : tl.constexpr = True
-    OUTPUT_MAX : tl.constexpr = False
-    FLOAT32_PRECISION : tl.constexpr = 'ieee'
-    IS_DIVISIBLE : tl.constexpr = True
-    SM_SCALE : tl.constexpr = 0.125
-    GQA_SHARED_HEADS : tl.constexpr = 1
-    HAS_FULL_BLOCKS : tl.constexpr = False
-    QK_HEAD_DIM : tl.constexpr = 64
-    QK_HEAD_DIM_ROUNDED : tl.constexpr = 64
-    V_HEAD_DIM : tl.constexpr = 64
-    V_HEAD_DIM_ROUNDED : tl.constexpr = 64
-    SAFE_HEAD_DIM : tl.constexpr = True
-    USE_TMA : tl.constexpr = False
-    BLOCK_M : tl.constexpr = 64
-    BLOCK_N : tl.constexpr = 128
-    SPARSE_Q_BLOCK_SIZE : tl.constexpr = 1073741824
-    SPARSE_KV_BLOCK_SIZE : tl.constexpr = 1073741824
-    INDEX_DTYPE : tl.constexpr = tl.int32
-
+    PRESCALE_QK: tl.constexpr = False
+    ROWS_GUARANTEED_SAFE: tl.constexpr = False
+    BLOCKS_ARE_CONTIGUOUS: tl.constexpr = False
+    WRITE_DQ: tl.constexpr = True
+    OUTPUT_LOGSUMEXP: tl.constexpr = True
+    OUTPUT_MAX: tl.constexpr = False
+    FLOAT32_PRECISION: tl.constexpr = 'ieee'
+    IS_DIVISIBLE: tl.constexpr = True
+    SM_SCALE: tl.constexpr = 0.125
+    GQA_SHARED_HEADS: tl.constexpr = 1
+    HAS_FULL_BLOCKS: tl.constexpr = False
+    QK_HEAD_DIM: tl.constexpr = 64
+    QK_HEAD_DIM_ROUNDED: tl.constexpr = 64
+    V_HEAD_DIM: tl.constexpr = 64
+    V_HEAD_DIM_ROUNDED: tl.constexpr = 64
+    SAFE_HEAD_DIM: tl.constexpr = True
+    USE_TMA: tl.constexpr = False
+    BLOCK_M: tl.constexpr = 64
+    BLOCK_N: tl.constexpr = 128
+    SPARSE_Q_BLOCK_SIZE: tl.constexpr = 1073741824
+    SPARSE_KV_BLOCK_SIZE: tl.constexpr = 1073741824
+    INDEX_DTYPE: tl.constexpr = tl.int32
 
     SPARSE_KV_MULTIPLE: tl.constexpr = (SPARSE_KV_BLOCK_SIZE // BLOCK_N)
     RCP_LN2: tl.constexpr = 1.44269504
@@ -1542,18 +1638,42 @@ def forward_inner(
         # Here IS_DIVISIBLE acts are the start_n = tl.multiple_of(start_n, BLOCK_N) from triton_fused_attention.
         if IS_DIVISIBLE:
             acc, l_i, m_i = forward_block_mn(
-                arg_Q, arg_K, arg_V, arg_LSE, arg_MAX, arg_KV_NUM_BLKS, arg_KV_IDX, arg_FULL_KV_NUM_BLKS, arg_FULL_KV_IDX, out_ptr0,
-                q, K, V, desc_k, desc_v, Q_LEN, KV_LEN,
+                arg_Q,
+                arg_K,
+                arg_V,
+                arg_LSE,
+                arg_MAX,
+                arg_KV_NUM_BLKS,
+                arg_KV_IDX,
+                arg_FULL_KV_NUM_BLKS,
+                arg_FULL_KV_IDX,
+                out_ptr0,
+                q,
+                K,
+                V,
+                desc_k,
+                desc_v,
+                Q_LEN,
+                KV_LEN,
                 # accumulated values
-                acc, l_i, m_i,
+                acc,
+                l_i,
+                m_i,
                 # Offsets
-                off_z, off_h, offs_m, offs_n,
+                off_z,
+                off_h,
+                offs_m,
+                offs_n,
                 # Offsets needed for TMA loads
                 kv_start,
                 kv_offset,
-                MATMUL_PRECISION, RCP_LN2,
+                MATMUL_PRECISION,
+                RCP_LN2,
                 # Strides for K and V
-                stride_kk, stride_kn, stride_vn, stride_vk,
+                stride_kk,
+                stride_kn,
+                stride_vn,
+                stride_vk,
                 IS_FULL_BLOCKS,
             )
         else:
@@ -1562,30 +1682,51 @@ def forward_inner(
             # However, we choose different strategy for bwd, where we only apply mod & mask
             # to the last block because it's faster a lot.
             acc, l_i, m_i = forward_block_mn(
-                arg_Q, arg_K, arg_V, arg_LSE, arg_MAX, arg_KV_NUM_BLKS, arg_KV_IDX, arg_FULL_KV_NUM_BLKS, arg_FULL_KV_IDX, out_ptr0,
-                q, K, V, desc_k, desc_v, Q_LEN, KV_LEN,
+                arg_Q,
+                arg_K,
+                arg_V,
+                arg_LSE,
+                arg_MAX,
+                arg_KV_NUM_BLKS,
+                arg_KV_IDX,
+                arg_FULL_KV_NUM_BLKS,
+                arg_FULL_KV_IDX,
+                out_ptr0,
+                q,
+                K,
+                V,
+                desc_k,
+                desc_v,
+                Q_LEN,
+                KV_LEN,
                 # accumulated values
-                acc, l_i, m_i,
+                acc,
+                l_i,
+                m_i,
                 # Offsets
-                off_z, off_h, offs_m, offs_n,
+                off_z,
+                off_h,
+                offs_m,
+                offs_n,
                 # Offsets needed for TMA loads
                 kv_start,
                 kv_offset,
-                MATMUL_PRECISION, RCP_LN2,
+                MATMUL_PRECISION,
+                RCP_LN2,
                 # Strides for K and V
-                stride_kk, stride_kn, stride_vn, stride_vk,
-                IS_FULL_BLOCKS, CHECK_BLOCK_BOUNDARY=True,
+                stride_kk,
+                stride_kn,
+                stride_vn,
+                stride_vk,
+                IS_FULL_BLOCKS,
+                CHECK_BLOCK_BOUNDARY=True,
             )
 
-
-        offset = get_offset_for_next_block(
-            start_n, kv_indices, kv_num_blocks,
-            SPARSE_KV_BLOCK_SIZE, SPARSE_KV_MULTIPLE, BLOCK_N, BLOCKS_ARE_CONTIGUOUS
-        )
+        offset = get_offset_for_next_block(start_n, kv_indices, kv_num_blocks, SPARSE_KV_BLOCK_SIZE, SPARSE_KV_MULTIPLE,
+                                           BLOCK_N, BLOCKS_ARE_CONTIGUOUS)
 
         offs_n = offs_n + offset
         kv_offset += offset
-
 
     return acc, l_i, m_i
 
@@ -1598,6 +1739,7 @@ def forward_inner(
 # ## TTGIR checker keys the harmless block-sum while staying blind to the parts that actually differ.
 # #########################################################################################
 
+
 # ========================================================================================= #
 # SCAN-1. Decoupled-lookback split scan  (source: triton_spl_fused_cumsum_0 | repro: cumsum(8x40000), H100)
 # Kernel type: SPLIT_SCAN = per-block tl.reduce + tl.associative_scan + cross-block lookback carry.
@@ -1609,7 +1751,7 @@ def forward_inner(
 # only the block-sum reduce and is blind to both the scan and the lookback carry -> over-merge risk.
 # ========================================================================================= #
 @triton.jit
-def SCAN_split_lookback_cumsum(in_ptr0, out_ptr0, ws_ptr, xnumel, r0_numel, R0_BLOCK : tl.constexpr):
+def SCAN_split_lookback_cumsum(in_ptr0, out_ptr0, ws_ptr, xnumel, r0_numel, R0_BLOCK: tl.constexpr):
     xnumel = 8
     XBLOCK: tl.constexpr = 1
     r0_numel = 40000
@@ -1625,7 +1767,7 @@ def SCAN_split_lookback_cumsum(in_ptr0, out_ptr0, ws_ptr, xnumel, r0_numel, R0_B
     rindex = r0_index
     r0_1 = r0_index
     x0 = xindex
-    tmp0 = tl.load(in_ptr0 + (r0_1 + 40000*x0), r0_mask, eviction_policy='evict_last', other=0.0)
+    tmp0 = tl.load(in_ptr0 + (r0_1 + 40000 * x0), r0_mask, eviction_policy='evict_last', other=0.0)
     tmp1 = tl.num_programs(0)
     tmp2 = ws_ptr.to(tl.pointer_type(tl.uint64)) + xoffset * 1 * tmp1
     tmp3 = tmp0.to(tl.float32)
@@ -1650,7 +1792,7 @@ def SCAN_split_lookback_cumsum(in_ptr0, out_ptr0, ws_ptr, xnumel, r0_numel, R0_B
     tmp7 = tl.associative_scan(tmp4, 0, _triton_helper_fn_add0)
     tmp8 = _triton_helper_fn_add0(tmp6, tmp7)
     tmp9 = tl.where(roffset == 0, tmp7, tmp8)
-    tl.store(out_ptr0 + (r0_1 + 40000*x0), tmp9, r0_mask)
+    tl.store(out_ptr0 + (r0_1 + 40000 * x0), tmp9, r0_mask)
 
 
 # #########################################################################################
@@ -1660,6 +1802,7 @@ def SCAN_split_lookback_cumsum(in_ptr0, out_ptr0, ws_ptr, xnumel, r0_numel, R0_B
 # ## SPLIT across CTAs (RSPLIT), each does a local tree-reduce, then a grid barrier + shared workspace
 # ## combine the per-CTA partials - a reduction ordering story that spans thread blocks.
 # #########################################################################################
+
 
 # ========================================================================================= #
 # COOP-1. Cross-CTA cooperative sum  (source: triton_unk_fused_sum_0 | repro: x.sum(-1) 8x131072, H100)
@@ -1672,7 +1815,8 @@ def SCAN_split_lookback_cumsum(in_ptr0, out_ptr0, ws_ptr, xnumel, r0_numel, R0_B
 # is keyed, but the cross-CTA carry (barrier + workspace) is opaque to PTX / safe-by-side-effect on TTGIR.
 # ========================================================================================= #
 @triton.jit
-def COOP_xgrid_sum(in_ptr0, out_ptr0, sem_ptr, ws_ptr, xnumel, r0_numel, XBLOCK : tl.constexpr, R0_BLOCK : tl.constexpr, RSPLIT : tl.constexpr):
+def COOP_xgrid_sum(in_ptr0, out_ptr0, sem_ptr, ws_ptr, xnumel, r0_numel, XBLOCK: tl.constexpr, R0_BLOCK: tl.constexpr,
+                   RSPLIT: tl.constexpr):
     xnumel = 8
     r0_numel = 131072
     rnumel = r0_numel
@@ -1701,7 +1845,7 @@ def COOP_xgrid_sum(in_ptr0, out_ptr0, sem_ptr, ws_ptr, xnumel, r0_numel, XBLOCK 
         roffset = r0_offset
         rindex = r0_index
         r0_1 = r0_index
-        tmp0 = tl.load(in_ptr0 + (r0_1 + 131072*x0), r0_mask & xmask, eviction_policy='evict_first', other=0.0)
+        tmp0 = tl.load(in_ptr0 + (r0_1 + 131072 * x0), r0_mask & xmask, eviction_policy='evict_first', other=0.0)
         tmp1 = tl.broadcast_to(tmp0, [XBLOCK, R0_BLOCK])
         # [scope: PTX] (sound; over-splits) per-CTA loop-carried partial accumulate (a left-fold);
         # _balance_pass rejects it as unbalanced, so no ITreeReduce collapse.
@@ -1720,7 +1864,8 @@ def COOP_xgrid_sum(in_ptr0, out_ptr0, sem_ptr, ws_ptr, xnumel, r0_numel, XBLOCK 
         # cross-CTA ordering (safe by side effect: a different RSPLIT changes the peer-reduce key).
         triton_helpers.x_grid_barrier(sem_ptr + tl.program_id(1))
     if HAS_RSPLIT:
-        tmp2_peers = tl.load(tmp2_ws + (xindex * RSPLIT + rsplit_arange), rsplit_mask, eviction_policy='evict_first', other=triton_helpers.if_mask(rsplit_mask, 0))
+        tmp2_peers = tl.load(tmp2_ws + (xindex * RSPLIT + rsplit_arange), rsplit_mask, eviction_policy='evict_first',
+                             other=triton_helpers.if_mask(rsplit_mask, 0))
         tmp2 = tl.sum(tmp2_peers, 1)[:, None]
     if rsplit_id == (0 % RSPLIT):
         tl.store(out_ptr0 + (x0), tmp2, xmask)
@@ -1734,6 +1879,7 @@ def COOP_xgrid_sum(in_ptr0, out_ptr0, sem_ptr, ws_ptr, xnumel, r0_numel, XBLOCK 
 # ## combo/foreach kernel generated on this H100 (config.combo_kernels).
 # #########################################################################################
 
+
 # ========================================================================================= #
 # PW-1. Reflection-pad + add  (source: triton_poi_fused_add_reflection_pad2d_0, test_cuda_repro.py:2480)
 # Kernel type: POINTWISE (reflection-pad addressing via tl_math.abs + a tensor add).
@@ -1744,7 +1890,7 @@ def COOP_xgrid_sum(in_ptr0, out_ptr0, sem_ptr, ws_ptr, xnumel, r0_numel, XBLOCK 
 # the baseline where both checkers correctly say 'equivalent for every config'.
 # ========================================================================================= #
 @triton.jit
-def PW_reflection_pad_add(in_ptr0, in_ptr1, out_ptr0, xnumel, XBLOCK : tl.constexpr):
+def PW_reflection_pad_add(in_ptr0, in_ptr1, out_ptr0, xnumel, XBLOCK: tl.constexpr):
     xnumel = 4000
     xoffset = tl.program_id(0) * XBLOCK
     xindex = xoffset + tl.arange(0, XBLOCK)[:]
@@ -1753,8 +1899,14 @@ def PW_reflection_pad_add(in_ptr0, in_ptr1, out_ptr0, xnumel, XBLOCK : tl.conste
     x1 = ((xindex // 20) % 20)
     x2 = xindex // 400
     x3 = xindex
-    tmp0 = tl.load(in_ptr0 + (99 + ((-1)*tl_math.abs((-9) + tl_math.abs((-5) + x0))) + ((-10)*tl_math.abs((-9) + tl_math.abs((-5) + x1))) + 100*x2), xmask, eviction_policy='evict_last')
-    tmp1 = tl.load(in_ptr1 + (99 + ((-1)*tl_math.abs((-9) + tl_math.abs((-5) + x0))) + ((-10)*tl_math.abs((-9) + tl_math.abs((-5) + x1))) + 100*x2), xmask, eviction_policy='evict_last')
+    tmp0 = tl.load(
+        in_ptr0 + (99 + ((-1) * tl_math.abs((-9) + tl_math.abs((-5) + x0))) +
+                   ((-10) * tl_math.abs((-9) + tl_math.abs((-5) + x1))) + 100 * x2), xmask,
+        eviction_policy='evict_last')
+    tmp1 = tl.load(
+        in_ptr1 + (99 + ((-1) * tl_math.abs((-9) + tl_math.abs((-5) + x0))) +
+                   ((-10) * tl_math.abs((-9) + tl_math.abs((-5) + x1))) + 100 * x2), xmask,
+        eviction_policy='evict_last')
     # [scope: neither] pure pointwise, no reduction. TTGIR returns () (trivially equal - an
     # elementwise kernel has no cross-element FP order to constrain); PTX builds a per-element DAG
     # with no cross-lane node. The only interesting bit is the tl_math.abs reflection addressing.
@@ -1771,9 +1923,7 @@ def PW_reflection_pad_add(in_ptr0, in_ptr1, out_ptr0, xnumel, XBLOCK : tl.conste
 # cross-lane FP order, so it stays in the trivially-sound floor.
 # ========================================================================================= #
 @triton.jit
-def PW_cat_masked(
-    in_ptr0, in_ptr1, out_ptr0, ks0, xnumel, XBLOCK: tl.constexpr
-):
+def PW_cat_masked(in_ptr0, in_ptr1, out_ptr0, ks0, xnumel, XBLOCK: tl.constexpr):
     xoffset = tl.program_id(0).to(tl.int64) * XBLOCK
     xindex = xoffset + tl.arange(0, XBLOCK)[:].to(tl.int64)
     xmask = xindex < xnumel
@@ -1781,9 +1931,7 @@ def PW_cat_masked(
     tmp0 = x0
     tmp3 = ks0
     tmp4 = tmp0 < tmp3
-    tmp5 = tl.load(
-        in_ptr0 + (x0), xmask & tmp4, eviction_policy="evict_last", other=0.0
-    )
+    tmp5 = tl.load(in_ptr0 + (x0), xmask & tmp4, eviction_policy="evict_last", other=0.0)
     tmp6 = 4.0
     tmp7 = tmp5 * tmp6
     tmp8 = tl.full(tmp7.shape, 0.0, tmp7.dtype)
@@ -1814,7 +1962,8 @@ def PW_cat_masked(
 # pointwise sub-kernels selected by pid. No reduction anywhere.
 # ========================================================================================= #
 @triton.jit
-def FOREACH_combo_add(in_ptr0, in_ptr1, in_ptr2, in_ptr3, in_ptr4, in_ptr5, in_ptr6, in_ptr7, out_ptr0, out_ptr1, out_ptr2, out_ptr3):
+def FOREACH_combo_add(in_ptr0, in_ptr1, in_ptr2, in_ptr3, in_ptr4, in_ptr5, in_ptr6, in_ptr7, out_ptr0, out_ptr1,
+                      out_ptr2, out_ptr3):
     # [scope: neither] a combo/foreach kernel: FOUR independent pointwise adds dispatched by pid
     # range in one launch. No reduction anywhere -> trivially sound for both checkers.
     pid = tl.program_id(0)
@@ -1882,6 +2031,7 @@ def FOREACH_combo_add(in_ptr0, in_ptr1, in_ptr2, in_ptr3, in_ptr4, in_ptr5, in_p
 # ## being integer there is no FP order to preserve. A useful 'reduction that is not an FP add-tree'.
 # #########################################################################################
 
+
 # ========================================================================================= #
 # RED-1. Boolean any(isinf)  (source: triton_red_fused_any_isinf_0, test_static_triton_launcher.py:351)
 # Kernel type: REDUCTION (looped OR-reduce of an isinf predicate via triton_helpers.any).
@@ -1914,9 +2064,7 @@ def RED_any_isinf(
         roffset = r0_offset  # noqa: F841
         rindex = r0_index  # noqa: F841
         r0_0 = r0_index
-        tmp0 = tl.load(
-            in_ptr0 + (r0_0), r0_mask, eviction_policy="evict_first", other=0.0
-        )
+        tmp0 = tl.load(in_ptr0 + (r0_0), r0_mask, eviction_policy="evict_first", other=0.0)
         tmp1 = libdevice.isinf(tmp0).to(tl.int1)
         tmp2 = tl.broadcast_to(tmp1, [XBLOCK, R0_BLOCK])
         tmp4 = _tmp3 | tmp2
@@ -1926,6 +2074,405 @@ def RED_any_isinf(
     # it stays layout-bearing (sound; over-splits). Being integer, there is no FP order anyway.
     tmp3 = triton_helpers.any(_tmp3.to(tl.int8), 1)[:, None].to(tl.int1)
     tl.store(out_ptr0 + (tl.full([XBLOCK, 1], 0, tl.int32)), tmp3, None)
+
+
+# #########################################################################################
+# ## GROUP 9 - LOOP-CARRIED REDUCTION DISCRIMINATORS (drove the D113598054 loop-chunk fix).
+# ## Real torch-Inductor looped reductions harvested VERBATIM from
+# ## ~/bitwise-equiv/inductor_loopcarried_kernels/ (each kernel there ships a SPEC + shared
+# ## _harness.py; see that dir's EVAL.md for the full separation table). UNLIKE GROUPS 1-8 (a
+# ## scope/gap-analysis corpus of mostly bit-STABLE kernels), every kernel here spans GENUINE
+# ## bitwise inequivalence: the accumulation is a loop-carried fold (acc = acc (+|*|max) chunk),
+# ## so the reduction CHUNK SIZE (R0_BLOCK; k_split for split-K) is a bit-RELEVANT knob -
+# ## different chunkings regroup the FP fold and produce DIFFERENT output bits. These are the
+# ## discriminators that DROVE the D113598054 loop-chunk soundness fix (the leaf-less / |loops=
+# ## fence over-merge): prod_loop_f32 + splitsum_2kernel_f32 were the two configs the pre-fix
+# ## checker WRONGLY merged (see EVAL.md "SOUNDNESS FINDING"); the fix makes over-merges 0.
+# ## Faithfulness: @triton.jit bodies copied verbatim (only the @triton_heuristics decorator +
+# ## standalone _harness scaffolding stripped, Inductor names given an LC_ group prefix). This is
+# ## step 1 = bring the kernels in; they are NOT wired into evaluate.py (format-unification is a
+# ## later step), matching how GROUPS 2+ stay a reference corpus.
+# #########################################################################################
+
+# ========================================================================================= #
+# LC-1. Long-axis sum, looped ADD-fold (fp32)  (source: sum_loop_f32.py / triton_red_fused_sum_0)
+# -----------------------------------------------------------------------------------------
+# What it computes: x.sum(-1) over (64, 16384) fp32 as a loop-carried add-fold (acc += chunk) then
+# a final tl.sum. Inductor: triton_red_fused_sum_0 (looped reduction, R0_BLOCK-wide chunks).
+# Bit-difference axis: R0_BLOCK (the chunk grouping) -> 22 empirical bit-classes over 36 configs.
+# Checker: SUPPORTED (reconstructed reduction tree); over-merges 0 AFTER the D113598054 fence fix.
+# ========================================================================================= #
+@triton.jit
+def LC_sum_loop_f32(in_ptr0, out_ptr0, xnumel, r0_numel, XBLOCK : tl.constexpr, R0_BLOCK : tl.constexpr):
+    xnumel = 64
+    r0_numel = 16384
+    rnumel = r0_numel
+    RBLOCK: tl.constexpr = R0_BLOCK
+    xoffset = tl.program_id(0) * XBLOCK
+    xindex = xoffset + tl.arange(0, XBLOCK)[:, None]
+    xmask = xindex < xnumel
+    r0_base = tl.arange(0, R0_BLOCK)[None, :]
+    rbase = r0_base
+    x0 = xindex
+    _tmp2 = tl.full([XBLOCK, R0_BLOCK], 0, tl.float32)
+    for r0_offset in tl.range(0, r0_numel, R0_BLOCK):
+        r0_index = r0_offset + r0_base
+        r0_mask = r0_index < r0_numel
+        roffset = r0_offset
+        rindex = r0_index
+        r0_1 = r0_index
+        tmp0 = tl.load(in_ptr0 + (r0_1 + 16384*x0), r0_mask & xmask, eviction_policy='evict_first', other=0.0)
+        tmp1 = tl.broadcast_to(tmp0, [XBLOCK, R0_BLOCK])
+        tmp3 = _tmp2 + tmp1
+        _tmp2 = tl.where(r0_mask & xmask, tmp3, _tmp2)
+    tmp2 = tl.sum(_tmp2, 1)[:, None]
+    tl.store(out_ptr0 + (x0), tmp2, xmask)
+
+
+# ========================================================================================= #
+# LC-2. Long-axis sum, looped ADD-fold (fp16)  (source: sum_loop_f16.py / triton_red_fused_sum_0)
+# -----------------------------------------------------------------------------------------
+# What it computes: x.sum(-1) over (64, 16384) fp16 (loaded to fp32 for the fold). Same body as
+# LC-1 with a .to(tl.float32) on the load; the fp16 vs fp32 difference lives in the input/output
+# dtype the (stripped) harness sets, so the @triton.jit body is verbatim-identical to LC-3.
+# Bit-difference axis: R0_BLOCK + num_warps -> 17 bit-classes over 36 configs (fp16 store rounds
+# away some low bits, so fewer classes than fp32). Checker: SUPPORTED; over-merges 0.
+# ========================================================================================= #
+@triton.jit
+def LC_sum_loop_f16(in_ptr0, out_ptr0, xnumel, r0_numel, XBLOCK : tl.constexpr, R0_BLOCK : tl.constexpr):
+    xnumel = 64
+    r0_numel = 16384
+    rnumel = r0_numel
+    RBLOCK: tl.constexpr = R0_BLOCK
+    xoffset = tl.program_id(0) * XBLOCK
+    xindex = xoffset + tl.arange(0, XBLOCK)[:, None]
+    xmask = xindex < xnumel
+    r0_base = tl.arange(0, R0_BLOCK)[None, :]
+    rbase = r0_base
+    x0 = xindex
+    _tmp2 = tl.full([XBLOCK, R0_BLOCK], 0, tl.float32)
+    for r0_offset in tl.range(0, r0_numel, R0_BLOCK):
+        r0_index = r0_offset + r0_base
+        r0_mask = r0_index < r0_numel
+        roffset = r0_offset
+        rindex = r0_index
+        r0_1 = r0_index
+        tmp0 = tl.load(in_ptr0 + (r0_1 + 16384*x0), r0_mask & xmask, eviction_policy='evict_first', other=0.0).to(tl.float32)
+        tmp1 = tl.broadcast_to(tmp0, [XBLOCK, R0_BLOCK])
+        tmp3 = _tmp2 + tmp1
+        _tmp2 = tl.where(r0_mask & xmask, tmp3, _tmp2)
+    tmp2 = tl.sum(_tmp2, 1)[:, None]
+    tl.store(out_ptr0 + (x0), tmp2, xmask)
+
+
+# ========================================================================================= #
+# LC-3. Long-axis sum, looped ADD-fold (bf16)  (source: sum_loop_bf16.py / triton_red_fused_sum_0)
+# -----------------------------------------------------------------------------------------
+# What it computes: x.sum(-1) over (64, 16384) bf16 (loaded to fp32 for the fold). Body is
+# verbatim-identical to LC-2 (bf16 vs fp16 is only the harness dtype). Bit-difference axis:
+# R0_BLOCK + num_warps -> 4 bit-classes over 36 configs (bf16 store rounds away the most low bits,
+# so the fewest empirical classes of the three sums). Checker: SUPPORTED; over-merges 0.
+# ========================================================================================= #
+@triton.jit
+def LC_sum_loop_bf16(in_ptr0, out_ptr0, xnumel, r0_numel, XBLOCK : tl.constexpr, R0_BLOCK : tl.constexpr):
+    xnumel = 64
+    r0_numel = 16384
+    rnumel = r0_numel
+    RBLOCK: tl.constexpr = R0_BLOCK
+    xoffset = tl.program_id(0) * XBLOCK
+    xindex = xoffset + tl.arange(0, XBLOCK)[:, None]
+    xmask = xindex < xnumel
+    r0_base = tl.arange(0, R0_BLOCK)[None, :]
+    rbase = r0_base
+    x0 = xindex
+    _tmp2 = tl.full([XBLOCK, R0_BLOCK], 0, tl.float32)
+    for r0_offset in tl.range(0, r0_numel, R0_BLOCK):
+        r0_index = r0_offset + r0_base
+        r0_mask = r0_index < r0_numel
+        roffset = r0_offset
+        rindex = r0_index
+        r0_1 = r0_index
+        tmp0 = tl.load(in_ptr0 + (r0_1 + 16384*x0), r0_mask & xmask, eviction_policy='evict_first', other=0.0).to(tl.float32)
+        tmp1 = tl.broadcast_to(tmp0, [XBLOCK, R0_BLOCK])
+        tmp3 = _tmp2 + tmp1
+        _tmp2 = tl.where(r0_mask & xmask, tmp3, _tmp2)
+    tmp2 = tl.sum(_tmp2, 1)[:, None]
+    tl.store(out_ptr0 + (x0), tmp2, xmask)
+
+
+# ========================================================================================= #
+# LC-4. Long-axis product, looped MUL-fold (fp32)  (source: prod_loop_f32.py / triton_red_fused_prod_0)
+# -----------------------------------------------------------------------------------------
+# What it computes: x.prod(-1) over (64, 8192) fp32 (values near 1.0) as a loop-carried mul-fold
+# (acc *= chunk) then triton_helpers.prod. Bit-difference axis: R0_BLOCK -> 18 bit-classes over 36.
+# *** DRIVER of the D113598054 fix: this MUL-fold was 1 of the 2 pre-fix OVER-MERGES *** (r0_block
+# 512 vs 1024 hashed to the SAME descriptor with no |loops= fence, yet the output bytes differ).
+# Checker: SUPPORTED (mul-fold not add-collapsed); over-merges 1 -> 0 AFTER the fence fix.
+# ========================================================================================= #
+@triton.jit
+def LC_prod_loop_f32(in_ptr0, out_ptr0, xnumel, r0_numel, XBLOCK : tl.constexpr, R0_BLOCK : tl.constexpr):
+    xnumel = 64
+    r0_numel = 8192
+    rnumel = r0_numel
+    RBLOCK: tl.constexpr = R0_BLOCK
+    xoffset = tl.program_id(0) * XBLOCK
+    xindex = xoffset + tl.arange(0, XBLOCK)[:, None]
+    xmask = xindex < xnumel
+    r0_base = tl.arange(0, R0_BLOCK)[None, :]
+    rbase = r0_base
+    x0 = xindex
+    _tmp2 = tl.full([XBLOCK, R0_BLOCK], 1, tl.float32)
+    for r0_offset in tl.range(0, r0_numel, R0_BLOCK):
+        r0_index = r0_offset + r0_base
+        r0_mask = r0_index < r0_numel
+        roffset = r0_offset
+        rindex = r0_index
+        r0_1 = r0_index
+        tmp0 = tl.load(in_ptr0 + (r0_1 + 8192*x0), r0_mask & xmask, eviction_policy='evict_first', other=0.0)
+        tmp1 = tl.broadcast_to(tmp0, [XBLOCK, R0_BLOCK])
+        tmp3 = _tmp2 * tmp1
+        _tmp2 = tl.where(r0_mask & xmask, tmp3, _tmp2)
+    tmp2 = triton_helpers.prod(_tmp2, 1)[:, None]
+    tl.store(out_ptr0 + (x0), tmp2, xmask)
+
+
+# ========================================================================================= #
+# LC-5. logsumexp: MAX-fold + SUM-of-exp fold (fp32)  (source: logsumexp_loop_f32.py / triton_red_fused_logsumexp_0)
+# -----------------------------------------------------------------------------------------
+# What it computes: x.logsumexp(-1) over (64, 16384) fp32 = a looped running-max fold, then a
+# looped running-sum-of-exp(x - max) fold, then log + add-back. Bit-difference axis: R0_BLOCK
+# (regroups BOTH folds) + num_warps -> 2 bit-classes over 36 configs. Checker: FAIL-CLOSED (falls
+# back to the sound fingerprint that pins ntid + shfl + loops, so it never merges); over-merges 0.
+# ========================================================================================= #
+@triton.jit
+def LC_logsumexp_loop_f32(in_out_ptr0, in_ptr0, xnumel, r0_numel, XBLOCK : tl.constexpr, R0_BLOCK : tl.constexpr):
+    xnumel = 64
+    r0_numel = 16384
+    rnumel = r0_numel
+    RBLOCK: tl.constexpr = R0_BLOCK
+    xoffset = tl.program_id(0) * XBLOCK
+    xindex = xoffset + tl.arange(0, XBLOCK)[:, None]
+    xmask = xindex < xnumel
+    r0_base = tl.arange(0, R0_BLOCK)[None, :]
+    rbase = r0_base
+    x0 = xindex
+    _tmp2 = tl.full([XBLOCK, R0_BLOCK], float("-inf"), tl.float32)
+    for r0_offset in tl.range(0, r0_numel, R0_BLOCK):
+        r0_index = r0_offset + r0_base
+        r0_mask = r0_index < r0_numel
+        roffset = r0_offset
+        rindex = r0_index
+        r0_1 = r0_index
+        tmp0 = tl.load(in_ptr0 + (r0_1 + 16384*x0), r0_mask & xmask, eviction_policy='evict_last', other=0.0)
+        tmp1 = tl.broadcast_to(tmp0, [XBLOCK, R0_BLOCK])
+        tmp3 = triton_helpers.maximum(_tmp2, tmp1)
+        _tmp2 = tl.where(r0_mask & xmask, tmp3, _tmp2)
+    tmp2 = triton_helpers.max2(_tmp2, 1)[:, None]
+    _tmp13 = tl.full([XBLOCK, R0_BLOCK], 0, tl.float32)
+    for r0_offset in tl.range(0, r0_numel, R0_BLOCK):
+        r0_index = r0_offset + r0_base
+        r0_mask = r0_index < r0_numel
+        roffset = r0_offset
+        rindex = r0_index
+        r0_1 = r0_index
+        tmp4 = tl.load(in_ptr0 + (r0_1 + 16384*x0), r0_mask & xmask, eviction_policy='evict_first', other=0.0)
+        tmp5 = tl_math.abs(tmp2)
+        tmp6 = tl.full([1, 1], float("inf"), tl.float32)
+        tmp7 = tmp5 == tmp6
+        tmp8 = tl.full([1, 1], 0.0, tl.float32)
+        tmp9 = tl.where(tmp7, tmp8, tmp2)
+        tmp10 = tmp4 - tmp9
+        tmp11 = libdevice.exp(tmp10)
+        tmp12 = tl.broadcast_to(tmp11, [XBLOCK, R0_BLOCK])
+        tmp14 = _tmp13 + tmp12
+        _tmp13 = tl.where(r0_mask & xmask, tmp14, _tmp13)
+    tmp13 = tl.sum(_tmp13, 1)[:, None]
+    tmp15 = tl_math.log(tmp13)
+    tmp16 = tl_math.abs(tmp2)
+    tmp17 = tl.full([1, 1], float("inf"), tl.float32)
+    tmp18 = tmp16 == tmp17
+    tmp19 = tl.full([1, 1], 0.0, tl.float32)
+    tmp20 = tl.where(tmp18, tmp19, tmp2)
+    tmp21 = tmp15 + tmp20
+    tl.store(in_out_ptr0 + (x0), tmp21, xmask)
+
+
+# ========================================================================================= #
+# LC-6. Variance via WELFORD online fold (fp32)  (source: var_welford_f32.py / triton_red_fused_var_0)
+# -----------------------------------------------------------------------------------------
+# What it computes: x.var(-1) over (64, 16384) fp32 via triton_helpers.welford_reduce online
+# (mean, M2, weight) fold, then a cross-lane welford + divide. Bit-difference axis: R0_BLOCK
+# (regroups the welford fold) -> 18 bit-classes over 36 configs. Checker: FAIL-CLOSED (the welford
+# combine is FMA/contraction-bearing, so it falls back to the sound fingerprint); over-merges 0.
+# ========================================================================================= #
+@triton.jit
+def LC_var_welford_f32(in_out_ptr0, in_ptr0, xnumel, r0_numel, XBLOCK : tl.constexpr, R0_BLOCK : tl.constexpr):
+    xnumel = 64
+    r0_numel = 16384
+    rnumel = r0_numel
+    RBLOCK: tl.constexpr = R0_BLOCK
+    xoffset = tl.program_id(0) * XBLOCK
+    xindex = xoffset + tl.arange(0, XBLOCK)[:, None]
+    xmask = xindex < xnumel
+    r0_base = tl.arange(0, R0_BLOCK)[None, :]
+    rbase = r0_base
+    x0 = xindex
+    tmp2_mean = tl.zeros([XBLOCK, R0_BLOCK], tl.float32)
+    tmp2_m2 = tl.zeros([XBLOCK, R0_BLOCK], tl.float32)
+    tmp2_weight = tl.zeros([XBLOCK, R0_BLOCK], tl.float32)
+    for r0_offset in tl.range(0, r0_numel, R0_BLOCK):
+        r0_index = r0_offset + r0_base
+        r0_mask = r0_index < r0_numel
+        roffset = r0_offset
+        rindex = r0_index
+        r0_1 = r0_index
+        tmp0 = tl.load(in_ptr0 + (r0_1 + 16384*x0), r0_mask & xmask, eviction_policy='evict_first', other=0.0)
+        tmp1 = tl.broadcast_to(tmp0, [XBLOCK, R0_BLOCK])
+        tmp2_mean_next, tmp2_m2_next, tmp2_weight_next = triton_helpers.welford_reduce(
+            tmp1, tmp2_mean, tmp2_m2, tmp2_weight, roffset == 0
+        )
+        tmp2_mean = tl.where(r0_mask & xmask, tmp2_mean_next, tmp2_mean)
+        tmp2_m2 = tl.where(r0_mask & xmask, tmp2_m2_next, tmp2_m2)
+        tmp2_weight = tl.where(r0_mask & xmask, tmp2_weight_next, tmp2_weight)
+    tmp3, tmp4, tmp5 = triton_helpers.welford(tmp2_mean, tmp2_m2, tmp2_weight, 1)
+    tmp2 = tmp3[:, None]
+    tmp6 = tmp4[:, None]
+    tmp7 = tmp5[:, None]
+    tmp8 = tl.full([1, 1], 16383.0, tl.float32)
+    tmp9 = (tmp6 / tmp8)
+    tl.store(in_out_ptr0 + (x0), tmp9, xmask)
+
+
+# ========================================================================================= #
+# LC-7. Cumulative sum via tl.associative_scan (fp32)  (source: cumsum_scan_f32.py / triton_red_fused_cumsum_0)
+# -----------------------------------------------------------------------------------------
+# What it computes: x.cumsum(-1) over (64, 16384) fp32 = a per-chunk associative_scan + a
+# loop-carried cross-chunk carry. Reuses the module-level _triton_helper_fn_add0 add-combine
+# (defined near the top for F_cumsum_scan / GROUP 5). Bit-difference axis: R0_BLOCK (regroups the
+# scan chunks + carry) -> 12 bit-classes over 36 configs. Checker: SUPPORTED (tt.scan is not
+# modeled, so it falls to the ntid + |loops= fence); the probe = does that fence separate every
+# chunking? over-merges 0 AFTER the fix.
+# ========================================================================================= #
+@triton.jit
+def LC_cumsum_scan_f32(in_ptr0, out_ptr0, xnumel, r0_numel, XBLOCK : tl.constexpr, R0_BLOCK : tl.constexpr):
+    xnumel = 64
+    r0_numel = 16384
+    rnumel = r0_numel
+    RBLOCK: tl.constexpr = R0_BLOCK
+    xoffset = tl.program_id(0) * XBLOCK
+    xindex = xoffset + tl.arange(0, XBLOCK)[:, None]
+    xmask = xindex < xnumel
+    r0_base = tl.arange(0, R0_BLOCK)[None, :]
+    rbase = r0_base
+    x0 = xindex
+    tmp3 = tl.full([XBLOCK, 1], float('nan'), tl.float32)
+    for r0_offset in tl.range(0, r0_numel, R0_BLOCK):
+        r0_index = r0_offset + r0_base
+        r0_mask = r0_index < r0_numel
+        roffset = r0_offset
+        rindex = r0_index
+        r0_1 = r0_index
+        tmp0 = tl.load(in_ptr0 + (r0_1 + 16384*x0), r0_mask & xmask, eviction_policy='evict_first', other=0.0)
+        tmp1 = tmp0.to(tl.float32)
+        tmp2 = tl.broadcast_to(tmp1, [XBLOCK, R0_BLOCK])
+        tmp4, = tl.associative_scan((tmp2,), 1, _triton_helper_fn_add0)
+        tmp5 = triton_helpers.select_one((tmp4), rbase == (RBLOCK - 1), dim=-1, keep_dims=True)
+        tmp6 = tmp3 + tmp5
+        tmp7 = tmp3 + tmp4
+        tmp8 = tl.where(roffset > 0, tmp7, tmp4)
+        tmp3 = tl.where(roffset > 0, tmp6, tmp5)
+        tl.store(out_ptr0 + (r0_1 + 16384*x0), tmp8, r0_mask & xmask)
+
+
+# ========================================================================================= #
+# LC-8. 2-kernel split reduction: partials + combine (fp32)  (source: splitsum_2kernel_f32.py)
+# -----------------------------------------------------------------------------------------
+# What it computes: x.sum() over (1048576,) fp32, which Inductor SPLITS into 128 partials (kernel0:
+# triton_red_fused_sum_0, a looped add-fold over 8192 each) + a combine (kernel1:
+# triton_per_fused_sum_1, sums the 128 partials). The non-GEMM analog of split-K. Bit-difference
+# axis: kernel0 R0_BLOCK (per-split fold grouping) -> 21 bit-classes over 36 configs.
+# *** DRIVER of the D113598054 fix: kernel0 was the OTHER pre-fix OVER-MERGE *** (same r0_block
+# 512 vs 1024 mechanism as LC-4). Checker: SUPPORTED; over-merges 1 -> 0 AFTER the fence fix.
+# ========================================================================================= #
+@triton.jit
+def LC_splitsum_partial_f32(in_ptr0, out_ptr0, xnumel, r0_numel, XBLOCK : tl.constexpr, R0_BLOCK : tl.constexpr):
+    xnumel = 128
+    r0_numel = 8192
+    rnumel = r0_numel
+    RBLOCK: tl.constexpr = R0_BLOCK
+    xoffset = tl.program_id(0) * XBLOCK
+    xindex = xoffset + tl.arange(0, XBLOCK)[:, None]
+    xmask = xindex < xnumel
+    r0_base = tl.arange(0, R0_BLOCK)[None, :]
+    rbase = r0_base
+    x0 = xindex
+    _tmp2 = tl.full([XBLOCK, R0_BLOCK], 0, tl.float32)
+    for r0_offset in tl.range(0, r0_numel, R0_BLOCK):
+        r0_index = r0_offset + r0_base
+        r0_mask = r0_index < r0_numel
+        roffset = r0_offset
+        rindex = r0_index
+        r0_1 = r0_index
+        tmp0 = tl.load(in_ptr0 + (r0_1 + 8192*x0), r0_mask & xmask, eviction_policy='evict_first', other=0.0)
+        tmp1 = tl.broadcast_to(tmp0, [XBLOCK, R0_BLOCK])
+        tmp3 = _tmp2 + tmp1
+        _tmp2 = tl.where(r0_mask & xmask, tmp3, _tmp2)
+    tmp2 = tl.sum(_tmp2, 1)[:, None]
+    tl.store(out_ptr0 + (x0), tmp2, xmask)
+
+
+@triton.jit
+def LC_splitsum_combine_f32(in_ptr0, out_ptr0, xnumel, r0_numel, XBLOCK : tl.constexpr):
+    xnumel = 1
+    r0_numel = 128
+    R0_BLOCK: tl.constexpr = 128
+    rnumel = r0_numel
+    RBLOCK: tl.constexpr = R0_BLOCK
+    xoffset = tl.program_id(0) * XBLOCK
+    xindex = xoffset + tl.arange(0, XBLOCK)[:, None]
+    xmask = tl.full([XBLOCK], True, tl.int1)[:, None]
+    r0_index = tl.arange(0, R0_BLOCK)[None, :]
+    r0_offset = 0
+    r0_mask = tl.full([R0_BLOCK], True, tl.int1)[None, :]
+    roffset = r0_offset
+    rindex = r0_index
+    r0_0 = r0_index
+    tmp0 = tl.load(in_ptr0 + (r0_0), None, eviction_policy='evict_first')
+    tmp1 = tl.broadcast_to(tmp0, [XBLOCK, R0_BLOCK])
+    tmp3 = tl.sum(tmp1, 1)[:, None].to(tl.float32)
+    tl.store(out_ptr0 + (tl.full([1, 1], 0, tl.int32).broadcast_to(XBLOCK, 1)), tmp3, None)
+
+
+# ========================================================================================= #
+# LC-9. Split-K GEMM via Inductor decompose_k (fp16 out, fp32 partials)  (source: splitk_gemm_f16.py / triton_per_fused_mm_0)
+# -----------------------------------------------------------------------------------------
+# What it computes: a @ b (a:(64,16384) b:(16384,64) fp16) which Inductor decompose_k lowers to an
+# extern bmm (cuBLAS, fp32 partials, DETERMINISTIC - not atomic_add) + this Triton reduction that
+# sums the k_split partials. Only body edit: R0_BLOCK lifted from a body constexpr to a signature
+# constexpr so k_split is sweepable. Bit-difference axis: k_split (# of K-contraction groups) ->
+# 7 bit-classes over 28 configs. Checker: SUPPORTED (only the deterministic partial-sum is checked;
+# the MMA is invisible/extern); over-merges 0.
+# ========================================================================================= #
+@triton.jit
+def LC_splitk_gemm_f16(in_ptr0, out_ptr1, xnumel, r0_numel, XBLOCK : tl.constexpr, R0_BLOCK : tl.constexpr):
+    xnumel = 4096
+    rnumel = r0_numel
+    RBLOCK: tl.constexpr = R0_BLOCK
+    xoffset = tl.program_id(0) * XBLOCK
+    xindex = xoffset + tl.arange(0, XBLOCK)[:, None]
+    xmask = tl.full([XBLOCK], True, tl.int1)[:, None]
+    r0_index = tl.arange(0, R0_BLOCK)[None, :]
+    r0_offset = 0
+    r0_mask = tl.full([R0_BLOCK], True, tl.int1)[None, :]
+    roffset = r0_offset
+    rindex = r0_index
+    r0_1 = r0_index
+    x0 = xindex
+    tmp0 = tl.load(in_ptr0 + (x0 + 4096*r0_1), None, eviction_policy='evict_first')
+    tmp1 = tl.broadcast_to(tmp0, [XBLOCK, R0_BLOCK])
+    tmp3 = tl.sum(tmp1, 1)[:, None].to(tl.float32)
+    tmp4 = tmp3.to(tl.float32)
+    tl.store(out_ptr1 + (x0), tmp4, None)
 
 
 # =========================================================================================
@@ -1954,13 +2501,13 @@ GEMM_KERNELS = (
 )
 
 # NOT runnable on sm_90 (needs Blackwell / sm_100); the verify harness skips it.
-WARP_SPECIALIZED_KERNELS = (WS_blackwell_ws_tma_mm,)
+WARP_SPECIALIZED_KERNELS = (WS_blackwell_ws_tma_mm, )
 
-ATTENTION_KERNELS = (ATTN_flex_attention_fwd,)
+ATTENTION_KERNELS = (ATTN_flex_attention_fwd, )
 
-SCAN_KERNELS = (SCAN_split_lookback_cumsum,)
+SCAN_KERNELS = (SCAN_split_lookback_cumsum, )
 
-COOPERATIVE_REDUCTION_KERNELS = (COOP_xgrid_sum,)
+COOPERATIVE_REDUCTION_KERNELS = (COOP_xgrid_sum, )
 
 POINTWISE_KERNELS = (
     PW_reflection_pad_add,
@@ -1968,7 +2515,23 @@ POINTWISE_KERNELS = (
     FOREACH_combo_add,
 )
 
-NONFP_REDUCTION_KERNELS = (RED_any_isinf,)
+NONFP_REDUCTION_KERNELS = (RED_any_isinf, )
+
+# GROUP 9 - loop-carried reduction discriminators (D113598054 loop-chunk fix drivers). 9 source
+# discriminators = 10 @triton.jit kernels (splitsum_2kernel is a partial fold + a combine). Every
+# one spans genuine bitwise inequivalence across its reduction chunk-size knob (R0_BLOCK / k_split).
+LOOP_CARRIED_KERNELS = (
+    LC_sum_loop_f32,
+    LC_sum_loop_f16,
+    LC_sum_loop_bf16,
+    LC_prod_loop_f32,
+    LC_logsumexp_loop_f32,
+    LC_var_welford_f32,
+    LC_cumsum_scan_f32,
+    LC_splitsum_partial_f32,
+    LC_splitsum_combine_f32,
+    LC_splitk_gemm_f16,
+)
 
 # Everything, groups in table order.
 REALISTIC_KERNELS = (
@@ -1980,4 +2543,429 @@ REALISTIC_KERNELS = (
     + COOPERATIVE_REDUCTION_KERNELS
     + POINTWISE_KERNELS
     + NONFP_REDUCTION_KERNELS
+    + LOOP_CARRIED_KERNELS
 )
+
+
+# #########################################################################################
+# ## GROUP 1b — NON-CONTIGUOUS / STRIDED-AXIS REDUCTIONS (the M2 firing targets).         ##
+# #########################################################################################
+# A reduction over a NON-innermost memory axis -- dbias = grad.sum(dim=0), per-channel stats,
+# a matmul-epilogue column sum. Inductor lowers these to a persistent-reduction tile
+# [XBLOCK(kept), R0_BLOCK(reduce)] whose reduce axis is STRIDED in memory (stride = xnumel)
+# while the kept axis is contiguous. Coalescing puts the lanes on the kept axis, so the reduce
+# axis is split across warps and under-parallelized within each warp -- exactly the layout M2
+# rewrites. This is the realistic-Inductor analogue of eval_kernels' sum_2d_col; the body is
+# faithful to the generated `triton_per_fused_sum` (load `x0 + xnumel*r0`, tl.sum(_, 1)),
+# confirmed by round-tripping torch.compile on grad.sum(0) / (A@B).sum(0).
+@triton.jit
+def RED_colsum_dim0(in_ptr0, out_ptr0, xnumel, r0_numel, XBLOCK: tl.constexpr, R0_BLOCK: tl.constexpr,
+                    ORD: tl.constexpr):
+    xoffset = tl.program_id(0) * XBLOCK
+    xindex = xoffset + tl.arange(0, XBLOCK)[:, None]
+    xmask = xindex < xnumel
+    r0_index = tl.arange(0, R0_BLOCK)[None, :]
+    r0_mask = r0_index < r0_numel
+    x0 = xindex
+    r0_1 = r0_index
+    tmp0 = tl.load(in_ptr0 + (x0 + xnumel * r0_1), xmask & r0_mask, other=0.0)  # kept contiguous, reduce strided
+    tmp3 = tl.sum(tmp0, 1, reduction_ordering=ORD)[:, None].to(tl.float32)
+    tl.store(out_ptr0 + x0, tmp3, xmask)
+
+
+# #########################################################################################
+# ## RUNNABLE M2 HARNESS for GROUP 1 (the six ordered add-reductions A, C, D, E, G, H)     ##
+# ## plus GROUP 1b (the strided-axis reductions I, J that M2 actually fires on).           ##
+# #########################################################################################
+# The GROUP 1 kernels above are made runnable via their ``ORD`` param (B_layernorm_welford_gather
+# and F_cumsum_scan are OUT of M2 scope — welford's combine and tt.scan are not ordered add-
+# reductions — so they stay reference-only). This harness compiles each inner_tree, checks that
+# inner_tree == inner_tree+M2 is bit-identical, and reports the 3-way perf (base / +M2 / unordered
+# ceiling). It is SELF-CONTAINED: it defines its own input/timing helpers and imports nothing from
+# eval_kernels, so Suite 2 stays independent of Suite 1. (This is where complex_fusion_eval.py was
+# merged in — the runnable inner_tree transcriptions were a duplicate of these six GROUP 1 bodies.)
+#
+# Run:  PYTHONPATH=. python -m bitequiv.evaluation.realistic_inductor_kernels [kernels] [num_warps]
+# Findings (H100): the six GROUP 1 kernels compile inner_tree + are bit-identical under M2 but run
+# ~1.00x with base ~= ceiling — they are CONTIGUOUS-axis (dim=-1) reductions the compiler already
+# parallelizes, so there is no ordered-vs-unordered gap for M2 to close (it correctly inserts
+# nothing). GROUP 1b (I_bias_grad_dim0, J_epilogue_colsum_dim0) are the STRIDED-axis analogues
+# Inductor emits for dim-0 / matmul-epilogue reductions: M2 fires on them (adds the operand
+# relayout) and closes most of the gap, bit-identically -- the realistic counterpart to
+# eval_kernels' sum_2d_col. So Suite 2 now exercises both M2 no-op and M2-win paths.
+_DEV = "cuda"
+_ORD = {"inner_tree": tl.ReductionOrdering.INNER_TREE, "unordered": tl.ReductionOrdering.UNORDERED}
+_SUM_LOGSPACE = (-6, 6)  # wide dynamic range: the reduction ORDER decides the result bits.
+
+
+def _adv_nd(numel, seed):
+    """Flat wide-dynamic-range, alternating-sign f32 buffer (reduction ORDER affects the bits)."""
+    g = torch.Generator(device="cpu").manual_seed(seed)
+    base = torch.randn(numel, generator=g, dtype=torch.float32)
+    scale = torch.logspace(_SUM_LOGSPACE[0], _SUM_LOGSPACE[1], numel, dtype=torch.float32)
+    signs = torch.where(torch.arange(numel) % 2 == 0, torch.tensor(1.0), torch.tensor(-1.0))
+    return (base * scale * signs).to(_DEV, torch.float32)
+
+
+def _near_one_nd(numel, seed):
+    """Values near 1.0 (product folds overflow/underflow on wide-range data, so keep them tame)."""
+    g = torch.Generator(device="cpu").manual_seed(seed)
+    return (1.0 + 0.01 * torch.randn(numel, generator=g, dtype=torch.float32)).to(_DEV, torch.float32)
+
+
+def _spread_nd(numel, seed, scale=3.0):
+    """Moderate-spread f32 (for exp-based folds like logsumexp, where wide range would overflow)."""
+    g = torch.Generator(device="cpu").manual_seed(seed)
+    return (scale * torch.randn(numel, generator=g, dtype=torch.float32)).to(_DEV, torch.float32)
+
+
+def _to_bytes(t):
+    """Exact output bits as a bytes object (the equality unit)."""
+    return t.detach().cpu().contiguous().view(torch.uint8).numpy().tobytes()
+
+
+def _bench_ms(thunk):
+    """Min-of-medians over 3 do_bench runs, to suppress noise."""
+    from triton.testing import do_bench
+    return min(do_bench(thunk, warmup=50, rep=200) for _ in range(3))
+
+
+# Per-kernel arg builders: return (jit_fn, args, outs, scalars, constexprs, grid_rows). XBLOCK is
+# set >1 (a real kept dim) where the x-extent allows, so M2 has room to relayout.
+def _spec_A(nw, seed=0):
+    X = 1024
+    ins = [_adv_nd(X * 256, 1 + seed), _adv_nd(256, 2 + seed)]  # in_ptr0 (x), in_ptr1 (weight)
+    outs = [torch.empty(X, device=_DEV), torch.empty(X * 256, device=_DEV)]  # in_out_ptr0, out_ptr0
+    return A_rms_norm_fwd, [outs[0], ins[0], ins[1], outs[1]], outs, [X, 256], dict(XBLOCK=8), X // 8
+
+
+def _spec_C(nw, seed=0):
+    X = 1024
+    ins = [_adv_nd(X * 256, i + seed) for i in range(1, 3)] + [
+        _adv_nd(X, 3 + seed), _adv_nd(X, 4 + seed), _adv_nd(256, 5 + seed), _adv_nd(256, 6 + seed)]
+    # order: in_ptr0[X*256], in_ptr1[X], in_ptr2[X], in_ptr3[256], in_ptr4[256], in_ptr5[X*256]
+    in_ptr0, in_ptr5, in_ptr1, in_ptr2, in_ptr3, in_ptr4 = ins
+    outs = [torch.empty(X * 256, device=_DEV) for _ in range(3)]
+    args = [in_ptr0, in_ptr1, in_ptr2, in_ptr3, in_ptr4, in_ptr5, outs[0], outs[1], outs[2]]
+    return C_rms_norm_bwd_2reduce, args, outs, [X, 256], dict(XBLOCK=8), X // 8
+
+
+def _spec_D(nw, seed=0):
+    ins = [_adv_nd(1024, 1 + seed)]
+    outs = [torch.empty(1, device=_DEV)]
+    return D_masked_global_sum, [ins[0], outs[0]], outs, [1, 608], dict(XBLOCK=1), 1
+
+
+def _spec_E(nw, seed=0):
+    X = 592
+    ins = [_adv_nd(X * 235, 1 + seed)]
+    outs = [torch.empty(X, device=_DEV)]
+    return E_triu_masked_rowsum, [ins[0], outs[0]], outs, [X, 235], dict(XBLOCK=8), (X + 7) // 8
+
+
+def _spec_G(nw, seed=0):
+    X = 5760
+    ins = [_adv_nd(737280, 1 + seed)]
+    outs = [torch.empty(X, device=_DEV)]
+    return G_plain_sum_looped, [ins[0], outs[0]], outs, [X, 128], dict(XBLOCK=8, R0_BLOCK=128), (X + 7) // 8
+
+
+def _spec_H(nw, seed=0):
+    X = 1024
+    ins = [_adv_nd(X * 256, 1 + seed)]
+    outs = [torch.empty(X, device=_DEV)]
+    return H_mean_permute, [ins[0], outs[0]], outs, [X, 256], dict(XBLOCK=8), X // 8
+
+
+# GROUP 1b — strided-axis reductions (M2 firing). Kept axis (xnumel) is contiguous, reduce axis
+# (r0_numel) is strided by xnumel; XBLOCK is the kept tile so the axis is split across warps.
+def _spec_I(nw, seed=0):
+    # dbias = grad.sum(dim=0): grad [r0=512, x=256] -> dbias[256]. Kept tiled 32-wide (like sum_2d_col).
+    N, M = 256, 512
+    ins = [_adv_nd(N * M, 1 + seed)]
+    outs = [torch.empty(N, device=_DEV)]
+    return RED_colsum_dim0, [ins[0], outs[0]], outs, [N, M], dict(XBLOCK=32, R0_BLOCK=512), (N + 31) // 32
+
+
+def _spec_J(nw, seed=0):
+    # matmul-epilogue / per-channel column sum: [r0=512, x=64] -> [64] (narrow kept, single tile).
+    N, M = 64, 512
+    ins = [_adv_nd(N * M, 1 + seed)]
+    outs = [torch.empty(N, device=_DEV)]
+    return RED_colsum_dim0, [ins[0], outs[0]], outs, [N, M], dict(XBLOCK=64, R0_BLOCK=512), 1
+
+
+SPECS = {"A_rms_norm_fwd": _spec_A, "C_rms_norm_bwd_2reduce": _spec_C, "D_masked_global_sum": _spec_D,
+         "E_triu_masked_rowsum": _spec_E, "G_plain_sum_looped": _spec_G, "H_mean_permute": _spec_H,
+         "I_bias_grad_dim0": _spec_I, "J_epilogue_colsum_dim0": _spec_J}
+
+
+def _clear():
+    """Clear every JITFunction cache so a TRITON_M2_ENABLE toggle actually recompiles."""
+    for o in list(globals().values()):
+        if isinstance(o, JITFunction):
+            for a in ("device_caches", "cache"):
+                c = getattr(o, a, None)
+                if hasattr(c, "clear"):
+                    try:
+                        c.clear()
+                    except Exception:  # noqa: BLE001
+                        pass
+
+
+def _compile(spec_fn, ordering, m2, nw, seed=0):
+    os.environ.setdefault("TRITON_ALWAYS_COMPILE", "1")
+    os.environ["TRITON_M2_ENABLE"] = "1" if m2 else "0"
+    _clear()
+    fn, args, outs, scalars, cst, grid = spec_fn(nw, seed)
+    # Runtime args = pointers (args) + the non-constexpr scalars (xnumel, r0_numel); both warmup
+    # and launch must pass them identically.
+    runtime = [*args, *scalars]
+    ck = fn.warmup(*runtime, grid=(grid, ), num_warps=nw, ORD=_ORD[ordering], **cst)
+    return runtime, outs, grid, ck
+
+
+def _run(spec_fn, ordering, m2, nw, seed=0):
+    runtime, outs, grid, ck = _compile(spec_fn, ordering, m2, nw, seed)
+    ck[(grid, 1, 1)](*runtime)
+    torch.cuda.synchronize()
+    return b"".join(_to_bytes(o) for o in outs)
+
+
+def _bench(spec_fn, ordering, m2, nw):
+    runtime, outs, grid, ck = _compile(spec_fn, ordering, m2, nw)
+
+    def thunk():
+        ck[(grid, 1, 1)](*runtime)
+
+    thunk()
+    torch.cuda.synchronize()
+    return _bench_ms(thunk)
+
+
+# #########################################################################################
+# ## CHECKER + FUZZER SOUNDNESS SWEEP                                                      ##
+# #########################################################################################
+# A second entry point (next to the M2 perf harness) that measures the FORWARD PTX checker
+# against the empirical fuzzer over a FAIR equivalence axis per kernel (same input data + math,
+# different reduction ORDER / loop chunking / num_warps). For each kernel it reports the checker
+# vs empirical partition + the over-merge count (checker classes that straddle an empirical
+# boundary -- a soundness violation, must be 0) and classifies it:
+#   a-discriminating-sound        empirical_sets>1, over_merges==0  (checker over-splits only = good)
+#   b-DISCRIMINATING-OVER-MERGE   over_merges>0                     (a REAL soundness violation)
+#   c-bit-stable                  empirical_sets==1                 (can't test soundness)
+#   d-nondeterministic            same config+seed differs on rerun (out of contract; OM not counted)
+# Reuses the FORWARD checker (bitequiv.ptx.forward.interp:forward_module_descriptor) + the
+# standalone fuzzer (bitequiv.evaluation.equivalence_fuzzer). Both are imported lazily inside
+# ``_sweep`` so the corpus still imports in a checkerless / torch-less environment.
+_R0_16384 = (512, 1024, 2048, 4096, 8192, 16384)  # r0_numel=16384 loop-chunk sweep
+_R0_8192 = (256, 512, 1024, 2048, 4096, 8192)     # r0_numel=8192; spans the 256/512 unroll/fence boundary
+
+
+def _checker_key(checker, ck):
+    """Static-checker key: the forward descriptor of the kernel's PTX (a tuple for a multi-launch case)."""
+    cks = ck if isinstance(ck, (tuple, list)) else [ck]
+    return tuple(checker(k.asm["ptx"]) for k in cks)
+
+
+def _eval_case(name, cfgs, compile_fn, run_fn, label_fn, repeats, checker, fz, nondet=False, note=""):
+    """Compile each config -> checker key, fuzz -> empirical key, classify soundness (see the banner)."""
+    ck_key, compiled, fails = {}, [], 0
+    for cfg in cfgs:
+        try:
+            ck = compile_fn(cfg)
+            run_fn(cfg, 0)  # trial launch: a config can compile yet fail / OOM at launch
+            ck_key[cfg] = _checker_key(checker, ck)
+            compiled.append(cfg)
+        except Exception:  # noqa: BLE001 - a broken config is dropped, not fatal to the sweep
+            fails += 1
+    if not compiled:
+        return dict(name=name, ok=0, fails=fails, classification="error-all-configs-failed", note=note)
+    if not nondet:
+        nondet = any(run_fn(c, 0) != run_fn(c, 0) for c in compiled)
+    emp_key = fz.empirical_keys(lambda cfg, seed: run_fn(cfg, seed), compiled, repeats)
+    ck_sets, emp_sets = fz.partition(compiled, ck_key), fz.partition(compiled, emp_key)
+    over_m = None if nondet else fz.over_merges(compiled, ck_key, emp_key)
+    over_s = None if nondet else fz.over_merges(compiled, emp_key, ck_key)
+    if nondet:
+        cls = "d-nondeterministic"
+    elif len(emp_sets) == 1:
+        cls = "c-bit-stable"
+    elif over_m > 0:
+        cls = "b-DISCRIMINATING-OVER-MERGE"
+    else:
+        cls = "a-discriminating-sound"
+    res = dict(name=name, ok=len(compiled), attempted=len(cfgs), fails=fails, repeats=repeats,
+               checker_sets=len(ck_sets), empirical_sets=len(emp_sets), over_merges=over_m,
+               over_splits=over_s, nondet=nondet, classification=cls, note=note)
+    if over_m:
+        pairs = fz.over_merge_pairs(compiled, ck_key, emp_key)
+        res["over_merge_pairs"] = [[label_fn(a), label_fn(b)] for a, b in pairs[:12]]
+    return res
+
+
+def _g1_cases():
+    """GROUP 1 ordered add-reductions. Fair axis: reduction_ordering x num_warps on the SAME
+    order-sensitive data (seed-varying via the threaded ``_spec_*``/``_run`` seed)."""
+    cfgs = [(o, nw) for o in ("unordered", "inner_tree") for nw in (1, 2, 4, 8)]
+    cases = []
+    for specname, spec_fn in SPECS.items():
+        def compile_fn(cfg, spec_fn=spec_fn):
+            return _compile(spec_fn, cfg[0], False, cfg[1], 0)[3]
+
+        def run_fn(cfg, seed, spec_fn=spec_fn):
+            return _run(spec_fn, cfg[0], False, cfg[1], seed)
+
+        cases.append((specname, cfgs, compile_fn, run_fn, lambda cfg: f"ord={cfg[0]} nw={cfg[1]}",
+                      False, "GROUP1 ordered add-reduction (ordering x num_warps, order-sensitive data)"))
+    return cases
+
+
+def _lc_launch(jitfn, xnumel, r0_numel, out_numel, in_dtype, builder, rb, nw, seed,
+               two_ptr=False, out_full=False, xblock=1):
+    """Warmup + launch one loop-carried config; data depends ONLY on seed (fixed across R0_BLOCK)."""
+    grid = (xnumel + xblock - 1) // xblock
+    a = builder(xnumel * r0_numel, seed).to(in_dtype)
+    out = torch.empty(xnumel * r0_numel if out_full else out_numel, device=_DEV, dtype=torch.float32)
+    args = [out, a, xnumel, r0_numel] if two_ptr else [a, out, xnumel, r0_numel]
+    ck = jitfn.warmup(*args, grid=(grid, ), XBLOCK=xblock, R0_BLOCK=rb, num_warps=nw)
+    ck[(grid, 1, 1)](*args)
+    torch.cuda.synchronize()
+    return _to_bytes(out), ck
+
+
+def _lc_case(name, jitfn, xnumel, r0_numel, out_numel, in_dtype, r0_blocks, builder, **kw):
+    """GROUP 9 loop-carried case: R0_BLOCK re-chunks the SAME data (fair over-merge axis) x num_warps."""
+    cfgs = [(rb, nw) for rb in r0_blocks for nw in (1, 2, 4, 8)]
+
+    def compile_fn(cfg):
+        return _lc_launch(jitfn, xnumel, r0_numel, out_numel, in_dtype, builder, cfg[0], cfg[1], 0, **kw)[1]
+
+    def run_fn(cfg, seed):
+        return _lc_launch(jitfn, xnumel, r0_numel, out_numel, in_dtype, builder, cfg[0], cfg[1], seed, **kw)[0]
+
+    return (name, cfgs, compile_fn, run_fn, lambda cfg: f"R0_BLOCK={cfg[0]} nw={cfg[1]}", False,
+            "GROUP9 loop-carried; R0_BLOCK re-chunks the SAME data (fair over-merge axis)")
+
+
+def _splitk_case():
+    """Split-K partial-sum (LC-9): k_split is NOT a fair axis (each split reduces independent per-k
+    data, so different k_split = different math, not a reordering) -- so k is fixed, num_warps only."""
+    K = 32
+
+    def launch(nw, seed):
+        a = _adv_nd(K * 4096, seed).to(torch.float16)
+        out = torch.empty(4096, device=_DEV, dtype=torch.float32)
+        ck = LC_splitk_gemm_f16.warmup(a, out, 4096, K, grid=(512, ), XBLOCK=8, R0_BLOCK=K, num_warps=nw)
+        ck[(512, 1, 1)](a, out, 4096, K)
+        torch.cuda.synchronize()
+        return _to_bytes(out), ck
+
+    cfgs = [(K, nw) for nw in (1, 2, 4, 8)]
+    return ("LC_splitk_gemm_f16", cfgs, lambda cfg: launch(cfg[1], 0)[1],
+            lambda cfg, seed: launch(cfg[1], seed)[0], lambda cfg: f"k={cfg[0]} nw={cfg[1]}", False,
+            "split-K partial-sum; num_warps-only fair axis (k fixed: independent per-k data)")
+
+
+def _combine_case():
+    """Split-sum combine (LC-8 kernel 2): a fixed 128-wide fold with no R0_BLOCK knob, so num_warps only."""
+    def launch(nw, seed):
+        a = _adv_nd(128, seed)
+        out = torch.empty(1, device=_DEV, dtype=torch.float32)
+        ck = LC_splitsum_combine_f32.warmup(a, out, 1, 128, grid=(1, ), XBLOCK=1, num_warps=nw)
+        ck[(1, 1, 1)](a, out, 1, 128)
+        torch.cuda.synchronize()
+        return _to_bytes(out), ck
+
+    cfgs = [(128, nw) for nw in (1, 2, 4, 8)]
+    return ("LC_splitsum_combine_f32", cfgs, lambda cfg: launch(cfg[1], 0)[1],
+            lambda cfg, seed: launch(cfg[1], seed)[0], lambda cfg: f"chunk={cfg[0]} nw={cfg[1]}", False,
+            "split-sum combine; num_warps-only fair axis (fixed 128-wide fold)")
+
+
+def _lc_cases():
+    """GROUP 9 loop-carried discriminators. R0_BLOCK spans small->full (incl. the 256/512 boundary)."""
+    return [
+        _lc_case("LC_sum_loop_f32", LC_sum_loop_f32, 64, 16384, 64, torch.float32, _R0_16384, _adv_nd),
+        _lc_case("LC_sum_loop_f16", LC_sum_loop_f16, 64, 16384, 64, torch.float16, _R0_16384, _adv_nd),
+        _lc_case("LC_sum_loop_bf16", LC_sum_loop_bf16, 64, 16384, 64, torch.bfloat16, _R0_16384, _adv_nd),
+        _lc_case("LC_prod_loop_f32", LC_prod_loop_f32, 64, 8192, 64, torch.float32, _R0_8192, _near_one_nd),
+        _lc_case("LC_logsumexp_loop_f32", LC_logsumexp_loop_f32, 64, 16384, 64, torch.float32, _R0_16384,
+                 _spread_nd, two_ptr=True),
+        _lc_case("LC_var_welford_f32", LC_var_welford_f32, 64, 16384, 64, torch.float32, _R0_16384,
+                 _adv_nd, two_ptr=True),
+        _lc_case("LC_cumsum_scan_f32", LC_cumsum_scan_f32, 64, 16384, 64, torch.float32, _R0_16384,
+                 _adv_nd, out_full=True),
+        _lc_case("LC_splitsum_partial_f32", LC_splitsum_partial_f32, 128, 8192, 128, torch.float32,
+                 _R0_8192, _adv_nd),
+        _splitk_case(),
+        _combine_case(),
+    ]
+
+
+def _sweep(argv):
+    """Checker+fuzzer soundness sweep over GROUP 1 reductions + GROUP 9 loop-carried discriminators.
+
+    Run:  PYTHONPATH=. TRITON_ALWAYS_COMPILE=1 \
+              python -m bitequiv.evaluation.realistic_inductor_kernels sweep [--repeats N] [--only SUBSTR]
+    """
+    import argparse
+
+    # Lazy so the corpus imports without the project's PTX checker (kept torch/inductor-optional above).
+    from bitequiv.evaluation import equivalence_fuzzer as fz
+    from bitequiv.ptx.forward.interp import forward_module_descriptor
+
+    ap = argparse.ArgumentParser(prog="realistic_inductor_kernels sweep")
+    ap.add_argument("--repeats", type=int, default=12, help="fuzzer seeds per config")
+    ap.add_argument("--only", default=None, help="substring filter on kernel name")
+    args = ap.parse_args(argv)
+
+    cases = _g1_cases() + _lc_cases()
+    if args.only:
+        cases = [c for c in cases if args.only in c[0]]
+    print(f"device: {torch.cuda.get_device_name()}  checker: forward_module_descriptor  "
+          f"cases: {len(cases)}  repeats: {args.repeats}")
+    print(f"{'kernel':28s} {'ok':>3s} {'chk':>4s} {'emp':>4s} {'over_m':>7s} {'over_s':>7s} class")
+    for name, cfgs, compile_fn, run_fn, label_fn, nondet, note in cases:
+        try:
+            res = _eval_case(name, cfgs, compile_fn, run_fn, label_fn, args.repeats,
+                             forward_module_descriptor, fz, nondet=nondet, note=note)
+        except Exception as e:  # noqa: BLE001 - one bad kernel must not abort the sweep
+            print(f"{name:28s}  ERROR {type(e).__name__}: {str(e).splitlines()[0][:60]}")
+            continue
+        print(f"{name:28s} {res.get('ok', 0):>3} {str(res.get('checker_sets')):>4} "
+              f"{str(res.get('empirical_sets')):>4} {str(res.get('over_merges')):>7} "
+              f"{str(res.get('over_splits')):>7} {res.get('classification')}")
+        if res.get("over_merges"):
+            print(f"    !!! OVER-MERGE sample: {res['over_merge_pairs'][:3]}")
+
+
+def main(argv):
+    kernels = argv[0].split(",") if argv else list(SPECS)
+    warps = [int(x) for x in argv[1].split(",")] if len(argv) > 1 else [2, 4, 8]
+    print(f"device: {torch.cuda.get_device_name()}")
+    print(f"{'kernel':24s} {'nw':>3s} {'support':>8s} {'correct':>8s} "
+          f"{'base(ms)':>9s} {'m2(ms)':>9s} {'ceil(ms)':>9s} {'m2/base':>8s} {'gapclos':>8s}")
+    for name in kernels:
+        spec_fn = SPECS[name]
+        for nw in warps:
+            try:
+                b_bytes = _run(spec_fn, "inner_tree", False, nw)
+                m_bytes = _run(spec_fn, "inner_tree", True, nw)
+                correct = (b_bytes == m_bytes)
+                tb = _bench(spec_fn, "inner_tree", False, nw)
+                tm = _bench(spec_fn, "inner_tree", True, nw)
+                tc = _bench(spec_fn, "unordered", False, nw)
+                denom = tb - tc
+                gap = (tb - tm) / denom if abs(denom) > 1e-9 else float("nan")
+                print(f"{name:24s} {nw:>3d} {'yes':>8s} {str(correct):>8s} "
+                      f"{tb:9.4f} {tm:9.4f} {tc:9.4f} {tb / tm:>7.3f}x {gap:>8.2f}")
+            except Exception as e:  # noqa: BLE001
+                print(f"{name:24s} {nw:>3d} {'FAIL':>8s}  {type(e).__name__}: {str(e).splitlines()[0][:44]}")
+
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "sweep":
+        _sweep(sys.argv[2:])
+    else:
+        main(sys.argv[1:])

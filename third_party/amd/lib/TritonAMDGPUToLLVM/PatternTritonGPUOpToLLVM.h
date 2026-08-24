@@ -6,16 +6,23 @@
 #include "triton/Analysis/Allocation.h"
 #include "triton/Analysis/AxisInfo.h"
 
+#include <memory>
+
+namespace mlir::triton {
+class DistributedCoordinateGroups;
+}
+
 namespace mlir::triton::AMD {
 void populateConvertLayoutOpToLLVMPatterns(LLVMTypeConverter &typeConverter,
                                            const TargetInfo &targetInfo,
                                            RewritePatternSet &patterns,
                                            PatternBenefit benefit);
 
-void populateMemoryOpToLLVMPatterns(LLVMTypeConverter &typeConverter,
-                                    RewritePatternSet &patterns,
-                                    const TargetInfo &targetInfo,
-                                    PatternBenefit benefit);
+void populateMemoryOpToLLVMPatterns(
+    LLVMTypeConverter &typeConverter, RewritePatternSet &patterns,
+    const TargetInfo &targetInfo, PatternBenefit benefit,
+    std::shared_ptr<mlir::triton::DistributedCoordinateGroups>
+        coordinateGroups);
 
 void populateDotOpToLLVMPatterns(LLVMTypeConverter &typeConverter,
                                  RewritePatternSet &patterns,
@@ -25,6 +32,13 @@ void populateElementwiseOpToLLVMPatterns(
     LLVMTypeConverter &typeConverter, RewritePatternSet &patterns, bool ftz,
     ModuleAxisInfoAnalysis &axisInfoAnalysis, ModuleAllocation &allocation,
     const TargetInfo &targetInfo, PatternBenefit benefit);
+
+void populateFpCastOpToLLVMPatterns(LLVMTypeConverter &typeConverter,
+                                    RewritePatternSet &patterns, bool ftz,
+                                    ModuleAxisInfoAnalysis &axisInfoAnalysis,
+                                    ModuleAllocation &allocation,
+                                    const TargetInfo &targetInfo,
+                                    PatternBenefit benefit);
 
 // Manipulates with execution mode register which is per-wavefront one.
 // The register controls execution of instructions - e.g., rounding modes,

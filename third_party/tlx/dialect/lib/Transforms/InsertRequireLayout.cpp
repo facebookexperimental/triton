@@ -1,5 +1,9 @@
 #include "IR/Dialect.h"
 #include "amd/include/Dialect/TritonAMDGPU/IR/Dialect.h"
+#include "amd/include/Dialect/TritonAMDGPU/IR/TargetFeatures.h"
+#include "amd/lib/TritonAMDGPUToLLVM/AsyncUtility.h"
+#include "amd/lib/TritonAMDGPUToLLVM/TargetInfo.h"
+#include "amd/lib/TritonAMDGPUToLLVM/Utility.h"
 #include "amd/lib/TritonAMDGPUTransforms/Utility.h"
 #include "mlir/Analysis/DataFlow/ConstantPropagationAnalysis.h"
 #include "mlir/Analysis/DataFlow/DeadCodeAnalysis.h"
@@ -16,6 +20,7 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/Debug.h"
 
+#undef DEBUG_TYPE
 #define DEBUG_TYPE "tlx-amd-insert-require-layout"
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
 #define LDBG(X) LLVM_DEBUG(DBGS() << X << "\n")
@@ -281,15 +286,13 @@ static Attribute computeSharedEncFromDotEnc(ttg::DotOperandEncodingAttr dotEnc,
   if (useAsyncCopy) {
     auto loadMemDesc = localLoadOp->getOperand(0);
     if (auto type = dyn_cast<ttg::MemDescType>(loadMemDesc.getType())) {
-      triton::AMD::TargetInfo targetInfo(
-          getAMDArch(localLoadOp->getParentOfType<ModuleOp>())
-              .value_or("")
-              .str());
-      using triton::AMD::ISAFamily;
+      auto targetFeatures = amdgpu::TargetFeatures::fromModuleOp(
+          localLoadOp->getParentOfType<ModuleOp>());
+      using amdgpu::ISAFamily;
       if (llvm::is_contained({ISAFamily::CDNA4, ISAFamily::GFX1250},
-                             targetInfo.getISAFamily())) {
+                             targetFeatures.getISAFamily())) {
         if (auto padded = composePaddedLayout(
-                targetInfo, dotEnc.getOpIdx(), dotEnc.getKWidth(),
+                targetFeatures, dotEnc.getOpIdx(), dotEnc.getKWidth(),
                 cast<ttg::TensorOrMemDesc>(type), paddedOrder, dotEnc,
                 /*useAsyncCopy=*/true)) {
           // `composePaddedLayout` returns the bank-conflict-avoiding padded
@@ -356,7 +359,7 @@ static Attribute computeSharedEncFromDotEnc(ttg::DotOperandEncodingAttr dotEnc,
                 allocShape, type.getElementType(), type.getEncoding(),
                 type.getMemorySpace(), type.getMutableMemory(), allocShape);
             auto paddedFull = composePaddedLayout(
-                targetInfo, dotEnc.getOpIdx(), dotEnc.getKWidth(),
+                targetFeatures, dotEnc.getOpIdx(), dotEnc.getKWidth(),
                 cast<ttg::TensorOrMemDesc>(fullType), paddedOrder, dotEnc,
                 /*useAsyncCopy=*/true);
             // The sliced view was paddable, so the (larger) allocation shape
@@ -411,8 +414,9 @@ static Value findMemDescRoot(Value memdesc) {
     // anchors and dot-consumer discovery meet on the full buffer even when
     // WMMA consumes a sliced or transposed view.
     if (isa<ttg::MemDescIndexOp, ttg::MemDescReinterpretOp,
-            ttg::MemDescSubsliceOp, ttg::MemDescTransOp, ttg::MemDescReshapeOp,
-            tlx::RequireLayoutOp>(def)) {
+            ttg::MemDescSubsliceOp, ttg::MemDescDynamicSubsliceOp,
+            ttg::MemDescTransOp, ttg::MemDescReshapeOp, tlx::RequireLayoutOp>(
+            def)) {
       root = def->getOperand(0);
       continue;
     }
@@ -434,8 +438,9 @@ static bool isFedByAnyMemDescUser(Value memdesc) {
       // local_load(transpose(subslice)), and already-constrained aliases are
       // recognized as users of the same allocation.
       if (isa<ttg::MemDescIndexOp, ttg::MemDescReinterpretOp,
-              ttg::MemDescSubsliceOp, ttg::MemDescTransOp,
-              ttg::MemDescReshapeOp, tlx::RequireLayoutOp>(u))
+              ttg::MemDescSubsliceOp, ttg::MemDescDynamicSubsliceOp,
+              ttg::MemDescTransOp, ttg::MemDescReshapeOp, tlx::RequireLayoutOp>(
+              u))
         worklist.insert(u->getResult(0));
     }
   }
@@ -451,12 +456,22 @@ static bool isFedByAnyMemDescUser(Value memdesc) {
 // padded-shared encoding, which the dot-path anchor would clobber.
 static bool isFedByTDM(Value memdesc) {
   return isFedByAnyMemDescUser<amdgpu::AsyncTDMCopyGlobalToLocalOp,
+                               amdgpu::AsyncTDMFusedCopyGlobalToLocalOp,
                                amdgpu::AsyncTDMCopyLocalToGlobalOp>(memdesc);
 }
 
 static bool isFedByAsyncLdsProducer(Value memdesc) {
   return isFedByAnyMemDescUser<ttg::AsyncCopyGlobalToLocalOp,
                                amdgpu::BufferLoadToLocalOp>(memdesc);
+}
+
+// True if the alloc feeding this memdesc carries a user-pinned encoding
+// (#tlx.user_layout / any PinnedEncodingTrait) -- an explicit author choice.
+static bool isUserPinnedMemDesc(Value memdesc) {
+  Value root = findMemDescRoot(memdesc);
+  if (auto ty = dyn_cast<ttg::MemDescType>(root.getType()))
+    return isa_and_nonnull<ttg::PinnedEncodingTrait>(ty.getEncoding());
+  return false;
 }
 
 // True if the alloc feeding this memdesc is written by a `buffer_load_to_local`
@@ -478,12 +493,83 @@ static amdgpu::BufferLoadToLocalOp findBufferProducer(Value memdesc) {
       if (auto buf = dyn_cast<amdgpu::BufferLoadToLocalOp>(u))
         return buf;
       if (isa<ttg::MemDescIndexOp, ttg::MemDescReinterpretOp,
-              ttg::MemDescSubsliceOp, ttg::MemDescTransOp,
-              ttg::MemDescReshapeOp, tlx::RequireLayoutOp>(u))
+              ttg::MemDescSubsliceOp, ttg::MemDescDynamicSubsliceOp,
+              ttg::MemDescTransOp, ttg::MemDescReshapeOp, tlx::RequireLayoutOp>(
+              u))
         worklist.insert(u->getResult(0));
     }
   }
   return nullptr;
+}
+
+// For a buffer_load_to_local into a user-pinned padded_shared dst, derive and
+// pin the offset tensor's #linear so the direct-to-LDS write is coalesced (via
+// deduceRegLayoutFromPaddedShared), sparing the author from hand-writing it.
+// Idempotent; only fires for user-pinned padded dsts.
+static void pinInferredBufferOffsetLayout(amdgpu::BufferLoadToLocalOp buf,
+                                          triton::ModuleAxisInfoAnalysis &axis,
+                                          OpBuilder &builder) {
+  if (buf.getOffsets().getDefiningOp<tlx::RequireLayoutOp>())
+    return;
+
+  auto destTy = dyn_cast<ttg::MemDescType>(buf.getDest().getType());
+  if (!destTy)
+    return;
+  auto pinned = dyn_cast<ttg::PinnedEncodingTrait>(destTy.getEncoding());
+  if (!pinned)
+    return;
+  auto paddedEnc =
+      dyn_cast_or_null<ttg::PaddedSharedEncodingAttr>(pinned.getPinnedLayout());
+  if (!paddedEnc)
+    return;
+
+  auto offsetsTy = cast<RankedTensorType>(buf.getOffsets().getType());
+  if (!offsetsTy.getEncoding())
+    return;
+  auto *ctx = buf.getContext();
+  auto mod = buf->getParentOfType<ModuleOp>();
+
+  triton::AMD::TargetInfo targetInfo(getAMDArch(mod).value_or("").str());
+  auto targetFeatures = amdgpu::TargetFeatures::fromModuleOp(mod);
+  using amdgpu::ISAFamily;
+  if (!llvm::is_contained({ISAFamily::CDNA3, ISAFamily::CDNA4},
+                          targetFeatures.getISAFamily()))
+    return;
+
+  // loadContig = the per-thread direct-to-LDS width the global reads support,
+  // clamped to a hardware-legal vector size (same signal the async coalescer /
+  // stock AMD buffer path use).
+  unsigned elemBitWidth = destTy.getElementTypeBitWidth();
+  unsigned loadContig =
+      mlir::LLVM::AMD::getContiguity(buf.getPtr(), buf.getOffsets(), axis);
+  loadContig = triton::AMD::fitToValidDirectToLdsVecSize(
+      loadContig, elemBitWidth, targetInfo);
+  if (loadContig == 0)
+    return;
+
+  unsigned threadsPerWarp = ttg::TritonGPUDialect::getThreadsPerWarp(mod);
+  unsigned numWarps = ttg::lookupNumWarps(buf);
+
+  auto regLayout = triton::AMD::deduceRegLayoutFromPaddedShared(
+      paddedEnc.getLinearComponent(), loadContig, threadsPerWarp, numWarps,
+      offsetsTy.getShape(), ttg::getCGALayout(offsetsTy.getEncoding()), ctx);
+  if (failed(regLayout)) {
+    buf->emitRemark() << "could not infer a coalesced direct-to-LDS offset "
+                         "layout from the pinned padded shared layout; check "
+                         "that the pinned shared layout is directly loadable";
+    return;
+  }
+
+  // Pin it (wrap as #tlx.user_layout) so the downstream layout passes anchor it
+  // and never rewrite it.
+  auto linearEnc = ttg::LinearEncodingAttr::get(ctx, std::move(*regLayout));
+  auto newOffsetsTy =
+      RankedTensorType::get(offsetsTy.getShape(), offsetsTy.getElementType(),
+                            tlx::wrapUserLayout(linearEnc));
+  builder.setInsertionPoint(buf);
+  auto requireOp = tlx::RequireLayoutOp::create(builder, buf.getLoc(),
+                                                newOffsetsTy, buf.getOffsets());
+  buf.getOffsetsMutable().assign(requireOp.getResult());
 }
 
 // The identity padded-layout ORDER for a buffer_load_to_local-fed dot operand,
@@ -519,8 +605,9 @@ computeBufferViewOrder(Value memdesc, triton::ModuleAxisInfoAnalysis &axis) {
     if (isa<ttg::MemDescTransOp>(def))
       swapped = !swapped;
     if (isa<ttg::MemDescIndexOp, ttg::MemDescReinterpretOp,
-            ttg::MemDescSubsliceOp, ttg::MemDescTransOp, ttg::MemDescReshapeOp,
-            tlx::RequireLayoutOp>(def)) {
+            ttg::MemDescSubsliceOp, ttg::MemDescDynamicSubsliceOp,
+            ttg::MemDescTransOp, ttg::MemDescReshapeOp, tlx::RequireLayoutOp>(
+            def)) {
       v = def->getOperand(0);
       continue;
     }
@@ -732,8 +819,9 @@ public:
     // source memdesc, which lets the alloc converge to the meet of
     // every sibling subview's dot-consumer state.
     if (isa<ttg::MemDescIndexOp, ttg::MemDescReinterpretOp,
-            ttg::MemDescSubsliceOp, ttg::MemDescTransOp, ttg::MemDescReshapeOp,
-            tlx::RequireLayoutOp>(op)) {
+            ttg::MemDescSubsliceOp, ttg::MemDescDynamicSubsliceOp,
+            ttg::MemDescTransOp, ttg::MemDescReshapeOp, tlx::RequireLayoutOp>(
+            op)) {
       for (const auto resultLattice : results) {
         for (auto [i, operandLattice] : llvm::enumerate(operands)) {
           if (!isa<ttg::MemDescType>(op->getOpOperand(i).get().getType()))
@@ -809,9 +897,9 @@ static Attribute chooseTDMBufEncoding(Operation *tdmOp, Value buf,
   Attribute encoding;
   if (allowDotAware) {
     if (auto info = findDotConsumer(buf, solver)) {
-      triton::AMD::TargetInfo targetInfo(
-          getAMDArch(tdmOp->getParentOfType<ModuleOp>()).value_or("").str());
-      encoding = composePaddedLayout(targetInfo, info->dotEnc.getOpIdx(),
+      auto targetFeatures = amdgpu::TargetFeatures::fromModuleOp(
+          tdmOp->getParentOfType<ModuleOp>());
+      encoding = composePaddedLayout(targetFeatures, info->dotEnc.getOpIdx(),
                                      info->dotEnc.getKWidth(),
                                      cast<ttg::TensorOrMemDesc>(bufType), order,
                                      info->dotEnc, /*useAsyncCopy=*/false);
@@ -869,7 +957,30 @@ static void materializeTDMConstraints(ModuleOp m, OpBuilder &builder,
     if (auto load = dyn_cast<amdgpu::AsyncTDMCopyGlobalToLocalOp>(op))
       anchorTDMRequireLayout(load, load.getResult(), load.getResultMutable(),
                              /*allowDotAware=*/true, builder, solver);
-    else if (auto store = dyn_cast<amdgpu::AsyncTDMCopyLocalToGlobalOp>(op))
+    else if (auto fused =
+                 dyn_cast<amdgpu::AsyncTDMFusedCopyGlobalToLocalOp>(op)) {
+      for (size_t i = 0; i < fused.getDescs().size(); ++i) {
+        Value dest = fused.getDests()[i];
+        if (dest.getDefiningOp<tlx::RequireLayoutOp>())
+          continue;
+        auto destType = dyn_cast<ttg::MemDescType>(dest.getType());
+        if (!destType)
+          continue;
+        auto descType = cast<tt::TensorDescType>(fused.getDescs()[i].getType());
+        Attribute encoding = chooseTDMBufEncoding(
+            fused, dest, destType, descType, /*allowDotAware=*/true, solver);
+        if (!encoding)
+          continue;
+        builder.setInsertionPoint(fused);
+        auto requiredType = ttg::MemDescType::get(
+            destType.getShape(), destType.getElementType(), encoding,
+            destType.getMemorySpace(), destType.getMutableMemory(),
+            destType.getAllocShape());
+        auto required = tlx::RequireLayoutOp::create(builder, fused.getLoc(),
+                                                     requiredType, dest);
+        fused.getDestsMutable()[i].assign(required.getResult());
+      }
+    } else if (auto store = dyn_cast<amdgpu::AsyncTDMCopyLocalToGlobalOp>(op))
       anchorTDMRequireLayout(store, store.getSrc(), store.getSrcMutable(),
                              /*allowDotAware=*/false, builder, solver);
   });
@@ -913,6 +1024,12 @@ LogicalResult insertRequireLayout(ModuleOp m) {
   // 3. Leave tensor/register propagation, region-branch retagging, and final
   //    convert cleanup to tlx-propagate-layout and downstream cleanup passes.
   m.walk([&](ttg::LocalLoadOp localLoadOp) {
+    // A user-pinned shared alloc is a hard constraint (see
+    // isUserPinnedMemDesc): don't synthesize a memdesc-side require_layout that
+    // would override it.
+    if (isUserPinnedMemDesc(localLoadOp->getOperand(0)))
+      return;
+
     auto *lattice =
         solver.lookupState<DotRewriteLattice>(localLoadOp.getResult());
     if (!lattice)
@@ -954,6 +1071,13 @@ LogicalResult insertRequireLayout(ModuleOp m) {
     auto sharedEnc = computeSharedEncFromDotEnc(
         dotEnc, localLoadOp, useAsyncCopy, isBufferLoadToLocal, bufferOrder);
     applyRequireLayout(sharedEnc, localLoadOp, builder);
+  });
+
+  // Infer & pin the direct-to-LDS offset layout for buffer_load_to_local ops
+  // whose destination alloc is a user-pinned padded_shared layout, so authors
+  // pin only the shared layout and the matching offset layout is derived.
+  m.walk([&](amdgpu::BufferLoadToLocalOp buf) {
+    pinInferredBufferOffsetLayout(buf, axisInfo, builder);
   });
 
   materializeDotUserTensorConstraints(m, builder);

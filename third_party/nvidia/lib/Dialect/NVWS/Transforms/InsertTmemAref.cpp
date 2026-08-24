@@ -1,4 +1,5 @@
 #include "Utilities.h"
+#include "lib/Dialect/TritonGPU/Transforms/WarpSpecialization/PartitionAttrs.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/UB/IR/UBOps.h"
@@ -106,7 +107,7 @@ struct TmemAccessDag {
     auto elseDag =
         std::make_unique<Node>(nullptr, nullptr, std::nullopt, nullptr);
     auto thenTok = addOp(*useThen, thenDag.get());
-    auto elseTok = addOp(*useElse, elseDag.get());
+    addOp(*useElse, elseDag.get());
 
     auto tokPos =
         *findValuePosInRange(ifOp.thenYield()->getOperands(), thenTok);
@@ -575,21 +576,6 @@ insertTmemArefImpl(TmemAccessDag::Node *node,
   return node;
 }
 
-bool canDoubleBufferAcc(MMAv5OpInterface mmaOp, int numTmemBlocks) {
-  auto tmemDesc = mmaOp.getAccumulator().getType();
-  auto blockM = tmemDesc.getShape()[0];
-  auto blockN = tmemDesc.getShape()[1];
-  constexpr int numTMEMColumns = 512;
-  constexpr int numTMEMRows = 128;
-  if (numTmemBlocks + (blockM * blockN * 2) > numTMEMRows * numTMEMColumns) {
-    return false;
-  }
-  if (isa<TCGen5MMAScaledOp>(mmaOp) && blockN == 256) {
-    return false;
-  }
-  return true;
-};
-
 bool hasProducerConsumerPartitioning(TmemAccessDag &accessDag) {
   // TMEM partitioning follows a producer-consumer pattern if it has this
   // structure:
@@ -662,7 +648,6 @@ int insertTmemAref(TmemAccessDag &accessDag, int numTmemBlocks) {
   auto allocOp = cast<TMEMAllocOp>(rootNode->op);
 
   auto isMultiStaged = hasProducerConsumerPartitioning(accessDag);
-  int numTmemBlock = 0;
   if (isMultiStaged) {
     for (auto user : allocOp.getResult().getUsers()) {
       if (auto mmaOp = dyn_cast<MMAv5OpInterface>(user)) {
@@ -676,8 +661,7 @@ int insertTmemAref(TmemAccessDag &accessDag, int numTmemBlocks) {
               // multibuffering.
               isAccMultibufferingPossible(mmaOp, loop) &&
               // The user didn't disable it with a flag.
-              !getDisallowAccMultiBuffer(wsLoop) &&
-              canDoubleBufferAcc(mmaOp, numTmemBlocks);
+              !getDisallowAccMultiBuffer(wsLoop);
           isMultiStaged = isMultiStaged && accIsMultiBuffered;
         }
       }
@@ -824,6 +808,7 @@ void workaroundForLoopScheduler(triton::FuncOp funcOp) {
 
   for (auto ifOp : ifs) {
     ImplicitLocOpBuilder b(ifOp.getLoc(), ifOp);
+    auto originalOutputs = getPartitionOutputs(ifOp);
 
     // move putExitOp
     b.setInsertionPoint(ifOp);
@@ -864,20 +849,22 @@ void workaroundForLoopScheduler(triton::FuncOp funcOp) {
     assignStage(b, enterIf, getStageCluster(putEnterOp));
     assignStage(b, exitIf, getStageCluster(putExitOp));
 
-    SetVector<int> enterExitIds, middleIds;
-    enterExitIds.insert(1);
-    middleIds.insert(0);
+    auto enterExitIds = originalOutputs[pos];
+    auto middleIds = getPartitionIds(ifOp);
+    for (auto id : enterExitIds)
+      middleIds.remove(id);
+    if (middleIds.empty())
+      middleIds = getPartitionIds(ifOp);
+
     setPartition(enterIf, enterExitIds);
     setPartition(exitIf, enterExitIds);
     setPartition(ifOp, middleIds);
 
-    SetVector<int> p0array, p1array;
-    p0array.insert(0);
-    p1array.insert(1);
     setPartitionOutputs(exitIf, {});
-    setPartitionOutputs(enterIf, {p1array});
-    SmallVector<SetVector<int>> outputs(ifOp->getNumResults(), p0array);
-    setPartitionOutputs(ifOp, outputs);
+    setPartitionOutputs(enterIf, {enterExitIds});
+    auto middleOutputs = originalOutputs;
+    middleOutputs[pos] = middleIds;
+    setPartitionOutputs(ifOp, middleOutputs);
   }
 }
 

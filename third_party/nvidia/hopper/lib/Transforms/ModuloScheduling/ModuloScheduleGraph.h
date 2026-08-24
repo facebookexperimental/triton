@@ -26,6 +26,7 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
 #include <cassert>
+#include <string>
 
 namespace mlir::triton::gpu {
 
@@ -43,6 +44,14 @@ struct ScheduleBuffer {
   llvm::SmallVector<int64_t, 4> shape; // e.g., {128, 64}
   unsigned elementBitWidth{16};        // e.g., 16 for f16
   unsigned count{1};                   // number of buffers (from stageDiff + 1)
+  // Depth the schedule's lifetime analysis asked for, snapshotted before any
+  // SMEM-budget reduction ever decrements `count`. count < requestedCount
+  // means this ring runs shallower than the schedule wants — the A.5 auto
+  // search uses the gap (in bytes) as its SMEM-pressure tie-breaker.
+  unsigned requestedCount{1};
+  // Explicit A.5/A.7 floor, separate from lifetime demand and co-consumer
+  // equalization. A budget reduction may still lower count below this value.
+  unsigned explicitMinCount{1};
 
   // For data buffers: index of the corresponding BARRIER buffer (UINT_MAX if
   // none) For barrier buffers: index of the data buffer this barrier guards
@@ -150,6 +159,14 @@ struct ScheduleNode {
   unsigned partitionCount{1};
   unsigned partitionDim{0}; // 0 = M, 1 = N
   unsigned mSize{0};        // per-partition size along partitionDim
+  // Pass A.7 epilogue subtiling. When subtileCount > 1, this op belongs to the
+  // epilogue chain (tmem_load → ... → descriptor_store) that the sched2tlx
+  // emitter renders as a `for sub_n in range(S)` loop, each iteration storing a
+  // (BM, nSize) sub-tile along N. Defaults mean "not subtiled" (full BN tile).
+  int subtileIndex{-1};
+  int subtileCount{1};
+  int nOffset{0};
+  int nSize{0}; // 0 = full BN
 
   bool isSuperNode() const { return childPipelineId != UINT_MAX; }
   bool hasBuffer() const {
@@ -165,7 +182,90 @@ struct ScheduleEdge {
   unsigned srcId{};
   unsigned dstId{};
   int latency{};
-  unsigned distance{}; // 0 = intra-iteration, 1+ = loop-carried
+  // 0 = intra-iteration, 1+ = loop-carried.
+  unsigned distance{};
+  // Producer result carried by this dependence.
+  unsigned srcResultIdx{};
+};
+
+// ============================================================================
+// Symbolic lowering — solver-owned synchronization and data-movement events
+// ============================================================================
+
+enum class LoweringEventKind {
+  Wait,
+  Arrive,
+  Expect,
+  LocalStore,
+  LocalLoad,
+  Fence,
+  TCCommit,
+};
+
+enum class LoweringRelation { Always, SameWG, DifferentWG };
+enum class LoweringEventOwner { Src, Dst };
+enum class LoweringPlacement { Before, After };
+enum class LoweringSemaphore { None, Full, Empty };
+
+/// One event exposed to the joint solver. UINT_MAX denotes an absent optional
+/// id; all other fields have inert defaults.
+struct LoweringEventTemplate {
+  unsigned id{};
+  LoweringEventKind kind{LoweringEventKind::Wait};
+  LoweringEventOwner owner{LoweringEventOwner::Src};
+  unsigned anchorNodeId{UINT_MAX};
+  LoweringPlacement placement{LoweringPlacement::Before};
+  HWPipeline pipeline{HWPipeline::NONE};
+  int issueDuration{0};
+  int completionLatency{0};
+  bool blocking{false};
+  bool isAsync{false};
+  unsigned distance{0};
+  int frequency{1};
+  unsigned bufferId{UINT_MAX};
+  int64_t bytes{0};
+  unsigned depth{1};
+  LoweringSemaphore semaphore{LoweringSemaphore::None};
+  unsigned fusionGroup{UINT_MAX};
+  unsigned dedupGroup{UINT_MAX};
+};
+
+/// A predicate-controlled group of symbolic events for one dependence.
+struct LoweringTemplate {
+  unsigned id{};
+  LoweringRelation relation{LoweringRelation::Always};
+  unsigned srcNodeId{UINT_MAX};
+  unsigned dstNodeId{UINT_MAX};
+  int srcCluster{-1};
+  int dstCluster{-1};
+  llvm::SmallVector<LoweringEventTemplate, 4> events;
+};
+
+/// Concrete placement returned by the solver for one active template event.
+struct LoweringEvent {
+  unsigned id{};
+  int cycle{0};
+  int warpGroup{-1};
+  int streamOrder{0};
+};
+
+struct LoweringTemplatePlan {
+  unsigned id{};
+  bool active{false};
+  llvm::SmallVector<LoweringEvent, 4> events;
+};
+
+enum class LoweringPlanStatus {
+  Absent,
+  ShadowUnmodeled,
+  ShadowVerified,
+  ShadowStale,
+};
+
+struct LoweringPlan {
+  std::string version{"lowering-plan-0.1"};
+  LoweringPlanStatus status{LoweringPlanStatus::Absent};
+  llvm::SmallVector<LoweringTemplatePlan, 8> templates;
 };
 
 // ============================================================================
@@ -190,6 +290,11 @@ struct ScheduleLoop {
   // Body (kernel loop steady state)
   llvm::SmallVector<ScheduleNode, 16> nodes;
   llvm::SmallVector<ScheduleEdge, 16> edges;
+
+  // Solver request/response metadata. These records describe lowering work;
+  // they do not themselves mutate the MLIR loop.
+  llvm::SmallVector<LoweringTemplate, 8> loweringTemplates;
+  LoweringPlan loweringPlan;
 
   // Expanded structure (populated after expansion, empty before)
   // Prologue: ops cloned before the loop (stage 0 of first iterations)
@@ -243,6 +348,10 @@ struct ScheduleLoop {
     // waitBeforeNodeId: emit mbarrier.wait BEFORE this node starts.
     unsigned arriveAfterNodeId{UINT_MAX};
     unsigned waitBeforeNodeId{UINT_MAX};
+
+    // Authoritative dependence distance from the ScheduleEdge that caused
+    // this synchronization record.
+    unsigned distance{0};
 
     // For mbarrier: expected bytes the producer writes (for expect_tx).
     int64_t expectBytes{0};

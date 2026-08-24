@@ -250,20 +250,20 @@ def test_line_info_ir_source(monkeypatch, status, tmp_path, fresh_triton_cache):
     kernel_info = triton.compile(str(temp_file))
     file_lines = extract_file_lines(command, anchor, separator, kernel_info.asm[obj_kind])
     if status == "ttir":
-        assert check_file_lines(file_lines, "/path/test.py", 8, should_contain=False)
-        assert check_file_lines(file_lines, str(temp_file), -1, should_contain=True)
+        assert check_file_lines(file_lines, "<source>/test.py", 8, should_contain=False)
+        assert check_file_lines(file_lines, "<source>/test.ttir", 3)
     else:
         # The scalar load may be folded into the store, dropping line 8 debug
         # info. This already happened on AMD and now also happens on NVIDIA with
         # newer LLVM, so only verify file-level info is present.
-        assert check_file_lines(file_lines, "/path/test.py", -1, should_contain=True)
+        assert check_file_lines(file_lines, "<source>/test.py", -1)
 
 
 def test_use_name_loc_as_prefix(fresh_triton_cache):
 
     @triton.jit
     def kernel_basic(src, N, BLOCK_SIZE: tl.constexpr):
-        # CHECK: #loc = loc("{{.*}}":261:5)
+        # CHECK: #loc = loc("{{.*}}":265:5)
         # CHECK-LABEL:  tt.func public @kernel_basic(
         # CHECK-SAME:                                %src: !tt.ptr<f32> loc("src"(#loc)), %N: i32 loc("N"(#loc)))
         # CHECK:          %x_plus_1 = arith.constant dense<1.000000e+00> : tensor<16xf32> loc(#loc12)
@@ -325,7 +325,7 @@ def test_use_name_loc_as_prefix(fresh_triton_cache):
         @triton.jit
         def kernel_tensordesc_param(foo):
             # CHECK-LABEL: tt.func public @kernel_tensordesc_param
-            # CHECK-SAME: %foo: !tt.tensordesc<tensor<32x64xf16>>
+            # CHECK-SAME: %foo: !tt.tensordesc<32x64xf16>
             # CHECK-SAME: %foo.shape.0: i32
             # CHECK-SAME: %foo.shape.1: i32
             # CHECK-SAME: %foo.stride.0: i64
@@ -455,20 +455,22 @@ def test_use_name_loc_as_prefix(fresh_triton_cache):
         # CHECK: %arange = tt.make_range {end = 16 : i32, start = 0 : i32} : tensor<16xi32>
         arange = tl.arange(0, 16)
         ivar = 0
-        # CHECK: %ivar_[[IV0:.+]]:2 = scf.while (%arange_[[AR0:.+]] = %arange, %ivar_[[IV1:.+]] = %ivar) : (tensor<16xi32>, i32) -> (tensor<16xi32>, i32)
-        # CHECK: %[[COND:.*]] = arith.cmpi slt, %ivar_[[IV1]], %N : i32
-        # CHECK: scf.condition(%[[COND]]) %arange_[[AR0]], %ivar_[[IV1]] : tensor<16xi32>, i32
+        # This loop is provably countable (monotone `ivar += 1` induction against
+        # the loop-invariant bound `ivar < N`), so the `triton-uplift-while-to-for`
+        # pass rewrites it into an equivalent `scf.for` — that way it can benefit
+        # from the for-loop optimization pipeline (software pipelining, etc.) that
+        # doesn't run on `scf.while`. Hence the checked IR below is a for loop
+        # carrying `arange`; the name-loc prefixes are preserved through the uplift.
+        # CHECK: %ivar_[[IV0:.+]] = scf.for %ivar_[[IV1:.+]] = %ivar to %N step %c1_i32 iter_args(%arange_[[AR0:.+]] = %arange) -> (tensor<16xi32>) : i32 {
         while ivar < N:
-            # CHECK: ^bb0(%arange_[[AR0]]: tensor<16xi32> loc("arange"), %ivar_[[IV1]]: i32
-
             # CHECK: %ivar_[[IV2:.+]] = arith.addi %ivar_[[IV1]], %c1_i32 : i32
             ivar += 1
             # CHECK: %arange_[[AR1:.+]] = tt.splat %ivar_[[IV2]] : i32 -> tensor<16xi32>
             # CHECK: %arange_[[AR2:.+]] = arith.muli %arange_[[AR0]], %arange_[[AR1]] : tensor<16xi32>
-            # CHECK: scf.yield %arange_[[AR2]], %ivar_[[IV2]] : tensor<16xi32>, i32
+            # CHECK: scf.yield %arange_[[AR2]] : tensor<16xi32>
             arange *= ivar
 
-        # CHECK: tt.print ": " {hex = false, isSigned = array<i32: 1>} : %ivar_[[IV0]]#0 : tensor<16xi32>
+        # CHECK: tt.print ": " {hex = false, isSigned = array<i32: 1>} : %ivar_[[IV0]] : tensor<16xi32>
         tl.device_print("", arange)
 
     h = triton.compile(triton.compiler.ASTSource(fn=kernel_basic_while, signature={"N": "i32"}, constexprs={}))
@@ -501,7 +503,7 @@ def test_line_and_column_numbers(fresh_triton_cache):
 
     @triton.jit
     def kernel_basic(src, N, BLOCK_SIZE: tl.constexpr):
-        # CHECK: #loc = loc("{{.*}}":489:5)
+        # CHECK: #loc = loc("{{.*}}":505:5)
         # CHECK: #loc10 = loc("src"(#loc))
         # CHECK: #loc11 = loc("N"(#loc))
         # CHECK-LABEL:  tt.func public @kernel_basic(
@@ -524,15 +526,15 @@ def test_line_and_column_numbers(fresh_triton_cache):
         # CHECK:          } loc(#loc)
         # CHECK:         } loc(#loc)
 
-        # CHECK: #loc1 = loc({{.*}}:535:20)
+        # CHECK: #loc1 = loc({{.*}}:551:20)
         # CHECK: #loc2 = loc(unknown)
-        # CHECK: #loc3 = loc({{.*}}:530:15)
-        # CHECK: #loc4 = loc({{.*}}:531:18)
-        # CHECK: #loc5 = loc({{.*}}:532:28)
-        # CHECK: #loc6 = loc({{.*}}:532:19)
-        # CHECK: #loc7 = loc({{.*}}:533:30)
-        # CHECK: #loc8 = loc({{.*}}:534:16)
-        # CHECK: #loc9 = loc({{.*}}:536:9)
+        # CHECK: #loc3 = loc({{.*}}:546:15)
+        # CHECK: #loc4 = loc({{.*}}:547:18)
+        # CHECK: #loc5 = loc({{.*}}:548:28)
+        # CHECK: #loc6 = loc({{.*}}:548:19)
+        # CHECK: #loc7 = loc({{.*}}:549:30)
+        # CHECK: #loc8 = loc({{.*}}:550:16)
+        # CHECK: #loc9 = loc({{.*}}:552:9)
         # CHECK: #loc12 = loc("x_plus_1"(#loc1))
         # CHECK: #loc13 = loc("pid"(#loc3))
         # CHECK: #loc14 = loc("offset"(#loc4))
@@ -554,6 +556,27 @@ def test_line_and_column_numbers(fresh_triton_cache):
                                   constexprs={"BLOCK_SIZE": 16}))
 
     check_template = inspect.getsource(kernel_basic.fn)
+    run_filecheck("placeholder", h.asm["ttir"], check_template)
+
+
+def test_while_block_arg_carries_init_handle_loc(fresh_triton_cache):
+
+    @triton.jit
+    def kernel_while_block_arg_loc(N):
+        # CHECK-DAG: #[[INIT_IVAR_LOC:loc[0-9]+]] = loc("ivar"(#{{loc[0-9]+}}))
+        # CHECK-LABEL: tt.func public @kernel_while_block_arg_loc
+        # CHECK: %arange = tt.make_range {{.*}} loc(#[[INIT_ARANGE_LOC:loc[0-9]+]])
+        arange = tl.arange(0, 16)
+        ivar = 0
+        # CHECK: scf.while (%arange_{{.+}} = %arange, %ivar_{{.+}} = %{{.+}})
+        while ivar < N and N > 0:
+            # CHECK: ^bb0(%arange_{{.+}}: tensor<16xi32> loc("arange"(#[[INIT_ARANGE_LOC]])), %ivar_{{.+}}: i32 loc("ivar"(#[[INIT_IVAR_LOC]])))
+            ivar += 1
+            arange *= ivar
+        tl.device_print("", arange)
+
+    h = triton.compile(triton.compiler.ASTSource(fn=kernel_while_block_arg_loc, signature={"N": "i32"}, constexprs={}))
+    check_template = inspect.getsource(kernel_while_block_arg_loc.fn)
     run_filecheck("placeholder", h.asm["ttir"], check_template)
 
 

@@ -62,7 +62,8 @@ bool isOneOperandElementwiseOp(Operation *op) {
 // Returns null store op if not suitable.
 static triton::StoreOp
 usePermlaneSwapToOptimizeStore(PatternRewriter &rewriter, Value ptr, Value val,
-                               Value mask, triton::StoreOp oldStoreOp) {
+                               Value mask, triton::StoreOp oldStoreOp,
+                               bool rematerializeCoordinates) {
   auto ptrType = cast<RankedTensorType>(ptr.getType());
   auto valType = cast<RankedTensorType>(val.getType());
 
@@ -80,8 +81,10 @@ usePermlaneSwapToOptimizeStore(PatternRewriter &rewriter, Value ptr, Value val,
                                                       newPtrType, ptr);
 
   auto newValType = valType.cloneWithEncoding(newEncoding);
-  Value newVal = triton::gpu::ConvertLayoutOp::create(rewriter, val.getLoc(),
-                                                      newValType, val);
+  auto newVal = triton::gpu::ConvertLayoutOp::create(rewriter, val.getLoc(),
+                                                     newValType, val);
+  if (rematerializeCoordinates)
+    newVal->setAttr("tlx.rematerialize_coordinates", rewriter.getUnitAttr());
 
   Value newMask = mask;
   if (mask) {
@@ -126,8 +129,19 @@ public:
     Value mask = stOp.getMask();
     auto ptrType = dyn_cast<RankedTensorType>(ptr.getType());
     auto valType = dyn_cast<RankedTensorType>(val.getType());
-    if (!ptrType || !valType ||
-        !isa<triton::gpu::BlockedEncodingAttr>(ptrType.getEncoding()) ||
+    if (!ptrType || !valType)
+      return mlir::failure();
+    // Respect a user-pinned store layout (PinnedEncodingTrait, e.g. TLX's
+    // #tlx.user_layout): the author chose this store layout deliberately, so do
+    // not rewrite it to the MMA accumulator layout. Mirrors Coalesce /
+    // RemoveLayoutConversions / OptimizeTMemLayouts, which already anchor on
+    // this trait (D112032532).
+    if (isa_and_nonnull<triton::gpu::PinnedEncodingTrait>(
+            valType.getEncoding()) ||
+        isa_and_nonnull<triton::gpu::PinnedEncodingTrait>(
+            ptrType.getEncoding()))
+      return mlir::failure();
+    if (!isa<triton::gpu::BlockedEncodingAttr>(ptrType.getEncoding()) ||
         !isa<triton::gpu::BlockedEncodingAttr>(valType.getEncoding()))
       return mlir::failure();
 
@@ -149,6 +163,8 @@ public:
     auto cvtOp = val.getDefiningOp<triton::gpu::ConvertLayoutOp>();
     if (!cvtOp)
       return mlir::failure();
+    bool rematerializeCoordinates =
+        cvtOp->hasAttr("tlx.rematerialize_coordinates");
 
     auto encoding = cvtOp.getSrc().getType().getEncoding();
     if (!isa<triton::gpu::MmaEncodingTrait>(encoding))
@@ -184,8 +200,8 @@ public:
       newMask = triton::gpu::ConvertLayoutOp::create(rewriter, mask.getLoc(),
                                                      newMaskType, mask);
     }
-    triton::StoreOp newStoreOp =
-        usePermlaneSwapToOptimizeStore(rewriter, newPtr, newVal, newMask, stOp);
+    triton::StoreOp newStoreOp = usePermlaneSwapToOptimizeStore(
+        rewriter, newPtr, newVal, newMask, stOp, rematerializeCoordinates);
     if (!newStoreOp) {
       newStoreOp =
           triton::StoreOp::create(rewriter, stOp.getLoc(), newPtr, newVal,

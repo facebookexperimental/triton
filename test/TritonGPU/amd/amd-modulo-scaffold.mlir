@@ -1,5 +1,8 @@
 // RUN: TRITON_ENABLE_AMD_MODULO=1 triton-opt %s -split-input-file \
 // RUN:   -tritonamdgpu-dot-decompose-and-schedule 2>&1 | FileCheck %s
+// RUN: TRITON_USE_MODULO_SCHEDULE=1 triton-opt %s -split-input-file \
+// RUN:   -tritonamdgpu-dot-decompose-and-schedule=mode=modulo 2>&1 \
+// RUN:   | FileCheck %s --check-prefix=RETRY
 //
 // Phase E0+E1 of the AMD modulo scheduler. E0: the scaffold builds the
 // backend-neutral DDG (TritonGPUModuloCore) for each inner loop using
@@ -13,6 +16,7 @@
 // order with a sched.barrier at the stage boundary.
 // (The remark is on stderr and may print before the IR, so no CHECK-LABEL.)
 // CHECK: remark: amd-modulo: DDG {{[0-9]+}} nodes MFMA=1 LDS=2 GLOBAL=0{{.*}}II={{[0-9]+}} maxStage={{[0-9]+}}{{.*}}barriers={{[0-9]+}}
+// RETRY: remark: amd-modulo: DDG {{[0-9]+}} nodes MFMA=1 LDS=2 GLOBAL=0{{.*}}II={{[0-9]+}} maxStage=1 retries={{[1-9][0-9]*}}{{.*}}serialized num_stages=2
 // E1/E2: ops carry the schedule, and the body is reordered with a barrier at the
 // stage boundary — prefetch-stage loads, then the barrier, then the compute dot.
 // CHECK:      ttg.local_load {{.*}}ttg.modulo_stage

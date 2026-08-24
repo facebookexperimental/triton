@@ -480,9 +480,8 @@ def test_local_gather(device):
         off_n = pid_n * BLOCK_SIZE_N
 
         # Gather once
-        buffer_in = tlx.local_view(buffers_in, 0)
         tlx.barrier_expect_bytes(bar, BLOCK_SIZE_M * BLOCK_SIZE_N * 2)
-        reinterpreted = tlx.local_reinterpret(buffer_in, tl.int16, [1, BLOCK_SIZE_M * BLOCK_SIZE_N])
+        reinterpreted = tlx.local_reinterpret(buffers_in, tl.int16, [1, BLOCK_SIZE_M * BLOCK_SIZE_N])
         tlx.async_descriptor_load(desc_in, reinterpreted, [0, off_m * N + off_n], bar)
         tlx.barrier_wait(bar=bar, phase=0)
 
@@ -493,8 +492,7 @@ def test_local_gather(device):
             in_local = tlx.local_load(buffer_in)
             tlx.local_store(buffer_out, in_local)
 
-        buffer_out = tlx.local_view(buffers_out, 0)
-        reinterpreted = tlx.local_reinterpret(buffer_out, tl.int16, [1, BLOCK_SIZE_M * BLOCK_SIZE_N])
+        reinterpreted = tlx.local_reinterpret(buffers_out, tl.int16, [1, BLOCK_SIZE_M * BLOCK_SIZE_N])
         tlx.async_descriptor_store(desc_out, reinterpreted, [0, off_m * N + off_n])
 
     triton.set_allocator(alloc_fn)
@@ -582,6 +580,20 @@ def test_tmem_copy_rejects_logical_rank2_scale_smem(device):
     with pytest.raises(triton.CompilationError) as exc_info:
         kernel[(1, )](dummy)
     assert "scale tmem_copy requires an explicit packed i8 SMEM shape" in str(exc_info.value)
+
+
+@pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
+@pytest.mark.parametrize("num_blocks", [1, 2])
+def test_tmem_copy_accepts_packed_rank2_scale_smem(num_blocks, device):
+
+    @triton.jit
+    def kernel(NUM_BLOCKS: tl.constexpr):
+        smem = tlx.local_alloc((32 * NUM_BLOCKS, 16), tl.uint8, tl.constexpr(1))
+        tmem = tlx.local_alloc((128, 16 * NUM_BLOCKS), tl.uint8, tl.constexpr(1), tlx.storage_kind.tmem)
+        tlx.tmem_copy(smem[0], tmem[0])
+
+    compiled = kernel.warmup(num_blocks, grid=(1, ))
+    assert compiled.asm["ttgir"].count("ttng.tmem_copy") == 1
 
 
 @pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")

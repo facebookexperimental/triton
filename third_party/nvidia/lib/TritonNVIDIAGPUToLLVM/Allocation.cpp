@@ -7,6 +7,8 @@
 #include "triton/Conversion/TritonGPUToLLVM/AllocateSharedMemoryUtility.h"
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
+#include "triton/Dialect/TritonGPU/Transforms/Utility.h"
+#include "triton/Dialect/TritonInstrument/IR/ConSanConstants.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Tools/GenericSwizzling.h"
 #include "triton/Tools/LayoutUtils.h"
@@ -55,11 +57,18 @@ static unsigned getNumScratchElemsSwizzledCvt(RankedTensorType srcTy,
   srcLayout = actionRemoveBroadcastedRegs(srcLayout).apply(srcLayout);
   dstLayout = actionRemoveBroadcastedRegs(dstLayout).apply(dstLayout);
   auto bitwidth = getBitwidth(srcTy);
-  auto [srcTiles, dstTiles] = gpu::getSrcDstTiles(targetInfo, bitwidth);
+  auto kBlock = StringAttr::get(ctx, "block");
+  bool crossCTA =
+      !dstLayout.invertAndCompose(srcLayout).isTrivialOver({kBlock});
+  auto [srcTiles, dstTiles] =
+      gpu::getSrcDstTiles(targetInfo, bitwidth, crossCTA);
   auto [smem, _] = triton::gpu::optimalSwizzling(srcLayout, dstLayout, srcTiles,
                                                  dstTiles, bitwidth);
   auto reps = smem.getInDimSize(StringAttr::get(ctx, "reps"));
-  return smem.getTotalOutDimSize() / reps;
+  // The smem has the same cta layout as the srcLayout, so we use that instead
+  // We remove the number of elements that are duplicated in the cta layout
+  auto nBlocks = product(triton::gpu::getCTASplitNum(srcTy.getEncoding()));
+  return smem.getTotalOutDimSizeProduct() / (reps * nBlocks);
 }
 
 std::function<unsigned(Operation *)>
@@ -68,6 +77,15 @@ getNvidiaAllocationAnalysisScratchSizeFn(TargetInfoBase &targetInfo) {
     if (auto cvtOp = dyn_cast<triton::gpu::ConvertLayoutOp>(op)) {
       auto srcTy = cvtOp.getSrc().getType();
       auto dstTy = cvtOp.getType();
+      if (hasNpotShape(srcTy) || hasNpotShape(dstTy)) {
+        // Use modular physical-cover sizing.
+        if (!cvtNeedsSharedMemory(srcTy, dstTy)) {
+          return 0;
+        }
+        auto elems = mlir::triton::getNumScratchElemsSwizzledCvt(srcTy, dstTy);
+        // Modular sub-byte values occupy one byte in shared memory.
+        return elems * std::max<unsigned>(getBitwidth(srcTy), 8) / 8;
+      }
       if (!cvtNeedsSharedMemory(srcTy, dstTy))
         return 0;
       // In cuda we always swizzle
@@ -76,6 +94,15 @@ getNvidiaAllocationAnalysisScratchSizeFn(TargetInfoBase &targetInfo) {
     }
     if (isa<triton::nvidia_gpu::TCGen5GlobalAllocOp>(op))
       return 4;
+    if (auto ws = dyn_cast<triton::gpu::WarpSpecializeOp>(op)) {
+      unsigned captureSize = defaultAllocationAnalysisScratchSizeFn(op);
+      // ConSan adds captures after allocation; reserve space pre-computed by
+      // the common TritonInstrumentPrepareConSanCaptures pass.
+      if (auto extra = ws->getAttrOfType<IntegerAttr>(
+              mlir::triton::instrument::kConSanExtraCaptureBytesAttr))
+        captureSize += extra.getInt();
+      return captureSize;
+    }
     return defaultAllocationAnalysisScratchSizeFn(op);
   };
   return allocation;

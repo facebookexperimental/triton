@@ -87,6 +87,13 @@ Key capabilities:
   (e.g., task 2 → 3 → 2 → 1), segments are merged by task ID and
   topologically sorted by data dependency, producing contiguous regions
   (e.g., task 3 → 2 → 1).
+- **Independent adjacent epilogues**: setup collection follows only the SSA
+  dependency chain from a split back to its `tmem_load`. It must not collect a
+  lexical block interval, because hoisted dV and dK loads can be adjacent and a
+  later split would otherwise absorb and erase the region generated for its
+  sibling. The pass fixpoint uses explicit transformation success rather than
+  operation-count changes; replacing a flat chain with a region can preserve
+  the total operation count.
 
 Structural equivalence (`checkStructuralEquivalence`) compares per-tile
 chains pairwise, recording differing operands and identity-compatible ops.
@@ -116,7 +123,7 @@ doMemoryPlanner
 doGenerateSubtiledRegion          ← creates SubtiledRegionOps
 doAnnotateTMAStoreWaits
 doValidateTMAStoreAnnotations
-doCodePartitionPost               ← creates inline NVWS ops in SubtiledRegionOps;
+doCodePartition               ← creates inline NVWS ops in SubtiledRegionOps;
                                     multi-task SubtiledRegionOps lowered here
 doLowerSubtiledRegionsWithNVWSOps ← inlines SubtiledRegionOps with NVWS ops
 doTokenLowering                   ← resolves NVWS ops → hardware barrier ops
@@ -211,7 +218,7 @@ two consumer shapes:
 
 - **Inside→outside** (`separate_epilogue_store=True`, the producer subtiled but
   each subtile's consumer a *flat* op outside): represented as `numTiles` sibling
-  `ChannelPost`s sharing one in-body template producer, each with its own flat
+  `AllocChannel`s sharing one in-body template producer, each with its own flat
   consumer. There are two sub-shapes depending on staging `buffer.copy`:
   - **Multi-buffered** (`buffer.copy > 1`): the siblings are one reuse group over
     one physical multibuffer; the in-body slot rotation (`getOrComputeSubtiledSlot`)
@@ -240,18 +247,21 @@ two consumer shapes:
   in the partition-scheduler rules and
   `test/Hopper/WarpSpecialization/ws_subtiled_inside_outside_channel.mlir`.
 - **Same-task interleaved** (`separate_epilogue_store=False`): the producer
-  `local_store` and the consumer `async_tma_copy_local_to_global` are both in the
-  epilogue task, so there is no cross-task channel and *no WS reuse barrier* — the
-  only drain sync is the per-tile `async_tma_store_token_wait`. These two endpoints
+  `local_store` and its consumer `async_tma_copy_local_to_global` or
+  `async_tma_reduce` are both in the epilogue task, so there is no cross-task
+  channel and *no WS reuse barrier* — the only drain sync is the per-tile
+  `async_tma_store_token_wait`. These two endpoints
   must therefore live in **one** `SubtiledRegionOp` whose tile body is
   `store_t → copy_t → token_wait` (per tile), so the TMA wait drains a staging slot
   before a later subtile reuses it. `collectPerTileChain`
   (`GenerateSubtiledRegion.cpp`) achieves this by following a `local_store`'s SMEM
-  buffer to a **same-task** TMA copy and pulling it into the same per-tile chain;
-  `buildSingleSubtiledRegionN` then emits one region (the store and copy share one
-  per-tile buffer position). Emitting two *sequential* same-task regions instead
-  (all stores, then all copies) races the staging slot whenever
-  `numTiles > buffer.copy` — the slot is overwritten before its copy drains —
+  buffer to a **same-task** TMA store/reduce and pulling it into the same per-tile
+  chain; `buildSingleSubtiledRegionN` then emits one region (the local store and
+  TMA operation share one per-tile buffer position). Emitting two *sequential*
+  same-task regions instead (all local stores, then all TMA operations) races the
+  staging slot whenever
+  `numTiles > buffer.copy` — the slot is overwritten before its TMA operation
+  drains —
   because, unlike the cross-task paths, there is no concurrency and no barrier to
   serialize the reuse. A debug assert in the separate-region branch guards this
   invariant. Because a same-task tile body now has both a write and a read of the
@@ -261,19 +271,19 @@ two consumer shapes:
 - **Both-endpoints-subtiled** (producer subtiled AND consumer subtiled, in
   *different* async tasks — the `DATA_PARTITION_FACTOR=2` epilogue): the
   `numTiles` per-tile allocs of one (producer region, consumer region) pair are
-  **collapsed** into a single `ChannelPost` in `collectPostChannels`
+  **collapsed** into a single `AllocChannel` in `collectAllocChannels`
   (`getSubtiledChannelEndpoints` resolves the two regions; the dedup key is the
   region pair, gated on the regions being in different tasks). The collapsed
   channel is the sole member of a degenerate size-1 subtiled reuse group (see
   [Reuse Groups](ReuseGroups.md)), so the in-body slot math above is unchanged.
   This collapse fires for **any `buffer.copy`, including `buffer.copy == 1`** (the
   DP=1 epilogue): the `numBuffers > 1` reuse-group guards are relaxed for channels
-  flagged `ChannelPost::isCollapsedBothSubtiled` (queried via
+  flagged `AllocChannel::isCollapsedBothSubtiled` (queried via
   `channelIsCollapsedBothSubtiled` — the *narrow* predicate, NOT the broad
   `channelIsSubtiled`, which would also match a consumer-only-subtiled bias load),
   the in-body math collapses all subtiles onto one physical slot (`bufferIdx == 0`,
   alternating phase), and the skipped sibling per-tile allocs
-  (`ChannelPost::collapsedSiblingAllocs`) are erased after the rewire. Omitting
+  (`AllocChannel::collapsedSiblingAllocs`) are erased after the rewire. Omitting
   any of this leaves the sibling staging alloc live → SMEM OOM (bug #13).
   Per-data-partition separation of the shared physical staging buffer is done in
   the memory planner (cross-partition staging split). See bug #11.

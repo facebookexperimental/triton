@@ -22,6 +22,9 @@ Each kernel is an importable module under `third_party/tlx/tutorials/`.
 |---|---|---|---|---|
 | `amd_gemm_warp_pipeline.py` | GEMM | `test_amd_gemm_warp_pipeline` | `test_amd_gemm_perf.py` (`warp_pipeline`) | `is_hip_cdna4` |
 | `amd_gemm_pipelined.py` | GEMM (LDS pipeline) | `test_amd_gemm_pipelined` | `test_amd_gemm_perf.py` (`pipelined`) | `is_hip` |
+| `amd_gemm_gfx942.py` | GEMM (MI300X, autotuned) | `test_amd_gemm_gfx942`, `test_amd_gemm_gfx942_odd_shapes` | `test_amd_gemm_gfx942_perf.py` | `is_hip_cdna3` |
+| `amd_addmm_gfx942.py` | addmm (MI300X, autotuned) | `test_amd_addmm_gfx942` | `test_amd_addmm_gfx942_perf.py` | `is_hip_cdna3` |
+| `amd_bmm_gfx942.py` | BMM (MI300X, autotuned) | `test_amd_bmm_gfx942`, `test_amd_bmm_gfx942_distinct_a` | `test_amd_bmm_gfx942_perf.py` | `is_hip_cdna3` |
 | `amd_fa_pipelined.py` | Flash Attention | `test_amd_fa_pipelined` | `test_amd_fa_perf.py` (`simple`, `prefetch`) | `is_hip_cdna4` |
 | `amd_fa_persistent.py` | Flash Attention (persistent) | `test_amd_fa_persistent`, `test_amd_fa_persistent_cross_attention` | `test_amd_fa_perf.py` (`persistent`) | `is_hip_cdna4` |
 | `amd_addmm_glu.py` | addmm + GLU (gated linear unit, **not** GELU) | `test_amd_addmm_glu` | `test_amd_addmm_glu_perf.py` | `is_hip_cdna4` |
@@ -30,8 +33,13 @@ Each kernel is an importable module under `third_party/tlx/tutorials/`.
 | `amd_tdm_gemm_pipelined.py` | GEMM (TDM) | `test_amd_tdm_gemm_pipelined` | — | `is_hip_gfx1250` |
 | `amd_mxfp_gemm_tdm_pipelined.py` | GEMM (MXFP, TDM) | `test_amd_mxfp_gemm_tdm_pipelined` | `test_amd_mxfp_gemm_perf.py` | `is_hip_gfx1250` |
 
-`gfx950` = CDNA4 = MI350-class (`is_hip_cdna4()`). `gfx1250` is a separate, newer
-target (`is_hip_gfx1250()`). On gfx950, the gfx1250-only GEMM tests auto-skip.
+`gfx950` = CDNA4 = MI350-class (`is_hip_cdna4()`). `gfx942` = CDNA3 = MI300X-class
+(`is_hip_cdna3()`). `gfx1250` is a separate, newer target (`is_hip_gfx1250()`). On
+gfx950, both the gfx1250-only and the gfx942-only GEMM tests auto-skip.
+
+The MI300X kernel is the only gfx942 entry and has **no CI runner** — the MI350
+workflow is gfx950, so `test_amd_gemm_gfx942*` always skips there. Run it by hand
+on an MI300X box.
 
 ## Correctness
 
@@ -52,9 +60,12 @@ its node id) — use `-k "amd or ikbo"`.
 ## Perf
 
 Never run perf unless explicitly asked. Use the `kernel-perf-testing` skill for
-run mechanics. `denoise.sh` works on AMD (it runs the command with NUMA pinning);
-its GPU clock/power lock is `nvidia-smi`-based and is skipped on AMD, so expect
-slightly higher run-to-run variance. Pick a free GPU with `rocm-smi`.
+run mechanics. `denoise.sh` **does** lock clocks on AMD: it identifies the part by
+PCI id (MI300X `0x74a0`/`0x74a1`/gfx942, MI350X, MI355X), then applies
+`rocm-smi --setperfdeterminism` (default 2100 MHz, override `DETERMINISM_CLK`) and
+`--setpoweroverdrive` (750 W on MI300X, override `DESIRED_POWER`), NUMA-binds to
+the GPU's node, and resets both on exit. It needs sudo and is best-effort. It
+defaults `HIP_VISIBLE_DEVICES` to 4 — set it to a free GPU (`rocm-smi`) yourself.
 
 ## CI
 

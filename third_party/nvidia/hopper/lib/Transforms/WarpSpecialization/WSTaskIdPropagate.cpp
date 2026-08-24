@@ -2,6 +2,7 @@
 #include "TaskIdPropagation.h"
 #include "Utility.h"
 #include "WarpSpecializationPipeline.h"
+#include "lib/Dialect/TritonGPU/Transforms/WarpSpecialization/PartitionAttrs.h"
 #include "mlir/Analysis/DataFlow/ConstantPropagationAnalysis.h"
 #include "mlir/Analysis/DataFlow/DeadCodeAnalysis.h"
 #include "mlir/Analysis/DataFlowFramework.h"
@@ -178,16 +179,19 @@ static void handleOperandDTaskIdPropagation(triton::FuncOp &funcOp) {
   });
 }
 
-int doTaskIdPropagate(triton::FuncOp &funcOp) {
+LogicalResult doTaskIdPropagate(triton::FuncOp funcOp) {
   // Compute the min partition to normalize to 0
   int64_t minPartition = INT64_MAX;
   funcOp.walk([&](mlir::Operation *op) {
     if (auto attr =
             op->getAttrOfType<DenseI32ArrayAttr>(ttg::kPartitionAttrName)) {
-      assert(attr.size() == 1 && "expected exactly 1 partition element");
-      int64_t idx = attr[0];
-      assert(idx >= 0);
-      minPartition = std::min(idx, minPartition);
+      // An op may belong to more than one partition: a no-MMA reduction
+      // annotates a scalar offset op with the union of its load and store
+      // users' partitions (e.g. array<i32: 1, 2>). Take the min over all ids.
+      for (int32_t idx : attr.asArrayRef()) {
+        assert(idx >= 0);
+        minPartition = std::min<int64_t>(idx, minPartition);
+      }
     }
   });
   DenseSet<AsyncTaskId> totalTaskIds;
@@ -195,11 +199,18 @@ int doTaskIdPropagate(triton::FuncOp &funcOp) {
   funcOp.walk([&](mlir::Operation *op) {
     if (auto attr =
             op->getAttrOfType<DenseI32ArrayAttr>(ttg::kPartitionAttrName)) {
-      assert(attr.size() == 1 && "expected exactly 1 partition element");
-      int64_t idx = attr[0] - minPartition;
-      totalTaskIds.insert(idx);
-      assert(idx >= 0);
-      setAsyncTaskIds(op, idx);
+      // Materialize every partition id. An op assigned to multiple partitions
+      // (e.g. a replicated scalar offset in a no-MMA reduction) is later cloned
+      // into each partition by code partitioning.
+      SmallVector<AsyncTaskId> taskIds;
+      for (int32_t rawIdx : attr.asArrayRef()) {
+        int64_t idx = static_cast<int64_t>(rawIdx) - minPartition;
+        assert(idx >= 0);
+        auto taskId = static_cast<AsyncTaskId>(idx);
+        totalTaskIds.insert(taskId);
+        taskIds.push_back(taskId);
+      }
+      setAsyncTaskIds(op, taskIds);
       op->removeAttr(ttg::kPartitionAttrName);
     }
   });
@@ -247,7 +258,7 @@ int doTaskIdPropagate(triton::FuncOp &funcOp) {
   solver.load<SparseConstantPropagation>();
   solver.load<ttg::TaskIdBackwardPropagation>(symbolTable);
   if (failed(solver.initializeAndRun(op)))
-    return -1;
+    return failure();
 
   funcOp.walk([&](mlir::Operation *op) {
     auto taskIds = ttg::TaskId::getUninitialized();
@@ -300,7 +311,7 @@ int doTaskIdPropagate(triton::FuncOp &funcOp) {
   // We do this in a separate walk to avoid having a parent operation treated
   // like an anchor op and skipped by the first walk.
   funcOp.walk([&](mlir::Operation *op) { labelParentOps(op); });
-  return 0;
+  return success();
 }
 
 #define GEN_PASS_DEF_NVGPUTESTWSTASKIDPROPAGATE
@@ -315,7 +326,9 @@ public:
 
   void runOnFuncOp(triton::FuncOp funcOp) {
     llvm::DenseSet<Operation *> anchorOps;
+    bool hasPartitionAnchors = false;
     funcOp.walk([&](mlir::Operation *op) {
+      hasPartitionAnchors |= op->hasAttr(ttg::kPartitionAttrName);
       auto asyncTasks = getAsyncTaskIds(op);
       if (!asyncTasks.empty()) {
         std::sort(asyncTasks.begin(), asyncTasks.end());
@@ -326,10 +339,9 @@ public:
           op->removeAttr("async_task_id");
       }
     });
-    if (numWarpGroups == 0 || anchorOps.empty())
+    if (numWarpGroups == 0 || (anchorOps.empty() && !hasPartitionAnchors))
       return;
-    int retCode = doTaskIdPropagate(funcOp);
-    if (retCode != 0)
+    if (failed(doTaskIdPropagate(funcOp)))
       signalPassFailure();
   }
 

@@ -121,11 +121,11 @@ class CudaUtils(object):
         # launch.h"` would not resolve. Substituting the header text keeps a
         # single source of truth (launch.h) while making the compile
         # self-contained.
-        driver_src = Path(os.path.join(dirname, "driver.c")).read_text()
+        driver_src = Path(os.path.join(dirname, "driver.c")).read_text(encoding="utf-8")
         launch_h_path = next((p for p in _launch_h_candidates if os.path.exists(p)), None)
         if launch_h_path is None:
             raise FileNotFoundError(f"launch.h not found in any of: {_launch_h_candidates}")
-        launch_h_src = Path(launch_h_path).read_text()
+        launch_h_src = Path(launch_h_path).read_text(encoding="utf-8")
         include_marker = '#include "nvidia/backend/launch.h"'
         if include_marker not in driver_src:
             raise RuntimeError(f"driver.c must contain the marker {include_marker!r} for "
@@ -444,6 +444,19 @@ def wrap_handle_tensordesc(launcher, signature, tensordesc_meta):
     return wrap_handle_tensordesc_impl(launcher, signature, tensordesc_meta, make_tensordesc_arg)
 
 
+def wrap_handle_gsan(launcher):
+
+    def inner(*args):
+        import triton.experimental.gsan._allocator as gsan_allocator
+
+        device = triton.runtime.driver.active.get_current_device()
+        device_rank = gsan_allocator.get_device_rank(device)
+        gsan_state_ptr = gsan_allocator.get_global_state_pointer() + device_rank * GSAN_PER_DEVICE_STATE_STRIDE
+        return launcher(*args[:-1], (*args[-1], gsan_state_ptr))
+
+    return inner
+
+
 class CudaLauncher(object):
 
     def __init__(self, src, metadata):
@@ -453,23 +466,33 @@ class CudaLauncher(object):
         signature = {idx: value for idx, value in src.signature.items()}
         tensordesc_meta = getattr(metadata, "tensordesc_meta", None)
 
-        # Compute Level 0 schema — the canonical ABI description for this kernel.
-        from triton.compiler.compiler import make_backend
-
-        backend = make_backend(metadata.target)
-        schema = backend.make_launch_metadata(metadata._asdict(), src)
-
         launcher = triton.runtime.driver.active.utils.launch
 
-        # kernel_signature: derived from Level 0 schema (single source of truth).
-        self.kernel_signature = build_kernel_signature_from_schema(schema)
-
-        # arg_annotations: still needs structural info from src.signature
-        # (tuple grouping is a Python calling convention, not kernel ABI).
+        # kernel_signature + arg_annotations are both derived from the object
+        # signature (src.signature): expand_signature flattens tensordescs, then
+        # make_kernel_signature / annotate_arguments walk the actual argument-type
+        # OBJECTS via isinstance(...). A NamedTuple *is* a tuple, so it flattens
+        # structurally like any other tuple -- no reliance on str(ty). Deriving the
+        # signature from the Level 0 schema's stringified types is a repr blind
+        # spot: a NamedTuple stringifies to a class repr ("Function(fn=...,
+        # captured=...)") rather than a tuple literal, so a string parser silently
+        # mis-flattens it. For every non-NamedTuple case this is byte-identical to
+        # the old schema path (asserted by
+        # test_launch_metadata.py::test_schema_derived_signature_matches_legacy).
         expanded_signature = expand_signature(signature.values(), tensordesc_meta)
+        gsan_enabled = "gsan" in metadata.instrumentation_mode
+        if gsan_enabled:
+            expanded_signature.append("*i8")
+        self.kernel_signature = make_kernel_signature(expanded_signature)
         self.arg_annotations = annotate_arguments(expanded_signature)
 
+        if gsan_enabled:
+            launcher = wrap_handle_gsan(launcher)
         self.launch = wrap_handle_tensordesc(launcher, signature, tensordesc_meta)
+        # Compiler-synthesized auto-TMA descriptors (PromoteLoadToTMA): the
+        # launcher builds each CUtensorMap host-side from existing scalar args
+        # via the launch.h recipe core and injects it (no device global scratch).
+        self.auto_tma_recipes = getattr(metadata, "auto_tma_recipes", []) or []
         self.global_scratch_size = metadata.global_scratch_size
         self.global_scratch_align = metadata.global_scratch_align
         self.profile_scratch_size = metadata.profile_scratch_size
@@ -545,6 +568,7 @@ class CudaLauncher(object):
             profile_scratch,
             self.arg_annotations,
             self.kernel_signature,
+            self.auto_tma_recipes,
             args,
         )
 
@@ -596,6 +620,13 @@ class CudaDriver(GPUDriver):
 
     @staticmethod
     def is_active():
+        # TODO: Replace with the result of https://github.com/triton-lang/triton/issues/10938
+        # Temporary workaround for torch-loaded processes: cuInit(0) is not
+        # fork-safe after CUDA initialization and can make Triton report no
+        # active driver from forked workers.
+        torch = sys.modules.get("torch")
+        if torch is not None:
+            return torch.cuda.is_available() and torch.version.hip is None
         return _cuda_driver_is_active()
 
     def map_python_to_cpp_type(self, ty: str) -> str:

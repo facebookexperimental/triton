@@ -12,9 +12,10 @@ normalizes `local_alloc` ops for downstream code partitioning passes.
 
 ```
 doTaskIdPropagate       ← assigns async_task_id to all ops
+  → doConvertDescriptorLoadsToNVWS
   → doBufferAllocation  ← THIS STEP: channels + alloc hoisting
   → doMemoryPlanner     ← decides multi-buffering (buffer.copy)
-  → doCodePartitionPost ← inserts accumCnts, async copies, sync ops
+  → doCodePartition ← inserts accumCnts, async copies, sync ops
 ```
 
 `doBufferAllocation` creates single-copy buffers. Multi-buffering is
@@ -43,6 +44,14 @@ source that already use `#shared` layout.
 After layout normalization, merge `LocalAllocOp`s that have the same
 source value and the same `MemDescType` — replace duplicates with the
 first alloc.
+
+### Step 0.75: `hoistDescriptorLoadBuffers`
+
+Descriptor conversion has already replaced every `tt.descriptor_load` with a
+buffer-writing `nvws.descriptor_load`. Trace each NVWS destination through
+memdesc views to its backing `local_alloc` and hoist nested allocations to
+function scope. This makes descriptor buffers canonical before remaining
+tensor channels are discovered and before memory planning.
 
 ### Step 1: `collectAsyncChannels`
 
@@ -78,9 +87,9 @@ the backing allocation to function entry:
 
 - **Tensor-typed channels** (no existing alloc):
   Call `createLocalAlloc` which creates a new `LocalAllocOp` (SMEM)
-  or `TMEMAllocOp` (for 1D tensors on Blackwell ≥ cc100). For
-  post-channels (`isPost=true`), also inserts `LocalStoreOp` after
-  the producer and `LocalLoadOp` before the consumer.
+  or `TMEMAllocOp` (for 1D tensors on Blackwell ≥ cc100), and also
+  inserts a `LocalStoreOp` after the producer and a `LocalLoadOp`
+  before the consumer.
 
 Channels sharing the same producer value share the same buffer.
 
@@ -89,7 +98,7 @@ Channels sharing the same producer value share the same buffer.
 Split any remaining `local_alloc %val` (alloc-with-source) into
 `local_alloc` + `local_store %val`. This normalization exposes
 cross-partition SMEM dependencies as separate store ops, enabling
-downstream `doCodePartition`/`doCodePartitionPost` to detect them
+downstream `doCodePartition`/`doCodePartition` to detect them
 as channels.
 
 The `local_store`'s task ID determines the producer partition for the
@@ -100,6 +109,14 @@ This models a 1-producer to N-consumer channel — one TMA load writes the
 shared buffer and every consumer partition reads it — instead of duplicating
 the buffer per consumer.
 
+Before buffer allocation, `doConvertDescriptorLoadsToNVWS` replaces every
+`tt.descriptor_load` with a buffer-writing `nvws.descriptor_load`. A load whose
+only user is `local_store` writes directly to that store's allocation. Other
+loads, including bias loads followed by arithmetic, receive a descriptor-layout
+SMEM allocation and a `local_load` preserving the original tensor uses. This
+makes their transfer buffers visible to memory planning. No unconverted
+descriptor load is allowed past this point.
+
 ## Key Distinction
 
 `doBufferAllocation` does **not** insert:
@@ -107,7 +124,7 @@ the buffer per consumer.
 - Async copies or TMA lowering
 - Tokens or synchronization ops (barriers, acquire/release)
 
-Those are handled by `doCodePartition` / `doCodePartitionPost`.
+Those are handled by `doCodePartition` / `doCodePartition`.
 
 ## Key Functions
 
@@ -116,6 +133,7 @@ Those are handled by `doCodePartition` / `doCodePartitionPost`.
 | `doBufferAllocation` | `WSCodePartition.cpp` | Entry point |
 | `swapTransposedLocalAllocs` | `WSCodePartition.cpp` | Layout normalization for buffer sharing |
 | `mergeDuplicateLocalAllocs` | `WSCodePartition.cpp` | Dedup same-source allocs |
+| `hoistDescriptorLoadBuffers` | `WSCodePartition.cpp` | Hoist explicit NVWS descriptor destinations |
 | `collectAsyncChannels` | `WSCodePartition.cpp` | Channel discovery |
 | `reorderEpilogOps` | `WSCodePartition.cpp` | Epilogue store reordering |
 | `createBuffer` | `WSCodePartition.cpp` | Buffer creation / hoisting |

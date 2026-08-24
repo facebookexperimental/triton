@@ -7,9 +7,14 @@ add_triton_library(TritonGPUModuloCore
   ModuloScheduling/AMDLatencyModel.cpp
   ModuloScheduling/AMDWarpPipelinePartition.cpp
   ModuloScheduling/DataDependenceGraph.cpp
+  ModuloScheduling/JointSolverFallback.cpp
+  ModuloScheduling/JointSolverScheduler.cpp
   ModuloScheduling/ModuloReservationTable.cpp
   ModuloScheduling/SwingScheduler.cpp
   ModuloScheduling/ExhaustiveScheduler.cpp
+  ModuloScheduling/Z3ConstraintEncoder.cpp
+  ModuloScheduling/Z3JointSolver.cpp
+  ModuloScheduling/Z3JointSolutionValidator.cpp
   ModuloScheduling/ModuloScheduleGraph.cpp
 
   LINK_LIBS PUBLIC
@@ -18,7 +23,18 @@ add_triton_library(TritonGPUModuloCore
   MLIRTransformUtils
 )
 
+if(TRITON_ENABLE_Z3_JOINT_SOLVER)
+  target_compile_definitions(TritonGPUModuloCore
+    PRIVATE TRITON_ENABLE_Z3_JOINT_SOLVER=1
+  )
+  target_include_directories(TritonGPUModuloCore PRIVATE ${Z3_INCLUDE_DIR})
+  target_link_libraries(TritonGPUModuloCore PUBLIC ${Z3_LIBRARIES})
+endif()
+
 add_triton_library(NVHopperTransforms
+  Analyze2CTADependencies.cpp
+  Plan2CTAExchange.cpp
+  Materialize2CTAExchange.cpp
   MultiCTAReduction.cpp
   WarpSpecialization.cpp
   WarpSpecialization/CodePartitionUtility.cpp
@@ -34,6 +50,11 @@ add_triton_library(NVHopperTransforms
   WarpSpecialization/WSLowerMem.cpp
   WarpSpecialization/WSLowerToken.cpp
   WarpSpecialization/WSMemoryPlanner.cpp
+  WarpSpecialization/WSMemoryPlanOrdering.cpp
+  WarpSpecialization/WSMemoryPlanCost.cpp
+  WarpSpecialization/WSMemoryPlanCopies.cpp
+  WarpSpecialization/WSMemoryPlanSearch.cpp
+  WarpSpecialization/WSMemoryPlanPackers.cpp
   WarpSpecialization/WSSpecialize.cpp
   WarpSpecialization/SinkBroadcast.cpp
   WarpSpecialization/WSTMAStoreLowering.cpp
@@ -44,6 +65,7 @@ add_triton_library(NVHopperTransforms
   ModuloScheduling/ModuloSchedulePass.cpp
   ModuloScheduling/ModuloWSPartitionPass.cpp
   ModuloScheduling/LLMSchedulePass.cpp
+  ModuloScheduling/JointSolverSchedulePass.cpp
   ModuloScheduling/ModuloBufferAllocPass.cpp
   ModuloScheduling/ModuloExpandPass.cpp
   ModuloScheduling/ModuloLowerPass.cpp

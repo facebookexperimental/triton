@@ -82,6 +82,43 @@ def TritonGPUProxyFenceInsertion : Pass<"triton-nvidia-gpu-proxy-fence-insertion
   ];
 }
 
+def TritonNvidiaGPUFuseTMEMLoadReducePass : Pass<"triton-nvidia-tmem-load-reduce", "mlir::ModuleOp"> {
+  let summary = "Fuse tmem_load and reduce";
+
+  let description = [{
+    Fuse ttng.tmem_load followed by a row reduction into ttng.tmem_load with a
+    reduction op, to generate tcgen05.ld.red.
+  }];
+
+  let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect",
+                           "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect",
+                           "mlir::triton::TritonDialect"];
+}
+
+def TritonNvidiaGPUTMemBarrierInsertionPass : Pass<"triton-nvidia-gpu-tmem-barrier-insertion", "mlir::ModuleOp"> {
+  let summary = "Insert barriers to order tensor-memory reuse";
+
+  let description = [{
+    This pass inserts CTA barriers between tensor-memory accesses that reuse
+    aliasing physical tensor-memory storage and require ordering across logical
+    allocation lifetimes.
+  }];
+
+  let dependentDialects = [
+    "mlir::triton::gpu::TritonGPUDialect",
+    "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"
+  ];
+}
+
+def TritonNvidiaGPUClusterBarrierMbarAllocatorPass : Pass<"triton-nvidia-gpu-cluster-barrier-mbar-allocator", "mlir::ModuleOp"> {
+  let summary = "Allocate mbarriers for warp-specialized cluster barriers";
+
+  let dependentDialects = [
+    "mlir::triton::gpu::TritonGPUDialect",
+    "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"
+  ];
+}
+
 def TritonNvidiaGPUTMALoweringPass : Pass<"triton-nvidia-tma-lowering", "mlir::ModuleOp"> {
   let summary = "lower to TMA load/store operations";
 
@@ -92,6 +129,14 @@ def TritonNvidiaGPUTMALoweringPass : Pass<"triton-nvidia-tma-lowering", "mlir::M
   let dependentDialects = [
     "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"
   ];
+}
+
+def TritonNvidiaGPUTMAMulticastPass : Pass<"triton-nvidia-plan-tma-multicast", "mlir::ModuleOp"> {
+  let summary = "Plan compiler-selected TMA multicast groups";
+  let description = [{
+    Annotates eligible descriptor loads with cluster axes across which their
+    source tile is statically invariant.
+  }];
 }
 
 def TritonNvidiaGPUTMAStoreBufferReusePass
@@ -236,8 +281,17 @@ def TritonNvidiaGPUCheckMatmulTwoCTAPass : Pass<"triton-nvidia-check-matmul-two-
     Inspect all matmul operations and ensure they agree on the `two_ctas`
     setting. Propagate the chosen value to the module so later lowering steps
     can access it. Compilation fails if mixed configurations are detected, or if
-    one 2-CTA `tt.dot` consumes a value derived from another 2-CTA `tt.dot`.
+    one 2-CTA `tt.dot` consumes a value derived from another 2-CTA `tt.dot`
+    unless dependent chains are explicitly enabled.
   }];
+
+  let options = [
+    Option<"allowDependentChains", "allow-dependent-chains", "bool",
+           /*default=*/"false",
+           "Allow dependent 2-CTA matmul chains. This is an implementation "
+           "gate for kernels whose later 2-CTA distribution passes make the "
+           "dependent operands legal.">
+  ];
 }
 
 def TritonNvidiaGPUCLCSplitPass : Pass<"triton-nvidia-gpu-clc-split", "mlir::ModuleOp"> {
@@ -271,22 +325,51 @@ def TritonNvidiaGPUCLCHoistPass : Pass<"triton-nvidia-gpu-clc-hoist", "mlir::Mod
 }
 
 def TritonNvidiaGPUCLCMaterializePass : Pass<"triton-nvidia-gpu-clc-materialize", "mlir::ModuleOp"> {
-  let summary = "Materialize the CLC token form into mbarrier ops (single-CTA only)";
+  let summary = "Materialize the CLC token form into response and reuse barriers";
 
   let description = [{
     Stage 4 of the CLC tile-scheduler lowering. Materializes each
     `clc_try_cancel_async` / `clc_read` pair into a response buffer + completion
-    mbarrier: the issue becomes `barrier_expect` + `clc_try_cancel`, the read
+    mbarrier. Explicit clusters also get an empty-barrier rendezvous that
+    prevents reuse until every CTA consumes the multicast. The issue becomes
+    `barrier_expect` + `clc_try_cancel`, and the read
     becomes `wait_barrier` + `clc_load_result` + `clc_is_canceled` /
     `clc_get_program_id`, with a loop-carried, per-iteration-toggled phase.
-    Supports a single CTA only; multi-cluster / multi-CTA is rejected.
+    Supports single-CTA and explicit ctas_per_cga program-id semantics;
+    Triton's num-ctas > 1 program-id model is rejected.
   }];
 
   let dependentDialects = [
     "mlir::triton::gpu::TritonGPUDialect",
     "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect",
+    "mlir::triton::nvgpu::NVGPUDialect",
     "mlir::arith::ArithDialect",
     "mlir::scf::SCFDialect"
+  ];
+}
+
+def TritonNvidiaGPUPromoteLoadToTMAPass : Pass<"triton-nvidia-promote-load-to-tma", "mlir::ModuleOp"> {
+  let summary = "Auto-promote eligible tt.load to a real TMA descriptor_load";
+
+  let description = [{
+    Analyze pointer-arithmetic patterns in tt.load operations. When a masked,
+    block-structured load is TMA-eligible (contiguous innermost dimension, rank
+    1-5, supported element type, >= 16 byte inner dim, zero OOB fill), rewrite it
+    into the explicit-TMA form -- tt.make_tensor_descriptor + tt.descriptor_load
+    -- so the standard nvidia TMA lowering turns it into an asynchronous TMA copy
+    on sm_90+. Non-eligible loads are left unchanged.
+  }];
+
+  let dependentDialects = [
+    "mlir::triton::TritonDialect",
+    "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect",
+    "mlir::arith::ArithDialect"
+  ];
+
+  let options = [
+    Option<"deviceMode", "device-mode", "bool", /*default=*/"false",
+           "Emit device-side tt.make_tensor_descriptor + descriptor_load/store "
+           "instead of host-side TMA recipes.">
   ];
 }
 

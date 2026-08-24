@@ -2,6 +2,7 @@
 
 #AL = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
 #A_SHARED = #ttg.swizzled_shared<{vec = 2, perPhase = 2, maxPhase = 4, order = [1, 0]}>
+#A_SHARED_T = #ttg.swizzled_shared<{vec = 2, perPhase = 2, maxPhase = 4, order = [0, 1]}>
 
 module attributes {"ttg.num-warps" = 4 : i32, "ttg.num-ctas" = 1 : i32} {
 // Check that we only get a single barrier when using AsyncWait
@@ -94,7 +95,55 @@ tt.func @pipelined_async_copy_local_to_global_3(%A: !tt.ptr<f16>, %B: !tt.ptr<f1
   tt.return
 }
 
-// Check that we do not get a barrier for LocalLoad if the token comes from a previous loop iteration
+// A wait only orders the async producer before the local consumer. It does not
+// release the consumed LDS slot for a later cooperative refill. Reusing the
+// same ring slot therefore needs a second workgroup barrier after local_load.
+// CHECK-LABEL: same_slot_refill_after_async_wait
+tt.func @same_slot_refill_after_async_wait(%A: !tt.ptr<f16>, %B: !tt.ptr<f16>) {
+  %c0_i32 = arith.constant 0 : i32
+  %offset = arith.constant dense<0> : tensor<128x32xi32, #AL>
+  %alloc = ttg.local_alloc : () -> !ttg.memdesc<2x128x32xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  %slot0 = ttg.memdesc_index %alloc[%c0_i32] : !ttg.memdesc<2x128x32xf16, #A_SHARED, #ttg.shared_memory, mutable> -> !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable>
+
+  %async0 = amdg.buffer_load_to_local %A[%offset] into %slot0 : <f16>[tensor<128x32xi32, #AL>] -> <128x32xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  %commit0 = ttg.async_commit_group tokens %async0
+  %wait0 = amdg.async_wait %commit0 {num_inst = 0 : i32}
+  // CHECK: amdg.async_wait
+  // CHECK-NEXT: ttg.barrier local
+  // CHECK-NEXT: ttg.local_load
+  // CHECK-NEXT: ttg.barrier local
+  // CHECK-NEXT: amdg.buffer_load_to_local
+  %value = ttg.local_load %slot0 {ttg.amdg.syncedViaAsyncWait = true} : !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable> -> tensor<128x32xf16, #AL>
+  %async1 = amdg.buffer_load_to_local %B[%offset] into %slot0 : <f16>[tensor<128x32xi32, #AL>] -> <128x32xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  tt.return
+}
+
+// A different constant ring slot is independently owned, so precise allocation
+// slices must avoid a false release barrier after local_load.
+// CHECK-LABEL: distinct_slot_prefetch_after_async_wait
+tt.func @distinct_slot_prefetch_after_async_wait(%A: !tt.ptr<f16>, %B: !tt.ptr<f16>) {
+  %c0_i32 = arith.constant 0 : i32
+  %c1_i32 = arith.constant 1 : i32
+  %offset = arith.constant dense<0> : tensor<128x32xi32, #AL>
+  %alloc = ttg.local_alloc : () -> !ttg.memdesc<2x128x32xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  %slot0 = ttg.memdesc_index %alloc[%c0_i32] : !ttg.memdesc<2x128x32xf16, #A_SHARED, #ttg.shared_memory, mutable> -> !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  %slot1 = ttg.memdesc_index %alloc[%c1_i32] : !ttg.memdesc<2x128x32xf16, #A_SHARED, #ttg.shared_memory, mutable> -> !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  %slot0_t = ttg.memdesc_trans %slot0 {order=array<i32: 1,0>} : !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable> -> !ttg.memdesc<32x128xf16, #A_SHARED_T, #ttg.shared_memory, mutable>
+
+  %async0 = amdg.buffer_load_to_local %A[%offset] into %slot0 : <f16>[tensor<128x32xi32, #AL>] -> <128x32xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  %commit0 = ttg.async_commit_group tokens %async0
+  %wait0 = amdg.async_wait %commit0 {num_inst = 0 : i32}
+  // CHECK: amdg.async_wait
+  // CHECK-NEXT: ttg.barrier local
+  // CHECK-NEXT: ttg.local_load
+  // CHECK-NEXT: amdg.buffer_load_to_local
+  %value = ttg.local_load %slot0_t {ttg.amdg.syncedViaAsyncWait = true} : !ttg.memdesc<32x128xf16, #A_SHARED_T, #ttg.shared_memory, mutable> -> tensor<32x128xf16, #AL>
+  %async1 = amdg.buffer_load_to_local %B[%offset] into %slot1 : <f16>[tensor<128x32xi32, #AL>] -> <128x32xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  tt.return
+}
+
+// A loop-carried AsyncWait token orders the prior async producer, but reusing
+// the same allocation still needs a release barrier after LocalLoad.
 // CHECK-LABEL: async_wait_in_previous_loop_iteration
 tt.func @async_wait_in_previous_loop_iteration(%a_ptr: tensor<16x16x!tt.ptr<f16>, #AL>, %loopIterCount: i32) {
   %c0_i32 = arith.constant 0 : i32
@@ -106,10 +155,12 @@ tt.func @async_wait_in_previous_loop_iteration(%a_ptr: tensor<16x16x!tt.ptr<f16>
 
   // CHECK: cf.br
   %loop_result:1 = scf.for %arg14 = %c0_i32 to %loopIterCount step %c1_i32 iter_args(%arg10 = %2) -> (!ttg.async.token)  : i32 {
+    // CHECK: ttg.local_load
+    // CHECK-NEXT: ttg.barrier local
+    // CHECK-NEXT: ttg.async_copy_global_to_local
     %6 = ttg.local_load %alloc token %arg10 : !ttg.memdesc<16x16xf16, #A_SHARED, #ttg.shared_memory, mutable> -> tensor<16x16xf16, #AL>
     %7 = ttg.async_copy_global_to_local %a_ptr, %alloc : tensor<16x16x!tt.ptr<f16>, #AL> -> !ttg.memdesc<16x16xf16, #A_SHARED, #ttg.shared_memory, mutable>
 
-    // CHECK-NOT: ttg.barrier local
     // CHECK: ttg.async_wait
     %8 = ttg.async_wait %7 {num = 4 : i32}
     // CHECK: ttg.barrier local
@@ -163,7 +214,8 @@ tt.func @loop_carried_token_not_from_async_wait(%a_ptr: tensor<16x16x!tt.ptr<f16
 }
 
 
-// Check that we do not get a barrier for an if where both branches yield an AsyncToken from AsyncWait
+// Tokens from either branch order the next producer-to-consumer edge, but the
+// same-slot refill before the branch still needs a release barrier.
 // CHECK-LABEL: async_wait_inside_if
 tt.func @async_wait_inside_if(%cond: i1, %a_ptr: tensor<16x16x!tt.ptr<f16>, #AL>, %loopIterCount: i32) {
   %c0_i32 = arith.constant 0 : i32
@@ -176,8 +228,8 @@ tt.func @async_wait_inside_if(%cond: i1, %a_ptr: tensor<16x16x!tt.ptr<f16>, #AL>
   %loop_result:1 = scf.for %arg14 = %c0_i32 to %loopIterCount step %c1_i32 iter_args(%arg10 = %2) -> (!ttg.async.token)  : i32 {
     %6 = ttg.local_load %alloc token %arg10 : !ttg.memdesc<16x16xf16, #A_SHARED, #ttg.shared_memory, mutable> -> tensor<16x16xf16, #AL>
     // CHECK: ttg.local_load
-    // CHECK-NOT: ttg.barrier local
-    // CHECK: ttg.async_copy_global_to_local
+    // CHECK-NEXT: ttg.barrier local
+    // CHECK-NEXT: ttg.async_copy_global_to_local
     %7 = ttg.async_copy_global_to_local %a_ptr, %alloc : tensor<16x16x!tt.ptr<f16>, #AL> -> !ttg.memdesc<16x16xf16, #A_SHARED, #ttg.shared_memory, mutable>
     %103 = scf.if %cond -> (!ttg.async.token) {
       %8 = ttg.async_wait %7 {num = 4 : i32}

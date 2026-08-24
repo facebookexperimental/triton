@@ -1,10 +1,17 @@
 #include "ir.h"
 
+#include <algorithm>
+#include <cstring>
+#include <nanobind/nanobind.h>
+#include <nanobind/stl/function.h>
+#include <nanobind/stl/map.h>
+#include <nanobind/stl/optional.h>
+#include <nanobind/stl/pair.h>
+#include <nanobind/stl/string.h>
+#include <nanobind/stl/tuple.h>
+#include <nanobind/stl/unique_ptr.h>
+#include <nanobind/stl/vector.h>
 #include <optional>
-#include <pybind11/cast.h>
-#include <pybind11/functional.h>
-#include <pybind11/pybind11.h>
-#include <pybind11/stl.h>
 
 #include "mlir/Dialect/ControlFlow/IR/ControlFlow.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
@@ -61,13 +68,29 @@ void setAsyncTaskIds(mlir::Operation *op,
               DenseI32ArrayAttr::get(op->getContext(), sortedAsyncTaskIds));
 }
 
-namespace py = pybind11;
+namespace py = nanobind;
 using namespace mlir;
 using namespace triton;
 namespace tt = triton;
 namespace ttg = triton::gpu;
 namespace ttng = triton::nvidia_gpu;
 namespace ir {
+
+// Elementwise casts must keep an existing concrete tensor ownership unless
+// the caller explicitly supplies a different destination encoding.  The
+// An ordinary frontend cast may supply only shape and element type, so an
+// unencoded destination type would otherwise make arith.extf/truncf invalid
+// when its operand came from an explicit MFMA or distributed layout.
+static Type inheritTensorEncoding(Value src, Type dstType) {
+  auto srcTensorType = dyn_cast<RankedTensorType>(src.getType());
+  auto dstTensorType = dyn_cast<RankedTensorType>(dstType);
+  if (!srcTensorType || !dstTensorType || !srcTensorType.getEncoding() ||
+      dstTensorType.getEncoding())
+    return dstType;
+  return RankedTensorType::get(dstTensorType.getShape(),
+                               dstTensorType.getElementType(),
+                               srcTensorType.getEncoding());
+}
 
 // Pointer to the TritonOpBuilder class, used to register IR ops for third-party
 // dialects.
@@ -206,10 +229,14 @@ py::list getTensorDescMetadata(ModuleOp &mod) {
     auto descTy = dyn_cast<TensorDescInterface>(arg.getType());
     if (!descTy)
       continue;
+    // Skip compiler-synthesized auto-TMA descriptors: they have no
+    // user-provided Python arg and are surfaced to the launcher via
+    // getAutoTmaRecipes().
+    if (kernelFunc.getArgAttr(i, "tt.auto_tma"))
+      continue;
 
     bool isIm2Col = isa<ttng::TensorDescIm2ColType>(arg.getType());
-    auto blockType = descTy.getBlockType();
-    auto encoding = blockType.getEncoding();
+    auto encoding = descTy.getSharedLayout();
 
     py::dict metadata;
     if (isa<ttg::NVMMASharedEncodingAttr>(encoding)) {
@@ -220,21 +247,23 @@ py::list getTensorDescMetadata(ModuleOp &mod) {
         throw py::type_error("invalid TMA descriptor type");
       auto tmaMode = isIm2Col ? ttg::TMAMode::Im2Col : ttg::TMAMode::Tiled;
       auto blockSize =
-          ttng::getTMABlockShape(blockType, /*packedSize=*/false, tmaMode);
+          ttng::getTMABlockShape(descTy, /*packedSize=*/false, tmaMode);
       metadata["swizzle"] = *swizzle;
-      metadata["elem_size"] = blockType.getElementTypeBitWidth() / 8;
+      metadata["elem_size"] =
+          descTy.getElementType().getIntOrFloatBitWidth() / 8;
       metadata["elem_type"] = *elemType;
       metadata["block_size"] =
           std::vector<int>(blockSize.begin(), blockSize.end());
       metadata["fp4_padded"] = mmaEncoding && mmaEncoding.getFp4Padded();
       metadata["is_im2col"] = isIm2Col;
     } else {
-      auto blockShape = blockType.getShape();
+      auto blockShape = descTy.getShape();
       metadata["block_size"] =
           std::vector<int>(blockShape.begin(), blockShape.end());
-      metadata["elem_bits"] = blockType.getElementTypeBitWidth();
+      metadata["elem_bits"] = descTy.getElementType().getIntOrFloatBitWidth();
 
-      if (auto paddedEnc = dyn_cast<ttg::PaddedSharedEncodingAttr>(encoding)) {
+      if (auto paddedEnc =
+              dyn_cast_if_present<ttg::PaddedSharedEncodingAttr>(encoding)) {
         py::list intervalPaddingPairs;
         for (auto [interval, padding] : llvm::zip_equal(
                  paddedEnc.getIntervals(), paddedEnc.getPaddings())) {
@@ -244,11 +273,115 @@ py::list getTensorDescMetadata(ModuleOp &mod) {
           intervalPaddingPairs.append(pair);
         }
         metadata["interval_padding_pairs"] = intervalPaddingPairs;
-
-        auto blockShape = blockType.getShape();
       }
     }
     result.append(std::move(metadata));
+  }
+  return result;
+}
+
+// Surfaces compiler-synthesized auto-TMA descriptors (from PromoteLoadToTMA) to
+// the launcher. Each entry says how to build one CUtensorMap on the host from
+// existing scalar kernel args (base ptr / shape / stride), and which kernel
+// param slot (desc_arg_index) receives it.
+py::list getAutoTmaRecipes(ModuleOp &mod) {
+  py::list result;
+  auto arr = mod->getAttrOfType<ArrayAttr>("ttg.auto_tma_recipes");
+  if (!arr)
+    return result;
+  // Locate the kernel FuncOp so we can read the *final* (post-pass) block shape
+  // from each synthetic descriptor arg's type. WS / 2-CTA passes
+  // (Transform2CTALoads, WSDataPartition) halve the host-side tensordesc arg
+  // type in place but do NOT update this module attr, so the attr's block_shape
+  // is stale after data partitioning. Reading the live arg type keeps the
+  // host-built CUtensorMap's box dims in sync (parity with
+  // getTensorDescMetadata for user descriptors). Falls back to the attr's
+  // block_shape if the arg/type can't be resolved.
+  triton::FuncOp kernelFunc;
+  mod.walk([&](triton::FuncOp func) {
+    if (triton::isKernel(func)) {
+      kernelFunc = func;
+      return WalkResult::interrupt();
+    }
+    return WalkResult::skip();
+  });
+  // Required integer recipe fields: raise rather than silently defaulting to 0
+  // for a missing key. A defaulted desc_arg_index=0 would read the swizzle off
+  // the wrong arg, and elem_type=0 / elem_size=0 would build a malformed
+  // CUtensorMap on the launcher side.
+  auto getReqI = [](DictionaryAttr d, StringRef k) -> int {
+    auto a = d.getAs<IntegerAttr>(k);
+    if (!a) {
+      auto message =
+          std::string("auto-TMA recipe: missing required integer key '") +
+          k.str() + "'";
+      throw py::key_error(message.c_str());
+    }
+    return (int)a.getInt();
+  };
+  auto getIArr = [](DictionaryAttr d, StringRef k) -> std::vector<int> {
+    std::vector<int> v;
+    if (auto a = d.getAs<ArrayAttr>(k))
+      for (auto e : a)
+        v.push_back((int)cast<IntegerAttr>(e).getInt());
+    return v;
+  };
+  for (auto attr : arr) {
+    auto d = cast<DictionaryAttr>(attr);
+    py::dict r;
+    int descArgIdx = getReqI(d, "desc_arg_index");
+    r["desc_arg_index"] = descArgIdx;
+    r["base_ptr_arg_index"] = getReqI(d, "base_ptr_arg_index");
+    r["shape_arg_indices"] = getIArr(d, "shape_arg_indices");
+    r["stride_arg_indices"] = getIArr(d, "stride_arg_indices");
+    // block_shape + swizzle: read from the FINAL descriptor arg type.
+    // block_shape reflects WS / 2-CTA halving. swizzle must match the
+    // descriptor's shared encoding (assigned by optimize_descriptor_encoding)
+    // -- a GEMM dot operand's NVMMAShared swizzle differs from a box-geometry
+    // heuristic, so read it via getTMASwizzleMode (parity with
+    // getTensorDescMetadata). -1 means "derive host-side from box geometry"
+    // (non-NVMMAShared / rank<2).
+    //
+    // block_shape is also the ENCODED box (launch.h box_dim). The full tile can
+    // exceed the 256-element cuTensorMapEncodeTiled cap (e.g. BLOCK=512), so we
+    // clamp it to the SAME box getTMABlockShape produces for the device
+    // lowering (each dim <= 256; contig dim = swizzle element width). The
+    // descriptor_load /store keeps the full-block SMEM result and the device
+    // AsyncTMACopy lowering multi-copies this clamped box to fill it -- single
+    // source of truth with the device path (both call getTMABlockShape on the
+    // same encoding). A trailing min(256) floor covers the 1D / non-NVMMAShared
+    // / no-descriptor fallbacks (idempotent for the getTMABlockShape output).
+    std::vector<int> blockShape = getIArr(d, "block_shape");
+    int swizzle = -1;
+    if (kernelFunc && descArgIdx >= 0 &&
+        descArgIdx < (int)kernelFunc.getNumArguments()) {
+      Value descArg = kernelFunc.getArgument(descArgIdx);
+      if (auto descTy = dyn_cast<TensorDescInterface>(descArg.getType())) {
+        auto blockTy = descTy.getBlockType();
+        auto shp = blockTy.getShape();
+        blockShape.assign(shp.begin(), shp.end());
+        if (shp.size() >= 2 &&
+            isa<ttg::NVMMASharedEncodingAttr>(descTy.getSharedLayout())) {
+          auto sw = ttng::getTMASwizzleMode(descArg.getLoc(), descTy);
+          if (succeeded(sw))
+            swizzle = *sw;
+          auto box = ttng::getTMABlockShape(descTy, /*packedSize=*/false,
+                                            ttg::TMAMode::Tiled);
+          blockShape.assign(box.begin(), box.end());
+        }
+      }
+    }
+    // Floor every box dim at the 256-element hardware cap (idempotent after the
+    // getTMABlockShape clamp above; handles 1D / non-NVMMAShared descriptors).
+    for (auto &v : blockShape)
+      v = std::min(v, 256);
+    r["block_shape"] = blockShape;
+    r["swizzle"] = swizzle;
+    r["elem_type"] = getReqI(d, "elem_type");
+    r["elem_size"] = getReqI(d, "elem_size");
+    r["fp4_padded"] = getReqI(d, "fp4_padded");
+    r["fill_mode"] = getReqI(d, "fill_mode");
+    result.append(std::move(r));
   }
   return result;
 }
@@ -260,16 +393,16 @@ py::list getTensorDescMetadata(ModuleOp &mod) {
 /*****************************************************************************/
 using namespace ir;
 
-void init_triton_ir(py::module &&m) {
-  using ret = py::return_value_policy;
-  using namespace pybind11::literals;
+void init_triton_ir(py::module_ &m) {
+  using ret = py::rv_policy;
+  using namespace nanobind::literals;
 
-  py::enum_<PaddingOption>(m, "PADDING_OPTION", py::module_local())
+  py::enum_<PaddingOption>(m, "PADDING_OPTION")
       .value("PAD_ZERO", PaddingOption::PAD_ZERO)
       .value("PAD_NAN", PaddingOption::PAD_NAN)
       .export_values();
 
-  py::enum_<CacheModifier>(m, "CACHE_MODIFIER", py::module_local())
+  py::enum_<CacheModifier>(m, "CACHE_MODIFIER")
       .value("NONE", CacheModifier::NONE)
       .value("CA", CacheModifier::CA)
       .value("CG", CacheModifier::CG)
@@ -279,26 +412,26 @@ void init_triton_ir(py::module &&m) {
       .value("CV", CacheModifier::CV)
       .export_values();
 
-  py::enum_<MemSemantic>(m, "MEM_SEMANTIC", py::module_local())
+  py::enum_<MemSemantic>(m, "MEM_SEMANTIC")
       .value("ACQUIRE_RELEASE", MemSemantic::ACQUIRE_RELEASE)
       .value("ACQUIRE", MemSemantic::ACQUIRE)
       .value("RELEASE", MemSemantic::RELEASE)
       .value("RELAXED", MemSemantic::RELAXED)
       .export_values();
 
-  py::enum_<MemSyncScope>(m, "MEM_SYNC_SCOPE", py::module_local())
+  py::enum_<MemSyncScope>(m, "MEM_SYNC_SCOPE")
       .value("GPU", MemSyncScope::GPU)
       .value("CTA", MemSyncScope::CTA)
       .value("SYSTEM", MemSyncScope::SYSTEM)
       .export_values();
 
-  py::enum_<EvictionPolicy>(m, "EVICTION_POLICY", py::module_local())
+  py::enum_<EvictionPolicy>(m, "EVICTION_POLICY")
       .value("NORMAL", EvictionPolicy::NORMAL)
       .value("EVICT_FIRST", EvictionPolicy::EVICT_FIRST)
       .value("EVICT_LAST", EvictionPolicy::EVICT_LAST)
       .export_values();
 
-  py::enum_<RMWOp>(m, "ATOMIC_OP", py::module_local())
+  py::enum_<RMWOp>(m, "ATOMIC_OP")
       .value("ADD", RMWOp::ADD)
       .value("FADD", RMWOp::FADD)
       .value("AND", RMWOp::AND)
@@ -310,8 +443,7 @@ void init_triton_ir(py::module &&m) {
       .value("UMIN", RMWOp::UMIN)
       .value("UMAX", RMWOp::UMAX);
 
-  py::enum_<DescriptorReduceKind>(m, "DESCRIPTOR_REDUCE_KIND",
-                                  py::module_local())
+  py::enum_<DescriptorReduceKind>(m, "DESCRIPTOR_REDUCE_KIND")
       .value("NONE", DescriptorReduceKind::NONE)
       .value("ADD", DescriptorReduceKind::ADD)
       .value("AND", DescriptorReduceKind::AND)
@@ -322,16 +454,16 @@ void init_triton_ir(py::module &&m) {
       .value("INC", DescriptorReduceKind::INC)
       .value("DEC", DescriptorReduceKind::DEC);
 
-  py::enum_<RoundingMode>(m, "ROUNDING_MODE", py::module_local())
+  py::enum_<RoundingMode>(m, "ROUNDING_MODE")
       .value("RTZ", RoundingMode::RTZ)
       .value("RTNE", RoundingMode::RTNE)
       .value("RS", RoundingMode::RS);
 
-  py::enum_<PropagateNan>(m, "PROPAGATE_NAN", py::module_local())
+  py::enum_<PropagateNan>(m, "PROPAGATE_NAN")
       .value("NONE", PropagateNan::NONE)
       .value("ALL", PropagateNan::ALL);
 
-  py::enum_<InputPrecision>(m, "INPUT_PRECISION", py::module_local())
+  py::enum_<InputPrecision>(m, "INPUT_PRECISION")
       .value("TF32", InputPrecision::TF32)
       .value("TF32x3", InputPrecision::TF32x3)
       .value("IEEE", InputPrecision::IEEE)
@@ -339,7 +471,7 @@ void init_triton_ir(py::module &&m) {
       .value("BF16x6", InputPrecision::BF16x6)
       .export_values();
 
-  py::enum_<ScaleDotElemType>(m, "ScaleDotElemTypeTY", py::module_local())
+  py::enum_<ScaleDotElemType>(m, "ScaleDotElemTypeTY")
       .value("E4M3", ScaleDotElemType::E4M3)
       .value("E5M2", ScaleDotElemType::E5M2)
       .value("E2M3", ScaleDotElemType::E2M3)
@@ -349,18 +481,16 @@ void init_triton_ir(py::module &&m) {
       .value("FP16", ScaleDotElemType::FP16)
       .export_values();
 
-  py::class_<MLIRContext>(m, "context", py::module_local())
-      .def(py::init<>([]() {
-        return std::make_unique<MLIRContext>(MLIRContext::Threading::DISABLED);
-      }))
+  py::class_<MLIRContext>(m, "context")
+      .def(py::new_(
+          []() { return new MLIRContext(MLIRContext::Threading::DISABLED); }))
       .def("printOpOnDiagnostic",
            [](MLIRContext &self, bool v) { self.printOpOnDiagnostic(v); })
       .def("printStackTraceOnDiagnostic", [](MLIRContext &self, bool v) {
         self.printStackTraceOnDiagnostic(v);
       });
 
-  py::class_<SourceMgrDiagnosticHandler>(m, "source_mgr_diag",
-                                         py::module_local())
+  py::class_<SourceMgrDiagnosticHandler>(m, "source_mgr_diag")
       .def(py::init<llvm::SourceMgr &, MLIRContext *>());
 
   m.def("load_dialects", [](MLIRContext &context) {
@@ -386,7 +516,7 @@ void init_triton_ir(py::module &&m) {
     context.loadAllAvailableDialects();
   });
 
-  py::class_<Type>(m, "type", py::module_local())
+  py::class_<Type>(m, "type")
       .def("is_integer",
            [](Type &self, unsigned width) { return self.isInteger(width); })
       .def("is_fp16", &Type::isF16)
@@ -407,13 +537,13 @@ void init_triton_ir(py::module &&m) {
         return os.str();
       });
 
-  py::class_<FunctionType>(m, "function_type", py::module_local())
+  py::class_<FunctionType>(m, "function_type")
       .def("param_types", [](FunctionType &self) {
         return std::vector<Type>(self.getInputs().begin(),
                                  self.getInputs().end());
       });
 
-  py::class_<Location>(m, "location", py::module_local())
+  py::class_<Location>(m, "location")
       .def("__str__",
            [](Location &self) {
              std::string str;
@@ -435,7 +565,7 @@ void init_triton_ir(py::module &&m) {
         return std::nullopt;
       });
 
-  py::class_<Value>(m, "value", py::module_local())
+  py::class_<Value>(m, "value")
       .def(py::init<>())
       .def("set_attr",
            [](Value &self, std::string &name, Attribute &attr) -> void {
@@ -480,13 +610,13 @@ void init_triton_ir(py::module &&m) {
            [](Value &self, Location loc) { return self.setLoc(loc); })
       .def("get_loc", [](Value &self) { return self.getLoc(); });
 
-  py::class_<OpResult, Value>(m, "op_result", py::module_local());
+  py::class_<OpResult, Value>(m, "op_result");
 
-  py::class_<BlockArgument, Value>(m, "block_argument", py::module_local())
+  py::class_<BlockArgument, Value>(m, "block_argument")
       .def("get_loc", &BlockArgument::getLoc)
       .def("set_loc", &BlockArgument::setLoc);
 
-  py::class_<Region>(m, "region", py::module_local())
+  py::class_<Region>(m, "region")
       .def("get_parent_region", &Region::getParentRegion, ret::reference)
       .def("size", [](Region &self) { return self.getBlocks().size(); })
       .def("empty", &Region::empty)
@@ -500,11 +630,11 @@ void init_triton_ir(py::module &&m) {
         return self.addArgument(ty, loc);
       });
 
-  py::class_<Block>(m, "block", py::module_local())
+  py::class_<Block>(m, "block")
       .def("arg",
            [](Block &self, int index) -> BlockArgument {
              if (index >= self.getNumArguments())
-               throw pybind11::index_error("Block argument index out of range");
+               throw py::index_error("Block argument index out of range");
              return self.getArgument(index);
            })
       .def("add_argument",
@@ -566,7 +696,7 @@ void init_triton_ir(py::module &&m) {
       .def("erase", [](Block &self) { self.erase(); })
       .def("id", [](Block &self) { return (uint64_t)&self; });
 
-  py::class_<Attribute>(m, "attribute", py::module_local())
+  py::class_<Attribute>(m, "attribute")
       .def("__str__",
            [](Attribute &self) {
              std::string str;
@@ -576,12 +706,12 @@ void init_triton_ir(py::module &&m) {
            })
       .def("__eq__",
            [](Attribute &self, Attribute &other) { return self == other; });
-  py::class_<IntegerAttr, Attribute>(m, "integer_attr", py::module_local());
-  py::class_<BoolAttr, Attribute>(m, "bool_attr", py::module_local());
-  py::class_<UnitAttr, Attribute>(m, "unit_attr", py::module_local());
+  py::class_<IntegerAttr, Attribute>(m, "integer_attr");
+  py::class_<BoolAttr, Attribute>(m, "bool_attr");
+  py::class_<UnitAttr, Attribute>(m, "unit_attr");
 
   // Ops
-  py::class_<OpState>(m, "OpState", py::module_local())
+  py::class_<OpState>(m, "OpState")
       .def("set_attr",
            [](OpState &self, std::string &name, Attribute &attr) -> void {
              self->setAttr(name, attr);
@@ -591,14 +721,14 @@ void init_triton_ir(py::module &&m) {
       .def("get_result",
            [](OpState &self, unsigned idx) -> Value {
              if (idx >= self->getNumResults())
-               throw pybind11::index_error("Op result index out of range");
+               throw py::index_error("Op result index out of range");
              return self->getResult(idx);
            })
       .def(
           "get_region",
           [](OpState &self, unsigned idx) -> Region & {
             if (idx >= self->getNumRegions())
-              throw pybind11::index_error("Op region index out of range");
+              throw py::index_error("Op region index out of range");
             return self->getRegion(idx);
           },
           ret::reference)
@@ -606,7 +736,7 @@ void init_triton_ir(py::module &&m) {
           "get_body",
           [](scf::ForOp &self, unsigned idx) -> Block * {
             if (idx >= self->getNumRegions())
-              throw pybind11::index_error("Op region index out of range");
+              throw py::index_error("Op region index out of range");
             return self.getBody(idx);
           },
           ret::reference)
@@ -636,26 +766,26 @@ void init_triton_ir(py::module &&m) {
                  setupTritonDiagnosticHandler(self.getContext());
              return succeeded(verify(self.getOperation()));
            })
-      .def("get_operation", [](OpState &self) { return self.getOperation(); });
+      .def(
+          "get_operation", [](OpState &self) { return self.getOperation(); },
+          ret::reference);
 
   // scf Ops
-  py::class_<scf::ForOp, OpState>(m, "ForOp", py::module_local())
+  py::class_<scf::ForOp, OpState>(m, "ForOp")
       .def("get_induction_var", &scf::ForOp::getInductionVar);
 
-  py::class_<scf::IfOp, OpState>(m, "IfOp", py::module_local())
+  py::class_<scf::IfOp, OpState>(m, "IfOp")
       .def("get_then_block", &scf::IfOp::thenBlock, ret::reference)
       .def("get_else_block", &scf::IfOp::elseBlock, ret::reference)
       .def("get_then_yield", &scf::IfOp::thenYield)
       .def("get_else_yield", &scf::IfOp::elseYield);
-  py::class_<scf::YieldOp, OpState>(m, "YieldOp", py::module_local());
-  py::class_<scf::WhileOp, OpState>(m, "WhileOp", py::module_local())
+  py::class_<scf::YieldOp, OpState>(m, "YieldOp");
+  py::class_<scf::WhileOp, OpState>(m, "WhileOp")
       .def("get_before", &scf::WhileOp::getBefore, ret::reference)
       .def("get_after", &scf::WhileOp::getAfter, ret::reference);
+  py::class_<scf::ConditionOp, OpState>(m, "ConditionOp");
 
-  py::class_<scf::ConditionOp, OpState>(m, "ConditionOp", py::module_local());
-
-  py::class_<Operation, std::unique_ptr<Operation, py::nodelete>>(
-      m, "operation", py::module_local())
+  py::class_<Operation>(m, "operation")
       .def("get_name",
            [](Operation &self) {
              llvm::StringRef opName = self.getName().getStringRef();
@@ -673,7 +803,8 @@ void init_triton_ir(py::module &&m) {
              auto ret = self.getAttrOfType<StringAttr>(name);
              if (!ret)
                return py::none();
-             return py::str(ret.getValue().str());
+             auto s = ret.getValue().str();
+             return py::str(s.c_str(), s.size());
            })
       .def("get_int_attr",
            [](Operation &self, const std::string &name) -> py::object {
@@ -714,13 +845,13 @@ void init_triton_ir(py::module &&m) {
              auto ret = self.getAttrOfType<FlatSymbolRefAttr>(name);
              if (!ret)
                return py::none();
-             return py::str(ret.getValue().str());
+             auto s = ret.getValue().str();
+             return py::str(s.c_str(), s.size());
            });
 
   // dynamic_attr is used to transfer ownership of the MLIR context to the
   // module
-  py::class_<ModuleOp, OpState>(m, "module", py::module_local(),
-                                py::dynamic_attr())
+  py::class_<ModuleOp, OpState>(m, "module", py::dynamic_attr())
       .def("dump", &ModuleOp::dump)
       .def("str",
            [](ModuleOp &self) -> std::string {
@@ -806,13 +937,14 @@ void init_triton_ir(py::module &&m) {
              return py::bool_(ret.getValue());
            })
       .def("get_tensordesc_metadata", getTensorDescMetadata)
+      .def("get_auto_tma_recipes", getAutoTmaRecipes)
       .def("get_cuda_warnings",
            [](ModuleOp &self, int32_t computeCapability) -> py::list {
              py::list result;
              auto warnings =
                  mlir::triton::collectCudaWarnings(self, computeCapability);
              for (const auto &warning : warnings) {
-               result.append(py::str(warning));
+               result.append(py::str(warning.c_str()));
              }
              return result;
            })
@@ -844,31 +976,34 @@ void init_triton_ir(py::module &&m) {
           throw std::runtime_error("Parse MLIR file failed.");
         return module->clone();
       },
-      ret::take_ownership);
+      ret::move);
 
-  m.def("deduce_scale_factor",
-        [](Value &lhs, std::optional<Value> &lhsScale,
-           ScaleDotElemType lhsFormat, bool lhsKPack, Value &rhs,
-           std::optional<Value> &rhsScale, ScaleDotElemType rhsFormat,
-           bool rhsKPack) -> int32_t {
-          int32_t scaleFactor = 0;
-          std::string errMsg;
-          if (failed(DotScaledOp::deduceScaleFactor(
-                  lhs, lhsScale.value_or(Value()), lhsFormat, lhsKPack, rhs,
-                  rhsScale.value_or(Value()), rhsFormat, rhsKPack, scaleFactor,
-                  errMsg)))
-            throw std::runtime_error(errMsg);
-          return scaleFactor;
-        });
+  m.def(
+      "deduce_scale_factor",
+      [](std::vector<int64_t> &lhs,
+         std::optional<std::vector<int64_t>> &lhsScale,
+         ScaleDotElemType lhsFormat, bool lhsKPack, std::vector<int64_t> &rhs,
+         std::optional<std::vector<int64_t>> &rhsScale,
+         ScaleDotElemType rhsFormat, bool rhsKPack) -> int32_t {
+        int32_t scaleFactor = 0;
+        std::string errMsg;
+        if (failed(deduceScaleFactor(lhs, lhsScale, lhsFormat, lhsKPack, rhs,
+                                     rhsScale, rhsFormat, rhsKPack, scaleFactor,
+                                     errMsg)))
+          throw std::runtime_error(errMsg);
+        return scaleFactor;
+      },
+      py::arg("lhs"), py::arg("lhsScale").none(), py::arg("lhsFormat"),
+      py::arg("lhsKPack"), py::arg("rhs"), py::arg("rhsScale").none(),
+      py::arg("rhsFormat"), py::arg("rhsKPack"));
 
-  py::class_<FuncOp, OpState>(m, "function", py::module_local())
-      // .def_property_readonly("attrs", &ir::function::attrs)
+  py::class_<FuncOp, OpState>(m, "function")
+      // .def_prop_ro("attrs", &ir::function::attrs)
       // .def("add_attr", &ir::function::add_attr);
       .def("args",
            [](FuncOp &self, unsigned idx) -> BlockArgument {
              if (idx >= self.getNumArguments())
-               throw pybind11::index_error(
-                   "Function argument index out of range");
+               throw py::index_error("Function argument index out of range");
              return self.getArgument(idx);
            })
       .def("get_num_args", &FuncOp::getNumArguments)
@@ -880,24 +1015,25 @@ void init_triton_ir(py::module &&m) {
           "set_arg_attr",
           [](FuncOp &self, int arg_no, const std::string &name, int val) {
             if (arg_no >= self.getNumArguments())
-              throw pybind11::index_error(
-                  "Function argument index out of range");
+              throw py::index_error("Function argument index out of range");
             // set arg attributes "name" to value "val"
             auto attrTy = IntegerType::get(self.getContext(), 32);
             self.setArgAttr(arg_no, name, IntegerAttr::get(attrTy, val));
           },
           ret::reference)
       //  .def("has_attr", &::FuncOp::hasAttr)
-      .def_property_readonly("type", &FuncOp::getFunctionType)
+      .def_prop_ro("type", &FuncOp::getFunctionType)
       .def("reset_type", &FuncOp::setType);
 
-  py::class_<OpBuilder::InsertPoint>(m, "InsertPoint", py::module_local());
+  py::class_<mlir::OpBuilder>(m, "op_builder", py::dynamic_attr())
+      .def(py::init<MLIRContext *>());
 
+  py::class_<OpBuilder::InsertPoint>(m, "InsertPoint");
   // The builder binding is static so it persists throughout compilation,
   // letting DSL plugins (registerCustomOps) and third-party backends (TLX,
   // via getBuilderClass) register their ops on it separately.
-  static py::class_<TritonOpBuilder> TritonOpBuilderBinding(
-      m, "builder", py::module_local(), py::dynamic_attr());
+  static py::class_<TritonOpBuilder> TritonOpBuilderBinding(m, "builder",
+                                                            py::dynamic_attr());
   builderClassPtr = &TritonOpBuilderBinding;
   TritonOpBuilderBinding.def(py::init<MLIRContext *>())
       .def("get_op_builder", &TritonOpBuilder::getBuilder, ret::reference)
@@ -964,9 +1100,12 @@ void init_triton_ir(py::module &&m) {
       // Use arith.ConstantOp to create constants
       // Constants
       .def("get_int1",
-           [](TritonOpBuilder &self, bool v) -> Value {
+           [](TritonOpBuilder &self, py::object v) -> Value {
+             int truth = PyObject_IsTrue(v.ptr());
+             if (truth < 0)
+               throw py::python_error();
              return Value(self.create<arith::ConstantIntOp>(
-                 self.getBuilder().getI1Type(), v));
+                 self.getBuilder().getI1Type(), truth != 0));
            })
       .def("get_int8",
            [](TritonOpBuilder &self, int64_t v) -> Value {
@@ -1151,7 +1290,7 @@ void init_triton_ir(py::module &&m) {
               return NameLoc::get(nameAttr, *childLoc);
             return NameLoc::get(nameAttr);
           },
-          py::arg("name"), py::arg("child_loc") = py::none())
+          py::arg("name"), (py::arg("child_loc").none() = py::none()))
       .def("set_loc",
            [](TritonOpBuilder &self, const std::string &fileName, int line,
               int column) { self.setLastLoc(fileName, line, column); })
@@ -1159,23 +1298,27 @@ void init_triton_ir(py::module &&m) {
            [](TritonOpBuilder &self) -> Location { return self.getLastLoc(); })
 
       // Ops
-      .def("get_or_insert_function",
-           [](TritonOpBuilder &self, ModuleOp &module, std::string &funcName,
-              Type &funcType, std::string &visibility,
-              bool noinline) -> FuncOp {
-             if (Operation *funcOperation = module.lookupSymbol(funcName))
-               return llvm::dyn_cast<FuncOp>(funcOperation);
-             if (auto funcTy = dyn_cast<FunctionType>(funcType)) {
-               llvm::SmallVector<NamedAttribute> attrs = {
-                   NamedAttribute(
-                       self.getBuilder().getStringAttr("sym_visibility"),
-                       self.getBuilder().getStringAttr(visibility)),
-                   NamedAttribute(self.getBuilder().getStringAttr("noinline"),
-                                  self.getBuilder().getBoolAttr(noinline))};
-               return self.create<FuncOp>(funcName, funcTy, attrs);
-             }
-             throw std::invalid_argument("invalid function type");
-           })
+      .def(
+          "get_or_insert_function",
+          [](TritonOpBuilder &self, ModuleOp &module, std::string &funcName,
+             Type &funcType, std::string &visibility,
+             std::optional<bool> noinline) -> FuncOp {
+            if (Operation *funcOperation = module.lookupSymbol(funcName))
+              return llvm::dyn_cast<FuncOp>(funcOperation);
+            if (auto funcTy = dyn_cast<FunctionType>(funcType)) {
+              llvm::SmallVector<NamedAttribute> attrs = {
+                  NamedAttribute(
+                      self.getBuilder().getStringAttr("sym_visibility"),
+                      self.getBuilder().getStringAttr(visibility)),
+                  NamedAttribute(
+                      self.getBuilder().getStringAttr("noinline"),
+                      self.getBuilder().getBoolAttr(noinline.value_or(false)))};
+              return self.create<FuncOp>(funcName, funcTy, attrs);
+            }
+            throw std::invalid_argument("invalid function type");
+          },
+          py::arg("module"), py::arg("func_name"), py::arg("func_type"),
+          py::arg("visibility"), py::arg("noinline").none())
       .def(
           "create_block",
           [](TritonOpBuilder &self) -> Block * {
@@ -1250,17 +1393,19 @@ void init_triton_ir(py::module &&m) {
       // Cast instructions
       // Conversions for custom FP types (FP8 and non-standard rounding
       // modes)
-      .def("create_fp_to_fp",
-           [](TritonOpBuilder &self, Value &src, Type &dstType,
-              std::optional<RoundingMode> roundingMode) -> Value {
-             if (roundingMode.has_value())
-               return self.create<FpToFpOp>(
-                   dstType, src,
-                   RoundingModeAttr::get(self.getBuilder().getContext(),
-                                         roundingMode.value()));
-             else
-               return self.create<FpToFpOp>(dstType, src);
-           })
+      .def(
+          "create_fp_to_fp",
+          [](TritonOpBuilder &self, Value &src, Type &dstType,
+             std::optional<RoundingMode> roundingMode) -> Value {
+            if (roundingMode.has_value())
+              return self.create<FpToFpOp>(
+                  dstType, src,
+                  RoundingModeAttr::get(self.getBuilder().getContext(),
+                                        roundingMode.value()));
+            else
+              return self.create<FpToFpOp>(dstType, src);
+          },
+          py::arg("src"), py::arg("dstType"), py::arg("roundingMode").none())
       // Conversions for standard LLVM builtin types
       .def("create_bitcast",
            [](TritonOpBuilder &self, Value &src, Type &dstType) -> Value {
@@ -1284,11 +1429,13 @@ void init_triton_ir(py::module &&m) {
            })
       .def("create_fp_ext",
            [](TritonOpBuilder &self, Value &src, Type &dstType) -> Value {
-             return self.create<arith::ExtFOp>(dstType, src);
+             return self.create<arith::ExtFOp>(
+                 inheritTensorEncoding(src, dstType), src);
            })
       .def("create_fp_trunc",
            [](TritonOpBuilder &self, Value &src, Type &dstType) -> Value {
-             return self.create<arith::TruncFOp>(dstType, src);
+             return self.create<arith::TruncFOp>(
+                 inheritTensorEncoding(src, dstType), src);
            })
       .def("create_int_cast",
            [](TritonOpBuilder &self, Value &src, Type &dstType,
@@ -1333,6 +1480,10 @@ void init_triton_ir(py::module &&m) {
       .def("create_fsub",
            [](TritonOpBuilder &self, Value &lhs, Value &rhs) -> Value {
              return self.create<arith::SubFOp>(lhs, rhs);
+           })
+      .def("create_fneg",
+           [](TritonOpBuilder &self, Value &input) -> Value {
+             return self.create<arith::NegFOp>(input);
            })
       .def("create_mul",
            [](TritonOpBuilder &self, Value &lhs, Value &rhs) -> Value {
@@ -1578,14 +1729,18 @@ void init_triton_ir(py::module &&m) {
               EvictionPolicy evictionPolicy) -> void {
              self.create<StoreOp>(ptrs, value, cacheModifier, evictionPolicy);
            })
-      .def("create_masked_load",
-           [](TritonOpBuilder &self, Value &ptrs, Value &mask,
-              std::optional<Value> &other, CacheModifier cacheModifier,
-              EvictionPolicy evictionPolicy, bool isVolatile) -> Value {
-             return self.create<LoadOp>(ptrs, mask, other.value_or(Value()),
-                                        cacheModifier, evictionPolicy,
-                                        isVolatile);
-           })
+      .def(
+          "create_masked_load",
+          [](TritonOpBuilder &self, Value &ptrs, Value &mask,
+             std::optional<Value> &other, CacheModifier cacheModifier,
+             EvictionPolicy evictionPolicy, bool isVolatile) -> Value {
+            return self.create<LoadOp>(ptrs, mask, other.value_or(Value()),
+                                       cacheModifier, evictionPolicy,
+                                       isVolatile);
+          },
+          py::arg("ptrs"), py::arg("mask"), py::arg("other").none(),
+          py::arg("cacheModifier"), py::arg("evictionPolicy"),
+          py::arg("isVolatile"))
       .def("create_masked_store",
            [](TritonOpBuilder &self, Value &ptrs, Value &val, Value &mask,
               CacheModifier cacheModifier,
@@ -1595,27 +1750,32 @@ void init_triton_ir(py::module &&m) {
            })
       .def("create_tensor_descriptor_type",
            [](TritonOpBuilder &self, Type blockTy, bool isSigned) -> Type {
-             auto ctx = self.getContext();
-             return triton::TensorDescType::get(
-                 ctx, cast<RankedTensorType>(blockTy), isSigned);
+             auto rtt = cast<RankedTensorType>(blockTy);
+             return triton::TensorDescType::get(rtt.getShape(),
+                                                rtt.getElementType(), isSigned);
            })
       .def("create_reinterpret_tensor_descriptor",
            [](TritonOpBuilder &self, Value desc_ptr, Type blockTy) -> Value {
-             auto ctx = self.getContext();
+             auto rtt = cast<RankedTensorType>(blockTy);
              auto resultTy = triton::TensorDescType::get(
-                 ctx, cast<RankedTensorType>(blockTy));
+                 rtt.getShape(), rtt.getElementType(), rtt.getEncoding());
              return self.create<ttng::ReinterpretTensorDescOp>(resultTy,
                                                                desc_ptr);
            })
-      .def("create_descriptor_load",
-           [](TritonOpBuilder &self, Value desc, std::vector<Value> &indices,
-              CacheModifier cacheModifier,
-              EvictionPolicy evictionPolicy) -> Value {
-             auto descTy = cast<triton::TensorDescType>(desc.getType());
-             auto resTy = descTy.getSignlessBlockType();
-             return self.create<DescriptorLoadOp>(
-                 resTy, desc, indices, cacheModifier, evictionPolicy);
-           })
+      .def(
+          "create_descriptor_load",
+          [](TritonOpBuilder &self, Value desc, std::vector<Value> &indices,
+             CacheModifier cacheModifier, EvictionPolicy evictionPolicy,
+             std::optional<bool> multicast) -> Value {
+            auto descTy = cast<triton::TensorDescType>(desc.getType());
+            auto resTy = descTy.getSignlessBlockType();
+            auto op = self.create<DescriptorLoadOp>(
+                resTy, desc, indices, cacheModifier, evictionPolicy,
+                multicast.value_or(false));
+            return op;
+          },
+          py::arg("desc"), py::arg("indices"), py::arg("cacheModifier"),
+          py::arg("evictionPolicy"), py::arg("multicast").none())
       .def("create_descriptor_gather",
            [](TritonOpBuilder &self, Value desc, Value x_indices, Value y_index,
               Type type) -> Value {
@@ -1752,13 +1912,13 @@ void init_triton_ir(py::module &&m) {
       .def("create_get_program_id",
            [](TritonOpBuilder &self, int axis) -> Value {
              if (axis < 0 || axis > 3)
-               throw pybind11::index_error("program_id must be in [0,3]");
+               throw py::index_error("program_id must be in [0,3]");
              return self.create<GetProgramIdOp>(axis);
            })
       .def("create_get_num_programs",
            [](TritonOpBuilder &self, int axis) -> Value {
              if (axis < 0 || axis > 3)
-               throw pybind11::index_error("program_id must be in [0,3]");
+               throw py::index_error("program_id must be in [0,3]");
              return self.create<GetNumProgramsOp>(axis);
            })
       // CLC (Cluster Launch Control) scheduler - SM100+ (Blackwell).
@@ -1779,18 +1939,22 @@ void init_triton_ir(py::module &&m) {
              return self.create<DotOp>(c.getType(), a, b, c, inputPrecision,
                                        maxNumImpreciseAcc, twoCtas);
            })
-      .def("create_dot_scaled",
-           [](TritonOpBuilder &self, mlir::Value &lhs,
-              std::optional<mlir::Value> &lhs_scale,
-              ScaleDotElemType lhs_format, mlir::Value &rhs,
-              std::optional<mlir::Value> &rhs_scale,
-              ScaleDotElemType rhs_format, bool fast_math, bool lhs_k_pack,
-              bool rhs_k_pack, mlir::Value &c) -> mlir::Value {
-             return self.create<DotScaledOp>(
-                 c.getType(), lhs, rhs, c, lhs_scale.value_or(Value()),
-                 rhs_scale.value_or(Value()), lhs_format, rhs_format, fast_math,
-                 lhs_k_pack, rhs_k_pack);
-           })
+      .def(
+          "create_dot_scaled",
+          [](TritonOpBuilder &self, mlir::Value &lhs,
+             std::optional<mlir::Value> &lhs_scale, ScaleDotElemType lhs_format,
+             mlir::Value &rhs, std::optional<mlir::Value> &rhs_scale,
+             ScaleDotElemType rhs_format, bool fast_math, bool lhs_k_pack,
+             bool rhs_k_pack, mlir::Value &c) -> mlir::Value {
+            return self.create<DotScaledOp>(
+                c.getType(), lhs, rhs, c, lhs_scale.value_or(Value()),
+                rhs_scale.value_or(Value()), lhs_format, rhs_format, fast_math,
+                lhs_k_pack, rhs_k_pack);
+          },
+          py::arg("lhs"), py::arg("lhs_scale").none(), py::arg("lhs_format"),
+          py::arg("rhs"), py::arg("rhs_scale").none(), py::arg("rhs_format"),
+          py::arg("fast_math"), py::arg("lhs_k_pack"), py::arg("rhs_k_pack"),
+          py::arg("c"))
       .def("create_floor",
            [](TritonOpBuilder &self, Value &val) -> Value {
              return self.create<math::FloorOp>(val);
@@ -1931,23 +2095,25 @@ void init_triton_ir(py::module &&m) {
            [](TritonOpBuilder &self, Type &type) -> Value {
              return self.create<ub::PoisonOp>(type);
            })
-      .def("create_histogram",
-           [](TritonOpBuilder &self, Value operand, int numBins,
-              std::optional<Value> mask) -> Value {
-             if (!mask) {
-               return self.create<HistogramOp>(
-                   RankedTensorType::get(
-                       {static_cast<int64_t>(numBins)},
-                       IntegerType::get(operand.getContext(), 32)),
-                   operand);
-             } else {
-               return self.create<HistogramOp>(
-                   RankedTensorType::get(
-                       {static_cast<int64_t>(numBins)},
-                       IntegerType::get(operand.getContext(), 32)),
-                   operand, *mask);
-             }
-           })
+      .def(
+          "create_histogram",
+          [](TritonOpBuilder &self, Value operand, int numBins,
+             std::optional<Value> mask) -> Value {
+            if (!mask) {
+              return self.create<HistogramOp>(
+                  RankedTensorType::get(
+                      {static_cast<int64_t>(numBins)},
+                      IntegerType::get(operand.getContext(), 32)),
+                  operand);
+            } else {
+              return self.create<HistogramOp>(
+                  RankedTensorType::get(
+                      {static_cast<int64_t>(numBins)},
+                      IntegerType::get(operand.getContext(), 32)),
+                  operand, *mask);
+            }
+          },
+          py::arg("operand"), py::arg("numBins"), py::arg("mask").none())
       .def("create_gather",
            [](TritonOpBuilder &self, Value src, Value indices, int axis)
                -> Value { return self.create<GatherOp>(src, indices, axis); })
@@ -1991,7 +2157,7 @@ void init_triton_ir(py::module &&m) {
     }
   }
 
-  py::class_<PassManager>(m, "pass_manager", py::module_local())
+  py::class_<PassManager>(m, "pass_manager")
       .def(py::init<MLIRContext *>())
       .def("enable_debug",
            [](PassManager &self) -> bool {
@@ -2121,6 +2287,8 @@ void init_triton_ir(py::module &&m) {
           py::call_guard<py::gil_scoped_release>());
 }
 
+namespace {
+
 bool str_eq_ignore_case(const char *s1, const char *s2, int n) {
   for (int i = 0; i < n; ++i) {
     if (tolower(s1[i]) != s2[i])
@@ -2129,17 +2297,10 @@ bool str_eq_ignore_case(const char *s1, const char *s2, int n) {
   return true;
 }
 
-int strlen_max(const char *str, int max) {
-  for (int i = 0; i <= max; ++i) {
-    if (str[i] == '\0') {
-      return i;
-    }
-  }
-  return 0;
-}
-
 bool is_truthy(char *str) {
-  int len = strlen_max(str, 4);
+  int len = strnlen(str, 5);
+  if (len > 4)
+    return false;
   switch (len) {
   case 1:
     return str[0] == '1' || tolower(str[0]) == 'y';
@@ -2194,13 +2355,15 @@ PyObject *py_getenv_bool(PyObject *self, PyObject *const *args,
   return res;
 }
 
-static PyMethodDef ModuleMethods[] = {
+PyMethodDef ModuleMethods[] = {
     {"getenv", (PyCFunction)py_getenv, METH_FASTCALL, NULL},
     {"getenv_bool", (PyCFunction)py_getenv_bool, METH_FASTCALL, NULL},
     {NULL, NULL, 0, NULL} // sentinel
 };
 
-void init_triton_env_vars(py::module &m) {
+} // namespace
+
+void init_triton_env_vars(py::module_ &m) {
   m.def("get_cache_invalidating_env_vars",
         []() -> std::map<std::string, std::string> {
           std::map<std::string, std::string> ret;

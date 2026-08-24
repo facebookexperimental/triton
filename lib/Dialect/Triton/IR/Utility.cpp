@@ -129,3 +129,45 @@ std::optional<ConstantIntRanges> tt::getBoundFromCmpOp(arith::CmpIOp cmpOp,
   }
   return {};
 }
+
+bool tt::encodingContainsTlxPlaceholder(Attribute attr) {
+  if (!attr)
+    return false;
+  if (attr.getDialect().getNamespace() == "tlx")
+    return true;
+  bool found = false;
+  attr.walkImmediateSubElements(
+      [&](Attribute sub) { found |= tt::encodingContainsTlxPlaceholder(sub); },
+      [](Type) {});
+  return found;
+}
+
+bool tt::encodingContainsTlxNoVerifyLayout(Attribute attr) {
+  if (!attr)
+    return false;
+  if (attr.getAbstractAttribute().getName() == "tlx.no_verify_layout")
+    return true;
+  bool found = false;
+  attr.walkImmediateSubElements(
+      [&](Attribute sub) {
+        found |= tt::encodingContainsTlxNoVerifyLayout(sub);
+      },
+      [](Type) {});
+  return found;
+}
+
+Attribute tt::unwrapTlxWrappers(Attribute attr) {
+  while (attr && attr.getDialect().getNamespace() == "tlx") {
+    Attribute inner;
+    attr.walkImmediateSubElements(
+        [&](Attribute sub) {
+          if (!inner)
+            inner = sub;
+        },
+        [](Type) {});
+    if (!inner || inner == attr)
+      break;
+    attr = inner;
+  }
+  return attr;
+}

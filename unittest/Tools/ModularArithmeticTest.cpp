@@ -281,6 +281,85 @@ TEST_F(ModularArithmeticTest, ModSolveLinear_Basic) {
   EXPECT_EQ((A3.at(0, 0) * x3[0] + A3.at(0, 1) * x3[1]) % 7, b3[0] % 7);
 }
 
+TEST_F(ModularArithmeticTest, ModSolveLinear_RejectsCompositeModulus) {
+  ModMatrix A(1, 1, 4);
+  A.at(0, 0) = 2;
+
+  EXPECT_TRUE(modSolveLinear(A, {1}, 4).empty());
+  EXPECT_TRUE(modSolveLinear(A, {2}, 4).empty());
+}
+
+TEST_F(ModularArithmeticTest, ModSolveLinear_ExhaustivePrimeField) {
+  for (int64_t prime : {2, 3}) {
+    for (int matrixOrdinal = 0; matrixOrdinal < intPow(prime, 4);
+         ++matrixOrdinal) {
+      ModMatrix A(2, 2, prime);
+      int remaining = matrixOrdinal;
+      for (int row = 0; row < 2; ++row) {
+        for (int col = 0; col < 2; ++col) {
+          A.at(row, col) = remaining % prime;
+          remaining /= prime;
+        }
+      }
+
+      for (int64_t b0 = 0; b0 < prime; ++b0) {
+        for (int64_t b1 = 0; b1 < prime; ++b1) {
+          auto result = modSolveLinear(A, {b0, b1}, prime);
+          bool hasSolution = false;
+          for (int64_t x0 = 0; x0 < prime; ++x0) {
+            for (int64_t x1 = 0; x1 < prime; ++x1) {
+              hasSolution |=
+                  (A.at(0, 0) * x0 + A.at(0, 1) * x1) % prime == b0 &&
+                  (A.at(1, 0) * x0 + A.at(1, 1) * x1) % prime == b1;
+            }
+          }
+
+          EXPECT_EQ(!result.empty(), hasSolution)
+              << "prime=" << prime << " matrix=" << matrixOrdinal << " b={"
+              << b0 << "," << b1 << "}";
+        }
+      }
+    }
+  }
+}
+
+TEST_F(ModularArithmeticTest, TypedSolveStatus) {
+  ModMatrix identity(1, 1, 3);
+  identity.at(0, 0) = 1;
+  EXPECT_EQ(tryModSolveLinear(identity, {2}, 3).status,
+            ModularSolveStatus::Success);
+
+  ModMatrix zero(1, 1, 3);
+  zero.at(0, 0) = 0;
+  EXPECT_EQ(tryModSolveLinear(zero, {1}, 3).status,
+            ModularSolveStatus::NoSolution);
+
+  ModMatrix noVariables(1, 0, 3);
+  EXPECT_EQ(tryModSolveLinear(noVariables, {0}, 3).status,
+            ModularSolveStatus::Success);
+  EXPECT_EQ(tryModSolveLinear(noVariables, {1}, 3).status,
+            ModularSolveStatus::NoSolution);
+
+  ModMatrix composite(1, 1, 4);
+  composite.at(0, 0) = 2;
+  EXPECT_EQ(tryModSolveLinear(composite, {1}, 4).status,
+            ModularSolveStatus::Unsupported);
+
+  auto singularLift = tryModSolveLinearHensel(composite, {2}, 2, 2);
+  EXPECT_NE(singularLift.status, ModularSolveStatus::NoSolution);
+  EXPECT_TRUE(singularLift.status == ModularSolveStatus::Success ||
+              singularLift.status == ModularSolveStatus::Unsupported);
+}
+
+TEST_F(ModularArithmeticTest, TypedSolveStatus_CRTFactorReduction) {
+  ModMatrix A(1, 1, 135);
+  // The large representative is solvable mod 27 and inconsistent mod 5.
+  A.at(0, 0) = std::numeric_limits<int64_t>::max() - 132;
+
+  EXPECT_EQ(tryModSolveLinearCRT(A, {86}, 135).status,
+            ModularSolveStatus::NoSolution);
+}
+
 TEST_F(ModularArithmeticTest, ModSolveLinearHensel_Mod9) {
   // modulus = 9 = 3^2
   ModMatrix A(2, 2, 9);
@@ -383,6 +462,7 @@ TEST_F(ModularArithmeticTest, ModSolveLinearHensel_InvalidPrimeRejected) {
   EXPECT_TRUE(modSolveLinearHensel(A, b, /*prime=*/1, /*exponent=*/2).empty());
   EXPECT_TRUE(modSolveLinearHensel(A, b, /*prime=*/0, /*exponent=*/2).empty());
   EXPECT_TRUE(modSolveLinearHensel(A, b, /*prime=*/-3, /*exponent=*/2).empty());
+  EXPECT_TRUE(modSolveLinearHensel(A, b, /*prime=*/4, /*exponent=*/2).empty());
 }
 
 TEST_F(ModularArithmeticTest, ModSolveLinearCRT_Composite_Mod15) {

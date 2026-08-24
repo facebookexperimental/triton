@@ -1,7 +1,5 @@
 from ..ampere.mbarrier import MBarrierLayout, allocate_mbarrier, init, invalidate, wait
-from triton.experimental.gluon._runtime import jit
 from ..._core import _unwrap_if_constexpr, builtin
-from . import cluster
 
 __all__ = [
     "allocate_mbarrier",
@@ -42,8 +40,9 @@ def arrive(mbarrier, *, count=1, pred=True, _semantic=None):
         pred (bool): Scalar predicate. Operation is skipped if predicate is False. Defaults to True.
     """
     count = _unwrap_if_constexpr(count)
+    cta_mask = 0
     pred = _semantic.to_tensor(pred)
-    _semantic.builder.create_mbarrier_arrive(mbarrier.handle, count, pred.handle)
+    _semantic.builder.create_mbarrier_arrive(mbarrier.handle, count, cta_mask, pred.handle)
 
 
 @builtin
@@ -54,12 +53,3 @@ def fence_init_release_cluster(_semantic=None):
     Needs to be called together with cluster.barrier(relaxed=True).
     """
     _semantic.builder.create_fence_mbarrier_init_release_cluster()
-
-
-@jit
-def sync_cluster_init():
-    """
-    Ensure mbarrier initialization is visible across the CTA cluster.
-    """
-    fence_init_release_cluster()
-    cluster.barrier(relaxed=True)

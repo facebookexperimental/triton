@@ -7,12 +7,25 @@
 // attributes for downstream pipelining passes.
 
 #include <cmath>
+#include <map>
+#include "lib/Dialect/TritonGPU/Transforms/WarpSpecialization/PartitionAttrs.h"
+#include <set>
+#include <tuple>
+
+#include "mlir/IR/Diagnostics.h"
+
+#include "JointSolverScheduler.h"
+#include "llvm/Support/JSON.h"
 
 #include "DataDependenceGraph.h"
+#include "JointSolverFallback.h"
+#include "JointSolverScheduler.h"
 #include "LatencyModel.h"
 #include "ModuloReservationTable.h"
+#include "ModuloScheduleDriver.h"
 #include "ModuloScheduleGraph.h"
 
+#include "mlir/Analysis/TopologicalSortUtils.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
@@ -36,6 +49,7 @@ int doTaskIdPropagate(triton::FuncOp &funcOp);
 #include "triton/Tools/Sys/GetEnv.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/Format.h"
+#include "llvm/Support/JSON.h"
 #include <queue>
 
 #include <limits>
@@ -48,6 +62,19 @@ using namespace mlir;
 namespace tt = triton;
 namespace ttg = triton::gpu;
 namespace ttng = triton::nvidia_gpu;
+
+/// TRITON_USE_MODULO_SCHEDULE value (and ScheduleDriverOptions::
+/// forceScheduleAlgo value) that selects the complete solver.
+static constexpr llvm::StringLiteral kJointSolverAlgo = "joint_solver";
+/// The algorithm a flag-off compile runs: Rau's IMS, what
+/// getActiveScheduleAlgo() reports when nothing is set. The terminal fallback
+/// names it explicitly so a fallback compile cannot inherit
+/// TRITON_USE_MODULO_SCHEDULE=joint_solver and loop forever.
+static constexpr llvm::StringLiteral kBaselineScheduleAlgo = "rau";
+/// Pass A.7's epilogue-subtile decision. The only IR attribute written before
+/// the lower-or-emit phase, so the only one a discarded attempt must restore.
+static constexpr llvm::StringLiteral kEpilogueSubtileAttrName =
+    "tt.epilogue_subtile";
 
 namespace {
 
@@ -71,12 +98,59 @@ namespace {
 //   tt.num_buffers — buffer depth (copies needed for lifetime coverage)
 //   buffer.id      — unique buffer index within the ScheduleGraph
 //
+// STANDALONE_MODULO with an exploration scheduler: emit ONLY the SWP schedule
+// (loop.stage/loop.cluster) and let downstream PartitionSchedulingMeta derive
+// partitions, exactly like the default/list-schedule path. In this mode we skip
+// every "modulo owns partitioning" marker (per-op ttg.partition, the epilogue
+// partition, ttg.partition_num_warps / ttg.partition.stages /
+// ttg.warp_specialize.tag, tt.modulo_ii, and the tt.autows MMA annotations) so
+// the IR stays partition-free and verifies without the follow-up WS passes.
+static bool isStandaloneModulo() {
+  if (!triton::tools::getBoolEnv("STANDALONE_MODULO"))
+    return false;
+  auto scheduler = triton::tools::getStrEnv("TRITON_USE_MODULO_SCHEDULE");
+  return scheduler == "exhaustive" || scheduler == "contracted";
+}
+
+// In STANDALONE mode the scheduler OWNS the loop schedule, so a tt.autows
+// annotation's stage/order fields would be a stale, conflicting schedule.
+// Strip them but KEEP the `channels` array: PromoteLHSToTMem (which runs
+// before this pass) and the downstream WS memory planner read the operand
+// memory-space hints ("opndA,tmem"/"opndA,smem") from there. If nothing but
+// the schedule was present, drop the attribute entirely so this loop reads as
+// unannotated to everything downstream.
+static void stripScheduleKeepMemtype(Operation *op) {
+  auto attr = op->getAttrOfType<StringAttr>("tt.autows");
+  if (!attr)
+    return;
+  auto parsed = llvm::json::parse(attr.getValue());
+  if (!parsed) {
+    llvm::consumeError(parsed.takeError());
+    return;
+  }
+  auto *obj = parsed->getAsObject();
+  if (!obj)
+    return;
+  obj->erase("stage");
+  obj->erase("order");
+  auto *channelsArr = obj->getArray("channels");
+  if (!channelsArr || channelsArr->empty()) {
+    op->removeAttr("tt.autows");
+    return;
+  }
+  std::string out;
+  llvm::raw_string_ostream os(out);
+  os << llvm::json::Value(std::move(*obj));
+  op->setAttr("tt.autows", StringAttr::get(op->getContext(), out));
+}
+
 static void emitScheduleFromGraph(scf::ForOp loop,
                                   const ttg::ScheduleGraph &graph,
                                   const ttg::DataDependenceGraph &ddg) {
   const auto &schedLoop = graph.getLoop(0);
   const int II = schedLoop.II;
   auto ctx = loop.getContext();
+  const bool standalone = isStandaloneModulo();
 
   // ── 1. Per-op: loop.stage / loop.cluster ──
   // Derive stage from cycle/II. Derive cluster from cycle ordering within
@@ -93,6 +167,18 @@ static void emitScheduleFromGraph(scf::ForOp loop,
     for (int i = 0, e = cycles.size(); i < e; ++i)
       stageAndCycleToCluster[stage][cycles[i]] = i;
   }
+  llvm::DenseMap<int, int> moduloCycleToCluster;
+  const bool contracted =
+      triton::tools::getStrEnv("TRITON_USE_MODULO_SCHEDULE") == "contracted";
+  if (contracted) {
+    SmallVector<int> moduloCycles;
+    for (const auto &node : schedLoop.nodes)
+      moduloCycles.push_back(node.cycle % II);
+    llvm::sort(moduloCycles);
+    moduloCycles.erase(llvm::unique(moduloCycles), moduloCycles.end());
+    for (int i = 0, e = moduloCycles.size(); i < e; ++i)
+      moduloCycleToCluster[moduloCycles[i]] = i;
+  }
 
   int maxStage = 0;
   for (const auto &node : schedLoop.nodes) {
@@ -104,7 +190,8 @@ static void emitScheduleFromGraph(scf::ForOp loop,
     if (opIt != ddg.getOpToIdx().end() && opIt->second != node.id)
       continue;
     int stage = node.cycle / II;
-    int clusterId = stageAndCycleToCluster[stage][node.cycle];
+    int clusterId = contracted ? moduloCycleToCluster[node.cycle % II]
+                               : stageAndCycleToCluster[stage][node.cycle];
     maxStage = std::max(maxStage, stage);
     node.op->setAttr(tt::kLoopStageAttrName,
                      IntegerAttr::get(IntegerType::get(ctx, 32), stage));
@@ -121,6 +208,14 @@ static void emitScheduleFromGraph(scf::ForOp loop,
       op.setAttr(tt::kLoopClusterAttrName,
                  IntegerAttr::get(IntegerType::get(ctx, 32), 0));
   }
+
+  // Standalone owns the schedule (loop.stage/loop.cluster above), so drop any
+  // stage/order carried on tt.autows — the scheduler's schedule is now
+  // authoritative — while keeping the operand memtype channels for the
+  // downstream WS memory planner.
+  if (standalone)
+    for (auto &op : loop.getBody()->without_terminator())
+      stripScheduleKeepMemtype(&op);
 
   // ── Default-partition selection (register-sink rule) ──
   // Default behavior: reserve partition 0 as an empty default warp group (the
@@ -184,135 +279,146 @@ static void emitScheduleFromGraph(scf::ForOp loop,
   };
   int numParts = (regDefault && defaultWg >= 0) ? (maxWg + 1) : (maxWg + 2);
 
-  // ── 1.5. Per-op: ttg.partition (= our Phase B warp-group decision) ──
-  // Emit the WG ID as a DenseI32ArrayAttr so the downstream WS pass
-  // (PartitionSchedulingMeta) can pick it up directly instead of
-  // re-deriving partitions from scratch. Skip ops with warpGroup<0
-  // (unassigned NONE/infrastructure ops) — the downstream pass will
-  // propagate them via SSA traversal.
-  for (const auto &node : schedLoop.nodes) {
-    if (!node.op)
-      continue;
-    auto opIt = ddg.getOpToIdx().find(node.op);
-    if (opIt != ddg.getOpToIdx().end() && opIt->second != node.id)
-      continue; // multi-stage super-node duplicate
-    // Reserve partition 0 as the DEFAULT warp group (runs the epilogue /
-    // non-specialized code), per the WS framework convention. Shift modulo's
-    // workers to partitions 1..N. Without this, the epilogue's tmem_load
-    // collapses into the MMA's partition (handleOperandD "Unexpected
-    // Producer").
-    int32_t wg;
-    if (node.warpGroup >= 0) {
-      wg = partOf(node.warpGroup);
-    } else if (!node.replicatedGroups.empty()) {
-      // Replicated infra op: its consumers span warp groups (e.g. case7's
-      // `iv * stride` offset feeding two parallel loads in different
-      // partitions). ttg.partition must be a SINGLE id (doTaskIdPropagate
-      // asserts size==1), so seed it with the lowest consumer partition; the
-      // backend's scalar task-id backward-propagation then clones it into the
-      // other consuming tasks (it's rematerializable scalar arith). The native
-      // backend has no per-task inlining step (unlike sched2tlx), so without a
-      // seed NVGPUWarpSpecialization rejects the loop ("op does not have
-      // expected attribute ttg.partition").
-      wg = partOf(*std::min_element(node.replicatedGroups.begin(),
-                                    node.replicatedGroups.end()));
-    } else {
-      continue; // warpGroup == -1 (no assigned consumers) — leave to backend.
-    }
-    node.op->setAttr(ttg::kPartitionAttrName,
-                     DenseI32ArrayAttr::get(ctx, ArrayRef<int32_t>{wg}));
-  }
-
-  // ── 1.5b. Function-scope EPILOGUE → default partition (id 0) ──
-  // The post-loop epilogue (e.g. the accumulator tmem_load -> divide -> truncf
-  // -> store chain) lives outside any partition. It must be assigned to the
-  // reserved default partition (0) so the backend anchors it AFTER the
-  // warp_specialize region; otherwise its tmem_load has no ordering dependency
-  // on the region and gets hoisted above the loop, reading the accumulator
-  // before the MMA writes it -> garbage. We derive the epilogue by walking
-  // forward from the loop's results (the dataflow that defines "post-loop"), so
-  // modulo owns this placement and the backend honors ttg.partition verbatim —
-  // no epilogue routing is needed in PartitionSchedulingMeta.
-  {
-    SmallVector<OpOperand *> worklist;
-    for (OpResult result : loop.getResults())
-      for (OpOperand &use : result.getUses())
-        worklist.push_back(&use);
-    DenseSet<Operation *> visited;
-    auto zeroPart = DenseI32ArrayAttr::get(ctx, ArrayRef<int32_t>{0});
-    while (!worklist.empty()) {
-      OpOperand *use = worklist.pop_back_val();
-      Operation *user = use->getOwner();
-      if (!visited.insert(user).second)
+  // Standalone mode skips all partition markers (§1.5–1.7 + tt.modulo_ii) so
+  // PartitionSchedulingMeta derives partitions from loop.stage/loop.cluster.
+  if (!standalone) {
+    // ── 1.5. Per-op: ttg.partition (= our Phase B warp-group decision) ──
+    // Emit the WG ID as a DenseI32ArrayAttr so the downstream WS pass
+    // (PartitionSchedulingMeta) can pick it up directly instead of
+    // re-deriving partitions from scratch. Skip ops with warpGroup<0
+    // (unassigned NONE/infrastructure ops) — the downstream pass will
+    // propagate them via SSA traversal.
+    for (const auto &node : schedLoop.nodes) {
+      if (!node.op)
         continue;
-      // Skip ops nested in a loop deeper than `loop` (those are not epilogue).
-      if (auto parent = user->getParentOfType<scf::ForOp>())
-        if (loop->isProperAncestor(parent))
+      auto opIt = ddg.getOpToIdx().find(node.op);
+      if (opIt != ddg.getOpToIdx().end() && opIt->second != node.id)
+        continue; // multi-stage super-node duplicate
+      // Reserve partition 0 as the DEFAULT warp group (runs the epilogue /
+      // non-specialized code), per the WS framework convention. Shift modulo's
+      // workers to partitions 1..N. Without this, the epilogue's tmem_load
+      // collapses into the MMA's partition (handleOperandD "Unexpected
+      // Producer").
+      int32_t wg;
+      if (node.warpGroup >= 0) {
+        wg = partOf(node.warpGroup);
+      } else if (!node.replicatedGroups.empty()) {
+        // Replicated infra op: its consumers span warp groups (e.g. case7's
+        // `iv * stride` offset feeding two parallel loads in different
+        // partitions). ttg.partition must be a SINGLE id (doTaskIdPropagate
+        // asserts size==1), so seed it with the lowest consumer partition; the
+        // backend's scalar task-id backward-propagation then clones it into the
+        // other consuming tasks (it's rematerializable scalar arith). The
+        // native backend has no per-task inlining step (unlike sched2tlx), so
+        // without a seed NVGPUWarpSpecialization rejects the loop ("op does not
+        // have expected attribute ttg.partition").
+        wg = partOf(*std::min_element(node.replicatedGroups.begin(),
+                                      node.replicatedGroups.end()));
+      } else {
+        continue; // warpGroup == -1 (no assigned consumers) — leave to backend.
+      }
+      node.op->setAttr(ttg::kPartitionAttrName,
+                       DenseI32ArrayAttr::get(ctx, ArrayRef<int32_t>{wg}));
+    }
+
+    // ── 1.5b. Function-scope EPILOGUE → default partition (id 0) ──
+    // The post-loop epilogue (e.g. the accumulator tmem_load -> divide ->
+    // truncf
+    // -> store chain) lives outside any partition. It must be assigned to the
+    // reserved default partition (0) so the backend anchors it AFTER the
+    // warp_specialize region; otherwise its tmem_load has no ordering
+    // dependency on the region and gets hoisted above the loop, reading the
+    // accumulator before the MMA writes it -> garbage. We derive the epilogue
+    // by walking forward from the loop's results (the dataflow that defines
+    // "post-loop"), so modulo owns this placement and the backend honors
+    // ttg.partition verbatim — no epilogue routing is needed in
+    // PartitionSchedulingMeta.
+    {
+      SmallVector<OpOperand *> worklist;
+      for (OpResult result : loop.getResults())
+        for (OpOperand &use : result.getUses())
+          worklist.push_back(&use);
+      DenseSet<Operation *> visited;
+      auto zeroPart = DenseI32ArrayAttr::get(ctx, ArrayRef<int32_t>{0});
+      while (!worklist.empty()) {
+        OpOperand *use = worklist.pop_back_val();
+        Operation *user = use->getOwner();
+        if (!visited.insert(user).second)
           continue;
-      // Do not override an existing partition assignment.
-      if (!user->hasAttr(ttg::kPartitionAttrName))
-        user->setAttr(ttg::kPartitionAttrName, zeroPart);
-      for (OpResult result : user->getResults())
-        for (OpOperand &nextUse : result.getUses())
-          worklist.push_back(&nextUse);
+        // Skip ops nested in a loop deeper than `loop` (those are not
+        // epilogue).
+        if (auto parent = user->getParentOfType<scf::ForOp>())
+          if (loop->isProperAncestor(parent))
+            continue;
+        // Do not override an existing partition assignment.
+        if (!user->hasAttr(ttg::kPartitionAttrName))
+          user->setAttr(ttg::kPartitionAttrName, zeroPart);
+        for (OpResult result : user->getResults())
+          for (OpOperand &nextUse : result.getUses())
+            worklist.push_back(&nextUse);
+      }
     }
-  }
 
-  // ── 1.6. Per-loop: ttg.partition_num_warps ──
-  // The per-partition warp count is a real schedule decision (Layer B): each
-  // warp group's count = max(minWarps) over its ops, snapped to {1,2,4,8}.
-  // Emit it as a DenseI32ArrayAttr indexed by partition id — the SAME shape as
-  // the final ttg.warp_specialize `partitionNumWarps` attr — so the downstream
-  // WS pass can honor modulo's choice instead of re-deriving from a binary
-  // tmem-presence heuristic. (Mirrors jsonDumpWarpGroups' num_warps.)
-  {
-    if (maxWg >= 0) {
-      // partOf maps warpGroup -> partition; index 0 is the default WG.
-      SmallVector<int32_t> numWarps(numParts, 1);
-      if (!(regDefault && defaultWg >= 0))
-        numWarps[0] = 4; // reserved empty default warp group (legacy)
-      for (int wg = 0; wg <= maxWg; ++wg)
-        numWarps[partOf(wg)] =
-            snapWarps(wgMaxMinWarps[wg] == 0 ? 1 : wgMaxMinWarps[wg]);
-      numWarps[0] = std::max<int32_t>(numWarps[0], 4); // default is a full WG
-      loop->setAttr("ttg.partition_num_warps",
-                    DenseI32ArrayAttr::get(ctx, numWarps));
+    // ── 1.6. Per-loop: ttg.partition_num_warps ──
+    // The per-partition warp count is a real schedule decision (Layer B): each
+    // warp group's count = max(minWarps) over its ops, snapped to {1,2,4,8}.
+    // Emit it as a DenseI32ArrayAttr indexed by partition id — the SAME shape
+    // as the final ttg.warp_specialize `partitionNumWarps` attr — so the
+    // downstream WS pass can honor modulo's choice instead of re-deriving from
+    // a binary tmem-presence heuristic. (Mirrors jsonDumpWarpGroups'
+    // num_warps.)
+    {
+      if (maxWg >= 0) {
+        // partOf maps warpGroup -> partition; index 0 is the default WG.
+        SmallVector<int32_t> numWarps(numParts, 1);
+        if (!(regDefault && defaultWg >= 0))
+          numWarps[0] = 4; // reserved empty default warp group (legacy)
+        for (int wg = 0; wg <= maxWg; ++wg)
+          numWarps[partOf(wg)] =
+              snapWarps(wgMaxMinWarps[wg] == 0 ? 1 : wgMaxMinWarps[wg]);
+        numWarps[0] = std::max<int32_t>(numWarps[0], 4); // default is a full WG
+        loop->setAttr("ttg.partition_num_warps",
+                      DenseI32ArrayAttr::get(ctx, numWarps));
+      }
     }
-  }
 
-  // ── 1.7. Per-loop: ttg.partition.stages + ttg.warp_specialize.tag ──
-  // These are exactly what PartitionSet::fromLoop() (the WS backend's
-  // honor-preset hook in PartitionSchedulingMeta::getInitialSchedule) requires.
-  // Emitting them makes the backend adopt modulo's ttg.partition assignment
-  // verbatim instead of re-deriving partitions from its own MMA-backward-slice
-  // heuristic — i.e. all partition decisions come from modulo. Ops modulo left
-  // unassigned (warpGroup<0 infra ops) are still filled in by the backend's
-  // propagatePartitions after fromLoop.
-  //
-  // Per-partition stage = max loop.stage over that partition's ops. This
-  // matches PSM's own convention (compute/MMA partition lands at the higher
-  // stage, loads/epilogue at stage 0); the value is otherwise only used for
-  // channel-buffering offsets. The tag is required to be present; PSM resets it
-  // to the loop's WS index during serialize.
-  {
-    if (maxWg >= 0) {
-      // Placed by partOf; index 0 (the default WG) defaults to stage 0 and is
-      // overwritten when reg-default makes a real consumer the default.
-      SmallVector<Attribute> stageAttrs(
-          numParts, IntegerAttr::get(IntegerType::get(ctx, 32), 0));
-      for (int wg = 0; wg <= maxWg; ++wg)
-        stageAttrs[partOf(wg)] =
-            IntegerAttr::get(IntegerType::get(ctx, 32), wgMaxStage[wg]);
-      loop->setAttr(ttg::kPartitionStagesAttrName,
-                    ArrayAttr::get(ctx, stageAttrs));
-      loop->setAttr(ttg::kWarpSpecializeTagAttrName,
-                    IntegerAttr::get(IntegerType::get(ctx, 32), 0));
+    // ── 1.7. Per-loop: ttg.partition.stages + ttg.warp_specialize.tag ──
+    // These are exactly what PartitionSet::fromLoop() (the WS backend's
+    // honor-preset hook in PartitionSchedulingMeta::getInitialSchedule)
+    // requires. Emitting them makes the backend adopt modulo's ttg.partition
+    // assignment verbatim instead of re-deriving partitions from its own
+    // MMA-backward-slice heuristic — i.e. all partition decisions come from
+    // modulo. Ops modulo left unassigned (warpGroup<0 infra ops) are still
+    // filled in by the backend's propagatePartitions after fromLoop.
+    //
+    // Per-partition stage = max loop.stage over that partition's ops. This
+    // matches PSM's own convention (compute/MMA partition lands at the higher
+    // stage, loads/epilogue at stage 0); the value is otherwise only used for
+    // channel-buffering offsets. The tag is required to be present; PSM resets
+    // it to the loop's WS index during serialize.
+    {
+      if (maxWg >= 0) {
+        // Placed by partOf; index 0 (the default WG) defaults to stage 0 and is
+        // overwritten when reg-default makes a real consumer the default.
+        SmallVector<Attribute> stageAttrs(
+            numParts, IntegerAttr::get(IntegerType::get(ctx, 32), 0));
+        for (int wg = 0; wg <= maxWg; ++wg)
+          stageAttrs[partOf(wg)] =
+              IntegerAttr::get(IntegerType::get(ctx, 32), wgMaxStage[wg]);
+        loop->setAttr(ttg::kPartitionStagesAttrName,
+                      ArrayAttr::get(ctx, stageAttrs));
+        loop->setAttr(ttg::kWarpSpecializeTagAttrName,
+                      IntegerAttr::get(IntegerType::get(ctx, 32), 0));
+      }
     }
-  }
+  } // end if (!standalone): partition markers
 
   // ── 2. Per-loop: tt.modulo_ii, tt.scheduled_max_stage ──
-  loop->setAttr("tt.modulo_ii",
-                IntegerAttr::get(IntegerType::get(ctx, 32), II));
+  // tt.modulo_ii is the "modulo owns partitioning" marker for PSM; skip it in
+  // standalone so PSM derives partitions from the schedule instead.
+  if (!standalone)
+    loop->setAttr("tt.modulo_ii",
+                  IntegerAttr::get(IntegerType::get(ctx, 32), II));
   loop->setAttr(tt::kScheduledMaxStageAttrName,
                 IntegerAttr::get(IntegerType::get(ctx, 32), maxStage));
 
@@ -507,7 +613,12 @@ static void emitMMAAnnotations(scf::ForOp loop,
     mmaDepthInStage[mma.nodeIdx] = depth;
   }
 
+  // tt.autows encodes modulo's per-MMA partition/stage decision; in standalone
+  // mode PSM owns partitioning, so leave the MMAs unannotated (their schedule
+  // is still carried by loop.stage/loop.cluster).
   for (auto &mma : mmas) {
+    if (isStandaloneModulo())
+      break;
     int cluster = mmaDepthInStage[mma.nodeIdx];
     std::string json = "{\"stage\": \"" + std::to_string(mma.stage) +
                        "\", \"order\": \"" + std::to_string(cluster) + "\"}";
@@ -595,6 +706,21 @@ convertDDGNode(const ttg::DDGNode &ddgNode, unsigned nodeId,
 /// Ops in the same stage are sorted by cycle; same cycle → same cluster,
 /// different cycle → different cluster (lower cycle = lower cluster ID).
 static void computeClusterIds(ttg::ScheduleLoop &loop) {
+  if (triton::tools::getStrEnv("TRITON_USE_MODULO_SCHEDULE") == "contracted") {
+    SmallVector<int> moduloCycles;
+    moduloCycles.reserve(loop.nodes.size());
+    for (const auto &node : loop.nodes)
+      moduloCycles.push_back(loop.II > 0 ? node.cycle % loop.II : node.cycle);
+    llvm::sort(moduloCycles);
+    moduloCycles.erase(llvm::unique(moduloCycles), moduloCycles.end());
+    for (auto &node : loop.nodes) {
+      int cycle = loop.II > 0 ? node.cycle % loop.II : node.cycle;
+      node.cluster =
+          llvm::lower_bound(moduloCycles, cycle) - moduloCycles.begin();
+    }
+    return;
+  }
+
   // Group node indices by stage
   llvm::DenseMap<int, SmallVector<unsigned>> stageToNodes;
   for (auto &node : loop.nodes) {
@@ -621,12 +747,14 @@ static void computeClusterIds(ttg::ScheduleLoop &loop) {
 }
 
 /// Build a ScheduleLoop for a loop. For super-nodes (nested loops), builds
-/// its own DDG and schedule recursively — works at any nesting depth.
-static unsigned buildScheduleLoop(scf::ForOp loop,
-                                  const ttg::DataDependenceGraph &ddg,
-                                  const ttg::ModuloScheduleResult &sched,
-                                  ttg::ScheduleGraph &graph,
-                                  const ttg::LatencyModel &model) {
+/// its own DDG and schedule recursively — works at any nesting depth, with
+/// `scheduleAlgo` (the driver's resolved backend) carried into every level.
+static unsigned buildScheduleLoop(
+    scf::ForOp loop, const ttg::DataDependenceGraph &ddg,
+    const ttg::ModuloScheduleResult &sched, ttg::ScheduleGraph &graph,
+    const ttg::LatencyModel &model, StringRef scheduleAlgo,
+    const llvm::DenseMap<Operation *, ttg::DataPartitionInfo> &partition =
+        llvm::DenseMap<Operation *, ttg::DataPartitionInfo>()) {
   unsigned loopId = graph.addLoop(loop);
   auto &schedLoop = graph.getLoop(loopId);
   schedLoop.II = sched.II;
@@ -666,12 +794,17 @@ static unsigned buildScheduleLoop(scf::ForOp loop,
 
     if (ddgNode.isSuperNode) {
       if (auto innerLoop = dyn_cast<scf::ForOp>(ddgNode.op)) {
-        auto childDDG = ttg::DataDependenceGraph::build(innerLoop, model);
+        // Pass A.5: build and schedule the child under the same partition so
+        // its dumped II / ScheduleNodes match the partitioned inner MMA.
+        auto childDDG = ttg::DataDependenceGraph::build(
+            innerLoop, model, partition, scheduleAlgo);
+        childDDG.applyDataPartition(partition);
         if (childDDG.getNumNodes() > 0) {
-          auto childSched = ttg::runModuloScheduling(childDDG);
+          auto childSched = ttg::runModuloScheduling(childDDG, scheduleAlgo);
           if (succeeded(childSched)) {
-            unsigned childId = buildScheduleLoop(innerLoop, childDDG,
-                                                 *childSched, graph, model);
+            unsigned childId =
+                buildScheduleLoop(innerLoop, childDDG, *childSched, graph,
+                                  model, scheduleAlgo, partition);
             sn.childPipelineId = childId;
             sn.prologueLatency = graph.getLoop(childId).prologueLatency;
           }
@@ -697,6 +830,7 @@ static unsigned buildScheduleLoop(scf::ForOp loop,
     se.dstId = dstIt->second;
     se.latency = ddgEdge.latency;
     se.distance = ddgEdge.distance;
+    se.srcResultIdx = ddgEdge.srcResultIdx;
     schedLoop.edges.push_back(se);
   }
 
@@ -725,16 +859,17 @@ static ttg::MemoryKind classifyMemoryKind(Operation *op) {
   return ttg::MemoryKind::Register;
 }
 
-/// Pass A.7-M4: pre-decide subtile factor for a descriptor_store op.
+/// Pass A.7: resolve the epilogue subtile factor S for a descriptor_store.
 ///
-/// Consulted by extractBufferShape so the SMEM staging buffer starts at
-/// (BM, BN/S) and the global SMEM reducer sees the shrunk size upfront —
-/// otherwise the reducer would cut K-loop pipeline depth based on the full
-/// store buffer, even if A.7 would later shrink it.
+/// Precedence: (1) env `TRITON_MODULO_EPILOGUE_SUBTILE` (2|4 force, any other
+/// value disables) overrides everything; (2) otherwise the auto-decision attr
+/// `tt.epilogue_subtile` set by `decideEpilogueSubtiles` from the cost model.
+/// The result is always clamped to legality (BN % S == 0 and BN/S >= 32, the
+/// 64-byte TMA min granularity for fp16).
 ///
-/// Today: env-override only (TRITON_MODULO_EPILOGUE_SUBTILE=2|4). The auto
-/// path (estimate K-loop SMEM + outer c_smem vs budget, pick smallest S that
-/// fits) is a follow-up — env override is enough for the demo.
+/// Consulted by extractBufferShape (shrink staging to (BM, BN/S) before the
+/// SMEM reducer runs), allocateBuffersForLoop (count→2), and
+/// markEpilogueSubtileNodes (emitter annotation) — so all three agree.
 static int getEpilogueSubtileForOp(Operation *op) {
   if (!isa<tt::DescriptorStoreOp>(op))
     return 1;
@@ -743,16 +878,21 @@ static int getEpilogueSubtileForOp(Operation *op) {
   if (!srcTy || srcTy.getRank() < 2)
     return 1;
   int BN = srcTy.getShape()[1];
-  auto env = triton::tools::getStrEnv("TRITON_MODULO_EPILOGUE_SUBTILE");
   int S = 0;
-  if (env == "2")
-    S = 2;
-  else if (env == "4")
-    S = 4;
-  // Min sub-tile width: 32 elements = 64 bytes for fp16, which is the
-  // TMA descriptor alignment minimum on Blackwell. The design doc gate
-  // is 64 (better TMA throughput); loosened here so the demo can use
-  // S=4 on the existing BN=128 case2 kernel.
+  auto env = triton::tools::getStrEnv("TRITON_MODULO_EPILOGUE_SUBTILE");
+  if (!env.empty()) {
+    // Manual override. "2"/"4" force; any other value (e.g. "0"/"1"/"off")
+    // disables, even if the cost model would have subtiled.
+    if (env == "2")
+      S = 2;
+    else if (env == "4")
+      S = 4;
+    else
+      S = 1;
+  } else if (auto attr =
+                 op->getAttrOfType<IntegerAttr>(kEpilogueSubtileAttrName)) {
+    S = static_cast<int>(attr.getInt());
+  }
   if (S > 1 && BN > 0 && BN % S == 0 && BN / S >= 32)
     return S;
   return 1;
@@ -831,27 +971,57 @@ static int walkLastConsumerEnd(const ttg::ScheduleLoop &loop, unsigned startId,
   return lastEnd;
 }
 
+/// The cycle at which a buffer's storage first becomes occupied.
+///
+/// For a TMA-loaded SMEM ring this is the load's ISSUE cycle, NOT the
+/// local_alloc's data-ready cycle. The TMA engine is multi-outstanding: it
+/// commits the ring slot for the whole transfer, and independent loads to
+/// different slots run concurrently, so the in-flight transfer window is part
+/// of the buffer's occupancy. The producer node (local_alloc) is a
+/// zero-latency rename scheduled AFTER the load completes, so its cycle already
+/// folds in the TMA latency — starting the lifetime there omits the transfer
+/// and under-provisions the prefetch ring (e.g. GEMM depth 3 vs the 5-6
+/// throughput optimum). Walk back through the producer's incoming data edges to
+/// any feeding TMA load and take the earliest issue cycle. (Scaling the modeled
+/// TMA latency does NOT help: it shifts both the load and the alloc by the same
+/// amount, leaving this span fixed.)
+static int bufferOccupancyStart(const ttg::ScheduleLoop &loop,
+                                unsigned producerNodeId) {
+  int start = loop.getNode(producerNodeId).cycle;
+  for (const auto &edge : loop.edges) {
+    if (edge.dstId != producerNodeId)
+      continue;
+    const auto &pred = loop.getNode(edge.srcId);
+    if (pred.pipeline == ttg::HWPipeline::TMA)
+      start = std::min(start, pred.cycle);
+  }
+  return start;
+}
+
 /// Step 3: Compute buffer count from cycle-level lifetime.
 ///
 /// Design doc formula:
 ///   lifetime(R) = lastConsumerEnd - producerStart
 ///   num_buffers(R) = floor(lifetime(R) / II) + 1
 ///
+/// producerStart is the buffer's occupancy start (bufferOccupancyStart), which
+/// for a TMA-loaded ring is the load issue cycle, not data-ready.
+///
 /// For loop-carried edges (distance > 0), the consumer in iteration i+d
 /// effectively ends at: consumerEnd + d * II (in absolute time).
 /// This is equivalent to adding d * II to the lifetime.
 static unsigned computeBufferCount(const ttg::ScheduleLoop &loop,
                                    unsigned producerNodeId) {
-  const auto &producer = loop.getNode(producerNodeId);
-  int prodCycle = producer.cycle;
   int II = loop.II;
   if (II <= 0)
     return 1;
 
+  int prodCycle = bufferOccupancyStart(loop, producerNodeId);
+
   llvm::DenseSet<unsigned> seen;
   seen.insert(producerNodeId);
-  int lastConsumerEnd =
-      walkLastConsumerEnd(loop, producerNodeId, prodCycle, II, 0, seen);
+  int lastConsumerEnd = walkLastConsumerEnd(
+      loop, producerNodeId, loop.getNode(producerNodeId).cycle, II, 0, seen);
 
   int lifetime = lastConsumerEnd - prodCycle;
   int numBuffers = lifetime / II + 1;
@@ -864,9 +1034,11 @@ static unsigned computeBufferCount(const ttg::ScheduleLoop &loop,
 
 // Which MMA bundles to partition and the matching TMEM accumulator allocs to
 // tag, computed once per module. `mmaInfo` keys the (inner-loop) MMA node — it
-// becomes a partition bundle with xN occupancy; `accInfo` keys the (outer-loop)
-// tmem_alloc whose ScheduleBuffer carries partition_count for the emitter's
-// per-group accumulator split.
+// becomes a partition bundle occupying max(full-tile occupancy, N x issue
+// cost): an M-split conserves MAC area, so only the per-sub-MMA issue floor
+// scales with N (see DataDependenceGraph::applyDataPartition). `accInfo` keys
+// the (outer-loop) tmem_alloc whose ScheduleBuffer carries partition_count for
+// the emitter's per-group accumulator split.
 struct DataPartitionPlan {
   llvm::DenseMap<Operation *, ttg::DataPartitionInfo> mmaInfo;
   llvm::DenseMap<Operation *, ttg::DataPartitionInfo> accInfo;
@@ -896,69 +1068,129 @@ static unsigned resolveDataPartitionFactor(Operation *mma, int optionFactor) {
   return 1;
 }
 
+// One legal way to M-split an MMA's accumulator: factor `n`, per-group tile
+// height `mSize`, and the TMEMAllocOp the accumulator traces to.
+struct DataPartitionCandidate {
+  Operation *mma = nullptr;
+  Operation *allocOp = nullptr;
+  unsigned n = 1;
+  unsigned mSize = 0;
+};
+
+// Enumerate every legal A.5 M-split (dim 0) of `op`'s accumulator: any N with
+// BM % N == 0 and BM/N >= max(64, TMEM blockM constraint), accumulator
+// traceable to a TMEMAllocOp. Single source of legality for both the planner
+// (which applies the user-resolved N) and the schedule-graph dump (which
+// lists every candidate so external tooling can compare splits).
+static SmallVector<DataPartitionCandidate>
+enumerateDataPartitionCandidates(Operation *op) {
+  SmallVector<DataPartitionCandidate> out;
+  Value acc;
+  if (auto m = dyn_cast<ttng::TCGen5MMAOp>(op))
+    acc = m.getAccumulator();
+  else if (auto m = dyn_cast<ttng::TCGen5MMAScaledOp>(op))
+    acc = m.getAccumulator();
+  else
+    return out;
+
+  auto accTy = dyn_cast<ttg::MemDescType>(acc.getType());
+  if (!accTy)
+    return out;
+  auto shape = ttg::getShapePerCTA(accTy);
+  if (shape.size() != 2)
+    return out;
+  int64_t bm = shape[0];
+  // The per-CTA TMEM block granularity along M: a group's accumulator must be a
+  // whole number of these blocks (a ragged M has no valid TMEM tiling).
+  int64_t blockM = 0;
+  if (auto tmem = dyn_cast<ttng::TensorMemoryEncodingAttr>(accTy.getEncoding()))
+    blockM = tmem.getBlockM() * tmem.getCGALayout().getCTASplitNum()[0];
+  int64_t minM = std::max<int64_t>(64, blockM);
+
+  // Trace the accumulator memdesc to its TMEMAllocOp. The persistent shape
+  // carries only the write-dep token as an inner-loop iter-arg, so the
+  // memdesc usually resolves to the outer alloc directly; peel a loop-carried
+  // memdesc iter-arg defensively.
+  Value root = acc;
+  if (auto ba = dyn_cast<BlockArgument>(root)) {
+    if (auto forOp = dyn_cast<scf::ForOp>(ba.getOwner()->getParentOp()))
+      if (OpOperand *init = forOp.getTiedLoopInit(ba))
+        root = init->get();
+  }
+  auto allocOp = root.getDefiningOp<ttng::TMEMAllocOp>();
+  if (!allocOp) {
+    LDBG("[A.5] skip MMA: accumulator TMEMAllocOp not found");
+    return out;
+  }
+
+  // TMEM holds at most kTmemLaneRows rows per CTA. A legal M-split brings each
+  // group's per-CTA M under that limit AND tiles it to whole blockM blocks;
+  // anything else is unallocatable (the TMEM allocator's findFirstFit asserts
+  // in debug / degenerates in release, and the op verifiers only check the
+  // encoding params, not total M). The upper bound has to live HERE, in the
+  // single source of candidates: the auto search filters it via tmemLegalFor,
+  // but the explicit-factor path (addMMAToPlanIfLegal) and the dumped
+  // data_partition_candidates surface both trust this list as-is.
+  constexpr int64_t kTmemLaneRows = 128;
+  for (int64_t n = 2; n * minM <= bm; ++n) {
+    if (bm % n != 0)
+      continue;
+    int64_t mSize = bm / n;
+    if (mSize > kTmemLaneRows)
+      continue;
+    if (blockM > 0 && mSize % blockM != 0)
+      continue;
+    out.push_back({op, allocOp.getOperation(), static_cast<unsigned>(n),
+                   static_cast<unsigned>(mSize)});
+  }
+  return out;
+}
+
 // Phase 1a: build the data-partition plan. M-split (dim 0) of each tc_gen5_mma
 // accumulator by factor N, when legal: BM % N == 0, BM/N >= 64, and the sliced
 // M still satisfies the TMEM blockM constraint. A/B SMEM operands stay shared
 // (untagged) — the emitter slices the full-A tile per group itself.
+// Add `op` to `plan` with factor N when N is one of its legal splits.
+static void addMMAToPlanIfLegal(Operation *op, unsigned N,
+                                DataPartitionPlan &plan) {
+  for (const auto &c : enumerateDataPartitionCandidates(op)) {
+    if (c.n != N)
+      continue;
+    ttg::DataPartitionInfo info{c.n, /*dim=*/0u, c.mSize};
+    plan.mmaInfo[op] = info;
+    plan.accInfo[c.allocOp] = info;
+    LDBG("[A.5] partition MMA N=" << c.n << " mSize=" << c.mSize);
+    return;
+  }
+  LDBG("[A.5] skip MMA: no legal M-split for N=" << N);
+}
+
 static DataPartitionPlan computeDataPartitionPlan(ModuleOp moduleOp,
                                                   int optionFactor) {
   DataPartitionPlan plan;
   moduleOp.walk([&](Operation *op) {
-    Value acc;
-    if (auto m = dyn_cast<ttng::TCGen5MMAOp>(op))
-      acc = m.getAccumulator();
-    else if (auto m = dyn_cast<ttng::TCGen5MMAScaledOp>(op))
-      acc = m.getAccumulator();
-    else
+    if (!isa<ttng::TCGen5MMAOp, ttng::TCGen5MMAScaledOp>(op))
       return;
-
     unsigned N = resolveDataPartitionFactor(op, optionFactor);
-    if (N <= 1)
-      return;
+    if (N > 1)
+      addMMAToPlanIfLegal(op, N, plan);
+  });
+  return plan;
+}
 
-    auto accTy = dyn_cast<ttg::MemDescType>(acc.getType());
-    if (!accTy)
+// A search-variant plan for the A.5 auto search: an MMA pinned by an explicit
+// `tt.data_partition_factor` attr keeps that factor; every other MMA gets the
+// searched `N` where it is a legal split. This is per-MMA, so a module that
+// pins one loop and auto-searches the rest resolves each MMA on its own terms
+// (the old whole-module behavior forced N=1 on the un-pinned loops).
+static DataPartitionPlan computeDataPartitionPlanForN(ModuleOp moduleOp,
+                                                      unsigned N) {
+  DataPartitionPlan plan;
+  moduleOp.walk([&](Operation *op) {
+    if (!isa<ttng::TCGen5MMAOp, ttng::TCGen5MMAScaledOp>(op))
       return;
-    auto shape = ttg::getShapePerCTA(accTy);
-    if (shape.size() != 2)
-      return;
-    int64_t bm = shape[0];
-    if (bm % static_cast<int64_t>(N) != 0)
-      return;
-    int64_t mSize = bm / static_cast<int64_t>(N);
-    if (mSize < 64) {
-      LDBG("[A.5] skip MMA: sliced M " << mSize << " < 64");
-      return;
-    }
-    if (auto tmem =
-            dyn_cast<ttng::TensorMemoryEncodingAttr>(accTy.getEncoding())) {
-      int64_t minM = tmem.getBlockM() * tmem.getCGALayout().getCTASplitNum()[0];
-      if (mSize < minM) {
-        LDBG("[A.5] skip MMA: sliced M " << mSize << " < TMEM blockM " << minM);
-        return;
-      }
-    }
-
-    // Trace the accumulator memdesc to its TMEMAllocOp. The persistent shape
-    // carries only the write-dep token as an inner-loop iter-arg, so the
-    // memdesc usually resolves to the outer alloc directly; peel a loop-carried
-    // memdesc iter-arg defensively.
-    Value root = acc;
-    if (auto ba = dyn_cast<BlockArgument>(root)) {
-      if (auto forOp = dyn_cast<scf::ForOp>(ba.getOwner()->getParentOp()))
-        if (OpOperand *init = forOp.getTiedLoopInit(ba))
-          root = init->get();
-    }
-    auto allocOp = root.getDefiningOp<ttng::TMEMAllocOp>();
-    if (!allocOp) {
-      LDBG("[A.5] skip MMA: accumulator TMEMAllocOp not found");
-      return;
-    }
-
-    ttg::DataPartitionInfo info{N, /*dim=*/0u, static_cast<unsigned>(mSize)};
-    plan.mmaInfo[op] = info;
-    plan.accInfo[allocOp.getOperation()] = info;
-    LDBG("[A.5] partition MMA N=" << N << " mSize=" << mSize);
+    unsigned pinned = resolveDataPartitionFactor(op, /*optionFactor=*/0);
+    addMMAToPlanIfLegal(op, pinned > 1 ? pinned : N, plan);
   });
   return plan;
 }
@@ -1029,6 +1261,12 @@ static void allocateBuffersForLoop(ttg::ScheduleLoop &loop,
     }
 
     buf.count = computeBufferCount(loop, node.id);
+    // Snapshot the pure lifetime-demanded depth NOW, before the A.5 depth-2
+    // floor and A.7 subtile bump below inflate `count`. The A.5 auto-search's
+    // SMEM-shortfall term is (requestedCount - reduced count) x bytes; sourcing
+    // requestedCount post-floor would book phantom shortfall against exactly
+    // the partitioned variants the floor applies to.
+    buf.requestedCount = buf.count;
     if (loopHasPartMMA && kind == ttg::MemoryKind::SMEM) {
       // Restrict the depth-2 floor to SMEM rings actually consumed by the
       // partitioned MMA (walking through transparent memdesc views). Other
@@ -1036,8 +1274,10 @@ static void allocateBuffersForLoop(ttg::ScheduleLoop &loop,
       // lifetime-derived count so we don't over-allocate SMEM.
       llvm::DenseSet<unsigned> seen;
       seen.insert(node.id);
-      if (bufferReachesPartMMA(loop, node.id, plan, seen))
+      if (bufferReachesPartMMA(loop, node.id, plan, seen)) {
+        buf.explicitMinCount = 2;
         buf.count = std::max<unsigned>(buf.count, 2u);
+      }
     }
     // No artificial minimum: trust the lifetime-based count from
     // `computeBufferCount`. Earlier code applied `std::max(count, 3u)`
@@ -1053,8 +1293,10 @@ static void allocateBuffersForLoop(ttg::ScheduleLoop &loop,
     // blackwell_gemm_ws tutorial overlap pattern. extractBufferShape
     // already shrank the shape; bump count here, after computeBufferCount
     // overwrote whatever it had set.
-    if (getEpilogueSubtileForOp(node.op) > 1)
+    if (getEpilogueSubtileForOp(node.op) > 1) {
+      buf.explicitMinCount = 2;
       buf.count = std::max<unsigned>(buf.count, 2u);
+    }
 
     loop.buffers.push_back(buf);
     node.producesBuffer = bufId;
@@ -1133,6 +1375,8 @@ static void allocateBuffersForLoop(ttg::ScheduleLoop &loop,
     bar.id = barId;
     bar.kind = ttg::MemoryKind::BARRIER;
     bar.count = loop.buffers[dataBufId].count;
+    bar.requestedCount = loop.buffers[dataBufId].requestedCount;
+    bar.explicitMinCount = loop.buffers[dataBufId].explicitMinCount;
     bar.defOp = loop.buffers[dataBufId].defOp;
     bar.pairedBufferId = dataBufId;
     loop.buffers[dataBufId].pairedBufferId = barId;
@@ -1196,17 +1440,137 @@ static int64_t computeTotalTmem(const ttg::ScheduleLoop &loop) {
   return computeTotalMemory(loop, ttg::MemoryKind::TMEM);
 }
 
+static llvm::DenseSet<unsigned>
+getSignalOnlyBufferIds(const ttg::ScheduleLoop &loop) {
+  llvm::DenseSet<unsigned> dataUsed;
+  for (const auto &node : loop.nodes) {
+    if (node.producesBuffer != UINT_MAX)
+      dataUsed.insert(node.producesBuffer);
+    for (unsigned bufferId : node.consumesBuffers)
+      dataUsed.insert(bufferId);
+  }
+  llvm::DenseSet<unsigned> forward, backward;
+  for (const auto &barrier : loop.crossGroupBarriers) {
+    if (barrier.pairedBufferId == UINT_MAX ||
+        barrier.producerNodeId >= loop.nodes.size() ||
+        barrier.consumerNodeId >= loop.nodes.size())
+      continue;
+    if (loop.nodes[barrier.producerNodeId].cycle >
+        loop.nodes[barrier.consumerNodeId].cycle)
+      backward.insert(barrier.pairedBufferId);
+    else
+      forward.insert(barrier.pairedBufferId);
+  }
+  llvm::DenseSet<unsigned> signalOnly;
+  for (unsigned bufferId : backward)
+    if (!forward.contains(bufferId) && !dataUsed.contains(bufferId))
+      signalOnly.insert(bufferId);
+  return signalOnly;
+}
+
+static bool emitterCanReuseSmemGroup(
+    const ttg::ScheduleLoop &loop, const ttg::PhysicalBuffer &physical) {
+  if (physical.memberBufferIds.size() < 2)
+    return true;
+  for (unsigned bufferId : physical.memberBufferIds) {
+    bool hasChannel = false;
+    for (const auto &barrier : loop.crossGroupBarriers) {
+      if (barrier.pairedBufferId != bufferId)
+        continue;
+      hasChannel = true;
+      if (barrier.producerNodeId >= loop.nodes.size() ||
+          barrier.consumerNodeId >= loop.nodes.size())
+        return false;
+      const auto &producer = loop.nodes[barrier.producerNodeId];
+      const auto &consumer = loop.nodes[barrier.consumerNodeId];
+      bool hardwareProducer =
+          producer.pipeline == ttg::HWPipeline::TMA ||
+          producer.pipeline == ttg::HWPipeline::TC ||
+          producer.pipeline == ttg::HWPipeline::MFMA;
+      if (producer.cycle > consumer.cycle || hardwareProducer)
+        return false;
+    }
+    if (!hasChannel)
+      return false;
+  }
+  return true;
+}
+
+static int64_t computeEmitterSmem(const ttg::ScheduleLoop &loop) {
+  int64_t total = computeTotalSmem(loop);
+  auto signalOnly = getSignalOnlyBufferIds(loop);
+  for (const auto &physical : loop.physicalBuffers) {
+    if (physical.kind != ttg::MemoryKind::SMEM)
+      continue;
+    int64_t privateBytes = 0;
+    for (unsigned bufferId : physical.memberBufferIds)
+      if (!signalOnly.contains(bufferId))
+        privateBytes += loop.buffers[bufferId].totalBytes();
+    if (privateBytes == 0)
+      total -= physical.totalBytes();
+    else if (!emitterCanReuseSmemGroup(loop, physical))
+      total += privateBytes - physical.totalBytes();
+  }
+  for (const auto &buffer : loop.buffers)
+    if (buffer.mergeGroupId == UINT_MAX && signalOnly.contains(buffer.id))
+      total -= buffer.totalBytes();
+  llvm::DenseSet<unsigned> seenPairedBuffers;
+  std::set<std::tuple<unsigned, unsigned, unsigned>> seenSignalBarriers;
+  for (const auto &barrier : loop.crossGroupBarriers) {
+    int64_t depth = std::max<unsigned>(barrier.depth, 1u);
+    if (barrier.pairedBufferId == UINT_MAX) {
+      auto key = std::make_tuple(barrier.producerNodeId,
+                                 barrier.consumerNodeId, barrier.distance);
+      if (seenSignalBarriers.insert(key).second)
+        total += depth * 8;
+      continue;
+    }
+    if (!seenPairedBuffers.insert(barrier.pairedBufferId).second)
+      continue;
+    bool fullAlreadyCounted = false;
+    if (barrier.pairedBufferId < loop.buffers.size()) {
+      unsigned barrierBufferId =
+          loop.buffers[barrier.pairedBufferId].pairedBufferId;
+      fullAlreadyCounted =
+          barrierBufferId < loop.buffers.size() &&
+          loop.buffers[barrierBufferId].kind == ttg::MemoryKind::BARRIER;
+    }
+    if (signalOnly.contains(barrier.pairedBufferId)) {
+      if (!fullAlreadyCounted)
+        total += depth * 8;
+      continue;
+    }
+    total += (fullAlreadyCounted ? 1 : 2) * depth * 8;
+  }
+  for (const auto &buffer : loop.buffers) {
+    if ((buffer.kind != ttg::MemoryKind::SMEM &&
+         buffer.kind != ttg::MemoryKind::TMEM) ||
+        buffer.shape.empty() || signalOnly.contains(buffer.id) ||
+        seenPairedBuffers.contains(buffer.id))
+      continue;
+    bool fullAlreadyCounted =
+        buffer.pairedBufferId < loop.buffers.size() &&
+        loop.buffers[buffer.pairedBufferId].kind == ttg::MemoryKind::BARRIER;
+    total += (fullAlreadyCounted ? 1 : 2) *
+             static_cast<int64_t>(buffer.count) * 8;
+  }
+  return total;
+}
+
 /// Compute the buffer lifetime (in cycles) for a given producer node.
 /// Walks transitively through transparent view ops (same as
 /// walkLastConsumerEnd) so the lifetime is consistent with the count
 /// computed by computeBufferCount.
 static int computeBufferLifetime(const ttg::ScheduleLoop &loop,
                                  unsigned producerNodeId) {
-  const auto &producer = loop.getNode(producerNodeId);
-  int prodCycle = producer.cycle;
+  // Occupancy starts at the TMA load issue for a TMA-loaded ring (matches
+  // computeBufferCount / bufferOccupancyStart), so the post-reduction II
+  // recompute sees the same resident span the depth was derived from.
+  int prodCycle = bufferOccupancyStart(loop, producerNodeId);
   llvm::DenseSet<unsigned> seen;
   int lastConsumerEnd =
-      walkLastConsumerEnd(loop, producerNodeId, prodCycle, loop.II, 0, seen);
+      walkLastConsumerEnd(loop, producerNodeId,
+                          loop.getNode(producerNodeId).cycle, loop.II, 0, seen);
   return lastConsumerEnd - prodCycle;
 }
 
@@ -1314,14 +1678,44 @@ buildCoConsumedGroups(const ttg::ScheduleLoop &loop) {
   return groups;
 }
 
-/// Reduce all buffers in a co-consumed group to the given depth.
-static void reduceGroupToDepth(ttg::ScheduleLoop &loop,
-                               const llvm::SmallVector<unsigned> &group,
-                               unsigned newDepth) {
-  for (unsigned bufId : group) {
-    if (loop.buffers[bufId].count > newDepth) {
-      loop.buffers[bufId].count = newDepth;
-      unsigned barId = loop.buffers[bufId].pairedBufferId;
+/// Reduce `bestIdx` together with every buffer it must stay equal-depth with,
+/// to `newDepth`. That set is the transitive closure over two relations:
+///   - co-consumed group: buffers feeding the same pipeline op share a ring
+///     depth;
+///   - merge group: buffers sharing one physical allocation, whose footprint is
+///     max(member.count) and whose members must stay equal for the emitter's
+///     reuse= aliasing (mergeNonOverlappingBuffers only groups equal counts).
+/// Reducing a single member would leave the physical footprint unchanged (so
+/// the budget loop would keep hammering that one member down to 1) and break
+/// the equal-count invariant. Paired barriers follow their data buffer.
+static void reduceBufferGroup(
+    ttg::ScheduleLoop &loop, unsigned bestIdx,
+    const llvm::SmallVector<llvm::SmallVector<unsigned>> &coGroups,
+    const llvm::DenseMap<unsigned, unsigned> &bufToGroupIdx,
+    unsigned newDepth) {
+  llvm::DenseSet<unsigned> toReduce;
+  llvm::SmallVector<unsigned> work;
+  work.push_back(bestIdx);
+  while (!work.empty()) {
+    unsigned b = work.pop_back_val();
+    if (b >= loop.buffers.size() || !toReduce.insert(b).second)
+      continue;
+    // Co-consumed peers (same ring depth).
+    auto git = bufToGroupIdx.find(b);
+    if (git != bufToGroupIdx.end())
+      for (unsigned m : coGroups[git->second])
+        work.push_back(m);
+    // Merge-group peers (same physical allocation).
+    unsigned mg = loop.buffers[b].mergeGroupId;
+    if (mg != UINT_MAX)
+      for (unsigned j = 0; j < loop.buffers.size(); ++j)
+        if (loop.buffers[j].mergeGroupId == mg)
+          work.push_back(j);
+  }
+  for (unsigned b : toReduce) {
+    if (loop.buffers[b].count > newDepth) {
+      loop.buffers[b].count = newDepth;
+      unsigned barId = loop.buffers[b].pairedBufferId;
       if (barId != UINT_MAX)
         loop.buffers[barId].count = newDepth;
     }
@@ -1336,21 +1730,6 @@ static void reduceGroupToDepth(ttg::ScheduleLoop &loop,
 /// The schedule (op placement) stays fixed — only II and buffer depths change.
 static bool reduceBuffersForBudget(ttg::ScheduleLoop &loop,
                                    int64_t smemReserved = 0) {
-  // Precompute buffer lifetimes (from the original schedule, before reduction).
-  llvm::DenseMap<unsigned, int> bufLifetimes;
-  for (unsigned i = 0; i < loop.buffers.size(); ++i) {
-    auto &buf = loop.buffers[i];
-    if (buf.kind == ttg::MemoryKind::BARRIER ||
-        buf.kind == ttg::MemoryKind::Register)
-      continue;
-    for (const auto &node : loop.nodes) {
-      if (node.producesBuffer == buf.id) {
-        bufLifetimes[i] = computeBufferLifetime(loop, node.id);
-        break;
-      }
-    }
-  }
-
   // Build co-consumed groups so we reduce them together.
   auto coGroups = buildCoConsumedGroups(loop);
   // Map bufId → group index for quick lookup.
@@ -1396,21 +1775,19 @@ static bool reduceBuffersForBudget(ttg::ScheduleLoop &loop,
     if (bestIdx < 0)
       break;
     unsigned newDepth = loop.buffers[bestIdx].count - 1;
-    // If this buffer is in a co-consumed group, reduce the whole group.
-    auto groupIt = bufToGroupIdx.find(bestIdx);
-    if (groupIt != bufToGroupIdx.end()) {
-      reduceGroupToDepth(loop, coGroups[groupIt->second], newDepth);
-      LLVM_DEBUG(llvm::dbgs()
-                 << "[Step4.6] Reduced co-consumed group (buf" << bestIdx
-                 << " + partners) to count=" << newDepth << "\n");
-    } else {
-      loop.buffers[bestIdx].count = newDepth;
-      unsigned barId = loop.buffers[bestIdx].pairedBufferId;
-      if (barId != UINT_MAX)
-        loop.buffers[barId].count = newDepth;
-      LLVM_DEBUG(llvm::dbgs() << "[Step4.6] Reduced SMEM buf" << bestIdx
-                              << " to count=" << newDepth << "\n");
-    }
+    // Reduce bestIdx together with its co-consumed AND merge-group peers, so
+    // the physical footprint actually drops and the equal-count invariants
+    // hold.
+    reduceBufferGroup(loop, bestIdx, coGroups, bufToGroupIdx, newDepth);
+    LLVM_DEBUG(llvm::dbgs()
+               << "[Step4.6] Reduced SMEM buf" << bestIdx
+               << " (+ co-consumed/merge peers) to count=" << newDepth << "\n");
+    // Refresh physical buffers so the next computeTotalSmem() reflects the
+    // reduced logical count. Without this the merge-group footprint stays
+    // frozen at the pre-reduction depth, the total never drops below budget,
+    // and the loop over-reduces every ring to count=1 — collapsing the pipeline
+    // to a serial (non-buffered) schedule.
+    buildPhysicalBuffers(loop);
   }
 
   // TMEM reduction
@@ -1429,33 +1806,49 @@ static bool reduceBuffersForBudget(ttg::ScheduleLoop &loop,
     }
     if (bestIdx < 0)
       break;
-    loop.buffers[bestIdx].count--;
-    unsigned barId = loop.buffers[bestIdx].pairedBufferId;
-    if (barId != UINT_MAX)
-      loop.buffers[barId].count = loop.buffers[bestIdx].count;
+    unsigned newDepth = loop.buffers[bestIdx].count - 1;
+    reduceBufferGroup(loop, bestIdx, coGroups, bufToGroupIdx, newDepth);
     LLVM_DEBUG(llvm::dbgs()
                << "[Step4.6] Reduced TMEM buf" << bestIdx
-               << " to count=" << loop.buffers[bestIdx].count << "\n");
+               << " (+ co-consumed/merge peers) to count=" << newDepth << "\n");
+    // Refresh physical buffers so the next computeTotalTmem() reflects the
+    // reduced logical count (see the SMEM loop above).
+    buildPhysicalBuffers(loop);
   }
 
-  // Recompute II from reduced buffer depths.
-  // new_II = max over all buffers of ceil(lifetime / depth).
+  // Recompute II from the reduced buffer depths:
+  //   new_II = max over buffers of ceil(lifetime / depth).
+  // For a loop-carried buffer (consumer distance d > 0) the lifetime itself
+  // grows with II -- lastConsumerEnd includes d*II -- so a single pass using
+  // lifetimes measured at the old II under-estimates II and can let the loader
+  // reclaim a slot before its loop-carried consumer finishes. Iterate to a
+  // fixed point: set the trial II, recompute lifetimes AT that II, take the
+  // tightest ceil(lifetime/depth), repeat. II only increases, so this
+  // converges; the iteration cap guards the depth <= d case (no feasible II --
+  // the budget check below then reports the residual overflow).
   int newII = originalII;
-  for (unsigned i = 0; i < loop.buffers.size(); ++i) {
-    auto &buf = loop.buffers[i];
-    if (buf.kind == ttg::MemoryKind::BARRIER ||
-        buf.kind == ttg::MemoryKind::Register)
-      continue;
-    auto it = bufLifetimes.find(i);
-    if (it == bufLifetimes.end() || buf.count <= 0)
-      continue;
-    int requiredII = (it->second + buf.count - 1) / buf.count;
-    if (requiredII > newII) {
-      LLVM_DEBUG(llvm::dbgs() << "[Step4.6] buf" << i << " lifetime="
-                              << it->second << " depth=" << buf.count
-                              << " → requires II=" << requiredII << "\n");
-      newII = requiredII;
+  for (int iter = 0; iter < 64; ++iter) {
+    loop.II = newII;
+    int trialII = originalII;
+    for (unsigned i = 0; i < loop.buffers.size(); ++i) {
+      auto &buf = loop.buffers[i];
+      if (buf.kind == ttg::MemoryKind::BARRIER ||
+          buf.kind == ttg::MemoryKind::Register || buf.count <= 0)
+        continue;
+      int lifetime = -1;
+      for (const auto &node : loop.nodes)
+        if (node.producesBuffer == buf.id) {
+          lifetime = computeBufferLifetime(loop, node.id);
+          break;
+        }
+      if (lifetime < 0)
+        continue;
+      trialII = std::max(
+          trialII, static_cast<int>((lifetime + buf.count - 1) / buf.count));
     }
+    if (trialII == newII)
+      break;
+    newII = trialII;
   }
 
   if (newII != originalII) {
@@ -1708,7 +2101,10 @@ static void computeBufferLifetimes(ttg::ScheduleLoop &loop) {
     for (const auto &node : loop.nodes) {
       if (node.producesBuffer != buf.id)
         continue;
-      buf.liveStart = node.cycle;
+      // Occupancy starts at the TMA load issue for a TMA-loaded ring (see
+      // bufferOccupancyStart), not the local_alloc's data-ready cycle. Keeps
+      // the merge-analysis live interval consistent with the buffer count.
+      buf.liveStart = bufferOccupancyStart(loop, node.id);
       // Walk transitively through transparent view ops (memdesc_trans /
       // memdesc_subview) so the buffer's live range reaches the actual
       // MMA / load / store that holds the SMEM, not just the metadata
@@ -2412,7 +2808,7 @@ constexpr double kInfeasiblePenalty = 1e7;
 // handwritten reference launches num_sms*4) can enable it via
 // TRITON_MODULO_CORES_PENALTY without a rebuild. case1's committed
 // footprint sits 12.9% above the 2-CTA SMEM bound (the nearest real
-// target).
+// target); see docs/SolverMigrationNotes.md.
 constexpr int kCoResidencyTargetCTAs = 2;
 static double coResidencyPenalty() {
   auto env = triton::tools::getStrEnv("TRITON_MODULO_CORES_PENALTY");
@@ -2871,6 +3267,12 @@ static CrossWGChannelSpec resolveCrossWGChannel(const ttg::ScheduleLoop &loop,
   const auto &src = loop.nodes[edge.srcId];
   const auto &dst = loop.nodes[edge.dstId];
 
+  Type resultTy;
+  if (src.op && edge.srcResultIdx < src.op->getNumResults())
+    resultTy = src.op->getResult(edge.srcResultIdx).getType();
+  if (!resultTy || !isa<ttg::MemDescType, RankedTensorType>(resultTy))
+    return spec;
+
   if (src.producesBuffer != UINT_MAX) {
     spec.pairedBuf = src.producesBuffer;
     spec.depth = loop.buffers[spec.pairedBuf].count;
@@ -2944,8 +3346,7 @@ static CrossWGChannelSpec resolveCrossWGChannel(const ttg::ScheduleLoop &loop,
     spec.depth = 1;
   }
   // Derive shape + element width from the producer's result type.
-  if (src.op && src.op->getNumResults() > 0) {
-    Type resTy = src.op->getResult(0).getType();
+  if (resultTy) {
     auto setFromShaped = [&](llvm::ArrayRef<int64_t> shape, Type elemTy) {
       if (!elemTy.isIntOrFloat())
         return;
@@ -2957,9 +3358,9 @@ static CrossWGChannelSpec resolveCrossWGChannel(const ttg::ScheduleLoop &loop,
         spec.shape.push_back(d);
       spec.elementBitWidth = elemTy.getIntOrFloatBitWidth();
     };
-    if (auto memDesc = dyn_cast<ttg::MemDescType>(resTy))
+    if (auto memDesc = dyn_cast<ttg::MemDescType>(resultTy))
       setFromShaped(memDesc.getShape(), memDesc.getElementType());
-    else if (auto tt = dyn_cast<RankedTensorType>(resTy))
+    else if (auto tt = dyn_cast<RankedTensorType>(resultTy))
       setFromShaped(tt.getShape(), tt.getElementType());
   }
   // No usable shape (scalar or unknown) → signal-only barrier, no buffer.
@@ -2985,7 +3386,7 @@ static int64_t
 predictChannelSmemBytes(const ttg::ScheduleLoop &loop,
                         const llvm::SmallDenseMap<unsigned, int> &nodeToWg) {
   int64_t total = 0;
-  llvm::SmallDenseSet<std::pair<unsigned, unsigned>, 8> seenPairs;
+  llvm::SmallDenseSet<std::tuple<unsigned, unsigned, unsigned>, 8> seenEdges;
   for (const auto &edge : loop.edges) {
     auto sIt = nodeToWg.find(edge.srcId);
     auto dIt = nodeToWg.find(edge.dstId);
@@ -2993,7 +3394,7 @@ predictChannelSmemBytes(const ttg::ScheduleLoop &loop,
       continue;
     if (sIt->second == dIt->second)
       continue;
-    if (!seenPairs.insert({edge.srcId, edge.dstId}).second)
+    if (!seenEdges.insert({edge.srcId, edge.dstId, edge.srcResultIdx}).second)
       continue;
     auto spec = resolveCrossWGChannel(loop, edge);
     if (!spec.synthesize)
@@ -3736,14 +4137,15 @@ static int getDumpTopN() {
   return n < 1 ? 1 : n;
 }
 
-/// Which partition variant to COMMIT for lowering, by cost-model rank — 0-based,
-/// matching `variant_id` in the TRITON_MODULO_DUMP_TOPN dump (0 = the rank-0
-/// winner). Default -1 = commit the winner. Set TRITON_MODULO_SELECT_VARIANT=k
-/// to instead lower the k-th-ranked partition as a single schedule, so you can
-/// empirically test whether the cost model's rank 0 is really the fastest (dump
-/// top-N, pick a variant_id, re-run with this flag to run just that one).
-/// Out-of-range clamps to the last available variant. Only the exhaustive
-/// partitioner enumerates variants; the greedy fallback has just one.
+/// Which partition variant to COMMIT for lowering, by cost-model rank —
+/// 0-based, matching `variant_id` in the TRITON_MODULO_DUMP_TOPN dump (0 = the
+/// rank-0 winner). Default -1 = commit the winner. Set
+/// TRITON_MODULO_SELECT_VARIANT=k to instead lower the k-th-ranked partition as
+/// a single schedule, so you can empirically test whether the cost model's rank
+/// 0 is really the fastest (dump top-N, pick a variant_id, re-run with this
+/// flag to run just that one). Out-of-range clamps to the last available
+/// variant. Only the exhaustive partitioner enumerates variants; the greedy
+/// fallback has just one.
 static int getSelectVariant() {
   auto v = triton::tools::getStrEnv("TRITON_MODULO_SELECT_VARIANT");
   if (v.empty())
@@ -3884,10 +4286,11 @@ static void partitionExhaustive(ttg::ScheduleLoop &loop,
   });
   const auto &winner = scored.front();
 
-  // Default: commit the cost-model winner (rank 0). TRITON_MODULO_SELECT_VARIANT
-  // overrides this to commit the k-th-ranked partition instead (0-based,
-  // matching variant_id in the TOPN dump) so a specific variant can be lowered
-  // and tested. Out-of-range clamps to the last available.
+  // Default: commit the cost-model winner (rank 0).
+  // TRITON_MODULO_SELECT_VARIANT overrides this to commit the k-th-ranked
+  // partition instead (0-based, matching variant_id in the TOPN dump) so a
+  // specific variant can be lowered and tested. Out-of-range clamps to the last
+  // available.
   size_t commitIdx = 0;
   if (int sel = getSelectVariant(); sel >= 0) {
     commitIdx = std::min<size_t>(sel, scored.size() - 1);
@@ -3979,26 +4382,26 @@ static constexpr int kReplicatedWarpGroup = -2;
 /// (`arith.muli → tt.descriptor_load`) and case3's `sem0_full`
 /// (`arith.addi → tt.descriptor_load`). Mirrors Meta's
 /// `TaskIdBackwardPropagation` (`isScalarArithOrMath`) treatment.
+/// Scalar arith/math on the CUDA pipe gets demoted to infra after
+/// partitioning (replicated into each consumer WG, no cross-WG hand-off).
+/// Tensor-result arith/math is real compute (extf, mulf, addf, truncf, ...)
+/// — those ARE anchors.
+static bool isDemotableScalarArith(const ttg::ScheduleNode &node) {
+  if (!node.op || node.pipeline != ttg::HWPipeline::CUDA)
+    return false;
+  StringRef dialect = node.op->getDialect()->getNamespace();
+  if (dialect != "arith" && dialect != "math")
+    return false;
+  for (auto t : node.op->getResultTypes())
+    if (isa<RankedTensorType>(t))
+      return false;
+  return true;
+}
+
 static void demoteScalarArithToInfra(ttg::ScheduleLoop &loop) {
   for (auto &node : loop.nodes) {
-    if (!node.op)
-      continue;
-    if (node.pipeline != ttg::HWPipeline::CUDA)
-      continue;
-    StringRef dialect = node.op->getDialect()->getNamespace();
-    if (dialect != "arith" && dialect != "math")
-      continue;
-    // Tensor-result arith/math is real compute (extf, mulf, addf,
-    // truncf, ...) — those ARE anchors.
-    bool isScalar = true;
-    for (auto t : node.op->getResultTypes())
-      if (isa<RankedTensorType>(t)) {
-        isScalar = false;
-        break;
-      }
-    if (!isScalar)
-      continue;
-    node.warpGroup = -1; // hand off to propagateWarpGroupToInfraOps
+    if (isDemotableScalarArith(node))
+      node.warpGroup = -1; // hand off to propagateWarpGroupToInfraOps
   }
 }
 
@@ -4089,7 +4492,7 @@ static void coLocateOperandAllocsWithLoads(ttg::ScheduleLoop &loop) {
 /// SMEM transfers (MEM→TC) → mbarrier with phase cycling.
 /// TMEM transfers (TC→CUDA) → named barrier.
 static void insertCrossGroupBarriers(ttg::ScheduleLoop &loop) {
-  llvm::DenseSet<std::pair<unsigned, unsigned>> seenBarrierPairs;
+  llvm::DenseSet<std::tuple<unsigned, unsigned, unsigned>> seenBarrierEdges;
   // A TC-free, memory-bound loop (e.g. LayerNorm) pipelines load→compute→store
   // across warp groups. Giving the TMA-load→compute channel depth-2 lets the
   // load warp run a full iteration ahead of compute (prefetch), which is what
@@ -4105,14 +4508,15 @@ static void insertCrossGroupBarriers(ttg::ScheduleLoop &loop) {
     if (src.warpGroup == dst.warpGroup)
       continue;
 
-    // Avoid duplicate barriers for the same (producer, consumer) pair.
+    // Avoid duplicate barriers for the same producer result and consumer.
     // Deduping BEFORE channel resolution also prevents the orphaned
     // duplicate channel buffer the old order created (a second edge between
     // the same pair — e.g. an op consuming the same value through two
     // operands — synthesized a second buffer, then skipped only the barrier
-    // record), and keeps the scoring-time predictor's per-pair accounting
+    // record), and keeps the scoring-time predictor's per-edge accounting
     // exact.
-    if (!seenBarrierPairs.insert({edge.srcId, edge.dstId}).second)
+    if (!seenBarrierEdges.insert({edge.srcId, edge.dstId, edge.srcResultIdx})
+             .second)
       continue;
 
     // Determine barrier kind from the producer/consumer pipeline.
@@ -4179,6 +4583,7 @@ static void insertCrossGroupBarriers(ttg::ScheduleLoop &loop) {
     // wait BEFORE the consumer starts reading (= consumer node)
     bar.arriveAfterNodeId = edge.srcId;
     bar.waitBeforeNodeId = edge.dstId;
+    bar.distance = edge.distance;
 
     // For mbarrier: expected bytes from the paired buffer.
     if (kind == ttg::ScheduleLoop::BarrierKind::MBARRIER &&
@@ -4203,6 +4608,247 @@ static void insertCrossGroupBarriers(ttg::ScheduleLoop &loop) {
                           << loop.crossGroupBarriers.size() << "\n");
 }
 
+/// Pass A.7: mark the epilogue chain so the sched2tlx emitter renders the
+/// subtiled store. For each subtiled `descriptor_store` (S = getEpilogueSubtile
+/// > 1), tag the store plus its register-compute producers (truncf / convert /
+/// casts) up to and including the `tmem_load` accumulator read with
+/// subtileCount = S and nSize = BN/S. The emitter's `_find_subtile_chain` keys
+/// off the FIRST chain node, so the whole chain (not just the store) must be
+/// marked. Buffer shrink + double-buffering are already handled by
+/// extractBufferShape / allocateBuffersForLoop; this only annotates the nodes.
+static void markEpilogueSubtileNodes(ttg::ScheduleLoop &loop) {
+  llvm::DenseMap<Operation *, unsigned> opToNode;
+  for (const auto &n : loop.nodes)
+    if (n.op)
+      opToNode[n.op] = n.id;
+
+  for (auto &storeNode : loop.nodes) {
+    if (!storeNode.op || !isa<tt::DescriptorStoreOp>(storeNode.op))
+      continue;
+    int S = getEpilogueSubtileForOp(storeNode.op);
+    if (S <= 1)
+      continue;
+    auto storeOp = cast<tt::DescriptorStoreOp>(storeNode.op);
+    auto srcTy = dyn_cast<RankedTensorType>(storeOp.getSrc().getType());
+    if (!srcTy || srcTy.getRank() < 2)
+      continue;
+    int subSize = static_cast<int>(srcTy.getShape().back()) / S;
+
+    auto mark = [&](ttg::ScheduleNode &n) {
+      n.subtileCount = S;
+      n.nSize = subSize;
+    };
+    mark(storeNode);
+
+    // Walk the value chain feeding the store, marking register epilogue ops.
+    // Stop at the tmem_load (accumulator read) — mark it but don't recurse
+    // into the TMEM accumulator / MMA upstream.
+    llvm::SmallVector<Value, 4> worklist{storeOp.getSrc()};
+    llvm::DenseSet<Operation *> visited;
+    while (!worklist.empty()) {
+      Value v = worklist.pop_back_val();
+      Operation *def = v.getDefiningOp();
+      if (!def || !visited.insert(def).second)
+        continue;
+      auto it = opToNode.find(def);
+      if (it == opToNode.end())
+        continue;
+      mark(loop.nodes[it->second]);
+      // Memory-read boundaries: the TMEM accumulator and any external SMEM
+      // staging (e.g. case5's bias). Mark them (the emitter sub-slices them at
+      // their source) but don't recurse — their producer load stays a full,
+      // once-per-tile load outside the sub-tile loop.
+      if (isa<ttng::TMEMLoadOp, ttg::LocalLoadOp, tt::DescriptorLoadOp,
+              tt::LoadOp>(def))
+        continue;
+      for (Value operand : def->getOperands())
+        worklist.push_back(operand);
+    }
+  }
+}
+
+/// True iff the store's value chain is subtileable along N: every op is either
+/// a memory-read boundary (the TMEM accumulator or an external SMEM staging —
+/// the emitter sub-slices those at their source) or an elementwise-along-N
+/// compute op (per-column, so slicing N is exact). This is NOT an op-name
+/// allowlist: it uses the same op predicate `WSDataPartition::sliceOp` uses to
+/// slice ops along a data-partition dimension (the identical transform), so
+/// bias `addf`, scale `mulf`, `math.exp`, casts, etc. all qualify, while a
+/// cross-column op (`tt.reduce`/`tt.trans`/`tt.dot`) correctly disqualifies —
+/// a genuine math constraint, not a missing case.
+static bool isSimpleSubtileableEpilogue(Operation *storeOp) {
+  llvm::SmallVector<Value, 4> worklist{
+      cast<tt::DescriptorStoreOp>(storeOp).getSrc()};
+  llvm::DenseSet<Operation *> seen;
+  while (!worklist.empty()) {
+    Operation *def = worklist.pop_back_val().getDefiningOp();
+    if (!def || !seen.insert(def).second)
+      continue;
+    // Memory-read boundary — sub-sliced at its source (TMEM accumulator via
+    // tlx.subslice, external SMEM staging likewise). Don't recurse past it.
+    if (isa<ttng::TMEMLoadOp, ttg::LocalLoadOp, tt::DescriptorLoadOp,
+            tt::LoadOp>(def))
+      continue;
+    // Elementwise-along-N compute (per-column): subtiling N is exact.
+    // Broadcast/ splat/expand_dims would need per-sub-tile shape adjustment the
+    // emitter doesn't do yet, so they're deliberately excluded (correct skip,
+    // not a silent wrong result).
+    if (def->hasTrait<mlir::OpTrait::Elementwise>() ||
+        isa<ttg::ConvertLayoutOp, tt::FpToFpOp>(def)) {
+      for (Value o : def->getOperands())
+        worklist.push_back(o);
+      continue;
+    }
+    return false; // reduce / trans / dot / broadcast / other: not N-subtileable
+  }
+  return true;
+}
+
+/// Estimate the graph's total SMEM (bytes) WITHOUT epilogue subtiling — sum
+/// over all loops of each SMEM buffer's (tile bytes × lifetime count). Mirrors
+/// computeTotalSmem but works pre-allocation (from nodes), so the subtile
+/// decision can run before allocateBuffersForLoop. Used for the capacity
+/// trigger.
+static int64_t estimateGraphSmemBytes(const ttg::ScheduleGraph &graph) {
+  int64_t total = 0;
+  for (const auto &loop : graph.loops)
+    for (const auto &n : loop.nodes) {
+      if (!n.op || classifyMemoryKind(n.op) != ttg::MemoryKind::SMEM)
+        continue;
+      ttg::ScheduleBuffer buf;
+      extractBufferShape(n.op, buf); // full size (no subtile attr set yet)
+      if (buf.shape.empty() || buf.elementBitWidth == 0)
+        continue;
+      int64_t elems = 1;
+      for (auto d : buf.shape)
+        elems *= d;
+      total += elems * (buf.elementBitWidth / 8) *
+               static_cast<int64_t>(computeBufferCount(loop, n.id));
+    }
+  return total;
+}
+
+/// Pass A.7 auto-decision: choose the epilogue subtile factor S and stamp
+/// `tt.epilogue_subtile` on the store op (read by getEpilogueSubtileForOp).
+/// Skipped when the env override is set.
+///
+/// Grounded in the microbenchmark study (users/wl/wlei/modulo_schedule/
+/// latency_model/epi_subtile). Subtiling has TWO independent benefits, gated
+/// separately, and one cost:
+///   COST  — smaller TMA stores move bytes at lower BW (down to ~0.5x in a
+///           memory-bound copy). Only acceptable if hidden behind compute.
+///   PERF (overlap) — the sub-stores hide behind the next tile's MMA. Positive
+///           ONLY when the inner loop is compute-bound (has an MMA); on a
+///           memory-bound loop the store is the critical path and subtiling is
+///           a pure loss. ⇒ gate on tensor-core compute in the inner loop.
+///   SMEM (capacity) — the c_smem staging shrinks BM·BN·count → BM·(BN/S)·2, so
+///           subtiling frees SMEM and can keep the K-pipeline from being cut by
+///           the budget reducer. ⇒ gate on the un-subtiled total exceeding the
+///           SMEM budget; pick the smallest S that fits (least BW penalty).
+/// Pre-reqs for both: persistent loop owning a descriptor_store + an inner-loop
+/// super-node, an emitter-safe chain, and BN/S >= 32 (the granularity floor).
+static void decideEpilogueSubtiles(ttg::ScheduleGraph &graph) {
+  if (!triton::tools::getStrEnv("TRITON_MODULO_EPILOGUE_SUBTILE").empty())
+    return; // manual override path — getEpilogueSubtileForOp reads the env.
+
+  auto legal = [](int BN, int s) { return BN % s == 0 && BN / s >= 32; };
+
+  for (auto &loop : graph.loops) {
+    Operation *storeOp = nullptr;
+    unsigned storeNodeId = 0;
+    int innerId = -1;
+    for (const auto &n : loop.nodes) {
+      if (n.op && isa<tt::DescriptorStoreOp>(n.op)) {
+        storeOp = n.op;
+        storeNodeId = n.id;
+      }
+      if (n.childPipelineId != UINT_MAX)
+        innerId = static_cast<int>(n.childPipelineId);
+    }
+    // Pre-reqs: persistent loop (store + inner super-node) + emitter-safe
+    // chain.
+    if (!storeOp || innerId < 0 || !isSimpleSubtileableEpilogue(storeOp))
+      continue;
+    auto srcTy = dyn_cast<RankedTensorType>(
+        cast<tt::DescriptorStoreOp>(storeOp).getSrc().getType());
+    if (!srcTy || srcTy.getRank() < 2)
+      continue;
+    int BN = static_cast<int>(srcTy.getShape().back());
+
+    const ttg::ScheduleLoop *inner = nullptr;
+    for (const auto &l : graph.loops)
+      if (static_cast<int>(l.id) == innerId)
+        inner = &l;
+    if (!inner)
+      continue;
+
+    // PERF trigger: inner loop has tensor-core compute to overlap the store.
+    bool hasCompute = false;
+    for (const auto &n : inner->nodes)
+      if (n.pipeline == ttg::HWPipeline::TC) {
+        hasCompute = true;
+        break;
+      }
+    // Overlap wants the largest legal S (capped at the validated 4).
+    int sOverlap = 1;
+    if (hasCompute)
+      for (int cand : {4, 2})
+        if (legal(BN, cand)) {
+          sOverlap = cand;
+          break;
+        }
+
+    // SMEM trigger: if the un-subtiled total exceeds budget, subtiling the
+    // store (BM·BN·count → BM·(BN/S)·2) frees SMEM so the reducer need not cut
+    // the K-pipeline. Pick the SMALLEST S that brings the total under budget
+    // (least BW penalty). delta(S) is exact: storeFull - storeSub(S); note S=2
+    // vs a single-buffered store frees nothing (BM·BN·1 == BM·(BN/2)·2), so the
+    // loop naturally escalates to S=4.
+    int sCap = 1;
+    int64_t budget = kSmemBudgetBytes();
+    int64_t fullTotal = estimateGraphSmemBytes(graph);
+    if (fullTotal > budget) {
+      ttg::ScheduleBuffer sbuf;
+      extractBufferShape(storeOp, sbuf); // full BM×BN (no attr yet)
+      int64_t sElems = 1;
+      for (auto d : sbuf.shape)
+        sElems *= d;
+      int64_t eb = sbuf.elementBitWidth / 8;
+      int64_t storeFull =
+          sElems * eb *
+          static_cast<int64_t>(computeBufferCount(loop, storeNodeId));
+      for (int cand : {2, 4}) { // smallest-first: minimize BW penalty
+        if (!legal(BN, cand))
+          continue;
+        int64_t storeSub = (sElems / cand) * eb * 2; // subtile double-buffers
+        if (fullTotal - storeFull + storeSub <= budget) {
+          sCap = cand;
+          break;
+        }
+      }
+      // Still over budget at every legal S → take the largest legal (most
+      // relief) as best effort; the reducer/HW limit is the backstop.
+      if (sCap == 1)
+        for (int cand : {4, 2})
+          if (legal(BN, cand)) {
+            sCap = cand;
+            break;
+          }
+    }
+
+    int S = std::max(sOverlap, sCap);
+    if (S > 1) {
+      storeOp->setAttr(
+          kEpilogueSubtileAttrName,
+          IntegerAttr::get(IntegerType::get(storeOp->getContext(), 32), S));
+      LLVM_DEBUG(llvm::dbgs()
+                 << "[A.7] auto subtile S=" << S << " (BN=" << BN
+                 << " overlap=" << sOverlap << " capacity=" << sCap
+                 << " smem=" << fullTotal << "/" << budget << ")\n");
+    }
+  }
+}
+
 /// Top-level: build a ScheduleGraph from DDG + schedule result.
 /// Includes Phase 0 (DDG→nodes/edges), Step 2.5 (clusters),
 /// Step 3 (buffer allocation), Step 4.5 (merging), Step 4.6 (budget),
@@ -4215,12 +4861,17 @@ static ttg::ScheduleGraph
 buildScheduleGraph(scf::ForOp loop, const ttg::DataDependenceGraph &ddg,
                    const ttg::ModuloScheduleResult &sched,
                    const ttg::LatencyModel &model,
-                   const DataPartitionPlan &plan) {
+                   const DataPartitionPlan &plan, StringRef scheduleAlgo) {
   ttg::ScheduleGraph graph;
-  buildScheduleLoop(loop, ddg, sched, graph, model);
+  buildScheduleLoop(loop, ddg, sched, graph, model, scheduleAlgo, plan.mmaInfo);
+
+  // Decide epilogue subtiling from the cost model BEFORE buffer allocation, so
+  // extractBufferShape shrinks the staging buffer ahead of the SMEM reducer.
+  decideEpilogueSubtiles(graph);
 
   for (auto &schedLoop : graph.loops) {
     allocateBuffersForLoop(schedLoop, plan);
+    markEpilogueSubtileNodes(schedLoop);
     mergeNonOverlappingBuffers(schedLoop);
   }
 
@@ -4268,7 +4919,7 @@ buildScheduleGraph(scf::ForOp loop, const ttg::DataDependenceGraph &ddg,
   // runs them as a single global pass over all scheduled loops
   // (`applyGlobalWarpPartition`) so cross-loop coordination — e.g., an
   // outer-loop super-node consistent with the inner loop's MMA group — is
-  // possible. See `runOnOperation`.
+  // possible. See `runScheduleDriver`.
   return graph;
 }
 
@@ -4289,24 +4940,28 @@ struct ScheduleResult {
 /// info (printed only for `node.isSuperNode`) is naturally a no-op for
 /// inner loops, so no branching is needed.
 ///
-/// `label` is used in diagnostics ("Loop" or "Outer"). `printScheduleGraph`
-/// is the test-only knob from the parent pass (dumps the graph to errs
-/// unconditionally for lit tests in opt builds).
+/// `label` is used in diagnostics ("Loop" or "Outer"). `scheduleAlgo` is the
+/// driver's resolved backend. `printScheduleGraph` is the test-only knob from
+/// the parent pass (dumps the graph to errs unconditionally for lit tests in
+/// opt builds).
 ///
-/// Lowering is intentionally NOT done here — `runOnOperation` runs a single
+/// Lowering is intentionally NOT done here — `runScheduleDriver` runs a single
 /// lower-or-emit phase after the iteration loop converges, so the schedule
 /// build stays cheap and idempotent inside the iteration.
 static std::optional<ScheduleResult>
 scheduleOneLoop(scf::ForOp loop, const ttg::LatencyModel &model,
                 triton::ModuleAxisInfoAnalysis &axisInfo, StringRef label,
-                const DataPartitionPlan &plan,
+                const DataPartitionPlan &plan, StringRef scheduleAlgo,
                 bool printScheduleGraph = false) {
-  auto ddg = ttg::DataDependenceGraph::build(loop, model);
+  // Pass A.5: thread the partition into build() so any inner super-node's
+  // innerII is computed from the PARTITIONED inner schedule; then tag this
+  // loop's own MMA bundle(s) so II/ResMII and the dumped ScheduleNode reflect
+  // the N hardware issues. No-op when this loop has no partitioned MMA.
+  auto ddg =
+      ttg::DataDependenceGraph::build(loop, model, plan.mmaInfo, scheduleAlgo);
   if (ddg.getNumNodes() == 0)
     return std::nullopt;
 
-  // Pass A.5: tag the partitioned MMA bundle(s) so II/ResMII and the dumped
-  // ScheduleNode reflect the N hardware issues. No-op when this loop has none.
   ddg.applyDataPartition(plan.mmaInfo);
 
   LDBG(label << " DDG: " << ddg.getNumNodes() << " nodes, "
@@ -4360,7 +5015,19 @@ scheduleOneLoop(scf::ForOp loop, const ttg::LatencyModel &model,
     }
   });
 
-  auto schedResult = ttg::runModuloScheduling(ddg);
+  // Opt-in M2 evidence: compare the joint solver against the in-tree
+  // schedulers on this DDG. Runs every backend, so it is gated behind
+  // TRITON_MODULO_BASELINE_REPORT and never fires on a compile path. Emitted
+  // on stderr so it does not interleave with triton-opt's IR on stdout.
+  if (ttg::baselineReportRequested()) {
+    llvm::StringRef fixture = label;
+    if (auto func = loop->getParentOfType<tt::FuncOp>())
+      fixture = func.getName();
+    ttg::printBaselineComparison(llvm::errs(),
+                                 ttg::compareAgainstBaselines(ddg, fixture));
+  }
+
+  auto schedResult = ttg::runModuloScheduling(ddg, scheduleAlgo);
   if (failed(schedResult)) {
     LDBG(label << " scheduling FAILED");
     return std::nullopt;
@@ -4391,7 +5058,8 @@ scheduleOneLoop(scf::ForOp loop, const ttg::LatencyModel &model,
     }
   });
 
-  auto graph = buildScheduleGraph(loop, ddg, *schedResult, model, plan);
+  auto graph =
+      buildScheduleGraph(loop, ddg, *schedResult, model, plan, scheduleAlgo);
 
   LLVM_DEBUG({
     llvm::dbgs() << "[PASS-A] === " << label << " ScheduleGraph ===\n";
@@ -4434,10 +5102,10 @@ static void scheduleAndRecord(scf::ForOp loop, StringRef label, bool isOuter,
                               const ttg::LatencyModel &model,
                               triton::ModuleAxisInfoAnalysis &axisInfo,
                               const DataPartitionPlan &plan,
-                              bool printScheduleGraph,
+                              StringRef scheduleAlgo, bool printScheduleGraph,
                               SmallVectorImpl<ScheduledLoop> &out) {
-  auto result =
-      scheduleOneLoop(loop, model, axisInfo, label, plan, printScheduleGraph);
+  auto result = scheduleOneLoop(loop, model, axisInfo, label, plan,
+                                scheduleAlgo, printScheduleGraph);
   if (!result)
     return;
   std::optional<ttg::ModuloScheduleResult> outerSched;
@@ -4480,6 +5148,1135 @@ static void clampOuterStagesAndClusters(scf::ForOp outerLoop) {
   }
 }
 
+// ============================================================================
+// Emitter (sched2tlx) capability facts — versioned LEGALITY constraints.
+// These describe what the emitter can lower, not what hardware allows;
+// encode them explicitly (constraints), never in costs, or a solver will
+// route around them and regress correctness (SolverMigrationNotes,
+// guard 3 / step-4 item 3). Bump kVersion when the emitter gains a
+// capability and delete the corresponding constraint.
+// ============================================================================
+struct EmitterCaps {
+  // v2: the outer-loop single-WG constraint (guard 3) was retired —
+  // sched2tlx lowers multi-WG OUTER bodies and its task-coverage check
+  // hard-errors on any scheduled op no task owns instead of silently
+  // dropping it, so every loop (inner and outer) goes through the same
+  // partitioner in applyGlobalWarpPartition.
+  static constexpr int kVersion = 2; // sched2tlx as of 2026-07
+  // TMEM accumulator allocation supports blockM <= 128 (no MMA splitting
+  // for larger tiles). Blocks case2's 256-blockM pre_modulo end-to-end;
+  // the emitter raises a clear error (see _emit_buffers in emitter.py).
+  static constexpr int kMaxTMEMBlockM = 128;
+};
+
+// ============================================================================
+// Joint formulation v1 (SolverMigrationNotes, step 3): warp-group assignment
+// solved by the native Z3 backend against the committed schedule, replacing
+// scoreCandidate's enumerate-and-score with an in-process constraint model.
+// Cycles stay fixed (the Twill-style re-solve holds II and, in this v1, the
+// placement); the native backend validates the versioned JSON contract.
+// Engaged by the joint-solver pass (JointSolverMode, see
+// ModuloScheduleDriver.h); any failure falls back to partitionExhaustive.
+// ============================================================================
+static StringRef loweringEventKindName(ttg::LoweringEventKind kind) {
+  switch (kind) {
+  case ttg::LoweringEventKind::Wait:
+    return "wait";
+  case ttg::LoweringEventKind::Arrive:
+    return "arrive";
+  case ttg::LoweringEventKind::Expect:
+    return "expect";
+  case ttg::LoweringEventKind::LocalStore:
+    return "local_store";
+  case ttg::LoweringEventKind::LocalLoad:
+    return "local_load";
+  case ttg::LoweringEventKind::Fence:
+    return "fence";
+  case ttg::LoweringEventKind::TCCommit:
+    return "tc_commit";
+  }
+  return "unknown";
+}
+
+static StringRef loweringRelationName(ttg::LoweringRelation relation) {
+  switch (relation) {
+  case ttg::LoweringRelation::Always:
+    return "always";
+  case ttg::LoweringRelation::SameWG:
+    return "same_wg";
+  case ttg::LoweringRelation::DifferentWG:
+    return "different_wg";
+  }
+  return "unknown";
+}
+
+static StringRef loweringOwnerName(ttg::LoweringEventOwner owner) {
+  switch (owner) {
+  case ttg::LoweringEventOwner::Src:
+    return "src";
+  case ttg::LoweringEventOwner::Dst:
+    return "dst";
+  }
+  return "unknown";
+}
+
+static StringRef loweringPlacementName(ttg::LoweringPlacement placement) {
+  switch (placement) {
+  case ttg::LoweringPlacement::Before:
+    return "before";
+  case ttg::LoweringPlacement::After:
+    return "after";
+  }
+  return "unknown";
+}
+
+static StringRef loweringSemaphoreName(ttg::LoweringSemaphore semaphore) {
+  switch (semaphore) {
+  case ttg::LoweringSemaphore::None:
+    return "none";
+  case ttg::LoweringSemaphore::Full:
+    return "full";
+  case ttg::LoweringSemaphore::Empty:
+    return "empty";
+  }
+  return "unknown";
+}
+
+static StringRef loweringPlanStatusName(ttg::LoweringPlanStatus status) {
+  switch (status) {
+  case ttg::LoweringPlanStatus::Absent:
+    return "absent";
+  case ttg::LoweringPlanStatus::ShadowUnmodeled:
+    return "shadow_unmodeled";
+  case ttg::LoweringPlanStatus::ShadowVerified:
+    return "shadow_verified";
+  case ttg::LoweringPlanStatus::ShadowStale:
+    return "shadow_stale";
+  }
+  return "unknown";
+}
+
+static bool isTensorCorePipeline(ttg::HWPipeline pipeline) {
+  return pipeline == ttg::HWPipeline::TC || pipeline == ttg::HWPipeline::MFMA;
+}
+
+static bool isComputePipeline(ttg::HWPipeline pipeline) {
+  return pipeline == ttg::HWPipeline::CUDA || pipeline == ttg::HWPipeline::SFU;
+}
+
+static int64_t loweringIssueSlots(const ttg::LoweringEventTemplate &event) {
+  return static_cast<int64_t>(event.issueDuration) * event.frequency;
+}
+
+/// Derive symbolic-lowering templates from data dependences. The templates
+/// remain predicates until the joint solver chooses warp groups.
+static SmallVector<ttg::LoweringTemplate, 8> buildLoweringTemplates(
+    const ttg::ScheduleLoop &loop,
+    const llvm::SmallDenseMap<unsigned, int> &nodeToCluster) {
+  SmallVector<ttg::LoweringTemplate, 8> templates;
+  llvm::SmallDenseSet<
+      std::tuple<unsigned, unsigned, unsigned, unsigned, unsigned>, 8>
+      seen;
+
+  for (const auto &edge : loop.edges) {
+    auto srcCluster = nodeToCluster.find(edge.srcId);
+    auto dstCluster = nodeToCluster.find(edge.dstId);
+    if (srcCluster == nodeToCluster.end() || dstCluster == nodeToCluster.end())
+      continue;
+
+    const auto &src = loop.nodes[edge.srcId];
+    const auto &dst = loop.nodes[edge.dstId];
+    bool asyncCompletion =
+        isTensorCorePipeline(src.pipeline) && isComputePipeline(dst.pipeline);
+    bool loopCarriedSignal = edge.distance > 0 &&
+                             isComputePipeline(src.pipeline) &&
+                             isTensorCorePipeline(dst.pipeline);
+    if (!asyncCompletion && !loopCarriedSignal)
+      continue;
+
+    unsigned category = asyncCompletion ? 0 : 1;
+    if (!seen.insert({edge.srcId, edge.dstId, edge.srcResultIdx, edge.distance,
+                      category})
+             .second)
+      continue;
+
+    auto channel = resolveCrossWGChannel(loop, edge);
+    int64_t bytes = 0;
+    if (channel.pairedBuf != UINT_MAX &&
+        channel.pairedBuf < loop.buffers.size())
+      bytes = loop.buffers[channel.pairedBuf].sizeBytes();
+    else if (channel.synthesize && channel.depth > 0)
+      bytes = channel.synthesizedBytes() / channel.depth;
+
+    int frequency =
+        std::max({src.frequencyMultiplier, dst.frequencyMultiplier, 1});
+    auto makeEvent = [&](unsigned id, ttg::LoweringEventKind kind,
+                         ttg::LoweringEventOwner owner, unsigned anchorNodeId,
+                         ttg::LoweringPlacement placement,
+                         ttg::HWPipeline pipeline, int issueDuration,
+                         int completionLatency, bool blocking, bool isAsync) {
+      ttg::LoweringEventTemplate event;
+      event.id = id;
+      event.kind = kind;
+      event.owner = owner;
+      event.anchorNodeId = anchorNodeId;
+      event.placement = placement;
+      event.pipeline = pipeline;
+      event.issueDuration = issueDuration;
+      event.completionLatency = completionLatency;
+      event.blocking = blocking;
+      event.isAsync = isAsync;
+      event.distance = edge.distance;
+      event.frequency = frequency;
+      event.bufferId = channel.pairedBuf;
+      event.bytes = bytes;
+      event.depth = std::max(channel.depth, 1u);
+      event.semaphore = ttg::LoweringSemaphore::Full;
+      return event;
+    };
+
+    ttg::LoweringTemplate loweringTemplate;
+    loweringTemplate.id = templates.size();
+    loweringTemplate.relation = asyncCompletion
+                                    ? ttg::LoweringRelation::Always
+                                    : ttg::LoweringRelation::DifferentWG;
+    loweringTemplate.srcNodeId = edge.srcId;
+    loweringTemplate.dstNodeId = edge.dstId;
+    loweringTemplate.srcCluster = srcCluster->second;
+    loweringTemplate.dstCluster = dstCluster->second;
+    if (asyncCompletion) {
+      loweringTemplate.events.push_back(makeEvent(
+          0, ttg::LoweringEventKind::TCCommit, ttg::LoweringEventOwner::Src,
+          edge.srcId, ttg::LoweringPlacement::After, ttg::HWPipeline::NONE,
+          kNamedBarrierIssueCost, std::max(src.latency, 0),
+          /*blocking=*/false, /*isAsync=*/true));
+    } else {
+      loweringTemplate.events.push_back(makeEvent(
+          0, ttg::LoweringEventKind::Arrive, ttg::LoweringEventOwner::Src,
+          edge.srcId, ttg::LoweringPlacement::After, ttg::HWPipeline::NONE,
+          kMBarrierIssueCost,
+          /*completionLatency=*/0, /*blocking=*/false, /*isAsync=*/false));
+    }
+    loweringTemplate.events.push_back(makeEvent(
+        1, ttg::LoweringEventKind::Wait, ttg::LoweringEventOwner::Dst,
+        edge.dstId, ttg::LoweringPlacement::Before, ttg::HWPipeline::NONE,
+        asyncCompletion ? kNamedBarrierIssueCost : kMBarrierIssueCost,
+        /*completionLatency=*/0, /*blocking=*/true, /*isAsync=*/false));
+    templates.push_back(std::move(loweringTemplate));
+  }
+  return templates;
+}
+
+/// Enumerate a buffer's REAL consumers (walking through transparent view
+/// ops), as (consumerId, latency, accumulated distance) — the leaves
+/// walkLastConsumerEnd maxes over, serialized so the v2 joint model can
+/// express depth = lifetime/II + 1 over cycle VARIABLES.
+static void
+collectRealConsumers(const ttg::ScheduleLoop &loop, unsigned startId,
+                     int distAcc, llvm::DenseSet<unsigned> &seen,
+                     SmallVectorImpl<std::tuple<unsigned, int, int>> &out) {
+  for (const auto &edge : loop.edges) {
+    if (edge.srcId != startId)
+      continue;
+    if (!seen.insert(edge.dstId).second)
+      continue;
+    const auto &consumer = loop.getNode(edge.dstId);
+    int totalDist = distAcc + static_cast<int>(edge.distance);
+    bool transparent =
+        consumer.pipeline == ttg::HWPipeline::NONE && consumer.latency == 0;
+    if (transparent) {
+      collectRealConsumers(loop, consumer.id, totalDist, seen, out);
+      continue;
+    }
+    out.push_back({consumer.id, consumer.latency, totalDist});
+  }
+}
+
+static bool partitionJointSolver(ttg::ScheduleLoop &loop,
+                                 int64_t reservedSmemBytes, bool v2) {
+  if (loop.II <= 0)
+    return false;
+  auto clusters = buildClusters(loop);
+  // Exclude ops that demoteScalarArithToInfra will demote after
+  // partitioning: they are REPLICATED into each consumer WG, so their
+  // cross-cluster edges never become real barriers — serializing them
+  // would let the solver glue unrelated clusters together through a shared
+  // scalar op just to save fictional barrier-issue cost.
+  for (auto &c : clusters) {
+    llvm::erase_if(c.nodeIds, [&](unsigned nid) {
+      return isDemotableScalarArith(loop.nodes[nid]);
+    });
+  }
+  llvm::erase_if(clusters,
+                 [](const OpCluster &c) { return c.nodeIds.empty(); });
+  if (clusters.size() < 2)
+    return false;
+
+  llvm::SmallDenseMap<unsigned, int> nodeToCluster;
+  for (const auto &c : clusters)
+    for (unsigned nid : c.nodeIds)
+      nodeToCluster[nid] = c.id;
+
+  llvm::json::Array jClusters;
+  for (const auto &c : clusters) {
+    llvm::json::Array nids;
+    for (unsigned nid : c.nodeIds)
+      nids.push_back(static_cast<int64_t>(nid));
+    jClusters.push_back(llvm::json::Object{
+        {"id", c.id},
+        {"min_warps", wgRequiredWarps(c.nodeIds, loop)},
+        {"nodes", std::move(nids)},
+    });
+  }
+  llvm::json::Array jNodes;
+  for (const auto &n : loop.nodes) {
+    // Ship ALL nodes in both modes: v2 needs cycle variables for every node
+    // (buffer producers are NONE-pipeline local_allocs), and v1's
+    // recurrence re-ranker (solve_partition) needs the full graph to build
+    // per-WG program-order bodies and buffer back-edges.
+    (void)0;
+    jNodes.push_back(llvm::json::Object{
+        {"id", static_cast<int64_t>(n.id)},
+        {"cycle", n.cycle},
+        {"duration", std::max(n.selfLatency, 1)},
+        {"latency", std::max(n.latency, 0)},
+        {"pipeline", ttg::getPipelineName(n.pipeline)},
+        {"freq", std::max(n.frequencyMultiplier, 1)},
+    });
+  }
+  llvm::json::Array jEdges;
+  for (const auto &edge : loop.edges) {
+    auto s = nodeToCluster.find(edge.srcId);
+    auto d = nodeToCluster.find(edge.dstId);
+    bool crossCluster = s != nodeToCluster.end() && d != nodeToCluster.end() &&
+                        s->second != d->second;
+    // Cross-cluster edges carry the full partition metadata (rt/xissue/
+    // chan_bytes + cluster ids); every other dependence is shipped in the
+    // plain format below — v2 models all of them, and v1's recurrence
+    // re-ranker rebuilds the steady-state graph from them.
+    if (!crossCluster) {
+      jEdges.push_back(llvm::json::Object{
+          {"src", static_cast<int64_t>(edge.srcId)},
+          {"dst", static_cast<int64_t>(edge.dstId)},
+          {"src_result_idx", static_cast<int64_t>(edge.srcResultIdx)},
+          {"latency", edge.latency},
+          {"distance", static_cast<int64_t>(edge.distance)},
+          {"freq", 1},
+          {"rt", 0},
+          {"xissue", 0},
+          {"chan_bytes", 0},
+      });
+      continue;
+    }
+    const auto &sN = loop.nodes[edge.srcId];
+    const auto &dN = loop.nodes[edge.dstId];
+    int freq =
+        std::max(std::max(sN.frequencyMultiplier, dN.frequencyMultiplier), 1);
+    int rt = 0;
+    if (isRegisterComputeValue(sN.op) && isRegisterComputeValue(dN.op)) {
+      if (int64_t bytes = registerTensorBytes(sN.op); bytes > 0)
+        rt = kCrossWGRoundTripLatency + smemMoveCost(bytes);
+    }
+    // One barrier instruction per side per iteration, kind as
+    // insertCrossGroupBarriers picks it (TC producer → named).
+    int xissue = 2 * freq *
+                 (sN.pipeline == ttg::HWPipeline::TC ? kNamedBarrierIssueCost
+                                                     : kMBarrierIssueCost);
+    auto spec = resolveCrossWGChannel(loop, edge);
+    int64_t chanBytes =
+        spec.synthesize ? spec.synthesizedBytes() + 2 * spec.depth * 8 : 0;
+    jEdges.push_back(llvm::json::Object{
+        {"src", static_cast<int64_t>(edge.srcId)},
+        {"dst", static_cast<int64_t>(edge.dstId)},
+        {"src_result_idx", static_cast<int64_t>(edge.srcResultIdx)},
+        {"src_cluster", s->second},
+        {"dst_cluster", d->second},
+        {"latency", edge.latency},
+        {"distance", static_cast<int64_t>(edge.distance)},
+        {"freq", freq},
+        {"rt", rt},
+        {"xissue", xissue},
+        {"chan_bytes", chanBytes},
+    });
+  }
+
+  // v2: iter-arg anti-dependence (WAR) edges. The emitter renders an
+  // iter-arg update as a reassignment at the yield-operand producer's
+  // cycle position, so every DIRECT reader of the block argument (which
+  // must see the PREVIOUS iteration's value) has to be emitted strictly
+  // before it. The data edges don't encode this — without it the v2
+  // re-solve legally reorders version-sensitive chains and the emitted
+  // kernel reads the wrong iter-arg version (measured on case3). Derived
+  // values are materialized at their own cycles and need no ordering;
+  // only direct block-argument readers do.
+  if (v2 && loop.forOp) {
+    llvm::DenseMap<Operation *, unsigned> opToNode;
+    for (const auto &n : loop.nodes)
+      if (n.op)
+        opToNode[n.op] = n.id;
+    Operation *yield = loop.forOp.getBody()->getTerminator();
+    for (auto [i, arg] : llvm::enumerate(loop.forOp.getRegionIterArgs())) {
+      Operation *writer = yield->getOperand(i).getDefiningOp();
+      auto wIt = writer ? opToNode.find(writer) : opToNode.end();
+      if (wIt == opToNode.end())
+        continue;
+      for (Operation *user : arg.getUsers()) {
+        auto rIt = opToNode.find(user);
+        if (rIt == opToNode.end() || rIt->second == wIt->second)
+          continue;
+        jEdges.push_back(llvm::json::Object{
+            {"src", static_cast<int64_t>(rIt->second)},
+            {"dst", static_cast<int64_t>(wIt->second)},
+            {"src_result_idx", 0},
+            {"latency", 1},
+            {"distance", 0},
+            {"freq", 1},
+            {"rt", 0},
+            {"xissue", 0},
+            {"chan_bytes", 0},
+        });
+      }
+    }
+  }
+
+  llvm::json::Array fpTable;
+  for (int w = 0; w <= 8; ++w)
+    fpTable.push_back((w == 1 || w == 2 || w == 4 || w == 8) ? wgFootprint(w)
+                                                             : 0);
+
+  // The wall clock is only a backstop against a hang; the deterministic rlimit
+  // budget in the solver is what is meant to stop the search, so this is set
+  // well above the time that budget normally takes to run out.
+  double timeLimitS = 180.0;
+  if (auto env =
+          triton::tools::getStrEnv("TRITON_MODULO_JOINT_SOLVER_TIMEOUT_S");
+      !env.empty())
+    timeLimitS = std::max(1.0, std::atof(env.c_str()));
+
+  // v2: serialize SMEM/TMEM staging buffers so depth = lifetime/II + 1 becomes
+  // a function of the re-solved cycles. fixed_smem carries only the SMEM the
+  // model does not re-derive (other loops, barrier buffers, merge-group
+  // residue — an approximation where merging shares storage); TMEM is modeled
+  // independently against its byte budget.
+  llvm::json::Array jBuffers;
+  int64_t modeledBytes = 0;
+  for (const auto &n : loop.nodes) {
+    if (n.producesBuffer == UINT_MAX)
+      continue;
+    const auto &buf = loop.buffers[n.producesBuffer];
+    // Both schema modes model SMEM and TMEM staging-buffer depths.
+    if (buf.kind != ttg::MemoryKind::SMEM && buf.kind != ttg::MemoryKind::TMEM)
+      continue;
+    llvm::DenseSet<unsigned> seen;
+    seen.insert(n.id);
+    SmallVector<std::tuple<unsigned, int, int>, 4> consumers;
+    collectRealConsumers(loop, n.id, 0, seen, consumers);
+    llvm::json::Array jCons;
+    for (auto &[cid, lat, dist] : consumers)
+      jCons.push_back(llvm::json::Object{{"node", static_cast<int64_t>(cid)},
+                                         {"latency", lat},
+                                         {"distance", dist}});
+    jBuffers.push_back(llvm::json::Object{
+        {"id", static_cast<int64_t>(buf.id)},
+        {"producer", static_cast<int64_t>(n.id)},
+        {"size_bytes", buf.sizeBytes()},
+        {"count", static_cast<int64_t>(buf.count)},
+        {"min_count", static_cast<int64_t>(buf.count >= buf.explicitMinCount
+                                               ? buf.explicitMinCount
+                                               : 1)},
+        {"kind", buf.kind == ttg::MemoryKind::SMEM ? "smem" : "tmem"},
+        {"consumers", std::move(jCons)}});
+    if (v2 && buf.kind == ttg::MemoryKind::SMEM)
+      modeledBytes += buf.totalBytes();
+  }
+  int64_t committedSmem = computeTotalSmem(loop) + reservedSmemBytes;
+
+  auto loweringTemplates = buildLoweringTemplates(loop, nodeToCluster);
+  llvm::json::Array jLoweringTemplates;
+  for (const auto &loweringTemplate : loweringTemplates) {
+    llvm::json::Array jEvents;
+    for (const auto &event : loweringTemplate.events) {
+      llvm::json::Object jEvent{
+          {"id", static_cast<int64_t>(event.id)},
+          {"kind", loweringEventKindName(event.kind)},
+          {"owner", loweringOwnerName(event.owner)},
+          {"anchor_node", static_cast<int64_t>(event.anchorNodeId)},
+          {"placement", loweringPlacementName(event.placement)},
+          {"pipeline", ttg::getPipelineName(event.pipeline)},
+          {"issue_duration", event.issueDuration},
+          {"completion_latency", event.completionLatency},
+          {"blocking", event.blocking},
+          {"async", event.isAsync},
+          {"distance", static_cast<int64_t>(event.distance)},
+          {"frequency", event.frequency},
+          {"bytes", event.bytes},
+          {"depth", static_cast<int64_t>(event.depth)},
+          {"semaphore", loweringSemaphoreName(event.semaphore)},
+      };
+      jEvent["buffer_id"] =
+          event.bufferId == UINT_MAX
+              ? llvm::json::Value(nullptr)
+              : llvm::json::Value(static_cast<int64_t>(event.bufferId));
+      jEvent["fusion_group"] =
+          event.fusionGroup == UINT_MAX
+              ? llvm::json::Value(nullptr)
+              : llvm::json::Value(static_cast<int64_t>(event.fusionGroup));
+      jEvent["dedup_group"] =
+          event.dedupGroup == UINT_MAX
+              ? llvm::json::Value(nullptr)
+              : llvm::json::Value(static_cast<int64_t>(event.dedupGroup));
+      jEvents.push_back(std::move(jEvent));
+    }
+    jLoweringTemplates.push_back(llvm::json::Object{
+        {"id", static_cast<int64_t>(loweringTemplate.id)},
+        {"relation", loweringRelationName(loweringTemplate.relation)},
+        {"src_node", static_cast<int64_t>(loweringTemplate.srcNodeId)},
+        {"dst_node", static_cast<int64_t>(loweringTemplate.dstNodeId)},
+        {"src_cluster", loweringTemplate.srcCluster},
+        {"dst_cluster", loweringTemplate.dstCluster},
+        {"events", std::move(jEvents)},
+    });
+  }
+
+  llvm::json::Object root{
+      {"version", "joint-solver-0.2"},
+      {"mode", v2 ? "joint" : "partition"},
+      {"emitter_caps_version", EmitterCaps::kVersion},
+      // Every loop — inner AND outer — reaches this partitioner (the
+      // outer-loop single-WG legality was retired in EmitterCaps v2);
+      // max_wgs = clusters.size() is the only WG-count bound in-model.
+      {"max_wgs", static_cast<int64_t>(clusters.size())},
+      {"ii", loop.II},
+      {"clusters", std::move(jClusters)},
+      {"nodes", std::move(jNodes)},
+      {"edges", std::move(jEdges)},
+      {"buffers", std::move(jBuffers)},
+      {"lowering_templates", std::move(jLoweringTemplates)},
+      {"committed_smem", committedSmem},
+      {"fixed_smem", std::max<int64_t>(0, committedSmem - modeledBytes)},
+      {"smem_budget", kSmemBudgetBytes()},
+      {"tmem_budget_bytes", kTmemBudgetBytes},
+      {"default_wg_footprint", kDefaultWGFootprint},
+      {"sm_regs", kBlackwellSMRegs},
+      {"default_slack", kDefaultSlack},
+      {"warp_footprint", std::move(fpTable)},
+      {"time_limit_s", timeLimitS},
+  };
+  // TRITON_MODULO_REG_BUDGET: Twill REGISTERLIMIT-style HARD register cap
+  // for the joint partition (v1 and v2). Unset (0) keeps the soft-deficit
+  // model; a value (typically ≤ sm_regs, per Twill's re-solve-at-reduced-
+  // budget answer to ptxas spills) forbids oversubscription outright.
+  if (auto env = triton::tools::getStrEnv("TRITON_MODULO_REG_BUDGET");
+      !env.empty())
+    root["reg_budget"] = std::atoll(env.c_str());
+  // Escape hatches for the deterministic budget, mirroring the timeout knob.
+  // Both travel in the request, so they land in the solver cache key
+  // automatically and cannot silently return an answer found under a
+  // different budget.
+  if (auto env = triton::tools::getStrEnv("TRITON_MODULO_JOINT_SOLVER_RLIMIT");
+      !env.empty())
+    root["rlimit"] = std::max<int64_t>(0, std::atoll(env.c_str()));
+  if (auto env = triton::tools::getStrEnv("TRITON_MODULO_JOINT_SOLVER_SEED");
+      !env.empty())
+    root["random_seed"] = std::max<int64_t>(0, std::atoll(env.c_str()));
+  std::string problemJson;
+  llvm::raw_string_ostream os(problemJson);
+  os << llvm::json::Value(std::move(root));
+
+  auto rawOut = ttg::runJointSolverBackend(problemJson);
+  if (failed(rawOut))
+    return false;
+  auto parsed = llvm::json::parse(*rawOut);
+  if (!parsed) {
+    llvm::consumeError(parsed.takeError());
+    return false;
+  }
+  auto *obj = parsed->getAsObject();
+  if (!obj)
+    return false;
+  auto responseVersion = obj->getString("version");
+  auto status = obj->getString("status");
+  auto *wgMap = obj->getObject("wg");
+  auto *loweringPlanObj = obj->getObject("lowering_plan");
+  if (!status || *status != "ok") {
+    LLVM_DEBUG(DBGS() << "[Phase4-JOINT] solver non-ok response: " << *rawOut
+                      << "\n");
+    return false;
+  }
+  if (!responseVersion || *responseVersion != "joint-solver-0.2" || !wgMap ||
+      !loweringPlanObj) {
+    LLVM_DEBUG(DBGS() << "[Phase4-JOINT] malformed ok response: " << *rawOut
+                      << "\n");
+    return false;
+  }
+
+  auto checkedInt = [](std::optional<int64_t> value, int &result) {
+    if (!value || *value < std::numeric_limits<int>::min() ||
+        *value > std::numeric_limits<int>::max())
+      return false;
+    result = static_cast<int>(*value);
+    return true;
+  };
+
+  // Validate every solver-owned assignment into temporaries first. The
+  // backend is advisory and a partial response must not leave the loop in a
+  // half-updated state.
+  SmallVector<int> solvedCycles;
+  solvedCycles.reserve(loop.nodes.size());
+  for (const auto &node : loop.nodes)
+    solvedCycles.push_back(node.cycle);
+  if (v2) {
+    auto *cyc = obj->getObject("cycles");
+    if (!cyc)
+      return false;
+    for (const auto &node : loop.nodes) {
+      int cycle = 0;
+      if (!checkedInt(cyc->getInteger(std::to_string(node.id)), cycle))
+        return false;
+      solvedCycles[node.id] = cycle;
+    }
+    // Safety net, mirroring runJointSolverSchedule's re-verification: never
+    // apply a solution that violates a dependence (the backend is advisory,
+    // not part of the correctness TCB).
+    for (const auto &edge : loop.edges) {
+      int64_t srcCycle = solvedCycles[edge.srcId];
+      int64_t dstCycle = solvedCycles[edge.dstId];
+      if (dstCycle < srcCycle + edge.latency -
+                         static_cast<int64_t>(edge.distance) * loop.II) {
+        LLVM_DEBUG(llvm::dbgs() << "[Phase4-JOINT] v2 verify failed: N"
+                                << edge.srcId << " -> N" << edge.dstId << "\n");
+        return false;
+      }
+    }
+    // Stage-invariance gate (2026-07-09, RE-VALIDATED 2026-07-10): accept
+    // only same-stage cycle refinements from v2; stage-changing solutions
+    // fall back to v1. The gate-removal experiment (case4, joint-mode=2,
+    // 12 draws, with the merge-alias and ring-counter emitter fixes in)
+    // measured stage-changing v2 at 4/12 HANGS + 1/12 wrong-numerics
+    // (dQ≈0.8, dV clean) — at least two further emitter-contract breaks
+    // under stage moves (frozen repros: case4-hang-repro-20260710).
+    // Same-stage v2 (8-WG joint partitions) is verified reliable. See
+    // docs/SolverMigrationNotes.md 2026-07-10 entries.
+    for (const auto &node : loop.nodes) {
+      int cycle = solvedCycles[node.id];
+      if (cycle / loop.II != node.stage) {
+        LLVM_DEBUG(llvm::dbgs()
+                   << "[Phase4-JOINT] v2 rejected: N" << node.id
+                   << " stage change " << node.stage << " -> "
+                   << cycle / loop.II
+                   << " (emitter stage-move contract not yet safe)\n");
+        return false;
+      }
+    }
+  }
+
+  SmallVector<int> solvedWarpGroups(loop.nodes.size(), -1);
+  llvm::SmallDenseMap<int, int> solvedClusterWGs;
+  for (const auto &cluster : clusters) {
+    int wg = -1;
+    if (!checkedInt(wgMap->getInteger(std::to_string(cluster.id)), wg) ||
+        wg < 0 || wg >= static_cast<int>(clusters.size()))
+      return false;
+    solvedClusterWGs[cluster.id] = wg;
+    for (unsigned nodeId : cluster.nodeIds)
+      solvedWarpGroups[nodeId] = wg;
+  }
+
+  auto planVersion = loweringPlanObj->getString("version");
+  auto *planTemplates = loweringPlanObj->getArray("templates");
+  if (!planVersion || *planVersion != "lowering-plan-0.1" || !planTemplates ||
+      planTemplates->size() != loweringTemplates.size())
+    return false;
+
+  ttg::LoweringPlan solvedLoweringPlan;
+  solvedLoweringPlan.version = planVersion->str();
+  bool modeledPlan = v2 && !obj->getObject("arbitrated");
+  solvedLoweringPlan.status = modeledPlan
+                                  ? ttg::LoweringPlanStatus::ShadowStale
+                                  : ttg::LoweringPlanStatus::ShadowUnmodeled;
+  llvm::SmallDenseSet<unsigned, 8> seenTemplateIds;
+  std::set<std::pair<int, int>> seenStreamOrders;
+  llvm::DenseMap<int, SmallVector<std::pair<int, int>, 8>> streamsByWG;
+  struct EventPlacementCheck {
+    unsigned templateId;
+    unsigned eventId;
+    unsigned anchorNodeId;
+    ttg::LoweringPlacement placement;
+    int64_t issueDuration;
+    int cycle;
+  };
+  std::map<std::pair<unsigned, int>, SmallVector<EventPlacementCheck, 4>>
+      placementGroups;
+  for (const auto &planTemplateValue : *planTemplates) {
+    auto *planTemplateObj = planTemplateValue.getAsObject();
+    if (!planTemplateObj)
+      return false;
+    auto idValue = planTemplateObj->getInteger("id");
+    auto activeValue = planTemplateObj->getBoolean("active");
+    auto *planEvents = planTemplateObj->getArray("events");
+    if (!idValue || *idValue < 0 ||
+        *idValue >= static_cast<int64_t>(loweringTemplates.size()) ||
+        !activeValue || !planEvents)
+      return false;
+    unsigned templateId = static_cast<unsigned>(*idValue);
+    if (!seenTemplateIds.insert(templateId).second)
+      return false;
+    const auto &loweringTemplate = loweringTemplates[templateId];
+    if (loweringTemplate.id != templateId ||
+        loweringTemplate.srcNodeId >= solvedWarpGroups.size() ||
+        loweringTemplate.dstNodeId >= solvedWarpGroups.size())
+      return false;
+    auto srcClusterWG = solvedClusterWGs.find(loweringTemplate.srcCluster);
+    auto dstClusterWG = solvedClusterWGs.find(loweringTemplate.dstCluster);
+    if (srcClusterWG == solvedClusterWGs.end() ||
+        dstClusterWG == solvedClusterWGs.end())
+      return false;
+    int srcWG = srcClusterWG->second;
+    int dstWG = dstClusterWG->second;
+    if (solvedWarpGroups[loweringTemplate.srcNodeId] != srcWG ||
+        solvedWarpGroups[loweringTemplate.dstNodeId] != dstWG)
+      return false;
+    bool expectedActive = false;
+    switch (loweringTemplate.relation) {
+    case ttg::LoweringRelation::Always:
+      expectedActive = true;
+      break;
+    case ttg::LoweringRelation::SameWG:
+      expectedActive = srcWG == dstWG;
+      break;
+    case ttg::LoweringRelation::DifferentWG:
+      expectedActive = srcWG != dstWG;
+      break;
+    }
+    if (*activeValue != expectedActive ||
+        planEvents->size() !=
+            (expectedActive ? loweringTemplate.events.size() : 0))
+      return false;
+
+    ttg::LoweringTemplatePlan solvedTemplate;
+    solvedTemplate.id = templateId;
+    solvedTemplate.active = *activeValue;
+    llvm::SmallDenseSet<unsigned, 4> seenEventIds;
+    for (const auto &planEventValue : *planEvents) {
+      auto *planEventObj = planEventValue.getAsObject();
+      if (!planEventObj)
+        return false;
+      auto eventIdValue = planEventObj->getInteger("id");
+      int eventCycle = 0;
+      int eventWG = -1;
+      int streamOrder = -1;
+      if (!eventIdValue || *eventIdValue < 0 ||
+          *eventIdValue > std::numeric_limits<unsigned>::max() ||
+          !checkedInt(planEventObj->getInteger("cycle"), eventCycle) ||
+          !checkedInt(planEventObj->getInteger("wg"), eventWG) ||
+          !checkedInt(planEventObj->getInteger("stream_order"), streamOrder) ||
+          eventWG < 0 || streamOrder < 0)
+        return false;
+      unsigned eventId = static_cast<unsigned>(*eventIdValue);
+      if (!seenEventIds.insert(eventId).second)
+        return false;
+      const ttg::LoweringEventTemplate *eventTemplate = nullptr;
+      for (const auto &candidate : loweringTemplate.events)
+        if (candidate.id == eventId) {
+          eventTemplate = &candidate;
+          break;
+        }
+      if (!eventTemplate || eventTemplate->anchorNodeId >= solvedCycles.size())
+        return false;
+
+      unsigned ownerNodeId =
+          eventTemplate->owner == ttg::LoweringEventOwner::Src
+              ? loweringTemplate.srcNodeId
+              : loweringTemplate.dstNodeId;
+      int ownerWG = solvedWarpGroups[ownerNodeId];
+      int anchorWG = solvedWarpGroups[eventTemplate->anchorNodeId];
+      if (eventWG != ownerWG || anchorWG != ownerWG)
+        return false;
+      placementGroups[{eventTemplate->anchorNodeId,
+                       static_cast<int>(eventTemplate->placement)}]
+          .push_back({templateId, eventId, eventTemplate->anchorNodeId,
+                      eventTemplate->placement,
+                      loweringIssueSlots(*eventTemplate),
+                      eventCycle});
+      if (!seenStreamOrders.insert({eventWG, streamOrder}).second)
+        return false;
+      streamsByWG[eventWG].push_back({streamOrder, eventCycle});
+      solvedTemplate.events.push_back(
+          {eventId, eventCycle, eventWG, streamOrder});
+    }
+    if (expectedActive && seenEventIds.size() != loweringTemplate.events.size())
+      return false;
+    llvm::sort(solvedTemplate.events,
+               [](const ttg::LoweringEvent &lhs,
+                  const ttg::LoweringEvent &rhs) { return lhs.id < rhs.id; });
+    solvedLoweringPlan.templates.push_back(std::move(solvedTemplate));
+  }
+  if (seenTemplateIds.size() != loweringTemplates.size())
+    return false;
+  for (auto &placementEntry : placementGroups) {
+    auto &events = placementEntry.second;
+    llvm::sort(events, [](const EventPlacementCheck &lhs,
+                          const EventPlacementCheck &rhs) {
+      return std::tie(lhs.templateId, lhs.eventId) <
+             std::tie(rhs.templateId, rhs.eventId);
+    });
+    unsigned anchorNodeId = events.front().anchorNodeId;
+    int64_t cursor = solvedCycles[anchorNodeId];
+    if (events.front().placement == ttg::LoweringPlacement::Before) {
+      for (const auto &event : events)
+        cursor -= event.issueDuration;
+    } else {
+      cursor += std::max(loop.nodes[anchorNodeId].selfLatency, 1);
+    }
+    for (const auto &event : events) {
+      if (event.cycle != cursor)
+        return false;
+      cursor += event.issueDuration;
+    }
+  }
+  for (auto &streamEntry : streamsByWG) {
+    auto &stream = streamEntry.second;
+    llvm::sort(stream);
+    for (size_t i = 0; i < stream.size(); ++i) {
+      if (stream[i].first != static_cast<int>(i))
+        return false;
+      if (i > 0 && stream[i - 1].second > stream[i].second)
+        return false;
+    }
+  }
+  llvm::sort(
+      solvedLoweringPlan.templates,
+      [](const ttg::LoweringTemplatePlan &lhs,
+         const ttg::LoweringTemplatePlan &rhs) { return lhs.id < rhs.id; });
+
+  auto applySolvedCycles = [&](ttg::ScheduleLoop &target) {
+    for (auto &node : target.nodes) {
+      node.cycle = solvedCycles[node.id];
+      node.stage = node.cycle / target.II;
+    }
+    computeClusterIds(target);
+    int tcStart = target.II;
+    for (const auto &node : target.nodes)
+      if (node.pipeline == ttg::HWPipeline::TC || node.isSuperNode())
+        tcStart = std::min(tcStart, node.cycle);
+    target.prologueLatency = tcStart;
+    for (auto &node : target.nodes) {
+      if (node.producesBuffer == UINT_MAX)
+        continue;
+      auto &buf = target.buffers[node.producesBuffer];
+      if (buf.kind == ttg::MemoryKind::BARRIER)
+        continue;
+      llvm::DenseSet<unsigned> seen;
+      seen.insert(node.id);
+      unsigned explicitDepthFloor =
+          buf.count >= buf.explicitMinCount ? buf.explicitMinCount : 1u;
+      buf.liveStart = node.cycle;
+      buf.liveEnd = walkLastConsumerEnd(target, node.id, node.cycle, target.II,
+                                        0, seen);
+      buf.requestedCount = computeBufferCount(target, node.id);
+      buf.count = std::max(buf.requestedCount, explicitDepthFloor);
+    }
+    for (const auto &group : buildCoConsumedGroups(target)) {
+      unsigned maxDepth = 1;
+      for (unsigned bufferId : group)
+        maxDepth = std::max(maxDepth, target.buffers[bufferId].count);
+      for (unsigned bufferId : group)
+        target.buffers[bufferId].count = maxDepth;
+    }
+    for (auto &buf : target.buffers) {
+      if (buf.kind == ttg::MemoryKind::BARRIER ||
+          buf.pairedBufferId == UINT_MAX ||
+          buf.pairedBufferId >= target.buffers.size())
+        continue;
+      auto &barrier = target.buffers[buf.pairedBufferId];
+      if (barrier.kind != ttg::MemoryKind::BARRIER)
+        continue;
+      barrier.count = buf.count;
+      barrier.requestedCount = buf.requestedCount;
+      barrier.explicitMinCount = buf.explicitMinCount;
+    }
+  };
+
+  // Commit only after recomputing every cycle-dependent buffer and channel
+  // with the solved placement. The request's chan_bytes were derived from the
+  // incumbent cycles, so accepting them without this check could let a deeper
+  // final channel exceed the hard SMEM budget.
+  if (v2) {
+    ttg::ScheduleLoop preview = loop;
+    applySolvedCycles(preview);
+    llvm::SmallDenseMap<unsigned, int> previewNodeToWG;
+    for (auto &node : preview.nodes) {
+      node.warpGroup = solvedWarpGroups[node.id];
+    }
+    demoteScalarArithToInfra(preview);
+    propagateWarpGroupToInfraOps(preview);
+    coLocateOperandAllocsWithLoads(preview);
+    for (const auto &node : preview.nodes)
+      if (node.warpGroup >= 0)
+        previewNodeToWG[node.id] = node.warpGroup;
+    for (auto &buf : preview.buffers)
+      buf.mergeGroupId = UINT_MAX;
+    preview.physicalBuffers.clear();
+    mergeNonOverlappingBuffers(preview);
+    int64_t projectedSmem =
+        reservedSmemBytes + computeTotalSmem(preview) +
+        predictChannelSmemBytes(preview, previewNodeToWG);
+    if (projectedSmem > kSmemBudgetBytes()) {
+      LLVM_DEBUG(llvm::dbgs()
+                 << "[Phase4-JOINT] v2 rejected: solved lowering needs "
+                 << projectedSmem << "B SMEM (budget=" << kSmemBudgetBytes()
+                 << "B)\n");
+      return false;
+    }
+    if (computeTotalTmem(preview) > kTmemBudgetBytes) {
+      LLVM_DEBUG(llvm::dbgs()
+                 << "[Phase4-JOINT] v2 rejected: solved placement exceeds "
+                    "TMEM budget\n");
+      return false;
+    }
+    applySolvedCycles(loop);
+    for (auto &buf : loop.buffers)
+      buf.mergeGroupId = UINT_MAX;
+    loop.physicalBuffers.clear();
+    mergeNonOverlappingBuffers(loop);
+  }
+
+  // Apply, same shape as partitionExhaustive's winner application: NONE ops
+  // reset to -1 (propagateWarpGroupToInfraOps attaches them later).
+  for (auto &node : loop.nodes)
+    node.warpGroup = solvedWarpGroups[node.id];
+  loop.loweringTemplates = std::move(loweringTemplates);
+  loop.loweringPlan = std::move(solvedLoweringPlan);
+  loop.topPartitions.clear();
+  loop.topPartitionCosts.clear();
+  if (auto objVal = obj->getNumber("objective"))
+    loop.partitionCost = *objVal;
+  LLVM_DEBUG({
+    llvm::dbgs() << "[Phase4-JOINT] joint-solver partition: "
+                 << obj->getInteger("used_wgs").value_or(-1)
+                 << " WGs, cost=" << loop.partitionCost << "\n";
+    for (const auto &c : clusters)
+      llvm::dbgs() << "[Phase4-JOINT]   C" << c.id << " ("
+                   << ttg::getPipelineName(c.pipeline) << ") → wg"
+                   << wgMap->getInteger(std::to_string(c.id)).value_or(-1)
+                   << "\n";
+  });
+  return true;
+}
+
+static void finalizeLoweringPlanStatus(ttg::ScheduleLoop &loop) {
+  auto &plan = loop.loweringPlan;
+  if (loop.loweringTemplates.empty() && plan.templates.empty()) {
+    plan.status = ttg::LoweringPlanStatus::Absent;
+    return;
+  }
+
+  bool structurallyValid =
+      plan.version == "lowering-plan-0.1" &&
+      loop.loweringTemplates.size() == plan.templates.size();
+  llvm::SmallDenseMap<unsigned, const ttg::LoweringTemplatePlan *, 8> planById;
+  for (const auto &templatePlan : plan.templates)
+    structurallyValid &=
+        planById.try_emplace(templatePlan.id, &templatePlan).second;
+
+  for (const auto &loweringTemplate : loop.loweringTemplates) {
+    auto planIt = planById.find(loweringTemplate.id);
+    if (planIt == planById.end() ||
+        loweringTemplate.srcNodeId >= loop.nodes.size() ||
+        loweringTemplate.dstNodeId >= loop.nodes.size()) {
+      structurallyValid = false;
+      continue;
+    }
+    const auto &templatePlan = *planIt->second;
+    int srcWG = loop.nodes[loweringTemplate.srcNodeId].warpGroup;
+    int dstWG = loop.nodes[loweringTemplate.dstNodeId].warpGroup;
+    bool active = false;
+    switch (loweringTemplate.relation) {
+    case ttg::LoweringRelation::Always:
+      active = true;
+      break;
+    case ttg::LoweringRelation::SameWG:
+      active = srcWG == dstWG;
+      break;
+    case ttg::LoweringRelation::DifferentWG:
+      active = srcWG != dstWG;
+      break;
+    }
+    if (templatePlan.active != active ||
+        templatePlan.events.size() !=
+            (active ? loweringTemplate.events.size() : 0)) {
+      structurallyValid = false;
+      continue;
+    }
+
+    llvm::SmallDenseSet<unsigned, 4> seenEventIds;
+    for (const auto &event : templatePlan.events) {
+      const ttg::LoweringEventTemplate *eventTemplate = nullptr;
+      for (const auto &candidate : loweringTemplate.events)
+        if (candidate.id == event.id) {
+          eventTemplate = &candidate;
+          break;
+        }
+      if (!eventTemplate || !seenEventIds.insert(event.id).second ||
+          eventTemplate->anchorNodeId >= loop.nodes.size()) {
+        structurallyValid = false;
+        continue;
+      }
+      unsigned ownerNodeId =
+          eventTemplate->owner == ttg::LoweringEventOwner::Src
+              ? loweringTemplate.srcNodeId
+              : loweringTemplate.dstNodeId;
+      int ownerWG = loop.nodes[ownerNodeId].warpGroup;
+      int anchorWG = loop.nodes[eventTemplate->anchorNodeId].warpGroup;
+      structurallyValid &= event.warpGroup == ownerWG && anchorWG == ownerWG;
+    }
+  }
+
+  if (!structurallyValid) {
+    plan.status = ttg::LoweringPlanStatus::ShadowStale;
+    return;
+  }
+  if (plan.status != ttg::LoweringPlanStatus::ShadowUnmodeled)
+    plan.status = ttg::LoweringPlanStatus::ShadowVerified;
+}
+
+/// Whole-nest epilogue warp-group unification (cost-model,
+/// storage-class-priced).
+///
+/// A persistent outer loop's epilogue may consume a value V produced by its
+/// inner loop. If V is a REGISTER value, running the epilogue in a warp group
+/// separate from V's producer forces V through an SMEM materialization
+/// round-trip (a local_store in the producer plus a local_load + 2 barriers in
+/// the consumer) — a real cost that scales with bytes(V). Co-locating the
+/// epilogue into the inner producer's warp group removes that hand-off.
+///
+/// The decision is priced by V's storage class, NOT by a "register → same WG"
+/// rule (that would just be pattern matching):
+///   Register V  → co-locating saves the full materialization (~2·bytes),
+///                 which is otherwise pure overhead → co-locate.
+///   TMEM/SMEM V → the consumer needs a barrier to read V regardless of which
+///                 warp group runs the epilogue, so co-location saves ~nothing.
+///                 A GEMM's TMEM accumulator therefore legitimately keeps its
+///                 own epilogue WG → stay separate.
+/// Overlap benefit is left implicit in the loop II/makespan (the epilogue work
+/// is scheduled either way); we price only the hand-off co-location removes.
+///
+/// The decision is expressed by RENUMBERING the epilogue-owning outer warp
+/// group so its id is meaningful across the super-node boundary — no side
+/// field:
+///   co-locate → the inner producer's warp-group id (the epilogue now SHARES
+///   it,
+///               which is exactly the co-location signal the emitter reads),
+///   separate  → a FRESH id above every id in the nest, guaranteed not to alias
+///               any inner id (so "epilogue wg == an inner wg" unambiguously
+///               means co-located, never a coincidence).
+/// The whole epilogue-owning group is renumbered together, so no intra-outer
+/// edge becomes cross-WG (no spurious barriers on super-node→epilogue or
+/// index-math→store). sched2tlx then just reads the warp-group id.
+static void unifyNestEpilogueWarpGroup(ttg::ScheduleGraph &graph) {
+  for (auto &outer : graph.loops) {
+    // Outer (persistent) loop = owns a descriptor_store AND wraps an inner-loop
+    // super-node.
+    tt::DescriptorStoreOp storeOp;
+    unsigned storeNodeId = 0;
+    scf::ForOp innerFor;
+    int innerId = -1;
+    for (auto &n : outer.nodes) {
+      if (n.op && isa<tt::DescriptorStoreOp>(n.op)) {
+        storeOp = cast<tt::DescriptorStoreOp>(n.op);
+        storeNodeId = n.id;
+      }
+      if (n.childPipelineId != UINT_MAX && n.op)
+        if (auto f = dyn_cast<scf::ForOp>(n.op)) {
+          innerFor = f;
+          innerId = static_cast<int>(n.childPipelineId);
+        }
+    }
+    if (!storeOp || !innerFor || innerId < 0)
+      continue;
+
+    // The epilogue-owning outer warp group (the group that runs the store).
+    int epiWg = -1;
+    for (auto &n : outer.nodes)
+      if (n.id == storeNodeId) {
+        epiWg = n.warpGroup;
+        break;
+      }
+    if (epiWg < 0)
+      continue;
+
+    // Inner warp-group ids + a fresh id above every id in the whole nest.
+    int freshId = 0;
+    const ttg::ScheduleLoop *innerLoop = nullptr;
+    for (auto &l : graph.loops) {
+      for (auto &n : l.nodes)
+        freshId = std::max(freshId, n.warpGroup + 1);
+      if (static_cast<int>(l.id) == innerId)
+        innerLoop = &l;
+    }
+
+    // Default: SEPARATE — a fresh non-aliasing id.
+    int newWg = freshId;
+
+    // Trace the store's source back to the inner-loop result it consumes. If
+    // that result is a REGISTER tensor, co-locate into its producer partition.
+    int resultIdx = -1;
+    SmallVector<Value> work{storeOp.getSrc()};
+    llvm::SmallPtrSet<Value, 8> seen;
+    while (!work.empty()) {
+      Value v = work.pop_back_val();
+      if (!seen.insert(v).second)
+        continue;
+      if (auto res = dyn_cast<OpResult>(v))
+        if (res.getOwner() == innerFor.getOperation()) {
+          resultIdx = static_cast<int>(res.getResultNumber());
+          continue;
+        }
+      Operation *def = v.getDefiningOp();
+      if (!def || def == innerFor.getOperation())
+        continue; // block arg / iv, or the inner loop itself.
+      // Only descend ops in the outer loop body — never into the inner loop.
+      if (def->getParentRegion() != innerFor->getParentRegion())
+        continue;
+      for (Value operand : def->getOperands())
+        work.push_back(operand);
+    }
+
+    if (resultIdx >= 0 && innerLoop) {
+      Value innerResult = innerFor.getResult(resultIdx);
+      if (auto tensorTy = dyn_cast<RankedTensorType>(innerResult.getType())) {
+        int64_t elems = 1;
+        for (auto d : tensorTy.getShape())
+          elems *= d;
+        int64_t bytes = elems * (tensorTy.getElementTypeBitWidth() / 8);
+        auto yield = cast<scf::YieldOp>(innerFor.getBody()->getTerminator());
+        Operation *yieldDef = yield.getOperand(resultIdx).getDefiningOp();
+        int producerWg = -1;
+        if (yieldDef)
+          for (auto &n : innerLoop->nodes)
+            if (n.op == yieldDef && n.warpGroup >= 0) {
+              producerWg = n.warpGroup;
+              break;
+            }
+        if (bytes > 0 && producerWg >= 0) {
+          newWg = producerWg; // co-locate: share the producer's WG id.
+          LLVM_DEBUG(llvm::dbgs()
+                     << "[colocate] outer epilogue → inner WG " << producerWg
+                     << " (register hand-off " << bytes << " B removed)\n");
+        }
+      }
+    }
+
+    if (newWg == epiWg)
+      continue; // already correct.
+
+    // Renumber the WHOLE epilogue-owning group together.
+    for (auto &n : outer.nodes)
+      if (n.warpGroup == epiWg)
+        n.warpGroup = newWg;
+  }
+}
+
 /// Pass B: Per-loop warp-group partition + cross-group barriers. Each
 /// ScheduleLoop gets its own Phase 4 partition run with its own II.
 /// Nested kernels (case2/case5) get inner-partition (e.g., 3-WG GEMM
@@ -4490,8 +6287,12 @@ static void clampOuterStagesAndClusters(scf::ForOp outerLoop) {
 ///
 /// `TRITON_MODULO_EXHAUSTIVE_PARTITION=0|off|false` opts into the greedy
 /// fallback partitioner. Default is the exhaustive Phase 4 search.
-static void
-applyGlobalWarpPartition(MutableArrayRef<ScheduledLoop> scheduledLoops) {
+/// `jointMode` (set by the joint-solver pass, Off under the modulo pass)
+/// engages the joint-solver partition above; each per-loop solver failure
+/// falls back down the chain to the exhaustive scorer.
+static LogicalResult
+applyGlobalWarpPartition(MutableArrayRef<ScheduledLoop> scheduledLoops,
+                         ttg::JointSolverMode jointMode) {
   auto exhaustiveEnv =
       triton::tools::getStrEnv("TRITON_MODULO_EXHAUSTIVE_PARTITION");
   bool useGreedy = (exhaustiveEnv == "0" || exhaustiveEnv == "false" ||
@@ -4500,10 +6301,30 @@ applyGlobalWarpPartition(MutableArrayRef<ScheduledLoop> scheduledLoops) {
   // alongside every OTHER loop's buffers (nested/sibling loops coexist in
   // the CTA — the budget reducers already enforce the limit jointly, see
   // reduceBuffersForGlobalBudget; the channel-capacity gate must too).
-  int64_t allLoopsSmem = 0;
-  for (auto &sl : scheduledLoops)
-    for (auto &schedLoop : sl.graph.loops)
-      allLoopsSmem += computeTotalSmem(schedLoop);
+  auto computeReservedSmem = [&](ttg::ScheduleLoop &current) {
+    int64_t total = 0;
+    Operation *currentOp =
+        current.forOp ? current.forOp.getOperation() : nullptr;
+    llvm::DenseMap<Operation *, int64_t> bytesByLoop;
+    for (auto &sl : scheduledLoops) {
+      for (auto &candidate : sl.graph.loops) {
+        Operation *candidateOp =
+            candidate.forOp ? candidate.forOp.getOperation() : nullptr;
+        if (&candidate == &current ||
+            (currentOp && candidateOp == currentOp))
+          continue;
+        int64_t bytes = computeTotalSmem(candidate);
+        if (candidateOp)
+          bytesByLoop[candidateOp] =
+              std::max(bytesByLoop.lookup(candidateOp), bytes);
+        else
+          total += bytes;
+      }
+    }
+    for (const auto &[_, bytes] : bytesByLoop)
+      total += bytes;
+    return total;
+  };
   for (auto &sl : scheduledLoops) {
     for (auto &schedLoop : sl.graph.loops) {
       if (schedLoop.II <= 0)
@@ -4521,17 +6342,63 @@ applyGlobalWarpPartition(MutableArrayRef<ScheduledLoop> scheduledLoops) {
       // on separate warp groups frees the compute warps and removes the
       // in-stream store drain (measured ~1.2x over 1-WG software
       // pipelining).
-      if (useGreedy) {
+      // TRITON_MODULO_EXHAUSTIVE_PARTITION=0 selects the greedy heuristic,
+      // but only WITHIN heuristic partitioning: when a joint mode is active
+      // (the joint pass, or the joint_solver-schedule promotion in
+      // runScheduleDriver) the env var must not silently disable the
+      // joint-solver partition — heuristics on a joint-solver schedule
+      // re-create the softmax-cut failure class. It instead picks which
+      // heuristic the joint chain falls back to.
+      if (useGreedy && jointMode == ttg::JointSolverMode::Off) {
         partitionIntoWarpGroups(schedLoop);
       } else {
-        partitionExhaustive(schedLoop,
-                            allLoopsSmem - computeTotalSmem(schedLoop));
+        int64_t reserved = computeReservedSmem(schedLoop);
+        // Joint-solver modes: v2 solves cycles + warp groups in one model,
+        // v1 solves warp groups with cycles fixed. The default chain tries
+        // v2 then v1; both fall back to the heuristics (greedy when
+        // requested, exhaustive scorer otherwise).
+        bool jointDone = false;
+        if (jointMode == ttg::JointSolverMode::V2ThenV1 ||
+            jointMode == ttg::JointSolverMode::V2Only)
+          jointDone = partitionJointSolver(schedLoop, reserved, /*v2=*/true);
+        if (!jointDone && (jointMode == ttg::JointSolverMode::V2ThenV1 ||
+                           jointMode == ttg::JointSolverMode::V1Only))
+          jointDone = partitionJointSolver(schedLoop, reserved, /*v2=*/false);
+        if (!jointDone) {
+          // Apply-stage terminal trigger. The heuristic partitioner below
+          // still runs so the attempt finishes in a well-formed state, but
+          // its result is not a legitimate outcome: it would pair a
+          // joint-solver MinII schedule with a heuristic partition. The
+          // policy layer in runScheduleDriver discards the whole attempt and
+          // reruns the complete baseline path. Replacing the current
+          // v2 -> v1 -> exhaustive mixed-state cascade itself is a separate
+          // cleanup with its own blast radius; this closes the joint solver's
+          // route into that state.
+          if (jointMode != ttg::JointSolverMode::Off)
+            ttg::reportJointSolverFailure(
+                ttg::JointSolverTrigger::PartitionSolve,
+                ("joint warp-group partition failed for a loop at II=" +
+                 Twine(schedLoop.II))
+                    .str());
+          if (useGreedy)
+            partitionIntoWarpGroups(schedLoop);
+          else
+            partitionExhaustive(schedLoop, reserved);
+        }
       }
       demoteScalarArithToInfra(schedLoop);
       propagateWarpGroupToInfraOps(schedLoop);
       coLocateOperandAllocsWithLoads(schedLoop);
     }
   }
+
+  // Cross-loop reconciliation: now that every loop has warp groups, unify each
+  // outer epilogue's warp-group id with its inner producer
+  // (storage-class-priced hand-off cost model). Runs before barrier insertion
+  // so the renumbered ids drive barrier synthesis and the emitter reads them
+  // directly.
+  for (auto &sl : scheduledLoops)
+    unifyNestEpilogueWarpGroup(sl.graph);
 
   // Run barrier insertion per-loop using the now-globally-consistent
   // warp-group IDs. Cross-loop barriers (from Phase 2 edges) are still
@@ -4555,7 +6422,76 @@ applyGlobalWarpPartition(MutableArrayRef<ScheduledLoop> scheduledLoops) {
         buf.mergeGroupId = UINT_MAX;
       schedLoop.physicalBuffers.clear();
       mergeNonOverlappingBuffers(schedLoop);
+      finalizeLoweringPlanStatus(schedLoop);
     }
+  // Final memory audit. Under a joint mode each rejection is also a terminal
+  // trigger: a joint-solver schedule presses II down and buffer depths up, so
+  // it can overrun a budget the baseline schedule fits in. Reporting it lets
+  // the policy layer rerun the baseline instead of hard-failing a compile the
+  // heuristics would have completed.
+  auto reportAuditFailure = [&](const Twine &what) {
+    if (jointMode != ttg::JointSolverMode::Off)
+      ttg::reportJointSolverFailure(ttg::JointSolverTrigger::MemoryAudit,
+                                    what.str());
+  };
+  int64_t finalSmem = 0;
+  ttg::ScheduleLoop *diagnosticLoop = nullptr;
+  llvm::DenseMap<Operation *, int64_t> smemByLoop;
+  llvm::DenseMap<Operation *, int64_t> tmemByLoop;
+  for (auto &sl : scheduledLoops) {
+    for (auto &schedLoop : sl.graph.loops) {
+      Operation *loopOp =
+          schedLoop.forOp ? schedLoop.forOp.getOperation() : nullptr;
+      if (!diagnosticLoop)
+        diagnosticLoop = &schedLoop;
+      int64_t loopSmem = computeEmitterSmem(schedLoop);
+      int64_t finalTmem = computeTotalTmem(schedLoop);
+      if (loopOp) {
+        smemByLoop[loopOp] = std::max(smemByLoop.lookup(loopOp), loopSmem);
+        tmemByLoop[loopOp] = std::max(tmemByLoop.lookup(loopOp), finalTmem);
+      } else {
+        finalSmem += loopSmem;
+      }
+      if (!loopOp && finalTmem > kTmemBudgetBytes) {
+        if (schedLoop.forOp)
+          schedLoop.forOp.emitError()
+              << "final lowering requires " << finalTmem
+              << " bytes of TMEM, exceeding the " << kTmemBudgetBytes
+              << "-byte budget";
+        reportAuditFailure("final lowering requires " + Twine(finalTmem) +
+                           " bytes of TMEM, exceeding the " +
+                           Twine(kTmemBudgetBytes) + "-byte budget");
+        return failure();
+      }
+    }
+  }
+  for (const auto &[_, bytes] : smemByLoop)
+    finalSmem += bytes;
+  for (const auto &[_, bytes] : tmemByLoop) {
+    if (bytes <= kTmemBudgetBytes)
+      continue;
+    if (diagnosticLoop && diagnosticLoop->forOp)
+      diagnosticLoop->forOp.emitError()
+          << "final lowering requires " << bytes
+          << " bytes of TMEM, exceeding the " << kTmemBudgetBytes
+          << "-byte budget";
+    reportAuditFailure("final lowering requires " + Twine(bytes) +
+                       " bytes of TMEM, exceeding the " +
+                       Twine(kTmemBudgetBytes) + "-byte budget");
+    return failure();
+  }
+  if (finalSmem > kSmemBudgetBytes()) {
+    if (diagnosticLoop && diagnosticLoop->forOp)
+      diagnosticLoop->forOp.emitError()
+          << "final lowering requires " << finalSmem
+          << " bytes of SMEM, exceeding the " << kSmemBudgetBytes()
+          << "-byte budget";
+    reportAuditFailure("final lowering requires " + Twine(finalSmem) +
+                       " bytes of SMEM, exceeding the " +
+                       Twine(kSmemBudgetBytes()) + "-byte budget");
+    return failure();
+  }
+  return success();
 }
 
 /// Re-run the partition-dependent finalization on ONE loop for the top-N
@@ -4636,7 +6572,10 @@ static SmallVector<CandidateLoop> collectCandidates(ModuleOp moduleOp) {
         c.hasTMA = true;
       if (isa<ttng::TCGen5MMAOp, ttng::TCGen5MMAScaledOp>(&op)) {
         c.hasMMA = true;
-        if (op.hasAttr("tt.autows"))
+        // STANDALONE owns the schedule: a tt.autows here carries only an
+        // operand memtype hint (already consumed by PromoteLHSToTMem before
+        // this pass), so do NOT treat it as a user-tuned schedule to skip.
+        if (op.hasAttr("tt.autows") && !isStandaloneModulo())
           c.hasExistingAnnotation = true;
       }
       if (isa<scf::ForOp>(&op))
@@ -4647,6 +6586,222 @@ static SmallVector<CandidateLoop> collectCandidates(ModuleOp moduleOp) {
   llvm::stable_sort(
       result, [](const auto &a, const auto &b) { return a.depth > b.depth; });
   return result;
+}
+
+// ── Pass A.5 auto search ─────────────────────────────────────────────────────
+// Picks the data-partition factor by solving each candidate variant with the
+// same scheduler and comparing on the model, instead of requiring the user to
+// name N. Triggered by TRITON_DATA_PARTITION_N=auto (all targets) or, in
+// sched2tlx dump mode, self-triggered when the baseline is TLX-illegal (see
+// dataPartitionAutoSearch). The candidate set comes from
+// enumerateDataPartitionCandidates (a handful of divisors of BM), so the
+// whole search is a few extra in-process schedule runs.
+//
+// Score, lexicographic:
+//   1. TMEM legality — this is the TLX `local_alloc` lane constraint of the
+//      sched2tlx target, NOT a universal one: TLX allocates a tcgen05
+//      accumulator as at most kTmemLanes rows, so a per-CTA, per-group M above
+//      the lane count cannot be lowered there and a split that brings it under
+//      wins outright (this is what makes BM=256 configs lowerable). The in-tree
+//      TTGIR allocator instead folds tall M into TMEM columns, so this term is
+//      scoped to the dump/TLX path (the self-trigger only fires in dump mode;
+//      an explicit env override that reaches in-tree is the user's choice).
+//      Judged straight off the candidate surface (per-CTA bm = n x m_size from
+//      enumerateDataPartitionCandidates), so it covers function-scope
+//      accumulators (flat kernels, which never become ScheduleBuffers) and
+//      never touches non-accumulator TMEM (MMA-scaled scale allocs fold rows
+//      into columns and are exempt);
+//   2. loops scheduled (a variant that fails to schedule a loop loses);
+//   3. sum of loop IIs (steady-state throughput; after the occupancy
+//      de-bias in applyDataPartition an M-split conserves MAC area, so
+//      this usually ties);
+//   4. SMEM shortfall in bytes — how far the budget reducers cut buffer
+//      rings below their lifetime-demanded depths (requestedCount vs
+//      count): a shrunk epilogue staging tile frees SMEM that lets
+//      operand rings reach full depth.
+// Ties keep the incumbent, so the baseline (N=1) wins unless a split is a
+// strict improvement.
+// TLX local_alloc geometry: it lays a tcgen05 accumulator out as at most 128
+// lanes (rows) x 512 columns per CTA, so a per-CTA M above this cannot be
+// lowered through local_alloc and needs an M-split. (The in-tree TTGIR path
+// folds tall M into columns instead — this bound is the TLX target's, used
+// only on the dump/self-trigger path; see the score doc above.)
+constexpr int64_t kTmemLanes = 128;
+
+// Does any partitionable accumulator exceed the TLX lane limit at baseline
+// (un-split), i.e. is the M-split the only way this module lowers on the TLX
+// target? Skips tt.autows-pinned MMAs (user-tuned, not our realization).
+static bool baselineExceedsTmemLanes(ModuleOp moduleOp) {
+  bool illegal = false;
+  moduleOp.walk([&](Operation *op) {
+    if (op->hasAttr("tt.autows"))
+      return;
+    for (const auto &c : enumerateDataPartitionCandidates(op)) {
+      // Every candidate of an op shares the same baseline BM = n * mSize.
+      if (static_cast<int64_t>(c.n) * c.mSize > kTmemLanes)
+        illegal = true;
+      break;
+    }
+  });
+  return illegal;
+}
+
+static bool dataPartitionAutoSearch(ModuleOp moduleOp, int optionFactor) {
+  if (optionFactor > 1)
+    return false; // explicit pass option wins
+  // Explicit `TRITON_DATA_PARTITION_N=auto` opts every target into the search
+  // (an override that also covers in-tree compiles). Per-loop
+  // tt.data_partition_factor attrs no longer disable it — the search resolves
+  // each MMA on its own terms (pinned MMAs keep their factor; see
+  // computeDataPartitionPlanForN), so a mixed pinned/auto module works.
+  if (triton::tools::getStrEnv("TRITON_DATA_PARTITION_N") == "auto")
+    return true;
+  // Self-trigger only while producing a sched2tlx dump AND only when the
+  // baseline cannot be lowered as-is on the TLX target (an accumulator taller
+  // than the local_alloc lane limit) — there the split is not an optimization
+  // but the only lowerable realization, so it should not depend on a debug
+  // env. In-tree compiles (no dump) fold tall M into TMEM columns and are left
+  // untouched.
+  if (!triton::tools::getStrEnv("TRITON_MODULO_DUMP_SCHEDULE").empty())
+    return baselineExceedsTmemLanes(moduleOp);
+  return false;
+}
+
+static DataPartitionPlan
+searchDataPartitionPlan(ModuleOp moduleOp, const ttg::LatencyModel &model,
+                        triton::ModuleAxisInfoAnalysis &axisInfo,
+                        StringRef scheduleAlgo) {
+  // Baseline respects explicit pins: an MMA with tt.data_partition_factor keeps
+  // that factor even before the search (the user asked for it); every other MMA
+  // is N=1. Variants (computeDataPartitionPlanForN) layer the searched N onto
+  // only the un-pinned MMAs, so a pinned MMA never re-enters the search.
+  DataPartitionPlan baseline =
+      computeDataPartitionPlan(moduleOp, /*optionFactor=*/0);
+  std::set<unsigned> factors;
+  // Per-MMA per-CTA accumulator height, off the candidate surface (every
+  // candidate has mSize = bm / n, so bm = n * mSize). This is the basis of
+  // the TMEM-legality score term — deliberately NOT derived from
+  // ScheduleBuffers, which only exist for allocs inside a scheduled loop
+  // body (a flat kernel's function-scope accumulator would be invisible).
+  // Skip tt.autows-pinned MMAs: they live in loops the evaluate() loop and the
+  // real orchestrator both skip (hasExistingAnnotation), so no plan here ever
+  // realizes their split — crediting a variant with "fixing" them would be
+  // fictitious and could drag a partition onto an unrelated healthy loop.
+  SmallVector<std::pair<Operation *, int64_t>> accRows;
+  moduleOp.walk([&](Operation *op) {
+    if (op->hasAttr("tt.autows"))
+      return;
+    auto cands = enumerateDataPartitionCandidates(op);
+    if (cands.empty())
+      return;
+    accRows.push_back(
+        {op, static_cast<int64_t>(cands.front().n) * cands.front().mSize});
+    for (const auto &c : cands)
+      factors.insert(c.n);
+  });
+  if (factors.empty())
+    return baseline;
+
+  auto tmemLegalFor = [&](const DataPartitionPlan &plan) {
+    for (const auto &[op, bm] : accRows) {
+      int64_t rows = bm;
+      if (auto it = plan.mmaInfo.find(op); it != plan.mmaInfo.end())
+        rows = it->second.mSize;
+      if (rows > kTmemLanes)
+        return false;
+    }
+    return true;
+  };
+
+  auto candidates = collectCandidates(moduleOp);
+  // Deeper nests are rejected by the main pass; don't search them.
+  for (const auto &c : candidates)
+    if (c.depth >= 2)
+      return baseline;
+
+  // The evaluations below re-run DDG construction once per variant; swallow
+  // warnings/remarks (e.g. the dynamic trip-count note) so each diagnostic
+  // reaches the user once — from the real scheduling run — not once per
+  // variant. Errors still propagate.
+  ScopedDiagnosticHandler quietWarnings(
+      moduleOp.getContext(), [](Diagnostic &diag) {
+        return success(diag.getSeverity() == DiagnosticSeverity::Warning ||
+                       diag.getSeverity() == DiagnosticSeverity::Remark);
+      });
+  // Same reasoning for the joint-solver fallback policy: a variant that fails
+  // to schedule a loop is a scored outcome here (it just loses), not a
+  // terminal trigger. Without this nested scope, absorbing the reports, one
+  // throwaway variant's solver failure would discard the whole joint attempt
+  // — or hard-fail the compile under strict-error — even though the winning
+  // plan scheduled cleanly.
+  ttg::JointSolverFallbackScope quietTriggers;
+
+  struct Score {
+    bool tmemLegal = true;
+    size_t scheduled = 0;
+    int64_t iiSum = 0;
+    int64_t shortfallBytes = 0;
+  };
+  auto evaluate = [&](const DataPartitionPlan &plan) {
+    Score sc;
+    sc.tmemLegal = tmemLegalFor(plan);
+    SmallVector<ScheduledLoop, 2> sls;
+    for (const auto &c : candidates) {
+      if (c.hasExistingAnnotation)
+        continue;
+      if (c.hasInnerLoop)
+        scheduleAndRecord(c.op, "Outer", /*isOuter=*/true, model, axisInfo,
+                          plan, scheduleAlgo, /*printScheduleGraph=*/false,
+                          sls);
+      else if (c.hasMMA || c.hasTMA)
+        scheduleAndRecord(c.op, "Inner", /*isOuter=*/false, model, axisInfo,
+                          plan, scheduleAlgo, /*printScheduleGraph=*/false,
+                          sls);
+    }
+    sc.scheduled = sls.size();
+    for (const auto &sl : sls) {
+      for (const auto &loop : sl.graph.loops) {
+        sc.iiSum += std::max(loop.II, 0);
+        for (const auto &buf : loop.buffers)
+          if (buf.kind == ttg::MemoryKind::SMEM &&
+              buf.requestedCount > buf.count)
+            sc.shortfallBytes +=
+                static_cast<int64_t>(buf.requestedCount - buf.count) *
+                buf.sizeBytes();
+      }
+    }
+    return sc;
+  };
+
+  Score best = evaluate(baseline);
+  DataPartitionPlan bestPlan = baseline;
+  unsigned bestN = 1;
+  LDBG("[A.5-auto] baseline: tmemLegal="
+       << best.tmemLegal << " scheduled=" << best.scheduled << " iiSum="
+       << best.iiSum << " shortfall=" << best.shortfallBytes << "B");
+  // No variant cap: the candidate set is already bounded by BM's divisor
+  // structure (bm % n == 0 with bm/n >= minM leaves a handful of factors).
+  for (unsigned n : factors) {
+    DataPartitionPlan plan = computeDataPartitionPlanForN(moduleOp, n);
+    if (plan.mmaInfo.empty())
+      continue;
+    Score sc = evaluate(plan);
+    LDBG("[A.5-auto] N=" << n << ": tmemLegal=" << sc.tmemLegal << " scheduled="
+                         << sc.scheduled << " iiSum=" << sc.iiSum
+                         << " shortfall=" << sc.shortfallBytes << "B");
+    auto key = [](const Score &x) {
+      return std::make_tuple(!x.tmemLegal, -static_cast<int64_t>(x.scheduled),
+                             x.iiSum, x.shortfallBytes);
+    };
+    bool better = key(sc) < key(best);
+    if (better) {
+      best = sc;
+      bestPlan = std::move(plan);
+      bestN = n;
+    }
+  }
+  LDBG("[A.5-auto] picked N=" << bestN);
+  return bestPlan;
 }
 
 // ============================================================================
@@ -5000,6 +7155,75 @@ void jsonDumpScheduleLoop(llvm::raw_ostream &os, const ttg::ScheduleLoop &sl,
   }
   os << "      ],\n";
 
+  // Symbolic lowering contract and its fixed-II shadow placement. The emitter
+  // still derives executable synchronization from cross_wg_barriers.
+  os << "      \"lowering_templates\": [";
+  for (size_t i = 0; i < sl.loweringTemplates.size(); ++i) {
+    const auto &loweringTemplate = sl.loweringTemplates[i];
+    if (i)
+      os << ", ";
+    os << "{\"id\": " << loweringTemplate.id << ", \"relation\": \""
+       << loweringRelationName(loweringTemplate.relation)
+       << "\", \"src_node\": " << loweringTemplate.srcNodeId
+       << ", \"dst_node\": " << loweringTemplate.dstNodeId
+       << ", \"src_cluster\": " << loweringTemplate.srcCluster
+       << ", \"dst_cluster\": " << loweringTemplate.dstCluster
+       << ", \"events\": [";
+    for (size_t j = 0; j < loweringTemplate.events.size(); ++j) {
+      const auto &event = loweringTemplate.events[j];
+      if (j)
+        os << ", ";
+      os << "{\"id\": " << event.id << ", \"kind\": \""
+         << loweringEventKindName(event.kind) << "\", \"owner\": \""
+         << loweringOwnerName(event.owner)
+         << "\", \"anchor_node\": " << event.anchorNodeId
+         << ", \"placement\": \"" << loweringPlacementName(event.placement)
+         << "\", \"pipeline\": \"" << ttg::getPipelineName(event.pipeline)
+         << "\", \"issue_duration\": " << event.issueDuration
+         << ", \"completion_latency\": " << event.completionLatency
+         << ", \"blocking\": " << (event.blocking ? "true" : "false")
+         << ", \"async\": " << (event.isAsync ? "true" : "false")
+         << ", \"distance\": " << event.distance
+         << ", \"frequency\": " << event.frequency << ", \"buffer_id\": "
+         << (event.bufferId == UINT_MAX ? std::string("null")
+                                        : std::to_string(event.bufferId))
+         << ", \"bytes\": " << event.bytes << ", \"depth\": " << event.depth
+         << ", \"semaphore\": \"" << loweringSemaphoreName(event.semaphore)
+         << "\", \"fusion_group\": "
+         << (event.fusionGroup == UINT_MAX ? std::string("null")
+                                           : std::to_string(event.fusionGroup))
+         << ", \"dedup_group\": "
+         << (event.dedupGroup == UINT_MAX ? std::string("null")
+                                          : std::to_string(event.dedupGroup))
+         << "}";
+    }
+    os << "]}";
+  }
+  os << "],\n";
+
+  os << "      \"lowering_plan\": {\"version\": \""
+     << jsonEscape(sl.loweringPlan.version) << "\", \"status\": \""
+     << loweringPlanStatusName(sl.loweringPlan.status)
+     << "\", \"templates\": [";
+  for (size_t i = 0; i < sl.loweringPlan.templates.size(); ++i) {
+    const auto &loweringTemplate = sl.loweringPlan.templates[i];
+    if (i)
+      os << ", ";
+    os << "{\"id\": " << loweringTemplate.id
+       << ", \"active\": " << (loweringTemplate.active ? "true" : "false")
+       << ", \"events\": [";
+    for (size_t j = 0; j < loweringTemplate.events.size(); ++j) {
+      const auto &event = loweringTemplate.events[j];
+      if (j)
+        os << ", ";
+      os << "{\"id\": " << event.id << ", \"cycle\": " << event.cycle
+         << ", \"wg\": " << event.warpGroup
+         << ", \"stream_order\": " << event.streamOrder << "}";
+    }
+    os << "]}";
+  }
+  os << "]},\n";
+
   // Graph: nodes + edges (first-class, from ScheduleGraph).
   os << "      \"graph\": {\n";
 
@@ -5033,12 +7257,18 @@ void jsonDumpScheduleLoop(llvm::raw_ostream &os, const ttg::ScheduleLoop &sl,
     if (n.isSuperNode())
       os << ", \"child_pipeline_id\": " << n.childPipelineId
          << ", \"prologue_latency\": " << n.prologueLatency;
-    // Pass A.5 data-partition fields on the (single) MMA bundle node. A.7
-    // subtile fields remain a separate follow-up.
+    // Pass A.5 data-partition fields on the (single) MMA bundle node.
     if (n.partitionCount > 1)
       os << ", \"partition_count\": " << n.partitionCount
          << ", \"partition_dim\": " << n.partitionDim
          << ", \"m_size\": " << n.mSize;
+    // Pass A.7 epilogue-subtile fields — only emitted for marked chain nodes
+    // so non-subtiled dumps stay byte-identical (the emitter defaults the
+    // rest to subtile_count=1).
+    if (n.subtileCount > 1)
+      os << ", \"subtile_index\": " << n.subtileIndex
+         << ", \"subtile_count\": " << n.subtileCount
+         << ", \"n_offset\": " << n.nOffset << ", \"n_size\": " << n.nSize;
     os << "}" << (i + 1 == sl.nodes.size() ? "" : ",") << "\n";
   }
   os << "        ],\n";
@@ -5071,7 +7301,15 @@ void jsonDumpScheduleLoop(llvm::raw_ostream &os, const ttg::ScheduleLoop &sl,
        << ", \"depth\": " << b.depth << ", \"paired_buffer_id\": "
        << (b.pairedBufferId == UINT_MAX ? std::string("null")
                                         : std::to_string(b.pairedBufferId))
-       << ", \"expect_bytes\": " << b.expectBytes << "}";
+       << ", \"expect_bytes\": " << b.expectBytes
+       << ", \"distance\": " << b.distance << ", \"arrive_after_node\": "
+       << (b.arriveAfterNodeId == UINT_MAX
+               ? std::string("null")
+               : std::to_string(b.arriveAfterNodeId))
+       << ", \"wait_before_node\": "
+       << (b.waitBeforeNodeId == UINT_MAX ? std::string("null")
+                                          : std::to_string(b.waitBeforeNodeId))
+       << "}";
   }
   os << (sl.crossGroupBarriers.empty() ? "" : "\n        ") << "]\n";
   os << "      }\n";
@@ -5209,6 +7447,54 @@ void jsonDumpOpsTable(llvm::raw_ostream &os, tt::FuncOp kernelFn,
   os << "  },\n";
 }
 
+// Pass A.5 candidate surface: every legal M-split (loop, MMA node, N,
+// m_size) plus the factor actually applied in THIS dump (applied_n; 1 =
+// unpartitioned). External tooling can re-run the pass with
+// TRITON_DATA_PARTITION_N=<n> per candidate and compare the resulting
+// schedules.
+//
+// Walks sl.graph.loops.front() per ScheduledLoop, matching the loops section
+// of the document (writeScheduleGraphDoc), so loop_id here == loop_id there.
+// This relies on the single-loop-per-graph shape (ScheduleGraph.loops size 1)
+// that fbsource beta produces; it does NOT drop any MMA candidate even when a
+// graph carries a nested child, because the orchestrator schedules every
+// MMA-bearing loop as its own "Inner" ScheduledLoop entry (see the hasMMA path
+// in runOnOperation), which the outer loop over scheduledLoops covers. If a
+// graph ever holds an MMA in a non-front loop with no separate entry, both
+// sections would need to iterate all sl.graph.loops together to keep loop_id
+// consistent.
+void jsonDumpDataPartitionCandidates(llvm::raw_ostream &os,
+                                     ArrayRef<ScheduledLoop> scheduledLoops) {
+  os << "  \"data_partition_candidates\": [";
+  bool first = true;
+  for (size_t li = 0; li < scheduledLoops.size(); ++li) {
+    const auto &sl = scheduledLoops[li];
+    if (sl.graph.loops.empty())
+      continue;
+    for (const auto &n : sl.graph.loops.front().nodes) {
+      if (!n.op)
+        continue;
+      auto cands = enumerateDataPartitionCandidates(n.op);
+      if (cands.empty())
+        continue;
+      os << (first ? "\n" : ",\n");
+      first = false;
+      os << "    {\"loop_id\": " << li << ", \"node_id\": " << n.id
+         << ", \"op_kind\": \"" << jsonEscape(n.op->getName().getStringRef())
+         << "\", \"dim\": 0, \"applied_n\": "
+         << (n.partitionCount > 1 ? n.partitionCount : 1) << ", \"factors\": [";
+      for (size_t i = 0; i < cands.size(); ++i) {
+        if (i)
+          os << ", ";
+        os << "{\"n\": " << cands[i].n << ", \"m_size\": " << cands[i].mSize
+           << "}";
+      }
+      os << "]}";
+    }
+  }
+  os << (first ? "" : "\n  ") << "],\n";
+}
+
 // Write ONE schedule-graph JSON document (kernel + ops + loops) to `os`.
 // Factored out so both the single-graph dumper and the multi-variant dumper
 // (top-N autotuning) can reuse it — each variant is a self-contained doc.
@@ -5227,6 +7513,7 @@ void writeScheduleGraphDoc(llvm::raw_ostream &os, ModuleOp moduleOp,
     os << "  \"variant_id\": " << variantId << ",\n";
   jsonDumpKernelSection(os, kernelFn, dc);
   jsonDumpOpsTable(os, kernelFn, dc);
+  jsonDumpDataPartitionCandidates(os, scheduledLoops);
 
   // loops section — drive off scheduledLoops, each contains a ScheduleGraph
   // (which itself may contain nested loops, but in fbsource beta each
@@ -5392,7 +7679,8 @@ void jsonDumpDDGLoop(llvm::raw_ostream &os, const ttg::DataDependenceGraph &ddg,
 }
 
 void dumpDDGAsJSON(ModuleOp moduleOp, StringRef path,
-                   ArrayRef<ScheduledLoop> scheduledLoops) {
+                   ArrayRef<ScheduledLoop> scheduledLoops,
+                   StringRef scheduleAlgo) {
   tt::FuncOp kernelFn = findKernelFn(moduleOp);
   JsonDumpContext dc = buildJsonDumpContext(kernelFn, scheduledLoops);
 
@@ -5411,10 +7699,9 @@ void dumpDDGAsJSON(ModuleOp moduleOp, StringRef path,
   // config — global knobs that shape how the solver turns this DDG into a
   // ScheduleGraph (algorithm choice + memory budgets driving buffer sizing).
   {
-    std::string algo = triton::tools::getStrEnv("TRITON_USE_MODULO_SCHEDULE");
-    if (algo.empty())
-      algo = "rau";
-    os << "  \"config\": {\"schedule_algo\": \"" << jsonEscape(algo)
+    // The backend this run actually scheduled with — "joint_solver" under the
+    // joint-solver pass, whatever the env var says.
+    os << "  \"config\": {\"schedule_algo\": \"" << jsonEscape(scheduleAlgo)
        << "\", \"smem_budget_bytes\": " << kSmemBudgetBytes()
        << ", \"tmem_budget_bytes\": " << kTmemBudgetBytes << "},\n";
   }
@@ -5475,7 +7762,455 @@ void dumpScheduleGraphsJSON(ModuleOp moduleOp, StringRef path,
 // Pass A: Modulo Scheduling
 // ============================================================================
 
-/// The main pass.
+/// DDG transformation hooks for iterative refinement (shared driver).
+/// Return true if any DDG was modified (triggers re-scheduling).
+
+/// Pass A.5: Data partitioning — split MMA + companion loads into N
+/// parallel sub-chains so the MMA queue can issue concurrent partials
+/// (NUM_MMA_GROUPS-style on Blackwell). M1: detect candidates only.
+///
+/// A.5 partition helpers (annotatePartition, partitionDecisions_) deferred
+/// along with this stub — they reference ScheduleNode / ScheduleBuffer
+/// partition fields that are part of the A.5 follow-up.
+static bool
+applyDataPartitioning(ModuleOp moduleOp, const ttg::LatencyModel &model,
+                      MutableArrayRef<ScheduledLoop> scheduledLoops) {
+  // A.5 (TRITON_DATA_PARTITION_N) deferred to follow-up diff.
+  return false;
+}
+
+/// Pass A.7: Epilogue subtiling — split monolithic TMA stores into
+/// independent sub-chains for better pipeline interleaving.
+///
+/// M1: detect chain. M2: pick S. M3: annotate ScheduleGraph + shrink store
+/// buffer.
+///
+/// SINGLE-ITERATION MODE (see plan §"KNOWN LIMITATION"): this function
+/// always returns false. The Pass A iterative loop rebuilds DDG +
+/// ScheduleGraph from source TTGIR each iteration, and the global SMEM
+/// reducer runs BEFORE A.7's mutation — so re-running the loop with a
+/// memoized decision doesn't recover K-loop depth. The buffer-recovery
+/// feedback path is deferred to M4.
+static bool
+applyEpilogueSubtiling(ModuleOp moduleOp, const ttg::LatencyModel &model,
+                       MutableArrayRef<ScheduledLoop> scheduledLoops) {
+  // A.7 (TRITON_MODULO_EPILOGUE_SUBTILE) deferred to follow-up diff.
+  return false;
+}
+
+} // namespace
+
+/// Shared Pass A orchestration — the entire behavioural difference between
+/// ModuloSchedulePass and JointSolverSchedulePass is `opts` (see
+/// ModuloScheduleDriver.h). Defined outside the anonymous namespace (whose
+/// helpers stay visible for the rest of the TU) so the qualified name is
+/// legal.
+LogicalResult ttg::runScheduleDriver(ModuleOp moduleOp,
+                                     const ScheduleDriverOptions &opts) {
+  // Resolve the schedule backend once and pass it explicitly to everything
+  // below — including super-node child re-schedules deep in
+  // buildScheduleGraph. The joint-solver pass forces "joint_solver"; the
+  // modulo pass leaves selection to TRITON_USE_MODULO_SCHEDULE. Threading it
+  // (rather than parking it in a process-global) is what keeps two modules
+  // compiled concurrently in one process from stealing each other's backend.
+  const std::string requestedAlgo =
+      ttg::getActiveScheduleAlgo(opts.forceScheduleAlgo);
+
+  ttg::NVLatencyModel model;
+  triton::ModuleAxisInfoAnalysis axisInfoAnalysis(moduleOp);
+
+  // Collect scheduling results across iterations. Only the LAST
+  // iteration's results are emitted — earlier iterations are discarded
+  // when DDG transformations trigger re-scheduling.
+  SmallVector<ScheduledLoop, 2> scheduledLoops;
+  // The backend the surviving attempt actually used. The JSON dumps label
+  // themselves with it, so after a fallback it must read "rau", not the
+  // backend that was asked for and failed.
+  std::string scheduleAlgo = requestedAlgo;
+
+  // One complete schedule + global-partition attempt. Everything below is
+  // read-only on the IR except the single `tt.epilogue_subtile` stamp that the
+  // caller snapshots around a discardable attempt, so a failed attempt can be
+  // thrown away wholesale.
+  auto runAttempt = [&](StringRef attemptAlgo,
+                        JointSolverMode requestedMode) -> LogicalResult {
+    scheduleAlgo = attemptAlgo.str();
+
+    // Schedule/partition capability coupling (2026-07-10): a joint-solver
+    // schedule presses II to the proven minimum, and the heuristic
+    // partitioners were shaped by Rau-conservative schedules — on FA the
+    // combination re-creates the softmax-cut failure class guard 1 used to
+    // fence (case3 at MinII with the heuristic partitioner: 292.9 TF vs 662
+    // with the joint-solver partition, 2.23x). Joint-solver schedules
+    // therefore always get the joint-solver v1 partition:
+    // TRITON_USE_MODULO_SCHEDULE=joint_solver becomes "joint pass minus v2"
+    // instead of a trap, and Off keeps meaning "heuristic partition for
+    // heuristic schedules". See docs/SolverMigrationNotes.md (2026-07-10
+    // second entry). Recomputed per attempt: the baseline rerun must not
+    // inherit the joint attempt's promotion.
+    JointSolverMode jointMode = requestedMode;
+    if (jointMode == JointSolverMode::Off && scheduleAlgo == "joint_solver") {
+      LDBG("Joint-solver schedule backend active — promoting warp partition "
+           "from heuristic to joint-solver v1");
+      jointMode = JointSolverMode::V1Only;
+    }
+
+    // Pass A.5: compute the data-partition plan once (module-stable). Threaded
+    // into per-loop scheduling so the inner-loop MMA bundle and the outer-loop
+    // TMEM accumulator buffer are both tagged for the emitter.
+    // TRITON_DATA_PARTITION_N=auto searches the candidate factors with the
+    // scheduler itself; otherwise the factor is user-resolved (option > attr
+    // > env), 1 = off. Inside the attempt because the auto search schedules
+    // with the active backend — a baseline rerun has to re-derive it.
+    DataPartitionPlan partitionPlan =
+        dataPartitionAutoSearch(moduleOp, opts.dataPartitionFactor)
+            ? searchDataPartitionPlan(moduleOp, model, axisInfoAnalysis,
+                                      scheduleAlgo)
+            : computeDataPartitionPlan(moduleOp, opts.dataPartitionFactor);
+
+    // ================================================================
+    // Iterative scheduling loop (design doc Pass A orchestrator)
+    //
+    // Each iteration: schedule → derive depths → check budget →
+    // apply DDG transformations → re-run if any DDG changed.
+    // Converges in 1-2 iterations.
+    // ================================================================
+    constexpr int kMaxIterations = 3;
+    for (int iteration = 0; iteration < kMaxIterations; ++iteration) {
+      LDBG("=== Iterative scheduling: iteration " << iteration << " ===");
+      scheduledLoops.clear();
+
+      // Single walk: collect every scf::ForOp with its nesting context and
+      // direct-body flags. Sorted deepest-first so we schedule inner loops
+      // before their outer wrappers — the outer schedule consumes the inner
+      // II as a super-node latency.
+      auto candidates = collectCandidates(moduleOp);
+
+      // We currently support at most a 2-level loop nest (an inner compute
+      // loop optionally wrapped by an outer tile/persistent loop). Refuse
+      // anything deeper rather than silently mis-scheduling — the prologue
+      // expansion, super-node DDG, and outer-loop pipelining all assume
+      // depth <= 1 today.
+      for (const auto &c : candidates) {
+        if (c.depth >= 2) {
+          c.op->emitError("modulo scheduling: loop nesting depth ")
+              << c.depth << " not supported (max 2 levels)";
+          return failure();
+        }
+      }
+
+      // Single bottom-up pass over candidates. `collectCandidates`'s
+      // contract is that the result is sorted by depth non-increasing so an
+      // inner K-loop (depth=1) is visited before its outer tile loop
+      // (depth=0). The outer DDG promotes the inner loop to a super-node
+      // whose `innerII` is the inner schedule's II, so this order is
+      // required for correctness — not just a stylistic preference. The
+      // assert below makes that invariant verifiable at runtime in case
+      // the sort in `collectCandidates` ever drifts.
+      //
+      // hasInnerLoop is the inner-vs-outer signal:
+      //   * true  → wraps a nested scf.for → outer
+      //   * false → leaf → inner (only worth scheduling if it has compute)
+      // Inner-vs-outer differences (super-node print, retaining the raw
+      // ModuloScheduleResult for lowerOuterLoopPipeline) live inside
+      // scheduleAndRecord / ScheduledLoop — not the call site.
+      unsigned numInner = 0, numOuter = 0;
+      [[maybe_unused]] unsigned prevDepth =
+          std::numeric_limits<unsigned>::max();
+      for (const auto &c : candidates) {
+        assert(c.depth <= prevDepth &&
+               "candidates must be sorted deepest-first");
+        prevDepth = c.depth;
+        if (c.hasExistingAnnotation) {
+          LDBG("Skipping loop with existing tt.autows annotations");
+          continue;
+        }
+        if (c.hasInnerLoop) {
+          scheduleAndRecord(c.op, "Outer", /*isOuter=*/true, model,
+                            axisInfoAnalysis, partitionPlan, scheduleAlgo,
+                            opts.printScheduleGraph, scheduledLoops);
+          ++numOuter;
+        } else if (c.hasMMA || c.hasTMA) {
+          scheduleAndRecord(c.op, "Inner", /*isOuter=*/false, model,
+                            axisInfoAnalysis, partitionPlan, scheduleAlgo,
+                            opts.printScheduleGraph, scheduledLoops);
+          ++numInner;
+        }
+      }
+      LDBG("Scheduled " << numInner << " inner loop(s), " << numOuter
+                        << " outer loop(s)");
+
+      // ================================================================
+      // Pass B: Global warp-group partition + cross-group barriers across
+      // all scheduled loops. Replaces the per-loop call that used to live
+      // inside `buildScheduleGraph` — moving it out of scheduling makes
+      // cross-loop coordination possible (e.g., outer-loop super-node
+      // matched to inner-loop MMA's warp group).
+      // ================================================================
+      // For top-N autotuning: snapshot each loop's pristine pre-partition
+      // graph (no warp-group assignment, no synthesized barriers/channels)
+      // before the winner is committed. Overwritten each iteration so it
+      // reflects the final converged schedule. Cheap value copy; only when
+      // multi-graph dump is requested.
+      if (getDumpTopN() > 1)
+        for (auto &sl : scheduledLoops)
+          sl.prePartitionGraph = sl.graph;
+      if (failed(applyGlobalWarpPartition(scheduledLoops, jointMode)))
+        return failure();
+
+      // ================================================================
+      // Iterative refinement: apply DDG transformations and check if
+      // we need to re-schedule.
+      // ================================================================
+      bool ddgChanged = false;
+      ddgChanged |= applyDataPartitioning(moduleOp, model, scheduledLoops);
+      ddgChanged |= applyEpilogueSubtiling(moduleOp, model, scheduledLoops);
+
+      if (!ddgChanged) {
+        LDBG("Converged after " << iteration + 1 << " iteration(s)");
+        break;
+      }
+
+      if (iteration + 1 >= kMaxIterations) {
+        LDBG("Hit iteration limit (" << kMaxIterations
+                                     << ") — keeping last valid schedule");
+        break;
+      }
+
+      LDBG("DDG changed by transformation — re-scheduling");
+    } // end iterative loop
+    return success();
+  }; // end runAttempt
+
+  // ================================================================
+  // Terminal fallback policy.
+  //
+  // Every joint-solver trigger — schedule solve, warp-group partition, final
+  // memory audit — routes through this ONE decision. It sits above both the
+  // solve and the apply stages because that is the only vantage point from
+  // which "a joint MinII schedule with a heuristic partition" is preventable:
+  // the schedule stage cannot see a partition failure, and the partition
+  // stage has no schedule to fall back to.
+  // ================================================================
+  const bool jointAttempt = requestedAlgo == kJointSolverAlgo ||
+                            opts.jointMode != JointSolverMode::Off;
+
+  if (!jointAttempt) {
+    // Flag-off / heuristic path: no policy, no scope, no snapshot, no second
+    // attempt. Byte-for-byte the pre-Diff-11 behaviour.
+    if (failed(runAttempt(requestedAlgo, opts.jointMode)))
+      return failure();
+  } else {
+    // The attempt is IR-read-only apart from A.7's `tt.epilogue_subtile`
+    // stamp, which is sticky and self-suppressing (it is only re-derived when
+    // the un-subtiled graph is over budget, which it no longer is once
+    // stamped). A discarded attempt must put it back or the baseline rerun
+    // starts from an already-shrunken store buffer and is no longer identical
+    // to a flag-off compile.
+    SmallVector<std::pair<Operation *, Attribute>> subtileSnapshot;
+    moduleOp.walk([&](tt::DescriptorStoreOp store) {
+      subtileSnapshot.emplace_back(store.getOperation(),
+                                   store->getAttr(kEpilogueSubtileAttrName));
+    });
+
+    // Attempt-1 diagnostics are provisional: an attempt we are about to
+    // discard must not leave an error or warning behind describing a compile
+    // that never happened. Capture them, and replay only when the attempt's
+    // outcome is the one the user sees.
+    SmallVector<Diagnostic> capturedDiags;
+    ttg::JointSolverFallbackScope fallback;
+    LogicalResult status = failure();
+    {
+      ScopedDiagnosticHandler capture(
+          moduleOp.getContext(), [&](Diagnostic &diag) {
+            capturedDiags.emplace_back(std::move(diag));
+            return success();
+          });
+      status = runAttempt(requestedAlgo, opts.jointMode);
+    }
+    auto replayCapturedDiags = [&] {
+      for (Diagnostic &diag : capturedDiags)
+        moduleOp.getContext()->getDiagEngine().emit(std::move(diag));
+      capturedDiags.clear();
+    };
+
+    std::optional<ttg::JointSolverTrigger> trigger = fallback.getTrigger();
+    if (failed(status) && !trigger)
+      trigger = ttg::JointSolverTrigger::AttemptFailed;
+
+    if (!trigger) {
+      replayCapturedDiags();
+    } else if (opts.strictError) {
+      // strict-error: the trigger IS the outcome. No rerun, no remark — the
+      // golden and determinism lanes want the failure, not a silently
+      // different schedule. Replay first, because for an AttemptFailed
+      // trigger the captured error is the actual cause.
+      replayCapturedDiags();
+      StringRef detail = fallback.getDetail();
+      InFlightDiagnostic diag =
+          moduleOp.emitError()
+          << "joint scheduling failed ("
+          << ttg::getJointSolverTriggerName(*trigger)
+          << ") and the strict-error terminal policy is enabled: refusing to "
+             "fall back to the baseline schedule";
+      if (!detail.empty())
+        diag.attachNote() << detail;
+      return failure();
+    } else {
+      // baseline: discard everything the joint attempt produced and rerun the
+      // complete heuristic schedule + partition path. A remark, never a
+      // warning — a successful baseline compile must not become an error
+      // under any -Werror-like policy.
+      StringRef name = ttg::getJointSolverTriggerName(*trigger);
+      StringRef detail = fallback.getDetail();
+      LDBG("Joint scheduling trigger '" << name << "' (" << fallback.getCount()
+                                        << " total) — rerunning the baseline "
+                                           "schedule + partition path");
+      {
+        // Scoped so the remark is reported here rather than at the end of the
+        // block: an InFlightDiagnostic flushes on destruction, which would
+        // print the fallback notice *after* everything the rerun emits, and
+        // drop it entirely if the rerun aborted.
+        InFlightDiagnostic remark =
+            moduleOp.emitRemark()
+            << "joint scheduling fell back to the baseline schedule and "
+               "partition path ("
+            << name << ")";
+        if (!detail.empty())
+          remark.attachNote() << detail;
+      }
+
+      scheduledLoops.clear();
+      for (auto [op, attr] : subtileSnapshot) {
+        if (attr)
+          op->setAttr(kEpilogueSubtileAttrName, attr);
+        else
+          op->removeAttr(kEpilogueSubtileAttrName);
+      }
+      if (failed(runAttempt(kBaselineScheduleAlgo, JointSolverMode::Off)))
+        return failure();
+    }
+  }
+
+  // ================================================================
+  // Lower-or-emit phase. Runs ONCE after convergence so the iteration
+  // loop above stays a pure schedule-refinement loop (no IR rewrites
+  // beyond attribute clamping). For each scheduled loop, either:
+  //   * `useScheduleGraphLowering` (TRITON_MODULO_LOWER_SCHEDULE_GRAPH=1)
+  //     → directly lower to multi-buffered allocs / async TMA / barriers
+  //     / WS regions. compiler.py skips downstream WS+pipeliner.
+  //   * otherwise → emit `loop.stage`/`loop.cluster` annotations and let
+  //     the downstream WS+pipeliner consume them.
+  // For outer loops, lowering is additionally gated by
+  // TRITON_MODULO_OUTER_LOWERING and requires getMaxStage() >= 1.
+  // ================================================================
+  for (auto &sl : scheduledLoops) {
+    if (sl.isOuter) {
+      // Stage clamping + cluster renumbering applies to BOTH paths
+      // (annotation and lowered) — it sits between the schedule and the
+      // attrs that downstream consumers read, so do it here once.
+      clampOuterStagesAndClusters(sl.loop);
+    }
+    emitScheduleFromGraph(sl.loop, sl.graph, sl.ddg);
+    if (sl.isOuter) {
+      // tt.modulo_cycle is a scratch attr the outer DDG builder leaves
+      // behind; clean it up regardless of the lowering path.
+      for (auto &op : sl.loop.getBody()->without_terminator())
+        op.removeAttr("tt.modulo_cycle");
+    }
+  }
+
+  // Inner scf.for ops that are super-nodes in an outer schedule
+  // carry loop.stage/loop.cluster from the OUTER schedule — keep
+  // them so the outer pipeliner knows where the K-loop sits.
+
+  // Optional: dump the ScheduleGraph as JSON for the TLX emitter.
+  if (const char *path = std::getenv("TRITON_MODULO_DUMP_SCHEDULE")) {
+    int topN = getDumpTopN();
+    if (topN <= 1) {
+      // Legacy single-graph dump (the cost-model winner committed to IR).
+      dumpScheduleGraphAsJSON(moduleOp, path, scheduledLoops);
+    } else {
+      // Top-N autotuning: emit ALL variants into ONE file, pluralized
+      // (schedule_graph.json -> schedule_graphs.json), ordered best-predicted
+      // first (variant 0 == committed winner). An external harness reads the
+      // `variants` array, emits + runs each, and picks the empirical winner.
+      //
+      // How many variants we can actually produce: the min over schedulable
+      // loops of available candidate partitions. Loops that fell back to
+      // greedy or had < 2 clusters contribute no alternatives.
+      // Variant count = MAX over schedulable loops of available candidate
+      // partitions (capped at topN). A loop with a single fixed partition
+      // (e.g. <2 clusters) is held fixed across variants via index clamping
+      // below, so it no longer caps the dump. If a loop went to greedy and
+      // recorded no partition, we can't safely build alternatives → fall back
+      // to a single (committed-winner) variant.
+      size_t maxAvail = 0;
+      bool sawSchedulable = false, anyEmpty = false;
+      for (auto &sl : scheduledLoops)
+        for (auto &schedLoop : sl.graph.loops)
+          if (schedLoop.II > 0) {
+            sawSchedulable = true;
+            if (schedLoop.topPartitions.empty())
+              anyEmpty = true;
+            maxAvail = std::max(maxAvail, schedLoop.topPartitions.size());
+          }
+      size_t numVariants =
+          (!sawSchedulable || anyEmpty)
+              ? 1
+              : std::min<size_t>(topN, std::max<size_t>(1, maxAvail));
+
+      SmallVector<SmallVector<ScheduledLoop, 2>, 3> variants;
+      for (size_t k = 0; k < numVariants; ++k) {
+        // Variant 0 reuses the committed winner graph as-is; k >= 1 is built
+        // off the pristine pre-partition snapshot, re-finalized with
+        // candidate-k's partition. Only the fields the dumper reads (loop,
+        // isOuter, graph) are populated.
+        SmallVector<ScheduledLoop, 2> variant;
+        for (auto &sl : scheduledLoops) {
+          ScheduledLoop v;
+          v.loop = sl.loop;
+          v.isOuter = sl.isOuter;
+          if (k == 0) {
+            v.graph = sl.graph; // committed winner
+          } else {
+            v.graph = sl.prePartitionGraph; // pristine copy
+            for (size_t li = 0; li < v.graph.loops.size(); ++li) {
+              auto &dstLoop = v.graph.loops[li];
+              auto &liveLoop = sl.graph.loops[li];
+              if (dstLoop.II > 0 && !liveLoop.topPartitions.empty()) {
+                // Loops with their own candidate-k vary; loops with fewer
+                // candidates (a single fixed partition) clamp to their last
+                // one so they stay constant across variants.
+                size_t idx = std::min(k, liveLoop.topPartitions.size() - 1);
+                finalizeLoopPartitionForDump(dstLoop,
+                                             liveLoop.topPartitions[idx]);
+                if (idx < liveLoop.topPartitionCosts.size())
+                  dstLoop.partitionCost = liveLoop.topPartitionCosts[idx];
+              }
+            }
+          }
+          variant.push_back(std::move(v));
+        }
+        variants.push_back(std::move(variant));
+      }
+      dumpScheduleGraphsJSON(moduleOp, pluralDumpPath(path), variants);
+    }
+  }
+  // Optional: dump the pre-schedule DDG layer (the solver's input + the
+  // MinII analysis it derives) as JSON. This is everything needed to
+  // regenerate the ScheduleGraph from the DDG.
+  if (const char *path = std::getenv("TRITON_MODULO_DUMP_DDG")) {
+    dumpDDGAsJSON(moduleOp, path, scheduledLoops, scheduleAlgo);
+  }
+  return success();
+}
+
+namespace {
+
+/// The main pass — a thin shell over the shared driver with the joint
+/// solver Off and algorithm selection left to TRITON_USE_MODULO_SCHEDULE.
+/// Its joint-solver sibling lives in JointSolverSchedulePass.cpp.
 struct ModuloSchedulePass
     : public PassWrapper<ModuloSchedulePass, OperationPass<ModuleOp>> {
 
@@ -5508,278 +8243,43 @@ struct ModuloSchedulePass
           "MMAs."),
       llvm::cl::init(0)};
 
-  /// DDG transformation hooks for iterative refinement.
-  /// Return true if any DDG was modified (triggers re-scheduling).
+  Option<bool> strictError{
+      *this, "strict-error",
+      llvm::cl::desc(
+          "Terminal policy for joint-solver failures: fail the "
+          "compilation instead of falling back to the baseline "
+          "schedule. Also settable with TRITON_MODULO_STRICT_ERROR."),
+      llvm::cl::init(false)};
 
-  /// Pass A.5: Data partitioning — split MMA + companion loads into N
-  /// parallel sub-chains so the MMA queue can issue concurrent partials
-  /// (NUM_MMA_GROUPS-style on Blackwell). M1: detect candidates only.
-  bool applyDataPartitioning(ModuleOp moduleOp, const ttg::LatencyModel &model,
-                             MutableArrayRef<ScheduledLoop> scheduledLoops) {
-    // A.5 (TRITON_DATA_PARTITION_N) deferred to follow-up diff.
-    return false;
-  }
-
-  // A.5 partition helpers (annotatePartition, partitionDecisions_) deferred
-  // along with applyDataPartitioning above — they reference ScheduleNode /
-  // ScheduleBuffer partition fields that are part of the A.5 follow-up.
-
-  /// Pass A.7: Epilogue subtiling — split monolithic TMA stores into
-  /// independent sub-chains for better pipeline interleaving.
-  ///
-  /// M1: detect chain. M2: pick S. M3: annotate ScheduleGraph + shrink store
-  /// buffer.
-  ///
-  /// SINGLE-ITERATION MODE (see plan §"KNOWN LIMITATION"): this function
-  /// always returns false. The Pass A iterative loop rebuilds DDG +
-  /// ScheduleGraph from source TTGIR each iteration, and the global SMEM
-  /// reducer runs BEFORE A.7's mutation — so re-running the loop with a
-  /// memoized decision doesn't recover K-loop depth. The buffer-recovery
-  /// feedback path is deferred to M4.
-  bool applyEpilogueSubtiling(ModuleOp moduleOp, const ttg::LatencyModel &model,
-                              MutableArrayRef<ScheduledLoop> scheduledLoops) {
-    // A.7 (TRITON_MODULO_EPILOGUE_SUBTILE) deferred to follow-up diff.
-    return false;
-  }
+  Option<std::string> forceJointSolverFault{
+      *this, "force-joint-solver-fault",
+      llvm::cl::desc("Test-only: replace the joint-solver backend with a "
+                     "canned fault (unavailable, timeout, unknown, "
+                     "global-unsat, malformed, illegal-schedule), optionally "
+                     "scoped with a 'schedule:' or 'partition:' prefix."),
+      llvm::cl::init("")};
 
   void runOnOperation() override {
-    auto moduleOp = getOperation();
-    ttg::NVLatencyModel model;
-    triton::ModuleAxisInfoAnalysis axisInfoAnalysis(moduleOp);
-
-    // Pass A.5: compute the data-partition plan once (module-stable). Threaded
-    // into per-loop scheduling so the inner-loop MMA bundle and the outer-loop
-    // TMEM accumulator buffer are both tagged for the emitter.
-    DataPartitionPlan partitionPlan =
-        computeDataPartitionPlan(moduleOp, dataPartitionFactor);
-
-    // ================================================================
-    // Iterative scheduling loop (design doc Pass A orchestrator)
-    //
-    // Each iteration: schedule → derive depths → check budget →
-    // apply DDG transformations → re-run if any DDG changed.
-    // Converges in 1-2 iterations.
-    // ================================================================
-    // Collect scheduling results across iterations. Only the LAST
-    // iteration's results are emitted — earlier iterations are discarded
-    // when DDG transformations trigger re-scheduling.
-    SmallVector<ScheduledLoop, 2> scheduledLoops;
-
-    constexpr int kMaxIterations = 3;
-    for (int iteration = 0; iteration < kMaxIterations; ++iteration) {
-      LDBG("=== Iterative scheduling: iteration " << iteration << " ===");
-      scheduledLoops.clear();
-
-      // Single walk: collect every scf::ForOp with its nesting context and
-      // direct-body flags. Sorted deepest-first so we schedule inner loops
-      // before their outer wrappers — the outer schedule consumes the inner
-      // II as a super-node latency.
-      auto candidates = collectCandidates(moduleOp);
-
-      // We currently support at most a 2-level loop nest (an inner compute
-      // loop optionally wrapped by an outer tile/persistent loop). Refuse
-      // anything deeper rather than silently mis-scheduling — the prologue
-      // expansion, super-node DDG, and outer-loop pipelining all assume
-      // depth <= 1 today.
-      for (const auto &c : candidates) {
-        if (c.depth >= 2) {
-          c.op->emitError("modulo scheduling: loop nesting depth ")
-              << c.depth << " not supported (max 2 levels)";
-          return signalPassFailure();
-        }
+    ttg::ScheduleDriverOptions opts;
+    opts.printScheduleGraph = printScheduleGraph;
+    opts.dataPartitionFactor = dataPartitionFactor;
+    // The Python compile path registers this pass with no options
+    // (ADD_PASS_WRAPPER_0), so the env var is the production channel and the
+    // option exists for lit tests.
+    opts.strictError =
+        strictError || triton::tools::getBoolEnv("TRITON_MODULO_STRICT_ERROR");
+    std::optional<ttg::ScopedJointSolverBackendOverride> fault;
+    if (!forceJointSolverFault.empty()) {
+      auto parsed = ttg::parseJointSolverFaultSpec(forceJointSolverFault);
+      if (!parsed) {
+        getOperation()->emitError("unknown force-joint-solver-fault '")
+            << forceJointSolverFault << "'";
+        return signalPassFailure();
       }
-
-      // Single bottom-up pass over candidates. `collectCandidates`'s
-      // contract is that the result is sorted by depth non-increasing so an
-      // inner K-loop (depth=1) is visited before its outer tile loop
-      // (depth=0). The outer DDG promotes the inner loop to a super-node
-      // whose `innerII` is the inner schedule's II, so this order is
-      // required for correctness — not just a stylistic preference. The
-      // assert below makes that invariant verifiable at runtime in case
-      // the sort in `collectCandidates` ever drifts.
-      //
-      // hasInnerLoop is the inner-vs-outer signal:
-      //   * true  → wraps a nested scf.for → outer
-      //   * false → leaf → inner (only worth scheduling if it has compute)
-      // Inner-vs-outer differences (super-node print, retaining the raw
-      // ModuloScheduleResult for lowerOuterLoopPipeline) live inside
-      // scheduleAndRecord / ScheduledLoop — not the call site.
-      unsigned numInner = 0, numOuter = 0;
-      [[maybe_unused]] unsigned prevDepth =
-          std::numeric_limits<unsigned>::max();
-      for (const auto &c : candidates) {
-        assert(c.depth <= prevDepth &&
-               "candidates must be sorted deepest-first");
-        prevDepth = c.depth;
-        if (c.hasExistingAnnotation) {
-          LDBG("Skipping loop with existing tt.autows annotations");
-          continue;
-        }
-        if (c.hasInnerLoop) {
-          scheduleAndRecord(c.op, "Outer", /*isOuter=*/true, model,
-                            axisInfoAnalysis, partitionPlan, printScheduleGraph,
-                            scheduledLoops);
-          ++numOuter;
-        } else if (c.hasMMA || c.hasTMA) {
-          scheduleAndRecord(c.op, "Inner", /*isOuter=*/false, model,
-                            axisInfoAnalysis, partitionPlan, printScheduleGraph,
-                            scheduledLoops);
-          ++numInner;
-        }
-      }
-      LDBG("Scheduled " << numInner << " inner loop(s), " << numOuter
-                        << " outer loop(s)");
-
-      // ================================================================
-      // Pass B: Global warp-group partition + cross-group barriers across
-      // all scheduled loops. Replaces the per-loop call that used to live
-      // inside `buildScheduleGraph` — moving it out of scheduling makes
-      // cross-loop coordination possible (e.g., outer-loop super-node
-      // matched to inner-loop MMA's warp group).
-      // ================================================================
-      // For top-N autotuning: snapshot each loop's pristine pre-partition
-      // graph (no warp-group assignment, no synthesized barriers/channels)
-      // before the winner is committed. Overwritten each iteration so it
-      // reflects the final converged schedule. Cheap value copy; only when
-      // multi-graph dump is requested.
-      if (getDumpTopN() > 1)
-        for (auto &sl : scheduledLoops)
-          sl.prePartitionGraph = sl.graph;
-      applyGlobalWarpPartition(scheduledLoops);
-
-      // ================================================================
-      // Iterative refinement: apply DDG transformations and check if
-      // we need to re-schedule.
-      // ================================================================
-      bool ddgChanged = false;
-      ddgChanged |= applyDataPartitioning(moduleOp, model, scheduledLoops);
-      ddgChanged |= applyEpilogueSubtiling(moduleOp, model, scheduledLoops);
-
-      if (!ddgChanged) {
-        LDBG("Converged after " << iteration + 1 << " iteration(s)");
-        break;
-      }
-
-      if (iteration + 1 >= kMaxIterations) {
-        LDBG("Hit iteration limit (" << kMaxIterations
-                                     << ") — keeping last valid schedule");
-        break;
-      }
-
-      LDBG("DDG changed by transformation — re-scheduling");
-    } // end iterative loop
-
-    // ================================================================
-    // Lower-or-emit phase. Runs ONCE after convergence so the iteration
-    // loop above stays a pure schedule-refinement loop (no IR rewrites
-    // beyond attribute clamping). For each scheduled loop, either:
-    //   * `useScheduleGraphLowering` (TRITON_MODULO_LOWER_SCHEDULE_GRAPH=1)
-    //     → directly lower to multi-buffered allocs / async TMA / barriers
-    //     / WS regions. compiler.py skips downstream WS+pipeliner.
-    //   * otherwise → emit `loop.stage`/`loop.cluster` annotations and let
-    //     the downstream WS+pipeliner consume them.
-    // For outer loops, lowering is additionally gated by
-    // TRITON_MODULO_OUTER_LOWERING and requires getMaxStage() >= 1.
-    // ================================================================
-    for (auto &sl : scheduledLoops) {
-      if (sl.isOuter) {
-        // Stage clamping + cluster renumbering applies to BOTH paths
-        // (annotation and lowered) — it sits between the schedule and the
-        // attrs that downstream consumers read, so do it here once.
-        clampOuterStagesAndClusters(sl.loop);
-      }
-      emitScheduleFromGraph(sl.loop, sl.graph, sl.ddg);
-      if (sl.isOuter) {
-        // tt.modulo_cycle is a scratch attr the outer DDG builder leaves
-        // behind; clean it up regardless of the lowering path.
-        for (auto &op : sl.loop.getBody()->without_terminator())
-          op.removeAttr("tt.modulo_cycle");
-      }
+      fault.emplace(*parsed);
     }
-
-    // Inner scf.for ops that are super-nodes in an outer schedule
-    // carry loop.stage/loop.cluster from the OUTER schedule — keep
-    // them so the outer pipeliner knows where the K-loop sits.
-
-    // Optional: dump the ScheduleGraph as JSON for the TLX emitter.
-    if (const char *path = std::getenv("TRITON_MODULO_DUMP_SCHEDULE")) {
-      int topN = getDumpTopN();
-      if (topN <= 1) {
-        // Legacy single-graph dump (the cost-model winner committed to IR).
-        dumpScheduleGraphAsJSON(moduleOp, path, scheduledLoops);
-      } else {
-        // Top-N autotuning: emit ALL variants into ONE file, pluralized
-        // (schedule_graph.json -> schedule_graphs.json), ordered best-predicted
-        // first (variant 0 == committed winner). An external harness reads the
-        // `variants` array, emits + runs each, and picks the empirical winner.
-        //
-        // How many variants we can actually produce: the min over schedulable
-        // loops of available candidate partitions. Loops that fell back to
-        // greedy or had < 2 clusters contribute no alternatives.
-        // Variant count = MAX over schedulable loops of available candidate
-        // partitions (capped at topN). A loop with a single fixed partition
-        // (e.g. <2 clusters) is held fixed across variants via index clamping
-        // below, so it no longer caps the dump. If a loop went to greedy and
-        // recorded no partition, we can't safely build alternatives → fall back
-        // to a single (committed-winner) variant.
-        size_t maxAvail = 0;
-        bool sawSchedulable = false, anyEmpty = false;
-        for (auto &sl : scheduledLoops)
-          for (auto &schedLoop : sl.graph.loops)
-            if (schedLoop.II > 0) {
-              sawSchedulable = true;
-              if (schedLoop.topPartitions.empty())
-                anyEmpty = true;
-              maxAvail = std::max(maxAvail, schedLoop.topPartitions.size());
-            }
-        size_t numVariants =
-            (!sawSchedulable || anyEmpty)
-                ? 1
-                : std::min<size_t>(topN, std::max<size_t>(1, maxAvail));
-
-        SmallVector<SmallVector<ScheduledLoop, 2>, 3> variants;
-        for (size_t k = 0; k < numVariants; ++k) {
-          // Variant 0 reuses the committed winner graph as-is; k >= 1 is built
-          // off the pristine pre-partition snapshot, re-finalized with
-          // candidate-k's partition. Only the fields the dumper reads (loop,
-          // isOuter, graph) are populated.
-          SmallVector<ScheduledLoop, 2> variant;
-          for (auto &sl : scheduledLoops) {
-            ScheduledLoop v;
-            v.loop = sl.loop;
-            v.isOuter = sl.isOuter;
-            if (k == 0) {
-              v.graph = sl.graph; // committed winner
-            } else {
-              v.graph = sl.prePartitionGraph; // pristine copy
-              for (size_t li = 0; li < v.graph.loops.size(); ++li) {
-                auto &dstLoop = v.graph.loops[li];
-                auto &liveLoop = sl.graph.loops[li];
-                if (dstLoop.II > 0 && !liveLoop.topPartitions.empty()) {
-                  // Loops with their own candidate-k vary; loops with fewer
-                  // candidates (a single fixed partition) clamp to their last
-                  // one so they stay constant across variants.
-                  size_t idx = std::min(k, liveLoop.topPartitions.size() - 1);
-                  finalizeLoopPartitionForDump(dstLoop,
-                                               liveLoop.topPartitions[idx]);
-                  if (idx < liveLoop.topPartitionCosts.size())
-                    dstLoop.partitionCost = liveLoop.topPartitionCosts[idx];
-                }
-              }
-            }
-            variant.push_back(std::move(v));
-          }
-          variants.push_back(std::move(variant));
-        }
-        dumpScheduleGraphsJSON(moduleOp, pluralDumpPath(path), variants);
-      }
-    }
-    // Optional: dump the pre-schedule DDG layer (the solver's input + the
-    // MinII analysis it derives) as JSON. This is everything needed to
-    // regenerate the ScheduleGraph from the DDG.
-    if (const char *path = std::getenv("TRITON_MODULO_DUMP_DDG")) {
-      dumpDDGAsJSON(moduleOp, path, scheduledLoops);
-    }
+    if (failed(ttg::runScheduleDriver(getOperation(), opts)))
+      signalPassFailure();
   }
 };
 
@@ -5844,58 +8344,407 @@ static int listEarliestStart(unsigned nodeIdx,
   return earliest;
 }
 
-/// Priority-based list scheduling on the DDG. Minimises makespan rather
-/// than II. Critical-path height is the priority (highest first).
-static FailureOr<ttg::ListScheduleResult>
-runListScheduling(const ttg::DataDependenceGraph &ddg) {
-  if (ddg.getNumNodes() == 0)
-    return failure();
-
-  auto heights = ddg.computeCriticalPathHeights();
-
-  llvm::SmallVector<unsigned> order;
-  for (unsigned i = 0; i < ddg.getNumNodes(); ++i)
-    order.push_back(i);
-  llvm::sort(order, [&](unsigned a, unsigned b) {
-    if (heights[a] != heights[b])
-      return heights[a] > heights[b];
-    return a < b;
-  });
-
+/// Placement core: given a fixed priority `order`, greedily place each node at
+/// its earliest resource-free slot and return the makespan schedule. Shared by
+/// the single-schedule path and the top-K ensemble.
+static ttg::ListScheduleResult
+scheduleGivenOrder(const ttg::DataDependenceGraph &ddg,
+                   llvm::ArrayRef<unsigned> order) {
   PipelineTracker tracker;
   llvm::DenseMap<unsigned, int> scheduled;
-
   for (unsigned nodeIdx : order) {
     const auto &node = ddg.getNode(nodeIdx);
     int duration = std::max(node.selfLatency, 1);
     if (node.pipeline == ttg::HWPipeline::NONE)
       duration = 1;
-
     int earliest = listEarliestStart(nodeIdx, ddg, scheduled);
     int slot = tracker.findFreeSlot(earliest, node.pipeline, duration);
-
     tracker.reserve(slot, node.pipeline, duration);
     scheduled[nodeIdx] = slot;
-
-    LLVM_DEBUG(DBGS() << "  List placed N" << nodeIdx << " ("
-                      << ttg::getPipelineName(node.pipeline)
-                      << " dur=" << duration << ") at cycle=" << slot << "\n");
   }
-
-  // makespan = max(start + occupancy) across all nodes.
   int makespan = 0;
   for (auto &[idx, cycle] : scheduled) {
     const auto &node = ddg.getNode(idx);
     makespan = std::max(makespan, cycle + std::max(node.selfLatency, 1));
   }
-
-  LLVM_DEBUG(DBGS() << "List schedule: makespan=" << makespan
-                    << " nodes=" << ddg.getNumNodes() << "\n");
-
   ttg::ListScheduleResult result;
   result.makespan = makespan;
   result.nodeToCycle = std::move(scheduled);
   return result;
+}
+
+// Priority heuristics for the top-K ensemble. Placement respects all deps
+// regardless of order, so each heuristic yields a valid — but differently
+// resource-resolved — schedule. Cheap: only need critical-path heights + node
+// latency (no new graph analyses; ASAP/ALAP-slack and beam search are the
+// documented follow-ups).
+enum class ListPriority {
+  HeightDescIdxAsc, // critical path first (default / single-schedule path)
+  HeightDescIdxDesc,
+  ProgramOrder, // original index order
+  HeightAsc,    // shallow-first
+  LatencyDesc,  // front-load long-latency ops (TMA/MMA) then height
+};
+
+static const char *listPriorityName(ListPriority p) {
+  switch (p) {
+  case ListPriority::HeightDescIdxAsc:
+    return "height_desc";
+  case ListPriority::HeightDescIdxDesc:
+    return "height_desc_idx_desc";
+  case ListPriority::ProgramOrder:
+    return "program_order";
+  case ListPriority::HeightAsc:
+    return "height_asc";
+  case ListPriority::LatencyDesc:
+    return "latency_desc";
+  }
+  return "?";
+}
+
+static llvm::SmallVector<unsigned>
+priorityOrder(const ttg::DataDependenceGraph &ddg,
+              const llvm::DenseMap<unsigned, int> &heights, ListPriority p) {
+  unsigned N = ddg.getNumNodes();
+  auto h = [&](unsigned n) { return heights.lookup(n); };
+  auto lat = [&](unsigned n) { return ddg.getNode(n).latency; };
+  // "a should be placed before b" under heuristic p.
+  auto higherPriority = [&](unsigned a, unsigned b) {
+    switch (p) {
+    case ListPriority::HeightDescIdxAsc:
+      return h(a) != h(b) ? h(a) > h(b) : a < b;
+    case ListPriority::HeightDescIdxDesc:
+      return h(a) != h(b) ? h(a) > h(b) : a > b;
+    case ListPriority::ProgramOrder:
+      return a < b;
+    case ListPriority::HeightAsc:
+      return h(a) != h(b) ? h(a) < h(b) : a < b;
+    case ListPriority::LatencyDesc:
+      return lat(a) != lat(b) ? lat(a) > lat(b)
+                              : (h(a) != h(b) ? h(a) > h(b) : a < b);
+    }
+    return a < b;
+  };
+  // Priority-guided topological sort over distance-0 edges (Kahn): among the
+  // nodes whose distance-0 predecessors are all placed, pick the highest-
+  // priority one. This guarantees every distance-0 producer precedes its
+  // consumer, so scheduleGivenOrder (which silently ignores a not-yet-placed
+  // predecessor in listEarliestStart) can never place a consumer before its
+  // same-iteration producer and emit an invalid schedule. Loop-carried
+  // (distance>0) edges intentionally do not constrain intra-iteration order.
+  llvm::SmallVector<int> inDeg(N, 0);
+  for (const auto &edge : ddg.getEdges())
+    if (edge.distance == 0)
+      inDeg[edge.dstIdx]++;
+  llvm::SmallVector<unsigned> ready;
+  for (unsigned i = 0; i < N; ++i)
+    if (inDeg[i] == 0)
+      ready.push_back(i);
+  llvm::SmallVector<unsigned> order;
+  order.reserve(N);
+  while (!ready.empty()) {
+    unsigned best = 0;
+    for (unsigned i = 1; i < ready.size(); ++i)
+      if (higherPriority(ready[i], ready[best]))
+        best = i;
+    unsigned cur = ready[best];
+    ready.erase(ready.begin() + best);
+    order.push_back(cur);
+    for (const auto *edge : ddg.getOutEdges(cur)) {
+      if (edge->distance > 0)
+        continue;
+      if (--inDeg[edge->dstIdx] == 0)
+        ready.push_back(edge->dstIdx);
+    }
+  }
+  // A distance-0 cycle (unschedulable in one iteration) would leave nodes
+  // unplaced; append them in priority order so none is dropped.
+  if (order.size() < N) {
+    llvm::DenseSet<unsigned> placed(order.begin(), order.end());
+    llvm::SmallVector<unsigned> rest;
+    for (unsigned i = 0; i < N; ++i)
+      if (!placed.contains(i))
+        rest.push_back(i);
+    llvm::sort(rest, higherPriority);
+    order.append(rest.begin(), rest.end());
+  }
+  return order;
+}
+
+/// Canonical signature of a schedule: node indices ordered by (cycle, idx).
+/// Two schedules with the same signature produce the same op ordering, so this
+/// is the dedup key for the top-K ensemble.
+static llvm::SmallVector<unsigned>
+scheduleSignature(const ttg::DataDependenceGraph &ddg,
+                  const ttg::ListScheduleResult &r) {
+  llvm::SmallVector<unsigned> idxs;
+  for (unsigned i = 0; i < ddg.getNumNodes(); ++i)
+    idxs.push_back(i);
+  llvm::sort(idxs, [&](unsigned a, unsigned b) {
+    int ca = r.nodeToCycle.lookup(a), cb = r.nodeToCycle.lookup(b);
+    return ca != cb ? ca < cb : a < b;
+  });
+  return idxs;
+}
+
+/// Priority-based list scheduling on the DDG (single schedule, default
+/// heuristic). Minimises makespan rather than II.
+static FailureOr<ttg::ListScheduleResult>
+runListScheduling(const ttg::DataDependenceGraph &ddg) {
+  if (ddg.getNumNodes() == 0)
+    return failure();
+  auto heights = ddg.computeCriticalPathHeights();
+  auto order = priorityOrder(ddg, heights, ListPriority::HeightDescIdxAsc);
+  auto result = scheduleGivenOrder(ddg, order);
+  LLVM_DEBUG(DBGS() << "List schedule: makespan=" << result.makespan
+                    << " nodes=" << ddg.getNumNodes() << "\n");
+  return result;
+}
+
+/// One partial (or complete) beam state: a topological placement prefix plus
+/// the resource/timing state needed to extend and score it.
+namespace {
+struct BeamState {
+  llvm::SmallVector<unsigned> order;   // placement order so far (topological)
+  llvm::DenseMap<unsigned, int> cycle; // node -> placed cycle
+  PipelineTracker tracker;             // per-pipeline resource state
+  llvm::DenseSet<unsigned> placed;
+  int makespan = 0; // max end cycle of placed ops
+  double cost = 0;  // makespan + max remaining height (pruning lower bound)
+};
+} // namespace
+
+// FNV-1a hash of a placement order — cheap dedup key within a beam step.
+static uint64_t hashOrder(llvm::ArrayRef<unsigned> o) {
+  uint64_t h = 1469598103934665603ull;
+  for (unsigned x : o) {
+    h ^= x;
+    h *= 1099511628211ull;
+  }
+  return h;
+}
+
+/// Beam search over topological orderings. At each step every beam state is
+/// extended by its top-`branch` ready ops (highest critical-path height);
+/// children are pruned to `beamWidth` by a lower-bound cost
+/// (makespan-so-far + deepest remaining height). Returns up to K complete
+/// schedules, ranked best-first. This complements the priority-heuristic
+/// ensemble: it explores the ordering space rather than a fixed handful.
+static llvm::SmallVector<ttg::ListScheduleResult>
+runListSchedulingBeam(const ttg::DataDependenceGraph &ddg, int K, int beamWidth,
+                      int branch) {
+  llvm::SmallVector<ttg::ListScheduleResult> out;
+  const unsigned N = ddg.getNumNodes();
+  if (N == 0 || K < 1 || beamWidth < 1)
+    return out;
+
+  auto heights = ddg.computeCriticalPathHeights();
+  auto h = [&](unsigned n) { return heights.lookup(n); };
+
+  auto remainingLB = [&](const BeamState &s) {
+    int maxRem = 0;
+    for (unsigned n = 0; n < N; ++n)
+      if (!s.placed.count(n))
+        maxRem = std::max(maxRem, h(n));
+    return s.makespan + maxRem;
+  };
+
+  auto extend = [&](const BeamState &s, unsigned n) {
+    BeamState ns = s; // copy resource/timing state
+    const auto &node = ddg.getNode(n);
+    int dur = (node.pipeline == ttg::HWPipeline::NONE)
+                  ? 1
+                  : std::max(node.selfLatency, 1);
+    int earliest = listEarliestStart(n, ddg, ns.cycle);
+    int slot = ns.tracker.findFreeSlot(earliest, node.pipeline, dur);
+    ns.tracker.reserve(slot, node.pipeline, dur);
+    ns.cycle[n] = slot;
+    ns.order.push_back(n);
+    ns.placed.insert(n);
+    ns.makespan = std::max(ns.makespan, slot + dur);
+    return ns;
+  };
+
+  llvm::SmallVector<BeamState> beam(1); // single empty root
+  for (unsigned step = 0; step < N; ++step) {
+    llvm::SmallVector<BeamState> children;
+    llvm::DenseSet<uint64_t> childHashes;
+    for (const auto &s : beam) {
+      // Ready = unplaced nodes whose intra-iteration (distance-0) preds are all
+      // placed. Rank ready by height; branch on the top few.
+      llvm::SmallVector<unsigned> ready;
+      for (unsigned n = 0; n < N; ++n) {
+        if (s.placed.count(n))
+          continue;
+        bool ok = true;
+        for (const auto *e : ddg.getInEdges(n))
+          if (e->distance == 0 && !s.placed.count(e->srcIdx)) {
+            ok = false;
+            break;
+          }
+        if (ok)
+          ready.push_back(n);
+      }
+      llvm::sort(ready, [&](unsigned a, unsigned b) {
+        return h(a) != h(b) ? h(a) > h(b) : a < b;
+      });
+      for (int i = 0; i < (int)ready.size() && i < branch; ++i) {
+        BeamState c = extend(s, ready[i]);
+        if (!childHashes.insert(hashOrder(c.order)).second)
+          continue; // identical prefix already produced this step
+        c.cost = remainingLB(c);
+        children.push_back(std::move(c));
+      }
+    }
+    if (children.empty())
+      break;
+    llvm::stable_sort(children, [](const BeamState &a, const BeamState &b) {
+      return a.cost < b.cost;
+    });
+    if ((int)children.size() > beamWidth)
+      children.truncate(beamWidth);
+    beam = std::move(children);
+  }
+
+  // Materialize complete states (order covers all N nodes) via the shared
+  // placement core so results are byte-identical to the ensemble path.
+  llvm::SmallVector<ttg::ListScheduleResult> results;
+  for (auto &s : beam)
+    if (s.order.size() == N)
+      results.push_back(scheduleGivenOrder(ddg, s.order));
+  llvm::stable_sort(results, [](const ttg::ListScheduleResult &a,
+                                const ttg::ListScheduleResult &b) {
+    return a.makespan < b.makespan;
+  });
+  for (int i = 0; i < (int)results.size() && i < K; ++i)
+    out.push_back(std::move(results[i]));
+  return out;
+}
+
+/// Beam width for the top-K generator. TRITON_LIST_SCHEDULE_BEAM:
+///   unset  -> default max(2K, 8)
+///   "0"    -> beam disabled (priority-heuristic ensemble only)
+///   n>0    -> explicit width
+static int getListBeamWidth(int K) {
+  auto v = triton::tools::getStrEnv("TRITON_LIST_SCHEDULE_BEAM");
+  if (v.empty())
+    return std::max(2 * K, 8);
+  int n = std::atoi(v.c_str());
+  return n < 0 ? 0 : n;
+}
+
+/// Generate up to K distinct list schedules, deduped by schedule signature and
+/// ranked by ascending makespan (best first). Candidates come from the
+/// priority-heuristic ensemble plus (unless disabled) a beam search over
+/// orderings; the union is deduped and the best K returned.
+/// TODO(follow-up): fold memory/register-peak into the ranking cost.
+static llvm::SmallVector<ttg::ListScheduleResult>
+runListSchedulingTopK(const ttg::DataDependenceGraph &ddg, int K) {
+  llvm::SmallVector<ttg::ListScheduleResult> out;
+  const unsigned N = ddg.getNumNodes();
+  if (N == 0 || K < 1)
+    return out;
+  auto heights = ddg.computeCriticalPathHeights();
+
+  llvm::SmallVector<ttg::ListScheduleResult> cands;
+  llvm::SmallVector<llvm::SmallVector<unsigned>> seen;
+  auto addCand = [&](ttg::ListScheduleResult res, const char *src) {
+    auto sig = scheduleSignature(ddg, res);
+    if (llvm::is_contained(seen, sig))
+      return; // dedup: identical op ordering
+    seen.push_back(std::move(sig));
+    LLVM_DEBUG(DBGS() << "  cand[" << src << "] makespan=" << res.makespan
+                      << "\n");
+    cands.push_back(std::move(res));
+  };
+
+  // 1) Priority-heuristic ensemble.
+  for (ListPriority p :
+       {ListPriority::HeightDescIdxAsc, ListPriority::LatencyDesc,
+        ListPriority::HeightDescIdxDesc, ListPriority::HeightAsc,
+        ListPriority::ProgramOrder})
+    addCand(scheduleGivenOrder(ddg, priorityOrder(ddg, heights, p)),
+            listPriorityName(p));
+
+  // 2) Beam search (unless disabled, or the loop is too large to be cheap).
+  int beamWidth = getListBeamWidth(K);
+  constexpr unsigned kBeamNodeCap = 512;
+  if (beamWidth > 0 && N <= kBeamNodeCap) {
+    for (auto &r : runListSchedulingBeam(ddg, K + beamWidth, beamWidth,
+                                         /*branch=*/4))
+      addCand(std::move(r), "beam");
+  } else if (beamWidth > 0) {
+    LLVM_DEBUG(DBGS() << "beam skipped: " << N << " nodes > cap "
+                      << kBeamNodeCap << "\n");
+  }
+
+  llvm::stable_sort(cands, [](const ttg::ListScheduleResult &a,
+                              const ttg::ListScheduleResult &b) {
+    return a.makespan < b.makespan;
+  });
+  LLVM_DEBUG(DBGS() << "top-K: " << cands.size() << " distinct schedules (K="
+                    << K << ", beamWidth=" << beamWidth << ")\n");
+  for (int i = 0; i < (int)cands.size() && i < K; ++i)
+    out.push_back(std::move(cands[i]));
+  return out;
+}
+
+/// Number of list-schedule variants to generate for autotuning.
+/// TRITON_LIST_SCHEDULE_TOPK (default 1 = single schedule).
+static int getListTopK() {
+  auto v = triton::tools::getStrEnv("TRITON_LIST_SCHEDULE_TOPK");
+  if (v.empty())
+    return 1;
+  int n = std::atoi(v.c_str());
+  return n < 1 ? 1 : n;
+}
+
+/// Which generated variant (rank) to apply to the IR. TRITON_LIST_SCHEDULE_PICK
+/// (default 0 = best). Applied globally to every loop and clamped to the number
+/// of variants actually produced for that loop. An autotuning harness sweeps
+/// PICK over 0..TOPK-1, compiling and timing each.
+static int getListPick() {
+  auto v = triton::tools::getStrEnv("TRITON_LIST_SCHEDULE_PICK");
+  if (v.empty())
+    return 0;
+  int n = std::atoi(v.c_str());
+  return n < 0 ? 0 : n;
+}
+
+/// Physically permute the loop body into schedule order, keyed on the
+/// `loop.stage`/`loop.cluster` attrs the list scheduler just wrote. This turns
+/// the list schedule (which otherwise only annotates) into a real instruction
+/// reordering — the "just reorder intra-loop" transform, with no software
+/// pipelining and no warp specialization.
+///
+/// Safety: the schedule respects data + memory deps, so `(stage, cluster)` is
+/// already a dep-respecting order; `computeTopologicalSorting` then guarantees
+/// every def precedes its uses (SSA dominance), preserving the cluster order
+/// wherever the dependencies allow. Ops missing the attrs (there shouldn't be
+/// any — the caller defaults them) sink to the end.
+static void reorderByCluster(scf::ForOp loop) {
+  auto key = [](Operation *op) -> int64_t {
+    auto s = op->getAttrOfType<IntegerAttr>(tt::kLoopStageAttrName);
+    auto c = op->getAttrOfType<IntegerAttr>(tt::kLoopClusterAttrName);
+    if (!s || !c)
+      return std::numeric_limits<int64_t>::max();
+    return (static_cast<int64_t>(s.getInt()) << 32) + c.getInt();
+  };
+  llvm::SmallVector<Operation *> ops;
+  for (Operation &op : loop.getBody()->without_terminator())
+    ops.push_back(&op);
+  // Stable so ops in the same cluster keep program order (already topological
+  // among same-cycle ops).
+  llvm::stable_sort(
+      ops, [&](Operation *a, Operation *b) { return key(a) < key(b); });
+  // Hard SSA-dominance guarantee; preserves the cluster order where legal.
+  mlir::computeTopologicalSorting(ops);
+
+  Operation *term = loop.getBody()->getTerminator();
+  for (Operation *op : ops)
+    op->moveBefore(term);
+  LDBG("reorderByCluster: permuted " << ops.size()
+                                     << " body ops into schedule order");
 }
 
 /// Build a ScheduleGraph from a list-scheduled loop. All ops get stage 0,
@@ -5942,6 +8791,7 @@ buildListScheduleGraph(scf::ForOp loop, const ttg::DataDependenceGraph &ddg,
     se.dstId = dstIt->second;
     se.latency = ddgEdge.latency;
     se.distance = ddgEdge.distance;
+    se.srcResultIdx = ddgEdge.srcResultIdx;
     schedLoop.edges.push_back(se);
   }
 
@@ -5960,6 +8810,62 @@ buildListScheduleGraph(scf::ForOp loop, const ttg::DataDependenceGraph &ddg,
   return graph;
 }
 
+/// Dense cluster id (rank of distinct cycle, stage 0) per DDG node. Returns an
+/// ordered map (keyed by node idx) so iteration is deterministic across builds
+/// — DenseMap iteration order is not, and this feeds emitted schedule dumps.
+static std::map<unsigned, int> listClusters(const ttg::DataDependenceGraph &ddg,
+                                            const ttg::ListScheduleResult &r) {
+  SmallVector<int> cycles;
+  for (auto &[idx, c] : r.nodeToCycle)
+    cycles.push_back(c);
+  llvm::sort(cycles);
+  cycles.erase(llvm::unique(cycles), cycles.end());
+  llvm::DenseMap<int, int> c2cl;
+  for (int i = 0, e = cycles.size(); i < e; ++i)
+    c2cl[cycles[i]] = i;
+  std::map<unsigned, int> out;
+  for (auto &[idx, c] : r.nodeToCycle)
+    out[idx] = c2cl[c];
+  return out;
+}
+
+/// Apply one list schedule to the loop IR: write loop.stage/loop.cluster on all
+/// body ops, mark the loop scheduled, and physically reorder into cluster
+/// order.
+static void applyListSchedule(scf::ForOp loop,
+                              const ttg::DataDependenceGraph &ddg,
+                              const ttg::ListScheduleResult &result) {
+  auto ctx = loop.getContext();
+  auto graph = buildListScheduleGraph(loop, ddg, result);
+  for (const auto &schedLoop : graph.loops)
+    for (const auto &node : schedLoop.nodes) {
+      if (!node.op)
+        continue;
+      node.op->setAttr(tt::kLoopStageAttrName,
+                       IntegerAttr::get(IntegerType::get(ctx, 32), 0));
+      node.op->setAttr(
+          tt::kLoopClusterAttrName,
+          IntegerAttr::get(IntegerType::get(ctx, 32), node.cluster));
+    }
+  int maxCluster = 0;
+  for (const auto &schedLoop : graph.loops)
+    for (const auto &node : schedLoop.nodes)
+      maxCluster = std::max(maxCluster, node.cluster);
+  for (auto &op : loop.getBody()->without_terminator()) {
+    if (!op.hasAttr(tt::kLoopStageAttrName))
+      op.setAttr(tt::kLoopStageAttrName,
+                 IntegerAttr::get(IntegerType::get(ctx, 32), 0));
+    if (!op.hasAttr(tt::kLoopClusterAttrName))
+      op.setAttr(tt::kLoopClusterAttrName,
+                 IntegerAttr::get(IntegerType::get(ctx, 32), maxCluster));
+  }
+  loop->setAttr("tt.modulo_ii",
+                IntegerAttr::get(IntegerType::get(ctx, 32), result.makespan));
+  loop->setAttr("tt.list_schedule_makespan",
+                IntegerAttr::get(IntegerType::get(ctx, 32), result.makespan));
+  reorderByCluster(loop);
+}
+
 struct ListSchedulePass
     : public PassWrapper<ListSchedulePass, OperationPass<ModuleOp>> {
 
@@ -5974,6 +8880,14 @@ struct ListSchedulePass
   void runOnOperation() override {
     auto moduleOp = getOperation();
     ttg::NVLatencyModel model;
+    int topK = getListTopK();
+    int globalPick = getListPick();
+    // Accumulated top-K dump (one JSON object per scheduled loop).
+    std::string dumpPath =
+        triton::tools::getStrEnv("TRITON_LIST_SCHEDULE_TOPK_DUMP");
+    std::string dumpJson;
+    llvm::raw_string_ostream dj(dumpJson);
+    unsigned loopSeq = 0;
 
     moduleOp.walk([&](scf::ForOp loop) {
       if (loop->hasAttr("tt.modulo_ii"))
@@ -5993,60 +8907,83 @@ struct ListSchedulePass
       if (ddg.getNumNodes() == 0)
         return;
 
-      LDBG("List scheduling loop with " << ddg.getNumNodes() << " nodes");
+      // Per-loop rank override via `tt.list_schedule_pick` (from the tl.range
+      // kwarg, which may be a tl.constexpr → autotunable). Falls back to the
+      // global TRITON_LIST_SCHEDULE_PICK. Generate enough variants to honor it.
+      bool hasPickAttr = loop->hasAttr("tt.list_schedule_pick");
+      int loopPick = globalPick;
+      if (auto a = loop->getAttrOfType<IntegerAttr>("tt.list_schedule_pick"))
+        loopPick = std::max<int>(0, a.getInt());
+      int genK = std::max(topK, loopPick + 1);
+      // Ranked selection is requested whenever a pick is in play (per-loop
+      // attr, global PICK, or TOPK>1). In that case rank 0 must mean the
+      // ensemble/beam BEST — so use the ranked generator even at genK==1. Only
+      // the pure default (no selection at all) uses the single cheap heuristic.
+      bool wantRanked = hasPickAttr || topK > 1 || globalPick > 0;
 
-      auto result = runListScheduling(ddg);
-      if (failed(result)) {
+      LDBG("List scheduling loop with "
+           << ddg.getNumNodes() << " nodes (genK=" << genK
+           << ", pick=" << loopPick << ", ranked=" << wantRanked << ")");
+
+      llvm::SmallVector<ttg::ListScheduleResult> variants;
+      if (!wantRanked) {
+        auto r = runListScheduling(ddg); // single default heuristic
+        if (succeeded(r))
+          variants.push_back(std::move(*r));
+      } else {
+        variants = runListSchedulingTopK(ddg, genK);
+      }
+      if (variants.empty()) {
         LDBG("List scheduling FAILED");
         return;
       }
 
-      LDBG("List schedule: makespan=" << result->makespan);
-
-      auto schedGraph = buildListScheduleGraph(loop, ddg, *result);
-
-      LLVM_DEBUG({
-        llvm::dbgs() << "[A.6] === List ScheduleGraph ===\n";
-        schedGraph.dump();
-      });
-
-      auto ctx = loop.getContext();
-      for (const auto &schedLoop : schedGraph.loops) {
-        for (const auto &node : schedLoop.nodes) {
-          if (!node.op)
-            continue;
-          node.op->setAttr(tt::kLoopStageAttrName,
-                           IntegerAttr::get(IntegerType::get(ctx, 32), 0));
-          node.op->setAttr(
-              tt::kLoopClusterAttrName,
-              IntegerAttr::get(IntegerType::get(ctx, 32), node.cluster));
+      // Emit all variants for autotuning (best-first). The external harness
+      // reconstructs each op ordering from the per-node cluster ids.
+      if (!dumpPath.empty()) {
+        if (loopSeq)
+          dj << ",\n";
+        dj << "  {\"loop\": " << loopSeq
+           << ", \"num_nodes\": " << ddg.getNumNodes() << ", \"variants\": [\n";
+        for (unsigned vi = 0; vi < variants.size(); ++vi) {
+          auto cl = listClusters(ddg, variants[vi]);
+          dj << "    {\"rank\": " << vi
+             << ", \"makespan\": " << variants[vi].makespan
+             << ", \"clusters\": {";
+          bool first = true;
+          for (const auto &node : ddg.getNodes()) {
+            auto it = cl.find(node.idx);
+            if (it == cl.end())
+              continue;
+            if (!first)
+              dj << ", ";
+            first = false;
+            dj << "\"" << node.idx << "\": " << it->second;
+          }
+          dj << "}}" << (vi + 1 < variants.size() ? ",\n" : "\n");
         }
+        dj << "  ]}";
       }
 
-      // Default unscheduled ops to stage 0, max cluster.
-      int maxCluster = 0;
-      for (const auto &schedLoop : schedGraph.loops)
-        for (const auto &node : schedLoop.nodes)
-          maxCluster = std::max(maxCluster, node.cluster);
-      for (auto &op : loop.getBody()->without_terminator()) {
-        if (!op.hasAttr(tt::kLoopStageAttrName))
-          op.setAttr(tt::kLoopStageAttrName,
-                     IntegerAttr::get(IntegerType::get(ctx, 32), 0));
-        if (!op.hasAttr(tt::kLoopClusterAttrName))
-          op.setAttr(tt::kLoopClusterAttrName,
-                     IntegerAttr::get(IntegerType::get(ctx, 32), maxCluster));
-      }
-
-      // Mark the loop scheduled so downstream `processScheduledLoop`
-      // (which gates on `tt.modulo_ii`) preserves the schedule attrs.
-      // `tt.list_schedule_makespan` distinguishes list-scheduled loops
-      // from true modulo-scheduled ones for any consumer that cares.
-      loop->setAttr("tt.modulo_ii", IntegerAttr::get(IntegerType::get(ctx, 32),
-                                                     result->makespan));
-      loop->setAttr(
-          "tt.list_schedule_makespan",
-          IntegerAttr::get(IntegerType::get(ctx, 32), result->makespan));
+      // Apply the picked variant (default rank 0 = best), clamped to the
+      // number of variants produced for this loop.
+      int p = std::min(loopPick, (int)variants.size() - 1);
+      LDBG("List schedule: applying rank "
+           << p << " of " << variants.size()
+           << " (makespan=" << variants[p].makespan << ")");
+      applyListSchedule(loop, ddg, variants[p]);
+      ++loopSeq;
     });
+
+    if (!dumpPath.empty() && loopSeq) {
+      std::error_code ec;
+      llvm::raw_fd_ostream os(dumpPath, ec);
+      if (!ec)
+        os << "{\n \"list_schedule_topk\": " << topK << ",\n \"loops\": [\n"
+           << dj.str() << "\n ]\n}\n";
+      else
+        LDBG("failed to open TRITON_LIST_SCHEDULE_TOPK_DUMP: " << dumpPath);
+    }
   }
 };
 

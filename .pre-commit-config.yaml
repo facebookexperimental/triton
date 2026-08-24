@@ -77,7 +77,11 @@ exclude: |
     ^third_party/tlx/language/tlx/inductor/|
     ^third_party/f2reduce|
     ^third_party/tileir|
+    ^website/|
     ^python/test/gluon/|
     ^python/triton/experimental/gluon/|
-    ^third_party/tlx/tools/
+    ^third_party/tlx/tools/|
+    ^third_party/nvidia/hopper/lib/Transforms/ModuloScheduling/|
+    ^lib/Tools/ModularArithmetic\.cpp$|
+    ^bitequiv/
   )

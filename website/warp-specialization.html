@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Assign warps to concurrent tasks and configure CTA clusters.">
+  <title>Warp specialization and clustering · FBTriton</title>
+  <link rel="stylesheet" href="assets/tlx.css?v=20260821b">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="../"><span>FB</span>Triton</a>
+    <nav class="topnav" aria-label="Top-level sections"><a href="triton.html">Triton</a>
+<a href="tlx.html" data-current="true">TLX</a>
+<a href="tooling.html">Tooling</a></nav>
+    <a class="repo-link" href="https://github.com/facebookexperimental/triton" target="_blank" rel="noreferrer">View on GitHub ↗</a>
+  </header>
+  <div class="shell">
+<aside class="sidebar">
+      <p class="eyebrow">TLX documentation</p>
+      <nav><a href="tlx.html">Overview</a>
+<a href="getting-started.html">Getting started</a>
+<a href="hardware-support.html">Hardware support</a>
+<a href="buffers.html">Local and remote buffers</a>
+<a href="async-memory.html">Async memory access</a>
+<a href="async-compute.html">Async tensor core operations</a>
+<a href="synchronization.html">Barriers and Cluster Launch Control</a>
+<a href="warp-specialization.html" aria-current="page">Warp specialization and clustering</a>
+<a href="utilities.html">Other operations</a>
+<a href="performance-optimization.html">Performance optimization</a>
+<a href="debugging.html">Debugging performance and numerics</a>
+<a href="kernels.html">Example kernels</a>
+<a href="production-case-studies.html">Production case studies</a>
+<a href="install-and-test.html">Build, install, and test</a>
+<a href="resources.html">More reading</a></nav>
+    </aside>
+    <main>
+      <p class="eyebrow">TLX documentation</p>
+      <h1>Warp specialization and clustering</h1>
+      <p class="lede">Assign warps to concurrent tasks and configure CTA clusters.</p>
+      <article><div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.async_tasks</code> and <code>tlx.async_task</code> <strong>[Hopper+]</strong></div></div>
+<pre><code>    with tlx.async_tasks()
+        with tlx.async_task(&quot;default&quot;)
+            ...
+        with tlx.async_task(num_warps=4)
+            ...</code></pre>
+<p><code>tlx.async_tasks</code> opens a multi-tasking region where independent asynchronous tasks can be declared. Each task executes in parallel using a dedicated subset of warps within the thread block.</p>
+<p><code>tlx.async_task(&quot;default&quot;)</code> defines the default task, also known as the trunk. It uses the available warps not explicitly reserved by other tasks.</p>
+<p><code>tlx.async_task(num_warps=4)</code> defines a warp-specialized asynchronous task that explicitly reserves 4 warps in addition to those used by the trunk task.</p>
+<h4 id="async-tasks-parameters">async_tasks Parameters</h4>
+<table><thead><tr><th>Parameter</th><th>Description</th></tr></thead><tbody><tr><td><code>exclusive</code></td><td>Assert this is the only one <code>tlx.async_tasks</code> in the kernel for more efficient PTX. Default to False.</td></tr><tr><td><code>no_ending_cluster_sync</code></td><td>This suppresses compiler generated cluster sync at end of Warp Spec. Should only be used if user guarantees all cross CTA SMEM/TMEM access are done by end of WS default task. Default to False.</td></tr><tr><td><code>mbarrier_try_wait_suspend_ns</code></td><td>On Blackwell, use the four-operand <code>mbarrier.try_wait.parity</code> form with this suspend hint for waits in the kernel. <code>None</code> is unspecified, <code>0</code> explicitly disables the hint, and positive values enable it. If multiple <code>async_tasks</code> regions specify a value, the minimum explicit value is used module-wide. Default to None.</td></tr></tbody></table>
+<h4 id="async-task-parameters">async_task Parameters</h4>
+<table><thead><tr><th>Parameter</th><th>Description</th></tr></thead><tbody><tr><td><code>&quot;default&quot;</code></td><td>First positional argument to mark this as the default/trunk task</td></tr><tr><td><code>num_warps</code></td><td>Number of warps to reserve for this task</td></tr><tr><td><code>num_regs</code></td><td>Number of registers per thread (optional, for register allocation tuning). It is supported by both default and non-default tasks and must be divisible by 8.</td></tr><tr><td><code>replicate</code></td><td>Number of replicas for this task (default: 1). Creates multiple copies of the task region</td></tr><tr><td><code>warp_group_start_id</code></td><td>Starting warp ID for this task (optional). Allows explicit control over warp assignment</td></tr></tbody></table>
+<h4 id="default-task-register-budget">Default Task Register Budget</h4>
+<p>Register budgets are specified per thread. When the default task does not set <code>num_regs</code>, register allocation keeps the original donation model: non-default warp groups receive their requested budgets, and the default task receives the remaining registers.</p>
+<p>Setting <code>num_regs</code> on the default task selects a fixed budget instead:</p>
+<pre><code class="language-python">with tlx.async_tasks():
+    with tlx.async_task(&quot;default&quot;, num_regs=80):
+        ...
+    with tlx.async_task(num_warps=4, num_regs=24):
+        ...</code></pre>
+<p>In this example, the default and non-default tasks receive 80 and 24 registers per thread, respectively. The default task does not absorb unused registers. Non-default warp groups without an explicit budget evenly share the remaining register pool. If every task has a fixed budget, any surplus is left unused. The compiler may raise a request to the hardware or instrumentation safety minimum when required.</p>
+<h4 id="explicit-warp-assignment-with-warp-group-start-id">Explicit Warp Assignment with warp_group_start_id</h4>
+<p>By default, the compiler automatically assigns warp IDs to each task. However, you can use <code>warp_group_start_id</code> to explicitly specify which warps each task should use. This is useful for:</p>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div>Fine-grained control over warp-to-task mapping</div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div>Ensuring specific hardware resource allocation</div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div>Advanced optimization scenarios</div></div>
+<p><strong>Example:</strong></p>
+<pre><code class="language-python">with tlx.async_tasks():
+    with tlx.async_task(&quot;default&quot;):  # Uses warps 0-3 (from num_warps=4 kernel param)
+        # Producer task
+        ...
+    with tlx.async_task(num_warps=2, warp_group_start_id=4, replicate=2):
+        # Two replicas, each using 2 warps
+        # Replica 0: warps 4-5
+        # Replica 1: warps 6-7
+        ...
+    with tlx.async_task(num_warps=1, warp_group_start_id=8):
+        # Consumer task using warp 8
+        ...</code></pre>
+<p><strong>Validation Rules:</strong></p>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div>Warp ranges must not overlap between tasks</div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div>Non-default tasks must not overlap with the default region (warps 0 to kernel's <code>num_warps</code>)</div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div>When using <code>warp_group_start_id</code>, it must be specified for ALL non-default tasks or NONE</div></div>
+<h3 id="cuda-thread-block-clustering">CUDA Thread Block Clustering</h3>
+<p>TLX supports CUDA Thread Block Clustering (available on SM90+ Hopper/Blackwell GPUs) through the <code>ctas_per_cga</code> parameter. This provides explicit control over cluster dimensions for multi-CTA cooperative kernels.</p>
+<h4 id="usage">Usage</h4>
+<p>Pass <code>ctas_per_cga</code> as a tuple when launching a kernel:</p>
+<pre><code class="language-python">kernel[(grid_x, grid_y)](
+    ...,
+    ctas_per_cga=(2, 1, 1),  # 2x1x1 cluster of CTAs
+    **kwargs
+)</code></pre>
+<h4 id="using-ctas-per-cga-with-autotune">Using ctas_per_cga with Autotune</h4>
+<p>You can specify <code>ctas_per_cga</code> in <code>triton.Config</code> for autotuning:</p>
+<pre><code class="language-python">@triton.autotune(
+    configs=[
+        triton.Config(
+            {&quot;BLOCK_M&quot;: 128, &quot;BLOCK_N&quot;: 128},
+            num_warps=4,
+            ctas_per_cga=(2, 1, 1),  # 2x1x1 cluster
+        ),
+        triton.Config(
+            {&quot;BLOCK_M&quot;: 64, &quot;BLOCK_N&quot;: 64},
+            num_warps=4,
+            ctas_per_cga=(1, 1, 1),  # No clustering
+        ),
+    ],
+    key=[&quot;M&quot;, &quot;N&quot;, &quot;K&quot;],
+)
+@triton.jit
+def matmul_kernel(...):
+    ...</code></pre>
+<h4 id="tlx-vs-triton-semantics">TLX vs Triton Semantics</h4>
+<p>TLX uses <strong>CUDA-native cluster semantics</strong> which differs from Triton's approach:</p>
+<table><thead><tr><th>Aspect</th><th>Triton's way (<code>num_ctas</code>)</th><th>TLX way (<code>ctas_per_cga</code>)</th></tr></thead><tbody><tr><td>Grid interpretation</td><td>Grid × cluster_dims = total CTAs</td><td>Grid = total CTAs</td></tr><tr><td>Cluster definition</td><td>Multiplicative</td><td>Regrouping</td></tr><tr><td><code>num_ctas</code> value</td><td><code>product(cluster_dims)</code></td><td>Always 1</td></tr><tr><td><code>launch_cluster</code></td><td>Can be False (enabled by <code>num_ctas != 1</code>)</td><td>Always True</td></tr></tbody></table></article>
+<footer class="pager"><a href="synchronization.html">← Barriers and Cluster Launch Control</a><a class="next" href="utilities.html">Other operations →</a></footer>
+    </main>
+  </div>
+</body>
+</html>

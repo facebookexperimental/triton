@@ -2,7 +2,6 @@
 #include "AsyncUtility.h"
 #include "Dialect/TritonAMDGPU/IR/Dialect.h"
 #include "TritonAMDGPUToLLVM/GCNAsmFormat.h"
-#include "TritonAMDGPUToLLVM/TargetUtils.h"
 #include "mlir/Dialect/LLVMIR/LLVMTypes.h"
 #include "mlir/Dialect/LLVMIR/ROCDLDialect.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
@@ -13,8 +12,7 @@
 #include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
 namespace tt = mlir::triton;
 using mlir::triton::ModuleAxisInfoAnalysis;
-using mlir::triton::AMD::DppCtrl;
-using mlir::triton::AMD::ISAFamily;
+using mlir::triton::amdgpu::ISAFamily;
 using mlir::triton::gpu::appendOrGetExternFuncOp;
 
 namespace mlir::LLVM::AMD {
@@ -28,7 +26,7 @@ enum class ShflKind : uint32_t {
 
 Value emitDpp(Location loc, RewriterBase &rewriter, Value old, Value src,
               DppCtrl dppCtrl, uint32_t rowMask = 0xf, uint32_t bankMask = 0xf,
-              bool boundCtrl = false) {
+              bool boundCtrl = true) {
   return ROCDL::DPPUpdateOp::create(
       rewriter, loc, src.getType(), old, src,
       rewriter.getI32IntegerAttr(static_cast<uint32_t>(dppCtrl)),
@@ -53,6 +51,25 @@ Value emitPermlaneX16Xor(Location loc, RewriterBase &rewriter, Value val,
   Value hiSel = b.i32_val(buildSelectorMask(8));
   return ROCDL::PermlaneX16Op::create(rewriter, loc, val.getType(), val, val,
                                       loSel, hiSel, true, false);
+}
+
+Value emitPermlaneSwapXor(Location loc, RewriterBase &rewriter, Value val,
+                          uint32_t laneMask) {
+  assert((laneMask == 16 || laneMask == 32) && "Expected a power of 2 mask");
+  assert(val.getType().isInteger(32) && "permlane_swap operates on i32 values");
+  auto b = TritonLLVMOpBuilder(loc, rewriter);
+  MLIRContext *ctx = rewriter.getContext();
+  const char *intrinsic = laneMask == 32 ? "llvm.amdgcn.permlane32.swap"
+                                         : "llvm.amdgcn.permlane16.swap";
+  Type retTy = struct_ty({i32_ty, i32_ty});
+  Value f = b.false_val();
+  Value perm = LLVM::createLLVMIntrinsicCallOp(rewriter, loc, intrinsic, retTy,
+                                               ValueRange{val, val, f, f})
+                   ->getResult(0);
+  Value v0 = b.extract_val(i32_ty, perm, 0);
+  Value v1 = b.extract_val(i32_ty, perm, 1);
+  Value isOriginalVal = b.icmp_eq(v0, val);
+  return b.select(isOriginalVal, v1, v0);
 }
 
 Value shuffleCommonImpl(Location loc, RewriterBase &rewriter,
@@ -141,15 +158,17 @@ Value shuffleCommonImpl(Location loc, RewriterBase &rewriter,
         ctrlBits |= (lane ^ quadMask) << (lane * 2);
       return static_cast<DppCtrl>(ctrlBits);
     };
+    bool usePermlaneSwap = isaFamily == ISAFamily::CDNA4 && (mask & 0x30);
 
-    if (isRDNA(isaFamily) || isaFamily == ISAFamily::GFX1250) {
+    if (triton::amdgpu::isRDNA(isaFamily) || isaFamily == ISAFamily::GFX1250) {
       if (mask < 16)
         return emitDpp(loc, rewriter, val, val,
                        makeDppCtrl(DppCtrl::ROW_XMASK0, mask));
       else if (mask < 32)
         return emitPermlaneX16Xor(loc, rewriter, val, mask & 0xf);
-    } else if ((isCDNA(isaFamily) || isaFamily == ISAFamily::GCN5_1) &&
-               mask < 16) {
+    } else if ((triton::amdgpu::isCDNA(isaFamily) ||
+                isaFamily == ISAFamily::GCN5_1) &&
+               (mask < 16 || usePermlaneSwap)) {
       Value result = val;
       uint32_t highBitsDppBasis = 0;
 
@@ -158,7 +177,7 @@ Value shuffleCommonImpl(Location loc, RewriterBase &rewriter,
       if (mask & 8)
         highBitsDppBasis ^= 8;
 
-      uint32_t quadMask = mask ^ highBitsDppBasis;
+      uint32_t quadMask = (mask & 0xf) ^ highBitsDppBasis;
 
       if (highBitsDppBasis) {
         DppCtrl highBitsDppCtrl;
@@ -179,6 +198,13 @@ Value shuffleCommonImpl(Location loc, RewriterBase &rewriter,
       if (quadMask) {
         result =
             emitDpp(loc, rewriter, result, result, makeQuadPermCtrl(quadMask));
+      }
+
+      if (usePermlaneSwap) {
+        if (mask & 16)
+          result = emitPermlaneSwapXor(loc, rewriter, result, 16);
+        if (mask & 32)
+          result = emitPermlaneSwapXor(loc, rewriter, result, 32);
       }
       return result;
     } else {
@@ -651,14 +677,14 @@ int32_t getCtrlBitsForCacheModifierOnTarget(
     triton::CacheModifier cm, bool isLoad,
     const mlir::triton::AMD::TargetInfo &targetInfo) {
   switch (targetInfo.getISAFamily()) {
-  case triton::AMD::ISAFamily::CDNA3:
-  case triton::AMD::ISAFamily::CDNA4:
+  case ISAFamily::CDNA3:
+  case ISAFamily::CDNA4:
     return getCtrlBitsForCacheModifierOn_CDNA3_CDNA4(cm, isLoad);
-  case triton::AMD::ISAFamily::RDNA3:
+  case ISAFamily::RDNA3:
     return getCtrlBitsForCacheModifierOnRDNA3(cm, isLoad);
-  case triton::AMD::ISAFamily::RDNA4:
+  case ISAFamily::RDNA4:
     return getCtrlBitsForCacheModifierOn_GFX12(cm, isLoad, /*$ bypass*/ false);
-  case triton::AMD::ISAFamily::GFX1250:
+  case ISAFamily::GFX1250:
     return getCtrlBitsForCacheModifierOn_GFX12(cm, isLoad, /*$ bypass*/ true);
   default:
     return getDefaultCtrlBitsForCacheModifier(cm);
@@ -698,11 +724,17 @@ unsigned getContiguity(Value ptr, Value offset,
   // FIXME (Alex): this should not be needed anymore because it's done inside
   // getContiguity, but we have an order issues with LL, so we keep this
   // until the LL order issue is fixed
-  auto linearLayout = triton::gpu::toLinearLayout(tensorTy);
-  auto llAttr = triton::gpu::LinearEncodingAttr::get(tensorTy.getContext(),
-                                                     std::move(linearLayout));
+  SmallVector<unsigned> contigPerThread;
+  if (auto llAttr =
+          dyn_cast<triton::gpu::LinearEncodingTrait>(tensorTy.getEncoding())) {
+    contigPerThread = llAttr.getContigPerThread();
+  } else {
+    auto linearLayout = triton::gpu::toLinearLayout(tensorTy);
+    auto fallbackAttr = triton::gpu::LinearEncodingAttr::get(
+        tensorTy.getContext(), std::move(linearLayout));
+    contigPerThread = fallbackAttr.getContigPerThread();
+  }
   auto order = triton::gpu::getOrder(tensorTy);
-  auto contigPerThread = llAttr.getContigPerThread();
   assert(order[0] < contigPerThread.size() &&
          "Unexpected contigPerThread size");
   contiguity = std::min(contiguity, contigPerThread[order[0]]);
@@ -795,7 +827,7 @@ bool canLoadDirectToLDS(const triton::AMD::TargetInfo &targetInfo,
     // Without scattering support, padding can only be inserted at warp
     // boundaries. This means minInterval must be a multiple of (vectorSize *
     // warpSize) which becomes vectorSize <= minInterval / warpSize.
-    if (!targetInfo.supportsDirectToLDSScattering())
+    if (!targetInfo.supportsDirectToLdsScatter())
       maxAllowedVecSize = paddedEnc.getMinInterval() / targetInfo.getWarpSize();
 
     vectorSize = std::min(vectorSize, maxAllowedVecSize);
@@ -809,7 +841,7 @@ bool canLoadDirectToLDS(const triton::AMD::TargetInfo &targetInfo,
   }
 
   // Following checks are specific to architectures not supporting scattering
-  if (targetInfo.supportsDirectToLDSScattering())
+  if (targetInfo.supportsDirectToLdsScatter())
     return true;
 
   // Must support the full vector width; splitting would cause strided writes.

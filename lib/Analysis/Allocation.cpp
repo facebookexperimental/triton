@@ -39,17 +39,37 @@ namespace mlir {
 //===----------------------------------------------------------------------===//
 namespace triton {
 
-unsigned getNumScratchElemsSwizzledCvt(RankedTensorType srcTy,
-                                       RankedTensorType dstTy) {
-  auto *ctx = srcTy.getContext();
-  auto srcLayout = gpu::toLinearLayout(srcTy);
-  auto dstLayout = gpu::toLinearLayout(dstTy);
-  srcLayout = actionRemoveBroadcastedRegs(srcLayout).apply(srcLayout);
-  dstLayout = actionRemoveBroadcastedRegs(dstLayout).apply(dstLayout);
-  auto bitwidth = getBitwidth(srcTy);
-  auto smem = gpu::optimalSwizzlingLdSt(srcLayout, dstLayout, bitwidth);
+unsigned getNumScratchElemsSwizzledCvt(const LinearLayout &srcLayout,
+                                       const LinearLayout &dstLayout,
+                                       int bitwidth, int numBanks,
+                                       gpu::LocalMemOpTile srcTile,
+                                       gpu::LocalMemOpTile dstTile) {
+  auto *ctx = srcLayout.getInDimNames().begin()->getContext();
+  auto srcLayoutNoBroadcast =
+      actionRemoveBroadcastedRegs(srcLayout).apply(srcLayout);
+  auto dstLayoutNoBroadcast =
+      actionRemoveBroadcastedRegs(dstLayout).apply(dstLayout);
+  auto smem =
+      gpu::optimalSwizzlingLdSt(srcLayoutNoBroadcast, dstLayoutNoBroadcast,
+                                bitwidth, numBanks, srcTile, dstTile);
   auto reps = smem.getInDimSize(StringAttr::get(ctx, "reps"));
-  return smem.getTotalOutDimSize() / reps;
+  // The smem has the same cta layout as the srcLayout, so we use that instead
+  // We remove the number of elements that are duplicated in the cta layout
+  auto nBlocks = product(triton::gpu::getCTASplitNum(
+      gpu::LinearEncodingAttr::get(ctx, srcLayout)));
+  // Modular layouts size the padded input cover; pow2 keeps output sizing.
+  auto elems =
+      smem.isModular() ? smem.getTotalInDimSize() : smem.getTotalOutDimSize();
+  return elems / (reps * nBlocks);
+}
+
+unsigned getNumScratchElemsSwizzledCvt(RankedTensorType srcTy,
+                                       RankedTensorType dstTy, int numBanks,
+                                       gpu::LocalMemOpTile srcTile,
+                                       gpu::LocalMemOpTile dstTile) {
+  return getNumScratchElemsSwizzledCvt(
+      gpu::toLinearLayout(srcTy), gpu::toLinearLayout(dstTy),
+      getBitwidth(srcTy), numBanks, srcTile, dstTile);
 }
 
 // Both `atomic_cas` and `atomic_rmw` may need scratch memory to store values
@@ -78,8 +98,7 @@ static SmallVector<unsigned> getRepShapeForAtomic(Value result) {
 
 unsigned defaultAllocationAnalysisScratchSizeFn(Operation *op) {
   if (auto reduceOp = dyn_cast<ReduceOp>(op)) {
-    ReduceOpHelper helper(reduceOp);
-    return helper.getScratchSizeInBytes();
+    return ReduceOpHelper(reduceOp).getScratchSizeInBytes();
   }
   if (auto scanOp = dyn_cast<ScanOp>(op)) {
     ScanLoweringHelper helper(scanOp);
@@ -105,8 +124,9 @@ unsigned defaultAllocationAnalysisScratchSizeFn(Operation *op) {
     auto elems = getNumScratchElemsSwizzledCvt(srcTy, dstTy);
     return elems * getBitwidth(srcTy) / 8;
   }
-  if (isa<AtomicRMWOp, AtomicCASOp, tti::ExperimentalGSanAtomicRMWOp,
-          tti::ExperimentalGSanAtomicCASOp>(op)) {
+  if (isa<gpu::LocalAtomicScatterRMWOp, AtomicRMWOp, AtomicCASOp,
+          tti::ExperimentalGSanAtomicRMWOp, tti::ExperimentalGSanAtomicCASOp>(
+          op)) {
     auto value = op->getOperand(0);
     auto smemShape = getRepShapeForAtomic(op->getResult(0));
     auto elems = getNumScratchElements(smemShape);
@@ -253,10 +273,14 @@ private:
     if (auto func = dyn_cast<FunctionOpInterface>(op)) {
       unsigned numWarpIndices = 0;
       // Warp specialization communicates states over shared memory to each
-      // warp. Add space for an i8 for each warpgroup warp.
-      func.walk([&](gpu::WarpSpecializeOp op) {
-        numWarpIndices = std::max(numWarpIndices, op.getTotalPartitionWarps());
-      });
+      // warp. Add space for an i8 for each warpgroup warp. If single-WS
+      // lowering, dispatch from warp id instead of a state id, so it needs no
+      // state array and we skip this allocation.
+      if (!gpu::hasSingleWarpSpecialize(op->getParentOfType<ModuleOp>()))
+        func.walk([&](gpu::WarpSpecializeOp op) {
+          numWarpIndices =
+              std::max(numWarpIndices, op.getTotalPartitionWarps());
+        });
       maybeAddScratchBuffer<BufferT::BufferKind::Scratch>(op, numWarpIndices);
       return;
     }
@@ -439,11 +463,13 @@ private:
         minId = 0;
         maxId = operationId.size();
       }
-      // For barriers used in warp specialization (InitBarrierOp), extend
-      // liveness to the entire function. Barriers are initialized at the
-      // start and may be used across multiple sequential warp-specialized
-      // loops. Without this, two barriers in different loops could get the
-      // same allocation offset, causing corruption when both are initialized.
+      // For barriers, extend liveness to the entire function. By default,
+      // SMEM based mbarriers (on NV GPU) need to be invalidated before reusing.
+      // If bar inval op is not explicitly inserted, it should be assumed that
+      // the bar is alive until kernel end. Without this lifetime extension, a
+      // later bar could think an earlier bar was dead since the last explicit
+      // reference to it and reuse the buffer, causing corruption when
+      // performing bar init again on this mem location.
       if (hasOpOfAnyTypeInForwardSlice<ttng::InitBarrierOp>(defOp)) {
         minId = 0;
         maxId = operationId.size();

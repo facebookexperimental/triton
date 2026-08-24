@@ -15,11 +15,39 @@ Structure modeled after blackwell_gemm_ws.py: smem_accum_cnt persists across
 tiles so the SMEM ring buffer doesn't need to drain between tiles.
 """
 
+import os
+
 import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
 
 
+@triton.jit
+def get_bufidx_phase(i, n: tl.constexpr):
+    """Continuous ring counter -> (buffer index, phase). Because the counter
+    runs unbroken across persistent tiles, producer and consumer agree on
+    (buf, phase) for every step regardless of how the ring depth relates to
+    k_tiles -- so a ring deeper than one tile's K-iterations is safe."""
+    return i % n, (i // n) & 1
+
+
+# Autotune ONLY the SMEM/TMEM ring depths (the same degrees of freedom the modulo
+# scheduler chooses) so the comparison against the generated kernel is
+# apples-to-apples; BLOCK_M/N/K, num_warps, and everything else stay fixed.
+def _autotune_configs():
+    # Measured best (do_bench on B200, square/representative shape). TLX_HW_BEST_CONFIG=1
+    # uses it directly (fast path, no autotune search); otherwise the full depth grid
+    # is swept. Mirrors the tutorial WS GEMM TLX_GEMM_USE_HEURISTIC pattern.
+    if os.environ.get("TLX_HW_BEST_CONFIG") == "1":
+        return [triton.Config({"NUM_SMEM_BUFFERS": 5, "NUM_TMEM_BUFFERS": 1}, num_warps=4, num_stages=2, num_ctas=1)]
+    return [
+        triton.Config({"NUM_SMEM_BUFFERS": s, "NUM_TMEM_BUFFERS": t}, num_warps=4, num_stages=2, num_ctas=1)
+        for s in (2, 3, 4, 5, 6)
+        for t in (1, 2)
+    ]
+
+
+@triton.autotune(configs=_autotune_configs(), key=["M", "N", "K"])
 @triton.jit
 def matmul_kernel(
     a_desc,
@@ -33,22 +61,25 @@ def matmul_kernel(
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
     NUM_SMEM_BUFFERS: tl.constexpr,
+    NUM_TMEM_BUFFERS: tl.constexpr,
 ):
     # ── Allocs (function scope) ──
     # A: [BM, BK] row-major (compatible with MMA's first operand layout)
     # B: [BN, BK] — TMA loads in this layout, transposed for MMA to [BK, BN]
     smem_a = tlx.local_alloc((BLOCK_M, BLOCK_K), tlx.dtype_of(a_desc), NUM_SMEM_BUFFERS)
     smem_b = tlx.local_alloc((BLOCK_N, BLOCK_K), tlx.dtype_of(b_desc), NUM_SMEM_BUFFERS)
-    acc_tmem = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float32, 1, tlx.storage_kind.tmem)
+    acc_tmem = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float32, NUM_TMEM_BUFFERS, tlx.storage_kind.tmem)
     c_smem = tlx.local_alloc((BLOCK_M, BLOCK_N), tlx.dtype_of(c_desc), 1)
 
     # ── Mbarriers ──
+    # A and B share one "empty" barrier per ring slot: the async_dot consumes
+    # both operands, so one MMA-completion signal frees the whole slot (mirrors
+    # the tutorial, which gates B reuse on A's empty barrier).
     a_full = tlx.alloc_barriers(num_barriers=NUM_SMEM_BUFFERS, arrive_count=1)
-    a_empty = tlx.alloc_barriers(num_barriers=NUM_SMEM_BUFFERS, arrive_count=1)
     b_full = tlx.alloc_barriers(num_barriers=NUM_SMEM_BUFFERS, arrive_count=1)
-    b_empty = tlx.alloc_barriers(num_barriers=NUM_SMEM_BUFFERS, arrive_count=1)
-    tmem_full = tlx.alloc_barriers(num_barriers=1, arrive_count=1)
-    tmem_empty = tlx.alloc_barriers(num_barriers=1, arrive_count=1)
+    ab_empty = tlx.alloc_barriers(num_barriers=NUM_SMEM_BUFFERS, arrive_count=1)
+    tmem_full = tlx.alloc_barriers(num_barriers=NUM_TMEM_BUFFERS, arrive_count=1)
+    tmem_empty = tlx.alloc_barriers(num_barriers=NUM_TMEM_BUFFERS, arrive_count=1)
 
     start_pid = tl.program_id(0)
     num_pid_m = tl.cdiv(M, BLOCK_M)
@@ -60,46 +91,53 @@ def matmul_kernel(
         # ── default partition (epilogue, runs once per tile) ──
         with tlx.async_task("default"):
             tile_id = start_pid
-            tmem_phase = 0
+            tmem_accum = 0
             while tile_id < num_tiles:
                 pid_m = tile_id // num_pid_n
                 pid_n = tile_id % num_pid_n
-                tlx.barrier_wait(tmem_full[0], tmem_phase)
-                acc = tlx.local_load(acc_tmem[0])
-                tlx.barrier_arrive(tmem_empty[0], 1)
+                cur_tmem, read_phase = get_bufidx_phase(tmem_accum, NUM_TMEM_BUFFERS)
+                tlx.barrier_wait(tmem_full[cur_tmem], read_phase)
+                acc = tlx.local_load(acc_tmem[cur_tmem])
+                tlx.barrier_arrive(tmem_empty[cur_tmem], 1)
                 c = acc.to(tlx.dtype_of(c_desc))
                 tlx.local_store(c_smem[0], c)
                 tlx.fence_async_shared()
                 tlx.async_descriptor_store(c_desc, c_smem[0], [pid_m * BLOCK_M, pid_n * BLOCK_N])
                 tlx.async_descriptor_store_wait(0)
+                tmem_accum += 1
                 tile_id += NUM_SMS
-                tmem_phase ^= 1
 
         # ── TC partition (MMA, K-loop nested inside persistent loop) ──
         with tlx.async_task(num_warps=1, num_regs=24):
-            tlx.barrier_wait(tmem_empty[0], 1)  # initial empty signal
             tile_id = start_pid
             smem_accum = 0
-            tmem_phase = 0
+            tmem_accum = 0
             while tile_id < num_tiles:
-                for k_iter in range(k_tiles):
-                    buf = smem_accum % NUM_SMEM_BUFFERS
-                    phase = (smem_accum // NUM_SMEM_BUFFERS) & 1
+                cur_tmem, write_phase = get_bufidx_phase(tmem_accum, NUM_TMEM_BUFFERS)
+                # Peeled first K-iter: reserve the accumulator slot (phase^1 makes
+                # the very first use a no-op, so no explicit initial signal), then
+                # clear it with use_acc=False.
+                buf, phase = get_bufidx_phase(smem_accum, NUM_SMEM_BUFFERS)
+                tlx.barrier_wait(tmem_empty[cur_tmem], write_phase ^ 1)
+                tlx.barrier_wait(a_full[buf], phase)
+                tlx.barrier_wait(b_full[buf], phase)
+                # B was loaded as [BN, BK]; transpose for MMA → [BK, BN]. The
+                # empty barrier is arrived on MMA COMPLETION (via mBarriers), not
+                # on issue, so the loader can't overwrite a slot still in use.
+                b_t = tlx.local_trans(smem_b[buf])
+                tlx.async_dot(smem_a[buf], b_t, acc_tmem[cur_tmem], use_acc=False, mBarriers=[ab_empty[buf]])
+                smem_accum += 1
+                for _ in range(1, k_tiles):
+                    buf, phase = get_bufidx_phase(smem_accum, NUM_SMEM_BUFFERS)
                     tlx.barrier_wait(a_full[buf], phase)
                     tlx.barrier_wait(b_full[buf], phase)
-                    use_acc = k_iter > 0
-                    # B was loaded as [BN, BK]; transpose for MMA → [BK, BN].
                     b_t = tlx.local_trans(smem_b[buf])
-                    tlx.async_dot(smem_a[buf], b_t, acc_tmem[0], use_acc=use_acc)
-                    tlx.barrier_arrive(a_empty[buf], 1)
-                    tlx.barrier_arrive(b_empty[buf], 1)
+                    tlx.async_dot(smem_a[buf], b_t, acc_tmem[cur_tmem], use_acc=True, mBarriers=[ab_empty[buf]])
                     smem_accum += 1
-                tlx.barrier_arrive(tmem_full[0], 1)
+                # tmem_full is arrived when the tile's async MMAs actually drain.
+                tlx.tcgen05_commit(tmem_full[cur_tmem])
+                tmem_accum += 1
                 tile_id += NUM_SMS
-                # Wait for epilogue to release TMEM before next tile.
-                if tile_id < num_tiles:
-                    tlx.barrier_wait(tmem_empty[0], tmem_phase ^ 1)
-                tmem_phase ^= 1
 
         # ── MEM partition (TMA loads, both A and B in one task) ──
         with tlx.async_task(num_warps=1, num_regs=24):
@@ -111,15 +149,12 @@ def matmul_kernel(
                 offs_am = pid_m * BLOCK_M
                 offs_bn = pid_n * BLOCK_N
                 for k_iter in range(k_tiles):
-                    buf = smem_accum % NUM_SMEM_BUFFERS
-                    phase = (smem_accum // NUM_SMEM_BUFFERS) & 1
+                    buf, phase = get_bufidx_phase(smem_accum, NUM_SMEM_BUFFERS)
                     offs_k = k_iter * BLOCK_K
-                    # Load A
-                    tlx.barrier_wait(a_empty[buf], phase ^ 1)
+                    # One empty wait frees the whole slot; load A and B into it.
+                    tlx.barrier_wait(ab_empty[buf], phase ^ 1)
                     tlx.barrier_expect_bytes(a_full[buf], BLOCK_M * BLOCK_K * 2)
                     tlx.async_descriptor_load(a_desc, smem_a[buf], [offs_am, offs_k], a_full[buf])
-                    # Load B (as [BN, BK])
-                    tlx.barrier_wait(b_empty[buf], phase ^ 1)
                     tlx.barrier_expect_bytes(b_full[buf], BLOCK_N * BLOCK_K * 2)
                     tlx.async_descriptor_load(b_desc, smem_b[buf], [offs_bn, offs_k], b_full[buf])
                     smem_accum += 1

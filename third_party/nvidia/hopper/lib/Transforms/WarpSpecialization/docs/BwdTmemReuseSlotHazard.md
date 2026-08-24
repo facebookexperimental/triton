@@ -117,7 +117,7 @@ ordering, passes with it). Note the **persistent** backward
 and the pipeliner cannot predicate `descriptor_reduce`); the reuse fix is
 validated on the usable non-persistent path.
 
-## Why this is not caught in `doCodePartitionPost`
+## Why this is not caught in `doCodePartition`
 
 A natural idea is to reject the bad ordering during reuse-group validation. That
 was tried (a program-order check: a channel's producer writing the slot before
@@ -126,7 +126,7 @@ read data) and it **false-positives**: it also fired on the *correct* default
 config (`bwd_config_idx=0`).
 
 The reason is timing in the pipeline: reuse-group validation runs in
-`doCodePartitionPost` **before** the reuse-WAR barriers are inserted (those come
+`doCodePartition` **before** the reuse-WAR barriers are inserted (those come
 later in `insertAsyncComm`). "Writer before reader" is *normal* for valid
 cross-partition reuse — the inserted barrier makes it safe (e.g. dpT writes the
 slot, the computation partition overwrites it with `dsT`, then dk reads — all
@@ -170,7 +170,7 @@ are both visible). Sketch:
 
 This is strictly more than a heuristic — it needs the barrier graph and the
 aliasing resolution — which is why it belongs in a dedicated post-`insertAsyncComm`
-verification pass rather than in `doCodePartitionPost`.
+verification pass rather than in `doCodePartition`.
 `ws_reuse_slot_hazard_xfail.mlir` is the executable spec for it.
 
 ## main4 reconciliation: keep the group out of the A6 hub

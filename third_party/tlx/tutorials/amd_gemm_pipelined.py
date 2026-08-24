@@ -186,15 +186,21 @@ def matmul_kernel_pipelined_mi300(a_ptr, b_ptr, c_ptr, M, N, K, stride_am, strid
     # Pipeline Kernel Main Loop.
     # BLOCK_SIZE_K - (NUM_STAGES - 1) iterations
     acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-    # Disable auto-pipelining with num_stages=0
-    for k in tl.range(NUM_STAGES - 1, K_ITERS, num_stages=0):
+    # Disable auto-pipelining with num_stages=1
+    for k in tl.range(NUM_STAGES - 1, K_ITERS, num_stages=1):
         # prefetch data for k into regs, this is NUM_STAGES - 1 ahead of the k in the following tl.dot
         a_k_smem_view = tlx.local_view(buffers_A, k % NUM_BUFFERS)
         b_k_smem_view = tlx.local_view(buffers_B, k % NUM_BUFFERS)
         a_load_reg = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K)
 
-        # do compute on data fetched ahead by NUM_STAGES - 1
-        buf = (k - NUM_STAGES - 1) % NUM_BUFFERS
+        # Compute on the tile fetched NUM_STAGES - 1 iterations ago, i.e. tile
+        #   k - (NUM_STAGES - 1) == k - NUM_BUFFERS
+        # since NUM_BUFFERS is defined as NUM_STAGES - 1 above. Buffers rotate
+        # modulo NUM_BUFFERS, so that tile sits in buffer
+        #   (k - NUM_BUFFERS) % NUM_BUFFERS == k % NUM_BUFFERS
+        # and it is read here before the local_store below refills the same
+        # buffer with tile k.
+        buf = k % NUM_BUFFERS
         a_k_prev_shmem = tlx.local_view(buffers_A, buf)
         b_k_prev_shmem = tlx.local_view(buffers_B, buf)
         a_k_prev_reg = tlx.local_load(a_k_prev_shmem)
@@ -227,8 +233,8 @@ def matmul_kernel_pipelined_mi300(a_ptr, b_ptr, c_ptr, M, N, K, stride_am, strid
 
 
 def matmul(a, b, config=None):
-    # config is accepted for a uniform launcher signature; this kernel is
-    # autotuned over `configs`, so the argument is intentionally unused.
+    # config=None autotunes over `configs`; an explicit config dict launches
+    # that config directly, matching the other tutorial launchers.
     # Check constraints.
     assert a.shape[1] == b.shape[0], "Incompatible dimensions"
     assert a.is_contiguous(), "Matrix A must be contiguous"
@@ -236,13 +242,18 @@ def matmul(a, b, config=None):
     K, N = b.shape
     # Allocates output (dtype follows the inputs so fp16/bf16 both round-trip).
     c = torch.empty((M, N), device=a.device, dtype=a.dtype)
-    # 1D launch kernel where each block gets its own program.
-    grid = lambda META: (triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(N, META['BLOCK_SIZE_N']), )
-    matmul_kernel_pipelined_mi300[grid](
+    args = (
         a, b, c,  #
         M, N, K,  #
         a.stride(0), a.stride(1),  #
         b.stride(0), b.stride(1),  #
         c.stride(0), c.stride(1),  #
     )
+    if config is not None:
+        grid = (triton.cdiv(M, config['BLOCK_SIZE_M']) * triton.cdiv(N, config['BLOCK_SIZE_N']), )
+        matmul_kernel_pipelined_mi300.fn[grid](*args, **config)
+    else:
+        # 1D launch kernel where each block gets its own program.
+        grid = lambda META: (triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(N, META['BLOCK_SIZE_N']), )
+        matmul_kernel_pipelined_mi300[grid](*args)
     return c

@@ -29,6 +29,20 @@ module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32} {
 
 #shared0 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
 #smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 2 : i32, "ttg.cluster-dim-z" = 2 : i32} {
+  // CHECK-LABEL: clc_try_cancel_explicit_cluster
+  tt.func @clc_try_cancel_explicit_cluster(%result: !ttg.memdesc<2xi64, #shared0, #smem>, %mbar: !ttg.memdesc<1xi64, #shared0, #smem>) {
+    // CHECK: nvg.cluster_id
+    // CHECK: clusterlaunchcontrol.try_cancel.async.shared::cta.mbarrier::complete_tx::bytes.multicast::cluster::all.b128
+    ttng.clc_try_cancel %result, %mbar : !ttg.memdesc<2xi64, #shared0, #smem>, !ttg.memdesc<1xi64, #shared0, #smem>
+    tt.return
+  }
+}
+
+// -----
+
+#shared0 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
   // CHECK-LABEL: clc_load_result
   tt.func @clc_load_result(%result: !ttg.memdesc<2xi64, #shared0, #smem>) {
@@ -70,6 +84,50 @@ module attributes {"ttg.num-ctas" = 4 : i32, "ttg.num-warps" = 4 : i32} {
     // CHECK-NEXT: %[[four:.*]] = llvm.mlir.constant(4 : i32)
     // CHECK-NEXT: llvm.sdiv %[[ctaid]], %[[four]] : i32
     %ctaid = ttng.clc_get_program_id %clcResult, x : i128 -> i32
+    tt.return
+  }
+}
+
+// -----
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 3 : i32, "ttg.cluster-dim-z" = 4 : i32} {
+  // CHECK-LABEL: clc_get_program_id_x_explicit_cluster
+  tt.func @clc_get_program_id_x_explicit_cluster(%clcResult: i128) {
+    // CHECK: clusterlaunchcontrol.query_cancel.get_first_ctaid::x.b32.b128
+    // CHECK: nvg.cluster_id
+    // CHECK: llvm.urem
+    // CHECK: llvm.add
+    %ctaid = ttng.clc_get_program_id %clcResult, x : i128 -> i32
+    tt.return
+  }
+}
+
+// -----
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 3 : i32, "ttg.cluster-dim-z" = 4 : i32} {
+  // CHECK-LABEL: clc_get_program_id_y_explicit_cluster
+  tt.func @clc_get_program_id_y_explicit_cluster(%clcResult: i128) {
+    // CHECK: clusterlaunchcontrol.query_cancel.get_first_ctaid::y.b32.b128
+    // CHECK: nvg.cluster_id
+    // CHECK: llvm.udiv
+    // CHECK: llvm.urem
+    // CHECK: llvm.add
+    %ctaid = ttng.clc_get_program_id %clcResult, y : i128 -> i32
+    tt.return
+  }
+}
+
+// -----
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 3 : i32, "ttg.cluster-dim-z" = 4 : i32} {
+  // CHECK-LABEL: clc_get_program_id_z_explicit_cluster
+  tt.func @clc_get_program_id_z_explicit_cluster(%clcResult: i128) {
+    // CHECK: clusterlaunchcontrol.query_cancel.get_first_ctaid::z.b32.b128
+    // CHECK: nvg.cluster_id
+    // CHECK: llvm.udiv
+    // CHECK: llvm.urem
+    // CHECK: llvm.add
+    %ctaid = ttng.clc_get_program_id %clcResult, z : i128 -> i32
     tt.return
   }
 }

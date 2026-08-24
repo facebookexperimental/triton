@@ -124,6 +124,10 @@ def build_spec(ptx: str, metadata, grid, ordered_args, ptxas: str) -> dict:
     make_tensordesc_arg) -- and appends the two trailing null scratch pointers. Backing tensors are
     deduped by `id` so descriptors that share a tensor share one allocation.
 
+    Cluster shape is read from ``metadata.ctas_per_cga`` ONLY: that is the sole field TLX kernels set to
+    request a cluster (the CUDA-native path), and the nvidia backend mirrors it into ``cluster_dims`` in
+    ``Metadata.__post_init__`` -- so ctas_per_cga is authoritative and cluster_dims/cluster are not read.
+
     Raises NotImplementedError for kernels this PTX-direct path does not cover yet (non-null
     global/profile scratch, multi-CTA/cluster, fp4-padded/im2col TMA, other arg types, or any param
     mismatch) so the caller fails open and simply does not collect that kernel."""
@@ -131,12 +135,23 @@ def build_spec(ptx: str, metadata, grid, ordered_args, ptxas: str) -> dict:
     gss = int(getattr(metadata, "global_scratch_size", 0) or 0)
     pss = int(getattr(metadata, "profile_scratch_size", 0) or 0)
     num_ctas = int(getattr(metadata, "num_ctas", 1) or 1)
-    cluster = list(getattr(metadata, "cluster_dims", getattr(metadata, "cluster", [1, 1, 1])) or [1, 1, 1])
+    # Cluster shape from ctas_per_cga only (see docstring): the field TLX kernels populate; the backend
+    # mirrors it into cluster_dims, so ctas_per_cga is authoritative.
+    cluster = list(getattr(metadata, "ctas_per_cga", None) or [1, 1, 1])
     tdmeta = list(getattr(metadata, "tensordesc_meta", None) or [])
     if gss or pss:
         raise NotImplementedError(f"non-null scratch (global={gss} profile={pss})")
-    if num_ctas != 1 or any(int(c) != 1 for c in cluster):
-        raise NotImplementedError(f"multi-CTA/cluster (num_ctas={num_ctas} cluster={cluster})")
+    # Cluster support is limited to the TLX / CUDA-native path: num_ctas == 1 with the cluster shape
+    # carried by the cubin's `.reqnctapercluster` directive, so a plain launch with the total-CTA grid
+    # re-forms the clusters (matches the frontend launcher, which sets NO CLUSTER_DIMENSION attr for
+    # this path). The Triton num_ctas>1 path (grid multiplied by num_ctas + an explicit
+    # CLUSTER_DIMENSION launch attr) is not covered.
+    if num_ctas != 1:
+        raise NotImplementedError(f"multi-CTA via num_ctas>1 (num_ctas={num_ctas})")
+    cluster = [int(c) for c in cluster]
+    cluster_size = 1
+    for c in cluster:
+        cluster_size *= c
     if len(kinds) < 2 or kinds[-2] != "ptr" or kinds[-1] != "ptr":
         raise NotImplementedError("expected two trailing scratch pointer params")
     user_kinds = kinds[:-2]  # drop global_scratch + profile_scratch
@@ -227,18 +242,23 @@ def build_spec(ptx: str, metadata, grid, ordered_args, ptxas: str) -> dict:
         raise NotImplementedError(f"param parity: consumed {ki} != {len(user_kinds)} PTX user params")
     args += [{"null": True}, {"null": True}]  # global_scratch, profile_scratch
 
-    g = list(grid)
+    g = [int(grid[0]), int(grid[1]) if len(grid) > 1 else 1, int(grid[2]) if len(grid) > 2 else 1]
+    # A clustered launch re-forms clusters from the total-CTA grid via `.reqnctapercluster`; the driver
+    # requires each grid dim to be a multiple of its cluster dim (as it was in the collected run).
+    if cluster_size != 1 and any(gd % cd != 0 for gd, cd in zip(g, cluster, strict=True)):
+        raise NotImplementedError(f"grid {g} not divisible by cluster {cluster}")
     spec = {
         "entry": name,
         "arch": parse_arch(ptx),
         "shared": int(getattr(metadata, "shared", 0) or 0),
         "block": [int(getattr(metadata, "num_warps", 1) or 1) * 32, 1, 1],
-        "grid": [int(g[0]), int(g[1]) if len(g) > 1 else 1,
-                 int(g[2]) if len(g) > 2 else 1],
+        "grid": g,
         "ptxas": ptxas,
         "tensors": tensors,
         "args": args,
     }
+    if cluster_size != 1:
+        spec["cluster"] = cluster
     if tensordescs:
         spec["tensordescs"] = tensordescs
     return spec

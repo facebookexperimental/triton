@@ -58,6 +58,10 @@ def is_blackwell_ultra():
     return is_cuda() and torch.cuda.get_device_capability()[0:2] == (10, 3)
 
 
+def is_rubin():
+    return is_cuda() and torch.cuda.get_device_capability()[0:2] == (10, 7)
+
+
 def is_hopper_or_newer():
     return is_cuda() and torch.cuda.get_device_capability()[0] >= 9
 
@@ -104,6 +108,10 @@ def is_hip_rdna4():
 def is_hip_gfx1250():
     target = get_current_target()
     return target is not None and target.backend == 'hip' and 'gfx1250' in target.arch
+
+
+def is_hip_cdna3_or_newer():
+    return is_hip_cdna3() or is_hip_cdna4()
 
 
 def is_hip_cdna():

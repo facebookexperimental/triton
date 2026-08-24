@@ -1,5 +1,6 @@
 #include "mlir/Analysis/SliceAnalysis.h"
 #include "mlir/IR/ImplicitLocOpBuilder.h"
+#include "mlir/IR/Matchers.h"
 #include "mlir/Transforms/Passes.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
@@ -8,25 +9,21 @@
 #include "triton/Dialect/TritonInstrument/IR/Utility.h"
 #include "triton/Dialect/TritonInstrument/Transforms/ConSanTargetHooks.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
+#include "triton/Tools/Sys/GetEnv.h"
 #include "llvm/ADT/StringMap.h"
+#include "llvm/Support/ErrorHandling.h"
 
 // clang-format off
 // Concurrency Sanitizer data structures:
-// ConSan keeps auxilary data requied for tracking memory accesses in tensors.
+// ConSan keeps auxiliary data required for tracking memory accesses in tensors.
 // These tensors are stored as a distributed tensor or in global scratch memory.
+// C = CTAs, B = buffers, K = mbarriers, T = logical ConSan thread bit slots,
+// P = base-thread commit columns.
 //
-// Name              | Storage | Rank/Type       | Description
-// ------------------|---------|-----------------|------------
-// buffers           | tensor  | <B x i64>       | Base pointers of all (sub)buffers
-// barriers          | tensor  | <K x i64>       | Pointers to all individual mbarriers
-// barrierStates     | scratch | <K x i32>       | Packed barrier phase (bit 0) and arrival counts (bits[1..8] init, [9..16] current); zero means invalid/uninitialized
-// waiting           | scratch | <K x i32>       | Two bits per thread: waiting flag bit (LSB), stored phase bit (bit 1)
-// writeVisibility   | scratch | <B x i64>       | Per-buffer thread-visibility bitmask (bit i => thread i visible)
-// readVisibility    | scratch | <B x T x i64>   | Per-buffer, per-thread visibility lanes (row-updated; values are bitmasks)
-// writeTracking     | scratch | <B x K x i8>    | Map buffers -> barriers that track writes
-// readTracking      | scratch | <B x K x i64>   | Map buffers -> barriers that track reads
-// outstandingCommits
-//   (async/wgmma)   | scratch | <B x T x i8>    | Number of outstanding commits per buffer/thread (2D replaces prior 1D)
+// Descriptors are CTA-agnostic: buffers are <B x i64> and barriers are
+// <K x i64>. Scratch state has explicit CTA axes for buffer rows, barrier rows,
+// logical threads, and visibility masks. See TritonInstrument.md for the full
+// logical shapes.
 // clang-format on
 
 namespace mlir {
@@ -91,7 +88,7 @@ private:
 };
 
 bool isTensorCoreOp(Operation *op) {
-  return isa<ttng::TCGen5MMAOp, ttng::TCGen5MMAScaledOp, ttng::TCGen5CommitOp>(
+  return isa<ttng::MMAv5OpInterface, ttng::TCGen5CommitOp, ttng::TMEMCopyOp>(
       op);
 }
 
@@ -105,96 +102,557 @@ std::optional<int> maybeGetPartitionIdx(Operation *op) {
   return std::nullopt;
 }
 
-int getCurrentThread(Operation *op, const ConSanTargetHooks *hooks) {
+int getCurrentThread(Operation *op, const ConSanTargetHooks &hooks,
+                     const AuxDataMap::ThreadLayout &threadLayout) {
   // Default partition is 0, other partitions are idx + 1
   int thread = maybeGetPartitionIdx(op).value_or(-1) + 1;
-  if (hooks->isTMAOp(op)) {
-    thread += TMA_THREAD_OFFSET;
+  if (hooks.isTMAOp(op)) {
+    assert(threadLayout.hasTMAThreads() &&
+           "TMA thread class must exist when instrumenting a TMA op");
+    thread += threadLayout.tmaThreadOffset;
     return thread;
   }
   if (isTensorCoreOp(op)) {
-    thread += TC_THREAD_OFFSET;
+    assert(threadLayout.hasTCThreads() &&
+           "TC thread class must exist when instrumenting a tensor-core op");
+    thread += threadLayout.tcThreadOffset;
+    return thread;
+  }
+  if (hooks.isCLCOp(op)) {
+    assert(threadLayout.hasCLCThreads() &&
+           "CLC thread class must exist when instrumenting a CLC op");
+    thread += threadLayout.clcThreadOffset;
     return thread;
   }
   return thread;
 }
 
-int getBaseThread(int thread) { return thread % NUM_THREADS; }
+int getBaseThread(int thread, const AuxDataMap::ThreadLayout &threadLayout) {
+  return thread % threadLayout.numBaseThreads;
+}
 
-// Peer threads are the equivalent threads in the TMA, TC and normal
+// Peer threads are the equivalent threads in the TMA, TC, CLC and normal
 // thread classes.
 // If a thread is a base thread, return the mask with the peers, otherwise
 // return the mask with the thread itself.
-uint64_t getThreadPeersMask(int thread) {
+uint64_t getThreadPeersMask(int thread,
+                            const AuxDataMap::ThreadLayout &threadLayout) {
   uint64_t mask = 1ULL << thread;
-  if (thread < NUM_THREADS) {
-    mask |= 1ULL << (thread + TMA_THREAD_OFFSET);
-    mask |= 1ULL << (thread + TC_THREAD_OFFSET);
+  if (thread < threadLayout.numBaseThreads) {
+    if (threadLayout.hasTMAThreads())
+      mask |= 1ULL << (thread + threadLayout.tmaThreadOffset);
+    if (threadLayout.hasTCThreads())
+      mask |= 1ULL << (thread + threadLayout.tcThreadOffset);
+    if (threadLayout.hasCLCThreads())
+      mask |= 1ULL << (thread + threadLayout.clcThreadOffset);
   }
   return mask;
 }
 
-int getActiveMask(Operation *op) {
-  int numParts = 1;
-
-  if (auto wsOp = op->getParentOfType<ttg::WarpSpecializeOp>()) {
-    numParts = wsOp.getPartitionRegions().size() + 1;
-  }
-  if (auto wsOp = op->getParentOfType<ttg::WarpSpecializePartitionsOp>()) {
-    numParts = wsOp.getPartitionRegions().size() + 1;
-  }
-  int activeMask = 0;
-  for (int i = 0; i < numParts; ++i)
-    activeMask |= (1 << i);
+int getActiveMask(ttg::WarpSpecializeOp wsOp) {
+  int activeMask = 1;
+  for (Region *region : wsOp.getNonEmptyPartitionRegions())
+    activeMask |= 1 << (region->getRegionNumber() + 1);
   return activeMask;
+}
+
+Value createStateMaskConstant(ImplicitLocOpBuilder &b,
+                              RankedTensorType maskType,
+                              const llvm::SmallBitVector &mask) {
+  assert(mask.size() <= static_cast<size_t>(maskType.getNumElements()));
+  SmallVector<APInt> bits(maskType.getNumElements(), APInt(1, 0));
+  for (unsigned bit = 0; bit < mask.size(); ++bit)
+    if (mask.test(bit))
+      bits[bit] = APInt(1, 1);
+  return arith::ConstantOp::create(b, maskType,
+                                   DenseElementsAttr::get(maskType, bits));
+}
+
+FailureOr<Value> createBufferStateMask(ImplicitLocOpBuilder &b,
+                                       AuxDataMap &auxData, MemType memType,
+                                       Value runtimeBase,
+                                       const BufferStateCandidates &candidates,
+                                       Operation *op) {
+  int index = static_cast<int>(memType);
+  const BufferStatePlan &plan = auxData.bufferStatePlans[index];
+  if (plan.numLanes == 0 || auxData.writeVisibility[index].empty()) {
+    op->emitError("active memdesc has no ConSan state plan");
+    return failure();
+  }
+  if (!candidates.unknown && candidates.cases.empty()) {
+    op->emitError("active memdesc has no buffer-state candidates");
+    return failure();
+  }
+
+  auto writeVisibilityType =
+      cast<RankedTensorType>(auxData.writeVisibility[index].at(op).type);
+  RankedTensorType maskType =
+      tti::getSlicedTensorType(writeVisibilityType, {1}, b.getI1Type());
+
+  if (candidates.unknown)
+    return createStateMaskConstant(b, maskType, plan.unknownMask);
+
+  SmallVector<Value> predicates;
+  if (candidates.cases.size() > 1) {
+    if (!runtimeBase) {
+      op->emitError("dynamic buffer-state cases require a runtime base");
+      return failure();
+    }
+    Value resolved = arith::ConstantIntOp::create(b, 0, 1);
+    for (const BufferStateCandidate &candidate : candidates.cases) {
+      Value base = tti::ExperimentalMemoryOffsetToI32Op::create(
+          b, candidate.baseOffset, memType);
+      Value predicate =
+          arith::CmpIOp::create(b, arith::CmpIPredicate::eq, runtimeBase, base);
+      predicates.push_back(predicate);
+      resolved = arith::OrIOp::create(b, resolved, predicate);
+    }
+    tti::createAssertInThread(
+        b, resolved,
+        "internal ConSan error: active memdesc resolved to no buffer state");
+  }
+
+  if (candidates.cases.size() == 1)
+    return createStateMaskConstant(b, maskType, candidates.cases.front().mask);
+
+  Value result =
+      createStateMaskConstant(b, maskType, llvm::SmallBitVector(plan.numLanes));
+  for (auto [state, predicate] : llvm::zip(candidates.cases, predicates)) {
+    Value candidate = createStateMaskConstant(b, maskType, state.mask);
+    Value predicateTensor = tt::SplatOp::create(b, maskType, predicate);
+    candidate = arith::AndIOp::create(b, candidate, predicateTensor);
+    result = arith::OrIOp::create(b, result, candidate);
+  }
+  return result;
+}
+
+bool shouldInitializeAllocations() {
+  std::string envValue = tt::tools::getStrEnv("TRITON_CONSAN_INIT_ALLOCATIONS");
+  if (envValue.empty())
+    return true;
+  if (auto enabled = tt::tools::isEnvValueBool(envValue))
+    return *enabled;
+  llvm::report_fatal_error("TRITON_CONSAN_INIT_ALLOCATIONS must be a boolean");
+}
+
+llvm::APInt getIntegerNaNPattern(unsigned bitWidth) {
+  switch (bitWidth) {
+  case 16:
+    // 0x7FC0 is a NaN in both bfloat16 and float16 interpretations.
+    return llvm::APInt(16, 0x7FC0);
+  case 32:
+    return llvm::APFloat::getNaN(llvm::APFloat::IEEEsingle()).bitcastToAPInt();
+  case 64:
+    return llvm::APFloat::getNaN(llvm::APFloat::IEEEdouble()).bitcastToAPInt();
+  default:
+    return llvm::APInt::getAllOnes(bitWidth);
+  }
+}
+
+Value createPoisonTensor(ImplicitLocOpBuilder &b,
+                         ttg::MemDescType memDescType) {
+  auto region = b.getInsertionBlock()->getParent();
+  Type elementType = memDescType.getElementType();
+  RankedTensorType poisonType;
+  if (isa<ttng::TensorMemorySpaceAttr>(memDescType.getMemorySpace())) {
+    auto encoding = ttng::getDefaultLayoutForTmemLdSt(
+        memDescType, ttg::lookupNumWarps(region));
+    poisonType =
+        RankedTensorType::get(memDescType.getShape(), elementType, encoding);
+  } else {
+    auto encoding = ttg::getDefaultBlockedEncoding(
+        b.getContext(), memDescType.getShape(), ttg::lookupNumWarps(region),
+        ttg::lookupThreadsPerWarp(b), ttg::lookupNumCTAs(b));
+    encoding = ttg::BlockedEncodingAttr::get(
+        b.getContext(), encoding.getSizePerThread(),
+        encoding.getThreadsPerWarp(), encoding.getWarpsPerCTA(),
+        encoding.getOrder(), ttg::getCGALayout(memDescType.getEncoding()));
+    poisonType =
+        RankedTensorType::get(memDescType.getShape(), elementType, encoding);
+  }
+
+  DenseElementsAttr poison;
+  if (auto floatType = dyn_cast<FloatType>(elementType)) {
+    poison = DenseElementsAttr::get(
+        poisonType, llvm::APFloat::getNaN(floatType.getFloatSemantics()));
+  } else if (auto integerType = dyn_cast<IntegerType>(elementType)) {
+    poison = DenseElementsAttr::get(
+        poisonType, getIntegerNaNPattern(integerType.getWidth()));
+  } else {
+    llvm::report_fatal_error(
+        "ConSan allocation initialization expects integer or float elements");
+  }
+  return arith::ConstantOp::create(b, b.getLoc(), poisonType, poison);
+}
+
+Value createSingleBufferView(ImplicitLocOpBuilder &b, Value alloc,
+                             int64_t buffer) {
+  auto allocType = cast<ttg::MemDescType>(alloc.getType());
+  SmallVector<int64_t> shape(allocType.getShape().begin() + 1,
+                             allocType.getShape().end());
+  auto viewType = ttg::MemDescType::get(
+      shape, allocType.getElementType(), allocType.getEncoding(),
+      allocType.getMemorySpace(), allocType.getMutableMemory());
+  Value index = arith::ConstantIntOp::create(b, buffer, 32);
+  return ttg::MemDescIndexOp::create(b, b.getLoc(), viewType, alloc, index);
+}
+
+void initializeAllocation(ImplicitLocOpBuilder &b, Value alloc) {
+  auto allocType = cast<ttg::MemDescType>(alloc.getType());
+  SmallVector<Value> leaves;
+  unsigned storeRank = allocType.getRank();
+  if (isa<ttng::TensorMemorySpaceAttr>(allocType.getMemorySpace())) {
+    storeRank = 2;
+  } else {
+    auto encoding = dyn_cast<ttg::LayoutEncodingTrait>(allocType.getEncoding());
+    assert(encoding && "shared allocation must have a layout encoding");
+    storeRank = encoding.getRank();
+  }
+
+  if (allocType.getRank() == storeRank) {
+    leaves.push_back(alloc);
+  } else {
+    assert(allocType.getRank() == storeRank + 1 &&
+           "only single-dimension multibuffer allocations are supported");
+    for (int64_t buffer = 0; buffer < allocType.getDimSize(0); ++buffer)
+      leaves.push_back(createSingleBufferView(b, alloc, buffer));
+  }
+
+  bool isTensorMemory =
+      isa<ttng::TensorMemorySpaceAttr>(allocType.getMemorySpace());
+  ttg::AddrSpace barrierSpace =
+      isTensorMemory
+          ? (ttg::AddrSpace::TensorRead | ttg::AddrSpace::TensorWrite)
+          : ttg::AddrSpace::Local;
+  // Synchronize warps, so in case of re-used memory we won't start poisoning
+  // memory that is still being used, and finish poisoning before the kernel's
+  // first real use of the allocation.
+  ttg::BarrierOp::create(b, b.getLoc(), barrierSpace);
+  for (Value leaf : leaves) {
+    auto leafType = cast<ttg::MemDescType>(leaf.getType());
+    Value poison = createPoisonTensor(b, leafType);
+    if (isTensorMemory) {
+      Value pred = arith::ConstantIntOp::create(b, 1, 1);
+      ttng::TMEMStoreOp::create(b, leaf, poison, pred);
+    } else {
+      ttg::LocalStoreOp::create(b, poison, leaf);
+    }
+  }
+  ttg::BarrierOp::create(b, b.getLoc(), barrierSpace);
+}
+
+bool canInitializeAllocation(Value alloc) {
+  auto allocType = cast<ttg::MemDescType>(alloc.getType());
+  if (!isa<ttng::TensorMemorySpaceAttr>(allocType.getMemorySpace()))
+    return true;
+  unsigned numWarps = ttg::lookupNumWarps(alloc.getDefiningOp());
+  return numWarps % 4 == 0;
+}
+
+Value currentCTAMask(ImplicitLocOpBuilder &b) {
+  Value ctaId = tti::ExperimentalClusterCTAIdOp::create(b, b.getLoc());
+  return arith::ShLIOp::create(b, arith::ConstantIntOp::create(b, 1, 32),
+                               ctaId);
+}
+
+Value allCTAsMask(ImplicitLocOpBuilder &b) {
+  int numCTAs = ttg::lookupNumCTAs(b);
+  assert(numCTAs <= 16 && "ConSan CTA bitsets assume at most 16 CTAs");
+  return arith::ConstantIntOp::create(b, (1u << numCTAs) - 1, 32);
+}
+
+uint16_t getBlockBroadcastMask(Value alloc) {
+  auto allocTy = cast<ttg::MemDescType>(alloc.getType());
+  auto kBlock = StringAttr::get(alloc.getContext(), "block");
+  return toLinearLayout(allocTy).getFreeVariableMasks().lookup(kBlock);
+}
+
+Value createCTABitset(ImplicitLocOpBuilder &b, uint32_t pattern,
+                      uint32_t baseMask) {
+  // Create a CTA bitset by shifting `pattern` by the non-broadcast CTA bits of
+  // the current CTA.
+  Value ctaId = tti::ExperimentalClusterCTAIdOp::create(b, b.getLoc());
+  Value base = arith::AndIOp::create(
+      b, ctaId, arith::ConstantIntOp::create(b, baseMask, 32));
+  return arith::ShLIOp::create(b, arith::ConstantIntOp::create(b, pattern, 32),
+                               base);
+}
+
+Value getMulticastRecipientCTAs(ImplicitLocOpBuilder &b, Value alloc) {
+  // Return the CTA rows touched by an alloc: current CTA for
+  // non-broadcast allocs, or all CTAs in the current multicast group.
+  uint16_t broadcastMask = getBlockBroadcastMask(alloc);
+  if (!broadcastMask)
+    return currentCTAMask(b);
+  int numCTAs = ttg::lookupNumCTAs(b);
+  auto encoding = ttng::getTMAMulticastMaskEncoding(numCTAs, broadcastMask);
+  return createCTABitset(b, encoding.pattern, encoding.fixedBits);
+}
+
+Value getLeaderCTA(ImplicitLocOpBuilder &b, Value barrier) {
+  uint16_t broadcastMask = getBlockBroadcastMask(barrier);
+  if (!broadcastMask)
+    return currentCTAMask(b);
+  int numCTAs = ttg::lookupNumCTAs(b);
+  auto encoding = ttng::getTMAMulticastMaskEncoding(numCTAs, broadcastMask);
+  return createCTABitset(b, /*pattern=*/1, encoding.fixedBits);
+}
+
+Value getMulticastBarrierRecipientCTAs(ImplicitLocOpBuilder &b, Value result,
+                                       Value barrier) {
+  uint32_t resultBroadcastMask = getBlockBroadcastMask(result);
+  uint32_t barrierBroadcastMask = getBlockBroadcastMask(barrier);
+  int numCTAs = ttg::lookupNumCTAs(b);
+  uint32_t recipientBroadcastMask =
+      resultBroadcastMask & ~barrierBroadcastMask & (numCTAs - 1);
+  auto encoding =
+      ttng::getTMAMulticastMaskEncoding(numCTAs, recipientBroadcastMask);
+  uint32_t baseMask =
+      ~(resultBroadcastMask | barrierBroadcastMask) & (numCTAs - 1);
+  return createCTABitset(b, encoding.pattern, baseMask);
+}
+
+Value getRecipientCTAsForBroadcastMasks(ImplicitLocOpBuilder &b,
+                                        ArrayRef<uint16_t> broadcastMasks) {
+  if (broadcastMasks.empty())
+    return currentCTAMask(b);
+
+  int numCTAs = ttg::lookupNumCTAs(b);
+  Value ctaId = tti::ExperimentalClusterCTAIdOp::create(b, b.getLoc());
+  Value recipientCTAs = arith::ConstantIntOp::create(b, 0, 32);
+  // Match eager tcgen05_commit lowering in
+  // DotOpToLLVM/MMAv5.cpp:createMMACommit: build one concrete recipient bitset
+  // per descriptor, then OR those bitsets.
+  for (uint16_t broadcastBits : broadcastMasks) {
+    // Compute the map that goes from cta_id to lead_cta_id (fixedBits)
+    // and the pattern that goes from cta_0 to its multicast group (pattern).
+    auto encoding = ttng::getTMAMulticastMaskEncoding(numCTAs, broadcastBits);
+    Value fixedBitsVal =
+        arith::ConstantIntOp::create(b, encoding.fixedBits, 32);
+    Value base = arith::AndIOp::create(b, ctaId, fixedBitsVal);
+    Value patternVal = arith::ConstantIntOp::create(b, encoding.pattern, 32);
+    Value descRecipientCTAs = arith::ShLIOp::create(b, patternVal, base);
+    recipientCTAs = arith::OrIOp::create(b, recipientCTAs, descRecipientCTAs);
+  }
+  return recipientCTAs;
+}
+
+SmallVector<uint16_t> getTensorCoreBarrierBroadcastMasks(Operation *op) {
+  assert(isTensorCoreOp(op) && "expected a tensor-core op");
+  bool twoCTAs = ttng::getModuleTwoCTAs(op);
+  SmallVector<Value> commitDescs;
+  if (auto commitOp = dyn_cast<ttng::TCGen5CommitOp>(op)) {
+    llvm::append_range(commitDescs, commitOp.getDescs());
+  } else if (auto mmaOp = dyn_cast<ttng::TCGen5MMAOp>(op)) {
+    if (mmaOp.getMulticast()) {
+      if (isa<ttg::SharedEncodingTrait>(mmaOp.getA().getType().getEncoding()))
+        commitDescs.push_back(mmaOp.getA());
+      commitDescs.push_back(mmaOp.getB());
+    }
+  } else if (isa<ttng::TMEMCopyOp, ttng::TCGen5MMAScaledOp>(op)) {
+    // TODO: we should support descs for tc_gen5_mma_scaled.
+  } else {
+    llvm_unreachable("unknown tensor-core op");
+  }
+  return ttng::getCTABroadcastMasks(twoCTAs, commitDescs);
+}
+
+Value getMemEffectCTAs(ImplicitLocOpBuilder &b, Operation *op) {
+  if (auto tmaLoad = dyn_cast<ttng::TMALoadLikeOpInterface>(op)) {
+    if (tmaLoad.getMulticast())
+      return getMulticastRecipientCTAs(b, tmaLoad.getResult());
+  }
+  if (auto copyOp = dyn_cast<ttng::AsyncTMACopyGlobalToLocalOp>(op)) {
+    if (copyOp.getMulticast())
+      return getMulticastRecipientCTAs(b, copyOp.getResult());
+    return currentCTAMask(b);
+  }
+  if (auto gatherOp = dyn_cast<ttng::AsyncTMAGatherOp>(op);
+      gatherOp && gatherOp.getMulticast())
+    return getMulticastRecipientCTAs(b, gatherOp.getResult());
+  if (isa<ttng::CLCTryCancelOp>(op))
+    return allCTAsMask(b);
+  if (isa<ttng::MMAv5OpInterface, ttng::TMEMCopyOp>(op))
+    return getRecipientCTAsForBroadcastMasks(
+        b, ttng::getCTABroadcastMasks(ttng::getModuleTwoCTAs(op), {}));
+  return currentCTAMask(b);
+}
+
+Value getMemEffectCTAs(ImplicitLocOpBuilder &b, Value recipients,
+                       const BufferStateCandidates &candidates) {
+  if (candidates.unknown)
+    return allCTAsMask(b);
+
+  uint32_t ownerMask = 0;
+  for (const BufferStateCandidate &candidate : candidates.cases)
+    ownerMask |= candidate.ctaMask;
+
+  if (ownerMask == 1)
+    return recipients;
+
+  int numCTAs = ttg::lookupNumCTAs(b);
+  APInt constant;
+  if (matchPattern(recipients, m_ConstantInt(&constant))) {
+    uint32_t result = 0;
+    for (int source = 0; source < numCTAs; ++source) {
+      if (!(constant.getZExtValue() & (1u << source)))
+        continue;
+      for (int offset = 0; offset < numCTAs; ++offset)
+        if (ownerMask & (1u << offset))
+          result |= 1u << (source ^ offset);
+    }
+    return arith::ConstantIntOp::create(b, result, 32);
+  }
+
+  Value result = arith::ConstantIntOp::create(b, 0, 32);
+  for (int source = 0; source < numCTAs; ++source) {
+    uint32_t targets = 0;
+    for (int offset = 0; offset < numCTAs; ++offset)
+      if (ownerMask & (1u << offset))
+        targets |= 1u << (source ^ offset);
+    Value sourceBit = arith::ConstantIntOp::create(b, 1u << source, 32);
+    Value present =
+        arith::CmpIOp::create(b, arith::CmpIPredicate::ne,
+                              arith::AndIOp::create(b, recipients, sourceBit),
+                              arith::ConstantIntOp::create(b, 0, 32));
+    Value targetMask = arith::SelectOp::create(
+        b, present, arith::ConstantIntOp::create(b, targets, 32),
+        arith::ConstantIntOp::create(b, 0, 32));
+    result = arith::OrIOp::create(b, result, targetMask);
+  }
+  return result;
+}
+
+Value getBarrierRecipientCTAs(ImplicitLocOpBuilder &b, Operation *op) {
+  if (auto expectOp = dyn_cast<ttng::BarrierExpectOp>(op))
+    return getLeaderCTA(b, expectOp.getAlloc());
+  if (auto arriveOp = dyn_cast<ttng::ArriveBarrierOp>(op))
+    return getLeaderCTA(b, arriveOp.getAlloc());
+  if (auto arriveOp = dyn_cast<ttng::AsyncCopyMbarrierArriveOp>(op))
+    return getLeaderCTA(b, arriveOp.getBarrier());
+  if (auto copyOp = dyn_cast<ttng::AsyncTMACopyGlobalToLocalOp>(op)) {
+    if (copyOp.getMulticast())
+      return getMulticastBarrierRecipientCTAs(b, copyOp.getResult(),
+                                              copyOp.getBarrier());
+    return getLeaderCTA(b, copyOp.getBarrier());
+  }
+  if (auto gatherOp = dyn_cast<ttng::AsyncTMAGatherOp>(op)) {
+    if (gatherOp.getMulticast())
+      return getMulticastBarrierRecipientCTAs(b, gatherOp.getResult(),
+                                              gatherOp.getBarrier());
+    return getLeaderCTA(b, gatherOp.getBarrier());
+  }
+  if (isa<ttng::CLCTryCancelOp>(op))
+    return allCTAsMask(b);
+
+  if (isTensorCoreOp(op))
+    return getRecipientCTAsForBroadcastMasks(
+        b, getTensorCoreBarrierBroadcastMasks(op));
+  return currentCTAMask(b);
 }
 
 class ConcurrencySanitizerImpl {
 public:
-  ConcurrencySanitizerImpl(ModuleOp module, const ConSanTargetHooks *hooks)
+  ConcurrencySanitizerImpl(ModuleOp module, const ConSanTargetHooks &hooks)
       : module(module), hooks(hooks) {}
 
-  void run() {
+  LogicalResult run() {
     tti::FunctionBuilder funcBuilder(module, auxData);
-    auxData.populateAndPassToWarpSpecialize(module, funcBuilder, hooks);
+    if (failed(auxData.populateAndPassToWarpSpecialize(module, funcBuilder,
+                                                       hooks)))
+      return failure();
 
     tt::FuncOp entryPoint = tti::getEntryPoint(module);
 
     ImplicitLocOpBuilder b(entryPoint.getLoc(), entryPoint);
     b.setInsertionPointToStart(&entryPoint.getBody().front());
-    instrumentMemoryOperations(b, funcBuilder);
+    if (failed(instrumentMemoryOperations(b, funcBuilder)))
+      return failure();
+    initializeAllocations();
+    return success();
   }
 
 private:
-  void instrumentMemoryOperations(ImplicitLocOpBuilder &b,
-                                  tti::FunctionBuilder &funcBuilder) {
+  void initializeAllocations() {
+    if (!shouldInitializeAllocations())
+      return;
+
+    SmallVector<Operation *> allocationsToInitialize;
     module.walk([&](Operation *op) {
+      if (auto alloc = dyn_cast<ttg::LocalAllocOp>(op)) {
+        if (!alloc.getSrc())
+          allocationsToInitialize.push_back(op);
+      }
+      if (auto alloc = dyn_cast<ttng::TMEMAllocOp>(op)) {
+        if (!alloc.getSrc())
+          allocationsToInitialize.push_back(op);
+      }
+    });
+
+    for (Operation *op : allocationsToInitialize) {
+      ImplicitLocOpBuilder b(op->getLoc(), op);
+      b.setInsertionPointAfter(op);
+      Value alloc = op->getResult(0);
+      if (canInitializeAllocation(alloc)) {
+        initializeAllocation(b, alloc);
+        auto allocType = cast<ttg::MemDescType>(alloc.getType());
+        bool isShared =
+            isa<ttg::SharedMemorySpaceAttr>(allocType.getMemorySpace());
+        if (isShared && auxData.hasAsyncProxyFenceTracking)
+          ttng::FenceAsyncSharedOp::create(b, /*bCluster=*/false);
+      }
+    }
+  }
+
+  LogicalResult instrumentMemoryOperations(ImplicitLocOpBuilder &b,
+                                           tti::FunctionBuilder &funcBuilder) {
+    SmallVector<ttng::ClusterBarrierOp> clusterBarriers;
+    WalkResult result = module.walk([&](Operation *op) -> WalkResult {
       CriticalSectionListener listener;
       b.setListener(&listener);
 
-      int thread = getCurrentThread(op, hooks);
-      int baseThread = getBaseThread(thread);
+      int thread = getCurrentThread(op, hooks, auxData.threadLayout);
+      int baseThread = getBaseThread(thread, auxData.threadLayout);
       b.setLoc(op->getLoc());
       b.setInsertionPoint(op);
-      if (isa<ttg::LocalAllocOp, ttng::TMEMAllocOp>(op) ||
-          hooks->isPostInstrumentedOp(op)) {
+      if (isa<ttg::LocalAllocOp, ttng::TMEMAllocOp>(op)) {
         // Place insert point after specific ops:
         // allocs - we want to
         //   check if it is not overwriting any earlier allocation, but the
         //   memref value can be referenced only after it is created.
-        // wait barriers - we can update aux data only after the wait is
-        //   completed
         b.setInsertionPointAfter(op);
       }
 
-      instrumentMemEffects(b, op, thread, funcBuilder);
+      if (auto info = hooks.getBarrierWaitInfo(op)) {
+        // For waits we want to instrument it before and after, so we do it
+        // manually inside instrumentBarrierWait (disable the critical section
+        // listener and return early)
+        b.setListener(nullptr);
+        instrumentBarrierWait(op, info->alloc, info->phase, info->pred, thread,
+                              baseThread, funcBuilder);
+        return WalkResult::advance();
+      }
+
+      if (failed(instrumentMemEffects(b, op, thread, funcBuilder))) {
+        b.setListener(nullptr);
+        return WalkResult::interrupt();
+      }
       b.setLoc(op->getLoc());
+      if (auto info = hooks.getAsyncProxyFenceInfo(op)) {
+        funcBuilder.createFenceProxyAccessesCall(
+            b, baseThread, info->cluster, hooks.getIssuerCTAPred(b, op), op);
+      }
       if (auto wsOp = dyn_cast<ttg::WarpSpecializeOp>(op)) {
-        auto partitionRegions = wsOp.getPartitionRegions();
+        funcBuilder.createSetActiveMaskCall(b, getActiveMask(wsOp), op);
+        auto partitionRegions = wsOp.getNonEmptyPartitionRegions();
         if (!partitionRegions.empty()) {
           uint64_t destMask = 0;
-          for (size_t idx = 0, e = partitionRegions.size(); idx < e; ++idx)
-            destMask |= getThreadPeersMask(idx + 1);
+          uint64_t baseDestMask = 0;
+          for (Region *region : partitionRegions)
+            destMask |= getThreadPeersMask(region->getRegionNumber() + 1,
+                                           auxData.threadLayout);
+          for (Region *region : partitionRegions)
+            baseDestMask |= 1ULL << (region->getRegionNumber() + 1);
           if (destMask) {
             for (MemType memType : {MemType::SHARED_MEM, MemType::TENSOR_MEM}) {
               funcBuilder.createCopyWriteVisibilityCall(b, thread, destMask,
@@ -203,191 +661,307 @@ private:
                                                        nullptr, memType, op);
             }
           }
+          if (baseDestMask)
+            funcBuilder.createCopyProxyAccessesCall(b, baseThread, baseDestMask,
+                                                    nullptr, op);
         }
       }
-      if (auto info = hooks->getBarrierInitInfo(op)) {
-        funcBuilder.createVerifyBarrierCanInitCall(b, info->alloc, op);
-        funcBuilder.createInitBarrierStateCall(b, info->alloc, info->count, op);
+      if (auto info = hooks.getBarrierInitInfo(op)) {
+        Value pred = hooks.getIssuerCTAPred(b, op);
+        funcBuilder.createVerifyBarrierCanInitCall(b, info->alloc, pred, op,
+                                                   currentCTAMask(b));
+        funcBuilder.createInitBarrierStateCall(b, info->alloc, info->count,
+                                               pred, op);
       }
-      if (auto invalOp = dyn_cast<ttng::InvalBarrierOp>(op)) {
-        Value barrier = invalOp.getAlloc();
-        funcBuilder.createVerifyBarrierInitializedCall(b, barrier, nullptr,
-                                                       invalOp);
-        funcBuilder.createInvalidateBarrierStateCall(b, barrier, invalOp);
+      if (auto info = hooks.getBarrierInvalidateInfo(op)) {
+        Value barrier = info->alloc;
+        Value pred = hooks.getIssuerCTAPred(b, op);
+        funcBuilder.createVerifyBarrierInitializedCall(b, barrier, pred, op,
+                                                       currentCTAMask(b));
+        funcBuilder.createInvalidateBarrierStateCall(b, barrier, pred, op);
         for (MemType memType : {MemType::SHARED_MEM, MemType::TENSOR_MEM}) {
-          funcBuilder.createClearBarrierWriteTrackingCall(b, barrier, nullptr,
-                                                          memType, invalOp);
-          funcBuilder.createClearBarrierReadTrackingCall(b, barrier, nullptr,
-                                                         memType, invalOp);
+          funcBuilder.createClearBarrierWriteTrackingCall(b, barrier, pred,
+                                                          memType, op);
+          funcBuilder.createClearBarrierReadTrackingCall(b, barrier, pred,
+                                                         memType, op);
         }
-      }
-      if (auto info = hooks->getBarrierWaitInfo(op)) {
-        instrumentBarrierWait(b, listener, op, info->alloc, info->phase,
-                              info->pred, thread, baseThread, funcBuilder);
+        funcBuilder.createClearBarrierProxyAccessTrackingCall(b, barrier, pred,
+                                                              op);
       }
       if (auto asyncCommitGroupOp = dyn_cast<ttg::AsyncCommitGroupOp>(op)) {
         if (!auxData.commits[CommitKind::AsyncCp].empty())
           funcBuilder.createCommitAccessesCall(b, thread, nullptr,
                                                CommitKind::AsyncCp, op);
       }
-      if (auto asyncWaitOp = dyn_cast<ttg::AsyncWaitOp>(op)) {
-        funcBuilder.createClearOutstandingCommitsTransferWritesCall(
-            b, baseThread, getThreadPeersMask(thread), asyncWaitOp.getNum(),
-            nullptr, CommitKind::AsyncCp, MemType::SHARED_MEM, op);
-      }
       if (auto wgmmaWaitOp = dyn_cast<ttng::WarpGroupDotWaitOp>(op)) {
         funcBuilder.createClearOutstandingCommitsTransferReadsCall(
-            b, baseThread, getThreadPeersMask(thread),
+            b, baseThread, getThreadPeersMask(thread, auxData.threadLayout),
             wgmmaWaitOp.getPendings(), nullptr, CommitKind::Wgmma,
             MemType::SHARED_MEM, op);
       }
-      if (auto info = hooks->getWaitOpInfo(op)) {
-        if (info->transferWrites) {
+      if (auto info = hooks.getWaitOpInfo(op, auxData)) {
+        if (info->transferWrites && info->transferReads) {
+          funcBuilder.createClearOutstandingCommitsTransferBothCall(
+              b, baseThread, getThreadPeersMask(thread, auxData.threadLayout),
+              info->pendingCount, nullptr, info->commitKind,
+              MemType::SHARED_MEM, op);
+        } else if (info->transferWrites) {
           funcBuilder.createClearOutstandingCommitsTransferWritesCall(
-              b, baseThread, getThreadPeersMask(thread), info->pendingCount,
-              nullptr, info->commitKind, MemType::SHARED_MEM, op);
-        } else {
+              b, baseThread, getThreadPeersMask(thread, auxData.threadLayout),
+              info->pendingCount, nullptr, info->commitKind,
+              MemType::SHARED_MEM, op);
+        } else if (info->transferReads) {
           funcBuilder.createClearOutstandingCommitsTransferReadsCall(
-              b, baseThread, getThreadPeersMask(thread), info->pendingCount,
-              nullptr, info->commitKind, MemType::SHARED_MEM, op);
+              b, baseThread, getThreadPeersMask(thread, auxData.threadLayout),
+              info->pendingCount, nullptr, info->commitKind,
+              MemType::SHARED_MEM, op);
         }
+      } else if (auto asyncWaitOp = dyn_cast<ttg::AsyncWaitOp>(op)) {
+        funcBuilder.createClearOutstandingCommitsTransferWritesCall(
+            b, baseThread, getThreadPeersMask(thread, auxData.threadLayout),
+            asyncWaitOp.getNum(), nullptr, CommitKind::AsyncCp,
+            MemType::SHARED_MEM, op);
+      }
+      if (auto clusterBarrier = dyn_cast<ttng::ClusterBarrierOp>(op)) {
+        if (!llvm::is_contained(auxData.internalClusterBarriers, op))
+          clusterBarriers.push_back(clusterBarrier);
+      }
+
+      if (isa<ttg::WarpYieldOp, ttg::WarpReturnOp>(op) &&
+          !auxData.activeMasks.empty()) {
+        auto wsOp = op->getParentOfType<ttg::WarpSpecializeOp>();
+        bool shouldRetire =
+            isa<ttg::WarpYieldOp>(op) ||
+            llvm::is_contained(wsOp.getNonEmptyPartitionRegions(),
+                               op->getParentRegion());
+        if (shouldRetire) {
+          b.setListener(nullptr);
+          b.setLoc(wsOp.getLoc());
+          Value lock = auxData.lock.at(op).value;
+          Value trueVal = arith::ConstantIntOp::create(b, 1, 1);
+          tti::ExperimentalLockAcquireOp::create(b, lock, trueVal);
+          funcBuilder.createRetireActiveThreadCall(b, baseThread, op);
+          Value ok =
+              funcBuilder.createCheckAllActiveWaitingCall(b, nullptr, op);
+          tti::ExperimentalLockReleaseOp::create(b, lock, trueVal);
+          tti::createAssertInThread(
+              b, ok,
+              "Deadlock detected after a warp-specialized thread exited");
+          b.setListener(&listener);
+        }
+      }
+      if (isa<tt::ReturnOp>(op) && !auxData.activeMasks.empty() &&
+          op->getParentOfType<tt::FuncOp>() == tti::getEntryPoint(module)) {
+        b.setListener(nullptr);
+        Value lock = auxData.lock.at(op).value;
+        Value trueVal = arith::ConstantIntOp::create(b, 1, 1);
+        tti::ExperimentalLockAcquireOp::create(b, lock, trueVal);
+        funcBuilder.createSetActiveMaskCall(b, 0, op);
+        Value ok = funcBuilder.createCheckAllActiveWaitingCall(b, nullptr, op);
+        tti::ExperimentalLockReleaseOp::create(b, lock, trueVal);
+        tti::createAssertInThread(b, ok,
+                                  "Deadlock detected when the kernel returned");
+        b.setListener(&listener);
       }
 
       listener.maybeWrapWithCriticalSection(b, auxData, nullptr);
       b.setListener(nullptr);
+      return WalkResult::advance();
     });
+    if (result.wasInterrupted())
+      return failure();
+
+    // Cluster rendezvous polling introduces control-flow blocks, so add it
+    // after the operation walk rather than invalidating the walk iterators.
+    for (ttng::ClusterBarrierOp clusterBarrier : clusterBarriers) {
+      Operation *op = clusterBarrier.getOperation();
+      int thread = getCurrentThread(op, hooks, auxData.threadLayout);
+      int baseThread = getBaseThread(thread, auxData.threadLayout);
+      bool partitionScoped =
+          static_cast<bool>(op->getParentOfType<ttg::WarpSpecializeOp>());
+      b.setLoc(op->getLoc());
+      b.setInsertionPoint(op);
+      funcBuilder.createClusterBarrierRendezvousCall(
+          b, auxData.getClusterBarrierSlot(op), baseThread,
+          getThreadPeersMask(baseThread, auxData.threadLayout), partitionScoped,
+          /*publishVisibility=*/!clusterBarrier.getRelaxed(), op);
+    }
+    return success();
   }
 
-  void instrumentBarrierWait(ImplicitLocOpBuilder &b,
-                             CriticalSectionListener &listener, Operation *op,
-                             Value alloc, Value phase, Value pred, int thread,
-                             int baseThread,
+  void instrumentBarrierWait(Operation *op, Value alloc, Value phase,
+                             Value pred, int thread, int baseThread,
                              tti::FunctionBuilder &funcBuilder) {
+    ImplicitLocOpBuilder wb(op->getLoc(), op);
+    pred = tti::maybeAnd(wb, pred, hooks.getIssuerCTAPred(wb, op));
+    Value lock = auxData.lock.at(op).value;
     // Pre-wait: mark waiting threads and check for deadlock.
-    {
-      CriticalSectionListener preListener;
-      b.setListener(&preListener);
-      b.setInsertionPoint(op);
-      funcBuilder.createVerifyBarrierInitializedCall(b, alloc, pred, op);
-      funcBuilder.createSetWaitingCall(b, alloc, baseThread, phase, pred, op);
-      funcBuilder.createCheckAllActiveWaitingCall(b, getActiveMask(op), pred,
-                                                  op);
-      preListener.maybeWrapWithCriticalSection(b, auxData, pred);
-      b.setListener(&listener);
-      b.setInsertionPointAfter(op);
-    }
+    tti::ExperimentalLockAcquireOp::create(wb, lock, pred);
+    funcBuilder.createVerifyBarrierInitializedCall(wb, alloc, pred, op,
+                                                   currentCTAMask(wb));
+    funcBuilder.createSetWaitingCall(wb, alloc, baseThread, phase, pred, op);
+    Value ok = funcBuilder.createCheckAllActiveWaitingCall(wb, pred, op);
+    tti::ExperimentalLockReleaseOp::create(wb, lock, pred);
+    tti::createAssertInThread(wb, ok,
+                              "Deadlock detected while waiting on an mbarrier");
     // Post-wait: transfer visible writes and reads to all peer threads,
-    // and clear waiting for this barrier
+    // and clear waiting for this barrier.
     assert(!auxData.barriers.empty() &&
            "barrier descriptors must exist when instrumenting wait");
+    wb.setInsertionPointAfter(op);
+    tti::ExperimentalLockAcquireOp::create(wb, lock, pred);
     for (MemType memType : {MemType::SHARED_MEM, MemType::TENSOR_MEM}) {
       funcBuilder.createTransferVisibleWritesCall(
-          b, alloc, getThreadPeersMask(thread), pred, memType, op);
+          wb, alloc, getThreadPeersMask(thread, auxData.threadLayout), pred,
+          memType, op);
       funcBuilder.createTransferVisibleReadsCall(
-          b, alloc, getThreadPeersMask(thread), pred, memType, op);
+          wb, alloc, getThreadPeersMask(thread, auxData.threadLayout), pred,
+          memType, op);
     }
-    funcBuilder.createClearWaitingCall(b, alloc, baseThread, pred, op);
+    funcBuilder.createTransferProxyAccessesCall(wb, alloc, baseThread, pred,
+                                                op);
+    funcBuilder.createClearWaitingCall(wb, alloc, baseThread, pred, op);
+    tti::ExperimentalLockReleaseOp::create(wb, lock, pred);
   }
 
-  void instrumentMemEffects(ImplicitLocOpBuilder &b, Operation *op, int thread,
-                            tti::FunctionBuilder &funcBuilder) {
-    int baseThread = getBaseThread(thread);
-    std::optional<MemEffectsOpInfo> opInfo = hooks->getMemEffectsOpInfo(op);
-    if (!opInfo) {
-      return;
-    }
+  LogicalResult instrumentMemEffects(ImplicitLocOpBuilder &b, Operation *op,
+                                     int thread,
+                                     tti::FunctionBuilder &funcBuilder) {
+    int baseThread = getBaseThread(thread, auxData.threadLayout);
+    std::optional<MemEffectsOpInfo> opInfo = hooks.getMemEffectsOpInfo(op);
+    if (!opInfo)
+      return success();
     Value pred = opInfo->pred;
-    auto combinePredicates = [&](Value barrierPred) -> Value {
-      if (barrierPred && pred) {
-        return arith::AndIOp::create(b, b.getLoc(), barrierPred, pred);
-      }
-      return barrierPred ? barrierPred : pred;
+    Value issuerCTAPred = hooks.getIssuerCTAPred(b, op);
+    pred = tti::maybeAnd(b, pred, issuerCTAPred);
+    Value defaultEffectCTAs = getMemEffectCTAs(b, op);
+    struct MaterializedEffect {
+      Value bufferMask;
+      Value effectCTAs;
+      MemType memType;
     };
-    for (auto effect : opInfo->operandEffects) {
+    SmallVector<MaterializedEffect> materializedEffects;
+    materializedEffects.reserve(opInfo->operandEffects.size());
+
+    for (const auto &effect : opInfo->operandEffects) {
+      MaterializedEffect materialized;
       Value buf = effect.buf;
       auto bufType = cast<ttg::MemDescType>(buf.getType());
-      MemType memType = MemType::TENSOR_MEM;
-      if (isa<ttg::SharedEncodingTrait>(bufType.getEncoding())) {
-        memType = MemType::SHARED_MEM;
+      materialized.memType = MemType::TENSOR_MEM;
+      if (isa<ttg::SharedMemorySpaceAttr>(bufType.getMemorySpace()))
+        materialized.memType = MemType::SHARED_MEM;
+      auto &candidateMap =
+          auxData.bufferCandidates[static_cast<int>(materialized.memType)];
+      auto candidateIt = candidateMap.find(buf);
+      if (candidateIt == candidateMap.end()) {
+        op->emitError("missing buffer-region candidates for memdesc");
+        return failure();
+      }
+      Value runtimeBase;
+      if (!candidateIt->second.unknown && candidateIt->second.cases.size() > 1)
+        runtimeBase = tti::ExperimentalMemDescToI32Op::create(b, buf);
+      FailureOr<Value> stateMask =
+          createBufferStateMask(b, auxData, materialized.memType, runtimeBase,
+                                candidateIt->second, op);
+      if (failed(stateMask))
+        return failure();
+      materialized.bufferMask = *stateMask;
+      materialized.effectCTAs =
+          getMemEffectCTAs(b, defaultEffectCTAs, candidateIt->second);
+      materializedEffects.push_back(materialized);
+
+      Value bufferMask = materialized.bufferMask;
+      Value effectCTAs = materialized.effectCTAs;
+      MemType memType = materialized.memType;
+      if (memType == MemType::SHARED_MEM) {
+        if (effect.proxy == MemEffectsOpInfo::Effects::Proxy::Async) {
+          funcBuilder.createVerifyProxyAccessCall(b, bufferMask, baseThread,
+                                                  effect.operandName, pred, op,
+                                                  effectCTAs);
+        } else {
+          funcBuilder.createSetProxyAccessCall(b, bufferMask, baseThread, pred,
+                                               op, effectCTAs);
+        }
       }
       if (effect.rw == MemEffectsOpInfo::Effects::Read) {
         // For op that is reading, we only need to check if anything else
         // is writing to the same buffer.
-        addWriteChecks(b, funcBuilder, op, buf, effect.length, pred, memType,
-                       thread, effect.operandName);
+        addWriteChecks(b, funcBuilder, op, bufferMask, pred, memType, thread,
+                       effect.operandName, effectCTAs, opInfo->commitKind);
         if (opInfo->trackingKind == MemEffectsOpInfo::TrackingKind::Barrier) {
-          funcBuilder.createSetReadVisibilityCall(b, buf, effect.length,
-                                                  getThreadPeersMask(thread),
-                                                  pred, memType, op);
+          funcBuilder.createSetReadVisibilityCall(
+              b, bufferMask, getThreadPeersMask(thread, auxData.threadLayout),
+              pred, memType, op, effectCTAs);
         }
         if (opInfo->trackingKind ==
             MemEffectsOpInfo::TrackingKind::CommitCount) {
           assert(memType == MemType::SHARED_MEM);
-          funcBuilder.createStageAccessForCommitCall(b, buf, effect.length,
-                                                     baseThread, pred, memType,
-                                                     opInfo->commitKind, op);
+          funcBuilder.createStageAccessForCommitCall(
+              b, bufferMask, baseThread, pred, memType, opInfo->commitKind, op);
         }
       }
       if (effect.rw == MemEffectsOpInfo::Effects::Write) {
         // Op is writing to the buffer, we need to check if anything else
         // is reading or writing to the same buffer.
-        addWriteChecks(b, funcBuilder, op, buf, effect.length, pred, memType,
-                       thread, effect.operandName);
-        addReadChecks(b, funcBuilder, op, buf, effect.length, pred, memType,
-                      thread, effect.operandName);
+        addWriteChecks(b, funcBuilder, op, bufferMask, pred, memType, thread,
+                       effect.operandName, effectCTAs, opInfo->commitKind);
+        addReadChecks(b, funcBuilder, op, bufferMask, pred, memType, thread,
+                      effect.operandName, effectCTAs, opInfo->commitKind);
         if (opInfo->trackingKind == MemEffectsOpInfo::TrackingKind::Barrier) {
-          funcBuilder.createSetWriteVisibilityCall(b, buf, effect.length,
-                                                   getThreadPeersMask(thread),
-                                                   pred, memType, op);
-          funcBuilder.createClearWriteTrackingCall(b, buf, effect.length, pred,
-                                                   memType, op);
-          funcBuilder.createClearReadVisibilityCall(b, buf, effect.length, pred,
-                                                    memType, op);
-          funcBuilder.createClearReadTrackingCall(b, buf, effect.length, pred,
-                                                  memType, op);
+          funcBuilder.createSetWriteVisibilityCall(
+              b, bufferMask, getThreadPeersMask(thread, auxData.threadLayout),
+              pred, memType, op, effectCTAs);
+          funcBuilder.createClearWriteTrackingCall(b, bufferMask, pred, memType,
+                                                   op, effectCTAs);
+          funcBuilder.createClearReadVisibilityCall(b, bufferMask, pred,
+                                                    memType, op, effectCTAs);
+          funcBuilder.createClearReadTrackingCall(b, bufferMask, pred, memType,
+                                                  op, effectCTAs);
         }
         if (opInfo->trackingKind ==
             MemEffectsOpInfo::TrackingKind::CommitCount) {
           assert(memType == MemType::SHARED_MEM);
-          funcBuilder.createStageAccessForCommitCall(b, buf, effect.length,
-                                                     baseThread, pred, memType,
-                                                     opInfo->commitKind, op);
+          funcBuilder.createStageAccessForCommitCall(
+              b, bufferMask, baseThread, pred, memType, opInfo->commitKind, op);
         }
       }
     }
     for (const auto &barrierInfo : opInfo->barriers) {
       Value barrier = barrierInfo.barrier;
-      Value combinedPred = combinePredicates(barrierInfo.pred);
+      Value combinedPred = tti::maybeAnd(b, barrierInfo.pred, pred);
+      Value recipientCTAs = getBarrierRecipientCTAs(b, op);
       funcBuilder.createVerifyBarrierInitializedCall(b, barrier, combinedPred,
-                                                     op);
+                                                     op, recipientCTAs);
       if (barrierInfo.trackingMode ==
           MemEffectsOpInfo::BarrierTrackingMode::Frontier) {
         // If the op has barriers, we treat it as a commit emitted for each
         // barrier.
         for (MemType memType : {MemType::SHARED_MEM, MemType::TENSOR_MEM}) {
-          funcBuilder.createTrackVisibleWritesCall(b, barrier, thread,
-                                                   combinedPred, memType, op);
-          funcBuilder.createTrackVisibleReadsCall(b, barrier, thread,
-                                                  combinedPred, memType, op);
+          funcBuilder.createTrackVisibleWritesCall(
+              b, barrier, thread, combinedPred, memType, op, recipientCTAs);
+          funcBuilder.createTrackVisibleReadsCall(
+              b, barrier, thread, combinedPred, memType, op, recipientCTAs);
         }
+        funcBuilder.createTrackProxyAccessesCall(
+            b, barrier, baseThread, combinedPred, op, recipientCTAs);
       } else if (barrierInfo.trackingMode ==
                  MemEffectsOpInfo::BarrierTrackingMode::EffectWrites) {
-        for (const auto &effect : opInfo->operandEffects) {
+        for (auto [effect, materialized] :
+             llvm::zip(opInfo->operandEffects, materializedEffects)) {
           if (effect.rw != MemEffectsOpInfo::Effects::Write)
             continue;
-          auto bufType = cast<ttg::MemDescType>(effect.buf.getType());
-          MemType memType = MemType::TENSOR_MEM;
-          if (isa<ttg::SharedEncodingTrait>(bufType.getEncoding()))
-            memType = MemType::SHARED_MEM;
           funcBuilder.createTrackBarrierWriteForBufferCall(
-              b, barrier, effect.buf, effect.length, combinedPred, memType, op);
+              b, barrier, materialized.bufferMask, combinedPred,
+              materialized.memType, op, recipientCTAs, materialized.effectCTAs);
         }
       }
-      if (barrierInfo.count > 0) {
-        funcBuilder.createVerifyBarrierArriveCall(b, barrier, barrierInfo.count,
-                                                  combinedPred, op);
-        funcBuilder.createUpdateBarrierStateCall(b, barrier, barrierInfo.count,
-                                                 combinedPred, op);
+      if (barrierInfo.count > 0 || barrierInfo.txCount != 0) {
+        funcBuilder.createVerifyBarrierArriveCall(
+            b, barrier, barrierInfo.count, combinedPred, op, recipientCTAs,
+            barrierInfo.txCount);
+        funcBuilder.createUpdateBarrierStateCall(
+            b, barrier, barrierInfo.count, combinedPred, op, recipientCTAs,
+            barrierInfo.txCount);
       }
     }
     if (opInfo->implicitCommit) {
@@ -396,50 +970,62 @@ private:
       funcBuilder.createCommitAccessesCall(b, baseThread, pred,
                                            opInfo->commitKind, op);
     }
+    return success();
   }
 
   void addWriteChecks(ImplicitLocOpBuilder &b,
                       tti::FunctionBuilder &funcBuilder, Operation *op,
-                      Value buf, uint32_t length, Value pred, MemType memType,
-                      int thread, const std::string &operandName) {
-    funcBuilder.createVerifyWriteVisibilityCall(b, buf, length, thread,
-                                                operandName, pred, memType, op);
+                      Value bufferMask, Value pred, MemType memType, int thread,
+                      const std::string &operandName, Value effectCTAs,
+                      CommitKind::Kind opCommitKind = CommitKind::None) {
+    funcBuilder.createVerifyWriteVisibilityCall(
+        b, bufferMask, thread, operandName, pred, memType, op, effectCTAs);
     // commit-num-based synchronization is only supported for shared memory
     if (memType == MemType::SHARED_MEM) {
-      funcBuilder.createCheckOutstandingCommitsCall(
-          b, buf, length, getBaseThread(thread), "async_copy_global_to_shared",
-          pred, memType, CommitKind::AsyncCp, op);
+      for (const auto &commitKindDesc :
+           hooks.getOutstandingWriteCommitKinds()) {
+        bool excludeSelf = (opCommitKind == commitKindDesc.kind &&
+                            hooks.isOrderedCommitKind(opCommitKind));
+        funcBuilder.createCheckOutstandingCommitsCall(
+            b, bufferMask, getBaseThread(thread, auxData.threadLayout),
+            commitKindDesc.operationDesc, pred, memType, commitKindDesc.kind,
+            op, effectCTAs, excludeSelf);
+      }
     }
   }
 
   void addReadChecks(ImplicitLocOpBuilder &b, tti::FunctionBuilder &funcBuilder,
-                     Operation *op, Value buf, uint32_t length, Value pred,
+                     Operation *op, Value bufferMask, Value pred,
                      MemType memType, int thread,
-                     const std::string &operandName) {
-    funcBuilder.createVerifyReadVisibilityCall(b, buf, length, thread,
-                                               operandName, pred, memType, op);
+                     const std::string &operandName, Value effectCTAs,
+                     CommitKind::Kind opCommitKind = CommitKind::None) {
+    funcBuilder.createVerifyReadVisibilityCall(
+        b, bufferMask, thread, operandName, pred, memType, op, effectCTAs);
     // commit-num-based synchronization is only supported for shared memory
     if (memType == MemType::SHARED_MEM) {
-      funcBuilder.createCheckOutstandingCommitsCall(
-          b, buf, length, getBaseThread(thread), "warpgroup_mma operand read",
-          pred, memType, CommitKind::Wgmma, op);
-      funcBuilder.createCheckOutstandingCommitsCall(
-          b, buf, length, getBaseThread(thread), "async_copy_shared_to_global",
-          pred, memType, CommitKind::TmaStore, op);
+      for (const auto &commitKindDesc :
+           hooks.getOutstandingReadCommitKinds(auxData)) {
+        bool excludeSelf = (opCommitKind == commitKindDesc.kind &&
+                            hooks.isOrderedCommitKind(opCommitKind));
+        funcBuilder.createCheckOutstandingCommitsCall(
+            b, bufferMask, getBaseThread(thread, auxData.threadLayout),
+            commitKindDesc.operationDesc, pred, memType, commitKindDesc.kind,
+            op, effectCTAs, excludeSelf);
+      }
     }
   }
 
   ModuleOp module;
   AuxDataMap auxData;
-  const ConSanTargetHooks *hooks;
+  const ConSanTargetHooks &hooks;
 };
 
 } // namespace
 
-void runConcurrencySanitizer(ModuleOp module, const ConSanTargetHooks *hooks) {
-  assert(hooks && "hooks must not be null");
+LogicalResult runConcurrencySanitizer(ModuleOp module,
+                                      const ConSanTargetHooks &hooks) {
   ConcurrencySanitizerImpl impl(module, hooks);
-  impl.run();
+  return impl.run();
 }
 
 class ConcurrencySanitizerPass
@@ -456,7 +1042,8 @@ public:
                                                  : "";
     auto hooks = createConSanHooks(key);
     assert(hooks && "no ConSan hooks registered for target");
-    runConcurrencySanitizer(module, hooks.get());
+    if (failed(runConcurrencySanitizer(module, *hooks)))
+      return signalPassFailure();
   }
 };
 

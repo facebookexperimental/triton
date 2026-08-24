@@ -9,7 +9,7 @@ different ``sizePerThread`` / ``num_warps`` / transpose produces a different one
 the PTX counterpart of TTGIR's ``sublayout({register,lane,warp,block},{dim<axis>})``.
 """
 
-from bitequiv.ptx.affine import Affine, canon
+from bitequiv.core.affine_algebra import Affine, canon
 
 # Byte widths for the load-result types we may see on a reduction's leaf loads.
 _WIDTH = {
@@ -78,7 +78,11 @@ def leaf_columns(ev, du, load_inst, slot):
     grid = []  # (coeff, n) for each thread-index symbol that selects a column
     for sym, coeff in addr.terms:
         if sym.startswith("%tid"):
-            n = ev.reqntid.get(sym.split(".")[-1])
+            parts = sym.split(".")
+            if len(parts) == 3 and parts[2].startswith("bit"):
+                n = 2  # one tid bit (from affine.py's tid bit-basis), range [0, 2)
+            else:
+                n = ev.reqntid.get(parts[-1])
             if n is None:
                 return None
             grid.append((coeff, n))

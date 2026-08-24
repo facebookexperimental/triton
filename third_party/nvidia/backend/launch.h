@@ -336,7 +336,40 @@ triton_construct_tma_desc(CUtensorMap *desc, const triton_tma_recipe_t *recipe,
         global_dim[rank - 1] *
         (rank == 1 ? (cuuint64_t)recipe->elem_size : global_strides[rank - 2]);
 
-  CUtensorMapSwizzle swizzle_mode = (CUtensorMapSwizzle)recipe->swizzle;
+  /* Swizzle: prefer the descriptor's shared-encoding swizzle (recipe->swizzle,
+   * set by get_auto_tma_recipes via getTMASwizzleMode) -- a wgmma dot operand's
+   * NVMMAShared swizzle differs from a box-geometry heuristic, and the host
+   * CUtensorMap must match what the device consumer expects. An explicit
+   * recipe->swizzle >= 0 is honored at ANY rank (this preserves the
+   * pre-auto-TMA behavior for rank-1 AOT recipes that set one explicitly).
+   * recipe->swizzle < 0 means "derive from box geometry" (the proven JIT
+   * make_tensor_descriptor convention), which requires a 2D box, so derivation
+   * + the innermost box-dim clamp (<= swizzle width; the device TMA lowering
+   * emits multiple copies to cover the full block) are gated on rank >= 2 and
+   * default to NONE otherwise. */
+  CUtensorMapSwizzle swizzle_mode = CU_TENSOR_MAP_SWIZZLE_NONE;
+  if (recipe->swizzle >= 0)
+    swizzle_mode = (CUtensorMapSwizzle)recipe->swizzle;
+  if (rank >= 2) {
+    int contig_bytes = recipe->elem_size * (int)box_dim[0];
+    if (recipe->swizzle >= 0) {
+      /* explicit swizzle already applied above */
+    } else if (box_dim[1] < 8 || contig_bytes < 32) {
+      swizzle_mode = CU_TENSOR_MAP_SWIZZLE_NONE;
+    } else if (contig_bytes >= 128) {
+      swizzle_mode = CU_TENSOR_MAP_SWIZZLE_128B;
+    } else if (contig_bytes >= 64) {
+      swizzle_mode = CU_TENSOR_MAP_SWIZZLE_64B;
+    } else {
+      swizzle_mode = CU_TENSOR_MAP_SWIZZLE_32B;
+    }
+    int swz_bytes = (swizzle_mode == CU_TENSOR_MAP_SWIZZLE_128B)  ? 128
+                    : (swizzle_mode == CU_TENSOR_MAP_SWIZZLE_64B) ? 64
+                    : (swizzle_mode == CU_TENSOR_MAP_SWIZZLE_32B) ? 32
+                                                                  : 0;
+    if (swz_bytes > 0 && contig_bytes > swz_bytes)
+      box_dim[0] = (cuuint32_t)(swz_bytes / recipe->elem_size);
+  }
   CUtensorMapFloatOOBfill fill =
       recipe->fill_mode ? CU_TENSOR_MAP_FLOAT_OOB_FILL_NAN_REQUEST_ZERO_FMA
                         : CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE;
@@ -389,6 +422,7 @@ typedef struct {
   int64_t shape[TRITON_MAX_TMA_DIMS];
   int64_t stride[TRITON_MAX_TMA_DIMS];
   int fill_mode;
+  int elem_type;
 } triton_tma_cache_entry_t;
 
 /**
@@ -420,7 +454,8 @@ static inline CUresult triton_construct_tma_desc_cached(
   }
 
   if (cache->valid && cache->ptr == cur_ptr &&
-      cache->fill_mode == recipe->fill_mode) {
+      cache->fill_mode == recipe->fill_mode &&
+      cache->elem_type == recipe->elem_type) {
     int same = 1;
     for (int d = 0; d < recipe->ndim; d++) {
       if (cache->shape[d] != cur_shape[d] ||
@@ -438,6 +473,7 @@ static inline CUresult triton_construct_tma_desc_cached(
     cache->valid = 1;
     cache->ptr = cur_ptr;
     cache->fill_mode = recipe->fill_mode;
+    cache->elem_type = recipe->elem_type;
     for (int d = 0; d < recipe->ndim; d++) {
       cache->shape[d] = cur_shape[d];
       cache->stride[d] = cur_stride[d];

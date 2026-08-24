@@ -125,16 +125,21 @@ def get_fp8_format_name(dtype: tl.dtype, _semantic=None) -> tl.constexpr:
 @tl.builtin
 def clock64(_semantic=None):
     """
-    Returns the current 64-bit hardware clock value.
-    The returned value is the number of clock cycles since the device was powered on or reset.
-    This is useful for measuring elapsed time or performance of specific code regions.
+    Returns the current backend-specific 64-bit hardware timer value.
+
+    Differences between two readings can be used for device-side timing. The
+    timer's tick frequency and scope are target-specific. The timer read is not
+    a synchronization primitive, so callers timing asynchronous or memory
+    operations must issue the appropriate waits or barriers.
+
     Returns:
-        tl.tensor: A tensor containing the current 64-bit clock value as an int64.
+        tl.tensor: A tensor containing the current timer value as an int64.
+
     Example:
         start = tlx.clock64()
         # ... kernel code ...
         end = tlx.clock64()
-        elapsed = end - start  # Number of clock cycles elapsed
+        elapsed = end - start
     """
     return tl.tensor(_semantic.builder.create_clock64(), tl.int64)
 

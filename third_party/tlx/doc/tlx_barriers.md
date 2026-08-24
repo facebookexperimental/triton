@@ -110,8 +110,11 @@ barriers.
 
 - Named barriers do not have to be allocated or initialized.
 
-- Wait and Arrive are called with the count of expected threads to
-  arrive at the barrier.
+- Wait and Arrive are called with the total number of threads required
+  to flip the barrier phase. This includes threads that execute Wait
+  and threads that execute Arrive: *num_waiting_threads +
+  num_arriving_threads*. Wait and Arrive calls for the same barrier
+  phase must use the same thread count.
 
 - All threads in the warp participate in the arrive operation, so the
   thread count should be *number of warps \* threads per warp*.
@@ -122,14 +125,17 @@ barriers.
 #### APIs
 
 - ***tlx.named_barrier_wait(bar_id, num_threads)***
-  Wait until num_threads threads have reached the phase of the *bar_id*
-  named barrier. num_threads has to be a multiple of warp size, i.e.,
-  a multiple of 32.
+  Wait until *num_threads* total threads have reached the phase of the
+  *bar_id* named barrier. The waiting threads contribute to this total,
+  so *num_threads* is the number of waiting threads plus the number of
+  arriving threads. It must match the count passed to Arrive and be a
+  multiple of warp size, i.e., a multiple of 32.
 
 - ***tlx.named_barrier_arrive(bar_id, num_threads)***
-  Signal arrival at *bar_id* named barrier with an arrival count of
-  *num_threads*. num_threads has to be a multiple of warp size, i.e.,
-  a multiple of 32.
+  Signal arrival at the *bar_id* named barrier. *num_threads* is the
+  total number of threads required to flip the barrier phase, including
+  both waiting and arriving threads. It must match the count passed to
+  Wait and be a multiple of warp size, i.e., a multiple of 32.
 
 | TLX | MLIR | PTX |
 |----|----|----|
@@ -260,6 +266,17 @@ while !done:
 
 - ***tlx.barrier_wait(bar, phase)***
   Wait until the *bar*’s phase has moved ahead of the *phase* argument.
+
+  On Blackwell (compute capability 100 or newer), waits inside
+  `tlx.async_tasks(mbarrier_try_wait_suspend_ns=N)` use the four-operand
+  `mbarrier.try_wait.parity` form. The suspend hint lets ptxas emit
+  `NANOSLEEP.SYNCS`, allowing a waiting warp to yield instead of busy-spinning.
+
+  `None` leaves the policy unspecified and does not participate when a kernel
+  contains multiple `async_tasks` regions. An explicit `0` disables the fused
+  suspend hint. Positive values are combined module-wide by selecting the
+  minimum explicit value. If no region specifies a value, waits use the default
+  busy-spin lowering.
 
 - ***tlx.barrier_arrive(bar, arrive_count=1)***
   Performs an arrive operation on *bar*, by decrementing *arrive_count*

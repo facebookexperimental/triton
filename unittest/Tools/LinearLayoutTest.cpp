@@ -550,6 +550,65 @@ TEST_F(LinearLayoutTest, InvertAndCompose_BroadcastedDims2) {
   EXPECT_EQ(c.compose(b), a.transposeOuts(llvm::to_vector(b.getOutDimNames())));
 }
 
+TEST_F(LinearLayoutTest, InvertAndComposeBlockLocal) {
+  auto memLayout =
+      LinearLayout({{S("offset"), {{1}}}, {S("block"), {{0}}}}, {S("dim")});
+  auto regLayout = LinearLayout({{S("register"), {}},
+                                 {S("lane"), {{0}, {0}, {0}, {0}, {0}}},
+                                 {S("warp"), {}},
+                                 {S("block"), {{1}}}},
+                                {S("dim")});
+
+  EXPECT_FALSE(
+      regLayout.invertAndCompose(memLayout).isIdentityOnOutDim(S("block")));
+  auto local = invertAndComposeBlockLocal(memLayout, regLayout);
+  auto expected =
+      LinearLayout({{S("register"), {}},
+                    {S("lane"), {{0, 0}, {0, 0}, {0, 0}, {0, 0}, {0, 0}}},
+                    {S("warp"), {}},
+                    {S("block"), {{1, 1}}}},
+                   {{S("offset"), 2}, {S("block"), 2}},
+                   /*requireSurjective=*/false);
+  EXPECT_EQ(local, expected);
+  EXPECT_TRUE(local.isIdentityOnOutDim(S("block")));
+  EXPECT_FALSE(local.isTrivialOver(S("block")));
+  EXPECT_EQ(local.compose(memLayout), regLayout);
+
+  auto partiallyBroadcastMem = LinearLayout(
+      {{S("offset"), {{2}}}, {S("block"), {{1}, {0}}}}, {S("dim")});
+  auto partiallyDistributedReg =
+      LinearLayout({{S("register"), {}},
+                    {S("lane"), {{0}, {0}, {0}, {0}, {0}}},
+                    {S("warp"), {}},
+                    {S("block"), {{1}, {2}}}},
+                   {S("dim")});
+  EXPECT_FALSE(partiallyDistributedReg.invertAndCompose(partiallyBroadcastMem)
+                   .isIdentityOnOutDim(S("block")));
+  auto partiallyLocal = invertAndComposeBlockLocal(partiallyBroadcastMem,
+                                                   partiallyDistributedReg);
+  auto partiallyExpected =
+      LinearLayout({{S("register"), {}},
+                    {S("lane"), {{0, 0}, {0, 0}, {0, 0}, {0, 0}, {0, 0}}},
+                    {S("warp"), {}},
+                    {S("block"), {{0, 1}, {1, 2}}}},
+                   {{S("offset"), 2}, {S("block"), 4}},
+                   /*requireSurjective=*/false);
+  EXPECT_EQ(partiallyLocal, partiallyExpected);
+  EXPECT_TRUE(partiallyLocal.isIdentityOnOutDim(S("block")));
+  EXPECT_EQ(partiallyLocal.compose(partiallyBroadcastMem),
+            partiallyDistributedReg);
+
+  auto partitionedMem =
+      LinearLayout({{S("offset"), {{1}}}, {S("block"), {{2}}}}, {S("dim")});
+  auto transposedReg = LinearLayout({{S("register"), {{2}}},
+                                     {S("lane"), {{0}, {0}, {0}, {0}, {0}}},
+                                     {S("warp"), {}},
+                                     {S("block"), {{1}}}},
+                                    {S("dim")});
+  EXPECT_EQ(invertAndComposeBlockLocal(partitionedMem, transposedReg),
+            transposedReg.invertAndCompose(partitionedMem));
+}
+
 TEST_F(LinearLayoutTest, InvertAndCompose_IdentityInDim) {
   SmallVector<StringAttr> outDims = {S("dim0"), S("dim1"), S("dim2"),
                                      S("dim3"), S("dim4"), S("dim5"),
@@ -769,6 +828,49 @@ TEST_F(LinearLayoutTest, FreeVariableMasks) {
             AR({{S("in"), 0b110}}));
 }
 
+// The pow2-only fast paths in isExpensiveView and the convert-layout no-op
+// collapse cannot distinguish two *different* modular (ADD-mod-N) register
+// maps, so they would treat a modular relayout as a cheap identity no-op and
+// scramble elements. These tests pin the two discriminators used by the
+// modular-aware guards:
+//   1. getFreeVariableMasks() is a conservative all-zero-basis check and
+//   returns
+//      the SAME masks for two different modular maps (isExpensiveView's old
+//      fast path relies on it -> false "cheap"). operator!= DOES distinguish
+//      them.
+//   2. quotient()/squareSublayoutIsIdentity() uses the pure GF(2) predicate
+//      (basis == 1<<b), which false-positives on a modular register basis, so
+//      minimalCvtLayout would quotient the register dim away and collapse to a
+//      no-op. isModular() flags the layout so the guard refuses the collapse.
+TEST_F(LinearLayoutTest, ModularRelayoutIsNotIdentity) {
+  // Two distinct modular maps over Z/6: strides 1 and 5. They are genuinely
+  // different permutations of {0..5} but the conservative free-variable mask is
+  // identical (no zero bases in either) -> the old isExpensiveView fast path
+  // would call them equal ("cheap").
+  auto modId = LinearLayout::modularStrided1D(6, 1, S("in"), S("out"));
+  auto modRev = LinearLayout::modularStrided1D(6, 5, S("in"), S("out"));
+  EXPECT_TRUE(modId.isModular());
+  EXPECT_TRUE(modRev.isModular());
+  // Old fast path: same free-variable masks despite being different maps.
+  EXPECT_EQ(to_vector(modId.getFreeVariableMasks()),
+            to_vector(modRev.getFreeVariableMasks()));
+  // The guard's discriminator: they are not equal.
+  EXPECT_NE(modId, modRev);
+  EXPECT_EQ(modId, modId);
+}
+
+TEST_F(LinearLayoutTest, ModularRegisterDimNotQuotientedAway) {
+  // A non-identity modular register map (stride 5 over Z/6). The GF(2) identity
+  // predicate used by squareSublayoutIsIdentity treats basis 5 (== 0b101) as
+  // "not identity" only for bit 0; but for a modular map the round-trip is not
+  // GF(2)-linear, so quotient must not silently drop it. Confirm isModular is
+  // set (the guard keys off it) and the map is not the identity.
+  auto modRev = LinearLayout::modularStrided1D(6, 5, S("register"), S("out"));
+  auto ident = LinearLayout::modularIdentity1D(6, S("register"), S("out"));
+  EXPECT_TRUE(modRev.isModular());
+  EXPECT_NE(modRev, ident);
+}
+
 TEST_F(LinearLayoutTest, QuotientOneDimension) {
   LinearLayout layout(
       {
@@ -897,7 +999,6 @@ TEST_F(LinearLayoutTest, BlackwellMixedPrecisionDotScaledSMEM) {
 TEST_F(LinearLayoutTest, BlackwellMixedPrecisionDotScaledSMEMSwizzled) {
   int M = 16;
   int KPadded8b = 128;
-  int numFp4Elems = M * KPadded8b;
   int KPacked8b = KPadded8b / 2;
   int elemBitWidth = 8;
   int tileWidthBytes = 128;
@@ -1353,6 +1454,33 @@ TEST_F(LinearLayoutTest, InvertAndCompose_Modular_MultiDim_LCM) {
   }
 }
 
+TEST_F(LinearLayoutTest, TryInvertAndCompose_ModularStatus) {
+  auto makeLayout = [&](StringRef inDim, int32_t basis, int32_t size) {
+    BasesT bases;
+    bases[S(inDim)].push_back({basis});
+    return LinearLayout(std::move(bases), {{S("dim0"), size}}, false);
+  };
+
+  auto requested = makeLayout("register", 1, 6);
+  auto unavailable = makeLayout("offset", 2, 6);
+  auto noSolution = requested.tryInvertAndCompose(unavailable);
+  EXPECT_EQ(noSolution.status, ModularSolveStatus::NoSolution);
+  EXPECT_FALSE(noSolution.layout.has_value());
+  EXPECT_DEATH((void)requested.invertAndCompose(unavailable),
+               "invertAndCompose failed");
+  EXPECT_DEATH((void)unavailable.pseudoinvert(), "pseudoinvert failed");
+
+  auto available = LinearLayout::modularIdentity1D(6, S("offset"), S("dim0"));
+  auto success = requested.tryInvertAndCompose(available);
+  ASSERT_TRUE(success.succeeded());
+  EXPECT_TRUE(success.layout.has_value());
+
+  auto singularSource = makeLayout("register", 3, 9);
+  auto singularTarget = makeLayout("offset", 3, 9);
+  auto singular = singularSource.tryInvertAndCompose(singularTarget);
+  EXPECT_NE(singular.status, ModularSolveStatus::NoSolution);
+}
+
 // Test multi-dimensional NPOT layouts
 TEST_F(LinearLayoutTest, IsModularSurjectiveMultiDim) {
   // Create a 2D layout with NPOT dimensions: 3x6
@@ -1441,6 +1569,15 @@ TEST_F(LinearLayoutTest, SurjectivityTruncationRegression) {
 // Mixed-Shape Tests (pow2 + NPOT dims in the same layout)
 // Verifies that per-layout isModular is correct for mixed shapes.
 //===----------------------------------------------------------------------===//
+
+TEST_F(LinearLayoutTest, MixedShapeSurjectivityUsesPerDimAlgebra) {
+  LinearLayout layout({{S("in"), {{1, 0}, {3, 0}, {0, 1}, {0, 2}, {0, 4}}}},
+                      {{S("pow2"), 4}, {S("npot"), 6}},
+                      /*requireSurjective=*/false);
+
+  EXPECT_TRUE(layout.isModular());
+  EXPECT_TRUE(layout.isModularSurjective());
+}
 
 TEST_F(LinearLayoutTest, MixedShape_OperatorStar_SharedDim) {
   // When inner and outer share an output dim, sizes multiply (not shift).

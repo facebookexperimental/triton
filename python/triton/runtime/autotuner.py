@@ -13,7 +13,7 @@ from functools import cached_property
 from typing import Dict, Tuple, List, Optional
 
 from .. import knobs
-from .jit import KernelInterface, JITFunction, _compile_iq_suppress_competition
+from .jit import KernelInterface, JITFunction, _compile_iq_suppress_competition, _hash_fc_opts
 from .errors import OutOfResources, PTXASError, AutotunerError
 from .driver import driver
 from .cache import get_cache_manager, triton_key
@@ -108,12 +108,14 @@ class _OnlineLinearRegression:
 
 class _EntropyCriterion:
 
+    DEFAULT_MIN_WARMUP_SAMPLES = 20
+
     def __init__(
         self,
         max_angle: float = 0.048,
         min_r2: float = 0.36,
         window_size: int = 299,
-        min_warmup_samples: int = 20,
+        min_warmup_samples: int = DEFAULT_MIN_WARMUP_SAMPLES,
         entropy_window_size: int = 500,
     ) -> None:
         self.max_angle = max_angle
@@ -177,13 +179,17 @@ class _EntropyCriterion:
                 self._sum_count_log_count += new_count * math.log2(new_count)
 
 
+def _entropy_warmup_sample_limit(probe_ms: float, budget_ms: int) -> int:
+    """Convert the warmup time budget to a bounded number of kernel launches."""
+    return max(1, min(10000, int(budget_ms / probe_ms)))
+
+
 def _entropy_warmup(kernel_call, clear_cache, torch, entropy_window_size=500, regr_window_size=299, max_samples=10000):
     """Adaptive warmup using entropy convergence. Returns (n_samples, avg_ms)."""
     crit = _EntropyCriterion(
         max_angle=0.048,
         min_r2=0.36,
         window_size=regr_window_size,
-        min_warmup_samples=20,
         entropy_window_size=entropy_window_size,
     )
     rounding_factor = 3
@@ -241,6 +247,26 @@ def _timed_measurement(kernel_call, clear_cache, n_repeat, torch):
     return torch.tensor([s.elapsed_time(e) for s, e in zip(start_ev, end_ev)], dtype=torch.float)
 
 
+class _AutotuneCache(dict):
+    """dict that invalidates C autotune proxy when cleared."""
+
+    def __init__(self, autotuner):
+        super().__init__()
+        self._autotuner = autotuner
+
+    def __reduce__(self):
+        return (dict, ())
+
+    def clear(self):
+        super().clear()
+        if hasattr(self._autotuner, '_autotune_proxy'):
+            del self._autotuner._autotune_proxy
+        if hasattr(self._autotuner, '_at_proxy_seeded'):
+            self._autotuner._at_proxy_seeded = set()
+        if hasattr(self._autotuner, '_fc_seeded'):
+            self._autotuner._fc_seeded = set()
+
+
 class Autotuner(KernelInterface):
 
     def __init__(self, fn, arg_names, configs, key, reset_to_zero, restore_value, pre_hook=None, post_hook=None,
@@ -280,7 +306,7 @@ class Autotuner(KernelInterface):
             self.configs = configs
         self.keys = key
         self.include_npot = include_npot
-        self.cache: Dict[Tuple, Config] = {}
+        self.cache: Dict[Tuple, Config] = _AutotuneCache(self)
         self.arg_names = arg_names
         self.cache_results = (cache_results or knobs.autotuning.cache) and not knobs.runtime.interpret
 
@@ -304,9 +330,14 @@ class Autotuner(KernelInterface):
 
             def _pre_hook(kwargs, reset_only=False):
                 for name in self.reset_to_zero:
-                    kwargs[name].zero_()
+                    if kwargs[name] is not None:
+                        kwargs[name].zero_()
                 if not reset_only:
-                    self.restore_copies = {name: kwargs[name].clone() for name in self.restore_value}
+                    self.restore_copies = {
+                        name: kwargs[name].clone()
+                        for name in self.restore_value
+                        if kwargs[name] is not None
+                    }
 
             self.pre_hook = _pre_hook
 
@@ -316,8 +347,8 @@ class Autotuner(KernelInterface):
         elif len(self.restore_value) > 0:
 
             def _post_hook(kwargs, exception):
-                for name in self.restore_value:
-                    kwargs[name].copy_(self.restore_copies[name])
+                for name, value in self.restore_copies.items():
+                    kwargs[name].copy_(value)
                 self.restore_copies = {}
 
             self.post_hook = _post_hook
@@ -402,6 +433,8 @@ class Autotuner(KernelInterface):
             return None
 
         rep = knobs.autotuning.rep
+        warmup = knobs.autotuning.warmup
+        fixed_benchmarker = driver.active.get_benchmarker()
         _WARMUP_BUDGET_MS = 250
 
         def entropy_benchmarker(kernel_call, quantiles):
@@ -422,6 +455,16 @@ class Autotuner(KernelInterface):
 
             # Scale windows so wall-clock warmup stays within budget
             probe_ms = max(probe_ms, 0.001)
+            max_samples = _entropy_warmup_sample_limit(probe_ms, _WARMUP_BUDGET_MS)
+            # If the minimum sample count cannot fit in the budget, use the
+            # existing fixed-time benchmarker.
+            if max_samples < _EntropyCriterion.DEFAULT_MIN_WARMUP_SAMPLES:
+                return fixed_benchmarker(
+                    kernel_call,
+                    warmup=warmup,
+                    rep=rep,
+                    quantiles=quantiles,
+                )
             entropy_window = min(500, max(50, int(_WARMUP_BUDGET_MS / probe_ms)))
             regr_window = max(20, int(entropy_window * 0.6))
 
@@ -431,6 +474,7 @@ class Autotuner(KernelInterface):
                 torch,
                 entropy_window_size=entropy_window,
                 regr_window_size=regr_window,
+                max_samples=max_samples,
             )
             avg_ms = n_warmup[1]
             n_repeat = max(10, int(rep / avg_ms)) if avg_ms > 0 else 100
@@ -563,7 +607,9 @@ class Autotuner(KernelInterface):
         """Return C-level AutotuneCacheProxy for fast dispatch if available."""
         # Check if we can use the C-level autotune proxy
         if (native_create_autotune_proxy is not None and getattr(self.fn, 'c_cache', False)
-                and knobs.nvidia.use_autotune_c_cache and knobs.nvidia.use_triton_dispatcher and len(self.configs) > 1):
+                and knobs.nvidia.use_autotune_c_cache and knobs.nvidia.use_triton_dispatcher and len(self.configs) > 1
+                and knobs.autotuning.listener is None
+                and getattr(driver.active, "is_cpu_backend", False) is not True):
             proxy = getattr(self, '_autotune_proxy', None)
             if proxy is None:
                 # Compute key_indices: positions in arg_names for autotuner key fields
@@ -602,6 +648,8 @@ class Autotuner(KernelInterface):
 
     def _seed_autotune_proxy(self, key, config):
         """Insert a key→config mapping into the C autotune proxy table."""
+        if getattr(driver.active, "is_cpu_backend", False) is True:
+            return
         proxy = getattr(self, '_autotune_proxy', None)
         if proxy is None or native_autotune_proxy_insert is None:
             return
@@ -621,7 +669,7 @@ class Autotuner(KernelInterface):
         _meta = {k: v for k, v in config_kwargs.items() if k not in fn_arg_name_set}
         _meta_opts = {k: v for k, v in _meta.items() if k not in getattr(self.fn, '_param_name_to_idx', {})}
         if _meta_opts:
-            options_hash = hash(tuple(sorted(_meta_opts.items()))) & 0xFFFFFFFFFFFFFFFF
+            options_hash = _hash_fc_opts(_meta_opts)
         else:
             options_hash = getattr(self.fn, '_fc_options_hash', 0)
 
@@ -668,6 +716,9 @@ class Autotuner(KernelInterface):
         Returns None when preconditions aren't met (no c_cache, callable
         grid that can't be evaluated, extra kwargs, etc.).
         """
+        if getattr(driver.active, "is_cpu_backend", False) is True:
+            return None
+
         input_grid = kwargs.get('grid')
         if input_grid is None or not getattr(self.fn, 'c_cache', False):
             return None
@@ -721,7 +772,7 @@ class Autotuner(KernelInterface):
             if _meta:
                 _meta_opts = {k: v for k, v in _meta.items() if k not in getattr(self.fn, '_param_name_to_idx', {})}
                 if _meta_opts:
-                    self.fn._fc_options_hash = hash(tuple(sorted(_meta_opts.items()))) & 0xFFFFFFFFFFFFFFFF
+                    self.fn._fc_options_hash = _hash_fc_opts(_meta_opts)
                 # Store meta kwargs for C proxy fallback forwarding.
                 self.fn._fc_meta_kwargs = _meta
                 # Invalidate proxy cache so next __getitem__ creates a new proxy
@@ -735,7 +786,15 @@ class Autotuner(KernelInterface):
                         _padded = _padded + (None, ) * (len(self.fn.params) - len(_padded))
                     native_fast_dispatch_insert(self.fn, _padded, self.fn.params, self.fn._fc_options_hash, kernel,
                                                 _disp, getattr(kernel, '_dispatch_arg_indices', None))
-            self._fc_seeded.add(_seed_key)
+                    # Only enable the meta-less steady-state fast path (self.fn[grid](*full_args)
+                    # below) once a native dispatcher exists to carry the winning config's
+                    # compilation options. Without one -- e.g. dispatcher creation failed with
+                    # "Too many kernel args" -- steady-state falls back to a plain JIT launch that
+                    # recompiles at the default num_warps/num_stages and silently drops the config's
+                    # values, miscompiling kernels pinned to a non-default num_warps. Leaving
+                    # _seed_key unseeded re-runs this seed branch (a full run(**_meta) that honors
+                    # the config) on every call instead.
+                    self._fc_seeded.add(_seed_key)
             return kernel
 
         # Steady-state: dispatch via JITCacheProxy (fastest path).
@@ -769,64 +828,83 @@ class Autotuner(KernelInterface):
                 else:
                     pruned_configs = self.prune_configs(kwargs)
 
-                def benchmark():
-                    # facebook begin
-                    import importlib
-                    if importlib.util.find_spec("torch.monitor") is not None:
-                        from torch.monitor import _WaitCounter
-                        waitcounter = _WaitCounter("pytorch.triton.benchmark").guard()
-                        waitcounter.__enter__()
-
-                    # facebook end
-                    bench_start = time.time()
-                    timings = {}
-                    compiled = {}  # config -> CompiledKernel (captured during the bench launch)
-                    for config in pruned_configs:
-                        timings[config] = self._bench(*args, config=config, **kwargs)
-                        compiled[config] = self._last_compiled_kernel
-                    # IR-based pruning runs here, AFTER benchmarking, reusing each config's
-                    # already-compiled artifact (no extra compile); a rejected config is pruned
-                    # by marking its timing invalid (inf) so it cannot win.
-                    #
-                    # DESIGN NOTE — why this is a post-bench pass and not an inline per-config
-                    # prune (raised in review D107928110): compilation is not a discrete step the
-                    # autotuner controls. A config's compiled artifact (CompiledKernel.asm) only
-                    # becomes available as the return value of `self.fn.run(...)` in jit.py, which
-                    # *fuses* compile + launch (JITFunction.run: compile on cache miss, then
-                    # launch, then return the kernel). `_bench` captures it as a side effect on
-                    # `self._last_compiled_kernel`. So a config's IR exists only once it has been
-                    # compiled AND benchmarked; pruning it *before* timing would require a separate
-                    # compile pass that re-implements jit.py's run pipeline (deliberately avoided).
-                    # Folding this pass into the loop above (per-config inline) is a pure code-org
-                    # change and is doable, but must still thread the captured kernel + reference
-                    # config through the loop and preserve the "first finite-time config =
-                    # reference" and "at least one survivor" semantics — left as a separate pass on
-                    # purpose; touch with care.
-                    if self.ir_config_prune is not None:
-                        self._ir_prune_after_bench(pruned_configs, timings, compiled)
-                    bench_end = time.time()
-                    self.bench_time = bench_end - bench_start
-                    # facebook begin T203283446
-                    if importlib.util.find_spec("torch.monitor") is not None:
-                        waitcounter.__exit__()
-                    if knobs.autotuning.print:
-                        print(
-                            f'\nPrinting ALL Multiple Triton autotuning Configs with timings in sorted order for kernel {self.fn}:',
-                            flush=True)
-                        sorted_configs = builtins.sorted(timings, key=timings.get)
-                        for config in sorted_configs:
-                            print(f'Triton autotune config: [{config}]; Triton autotune timing: {timings[config]}',
-                                  flush=True)
-                    # facebook end T203283446
-                    self.cache[key] = builtins.min(timings, key=timings.get)
-                    full_nargs = {**self.nargs, **kwargs, **self.cache[key].all_kwargs()}
-                    self.pre_hook(full_nargs, reset_only=True)
-                    self.configs_timings = timings
-
-                if self.cache_results:
-                    used_cached_result = self.check_disk_cache(key, pruned_configs, benchmark)
+                if len(pruned_configs) == 1 and self.ir_config_prune is None:
+                    # Match single-config autotune behavior: no benchmarking is needed.
+                    self.cache[key] = pruned_configs[0]
+                    used_cached_result = True
                 else:
-                    benchmark()
+
+                    def benchmark():
+                        # facebook begin
+                        import importlib
+                        if importlib.util.find_spec("torch.monitor") is not None:
+                            from torch.monitor import _WaitCounter
+                            waitcounter = _WaitCounter("pytorch.triton.benchmark").guard()
+                            waitcounter.__enter__()
+
+                        # facebook end
+                        bench_start = time.time()
+                        timings = {}
+                        compiled = {}  # config -> CompiledKernel (captured during the bench launch)
+                        for config in pruned_configs:
+                            timings[config] = self._bench(*args, config=config, **kwargs)
+                            compiled[config] = self._last_compiled_kernel
+                        # IR-based pruning runs here, AFTER benchmarking, reusing each config's
+                        # already-compiled artifact (no extra compile); a rejected config is pruned
+                        # by marking its timing invalid (inf) so it cannot win.
+                        #
+                        # DESIGN NOTE — why this is a post-bench pass and not an inline per-config
+                        # prune (raised in review D107928110): compilation is not a discrete step the
+                        # autotuner controls. A config's compiled artifact (CompiledKernel.asm) only
+                        # becomes available as the return value of `self.fn.run(...)` in jit.py, which
+                        # *fuses* compile + launch (JITFunction.run: compile on cache miss, then
+                        # launch, then return the kernel). `_bench` captures it as a side effect on
+                        # `self._last_compiled_kernel`. So a config's IR exists only once it has been
+                        # compiled AND benchmarked; pruning it *before* timing would require a separate
+                        # compile pass that re-implements jit.py's run pipeline (deliberately avoided).
+                        # Folding this pass into the loop above (per-config inline) is a pure code-org
+                        # change and is doable, but must still thread the captured kernel + reference
+                        # config through the loop and preserve the "first finite-time config =
+                        # reference" and "at least one survivor" semantics — left as a separate pass on
+                        # purpose; touch with care.
+                        if self.ir_config_prune is not None:
+                            self._ir_prune_after_bench(pruned_configs, timings, compiled)
+                        bench_end = time.time()
+                        self.bench_time = bench_end - bench_start
+                        # facebook begin T203283446
+                        if importlib.util.find_spec("torch.monitor") is not None:
+                            waitcounter.__exit__()
+                        if knobs.autotuning.print:
+                            print(
+                                f'\nPrinting ALL Multiple Triton autotuning Configs with timings in sorted order for kernel {self.fn}:',
+                                flush=True)
+                            sorted_configs = builtins.sorted(timings, key=timings.get)
+                            for config in sorted_configs:
+                                print(f'Triton autotune config: [{config}]; Triton autotune timing: {timings[config]}',
+                                      flush=True)
+                        # facebook end T203283446
+                        self.cache[key] = builtins.min(timings, key=timings.get)
+                        full_nargs = {**self.nargs, **kwargs, **self.cache[key].all_kwargs()}
+                        self.pre_hook(full_nargs, reset_only=True)
+                        self.configs_timings = timings
+
+                    if self.cache_results:
+                        used_cached_result = self.check_disk_cache(key, pruned_configs, benchmark)
+                    else:
+                        benchmark()
+
+                    if knobs.autotuning.listener is not None:
+                        jit_fn = self.fn
+                        while not isinstance(jit_fn, JITFunction):
+                            jit_fn = jit_fn.fn
+                        knobs.autotuning.listener(
+                            fn=jit_fn,
+                            key=key,
+                            best_config=self.cache[key],
+                            configs_timings=self.configs_timings,
+                            duration=getattr(self, 'bench_time', None) if not used_cached_result else None,
+                            cache_hit=used_cached_result,
+                        )
 
             config = self.cache[key]
             self._last_key = key
@@ -944,7 +1022,11 @@ class Autotuner(KernelInterface):
         if self.perf_model:
             top_k = self.configs_top_k
             if isinstance(top_k, float) and top_k <= 1.0:
-                top_k = int(len(configs) * top_k)
+                # Keep at least one config: a small fraction over a small config
+                # set rounds down to zero, which would prune everything and crash
+                # the later min() on an empty set. early_config_prune already
+                # guarantees at least one config; mirror that here.
+                top_k = max(1, int(len(self.configs) * top_k))
             elif not isinstance(top_k, int):
                 # Slice index must be an integer
                 raise TypeError("Error while pruning configs, top_k must be either 1) a float <= 1.0 or 2) an int")
@@ -1003,6 +1085,11 @@ class Config:
         required, this is a hint: the driver may use a smaller cluster if resources are constrained.
         Maps to CU_LAUNCH_ATTRIBUTE_PREFERRED_CLUSTER_DIMENSION. The per dim grid size must be divisible by this per dim cluster size.
     :type preferred_ctas_per_cga: tuple[int, int, int]
+    :ivar multicast: default policy for compiler-selected TMA multicast loads.
+    :type multicast: bool
+    :ivar enable_tree_reduction: use tree-shaped, vectorized in-thread reductions. If unset, use the
+        backend's architecture-specific default.
+    :type enable_tree_reduction: bool | None
     """
 
     @staticmethod
@@ -1028,8 +1115,13 @@ class Config:
         reg_inc_consumer=0,
         ctas_per_cga=None,
         early_tma_store_lowering=None,
+        tma_store_pipelining=None,
         generate_subtiled_region=None,
         preferred_ctas_per_cga=None,
+        multicast=False,
+        auto_tma=None,
+        enable_tree_reduction=None,
+        allowDependentTwoCTA=None,
     ):
         self.kwargs = kwargs
         self.num_warps = num_warps
@@ -1045,8 +1137,15 @@ class Config:
         self.pingpongAutoWS = pingpongAutoWS
         self.ctas_per_cga = ctas_per_cga
         self.early_tma_store_lowering = early_tma_store_lowering
+        self.tma_store_pipelining = tma_store_pipelining
         self.generate_subtiled_region = generate_subtiled_region
         self.preferred_ctas_per_cga = preferred_ctas_per_cga
+        self.multicast = multicast
+        self.allowDependentTwoCTA = allowDependentTwoCTA
+        # Per-config auto-TMA toggle. None -> defer to the global TRITON_AUTO_TMA
+        # knob; True/False lets the autotuner A/B auto-TMA per shape.
+        self.auto_tma = auto_tma
+        self.enable_tree_reduction = enable_tree_reduction
 
     def __setstate__(self, state):
         self.kwargs = state.get("kwargs", {})
@@ -1061,8 +1160,13 @@ class Config:
         self.pingpongAutoWS = state.get("pingpongAutoWS", None)
         self.ctas_per_cga = state.get("ctas_per_cga", None)
         self.early_tma_store_lowering = state.get("early_tma_store_lowering", None)
+        self.tma_store_pipelining = state.get("tma_store_pipelining", None)
         self.generate_subtiled_region = state.get("generate_subtiled_region", None)
         self.preferred_ctas_per_cga = state.get("preferred_ctas_per_cga", None)
+        self.multicast = state.get("multicast", False)
+        self.allowDependentTwoCTA = state.get("allowDependentTwoCTA", None)
+        self.auto_tma = state.get("auto_tma", None)
+        self.enable_tree_reduction = state.get("enable_tree_reduction", None)
 
     def all_kwargs(self):
         return {
@@ -1080,8 +1184,13 @@ class Config:
                     ("pingpongAutoWS", self.pingpongAutoWS),
                     ("ctas_per_cga", self.ctas_per_cga),
                     ("early_tma_store_lowering", self.early_tma_store_lowering),
+                    ("tma_store_pipelining", self.tma_store_pipelining),
                     ("generate_subtiled_region", self.generate_subtiled_region),
                     ("preferred_ctas_per_cga", self.preferred_ctas_per_cga),
+                    ("multicast", self.multicast),
+                    ("auto_tma", self.auto_tma),
+                    ("enable_tree_reduction", self.enable_tree_reduction),
+                    ("allowDependentTwoCTA", self.allowDependentTwoCTA),
                 ) if v is not None
             },
         }
@@ -1099,8 +1208,12 @@ class Config:
         res.append(f"pingpongAutoWS: {self.pingpongAutoWS}")
         res.append(f"ctas_per_cga: {self.ctas_per_cga}")
         res.append(f"early_tma_store_lowering: {self.early_tma_store_lowering}")
+        res.append(f"tma_store_pipelining: {self.tma_store_pipelining}")
         res.append(f"generate_subtiled_region: {self.generate_subtiled_region}")
         res.append(f"preferred_ctas_per_cga: {self.preferred_ctas_per_cga}")
+        res.append(f"multicast: {self.multicast}")
+        res.append(f"auto_tma: {self.auto_tma}")
+        res.append(f"enable_tree_reduction: {self.enable_tree_reduction}")
         return ", ".join(res)
 
     def __hash__(self):
@@ -1357,7 +1470,7 @@ def heuristics(values):
         def kernel(x_ptr, x_size, BLOCK_SIZE: tl.constexpr):
             ...
     :param values: a dictionary of meta-parameter names and functions that compute the value of the meta-parameter.
-                   each such function takes a list of positional arguments as input.
+                   each such function takes a dict of all the arguments passed to the kernel, keyed by argument name, as input.
     :type values: dict[str, Callable[[dict[str, Any]], Any]]
     """
 

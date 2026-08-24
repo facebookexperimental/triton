@@ -25,7 +25,7 @@ namespace mlir::triton::gpu {
 // scheduleLoops
 //===----------------------------------------------------------------------===//
 
-template <typename... OpTypes> bool containsAny(scf::ForOp forOp) {
+template <typename... OpTypes> static bool containsAny(scf::ForOp forOp) {
   WalkResult result = forOp.walk([&](Operation *op) {
     if (isa<OpTypes...>(op))
       return WalkResult::interrupt();
@@ -81,6 +81,18 @@ void preprocesssWarpSpecializedOuterLoop(scf::ForOp &forOp, Builder &builder) {
   }
 }
 
+// A dynamic-persistent warp-specialized loop remains an scf.while after code
+// partitioning. Its nested scf.for loops still need to be rescheduled before
+// software pipelining, just like the nested loops of an outer scf.for.
+void preprocesssWarpSpecializedOuterLoop(scf::WhileOp whileOp,
+                                         Builder &builder) {
+  if (!whileOp->hasAttr(kWarpSpecializeAttrName))
+    return;
+  whileOp.walk([&](scf::ForOp innerLoop) {
+    preprocesssWarpSpecializedInnerLoop(innerLoop, builder);
+  });
+}
+
 void doLoopSchedulePreprocessing(ModuleOp moduleOp, Builder &builder) {
   // Process the given function to propagate the warp-specialize attribute
   // from the outer loop to the inner loops. This is done to enable the loop
@@ -91,6 +103,9 @@ void doLoopSchedulePreprocessing(ModuleOp moduleOp, Builder &builder) {
   // attribute when the inner loop already has the max stage count.
   moduleOp.walk([&](scf::ForOp forOp) {
     preprocesssWarpSpecializedOuterLoop(forOp, builder);
+  });
+  moduleOp.walk([&](scf::WhileOp whileOp) {
+    preprocesssWarpSpecializedOuterLoop(whileOp, builder);
   });
 }
 
@@ -692,13 +707,10 @@ CoarseSchedule
 scheduleKeyOpsAnnotation(scf::ForOp forOp,
                          const DenseMap<Operation *, int> &opLatency,
                          int defaultNumStages) {
-  // Collect all latency ops and MMA ops with annotations.
-  SmallVector<Operation *> latOps;
+  // Collect MMA ops with annotations.
   SmallVector<std::tuple<ttng::MMAv5OpInterface, int, int>> annotatedMMAs;
 
   for (auto &op : forOp.getBody()->without_terminator()) {
-    if (opLatency.count(&op))
-      latOps.push_back(&op);
     if (auto mmaOp = dyn_cast<ttng::MMAv5OpInterface>(&op)) {
       if (auto attr = op.getAttrOfType<StringAttr>("tt.autows")) {
         auto parsed = llvm::json::parse(attr.getValue());
@@ -741,12 +753,10 @@ scheduleKeyOpsAnnotation(scf::ForOp forOp,
     schedule.insert(mma, stage, clusters[cluster]);
   }
 
-  // Schedule latency ops (loads, etc.) to stage 0, cluster 0.
-  for (auto *op : latOps) {
-    if (schedule.count(op))
-      continue;
-    schedule.insert(op, 0, clusters[0]);
-  }
+  // Leave latency ops unscheduled here. scheduleDependencies() places each
+  // load with its annotated consumer. This realizes the qT/dOt prologue and
+  // delayed-q epilogue of FA backward without speculatively prefetching a
+  // single-buffered metadata channel such as delta/Di.
 
   LDBG("scheduleKeyOpsAnnotation: scheduled "
        << annotatedMMAs.size() << " annotated MMAs with " << numStages
@@ -798,11 +808,11 @@ CoarseSchedule getInitialSchedule(scf::ForOp forOp,
     // root at the stages of the latency ops to prune unnecessary stages.
     auto isLatencyOp = [&](Operation &op) {
       return opLatency.count(&op) ||
-             isa<LoadOp, DescriptorLoadOp, DescriptorGatherOp, LocalStoreOp,
+             isa<LoadOp, DescriptorLoadLikeOpInterface, LocalStoreOp,
                  LocalLoadOp, ttng::TMEMLoadOp, ttng::TMEMStoreOp,
-                 AsyncCopyGlobalToLocalOp, ttng::AsyncTMACopyGlobalToLocalOp,
-                 ttng::AsyncTMAGatherOp, ttng::MMAv5OpInterface,
-                 ttng::WaitBarrierOp, ttng::ArriveBarrierOp>(op);
+                 AsyncCopyGlobalToLocalOp, ttng::TMAOpInterface,
+                 ttng::MMAv5OpInterface, ttng::WaitBarrierOp,
+                 ttng::ArriveBarrierOp>(op);
     };
 
     // If there are no latency ops or all latency ops are in the same stage, we

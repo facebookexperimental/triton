@@ -92,13 +92,15 @@ budget check is performed in this phase; the total SMEM may temporarily exceed
 the budget afterwards.
 
 Budget is reconciled later (Phase 3.6) by reusing **discretionary** SMEM — the
-TMA store/reduce staging buffers (write → TMA op → dead). Co-live operand buffers
-(loaded once per outer iteration and read across the whole inner loop, e.g.
-`q`/`k`/`v`) are explicitly excluded from that reuse, since aliasing them is
-unsafe. If, even after staging reuse, the floored allocation still exceeds the
-budget, the planner emits a warning and **ships it anyway** rather than dropping
-a floor — the real hardware SMEM limit (an `OutOfResources` at codegen) is the
-backstop.
+TMA store/reduce staging buffers (write → TMA op → dead). A staging buffer may
+reuse an unstaged NVWS descriptor destination when their encodings match and a
+forward SSA/memory dependency proves that the descriptor consumer completes
+before the staging producer. Co-live operand buffers (loaded once per outer
+iteration and read across the whole inner loop, e.g. `q`/`k`/`v`) are explicitly
+excluded from that reuse, since aliasing them is unsafe. If, even after staging
+reuse, the floored allocation still exceeds the budget, the planner emits a
+warning and **ships it anyway** rather than dropping a floor — the real hardware
+SMEM limit (an `OutOfResources` at codegen) is the backstop.
 
 > Earlier revision: a budget-gated revert here silently downgraded the
 > cross-stage `q` buffer to a single copy and deadlocked `_attn_bwd_persist`
@@ -631,7 +633,7 @@ This interface is unchanged.
 ```
 doMemoryPlanner(funcOp, numBuffers)
   ├── Step 0: reorderOpsBySchedule (disabled)
-  ├── Step 1: collectPostChannels
+  ├── Step 1: collectAllocChannels
   ├── Step 1.5: identify cross-stage channels
   ├── Step 2: MemoryPlanner::run(numBuffers)       ← THIS CHANGES
   │     ├── Phase 1: create WSBuffers, unique IDs, all copy=1

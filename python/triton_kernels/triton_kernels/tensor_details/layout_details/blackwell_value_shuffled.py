@@ -61,6 +61,16 @@ class BlackwellMX4ValueShuffledTransformation(LayoutTransformation):
     block_k: int = 128
     block_n: int = 256
 
+    @property
+    def storage_shape(self) -> list[int]:
+        if not self.is_fp4:
+            raise ValueError("BlackwellMX4ValueShuffledLayout only supports fp4 values")
+        E = math.prod(self.shape[:-2])
+        K_packed = self.shape[-2] // 2
+        N = self.shape[-1]
+        tile_k_packed, tile_n, _, _, num_tiles_k, num_tiles_n = self._compute_params(E, K_packed, N)
+        return [E, num_tiles_k, num_tiles_n, tile_n, tile_k_packed]
+
     def _compute_params(self, E, K_packed, N):
         """Compute tiling parameters from the physical shape."""
         packed_block_k = self.block_k // 2
@@ -104,15 +114,12 @@ class BlackwellMX4ValueShuffledTransformation(LayoutTransformation):
         Target layout: [E, num_tiles_k, num_tiles_n, tile_n, tile_k_packed]
         This matches the baseline TMA block shape [block_n, packed_block_k] after swapping.
         """
-        if data.ndim == 2:
-            data = data.unsqueeze(0)
-        if data.ndim != 3:
-            raise ValueError(f"Expected 2D or 3D canonical data, got {data.ndim}D")
-
         data = self._canonical_to_physical(data)
-        E, K_packed, N = data.shape
-        tile_k_packed, tile_n, padded_K_packed, padded_N, num_tiles_k, num_tiles_n = \
-            self._compute_params(E, K_packed, N)
+        E, num_tiles_k, num_tiles_n, tile_n, tile_k_packed = self.storage_shape
+        K_packed, N = data.shape[-2:]
+        data = data.reshape(E, K_packed, N)
+        padded_K_packed = num_tiles_k * tile_k_packed
+        padded_N = num_tiles_n * tile_n
 
         # Pad to tile boundaries if needed (in original [E, K_packed, N] space)
         if K_packed != padded_K_packed or N != padded_N:
@@ -130,7 +137,7 @@ class BlackwellMX4ValueShuffledTransformation(LayoutTransformation):
         # This puts K tiles first (for inner loop locality) and arranges
         # inner dims as [tile_n, tile_k_packed] to match baseline TMA block.
         data = data.permute(0, 3, 1, 2, 4).contiguous()
-        return data
+        return self._validate_storage_shape(data)
 
     def unswizzle_data(self, data: torch.Tensor) -> torch.Tensor:
         """
@@ -139,6 +146,7 @@ class BlackwellMX4ValueShuffledTransformation(LayoutTransformation):
         Input layout: [E, num_tiles_k, num_tiles_n, tile_n, tile_k_packed]
         """
         E = data.shape[0]
+        leading_shape = self.shape[:-2]
         # Recover original shape from self.shape (the logical shape passed to convert_layout)
         orig_K_packed = self.shape[-2] // 2 if self.is_fp4 else self.shape[-2]
         orig_N = self.shape[-1]
@@ -159,4 +167,6 @@ class BlackwellMX4ValueShuffledTransformation(LayoutTransformation):
         # Trim padding back to original shape
         data = data[:, :orig_K_packed, :orig_N].contiguous()
         data = self._physical_to_canonical(data)
-        return data if len(self.shape) == 3 else data.squeeze(0)
+        if not leading_shape:
+            return data.squeeze(0)
+        return data.reshape(*leading_shape, data.shape[-2], data.shape[-1])

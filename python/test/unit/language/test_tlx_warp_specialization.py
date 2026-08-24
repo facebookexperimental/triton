@@ -285,14 +285,31 @@ def test_async_tasks_region_error(device):
     assert "division by zero" in exc_msg, "\n\nExpected 'division by zero' but got: \n\n" + exc_msg + "\n\n"
 
 
-def test_default_task_rejects_registers():
-    """Specifying registers on the default async_task is banned because the
-    default always receives leftover registers from the partition budget."""
-    with pytest.raises(AssertionError, match="Cannot specify registers"):
-        tlx.async_task("default", registers=128)
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
+def test_default_task_register_budget(device):
 
-    with pytest.raises(AssertionError, match="Cannot specify registers"):
-        tlx.async_task("default", num_regs=128)
+    @triton.jit
+    def register_budget_kernel(default_out, worker_out):
+        with tlx.async_tasks():
+            with tlx.async_task("default", num_regs=80):
+                tl.store(default_out, 1)
+            with tlx.async_task(num_warps=4, num_regs=24):
+                tl.store(worker_out, 2)
+
+    default_out = torch.empty((), device=device, dtype=torch.int32)
+    worker_out = torch.empty((), device=device, dtype=torch.int32)
+    kernel = register_budget_kernel[(1, )](default_out, worker_out, num_warps=4)
+
+    ttgir = kernel.asm["ttgir"]
+    assert "defaultRequestedRegisters = 80 : i32" in ttgir
+    assert default_out.item() == 1
+    assert worker_out.item() == 2
+
+
+@pytest.mark.parametrize("kwargs", [{"num_regs": 128}, {"registers": 128}])
+def test_default_task_accepts_registers(kwargs):
+    task = tlx.async_task("default", **kwargs)
+    assert task.num_regs == 128
 
 
 @pytest.mark.parametrize(
@@ -302,9 +319,13 @@ def test_default_task_rejects_registers():
         {"registers": 25},
     ],
 )
-def test_async_task_rejects_unaligned_registers(kwargs):
+@pytest.mark.parametrize("task_args", [(), ("default", )])
+def test_async_task_rejects_unaligned_registers(kwargs, task_args):
     with pytest.raises(ValueError, match="divisible by 8"):
-        tlx.async_task(num_warps=1, **kwargs)
+        if task_args:
+            tlx.async_task(*task_args, **kwargs)
+        else:
+            tlx.async_task(num_warps=1, **kwargs)
 
 
 @pytest.mark.parametrize(
@@ -332,8 +353,8 @@ def test_async_token_error(device):
             token = tlx.async_load(y_ptr + offsets, buffers[0])
         tlx.async_load_commit_group([token])
 
-    x = torch.tensor([128], dtype=torch.float32, device=device)
-    y = torch.tensor([128], dtype=torch.float32, device=device)
+    x = torch.full((128, ), 128, dtype=torch.float32, device=device)
+    y = torch.full((128, ), 128, dtype=torch.float32, device=device)
     grid = lambda meta: (1, )
     kernel = asycn_copy_kernel[grid](x, y, True)
     assert kernel.asm["ttgir"].count("ttg.async_copy_global_to_local") == 2
@@ -739,3 +760,62 @@ def test_store_ws(device):
 
     expected = torch.arange(n_elements, device=device, dtype=torch.float32)
     torch.testing.assert_close(output, expected)
+
+
+@pytest.mark.skipif(not is_blackwell(), reason="single_warp_specialize lowering targets Blackwell")
+def test_single_warp_specialize(device):
+    # A single warp_specialize op (captures the pointers/size): the `default`
+    # warp group computes x + y, one worker warp group computes a + b. Marking
+    # the async_tasks block `exclusive=True` makes the Fixup pass set the
+    # ttg.single-warp-specialize module attribute (after validating there is
+    # exactly one warp_specialize op), which makes the warp-specialize -> LLVM
+    # lowering dispatch worker warps from `wid` (no SMEM state id / switch table)
+    # and reclaim the state SMEM.
+    @triton.jit
+    def add2_ws_kernel(x_ptr, y_ptr, z_ptr, a_ptr, b_ptr, c_ptr, n_elements, BLOCK_SIZE: tl.constexpr,
+                       EXCLUSIVE: tl.constexpr):
+        pid = tl.program_id(axis=0)
+        block_start = pid * BLOCK_SIZE
+        with tlx.async_tasks(exclusive=EXCLUSIVE):
+            with tlx.async_task("default"):
+                offs = block_start + tl.arange(0, BLOCK_SIZE)
+                mask = offs < n_elements
+                tl.store(z_ptr + offs, tl.load(x_ptr + offs, mask=mask) + tl.load(y_ptr + offs, mask=mask), mask=mask)
+            with tlx.async_task(num_warps=4, num_regs=232):
+                offs = block_start + tl.arange(0, BLOCK_SIZE)
+                mask = offs < n_elements
+                tl.store(c_ptr + offs, tl.load(a_ptr + offs, mask=mask) + tl.load(b_ptr + offs, mask=mask), mask=mask)
+
+    def run(exclusive):
+        torch.manual_seed(0)
+        n = 98432
+        x, y, a, b = (torch.rand(n, device=device) for _ in range(4))
+        z, c = torch.empty_like(x), torch.empty_like(a)
+        grid = lambda meta: (triton.cdiv(n, meta["BLOCK_SIZE"]), )
+        compiled = add2_ws_kernel[grid](x, y, z, a, b, c, n, BLOCK_SIZE=1024, EXCLUSIVE=exclusive)
+        # Same result regardless of the dispatch strategy.
+        torch.testing.assert_close(z, x + y, check_dtype=False)
+        torch.testing.assert_close(c, a + b, check_dtype=False)
+        return compiled
+
+    single = run(exclusive=True)
+    multi = run(exclusive=False)
+
+    # The exclusive marker is propagated to the module attribute, and there is
+    # exactly one warp_specialize op (a precondition of the fast path).
+    assert '"ttg.single-warp-specialize" = true' in single.asm["ttgir"]
+    assert single.asm["ttgir"].count("ttg.warp_specialize(") == 1
+    assert "single-warp-specialize" not in multi.asm["ttgir"]
+
+    # The fast path dispatches worker warps from `wid`: no SMEM state-id switch
+    # table. The general path still lowers to a switch.
+    assert "switch" not in single.asm["llir"]
+    assert "switch" in multi.asm["llir"]
+
+    # The worker task requested 232 registers, so the lowering emits register
+    # (setmaxnreg) and barrier instructions in the PTX. The fast path drops the
+    # end-of-region register restoration and the state-id/switch barriers, so it
+    # emits strictly fewer of both than the general (multi-WS) lowering.
+    single_ptx, multi_ptx = single.asm["ptx"], multi.asm["ptx"]
+    assert single_ptx.count("setmaxnreg") < multi_ptx.count("setmaxnreg")
+    assert single_ptx.count("barrier.sync") < multi_ptx.count("barrier.sync")

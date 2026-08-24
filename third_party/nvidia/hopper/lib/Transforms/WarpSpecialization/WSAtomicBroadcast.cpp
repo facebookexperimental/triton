@@ -36,6 +36,8 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinAttributes.h"
+#include "mlir/Pass/Pass.h"
+#include "nvidia/hopper/include/Transforms/Passes.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/Partition.h"
@@ -149,7 +151,7 @@ static AsyncTaskId getOwnerPartition(scf::WhileOp whileOp,
 // the atomic once in the owner partition, splat its scalar result into a 1-CTA
 // SMEM slot, and read it back (+ tt.unsplat) in every partition, rewiring the
 // while's loop-carried tile id to the broadcast value. The producer→consumer
-// synchronization is left to `doCodePartitionPost`, which already turns a
+// synchronization is left to `doCodePartition`, which already turns a
 // cross-partition `local_store`→`local_load` into (N) SMEM channels with the
 // correct full/empty mbarriers and phase — i.e. the broadcast is expressed in
 // terms of an existing, tested AutoWS channel rather than a bespoke handshake.
@@ -283,7 +285,7 @@ static CLCWSCase classifyCLC(ttng::CLCReadOp readOp, scf::WhileOp &whileOut) {
 // Broadcast a scalar produced in `owner` to every partition through a
 // function-scope SMEM slot (splat -> local_store in owner; local_load ->
 // unsplat in all partitions). Mirrors the atomic case; the store/load edge
-// becomes SMEM channels in doCodePartitionPost. `b`'s insertion point must be
+// becomes SMEM channels in doCodePartition. `b`'s insertion point must be
 // after the scalar's producer.
 static Value broadcastScalarThroughSmem(triton::FuncOp funcOp,
                                         OpBuilderWithAsyncTaskIds &b,
@@ -396,7 +398,7 @@ static LogicalResult transformCLC(triton::FuncOp funcOp, ttng::CLCReadOp readOp,
 // (run once in the owner/producer partition + broadcast the loop-carried
 // result(s) to all partitions), or reject. Returns failure() to force a
 // graceful warp-specialization reject; the caller strips WS metadata via
-// removeWarpSpecializeAttr (which clears both partition ids and
+// removeWarpSpecMetadata (which clears both partition ids and
 // async_task_ids), leaving the kernel unspecialized-but-compilable — one source
 // of truth for the reject teardown shared with the other AutoWS bail-outs.
 LogicalResult doDynamicTileBroadcast(triton::FuncOp funcOp,
@@ -443,5 +445,29 @@ LogicalResult doDynamicTileBroadcast(triton::FuncOp funcOp,
   }
   return success();
 }
+
+#define GEN_PASS_DEF_NVGPUTESTWSATOMICBROADCAST
+#include "nvidia/hopper/include/Transforms/Passes.h.inc"
+
+// Test-only wrapper that runs `doDynamicTileBroadcast` in isolation so the
+// outer-`scf.while` broadcast path can be validated with lit, chained after
+// `nvgpu-partition-scheduling-meta` + `nvgpu-test-taskid-propagate`. Mirrors
+// `nvgpu-test-taskid-propagate`: a reject (unsupported atomic/CLC shape)
+// surfaces as a pass failure rather than performing the orchestrator's
+// WS-metadata teardown, which the full `nvgpu-warp-specialization` pass owns.
+class NVGPUTestWSAtomicBroadcastPass
+    : public impl::NVGPUTestWSAtomicBroadcastBase<
+          NVGPUTestWSAtomicBroadcastPass> {
+public:
+  using impl::NVGPUTestWSAtomicBroadcastBase<
+      NVGPUTestWSAtomicBroadcastPass>::NVGPUTestWSAtomicBroadcastBase;
+
+  void runOnOperation() override {
+    getOperation()->walk([&](triton::FuncOp funcOp) {
+      if (failed(doDynamicTileBroadcast(funcOp, tilePrefetchDepth)))
+        signalPassFailure();
+    });
+  }
+};
 
 } // namespace mlir

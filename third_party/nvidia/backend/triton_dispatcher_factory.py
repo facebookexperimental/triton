@@ -20,6 +20,18 @@ from triton.runtime.driver import driver
 _bridge_registered = False
 
 
+class _ProfileAllocator:
+    """Provide the C dispatcher with the Python launcher's profile-scratch fallback."""
+
+    def get(self):
+        if _allocation.has_profile_allocator():
+            return _allocation._profile_allocator.get()
+        return driver.active.allocate_default_profile_scratch
+
+
+_profile_allocator = _ProfileAllocator()
+
+
 def _load_module():
     """Return the cuda_utils module (contains _TritonDispatcher type)."""
     global _bridge_registered
@@ -61,9 +73,13 @@ def _expand_schema_arg_types(schema):
 
             if meta is None:
                 # Host-side path: base pointer + shape + strides + padding flag
+                # + round_f32_to_tf32 flag. Must mirror expand_signature()'s
+                # host TMA path (two i1 flags) and decompose_descriptor()'s
+                # arg layout: (arg.padding == "nan", arg.round_f32_to_tf32).
                 flat_types.append("*" + dtype)
                 for _ in range(2 * ndim):
                     flat_types.append("i64")
+                flat_types.append("i1")
                 flat_types.append("i1")
                 # Host-side also appends shapes (i32) + strides (i64) as explicit kernel args
                 for _ in range(ndim):
@@ -78,6 +94,19 @@ def _expand_schema_arg_types(schema):
                 for _ in range(ndim):
                     flat_types.append("i64")
         else:
+            # Structured (tuple / NamedTuple) arg types cannot be expressed by the
+            # C dispatcher's flat "one schema arg == one scalar leaf" model (see the
+            # flat_pos bookkeeping below and the a["index"] mapping in
+            # CompiledKernel._build_dispatcher). Their str(ty) is either a tuple
+            # literal ("('i32', 'constexpr')") or a NamedTuple class repr
+            # ("Function(fn='constexpr', captured=('*fp32',))") -- both contain "(",
+            # which scalar/pointer/tensordesc types never do. Rather than re-parse
+            # the repr (the same fragile repr blind spot that broke the launcher
+            # path), decline the C dispatcher by returning (None, None) so make_triton_dispatcher
+            # returns None and the caller falls back to the Python launcher, which
+            # flattens the object signature structurally.
+            if "(" in ty:
+                return None, None
             flat_types.append(ty)
 
     return flat_types, tensordesc_info if tensordesc_info else None
@@ -104,11 +133,14 @@ class _TensorDescDispatcherWrapper:
             if info is not None:
                 _, meta = info
                 assert meta is None, "TMA tensordesc should be handled in C, not Python wrapper"
-                # Host-side tensordesc: base ptr, shape, strides, padding, shape, strides
+                # Host-side tensordesc: base ptr, shape, strides, padding,
+                # round_f32_to_tf32, shape, strides — must mirror
+                # decompose_descriptor() in triton.backends.driver.
                 expanded.append(arg.base)
                 expanded.extend(arg.shape)
                 expanded.extend(arg.strides)
                 expanded.append(arg.padding == "nan")
+                expanded.append(arg.round_f32_to_tf32)
                 expanded.extend(arg.shape)
                 expanded.extend(arg.strides)
             else:
@@ -151,7 +183,7 @@ def make_triton_dispatcher(schema, cu_function: int):
                 _, ndim_td, meta_td = tensordesc_info[td_iter]
                 flat_pos_for_td.append(current_flat_pos)
                 if meta_td is None:
-                    current_flat_pos += 1 + 2 * ndim_td + 1 + ndim_td + ndim_td
+                    current_flat_pos += 1 + 2 * ndim_td + 2 + ndim_td + ndim_td
                 else:
                     current_flat_pos += 1 + ndim_td + ndim_td
                 td_iter += 1
@@ -195,6 +227,7 @@ def make_triton_dispatcher(schema, cu_function: int):
             tma_meta_list = None
 
     cluster_dims = schema.get("cluster_dims", [1, 1, 1])
+    preferred_cluster_dims = schema.get("preferred_cluster_dims", [0, 0, 0])
 
     c_dispatcher = mod._TritonDispatcher(
         function=cu_function,
@@ -212,11 +245,14 @@ def make_triton_dispatcher(schema, cu_function: int):
         profile_scratch_size=schema.get("profile_scratch_size", 0),
         profile_scratch_align=schema.get("profile_scratch_align", 1),
         allocator=_allocation._allocator,
-        profile_allocator=_allocation._profile_allocator,
+        profile_allocator=_profile_allocator,
         tma_meta=tma_meta_list,
         cluster_dim_x=int(cluster_dims[0]) if len(cluster_dims) > 0 else 1,
         cluster_dim_y=int(cluster_dims[1]) if len(cluster_dims) > 1 else 1,
         cluster_dim_z=int(cluster_dims[2]) if len(cluster_dims) > 2 else 1,
+        preferred_cluster_dim_x=int(preferred_cluster_dims[0]) if len(preferred_cluster_dims) > 0 else 0,
+        preferred_cluster_dim_y=int(preferred_cluster_dims[1]) if len(preferred_cluster_dims) > 1 else 0,
+        preferred_cluster_dim_z=int(preferred_cluster_dims[2]) if len(preferred_cluster_dims) > 2 else 0,
     )
 
     # If there are host-side tensordescs (no TMA meta) that still need Python expansion,

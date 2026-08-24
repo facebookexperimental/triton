@@ -152,20 +152,15 @@ Value createLeaderCTAPredicate(Location loc, OpBuilder &rewriter) {
 Value createTMAMulticastMask(Location loc, ConversionPatternRewriter &rewriter,
                              uint16_t broadcastBits) {
   int numCTAs = triton::gpu::lookupNumCTAs(rewriter);
-  int blockBits = llvm::Log2_32(numCTAs);
-  uint32_t fixedBits = (~broadcastBits) & (numCTAs - 1);
-  uint32_t pattern = 1;
-  for (int i = 0; i < blockBits; ++i) {
-    if ((fixedBits & (1u << i)) == 0)
-      pattern |= (pattern << (1u << i));
-  }
+  auto encoding =
+      triton::nvidia_gpu::getTMAMulticastMaskEncoding(numCTAs, broadcastBits);
   auto b = TritonLLVMOpBuilder(loc, rewriter);
   auto ctaId = nvgpu::ClusterCTAIdOp::create(rewriter, loc);
-  Value base = b.and_(ctaId, b.i32_val(fixedBits));
-  return b.shl(b.i32_val(pattern), base);
+  Value base = b.and_(ctaId, b.i32_val(encoding.fixedBits));
+  return b.shl(b.i32_val(encoding.pattern), base);
 }
 
-static uint32_t getCGABroadcastMask(mlir::triton::gpu::MemDescType barrierTy) {
+uint32_t getCGABroadcastMask(mlir::triton::gpu::MemDescType barrierTy) {
   auto kBlock = StringAttr::get(barrierTy.getContext(), "block");
   return toLinearLayout(barrierTy).getFreeVariableMasks().lookup(kBlock);
 }
@@ -227,8 +222,8 @@ LogicalResult lowerLdStMatrix(
   auto kReg = S("register");
   auto kLane = S("lane");
   auto kWarp = S("warp");
-  auto kBlock = S("block");
   auto kOffset = S("offset");
+  auto kBlock = S("block");
   auto kAddr = S("addr");
   auto smemPtrTy = ptr_ty(ctx, 3);
   auto bitwidth = getIntOrFloatOrPtrBitWidth(llvmElemTy);
@@ -237,9 +232,6 @@ LogicalResult lowerLdStMatrix(
   if ((!transpose && bitwidth > 32) ||
       (transpose && !(bitwidth == 16 ||
                       (bitwidth == 8 && targetInfo.supportLdStMatrixB8()))))
-    return failure();
-  // Inter block stmatrix is not supported
-  if (cvt.hasInDim(kBlock))
     return failure();
 
   // Map onto offsets (contiguous part) and addr (non-contiguous part)
@@ -377,10 +369,19 @@ LogicalResult lowerLdStMatrix(
       LinearLayout({{kLane, addrToOffset.getBases().lookup(kAddr)},
                     {kWarp, reps.getBases().lookup(kWarp)}},
                    {{kOffset, reps.getOutDimSize(kOffset)}}, false);
+
+  // Matrix accesses are CTA-local. Model that with a trivial block output so
+  // additive stride analysis always compares (offset, block) components.
+  reps =
+      reps.reshapeOuts({{kOffset, reps.getOutDimSize(kOffset)}, {kBlock, 1}});
+  addrLayout = addrLayout.reshapeOuts(reps.getOutDims());
   // Compute the bits that are moved by one instruction
   // Compute elements for which we can swap the xor by an add
-  auto [nAdditive, permStrides] =
-      actionAdditiveStrides(reps, addrLayout, maskSpanAffineOffset);
+  // Pass the full ldmatrix/stmatrix vector width because the shared helper
+  // classifies its low register bases as one indivisible instruction group.
+  auto [nAdditive, permStrides] = actionAdditiveStrides(
+      reps, addrLayout, maskSpanAffineOffset, /*maskSpanBlocks=*/0,
+      fullTileVec.getInDimSize(kReg));
   reps = permStrides.apply(reps);
   if (isStore) {
     vals = permStrides.apply(vals);

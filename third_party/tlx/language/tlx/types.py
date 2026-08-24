@@ -136,10 +136,11 @@ class swizzled_layout:
     """
 
     def __init__(self, bits, base=0, shift=0, order=None):
-        self.bits = bits  # B
-        self.base = base  # M
-        self.shift = shift  # S
-        self.order = list(order) if order is not None else None
+        self.bits = int(tl._unwrap_if_constexpr(bits))  # B
+        self.base = int(tl._unwrap_if_constexpr(base))  # M
+        self.shift = int(tl._unwrap_if_constexpr(shift))  # S
+        order = tl._unwrap_if_constexpr(order)
+        self.order = ([int(tl._unwrap_if_constexpr(dim)) for dim in order] if order is not None else None)
 
     @classmethod
     def make_default(cls, rank):
@@ -210,7 +211,8 @@ class padded_shared_layout_encoding(shared_layout_encoding):
     ``padded_shared<[interval_0:+pad_0, ...] {order = ..., shape = ...}>``.
     """
 
-    def __init__(self, intervals, paddings, order, shape, numCTAsPerCGA, numCTASplit, numCTAOrder):
+    def __init__(self, intervals, paddings, order, shape, numCTAsPerCGA, numCTASplit, numCTAOrder, offset_bases=None,
+                 block_bases=None):
         super().__init__()
         assert len(intervals) == len(paddings), \
             "intervals and paddings must have the same length"
@@ -221,6 +223,44 @@ class padded_shared_layout_encoding(shared_layout_encoding):
         self.numCTAsPerCGA = list(numCTAsPerCGA)
         self.numCTASplit = list(numCTASplit)
         self.numCTAOrder = list(numCTAOrder)
+        # When set, the layout is built from an explicit linear component
+        # (offset/block bases) instead of the identity {order, shape} form.
+        self.offset_bases = None if offset_bases is None else [list(b) for b in offset_bases]
+        self.block_bases = None if block_bases is None else [list(b) for b in block_bases]
+
+    @staticmethod
+    @constexpr_function
+    def with_bases(interval_padding_pairs, offset_bases, shape, block_bases=None):
+        """Build a padded_shared encoding with an explicit linear component.
+
+        Mirrors ``#ttg.padded_shared<[i:+p, ...] {offset = [...], block = [...]}>``.
+        ``offset_bases`` is a list of per-dim base vectors (one per offset bit),
+        e.g. ``[[0, 1], [0, 2], ..., [16, 0], [1, 0], ...]`` — this lets you pin
+        a swizzled (row/col-permuted) shared layout rather than the identity one.
+        """
+        rank = len(shape)
+        assert rank > 0, "shape must be non-empty"
+        assert len(offset_bases) > 0, "offset_bases must be non-empty"
+        for b in offset_bases:
+            assert len(b) == rank, \
+                f"each offset base vector must have length rank={rank}, got {len(b)}: {b}"
+        for b in (block_bases or []):
+            assert len(b) == rank, \
+                f"each block base vector must have length rank={rank}, got {len(b)}: {b}"
+        intervals = [int(p[0]) for p in interval_padding_pairs]
+        paddings = [int(p[1]) for p in interval_padding_pairs]
+        enc = padded_shared_layout_encoding(
+            intervals=intervals,
+            paddings=paddings,
+            order=list(reversed(range(rank))),
+            shape=list(shape),
+            numCTAsPerCGA=[1] * rank,
+            numCTASplit=[1] * rank,
+            numCTAOrder=list(range(rank)),
+            offset_bases=[[int(x) for x in b] for b in offset_bases],
+            block_bases=[[int(x) for x in b] for b in (block_bases or [])],
+        )
+        return enc
 
     @staticmethod
     @constexpr_function
@@ -254,6 +294,14 @@ class padded_shared_layout_encoding(shared_layout_encoding):
         )
 
     def to_ir(self, builder: ir.builder) -> None:
+        if self.offset_bases is not None:
+            return builder.make_padded_shared_encoding_attr_with_bases(
+                self.intervals,
+                self.paddings,
+                self.offset_bases,
+                self.block_bases if self.block_bases is not None else [],
+                len(self.shape),
+            )
         return builder.make_padded_shared_encoding_attr(
             self.intervals,
             self.paddings,
@@ -263,6 +311,89 @@ class padded_shared_layout_encoding(shared_layout_encoding):
             self.numCTASplit,
             self.numCTAOrder,
         )
+
+
+class shared_linear_layout_encoding(shared_layout_encoding):
+    """Explicit linear shared-memory mapping used by Gluon K-tile paths.
+
+    Unlike :class:`padded_shared_layout_encoding`, this encoding has no
+    implicit interval padding.  Each offset basis maps one shared-memory bit
+    to a tensor dimension, which lets CDNA4 transpose reads consume a physical
+    row-major 16x16 tile image without an intermediate register permutation.
+    """
+
+    def __init__(self, offset_bases, block_bases=None, alignment=16):
+        super().__init__()
+        self.offset_bases = [list(map(int, basis)) for basis in offset_bases]
+        self.block_bases = [list(map(int, basis)) for basis in (block_bases or [])]
+        self.alignment = int(alignment)
+        assert self.offset_bases and len(self.offset_bases[0]) > 0
+        rank = len(self.offset_bases[0])
+        assert all(len(basis) == rank for basis in self.offset_bases)
+        assert all(len(basis) == rank for basis in self.block_bases)
+        assert self.alignment > 0 and (self.alignment & (self.alignment - 1)) == 0
+
+    def make_permute(self, dims):
+        # SharedLinear is used as a physical image; preserve the bit bases and
+        # let the consumer's memdesc_trans describe the logical permutation.
+        del dims
+        return self
+
+    def to_ir(self, builder: ir.builder) -> None:
+        return builder.make_shared_linear_encoding_attr(self.offset_bases, self.block_bases, self.alignment)
+
+
+class amd_mfma_layout(layout_encoding):
+    """gfx950 MFMA distributed layout for explicit shared-load consumers."""
+
+    def __init__(self, version, instr_shape, transposed, warps_per_cta, element_bitwidth=32, tiles_per_warp=None,
+                 cga_layout=None):
+        super().__init__()
+        self.version = int(version)
+        self.instr_shape = list(map(int, instr_shape))
+        self.transposed = bool(transposed)
+        self.warps_per_cta = list(map(int, warps_per_cta))
+        self.element_bitwidth = int(element_bitwidth)
+        # Gluon's AMDMFMALayout uses one tile factor for each warp-layout axis
+        # (M, N).  The instruction shape also has a K dimension, but that
+        # dimension is not a tiles-per-warp axis and must not be synthesized in
+        # the default or validation length.
+        warp_rank = len(self.warps_per_cta)
+        self.tiles_per_warp = list(map(int, tiles_per_warp or [1] * warp_rank))
+        self.cga_layout = [list(map(int, basis)) for basis in (cga_layout or [])]
+        assert 1 <= self.version <= 4
+        assert len(self.instr_shape) == 3
+        assert self.instr_shape[:2] in ([32, 32], [16, 16], [64, 4], [4, 64])
+        assert self.element_bitwidth in (32, 64)
+        assert len(self.tiles_per_warp) == warp_rank
+        assert all(len(basis) == len(self.warps_per_cta) for basis in self.cga_layout)
+
+    def to_ir(self, builder: ir.builder, shape=None, element_type=None) -> None:
+        del shape, element_type
+        return builder.make_amd_mfma_encoding_attr(self.version, self.warps_per_cta, self.instr_shape, self.transposed,
+                                                   self.cga_layout, self.tiles_per_warp, self.element_bitwidth)
+
+
+class dot_operand_layout(layout_encoding):
+    """Explicit MFMA dot-operand view for a shared-memory local load."""
+
+    def __init__(self, operand_index, parent, k_width=8):
+        super().__init__()
+        self.operand_index = int(operand_index)
+        # Layout constructors are commonly nested inside a Triton JIT body,
+        # where an annotated ``tl.constexpr`` argument is wrapped once more by
+        # the frontend. Unwrap it here so ``to_ir`` sees the actual MFMA
+        # encoding rather than a constexpr shell.
+        self.parent = tl._unwrap_if_constexpr(parent)
+        self.k_width = int(k_width)
+        assert self.operand_index in (0, 1)
+        assert self.k_width > 0
+
+    def to_ir(self, builder: ir.builder, shape=None, element_type=None) -> None:
+        del shape
+        parent = self.parent.to_ir(builder)
+        del element_type
+        return builder.make_dot_operand_encoding_attr_with_type(self.operand_index, parent, self.k_width)
 
 
 class TMemCTAMode:
@@ -483,8 +614,9 @@ class layout(layout_encoding):
     matching tuple of **flat, row-major offsets** into the tile. The author only
     speaks shape/stride; the compiler decomposes each mode `(2^k, s)` into bits
     `s, 2s, ..., 2^(k-1)s`, splits the thread bits into lane (the low
-    `log2(threads_per_warp)`) and warp (the rest), maps the value bits to
-    registers, and builds the corresponding `#linear` encoding to propagate.
+    `log2(threads_per_warp)`) and warp (the rest), and maps the value bits to
+    registers. Permutation layouts resolve to ``#ttg.linear``; layouts with
+    swizzled warp bases resolve to ``#ttg.generic_linear``.
 
     Example (separable QK layout, tile [N=128, M=128], row-major flat offset
     = ``n * 128 + m``):
@@ -1117,10 +1249,20 @@ class buffered_tensor_type(tl.block_type):
         shape = self.shape
         if self.num >= 1:
             shape = [self.num] + list(shape)
+        layout_handle = self.layout.to_ir(builder)
+        # An explicit, user-pinned shared layout (tlx.local_alloc(layout=...)) is
+        # wrapped as #tlx.user_layout<...> so layout propagation respects it. The
+        # pin is marked on the layout object by local_alloc; wrap here so the same
+        # wrapper appears wherever this type is reconstructed -- e.g. a @triton.jit
+        # callee's param rebuilt from this type, or a subview's result -- keeping
+        # tt.call operand/param and memdesc subview encodings consistent. The
+        # wrapper is stripped later by tlx-resolve-placeholder-layouts.
+        if getattr(self.layout, "_tlx_user_pinned", False):
+            layout_handle = builder.make_user_layout_attr(layout_handle)
         return builder.get_memdesc_type(
             shape,
             self.element_ty.to_ir(builder),
-            self.layout.to_ir(builder),
+            layout_handle,
             self.storage.value,
         )
 
@@ -1215,11 +1357,21 @@ class clc_response_type(buffered_tensor_type):
     # both of which are opaque objects with fixed size
 
     def __init__(self, num: int, layout: Optional[swizzled_shared_layout_encoding]):
+        # A CLC response is a 16-byte opaque hardware object, i.e. one `ui128`
+        # per stage. Triton has no 128-bit `tl.dtype`, so the base class is
+        # given `tl.int64` as a placeholder and `to_ir` below builds the real
+        # element type through the builder instead of from `self.element_ty`.
         super().__init__(tl.int64, [1], num, storage_kind.smem, layout)
 
     def _unflatten_ir(self, handles: List[ir.value], cursor: int) -> Tuple[clc_response, int]:
         value = clc_response(handles[cursor], self.num, self.layout)
         return value, cursor + 1
+
+    def mangle(self) -> str:
+        # Distinct from buffered_tensor_type/mbarrier_type, whose mangles are
+        # derived from the (placeholder) int64 element type and would otherwise
+        # collide with this one for the same shape.
+        return f"clc_response_{self.num}"
 
     def to_ir(self, builder: ir.builder) -> None:
         if self.num >= 1:
@@ -1228,7 +1380,13 @@ class clc_response_type(buffered_tensor_type):
             shape = self.shape
         return builder.get_memdesc_type(
             shape,
-            self.element_ty.to_ir(builder),
+            # NOT self.element_ty: the allocation created by
+            # create_alloc_clc_responses uses `ui128`. Using the placeholder
+            # int64 here builds a different memdesc type whenever this type is
+            # reconstructed -- notably for a @triton.jit callee's parameter when
+            # a CLC context crosses a tt.call -- which fails TTIR verification
+            # with a `tt.call` operand type mismatch.
+            builder.get_clc_response_element_ty(),
             self.layout.to_ir(builder),
             self.storage.value,
         )

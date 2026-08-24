@@ -13,6 +13,7 @@
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 
 #include "tlx/dialect/include/IR/Dialect.h.inc"
+#include "tlx/dialect/include/IR/TLXLayoutInterface.h.inc"
 #include "tlx/dialect/include/IR/Traits.h"
 #define GET_ATTRDEF_CLASSES
 #include "tlx/dialect/include/IR/TLXAttrDefs.h.inc"
@@ -35,6 +36,7 @@ constexpr static char AttrClusterSyncKernelInitName[] =
     "tlx.cluster_sync_kernel_init";
 constexpr static char AttrClusterSyncKernelCleanupName[] =
     "tlx.cluster_sync_kernel_cleanup";
+constexpr static char AttrUserPostWsSyncName[] = "tlx.user_post_ws_sync";
 
 bool tlxEnablePairedMMA(Operation *op);
 
@@ -42,11 +44,35 @@ Attribute wrapNoVerifyLayout(Attribute layout);
 Attribute unwrapNoVerifyLayout(Attribute layout);
 bool hasNoVerifyLayout(Attribute layout);
 
+// Peel any TLX layout wrappers (attributes implementing TLXLayoutAttrInterface,
+// e.g. #tlx.no_verify_layout / #tlx.user_layout) to a fixed point and return
+// the concrete, non-wrapper encoding (or the argument unchanged if it is not a
+// wrapper). Use this wherever a TLX-produced encoding must be compared or
+// isa<>-tested against a concrete layout.
+Attribute getEffectiveEncoding(Attribute enc);
+
+// True iff `enc` is a TLX layout wrapper (implements TLXLayoutAttrInterface).
+bool isTLXLayoutWrapper(Attribute enc);
+
+// Wrap a concrete layout (distributed or shared) as a user-pinned layout (no-op
+// if the layout is already wrapped or is not a distributed/shared encoding).
+// Unwrap returns the inner layout, or the argument unchanged if it is not a
+// UserLayoutAttr.
+Attribute wrapUserLayout(Attribute layout);
+Attribute unwrapUserLayout(Attribute layout);
+
 bool hasClusterSyncKernelInit(Operation *op);
 void setClusterSyncKernelInitOnMod(Operation *op, bool value);
 
 bool hasClusterSyncKernelCleanup(Operation *op);
 void setClusterSyncKernelCleanupOnMod(Operation *op, bool value);
+
+// `tlx.user_post_ws_sync`: the user provides the post-warp-specialize sync, so
+// the compiler should skip the auto cluster arrive/wait before TMEM dealloc.
+// Propagated from `tlx.async_tasks(no_ending_cluster_sync=True)` in the Fixup
+// pass.
+bool hasUserPostWsSync(Operation *op);
+void setUserPostWsSyncOnMod(Operation *op, bool value);
 
 // Returns true if the kernel uses clusters (clusterDims product > 1).
 // Subsumes tlxEnablePairedMMA: paired CTA MMA always implies clustering.

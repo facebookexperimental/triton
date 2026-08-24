@@ -31,6 +31,11 @@ flash_attention:
 blackwell_attentions_mxfp8:
   devices:
     - b200
+  # Inherits the parent op's input shapes (input-0 is N_CTX=128), which triggers
+  # the same AutoWS compiler crash and cross-tile race on the persistent
+  # Blackwell FA path (single-trip inner loop). Run seq>=256 in CI until that is
+  # fixed. See T279315890.
+  extra_args: --seq-len 256
 blackwell_attentions:
   devices:
     - b200
@@ -38,6 +43,12 @@ blackwell_attentions:
   # cross-tile race on the persistent Blackwell FA path (single-trip inner
   # loop). Run seq>=256 in CI until that is fixed. See T279315890.
   extra_args: --seq-len 256
+hstu_cross_attention_bwd:
+  devices:
+    - b200
+  # Blackwell reduce_dq backward op (autoWS / TLX 2-KV variants). The default
+  # kv-len sweep (256/384/512/1024) is heavy for CI; pin a single shape.
+  extra_args: --seq-len-kv 256
 nvfp4_gemm:
   devices:
     - b200
@@ -47,11 +58,13 @@ fp32_to_mx4:
 mx4_to_fp32:
   devices:
     - cuda
-# NVGPUWarpSpecialization pass crashes on hstu_attn_fwd kernel
+# cuda covers all NVIDIA (keeps existing coverage); the literal b200 entry is
+# required for the b200-only CI filter. This exercises hstu_tlx plus the
+# default, manual-DP, and DQ-reduce AutoWS self-attention backends on b200.
 ragged_attention:
-  report: true
-  disabled_devices:
+  devices:
     - cuda
+    - b200
 # rms_norm subprocess segfaults on hip (exit code 11)
 rms_norm:
   report: true

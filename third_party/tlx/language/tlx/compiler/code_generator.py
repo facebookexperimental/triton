@@ -160,6 +160,23 @@ def _validate_warp_group_start_ids(
 @tlx_enter_sub_region()
 def visit_withAsyncTasks(self, node):
     from triton.compiler.code_generator import enter_sub_region, _is_list_like, _is_constexpr
+    from triton.language.core import _unwrap_if_constexpr
+
+    # Mark the warp_specialize op so the Fixup pass can propagate async-task
+    # policy to module attributes consumed by later lowering passes.
+    ws_context = node.items[0].context_expr
+    exclusive = False
+    no_ending_cluster_sync = False
+    mbarrier_try_wait_suspend_ns = None
+    for kw in getattr(ws_context, "keywords", []):
+        if kw.arg == "exclusive":
+            exclusive = bool(_unwrap_if_constexpr(self.visit(kw.value)))
+        elif kw.arg == "no_ending_cluster_sync":
+            no_ending_cluster_sync = bool(_unwrap_if_constexpr(self.visit(kw.value)))
+        elif kw.arg == "mbarrier_try_wait_suspend_ns":
+            mbarrier_try_wait_suspend_ns = _unwrap_if_constexpr(self.visit(kw.value))
+            if not isinstance(mbarrier_try_wait_suspend_ns, int) or mbarrier_try_wait_suspend_ns < 0:
+                raise ValueError("mbarrier_try_wait_suspend_ns must be a non-negative integer")
 
     with enter_sub_region(self) as sr:
         liveins, _ = sr
@@ -216,12 +233,14 @@ def visit_withAsyncTasks(self, node):
             region_replica_id_stack.append(-1)  # dummy placeholder
 
             num_default = 0
+            default_num_regs = None
             for stmt in stmts:
                 task = _get_async_task(self, stmt)
                 assert task.is_explict
                 assert task.replicate is not None, "Replicate must be non-None task"
                 if task.is_default:
                     num_default += 1
+                    default_num_regs = task.num_regs
                     if task.replicate > 1:
                         task_replicas.append(task.replicate - 1)
                         task_num_warps.extend([self.builder.options.num_warps] * (task.replicate - 1))
@@ -268,9 +287,19 @@ def visit_withAsyncTasks(self, node):
         ws_op = self.builder.create_warp_specialize_op(
             task_num_warps,
             task_num_regs if task_num_regs else None,
+            default_num_regs if default_num_regs else None,
             sum(task_replicas),
             task_warp_group_start_ids if task_warp_group_start_ids else None,
         )
+        if exclusive:
+            ws_op.set_attr("tlx.exclusive", self.builder.get_unit_attr())
+        if no_ending_cluster_sync:
+            ws_op.set_attr("tlx.no_ending_cluster_sync", self.builder.get_unit_attr())
+        if mbarrier_try_wait_suspend_ns is not None:
+            ws_op.set_attr(
+                "tlx.mbarrier_try_wait_suspend_ns",
+                self.builder.get_int32_attr(mbarrier_try_wait_suspend_ns),
+            )
 
         # dry visit async task body to calculate captures
         index = 0

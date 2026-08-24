@@ -54,19 +54,26 @@ from pyptx.parser.parser import ParseError
 
 from bitequiv.ptx.affine import reqntid_of
 from bitequiv.ptx.builder import entry_signatures
+from bitequiv.ptx.forward.loops import back_edges, innermost_loop, instrs_and_labels, loop_accumulates
 from bitequiv.ptx.linker import linearize
 
 
 def _loop_steps(func):
-    """Sorted multiset of loop-induction SELF-INCREMENT constants: every ``add R, R, IMM``
-    where dst==src0 is a loop counter stepped by a compile-time constant (for a chunked
-    reduction this is exactly BLOCK_N — the cross-chunk column stride). This is a LAYOUT-/
-    num_warps-INVARIANT, BLOCK_N-FAITHFUL fence: the reconstruction cannot follow the loop
-    back-edge, so a collapsed per-chunk reduction loses the chunk SIZE; folding the loop step
-    into the entry signature restores it. Adding it can only SPLIT classes further (it is extra
-    distinguishing info), so it is monotonically sound — it never causes an over-merge."""
+    """Sorted multiset of loop-induction SELF-INCREMENT constants (``add R, R, IMM``, dst==src0),
+    but ONLY for loops that carry a floating-point ACCUMULATION. A self-increment inside an
+    output-tiling / parallelization loop (no loop-carried fp total in its own body) is bit-free and
+    dropped — so the fence stops over-splitting on BLOCK_M / num_warps — while the reduction chunk
+    step (BLOCK_N for a chunked reduction, BLOCK_K for a GEMM K-loop) is kept.
+
+    Sound / monotone: a step is DROPPED only when its self-increment sits inside a DETECTED loop
+    that provably does not accumulate. If no loop is recovered around a self-increment (loops
+    unrolled, or structure not recovered), the step is KEPT — so this can only reduce over-split,
+    never introduce an over-merge (dropping a bit-relevant chunk step)."""
+    insts, label_at = instrs_and_labels(func)
+    loops = back_edges(insts, label_at)
+    accumulates = {lp: loop_accumulates(insts, lp, loops) for lp in set(loops)}
     steps = []
-    for inst in linearize(func):
+    for i, inst in enumerate(insts):
         if inst.opcode == "add" and len(inst.operands) == 3:
             d, a, b = inst.operands
             if (isinstance(d, RegisterOperand) and isinstance(a, RegisterOperand) and d.name == a.name
@@ -75,8 +82,12 @@ def _loop_steps(func):
                     v = int(b.text, 0)
                 except (ValueError, TypeError):
                     continue
-                if v != 0:
-                    steps.append(v)
+                if v == 0:
+                    continue
+                lp = innermost_loop(i, loops)
+                if lp is not None and not accumulates[lp]:
+                    continue  # self-increment in a non-accumulating (tiling / parallel) loop -> drop
+                steps.append(v)
     return tuple(sorted(steps))
 
 
@@ -89,7 +100,14 @@ _MMA_OPCODES = frozenset({"wgmma", "mma", "wmma", "tcgen05"})
 # bare-entry fragments (unit-test snippets) do not, so synthesize a minimal header when
 # absent. The synthetic version/target only label the module; they do not affect the
 # extracted reduction tree.
-_SYNTH_HEADER = ".version 8.5\n.target sm_90a\n.address_size 64\n"
+def ptx_header(target="sm_90a", version="8.5", address_size=64):
+    """A minimal pyptx-parseable module header. Parameterized so a target / PTX-ISA-version upgrade is a
+    one-line change here rather than a hardcoded string duplicated across call sites and the unit tests
+    (reviewer nit, D112765110)."""
+    return f".version {version}\n.target {target}\n.address_size {address_size}\n"
+
+
+_SYNTH_HEADER = ptx_header()
 
 
 class _Unparseable:

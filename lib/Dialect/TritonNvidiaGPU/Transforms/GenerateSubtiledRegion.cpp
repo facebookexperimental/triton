@@ -1,4 +1,6 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
+// META_WS_ONLY
+#include "lib/Dialect/TritonGPU/Transforms/WarpSpecialization/PartitionAttrs.h"
 #include "mlir/IR/IRMapping.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
@@ -22,6 +24,18 @@ static SmallVector<int32_t> getOpAsyncTaskIds(Operation *op) {
     return SmallVector<int32_t>(attr.asArrayRef());
   if (auto attr = op->getAttrOfType<DenseI32ArrayAttr>(gpu::kPartitionAttrName))
     return SmallVector<int32_t>(attr.asArrayRef());
+  return {};
+}
+
+static bool isTMAStoreLike(Operation *op) {
+  return isa<AsyncTMACopyLocalToGlobalOp, AsyncTMAReduceOp>(op);
+}
+
+static Value getTMAStoreSrc(Operation *op) {
+  if (auto copy = dyn_cast<AsyncTMACopyLocalToGlobalOp>(op))
+    return copy.getSrc();
+  if (auto reduce = dyn_cast<AsyncTMAReduceOp>(op))
+    return reduce.getSrc();
   return {};
 }
 
@@ -483,36 +497,35 @@ collectPerTileChain(Value splitResult, Operation *splitOp, Block *block,
       for (Value result : user->getResults())
         worklist.push_back(result);
 
-      // Keep a SAME-TASK async TMA-store consumer in this per-tile chain.
+      // Keep a SAME-TASK async TMA-store/reduce consumer in this per-tile
+      // chain.
       // local_store has no SSA result, so the forward walk would otherwise stop
-      // at the store and the downstream async_tma_copy_local_to_global (which
-      // reads the staging SMEM buffer, not an SSA value) would be wrapped in a
-      // *separate* subtiled region. For separate_epilogue_store=False the store
-      // and copy share task 0 and run on one warp group; splitting them emits
-      // all stores then all copies, so the per-tile async_tma_store_token_wait
-      // can no longer drain a staging slot before a later subtile reuses it
-      // (a silent race when numTiles > buffer.copy). Pulling the copy into the
-      // same chain keeps the lowered body interleaved (store_t -> copy_t ->
-      // token_wait) so the TMA wait serializes slot reuse. Cross-task copies
-      // (separate_epilogue_store=True) are a different async task and are left
-      // for the concurrent separate-region path below.
+      // at the store and a downstream async_tma_copy_local_to_global or
+      // async_tma_reduce (which reads the staging SMEM buffer, not an SSA
+      // value) would be wrapped in a *separate* subtiled region. For
+      // separate_epilogue_store=False the producer and TMA op share one warp
+      // group; splitting them emits all local stores before all TMA launches,
+      // so the per-tile token wait cannot protect staging-slot reuse. Pulling
+      // the TMA op into the same chain keeps the lowered body interleaved
+      // (store_t -> TMA_t -> token_wait). Cross-task TMA ops are left for the
+      // concurrent separate-region path below.
       if (auto store = dyn_cast<gpu::LocalStoreOp>(user)) {
         for (Operation *bufUser : store.getDst().getUsers()) {
           if (bufUser->getBlock() != block || bufUser == store)
             continue;
-          auto cp = dyn_cast<AsyncTMACopyLocalToGlobalOp>(bufUser);
-          if (!cp || getOpAsyncTaskIds(cp) != getOpAsyncTaskIds(store))
+          if (!isTMAStoreLike(bufUser) ||
+              getOpAsyncTaskIds(bufUser) != getOpAsyncTaskIds(store))
             continue;
-          if (cp->isBeforeInBlock(splitOp) || cp == splitOp)
+          if (bufUser->isBeforeInBlock(splitOp) || bufUser == splitOp)
             continue;
-          if (excludeOps.contains(cp) || isa<SubtiledRegionOp>(cp))
+          if (excludeOps.contains(bufUser) || isa<SubtiledRegionOp>(bufUser))
             continue;
-          if (!visited.insert(cp).second)
+          if (!visited.insert(bufUser).second)
             continue;
-          chain.push_back(cp);
-          // Pushing the copy's token result pulls its
+          chain.push_back(bufUser);
+          // Pushing the TMA op's token result pulls its
           // async_tma_store_token_wait into the chain via the normal walk.
-          for (Value r : cp->getResults())
+          for (Value r : bufUser->getResults())
             worklist.push_back(r);
         }
       }
@@ -1054,10 +1067,10 @@ static bool hasNonContiguousTaskIds(ArrayRef<ChainSegment> segments) {
 
 } // anonymous namespace
 
-void tryGenerateForSplit(triton::SplitOp splitOp) {
+bool tryGenerateForSplit(triton::SplitOp splitOp) {
   auto tmemLoad = traceSetupChain(splitOp);
   if (!tmemLoad)
-    return;
+    return false;
 
   Block *block = splitOp->getBlock();
 
@@ -1077,13 +1090,13 @@ void tryGenerateForSplit(triton::SplitOp splitOp) {
   for (Value leaf : leafValues) {
     auto chain = collectPerTileChain(leaf, lastSetupOp, block, excludeOps);
     if (chain.empty())
-      return;
+      return false;
     chains.push_back(std::move(chain));
   }
 
   auto equiv = checkStructuralEquivalenceN(chains);
   if (!equiv)
-    return;
+    return false;
 
   // If collectPerTileChain pulled a same-task async TMA-store consumer into the
   // per-tile chains, the producer store and consumer copy are emitted as ONE
@@ -1092,7 +1105,7 @@ void tryGenerateForSplit(triton::SplitOp splitOp) {
   bool tmaInterleaved = false;
   for (auto &chain : chains) {
     for (Operation *op : chain)
-      if (isa<AsyncTMACopyLocalToGlobalOp>(op)) {
+      if (isTMAStoreLike(op)) {
         tmaInterleaved = true;
         break;
       }
@@ -1100,11 +1113,24 @@ void tryGenerateForSplit(triton::SplitOp splitOp) {
       break;
   }
 
-  // Collect setup ops: tmemLoad → root split + inner setup ops.
+  // Collect only the setup dependency chain from this root split back to its
+  // TMEM load. TMEM loads for several epilogues are commonly hoisted together
+  // (for example dV followed by dK), so collecting every operation in the
+  // block interval would absorb an already-created sibling SubtiledRegionOp
+  // and erase it while processing the later split.
   SmallVector<Operation *> setupOps;
-  for (auto it = Block::iterator(tmemLoad); it != Block::iterator(splitOp);
-       ++it)
-    setupOps.push_back(&*it);
+  Value setupValue = splitOp.getSrc();
+  while (Operation *def = setupValue.getDefiningOp()) {
+    setupOps.push_back(def);
+    if (def == tmemLoad.getOperation())
+      break;
+    if (def->getNumOperands() != 1)
+      return false;
+    setupValue = def->getOperand(0);
+  }
+  if (setupOps.empty() || setupOps.back() != tmemLoad.getOperation())
+    return false;
+  std::reverse(setupOps.begin(), setupOps.end());
   setupOps.push_back(splitOp);
   llvm::sort(innerSetupOps,
              [](Operation *a, Operation *b) { return a->isBeforeInBlock(b); });
@@ -1126,7 +1152,7 @@ void tryGenerateForSplit(triton::SplitOp splitOp) {
   } else {
     auto segments = groupByContiguousTaskSet(chains, *equiv);
     if (!segments || segments->empty())
-      return;
+      return false;
 
     if (segments->size() == 1) {
       buildSingleSubtiledRegionN(builder, loc, setupOps, leafValues, chains,
@@ -1231,7 +1257,7 @@ void tryGenerateForSplit(triton::SplitOp splitOp) {
   }
 
   if (!built)
-    return;
+    return false;
 
   // Same-task TMA copies were interleaved into the producer region above; only
   // cross-task (separate_epilogue_store=True) copies take the separate
@@ -1286,13 +1312,13 @@ void tryGenerateForSplit(triton::SplitOp splitOp) {
           producerTaskIds = getOpAsyncTaskIds(op);
           break;
         }
-      auto tmaCopy0 =
-          dyn_cast<AsyncTMACopyLocalToGlobalOp>(tmaChains[0].front());
-      SmallVector<int32_t> tmaTaskIds =
-          tmaCopy0 ? getOpAsyncTaskIds(tmaCopy0) : SmallVector<int32_t>{};
+      Operation *tmaStore0 = tmaChains[0].front();
+      SmallVector<int32_t> tmaTaskIds = isTMAStoreLike(tmaStore0)
+                                            ? getOpAsyncTaskIds(tmaStore0)
+                                            : SmallVector<int32_t>{};
       int64_t copies = 0;
-      if (tmaCopy0)
-        if (Operation *alloc = tmaCopy0.getSrc().getDefiningOp())
+      if (Value src = getTMAStoreSrc(tmaStore0))
+        if (Operation *alloc = src.getDefiningOp())
           if (auto attr = alloc->getAttrOfType<IntegerAttr>("buffer.copy"))
             copies = attr.getInt();
       assert(
@@ -1318,10 +1344,7 @@ void tryGenerateForSplit(triton::SplitOp splitOp) {
         for (unsigned t = 0; t < numTiles; ++t) {
           // Find the SMEM buffer from the first op in the TMA chain
           // (async_tma_copy_local_to_global's last operand is the SMEM src).
-          auto tmaCopy =
-              dyn_cast<AsyncTMACopyLocalToGlobalOp>(tmaChains[t].front());
-          if (tmaCopy)
-            smemLeaves[t] = tmaCopy.getSrc();
+          smemLeaves[t] = getTMAStoreSrc(tmaChains[t].front());
         }
 
         if (smemLeaves[0]) {
@@ -1352,6 +1375,7 @@ void tryGenerateForSplit(triton::SplitOp splitOp) {
     if (op->use_empty())
       op->erase();
   }
+  return true;
 }
 
 namespace {
@@ -1405,12 +1429,7 @@ public:
         auto tmemLoad = traceSetupChain(splitOp);
         if (!tmemLoad)
           continue;
-        unsigned opCountBefore = 0;
-        getOperation().walk([&](Operation *) { opCountBefore++; });
-        tryGenerateForSplit(splitOp);
-        unsigned opCountAfter = 0;
-        getOperation().walk([&](Operation *) { opCountAfter++; });
-        if (opCountBefore != opCountAfter) {
+        if (tryGenerateForSplit(splitOp)) {
           changed = true;
         } else {
           failedSplits.insert(splitOp);

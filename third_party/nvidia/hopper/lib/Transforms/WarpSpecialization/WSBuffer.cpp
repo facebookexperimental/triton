@@ -40,9 +40,10 @@ namespace mlir {
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
 #define LDBG(X) LLVM_DEBUG(DBGS() << X << "\n")
 
-static bool
-enclosingAChannel(Operation *ctrlOp,
-                  const DenseSet<Operation *> &regionsWithChannels) {
+namespace {
+
+bool enclosingAChannel(Operation *ctrlOp,
+                       const DenseSet<Operation *> &regionsWithChannels) {
   for (auto *op : regionsWithChannels) {
     if (ctrlOp == op)
       return true;
@@ -54,16 +55,6 @@ enclosingAChannel(Operation *ctrlOp,
         return true;
   }
   return false;
-}
-
-unsigned getLoopDepth(Operation *op) {
-  unsigned depth = 0;
-  auto pOp = op->getParentOfType<scf::ForOp>();
-  while (pOp) {
-    ++depth;
-    pOp = pOp->getParentOfType<scf::ForOp>();
-  }
-  return depth;
 }
 
 // Update preOrderOps with a list of region Ops nested under ctrlOp that will
@@ -278,7 +269,7 @@ static int64_t getReuseGroupStride(ReuseGroup *group) {
     // Only SMEM(-post) channels participate in subtiled reuse. Skip TMEM(-post)
     // channels: they never subtile and getDstOp() can be unsafe on operand-D.
     if (ch->channelKind != DataChannelKind::SMEM &&
-        ch->channelKind != DataChannelKind::SMEMPost)
+        ch->channelKind != DataChannelKind::SMEMAlloc)
       continue;
     if ((sub = enclosingSubtiledOf(ch->getSrcOp())))
       break;
@@ -413,7 +404,7 @@ Value getAccumForReuseGroup(Operation *op, SmallVector<Operation *> &chList,
         getAccumCnts(whileOp.getOperation(), regionsWithChannels, config);
     Value arg = whileOp.getAfterBody()->getArgument(numArgs - tCnts + argIdx);
     Value lit = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
-        whileOp.getLoc(), before ? opIdx : opIdx + 1, 64);
+        whileOp.getLoc(), (before ? opIdx : opIdx + 1) * stride, 64);
     Value endAccum = builder.createWithAsyncTaskIds<arith::AddIOp>(
         accumCntLoc(whileOp.getLoc()), arg, lit);
     return endAccum;
@@ -512,7 +503,7 @@ scf::IfOp rewriteIfOp(scf::IfOp ifOp, SmallVector<Operation *> &taskTopOps,
   } else {
     // Create an empty yield
     auto b = newIfOp.getElseBodyBuilder();
-    auto yieldOp = scf::YieldOp::create(b, ifOp.getLoc());
+    scf::YieldOp::create(b, ifOp.getLoc());
   }
 
   SmallVector<Value> elseYieldOperands = newIfOp.elseYield().getOperands();
@@ -670,32 +661,21 @@ scf::ForOp createNewLoop(scf::ForOp forOp, scf::ForOp &parentForOp,
   return newForOp;
 }
 
+} // namespace
+
 // Here we assume the source and destination ops are in the same region op.
 // Go through channels, and get a set of region ops containing channels.
 void collectRegionsWithChannels(const SmallVector<Channel *> &channels,
                                 DenseSet<Operation *> &regionsWithChannels) {
-  for (auto *ch : channels) {
-    auto *dst = ch->getDstOp();
-    auto *pOp = dst->getParentOp();
-    if (!pOp)
-      continue;
-    if (auto forOp = dyn_cast<scf::ForOp>(pOp))
-      regionsWithChannels.insert(pOp);
-    if (auto ifOp = dyn_cast<scf::IfOp>(pOp))
-      regionsWithChannels.insert(pOp);
-    // Channel directly in a persistent scf.while after region.
-    if (auto whileOp = dyn_cast<scf::WhileOp>(pOp))
-      regionsWithChannels.insert(pOp);
-  }
-}
-
-void collectRegionsWithChannelsPost(
-    const SmallVector<Channel *> &channels,
-    DenseSet<Operation *> &regionsWithChannels) {
   for (auto *channel : channels) {
-    if (channel->channelKind == DataChannelKind::TMEMPost) {
-      ttng::TmemDataChannelPost *tmemChannel =
-          static_cast<ttng::TmemDataChannelPost *>(channel);
+    // A defunct channel's alloc was folded into a reuse representative and
+    // erased; its allocOp/endpoints are dangling, so skip it (the
+    // representative already contributes its regions).
+    if (channel->defunct)
+      continue;
+    if (channel->channelKind == DataChannelKind::TMEMAlloc) {
+      ttng::TmemAllocChannel *tmemChannel =
+          static_cast<ttng::TmemAllocChannel *>(channel);
       if (tmemChannel->isOperandD) {
         // Go through all dst ops and src ops.
         for (auto user : cast<ttng::TMEMAllocOp>(tmemChannel->allocOp)
@@ -750,6 +730,8 @@ void collectRegionsWithChannelsPost(
     }
   }
 }
+
+namespace {
 
 // Go through a list of operations in opList, recursively call into
 // createNewLoopWrapper or rewriteIfOp.
@@ -867,18 +849,7 @@ scf::ForOp createNewLoopWrapper(scf::ForOp origForOp,
   }
   // Handle reuse groups.
   for (unsigned idx = 0; idx < config->getGroupSize(); ++idx) {
-    // A collapsed both-subtiled channel is the sole member of its group but
-    // still carries a shared accumCnt (numTiles stride); keep it. This must
-    // match getAccumCnts / getReuseChannels, which also special-case size-1
-    // subtiled groups, or the loop arg count and accumCnt indices disagree.
-    if (config->getGroup(idx)->channels.size() <= 1 &&
-        !channelIsSubtiled(config->getGroup(idx)->channels[0]))
-      continue;
-    // A collapsed subtiled channel carries its shared accumCnt (numTiles
-    // stride) even at buffer.copy == 1; keep its loop arg so the count matches
-    // getAccumCnts / getReuseChannels. Plain single-buffered groups skip.
-    if (config->getGroup(idx)->channels[0]->getNumBuffers() <= 1 &&
-        !channelIsCollapsedBothSubtiled(config->getGroup(idx)->channels[0]))
+    if (!reuseGroupNeedsAccumCnt(config->getGroup(idx)))
       continue;
     Operation *parentOp = origForOp->getParentOp();
 #if 0
@@ -1124,8 +1095,6 @@ scf::WhileOp createNewWhileWrapper(scf::WhileOp origWhileOp,
   getAccumCntsPreOrder(origWhileOp.getOperation(), regionsWithChannels,
                        preOrderOps);
   unsigned tCnts = preOrderOps.size();
-  if (tCnts == 0)
-    return origWhileOp;
 
   OpBuilderWithAsyncTaskIds builder(origWhileOp->getContext());
   builder.setAsynTaskIdsFromArray(getNestedAsyncTaskIds(origWhileOp));
@@ -1143,9 +1112,7 @@ scf::WhileOp createNewWhileWrapper(scf::WhileOp origWhileOp,
   // per-region counters. Mirrors createNewLoopWrapper. The while is outermost,
   // so the prior value resolves to a constant 0.
   for (unsigned idx = 0; idx < config->getGroupSize(); ++idx) {
-    if (config->getGroup(idx)->channels.size() <= 1)
-      continue;
-    if (config->getGroup(idx)->channels[0]->getNumBuffers() <= 1)
+    if (!reuseGroupNeedsAccumCnt(config->getGroup(idx)))
       continue;
     SmallVector<Operation *> chList;
     getReuseChannels(config->getGroup(idx), origWhileOp.getOperation(), chList);
@@ -1161,6 +1128,12 @@ scf::WhileOp createNewWhileWrapper(scf::WhileOp origWhileOp,
                               regionsWithChannels, config, idx, true);
     initialAccums.push_back(prevAccum);
   }
+
+  // A same-task generated subtiled region can need only a reuse-group counter,
+  // with no ordinary channel-bearing region in preOrderOps. Do not skip that
+  // counter merely because tCnts is zero.
+  if (initialAccums.empty())
+    return origWhileOp;
 
   unsigned totalCnts = initialAccums.size();
   scf::WhileOp newWhileOp = createNewWhileLoop(origWhileOp, initialAccums);
@@ -1275,6 +1248,8 @@ scf::WhileOp createNewWhileWrapper(scf::WhileOp origWhileOp,
   });
   return newWhileOp;
 }
+
+} // namespace
 
 void appendAccumCntsForOps(SmallVector<Operation *> &taskTopOps,
                            const SmallVector<Channel *> &channels,

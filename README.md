@@ -15,6 +15,18 @@ Primarily targeting NVIDIA GPUs (for now), TLX extends Triton to support:
 While this approach places more responsibility on the user, it reduces the compiler's role as a performance bottleneck. Although it may introduce divergence across hardware platforms, it empowers users to perform deeper, architecture-specific optimizations without relying solely on compiler heuristics.
 
 
+## Nightly builds (fbtriton)
+
+Nightly `.dev` wheels are published to a self-managed index (not PyPI):
+
+    pip install --pre fbtriton \
+      --index-url https://facebookexperimental.github.io/triton/nightly/simple/
+
+Each nightly is built from the newest `main` commit whose GPU/CI checks are all
+green. `triton.__version__` reports `3.8.0.dev<YYYYMMDD>+fb.git<hash>`. Nightlies
+are retained for ~30 days. Formal releases remain on PyPI (`pip install fbtriton`).
+
+
 ## Gluon support
 
 [Gluon](https://github.com/triton-lang/triton/tree/main/python/triton/experimental/gluon)
@@ -76,9 +88,12 @@ the re-sync.
     Return a subview of the buffer indexed by `buffer_idx` from `buffers`. Both the explicit `local_view()` call and the indexing syntax `[]` are supported.
 
 
-- `distributed_tensor = tlx.local_load(buffer, optional_token)` **[Hopper+, MI300+]**
+- `distributed_tensor = tlx.local_load(buffer, token=None, layout=None, relaxed=False, rematerialize_coordinates=False, rematerialize_coordinates_group=None)` **[Hopper+, MI300+]**
 
-    Loads the buffer from local memory or tensor memory into a distributed tensor.
+    Loads the buffer from local or tensor memory. `layout` pins a requested
+    register layout. On AMD, the rematerialization options start fresh address
+    coordinate live ranges either per load or for a named group of nearby
+    loads; the two options are mutually exclusive.
 
 
 - `tlx.local_store(buffer, distributed_tensor)` **[Hopper+, MI300+]**
@@ -97,9 +112,13 @@ the re-sync.
 
     Permutes the dimensions of a tensor.
 
-- `buffer = tlx.local_slice(buffer, offsets=[m, n], shapes=[M, N])` **[Hopper+, MI300+]**
+- `buffer = tlx.local_slice(buffer, offset=[m, n], shape=[M, N])` **[Hopper+, MI300+]**
 
-    Slice a `M x N` tensor at a `m x n` offset.
+    Slice a tensor at the given logical offset. On MI300+, SMEM offsets may be
+    runtime scalar i32 tensors; `shape` remains constexpr. The caller must keep
+    a runtime-offset view within the allocation and satisfy the same
+    tile-alignment contract as a static slice; violating either condition is
+    undefined behavior.
 
 #### Buffer Reuse
 
@@ -394,6 +413,10 @@ Binary wheels are available for CPython 3.10-3.14.
 
    The operation returns a token object which can be used to track the completion of the operation.
 
+   **MI350X caveat:** When `mask` is provided, callers should also provide `other`—typically `0.0` for numerical kernels. Elements for which `mask=True` are copied from global memory into the destination local buffer. For elements where `mask=False`, `other` is written only if it is provided. Otherwise, the corresponding LDS locations retain unspecified, potentially stale contents from an earlier use of the buffer.
+
+   For example, in FlashAttention, when the sequence length is not a multiple of `BLOCK_N`, the final `V` tile contains masked-out rows. If `other` is omitted, those rows may contain unspecified values, including bit patterns representing NaN or infinity. These values can propagate through the subsequent matrix multiplication and produce incorrect output. Use `other=0.0` for such padded tiles.
+
 
 - `tlx.async_load_commit_group(tokens)` **[Hopper+, MI350]**
 
@@ -564,11 +587,15 @@ Binary wheels are available for CPython 3.10-3.14.
 
 - `tlx.named_barrier_wait(bar_id, num_threads)` **[Hopper+]**
 
-    Wait until `num_threads` threads have reached the specified named mbarrier phase.
+    Wait until `num_threads` total threads have reached the specified named mbarrier phase.
 
 - `tlx.named_barrier_arrive(bar_id, num_threads)` **[Hopper+]**
 
-    Signal arrival at a named mbarrier with the given thread count.
+    Signal arrival at a named mbarrier.
+
+    For both APIs, `num_threads` is the total number of threads required to flip
+    the barrier phase: `num_waiting_threads + num_arriving_threads`. Wait and
+    Arrive calls for the same barrier phase must use the same value.
 
 - `tlx.barrier_expect_bytes(bar, bytes)` **[Hopper+]**
 
@@ -577,6 +604,12 @@ Binary wheels are available for CPython 3.10-3.14.
 - `tlx.barrier_arrive(bar, arrive_count=1, remote_cta_rank=None)` **[Hopper+]**
 
     Perform the arrive operation on an mbarrier. If `remote_cta_rank` is provided, signals the barrier in the specified remote CTA's shared memory (useful for multi-CTA synchronization).
+
+- `tlx.amd_sched_barrier(mask=0)`  **[AMD]**
+
+    Prevents selected AMD machine-instruction classes from crossing a source
+    boundary. It is a scheduling marker, not a workgroup barrier or memory
+    fence.
 
 ### Memory Fences
 
@@ -620,26 +653,26 @@ CLC (Cluster Launch Control) is a Blackwell-specific feature **[Blackwell]** tha
     **Parameters:**
     - `num_consumers`: Number of consumers that will signal completion per tile (typically 3 async tasks × num_CTAs)
 
-- `tlx.clc_producer(context, p_producer=phase, multi_ctas=False)` **[Blackwell]**
+- `tlx.clc_producer(context, p_producer=phase, multi_ctas=True)` **[Blackwell]**
 
     Issue a CLC try_cancel request to acquire a new tile ID.
 
     **Parameters:**
     - `context`: CLC pipeline context from `clc_create_context`
     - `phase`: Current barrier phase (0 or 1, alternates each iteration)
-    - `multi_ctas`: Set to `True` for 2-CTA mode (cluster of 2 CTAs). When enabled, `pred_cta0` is computed internally from `cluster_cta_rank()`.
+    - `multi_ctas`: Enables cluster-aware synchronization by default when the compilation options specify multiple CTAs. For a `(1, 1, 1)` cluster, the frontend emits the local single-CTA path. Set to `False` to request the local-only path explicitly.
 
-- `tile_id = tlx.clc_consumer(context, p_consumer=phase, multi_ctas=False, k=0, return_3d=False)` **[Blackwell]**
+- `tile_id = tlx.clc_consumer(context, p_consumer=phase, multi_ctas=True, k=0, return_3d=False)` **[Blackwell]**
 
     Decode the tile ID from a CLC response and signal completion.
 
     **Parameters:**
     - `context`: CLC pipeline context from `clc_create_context`
     - `phase`: Current barrier phase
-    - `multi_ctas`: Set to `True` for 2-CTA mode. When enabled, `pred_cta0` is computed internally.
+    - `multi_ctas`: Enables cluster-aware synchronization by default when the compilation options specify multiple CTAs. For a `(1, 1, 1)` cluster, the frontend emits a local barrier arrival. Set to `False` to request the local-only path explicitly.
     - `return_3d`: Set to `True` to return `(ctaIdX, ctaIdY, ctaIdZ)` tuple instead of scalar tile_id.
 
-    **Returns:** The tile ID (already offset by `cluster_cta_rank()` for unique tile assignments), or -1 if no work available. With `return_3d=True`, returns `(ctaIdX, ctaIdY, ctaIdZ)` tuple.
+    **Returns:** The tile ID (offset by `cluster_cta_rank()` for unique tile assignments), or -1 if no work is available. With `return_3d=True`, returns `(ctaIdX, ctaIdY, ctaIdZ)`.
 
 #### How CLC Works
 
@@ -763,7 +796,7 @@ Examples: how mbarriers are communicated in warp specialization
 - `tlx.async_tasks` and `tlx.async_task` **[Hopper+]**
 
 ```
-    with tlx.async_tasks
+    with tlx.async_tasks()
         with tlx.async_task("default")
             ...
         with tlx.async_task(num_warps=4)
@@ -775,15 +808,47 @@ Examples: how mbarriers are communicated in warp specialization
 
 `tlx.async_task(num_warps=4)` defines a warp-specialized asynchronous task that explicitly reserves 4 warps in addition to those used by the trunk task.
 
+#### async_tasks Parameters
+
+| Parameter                | Description                                                                                                                                                                                      |
+|--------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `exclusive`              | Assert this is the only one `tlx.async_tasks` in the kernel for more efficient PTX. Default to False.                                                                                            |
+| `no_ending_cluster_sync` | This suppresses compiler generated cluster sync at end of Warp Spec. Should only be used if user guarantees all cross CTA SMEM/TMEM access are done by end of WS default task. Default to False. |
+| `mbarrier_try_wait_suspend_ns` | On Blackwell, use the four-operand `mbarrier.try_wait.parity` form with this suspend hint for waits in the kernel. `None` is unspecified, `0` explicitly disables the hint, and positive values enable it. If multiple `async_tasks` regions specify a value, the minimum explicit value is used module-wide. Default to None. |
+
 #### async_task Parameters
 
 | Parameter | Description |
 |-----------|-------------|
 | `"default"` | First positional argument to mark this as the default/trunk task |
 | `num_warps` | Number of warps to reserve for this task |
-| `num_regs` | Number of registers per thread (optional, for register allocation tuning). When provided, it must be divisible by 8. |
+| `num_regs` | Number of registers per thread (optional, for register allocation tuning). It is supported by both default and non-default tasks and must be divisible by 8. |
 | `replicate` | Number of replicas for this task (default: 1). Creates multiple copies of the task region |
 | `warp_group_start_id` | Starting warp ID for this task (optional). Allows explicit control over warp assignment |
+
+#### Default Task Register Budget
+
+Register budgets are specified per thread. When the default task does not set
+`num_regs`, register allocation keeps the original donation model: non-default
+warp groups receive their requested budgets, and the default task receives the
+remaining registers.
+
+Setting `num_regs` on the default task selects a fixed budget instead:
+
+```python
+with tlx.async_tasks():
+    with tlx.async_task("default", num_regs=80):
+        ...
+    with tlx.async_task(num_warps=4, num_regs=24):
+        ...
+```
+
+In this example, the default and non-default tasks receive 80 and 24 registers
+per thread, respectively. The default task does not absorb unused registers.
+Non-default warp groups without an explicit budget evenly share the remaining
+register pool. If every task has a fixed budget, any surplus is left unused.
+The compiler may raise a request to the hardware or instrumentation safety
+minimum when required.
 
 #### Explicit Warp Assignment with warp_group_start_id
 
@@ -1011,6 +1076,80 @@ TLX uses **CUDA-native cluster semantics** which differs from Triton's approach:
     tlx.dump_layout(v)                  # -> // cute: _64:_1
     ```
 
+- `x = tlx.require_layout(x, layout, pin=True, late_address_compute=False)` **[Hopper+, MI300+]**
+
+    Require a register tensor `x` to use `layout`, expressed as a
+    `tlx.layout(...)` (Shape:Stride). With the default `pin=True`, the `#linear`
+    encoding is wrapped as `#tlx.no_verify_layout(#tlx.user_layout(...))`. The
+    inner `#tlx.user_layout` carries `PinnedEncodingTrait`, so downstream passes
+    (`tritongpu-coalesce`, `remove-layout-conversions`, AMD `optimize-epilogue`)
+    treat it as fixed and never rewrite it; the outer `#tlx.no_verify_layout` defers
+    operand-layout verification until the pin is peeled by
+    `TLXResolvePlaceholderLayouts` in `make_ttgir`. Example: pin an FP16 epilogue
+    `tl.store` to a coalesced layout so `OptimizeEpilogue` keeps the wide
+    `buffer_store_dwordx4` instead of narrowing it to the MMA-accumulator store,
+    without staging the value through LDS.
+
+    Pass `pin=False` for an optimizer-flexible requirement. This emits the
+    requested encoding without the `#tlx.user_layout` hard anchor, allowing
+    later layout passes to propagate the requirement or materialize a layout
+    conversion. The default remains `pin=True` for existing callers.
+
+    On AMD, `late_address_compute=True` asks shared-memory-backed layout
+    conversions to compute their addresses at this use. The backend does this
+    by rematerializing inexpensive lane/warp coordinates, shortening their live
+    ranges across register-heavy regions.
+
+    Pair with `tlx.assert_same_layout(x, layout)` (below) to statically verify the
+    pin survived to the final TTGIR.
+
+- `x = tlx.release_layout(x)` **[Hopper+, MI300+]**
+
+    End an explicit register-layout requirement without changing the tensor's
+    value. Downstream layout propagation may select a layout preferred by the
+    consumer, for example when a dot-operand layout feeds a reduction. This is
+    not a conversion request; use another `require_layout` when the replacement
+    layout is part of the algorithm.
+
+- `tlx.assert_same_layout(lhs, rhs)` **[Hopper+, MI300+]**
+
+    Compile-time assertion that two layouts are equivalent after layout
+    propagation and all other TTGIR layout optimizations have completed. Like
+    `tlx.dump_layout`, it emits no device code and is consumed at the end of the
+    TTGIR pipeline.
+
+    `rhs` supports two forms:
+
+    - **Value/value:** `rhs` is another register tensor or shared/tensor-memory
+      buffer. The frontend emits `tlx.assert_same_layout`, whose two operands
+      retain their independently resolved final types.
+    - **Value/layout:** `rhs` is a constant `tlx.layout_encoding`. The frontend
+      lowers the constant to an encoding attribute and emits
+      `tlx.assert_same_layout_expected`. At assertion time, the pass combines
+      that encoding with `lhs`'s shape, element type, and (for buffers) memory
+      properties to construct an expected tensor or memdesc type.
+
+    These are separate internal operations only because an SSA value is an MLIR
+    operand while a constant layout is an MLIR attribute. They share the same
+    comparison path and the same public Python API.
+
+    Before comparison, both final types are converted with
+    `ttg::toLinearLayout`. The assertion compares the resulting
+    `LinearLayout`s, not the original encoding attributes. Consequently,
+    structurally different encodings pass if they describe the same logical
+    mapping. A mismatch reports both normalized LinearLayouts and fails
+    compilation.
+
+    Example:
+
+    ```python
+    x = tlx.local_load(x_buf, layout=REGISTER_LAYOUT)
+    y = tlx.local_load(y_buf, layout=REGISTER_LAYOUT)
+
+    tlx.assert_same_layout(x, y)                # value/value
+    tlx.assert_same_layout(x, REGISTER_LAYOUT)  # value/layout
+    ```
+
 
 ## Buffer Operations (AMD)
 
@@ -1023,7 +1162,9 @@ Buffer operations access global memory via a scalar base pointer and a tensor of
 Load a tensor of values from global memory.
 
 ```python
-result = tlx.buffer_load(ptr, offsets, mask=None, other=None, cache=None)
+result = tlx.buffer_load(
+    ptr, offsets, mask=None, other=None, cache=None, contiguity=1
+)
 ```
 
 | Argument | Type | Description |
@@ -1033,6 +1174,7 @@ result = tlx.buffer_load(ptr, offsets, mask=None, other=None, cache=None)
 | `mask` | bool tensor, optional | When `mask[i]` is `False`, the element is not loaded. |
 | `other` | tensor or scalar, optional | Value used for masked-out elements (where `mask[i]` is `False`). |
 | `cache` | str, optional | Cache modifier (e.g. `".ca"`, `".cg"`). |
+| `contiguity` | constexpr int | Trusted positive power-of-two vectorization width; it must divide each thread's element count. |
 
 **Returns**: A tensor with the same shape as `offsets` and element type matching the pointee type of `ptr`.
 
@@ -1058,6 +1200,23 @@ tlx.buffer_store(stored_value, ptr, offsets, mask=None, cache=None)
 
 Lowers to `amdg.buffer_store`, which is eventually lowered to `rocdl.raw.ptr.buffer.store`.
 
+### `tlx.buffer_atomic_add`
+
+Atomically add a tensor through an AMD scalar resource descriptor.
+
+```python
+previous = tlx.buffer_atomic_add(
+    ptr, offsets, value, mask=None, sem=None, scope=None, contiguity=1
+)
+```
+
+`contiguity` is the same trusted per-thread adjacency width accepted by
+`buffer_load`; values greater than one also preserve the selected layout. The
+operation returns the values observed before the additions. FP16 and BF16 use
+packed two-element instructions, so `contiguity` must be at least two and any
+mask must be uniform for each adjacent pair. Compilation fails if mask analysis
+reduces the legal vector width below two.
+
 ### `tlx.buffer_load_to_local`
 
 Async load from global memory directly into shared (local) memory, bypassing registers. This is useful for producer warps that prefetch data into shared memory for other warps to consume.
@@ -1079,6 +1238,11 @@ token = tlx.buffer_load_to_local(dest, ptr, offsets, mask=None, other=None, cach
 
 Lowers to `amdg.buffer_load_to_local`, which is eventually lowered to `rocdl.raw.ptr.buffer.load.async.lds` — a single hardware instruction that moves data from global memory to LDS without going through VGPRs.
 
+**Requirements.** The direct-to-LDS copy has the following hardware constraints:
+- **Vector width.** Each thread's load must reach a supported direct-to-LDS width (**32 or 128 bits**). If it can only be vectorized to a smaller width, it cannot be lowered.
+- **Provable pointer/offset alignment.** The compiler must be able to *prove* the alignment that vector width needs.
+- **Mask alignment.** If `mask` is given it must be aligned to the vector width: each group of (vector width) consecutive mask values must be identical. The copy transfers each lane's whole vector in one transaction, so a mask whose `True`/`False` boundary cannot be proven vector-aligned (e.g. `offs < K` for a runtime `K`) forces per-element vectorization and cannot lower.
+
 ### Example
 
 ```python
@@ -1098,41 +1262,106 @@ def kernel(src_ptr, dst_ptr, BLOCK_SIZE: tl.constexpr):
 
 For the async global-to-shared variant, see the warp-pipeline GEMM example (`third_party/amd/python/examples/gluon/f16_gemm_warp_pipeline_gfx1250.py`).
 
+## Wave Uniformity (AMD)
+
+### `tlx.assume_uniform`
+
+Assert that a scalar holds the same value in every lane of the wave.
+
+```python
+value = tlx.assume_uniform(value)
+```
+
+| Argument | Type | Description |
+|----------|------|-------------|
+| `value` | scalar pointer, or 16/32/64-bit int or float | Value asserted to be wave-uniform. Narrower types are not supported. |
+
+**Returns**: `value`, unchanged.
+
+The main use is buffer operations, which keep their base pointer in the scalar (SGPR) resource descriptor, so it has to be wave-uniform. When the backend cannot prove that it is — most commonly because the pointer was loaded from memory — it falls back to a per-lane waterfall loop around every access. `tlx.assume_uniform` tells the backend to take uniformity as given:
+
+```python
+base = tl.load(ptr_array + gid).to(tl.pointer_type(tl.float16))
+base = tlx.assume_uniform(base)
+data = tlx.buffer_load(base, offsets)
+```
+
+Lowers to `amdg.assume_uniform`, which is eventually lowered to `llvm.amdgcn.readfirstlane` — that makes the result uniform by construction as far as LLVM's uniformity analysis is concerned. On non-AMD backends it is a no-op that returns its argument. Nothing verifies the assertion: if the value is not actually uniform, every lane silently gets lane 0's value.
+
+## Explicit MFMA Scheduling (AMD)
+
+> **[MI350]** — the source-scheduled operations are restricted to CDNA4
+> (`gfx950`) native BF16 MFMA layouts.
+
+- `tl.dot(a, b, acc)` preserves a TLX-pinned accumulator layout, so whole dots
+  need no AMD-specific wrapper.
+- `tlx.extract_slice(source, shape, offsets)` selects an aligned register
+  fragment without cross-thread movement.
+- `tlx.rematerialized_range(start, end, anchor, placement=None)` recreates
+  inexpensive distributed coordinates near a use instead of carrying them
+  through a long software pipeline.
+- `tlx.amd_register_resident(value, register_class="agpr", registers_per_group=1)`
+  keeps every native-register group in one allocator-visible whole-tensor
+  residency interval.
+- `tlx.amd_register_handoff(value, register_class="vgpr")` starts an
+  independent allocation interval for each 32-bit native register value,
+  shortening a local live range without requiring simultaneous whole-tensor
+  residency. Both register-boundary operations accept `"vgpr"` or `"agpr"`;
+  `amd_register_resident` additionally accepts a power-of-two
+  `registers_per_group` from 1 through 32.
+- `tlx.amd_scheduled_mfma(...)` exposes independent native MFMA accumulator
+  chains in deterministic N-major, M-minor, K-reduction source order.
+- `tlx.amd_mfma_commit(value, preserve)` applies the CDNA4 MFMA result hazard
+  boundary while threading a live dot-operand dependency.
+- `tlx.amd_sched_barrier(mask=0)` prevents selected AMD machine-instruction
+  classes from crossing a source boundary. It is a scheduling marker, not a
+  workgroup barrier or memory fence.
+
+These primitives describe fragments, lifetimes, and ordering without assigning
+physical registers. Their verifiers reject unsupported targets, layouts,
+element types, and native fragment widths before lowering.
+
+Unlike `tl.dot`, `amd_scheduled_mfma` carries an explicit `accumulator_role`.
+`transient` selects the latency-aware intrinsic path for phase-local work;
+`persistent` selects register-constrained lowering for a chain carried across
+phases. Neither role changes the numerical matrix operation.
+
 ## AMD TDM Descriptor Loads
 
-`tlx.async_amd_descriptor_load(desc, result, offsets, pred=None)` issues an AMD
-TDM descriptor load from global memory to a TLX local buffer. It is available on
-TDM-capable AMD targets (`gfx1250+`) and should be synchronized with
+`tlx.update_tensor_descriptor(desc, add_offsets=None, set_bounds=None,
+pred=None, clamp_bounds=False)` produces a positioned descriptor SSA value.
+`add_offsets` advances the tile position without changing bounds;
+`set_bounds` rewrites absolute bounds; and `pred` replaces the inherited
+predicate. Use `clamp_bounds=True` with `add_offsets` to derive the remaining
+OOB extent of an advanced tile.
+
+`tlx.async_amd_descriptor_load(desc, result, offsets=None, pred=None,
+clamp_bounds=True)` issues an AMD TDM descriptor load from global memory to a
+TLX local buffer. If `offsets` is omitted, `desc` is used as already positioned
+and its predicate is preserved. The analogous store accepts `offsets=None` for
+the same reason. Both operations are available on TDM-capable AMD targets
+(`gfx1250+`) and should be synchronized with
 `tlx.async_amd_descriptor_wait`.
 
-`tlx.async_amd_descriptor_load_group(descs, results, offsets, warp_masks,
-preds=None)` groups multiple AMD TDM descriptor loads behind one static hardware
-TDM instruction. Each list entry is one arm:
-
-| Argument | Description |
-|----------|-------------|
-| `descs[i]` | Tensor descriptor for arm `i`. |
-| `results[i]` | Local buffer or local view receiving arm `i`. |
-| `offsets[i]` | Offset list for arm `i`; all arms must have the same rank. |
-| `warp_masks[i]` | Bitmask selecting the waves that use arm `i`. |
-| `preds[i]` | Optional predicate for arm `i`; defaults to true. |
-
-The warp masks must be non-empty, disjoint, axis-aligned, and cover all waves in
-the CTA exactly once. The grouped operation currently requires one CTA, the same
-rank and element bitwidth for every arm, one shared cache modifier, and shared
-layouts supported by AMD TDM lowering. This is useful for kernels where
-different wave groups load different inputs, such as A/B GEMM tiles or A/B plus
-scale tiles in MXFP GEMM, while keeping the assembly to one TDM instruction per
-load group.
+`tlx.async_amd_descriptor_load_fused(members, cache_modifier="")` fuses two to
+four AMD TDM descriptor loads behind one static hardware instruction. Each
+member is a `(positioned_desc, destination, warp_used_hint)` tuple. Position
+descriptors with `tlx.update_tensor_descriptor` before issuing the fused load.
+The hints must be non-empty, pairwise disjoint, and legal axis-aligned subsets
+of the CTA's waves; they do not need to cover every wave. Members must have the
+same descriptor rank but may have different shapes and element types. All
+members share one cache modifier.
 
 Example:
 ```python
-a_tok = tlx.async_amd_descriptor_load_group(
-    [a_desc, b_desc],
-    [tlx.local_view(a_buf, slot), tlx.local_view(b_buf, slot)],
-    [[off_m, k * BLOCK_K], [k * BLOCK_K, off_n]],
-    [0b0011, 0b1100],
-)
+a_load_desc = tlx.update_tensor_descriptor(
+    a_desc, add_offsets=[off_m, k * BLOCK_K], pred=True, clamp_bounds=True)
+b_load_desc = tlx.update_tensor_descriptor(
+    b_desc, add_offsets=[k * BLOCK_K, off_n], pred=True, clamp_bounds=True)
+a_tok = tlx.async_amd_descriptor_load_fused([
+    (a_load_desc, tlx.local_view(a_buf, slot), 0b0011),
+    (b_load_desc, tlx.local_view(b_buf, slot), 0b1100),
+])
 tlx.async_amd_descriptor_wait(0, [a_tok])
 ```
 
@@ -1259,6 +1488,18 @@ hand-poking attributes.
 Currently consumed only by the scaled-WMMA pattern (gfx1250). Regular
 `tt.dot` WMMA and the MFMA patterns do not read it.
 
+### Explicit WMMA layout pinning
+
+`tlx.require_amd_wmma_layout(x, version=3, transposed=True, warp_bases=...,
+reg_bases=..., instr_shape=(16, 16, 128))` pins a tensor to an explicit AMD
+WMMA register/warp layout. This is useful for tuned gfx1250 epilogues that must
+retain the accumulator ownership chosen by `tiles_per_warp` across otherwise
+layout-neutral tensor operations. The bases contain one linear-layout basis
+vector per register or warp bit and must match the tensor rank.
+
+The helper lowers to a pinned `tlx.require_layout`; omit it when automatic
+layout propagation is sufficient.
+
 ## Kernels Implemented with TLX
 
 ### GEMM kernels
@@ -1267,6 +1508,8 @@ Currently consumed only by the scaled-WMMA pattern (gfx1250). Regular
 [Warp-specialized GEMM on Hopper](third_party/tlx/tutorials/hopper_gemm_ws_test.py)
 
 [Warp-specialized GEMM on Blackwell](third_party/tlx/tutorials/blackwell_gemm_ws.py)
+
+[Warp-specialized MXFP8 GEMM on Blackwell](third_party/tlx/tutorials/blackwell_gemm_ws_mxfp8.py)
 
 [Grouped GEMM on Blackwell](third_party/tlx/tutorials/blackwell_grouped_gemm_test.py)
 

@@ -1,6 +1,9 @@
 #pragma once
 #include "amd/include/Dialect/TritonAMDGPU/IR/Dialect.h"
 #include "amd/include/TritonAMDGPUTransforms/Passes.h"
+#ifdef TRITON_ENABLE_CPU_BACKEND
+#include "cpu/include/TritonCPU/Registration.h"
+#endif
 #include "mlir/Dialect/LLVMIR/Transforms/InlinerInterfaceImpl.h"
 #include "nvidia/include/Dialect/NVGPU/IR/Dialect.h"
 #include "nvidia/include/Dialect/NVWS/IR/Dialect.h"
@@ -96,6 +99,7 @@ inline void registerTritonDialects(mlir::DialectRegistry &registry) {
   mlir::triton::gpu::registerTritonGPUGlobalScratchAllocationPass();
   mlir::triton::gpu::registerCanonicalizeLLVMIR();
   mlir::triton::registerConvertWarpSpecializeToLLVM();
+  mlir::triton::registerInitializeWSClusterBarriers();
   mlir::triton::registerConvertTritonGPUToLLVMPass();
   mlir::triton::registerConvertNVGPUToLLVMPass();
   mlir::triton::registerAllocateSharedMemoryNvPass();
@@ -120,6 +124,7 @@ inline void registerTritonDialects(mlir::DialectRegistry &registry) {
 
   // TritonAMDGPUTransforms passes
   mlir::registerTritonAMDGPUAccelerateMatmul();
+  mlir::registerTritonAMDGPUOptimizeDescriptorEncoding();
   mlir::registerTritonAMDGPUOptimizeEpilogue();
   mlir::registerTritonAMDGPUHoistLayoutConversions();
   mlir::registerTritonAMDGPUSinkLayoutConversions();
@@ -134,16 +139,16 @@ inline void registerTritonDialects(mlir::DialectRegistry &registry) {
   mlir::registerTritonAMDGPUConvertToTensorOps();
   mlir::registerTritonAMDGPUOptimizeBufferOpPtr();
   mlir::registerTritonAMDGPUDotDecomposeAndSchedule();
+  mlir::registerTritonAMDGPUSchedGroupBarrierScheduler();
   mlir::registerTritonAMDGPUInThreadTranspose();
   mlir::registerTritonAMDGPUCoalesceAsyncCopy();
   mlir::registerTritonAMDGPUCoalesceBufferOps();
   mlir::registerTritonAMDGPUUpdateAsyncWaitCount();
   mlir::registerTritonAMDGPUWarpPipeline();
-  mlir::triton::registerTritonAMDGPUInsertInstructionSchedHints();
-  mlir::triton::registerTritonAMDGPULowerInstructionSchedHints();
   mlir::registerTritonAMDFoldTrueCmpI();
   mlir::registerTritonAMDGPUFpSanitizer();
   mlir::triton::amdgpu::registerTritonAMDGPUOptimizeDotOperands();
+  mlir::registerConSanAMDHooks();
 
   // NVWS passes
   mlir::triton::registerNVWSTransformsPasses();
@@ -157,6 +162,7 @@ inline void registerTritonDialects(mlir::DialectRegistry &registry) {
   mlir::registerNVGPUModuloLower();
   mlir::registerNVGPUListSchedule();
   mlir::registerNVGPULLMSchedule();
+  mlir::registerNVGPUJointSolverSchedule();
 
   // Proton passes
   mlir::test::proton::registerTestScopeIdAllocationPass();
@@ -170,6 +176,10 @@ inline void registerTritonDialects(mlir::DialectRegistry &registry) {
 
   // TLX passes
   mlir::triton::tlx::registerPasses();
+
+#ifdef TRITON_ENABLE_CPU_BACKEND
+  mlir::triton::cpu::registerTritonCPU(registry);
+#endif
 
   // Register plugin passes and dialects.
   for (const auto &plugin : mlir::triton::plugin::loadPlugins()) {

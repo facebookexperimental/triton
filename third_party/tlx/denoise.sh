@@ -63,67 +63,58 @@ elif [[ "$GPU_VENDOR" == "amd" ]]; then
     export HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES:=4}"
 
     GPU_INFO=$(rocm-smi -d "$HIP_VISIBLE_DEVICES" --showproductname 2>/dev/null)
-    GPU_MODEL=$(printf '%s\n' "$GPU_INFO" | awk -F: '/Card Series/ {print $NF; exit}' | xargs)
-    if [[ -z "$GPU_MODEL" || "$GPU_MODEL" == "N/A" ]]; then
-        GPU_MODEL=$(printf '%s\n' "$GPU_INFO" | awk -F: '/Card Model/ {print $NF; exit}' | xargs)
-    fi
-    if [[ -z "$GPU_MODEL" || "$GPU_MODEL" == "N/A" ]]; then
-        GPU_MODEL=$(amd-smi static --asic -g "$HIP_VISIBLE_DEVICES" 2>/dev/null \
-            | grep -i "market_name\|model" | head -1 | awk -F: '{print $NF}' | xargs)
-    fi
+    # "Card Series" is often just "AMD Radeon Graphics" on CDNA data-center parts (e.g. MI350),
+    # so identify by the PCI device id ("Card Model") and GFX version, which are reliable; keep
+    # Series only for display. (MI350/MI355 both report gfx950, so match device id before gfx.)
+    DEVICE_ID=$(printf  '%s\n' "$GPU_INFO" | awk -F: '/Card Model/  {print $NF; exit}' | xargs)
+    GFX_VER=$(printf    '%s\n' "$GPU_INFO" | awk -F: '/GFX Version/ {print $NF; exit}' | xargs)
+    GPU_SERIES=$(printf '%s\n' "$GPU_INFO" | awk -F: '/Card Series/ {print $NF; exit}' | xargs)
 
-    # Map model to GPU name and default power
-    case "$GPU_MODEL" in
-        *MI300*|0x74a0|0x74a1)
-            GPU_NAME="MI300X"
-            [[ -z "${DESIRED_POWER:-}" ]] && DESIRED_POWER=750
-            ;;
-        *MI350*|0x75a0)
-            GPU_NAME="MI350X"
-            [[ -z "${DESIRED_POWER:-}" ]] && DESIRED_POWER=1000
-            ;;
-        *MI355*|0x75a1|0x75a3)
-            GPU_NAME="MI355X"
-            [[ -z "${DESIRED_POWER:-}" ]] && DESIRED_POWER=1400
-            ;;
-        *)
-            GPU_NAME="AMD GPU ($GPU_MODEL)"
-            [[ -z "${DESIRED_POWER:-}" ]] && DESIRED_POWER=500
-            ;;
+    case "$DEVICE_ID:$GFX_VER:$GPU_SERIES" in
+        *0x74a0*|*0x74a1*|*MI300*|*gfx942*) GPU_NAME="MI300X"; : "${DESIRED_POWER:=750}"  ;;
+        *0x75a1*|*0x75a3*|*MI355*)          GPU_NAME="MI355X"; : "${DESIRED_POWER:=1400}" ;;
+        *0x75a0*|*MI350*|*gfx950*)          GPU_NAME="MI350X"; : "${DESIRED_POWER:=1000}" ;;
+        *) GPU_NAME="AMD GPU (${GPU_SERIES:-$DEVICE_ID $GFX_VER})"; : "${DESIRED_POWER:=500}" ;;
     esac
 
-    echo "Detected $GPU_NAME"
-    echo "Locking GPU $HIP_VISIBLE_DEVICES power cap to ${DESIRED_POWER} W"
-    echo "Setting GPU $HIP_VISIBLE_DEVICES to high performance mode"
+    # sclk to pin via perf-determinism (overridable). CDNA4/MI350 does NOT support
+    # `--setperflevel high` (rocm-smi returns "Not supported on the given system"),
+    # so that silently did nothing — use --setperfdeterminism, which pins the GFX clock.
+    DETERMINISM_CLK="${DETERMINISM_CLK:=2100}"
 
-    # Lock GPU clocks by setting performance level to high and applying power overdrive
+    echo "Detected $GPU_NAME"
+    echo "Locking GPU $HIP_VISIBLE_DEVICES sclk to ${DETERMINISM_CLK} MHz (perf-determinism) + power cap ${DESIRED_POWER} W"
+
+    # Lock GPU clocks via perf-determinism and apply power overdrive (both best-effort under sudo)
     (
-        sudo rocm-smi -d "$HIP_VISIBLE_DEVICES" --setperflevel high
+        sudo rocm-smi -d "$HIP_VISIBLE_DEVICES" --setperfdeterminism "$DETERMINISM_CLK"
         sudo rocm-smi -d "$HIP_VISIBLE_DEVICES" --setpoweroverdrive "$DESIRED_POWER"
     ) >/dev/null
 fi
 
-# TODO: Automate NUMA node detection. On one devgpu, device 6 is attached to
-# NUMA node 3. This is how to discover that mapping:
-#
-# `nvidia-smi -i 6 -pm 1` prints the PCI bus ID (00000000:C6:00.0)
-#
-# You can also get this from `nvidia-smi -x -q` and looking for minor_number
-# and pci_bus_id
-#
-# Then, `cat /sys/bus/pci/devices/0000:c6:00.0/numa_node` prints 3
-# is it always the case that device N is on numa node N/2? :shrug:
-#
-# Maybe automate this process or figure out if it always holds?
-#
-# ... Or you can just `nvidia-smi topo -mp` and it will just print out exactly
-# what you want, like this:
+NUMA_NODE=""
+if [[ "$GPU_VENDOR" == "nvidia" ]]; then
+    PCI_BUS_ID=$(nvidia-smi -i "$CUDA_VISIBLE_DEVICES" --query-gpu=pci.bus_id --format=csv,noheader | tr '[:upper:]' '[:lower:]')
+    # nvidia-smi uses an eight-digit PCI domain; sysfs uses four digits.
+    PCI_BUS_ID=$(printf '%s' "$PCI_BUS_ID" | sed -E 's/^[0-9a-f]{4}([0-9a-f]{4}:)/\1/')
+    NUMA_NODE_FILE="/sys/bus/pci/devices/$PCI_BUS_ID/numa_node"
+    if [[ -r "$NUMA_NODE_FILE" ]]; then
+        NUMA_NODE=$(<"$NUMA_NODE_FILE")
+    fi
+elif [[ "$GPU_VENDOR" == "amd" ]]; then
+    DRM_DEVICE=$(readlink -f "/sys/class/drm/card${HIP_VISIBLE_DEVICES}/device" 2>/dev/null || true)
+    if [[ -r "$DRM_DEVICE/numa_node" ]]; then
+        NUMA_NODE=$(<"$DRM_DEVICE/numa_node")
+    fi
+fi
 
-#       GPU0    GPU1    GPU2    GPU3    GPU4    GPU5    GPU6    GPU7    mlx5_0  mlx5_1  mlx5_2  mlx5_3  CPU Affinity    NUMA Affinity
-# GPU0   X      PXB     SYS     SYS     SYS     SYS     SYS     SYS     NODE    SYS     SYS     SYS     0-23,96-119     0
-# GPU6  SYS     SYS     SYS     SYS     SYS     SYS      X      PXB     SYS     SYS     SYS     NODE    72-95,168-191   3
-
-numactl -m 0 -c 0 "$@"
+if [[ "$NUMA_NODE" =~ ^[0-9]+$ ]]; then
+    echo "Binding CPU and memory to NUMA node $NUMA_NODE"
+    numactl --membind="$NUMA_NODE" --cpunodebind="$NUMA_NODE" "$@"
+else
+    echo "Warning: Could not determine a valid GPU-local NUMA node; running without NUMA binding" >&2
+    "$@"
+fi
 
 # Unlock GPU clock
 if [[ "$GPU_VENDOR" == "nvidia" ]]; then
@@ -133,7 +124,7 @@ if [[ "$GPU_VENDOR" == "nvidia" ]]; then
     ) >/dev/null
 elif [[ "$GPU_VENDOR" == "amd" ]]; then
     (
-        sudo rocm-smi -d "$HIP_VISIBLE_DEVICES" --resetclocks
+        sudo rocm-smi -d "$HIP_VISIBLE_DEVICES" --resetperfdeterminism
         sudo rocm-smi -d "$HIP_VISIBLE_DEVICES" --resetpoweroverdrive
     ) >/dev/null
 fi

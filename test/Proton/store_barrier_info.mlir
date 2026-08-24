@@ -93,7 +93,7 @@ module attributes {"ttg.num-warps" = 8 : i32} {
 
 module attributes {"ttg.num-warps" = 8 : i32, ttg.target = "cuda:90"} {
   // CHECK-LABEL: @test_tma_copy_barrier_resolution
-  tt.func @test_tma_copy_barrier_resolution(%a_desc: !tt.tensordesc<tensor<64x32xbf16, #shared>>) {
+  tt.func @test_tma_copy_barrier_resolution(%a_desc: !tt.tensordesc<64x32xbf16, #shared>) {
     %c0_i32 = arith.constant 0 : i32
     %true = arith.constant true
 
@@ -113,7 +113,7 @@ module attributes {"ttg.num-warps" = 8 : i32, ttg.target = "cuda:90"} {
     %start_counter = proton_gpu.read_counter : i32
     proton_gpu.circular_store start %segment, %start_counter {scopeId = 0 : i32} : !proton_gpu.segment<1024, #smem, warp>, i32
 
-    ttng.async_tma_copy_global_to_local %a_desc[%c0_i32, %c0_i32] %data_smem, %barriers, %true : !tt.tensordesc<tensor<64x32xbf16, #shared>>, !ttg.memdesc<1xi64, #shared1, #smem, mutable> -> !ttg.memdesc<64x32xbf16, #shared, #smem, mutable>
+    ttng.async_tma_copy_global_to_local %a_desc[%c0_i32, %c0_i32] %data_smem, %barriers, %true : !tt.tensordesc<64x32xbf16, #shared>, !ttg.memdesc<1xi64, #shared1, #smem, mutable> -> !ttg.memdesc<64x32xbf16, #shared, #smem, mutable>
 
     // CHECK: proton_gpu.circular_store end %{{.*}}, %{{.*}}
     %end_counter = proton_gpu.read_counter : i32

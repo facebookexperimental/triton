@@ -111,8 +111,12 @@ static int minNumInterleavedCommitOps(Operation *waitOp) {
     return 0;
   };
 
+  // For AsyncWaitOp ops that do not come with a token to track the specific
+  // copy group, respect the original pending number. Such case is most likely
+  // from user code. The compiler should not generate a non-zero pending number
+  // if it does not know exactly which group to track.
   if (waitOp->getNumOperands() == 0)
-    return 0;
+    return cast<ttg::AsyncWaitOp>(waitOp).getNum();
 
   // Multi-token waits: take the min of minOverHistories across operands. Both
   // the captured `minCommitNumber` and the returned bailout-0s are folded in.
@@ -134,13 +138,18 @@ static int minNumInterleavedCommitOps(Operation *waitOp) {
 /// Update wait op number by analyzing the number of async_commit_group ops
 /// along all paths.
 void mlir::triton::updateWaits(ModuleOp module) {
-  llvm::SmallSetVector<ttg::AsyncWaitOp, 8> waitOps;
+  llvm::SmallSetVector<Operation *, 8> waitOps;
   module.walk([&](ttg::AsyncWaitOp waitOp) {
     int minNumCommits = minNumInterleavedCommitOps(waitOp);
     waitOp.setNum(minNumCommits);
     waitOps.insert(waitOp);
   });
-  tt::combineRedundantWaitOps(waitOps);
+  tt::combineRedundantWaitOps(
+      waitOps, [](Operation *op) { return isa<ttg::AsyncCommitGroupOp>(op); },
+      [](OpBuilder &b, Location loc, ValueRange operands,
+         unsigned num) -> Operation * {
+        return ttg::AsyncWaitOp::create(b, loc, operands, num);
+      });
 }
 
 // Add the given values as operands of the given wait, and replace all uses of
@@ -236,6 +245,8 @@ static void threadValuesThroughWait(ttng::WarpGroupDotWaitOp wait,
   }
   wait->erase();
 }
+
+namespace {
 
 // Split the LHS of a RSWGMMADot operation into multiple
 // tensors of size MxnewK via SplitOps
@@ -380,6 +391,8 @@ splitRSDots(const llvm::MapVector<Operation *, int> &dots) {
   }
   return ret;
 }
+
+} // namespace
 
 // Determines whether a given MMAv3 dot op, represented as ttng.warp_group_dot,
 // needs a wait immediately after it.

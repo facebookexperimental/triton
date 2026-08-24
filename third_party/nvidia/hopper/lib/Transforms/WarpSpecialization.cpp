@@ -1,3 +1,4 @@
+#include "lib/Dialect/TritonGPU/Transforms/WarpSpecialization/PartitionAttrs.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Pass/Pass.h"
@@ -6,6 +7,7 @@
 #include "nvidia/hopper/include/Transforms/Passes.h"
 #include "nvidia/hopper/lib/Transforms/WarpSpecialization/CodePartitionUtility.h"
 #include "nvidia/hopper/lib/Transforms/WarpSpecialization/WarpSpecializationPipeline.h"
+#include "nvidia/include/Dialect/NVGPU/IR/Dialect.h"
 #include "nvidia/include/Dialect/NVWS/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/Partition.h"
@@ -23,6 +25,19 @@
 #define LDBG(X) LLVM_DEBUG(DBGS() << X << "\n")
 
 namespace mlir {
+
+// A GPU is Blackwell-class (sm_100+) when its major compute capability is >= 10
+// (capability is encoded as major*10 + minor, e.g. 90 for Hopper, 100 for
+// Blackwell).
+static bool capabilityIsBlackwell(int capability) {
+  return capability / 10 > 9;
+}
+
+// Warp-group split for warp specialization: one producer (load) group plus N
+// consumer (compute) groups. Blackwell needs fewer groups than Hopper because
+// its MMA is issued by a single warp.
+static constexpr unsigned kNumWarpGroupsBlackwell = 2;
+static constexpr unsigned kNumWarpGroupsHopper = 3;
 
 // Helper to get printing flags with location info enabled
 static OpPrintingFlags getOpPrintingFlagsWithLoc() {
@@ -42,7 +57,7 @@ static LogicalResult cleanupWarpSpecializedLoops(Operation *op) {
   return applyPatternsGreedily(op, std::move(patterns));
 }
 
-void doLowerSubtiledRegionsWithNVWSOps(triton::FuncOp &funcOp) {
+void doLowerSubtiledRegionsWithNVWSOps(triton::FuncOp funcOp) {
   namespace ttng = triton::nvidia_gpu;
   namespace nvws = triton::nvws;
   SmallVector<ttng::SubtiledRegionOp> toInline;
@@ -60,7 +75,7 @@ void doLowerSubtiledRegionsWithNVWSOps(triton::FuncOp &funcOp) {
     ttng::lowerSubtiledRegion(op);
 }
 
-void doLowerRemainingSubtiledRegions(triton::FuncOp &funcOp) {
+void doLowerRemainingSubtiledRegions(triton::FuncOp funcOp) {
   namespace ttng = triton::nvidia_gpu;
   SmallVector<ttng::SubtiledRegionOp> remaining;
   funcOp.walk([&](ttng::SubtiledRegionOp op) { remaining.push_back(op); });
@@ -68,14 +83,14 @@ void doLowerRemainingSubtiledRegions(triton::FuncOp &funcOp) {
     ttng::lowerSubtiledRegion(op);
 }
 
-void doGenerateSubtiledRegion(triton::FuncOp &funcOp) {
+void doGenerateSubtiledRegion(triton::FuncOp funcOp) {
   auto moduleOp = funcOp->getParentOfType<ModuleOp>();
   PassManager pm(moduleOp.getContext());
   pm.addPass(triton::nvidia_gpu::
                  createTritonNvidiaGPUTestGenerateSubtiledRegionPass());
   // OptimizeTMemLayouts runs later via add_optimize_tmem_layouts in
   // compiler.py. This avoids transforming bare splits into tmem_subslice
-  // ops that lack async_task_id and would crash createChannelPost.
+  // ops that lack async_task_id and would crash createAllocChannel.
   (void)pm.run(moduleOp);
 }
 
@@ -88,37 +103,12 @@ public:
   using impl::NVGPUWarpSpecializationBase<
       NVGPUWarpSpecializationPass>::NVGPUWarpSpecializationBase;
 
-  // Remove the warp_specialize attribute from all loops in the function, plus
-  // any partition metadata that the earlier `tritongpu-partition-scheduling`
-  // pass may have written. The two passes form a pair: when this pass takes
-  // an early-exit and skips warp specialization (e.g. else-block fallback),
-  // leaving `ttg.partition` / `ttg.partition.stages` /
-  // `ttg.warp_specialize.tag` behind on ops + loops produces a half-tagged
-  // state — the downstream `tritongpu-pipeline` pass treats partition-tagged
-  // regions as WS regions and crashes when sibling ops in an scf.if/else aren't
-  // tagged. Stripping everything ensures downstream sees a plain (non-WS) loop.
-  void removeWarpSpecializeAttr(triton::FuncOp funcOp) {
-    auto stripLoop = [](Operation *loop) {
-      loop->removeAttr(mlir::triton::kWarpSpecializeAttrName);
-      loop->removeAttr(mlir::triton::gpu::kPartitionStagesAttrName);
-      loop->removeAttr(mlir::triton::gpu::kWarpSpecializeTagAttrName);
-      loop->removeAttr(kPartitionTypesAttrName);
-    };
-    funcOp->walk([&](scf::ForOp forOp) { stripLoop(forOp); });
-    funcOp->walk([&](scf::WhileOp whileOp) { stripLoop(whileOp); });
-    funcOp->walk([&](Operation *op) {
-      // Strip both the partition id (`ttg.partition`) and the task id
-      // (`async_task_id`). The task id is only present once `doTaskIdPropagate`
-      // has run (e.g. the atomic-broadcast reject path bails after
-      // propagation); for the earlier bail-outs it simply does not exist yet
-      // and this is a no-op. Leaving either behind produces a half-tagged state
-      // that the downstream `tritongpu-pipeline` pass mis-treats as a WS
-      // region. Use the shared helper so the attr name lives in one place.
-      removeAsyncTaskIds(op);
-      op->removeAttr(mlir::triton::gpu::kPartitionAttrName);
-      op->removeAttr(mlir::triton::gpu::kPartitionOutputsAttrName);
-    });
-  }
+  // Reject warp specialization for this function: strip the WS metadata so the
+  // downstream pipeline sees a plain, compilable non-WS kernel. This is the
+  // single reject epilogue shared by the early-exit paths in runOnFuncOp; use
+  // it as `return bailOut(funcOp);`. The canonical WS-metadata set lives in the
+  // shared `removeWarpSpecMetadata` (CodePartitionUtility.h).
+  void bailOut(triton::FuncOp funcOp) { removeWarpSpecMetadata(funcOp); }
 
   // Dump the whole module to llvm::dbgs() after a pipeline step, gated on the
   // `dump-intermediate-steps` pass option. Collapses the identical dump blocks
@@ -133,62 +123,97 @@ public:
   }
 
   void runOnFuncOp(triton::FuncOp funcOp) {
+    // Warp specialization is enabled for this function if any op carries WS
+    // metadata: an `async_task_id` or `ttg.partition` tag, or a loop marked
+    // with the warp-specialize attribute. A single walk with early-out
+    // suffices.
     bool enabled = false;
     funcOp->walk([&](Operation *op) {
-      if (auto attr = op->getAttrOfType<DenseI32ArrayAttr>("async_task_id"))
+      if (op->getAttrOfType<DenseI32ArrayAttr>(kAsyncTaskIdAttrName) ||
+          op->getAttrOfType<DenseI32ArrayAttr>(
+              triton::gpu::kPartitionAttrName) ||
+          (isa<scf::ForOp, scf::WhileOp>(op) &&
+           op->hasAttr(mlir::triton::kWarpSpecializeAttrName))) {
         enabled = true;
-      if (auto attr = op->getAttrOfType<DenseI32ArrayAttr>(
-              triton::gpu::kPartitionAttrName))
-        enabled = true;
+        return WalkResult::interrupt();
+      }
+      return WalkResult::advance();
     });
-    if (!enabled) {
-      SmallVector<scf::ForOp> loops;
-      funcOp->walk([&](scf::ForOp forOp) {
-        if (forOp->hasAttr(mlir::triton::kWarpSpecializeAttrName))
-          loops.push_back(forOp);
-      });
-      if (!loops.empty())
-        enabled = true;
-    }
     if (!enabled)
       return;
 
     int numWarps = mlir::triton::gpu::lookupNumWarps(funcOp);
     if (numWarps < 4) {
       LDBG("Warp specialization requires at least 4 warps. Skipping.");
-      removeWarpSpecializeAttr(funcOp);
-      return;
-    }
-
-    // FIXME: skip warpspec if there is else block. Need to improve
-    // CodePartitioning to correctly handle channels in else block.
-    bool hasElse = false;
-    funcOp->walk([&](scf::IfOp ifOp) {
-      if (ifOp.elseBlock()) {
-        for (Operation &op : ifOp.elseBlock()->getOperations()) {
-          if (!isa<scf::YieldOp>(&op))
-            hasElse = true;
-        }
-      }
-    });
-    if (hasElse) {
-      LDBG("Warp specialization does not support else blocks. Skipping.");
-      removeWarpSpecializeAttr(funcOp);
-      return;
+      return bailOut(funcOp);
     }
 
     OpBuilder builder(funcOp);
     auto moduleOp = funcOp->getParentOfType<ModuleOp>();
     // FIXME: skip data partitioning for Blackwell.
-    bool ForBlackWell = (capability / 10) > 9;
-    unsigned numWarpGroups = ForBlackWell ? 2 : 3;
+    bool isBlackwell = capabilityIsBlackwell(capability);
+    unsigned numWarpGroups =
+        isBlackwell ? kNumWarpGroupsBlackwell : kNumWarpGroupsHopper;
 
-    int retCode = doTaskIdPropagate(funcOp);
-    if (retCode == -1) {
+    if (failed(doTaskIdPropagate(funcOp))) {
       signalPassFailure();
       return;
     }
     dumpAfter(moduleOp, "doTaskIdPropagate");
+
+    // Final eligibility gate, and the last one before the pipeline starts
+    // rewriting ops. `enabled` above only proves someone *asked* for warp
+    // specialization (a `tt.warp_specialize` loop marker). Whether there is
+    // anything to specialize is decided by the partitions, which
+    // PartitionSchedulingMeta assigns as `ttg.partition` and doTaskIdPropagate
+    // materializes as `async_task_id`. With none at all there is no partition
+    // to place anything in, so doCodePartition creates no channels,
+    // insertAsyncComm never calls optimizeTMALoads, and every subsequent step
+    // is a no-op.
+    //
+    // That is not merely wasted work. doConvertDescriptorLoadsToNVWS below
+    // rewrites every `tt.descriptor_load` into `nvws.descriptor_load`
+    // unconditionally, and optimizeTMALoads (during code partitioning) is the
+    // only thing that ever erases one -- there is no rollback path. Converting
+    // a function we are not going to specialize therefore strands the NVWS op
+    // in the IR, where it survives to LLVM translation and fails as
+    // "LLVM Translation failed for operation:
+    // builtin.unrealized_conversion_cast" on the backward casts feeding it.
+    //
+    // PartitionSchedulingMeta assigns no partitions when it finds no MMA to
+    // build producer/consumer roles around -- e.g. a GEMM whose `tt.dot` is an
+    // IEEE fp32 dot, which lowers to FMA rather than wgmma/tcgen5. Note this
+    // gate is deliberately phrased as "no partitions" and not "no MMA": the
+    // no-MMA reduction kernels (RMS norm / LayerNorm / softmax) DO get
+    // partitions from PSM's no-MMA path and must keep specializing.
+    if (getNestedAsyncTaskIds(funcOp).empty()) {
+      LDBG("Warp specialization found no partitions to specialize. "
+           "Skipping.");
+      return bailOut(funcOp);
+    }
+
+    // Code partitioning cannot yet place communication channels in both sides
+    // of an IfOp. An IfOp whose complete then/else region belongs to one task
+    // does not need such a channel, however, and specialization already knows
+    // how to clone both regions and their yields. Check this after task ID
+    // propagation so the decision uses the materialized nested task IDs.
+    bool hasUnsupportedElse = false;
+    funcOp->walk([&](scf::IfOp ifOp) {
+      if (!ifOp.elseBlock() || hasUnsupportedElse)
+        return;
+      bool hasNonTrivialElse =
+          llvm::any_of(ifOp.elseBlock()->getOperations(),
+                       [](Operation &op) { return !isa<scf::YieldOp>(op); });
+      if (!hasNonTrivialElse)
+        return;
+      SmallVector<AsyncTaskId> taskIds = getNestedAsyncTaskIds(ifOp);
+      hasUnsupportedElse = taskIds.size() != 1;
+    });
+    if (hasUnsupportedElse) {
+      LDBG("Warp specialization only supports else blocks contained in one "
+           "task. Skipping.");
+      return bailOut(funcOp);
+    }
 
     // Cross-partition run-once, loop-carried "claim the next tile" support for
     // dynamic-persistent kernels. Handles both the `tt.atomic_rmw` tile counter
@@ -196,15 +221,14 @@ public:
     // run the claim once in the owner/producer partition and broadcast the
     // loop-carried result(s) to every partition through SMEM, or gracefully
     // bail out of warp specialization (unsupported shape). On a reject we strip
-    // all WS metadata via removeWarpSpecializeAttr (which also clears the
+    // all WS metadata via removeWarpSpecMetadata (which also clears the
     // `async_task_id`s that doTaskIdPropagate materialized above) so downstream
     // sees a plain, compilable non-WS kernel. The broadcast channel depth comes
     // from the `tile-prefetch-depth` pass option (a Python knob), not an env
     // var.
     if (failed(doDynamicTileBroadcast(funcOp, tilePrefetchDepth))) {
       LDBG("Dynamic tile broadcast rejected warp specialization. Skipping.");
-      removeWarpSpecializeAttr(funcOp);
-      return;
+      return bailOut(funcOp);
     }
     dumpAfter(moduleOp, "doDynamicTileBroadcast");
 
@@ -224,17 +248,24 @@ public:
     // persistent kernels.
     removeRedundantTmemZeroStores(funcOp);
 
+    if (failed(doConvertDescriptorLoadsToNVWS(funcOp))) {
+      signalPassFailure();
+      return;
+    }
+    dumpAfter(moduleOp, "doConvertDescriptorLoadsToNVWS");
+
     // Canonicalize the SMEM/TEM buffers.
     // Create buffers for register channels.
-    doBufferAllocation(funcOp);
+    if (failed(doBufferAllocation(funcOp))) {
+      signalPassFailure();
+      return;
+    }
     dumpAfter(moduleOp, "doBufferAllocation");
 
     doHoistLoopInvariantTMEMStore(funcOp);
     dumpAfter(moduleOp, "doHoistLoopInvariantTMEMStore");
 
-    if (failed(doMemoryPlanner(funcOp, numStages, /*readDecisionFile=*/"",
-                               /*writeDecisionFile=*/"",
-                               /*smemAllocAlgo=*/1, smemBudget))) {
+    if (failed(doMemoryPlanner(funcOp, numStages, smemBudget))) {
       signalPassFailure();
       return;
     }
@@ -245,14 +276,15 @@ public:
       dumpAfter(moduleOp, "doGenerateSubtiledRegion");
     }
 
-    doAnnotateTMAStoreWaits(funcOp);
-    dumpAfter(moduleOp, "doAnnotateTMAStoreWaits");
+    if (tmaStorePipelining) {
+      doAnnotateTMAStoreWaits(funcOp);
+      dumpAfter(moduleOp, "doAnnotateTMAStoreWaits");
 
-    doValidateTMAStoreAnnotations(funcOp);
-    dumpAfter(moduleOp, "doValidateTMAStoreAnnotations");
+      doValidateTMAStoreAnnotations(funcOp);
+      dumpAfter(moduleOp, "doValidateTMAStoreAnnotations");
+    }
 
-    doCodePartitionPost(funcOp, numStages);
-    // Label kept as "doCodePartition" for output stability (see WS-15).
+    doCodePartition(funcOp, numStages);
     dumpAfter(moduleOp, "doCodePartition");
 
     if (pingpongAutoWS) {
@@ -261,7 +293,9 @@ public:
     }
 
     doLowerSubtiledRegionsWithNVWSOps(funcOp);
-    doTokenLowering(funcOp, numWarpGroups - 1);
+    // One producer (load) group; the remaining groups are consumers.
+    unsigned numConsumerGroups = numWarpGroups - 1;
+    doTokenLowering(funcOp, numConsumerGroups);
     invalidateWarpSpecializeBarriers(funcOp);
     dumpAfter(moduleOp, "doTokenLowering");
 
@@ -278,16 +312,23 @@ public:
     }
     dumpAfter(moduleOp, "cleanupWarpSpecializedLoops");
 
-    doTMAStoreWaitReorder(funcOp);
-    dumpAfter(moduleOp, "doTMAStoreWaitReorder");
+    if (tmaStorePipelining) {
+      doTMAStoreWaitReorder(funcOp);
+      dumpAfter(moduleOp, "doTMAStoreWaitReorder");
+    }
   }
 
   void runOnOperation() override {
-    assert(numStages >= 1 && "numStages must be at least 1");
-    getOperation()->walk([&](triton::FuncOp funcOp) { runOnFuncOp(funcOp); });
+    ModuleOp moduleOp = getOperation();
+    if (numStages < 1) {
+      moduleOp.emitError("nvgpu-warp-specialization requires num-stages >= 1; "
+                         "use 1 for an unpipelined kernel");
+      return signalPassFailure();
+    }
+    moduleOp.walk([&](triton::FuncOp funcOp) { runOnFuncOp(funcOp); });
 
     // Cleanup code generated by warp specialization.
-    if (failed(cleanupWarpSpecializedLoops(getOperation())))
+    if (failed(cleanupWarpSpecializedLoops(moduleOp)))
       return signalPassFailure();
   }
 };

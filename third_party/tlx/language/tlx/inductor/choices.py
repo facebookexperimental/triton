@@ -151,11 +151,9 @@ class TLXInductorChoices(InductorChoices):
         sparse_q_block_size: int,
         sparse_kv_block_size: int,
     ) -> list[Any]:
-        from .flex_attention_templates import (
-            append_tlx_flex_attention_choice,
-        )
+        from .flex_attention_templates import append_tlx_flex
 
-        append_tlx_flex_attention_choice(
+        append_tlx_flex(
             choices,
             configs,
             input_nodes,

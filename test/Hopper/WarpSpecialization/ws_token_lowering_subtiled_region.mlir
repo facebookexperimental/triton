@@ -35,9 +35,9 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
   // CHECK: ttng.async_tma_copy_local_to_global
   // CHECK: ttng.arrive_barrier
   tt.func public @persistent_subtile_token_lowering(
-      %a_desc: !tt.tensordesc<tensor<128x64xf16, #shared>>,
-      %b_desc: !tt.tensordesc<tensor<128x64xf16, #shared>>,
-      %c_desc: !tt.tensordesc<tensor<128x64xf16, #shared>>,
+      %a_desc: !tt.tensordesc<128x64xf16, #shared>,
+      %b_desc: !tt.tensordesc<128x64xf16, #shared>,
+      %c_desc: !tt.tensordesc<128x64xf16, #shared>,
       %M: i32 {tt.divisibility = 16 : i32},
       %N: i32 {tt.divisibility = 16 : i32},
       %K: i32 {tt.divisibility = 16 : i32}) {
@@ -88,11 +88,11 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
           iter_args(%use_acc = %false, %mma_tok = %acc_stored) -> (i1, !ttg.async.token) : i32 {
         %offs_k = arith.muli %ki, %c64_i32 {loop.cluster = 1 : i32, loop.stage = 0 : i32} : i32
         %a = tt.descriptor_load %a_desc[%offs_am, %offs_k] {loop.cluster = 1 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 3>}
-            : !tt.tensordesc<tensor<128x64xf16, #shared>> -> tensor<128x64xf16, #blocked>
+            : !tt.tensordesc<128x64xf16, #shared> -> tensor<128x64xf16, #blocked>
         %a_smem = ttg.local_alloc %a {loop.cluster = 0 : i32, loop.stage = 1 : i32, ttg.partition = array<i32: 3>}
             : (tensor<128x64xf16, #blocked>) -> !ttg.memdesc<128x64xf16, #shared, #smem>
         %b = tt.descriptor_load %b_desc[%offs_bn, %offs_k] {loop.cluster = 1 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 3>}
-            : !tt.tensordesc<tensor<128x64xf16, #shared>> -> tensor<128x64xf16, #blocked>
+            : !tt.tensordesc<128x64xf16, #shared> -> tensor<128x64xf16, #blocked>
         %b_smem = ttg.local_alloc %b {loop.cluster = 0 : i32, loop.stage = 1 : i32, ttg.partition = array<i32: 3>}
             : (tensor<128x64xf16, #blocked>) -> !ttg.memdesc<128x64xf16, #shared, #smem>
         %b_trans = ttg.memdesc_trans %b_smem {loop.cluster = 0 : i32, loop.stage = 1 : i32, order = array<i32: 1, 0>, ttg.partition = array<i32: 0>}
@@ -134,7 +134,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
       %c0_smem = ttg.local_alloc %c0_cvt {ttg.partition = array<i32: 1>}
           : (tensor<128x64xf16, #blocked>) -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
       %tok0 = ttng.async_tma_copy_local_to_global %c_desc[%offs_am_c, %offs_bn_c] %c0_smem {ttg.partition = array<i32: 2>}
-          : !tt.tensordesc<tensor<128x64xf16, #shared>>, !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> !ttg.async.token
+          : !tt.tensordesc<128x64xf16, #shared>, !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> !ttg.async.token
       ttng.async_tma_store_token_wait %tok0 {ttg.partition = array<i32: 2>} : !ttg.async.token
 
       // Tile 1: truncf → local_alloc → TMA store
@@ -146,7 +146,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
       %c1_smem = ttg.local_alloc %c1_cvt {ttg.partition = array<i32: 1>}
           : (tensor<128x64xf16, #blocked>) -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
       %tok1 = ttng.async_tma_copy_local_to_global %c_desc[%offs_am_c, %offs_bn_c2] %c1_smem {ttg.partition = array<i32: 2>}
-          : !tt.tensordesc<tensor<128x64xf16, #shared>>, !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> !ttg.async.token
+          : !tt.tensordesc<128x64xf16, #shared>, !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> !ttg.async.token
       ttng.async_tma_store_token_wait %tok1 {ttg.partition = array<i32: 2>} : !ttg.async.token
 
       scf.yield %tile_id_c_next : i32

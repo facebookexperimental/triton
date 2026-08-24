@@ -488,7 +488,7 @@ def _hstu_attn_fwd_compute(  # noqa C901
             if uih_end < start_m:
                 low_delta = start_m
                 high_delta = start_m + BLOCK_M
-                for start_delta in tl.range(low_delta, high_delta, BLOCK_N, num_stages=0):
+                for start_delta in tl.range(low_delta, high_delta, BLOCK_N, num_stages=1):
                     acc += _hstu_attn_fwd_one_block(
                         start_n=start_delta,
                         seq_len=seq_len,

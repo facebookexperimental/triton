@@ -23,7 +23,6 @@ def main() -> int:
     # single-MMA-group kernels. The persistent structure is what we're
     # testing here, not the exact tile shape.
     BLOCK_M, BLOCK_N, BLOCK_K = 128, 128, 64
-    NUM_SMEM_BUFFERS = 2
 
     shapes = [
         (1024, 1024, 1024),
@@ -59,10 +58,7 @@ def main() -> int:
             BLOCK_M=BLOCK_M,
             BLOCK_N=BLOCK_N,
             BLOCK_K=BLOCK_K,
-            NUM_SMEM_BUFFERS=NUM_SMEM_BUFFERS,
-            num_warps=4,
-            num_ctas=1,
-            num_stages=2,
+            # NUM_SMEM_BUFFERS / NUM_TMEM_BUFFERS + num_warps/num_ctas/num_stages injected by @triton.autotune.
         )
 
         ref = torch.matmul(a, b)

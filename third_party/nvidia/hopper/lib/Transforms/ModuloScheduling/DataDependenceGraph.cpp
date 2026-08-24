@@ -40,14 +40,16 @@ unsigned DataDependenceGraph::addNode(Operation *op,
 }
 
 void DataDependenceGraph::addEdge(unsigned src, unsigned dst, int latency,
-                                  unsigned distance) {
-  edges.push_back(DDGEdge{src, dst, latency, distance});
+                                  unsigned distance, unsigned srcResultIdx) {
+  edges.push_back(DDGEdge{src, dst, latency, distance, srcResultIdx});
   nodes[src].succs.push_back(dst);
   nodes[dst].preds.push_back(src);
 }
 
-DataDependenceGraph DataDependenceGraph::build(scf::ForOp loop,
-                                               const LatencyModel &model) {
+DataDependenceGraph DataDependenceGraph::build(
+    scf::ForOp loop, const LatencyModel &model,
+    const llvm::DenseMap<Operation *, DataPartitionInfo> &partition,
+    llvm::StringRef scheduleAlgo) {
   DataDependenceGraph ddg;
 
   // Phase 1: Create nodes for every op in the loop body (except terminator).
@@ -59,8 +61,14 @@ DataDependenceGraph DataDependenceGraph::build(scf::ForOp loop,
     // is the inner loop's total execution time (II × trip_count), and
     // its pipeline is NONE (handles its own internal pipelining).
     if (auto innerLoop = dyn_cast<scf::ForOp>(op)) {
-      auto innerDDG = DataDependenceGraph::build(innerLoop, model);
-      auto innerSched = runModuloScheduling(innerDDG);
+      auto innerDDG =
+          DataDependenceGraph::build(innerLoop, model, partition, scheduleAlgo);
+      // Pass A.5: the inner MMA may be partitioned; apply the split before
+      // scheduling so the super-node's innerII is the partitioned II, not the
+      // unpartitioned one (which would dilute the outer loop's cost and could
+      // hide a variant that only schedules once the inner MMA is split).
+      innerDDG.applyDataPartition(partition);
+      auto innerSched = runModuloScheduling(innerDDG, scheduleAlgo);
 
       DDGNode node;
       node.op = &op;
@@ -144,7 +152,8 @@ DataDependenceGraph DataDependenceGraph::build(scf::ForOp loop,
       // a single `latency` that captures full delivery, and edges just
       // propagate it.
       int edgeLatency = ddg.nodes[srcIdx].latency;
-      ddg.addEdge(srcIdx, node.idx, edgeLatency, /*distance=*/0);
+      unsigned srcResultIdx = cast<OpResult>(operand).getResultNumber();
+      ddg.addEdge(srcIdx, node.idx, edgeLatency, /*distance=*/0, srcResultIdx);
     }
   }
 
@@ -229,8 +238,9 @@ DataDependenceGraph DataDependenceGraph::build(scf::ForOp loop,
       if (srcNode.pipeline == HWPipeline::TC &&
           dstNode.pipeline == HWPipeline::TC)
         backEdgeLat = std::max(pipelineOccupancy(srcNode), 1);
+      unsigned srcResultIdx = cast<OpResult>(yieldVal).getResultNumber();
       ddg.addEdge(srcIdx, userIt->second, backEdgeLat,
-                  /*distance=*/1);
+                  /*distance=*/1, srcResultIdx);
     }
   }
 
@@ -305,11 +315,18 @@ void DataDependenceGraph::applyDataPartition(
     node.partitionCount = info.count;
     node.partitionDim = info.dim;
     node.mSize = info.mSize;
-    // The bundle issues `count` MMAs back-to-back on the tensor core, so it
-    // ties up the TC pipeline `count`× as long. Scale occupancy so ResMII
-    // reflects the N hardware issues (the result latency is unchanged).
-    node.occupancy =
-        std::max(pipelineOccupancy(node), 1) * static_cast<int>(info.count);
+    // M-split conserves MAC area: the throughput-based occupancy (MACs /
+    // rate — see getMMAOccupancyCycles) of the full-tile MMA already counts
+    // every row the N sub-MMAs issue, so the bundle's TC busy time stays
+    // ~occ_full. The old ×N scale double-counted the area and inflated
+    // ResMII (case2: II 1024→2048 at N=2 for identical MAC work), which
+    // systematically biased any model-cost comparison against partitioning.
+    // What does scale with N is the SM dispatch floor: N sub-issues each
+    // hold the pipe at least selfLatency (the tcgen05 issue cost).
+    int occFull = std::max(pipelineOccupancy(node), 1);
+    int issueFloor =
+        std::max(node.selfLatency, 1) * static_cast<int>(info.count);
+    node.occupancy = std::max(occFull, issueFloor);
   }
 }
 

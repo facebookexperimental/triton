@@ -5,7 +5,7 @@ import triton
 import triton.language as tl
 from test_mxfp import MXFP4Tensor, MXScaleTensor
 import re
-from triton._internal_testing import is_cuda, is_hip, is_hip_cdna3, is_hip_cdna4, is_hip_cdna, is_hip_gfx1250
+from triton._internal_testing import is_cuda, is_hip, is_hip_cdna3, is_hip_cdna4, is_hip_cdna, is_hip_gfx1250, is_rubin, is_blackwell
 
 
 def f8_to_f16(x, dtype):
@@ -47,7 +47,6 @@ def matmul_kernel(  #
     PRECISION: tl.constexpr = "ieee",
     A_TRANS: tl.constexpr = False,
     EPILOGUE_SUBTILE: tl.constexpr = False,
-    dummy: tl.constexpr = 0,
 ):
     pid = tl.program_id(axis=0)
     num_pid_m = tl.cdiv(M, BLOCK_M)
@@ -89,6 +88,32 @@ def matmul_kernel(  #
         tl.store(output_ptrs, accumulator)
 
 
+@triton.jit
+def matmul_i4_m_minor_kernel(w4_ptr, rhs_ptr, output_ptr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+                             BLOCK_K: tl.constexpr):
+    offs_pm = tl.arange(0, BLOCK_M // 2)
+    offs_m = tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    packed = tl.load(w4_ptr + offs_k[None, :] * (BLOCK_M // 2) + offs_pm[:, None])
+    low = (packed << 4) >> 4
+    high = packed >> 4
+    joined = tl.join(low, high)
+    lhs_i8 = tl.reshape(tl.trans(joined, 0, 2, 1), (BLOCK_M, BLOCK_K))
+    lhs = lhs_i8.to(tl.bfloat16)
+
+    rhs = tl.load(rhs_ptr + offs_k[:, None] * BLOCK_N + offs_n[None, :])
+    acc = tl.dot(lhs, rhs, input_precision="tf32")
+    tl.store(output_ptr + offs_m[:, None] * BLOCK_N + offs_n[None, :], acc)
+
+
+def pack_i4_m_minor(x):
+    x = x.T.contiguous().to(torch.int16) & 0xF
+    packed = x[:, 0::2] | (x[:, 1::2] << 4)
+    return packed.to(torch.uint8).view(torch.int8).contiguous()
+
+
 def get_src_element_ty_size(dtype_str):
     if dtype_str == "float8e5":
         return 1
@@ -113,12 +138,12 @@ def get_src_element_ty_size(dtype_str):
         (64, 512, 32, 2),
         (512, 64, 32, 2),
         (64, 16, 32, 4),
-    ],
+        (64, 16, 64, 4),
+    ] + ([(256, 128, 128, 3)] if is_rubin() else []),
 )
 @pytest.mark.parametrize("NUM_CTAS", [1, 2])
 @pytest.mark.parametrize("NUM_WARPS", [4, 8])
 @pytest.mark.parametrize("EPILOGUE_SUBTILE", [True, False])
-@pytest.mark.parametrize("LAYOUT_16x256", [True, False])
 def test_simple_matmul(
     dtype_src_str,
     dtype_dst_str,
@@ -130,8 +155,6 @@ def test_simple_matmul(
     NUM_CTAS,
     device,
     EPILOGUE_SUBTILE,
-    LAYOUT_16x256,
-    monkeypatch,
 ):
     if NUM_CTAS > 1 and (not is_cuda() or torch.cuda.get_device_capability()[0] < 9):
         pytest.skip("Clusters requires nvidia compute capability >= 9")
@@ -155,8 +178,6 @@ def test_simple_matmul(
         pytest.skip("multi-CTAs is broken for mmav2")
     if EPILOGUE_SUBTILE and (is_hip() or NUM_CTAS > 1 or BLOCK_N >= 512):
         pytest.skip("creates convert layout too big to fit in smem")
-    if LAYOUT_16x256 and (not is_cuda() or torch.cuda.get_device_capability()[0] < 10):
-        pytest.skip("skip forcing tmem layout on non blackwell targets.")
     M, N, K = 1024, 512, 256
     torch.manual_seed(42)
     precision = "tf32" if dtype_src_str == "tensorfloat32" else "ieee"
@@ -172,9 +193,6 @@ def test_simple_matmul(
         b = torch.randn(K, N, dtype=dtype_src, device=device)
         A = a
         B = b
-    # pass a dummy constexpr argument to force recompilation.
-    if LAYOUT_16x256:
-        monkeypatch.setenv("TRITON_PREFER_TMEM_16x256_LAYOUT", "1")
     dtype_dst = getattr(torch, dtype_dst_str)
     output = torch.empty((M, N), dtype=dtype_dst, device=device)
     grid = (triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N), 1)
@@ -199,7 +217,6 @@ def test_simple_matmul(
         num_warps=NUM_WARPS,
         num_ctas=NUM_CTAS,
         EPILOGUE_SUBTILE=EPILOGUE_SUBTILE,
-        dummy=LAYOUT_16x256,
     )
     ref_out = torch.matmul(A, B).to(torch.float32)
     output = output.to(torch.float32)
@@ -225,12 +242,30 @@ def test_simple_matmul(
         count = ttgir.count("ttng.tc_gen5_mma")
         assert count == 2, "The TTGIR does not match the expected pattern."
         ptx = k.asm["ptx"]
-        if LAYOUT_16x256:
-            assert "16x256b" in ptx, "PTX does not contain 16x256b"
-        else:
-            if "32x32b" not in ptx and "16x32b" not in ptx:
-                print(ptx)
-            assert ("32x32b" in ptx) or ("16x32b" in ptx), "PTX does not contain 32x32b or 16x32b"
+        if "32x32b" not in ptx and "16x32b" not in ptx:
+            print(ptx)
+        assert ("32x32b" in ptx) or ("16x32b" in ptx), "PTX does not contain 32x32b or 16x32b"
+
+
+def test_i4_m_minor_join_bk16_matmul(device):
+    if not is_cuda():
+        pytest.skip("i4 M-minor join regression is CUDA-specific")
+    if torch.cuda.get_device_capability()[0] < 8:
+        pytest.skip("bf16 dot requires NVIDIA compute capability >= 8")
+
+    M, N, K = 64, 64, 16
+    torch.manual_seed(6120775)
+
+    w_i4 = torch.randint(-8, 8, (M, K), device=device, dtype=torch.int8)
+    w4 = pack_i4_m_minor(w_i4)
+    rhs = torch.randn((K, N), device=device, dtype=torch.float32).bfloat16()
+    output = torch.empty((M, N), device=device, dtype=torch.float32)
+
+    matmul_i4_m_minor_kernel[(1, )](w4, rhs, output, BLOCK_M=M, BLOCK_N=N, BLOCK_K=K, num_warps=2, num_stages=1)
+
+    ref_lhs = w_i4.float().bfloat16()
+    ref = torch.matmul(ref_lhs.float(), rhs.float())
+    torch.testing.assert_close(output, ref, atol=1e-3, rtol=1e-3)
 
 
 # persistent matmul with fused loops
@@ -437,11 +472,12 @@ def fp8e8m0_to_float32(scale):
     return scale
 
 
+@pytest.mark.interpreter
 @pytest.mark.parametrize("M, N, K", [(1024, 512, 256), (128, 256, 256), (128, 128, 128), (2, 4, 64)])
 @pytest.mark.parametrize(
     "BLOCK_M, BLOCK_N, BLOCK_K",
-    [(128, 128, 128), (256, 128, 128), (128, 256, 128), (128, 256, 256), (128, 128, 64), (128, 64, 128),
-     (128, 16, 256)],
+    [(128, 128, 128), (256, 128, 128), (128, 256, 128), (128, 256, 256), (128, 128, 64), (128, 64, 128), (128, 16, 256),
+     (128, 16, 64), (128, 16, 64)] + ([(256, 256, 128)] if is_rubin() else []),
 )
 @pytest.mark.parametrize("NUM_STAGES", [1, 3])
 @pytest.mark.parametrize("NUM_WARPS", [4, 8])
@@ -462,7 +498,7 @@ def test_mxfp(BLOCK_M, BLOCK_N, BLOCK_K, NUM_STAGES, nonKDim, NUM_WARPS, device)
         if (BLOCK_M == 256 or BLOCK_N == 256) and BLOCK_K == 256:
             pytest.skip("Config requires too much shared memory")
 
-    if BLOCK_N == 256 and BLOCK_K == 256:
+    if not is_rubin() and BLOCK_N == 256 and BLOCK_K == 256:
         NUM_STAGES = min(NUM_STAGES, 2)
     torch.manual_seed(42)
     dtype_src_str = "float8e5"
@@ -747,6 +783,7 @@ def _gemm_kernel_preshuffled_scales_cdna4(
     tl.store(c_ptrs, c, mask=c_mask, cache_modifier=".wt")
 
 
+@pytest.mark.interpreter
 @pytest.mark.parametrize("M, N, K", [(1024, 1024, 1024)])
 @pytest.mark.parametrize("BLOCK_M, BLOCK_N, BLOCK_K", [(128, 128, 256), (64, 64, 512), [32, 32, 64]])
 @pytest.mark.parametrize("DTYPE_A, DTYPE_B, FAST_MATH", [("mxfp4", "mxfp4", False), ("fp16", "mxfp8e5", False),
@@ -898,6 +935,7 @@ def test_preshuffle_scale_mxfp_cdna4(M, N, K, BLOCK_M, BLOCK_N, BLOCK_K, DTYPE_A
             assert "tilesPerWarp" not in k.asm["ttgir"]
 
 
+@pytest.mark.interpreter
 @pytest.mark.parametrize("M, N, K", [(1024, 512, 512), (998, 111, 512), (63, 128, 512)])
 @pytest.mark.parametrize("BLOCK_M, BLOCK_N, BLOCK_K", [(128, 128, 128), (256, 128, 128), (128, 256, 128),
                                                        (128, 128, 256), (128, 256, 256)])
@@ -905,10 +943,11 @@ def test_preshuffle_scale_mxfp_cdna4(M, N, K, BLOCK_M, BLOCK_N, BLOCK_K, DTYPE_A
 @pytest.mark.parametrize("USE_2D_SCALE_LOAD", [False, True])
 @pytest.mark.skipif(is_hip() or torch.cuda.get_device_capability()[0] != 10, reason="Requires compute capability == 10")
 def test_blocked_scale_mxfp(M, N, K, BLOCK_M, BLOCK_N, BLOCK_K, NUM_STAGES, USE_2D_SCALE_LOAD, device):
-    if BLOCK_N == 256 and BLOCK_K == 256:
-        NUM_STAGES = min(NUM_STAGES, 2)
-    elif BLOCK_K == 256:
-        NUM_STAGES = min(NUM_STAGES, 3)
+    if not is_rubin():
+        if BLOCK_N == 256 and BLOCK_K == 256:
+            NUM_STAGES = min(NUM_STAGES, 2)
+        elif BLOCK_K == 256:
+            NUM_STAGES = min(NUM_STAGES, 3)
     # since the block size are big we use num_warps = 8 to avoid pressure problems.
     num_warps = 8
     torch.manual_seed(42)
@@ -1094,6 +1133,7 @@ def lhs_in_tmem_kernel_mxfp(  #
     tl.store(output_ptrs, accumulator)
 
 
+@pytest.mark.interpreter
 @pytest.mark.skipif(is_hip() or torch.cuda.get_device_capability()[0] != 10, reason="Requires compute capability == 10")
 def test_lhs_in_tmem_mxfp(device, monkeypatch):
     _knob_promote_lhs_to_tmem(monkeypatch)
@@ -1211,6 +1251,7 @@ def block_scale_fp4_matmul(  #
     tl.store(output_ptrs, accumulator, mask=c_mask)
 
 
+@pytest.mark.interpreter
 @pytest.mark.parametrize("M, N, K", [(1024, 512, 256)])
 @pytest.mark.parametrize(
     "BLOCK_M, BLOCK_N, BLOCK_K",
@@ -1220,24 +1261,30 @@ def block_scale_fp4_matmul(  #
 @pytest.mark.parametrize("with_a_scale", [True, False])
 @pytest.mark.parametrize("with_b_scale", [True, False])
 @pytest.mark.parametrize("pack_along_k", [True, False])
-@pytest.mark.parametrize(("scale_type", "VEC_SIZE"), [("float8_e8m0fnu", 32), ("float8_e4m3fn", 16)],
-                         ids=["mxfp4", "nvfp4"])
+@pytest.mark.parametrize(
+    ("scale_type", "VEC_SIZE"),
+    [("float8_e8m0fnu", 32), ("float8_e4m3fn", 16), ("float8_e4m3fn", 32)],
+    ids=["mxfp4", "nvfp4", "nvfp4_vec32_rubin"],
+)
 @pytest.mark.parametrize("nonKDim", ([0, 16, 32] if (is_hip_cdna() or is_hip_gfx1250()) else [0]))
 def test_block_scale_fp4(M, N, K, BLOCK_M, BLOCK_N, BLOCK_K, VEC_SIZE, with_a_scale, with_b_scale, pack_along_k,
                          scale_type, nonKDim, device):
     assert M % BLOCK_M == 0
     assert N % BLOCK_N == 0
     assert K % BLOCK_K == 0
+    is_rubin = is_cuda() and torch.cuda.get_device_capability() == (10, 7)
 
     if is_cuda():
         if BLOCK_M < 128 and not pack_along_k:
             pytest.skip("Packing along M/N with BLOCK_M < 128 is not supported on CUDA")
+        if scale_type == "float8_e4m3fn" and VEC_SIZE == 32 and not is_rubin:
+            pytest.skip("NVFP4 vec32 is only supported on Rubin")
         if scale_type == "float8_e4m3fn" and not pack_along_k:
             pytest.skip("Packing along K is required for float8_e4m3fn")
-        if torch.cuda.get_device_capability()[0] != 10 and torch.cuda.get_device_capability()[0] != 12:
-            pytest.skip("Requires compute capability == 10 or 12")
-        if torch.cuda.get_device_capability()[0] == 12 and pack_along_k is False:
-            pytest.skip("Packing along M, N is not supported on SM120")
+        if scale_type == "float8_e4m3fn" and torch.cuda.get_device_capability()[0] < 9:
+            pytest.skip("fp8e4nv not supported on Ampere or older")
+        if BLOCK_N == 256 and BLOCK_K == 256 and torch.cuda.get_device_capability()[0] < 9:
+            pytest.skip("Insufficient SMEM Ampere or older")
         if not (with_a_scale and with_b_scale):
             pytest.skip("None aScale/bScale is only tested on AMD backend for now")
     elif is_hip():
@@ -1318,9 +1365,11 @@ def test_block_scale_fp4(M, N, K, BLOCK_M, BLOCK_N, BLOCK_K, VEC_SIZE, with_a_sc
     )
     torch.testing.assert_close(ref_out, output, atol=1e-3, rtol=1e-3)
     nvfp4_fallback = BLOCK_M < 128
-    if is_cuda() and not nvfp4_fallback:
+    if is_cuda() and torch.cuda.get_device_capability()[0] in (10, 12) and not nvfp4_fallback:
         ptx = k.asm["ptx"]
         if pack_along_k:
+            if scale_type == "float8_e4m3fn" and VEC_SIZE == 32 and is_rubin:
+                assert "kind::mxf4nvf4.block_scale.block32" in ptx
             assert "kind::mxf4" in ptx
         else:
             assert "kind::mxf8f6f4" in ptx
@@ -1405,6 +1454,7 @@ def mxfp8_mxfp4_matmul(  #
     tl.store(output_ptrs, accumulator, mask=c_mask)
 
 
+@pytest.mark.interpreter
 @pytest.mark.parametrize("M, N, K", [(1024, 512, 512)])
 @pytest.mark.parametrize(
     "BLOCK_M, BLOCK_N, BLOCK_K",
@@ -1458,7 +1508,7 @@ def test_mxfp8_mxfp4_matmul(
             pytest.skip("Config requires too much shared memory")
     if not PACK_B_ALONG_K and B_DATA_TYPE != "float4":
         pytest.skip("Pack along K can only be False for float4")
-    if BLOCK_N == 256 and BLOCK_K == 256:
+    if not is_rubin() and BLOCK_N == 256 and BLOCK_K == 256:
         NUM_STAGES = 2
 
     torch.manual_seed(42)
@@ -1551,7 +1601,7 @@ def test_mxfp8_mxfp4_matmul(
         NUM_STAGES=NUM_STAGES,
         **kernel_kwargs,
     )
-    if is_cuda():
+    if is_blackwell() and not is_rubin():
         ttgir = out.asm["ttgir"]
         assert "fp4Padded = true" in ttgir
 
@@ -1615,6 +1665,7 @@ def batched_mxfp_matmul(  #
     tl.store(output_ptrs, accumulator, mask=c_mask)
 
 
+@pytest.mark.interpreter
 @pytest.mark.parametrize("BATCH_SIZE, BLOCK_BATCH_SIZE", [(1, 1), (16, 1), (16, 4)])
 @pytest.mark.parametrize("BLOCK_M, BLOCK_N, BLOCK_K", [(128, 128, 64), (128, 64, 128), (64, 64, 128)])
 @pytest.mark.parametrize("NUM_STAGES", [1, 2 if is_hip() else 3])
@@ -1698,3 +1749,111 @@ def test_batched_mxfp(BATCH_SIZE, BLOCK_BATCH_SIZE, BLOCK_M, BLOCK_N, BLOCK_K, N
     if is_cuda() and torch.cuda.get_device_capability()[0] == 12:
         ptx = out.asm["ptx"]
         assert "mma.sync.aligned.m16n8k32.row.col.kind::mxf8f6f4.block_scale.scale_vec::1X" in ptx
+
+
+@triton.jit
+def nvfp4_ue5m3_matmul(a_ptr, b_ptr, output_ptr, a_scale, b_scale, M, N, K, stride_scale, stride_am, stride_ak,
+                       stride_bk, stride_bn, stride_cm, stride_cn, VEC_SIZE: tl.constexpr, BLOCK_M: tl.constexpr,
+                       BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr):
+    pid = tl.program_id(axis=0)
+    num_pid_m = tl.cdiv(M, BLOCK_M)
+    pid_m = pid % num_pid_m
+    pid_n = pid // num_pid_m
+    offs_am = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_bn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k_packed = tl.arange(0, BLOCK_K // 2)
+    offs_scale_k = tl.arange(0, BLOCK_K // VEC_SIZE)
+
+    a_ptrs = a_ptr + offs_am[:, None] * stride_am + offs_k_packed[None, :] * stride_ak
+    b_ptrs = b_ptr + offs_k_packed[:, None] * stride_bk + offs_bn[None, :] * stride_bn
+    a_scale_ptrs = a_scale + offs_am[:, None] * stride_scale + offs_scale_k[None, :]
+    b_scale_ptrs = b_scale + offs_bn[:, None] * stride_scale + offs_scale_k[None, :]
+
+    accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for _ in tl.range(0, tl.cdiv(K, BLOCK_K)):
+        a = tl.load(a_ptrs)
+        b = tl.load(b_ptrs)
+        scale_a = tl.load(a_scale_ptrs)
+        scale_b = tl.load(b_scale_ptrs)
+        accumulator = tl.dot_scaled(a, scale_a, "e2m1", b, scale_b, "e2m1", accumulator, lhs_k_pack=True,
+                                    rhs_k_pack=True)
+        a_ptrs += (BLOCK_K // 2) * stride_ak
+        b_ptrs += (BLOCK_K // 2) * stride_bk
+        a_scale_ptrs += BLOCK_K // VEC_SIZE
+        b_scale_ptrs += BLOCK_K // VEC_SIZE
+
+    offs_cm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_cn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    output_ptrs = output_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
+    mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+    tl.store(output_ptrs, accumulator, mask=mask)
+
+
+@pytest.mark.skipif(not is_rubin(), reason="Requires Rubin")
+def test_nvfp4_ue5m3_matmul():
+
+    def ue5m3_to_float32(data):
+        data = data.to(torch.uint8)
+        exp = ((data >> 3) & 0x1F).to(torch.int32)
+        mant = (data & 0x7).to(torch.float32)
+        out = torch.empty_like(mant, dtype=torch.float32)
+        is_subnormal = exp == 0
+        is_nan = (exp == 0x1F) & (mant == 7)
+        is_normal = ~(is_subnormal | is_nan)
+        out[is_subnormal] = mant[is_subnormal] * (2.0**-17)
+        out[is_normal] = (1.0 + mant[is_normal] / 8.0) * torch.pow(2.0, exp[is_normal].to(torch.float32) - 15.0)
+        out[is_nan] = torch.nan
+        return out
+
+    def random_ue5m3_scale_tensor(size, device):
+        exp = torch.randint(13, 16, size=size, dtype=torch.uint8, device=device)
+        mant = torch.zeros(size, dtype=torch.uint8, device=device)
+        data = (exp << 3) | mant
+        return data, ue5m3_to_float32(data)
+
+    m, n, k = 1024, 1024, 1024
+    block_m, block_n, block_k = 128, 256, 128
+    num_warps = 8
+    vec_size = 16
+
+    torch.manual_seed(0)
+    a_mxfp4 = MXFP4Tensor(size=(m, k), device="cuda").random()
+    b_mxfp4 = MXFP4Tensor(size=(n, k), device="cuda").random()
+    a = a_mxfp4.to_packed_tensor(dim=1)
+    b = b_mxfp4.to_packed_tensor(dim=1).T.contiguous()
+    a_ref = a_mxfp4.to(torch.float32)
+    b_ref = b_mxfp4.to(torch.float32).T
+
+    a_scale, a_scale_ref = random_ue5m3_scale_tensor((m, k // vec_size), "cuda")
+    b_scale, b_scale_ref = random_ue5m3_scale_tensor((n, k // vec_size), "cuda")
+    a_scale_ref = a_scale_ref.repeat_interleave(vec_size, dim=1)[:m, :k]
+    b_scale_ref = b_scale_ref.repeat_interleave(vec_size, dim=1).T.contiguous()[:k, :n]
+
+    out = torch.empty((m, n), dtype=torch.float32, device="cuda")
+    grid = (triton.cdiv(m, block_m) * triton.cdiv(n, block_n), 1)
+    kernel = nvfp4_ue5m3_matmul[grid](
+        a,
+        b,
+        out,
+        a_scale,
+        b_scale,
+        m,
+        n,
+        k,
+        a_scale.stride(0),
+        a.stride(0),
+        a.stride(1),
+        b.stride(0),
+        b.stride(1),
+        out.stride(0),
+        out.stride(1),
+        vec_size,
+        block_m,
+        block_n,
+        block_k,
+        num_warps=num_warps,
+    )
+
+    ref = torch.matmul(a_ref * a_scale_ref, b_ref * b_scale_ref)
+    torch.testing.assert_close(ref, out, atol=1e-3, rtol=1e-3)
+    assert "kind::mxf4nvf4.block_scale.block16" in kernel.asm["ptx"]

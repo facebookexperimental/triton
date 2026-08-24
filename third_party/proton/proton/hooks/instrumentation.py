@@ -14,7 +14,7 @@ from triton.backends import backends
 
 from .hook import Hook
 from ..flags import flags
-from ..state import enter_state, exit_state, COMPUTE_METADATA_SCOPE_NAME
+from ..state import metadata_state
 from .. import mode
 
 # TODO(fywkevin): add support for major.minor
@@ -39,9 +39,8 @@ class CudaAllocator:
 
         # Create the buffer
         import torch
-        enter_state(COMPUTE_METADATA_SCOPE_NAME)
-        buffer = torch.zeros((aligned_size, ), dtype=torch.uint8, device="cuda")
-        exit_state()
+        with metadata_state():
+            buffer = torch.zeros((aligned_size, ), dtype=torch.uint8, device="cuda")
         self.instrumentation_hook.buffer = buffer
         return buffer
 
@@ -306,7 +305,7 @@ class InstrumentationHook(Hook):
             total_unit = data["num_warps"]
             uid_num = total_unit if self.mode.sampling_strategy == triton_proton.SAMPLING_STRATEGY.NONE else len(
                 sampled_warps)
-            block_num = int(alloc_size / scratch_mem_size)
+            block_num = alloc_size // scratch_mem_size if scratch_mem_size else 0
 
             # Binary trace layout:
             # +------------------+
@@ -358,5 +357,6 @@ class InstrumentationHook(Hook):
             InstrumentationHook.host_buffer = torch.empty(header_size + alloc_size, dtype=torch.uint8, device="cpu")
             config_portion = InstrumentationHook.host_buffer[:header_size]
             config_portion.copy_(torch.tensor(list(header_bytes), dtype=torch.uint8))
-            data_portion = InstrumentationHook.host_buffer[header_size:].view_as(self.buffer)
-            data_portion.copy_(self.buffer.cpu())
+            if self.buffer is not None:
+                data_portion = InstrumentationHook.host_buffer[header_size:].view_as(self.buffer)
+                data_portion.copy_(self.buffer.cpu())

@@ -548,7 +548,7 @@ The FA forward kernel in `amd-fa-pipelined_test.py` ships four variants of incre
 
 | Variant | Kernel | LDS depth | Pipelining mechanism |
 |---|---|---|---|
-| `async_simple` | `_attn_fwd_async_simple` | 1 (single-buffer) | plain async-load + `wait_group(0)`, `num_stages=0` |
+| `async_simple` | `_attn_fwd_async_simple` | 1 (single-buffer) | plain async-load + `wait_group(0)`, `num_stages=1` |
 | `async_prefetch` | `_attn_fwd_async_prefetch` | 2 (double-buffer) | hand modulo-scheduled prologue / hot-loop / epilogue |
 | `persistent` | `_attn_fwd_persistent` | 2 | `async_prefetch` tile body + persistent XCD-pinned zig-zag scheduler |
 | **`cluster`** | **`_attn_fwd_cluster_pipeline` → `_attn_inner_pipelined`** | **2 (2-slot), depth-4** | **rotated 4-cluster `warp_pipeline_stage`** |
@@ -646,7 +646,7 @@ The `local_trans` on K is a **metadata-only memdesc transpose**: it makes `local
 ### Pass B/C, Step 5: Emitted IR (steady-state loop, abbreviated; rendered as TLX for readability)
 
 ```python
-for block_n in tl.range(block_start, block_end - 3, num_stages=0):
+for block_n in tl.range(block_start, block_end - 3, num_stages=1):
     cur_slot = (block_n - block_start) % BUF_DEPTH
     nxt_slot = (block_n + 1 - block_start) % BUF_DEPTH
 

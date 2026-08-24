@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Diagnose compiler, runtime, performance, and numerical issues systematically.">
+  <title>Debugging performance and numerics · FBTriton</title>
+  <link rel="stylesheet" href="assets/tlx.css?v=20260821b">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="../"><span>FB</span>Triton</a>
+    <nav class="topnav" aria-label="Top-level sections"><a href="triton.html">Triton</a>
+<a href="tlx.html" data-current="true">TLX</a>
+<a href="tooling.html">Tooling</a></nav>
+    <a class="repo-link" href="https://github.com/facebookexperimental/triton" target="_blank" rel="noreferrer">View on GitHub ↗</a>
+  </header>
+  <div class="shell">
+<aside class="sidebar">
+      <p class="eyebrow">TLX documentation</p>
+      <nav><a href="tlx.html">Overview</a>
+<a href="getting-started.html">Getting started</a>
+<a href="hardware-support.html">Hardware support</a>
+<a href="buffers.html">Local and remote buffers</a>
+<a href="async-memory.html">Async memory access</a>
+<a href="async-compute.html">Async tensor core operations</a>
+<a href="synchronization.html">Barriers and Cluster Launch Control</a>
+<a href="warp-specialization.html">Warp specialization and clustering</a>
+<a href="utilities.html">Other operations</a>
+<a href="performance-optimization.html">Performance optimization</a>
+<a href="debugging.html" aria-current="page">Debugging performance and numerics</a>
+<a href="kernels.html">Example kernels</a>
+<a href="production-case-studies.html">Production case studies</a>
+<a href="install-and-test.html">Build, install, and test</a>
+<a href="resources.html">More reading</a></nav>
+    </aside>
+    <main>
+      <p class="eyebrow">TLX documentation</p>
+      <h1>Debugging performance and numerics</h1>
+      <p class="lede">Diagnose compiler, runtime, performance, and numerical issues systematically.</p>
+      <article><p>Performance and numerical failures often have different root causes, but the fastest workflow is the same: create one reproducible configuration, inspect the earliest stage where behavior diverges, and change only one variable at a time.</p>
+<h2 id="performance-debugging-workflow">Performance debugging workflow</h2>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><strong>Profile first.</strong> Decide whether the kernel is memory-bound, tensor-core-bound, occupancy-limited, or latency-bound.</div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><strong>Read compiler diagnostics.</strong> Failed pipelining, unavailable tensor-core shapes, register spills, uncoalesced accesses, and failed vectorization often identify the limiting transformation.</div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><strong>Inspect every compilation stage.</strong> Compare TTIR, TTGIR, LLVM IR, and PTX or AMDGPU output rather than reasoning only from Python source.</div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><strong>Diff known-good and regressed builds.</strong> Hold shapes and launch metadata constant while comparing generated IR and selected autotune configurations.</div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><strong>Inspect runtime scheduling.</strong> Warp traces reveal barrier stalls, load/compute imbalance, deadlocks, and instruction issue gaps that static IR cannot.</div></div>
+<p>The <a href="tooling.html">Tooling</a> section summarizes the profiling, tracing, sanitizing, and benchmarking tools used in this workflow.</p>
+<h3 id="common-performance-symptoms">Common performance symptoms</h3>
+<table><thead><tr><th>Symptom</th><th>Likely cause</th><th>First checks</th></tr></thead><tbody><tr><td>Low tensor-core utilization</td><td>Unsupported dot shape/dtype or gaps between MMA issues</td><td>Inspect lowered MMA instructions and producer readiness</td></tr><tr><td>Register spills</td><td>Tiles or live ranges are too large</td><td>Reduce tile size, shorten live ranges, or rebalance registers across tasks</td></tr><tr><td>Memory bandwidth saturation</td><td>Too little reuse or compute overlap</td><td>Increase useful fusion or pipeline overlap; verify coalescing</td></tr><tr><td>Barrier stalls</td><td>Producer/consumer imbalance or incorrect stage cadence</td><td>Compare arrive/wait phases and time spent by each task</td></tr><tr><td>Low occupancy</td><td>Shared-memory, register, or cluster footprint is too large</td><td>Reduce stages, buffers, registers, or cluster size</td></tr><tr><td>Launch overhead dominates</td><td>Work is short or fragmented</td><td>Fuse stages or consider persistent scheduling</td></tr><tr><td>AMD LDS bank conflicts</td><td>Incompatible access pattern and layout</td><td>Try padded or swizzled LDS layouts and re-measure</td></tr></tbody></table>
+<h3 id="useful-compiler-controls">Useful compiler controls</h3>
+<pre><code class="language-bash"># Dump Triton/MLIR compilation stages
+MLIR_ENABLE_DUMP=1 python reproduce.py
+
+# Run through the interpreter when the kernel subset is supported
+TRITON_INTERPRET=1 python reproduce.py
+
+# Show autotuning decisions
+TRITON_PRINT_AUTOTUNING=1 python reproduce.py
+
+# Enable additional Triton diagnostics
+TRITON_DEBUG=1 python reproduce.py</code></pre>
+<h2 id="numerical-debugging-workflow">Numerical debugging workflow</h2>
+<h3 id="preserve-computation-order">Preserve computation order</h3>
+<p>Non-linear operations are sensitive to scale placement. Scaling after an activation is not equivalent to scaling its input.</p>
+<pre><code class="language-python"># Wrong: activation sees the unscaled range
+scores = gelu(tl.dot(q, k_t)) * qk_scale
+
+# Correct: scale before the non-linearity
+scores = gelu(tl.dot(q, k_t) * qk_scale)</code></pre>
+<h3 id="synchronize-asynchronous-consumers">Synchronize asynchronous consumers</h3>
+<p>An epilogue must not read an accumulator or shared buffer until the final producing operation has completed.</p>
+<pre><code class="language-python">with tlx.async_task(num_warps=1):
+    tlx.barrier_wait(dot_done, phase)
+    result = tlx.local_load(accumulator)</code></pre>
+<h3 id="treat-low-precision-formats-explicitly">Treat low-precision formats explicitly</h3>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div>Accumulate FP8, MXFP8, BF16, and FP16 dot products in FP32 unless the algorithm deliberately chooses otherwise.</div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div>Verify scale expansion and reshaping independently from the dot product.</div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div>Track expected ranges before and after quantization, activation, and normalization.</div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div>Use different random seeds when validating stochastic rounding.</div></div>
+<h3 id="expect-reduction-order-differences">Expect reduction-order differences</h3>
+<p>Floating-point addition is not associative. Changing tile shape, stage count, or the number of cooperating warp groups can alter reduction order without indicating a correctness bug. Evaluate error against an algorithm-appropriate tolerance and check whether it grows with problem size.</p>
+<h3 id="isolate-the-first-bad-value">Isolate the first bad value</h3>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div>Compare TLX against a known-correct PyTorch or Triton reference.</div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div>Validate stages separately: loads, dot products, scaling, activation, reductions, then stores.</div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div>Print or store selected intermediate tiles rather than only the final output.</div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div>If only one autotune configuration fails, inspect boundary masks, buffer rotation, and barrier phases for that configuration.</div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div>Repeat the same launch to distinguish deterministic arithmetic differences from races or uninitialized data.</div></div>
+<pre><code class="language-python">torch.testing.assert_close(output, reference, atol=1e-2, rtol=1e-2)
+
+error = (output - reference).abs()
+print(&quot;max abs:&quot;, error.max().item())
+print(&quot;mean abs:&quot;, error.mean().item())</code></pre>
+<p>Tolerance is workload-specific. Typical starting points are around <code>1e-5</code> for FP32, <code>1e-3</code> to <code>1e-2</code> for FP16/BF16, and wider for FP8-family inputs, always with FP32 reference accumulation where practical.</p></article>
+<footer class="pager"><a href="performance-optimization.html">← Performance optimization</a><a class="next" href="kernels.html">Example kernels →</a></footer>
+    </main>
+  </div>
+</body>
+</html>

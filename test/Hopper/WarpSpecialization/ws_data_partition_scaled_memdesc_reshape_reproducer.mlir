@@ -8,8 +8,8 @@
 // CHECK-SAME: !ttg.memdesc<128x256xf32
 // CHECK: ttng.tmem_alloc
 // CHECK-SAME: !ttg.memdesc<128x256xf32
-// CHECK: tt.descriptor_load {{.*}}!tt.tensordesc<tensor<128x128xf8E4M3FN
-// CHECK: tt.descriptor_load {{.*}}!tt.tensordesc<tensor<1x1x1x2x256xui8
+// CHECK: tt.descriptor_load {{.*}}!tt.tensordesc<128x128xf8E4M3FN
+// CHECK: tt.descriptor_load {{.*}}!tt.tensordesc<1x1x1x2x256xui8
 // CHECK: ttng.tmem_alloc
 // CHECK-SAME: tensor<128x4xi8
 // CHECK-SAME: !ttg.memdesc<128x4xi8
@@ -71,13 +71,13 @@ module attributes {"ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32,
         %17 = arith.extsi %arg12 : i32 to i64
         %18 = arith.muli %17, %c3072_i64 : i64
         %19 = tt.addptr %arg0, %18 : !tt.ptr<f8E4M3FN>, i64
-        %20 = tt.make_tensor_descriptor %19, [%3, %c3072_i32], [%c3072_i64, %c1_i64] : !tt.ptr<f8E4M3FN>, !tt.tensordesc<tensor<256x128xf8E4M3FN>>
+        %20 = tt.make_tensor_descriptor %19, [%3, %c3072_i32], [%c3072_i64, %c1_i64] : !tt.ptr<f8E4M3FN>, !tt.tensordesc<256x128xf8E4M3FN>
         %21 = arith.extsi %arg9 : i32 to i64
         %22 = arith.muli %21, %c9437184_i64 : i64
         %23 = tt.addptr %arg1, %22 : !tt.ptr<f8E4M3FN>, i64
-        %24 = tt.make_tensor_descriptor %23, [%c3072_i32, %c3072_i32], [%c3072_i64, %c1_i64] : !tt.ptr<f8E4M3FN>, !tt.tensordesc<tensor<256x128xf8E4M3FN>>
+        %24 = tt.make_tensor_descriptor %23, [%c3072_i32, %c3072_i32], [%c3072_i64, %c1_i64] : !tt.ptr<f8E4M3FN>, !tt.tensordesc<256x128xf8E4M3FN>
         %25 = tt.addptr %arg2, %18 : !tt.ptr<bf16>, i64
-        %26 = tt.make_tensor_descriptor %25, [%3, %c3072_i32], [%c3072_i64, %c1_i64] : !tt.ptr<bf16>, !tt.tensordesc<tensor<256x32xbf16>>
+        %26 = tt.make_tensor_descriptor %25, [%3, %c3072_i32], [%c3072_i64, %c1_i64] : !tt.ptr<bf16>, !tt.tensordesc<256x32xbf16>
         %27 = arith.muli %5, %arg7 : i32
         %28 = arith.muli %27, %c512_i32 : i32
         %29 = arith.muli %arg7, %c512_i32 : i32
@@ -88,14 +88,14 @@ module attributes {"ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32,
         %34 = tt.addptr %arg3, %33 : !tt.ptr<i8>, i64
         %35 = arith.extsi %28 : i32 to i64
         %36 = arith.extsi %29 : i32 to i64
-        %37 = tt.make_tensor_descriptor %34, [%c1_i32, %5, %arg7, %c4_i32, %c256_i32], [%35, %36, %c512_i64, %c256_i64, %c1_i64] : !tt.ptr<i8>, !tt.tensordesc<tensor<1x1x1x4x256xui8>>
+        %37 = tt.make_tensor_descriptor %34, [%c1_i32, %5, %arg7, %c4_i32, %c256_i32], [%35, %36, %c512_i64, %c256_i64, %c1_i64] : !tt.ptr<i8>, !tt.tensordesc<1x1x1x4x256xui8>
         %38 = arith.muli %arg6, %arg7 : i32
         %39 = arith.muli %38, %c512_i32 : i32
         %40 = arith.extsi %arg8 : i32 to i64
         %41 = arith.muli %21, %40 : i64
         %42 = tt.addptr %arg4, %41 : !tt.ptr<i8>, i64
         %43 = arith.extsi %39 : i32 to i64
-        %44 = tt.make_tensor_descriptor %42, [%c1_i32, %arg6, %arg7, %c2_i32, %c256_i32], [%43, %36, %c512_i64, %c256_i64, %c1_i64] : !tt.ptr<i8>, !tt.tensordesc<tensor<1x2x1x2x256xui8>>
+        %44 = tt.make_tensor_descriptor %42, [%c1_i32, %arg6, %arg7, %c2_i32, %c256_i32], [%43, %36, %c512_i64, %c256_i64, %c1_i64] : !tt.ptr<i8>, !tt.tensordesc<1x2x1x2x256xui8>
         %45 = arith.subi %10, %arg10 : i32
         %46 = arith.addi %45, %c151_i32 : i32
         %47 = arith.divsi %46, %c152_i32 : i32
@@ -108,10 +108,10 @@ module attributes {"ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32,
           %54 = arith.muli %51, %c2_i32 : i32
           %55 = scf.for %arg16 = %c0_i32 to %c24_i32 step %c1_i32 iter_args(%arg17 = %cst) -> (tensor<256x256xf32>)  : i32 {
             %86 = arith.muli %arg16, %c128_i32 : i32
-            %87 = tt.descriptor_load %20[%52, %86] : !tt.tensordesc<tensor<256x128xf8E4M3FN>> -> tensor<256x128xf8E4M3FN>
-            %88 = tt.descriptor_load %24[%53, %86] : !tt.tensordesc<tensor<256x128xf8E4M3FN>> -> tensor<256x128xf8E4M3FN>
-            %89 = tt.descriptor_load %37[%c0_i32, %50, %arg16, %c0_i32, %c0_i32] : !tt.tensordesc<tensor<1x1x1x4x256xui8>> -> tensor<1x1x1x4x256xi8>
-            %90 = tt.descriptor_load %44[%c0_i32, %54, %arg16, %c0_i32, %c0_i32] : !tt.tensordesc<tensor<1x2x1x2x256xui8>> -> tensor<1x2x1x2x256xi8>
+            %87 = tt.descriptor_load %20[%52, %86] : !tt.tensordesc<256x128xf8E4M3FN> -> tensor<256x128xf8E4M3FN>
+            %88 = tt.descriptor_load %24[%53, %86] : !tt.tensordesc<256x128xf8E4M3FN> -> tensor<256x128xf8E4M3FN>
+            %89 = tt.descriptor_load %37[%c0_i32, %50, %arg16, %c0_i32, %c0_i32] : !tt.tensordesc<1x1x1x4x256xui8> -> tensor<1x1x1x4x256xi8>
+            %90 = tt.descriptor_load %44[%c0_i32, %54, %arg16, %c0_i32, %c0_i32] : !tt.tensordesc<1x2x1x2x256xui8> -> tensor<1x2x1x2x256xi8>
             %91 = tt.reshape %89 : tensor<1x1x1x4x256xi8> -> tensor<256x4xi8>
             %94 = tt.reshape %90 : tensor<1x2x1x2x256xi8> -> tensor<2x1x32x4x4xi8>
             %95 = tt.trans %94 {order = array<i32: 0, 3, 2, 1, 4>} : tensor<2x1x32x4x4xi8> -> tensor<2x4x32x1x4xi8>
@@ -142,28 +142,28 @@ module attributes {"ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32,
           %69 = tt.trans %68 {order = array<i32: 0, 2, 1>} : tensor<256x2x32xf32> -> tensor<256x32x2xf32>
           %outLHS_10, %outRHS_11 = tt.split %69 : tensor<256x32x2xf32> -> tensor<256x32xf32>
           %70 = arith.truncf %outLHS_2 : tensor<256x32xf32> to tensor<256x32xbf16>
-          tt.descriptor_store %26[%52, %53], %70 : !tt.tensordesc<tensor<256x32xbf16>>, tensor<256x32xbf16>
+          tt.descriptor_store %26[%52, %53], %70 : !tt.tensordesc<256x32xbf16>, tensor<256x32xbf16>
           %71 = arith.addi %53, %c32_i32 : i32
           %72 = arith.truncf %outRHS_3 : tensor<256x32xf32> to tensor<256x32xbf16>
-          tt.descriptor_store %26[%52, %71], %72 : !tt.tensordesc<tensor<256x32xbf16>>, tensor<256x32xbf16>
+          tt.descriptor_store %26[%52, %71], %72 : !tt.tensordesc<256x32xbf16>, tensor<256x32xbf16>
           %73 = arith.addi %53, %c64_i32 : i32
           %74 = arith.truncf %outLHS_4 : tensor<256x32xf32> to tensor<256x32xbf16>
-          tt.descriptor_store %26[%52, %73], %74 : !tt.tensordesc<tensor<256x32xbf16>>, tensor<256x32xbf16>
+          tt.descriptor_store %26[%52, %73], %74 : !tt.tensordesc<256x32xbf16>, tensor<256x32xbf16>
           %75 = arith.addi %53, %c96_i32 : i32
           %76 = arith.truncf %outRHS_5 : tensor<256x32xf32> to tensor<256x32xbf16>
-          tt.descriptor_store %26[%52, %75], %76 : !tt.tensordesc<tensor<256x32xbf16>>, tensor<256x32xbf16>
+          tt.descriptor_store %26[%52, %75], %76 : !tt.tensordesc<256x32xbf16>, tensor<256x32xbf16>
           %77 = arith.addi %53, %c128_i32 : i32
           %78 = arith.truncf %outLHS_8 : tensor<256x32xf32> to tensor<256x32xbf16>
-          tt.descriptor_store %26[%52, %77], %78 : !tt.tensordesc<tensor<256x32xbf16>>, tensor<256x32xbf16>
+          tt.descriptor_store %26[%52, %77], %78 : !tt.tensordesc<256x32xbf16>, tensor<256x32xbf16>
           %79 = arith.addi %53, %c160_i32 : i32
           %80 = arith.truncf %outRHS_9 : tensor<256x32xf32> to tensor<256x32xbf16>
-          tt.descriptor_store %26[%52, %79], %80 : !tt.tensordesc<tensor<256x32xbf16>>, tensor<256x32xbf16>
+          tt.descriptor_store %26[%52, %79], %80 : !tt.tensordesc<256x32xbf16>, tensor<256x32xbf16>
           %81 = arith.addi %53, %c192_i32 : i32
           %82 = arith.truncf %outLHS_10 : tensor<256x32xf32> to tensor<256x32xbf16>
-          tt.descriptor_store %26[%52, %81], %82 : !tt.tensordesc<tensor<256x32xbf16>>, tensor<256x32xbf16>
+          tt.descriptor_store %26[%52, %81], %82 : !tt.tensordesc<256x32xbf16>, tensor<256x32xbf16>
           %83 = arith.addi %53, %c224_i32 : i32
           %84 = arith.truncf %outRHS_11 : tensor<256x32xf32> to tensor<256x32xbf16>
-          tt.descriptor_store %26[%52, %83], %84 : !tt.tensordesc<tensor<256x32xbf16>>, tensor<256x32xbf16>
+          tt.descriptor_store %26[%52, %83], %84 : !tt.tensordesc<256x32xbf16>, tensor<256x32xbf16>
           %85 = arith.addi %arg15, %c152_i32 : i32
           scf.yield %85 : i32
         } {tt.data_partition_factor = 2 : i32, tt.separate_epilogue_store = true, tt.warp_specialize}

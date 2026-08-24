@@ -29,14 +29,19 @@
 #include "triton/Dialect/Triton/IR/Interfaces.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonGPU/Transforms/DescriptorMemoryLayouts.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Tools/LayoutUtils.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/TypeSwitch.h"
+#include "llvm/Support/FormatVariadic.h"
 #include <limits>
+#include <optional>
 
 // clang-format off
 #include "Dialect/TritonAMDGPU/IR/Dialect.h"
 #include "Dialect/TritonAMDGPU/IR/Dialect.cpp.inc"
+#include "Dialect/TritonAMDGPU/IR/TargetFeatures.h"
 // clang-format on
 
 #include "third_party/amd/include/Dialect/TritonAMDGPU/Utility/CommonUtils.h"
@@ -82,6 +87,8 @@ void mlir::triton::amdgpu::TritonAMDGPUDialect::initialize() {
 
 namespace mlir::triton::amdgpu {
 
+namespace {
+
 std::string getStringFromCoords(mlir::triton::AMD::ElemLocationKey coords) {
   std::string result;
   llvm::raw_string_ostream os(result);
@@ -93,8 +100,7 @@ std::string getStringFromCoords(mlir::triton::AMD::ElemLocationKey coords) {
 }
 
 // Helper function to verify TDM block dimensions
-static LogicalResult verifyTDMBlockSize(Operation *op,
-                                        ArrayRef<int64_t> blockShape) {
+LogicalResult verifyTDMBlockSize(Operation *op, ArrayRef<int64_t> blockShape) {
   constexpr int64_t maxBlockSize = std::numeric_limits<uint16_t>::max();
   for (size_t i = 0; i < blockShape.size(); ++i) {
     if (blockShape[i] > maxBlockSize) {
@@ -105,6 +111,110 @@ static LogicalResult verifyTDMBlockSize(Operation *op,
   }
   return success();
 }
+
+// TLX pins explicit shared layouts with a generic PinnedEncodingTrait wrapper.
+// TDM validation is concerned with the physical shared layout underneath it.
+Attribute unwrapPinnedTDMLayout(Attribute layout) {
+  if (!layout)
+    return layout;
+  while (auto pinned = llvm::dyn_cast<gpu::PinnedEncodingTrait>(layout))
+    layout = pinned.getPinnedLayout();
+  if (auto partitioned =
+          llvm::dyn_cast<gpu::PartitionedSharedEncodingAttr>(layout)) {
+    auto inner = llvm::cast<gpu::SharedEncodingTrait>(
+        unwrapPinnedTDMLayout(partitioned.getPartitionLayout()));
+    if (inner != partitioned.getPartitionLayout())
+      layout = gpu::PartitionedSharedEncodingAttr::get(
+          layout.getContext(), partitioned.getNumPartitions(),
+          partitioned.getNumGroups(), partitioned.getPartitionDim(), inner);
+  }
+  return layout;
+}
+
+// Verify the descriptor and allocation carry a consistent TDM shared layout
+LogicalResult verifyTDMLayoutConsistency(Operation *op,
+                                         triton::TensorDescType descTy,
+                                         gpu::MemDescType smemTy) {
+  Attribute descLayout = unwrapPinnedTDMLayout(descTy.getSharedLayout());
+  if (!descLayout)
+    return success();
+  Attribute allocLayout = unwrapPinnedTDMLayout(smemTy.getEncoding());
+  auto descPartitioned =
+      llvm::dyn_cast<gpu::PartitionedSharedEncodingAttr>(descLayout);
+  auto allocPartitioned =
+      llvm::dyn_cast<gpu::PartitionedSharedEncodingAttr>(allocLayout);
+  Attribute effectiveAllocLayout = allocLayout;
+  if (!descPartitioned && allocPartitioned)
+    effectiveAllocLayout = allocPartitioned.getPartitionLayout();
+
+  bool compatible =
+      descLayout == allocLayout || (!descPartitioned && allocPartitioned &&
+                                    descLayout == effectiveAllocLayout);
+  // Padded layouts bake in the tile shape, so compare the physical padding
+  // only.
+  auto descPad = llvm::dyn_cast<gpu::PaddedSharedEncodingAttr>(descLayout);
+  auto allocPad =
+      llvm::dyn_cast<gpu::PaddedSharedEncodingAttr>(effectiveAllocLayout);
+  if (descPad && allocPad)
+    compatible = descPad.getIntervals() == allocPad.getIntervals() &&
+                 descPad.getPaddings() == allocPad.getPaddings();
+
+  if (!compatible && descTy.getShape() != smemTy.getShape() &&
+      llvm::isa<gpu::SwizzledSharedEncodingAttr>(descLayout)) {
+    auto descEncoding = llvm::cast<gpu::SharedEncodingTrait>(descLayout);
+    auto smemTensorTy = RankedTensorType::get(
+        smemTy.getShape(), smemTy.getElementType(), effectiveAllocLayout);
+    compatible = gpu::updateEncodingForShape(op, descEncoding, smemTensorTy) ==
+                 effectiveAllocLayout;
+  }
+
+  if (!compatible)
+    return op->emitOpError("shared layout of the tensor descriptor (")
+           << descLayout
+           << ") is inconsistent with the shared memory allocation layout ("
+           << allocLayout
+           << "); TDM uses a single shared layout so they must match";
+  return success();
+}
+
+// Verify the TDM layout constraints common to all TDM ops
+LogicalResult verifyTDMCommonLayout(Operation *op,
+                                    triton::TensorDescType descTy,
+                                    gpu::MemDescType smemTy) {
+  if (failed(verifyTDMBlockSize(op, descTy.getShape())))
+    return failure();
+
+  auto swizzledEnc = llvm::dyn_cast<gpu::SwizzledSharedEncodingAttr>(
+      unwrapPinnedTDMLayout(smemTy.getEncoding()));
+  if (swizzledEnc && swizzledEnc.getMaxPhase() != 1)
+    return op->emitOpError("TDM does not support swizzling");
+
+  return success();
+}
+
+LogicalResult verifyBufferContiguity(Operation *op, RankedTensorType tensorTy,
+                                     int64_t contiguity) {
+  if (contiguity <= 0 || (contiguity & (contiguity - 1)) != 0)
+    return op->emitError("contiguity must be a positive power-of-two integer");
+
+  Attribute encoding = tensorTy.getEncoding();
+  // Encoding-free tensors and frontend placeholder encodings are valid before
+  // TTGIR layout assignment. Validate per-thread ownership once the encoding
+  // has resolved to a concrete TritonGPU layout.
+  if (!encoding || !isa<triton::gpu::LayoutEncodingTrait>(encoding))
+    return success();
+  if (!isa<triton::gpu::DistributedEncodingTrait>(encoding))
+    return op->emitError("requires a distributed tensor encoding");
+
+  int64_t elementsPerThread = triton::gpu::getTotalElemsPerThread(tensorTy);
+  if (contiguity > elementsPerThread || elementsPerThread % contiguity != 0)
+    return op->emitError() << "contiguity " << contiguity << " must divide the "
+                           << elementsPerThread
+                           << " elements owned by each thread";
+  return success();
+}
+
+} // namespace
 
 LogicalResult ExtractSliceOp::verify() {
   // Basic type/rank checks.
@@ -119,6 +229,10 @@ LogicalResult ExtractSliceOp::verify() {
     return emitError("result element type must match source element type");
   if (srcTy.getRank() != dstTy.getRank())
     return emitError("result rank must be equal to source rank");
+  if (!isa<triton::gpu::DistributedEncodingTrait>(srcTy.getEncoding()))
+    return emitOpError("requires a distributed source layout");
+  if (!isa<triton::gpu::DistributedEncodingTrait>(dstTy.getEncoding()))
+    return emitOpError("requires a distributed result layout");
 
   // Per-dimension shape/offset checks
   auto srcShape = srcTy.getShape();
@@ -451,11 +565,6 @@ LogicalResult ConcatOp::verify() {
                      linearLayoutDst.getBases().lookup(key)};
   };
 
-  auto srcToDstShape = LLVM::AMD::multiDimElementwise<int64_t, int64_t>(
-      dstShape, srcShape, std::divides<unsigned>());
-  std::vector<unsigned> defaultOrder(rank);
-  std::iota(defaultOrder.rbegin(), defaultOrder.rend(), 0);
-
   StringAttr kReg = StringAttr::get(ctx, "register");
   auto dstRegBases = linearLayoutDst.getBases().lookup(kReg);
   int dstRegCount = 1 << dstRegBases.size();
@@ -477,9 +586,6 @@ LogicalResult ConcatOp::verify() {
     // 3.   find, which input tile holds the dst value
     auto multiDimOperandIdx = LLVM::AMD::multiDimElementwise<int32_t, int64_t>(
         elemCoordsArray, srcShape, std::divides<unsigned>());
-    auto linearOperandIdx =
-        linearizeIndices(multiDimOperandIdx, srcToDstShape, defaultOrder);
-
     // 4.   subtract dst coordinates and start coordinates of the tile
 
     for (int dim = 0; dim < rank; ++dim)
@@ -512,17 +618,56 @@ LogicalResult BufferLoadToLocalOp::verify() {
   auto mod = getOperation()->getParentOfType<ModuleOp>();
   if (!mod)
     return success();
-
-  auto arch = mlir::getAMDArch(mod);
-  // buffer_load_to_local is supported only on CDNA3 (gfx942) and CDNA4
-  // (gfx950) -- i.e. AMD::TargetInfo::supportsBufferLoadToLocal() returns
-  // isaFamily in {CDNA3, CDNA4}. We check the arch string directly here rather
-  // than constructing AMD::TargetInfo (or calling deduceISAFamily): both live
-  // in the TritonAMDGPUToLLVM lowering library, which this IR dialect library
-  // (TritonAMDGPUIR) must not depend on.
-  if (!arch || *arch == "gfx942" || *arch == "gfx950")
+  TargetFeatures features = TargetFeatures::fromModuleOp(mod);
+  if (features.getArch().empty() || features.supportsBufferLoadToLocal())
     return success();
   return emitError() << "BufferLoadToLocal unsupported on target architecture";
+}
+
+static LogicalResult verifyCDNA4Only(Operation *op) {
+  auto mod = op->getParentOfType<ModuleOp>();
+  if (!mod)
+    return success();
+  auto arch = mlir::getAMDArch(mod);
+  // Keep low-level, target-free IR tests valid, but reject a known target
+  // before lowering architecture-specific MFMA hazards and register roles.
+  if (!arch || *arch == "gfx950")
+    return success();
+  return op->emitOpError("is supported only on CDNA4 (gfx950)");
+}
+
+LogicalResult BufferLoadOp::verify() {
+  return verifyBufferContiguity(getOperation(),
+                                cast<RankedTensorType>(getOffsets().getType()),
+                                getContiguity());
+}
+
+LogicalResult BufferAtomicRMWOp::verify() {
+  if (failed(verifyBufferContiguity(
+          getOperation(), cast<RankedTensorType>(getOffsets().getType()),
+          getContiguity())))
+    return failure();
+
+  Type elementType = getElementTypeOrSelf(getValue());
+  bool isSupportedType = elementType.isF16() || elementType.isBF16() ||
+                         elementType.isF32() || elementType.isF64() ||
+                         elementType.isInteger(32) || elementType.isInteger(64);
+  if (!isSupportedType)
+    return emitOpError(
+        "supports only f16, bf16, f32, f64, i32, and i64 values");
+
+  auto mod = getOperation()->getParentOfType<ModuleOp>();
+  if (!mod)
+    return success();
+  TargetFeatures features = TargetFeatures::fromModuleOp(mod);
+  if (features.getArch().empty())
+    return success();
+  if (!features.supportsBufferAtomicRMW())
+    return emitOpError("is unsupported on the target architecture");
+  if (getAtomicRmwOp() == RMWOp::FADD &&
+      !features.supportsBufferAtomicFadd(elementType))
+    return emitOpError("fadd is unsupported for this type on the target");
+  return success();
 }
 
 LogicalResult LocalLoadPackedTransposedOp::verify() {
@@ -580,10 +725,263 @@ LogicalResult LocalLoadPackedTransposedOp::verify() {
   return success();
 }
 
+LogicalResult RematerializedRangeOp::verify() {
+  auto tensorTy = getResult().getType();
+  if (tensorTy.getRank() != 1 || !tensorTy.getElementType().isInteger(32))
+    return emitOpError("requires a rank-one i32 tensor result");
+
+  int64_t start = getStart();
+  int64_t end = getEnd();
+  if (end <= start)
+    return emitOpError("requires end to be greater than start");
+  if (tensorTy.getShape()[0] != end - start)
+    return emitOpError() << "result extent must equal end - start ("
+                         << end - start << ")";
+  return success();
+}
+
+static LogicalResult verifyRegisterAllocationContract(Operation *op,
+                                                      RankedTensorType tensorTy,
+                                                      StringRef registerClass,
+                                                      int64_t registersPerGroup,
+                                                      bool allowUnencoded) {
+  namespace ttg = mlir::triton::gpu;
+
+  Attribute encoding = tensorTy.getEncoding();
+  if (!encoding && !allowUnencoded)
+    return op->emitOpError("requires a distributed tensor encoding");
+  if (encoding && !isa<ttg::DistributedEncodingTrait>(encoding))
+    return op->emitOpError("requires a distributed tensor encoding");
+  Type elementType = tensorTy.getElementType();
+  if (!elementType.isIntOrFloat())
+    return op->emitOpError(
+        "requires an integer or floating-point element type");
+  unsigned bitWidth = elementType.getIntOrFloatBitWidth();
+  if (bitWidth != 16 && bitWidth != 32)
+    return op->emitOpError("supports only 16-bit and 32-bit element types");
+  if (registerClass != "agpr" && registerClass != "vgpr")
+    return op->emitOpError("register_class must be \"agpr\" or \"vgpr\"");
+  if (registersPerGroup <= 0 || registersPerGroup > 32 ||
+      (registersPerGroup & (registersPerGroup - 1)) != 0)
+    return op->emitOpError(
+        "registers_per_group must be a power of two between 1 and 32");
+  if (!encoding)
+    return success();
+  int64_t elementsPerGroup = registersPerGroup * 32 / bitWidth;
+  int64_t elementsPerThread = ttg::getTotalElemsPerThread(tensorTy);
+  if (elementsPerThread % elementsPerGroup != 0)
+    return op->emitOpError() << "requires " << elementsPerThread
+                             << " elements per thread to be divisible by the "
+                             << elementsPerGroup << "-element native tuple";
+  return success();
+}
+
+LogicalResult RegisterResidentOp::verify() {
+  return verifyRegisterAllocationContract(
+      getOperation(), getInput().getType(), getRegisterClass(),
+      getRegistersPerGroup(), /*allowUnencoded=*/false);
+}
+
+LogicalResult RegisterHandoffOp::verify() {
+  return verifyRegisterAllocationContract(
+      getOperation(), getInput().getType(), getRegisterClass(),
+      /*registersPerGroup=*/1, /*allowUnencoded=*/true);
+}
+
+LogicalResult MfmaCommitOp::inferReturnTypes(
+    MLIRContext *context, std::optional<Location> location, ValueRange operands,
+    DictionaryAttr attributes, PropertyRef properties, RegionRange regions,
+    SmallVectorImpl<Type> &inferredReturnTypes) {
+  for (Value operand : operands)
+    inferredReturnTypes.push_back(operand.getType());
+  return success();
+}
+
+LogicalResult MfmaCommitOp::verify() {
+  namespace ttg = mlir::triton::gpu;
+
+  if (failed(verifyCDNA4Only(getOperation())))
+    return failure();
+  if (getInputs().size() != getOutputs().size())
+    return emitOpError("requires one output for every input");
+  for (auto [index, input] : llvm::enumerate(getInputs())) {
+    if (input.getType() != getOutputs()[index].getType())
+      return emitOpError() << "input/output pair " << index
+                           << " must have identical types";
+  }
+
+  constexpr int64_t warpSize = 64;
+  bool hasMfmaResult = false;
+  for (auto [index, input] : llvm::enumerate(getInputs())) {
+    auto tensorTy = cast<RankedTensorType>(input.getType());
+    if (tensorTy.getRank() != 2)
+      return emitOpError() << "input " << index << " must be rank two";
+
+    if (tensorTy.getElementType().isF32()) {
+      auto mfma =
+          dyn_cast_or_null<ttg::AMDMfmaEncodingAttr>(tensorTy.getEncoding());
+      if (!mfma || mfma.getVersion() != 4 || !mfma.hasUnitTilesPerWarp())
+        return emitOpError() << "input " << index
+                             << " must use a unit-tile CDNA4 MFMA layout";
+      if (!input.hasOneUse())
+        return emitOpError()
+               << "input " << index
+               << " must be consumed only by this completion boundary";
+      ArrayRef<unsigned> instr = mfma.getInstrShape();
+      int64_t elementsPerFragment = instr[0] * instr[1] / warpSize;
+      if (ttg::getTotalElemsPerThread(tensorTy) % elementsPerFragment != 0)
+        return emitOpError()
+               << "input " << index
+               << " ownership must divide into native MFMA result fragments";
+      hasMfmaResult = true;
+      continue;
+    }
+
+    if (tensorTy.getElementType().isBF16()) {
+      auto dot = dyn_cast<ttg::DotOperandEncodingAttr>(tensorTy.getEncoding());
+      auto mfma = dot ? dyn_cast<ttg::AMDMfmaEncodingAttr>(dot.getParent())
+                      : ttg::AMDMfmaEncodingAttr();
+      if (!dot || !mfma || mfma.getVersion() != 4 ||
+          !llvm::is_contained({4u, 8u}, dot.getKWidth()))
+        return emitOpError()
+               << "input " << index
+               << " must use a CDNA4 BF16 dot-operand layout with kWidth=4/8";
+      ArrayRef<unsigned> instr = mfma.getInstrShape();
+      int64_t fragmentElements =
+          dot.getOpIdx() == 0 ? instr[0] * instr[2] : instr[2] * instr[1];
+      if (fragmentElements <= 0 || fragmentElements % warpSize != 0)
+        return emitOpError()
+               << "input " << index
+               << " native dot fragment must have an integral per-lane "
+                  "element count";
+      int64_t elementsPerFragment = fragmentElements / warpSize;
+      int64_t fragmentBitWidth =
+          elementsPerFragment * tensorTy.getElementTypeBitWidth();
+      if (fragmentBitWidth <= 0 || fragmentBitWidth % 32 != 0)
+        return emitOpError()
+               << "input " << index
+               << " native dot fragment must occupy a positive integral "
+                  "number of 32-bit registers";
+      if (ttg::getTotalElemsPerThread(tensorTy) % elementsPerFragment != 0)
+        return emitOpError()
+               << "input " << index
+               << " ownership must divide into native dot fragments";
+      continue;
+    }
+
+    return emitOpError()
+           << "input " << index
+           << " must be an F32 MFMA result or BF16 dot-operand dependency";
+  }
+  if (!hasMfmaResult)
+    return emitOpError("requires at least one MFMA result");
+  return success();
+}
+
+LogicalResult ScheduledMfmaOp::verify() {
+  namespace ttg = mlir::triton::gpu;
+
+  if (failed(verifyCDNA4Only(getOperation())))
+    return failure();
+
+  auto aTy = getA().getType();
+  auto bTy = getB().getType();
+  auto accTy = getAcc().getType();
+  auto resultTy = getResult().getType();
+  if (aTy.getRank() != 2 || bTy.getRank() != 2 || accTy.getRank() != 2)
+    return emitOpError("requires rank-2 operands and accumulator");
+  Type aElemTy = aTy.getElementType();
+  Type bElemTy = bTy.getElementType();
+  if ((!aElemTy.isBF16() && !aElemTy.isF16()) || aElemTy != bElemTy ||
+      !accTy.getElementType().isF32())
+    return emitOpError(
+        "requires matching BF16 or F16 operands and an F32 accumulator");
+  if (resultTy != accTy)
+    return emitOpError("result type must exactly match the accumulator type");
+  if (aTy.getShape()[0] != accTy.getShape()[0] ||
+      bTy.getShape()[1] != accTy.getShape()[1] ||
+      aTy.getShape()[1] != bTy.getShape()[0])
+    return emitOpError(
+        "operand and accumulator matrix shapes are inconsistent");
+
+  auto mfma = dyn_cast<ttg::AMDMfmaEncodingAttr>(accTy.getEncoding());
+  if (!mfma || mfma.getVersion() != 4 || !mfma.hasUnitTilesPerWarp() ||
+      mfma.getElementBitWidth() != 32)
+    return emitOpError(
+        "requires a CDNA4 F32 MFMA accumulator with unit tiles per wave");
+  ArrayRef<unsigned> instrShape = mfma.getInstrShape();
+  if (instrShape != ArrayRef<unsigned>({32, 32, 16}) &&
+      instrShape != ArrayRef<unsigned>({16, 16, 32}))
+    return emitOpError(
+        "supports only native 32x32x16 and 16x16x32 MFMA shapes");
+
+  auto aDot = dyn_cast<ttg::DotOperandEncodingAttr>(aTy.getEncoding());
+  auto bDot = dyn_cast<ttg::DotOperandEncodingAttr>(bTy.getEncoding());
+  if (!aDot || aDot.getOpIdx() != 0 ||
+      !llvm::is_contained({4u, 8u}, aDot.getKWidth()) ||
+      aDot.getParent() != mfma)
+    return emitOpError(
+        "operand A must use the matching opIdx=0, kWidth=4/8 dot layout");
+  if (!bDot || bDot.getOpIdx() != 1 ||
+      !llvm::is_contained({4u, 8u}, bDot.getKWidth()) ||
+      bDot.getParent() != mfma)
+    return emitOpError(
+        "operand B must use the matching opIdx=1, kWidth=4/8 dot layout");
+  if (aDot.getKWidth() != bDot.getKWidth())
+    return emitOpError("operand dot layouts must use the same kWidth");
+
+  SmallVector<int64_t> aRep =
+      mfma.getRepForOperand(aTy.getShape(), aDot.getKWidth(), 0);
+  SmallVector<int64_t> bRep =
+      mfma.getRepForOperand(bTy.getShape(), bDot.getKWidth(), 1);
+  if (aRep[0] != 1 || bRep[0] != 1 || aRep[2] <= 0 || aRep[2] != bRep[1])
+    return emitOpError(
+        "requires one batch and matching nonempty K fragments per wave");
+
+  // Lowering packs dot operands into eight-element BF16 vectors, which are
+  // the per-lane inputs of one native CDNA4 MFMA.  A kWidth=4 layout therefore
+  // needs an even number of logical K repetitions; otherwise the operand only
+  // describes half of a native K fragment and cannot be lowered.
+  constexpr int64_t elementsPerNativeKFragment = 8;
+  int64_t logicalKElements = aRep[2] * aDot.getKWidth();
+  if (logicalKElements % elementsPerNativeKFragment != 0)
+    return emitOpError(
+        "operand K ownership must contain complete native MFMA fragments");
+  int64_t numRepK = logicalKElements / elementsPerNativeKFragment;
+  if (ttg::getTotalElemsPerThread(aTy) !=
+          aRep[0] * aRep[1] * numRepK * elementsPerNativeKFragment ||
+      ttg::getTotalElemsPerThread(bTy) !=
+          bRep[0] * bRep[2] * numRepK * elementsPerNativeKFragment)
+    return emitOpError(
+        "operand ownership does not match the native MFMA K grid");
+
+  constexpr int64_t warpSize = 64;
+  int64_t elementsPerFragment = instrShape[0] * instrShape[1] / warpSize;
+  int64_t expectedElements = aRep[1] * bRep[2] * elementsPerFragment;
+  if (ttg::getTotalElemsPerThread(accTy) != expectedElements)
+    return emitOpError(
+        "accumulator ownership does not match the native MFMA grid");
+
+  if (getResidentOperand() != "none" && getResidentOperand() != "lhs" &&
+      getResidentOperand() != "rhs")
+    return emitOpError(
+        "resident_operand must be \"none\", \"lhs\", or \"rhs\"");
+  if (getAccumulatorRole() != "transient" &&
+      getAccumulatorRole() != "persistent")
+    return emitOpError(
+        "accumulator_role must be \"transient\" or \"persistent\"");
+  if (getAccumulatorRegisterClass() != "auto" &&
+      getAccumulatorRegisterClass() != "agpr" &&
+      getAccumulatorRegisterClass() != "vgpr")
+    return emitOpError(
+        "accumulator_register_class must be \"auto\", \"agpr\", or \"vgpr\"");
+  return success();
+}
+
 // This pattern removes a concatOp if it has a single input operand.
 // This scenario can potentially happen as a result of ops refinement.
-mlir::LogicalResult foldConcatOpFromSingleSource(amdgpu::ConcatOp op,
-                                                 PatternRewriter &rewriter) {
+static mlir::LogicalResult
+foldConcatOpFromSingleSource(amdgpu::ConcatOp op, PatternRewriter &rewriter) {
   auto sources = op.getSources();
   if (sources.size() == 1) {
     auto source = sources.front();
@@ -608,44 +1006,93 @@ verifyBarrierType(Operation *op, mlir::triton::gpu::MemDescType barrierType) {
   return success();
 }
 
-LogicalResult AsyncTDMCopyGlobalToLocalOp::verify() {
-  auto tensorDescTy = getDesc().getType();
-  auto smemTy = getResult().getType();
+namespace {
+// Validate `warp_used_hint` against the axis-aligned hint rule (see
+// TritonAMDGPUOps.td).  Encoding-specific rules (e.g.
+// PartitionedSharedEncoding) live in verify() since they need the result type.
+LogicalResult validateWarpUsedHint(Operation *op, uint32_t hint,
+                                   int64_t numWarps) {
+  if (!llvm::isPowerOf2_64(numWarps))
+    return op->emitOpError("num_warps must be a power of two when using "
+                           "warp_used_hint, got ")
+           << numWarps;
 
-  // Check that every dimension of the block shape is <= 2^16
-  auto blockShape = tensorDescTy.getBlockType().getShape();
-  auto verifyResult = verifyTDMBlockSize(getOperation(), blockShape);
-  if (failed(verifyResult))
-    return verifyResult;
+  if (numWarps >= 32)
+    return op->emitOpError("num_warps must be less than 32 when using "
+                           "warp_used_hint, got ")
+           << numWarps;
 
-  auto swizzledEnc =
-      llvm::dyn_cast<gpu::SwizzledSharedEncodingAttr>(smemTy.getEncoding());
-  if (swizzledEnc && swizzledEnc.getMaxPhase() != 1)
-    return emitOpError("TDM does not support swizzling");
+  if (hint == 0)
+    return op->emitOpError("warp_used_hint must have at least one bit set");
 
-  auto paddedEnc =
-      llvm::dyn_cast<gpu::PaddedSharedEncodingAttr>(smemTy.getEncoding());
+  // Bits above num_warps - 1 must be zero (no warp at those positions).
+  uint32_t numWarpsMask = (uint32_t{1} << numWarps) - 1;
+  if ((hint & ~numWarpsMask) != 0)
+    return op->emitOpError("warp_used_hint = ")
+           << llvm::formatv("{0:x}", hint)
+           << " sets bits beyond num_warps = " << numWarps;
 
-  // Check for PartitionedSharedEncodingAttr and validate its inner layout
-  auto partitionedEnc =
-      llvm::dyn_cast<gpu::PartitionedSharedEncodingAttr>(smemTy.getEncoding());
+  unsigned K = llvm::popcount(hint);
+  if (!llvm::isPowerOf2_32(K))
+    return op->emitOpError("popcount(warp_used_hint) = ")
+           << K << " must be a power of two (got hint "
+           << llvm::formatv("{0:x}", hint) << ")";
+
+  // Axis-aligned check.  Anchor at i0 = lsb(hint) and OR the shifted
+  // warp indices: `support` is the bits that vary across the active
+  // set.  Legal iff popcount(support) == log2(K) -- pigeonhole forces
+  // the K shifted indices to hit every subset of `support`, i.e. the
+  // active set is selectable by a single mask check.
+  unsigned i0 = llvm::countr_zero(hint);
+  uint32_t support = 0;
+  for (uint32_t mask = hint; mask != 0; mask &= mask - 1) {
+    unsigned w = llvm::countr_zero(mask);
+    support |= static_cast<uint32_t>(w ^ i0);
+  }
+  unsigned logK = llvm::Log2_32(K);
+  unsigned spanned = static_cast<unsigned>(llvm::popcount(support));
+  if (spanned != logK)
+    return op->emitOpError("warp_used_hint = ")
+           << llvm::formatv("{0:x}", hint) << " is not axis-aligned: K = " << K
+           << " active warps span " << spanned
+           << " warpId bit positions, but an axis-aligned hint "
+           << "spans exactly log2(K) = " << logK;
+
+  return success();
+}
+
+LogicalResult verifyTDMSharedMemoryEncoding(Operation *op,
+                                            gpu::MemDescType smemTy) {
+  auto enc = unwrapPinnedTDMLayout(smemTy.getEncoding());
+  auto paddedEnc = llvm::dyn_cast<gpu::PaddedSharedEncodingAttr>(enc);
+  auto swizzledEnc = llvm::dyn_cast<gpu::SwizzledSharedEncodingAttr>(enc);
+
+  // Check for PartitionedSharedEncodingAttr and validate its inner layout.
+  auto partitionedEnc = llvm::dyn_cast<gpu::PartitionedSharedEncodingAttr>(enc);
   if (partitionedEnc) {
     auto partitionLayout = partitionedEnc.getPartitionLayout();
     auto innerSwizzled =
         llvm::dyn_cast<gpu::SwizzledSharedEncodingAttr>(partitionLayout);
     if (innerSwizzled && innerSwizzled.getMaxPhase() != 1)
-      return emitOpError(
+      return op->emitOpError(
           "TDM does not support swizzling in partitioned layout");
 
     auto innerPadded =
         llvm::dyn_cast<gpu::PaddedSharedEncodingAttr>(partitionLayout);
     if (!innerPadded && !innerSwizzled)
-      return emitOpError(
+      return op->emitOpError(
           "Invalid inner layout for partitioned shared memory in TDM");
   }
 
   if (!paddedEnc && !swizzledEnc && !partitionedEnc)
-    return emitOpError("Invalid shared memory layout for TDM");
+    return op->emitOpError("Invalid shared memory layout for TDM");
+
+  if (auto effectivePadded = gpu::getPaddedEncoding(enc)) {
+    if (effectivePadded.getIntervals().size() != 1 ||
+        effectivePadded.getPaddings().size() != 1)
+      return op->emitOpError(
+          "TDM load only supports a single interval-padding pair");
+  }
 
   Type elementType = smemTy.getElementType();
   auto elementBitWidth = elementType.getIntOrFloatBitWidth();
@@ -655,15 +1102,68 @@ LogicalResult AsyncTDMCopyGlobalToLocalOp::verify() {
          llvm::zip(paddedEnc.getIntervals(), paddedEnc.getPaddings())) {
       auto intervalInDwords = interval * elementBitWidth / dwordSize;
       if (intervalInDwords < 2)
-        return emitOpError("TDM padding interval must be at least 2 dwords");
+        return op->emitOpError(
+            "TDM padding interval must be at least 2 dwords");
 
       auto paddingInDwords = padding * elementBitWidth / dwordSize;
       if (paddingInDwords < 1)
-        return emitOpError("TDM padding amount must be at least 1 dword");
+        return op->emitOpError("TDM padding amount must be at least 1 dword");
     }
   }
 
   return success();
+}
+
+LogicalResult verifyPartitionedHintFitsSingleInstruction(
+    Operation *op, gpu::MemDescType smemTy, uint32_t hint,
+    std::optional<size_t> memberIdx = std::nullopt) {
+  auto partitionedEnc = llvm::dyn_cast<gpu::PartitionedSharedEncodingAttr>(
+      unwrapPinnedTDMLayout(smemTy.getEncoding()));
+  if (!partitionedEnc)
+    return success();
+
+  unsigned numLogicalPieces = partitionedEnc.getNumLogicalPieces();
+  assert(numLogicalPieces > 0 &&
+         "PartitionedSharedEncoding must have numLogicalPieces >= 1");
+  unsigned K = llvm::popcount(hint);
+  if (K % numLogicalPieces == 0)
+    return success();
+
+  InFlightDiagnostic diag =
+      op->emitOpError("warp_used_hint with a partitioned shared encoding must "
+                      "select K active warps such that numLogicalPieces "
+                      "divides K so the copy fits in a single TDM instruction");
+  if (memberIdx)
+    diag << " (member " << *memberIdx << " got K = " << K
+         << ", numLogicalPieces = " << numLogicalPieces << ")";
+  else
+    diag << " (got K = " << K << ", numLogicalPieces = " << numLogicalPieces
+         << ", partitionDim = " << partitionedEnc.getPartitionDim() << ")";
+  return failure();
+}
+} // namespace
+
+LogicalResult AsyncTDMCopyGlobalToLocalOp::verify() {
+  auto tensorDescTy = getDesc().getType();
+  auto smemTy = getResult().getType();
+
+  if (failed(verifyTDMCommonLayout(getOperation(), tensorDescTy, smemTy)))
+    return failure();
+  if (failed(verifyTDMSharedMemoryEncoding(getOperation(), smemTy)))
+    return failure();
+
+  if (auto warpUsedHintAttr = getWarpUsedHintAttr()) {
+    uint32_t hint = static_cast<uint32_t>(warpUsedHintAttr.getInt());
+    if (auto numWarps = gpu::maybeLookupNumWarps(getOperation())) {
+      if (failed(validateWarpUsedHint(getOperation(), hint, *numWarps)))
+        return failure();
+    }
+    if (failed(verifyPartitionedHintFitsSingleInstruction(getOperation(),
+                                                          smemTy, hint)))
+      return failure();
+  }
+
+  return verifyTDMLayoutConsistency(getOperation(), tensorDescTy, smemTy);
 }
 
 // -- AsyncCopyLocalToGlobalOp --
@@ -676,23 +1176,68 @@ LogicalResult AsyncCopyLocalToGlobalOp::verify() {
   return success();
 }
 
+LogicalResult AsyncTDMFusedCopyGlobalToLocalOp::verify() {
+  size_t numMembers = getDescs().size();
+  if (numMembers < 2 || numMembers > 4)
+    return emitOpError("requires 2 to 4 members");
+  if (getDests().size() != numMembers)
+    return emitOpError(
+        "requires the same number of descriptors and destinations");
+  if (getWarpUsedHints().size() != numMembers)
+    return emitOpError("requires one warp_used_hint per member");
+
+  auto firstDescTy = cast<triton::TensorDescType>(getDescs().front().getType());
+  unsigned rank = firstDescTy.getShape().size();
+  uint32_t hintUnion = 0;
+  std::optional<int> numWarps = gpu::maybeLookupNumWarps(getOperation());
+  for (auto [idx, member] :
+       llvm::enumerate(llvm::zip(getDescs(), getDests(), getWarpUsedHints()))) {
+    auto [desc, dest, hint] = member;
+    auto tensorDescTy = cast<triton::TensorDescType>(desc.getType());
+    auto smemTy = cast<gpu::MemDescType>(dest.getType());
+    if (failed(verifyTDMCommonLayout(getOperation(), tensorDescTy, smemTy)) ||
+        failed(verifyTDMSharedMemoryEncoding(getOperation(), smemTy)) ||
+        failed(
+            verifyTDMLayoutConsistency(getOperation(), tensorDescTy, smemTy)))
+      return failure();
+
+    if (tensorDescTy.getShape().size() != rank)
+      return emitOpError(
+          "requires all member descriptors to have the same rank");
+    if (tensorDescTy.getElementType().getIntOrFloatBitWidth() !=
+        smemTy.getElementType().getIntOrFloatBitWidth())
+      return emitOpError("requires each descriptor and its destination to "
+                         "have the same element bitwidth");
+
+    uint32_t hintValue = static_cast<uint32_t>(hint);
+    if (numWarps &&
+        failed(validateWarpUsedHint(getOperation(), hintValue, *numWarps)))
+      return failure();
+    if (hintUnion & hintValue)
+      return emitOpError("requires pairwise-disjoint warp_used_hint values");
+    hintUnion |= hintValue;
+
+    if (failed(verifyPartitionedHintFitsSingleInstruction(
+            getOperation(), smemTy, hintValue, idx)))
+      return failure();
+  }
+
+  return success();
+}
+
 LogicalResult AsyncTDMCopyLocalToGlobalOp::verify() {
   auto tensorDescTy = getDesc().getType();
   auto smemTy = getSrc().getType();
 
-  // Check that every dimension of the block shape is <= 2^16
-  auto blockShape = tensorDescTy.getBlockType().getShape();
-  auto verifyResult = verifyTDMBlockSize(getOperation(), blockShape);
-  if (failed(verifyResult))
-    return verifyResult;
+  if (failed(verifyTDMCommonLayout(getOperation(), tensorDescTy, smemTy)))
+    return failure();
 
-  auto swizzledEnc =
-      llvm::dyn_cast<gpu::SwizzledSharedEncodingAttr>(smemTy.getEncoding());
-  if (swizzledEnc && swizzledEnc.getMaxPhase() != 1)
-    return emitOpError("TDM does not support swizzling");
+  auto enc = unwrapPinnedTDMLayout(smemTy.getEncoding());
+  auto paddedEnc = llvm::dyn_cast<gpu::PaddedSharedEncodingAttr>(enc);
+  if (!paddedEnc && !llvm::isa<gpu::SwizzledSharedEncodingAttr>(enc))
+    return emitOpError("Invalid shared memory layout for TDM");
 
-  auto paddedEnc =
-      llvm::dyn_cast<gpu::PaddedSharedEncodingAttr>(smemTy.getEncoding());
+  auto blockShape = tensorDescTy.getShape();
   if (paddedEnc) {
     // Check if we can apply the padding workaround, see the lowering to LLVM
     // for more details.
@@ -701,7 +1246,7 @@ LogicalResult AsyncTDMCopyLocalToGlobalOp::verify() {
       return emitOpError("TDM store only supports single interval paddings.");
 
     auto shapePerCTA = triton::gpu::getShapePerCTA(paddedEnc, blockShape);
-    if (intervals[0] != shapePerCTA[paddedEnc.getOrder().front()])
+    if (intervals[0] != shapePerCTA.back())
       return emitOpError("TDM store padding is only supported when padding "
                          "interval equals the innermost block dimension (got "
                          "padInterval=")
@@ -709,10 +1254,7 @@ LogicalResult AsyncTDMCopyLocalToGlobalOp::verify() {
              << ")";
   }
 
-  if (!paddedEnc && !swizzledEnc)
-    return emitOpError("Invalid shared memory layout for TDM");
-
-  return success();
+  return verifyTDMLayoutConsistency(getOperation(), tensorDescTy, smemTy);
 }
 
 LogicalResult AsyncTDMScatterOp::verify() {
@@ -720,15 +1262,21 @@ LogicalResult AsyncTDMScatterOp::verify() {
   auto smemTy = getSrc().getType();
 
   // TDM scatter mode only supports 2D tensors
-  auto blockShape = tensorDescTy.getBlockType().getShape();
+  auto blockShape = tensorDescTy.getShape();
   if (blockShape.size() != 2)
     return emitOpError("TDM scatter only supports 2D tensors, got ")
            << blockShape.size() << "D";
 
-  // Check that every dimension of the block shape is <= 2^16
-  auto verifyResult = verifyTDMBlockSize(getOperation(), blockShape);
-  if (failed(verifyResult))
-    return verifyResult;
+  if (failed(verifyTDMCommonLayout(getOperation(), tensorDescTy, smemTy)))
+    return failure();
+
+  auto enc = unwrapPinnedTDMLayout(smemTy.getEncoding());
+  if (!llvm::isa<gpu::PaddedSharedEncodingAttr>(enc) &&
+      !llvm::isa<gpu::SwizzledSharedEncodingAttr>(enc))
+    return emitOpError("Invalid shared memory layout for TDM");
+
+  if (smemTy.getElementType().getIntOrFloatBitWidth() < 8)
+    return emitOpError("TDM scatter requires element types of at least 8 bits");
 
   auto dstRowIndicesType = cast<RankedTensorType>(getDstRowIndices().getType());
   if (dstRowIndicesType.getRank() != 1)
@@ -742,14 +1290,7 @@ LogicalResult AsyncTDMScatterOp::verify() {
     return emitOpError("dst_row_indices size must be a power of 2, got ")
            << numIndices;
 
-  auto swizzledEnc =
-      llvm::dyn_cast<gpu::SwizzledSharedEncodingAttr>(smemTy.getEncoding());
-  if (swizzledEnc && swizzledEnc.getMaxPhase() != 1)
-    return emitOpError("TDM does not support swizzling");
-
-  auto paddedEnc =
-      llvm::dyn_cast<gpu::PaddedSharedEncodingAttr>(smemTy.getEncoding());
-  if (paddedEnc) {
+  if (auto paddedEnc = llvm::dyn_cast<gpu::PaddedSharedEncodingAttr>(enc)) {
     // Check if we can apply the padding workaround, see the lowering to LLVM
     // for more details.
     auto intervals = paddedEnc.getIntervals();
@@ -764,17 +1305,7 @@ LogicalResult AsyncTDMScatterOp::verify() {
              << ")";
   }
 
-  if (!paddedEnc && !swizzledEnc)
-    return emitOpError("Invalid shared memory layout for TDM");
-
-  auto shapePerCTA = triton::gpu::getShapePerCTA(smemTy);
-  auto sharedOrder = triton::gpu::getOrder(
-      cast<triton::gpu::SharedEncodingTrait>(smemTy.getEncoding()),
-      shapePerCTA);
-  if (sharedOrder[0] != (sharedOrder.size() - 1))
-    return emitOpError("TDM scatter only supports row-major shared order");
-
-  return success();
+  return verifyTDMLayoutConsistency(getOperation(), tensorDescTy, smemTy);
 }
 
 LogicalResult AsyncTDMGatherOp::verify() {
@@ -782,15 +1313,21 @@ LogicalResult AsyncTDMGatherOp::verify() {
   auto smemTy = getDst().getType();
 
   // TDM gather mode only supports 2D tensors
-  auto blockShape = tensorDescTy.getBlockType().getShape();
+  auto blockShape = tensorDescTy.getShape();
   if (blockShape.size() != 2)
     return emitOpError("TDM gather only supports 2D tensors, got ")
            << blockShape.size() << "D";
 
-  // Check that every dimension of the block shape is <= 2^16
-  auto verifyResult = verifyTDMBlockSize(getOperation(), blockShape);
-  if (failed(verifyResult))
-    return verifyResult;
+  if (failed(verifyTDMCommonLayout(getOperation(), tensorDescTy, smemTy)))
+    return failure();
+
+  auto enc = unwrapPinnedTDMLayout(smemTy.getEncoding());
+  if (!llvm::isa<gpu::PaddedSharedEncodingAttr>(enc) &&
+      !llvm::isa<gpu::SwizzledSharedEncodingAttr>(enc))
+    return emitOpError("Invalid shared memory layout for TDM");
+
+  if (smemTy.getElementType().getIntOrFloatBitWidth() < 8)
+    return emitOpError("TDM gather requires element types of at least 8 bits");
 
   auto srcRowIndicesType = cast<RankedTensorType>(getSrcRowIndices().getType());
   if (srcRowIndicesType.getRank() != 1)
@@ -804,20 +1341,20 @@ LogicalResult AsyncTDMGatherOp::verify() {
     return emitOpError("src_row_indices size must be a power of 2, got ")
            << numIndices;
 
-  auto swizzledEnc =
-      llvm::dyn_cast<gpu::SwizzledSharedEncodingAttr>(smemTy.getEncoding());
-  if (swizzledEnc && swizzledEnc.getMaxPhase() != 1)
-    return emitOpError("TDM does not support swizzling");
+  auto paddedEnc = llvm::dyn_cast<gpu::PaddedSharedEncodingAttr>(enc);
+  if (paddedEnc) {
+    if (!(paddedEnc.getIntervals().size() == 1 &&
+          paddedEnc.getPaddings().size() == 1))
+      return emitOpError(
+          "TDM gather does not support multiple interval-padding pairs");
 
-  auto paddedEnc =
-      llvm::dyn_cast<gpu::PaddedSharedEncodingAttr>(smemTy.getEncoding());
-  if (paddedEnc && !(paddedEnc.getIntervals().size() == 1 &&
-                     paddedEnc.getPaddings().size() == 1))
-    return emitOpError(
-        "TDM gather does not support multiple interval-padding pairs");
-
-  if (!paddedEnc && !swizzledEnc)
-    return emitOpError("Invalid shared memory layout for TDM");
+    if (blockShape.back() % paddedEnc.getIntervals()[0] != 0)
+      return emitOpError(
+                 "TDM gather padding interval must divide the innermost "
+                 "block dimension (got padInterval=")
+             << paddedEnc.getIntervals()[0]
+             << ", innermost dimension=" << blockShape.back() << ")";
+  }
 
   auto shapePerCTA = triton::gpu::getShapePerCTA(smemTy);
   auto sharedOrder = triton::gpu::getOrder(
@@ -832,6 +1369,7 @@ LogicalResult AsyncTDMGatherOp::verify() {
   if (srcRowIndicesType.getEncoding()) {
     auto indexLL = triton::gpu::toLinearLayout(srcRowIndicesType);
     auto kLane = mlir::StringAttr::get(getContext(), "lane");
+    auto kBlock = mlir::StringAttr::get(getContext(), "block");
     auto freeVarMasks = indexLL.getFreeVariableMasks();
     unsigned laneFreeMask = freeVarMasks.lookup(kLane);
     unsigned numLanes = indexLL.getInDimSize(kLane);
@@ -840,6 +1378,63 @@ LogicalResult AsyncTDMGatherOp::verify() {
           "index layout distributes values across lanes, which is "
           "incompatible with the warp-level TDM instruction. Change layout "
           "to broadcast the same indices to all lanes in a warp.");
+
+    // Because indices only describe rows the CGA layout of the indices and the
+    // destination must only match on the row dimension.
+    // How the tensor is distributed across the columns is not relevant for the
+    // indicies and is only encoded in the CGA layout of the destination.
+    auto sharedLL = paddedEnc ? paddedEnc.getLinearComponent()
+                              : triton::gpu::toLinearLayout(smemTy);
+    auto kDim0 = mlir::StringAttr::get(getContext(), "dim0");
+    auto indexBlockIt = indexLL.getBases().find(kBlock);
+    auto sharedBlockIt = sharedLL.getBases().find(kBlock);
+
+    bool indexHasBlockBasis = indexBlockIt != indexLL.getBases().end() &&
+                              !indexBlockIt->second.empty();
+    bool sharedHasBlockBasis = sharedBlockIt != sharedLL.getBases().end() &&
+                               !sharedBlockIt->second.empty();
+
+    if (indexHasBlockBasis != sharedHasBlockBasis) {
+      return emitOpError("TDM gather index and destination layout must both "
+                         "have a block basis or neither have a block basis");
+    } else if (indexHasBlockBasis && sharedHasBlockBasis) {
+      auto indexRowCGA = indexLL.sublayout({kBlock}, {kDim0});
+      auto sharedRowCGA = sharedLL.sublayout({kBlock}, {kDim0});
+      if (!indexRowCGA.equalIgnoringOutDimSizes(sharedRowCGA))
+        return emitOpError("TDM gather index and shared encoding must have "
+                           "the same block basis for the row dimension");
+    }
+  }
+
+  return verifyTDMLayoutConsistency(getOperation(), tensorDescTy, smemTy);
+}
+
+// -- UpdateTensorDescriptorOp --
+LogicalResult UpdateTensorDescriptorOp::verify() {
+  auto descTy = getDesc().getType();
+  size_t rank = descTy.getBlockType().getRank();
+
+  if (!getAddOffsets().empty() && getAddOffsets().size() != rank)
+    return emitOpError("expected ")
+           << rank << " add_offsets to match descriptor rank, got "
+           << getAddOffsets().size();
+
+  if (!getSetBounds().empty() && getSetBounds().size() != rank)
+    return emitOpError("expected ")
+           << rank << " set_bounds to match descriptor rank, got "
+           << getSetBounds().size();
+
+  // At least one mutation parameter must be provided -- a no-op update is
+  // either a user mistake or should be folded by canonicalizer.
+  if (getAddOffsets().empty() && getSetBounds().empty() && !getPred())
+    return emitOpError("must provide at least one of add_offsets, set_bounds, "
+                       "or pred");
+
+  if (getClampBounds()) {
+    if (getAddOffsets().empty())
+      return emitOpError("clamp_bounds requires add_offsets");
+    if (!getSetBounds().empty())
+      return emitOpError("clamp_bounds and set_bounds are mutually exclusive");
   }
 
   return success();
@@ -854,12 +1449,16 @@ LogicalResult InitBarrierOp::verify() {
   return success();
 }
 
+TypedValue<gpu::MemDescType> InitBarrierOp::getBarrier() { return getAlloc(); }
+
 // -- WaitBarrierOp --
 LogicalResult WaitBarrierOp::verify() {
   if (failed(verifyBarrierType(*this, getAlloc().getType())))
     return failure();
   return success();
 }
+
+TypedValue<gpu::MemDescType> WaitBarrierOp::getBarrier() { return getAlloc(); }
 
 // -- ArriveBarrierOp --
 LogicalResult ArriveBarrierOp::verify() {
@@ -868,6 +1467,10 @@ LogicalResult ArriveBarrierOp::verify() {
   if (getCount() < 1)
     return emitOpError("count must be greater than or equal to 1");
   return success();
+}
+
+TypedValue<gpu::MemDescType> ArriveBarrierOp::getBarrier() {
+  return getAlloc();
 }
 
 // -- AsyncCopyMbarrierArriveOp --
@@ -898,9 +1501,8 @@ LogicalResult TDMPrefetchOp::inferReturnTypes(
   }
 
   auto descType = cast<triton::TensorDescType>(ad.getDesc().getType());
-  auto blockType = descType.getBlockType();
-  auto blockShape = blockType.getShape();
-  auto elementType = blockType.getElementType();
+  auto blockShape = descType.getShape();
+  auto elementType = descType.getElementType();
 
   // Lookup the module to get the number of threads per warp, number of warps
   // and number of CTAs
@@ -958,6 +1560,56 @@ LogicalResult ClusterBarrierWaitOp::verify() {
   if (numCTAs <= 1)
     return emitOpError("requires ttg.num-ctas > 1");
   return success();
+}
+
+// -- PredicatedOpInterface implementations --
+
+Value BufferLoadOp::getPredicateOperand() { return getMask(); }
+void BufferLoadOp::setPredicateOperand(Value pred) {
+  getMaskMutable().assign(pred);
+}
+Type BufferLoadOp::getPredicateOperandTypeLike() {
+  return getOffsets().getType();
+}
+
+Value BufferLoadToLocalOp::getPredicateOperand() { return getMask(); }
+void BufferLoadToLocalOp::setPredicateOperand(Value pred) {
+  getMaskMutable().assign(pred);
+}
+Type BufferLoadToLocalOp::getPredicateOperandTypeLike() {
+  return getOffsets().getType();
+}
+
+Value BufferAtomicRMWOp::getPredicateOperand() { return getMask(); }
+void BufferAtomicRMWOp::setPredicateOperand(Value pred) {
+  getMaskMutable().assign(pred);
+}
+Type BufferAtomicRMWOp::getPredicateOperandTypeLike() {
+  return getOffsets().getType();
+}
+
+Value BufferStoreOp::getPredicateOperand() { return getMask(); }
+void BufferStoreOp::setPredicateOperand(Value pred) {
+  getMaskMutable().assign(pred);
+}
+Type BufferStoreOp::getPredicateOperandTypeLike() {
+  return getOffsets().getType();
+}
+
+Value AsyncCopyLocalToGlobalOp::getPredicateOperand() { return getMask(); }
+void AsyncCopyLocalToGlobalOp::setPredicateOperand(Value pred) {
+  getMaskMutable().assign(pred);
+}
+Type AsyncCopyLocalToGlobalOp::getPredicateOperandTypeLike() {
+  return getDst().getType();
+}
+
+Value TDMPrefetchOp::getPredicateOperand() { return getPred(); }
+void TDMPrefetchOp::setPredicateOperand(Value pred) {
+  getPredMutable().assign(pred);
+}
+Type TDMPrefetchOp::getPredicateOperandTypeLike() {
+  return IntegerType::get(getContext(), 1);
 }
 
 } // namespace mlir::triton::amdgpu

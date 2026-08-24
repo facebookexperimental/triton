@@ -128,7 +128,6 @@ static LogicalResult lowerWarpSpecialize(LLVM::LLVMFuncOp func,
     return mlir::emitError(module.getLoc(),
                            "module missing 'ttg.total-num-warps' attribute");
   }
-  unsigned totalNumThreads = totalNumWarpsAttr.getInt() * threadsPerWarp;
 
   // Determine how many registers the worker warps can surrender before they
   // begin execution.
@@ -190,13 +189,17 @@ static LogicalResult lowerWarpSpecialize(LLVM::LLVMFuncOp func,
     // predicate here to select only non default warps
     PTXBuilder ptxBuilder;
     auto clusterArriveOp =
-        *ptxBuilder.create("@!$0 barrier.cluster.arrive.aligned;");
+        *ptxBuilder.create("@!$0 barrier.cluster.arrive.relaxed.aligned;");
     clusterArriveOp({ptxBuilder.newOperand(isDefault, "b")},
                     /*onlyAttachMLIRArgs=*/true);
     auto voidTy = void_ty(ctx);
     ptxBuilder.launch(b, func.getLoc(), voidTy);
   }
-  LLVM::CondBrOp::create(b, b.getLoc(), isDefault, entry, switchLoop);
+  LLVM::CondBrOp::create(
+      b, b.getLoc(), isDefault, entry, ValueRange{}, switchLoop, ValueRange{},
+      std::pair<uint32_t, uint32_t>{
+          static_cast<uint32_t>(defaultNumWarps),
+          static_cast<uint32_t>(totalNumWarpsAttr.getInt() - defaultNumWarps)});
 
   // Forward arguments from the header into the old entry block.
   for (auto [arg, oldArg] :

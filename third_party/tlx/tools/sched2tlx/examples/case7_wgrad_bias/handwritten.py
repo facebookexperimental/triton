@@ -30,6 +30,8 @@ bias task consume each dout tile, so the producer must wait for both before
 reusing the buffer (the MMA's arrival also frees the paired act tile).
 """
 
+import os
+
 import torch
 import triton
 import triton.language as tl
@@ -41,6 +43,24 @@ def _bufidx_phase(cnt, NBUF: tl.constexpr):
     return cnt % NBUF, (cnt // NBUF) & 1
 
 
+# To keep the comparison against the generated kernel apples-to-apples, we
+# autotune ONLY the SMEM/TMEM ring depths
+# (the same degrees of freedom the modulo scheduler chooses); BLOCK_KO/NI/M,
+# num_warps, and everything else stay fixed.
+def _autotune_configs():
+    # Measured best (do_bench on B200, square/representative shape). TLX_HW_BEST_CONFIG=1
+    # uses it directly (fast path, no autotune search); otherwise the full depth grid
+    # is swept. Mirrors the tutorial WS GEMM TLX_GEMM_USE_HEURISTIC pattern.
+    if os.environ.get("TLX_HW_BEST_CONFIG") == "1":
+        return [triton.Config({"NUM_SMEM_BUFFERS": 3, "NUM_TMEM_BUFFERS": 1}, num_warps=4, num_stages=2, num_ctas=1)]
+    return [
+        triton.Config({"NUM_SMEM_BUFFERS": s, "NUM_TMEM_BUFFERS": t}, num_warps=4, num_stages=2, num_ctas=1)
+        for s in (2, 3, 4, 5, 6)
+        for t in (1, 2)
+    ]
+
+
+@triton.autotune(configs=_autotune_configs(), key=["M", "K_out", "N_in"])
 @triton.jit
 def wgrad_bias_ws(
     DOUT,  # [M, K_out]   upstream gradient

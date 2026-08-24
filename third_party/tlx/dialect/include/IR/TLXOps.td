@@ -286,6 +286,13 @@ def TLX_ReleaseLayoutOp : TLX_Op<"release_layout",
                                   Pure]> {
   let summary = "release specific layout for a register buffer";
 
+  let description = [{
+    `tlx.release_layout` marks the boundary after which tensor layout
+    propagation may choose an encoding independently of the source. The
+    source must have an explicit layout; the result may be unencoded in TTIR
+    or carry the layout selected during TTGIR propagation.
+  }];
+
   let arguments = (ins TT_Tensor:$src);
 
   let results = (outs TT_Tensor:$result);
@@ -293,6 +300,37 @@ def TLX_ReleaseLayoutOp : TLX_Op<"release_layout",
   let assemblyFormat = "$src attr-dict `:` type($src) `->` type($result)";
 
   let hasFolder = 1;
+  let hasVerifier = 1;
+}
+
+def TLX_AssertSameLayoutOp : TLX_Op<"assert_same_layout", []> {
+  let summary = "compile-time assertion that two values have the same layout";
+
+  let description = [{
+    Compares the final resolved layouts of two register tensors or buffers at
+    the end of the TTGIR pipeline. Both layouts are converted to LinearLayout.
+  }];
+
+  let arguments = (ins TTG_TensorOrMemDesc:$lhs, TTG_TensorOrMemDesc:$rhs);
+
+  let results = (outs);
+
+  let assemblyFormat = "$lhs `,` $rhs attr-dict `:` type($lhs) `,` type($rhs)";
+}
+
+def TLX_AssertSameLayoutExpectedOp : TLX_Op<"assert_same_layout_expected", []> {
+  let summary = "compile-time assertion against a constant layout";
+
+  let description = [{
+    Compares a value's final resolved layout against a constant layout encoding
+    at the end of the TTGIR pipeline using LinearLayout equivalence.
+  }];
+
+  let arguments = (ins TTG_TensorOrMemDesc:$src, AnyAttr:$expected);
+
+  let results = (outs);
+
+  let assemblyFormat = "$src attr-dict `:` type($src)";
 }
 
 def TLX_DumpLayoutOp : TLX_Op<"dump_layout", []> {

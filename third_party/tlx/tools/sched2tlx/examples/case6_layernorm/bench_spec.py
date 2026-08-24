@@ -1,6 +1,6 @@
 """Benchmark spec for case6 (LayerNorm fwd) consumed by examples/testing/perf_regression/perf_harness.py.
 
-Launch logic mirrors perf_generated_vs_handwritten.py. Memory-bound → GB/s metric.
+Defines generated and handwritten launches for the shared performance harness. Memory-bound → GB/s metric.
 The generated kernel bakes N=512 and BLOCK_M=8 in as literals.
 """
 
@@ -43,7 +43,7 @@ def hw_call(handwritten, inputs):
     handwritten.layernorm_fwd_tma[(num_persist,)](
         inputs["x"], inputs["w"], inputs["b"], inputs["yh"], inputs["M"], EPS,
         row_stride=inputs["x"].stride(0), N=N, BLOCK_M=BLOCK_M, BLOCK_N=512,
-        NUM_PERSIST=num_persist, num_warps=4,
+        NUM_PERSIST=num_persist,
     )
     return inputs["yh"]
 

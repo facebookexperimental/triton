@@ -138,3 +138,81 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
     tt.return
   }
 }
+
+// -----
+
+// A terminal local_store is layout-flexible, so keep an AMD MMA producer in
+// its native layout through an elementwise epilogue instead of round-tripping
+// through shared memory for a convert_layout.
+
+// CHECK-LABEL: @keep_amd_wmma_for_local_store
+// CHECK: %[[WMMA_DOT:.*]] = tt.dot
+// CHECK-NOT: ttg.convert_layout
+// CHECK: %[[WMMA_TRUNC:.*]] = arith.truncf %[[WMMA_DOT]] : tensor<128x128xf32, #[[$WMMA:.*]]> to tensor<128x128xf16, #[[$WMMA]]>
+// CHECK-NEXT: ttg.local_store %[[WMMA_TRUNC]], {{.*}} : tensor<128x128xf16, #[[$WMMA]]>
+
+#blocked_wmma_out = #ttg.blocked<{sizePerThread = [4, 4], threadsPerWarp = [1, 32], warpsPerCTA = [4, 1], order = [1, 0]}>
+#wmma_out = #ttg.amd_wmma<{version = 3, isTranspose = true, ctaLayout = {warp = [[0, 1], [1, 0]]}, instrShape = [16, 16, 32]}>
+#wmma_lhs = #ttg.dot_op<{opIdx = 0, parent = #wmma_out, kWidth = 8}>
+#wmma_rhs = #ttg.dot_op<{opIdx = 1, parent = #wmma_out, kWidth = 8}>
+#shared_wmma_out = #ttg.padded_shared<[128:+8] {order = [1, 0], shape = [128, 128]}>
+#smem_wmma_out = #ttg.shared_memory
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @keep_amd_wmma_for_local_store(
+      %a: tensor<128x32xf16, #wmma_lhs>,
+      %b: tensor<32x128xf16, #wmma_rhs>,
+      %acc: tensor<128x128xf32, #wmma_out>,
+      %dst: !ttg.memdesc<128x128xf16, #shared_wmma_out, #smem_wmma_out, mutable>) {
+    %dot = tt.dot %a, %b, %acc : tensor<128x32xf16, #wmma_lhs> * tensor<32x128xf16, #wmma_rhs> -> tensor<128x128xf32, #wmma_out>
+    %converted = ttg.convert_layout %dot : tensor<128x128xf32, #wmma_out> -> tensor<128x128xf32, #blocked_wmma_out>
+    %truncated = arith.truncf %converted : tensor<128x128xf32, #blocked_wmma_out> to tensor<128x128xf16, #blocked_wmma_out>
+    ttg.local_store %truncated, %dst : tensor<128x128xf16, #blocked_wmma_out> -> !ttg.memdesc<128x128xf16, #shared_wmma_out, #smem_wmma_out, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+// CHECK-LABEL: @keep_amd_mfma_for_local_store
+// CHECK: %[[MFMA_STORE_DOT:.*]] = tt.dot
+// CHECK-NOT: ttg.convert_layout
+// CHECK: %[[MFMA_STORE_TRUNC:.*]] = arith.truncf %[[MFMA_STORE_DOT]] : tensor<64x64xf32, #[[$MFMA_STORE:.*]]> to tensor<64x64xf16, #[[$MFMA_STORE]]>
+// CHECK-NEXT: ttg.local_store %[[MFMA_STORE_TRUNC]], {{.*}} : tensor<64x64xf16, #[[$MFMA_STORE]]>
+// CHECK-LABEL: @keep_amd_mfma_for_initialized_local_alloc
+// CHECK: %[[MFMA_ALLOC_DOT:.*]] = tt.dot
+// CHECK-NOT: ttg.convert_layout
+// CHECK: %[[MFMA_ALLOC_TRUNC:.*]] = arith.truncf %[[MFMA_ALLOC_DOT]] : tensor<64x64xf32, #[[$MFMA_ALLOC:.*]]> to tensor<64x64xf16, #[[$MFMA_ALLOC]]>
+// CHECK-NEXT: ttg.local_alloc %[[MFMA_ALLOC_TRUNC]] : (tensor<64x64xf16, #[[$MFMA_ALLOC]]>)
+
+#blocked_mfma_out = #ttg.blocked<{sizePerThread = [4, 4], threadsPerWarp = [4, 16], warpsPerCTA = [2, 2], order = [1, 0]}>
+#mfma_out = #ttg.amd_mfma<{version = 3, warpsPerCTA = [2, 2], instrShape = [32, 32, 8], isTransposed = true}>
+#mfma_lhs = #ttg.dot_op<{opIdx = 0, parent = #mfma_out, kWidth = 4}>
+#mfma_rhs = #ttg.dot_op<{opIdx = 1, parent = #mfma_out, kWidth = 4}>
+#shared_mfma_out = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#smem_mfma_out = #ttg.shared_memory
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx942", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @keep_amd_mfma_for_local_store(
+      %a: tensor<64x32xf16, #mfma_lhs>,
+      %b: tensor<32x64xf16, #mfma_rhs>,
+      %acc: tensor<64x64xf32, #mfma_out>,
+      %dst: !ttg.memdesc<64x64xf16, #shared_mfma_out, #smem_mfma_out, mutable>) {
+    %dot = tt.dot %a, %b, %acc : tensor<64x32xf16, #mfma_lhs> * tensor<32x64xf16, #mfma_rhs> -> tensor<64x64xf32, #mfma_out>
+    %converted = ttg.convert_layout %dot : tensor<64x64xf32, #mfma_out> -> tensor<64x64xf32, #blocked_mfma_out>
+    %truncated = arith.truncf %converted : tensor<64x64xf32, #blocked_mfma_out> to tensor<64x64xf16, #blocked_mfma_out>
+    ttg.local_store %truncated, %dst : tensor<64x64xf16, #blocked_mfma_out> -> !ttg.memdesc<64x64xf16, #shared_mfma_out, #smem_mfma_out, mutable>
+    tt.return
+  }
+
+  tt.func @keep_amd_mfma_for_initialized_local_alloc(
+      %a: tensor<64x32xf16, #mfma_lhs>,
+      %b: tensor<32x64xf16, #mfma_rhs>,
+      %acc: tensor<64x64xf32, #mfma_out>) -> !ttg.memdesc<64x64xf16, #shared_mfma_out, #smem_mfma_out, mutable> {
+    %dot = tt.dot %a, %b, %acc : tensor<64x32xf16, #mfma_lhs> * tensor<32x64xf16, #mfma_rhs> -> tensor<64x64xf32, #mfma_out>
+    %converted = ttg.convert_layout %dot : tensor<64x64xf32, #mfma_out> -> tensor<64x64xf32, #blocked_mfma_out>
+    %truncated = arith.truncf %converted : tensor<64x64xf32, #blocked_mfma_out> to tensor<64x64xf16, #blocked_mfma_out>
+    %initialized = ttg.local_alloc %truncated : (tensor<64x64xf16, #blocked_mfma_out>) -> !ttg.memdesc<64x64xf16, #shared_mfma_out, #smem_mfma_out, mutable>
+    tt.return %initialized : !ttg.memdesc<64x64xf16, #shared_mfma_out, #smem_mfma_out, mutable>
+  }
+}

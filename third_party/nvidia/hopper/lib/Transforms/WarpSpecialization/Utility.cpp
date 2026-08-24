@@ -1,4 +1,5 @@
 #include "Utility.h"
+#include "lib/Dialect/TritonGPU/Transforms/WarpSpecialization/PartitionAttrs.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/Partition.h"
@@ -21,7 +22,7 @@ static void normalizeAsyncTaskIds(SmallVectorImpl<AsyncTaskId> &asyncTaskIds) {
 
 SmallVector<AsyncTaskId> getAsyncTaskIds(Operation *op) {
   SmallVector<AsyncTaskId> asyncTaskIds;
-  if (auto attr = op->getAttrOfType<DenseI32ArrayAttr>("async_task_id")) {
+  if (auto attr = op->getAttrOfType<DenseI32ArrayAttr>(kAsyncTaskIdAttrName)) {
     for (AsyncTaskId asyncTaskId : attr.asArrayRef()) {
       asyncTaskIds.push_back(asyncTaskId);
     }
@@ -45,7 +46,7 @@ void setAsyncTaskIds(Operation *op, ArrayRef<AsyncTaskId> asyncTaskIds) {
   SmallVector<AsyncTaskId> sortedAsyncTaskIds(asyncTaskIds.begin(),
                                               asyncTaskIds.end());
   normalizeAsyncTaskIds(sortedAsyncTaskIds);
-  op->setAttr("async_task_id",
+  op->setAttr(kAsyncTaskIdAttrName,
               DenseI32ArrayAttr::get(op->getContext(), sortedAsyncTaskIds));
 }
 
@@ -86,12 +87,12 @@ void removeAsyncTaskId(Operation *op, AsyncTaskId asyncTaskId) {
   auto origAsyncTaskIds = getAsyncTaskIds(op);
   llvm::erase(origAsyncTaskIds, asyncTaskId);
   if (origAsyncTaskIds.empty())
-    op->removeAttr("async_task_id");
+    op->removeAttr(kAsyncTaskIdAttrName);
   else
     setAsyncTaskIds(op, origAsyncTaskIds);
 }
 
-void removeAsyncTaskIds(Operation *op) { op->removeAttr("async_task_id"); }
+void removeAsyncTaskIds(Operation *op) { op->removeAttr(kAsyncTaskIdAttrName); }
 
 void copyLoopScheduleInfo(Operation *newOp, Operation *oldOp) {
   // This assignment is optional because we may call this code

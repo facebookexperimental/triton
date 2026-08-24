@@ -100,7 +100,7 @@ class IRSource:
         path = Path(path)
         self.ext = path.suffix[1:]
         self.language = Language.TRITON
-        self.src = path.read_text()
+        self.src = path.read_text(encoding="utf-8")
         ir.load_dialects(context)
         backend.load_dialects(context)
 
@@ -140,18 +140,22 @@ class IRSource:
 
 
 @functools.lru_cache()
+def _max_shared_mem(device, driver_utils):
+    return driver_utils.get_device_properties(device)["max_shared_mem"]
+
+
 def max_shared_mem(device):
-    return driver.active.utils.get_device_properties(device)["max_shared_mem"]
+    return _max_shared_mem(device, driver.active.utils)
 
 
 def parse(full_name, ext, context):
-    if ext == "ttir" or ext == "ttgir":
+    if ext == "ttir" or ext == "ttgir" or ext == "ttcir" or ext == "tttcir":
         module = ir.parse_mlir_module(full_name, context)
         module.context = context
         return module
-    if ext == "llir" or ext == "ptx" or ext == "amdgcn":
-        return Path(full_name).read_text()
-    if ext == "cubin" or ext == "hsaco":
+    if ext == "llir" or ext == "ptx" or ext == "amdgcn" or ext == "asm":
+        return Path(full_name).read_text(encoding="utf-8")
+    if ext == "cubin" or ext == "hsaco" or ext == "so":
         return Path(full_name).read_bytes()
 
 
@@ -522,7 +526,7 @@ class CompiledKernel:
     def __init__(self, src, metadata_group, hash):
         from collections import namedtuple
         metadata_path = next((Path(p) for c, p in metadata_group.items() if c.endswith(".json")))
-        metadata = json.loads(metadata_path.read_text())
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
         if metadata.get('ctas_per_cga') is not None:
             metadata['ctas_per_cga'] = tuple(metadata['ctas_per_cga'])
         if metadata.get('preferred_ctas_per_cga') is not None:
@@ -541,7 +545,8 @@ class CompiledKernel:
         asm_files = [Path(p) for c, p in metadata_group.items() if not c.endswith(".json")]
         binary_ext = backend.binary_ext
         self.asm = AsmDict({
-            file.suffix[1:]: file.read_bytes() if file.suffix[1:] == binary_ext else file.read_text()
+            file.suffix[1:]:
+            file.read_bytes() if file.suffix[1:] == binary_ext else file.read_text(encoding="utf-8")
             for file in asm_files
         })
         self.metadata_group = metadata_group
@@ -552,6 +557,7 @@ class CompiledKernel:
         self.module = None
         self.function = None
         self._run = None
+        self._unload_module = None
 
     @property
     def launch_metadata_schema(self):
@@ -567,7 +573,8 @@ class CompiledKernel:
             if knobs.runtime.kernel_unload_hook is not None:
                 knobs.runtime.kernel_unload_hook(self.module, self.function, self.name, self.metadata_group, self.hash)
 
-            driver.active.utils.unload_module(self.module)
+            if self._unload_module is not None:
+                self._unload_module(self.module)
             self.module = None
 
     def _init_handles(self):
@@ -582,24 +589,29 @@ class CompiledKernel:
 
         # Facebook end
 
-        device = driver.active.get_current_device()
+        active_driver = driver.active
+        device = active_driver.get_current_device()
+        utils = active_driver.utils
         # create launcher
-        self._run = driver.active.launcher_cls(self.src, self.metadata)
+        self._run = active_driver.launcher_cls(self.src, self.metadata)
         # not enough shared memory to run the kernel
-        max_shared = max_shared_mem(device)
+        max_shared = _max_shared_mem(device, utils)
         if self.metadata.shared > max_shared:
             raise_(OutOfResources(self.metadata.shared, max_shared, "shared memory"))
         if hasattr(self.metadata, "tmem_size") and self.metadata.tmem_size is not None:
             # Use blackwell max tmem size for now, this should be moved in device properties
             max_tmem_size = 512  # tmem size in number of columns
+            if self.metadata.target.arch == 107:
+                max_tmem_size = 576
             if self.metadata.tmem_size > max_tmem_size:
                 raise_(OutOfResources(self.metadata.tmem_size, max_tmem_size, "tensor memory"))
         if knobs.runtime.kernel_load_start_hook is not None:
             knobs.runtime.kernel_load_start_hook(self.module, self.function, self.name, self.metadata_group, self.hash)
         # TODO: n_regs, n_spills should be metadata generated when calling `ptxas`
-        self.module, self.function, self.n_regs, self.n_spills, self.n_max_threads = driver.active.utils.load_binary(
+        self._unload_module = utils.unload_module
+        self.module, self.function, self.n_regs, self.n_spills, self.n_max_threads = utils.load_binary(
             self.name, self.kernel, self.metadata.shared, device)
-        warp_size = driver.active.get_current_target().warp_size
+        warp_size = active_driver.get_current_target().warp_size
         if self.metadata.num_warps * warp_size > self.n_max_threads:
             raise_(OutOfResources(self.metadata.num_warps * warp_size, self.n_max_threads, "threads"))
         if knobs.runtime.kernel_load_end_hook is not None:
@@ -621,7 +633,13 @@ class CompiledKernel:
                 schema = json.loads(self.asm["launch_metadata"])
                 # Build both values before assigning to self so that a failure
                 # in either step leaves both attributes as None (atomic assignment).
-                dispatcher = make_triton_dispatcher(schema, self.function)
+                # Auto-TMA kernels carry compiler-synthesized descriptor params
+                # that only the variadic CudaLauncher injects; skip the dispatcher
+                # (fast path) for them so they fall back to the working launcher.
+                if schema.get("auto_tma_recipes"):
+                    dispatcher = None
+                else:
+                    dispatcher = make_triton_dispatcher(schema, self.function)
                 if dispatcher is not None:
                     indices = tuple(a["index"] for a in schema["args"])
                     self._dispatcher = dispatcher

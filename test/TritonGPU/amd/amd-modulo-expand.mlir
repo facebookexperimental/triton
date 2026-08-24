@@ -1,23 +1,24 @@
-// RUN: TRITON_AMD_EARLY_LOWER=1 triton-opt %s -split-input-file \
-// RUN:   -tritonamdgpu-dot-decompose-and-schedule 2>/dev/null \
-// RUN:   | triton-opt -split-input-file \
-// RUN:       -tritonamdgpu-dot-decompose-and-schedule=mode=expand 2>&1 \
+// RUN: TRITON_USE_MODULO_SCHEDULE=1 triton-opt %s -split-input-file \
+// RUN:   -tritonamdgpu-dot-decompose-and-schedule=mode=modulo 2>&1 \
+// RUN:   | FileCheck %s --check-prefix=SCHEDULE
+// RUN: TRITON_USE_MODULO_SCHEDULE=1 triton-opt %s -split-input-file \
+// RUN:   -tritonamdgpu-dot-decompose-and-schedule=mode=modulo 2>/dev/null \
+// RUN:   | triton-opt -split-input-file -tritonamdgpu-pipeline 2>&1 \
 // RUN:   | FileCheck %s
 //
-// Change #4 (ModuloDotSchedule expander): mode=expand takes the early-lowered
-// loop (single-buffer async_copy + local_load) and produces a real software
-// pipeline — re-buffer single->double (memdesc<2x...>) + ring extractIdx, then the
-// general expander peels a prologue async_copy and an epilogue dot. The two RUNs
-// chain change #1 (early-lower) into change #4 (expand).
+// Modulo runs before the guarded legacy scheduler. A successful modulo schedule
+// is preserved; the standard AMD pipeline lowers and expands it.
 
+// SCHEDULE: remark: amd-modulo:{{.*}}II={{[0-9]+}} maxStage=1{{.*}}serialized num_stages=2
+// SCHEDULE-NOT: triton.warp_pipeline.border
 // CHECK-LABEL: tt.func @early_lower
-// double-buffered alloc:
-// CHECK:       ttg.local_alloc {{.*}}memdesc<2x256x64xf16
-// prologue load peeled out of the loop:
-// CHECK:       ttg.async_copy_global_to_local
-// CHECK:       scf.for
-// steady-state load (prefetch next iter) is ring-indexed:
-// CHECK:         ttg.memdesc_index {{.*}}[%
+// The standard pipeline may choose register pipelining when this single-load
+// fixture is not profitable/legal for LDS async copy. Verify the load is peeled
+// into the prologue and forwarded as a loop-carried tensor to the stage-1 dot.
+// CHECK:       tt.load {{.*}}amd.pipeliner_part = "prologue"
+// CHECK:       scf.for {{.*}}iter_args({{.*}}tensor<256x64xf16, #blocked>)
+// CHECK:         tt.load
+// CHECK:         ttg.convert_layout {{.*}}tensor<256x64xf16, #blocked>
 // CHECK:         tt.dot
 
 #mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [2, 2], instrShape = [16, 16, 32], isTransposed = true}>

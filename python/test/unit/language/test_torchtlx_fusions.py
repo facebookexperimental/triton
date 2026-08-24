@@ -56,11 +56,37 @@ def has_tlx():
 
 
 def is_gfx950():
-    """True on AMD MI350X (gfx950), where the TLX warp-pipe addmm template runs."""
-    if torch.version.hip is None:
-        return False
+    """True on AMD MI350X (gfx950), where the TLX warp-pipe addmm template runs.
+
+    Delegates to the shared target model so adding MI300X/MI450X coverage is a
+    change to the arch table rather than to every gate in the test suite. Falls
+    back to False when TLX is not importable at all, matching has_tlx().
+    """
     try:
-        return "gfx95" in torch.cuda.get_device_properties(0).gcnArchName
+        from triton.language.extra.tlx.hw.target import current_target
+    except ImportError:
+        return False
+    return current_target().is_gfx950
+
+
+def supports_template_epilogue_fusion():
+    """True if the active torch exposes the template epilogue-fusion codegen API.
+
+    Older torch wheels (e.g. the current ROCm nightly) lack it, and additionally
+    decompose ``addmm`` -> ``mm`` + epilogue when a pointwise consumer follows, so
+    the TLX addmm warp-pipe template is never a candidate. Epilogue-fusion tests
+    gate on this so they run on a matching torch and skip cleanly otherwise.
+
+    Probe torch directly (``codegen_template_body`` is the method the fork's
+    fusion path wraps) rather than importing the fork registry: importing the
+    registry this early — at collection time, before torch first imports it during
+    compile — perturbs TLX JIT resolution on some torch versions and breaks
+    unrelated template compiles.
+    """
+    try:
+        from torch._inductor.select_algorithm import TritonTemplateKernel
+
+        return hasattr(TritonTemplateKernel, "codegen_template_body")
     except Exception:
         return False
 
@@ -283,6 +309,10 @@ class TestTorchTLXEpilogueFusion(TestCase):
         "Need AMD MI350X (gfx950) for the TLX warp-pipe addmm template",
     )
     @unittest.skipIf(not has_tlx(), "TLX not available")
+    @unittest.skipIf(
+        not supports_template_epilogue_fusion(),
+        "torch lacks the template epilogue-fusion codegen API (old ROCm nightly)",
+    )
     @parametrize("dtype", (torch.float16, torch.bfloat16))
     def test_tlx_addmm_relu_epilogue_is_fused(
         self,

@@ -1,10 +1,9 @@
-// REQUIRES: asserts
-// RUN: triton-opt %s -allow-unregistered-dialect -nvgpu-modulo-schedule -debug-only=nvgpu-modulo-schedule 2>&1 | FileCheck %s
+// RUN: triton-opt %s -allow-unregistered-dialect -nvgpu-modulo-schedule="print-schedule-graph" 2>&1 | FileCheck %s
 
 //===----------------------------------------------------------------------===//
 // Test: Buffer allocations and barrier pairing
 //   SMEM buffers for A (128x64xf16) and B (64x128xf16) tiles,
-//   TMEM buffer for accumulator (128x128xf32), each with paired barriers.
+//   TMEM buffer for accumulator (128x128xf32) with a paired barrier.
 //===----------------------------------------------------------------------===//
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [4, 1], order = [1, 0]}>
@@ -15,8 +14,9 @@
 
 module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
 
-// --- SMEM buffers: count=2, shapes match tiles, live=[start, end) per
-//     design doc §215 worked example. ---
+// --- SMEM buffers: count=2 (the operand rings are double-buffered — SMEM
+//     ring depth = ceil(full-load-to-consume lifetime / II)), shapes match
+//     tiles, live=[start, end) per design doc §215 worked example. ---
 // CHECK: %buf0 = modulo.alloc SMEM [2 x 128x64 x f16]
 // CHECK-SAME: live=[
 // CHECK-SAME: bytes total
@@ -24,22 +24,23 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
 // CHECK-SAME: live=[
 // CHECK-SAME: bytes total
 //
-// --- TMEM buffer: count=3 for accumulator ---
-// CHECK: %buf2 = modulo.alloc TMEM [3 x 128x128 x f32]
+// --- TMEM buffer: count=2 for accumulator ---
+// CHECK: %buf2 = modulo.alloc TMEM [2 x 128x128 x f32]
 // CHECK-SAME: live=[
-// CHECK-SAME: 196608 bytes total
+// CHECK-SAME: 131072 bytes total
 //
-// --- Paired barriers carry the same live interval as their data buffer ---
+// --- Each count>1 data buffer gets a paired barrier carrying the same live
+//     interval; the accumulator's barrier is now bar5. ---
 // CHECK: %bar3 = modulo.alloc BARRIER [2] for buf0
 // CHECK-SAME: live=[
 // CHECK: %bar4 = modulo.alloc BARRIER [2] for buf1
 // CHECK-SAME: live=[
-// CHECK: %bar5 = modulo.alloc BARRIER [3] for buf2
+// CHECK: %bar5 = modulo.alloc BARRIER [2] for buf2
 // CHECK-SAME: live=[
 //
 // --- Producers: local_alloc → ->buf ---
-// CHECK: ttg.local_alloc  {pipe: TMA, {{.*}}->buf0}
-// CHECK: ttg.local_alloc  {pipe: TMA, {{.*}}->buf1}
+// CHECK: ttg.local_alloc  {pipe: NONE, {{.*}}->buf0}
+// CHECK: ttg.local_alloc  {pipe: NONE, {{.*}}->buf1}
 //
 // --- Consumer: MMA consumes all three buffers ---
 // CHECK: ttng.tc_gen5_mma  {pipe: TC, {{.*}}<-buf0, <-buf1, <-buf2}
@@ -47,8 +48,8 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
 // --- tmem_load consumes TMEM buffer ---
 // CHECK: ttng.tmem_load  {pipe: CUDA, {{.*}}<-buf2}
 tt.func @test_buffers(
-  %a_desc: !tt.tensordesc<tensor<128x64xf16>>,
-  %b_desc: !tt.tensordesc<tensor<64x128xf16>>
+  %a_desc: !tt.tensordesc<128x64xf16>,
+  %b_desc: !tt.tensordesc<64x128xf16>
 ) {
   %c0_i32 = arith.constant 0 : i32
   %c1_i32 = arith.constant 1 : i32
@@ -59,8 +60,8 @@ tt.func @test_buffers(
   scf.for %k = %c0_i32 to %k_tiles step %c1_i32 iter_args(%acc = %zero) -> (tensor<128x128xf32, #acc_layout>) : i32 {
     %off_k = arith.muli %k, %c1_i32 : i32
 
-    %a = tt.descriptor_load %a_desc[%c0_i32, %off_k] : !tt.tensordesc<tensor<128x64xf16>> -> tensor<128x64xf16, #blocked>
-    %b = tt.descriptor_load %b_desc[%off_k, %c0_i32] : !tt.tensordesc<tensor<64x128xf16>> -> tensor<64x128xf16, #blocked>
+    %a = tt.descriptor_load %a_desc[%c0_i32, %off_k] : !tt.tensordesc<128x64xf16> -> tensor<128x64xf16, #blocked>
+    %b = tt.descriptor_load %b_desc[%off_k, %c0_i32] : !tt.tensordesc<64x128xf16> -> tensor<64x128xf16, #blocked>
 
     %a_shared = ttg.local_alloc %a : (tensor<128x64xf16, #blocked>) -> !ttg.memdesc<128x64xf16, #shared, #smem>
     %b_shared = ttg.local_alloc %b : (tensor<64x128xf16, #blocked>) -> !ttg.memdesc<64x128xf16, #shared, #smem>

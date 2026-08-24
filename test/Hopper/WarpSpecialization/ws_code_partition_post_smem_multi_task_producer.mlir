@@ -1,4 +1,4 @@
-// RUN: triton-opt %s --nvgpu-test-ws-code-partition='num-buffers=2 post-channel-creation=1' | FileCheck %s
+// RUN: triton-opt %s --nvgpu-test-ws-code-partition='num-buffers=2' | FileCheck %s
 
 // Regression test for B-1-F2 / T273462656.
 // Multi-task SMEM producers can have consumers in multiple task partitions.

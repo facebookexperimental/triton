@@ -1,26 +1,32 @@
 #ifndef TRITON_THIRD_PARTY_AMD_LIB_TRITONAMDGPUTOLLVM_TARGETINFO_H_
 #define TRITON_THIRD_PARTY_AMD_LIB_TRITONAMDGPUTOLLVM_TARGETINFO_H_
 
-#include "TritonAMDGPUToLLVM/TargetUtils.h"
+#include "Dialect/TritonAMDGPU/IR/TargetFeatures.h"
 #include "triton/Conversion/TritonGPUToLLVM/TargetInfoBase.h"
 #include "llvm/TargetParser/AMDGPUTargetParser.h"
+#include "llvm/TargetParser/TargetParser.h"
+#include <optional>
 #include <string>
 
 namespace mlir::triton::AMD {
 class TargetInfo : public mlir::triton::TargetInfoBase {
 public:
-  explicit TargetInfo(std::string arch) : arch(std::move(arch)) {}
+  explicit TargetInfo(std::optional<StringRef> arch) : targetFeatures(arch) {}
 
   llvm::AMDGPU::IsaVersion getIsaVersion() const;
 
-  StringRef getArch() const { return arch; }
-  ISAFamily getISAFamily() const { return deduceISAFamily(arch); }
+  StringRef getArch() const { return targetFeatures.getArch(); }
+  amdgpu::ISAFamily getISAFamily() const {
+    return targetFeatures.getISAFamily();
+  }
 
   llvm::AMDGPU::GPUKind getGPUKind() const;
 
   int getWarpSize() const;
 
   int getSharedMemorySize() const;
+
+  int getSharedMemoryBanks() const override;
 
   size_t getSharedMemoryPartitionSize() const override;
 
@@ -35,30 +41,29 @@ public:
 
   void barrier(Location loc, RewriterBase &rewriter,
                triton::gpu::AddrSpace targets) const override;
+  void clusterBarrier(Location loc, RewriterBase &rewriter,
+                      Operation *sourceOp) const override;
 
   void warpSync(Location loc, RewriterBase &rewriter) const override;
 
   void storeDShared(RewriterBase &rewriter, Location loc, Value ptr,
-                    std::optional<Value> ctaId, Value val, Value pred,
+                    Value ctaId, Value val, Value pred,
                     std::optional<Value> barrierPtr = {}) const override;
   Value loadDShared(RewriterBase &rewriter, Location loc, Value ptr,
-                    std::optional<Value> ctaId, Type elemTy, Value pred,
+                    Value ctaId, Type elemTy, Value pred,
                     Operation *localLoadOp = nullptr) const override;
 
-  // Describes the parameters of ds_read_tr for a particular data type
-  struct LDSTransLoadParams {
-    // Number of lanes that cooperate in the instruction
-    unsigned numLanesInShuffleGroup;
-    // Number of bits that each lane reads per issued instruction
-    unsigned instBitWidth;
-    // Number of elements that the instruction needs to be contiguous in LDS
-    unsigned tileSize;
-    // Whether B8 types require double contiguity (for certain architectures)
-    bool needsDoubleB8Contiguity;
-  };
+  Value rematerializeDistributedCoordinate(RewriterBase &rewriter, Location loc,
+                                           Value coordinate) const override;
+
+  // Describes the parameters of ds_read_tr for a particular data type.
+  using TileKind = amdgpu::TargetFeatures::TileKind;
+  using LDSTransLoadParams = amdgpu::TargetFeatures::LDSTransLoadParams;
   // Get the ds_read_tr parameters for the instruction that operates on the
-  // element granularty specified by bitWidth
-  std::optional<LDSTransLoadParams> queryLDSTransLoadParams(int bitWidth) const;
+  // element granularity specified by bitWidth. Returns candidates ordered from
+  // largest (most restrictive) to smallest, so the lowering can try the more
+  // profitable instruction first and fall back.
+  SmallVector<LDSTransLoadParams> queryLDSTransLoadParams(int bitWidth) const;
 
   Value shuffleXor(RewriterBase &rewriter, Location loc, Value val,
                    int i) const override;
@@ -97,10 +102,15 @@ public:
 
   bool supportVectorizedAtomics() const override;
 
+  bool supportBitwidth16Elementwise() const override;
+  bool supportBitwidth32Elementwise() const override;
+
+  unsigned getReductionTreeArity(Operation *combinerOp) const override;
+
   // Returns true if the target supports per lane addresses into LDS for
   // direct-to-lds loads. Some architectures (e.g. GFX9) do not support
   // scattering and instead have to write warp coalesced into LDS
-  bool supportsDirectToLDSScattering() const;
+  bool supportsDirectToLdsScatter() const;
 
   // Some architectures (GFX9) require alias information on direct-to-lds loads
   // and loads from LDS so LLVM does not add conservative waits between those
@@ -145,12 +155,36 @@ public:
   void localLoadOpAnnotation(triton::gpu::LocalLoadOp localLoadOp,
                              Operation *llLoadOp) const override;
 
+  // Returns the hardware-specific tiles for shared memory loads and stores.
+  // The returned pair is in the format {LoadTile, StoreTile}.
+  std::pair<mlir::triton::gpu::LocalMemOpTile,
+            mlir::triton::gpu::LocalMemOpTile>
+  getSharedLdStTiles(int32_t vecBitwidth) const override;
+
 private:
+  // Emit the wave64 DPP butterfly warp-reduce into `acc` (in place) using the
+  // given within-row row_shr step order (count-down 8,4,2,1 for the default
+  // reduction; count-up 1,2,4,8 for an ordered inner_tree reduction). `reduxOp`
+  // is the reduction's single combiner op.
+  void emitDppWarpReduce(RewriterBase &rewriter, Location loc,
+                         SmallVector<Value> &acc, Operation *reduxOp,
+                         ArrayRef<int> rowShrSteps) const;
+
+  // Warp-reduce for a reduction with a defined ("inner_tree") ordering,
+  // emitting the fixed count-up DPP tree so the result is bitwise-identical
+  // across num_warps. Returns false when the count-up DPP tree is not
+  // applicable (partial warp, non-wave64, unsupported arch, or
+  // non-single-combiner reduce) so the shared count-up shuffle tree runs
+  // instead.
+  bool warpReduceInnerTree(RewriterBase &rewriter, Location loc,
+                           SmallVector<Value> &acc, triton::ReduceOp op,
+                           unsigned numLaneToReduce) const;
+
   void printfImpl(Value formatStrStart, int formatStrByteCount, ValueRange args,
                   ArrayRef<bool> isSigned, RewriterBase &rewriter,
                   bool useStdErr) const;
 
-  std::string arch;
+  amdgpu::TargetFeatures targetFeatures;
 };
 } // namespace mlir::triton::AMD
 

@@ -337,6 +337,61 @@ tt.func @reshape_refined_piece_merge(
 
 // -----
 
+tt.func @reshape_global_divisibility(
+    %arg0: tensor<2x2xi32> {tt.contiguity = dense<[1, 1]> : tensor<2xi32>, tt.divisibility = dense<[8, 2]> : tensor<2xi32>, tt.constancy = dense<[1, 1]> : tensor<2xi32>},
+    %arg1: tensor<2x2xi32> {tt.contiguity = dense<[1, 1]> : tensor<2xi32>, tt.divisibility = dense<[2, 8]> : tensor<2xi32>, tt.constancy = dense<[1, 1]> : tensor<2xi32>},
+    %arg2: tensor<2x1x2xi32> {tt.contiguity = dense<[1, 1, 1]> : tensor<3xi32>, tt.divisibility = dense<[2, 32, 4]> : tensor<3xi32>, tt.constancy = dense<[1, 1, 1]> : tensor<3xi32>},
+    %arg3: tensor<4x4xi32> {tt.contiguity = dense<[1, 1]> : tensor<2xi32>, tt.divisibility = dense<[8, 2]> : tensor<2xi32>, tt.constancy = dense<[2, 4]> : tensor<2xi32>},
+    %arg4: tensor<2x2x!tt.ptr<i32>> {tt.contiguity = dense<[1, 2]> : tensor<2xi32>, tt.divisibility = dense<[4, 8]> : tensor<2xi32>, tt.constancy = dense<[1, 1]> : tensor<2xi32>}) {
+  // Divisibility from a unit-contiguity source axis applies to every output
+  // axis, including axes whose flat-index bits do not overlap the source axis.
+  // expected-remark @below {{contiguity = [1, 1, 1], divisibility = [8, 8, 8], constancy = [1, 1, 1], constant_value = <none>}}
+  %0 = tt.reshape %arg0 : tensor<2x2xi32> -> tensor<1x2x2xi32>
+  // expected-remark @below {{contiguity = [1, 1, 1], divisibility = [8, 8, 8], constancy = [1, 1, 1], constant_value = <none>}}
+  %1 = tt.reshape %arg1 : tensor<2x2xi32> -> tensor<1x2x2xi32>
+  // The strongest global divisor may come from a singleton source axis.
+  // expected-remark @below {{contiguity = [1], divisibility = [32], constancy = [1], constant_value = <none>}}
+  %2 = tt.reshape %arg2 : tensor<2x1x2xi32> -> tensor<4xi32>
+  // Global divisibility is independent of merging constant source factors.
+  // expected-remark @below {{contiguity = [1], divisibility = [8], constancy = [8], constant_value = <none>}}
+  %3 = tt.reshape %arg3 : tensor<4x4xi32> -> tensor<16xi32>
+  // Pointer contiguity is measured in elements while divisibility is measured
+  // in bytes, so global divisibility can coexist with contiguity greater than
+  // one. Reshape must preserve the global divisor even when splitting that
+  // contiguous axis.
+  // expected-remark @below {{contiguity = [2, 1], divisibility = [8, 4], constancy = [1, 1], constant_value = <none>}}
+  %4 = tt.reshape %arg4 : tensor<2x2x!tt.ptr<i32>> -> tensor<4x1x!tt.ptr<i32>>
+  tt.return
+}
+
+// -----
+
+tt.func @global_divisibility_is_axis_independent(
+    %arg0: tensor<2x2xi32> {tt.contiguity = dense<[1, 1]> : tensor<2xi32>, tt.divisibility = dense<[8, 2]> : tensor<2xi32>, tt.constancy = dense<[1, 1]> : tensor<2xi32>},
+    %arg1: tensor<2x2xi32> {tt.contiguity = dense<[1, 1]> : tensor<2xi32>, tt.divisibility = dense<[2, 8]> : tensor<2xi32>, tt.constancy = dense<[1, 1]> : tensor<2xi32>},
+    %cond: i1) {
+  // Unit contiguity makes every element a group base, so the strongest such
+  // divisibility applies to every axis through shape and arithmetic ops.
+  // expected-remark @below {{contiguity = [1, 1, 1], divisibility = [8, 8, 8], constancy = [1, 1, 1], constant_value = <none>}}
+  %0 = tt.expand_dims %arg0 {axis = 0 : i32} : tensor<2x2xi32> -> tensor<1x2x2xi32>
+  // expected-remark @below {{contiguity = [1, 1], divisibility = [8, 8], constancy = [1, 1], constant_value = <none>}}
+  %1 = tt.trans %arg0 {order = array<i32: 1, 0>} : tensor<2x2xi32> -> tensor<2x2xi32>
+  // expected-remark @below {{contiguity = [1, 1, 1], divisibility = [8, 8, 8], constancy = [4, 1, 1], constant_value = <none>}}
+  %2 = tt.broadcast %0 : tensor<1x2x2xi32> -> tensor<4x2x2xi32>
+  %zero = arith.constant dense<0> : tensor<2x2xi32>
+  // expected-remark @below {{contiguity = [1, 1], divisibility = [8, 8], constancy = [1, 1], constant_value = <none>}}
+  %3 = arith.addi %arg0, %zero : tensor<2x2xi32>
+  // expected-remark @below {{contiguity = [1, 1], divisibility = [8, 8], constancy = [1, 1], constant_value = <none>}}
+  %4 = scf.if %cond -> tensor<2x2xi32> {
+    scf.yield %arg0 : tensor<2x2xi32>
+  } else {
+    scf.yield %arg1 : tensor<2x2xi32>
+  }
+  tt.return
+}
+
+// -----
+
 tt.func @broadcast() {
   // expected-remark @below {{contiguity = [1], divisibility = [64], constancy = [128], constant_value = 64}}
   %0 = arith.constant dense<64> : tensor<128xi32>
@@ -1095,6 +1150,17 @@ tt.func @unrealized_conversion_cast(%arg0: tensor<128x128xi32> {tt.contiguity = 
 
 // -----
 
+// An unrealized conversion cast can materialize a value without an input.
+// AxisInfo must return a pessimistic state with the result rank instead of
+// indexing an empty operand lattice.
+tt.func @empty_unrealized_conversion_cast() {
+  // expected-remark @below {{contiguity = [1, 1], divisibility = [1, 1], constancy = [1, 1], constant_value = <none>}}
+  %0 = "builtin.unrealized_conversion_cast"() : () -> tensor<4x8xi32>
+  tt.return
+}
+
+// -----
+
 // Axis analysis does not support multi-dimensional function arguments. Make
 // sure that we don't crash.
 tt.func @callee(%arg0: tensor<128x1xi32>) {
@@ -1141,6 +1207,24 @@ tt.func @select_same_value_constancy() {
   %rhs = arith.constant dense<42> : tensor<4xi32>
   // expected-remark @below {{constancy = [4], constant_value = 42}}
   %sel = arith.select %cond, %lhs, %rhs : tensor<4xi1>, tensor<4xi32>
+  tt.return
+}
+
+// -----
+
+// Regression: SelectOp must clamp divisibility when condConstancy reduces the
+// output contiguity below either input's contiguity. Otherwise the helper
+// getDivisibilityFromContiguity overestimates divisibility because it does not
+// see condConstancy. See issue triton-lang/triton#10067.
+tt.func @select_cond_constancy_clamps_divisibility(%arg0: tensor<8xi1>) {
+  // expected-remark @below {{contiguity = [8], divisibility = [8], constancy = [1], constant_value = <none>}}
+  %lhs = tt.make_range {end = 16 : i32, start = 8 : i32} : tensor<8xi32>
+  // expected-remark @below {{contiguity = [8], divisibility = [16], constancy = [1], constant_value = <none>}}
+  %rhs = tt.make_range {end = 24 : i32, start = 16 : i32} : tensor<8xi32>
+  // %arg0 has unknown contents, so condConstancy = 1. Output contiguity must
+  // collapse to gcd(8, 8, 1) = 1; divisibility must clamp to 1 (not gcd(8, 16) = 8).
+  // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [1], constant_value = <none>}}
+  %sel = arith.select %arg0, %lhs, %rhs : tensor<8xi1>, tensor<8xi32>
   tt.return
 }
 

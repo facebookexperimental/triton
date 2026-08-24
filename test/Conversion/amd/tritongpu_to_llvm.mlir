@@ -1,7 +1,39 @@
-// RUN: triton-opt %s -split-input-file --allocate-shared-memory --convert-triton-amdgpu-to-llvm=gfx-arch=gfx942 --convert-builtin-func-to-llvm | FileCheck %s
-// RUN: triton-opt %s -split-input-file --allocate-shared-memory --convert-triton-amdgpu-to-llvm=gfx-arch=gfx950 | FileCheck %s --check-prefix=GFX950
-// RUN: triton-opt %s -split-input-file --allocate-shared-memory --convert-triton-amdgpu-to-llvm=gfx-arch=gfx1250 | FileCheck %s --check-prefix=GFX1250
-// RUN: triton-opt %s -split-input-file --allocate-shared-memory --convert-triton-amdgpu-to-llvm=gfx-arch=gfx906 | FileCheck %s --check-prefix=GFX906
+// RUN: triton-opt %s -split-input-file --allocate-shared-memory --convert-triton-amdgpu-to-llvm=gfx-arch=gfx942 --convert-builtin-func-to-llvm | FileCheck %s --enable-var-scope --check-prefixes=CHECK,COMMON
+// RUN: triton-opt %s -split-input-file --allocate-shared-memory --convert-triton-amdgpu-to-llvm=gfx-arch=gfx950 | FileCheck %s --enable-var-scope --check-prefixes=GFX950,COMMON
+// RUN: triton-opt %s -split-input-file --allocate-shared-memory --convert-triton-amdgpu-to-llvm=gfx-arch=gfx1250 | FileCheck %s --enable-var-scope --check-prefixes=GFX1250,COMMON
+// RUN: triton-opt %s -split-input-file --allocate-shared-memory --convert-triton-amdgpu-to-llvm=gfx-arch=gfx906 | FileCheck %s --enable-var-scope --check-prefixes=GFX906,COMMON
+
+// COMMON-DAG: [[$LOCAL_MMRA_TAG:#[A-Za-z0-9_]+]] = #llvm.mmra_tag<"amdgpu-synchronize-as":"local">
+// COMMON-DAG: [[$GLOBAL_MMRA_TAG:#[A-Za-z0-9_]+]] = #llvm.mmra_tag<"amdgpu-synchronize-as":"global">
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
+  // COMMON-LABEL: lower_barrier
+  tt.func @lower_barrier() {
+    // COMMON: llvm.fence syncscope("workgroup") release {llvm.mmra = [[$LOCAL_MMRA_TAG]]}
+    // COMMON-NEXT: rocdl.s.barrier
+    // COMMON-NEXT: llvm.fence syncscope("workgroup") acquire {llvm.mmra = [[$LOCAL_MMRA_TAG]]}
+    ttg.barrier local
+
+    // COMMON: llvm.fence syncscope("workgroup") release {llvm.mmra = [[$GLOBAL_MMRA_TAG]]}
+    // COMMON-NEXT: rocdl.s.barrier
+    // COMMON-NEXT: llvm.fence syncscope("workgroup") acquire {llvm.mmra = [[$GLOBAL_MMRA_TAG]]}
+    ttg.barrier global_read
+
+    // COMMON: llvm.fence syncscope("workgroup") release {llvm.mmra = [[$GLOBAL_MMRA_TAG]]}
+    // COMMON-NEXT: rocdl.s.barrier
+    // COMMON-NEXT: llvm.fence syncscope("workgroup") acquire {llvm.mmra = [[$GLOBAL_MMRA_TAG]]}
+    ttg.barrier global_write
+
+    // COMMON: llvm.fence syncscope("workgroup") release{{$}}
+    // COMMON-NEXT: rocdl.s.barrier
+    // COMMON-NEXT: llvm.fence syncscope("workgroup") acquire{{$}}
+    ttg.barrier local|global_read|global_write
+
+    tt.return
+  }
+}
+
+// -----
 
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
   // CHECK-LABEL: atomic_add_f32_scalar
@@ -14,8 +46,9 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
     // CHECK: llvm.atomicrmw
     // CHECK: llvm.store
     // CHECK: llvm.br
-    // CHECK: rocdl.s.waitcnt 49279
-    // CHECK: rocdl.s.barrier
+    // COMMON: llvm.fence syncscope("workgroup") release {llvm.mmra = [[$LOCAL_MMRA_TAG]]}
+    // COMMON-NEXT: rocdl.s.barrier
+    // COMMON-NEXT: llvm.fence syncscope("workgroup") acquire {llvm.mmra = [[$LOCAL_MMRA_TAG]]}
     // CHECK: llvm.load
     // CHECK: llvm.store
     %0 = tt.atomic_rmw fadd, relaxed, gpu, %arg0, %arg2, %arg1 : (!tt.ptr<f32>, f32, i1) -> f32
@@ -48,6 +81,28 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
 
 // -----
 
+#remat_blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>
+#remat_shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#remat_smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 64 : i32} {
+  // COMMON-LABEL: local_load_rematerialized_coordinates
+  tt.func @local_load_rematerialized_coordinates(%arg0: tensor<256xf32, #remat_blocked>, %arg1: tensor<256x!tt.ptr<f32>, #remat_blocked>, %arg2: tensor<256xf32, #remat_blocked>, %arg3: tensor<256x!tt.ptr<f32>, #remat_blocked>) {
+    %0 = ttg.local_alloc %arg0 : (tensor<256xf32, #remat_blocked>) -> !ttg.memdesc<256xf32, #remat_shared, #remat_smem>
+    // One lane and one warp anchor are shared by both loads in group 7.
+    // COMMON-COUNT-2: llvm.inline_asm has_side_effects asm_dialect = att operand_attrs = [] "", "=v,0"
+    // COMMON-NOT: llvm.inline_asm has_side_effects asm_dialect = att operand_attrs = [] "", "=v,0"
+    // COMMON: llvm.load
+    %1 = ttg.local_load %0 {tlx.rematerialize_coordinates_group = 7 : i32} : !ttg.memdesc<256xf32, #remat_shared, #remat_smem> -> tensor<256xf32, #remat_blocked>
+    tt.store %arg1, %1 : tensor<256x!tt.ptr<f32>, #remat_blocked>
+    %2 = ttg.local_alloc %arg2 : (tensor<256xf32, #remat_blocked>) -> !ttg.memdesc<256xf32, #remat_shared, #remat_smem>
+    %3 = ttg.local_load %2 {tlx.rematerialize_coordinates_group = 7 : i32} : !ttg.memdesc<256xf32, #remat_shared, #remat_smem> -> tensor<256xf32, #remat_blocked>
+    tt.store %arg3, %3 : tensor<256x!tt.ptr<f32>, #remat_blocked>
+    tt.return
+  }
+}
+
+// -----
+
 // Smoke test to check that mfma 32 and dot operand layouts can work with small tensors, for example with shape 16x16
 #mfma = #ttg.amd_mfma<{version = 2, warpsPerCTA = [2, 2], instrShape = [32, 32, 8], isTransposed = true}>
 #dotop0 = #ttg.dot_op<{opIdx = 0, parent = #mfma, kWidth=4}>
@@ -60,9 +115,13 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
     // CHECK-NOT: ttg.convert_layout
     %0 = ttg.local_alloc %arg0 : (tensor<16x16xf16, #mfma>) -> !ttg.memdesc<16x16xf16, #shared, #smem>
     // CHECK-4: store {{.*}} vector<4xf16>
-    %1 = ttg.local_load %0 : !ttg.memdesc<16x16xf16, #shared, #smem> -> tensor<16x16xf16, #dotop0>
+    %1 = ttg.local_load %0 {tlx.rematerialize_coordinates_group = 8 : i32} : !ttg.memdesc<16x16xf16, #shared, #smem> -> tensor<16x16xf16, #dotop0>
     // CHECK-2: load {{.*}} vector<4xf16>
-    %2 = ttg.local_load %0 : !ttg.memdesc<16x16xf16, #shared, #smem> -> tensor<16x16xf16, #dotop1>
+    // The two loads take the AMD ds_read_tr and generic local-load paths, but
+    // their named coordinate group must still share one rematerialization.
+    // GFX950-COUNT-1: llvm.inline_asm has_side_effects asm_dialect = att operand_attrs = [] "", "=v,0"
+    // GFX950-NOT: llvm.inline_asm has_side_effects asm_dialect = att operand_attrs = [] "", "=v,0"
+    %2 = ttg.local_load %0 {tlx.rematerialize_coordinates_group = 8 : i32} : !ttg.memdesc<16x16xf16, #shared, #smem> -> tensor<16x16xf16, #dotop1>
     // CHECK-8: load {{.*}} vector<1xf16>
     %3 = ttg.local_load %0 : !ttg.memdesc<16x16xf16, #shared, #smem> -> tensor<16x16xf16, #mfma>
     // CHECK-4: load {{.*}} vector<4xf16>
@@ -234,24 +293,24 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.thr
 
     // stride 8: ROW_ROR:8 (0x128 = 296)
     // CHECK: rocdl.update.dpp
-    // CHECK-SAME: with 296, 15, 15, false : i32
+    // CHECK-SAME: with 296, 15, 15, true : i32
     // CHECK: llvm.intr.maxnum
 
     // stride 4: ROW_HALF_MIRROR (0x141 = 321) + quad_perm xor 3 (27)
     // CHECK: rocdl.update.dpp
-    // CHECK-SAME: with 321, 15, 15, false : i32
+    // CHECK-SAME: with 321, 15, 15, true : i32
     // CHECK: rocdl.update.dpp
-    // CHECK-SAME: with 27, 15, 15, false : i32
+    // CHECK-SAME: with 27, 15, 15, true : i32
     // CHECK: llvm.intr.maxnum
 
     // stride 2: quad_perm xor 2 (78)
     // CHECK: rocdl.update.dpp
-    // CHECK-SAME: with 78, 15, 15, false : i32
+    // CHECK-SAME: with 78, 15, 15, true : i32
     // CHECK: llvm.intr.maxnum
 
     // stride 1: quad_perm xor 1 (177)
     // CHECK: rocdl.update.dpp
-    // CHECK-SAME: with 177, 15, 15, false : i32
+    // CHECK-SAME: with 177, 15, 15, true : i32
     %0 = "tt.reduce"(%arg0) <{axis = 0 : i32}> ({
     ^bb0(%arg1: f32, %arg2: f32):
       %1 = arith.maxnumf %arg1, %arg2 : f32
@@ -268,25 +327,24 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.thr
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 32 : i32} {
   // GFX1250-LABEL: reduce_xor_row_xmask
   tt.func @reduce_xor_row_xmask(%arg0: tensor<16x2xf32, #linear>) {
-    // beta gfx1250: ROW_XMASK dpp shuffles only; this #linear reduction produces
-    // no stride-16 permlane step, so neither permlanex16 nor ds_bpermute is emitted.
+    // Lane bit 1 is broadcast while bits 0, 2, 3, and 4 move the reduction
+    // axis. Reduce only those participating bits: strides 16, 8, 4, and 1.
     // GFX1250-NOT: rocdl.ds_bpermute
+
+    // stride 16: permlanex16
+    // GFX1250: rocdl.permlanex16
 
     // stride 8: ROW_XMASK:8
     // GFX1250: rocdl.update.dpp
-    // GFX1250-SAME: with 360, 15, 15, false
+    // GFX1250-SAME: with 360, 15, 15, true
 
     // stride 4: ROW_XMASK:4
     // GFX1250: rocdl.update.dpp
-    // GFX1250-SAME: with 356, 15, 15, false
-
-    // stride 2: ROW_XMASK:2
-    // GFX1250: rocdl.update.dpp
-    // GFX1250-SAME: with 354, 15, 15, false
+    // GFX1250-SAME: with 356, 15, 15, true
 
     // stride 1: ROW_XMASK:1
     // GFX1250: rocdl.update.dpp
-    // GFX1250-SAME: with 353, 15, 15, false
+    // GFX1250-SAME: with 353, 15, 15, true
     %0 = "tt.reduce"(%arg0) <{axis = 0 : i32}> ({
     ^bb0(%arg1: f32, %arg2: f32):
       %1 = arith.maxnumf %arg1, %arg2 : f32
@@ -468,6 +526,23 @@ module attributes {"ttg.target" = "hip:gfx942", "ttg.num-ctas" = 1 : i32, "ttg.n
 
 // -----
 
+// CHECK-LABEL: dynamic_subslice_shared_layout
+#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [8, 8], warpsPerCTA = [1, 1], order = [1, 0]}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.target" = "hip:gfx950", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @dynamic_subslice_shared_layout(%arg0: tensor<8x16xf16, #blocked>, %row: i32) {
+    %zero = arith.constant 0 : i32
+    %buffer = ttg.local_alloc %arg0 : (tensor<8x16xf16, #blocked>) -> !ttg.memdesc<8x16xf16, #shared, #smem, mutable>
+    // CHECK: llvm.add %{{.*}}, %{{.*}} : i32
+    // CHECK-NOT: ttg.memdesc_dynamic_subslice
+    %view = ttg.memdesc_dynamic_subslice %buffer[%row, %zero] : !ttg.memdesc<8x16xf16, #shared, #smem, mutable> -> !ttg.memdesc<1x16xf16, #shared, #smem, mutable, 8x16>
+    tt.return
+  }
+}
+
+// -----
+
 // CHECK-LABEL: padded_shared_layout
 #blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [8, 8], warpsPerCTA = [2, 2], order = [1, 0]}>
 #shared = #ttg.padded_shared<[128:+4, 256:+8] {order = [1, 0], shape = [64, 64]}>
@@ -604,11 +679,35 @@ module attributes {"ttg.target" = "hip:gfx942", "ttg.num-ctas" = 1 : i32, "ttg.n
 #mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [2, 1], instrShape = [16, 16, 32], isTransposed = true}>
 module attributes {"ttg.target" = "hip:gfx942", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 2 : i32, "ttg.threads-per-warp" = 64 : i32} {
   tt.func @padded_shared_layout_subslice_load_store(%arg0: tensor<32x32xf16, #blocked>) {
+    // CHECK: %[[SUBSLICE_CST16:.+]] = llvm.mlir.constant(16 : i32)
+    // CHECK: %[[SUBSLICE_CST3:.+]] = llvm.mlir.constant(3 : i32)
+    // CHECK: %[[SUBSLICE_CST2:.+]] = llvm.mlir.constant(2 : i32)
+    // CHECK: %[[SUBSLICE_CST6:.+]] = llvm.mlir.constant(6 : i32)
+    // CHECK: %[[SUBSLICE_CST0:.+]] = llvm.mlir.constant(0 : i32)
     // CHECK: llvm.store {{.*}} : vector<8xf16>, !llvm.ptr<3>
     // CHECK-NOT: llvm.store
     %0 = ttg.local_alloc %arg0 : (tensor<32x32xf16, #blocked>) -> !ttg.memdesc<32x32xf16, #shared, #smem, mutable>
     %1 = ttg.memdesc_subslice %0 [16, 0]  : !ttg.memdesc<32x32xf16, #shared, #smem, mutable> -> !ttg.memdesc<16x32xf16, #shared, #smem, mutable, 32x32>
-    // CHECK-COUNT-2: llvm.load {{.*}} : !llvm.ptr<3> -> vector<4xf16>
+    // COMMON: llvm.fence syncscope("workgroup") release {llvm.mmra = [[$LOCAL_MMRA_TAG]]}
+    // COMMON-NEXT: rocdl.s.barrier
+    // COMMON-NEXT: llvm.fence syncscope("workgroup") acquire {llvm.mmra = [[$LOCAL_MMRA_TAG]]}
+    // CHECK: %[[AFF_I8:.+]] = llvm.mul %{{.+}}, %[[SUBSLICE_CST2]] : i32
+    // CHECK-NEXT: %[[AFF_SHR:.+]] = llvm.lshr %[[AFF_I8]], %[[SUBSLICE_CST6]] : i32
+    // CHECK-NEXT: %[[AFF_SHL:.+]] = llvm.shl %[[AFF_SHR]], %[[SUBSLICE_CST3]] : i32
+    // CHECK-NEXT: %[[AFF_PAD0:.+]] = llvm.add %[[AFF_SHL]], %[[SUBSLICE_CST0]] : i32
+    // CHECK-NEXT: %[[PAD_AFF:.+]] = llvm.add %[[AFF_I8]], %[[AFF_PAD0]] : i32
+    // CHECK: %[[DYN_BASE:.+]] = llvm.xor %{{.+}}, %[[SUBSLICE_CST0]] : i32
+    // CHECK-NEXT: %[[DYN_SHR:.+]] = llvm.lshr %[[DYN_BASE]], %[[SUBSLICE_CST6]] : i32
+    // CHECK-NEXT: %[[DYN_SHL:.+]] = llvm.shl %[[DYN_SHR]], %[[SUBSLICE_CST3]] : i32
+    // CHECK-NEXT: %[[DYN_PAD0:.+]] = llvm.add %[[DYN_SHL]], %[[SUBSLICE_CST0]] : i32
+    // CHECK-NEXT: %[[PAD_DYN:.+]] = llvm.add %[[DYN_BASE]], %[[DYN_PAD0]] : i32
+    // CHECK-NEXT: %[[PADDED_OFF:.+]] = llvm.add %[[PAD_DYN]], %[[PAD_AFF]] : i32
+    // CHECK-NEXT: %[[INNER_OFF0:.+]] = llvm.add %[[PADDED_OFF]], %[[SUBSLICE_CST0]] : i32
+    // CHECK-NEXT: %[[LOAD_PTR0:.+]] = llvm.getelementptr inbounds %{{.+}}[%[[INNER_OFF0]]] : (!llvm.ptr<3>, i32) -> !llvm.ptr<3>, i8
+    // CHECK-NEXT: llvm.load %[[LOAD_PTR0]] : !llvm.ptr<3> -> vector<4xf16>
+    // CHECK: %[[INNER_OFF1:.+]] = llvm.add %[[PADDED_OFF]], %{{.+}} : i32
+    // CHECK-NEXT: %[[LOAD_PTR1:.+]] = llvm.getelementptr inbounds %{{.+}}[%[[INNER_OFF1]]] : (!llvm.ptr<3>, i32) -> !llvm.ptr<3>, i8
+    // CHECK-NEXT: llvm.load %[[LOAD_PTR1]] : !llvm.ptr<3> -> vector<4xf16>
     // CHECK-NOT: llvm.load
     %2 = ttg.local_load %1: !ttg.memdesc<16x32xf16, #shared, #smem, mutable, 32x32> -> tensor<16x32xf16, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 4}>>
     // CHECK-COUNT-2: llvm.store {{.*}} : vector<4xf16>, !llvm.ptr<3>

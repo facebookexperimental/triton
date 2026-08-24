@@ -19,11 +19,31 @@ Layout:
   MEM     — TMA loads (Q once, K+V every iter)
 """
 
+import os
+
 import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
 
 
+# To keep the comparison against the generated kernel apples-to-apples, we
+# autotune ONLY the SMEM ring depth (the
+# same degree of freedom the modulo scheduler chooses); the TMEM qk/p/acc
+# buffers are single-buffered with a fixed hand-off, and BLOCK_M/N, HEAD_DIM,
+# num_warps, and everything else stay fixed.
+def _autotune_configs():
+    # Measured best (do_bench on B200, square/representative shape). TLX_HW_BEST_CONFIG=1
+    # uses it directly (fast path, no autotune search); otherwise the full depth grid
+    # is swept. Mirrors the tutorial WS GEMM TLX_GEMM_USE_HEURISTIC pattern.
+    if os.environ.get("TLX_HW_BEST_CONFIG") == "1":
+        return [triton.Config({"NUM_BUFFERS_KV": 2}, num_warps=4, num_stages=2, num_ctas=1)]
+    return [
+        triton.Config({"NUM_BUFFERS_KV": s}, num_warps=4, num_stages=2, num_ctas=1)
+        for s in (2, 3, 4, 5, 6)
+    ]
+
+
+@triton.autotune(configs=_autotune_configs(), key=["Z", "H", "N_CTX"])
 @triton.jit
 def fa_fwd_kernel(
     Q,

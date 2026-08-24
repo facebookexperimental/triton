@@ -30,6 +30,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v3
+        with:
+          submodules: recursive
       - name: Tune Nvidia GPU
         run: |
           sudo nvidia-smi -pm 1
@@ -99,6 +101,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v3
+        with:
+          submodules: recursive
       - name: Tune Nvidia GPU
         run: |
           sudo nvidia-smi -pm 1
@@ -120,24 +124,34 @@ jobs:
         timeout-minutes: 5
         run: |
           . "${SETUP_SCRIPT}"
+          # TLX-only: the test_tlx_*.py glob covers manual TLX (tlx.async_tasks)
+          # and structurally excludes the autoWS suites (test_autows_*.py,
+          # test_warp_specialization.py, test_tutorial09_warp_specialization.py),
+          # which are never collected here and are tested separately.
           python -m pytest python/test/unit/language/test_tlx_*.py -v --junitxml=/tmp/tlx-unit.xml
       - name: Run TLX tutorial correctness tests
         id: run_correctness_tests
-        timeout-minutes: 5
+        timeout-minutes: 15
         run: |
           . "${SETUP_SCRIPT}"
           python -m pytest third_party/tlx/tutorials/testing/test_correctness.py -v --junitxml=/tmp/tlx-correctness.xml
+      - name: Run runtime unit tests
+        id: run_runtime_tests
+        timeout-minutes: 5
+        run: |
+          . "${SETUP_SCRIPT}"
+          python -m pytest python/test/unit/runtime/test_fast_cache_edge_cases.py python/test/unit/runtime/test_tensordesc_cache.py python/test/unit/runtime/test_triton_dispatcher_factory.py -v --junitxml=/tmp/runtime-unit.xml
       - name: Collect nightly failures (TLX)
         id: parse
         if: always() && github.event_name == 'schedule'
         run: |
           . "${SETUP_SCRIPT}"
           FAILED_FLAG=""
-          if [[ "${{ steps.run_unit_tests.outcome }}" != "success" || "${{ steps.run_correctness_tests.outcome }}" != "success" ]]; then
+          if [[ "${{ steps.run_unit_tests.outcome }}" != "success" || "${{ steps.run_correctness_tests.outcome }}" != "success" || "${{ steps.run_runtime_tests.outcome }}" != "success" ]]; then
             FAILED_FLAG="--failed --bucket h100-tlx-job-failed"
           fi
           python3 .github/scripts/parse_junit_failures.py \
-            --junit /tmp/tlx-unit.xml /tmp/tlx-correctness.xml \
+            --junit /tmp/tlx-unit.xml /tmp/tlx-correctness.xml /tmp/runtime-unit.xml \
             --workflow "${GITHUB_WORKFLOW}" \
             --job "h100-tlx-test" \
             ${FAILED_FLAG}

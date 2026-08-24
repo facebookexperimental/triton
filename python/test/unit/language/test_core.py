@@ -622,6 +622,29 @@ def test_shift_op(dtype_x, dtype_y, op, num_ctas, device):
     )
 
 
+@pytest.mark.interpreter
+def test_interpreter_ashr_does_not_mutate_uint64_rhs(device):
+
+    @triton.jit
+    def kernel(Z, X, Y, BLOCK: tl.constexpr):
+        off = tl.arange(0, BLOCK)
+        x = tl.load(X + off)
+        y = tl.load(Y + off)
+        _ = x >> y
+        z = y + (1 << 63)
+        tl.store(Z + off, z)
+
+    x = np.array([-1, -8, -(1 << 62), 2], dtype=np.int64)
+    y = np.array([0, 1, 63, 1], dtype=np.uint64)
+    z = np.empty_like(y)
+
+    z_tri = to_triton(z, device=device, dst_type="uint64")
+    x_tri = to_triton(x, device=device)
+    y_tri = to_triton(y, device=device, dst_type="uint64")
+    kernel[(1, )](z_tri, x_tri, y_tri, BLOCK=y.size)
+    np.testing.assert_equal(to_numpy(z_tri), y + np.uint64(1 << 63))
+
+
 # ---------------
 # test compare ops
 # ---------------
@@ -1016,6 +1039,25 @@ def test_where_broadcast(num_ctas, device):
 @pytest.mark.parametrize("num_ctas", num_ctas_list)
 def test_unary_op(dtype_x, expr, num_ctas, device):
     _test_unary(dtype_x, expr, device=device, num_ctas=num_ctas)
+
+
+@triton.jit
+def _neg_signed_zero_kernel(x_ptr, y_ptr):
+    offsets = tl.arange(0, 2)
+    x = tl.load(x_ptr + offsets)
+    tl.store(y_ptr + offsets, -x)
+
+
+@pytest.mark.interpreter
+def test_neg_preserves_signed_zero(device):
+    x = np.array([0.0, -0.0], dtype=np.float32)
+    y = np.empty_like(x)
+    x_tri = to_triton(x, device=device)
+    y_tri = to_triton(y, device=device)
+
+    _neg_signed_zero_kernel[(1, )](x_tri, y_tri)
+
+    np.testing.assert_array_equal(np.signbit(to_numpy(y_tri)), np.array([True, False]))
 
 
 # ----------------
@@ -1430,6 +1472,30 @@ def test_noinline(mode, device):
     elif mode == "shared":
         ref = torch.full((16, 16), 16, device=device, dtype=torch.float32)
         assert torch.equal(z, ref + x + y)
+
+
+@triton.jit(noinline=True)
+def noinline_load_block_fn(ptr, BLOCK_SIZE: tl.constexpr):
+    offsets = tl.arange(0, BLOCK_SIZE)
+    return tl.load(ptr + offsets)
+
+
+def test_noinline_returns_tensor(device):
+
+    @triton.jit
+    def kernel(X, Y, Z, BLOCK_SIZE: tl.constexpr):
+        x = noinline_load_block_fn(X, BLOCK_SIZE)
+        y = noinline_load_block_fn(Y, BLOCK_SIZE)
+        offsets = tl.arange(0, BLOCK_SIZE)
+        tl.store(Z + offsets, x + y)
+
+    BLOCK_SIZE = 128
+    torch.manual_seed(0)
+    x = torch.randn(BLOCK_SIZE, device=device, dtype=torch.float32)
+    y = torch.randn(BLOCK_SIZE, device=device, dtype=torch.float32)
+    z = torch.empty_like(x)
+    kernel[(1, )](x, y, z, BLOCK_SIZE=BLOCK_SIZE, num_warps=1)
+    assert torch.equal(z, x + y)
 
 
 # ---------------
@@ -1852,6 +1918,44 @@ def test_atomic_cas(sem, num_ctas, dtype_str, device):
     if not is_cuda():
         return
     assert f"atom.global.{sem_str}" in h.asm["ptx"]
+
+
+@pytest.mark.skipif(not is_cuda() or torch.cuda.get_device_capability()[0] < 9,
+                    reason="num_ctas > 1 requires NVIDIA SM90+ (Hopper)")
+def test_scalar_atomic_cas_multicta_result(device):
+
+    @triton.jit
+    def kernel(lock, output, BLOCK_SIZE: tl.constexpr):
+        old = tl.atomic_cas(lock, 0, 1)
+        offsets = tl.arange(0, BLOCK_SIZE)
+        tl.store(output + offsets, old)
+
+    block_size = 512
+    lock = torch.full((1, ), 7, device=device, dtype=torch.int32)
+    output = torch.empty((block_size, ), device=device, dtype=torch.int32)
+    kernel[(1, )](lock, output, BLOCK_SIZE=block_size, num_ctas=4)
+    torch.testing.assert_close(output, torch.full_like(output, 7))
+
+
+@pytest.mark.skipif(not is_cuda() or torch.cuda.get_device_capability()[0] < 9,
+                    reason="num_ctas > 1 requires NVIDIA SM90+ (Hopper)")
+@pytest.mark.parametrize("size", [1, 4, 16, 128, 512])
+def test_tensor_atomic_cas_multicta_result(size, device):
+
+    @triton.jit
+    def kernel(lock, output, SIZE: tl.constexpr):
+        offsets = tl.arange(0, SIZE)
+        old = tl.atomic_cas(
+            lock + offsets,
+            tl.zeros((SIZE, ), tl.int32),
+            tl.full((SIZE, ), 1, tl.int32),
+        )
+        tl.store(output + offsets, old)
+
+    lock = torch.arange(7, size + 7, device=device, dtype=torch.int32)
+    output = torch.empty_like(lock)
+    kernel[(1, )](lock, output, SIZE=size, num_ctas=4)
+    torch.testing.assert_close(output, lock)
 
 
 @pytest.mark.interpreter
@@ -2529,6 +2633,114 @@ def test_max_min_with_nan(device):
 
     min_kernel[(1, )](x, y, BLOCK_SIZE=BLOCK_SIZE)
     assert y[0] == float("-inf")
+
+
+@pytest.mark.interpreter
+def test_argmax_argmin_with_nan(device):
+    # In triton, argmax/argmin should also follow the "nan ignore" style,
+    # consistent with tl.max/tl.min. NaN should be skipped, returning the
+    # index of the largest/smallest finite value.
+    @triton.jit
+    def argmax_kernel(x_ptr, val_ptr, idx_ptr, N: tl.constexpr, BLOCK: tl.constexpr):
+        offsets = tl.arange(0, BLOCK)
+        mask = offsets < N
+        x = tl.load(x_ptr + offsets, mask=mask, other=-float("inf"))
+        val = tl.max(x, axis=0)
+        idx = tl.argmax(x, axis=0)
+        tl.store(val_ptr, val)
+        tl.store(idx_ptr, idx)
+
+    @triton.jit
+    def argmin_kernel(x_ptr, val_ptr, idx_ptr, N: tl.constexpr, BLOCK: tl.constexpr):
+        offsets = tl.arange(0, BLOCK)
+        mask = offsets < N
+        x = tl.load(x_ptr + offsets, mask=mask, other=float("inf"))
+        val = tl.min(x, axis=0)
+        idx = tl.argmin(x, axis=0)
+        tl.store(val_ptr, val)
+        tl.store(idx_ptr, idx)
+
+    # argmax: [nan, 6, 8] -> max=8.0, argmax=2
+    x = torch.tensor([float("nan"), 6.0, 8.0], dtype=torch.float32, device=device)
+    val = torch.empty((), dtype=torch.float32, device=device)
+    idx = torch.empty((), dtype=torch.int32, device=device)
+    argmax_kernel[(1, )](x, val, idx, N=3, BLOCK=4)
+    assert val.item() == 8.0, f"expected 8.0, got {val.item()}"
+    assert idx.item() == 2, f"expected 2, got {idx.item()}"
+
+    # argmin: [nan, 6, 8] -> min=6.0, argmin=1
+    val.zero_()
+    idx.zero_()
+    argmin_kernel[(1, )](x, val, idx, N=3, BLOCK=4)
+    assert val.item() == 6.0, f"expected 6.0, got {val.item()}"
+    assert idx.item() == 1, f"expected 1, got {idx.item()}"
+
+    # argmax: NaN at end [3, 5, nan] -> max=5.0, argmax=1
+    x_nan_end = torch.tensor([3.0, 5.0, float("nan")], dtype=torch.float32, device=device)
+    val.zero_()
+    idx.zero_()
+    argmax_kernel[(1, )](x_nan_end, val, idx, N=3, BLOCK=4)
+    assert val.item() == 5.0, f"expected 5.0, got {val.item()}"
+    assert idx.item() == 1, f"expected 1, got {idx.item()}"
+
+
+@pytest.mark.interpreter
+def test_argmax_argmin_tie_break_fast_with_nan(device):
+    # tl.argmax/argmin with tie_break_left=False should also ignore NaN,
+    # consistent with the tie_break_left=True behaviour and JIT hardware
+    # semantics (fmaxf/fminf treat NaN as missing values).
+    # Regression test for: https://github.com/triton-lang/triton/issues/10697
+    @triton.jit
+    def argmax_fast_kernel(x_ptr, val_ptr, idx_ptr, N: tl.constexpr, BLOCK: tl.constexpr):
+        offsets = tl.arange(0, BLOCK)
+        mask = offsets < N
+        x = tl.load(x_ptr + offsets, mask=mask, other=-float("inf"))
+        val = tl.max(x, axis=0)
+        idx = tl.argmax(x, axis=0, tie_break_left=False)
+        tl.store(val_ptr, val)
+        tl.store(idx_ptr, idx)
+
+    @triton.jit
+    def argmin_fast_kernel(x_ptr, val_ptr, idx_ptr, N: tl.constexpr, BLOCK: tl.constexpr):
+        offsets = tl.arange(0, BLOCK)
+        mask = offsets < N
+        x = tl.load(x_ptr + offsets, mask=mask, other=float("inf"))
+        val = tl.min(x, axis=0)
+        idx = tl.argmin(x, axis=0, tie_break_left=False)
+        tl.store(val_ptr, val)
+        tl.store(idx_ptr, idx)
+
+    val = torch.empty((), dtype=torch.float32, device=device)
+    idx = torch.empty((), dtype=torch.int32, device=device)
+
+    # argmax: [nan, 6, 8] -> max=8.0, argmax=2
+    x = torch.tensor([float("nan"), 6.0, 8.0], dtype=torch.float32, device=device)
+    argmax_fast_kernel[(1, )](x, val, idx, N=3, BLOCK=4)
+    assert val.item() == 8.0, f"expected 8.0, got {val.item()}"
+    assert idx.item() == 2, f"expected 2, got {idx.item()}"
+
+    # argmin: [nan, 6, 8] -> min=6.0, argmin=1
+    val.zero_()
+    idx.zero_()
+    argmin_fast_kernel[(1, )](x, val, idx, N=3, BLOCK=4)
+    assert val.item() == 6.0, f"expected 6.0, got {val.item()}"
+    assert idx.item() == 1, f"expected 1, got {idx.item()}"
+
+    # argmax: NaN at end [3, 5, nan] -> max=5.0, argmax=1
+    x_nan_end = torch.tensor([3.0, 5.0, float("nan")], dtype=torch.float32, device=device)
+    val.zero_()
+    idx.zero_()
+    argmax_fast_kernel[(1, )](x_nan_end, val, idx, N=3, BLOCK=4)
+    assert val.item() == 5.0, f"expected 5.0, got {val.item()}"
+    assert idx.item() == 1, f"expected 1, got {idx.item()}"
+
+    # argmin: NaN in middle [3, nan, 1] -> min=1.0, argmin=2
+    x_nan_mid = torch.tensor([3.0, float("nan"), 1.0], dtype=torch.float32, device=device)
+    val.zero_()
+    idx.zero_()
+    argmin_fast_kernel[(1, )](x_nan_mid, val, idx, N=3, BLOCK=4)
+    assert val.item() == 1.0, f"expected 1.0, got {val.item()}"
+    assert idx.item() == 2, f"expected 2, got {idx.item()}"
 
 
 def get_reduced_dtype(dtype_str, op):
@@ -3564,6 +3776,63 @@ def test_reduction_ordering_sum_masked_multi_reg_group(num_warps, N, BLOCK_N, de
                                    f"num_warps={num_warps}")
 
 
+@pytest.mark.skipif(not is_hip(), reason="AMD-only: DPP warp-reduce count-up order for inner_tree (D113540598)")
+def test_reduction_ordering_sum_num_warps_bitwise_hip(device):
+    """AMD regression (D113540598): on gfx942/CDNA (wave64) a float `sum` with
+    INNER_TREE ordering must be bitwise-identical across num_warps.  The within-
+    warp stage lowers to a DPP butterfly; before the fix AMD always emitted the
+    count-down row_shr order (8,4,2,1) and ignored reduction_ordering, so the add
+    grouping -- and thus the result bits -- changed when num_warps / BLOCK_SIZE
+    reshaped the reduce axis (sizePerThread).  The fix emits the count-up order
+    (1,2,4,8) for inner_tree, matching the shared count-up shuffle tree.
+
+    N=1024 with a single reduced row places all warps on the reduce axis, so
+    sizePerThread on that axis shifts as num_warps grows -- the layout change
+    that used to move the result bits."""
+    BLOCK_N = 1024
+    TOTAL_ROWS = 32
+
+    @triton.jit
+    def sum_kernel_1row(X, Z, stride_row, stride_col, BLOCK_N: tl.constexpr, ORDERING: tl.constexpr):
+        pid = tl.program_id(0)
+        offs_n = tl.arange(0, BLOCK_N)
+        x = tl.load(X + pid * stride_row + offs_n * stride_col)
+        z = tl.sum(x, axis=0, reduction_ordering=ORDERING)
+        tl.store(Z + pid, z)
+
+    torch.manual_seed(42)
+    x = torch.randn((TOTAL_ROWS, BLOCK_N), device=device, dtype=torch.float32)
+    grid = (TOTAL_ROWS, )
+
+    def run(ordering, num_warps):
+        out = torch.empty(TOTAL_ROWS, device=device, dtype=torch.float32)
+        sum_kernel_1row[grid](
+            x,
+            out,
+            x.stride(0),
+            x.stride(1),
+            BLOCK_N=BLOCK_N,
+            ORDERING=ordering,
+            num_warps=num_warps,
+        )
+        return out
+
+    # INNER_TREE must be bitwise num_warps-invariant.  Compare raw bits (integer
+    # view) against the num_warps=1 reference so +0/-0 and NaN patterns count as
+    # different, not just the numeric value.
+    ref_bits = run(tl.ReductionOrdering.INNER_TREE, 1).view(torch.int32)
+    for num_warps in [1, 2, 4, 8]:
+        out_bits = run(tl.ReductionOrdering.INNER_TREE, num_warps).view(torch.int32)
+        assert torch.equal(out_bits,
+                           ref_bits), (f"INNER_TREE sum not bitwise num_warps-invariant on AMD: num_warps={num_warps}")
+
+    # Control: the UNORDERED path is deliberately NOT asserted.  It is allowed to
+    # vary across num_warps (that freedom is exactly what inner_tree removes), so
+    # requiring it to match would be wrong.  We still run it once to confirm it
+    # compiles and executes on this path.
+    run(tl.ReductionOrdering.UNORDERED, 4)
+
+
 # ---------------
 # test permute
 # ---------------
@@ -3936,6 +4205,21 @@ def get_test_dot_small_mn_mfma_cases():
             for in_dtype, out_dtype in [("float16", "float16"), ("float32", "float32")]]
 
 
+# M, N, K, num_warps, col_a, col_b, epilogue, input_precision, in_dtype,
+# out_dtype, kpack, mma_nonk_size
+def get_test_dot_kpack_kwidth_mfma_cases():
+    if not is_hip_cdna():
+        return []
+    return [
+        # Small K with kpack=2 forces the kPack guard for symmetric MFMA shapes.
+        (64, 64, 16, 4, False, False, 'None', 'ieee', 'float16', 'float32', 2, 16),
+        (64, 64, 16, 4, False, False, 'None', 'ieee', 'bfloat16', 'float32', 2, 16),
+        # Asymmetric 64x4 / 4x64 MFMA shapes with kpack=2.
+        (64, 4, 32, 1, False, False, 'None', 'ieee', 'float32', 'float32', 2, None),
+        (4, 64, 32, 1, False, False, 'None', 'ieee', 'float32', 'float32', 2, None),
+    ]
+
+
 def get_test_dot_double_rate_cases():
     if not (is_hip_cdna() or is_hip_gfx1250()):
         return []
@@ -3986,8 +4270,9 @@ def get_test_small_dots_cases():
     get_test_dot_vdot2_cases() + get_test_dot_double_rate_cases() + get_test_dot_base_cases() +
     get_test_dot_mixed_sizes_cases() + get_test_dot_transposed_op_base_cases() + get_test_dot_h100_shortcut_cases() +
     get_test_dot_mfma_edge_cases() + get_test_dot_fp8_output_cases() + get_test_dot_small_k_mfma_cases() +
-    get_test_dot_small_mn_mfma_cases() + get_test_dot_small_mn_wmma_cases() + get_test_dot_small_k_wmma_cases() +
-    get_test_dot_softmax() + get_test_small_dots_cases() + get_test_dot_small_fp64_cases(),
+    get_test_dot_small_mn_mfma_cases() + get_test_dot_kpack_kwidth_mfma_cases() + get_test_dot_small_mn_wmma_cases() +
+    get_test_dot_small_k_wmma_cases() + get_test_dot_softmax() + get_test_small_dots_cases() +
+    get_test_dot_small_fp64_cases(),
 )
 @pytest.mark.parametrize("num_ctas", num_ctas_list)
 def test_dot(
@@ -4013,7 +4298,8 @@ def test_dot(
             pytest.skip(f"input_precision {input_precision} is not supported in the interpreter")
     else:
         if not is_hip() and K < 16:
-            if in_dtype != 'float64':
+            tf32_n8 = (in_dtype == 'float32' and N == 8 and K == 8 and input_precision == 'tf32')
+            if in_dtype != 'float64' and not tf32_n8:
                 pytest.skip("small dots are supported only on HIP at the moment")
         if is_cuda():
             capability = torch.cuda.get_device_capability()
@@ -4262,15 +4548,16 @@ def test_dot(
                 assert "v_dot2c_f32_bf16" in amdgcn
         return
 
-    # make sure ld/st are vectorized
     ptx = pgm.asm["ptx"]
-
-    if (K > 16 or N > 16 or M > 16) and (M * N // (num_warps * 32) >= 4):
-        # XXX: skip small sizes because they are not vectorized
+    # XXX: skip small sizes because they are not vectorized; with runtime
+    # strides, v4 needs the contiguous dim >= 16 (K for loads, N for stores).
+    enough_work = (M * N // (num_warps * 32) >= 4) and (K > 16 or N > 16 or M > 16)
+    if enough_work and K >= 16:
         if "float64" in in_dtype:
             assert "ld.global.v2.b64" in ptx
         else:
             assert "ld.global.v4" in ptx
+    if enough_work and N >= 16:
         if "float8" in in_dtype:
             assert "st.global.v2" in ptx
         elif "float64" in in_dtype:
@@ -4317,7 +4604,7 @@ def test_dot(
                 ptx,
             )
     elif in_dtype == "int8":
-        if is_tcgen5 and capability[0:2] != (10, 3):
+        if is_tcgen5 and capability[1] not in (3, 7):
             assert re.search(r"tcgen05.mma.cta_group::1.kind::i8", ptx)
         elif capability[0] == 7 and capability[1] == 5:  # Turing
             assert "mma.sync.aligned.m8n8k16.row.col.satfinite.s32.s8.s8.s32" in ptx
@@ -4340,6 +4627,7 @@ def test_dot(
         assert re.search(pattern, ptx, flags=re.DOTALL)
 
 
+@pytest.mark.interpreter
 @pytest.mark.parametrize(
     "M, N, K, col_a, col_b, rhs_scale, mxfp_type, normal_type, num_warps, mma, kpack",
     [(M, N, K, col_a, col_b, rhs_scale, mxfp_type, normal_type, 4, mma, kpack)
@@ -4365,6 +4653,8 @@ def test_scaled_dot(
     kpack,
     device,
 ):
+    if is_interpreter() and normal_type != "fp16":
+        pytest.skip("bfloat16 is not supported in the interpreter")
     is_SM120 = False
     if is_cuda():
         cc = torch.cuda.get_device_capability()
@@ -4647,6 +4937,8 @@ def test_scaled_dot(
     if is_hip_rdna3() and mxfp_type == "e4m3" and normal_type == "fp16":
         large_tolerance = True
     if is_SM120:
+        large_tolerance = True
+    if mxfp_type == 'e4m3' and is_interpreter():
         large_tolerance = True
     atol = 2e-4 if large_tolerance else 1e-5
     rtol = 2e-2 if large_tolerance else 1e-2
@@ -5357,6 +5649,87 @@ def test_vectorization_hints(has_hints, device):
         assert "ld.global.v4.b32" in ptx
     else:
         assert "ld.global.v4.b32" not in ptx
+
+
+def _ptx_version(ptx):
+    match = re.search(r"^\.version\s+(\d+)\.(\d+)", ptx, re.MULTILINE)
+    assert match is not None, "PTX is missing a .version directive"
+    return int(match.group(1)), int(match.group(2))
+
+
+def _ptx_global_access_widths(ptx, op):
+    widths = []
+    for match in re.finditer(rf"\b{op}\.global(?:\.[a-zA-Z0-9_:]+)*?(?:\.v(?P<count>\d+))?\.b(?P<bits>\d+)\b", ptx):
+        widths.append(int(match.group("count") or 1) * int(match.group("bits")))
+    return widths
+
+
+@triton.jit
+def _softmax_vectorization_kernel(output_ptr, input_ptr, input_row_stride, output_row_stride, n_rows, n_cols,
+                                  BLOCK_SIZE: tl.constexpr, num_stages: tl.constexpr, MAX_DIVISIBILITY: tl.constexpr):
+    row_start = tl.program_id(0)
+    row_step = tl.num_programs(0)
+    for row_idx in tl.range(row_start, n_rows, row_step, num_stages=num_stages):
+        col_offsets = tl.arange(0, BLOCK_SIZE)
+        row_start_ptr = input_ptr + row_idx * input_row_stride
+        input_ptrs = row_start_ptr + col_offsets
+        if MAX_DIVISIBILITY > 1:
+            n_cols = tl.multiple_of(n_cols, MAX_DIVISIBILITY)
+            input_ptrs = tl.max_contiguous(tl.multiple_of(input_ptrs, MAX_DIVISIBILITY), MAX_DIVISIBILITY)
+        mask = col_offsets < n_cols
+        row = tl.load(input_ptrs, mask=mask, other=-float("inf"))
+        row = row - tl.max(row, axis=0)
+        numerator = tl.exp(row)
+        softmax_output = numerator / tl.sum(numerator, axis=0)
+        output_ptrs = output_ptr + row_idx * output_row_stride + col_offsets
+        if MAX_DIVISIBILITY > 1:
+            output_ptrs = tl.max_contiguous(tl.multiple_of(output_ptrs, MAX_DIVISIBILITY), MAX_DIVISIBILITY)
+        tl.store(output_ptrs, softmax_output, mask=mask)
+
+
+@pytest.mark.parametrize("n_cols", [1152, 4096])
+def test_softmax_vectorization_correctness(n_cols, device):
+    if not is_cuda():
+        pytest.skip("Requires CUDA")
+    if torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("Requires Blackwell")
+
+    torch.manual_seed(0)
+    n_rows = 32
+    x = torch.randn((n_rows, n_cols), device=device, dtype=torch.float32)
+    expected = torch.softmax(x, dim=1)
+    cases = [
+        ("triton-128", 16, 1),
+        ("triton-256", 32, 1),
+        ("triton-128-pipelined", 16, 4),
+    ]
+
+    for provider, max_divisibility, num_stages in cases:
+        y = torch.empty_like(x)
+        pgm = _softmax_vectorization_kernel[(n_rows, )](
+            y,
+            x,
+            x.stride(0),
+            y.stride(0),
+            n_rows,
+            n_cols,
+            BLOCK_SIZE=triton.next_power_of_2(n_cols),
+            num_stages=num_stages,
+            MAX_DIVISIBILITY=max_divisibility,
+            num_warps=8,
+        )
+        torch.testing.assert_close(y, expected, rtol=1e-4, atol=1e-6, msg=provider)
+        ptx = pgm.asm["ptx"]
+        assert ".target sm_100" in ptx, provider
+        if num_stages == 1:
+            assert "cp.async" not in ptx, provider
+            expected_width = 256 if provider == "triton-256" and _ptx_version(ptx) >= (8, 8) else 128
+            assert expected_width in _ptx_global_access_widths(ptx, "ld"), provider
+            assert expected_width in _ptx_global_access_widths(ptx, "st"), provider
+        else:
+            assert "cp.async.cg.shared.global" in ptx, provider
+            assert "cp.async.wait_group" in ptx, provider
+            assert 128 in _ptx_global_access_widths(ptx, "st"), provider
 
 
 @pytest.mark.interpreter
@@ -6585,15 +6958,16 @@ def test_constexpr_assignment(literal, tensor_ty):
     def kernel(input_literal: tl.constexpr, tensor_type: tl.constexpr):
         patched_literal: tl.constexpr = PATCHED
         # Sanity checks
-        tl.static_assert(patched_literal.type == constexpr_type(PATCHED))
-        tl.static_assert(input_literal.type == constexpr_type(PATCHED))
+        tl.static_assert(patched_literal.type == (PATCHED).type)
+        tl.static_assert(input_literal.type == (PATCHED).type)
 
         assigned_literal: tl.constexpr = input_literal
-        tl.static_assert(assigned_literal.type == constexpr_type(PATCHED))
+        tl.static_assert(assigned_literal.type == (PATCHED).type)
         tl.static_assert(assigned_literal == patched_literal)
 
         if tensor_type is not None:
             assigned_variable = input_literal
+            tl.static_assert(input_literal.type == constexpr_type(PATCHED))
             tl.static_assert(assigned_variable.type == tensor_type)
 
     kernel_patched = patch_kernel(kernel, {"PATCHED": f"{literal}"})
@@ -7018,6 +7392,7 @@ def test_num_ctas_pre_sm90(device, fresh_knobs):
 # -----------------------
 
 
+@pytest.mark.interpreter
 @pytest.mark.parametrize("dtype", ["float16", "float32"])
 @pytest.mark.parametrize("propagate_nan", ["NONE", "ALL"])
 @pytest.mark.parametrize("func", ["minimum", "maximum", "clamp"])
@@ -8015,7 +8390,7 @@ def test_libdevice_rint(dtype_str, device):
         -float("inf"),
         float("nan"),
     ])
-    x_np = np.concat((x0_np, x1_np, x2_np))
+    x_np = np.concatenate((x0_np, x1_np, x2_np))
     x_tri = to_triton(x_np, device=device, dst_type=dtype_str)
 
     @triton.jit

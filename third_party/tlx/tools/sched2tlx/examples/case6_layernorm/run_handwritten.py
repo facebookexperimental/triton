@@ -44,7 +44,7 @@ def main() -> int:
             BLOCK_M=BLOCK_M,
             BLOCK_N=BLOCK_N,
             NUM_PERSIST=NUM_PERSIST,
-            num_warps=4,
+            # NUM_BUFFERS + num_warps injected by @triton.autotune.
         )
 
         ref = F.layer_norm(x.float(), (N, ), w.float(), b.float(), eps)

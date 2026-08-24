@@ -8,12 +8,20 @@ must start zeroed.
 
 from __future__ import annotations
 
+import importlib
 import math
 import sys
 
 import torch
 import triton
-from generated import fa_bwd_dkdv_5mma
+
+try:
+    from generated import fa_bwd_dkdv_5mma
+except ModuleNotFoundError:  # buck par: module lives under the dotted package
+    _gen = importlib.import_module(
+        (__package__ + ".generated") if __package__ else "generated"
+    )
+    fa_bwd_dkdv_5mma = _gen.fa_bwd_dkdv_5mma
 
 LOG2E = 1.4426950408889634
 

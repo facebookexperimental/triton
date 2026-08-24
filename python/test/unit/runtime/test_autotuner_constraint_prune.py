@@ -194,7 +194,7 @@ def test_ir_prune_count():
 # ---------------------------------------------------------------------------
 # GPU end-to-end tests (real Triton compile)
 # ---------------------------------------------------------------------------
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA GPU")
+@pytest.mark.skipif(not is_cuda(), reason="requires CUDA GPU")
 def test_gpu_ir_prune_on_real_ir(device="cuda"):
     N = 1024
     src = torch.randn(N, device=device, dtype=torch.float32)
@@ -235,7 +235,7 @@ def test_gpu_ir_prune_on_real_ir(device="cuda"):
 # BLOCK_SIZE>=512 -> v4, 256 -> v2, 128 -> scalar. Arch-independent (H100 fine). We record
 # the predicate's per-config verdict and assert the prune outcome matches it exactly.
 # ---------------------------------------------------------------------------
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA GPU")
+@pytest.mark.skipif(not is_cuda(), reason="requires CUDA GPU")
 def test_gpu_vectorization_filter(device="cuda"):
     N = 1 << 20
     src = torch.randn(N, device=device, dtype=torch.float32)

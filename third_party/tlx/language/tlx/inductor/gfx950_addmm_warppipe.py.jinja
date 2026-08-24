@@ -1,0 +1,221 @@
+{{def_kernel("A", "B")}}
+    # TLX warp-pipelined addmm for AMD (MI350X / gfx950), COL-MAJOR B (stride_bk == 1).
+    # A:[M,K] row-major, B:[K,N] col-major (the nn.Linear weight-transpose layout).
+    # B is loaded as (BLOCK_N, BLOCK_K) tiles (K contiguous -> coalesced async_load) and
+    # transposed via tlx.local_trans for the MFMA. Bias is applied by store_output via the
+    # epilogue_fn / prefix_args supplied by the heuristic (not referenced here). num_stages=1.
+    #
+    # NOTE: tlx.async_load's flat offset is int32 here, so this template is restricted (by the
+    # heuristic) to shapes Inductor indexes with int32 (M*K and N*K statically < 2**31). An int32
+    # offset that overflows faults at runtime (GPU memory access fault), which is why the bound is
+    # enforced. (A 64-bit *base* advance -- e.g. `a_ptr + batch*stride` cast to int64 -- DOES lower
+    # and read correctly on gfx950, verified separately, so a future batched bmm can address
+    # per-batch bases that way; only the 32-bit within-tile offset is the hard limit.)
+    #
+    # UNALIGNED K: a MASKED (partial-K) async_load fails to lower on gfx950 (the partial
+    # ttg.async_copy_global_to_local into a padded_shared LDS layout is marked illegal). So the
+    # warp-pipe walks only FULL K-tiles (K_ITERS = K // BLOCK_K, UNMASKED async_load) and the
+    # leftover K columns (K % BLOCK_K) are handled once, after the pipeline, by a synchronous
+    # masked tl.load + one extra dot ("sync-load the tail"). For K that IS a multiple of BLOCK_K
+    # the tail is a no-op (all-false mask), so aligned-K codegen is unchanged.
+    #
+    # DUAL PATH (USE_ASYNC constexpr, set by the heuristic from K's alignment): K % 8 == 0 uses the
+    # async_load direct-to-LDS warp-pipe below (needs 16-byte-aligned rows: A [M,K] + col-major
+    # B [K,N] have row stride K, so K*2 B must be 16-aligned). Unaligned/odd/sliced/small/dynamic K
+    # -- which the async_copy path can't legalize on CDNA4 -- uses the register-path fallback
+    # (tl.load->tl.dot, auto-pipelined), same mechanism as the bmm template (T280910119).
+    M = {{size("A", 0)}}
+    N = {{size("B", 1)}}
+    K = {{size("A", 1)}}
+    if M * N == 0:
+        # early exit due to zero-size input(s)
+        return
+    stride_am = {{stride("A", 0)}}
+    stride_ak = {{stride("A", 1)}}
+    stride_bk = {{stride("B", 0)}}
+    stride_bn = {{stride("B", 1)}}
+    tl.assume(stride_am > 0)
+    tl.assume(stride_ak > 0)
+    tl.assume(stride_bk > 0)
+    tl.assume(stride_bn > 0)
+
+    # re-order program ID for better L2 performance
+    pid = tl.program_id(0).to(INDEX_DTYPE)
+{% if SPLIT_K > 1 %}
+    # split-K: grid is grid_mn * SPLIT_K; each program owns one (tile, split) and
+    # reduces only its K-slice. Partials go to the fp32 split_k_ws workspace and are
+    # summed (+ bias) by _reduce_k_kernel (emitted after this kernel by the plumbing).
+    split_id = (pid % SPLIT_K).to(INDEX_DTYPE)
+    pid = pid // SPLIT_K
+{% endif %}
+    grid_m = (M + BLOCK_M - 1) // BLOCK_M
+    grid_n = (N + BLOCK_N - 1) // BLOCK_N
+
+    # L2 chiplet swizzle: group adjacent PIDs onto the same XCD in chunks so tiles that
+    # share operands hit warm L2. NUM_XCDS is injected by the heuristic (8 for gfx942/gfx950,
+    # else 1, which makes this an identity). Mirrors the standalone amd_addmm_mul.py
+    # chiplet_transform_chunked (XCD_CHUNK=4). PIDs in the trailing remainder (grid not a
+    # multiple of NUM_XCDS*XCD_CHUNK) pass through unchanged.
+    # Line-by-line walkthrough + chiplet diagrams: P2410594601.
+    XCD_CHUNK: tl.constexpr = 4
+    grid_mn = grid_m * grid_n
+    # aligned = largest whole number of NUM_XCDS*XCD_CHUNK "super-chunks"; only these are remapped.
+    aligned = (grid_mn // (NUM_XCDS * XCD_CHUNK)) * (NUM_XCDS * XCD_CHUNK)
+    if pid < aligned:
+        xcd = pid % NUM_XCDS            # the XCD the HW already placed this block on (fixed)
+        local_pid = pid // NUM_XCDS     # which round this block is within that XCD
+        # new logical tile = super-chunk base + this XCD's XCD_CHUNK-wide slot + position in slot,
+        # so consecutive tiles land as contiguous chunks on one XCD (a bijection; math unchanged).
+        pid = (local_pid // XCD_CHUNK) * (NUM_XCDS * XCD_CHUNK) + xcd * XCD_CHUNK + (local_pid % XCD_CHUNK)
+
+    width = GROUP_M * grid_n
+    group_id = pid // width
+    group_size = min(grid_m - group_id * GROUP_M, GROUP_M)
+    pid_m = group_id * GROUP_M + (pid % group_size)
+    pid_n = (pid % width) // (group_size)
+    tl.assume(pid_m >= 0)
+    tl.assume(pid_n >= 0)
+
+    offs_m = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M).to(INDEX_DTYPE)) % M
+    offs_n = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N).to(INDEX_DTYPE)) % N
+    offs_k = tl.arange(0, BLOCK_K).to(INDEX_DTYPE)
+
+    a_base = offs_m[:, None] * stride_am
+    b_base = offs_n[:, None] * stride_bn          # B as (BLOCK_N, BLOCK_K): n is the row of the [N,K] view
+
+{% if USE_ASYNC %}
+    # --- async_load direct-to-LDS warp-pipe path (USE_ASYNC=1: K % 8 == 0, 16-byte-aligned rows) ---
+    K_ITERS = K // BLOCK_K   # FULL K-tiles only; the partial-K tail is handled after the pipeline
+{% if SPLIT_K > 1 %}
+    # this split's contiguous K-iteration range [k_lo, k_lo + n_iters). BALANCED
+    # partition: the first `rem` splits get (base + 1) iters, the rest get `base`.
+    # This keeps every split within +-1 iter of the others, so n_iters stays > NUM_BUFFERS
+    # for all splits (the heuristic guards base > NUM_BUFFERS). A ceil-then-remainder
+    # split would instead leave the LAST split with as little as 1 iter, underflowing
+    # the prologue/drain and double-counting K-tiles.
+    base = K_ITERS // SPLIT_K
+    rem = K_ITERS - base * SPLIT_K
+    k_lo = split_id * base + tl.minimum(split_id, rem)
+    n_iters = base + (split_id < rem).to(INDEX_DTYPE)
+{% else %}
+    k_lo = 0
+    n_iters = K_ITERS
+{% endif %}
+
+    smemA = tlx.local_alloc((BLOCK_M, BLOCK_K), tlx.dtype_of(A), NUM_BUFFERS)
+    smemB = tlx.local_alloc((BLOCK_N, BLOCK_K), tlx.dtype_of(B), NUM_BUFFERS)   # holds Bᵀ tile
+
+    # prologue: prefetch the first NUM_BUFFERS K-tiles (heuristic guarantees K_ITERS > NUM_BUFFERS).
+    # A and B share a SINGLE async_load_commit_group per K-tile -- Hongtao's P2419921423 structure.
+    # One group/iter means the wait counts tiles directly (no *2), and it lets the wait live at the
+    # loop tail (below), which is what makes the pipeline race-free across all NUM_BUFFERS (incl. 2).
+    for i in tl.range(0, NUM_BUFFERS, loop_unroll_factor=NUM_BUFFERS):
+        k_start = (k_lo + i) * BLOCK_K
+        a_offs = a_base + (k_start + offs_k[None, :]) * stride_ak
+        b_offs = b_base + (k_start + offs_k[None, :]) * stride_bk
+        # Full tiles only (k_start + BLOCK_K <= K_ITERS*BLOCK_K <= K) -> UNMASKED: a masked
+        # (partial-K) async_load fails to lower on gfx950. int32 cast is lossless (heuristic bound).
+        tok_a = tlx.async_load(A + a_offs.to(tl.int32), tlx.local_view(smemA, i))
+        tok_b = tlx.async_load(B + b_offs.to(tl.int32), tlx.local_view(smemB, i))
+        tlx.async_load_commit_group([tok_a, tok_b])
+
+    tlx.async_load_wait_group(NUM_BUFFERS - 2)
+    a_tile = tlx.local_load(tlx.local_view(smemA, 0))
+    b_tile = tlx.local_load(tlx.local_trans(tlx.local_view(smemB, 0)))
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_TYPE)
+
+    for tile_id in tl.range(0, n_iters - NUM_BUFFERS):
+        # buffer indices MUST be int32: local_view feeds them to the block-ptr index check, which
+        # rejects int64. tile_id is int64 when K (-> K_ITERS) is symbolic (dynamic shapes).
+        prefetch_buf = (tile_id % NUM_BUFFERS).to(tl.int32)
+        next_buf = ((tile_id + 1) % NUM_BUFFERS).to(tl.int32)
+        k_prefetch = (k_lo + tile_id + NUM_BUFFERS) * BLOCK_K
+
+        with tlx.warp_pipeline_stage("mfma", priority=0):
+            acc = tl.dot(a_tile, b_tile, acc, allow_tf32=ALLOW_TF32, out_dtype=ACC_TYPE)
+
+        with tlx.warp_pipeline_stage("mem", priority=1):
+            a_offs = a_base + (k_prefetch + offs_k[None, :]) * stride_ak
+            b_offs = b_base + (k_prefetch + offs_k[None, :]) * stride_bk
+            # full tile (see prologue) -> UNMASKED async_load.
+            tok_a = tlx.async_load(A + a_offs.to(tl.int32), tlx.local_view(smemA, prefetch_buf))
+            tok_b = tlx.async_load(B + b_offs.to(tl.int32), tlx.local_view(smemB, prefetch_buf))
+            tlx.async_load_commit_group([tok_a, tok_b])
+            a_tile = tlx.local_load(tlx.local_view(smemA, next_buf))
+            b_tile = tlx.local_load(tlx.local_trans(tlx.local_view(smemB, next_buf)))
+
+        # loop-tail wait (Hongtao P2419921423): keep NUM_BUFFERS-2 commit groups in flight. With
+        # single A+B commits this counts tiles directly. Race-free because local_load(next_buf)
+        # above reads a buffer committed >=2 iters ago, made complete by the PREVIOUS iteration's
+        # tail wait; NUM_BUFFERS=2 -> wait(0) fully drains each iter (correct, serial). Replaces
+        # the earlier in-loop async_load_wait_group((NUM_BUFFERS-2)*2) before local_load, which
+        # fixed the same RAW race with separate A/B commits.
+        tlx.async_load_wait_group(NUM_BUFFERS - 2)
+
+    acc = tl.dot(a_tile, b_tile, acc, allow_tf32=ALLOW_TF32, out_dtype=ACC_TYPE)
+    tlx.async_load_wait_group(0)
+    for i in tl.range(0, NUM_BUFFERS - 1, loop_unroll_factor=NUM_BUFFERS - 1):
+        buf = ((n_iters - (NUM_BUFFERS - 1) + i) % NUM_BUFFERS).to(tl.int32)   # int32 buffer index
+        a_tile = tlx.local_load(tlx.local_view(smemA, buf))
+        b_tile = tlx.local_load(tlx.local_trans(tlx.local_view(smemB, buf)))
+        acc = tl.dot(a_tile, b_tile, acc, allow_tf32=ALLOW_TF32, out_dtype=ACC_TYPE)
+
+    # --- partial-K tail ("sync-load the tail") ---
+    # The warp-pipe above covered [0, K_ITERS*BLOCK_K); the leftover K columns (K % BLOCK_K, if
+    # any) are loaded here with a SYNCHRONOUS masked tl.load (async_load cannot lower a partial-K
+    # tile) and folded into acc with one extra dot. tail_width == 0 when K is a multiple of BLOCK_K,
+    # giving an all-false mask (a no-op), so aligned-K shapes are unaffected. Under split-K only the
+    # last split owns the tail -- every other split zeroes tail_width so it is not double-counted.
+    k_tail = K_ITERS * BLOCK_K
+{% if SPLIT_K > 1 %}
+    tail_width = (K - k_tail) * (split_id == SPLIT_K - 1).to(INDEX_DTYPE)
+{% else %}
+    tail_width = K - k_tail
+{% endif %}
+    a_offs = a_base + (k_tail + offs_k[None, :]) * stride_ak          # (BLOCK_M, BLOCK_K)
+    a_tail = tl.load(A + a_offs.to(tl.int32), mask=offs_k[None, :] < tail_width, other=0.0)
+    # Load B's tail directly as (BLOCK_K, BLOCK_N) (K along rows) so it feeds tl.dot without a
+    # transpose -- the warp-pipe uses tlx.local_trans, but that is LDS-only; here a plain tl.load
+    # with a transposed index is simplest for the one-off tail.
+    b_offs = (k_tail + offs_k[:, None]) * stride_bk + offs_n[None, :] * stride_bn
+    b_tail = tl.load(B + b_offs.to(tl.int32), mask=offs_k[:, None] < tail_width, other=0.0)
+    acc = tl.dot(a_tail, b_tail, acc, allow_tf32=ALLOW_TF32, out_dtype=ACC_TYPE)
+{% else %}
+    # --- register-path fallback (USE_ASYNC=0: (K*itemsize) % 16 != 0, e.g. odd/sliced/small K) ---
+    # buffer_load (tl.load) is element-granular, so it lowers for ANY row-stride alignment where the
+    # direct-to-LDS async_load cannot -- same mechanism as the bmm register branch (T280910119).
+    # A is loaded [BLOCK_M, BLOCK_K]; col-major B [K,N] is loaded [BLOCK_K, BLOCK_N] with K along rows
+    # (same index as the sync-tail above) so it feeds tl.dot directly (no local_trans). The masked
+    # load handles K % BLOCK_K inline. num_stages>1 (set by the heuristic) auto-pipelines the loads.
+    # SPLIT_K is always 1 on this path (the heuristic only emits SPLIT_K=1 register configs).
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_TYPE)
+    for k in range(0, K, BLOCK_K):
+        a_offs = a_base + (k + offs_k[None, :]) * stride_ak
+        a_reg = tl.load(A + a_offs.to(tl.int32), mask=offs_k[None, :] < K - k, other=0.0)
+        b_offs = (k + offs_k[:, None]) * stride_bk + offs_n[None, :] * stride_bn
+        b_reg = tl.load(B + b_offs.to(tl.int32), mask=offs_k[:, None] < K - k, other=0.0)
+        acc = tl.dot(a_reg, b_reg, acc, allow_tf32=ALLOW_TF32, out_dtype=ACC_TYPE)
+{% endif %}
+
+    # rematerialize rm and rn to save registers
+    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M).to(INDEX_DTYPE)
+    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N).to(INDEX_DTYPE)
+    idx_m = rm[:, None]
+    idx_n = rn[None, :]
+    mask = (idx_m < M) & (idx_n < N)
+
+{% if SPLIT_K > 1 %}
+    # split-K: write this split's fp32 partial to workspace[(split_id*M + m), n].
+    # _reduce_k_kernel (emitted after this kernel) sums the SPLIT_K partials, adds bias,
+    # casts, and stores the final output. store_output (and its bias epilogue) is bypassed,
+    # so bias is applied in the reduction step (see registry _tlx_emit_post_kernel_code).
+    # Referencing output_ptr() keeps out_ptr0 in the kernel signature (the autotuning
+    # harness passes `out` positionally); the real output is written by _reduce_k_kernel.
+    keep_out_ptr = {{output_ptr()}}  # noqa: F841
+    ws_off = split_id * (M * N) + idx_m * N + idx_n
+    tl.store(split_k_ws + ws_off, acc, mask=mask)
+{% else %}
+    # inductor generates a suffix (bias add via epilogue_fn + prefix_args, cast, store)
+    {{store_output(("idx_m", "idx_n"), "acc", "mask", val_shape=("BLOCK_M", "BLOCK_N"))}}
+{% endif %}

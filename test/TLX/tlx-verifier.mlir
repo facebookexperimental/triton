@@ -31,7 +31,7 @@ module attributes {tlx.has_warp_spec_ops = true, "ttg.num-ctas" = 1 : i32, "ttg.
 #shared = #ttg.nvmma_shared<{swizzlingByteWidth = 32, transposed = false, elementBitWidth = 16, CGALayout = [[1, 0]]}>
 #shared1 = #ttg.nvmma_shared<{swizzlingByteWidth = 32, transposed = true, elementBitWidth = 16, CGALayout = [[0, 1]]}>
 #shared1_nosplit = #ttg.nvmma_shared<{swizzlingByteWidth = 32, transposed = true, elementBitWidth = 16, CGALayout = [[0, 1]]}>
-#shared2 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0], CGALayout = [[0]]}>
+#shared2 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0], CGALayout = [[1]]}>
 
 #tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1, CGALayout = [[1, 0]], twoCTAs = true>
 module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 8 : i32, "ttng.two-ctas" = true} {
@@ -68,5 +68,29 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.shar
     // expected-error @+1 {{Unexpected buffer remote view in 1cta mode}}
     %0 = ttng.map_to_remote_buffer %arg, %c1_i32: !ttg.memdesc<1xi64, #shared, #smem, mutable> -> !ttg.memdesc<1xi64, #shared, #ttng.shared_cluster_memory, mutable>
     tt.return
+  }
+}
+
+// -----
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @release_layout_requires_encoded_source(
+      %arg: tensor<128xf32>) -> tensor<128xf32> {
+    // expected-error @+1 {{requires the source tensor to have a layout encoding}}
+    %result = tlx.release_layout %arg : tensor<128xf32> -> tensor<128xf32>
+    tt.return %result : tensor<128xf32>
+  }
+}
+
+// -----
+
+#release_shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#release_user_shared = #tlx.user_layout<#release_shared>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @release_layout_accepts_encoded_source(
+      %arg: tensor<128xf32, #release_user_shared>) -> tensor<128xf32> {
+    %result = tlx.release_layout %arg
+        : tensor<128xf32, #release_user_shared> -> tensor<128xf32>
+    tt.return %result : tensor<128xf32>
   }
 }

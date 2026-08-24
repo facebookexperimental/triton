@@ -86,8 +86,11 @@ TritonGPUConversionTarget::TritonGPUConversionTarget(
         cast<RankedTensorType>(dotOp.getA().getType()).getEncoding();
     Attribute bEncoding =
         cast<RankedTensorType>(dotOp.getB().getType()).getEncoding();
-    if (aEncoding && isa<triton::gpu::DotOperandEncodingAttr>(aEncoding) &&
-        bEncoding && isa<triton::gpu::DotOperandEncodingAttr>(bEncoding))
+    if (aEncoding && bEncoding &&
+        isa<triton::gpu::DotOperandEncodingAttr>(
+            triton::tlx::getEffectiveEncoding(aEncoding)) &&
+        isa<triton::gpu::DotOperandEncodingAttr>(
+            triton::tlx::getEffectiveEncoding(bEncoding)))
       return true;
     return false;
   });
@@ -110,11 +113,13 @@ TritonGPUConversionTarget::TritonGPUConversionTarget(
       triton::gpu::LocalStoreOp, triton::gpu::RemoteShmemStoreOp,
       triton::gpu::LocalGatherOp, triton::gpu::LocalScatterOp,
       triton::gpu::AsyncRemoteShmemStoreOp, triton::nvidia_gpu::PrefetchOp,
+      triton::nvidia_gpu::TwoCTAPeerGatherOp,
       triton::nvidia_gpu::WarpGroupDotWaitOp,
       triton::nvidia_gpu::VoteBallotSyncOp, triton::tlx::RequireLayoutOp,
       triton::tlx::ReleaseLayoutOp, triton::tlx::LocalAliasOp,
       triton::tlx::DumpLayoutOp, triton::amdgpu::BufferLoadOp,
-      triton::amdgpu::BufferStoreOp, triton::amdgpu::BufferLoadToLocalOp>(
+      triton::amdgpu::BufferStoreOp, triton::amdgpu::BufferLoadToLocalOp,
+      triton::amdgpu::RematerializedRangeOp, triton::amdgpu::RegisterHandoffOp>(
       [&](Operation *op) -> bool {
         // make sure every RankedTensorType operand has encoding
         for (auto operandType : op->getOperandTypes()) {
@@ -137,13 +142,13 @@ TritonGPUConversionTarget::TritonGPUConversionTarget(
       });
 
   addDynamicallyLegalOp<triton::FuncOp>([](triton::FuncOp funcOp) -> bool {
-    for (auto arg : funcOp.getArguments()) {
-      if (auto tensor = dyn_cast<RankedTensorType>(arg.getType())) {
-        if (!tensor.getEncoding())
-          return false;
-      }
-    }
-    return true;
+    auto check = [](auto types) {
+      return llvm::all_of(types, [](auto type) {
+        auto tensor = dyn_cast<RankedTensorType>(type);
+        return !tensor || tensor.getEncoding();
+      });
+    };
+    return check(funcOp.getArgumentTypes()) && check(funcOp.getResultTypes());
   });
 }
 

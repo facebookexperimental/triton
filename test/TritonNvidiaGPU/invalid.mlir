@@ -1,5 +1,106 @@
 // RUN: triton-opt --split-input-file %s --verify-diagnostics
 
+// expected-error @below {{fp4Padded tensor memory layout requires colStride 1 but got 2}}
+#bad_fp4_padded_tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 64, colStride = 2, fp4Padded = true>
+
+// -----
+
+#shared_a = #ttg.nvmma_shared<{swizzlingByteWidth = 32, transposed = false, elementBitWidth = 8}>
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 32, transposed = true, elementBitWidth = 8}>
+#tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
+#tmem_acc_fp4_padded = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1, fp4Padded = true>
+#tmem_fp4_dense = #ttng.tensor_memory_encoding<blockM = 128, blockN = 64, colStride = 1>
+#tmem_fp4_padded = #ttng.tensor_memory_encoding<blockM = 128, blockN = 64, colStride = 1, fp4Padded = true>
+#tmem_scales = #ttng.tensor_memory_scales_encoding<>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
+  tt.func public @dense_fp4_tmem_lhs_mixed_rhs_invalid(
+      %a: !ttg.memdesc<128x64xi8, #tmem_fp4_dense, #ttng.tensor_memory>,
+      %b: !ttg.memdesc<128x128xf8E5M2, #shared, #ttg.shared_memory>,
+      %c: !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>,
+      %scale_a: !ttg.memdesc<128x4xi8, #tmem_scales, #ttng.tensor_memory>,
+      %scale_b: !ttg.memdesc<128x4xi8, #tmem_scales, #ttng.tensor_memory>,
+      %useAcc: i1,
+      %pred: i1) {
+    // expected-error @below {{expected e2m1 LHS operand to be fp4_padded when RHS is float8}}
+    ttng.tc_gen5_mma_scaled %a, %b, %c, %scale_a, %scale_b, %useAcc, %pred lhs = e2m1 rhs = e5m2 :
+       !ttg.memdesc<128x64xi8, #tmem_fp4_dense, #ttng.tensor_memory>,
+       !ttg.memdesc<128x128xf8E5M2, #shared, #ttg.shared_memory>,
+       !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>,
+       !ttg.memdesc<128x4xi8, #tmem_scales, #ttng.tensor_memory>,
+       !ttg.memdesc<128x4xi8, #tmem_scales, #ttng.tensor_memory>
+    tt.return
+  }
+
+  tt.func public @fp4_padded_tmem_lhs_fp8_storage_invalid(
+      %a: !ttg.memdesc<128x64xf8E5M2, #tmem_fp4_padded, #ttng.tensor_memory>,
+      %b: !ttg.memdesc<128x128xf8E5M2, #shared, #ttg.shared_memory>,
+      %c: !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>,
+      %scale_a: !ttg.memdesc<128x4xi8, #tmem_scales, #ttng.tensor_memory>,
+      %scale_b: !ttg.memdesc<128x4xi8, #tmem_scales, #ttng.tensor_memory>,
+      %useAcc: i1,
+      %pred: i1) {
+    // expected-error @below {{expected e2m1 LHS operand to have i8 storage}}
+    ttng.tc_gen5_mma_scaled %a, %b, %c, %scale_a, %scale_b, %useAcc, %pred lhs = e2m1 rhs = e5m2 :
+       !ttg.memdesc<128x64xf8E5M2, #tmem_fp4_padded, #ttng.tensor_memory>,
+       !ttg.memdesc<128x128xf8E5M2, #shared, #ttg.shared_memory>,
+       !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>,
+       !ttg.memdesc<128x4xi8, #tmem_scales, #ttng.tensor_memory>,
+       !ttg.memdesc<128x4xi8, #tmem_scales, #ttng.tensor_memory>
+    tt.return
+  }
+
+  tt.func public @tcgen5_fp4_padded_accumulator_invalid(
+      %a: !ttg.memdesc<128x128xf8E5M2, #shared_a, #ttg.shared_memory>,
+      %b: !ttg.memdesc<128x128xf8E5M2, #shared, #ttg.shared_memory>,
+      %c: !ttg.memdesc<128x128xf16, #tmem_acc_fp4_padded, #ttng.tensor_memory, mutable>,
+      %accUse: i1,
+      %pred: i1) {
+    // expected-error @below {{Accumulator must not be fp4_padded}}
+    ttng.tc_gen5_mma %a, %b, %c, %accUse, %pred :
+       !ttg.memdesc<128x128xf8E5M2, #shared_a, #ttg.shared_memory>,
+       !ttg.memdesc<128x128xf8E5M2, #shared, #ttg.shared_memory>,
+       !ttg.memdesc<128x128xf16, #tmem_acc_fp4_padded, #ttng.tensor_memory, mutable>
+    tt.return
+  }
+
+  tt.func public @tcgen5_scaled_fp4_padded_accumulator_invalid(
+      %a: !ttg.memdesc<128x64xi8, #tmem_fp4_padded, #ttng.tensor_memory>,
+      %b: !ttg.memdesc<128x128xf8E5M2, #shared, #ttg.shared_memory>,
+      %c: !ttg.memdesc<128x128xf32, #tmem_acc_fp4_padded, #ttng.tensor_memory, mutable>,
+      %scale_a: !ttg.memdesc<128x4xi8, #tmem_scales, #ttng.tensor_memory>,
+      %scale_b: !ttg.memdesc<128x4xi8, #tmem_scales, #ttng.tensor_memory>,
+      %useAcc: i1,
+      %pred: i1) {
+    // expected-error @below {{accumulator layout must not be fp4_padded}}
+    ttng.tc_gen5_mma_scaled %a, %b, %c, %scale_a, %scale_b, %useAcc, %pred lhs = e2m1 rhs = e5m2 :
+       !ttg.memdesc<128x64xi8, #tmem_fp4_padded, #ttng.tensor_memory>,
+       !ttg.memdesc<128x128xf8E5M2, #shared, #ttg.shared_memory>,
+       !ttg.memdesc<128x128xf32, #tmem_acc_fp4_padded, #ttng.tensor_memory, mutable>,
+       !ttg.memdesc<128x4xi8, #tmem_scales, #ttng.tensor_memory>,
+       !ttg.memdesc<128x4xi8, #tmem_scales, #ttng.tensor_memory>
+    tt.return
+  }
+
+  tt.func public @scaled_tmem_lhs_fp16_storage_invalid(
+      %a: !ttg.memdesc<128x64xf16, #tmem, #ttng.tensor_memory>,
+      %b: !ttg.memdesc<64x128xf16, #shared, #ttg.shared_memory>,
+      %c: !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>,
+      %scale_a: !ttg.memdesc<128x4xi8, #tmem_scales, #ttng.tensor_memory>,
+      %scale_b: !ttg.memdesc<128x4xi8, #tmem_scales, #ttng.tensor_memory>,
+      %useAcc: i1,
+      %pred: i1) {
+    // expected-error @below {{unsupported LHS operand type for scaled MMA}}
+    ttng.tc_gen5_mma_scaled %a, %b, %c, %scale_a, %scale_b, %useAcc, %pred lhs = fp16 rhs = fp16 :
+       !ttg.memdesc<128x64xf16, #tmem, #ttng.tensor_memory>,
+       !ttg.memdesc<64x128xf16, #shared, #ttg.shared_memory>,
+       !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>,
+       !ttg.memdesc<128x4xi8, #tmem_scales, #ttng.tensor_memory>,
+       !ttg.memdesc<128x4xi8, #tmem_scales, #ttng.tensor_memory>
+    tt.return
+  }
+}
+
+// -----
 #shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
 #smem = #ttg.shared_memory
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.shared = 65536 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
@@ -51,6 +152,33 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.shar
 
 // -----
 
+#blocked_i32 = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+#shared_i32 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @async_shared_store_requires_cluster(%src: tensor<128xi32, #blocked_i32>, %dst: !ttg.memdesc<128xi32, #shared_i32, #smem, mutable>, %bar: !ttg.memdesc<1xi64, #shared_i32, #smem, mutable>) {
+    // expected-error @+1 {{requires at least two CTAs in the cluster}}
+    ttng.async_shared_store %src, %dst, %bar : tensor<128xi32, #blocked_i32> -> !ttg.memdesc<128xi32, #shared_i32, #smem, mutable>, !ttg.memdesc<1xi64, #shared_i32, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+#blocked_f16 = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0], CGALayout = [[0]]}>
+#shared_f16 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0], CGALayout = [[0]]}>
+#barrier_shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0], CGALayout = [[1]]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @async_shared_store_requires_packable_layout(%src: tensor<128xf16, #blocked_f16>, %dst: !ttg.memdesc<128xf16, #shared_f16, #smem, mutable>, %bar: !ttg.memdesc<2xi64, #barrier_shared, #smem, mutable>) {
+    // expected-error @+1 {{requires a layout vectorizing stores to at least 32 bits}}
+    ttng.async_shared_store %src, %dst, %bar : tensor<128xf16, #blocked_f16> -> !ttg.memdesc<128xf16, #shared_f16, #smem, mutable>, !ttg.memdesc<2xi64, #barrier_shared, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
 #shared1 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
 #scales = #ttg.linear<{register = [[0, 1], [0, 2], [32, 0], [64, 0]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], warp = [[0, 0], [0, 0]], block = []}>
 #tmem = #ttng.tensor_memory_scales_encoding<>
@@ -85,12 +213,12 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.shar
 #blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
 
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
-tt.func @async_tma_gather(%desc: !tt.tensordesc<tensor<1x128xbf16, #shared>>, %x_offsets: tensor<32xi32, #blocked>, %y_offset: i32,
+tt.func @async_tma_gather(%desc: !tt.tensordesc<1x128xbf16, #shared>, %x_offsets: tensor<32xi32, #blocked>, %y_offset: i32,
                           %bar: !ttg.memdesc<2xi32, #shared1, #ttg.shared_memory, mutable>,
                           %result: !ttg.memdesc<32x128xbf16, #shared, #ttg.shared_memory, mutable>,
                           %pred: i1) {
   // expected-error @below {{barrier allocation must be a descriptor of Nxi64 type with N <= number of CTAs}}
-  ttng.async_tma_gather %desc[%x_offsets, %y_offset] %result, %bar, %pred : !tt.tensordesc<tensor<1x128xbf16, #shared>>, tensor<32xi32, #blocked>, i32, !ttg.memdesc<2xi32, #shared1, #ttg.shared_memory, mutable>, !ttg.memdesc<32x128xbf16, #shared, #ttg.shared_memory, mutable>, i1
+  ttng.async_tma_gather %desc[%x_offsets, %y_offset] %result, %bar, %pred : !tt.tensordesc<1x128xbf16, #shared>, tensor<32xi32, #blocked>, i32, !ttg.memdesc<2xi32, #shared1, #ttg.shared_memory, mutable>, !ttg.memdesc<32x128xbf16, #shared, #ttg.shared_memory, mutable>, i1
   tt.return
 }
 }
@@ -103,12 +231,12 @@ tt.func @async_tma_gather(%desc: !tt.tensordesc<tensor<1x128xbf16, #shared>>, %x
 #blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
 
 module attributes {"ttg.num-warps" = 4 : i32} {
-tt.func @async_tma_gather(%desc: !tt.tensordesc<tensor<1x128xbf16, #shared>>, %x_offsets: tensor<32xi32, #blocked>, %y_offset: i32,
+tt.func @async_tma_gather(%desc: !tt.tensordesc<1x128xbf16, #shared>, %x_offsets: tensor<32xi32, #blocked>, %y_offset: i32,
                           %bar: !ttg.memdesc<1xi64, #shared1, #ttg.shared_memory, mutable>,
                           %result: !ttg.memdesc<32x128xbf16, #shared, #ttg.shared_memory>,
                           %pred: i1) {
   // expected-error @below {{cannot store into immutable memory}}
-  ttng.async_tma_gather %desc[%x_offsets, %y_offset] %result, %bar, %pred : !tt.tensordesc<tensor<1x128xbf16, #shared>>, tensor<32xi32, #blocked>, i32, !ttg.memdesc<1xi64, #shared1, #ttg.shared_memory, mutable>, !ttg.memdesc<32x128xbf16, #shared, #ttg.shared_memory>, i1
+  ttng.async_tma_gather %desc[%x_offsets, %y_offset] %result, %bar, %pred : !tt.tensordesc<1x128xbf16, #shared>, tensor<32xi32, #blocked>, i32, !ttg.memdesc<1xi64, #shared1, #ttg.shared_memory, mutable>, !ttg.memdesc<32x128xbf16, #shared, #ttg.shared_memory>, i1
   tt.return
 }
 }
@@ -134,13 +262,225 @@ tt.func @wgmma(%a: tensor<128x128xf16, #ttg.dot_op<{opIdx = 0, parent = #mma, kW
 #shared1 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
 #smem = #ttg.shared_memory
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
-  tt.func public @async_tma_copy_global_to_local(%arg0: !tt.tensordesc<tensor<1x256x32xf32, #shared>>) -> tensor<256x32xf32, #blocked> {
+  tt.func public @async_tma_copy_global_to_local(%arg0: !tt.tensordesc<1x256x32xf32, #shared>) -> tensor<256x32xf32, #blocked> {
     %true = arith.constant true
     %c32_i32 = arith.constant 32 : i32
     %0 = ttg.local_alloc : () -> !ttg.memdesc<256x32xf32, #shared, #smem, mutable>
     %1 = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
     // expected-error @below {{TMA descriptor must have NVMMA shared layout}}
-    ttng.async_tma_copy_global_to_local %arg0[%c32_i32, %c32_i32, %c32_i32] %0, %1, %true : !tt.tensordesc<tensor<1x256x32xf32, #shared>>, !ttg.memdesc<1xi64, #shared1, #smem, mutable> -> !ttg.memdesc<256x32xf32, #shared, #smem, mutable>
+    ttng.async_tma_copy_global_to_local %arg0[%c32_i32, %c32_i32, %c32_i32] %0, %1, %true : !tt.tensordesc<1x256x32xf32, #shared>, !ttg.memdesc<1xi64, #shared1, #smem, mutable> -> !ttg.memdesc<256x32xf32, #shared, #smem, mutable>
+  }
+}
+
+// -----
+
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 64, transposed = false, elementBitWidth = 8}>
+#sharedT = #ttg.nvmma_shared<{swizzlingByteWidth = 64, transposed = true, elementBitWidth = 8}>
+#barrier = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 256, colStride = 1>
+#tmem_scales = #ttng.tensor_memory_scales_encoding<>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:107", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @tcgen5_mma_scaled_rubin_wrong_a_scale_block_rep_order(
+      %a: !ttg.memdesc<256x128xi8, #shared, #ttg.shared_memory>,
+      %b: !ttg.memdesc<128x256xi8, #sharedT, #ttg.shared_memory>,
+      %c: !ttg.memdesc<256x256xf32, #tmem, #ttng.tensor_memory, mutable>,
+      %scale_a: !ttg.memdesc<256x8xf8E4M3FN, #tmem_scales, #ttng.tensor_memory>,
+      %scale_b: !ttg.memdesc<256x8xf8E4M3FN, #tmem_scales, #ttng.tensor_memory>,
+      %useAcc: i1,
+      %pred: i1,
+      %bar: !ttg.memdesc<1xi64, #barrier, #ttg.shared_memory, mutable>,
+      %barPred: i1) {
+    // expected-error @below {{A scales in tensor memory must use #ttng.tensor_memory_scales_encoding<blockRepOrder = kThenMn>}}
+    ttng.tc_gen5_mma_scaled %a, %b, %c, %scale_a, %scale_b, %useAcc, %pred lhs = e2m1 rhs = e2m1, %bar[%barPred] {is_async} :
+      !ttg.memdesc<256x128xi8, #shared, #ttg.shared_memory>,
+      !ttg.memdesc<128x256xi8, #sharedT, #ttg.shared_memory>,
+      !ttg.memdesc<256x256xf32, #tmem, #ttng.tensor_memory, mutable>,
+      !ttg.memdesc<256x8xf8E4M3FN, #tmem_scales, #ttng.tensor_memory>,
+      !ttg.memdesc<256x8xf8E4M3FN, #tmem_scales, #ttng.tensor_memory>,
+      !ttg.memdesc<1xi64, #barrier, #ttg.shared_memory, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 64, transposed = false, elementBitWidth = 8}>
+#sharedT = #ttg.nvmma_shared<{swizzlingByteWidth = 64, transposed = true, elementBitWidth = 8}>
+#tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
+#tmem_scales = #ttng.tensor_memory_scales_encoding<>
+#tmem_scales_k_then_mn = #ttng.tensor_memory_scales_encoding<blockRepOrder = kThenMn>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @tcgen5_mma_scaled_blackwell_k_then_mn(
+      %a: !ttg.memdesc<128x64xi8, #shared, #ttg.shared_memory>,
+      %b: !ttg.memdesc<64x128xi8, #sharedT, #ttg.shared_memory>,
+      %c: !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>,
+      %scale_a: !ttg.memdesc<128x8xf8E4M3FN, #tmem_scales_k_then_mn, #ttng.tensor_memory>,
+      %scale_b: !ttg.memdesc<128x8xf8E4M3FN, #tmem_scales, #ttng.tensor_memory>,
+      %useAcc: i1,
+      %pred: i1) {
+    // expected-error @below {{A scales in tensor memory must use #ttng.tensor_memory_scales_encoding<blockRepOrder = mnThenK>}}
+    ttng.tc_gen5_mma_scaled %a, %b, %c, %scale_a, %scale_b, %useAcc, %pred lhs = e2m1 rhs = e2m1 :
+      !ttg.memdesc<128x64xi8, #shared, #ttg.shared_memory>,
+      !ttg.memdesc<64x128xi8, #sharedT, #ttg.shared_memory>,
+      !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>,
+      !ttg.memdesc<128x8xf8E4M3FN, #tmem_scales_k_then_mn, #ttng.tensor_memory>,
+      !ttg.memdesc<128x8xf8E4M3FN, #tmem_scales, #ttng.tensor_memory>
+    tt.return
+  }
+}
+
+// -----
+
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 64, transposed = false, elementBitWidth = 8}>
+#sharedT = #ttg.nvmma_shared<{swizzlingByteWidth = 64, transposed = true, elementBitWidth = 8}>
+#barrier = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 256, colStride = 1>
+#tmem_scales_k_then_mn = #ttng.tensor_memory_scales_encoding<blockRepOrder = kThenMn>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:107", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @tcgen5_mma_scaled_rubin_wrong_b_scale_block_rep_order(
+      %a: !ttg.memdesc<256x128xi8, #shared, #ttg.shared_memory>,
+      %b: !ttg.memdesc<128x256xi8, #sharedT, #ttg.shared_memory>,
+      %c: !ttg.memdesc<256x256xf32, #tmem, #ttng.tensor_memory, mutable>,
+      %scale_a: !ttg.memdesc<256x8xf8E4M3FN, #tmem_scales_k_then_mn, #ttng.tensor_memory>,
+      %scale_b: !ttg.memdesc<256x8xf8E4M3FN, #tmem_scales_k_then_mn, #ttng.tensor_memory>,
+      %useAcc: i1,
+      %pred: i1,
+      %bar: !ttg.memdesc<1xi64, #barrier, #ttg.shared_memory, mutable>,
+      %barPred: i1) {
+    // expected-error @below {{B scales in tensor memory must use #ttng.tensor_memory_scales_encoding<blockRepOrder = mnThenK>}}
+    ttng.tc_gen5_mma_scaled %a, %b, %c, %scale_a, %scale_b, %useAcc, %pred lhs = e2m1 rhs = e2m1, %bar[%barPred] {is_async} :
+      !ttg.memdesc<256x128xi8, #shared, #ttg.shared_memory>,
+      !ttg.memdesc<128x256xi8, #sharedT, #ttg.shared_memory>,
+      !ttg.memdesc<256x256xf32, #tmem, #ttng.tensor_memory, mutable>,
+      !ttg.memdesc<256x8xf8E4M3FN, #tmem_scales_k_then_mn, #ttng.tensor_memory>,
+      !ttg.memdesc<256x8xf8E4M3FN, #tmem_scales_k_then_mn, #ttng.tensor_memory>,
+      !ttg.memdesc<1xi64, #barrier, #ttg.shared_memory, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 8}>
+#sharedT = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = true, elementBitWidth = 8}>
+#shared1 = #ttg.nvmma_shared<{swizzlingByteWidth = 0, transposed = false, elementBitWidth = 8}>
+#barrier = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 64, colStride = 1>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
+  tt.func @tcgen5_mma_scaled_sync_with_barrier(
+      %a: !ttg.memdesc<128x256xi8, #shared, #ttg.shared_memory>,
+      %b: !ttg.memdesc<256x64xi8, #sharedT, #ttg.shared_memory>,
+      %c: !ttg.memdesc<128x64xf32, #tmem, #ttng.tensor_memory, mutable>,
+      %scale_a: !ttg.memdesc<128x8xf8E4M3FN, #shared1, #ttg.shared_memory>,
+      %scale_b: !ttg.memdesc<64x8xf8E4M3FN, #shared1, #ttg.shared_memory>,
+      %useAcc: i1,
+      %pred: i1,
+      %bar: !ttg.memdesc<1xi64, #barrier, #ttg.shared_memory, mutable>,
+      %barPred: i1) {
+    // expected-error @below {{The op is synchronous but a barrier is present.}}
+    ttng.tc_gen5_mma_scaled %a, %b, %c, %scale_a, %scale_b, %useAcc, %pred lhs = e2m1 rhs = e2m1, %bar[%barPred] :
+      !ttg.memdesc<128x256xi8, #shared, #ttg.shared_memory>,
+      !ttg.memdesc<256x64xi8, #sharedT, #ttg.shared_memory>,
+      !ttg.memdesc<128x64xf32, #tmem, #ttng.tensor_memory, mutable>,
+      !ttg.memdesc<128x8xf8E4M3FN, #shared1, #ttg.shared_memory>,
+      !ttg.memdesc<64x8xf8E4M3FN, #shared1, #ttg.shared_memory>,
+      !ttg.memdesc<1xi64, #barrier, #ttg.shared_memory, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+#shared_clc_bad = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0], CGALayout = [[1]]}>
+#barrier = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0], CGALayout = [[1]]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32} {
+  tt.func @clc_try_cancel_result_cga_layout_bases_nonzero(
+      %result: !ttg.memdesc<2xi64, #shared_clc_bad, #smem>,
+      %mbar: !ttg.memdesc<1xi64, #barrier, #smem>) {
+    // expected-error @below {{Expected CLC result buffer cga_layout bases to be all zeros. Got [[1]]}}
+    ttng.clc_try_cancel %result, %mbar {multicast = false} :
+      !ttg.memdesc<2xi64, #shared_clc_bad, #smem>, !ttg.memdesc<1xi64, #barrier, #smem>
+    tt.return
+  }
+}
+
+// -----
+
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90"} {
+  tt.func @arrive_barrier_multicast_invalid() {
+    %bar = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    // expected-error @below {{multicast arrive requires num_ctas > 1}}
+    ttng.arrive_barrier %bar, 1 {ctaMask = 1 : i32} : !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0], CGALayout = [[0]]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90"} {
+  tt.func @arrive_barrier_multicast_zero_count() {
+    %bar = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    // expected-error @below {{count must be greater than or equal to 1}}
+    ttng.arrive_barrier %bar, 0 {ctaMask = 3 : i32} : !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0], CGALayout = [[1]]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90"} {
+  tt.func @arrive_barrier_multicast_mask_overflow() {
+    %bar = ttg.local_alloc : () -> !ttg.memdesc<2xi64, #shared, #smem, mutable>
+    // expected-error @below {{ctaMask exceeds numCTAs - 1}}
+    ttng.arrive_barrier %bar, 1 {ctaMask = 7 : i32} : !ttg.memdesc<2xi64, #shared, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0], CGALayout = [[1]]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90"} {
+  tt.func @arrive_barrier_multicast_negative_mask() {
+    %bar = ttg.local_alloc : () -> !ttg.memdesc<2xi64, #shared, #smem, mutable>
+    // Negative masks are invalid and are rejected by the mask bounds check.
+    // expected-error @below {{ctaMask exceeds numCTAs - 1}}
+    ttng.arrive_barrier %bar, 1 {ctaMask = -1 : i32} : !ttg.memdesc<2xi64, #shared, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0], CGALayout = [[0]]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90"} {
+  tt.func @arrive_barrier_multicast_non_identity_cga() {
+    %bar = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    // expected-error @below {{multicast barrier cga_layout must be [[1]], got [[0]]}}
+    ttng.arrive_barrier %bar, 1 {ctaMask = 1 : i32} : !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0], CGALayout = [[1]]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90"} {
+  tt.func @arrive_barrier_multicast_per_thread() {
+    %bar = ttg.local_alloc : () -> !ttg.memdesc<2xi64, #shared, #smem, mutable>
+    // expected-error @below {{multicast arrive does not support perThread}}
+    ttng.arrive_barrier %bar, 1 {ctaMask = 1 : i32, perThread} : !ttg.memdesc<2xi64, #shared, #smem, mutable>
+    tt.return
   }
 }
 
@@ -151,13 +491,13 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
 #shared2 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
 #smem = #ttg.shared_memory
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
-  tt.func public @async_tma_copy_global_to_local(%arg0: !tt.tensordesc<tensor<1x256x32xf32, #shared>>) -> tensor<256x32xf32, #blocked> {
+  tt.func public @async_tma_copy_global_to_local(%arg0: !tt.tensordesc<1x256x32xf32, #shared>) -> tensor<256x32xf32, #blocked> {
     %true = arith.constant true
     %c32_i32 = arith.constant 32 : i32
     %0 = ttg.local_alloc : () -> !ttg.memdesc<256x32xf32, #shared, #smem, mutable>
     %1 = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared2, #smem, mutable>
     // expected-error @below {{TMA descriptor layout must not be transposed}}
-    ttng.async_tma_copy_global_to_local %arg0[%c32_i32, %c32_i32, %c32_i32] %0, %1, %true : !tt.tensordesc<tensor<1x256x32xf32, #shared>>, !ttg.memdesc<1xi64, #shared2, #smem, mutable> -> !ttg.memdesc<256x32xf32, #shared, #smem, mutable>
+    ttng.async_tma_copy_global_to_local %arg0[%c32_i32, %c32_i32, %c32_i32] %0, %1, %true : !tt.tensordesc<1x256x32xf32, #shared>, !ttg.memdesc<1xi64, #shared2, #smem, mutable> -> !ttg.memdesc<256x32xf32, #shared, #smem, mutable>
   }
 }
 
@@ -169,16 +509,52 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
 #shared_mbar = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
 #smem = #ttg.shared_memory
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
-  tt.func public @async_tma_copy_global_to_local(%arg0: !tt.tensordesc<tensor<1x256x64xf32, #nvmma32>>) {
+  tt.func public @async_tma_copy_global_to_local(%arg0: !tt.tensordesc<1x256x64xf32, #nvmma32>) {
     %true = arith.constant true
     %c32_i32 = arith.constant 32 : i32
     %0 = ttg.local_alloc : () -> !ttg.memdesc<256x64xf32, #nvmma64, #smem, mutable>
     %1 = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared_mbar, #smem, mutable>
     // expected-error @below {{TMA descriptor layout must match shared layout}}
-    ttng.async_tma_copy_global_to_local %arg0[%c32_i32, %c32_i32, %c32_i32] %0, %1, %true : !tt.tensordesc<tensor<1x256x64xf32, #nvmma32>>, !ttg.memdesc<1xi64, #shared_mbar, #smem, mutable> -> !ttg.memdesc<256x64xf32, #nvmma64, #smem, mutable>
+    ttng.async_tma_copy_global_to_local %arg0[%c32_i32, %c32_i32, %c32_i32] %0, %1, %true : !tt.tensordesc<1x256x64xf32, #nvmma32>, !ttg.memdesc<1xi64, #shared_mbar, #smem, mutable> -> !ttg.memdesc<256x64xf32, #nvmma64, #smem, mutable>
     tt.return
   }
 }
+// -----
+
+#nvmma = #ttg.nvmma_shared<{swizzlingByteWidth = 32, transposed = false, elementBitWidth = 16, CGALayout = [[1, 0]]}>
+#barrier = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0], CGALayout = [[0]]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, "ttng.two-ctas" = false, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @async_tma_copy_global_to_local_requires_1d_barrier_layout(
+      %arg0: !tt.tensordesc<64x128xf16, #nvmma>) {
+    %true = arith.constant true
+    %c0_i32 = arith.constant 0 : i32
+    %0 = ttg.local_alloc : () -> !ttg.memdesc<64x128xf16, #nvmma, #smem, mutable>
+    %1 = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #barrier, #smem, mutable>
+    // expected-error @below {{TMA barrier cga_layout must be [[1]], got [[0]]}}
+    ttng.async_tma_copy_global_to_local %arg0[%c0_i32, %c0_i32] %0, %1, %true : !tt.tensordesc<64x128xf16, #nvmma>, !ttg.memdesc<1xi64, #barrier, #smem, mutable> -> !ttg.memdesc<64x128xf16, #nvmma, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+#nvmma = #ttg.nvmma_shared<{swizzlingByteWidth = 32, transposed = false, elementBitWidth = 16, CGALayout = [[1, 0], [0, 1]]}>
+#barrier = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0], CGALayout = [[0], [0]]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 4 : i32, "ttg.num-warps" = 4 : i32, "ttng.two-ctas" = true, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @async_tma_copy_global_to_local_requires_two_cta_barrier_layout(
+      %arg0: !tt.tensordesc<64x128xf16, #nvmma>) {
+    %true = arith.constant true
+    %c0_i32 = arith.constant 0 : i32
+    %0 = ttg.local_alloc : () -> !ttg.memdesc<64x128xf16, #nvmma, #smem, mutable>
+    %1 = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #barrier, #smem, mutable>
+    // expected-error @below {{TMA barrier cga_layout must be [[1], [2]] or [[0], [1]], got [[0], [0]]}}
+    ttng.async_tma_copy_global_to_local %arg0[%c0_i32, %c0_i32] %0, %1, %true : !tt.tensordesc<64x128xf16, #nvmma>, !ttg.memdesc<1xi64, #barrier, #smem, mutable> -> !ttg.memdesc<64x128xf16, #nvmma, #smem, mutable>
+    tt.return
+  }
+}
+
 // -----
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [8, 1], order = [1, 0]}>
@@ -186,13 +562,13 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
 #shared2 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
 #smem = #ttg.shared_memory
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
-  tt.func public @tma_im2col_missing_offsets(%arg0: !ttng.tensordesc_im2col<tensor<64x128xf16, #nvmma_128>>) {
+  tt.func public @tma_im2col_missing_offsets(%arg0: !ttng.tensordesc_im2col<64x128xf16, #nvmma_128>) {
     %true = arith.constant true
     %c0_i32 = arith.constant 0 : i32
     %0 = ttg.local_alloc : () -> !ttg.memdesc<64x128xf16, #nvmma_128, #smem, mutable>
     %1 = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared2, #smem, mutable>
     // expected-error @below {{IM2COL mode requires offsets to be provided}}
-    ttng.async_tma_copy_global_to_local %arg0[%c0_i32, %c0_i32, %c0_i32, %c0_i32] %0, %1, %true : !ttng.tensordesc_im2col<tensor<64x128xf16, #nvmma_128>>, !ttg.memdesc<1xi64, #shared2, #smem, mutable> -> !ttg.memdesc<64x128xf16, #nvmma_128, #smem, mutable>
+    ttng.async_tma_copy_global_to_local %arg0[%c0_i32, %c0_i32, %c0_i32, %c0_i32] %0, %1, %true : !ttng.tensordesc_im2col<64x128xf16, #nvmma_128>, !ttg.memdesc<1xi64, #shared2, #smem, mutable> -> !ttg.memdesc<64x128xf16, #nvmma_128, #smem, mutable>
     tt.return
   }
 }
@@ -203,14 +579,14 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
 #shared2 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
 #smem = #ttg.shared_memory
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
-  tt.func public @tma_im2col_wrong_offset_count(%arg0: !ttng.tensordesc_im2col<tensor<64x128xf16, #nvmma_128>>) {
+  tt.func public @tma_im2col_wrong_offset_count(%arg0: !ttng.tensordesc_im2col<64x128xf16, #nvmma_128>) {
     %true = arith.constant true
     %c0_i32 = arith.constant 0 : i32
     %c1_i16 = arith.constant 1 : i16
     %0 = ttg.local_alloc : () -> !ttg.memdesc<64x128xf16, #nvmma_128, #smem, mutable>
     %1 = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared2, #smem, mutable>
     // expected-error @below {{IM2COL mode with 4D coordinates requires 2 offsets, but got 1}}
-    ttng.async_tma_copy_global_to_local %arg0[%c0_i32, %c0_i32, %c0_i32, %c0_i32] offsets = [%c1_i16] %0, %1, %true : !ttng.tensordesc_im2col<tensor<64x128xf16, #nvmma_128>>, !ttg.memdesc<1xi64, #shared2, #smem, mutable> -> !ttg.memdesc<64x128xf16, #nvmma_128, #smem, mutable>
+    ttng.async_tma_copy_global_to_local %arg0[%c0_i32, %c0_i32, %c0_i32, %c0_i32] offsets = [%c1_i16] %0, %1, %true : !ttng.tensordesc_im2col<64x128xf16, #nvmma_128>, !ttg.memdesc<1xi64, #shared2, #smem, mutable> -> !ttg.memdesc<64x128xf16, #nvmma_128, #smem, mutable>
     tt.return
   }
 }
@@ -222,14 +598,114 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
 #shared2 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
 #smem = #ttg.shared_memory
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
-  tt.func public @tma_tiled_with_offsets(%arg0: !tt.tensordesc<tensor<64x128xf16, #nvmma_128>>) {
+  tt.func public @tma_tiled_with_offsets(%arg0: !tt.tensordesc<64x128xf16, #nvmma_128>) {
     %true = arith.constant true
     %c0_i32 = arith.constant 0 : i32
     %c1_i16 = arith.constant 1 : i16
     %0 = ttg.local_alloc : () -> !ttg.memdesc<64x128xf16, #nvmma_128, #smem, mutable>
     %1 = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared2, #smem, mutable>
     // expected-error @below {{TILED mode does not support offsets}}
-    ttng.async_tma_copy_global_to_local %arg0[%c0_i32, %c0_i32] offsets = [%c1_i16] %0, %1, %true : !tt.tensordesc<tensor<64x128xf16, #nvmma_128>>, !ttg.memdesc<1xi64, #shared2, #smem, mutable> -> !ttg.memdesc<64x128xf16, #nvmma_128, #smem, mutable>
+    ttng.async_tma_copy_global_to_local %arg0[%c0_i32, %c0_i32] offsets = [%c1_i16] %0, %1, %true : !tt.tensordesc<64x128xf16, #nvmma_128>, !ttg.memdesc<1xi64, #shared2, #smem, mutable> -> !ttg.memdesc<64x128xf16, #nvmma_128, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 32, transposed = true, elementBitWidth = 16, CGALayout = [[0, 0], [0, 0]]}>
+#shared1 = #ttg.nvmma_shared<{swizzlingByteWidth = 32, transposed = true, elementBitWidth = 16, CGALayout = [[0, 1], [0, 0]]}>
+#barrier = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0], CGALayout = [[1], [0]]}>
+#tmem = #ttng.tensor_memory_encoding<blockM = 64, blockN = 32, colStride = 1, CGALayout = [[0, 1], [0, 0]]>
+module attributes {"ttg.num-ctas" = 4 : i32, "ttg.num-warps" = 8 : i32} {
+  tt.func @tcgen5_completion_barrier_cga_layout(
+      %a: !ttg.memdesc<128x16xf16, #shared, #ttg.shared_memory>,
+      %b: !ttg.memdesc<16x128xf16, #shared1, #ttg.shared_memory>,
+      %c: !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>,
+      %accUse: i1,
+      %pred: i1,
+      %bar: !ttg.memdesc<1xi64, #barrier, #ttg.shared_memory>,
+      %barPred: i1) {
+    // expected-error @below {{completion barrier cga_layout must be}}
+    ttng.tc_gen5_mma %a, %b, %c, %accUse, %pred, %bar[%barPred] {is_async} :
+       !ttg.memdesc<128x16xf16, #shared, #ttg.shared_memory>,
+       !ttg.memdesc<16x128xf16, #shared1, #ttg.shared_memory>,
+       !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>,
+       !ttg.memdesc<1xi64, #barrier, #ttg.shared_memory>
+    tt.return
+  }
+}
+
+// -----
+
+#barrier = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0], CGALayout = [[1], [0]]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 4 : i32, "ttg.num-warps" = 4 : i32} {
+  tt.func @tcgen5_commit_completion_barrier_cga_layout(
+      %bar: !ttg.memdesc<1xi64, #barrier, #smem, mutable>, %pred: i1) {
+    // expected-error @below {{completion barrier cga_layout must be}}
+    ttng.tc_gen5_commit %bar, %pred : !ttg.memdesc<1xi64, #barrier, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 8}>
+#sharedT = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = true, elementBitWidth = 8}>
+#shared1 = #ttg.nvmma_shared<{swizzlingByteWidth = 0, transposed = false, elementBitWidth = 8}>
+#barrier = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 64, colStride = 1>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
+  tt.func @tcgen5_mma_scaled_sync_with_barrier(
+      %a: !ttg.memdesc<128x256xi8, #shared, #ttg.shared_memory>,
+      %b: !ttg.memdesc<256x64xi8, #sharedT, #ttg.shared_memory>,
+      %c: !ttg.memdesc<128x64xf32, #tmem, #ttng.tensor_memory, mutable>,
+      %scale_a: !ttg.memdesc<128x8xf8E4M3FN, #shared1, #ttg.shared_memory>,
+      %scale_b: !ttg.memdesc<64x8xf8E4M3FN, #shared1, #ttg.shared_memory>,
+      %useAcc: i1,
+      %pred: i1,
+      %bar: !ttg.memdesc<1xi64, #barrier, #ttg.shared_memory, mutable>,
+      %barPred: i1) {
+    // expected-error @below {{The op is synchronous but a barrier is present.}}
+    ttng.tc_gen5_mma_scaled %a, %b, %c, %scale_a, %scale_b, %useAcc, %pred lhs = e2m1 rhs = e2m1, %bar[%barPred] :
+      !ttg.memdesc<128x256xi8, #shared, #ttg.shared_memory>,
+      !ttg.memdesc<256x64xi8, #sharedT, #ttg.shared_memory>,
+      !ttg.memdesc<128x64xf32, #tmem, #ttng.tensor_memory, mutable>,
+      !ttg.memdesc<128x8xf8E4M3FN, #shared1, #ttg.shared_memory>,
+      !ttg.memdesc<64x8xf8E4M3FN, #shared1, #ttg.shared_memory>,
+      !ttg.memdesc<1xi64, #barrier, #ttg.shared_memory, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+#shared_clc = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0], CGALayout = [[0], [0]]}>
+#barrier = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0], CGALayout = [[0], [1]]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 4 : i32, "ttg.num-warps" = 4 : i32} {
+  tt.func @clc_try_cancel_completion_barrier_cga_layout(
+      %result: !ttg.memdesc<2xi64, #shared_clc, #smem>,
+      %mbar: !ttg.memdesc<1xi64, #barrier, #smem>) {
+    // expected-error @below {{completion barrier cga_layout must be}}
+    ttng.clc_try_cancel %result, %mbar {multicast = false} :
+      !ttg.memdesc<2xi64, #shared_clc, #smem>, !ttg.memdesc<1xi64, #barrier, #smem>
+    tt.return
+  }
+}
+
+// -----
+
+#shared_clc_bad = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0], CGALayout = [[1]]}>
+#barrier = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0], CGALayout = [[1]]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32} {
+  tt.func @clc_try_cancel_result_cga_layout_bases_nonzero(
+      %result: !ttg.memdesc<2xi64, #shared_clc_bad, #smem>,
+      %mbar: !ttg.memdesc<1xi64, #barrier, #smem>) {
+    // expected-error @below {{Expected CLC result buffer cga_layout bases to be all zeros. Got [[1]]}}
+    ttng.clc_try_cancel %result, %mbar {multicast = false} :
+      !ttg.memdesc<2xi64, #shared_clc_bad, #smem>, !ttg.memdesc<1xi64, #barrier, #smem>
     tt.return
   }
 }
@@ -241,13 +717,13 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
 #shared2 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
 #smem = #ttg.shared_memory
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
-  tt.func public @tma_im2col_2d_invalid(%arg0: !ttng.tensordesc_im2col<tensor<64x128xf16, #nvmma_128>>) {
+  tt.func public @tma_im2col_2d_invalid(%arg0: !ttng.tensordesc_im2col<64x128xf16, #nvmma_128>) {
     %true = arith.constant true
     %c0_i32 = arith.constant 0 : i32
     %0 = ttg.local_alloc : () -> !ttg.memdesc<64x128xf16, #nvmma_128, #smem, mutable>
     %1 = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared2, #smem, mutable>
     // expected-error @below {{IM2COL mode requires at least 3D coordinates, but got 2D}}
-    ttng.async_tma_copy_global_to_local %arg0[%c0_i32, %c0_i32] %0, %1, %true : !ttng.tensordesc_im2col<tensor<64x128xf16, #nvmma_128>>, !ttg.memdesc<1xi64, #shared2, #smem, mutable> -> !ttg.memdesc<64x128xf16, #nvmma_128, #smem, mutable>
+    ttng.async_tma_copy_global_to_local %arg0[%c0_i32, %c0_i32] %0, %1, %true : !ttng.tensordesc_im2col<64x128xf16, #nvmma_128>, !ttg.memdesc<1xi64, #shared2, #smem, mutable> -> !ttg.memdesc<64x128xf16, #nvmma_128, #smem, mutable>
     tt.return
   }
 }
@@ -313,8 +789,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 
 // -----
 
-// NOTE: beta intentionally does NOT reject ttng.cluster_arrive / ttng.cluster_wait
-// inside ttg.warp_specialize (beta's autows/TLX pipelines place them there and the
+// NOTE: Meta Triton intentionally does NOT reject ttng.cluster_arrive / ttng.cluster_wait
+// inside ttg.warp_specialize (Meta Triton's autows/TLX pipelines place them there and the
 // conversion lowers them with all-warps wrapping). Only ttng.cluster_barrier is
 // rejected. The arrive/wait warp-specialize invalid cases from upstream #9456 are
 // therefore omitted here.
@@ -330,31 +806,33 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // -----
 
 module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90"} {
-  tt.func @cluster_barrier_in_default_region_invalid() {
-    ttg.warp_specialize()
-    default {
-      // expected-error @below {{cannot be used inside `ttg.warp_specialize`}}
-      ttng.cluster_barrier
-      ttg.warp_yield
-    }
-    partition0() num_warps(4) {
-      ttg.warp_return
-    } : () -> ()
+  tt.func public @cluster_barrier_in_noinline_kernel_valid() attributes {noinline = true} {
+    ttng.cluster_barrier
+    tt.return
+  }
+
+  tt.func private @cluster_barrier_in_non_kernel_function_invalid() attributes {noinline = true} {
+    // expected-error @below {{must be inside a kernel function}}
+    ttng.cluster_barrier
     tt.return
   }
 }
 
 // -----
+
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0], CGALayout = [[0]]}>
+#smem = #ttg.shared_memory
 
 module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90"} {
-  tt.func @cluster_barrier_in_partition_invalid() {
+  tt.func @init_barrier_in_default_region_invalid() {
+    %bar = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
     ttg.warp_specialize()
     default {
+      // expected-error @below {{cannot be used inside `ttg.warp_specialize`}}
+      ttng.init_barrier %bar, 1 : !ttg.memdesc<1xi64, #shared, #smem, mutable>
       ttg.warp_yield
     }
     partition0() num_warps(4) {
-      // expected-error @below {{cannot be used inside `ttg.warp_specialize`}}
-      ttng.cluster_barrier
       ttg.warp_return
     } : () -> ()
     tt.return
@@ -363,7 +841,7 @@ module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 
 // -----
 
-// expected-error @+1 {{After removing the zero bases the layout must be bijective}}
+// expected-error @+1 {{LinearEncodingAttr requires a permutation matrix layout after removing broadcast bases}}
 #linear = #ttg.linear<{register = [[0, 2], [0, 4], [0, 8], [0, 16], [0, 32]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [0, 1]], warp = [[16, 0], [8, 0]], block = []}>
 module attributes {"ttg.num-warps" = 4 : i32, "ttg.num-ctas" = 1 : i32, "ttg.threads-per-warp" = 32 : i32} {
   tt.func @invalid_linear_layout(%arg0: tensor<32x64xi32, #linear>) {
@@ -468,10 +946,104 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.shar
 
 // -----
 
+#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [8, 1], order = [1, 0]}>
+#nvmma_no_broadcast = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16, CGALayout = [[1, 0]]}>
+#shared_bar = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0], CGALayout = [[0]]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 8 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @async_tma_copy_multicast_requires_broadcast(%arg0: !tt.tensordesc<64x128xf16, #nvmma_no_broadcast>) {
+    %true = arith.constant true
+    %c0_i32 = arith.constant 0 : i32
+    %0 = ttg.local_alloc : () -> !ttg.memdesc<64x128xf16, #nvmma_no_broadcast, #smem, mutable>
+    %1 = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared_bar, #smem, mutable>
+    // expected-error @below {{multicast requires the shared layout to broadcast across CTAs}}
+    ttng.async_tma_copy_global_to_local %arg0[%c0_i32, %c0_i32] %0, %1, %true {multicast} : !tt.tensordesc<64x128xf16, #nvmma_no_broadcast>, !ttg.memdesc<1xi64, #shared_bar, #smem, mutable> -> !ttg.memdesc<64x128xf16, #nvmma_no_broadcast, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+#nvmma_no_broadcast = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16, CGALayout = [[1, 0]]}>
+#shared_bar = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0], CGALayout = [[0]]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 8 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @async_tma_copy_explicit_multicast_allows_nonbroadcast_layout(%arg0: !tt.tensordesc<64x128xf16, #nvmma_no_broadcast>, %mcast: i32) {
+    %true = arith.constant true
+    %c0_i32 = arith.constant 0 : i32
+    %0 = ttg.local_alloc : () -> !ttg.memdesc<64x128xf16, #nvmma_no_broadcast, #smem, mutable>
+    %1 = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared_bar, #smem, mutable>
+    ttng.async_tma_copy_global_to_local %arg0[%c0_i32, %c0_i32] %0, %1, %true, %mcast {multicast} : !tt.tensordesc<64x128xf16, #nvmma_no_broadcast>, !ttg.memdesc<1xi64, #shared_bar, #smem, mutable> -> !ttg.memdesc<64x128xf16, #nvmma_no_broadcast, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+#blocked_broadcast = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0], CGALayout = [[0]]}>
+#nvmma_no_broadcast = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16, CGALayout = [[1, 0]]}>
+#shared_bar = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0], CGALayout = [[0]]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @async_tma_gather_multicast_requires_broadcast(%arg0: !tt.tensordesc<1x128xf16, #nvmma_no_broadcast>) {
+    %true = arith.constant true
+    %c0_i32 = arith.constant 0 : i32
+    %x_offsets = arith.constant dense<0> : tensor<32xi32, #blocked_broadcast>
+    %bar = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared_bar, #smem, mutable>
+    %result = ttg.local_alloc : () -> !ttg.memdesc<32x128xf16, #nvmma_no_broadcast, #smem, mutable>
+    // expected-error @below {{multicast requires the shared layout to broadcast across CTAs}}
+    ttng.async_tma_gather %arg0[%x_offsets, %c0_i32] %result, %bar, %true {multicast} : !tt.tensordesc<1x128xf16, #nvmma_no_broadcast>, tensor<32xi32, #blocked_broadcast>, i32, !ttg.memdesc<1xi64, #shared_bar, #smem, mutable>, !ttg.memdesc<32x128xf16, #nvmma_no_broadcast, #smem, mutable>, i1
+    tt.return
+  }
+}
+
+// -----
+
+#blocked_broadcast_parent = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [32, 1], warpsPerCTA = [1, 4], order = [1, 0], CGALayout = [[0, 0], [0, 0]]}>
+#blocked_broadcast = #ttg.slice<{dim = 0, parent = #blocked_broadcast_parent}>
+#nvmma_partial_broadcast = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16, CGALayout = [[1, 0], [0, 0]]}>
+#shared_bar = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0], CGALayout = [[0], [0]]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 4 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @async_tma_gather_multicast_requires_matching_x_offset_cga(%arg0: !tt.tensordesc<1x128xf16, #nvmma_partial_broadcast>) {
+    %true = arith.constant true
+    %c0_i32 = arith.constant 0 : i32
+    %x_offsets = arith.constant dense<0> : tensor<32xi32, #blocked_broadcast>
+    %bar = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared_bar, #smem, mutable>
+    %result = ttg.local_alloc : () -> !ttg.memdesc<32x128xf16, #nvmma_partial_broadcast, #smem, mutable>
+    // expected-error @below {{x offsets must have the same row CGA layout as the memdesc}}
+    ttng.async_tma_gather %arg0[%x_offsets, %c0_i32] %result, %bar, %true {multicast} : !tt.tensordesc<1x128xf16, #nvmma_partial_broadcast>, tensor<32xi32, #blocked_broadcast>, i32, !ttg.memdesc<1xi64, #shared_bar, #smem, mutable>, !ttg.memdesc<32x128xf16, #nvmma_partial_broadcast, #smem, mutable>, i1
+    tt.return
+  }
+}
+
+// -----
+
+#blocked_split_parent = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [32, 1], warpsPerCTA = [1, 4], order = [1, 0], CGALayout = [[0, 1]]}>
+#blocked_split = #ttg.slice<{dim = 0, parent = #blocked_split_parent}>
+#nvmma_broadcast = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16, CGALayout = [[0, 0]]}>
+#shared_bar = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0], CGALayout = [[0]]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @async_tma_gather_multicast_requires_uniform_x_offsets(%arg0: !tt.tensordesc<1x128xf16, #nvmma_broadcast>) {
+    %true = arith.constant true
+    %c0_i32 = arith.constant 0 : i32
+    %x_offsets = arith.constant dense<0> : tensor<32xi32, #blocked_split>
+    %bar = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared_bar, #smem, mutable>
+    %result = ttg.local_alloc : () -> !ttg.memdesc<32x128xf16, #nvmma_broadcast, #smem, mutable>
+    // expected-error @below {{x offsets must have the same row CGA layout as the memdesc}}
+    ttng.async_tma_gather %arg0[%x_offsets, %c0_i32] %result, %bar, %true {multicast} : !tt.tensordesc<1x128xf16, #nvmma_broadcast>, tensor<32xi32, #blocked_split>, i32, !ttg.memdesc<1xi64, #shared_bar, #smem, mutable>, !ttg.memdesc<32x128xf16, #nvmma_broadcast, #smem, mutable>, i1
+    tt.return
+  }
+
+}
+
+// -----
+
 // Test invalid TensorDescIm2ColType: rank-3 blockType (must be rank-2)
 module attributes {"ttg.num-warps" = 4 : i32, "ttg.num-ctas" = 1 : i32} {
-  // expected-error @below {{TensorDescIm2ColType requires rank-2 blockType, got rank 3}}
-  tt.func @tensordesc_im2col_wrong_rank(%desc: !ttng.tensordesc_im2col<tensor<32x64x128xf16>>) {
+  // expected-error @below {{TensorDescIm2ColType requires rank-2 shape, got rank 3}}
+  tt.func @tensordesc_im2col_wrong_rank(%desc: !ttng.tensordesc_im2col<32x64x128xf16>) {
     tt.return
   }
 }
@@ -570,6 +1142,290 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
     %md = ttng.tmem_alloc : () -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
     // expected-error @+1 {{Subslice range exceeds source shape.}}
     %sub = ttng.tmem_subslice %md {N = 128 : i32} : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x64xf32, #tmem, #ttng.tensor_memory, mutable, 128x128>
+    tt.return
+  }
+}
+
+// -----
+
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 32}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @async_tma_reduce_rejects_unsupported_kind(%arg0: !tt.tensordesc<32x32xf32, #shared>, %x: i32) {
+    %src = ttg.local_alloc : () -> !ttg.memdesc<32x32xf32, #shared, #smem, mutable>
+    // expected-error @below {{unsupported reduce kind inc for element type 'f32'}}
+    ttng.async_tma_reduce inc, %arg0[%x, %x] %src : !tt.tensordesc<32x32xf32, #shared>, !ttg.memdesc<32x32xf32, #shared, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#shared_bar = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @async_tma_gather_requires_legal_x_offsets(%arg0: !tt.tensordesc<1x128xf16, #shared>) {
+    %true = arith.constant true
+    %c0_i32 = arith.constant 0 : i32
+    %x_offsets = arith.constant dense<0> : tensor<32xi32, #blocked>
+    %bar = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared_bar, #smem, mutable>
+    %result = ttg.local_alloc : () -> !ttg.memdesc<32x128xf16, #shared, #smem, mutable>
+    // expected-error @below {{x offsets must have at least 4 contiguous elements per thread}}
+    ttng.async_tma_gather %arg0[%x_offsets, %c0_i32] %result, %bar, %true : !tt.tensordesc<1x128xf16, #shared>, tensor<32xi32, #blocked>, i32, !ttg.memdesc<1xi64, #shared_bar, #smem, mutable>, !ttg.memdesc<32x128xf16, #shared, #smem, mutable>, i1
+    tt.return
+  }
+}
+
+// -----
+
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 64}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @async_tma_reduce_rejects_signed_i64_add(%arg0: !tt.tensordesc<32x32xsi64, #shared>, %x: i32) {
+    %src = ttg.local_alloc : () -> !ttg.memdesc<32x32xi64, #shared, #smem, mutable>
+    // expected-error @below {{unsupported reduce kind add for element type 'si64'}}
+    ttng.async_tma_reduce add, %arg0[%x, %x] %src : !tt.tensordesc<32x32xsi64, #shared>, !ttg.memdesc<32x32xi64, #shared, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+// NOTE: the "multicast requires the shared layout to broadcast across CTAs"
+// verifier check comes from upstream #9977/#9615 (TMA gather/scatter multiCTA +
+// MultiCTA membar), which are not part of this tensordesc-migration bundle. The
+// corresponding invalid.mlir section is deferred until those land in Meta Triton.
+
+// Test invalid TensorDescIm2ColType: rank-3 blockType (must be rank-2)
+module attributes {"ttg.num-warps" = 4 : i32, "ttg.num-ctas" = 1 : i32} {
+  // expected-error @below {{TensorDescIm2ColType requires rank-2 shape, got rank 3}}
+  tt.func @tensordesc_im2col_wrong_rank(%desc: !ttng.tensordesc_im2col<32x64x128xf16>) {
+    tt.return
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [2], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:107", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @packed_arith_wrong_binary_arity(
+      %a: tensor<256xf32, #blocked>,
+      %b: tensor<256xf32, #blocked>,
+      %c: tensor<256xf32, #blocked>) {
+    // expected-error @below {{'ttng.packed_arith' op add expects 2 operands but got 3}}
+    %0 = ttng.packed_arith add %a, %b, %c : (tensor<256xf32, #blocked>, tensor<256xf32, #blocked>, tensor<256xf32, #blocked>) -> tensor<256xf32, #blocked>
+    tt.return
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [2], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:107", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @packed_arith_wrong_fma_arity(
+      %a: tensor<256xf32, #blocked>,
+      %b: tensor<256xf32, #blocked>) {
+    // expected-error @below {{'ttng.packed_arith' op fma expects 3 operands but got 2}}
+    %0 = ttng.packed_arith fma %a, %b : (tensor<256xf32, #blocked>, tensor<256xf32, #blocked>) -> tensor<256xf32, #blocked>
+    tt.return
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:107", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @packed_arith_insufficient_unique_elements(
+      %a: tensor<128xf32, #blocked>,
+      %b: tensor<128xf32, #blocked>) {
+    // expected-error @below {{'ttng.packed_arith' op result layout must provide a multiple of 2 unique elements per thread}}
+    %0 = ttng.packed_arith add %a, %b : (tensor<128xf32, #blocked>, tensor<128xf32, #blocked>) -> tensor<128xf32, #blocked>
+    tt.return
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [2], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:107", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @packed_arith_unsupported_signature(
+      %f16: tensor<256xf16, #blocked>,
+      %f32: tensor<256xf32, #blocked>) {
+    // expected-error @below {{'ttng.packed_arith' op unsupported add signature f16x2 <- (f16x2, f32x2)}}
+    %0 = ttng.packed_arith add %f16, %f32 : (tensor<256xf16, #blocked>, tensor<256xf32, #blocked>) -> tensor<256xf16, #blocked>
+    tt.return
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [4], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @packed_arith_invalid_alternate_result(
+      %a: tensor<256xi8, #blocked>,
+      %b: tensor<256xi8, #blocked>) {
+    // expected-error @below {{'ttng.packed_arith' op result #0 must be ranked tensor of packed arithmetic result element values}}
+    %0 = ttng.packed_arith mul %a, %b : (tensor<256xi8, #blocked>, tensor<256xi8, #blocked>) -> tensor<256xi8, #blocked>
+    tt.return
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [4], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @packed_arith_mixed_widths(
+      %a: tensor<256xf16, #blocked>,
+      %b: tensor<256xf8E4M3FN, #blocked>) {
+    // expected-error @below {{'ttng.packed_arith' op unsupported add signature f32x2 <- (f16x2, e4m3x4)}}
+    %0 = ttng.packed_arith add %a, %b : (tensor<256xf16, #blocked>, tensor<256xf8E4M3FN, #blocked>) -> tensor<256xf32, #blocked>
+    tt.return
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [4], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @packed_arith_alternate_addend_must_match_result(
+      %a: tensor<256xf8E5M2, #blocked>,
+      %b: tensor<256xf8E5M2, #blocked>) {
+    // expected-error @below {{'ttng.packed_arith' op unsupported add signature e4m3x4 <- (e5m2x4, e5m2x4)}}
+    %0 = ttng.packed_arith add %a, %b : (tensor<256xf8E5M2, #blocked>, tensor<256xf8E5M2, #blocked>) -> tensor<256xf8E4M3FN, #blocked>
+    tt.return
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [4], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+#fp4 = #ttg.blocked<{sizePerThread = [2], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @packed_arith_alternate_fma_addend_must_match_result(
+      %a: tensor<128xi8, #fp4>,
+      %b: tensor<256xf8E4M3FN, #blocked>,
+      %c: tensor<256xf8E5M2, #blocked>) {
+    // expected-error @below {{'ttng.packed_arith' op unsupported fma signature e4m3x4 <- (e2m1x4, e4m3x4, e5m2x4)}}
+    %0 = ttng.packed_arith fma %a, %b, %c : (tensor<128xi8, #fp4>, tensor<256xf8E4M3FN, #blocked>, tensor<256xf8E5M2, #blocked>) -> tensor<256xf8E4M3FN, #blocked>
+    tt.return
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [2], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @packed_arith_x4_insufficient_unique_elements(
+      %a: tensor<2xf8E4M3FN, #blocked>,
+      %b: tensor<2xf8E4M3FN, #blocked>) {
+    // expected-error @below {{'ttng.packed_arith' op result layout must provide a multiple of 4 unique elements per thread}}
+    %0 = ttng.packed_arith add %a, %b : (tensor<2xf8E4M3FN, #blocked>, tensor<2xf8E4M3FN, #blocked>) -> tensor<2xf8E4M3FN, #blocked>
+    tt.return
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [2], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @packed_arith_f32x2_min_is_unsupported(
+      %a: tensor<256xf32, #blocked>,
+      %b: tensor<256xf32, #blocked>) {
+    // expected-error @below {{'ttng.packed_arith' op unsupported min signature f32x2 <- (f32x2, f32x2)}}
+    %0 = ttng.packed_arith min %a, %b : (tensor<256xf32, #blocked>, tensor<256xf32, #blocked>) -> tensor<256xf32, #blocked>
+    tt.return
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [4], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @packed_arith_x4_max_is_unsupported(
+      %a: tensor<256xf8E4M3FN, #blocked>,
+      %b: tensor<256xf8E4M3FN, #blocked>) {
+    // expected-error @below {{'ttng.packed_arith' op unsupported max signature e4m3x4 <- (e4m3x4, e4m3x4)}}
+    %0 = ttng.packed_arith max %a, %b : (tensor<256xf8E4M3FN, #blocked>, tensor<256xf8E4M3FN, #blocked>) -> tensor<256xf8E4M3FN, #blocked>
+    tt.return
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [4], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @packed_arith_fp4_wrong_shape(
+      %a: tensor<256xi8, #blocked>,
+      %b: tensor<256xf8E4M3FN, #blocked>) {
+    // expected-error @below {{'ttng.packed_arith' op requires every fp4 operand to have the result shape with the same single dimension halved}}
+    %0 = ttng.packed_arith add %a, %b : (tensor<256xi8, #blocked>, tensor<256xf8E4M3FN, #blocked>) -> tensor<256xf8E4M3FN, #blocked>
+    tt.return
+  }
+}
+
+// -----
+
+#result = #ttg.blocked<{sizePerThread = [4], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+#fp4 = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+#linear_fp4 = #ttg.linear<{register = [[1], [2]], lane = [[4], [8], [16], [32], [64]], warp = [[128], [256]], block = []}>
+#permuted = #ttg.linear<{register = [[2], [1], [4]], lane = [[8], [16], [32], [64], [128]], warp = [[256], [512]], block = []}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @packed_arith_fp4_wrong_layout(
+      %a: tensor<128xi8, #fp4>,
+      %b: tensor<256xf8E4M3FN, #result>) {
+    // expected-error @below {{'ttng.packed_arith' op fp4 operand 0 must have a layout compatible with the result}}
+    %0 = ttng.packed_arith add %a, %b : (tensor<128xi8, #fp4>, tensor<256xf8E4M3FN, #result>) -> tensor<256xf8E4M3FN, #result>
+    tt.return
+  }
+
+  tt.func @packed_arith_fp4_noncanonical_register_order(
+      %a: tensor<512xi8, #linear_fp4>,
+      %b: tensor<1024xf8E4M3FN, #permuted>) {
+    // expected-error @below {{'ttng.packed_arith' op fp4 operand 0 must have a layout compatible with the result}}
+    %0 = ttng.packed_arith add %a, %b : (tensor<512xi8, #linear_fp4>, tensor<1024xf8E4M3FN, #permuted>) -> tensor<1024xf8E4M3FN, #permuted>
+    tt.return
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [4], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @packed_arith_fp6_is_unsupported(
+      %a: tensor<256xf6E3M2FN, #blocked>,
+      %b: tensor<256xf8E4M3FN, #blocked>) {
+    // expected-error @below {{'ttng.packed_arith' op operand #0 must be variadic of ranked tensor of packed arithmetic operand element values}}
+    %0 = ttng.packed_arith add %a, %b : (tensor<256xf6E3M2FN, #blocked>, tensor<256xf8E4M3FN, #blocked>) -> tensor<256xf8E4M3FN, #blocked>
+    tt.return
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [4], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @packed_arith_ue8m0_addend_must_match_result(
+      %a: tensor<256xf8E4M3FN, #blocked>,
+      %b: tensor<256xf8E8M0FNU, #blocked>) {
+    // expected-error @below {{'ttng.packed_arith' op unsupported add signature e4m3x4 <- (e4m3x4, ue8m0x4)}}
+    %0 = ttng.packed_arith add %a, %b : (tensor<256xf8E4M3FN, #blocked>, tensor<256xf8E8M0FNU, #blocked>) -> tensor<256xf8E4M3FN, #blocked>
+    tt.return
+  }
+}
+
+// -----
+
+#result = #ttg.blocked<{sizePerThread = [4, 2], threadsPerWarp = [1, 32], warpsPerCTA = [1, 4], order = [1, 0]}>
+#fp4_axis0 = #ttg.blocked<{sizePerThread = [2, 2], threadsPerWarp = [1, 32], warpsPerCTA = [1, 4], order = [1, 0]}>
+#fp4_axis1 = #ttg.blocked<{sizePerThread = [4, 1], threadsPerWarp = [1, 32], warpsPerCTA = [1, 4], order = [1, 0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @packed_arith_fp4_operands_require_matching_axes(
+      %axis0: tensor<2x256xi8, #fp4_axis0>,
+      %axis1: tensor<4x128xi8, #fp4_axis1>) {
+    // expected-error @below {{'ttng.packed_arith' op requires every fp4 operand to have the result shape with the same single dimension halved}}
+    %0 = ttng.packed_arith mul %axis0, %axis1 : (tensor<2x256xi8, #fp4_axis0>, tensor<4x128xi8, #fp4_axis1>) -> tensor<4x256xf8E4M3FN, #result>
     tt.return
   }
 }

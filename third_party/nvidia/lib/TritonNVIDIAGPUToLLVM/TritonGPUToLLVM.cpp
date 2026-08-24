@@ -11,13 +11,20 @@
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/LLVMIR/NVVMDialect.h"
 #include "mlir/Pass/Pass.h"
+#include "mlir/Pass/PassManager.h"
+#include "mlir/Transforms/Passes.h"
 #include "triton/Analysis/Allocation.h"
 #include "triton/Analysis/AxisInfo.h"
 #include "triton/Analysis/Membar.h"
+#include "triton/Conversion/TritonGPUToLLVM/Passes.h"
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
+#include "triton/Dialect/Gluon/Transforms/Passes.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonInstrument/Transforms/ConSanTargetHooks.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonNvidiaGPU/Transforms/ClusterBarrierInsertion.h"
+#include "triton/Dialect/TritonNvidiaGPU/Transforms/ClusterBarrierMbarAllocator.h"
 
 #include "Allocation.h"
 #include "PatternTritonGPUOpToLLVM.h"
@@ -89,6 +96,16 @@ struct ConvertTritonGPUToLLVM
       : ConvertTritonGPUToLLVMBase({computeCapability}) {}
   ConvertTritonGPUToLLVM(int32_t computeCapability, int32_t ptxVersion)
       : ConvertTritonGPUToLLVMBase({computeCapability, ptxVersion}) {}
+  ConvertTritonGPUToLLVM(int32_t computeCapability, int32_t ptxVersion,
+                         bool enableConcurrencySanitizer)
+      : ConvertTritonGPUToLLVMBase(
+            {computeCapability, ptxVersion, enableConcurrencySanitizer}) {}
+  ConvertTritonGPUToLLVM(int32_t computeCapability, int32_t ptxVersion,
+                         bool enableConcurrencySanitizer,
+                         bool enableTreeReduction)
+      : ConvertTritonGPUToLLVMBase({computeCapability, ptxVersion,
+                                    enableConcurrencySanitizer,
+                                    enableTreeReduction}) {}
 
   void runOnOperation() override {
     MLIRContext *context = &getContext();
@@ -99,11 +116,35 @@ struct ConvertTritonGPUToLLVM
     ModuleAllocation allocation(
         mod, mlir::triton::nvidia_gpu::getNvidiaAllocationAnalysisScratchSizeFn(
                  targetInfo));
+    mlir::triton::nvidia_gpu::runClusterBarrierInsertion(allocation,
+                                                         computeCapability);
+    if (failed(mlir::triton::nvidia_gpu::runCrossCTAMBarrierInitSyncInsertion(
+            allocation, computeCapability)))
+      return signalPassFailure();
     ModuleMembarAnalysis membarPass(&allocation, canSkipBarSync);
     membarPass.run();
     if (failed(maybeInsertClusterSync(mod))) {
       return signalPassFailure();
     }
+    if (enableConcurrencySanitizer) {
+      auto hooks = mlir::triton::instrument::createConSanHooks("nvidia");
+      assert(hooks && "no ConSan hooks registered for nvidia");
+      if (failed(
+              mlir::triton::instrument::runConcurrencySanitizer(mod, *hooks)))
+        return signalPassFailure();
+      mlir::PassManager cleanupPm(context);
+      cleanupPm.addPass(mlir::triton::gluon::createGluonCanonicalize());
+      cleanupPm.addPass(mlir::createCSEPass());
+      if (failed(cleanupPm.run(mod)))
+        return signalPassFailure();
+    }
+    mlir::triton::nvidia_gpu::runClusterBarrierMbarAllocator(mod);
+    bool hasGlobalScratchAlloc = false;
+    mod.walk([&](triton::gpu::GlobalScratchAllocOp) {
+      hasGlobalScratchAlloc = true;
+    });
+    if (hasGlobalScratchAlloc)
+      mlir::triton::gpu::runGlobalScratchMemoryAllocation(mod);
 
     mlir::LowerToLLVMOptions option(context);
     option.overrideIndexBitwidth(32);
@@ -143,15 +184,16 @@ struct ConvertTritonGPUToLLVM
     populateLoadStoreOpToLLVMPatterns(typeConverter, targetInfo,
                                       computeCapability, patterns,
                                       axisInfoAnalysis, benefit);
-    mlir::triton::populateReduceOpToLLVMPatterns(typeConverter, patterns,
-                                                 targetInfo, benefit);
+    mlir::triton::populateReduceOpToLLVMPatternsWithOptions(
+        typeConverter, patterns, targetInfo, benefit, enableTreeReduction);
     mlir::triton::populateScanOpToLLVMPatterns(typeConverter, patterns,
                                                targetInfo, benefit);
     mlir::triton::populateGatherOpToLLVMPatterns(typeConverter, patterns,
                                                  targetInfo, benefit);
     populateBarrierOpToLLVMPatterns(typeConverter, patterns, benefit,
                                     targetInfo);
-    populateClusterOpsToLLVMPatterns(typeConverter, patterns, benefit);
+    populateClusterOpsToLLVMPatterns(typeConverter, patterns, benefit,
+                                     targetInfo);
     mlir::triton::populateHistogramOpToLLVMPatterns(typeConverter, patterns,
                                                     targetInfo, benefit);
     mlir::triton::populatePrintOpToLLVMPattern(typeConverter, patterns,
@@ -180,12 +222,13 @@ struct ConvertTritonGPUToLLVM
         typeConverter, patterns, benefit);
     mlir::triton::populateMakeRangeOpToLLVMPattern(typeConverter, targetInfo,
                                                    patterns, benefit);
-    mlir::triton::NVIDIA::populateTCGen5MMAOpToLLVMPattern(typeConverter,
-                                                           patterns, benefit);
+    mlir::triton::NVIDIA::populateTCGen5MMAOpToLLVMPattern(
+        typeConverter, patterns, benefit, targetInfo);
     mlir::triton::NVIDIA::populateFp4ToFpToLLVMPatterns(typeConverter, patterns,
                                                         benefit);
     mlir::triton::populateInstrumentationToLLVMPatterns(typeConverter, patterns,
                                                         targetInfo);
+    mlir::triton::populateFpSanToLLVMPatterns(typeConverter, patterns);
     mlir::triton::populateGSanToLLVMPatterns(typeConverter, patterns,
                                              axisInfoAnalysis, targetInfo);
 
@@ -350,6 +393,14 @@ private:
       llvm::SetVector<Value> bars;
       bars.insert(asyncCLCTryCancelOp.getMbarAlloc());
       return bars;
+    } else if (auto clcTryCancelOp = llvm::dyn_cast<ttng::CLCTryCancelOp>(op)) {
+      // The core Triton CLC scheduler also multicasts its response and
+      // completion signal when an explicit physical cluster is configured.
+      // All CTAs must finish initializing their local completion barriers
+      // before the lead CTA can issue the request.
+      llvm::SetVector<Value> bars;
+      bars.insert(clcTryCancelOp.getMbarrier());
+      return bars;
     } else if (auto tcgen5CommitOp = llvm::dyn_cast<ttng::TCGen5CommitOp>(op)) {
       // As of now, there're only three sources to have a tcgen05.commit
       // instruction:
@@ -372,17 +423,6 @@ private:
         llvm::SetVector<Value> bars;
         bars.insert(tcgen5CommitOp.getBarrier());
         return bars;
-      }
-    } else if (auto tmemCopyOp = llvm::dyn_cast<ttng::TMEMCopyOp>(op)) {
-      // case 2 for gen5 commit: a commit inline ptx is generated for a tmem cp
-      // op if it has a barrier arg. If the mod is in 2cta mode, the commit op
-      // can multicast bar signals.
-      if (auto bar = tmemCopyOp.getBarrier()) {
-        if (tlx::tlxEnablePairedMMA(op)) {
-          llvm::SetVector<Value> bars;
-          bars.insert(bar);
-          return bars;
-        }
       }
     } else if (llvm::isa<ttng::MMAv5OpInterface>(op)) {
       // case 3 for gen5 commit: a commit inline ptx will be generated for each
@@ -418,8 +458,14 @@ private:
     }
 
     bool hasRemoteBar = false;
-    // Find if we have a remote bar
+    bool hasMulticastArrive = false;
+    // Find if we have a remote bar or multicast arrive.
     mod.walk([&](Operation *op) {
+      if (auto arrive = dyn_cast<ttng::ArriveBarrierOp>(op);
+          arrive && arrive.isMulticast()) {
+        hasMulticastArrive = true;
+        return WalkResult::interrupt();
+      }
       SetVector<Operation *> ops;
       auto remoteBar = getRemoteBarrier(op);
       if (remoteBar.has_value()) {
@@ -428,10 +474,10 @@ private:
       }
       return WalkResult::advance();
     });
-
-    // If we have remote mbar/SMEM access, or if we have 2cta TMEM allocation,
-    // we need a cluster sync after mbar init and before TMEM alloc
-    bool shouldInsert = hasRemoteBar || tlx::tlxEnablePairedMMA(mod);
+    // If we have remote mbar/SMEM access, a multicast arrive, or 2cta TMEM
+    // allocation, we need a cluster sync after mbar init and before use.
+    bool shouldInsert =
+        hasRemoteBar || hasMulticastArrive || tlx::tlxEnablePairedMMA(mod);
     if (!shouldInsert) {
       return success();
     }
@@ -481,7 +527,7 @@ private:
     // CTA_Y's bar before CTA_Y inits it, as shown in ptx doc examples:
     // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#parallel-synchronization-and-communication-instructions-mbarrier-test-wait-try-wait
     ttng::ClusterArriveOp::create(builder, lastBarInitOp.getLoc(),
-                                  /*relaxed*/ false);
+                                  /*relaxed*/ true);
     ttng::ClusterWaitOp::create(builder, lastBarInitOp.getLoc());
     // mark mod attr so that WS lowering is aware of this cluster sync point
     tlx::setClusterSyncKernelInitOnMod(mod, true);
@@ -508,7 +554,24 @@ createConvertTritonGPUToLLVMPass(int32_t computeCapability,
                                                   ptxVersion);
 }
 
+std::unique_ptr<OperationPass<ModuleOp>>
+createConvertTritonGPUToLLVMPass(int32_t computeCapability, int32_t ptxVersion,
+                                 bool enableConcurrencySanitizer) {
+  return std::make_unique<ConvertTritonGPUToLLVM>(computeCapability, ptxVersion,
+                                                  enableConcurrencySanitizer);
+}
+
+std::unique_ptr<OperationPass<ModuleOp>>
+createConvertTritonGPUToLLVMPass(int32_t computeCapability, int32_t ptxVersion,
+                                 bool enableConcurrencySanitizer,
+                                 bool enableTreeReduction) {
+  return std::make_unique<ConvertTritonGPUToLLVM>(computeCapability, ptxVersion,
+                                                  enableConcurrencySanitizer,
+                                                  enableTreeReduction);
+}
+
 bool NVIDIA::canSkipBarSync(Operation *before, Operation *after,
+                            bool /*beforeIsRead*/, bool /*afterIsRead*/,
                             Allocation *allocation) {
   // These mbarrier ops are single threaded, so are always synchronized wrt.
   // each other.
@@ -519,7 +582,7 @@ bool NVIDIA::canSkipBarSync(Operation *before, Operation *after,
     return true;
 
   // wait_barrier will never run ahead of the load it's waiting on
-  if (isa<ttng::AsyncTMACopyGlobalToLocalOp, ttng::AsyncTMAGatherOp>(before) &&
+  if (isa<ttng::TMALoadLikeOpInterface>(before) &&
       isa<ttng::WaitBarrierOp>(after))
     return true;
 
