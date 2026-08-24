@@ -1,12 +1,12 @@
 {{def_kernel("A", "B")}}
     # PERSISTENT TLX warp-pipelined addmm for AMD (MI350X / gfx950), COL-MAJOR B (stride_bk == 1).
     # Persistent variant of gfx950_addmm_warppipe: the grid is capped at NUM_SMS (see
-    # _persistent_mm_grid_split_k) and each program strides over output tiles by NUM_SMS.
+    # _persistent_mm_grid_split_k) and each program strides over work items by NUM_SMS.
     # The per-tile body (col-major B loaded as (BLOCK_N, BLOCK_K) + tlx.local_trans, XCD chiplet
     # swizzle, "mfma"/"mem" warp-pipeline stages, single combined A+B commit, loop-tail wait) is
-    # copied verbatim from the proven per-tile template -- the ONLY change is wrapping it in the
-    # `for tile_iter in tl.range(start_pid, num_tiles, NUM_SMS)` loop and allocating the SMEM
-    # buffers once outside that loop. Bias is applied by store_output via epilogue_fn / prefix_args.
+    # copied from the proven per-tile template, wrapped in a persistent work-item loop with the SMEM
+    # buffers allocated once outside it. A work item is one (output tile, K split) pair. SPLIT_K=1
+    # stores through store_output; larger splits write fp32 partials for the shared reduce_k epilogue.
     #
     # NOTE: this nesting (warp_pipeline_stage inside a K-loop inside the persistent tile-loop) is
     # exactly what failed to lower on fbcode beta triton 3.6 ("barrier or wait op cannot appear
@@ -32,14 +32,15 @@
     grid_m = (M + BLOCK_M - 1) // BLOCK_M
     grid_n = (N + BLOCK_N - 1) // BLOCK_N
     num_tiles = grid_m * grid_n
+    num_work_items = num_tiles * SPLIT_K
     width = GROUP_M * grid_n
 
     K_ITERS = tl.cdiv(K, BLOCK_K)
     offs_k = tl.arange(0, BLOCK_K).to(INDEX_DTYPE)
 
-    # Persistent: allocate the multi-buffered LDS staging ONCE and reuse it across tiles.
-    # Each tile's epilogue drains all in-flight loads (async_load_wait_group(0)) before the next
-    # tile's prologue reuses the buffers.
+    # Persistent: allocate the multi-buffered LDS staging ONCE and reuse it across work items.
+    # Each work item's epilogue drains all in-flight loads (async_load_wait_group(0)) before the
+    # next one reuses the buffers.
     smemA = tlx.local_alloc((BLOCK_M, BLOCK_K), tlx.dtype_of(A), NUM_BUFFERS)
     smemB = tlx.local_alloc((BLOCK_N, BLOCK_K), tlx.dtype_of(B), NUM_BUFFERS)   # holds Bᵀ tile
 
@@ -48,10 +49,17 @@
     XCD_CHUNK: tl.constexpr = 4
     aligned = (num_tiles // (NUM_XCDS * XCD_CHUNK)) * (NUM_XCDS * XCD_CHUNK)
 
-    for tile_iter in tl.range(start_pid, num_tiles, NUM_SMS):
+    for work_id in tl.range(start_pid, num_work_items, NUM_SMS):
+{% if SPLIT_K > 1 %}
+        # Interleave splits within each output tile so the persistent grid can cover the same
+        # flattened (tile, split) space as the per-tile kernel while remaining capped at NUM_SMS.
+        split_id = (work_id % SPLIT_K).to(INDEX_DTYPE)
+        pid = work_id // SPLIT_K
+{% else %}
+        pid = work_id
+{% endif %}
         # XCD chiplet swizzle: group adjacent tiles onto the same XCD in chunks for warm L2.
         # NUM_XCDS is 8 for gfx942/gfx950 (else 1 -> identity). Trailing remainder passes through.
-        pid = tile_iter
         if pid < aligned:
             xcd = pid % NUM_XCDS
             local_pid = pid // NUM_XCDS
@@ -69,10 +77,22 @@
         a_base = offs_m[:, None] * stride_am
         b_base = offs_n[:, None] * stride_bn          # B as (BLOCK_N, BLOCK_K)
 
-        # prologue: prefetch the first NUM_BUFFERS K-tiles (heuristic guarantees K_ITERS > NUM_BUFFERS).
+{% if SPLIT_K > 1 %}
+        # Balanced contiguous K-iteration partition. The heuristic guarantees every split has at
+        # least NUM_BUFFERS iterations, so the shared prologue/drain remains well formed.
+        base = K_ITERS // SPLIT_K
+        rem = K_ITERS - base * SPLIT_K
+        k_lo = split_id * base + tl.minimum(split_id, rem)
+        n_iters = base + (split_id < rem).to(INDEX_DTYPE)
+{% else %}
+        k_lo = 0
+        n_iters = K_ITERS
+{% endif %}
+
+        # prologue: prefetch the first NUM_BUFFERS K-tiles.
         # A and B share a SINGLE async_load_commit_group per K-tile (wait counts tiles directly).
         for i in tl.range(0, NUM_BUFFERS, loop_unroll_factor=NUM_BUFFERS):
-            k_start = i * BLOCK_K
+            k_start = (k_lo + i) * BLOCK_K
             a_offs = a_base + (k_start + offs_k[None, :]) * stride_ak
             b_offs = b_base + (k_start + offs_k[None, :]) * stride_bk
             tok_a = tlx.async_load(A + a_offs.to(tl.int32), tlx.local_view(smemA, i), mask=offs_k[None, :] < K - k_start)
@@ -85,11 +105,11 @@
 
         acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_TYPE)
 
-        for k_id in tl.range(0, K_ITERS - NUM_BUFFERS):
+        for k_id in tl.range(0, n_iters - NUM_BUFFERS):
             # buffer indices MUST be int32 (local_view feeds them to the block-ptr index check).
             prefetch_buf = (k_id % NUM_BUFFERS).to(tl.int32)
             next_buf = ((k_id + 1) % NUM_BUFFERS).to(tl.int32)
-            k_prefetch = (k_id + NUM_BUFFERS) * BLOCK_K
+            k_prefetch = (k_lo + k_id + NUM_BUFFERS) * BLOCK_K
 
             with tlx.warp_pipeline_stage("mfma", priority=0):
                 acc = tl.dot(a_tile, b_tile, acc, allow_tf32=ALLOW_TF32, out_dtype=ACC_TYPE)
@@ -111,7 +131,7 @@
         acc = tl.dot(a_tile, b_tile, acc, allow_tf32=ALLOW_TF32, out_dtype=ACC_TYPE)
         tlx.async_load_wait_group(0)
         for i in tl.range(0, NUM_BUFFERS - 1, loop_unroll_factor=NUM_BUFFERS - 1):
-            buf = ((K_ITERS - (NUM_BUFFERS - 1) + i) % NUM_BUFFERS).to(tl.int32)   # int32 buffer index
+            buf = ((n_iters - (NUM_BUFFERS - 1) + i) % NUM_BUFFERS).to(tl.int32)   # int32 buffer index
             a_tile = tlx.local_load(tlx.local_view(smemA, buf))
             b_tile = tlx.local_load(tlx.local_trans(tlx.local_view(smemB, buf)))
             acc = tl.dot(a_tile, b_tile, acc, allow_tf32=ALLOW_TF32, out_dtype=ACC_TYPE)
@@ -123,8 +143,16 @@
         idx_n = rn[None, :]
         mask = (idx_m < M) & (idx_n < N)
 
+{% if SPLIT_K > 1 %}
+        # The reducer owns bias/epilogue application after summing all fp32 partials. Keep the real
+        # output pointer in the signature even though this kernel only writes the workspace.
+        keep_out_ptr = {{output_ptr()}}  # noqa: F841
+        ws_off = split_id * (M * N) + idx_m * N + idx_n
+        tl.store(split_k_ws + ws_off, acc, mask=mask)
+{% else %}
         # inductor generates a suffix (bias add via epilogue_fn + prefix_args, cast, store).
         # store_output inside a persistent tile-loop is supported (see blackwell_gemm_ws.py.jinja);
         # indent_width=8 is REQUIRED so the generated epilogue body lands at the loop-body indent
         # (default 4 would emit it outside the loop -> idx_m/idx_n/mask NameError).
         {{store_output(("idx_m", "idx_n"), "acc", "mask", val_shape=("BLOCK_M", "BLOCK_N"), indent_width=8)}}
+{% endif %}
