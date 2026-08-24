@@ -608,8 +608,7 @@ class Autotuner(KernelInterface):
         # Check if we can use the C-level autotune proxy
         if (native_create_autotune_proxy is not None and getattr(self.fn, 'c_cache', False)
                 and knobs.nvidia.use_autotune_c_cache and knobs.nvidia.use_triton_dispatcher and len(self.configs) > 1
-                and knobs.autotuning.listener is None
-                and getattr(driver.active, "is_cpu_backend", False) is not True):
+                and knobs.autotuning.listener is None and getattr(driver.active, "is_cpu_backend", False) is not True):
             proxy = getattr(self, '_autotune_proxy', None)
             if proxy is None:
                 # Compute key_indices: positions in arg_names for autotuner key fields
