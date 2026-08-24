@@ -198,6 +198,7 @@ void AutomaticWarpSpecialization::runOnOperation() {
       metaPM.addPass(createNVWSInsertAllocas());
     } else {
       // Original Meta allocation materialization.
+      metaPM.addPass(createNVGPUConvertDescriptorLoadsToNVWS());
       metaPM.addPass(createNVGPUTestWSBufferAllocation());
     }
 
