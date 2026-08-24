@@ -545,6 +545,7 @@ def _fwd_softmax_tile_2cta(
     for start_n in tl.range(lo, hi, BLOCK_N):
         _, qk_phase = get_bufidx_phase(accum_cnt_qk, 1)
         tlx.barrier_wait(tlx.local_view(qk_fulls, cid), qk_phase)
+        qk_head0 = tl.zeros([BLOCK_M // 2, 32], dtype=tl.float32)
         if gauge_cnt == 0:
             for fragment_id in tl.static_range(0, 4):
                 qk_fragment = tlx.local_load(
@@ -554,18 +555,23 @@ def _fwd_softmax_tile_2cta(
                         32,
                     )
                 )
+                if fragment_id == 0:
+                    qk_head0 = qk_fragment
                 m_i = tl.maximum(m_i, tl.max(qk_fragment, 1) * qk_scale)
             m_i = tl.ceil(m_i) + 0.055517269
         l_ij = tl.zeros([BLOCK_M // 2], dtype=tl.float32)
         p_pending = tl.zeros([BLOCK_M // 2, 32], dtype=out_dtype)
         for fragment_id in tl.static_range(0, 4):
-            qk_fragment = tlx.local_load(
-                tlx.subslice(
-                    tlx.local_view(qk_tiles, cid),
-                    fragment_id * 32,
-                    32,
+            if gauge_cnt == 0 and fragment_id == 0:
+                qk_fragment = qk_head0
+            else:
+                qk_fragment = tlx.local_load(
+                    tlx.subslice(
+                        tlx.local_view(qk_tiles, cid),
+                        fragment_id * 32,
+                        32,
+                    )
                 )
-            )
             p_h = _s2_exp2_bf16(
                 qk_fragment,
                 qk_scale * 128.0,
