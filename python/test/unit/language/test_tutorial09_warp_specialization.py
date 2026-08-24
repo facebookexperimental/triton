@@ -632,6 +632,7 @@ def matmul_kernel_tma_unified_persistent_ws_while(
     TWO_CTAS: tl.constexpr,
     SMEM_ALLOC_ALGO: tl.constexpr,
     SEPARATE_EPILOGUE_STORE: tl.constexpr,
+    WARP_SPECIALIZE: tl.constexpr = True,
 ):
     dtype = tl.float16
     num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
@@ -643,7 +644,7 @@ def matmul_kernel_tma_unified_persistent_ws_while(
     sched = SCHEDULE.initialize(lowering_args, _unified_num_tiles, tile_counter)
     while tl.condition(
             sched.is_valid(),
-            warp_specialize=True,
+            warp_specialize=WARP_SPECIALIZE,
             data_partition_factor=DATA_PARTITION_FACTOR,
             separate_epilogue_store=SEPARATE_EPILOGUE_STORE,
             smem_alloc_algo=SMEM_ALLOC_ALGO,
@@ -983,6 +984,68 @@ def test_tutorial09_matmul_tma_warp_specialize(
         # Verify correctness
         ref_out = torch.matmul(A.to(torch.float32), B.T.to(torch.float32)).to(dtype)
         torch.testing.assert_close(ref_out, C, atol=0.03, rtol=0.03)
+
+
+@pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell 2-CTA MMA")
+def test_tutorial09_dynamic_2cta_without_warp_specialization(device):
+    """Exercise the standalone late materialization path without AutoWS."""
+    M, N, K = 1024, 1024, 128
+    block_m = block_n = 256
+    block_k = 64
+    num_ctas = 2
+    grid_size = 4
+    dtype = torch.float16
+
+    torch.manual_seed(43)
+    a = torch.randn((M, K), dtype=dtype, device=device)
+    b = torch.randn((N, K), dtype=dtype, device=device)
+    c = torch.empty((M, N), dtype=dtype, device=device)
+    counter = torch.full((1, ), grid_size, dtype=torch.int32, device=device)
+
+    a_desc = TensorDescriptor(a, a.shape, a.stride(), [block_m, block_k])
+    b_desc = TensorDescriptor(b, b.shape, b.stride(), [block_n, block_k])
+    c_desc = TensorDescriptor(c, c.shape, c.stride(), [block_m, block_n])
+
+    def alloc_fn(size, align, stream):
+        return torch.empty(size, dtype=torch.int8, device=device)
+
+    triton.set_allocator(alloc_fn)
+    with triton.knobs.nvidia.scope():
+        triton.knobs.nvidia.use_meta_ws = False
+        triton.knobs.nvidia.use_meta_partition = False
+        kernel = matmul_kernel_tma_unified_persistent_ws_while[(grid_size, )](
+            a_desc,
+            b_desc,
+            c_desc,
+            counter,
+            M,
+            N,
+            K,
+            BLOCK_SIZE_M=block_m,
+            BLOCK_SIZE_N=block_n,
+            BLOCK_SIZE_K=block_k,
+            GROUP_SIZE_M=8,
+            EPILOGUE_SUBTILE=1,
+            NUM_SMS=torch.cuda.get_device_properties(device).multi_processor_count,
+            SCHEDULE=tl.DynamicPersistent1DScheduler,
+            DATA_PARTITION_FACTOR=1,
+            NUM_CTAS=num_ctas,
+            TWO_CTAS=True,
+            SMEM_ALLOC_ALGO=1,
+            SEPARATE_EPILOGUE_STORE=False,
+            WARP_SPECIALIZE=False,
+            num_warps=4,
+            num_stages=3,
+            ctas_per_cga=(2, 1, 1),
+        )
+
+    ttgir = kernel.asm["ttgir"]
+    assert "ttg.warp_specialize" not in ttgir
+    assert "ttg.remote_shmem_store" in ttgir
+    assert "ttng.cluster_barrier" not in ttgir
+    assert "ttng.map_to_remote_buffer" in ttgir
+    ref = torch.matmul(a.to(torch.float32), b.T.to(torch.float32)).to(dtype)
+    torch.testing.assert_close(c, ref, atol=0.03, rtol=0.03)
 
 
 # ============================================================================
@@ -1904,11 +1967,14 @@ _UNIFIED_OUTER_AUTOWS_CONFIGS = [
                  id="dynamic-generated-separate-subtile-4"),
     pytest.param(tl.DynamicPersistent1DScheduler, 256, 128, 2, 2, 1, True, True, 1, True,
                  id="dynamic-dp2-generated-separate-subtile-2"),
+    pytest.param(tl.DynamicPersistent1DScheduler, 256, 256, 1, 2, 2, False, True, 1, True,
+                 id="dynamic-2cta-data-partition-2"),
     pytest.param(tl.DynamicPersistent1DScheduler, 128, 128, 1, 1, 1, False, False, 2, False,
                  id="dynamic-broadcast-depth-2"),
     pytest.param(tl.ClcTileScheduler, 128, 128, 1, 1, 1, False, False, 1, True, id="clc-subtile-1"),
     pytest.param(tl.ClcTileScheduler, 128, 128, 2, 1, 1, False, False, 1, True, id="clc-subtile-2"),
     pytest.param(tl.ClcTileScheduler, 128, 128, 4, 1, 1, False, False, 1, True, id="clc-subtile-4"),
+    pytest.param(tl.ClcTileScheduler, 256, 256, 1, 2, 2, False, True, 1, True, id="clc-2cta-data-partition-2"),
 ]
 
 
@@ -1933,9 +1999,6 @@ def test_tutorial09_matmul_tma_unified_persistent_while_loop_warp_specialize(
     """Exercise outer-loop AutoWS with each unified scheduler."""
     if blackwell_only and not is_blackwell():
         pytest.skip("Subtiled regions, BLOCK_M=256 data partitioning, and 2-CTA require Blackwell")
-    if NUM_CTAS == 2 and SCHEDULE in (tl.DynamicPersistent1DScheduler, tl.ClcTileScheduler):
-        pytest.skip("2-CTA is not supported for dynamic or CLC scheduling")
-
     M, N, K = 2048, 2048, 256
     BLOCK_SIZE_K = 64
     GROUP_SIZE_M = 8
@@ -1966,6 +2029,13 @@ def test_tutorial09_matmul_tma_unified_persistent_while_loop_warp_specialize(
             grid_size = num_tiles
         else:
             grid_size = min(NUM_SMS, num_tiles)
+            # Persistent cluster launches and the dynamic counter both begin at
+            # the number of physical CTAs. Keep that seed cluster-aligned.
+            grid_size = grid_size // NUM_CTAS * NUM_CTAS
+            if SCHEDULE is tl.DynamicPersistent1DScheduler and NUM_CTAS == 2:
+                # Force several reservations per cluster so the full/empty
+                # mbarrier phase and DSM-slot reuse are exercised at runtime.
+                grid_size = min(grid_size, 32)
         tile_counter = torch.full((1, ), grid_size, dtype=torch.int32, device=device)
 
         def alloc_fn(size, align, stream):
@@ -2039,8 +2109,15 @@ def test_tutorial09_matmul_tma_unified_persistent_while_loop_warp_specialize(
         assert "ttng.async_tma_copy_global_to_local" in ttgir, "Expected TMA copy"
         if SCHEDULE is not tl.ClcTileScheduler:
             assert "ttng.clc_" not in ttgir, "Expected non-CLC scheduling"
+        elif NUM_CTAS == 2:
+            assert "ttng.cluster_barrier" not in ttgir
+            assert "ttng.map_to_remote_buffer" in ttgir
         if SCHEDULE is tl.DynamicPersistent1DScheduler:
             assert "atomic" in ttgir, "Expected an atomic op driving the dynamic tile id"
+            if NUM_CTAS == 2:
+                assert "ttg.remote_shmem_store" in ttgir, "Expected the cluster leader to distribute the claimed PID"
+                assert "ttng.cluster_barrier" not in ttgir
+                assert "ttng.map_to_remote_buffer" in ttgir
 
         mma_op = "ttng.tc_gen5_mma" if is_blackwell() else "ttng.warp_group_dot"
         assert ttgir.count(mma_op) >= DATA_PARTITION_FACTOR, "Expected one MMA per data partition"

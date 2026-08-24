@@ -488,6 +488,15 @@ LogicalResult ClusterWaitOp::verify() {
   return success();
 }
 
+PhysicalClusterInfo getPhysicalClusterInfo(ModuleOp mod) {
+  int numCTAs = gpu::TritonGPUDialect::getNumCTAs(mod);
+  SmallVector<int, 3> dims = gpu::TritonGPUDialect::getClusterDims(mod);
+  int explicitSize = dims[0] * dims[1] * dims[2];
+  if (explicitSize > 1)
+    return {std::move(dims), explicitSize, numCTAs == 1};
+  return {{numCTAs, 1, 1}, numCTAs, false};
+}
+
 static LogicalResult verifyClusterIsMultiCTA(Operation *op) {
   int numCTAs = triton::gpu::lookupPhysicalNumCTAs(op);
   if (numCTAs <= 1)

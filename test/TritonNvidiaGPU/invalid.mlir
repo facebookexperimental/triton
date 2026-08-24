@@ -1,4 +1,4 @@
-// RUN: triton-opt --split-input-file %s --verify-diagnostics
+// RUN: triton-opt --split-input-file %s --triton-nvidia-gpu-atomic-tile-scheduler-prepare --verify-diagnostics
 
 // expected-error @below {{fp4Padded tensor memory layout requires colStride 1 but got 2}}
 #bad_fp4_padded_tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 64, colStride = 2, fp4Padded = true>
@@ -159,6 +159,83 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
   tt.func public @async_shared_store_requires_cluster(%src: tensor<128xi32, #blocked_i32>, %dst: !ttg.memdesc<128xi32, #shared_i32, #smem, mutable>, %bar: !ttg.memdesc<1xi64, #shared_i32, #smem, mutable>) {
     // expected-error @+1 {{requires at least two CTAs in the cluster}}
     ttng.async_shared_store %src, %dst, %bar : tensor<128xi32, #blocked_i32> -> !ttg.memdesc<128xi32, #shared_i32, #smem, mutable>, !ttg.memdesc<1xi64, #shared_i32, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+// A clustered dynamic scheduler introduces full-cluster synchronization, so
+// the compiler must reject a runtime tile bound whose cluster alignment cannot
+// be proved before materializing that protocol.
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32, "ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32} {
+  tt.func @clustered_atomic_scheduler_requires_aligned_bound(
+      %counter: !tt.ptr<i32>, %num_tiles: i32,
+      %a: tensor<128x64xf16>, %b: tensor<64x128xf16>,
+      %acc: tensor<128x128xf32>) {
+    %c1 = arith.constant 1 : i32
+    %true = arith.constant true
+    %start = tt.get_program_id x : i32
+    %result = scf.while (%tile = %start) : (i32) -> i32 {
+      // expected-error @below {{cannot prove num_tiles is divisible by physical cluster size 2; pad the 1-D scheduled tile space to a full cluster}}
+      %valid = arith.cmpi slt, %tile, %num_tiles : i32
+      scf.condition(%valid) %tile : i32
+    } do {
+    ^bb0(%tile: i32):
+      %dot = tt.dot %a, %b, %acc {two_ctas} : tensor<128x64xf16> * tensor<64x128xf16> -> tensor<128x128xf32>
+      %next = tt.atomic_rmw add, acq_rel, gpu, %counter, %c1, %true : (!tt.ptr<i32>, i32, i1) -> i32
+      scf.yield %next : i32
+    }
+    tt.return
+  }
+}
+
+// -----
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32, "ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32} {
+  tt.func @clustered_atomic_scheduler_requires_device_scope(
+      %counter: !tt.ptr<i32>, %a: tensor<128x64xf16>,
+      %b: tensor<64x128xf16>, %acc: tensor<128x128xf32>) {
+    %c1 = arith.constant 1 : i32
+    %c8 = arith.constant 8 : i32
+    %true = arith.constant true
+    %start = tt.get_program_id x : i32
+    %result = scf.while (%tile = %start) : (i32) -> i32 {
+      %valid = arith.cmpi slt, %tile, %c8 : i32
+      scf.condition(%valid) %tile : i32
+    } do {
+    ^bb0(%tile: i32):
+      %dot = tt.dot %a, %b, %acc {two_ctas} : tensor<128x64xf16> * tensor<64x128xf16> -> tensor<128x128xf32>
+      // expected-error @below {{clustered dynamic scheduler atomic must have GPU or system scope}}
+      %next = tt.atomic_rmw add, acq_rel, cta, %counter, %c1, %true : (!tt.ptr<i32>, i32, i1) -> i32
+      scf.yield %next : i32
+    }
+    tt.return
+  }
+}
+
+// -----
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32, "ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32} {
+  tt.func @clustered_atomic_scheduler_requires_direct_carry(
+      %counter: !tt.ptr<i32>, %a: tensor<128x64xf16>,
+      %b: tensor<64x128xf16>, %acc: tensor<128x128xf32>) {
+    %c0 = arith.constant 0 : i32
+    %c1 = arith.constant 1 : i32
+    %c8 = arith.constant 8 : i32
+    %true = arith.constant true
+    %start = tt.get_program_id x : i32
+    %result = scf.while (%tile = %start) : (i32) -> i32 {
+      %valid = arith.cmpi slt, %tile, %c8 : i32
+      scf.condition(%valid) %tile : i32
+    } do {
+    ^bb0(%tile: i32):
+      %dot = tt.dot %a, %b, %acc {two_ctas} : tensor<128x64xf16> * tensor<64x128xf16> -> tensor<128x128xf32>
+      // expected-error @below {{clustered dynamic scheduler atomic must be forwarded directly through scf.yield}}
+      %claimed = tt.atomic_rmw add, acq_rel, gpu, %counter, %c1, %true : (!tt.ptr<i32>, i32, i1) -> i32
+      %next = arith.addi %claimed, %c0 : i32
+      scf.yield %next : i32
+    }
     tt.return
   }
 }

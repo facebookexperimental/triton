@@ -25,6 +25,7 @@
 #include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonNvidiaGPU/Transforms/ClusterHandoff.h"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/Passes.h"
 
 namespace mlir {
@@ -43,13 +44,6 @@ namespace {
 // A CLC response is 16 bytes; the low-level ops require a rank-1 memdesc of
 // exactly 2 x i64 (see verifyCLCResultMemdesc).
 constexpr int kClcResponseBytes = 16;
-
-int getExplicitClusterSize(ModuleOp mod) {
-  if (ttg::TritonGPUDialect::getNumCTAs(mod) != 1)
-    return 1;
-  auto dims = ttg::TritonGPUDialect::getClusterDims(mod);
-  return dims[0] * dims[1] * dims[2];
-}
 
 Value createClcResponseAlloc(OpBuilder &b, Location loc) {
   MLIRContext *ctx = b.getContext();
@@ -158,8 +152,7 @@ struct CLCMaterializePass
     Location loc = read.getLoc();
     OpBuilder b(whileOp);
     Type i32 = b.getI32Type();
-    ModuleOp mod = read->getParentOfType<ModuleOp>();
-    int clusterSize = getExplicitClusterSize(mod);
+    int clusterSize = getPhysicalClusterInfo(read).size;
 
     // Loop-carried phase, initialized to 0.
     Value zero =
