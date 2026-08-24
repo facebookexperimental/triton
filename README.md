@@ -1013,6 +1013,28 @@ TLX uses **CUDA-native cluster semantics** which differs from Triton's approach:
         ballot_result = tlx.vote_ballot_sync(0xFFFFFFFF, pred)
     ```
 
+- `tlx.warp_all(pred)` / `tlx.warp_any(pred)` **[Hopper+, MI300+]**
+
+    Reduce one distributed predicate per physical lane to a warp-uniform
+    scalar `i1`. Non-boolean inputs are compared with zero first. `warp_all`
+    is true only if every lane contributes true; `warp_any` is true if at
+    least one lane contributes true.
+
+    These are physical-lane votes, not logical tensor-axis reductions.
+    `tl.all` and `tl.max` reduce a tensor dimension and retain tensor layout
+    semantics, whereas these operations produce a scalar suitable for a
+    uniform branch. The predicate must distribute exactly one element per
+    lane; compilation fails if its resolved layout gives a lane zero or
+    multiple elements.
+
+    ```python
+    all_safe = tlx.warp_all(per_lane_safe)
+    any_active = tlx.warp_any(per_lane_active)
+    ```
+
+    Prefer these semantic reductions when code only needs an all/any result.
+    They do not expose a hardware ballot bit mask.
+
 - `tlx.prefetch(pointer, level="L2", mask=None, tensormap=False)` **[Hopper+]** issues a non-blocking prefetch hint for pointer-based scattered/gather loads. This complements `tlx.async_descriptor_prefetch_tensor` (which works on TMA tensor descriptors) by supporting raw pointer tensors.
   Additionally, if `tensormap` is specified to `True`, the API instead does a prefetch of tensor map object (TMA descriptor) and ignores other parameters other than `pointer`.
 
@@ -1110,7 +1132,6 @@ TLX uses **CUDA-native cluster semantics** which differs from Triton's approach:
     consumer, for example when a dot-operand layout feeds a reduction. This is
     not a conversion request; use another `require_layout` when the replacement
     layout is part of the algorithm.
-
 - `tlx.assert_same_layout(lhs, rhs)` **[Hopper+, MI300+]**
 
     Compile-time assertion that two layouts are equivalent after layout
