@@ -95,8 +95,8 @@ def amd_bmm_kernel(a_ptr, b_ptr, c_ptr, M, N, K, sab, sam, sak, sbb, sbk, sbn, s
     pn = pid % npn
     a_sh: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases([(512, 16)], A_BASES, [BLOCK_M, BLOCK_K])
     b_sh: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases([(512, 16)], _B_BASES, [BLOCK_K, BLOCK_N])
-    sA = tlx.local_alloc((BLOCK_M, BLOCK_K), tl.float16, NB, layout=a_sh)
-    sB = tlx.local_alloc((BLOCK_K, BLOCK_N), tl.float16, NB, layout=b_sh)
+    sA = tlx.local_alloc((BLOCK_M, BLOCK_K), tlx.dtype_of(a_ptr), NB, layout=a_sh)
+    sB = tlx.local_alloc((BLOCK_K, BLOCK_N), tlx.dtype_of(b_ptr), NB, layout=b_sh)
     om = (pm * BLOCK_M + tl.arange(0, BLOCK_M)) % M
     on = (pn * BLOCK_N + tl.arange(0, BLOCK_N)) % N
     ok = tl.arange(0, BLOCK_K)
@@ -175,6 +175,9 @@ def amd_bmm_kernel(a_ptr, b_ptr, c_ptr, M, N, K, sab, sam, sak, sbb, sbk, sbn, s
 def bmm(a, b, block_m=None, nw=4, nb=None):
     """C = A @ B batched. a (B, M, K) row-major; b (B, K, N) COLUMN-major (stride_bk == 1)."""
     assert a.ndim == 3 and b.ndim == 3 and a.shape[0] == b.shape[0]
+    # sA / sB take their element type from a_ptr / b_ptr independently, so a dtype
+    # mismatch would silently give the two LDS buffers different types.
+    assert a.dtype == b.dtype, f"A and B must have the same dtype, got {a.dtype} and {b.dtype}"
     Bs, M, K = a.shape
     _, _, N = b.shape
     bm = block_m or int(os.environ.get("BM_BMM", "128"))
