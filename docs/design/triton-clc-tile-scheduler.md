@@ -133,6 +133,13 @@ def TTNG_CLCAdvanceOp : TTNG_Op<"clc_advance", []> {
 Effectful (it claims a pending cluster) so it is neither DCE'd nor hoisted out of
 the loop; one per persistent-loop iteration. It references no mbarrier or buffer.
 
+For a clustered launch, `clc_advance` represents one cluster-scoped claim.
+Lowering elects exactly one CTA to issue the hardware request and distributes
+the response to the entire cluster. The returned `isValid` bit is therefore
+cluster-uniform. The `(x, y, z)` coordinates are reconstructed per CTA from the
+claimed cluster base and may differ along clustered dimensions. Electing rank
+zero is the current lowering strategy, not part of the operation contract.
+
 ### Initial TTIR
 
 ```mlir
@@ -167,9 +174,12 @@ Two ops model the intermediate form; together they are exactly `clc_advance`
 
 - `ttng.clc_try_cancel_async : !ttg.async_token` — issue the async CLC request.
   Returns **only a token**, nothing else. Effectful (claims a pending cluster).
+  For a clustered launch, the token represents one cluster-scoped request;
+  which CTA issues it is a lowering detail.
 - `ttng.clc_read(!ttg.async_token) -> (i1 isValid, i32 x, i32 y, i32 z)` — await
   the token and return the decoded tile. Same results as `clc_advance` (it must
-  return `is_valid` too).
+  return `is_valid` too). For a cluster-scoped token, every CTA observes the
+  same `isValid`, while coordinates are reconstructed per CTA.
 
 The token is `!ttg.async_token`, the same completion-handle type used by
 `cp.async` / TMA / `tcgen05` — so the existing async-dependency machinery applies.

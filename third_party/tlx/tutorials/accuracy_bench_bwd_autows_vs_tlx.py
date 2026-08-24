@@ -33,7 +33,6 @@ DTYPE = torch.float16
 RUNS = int(os.environ.get("BENCH_RUNS", 5))
 SEED = int(os.environ.get("BENCH_SEED", 20))
 
-
 # baseVariant: "ws_persistent" (failing) or "ws" (passing). Default to the
 # failing persistent path under investigation.
 AWS_VARIANT = os.environ.get("BENCH_VARIANT", "ws_persistent")
@@ -50,10 +49,11 @@ def pin_tlx_config():
     aws_cfg = aws.configs_bwd_persist[BWD_IDX]
     num_ctas = aws_cfg.kwargs.get("NUM_CTAS", 1)
     block_m = aws_cfg.kwargs["BLOCK_M1"]
-    cfgs = [c for c in tlx.configs_bwd_tlx
-            if c.kwargs.get("NUM_CTAS", 1) == num_ctas
-            and c.kwargs.get("USE_WARP_BARRIER") is False
-            and (num_ctas > 1 or c.kwargs.get("BLOCK_M1") == block_m)]
+    cfgs = [
+        c for c in tlx.configs_bwd_tlx
+        if c.kwargs.get("NUM_CTAS", 1) == num_ctas and c.kwargs.get("USE_WARP_BARRIER") is False and (
+            num_ctas > 1 or c.kwargs.get("BLOCK_M1") == block_m)
+    ]
     assert len(cfgs) == 1, f"expected 1 matching TLX config, got {len(cfgs)}"
     tlx._attn_bwd_ws.configs = cfgs
     tlx._attn_bwd_ws.cache = {}
