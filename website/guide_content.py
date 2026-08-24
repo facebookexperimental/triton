@@ -7,6 +7,17 @@ GUIDE_CONTENT = {
 
 This site covers three connected parts of Meta's work: the Triton compiler, the TLX low-level programming model, and the tools used to understand and improve generated GPU kernels.
 
+## News
+
+[Aug'26] GPU MODE competition wins:
+
+- Eigh: #5
+- Cholesky: #3
+- QR decomposition: #7
+- Trimul competition: #1
+
+[Jul'26] TritonParse accepted to ASPLOS 2026
+
 ## Explore the project
 
 | Area | Focus |
