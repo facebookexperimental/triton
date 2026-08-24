@@ -225,7 +225,10 @@ def require_layout(
     assert isinstance(pin, bool), f"pin must be a constexpr bool, got {type(pin).__name__}"
     assert isinstance(late_address_compute, bool), ("late_address_compute must be a constexpr bool, got "
                                                     f"{type(late_address_compute).__name__}")
-    enc = layout.to_ir(_semantic.builder, x.shape, x.dtype)
+    if isinstance(layout, tlx.layout):
+        enc = layout.to_ir(_semantic.builder, x.shape, x.dtype)
+    else:
+        enc = layout.to_ir(_semantic.builder)
     handle = _semantic.builder.create_require_layout(
         x.handle,
         enc,
@@ -237,11 +240,7 @@ def require_layout(
 
 @tl.builtin
 def release_layout(x, _semantic=None):
-    """Release a register tensor's explicit layout for a flexible consumer.
-
-    This is the inverse boundary to :func:`require_layout`: layout propagation
-    may select a new encoding after this point without changing tensor values.
-    """
+    """Release a register tensor's explicit layout for a flexible consumer."""
     assert isinstance(x, tl.tensor) and x.type.is_block(), "x must be a distributed tensor"
     handle = _semantic.builder.create_release_layout(x.handle)
     return tl.tensor(handle, x.type)

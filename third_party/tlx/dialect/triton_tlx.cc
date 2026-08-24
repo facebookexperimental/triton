@@ -817,6 +817,12 @@ void init_triton_tlx_ir(py::module_ &m) {
            [](TritonOpBuilder &self, int32_t mask) {
              self.create<ROCDL::SchedBarrier>(mask);
            })
+      .def("create_warp_vote",
+           [](TritonOpBuilder &self, Value pred,
+              const std::string &kind) -> mlir::Value {
+             return self.create<ttg::WarpVoteOp>(
+                 pred, self.getBuilder().getStringAttr(kind));
+           })
       .def("create_barrier_expect",
            [](TritonOpBuilder &self, Value mbarrerLoc, int expectBytes,
               Value pred) -> void {
