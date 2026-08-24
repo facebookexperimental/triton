@@ -908,4 +908,22 @@ def TTG_WarpIdOp : TTG_Op<"warp_id", [Pure]> {
   let assemblyFormat = "attr-dict";
 }
 
+def TTG_WarpVoteOp : TTG_Op<"warp_vote", [Pure]> {
+  let summary = "Reduce one predicate per lane to a warp-uniform boolean";
+
+  let description = [{
+    Each lane contributes its single distributed `i1` value. The uniform i1
+    result is the logical `all` or `any` reduction across the physical warp,
+    selected by `kind`.
+
+    The predicate tensor must distribute exactly one element to each lane.
+  }];
+
+  let arguments = (ins TT_BoolTensor:$pred, StrAttr:$kind);
+  let results = (outs I1:$result);
+
+  let assemblyFormat = "$pred $kind attr-dict `:` type($pred) `->` type($result)";
+  let hasVerifier = 1;
+}
+
 #endif // TRITONGPU_OPS

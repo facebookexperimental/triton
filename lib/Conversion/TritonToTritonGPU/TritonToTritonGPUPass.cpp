@@ -648,6 +648,8 @@ void populateTritonPatterns(TritonGPUTypeConverter &typeConverter,
 void populateTLXPatterns(TritonGPUTypeConverter &typeConverter,
                             RewritePatternSet &patterns) {
   MLIRContext *context = patterns.getContext();
+  patterns.add<GenericOpPattern<triton::gpu::WarpVoteOp>>(typeConverter,
+                                                          context);
   patterns.add<GenericOpPattern<triton::tlx::RequireLayoutOp>>(typeConverter, context);
   patterns.add<GenericOpPattern<triton::tlx::ReleaseLayoutOp>>(typeConverter,
                                                            context);
