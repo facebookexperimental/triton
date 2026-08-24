@@ -12,6 +12,7 @@ Covers:
 """
 
 import os
+import unittest
 from unittest import TestCase
 from unittest.mock import patch
 
@@ -20,6 +21,14 @@ import triton
 import triton.language as tl
 from triton._C.libtriton import native_fast_dispatch_insert
 from triton.runtime.jit import _hash_fc_opts
+
+
+def is_cuda():
+    return torch.cuda.is_available() and triton.runtime.driver.active.get_current_target().backend == "cuda"
+
+
+def is_hopper_or_newer():
+    return is_cuda() and triton.runtime.driver.active.get_current_target().arch >= 90
 
 
 def _get_device():
@@ -779,7 +788,7 @@ class TestUnhashableKwargs(TestCase):
 # Module-level global referenced by the 2-CTA test kernel → populates
 # used_global_vals → __getitem__ returns the lambda fallback instead of
 # the C proxy, exercising the buggy path.
-_CLUSTER_SCALE = 1.0
+_CLUSTER_SCALE = tl.constexpr(1.0)
 
 
 class TestCtasPerCgaAutotunerSteadyState(TestCase):
@@ -797,11 +806,8 @@ class TestCtasPerCgaAutotunerSteadyState(TestCase):
     cluster config and cuLaunchKernelEx fails with error 912.
     """
 
+    @unittest.skipUnless(is_hopper_or_newer(), "ctas_per_cga is NVIDIA-only and requires Hopper (sm90) or newer")
     def test_second_call_preserves_cluster_config(self):
-        if not torch.cuda.is_available():
-            self.skipTest("CUDA not available")
-        if torch.cuda.get_device_capability()[0] < 9:
-            self.skipTest("ctas_per_cga requires Hopper (sm90) or newer")
 
         @triton.autotune(
             configs=[

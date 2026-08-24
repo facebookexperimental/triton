@@ -375,9 +375,15 @@ static Attribute inferDstEncoding(triton::ReduceOp op, Attribute encoding) {
   // If the input is rank 1, the output is a scalar value.
   if (cast<ttg::LayoutEncodingTrait>(encoding).getRank() == 1)
     return {};
-  return triton::gpu::SliceEncodingAttr::get(
-      op->getContext(), op.getAxis(),
-      cast<ttg::DistributedEncodingTrait>(encoding));
+  Attribute dstEncoding;
+  auto *inferLayout =
+      encoding.getDialect()
+          .getRegisteredInterface<DialectInferLayoutInterface>();
+  if (!inferLayout ||
+      failed(inferLayout->inferReduceOpEncoding(
+          encoding, op.getAxis(), dstEncoding, /*loc=*/std::nullopt)))
+    return {};
+  return dstEncoding;
 }
 
 static Attribute inferDstEncoding(triton::ExpandDimsOp op, Attribute encoding) {
