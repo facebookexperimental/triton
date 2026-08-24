@@ -844,23 +844,35 @@ static LogicalResult reconcileVerifierLayouts(ModuleOp mod) {
       // A result-side user pin on transpose must be reflected through the
       // inverse permutation before normal forward type inference runs.
       if (auto trans = dyn_cast<::mlir::triton::TransOp>(op)) {
+        auto srcTy = trans.getSrc().getType();
         auto resultType = cast<RankedTensorType>(trans.getType());
+        Attribute srcEnc = srcTy.getEncoding();
         Attribute resultEnc = resultType.getEncoding();
         if (isPlaceholderEncoding(resultEnc)) {
           auto inverseOrder = invertPermutation(trans.getOrder());
-          Attribute srcEnc;
+          Attribute inferredSrcEnc;
           auto *layout = cast<::mlir::triton::DialectInferLayoutInterface>(
               &resultEnc.getDialect());
           if (succeeded(layout->inferTransOpEncoding(
-                  resultEnc, resultType.getShape(), inverseOrder, srcEnc,
-                  trans.getLoc()))) {
-            changed |= retypeWithEncoding(trans.getSrc(), srcEnc);
+                  resultEnc, resultType.getShape(), inverseOrder,
+                  inferredSrcEnc, trans.getLoc()))) {
+            changed |= retypeWithEncoding(trans.getSrc(), inferredSrcEnc);
             return;
           }
         }
+        if (srcEnc && (!resultEnc || isPlaceholderEncoding(resultEnc))) {
+          auto *layout = cast<::mlir::triton::DialectInferLayoutInterface>(
+              &srcEnc.getDialect());
+          if (succeeded(layout->inferTransOpEncoding(
+                  srcEnc, srcTy.getShape(), trans.getOrder(), resultEnc,
+                  trans.getLoc())))
+            changed |= retypeWithEncoding(trans.getResult(), resultEnc);
+          return;
+        }
       }
+
       // Re-infer any op whose operands acquired a placeholder after frontend
-      // construction. This covers trans/split/reduce/expand-dims and future ops
+      // construction. This covers split/reduce/expand-dims and future ops
       // implementing InferTypeOpInterface.
       Attribute operandEnc;
       for (Value operand : op->getOperands())
