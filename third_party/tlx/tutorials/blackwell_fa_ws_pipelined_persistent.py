@@ -139,6 +139,40 @@ def prune_configs_by_hdim(configs, named_args, **kwargs):
     return pruned
 
 
+_S2_F16_GAUGE: tl.constexpr = 0.055517269
+
+
+@core.builtin
+def _s2_exp2_f16(x, a2, b2m, _semantic=None):
+    return core.inline_asm_elementwise(
+        """
+        {
+            .reg .b64 ra, rb, rc, rd;
+            .reg .b32 v0, v1, pk, zz, uu, mk, c0;
+            mov.b64 ra, { $1, $2 };
+            mov.b64 rb, { $3, $4 };
+            mov.b64 rc, { $5, $6 };
+            fma.rn.f32x2 rd, ra, rb, rc;
+            mov.b64 { v0, v1 }, rd;
+            prmt.b32 pk, v0, v1, 0x5410;
+            mov.b32 zz, 0;
+            mov.b32 mk, 0x02000200;
+            add.s16x2 uu, pk, mk;
+            mov.b32 c0, 0x39AB39AB;
+            fma.rn.f16x2 pk, uu, c0, pk;
+            max.f16x2 pk, pk, zz;
+            mov.b32 $0, pk;
+        }
+        """,
+        "=r,r,r,r,r,r,r",
+        [x, a2, b2m],
+        dtype=core.float16,
+        is_pure=True,
+        pack=2,
+        _semantic=_semantic,
+    )
+
+
 @core.builtin
 def _s2_exp2_bf16(x, a2, b2m, _semantic=None):
     return core.inline_asm_elementwise(
@@ -305,6 +339,7 @@ def _fwd_softmax_tile_1cta(
     alpha_tiles,
     cid,
     accum_cnt_qk,
+    gauge_cnt,
     qk_scale,
     offs_m,
     m_i,
@@ -320,9 +355,11 @@ def _fwd_softmax_tile_1cta(
     SCALAR_N: tl.constexpr,
     FAST_FIXED: tl.constexpr,
 ):
+    FAST_BF16: tl.constexpr = FAST_FIXED and out_dtype == tl.bfloat16
+    FAST_F16: tl.constexpr = FAST_FIXED and out_dtype == tl.float16
+    NUM_P_SLICES: tl.constexpr = 2 if FAST_F16 else NUM_MMA_SLICES
     if FAST_FIXED:
         lo, hi = _get_unfused_loop_bounds(start_m, N_CTX, BLOCK_M, STAGE)
-        gauge_cnt = 0
         for start_n in tl.range(lo, hi, BLOCK_N):
             _, qk_phase = get_bufidx_phase(accum_cnt_qk, 1)
             tlx.barrier_wait(tlx.local_view(qk_fulls, cid), qk_phase)
@@ -335,8 +372,15 @@ def _fwd_softmax_tile_1cta(
                             32,
                         )
                     )
+                    if STAGE == 2:
+                        col_limit_right = (
+                            offs_m - (start_n + fragment_id * 32) + 1
+                        )[:, None]
+                        qk_fragment = _apply_causal_mask(
+                            qk_fragment, col_limit_right, 32
+                        )
                     m_i = tl.maximum(m_i, tl.max(qk_fragment, 1) * qk_scale)
-                m_i = tl.ceil(m_i) + 0.055517269
+                m_i = tl.ceil(m_i) + _S2_F16_GAUGE
             l_ij = tl.zeros([BLOCK_M // 2], dtype=tl.float32)
             p_pending = tl.zeros([BLOCK_M // 2, 32], dtype=out_dtype)
             for fragment_id in tl.static_range(0, 4):
@@ -347,25 +391,50 @@ def _fwd_softmax_tile_1cta(
                         32,
                     )
                 )
-                p_h = _s2_exp2_bf16(
-                    qk_fragment,
-                    qk_scale * 128.0,
-                    12582912.0 + 128.0 * (126.0 - m_i[:, None]),
-                )
-                if fragment_id % 2 == 0:
-                    p_pending = p_h
+                if STAGE == 2:
+                    col_limit_right = (
+                        offs_m - (start_n + fragment_id * 32) + 1
+                    )[:, None]
+                    qk_fragment = _apply_causal_mask(
+                        qk_fragment, col_limit_right, 32
+                    )
+                if FAST_BF16:
+                    p_h = _s2_exp2_bf16(
+                        qk_fragment,
+                        qk_scale * 128.0,
+                        12582912.0 + 128.0 * (126.0 - m_i[:, None]),
+                    )
+                elif STAGE == 2:
+                    p_i = tl.math.exp2(
+                        _fma_f32x2(qk_fragment, qk_scale, -m_i[:, None])
+                    )
+                    p_h = p_i.to(out_dtype)
                 else:
+                    p_h = _s2_exp2_f16(
+                        qk_fragment,
+                        qk_scale * 1024.0,
+                        12582912.0 + 1024.0 * (14.0 - m_i[:, None]),
+                    )
+                if (FAST_BF16 or FAST_F16) and fragment_id % 2 == 0:
+                    p_pending = p_h
+                elif FAST_BF16 or FAST_F16:
                     p_bufIdx = cid * 2 + fragment_id // 2
                     tlx.local_store(
-                        tlx.local_view(p_tiles, p_bufIdx),
-                        _join_n_2D([p_pending, p_h]),
+                        tlx.local_view(p_tiles, p_bufIdx), _join_n_2D([p_pending, p_h])
                     )
                     tlx.barrier_arrive(tlx.local_view(p_fulls, p_bufIdx))
-                l_ij += tl.reduce(p_h, axis=1, combine_fn=_reduce_bf16).to(tl.float32)
+                if FAST_BF16:
+                    l_ij += tl.reduce(
+                        p_h, axis=1, combine_fn=_reduce_bf16
+                    ).to(tl.float32)
+                elif STAGE == 2:
+                    l_ij += tl.sum(p_i, 1)
+                else:
+                    l_ij += tl.sum(p_h, 1).to(tl.float32)
             l_i += l_ij
             accum_cnt_qk += 1
             gauge_cnt += 1
-        return m_i, l_i, accum_cnt_qk
+        return m_i, l_i, accum_cnt_qk, gauge_cnt
 
     lo, hi = _get_unfused_loop_bounds(start_m, N_CTX, BLOCK_M, STAGE)
     for start_n in tl.range(lo, hi, BLOCK_N):
@@ -424,19 +493,31 @@ def _fwd_softmax_tile_1cta(
         # the loop is unrolled twice likely for vectorization
         qks = _split_n_2D(qk, NUM_MMA_SLICES)
         l_ij = tl.zeros_like(l_i)
+        p_pending = tl.zeros([BLOCK_M // 2, BLOCK_N // NUM_MMA_SLICES], dtype=out_dtype)
         for slice_id in tl.static_range(0, NUM_MMA_SLICES):
             # prepare p for the v dot
-            p_bufIdx = qk_buf * NUM_MMA_SLICES + slice_id
             p_i = tl.math.exp2(qks[slice_id])
             p_h = p_i.to(out_dtype)
-            tlx.local_store(tlx.local_view(p_tiles, p_bufIdx), p_h)
-            tlx.barrier_arrive(tlx.local_view(p_fulls, p_bufIdx))
+            if FAST_F16:
+                if slice_id % 2 == 0:
+                    p_pending = p_h
+                else:
+                    p_bufIdx = qk_buf * NUM_P_SLICES + slice_id // 2
+                    tlx.local_store(
+                        tlx.local_view(p_tiles, p_bufIdx),
+                        _join_n_2D([p_pending, p_h]),
+                    )
+                    tlx.barrier_arrive(tlx.local_view(p_fulls, p_bufIdx))
+            else:
+                p_bufIdx = qk_buf * NUM_P_SLICES + slice_id
+                tlx.local_store(tlx.local_view(p_tiles, p_bufIdx), p_h)
+                tlx.barrier_arrive(tlx.local_view(p_fulls, p_bufIdx))
             l_ij += tl.sum(p_i, 1)
 
         l_i += l_ij
         m_i = m_ij
         accum_cnt_qk += 1
-    return m_i, l_i, accum_cnt_qk
+    return m_i, l_i, accum_cnt_qk, gauge_cnt
 
 
 @triton.jit
@@ -447,6 +528,7 @@ def _fwd_softmax_tile_2cta(
     p_tiles,
     cid,
     accum_cnt_qk,
+    gauge_cnt,
     qk_scale,
     m_i,
     l_i,
@@ -460,7 +542,6 @@ def _fwd_softmax_tile_2cta(
 ):
     tl.static_assert(NUM_MMA_SLICES == 2)
     lo, hi = _get_unfused_loop_bounds(start_m, N_CTX, BLOCK_M, STAGE)
-    gauge_cnt = 0
     for start_n in tl.range(lo, hi, BLOCK_N):
         _, qk_phase = get_bufidx_phase(accum_cnt_qk, 1)
         tlx.barrier_wait(tlx.local_view(qk_fulls, cid), qk_phase)
@@ -518,7 +599,7 @@ def _fwd_softmax_tile_2cta(
         l_i += l_ij
         accum_cnt_qk += 1
         gauge_cnt += 1
-    return m_i, l_i, accum_cnt_qk
+    return m_i, l_i, accum_cnt_qk, gauge_cnt
 
 
 @triton.jit
@@ -531,6 +612,7 @@ def _fwd_softmax_tile_2cta_online(
     acc_tiles,
     cid,
     accum_cnt_qk,
+    gauge_cnt,
     qk_scale,
     m_i,
     l_i,
@@ -546,7 +628,6 @@ def _fwd_softmax_tile_2cta_online(
 ):
     tl.static_assert(NUM_MMA_SLICES == 2)
     lo, hi = _get_unfused_loop_bounds(start_m, N_CTX, BLOCK_M, STAGE)
-    block_count = 0
     for start_n in tl.range(lo, hi, BLOCK_N):
         _, qk_phase = get_bufidx_phase(accum_cnt_qk, 1)
         tlx.barrier_wait(tlx.local_view(qk_fulls, cid), qk_phase)
@@ -561,7 +642,7 @@ def _fwd_softmax_tile_2cta_online(
         else:
             m_ij = tl.maximum(m_i, tl.max(qk, 1) * qk_scale)
             alpha = tl.math.exp2(m_i - m_ij)
-        if block_count > 0:
+        if gauge_cnt > 0:
             for slice_id in tl.static_range(0, NUM_MMA_SLICES):
                 acc_slice = tlx.subslice(
                     tlx.local_view(acc_tiles, cid),
@@ -614,8 +695,8 @@ def _fwd_softmax_tile_2cta_online(
         l_i += l_ij
         m_i = m_ij
         accum_cnt_qk += 1
-        block_count += 1
-    return m_i, l_i, accum_cnt_qk
+        gauge_cnt += 1
+    return m_i, l_i, accum_cnt_qk, gauge_cnt
 
 
 @triton.jit
@@ -631,6 +712,7 @@ def _fwd_softmax_tile(
     acc_tiles,
     cid,
     accum_cnt_qk,
+    gauge_cnt,
     qk_scale,
     offs_m,
     m_i,
@@ -657,6 +739,7 @@ def _fwd_softmax_tile(
                 p_tiles,
                 cid,
                 accum_cnt_qk,
+                gauge_cnt,
                 qk_scale,
                 m_i,
                 l_i,
@@ -677,6 +760,7 @@ def _fwd_softmax_tile(
             acc_tiles,
             cid,
             accum_cnt_qk,
+            gauge_cnt,
             qk_scale,
             m_i,
             l_i,
@@ -700,6 +784,7 @@ def _fwd_softmax_tile(
         alpha_tiles,
         cid,
         accum_cnt_qk,
+        gauge_cnt,
         qk_scale,
         offs_m,
         m_i,
@@ -756,7 +841,8 @@ def _fwd_control_tile(
     STAGE,
     USE_2CTA,
     USE_WHERE,
-    FAST_FIXED,
+    SKIP_RESCALE,
+    FUSE_EPILOG,
 ):
     start_m, off_hz, lo, hi, qo_offset_y, kv_offset_y = _compute_offsets(
         tile_id // NUM_CTAS,
@@ -768,7 +854,7 @@ def _fwd_control_tile(
         STAGE,
         GROUP_SIZE_N,
     )
-    control_lo = hi if FAST_FIXED else lo
+    control_lo = hi if SKIP_RESCALE else lo
     # Rescale the live output accumulator when the online-softmax gauge changes.
     for _ in tl.range(control_lo, hi, BLOCK_N):
         _, phase = get_bufidx_phase(accum_cnt, 1)
@@ -859,7 +945,7 @@ def _fwd_control_tile(
             )
             tlx.local_store(subslice_o, acc)
         tlx.fence("async_shared")
-        if FAST_FIXED:
+        if FUSE_EPILOG:
             qo_offset_y_split = qo_offset_y + group_id * BLOCK_M_SPLIT
             tlx.async_descriptor_store(desc_o, o_tiles[cid], [qo_offset_y_split, 0])
             tlx.async_descriptor_store_wait(0)
@@ -1034,7 +1120,7 @@ def _fwd_mma_tile(
     HEAD_DIM_KV: tl.constexpr,
     NUM_BUFFERS_Q: tl.constexpr,
     NUM_BUFFERS_KV: tl.constexpr,
-    NUM_MMA_SLICES: tl.constexpr,
+    NUM_P_SLICES: tl.constexpr,
     v_tiles=None,
     v_fulls=None,
     v_empties=None,
@@ -1093,13 +1179,13 @@ def _fwd_mma_tile(
     else:
         if not SKIP_RESCALE:
             tlx.barrier_wait(acc_fulls[0], qk_phase)
-        for slice_id in tl.static_range(0, NUM_MMA_SLICES):
+        for slice_id in tl.static_range(0, NUM_P_SLICES):
             p_bufIdx = slice_id
             tlx.barrier_wait(p_fulls[p_bufIdx], qk_phase)
             kv_slice = tlx.local_slice(
                 v_tiles[v_bufIdx],
-                [BLOCK_N * slice_id // NUM_MMA_SLICES, 0],
-                [BLOCK_N // NUM_MMA_SLICES, HEAD_DIM_KV],
+                [BLOCK_N * slice_id // NUM_P_SLICES, 0],
+                [BLOCK_N // NUM_P_SLICES, HEAD_DIM_KV],
             )
             tlx.async_dot(
                 p_tiles[p_bufIdx],
@@ -1148,16 +1234,16 @@ def _fwd_mma_tile(
         else:
             if not SKIP_RESCALE:
                 tlx.barrier_wait(acc_fulls[1], qk_phase_prev)
-            for slice_id in tl.static_range(0, NUM_MMA_SLICES):
-                p_bufIdx = slice_id + NUM_MMA_SLICES
+            for slice_id in tl.static_range(0, NUM_P_SLICES):
+                p_bufIdx = slice_id + NUM_P_SLICES
                 tlx.barrier_wait(p_fulls[p_bufIdx], qk_phase_prev)
                 kv_slice = tlx.local_slice(
                     v_tiles[v_bufIdx_prev],
-                    [BLOCK_N * slice_id // NUM_MMA_SLICES, 0],
-                    [BLOCK_N // NUM_MMA_SLICES, HEAD_DIM_KV],
+                    [BLOCK_N * slice_id // NUM_P_SLICES, 0],
+                    [BLOCK_N // NUM_P_SLICES, HEAD_DIM_KV],
                 )
                 use_acc = acc1_init if slice_id == 0 else True
-                mBarriers = [v_empties[v_bufIdx_prev]] if slice_id == NUM_MMA_SLICES - 1 else []
+                mBarriers = [v_empties[v_bufIdx_prev]] if slice_id == NUM_P_SLICES - 1 else []
                 tlx.async_dot(
                     p_tiles[p_bufIdx],
                     kv_slice,
@@ -1194,13 +1280,13 @@ def _fwd_mma_tile(
         else:
             if not SKIP_RESCALE:
                 tlx.barrier_wait(acc_fulls[0], qk_phase)
-            for slice_id in tl.static_range(0, NUM_MMA_SLICES):
+            for slice_id in tl.static_range(0, NUM_P_SLICES):
                 p_bufIdx = slice_id
                 tlx.barrier_wait(p_fulls[p_bufIdx], qk_phase)
                 kv_slice = tlx.local_slice(
                     v_tiles[v_bufIdx],
-                    [BLOCK_N * slice_id // NUM_MMA_SLICES, 0],
-                    [BLOCK_N // NUM_MMA_SLICES, HEAD_DIM_KV],
+                    [BLOCK_N * slice_id // NUM_P_SLICES, 0],
+                    [BLOCK_N // NUM_P_SLICES, HEAD_DIM_KV],
                 )
                 tlx.async_dot(
                     p_tiles[p_bufIdx],
@@ -1227,16 +1313,16 @@ def _fwd_mma_tile(
     else:
         if not SKIP_RESCALE:
             tlx.barrier_wait(acc_fulls[1], qk_phase)
-        for slice_id in tl.static_range(0, NUM_MMA_SLICES):
-            p_bufIdx = slice_id + NUM_MMA_SLICES
+        for slice_id in tl.static_range(0, NUM_P_SLICES):
+            p_bufIdx = slice_id + NUM_P_SLICES
             tlx.barrier_wait(p_fulls[p_bufIdx], qk_phase)
             kv_slice = tlx.local_slice(
                 v_tiles[v_bufIdx],
-                [BLOCK_N * slice_id // NUM_MMA_SLICES, 0],
-                [BLOCK_N // NUM_MMA_SLICES, HEAD_DIM_KV],
+                [BLOCK_N * slice_id // NUM_P_SLICES, 0],
+                [BLOCK_N // NUM_P_SLICES, HEAD_DIM_KV],
             )
             use_acc = acc1_init if slice_id == 0 else True
-            mBarriers = [acc_empties[1], v_empties[v_bufIdx]] if slice_id == NUM_MMA_SLICES - 1 else []
+            mBarriers = [acc_empties[1], v_empties[v_bufIdx]] if slice_id == NUM_P_SLICES - 1 else []
             tlx.async_dot(
                 p_tiles[p_bufIdx],
                 kv_slice,
@@ -1312,10 +1398,18 @@ def _attn_fwd_ws_kernel(sm_scale, M,  #
 
     USE_2CTA: tl.constexpr = NUM_CTAS == 2
     tl.static_assert(not USE_2CTA or BLOCK_M == 256)
-    USE_FAST_FIXED: tl.constexpr = (
-        FAST_FIXED and tlx.dtype_of(desc_v) == tl.bfloat16 and POLICY == POLICY_DENSE
+    FAST_BF16: tl.constexpr = (
+        tlx.dtype_of(desc_v) == tl.bfloat16 and POLICY == POLICY_DENSE
         and NUM_MMA_SLICES == 2 and STAGE == 1 and not RESCALE_OPT
     )
+    FAST_F16_CAPABLE: tl.constexpr = (
+        tlx.dtype_of(desc_v) == tl.float16 and NUM_MMA_SLICES == 4
+        and not RESCALE_OPT and not USE_2CTA
+    )
+    USE_FAST_FIXED: tl.constexpr = FAST_FIXED and (FAST_BF16 or FAST_F16_CAPABLE)
+    USE_FAST_F16: tl.constexpr = USE_FAST_FIXED and FAST_F16_CAPABLE
+    FUSE_EPILOG: tl.constexpr = USE_FAST_FIXED and not USE_2CTA
+    DIRECT_SCHED: tl.constexpr = USE_2CTA or USE_FAST_F16
     cluster_cta_rank = tlx.cluster_cta_rank() if USE_2CTA else 0
     is_leader = (not USE_2CTA) or (cluster_cta_rank % 2 == 0)
 
@@ -1377,10 +1471,11 @@ def _attn_fwd_ws_kernel(sm_scale, M,  #
     qk_storage_alias = tlx.storage_alias_spec(storage=tlx.storage_kind.tmem)
     qk_tiles = tlx.local_alloc((BLOCK_M_SPLIT, BLOCK_N), qk_dtype, NUM_MMA_GROUPS, tlx.storage_kind.tmem,
                                reuse=qk_storage_alias)
+    NUM_P_SLICES: tl.constexpr = 2 if USE_FAST_F16 else NUM_MMA_SLICES
     p_tiles = tlx.local_alloc(
-        (BLOCK_M_SPLIT, BLOCK_N // NUM_MMA_SLICES),
+        (BLOCK_M_SPLIT, BLOCK_N // NUM_P_SLICES),
         tlx.dtype_of(desc_v),
-        NUM_MMA_GROUPS * NUM_MMA_SLICES,
+        NUM_MMA_GROUPS * NUM_P_SLICES,
         tlx.storage_kind.tmem,
         reuse=qk_storage_alias,
     )
@@ -1422,7 +1517,7 @@ def _attn_fwd_ws_kernel(sm_scale, M,  #
         tlx.reuse_group(
             qk_tiles,
             tlx.reuse_group(
-                tlx.reuse_group(p_tiles, group_size=NUM_MMA_SLICES),
+                tlx.reuse_group(p_tiles, group_size=NUM_P_SLICES),
                 alpha_tiles,
                 l_tiles,
                 m_tiles,
@@ -1446,14 +1541,14 @@ def _attn_fwd_ws_kernel(sm_scale, M,  #
         )
     elif USE_WARP_BARRIER:
         qk_empties = tlx.alloc_warp_barrier(num_barriers=NUM_MMA_GROUPS, num_warps=4)
-        p_fulls = tlx.alloc_warp_barrier(num_barriers=NUM_MMA_GROUPS * NUM_MMA_SLICES, num_warps=4)
+        p_fulls = tlx.alloc_warp_barrier(num_barriers=NUM_MMA_GROUPS * NUM_P_SLICES, num_warps=4)
         acc_fulls = (
             acc_empties if USE_FAST_FIXED
             else tlx.alloc_warp_barrier(num_barriers=NUM_MMA_GROUPS, num_warps=4)
         )
     else:
         qk_empties = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS, arrive_count=NUM_CTAS)
-        p_fulls = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS * NUM_MMA_SLICES, arrive_count=NUM_CTAS)
+        p_fulls = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS * NUM_P_SLICES, arrive_count=NUM_CTAS)
         acc_fulls = (
             acc_empties if USE_FAST_FIXED
             else tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS, arrive_count=NUM_CTAS)
@@ -1476,9 +1571,9 @@ def _attn_fwd_ws_kernel(sm_scale, M,  #
     )
 
     # CLC consumers per CTA: correction(1) + softmax(NUM_GROUPS_PER_CTA) + mma(1) + load(1) + epilog(1).
-    if not USE_2CTA:
+    if not DIRECT_SCHED:
         clc_context = tlx.clc_create_context(
-            num_consumers=3 + NUM_GROUPS_PER_CTA if USE_FAST_FIXED else 4 + NUM_GROUPS_PER_CTA
+            num_consumers=3 + NUM_GROUPS_PER_CTA if FUSE_EPILOG else 4 + NUM_GROUPS_PER_CTA
         )
 
     # In 2-CTA mode, cross-CTA barrier_arrive (to the leader's mbarriers) requires
@@ -1498,9 +1593,9 @@ def _attn_fwd_ws_kernel(sm_scale, M,  #
             while tile_id != -1:
                 # Publish this persistent tile, then finalize its M and O outputs.
                 if not USE_2CTA:
-                    tlx.clc_producer(clc_context, clc_phase_producer)
-                    clc_phase_producer ^= 1
-                if not USE_2CTA:
+                    if not DIRECT_SCHED:
+                        tlx.clc_producer(clc_context, clc_phase_producer)
+                        clc_phase_producer ^= 1
                     accum_cnt = _fwd_control_tile(
                         tile_id,
                         tile_count,
@@ -1539,10 +1634,10 @@ def _attn_fwd_ws_kernel(sm_scale, M,  #
                         STAGE,
                         USE_2CTA,
                         USE_WHERE,
-                        USE_FAST_FIXED,
+                        USE_FAST_FIXED, FUSE_EPILOG,
                     )
                 tile_count += 1
-                if USE_2CTA:
+                if DIRECT_SCHED:
                     next_tile_id = tile_id + persistent_stride
                     tile_id = tl.where(next_tile_id < num_tiles, next_tile_id, -1)
                 else:
@@ -1553,10 +1648,12 @@ def _attn_fwd_ws_kernel(sm_scale, M,  #
         with tlx.async_task(num_warps=4, registers=DENSE_REGS if USE_2CTA else 168,
                             replicate=NUM_GROUPS_PER_CTA):
             accum_cnt_qk = 0
+            gauge_cnt = 0
             tile_count = 0
             tile_id = start_pid
             clc_phase_consumer = 0
             while tile_id != -1:
+                gauge_cnt = 0
                 # initialize offsets
                 start_m, off_hz, lo, hi, qo_offset_y, kv_offset_y = _compute_offsets(
                     tile_id,
@@ -1588,7 +1685,7 @@ def _attn_fwd_ws_kernel(sm_scale, M,  #
                     group_id = cid
                 offs_m = (start_m * EFFECTIVE_BLOCK_M) + ((group_id * BLOCK_M_SPLIT) + tl.arange(0, BLOCK_M_SPLIT))
                 if STAGE & 1:
-                    m_i, l_i, accum_cnt_qk = _fwd_softmax_tile(
+                    m_i, l_i, accum_cnt_qk, gauge_cnt = _fwd_softmax_tile(
                         qk_fulls,
                         qk_tiles,
                         p_fulls,
@@ -1600,6 +1697,7 @@ def _attn_fwd_ws_kernel(sm_scale, M,  #
                         acc_tiles,
                         cid,
                         accum_cnt_qk,
+                        gauge_cnt,
                         qk_scale,
                         offs_m,
                         m_i,
@@ -1618,7 +1716,7 @@ def _attn_fwd_ws_kernel(sm_scale, M,  #
                         FAST_FIXED=USE_FAST_FIXED,
                     )
                 if STAGE & 2:
-                    m_i, l_i, accum_cnt_qk = _fwd_softmax_tile(
+                    m_i, l_i, accum_cnt_qk, gauge_cnt = _fwd_softmax_tile(
                         qk_fulls,
                         qk_tiles,
                         p_fulls,
@@ -1630,6 +1728,7 @@ def _attn_fwd_ws_kernel(sm_scale, M,  #
                         acc_tiles,
                         cid,
                         accum_cnt_qk,
+                        gauge_cnt,
                         qk_scale,
                         offs_m,
                         m_i,
@@ -1678,7 +1777,7 @@ def _attn_fwd_ws_kernel(sm_scale, M,  #
                     tlx.local_store(m_tiles[cid], tl.join(m_i, m_i) if SCALAR_N == 2 else m_i[:, None])
                     tlx.barrier_arrive(l_fulls[cid])
                 tile_count += 1
-                if USE_2CTA:
+                if DIRECT_SCHED:
                     next_tile_id = tile_id + persistent_stride
                     tile_id = tl.where(next_tile_id < num_tiles, next_tile_id, -1)
                 else:
@@ -1706,7 +1805,8 @@ def _attn_fwd_ws_kernel(sm_scale, M,  #
                             q_fulls, q_empties, k_fulls, k_empties, qk_fulls,
                             qk_empties, p_fulls, acc_fulls, acc_empties,
                             BLOCK_N, HEAD_DIM_KV, NUM_BUFFERS_Q, NUM_BUFFERS_KV,
-                            NUM_MMA_SLICES, v_tiles, v_fulls, v_empties, True,
+                            NUM_P_SLICES,
+                            v_tiles, v_fulls, v_empties, True,
                             SKIP_RESCALE=USE_FAST_FIXED,
                         )
                 else:
@@ -1716,11 +1816,11 @@ def _attn_fwd_ws_kernel(sm_scale, M,  #
                         q_fulls, q_empties, kv_fulls, kv_empties, qk_fulls,
                         qk_empties, p_fulls, acc_fulls, acc_empties,
                         BLOCK_N, HEAD_DIM_KV, NUM_BUFFERS_Q, NUM_BUFFERS_KV,
-                        NUM_MMA_SLICES, None, None, None, False,
-                        SKIP_RESCALE=USE_FAST_FIXED,
+                        NUM_P_SLICES,
+                        None, None, None, False, SKIP_RESCALE=USE_FAST_FIXED,
                     )
                 tile_count += 1
-                if USE_2CTA:
+                if DIRECT_SCHED:
                     next_tile_id = tile_id + persistent_stride
                     tile_id = tl.where(next_tile_id < num_tiles, next_tile_id, -1)
                 else:
@@ -1758,7 +1858,7 @@ def _attn_fwd_ws_kernel(sm_scale, M,  #
                     )
 
                 tile_count += 1
-                if USE_2CTA:
+                if DIRECT_SCHED:
                     next_tile_id = tile_id + persistent_stride
                     tile_id = tl.where(next_tile_id < num_tiles, next_tile_id, -1)
                 else:
@@ -1766,7 +1866,7 @@ def _attn_fwd_ws_kernel(sm_scale, M,  #
                     clc_phase_consumer ^= 1
 
         # epilog group
-        if USE_2CTA or not USE_FAST_FIXED:
+        if USE_2CTA or not FUSE_EPILOG:
             with tlx.async_task(num_warps=1, registers=24):
                 # initialize offsets
                 tile_count = 0
@@ -1794,7 +1894,7 @@ def _attn_fwd_ws_kernel(sm_scale, M,  #
                         tlx.barrier_arrive(o_empties[cid])
 
                     tile_count += 1
-                    if USE_2CTA:
+                    if DIRECT_SCHED:
                         next_tile_id = tile_id + persistent_stride
                         tile_id = tl.where(next_tile_id < num_tiles, next_tile_id, -1)
                     else:
@@ -3946,6 +4046,7 @@ class _attention(torch.autograd.Function):
                 RESCALE_OPT=False, USE_WHERE=False, USE_WARP_BARRIER=True,
                 NUM_CTAS=plan.num_ctas, PIPELINED=True, POLICY=plan.policy,
                 DENSE_REGS=176 if use_s1_2cta else 168,
+                FAST_FIXED=True,
                 num_stages=1, num_warps=4,
                 **({"ctas_per_cga": (2, 1, 1)} if use_s1_2cta else {}),
                 **extra_kern_args,
