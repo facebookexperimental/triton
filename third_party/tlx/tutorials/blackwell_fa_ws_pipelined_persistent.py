@@ -2,10 +2,12 @@ import torch
 import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
+from triton.language import core
 from triton.language.extra.tlx.warp_spec import get_bufidx_phase
 from triton.language.extra.cuda.inline_ptx_lib import _mul_f32x2, _fma_f32x2, _sub_f32x2
-from triton.language.extra.subtile_ops import _split_n_2D
+from triton.language.extra.subtile_ops import _join_n_2D, _split_n_2D
 from triton.tools.tensor_descriptor import TensorDescriptor
+
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
@@ -99,6 +101,42 @@ def prune_configs_by_hdim(configs, named_args, **kwargs):
                 continue
         pruned.append(conf)
     return pruned
+
+
+@core.builtin
+def _s2_exp2_bf16(x, a2, b2m, _semantic=None):
+    return core.inline_asm_elementwise(
+        """
+        {
+            .reg .b64 ra, rb, rc, rd;
+            .reg .b32 v0, v1, pk, zz, uu, mk, c0;
+            mov.b64 ra, { $1, $2 };
+            mov.b64 rb, { $3, $4 };
+            mov.b64 rc, { $5, $6 };
+            fma.rn.f32x2 rd, ra, rb, rc;
+            mov.b64 { v0, v1 }, rd;
+            prmt.b32 pk, v0, v1, 0x5410;
+            mov.b32 zz, 0;
+            mov.b32 mk, 0x00400040;
+            add.s16x2 uu, pk, mk;
+            mov.b32 c0, 0x3f3b3f3b;
+            fma.rn.bf16x2 pk, uu, c0, pk;
+            max.bf16x2 pk, pk, zz;
+            mov.b32 $0, pk;
+        }
+        """,
+        "=r,r,r,r,r,r,r",
+        [x, a2, b2m],
+        dtype=core.bfloat16,
+        is_pure=True,
+        pack=2,
+        _semantic=_semantic,
+    )
+
+
+@triton.jit
+def _reduce_bf16(a, b):
+    return (a + b).to(tl.bfloat16)
 
 
 @triton.jit
