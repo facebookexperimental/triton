@@ -90,6 +90,12 @@ target_link_libraries(triton-tensor-layout PRIVATE
   MLIRTransforms
 )
 
+if("cpu" IN_LIST TRITON_CODEGEN_BACKENDS)
+  foreach(target triton-opt triton-reduce triton-lsp triton-tensor-layout)
+    target_compile_definitions(${target} PRIVATE TRITON_ENABLE_CPU_BACKEND)
+  endforeach()
+endif()
+
 install(TARGETS
   triton-opt
   triton-reduce

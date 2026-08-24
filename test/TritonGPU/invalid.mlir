@@ -118,6 +118,73 @@ tt.func public @too_few_offsets(%arg0: !ttg.memdesc<8x16xf32, #shared, #smem>) {
 
 #shared = #ttg.swizzled_shared<{vec = 8, perPhase = 1, maxPhase = 4, order = [0, 1]}>
 #smem = #ttg.shared_memory
+tt.func public @dynamic_subslice_element_type(%arg0: !ttg.memdesc<8x16xf32, #shared, #smem>) {
+    %zero = arith.constant 0 : i32
+    // expected-error @+1 {{result element type must match descriptor element type}}
+    %a = ttg.memdesc_dynamic_subslice %arg0[%zero, %zero] : !ttg.memdesc<8x16xf32, #shared, #smem> -> !ttg.memdesc<4x16xf16, #shared, #smem, 8x16>
+    tt.return
+}
+
+// -----
+
+#shared = #ttg.swizzled_shared<{vec = 8, perPhase = 1, maxPhase = 4, order = [0, 1]}>
+#smem = #ttg.shared_memory
+tt.func public @dynamic_subslice_offset_rank(%arg0: !ttg.memdesc<8x16xf32, #shared, #smem>) {
+    %zero = arith.constant 0 : i32
+    // expected-error @+1 {{offsets must have the same rank as the source}}
+    %a = ttg.memdesc_dynamic_subslice %arg0[%zero] : !ttg.memdesc<8x16xf32, #shared, #smem> -> !ttg.memdesc<4x16xf32, #shared, #smem, 8x16>
+    tt.return
+}
+
+// -----
+
+#shared = #ttg.swizzled_shared<{vec = 8, perPhase = 1, maxPhase = 4, order = [0, 1]}>
+#smem = #ttg.shared_memory
+tt.func public @dynamic_subslice_allocation_shape(%arg0: !ttg.memdesc<8x16xf32, #shared, #smem>) {
+    %zero = arith.constant 0 : i32
+    // expected-error @+1 {{result must preserve the source allocation shape}}
+    %a = ttg.memdesc_dynamic_subslice %arg0[%zero, %zero] : !ttg.memdesc<8x16xf32, #shared, #smem> -> !ttg.memdesc<4x16xf32, #shared, #smem>
+    tt.return
+}
+
+// -----
+
+#shared = #ttg.swizzled_shared<{vec = 8, perPhase = 1, maxPhase = 4, order = [0, 1]}>
+#smem = #ttg.shared_memory
+tt.func public @dynamic_subslice_mutability(%arg0: !ttg.memdesc<8x16xf32, #shared, #smem, mutable>) {
+    %zero = arith.constant 0 : i32
+    // expected-error @+1 {{source and result must have the same mutability}}
+    %a = ttg.memdesc_dynamic_subslice %arg0[%zero, %zero] : !ttg.memdesc<8x16xf32, #shared, #smem, mutable> -> !ttg.memdesc<4x16xf32, #shared, #smem, 8x16>
+    tt.return
+}
+
+// -----
+
+#shared_src = #ttg.swizzled_shared<{vec = 8, perPhase = 1, maxPhase = 4, order = [0, 1]}>
+#shared_dst = #ttg.swizzled_shared<{vec = 4, perPhase = 2, maxPhase = 4, order = [0, 1]}>
+#smem = #ttg.shared_memory
+tt.func public @dynamic_subslice_encoding(%arg0: !ttg.memdesc<8x16xf32, #shared_src, #smem>) {
+    %zero = arith.constant 0 : i32
+    // expected-error @+1 {{source and result must have the same encoding}}
+    %a = ttg.memdesc_dynamic_subslice %arg0[%zero, %zero] : !ttg.memdesc<8x16xf32, #shared_src, #smem> -> !ttg.memdesc<4x16xf32, #shared_dst, #smem, 8x16>
+    tt.return
+}
+
+// -----
+
+#shared = #ttg.swizzled_shared<{vec = 8, perPhase = 1, maxPhase = 4, order = [0, 1]}>
+#smem = #ttg.shared_memory
+tt.func public @dynamic_subslice_must_narrow(%arg0: !ttg.memdesc<8x16xf32, #shared, #smem>) {
+    %zero = arith.constant 0 : i32
+    // expected-error @+1 {{dynamic subslice must narrow at least one dimension}}
+    %a = ttg.memdesc_dynamic_subslice %arg0[%zero, %zero] : !ttg.memdesc<8x16xf32, #shared, #smem> -> !ttg.memdesc<8x16xf32, #shared, #smem, 8x16>
+    tt.return
+}
+
+// -----
+
+#shared = #ttg.swizzled_shared<{vec = 8, perPhase = 1, maxPhase = 4, order = [0, 1]}>
+#smem = #ttg.shared_memory
 tt.func public @result_rank_too_large(%arg0: !ttg.memdesc<3x8x16xf32, #shared, #smem>) {
     %zero = arith.constant 0 : i32
     // expected-error @+1 {{result rank}}

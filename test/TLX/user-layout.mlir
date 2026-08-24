@@ -1,4 +1,4 @@
-// RUN: triton-opt -split-input-file --tlx-propagate-layout %s | FileCheck %s
+// RUN: triton-opt -split-input-file --tlx-propagate-layout --tlx-finalize-user-layouts %s | FileCheck %s
 
 // A user-pinned layout (#tlx.user_layout<...>) is honored by layout propagation:
 // the value is never retagged, and the wrapper is unwrapped back to the concrete
@@ -47,6 +47,24 @@ module attributes {"ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 64 : i32,
     %buf = ttg.local_alloc %src : (tensor<64x32xf16, #blocked>) -> !ttg.memdesc<64x32xf16, #user, #smem, mutable>
     %a = ttg.local_load %buf : !ttg.memdesc<64x32xf16, #user, #smem, mutable> -> tensor<64x32xf16, #dot0>
     tt.return %a : tensor<64x32xf16, #dot0>
+  }
+}
+
+// -----
+
+// Unwrapping a user layout can turn a previously meaningful conversion into
+// an identity. Finalization must erase it from the emitted TTGIR.
+
+#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [8, 4], warpsPerCTA = [4, 1], order = [1, 0]}>
+#user = #tlx.user_layout<#tlx.no_verify_layout<#blocked>>
+
+module attributes {"ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32, "ttg.num-ctas" = 1 : i32} {
+  // CHECK-LABEL: @erase_unwrapped_identity_conversion
+  tt.func @erase_unwrapped_identity_conversion(%arg0: tensor<128x64xf16, #user>) -> tensor<128x64xf16, #blocked> {
+    // CHECK-NOT: ttg.convert_layout
+    // CHECK: tt.return %{{.*}} : tensor<128x64xf16, #blocked>
+    %0 = ttg.convert_layout %arg0 : tensor<128x64xf16, #user> -> tensor<128x64xf16, #blocked>
+    tt.return %0 : tensor<128x64xf16, #blocked>
   }
 }
 

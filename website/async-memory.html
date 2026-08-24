@@ -4,25 +4,33 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="description" content="Move data asynchronously with descriptors, TMA, and copy groups.">
-  <title>Async memory access · TLX</title>
-  <link rel="stylesheet" href="assets/tlx.css">
+  <title>Async memory access · FBTriton</title>
+  <link rel="stylesheet" href="assets/tlx.css?v=20260821b">
 </head>
 <body>
   <header class="topbar">
-    <a class="brand" href="../"><span>TLX</span> Triton Low-level Language Extensions</a>
+    <a class="brand" href="../"><span>FB</span>Triton</a>
+    <nav class="topnav" aria-label="Top-level sections"><a href="triton.html">Triton</a>
+<a href="tlx.html" data-current="true">TLX</a>
+<a href="tooling.html">Tooling</a></nav>
     <a class="repo-link" href="https://github.com/facebookexperimental/triton" target="_blank" rel="noreferrer">View on GitHub ↗</a>
   </header>
   <div class="shell">
-    <aside class="sidebar">
-      <p class="eyebrow">Documentation</p>
-      <nav><a href="../">Overview</a>
+<aside class="sidebar">
+      <p class="eyebrow">TLX documentation</p>
+      <nav><a href="tlx.html">Overview</a>
+<a href="getting-started.html">Getting started</a>
+<a href="hardware-support.html">Hardware support</a>
 <a href="buffers.html">Local and remote buffers</a>
 <a href="async-memory.html" aria-current="page">Async memory access</a>
 <a href="async-compute.html">Async tensor core operations</a>
 <a href="synchronization.html">Barriers and Cluster Launch Control</a>
 <a href="warp-specialization.html">Warp specialization and clustering</a>
 <a href="utilities.html">Other operations</a>
+<a href="performance-optimization.html">Performance optimization</a>
+<a href="debugging.html">Debugging performance and numerics</a>
 <a href="kernels.html">Example kernels</a>
+<a href="production-case-studies.html">Production case studies</a>
 <a href="install-and-test.html">Build, install, and test</a>
 <a href="resources.html">More reading</a></nav>
     </aside>
@@ -164,7 +172,7 @@
 <p>Commits all prior initiated but uncommitted async_load ops an async group. Optionally, each token represents a tracked async load operation.</p>
 <div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.async_load_wait_group(pendings, tokens)</code> <strong>[Hopper+, MI350]</strong></div></div>
 <p>Wait for completion of prior asynchronous copy operations. The <code>pendings</code> argument indicates the number of in-flight operations not completed. Optionally, each token represents a tracked async commit group operation.</p></article>
-      <footer class="pager"><a href="buffers.html">← Local and remote buffers</a><a class="next" href="async-compute.html">Async tensor core operations →</a></footer>
+<footer class="pager"><a href="buffers.html">← Local and remote buffers</a><a class="next" href="async-compute.html">Async tensor core operations →</a></footer>
     </main>
   </div>
 </body>

@@ -112,9 +112,13 @@ the re-sync.
 
     Permutes the dimensions of a tensor.
 
-- `buffer = tlx.local_slice(buffer, offsets=[m, n], shapes=[M, N])` **[Hopper+, MI300+]**
+- `buffer = tlx.local_slice(buffer, offset=[m, n], shape=[M, N])` **[Hopper+, MI300+]**
 
-    Slice a `M x N` tensor at a `m x n` offset.
+    Slice a tensor at the given logical offset. On MI300+, SMEM offsets may be
+    runtime scalar i32 tensors; `shape` remains constexpr. The caller must keep
+    a runtime-offset view within the allocation and satisfy the same
+    tile-alignment contract as a static slice; violating either condition is
+    undefined behavior.
 
 #### Buffer Reuse
 
@@ -649,26 +653,26 @@ CLC (Cluster Launch Control) is a Blackwell-specific feature **[Blackwell]** tha
     **Parameters:**
     - `num_consumers`: Number of consumers that will signal completion per tile (typically 3 async tasks × num_CTAs)
 
-- `tlx.clc_producer(context, p_producer=phase, multi_ctas=False)` **[Blackwell]**
+- `tlx.clc_producer(context, p_producer=phase, multi_ctas=True)` **[Blackwell]**
 
     Issue a CLC try_cancel request to acquire a new tile ID.
 
     **Parameters:**
     - `context`: CLC pipeline context from `clc_create_context`
     - `phase`: Current barrier phase (0 or 1, alternates each iteration)
-    - `multi_ctas`: Set to `True` for 2-CTA mode (cluster of 2 CTAs). When enabled, `pred_cta0` is computed internally from `cluster_cta_rank()`.
+    - `multi_ctas`: Enables cluster-aware synchronization by default when the compilation options specify multiple CTAs. For a `(1, 1, 1)` cluster, the frontend emits the local single-CTA path. Set to `False` to request the local-only path explicitly.
 
-- `tile_id = tlx.clc_consumer(context, p_consumer=phase, multi_ctas=False, k=0, return_3d=False)` **[Blackwell]**
+- `tile_id = tlx.clc_consumer(context, p_consumer=phase, multi_ctas=True, k=0, return_3d=False)` **[Blackwell]**
 
     Decode the tile ID from a CLC response and signal completion.
 
     **Parameters:**
     - `context`: CLC pipeline context from `clc_create_context`
     - `phase`: Current barrier phase
-    - `multi_ctas`: Set to `True` for 2-CTA mode. When enabled, `pred_cta0` is computed internally.
+    - `multi_ctas`: Enables cluster-aware synchronization by default when the compilation options specify multiple CTAs. For a `(1, 1, 1)` cluster, the frontend emits a local barrier arrival. Set to `False` to request the local-only path explicitly.
     - `return_3d`: Set to `True` to return `(ctaIdX, ctaIdY, ctaIdZ)` tuple instead of scalar tile_id.
 
-    **Returns:** The tile ID (already offset by `cluster_cta_rank()` for unique tile assignments), or -1 if no work available. With `return_3d=True`, returns `(ctaIdX, ctaIdY, ctaIdZ)` tuple.
+    **Returns:** The tile ID (offset by `cluster_cta_rank()` for unique tile assignments), or -1 if no work is available. With `return_3d=True`, returns `(ctaIdX, ctaIdY, ctaIdZ)`.
 
 #### How CLC Works
 
@@ -1099,6 +1103,14 @@ TLX uses **CUDA-native cluster semantics** which differs from Triton's approach:
     Pair with `tlx.assert_same_layout(x, layout)` (below) to statically verify the
     pin survived to the final TTGIR.
 
+- `x = tlx.release_layout(x)` **[Hopper+, MI300+]**
+
+    End an explicit register-layout requirement without changing the tensor's
+    value. Downstream layout propagation may select a layout preferred by the
+    consumer, for example when a dot-operand layout feeds a reduction. This is
+    not a conversion request; use another `require_layout` when the replacement
+    layout is part of the algorithm.
+
 - `tlx.assert_same_layout(lhs, rhs)` **[Hopper+, MI300+]**
 
     Compile-time assertion that two layouts are equivalent after layout
@@ -1289,7 +1301,14 @@ Lowers to `amdg.assume_uniform`, which is eventually lowered to `llvm.amdgcn.rea
   inexpensive distributed coordinates near a use instead of carrying them
   through a long software pipeline.
 - `tlx.amd_register_resident(value, register_class="agpr", registers_per_group=1)`
-  keeps a distributed value in allocator-visible native register tuples.
+  keeps every native-register group in one allocator-visible whole-tensor
+  residency interval.
+- `tlx.amd_register_handoff(value, register_class="vgpr")` starts an
+  independent allocation interval for each 32-bit native register value,
+  shortening a local live range without requiring simultaneous whole-tensor
+  residency. Both register-boundary operations accept `"vgpr"` or `"agpr"`;
+  `amd_register_resident` additionally accepts a power-of-two
+  `registers_per_group` from 1 through 32.
 - `tlx.amd_scheduled_mfma(...)` exposes independent native MFMA accumulator
   chains in deterministic N-major, M-minor, K-reduction source order.
 - `tlx.amd_mfma_commit(value, preserve)` applies the CDNA4 MFMA result hazard

@@ -1612,7 +1612,8 @@ ttg::LocalAllocOp findShmemAlloc(Value operand) {
   // allowed in between.
   Value transitiveOperand = operand;
   while (isa_and_nonnull<ttg::ConvertLayoutOp, tt::TransOp, ttg::MemDescTransOp,
-                         ttg::MemDescReshapeOp, ttg::MemDescSubsliceOp>(
+                         ttg::MemDescReshapeOp, ttg::MemDescSubsliceOp,
+                         ttg::MemDescDynamicSubsliceOp>(
              transitiveOperand.getDefiningOp()) ||
          isa<BlockArgument>(transitiveOperand)) {
     if (auto blockArg = dyn_cast<BlockArgument>(transitiveOperand)) {
@@ -1806,6 +1807,14 @@ void replaceUsesAndPropagateType(
           oldType.getShape(), oldType.getElementType(), oldType.getEncoding(),
           oldType.getMemorySpace(), isMutable, oldType.getAllocShape());
       newVal = ttg::MemDescSubsliceOp::create(
+          builder, subslice.getLoc(), newDstType, val, subslice.getOffsets());
+    } else if (auto subslice = dyn_cast<ttg::MemDescDynamicSubsliceOp>(user)) {
+      ttg::MemDescType oldType = subslice.getType();
+      bool isMutable = cast<ttg::MemDescType>(val.getType()).getMutableMemory();
+      Type newDstType = ttg::MemDescType::get(
+          oldType.getShape(), oldType.getElementType(), oldType.getEncoding(),
+          oldType.getMemorySpace(), isMutable, oldType.getAllocShape());
+      newVal = ttg::MemDescDynamicSubsliceOp::create(
           builder, subslice.getLoc(), newDstType, val, subslice.getOffsets());
     } else if (auto trans = dyn_cast<ttg::MemDescTransOp>(user)) {
       newVal = ttg::MemDescTransOp::create(builder, trans.getLoc(), val,

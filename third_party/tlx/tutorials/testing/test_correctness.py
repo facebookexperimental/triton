@@ -67,6 +67,8 @@ from triton.language.extra.tlx.tutorials.amd_fa_cluster import (
     attention as _amd_fa_cluster, )
 from triton.language.extra.tlx.tutorials.amd_fa_cluster import (
     persistent_attention as _amd_fa_cluster_persistent, )
+from triton.language.extra.tlx.tutorials.amd_fa_bwd import (
+    fa_backward as _amd_fa_backward, )
 from triton.language.extra.tlx.tutorials.amd_pa_decode import (
     pa_decode_tlx as _amd_pa_decode,
     build_inputs as _amd_pa_decode_build_inputs,
@@ -108,7 +110,10 @@ from triton.language.extra.tlx.tutorials.gfx950_gdpa import (
     generate_gdpa_data as _gfx950_gdpa_gen,
     gelu_approx_error as _gfx950_gdpa_approx_error,
 )
-from triton.language.extra.tlx.tutorials.amd_addmm_gfx950 import addmm as _amd_addmm
+from triton.language.extra.tlx.tutorials.amd_addmm_gfx950 import (
+    addmm as _amd_addmm,
+    available_paths as _amd_addmm_paths,
+)
 from triton.language.extra.tlx.tutorials import amd_hstu_attn as _hstu
 from triton.tools.mxfp import MXScaleTensor
 
@@ -271,6 +276,32 @@ class Gemm:
             "SCALE_BLOCK": 32,
             "num_warps": 4,
             "waves_per_eu": 1,
+        },
+        "amd_gemm_pipelined": {
+            "BLOCK_SIZE_M": 128,
+            "BLOCK_SIZE_N": 128,
+            "BLOCK_SIZE_K": 128,
+            "GROUP_SIZE_M": 4,
+            "NUM_STAGES": 2,
+            "kpack": 1,
+            "matrix_instr_nonkdim": 16,
+            "waves_per_eu": 0,
+            "num_warps": 8,
+        },
+        # Register path of the gfx950 standalone addmm. A mid-size 128x128x64
+        # tile is the safe pin for the whole shape list: the kernel masks its K
+        # tail and store, so it is valid down to K=24 and up to M=32768.
+        "amd_standalone_addmm_register": {
+            "BLOCK_M": 128,
+            "BLOCK_N": 128,
+            "BLOCK_K": 64,
+            "GROUP_M": 8,
+            "NUM_XCDS": 1,
+            "matrix_instr_nonkdim": 16,
+            "waves_per_eu": 0,
+            "kpack": 1,
+            "num_warps": 8,
+            "num_stages": 2,
         },
     }
 
@@ -1505,6 +1536,39 @@ def test_amd_fa_cluster_persistent_scheduler_knobs(causal, HEAD_DIM):
     torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
 
 
+@pytest.mark.parametrize(
+    ("B", "Hq", "Hkv", "N_CTX"),
+    [(1, 1, 1, 512),  # MHA
+     (1, 8, 1, 512),  # GQA8
+     ],
+    ids=["mha", "gqa8"],
+)
+@pytest.mark.parametrize("causal", [False, True], ids=["nocausal", "causal"])
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware (CDNA4)")
+def test_amd_fa_bwd_d64(B, Hq, Hkv, N_CTX, causal):
+    torch.manual_seed(42)
+    D = 64
+    q = torch.randn(B, Hq, N_CTX, D, device=DEVICE, dtype=torch.bfloat16).contiguous()
+    k = torch.randn(B, Hkv, N_CTX, D, device=DEVICE, dtype=torch.bfloat16).contiguous()
+    v = torch.randn(B, Hkv, N_CTX, D, device=DEVICE, dtype=torch.bfloat16).contiguous()
+    do = torch.randn_like(q)
+    sm_scale = D**-0.5
+
+    state = torch.ops.aten._scaled_dot_product_flash_attention.default(q, k, v, 0.0, causal, False, scale=sm_scale)
+    o, lse = state[0], state[1]
+    cum_q, cum_k, max_q, max_k, rng, unused = state[2:8]
+    ref_dq, ref_dk, ref_dv = torch.ops.aten._scaled_dot_product_flash_attention_backward.default(
+        do, q, k, v, o, lse, cum_q, cum_k, max_q, max_k, 0.0, causal, rng, unused, scale=sm_scale)
+
+    dq, dk, dv = _amd_fa_backward(q, k, v, o.contiguous(), do, lse.contiguous(), sm_scale, causal)
+
+    for name, actual, expected in (("dq", dq, ref_dq), ("dk", dk, ref_dk), ("dv", dv, ref_dv)):
+        assert torch.isfinite(actual).all(), name
+        rel_l2 = torch.linalg.vector_norm(actual.float() - expected.float()) / torch.linalg.vector_norm(
+            expected.float())
+        assert rel_l2.item() < 5e-3, (name, rel_l2.item())
+
+
 # =============================================================================
 # AMD Paged-Attention Decode Tests (gfx950)
 # =============================================================================
@@ -1697,8 +1761,7 @@ def test_amd_gemm_pingpong(dtype):
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
 @pytest.mark.skipif(not is_hip(), reason="Requires AMD GPU")
 def test_amd_gemm_pipelined(dtype):
-    # Autotuned kernel: no fixed config (config=None).
-    Gemm.run_test(_amd_gemm_pipelined, None, dtype=dtype)
+    Gemm.run_test(_amd_gemm_pipelined, Gemm.CONFIGS["amd_gemm_pipelined"], dtype=dtype)
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
@@ -1823,6 +1886,21 @@ def test_amd_mxfp_gemm_tdm_pipelined(TRANSPOSE_B):
 # =============================================================================
 
 
+# The addmm launcher's default `path=None` times its candidate paths against
+# each other with `do_bench` and keeps the winner. Correctness tests pin the
+# path instead, for two reasons: the timing race costs more wall clock than the
+# assertion it guards, and it admits a candidate only once that candidate
+# already agrees with `register` -- so a wrong `inter_wave` would be dropped
+# from the race and the suite would still pass. Iterating `available_paths`
+# asserts every path a shape can take against torch, independently.
+def _check_addmm_all_paths(bias, a, b, dtype=torch.float16):
+    ref = torch.addmm(bias, a, b)
+    config = Gemm.CONFIGS["amd_standalone_addmm_register"]
+    for path in _amd_addmm_paths(bias, a, b):
+        out = _amd_addmm(bias, a, b, path=path, config=config)
+        torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2, msg=lambda m, path=path: f"path={path}\n{m}")
+
+
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
 @pytest.mark.parametrize("bias_2d,split_k", [(False, 1), (True, 2)], ids=["1d-direct", "2d-split-k"])
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware (CDNA4)")
@@ -1833,10 +1911,14 @@ def test_amd_standalone_addmm(dtype, bias_2d, split_k):
     b = ((torch.randn(N, K, device=DEVICE, dtype=dtype) + 1) / K).T
     bias_shape = (1, N) if bias_2d else (N, )
     bias = torch.randn(bias_shape, device=DEVICE, dtype=dtype)
-
-    out = _amd_addmm(bias, a, b, SPLIT_K=split_k)
     ref = torch.addmm(bias, a, b)
-    torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
+
+    if split_k > 1:
+        # SPLIT_K > 1 is inter-wave only, and the launcher routes it directly.
+        out = _amd_addmm(bias, a, b, SPLIT_K=split_k)
+        torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
+    else:
+        _check_addmm_all_paths(bias, a, b, dtype=dtype)
 
 
 @pytest.mark.parametrize(
@@ -1858,9 +1940,7 @@ def test_amd_standalone_addmm_stock_triton_shapes(M, N, K):
     b = ((torch.randn(N, K, device=DEVICE, dtype=torch.float16) + 1) / K).T
     bias = torch.randn(N, device=DEVICE, dtype=torch.float16)
 
-    out = _amd_addmm(bias, a, b)
-    ref = torch.addmm(bias, a, b)
-    torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
+    _check_addmm_all_paths(bias, a, b)
 
 
 # =============================================================================
@@ -1901,6 +1981,19 @@ def test_amd_addmm_glu(kernel_name, K):
 # relative L2 rather than elementwise max-rel: the reference has near-zero
 # elements (max_rel reaches 5e3 on them) which make elementwise ratios useless.
 
+# Pinned instead of sweeping the shipped 15-config space once per distinct
+# (H, MAX_M, DFF, QK_SCALE). BLOCK_M=128 is the smallest shipped m-tile, so it
+# covers the short-Q cases (max_M=64, 137) without wasting ragged-tail rows.
+GDPA_CONFIG = {
+    "BLOCK_M": 128,
+    "BLOCK_N": 64,
+    "NUM_BUFFERS": 2,
+    "matrix_instr_nonkdim": 16,
+    "waves_per_eu": 0,
+    "num_stages": 1,
+    "num_warps": 4,
+}
+
 
 @pytest.mark.parametrize(
     "B,max_M,H,dff,sparsity,seq_len_mode",
@@ -1922,7 +2015,7 @@ def test_amd_gfx950_gdpa(B, max_M, H, dff, sparsity, seq_len_mode):
     q, k, v, q_offsets = data["q"], data["k"], data["v"], data["q_offsets"]
 
     ref = _gfx950_gdpa_ref(q, k, v, q_offsets, dff, qk_scale=1.0)
-    out = _gfx950_gdpa(q, k, v, q_offsets, dff, qk_scale=1.0)
+    out = _gfx950_gdpa(q, k, v, q_offsets, dff, qk_scale=1.0, config=GDPA_CONFIG)
 
     assert out.shape == q.shape and out.dtype == q.dtype
     diff = (out.float() - ref.float()).abs()
@@ -1977,6 +2070,13 @@ def test_multi_cta_layer_norm_2d(num_ctas):
 # IKBO (In-Kernel Broadcast Optimization) Tests
 # =============================================================================
 
+# IKBO is the one tutorial pair that supports both backends explicitly
+# (`ikbo_fa_triton` carries separate `_amd_configs` / `_nvidia_configs` and
+# flips ALLOW_TF32 on `_is_hip`), so it is gated on "a GPU this kernel targets"
+# rather than on gfx950 alone -- a CDNA4-only gate would drop the NVIDIA
+# coverage the module is written for.
+_ikbo_supported = is_hip_cdna4() or is_hopper_or_newer()
+
 
 class IkboLce:
     """Common utilities for IKBO LCE tests."""
@@ -1986,6 +2086,11 @@ class IkboLce:
         (512, 128, 256, 1024, 1024, 70),
         (1024, 433, 256, 1184, 872, 100),
     ]
+
+    # Correctness pins the smallest tile rather than sweeping the 48-config
+    # space (2x2x2 tiles x 3 stages x 2 warp counts, and no early_config_prune)
+    # once per shape. 64x64x64 is valid for every shape: the K loop is masked.
+    CONFIG = {"BM": 64, "BN": 64, "BK": 64, "GROUP_SIZE_M": 8, "num_stages": 3, "num_warps": 4}
 
     ERROR_MULTIPLIER = 1.0
     ERROR_FLOOR = 1e-4
@@ -2008,12 +2113,22 @@ class IkboFa:
         (1024, 64, 2, 128, 1024, 64),
     ]
 
+    # Smallest tile on either backend; num_warps differs because the AMD and
+    # NVIDIA config lists do.
+    CONFIG = {
+        "BLOCK_M": 32,
+        "BLOCK_N": 32,
+        "num_stages": 2,
+        "num_warps": 2 if is_hip() else 4,
+    }
+
 
 @pytest.mark.parametrize(
     "B, M, N, K_USER, K_CAND, ratio",
     IkboLce.SHAPES,
     ids=[f"B{s[0]}_M{s[1]}" for s in IkboLce.SHAPES],
 )
+@pytest.mark.skipif(not _ikbo_supported, reason="Requires gfx950 (CDNA4) or Hopper+ GPU")
 def test_ikbo_lce(B, M, N, K_USER, K_CAND, ratio):
     torch.manual_seed(0)
     cw_c, cw_u, e_c, e_u, idx = _ikbo_lce_create_inputs(
@@ -2033,7 +2148,7 @@ def test_ikbo_lce(B, M, N, K_USER, K_CAND, ratio):
         idx,
     )
     ref_fp16 = _ikbo_lce_reference(cw_c, cw_u, e_c, e_u, idx)
-    out = _ikbo_lce(cw_c, cw_u, e_c, e_u, idx)
+    out = _ikbo_lce(cw_c, cw_u, e_c, e_u, idx, config=IkboLce.CONFIG)
     IkboLce.check_vs_fp32(out, ref_fp16, ref_fp32)
 
 
@@ -2042,6 +2157,7 @@ def test_ikbo_lce(B, M, N, K_USER, K_CAND, ratio):
     IkboFa.SHAPES,
     ids=[f"B{s[0]}_h{s[2]}_d{s[3]}" for s in IkboFa.SHAPES],
 )
+@pytest.mark.skipif(not _ikbo_supported, reason="Requires gfx950 (CDNA4) or Hopper+ GPU")
 def test_ikbo_fa(B, n_seed, num_heads, d_head, max_seq_len, ratio):
     random.seed(0)
     torch.manual_seed(0)
@@ -2074,5 +2190,6 @@ def test_ikbo_fa(B, n_seed, num_heads, d_head, max_seq_len, ratio):
         num_heads,
         d_head,
         max_seq_len,
+        config=IkboFa.CONFIG,
     )
     torch.testing.assert_close(tri_out, ref_out, atol=1e-2, rtol=0)

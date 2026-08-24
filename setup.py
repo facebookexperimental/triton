@@ -419,7 +419,7 @@ class CMakeBuild(build_ext):
         subprocess.check_call(["cmake", "--build", ".", "--target", "mlir-doc"], cwd=cmake_dir)
 
 
-backends = [*BackendInstaller.copy(["nvidia", "amd"]), *BackendInstaller.copy_externals()]
+backends = [*BackendInstaller.copy(["nvidia", "amd", "cpu"]), *BackendInstaller.copy_externals()]
 
 
 def get_package_dirs():

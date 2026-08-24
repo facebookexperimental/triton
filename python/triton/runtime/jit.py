@@ -514,6 +514,7 @@ class KernelInterface(Generic[T]):
         # hook — so those still fire (mirrors the run() c_cache fast-path guard).
         if native_create_jit_proxy is not None and getattr(self, 'c_cache', False) \
                 and knobs.nvidia.use_triton_dispatcher \
+                and getattr(driver.active, "is_cpu_backend", False) is not True \
                 and not self.used_global_vals \
                 and not self.pre_run_hooks and not self.launch_metadata \
                 and not knobs.runtime.launch_enter_hook and not knobs.runtime.launch_exit_hook \
@@ -802,6 +803,12 @@ def convert_to_tuple_if_list(item):
     return tuple(item)
 
 
+def get_device_key(device, is_cpu_backend):
+    # Preserve the existing GPU cache shape (and its public test/debugging
+    # surface) while keeping CPU device 0 distinct from GPU device 0.
+    return f"cpu:{device}" if is_cpu_backend else device
+
+
 class _DeviceCaches(defaultdict):
     """defaultdict of per-device compiled-kernel caches that also invalidates the
     C fast caches (JITCacheProxy cache + native FastCache) when cleared.
@@ -966,7 +973,10 @@ class JITFunction(JITCallable, KernelInterface[T]):
         # Single C function call does: key computation + cache lookup + dispatcher launch.
         # Guards: no warmup, no hooks, no kwargs, no globals, all args positional, tuple grid.
         device = driver.active.get_current_device()
+        is_cpu_backend = getattr(driver.active, "is_cpu_backend", False) is True
+        device_key = get_device_key(device, is_cpu_backend)
         stream = driver.active.get_current_stream(device)
+        use_native_cache = self.c_cache and not is_cpu_backend
 
         # --- C FAST PATH (opt-in via @triton.jit(c_cache=True)) ---
         # NOTE: This assumes knobs.runtime.debug and instrumentation_mode do not
@@ -976,7 +986,7 @@ class JITFunction(JITCallable, KernelInterface[T]):
         # NOTE: This block is only reached when JITCacheProxy cannot be used
         # (callable grid, first call, or C extension unavailable).
         # Static-grid repeat calls go through JITCacheProxy directly.
-        if not _skip_fc and self.c_cache and not warmup \
+        if not _skip_fc and use_native_cache and not warmup \
                 and not self.pre_run_hooks and not knobs.compilation.always_compile \
                 and not self.used_global_vals \
                 and knobs.runtime.add_stages_inspection_hook is None \
@@ -1050,7 +1060,7 @@ class JITFunction(JITCallable, KernelInterface[T]):
                         elif _CACHE_STATS_ON:
                             _cache_stats_record(self._fn_name, "run_fast_hit_c")
                         return kernel
-        elif not _skip_fc and self.c_cache and not warmup:
+        elif not _skip_fc and use_native_cache and not warmup:
             reasons = []
             if self.pre_run_hooks:
                 reasons.append("pre_run_hooks active")
@@ -1094,7 +1104,7 @@ class JITFunction(JITCallable, KernelInterface[T]):
         for hook in self.pre_run_hooks:
             hook(*args, **kwargs)
 
-        kernel_cache, kernel_key_cache, target, backend, binder = self.device_caches[device]
+        kernel_cache, kernel_key_cache, target, backend, binder = self.device_caches[device_key]
         # specialization is list[tuple[str, Any]], where first element of tuple is
         # the type and the second parameter is the 'specialization' value.
         bound_args, specialization, options = binder(*args, **kwargs)
@@ -1121,7 +1131,7 @@ class JITFunction(JITCallable, KernelInterface[T]):
                 except Exception:
                     pass
 
-            kernel = self._do_compile(key, signature, device, constexprs, options, attrs, warmup)
+            kernel = self._do_compile(key, signature, device, device_key, constexprs, options, attrs, warmup)
             if kernel is None:
                 return None
             # compile_iq: dump a collection task for the offline ACF factory.
@@ -1136,7 +1146,7 @@ class JITFunction(JITCallable, KernelInterface[T]):
                                  constexprs=constexprs, grid=tuple(list(_cg) + [1, 1, 1])[:3])
                 except Exception:
                     pass
-            _fc_needs_insert = self.c_cache
+            _fc_needs_insert = use_native_cache
         else:
             _fc_needs_insert = False
 
@@ -1193,7 +1203,7 @@ class JITFunction(JITCallable, KernelInterface[T]):
             else:
                 if _CACHE_STATS_ON:
                     _cache_stats_record(self._fn_name, "run_slow_py_fallback")
-                if knobs.nvidia.use_triton_dispatcher and _disp is None:
+                if knobs.nvidia.use_triton_dispatcher and _disp is None and not is_cpu_backend:
                     warnings.warn(
                         f"[Triton] TRITON_USE_C_DISPATCHER=1 but kernel '{self._fn_name}' has no C dispatcher, "
                         f"falling back to Python launch",
@@ -1291,13 +1301,15 @@ class JITFunction(JITCallable, KernelInterface[T]):
         import json
         import triton.language as tl
         device = driver.active.get_current_device()
+        is_cpu_backend = getattr(driver.active, "is_cpu_backend", False) is True
+        device_key = get_device_key(device, is_cpu_backend)
         deserialized_obj = json.loads(specialization_data)
         if deserialized_obj['name'] != self._fn_name:
             raise RuntimeError(
                 f"Specialization data is for {deserialized_obj['name']} but trying to preload for {self._fn_name}")
         constant_keys = map(tuple, deserialized_obj['constant_keys'])
         constant_vals = deserialized_obj['constant_vals']
-        _, _, target, backend, _ = self.device_caches[device]
+        _, _, target, backend, _ = self.device_caches[device_key]
         deserialized_target = deserialized_obj['target']
         # TODO: we could support loading a kernel signature serialized on a different target however
         # currently options are target specific so we would need to change that.
@@ -1334,14 +1346,15 @@ class JITFunction(JITCallable, KernelInterface[T]):
             key,
             signature,
             device,
+            device_key,
             constexprs,
             options,
             attrs,
             warmup=True,
         )
 
-    def _do_compile(self, key, signature, device, constexprs, options, attrs, warmup):
-        kernel_cache, _, target, backend, _ = self.device_caches[device]
+    def _do_compile(self, key, signature, device, device_key, constexprs, options, attrs, warmup):
+        kernel_cache, _, target, backend, _ = self.device_caches[device_key]
 
         if self._call_hook(knobs.runtime.jit_cache_hook, key, signature, target, device, constexprs, options, [attrs],
                            warmup):

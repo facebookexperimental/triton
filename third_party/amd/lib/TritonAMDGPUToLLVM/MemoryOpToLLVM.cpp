@@ -745,7 +745,7 @@ packMfmaDotOperandFragments(Value value, RankedTensorType tensorTy,
           ? dyn_cast<triton::gpu::AMDMfmaEncodingAttr>(dotEncoding.getParent())
           : triton::gpu::AMDMfmaEncodingAttr();
   if (!mfmaEncoding || dotEncoding.getOpIdx() != opIdx ||
-      dotEncoding.getKWidth() != 8)
+      !llvm::is_contained({4u, 8u}, dotEncoding.getKWidth()))
     return failure();
 
   SmallVector<int64_t> rep = mfmaEncoding.getRepForOperand(
@@ -1020,6 +1020,74 @@ public:
       for (unsigned index = 0; index < elementsPerGroup; ++index)
         constrainedElements.push_back(
             b.extract_element(elemTy, restored, b.i32_val(index)));
+    }
+
+    Value result = packTensorElements(loc, typeConverter, constrainedElements,
+                                      rewriter, op.getResult().getType());
+    rewriter.replaceOp(op, result);
+    return success();
+  }
+};
+
+class RegisterHandoffOpConversion
+    : public ConvertOpToLLVMPattern<triton::amdgpu::RegisterHandoffOp> {
+public:
+  using ConvertOpToLLVMPattern<
+      triton::amdgpu::RegisterHandoffOp>::ConvertOpToLLVMPattern;
+  using OpAdaptor = triton::amdgpu::RegisterHandoffOp::Adaptor;
+
+  LogicalResult
+  matchAndRewrite(triton::amdgpu::RegisterHandoffOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    auto *ctx = rewriter.getContext();
+    auto typeConverter = getTypeConverter();
+    auto tensorTy = cast<RankedTensorType>(op.getInput().getType());
+    Type elemTy = typeConverter->convertType(tensorTy.getElementType());
+    unsigned bitWidth = getIntOrFloatOrPtrBitWidth(elemTy);
+    unsigned elementsPerRegister = 32 / bitWidth;
+    SmallVector<Value> elements =
+        unpackTensorElements(loc, adaptor.getInput(), rewriter, tensorTy);
+    if (elements.empty() || elements.size() % elementsPerRegister != 0)
+      return rewriter.notifyMatchFailure(
+          op, "native register does not divide the per-thread elements");
+
+    StringRef outputConstraint = op.getRegisterClass() == "agpr" ? "=a" : "=v";
+    std::string constraints = outputConstraint.str() + ",0";
+    auto asmDialect = LLVM::AsmDialectAttr::get(ctx, LLVM::AsmDialect::AD_ATT);
+    auto operandAttrs = ArrayAttr::get(ctx, {});
+    Type registerTy = elementsPerRegister == 1
+                          ? elemTy
+                          : Type(vec_ty(elemTy, elementsPerRegister));
+    TritonLLVMOpBuilder b(loc, rewriter);
+    SmallVector<Value> constrainedElements;
+    constrainedElements.reserve(elements.size());
+
+    for (unsigned begin = 0; begin < elements.size();
+         begin += elementsPerRegister) {
+      Value registerValue = elements[begin];
+      if (elementsPerRegister != 1) {
+        registerValue = b.undef(registerTy);
+        for (unsigned index = 0; index < elementsPerRegister; ++index)
+          registerValue =
+              b.insert_element(registerTy, registerValue,
+                               elements[begin + index], b.i32_val(index));
+      }
+
+      Value asmResult = LLVM::InlineAsmOp::create(
+                            rewriter, loc, registerTy, registerValue,
+                            /*asm_string=*/"", constraints,
+                            /*has_side_effects=*/true,
+                            /*is_align_stack=*/false, LLVM::TailCallKind::None,
+                            asmDialect, operandAttrs)
+                            .getRes();
+      if (elementsPerRegister == 1) {
+        constrainedElements.push_back(asmResult);
+        continue;
+      }
+      for (unsigned index = 0; index < elementsPerRegister; ++index)
+        constrainedElements.push_back(
+            b.extract_element(elemTy, asmResult, b.i32_val(index)));
     }
 
     Value result = packTensorElements(loc, typeConverter, constrainedElements,
@@ -1309,16 +1377,19 @@ public:
                          : ROCDL::mfma_f32_16x16x32_bf16::getOperationName());
     bool useLatencyAwareIntrinsic = op.getAccumulatorRole() == "transient";
 
-    SmallVector<Value> updatedFragments(numRepM * numRepN);
+    SmallVector<Value> updatedFragments = accumulatorFragments;
     // Keep one SSA chain per output fragment while making source order
-    // explicit across the grid. Native intrinsics expose transient chains to
-    // AMDGPU's MFMA hazard recognizer and machine scheduler. Direct inline
-    // assembly preserves the requested register class for persistent chains.
-    for (int64_t n = 0; n < numRepN; ++n) {
-      for (int64_t m = 0; m < numRepM; ++m) {
-        int64_t accumulatorIndex = m * numRepN + n;
-        Value current = accumulatorFragments[accumulatorIndex];
-        for (int64_t k = 0; k < numRepK; ++k) {
+    // explicit across the grid. Round-robin the K slices over independent
+    // output fragments so persistent inline-assembly chains expose enough
+    // distance between dependent MFMAs. Native intrinsics expose transient
+    // chains to AMDGPU's MFMA hazard recognizer and machine scheduler. Direct
+    // inline assembly preserves the requested register class for persistent
+    // chains.
+    for (int64_t k = 0; k < numRepK; ++k) {
+      for (int64_t n = 0; n < numRepN; ++n) {
+        for (int64_t m = 0; m < numRepM; ++m) {
+          int64_t accumulatorIndex = m * numRepN + n;
+          Value current = updatedFragments[accumulatorIndex];
           Value operandA = (*maybeA)[m * numRepK + k];
           Value operandB = (*maybeB)[n * numRepK + k];
           // The MFMA inline asm below already constrains ordinary operands to
@@ -1354,53 +1425,59 @@ public:
             loweredOp.addAttribute("abid", rewriter.getI32IntegerAttr(0));
             loweredOp.addAttribute("blgp", rewriter.getI32IntegerAttr(0));
             current = rewriter.create(loweredOp)->getResult(0);
-            continue;
+          } else {
+            std::string constraints = outputConstraint.str();
+            constraints += "," + inputConstraint(aRegisterClass).str();
+            constraints += "," + inputConstraint(bRegisterClass).str();
+            SmallVector<Value> asmOperands{operandA, operandB};
+            if (!zeroThisInstruction) {
+              asmOperands.push_back(current);
+              constraints += ",0";
+            }
+            // The hazard recognizer cannot see this MFMA (it lives inside an
+            // `asm sideeffect` block), so it will not pad a preceding VALU
+            // write of srcA/srcB or of EXEC. Per LLVM's checkMAIHazards90A
+            // that needs `LegacyVALUNotDotWritesVGPRWaitStates` (2) and
+            // `VALUWritesExecWaitStates` (4) respectively; 4 covers both. An
+            // exact same-register srcC forward from the previous MFMA in the
+            // chain is explicitly not a hazard, so this does not serialize
+            // the accumulation chain.
+            std::string mfmaAsm =
+                mfmaWaitStateAsm(/*waitStates=*/4) + "\n" + mfmaAsmPrefix;
+            mfmaAsm += zeroThisInstruction ? "0" : "$0";
+            auto inlineAsm = LLVM::InlineAsmOp::create(
+                rewriter, loc, fragmentTy, asmOperands, mfmaAsm, constraints,
+                /*has_side_effects=*/true,
+                /*is_align_stack=*/false, LLVM::TailCallKind::None, asmDialect,
+                operandAttrs);
+            current = inlineAsm->getResult(0);
           }
-
-          std::string constraints = outputConstraint.str();
-          constraints += "," + inputConstraint(aRegisterClass).str();
-          constraints += "," + inputConstraint(bRegisterClass).str();
-          SmallVector<Value> asmOperands{operandA, operandB};
-          if (!zeroThisInstruction) {
-            asmOperands.push_back(current);
-            constraints += ",0";
-          }
-          // The hazard recognizer cannot see this MFMA (it lives inside an
-          // `asm sideeffect` block), so it will not pad a preceding VALU write
-          // of srcA/srcB or of EXEC. Per LLVM's checkMAIHazards90A that needs
-          // `LegacyVALUNotDotWritesVGPRWaitStates` (2) and
-          // `VALUWritesExecWaitStates` (4) respectively; 4 covers both. An
-          // exact same-register srcC forward from the previous MFMA in the
-          // chain is explicitly not a hazard, so this does not serialize the
-          // accumulation chain.
-          std::string mfmaAsm =
-              mfmaWaitStateAsm(/*waitStates=*/4) + "\n" + mfmaAsmPrefix;
-          mfmaAsm += zeroThisInstruction ? "0" : "$0";
-          auto inlineAsm = LLVM::InlineAsmOp::create(
-              rewriter, loc, fragmentTy, asmOperands, mfmaAsm, constraints,
-              /*has_side_effects=*/true,
-              /*is_align_stack=*/false, LLVM::TailCallKind::None, asmDialect,
-              operandAttrs);
-          current = inlineAsm->getResult(0);
+          updatedFragments[accumulatorIndex] = current;
         }
-        if (!useLatencyAwareIntrinsic) {
-          // The consumer is unknown at this point, so use the largest
-          // requirement LLVM models for reading an MFMA destination on gfx950:
-          // `GFX940_XDL_N_PassWritesVGPROverlappedSrcABWaitStates` is
-          // `NumPasses + 3 + 1` = 20 for a 16-pass MFMA, which exceeds both
-          // `MFMA32x32WritesAGPRAccVgprReadWaitStates` (18) and the function's
-          // own `MaxWaitStates` (19). Sizing the drain for the worst consumer
-          // keeps it sufficient on its own, rather than relying on the next
-          // MFMA's input padding to make up a shortfall.
+      }
+    }
+
+    if (!useLatencyAwareIntrinsic) {
+      // The consumer is unknown at this point, so use the largest requirement
+      // LLVM models for reading an MFMA destination on gfx950:
+      // `GFX940_XDL_N_PassWritesVGPROverlappedSrcABWaitStates` is
+      // `NumPasses + 3 + 1` = 20 for a 16-pass MFMA, which exceeds both
+      // `MFMA32x32WritesAGPRAccVgprReadWaitStates` (18) and the function's own
+      // `MaxWaitStates` (19). Sizing the drain for the worst consumer keeps it
+      // sufficient on its own, rather than relying on the next MFMA's input
+      // padding to make up a shortfall.
+      for (int64_t n = 0; n < numRepN; ++n) {
+        for (int64_t m = 0; m < numRepM; ++m) {
+          int64_t accumulatorIndex = m * numRepN + n;
           FailureOr<Value> drained = drainMfmaPipeline(
-              current, accumulatorStorage, /*waitStates=*/20, rewriter, loc);
+              updatedFragments[accumulatorIndex], accumulatorStorage,
+              /*waitStates=*/20, rewriter, loc);
           if (failed(drained))
             return rewriter.notifyMatchFailure(
                 op, "MFMA accumulator fragment must pack into complete 32-bit "
                     "registers");
-          current = *drained;
+          updatedFragments[accumulatorIndex] = *drained;
         }
-        updatedFragments[accumulatorIndex] = current;
       }
     }
 
@@ -1612,7 +1689,8 @@ void mlir::triton::AMD::populateMemoryOpToLLVMPatterns(
                                                   benefit.getBenefit() + 1);
   patterns.add<RematerializedRangeOpConversion>(typeConverter, targetInfo,
                                                 transBenefit);
-  patterns.add<RegisterResidentOpConversion>(typeConverter, transBenefit);
+  patterns.add<RegisterResidentOpConversion, RegisterHandoffOpConversion>(
+      typeConverter, transBenefit);
   patterns.add<MfmaCommitOpConversion, ScheduledMfmaOpConversion>(
       typeConverter, targetInfo, transBenefit);
   patterns.add<BarrierOpConversion, MemoryCounterWaitOpConversion>(

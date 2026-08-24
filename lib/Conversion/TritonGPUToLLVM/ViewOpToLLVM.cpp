@@ -604,6 +604,33 @@ struct MemDescSubsliceOpConversion
   }
 };
 
+struct MemDescDynamicSubsliceOpConversion
+    : public ConvertOpToLLVMPattern<triton::gpu::MemDescDynamicSubsliceOp> {
+  using ConvertOpToLLVMPattern<
+      triton::gpu::MemDescDynamicSubsliceOp>::ConvertOpToLLVMPattern;
+
+  LogicalResult
+  matchAndRewrite(triton::gpu::MemDescDynamicSubsliceOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Location loc = op->getLoc();
+    auto b = TritonLLVMOpBuilder(loc, rewriter);
+    auto srcTy = op.getSrc().getType();
+    auto llvmElemTy = getTypeConverter()->convertType(srcTy.getElementType());
+    auto smemObj = getSharedMemoryObjectFromStruct(loc, adaptor.getSrc(),
+                                                   llvmElemTy, rewriter);
+
+    SmallVector<Value> offsetVals;
+    for (auto [oldOffset, dynamicOffset] :
+         llvm::zip_equal(smemObj.getOffsets(), adaptor.getOffsets()))
+      offsetVals.push_back(b.add(oldOffset, dynamicOffset));
+
+    SharedMemoryObject resultObj(smemObj.getBases(), llvmElemTy, offsetVals);
+    rewriter.replaceOp(
+        op, getStructFromSharedMemoryObject(loc, resultObj, rewriter));
+    return success();
+  }
+};
+
 struct MemDescReinterpretOpConversion
     : public ConvertOpToLLVMPattern<MemDescReinterpretOp> {
   using ConvertOpToLLVMPattern::ConvertOpToLLVMPattern;
@@ -649,7 +676,7 @@ void mlir::triton::populateViewOpToLLVMPatterns(
       typeConverter, benefit);
   patterns.add<TransOpConversion>(typeConverter, benefit);
   patterns.add<BroadcastOpConversion>(typeConverter, benefit);
-  patterns.add<MemDescSubsliceOpConversion, MemDescIndexOpConversion>(
-      typeConverter, benefit);
+  patterns.add<MemDescSubsliceOpConversion, MemDescDynamicSubsliceOpConversion,
+               MemDescIndexOpConversion>(typeConverter, benefit);
   patterns.add<MemDescReinterpretOpConversion>(typeConverter, benefit);
 }

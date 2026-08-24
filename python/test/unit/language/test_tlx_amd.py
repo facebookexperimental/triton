@@ -7,6 +7,7 @@ an explicit GPUTarget and verify the generated TTGIR/AMDGCN. No AMD hardware is
 required for the compilation checks. Correctness checks (actual execution) run
 only when the corresponding hardware is available.
 """
+import dataclasses
 import importlib.util
 import re
 import sys
@@ -125,6 +126,277 @@ def compile_for_target(fn, signature, constexprs, target):
 def compile_for_gfx950(fn, signature, constexprs):
     """Compile a TLX kernel for gfx950 and return the compiled object."""
     return compile_for_target(fn, signature, constexprs, GFX950)
+
+
+@pytest.mark.parametrize(
+    ("sq", "skv", "supported"),
+    [
+        pytest.param(8_388_544, 16_777_152, True, id="largest-aligned-safe"),
+        pytest.param(8_388_608, 16_777_152, False, id="fp32-dq-span-overflow"),
+        pytest.param(8_388_544, 16_777_216, False, id="bf16-kv-span-overflow"),
+    ],
+)
+def test_d64_buffer_span_boundaries_guard_dispatch(sq, skv, supported):
+    from triton.language.extra.tlx.tutorials import amd_fa_bwd
+
+    assert amd_fa_bwd._AMD_BUFFER_MAX_ADDRESSABLE_BYTES == (1 << 31) - 1
+    assert amd_fa_bwd._D64_MAX_QUERY_SEQUENCE == 8_388_544
+    assert amd_fa_bwd._D64_MAX_KV_SEQUENCE == 16_777_152
+    assert amd_fa_bwd._D64_MAX_QUERY_SEQUENCE * 64 * torch.float32.itemsize <= (1 << 31) - 1
+    assert (amd_fa_bwd._D64_MAX_QUERY_SEQUENCE + 64) * 64 * torch.float32.itemsize > (1 << 31) - 1
+    assert amd_fa_bwd._D64_MAX_KV_SEQUENCE * 64 * torch.bfloat16.itemsize <= (1 << 31) - 1
+    assert (amd_fa_bwd._D64_MAX_KV_SEQUENCE + 64) * 64 * torch.bfloat16.itemsize > (1 << 31) - 1
+
+    q_shape = (1, 8, sq, 64)
+    k_shape = (1, 1, skv, 64)
+    assert amd_fa_bwd._is_supported_d64_shape(q_shape, k_shape) is supported
+    if supported:
+        dispatch = amd_fa_bwd._select_d64_dispatch(q_shape, k_shape, False)
+        assert dispatch.family == "noncausal_direct_n256"
+    else:
+        with pytest.raises(ValueError, match="unsupported D64 dispatch shapes"):
+            amd_fa_bwd._select_d64_dispatch(q_shape, k_shape, False)
+
+
+@pytest.mark.parametrize(
+    ("q_shape", "k_shape", "causal", "dispatch_kwargs", "message"),
+    [
+        pytest.param(
+            (1, 1, 256, 128),
+            (1, 1, 256, 128),
+            False,
+            {
+                "family": "noncausal_direct_n256",
+                "owner_rows": 32,
+                "key_rows": 256,
+                "kv_splits": 1,
+            },
+            "unsupported D64 dispatch shapes",
+            id="shape",
+        ),
+        pytest.param(
+            (1, 1, 4096, 64),
+            (1, 1, 4096, 64),
+            True,
+            {
+                "family": "noncausal_direct_n256",
+                "owner_rows": 32,
+                "key_rows": 256,
+                "kv_splits": 1,
+            },
+            "requires noncausal attention",
+            id="causal-family",
+        ),
+        pytest.param(
+            (1, 8, 4096, 64),
+            (1, 1, 4096, 64),
+            True,
+            {
+                "family": "causal_scheduled_gqa8",
+                "owner_rows": 256,
+                "key_rows": 128,
+                "kv_splits": 1,
+                "selected_causal": True,
+                "stat_mode": 1,
+                "dq_logical_n": 32,
+            },
+            "kv_splits",
+            id="gqa-splits",
+        ),
+        pytest.param(
+            (1, 1, 4096, 64),
+            (1, 1, 4096, 64),
+            True,
+            {
+                "family": "causal_scheduled_mha",
+                "owner_rows": 192,
+                "key_rows": 64,
+                "kv_splits": 1,
+                "selected_causal": True,
+                "stat_mode": 1,
+                "dq_logical_n": 32,
+            },
+            "stat_mode",
+            id="mha-stat-mode",
+        ),
+        pytest.param(
+            (1, 1, 4096, 64),
+            (1, 1, 4096, 64),
+            False,
+            {
+                "family": "unknown",
+                "owner_rows": 32,
+                "key_rows": 256,
+                "kv_splits": 1,
+            },
+            "unknown D64 dispatch family",
+            id="unknown-family",
+        ),
+    ],
+)
+def test_d64_dispatch_validation_rejects_invalid_contracts(q_shape, k_shape, causal, dispatch_kwargs, message):
+    from triton.language.extra.tlx.tutorials import amd_fa_bwd
+
+    assert hasattr(amd_fa_bwd,
+                   "_validate_d64_dispatch"), ("D64 dispatch validation must not depend on removable Python asserts")
+    dispatch = amd_fa_bwd._D64Dispatch(**dispatch_kwargs)
+
+    with pytest.raises(ValueError, match=message):
+        amd_fa_bwd._validate_d64_dispatch(q_shape, k_shape, causal, dispatch)
+
+
+def test_d64_dispatch_validation_rejects_incomplete_dq_launch_plan():
+    from triton.language.extra.tlx.tutorials import amd_fa_bwd
+
+    q_shape = (4, 48, 4096, 64)
+    k_shape = (4, 6, 4096, 64)
+    dispatch = amd_fa_bwd._select_d64_dispatch(
+        q_shape,
+        k_shape,
+        True,
+        arch="gfx950:sramecc+:xnack-",
+        cu_count=256,
+        sm_scale=0.125,
+        bases_aligned_16=True,
+    )
+    malformed = dataclasses.replace(
+        dispatch,
+        dq_launches=(amd_fa_bwd._D64DQLaunch(1, False, 0, 0, 3, 0), ),
+    )
+
+    with pytest.raises(ValueError, match="dq_launches must match"):
+        amd_fa_bwd._validate_d64_dispatch(q_shape, k_shape, True, malformed)
+
+
+@pytest.mark.parametrize(
+    ("q_shape", "k_shape", "changes", "message"),
+    [
+        pytest.param(
+            (1, 25, 4096, 64),
+            (1, 25, 4096, 64),
+            {"dq_use_xcd": True},
+            "dq_use_xcd",
+            id="dq-xcd",
+        ),
+        pytest.param(
+            (4, 40, 4096, 64),
+            (4, 5, 4096, 64),
+            {"gqa_grid_mode": "xcd"},
+            "GQA XCD grid requires",
+            id="gqa-xcd-grid",
+        ),
+        pytest.param(
+            (4, 48, 1024, 64),
+            (4, 6, 2048, 64),
+            {"dkdv_lifetime": "independent_d32"},
+            "dkdv_lifetime",
+            id="gqa-lifetime",
+        ),
+        pytest.param(
+            (4, 48, 4096, 64),
+            (4, 6, 4096, 64),
+            {"cyclic_query_split": True},
+            "cyclic_query_split",
+            id="gqa-cyclic",
+        ),
+    ],
+)
+def test_d64_dispatch_validation_rejects_incompatible_selected_modes(q_shape, k_shape, changes, message):
+    from triton.language.extra.tlx.tutorials import amd_fa_bwd
+
+    dispatch = amd_fa_bwd._select_d64_dispatch(
+        q_shape,
+        k_shape,
+        True,
+        arch="gfx950:sramecc+:xnack-",
+        cu_count=256,
+        sm_scale=0.125,
+        bases_aligned_16=True,
+    )
+    assert dispatch.selected_causal
+    malformed = dataclasses.replace(dispatch, **changes)
+
+    with pytest.raises(ValueError, match=message):
+        amd_fa_bwd._validate_d64_dispatch(q_shape, k_shape, True, malformed)
+
+
+@pytest.mark.parametrize(
+    ("q_shape", "k_shape", "causal", "family"),
+    [
+        pytest.param(
+            (2, 32, 16384, 64),
+            (2, 32, 16384, 64),
+            False,
+            "noncausal_fused_n256",
+            id="mha-square-16k-noncausal",
+        ),
+        pytest.param(
+            (2, 32, 16384, 64),
+            (2, 32, 16384, 64),
+            True,
+            "causal_scheduled_mha",
+            id="mha-square-16k-causal",
+        ),
+        pytest.param(
+            (2, 32, 16384, 64),
+            (2, 4, 16384, 64),
+            False,
+            "noncausal_fused_n256",
+            id="gqa8-square-16k-noncausal",
+        ),
+        pytest.param(
+            (2, 32, 16384, 64),
+            (2, 4, 16384, 64),
+            True,
+            "causal_scheduled_gqa8",
+            id="gqa8-square-16k-causal",
+        ),
+        pytest.param(
+            (4, 48, 4096, 64),
+            (4, 6, 4096, 64),
+            True,
+            "causal_scheduled_gqa8",
+            id="gqa8-square-4k-causal",
+        ),
+        pytest.param(
+            (4, 48, 4096, 64),
+            (4, 6, 16384, 64),
+            True,
+            "causal_scheduled_gqa8",
+            id="gqa8-rect-4k-16k-causal",
+        ),
+        pytest.param(
+            (4, 48, 4096, 64),
+            (4, 6, 8192, 64),
+            True,
+            "causal_scheduled_gqa8",
+            id="gqa8-rect-4k-8k-causal",
+        ),
+        pytest.param(
+            (4, 48, 4096, 64),
+            (4, 6, 12288, 64),
+            True,
+            "causal_scheduled_gqa8",
+            id="gqa8-rect-4k-12k-causal",
+        ),
+    ],
+)
+def test_d64_dispatch_contract_is_ci_discovered(q_shape, k_shape, causal, family):
+    from triton.language.extra.tlx.tutorials import amd_fa_bwd
+
+    dispatch = amd_fa_bwd._select_d64_dispatch(
+        q_shape,
+        k_shape,
+        causal,
+        arch="gfx950:sramecc+:xnack-",
+        cu_count=256,
+        sm_scale=0.125,
+        bases_aligned_16=True,
+    )
+
+    assert dispatch.family == family
+    assert dispatch.selected_causal is causal
+    amd_fa_bwd._validate_d64_dispatch(q_shape, k_shape, causal, dispatch)
 
 
 @triton.jit
@@ -811,15 +1083,141 @@ def test_amd_late_address_compute_compiles_gfx950():
 
 
 @triton.jit
-def _amd_scheduled_mfma_kernel(a_ptr, b_ptr, output_ptr):
+def _amd_register_handoff_kernel(x_ptr, y_ptr, REGISTER_CLASS: tl.constexpr):
+    offsets = tl.arange(0, 2048)
+    values = tl.load(x_ptr + offsets)
+    values = tlx.amd_register_handoff(values, register_class=REGISTER_CLASS)
+    tl.store(y_ptr + offsets, values)
+
+
+@pytest.mark.parametrize(
+    ("register_class", "element_type"),
+    [
+        pytest.param("vgpr", "fp32", id="vgpr-fp32"),
+        pytest.param("vgpr", "fp16", id="vgpr-fp16"),
+        pytest.param("agpr", "fp32", id="agpr-fp32"),
+    ],
+)
+def test_amd_register_handoff_compiles_gfx950(register_class, element_type):
+    compiled = compile_for_gfx950(
+        _amd_register_handoff_kernel,
+        signature={"x_ptr": f"*{element_type}", "y_ptr": f"*{element_type}"},
+        constexprs={"REGISTER_CLASS": register_class},
+    )
+    ttir = compiled.asm["ttir"]
+    assert ttir.count("amdg.register_handoff") == 1
+    assert f'class "{register_class}"' in ttir
+    assert "groups" not in ttir
+    assert "tt.elementwise_inline_asm" not in ttir
+    assert "amdg.register_resident" not in ttir
+    llir = compiled.asm["llir"]
+    assert "amdg.register_handoff" not in llir
+    register_constraint = "a" if register_class == "agpr" else "v"
+    constraint = f'"={register_constraint},0"'
+    handoff_asm = [line for line in llir.splitlines() if constraint in line]
+    expected_asm = 4 if element_type == "fp16" else 8
+    assert len(handoff_asm) == expected_asm
+    assert all("sideeffect" in line for line in handoff_asm)
+
+
+@triton.jit
+def _invalid_amd_register_handoff_kernel(
+    x_ptr,
+    y_ptr,
+    REGISTER_CLASS: tl.constexpr,
+):
+    offsets = tl.arange(0, 1024)
+    values = tl.load(x_ptr + offsets)
+    values = tlx.amd_register_handoff(
+        values,
+        register_class=REGISTER_CLASS,
+    )
+    tl.store(y_ptr + offsets, values)
+
+
+@pytest.mark.parametrize(
+    ("register_class", "element_type", "message"),
+    [
+        pytest.param("sgpr", "fp32", 'register_class must be either "agpr" or "vgpr"', id="register-class"),
+        pytest.param("vgpr", "i8", "value elements must be 16 or 32 bits", id="element-width"),
+    ],
+)
+def test_amd_register_handoff_rejects_invalid_contract(register_class, element_type, message):
+    with pytest.raises(CompilationError, match=message):
+        compile_for_gfx950(
+            _invalid_amd_register_handoff_kernel,
+            signature={"x_ptr": f"*{element_type}", "y_ptr": f"*{element_type}"},
+            constexprs={
+                "REGISTER_CLASS": register_class,
+            },
+        )
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+@pytest.mark.parametrize("register_class", ["vgpr", "agpr"])
+def test_amd_register_handoff_correct_gfx950(register_class):
+    x = torch.arange(2048, device="cuda", dtype=torch.float32)
+    actual = torch.empty_like(x)
+    _amd_register_handoff_kernel[(1, )](x, actual, register_class, num_warps=4)
+    torch.testing.assert_close(actual, x)
+
+
+@triton.jit
+def _release_dot_layout_reduce_kernel(x_ptr, y_ptr):
+    mma: tl.constexpr = tlx.amd_mfma_layout(
+        version=4,
+        instr_shape=[16, 16, 32],
+        transposed=True,
+        warps_per_cta=[4, 1],
+    )
+    dot0: tl.constexpr = tlx.dot_operand_layout(0, mma, k_width=8)
+    rows = tl.arange(0, 64)
+    cols = tl.arange(0, 64)
+    values = tl.load(x_ptr + rows[:, None] * 64 + cols[None, :]).to(tl.float32)
+    values = tlx.require_layout(values, dot0, pin=False)
+    values = tlx.release_layout(values)
+    reduced = tl.sum(values, axis=1)
+    tl.store(y_ptr + rows, reduced)
+
+
+def test_release_dot_layout_reduce_compiles_gfx950():
+    compiled = compile_for_gfx950(
+        _release_dot_layout_reduce_kernel,
+        signature={"x_ptr": "*bf16", "y_ptr": "*fp32"},
+        constexprs={},
+    )
+    assert "tlx.release_layout" in compiled.asm["ttir"]
+    assert "tt.reduce" in compiled.asm["ttgir"]
+    assert "amdgcn" in compiled.asm
+
+
+@triton.jit
+def _invalid_release_layout_kernel(x_ptr, y_ptr):
+    offsets = tl.arange(0, 64)
+    values = tl.load(x_ptr + offsets)
+    values = tlx.release_layout(values)
+    tl.store(y_ptr + offsets, values)
+
+
+def test_release_layout_rejects_unencoded_source():
+    with pytest.raises(CompilationError, match="release_layout requires an explicit source layout"):
+        compile_for_gfx950(
+            _invalid_release_layout_kernel,
+            signature={"x_ptr": "*fp32", "y_ptr": "*fp32"},
+            constexprs={},
+        )
+
+
+@triton.jit
+def _amd_scheduled_mfma_kernel(a_ptr, b_ptr, output_ptr, K_WIDTH: tl.constexpr):
     mma: tl.constexpr = tlx.amd_mfma_layout(
         version=4,
         instr_shape=[16, 16, 32],
         transposed=True,
         warps_per_cta=[1, 4],
     )
-    dot0: tl.constexpr = tlx.dot_operand_layout(0, mma, k_width=8)
-    dot1: tl.constexpr = tlx.dot_operand_layout(1, mma, k_width=8)
+    dot0: tl.constexpr = tlx.dot_operand_layout(0, mma, k_width=K_WIDTH)
+    dot1: tl.constexpr = tlx.dot_operand_layout(1, mma, k_width=K_WIDTH)
     rows = tl.arange(0, 16)
     reduction = tl.arange(0, 32)
     cols = tl.arange(0, 64)
@@ -847,8 +1245,13 @@ def _amd_scheduled_mfma_kernel(a_ptr, b_ptr, output_ptr):
 def test_amd_scheduled_mfma_compiles_gfx950():
     compiled = compile_for_gfx950(
         _amd_scheduled_mfma_kernel,
-        signature={"a_ptr": "*bf16", "b_ptr": "*bf16", "output_ptr": "*fp32"},
-        constexprs={},
+        signature={
+            "a_ptr": "*bf16",
+            "b_ptr": "*bf16",
+            "output_ptr": "*fp32",
+            "K_WIDTH": "constexpr",
+        },
+        constexprs={"K_WIDTH": 8},
     )
     assert "amdg.register_resident" in compiled.asm["ttir"]
     assert 'class "agpr" groups 4' in compiled.asm["ttir"]
@@ -869,8 +1272,9 @@ def test_amd_scheduled_mfma_rejects_non_cdna4():
                 "a_ptr": "*bf16",
                 "b_ptr": "*bf16",
                 "output_ptr": "*fp32",
+                "K_WIDTH": "constexpr",
             },
-            constexprs={},
+            constexprs={"K_WIDTH": 8},
             target=GFX942,
         )
 
@@ -885,6 +1289,24 @@ def test_amd_scheduled_mfma_initialize_discards_acc_gfx950():
         a,
         b,
         actual,
+        K_WIDTH=8,
+        num_warps=4,
+        matrix_instr_nonkdim=16,
+    )
+    torch.testing.assert_close(actual, a.float() @ b.float(), atol=2e-4, rtol=2e-4)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_amd_scheduled_mfma_kwidth4_correct_gfx950():
+    torch.manual_seed(0)
+    a = torch.randn((16, 32), device="cuda", dtype=torch.bfloat16)
+    b = torch.randn((32, 64), device="cuda", dtype=torch.bfloat16)
+    actual = torch.empty((16, 64), device="cuda", dtype=torch.float32)
+    _amd_scheduled_mfma_kernel[(1, )](
+        a,
+        b,
+        actual,
+        K_WIDTH=4,
         num_warps=4,
         matrix_instr_nonkdim=16,
     )
@@ -2003,6 +2425,60 @@ def test_local_load_rematerialized_coordinates_compiles_gfx950():
 
 
 @triton.jit
+def _local_slice_runtime_offset_kernel(x_ptr, output_ptr, row):
+    value_layout: tl.constexpr = tlx.layout(
+        shape=((8, 32), (2, )),
+        stride=((64, 2), (1, )),
+    )
+    smem_layout: tl.constexpr = tlx.shared_linear_layout_encoding(
+        offset_bases=[
+            [0, 1],
+            [0, 2],
+            [0, 4],
+            [0, 8],
+            [0, 16],
+            [0, 32],
+            [1, 0],
+            [2, 8],
+            [4, 16],
+        ],
+        block_bases=[],
+        alignment=8,
+    )
+    rows = tl.arange(0, 8)
+    cols = tl.arange(0, 64)
+    offsets = rows[:, None] * 64 + cols[None, :]
+    offsets = tlx.require_layout(offsets, value_layout, pin=False)
+    values = tl.load(x_ptr + offsets)
+    buffers = tlx.local_alloc((8, 64), tl.float32, 1, layout=smem_layout)
+    buffer = tlx.local_view(buffers, 0)
+    tlx.local_store(buffer, values)
+    tl.debug_barrier()
+    view = tlx.local_slice(buffer, [row, 0], [1, 64])
+    selected = tl.reshape(tlx.local_load(view, relaxed=True), (64, ))
+    tl.store(output_ptr + cols, selected)
+
+
+def test_local_slice_runtime_offset_compiles_gfx950():
+    compiled = compile_for_gfx950(
+        _local_slice_runtime_offset_kernel,
+        signature={"x_ptr": "*fp32", "output_ptr": "*fp32", "row": "i32"},
+        constexprs={},
+    )
+    assert "ttg.memdesc_dynamic_subslice" in compiled.asm["ttgir"]
+    assert "ttg.memdesc_dynamic_subslice" not in compiled.asm["llir"]
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+@pytest.mark.parametrize("row", [0, 3, 7])
+def test_local_slice_runtime_offset_correct_gfx950(row):
+    x = torch.arange(8 * 64, device="cuda", dtype=torch.float32).reshape(8, 64)
+    actual = torch.empty(64, device="cuda", dtype=torch.float32)
+    _local_slice_runtime_offset_kernel[(1, )](x, actual, row, num_warps=4)
+    torch.testing.assert_close(actual, x[row], atol=0.0, rtol=0.0)
+
+
+@triton.jit
 def _padded_local_slice_transposed_load_kernel(x_ptr, rhs_ptr, output_ptr):
     mma: tl.constexpr = tlx.amd_mfma_layout(
         version=4,
@@ -2072,6 +2548,8 @@ def test_padded_local_slice_uses_transposed_lds_read_gfx950():
         },
         constexprs={},
     )
+    assert "ttg.memdesc_subslice" in compiled.asm["ttgir"]
+    assert "ttg.memdesc_dynamic_subslice" not in compiled.asm["ttgir"]
     amdgcn = compiled.asm["amdgcn"]
     assert "ds_read_b64_tr_b16" in amdgcn
     assert "ds_read_u16" not in amdgcn
