@@ -524,6 +524,12 @@ def TTNG_WaitBarrierOp
     This lowers a waitloop using PTX instruction
     mbarrier.try_wait.parity.shared::cta.b64.
 
+    An omitted predicate represents an unconditional wait and is encoded as an
+    absent operand, not as a constant-true operand. Lowering may still restrict
+    execution to the leader CTA when multiple CTAs share one logical barrier;
+    that hardware ownership predicate is independent of this optional user
+    predicate.
+
     Accepts an optional list of memory dependencies. If present, it is assumed
     that any of the dependencies may be accessed until the barrier completes.
 

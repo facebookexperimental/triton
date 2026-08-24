@@ -185,6 +185,11 @@ def _check_reg_auto_ws_alignment(name: str, value: Optional[int]) -> None:
         raise ValueError(f"{name} must be divisible by 8, got {value}")
 
 
+def _validate_cluster_shape(name: str, shape: tuple[int, ...]) -> None:
+    if len(shape) != 3 or any(dim <= 0 for dim in shape):
+        raise ValueError(f"{name} must contain exactly three positive dimensions, got {shape}")
+
+
 @dataclass(frozen=True)
 class CUDAOptions:
     num_warps: int = 4
@@ -259,15 +264,22 @@ class CUDAOptions:
         _check_reg_auto_ws_alignment("minRegAutoWS", self.minRegAutoWS)
         _check_reg_auto_ws_alignment("maxRegAutoWS", self.maxRegAutoWS)
 
+        if self.num_ctas <= 0:
+            raise ValueError(f"num_ctas must be positive, got {self.num_ctas}")
+        _validate_cluster_shape("cluster_dims", self.cluster_dims)
+        if self.ctas_per_cga is not None:
+            _validate_cluster_shape("ctas_per_cga", self.ctas_per_cga)
+
         # If ctas_per_cga is set, it overrides cluster_dims with CUDA semantics:
         # ctas_per_cga defines the cluster shape for regrouping grid CTAs.
         # num_ctas must be 1 when using ctas_per_cga since it's incompatible with
         # the multiplicative semantics of num_ctas.
         if self.ctas_per_cga is not None:
             # Ensure cluster_dims is all 1s to prevent conflicting cluster specifications.
-            assert (self.cluster_dims == (1, 1, 1) or self.cluster_dims == self.ctas_per_cga), (
-                f"When using ctas_per_cga, cluster_dims must be default (1,1,1) or match ctas_per_cga to avoid conflicting "
-                f"cluster specifications. Got cluster_dims={self.cluster_dims}")
+            if self.cluster_dims != (1, 1, 1) and self.cluster_dims != self.ctas_per_cga:
+                raise ValueError(
+                    "When using ctas_per_cga, cluster_dims must be default (1,1,1) or match ctas_per_cga to avoid "
+                    f"conflicting cluster specifications. Got cluster_dims={self.cluster_dims}")
 
             object.__setattr__(self, "cluster_dims", self.ctas_per_cga)
             object.__setattr__(self, "num_ctas", 1)
@@ -347,11 +359,15 @@ class CUDABackend(BaseBackend):
         return CUDAOptions(**args)
 
     def pack_metadata(self, metadata):
+        cluster = getattr(metadata, "cluster_dims", None) or (1, 1, 1)
         preferred = getattr(metadata, "preferred_ctas_per_cga", None) or (0, 0, 0)
         return (
             metadata.num_warps,
             metadata.num_ctas,
             metadata.shared,
+            cluster[0],
+            cluster[1],
+            cluster[2],
             preferred[0],
             preferred[1],
             preferred[2],
@@ -365,8 +381,8 @@ class CUDABackend(BaseBackend):
         alongside the cubin as ``asm["launch_metadata"]`` and is intended to replace the
         implicit metadata bag that downstream consumers currently probe with hasattr guards.
 
-        The schema is purely additive — existing ``pack_metadata()`` / ``make_launcher()``
-        paths are not affected.
+        The schema is purely additive and does not replace the existing packed metadata
+        consumed by the JIT launchers.
         """
 
         def _get(key, default=None):
@@ -851,6 +867,7 @@ class CUDABackend(BaseBackend):
         if (capability // 10 >= 10 and opt.cluster_dims is not None and max(opt.cluster_dims) >= 2
                 and opt.ctas_per_cga is not None):
             nvidia.passes.ttnvgpuir.add_check_matmul_two_cta(pm, opt.allowDependentTwoCTA)
+            nvidia.passes.ttnvgpuir.add_atomic_tile_scheduler_prepare(pm)
         # optimize TTGIR
         ptx_version = get_ptx_version_from_options(opt, capability)
         max_vec_bits = 256 if capability >= 100 and ptx_version >= 88 else 128
@@ -1018,9 +1035,10 @@ class CUDABackend(BaseBackend):
             passes.ttgpuir.add_combine_tensor_select_and_if(pm)
             # hoist again and allow hoisting out of if statements
             passes.ttgpuir.add_hoist_tmem_alloc(pm, True)
-            # CLC tile scheduler (Stage 4): materialize the async-token form into
-            # the response buffer + completion mbarrier. Explicit clusters also
-            # get a reuse rendezvous. Runs after warp specialization.
+            # Materialize marked cluster-atomic claims after optional warp
+            # specialization, then materialize the CLC async-token form. Explicit
+            # CLC clusters also get a reuse rendezvous.
+            nvidia.passes.ttnvgpuir.add_atomic_tile_scheduler_materialize(pm)
             nvidia.passes.ttnvgpuir.add_clc_materialize(pm)
             nvidia.passes.ttnvgpuir.add_remove_tmem_tokens(pm)
             # 2-CTA: Insert cross-CTA sync AFTER all WS passes.

@@ -29,6 +29,7 @@
 #include "tlx/dialect/include/IR/Dialect.h"
 #include "triton/Analysis/Utility.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
+#include "triton/Dialect/Triton/IR/TMAMulticast.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Attributes.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
@@ -487,15 +488,27 @@ LogicalResult ClusterWaitOp::verify() {
   return success();
 }
 
+PhysicalClusterInfo getPhysicalClusterInfo(ModuleOp mod) {
+  int numCTAs = gpu::TritonGPUDialect::getNumCTAs(mod);
+  SmallVector<int, 3> dims = gpu::TritonGPUDialect::getClusterDims(mod);
+  int explicitSize = dims[0] * dims[1] * dims[2];
+  if (explicitSize > 1)
+    return {std::move(dims), explicitSize, numCTAs == 1};
+  return {{numCTAs, 1, 1}, numCTAs, false};
+}
+
 static LogicalResult verifyClusterIsMultiCTA(Operation *op) {
-  int numCTAs = triton::gpu::lookupNumCTAs(op);
+  int numCTAs = triton::gpu::lookupPhysicalNumCTAs(op);
   if (numCTAs <= 1)
-    return op->emitOpError("requires ttg.num-ctas > 1");
+    return op->emitOpError("requires a multi-CTA cluster");
   return success();
 }
 
 // -- ClusterBarrierOp --
 LogicalResult ClusterBarrierOp::verify() {
+  // AutoWS may place this op inside warp-specialized regions and guarantees
+  // that every required warp group participates. Rejecting the region here
+  // would also reject valid compiler-generated synchronization.
   if (failed(verifyClusterIsMultiCTA(getOperation())))
     return failure();
   auto func = getOperation()->getParentOfType<FunctionOpInterface>();
@@ -568,7 +581,7 @@ LogicalResult ArriveBarrierOp::verify() {
   if (isMulticast()) {
     if (getPerThread())
       return emitOpError("multicast arrive does not support perThread");
-    int numCTAs = triton::gpu::lookupNumCTAs(getOperation());
+    int numCTAs = triton::gpu::lookupPhysicalNumCTAs(getOperation());
     if (numCTAs <= 1)
       return emitOpError("multicast arrive requires num_ctas > 1");
     if (getCtaMask() > static_cast<uint32_t>(numCTAs - 1))
@@ -686,16 +699,24 @@ static LogicalResult verifyBarrierCGALayout(Operation *op, Value barrier,
 }
 
 static LogicalResult verifyTMABarrierLayout(Operation *op, Value barrier) {
+  auto axes = op->getAttrOfType<DenseI32ArrayAttr>(
+      ::mlir::triton::kMulticastAxesAttrName);
+  if (failed(::mlir::triton::verifyTMAMulticastAxes(op, axes)))
+    return failure();
+
+  auto ctx = op->getContext();
+  int numCTAs = gpu::lookupNumCTAs(op);
+  auto oneCTACGALayout = CGAEncodingAttr::get1DLayout(ctx, numCTAs);
+  if (axes)
+    return verifyBarrierCGALayout(op, barrier, oneCTACGALayout, "TMA barrier");
+
   auto twoCTAsAttr =
       op->getParentOfType<ModuleOp>()->getAttrOfType<BoolAttr>(AttrTwoCTAsName);
   if (!twoCTAsAttr)
     return success();
 
-  auto ctx = op->getContext();
-  int numCTAs = gpu::lookupNumCTAs(op);
   auto barrierTy = cast<MemDescType>(barrier.getType());
   auto actualCGALayout = getCGALayout(barrierTy.getEncoding());
-  auto oneCTACGALayout = CGAEncodingAttr::get1DLayout(ctx, numCTAs);
   if (actualCGALayout == oneCTACGALayout)
     return success();
 

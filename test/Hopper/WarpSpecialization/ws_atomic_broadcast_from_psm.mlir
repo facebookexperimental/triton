@@ -54,7 +54,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
   // FULL: %[[ATOMIC_SLOT:[0-9]+]] = ttg.local_alloc {buffer.copy = 2 : i32, buffer.id = {{[0-9]+}} : i32} : () -> !ttg.memdesc<2x1xi32
   // FULL: ttg.warp_specialize
   // FULL: default {
-  // FULL: scf.while {{.*}} : (i32, i64, i64) -> (i32, i64, i64)
+  // FULL: scf.while {{.*}} : (i32, i64, i64) -> (i64, i64)
   // Post-WS preprocessing must mark the staged inner K loop so scheduleLoops
   // completes the partial schedule before software pipelining.
   // FULL: scf.for
@@ -64,10 +64,11 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
   // The default partition rotates the slot and full-barrier phase from the
   // direct while accumulation counter before loading the broadcast value.
   // FULL: arith.andi
-  // FULL: ttg.memdesc_index %[[ATOMIC_SLOT]]
+  // The allocation is captured as a warp-specialize region argument.
+  // FULL: ttg.memdesc_index %{{.*}}
   // FULL: ttng.wait_barrier
-  // FULL: ttg.local_load
-  // FULL: ttng.arrive_barrier
+  // FULL: ttg.local_load {{.*}}async_task_id = array<i32: 0>
+  // FULL: ttng.arrive_barrier {{.*}}async_task_id = array<i32: 0>
   // FULL: partition0
   // FULL: scf.while {{.*}} : (i32, i64, i64) -> (i32, i64, i64)
   // FULL: scf.for

@@ -5,8 +5,9 @@
 // assertion in CodePartitionUtility.cpp `createChannelPost`.
 //
 // Real FA3 backward kernel (same body as partition-scheduling-meta-fa-bwd.mlir)
-// driven through the full warp-specialization pipeline so it reaches
-// `createChannelPost`. `separateLocalAllocWithSrc` splits a shared alloc that
+// driven through partition scheduling and the full warp-specialization
+// pipeline so it reaches `createChannelPost`. `separateLocalAllocWithSrc`
+// splits a shared alloc that
 // carries no async_task_id, leaving a `local_store` with an empty producer
 // set; the `if (producerTaskIds.empty()) return;` guard skips it (a producer
 // with no partition needs no channel). Without the guard the `else` branch

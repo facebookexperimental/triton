@@ -53,10 +53,17 @@ LogicalResult doMemoryPlanner(triton::FuncOp funcOp, unsigned numBuffers,
                               const MemoryPlannerOptions &options = {});
 
 LogicalResult doBufferAllocation(triton::FuncOp funcOp);
+// Read-only eligibility check for channels whose final topology is known
+// before buffer allocation mutates the function.
+bool hasUnsupportedPrePartitionChannels(triton::FuncOp funcOp,
+                                        unsigned numBuffers);
+// Read-only validation that retained scf.while boundary values can be cloned
+// without inferring ownership for side-effecting operations.
+bool hasUnsupportedWhileSpecialization(triton::FuncOp funcOp);
 LogicalResult doConvertDescriptorLoadsToNVWS(triton::FuncOp funcOp);
 void doHoistLoopInvariantTMEMStore(triton::FuncOp funcOp);
 void removeRedundantTmemZeroStores(triton::FuncOp funcOp);
-void doCodePartition(triton::FuncOp funcOp, unsigned numBuffers);
+LogicalResult doCodePartition(triton::FuncOp funcOp, unsigned numBuffers);
 void doTokenLowering(triton::FuncOp funcOp, unsigned numConsumerGroups);
 void doPingPongPrep(triton::FuncOp funcOp, unsigned numWarpGroups,
                     int capability, int defaultNumStages);

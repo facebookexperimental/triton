@@ -37,6 +37,28 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 
 // -----
 
+// An explicit-cluster CLC fetch with no task ID has no proven owner partition.
+// AutoWS must reject it rather than selecting an arbitrary partition or
+// allowing the fetch to be replicated.
+// CHECK-LABEL: @reject_clustered_clc_without_owner
+module attributes {"ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 2 : i32, "ttg.cluster-dim-z" = 1 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @reject_clustered_clc_without_owner() {
+    %c0_i32 = arith.constant 0 : i32
+    %true = arith.constant true
+    %r0, %r1, %r2, %r3 = scf.while (%valid = %true, %x = %c0_i32, %y = %c0_i32, %z = %c0_i32) : (i1, i32, i32, i32) -> (i1, i32, i32, i32) {
+      scf.condition(%valid) %valid, %x, %y, %z : i1, i32, i32, i32
+    } do {
+    ^bb0(%valid: i1, %x: i32, %y: i32, %z: i32):
+      %tok = ttng.clc_try_cancel_async : !ttg.async.token
+      %next_valid, %next_x, %next_y, %next_z = ttng.clc_read %tok : !ttg.async.token -> i1, i32, i32, i32
+      scf.yield %next_valid, %next_x, %next_y, %next_z : i1, i32, i32, i32
+    } attributes {async_task_id = array<i32: 0, 1>}
+    tt.return
+  }
+}
+
+// -----
+
 // A scalar atomic replicated to ALL partitions, but whose result is NOT the
 // loop-carried yield of the while (the while yields an unrelated value) ->
 // reject (getLoopCarryingWhile == nullptr), WSAtomicBroadcast.cpp :109-113. This

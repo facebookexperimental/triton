@@ -8,6 +8,7 @@
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/IR/Verifier.h"
 #include "mlir/Interfaces/InferTypeOpInterface.h"
+#include "mlir/Interfaces/LoopLikeInterface.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Support/LLVM.h"
@@ -667,6 +668,19 @@ scf::ForOp createNewLoop(scf::ForOp forOp, scf::ForOp &parentForOp,
 // Go through channels, and get a set of region ops containing channels.
 void collectRegionsWithChannels(const SmallVector<Channel *> &channels,
                                 DenseSet<Operation *> &regionsWithChannels) {
+  auto getCommonEnclosingLoop = [](Operation *a, Operation *b) -> Operation * {
+    if (!a || !b)
+      return nullptr;
+    DenseSet<Operation *> aLoops;
+    for (Operation *op = a->getParentOp(); op; op = op->getParentOp())
+      if (isa<LoopLikeOpInterface>(op))
+        aLoops.insert(op);
+    for (Operation *op = b->getParentOp(); op; op = op->getParentOp())
+      if (aLoops.contains(op))
+        return op;
+    return nullptr;
+  };
+
   for (auto *channel : channels) {
     // A defunct channel's alloc was folded into a reuse representative and
     // erased; its allocOp/endpoints are dangling, so skip it (the
@@ -696,6 +710,15 @@ void collectRegionsWithChannels(const SmallVector<Channel *> &channels,
           // rotates once per persistent iteration, so the while carries it.
           if (auto whileOp = dyn_cast<scf::WhileOp>(pOp))
             regionsWithChannels.insert(pOp);
+        }
+        if (auto *commonLoop = getCommonEnclosingLoop(channel->getSrcOp(),
+                                                      channel->getDstOp())) {
+          if (auto forOp = dyn_cast<scf::ForOp>(commonLoop)) {
+            if (!hasLoopCarriedAccToken(tmemChannel->allocOp, forOp))
+              regionsWithChannels.insert(commonLoop);
+          } else {
+            regionsWithChannels.insert(commonLoop);
+          }
         }
         continue;
       }

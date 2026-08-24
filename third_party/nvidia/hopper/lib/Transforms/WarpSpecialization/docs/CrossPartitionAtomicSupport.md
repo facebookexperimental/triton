@@ -71,6 +71,55 @@ channels with the correct full/empty mbarriers and phase — i.e. the broadcast 
 expressed in terms of an existing, tested AutoWS channel rather than a bespoke
 handshake.
 
+### Physical multi-CTA clusters
+
+See [Atomic Tile Scheduler](AtomicTileScheduler.md) for the complete pass and
+IR-shape contract, and [Cluster Handoff Utilities](ClusterHandoff.md) for the
+shared DSM/mbarrier builders used by the atomic and CLC materializers.
+
+The cross-partition broadcast above is intra-CTA; it is not itself a
+cluster-level scheduler. For an explicitly clustered 2-CTA MMA kernel, the
+NVIDIA backend adds a second protocol without changing
+`DynamicPersistent1DScheduler` or its frontend IR:
+
+1. Before AutoWS, `atomic-tile-scheduler-prepare` recognizes the canonical
+   scalar `atomic_add(counter, 1)` loop, requires a uniform counter argument,
+   proves that the loop bound is cluster-uniform and divisible by the physical
+   cluster size `K`, and rewrites the seed into cluster-major X-fastest linear
+   order.
+2. AutoWS runs normally. `doDynamicTileBroadcast` still executes the tagged
+   atomic in one warp partition per CTA and broadcasts its result to the other
+   partitions in that CTA.
+3. Generic code partitioning clones the marked atomic into its run-once owner
+   partition. The late cluster-materialization pass then replaces that claim
+   with a rank-zero `atomic_add(counter, K)`. Rank zero publishes the returned
+   base PID to the other `K-1` CTAs through generic-proxy DSM stores; every CTA
+   uses `base + cluster_cta_rank`. The same late pass handles non-WS kernels.
+4. Full/empty mbarriers use TLX's existing remote-arrive/local-wait protocol to
+   publish the PID and protect slot reuse. Inside AutoWS they live in the
+   run-once owner partition, so compute partitions do not rendezvous; the owner
+   forwards the PID into the existing buffered AutoWS channel.
+
+The atomic and CLC late materializers share only the utility needed to capture
+function-lifetime handoff storage into an already-isolated owner partition.
+They reuse existing cluster and mbarrier operations rather than adding an
+atomic-specific wait mode. CLC's hardware multicast completion remains an
+ordinary local mbarrier wait, and its response reuse uses TLX's
+remote-arrive/local-wait pattern.
+
+The handoff is deliberately inserted after code partitioning, inside the
+run-once owner partition in each CTA. The owner copies the received tile ID into
+the existing multi-buffered AutoWS SMEM channel, and generic code partitioning
+distributes it without involving compute partitions in cross-CTA synchronization.
+
+This applies to the product of all explicit `ctas_per_cga` dimensions, including
+`(2,2)` and `(4,1)`. The kernel owns the mapping from the resulting linear PID
+to problem dimensions and must pad the scheduled tile count to `K`; the compiler
+rejects the transform when it cannot prove that padding. The tile counter is
+initialized to the cluster-aligned number of launched physical CTAs, as in the
+ordinary dynamic scheduler contract. Triton's distinct `num_ctas > 1` program
+ID semantics are not supported by this lowering.
+
 ### Case 3 — graceful reject
 
 `doDynamicTileBroadcast` returns `failure()`. The caller then calls the canonical
@@ -145,3 +194,8 @@ broadcast (`transformCLC`) is single-stage.
 - LIT: `test/Hopper/WarpSpecialization/ws_atomic_broadcast_transform.mlir`
   (case 2 — exactly one atomic + broadcast) and `ws_atomic_broadcast_reject.mlir`
   (case 3 — no WS / no partition ids / no task ids left, atomic preserved).
+- Cluster lowering: `test/Hopper/TwoCTA/check_matmul_two_cta.mlir` checks
+  `(2,2)` and `(4,1)` seed linearization, one `+K` atomic, `K-1` DSM stores,
+  and the ready/reuse barrier protocol. The unified tutorial matrix covers the
+  clustered dynamic scheduler through Meta AutoWS on Blackwell; a separate
+  tutorial test covers the standalone non-WS materialization path.

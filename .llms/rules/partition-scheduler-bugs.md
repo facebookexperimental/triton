@@ -172,6 +172,12 @@
 - **Companion**: `ws_code_partition_empty_producer_guard.mlir` now runs `--nvgpu-partition-scheduling-meta` before `--nvgpu-warp-specialization`. Its raw kernel carries no `ttg.partition`, so under the new gate the pass rejected it early and the test silently stopped covering bug #7 — while its pre-fix output had been pinning 4 unlowered `nvws.descriptor_load` ops and no `ttg.warp_specialize`. With PSM in the pipeline it gets real partitions, emits physical WS regions, and reaches `createChannelPost` as intended.
 - **Key insight**: `tt.warp_specialize` on a loop is a *request*, not a decision. Any pass that rewrites ops on the strength of that marker must first confirm partitions exist, because the pass that undoes the rewrite only runs when they do.
 
+### 23. Blackwell clustered CLC multicast hangs after AutoWS lowering (2026-08-21, fixed)
+- **Symptom**: `test_tutorial09_tma_multicast_gemm_variants[clc-autows]` hangs on B200 both with worker-partition hardware multicast and after stripping `tt.multicast_axes` to use the ordinary per-CTA AutoWS channel plan.
+- **Root cause**: clustered CLC multicast has a validated unspecialized cluster-wide scheduling and rendezvous protocol, but no safe composition with the current Blackwell AutoWS worker-partition protocol. Falling back only the TMA operation is too late because the CLC broadcast has already specialized the persistent loop.
+- **Fix**: reject AutoWS transactionally when a clustered CLC function contains a multicast descriptor load. The canonical metadata teardown restores the unspecialized kernel while preserving its standard clustered multicast lowering. Clustered CLC without multicast remains eligible for AutoWS.
+- **Regression**: the CUDA 12.8 B200 `clc-autows` tutorial09 variant completes through the unspecialized fallback and validates multicast axes and numerical correctness.
+
 ## Debugging Workflow
 - `t.dump` captures IR after each WarpSpec pass (doTaskIdPropagate → doBufferAllocation → doMemoryPlanner → doCodePartition → ...)
 - IR after PartitionSchedulingMeta uses `ttg.partition = array<i32: N>` attributes (not `async_task_id`)

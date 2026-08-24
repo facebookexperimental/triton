@@ -404,6 +404,9 @@ struct CanonicalizeConvertFromConvert
 
     // cvt(cvt(x, type1), type2) -> cvt(x, type2)
     if (auto cvt = dyn_cast<ConvertLayoutOp>(arg)) {
+      bool rematerializeCoordinates =
+          op->hasAttr("tlx.rematerialize_coordinates") ||
+          cvt->hasAttr("tlx.rematerialize_coordinates");
       auto replacement =
           rewriter.replaceOpWithNewOp<triton::gpu::ConvertLayoutOp>(
               op, op->getResultTypes().front(), cvt.getSrc());
@@ -411,8 +414,7 @@ struct CanonicalizeConvertFromConvert
       // still represents one shared-memory-backed transfer after folding.
       // Preserve the request on the replacement rather than silently
       // reverting to the entry-time lane/warp coordinates.
-      if (op->hasAttr("tlx.rematerialize_coordinates") ||
-          cvt->hasAttr("tlx.rematerialize_coordinates"))
+      if (rematerializeCoordinates)
         replacement->setAttr("tlx.rematerialize_coordinates",
                              rewriter.getUnitAttr());
       return success();

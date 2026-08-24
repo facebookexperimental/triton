@@ -429,6 +429,47 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
     } {async_task_id = array<i32: 0, 1>, tt.warp_specialize, ttg.partition.stages = [0 : i32, 0 : i32], ttg.partition.types = ["compute", "compute"]}
     tt.return
   }
+
+  // A retained while yield may depend on a pure op nested behind an scf.if
+  // yield. Specialization must clone that complete dependency chain.
+  // CODEPART-LABEL: @while_nested_yield_dependency
+  // CODEPART: partition0
+  // CODEPART: scf.while
+  // CODEPART: scf.if
+  // CODEPART: arith.addi
+  // CODEPART: scf.yield
+  tt.func public @while_nested_yield_dependency(%src: tensor<16xf32, #blocked>, %dst: tensor<16x!tt.ptr<f32>, #blocked>) {
+    %c0 = arith.constant {async_task_id = array<i32: 0, 1>} 0 : index
+    %c1 = arith.constant {async_task_id = array<i32: 0, 1>} 1 : index
+    %c0_i32 = arith.constant {async_task_id = array<i32: 0, 1>} 0 : i32
+    %c1_i32 = arith.constant {async_task_id = array<i32: 0, 1>} 1 : i32
+    %true = arith.constant {async_task_id = array<i32: 0, 1>} true
+    %false = arith.constant {async_task_id = array<i32: 0, 1>} false
+    %zero_vec = arith.constant {async_task_id = array<i32: 1>} dense<0> : tensor<16xi32, #blocked>
+    %alloc = ttg.local_alloc {async_task_id = array<i32: 0>, buffer.copy = 1 : i32, buffer.id = 0 : i32} : () -> !ttg.memdesc<16xf32, #shared, #smem, mutable>
+    scf.for %iv = %c0 to %c1 step %c1 {
+      %while_result = scf.while (%carry = %c0_i32, %keep = %true) : (i32, i1) -> i32 {
+        scf.condition(%keep) {async_task_id = array<i32: 1>} %carry : i32
+      } do {
+      ^bb0(%carry: i32):
+        %next = scf.if %true -> i32 {
+          %computed = arith.addi %carry, %c1_i32 : i32
+          scf.yield %computed : i32
+        } else {
+          scf.yield %carry : i32
+        } {async_task_id = array<i32: 1>}
+        scf.yield {async_task_id = array<i32: 1>} %next, %false : i32, i1
+      } attributes {async_task_id = array<i32: 1>}
+      %used = arith.addi %while_result, %c1_i32 {async_task_id = array<i32: 1>} : i32
+      %used_vec = tt.splat %used {async_task_id = array<i32: 1>} : i32 -> tensor<16xi32, #blocked>
+      %mask = arith.cmpi sge, %used_vec, %zero_vec {async_task_id = array<i32: 1>} : tensor<16xi32, #blocked>
+      %stored = arith.addf %src, %src {async_task_id = array<i32: 0>} : tensor<16xf32, #blocked>
+      ttg.local_store %stored, %alloc {async_task_id = array<i32: 0>} : tensor<16xf32, #blocked> -> !ttg.memdesc<16xf32, #shared, #smem, mutable>
+      %loaded = ttg.local_load %alloc {async_task_id = array<i32: 1>} : !ttg.memdesc<16xf32, #shared, #smem, mutable> -> tensor<16xf32, #blocked>
+      tt.store %dst, %loaded, %mask {async_task_id = array<i32: 1>} : tensor<16x!tt.ptr<f32>, #blocked>
+    } {async_task_id = array<i32: 0, 1>, tt.warp_specialize, ttg.partition.stages = [0 : i32, 0 : i32], ttg.partition.types = ["compute", "compute"]}
+    tt.return
+  }
 }
 
 // -----

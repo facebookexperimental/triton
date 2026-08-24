@@ -1,4 +1,4 @@
-// RUN: triton-opt --split-input-file %s --verify-diagnostics
+// RUN: triton-opt --split-input-file %s --triton-nvidia-gpu-atomic-tile-scheduler-prepare --verify-diagnostics
 
 // expected-error @below {{fp4Padded tensor memory layout requires colStride 1 but got 2}}
 #bad_fp4_padded_tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 64, colStride = 2, fp4Padded = true>
@@ -128,7 +128,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.shar
 #tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
 module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, ttg.shared = 65536 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
   tt.func public @tmem_layout_cta_mismatch() {
-    // expected-error @+1 {{Layout has 1 CTAs per CGA, but the context requires 2 CTAs per CGA.}}
+    // expected-error @+1 {{Layout has 1 CTAs per CGA, but the context requires either 2 logical or 2 physical CTAs per CGA.}}
     %0 = ttng.tmem_alloc : () -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
     tt.return
   }
@@ -159,6 +159,83 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
   tt.func public @async_shared_store_requires_cluster(%src: tensor<128xi32, #blocked_i32>, %dst: !ttg.memdesc<128xi32, #shared_i32, #smem, mutable>, %bar: !ttg.memdesc<1xi64, #shared_i32, #smem, mutable>) {
     // expected-error @+1 {{requires at least two CTAs in the cluster}}
     ttng.async_shared_store %src, %dst, %bar : tensor<128xi32, #blocked_i32> -> !ttg.memdesc<128xi32, #shared_i32, #smem, mutable>, !ttg.memdesc<1xi64, #shared_i32, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+// A clustered dynamic scheduler introduces full-cluster synchronization, so
+// the compiler must reject a runtime tile bound whose cluster alignment cannot
+// be proved before materializing that protocol.
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32, "ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32} {
+  tt.func @clustered_atomic_scheduler_requires_aligned_bound(
+      %counter: !tt.ptr<i32>, %num_tiles: i32,
+      %a: tensor<128x64xf16>, %b: tensor<64x128xf16>,
+      %acc: tensor<128x128xf32>) {
+    %c1 = arith.constant 1 : i32
+    %true = arith.constant true
+    %start = tt.get_program_id x : i32
+    %result = scf.while (%tile = %start) : (i32) -> i32 {
+      // expected-error @below {{cannot prove num_tiles is divisible by physical cluster size 2; pad the 1-D scheduled tile space to a full cluster}}
+      %valid = arith.cmpi slt, %tile, %num_tiles : i32
+      scf.condition(%valid) %tile : i32
+    } do {
+    ^bb0(%tile: i32):
+      %dot = tt.dot %a, %b, %acc {two_ctas} : tensor<128x64xf16> * tensor<64x128xf16> -> tensor<128x128xf32>
+      %next = tt.atomic_rmw add, acq_rel, gpu, %counter, %c1, %true : (!tt.ptr<i32>, i32, i1) -> i32
+      scf.yield %next : i32
+    }
+    tt.return
+  }
+}
+
+// -----
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32, "ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32} {
+  tt.func @clustered_atomic_scheduler_requires_device_scope(
+      %counter: !tt.ptr<i32>, %a: tensor<128x64xf16>,
+      %b: tensor<64x128xf16>, %acc: tensor<128x128xf32>) {
+    %c1 = arith.constant 1 : i32
+    %c8 = arith.constant 8 : i32
+    %true = arith.constant true
+    %start = tt.get_program_id x : i32
+    %result = scf.while (%tile = %start) : (i32) -> i32 {
+      %valid = arith.cmpi slt, %tile, %c8 : i32
+      scf.condition(%valid) %tile : i32
+    } do {
+    ^bb0(%tile: i32):
+      %dot = tt.dot %a, %b, %acc {two_ctas} : tensor<128x64xf16> * tensor<64x128xf16> -> tensor<128x128xf32>
+      // expected-error @below {{clustered dynamic scheduler atomic must have GPU or system scope}}
+      %next = tt.atomic_rmw add, acq_rel, cta, %counter, %c1, %true : (!tt.ptr<i32>, i32, i1) -> i32
+      scf.yield %next : i32
+    }
+    tt.return
+  }
+}
+
+// -----
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32, "ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32} {
+  tt.func @clustered_atomic_scheduler_requires_direct_carry(
+      %counter: !tt.ptr<i32>, %a: tensor<128x64xf16>,
+      %b: tensor<64x128xf16>, %acc: tensor<128x128xf32>) {
+    %c0 = arith.constant 0 : i32
+    %c1 = arith.constant 1 : i32
+    %c8 = arith.constant 8 : i32
+    %true = arith.constant true
+    %start = tt.get_program_id x : i32
+    %result = scf.while (%tile = %start) : (i32) -> i32 {
+      %valid = arith.cmpi slt, %tile, %c8 : i32
+      scf.condition(%valid) %tile : i32
+    } do {
+    ^bb0(%tile: i32):
+      %dot = tt.dot %a, %b, %acc {two_ctas} : tensor<128x64xf16> * tensor<64x128xf16> -> tensor<128x128xf32>
+      // expected-error @below {{clustered dynamic scheduler atomic must be forwarded directly through scf.yield}}
+      %claimed = tt.atomic_rmw add, acq_rel, gpu, %counter, %c1, %true : (!tt.ptr<i32>, i32, i1) -> i32
+      %next = arith.addi %claimed, %c0 : i32
+      scf.yield %next : i32
+    }
     tt.return
   }
 }
@@ -221,6 +298,34 @@ tt.func @async_tma_gather(%desc: !tt.tensordesc<1x128xbf16, #shared>, %x_offsets
   ttng.async_tma_gather %desc[%x_offsets, %y_offset] %result, %bar, %pred : !tt.tensordesc<1x128xbf16, #shared>, tensor<32xi32, #blocked>, i32, !ttg.memdesc<2xi32, #shared1, #ttg.shared_memory, mutable>, !ttg.memdesc<32x128xbf16, #shared, #ttg.shared_memory, mutable>, i1
   tt.return
 }
+}
+
+// -----
+
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [1, 4], order = [1, 0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @descriptor_load_invalid_multicast_axis(
+      %desc: !tt.tensordesc<128x64xf16, #shared>) {
+    %c0 = arith.constant 0 : i32
+    // expected-error @+1 {{tt.multicast_axes values must be in [0, 2]}}
+    %0 = tt.descriptor_load %desc[%c0, %c0] {tt.multicast_axes = array<i32: 3>} : !tt.tensordesc<128x64xf16, #shared> -> tensor<128x64xf16, #blocked>
+    tt.return
+  }
+}
+
+// -----
+
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [1, 4], order = [1, 0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @descriptor_load_empty_multicast_axes(
+      %desc: !tt.tensordesc<128x64xf16, #shared>) {
+    %c0 = arith.constant 0 : i32
+    // expected-error @+1 {{tt.multicast_axes must not be empty}}
+    %0 = tt.descriptor_load %desc[%c0, %c0] {tt.multicast_axes = array<i32>} : !tt.tensordesc<128x64xf16, #shared> -> tensor<128x64xf16, #blocked>
+    tt.return
+  }
 }
 
 // -----
@@ -539,6 +644,24 @@ module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, "ttng.tw
 
 // -----
 
+#nvmma = #ttg.nvmma_shared<{swizzlingByteWidth = 32, transposed = false, elementBitWidth = 16, CGALayout = [[1, 0]]}>
+#barrier = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0], CGALayout = [[0]]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @planned_multicast_requires_local_barrier_layout(
+      %arg0: !tt.tensordesc<64x128xf16, #nvmma>) {
+    %true = arith.constant true
+    %c0_i32 = arith.constant 0 : i32
+    %0 = ttg.local_alloc : () -> !ttg.memdesc<64x128xf16, #nvmma, #smem, mutable>
+    %1 = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #barrier, #smem, mutable>
+    // expected-error @below {{TMA barrier cga_layout must be [[1]], got [[0]]}}
+    ttng.async_tma_copy_global_to_local %arg0[%c0_i32, %c0_i32] %0, %1, %true {tt.multicast_axes = array<i32: 0>} : !tt.tensordesc<64x128xf16, #nvmma>, !ttg.memdesc<1xi64, #barrier, #smem, mutable> -> !ttg.memdesc<64x128xf16, #nvmma, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
 #nvmma = #ttg.nvmma_shared<{swizzlingByteWidth = 32, transposed = false, elementBitWidth = 16, CGALayout = [[1, 0], [0, 1]]}>
 #barrier = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0], CGALayout = [[0], [0]]}>
 #smem = #ttg.shared_memory
@@ -789,15 +912,15 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 
 // -----
 
-// NOTE: Meta Triton intentionally does NOT reject ttng.cluster_arrive / ttng.cluster_wait
-// inside ttg.warp_specialize (Meta Triton's autows/TLX pipelines place them there and the
-// conversion lowers them with all-warps wrapping). Only ttng.cluster_barrier is
-// rejected. The arrive/wait warp-specialize invalid cases from upstream #9456 are
-// therefore omitted here.
+// Meta Triton does not reject ttng.cluster_arrive, ttng.cluster_wait, or
+// ttng.cluster_barrier inside ttg.warp_specialize. AutoWS and TLX place them
+// there, and their conversions lower them with all-warps wrapping. The
+// warp-specialize invalid cases from upstream #9456 are therefore omitted. A
+// cluster barrier must still execute in a multi-CTA cluster.
 
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90"} {
   tt.func @cluster_barrier_invalid() {
-    // expected-error @below {{requires ttg.num-ctas > 1}}
+    // expected-error @below {{requires a multi-CTA cluster}}
     ttng.cluster_barrier
     tt.return
   }

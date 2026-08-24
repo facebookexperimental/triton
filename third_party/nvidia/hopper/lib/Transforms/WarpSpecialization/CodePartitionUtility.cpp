@@ -42,6 +42,62 @@ void removeWarpSpecMetadata(triton::FuncOp funcOp) {
   });
 }
 
+std::pair<Operation *, Operation *> getCommonBlockAnchors(Operation *a,
+                                                          Operation *b) {
+  DenseMap<Block *, Operation *> aAnchors;
+  for (Operation *op = a; op && !isa<triton::FuncOp>(op);
+       op = op->getParentOp())
+    aAnchors.try_emplace(op->getBlock(), op);
+  for (Operation *op = b; op && !isa<triton::FuncOp>(op);
+       op = op->getParentOp()) {
+    auto it = aAnchors.find(op->getBlock());
+    if (it != aAnchors.end())
+      return {it->second, op};
+  }
+  return {nullptr, nullptr};
+}
+
+static Operation *getEffectiveParentOp(Operation *op) {
+  Operation *parent = op->getParentOp();
+  while (parent && isa<ttng::SubtiledRegionOp>(parent))
+    parent = parent->getParentOp();
+  return parent;
+}
+
+RegionRelationInfo getRegionRelationInfo(Operation *a, Operation *b) {
+  if (a->getBlock() == b->getBlock())
+    return {RegionRelation::SameBlock};
+
+  for (Operation *op = a; op && !isa<triton::FuncOp>(op);
+       op = op->getParentOp()) {
+    if (getEffectiveParentOp(op) == getEffectiveParentOp(b))
+      return {RegionRelation::AIsNested};
+  }
+  for (Operation *op = b; op && !isa<triton::FuncOp>(op);
+       op = op->getParentOp()) {
+    if (getEffectiveParentOp(op) == getEffectiveParentOp(a))
+      return {RegionRelation::BIsNested};
+  }
+
+  auto [aAnchor, bAnchor] = getCommonBlockAnchors(a, b);
+  if (aAnchor && bAnchor && aAnchor != bAnchor &&
+      aAnchor->getBlock() == bAnchor->getBlock())
+    return {RegionRelation::Siblings, aAnchor, bAnchor};
+  return {RegionRelation::Unsupported};
+}
+
+bool isSupportedCrossRegionChannel(Operation *producer, Operation *consumer) {
+  if (!producer || !consumer)
+    return false;
+  RegionRelationInfo info = getRegionRelationInfo(producer, consumer);
+  if (info.relation == RegionRelation::Unsupported)
+    return false;
+  if (info.relation != RegionRelation::Siblings)
+    return true;
+  return isa<ttng::MMAv5OpInterface>(producer) && info.aAnchor &&
+         info.bAnchor && !info.bAnchor->isBeforeInBlock(info.aAnchor);
+}
+
 // Check whether two channels belong to the same consumer group.
 // Mirrors the merge conditions in insertAsyncComm (WSCodePartition.cpp):
 //   same getDstOp(), same consumer task IDs, same full consumer set.
@@ -1504,10 +1560,10 @@ void getBufferIdxAndPhase(OpBuilderWithAsyncTaskIds &builder, Operation *op,
 Value getBarrierForPipelineStage(OpBuilderWithAsyncTaskIds &builder,
                                  Value barrierAlloc, Value bufferIdx) {
   ttg::MemDescType allocType = cast<ttg::MemDescType>(barrierAlloc.getType());
-  ttg::MemDescType barrierTy =
-      ttg::MemDescType::get({1}, builder.getI64Type(), allocType.getEncoding(),
-                            allocType.getMemorySpace(),
-                            /*mutableMemory=*/true);
+  SmallVector<int64_t> barrierShape(allocType.getShape().drop_front());
+  ttg::MemDescType barrierTy = ttg::MemDescType::get(
+      barrierShape, builder.getI64Type(), allocType.getEncoding(),
+      allocType.getMemorySpace(), /*mutableMemory=*/true);
 
   // Create barrierForTMA from barrierAlloc.
   auto output = builder.createWithAsyncTaskIds<ttg::MemDescIndexOp>(
@@ -3627,7 +3683,8 @@ static void createAllocChannel(Operation *allocOp, mlir::DominanceInfo &dom,
 
 void collectAllocChannels(SmallVector<std::unique_ptr<Channel>> &channels,
                           triton::FuncOp &funcOp,
-                          bool includeSameTaskSmemChannels) {
+                          bool includeSameTaskSmemChannels,
+                          bool includeTmemChannels) {
   mlir::DominanceInfo dom(funcOp);
   // For both-endpoints-subtiled SMEM channels, the N per-tile staging allocs of
   // one logical channel resolve to the SAME (producer subtiled region, consumer
@@ -3644,7 +3701,8 @@ void collectAllocChannels(SmallVector<std::unique_ptr<Channel>> &channels,
     // gemm's operand is in smem and comes from local_alloc.
     // All buffers have been allocated, a channel will be created based on
     // the alloc.
-    if (isa<ttng::TMEMAllocOp>(op) || isa<ttg::LocalAllocOp>(op)) {
+    if ((includeTmemChannels && isa<ttng::TMEMAllocOp>(op)) ||
+        isa<ttg::LocalAllocOp>(op)) {
       ttng::SubtiledRegionOp prodRegion, consRegion;
       getSubtiledChannelEndpoints(op, prodRegion, consRegion);
       // Only collapse a GENUINE cross-partition both-subtiled channel: the

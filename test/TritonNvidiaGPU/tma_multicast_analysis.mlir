@@ -1,4 +1,5 @@
 // RUN: triton-opt %s --triton-nvidia-plan-tma-multicast | FileCheck %s
+// RUN: triton-opt %s --triton-nvidia-plan-tma-multicast --triton-nvidia-tma-lowering | FileCheck %s --check-prefix=LOWERING
 
 #shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
 #blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [1, 4], order = [1, 0]}>
@@ -146,6 +147,20 @@ module attributes {
     tt.return
   }
 
+  // LOWERING-LABEL: @lowering_preserves_plan
+  // CHECK-LABEL: @lowering_preserves_plan
+  tt.func public @lowering_preserves_plan(
+      %b: !tt.tensordesc<128x64xf16, #shared>) -> tensor<128x64xf16, #blocked> {
+    %y = tt.get_program_id y : i32
+    %k = arith.constant 0 : i32
+    // CHECK: tt.descriptor_load {{.*}}tt.multicast_axes = array<i32: 0>}
+    // LOWERING: ttng.cluster_barrier
+    // LOWERING: arith.cmpi eq
+    // LOWERING: ttng.async_tma_copy_global_to_local {{.*}}tt.multicast_axes = array<i32: 0>}
+    %bv = tt.descriptor_load %b[%y, %k] {multicast = true} : !tt.tensordesc<128x64xf16, #shared> -> tensor<128x64xf16, #blocked>
+    tt.return %bv : tensor<128x64xf16, #blocked>
+  }
+
   // CHECK-LABEL: @clc_cluster_schedule
   tt.func public @clc_cluster_schedule(
       %a: !tt.tensordesc<128x64xf16, #shared>,
@@ -168,6 +183,92 @@ module attributes {
       scf.yield %next_valid, %next_x, %next_y, %next_z : i1, i32, i32, i32
     }
     tt.return
+  }
+
+  // CHECK-LABEL: @clc_read_cluster_schedule
+  // LOWERING-LABEL: @clc_read_cluster_schedule
+  tt.func public @clc_read_cluster_schedule(
+      %a: !tt.tensordesc<128x64xf16, #shared>,
+      %b: !tt.tensordesc<128x64xf16, #shared>) -> tensor<128x64xf16, #blocked> {
+    %k = arith.constant 0 : i32
+    %zero = arith.constant dense<0.0> : tensor<128x64xf16, #blocked>
+    %token = ttng.clc_try_cancel_async : !ttg.async.token
+    %valid, %x, %y, %z = ttng.clc_read %token : !ttg.async.token -> i1, i32, i32, i32
+    %result = scf.if %valid -> tensor<128x64xf16, #blocked> {
+      // CHECK: tt.descriptor_load {{.*}}multicast = true{{.*}}tt.multicast_axes = array<i32: 1>}
+      // LOWERING-DAG: %[[C0:.*]] = arith.constant 0 : i32
+      // LOWERING-DAG: %[[C1:.*]] = arith.constant 1 : i32
+      // LOWERING-DAG: %[[C2:.*]] = arith.constant 2 : i32
+      // LOWERING-DAG: %[[C3:.*]] = arith.constant 3 : i32
+      // LOWERING-DAG: %[[C4:.*]] = arith.constant 4 : i32
+      // LOWERING-DAG: %[[C5:.*]] = arith.constant 5 : i32
+      // LOWERING-DAG: %[[C6:.*]] = arith.constant 6 : i32
+      // LOWERING-DAG: %[[C7:.*]] = arith.constant 7 : i32
+      // LOWERING-DAG: %[[A_MASK_X0:.*]] = arith.constant 85 : i32
+      // LOWERING-DAG: %[[A_MASK_X1:.*]] = arith.constant 170 : i32
+      // LOWERING-DAG: %[[B_MASK_Y1:.*]] = arith.constant 12 : i32
+      // LOWERING-DAG: %[[B_MASK_Y2:.*]] = arith.constant 48 : i32
+      // LOWERING-DAG: %[[B_MASK_Y3:.*]] = arith.constant 192 : i32
+      // LOWERING: %[[A_CTA:.*]] = nvg.cluster_id
+      // LOWERING: %[[A_EQ0:.*]] = arith.cmpi eq, %[[A_CTA]], %[[C0]] : i32
+      // LOWERING: %[[A_T0:.*]] = arith.select %[[A_EQ0]], %[[A_MASK_X0]], %[[C0]] : i32
+      // LOWERING: %[[A_EQ1:.*]] = arith.cmpi eq, %[[A_CTA]], %[[C1]] : i32
+      // LOWERING: %[[A_T1:.*]] = arith.select %[[A_EQ1]], %[[A_MASK_X1]], %[[A_T0]] : i32
+      // LOWERING: %[[A_L1:.*]] = arith.select %[[A_EQ1]], %[[C1]], %[[C0]] : i32
+      // LOWERING: %[[A_EQ2:.*]] = arith.cmpi eq, %[[A_CTA]], %[[C2]] : i32
+      // LOWERING: %[[A_T2:.*]] = arith.select %[[A_EQ2]], %[[A_MASK_X0]], %[[A_T1]] : i32
+      // LOWERING: %[[A_L2:.*]] = arith.select %[[A_EQ2]], %[[C0]], %[[A_L1]] : i32
+      // LOWERING: %[[A_EQ3:.*]] = arith.cmpi eq, %[[A_CTA]], %[[C3]] : i32
+      // LOWERING: %[[A_T3:.*]] = arith.select %[[A_EQ3]], %[[A_MASK_X1]], %[[A_T2]] : i32
+      // LOWERING: %[[A_L3:.*]] = arith.select %[[A_EQ3]], %[[C1]], %[[A_L2]] : i32
+      // LOWERING: %[[A_EQ4:.*]] = arith.cmpi eq, %[[A_CTA]], %[[C4]] : i32
+      // LOWERING: %[[A_T4:.*]] = arith.select %[[A_EQ4]], %[[A_MASK_X0]], %[[A_T3]] : i32
+      // LOWERING: %[[A_L4:.*]] = arith.select %[[A_EQ4]], %[[C0]], %[[A_L3]] : i32
+      // LOWERING: %[[A_EQ5:.*]] = arith.cmpi eq, %[[A_CTA]], %[[C5]] : i32
+      // LOWERING: %[[A_T5:.*]] = arith.select %[[A_EQ5]], %[[A_MASK_X1]], %[[A_T4]] : i32
+      // LOWERING: %[[A_L5:.*]] = arith.select %[[A_EQ5]], %[[C1]], %[[A_L4]] : i32
+      // LOWERING: %[[A_EQ6:.*]] = arith.cmpi eq, %[[A_CTA]], %[[C6]] : i32
+      // LOWERING: %[[A_T6:.*]] = arith.select %[[A_EQ6]], %[[A_MASK_X0]], %[[A_T5]] : i32
+      // LOWERING: %[[A_L6:.*]] = arith.select %[[A_EQ6]], %[[C0]], %[[A_L5]] : i32
+      // LOWERING: %[[A_EQ7:.*]] = arith.cmpi eq, %[[A_CTA]], %[[C7]] : i32
+      // LOWERING: %[[A_TARGETS:.*]] = arith.select %[[A_EQ7]], %[[A_MASK_X1]], %[[A_T6]] : i32
+      // LOWERING: %[[A_LEADER:.*]] = arith.select %[[A_EQ7]], %[[C1]], %[[A_L6]] : i32
+      // LOWERING: %[[A_PRED:.*]] = arith.cmpi eq, %[[A_CTA]], %[[A_LEADER]] : i32
+      // LOWERING: ttng.async_tma_copy_global_to_local %arg0[{{.*}}] %[[A_RESULT:.*]], %[[A_BARRIER:.*]], %[[A_PRED]], %[[A_TARGETS]] {tt.multicast_axes = array<i32: 1>}
+      %av = tt.descriptor_load %a[%x, %k] {multicast = true} : !tt.tensordesc<128x64xf16, #shared> -> tensor<128x64xf16, #blocked>
+      // CHECK: tt.descriptor_load {{.*}}multicast = true{{.*}}tt.multicast_axes = array<i32: 0>}
+      // LOWERING: %[[B_CTA:.*]] = nvg.cluster_id
+      // LOWERING: %[[B_EQ0:.*]] = arith.cmpi eq, %[[B_CTA]], %[[C0]] : i32
+      // LOWERING: %[[B_T0:.*]] = arith.select %[[B_EQ0]], %[[C3]], %[[C0]] : i32
+      // LOWERING: %[[B_EQ1:.*]] = arith.cmpi eq, %[[B_CTA]], %[[C1]] : i32
+      // LOWERING: %[[B_T1:.*]] = arith.select %[[B_EQ1]], %[[C3]], %[[B_T0]] : i32
+      // LOWERING: %[[B_EQ2:.*]] = arith.cmpi eq, %[[B_CTA]], %[[C2]] : i32
+      // LOWERING: %[[B_T2:.*]] = arith.select %[[B_EQ2]], %[[B_MASK_Y1]], %[[B_T1]] : i32
+      // LOWERING: %[[B_L2:.*]] = arith.select %[[B_EQ2]], %[[C2]], %[[C0]] : i32
+      // LOWERING: %[[B_EQ3:.*]] = arith.cmpi eq, %[[B_CTA]], %[[C3]] : i32
+      // LOWERING: %[[B_T3:.*]] = arith.select %[[B_EQ3]], %[[B_MASK_Y1]], %[[B_T2]] : i32
+      // LOWERING: %[[B_L3:.*]] = arith.select %[[B_EQ3]], %[[C2]], %[[B_L2]] : i32
+      // LOWERING: %[[B_EQ4:.*]] = arith.cmpi eq, %[[B_CTA]], %[[C4]] : i32
+      // LOWERING: %[[B_T4:.*]] = arith.select %[[B_EQ4]], %[[B_MASK_Y2]], %[[B_T3]] : i32
+      // LOWERING: %[[B_L4:.*]] = arith.select %[[B_EQ4]], %[[C4]], %[[B_L3]] : i32
+      // LOWERING: %[[B_EQ5:.*]] = arith.cmpi eq, %[[B_CTA]], %[[C5]] : i32
+      // LOWERING: %[[B_T5:.*]] = arith.select %[[B_EQ5]], %[[B_MASK_Y2]], %[[B_T4]] : i32
+      // LOWERING: %[[B_L5:.*]] = arith.select %[[B_EQ5]], %[[C4]], %[[B_L4]] : i32
+      // LOWERING: %[[B_EQ6:.*]] = arith.cmpi eq, %[[B_CTA]], %[[C6]] : i32
+      // LOWERING: %[[B_T6:.*]] = arith.select %[[B_EQ6]], %[[B_MASK_Y3]], %[[B_T5]] : i32
+      // LOWERING: %[[B_L6:.*]] = arith.select %[[B_EQ6]], %[[C6]], %[[B_L5]] : i32
+      // LOWERING: %[[B_EQ7:.*]] = arith.cmpi eq, %[[B_CTA]], %[[C7]] : i32
+      // LOWERING: %[[B_TARGETS:.*]] = arith.select %[[B_EQ7]], %[[B_MASK_Y3]], %[[B_T6]] : i32
+      // LOWERING: %[[B_LEADER:.*]] = arith.select %[[B_EQ7]], %[[C6]], %[[B_L6]] : i32
+      // LOWERING: %[[B_PRED:.*]] = arith.cmpi eq, %[[B_CTA]], %[[B_LEADER]] : i32
+      // LOWERING: ttng.async_tma_copy_global_to_local %arg1[{{.*}}] %[[B_RESULT:.*]], %[[B_BARRIER:.*]], %[[B_PRED]], %[[B_TARGETS]] {tt.multicast_axes = array<i32: 0>}
+      %bv = tt.descriptor_load %b[%y, %k] {multicast = true} : !tt.tensordesc<128x64xf16, #shared> -> tensor<128x64xf16, #blocked>
+      %sum = arith.addf %av, %bv : tensor<128x64xf16, #blocked>
+      scf.yield %sum : tensor<128x64xf16, #blocked>
+    } else {
+      scf.yield %zero : tensor<128x64xf16, #blocked>
+    }
+    tt.return %result : tensor<128x64xf16, #blocked>
   }
 }
 

@@ -105,6 +105,20 @@ inline bool is2CTA(Operation *op) {
   return is2CTA(op->getParentOfType<ModuleOp>());
 }
 
+struct PhysicalClusterInfo {
+  SmallVector<int, 3> dims;
+  int size;
+  bool hasPerCTAProgramIds;
+};
+
+// num-ctas describes Triton's logical/layout cluster model. ctas_per_cga keeps
+// num-ctas == 1 and records the physical CUDA cluster in ttg.cluster-dim-*.
+PhysicalClusterInfo getPhysicalClusterInfo(ModuleOp mod);
+
+inline PhysicalClusterInfo getPhysicalClusterInfo(Operation *op) {
+  return getPhysicalClusterInfo(op->getParentOfType<ModuleOp>());
+}
+
 // Returns the required ordering of repeated TMEM scale blocks for one
 // tcgen05 scaled-MMA operand.
 TensorMemoryScalesBlockRepOrder getTensorMemoryScalesBlockRepOrder(

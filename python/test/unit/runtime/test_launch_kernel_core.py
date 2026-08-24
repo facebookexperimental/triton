@@ -17,7 +17,7 @@ import torch
 import triton
 import triton.language as tl
 from triton import knobs
-from triton._internal_testing import is_cuda
+from triton._internal_testing import is_cuda, is_hopper_or_newer
 
 
 @contextlib.contextmanager
@@ -104,6 +104,21 @@ def test_launchkernel_path_empty_grid():
     torch.cuda.synchronize()
     # out must be untouched (kernel never ran)
     torch.testing.assert_close(out, torch.zeros(N, device="cuda"))
+    assert counter["calls"] > 0, "launchKernel path was not exercised"
+
+
+@pytest.mark.skipif(not is_cuda(), reason="Requires CUDA")
+def test_launchkernel_rejects_incomplete_exact_cluster():
+    if not is_hopper_or_newer():
+        pytest.skip("clusters need Hopper or newer")
+
+    with force_launch_kernel_path() as counter:
+        with pytest.raises(
+                ValueError,
+                match=(r"physical grid \(3, 1, 1\).*required cluster shape "
+                       r"\(2, 1, 1\)"),
+        ):
+            _nop_kernel[(3, )](ctas_per_cga=(2, 1, 1))
     assert counter["calls"] > 0, "launchKernel path was not exercised"
 
 

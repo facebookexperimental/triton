@@ -88,6 +88,40 @@ static bool isValueNeededByTask(Value value, AsyncTaskId asyncTaskId,
           }
           continue;
         }
+        if (auto whileOp = dyn_cast<scf::WhileOp>(yield->getParentOp())) {
+          for (auto [index, operand] : llvm::enumerate(yield.getOperands())) {
+            if (operand != curr)
+              continue;
+            Value beforeArg = whileOp.getBeforeArguments()[index];
+            if (followBackedge && visited.insert(beforeArg).second)
+              worklist.push_back(beforeArg);
+          }
+          continue;
+        }
+      }
+      // A while condition can forward only a subset of the before-region
+      // arguments, and may reorder them. Follow the SSA forwarding relation to
+      // the matching after-region argument and result instead of treating the
+      // shared condition op itself as a use by every task.
+      if (auto condition = dyn_cast<scf::ConditionOp>(user)) {
+        auto whileOp = cast<scf::WhileOp>(condition->getParentOp());
+        if (curr == condition.getCondition() &&
+            hasAsyncTaskId(whileOp, asyncTaskId))
+          return true;
+        bool isForwarded = false;
+        for (auto [index, arg] : llvm::enumerate(condition.getArgs())) {
+          if (arg != curr)
+            continue;
+          isForwarded = true;
+          Value afterArg = whileOp.getAfterArguments()[index];
+          if (visited.insert(afterArg).second)
+            worklist.push_back(afterArg);
+          Value result = whileOp.getResult(index);
+          if (visited.insert(result).second)
+            worklist.push_back(result);
+        }
+        if (isForwarded)
+          continue;
       }
       // Follow an init only through its matching loop-carried value.
       if (auto forOp = dyn_cast<scf::ForOp>(user)) {
@@ -107,6 +141,19 @@ static bool isValueNeededByTask(Value value, AsyncTaskId asyncTaskId,
                              curr == forOp.getUpperBound() ||
                              curr == forOp.getStep();
         if (isInit && !isLoopControl)
+          continue;
+      }
+      if (auto whileOp = dyn_cast<scf::WhileOp>(user)) {
+        bool isInit = false;
+        for (auto [index, init] : llvm::enumerate(whileOp.getInits())) {
+          if (init != curr)
+            continue;
+          isInit = true;
+          Value beforeArg = whileOp.getBeforeArguments()[index];
+          if (visited.insert(beforeArg).second)
+            worklist.push_back(beforeArg);
+        }
+        if (isInit)
           continue;
       }
       if (hasAsyncTaskId(user, asyncTaskId))
@@ -325,6 +372,148 @@ SmallVector<unsigned> collectBlockArgsForTask(scf::ForOp forOp,
   return args;
 }
 
+struct WhileTaskSlots {
+  SmallVector<unsigned> before;
+  SmallVector<unsigned> results;
+};
+
+static WhileTaskSlots collectWhileSlotsForTask(scf::WhileOp whileOp,
+                                                AsyncTaskId asyncTaskId) {
+  WhileTaskSlots slots;
+  for (auto [index, arg] : llvm::enumerate(whileOp.getBeforeArguments())) {
+    if (isValueNeededByTask(arg, asyncTaskId, /*followBackedge=*/false))
+      slots.before.push_back(index);
+  }
+  for (unsigned index = 0; index < whileOp.getNumResults(); ++index) {
+    if (isValueNeededByTask(whileOp.getAfterArguments()[index], asyncTaskId,
+                            /*followBackedge=*/false) ||
+        isValueNeededByTask(whileOp.getResult(index), asyncTaskId,
+                            /*followBackedge=*/false))
+      slots.results.push_back(index);
+  }
+  return slots;
+}
+
+static bool retainedWhileValueNeedsUnsupportedClone(
+    Value value, Region &region, const DenseSet<Value> &mappedBlockArgs,
+    AsyncTaskId asyncTaskId, DenseSet<Value> &visited) {
+  if (!region.isAncestor(value.getParentRegion()) ||
+      mappedBlockArgs.contains(value) || !visited.insert(value).second)
+    return false;
+
+  if (isa<BlockArgument>(value))
+    return true;
+
+  Operation *def = value.getDefiningOp();
+  if (!def)
+    return true;
+  if (hasAsyncTaskId(def, asyncTaskId) || isNeededByTask(def, asyncTaskId))
+    return false;
+  if (def->getNumRegions() != 0 || !isMemoryEffectFree(def))
+    return true;
+
+  for (Value operand : def->getOperands())
+    if (retainedWhileValueNeedsUnsupportedClone(
+            operand, region, mappedBlockArgs, asyncTaskId, visited))
+      return true;
+  return false;
+}
+
+static bool hasUnsupportedWhileSpecializationImpl(triton::FuncOp funcOp) {
+  bool unsupported = false;
+  funcOp.walk([&](scf::WhileOp whileOp) {
+    for (AsyncTaskId asyncTaskId : getAsyncTaskIds(whileOp)) {
+      WhileTaskSlots slots = collectWhileSlotsForTask(whileOp, asyncTaskId);
+
+      DenseSet<Value> beforeArgs;
+      for (unsigned index : slots.before)
+        beforeArgs.insert(whileOp.getBeforeArguments()[index]);
+      DenseSet<Value> afterArgs;
+      for (unsigned index : slots.results)
+        afterArgs.insert(whileOp.getAfterArguments()[index]);
+
+      DenseSet<Value> visited;
+      auto condition = whileOp.getConditionOp();
+      if (retainedWhileValueNeedsUnsupportedClone(
+              condition.getCondition(), whileOp.getBefore(), beforeArgs,
+              asyncTaskId, visited)) {
+        unsupported = true;
+        return WalkResult::interrupt();
+      }
+      for (unsigned index : slots.results) {
+        if (retainedWhileValueNeedsUnsupportedClone(
+                condition.getArgs()[index], whileOp.getBefore(), beforeArgs,
+                asyncTaskId, visited)) {
+          unsupported = true;
+          return WalkResult::interrupt();
+        }
+      }
+
+      visited.clear();
+      auto yield = whileOp.getYieldOp();
+      for (unsigned index : slots.before) {
+        if (retainedWhileValueNeedsUnsupportedClone(
+                yield.getOperand(index), whileOp.getAfter(), afterArgs,
+                asyncTaskId, visited)) {
+          unsupported = true;
+          return WalkResult::interrupt();
+        }
+      }
+    }
+    return WalkResult::advance();
+  });
+  return unsupported;
+}
+
+static bool cloneMissingPureRegionValue(
+    Value value, Region &region, IRMapping &mapping,
+    OpBuilderWithAsyncTaskIds &builder, AsyncTaskId asyncTaskId,
+    DenseSet<Operation *> &visiting) {
+  if (!region.isAncestor(value.getParentRegion()) ||
+      mapping.lookupOrNull(value))
+    return true;
+  if (isa<BlockArgument>(value))
+    return false;
+
+  Operation *def = value.getDefiningOp();
+  if (!def || def->getNumRegions() != 0 || !isMemoryEffectFree(def) ||
+      !visiting.insert(def).second)
+    return false;
+  for (Value operand : def->getOperands()) {
+    if (!cloneMissingPureRegionValue(operand, region, mapping, builder,
+                                     asyncTaskId, visiting))
+      return false;
+  }
+  Operation *cloned = builder.clone(*def, mapping);
+  setAsyncTaskIds(cloned, asyncTaskId);
+  for (auto [oldResult, newResult] :
+       llvm::zip_equal(def->getResults(), cloned->getResults()))
+    mapping.map(oldResult, newResult);
+  visiting.erase(def);
+  return true;
+}
+
+static Value mapOrClonePureRegionValue(
+    Value value, Region &region, IRMapping &mapping,
+    OpBuilderWithAsyncTaskIds &builder, AsyncTaskId asyncTaskId) {
+  if (!region.isAncestor(value.getParentRegion()))
+    return mapping.lookupOrDefault(value);
+
+  Value mapped = mapping.lookupOrNull(value);
+  if (!mapped) {
+    DenseSet<Operation *> visiting;
+    bool cloned = cloneMissingPureRegionValue(
+        value, region, mapping, builder, asyncTaskId, visiting);
+    assert(cloned && "retained region value requires an unsafe late clone");
+    if (!cloned)
+      llvm_unreachable(
+          "retained region dependency escaped specialization preflight");
+    mapped = mapping.lookupOrNull(value);
+  }
+  assert(mapped && "retained region value was not cloned for this task");
+  return mapped;
+}
+
 Operation *SpecializeIfOp(scf::IfOp ifOp, IRMapping &mapping,
                           OpBuilderWithAsyncTaskIds &builder,
                           AsyncTaskId asyncTaskId) {
@@ -358,42 +547,29 @@ Operation *SpecializeIfOp(scf::IfOp ifOp, IRMapping &mapping,
   OpBuilderWithAsyncTaskIds ifBuilder(ifOp.getContext());
   ifBuilder.setAsynTaskIdsFromArray({asyncTaskId});
 
-  // Handle thenRegion of this IfOp.
-  ifBuilder.setInsertionPointToEnd(newIfOp.thenBlock());
-  for (Operation &thenOp : ifOp.thenBlock()->getOperations()) {
-    SpecializeOp(&thenOp, mapping, ifBuilder, asyncTaskId);
-  }
+  auto specializeBranch = [&](Block *oldBlock, Block *newBlock) {
+    auto oldYield = cast<scf::YieldOp>(oldBlock->getTerminator());
+    ifBuilder.setInsertionPointToStart(newBlock);
+    for (Operation &op : oldBlock->without_terminator())
+      SpecializeOp(&op, mapping, ifBuilder, asyncTaskId);
 
-  // Update yields
-  auto updateYield = [&](scf::YieldOp yield, SmallVector<Value> &operands) {
-    ifBuilder.setInsertionPoint(yield);
-    ifBuilder.setLoopScheduleInfoFromOp(yield);
-    ifBuilder.createWithAsyncTaskIds<scf::YieldOp>(yield.getLoc(), operands);
+    SmallVector<Value> yieldOperands;
+    for (unsigned index : keptResultVec) {
+      yieldOperands.push_back(mapOrClonePureRegionValue(
+          oldYield.getOperand(index), *oldBlock->getParent(), mapping,
+          ifBuilder, asyncTaskId));
+    }
+    if (newBlock->mightHaveTerminator())
+      newBlock->getTerminator()->erase();
+    ifBuilder.setInsertionPointToEnd(newBlock);
+    ifBuilder.setLoopScheduleInfoFromOp(oldYield);
+    ifBuilder.createWithAsyncTaskIds<scf::YieldOp>(oldYield.getLoc(),
+                                                  yieldOperands);
     ifBuilder.clearLoopScheduleInfo();
-    yield.erase();
   };
-  if (keptResultVec.size() < ifOp->getResultTypes().size()) {
-    SmallVector<Value> ifYieldOperands;
-    for (auto idx : keptResultVec) {
-      ifYieldOperands.push_back(newIfOp.thenYield().getOperand(idx));
-    }
-    updateYield(newIfOp.thenYield(), ifYieldOperands);
-  }
-
-  // Handle elseRegion of the IfOp.
-  if (ifOp.elseBlock()) {
-    ifBuilder.setInsertionPointToEnd(newIfOp.elseBlock());
-    for (Operation &elseOp : ifOp.elseBlock()->getOperations()) {
-      SpecializeOp(&elseOp, mapping, ifBuilder, asyncTaskId);
-    }
-    if (keptResultVec.size() < ifOp->getResultTypes().size()) {
-      SmallVector<Value> elseYieldOperands;
-      for (auto idx : keptResultVec) {
-        elseYieldOperands.push_back(newIfOp.elseYield().getOperand(idx));
-      }
-      updateYield(newIfOp.elseYield(), elseYieldOperands);
-    }
-  }
+  specializeBranch(ifOp.thenBlock(), newIfOp.thenBlock());
+  if (ifOp.elseBlock())
+    specializeBranch(ifOp.elseBlock(), newIfOp.elseBlock());
 
   unsigned newResIdx = 0;
   for (auto idx : keptResultVec) {
@@ -503,13 +679,19 @@ Operation *SpecializeForOp(scf::ForOp forOp, IRMapping &mapping,
 Operation *SpecializeWhileOp(scf::WhileOp whileOp, IRMapping &mapping,
                              OpBuilderWithAsyncTaskIds &builder,
                              AsyncTaskId asyncTaskId) {
+  WhileTaskSlots slots = collectWhileSlotsForTask(whileOp, asyncTaskId);
+
   SmallVector<Value> newInits;
-  for (Value init : whileOp.getInits())
-    newInits.push_back(mapping.lookupOrDefault(init));
+  for (unsigned index : slots.before)
+    newInits.push_back(mapping.lookupOrDefault(whileOp.getInits()[index]));
+
+  SmallVector<Type> newResultTypes;
+  for (unsigned index : slots.results)
+    newResultTypes.push_back(whileOp.getResult(index).getType());
 
   builder.setLoopScheduleInfoFromOp(whileOp);
   auto newWhileOp = builder.createWithAsyncTaskIds<scf::WhileOp>(
-      whileOp.getLoc(), whileOp->getResultTypes(), newInits);
+      whileOp.getLoc(), newResultTypes, newInits);
   builder.clearLoopScheduleInfo();
   for (auto attr : whileOp->getAttrs()) {
     if (attr.getName() != "async_task_id")
@@ -519,7 +701,7 @@ Operation *SpecializeWhileOp(scf::WhileOp whileOp, IRMapping &mapping,
   SmallVector<Type> beforeTypes;
   for (Value init : newInits)
     beforeTypes.push_back(init.getType());
-  SmallVector<Type> afterTypes(whileOp->getResultTypes());
+  SmallVector<Type> afterTypes(newResultTypes);
   SmallVector<Location> beforeLocs(beforeTypes.size(), whileOp.getLoc());
   SmallVector<Location> afterLocs(afterTypes.size(), whileOp.getLoc());
   if (newWhileOp.getBefore().empty())
@@ -530,27 +712,33 @@ Operation *SpecializeWhileOp(scf::WhileOp whileOp, IRMapping &mapping,
   newWhileOp.getAfterBody()->addArguments(afterTypes, afterLocs);
 
   IRMapping localMapping = mapping;
-  for (auto [oldArg, newArg] :
-       llvm::zip(whileOp.getBeforeArguments(), newWhileOp.getBeforeArguments()))
-    localMapping.map(oldArg, newArg);
-  for (auto [oldArg, newArg] :
-       llvm::zip(whileOp.getAfterArguments(), newWhileOp.getAfterArguments()))
-    localMapping.map(oldArg, newArg);
+  for (auto [newIndex, oldIndex] : llvm::enumerate(slots.before))
+    localMapping.map(whileOp.getBeforeArguments()[oldIndex],
+                     newWhileOp.getBeforeArguments()[newIndex]);
+  for (auto [newIndex, oldIndex] : llvm::enumerate(slots.results))
+    localMapping.map(whileOp.getAfterArguments()[oldIndex],
+                     newWhileOp.getAfterArguments()[newIndex]);
 
   OpBuilderWithAsyncTaskIds whileBuilder(whileOp.getContext());
   whileBuilder.setAsynTaskIdsFromArray({asyncTaskId});
+
+  auto mapRegionValue = [&](Value value, Region &region) {
+    return mapOrClonePureRegionValue(value, region, localMapping, whileBuilder,
+                                     asyncTaskId);
+  };
 
   whileBuilder.setInsertionPointToStart(newWhileOp.getBeforeBody());
   for (Operation &op : whileOp.getBeforeBody()->without_terminator())
     SpecializeOp(&op, localMapping, whileBuilder, asyncTaskId);
   auto condOp = whileOp.getConditionOp();
   SmallVector<Value> condArgs;
-  for (Value arg : condOp.getArgs())
-    condArgs.push_back(localMapping.lookupOrDefault(arg));
+  for (unsigned index : slots.results)
+    condArgs.push_back(mapRegionValue(condOp.getArgs()[index],
+                                      whileOp.getBefore()));
   whileBuilder.setLoopScheduleInfoFromOp(condOp);
   whileBuilder.createWithAsyncTaskIds<scf::ConditionOp>(
-      condOp.getLoc(), localMapping.lookupOrDefault(condOp.getCondition()),
-      condArgs);
+      condOp.getLoc(),
+      mapRegionValue(condOp.getCondition(), whileOp.getBefore()), condArgs);
   whileBuilder.clearLoopScheduleInfo();
 
   whileBuilder.setInsertionPointToStart(newWhileOp.getAfterBody());
@@ -558,16 +746,16 @@ Operation *SpecializeWhileOp(scf::WhileOp whileOp, IRMapping &mapping,
     SpecializeOp(&op, localMapping, whileBuilder, asyncTaskId);
   auto yieldOp = whileOp.getYieldOp();
   SmallVector<Value> yieldArgs;
-  for (Value arg : yieldOp.getOperands())
-    yieldArgs.push_back(localMapping.lookupOrDefault(arg));
+  for (unsigned index : slots.before)
+    yieldArgs.push_back(
+        mapRegionValue(yieldOp.getOperand(index), whileOp.getAfter()));
   whileBuilder.setLoopScheduleInfoFromOp(yieldOp);
   whileBuilder.createWithAsyncTaskIds<scf::YieldOp>(yieldOp.getLoc(),
                                                     yieldArgs);
   whileBuilder.clearLoopScheduleInfo();
 
-  for (auto [oldResult, newResult] :
-       llvm::zip(whileOp.getResults(), newWhileOp.getResults()))
-    mapping.map(oldResult, newResult);
+  for (auto [newIndex, oldIndex] : llvm::enumerate(slots.results))
+    mapping.map(whileOp.getResult(oldIndex), newWhileOp.getResult(newIndex));
 
   return newWhileOp;
 }
@@ -731,6 +919,10 @@ static SmallVector<Operation *> topologicalSort(ArrayRef<Operation *> opList) {
 }
 
 } // namespace
+
+bool hasUnsupportedWhileSpecialization(triton::FuncOp funcOp) {
+  return hasUnsupportedWhileSpecializationImpl(funcOp);
+}
 
 void specializeRegion(triton::FuncOp funcOp, unsigned requestedRegisters) {
 
