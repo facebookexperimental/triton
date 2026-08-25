@@ -86,7 +86,8 @@ static void materializeDeferredSchedGroupBarriers(ModuleOp mod) {
 
       Location loc = block.front().getLoc();
       OpBuilder startBuilder(&block.front());
-      ROCDL::SchedBarrier::create(startBuilder, loc, /*mask=*/0);
+      ROCDL::SchedBarrier::create(startBuilder, loc,
+                                  ROCDL::SchedGroupMask::none);
 
       for (auto [regionIndex, pair] :
            llvm::enumerate(llvm::zip(regions, boundaries))) {
@@ -160,17 +161,21 @@ static void materializeDeferredSchedGroupBarriers(ModuleOp mod) {
         OpBuilder builder(boundary);
         unsigned syncId = nextSyncId++;
         for (const Group &group : groups) {
-          ROCDL::SchedGroupBarrier::create(builder, loc, group.mask, 1, syncId);
+          ROCDL::SchedGroupBarrier::create(
+              builder, loc, static_cast<ROCDL::SchedGroupMask>(group.mask), 1,
+              syncId);
           if (group.cover)
-            ROCDL::SchedGroupBarrier::create(builder, loc, 1 << 3, group.cover,
-                                             syncId);
+            ROCDL::SchedGroupBarrier::create(builder, loc,
+                                             ROCDL::SchedGroupMask::mfma_wmma,
+                                             group.cover, syncId);
         }
         if (regionIndex + 1 < regions.size())
-          ROCDL::SchedBarrier::create(builder, loc, /*mask=*/0);
+          ROCDL::SchedBarrier::create(builder, loc,
+                                      ROCDL::SchedGroupMask::none);
       }
 
       OpBuilder endBuilder(block.getTerminator());
-      ROCDL::SchedBarrier::create(endBuilder, loc, /*mask=*/0);
+      ROCDL::SchedBarrier::create(endBuilder, loc, ROCDL::SchedGroupMask::none);
     }
   });
 }

@@ -2,6 +2,7 @@
 #include "triton/Analysis/Allocation.h"
 #include "triton/Analysis/Membar.h"
 #include "triton/Analysis/Utility.h"
+#include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 
@@ -171,6 +172,12 @@ static bool opUsesTrackedMBarrier(Operation *op,
       .wasInterrupted();
 }
 
+static bool hasWarpSpecializeOp(FunctionOpInterface funcOp) {
+  return funcOp
+      ->walk([](ttg::WarpSpecializeOp) { return WalkResult::interrupt(); })
+      .wasInterrupted();
+}
+
 static LogicalResult
 insertCrossCTAMBarrierInitSyncForFunction(FunctionOpInterface funcOp,
                                           Allocation *allocation, int numCTAs,
@@ -336,6 +343,19 @@ void ClusterBarrierAnalysis::update(Operation *op, BlockInfo *blockInfo,
   if (isa<ttng::ClusterWaitOp>(op)) {
     blockInfo->sync();
     return;
+  }
+
+  // Any path from distributed shared memory use to kernel exit must include a
+  // cluster barrier. A return-site barrier is only reached by default warps in
+  // warp-specialized kernels; their lowering must provide any terminal sync.
+  if (op->hasTrait<OpTrait::ReturnLike>() &&
+      isa<FunctionOpInterface>(op->getParentOp())) {
+    auto funcOp = cast<FunctionOpInterface>(op->getParentOp());
+    if (triton::isKernel(funcOp) && !hasWarpSpecializeOp(funcOp)) {
+      builder->setInsertionPoint(op);
+      ttng::ClusterBarrierOp::create(*builder, op->getLoc());
+      blockInfo->sync();
+    }
   }
 
   BlockInfo curBlockInfo;

@@ -815,7 +815,8 @@ void init_triton_tlx_ir(py::module_ &m) {
            })
       .def("create_amd_sched_barrier",
            [](TritonOpBuilder &self, int32_t mask) {
-             self.create<ROCDL::SchedBarrier>(mask);
+             self.create<ROCDL::SchedBarrier>(
+                 static_cast<ROCDL::SchedGroupMask>(mask));
            })
       .def("create_warp_vote",
            [](TritonOpBuilder &self, Value pred,

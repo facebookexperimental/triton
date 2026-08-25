@@ -151,6 +151,24 @@ def TTI_ExperimentalGSanTensorAccessOp
   }];
 }
 
+def TTI_ExperimentalGSanAtomicPollOp
+    : TTI_Op<"experimental_gsan_atomic_poll"> {
+  let summary = "Instrument a completed atomic poll for GSan";
+  let description = [{
+    Records the successful read performed by an atomic poll after the hardware
+    polling loop has completed.
+  }];
+  let arguments = (ins
+    Arg<TT_Ptr, "", [MemRead<GlobalMemory>, MemWrite<GlobalMemory>]>:$ptr,
+    I1:$matched,
+    TT_MemSemanticAttr:$sem,
+    TT_MemSyncScopeAttr:$scope
+  );
+  let assemblyFormat = [{
+    $sem `,` $scope `,` $ptr `,` $matched attr-dict `:` qualified(type($ptr))
+  }];
+}
+
 def TTI_ExperimentalGSanAtomicTensorAccessOp
     : TTI_Op<"experimental_gsan_atomic_tensor_access",
              [TypesMatchWith<

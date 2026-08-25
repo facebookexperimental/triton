@@ -335,7 +335,6 @@ getMemDescSubsliceUnpaddedOffsets(ttg::MemDescSubsliceOp op) {
   return MemDescSubsliceOffsets{static_cast<uint32_t>(byteOffset),
                                 partitionOffset, blockOffset};
 }
-
 std::optional<triton::BufferRegionAnalysis::RegionType> getRegionType(Value v) {
   if (isUsedAsBarrier(v))
     return triton::BufferRegionAnalysis::RegionType::BARRIER;
