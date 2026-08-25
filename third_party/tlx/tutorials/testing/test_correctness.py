@@ -27,9 +27,11 @@ from triton.language.extra.tlx.tutorials.blackwell_fa_ws_pipelined_persistent im
     _attn_bwd_ws as _blackwell_fa_bwd_ws,
     _attn_fwd_ws as _blackwell_fa_fwd_ws,
     _host_descriptor_pre_hook as _blackwell_fa_fwd_pre_hook,
+    configs as _configs_fwd,
     configs_bwd_1cta as _configs_bwd_1cta,
     configs_bwd_2cta as _configs_bwd_2cta,
     _bwd_selected_meta,
+    prune_configs_by_hdim as _prune_fwd_configs,
     prune_bwd_configs as _prune_bwd_configs,
 )
 from triton.language.extra.tlx.tutorials.blackwell_fa_clc import (
@@ -857,20 +859,203 @@ def test_blackwell_fa_ws_pipelined_persistent_2cta(RESCALE_OPT, USE_WHERE):
         torch.testing.assert_close(tri_out, ref_out, atol=1e-2, rtol=0)
 
 
+def _run_blackwell_fa_numeric(q, k, v, sm_scale, *, fast_fixed=True, rescale_opt=False):
+    Z, H, N_CTX, HEAD_DIM = q.shape
+    config = FlashAttention.CONFIGS["blackwell_fa_ws_pipelined_persistent_2cta"].copy()
+    config.update({
+        "NUM_BUFFERS_KV": 3,
+        "RESCALE_OPT": rescale_opt,
+        "USE_WHERE": False,
+        "USE_WARP_BARRIER": True,
+        "PIPELINED": True,
+        "DENSE_REGS": 176,
+        "FAST_FIXED": fast_fixed,
+    })
+
+    o = torch.full_like(q, float("nan"))
+    m = torch.full((Z, H, N_CTX), float("nan"), device=q.device, dtype=torch.float32)
+    y_dim = Z * H * N_CTX
+    dummy_block = [1, 1]
+    desc_q = TensorDescriptor(q, shape=[y_dim, HEAD_DIM], strides=[HEAD_DIM, 1], block_shape=dummy_block)
+    desc_k = TensorDescriptor(k, shape=[y_dim, HEAD_DIM], strides=[HEAD_DIM, 1], block_shape=dummy_block)
+    desc_v = TensorDescriptor(v, shape=[y_dim, HEAD_DIM], strides=[HEAD_DIM, 1], block_shape=dummy_block)
+    desc_o = TensorDescriptor(o, shape=[y_dim, HEAD_DIM], strides=[HEAD_DIM, 1], block_shape=dummy_block)
+    nargs = {
+        **config,
+        "HEAD_DIM": HEAD_DIM,
+        "desc_q": desc_q,
+        "desc_k": desc_k,
+        "desc_v": desc_v,
+        "desc_o": desc_o,
+    }
+    _blackwell_fa_fwd_pre_hook(nargs)
+
+    def alloc_fn(size: int, align: int, _):
+        return torch.empty(size, dtype=torch.int8, device="cuda")
+
+    triton.set_allocator(alloc_fn)
+    num_ctas = config["NUM_CTAS"]
+    work_ctas = triton.cdiv(N_CTX, config["BLOCK_M"] * num_ctas) * Z * H * num_ctas
+    grid_ctas = min(torch.cuda.get_device_properties(q.device).multi_processor_count, work_ctas)
+    grid_ctas -= grid_ctas % num_ctas
+    _blackwell_fa_fwd_ws.fn[(grid_ctas, 1, 1)](
+        sm_scale,
+        m,
+        Z,
+        H,
+        desc_q,
+        desc_k,
+        desc_v,
+        desc_o,
+        N_CTX=N_CTX,
+        HEAD_DIM=HEAD_DIM,
+        STAGE=1,
+        num_stages=1,
+        num_warps=4,
+        ctas_per_cga=(2, 1, 1),
+        **config,
+    )
+    return o, m
+
+
+def _make_attention_numeric_inputs(shape, dtype, distribution):
+    torch.manual_seed(20)
+    if distribution == "uniform_random":
+        return tuple(torch.empty(shape, device=DEVICE, dtype=dtype).uniform_(-0.5, 0.5) for _ in range(3))
+    if distribution == "normal_random":
+        return tuple(torch.empty(shape, device=DEVICE, dtype=dtype).normal_(mean=0.0, std=0.5) for _ in range(3))
+    q = torch.ones(shape, device=DEVICE, dtype=dtype)
+    q[:, :, shape[2] // 2:, :] = -1
+    amplitude = 0.625 if shape[3] == 128 else 0.2
+    k = torch.full(shape, amplitude, device=DEVICE, dtype=dtype)
+    k[:, :, :128, :] = -amplitude
+    v = torch.empty(shape, device=DEVICE, dtype=dtype).normal_(mean=0.0, std=0.5)
+    return q, k, v
+
+
+@pytest.mark.parametrize("distribution", ["uniform_random", "normal_random", "far_apart"])
+@pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell GPU")
+def test_blackwell_fa_ws_pipelined_persistent_fast_fixed_bf16_numerics(distribution):
+    Z, H, N_CTX, HEAD_DIM = 4, 48, 1024, 128
+    shape = (Z, H, N_CTX, HEAD_DIM)
+    sm_scale = 0.5
+    q, k, v = _make_attention_numeric_inputs(shape, torch.bfloat16, distribution)
+
+    scores = torch.matmul(q.float(), k.float().transpose(-2, -1)) * sm_scale
+    ref_o = torch.matmul(torch.softmax(scores, dim=-1), v.float())
+    ref_m = torch.logsumexp(scores, dim=-1) * math.log2(math.e)
+
+    outputs = [_run_blackwell_fa_numeric(q, k, v, sm_scale) for _ in range(3)]
+    tri_o, tri_m = outputs[0]
+    for repeat_o, repeat_m in outputs:
+        assert torch.isfinite(repeat_o).all()
+        assert torch.isfinite(repeat_m).all()
+        torch.testing.assert_close(repeat_o, tri_o, atol=0, rtol=0)
+        torch.testing.assert_close(repeat_m, tri_m, atol=0, rtol=0)
+    o_error = (tri_o.float() - ref_o).abs()
+    print(f"{distribution}: O max/RMSE="
+          f"{o_error.max().item():.8g}/{o_error.square().mean().sqrt().item():.8g}")
+    torch.testing.assert_close(tri_o.float(), ref_o, atol=1e-2, rtol=0)
+    # The fixed-gauge BF16 exp approximation has a bounded bias in the saved
+    # base-2 log-sum-exp; backward consumes the matching value from forward.
+    torch.testing.assert_close(tri_m, ref_m, atol=0.125, rtol=0)
+
+
+@pytest.mark.parametrize("rescale_opt", [False, True])
+@pytest.mark.parametrize("distribution", ["uniform_random", "normal_random", "far_apart"])
+@pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell GPU")
+def test_blackwell_fa_ws_pipelined_persistent_2cta_non_fast_fixed_numerics(distribution, rescale_opt):
+    Z, H, N_CTX, HEAD_DIM = 4, 48, 1024, 128
+    shape = (Z, H, N_CTX, HEAD_DIM)
+    sm_scale = 0.5
+    q, k, v = _make_attention_numeric_inputs(shape, torch.bfloat16, distribution)
+
+    scores = torch.matmul(q.float(), k.float().transpose(-2, -1)) * sm_scale
+    ref_o = torch.matmul(torch.softmax(scores, dim=-1), v.float())
+    ref_m = torch.logsumexp(scores, dim=-1) * math.log2(math.e)
+    outputs = [
+        _run_blackwell_fa_numeric(
+            q,
+            k,
+            v,
+            sm_scale,
+            fast_fixed=False,
+            rescale_opt=rescale_opt,
+        ) for _ in range(3)
+    ]
+    tri_o, tri_m = outputs[0]
+    for repeat_o, repeat_m in outputs:
+        assert torch.isfinite(repeat_o).all()
+        assert torch.isfinite(repeat_m).all()
+        torch.testing.assert_close(repeat_o, tri_o, atol=0, rtol=0)
+        torch.testing.assert_close(repeat_m, tri_m, atol=0, rtol=0)
+    o_error = (tri_o.float() - ref_o).abs()
+    print(f"{distribution}, RESCALE_OPT={rescale_opt}: "
+          f"O max/RMSE={o_error.max().item():.8g}/{o_error.square().mean().sqrt().item():.8g}")
+    torch.testing.assert_close(tri_o.float(), ref_o, atol=1e-2, rtol=0)
+    torch.testing.assert_close(tri_m, ref_m, atol=0.125, rtol=0)
+
+
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell GPU")
+def test_blackwell_fa_ws_pipelined_persistent_fp16_fixed_gauge_opt_out(causal):
+    shape = (1, 1, 1024, 64)
+    q, k, v = _make_attention_numeric_inputs(shape, torch.float16, "far_apart")
+    config = FlashAttention.CONFIGS["blackwell_fa_ws_pipelined_persistent"].copy()
+    config.update({
+        "NUM_CTAS": 1,
+        "NUM_MMA_SLICES": 2,
+        "RESCALE_OPT": False,
+        "USE_WHERE": False,
+        "FAST_FIXED": False,
+    })
+    ref_o = torch.nn.functional.scaled_dot_product_attention(q, k, v, scale=0.5, is_causal=causal)
+    outputs = [_blackwell_fa_ws_pipelined_persistent(q, k, v, 0.5, causal, config=config) for _ in range(3)]
+    for repeat_o in outputs:
+        assert torch.isfinite(repeat_o).all()
+        torch.testing.assert_close(repeat_o, outputs[0], atol=0, rtol=0)
+    torch.testing.assert_close(outputs[0], ref_o, atol=1e-2, rtol=0)
+
+
+def test_blackwell_fa_ws_pipelined_persistent_2cta_pruning():
+    selected = _prune_fwd_configs(
+        _configs_fwd,
+        {},
+        HEAD_DIM=128,
+        STAGE=1,
+        N_CTX=768,
+    )
+    assert selected
+    assert all(config.kwargs.get("NUM_CTAS", 1) == 1 for config in selected)
+
+    selected = _prune_fwd_configs(
+        _configs_fwd,
+        {},
+        HEAD_DIM=128,
+        STAGE=1,
+        N_CTX=1024,
+    )
+    assert any(config.kwargs.get("NUM_CTAS", 1) == 2 for config in selected)
+    assert all(
+        config.kwargs["NUM_BUFFERS_KV"] == 3
+        for config in selected
+        if config.kwargs.get("NUM_CTAS", 1) == 2
+    )
+
+
 @pytest.mark.parametrize("Z,H", [(4, 8), (4, 48), (24, 8)])
 @pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell GPU")
 def test_blackwell_fa_ws_pipelined_persistent_2cta_probe(Z, H):
-    # Isolation probe (deadlock already fixed; single launch is enough for
-    # correctness). Distinguish grid-size/tile-pairing vs head-count as the
-    # cause of the H=48 correctness failure:
-    #   (4,8)  128 tiles  (baseline, expect pass)
-    #   (4,48) 768 tiles / 192 (batch,head) groups (known fail)
-    #   (24,8) 768 tiles / 192 groups -- SAME tile layout as (4,48) but H=8.
-    # (24,8) fail -> grid-size / work-steal pairing (head-agnostic);
-    # (24,8) pass -> failure is specific to head count.
+    # Cover multiple persistent waves and equivalent batch/head decompositions.
     config = FlashAttention.CONFIGS["blackwell_fa_ws_pipelined_persistent_2cta"].copy()
-    config["RESCALE_OPT"] = True
-    config["USE_WHERE"] = False
+    config.update({
+        "NUM_BUFFERS_KV": 3,
+        "RESCALE_OPT": True,
+        "USE_WHERE": False,
+        "USE_WARP_BARRIER": True,
+        "PIPELINED": True,
+        "DENSE_REGS": 176,
+    })
     sm_scale = 0.5
     N_CTX, HEAD_DIM = 1024, 128
     q, k, v = FlashAttention.create_inputs(Z, H, N_CTX, HEAD_DIM)
@@ -963,10 +1148,11 @@ def test_blackwell_fa_clc(N_CTX, causal, RESCALE_OPT, USE_WHERE):
 
 @pytest.mark.parametrize("NUM_CTAS", [1, 2])
 @pytest.mark.parametrize("USE_WARP_BARRIER", [False, True])
+@pytest.mark.parametrize("HEAD_DIM", [64, 128])
 @pytest.mark.parametrize("causal", [True, False])
 @pytest.mark.parametrize("RESCALE_OPT,USE_WHERE", [(False, False), (True, False), (True, True)])
 @pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell GPU")
-def test_blackwell_fa_ws_pipelined_persistent_bwd(causal, RESCALE_OPT, USE_WHERE, USE_WARP_BARRIER, NUM_CTAS):
+def test_blackwell_fa_ws_pipelined_persistent_bwd(causal, RESCALE_OPT, USE_WHERE, HEAD_DIM, USE_WARP_BARRIER, NUM_CTAS):
     if NUM_CTAS == 2 and USE_WARP_BARRIER:
         pytest.skip("the 2-CTA configuration uses cluster barriers")
     fwd_config: dict[str,
@@ -975,7 +1161,7 @@ def test_blackwell_fa_ws_pipelined_persistent_bwd(causal, RESCALE_OPT, USE_WHERE
     fwd_config["USE_WHERE"] = USE_WHERE
     sm_scale = 0.5
 
-    for Z, H, N_CTX, HEAD_DIM in FlashAttention.SHAPES:
+    for Z, H, N_CTX, _ in FlashAttention.SHAPES:
         direct_dq_output = NUM_CTAS == 2 and HEAD_DIM == 128
         q, k, v = FlashAttention.create_inputs(Z, H, N_CTX, HEAD_DIM)
 
@@ -1157,6 +1343,44 @@ def test_blackwell_fa_ws_pipelined_persistent_direct_dq_pruning():
     )
     assert odd_tiles
     assert all(config.kwargs.get("NUM_CTAS", 1) == 1 for config in odd_tiles)
+
+
+@pytest.mark.parametrize(
+    "dtype,N_CTX,causal",
+    [
+        (torch.float16, 128, False),
+        (torch.float16, 384, False),
+        (torch.float16, 1024, False),
+        (torch.bfloat16, 1024, False),
+        (torch.bfloat16, 1024, True),
+        (torch.bfloat16, 4096, False),
+    ],
+)
+@pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell GPU")
+def test_blackwell_fa_ws_pipelined_persistent_backward_public_paths(dtype, N_CTX, causal):
+    shape = (1, 1, N_CTX, 128)
+    torch.manual_seed(20)
+    q0, k0, v0 = [torch.empty(shape, device=DEVICE, dtype=dtype).normal_(mean=0.0, std=0.5) for _ in range(3)]
+    do = torch.empty(shape, device=DEVICE, dtype=dtype).normal_(mean=0.0, std=0.5)
+
+    ref_q, ref_k, ref_v = [tensor.detach().clone().requires_grad_() for tensor in (q0, k0, v0)]
+    ref_o = torch.nn.functional.scaled_dot_product_attention(ref_q, ref_k, ref_v, scale=0.5, is_causal=causal)
+    ref_o.backward(do)
+    reference = (ref_q.grad, ref_k.grad, ref_v.grad)
+
+    results = []
+    for _ in range(3):
+        q, k, v = [tensor.detach().clone().requires_grad_() for tensor in (q0, k0, v0)]
+        out = _blackwell_fa_ws_pipelined_persistent(q, k, v, 0.5, causal)
+        out.backward(do)
+        result = (q.grad, k.grad, v.grad)
+        assert all(torch.isfinite(grad).all() for grad in result)
+        results.append(result)
+
+    atol = 6.25e-2 if dtype == torch.bfloat16 else 1.5e-2
+    for result in results:
+        for grad, ref_grad in zip(result, reference):
+            torch.testing.assert_close(grad, ref_grad, atol=atol, rtol=0)
 
 
 @pytest.mark.parametrize("HEAD_DIM", [64, 128])
