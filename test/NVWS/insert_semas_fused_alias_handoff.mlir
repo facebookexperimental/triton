@@ -316,18 +316,18 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
     // SEMA: [[A_BASE:%.*]] = ttng.tmem_alloc {buffer.copy = 3 : i32}
     // SEMA: [[A_ENTRY:%.*]] = nvws.semaphore.create [[A_BASE]] released = 1 {pending_count = 1 : i32}
     // SEMA: [[A_NEXT:%.*]] = nvws.semaphore.create [[A_BASE]] released = 6 {pending_count = 1 : i32}
-    // SEMA: [[A_INIT_TOK:%.*]] = nvws.semaphore.acquire [[A_ENTRY]] :
+    // SEMA: [[A_INIT_TOK:%.*]] = nvws.semaphore.acquire [[A_ENTRY]] {ttg.partition = array<i32: 0>, ttg.warp_specialize.tag = 10 : i32} :
     // ASP: [[A_BASE:%.*]] = ttng.tmem_alloc {buffer.copy = 3 : i32}
     // ASP: [[A_ENTRY:%.*]] = nvws.semaphore.create [[A_BASE]] released = 1 {pending_count = 1 : i32}
     // ASP: [[A_NEXT:%.*]] = nvws.semaphore.create [[A_BASE]] released = 6 {pending_count = 1 : i32}
     // ASP: [[A_INITIAL_CURRENT_STAGE:%.*]] = arith.constant 2 : i32
-    // ASP: [[A_INITIAL_ONE:%.*]] = arith.constant 1 : i32
-    // ASP: [[A_INITIAL_NEXT_RAW:%.*]] = arith.addi [[A_INITIAL_CURRENT_STAGE]], [[A_INITIAL_ONE]] : i32
-    // ASP: [[A_INITIAL_DEPTH:%.*]] = arith.constant 3 : i32
-    // ASP: [[A_INITIAL_NEEDS_WRAP:%.*]] = arith.cmpi eq, [[A_INITIAL_NEXT_RAW]], [[A_INITIAL_DEPTH]] : i32
-    // ASP: [[A_INITIAL_ZERO:%.*]] = arith.constant 0 : i32
-    // ASP: [[A_INITIAL_NEXT_STAGE:%.*]] = arith.select [[A_INITIAL_NEEDS_WRAP]], [[A_INITIAL_ZERO]], [[A_INITIAL_NEXT_RAW]] : i32
-    // ASP: [[A_INIT_TOK:%.*]] = nvws.semaphore.acquire [[A_ENTRY]][[[A_INITIAL_NEXT_STAGE]], {{%.*}}]
+    // ASP: [[A_INITIAL_ONE:%.*]] = arith.constant {ttg.partition = array<i32: 0, 1>, ttg.warp_specialize.tag = 10 : i32} 1 : i32
+    // ASP: [[A_INITIAL_NEXT_RAW:%.*]] = arith.addi [[A_INITIAL_CURRENT_STAGE]], [[A_INITIAL_ONE]] {ttg.partition = array<i32: 0, 1>, ttg.warp_specialize.tag = 10 : i32} : i32
+    // ASP: [[A_INITIAL_DEPTH:%.*]] = arith.constant {ttg.partition = array<i32: 0, 1>, ttg.warp_specialize.tag = 10 : i32} 3 : i32
+    // ASP: [[A_INITIAL_NEEDS_WRAP:%.*]] = arith.cmpi eq, [[A_INITIAL_NEXT_RAW]], [[A_INITIAL_DEPTH]] {ttg.partition = array<i32: 0, 1>, ttg.warp_specialize.tag = 10 : i32} : i32
+    // ASP: [[A_INITIAL_ZERO:%.*]] = arith.constant {ttg.partition = array<i32: 0, 1>, ttg.warp_specialize.tag = 10 : i32} 0 : i32
+    // ASP: [[A_INITIAL_NEXT_STAGE:%.*]] = arith.select [[A_INITIAL_NEEDS_WRAP]], [[A_INITIAL_ZERO]], [[A_INITIAL_NEXT_RAW]] {ttg.partition = array<i32: 0, 1>, ttg.warp_specialize.tag = 10 : i32} : i32
+    // ASP: [[A_INIT_TOK:%.*]] = nvws.semaphore.acquire [[A_ENTRY]][[[A_INITIAL_NEXT_STAGE]], {{%.*}}] {ttg.partition = array<i32: 0>, ttg.warp_specialize.tag = 10 : i32}
     %acc, %tok = ttng.tmem_alloc {buffer.copy = 3 : i32} : () -> (!ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.async.token)
     // SEMA: scf.for {{.*}} iter_args([[A_W0_TOK:%.*]] = [[A_INIT_TOK]])
     // ASP: scf.for {{.*}} iter_args([[A_W0_TOK:%.*]] = [[A_INIT_TOK]], [[A_CURRENT_STAGE:%.*]] = [[A_INITIAL_NEXT_STAGE]],
@@ -525,18 +525,18 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
     // SEMA: [[D_BASE:%.*]] = ttng.tmem_alloc {buffer.copy = 3 : i32}
     // SEMA: [[D_ENTRY:%.*]] = nvws.semaphore.create [[D_BASE]] released = 1 {pending_count = 1 : i32}
     // SEMA: [[D_NEXT:%.*]] = nvws.semaphore.create [[D_BASE]] released = 6 {pending_count = 1 : i32}
-    // SEMA: [[D_INIT_TOK:%.*]] = nvws.semaphore.acquire [[D_ENTRY]] :
+    // SEMA: [[D_INIT_TOK:%.*]] = nvws.semaphore.acquire [[D_ENTRY]] {ttg.partition = array<i32: 0>, ttg.warp_specialize.tag = 13 : i32} :
     // ASP: [[D_BASE:%.*]] = ttng.tmem_alloc {buffer.copy = 3 : i32}
     // ASP: [[D_ENTRY:%.*]] = nvws.semaphore.create [[D_BASE]] released = 1 {pending_count = 1 : i32}
     // ASP: [[D_NEXT:%.*]] = nvws.semaphore.create [[D_BASE]] released = 6 {pending_count = 1 : i32}
     // ASP: [[D_INITIAL_CURRENT_STAGE:%.*]] = arith.constant 2 : i32
-    // ASP: [[D_INITIAL_ONE:%.*]] = arith.constant 1 : i32
-    // ASP: [[D_INITIAL_NEXT_RAW:%.*]] = arith.addi [[D_INITIAL_CURRENT_STAGE]], [[D_INITIAL_ONE]] : i32
-    // ASP: [[D_INITIAL_DEPTH:%.*]] = arith.constant 3 : i32
-    // ASP: [[D_INITIAL_NEEDS_WRAP:%.*]] = arith.cmpi eq, [[D_INITIAL_NEXT_RAW]], [[D_INITIAL_DEPTH]] : i32
-    // ASP: [[D_INITIAL_ZERO:%.*]] = arith.constant 0 : i32
-    // ASP: [[D_INITIAL_NEXT_STAGE:%.*]] = arith.select [[D_INITIAL_NEEDS_WRAP]], [[D_INITIAL_ZERO]], [[D_INITIAL_NEXT_RAW]] : i32
-    // ASP: [[D_INIT_TOK:%.*]] = nvws.semaphore.acquire [[D_ENTRY]][[[D_INITIAL_NEXT_STAGE]], {{%.*}}]
+    // ASP: [[D_INITIAL_ONE:%.*]] = arith.constant {ttg.partition = array<i32: 0, 1>, ttg.warp_specialize.tag = 13 : i32} 1 : i32
+    // ASP: [[D_INITIAL_NEXT_RAW:%.*]] = arith.addi [[D_INITIAL_CURRENT_STAGE]], [[D_INITIAL_ONE]] {ttg.partition = array<i32: 0, 1>, ttg.warp_specialize.tag = 13 : i32} : i32
+    // ASP: [[D_INITIAL_DEPTH:%.*]] = arith.constant {ttg.partition = array<i32: 0, 1>, ttg.warp_specialize.tag = 13 : i32} 3 : i32
+    // ASP: [[D_INITIAL_NEEDS_WRAP:%.*]] = arith.cmpi eq, [[D_INITIAL_NEXT_RAW]], [[D_INITIAL_DEPTH]] {ttg.partition = array<i32: 0, 1>, ttg.warp_specialize.tag = 13 : i32} : i32
+    // ASP: [[D_INITIAL_ZERO:%.*]] = arith.constant {ttg.partition = array<i32: 0, 1>, ttg.warp_specialize.tag = 13 : i32} 0 : i32
+    // ASP: [[D_INITIAL_NEXT_STAGE:%.*]] = arith.select [[D_INITIAL_NEEDS_WRAP]], [[D_INITIAL_ZERO]], [[D_INITIAL_NEXT_RAW]] {ttg.partition = array<i32: 0, 1>, ttg.warp_specialize.tag = 13 : i32} : i32
+    // ASP: [[D_INIT_TOK:%.*]] = nvws.semaphore.acquire [[D_ENTRY]][[[D_INITIAL_NEXT_STAGE]], {{%.*}}] {ttg.partition = array<i32: 0>, ttg.warp_specialize.tag = 13 : i32}
     %acc, %tok = ttng.tmem_alloc {buffer.copy = 3 : i32} : () -> (!ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.async.token)
     // SEMA: scf.for {{.*}} iter_args([[D_W0_TOK:%.*]] = [[D_INIT_TOK]])
     // ASP: scf.for {{.*}} iter_args([[D_W0_TOK:%.*]] = [[D_INIT_TOK]], [[D_CURRENT_STAGE:%.*]] = [[D_INITIAL_NEXT_STAGE]],

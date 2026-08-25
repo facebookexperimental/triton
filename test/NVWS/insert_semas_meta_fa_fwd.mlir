@@ -155,8 +155,8 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
     // outer loop; the R5 token does not.
     // CHECK:           [[IA_R4:%.*]] = nvws.semaphore.acquire [[R4_E]] {ttg.partition = array<i32: 1>, ttg.warp_specialize.tag = 0 : i32} : <[{{.*}}]> -> !ttg.async.token
     // CHECK:           [[IA_R5:%.*]] = nvws.semaphore.acquire [[R5_E]] {ttg.partition = array<i32: 1>, ttg.warp_specialize.tag = 0 : i32} : <[{{.*}}]> -> !ttg.async.token
-    // CHECK:           [[IA_ACC0:%.*]] = nvws.semaphore.acquire [[ACC0_E]] : <[!ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable>]> -> !ttg.async.token
-    // CHECK:           [[IA_ACC1:%.*]] = nvws.semaphore.acquire [[ACC1_E]] : <[!ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable>]> -> !ttg.async.token
+    // CHECK:           [[IA_ACC0:%.*]] = nvws.semaphore.acquire [[ACC0_E]] {ttg.partition = array<i32: 0>, ttg.warp_specialize.tag = 0 : i32} : <[!ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable>]> -> !ttg.async.token
+    // CHECK:           [[IA_ACC1:%.*]] = nvws.semaphore.acquire [[ACC1_E]] {ttg.partition = array<i32: 0>, ttg.warp_specialize.tag = 0 : i32} : <[!ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable>]> -> !ttg.async.token
 
     // R5 is not carried through the outer persistent loop. R4 also needs no
     // carried token.
