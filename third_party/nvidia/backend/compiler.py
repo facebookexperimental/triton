@@ -241,6 +241,7 @@ class CUDAOptions:
     # instead of host TMA recipes. Falls back to knobs.nvidia.auto_tma_device.
     auto_tma_device: bool = False
     enable_tree_reduction: bool = False
+    enable_nvptx_v2i32: bool = False
 
     def __post_init__(self):
         default_libdir = Path(__file__).parent / "lib"
@@ -1296,6 +1297,8 @@ class CUDABackend(BaseBackend):
         proc = sm_arch_from_capability(cap_llvm)
         features = get_features(opt, cap_llvm)
         flags = ["nvptx-mad-wide-opt"]
+        if opt.enable_nvptx_v2i32:
+            flags.append("nvptx-v2i32")
         canonicalize_gep = "fpsan" in opt.instrumentation_mode
         ret = llvm.translate_to_asm(src, triple, proc, features, flags, opt.enable_fp_fusion, False, canonicalize_gep)
         # Find kernel names (there should only be one)

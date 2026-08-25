@@ -32,15 +32,19 @@ def test_config_backend_options():
     tree_config = triton.Config(kwargs={}, enable_tree_reduction=True)
     linear_config = triton.Config(kwargs={}, enable_tree_reduction=False)
     dependent_two_cta_config = triton.Config(kwargs={}, allowDependentTwoCTA=True)
+    packed_i32_config = triton.Config(kwargs={}, enable_nvptx_v2i32=True)
 
     assert "enable_tree_reduction" not in default_config.all_kwargs()
+    assert "enable_nvptx_v2i32" not in default_config.all_kwargs()
     assert tree_config.all_kwargs()["enable_tree_reduction"] is True
     assert linear_config.all_kwargs()["enable_tree_reduction"] is False
     assert "allowDependentTwoCTA" not in default_config.all_kwargs()
     assert dependent_two_cta_config.all_kwargs()["allowDependentTwoCTA"] is True
+    assert packed_i32_config.all_kwargs()["enable_nvptx_v2i32"] is True
 
     amd_backend = HIPBackend(GPUTarget("hip", "gfx942", 64))
     assert amd_backend.parse_options(default_config.all_kwargs()).enable_tree_reduction is False
+    assert amd_backend.parse_options(packed_i32_config.all_kwargs()).enable_nvptx_v2i32 is True
     assert amd_backend.parse_options(tree_config.all_kwargs()).enable_tree_reduction is True
     assert amd_backend.parse_options(linear_config.all_kwargs()).enable_tree_reduction is False
 
@@ -51,6 +55,8 @@ def test_config_backend_options():
     assert h100_backend.parse_options(linear_config.all_kwargs()).enable_tree_reduction is False
     assert blackwell_backend.parse_options(tree_config.all_kwargs()).enable_tree_reduction is True
     assert blackwell_backend.parse_options(dependent_two_cta_config.all_kwargs()).allowDependentTwoCTA is True
+    assert blackwell_backend.parse_options(default_config.all_kwargs()).enable_nvptx_v2i32 is False
+    assert blackwell_backend.parse_options(packed_i32_config.all_kwargs()).enable_nvptx_v2i32 is True
 
 
 def test_c_cache_fallback_forwards_autotune_config_options():
