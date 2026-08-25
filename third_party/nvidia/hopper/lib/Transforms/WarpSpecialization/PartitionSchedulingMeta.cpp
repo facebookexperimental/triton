@@ -2966,6 +2966,54 @@ void PartitionSchedulingMeta::runOnOperation() {
         }
       }
 
+      // A predicated TMEM read-modify-write becomes an scf.if only after code
+      // specialization. Until then, keep its predicate chain in the same
+      // partition as the store: code partitioning does not materialize scalar
+      // channels. Also pull tensor elementwise ops feeding the scalar chain
+      // into the store partition. The op may have any number of users, as long
+      // as every one of them is already in the store's partition -- otherwise
+      // moving it would drag a value across a partition boundary. FA forward
+      // uses this to compute `alpha < 1` beside the alpha channel load instead
+      // of creating a second tensor channel for the predicate. Its tensor
+      // operands remain ordinary channel boundaries.
+      getLoopBodyRegion(loop).walk([&](ttng::TMEMStoreOp store) {
+        if (!store.getPred().getType().isInteger(1))
+          return;
+        if (store.getPred().getDefiningOp<arith::ConstantOp>())
+          return;
+        SetVector<int> storeIds = safeGetPartitionIds(store);
+        if (storeIds.size() != 1)
+          return;
+        SmallVector<Operation *> worklist;
+        if (Operation *def = store.getPred().getDefiningOp())
+          worklist.push_back(def);
+        DenseSet<Operation *> seen;
+        while (!worklist.empty()) {
+          Operation *op = worklist.pop_back_val();
+          if (!seen.insert(op).second ||
+              op->getParentRegion() != store->getParentRegion())
+            continue;
+          bool hasTensorResult =
+              llvm::any_of(op->getResults(), [](Value result) {
+                return isa<RankedTensorType>(result.getType());
+              });
+          if (hasTensorResult) {
+            if (!op->hasTrait<OpTrait::Elementwise>() ||
+                llvm::any_of(op->getUsers(), [&](Operation *user) {
+                  return safeGetPartitionIds(user) != storeIds;
+                }))
+              continue;
+          }
+          op->walk([&](Operation *nested) { setPartition(nested, storeIds); });
+          for (Value operand : op->getOperands()) {
+            if (hasTensorResult && isa<RankedTensorType>(operand.getType()))
+              continue;
+            if (Operation *def = operand.getDefiningOp())
+              worklist.push_back(def);
+          }
+        }
+      });
+
       // Scalar values are rematerializable and must not become cross-partition
       // channels: WS buffer allocation only materializes ranked tensor values.
       // This matters for persistent jagged kernels where a scalar seq-offset
