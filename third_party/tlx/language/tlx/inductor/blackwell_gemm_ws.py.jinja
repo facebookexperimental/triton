@@ -37,6 +37,12 @@
         tlx.storage_kind.tmem,
     )
 {% if SPLIT_K > 1 %}
+    # Split-K writes fp32 partials to split_k_ws and never store_output()s, so out_ptr0
+    # would be pruned from the kernel signature -- but the autotuning harness always
+    # passes `out` positionally, so the trailing arg would land on `stream`. Referencing
+    # output_ptr() keeps it in the signature; the real output is written by
+    # _reduce_k_kernel (see registry _tlx_emit_post_kernel_code).
+    keep_out_ptr = {{output_ptr()}}  # noqa: F841
     NUM_EPILOGUE_SMEM_BUFFERS: tl.constexpr = NUM_MMA_GROUPS if NUM_MMA_GROUPS > 2 else 2
     ws_smem_buffers = tlx.local_alloc(
         (BLOCK_M_SPLIT, slice_size),

@@ -876,6 +876,100 @@ class TestSplitK(TestCase):
         # relu is fused into the reducer, so no separate pointwise kernel
         self.assertNotIn("triton_poi_", code_str)
 
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    def test_split_k_template_keeps_output_ptr(self):
+        """The SPLIT_K > 1 branch must reference output_ptr(). No GPU needed.
+
+        Split-K writes fp32 partials to split_k_ws and never calls store_output(), so
+        without an explicit output_ptr() reference Inductor prunes out_ptr0 from the
+        kernel signature. The autotune benchmark harness still passes `out`
+        positionally, so the trailing argument lands on the launcher's `stream`
+        parameter and every SPLIT_K > 1 candidate dies with "too many positional
+        arguments ... 'stream' must be passed as a keyword argument" before it can be
+        measured. Rendering the jinja directly pins the reference regardless of which
+        config autotune happens to select.
+        """
+        import jinja2
+        from triton.language.extra.tlx.inductor.mm_templates import load_tlx_template
+
+        source = load_tlx_template("blackwell_gemm_ws")
+
+        # Count output_ptr() invocations rather than grepping the rendered text: it is
+        # calling the hook, not the spelling of the emitted line, that registers the
+        # buffer in the kernel signature.
+        output_ptr_calls = []
+
+        def output_ptr(*a, **k):
+            output_ptr_calls.append(1)
+            return "out_ptr0"
+
+        hooks = {
+            "def_kernel": lambda *a, **k: "def _kernel(A, B, out_ptr0):",
+            "size": lambda *a, **k: "0",
+            "stride": lambda *a, **k: "1",
+            "output_ptr": output_ptr,
+            "store_output": lambda *a, **k: "# store_output(...)",
+            "compute_epilogue": lambda *a, **k: "# compute_epilogue(...)",
+        }
+        tmpl = jinja2.Environment().from_string(source)
+        common = dict(TMA_EPILOGUE_STORE=0, INTERLEAVE_EPILOGUE=0, **hooks)
+
+        split = tmpl.render(SPLIT_K=4, **common)
+        self.assertIn("split_k_ws", split)
+        self.assertTrue(output_ptr_calls, "SPLIT_K > 1 must reference output_ptr()")
+
+        # Negative control: the plain data-parallel path stores through store_output,
+        # which registers the output buffer on its own, so output_ptr() is not needed.
+        output_ptr_calls.clear()
+        nosplit = tmpl.render(SPLIT_K=1, **common)
+        self.assertFalse(output_ptr_calls)
+        self.assertNotIn("split_k_ws", nosplit)
+
+    @unittest.skipIf(
+        not has_datacenter_blackwell_tma_device(),
+        "Need Blackwell with device-side TMA support in Triton",
+    )
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    def test_split_k_candidate_survives_autotune_in_allow_mode(self):
+        """A SPLIT_K > 1 candidate must survive being stood up by the benchmark harness.
+
+        The other split-K tests here run in force mode, where the heuristic config is
+        the only choice and autotuning short-circuits -- so the candidate is never
+        handed to the benchmark harness and its arg-count mismatch stays invisible.
+        allow mode makes it compete against the autotune pool, which is what every
+        undersaturated large-K shape does in practice, and is the path that used to
+        raise "'stream' must be passed as a keyword argument".
+        """
+        from triton.language.extra.tlx.inductor.registry import get_heuristic_config
+
+        def mm(a, b):
+            return torch.mm(a, b)
+
+        # 8 MN tiles (128x64) on 148 SMs -> deeply undersaturated, and K=8192 leaves
+        # each of 4 splits well above the 4-K-tile floor, so Rule 6 picks SPLIT_K > 1.
+        M, K, N = 256, 8192, 256
+        heuristic = get_heuristic_config(M, N, K)
+        # Guard against the heuristic drifting and silently turning this into a
+        # SPLIT_K=1 test that no longer covers the split-K benchmark path.
+        self.assertGreater(heuristic.get("SPLIT_K", 1) if heuristic else 1, 1)
+
+        a = torch.randn(M, K, dtype=torch.float16, device=GPU_TYPE)
+        b = torch.randn(K, N, dtype=torch.float16, device=GPU_TYPE)
+
+        with (
+                config.patch({
+                    "triton.tlx_mode": "allow",
+                    "max_autotune": True,
+                    "max_autotune_gemm_backends": "TRITON",
+                    "force_disable_caches": True,
+                    "enable_caching_generated_triton_templates": False,
+                }),
+                tlx_config.patch(use_heuristic_config=True, ),
+        ):
+            c_actual = torch.compile(mm)(a, b)
+
+        torch.testing.assert_close(c_actual, mm(a, b), atol=0.01, rtol=0.01)
+
 
 class TestReduceKKernel(TestCase):
     """Direct unit tests for the split-K reduction kernel."""
