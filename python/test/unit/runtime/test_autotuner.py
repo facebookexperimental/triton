@@ -53,6 +53,41 @@ def test_config_backend_options():
     assert blackwell_backend.parse_options(dependent_two_cta_config.all_kwargs()).allowDependentTwoCTA is True
 
 
+def test_c_cache_fallback_forwards_autotune_config_options():
+
+    class Param:
+        is_constexpr = False
+
+    class FakeJITFunction:
+        c_cache = True
+        arg_names = ["x"]
+        params = [Param()]
+
+        def __init__(self):
+            self.run_kwargs = None
+
+        def _get_jit_cache_proxy(self, grid):
+            return None
+
+        def run(self, *args, **kwargs):
+            self.run_kwargs = kwargs
+            return "fallback"
+
+    fn = FakeJITFunction()
+    autotuner = object.__new__(_autotuner.Autotuner)
+    autotuner.fn = fn
+    autotuner.keys = []
+    autotuner._fc_seeded = {None}
+    autotuner._last_key = None
+    config = triton.Config({}, num_warps=4, num_stages=2)
+
+    result = autotuner._try_fast_path((object(), ), {"grid": (1, )}, config)
+
+    assert result == "fallback"
+    assert fn.run_kwargs["num_warps"] == 4
+    assert fn.run_kwargs["num_stages"] == 2
+
+
 @pytest.mark.parametrize('use_cuda_graph', [False, True])
 def test_kwargs(use_cuda_graph: bool, device: str):
     if use_cuda_graph and not torch.cuda.is_available():
