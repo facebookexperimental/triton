@@ -138,6 +138,55 @@ class TestTLXTemplates(TestCase):
             pass  # Both TMA and tl.store paths are valid
 
     @unittest.skipIf(
+        not has_datacenter_blackwell_tma_device(),
+        "Need Blackwell with device-side TMA support in Triton",
+    )
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    @parametrize("layout", ("a_col", "b_col", "both_col"))
+    def test_tlx_matmul_ws_column_major(self, layout: str):
+        """A column-major operand goes through the transposed TMA descriptor path.
+
+        A column-major (M, K) operand has strides (1, M), so its .T is a row-major
+        (K, M) view of the same memory. The template describes that view, loads the
+        flipped tile shape, and recovers the MMA operand with tlx.local_trans -- no
+        contiguous copy. tlx_mode=force makes the TLX template the only choice, so a
+        layout it cannot handle fails here rather than quietly losing autotune.
+        """
+
+        def mm(a, b):
+            return torch.mm(a, b)
+
+        # Saturated (Rule 7) so the heuristic picks SPLIT_K=1: a split-K config would
+        # trip the separate reduce-k launch bug, which has nothing to do with layout.
+        M, K, N = 4096, 2048, 4096
+        dtype = torch.bfloat16
+        a = torch.randn((M, K), dtype=dtype, device=GPU_TYPE)
+        b = torch.randn((K, N), dtype=dtype, device=GPU_TYPE)
+        if layout in ("a_col", "both_col"):
+            a = a.t().contiguous().t()
+        if layout in ("b_col", "both_col"):
+            b = b.t().contiguous().t()
+
+        with config.patch({
+                "triton.tlx_mode": "force",
+                "force_disable_caches": True,
+                "enable_caching_generated_triton_templates": False,
+        }):
+            c_actual, code = run_and_get_code(torch.compile(mm), a, b)
+            c_expected = mm(a, b)
+
+        torch.testing.assert_close(c_actual, c_expected, atol=0.01, rtol=0.01)
+
+        # Both layout branches are constexpr and so both appear in the emitted source;
+        # the compiled-in flag is what says which one Triton folded to.
+        code_str = "\n".join(code)
+        self.assertIn("triton_tem_fused_tlx_mm", code_str)
+        if layout in ("a_col", "both_col"):
+            self.assertIn("A_ROW_MAJOR : tl.constexpr = False", code_str)
+        if layout in ("b_col", "both_col"):
+            self.assertIn("B_ROW_MAJOR : tl.constexpr = False", code_str)
+
+    @unittest.skipIf(
         not is_gfx950(),
         "Need AMD MI350X (gfx950) for the TLX warp-pipe addmm template",
     )

@@ -21,6 +21,7 @@ them without importing torch._inductor.
 import dataclasses
 import logging
 import os
+from collections.abc import Sequence
 from typing import Any, Generator
 
 log = logging.getLogger(__name__)
@@ -807,68 +808,29 @@ class BlackwellGemmWSConfigMixin(TMATemplateConfigMixin):
             check_tmem=False,
         )
 
-    def adjust_kernel_inputs(
-        self,
-        kernel_inputs: KernelInputs,
-        op_name: str,
-    ) -> KernelInputs:
-        """
-        Adjust kernel inputs for TLX template.
+    @staticmethod
+    def _row_major_kwargs(kernel_inputs: KernelInputs) -> dict[str, bool]:
+        """A_ROW_MAJOR/B_ROW_MAJOR, spelled exactly as TMATemplateConfigMixin does."""
+        mat1, mat2 = kernel_inputs.mat1mat2()
+        return {
+            "A_ROW_MAJOR": not mat1.layout.is_transposed(),
+            "B_ROW_MAJOR": not mat2.layout.is_transposed(),
+        }
 
-        TLX Blackwell GEMM template requires both A and B to be row-major
-        (stride[-1] == 1). If either is column-major, make it contiguous to
-        convert to row-major layout.
-
-        Note: Unlike triton_blackwell_ws_persistent_device_tma_mm.py.jinja which uses
-        A_ROW_MAJOR/B_ROW_MAJOR flags to handle column-major inputs via transposed TMA
-        descriptor + .T after load, the TLX template cannot easily support this approach
-        because:
-        1. tlx.async_dot operates directly on SMEM buffers with fixed shapes
-        2. Loading column-major data with transposed descriptor yields transposed layout
-           in SMEM
-        3. There's no simple transpose before async_dot (unlike tl.dot which accepts .T)
-
-        Making A/B contiguous here matches the standalone TLX kernel behavior
-        (a.contiguous(), b.contiguous() in tritonbench wrapper) and ensures correct
-        results with minimal template changes.
-        """
-        from torch._inductor.ir import ExternKernel
-
-        assert isinstance(kernel_inputs, MMKernelInputs), "Expect MMKernelInputs"
+    @staticmethod
+    def _has_unsupported_layout(kernel_inputs: KernelInputs) -> bool:
+        if not isinstance(kernel_inputs, MMKernelInputs):
+            return False
 
         strides = kernel_inputs.strides_hinted()
-        nodes = list(kernel_inputs.nodes())
-        mat1_idx = kernel_inputs._mat1_idx
-        mat2_idx = kernel_inputs._mat2_idx
-        changed = False
 
-        # Check A's layout from strides
-        # Column-major A has stride pattern [1, M] where inner dim stride is not 1
-        a_strides = strides[mat1_idx]
-        is_a_col_major = a_strides[-2] == 1 and a_strides[-1] != 1
-        if is_a_col_major:
-            mat_a_contiguous = ExternKernel.require_contiguous(nodes[mat1_idx])
-            nodes[mat1_idx] = mat_a_contiguous
-            changed = True
+        def is_dense_2d(s: Sequence[int]) -> bool:
+            return s[-1] == 1 or s[-2] == 1
 
-        # Check B's layout from strides
-        # Column-major B has stride pattern [1, N] where first stride is 1
-        b_strides = strides[mat2_idx]
-        is_b_col_major = b_strides[-2] == 1 and b_strides[-1] != 1
-        if is_b_col_major:
-            mat_b_contiguous = ExternKernel.require_contiguous(nodes[mat2_idx])
-            nodes[mat2_idx] = mat_b_contiguous
-            changed = True
-
-        if changed:
-            return MMKernelInputs(
-                nodes,
-                kernel_inputs.output_layout(),
-                mat1_idx=mat1_idx,
-                mat2_idx=mat2_idx,
-            )
-
-        return kernel_inputs
+        return not (
+            is_dense_2d(strides[kernel_inputs._mat1_idx])
+            and is_dense_2d(strides[kernel_inputs._mat2_idx])
+        )
 
     def _get_template_configs_impl(
         self,
@@ -923,6 +885,10 @@ class BlackwellGemmWSConfigMixin(TMATemplateConfigMixin):
                 "num_stages": 1,
                 "num_warps": 4,
                 "NUM_SMS": num_sms,
+                # This config is hand-built rather than routed through
+                # TMATemplateConfigMixin, so it has to carry the layout flags itself;
+                # the autotuning pool below picks them up from super().
+                **self._row_major_kwargs(kernel_inputs),
             }
 
             # Check NUM_CTAS=2 compatibility
@@ -1455,8 +1421,16 @@ class BlackwellGemmWSConfigHeuristic(BlackwellGemmWSConfigMixin, CUDAConfigHeuri
 
     def should_run(self, inputs: KernelInputs) -> bool:
         """
-        Override to allow TLX templates to run without max_autotune when tlx_mode is set.
+        Override to allow TLX templates to run without max_autotune when tlx_mode is set,
+        and to decline operands the template's TMA descriptors cannot describe.
+
+        Both descriptor forms in the template hardcode a unit innermost stride, so an
+        operand that is neither row- nor column-major has no valid form and is declined
+        rather than described with a stride it does not have.
         """
+        if self._has_unsupported_layout(inputs):
+            log.debug("TLX blackwell_gemm_ws declined: operand is neither row- nor column-major")
+            return False
         if config.triton.tlx_mode in ("allow", "force"):
             return True
         return super().should_run(inputs)
