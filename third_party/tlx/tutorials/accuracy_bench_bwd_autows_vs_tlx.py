@@ -50,7 +50,7 @@ def pin_tlx_config():
     num_ctas = aws_cfg.kwargs.get("NUM_CTAS", 1)
     block_m = aws_cfg.kwargs["BLOCK_M1"]
     cfgs = [
-        c for c in tlx.configs_bwd_tlx
+        c for c in tlx.BWD_CONFIGS
         if c.kwargs.get("NUM_CTAS", 1) == num_ctas and c.kwargs.get("USE_WARP_BARRIER") is False and (
             num_ctas > 1 or c.kwargs.get("BLOCK_M1") == block_m)
     ]
