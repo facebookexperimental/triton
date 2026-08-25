@@ -86,7 +86,7 @@ jobs:
       CONDA_ENV: pytorch
       UV_VENV_DIR: /workspace/uv_venvs
       SETUP_SCRIPT: /workspace/setup_instance.sh
-    timeout-minutes: 30
+    timeout-minutes: 120
     permissions:
       id-token: write
       contents: read
