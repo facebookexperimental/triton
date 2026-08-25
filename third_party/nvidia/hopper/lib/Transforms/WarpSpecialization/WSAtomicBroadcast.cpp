@@ -130,7 +130,8 @@ static AsyncTaskId getOwnerPartition(scf::WhileOp whileOp,
   whileOp.getAfterBody()->walk([&](Operation *op) {
     if (found)
       return;
-    if (isa<tt::DescriptorLoadOp, ttng::AsyncTMACopyGlobalToLocalOp>(op)) {
+    if (isa<tt::DescriptorLoadLikeOpInterface,
+            ttng::AsyncTMACopyGlobalToLocalOp, ttng::AsyncTMAGatherOp>(op)) {
       auto ids = getAsyncTaskIds(op);
       if (ids.size() == 1) {
         owner = ids[0];
