@@ -230,6 +230,21 @@ def NVGPUTestPingPongPrep : Pass<"nvgpu-test-ping-pong-prep", "mlir::ModuleOp"> 
   ];
 }
 
+def NVGPUConvertDescriptorLoadsToNVWS
+    : Pass<"nvgpu-convert-descriptor-loads-to-nvws", "mlir::ModuleOp"> {
+  let summary = "Convert TT descriptor loads and gathers to NVWS";
+  let description = [{
+    Converts `tt.descriptor_load` and `tt.descriptor_gather` to explicit-buffer
+    `nvws.descriptor_load` and `nvws.descriptor_gather`. This pass performs only
+    descriptor conversion.
+  }];
+  let dependentDialects = ["mlir::arith::ArithDialect",
+                           "mlir::triton::TritonDialect",
+                           "mlir::triton::gpu::TritonGPUDialect",
+                           "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect",
+                           "mlir::triton::nvws::NVWSDialect"];
+}
+
 def NVGPUWSTMAStoreLowering : Pass<"nvgpu-ws-tma-store-lowering", "mlir::ModuleOp"> {
   let summary = "Lower descriptor stores to async TMA copies via shared memory";
 
