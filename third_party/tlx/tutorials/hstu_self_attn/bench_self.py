@@ -212,6 +212,7 @@ _PERF_ENV = {
         "HSTU_SELF_DQ_REUSE": "1",
         "HSTU_SELF_AUTOWS_CLC": "1",
         "HSTU_SELF_AUTOWS_CLC_SMEM_ALGO": "2",
+        "HSTU_SELF_BWD_DKDV_SUBTILE": "2",
         "HSTU_SELF_DP": "1",
         "HSTU_SELF_AUTOWS_BWD_BM": "128",
         "HSTU_SELF_AUTOWS_BWD_BN": "128",
