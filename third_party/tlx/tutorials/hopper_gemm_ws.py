@@ -12,8 +12,6 @@ from triton.tools.tensor_descriptor import TensorDescriptor
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
 
-
-
 def alloc_fn(size: int, align: int, stream: Optional[int]):
     assert align == 128
     assert stream == 0
