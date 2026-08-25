@@ -36,9 +36,9 @@ module attributes {"ttg.num-warps" = 4 : i32} {
       %loaded = ttg.local_load %whole {ttg.partition = array<i32: 1>} : !ttg.memdesc<2xi32, #shared, #smem, mutable> -> !two
       "consumer"(%loaded) {ttg.partition = array<i32: 1>} : (!two) -> ()
     // CHECK: } {tt.warp_specialize
-    // CHECK-NEXT: [[ROOT_DRAIN:%[0-9]+]] = nvws.semaphore.acquire [[ROOT_EMPTY]]
-    // CHECK-NEXT: nvws.semaphore.release [[ROOT_RIGHT_READY]], [[ROOT_DRAIN]] [#nvws.async_op<none>] {arrive_count = 1 : i32}
-    // CHECK-NEXT: nvws.semaphore.release [[ROOT_LEFT_READY]], [[ROOT_DRAIN]] [#nvws.async_op<none>] {arrive_count = 1 : i32}
+    // CHECK-NEXT: [[ROOT_DRAIN:%[0-9]+]] = nvws.semaphore.acquire [[ROOT_EMPTY]] {ttg.partition = array<i32: 0>, ttg.warp_specialize.tag = 0 : i32}
+    // CHECK-NEXT: nvws.semaphore.release [[ROOT_RIGHT_READY]], [[ROOT_DRAIN]] [#nvws.async_op<none>] {arrive_count = 1 : i32, ttg.partition = array<i32: 0>, ttg.warp_specialize.tag = 0 : i32}
+    // CHECK-NEXT: nvws.semaphore.release [[ROOT_LEFT_READY]], [[ROOT_DRAIN]] [#nvws.async_op<none>] {arrive_count = 1 : i32, ttg.partition = array<i32: 0>, ttg.warp_specialize.tag = 0 : i32}
     // CHECK-NEXT: [[ROOT_LEFT_TOKEN:%[0-9]+]] = nvws.semaphore.acquire [[ROOT_LEFT_READY]]
     } {tt.warp_specialize, ttg.partition = array<i32: 0, 1>,
        ttg.warp_specialize.tag = 0 : i32}
@@ -102,9 +102,9 @@ module attributes {"ttg.num-warps" = 4 : i32} {
       %loaded = ttg.local_load %whole {ttg.partition = array<i32: 1>} : !ttg.memdesc<2xi32, #shared, #smem, mutable> -> !two
       "consumer"(%loaded) {ttg.partition = array<i32: 1>} : (!two) -> ()
     // CHECK: } {tt.warp_specialize
-    // CHECK-NEXT: [[P23_DRAIN:%[0-9]+]] = nvws.semaphore.acquire [[P23_EMPTY]]
-    // CHECK-NEXT: nvws.semaphore.release [[P23_RIGHT_READY]], [[P23_DRAIN]] [#nvws.async_op<none>] {arrive_count = 1 : i32}
-    // CHECK-NEXT: nvws.semaphore.release [[P23_ROOT_READY]], [[P23_DRAIN]] [#nvws.async_op<none>] {arrive_count = 1 : i32}
+    // CHECK-NEXT: [[P23_DRAIN:%[0-9]+]] = nvws.semaphore.acquire [[P23_EMPTY]] {ttg.partition = array<i32: 0>, ttg.warp_specialize.tag = 0 : i32}
+    // CHECK-NEXT: nvws.semaphore.release [[P23_RIGHT_READY]], [[P23_DRAIN]] [#nvws.async_op<none>] {arrive_count = 1 : i32, ttg.partition = array<i32: 0>, ttg.warp_specialize.tag = 0 : i32}
+    // CHECK-NEXT: nvws.semaphore.release [[P23_ROOT_READY]], [[P23_DRAIN]] [#nvws.async_op<none>] {arrive_count = 1 : i32, ttg.partition = array<i32: 0>, ttg.warp_specialize.tag = 0 : i32}
     // CHECK-NEXT: [[P23_ROOT_TOKEN:%[0-9]+]] = nvws.semaphore.acquire [[P23_ROOT_READY]]
     } {tt.warp_specialize, ttg.partition = array<i32: 0, 1, 2, 3>,
        ttg.warp_specialize.tag = 0 : i32}
@@ -171,8 +171,8 @@ module attributes {"ttg.num-warps" = 4 : i32} {
       %loaded = ttg.local_load %whole {ttg.partition = array<i32: 1>} : !ttg.memdesc<2xi32, #shared, #smem, mutable> -> !two
       "consumer"(%loaded) {ttg.partition = array<i32: 1>} : (!two) -> ()
     // CHECK: } {tt.warp_specialize
-    // CHECK-NEXT: [[P10_DRAIN:%[0-9]+]] = nvws.semaphore.acquire [[P10_EMPTY]]
-    // CHECK-NEXT: nvws.semaphore.release [[P10_ROOT_READY]], [[P10_DRAIN]] [#nvws.async_op<none>] {arrive_count = 1 : i32}
+    // CHECK-NEXT: [[P10_DRAIN:%[0-9]+]] = nvws.semaphore.acquire [[P10_EMPTY]] {ttg.partition = array<i32: 0>, ttg.warp_specialize.tag = 0 : i32}
+    // CHECK-NEXT: nvws.semaphore.release [[P10_ROOT_READY]], [[P10_DRAIN]] [#nvws.async_op<none>] {arrive_count = 1 : i32, ttg.partition = array<i32: 0>, ttg.warp_specialize.tag = 0 : i32}
     // CHECK-NEXT: [[P10_ROOT_TOKEN:%[0-9]+]] = nvws.semaphore.acquire [[P10_ROOT_READY]]
     } {tt.warp_specialize, ttg.partition = array<i32: 0, 1>,
        ttg.warp_specialize.tag = 0 : i32}

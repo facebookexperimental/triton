@@ -288,12 +288,8 @@ static OpT emitInto(OpBuilder &b, Location loc, const Owner &owner,
     auto forOp = op->template getParentOfType<scf::ForOp>();
     while (forOp && !gpu::hasWarpSpecializeTag(forOp))
       forOp = forOp->template getParentOfType<scf::ForOp>();
-    if (!forOp) {
-      if (owner->first == 0)
-        op->removeAttr(gpu::kPartitionAttrName);
-      else
-        gpu::setWarpSpecializeTag(op, owner->second);
-    }
+    if (!forOp)
+      gpu::setWarpSpecializeTag(op, owner->second);
   }
   return op;
 }
