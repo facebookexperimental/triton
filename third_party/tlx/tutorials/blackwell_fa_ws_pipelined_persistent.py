@@ -3225,6 +3225,7 @@ def _attn_bwd_ws(
     NUM_COMPUTE_SLICES: tl.constexpr,
     DQ_REDUCE_STAGES: tl.constexpr,
     DQ_REDUCE_NCOL: tl.constexpr,
+    DQ_STAGE_COUNT: tl.constexpr,
     DKV_STORE_NCOL: tl.constexpr,
     STAGE: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
@@ -3315,8 +3316,8 @@ def _attn_bwd_ws(
     else:
         dq_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_TMEM, arrive_count=NUM_CTAS)
     if DIRECT_DQ_OUTPUT:
-        dq_stage_fulls = tlx.alloc_warp_barrier(num_barriers=2, num_warps=4)
-        dq_stage_empties = tlx.alloc_barriers(num_barriers=2)
+        dq_stage_fulls = tlx.alloc_warp_barrier(num_barriers=DQ_STAGE_COUNT, num_warps=4)
+        dq_stage_empties = tlx.alloc_barriers(num_barriers=DQ_STAGE_COUNT)
     else:
         dq_stage_fulls = None
         dq_stage_empties = None
@@ -3374,7 +3375,7 @@ def _attn_bwd_ws(
     DQ_SLICE_N: tl.constexpr = HEAD_DIM // EPILOGUE_SUBTILE
     if USE_2CTA:
         DQ_STORE_STAGES: tl.constexpr = 1 if EPILOGUE_SUBTILE == 4 else 2
-        DQ_BUFFER_STAGES: tl.constexpr = 2 if DIRECT_DQ_OUTPUT else DQ_STORE_STAGES
+        DQ_BUFFER_STAGES: tl.constexpr = DQ_STAGE_COUNT if DIRECT_DQ_OUTPUT else DQ_STORE_STAGES
         dq_store_buf = tlx.local_alloc((BLOCK_M1, DQ_SLICE_N), tlx.dtype_of(desc_dq), DQ_BUFFER_STAGES)
     else:
         DQ_REDUCE_ITERS: tl.constexpr = HEAD_DIM // DQ_REDUCE_NCOL
@@ -3759,7 +3760,7 @@ def _attn_bwd_ws(
                         dq_slices = _split_n_2D(dq_full, DQ_PACK_ITERS)
                         for slice_id in tl.static_range(DQ_PACK_ITERS):
                             dq_stage_count = blk_idx * DQ_PACK_ITERS + slice_id
-                            dq_stage_buf_id, dq_stage_phase = get_bufidx_phase(dq_stage_count, 2)
+                            dq_stage_buf_id, dq_stage_phase = get_bufidx_phase(dq_stage_count, DQ_STAGE_COUNT)
                             tlx.barrier_wait(
                                 dq_stage_empties[dq_stage_buf_id],
                                 dq_stage_phase ^ 1,
@@ -3848,9 +3849,9 @@ def _attn_bwd_ws(
                 for blk_idx in range(num_steps):
                     for slice_id in tl.static_range(DQ_PACK_ITERS):
                         dq_stage_count = blk_idx * DQ_PACK_ITERS + slice_id
-                        dq_stage_buf_id, dq_stage_phase = get_bufidx_phase(dq_stage_count, 2)
-                        if dq_stage_count >= 2:
-                            tlx.async_descriptor_store_wait(2)
+                        dq_stage_buf_id, dq_stage_phase = get_bufidx_phase(dq_stage_count, DQ_STAGE_COUNT)
+                        if dq_stage_count >= DQ_STAGE_COUNT:
+                            tlx.async_descriptor_store_wait(DQ_STAGE_COUNT - 1)
                             tlx.barrier_arrive(dq_stage_empties[dq_stage_buf_id])
                         tlx.barrier_wait(dq_stage_fulls[dq_stage_buf_id], dq_stage_phase)
                         dq_smem = dq_store_buf[dq_stage_buf_id]
@@ -4404,6 +4405,7 @@ class _attention(torch.autograd.Function):
             BLK_SLICE_FACTOR=BLK_SLICE_FACTOR,  #
             HEAD_DIM=ctx.HEAD_DIM,  #
             STAGE=stage,  #
+            DQ_STAGE_COUNT=2,
             SCALE_QK_IN_KERNEL=direct_dq_output,
         )
 
