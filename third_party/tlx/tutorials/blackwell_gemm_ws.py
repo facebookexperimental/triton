@@ -22,6 +22,7 @@ def _get_num_sms():
     return torch.cuda.get_device_properties("cuda").multi_processor_count
 
 
+
 def get_heuristic_config(M, N, K, num_sms=148):
     """
     Select optimal GEMM config based on problem shape characteristics.
