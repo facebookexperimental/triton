@@ -425,7 +425,8 @@ def test_amd_fa_cluster_rejects_unsupported_inputs():
         pytest.param(torch.float16, 2048, 128, False, {}, -1, id="short-row"),
         pytest.param(torch.float16, 4096, 128, False, {}, 263, id="n4096"),
         pytest.param(torch.float16, 8192, 128, False, {}, 263, id="n8192"),
-        pytest.param(torch.bfloat16, 4096, 128, False, {}, -1, id="bf16"),
+        pytest.param(torch.bfloat16, 4096, 128, False, {}, -1, id="bf16-n4096"),
+        pytest.param(torch.bfloat16, 16384, 128, False, {}, 263, id="bf16-n16384"),
         pytest.param(torch.float16, 4096, 128, True, {}, -1, id="causal"),
         pytest.param(torch.float16, 4096, 64, False, {}, -1, id="d64"),
         pytest.param(torch.float16, 4096, 128, False, {"use_autotune": False}, -1, id="explicit-config"),
@@ -453,15 +454,15 @@ def test_amd_fa_cluster_selects_static_k_row_stride(dtype, n_ctx, head_dim, caus
 
 
 @pytest.mark.parametrize(
-    ("dtype", "expected"),
+    ("dtype", "n_ctx", "expected"),
     [
-        pytest.param(torch.float16, 263, id="selected-fp16"),
-        pytest.param(torch.bfloat16, -1, id="dynamic-bf16"),
+        pytest.param(torch.float16, 4096, 263, id="selected-fp16"),
+        pytest.param(torch.bfloat16, 4096, -1, id="dynamic-bf16-n4096"),
+        pytest.param(torch.bfloat16, 16384, 263, id="selected-bf16-n16384"),
     ],
 )
-def test_amd_fa_cluster_launch_forwards_static_k_row_stride(monkeypatch, dtype, expected):
+def test_amd_fa_cluster_launch_forwards_static_k_row_stride(monkeypatch, dtype, n_ctx, expected):
     """The public wrapper forwards the selected stride to the compiled kernel."""
-    n_ctx = _amd_fa_cluster_module._CLUSTER_STATIC_K_ROW_MIN_N
     strides = (64 * n_ctx * 263, n_ctx * 263, 263, 1)
     tensor = SimpleNamespace(shape=(1, 64, n_ctx, 128), dtype=dtype, stride=lambda dim: strides[dim])
     captured = {}
@@ -614,10 +615,11 @@ def test_amd_fa_cluster_n1024_fp16_qk_handoff_uses_result_barrier_gfx950():
     assert compiled.asm["ttir"].count(qk_constraints) == 1
 
 
-def test_amd_fa_cluster_static_k_row_stride_codegen_gfx950():
-    """A selected K-row override removes the dynamic stride from pointer arithmetic."""
-    batch, heads, n_ctx, head_dim = 1, 64, 4096, 128
-    tensor = MockTensor(torch.float16, (batch, heads, n_ctx, head_dim))
+@pytest.fixture(scope="module")
+def amd_fa_cluster_long_bf16_codegen_gfx950():
+    """Compile the long BF16 object shared by its focused codegen checks."""
+    batch, heads, n_ctx, head_dim = 1, 64, 16384, 128
+    tensor = MockTensor(torch.bfloat16, (batch, heads, n_ctx, head_dim))
     q_strides = (heads * n_ctx * 257, n_ctx * 257, 257, 1)
     k_strides = (heads * n_ctx * 263, n_ctx * 263, 263, 1)
     v_strides = (heads * n_ctx * 269, n_ctx * 269, 269, 1)
@@ -652,6 +654,12 @@ def test_amd_fa_cluster_static_k_row_stride_codegen_gfx950():
             enable_sched_group_barrier_scheduler=False,
             llvm_fn_attrs=_amd_fa_cluster_module._CLUSTER_VGPR_ONLY_LLVM_FN_ATTRS,
         )
+    return compiled
+
+
+def test_amd_fa_cluster_static_k_row_stride_codegen_gfx950(amd_fa_cluster_long_bf16_codegen_gfx950):
+    """A selected K-row override removes the dynamic stride from pointer arithmetic."""
+    compiled = amd_fa_cluster_long_bf16_codegen_gfx950
 
     ttir = compiled.asm["ttir"]
     # Runtime kernel parameters remain in the public ABI, but a specialized
@@ -660,6 +668,17 @@ def test_amd_fa_cluster_static_k_row_stride_codegen_gfx950():
     kernel_body = "\n".join(ttir.split("tt.func public @_attn_fwd_cluster_pipeline", 1)[1].splitlines()[1:])
     assert "%stride_kn" not in kernel_body
     assert "%stride_qm" in kernel_body
+
+
+def test_amd_fa_cluster_row_reduction_preserves_mfma_slices_gfx950(amd_fa_cluster_long_bf16_codegen_gfx950):
+    """The four row-reduction slices retain their parent MFMA layout."""
+    compiled = amd_fa_cluster_long_bf16_codegen_gfx950
+    ttgir = compiled.asm["ttgir"]
+    reduction_slices = re.findall(
+        r"amdg\.extract_slice .*tensor<256x64xf32, #mma> to tensor<256x16xf32, #mma>",
+        ttgir,
+    )
+    assert len(reduction_slices) >= 4
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])

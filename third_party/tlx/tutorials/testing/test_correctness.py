@@ -1779,12 +1779,18 @@ def test_amd_fa_cluster(causal, dtype, HEAD_DIM):
     torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
 
 
+@pytest.mark.parametrize(
+    ("dtype", "N_CTX"),
+    [
+        pytest.param(torch.float16, 4096, id="fp16-n4096"),
+        pytest.param(torch.bfloat16, 16384, id="bf16-n16384"),
+    ],
+)
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware (CDNA4)")
-def test_amd_fa_cluster_static_physical_k_row_stride():
+def test_amd_fa_cluster_static_physical_k_row_stride(dtype, N_CTX):
     """The selected constexpr K row stride preserves arbitrary physical padding."""
     torch.manual_seed(42)
-    B, H, N_CTX, D = 1, 1, 4096, 128
-    dtype = torch.float16
+    B, H, D = 1, 1, 128
     q = torch.randn(B, H, N_CTX, D + 5, device=DEVICE, dtype=dtype)[..., :D]
     k = torch.randn(B, H, N_CTX, D + 7, device=DEVICE, dtype=dtype)[..., :D]
     v = torch.randn(B, H, N_CTX, D + 9, device=DEVICE, dtype=dtype)[..., :D]
@@ -1812,10 +1818,11 @@ def test_amd_fa_cluster_magnifying_scale_preserves_finite_fp16_inputs(sm_scale):
     torch.testing.assert_close(out, expected, atol=2e-2, rtol=2e-2)
 
 
+@pytest.mark.parametrize("N_CTX", [1024, 4096], ids=["short", "long"])
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware (CDNA4)")
-def test_amd_fa_cluster_magnifying_scale_retains_bf16_accuracy():
+def test_amd_fa_cluster_magnifying_scale_retains_bf16_accuracy(N_CTX):
     torch.manual_seed(1170)
-    B, H, N_CTX, D = 1, 4, 1024, 128
+    B, H, D = 1, 4, 128
     q = torch.randn(B, H, N_CTX, D, device=DEVICE, dtype=torch.bfloat16)
     k = torch.randn_like(q)
     v = torch.randn_like(q)

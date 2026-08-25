@@ -18,7 +18,9 @@ CDNA_MFMA_ROWS_PER_WAVE = tl.constexpr(32)
 
 _CLUSTER_PIPELINE_STAGE_COUNT = 4
 _CLUSTER_AUTOTUNE_NUM_WARPS = tuple(range(1, 9))
-_CLUSTER_STATIC_K_ROW_MIN_N = 4096
+_CLUSTER_EXPLICIT_STAGE_PRIORITY_MAX_N = tl.constexpr(512)
+_CLUSTER_STATIC_FP16_K_ROW_MIN_N = 4096
+_CLUSTER_STATIC_BF16_K_ROW_MIN_N = 16384
 _CLUSTER_VGPR_ONLY_LLVM_FN_ATTRS = (("amdgpu-agpr-alloc", "0,0"), )
 _CLUSTER_SHORT_N512_LLVM_FN_ATTRS = (
     ("amdgpu-no-dispatch-id", ""),
@@ -148,10 +150,21 @@ def _concat_cols(x0, x1):
 
 @triton.jit
 def _sum_rows_chain4(x, ROTATE_FINAL: tl.constexpr):
-    """Reduce four zero-copy column slices through one dependency chain."""
-    x_01, x_23 = _split_cols(x)
-    x_0, x_1 = _split_cols(x_01)
-    x_2, x_3 = _split_cols(x_23)
+    """Reduce four MFMA-layout column slices through one dependency chain."""
+    tl.static_assert(x.shape[0] == CDNA_MFMA_ROWS_PER_WAVE * tlx.num_warps())
+    tl.static_assert(x.shape[1] % 4 == 0)
+    mma: tl.constexpr = tlx.amd_mfma_layout(
+        version=4,
+        instr_shape=[32, 32, 16],
+        transposed=True,
+        warps_per_cta=[tlx.num_warps(), 1],
+    )
+    x = tlx.require_layout(x, mma, pin=True)
+    slice_shape: tl.constexpr = [x.shape[0], x.shape[1] // 4]
+    x_0 = tlx.extract_slice(x, slice_shape, [0, 0])
+    x_1 = tlx.extract_slice(x, slice_shape, [0, x.shape[1] // 4])
+    x_2 = tlx.extract_slice(x, slice_shape, [0, x.shape[1] // 2])
+    x_3 = tlx.extract_slice(x, slice_shape, [0, 3 * x.shape[1] // 4])
     partial = x_0 + x_1
     if ROTATE_FINAL:
         partial = partial + x_3
@@ -379,13 +392,22 @@ class SoftmaxState:
         p_67 = _concat_cols(p_6, p_7)
         p = _concat_cols(p_state.p_0123, _concat_cols(p_45, p_67))
         p_cast = p.to(out_dtype)
+        l_i = self.l_i
         if FP16_CAST_ROWSUM and out_dtype == tl.float16:
             l_ij = tl.sum(p_cast, 1)
         elif CHAIN_BF16_ROWSUM:
             l_ij = _sum_rows_chain4(p, CHAIN_BF16_ROWSUM == 2)
+            mma: tl.constexpr = tlx.amd_mfma_layout(
+                version=4,
+                instr_shape=[32, 32, 16],
+                transposed=True,
+                warps_per_cta=[tlx.num_warps(), 1],
+            )
+            row_layout: tl.constexpr = tlx.slice_layout(mma, 1)
+            l_i = tlx.require_layout(self.l_i, row_layout, pin=True)
         else:
             l_ij = tl.sum(p, 1)
-        l_i = self.l_i + l_ij
+        l_i = l_i + l_ij
         return SoftmaxState(self.acc, l_i, self.m_i), p_cast
 
     @triton.jit
@@ -769,12 +791,15 @@ def _attn_inner_pipelined_lazy_step(
     STEP_QK_VEC2: tl.constexpr,
     FP16_CAST_ROWSUM: tl.constexpr,
     CHAIN_BF16_ROWSUM: tl.constexpr,
+    USE_EXPLICIT_STAGE_PRIORITIES: tl.constexpr,
 ):
     """Advance one aligned lazy-rescale tile with static LDS slots."""
     ack_n = (block_n + 3) * BLOCK_N
     acv_n = (block_n + 2) * BLOCK_N
+    dot_priority: tl.constexpr = 0 if USE_EXPLICIT_STAGE_PRIORITIES else None
+    mem_priority: tl.constexpr = 1 if USE_EXPLICIT_STAGE_PRIORITIES else None
 
-    with tlx.warp_pipeline_stage("dot1", priority=0):
+    with tlx.warp_pipeline_stage("dot1", priority=dot_priority):
         if STEP_QK_VEC2:
             state, p_dot, qk = _attn_dot_qk_step8_vec2(state, p_c, q, kt_dot, QK_SCALE, FP16_CAST_ROWSUM)
         else:
@@ -792,12 +817,12 @@ def _attn_inner_pipelined_lazy_step(
 
     tlx.async_load_wait_group(1)
 
-    with tlx.warp_pipeline_stage("mem1", priority=1):
+    with tlx.warp_pipeline_stage("mem1", priority=mem_priority):
         v_dot = tlx.local_load(tlx.local_view(v_buf, CUR_SLOT), relaxed=True)
         tok_k = tlx.async_load(k_ptrs + ack_n * stride_kn, tlx.local_view(k_buf, NEXT_SLOT))
         tlx.async_load_commit_group([tok_k])
 
-    with tlx.warp_pipeline_stage("dot2", priority=0):
+    with tlx.warp_pipeline_stage("dot2", priority=dot_priority):
         if STEP_PV_VEC1:
             state, p_c, delta_c, advance_c = _attn_dot_pv_vec1_lazy(
                 state,
@@ -817,7 +842,7 @@ def _attn_inner_pipelined_lazy_step(
 
     tlx.async_load_wait_group(1)
 
-    with tlx.warp_pipeline_stage("mem2", priority=1):
+    with tlx.warp_pipeline_stage("mem2", priority=mem_priority):
         # Preserve the optimized Gluon lazy cadence exactly: consume K from
         # LDS before issuing the independent V copy for this slot.  The
         # V-before-K ordering belongs only to Gluon's non-lazy fallback path.
@@ -1003,6 +1028,9 @@ def _attn_inner_pipelined(
         # the established three-tile drain.
         DRAIN_TILES: tl.constexpr = 1 if USE_ONE_TILE_PREFIX_DRAIN else 3
         ODD_TAIL: tl.constexpr = (N_CTX // BLOCK_N - DRAIN_TILES) % 2 == 1
+        # The priority hints retain a small win on short rows, but constrain
+        # instruction interleaving once the steady-state loop grows longer.
+        USE_EXPLICIT_STAGE_PRIORITIES: tl.constexpr = N_CTX <= _CLUSTER_EXPLICIT_STAGE_PRIORITY_MAX_N
         main_loop_pairs = (block_end - block_start - DRAIN_TILES) // 2
         for pair_idx in tl.range(0, main_loop_pairs, num_stages=1):
             block_n = block_start + pair_idx * 2
@@ -1028,6 +1056,7 @@ def _attn_inner_pipelined(
                 STEP_QK_VEC2,
                 FP16_CAST_ROWSUM,
                 CHAIN_BF16_ROWSUM,
+                USE_EXPLICIT_STAGE_PRIORITIES,
             )
             state, p_c, kt_dot = _attn_inner_pipelined_lazy_step(
                 state,
@@ -1051,6 +1080,7 @@ def _attn_inner_pipelined(
                 STEP_QK_VEC2,
                 FP16_CAST_ROWSUM,
                 CHAIN_BF16_ROWSUM,
+                USE_EXPLICIT_STAGE_PRIORITIES,
             )
 
         if ODD_TAIL:
@@ -1077,6 +1107,7 @@ def _attn_inner_pipelined(
                 STEP_QK_VEC2,
                 FP16_CAST_ROWSUM,
                 CHAIN_BF16_ROWSUM,
+                USE_EXPLICIT_STAGE_PRIORITIES,
             )
 
     else:
@@ -2594,9 +2625,11 @@ def _attn_cluster_tile(
             # is below the store precision while avoiding the corrected IEEE
             # divide.
             l_recip = fast_dividef(1.0, state.l_i)
-            acc = state.acc * l_recip[:, None]
         else:
-            acc = state.acc / state.l_i[:, None]
+            # Keep the row reciprocal scalar until its broadcast multiply;
+            # dividing the full accumulator lengthens every column's chain.
+            l_recip = 1.0 / state.l_i
+        acc = state.acc * l_recip[:, None]
     o_ptrs = Out + o_off + offs_m[:, None] * stride_om + offs_d[None, :] * stride_ok
     out = acc.to(Out.dtype.element_ty)
     if USE_Q_LDS:
@@ -3191,12 +3224,13 @@ def _cluster_static_k_row_stride(q, k, causal, use_autotune, block_m, block_n, n
     """Specialize K's physical row stride on the measured long noncausal path."""
     n_ctx = q.shape[2]
     head_dim = q.shape[3]
-    # The broader Gluon gate is not transferable to this stock-scheduled TLX
-    # object: causal and BF16 rows regress, while FP16 N>=4096 wins at both the
-    # standard and magnifying scales. Keep explicit configurations unchanged.
-    use_krow = (use_autotune and not causal and q.dtype == torch.float16 and q.shape[1] == k.shape[1]
-                and head_dim == 128 and n_ctx >= _CLUSTER_STATIC_K_ROW_MIN_N and n_ctx % 256 == 0 and block_m == 256
-                and block_n == 64 and num_warps == 8 and waves_per_eu == 2)
+    # BF16 reaches its repeatable static-addressing crossover later than FP16.
+    measured_dtype_path = ((q.dtype == torch.float16 and n_ctx >= _CLUSTER_STATIC_FP16_K_ROW_MIN_N)
+                           or (q.dtype == torch.bfloat16 and n_ctx >= _CLUSTER_STATIC_BF16_K_ROW_MIN_N))
+    # Keep causal and explicit configurations dynamic: only the autotuned
+    # long-noncausal objects above have demonstrated a static-stride gain.
+    use_krow = (use_autotune and not causal and measured_dtype_path and q.shape[1] == k.shape[1] and head_dim == 128
+                and n_ctx % 256 == 0 and block_m == 256 and block_n == 64 and num_warps == 8 and waves_per_eu == 2)
     return k.stride(2) if use_krow else -1
 
 
