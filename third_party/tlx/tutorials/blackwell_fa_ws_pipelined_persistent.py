@@ -74,7 +74,7 @@ configs = [
         pre_hook=_host_descriptor_pre_hook,
         ctas_per_cga=(2, 1, 1),
     )
-    for kv in [4, 5, 6, 7, 8, 9]
+    for kv in [3, 6]
     for grp_n in [1]
     for (rescale_opt, where) in [(False, False), (True, False), (True, True)]
 ]
@@ -93,7 +93,7 @@ def prune_configs_by_hdim(configs, named_args, **kwargs):
         if grp_n != target_group_size_n:
             continue
         if is_2cta:
-            if kv not in (4, 5, 6, 7):
+            if kv != target_kv_buffers:
                 continue
         else:
             if kv != target_kv_buffers:
@@ -503,7 +503,7 @@ def _fwd_control_tile(
 
 
 @triton.jit
-def _fwd_load_1cta(
+def _fwd_load_tile(
     tile_count,
     accum_cnt_kv,
     lo,
@@ -527,8 +527,53 @@ def _fwd_load_1cta(
     HEAD_DIM: tl.constexpr,
     NUM_BUFFERS_Q: tl.constexpr,
     NUM_BUFFERS_KV: tl.constexpr,
+    cluster_cta_rank=0,
+    v_tiles=None,
+    v_fulls=None,
+    v_empties=None,
+    NUM_GROUPS_PER_CTA: tl.constexpr = 2,
+    NUM_CTAS: tl.constexpr = 1,
 ):
+    USE_2CTA: tl.constexpr = NUM_CTAS == 2
     # load q0
+    if USE_2CTA:
+        q_bufIdx, q_phase = get_bufidx_phase(tile_count, NUM_BUFFERS_Q)
+        for group_id in tl.static_range(0, NUM_GROUPS_PER_CTA):
+            q_id = q_bufIdx + group_id * NUM_BUFFERS_Q
+            tlx.barrier_wait(q_empties[q_id], q_phase ^ 1)
+            if cluster_cta_rank == 0:
+                tlx.barrier_expect_bytes(q_fulls[q_id], Q_BYTES_PER_ELEM * BLOCK_M_SPLIT * HEAD_DIM * NUM_CTAS)
+            tlx.async_descriptor_load(
+                desc_q,
+                q_tiles[q_id],
+                [qo_offset_y + (group_id * NUM_CTAS + cluster_cta_rank) * BLOCK_M_SPLIT, 0],
+                q_fulls[q_id],
+                two_ctas=True,
+            )
+        for _ in tl.range(lo, hi, BLOCK_N):
+            buf, phase = get_bufidx_phase(accum_cnt_kv, NUM_BUFFERS_KV)
+            tlx.barrier_wait(kv_empties[buf], phase ^ 1)
+            tlx.barrier_wait(v_empties[buf], phase ^ 1)
+            if cluster_cta_rank == 0:
+                tlx.barrier_expect_bytes(kv_fulls[buf], K_BYTES_PER_ELEM * BLOCK_N * HEAD_DIM)
+                tlx.barrier_expect_bytes(v_fulls[buf], V_BYTES_PER_ELEM * BLOCK_N * HEAD_DIM)
+            tlx.async_descriptor_load(
+                desc_k,
+                kv_tiles[buf],
+                [kv_offset_y + cluster_cta_rank * (BLOCK_N // NUM_CTAS), 0],
+                kv_fulls[buf],
+                two_ctas=True,
+            )
+            tlx.async_descriptor_load(
+                desc_v,
+                v_tiles[buf],
+                [kv_offset_y, cluster_cta_rank * (HEAD_DIM // NUM_CTAS)],
+                v_fulls[buf],
+                two_ctas=True,
+            )
+            kv_offset_y += BLOCK_N
+            accum_cnt_kv += 1
+        return accum_cnt_kv
     q_bufIdx, q_phase = get_bufidx_phase(tile_count, NUM_BUFFERS_Q)
     tlx.barrier_wait(q_empties[q_bufIdx], q_phase ^ 1)
     tlx.barrier_expect_bytes(q_fulls[q_bufIdx], Q_BYTES_PER_ELEM * BLOCK_M_SPLIT * HEAD_DIM)
@@ -878,7 +923,7 @@ def _attn_fwd_ws_kernel(sm_scale, M,  #
         # V loaded as (N, D/2).
         k_tiles = tlx.local_alloc((BLOCK_N_KV, HEAD_DIM), tlx.dtype_of(desc_k), NUM_BUFFERS_KV)
         v_tiles = tlx.local_alloc((BLOCK_N, HEAD_DIM_KV), tlx.dtype_of(desc_v), NUM_BUFFERS_KV)
-        o_tiles = tlx.local_alloc((BLOCK_M_SPLIT, HEAD_DIM), tlx.dtype_of(desc_o), NUM_GROUPS_PER_CTA, reuse=q_tiles)
+        o_tiles = tlx.local_alloc((BLOCK_M_SPLIT, HEAD_DIM), tlx.dtype_of(desc_o), NUM_GROUPS_PER_CTA)
     else:
         kv_tiles = tlx.local_alloc((BLOCK_N, HEAD_DIM), tlx.dtype_of(desc_k), NUM_BUFFERS_KV)
         o_tiles = tlx.local_alloc((BLOCK_M_SPLIT, HEAD_DIM), tlx.dtype_of(desc_o), NUM_MMA_GROUPS)
@@ -1214,89 +1259,81 @@ def _attn_fwd_ws_kernel(sm_scale, M,  #
                 tile_id = tlx.clc_consumer(clc_context, clc_phase_consumer, multi_ctas=USE_2CTA)
                 clc_phase_consumer ^= 1
 
-        # load
+        # Q/K/V loader role; output publication remains in the epilog task.
         with tlx.async_task(num_warps=1, registers=24):
             accum_cnt_kv = 0
             tile_count = 0
             tile_id = start_pid
             clc_phase_consumer = 0
             while tile_id != -1:
+                _, _, lo, hi, qo_offset_y, kv_offset_y = _compute_offsets(
+                    tile_id // NUM_CTAS,
+                    H,
+                    num_pid_n,
+                    num_pid_in_group,
+                    N_CTX,
+                    EFFECTIVE_BLOCK_M,
+                    STAGE,
+                    GROUP_SIZE_N,
+                )
                 if USE_2CTA:
-                    _, off_hz2, lo2, hi2, qo2, kv2 = _compute_offsets(tile_id // NUM_CTAS, H, num_pid_n,
-                                                                      num_pid_in_group, N_CTX, EFFECTIVE_BLOCK_M, STAGE,
-                                                                      GROUP_SIZE_N)
-
-                    q_bufIdx, q_phase = get_bufidx_phase(tile_count, NUM_BUFFERS_Q)
-                    # Q and O share SMEM (o_tiles reuses q_tiles). Wait for the
-                    # epilog to finish storing the previous tile's O before
-                    # overwriting the buffer with new Q data.
-                    _, o_phase = get_bufidx_phase(tile_count, 1)
-                    for cid in tl.static_range(0, NUM_GROUPS_PER_CTA):
-                        tlx.barrier_wait(o_empties[cid], o_phase ^ 1)
-                    # load Q0
-                    tlx.barrier_wait(q_empties[q_bufIdx], q_phase ^ 1)
-                    if is_leader:
-                        tlx.barrier_expect_bytes(q_fulls[q_bufIdx],
-                                                 Q_BYTES_PER_ELEM * BLOCK_M_SPLIT * HEAD_DIM * NUM_CTAS)
-                    tlx.async_descriptor_load(desc_q, q_tiles[q_bufIdx], [qo2 + cluster_cta_rank * BLOCK_M_SPLIT, 0],
-                                              q_fulls[q_bufIdx], two_ctas=tl.constexpr(True))
-                    # load Q1
-                    q_bufIdx1 = q_bufIdx + NUM_BUFFERS_Q
-                    tlx.barrier_wait(q_empties[q_bufIdx1], q_phase ^ 1)
-                    if is_leader:
-                        tlx.barrier_expect_bytes(q_fulls[q_bufIdx1],
-                                                 Q_BYTES_PER_ELEM * BLOCK_M_SPLIT * HEAD_DIM * NUM_CTAS)
-                    tlx.async_descriptor_load(desc_q, q_tiles[q_bufIdx1],
-                                              [qo2 + (NUM_CTAS + cluster_cta_rank) * BLOCK_M_SPLIT, 0],
-                                              q_fulls[q_bufIdx1], two_ctas=tl.constexpr(True))
-
-                    kv_offset_y = kv2
-
-                    k_bufIdx, k_phase = get_bufidx_phase(accum_cnt_kv, NUM_BUFFERS_KV)
-                    tlx.barrier_wait(k_empties[k_bufIdx], k_phase ^ 1)
-                    if is_leader:
-                        tlx.barrier_expect_bytes(k_fulls[k_bufIdx], K_BYTES_PER_ELEM * BLOCK_N_KV * HEAD_DIM * NUM_CTAS)
-                    tlx.async_descriptor_load(desc_k, k_tiles[k_bufIdx],
-                                              [kv_offset_y + cluster_cta_rank * BLOCK_N_KV, 0], k_fulls[k_bufIdx],
-                                              two_ctas=tl.constexpr(True))
-
-                    v_bufIdx, v_phase = get_bufidx_phase(accum_cnt_kv, NUM_BUFFERS_KV)
-                    tlx.barrier_wait(v_empties[v_bufIdx], v_phase ^ 1)
-                    if is_leader:
-                        tlx.barrier_expect_bytes(v_fulls[v_bufIdx], V_BYTES_PER_ELEM * BLOCK_N * HEAD_DIM)
-                    tlx.async_descriptor_load(desc_v, v_tiles[v_bufIdx], [kv_offset_y, cluster_cta_rank * HEAD_DIM_KV],
-                                              v_fulls[v_bufIdx], two_ctas=tl.constexpr(True))
-
-                    kv_offset_y += BLOCK_N
-                    accum_cnt_kv += 1
-
-                    for _ in tl.range(lo2 + BLOCK_N, hi2, BLOCK_N):
-                        k_bufIdx, k_phase = get_bufidx_phase(accum_cnt_kv, NUM_BUFFERS_KV)
-                        tlx.barrier_wait(k_empties[k_bufIdx], k_phase ^ 1)
-                        if is_leader:
-                            tlx.barrier_expect_bytes(k_fulls[k_bufIdx],
-                                                     K_BYTES_PER_ELEM * BLOCK_N_KV * HEAD_DIM * NUM_CTAS)
-                        tlx.async_descriptor_load(desc_k, k_tiles[k_bufIdx],
-                                                  [kv_offset_y + cluster_cta_rank * BLOCK_N_KV, 0], k_fulls[k_bufIdx],
-                                                  two_ctas=tl.constexpr(True))
-
-                        v_bufIdx, v_phase = get_bufidx_phase(accum_cnt_kv, NUM_BUFFERS_KV)
-                        tlx.barrier_wait(v_empties[v_bufIdx], v_phase ^ 1)
-                        if is_leader:
-                            tlx.barrier_expect_bytes(v_fulls[v_bufIdx], V_BYTES_PER_ELEM * BLOCK_N * HEAD_DIM)
-                        tlx.async_descriptor_load(desc_v, v_tiles[v_bufIdx],
-                                                  [kv_offset_y, cluster_cta_rank * HEAD_DIM_KV], v_fulls[v_bufIdx],
-                                                  two_ctas=tl.constexpr(True))
-
-                        kv_offset_y += BLOCK_N
-                        accum_cnt_kv += 1
+                    accum_cnt_kv = _fwd_load_tile(
+                        tile_count,
+                        accum_cnt_kv,
+                        lo,
+                        hi,
+                        qo_offset_y,
+                        kv_offset_y,
+                        desc_q,
+                        desc_k,
+                        desc_v,
+                        q_tiles,
+                        k_tiles,
+                        q_fulls,
+                        q_empties,
+                        k_fulls,
+                        k_empties,
+                        Q_BYTES_PER_ELEM,
+                        K_BYTES_PER_ELEM,
+                        V_BYTES_PER_ELEM,
+                        BLOCK_M_SPLIT,
+                        BLOCK_N,
+                        HEAD_DIM,
+                        NUM_BUFFERS_Q,
+                        NUM_BUFFERS_KV,
+                        cluster_cta_rank,
+                        v_tiles,
+                        v_fulls,
+                        v_empties,
+                        NUM_GROUPS_PER_CTA,
+                        NUM_CTAS,
+                    )
                 else:
-                    _, _, lo, hi, qo_offset_y, kv_offset_y = _compute_offsets(tile_id, H, num_pid_n, num_pid_in_group,
-                                                                              N_CTX, BLOCK_M, STAGE, GROUP_SIZE_N)
-                    accum_cnt_kv = _fwd_load_1cta(tile_count, accum_cnt_kv, lo, hi, qo_offset_y, kv_offset_y, desc_q,
-                                                  desc_k, desc_v, q_tiles, kv_tiles, q_fulls, q_empties, kv_fulls,
-                                                  kv_empties, Q_BYTES_PER_ELEM, K_BYTES_PER_ELEM, V_BYTES_PER_ELEM,
-                                                  BLOCK_M_SPLIT, BLOCK_N, HEAD_DIM, NUM_BUFFERS_Q, NUM_BUFFERS_KV)
+                    accum_cnt_kv = _fwd_load_tile(
+                        tile_count,
+                        accum_cnt_kv,
+                        lo,
+                        hi,
+                        qo_offset_y,
+                        kv_offset_y,
+                        desc_q,
+                        desc_k,
+                        desc_v,
+                        q_tiles,
+                        kv_tiles,
+                        q_fulls,
+                        q_empties,
+                        kv_fulls,
+                        kv_empties,
+                        Q_BYTES_PER_ELEM,
+                        K_BYTES_PER_ELEM,
+                        V_BYTES_PER_ELEM,
+                        BLOCK_M_SPLIT,
+                        BLOCK_N,
+                        HEAD_DIM,
+                        NUM_BUFFERS_Q,
+                        NUM_BUFFERS_KV,
+                    )
 
                 tile_count += 1
                 tile_id = tlx.clc_consumer(clc_context, clc_phase_consumer, multi_ctas=USE_2CTA)
