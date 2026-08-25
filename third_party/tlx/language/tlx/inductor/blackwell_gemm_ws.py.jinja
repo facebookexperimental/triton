@@ -10,26 +10,56 @@
 
     dsize: tl.constexpr = 2
 
-    desc_a = tl.make_tensor_descriptor(
-        A,
-        shape=[M, K],
-        strides=[stride_am, 1],
-        block_shape=[BLOCK_M_SPLIT, BLOCK_K],
-    )
+    # A column-major (M, K) operand has strides (1, M), so its .T is a row-major
+    # (K, M) view of the same memory: the descriptor, the SMEM tile and the TMA
+    # offsets all flip, and the MMA operand is recovered with a metadata-only
+    # tlx.local_trans. No copy is needed. Mirrors tutorials/blackwell_gemm_ws.py.
+    if A_ROW_MAJOR:
+        desc_a = tl.make_tensor_descriptor(
+            A,
+            shape=[M, K],
+            strides=[stride_am, 1],
+            block_shape=[BLOCK_M_SPLIT, BLOCK_K],
+        )
+    else:
+        desc_a = tl.make_tensor_descriptor(
+            A,
+            shape=[K, M],
+            strides=[stride_ak, 1],
+            block_shape=[BLOCK_K, BLOCK_M_SPLIT],
+        )
 
-    desc_b = tl.make_tensor_descriptor(
-        B,
-        shape=[K, N],
-        strides=[stride_bk, 1],
-        block_shape=[BLOCK_K, BLOCK_N // NUM_CTAS],
-    )
+    if B_ROW_MAJOR:
+        desc_b = tl.make_tensor_descriptor(
+            B,
+            shape=[K, N],
+            strides=[stride_bk, 1],
+            block_shape=[BLOCK_K, BLOCK_N // NUM_CTAS],
+        )
+    else:
+        desc_b = tl.make_tensor_descriptor(
+            B,
+            shape=[N, K],
+            strides=[stride_bn, 1],
+            block_shape=[BLOCK_N // NUM_CTAS, BLOCK_K],
+        )
 
-    buffers_A = tlx.local_alloc(
-        (BLOCK_M_SPLIT, BLOCK_K),
-        A.dtype.element_ty,
-        NUM_SMEM_BUFFERS * NUM_MMA_GROUPS,
-    )
-    buffers_B = tlx.local_alloc((BLOCK_K, BLOCK_N // NUM_CTAS), A.dtype.element_ty, NUM_SMEM_BUFFERS)
+    if A_ROW_MAJOR:
+        buffers_A = tlx.local_alloc(
+            (BLOCK_M_SPLIT, BLOCK_K),
+            A.dtype.element_ty,
+            NUM_SMEM_BUFFERS * NUM_MMA_GROUPS,
+        )
+    else:
+        buffers_A = tlx.local_alloc(
+            (BLOCK_K, BLOCK_M_SPLIT),
+            A.dtype.element_ty,
+            NUM_SMEM_BUFFERS * NUM_MMA_GROUPS,
+        )
+    if B_ROW_MAJOR:
+        buffers_B = tlx.local_alloc((BLOCK_K, BLOCK_N // NUM_CTAS), A.dtype.element_ty, NUM_SMEM_BUFFERS)
+    else:
+        buffers_B = tlx.local_alloc((BLOCK_N // NUM_CTAS, BLOCK_K), A.dtype.element_ty, NUM_SMEM_BUFFERS)
     tmem_buffers = tlx.local_alloc(
         (BLOCK_M_SPLIT, BLOCK_N),
         tl.float32,
@@ -352,9 +382,12 @@
                             tlx.barrier_arrive(cta_bars[a_buf], arrive_count=1, remote_cta_rank=0)
                             tlx.barrier_wait(cta_bars[a_buf], phase=phase, pred=pred_cta0)
 
+                        # Transpose the SMEM views back if the inputs were column-major
+                        a_operand = tlx.local_trans(buffers_A[a_buf]) if not A_ROW_MAJOR else buffers_A[a_buf]
+                        b_operand = tlx.local_trans(buffers_B[buf]) if not B_ROW_MAJOR else buffers_B[buf]
                         tlx.async_dot(
-                            buffers_A[a_buf],
-                            buffers_B[buf],
+                            a_operand,
+                            b_operand,
                             tmem_buffers[acc_buf],
                             use_acc=False,
                             mBarriers=[A_smem_empty_bars[a_buf]],
@@ -378,9 +411,11 @@
                                 tlx.barrier_arrive(cta_bars[a_buf], arrive_count=1, remote_cta_rank=0)
                                 tlx.barrier_wait(cta_bars[a_buf], phase=phase, pred=pred_cta0)
 
+                            a_operand = tlx.local_trans(buffers_A[a_buf]) if not A_ROW_MAJOR else buffers_A[a_buf]
+                            b_operand = tlx.local_trans(buffers_B[buf]) if not B_ROW_MAJOR else buffers_B[buf]
                             tlx.async_dot(
-                                buffers_A[a_buf],
-                                buffers_B[buf],
+                                a_operand,
+                                b_operand,
                                 tmem_buffers[acc_buf],
                                 use_acc=True,
                                 mBarriers=[A_smem_empty_bars[a_buf]],
@@ -417,9 +452,12 @@
                         tlx.barrier_arrive(cta_bars[a_buf], arrive_count=1, remote_cta_rank=0)
                         tlx.barrier_wait(cta_bars[a_buf], phase=phase, pred=pred_cta0)
 
+                    # Transpose the SMEM views back if the inputs were column-major
+                    a_operand = tlx.local_trans(buffers_A[a_buf]) if not A_ROW_MAJOR else buffers_A[a_buf]
+                    b_operand = tlx.local_trans(buffers_B[buf]) if not B_ROW_MAJOR else buffers_B[buf]
                     tlx.async_dot(
-                        buffers_A[a_buf],
-                        buffers_B[buf],
+                        a_operand,
+                        b_operand,
                         tmem_buffers[acc_buf],
                         use_acc=False,
                         mBarriers=[A_smem_empty_bars[a_buf]],
@@ -443,9 +481,11 @@
                             tlx.barrier_arrive(cta_bars[a_buf], arrive_count=1, remote_cta_rank=0)
                             tlx.barrier_wait(cta_bars[a_buf], phase=phase, pred=pred_cta0)
 
+                        a_operand = tlx.local_trans(buffers_A[a_buf]) if not A_ROW_MAJOR else buffers_A[a_buf]
+                        b_operand = tlx.local_trans(buffers_B[buf]) if not B_ROW_MAJOR else buffers_B[buf]
                         tlx.async_dot(
-                            buffers_A[a_buf],
-                            buffers_B[buf],
+                            a_operand,
+                            b_operand,
                             tmem_buffers[acc_buf],
                             use_acc=True,
                             mBarriers=[A_smem_empty_bars[a_buf]],
@@ -513,14 +553,22 @@
                         tlx.barrier_wait(A_smem_empty_bars[a_buf], phase ^ 1)
                         offs_am = pid_m * BLOCK_M
                         tlx.barrier_expect_bytes(A_smem_full_bars[a_buf], dsize * BLOCK_M_SPLIT * BLOCK_K)
-                        tlx.async_descriptor_load(desc_a, buffers_A[a_buf], [offs_am, offs_k], A_smem_full_bars[a_buf],
-                                                  eviction_policy="evict_last")
+                        if A_ROW_MAJOR:
+                            tlx.async_descriptor_load(desc_a, buffers_A[a_buf], [offs_am, offs_k], A_smem_full_bars[a_buf],
+                                                      eviction_policy="evict_last")
+                        else:
+                            tlx.async_descriptor_load(desc_a, buffers_A[a_buf], [offs_k, offs_am], A_smem_full_bars[a_buf],
+                                                      eviction_policy="evict_last")
 
                         last_a_buf = (NUM_MMA_GROUPS - 1) * NUM_SMEM_BUFFERS + buf
                         tlx.barrier_wait(A_smem_empty_bars[last_a_buf], phase ^ 1)
                         tlx.barrier_expect_bytes(B_smem_full_bars[buf], expected_bytes)
-                        tlx.async_descriptor_load(desc_b, buffers_B[buf], [offs_k, offs_bn], B_smem_full_bars[buf],
-                                                  eviction_policy="evict_last")
+                        if B_ROW_MAJOR:
+                            tlx.async_descriptor_load(desc_b, buffers_B[buf], [offs_k, offs_bn], B_smem_full_bars[buf],
+                                                      eviction_policy="evict_last")
+                        else:
+                            tlx.async_descriptor_load(desc_b, buffers_B[buf], [offs_bn, offs_k], B_smem_full_bars[buf],
+                                                      eviction_policy="evict_last")
 
                         for group_id in tl.static_range(1, NUM_MMA_GROUPS):
                             a_buf = group_id * NUM_SMEM_BUFFERS + buf
@@ -530,8 +578,12 @@
                             offs_am2 = offs_am + group_id * BLOCK_M_SPLIT
 
                             tlx.barrier_expect_bytes(A_smem_full_bars[a_buf], dsize * BLOCK_M_SPLIT * BLOCK_K)
-                            tlx.async_descriptor_load(desc_a, buffers_A[a_buf], [offs_am2, offs_k], A_smem_full_bars[a_buf],
-                                                      eviction_policy="evict_last")
+                            if A_ROW_MAJOR:
+                                tlx.async_descriptor_load(desc_a, buffers_A[a_buf], [offs_am2, offs_k], A_smem_full_bars[a_buf],
+                                                          eviction_policy="evict_last")
+                            else:
+                                tlx.async_descriptor_load(desc_a, buffers_A[a_buf], [offs_k, offs_am2], A_smem_full_bars[a_buf],
+                                                          eviction_policy="evict_last")
 
                         smem_accum_cnt += 1
 {% else %}
@@ -548,14 +600,22 @@
                     tlx.barrier_wait(A_smem_empty_bars[a_buf], phase ^ 1)
                     offs_am = pid_m * BLOCK_M
                     tlx.barrier_expect_bytes(A_smem_full_bars[a_buf], dsize * BLOCK_M_SPLIT * BLOCK_K)
-                    tlx.async_descriptor_load(desc_a, buffers_A[a_buf], [offs_am, offs_k], A_smem_full_bars[a_buf],
-                                              eviction_policy="evict_last")
+                    if A_ROW_MAJOR:
+                        tlx.async_descriptor_load(desc_a, buffers_A[a_buf], [offs_am, offs_k], A_smem_full_bars[a_buf],
+                                                  eviction_policy="evict_last")
+                    else:
+                        tlx.async_descriptor_load(desc_a, buffers_A[a_buf], [offs_k, offs_am], A_smem_full_bars[a_buf],
+                                                  eviction_policy="evict_last")
 
                     last_a_buf = (NUM_MMA_GROUPS - 1) * NUM_SMEM_BUFFERS + buf
                     tlx.barrier_wait(A_smem_empty_bars[last_a_buf], phase ^ 1)
                     tlx.barrier_expect_bytes(B_smem_full_bars[buf], expected_bytes)
-                    tlx.async_descriptor_load(desc_b, buffers_B[buf], [offs_k, offs_bn], B_smem_full_bars[buf],
-                                              eviction_policy="evict_last")
+                    if B_ROW_MAJOR:
+                        tlx.async_descriptor_load(desc_b, buffers_B[buf], [offs_k, offs_bn], B_smem_full_bars[buf],
+                                                  eviction_policy="evict_last")
+                    else:
+                        tlx.async_descriptor_load(desc_b, buffers_B[buf], [offs_bn, offs_k], B_smem_full_bars[buf],
+                                                  eviction_policy="evict_last")
 
                     for group_id in tl.static_range(1, NUM_MMA_GROUPS):
                         a_buf = group_id * NUM_SMEM_BUFFERS + buf
@@ -565,8 +625,12 @@
                         offs_am2 = offs_am + group_id * BLOCK_M_SPLIT
 
                         tlx.barrier_expect_bytes(A_smem_full_bars[a_buf], dsize * BLOCK_M_SPLIT * BLOCK_K)
-                        tlx.async_descriptor_load(desc_a, buffers_A[a_buf], [offs_am2, offs_k], A_smem_full_bars[a_buf],
-                                                  eviction_policy="evict_last")
+                        if A_ROW_MAJOR:
+                            tlx.async_descriptor_load(desc_a, buffers_A[a_buf], [offs_am2, offs_k], A_smem_full_bars[a_buf],
+                                                      eviction_policy="evict_last")
+                        else:
+                            tlx.async_descriptor_load(desc_a, buffers_A[a_buf], [offs_k, offs_am2], A_smem_full_bars[a_buf],
+                                                      eviction_policy="evict_last")
 
                     smem_accum_cnt += 1
 {% endif %}
