@@ -15,6 +15,17 @@ inline constexpr StringLiteral kScheduledMaxStageAttrName =
 inline constexpr StringLiteral kDataPartitionFactorAttrName =
     "tt.data_partition_factor";
 
+// AutoWS annotation on an MMA op: a JSON object carrying the desired schedule
+// and, optionally, the channels the operands travel through, e.g.
+//   {"stage": "0", "order": "2", "channels": ["opndD,tmem,1,0"]}
+// The names below are the single source of truth for everyone who reads or
+// writes that annotation (ScheduleLoops, AssignLatencies, WSMemoryPlanner).
+inline constexpr StringLiteral kAutoWSAnnotationAttrName = "tt.autows";
+inline constexpr StringLiteral kAutoWSStageKey = "stage";
+inline constexpr StringLiteral kAutoWSOrderKey = "order";
+inline constexpr StringLiteral kAutoWSChannelsKey = "channels";
+inline constexpr StringLiteral kAutoWSOperandDTag = "opndD";
+
 enum class AutoWSLoopAttrPropagation {
   NotForwarded,
   ForwardToInnerLoop,
