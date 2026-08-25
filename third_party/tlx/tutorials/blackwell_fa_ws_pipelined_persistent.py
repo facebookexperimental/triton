@@ -2,6 +2,7 @@ import torch
 import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
+from triton.language import core
 from triton.language.extra.tlx.warp_spec import get_bufidx_phase
 from triton.language.extra.cuda.inline_ptx_lib import _mul_f32x2, _fma_f32x2, _sub_f32x2
 from triton.language.extra.subtile_ops import _split_n_2D
@@ -99,6 +100,42 @@ def prune_configs_by_hdim(configs, named_args, **kwargs):
                 continue
         pruned.append(conf)
     return pruned
+
+
+@core.builtin
+def _s2_exp2_bf16(x, a2, b2m, _semantic=None):
+    return core.inline_asm_elementwise(
+        """
+        {
+            .reg .b64 ra, rb, rc, rd;
+            .reg .b32 v0, v1, pk, zz, uu, mk, c0;
+            mov.b64 ra, { $1, $2 };
+            mov.b64 rb, { $3, $4 };
+            mov.b64 rc, { $5, $6 };
+            fma.rn.f32x2 rd, ra, rb, rc;
+            mov.b64 { v0, v1 }, rd;
+            prmt.b32 pk, v0, v1, 0x5410;
+            mov.b32 zz, 0;
+            mov.b32 mk, 0x00400040;
+            add.s16x2 uu, pk, mk;
+            mov.b32 c0, 0x3f3b3f3b;
+            fma.rn.bf16x2 pk, uu, c0, pk;
+            max.bf16x2 pk, pk, zz;
+            mov.b32 $0, pk;
+        }
+        """,
+        "=r,r,r,r,r,r,r",
+        [x, a2, b2m],
+        dtype=core.bfloat16,
+        is_pure=True,
+        pack=2,
+        _semantic=_semantic,
+    )
+
+
+@triton.jit
+def _reduce_bf16(a, b):
+    return (a + b).to(tl.bfloat16)
 
 
 @triton.jit
@@ -320,6 +357,149 @@ def _softmax_inner_loop(
         accum_cnt_qk += 1
 
     return m_i, l_i, accum_cnt_qk
+
+
+@triton.jit
+def _fwd_control_tile(
+    tile_id,
+    tile_count,
+    accum_cnt,
+    sm_scale,
+    M,
+    H,
+    num_pid_n,
+    num_pid_in_group,
+    N_CTX,
+    desc_o,
+    alpha_empties,
+    alpha_fulls,
+    alpha_tiles,
+    acc_empties,
+    acc_fulls,
+    acc_tiles,
+    l_fulls,
+    l_tiles,
+    m_tiles,
+    qk_empties,
+    o_empties,
+    o_fulls,
+    o_tiles,
+    cluster_cta_rank,
+    BLOCK_M_SPLIT: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    EFFECTIVE_BLOCK_M: tl.constexpr,
+    GROUP_SIZE_N: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    NUM_CTAS: tl.constexpr,
+    NUM_GROUPS_PER_CTA: tl.constexpr,
+    NUM_MMA_SLICES: tl.constexpr,
+    RESCALE_OPT: tl.constexpr,
+    SCALAR_N: tl.constexpr,
+    STAGE: tl.constexpr,
+    USE_2CTA: tl.constexpr,
+    USE_WHERE: tl.constexpr,
+):
+    start_m, off_hz, lo, hi, qo_offset_y, kv_offset_y = _compute_offsets(
+        tile_id // NUM_CTAS,
+        H,
+        num_pid_n,
+        num_pid_in_group,
+        N_CTX,
+        EFFECTIVE_BLOCK_M,
+        STAGE,
+        GROUP_SIZE_N,
+    )
+    # Rescale the live output accumulator when the online-softmax gauge changes.
+    for _ in tl.range(lo, hi, BLOCK_N):
+        _, phase = get_bufidx_phase(accum_cnt, 1)
+        for cid in tl.static_range(0, NUM_GROUPS_PER_CTA):
+            tlx.barrier_wait(alpha_fulls[cid], phase)
+            alpha_loaded = tlx.local_load(alpha_tiles[cid])
+            alpha_1 = tl.split(alpha_loaded)[0][:, None] if SCALAR_N == 2 else alpha_loaded
+            tlx.barrier_arrive(alpha_empties[cid])
+            if RESCALE_OPT:
+                # One warp vote skips the whole accumulator update when no lane
+                # changed its online-softmax gauge.
+                pred = alpha_1 < 1.0
+                ballot_result = tlx.vote_ballot_sync(0xFFFFFFFF, pred)
+                should_rescale = ballot_result != 0
+
+            if USE_WHERE:
+                for slice_id in tl.static_range(0, NUM_MMA_SLICES):
+                    subslice = tlx.subslice(
+                        acc_tiles[cid],
+                        HEAD_DIM * slice_id // NUM_MMA_SLICES,
+                        HEAD_DIM // NUM_MMA_SLICES,
+                    )
+                    acc = tlx.local_load(subslice)
+                    if RESCALE_OPT:
+                        scaled_acc = _mul_f32x2(acc, alpha_1)
+                        acc = tl.where(should_rescale, scaled_acc, acc)
+                    else:
+                        acc = _mul_f32x2(acc, alpha_1)
+                    tlx.local_store(subslice, acc)
+            else:
+                if RESCALE_OPT:
+                    should_rescale_red = tl.reduce(should_rescale, axis=0, combine_fn=_reduce_or)
+                    should_rescale_scalar = tl.reshape(should_rescale_red, ())
+                if not RESCALE_OPT or (RESCALE_OPT and should_rescale_scalar):
+                    for slice_id in tl.static_range(0, NUM_MMA_SLICES):
+                        subslice = tlx.subslice(
+                            acc_tiles[cid],
+                            HEAD_DIM * slice_id // NUM_MMA_SLICES,
+                            HEAD_DIM // NUM_MMA_SLICES,
+                        )
+                        acc = tlx.local_load(subslice)
+                        acc = _mul_f32x2(acc, alpha_1)
+                        tlx.local_store(subslice, acc)
+            if USE_2CTA:
+                tlx.barrier_arrive(acc_fulls[cid], 1, remote_cta_rank=0)
+            else:
+                tlx.barrier_arrive(acc_fulls[cid])
+        accum_cnt += 1
+
+    _, phase = get_bufidx_phase(tile_count, 1)
+    for cid in tl.static_range(0, NUM_GROUPS_PER_CTA):
+        group_id = cid * NUM_CTAS + cluster_cta_rank
+        # l and m share a synchronization group, so release QK only after both loads.
+        tlx.barrier_wait(l_fulls[cid], phase)
+        l_loaded = tlx.local_load(l_tiles[cid])
+        m_loaded = tlx.local_load(m_tiles[cid])
+        l = tl.split(l_loaded)[0][:, None] if SCALAR_N == 2 else l_loaded
+        m = tl.split(m_loaded)[0][:, None] if SCALAR_N == 2 else m_loaded
+        if USE_2CTA:
+            tlx.barrier_arrive(qk_empties[cid], 1, remote_cta_rank=0)
+        else:
+            tlx.barrier_arrive(qk_empties[cid])
+        if RESCALE_OPT:
+            m = m * sm_scale * 1.44269504
+        m += tl.math.log2(l)
+        offs_m = start_m * EFFECTIVE_BLOCK_M + group_id * BLOCK_M_SPLIT + tl.arange(0, BLOCK_M_SPLIT)
+        m_ptrs = M + off_hz * N_CTX + offs_m
+        tl.store(m_ptrs, tl.reshape(m, [BLOCK_M_SPLIT]))
+
+        # Normalize the completed accumulator into the output staging tile;
+        # the epilog task owns publication to global memory.
+        tlx.barrier_wait(acc_empties[cid], phase)
+        tlx.barrier_wait(o_empties[cid], phase ^ 1)
+        scale = 1 / l
+        for slice_id in tl.static_range(0, NUM_MMA_SLICES):
+            subslice = tlx.subslice(
+                acc_tiles[cid],
+                HEAD_DIM * slice_id // NUM_MMA_SLICES,
+                HEAD_DIM // NUM_MMA_SLICES,
+            )
+            acc = tlx.local_load(subslice)
+            acc = _mul_f32x2(acc, scale)
+            acc = acc.to(tlx.dtype_of(desc_o))
+            subslice_o = tlx.local_slice(
+                o_tiles[cid],
+                [0, HEAD_DIM * slice_id // NUM_MMA_SLICES],
+                [BLOCK_M_SPLIT, HEAD_DIM // NUM_MMA_SLICES],
+            )
+            tlx.local_store(subslice_o, acc)
+        tlx.barrier_arrive(o_fulls[cid])
+    return accum_cnt
 
 
 @triton.jit
@@ -792,127 +972,53 @@ def _attn_fwd_ws_kernel(sm_scale, M,  #
         # correction group
         with tlx.async_task("default"):
             accum_cnt = 0
-            phase = 0
             tile_count = 0
             tile_id = start_pid
             clc_phase_producer = 1
             clc_phase_consumer = 0
             while tile_id != -1:
-                # CLC producer: announce work to all consumer tasks
+                # Publish this persistent tile, then finalize its M and O outputs.
                 tlx.clc_producer(clc_context, clc_phase_producer, multi_ctas=USE_2CTA)
                 clc_phase_producer ^= 1
-
-                # initialize offsets
-                start_m, off_hz, lo, hi, qo_offset_y, kv_offset_y = _compute_offsets(
-                    tile_id // NUM_CTAS,
+                accum_cnt = _fwd_control_tile(
+                    tile_id,
+                    tile_count,
+                    accum_cnt,
+                    sm_scale,
+                    M,
                     H,
                     num_pid_n,
                     num_pid_in_group,
                     N_CTX,
+                    desc_o,
+                    alpha_empties,
+                    alpha_fulls,
+                    alpha_tiles,
+                    acc_empties,
+                    acc_fulls,
+                    acc_tiles,
+                    l_fulls,
+                    l_tiles,
+                    m_tiles,
+                    qk_empties,
+                    o_empties,
+                    o_fulls,
+                    o_tiles,
+                    cluster_cta_rank,
+                    BLOCK_M_SPLIT,
+                    BLOCK_N,
                     EFFECTIVE_BLOCK_M,
-                    STAGE,
                     GROUP_SIZE_N,
+                    HEAD_DIM,
+                    NUM_CTAS,
+                    NUM_GROUPS_PER_CTA,
+                    NUM_MMA_SLICES,
+                    RESCALE_OPT,
+                    SCALAR_N,
+                    STAGE,
+                    USE_2CTA,
+                    USE_WHERE,
                 )
-                for _ in tl.range(lo, hi, BLOCK_N):
-                    _, phase = get_bufidx_phase(accum_cnt, 1)
-                    for cid in tl.static_range(0, NUM_GROUPS_PER_CTA):
-                        # -- update output accumulator --
-                        tlx.barrier_wait(alpha_fulls[cid], phase)
-                        alpha_loaded = tlx.local_load(alpha_tiles[cid])
-                        alpha_1 = tl.split(alpha_loaded)[0][:, None] if SCALAR_N == 2 else alpha_loaded
-                        tlx.barrier_arrive(alpha_empties[cid])
-                        # Perform warp-level ballot vote to check if any thread needs rescaling
-                        # 0xFFFFFFFF means all 32 threads in the warp participate
-                        if RESCALE_OPT:
-                            pred = alpha_1 < 1.0
-                            # ballot_result is a tensor with the same shape as pred
-                            # All elements contain the same warp-level ballot value
-                            # Non-zero means at least one thread has alpha_1 < 1.0
-                            ballot_result = tlx.vote_ballot_sync(0xFFFFFFFF, pred)
-                            should_rescale = ballot_result != 0
-
-                        if USE_WHERE:
-                            for slice_id in tl.static_range(0, NUM_MMA_SLICES):
-                                subslice = tlx.subslice(
-                                    acc_tiles[cid],
-                                    HEAD_DIM * slice_id // NUM_MMA_SLICES,
-                                    HEAD_DIM // NUM_MMA_SLICES,
-                                )
-                                acc = tlx.local_load(subslice)
-                                # Use tl.where to conditionally apply rescaling
-                                # acc = acc * alpha_1 where should_rescale, else acc unchanged
-                                if RESCALE_OPT:
-                                    scaled_acc = _mul_f32x2(acc, alpha_1)
-                                    acc = tl.where(should_rescale, scaled_acc, acc)
-                                else:
-                                    acc = _mul_f32x2(acc, alpha_1)
-                                tlx.local_store(subslice, acc)
-                        else:
-                            # option 2: use a single scalar IfOp
-                            if RESCALE_OPT:
-                                should_rescale_red = tl.reduce(should_rescale, axis=0, combine_fn=_reduce_or)
-                                should_rescale_scalar = tl.reshape(should_rescale_red, ())
-                            if not RESCALE_OPT or (RESCALE_OPT and should_rescale_scalar):
-                                for slice_id in tl.static_range(0, NUM_MMA_SLICES):
-                                    subslice = tlx.subslice(
-                                        acc_tiles[cid],
-                                        HEAD_DIM * slice_id // NUM_MMA_SLICES,
-                                        HEAD_DIM // NUM_MMA_SLICES,
-                                    )
-                                    acc = tlx.local_load(subslice)
-                                    acc = _mul_f32x2(acc, alpha_1)
-                                    tlx.local_store(subslice, acc)
-                        if USE_2CTA:
-                            tlx.barrier_arrive(acc_fulls[cid], 1, remote_cta_rank=0)
-                        else:
-                            tlx.barrier_arrive(acc_fulls[cid])
-                    accum_cnt += 1
-
-                _, phase = get_bufidx_phase(tile_count, 1)
-                for cid in tl.static_range(0, NUM_GROUPS_PER_CTA):
-                    group_id = cid * NUM_CTAS + cluster_cta_rank
-                    # epilogue
-                    tlx.barrier_wait(l_fulls[cid], phase)
-                    l_loaded = tlx.local_load(l_tiles[cid])
-                    m_loaded = tlx.local_load(m_tiles[cid])
-                    l = tl.split(l_loaded)[0][:, None] if SCALAR_N == 2 else l_loaded
-                    m = tl.split(m_loaded)[0][:, None] if SCALAR_N == 2 else m_loaded
-                    # Signal qk_empties after both l and m loads complete,
-                    # since both tiles share the same synchronization group.
-                    if USE_2CTA:
-                        tlx.barrier_arrive(qk_empties[cid], 1, remote_cta_rank=0)
-                    else:
-                        tlx.barrier_arrive(qk_empties[cid])
-                    if RESCALE_OPT:
-                        # RESCALE_OPT stores unscaled row-max in m_tiles.
-                        # The bwd kernel expects scaled values (m * qk_scale),
-                        # so we scale here before storing M.
-                        m = m * sm_scale * 1.44269504
-                    m += tl.math.log2(l)
-                    offs_m = start_m * EFFECTIVE_BLOCK_M + group_id * BLOCK_M_SPLIT + tl.arange(0, BLOCK_M_SPLIT)
-                    m_ptrs = M + off_hz * N_CTX + offs_m
-                    tl.store(m_ptrs, tl.reshape(m, [BLOCK_M_SPLIT]))
-
-                    tlx.barrier_wait(acc_empties[cid], phase)
-                    tlx.barrier_wait(o_empties[cid], phase ^ 1)
-                    scale = 1 / l
-                    for slice_id in tl.static_range(0, NUM_MMA_SLICES):
-                        subslice = tlx.subslice(
-                            acc_tiles[cid],
-                            HEAD_DIM * slice_id // NUM_MMA_SLICES,
-                            HEAD_DIM // NUM_MMA_SLICES,
-                        )
-                        acc = tlx.local_load(subslice)
-                        acc = _mul_f32x2(acc, scale)
-                        acc = acc.to(tlx.dtype_of(desc_o))
-                        subslice_o = tlx.local_slice(
-                            o_tiles[cid],
-                            [0, HEAD_DIM * slice_id // NUM_MMA_SLICES],
-                            [BLOCK_M_SPLIT, HEAD_DIM // NUM_MMA_SLICES],
-                        )
-                        tlx.local_store(subslice_o, acc)
-                    tlx.barrier_arrive(o_fulls[cid])
-
                 tile_count += 1
                 tile_id = tlx.clc_consumer(clc_context, clc_phase_consumer, multi_ctas=USE_2CTA)
                 clc_phase_consumer ^= 1
@@ -940,7 +1046,6 @@ def _attn_fwd_ws_kernel(sm_scale, M,  #
                 # FA4 update_row_sum has init_val being None for the first iteration, here
                 # we use initial value of 1.0
                 l_i = tl.zeros([BLOCK_M_SPLIT], dtype=tl.float32) + 1.0
-                acc = tl.zeros([BLOCK_M_SPLIT, HEAD_DIM], dtype=tl.float32)
                 qk_scale = sm_scale
                 qk_scale *= 1.44269504  # 1/log(2)
                 p_dtype = tlx.dtype_of(desc_v)
