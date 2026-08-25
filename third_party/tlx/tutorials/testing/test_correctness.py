@@ -30,6 +30,7 @@ from triton.language.extra.tlx.tutorials.blackwell_fa_ws_pipelined_persistent im
     configs_bwd_1cta as _configs_bwd_1cta,
     configs_bwd_2cta as _configs_bwd_2cta,
     _bwd_selected_meta,
+    prune_bwd_configs as _prune_bwd_configs,
 )
 from triton.language.extra.tlx.tutorials.blackwell_fa_clc import (
     attention as _blackwell_fa_clc, )
@@ -368,7 +369,7 @@ class FlashAttention:
             "BLOCK_M": 256,
             "BLOCK_N": 128,
             "NUM_BUFFERS_Q": 1,
-            "NUM_BUFFERS_KV": 5,
+            "NUM_BUFFERS_KV": 3,
             "NUM_BUFFERS_QK": 1,
             "NUM_MMA_GROUPS": 2,
             "NUM_MMA_SLICES": 2,
@@ -823,6 +824,21 @@ def test_blackwell_fa_ws_pipelined_persistent(causal, RESCALE_OPT, USE_WHERE, BL
         torch.testing.assert_close(tri_out, ref_out, atol=1e-2, rtol=0)
 
 
+@pytest.mark.parametrize("causal", [True, False])
+@pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell GPU")
+def test_blackwell_fa_ws_pipelined_persistent_fast_f16(causal):
+    # Exercise the selected production route: long FP16 D64 uses the four-slice
+    # fixed-gauge path by default. Numerically sensitive callers can opt out via
+    # an explicit configuration; that path is covered separately.
+    Z, H, N_CTX, HEAD_DIM = 1, 1, 32768, 64
+    sm_scale = 0.5
+    q, k, v = FlashAttention.create_inputs(Z, H, N_CTX, HEAD_DIM, dtype=torch.float16)
+    ref_out = FlashAttention.get_reference(q, k, v, sm_scale, causal)
+    tri_out = _blackwell_fa_ws_pipelined_persistent(q, k, v, sm_scale, causal)
+    assert torch.isfinite(tri_out).all()
+    torch.testing.assert_close(tri_out, ref_out, atol=1.5e-2, rtol=0)
+
+
 @pytest.mark.parametrize("RESCALE_OPT,USE_WHERE", [(False, False), (True, False), (True, True)])
 @pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell GPU")
 def test_blackwell_fa_ws_pipelined_persistent_2cta(RESCALE_OPT, USE_WHERE):
@@ -946,10 +962,13 @@ def test_blackwell_fa_clc(N_CTX, causal, RESCALE_OPT, USE_WHERE):
 
 
 @pytest.mark.parametrize("NUM_CTAS", [1, 2])
+@pytest.mark.parametrize("USE_WARP_BARRIER", [False, True])
 @pytest.mark.parametrize("causal", [True, False])
 @pytest.mark.parametrize("RESCALE_OPT,USE_WHERE", [(False, False), (True, False), (True, True)])
 @pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell GPU")
-def test_blackwell_fa_ws_pipelined_persistent_bwd(causal, RESCALE_OPT, USE_WHERE, NUM_CTAS):
+def test_blackwell_fa_ws_pipelined_persistent_bwd(causal, RESCALE_OPT, USE_WHERE, USE_WARP_BARRIER, NUM_CTAS):
+    if NUM_CTAS == 2 and USE_WARP_BARRIER:
+        pytest.skip("the 2-CTA configuration uses cluster barriers")
     fwd_config: dict[str,
                      bool | int] = FlashAttention.CONFIGS["blackwell_fa_ws_pipelined_persistent_warp_barrier"].copy()
     fwd_config["RESCALE_OPT"] = RESCALE_OPT
@@ -957,6 +976,7 @@ def test_blackwell_fa_ws_pipelined_persistent_bwd(causal, RESCALE_OPT, USE_WHERE
     sm_scale = 0.5
 
     for Z, H, N_CTX, HEAD_DIM in FlashAttention.SHAPES:
+        direct_dq_output = NUM_CTAS == 2 and HEAD_DIM == 128
         q, k, v = FlashAttention.create_inputs(Z, H, N_CTX, HEAD_DIM)
 
         # Reference backward via PyTorch autograd
@@ -1010,19 +1030,21 @@ def test_blackwell_fa_ws_pipelined_persistent_bwd(causal, RESCALE_OPT, USE_WHERE
 
         # Backward: preprocess
         RCP_LN2 = 1.4426950408889634
-        arg_k = k * (sm_scale * RCP_LN2)
+        arg_k = k if direct_dq_output else k * (sm_scale * RCP_LN2)
         PRE_BLOCK = 128
         pre_grid = (N_CTX // PRE_BLOCK, Z * H)
         delta = torch.empty_like(M)
         _blackwell_fa_bwd_preprocess[pre_grid](o, do, delta, N_CTX, BLOCK_M=PRE_BLOCK, HEAD_DIM=HEAD_DIM)
 
         # Backward: main kernel
-        dq = torch.empty(q.shape, device=q.device, dtype=torch.float32)
+        dq = torch.zeros(q.shape, device=q.device, dtype=torch.float32) if direct_dq_output else torch.empty(
+            q.shape, device=q.device, dtype=torch.float32)
         dk = torch.empty_like(k)
         dv = torch.empty_like(v)
 
         _HALF_HD = HEAD_DIM // 2
-        dq_accum = torch.zeros([Z, H, N_CTX, HEAD_DIM], device=q.device, dtype=torch.float32)
+        dq_accum = dq if direct_dq_output else torch.zeros([Z, H, N_CTX, HEAD_DIM], device=q.device,
+                                                           dtype=torch.float32)
 
         dummy_block_4d = [1, 1, 1, 1]
         desc_shape = [Z, H, N_CTX, HEAD_DIM]
@@ -1031,8 +1053,12 @@ def test_blackwell_fa_ws_pipelined_persistent_bwd(causal, RESCALE_OPT, USE_WHERE
         desc_bv = TensorDescriptor(v, shape=desc_shape, strides=desc_strides, block_shape=dummy_block_4d)
         desc_bq = TensorDescriptor(q, shape=desc_shape, strides=desc_strides, block_shape=dummy_block_4d)
         desc_do = TensorDescriptor(do, shape=desc_shape, strides=desc_strides, block_shape=dummy_block_4d)
-        _dq_desc_shape = [Z, H, 2 * N_CTX, _HALF_HD]
-        _dq_desc_strides = [H * N_CTX * HEAD_DIM, N_CTX * HEAD_DIM, _HALF_HD, 1]
+        if direct_dq_output:
+            _dq_desc_shape = desc_shape
+            _dq_desc_strides = desc_strides
+        else:
+            _dq_desc_shape = [Z, H, 2 * N_CTX, _HALF_HD]
+            _dq_desc_strides = [H * N_CTX * HEAD_DIM, N_CTX * HEAD_DIM, _HALF_HD, 1]
         desc_dq = TensorDescriptor(dq_accum, shape=_dq_desc_shape, strides=_dq_desc_strides, block_shape=dummy_block_4d)
         desc_dk = TensorDescriptor(dk, shape=desc_shape, strides=desc_strides, block_shape=dummy_block_4d)
         desc_dv = TensorDescriptor(dv, shape=desc_shape, strides=desc_strides, block_shape=dummy_block_4d)
@@ -1047,7 +1073,9 @@ def test_blackwell_fa_ws_pipelined_persistent_bwd(causal, RESCALE_OPT, USE_WHERE
 
         BLK_SLICE_FACTOR = 2
 
-        bwd_configs = _configs_bwd_1cta if NUM_CTAS == 1 else _configs_bwd_2cta
+        source_configs = _configs_bwd_1cta if NUM_CTAS == 1 else _configs_bwd_2cta
+        bwd_configs = [config for config in source_configs if config.kwargs["USE_WARP_BARRIER"] == USE_WARP_BARRIER]
+        assert len(bwd_configs) == 1
         bwd_kernel = triton.autotune(configs=bwd_configs, key=["N_CTX", "HEAD_DIM"])(_blackwell_fa_bwd_ws.fn)
 
         def grid_persistent(meta):
@@ -1078,23 +1106,57 @@ def test_blackwell_fa_ws_pipelined_persistent_bwd(causal, RESCALE_OPT, USE_WHERE
             BLK_SLICE_FACTOR=BLK_SLICE_FACTOR,
             HEAD_DIM=HEAD_DIM,
             STAGE=stage,
+            DQ_STAGE_COUNT=2,
+            SCALE_QK_IN_KERNEL=direct_dq_output,
         )
 
-        _blk = _bwd_selected_meta["BLOCK_M1"] // _bwd_selected_meta["NUM_CTAS"]
-        post_grid = (N_CTX // PRE_BLOCK, Z * H)
-        _blackwell_fa_bwd_dq_postprocess[post_grid](
-            dq_accum,
-            dq,
-            N_CTX,
-            BLK=_blk,
-            HALF_HD=HEAD_DIM // 2,
-            BLOCK_M=PRE_BLOCK,
-            HEAD_DIM=HEAD_DIM,
-        )
+        if not direct_dq_output:
+            _blk = _bwd_selected_meta["BLOCK_M1"] // _bwd_selected_meta["NUM_CTAS"]
+            post_grid = (N_CTX // PRE_BLOCK, Z * H)
+            _blackwell_fa_bwd_dq_postprocess[post_grid](
+                dq_accum,
+                dq,
+                N_CTX,
+                BLK=_blk,
+                HALF_HD=HEAD_DIM // 2,
+                BLOCK_M=PRE_BLOCK,
+                HEAD_DIM=HEAD_DIM,
+            )
 
         torch.testing.assert_close(dv, ref_dv, atol=1e-2, rtol=0)
         torch.testing.assert_close(dk, ref_dk, atol=1e-2, rtol=0)
         torch.testing.assert_close(dq.to(ref_dq.dtype), ref_dq, atol=1e-2, rtol=0)
+
+
+def test_blackwell_fa_ws_pipelined_persistent_direct_dq_pruning():
+    configs = _configs_bwd_1cta + _configs_bwd_2cta
+    selected = _prune_bwd_configs(
+        configs,
+        {},
+        SCALE_QK_IN_KERNEL=True,
+        HEAD_DIM=128,
+        N_CTX=1024,
+    )
+    assert selected
+    assert all(config.kwargs.get("NUM_CTAS", 1) == 2 for config in selected)
+    with pytest.raises(AssertionError):
+        _prune_bwd_configs(
+            configs,
+            {},
+            SCALE_QK_IN_KERNEL=True,
+            HEAD_DIM=64,
+            N_CTX=1024,
+        )
+
+    odd_tiles = _prune_bwd_configs(
+        configs,
+        {},
+        SCALE_QK_IN_KERNEL=False,
+        HEAD_DIM=128,
+        N_CTX=384,
+    )
+    assert odd_tiles
+    assert all(config.kwargs.get("NUM_CTAS", 1) == 1 for config in odd_tiles)
 
 
 @pytest.mark.parametrize("HEAD_DIM", [64, 128])
