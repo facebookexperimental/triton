@@ -1401,7 +1401,7 @@ def _attn_predicated_causal_tile(
     BLOCK_N: tl.constexpr,
     ENABLE_CLASS_DIAGONAL_LAZY: tl.constexpr,
 ):
-    """Consume one diagonal tile inside a wave-uniform EXEC region."""
+    """Consume one diagonal tile for an active wave."""
     if BLOCK_N == 32:
         k_tile = tlx.local_slice(k_tile, [0, 0], [32, q.shape[1]])
         v_tile = tlx.local_slice(v_tile, [0, 0], [32, q.shape[1]])
@@ -1461,46 +1461,6 @@ def _attn_predicated_causal_tile(
     else:
         acc = _attn_dot_pv_mfma32(state.acc, p_dot, v_dot)
     return acc, state.l_i, state.m_i
-
-
-@triton.jit
-def _attn_predicated_causal_tile_from_state(
-    _unused_acc,
-    _unused_l_i,
-    _unused_m_i,
-    acc,
-    l_i,
-    m_i,
-    q,
-    offs_m,
-    k_tile,
-    v_tile,
-    wait,
-    start_n,
-    N_CTX: tl.constexpr,
-    QK_SCALE: tl.constexpr,
-    DIAG_OFFSET: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    ENABLE_CLASS_DIAGONAL_LAZY: tl.constexpr,
-):
-    """Compute from read-only state while carrying independent merge values."""
-    return _attn_predicated_causal_tile(
-        acc,
-        l_i,
-        m_i,
-        q,
-        offs_m,
-        k_tile,
-        v_tile,
-        wait,
-        start_n,
-        N_CTX,
-        QK_SCALE,
-        DIAG_OFFSET,
-        BLOCK_N,
-        ENABLE_CLASS_DIAGONAL_LAZY,
-    )
-
 
 @triton.jit
 def _attn_predicated_causal_regs_bn32(
@@ -1710,30 +1670,27 @@ def _attn_inner_short(
             mma_rows: tl.constexpr = tlx.slice_layout(mma, 1)
             # Gluon carries both softmax row states in SliceLayout(mma, 1).
             # Materialize TLX's otherwise-blocked running max before entering
-            # the wave-predicated loop so any register redistribution remains
-            # convergent and the predicated bodies need no CTA-wide scratch.
+            # the wave-uniform loop so any register redistribution remains
+            # convergent and the conditional bodies need no CTA-wide scratch.
             state = SoftmaxState(
                 state.acc,
                 tlx.require_layout(state.l_i, mma_rows, pin=True),
                 tlx.require_layout(state.m_i, mma_rows, pin=True),
             )
-            wave = tlx.thread_id(0) // CDNA_WAVE_SIZE
-            wave = wave ^ ((wave // 4) * 3)
-            wave_m_last = (wave * CDNA_MFMA_ROWS_PER_WAVE + CDNA_MFMA_ROWS_PER_WAVE - 1 + DIAG_OFFSET)
+            vote_rows = tlx.require_layout(offs_m + DIAG_OFFSET, mma_rows, pin=True)
             # Keep one runtime loop body, matching Gluon's four-slot diagonal
             # consumer.  Unrolling this loop duplicates both the BN64 and
             # low-half BN32 MFMA bodies four times in the code object.
             for diag_slot in tl.range(0, num_blocks, num_stages=1):
                 start_n = (block_start + diag_slot) * BLOCK_N
-                diagonal_start = start_n % q.shape[0]
-                active_full = wave_m_last >= diagonal_start + CDNA_MFMA_ROWS_PER_WAVE
-                active_lo = wave_m_last >= diagonal_start
+                active_full = tlx.warp_any(vote_rows >= start_n + CDNA_MFMA_ROWS_PER_WAVE)
+                active_lo = tlx.warp_any(vote_rows >= start_n)
                 active_lo_only = active_lo & ~active_full
-                acc, l_i, m_i = tlx.warp_predicate(
-                    active_full,
-                    (state.acc, state.l_i, state.m_i),
-                    _attn_predicated_causal_tile,
-                    args=(
+                if active_full:
+                    acc, l_i, m_i = _attn_predicated_causal_tile(
+                        state.acc,
+                        state.l_i,
+                        state.m_i,
                         q,
                         offs_m,
                         tlx.local_view(k_buf, diag_slot),
@@ -1745,19 +1702,10 @@ def _attn_inner_short(
                         DIAG_OFFSET,
                         BLOCK_N,
                         True,
-                    ),
-                    wave_uniform=True,
-                )
-                state = SoftmaxState(acc, l_i, m_i)
-                next_acc, next_l_i, next_m_i = tlx.warp_predicate(
-                    active_lo_only,
-                    (
-                        tl.zeros_like(state.acc),
-                        tl.zeros_like(state.l_i),
-                        tl.zeros_like(state.m_i),
-                    ),
-                    _attn_predicated_causal_tile_from_state,
-                    args=(
+                    )
+                    state = SoftmaxState(acc, l_i, m_i)
+                if active_lo_only:
+                    acc, l_i, m_i = _attn_predicated_causal_tile(
                         state.acc,
                         state.l_i,
                         state.m_i,
@@ -1772,14 +1720,8 @@ def _attn_inner_short(
                         DIAG_OFFSET,
                         CDNA_MFMA_ROWS_PER_WAVE,
                         True,
-                    ),
-                    wave_uniform=True,
-                )
-                state = SoftmaxState(
-                    tl.where(active_lo_only, next_acc, state.acc),
-                    tl.where(active_lo_only, next_l_i, state.l_i),
-                    tl.where(active_lo_only, next_m_i, state.m_i),
-                )
+                    )
+                    state = SoftmaxState(acc, l_i, m_i)
             return state
 
         # N512's two-slot diagonal is always consumed as a pair.  Preserve
@@ -2213,7 +2155,7 @@ def _attn_cluster_tile(
                                                    and HEAD_DIM == 128 and tlx.num_warps() == 8)
     if USE_ALIGNED_BM256_BN64_CAUSAL:
         # Gluon folds this shape to exactly one unmasked prefix body followed
-        # by its four-tile wave-predicated diagonal. Spell out that constexpr
+        # by its four-tile wave-voted diagonal. Spell out that constexpr
         # route so TLX does not retain the impossible masked-pipeline peers in
         # the same code object.
         diagonal_mma: tl.constexpr = tlx.amd_mfma_layout(

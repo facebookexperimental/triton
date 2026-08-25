@@ -704,6 +704,10 @@ def test_amd_fa_cluster_n2048_four_slot_prefix_handoff_codegen_gfx950(dtype):
     # addition to five prologue, four paired-loop, two odd-tail, and five
     # prefix-handoff copies.  The old three-tile drain has 20 sites instead.
     assert ttir.count("ttg.async_copy_global_to_local") == 24
+    # The diagonal decision is all-or-none within each wave.  Preserve the
+    # wave vote + uniform-if lowering instead of reintroducing EXEC masking.
+    assert ttir.count("ttg.warp_vote") == 2
+    assert ttir.count("ttg.warp_predicate") == 3
     amdgcn = compiled.asm["amdgcn"]
     assert ".private_segment_fixed_size: 0" in amdgcn
     assert ".vgpr_spill_count: 0" in amdgcn
