@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Pin, release, and verify register and shared-memory layouts.">
+  <title>Layout control and diagnostics · FBTriton</title>
+  <link rel="stylesheet" href="assets/tlx.css?v=20260824c">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="../"><span>FBTriton</span></a>
+    <nav class="topnav" aria-label="Top-level sections"><a href="triton.html">Triton</a>
+<a href="tlx.html" data-current="true">TLX</a>
+<a href="torchtlx.html">TorchTLX</a>
+<a href="ci.html">CI</a>
+<a href="tooling.html">Tooling</a></nav>
+    <a class="repo-link" href="https://github.com/facebookexperimental/triton" target="_blank" rel="noreferrer">View on GitHub ↗</a>
+  </header>
+  <div class="shell">
+<aside class="sidebar">
+      <p class="eyebrow">TLX documentation</p>
+      <nav><a href="tlx.html">Overview</a>
+<a href="buffers.html">Memory</a>
+<a href="global-memory.html">Global memory access</a>
+<a href="async-memory.html">Async memory access</a>
+<a href="async-compute.html">Tensor core operations</a>
+<a href="synchronization.html">Synchronization</a>
+<a href="warp-specialization.html">Warp specialization</a>
+<a href="clusters.html">Clusters and Cluster Launch Control</a>
+<a href="layouts.html" aria-current="page">Layout control and diagnostics</a>
+<a class="sub" href="#explicit-wmma-layout-pinning">Explicit WMMA layout pinning</a>
+<a class="sub" href="#compiler-pipeline-inspection">Compiler pipeline inspection</a>
+<a href="utilities.html">Other operations</a>
+<a href="kernels.html">Kernels implemented with TLX</a>
+<a href="testing.html">Testing</a>
+<a href="resources.html">Further reading</a></nav>
+    </aside>
+    <main>
+      <p class="eyebrow">TLX documentation</p>
+      <h1>Layout control and diagnostics</h1>
+      <p class="lede">Pin, release, and verify register and shared-memory layouts.</p>
+      <article><blockquote><p>On how TLX defers layout computation until after function inlining — needed when a helper's effective <code>num_warps</code> differs from the module's — see <a href="https://github.com/facebookexperimental/triton/blob/main/third_party/tlx/doc/PlaceholderLayouts.md" target="_blank" rel="noreferrer">Placeholder Layouts in TLX</a>.</p></blockquote>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.dump_layout(x)</code> <strong>[sm90+, gfx942+]</strong></div></div>
+<p>Compile-time diagnostic that prints the resolved layout of a value to the compiler log. <code>x</code> may be a register tensor or a shared/tensor-memory buffer (memdesc). It emits <strong>no</strong> device code and returns nothing — this is a static, host-side diagnostic, distinct from the runtime <code>tl.device_print</code> / <code>tl.print</code>. The op is rendered at the end of the TTGIR pipeline, so the printed layout reflects all compiler optimizations, then it is erased.</p>
+<p>The layout is printed in CuTe (CUTLASS) <code>Shape:Stride</code> notation (<code>_N</code> marks a static integer):</p>
+<div class="list-item depth-2"><span aria-hidden="true">•</span><div>Register tensors → a thread-value (TV) layout</div></div>
+<p><code>((thread...),(value...)):((thread...),(value...))</code>, where the thread group comes from the hardware lane/warp/block dims and the value group from the per-thread registers (stride <code>_0</code> denotes a broadcast).</p>
+<div class="list-item depth-2"><span aria-hidden="true">•</span><div>Shared/tensor-memory buffers → a single strided layout, e.g. <code>_64:_1</code>.</div></div>
+<div class="list-item depth-2"><span aria-hidden="true">•</span><div>Swizzled shared buffers → <code>Swizzle&lt;B,M,S&gt; o (base):(stride)</code>.</div></div>
+<p>In all cases the layout maps a coordinate to the <strong>logical tensor's row-major element index</strong> (its codomain): for a register tensor a <code>(thread, value)</code> coordinate → the logical element index it holds, and for a buffer an offset → the buffer element index. The strides are offsets in that logical index space, not physical byte/bank addresses.</p>
+<p>Layouts that are not representable as a CuTe layout fall back to the raw linear-layout string.</p>
+<p>Example:</p>
+<pre><code class="language-python">    x = tl.load(x_ptr + offs)          # register tensor
+    tlx.dump_layout(x)                  # -&gt; // cute: ((_32,_2,_2),_1):((_1,_32,_0),_0)
+
+    buf = tlx.local_alloc((BLOCK,), tl.float32, 1)
+    v = tlx.local_view(buf, 0)
+    tlx.dump_layout(v)                  # -&gt; // cute: _64:_1</code></pre>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>x = tlx.require_layout(x, layout, pin=True, late_address_compute=False)</code> <strong>[sm90+, gfx942+]</strong></div></div>
+<p>Require a register tensor <code>x</code> to use <code>layout</code>, expressed as a <code>tlx.layout(...)</code> (Shape:Stride). With the default <code>pin=True</code>, the <code>#linear</code> encoding is wrapped as <code>#tlx.no_verify_layout(#tlx.user_layout(...))</code>. The inner <code>#tlx.user_layout</code> carries <code>PinnedEncodingTrait</code>, so downstream passes (<code>tritongpu-coalesce</code>, <code>remove-layout-conversions</code>, AMD <code>optimize-epilogue</code>) treat it as fixed and never rewrite it; the outer <code>#tlx.no_verify_layout</code> defers operand-layout verification until the pin is peeled by <code>TLXResolvePlaceholderLayouts</code> in <code>make_ttgir</code>. Example: pin an FP16 epilogue <code>tl.store</code> to a coalesced layout so <code>OptimizeEpilogue</code> keeps the wide <code>buffer_store_dwordx4</code> instead of narrowing it to the MMA-accumulator store, without staging the value through LDS.</p>
+<p>Pass <code>pin=False</code> for an optimizer-flexible requirement. This emits the requested encoding without the <code>#tlx.user_layout</code> hard anchor, allowing later layout passes to propagate the requirement or materialize a layout conversion. The default remains <code>pin=True</code> for existing callers.</p>
+<p>On AMD, <code>late_address_compute=True</code> asks shared-memory-backed layout conversions to compute their addresses at this use. The backend does this by rematerializing inexpensive lane/warp coordinates, shortening their live ranges across register-heavy regions.</p>
+<p>Pair with <code>tlx.assert_same_layout(x, layout)</code> (below) to statically verify the pin survived to the final TTGIR.</p>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>x = tlx.release_layout(x)</code> <strong>[sm90+, gfx942+]</strong></div></div>
+<p>End an explicit register-layout requirement without changing the tensor's value. Downstream layout propagation may select a layout preferred by the consumer, for example when a dot-operand layout feeds a reduction. This is not a conversion request; use another <code>require_layout</code> when the replacement layout is part of the algorithm.</p>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.assert_same_layout(lhs, rhs)</code> <strong>[sm90+, gfx942+]</strong></div></div>
+<p>Compile-time assertion that two layouts are equivalent after layout propagation and all other TTGIR layout optimizations have completed. Like <code>tlx.dump_layout</code>, it emits no device code and is consumed at the end of the TTGIR pipeline.</p>
+<p><code>rhs</code> supports two forms:</p>
+<div class="list-item depth-2"><span aria-hidden="true">•</span><div><strong>Value/value:</strong> <code>rhs</code> is another register tensor or shared/tensor-memory</div></div>
+<p>buffer. The frontend emits <code>tlx.assert_same_layout</code>, whose two operands retain their independently resolved final types.</p>
+<div class="list-item depth-2"><span aria-hidden="true">•</span><div><strong>Value/layout:</strong> <code>rhs</code> is a constant <code>tlx.layout_encoding</code>. The frontend</div></div>
+<p>lowers the constant to an encoding attribute and emits <code>tlx.assert_same_layout_expected</code>. At assertion time, the pass combines that encoding with <code>lhs</code>'s shape, element type, and (for buffers) memory properties to construct an expected tensor or memdesc type.</p>
+<p>These are separate internal operations only because an SSA value is an MLIR operand while a constant layout is an MLIR attribute. They share the same comparison path and the same public Python API.</p>
+<p>Before comparison, both final types are converted with <code>ttg::toLinearLayout</code>. The assertion compares the resulting <code>LinearLayout</code>s, not the original encoding attributes. Consequently, structurally different encodings pass if they describe the same logical mapping. A mismatch reports both normalized LinearLayouts and fails compilation.</p>
+<p>Example:</p>
+<pre><code class="language-python">    x = tlx.local_load(x_buf, layout=REGISTER_LAYOUT)
+    y = tlx.local_load(y_buf, layout=REGISTER_LAYOUT)
+
+    tlx.assert_same_layout(x, y)                # value/value
+    tlx.assert_same_layout(x, REGISTER_LAYOUT)  # value/layout</code></pre>
+<h2 id="explicit-wmma-layout-pinning">Explicit WMMA layout pinning</h2>
+<p><code>tlx.require_amd_wmma_layout(x, version=3, transposed=True, warp_bases=..., reg_bases=..., instr_shape=(16, 16, 128))</code> pins a tensor to an explicit AMD WMMA register/warp layout. This is useful for tuned gfx1250 epilogues that must retain the accumulator ownership chosen by <code>tiles_per_warp</code> across otherwise layout-neutral tensor operations. The bases contain one linear-layout basis vector per register or warp bit and must match the tensor rank.</p>
+<p>The helper lowers to a pinned <code>tlx.require_layout</code>; omit it when automatic layout propagation is sufficient.</p>
+<h2 id="compiler-pipeline-inspection">Compiler pipeline inspection</h2>
+<p>To introspect the pipeline <code>add_stages</code>, before running your kernels, simply set the add_stages_inspection_hook like so:</p>
+<pre><code class="language-python">def inspect_stages(_self, stages, options, language, capability):
+    # inspect or modify add_stages here
+triton.knobs.runtime.add_stages_inspection_hook = inspect_stages</code></pre>
+<p>For an example of using this with out-of-tree plugin passes, see <a href="https://github.com/facebookexperimental/triton/blob/main/examples/plugins/README.md" target="_blank" rel="noreferrer"><code>examples/plugins/</code></a>.</p></article>
+<footer class="pager"><a href="clusters.html">← Clusters and Cluster Launch Control</a><a class="next" href="utilities.html">Other operations →</a></footer>
+    </main>
+  </div>
+</body>
+</html>

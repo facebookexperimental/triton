@@ -5,18 +5,24 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="description" content="Tools for tracing, profiling, validating, and benchmarking Triton kernels.">
   <title>Tooling · FBTriton</title>
-  <link rel="stylesheet" href="assets/tlx.css?v=20260821b">
+  <link rel="stylesheet" href="assets/tlx.css?v=20260824c">
 </head>
 <body>
   <header class="topbar">
-    <a class="brand" href="../"><span>FB</span>Triton</a>
+    <a class="brand" href="../"><span>FBTriton</span></a>
     <nav class="topnav" aria-label="Top-level sections"><a href="triton.html">Triton</a>
 <a href="tlx.html">TLX</a>
+<a href="torchtlx.html">TorchTLX</a>
+<a href="ci.html">CI</a>
 <a href="tooling.html" data-current="true">Tooling</a></nav>
     <a class="repo-link" href="https://github.com/facebookexperimental/triton" target="_blank" rel="noreferrer">View on GitHub ↗</a>
   </header>
-  <div class="shell no-sidebar">
-
+  <div class="shell">
+<aside class="sidebar">
+      <p class="eyebrow">Developer tooling</p>
+      <nav><a href="tooling.html" aria-current="page">Tooling</a>
+<a class="sub" href="#suggested-workflow">Suggested workflow</a></nav>
+    </aside>
     <main>
       <p class="eyebrow">Developer tooling</p>
       <h1>Tooling</h1>
@@ -30,7 +36,7 @@
 <div class="list-item depth-0"><span aria-hidden="true">•</span><div>Add CUTracer or Compute Sanitizer only when runtime ordering, races, or memory access are suspect.</div></div>
 <div class="list-item depth-0"><span aria-hidden="true">•</span><div>Confirm improvements with TritonBench or the repository's correctness and performance harnesses.</div></div>
 <p>The <a href="debugging.html">debugging guide</a> provides symptom-driven workflows for performance and numerical issues.</p></article>
-<footer class="pager"><a href="tlx.html">← TLX</a></footer>
+<footer class="pager"><a href="ci.html">← CI</a></footer>
     </main>
   </div>
 </body>

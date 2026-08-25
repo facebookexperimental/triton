@@ -6,8 +6,10 @@
   --text: #e8edf7;
   --muted: #a7b1c4;
   --line: #2b3854;
-  --accent: #77e1c2;
+  --accent: #4599ff;
   --accent-2: #9fb5ff;
+  --brand-bg: #1877f2;
+  --brand-fg: #ffffff;
   --code: #080c17;
   --max-width: 920px;
 }
@@ -62,14 +64,13 @@ a:hover {
 }
 
 .brand span {
-  background: var(--accent);
+  background: var(--brand-bg);
   border-radius: 6px;
-  color: #07110e;
+  color: var(--brand-fg);
   display: inline-block;
   font-weight: 850;
-  letter-spacing: 0.08em;
-  margin-right: 10px;
-  padding: 2px 8px;
+  letter-spacing: 0.04em;
+  padding: 2px 9px;
 }
 
 .repo-link {
@@ -122,10 +123,10 @@ a:hover {
 
 .eyebrow {
   color: var(--accent);
-  font-size: 0.74rem;
-  font-weight: 800;
-  letter-spacing: 0.12em;
-  margin: 0 0 14px;
+  font-size: 0.86rem;
+  font-weight: 700;
+  letter-spacing: 0.09em;
+  margin: 0 0 10px;
   text-transform: uppercase;
 }
 
@@ -148,22 +149,29 @@ a:hover {
   margin-left: -1px;
 }
 
+.sidebar nav a.sub {
+  font-size: 0.82rem;
+  opacity: 0.85;
+  padding: 4px 0 4px 32px;
+}
+
 main {
   min-width: 0;
 }
 
 main > h1 {
-  font-size: clamp(2.25rem, 6vw, 4.3rem);
-  letter-spacing: -0.045em;
-  line-height: 1.02;
+  font-size: clamp(1.9rem, 3.2vw, 2.6rem);
+  letter-spacing: -0.02em;
+  line-height: 1.15;
   margin: 0;
   max-width: 850px;
 }
 
 .lede {
   color: var(--muted);
-  font-size: 1.2rem;
-  margin: 20px 0 52px;
+  font-size: 1.08rem;
+  line-height: 1.55;
+  margin: 14px 0 40px;
   max-width: 700px;
 }
 
@@ -328,7 +336,7 @@ th {
   }
 
   main > h1 {
-    font-size: 2.7rem;
+    font-size: 2rem;
   }
 }
 
@@ -340,8 +348,10 @@ th {
     --text: #172033;
     --muted: #526079;
     --line: #d8e0ec;
-    --accent: #087f68;
+    --accent: #1877f2;
     --accent-2: #345dcc;
+    --brand-bg: #1877f2;
+    --brand-fg: #ffffff;
     --code: #f0f4f9;
   }
 

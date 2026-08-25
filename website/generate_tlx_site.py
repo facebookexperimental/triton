@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build the FBTriton GitHub Pages site from README.md and curated guides."""
+"""Build the FBTriton GitHub Pages site from website/content and curated guides."""
 
 from __future__ import annotations
 
@@ -13,88 +13,79 @@ from guide_content import GUIDE_CONTENT
 SITE_ROOT = Path(__file__).resolve().parent
 REPOSITORY_ROOT = SITE_ROOT.parent
 REPOSITORY_URL = "https://github.com/facebookexperimental/triton"
-STYLESHEET_VERSION = "20260821b"
+STYLESHEET_VERSION = "20260824c"
 
 
 @dataclass(frozen=True)
 class Page:
     slug: str
     title: str
-    start: str | None
-    end: str | None
     summary: str
     section: str = "tlx"
 
 
-README_PAGES = (
-    Page(
-        "tlx",
-        "TLX",
-        None,
-        "## The DSL Extension",
-        "What TLX is and when to use it.",
-    ),
+CONTENT_ROOT = SITE_ROOT / "content"
+
+TLX_PAGES = (
+    Page("tlx", "TLX", "What TLX is, and the hardware tags used throughout."),
     Page(
         "buffers",
-        "Local and remote buffers",
-        "## The DSL Extension",
-        "### Async memory access",
-        "Allocate, view, load, store, and share hardware-near buffers.",
+        "Memory",
+        "Allocate, view, slice, and reuse local and remote buffers.",
+    ),
+    Page(
+        "global-memory",
+        "Global memory access",
+        "Address global memory directly with scalar-base buffer operations.",
     ),
     Page(
         "async-memory",
         "Async memory access",
-        "### Async memory access",
-        "### Async tensor core operations",
-        "Move data asynchronously with descriptors, TMA, and copy groups.",
+        "Move data asynchronously with descriptors, TMA, TDM, and copy groups.",
     ),
     Page(
         "async-compute",
-        "Async tensor core operations",
-        "### Async tensor core operations",
-        "### Barrier operations",
-        "Issue and coordinate asynchronous tensor-core work.",
+        "Tensor core operations",
+        "Issue and schedule synchronous and asynchronous tensor-core work.",
     ),
     Page(
         "synchronization",
-        "Barriers and Cluster Launch Control",
-        "### Barrier operations",
-        "### Warp Specialization operations",
-        "Synchronize tasks and distribute persistent work across CTAs.",
+        "Synchronization",
+        "Barriers, scheduling barriers, and memory fences.",
     ),
     Page(
         "warp-specialization",
-        "Warp specialization and clustering",
-        "### Warp Specialization operations",
-        "### Other operations",
-        "Assign warps to concurrent tasks and configure CTA clusters.",
+        "Warp specialization",
+        "Assign warps to concurrent tasks and build explicit pipelines.",
+    ),
+    Page(
+        "clusters",
+        "Clusters and Cluster Launch Control",
+        "Cooperate across CTAs and distribute persistent work in hardware.",
+    ),
+    Page(
+        "layouts",
+        "Layout control and diagnostics",
+        "Pin, release, and verify register and shared-memory layouts.",
     ),
     Page(
         "utilities",
         "Other operations",
-        "### Other operations",
-        "## Kernels Implemented with TLX",
         "Thread, type, timing, and stochastic-rounding utilities.",
     ),
     Page(
         "kernels",
-        "Example kernels",
-        "## Kernels Implemented with TLX",
-        "## Build and install TLX from source",
+        "Kernels implemented with TLX",
         "GEMM and attention kernels implemented with TLX.",
     ),
     Page(
-        "install-and-test",
-        "Build, install, and test",
-        "## Build and install TLX from source",
-        "## More reading materials",
-        "Build TLX and run its correctness and performance scripts.",
+        "testing",
+        "Testing",
+        "Correctness and performance scripts for the TLX tutorial kernels.",
     ),
     Page(
         "resources",
-        "More reading",
-        "## More reading materials",
-        None,
+        "Further reading",
         "Additional TLX documentation and conference material.",
     ),
 )
@@ -102,129 +93,69 @@ README_PAGES = (
 HOME_PAGE = Page(
     "home",
     "Overview",
-    None,
-    None,
-    "Explore Triton, TLX, and the tooling used to build and optimize GPU kernels.",
+    "Explore Triton, TLX, TorchTLX, and the tooling used to build and optimize GPU kernels.",
     "home",
-)
-GETTING_STARTED_PAGE = Page(
-    "getting-started",
-    "Getting started",
-    None,
-    None,
-    "Start with TLX imports, tutorials, and a minimal warp-specialized kernel.",
-)
-HARDWARE_SUPPORT_PAGE = Page(
-    "hardware-support",
-    "Hardware support",
-    None,
-    None,
-    "Understand TLX capabilities across Hopper, Blackwell, and AMD CDNA GPUs.",
-)
-PERFORMANCE_PAGE = Page(
-    "performance-optimization",
-    "Performance optimization",
-    None,
-    None,
-    "Structure pipelines, buffers, fusion, and scheduling for high utilization.",
-)
-DEBUGGING_PAGE = Page(
-    "debugging",
-    "Debugging performance and numerics",
-    None,
-    None,
-    "Diagnose compiler, runtime, performance, and numerical issues systematically.",
-)
-CASE_STUDIES_PAGE = Page(
-    "production-case-studies",
-    "Production case studies",
-    None,
-    None,
-    "See how TLX has been applied to large-scale training and inference workloads.",
 )
 TRITON_PAGE = Page(
     "triton",
     "Triton",
-    None,
-    None,
     "Compiler-managed performance portability and automatic warp specialization.",
     "triton",
+)
+COMPILER_PAGE = Page(
+    "compiler",
+    "Compiler features",
+    "AutoWS enablement and knobs, and deterministic reduction ordering.",
+    "triton",
+)
+TORCHTLX_PAGE = Page(
+    "torchtlx",
+    "TorchTLX",
+    "Bring TLX kernels into PyTorch 2 through Inductor templates and epilogue fusion.",
+    "torchtlx",
+)
+CI_PAGE = Page(
+    "ci",
+    "CI",
+    "Workflows, runners, nightly failure handling, and per-project test coverage.",
+    "ci",
 )
 TOOLING_PAGE = Page(
     "tooling",
     "Tooling",
-    None,
-    None,
     "Tools for tracing, profiling, validating, and benchmarking Triton kernels.",
     "tooling",
 )
 
-TLX_PAGES = (
-    README_PAGES[0],
-    GETTING_STARTED_PAGE,
-    HARDWARE_SUPPORT_PAGE,
-    *README_PAGES[1:7],
-    PERFORMANCE_PAGE,
-    DEBUGGING_PAGE,
-    README_PAGES[7],
-    CASE_STUDIES_PAGE,
-    *README_PAGES[8:],
-)
-SECTION_PAGES = (TRITON_PAGE, README_PAGES[0], TOOLING_PAGE)
+TRITON_PAGES = (TRITON_PAGE, COMPILER_PAGE)
+
+SECTIONS = {
+    "triton": TRITON_PAGES,
+    "tlx": TLX_PAGES,
+    "torchtlx": (TORCHTLX_PAGE,),
+    "ci": (CI_PAGE,),
+    "tooling": (TOOLING_PAGE,),
+}
+SECTION_PAGES = tuple(pages[0] for pages in SECTIONS.values())
 SECTION_LABELS = {
     "triton": "Triton",
     "tlx": "TLX",
+    "torchtlx": "TorchTLX",
+    "ci": "CI",
     "tooling": "Tooling",
 }
-TRITON_NAV_ITEMS = (
-    ("Overview", "triton.html"),
-    ("Automatic warp specialization", "#automatic-warp-specialization"),
-    ("Compiler pipeline", "#the-compiler-pipeline-today"),
-    ("TLX and AutoWS", "#tlx-and-autows"),
-    ("Roadmap", "#roadmap"),
-    ("Design article", "#read-the-design-article"),
-)
-PAGES = (HOME_PAGE, TRITON_PAGE, *TLX_PAGES, TOOLING_PAGE)
+PAGES = (HOME_PAGE, *TRITON_PAGES, *TLX_PAGES, TORCHTLX_PAGE, CI_PAGE, TOOLING_PAGE)
+
+def page_source(page: Page) -> str:
+    """Read a page body from website/content/, falling back to guide_content."""
+    path = CONTENT_ROOT / f"{page.slug}.md"
+    if path.exists():
+        return path.read_text(encoding="utf-8")
+    return GUIDE_CONTENT[page.slug].strip() + "\n"
 
 
-def read_readme() -> str:
-    return (REPOSITORY_ROOT / "README.md").read_text(encoding="utf-8")
-
-
-def split_readme(source: str) -> list[tuple[Page, str]]:
-    chunks: list[tuple[Page, str]] = []
-    for page in README_PAGES:
-        start = source.index(page.start) if page.start else 0
-        end = source.index(page.end) if page.end else len(source)
-        chunks.append((page, source[start:end]))
-
-    if "".join(chunk for _, chunk in chunks) != source:
-        raise RuntimeError("Page boundaries do not reproduce README.md exactly")
-    return chunks
-
-
-def collect_page_sources(source: str) -> list[tuple[Page, str]]:
-    sources = {page.slug: chunk for page, chunk in split_readme(source)}
-    sources["tlx"] = sources["tlx"].replace(
-        "Primarily targeting NVIDIA GPUs (for now), TLX extends Triton to support:",
-        "TLX targets NVIDIA and AMD GPUs and supports:",
-        1,
-    )
-    overview_marker = "## Nightly builds (fbtriton)"
-    if overview_marker not in sources["tlx"]:
-        raise RuntimeError(f"Missing overview insertion point: {overview_marker}")
-    overview_addition = GUIDE_CONTENT["tlx-overview"].strip()
-    sources["tlx"] = sources["tlx"].replace(
-        overview_marker,
-        f"{overview_addition}\n\n{overview_marker}",
-        1,
-    )
-
-    for slug, content in GUIDE_CONTENT.items():
-        if slug != "tlx-overview":
-            sources[slug] = content.strip() + "\n"
-
-    return [(page, sources[page.slug]) for page in PAGES]
+def collect_page_sources() -> list[tuple[Page, str]]:
+    return [(page, page_source(page)) for page in PAGES]
 
 
 def slugify(value: str) -> str:
@@ -365,7 +296,7 @@ def render_markdown(source: str) -> str:
 
 def content_without_page_heading(source: str) -> str:
     lines = source.splitlines()
-    if lines and lines[0].startswith("#"):
+    if lines and lines[0].startswith("# "):
         lines = lines[1:]
     while lines and not lines[0].strip():
         lines.pop(0)
@@ -389,28 +320,44 @@ def top_navigation(page: Page, from_root: bool) -> str:
     return "\n".join(items)
 
 
-def documentation_navigation(active_slug: str, from_root: bool) -> str:
-    items = []
-    for page in TLX_PAGES:
-        href = page_href(page, from_root)
-        current = ' aria-current="page"' if page.slug == active_slug else ""
-        label = "Overview" if page.slug == "tlx" else page.title
-        items.append(f'<a href="{href}"{current}>{html.escape(label)}</a>')
-    return "\n".join(items)
+def sub_headings(source: str) -> list[str]:
+    """Level-2 headings of a page body, ignoring fenced code."""
+    out, in_code = [], False
+    for line in source.splitlines():
+        if re.match(r"^\s*```", line):
+            in_code = not in_code
+            continue
+        if in_code:
+            continue
+        heading = re.match(r"^## (.+)$", line)
+        if heading:
+            out.append(heading.group(1).strip())
+    return out
 
 
-def triton_navigation() -> str:
+def section_navigation(page: Page, source: str, from_root: bool) -> str:
+    pages = SECTIONS[page.section]
     items = []
-    for index, (label, href) in enumerate(TRITON_NAV_ITEMS):
-        current = ' aria-current="page"' if index == 0 else ""
+    for entry in pages:
+        href = page_href(entry, from_root)
+        current = ' aria-current="page"' if entry.slug == page.slug else ""
+        label = "Overview" if len(pages) > 1 and entry is pages[0] else entry.title
         items.append(f'<a href="{href}"{current}>{html.escape(label)}</a>')
+        if entry.slug == page.slug:
+            for heading in sub_headings(source):
+                items.append(
+                    f'<a class="sub" href="#{slugify(heading)}">{html.escape(heading)}</a>')
     return "\n".join(items)
 
 
 def page_links(page: Page, from_root: bool) -> str:
     if page.section == "home":
         return ""
-    sequence = TLX_PAGES if page.section == "tlx" else SECTION_PAGES
+    # Page within its own section when the section has several; otherwise step
+    # across the top-level sections.
+    sequence = SECTIONS[page.section]
+    if len(sequence) == 1:
+        sequence = SECTION_PAGES
     position = sequence.index(page)
     previous = sequence[position - 1] if position else None
     following = sequence[position + 1] if position + 1 < len(sequence) else None
@@ -434,23 +381,19 @@ def render_page(page: Page, source: str) -> str:
         "home": "Triton at Meta",
         "triton": "Triton compiler",
         "tlx": "TLX documentation",
+        "torchtlx": "TorchTLX",
+        "ci": "Continuous integration",
         "tooling": "Developer tooling",
     }[page.section]
     pager = page_links(page, from_root)
     footer = f'<footer class="pager">{pager}</footer>' if pager else ""
     sidebar = ""
     shell_class = "shell no-sidebar"
-    if page.section == "tlx":
+    if page.section in SECTIONS:
         shell_class = "shell"
         sidebar = f"""<aside class="sidebar">
-      <p class="eyebrow">TLX documentation</p>
-      <nav>{documentation_navigation(page.slug, from_root)}</nav>
-    </aside>"""
-    elif page.section == "triton":
-        shell_class = "shell"
-        sidebar = f"""<aside class="sidebar">
-      <p class="eyebrow">Triton documentation</p>
-      <nav>{triton_navigation()}</nav>
+      <p class="eyebrow">{html.escape(eyebrow)}</p>
+      <nav>{section_navigation(page, source, from_root)}</nav>
     </aside>"""
     return f"""<!doctype html>
 <html lang="en">
@@ -463,7 +406,7 @@ def render_page(page: Page, source: str) -> str:
 </head>
 <body>
   <header class="topbar">
-    <a class="brand" href="{home}"><span>FB</span>Triton</a>
+    <a class="brand" href="{home}"><span>FBTriton</span></a>
     <nav class="topnav" aria-label="Top-level sections">{top_navigation(page, from_root)}</nav>
     <a class="repo-link" href="{REPOSITORY_URL}" target="_blank" rel="noreferrer">View on GitHub ↗</a>
   </header>
@@ -483,13 +426,13 @@ def render_page(page: Page, source: str) -> str:
 
 
 def main() -> None:
-    chunks = collect_page_sources(read_readme())
+    chunks = collect_page_sources()
 
     for page, source in chunks:
         output = (REPOSITORY_ROOT / "index.html" if page.slug == "home" else SITE_ROOT / f"{page.slug}.html")
         output.write_text(render_page(page, source), encoding="utf-8")
 
-    print(f"Generated {len(chunks)} pages from README.md and guide content")
+    print(f"Generated {len(chunks)} pages from website/content and guide content")
 
 
 if __name__ == "__main__":

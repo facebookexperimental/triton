@@ -5,13 +5,15 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="description" content="Thread, type, timing, and stochastic-rounding utilities.">
   <title>Other operations · FBTriton</title>
-  <link rel="stylesheet" href="assets/tlx.css?v=20260821b">
+  <link rel="stylesheet" href="assets/tlx.css?v=20260824c">
 </head>
 <body>
   <header class="topbar">
-    <a class="brand" href="../"><span>FB</span>Triton</a>
+    <a class="brand" href="../"><span>FBTriton</span></a>
     <nav class="topnav" aria-label="Top-level sections"><a href="triton.html">Triton</a>
 <a href="tlx.html" data-current="true">TLX</a>
+<a href="torchtlx.html">TorchTLX</a>
+<a href="ci.html">CI</a>
 <a href="tooling.html">Tooling</a></nav>
     <a class="repo-link" href="https://github.com/facebookexperimental/triton" target="_blank" rel="noreferrer">View on GitHub ↗</a>
   </header>
@@ -19,32 +21,29 @@
 <aside class="sidebar">
       <p class="eyebrow">TLX documentation</p>
       <nav><a href="tlx.html">Overview</a>
-<a href="getting-started.html">Getting started</a>
-<a href="hardware-support.html">Hardware support</a>
-<a href="buffers.html">Local and remote buffers</a>
+<a href="buffers.html">Memory</a>
+<a href="global-memory.html">Global memory access</a>
 <a href="async-memory.html">Async memory access</a>
-<a href="async-compute.html">Async tensor core operations</a>
-<a href="synchronization.html">Barriers and Cluster Launch Control</a>
-<a href="warp-specialization.html">Warp specialization and clustering</a>
+<a href="async-compute.html">Tensor core operations</a>
+<a href="synchronization.html">Synchronization</a>
+<a href="warp-specialization.html">Warp specialization</a>
+<a href="clusters.html">Clusters and Cluster Launch Control</a>
+<a href="layouts.html">Layout control and diagnostics</a>
 <a href="utilities.html" aria-current="page">Other operations</a>
-<a href="performance-optimization.html">Performance optimization</a>
-<a href="debugging.html">Debugging performance and numerics</a>
-<a href="kernels.html">Example kernels</a>
-<a href="production-case-studies.html">Production case studies</a>
-<a href="install-and-test.html">Build, install, and test</a>
-<a href="resources.html">More reading</a></nav>
+<a class="sub" href="#tlx-assume-uniform">`tlx.assume_uniform`</a>
+<a href="kernels.html">Kernels implemented with TLX</a>
+<a href="testing.html">Testing</a>
+<a href="resources.html">Further reading</a></nav>
     </aside>
     <main>
       <p class="eyebrow">TLX documentation</p>
       <h1>Other operations</h1>
       <p class="lede">Thread, type, timing, and stochastic-rounding utilities.</p>
-      <article><div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.cluster_cta_rank()</code> <strong>[Hopper+]</strong></div></div>
-<p>Returns the rank (unique ID) of the current CTA within the cluster.</p>
-<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.thread_id(axis)</code> <strong>[Hopper+]</strong></div></div>
+      <article><div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.thread_id(axis)</code> <strong>[sm90+]</strong></div></div>
 <p>Returns the id of the current thread instance along the given <code>axis</code>.</p>
-<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.dtype_of(v)</code> <strong>[Hopper+]</strong></div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.dtype_of(v)</code> <strong>[sm90+]</strong></div></div>
 <p>Returns the dtype of a tensor or tensor descriptor.</p>
-<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.size_of(dtype)</code> <strong>[Hopper+]</strong></div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.size_of(dtype)</code> <strong>[sm90+]</strong></div></div>
 <p>Returns the size in bytes of a given Triton dtype. This is useful for dynamically computing memory sizes based on dtype, especially in barrier synchronization code.</p>
 <p>Example:</p>
 <pre><code class="language-python">    # Instead of hardcoding size values
@@ -53,13 +52,13 @@
     # Use size_of for dtype-aware computation
     tlx.barrier_expect_bytes(barrier,
                            tlx.size_of(tlx.dtype_of(desc)) * BLOCK_M * BLOCK_K)</code></pre>
-<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.clock64()</code> <strong>[Hopper+]</strong></div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.clock64()</code> <strong>[sm90+]</strong></div></div>
 <p>Returns the current 64-bit hardware clock value. E.g,</p>
 <pre><code>        start = tlx.clock64()
         # ... kernel code ...
         end = tlx.clock64()
         elapsed = end - start  # Number of clock cycles elapsed</code></pre>
-<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.stoch_round(src, dst_dtype, rand_bits)</code> <strong>[Blackwell]</strong></div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.stoch_round(src, dst_dtype, rand_bits)</code> <strong>[sm100]</strong></div></div>
 <p>Performs hardware-accelerated stochastic rounding for FP32→FP8/BF16/F16 conversions on Blackwell GPUs (compute capability ≥ 100). Uses PTX <code>cvt.rs.satfinite</code> instructions for probabilistic rounding.</p>
 <p><strong>Why Use Stochastic Rounding:</strong></p>
 <div class="list-item depth-2"><span aria-hidden="true">•</span><div>Reduces bias in low-precision training/inference by randomly rounding up or down</div></div>
@@ -85,10 +84,16 @@
 
         # Apply stochastic rounding
         y = tlx.stoch_round(x, tlx.dtype_of(y_ptr), rbits)</code></pre>
-<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.vote_ballot_sync(mask, pred)</code> <strong>[Hopper+]</strong></div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.vote_ballot_sync(mask, pred)</code> <strong>[sm90+]</strong></div></div>
 <p>Collects a predicate from each thread in the warp and returns a 32-bit mask where each bit represents the predicate value from the corresponding lane. Only threads specified by <code>mask</code> participate in the vote.</p>
 <pre><code>        ballot_result = tlx.vote_ballot_sync(0xFFFFFFFF, pred)</code></pre>
-<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.prefetch(pointer, level=&quot;L2&quot;, mask=None, tensormap=False)</code> <strong>[Hopper+]</strong> issues a non-blocking prefetch hint for pointer-based scattered/gather loads. This complements <code>tlx.async_descriptor_prefetch_tensor</code> (which works on TMA tensor descriptors) by supporting raw pointer tensors.</div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.warp_all(pred)</code> / <code>tlx.warp_any(pred)</code> <strong>[sm90+, gfx942+]</strong></div></div>
+<p>Reduce one distributed predicate per physical lane to a warp-uniform scalar <code>i1</code>. Non-boolean inputs are compared with zero first. <code>warp_all</code> is true only if every lane contributes true; <code>warp_any</code> is true if at least one lane contributes true.</p>
+<p>These are physical-lane votes, not logical tensor-axis reductions. <code>tl.all</code> and <code>tl.max</code> reduce a tensor dimension and retain tensor layout semantics, whereas these operations produce a scalar suitable for a uniform branch. The predicate must distribute exactly one element per lane; compilation fails if its resolved layout gives a lane zero or multiple elements.</p>
+<pre><code class="language-python">    all_safe = tlx.warp_all(per_lane_safe)
+    any_active = tlx.warp_any(per_lane_active)</code></pre>
+<p>Prefer these semantic reductions when code only needs an all/any result. They do not expose a hardware ballot bit mask.</p>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.prefetch(pointer, level=&quot;L2&quot;, mask=None, tensormap=False)</code> <strong>[sm90+]</strong> issues a non-blocking prefetch hint for pointer-based scattered/gather loads. This complements <code>tlx.async_descriptor_prefetch_tensor</code> (which works on TMA tensor descriptors) by supporting raw pointer tensors.</div></div>
 <p>Additionally, if <code>tensormap</code> is specified to <code>True</code>, the API instead does a prefetch of tensor map object (TMA descriptor) and ignores other parameters other than <code>pointer</code>.</p>
 <table><thead><tr><th>Level</th><th>PTX</th><th>Description</th></tr></thead><tbody><tr><td><code>&quot;L1&quot;</code></td><td><code>prefetch.global.L1</code></td><td>Prefetch into L1 and L2 cache</td></tr><tr><td><code>&quot;L2&quot;</code></td><td><code>prefetch.global.L2</code></td><td>Prefetch into L2 cache only (default)</td></tr></tbody></table>
 <p>Example:</p>
@@ -106,91 +111,7 @@
             block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_N],
         )
   tlx.prefetch(desc_in, tensormap=True)</code></pre>
-<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.dump_layout(x)</code> <strong>[Hopper+, MI300+]</strong></div></div>
-<p>Compile-time diagnostic that prints the resolved layout of a value to the compiler log. <code>x</code> may be a register tensor or a shared/tensor-memory buffer (memdesc). It emits <strong>no</strong> device code and returns nothing — this is a static, host-side diagnostic, distinct from the runtime <code>tl.device_print</code> / <code>tl.print</code>. The op is rendered at the end of the TTGIR pipeline, so the printed layout reflects all compiler optimizations, then it is erased.</p>
-<p>The layout is printed in CuTe (CUTLASS) <code>Shape:Stride</code> notation (<code>_N</code> marks a static integer):</p>
-<div class="list-item depth-2"><span aria-hidden="true">•</span><div>Register tensors → a thread-value (TV) layout</div></div>
-<p><code>((thread...),(value...)):((thread...),(value...))</code>, where the thread group comes from the hardware lane/warp/block dims and the value group from the per-thread registers (stride <code>_0</code> denotes a broadcast).</p>
-<div class="list-item depth-2"><span aria-hidden="true">•</span><div>Shared/tensor-memory buffers → a single strided layout, e.g. <code>_64:_1</code>.</div></div>
-<div class="list-item depth-2"><span aria-hidden="true">•</span><div>Swizzled shared buffers → <code>Swizzle&lt;B,M,S&gt; o (base):(stride)</code>.</div></div>
-<p>In all cases the layout maps a coordinate to the <strong>logical tensor's row-major element index</strong> (its codomain): for a register tensor a <code>(thread, value)</code> coordinate → the logical element index it holds, and for a buffer an offset → the buffer element index. The strides are offsets in that logical index space, not physical byte/bank addresses.</p>
-<p>Layouts that are not representable as a CuTe layout fall back to the raw linear-layout string.</p>
-<p>Example:</p>
-<pre><code class="language-python">    x = tl.load(x_ptr + offs)          # register tensor
-    tlx.dump_layout(x)                  # -&gt; // cute: ((_32,_2,_2),_1):((_1,_32,_0),_0)
-
-    buf = tlx.local_alloc((BLOCK,), tl.float32, 1)
-    v = tlx.local_view(buf, 0)
-    tlx.dump_layout(v)                  # -&gt; // cute: _64:_1</code></pre>
-<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>x = tlx.require_layout(x, layout, pin=True, late_address_compute=False)</code> <strong>[Hopper+, MI300+]</strong></div></div>
-<p>Require a register tensor <code>x</code> to use <code>layout</code>, expressed as a <code>tlx.layout(...)</code> (Shape:Stride). With the default <code>pin=True</code>, the <code>#linear</code> encoding is wrapped as <code>#tlx.no_verify_layout(#tlx.user_layout(...))</code>. The inner <code>#tlx.user_layout</code> carries <code>PinnedEncodingTrait</code>, so downstream passes (<code>tritongpu-coalesce</code>, <code>remove-layout-conversions</code>, AMD <code>optimize-epilogue</code>) treat it as fixed and never rewrite it; the outer <code>#tlx.no_verify_layout</code> defers operand-layout verification until the pin is peeled by <code>TLXResolvePlaceholderLayouts</code> in <code>make_ttgir</code>. Example: pin an FP16 epilogue <code>tl.store</code> to a coalesced layout so <code>OptimizeEpilogue</code> keeps the wide <code>buffer_store_dwordx4</code> instead of narrowing it to the MMA-accumulator store, without staging the value through LDS.</p>
-<p>Pass <code>pin=False</code> for an optimizer-flexible requirement. This emits the requested encoding without the <code>#tlx.user_layout</code> hard anchor, allowing later layout passes to propagate the requirement or materialize a layout conversion. The default remains <code>pin=True</code> for existing callers.</p>
-<p>On AMD, <code>late_address_compute=True</code> asks shared-memory-backed layout conversions to compute their addresses at this use. The backend does this by rematerializing inexpensive lane/warp coordinates, shortening their live ranges across register-heavy regions.</p>
-<p>Pair with <code>tlx.assert_same_layout(x, layout)</code> (below) to statically verify the pin survived to the final TTGIR.</p>
-<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.assert_same_layout(lhs, rhs)</code> <strong>[Hopper+, MI300+]</strong></div></div>
-<p>Compile-time assertion that two layouts are equivalent after layout propagation and all other TTGIR layout optimizations have completed. Like <code>tlx.dump_layout</code>, it emits no device code and is consumed at the end of the TTGIR pipeline.</p>
-<p><code>rhs</code> supports two forms:</p>
-<div class="list-item depth-2"><span aria-hidden="true">•</span><div><strong>Value/value:</strong> <code>rhs</code> is another register tensor or shared/tensor-memory</div></div>
-<p>buffer. The frontend emits <code>tlx.assert_same_layout</code>, whose two operands retain their independently resolved final types.</p>
-<div class="list-item depth-2"><span aria-hidden="true">•</span><div><strong>Value/layout:</strong> <code>rhs</code> is a constant <code>tlx.layout_encoding</code>. The frontend</div></div>
-<p>lowers the constant to an encoding attribute and emits <code>tlx.assert_same_layout_expected</code>. At assertion time, the pass combines that encoding with <code>lhs</code>'s shape, element type, and (for buffers) memory properties to construct an expected tensor or memdesc type.</p>
-<p>These are separate internal operations only because an SSA value is an MLIR operand while a constant layout is an MLIR attribute. They share the same comparison path and the same public Python API.</p>
-<p>Before comparison, both final types are converted with <code>ttg::toLinearLayout</code>. The assertion compares the resulting <code>LinearLayout</code>s, not the original encoding attributes. Consequently, structurally different encodings pass if they describe the same logical mapping. A mismatch reports both normalized LinearLayouts and fails compilation.</p>
-<p>Example:</p>
-<pre><code class="language-python">    x = tlx.local_load(x_buf, layout=REGISTER_LAYOUT)
-    y = tlx.local_load(y_buf, layout=REGISTER_LAYOUT)
-
-    tlx.assert_same_layout(x, y)                # value/value
-    tlx.assert_same_layout(x, REGISTER_LAYOUT)  # value/layout</code></pre>
-<h2 id="buffer-operations-amd">Buffer Operations (AMD)</h2>
-<blockquote><p><strong>[MI350]</strong> — available on AMD MI350 (CDNA4) only; not available on MI300.</p></blockquote>
-<p>Buffer operations access global memory via a scalar base pointer and a tensor of i32 element offsets, rather than a tensor of pointers. This maps directly to AMD's hardware buffer instructions, which use a resource descriptor and byte offsets, enabling the hardware to do out-of-bounds checking and cache optimization.</p>
-<h3 id="tlx-buffer-load"><code>tlx.buffer_load</code></h3>
-<p>Load a tensor of values from global memory.</p>
-<pre><code class="language-python">result = tlx.buffer_load(
-    ptr, offsets, mask=None, other=None, cache=None, contiguity=1
-)</code></pre>
-<table><thead><tr><th>Argument</th><th>Type</th><th>Description</th></tr></thead><tbody><tr><td><code>ptr</code></td><td>scalar pointer</td><td>Base address in global memory.</td></tr><tr><td><code>offsets</code></td><td>i32 tensor</td><td>Per-element byte offsets from <code>ptr</code>.</td></tr><tr><td><code>mask</code></td><td>bool tensor, optional</td><td>When <code>mask[i]</code> is <code>False</code>, the element is not loaded.</td></tr><tr><td><code>other</code></td><td>tensor or scalar, optional</td><td>Value used for masked-out elements (where <code>mask[i]</code> is <code>False</code>).</td></tr><tr><td><code>cache</code></td><td>str, optional</td><td>Cache modifier (e.g. <code>&quot;.ca&quot;</code>, <code>&quot;.cg&quot;</code>).</td></tr><tr><td><code>contiguity</code></td><td>constexpr int</td><td>Trusted positive power-of-two vectorization width; it must divide each thread's element count.</td></tr></tbody></table>
-<p><strong>Returns</strong>: A tensor with the same shape as <code>offsets</code> and element type matching the pointee type of <code>ptr</code>.</p>
-<p>Lowers to <code>amdg.buffer_load</code>, which is eventually lowered to <code>rocdl.raw.ptr.buffer.load</code>.</p>
-<h3 id="tlx-buffer-store"><code>tlx.buffer_store</code></h3>
-<p>Store a tensor of values to global memory.</p>
-<pre><code class="language-python">tlx.buffer_store(stored_value, ptr, offsets, mask=None, cache=None)</code></pre>
-<table><thead><tr><th>Argument</th><th>Type</th><th>Description</th></tr></thead><tbody><tr><td><code>stored_value</code></td><td>tensor</td><td>Values to write.</td></tr><tr><td><code>ptr</code></td><td>scalar pointer</td><td>Base address in global memory.</td></tr><tr><td><code>offsets</code></td><td>i32 tensor</td><td>Per-element byte offsets from <code>ptr</code>.</td></tr><tr><td><code>mask</code></td><td>bool tensor, optional</td><td>When <code>mask[i]</code> is <code>False</code>, the element is not written.</td></tr><tr><td><code>cache</code></td><td>str, optional</td><td>Cache modifier.</td></tr></tbody></table>
-<p><strong>Returns</strong>: Nothing.</p>
-<p>Lowers to <code>amdg.buffer_store</code>, which is eventually lowered to <code>rocdl.raw.ptr.buffer.store</code>.</p>
-<h3 id="tlx-buffer-atomic-add"><code>tlx.buffer_atomic_add</code></h3>
-<p>Atomically add a tensor through an AMD scalar resource descriptor.</p>
-<pre><code class="language-python">previous = tlx.buffer_atomic_add(
-    ptr, offsets, value, mask=None, sem=None, scope=None, contiguity=1
-)</code></pre>
-<p><code>contiguity</code> is the same trusted per-thread adjacency width accepted by <code>buffer_load</code>; values greater than one also preserve the selected layout. The operation returns the values observed before the additions. FP16 and BF16 use packed two-element instructions, so <code>contiguity</code> must be at least two and any mask must be uniform for each adjacent pair. Compilation fails if mask analysis reduces the legal vector width below two.</p>
-<h3 id="tlx-buffer-load-to-local"><code>tlx.buffer_load_to_local</code></h3>
-<p>Async load from global memory directly into shared (local) memory, bypassing registers. This is useful for producer warps that prefetch data into shared memory for other warps to consume.</p>
-<pre><code class="language-python">token = tlx.buffer_load_to_local(dest, ptr, offsets, mask=None, other=None, cache_modifier=&quot;&quot;)</code></pre>
-<table><thead><tr><th>Argument</th><th>Type</th><th>Description</th></tr></thead><tbody><tr><td><code>dest</code></td><td><code>tlx.buffered_tensor</code></td><td>Destination slice in shared memory.</td></tr><tr><td><code>ptr</code></td><td>scalar pointer</td><td>Base address in global memory.</td></tr><tr><td><code>offsets</code></td><td>i32 tensor</td><td>Per-element byte offsets from <code>ptr</code>.</td></tr><tr><td><code>mask</code></td><td>bool tensor, optional</td><td>When <code>mask[i]</code> is <code>False</code>, the element is not loaded.</td></tr><tr><td><code>other</code></td><td>tensor or scalar, optional</td><td>Value used for masked-out elements.</td></tr><tr><td><code>cache_modifier</code></td><td>str, optional</td><td>Cache modifier string (default <code>&quot;&quot;</code>).</td></tr></tbody></table>
-<p><strong>Returns</strong>: A <code>tlx.async_token</code> that can be used with <code>tlx.async_load_wait_group()</code> to synchronize on the completion of the transfer.</p>
-<p>Lowers to <code>amdg.buffer_load_to_local</code>, which is eventually lowered to <code>rocdl.raw.ptr.buffer.load.async.lds</code> — a single hardware instruction that moves data from global memory to LDS without going through VGPRs.</p>
-<p><strong>Requirements.</strong> The direct-to-LDS copy has the following hardware constraints:</p>
-<div class="list-item depth-0"><span aria-hidden="true">•</span><div><strong>Vector width.</strong> Each thread's load must reach a supported direct-to-LDS width (<strong>32 or 128 bits</strong>). If it can only be vectorized to a smaller width, it cannot be lowered.</div></div>
-<div class="list-item depth-0"><span aria-hidden="true">•</span><div><strong>Provable pointer/offset alignment.</strong> The compiler must be able to *prove* the alignment that vector width needs.</div></div>
-<div class="list-item depth-0"><span aria-hidden="true">•</span><div><strong>Mask alignment.</strong> If <code>mask</code> is given it must be aligned to the vector width: each group of (vector width) consecutive mask values must be identical. The copy transfers each lane's whole vector in one transaction, so a mask whose <code>True</code>/<code>False</code> boundary cannot be proven vector-aligned (e.g. <code>offs &lt; K</code> for a runtime <code>K</code>) forces per-element vectorization and cannot lower.</div></div>
-<h3 id="example">Example</h3>
-<pre><code class="language-python">import triton.language.extra.tlx as tlx
-
-@triton.jit
-def kernel(src_ptr, dst_ptr, BLOCK_SIZE: tl.constexpr):
-    offsets = tl.arange(0, BLOCK_SIZE).to(tl.int32)
-    mask = offsets &lt; BLOCK_SIZE
-
-    # Load from global memory using buffer semantics
-    data = tlx.buffer_load(src_ptr, offsets, mask=mask, other=0.0)
-
-    # Store to global memory using buffer semantics
-    tlx.buffer_store(data, dst_ptr, offsets, mask=mask)</code></pre>
-<p>For the async global-to-shared variant, see the warp-pipeline GEMM example (<code>third_party/amd/python/examples/gluon/f16_gemm_warp_pipeline_gfx1250.py</code>).</p>
-<h2 id="wave-uniformity-amd">Wave Uniformity (AMD)</h2>
-<h3 id="tlx-assume-uniform"><code>tlx.assume_uniform</code></h3>
+<h2 id="tlx-assume-uniform"><code>tlx.assume_uniform</code></h2>
 <p>Assert that a scalar holds the same value in every lane of the wave.</p>
 <pre><code class="language-python">value = tlx.assume_uniform(value)</code></pre>
 <table><thead><tr><th>Argument</th><th>Type</th><th>Description</th></tr></thead><tbody><tr><td><code>value</code></td><td>scalar pointer, or 16/32/64-bit int or float</td><td>Value asserted to be wave-uniform. Narrower types are not supported.</td></tr></tbody></table>
@@ -199,106 +120,8 @@ def kernel(src_ptr, dst_ptr, BLOCK_SIZE: tl.constexpr):
 <pre><code class="language-python">base = tl.load(ptr_array + gid).to(tl.pointer_type(tl.float16))
 base = tlx.assume_uniform(base)
 data = tlx.buffer_load(base, offsets)</code></pre>
-<p>Lowers to <code>amdg.assume_uniform</code>, which is eventually lowered to <code>llvm.amdgcn.readfirstlane</code> — that makes the result uniform by construction as far as LLVM's uniformity analysis is concerned. On non-AMD backends it is a no-op that returns its argument. Nothing verifies the assertion: if the value is not actually uniform, every lane silently gets lane 0's value.</p>
-<h2 id="explicit-mfma-scheduling-amd">Explicit MFMA Scheduling (AMD)</h2>
-<blockquote><p><strong>[MI350]</strong> — the source-scheduled operations are restricted to CDNA4 (<code>gfx950</code>) native BF16 MFMA layouts.</p></blockquote>
-<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tl.dot(a, b, acc)</code> preserves a TLX-pinned accumulator layout, so whole dots</div></div>
-<p>need no AMD-specific wrapper.</p>
-<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.extract_slice(source, shape, offsets)</code> selects an aligned register</div></div>
-<p>fragment without cross-thread movement.</p>
-<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.rematerialized_range(start, end, anchor, placement=None)</code> recreates</div></div>
-<p>inexpensive distributed coordinates near a use instead of carrying them through a long software pipeline.</p>
-<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.amd_register_resident(value, register_class=&quot;agpr&quot;, registers_per_group=1)</code></div></div>
-<p>keeps a distributed value in allocator-visible native register tuples.</p>
-<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.amd_scheduled_mfma(...)</code> exposes independent native MFMA accumulator</div></div>
-<p>chains in deterministic N-major, M-minor, K-reduction source order.</p>
-<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.amd_mfma_commit(value, preserve)</code> applies the CDNA4 MFMA result hazard</div></div>
-<p>boundary while threading a live dot-operand dependency.</p>
-<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.amd_sched_barrier(mask=0)</code> prevents selected AMD machine-instruction</div></div>
-<p>classes from crossing a source boundary. It is a scheduling marker, not a workgroup barrier or memory fence.</p>
-<p>These primitives describe fragments, lifetimes, and ordering without assigning physical registers. Their verifiers reject unsupported targets, layouts, element types, and native fragment widths before lowering.</p>
-<p>Unlike <code>tl.dot</code>, <code>amd_scheduled_mfma</code> carries an explicit <code>accumulator_role</code>. <code>transient</code> selects the latency-aware intrinsic path for phase-local work; <code>persistent</code> selects register-constrained lowering for a chain carried across phases. Neither role changes the numerical matrix operation.</p>
-<h2 id="amd-tdm-descriptor-loads">AMD TDM Descriptor Loads</h2>
-<p><code>tlx.update_tensor_descriptor(desc, add_offsets=None, set_bounds=None, pred=None, clamp_bounds=False)</code> produces a positioned descriptor SSA value. <code>add_offsets</code> advances the tile position without changing bounds; <code>set_bounds</code> rewrites absolute bounds; and <code>pred</code> replaces the inherited predicate. Use <code>clamp_bounds=True</code> with <code>add_offsets</code> to derive the remaining OOB extent of an advanced tile.</p>
-<p><code>tlx.async_amd_descriptor_load(desc, result, offsets=None, pred=None, clamp_bounds=True)</code> issues an AMD TDM descriptor load from global memory to a TLX local buffer. If <code>offsets</code> is omitted, <code>desc</code> is used as already positioned and its predicate is preserved. The analogous store accepts <code>offsets=None</code> for the same reason. Both operations are available on TDM-capable AMD targets (<code>gfx1250+</code>) and should be synchronized with <code>tlx.async_amd_descriptor_wait</code>.</p>
-<p><code>tlx.async_amd_descriptor_load_fused(members, cache_modifier=&quot;&quot;)</code> fuses two to four AMD TDM descriptor loads behind one static hardware instruction. Each member is a <code>(positioned_desc, destination, warp_used_hint)</code> tuple. Position descriptors with <code>tlx.update_tensor_descriptor</code> before issuing the fused load. The hints must be non-empty, pairwise disjoint, and legal axis-aligned subsets of the CTA's waves; they do not need to cover every wave. Members must have the same descriptor rank but may have different shapes and element types. All members share one cache modifier.</p>
-<p>Example:</p>
-<pre><code class="language-python">a_load_desc = tlx.update_tensor_descriptor(
-    a_desc, add_offsets=[off_m, k * BLOCK_K], pred=True, clamp_bounds=True)
-b_load_desc = tlx.update_tensor_descriptor(
-    b_desc, add_offsets=[k * BLOCK_K, off_n], pred=True, clamp_bounds=True)
-a_tok = tlx.async_amd_descriptor_load_fused([
-    (a_load_desc, tlx.local_view(a_buf, slot), 0b0011),
-    (b_load_desc, tlx.local_view(b_buf, slot), 0b1100),
-])
-tlx.async_amd_descriptor_wait(0, [a_tok])</code></pre>
-<h2 id="warp-pipeline-amd">Warp Pipeline (AMD)</h2>
-<blockquote><p><strong>[MI350]</strong> — AMD MI350 (CDNA4); not available on MI300.</p></blockquote>
-<p><code>tlx.warp_pipeline_stage(label, *, priority=None)</code> is a context manager that marks explicit pipeline stage boundaries inside a loop. The compiler partitions the loop body at these boundaries and inserts conditional barriers so that one warp group executes one stage ahead of the other, overlapping memory latency with compute.</p>
-<p><strong>This is an explicit partitioning marker, not an automatic optimization.</strong> Correctness depends on the user's buffering and synchronization structure. In particular:</p>
-<div class="list-item depth-0"><span aria-hidden="true">•</span><div>Use multi-buffered shared memory (typically triple buffering with <code>NUM_BUFFERS=3</code>) to prevent data races between warp groups accessing the same buffer.</div></div>
-<div class="list-item depth-0"><span aria-hidden="true">•</span><div>Use explicit <code>tlx.async_load_wait_group()</code> to ensure data is ready before consumption.</div></div>
-<div class="list-item depth-0"><span aria-hidden="true">•</span><div>Handle prologue (prefetch) and epilogue (drain) around the main loop.</div></div>
-<p>See the gfx1250 warp-pipeline GEMM example (<code>third_party/amd/python/examples/gluon/f16_gemm_warp_pipeline_gfx1250.py</code>) for the full pattern.</p>
-<table><thead><tr><th>Parameter</th><th>Type</th><th>Description</th></tr></thead><tbody><tr><td><code>label</code></td><td><code>str</code></td><td>Stage name for diagnostics (e.g. <code>&quot;load&quot;</code>, <code>&quot;compute&quot;</code>)</td></tr><tr><td><code>priority</code></td><td><code>int</code> (0-3), optional</td><td>Hardware scheduling hint, maps to <code>s_setprio</code>. Higher = more urgent.</td></tr></tbody></table>
-<p>Auto software pipelining is automatically disabled on loops that contain warp pipeline stages.</p>
-<p>Example (simplified — see gfx1250 example for production pattern):</p>
-<pre><code class="language-python">import triton.language.extra.tlx as tlx
-
-@triton.jit
-def gemm_kernel(..., BLOCK_K: tl.constexpr, NUM_BUFFERS: tl.constexpr):
-    buf_A = tlx.local_alloc((BLOCK_M, BLOCK_K), tl.float16, NUM_BUFFERS)
-    buf_B = tlx.local_alloc((BLOCK_K, BLOCK_N), tl.float16, NUM_BUFFERS)
-
-    # Prologue: prefetch NUM_BUFFERS-1 tiles into shared memory
-    for i in tl.range(0, NUM_BUFFERS - 1, loop_unroll_factor=NUM_BUFFERS - 1):
-        tlx.async_load(a_ptrs, tlx.local_view(buf_A, i), mask=...)
-        tlx.async_load(b_ptrs, tlx.local_view(buf_B, i), mask=...)
-        tlx.async_load_commit_group()
-        a_ptrs += BLOCK_K * stride_ak; b_ptrs += BLOCK_K * stride_bk
-    tlx.async_load_wait_group(NUM_BUFFERS - 2)
-
-    # Main loop with warp pipelining
-    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-    for k in tl.range(NUM_BUFFERS - 1, K_ITERS):
-        consumer = (k - (NUM_BUFFERS - 1)) % NUM_BUFFERS
-        producer = k % NUM_BUFFERS
-        with tlx.warp_pipeline_stage(&quot;lds_load&quot;, priority=1):
-            a_tile = tlx.local_load(tlx.local_view(buf_A, consumer))
-            b_tile = tlx.local_load(tlx.local_view(buf_B, consumer))
-        tlx.async_load_wait_group(0)
-        with tlx.warp_pipeline_stage(&quot;compute_and_load&quot;, priority=0):
-            tlx.async_load(a_ptrs, tlx.local_view(buf_A, producer), mask=...)
-            tlx.async_load_commit_group()
-            acc = tl.dot(a_tile, b_tile, acc)
-
-    # Epilogue: drain remaining buffers
-    ...</code></pre>
-<h2 id="scaled-dot-amd">Scaled Dot (AMD)</h2>
-<p><code>tlx.dot_scaled(lhs, lhs_scale, lhs_format, rhs, rhs_scale, rhs_format, acc=None, *, fast_math=False, lhs_k_pack=True, rhs_k_pack=True, out_dtype=tl.float32, tiles_per_warp=None)</code> is a thin wrapper around <code>tl.dot_scaled</code>. Without <code>tiles_per_warp</code> it is exactly equivalent to <code>tl.dot_scaled</code> — pass it only when you need the AMD-specific WMMA scheduling hint described below.</p>
-<h3 id="tiles-per-warp-what-it-controls"><code>tiles_per_warp</code> — what it controls</h3>
-<table><thead><tr><th>Concept</th><th>Controlled by</th><th>What it means</th></tr></thead><tbody><tr><td><strong>Warp distribution</strong></td><td><code>warpsPerCTA</code> (chosen automatically by <code>AccelerateAMDMatmul::planWarps</code>)</td><td>How the total result tile is split *across* warps along M/N.</td></tr><tr><td><strong>Per-warp tiling</strong></td><td><code>tiles_per_warp</code> (this hint)</td><td>How many <code>instrShape</code>-sized WMMA tiles *each warp* covers contiguously before the layout repeats.</td></tr></tbody></table>
-<p>So <code>tiles_per_warp=[2, 2]</code> does <strong>not</strong> mean "distribute 4 tiles across 4 warps." It means *each* warp emits a 2×2 block of WMMA instruction tiles, holding the corresponding 2×2 accumulator registers. Concretely, for a <code>tt.dot_scaled</code> lowered to gfx1250 WMMA (<code>instrShape = [16, 16, K]</code>), 4 warps, <code>warpsPerCTA = [2, 2]</code>:</p>
-<table><thead><tr><th><code>tiles_per_warp</code></th><th>Per-warp coverage (M × N)</th><th>Per-CTA coverage before repeat (M × N)</th></tr></thead><tbody><tr><td><code>[1, 1]</code> (default)</td><td><code>16 × 16</code></td><td><code>32 × 32</code></td></tr><tr><td><code>[2, 2]</code></td><td><code>32 × 32</code></td><td><code>64 × 64</code></td></tr></tbody></table>
-<p>For a <code>256 × 256</code> result, <code>[1, 1]</code> repeats the layout <code>8 × 8</code> times, <code>[2, 2]</code> repeats it <code>4 × 4</code>. Larger <code>tiles_per_warp</code> gives each warp more contiguous accumulator state (better register reuse for preshuffled MXFP scales, fewer warp-level reductions), at the cost of more registers per warp.</p>
-<p>Together, <code>instrShape</code>, <code>warpsPerCTA</code>, and <code>tiles_per_warp</code> define the M/N extent of one CTA-level WMMA layout period: <code>period[d] = instrShape[d] * warpsPerCTA[d] * tiles_per_warp[d]</code>. If the result tile is larger than this period, the period repeats. The K entry of <code>instrShape</code> is the per-instruction reduction depth and is handled separately from this M/N tiling.</p>
-<p><code>tiles_per_warp</code> is validated by <code>AccelerateAMDMatmul</code>: it must have one entry per result-tile dim, each entry must be positive, and <code>instrShape[d] * warpsPerCTA[d] * tiles_per_warp[d]</code> must fit in the result tile shape.</p>
-<h3 id="example">Example</h3>
-<pre><code class="language-python">import triton.language.extra.tlx as tlx
-
-acc = tlx.dot_scaled(
-    a, a_scale, &quot;e5m2&quot;,
-    b, b_scale, &quot;e5m2&quot;,
-    acc,
-    tiles_per_warp=[2, 2],   # pack 2x2 WMMA tiles per warp for preshuffled MXFP
-)</code></pre>
-<h3 id="mechanism-for-ir-level-users">Mechanism (for IR-level users)</h3>
-<p>The wrapper attaches <code>amdg.wmma_tiles_per_warp = array&lt;i32: m, n&gt;</code> on the resulting <code>tt.dot_scaled</code> op. <code>ScaledBlockedToScaledWMMAF8F6F4</code> reads the attribute and substitutes <code>m, n</code> for the default <code>1, 1</code> when building the WMMA encoding. Setting the attribute directly on a <code>tt.dot[_scaled]</code> op in MLIR has the same effect; the wrapper just spares Python kernels from hand-poking attributes.</p>
-<p>Currently consumed only by the scaled-WMMA pattern (gfx1250). Regular <code>tt.dot</code> WMMA and the MFMA patterns do not read it.</p>
-<h3 id="explicit-wmma-layout-pinning">Explicit WMMA layout pinning</h3>
-<p><code>tlx.require_amd_wmma_layout(x, version=3, transposed=True, warp_bases=..., reg_bases=..., instr_shape=(16, 16, 128))</code> pins a tensor to an explicit AMD WMMA register/warp layout. This is useful for tuned gfx1250 epilogues that must retain the accumulator ownership chosen by <code>tiles_per_warp</code> across otherwise layout-neutral tensor operations. The bases contain one linear-layout basis vector per register or warp bit and must match the tensor rank.</p>
-<p>The helper lowers to a pinned <code>tlx.require_layout</code>; omit it when automatic layout propagation is sufficient.</p></article>
-<footer class="pager"><a href="warp-specialization.html">← Warp specialization and clustering</a><a class="next" href="performance-optimization.html">Performance optimization →</a></footer>
+<p>Lowers to <code>amdg.assume_uniform</code>, which is eventually lowered to <code>llvm.amdgcn.readfirstlane</code> — that makes the result uniform by construction as far as LLVM's uniformity analysis is concerned. On non-AMD backends it is a no-op that returns its argument. Nothing verifies the assertion: if the value is not actually uniform, every lane silently gets lane 0's value.</p></article>
+<footer class="pager"><a href="layouts.html">← Layout control and diagnostics</a><a class="next" href="kernels.html">Kernels implemented with TLX →</a></footer>
     </main>
   </div>
 </body>
