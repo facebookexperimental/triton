@@ -13,7 +13,7 @@ from guide_content import GUIDE_CONTENT
 SITE_ROOT = Path(__file__).resolve().parent
 REPOSITORY_ROOT = SITE_ROOT.parent
 REPOSITORY_URL = "https://github.com/facebookexperimental/triton"
-STYLESHEET_VERSION = "20260824b"
+STYLESHEET_VERSION = "20260824c"
 
 
 @dataclass(frozen=True)
