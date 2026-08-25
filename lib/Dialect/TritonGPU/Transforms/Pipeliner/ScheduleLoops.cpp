@@ -1,5 +1,6 @@
 #include "mlir/IR/Dominance.h"
 #include "triton/Analysis/Utility.h"
+#include "triton/Dialect/Triton/IR/DiscardableAttributes.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/MMAv5PipelineUtility.h"
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h"
@@ -712,7 +713,8 @@ scheduleKeyOpsAnnotation(scf::ForOp forOp,
 
   for (auto &op : forOp.getBody()->without_terminator()) {
     if (auto mmaOp = dyn_cast<ttng::MMAv5OpInterface>(&op)) {
-      if (auto attr = op.getAttrOfType<StringAttr>("tt.autows")) {
+      if (auto attr =
+              op.getAttrOfType<StringAttr>(tt::kAutoWSAnnotationAttrName)) {
         auto parsed = llvm::json::parse(attr.getValue());
         if (!parsed) {
           llvm::consumeError(parsed.takeError());
@@ -721,8 +723,8 @@ scheduleKeyOpsAnnotation(scf::ForOp forOp,
         auto *obj = parsed->getAsObject();
         if (!obj)
           continue;
-        auto stageStr = obj->getString("stage");
-        auto clusterStr = obj->getString("order");
+        auto stageStr = obj->getString(tt::kAutoWSStageKey);
+        auto clusterStr = obj->getString(tt::kAutoWSOrderKey);
         if (!stageStr || !clusterStr)
           continue;
         int stage = std::stoi(stageStr->str());
@@ -908,7 +910,8 @@ void scheduleLoop(scf::ForOp forOp, const DenseMap<Operation *, int> &opLatency,
   // Check if any MMA op has tt.autows annotations.
   bool hasAnnotations = false;
   for (auto &op : forOp.getBody()->without_terminator()) {
-    if (isa<ttng::MMAv5OpInterface>(&op) && op.hasAttr("tt.autows")) {
+    if (isa<ttng::MMAv5OpInterface>(&op) &&
+        op.hasAttr(tt::kAutoWSAnnotationAttrName)) {
       hasAnnotations = true;
       break;
     }
