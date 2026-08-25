@@ -107,6 +107,7 @@ class HIPOptions:
     launch_cluster: bool = False  # No-op placeholder
     multicast: bool = False  # No-op placeholder (TMA multicast is NVIDIA-only)
     enable_tree_reduction: bool = False
+    enable_nvptx_v2i32: bool = False  # No-op placeholder (NVPTX-only)
     matrix_instr_nonkdim: int = 0
     kpack: int = 1
     allow_flush_denorm: bool = False

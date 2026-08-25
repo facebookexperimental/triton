@@ -1089,6 +1089,9 @@ class Config:
     :ivar enable_tree_reduction: use tree-shaped, vectorized in-thread reductions. If unset, use the
         backend's architecture-specific default.
     :type enable_tree_reduction: bool | None
+    :ivar enable_nvptx_v2i32: opt in to NVPTX v2i32 register legalization. Off by default;
+        the packed form costs an unpack/repack per use and no integer op is legal on it.
+    :type enable_nvptx_v2i32: bool | None
     """
 
     @staticmethod
@@ -1121,6 +1124,7 @@ class Config:
         auto_tma=None,
         enable_tree_reduction=None,
         allowDependentTwoCTA=None,
+        enable_nvptx_v2i32=None,
     ):
         self.kwargs = kwargs
         self.num_warps = num_warps
@@ -1145,6 +1149,7 @@ class Config:
         # knob; True/False lets the autotuner A/B auto-TMA per shape.
         self.auto_tma = auto_tma
         self.enable_tree_reduction = enable_tree_reduction
+        self.enable_nvptx_v2i32 = enable_nvptx_v2i32
 
     def __setstate__(self, state):
         self.kwargs = state.get("kwargs", {})
@@ -1166,6 +1171,7 @@ class Config:
         self.allowDependentTwoCTA = state.get("allowDependentTwoCTA", None)
         self.auto_tma = state.get("auto_tma", None)
         self.enable_tree_reduction = state.get("enable_tree_reduction", None)
+        self.enable_nvptx_v2i32 = state.get("enable_nvptx_v2i32", None)
 
     def all_kwargs(self):
         return {
@@ -1190,6 +1196,7 @@ class Config:
                     ("auto_tma", self.auto_tma),
                     ("enable_tree_reduction", self.enable_tree_reduction),
                     ("allowDependentTwoCTA", self.allowDependentTwoCTA),
+                    ("enable_nvptx_v2i32", self.enable_nvptx_v2i32),
                 ) if v is not None
             },
         }
@@ -1213,6 +1220,7 @@ class Config:
         res.append(f"multicast: {self.multicast}")
         res.append(f"auto_tma: {self.auto_tma}")
         res.append(f"enable_tree_reduction: {self.enable_tree_reduction}")
+        res.append(f"enable_nvptx_v2i32: {self.enable_nvptx_v2i32}")
         return ", ".join(res)
 
     def __hash__(self):
