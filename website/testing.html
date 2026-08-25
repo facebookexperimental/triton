@@ -3,16 +3,16 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="description" content="Build TLX and run its correctness and performance scripts.">
-  <title>Build, install, and test · FBTriton</title>
-  <link rel="stylesheet" href="assets/tlx.css?v=20260824a">
+  <meta name="description" content="Correctness and performance scripts for the TLX tutorial kernels.">
+  <title>Testing · FBTriton</title>
+  <link rel="stylesheet" href="assets/tlx.css?v=20260824b">
 </head>
 <body>
   <header class="topbar">
     <a class="brand" href="../"><span>FBTriton</span></a>
     <nav class="topnav" aria-label="Top-level sections"><a href="triton.html">Triton</a>
 <a href="tlx.html" data-current="true">TLX</a>
-<a href="torchtlx.html">torchTLX</a>
+<a href="torchtlx.html">TorchTLX</a>
 <a href="ci.html">CI</a>
 <a href="tooling.html">Tooling</a></nav>
     <a class="repo-link" href="https://github.com/facebookexperimental/triton" target="_blank" rel="noreferrer">View on GitHub ↗</a>
@@ -21,45 +21,30 @@
 <aside class="sidebar">
       <p class="eyebrow">TLX documentation</p>
       <nav><a href="tlx.html">Overview</a>
-<a href="getting-started.html">Getting started</a>
-<a href="hardware-support.html">Hardware support</a>
-<a href="buffers.html">Local and remote buffers</a>
+<a href="buffers.html">Memory</a>
 <a href="global-memory.html">Global memory access</a>
 <a href="async-memory.html">Async memory access</a>
 <a href="async-compute.html">Tensor core operations</a>
-<a href="synchronization.html">Barriers and fences</a>
+<a href="synchronization.html">Synchronization</a>
 <a href="warp-specialization.html">Warp specialization</a>
 <a href="clusters.html">Clusters and Cluster Launch Control</a>
 <a href="layouts.html">Layout control and diagnostics</a>
 <a href="utilities.html">Other operations</a>
-<a href="performance-optimization.html">Performance optimization</a>
-<a href="debugging.html">Debugging performance and numerics</a>
-<a href="kernels.html">Example kernels</a>
-<a href="production-case-studies.html">Production case studies</a>
-<a href="install-and-test.html" aria-current="page">Build, install, and test</a>
-<a href="resources.html">More reading</a></nav>
+<a href="kernels.html">Kernels implemented with TLX</a>
+<a href="testing.html" aria-current="page">Testing</a>
+<a href="resources.html">Further reading</a></nav>
     </aside>
     <main>
       <p class="eyebrow">TLX documentation</p>
-      <h1>Build, install, and test</h1>
-      <p class="lede">Build TLX and run its correctness and performance scripts.</p>
-      <article><h2 id="build-from-source">Build from source</h2>
-<pre><code class="language-bash">git clone https://github.com/facebookexperimental/triton.git
-cd triton
-
-pip install -r python/requirements.txt # build-time dependencies
-pip install -e .</code></pre>
-<p>C++ changes require a rebuild to take effect; Python-only changes do not. Run <code>pre-commit run --all</code> before sending a pull request.</p>
-<p>Run a tutorial once the build finishes, for example:</p>
-<pre><code class="language-bash">python third_party/tlx/tutorials/hopper_fa_ws_pipelined_pingpong_test.py</code></pre>
-<h2 id="testing">Testing</h2>
-<h3 id="correctness">Correctness</h3>
+      <h1>Testing</h1>
+      <p class="lede">Correctness and performance scripts for the TLX tutorial kernels.</p>
+      <article><h2 id="correctness">Correctness</h2>
 <p><code>[TLX_VERSION=&lt;kernel_name&gt;] pytest third_party/tlx/tutorials/testing/test_correctness.py</code></p>
 <p>By default only one autotune config will be used by correctness test.</p>
 <p>All kernels — Hopper, Blackwell, and AMD — share this one file; each test is arch-gated with <code>@pytest.mark.skipif</code>, so on any given GPU only the relevant cases run and the rest skip. To run just the AMD/IKBO cases:</p>
 <p><code>pytest third_party/tlx/tutorials/testing/test_correctness.py -k &quot;amd or ikbo&quot;</code></p>
 <p>(on gfx950 the gfx1250-only GEMM cases skip automatically).</p>
-<h3 id="performance">Performance</h3>
+<h2 id="performance">Performance</h2>
 <p><code>third_party/tlx/denoise.sh third_party/tlx/tutorials/testing/test_hopper_gemm_perf.py [--version {ws|pipelined}]</code></p>
 <p><code>third_party/tlx/denoise.sh third_party/tlx/tutorials/testing/test_hopper_fa_perf.py [--version {ws|ws_pipelined|ws_pipelined_pingpong|ws_pipelined_pingpong_persistent}]</code></p>
 <p><code>third_party/tlx/denoise.sh third_party/tlx/tutorials/testing/test_blackwell_gemm_perf.py [--version {ws|pipelined|clc|2cta}]</code></p>
@@ -73,7 +58,7 @@ pip install -e .</code></pre>
 <p><code>third_party/tlx/denoise.sh python third_party/tlx/tutorials/testing/test_amd_ikbo_lce_perf.py</code>  (IKBO LCE — distinct op, not attention)</p>
 <p>gfx1250:</p>
 <p><code>third_party/tlx/denoise.sh python third_party/tlx/tutorials/testing/test_amd_mxfp_gemm_perf.py [--transpose-b]</code></p></article>
-<footer class="pager"><a href="production-case-studies.html">← Production case studies</a><a class="next" href="resources.html">More reading →</a></footer>
+<footer class="pager"><a href="kernels.html">← Kernels implemented with TLX</a><a class="next" href="resources.html">Further reading →</a></footer>
     </main>
   </div>
 </body>

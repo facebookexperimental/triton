@@ -3,16 +3,16 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="description" content="What TLX is and when to use it.">
+  <meta name="description" content="What TLX is, and the hardware tags used throughout.">
   <title>TLX · FBTriton</title>
-  <link rel="stylesheet" href="assets/tlx.css?v=20260824a">
+  <link rel="stylesheet" href="assets/tlx.css?v=20260824b">
 </head>
 <body>
   <header class="topbar">
     <a class="brand" href="../"><span>FBTriton</span></a>
     <nav class="topnav" aria-label="Top-level sections"><a href="triton.html">Triton</a>
 <a href="tlx.html" data-current="true">TLX</a>
-<a href="torchtlx.html">torchTLX</a>
+<a href="torchtlx.html">TorchTLX</a>
 <a href="ci.html">CI</a>
 <a href="tooling.html">Tooling</a></nav>
     <a class="repo-link" href="https://github.com/facebookexperimental/triton" target="_blank" rel="noreferrer">View on GitHub ↗</a>
@@ -21,53 +21,36 @@
 <aside class="sidebar">
       <p class="eyebrow">TLX documentation</p>
       <nav><a href="tlx.html" aria-current="page">Overview</a>
-<a href="getting-started.html">Getting started</a>
-<a href="hardware-support.html">Hardware support</a>
-<a href="buffers.html">Local and remote buffers</a>
+<a href="buffers.html">Memory</a>
 <a href="global-memory.html">Global memory access</a>
 <a href="async-memory.html">Async memory access</a>
 <a href="async-compute.html">Tensor core operations</a>
-<a href="synchronization.html">Barriers and fences</a>
+<a href="synchronization.html">Synchronization</a>
 <a href="warp-specialization.html">Warp specialization</a>
 <a href="clusters.html">Clusters and Cluster Launch Control</a>
 <a href="layouts.html">Layout control and diagnostics</a>
 <a href="utilities.html">Other operations</a>
-<a href="performance-optimization.html">Performance optimization</a>
-<a href="debugging.html">Debugging performance and numerics</a>
-<a href="kernels.html">Example kernels</a>
-<a href="production-case-studies.html">Production case studies</a>
-<a href="install-and-test.html">Build, install, and test</a>
-<a href="resources.html">More reading</a></nav>
+<a href="kernels.html">Kernels implemented with TLX</a>
+<a href="testing.html">Testing</a>
+<a href="resources.html">Further reading</a></nav>
     </aside>
     <main>
       <p class="eyebrow">TLX documentation</p>
       <h1>TLX</h1>
-      <p class="lede">What TLX is and when to use it.</p>
+      <p class="lede">What TLX is, and the hardware tags used throughout.</p>
       <article><p>TLX (Triton Low-level Language Extensions) is a low-level, warp-aware, hardware-near extension of the Triton DSL. It offers intrinsics and warp-specialized operations for fine-grained GPU control, hardware-oriented primitives for advanced kernel development, and explicit constructs for GPU memory, computation, and asynchronous control flow. TLX is designed for expert users pushing Triton closer to the metal.</p>
-<p>TLX targets NVIDIA and AMD GPUs and supports:</p>
+<p>Primarily targeting NVIDIA GPUs (for now), TLX extends Triton to support:</p>
 <div class="list-item depth-0"><span aria-hidden="true">•</span><div>Hardware-specific intrinsics (e.g., wgmma, async_copy, barrier)</div></div>
 <div class="list-item depth-0"><span aria-hidden="true">•</span><div>Shared and local memory allocation</div></div>
 <div class="list-item depth-0"><span aria-hidden="true">•</span><div>Instruction-level scheduling and control</div></div>
 <div class="list-item depth-0"><span aria-hidden="true">•</span><div>Cross-warpgroup synchronization</div></div>
 <p>While this approach places more responsibility on the user, it reduces the compiler's role as a performance bottleneck. Although it may introduce divergence across hardware platforms, it empowers users to perform deeper, architecture-specific optimizations without relying solely on compiler heuristics.</p>
-<h2 id="architecture-the-mimw-programming-model">Architecture: the MIMW programming model</h2>
-<p>TLX uses a <strong>Multiple Instructions, Multiple Warps (MIMW)</strong> model. A warp group is an explicit execution agent: one group can move data, another can issue tensor-core work, and another can run an epilogue. The groups communicate through shared or tensor memory and synchronize with hardware barriers.</p>
-<p>This fills the gap between CUDA's thread-level SIMT model and Triton's program-level blocked model. Regular tensor expressions still look like Triton; orchestration becomes explicit only where hardware-aware control matters.</p>
-<table><thead><tr><th>Layer</th><th>Primary unit</th><th>Best fit</th></tr></thead><tbody><tr><td>CUDA / PTX</td><td>Thread and warp</td><td>Maximum control, with manual scheduling and synchronization</td></tr><tr><td>Triton</td><td>Program instance / block</td><td>Productive blocked tensor programs and compiler-managed layouts</td></tr><tr><td>TLX</td><td>Cooperating warp groups</td><td>Explicit pipelines, async engines, tensor memory, and cluster execution</td></tr></tbody></table>
-<h3 id="orchestration-surfaces">Orchestration surfaces</h3>
-<div class="list-item depth-0"><span aria-hidden="true">•</span><div><strong>Warp groups:</strong> <code>tlx.async_tasks()</code> and <code>tlx.async_task()</code> define producer, consumer, and epilogue roles.</div></div>
-<div class="list-item depth-0"><span aria-hidden="true">•</span><div><strong>Synchronization:</strong> mbarriers express phase-based dependencies between warp groups and asynchronous engines.</div></div>
-<div class="list-item depth-0"><span aria-hidden="true">•</span><div><strong>Memory:</strong> local buffers, TMA-style descriptor operations, and Blackwell tensor memory keep data close to compute.</div></div>
-<div class="list-item depth-0"><span aria-hidden="true">•</span><div><strong>Clusters:</strong> CTA rank, cluster barriers, and remote shared-memory operations enable multi-CTA cooperation.</div></div>
-<div class="list-item depth-0"><span aria-hidden="true">•</span><div><strong>Scheduling:</strong> Cluster Launch Control supports hardware-assisted persistent work distribution on Blackwell.</div></div>
-<h3 id="why-this-level-of-abstraction">Why this level of abstraction?</h3>
-<p>Modern GPUs increasingly depend on features that sit between individual threads and whole thread blocks: warp specialization, asynchronous data movement, tensor-memory accumulators, and clustered execution. TLX exposes those features without requiring a kernel to be written directly in CUDA or PTX, while keeping layouts compiler-inferred unless an expert needs to override them.</p>
 <h2 id="hardware-tags">Hardware tags</h2>
 <p>Every operation below is tagged with the targets it runs on, using the architecture ids from <code>triton._internal_testing</code> — the same vocabulary the rest of this repo uses:</p>
 <table><thead><tr><th>Tag</th><th>Hardware</th></tr></thead><tbody><tr><td><code>sm90</code></td><td>NVIDIA Hopper</td></tr><tr><td><code>sm100</code></td><td>NVIDIA Blackwell</td></tr><tr><td><code>sm90+</code></td><td>Hopper and newer NVIDIA</td></tr><tr><td><code>gfx942</code></td><td>AMD MI300 (CDNA3)</td></tr><tr><td><code>gfx950</code></td><td>AMD MI350 (CDNA4)</td></tr><tr><td><code>gfx942+</code></td><td>MI300 and newer AMD</td></tr><tr><td><code>gfx1250</code></td><td>AMD RDNA4</td></tr><tr><td><code>amd</code></td><td>All AMD targets</td></tr></tbody></table>
 <p>A trailing <code>?</code> (e.g. <code>gfx942+?</code>) marks availability that has <strong>not been confirmed yet</strong> and needs verification. An absent vendor means this document makes no claim for that vendor, not necessarily that the op is unsupported.</p>
 <p>Note: async copies (<code>async_load</code> and its commit/wait groups) and the AMD buffer ops require <strong>gfx950</strong> — they are <strong>not</strong> available on gfx942. <code>barrier_arrive</code> on AMD requires <code>arrive_count == 1</code>.</p></article>
-<footer class="pager"><a class="next" href="getting-started.html">Getting started →</a></footer>
+<footer class="pager"><a class="next" href="buffers.html">Memory →</a></footer>
     </main>
   </div>
 </body>

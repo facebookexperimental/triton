@@ -1,4 +1,4 @@
-We introduce torchTLX to boost PT2 performance by pushing TLX primitives deeper into inductor template and fusion infra.
+We introduce TorchTLX to boost PT2 performance by pushing TLX primitives deeper into inductor template and fusion infra.
 
 This work runs in parallel with our ongoing Triton compiler investments. TorchTLX lets us rapidly validate hardware-specific optimizations and bring forward wins while feeding proven techniques back to the Triton compiler.
 
@@ -10,7 +10,7 @@ However, low-level hardware primitives such as tile shapes, warp spec roles and 
 
 Meanwhile, standalone TLX matmul kernels are matching or slightly exceeding cuBLAS. Unlike opaque cuBLAS kernels, a TLX kernel at parity opens the door to richer epilogue fusions.
 
-In summary, torchTLX integrates TLX as a low-level backend for Inductor, introducing significant changes to template selection, fusion logic and kernel codegen.
+In summary, TorchTLX integrates TLX as a low-level backend for Inductor, introducing significant changes to template selection, fusion logic and kernel codegen.
 
 ## Knob
 
@@ -124,9 +124,9 @@ For templates using tlx.async_descriptor_store, we introduce compute_epilogue to
 
 ## Vision for Next-gen Hardware
 
-As new GPU architectures arrive, torchTLX offers two key advantages.
+As new GPU architectures arrive, TorchTLX offers two key advantages.
 
-First, it streamlines access to state-of-the-art hardware intrinsics. Given that TLX provides a Triton-native API for features like TMA, WS, CLC, 2-CTA, etc., once the performance is maximized in the standalone TLX kernel, integrating those wins into the PT2 stack through torchTLX requires a fairly small amount of additional work.
+First, it streamlines access to state-of-the-art hardware intrinsics. Given that TLX provides a Triton-native API for features like TMA, WS, CLC, 2-CTA, etc., once the performance is maximized in the standalone TLX kernel, integrating those wins into the PT2 stack through TorchTLX requires a fairly small amount of additional work.
 
 Second, it scales better than manual agentic kernel authoring. There is growing interest across the industry in agentic kernel authoring at scale. We believe making the PT2 stack natively aware of hardware architecture features might be a more scalable path. Once the plumbing is in place, every new kernel and fusion pattern benefits automatically.
 

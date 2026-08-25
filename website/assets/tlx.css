@@ -123,10 +123,10 @@ a:hover {
 
 .eyebrow {
   color: var(--accent);
-  font-size: 0.74rem;
-  font-weight: 800;
-  letter-spacing: 0.12em;
-  margin: 0 0 14px;
+  font-size: 0.86rem;
+  font-weight: 700;
+  letter-spacing: 0.09em;
+  margin: 0 0 10px;
   text-transform: uppercase;
 }
 
@@ -154,17 +154,18 @@ main {
 }
 
 main > h1 {
-  font-size: clamp(2.25rem, 6vw, 4.3rem);
-  letter-spacing: -0.045em;
-  line-height: 1.02;
+  font-size: clamp(1.9rem, 3.2vw, 2.6rem);
+  letter-spacing: -0.02em;
+  line-height: 1.15;
   margin: 0;
   max-width: 850px;
 }
 
 .lede {
   color: var(--muted);
-  font-size: 1.2rem;
-  margin: 20px 0 52px;
+  font-size: 1.08rem;
+  line-height: 1.55;
+  margin: 14px 0 40px;
   max-width: 700px;
 }
 
@@ -329,7 +330,7 @@ th {
   }
 
   main > h1 {
-    font-size: 2.7rem;
+    font-size: 2rem;
   }
 }
 

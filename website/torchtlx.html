@@ -4,22 +4,22 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="description" content="Bring TLX kernels into PyTorch 2 through Inductor templates and epilogue fusion.">
-  <title>torchTLX · FBTriton</title>
-  <link rel="stylesheet" href="assets/tlx.css?v=20260824a">
+  <title>TorchTLX · FBTriton</title>
+  <link rel="stylesheet" href="assets/tlx.css?v=20260824b">
 </head>
 <body>
   <header class="topbar">
     <a class="brand" href="../"><span>FBTriton</span></a>
     <nav class="topnav" aria-label="Top-level sections"><a href="triton.html">Triton</a>
 <a href="tlx.html">TLX</a>
-<a href="torchtlx.html" data-current="true">torchTLX</a>
+<a href="torchtlx.html" data-current="true">TorchTLX</a>
 <a href="ci.html">CI</a>
 <a href="tooling.html">Tooling</a></nav>
     <a class="repo-link" href="https://github.com/facebookexperimental/triton" target="_blank" rel="noreferrer">View on GitHub ↗</a>
   </header>
   <div class="shell">
 <aside class="sidebar">
-      <p class="eyebrow">torchTLX documentation</p>
+      <p class="eyebrow">TorchTLX documentation</p>
       <nav><a href="torchtlx.html" aria-current="page">Overview</a>
 <a href="#knob">Enabling it</a>
 <a href="#torchtlx-templates">Templates</a>
@@ -29,16 +29,16 @@
 <a href="#source-and-tests">Source and tests</a></nav>
     </aside>
     <main>
-      <p class="eyebrow">torchTLX</p>
-      <h1>torchTLX</h1>
+      <p class="eyebrow">TorchTLX</p>
+      <h1>TorchTLX</h1>
       <p class="lede">Bring TLX kernels into PyTorch 2 through Inductor templates and epilogue fusion.</p>
-      <article><p>We introduce torchTLX to boost PT2 performance by pushing TLX primitives deeper into inductor template and fusion infra.</p>
+      <article><p>We introduce TorchTLX to boost PT2 performance by pushing TLX primitives deeper into inductor template and fusion infra.</p>
 <p>This work runs in parallel with our ongoing Triton compiler investments. TorchTLX lets us rapidly validate hardware-specific optimizations and bring forward wins while feeding proven techniques back to the Triton compiler.</p>
 <h2 id="overview">Overview</h2>
 <p>PT2 flows through Dynamo for graph capture and Inductor for optimization and code gen. Within Inductor, a scheduler decides which operations to fuse and then delegates to a backend-specific codegen engine, selecting among template candidates (Triton/CUTLASS) and cuBLAS via autotuning.</p>
 <p>However, low-level hardware primitives such as tile shapes, warp spec roles and TMA directionality are invisible to the scheduler, limiting its ability to leverage modern GPU architecture when making fusion decisions.</p>
 <p>Meanwhile, standalone TLX matmul kernels are matching or slightly exceeding cuBLAS. Unlike opaque cuBLAS kernels, a TLX kernel at parity opens the door to richer epilogue fusions.</p>
-<p>In summary, torchTLX integrates TLX as a low-level backend for Inductor, introducing significant changes to template selection, fusion logic and kernel codegen.</p>
+<p>In summary, TorchTLX integrates TLX as a low-level backend for Inductor, introducing significant changes to template selection, fusion logic and kernel codegen.</p>
 <h2 id="knob">Knob</h2>
 <p><code>TORCHINDUCTOR_TLX_MODE</code> (unset by default)</p>
 <div class="list-item depth-0"><span aria-hidden="true">•</span><div>unset / any other value - TLX not considered (standard inductor behavior; the config value is <code>None</code>)</div></div>
@@ -97,8 +97,8 @@
                         tlx.fence_async_shared()
                         tlx.async_descriptor_store(desc_c, c_smem, [offs_am, offs_cn], eviction_policy=&quot;evict_first&quot;)</code></pre>
 <h2 id="vision-for-next-gen-hardware">Vision for Next-gen Hardware</h2>
-<p>As new GPU architectures arrive, torchTLX offers two key advantages.</p>
-<p>First, it streamlines access to state-of-the-art hardware intrinsics. Given that TLX provides a Triton-native API for features like TMA, WS, CLC, 2-CTA, etc., once the performance is maximized in the standalone TLX kernel, integrating those wins into the PT2 stack through torchTLX requires a fairly small amount of additional work.</p>
+<p>As new GPU architectures arrive, TorchTLX offers two key advantages.</p>
+<p>First, it streamlines access to state-of-the-art hardware intrinsics. Given that TLX provides a Triton-native API for features like TMA, WS, CLC, 2-CTA, etc., once the performance is maximized in the standalone TLX kernel, integrating those wins into the PT2 stack through TorchTLX requires a fairly small amount of additional work.</p>
 <p>Second, it scales better than manual agentic kernel authoring. There is growing interest across the industry in agentic kernel authoring at scale. We believe making the PT2 stack natively aware of hardware architecture features might be a more scalable path. Once the plumbing is in place, every new kernel and fusion pattern benefits automatically.</p>
 <h2 id="source-and-tests">Source and tests</h2>
 <p>Templates, heuristics and codegen live in <a href="https://github.com/facebookexperimental/triton/tree/main/third_party/tlx/language/tlx/inductor/" target="_blank" rel="noreferrer"><code>third_party/tlx/language/tlx/inductor/</code></a>.</p>

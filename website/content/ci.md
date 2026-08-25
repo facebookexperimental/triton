@@ -78,7 +78,7 @@ runner, mirroring the H100 job in [`h100.yml`](.github/workflows/h100.yml):
   (`third_party/tlx/tutorials/testing/test_correctness.py`). AMD and IKBO cases
   run; Hopper/Blackwell and gfx1250 cases auto-skip via the arch gates.
 - **`mi350-meta-triton-test`** — TritonBench performance coverage (the AMD perf
-  scripts in [TLX &rsaquo; Testing](install-and-test.html#testing) are for local runs;
+  scripts in [TLX &rsaquo; Testing](testing.html) are for local runs;
   perf-regression tracking lives in TritonBench).
 
 Both run on push, PR, and the nightly schedule; nightly failures are filed as

@@ -1,26 +1,4 @@
-## Build from source
-
-```bash
-git clone https://github.com/facebookexperimental/triton.git
-cd triton
-
-pip install -r python/requirements.txt # build-time dependencies
-pip install -e .
-```
-
-C++ changes require a rebuild to take effect; Python-only changes do not. Run
-`pre-commit run --all` before sending a pull request.
-
-Run a tutorial once the build finishes, for example:
-
-```bash
-python third_party/tlx/tutorials/hopper_fa_ws_pipelined_pingpong_test.py
-```
-
-
-## Testing
-
-### Correctness
+## Correctness
 
 `[TLX_VERSION=<kernel_name>] pytest third_party/tlx/tutorials/testing/test_correctness.py`
 
@@ -34,7 +12,7 @@ cases run and the rest skip. To run just the AMD/IKBO cases:
 
 (on gfx950 the gfx1250-only GEMM cases skip automatically).
 
-### Performance
+## Performance
 
 `third_party/tlx/denoise.sh third_party/tlx/tutorials/testing/test_hopper_gemm_perf.py [--version {ws|pipelined}]`
 

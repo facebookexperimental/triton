@@ -5,14 +5,14 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="description" content="Workflows, runners, nightly failure handling, and per-project test coverage.">
   <title>CI · FBTriton</title>
-  <link rel="stylesheet" href="assets/tlx.css?v=20260824a">
+  <link rel="stylesheet" href="assets/tlx.css?v=20260824b">
 </head>
 <body>
   <header class="topbar">
     <a class="brand" href="../"><span>FBTriton</span></a>
     <nav class="topnav" aria-label="Top-level sections"><a href="triton.html">Triton</a>
 <a href="tlx.html">TLX</a>
-<a href="torchtlx.html">torchTLX</a>
+<a href="torchtlx.html">TorchTLX</a>
 <a href="ci.html" data-current="true">CI</a>
 <a href="tooling.html">Tooling</a></nav>
     <a class="repo-link" href="https://github.com/facebookexperimental/triton" target="_blank" rel="noreferrer">View on GitHub ↗</a>
@@ -60,14 +60,14 @@
 <div class="list-item depth-0"><span aria-hidden="true">•</span><div><strong><code>mi350-tlx-test</code></strong> — TLX unit tests (<code>python/test/unit/language/test_tlx_*.py</code>)</div></div>
 <p>plus the tutorial correctness suite (<code>third_party/tlx/tutorials/testing/test_correctness.py</code>). AMD and IKBO cases run; Hopper/Blackwell and gfx1250 cases auto-skip via the arch gates.</p>
 <div class="list-item depth-0"><span aria-hidden="true">•</span><div><strong><code>mi350-meta-triton-test</code></strong> — TritonBench performance coverage (the AMD perf</div></div>
-<p>scripts in <a href="https://github.com/facebookexperimental/triton/blob/main/install-and-test.html#testing" target="_blank" rel="noreferrer">TLX &amp;rsaquo; Testing</a> are for local runs; perf-regression tracking lives in TritonBench).</p>
+<p>scripts in <a href="testing.html">TLX &amp;rsaquo; Testing</a> are for local runs; perf-regression tracking lives in TritonBench).</p>
 <p>Both run on push, PR, and the nightly schedule; nightly failures are filed as issues via <code>report-nightly-failure.yml</code>.</p>
 <h2 id="gluon">Gluon</h2>
 <p><a href="https://github.com/triton-lang/triton/tree/main/python/triton/experimental/gluon" target="_blank" rel="noreferrer">Gluon</a> (<code>python/triton/experimental/gluon/</code>) is <strong>upstream-synced and not a first-class DSL</strong> here (TLX is the focus) — do Gluon feature/bug work upstream, not in this fork. But since fbtriton is a secondary Triton, we run <strong>fundamental Gluon CI</strong> so we don't silently break it.</p>
 <p><strong>CI:</strong> the <code>b200-gluon-test</code> / <code>mi350-gluon-test</code> jobs run <code>pytest python/test/gluon/</code> (every <code>test_*.py</code>). It is <strong>green</strong>: ~200 passed, ~1600 skipped, 0 failed. The real signal is the compile-only, target-agnostic frontend suite (<code>test_frontend.py</code>, one run covers NVIDIA + AMD codegen via mock <code>GPUTarget</code>); the version-skewed cases below are skipped via <code>python/test/gluon/conftest.py</code> rather than failing the job.</p>
 <p><strong>Fork-side fixes</strong> (Gluon frontend itself unmodified): <code>core.py</code> reduce <code>reduction_ordering</code> compat, <code>semantic.py</code> <code>dot()</code> <code>allow_tf32</code> default, a <code>test_core.py</code> collection fix (a bad cherry-pick left an <code>IndentationError</code>), and regenerated <code>test_frontend.py</code> goldens (upstream-synced — overwritten on next sync).</p>
 <p><strong>Skipped, needs upstream Gluon re-sync — TODO(gluon-ci):</strong> the GPU-execution suites (<code>test_core</code>, <code>test_lowerings</code>, <code>test_consan</code>, <code>test_fpsan</code>, one kernel in <code>test_layout_format_view</code>) were synced from much newer upstream (e.g. <code>test_fpsan.py</code> via bundle #1956) than the pinned Gluon frontend (<code>_semantic.py</code> ~2026-06-29). They require Gluon behavior the frontend doesn't have yet — raw pointer <code>gl.load</code>/<code>gl.store</code> inferring a *distributed* layout — so they fail wholesale with <code>expected ... distributed_type but got block_type</code>. The fix is to sync the Gluon frontend forward (upstream cherry-pick / re-sync), not a local patch. Also skipped: ~9 frontend per-target golden tests (single inline golden can't match every parametrized target) and the <code>create_lds_barrier_wait</code> pybind mismatch. <code>conftest.py</code> lists these; remove/trim it after the re-sync.</p></article>
-<footer class="pager"><a href="torchtlx.html">← torchTLX</a><a class="next" href="tooling.html">Tooling →</a></footer>
+<footer class="pager"><a href="torchtlx.html">← TorchTLX</a><a class="next" href="tooling.html">Tooling →</a></footer>
     </main>
   </div>
 </body>

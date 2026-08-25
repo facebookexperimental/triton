@@ -13,7 +13,7 @@ yourself":
 | | You write | You get | Docs |
 |---|---|---|---|
 | **AutoWS** | ordinary Triton, plus `warp_specialize=True` on a loop | the compiler partitions the loop into producer/consumer warp groups | [Triton](https://facebookexperimental.github.io/triton/website/triton.html) |
-| **torchTLX** | ordinary PyTorch | Inductor selects TLX-backed templates and fuses epilogues into them | [torchTLX](https://facebookexperimental.github.io/triton/website/torchtlx.html) |
+| **TorchTLX** | ordinary PyTorch | Inductor selects TLX-backed templates and fuses epilogues into them | [TorchTLX](https://facebookexperimental.github.io/triton/website/torchtlx.html) |
 | **TLX** | the kernel, explicitly | direct access to barriers, TMA, MMA, TMEM, clusters, warp specialization | [TLX](https://facebookexperimental.github.io/triton/website/tlx.html) |
 
 Tracing, profiling, sanitizers, and benchmarking are covered under
@@ -89,12 +89,12 @@ pytest python/test/unit/language/test_tlx_*.py
 # AutoWS
 pytest python/test/unit/language/test_autows_*.py
 
-# torchTLX
+# TorchTLX
 pytest python/test/unit/language/test_torchtlx_*.py
 ```
 
 Performance scripts and per-target invocations are on
-[Build, install, and test](https://facebookexperimental.github.io/triton/website/install-and-test.html).
+[Testing](https://facebookexperimental.github.io/triton/website/testing.html).
 
 ## CI
 
@@ -147,7 +147,7 @@ the re-sync.
 ## Editing the site
 
 The site is generated, not hand-written. Page bodies live in
-[`website/content/`](website/content/) (the TLX and torchTLX reference) and
+[`website/content/`](website/content/) (the TLX and TorchTLX reference) and
 [`website/guide_content.py`](website/guide_content.py) (curated guides). After
 editing either, regenerate and commit the HTML:
 
@@ -158,7 +158,7 @@ cd website && python3 generate_tlx_site.py
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md). Bugs and feature requests for TLX,
-AutoWS, and torchTLX belong here; anything in core Triton or Gluon belongs
+AutoWS, and TorchTLX belong here; anything in core Triton or Gluon belongs
 [upstream](https://github.com/triton-lang/triton).
 
 ## Further reading
