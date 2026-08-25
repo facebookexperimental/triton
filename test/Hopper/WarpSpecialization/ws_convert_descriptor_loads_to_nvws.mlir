@@ -8,7 +8,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
   // CHECK-LABEL: @descriptor_load
   // CHECK: %[[BUFFER:.*]] = ttg.local_alloc
   // CHECK: nvws.descriptor_load %arg0[%arg1, %arg1] 16384 %[[BUFFER]]
-  // CHECK-SAME: {async_task_id = array<i32: 1>, loop.cluster = 2 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 1>}
+  // CHECK-SAME: {async_task_id = array<i32: 1>, loop.cluster = 2 : i32, loop.stage = 0 : i32, multicast = false, ttg.partition = array<i32: 1>}
   // CHECK: %[[VALUE:.*]] = ttg.local_load %[[BUFFER]] {async_task_id = array<i32: 0>}
   // CHECK: arith.addf %[[VALUE]], %[[VALUE]]
   // CHECK-NOT: tt.descriptor_load
