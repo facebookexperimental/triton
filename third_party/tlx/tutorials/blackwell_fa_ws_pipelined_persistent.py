@@ -4409,7 +4409,7 @@ class _attention(torch.autograd.Function):
             BLK_SLICE_FACTOR=BLK_SLICE_FACTOR,  #
             HEAD_DIM=ctx.HEAD_DIM,  #
             STAGE=stage,  #
-            DQ_STAGE_COUNT=2,
+            DQ_STAGE_COUNT=(4 if bf16_dq_output and N_CTX >= 4096 else 2),
             SCALE_QK_IN_KERNEL=direct_dq_output,
         )
 
