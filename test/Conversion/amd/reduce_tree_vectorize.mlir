@@ -122,3 +122,44 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.thr
     tt.return
   }
 }
+
+// -----
+
+// Register bit 0 is separated from bits 2--4 by a lane bit, forming eight
+// two-value register groups along the reduction axis. Since both warp bits
+// also move that axis, this exercises the multi-group reduction path.
+#multi_group = #ttg.linear<{register = [[1, 0], [4, 0], [8, 0], [16, 0]], lane = [[2, 0], [32, 0], [64, 0], [0, 1], [0, 2], [0, 4]], warp = [[128, 0], [256, 0]], block = []}>
+#rows = #ttg.slice<{dim = 0, parent = #multi_group}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 64 : i32} {
+  // Unordered reductions may merge all eight groups before vectorization:
+  // 16 register values become eight packed pairs and one seven-node vector
+  // tree, followed by a single horizontal scalar add.
+  // GFX950-LABEL: reduce_multi_register_groups_unordered
+  // GFX950-COUNT-7: llvm.fadd {{.*}} : vector<2xf32>
+  // GFX950-NOT: llvm.fadd {{.*}} : vector<2xf32>
+  // GFX950: llvm.extractelement
+  // GFX950: llvm.extractelement
+  // GFX950: llvm.fadd {{.*}} : f32
+  tt.func public @reduce_multi_register_groups_unordered(%arg0: tensor<512x8xf32, #multi_group>) {
+    %0 = "tt.reduce"(%arg0) <{axis = 0 : i32, reduction_ordering = "unordered"}> ({
+    ^bb0(%a: f32, %b: f32):
+      %sum = arith.addf %a, %b : f32
+      tt.reduce.return %sum : f32
+    }) : (tensor<512x8xf32, #multi_group>) -> tensor<8xf32, #rows>
+    tt.return
+  }
+
+  // Explicitly ordered reductions continue to reduce each register group
+  // independently and therefore do not use packed vector combines.
+  // GFX950-LABEL: reduce_multi_register_groups_inner_tree
+  // GFX950-NOT: vector<2xf32>
+  // GFX950: llvm.return
+  tt.func public @reduce_multi_register_groups_inner_tree(%arg0: tensor<512x8xf32, #multi_group>) {
+    %0 = "tt.reduce"(%arg0) <{axis = 0 : i32, reduction_ordering = "inner_tree"}> ({
+    ^bb0(%a: f32, %b: f32):
+      %sum = arith.addf %a, %b : f32
+      tt.reduce.return %sum : f32
+    }) : (tensor<512x8xf32, #multi_group>) -> tensor<8xf32, #rows>
+    tt.return
+  }
+}

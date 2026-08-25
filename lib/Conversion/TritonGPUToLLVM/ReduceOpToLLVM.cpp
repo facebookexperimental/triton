@@ -686,18 +686,21 @@ private:
       return result;
     };
 
+    // Unordered reductions may combine all register groups that contribute to
+    // the same output element.  Keeping the groups separate forces each
+    // vectorized group to be reduced to a scalar before the partial results
+    // are combined, which introduces one horizontal vector reduction per
+    // group.  Merge them first so vector packing stays live across the whole
+    // in-thread reduction and is unpacked only once.
+    std::map<SmallVector<unsigned>, SmallVector<int>> mergedRegGroups;
     for (auto &[groupKey, group] : regGroups) {
-      auto reduced = reduceGroup(group);
       auto key = groupKey;
       key[axis] = 0;
-      bool isFirst = accs.find(key) == accs.end();
-      if (isFirst) {
-        accs[key] = std::move(reduced);
-        indices[key] = srcIndices[group.front()];
-      } else {
-        accumulate(op.getLoc(), rewriter, op.getCombineOp(), accs[key],
-                   reduced);
-      }
+      llvm::append_range(mergedRegGroups[key], group);
+    }
+    for (auto &[key, group] : mergedRegGroups) {
+      accs[key] = reduceGroup(group);
+      indices[key] = srcIndices[group.front()];
     }
   }
 
