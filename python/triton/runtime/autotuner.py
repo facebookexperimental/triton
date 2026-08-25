@@ -785,21 +785,21 @@ class Autotuner(KernelInterface):
                         _padded = _padded + (None, ) * (len(self.fn.params) - len(_padded))
                     native_fast_dispatch_insert(self.fn, _padded, self.fn.params, self.fn._fc_options_hash, kernel,
                                                 _disp, getattr(kernel, '_dispatch_arg_indices', None))
-                    # Only enable the meta-less steady-state fast path (self.fn[grid](*full_args)
-                    # below) once a native dispatcher exists to carry the winning config's
-                    # compilation options. Without one -- e.g. dispatcher creation failed with
-                    # "Too many kernel args" -- steady-state falls back to a plain JIT launch that
-                    # recompiles at the default num_warps/num_stages and silently drops the config's
-                    # values, miscompiling kernels pinned to a non-default num_warps. Leaving
-                    # _seed_key unseeded re-runs this seed branch (a full run(**_meta) that honors
-                    # the config) on every call instead.
+                    # Only enter steady-state proxy dispatch once a native dispatcher exists.
+                    # Without one -- e.g. dispatcher creation failed with "Too many kernel args"
+                    # -- leaving _seed_key unseeded keeps every launch on this full run(**_meta)
+                    # path and preserves the winning config's compilation options.
                     self._fc_seeded.add(_seed_key)
             return kernel
 
-        # Steady-state: dispatch via JITCacheProxy (fastest path).
-        # The C cache stores dispatch_arg_indices per entry so it correctly
-        # selects only the args the dispatcher expects (handles None ptr args).
-        return self.fn[evaluated_grid](*full_args)
+        # Steady-state: use JITCacheProxy when available. If proxy creation is
+        # bypassed or fails, retain the winning config's compilation options on
+        # the Python run() fallback rather than silently using backend defaults.
+        get_proxy = getattr(self.fn, '_get_jit_cache_proxy', None)
+        proxy = get_proxy(evaluated_grid) if get_proxy is not None else None
+        if proxy is not None:
+            return proxy(*full_args)
+        return self.fn.run(*full_args, grid=evaluated_grid, warmup=False, **_meta)
 
     def run(self, *args, **kwargs):
         self.nargs = dict(zip(self.arg_names, args))

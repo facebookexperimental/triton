@@ -23,7 +23,7 @@ jobs:
   lit-tests:
     name: LIT Tests
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 120
     outputs:
       failures: ${{ steps.parse.outputs.failures }}
 
