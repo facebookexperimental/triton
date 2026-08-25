@@ -15,6 +15,7 @@
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "mlir/Transforms/Passes.h"
 #include "mlir/Transforms/RegionUtils.h"
+#include "nvidia/hopper/include/Transforms/Passes.h"
 #include "nvidia/include/Dialect/NVGPU/IR/Dialect.h"
 #include "nvidia/include/Dialect/NVWS/IR/Dialect.h"
 #include "triton/Analysis/Utility.h"
@@ -61,108 +62,147 @@ static bool isValidTMADestEncoding(Attribute bufferEnc, Attribute descEnc) {
          descNvmma.getFp4Padded() == nvmma.getFp4Padded();
 }
 
-LogicalResult doConvertDescriptorLoadsToNVWS(triton::FuncOp funcOp) {
-  SmallVector<tt::DescriptorLoadOp> loads;
-  funcOp.walk([&](tt::DescriptorLoadOp load) { loads.push_back(load); });
+static LogicalResult
+convertDescriptorLoadLikeToNVWS(tt::DescriptorLoadLikeOpInterface load) {
+  auto result = load->getResult(0);
+  auto tensorType = dyn_cast<RankedTensorType>(result.getType());
+  if (!tensorType)
+    return load->emitError("expected a ranked tensor descriptor load result");
 
-  for (tt::DescriptorLoadOp load : loads) {
-    auto tensorType = dyn_cast<RankedTensorType>(load.getType());
-    if (!tensorType)
-      return load.emitError("expected a ranked tensor descriptor load result");
+  Attribute descEnc =
+      cast<tt::TensorDescType>(load.getDesc().getType()).getSharedLayout();
 
-    Attribute descEnc =
-        cast<tt::TensorDescType>(load.getDesc().getType()).getSharedLayout();
+  ttg::LocalStoreOp soleStore;
+  ttg::LocalAllocOp soleAlloc;
+  if (load->hasOneUse())
+    soleStore = dyn_cast<ttg::LocalStoreOp>(*load->getUsers().begin());
+  if (load->hasOneUse())
+    soleAlloc = dyn_cast<ttg::LocalAllocOp>(*load->getUsers().begin());
 
-    ttg::LocalStoreOp soleStore;
-    ttg::LocalAllocOp soleAlloc;
-    if (load->hasOneUse())
-      soleStore = dyn_cast<ttg::LocalStoreOp>(*load->getUsers().begin());
-    if (load->hasOneUse())
-      soleAlloc = dyn_cast<ttg::LocalAllocOp>(*load->getUsers().begin());
+  // Only reuse the consumer's buffer when the TMA copy can actually target
+  // it; otherwise fall through to the register-consumed path below, which
+  // allocates an NVMMA buffer and local_loads out of it (what the upstream
+  // tt.descriptor_load/gather lowering does for every load).
+  if (soleStore && !isValidTMADestEncoding(
+                       soleStore.getDst().getType().getEncoding(), descEnc))
+    soleStore = nullptr;
+  if (soleAlloc &&
+      !isValidTMADestEncoding(soleAlloc.getType().getEncoding(), descEnc))
+    soleAlloc = nullptr;
 
-    // Only reuse the consumer's buffer when the TMA copy can actually target
-    // it; otherwise fall through to the register-consumed path below, which
-    // allocates an NVMMA buffer and local_loads out of it (what the upstream
-    // tt.descriptor_load lowering does for every load).
-    if (soleStore && !isValidTMADestEncoding(
-                         soleStore.getDst().getType().getEncoding(), descEnc))
-      soleStore = nullptr;
-    if (soleAlloc &&
-        !isValidTMADestEncoding(soleAlloc.getType().getEncoding(), descEnc))
-      soleAlloc = nullptr;
-
-    OpBuilderWithAsyncTaskIds builder(load);
-    builder.setInsertionPoint(load);
-    Value buffer;
-    if (soleStore) {
-      buffer = soleStore.getDst();
-    } else if (soleAlloc) {
-      auto oldType = cast<ttg::MemDescType>(soleAlloc.getType());
-      auto bufferType = ttg::MemDescType::get(
-          oldType.getShape(), oldType.getElementType(), oldType.getEncoding(),
-          oldType.getMemorySpace(), /*mutableMemory=*/true);
-      auto newAlloc = builder.createWithAsyncTaskIds<ttg::LocalAllocOp>(
-          soleAlloc.getLoc(), bufferType);
-      newAlloc->setAttrs(soleAlloc->getAttrs());
-      triton::replaceUsesAndPropagateType(builder, soleAlloc,
-                                          newAlloc.getResult());
-      buffer = newAlloc.getResult();
-      builder.setInsertionPointAfter(newAlloc);
-    } else {
-      auto encoding =
-          ttng::getEncodingFromDescriptor(load, tensorType, load.getDesc());
-      auto memorySpace = ttg::SharedMemorySpaceAttr::get(load.getContext());
-      auto bufferType = ttg::MemDescType::get(
-          tensorType.getShape(), tensorType.getElementType(), encoding,
-          memorySpace, /*mutableMemory=*/true);
-      buffer = builder
-                   .createWithAsyncTaskIds<ttg::LocalAllocOp>(load.getLoc(),
-                                                              bufferType)
-                   .getResult();
-    }
-
-    if (Operation *bufferDef = buffer.getDefiningOp();
-        bufferDef && bufferDef->getBlock() == load->getBlock() &&
-        load->isBeforeInBlock(bufferDef))
-      bufferDef->moveBefore(load);
-
-    int64_t txCount =
-        ttng::getDescriptorLoadBytes(cast<ttg::MemDescType>(buffer.getType()));
-    auto nvwsLoad = builder.createWithAsyncTaskIds<ttnvws::DescriptorLoadOp>(
-        load.getLoc(), load.getDesc(), load.getIndices(), txCount, buffer,
-        load.getCache(), load.getEvict());
-    nvwsLoad->setAttrs(load->getAttrs());
-
-    if (soleStore) {
-      soleStore.erase();
-    } else if (soleAlloc) {
-      soleAlloc.erase();
-    } else {
-      // Register-consumed load (e.g. the m/Di softmax metadata). Tag the
-      // local_load with the *consumer* partitions and their loop schedule --
-      // not the producer's -- so the nvws.descriptor_load's SMEM buffer serves
-      // directly as the cross-partition channel (one buffer). Inheriting the
-      // producer task id instead materializes the value in the producer
-      // partition and forces doBufferAllocation to create a *second*
-      // cross-partition channel buffer, doubling the SMEM footprint that the
-      // original tt.descriptor_load path kept unified (SMEM/TMEM overflow in FA
-      // backward).
-      builder.setAsyncTaskIdsFromValueUsers(load.getResult());
-      builder.setLoopScheduleInfoFromOp(*load->getUsers().begin());
-      auto localLoad = builder.createWithAsyncTaskIds<ttg::LocalLoadOp>(
-          load.getLoc(), load.getType(), buffer);
-      load.replaceAllUsesWith(localLoad.getResult());
-    }
-    load.erase();
+  OpBuilderWithAsyncTaskIds builder(load);
+  builder.setInsertionPoint(load);
+  Value buffer;
+  if (soleStore) {
+    buffer = soleStore.getDst();
+  } else if (soleAlloc) {
+    auto oldType = cast<ttg::MemDescType>(soleAlloc.getType());
+    auto bufferType = ttg::MemDescType::get(
+        oldType.getShape(), oldType.getElementType(), oldType.getEncoding(),
+        oldType.getMemorySpace(), /*mutableMemory=*/true);
+    auto newAlloc = builder.createWithAsyncTaskIds<ttg::LocalAllocOp>(
+        soleAlloc.getLoc(), bufferType);
+    newAlloc->setAttrs(soleAlloc->getAttrs());
+    triton::replaceUsesAndPropagateType(builder, soleAlloc,
+                                        newAlloc.getResult());
+    buffer = newAlloc.getResult();
+    builder.setInsertionPointAfter(newAlloc);
+  } else {
+    auto encoding =
+        ttng::getEncodingFromDescriptor(load, tensorType, load.getDesc());
+    auto memorySpace = ttg::SharedMemorySpaceAttr::get(load.getContext());
+    auto bufferType = ttg::MemDescType::get(
+        tensorType.getShape(), tensorType.getElementType(), encoding,
+        memorySpace, /*mutableMemory=*/true);
+    buffer = builder
+                 .createWithAsyncTaskIds<ttg::LocalAllocOp>(load.getLoc(),
+                                                            bufferType)
+                 .getResult();
   }
 
+  if (Operation *bufferDef = buffer.getDefiningOp();
+      bufferDef && bufferDef->getBlock() == load->getBlock() &&
+      load->isBeforeInBlock(bufferDef))
+    bufferDef->moveBefore(load);
+
+  int64_t txCount =
+      ttng::getDescriptorLoadBytes(cast<ttg::MemDescType>(buffer.getType()));
+  Operation *nvwsOp = nullptr;
+  if (auto loadOp = dyn_cast<tt::DescriptorLoadOp>(load.getOperation())) {
+    nvwsOp = builder.createWithAsyncTaskIds<ttnvws::DescriptorLoadOp>(
+        loadOp.getLoc(), loadOp.getDesc(), loadOp.getIndices(), txCount, buffer,
+        loadOp.getCache(), loadOp.getEvict());
+  } else {
+    auto gather = cast<tt::DescriptorGatherOp>(load.getOperation());
+    Value xOffsets = gather.getXOffsets();
+    auto offsetsType = cast<RankedTensorType>(xOffsets.getType());
+    if (offsetsType.getElementType().isInteger(16)) {
+      xOffsets = builder.createWithAsyncTaskIds<arith::ExtSIOp>(
+          gather.getLoc(), offsetsType.clone(builder.getI32Type()), xOffsets);
+    }
+    nvwsOp = builder.createWithAsyncTaskIds<ttnvws::DescriptorGatherOp>(
+        gather.getLoc(), gather.getDesc(), xOffsets, gather.getYOffset(),
+        txCount, buffer);
+  }
+  nvwsOp->setAttrs(load->getAttrs());
+
+  if (soleStore) {
+    soleStore.erase();
+  } else if (soleAlloc) {
+    soleAlloc.erase();
+  } else {
+    // Register-consumed load (e.g. the m/Di softmax metadata). Tag the
+    // local_load with the *consumer* partitions and their loop schedule --
+    // not the producer's -- so the nvws.descriptor_load's SMEM buffer serves
+    // directly as the cross-partition channel (one buffer). Inheriting the
+    // producer task id instead materializes the value in the producer
+    // partition and forces doBufferAllocation to create a *second*
+    // cross-partition channel buffer, doubling the SMEM footprint that the
+    // original tt.descriptor_load path kept unified (SMEM/TMEM overflow in FA
+    // backward).
+    builder.setAsyncTaskIdsFromValueUsers(result);
+    builder.setLoopScheduleInfoFromOp(*load->getUsers().begin());
+    auto localLoad = builder.createWithAsyncTaskIds<ttg::LocalLoadOp>(
+        load.getLoc(), result.getType(), buffer);
+    result.replaceAllUsesWith(localLoad.getResult());
+  }
+  load->erase();
+  return success();
+}
+
+LogicalResult doConvertDescriptorLoadsToNVWS(triton::FuncOp funcOp) {
+  SmallVector<tt::DescriptorLoadLikeOpInterface> loads;
+  funcOp.walk(
+      [&](tt::DescriptorLoadLikeOpInterface load) { loads.push_back(load); });
+
+  for (tt::DescriptorLoadLikeOpInterface load : loads)
+    if (failed(convertDescriptorLoadLikeToNVWS(load)))
+      return failure();
+
   bool hasUnconvertedLoad = false;
-  funcOp.walk([&](tt::DescriptorLoadOp load) {
-    load.emitError("descriptor load was not converted for AutoWS");
+  funcOp.walk([&](tt::DescriptorLoadLikeOpInterface load) {
+    load->emitError("descriptor operation was not converted for AutoWS");
     hasUnconvertedLoad = true;
   });
   return failure(hasUnconvertedLoad);
 }
+
+#define GEN_PASS_DEF_NVGPUCONVERTDESCRIPTORLOADSTONVWS
+#include "nvidia/hopper/include/Transforms/Passes.h.inc"
+
+struct NVGPUConvertDescriptorLoadsToNVWSPass
+    : public impl::NVGPUConvertDescriptorLoadsToNVWSBase<
+          NVGPUConvertDescriptorLoadsToNVWSPass> {
+  void runOnOperation() override {
+    WalkResult result = getOperation().walk([&](triton::FuncOp funcOp) {
+      if (failed(doConvertDescriptorLoadsToNVWS(funcOp)))
+        return WalkResult::interrupt();
+      return WalkResult::advance();
+    });
+    if (result.wasInterrupted())
+      signalPassFailure();
+  }
+};
 
 Value createBufferView(OpBuilderWithAsyncTaskIds &builder, Value alloc,
                        Value idx) {
@@ -189,6 +229,12 @@ Value getTMALoadBufferForStage(OpBuilderWithAsyncTaskIds &builder, Value buffer,
   if (!currentView)
     return buffer;
   return createBufferView(builder, currentView.getSrc(), bufferIdx);
+}
+
+Value getDescriptorLoadBuffer(ttnvws::DescriptorLoadOpInterface op) {
+  if (auto load = dyn_cast<ttnvws::DescriptorLoadOp>(op.getOperation()))
+    return load.getResult();
+  return cast<ttnvws::DescriptorGatherOp>(op.getOperation()).getResult();
 }
 
 } // namespace
@@ -248,14 +294,14 @@ static TwoCTAPairRank buildTwoCTAPairRank(OpBuilderWithAsyncTaskIds &builder,
   return rank;
 }
 
-Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
-                            SmallVector<ttnvws::DescriptorLoadOp> &tmaLoads,
-                            Value barrierAlloc, Value bufferIdx,
-                            Value bufferIdxExtract, Value phase,
-                            Operation *headProducer, Operation *headConsumer,
-                            Operation *headConsumerSameLevel,
-                            ArrayRef<int> additionalConsumerTaskIds,
-                            DictionaryAttr consumerWaitConstraints) {
+Operation *
+optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
+                 SmallVector<ttnvws::DescriptorLoadOpInterface> &tmaLoads,
+                 Value barrierAlloc, Value bufferIdx, Value bufferIdxExtract,
+                 Value phase, Operation *headProducer, Operation *headConsumer,
+                 Operation *headConsumerSameLevel,
+                 ArrayRef<int> additionalConsumerTaskIds,
+                 DictionaryAttr consumerWaitConstraints) {
   // Callers group at least one load behind each fused barrier. Make the
   // precondition explicit instead of dereferencing front() blind below.
   if (tmaLoads.empty())
@@ -270,10 +316,10 @@ Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
   // barrier inconsistent completion routing and expected-byte semantics.
   int64_t sizeInBytes = 0;
   bool twoCTA = tmaLoads.front()->hasAttr(ttng::AttrTwoCTALoadName);
-  if (!llvm::all_of(tmaLoads, [twoCTA](ttnvws::DescriptorLoadOp load) {
+  if (!llvm::all_of(tmaLoads, [twoCTA](ttnvws::DescriptorLoadOpInterface load) {
         return load->hasAttr(ttng::AttrTwoCTALoadName) == twoCTA;
       })) {
-    tmaLoads.front().emitError(
+    tmaLoads.front()->emitError(
         "TMA barrier fusion cannot mix cooperative and per-CTA loads");
     return nullptr;
   }
@@ -309,15 +355,23 @@ Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
     builder.setInsertionPoint(tmaLoad);
     builder.setAsyncTaskIdsFromOp(tmaLoad);
     builder.setLoopScheduleInfoFromOp(tmaLoad);
-    Value pipelineBuffer =
-        getTMALoadBufferForStage(builder, tmaLoad.getResult(), bufferIdx);
-    auto copyOp =
-        builder.createWithAsyncTaskIds<ttng::AsyncTMACopyGlobalToLocalOp>(
-            tmaLoad.getLoc(), tmaLoad.getDesc(), tmaLoad.getIndices(),
-            tmaBarrier, pipelineBuffer, pred);
-    if (tmaLoad->hasAttr(ttng::AttrTwoCTALoadName))
-      copyOp.setTwoCta(true);
-    copy = copyOp;
+    Value pipelineBuffer = getTMALoadBufferForStage(
+        builder, getDescriptorLoadBuffer(tmaLoad), bufferIdx);
+    if (auto load =
+            dyn_cast<ttnvws::DescriptorLoadOp>(tmaLoad.getOperation())) {
+      auto copyOp =
+          builder.createWithAsyncTaskIds<ttng::AsyncTMACopyGlobalToLocalOp>(
+              load.getLoc(), load.getDesc(), load.getIndices(), tmaBarrier,
+              pipelineBuffer, pred);
+      if (load->hasAttr(ttng::AttrTwoCTALoadName))
+        copyOp.setTwoCta(true);
+      copy = copyOp;
+    } else {
+      auto gather = cast<ttnvws::DescriptorGatherOp>(tmaLoad.getOperation());
+      copy = builder.createWithAsyncTaskIds<ttng::AsyncTMAGatherOp>(
+          gather.getLoc(), gather.getDesc(), gather.getXOffsets(),
+          gather.getYOffset(), tmaBarrier, pipelineBuffer, pred);
+    }
   }
 
   // Create a wait_barrier before the first consumer.
@@ -384,7 +438,7 @@ Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
   }
 
   for (auto tmaLoad : tmaLoads)
-    tmaLoad.erase();
+    tmaLoad->erase();
   builder.clearLoopScheduleInfo();
   return copy;
 }

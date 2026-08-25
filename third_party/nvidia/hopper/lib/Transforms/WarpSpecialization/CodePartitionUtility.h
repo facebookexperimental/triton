@@ -310,7 +310,7 @@ Value getBarrierForPipelineStage(OpBuilderWithAsyncTaskIds &builder,
 
 Operation *
 optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
-                 SmallVector<triton::nvws::DescriptorLoadOp> &tmaLoads,
+                 SmallVector<triton::nvws::DescriptorLoadOpInterface> &tmaLoads,
                  Value barrierAlloc, Value bufferIdx, Value bufferIdxExtract,
                  Value phase, Operation *headProducer, Operation *headConsumer,
                  Operation *headConsumerSameLevel,
