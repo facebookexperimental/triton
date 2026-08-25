@@ -192,7 +192,7 @@ static Operation *findOriginalLoadForChannel(Channel *ch) {
   Operation *srcOp = ch->getSrcOp();
   if (!srcOp)
     return nullptr;
-  if (isa<ttnvws::DescriptorLoadOp>(srcOp))
+  if (isa<ttnvws::DescriptorLoadOpInterface>(srcOp))
     return srcOp;
   if (auto storeOp = dyn_cast<ttg::LocalStoreOp>(srcOp))
     return findOriginalLoadOp(storeOp.getSrc());
@@ -1256,7 +1256,7 @@ static bool isSmemTMAChannel(Operation *alloc,
     return false;
   if (isa<ttng::AsyncTMACopyGlobalToLocalOp>(srcOp))
     return true;
-  return isa<ttnvws::DescriptorLoadOp>(srcOp);
+  return isa<ttnvws::DescriptorLoadOpInterface>(srcOp);
 }
 
 /// Helper to read the loop.stage attribute from an op. Returns -1 if absent.
@@ -1858,7 +1858,7 @@ static bool isOrderedDescriptorReuseTarget(const WSBuffer &candidate,
   Channel *targetChannel = findChannelForOp(target.allocOp, channels);
   Channel *candidateChannel = findChannelForOp(candidate.allocOp, channels);
   if (!targetChannel || !candidateChannel ||
-      !isa<ttnvws::DescriptorLoadOp>(targetChannel->getSrcOp()))
+      !isa<ttnvws::DescriptorLoadOpInterface>(targetChannel->getSrcOp()))
     return false;
 
   Operation *candidateProducer = getLogicalProducerOp(candidateChannel);
@@ -2444,7 +2444,7 @@ static bool isFedByDescriptorLoad(Value stored) {
   if (!localLoad)
     return false;
   return llvm::any_of(localLoad.getSrc().getUsers(), [](Operation *user) {
-    return isa<ttnvws::DescriptorLoadOp>(user);
+    return isa<ttnvws::DescriptorLoadOpInterface>(user);
   });
 }
 
@@ -2979,7 +2979,7 @@ static unsigned allocateSmemBuffers(
               break;
             }
           }
-          if (isa<ttnvws::DescriptorLoadOp>(user)) {
+          if (isa<ttnvws::DescriptorLoadOpInterface>(user)) {
             feedsTMA = true;
             break;
           }

@@ -44,12 +44,14 @@ def NVWSLowerWarpGroup : Pass<"nvws-lower-warp-group", "mlir::ModuleOp"> {
 }
 
 def NVWSAssignStagePhase : Pass<"nvws-assign-stage-phase", "mlir::ModuleOp"> {
-  let summary = "Assign buffer stage to nvws.aref.*.";
+  // See sema-docs/assign-stage-phase-and-lower-semaphores.md.
+  let summary = "Assign buffer stage to nvws.semaphore.*.";
 
   let description = [{
-    Assign buffer stage & phase to nvws.aref.*
+    Assign buffer stage & phase to nvws.semaphore.*
 
-    The pass will assign buffer stage to each aref op, and phase for enter ops.
+    The pass will assign buffer stage to each semaphore op, and phase for
+    acquire/release ops.
   }];
 
   let dependentDialects = [
@@ -58,17 +60,19 @@ def NVWSAssignStagePhase : Pass<"nvws-assign-stage-phase", "mlir::ModuleOp"> {
     "mlir::triton::gpu::TritonGPUDialect",
     "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"
   ];
+
 }
 
-def NVWSLowerAref : Pass<"nvws-lower-aref", "mlir::ModuleOp"> {
-  let summary = "Convert nvws.aref.* to ttng.*barrier* ops.";
+def NVWSLowerSemaphore : Pass<"nvws-lower-semaphore", "mlir::ModuleOp"> {
+  // See sema-docs/assign-stage-phase-and-lower-semaphores.md.
+  let summary = "Convert nvws.semaphore.* to ttng.*barrier* ops.";
 
   let description = [{
-    Convert nvws.aref.* to ttng.*barrier* ops.
+    Convert nvws.semaphore.* to ttng.*barrier* ops.
 
-    The pass will convert each aref to a matched value and barrier set,
+    The pass will convert each semaphore to a matched barrier set,
     and will determined appropriate waits/signalling for values being
-    "empty" or "full" from the use/def chain of aref get/put.
+    "empty" or "full" from the use/def chain of semaphore acquire/release.
 
     This lowering may yield non-ideal parallelism in certain cases,
     which will be optimized by follow up peephole passes.
@@ -87,21 +91,32 @@ def NVWSLowerAref : Pass<"nvws-lower-aref", "mlir::ModuleOp"> {
   ];
 }
 
-def NVWSInsertAref: Pass<"nvws-insert-aref", "mlir::ModuleOp"> {
-  let summary = "Insert arefs between producer and consumer partitions.";
+def NVWSInsertAllocas: Pass<"nvws-insert-allocas", "mlir::ModuleOp"> {
+  // See sema-docs/insert-allocas.md.
+  let summary = "Materialize NVWS communication allocations and accesses.";
 
   let description = [{
-    To automate barrier synchronizations between producer and consumer
-    partitions, arefs are introduced in the IR. This pass handles tensor,
-    scalar, and SMEM producers and consumers.
+    Materializes explicit local/TMEM communication buffers and memory accesses
+    for cross-partition SSA values without inserting semaphore operations.
+  }];
 
-    Specifically, for producer partitions, a producing operation is
-    wrapped in an ArefPutEnterOp and ArefPutExitOp pair. A descriptor load
-    op is replaced with the corresponding NVWS op, to store its result
-    into the SMEM buffer owned by an aref. For consumer partitions, a reference
-    to the original SMEM buffer is replaced with an indirection via ArefGetEnterOp on
-    the SMEM buffer owned by an aref. ArefGetExitOp is placed after the post-dominant
-    consumer operation.
+  let dependentDialects = [
+    "mlir::triton::nvws::NVWSDialect",
+    "mlir::triton::TritonDialect",
+    "mlir::triton::gpu::TritonGPUDialect",
+    "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"
+  ];
+
+}
+
+def NVWSMetaToNVWSConvert
+    : Pass<"nvws-meta-to-nvws-convert", "mlir::ModuleOp"> {
+  let summary = "Convert Meta warp-specialization planning metadata to NVWS IR";
+
+  let description = [{
+    Mechanically converts the output of the Meta warp-specialization planning
+    prefix into the representation consumed by the NVWS mechanism passes. The
+    pass does not choose partitions, schedules, buffers, or synchronization.
   }];
 
   let dependentDialects = [
@@ -112,15 +127,16 @@ def NVWSInsertAref: Pass<"nvws-insert-aref", "mlir::ModuleOp"> {
   ];
 }
 
-def NVWSInsertTmemAref: Pass<"nvws-insert-tmem-aref", "mlir::ModuleOp"> {
-  let summary = "Insert tmem arefs between producer and consumer partitions.";
+def NVWSOrderBufferGroups
+    : Pass<"nvws-order-buffer-groups", "mlir::ModuleOp"> {
+  let summary = "Order NVWS buffer groups by predicted producer readiness";
 
   let description = [{
-    Insert arefs when TMEM partition ownership changes.
-
-    In contrast to the InsertAref pass, this pass uses ArefPut/ArefGet as ping-pong
-    ownership transfer between two groups. Currently, this pass limits ownership
-    of a specific TMEM buffer to no more than two groups.
+    Orders eligible source-free entry-block TMEM allocation representatives so
+    that InsertSemas processes groups which are predicted to become ready later
+    before groups predicted to become ready earlier.  This makes the order of
+    co-located blocking waits an explicit pre-InsertSemas policy instead of an
+    accidental consequence of memory-planner allocation order.
   }];
 
   let dependentDialects = [
@@ -128,6 +144,50 @@ def NVWSInsertTmemAref: Pass<"nvws-insert-tmem-aref", "mlir::ModuleOp"> {
     "mlir::triton::TritonDialect",
     "mlir::triton::gpu::TritonGPUDialect",
     "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"
+  ];
+}
+
+def NVWSPackEpilogueSlices
+    : Pass<"nvws-pack-epilogue-slices", "mlir::ModuleOp"> {
+  let summary = "Pack data-partitioned epilogue producer/store slices";
+
+  let description = [{
+    Shortens register live ranges in data-partitioned merged epilogues by
+    placing each explicit local_store immediately after its producer slice.
+    This is a scheduling-only optimization over buffers already materialized
+    by Meta buffer allocation and must run before memory planning.
+  }];
+
+  let dependentDialects = [
+    "mlir::scf::SCFDialect",
+    "mlir::triton::TritonDialect",
+    "mlir::triton::gpu::TritonGPUDialect",
+    "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"
+  ];
+}
+
+def NVWSInsertSemas: Pass<"nvws-insert-semas", "mlir::ModuleOp"> {
+  // See sema-docs/insert-semas/overview.md.
+  let summary = "Insert semaphore ops for ownership transfer.";
+
+  let description = [{
+    Access-DAG-driven SMEM/TMEM semaphore insertion for ownership transfer
+    between warp-specialized partitions.
+  }];
+
+  let dependentDialects = [
+    "mlir::triton::nvws::NVWSDialect",
+    "mlir::triton::TritonDialect",
+    "mlir::triton::gpu::TritonGPUDialect",
+    "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"
+  ];
+
+  let options = [
+    Option<"useMetaPartitioner", "use-meta-partitioner",
+           "bool", /*default*/"false",
+           "If true, InsertSemas is running after the NVWS meta partitioner">,
+    Option<"numStages", "num-stages", "int32_t", /*default*/"3",
+           "pipeline depth used by LowerSemaphore auto-multibuffering">
   ];
 }
 
@@ -168,7 +228,7 @@ def NVWSHoistTmemStore: Pass<"nvws-hoist-tmem-store", "mlir::ModuleOp"> {
     If the inner loop does not execute at all, we would be returning the accumulator filled with zeros for all output tiles.
 
     This transformation is strictly an optimization. Note that the tmem_store before the inner loop is assigned to the partition 0, while the accumulator
-    is used by the MMA op in partition 1. This would result in an aref being created for this use of TMEM, along with put enter/exit and get enter/exit in
+    is used by the MMA op in partition 1. This would result in a semaphore being created for this use of TMEM, along with acquire/release in
     the two partitions, meaning an additional synchronization before the inner loop just to clear the accumulator. When the useD flag is intialized to false,
     hoisting the tmem_store to the top level eliminates such unnecessary synchronization.
 
@@ -184,6 +244,22 @@ def NVWSHoistTmemStore: Pass<"nvws-hoist-tmem-store", "mlir::ModuleOp"> {
     "mlir::triton::TritonDialect",
     "mlir::triton::gpu::TritonGPUDialect",
     "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"
+  ];
+}
+
+def NVWSStripPartitionAttrsOutsideWS
+    : Pass<"nvws-strip-partition-attrs-outside-ws", "mlir::triton::FuncOp"> {
+  let summary = "Strip partition attrs outside tt.warp_specialize loops.";
+
+  let description = [{
+    Removes internal warp-specialization partition attributes from operations
+    outside tt.warp_specialize loops while preserving the attributes on the
+    loop itself and operations nested inside it.
+  }];
+
+  let dependentDialects = [
+    "mlir::triton::TritonDialect",
+    "mlir::triton::gpu::TritonGPUDialect"
   ];
 }
 

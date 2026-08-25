@@ -56,16 +56,6 @@ uint64_t getAllocationOffset(ttng::TMEMAllocOp op) {
   return colOffset | (rowOffset << 16);
 }
 
-unsigned getMemDescSize(ttg::MemDescType ty) {
-  if (isa<ttng::TensorMemorySpaceAttr>(ty.getMemorySpace())) {
-    return ttng::getTmemAllocSizes(ty).numCols;
-  }
-  assert(isa<ttg::SharedMemorySpaceAttr>(ty.getMemorySpace()) &&
-         "Unsupported memory space");
-  unsigned elSize = ty.getElementType().getIntOrFloatBitWidth() / 8;
-  return product(ttg::getShapePerCTA(ty)) * elSize;
-}
-
 uint32_t applySharedPadding(uint32_t byteOffset, ttg::MemDescType ty) {
   auto padded = ttg::getPaddedEncoding(ty.getEncoding());
   if (!padded)
@@ -236,7 +226,7 @@ triton::BufferRegionView getMemDescView(
                         (isa<ttng::TensorMemorySpaceAttr>(ty.getMemorySpace())
                              ? affineOffset
                              : applySharedPadding(affineOffset, ty));
-  return {{baseOffset, getMemDescSize(ty), std::move(footprint)},
+  return {{baseOffset, triton::getMemDescSize(ty), std::move(footprint)},
           storageBase,
           affineOffset,
           llvm::to_vector<2>(partitionBases),
@@ -247,7 +237,8 @@ triton::BufferRegionView getMemDescView(
 uint32_t getMemDescStorageOffset(ttg::MemDescType ty, unsigned index) {
   if (isa<ttng::TensorMemorySpaceAttr>(ty.getMemorySpace()))
     return index * ttng::getTmemAllocSizes(ty).numCols;
-  uint64_t offset = static_cast<uint64_t>(index) * getMemDescSize(ty);
+  uint64_t offset =
+      static_cast<uint64_t>(index) * triton::getMemDescSize(ty);
   assert(offset <= std::numeric_limits<uint32_t>::max());
   return static_cast<uint32_t>(offset);
 }
@@ -502,6 +493,16 @@ BufferStatePlan createBufferStatePlan(ArrayRef<BufferRegion> regions,
   }
   assert(laneBegin + includeUnknown == plan.numLanes);
   return plan;
+}
+
+unsigned getMemDescSize(gpu::MemDescType ty) {
+  if (isa<nvidia_gpu::TensorMemorySpaceAttr>(ty.getMemorySpace())) {
+    return nvidia_gpu::getTmemAllocSizes(ty).numCols;
+  }
+  assert(isa<gpu::SharedMemorySpaceAttr>(ty.getMemorySpace()) &&
+         "Unsupported memory space");
+  unsigned elSize = ty.getElementType().getIntOrFloatBitWidth() / 8;
+  return product(gpu::getShapePerCTA(ty)) * elSize;
 }
 
 LogicalResult BufferRegionAnalysis::initialize(Operation *top) {

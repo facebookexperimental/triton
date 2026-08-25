@@ -126,7 +126,12 @@ def TritonGPUAutomaticWarpSpecialization : Pass<"tritongpu-automatic-warp-specia
 
   let options = [
     Option<"numStages", "num-stages", "int32_t", /*default*/"3",
-           "number of pipeline stages">
+           "number of pipeline stages">,
+    Option<"useMetaPartitioner", "use-meta-partitioner", "bool",
+           /*default*/"false",
+           "use NVWS data partitioning and Meta partition scheduling">,
+    Option<"smemBudget", "smem-budget", "int32_t", /*default*/"0",
+           "SMEM budget in bytes for NVWS memory planning">
   ];
 }
 

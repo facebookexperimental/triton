@@ -953,9 +953,20 @@ void multibufferTensorMemory(scf::ForOp forOp, CoarseSchedule &schedule,
                             domInfo);
 }
 
+bool isCompletionManagedByWarpSpecialization(
+    ttng::MMAv5OpInterface mma) {
+  // AWS currently marks operand-D channel endpoints on the MMA to indicate
+  // that warp specialization owns its accumulator completion protocol.
+  // TODO: Have AWS emit a dedicated `ttg.mma_completion_managed` attribute.
+  return mma->hasAttr("tmem.start") || mma->hasAttr("tmem.end");
+}
+
 scf::ForOp lowerMMA(ttng::MMAv5OpInterface mma, scf::ForOp forOp,
                     CoarseSchedule &schedule) {
   Value alloc = mma.getAccumulator();
+
+  if (isCompletionManagedByWarpSpecialization(mma))
+    return forOp;
 
   int mmaSelfLatency = getSelfLatencyFromAttr(mma.getOperation());
   if (mmaSelfLatency == 0) {
