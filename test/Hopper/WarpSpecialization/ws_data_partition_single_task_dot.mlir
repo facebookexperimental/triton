@@ -5,18 +5,22 @@
 // unrelated dot with a single consumer task id should not be sliced merely
 // because another dot in the same function needs partitioning.
 
+// The unpartitioned dot now precedes the sliced pair: serializeDataPartitionedOps
+// groups each partition's chain, and an op with no tt.data_partition_id sorts
+// ahead of the partitioned ones. What matters here is still that it is emitted
+// once, unsliced, at its full 128x256 shape.
 // CHECK-LABEL: @single_task_dot_not_partitioned
+// CHECK: ttng.warp_group_dot
+// CHECK-SAME: {async_task_id = array<i32: 1>
+// CHECK-SAME: !ttg.memdesc<128x64xf16, #shared, #smem>
+// CHECK-SAME: !ttg.memdesc<64x256xf16, #shared, #smem>
+// CHECK-SAME: -> tensor<128x256xf32, #mma>
 // CHECK: ttng.warp_group_dot
 // CHECK-SAME: {async_task_id = array<i32: 1>
 // CHECK-SAME: -> tensor<64x256xf32, #mma>
 // CHECK: ttng.warp_group_dot
 // CHECK-SAME: {async_task_id = array<i32: 2>
 // CHECK-SAME: -> tensor<64x256xf32, #mma>
-// CHECK: ttng.warp_group_dot
-// CHECK-SAME: {async_task_id = array<i32: 1>
-// CHECK-SAME: !ttg.memdesc<128x64xf16, #shared, #smem>
-// CHECK-SAME: !ttg.memdesc<64x256xf16, #shared, #smem>
-// CHECK-SAME: -> tensor<128x256xf32, #mma>
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [2, 2], order = [1, 0]}>
 #blocked1 = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [1, 4], order = [1, 0]}>
