@@ -530,6 +530,12 @@ public:
   }
 };
 
+static bool hasWarpSpecializeOp(LLVM::LLVMFuncOp func) {
+  return func
+      .walk([](ttg::WarpSpecializeOp) { return WalkResult::interrupt(); })
+      .wasInterrupted();
+}
+
 static Value createTMAlloc(IRRewriter &rewriter, LLVM::LLVMFuncOp func,
                            std::string exclusive, size_t size, Value pred,
                            bool twoCTAs, int smemOffset = 0) {
@@ -537,6 +543,11 @@ static Value createTMAlloc(IRRewriter &rewriter, LLVM::LLVMFuncOp func,
   Location loc = func.getLoc();
   auto b = TritonLLVMOpBuilder(loc, rewriter);
   Value sharedMem = mlir::LLVM::getStackPointer(rewriter, func);
+  if (twoCTAs && !hasWarpSpecializeOp(func)) {
+    auto ctx = func->getContext();
+    NVVM::ClusterArriveOp::create(rewriter, loc, UnitAttr::get(ctx));
+    NVVM::ClusterWaitOp::create(rewriter, loc, UnitAttr::get(ctx));
+  }
   if (smemOffset > 0) {
     auto ptrTy = sharedMem.getType();
     sharedMem = LLVM::GEPOp::create(rewriter, loc, ptrTy, i8_ty, sharedMem,
@@ -577,11 +588,7 @@ void freeTMAlloc(LLVM::LLVMFuncOp func, Value alloc, std::string exclusive,
     auto ctx = ret->getContext();
     auto loc = ret.getLoc();
     auto voidTy = void_ty(ctx);
-    bool hasWarpSpecialize = false;
-    func.walk([&](Operation *op) {
-      if (isa<triton::gpu::WarpSpecializeOp>(op))
-        hasWarpSpecialize = true;
-    });
+    bool hasWarpSpecialize = hasWarpSpecializeOp(func);
     if (tlxPairedMMA) {
       // TLX paired MMA: do a cluster sync before tmem de-alloc. This works
       // even in WS mode because the WS lowering inserts matching cluster

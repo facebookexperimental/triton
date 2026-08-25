@@ -79,27 +79,9 @@ LogicalResult lowerLdStMatrix(
     SharedMemoryObject smemObj, ConversionPatternRewriter &rewriter,
     const NVIDIA::TargetInfo &targetInfo,
     const LLVMTypeConverter *typeConverter) {
-  bool isStore = !vals.empty();
-
-  // Remove broadcasting from regLayout
-  auto removeBroadcast = actionRemoveBroadcastedRegs(regLayout);
-  if (!removeBroadcast.isIdentity()) {
-    if (isStore) {
-      auto newRegLayout = removeBroadcast.apply(regLayout);
-      vals = removeBroadcast.apply(vals);
-      return lowerLdStMatrix(loc, newRegLayout, memDescType, vals, smemObj,
-                             rewriter, targetInfo, typeConverter);
-    } else {
-      auto newRegLayout = removeBroadcast.apply(regLayout);
-      auto result =
-          lowerLdStMatrix(loc, newRegLayout, memDescType, vals, smemObj,
-                          rewriter, targetInfo, typeConverter);
-      if (succeeded(result)) {
-        vals = broadcastAs(vals, regLayout);
-      }
-      return result;
-    }
-  }
+  auto *ctx = loc.getContext();
+  assert(regLayout.getFreeVariableMasks().lookup(str_attr("register")) == 0 &&
+         "expected register broadcasting to be removed by the caller");
   if (isa<PaddedSharedEncodingAttr>(memDescType.getEncoding())) {
     return failure();
   }
@@ -155,6 +137,7 @@ public:
                   ConversionPatternRewriter &rewriter) const override {
     if (!op.getSrc())
       return failure();
+    auto *ctx = op.getContext();
     MemDescType memDescType = op.getSrc().getType();
     RankedTensorType dstTy = op.getType();
     Type llvmElemTy = typeConverter->convertType(dstTy.getElementType());
@@ -163,17 +146,16 @@ public:
 
     auto *typeConverter = getTypeConverter();
     llvm::SmallVector<Value> values;
-    auto regLayout = toLinearLayout(dstTy);
+    auto regLayout =
+        toLinearLayout(dstTy).removeZeroBasesAlongDim(str_attr("register"));
     auto result =
         lowerLdStMatrix(op.getLoc(), regLayout, memDescType, values, smemObj,
                         rewriter, targetInfo, getTypeConverter());
     if (failed(result)) {
       return failure();
     }
-    auto structTy = LLVM::LLVMStructType::getLiteral(
-        op.getLoc().getContext(), SmallVector<Type>(values.size(), llvmElemTy));
-    auto value =
-        packLLElements(op.getLoc(), typeConverter, values, rewriter, structTy);
+    auto value = packUniqueTensorElements(op.getLoc(), typeConverter, values,
+                                          rewriter, dstTy);
     rewriter.replaceOp(op, value);
     return success();
   }
@@ -195,6 +177,7 @@ struct LocalAllocOpConversion
                   ConversionPatternRewriter &rewriter) const override {
     if (!op.getSrc())
       return failure();
+    auto *ctx = op.getContext();
     MemDescType memDescType = op.getType();
     RankedTensorType regTy = op.getSrc().getType();
     Type llvmElemTy = typeConverter->convertType(regTy.getElementType());
@@ -203,8 +186,10 @@ struct LocalAllocOpConversion
     auto smemObj = SharedMemoryObject(
         smemBase, llvmElemTy, memDescType.getRank(), op.getLoc(), rewriter);
 
-    auto regLayout = toLinearLayout(regTy);
-    auto values = unpackLLElements(op.getLoc(), adaptor.getSrc(), rewriter);
+    auto regLayout =
+        toLinearLayout(regTy).removeZeroBasesAlongDim(str_attr("register"));
+    auto values =
+        unpackUniqueTensorElements(op.getLoc(), adaptor.getSrc(), rewriter);
     auto result =
         lowerLdStMatrix(op.getLoc(), regLayout, memDescType, values, smemObj,
                         rewriter, targetInfo, getTypeConverter());
@@ -233,14 +218,17 @@ struct LocalStoreOpConversion
   LogicalResult
   matchAndRewrite(triton::gpu::LocalStoreOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
+    auto *ctx = op.getContext();
     MemDescType memDescType = op.getDst().getType();
     RankedTensorType srcTy = op.getSrc().getType();
     Type llvmElemTy = typeConverter->convertType(srcTy.getElementType());
     SharedMemoryObject smemObj = LLVM::getSharedMemoryObjectFromStruct(
         op.getLoc(), adaptor.getDst(), llvmElemTy, rewriter);
 
-    auto regLayout = toLinearLayout(srcTy);
-    auto values = unpackLLElements(op.getLoc(), adaptor.getSrc(), rewriter);
+    auto regLayout =
+        toLinearLayout(srcTy).removeZeroBasesAlongDim(str_attr("register"));
+    auto values =
+        unpackUniqueTensorElements(op.getLoc(), adaptor.getSrc(), rewriter);
     auto result =
         lowerLdStMatrix(op.getLoc(), regLayout, memDescType, values, smemObj,
                         rewriter, targetInfo, getTypeConverter());
@@ -365,21 +353,14 @@ static void emitAsyncSharedStore(Location loc, ArrayRef<Value> vals, Value dst,
 }
 
 static void lowerAsyncSharedStore(Location loc, MLIRContext *ctx,
-                                  LinearLayout cvt, ArrayRef<Value> vals,
+                                  const LinearLayout &cvt, ArrayRef<Value> vals,
                                   Type llvmElemTy, MemDescType dstTy,
                                   SharedMemoryObject dstMemObj,
                                   Value mbarrierPtr, MemDescType mbarrierTy,
                                   ConversionPatternRewriter &rewriter,
                                   const NVIDIA::TargetInfo &targetInfo) {
-  auto removeBroadcastSrc = actionRemoveBroadcastedRegs(cvt);
-  if (!removeBroadcastSrc.isIdentity()) {
-    auto prmtCvt = removeBroadcastSrc.apply(cvt);
-    auto inVals = removeBroadcastSrc.apply(to_vector(vals));
-    lowerAsyncSharedStore(loc, ctx, prmtCvt, inVals, llvmElemTy, dstTy,
-                          dstMemObj, mbarrierPtr, mbarrierTy, rewriter,
-                          targetInfo);
-    return;
-  }
+  assert(cvt.getFreeVariableMasks().lookup(str_attr("register")) == 0 &&
+         "expected register broadcasting to be removed by the caller");
 
   auto [affineOffset, affineBlockOffset] =
       dstMemObj.getShmemOffsetAndBlock(loc, rewriter, dstTy);
@@ -434,6 +415,7 @@ struct AsyncSharedStoreOpConversion
       return op.emitError("requires cluster-capable SM90+");
 
     auto loc = op.getLoc();
+    auto *ctx = op.getContext();
     MemDescType dstTy = op.getDst().getType();
     RankedTensorType srcTy = op.getSrc().getType();
     Type llvmElemTy = typeConverter->convertType(srcTy.getElementType());
@@ -444,15 +426,16 @@ struct AsyncSharedStoreOpConversion
         loc, adaptor.getMbarrier(),
         typeConverter->convertType(mbarrierTy.getElementType()), rewriter);
 
-    auto regLayout = toLinearLayout(srcTy);
+    auto regLayout =
+        toLinearLayout(srcTy).removeZeroBasesAlongDim(str_attr("register"));
     auto sharedLayout = isPaddedEncoding(dstTy.getEncoding())
                             ? paddedLinearLayout(dstTy)
                             : toLinearLayout(dstTy);
     auto cvt = regLayout.invertAndCompose(sharedLayout);
-    auto values = unpackLLElements(loc, adaptor.getSrc(), rewriter);
-    lowerAsyncSharedStore(loc, op.getContext(), cvt, values, llvmElemTy, dstTy,
-                          dstMemObj, mbarrierMemObj.getBase(), mbarrierTy,
-                          rewriter, targetInfo);
+    auto values = unpackUniqueTensorElements(loc, adaptor.getSrc(), rewriter);
+    lowerAsyncSharedStore(loc, ctx, cvt, values, llvmElemTy, dstTy, dstMemObj,
+                          mbarrierMemObj.getBase(), mbarrierTy, rewriter,
+                          targetInfo);
     rewriter.eraseOp(op);
     return success();
   }
@@ -522,8 +505,6 @@ public:
       return success();
     }
 
-    if (!info.removeBroadcast.isIdentity())
-      results = broadcastAs(results, info.regLayout);
     finalizeTensorAtomicResults(op, info.valuesTy, rewriter, results,
                                 info.llvmElemTy, b, info.threadPred, targetInfo,
                                 getTypeConverter());

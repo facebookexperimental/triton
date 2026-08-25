@@ -198,10 +198,10 @@ struct TLXInferLayoutInterface : public triton::DialectInferLayoutInterface {
         });
   }
 
-  LogicalResult
-  verifyLayoutsAreEqual(ArrayRef<int64_t> shape, Attribute expected,
-                        Attribute got,
-                        std::optional<Location> loc) const override {
+  LogicalResult verifyLayoutsAreEqual(ArrayRef<int64_t> shape,
+                                      Attribute expected, Attribute got,
+                                      std::optional<Location> loc,
+                                      bool ignoreRegBroadcast) const override {
     if (hasNoVerifyLayout(expected) || hasNoVerifyLayout(got))
       return success();
 
@@ -211,8 +211,8 @@ struct TLXInferLayoutInterface : public triton::DialectInferLayoutInterface {
         getInferLayoutInterfaceFor(unwrappedExpected);
     if (!delegate)
       return failure();
-    return delegate->verifyLayoutsAreEqual(shape, unwrappedExpected,
-                                           unwrappedGot, loc);
+    return delegate->verifyLayoutsAreEqual(
+        shape, unwrappedExpected, unwrappedGot, loc, ignoreRegBroadcast);
   }
 
   LogicalResult

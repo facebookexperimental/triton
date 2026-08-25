@@ -815,7 +815,8 @@ struct PackedArithOpConversion
     SmallVector<SmallVector<Value>> operandValues;
     for (auto [operand, converted] :
          llvm::zip(op.getOperands(), adaptor.getOperands())) {
-      auto values = unpackLLElements(loc, converted, rewriter);
+      auto values =
+          unpackTensorElements(loc, converted, rewriter, operand.getType());
       auto layout = toLinearLayout(cast<RankedTensorType>(operand.getType()));
       auto removeBroadcasts = actionRemoveBroadcastedRegs(layout);
       if (!removeBroadcasts.isIdentity())
@@ -868,7 +869,8 @@ struct PackedArithOpConversion
     auto removeResultBroadcasts = actionRemoveBroadcastedRegs(resultLayout);
     if (!removeResultBroadcasts.isIdentity())
       packedResults = broadcastAs(packedResults, resultLayout);
-    rewriter.replaceOp(op, packLLElements(loc, getTypeConverter(),
+    rewriter.replaceOp(op,
+                       packTensorElements(loc, getTypeConverter(),
                                           packedResults, rewriter, tensorType));
     return success();
   }

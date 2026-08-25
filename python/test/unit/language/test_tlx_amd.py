@@ -3839,7 +3839,7 @@ def test_a4w4_inter_wave_256tile_codegen_gfx950(device, fresh_triton_cache):
     assert "arith.xori" not in ttgir
     assert ttgir.count('triton.warp_pipeline.stage = "mfma"') == 8
     assert ttgir.count('triton.warp_pipeline.stage = "mem"') == 8
-    assert ttgir.count("rocdl.sched.barrier 0") == 8
+    assert ttgir.count("rocdl.sched.barrier none") == 8
     assert ttgir.count("tt.dot_scaled") == 16
     assert ttgir.count("amdg.buffer_load_to_local") == 28
     assert "contiguity" not in ttgir

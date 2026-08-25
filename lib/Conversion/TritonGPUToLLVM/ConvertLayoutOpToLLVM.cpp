@@ -120,16 +120,15 @@ struct ConvertLayoutOpConversion
     auto kRegister = str_attr("register");
     assert(!cvtNeedsSharedMemory(op.getSrc().getType(), op.getType()));
 
-    auto srcTy = op.getSrc().getType();
-    auto dstTy = op.getType();
-    auto inVals = unpackLLElements(loc, adaptor.getSrc(), rewriter);
+    auto inVals = unpackTensorElements(loc, adaptor.getSrc(), rewriter,
+                                       op.getSrc().getType());
     SmallVector<Value> outVals(conversion.getInDimSize(kRegister));
     for (int i = 0; i < outVals.size(); i++) {
       auto srcIdx = conversion.apply({{kRegister, i}}).begin()->second;
       outVals[i] = inVals[srcIdx];
     }
-    Value result = packLLElements(loc, getTypeConverter(), outVals, rewriter,
-                                  op.getType());
+    Value result = packTensorElements(loc, getTypeConverter(), outVals,
+                                      rewriter, op.getType());
     rewriter.replaceOp(op, result);
     return success();
   }
@@ -408,11 +407,13 @@ struct ConvertLayoutOpConversion
 
     auto srcLayout = toLinearLayout(srcTy);
     auto dstLayout = toLinearLayout(dstTy);
+    srcLayout = srcLayout.removeZeroBasesAlongDim(str_attr("register"));
+    dstLayout = dstLayout.removeZeroBasesAlongDim(str_attr("register"));
 
     auto llvmElemTy = getTypeConverter()->convertType(srcTy.getElementType());
     auto smemBase =
         LLVM::getSharedMemoryBase(loc, rewriter, targetInfo, op.getOperation());
-    auto inVals = unpackLLElements(loc, src, rewriter);
+    auto inVals = unpackUniqueTensorElements(loc, src, rewriter);
 
     std::optional<std::pair<Value, Value>> distributedCoordinates;
     if (op->hasAttr("tlx.rematerialize_coordinates")) {
@@ -426,8 +427,8 @@ struct ConvertLayoutOpConversion
         loc, rewriter, srcLayout, dstLayout, inVals, llvmElemTy, smemBase, op,
         distributedCoordinates);
 
-    Value result =
-        packLLElements(loc, getTypeConverter(), outVals, rewriter, dstTy);
+    Value result = packUniqueTensorElements(loc, getTypeConverter(), outVals,
+                                            rewriter, dstTy);
     rewriter.replaceOp(op, result);
   }
 
@@ -470,13 +471,7 @@ struct ConvertLayoutOpConversion
     // Here, R denotes the number of 32-bit registers in use after packing (or
     // splitting, if applied to 64-bit types or pointers), and in the `Swap`
     // method, `m` denotes the number of mixed transpositions passed in.
-    auto inVals = unpackLLElements(loc, adaptor.getSrc(), rewriter);
-
-    // To avoid unnecessary data movement, we remove any broadcasting in the
-    // register dimension from the `inVals`.
-    auto srcLayout = toLinearLayout(srcTy);
-    auto removeBroadcastSrc = actionRemoveBroadcastedRegs(srcLayout);
-    inVals = removeBroadcastSrc.apply(inVals);
+    auto inVals = unpackUniqueTensorElements(loc, adaptor.getSrc(), rewriter);
 
     // If the target layout has a larger register dimension than the source
     // layout, then we broadcast along the register dimension to match size. The
@@ -578,16 +573,11 @@ struct ConvertLayoutOpConversion
     // If `dstLayout` has a smaller `kReg` dimension than `srcLayout` after
     // broadcasting is removed, then drop the extra registers from `outVals`.
     auto dstLayout = toLinearLayout(dstTy);
-    auto removeBroadcastDst = actionRemoveBroadcastedRegs(dstLayout);
-    auto strippedDstLayout = removeBroadcastDst.apply(dstLayout);
+    auto strippedDstLayout = dstLayout.removeZeroBasesAlongDim(kReg);
     outVals.resize(strippedDstLayout.getInDimSize(kReg));
 
-    // Introduce broadcasting in registers if expected by `dstLayout`.
-    if (!removeBroadcastDst.isIdentity())
-      outVals = broadcastAs(outVals, dstLayout);
-
-    Value result = packLLElements(loc, getTypeConverter(), outVals, rewriter,
-                                  op.getType());
+    Value result = packUniqueTensorElements(loc, getTypeConverter(), outVals,
+                                            rewriter, dstTy);
     rewriter.replaceOp(op, result);
     return success();
   }
