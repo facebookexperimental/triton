@@ -28,25 +28,55 @@ This site covers four connected parts of Meta's work: the Triton compiler, the T
 | [CI](website/ci.html) | Workflows, runners, nightly failure handling, and per-project test coverage |
 | [Tooling](website/tooling.html) | Compilation tracing, profiling, runtime diagnostics, sanitizers, and benchmarking |
 
-### Triton
+## Install
 
-Triton is a compiler and language for writing performance-portable AI kernels with a productive blocked programming model. This site focuses on FBTriton compiler work such as automatic warp specialization, scheduling, memory planning, and support for new GPU features.
+FBTriton installs as the `triton` package, so `import triton` resolves to this fork. Uninstall upstream Triton first: both distributions own the same `triton/` directory, and installing one over the other leaves an inconsistent environment rather than a clean error.
 
-### TLX
+```bash
+pip uninstall -y triton
+pip install fbtriton
+```
 
-TLX is a low-level Triton extension for explicit warp-group orchestration, asynchronous memory movement, tensor-core operations, barriers, tensor memory, and cluster execution across NVIDIA and AMD GPUs.
+Nightly `.dev` wheels are published to a self-managed index, not PyPI:
 
-### TorchTLX
+```bash
+pip install --pre fbtriton \
+  --index-url https://facebookexperimental.github.io/triton/nightly/simple/
+```
 
-TorchTLX pushes TLX primitives into Inductor's template and fusion infrastructure, so a PyTorch 2 program can select a TLX-backed GEMM or attention template and fuse epilogues into it without the user writing a kernel.
+Each nightly is built from the newest `main` commit whose GPU and CI checks are all green, and reports a version of the form `3.8.0.dev<YYYYMMDD>+fb.git<hash>`. Nightlies are retained for about 30 days. Binary wheels cover CPython 3.10 through 3.14.
 
-### CI
+FBTriton is intended as a drop-in replacement for upstream Triton on a best-effort basis: it tracks upstream closely, and existing Triton kernels are expected to work unchanged. That is not a formal guarantee — if something that works upstream breaks here, please file an issue.
 
-The CI section describes the GPU test workflows and the runners behind them, how nightly failures are filed, reconciled, and bisected, and what coverage each project has.
+### Build from source
 
-### Tooling
+```bash
+git clone https://github.com/facebookexperimental/triton.git
+cd triton
 
-The tooling section covers compilation tracing, profiling, runtime diagnostics, sanitizers, static analysis, and benchmarking utilities used to develop and evaluate Triton and TLX kernels.
+pip install -r python/requirements.txt # build-time dependencies
+pip install -e .
+```
+
+C++ changes require a rebuild to take effect; Python-only changes do not. Run `pre-commit run --all` before sending a pull request.
+
+## Hardware support
+
+| Vendor | Targets |
+|---|---|
+| NVIDIA | Hopper (`sm90`), Blackwell (`sm100`) |
+| AMD | MI300 / CDNA3 (`gfx942`), MI350 / CDNA4 (`gfx950`), RDNA4 (`gfx1250`) |
+
+Support varies per feature. Every operation in the [TLX reference](website/tlx.html) carries a tag naming the targets it runs on, and AutoWS requires `sm90` or newer.
+
+### Check the install
+
+```bash
+python -c "import triton; print(triton.__version__)"
+pytest third_party/tlx/tutorials/testing/test_correctness.py
+```
+
+The tutorial suite is arch-gated, so cases that do not apply to your GPU skip rather than fail.
 """,
     "triton":
     r"""

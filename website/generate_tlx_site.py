@@ -102,6 +102,12 @@ TRITON_PAGE = Page(
     "Compiler-managed performance portability and automatic warp specialization.",
     "triton",
 )
+COMPILER_PAGE = Page(
+    "compiler",
+    "Compiler features",
+    "AutoWS enablement and knobs, and deterministic reduction ordering.",
+    "triton",
+)
 TORCHTLX_PAGE = Page(
     "torchtlx",
     "TorchTLX",
@@ -121,7 +127,16 @@ TOOLING_PAGE = Page(
     "tooling",
 )
 
-SECTION_PAGES = (TRITON_PAGE, TLX_PAGES[0], TORCHTLX_PAGE, CI_PAGE, TOOLING_PAGE)
+TRITON_PAGES = (TRITON_PAGE, COMPILER_PAGE)
+
+SECTIONS = {
+    "triton": TRITON_PAGES,
+    "tlx": TLX_PAGES,
+    "torchtlx": (TORCHTLX_PAGE,),
+    "ci": (CI_PAGE,),
+    "tooling": (TOOLING_PAGE,),
+}
+SECTION_PAGES = tuple(pages[0] for pages in SECTIONS.values())
 SECTION_LABELS = {
     "triton": "Triton",
     "tlx": "TLX",
@@ -129,34 +144,7 @@ SECTION_LABELS = {
     "ci": "CI",
     "tooling": "Tooling",
 }
-TRITON_NAV_ITEMS = (
-    ("Overview", "triton.html"),
-    ("Automatic warp specialization", "#automatic-warp-specialization"),
-    ("Compiler pipeline", "#the-compiler-pipeline-today"),
-    ("TLX and AutoWS", "#tlx-and-autows"),
-    ("Roadmap", "#roadmap"),
-    ("Design article", "#read-the-design-article"),
-)
-TORCHTLX_NAV_ITEMS = (
-    ("Overview", "torchtlx.html"),
-    ("Enabling it", "#knob"),
-    ("Templates", "#torchtlx-templates"),
-    ("Naming conventions", "#naming-conventions"),
-    ("Fusions", "#torchtlx-fusions"),
-    ("Next-gen hardware", "#vision-for-next-gen-hardware"),
-    ("Source and tests", "#source-and-tests"),
-)
-CI_NAV_ITEMS = (
-    ("Overview", "ci.html"),
-    ("GPU test workflows", "#gpu-test-workflows"),
-    ("Compiler tests", "#compiler-tests"),
-    ("Pre-commit", "#pre-commit"),
-    ("Nightlies and releases", "#nightlies-and-releases"),
-    ("Nightly failure handling", "#nightly-failure-handling"),
-    ("TLX-AMD CI", "#tlx-amd-ci"),
-    ("Gluon", "#gluon"),
-)
-PAGES = (HOME_PAGE, TRITON_PAGE, *TLX_PAGES, TORCHTLX_PAGE, CI_PAGE, TOOLING_PAGE)
+PAGES = (HOME_PAGE, *TRITON_PAGES, *TLX_PAGES, TORCHTLX_PAGE, CI_PAGE, TOOLING_PAGE)
 
 def page_source(page: Page) -> str:
     """Read a page body from website/content/, falling back to guide_content."""
@@ -332,28 +320,44 @@ def top_navigation(page: Page, from_root: bool) -> str:
     return "\n".join(items)
 
 
-def documentation_navigation(active_slug: str, from_root: bool) -> str:
-    items = []
-    for page in TLX_PAGES:
-        href = page_href(page, from_root)
-        current = ' aria-current="page"' if page.slug == active_slug else ""
-        label = "Overview" if page.slug == "tlx" else page.title
-        items.append(f'<a href="{href}"{current}>{html.escape(label)}</a>')
-    return "\n".join(items)
+def sub_headings(source: str) -> list[str]:
+    """Level-2 headings of a page body, ignoring fenced code."""
+    out, in_code = [], False
+    for line in source.splitlines():
+        if re.match(r"^\s*```", line):
+            in_code = not in_code
+            continue
+        if in_code:
+            continue
+        heading = re.match(r"^## (.+)$", line)
+        if heading:
+            out.append(heading.group(1).strip())
+    return out
 
 
-def anchor_navigation(nav_items: tuple[tuple[str, str], ...]) -> str:
+def section_navigation(page: Page, source: str, from_root: bool) -> str:
+    pages = SECTIONS[page.section]
     items = []
-    for index, (label, href) in enumerate(nav_items):
-        current = ' aria-current="page"' if index == 0 else ""
+    for entry in pages:
+        href = page_href(entry, from_root)
+        current = ' aria-current="page"' if entry.slug == page.slug else ""
+        label = "Overview" if len(pages) > 1 and entry is pages[0] else entry.title
         items.append(f'<a href="{href}"{current}>{html.escape(label)}</a>')
+        if entry.slug == page.slug:
+            for heading in sub_headings(source):
+                items.append(
+                    f'<a class="sub" href="#{slugify(heading)}">{html.escape(heading)}</a>')
     return "\n".join(items)
 
 
 def page_links(page: Page, from_root: bool) -> str:
     if page.section == "home":
         return ""
-    sequence = TLX_PAGES if page.section == "tlx" else SECTION_PAGES
+    # Page within its own section when the section has several; otherwise step
+    # across the top-level sections.
+    sequence = SECTIONS[page.section]
+    if len(sequence) == 1:
+        sequence = SECTION_PAGES
     position = sequence.index(page)
     previous = sequence[position - 1] if position else None
     following = sequence[position + 1] if position + 1 < len(sequence) else None
@@ -385,29 +389,11 @@ def render_page(page: Page, source: str) -> str:
     footer = f'<footer class="pager">{pager}</footer>' if pager else ""
     sidebar = ""
     shell_class = "shell no-sidebar"
-    if page.section == "tlx":
+    if page.section in SECTIONS:
         shell_class = "shell"
         sidebar = f"""<aside class="sidebar">
-      <p class="eyebrow">TLX documentation</p>
-      <nav>{documentation_navigation(page.slug, from_root)}</nav>
-    </aside>"""
-    elif page.section == "triton":
-        shell_class = "shell"
-        sidebar = f"""<aside class="sidebar">
-      <p class="eyebrow">Triton documentation</p>
-      <nav>{anchor_navigation(TRITON_NAV_ITEMS)}</nav>
-    </aside>"""
-    elif page.section == "torchtlx":
-        shell_class = "shell"
-        sidebar = f"""<aside class="sidebar">
-      <p class="eyebrow">TorchTLX documentation</p>
-      <nav>{anchor_navigation(TORCHTLX_NAV_ITEMS)}</nav>
-    </aside>"""
-    elif page.section == "ci":
-        shell_class = "shell"
-        sidebar = f"""<aside class="sidebar">
-      <p class="eyebrow">CI documentation</p>
-      <nav>{anchor_navigation(CI_NAV_ITEMS)}</nav>
+      <p class="eyebrow">{html.escape(eyebrow)}</p>
+      <nav>{section_navigation(page, source, from_root)}</nav>
     </aside>"""
     return f"""<!doctype html>
 <html lang="en">

@@ -149,6 +149,12 @@ a:hover {
   margin-left: -1px;
 }
 
+.sidebar nav a.sub {
+  font-size: 0.82rem;
+  opacity: 0.85;
+  padding: 4px 0 4px 32px;
+}
+
 main {
   min-width: 0;
 }

@@ -32,13 +32,19 @@
 <a href="utilities.html">Other operations</a>
 <a href="kernels.html">Kernels implemented with TLX</a>
 <a href="testing.html" aria-current="page">Testing</a>
+<a class="sub" href="#test-suites-by-project">Test suites by project</a>
+<a class="sub" href="#correctness">Correctness</a>
+<a class="sub" href="#performance">Performance</a>
 <a href="resources.html">Further reading</a></nav>
     </aside>
     <main>
       <p class="eyebrow">TLX documentation</p>
       <h1>Testing</h1>
       <p class="lede">Correctness and performance scripts for the TLX tutorial kernels.</p>
-      <article><h2 id="correctness">Correctness</h2>
+      <article><h2 id="test-suites-by-project">Test suites by project</h2>
+<table><thead><tr><th>Project</th><th>Command</th></tr></thead><tbody><tr><td>TLX tutorial kernels</td><td><code>pytest third_party/tlx/tutorials/testing/test_correctness.py</code></td></tr><tr><td>TLX language</td><td><code>pytest python/test/unit/language/test_tlx_*.py</code></td></tr><tr><td>AutoWS</td><td><code>pytest python/test/unit/language/test_autows_*.py</code></td></tr><tr><td>TorchTLX</td><td><code>pytest python/test/unit/language/test_torchtlx_*.py</code></td></tr></tbody></table>
+<p>Every suite is arch-gated, so cases that do not apply to the GPU you are on skip rather than fail. The <code>test_tlx_*.py</code> glob covers manual TLX (<code>tlx.async_tasks</code>) and structurally excludes the AutoWS suites, which are tested separately. Which of these run in CI, and on which runners, is described under <a href="ci.html">CI</a>.</p>
+<h2 id="correctness">Correctness</h2>
 <p><code>[TLX_VERSION=&lt;kernel_name&gt;] pytest third_party/tlx/tutorials/testing/test_correctness.py</code></p>
 <p>By default only one autotune config will be used by correctness test.</p>
 <p>All kernels — Hopper, Blackwell, and AMD — share this one file; each test is arch-gated with <code>@pytest.mark.skipif</code>, so on any given GPU only the relevant cases run and the rest skip. To run just the AMD/IKBO cases:</p>

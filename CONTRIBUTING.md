@@ -1,3 +1,48 @@
+# Contributing to fbtriton
+
+## Building from source
+
+```bash
+git clone https://github.com/facebookexperimental/triton.git
+cd triton
+
+pip install -r python/requirements.txt # build-time dependencies
+pip install -e .
+```
+
+C++ changes require a rebuild to take effect; Python-only changes do not.
+Run `pre-commit run --all` before sending a pull request.
+
+## Running tests
+
+| Project | Command |
+|---|---|
+| TLX tutorial kernels | `pytest third_party/tlx/tutorials/testing/test_correctness.py` |
+| TLX language | `pytest python/test/unit/language/test_tlx_*.py` |
+| AutoWS | `pytest python/test/unit/language/test_autows_*.py` |
+| TorchTLX | `pytest python/test/unit/language/test_torchtlx_*.py` |
+
+Suites are arch-gated, so cases that do not apply to your GPU skip rather than
+fail. CI workflows and runners are documented at
+<https://facebookexperimental.github.io/triton/website/ci.html>.
+
+## Editing the documentation site
+
+The site under `website/` is generated, not hand-written. Page bodies live in
+`website/content/*.md`; the curated home, Triton, and Tooling pages live in
+`website/guide_content.py`. After editing either, regenerate and commit the
+generated HTML:
+
+```bash
+cd website && python3 generate_tlx_site.py
+```
+
+## Where to file issues
+
+Bugs and feature requests for TLX, AutoWS, and TorchTLX belong in this
+repository. Anything in core Triton or Gluon belongs upstream, at
+<https://github.com/triton-lang/triton>.
+
 # Governance Structure
 
 Triton adopts the following hierarchical technical governance structure:

@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="AutoWS enablement and knobs, and deterministic reduction ordering.">
+  <title>Compiler features · FBTriton</title>
+  <link rel="stylesheet" href="assets/tlx.css?v=20260824b">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="../"><span>FBTriton</span></a>
+    <nav class="topnav" aria-label="Top-level sections"><a href="triton.html" data-current="true">Triton</a>
+<a href="tlx.html">TLX</a>
+<a href="torchtlx.html">TorchTLX</a>
+<a href="ci.html">CI</a>
+<a href="tooling.html">Tooling</a></nav>
+    <a class="repo-link" href="https://github.com/facebookexperimental/triton" target="_blank" rel="noreferrer">View on GitHub ↗</a>
+  </header>
+  <div class="shell">
+<aside class="sidebar">
+      <p class="eyebrow">Triton compiler</p>
+      <nav><a href="triton.html">Overview</a>
+<a href="compiler.html" aria-current="page">Compiler features</a>
+<a class="sub" href="#autows-automatic-warp-specialization">AutoWS — automatic warp specialization</a>
+<a class="sub" href="#reduction-ordering">Reduction ordering</a></nav>
+    </aside>
+    <main>
+      <p class="eyebrow">Triton compiler</p>
+      <h1>Compiler features</h1>
+      <p class="lede">AutoWS enablement and knobs, and deterministic reduction ordering.</p>
+      <article><p>Compiler and core-language capabilities this fork adds on top of upstream Triton. These need no TLX code — they apply to ordinary Triton kernels.</p>
+<h2 id="autows-automatic-warp-specialization">AutoWS — automatic warp specialization</h2>
+<p>AutoWS is a compiler optimization that partitions a kernel's operations into specialized warp groups — typically a <strong>producer</strong> group that handles memory loads and a <strong>consumer</strong> group that handles computation (MMA/tensor core ops). By assigning different hardware resources to each group, warp specialization enables overlap of memory transfers, CUDA core work, and tensor core work, improving SM utilization.</p>
+<p>Where <a href="tlx.html">TLX</a> has you write warp specialization by hand with <code>tlx.async_tasks</code>, AutoWS asks the compiler to do it. The two are separate paths: the TLX unit tests and the AutoWS suites are deliberately kept apart.</p>
+<h3 id="enabling-it">Enabling it</h3>
+<p>Mark a loop with the <code>warp_specialize</code> attribute:</p>
+<pre><code class="language-python">for k in tl.range(0, K, BLOCK_K, warp_specialize=True):
+    ...</code></pre>
+<p>It is also accepted on <code>tl.condition</code> for while loops:</p>
+<pre><code class="language-python">while tl.condition(c, warp_specialize=True, num_stages=3):
+    ...</code></pre>
+<p>Per <code>tl.range</code>'s own documentation, this enables automatic warp specialization on the loop: the compiler will attempt to partition memory, MMA, and vector operations in the loop into separate async partitions. <strong>This increases the total number of warps the kernel requires.</strong></p>
+<p>The marker is a *request*, not a decision — if the compiler's partition scheduling assigns no partitions, the kernel compiles without warp specialization rather than failing.</p>
+<p>To select the Meta warp-specialization backend:</p>
+<pre><code class="language-bash">export TRITON_USE_META_WS=1</code></pre>
+<p>or, scoped from Python:</p>
+<pre><code class="language-python">triton.knobs.nvidia.use_meta_ws = True</code></pre>
+<h3 id="hardware">Hardware</h3>
+<p>Requires sm_90 or newer — Hopper (<code>sm90</code>) and Blackwell (<code>sm100</code>). On Blackwell, task assignments come from the <code>PartitionSchedulingMeta</code> pass rather than the Hopper <code>doTaskPartition</code> path.</p>
+<h3 id="tuning-knobs">Tuning knobs</h3>
+<table><thead><tr><th>Knob</th><th>Env var</th><th>Purpose</th></tr></thead><tbody><tr><td><code>knobs.nvidia.use_meta_ws</code></td><td><code>TRITON_USE_META_WS</code></td><td>Select the Meta WS backend</td></tr><tr><td><code>knobs.nvidia.ws_tile_prefetch_depth</code></td><td><code>TRITON_WS_TILE_PREFETCH_DEPTH</code></td><td>Buffers for the dynamic-persistent tile-id broadcast channel (1 = single-stage)</td></tr><tr><td><code>knobs.nvidia.ws_mem_plan_topk</code></td><td><code>TRITON_WS_MEM_PLAN_TOPK</code></td><td>Enumerate the top-K TMEM column packings</td></tr><tr><td><code>knobs.nvidia.ws_mem_plan_pick</code></td><td><code>TRITON_WS_MEM_PLAN_PICK</code></td><td>Which ranked packing to apply (0 = cost/occupancy-best)</td></tr><tr><td><code>knobs.nvidia.ws_mem_plan_topk_dump</code></td><td><code>TRITON_WS_MEM_PLAN_TOPK_DUMP</code></td><td>Write ranked packings as JSON</td></tr></tbody></table>
+<p><code>minRegAutoWS</code> / <code>maxRegAutoWS</code> (compilation options, not env vars) control the per-thread register budgets AutoWS assigns to non-tensor and tensor partitions. If either is provided from the Python frontend, its value must be divisible by 8 so the emitted register allocation matches backend warp-group granularity.</p>
+<p>Prefer the knobs over the raw <code>TRITON_WS_MEM_PLAN_*</code> environment variables so tests can scope them with <code>knobs.nvidia.scope()</code> without leaking global env state across a batch run.</p>
+<h3 id="tests">Tests</h3>
+<pre><code class="language-bash">pytest python/test/unit/language/test_autows_addmm.py
+pytest python/test/unit/language/test_autows_auto_tma.py
+pytest python/test/unit/language/test_autows_quantized_matmul.py
+pytest python/test/unit/language/test_warp_specialization.py
+pytest python/test/unit/language/test_tutorial09_warp_specialization.py</code></pre>
+<p>Compiler-side coverage is in the WarpSpecialization lit suite (no GPU required); see <a href="ci.html">CI</a>.</p>
+<h3 id="design-documentation">Design documentation</h3>
+<p>The pass pipeline and its sub-passes are documented in detail under <a href="https://github.com/facebookexperimental/triton/tree/main/third_party/nvidia/hopper/lib/Transforms/WarpSpecialization/docs/" target="_blank" rel="noreferrer"><code>third_party/nvidia/hopper/lib/Transforms/WarpSpecialization/docs/</code></a>. Start with <code>Overview.md</code>, which lays out the pipeline:</p>
+<pre><code>doTaskPartition          (Hopper only; skipped on Blackwell)
+  → doTaskIdPropagate
+  → doDynamicTileBroadcast
+  → doDataPartition
+  → doPingPongPrep       (optional)
+  → doConvertDescriptorLoadsToNVWS
+  → doBufferAllocation
+  → doMemoryPlanner
+  → doCodePartition
+  → doPingPongSync       (optional)
+  → doTokenLowering
+  → doLoopSchedulePreprocessing + scheduleLoops</code></pre>
+<p>Frequently useful entry points from that directory:</p>
+<table><thead><tr><th>Topic</th><th>Document</th></tr></thead><tbody><tr><td>Pipeline overview</td><td><code>Overview.md</code></td></tr><tr><td>Partition assignment</td><td><code>PartitionSchedulingMeta.md</code></td></tr><tr><td>Buffer allocation</td><td><code>BufferAllocation.md</code>, <code>SmemAllocationDesign.md</code></td></tr><tr><td>Code partitioning</td><td><code>CodePartition.md</code>, <code>CodeSpecialization.md</code></td></tr><tr><td>Barriers</td><td><code>BarrierInsertion.md</code>, <code>BarrierConstraints.md</code>, <code>BarrierFusion.md</code></td></tr><tr><td>TMEM</td><td><code>TMEMAllocationHeuristics.md</code>, <code>TMEMInterleave.md</code></td></tr><tr><td>Debugging wrong results or hangs</td><td><code>DebuggingAccuracyAndDeadlocks.md</code></td></tr></tbody></table>
+<p>Additional design notes live in <a href="https://github.com/facebookexperimental/triton/tree/main/docs/design/" target="_blank" rel="noreferrer"><code>docs/design/</code></a>, including <code>2cta-autoWS-sync.md</code> and <code>llm-autows.md</code>.</p>
+<h2 id="reduction-ordering">Reduction ordering</h2>
+<p>Triton's default reduction (<code>tl.sum</code>, <code>tl.reduce</code>) uses layout-dependent accumulation order, so changing <code>num_warps</code> or <code>BLOCK_SIZE</code> can change the floating-point result. For workloads that require bitwise reproducibility — deterministic training, numerical debugging, regression testing — the <code>reduction_ordering</code> parameter requests a deterministic accumulation order that is independent of thread layout.</p>
+<pre><code class="language-python"># Sum with deterministic ordering
+z = tl.sum(x, axis=1, reduction_ordering=tl.ReductionOrdering.INNER_TREE)
+
+# Custom combine function with deterministic ordering
+z = tl.reduce(x, axis=1, combine_fn=my_fn,
+              reduction_ordering=tl.ReductionOrdering.INNER_TREE)
+
+# Default (no ordering guarantee, best performance)
+z = tl.sum(x, axis=1)  # equivalent to ReductionOrdering.UNORDERED</code></pre>
+<p>Given the same logical input data and reduction ordering, the result is bitwise identical regardless of <code>num_warps</code>, memory layout, or other compilation parameters.</p>
+<p><code>ReductionOrdering</code> objects cannot be used directly inside JIT-compiled code (they are Python objects without a Triton type), so pass them as <code>tl.constexpr</code> kernel parameters:</p>
+<pre><code class="language-python">@triton.jit
+def kernel(X, Z, ORDERING: tl.constexpr):
+    x = tl.load(X + tl.arange(0, 1024))
+    z = tl.sum(x, axis=0, reduction_ordering=ORDERING)
+    tl.store(Z, z)
+
+kernel[(1,)](x, z, ORDERING=tl.ReductionOrdering.INNER_TREE, num_warps=4)</code></pre>
+<p>Full design, ordering semantics, and the frontend-to-C++ plumbing are in <a href="https://github.com/facebookexperimental/triton/blob/main/third_party/tlx/doc/reduction_ordering.md" target="_blank" rel="noreferrer">Reduction Ordering in Triton</a>.</p></article>
+<footer class="pager"><a href="triton.html">← Triton</a></footer>
+    </main>
+  </div>
+</body>
+</html>
