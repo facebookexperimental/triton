@@ -1,3 +1,5 @@
+from enum import IntEnum
+from typing import NamedTuple
 import torch
 import triton
 import triton.language as tl
@@ -8,6 +10,25 @@ from triton.language.extra.cuda.inline_ptx_lib import _mul_f32x2, _fma_f32x2, _s
 from triton.language.extra.subtile_ops import _split_n_2D
 from triton.tools.tensor_descriptor import TensorDescriptor
 
+
+class Policy(IntEnum):
+    DENSE = 0
+    CAUSAL_64K = 1
+    CAUSAL_128K = 2
+    CAUSAL_256K = 3
+    CAUSAL_512K = 4
+
+
+class ForwardPlan(NamedTuple):
+    stage: int
+    pipelined: bool
+    policy: int
+    dense_regs: int
+
+
+POLICY_DENSE = tl.constexpr(int(Policy.DENSE))
+CAUSAL_POLICY_BIT_OFFSET = 16
+FWD_BLOCK_M = tl.constexpr(256)
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
 
@@ -258,7 +279,7 @@ def _apply_causal_mask(qk, col_limit, BLOCK: tl.constexpr, keep_ge: tl.constexpr
 
 
 @triton.jit
-def _softmax_inner_loop(
+def _fwd_softmax_tile(
     qk_fulls,
     qk_tiles,
     p_fulls,
@@ -843,46 +864,68 @@ def _fwd_mma_tile(
     prune_configs_by={"early_config_prune": prune_configs_by_hdim},
 )
 @triton.jit
-def _attn_fwd_ws(sm_scale, M,  #
-                 Z, H, desc_q, desc_k, desc_v, desc_o, N_CTX,  #
-                 HEAD_DIM: tl.constexpr,  #
-                 BLOCK_M: tl.constexpr,  #
-                 BLOCK_N: tl.constexpr,  #
-                 STAGE: tl.constexpr,  #
-                 NUM_BUFFERS_Q: tl.constexpr,  #
-                 NUM_BUFFERS_KV: tl.constexpr,  #
-                 NUM_BUFFERS_QK: tl.constexpr,  #
-                 NUM_MMA_GROUPS: tl.constexpr,  #
-                 NUM_MMA_SLICES: tl.constexpr,  #
-                 GROUP_SIZE_N: tl.constexpr,  #
-                 RESCALE_OPT: tl.constexpr,  #
-                 USE_WHERE: tl.constexpr,  #
-                 USE_WARP_BARRIER: tl.constexpr,  #
-                 NUM_CTAS: tl.constexpr = 1,  #
-                 ):
+def _attn_fwd_ws(
+    sm_scale,
+    M,  #
+    Z,
+    H,
+    desc_q,
+    desc_k,
+    desc_v,
+    desc_o,
+    N_CTX,  #
+    HEAD_DIM: tl.constexpr,  #
+    BLOCK_M: tl.constexpr,  #
+    BLOCK_N: tl.constexpr,  #
+    STAGE: tl.constexpr,  #
+    NUM_BUFFERS_Q: tl.constexpr,  #
+    NUM_BUFFERS_KV: tl.constexpr,  #
+    NUM_BUFFERS_QK: tl.constexpr,  #
+    NUM_MMA_GROUPS: tl.constexpr,  #
+    NUM_MMA_SLICES: tl.constexpr,  #
+    GROUP_SIZE_N: tl.constexpr,  #
+    RESCALE_OPT: tl.constexpr,  #
+    USE_WHERE: tl.constexpr,  #
+    USE_WARP_BARRIER: tl.constexpr,  #
+    NUM_CTAS: tl.constexpr = 1,  #
+    PIPELINED: tl.constexpr = False,
+    POLICY: tl.constexpr = POLICY_DENSE,
+    DENSE_REGS: tl.constexpr = 200,
+):
     _attn_fwd_ws_kernel(sm_scale, M, Z, H, desc_q, desc_k, desc_v, desc_o, N_CTX, HEAD_DIM, BLOCK_M, BLOCK_N, STAGE,
                         NUM_BUFFERS_Q, NUM_BUFFERS_KV, NUM_BUFFERS_QK, NUM_MMA_GROUPS, NUM_MMA_SLICES, GROUP_SIZE_N,
-                        RESCALE_OPT, USE_WHERE, USE_WARP_BARRIER, NUM_CTAS)
+                        RESCALE_OPT, USE_WHERE, USE_WARP_BARRIER, NUM_CTAS, PIPELINED, POLICY, DENSE_REGS)
 
 
 @triton.jit
-def _attn_fwd_ws_kernel(sm_scale, M,  #
-                        Z, H, desc_q, desc_k, desc_v, desc_o, N_CTX,  #
-                        HEAD_DIM: tl.constexpr,  #
-                        BLOCK_M: tl.constexpr,  #
-                        BLOCK_N: tl.constexpr,  #
-                        STAGE: tl.constexpr,  #
-                        NUM_BUFFERS_Q: tl.constexpr,  #
-                        NUM_BUFFERS_KV: tl.constexpr,  #
-                        NUM_BUFFERS_QK: tl.constexpr,  #
-                        NUM_MMA_GROUPS: tl.constexpr,  #
-                        NUM_MMA_SLICES: tl.constexpr,  #
-                        GROUP_SIZE_N: tl.constexpr,  #
-                        RESCALE_OPT: tl.constexpr,  #
-                        USE_WHERE: tl.constexpr,  #
-                        USE_WARP_BARRIER: tl.constexpr,  #
-                        NUM_CTAS: tl.constexpr = 1,  #
-                        ):
+def _attn_fwd_ws_kernel(
+    sm_scale,
+    M,  #
+    Z,
+    H,
+    desc_q,
+    desc_k,
+    desc_v,
+    desc_o,
+    N_CTX,  #
+    HEAD_DIM: tl.constexpr,  #
+    BLOCK_M: tl.constexpr,  #
+    BLOCK_N: tl.constexpr,  #
+    STAGE: tl.constexpr,  #
+    NUM_BUFFERS_Q: tl.constexpr,  #
+    NUM_BUFFERS_KV: tl.constexpr,  #
+    NUM_BUFFERS_QK: tl.constexpr,  #
+    NUM_MMA_GROUPS: tl.constexpr,  #
+    NUM_MMA_SLICES: tl.constexpr,  #
+    GROUP_SIZE_N: tl.constexpr,  #
+    RESCALE_OPT: tl.constexpr,  #
+    USE_WHERE: tl.constexpr,  #
+    USE_WARP_BARRIER: tl.constexpr,  #
+    NUM_CTAS: tl.constexpr = 1,  #
+    PIPELINED: tl.constexpr = False,
+    POLICY: tl.constexpr = POLICY_DENSE,
+    DENSE_REGS: tl.constexpr = 200,
+):
     tl.static_assert(NUM_MMA_GROUPS == 2)
     tl.static_assert(NUM_BUFFERS_QK == 1)
     tl.static_assert(NUM_BUFFERS_Q == 1)
@@ -1118,7 +1161,7 @@ def _attn_fwd_ws_kernel(sm_scale, M,  #
                     group_id = cid
                 offs_m = (start_m * EFFECTIVE_BLOCK_M) + ((group_id * BLOCK_M_SPLIT) + tl.arange(0, BLOCK_M_SPLIT))
                 if STAGE & 1:
-                    m_i, l_i, accum_cnt_qk = _softmax_inner_loop(
+                    m_i, l_i, accum_cnt_qk = _fwd_softmax_tile(
                         qk_fulls,
                         qk_tiles,
                         p_fulls,
@@ -1144,7 +1187,7 @@ def _attn_fwd_ws_kernel(sm_scale, M,  #
                         USE_2CTA=USE_2CTA,
                     )
                 if STAGE & 2:
-                    m_i, l_i, accum_cnt_qk = _softmax_inner_loop(
+                    m_i, l_i, accum_cnt_qk = _fwd_softmax_tile(
                         qk_fulls,
                         qk_tiles,
                         p_fulls,
@@ -1254,6 +1297,10 @@ def _attn_fwd_ws_kernel(sm_scale, M,  #
                         NUM_BUFFERS_Q,
                         NUM_BUFFERS_KV,
                         NUM_MMA_SLICES,
+                        None,
+                        None,
+                        None,
+                        False,
                     )
                 tile_count += 1
                 tile_id = tlx.clc_consumer(clc_context, clc_phase_consumer, multi_ctas=USE_2CTA)
@@ -3404,6 +3451,15 @@ def _attn_bwd_ws(
         #     pass
 
 
+def _select_forward_plan(causal):
+    return ForwardPlan(
+        stage=3 if causal else 1,
+        pipelined=False,
+        policy=int(Policy.DENSE),
+        dense_regs=200,
+    )
+
+
 class _attention(torch.autograd.Function):
 
     @staticmethod
@@ -3413,7 +3469,7 @@ class _attention(torch.autograd.Function):
         assert HEAD_DIM_Q == HEAD_DIM_K and HEAD_DIM_K == HEAD_DIM_V
         assert HEAD_DIM_K in {16, 32, 64, 128, 256}
 
-        stage = 3 if causal else 1
+        plan = _select_forward_plan(causal)
 
         o = torch.empty_like(q)
         extra_kern_args = {}
@@ -3422,7 +3478,7 @@ class _attention(torch.autograd.Function):
         # Note that on Hopper we cannot perform a FP8 dot with a non-transposed second tensor
         y_dim = q.shape[0] * q.shape[1] * q.shape[2]
 
-        dummy_block = [1, 1]
+        dummy_block = [128, HEAD_DIM_K] if plan.pipelined else [1, 1]
         desc_q = TensorDescriptor(
             q,
             shape=[y_dim, HEAD_DIM_K],
@@ -3453,27 +3509,64 @@ class _attention(torch.autograd.Function):
 
         triton.set_allocator(alloc_fn)
 
-        def grid(META):
-            num_ctas = META.get("NUM_CTAS") or 1
-            n_ctas = triton.cdiv(q.shape[2], META["BLOCK_M"]) * q.shape[0] * q.shape[1]
-            n_ctas = triton.cdiv(n_ctas, num_ctas) * num_ctas
-            return (n_ctas, )
+        if plan.pipelined:
+            grid = (triton.cdiv(q.shape[2], FWD_BLOCK_M.value) * q.shape[0] * q.shape[1], )
+            _attn_fwd_ws.fn[grid](
+                sm_scale,
+                M,  #
+                q.shape[0],
+                q.shape[1],  #
+                desc_q,
+                desc_k,
+                desc_v,
+                desc_o,  #
+                N_CTX=q.shape[2],  #
+                HEAD_DIM=HEAD_DIM_K,  #
+                BLOCK_M=256,
+                BLOCK_N=128,
+                STAGE=plan.stage,  #
+                NUM_BUFFERS_Q=1,
+                NUM_BUFFERS_KV=3 if HEAD_DIM_K == 128 else 6,
+                NUM_BUFFERS_QK=1,
+                NUM_MMA_GROUPS=2,
+                NUM_MMA_SLICES=(2 if HEAD_DIM_K == 128 or (q.dtype != torch.float16 and plan.policy in (1, 2)) else 4),
+                GROUP_SIZE_N=4 if plan.policy == 1 else 1,
+                RESCALE_OPT=False,
+                USE_WHERE=False,
+                USE_WARP_BARRIER=True,
+                NUM_CTAS=1,
+                PIPELINED=True,
+                POLICY=plan.policy,
+                DENSE_REGS=plan.dense_regs,
+                num_stages=1,
+                num_warps=4,
+                **extra_kern_args,
+            )
+        else:
 
+            def grid(META):
+                num_ctas = META.get("NUM_CTAS") or 1
+                n_ctas = triton.cdiv(q.shape[2], META["BLOCK_M"]) * q.shape[0] * q.shape[1]
+                return (triton.cdiv(n_ctas, num_ctas) * num_ctas, )
+
+            _attn_fwd_ws[grid](
+                sm_scale,
+                M,
+                q.shape[0],
+                q.shape[1],
+                desc_q,
+                desc_k,
+                desc_v,
+                desc_o,
+                N_CTX=q.shape[2],
+                HEAD_DIM=HEAD_DIM_K,
+                STAGE=plan.stage,
+                PIPELINED=False,
+                POLICY=plan.policy,
+                DENSE_REGS=plan.dense_regs,
+                **extra_kern_args,
+            )
         ctx.grid = grid
-        _attn_fwd_ws[grid](
-            sm_scale,
-            M,  #
-            q.shape[0],
-            q.shape[1],  #
-            desc_q,
-            desc_k,
-            desc_v,
-            desc_o,  #
-            N_CTX=q.shape[2],  #
-            HEAD_DIM=HEAD_DIM_K,  #
-            STAGE=stage,  #
-            **extra_kern_args,
-        )
 
         ctx.save_for_backward(q, k, v, o, M)
         ctx.sm_scale = sm_scale
