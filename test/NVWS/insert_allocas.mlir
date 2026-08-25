@@ -18,7 +18,7 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
   // SMEM-LABEL: tt.func @warp_specialize_tma_matmul
   // SMEM: [[LHS:%.*]] = ttg.local_alloc : () -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
   // SMEM: [[RHS:%.*]] = ttg.local_alloc : () -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
-  // SMEM: nvws.descriptor_load {{.*}} [[LHS]] {loop.cluster = 1 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 2>}
+  // SMEM: nvws.descriptor_load {{.*}} [[LHS]] {loop.cluster = 1 : i32, loop.stage = 0 : i32, multicast = false, ttg.partition = array<i32: 2>}
   // SMEM: [[RHS_CONSUMER:%.*]] = ttg.memdesc_trans [[RHS]] {loop.cluster = 0 : i32, loop.stage = 1 : i32, order = array<i32: 1, 0>, ttg.partition = array<i32: 1>} : !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> !ttg.memdesc<64x128xf16, #shared1, #smem, mutable>
   tt.func @warp_specialize_tma_matmul(%arg0: i32, %arg1: i32, %arg2: i32, %arg3: !tt.tensordesc<128x64xf16, #shared>, %arg4: !tt.tensordesc<128x64xf16, #shared>) {
     %true = arith.constant true
