@@ -90,19 +90,17 @@ fp8_attention:
 gather_gemv:
   report: true
   disabled_devices:
-    - hip
+   - hip
+# TODO: jagged_softmax will CPU OOM and cancel the entire workflow
 jagged_softmax:
   report: true
-  disabled_devices:
-    - hip
 jagged_mean:
   report: true
   disabled_devices:
     - hip
+# TODO: jagged_sum will CPU OOM and cancel the entire workflow
 jagged_sum:
   report: true
-  disabled_devices:
-    - hip
 # TODO: embedding, flash_attention will segfault on hip
 embedding:
   report: true
