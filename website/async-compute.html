@@ -3,15 +3,17 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="description" content="Issue and coordinate asynchronous tensor-core work.">
-  <title>Async tensor core operations · FBTriton</title>
-  <link rel="stylesheet" href="assets/tlx.css?v=20260821b">
+  <meta name="description" content="Issue and schedule synchronous and asynchronous tensor-core work.">
+  <title>Tensor core operations · FBTriton</title>
+  <link rel="stylesheet" href="assets/tlx.css?v=20260824a">
 </head>
 <body>
   <header class="topbar">
-    <a class="brand" href="../"><span>FB</span>Triton</a>
+    <a class="brand" href="../"><span>FBTriton</span></a>
     <nav class="topnav" aria-label="Top-level sections"><a href="triton.html">Triton</a>
 <a href="tlx.html" data-current="true">TLX</a>
+<a href="torchtlx.html">torchTLX</a>
+<a href="ci.html">CI</a>
 <a href="tooling.html">Tooling</a></nav>
     <a class="repo-link" href="https://github.com/facebookexperimental/triton" target="_blank" rel="noreferrer">View on GitHub ↗</a>
   </header>
@@ -22,10 +24,13 @@
 <a href="getting-started.html">Getting started</a>
 <a href="hardware-support.html">Hardware support</a>
 <a href="buffers.html">Local and remote buffers</a>
+<a href="global-memory.html">Global memory access</a>
 <a href="async-memory.html">Async memory access</a>
-<a href="async-compute.html" aria-current="page">Async tensor core operations</a>
-<a href="synchronization.html">Barriers and Cluster Launch Control</a>
-<a href="warp-specialization.html">Warp specialization and clustering</a>
+<a href="async-compute.html" aria-current="page">Tensor core operations</a>
+<a href="synchronization.html">Barriers and fences</a>
+<a href="warp-specialization.html">Warp specialization</a>
+<a href="clusters.html">Clusters and Cluster Launch Control</a>
+<a href="layouts.html">Layout control and diagnostics</a>
 <a href="utilities.html">Other operations</a>
 <a href="performance-optimization.html">Performance optimization</a>
 <a href="debugging.html">Debugging performance and numerics</a>
@@ -36,12 +41,12 @@
     </aside>
     <main>
       <p class="eyebrow">TLX documentation</p>
-      <h1>Async tensor core operations</h1>
-      <p class="lede">Issue and coordinate asynchronous tensor-core work.</p>
-      <article><div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>acc = tlx.async_dot(a[i], b[i], acc)</code> <strong>[Hopper+]</strong></div></div>
-<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>acc = tlx.async_dot(a_reg, b[i], acc)</code> <strong>[Hopper]</strong></div></div>
-<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>acc[i] = tlx.async_dot(a[i], b[i], acc[i], barrier)</code> <strong>[Blackwell]</strong></div></div>
-<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>acc[i] = tlx.async_dot_scaled(a[i], b[i], acc[i], a_scale[i], a_format, b_scale[i], b_format, use_acc, two_ctas, mBarriers)</code> <strong>[Blackwell]</strong></div></div>
+      <h1>Tensor core operations</h1>
+      <p class="lede">Issue and schedule synchronous and asynchronous tensor-core work.</p>
+      <article><div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>acc = tlx.async_dot(a[i], b[i], acc)</code> <strong>[sm90+]</strong></div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>acc = tlx.async_dot(a_reg, b[i], acc)</code> <strong>[sm90]</strong></div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>acc[i] = tlx.async_dot(a[i], b[i], acc[i], barrier)</code> <strong>[sm100]</strong></div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>acc[i] = tlx.async_dot_scaled(a[i], b[i], acc[i], a_scale[i], a_format, b_scale[i], b_format, use_acc, two_ctas, mBarriers)</code> <strong>[sm100]</strong></div></div>
 <p><strong>Parameters:</strong></p>
 <div class="list-item depth-2"><span aria-hidden="true">•</span><div><code>a[i]</code>: A tile in shared memory (FP8 format)</div></div>
 <div class="list-item depth-2"><span aria-hidden="true">•</span><div><code>b[i]</code>: B tile in shared memory (FP8 format)</div></div>
@@ -96,7 +101,7 @@
     a_scale_tmem = tlx.local_alloc((128, 8), tl.uint8, num=1, storage=tlx.storage_kind.tmem)
     b_scale_tmem = tlx.local_alloc((256, 4), tl.uint8, num=1, storage=tlx.storage_kind.tmem)</code></pre>
 <p>*Copying Scales from SMEM to TMEM:*</p>
-<p>Use <code>tlx.tmem_copy</code> <strong>[Blackwell]</strong> to efficiently transfer scale data from shared memory to tensor memory:</p>
+<p>Use <code>tlx.tmem_copy</code> <strong>[sm100]</strong> to efficiently transfer scale data from shared memory to tensor memory:</p>
 <pre><code class="language-python">    # Copy scales from SMEM to TMEM (asynchronous, uses tcgen05.cp instruction)
     tlx.tmem_copy(a_scale_smem, a_scale_tmem)
     tlx.tmem_copy(b_scale_smem, b_scale_tmem)</code></pre>
@@ -134,13 +139,54 @@
             use_acc=False,
         )</code></pre>
 <p><strong>Note:</strong> Multibuffering is automatically cancelled for scale buffers since TMEM scales don't support multibuffering. 3D allocations (1×M×K) are automatically flattened to 2D (M×K).</p>
-<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>acc = tlx.async_dot_wait(pendings, acc)</code> <strong>[Hopper+]</strong></div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>acc = tlx.async_dot_wait(pendings, acc)</code> <strong>[sm90+]</strong></div></div>
 <p>Wait for completion of prior asynchronous dot operations. The pendings argument indicates the number of in-flight operations not completed.</p>
 <p>Example:</p>
 <pre><code class="language-python">    acc = tlx.async_dot(a_smem, b_smem)
     acc = tlx.async_dot_wait(tl.constexpr(0), acc)
-    tl.store(C_ptrs, acc)</code></pre></article>
-<footer class="pager"><a href="async-memory.html">← Async memory access</a><a class="next" href="synchronization.html">Barriers and Cluster Launch Control →</a></footer>
+    tl.store(C_ptrs, acc)</code></pre>
+<h2 id="explicit-mfma-scheduling">Explicit MFMA scheduling</h2>
+<blockquote><p><strong>[gfx950]</strong> — the source-scheduled operations are restricted to CDNA4 (<code>gfx950</code>) native BF16 MFMA layouts.</p></blockquote>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tl.dot(a, b, acc)</code> preserves a TLX-pinned accumulator layout, so whole dots</div></div>
+<p>need no AMD-specific wrapper.</p>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.extract_slice(source, shape, offsets)</code> selects an aligned register</div></div>
+<p>fragment without cross-thread movement.</p>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.rematerialized_range(start, end, anchor, placement=None)</code> recreates</div></div>
+<p>inexpensive distributed coordinates near a use instead of carrying them through a long software pipeline.</p>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.amd_register_resident(value, register_class=&quot;agpr&quot;, registers_per_group=1)</code></div></div>
+<p>keeps every native-register group in one allocator-visible whole-tensor residency interval.</p>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.amd_register_handoff(value, register_class=&quot;vgpr&quot;)</code> starts an</div></div>
+<p>independent allocation interval for each 32-bit native register value, shortening a local live range without requiring simultaneous whole-tensor residency. Both register-boundary operations accept <code>&quot;vgpr&quot;</code> or <code>&quot;agpr&quot;</code>; <code>amd_register_resident</code> additionally accepts a power-of-two <code>registers_per_group</code> from 1 through 32.</p>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.amd_scheduled_mfma(...)</code> exposes independent native MFMA accumulator</div></div>
+<p>chains in deterministic N-major, M-minor, K-reduction source order.</p>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.amd_mfma_commit(value, preserve)</code> applies the CDNA4 MFMA result hazard</div></div>
+<p>boundary while threading a live dot-operand dependency.</p>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.amd_sched_barrier(mask=0)</code> prevents selected AMD machine-instruction</div></div>
+<p>classes from crossing a source boundary. It is a scheduling marker, not a workgroup barrier or memory fence.</p>
+<p>These primitives describe fragments, lifetimes, and ordering without assigning physical registers. Their verifiers reject unsupported targets, layouts, element types, and native fragment widths before lowering.</p>
+<p>Unlike <code>tl.dot</code>, <code>amd_scheduled_mfma</code> carries an explicit <code>accumulator_role</code>. <code>transient</code> selects the latency-aware intrinsic path for phase-local work; <code>persistent</code> selects register-constrained lowering for a chain carried across phases. Neither role changes the numerical matrix operation.</p>
+<h2 id="scaled-dot">Scaled dot</h2>
+<p><code>tlx.dot_scaled(lhs, lhs_scale, lhs_format, rhs, rhs_scale, rhs_format, acc=None, *, fast_math=False, lhs_k_pack=True, rhs_k_pack=True, out_dtype=tl.float32, tiles_per_warp=None)</code> is a thin wrapper around <code>tl.dot_scaled</code>. Without <code>tiles_per_warp</code> it is exactly equivalent to <code>tl.dot_scaled</code> — pass it only when you need the AMD-specific WMMA scheduling hint described below.</p>
+<h3 id="tiles-per-warp-what-it-controls"><code>tiles_per_warp</code> — what it controls</h3>
+<table><thead><tr><th>Concept</th><th>Controlled by</th><th>What it means</th></tr></thead><tbody><tr><td><strong>Warp distribution</strong></td><td><code>warpsPerCTA</code> (chosen automatically by <code>AccelerateAMDMatmul::planWarps</code>)</td><td>How the total result tile is split *across* warps along M/N.</td></tr><tr><td><strong>Per-warp tiling</strong></td><td><code>tiles_per_warp</code> (this hint)</td><td>How many <code>instrShape</code>-sized WMMA tiles *each warp* covers contiguously before the layout repeats.</td></tr></tbody></table>
+<p>So <code>tiles_per_warp=[2, 2]</code> does <strong>not</strong> mean "distribute 4 tiles across 4 warps." It means *each* warp emits a 2×2 block of WMMA instruction tiles, holding the corresponding 2×2 accumulator registers. Concretely, for a <code>tt.dot_scaled</code> lowered to gfx1250 WMMA (<code>instrShape = [16, 16, K]</code>), 4 warps, <code>warpsPerCTA = [2, 2]</code>:</p>
+<table><thead><tr><th><code>tiles_per_warp</code></th><th>Per-warp coverage (M × N)</th><th>Per-CTA coverage before repeat (M × N)</th></tr></thead><tbody><tr><td><code>[1, 1]</code> (default)</td><td><code>16 × 16</code></td><td><code>32 × 32</code></td></tr><tr><td><code>[2, 2]</code></td><td><code>32 × 32</code></td><td><code>64 × 64</code></td></tr></tbody></table>
+<p>For a <code>256 × 256</code> result, <code>[1, 1]</code> repeats the layout <code>8 × 8</code> times, <code>[2, 2]</code> repeats it <code>4 × 4</code>. Larger <code>tiles_per_warp</code> gives each warp more contiguous accumulator state (better register reuse for preshuffled MXFP scales, fewer warp-level reductions), at the cost of more registers per warp.</p>
+<p>Together, <code>instrShape</code>, <code>warpsPerCTA</code>, and <code>tiles_per_warp</code> define the M/N extent of one CTA-level WMMA layout period: <code>period[d] = instrShape[d] * warpsPerCTA[d] * tiles_per_warp[d]</code>. If the result tile is larger than this period, the period repeats. The K entry of <code>instrShape</code> is the per-instruction reduction depth and is handled separately from this M/N tiling.</p>
+<p><code>tiles_per_warp</code> is validated by <code>AccelerateAMDMatmul</code>: it must have one entry per result-tile dim, each entry must be positive, and <code>instrShape[d] * warpsPerCTA[d] * tiles_per_warp[d]</code> must fit in the result tile shape.</p>
+<h3 id="example-tiles-per-warp">Example: <code>tiles_per_warp</code></h3>
+<pre><code class="language-python">import triton.language.extra.tlx as tlx
+
+acc = tlx.dot_scaled(
+    a, a_scale, &quot;e5m2&quot;,
+    b, b_scale, &quot;e5m2&quot;,
+    acc,
+    tiles_per_warp=[2, 2],   # pack 2x2 WMMA tiles per warp for preshuffled MXFP
+)</code></pre>
+<h3 id="mechanism-for-ir-level-users">Mechanism (for IR-level users)</h3>
+<p>The wrapper attaches <code>amdg.wmma_tiles_per_warp = array&lt;i32: m, n&gt;</code> on the resulting <code>tt.dot_scaled</code> op. <code>ScaledBlockedToScaledWMMAF8F6F4</code> reads the attribute and substitutes <code>m, n</code> for the default <code>1, 1</code> when building the WMMA encoding. Setting the attribute directly on a <code>tt.dot[_scaled]</code> op in MLIR has the same effect; the wrapper just spares Python kernels from hand-poking attributes.</p>
+<p>Currently consumed only by the scaled-WMMA pattern (gfx1250). Regular <code>tt.dot</code> WMMA and the MFMA patterns do not read it.</p></article>
+<footer class="pager"><a href="async-memory.html">← Async memory access</a><a class="next" href="synchronization.html">Barriers and fences →</a></footer>
     </main>
   </div>
 </body>

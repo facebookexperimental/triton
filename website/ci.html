@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Workflows, runners, nightly failure handling, and per-project test coverage.">
+  <title>CI · FBTriton</title>
+  <link rel="stylesheet" href="assets/tlx.css?v=20260824a">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="../"><span>FBTriton</span></a>
+    <nav class="topnav" aria-label="Top-level sections"><a href="triton.html">Triton</a>
+<a href="tlx.html">TLX</a>
+<a href="torchtlx.html">torchTLX</a>
+<a href="ci.html" data-current="true">CI</a>
+<a href="tooling.html">Tooling</a></nav>
+    <a class="repo-link" href="https://github.com/facebookexperimental/triton" target="_blank" rel="noreferrer">View on GitHub ↗</a>
+  </header>
+  <div class="shell">
+<aside class="sidebar">
+      <p class="eyebrow">CI documentation</p>
+      <nav><a href="ci.html" aria-current="page">Overview</a>
+<a href="#gpu-test-workflows">GPU test workflows</a>
+<a href="#compiler-tests">Compiler tests</a>
+<a href="#pre-commit">Pre-commit</a>
+<a href="#nightlies-and-releases">Nightlies and releases</a>
+<a href="#nightly-failure-handling">Nightly failure handling</a>
+<a href="#tlx-amd-ci">TLX-AMD CI</a>
+<a href="#gluon">Gluon</a></nav>
+    </aside>
+    <main>
+      <p class="eyebrow">Continuous integration</p>
+      <h1>CI</h1>
+      <p class="lede">Workflows, runners, nightly failure handling, and per-project test coverage.</p>
+      <article><p>All workflows live in <a href="https://github.com/facebookexperimental/triton/tree/main/github/workflows/" target="_blank" rel="noreferrer"><code>.github/workflows/</code></a>. The GPU test workflows run on push, pull request, and a nightly schedule; nightly failures are filed as issues automatically.</p>
+<h2 id="gpu-test-workflows">GPU test workflows</h2>
+<table><thead><tr><th>Workflow</th><th>Runner</th><th>Jobs</th></tr></thead><tbody><tr><td><a href="https://github.com/facebookexperimental/triton/blob/main/github/workflows/b200.yml" target="_blank" rel="noreferrer"><code>b200.yml</code></a></td><td><code>nvidia-dgx-b200</code></td><td><code>b200-meta-triton-test</code>, <code>b200-tlx-test</code>, <code>b200-gluon-test</code></td></tr><tr><td><a href="https://github.com/facebookexperimental/triton/blob/main/github/workflows/h100.yml" target="_blank" rel="noreferrer"><code>h100.yml</code></a></td><td><code>linux-gcp-h100</code></td><td><code>h100-meta-triton-test</code>, <code>h100-tlx-test</code></td></tr><tr><td><a href="https://github.com/facebookexperimental/triton/blob/main/github/workflows/mi350.yml" target="_blank" rel="noreferrer"><code>mi350.yml</code></a></td><td><code>linux-fb-triton-mi350-1</code> (gfx950 / CDNA4)</td><td><code>mi350-meta-triton-test</code>, <code>mi350-tlx-test</code>, <code>mi350-gluon-test</code></td></tr><tr><td><a href="https://github.com/facebookexperimental/triton/blob/main/github/workflows/torchtlx.yml" target="_blank" rel="noreferrer"><code>torchtlx.yml</code></a></td><td><code>nvidia-dgx-b200</code>, <code>linux-fb-triton-mi350-1</code></td><td><code>b200-torchtlx-test</code>, <code>mi350-torchtlx-test</code></td></tr></tbody></table>
+<p>What each job class runs:</p>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><strong><code>*-meta-triton-test</code></strong> — TritonBench performance coverage, against</div></div>
+<p><a href="https://github.com/meta-pytorch/tritonbench" target="_blank" rel="noreferrer">meta-pytorch/tritonbench</a>. Skips are listed in <code>.ci/tritonbench/fbtriton_skip_tests.yaml</code>.</p>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><strong><code>*-tlx-test</code></strong> — TLX unit tests (<code>python/test/unit/language/test_tlx_*.py</code>),</div></div>
+<p>the tutorial correctness suite (<code>third_party/tlx/tutorials/testing/test_correctness.py</code>), and runtime unit tests. The <code>test_tlx_*.py</code> glob covers manual TLX (<code>tlx.async_tasks</code>) and structurally excludes the autoWS suites, which are tested separately.</p>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><strong><code>*-gluon-test</code></strong> — <code>pytest python/test/gluon/</code> (see <a href="#gluon">Gluon</a> below).</div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><strong><code>*-torchtlx-test</code></strong> — <code>test_torchtlx_templates.py</code> and</div></div>
+<p><code>test_torchtlx_fusions.py</code>, against a nightly PyTorch.</p>
+<h2 id="compiler-tests">Compiler tests</h2>
+<p><a href="https://github.com/facebookexperimental/triton/blob/main/github/workflows/compiler.yml" target="_blank" rel="noreferrer"><code>compiler.yml</code></a> runs the lit test suite (<code>lit-tests</code>) on <code>ubuntu-latest</code> — no GPU required. This is where compiler-side <a href="triton.html">AutoWS</a> coverage lives.</p>
+<p><a href="https://github.com/facebookexperimental/triton/blob/main/github/workflows/ci.yml" target="_blank" rel="noreferrer"><code>ci.yml</code></a> runs integration tests and pre-commit.</p>
+<h2 id="pre-commit">Pre-commit</h2>
+<p><a href="https://github.com/facebookexperimental/triton/blob/main/github/workflows/pre-commit.yml" target="_blank" rel="noreferrer"><code>pre-commit.yml</code></a> enforces formatting; <a href="https://github.com/facebookexperimental/triton/blob/main/github/workflows/pre-commit-autofix.yml" target="_blank" rel="noreferrer"><code>pre-commit-autofix.yml</code></a> can apply fixes on demand. Run it locally before pushing:</p>
+<pre><code class="language-bash">pre-commit run --all</code></pre>
+<h2 id="nightlies-and-releases">Nightlies and releases</h2>
+<table><thead><tr><th>Workflow</th><th>Purpose</th></tr></thead><tbody><tr><td><a href="https://github.com/facebookexperimental/triton/blob/main/github/workflows/nightly-fbtriton.yml" target="_blank" rel="noreferrer"><code>nightly-fbtriton.yml</code></a></td><td>Build and publish nightly <code>.dev</code> wheels</td></tr><tr><td><a href="https://github.com/facebookexperimental/triton/blob/main/github/workflows/wheels_fb.yml" target="_blank" rel="noreferrer"><code>wheels_fb.yml</code></a></td><td>Build fbtriton wheels (<code>TRITON_WHEEL_NAME=fbtriton</code>)</td></tr><tr><td><a href="https://github.com/facebookexperimental/triton/blob/main/github/workflows/publish_fbtriton.yml" target="_blank" rel="noreferrer"><code>publish_fbtriton.yml</code></a></td><td>Publish to PyPI</td></tr><tr><td><a href="https://github.com/facebookexperimental/triton/blob/main/github/workflows/create_release.yml" target="_blank" rel="noreferrer"><code>create_release.yml</code></a></td><td>Cut a release</td></tr><tr><td><a href="https://github.com/facebookexperimental/triton/blob/main/github/workflows/release-testing.yml" target="_blank" rel="noreferrer"><code>release-testing.yml</code></a></td><td>Release validation</td></tr><tr><td><a href="https://github.com/facebookexperimental/triton/blob/main/github/workflows/llvm-build.yml" target="_blank" rel="noreferrer"><code>llvm-build.yml</code></a></td><td>Build the pinned LLVM</td></tr><tr><td><a href="https://github.com/facebookexperimental/triton/blob/main/github/workflows/documentation.yml" target="_blank" rel="noreferrer"><code>documentation.yml</code></a></td><td>Build docs</td></tr></tbody></table>
+<h2 id="nightly-failure-handling">Nightly failure handling</h2>
+<p>Scheduled runs parse their JUnit output with <code>.github/scripts/parse_junit_failures.py</code> and bucket failures per job. Three workflows then act on that:</p>
+<table><thead><tr><th>Workflow</th><th>Purpose</th></tr></thead><tbody><tr><td><a href="https://github.com/facebookexperimental/triton/blob/main/github/workflows/report-nightly-failure.yml" target="_blank" rel="noreferrer"><code>report-nightly-failure.yml</code></a></td><td>File an issue for a nightly failure</td></tr><tr><td><a href="https://github.com/facebookexperimental/triton/blob/main/github/workflows/reconcile-nightly-issues.yml" target="_blank" rel="noreferrer"><code>reconcile-nightly-issues.yml</code></a></td><td>Close issues that no longer reproduce</td></tr><tr><td><a href="https://github.com/facebookexperimental/triton/blob/main/github/workflows/bisect-nightly-failure.yml" target="_blank" rel="noreferrer"><code>bisect-nightly-failure.yml</code></a></td><td>Bisect a nightly failure (manual dispatch)</td></tr></tbody></table>
+<h2 id="tlx-amd-ci">TLX-AMD CI</h2>
+<p>AMD tutorial kernels are exercised by <a href="https://github.com/facebookexperimental/triton/blob/main/github/workflows/mi350.yml" target="_blank" rel="noreferrer"><code>mi350.yml</code></a> on a gfx950 (MI350 / CDNA4) runner, mirroring the H100 job in <a href="https://github.com/facebookexperimental/triton/blob/main/github/workflows/h100.yml" target="_blank" rel="noreferrer"><code>h100.yml</code></a>:</p>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><strong><code>mi350-tlx-test</code></strong> — TLX unit tests (<code>python/test/unit/language/test_tlx_*.py</code>)</div></div>
+<p>plus the tutorial correctness suite (<code>third_party/tlx/tutorials/testing/test_correctness.py</code>). AMD and IKBO cases run; Hopper/Blackwell and gfx1250 cases auto-skip via the arch gates.</p>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><strong><code>mi350-meta-triton-test</code></strong> — TritonBench performance coverage (the AMD perf</div></div>
+<p>scripts in <a href="https://github.com/facebookexperimental/triton/blob/main/install-and-test.html#testing" target="_blank" rel="noreferrer">TLX &amp;rsaquo; Testing</a> are for local runs; perf-regression tracking lives in TritonBench).</p>
+<p>Both run on push, PR, and the nightly schedule; nightly failures are filed as issues via <code>report-nightly-failure.yml</code>.</p>
+<h2 id="gluon">Gluon</h2>
+<p><a href="https://github.com/triton-lang/triton/tree/main/python/triton/experimental/gluon" target="_blank" rel="noreferrer">Gluon</a> (<code>python/triton/experimental/gluon/</code>) is <strong>upstream-synced and not a first-class DSL</strong> here (TLX is the focus) — do Gluon feature/bug work upstream, not in this fork. But since fbtriton is a secondary Triton, we run <strong>fundamental Gluon CI</strong> so we don't silently break it.</p>
+<p><strong>CI:</strong> the <code>b200-gluon-test</code> / <code>mi350-gluon-test</code> jobs run <code>pytest python/test/gluon/</code> (every <code>test_*.py</code>). It is <strong>green</strong>: ~200 passed, ~1600 skipped, 0 failed. The real signal is the compile-only, target-agnostic frontend suite (<code>test_frontend.py</code>, one run covers NVIDIA + AMD codegen via mock <code>GPUTarget</code>); the version-skewed cases below are skipped via <code>python/test/gluon/conftest.py</code> rather than failing the job.</p>
+<p><strong>Fork-side fixes</strong> (Gluon frontend itself unmodified): <code>core.py</code> reduce <code>reduction_ordering</code> compat, <code>semantic.py</code> <code>dot()</code> <code>allow_tf32</code> default, a <code>test_core.py</code> collection fix (a bad cherry-pick left an <code>IndentationError</code>), and regenerated <code>test_frontend.py</code> goldens (upstream-synced — overwritten on next sync).</p>
+<p><strong>Skipped, needs upstream Gluon re-sync — TODO(gluon-ci):</strong> the GPU-execution suites (<code>test_core</code>, <code>test_lowerings</code>, <code>test_consan</code>, <code>test_fpsan</code>, one kernel in <code>test_layout_format_view</code>) were synced from much newer upstream (e.g. <code>test_fpsan.py</code> via bundle #1956) than the pinned Gluon frontend (<code>_semantic.py</code> ~2026-06-29). They require Gluon behavior the frontend doesn't have yet — raw pointer <code>gl.load</code>/<code>gl.store</code> inferring a *distributed* layout — so they fail wholesale with <code>expected ... distributed_type but got block_type</code>. The fix is to sync the Gluon frontend forward (upstream cherry-pick / re-sync), not a local patch. Also skipped: ~9 frontend per-target golden tests (single inline golden can't match every parametrized target) and the <code>create_lds_barrier_wait</code> pybind mismatch. <code>conftest.py</code> lists these; remove/trim it after the re-sync.</p></article>
+<footer class="pager"><a href="torchtlx.html">← torchTLX</a><a class="next" href="tooling.html">Tooling →</a></footer>
+    </main>
+  </div>
+</body>
+</html>

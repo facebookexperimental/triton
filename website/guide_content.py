@@ -5,7 +5,7 @@ GUIDE_CONTENT = {
     r"""
 # Overview
 
-This site covers three connected parts of Meta's work: the Triton compiler, the TLX low-level programming model, and the tools used to understand and improve generated GPU kernels.
+This site covers four connected parts of Meta's work: the Triton compiler, the TLX low-level programming model, the torchTLX path that brings TLX kernels into PyTorch 2, and the tools used to understand and improve generated GPU kernels.
 
 ## News
 
@@ -24,6 +24,8 @@ This site covers three connected parts of Meta's work: the Triton compiler, the 
 |---|---|
 | [Triton](website/triton.html) | Compiler-managed performance portability, including automatic warp specialization and its roadmap |
 | [TLX](website/tlx.html) | Explicit warp-group orchestration, asynchronous memory and tensor-core operations, barriers, and hardware-specific kernel development |
+| [torchTLX](website/torchtlx.html) | TLX-backed Inductor templates, epilogue fusion, and the PyTorch 2 integration path |
+| [CI](website/ci.html) | Workflows, runners, nightly failure handling, and per-project test coverage |
 | [Tooling](website/tooling.html) | Compilation tracing, profiling, runtime diagnostics, sanitizers, and benchmarking |
 
 ### Triton
@@ -33,6 +35,14 @@ Triton is a compiler and language for writing performance-portable AI kernels wi
 ### TLX
 
 TLX is a low-level Triton extension for explicit warp-group orchestration, asynchronous memory movement, tensor-core operations, barriers, tensor memory, and cluster execution across NVIDIA and AMD GPUs.
+
+### torchTLX
+
+torchTLX pushes TLX primitives into Inductor's template and fusion infrastructure, so a PyTorch 2 program can select a TLX-backed GEMM or attention template and fuse epilogues into it without the user writing a kernel.
+
+### CI
+
+The CI section describes the GPU test workflows and the runners behind them, how nightly failures are filed, reconciled, and bisected, and what coverage each project has.
 
 ### Tooling
 

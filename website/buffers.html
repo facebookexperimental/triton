@@ -5,13 +5,15 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="description" content="Allocate, view, load, store, and share hardware-near buffers.">
   <title>Local and remote buffers · FBTriton</title>
-  <link rel="stylesheet" href="assets/tlx.css?v=20260821b">
+  <link rel="stylesheet" href="assets/tlx.css?v=20260824a">
 </head>
 <body>
   <header class="topbar">
-    <a class="brand" href="../"><span>FB</span>Triton</a>
+    <a class="brand" href="../"><span>FBTriton</span></a>
     <nav class="topnav" aria-label="Top-level sections"><a href="triton.html">Triton</a>
 <a href="tlx.html" data-current="true">TLX</a>
+<a href="torchtlx.html">torchTLX</a>
+<a href="ci.html">CI</a>
 <a href="tooling.html">Tooling</a></nav>
     <a class="repo-link" href="https://github.com/facebookexperimental/triton" target="_blank" rel="noreferrer">View on GitHub ↗</a>
   </header>
@@ -22,10 +24,13 @@
 <a href="getting-started.html">Getting started</a>
 <a href="hardware-support.html">Hardware support</a>
 <a href="buffers.html" aria-current="page">Local and remote buffers</a>
+<a href="global-memory.html">Global memory access</a>
 <a href="async-memory.html">Async memory access</a>
-<a href="async-compute.html">Async tensor core operations</a>
-<a href="synchronization.html">Barriers and Cluster Launch Control</a>
-<a href="warp-specialization.html">Warp specialization and clustering</a>
+<a href="async-compute.html">Tensor core operations</a>
+<a href="synchronization.html">Barriers and fences</a>
+<a href="warp-specialization.html">Warp specialization</a>
+<a href="clusters.html">Clusters and Cluster Launch Control</a>
+<a href="layouts.html">Layout control and diagnostics</a>
 <a href="utilities.html">Other operations</a>
 <a href="performance-optimization.html">Performance optimization</a>
 <a href="debugging.html">Debugging performance and numerics</a>
@@ -38,32 +43,32 @@
       <p class="eyebrow">TLX documentation</p>
       <h1>Local and remote buffers</h1>
       <p class="lede">Allocate, view, load, store, and share hardware-near buffers.</p>
-      <article><blockquote><p><strong>Hardware availability tags.</strong> Each op below is tagged with the targets it runs on: <code>**[Hopper+]**</code> = NVIDIA Hopper and newer; <code>**[MI300+]**</code> = AMD MI300 (CDNA3) and MI350 (CDNA4); <code>**[MI350]**</code> = AMD MI350 (CDNA4) only. A trailing <code>?</code> (e.g. <code>**[MI300+?]**</code>) marks AMD availability that has <strong>not been confirmed yet</strong> and needs verification. Note: async copies (<code>async_load</code> and its commit/wait groups) and the AMD buffer ops require <strong>MI350</strong> — they are <strong>not</strong> available on MI300. <code>barrier_arrive</code> on AMD requires <code>arrive_count == 1</code>.</p></blockquote>
-<h3 id="local-buffer-operations">Local buffer operations</h3>
-<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>buffers = tlx.local_alloc(shape, dtype, NUM_BUFFERS)</code> <strong>[Hopper+, MI300+]</strong></div></div>
+      <article><h2 id="local-buffers">Local buffers</h2>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>buffers = tlx.local_alloc(shape, dtype, NUM_BUFFERS)</code> <strong>[sm90+, gfx942+]</strong></div></div>
 <p>Allocate <code>NUM_BUFFERS</code> buffers in local memory per thread block, each of the specified size. The memory layout is inferred from its consumers.</p>
-<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>buffers = tlx.local_alloc(shape, dtype, NUM_BUFFERS, tlx.storage_kind.tmem)</code> <strong>[Blackwell]</strong></div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>buffers = tlx.local_alloc(shape, dtype, NUM_BUFFERS, tlx.storage_kind.tmem)</code> <strong>[sm100]</strong></div></div>
 <p>Allocate <code>NUM_BUFFERS</code> of buffers in the tensor memory per thread block, each with size size. The memory layout is inferred from its consumers.</p>
-<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>buffers = tlx.local_alloc(shape, dtype, NUM_BUFFERS, reuse=other_buffers)</code> <strong>[Hopper+, MI300+]</strong></div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>buffers = tlx.local_alloc(shape, dtype, NUM_BUFFERS, reuse=other_buffers)</code> <strong>[sm90+, gfx942+]</strong></div></div>
 <p>Alias this allocation to an existing <code>buffered_tensor</code> so multiple logical buffers reuse the same underlying local storage (SMEM or TMEM) without reallocation.</p>
-<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>buffer = tlx.local_view(buffers, buffer_idx)</code> or <code>buffer = buffers[buffer_idx]</code> <strong>[Hopper+, MI300+]</strong></div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>buffer = tlx.local_view(buffers, buffer_idx)</code> or <code>buffer = buffers[buffer_idx]</code> <strong>[sm90+, gfx942+]</strong></div></div>
 <p>Return a subview of the buffer indexed by <code>buffer_idx</code> from <code>buffers</code>. Both the explicit <code>local_view()</code> call and the indexing syntax <code>[]</code> are supported.</p>
-<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>distributed_tensor = tlx.local_load(buffer, token=None, layout=None, relaxed=False, rematerialize_coordinates=False, rematerialize_coordinates_group=None)</code> <strong>[Hopper+, MI300+]</strong></div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>distributed_tensor = tlx.local_load(buffer, token=None, layout=None, relaxed=False, rematerialize_coordinates=False, rematerialize_coordinates_group=None)</code> <strong>[sm90+, gfx942+]</strong></div></div>
 <p>Loads the buffer from local or tensor memory. <code>layout</code> pins a requested register layout. On AMD, the rematerialization options start fresh address coordinate live ranges either per load or for a named group of nearby loads; the two options are mutually exclusive.</p>
-<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.local_store(buffer, distributed_tensor)</code> <strong>[Hopper+, MI300+]</strong></div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.local_store(buffer, distributed_tensor)</code> <strong>[sm90+, gfx942+]</strong></div></div>
 <p>Store a distributed tensor into a buffer in local memory or tensor memory.</p>
-<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>distributed_tensor = tlx.local_gather(src, indices, axis, optional_token)</code> <strong>[Hopper+, MI300+?]</strong></div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>distributed_tensor = tlx.local_gather(src, indices, axis, optional_token)</code> <strong>[sm90+, gfx942+?]</strong></div></div>
 <p>Gather elements from shared memory along a specified axis using an indices tensor. The output shape matches the indices shape, and elements are gathered from <code>src</code> at positions specified by <code>indices</code> along the given <code>axis</code>.</p>
-<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.local_scatter(dst, src, indices, axis, optional_token)</code> <strong>[Hopper+, MI300+?]</strong></div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.local_scatter(dst, src, indices, axis, optional_token)</code> <strong>[sm90+, gfx942+?]</strong></div></div>
 <p>Scatter elements to shared memory along a specified axis using an indices tensor. Elements from <code>src</code> are written to <code>dst</code> at positions specified by <code>indices</code> along the given <code>axis</code>.</p>
-<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>buffer = tlx.local_trans(buffer, dims)</code> <strong>[Hopper+, MI300+]</strong></div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>buffer = tlx.local_trans(buffer, dims)</code> <strong>[sm90+, gfx942+]</strong></div></div>
 <p>Permutes the dimensions of a tensor.</p>
-<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>buffer = tlx.local_slice(buffer, offsets=[m, n], shapes=[M, N])</code> <strong>[Hopper+, MI300+]</strong></div></div>
-<p>Slice a <code>M x N</code> tensor at a <code>m x n</code> offset.</p>
-<h4 id="buffer-reuse">Buffer Reuse</h4>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>buffer = tlx.local_slice(buffer, offset=[m, n], shape=[M, N])</code> <strong>[sm90+, gfx942+]</strong></div></div>
+<p>Slice a tensor at the given logical offset. On gfx942+, SMEM offsets may be runtime scalar i32 tensors; <code>shape</code> remains constexpr. The caller must keep a runtime-offset view within the allocation and satisfy the same tile-alignment contract as a static slice; violating either condition is undefined behavior.</p>
+<h3 id="buffer-reuse">Buffer Reuse</h3>
 <p>TLX provides you the ability to reuse the same allocated buffer across multiple disjoint steps in your kernel. This is useful to allow additional pipelining when you may not have enough isolated SMEM or TMEM.</p>
-<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.storage_alias_spec(storage=storage_kind)</code> <strong>[Hopper+, MI300+]</strong></div></div>
-<p>Defines a buffer that you will want to share across multiple aliases. The storage can be either SMEM or TMEM. To use this in an allocation you should provide the spec in the <code>reuse</code> argument for <code>local_alloc</code>. Here is the example from the FA kernel.</p>
+<blockquote><p>For why this API replaced the older manual <code>reuse</code> parameter, and the design behind it, see <a href="https://github.com/facebookexperimental/triton/blob/main/third_party/tlx/doc/StorageAliasSpecAndSetBufferOverlap.md" target="_blank" rel="noreferrer"><code>storage_alias_spec</code> and <code>set_buffer_overlap</code></a>.</p></blockquote>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.storage_alias_spec(storage=storage_kind, buffer_size_bytes=None)</code> <strong>[sm90+, gfx942+]</strong></div></div>
+<p>Defines a buffer that you will want to share across multiple aliases. The storage can be either SMEM or TMEM (<code>smemCluster</code> is not supported). To use this in an allocation you should provide the spec in the <code>reuse</code> argument for <code>local_alloc</code>; that argument accepts either a <code>storage_alias_spec</code> or, for legacy callers, a <code>buffered_tensor</code>. <code>buffer_size_bytes</code> is an optional compile-time size — if omitted, the compiler uses the maximum across all referencing allocations. Here is the example from the FA kernel.</p>
 <pre><code># Create the storage alias spec for all shared buffers. Cannot be directly
 # indexed.
 qk_storage_alias = tlx.storage_alias_spec(storage=tlx.storage_kind.tmem)
@@ -90,9 +95,9 @@ m_tiles = tlx.local_alloc(
     (BLOCK_M_SPLIT, 1), tl.float32, NUM_MMA_GROUPS * NUM_BUFFERS_QK,
     tlx.storage_kind.tmem, reuse=qk_storage_alias,
 )</code></pre>
-<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.reuse_group(*tensors, group_type=REUSE_TYPE, group_size=SUBTILE_SIZE)</code> <strong>[Hopper+, MI300+]</strong></div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.reuse_group(*tensors, group_type=REUSE_TYPE, group_size=SUBTILE_SIZE)</code> <strong>[sm90+, gfx942+]</strong></div></div>
 <p>A reuse group expresses how you intend to access the shared buffer. There are two types: Shared or Distinct. A shared buffer wants to occupy the same memory and each index should not be accessed at the same time. A distinct buffer will be accessible at the same index at the same time. The compiler will isolate buffer locations and potentially expand the buffer allocation to enforce this guarantee, which is helpful with buffers of unequal sizes.</p>
-<p>The group_size is used to enable subtiling a buffer. This ensures that for every 1 index of a buffer that SUBTILE_SIZE indices of this other buffer/group can be accessed.  Reuse groups can be nested to allow expressing more complex relationships. Currently a reuse group is not applied unless you assign it to a buffer with <code>spec.set_buffer_overlap</code>.</p>
+<p>The group_size is used to enable subtiling a buffer. This ensures that for every 1 index of a buffer that SUBTILE_SIZE indices of this other buffer/group can be accessed.  Reuse groups can be nested to allow expressing more complex relationships. Currently a reuse group is not applied unless you assign it to a buffer with <code>spec.set_buffer_overlap</code>, whose leaf nodes must all be <code>buffered_tensor</code>s allocated from that same spec.</p>
 <p>Here is the example implementation for Flash Attention. In this kernel as the comment suggests, QK is shared with P, l, m, and alpha, and P is potentially subtiling.</p>
 <pre><code># Define the buffer overlap strategy:
 #   QK : |                                                   BLK_M/2 * BLOCK_N * fp32                         |
@@ -111,16 +116,10 @@ qk_storage_alias.set_buffer_overlap(
         group_type=tlx.reuse_group_type.shared,
     )
 )</code></pre>
-<p><strong>Compiler Pipeline Inspection Steps</strong> To introspect the pipeline <code>add_stages</code>, before running your kernels, simply set the add_stages_inspection_hook like so:</p>
-<pre><code class="language-python">def inspect_stages(_self, stages, options, language, capability):
-    # inspect or modify add_stages here
-triton.knobs.runtime.add_stages_inspection_hook = inspect_stages</code></pre>
-<p>Examples of how to use this for out of tree plugin passes is <a href="https://github.com/facebookexperimental/triton/blob/main/lib/Plugins/README.md" target="_blank" rel="noreferrer">here</a></p>
-<p>Binary wheels are available for CPython 3.10-3.14.</p>
-<h3 id="remote-buffer-operations">Remote buffer operations</h3>
-<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>buffer = tlx.remote_view(buffer, remote_cta_rank)</code> <strong>[Hopper+]</strong></div></div>
+<h2 id="remote-buffers">Remote buffers</h2>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>buffer = tlx.remote_view(buffer, remote_cta_rank)</code> <strong>[sm90+]</strong></div></div>
 <p>Return a remote view of the <code>buffer</code> living in another CTA in the same cluster with ID <code>remote_cta_rank</code>. NOTE: for now we only support barrier as <code>buffer</code>, not general SMEM.</p>
-<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.remote_shmem_store(dst, src, remote_cta_rank)</code> <strong>[Hopper+]</strong></div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.remote_shmem_store(dst, src, remote_cta_rank)</code> <strong>[sm90+]</strong></div></div>
 <p>Store a distributed tensor into a buffer in the remote shared memory of a cluster (synchronous).</p>
 <p><strong>Parameters:</strong></p>
 <div class="list-item depth-1"><span aria-hidden="true">•</span><div><code>dst</code>: The destination buffer in local shared memory (will be internally mapped to the remote CTA)</div></div>
@@ -132,7 +131,7 @@ triton.knobs.runtime.add_stages_inspection_hook = inspect_stages</code></pre>
 
   # Store to remote CTA&#x27;s shared memory (synchronous)
   tlx.remote_shmem_store(buffer[0], src_tensor, remote_cta_rank=1)</code></pre></article>
-<footer class="pager"><a href="hardware-support.html">← Hardware support</a><a class="next" href="async-memory.html">Async memory access →</a></footer>
+<footer class="pager"><a href="hardware-support.html">← Hardware support</a><a class="next" href="global-memory.html">Global memory access →</a></footer>
     </main>
   </div>
 </body>

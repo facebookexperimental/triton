@@ -6,8 +6,10 @@
   --text: #e8edf7;
   --muted: #a7b1c4;
   --line: #2b3854;
-  --accent: #77e1c2;
+  --accent: #4599ff;
   --accent-2: #9fb5ff;
+  --brand-bg: #1877f2;
+  --brand-fg: #ffffff;
   --code: #080c17;
   --max-width: 920px;
 }
@@ -62,14 +64,13 @@ a:hover {
 }
 
 .brand span {
-  background: var(--accent);
+  background: var(--brand-bg);
   border-radius: 6px;
-  color: #07110e;
+  color: var(--brand-fg);
   display: inline-block;
   font-weight: 850;
-  letter-spacing: 0.08em;
-  margin-right: 10px;
-  padding: 2px 8px;
+  letter-spacing: 0.04em;
+  padding: 2px 9px;
 }
 
 .repo-link {
@@ -340,8 +341,10 @@ th {
     --text: #172033;
     --muted: #526079;
     --line: #d8e0ec;
-    --accent: #087f68;
+    --accent: #1877f2;
     --accent-2: #345dcc;
+    --brand-bg: #1877f2;
+    --brand-fg: #ffffff;
     --code: #f0f4f9;
   }
 

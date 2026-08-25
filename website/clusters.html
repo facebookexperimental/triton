@@ -1,0 +1,197 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Cooperate across CTAs and distribute persistent work in hardware.">
+  <title>Clusters and Cluster Launch Control · FBTriton</title>
+  <link rel="stylesheet" href="assets/tlx.css?v=20260824a">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="../"><span>FBTriton</span></a>
+    <nav class="topnav" aria-label="Top-level sections"><a href="triton.html">Triton</a>
+<a href="tlx.html" data-current="true">TLX</a>
+<a href="torchtlx.html">torchTLX</a>
+<a href="ci.html">CI</a>
+<a href="tooling.html">Tooling</a></nav>
+    <a class="repo-link" href="https://github.com/facebookexperimental/triton" target="_blank" rel="noreferrer">View on GitHub ↗</a>
+  </header>
+  <div class="shell">
+<aside class="sidebar">
+      <p class="eyebrow">TLX documentation</p>
+      <nav><a href="tlx.html">Overview</a>
+<a href="getting-started.html">Getting started</a>
+<a href="hardware-support.html">Hardware support</a>
+<a href="buffers.html">Local and remote buffers</a>
+<a href="global-memory.html">Global memory access</a>
+<a href="async-memory.html">Async memory access</a>
+<a href="async-compute.html">Tensor core operations</a>
+<a href="synchronization.html">Barriers and fences</a>
+<a href="warp-specialization.html">Warp specialization</a>
+<a href="clusters.html" aria-current="page">Clusters and Cluster Launch Control</a>
+<a href="layouts.html">Layout control and diagnostics</a>
+<a href="utilities.html">Other operations</a>
+<a href="performance-optimization.html">Performance optimization</a>
+<a href="debugging.html">Debugging performance and numerics</a>
+<a href="kernels.html">Example kernels</a>
+<a href="production-case-studies.html">Production case studies</a>
+<a href="install-and-test.html">Build, install, and test</a>
+<a href="resources.html">More reading</a></nav>
+    </aside>
+    <main>
+      <p class="eyebrow">TLX documentation</p>
+      <h1>Clusters and Cluster Launch Control</h1>
+      <p class="lede">Cooperate across CTAs and distribute persistent work in hardware.</p>
+      <article><div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.cluster_cta_rank()</code> <strong>[sm90+]</strong></div></div>
+<p>Returns the rank (unique ID) of the current CTA within the cluster.</p>
+<p>TLX supports CUDA Thread Block Clustering (available on SM90+ Hopper/Blackwell GPUs) through the <code>ctas_per_cga</code> parameter. This provides explicit control over cluster dimensions for multi-CTA cooperative kernels.</p>
+<h4 id="usage">Usage</h4>
+<p>Pass <code>ctas_per_cga</code> as a tuple when launching a kernel:</p>
+<pre><code class="language-python">kernel[(grid_x, grid_y)](
+    ...,
+    ctas_per_cga=(2, 1, 1),  # 2x1x1 cluster of CTAs
+    **kwargs
+)</code></pre>
+<h4 id="using-ctas-per-cga-with-autotune">Using ctas_per_cga with Autotune</h4>
+<p>You can specify <code>ctas_per_cga</code> in <code>triton.Config</code> for autotuning:</p>
+<pre><code class="language-python">@triton.autotune(
+    configs=[
+        triton.Config(
+            {&quot;BLOCK_M&quot;: 128, &quot;BLOCK_N&quot;: 128},
+            num_warps=4,
+            ctas_per_cga=(2, 1, 1),  # 2x1x1 cluster
+        ),
+        triton.Config(
+            {&quot;BLOCK_M&quot;: 64, &quot;BLOCK_N&quot;: 64},
+            num_warps=4,
+            ctas_per_cga=(1, 1, 1),  # No clustering
+        ),
+    ],
+    key=[&quot;M&quot;, &quot;N&quot;, &quot;K&quot;],
+)
+@triton.jit
+def matmul_kernel(...):
+    ...</code></pre>
+<h4 id="tlx-vs-triton-semantics">TLX vs Triton Semantics</h4>
+<p>TLX uses <strong>CUDA-native cluster semantics</strong> which differs from Triton's approach:</p>
+<table><thead><tr><th>Aspect</th><th>Triton's way (<code>num_ctas</code>)</th><th>TLX way (<code>ctas_per_cga</code>)</th></tr></thead><tbody><tr><td>Grid interpretation</td><td>Grid × cluster_dims = total CTAs</td><td>Grid = total CTAs</td></tr><tr><td>Cluster definition</td><td>Multiplicative</td><td>Regrouping</td></tr><tr><td><code>num_ctas</code> value</td><td><code>product(cluster_dims)</code></td><td>Always 1</td></tr><tr><td><code>launch_cluster</code></td><td>Can be False (enabled by <code>num_ctas != 1</code>)</td><td>Always True</td></tr></tbody></table>
+<h2 id="cluster-launch-control-clc">Cluster Launch Control (CLC)</h2>
+<p>CLC (Cluster Launch Control) is a Blackwell-specific feature <strong>[sm100]</strong> that enables <strong>dynamic persistent kernel</strong> execution with efficient work stealing across thread blocks. It allows CTAs to dynamically acquire tile IDs from a hardware-managed work queue, enabling load balancing without explicit inter-CTA communication.</p>
+<h3 id="clc-api">CLC API</h3>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>context = tlx.clc_create_context(num_consumers=num_consumers)</code> <strong>[sm100]</strong></div></div>
+<p>Create a CLC pipeline context with the specified number of stages and expected consumer count.</p>
+<p><strong>Parameters:</strong></p>
+<div class="list-item depth-2"><span aria-hidden="true">•</span><div><code>num_consumers</code>: Number of consumers that will signal completion per tile (typically 3 async tasks × num_CTAs)</div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.clc_producer(context, p_producer=phase, multi_ctas=True)</code> <strong>[sm100]</strong></div></div>
+<p>Issue a CLC try_cancel request to acquire a new tile ID.</p>
+<p><strong>Parameters:</strong></p>
+<div class="list-item depth-2"><span aria-hidden="true">•</span><div><code>context</code>: CLC pipeline context from <code>clc_create_context</code></div></div>
+<div class="list-item depth-2"><span aria-hidden="true">•</span><div><code>phase</code>: Current barrier phase (0 or 1, alternates each iteration)</div></div>
+<div class="list-item depth-2"><span aria-hidden="true">•</span><div><code>multi_ctas</code>: Enables cluster-aware synchronization by default when the compilation options specify multiple CTAs. For a <code>(1, 1, 1)</code> cluster, the frontend emits the local single-CTA path. Set to <code>False</code> to request the local-only path explicitly.</div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tile_id = tlx.clc_consumer(context, p_consumer=phase, multi_ctas=True, k=0, return_3d=False)</code> <strong>[sm100]</strong></div></div>
+<p>Decode the tile ID from a CLC response and signal completion.</p>
+<p><strong>Parameters:</strong></p>
+<div class="list-item depth-2"><span aria-hidden="true">•</span><div><code>context</code>: CLC pipeline context from <code>clc_create_context</code></div></div>
+<div class="list-item depth-2"><span aria-hidden="true">•</span><div><code>phase</code>: Current barrier phase</div></div>
+<div class="list-item depth-2"><span aria-hidden="true">•</span><div><code>multi_ctas</code>: Enables cluster-aware synchronization by default when the compilation options specify multiple CTAs. For a <code>(1, 1, 1)</code> cluster, the frontend emits a local barrier arrival. Set to <code>False</code> to request the local-only path explicitly.</div></div>
+<div class="list-item depth-2"><span aria-hidden="true">•</span><div><code>return_3d</code>: Set to <code>True</code> to return <code>(ctaIdX, ctaIdY, ctaIdZ)</code> tuple instead of scalar tile_id.</div></div>
+<p><strong>Returns:</strong> The tile ID (offset by <code>cluster_cta_rank()</code> for unique tile assignments), or -1 if no work is available. With <code>return_3d=True</code>, returns <code>(ctaIdX, ctaIdY, ctaIdZ)</code>.</p>
+<h3 id="how-clc-works">How CLC Works</h3>
+<p>CLC uses hardware-assisted work stealing via the PTX instruction:</p>
+<pre><code>clusterlaunchcontrol.try_cancel.async.shared::cta.mbarrier::complete_tx::bytes.multicast::cluster::all.b128</code></pre>
+<p>The <code>.multicast::cluster::all</code> qualifier means the response is <strong>asynchronously written to all CTAs</strong> in the cluster. This enables efficient multi-CTA execution where all CTAs in a cluster receive the same base tile ID.</p>
+<h3 id="clc-synchronization-flow">CLC Synchronization Flow</h3>
+<pre><code>┌─────────────────────────────────────────────────────────────────┐
+│                    CLC Producer (clc_producer)                  │
+├─────────────────────────────────────────────────────────────────┤
+│  1. WAIT:   barrier_wait(bar_empty)      ← Wait for consumers   │
+│  2. EXPECT: barrier_expect_bytes(bar_full, 16)                  │
+│  3. ISSUE:  clc_issue(response, bar_full) ← Hardware request    │
+└─────────────────────────────────────────────────────────────────┘
+                              ↓
+                    [Hardware processes CLC]
+                    [Multicasts response to all CTAs]
+                              ↓
+┌─────────────────────────────────────────────────────────────────┐
+│                    CLC Consumer (clc_consumer)                  │
+├─────────────────────────────────────────────────────────────────┤
+│  1. WAIT:   barrier_wait(bar_full)       ← Wait for response    │
+│  2. QUERY:  tile_id = clc_query(response) ← Extract tile ID     │
+│  3. SIGNAL: barrier_arrive(bar_empty)    ← Release producer     │
+└─────────────────────────────────────────────────────────────────┘</code></pre>
+<h3 id="multi-cta-mode-2-cta-clusters">Multi-CTA Mode (2-CTA Clusters)</h3>
+<p>In multi-CTA mode (<code>multi_ctas=True</code>), multiple CTAs in a cluster work together on adjacent tiles. The key constraint is: <strong>you can arrive at a remote mbarrier, but you cannot wait on a remote mbarrier</strong> (per NVIDIA specification).</p>
+<h4 id="key-principle-arrive-remote-wait-local">Key Principle: "Arrive Remote, Wait Local"</h4>
+<table><thead><tr><th>Operation</th><th>Local mbarrier</th><th>Remote mbarrier</th></tr></thead><tbody><tr><td><code>barrier_wait</code></td><td>✅ Allowed</td><td>❌ Undefined behavior</td></tr><tr><td><code>barrier_arrive</code></td><td>✅ Allowed</td><td>✅ Allowed (via <code>remote_cta_rank</code>)</td></tr></tbody></table>
+<h4 id="example-multi-cta-gemm-with-clc">Example: Multi-CTA GEMM with CLC</h4>
+<pre><code class="language-python">@triton.jit
+def matmul_kernel(..., PAIR_CTA: tl.constexpr):
+    # Create CLC context: 6 consumers for 2-CTA mode (3 tasks × 2 CTAs)
+    clc_context = tlx.clc_create_context(num_consumers= 6 if PAIR_CTA else 3)
+
+    with tlx.async_tasks():
+        with tlx.async_task(&quot;default&quot;):  # Epilogue consumer
+            clc_phase_producer = 1
+            clc_phase_consumer = 0
+            tile_id = start_pid
+
+            while tile_id != -1:
+                # Producer: acquire next tile
+                tlx.clc_producer(clc_context, p_producer=clc_phase_producer, multi_ctas=PAIR_CTA)
+                clc_phase_producer ^= 1
+
+                # ... process tile ...
+
+                # Consumer: get tile ID and signal completion
+                tile_id = tlx.clc_consumer(clc_context, p_consumer=clc_phase_consumer, multi_ctas=PAIR_CTA)
+                clc_phase_consumer ^= 1
+        with tlx.async_task(num_warps=1, num_regs=24):  # MMA consumer
+            clc_phase_consumer = 0
+            tile_id = start_pid
+
+            while tile_id != -1:
+                # ... process tile ...
+
+                # Consumer: get tile ID and signal completion
+                tile_id = tlx.clc_consumer(clc_context, p_consumer=clc_phase_consumer, multi_ctas=PAIR_CTA)
+                clc_phase_consumer ^= 1
+        with tlx.async_task(num_warps=1, num_regs=24):  # producer, TMA load
+            clc_phase_consumer = 0
+            tile_id = start_pid
+
+            while tile_id != -1:
+                # ... process tile ...
+
+                # Consumer: get tile ID and signal completion
+                tile_id = tlx.clc_consumer(clc_context, p_consumer=clc_phase_consumer, multi_ctas=PAIR_CTA)
+                clc_phase_consumer ^= 1
+</code></pre>
+<p>Examples: how mbarriers are communicated in warp specialization</p>
+<pre><code>    phase = 0
+    with tlx.async_tasks():
+        with tlx.async_task(&quot;default&quot;):
+
+            tlx.barrier_wait(bar=b1, phase=phase ^ 1)
+
+            # Placeholder block to do something
+
+            tlx.barrier_arrive(bar=b0)  # Release
+
+        with tlx.async_task(num_warps=4):
+
+            tlx.barrier_wait(bar=b0, phase=phase)  # Wait
+
+            # Some arith ops TODO. add WS
+            offsets = block_start + tl.arange(0, BLOCK_SIZE)
+            mask = offsets &lt; n_elements
+            x = tl.load(x_ptr + offsets, mask=mask)
+            z = x * x
+            tl.store(z_ptr + offsets, z, mask=mask)
+
+            tlx.barrier_arrive(bar=b0)  # Wait</code></pre></article>
+<footer class="pager"><a href="warp-specialization.html">← Warp specialization</a><a class="next" href="layouts.html">Layout control and diagnostics →</a></footer>
+    </main>
+  </div>
+</body>
+</html>

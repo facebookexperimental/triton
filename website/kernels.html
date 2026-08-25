@@ -5,13 +5,15 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="description" content="GEMM and attention kernels implemented with TLX.">
   <title>Example kernels · FBTriton</title>
-  <link rel="stylesheet" href="assets/tlx.css?v=20260821b">
+  <link rel="stylesheet" href="assets/tlx.css?v=20260824a">
 </head>
 <body>
   <header class="topbar">
-    <a class="brand" href="../"><span>FB</span>Triton</a>
+    <a class="brand" href="../"><span>FBTriton</span></a>
     <nav class="topnav" aria-label="Top-level sections"><a href="triton.html">Triton</a>
 <a href="tlx.html" data-current="true">TLX</a>
+<a href="torchtlx.html">torchTLX</a>
+<a href="ci.html">CI</a>
 <a href="tooling.html">Tooling</a></nav>
     <a class="repo-link" href="https://github.com/facebookexperimental/triton" target="_blank" rel="noreferrer">View on GitHub ↗</a>
   </header>
@@ -22,10 +24,13 @@
 <a href="getting-started.html">Getting started</a>
 <a href="hardware-support.html">Hardware support</a>
 <a href="buffers.html">Local and remote buffers</a>
+<a href="global-memory.html">Global memory access</a>
 <a href="async-memory.html">Async memory access</a>
-<a href="async-compute.html">Async tensor core operations</a>
-<a href="synchronization.html">Barriers and Cluster Launch Control</a>
-<a href="warp-specialization.html">Warp specialization and clustering</a>
+<a href="async-compute.html">Tensor core operations</a>
+<a href="synchronization.html">Barriers and fences</a>
+<a href="warp-specialization.html">Warp specialization</a>
+<a href="clusters.html">Clusters and Cluster Launch Control</a>
+<a href="layouts.html">Layout control and diagnostics</a>
 <a href="utilities.html">Other operations</a>
 <a href="performance-optimization.html">Performance optimization</a>
 <a href="debugging.html">Debugging performance and numerics</a>
@@ -38,19 +43,19 @@
       <p class="eyebrow">TLX documentation</p>
       <h1>Example kernels</h1>
       <p class="lede">GEMM and attention kernels implemented with TLX.</p>
-      <article><h3 id="gemm-kernels">GEMM kernels</h3>
-<p><a href="https://github.com/facebookexperimental/triton/blob/main/third_party/tlx/tutorials/hopper_gemm_pipelined_test.py" target="_blank" rel="noreferrer">Pipelined GEMM on Hopper</a></p>
-<p><a href="https://github.com/facebookexperimental/triton/blob/main/third_party/tlx/tutorials/hopper_gemm_ws_test.py" target="_blank" rel="noreferrer">Warp-specialized GEMM on Hopper</a></p>
+      <article><h2 id="gemm-kernels">GEMM kernels</h2>
+<p><a href="https://github.com/facebookexperimental/triton/blob/main/third_party/tlx/tutorials/hopper_gemm_pipelined.py" target="_blank" rel="noreferrer">Pipelined GEMM on Hopper</a></p>
+<p><a href="https://github.com/facebookexperimental/triton/blob/main/third_party/tlx/tutorials/hopper_gemm_ws.py" target="_blank" rel="noreferrer">Warp-specialized GEMM on Hopper</a></p>
 <p><a href="https://github.com/facebookexperimental/triton/blob/main/third_party/tlx/tutorials/blackwell_gemm_ws.py" target="_blank" rel="noreferrer">Warp-specialized GEMM on Blackwell</a></p>
 <p><a href="https://github.com/facebookexperimental/triton/blob/main/third_party/tlx/tutorials/blackwell_gemm_ws_mxfp8.py" target="_blank" rel="noreferrer">Warp-specialized MXFP8 GEMM on Blackwell</a></p>
-<p><a href="https://github.com/facebookexperimental/triton/blob/main/third_party/tlx/tutorials/blackwell_grouped_gemm_test.py" target="_blank" rel="noreferrer">Grouped GEMM on Blackwell</a></p>
+<p><a href="https://github.com/facebookexperimental/triton/blob/main/third_party/tlx/tutorials/blackwell-grouped-gemm_test.py" target="_blank" rel="noreferrer">Grouped GEMM on Blackwell</a></p>
 <p><a href="https://github.com/facebookexperimental/triton/blob/main/third_party/tlx/tutorials/blackwell_gemm_pipelined.py" target="_blank" rel="noreferrer">Pipelined GEMM on Blackwell</a></p>
 <p><a href="https://github.com/facebookexperimental/triton/blob/main/third_party/tlx/tutorials/blackwell_gemm_clc.py" target="_blank" rel="noreferrer">CLC GEMM on Blackwell</a></p>
 <p><a href="https://github.com/facebookexperimental/triton/blob/main/third_party/tlx/tutorials/blackwell_gemm_2cta.py" target="_blank" rel="noreferrer">2-CTA GEMM on Blackwell</a></p>
-<h3 id="attention-kernels">Attention kernels</h3>
-<p><a href="https://github.com/facebookexperimental/triton/blob/main/third_party/tlx/tutorials/blackwell_fa_ws_pipelined_persistent_test.py" target="_blank" rel="noreferrer">Warp-specialized pipelined persistent FA fwd/bwd on Blackwell</a></p>
-<p><a href="https://github.com/facebookexperimental/triton/blob/main/third_party/tlx/tutorials/hopper_fa_ws_pipelined_pingpong_test.py" target="_blank" rel="noreferrer">Warp-Specialized computation-pipelined pingpong FA fwd on Hopper</a></p>
-<h3 id="amd-kernels-gfx950-cdna4">AMD kernels (gfx950 / CDNA4)</h3>
+<h2 id="attention-kernels">Attention kernels</h2>
+<p><a href="https://github.com/facebookexperimental/triton/blob/main/third_party/tlx/tutorials/blackwell_fa_ws_pipelined_persistent.py" target="_blank" rel="noreferrer">Warp-specialized pipelined persistent FA fwd/bwd on Blackwell</a></p>
+<p><a href="https://github.com/facebookexperimental/triton/blob/main/third_party/tlx/tutorials/hopper_fa_ws_pipelined_pingpong.py" target="_blank" rel="noreferrer">Warp-Specialized computation-pipelined pingpong FA fwd on Hopper</a></p>
+<h2 id="amd-kernels-gfx950-cdna4">AMD kernels (gfx950 / CDNA4)</h2>
 <p><a href="https://github.com/facebookexperimental/triton/blob/main/third_party/tlx/tutorials/amd_gemm_pipelined.py" target="_blank" rel="noreferrer">LDS-pipelined GEMM</a></p>
 <p><a href="https://github.com/facebookexperimental/triton/blob/main/third_party/tlx/tutorials/amd_gemm_warp_pipeline.py" target="_blank" rel="noreferrer">Warp-pipelined GEMM</a></p>
 <p><a href="https://github.com/facebookexperimental/triton/blob/main/third_party/tlx/tutorials/amd_fa_pipelined.py" target="_blank" rel="noreferrer">Async-DMA Flash Attention fwd — simple / prefetch</a></p>
@@ -59,7 +64,7 @@
 <p><a href="https://github.com/facebookexperimental/triton/blob/main/third_party/tlx/tutorials/amd_addmm_glu.py" target="_blank" rel="noreferrer">Fused addmm + GLU (Gated Linear Unit: out = x + x*y, x = A@B + bias)</a></p>
 <p><a href="https://github.com/facebookexperimental/triton/blob/main/third_party/tlx/tutorials/ikbo/ikbo_fa_triton.py" target="_blank" rel="noreferrer">IKBO Flash Attention (In-Kernel Broadcast Optimization, candidate/user broadcast)</a></p>
 <p><a href="https://github.com/facebookexperimental/triton/blob/main/third_party/tlx/tutorials/ikbo/ikbo_lce_triton.py" target="_blank" rel="noreferrer">IKBO LCE (logit cross-entropy over candidate/user embeddings — not attention)</a></p>
-<h3 id="amd-kernels-gfx1250">AMD kernels (gfx1250)</h3>
+<h2 id="amd-kernels-gfx1250">AMD kernels (gfx1250)</h2>
 <p><a href="https://github.com/facebookexperimental/triton/blob/main/third_party/tlx/tutorials/amd_tdm_gemm_pipelined.py" target="_blank" rel="noreferrer">TDM-pipelined GEMM</a></p>
 <p><a href="https://github.com/facebookexperimental/triton/blob/main/third_party/tlx/tutorials/amd_mxfp_gemm_tdm_pipelined.py" target="_blank" rel="noreferrer">MXFP TDM-pipelined GEMM</a></p></article>
 <footer class="pager"><a href="debugging.html">← Debugging performance and numerics</a><a class="next" href="production-case-studies.html">Production case studies →</a></footer>

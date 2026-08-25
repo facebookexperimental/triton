@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Bring TLX kernels into PyTorch 2 through Inductor templates and epilogue fusion.">
+  <title>torchTLX · FBTriton</title>
+  <link rel="stylesheet" href="assets/tlx.css?v=20260824a">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="../"><span>FBTriton</span></a>
+    <nav class="topnav" aria-label="Top-level sections"><a href="triton.html">Triton</a>
+<a href="tlx.html">TLX</a>
+<a href="torchtlx.html" data-current="true">torchTLX</a>
+<a href="ci.html">CI</a>
+<a href="tooling.html">Tooling</a></nav>
+    <a class="repo-link" href="https://github.com/facebookexperimental/triton" target="_blank" rel="noreferrer">View on GitHub ↗</a>
+  </header>
+  <div class="shell">
+<aside class="sidebar">
+      <p class="eyebrow">torchTLX documentation</p>
+      <nav><a href="torchtlx.html" aria-current="page">Overview</a>
+<a href="#knob">Enabling it</a>
+<a href="#torchtlx-templates">Templates</a>
+<a href="#naming-conventions">Naming conventions</a>
+<a href="#torchtlx-fusions">Fusions</a>
+<a href="#vision-for-next-gen-hardware">Next-gen hardware</a>
+<a href="#source-and-tests">Source and tests</a></nav>
+    </aside>
+    <main>
+      <p class="eyebrow">torchTLX</p>
+      <h1>torchTLX</h1>
+      <p class="lede">Bring TLX kernels into PyTorch 2 through Inductor templates and epilogue fusion.</p>
+      <article><p>We introduce torchTLX to boost PT2 performance by pushing TLX primitives deeper into inductor template and fusion infra.</p>
+<p>This work runs in parallel with our ongoing Triton compiler investments. TorchTLX lets us rapidly validate hardware-specific optimizations and bring forward wins while feeding proven techniques back to the Triton compiler.</p>
+<h2 id="overview">Overview</h2>
+<p>PT2 flows through Dynamo for graph capture and Inductor for optimization and code gen. Within Inductor, a scheduler decides which operations to fuse and then delegates to a backend-specific codegen engine, selecting among template candidates (Triton/CUTLASS) and cuBLAS via autotuning.</p>
+<p>However, low-level hardware primitives such as tile shapes, warp spec roles and TMA directionality are invisible to the scheduler, limiting its ability to leverage modern GPU architecture when making fusion decisions.</p>
+<p>Meanwhile, standalone TLX matmul kernels are matching or slightly exceeding cuBLAS. Unlike opaque cuBLAS kernels, a TLX kernel at parity opens the door to richer epilogue fusions.</p>
+<p>In summary, torchTLX integrates TLX as a low-level backend for Inductor, introducing significant changes to template selection, fusion logic and kernel codegen.</p>
+<h2 id="knob">Knob</h2>
+<p><code>TORCHINDUCTOR_TLX_MODE</code> (unset by default)</p>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div>unset / any other value - TLX not considered (standard inductor behavior; the config value is <code>None</code>)</div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div>allow - TLX added to candidates, competes via autotuning</div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div>force - TLX templates enabled + forced epilogue fusion</div></div>
+<p>Only <code>allow</code> and <code>force</code> engage TLX; every other value (including an unset env var or a legacy <code>default</code>) maps to <code>None</code>, leaving TLX off. TLX is additionally a no-op unless the active Triton is the fbtriton fork.</p>
+<h2 id="torchtlx-templates">TorchTLX Templates</h2>
+<p>TorchTLX templates are jinja-based kernel definitions that encode our best-performing TLX kernels into Inductor's template infra. We have shipped a GEMM template targeting Blackwell, with a flex attention template in active development. The underlying TLX GEMM kernel incorporates a series of hardware optimizations: warp specialization, CLC-based persistent execution, multi-CTA cooperation, epilogue subslicing, data partitioning and dynamic split-K.</p>
+<p>Our performance strategy operates on two parallel tracks: improving standalone TLX kernels upstream and closing any remaining gap when running through the Inductor template path.</p>
+<h2 id="naming-conventions">Naming Conventions</h2>
+<p>Names carry the architecture, because in this codebase "which GPU" is the question that decides almost everything: which template is offered, which config table is valid, and how much on-chip memory a tile may use. A name that hides the arch invites a config tuned for one part to be applied to another.</p>
+<p><strong>Arch ids</strong> follow <code>triton._internal_testing</code>, so the two agree on what "the same target" means: <code>sm90</code>, <code>sm100</code>, <code>sm107</code> on NVIDIA (compute capability) and <code>gfx942</code>, <code>gfx950</code>, <code>gfx1250</code> on AMD. One caution that module documents — match <code>gfx1250</code> before any <code>gfx12</code> prefix rule, or an RDNA4 check swallows it.</p>
+<p><strong>Templates are named for the arch they were tuned and validated on</strong>, and the same name appears at all three layers:</p>
+<table><thead><tr><th>jinja file</th><th>uid (appears in generated kernel names)</th><th>Python object</th></tr></thead><tbody><tr><td><code>blackwell_gemm_ws.py.jinja</code></td><td><code>tlx_blackwell_gemm_ws</code></td><td><code>blackwell_gemm_ws_template</code></td></tr><tr><td><code>gfx950_addmm_warppipe.py.jinja</code></td><td><code>tlx_gfx950_addmm_warppipe</code></td><td><code>gfx950_addmm_warppipe_template</code></td></tr></tbody></table>
+<p>The file drops the <code>tlx_</code> prefix (the directory is already TLX); the uid keeps it. Heuristic classes follow the template they serve: <code>BlackwellGemmWSConfigHeuristic</code>, <code>Gfx950AddMMWarpPipeConfigHeuristic</code>.</p>
+<p>Note that <strong>registration is deliberately broader than the name</strong>. The warp-pipe heuristics register for all of ROCm and the Blackwell GEMM for all of CUDA, so a config still has to fit the *actual* target's budget — gfx942 has a quarter of gfx950's LDS. Validate against that target's limits rather than assuming the one in the name.</p>
+<p><strong>Vendor names are for the dispatch layer only</strong> — the code that branches on vendor rather than on part: <code>append_tlx</code> → <code>_append_tlx_{nvidia,amd}</code>, <code>_AmdArch</code>, <code>IS_ROCM</code>. Say <code>amd</code>, not <code>ROCm</code>, for the vendor; ROCm is the build.</p>
+<p><strong>Each vendor keeps its own vocabulary</strong> in the arch classes, with two vendor-agnostic accessors so callers need not care:</p>
+<table><thead><tr><th>concept</th><th>NVIDIA</th><th>AMD</th><th>vendor-agnostic</th></tr></thead><tbody><tr><td>on-chip memory</td><td><code>smem_bytes</code></td><td><code>lds_bytes</code></td><td><code>on_chip_bytes()</code></td></tr><tr><td>processors</td><td><code>num_sms</code></td><td><code>num_cus</code></td><td><code>processor_count()</code></td></tr></tbody></table>
+<p>Finally, <strong>an absent attribute means the concept does not exist there, or is not yet measured</strong> — there are no sentinel values. <code>tmem_columns</code> appears first on <code>Sm100</code>, <code>num_xcds</code> only on AMD, and <code>Gfx1250</code> declares neither an LDS size nor a CU count. Reading one is an <code>AttributeError</code> at the call site that should have gated, never a plausible-looking <code>0</code> or a neighbouring part's number.</p>
+<h2 id="torchtlx-fusions">TorchTLX Fusions</h2>
+<p>TorchTLX supports epilogue fusion through two store mechanisms. Inductor's standard epilogue fusion works out of box when a TLX templated kernel uses tl.store. The scheduler detects fusible downstream ops (e.g., bias add, ReLU) and injects them into the template's <code>{{store_output}}</code> hook at codegen time.</p>
+<pre><code>                        tlx.barrier_arrive(tmem_empty_bars[buf_idx], 1)
+                        offs_cn = offs_bn + slice_id * slice_size
+                        _tmp_var1 = offs_am
+                        _tmp_var0 = (_tmp_var1 + tl.arange(0, BLOCK_M_SPLIT))[:, None]
+                        _tmp_var2 = _tmp_var0 &lt; 4096
+                        _tmp_var4 = offs_cn
+                        _tmp_var3 = (_tmp_var4 + tl.arange(0, slice_size))[None, :, ]
+                        _tmp_var5 = _tmp_var3 &lt; 4096
+                        _tmp_var6 = _tmp_var2 &amp; _tmp_var5
+                        xindex = _tmp_var3 + 4096*_tmp_var0
+                        tmp0 = tl.load(in_ptr2 + (tl.broadcast_to(xindex, [BLOCK_M_SPLIT, slice_size])), _tmp_var6, eviction_policy=&#x27;evict_last&#x27;).to(tl.float32)
+                        tmp1 = result + tmp0
+                        tmp2 = tl.full([1], 0, tl.int32)
+                        tmp3 = triton_helpers.maximum(tmp2, tmp1)
+                        tl.store(out_ptr1 + (tl.broadcast_to(xindex, [BLOCK_M_SPLIT, slice_size])), tmp3, _tmp_var6)</code></pre>
+<p>For templates using tlx.async_descriptor_store, we introduce compute_epilogue to run the fused epilogue ops and assign the result to a variable, letting the template manually stage through SMEM and issue async_descriptor_store to preserve the async pipeline overlap with MMA warps.</p>
+<pre><code>                        tlx.barrier_arrive(tmem_empty_bars[buf_idx], 1)
+                        offs_cn = offs_bn + slice_id * slice_size
+                        xoffset = offs_am
+                        xindex = (xoffset + tl.arange(0, XBLOCK))[:, None]
+                        xmask = xindex &lt; 4096
+                        yoffset = offs_cn
+                        yindex = (yoffset + tl.arange(0, YBLOCK))[None, :, ]
+                        ymask = yindex &lt; 4096
+                        fused_c = result
+                        tmp0 = tl.load(in_ptr2 + (yindex + 4096*xindex), None, eviction_policy=&#x27;evict_last&#x27;).to(tl.float32)
+                        tmp1 = result + tmp0
+                        tmp2 = tl.full([1, 1], 0, tl.int32)
+                        tmp3 = triton_helpers.maximum(tmp2, tmp1)
+                        fused_c = tmp3
+                        c_smem = c_smem_buffers[(group_id * EPILOGUE_SUBTILE + slice_id) % NUM_EPILOGUE_SMEM_BUFFERS]
+                        tlx.async_descriptor_store_wait(1)
+                        tlx.local_store(c_smem, fused_c.to(A.dtype.element_ty))
+                        tlx.fence_async_shared()
+                        tlx.async_descriptor_store(desc_c, c_smem, [offs_am, offs_cn], eviction_policy=&quot;evict_first&quot;)</code></pre>
+<h2 id="vision-for-next-gen-hardware">Vision for Next-gen Hardware</h2>
+<p>As new GPU architectures arrive, torchTLX offers two key advantages.</p>
+<p>First, it streamlines access to state-of-the-art hardware intrinsics. Given that TLX provides a Triton-native API for features like TMA, WS, CLC, 2-CTA, etc., once the performance is maximized in the standalone TLX kernel, integrating those wins into the PT2 stack through torchTLX requires a fairly small amount of additional work.</p>
+<p>Second, it scales better than manual agentic kernel authoring. There is growing interest across the industry in agentic kernel authoring at scale. We believe making the PT2 stack natively aware of hardware architecture features might be a more scalable path. Once the plumbing is in place, every new kernel and fusion pattern benefits automatically.</p>
+<h2 id="source-and-tests">Source and tests</h2>
+<p>Templates, heuristics and codegen live in <a href="https://github.com/facebookexperimental/triton/tree/main/third_party/tlx/language/tlx/inductor/" target="_blank" rel="noreferrer"><code>third_party/tlx/language/tlx/inductor/</code></a>.</p>
+<pre><code class="language-bash">pytest python/test/unit/language/test_torchtlx_templates.py
+pytest python/test/unit/language/test_torchtlx_fusions.py</code></pre>
+<p>In an fbtriton git checkout, <a href="https://github.com/facebookexperimental/triton/blob/main/scripts/run_torchtlx_tests.sh" target="_blank" rel="noreferrer"><code>scripts/run_torchtlx_tests.sh</code></a> runs both. CI coverage is described in <a href="https://github.com/facebookexperimental/triton/tree/main/github/workflows/" target="_blank" rel="noreferrer">CI</a>.</p></article>
+<footer class="pager"><a href="tlx.html">← TLX</a><a class="next" href="ci.html">CI →</a></footer>
+    </main>
+  </div>
+</body>
+</html>
