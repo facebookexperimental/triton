@@ -15,6 +15,7 @@
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "mlir/Transforms/Passes.h"
 #include "mlir/Transforms/RegionUtils.h"
+#include "nvidia/hopper/include/Transforms/Passes.h"
 #include "nvidia/include/Dialect/NVGPU/IR/Dialect.h"
 #include "nvidia/include/Dialect/NVWS/IR/Dialect.h"
 #include "triton/Analysis/Utility.h"
@@ -181,6 +182,23 @@ LogicalResult doConvertDescriptorLoadsToNVWS(triton::FuncOp funcOp) {
   });
   return failure(hasUnconvertedLoad);
 }
+
+#define GEN_PASS_DEF_NVGPUCONVERTDESCRIPTORLOADSTONVWS
+#include "nvidia/hopper/include/Transforms/Passes.h.inc"
+
+struct NVGPUConvertDescriptorLoadsToNVWSPass
+    : public impl::NVGPUConvertDescriptorLoadsToNVWSBase<
+          NVGPUConvertDescriptorLoadsToNVWSPass> {
+  void runOnOperation() override {
+    WalkResult result = getOperation().walk([&](triton::FuncOp funcOp) {
+      if (failed(doConvertDescriptorLoadsToNVWS(funcOp)))
+        return WalkResult::interrupt();
+      return WalkResult::advance();
+    });
+    if (result.wasInterrupted())
+      signalPassFailure();
+  }
+};
 
 Value createBufferView(OpBuilderWithAsyncTaskIds &builder, Value alloc,
                        Value idx) {
