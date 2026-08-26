@@ -1,0 +1,6 @@
+{
+  "backend": "cpu",
+  "architecture": "host",
+  "device": "cpu",
+  "environment": {}
+}

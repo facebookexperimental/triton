@@ -1,0 +1,22 @@
+[
+  {
+    "case_id": "vec_1024",
+    "parameters": {
+      "n": 1024,
+      "dtype": "float32",
+      "scale": 1.0
+    },
+    "weight": 1.0,
+    "protected": true
+  },
+  {
+    "case_id": "vec_4096",
+    "parameters": {
+      "n": 4096,
+      "dtype": "float32",
+      "scale": 1.0
+    },
+    "weight": 1.0,
+    "protected": true
+  }
+]
