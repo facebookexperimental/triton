@@ -207,7 +207,12 @@ struct Transform2CTALoads
 
     LDBG("Found " << twoCTAMMAOps.size() << " 2-CTA MMA ops to transform");
 
+    DenseSet<Operation *> splitTransformedMMAs;
     for (auto mma : twoCTAMMAOps) {
+      if (splitTransformedMMAs.contains(mma))
+        continue;
+      if (succeeded(transformSplitBLoad(mma, splitTransformedMMAs)))
+        continue;
       if (failed(transformBLoad(mma)))
         LDBG("Skipped MMA at " << mma.getLoc()
                                << " (B not from descriptor load)");
@@ -235,6 +240,174 @@ struct Transform2CTALoads
                             UnitAttr::get(moduleOp.getContext()));
       });
     }
+  }
+
+  // A source-level split of one KxN V tile normally becomes
+  //
+  //   descriptor_load -> reshape -> trans -> split -> local_alloc x2
+  //
+  // before this pass. Transforming either leaf independently would retain a
+  // register-mediated shared-to-shared copy. Instead, make the cooperative
+  // descriptor load half-width once, allocate its complete 2Kx(N/2) tile in
+  // shared memory, and feed the two MMAs with zero-copy Kx(N/2) subslices.
+  LogicalResult transformSplitBLoad(ttng::TCGen5MMAOp mma,
+                                    DenseSet<Operation *> &transformedMMAs) {
+    auto localAlloc = mma.getB().getDefiningOp<ttg::LocalAllocOp>();
+    if (!localAlloc)
+      return failure();
+    auto split = localAlloc.getSrc().getDefiningOp<tt::SplitOp>();
+    if (!split || !split.getOutLHS().hasOneUse() ||
+        !split.getOutRHS().hasOneUse())
+      return failure();
+
+    auto lhsAlloc =
+        dyn_cast<ttg::LocalAllocOp>(*split.getOutLHS().getUsers().begin());
+    auto rhsAlloc =
+        dyn_cast<ttg::LocalAllocOp>(*split.getOutRHS().getUsers().begin());
+    if (!lhsAlloc || !rhsAlloc || !lhsAlloc.getResult().hasOneUse() ||
+        !rhsAlloc.getResult().hasOneUse())
+      return failure();
+    auto lhsMMA =
+        dyn_cast<ttng::TCGen5MMAOp>(*lhsAlloc.getResult().getUsers().begin());
+    auto rhsMMA =
+        dyn_cast<ttng::TCGen5MMAOp>(*rhsAlloc.getResult().getUsers().begin());
+    if (!lhsMMA || !rhsMMA || !lhsMMA.getTwoCtas() || !rhsMMA.getTwoCtas() ||
+        lhsMMA.getB() != lhsAlloc.getResult() ||
+        rhsMMA.getB() != rhsAlloc.getResult())
+      return failure();
+
+    auto trans = split.getSrc().getDefiningOp<tt::TransOp>();
+    if (!trans || trans.getOrder().size() != 3 || trans.getOrder()[0] != 1 ||
+        trans.getOrder()[1] != 2 || trans.getOrder()[2] != 0)
+      return failure();
+    auto reshape = trans.getSrc().getDefiningOp<tt::ReshapeOp>();
+    if (!reshape)
+      return failure();
+    auto descLoad = reshape.getSrc().getDefiningOp<tt::DescriptorLoadOp>();
+    if (!descLoad)
+      return failure();
+
+    auto descType = originalDescTypes.lookup(descLoad.getDesc());
+    auto loadType = dyn_cast<RankedTensorType>(descLoad.getType());
+    auto lhsType = dyn_cast<ttg::MemDescType>(lhsAlloc.getType());
+    auto rhsType = dyn_cast<ttg::MemDescType>(rhsAlloc.getType());
+    if (!descType || !loadType || !lhsType || !rhsType ||
+        loadType.getRank() != 2 || lhsType != rhsType)
+      return failure();
+
+    constexpr unsigned splitDim = 1;
+    auto blockShape = descType.getBlockType().getShape();
+    auto loadShape = loadType.getShape();
+    auto leafShape = lhsType.getShape();
+    if (blockShape.size() != 2 || blockShape[splitDim] % 2 != 0 ||
+        loadShape.size() != 2 || leafShape.size() != 2 ||
+        loadShape[0] != 2 * leafShape[0] || loadShape[1] != leafShape[1])
+      return failure();
+
+    int64_t halfN = blockShape[splitDim] / 2;
+    if (halfN < 16)
+      return failure();
+    SmallVector<int64_t> newBlockShape(blockShape.begin(), blockShape.end());
+    newBlockShape[splitDim] = halfN;
+
+    MLIRContext *ctx = mma.getContext();
+    auto elemType = descType.getElementType();
+    auto sharedLayout =
+        shrinkSwizzleForShape(descType.getSharedLayout(), newBlockShape);
+    auto newDescType =
+        tt::TensorDescType::get(newBlockShape, elemType, sharedLayout);
+
+    Value newDesc;
+    auto makeDesc = descLoad.getDesc().getDefiningOp<tt::MakeTensorDescOp>();
+    if (makeDesc) {
+      OpBuilder descBuilder(makeDesc);
+      IRMapping mapper;
+      auto *clonedOp = descBuilder.clone(*makeDesc.getOperation(), mapper);
+      auto newMakeDesc = cast<tt::MakeTensorDescOp>(clonedOp);
+      newMakeDesc.getResult().setType(newDescType);
+      newDesc = newMakeDesc.getResult();
+    } else {
+      auto descVal = descLoad.getDesc();
+      // The makeDesc path above clones before retyping. Here there is nothing
+      // to clone -- the descriptor is typically a func argument -- so the type
+      // is mutated in place, which is only sound if this load is its sole
+      // consumer. Otherwise an unrelated descriptor_load sharing the value
+      // would silently inherit the half-width type and address the wrong tile.
+      if (!descVal.hasOneUse())
+        return failure();
+      descVal.setType(newDescType);
+      newDesc = descVal;
+      if (auto funcOp = descLoad->getParentOfType<triton::FuncOp>()) {
+        auto &entryBlock = funcOp.getBlocks().front();
+        SmallVector<Type> argTys(entryBlock.getArgumentTypes());
+        funcOp.setFunctionType(FunctionType::get(
+            ctx, argTys, funcOp.getFunctionType().getResults()));
+      }
+    }
+
+    OpBuilder builder(descLoad);
+    Location loc = descLoad.getLoc();
+    auto i32Ty = builder.getI32Type();
+    Value ctaRank = nvgpu::ClusterCTAIdOp::create(builder, loc, i32Ty);
+    Value two = arith::ConstantIntOp::create(builder, loc, 2, 32);
+    Value ctaMod2 = arith::RemSIOp::create(builder, loc, ctaRank, two);
+    Value halfNVal = arith::ConstantIntOp::create(builder, loc, halfN, 32);
+    Value offset = arith::MulIOp::create(builder, loc, ctaMod2, halfNVal);
+    SmallVector<Value> newIndices(descLoad.getIndices());
+    newIndices[splitDim] =
+        arith::AddIOp::create(builder, loc, newIndices[splitDim], offset);
+
+    auto origEncoding = cast<ttg::BlockedEncodingAttr>(loadType.getEncoding());
+    auto newEncoding =
+        getCompatibleEncoding(origEncoding, newBlockShape, splitDim, ctx);
+    auto halfResultType =
+        RankedTensorType::get(newBlockShape, elemType, newEncoding);
+    auto newDescLoad = tt::DescriptorLoadOp::create(
+        builder, loc, halfResultType, newDesc, newIndices);
+    newDescLoad->setAttr("two_cta_b", builder.getUnitAttr());
+
+    builder.setInsertionPoint(lhsAlloc);
+    auto fullMemDescEncoding =
+        shrinkSwizzleForShape(lhsType.getEncoding(), newBlockShape);
+    auto fullMemDescType = ttg::MemDescType::get(
+        newBlockShape, elemType, fullMemDescEncoding, lhsType.getMemorySpace(),
+        lhsType.getMutableMemory());
+    auto fullAlloc = ttg::LocalAllocOp::create(
+        builder, lhsAlloc.getLoc(), fullMemDescType, newDescLoad.getResult());
+
+    SmallVector<int64_t> slicedShape(newBlockShape.begin(),
+                                     newBlockShape.end());
+    slicedShape[0] /= 2;
+    auto slicedType = ttg::MemDescType::get(
+        slicedShape, elemType, fullMemDescEncoding, lhsType.getMemorySpace(),
+        lhsType.getMutableMemory(), newBlockShape);
+    SmallVector<int32_t> lhsOffsets = {0, 0};
+    SmallVector<int32_t> rhsOffsets = {static_cast<int32_t>(slicedShape[0]), 0};
+    Value lhsSlice = ttg::MemDescSubsliceOp::create(
+        builder, lhsAlloc.getLoc(), slicedType, fullAlloc, lhsOffsets);
+    Value rhsSlice = ttg::MemDescSubsliceOp::create(
+        builder, rhsAlloc.getLoc(), slicedType, fullAlloc, rhsOffsets);
+    lhsAlloc.getResult().replaceAllUsesWith(lhsSlice);
+    rhsAlloc.getResult().replaceAllUsesWith(rhsSlice);
+    lhsAlloc.erase();
+    rhsAlloc.erase();
+
+    if (split->use_empty())
+      split.erase();
+    if (trans->use_empty())
+      trans.erase();
+    if (reshape->use_empty())
+      reshape.erase();
+    if (descLoad->use_empty())
+      descLoad.erase();
+    if (makeDesc && makeDesc->use_empty())
+      makeDesc.erase();
+
+    transformedMMAs.insert(lhsMMA);
+    transformedMMAs.insert(rhsMMA);
+    LDBG("Transformed split B load for 2-CTA MMAs at "
+         << lhsMMA.getLoc() << " and " << rhsMMA.getLoc());
+    return success();
   }
 
   LogicalResult transformBLoad(ttng::TCGen5MMAOp mma) {
