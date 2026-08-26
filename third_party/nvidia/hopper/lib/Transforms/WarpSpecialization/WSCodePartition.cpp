@@ -5678,7 +5678,7 @@ void doCodePartition(triton::FuncOp funcOp, unsigned numBuffers) {
     // Derive staging/load tasks from the *matched* entry (not from
     // stagingReuseInfos.front(), which may have been skipped above) so the
     // barrier's task IDs always agree with the selected outer loop.
-    scf::ForOp outerLoop;
+    LoopLikeOpInterface outerLoop;
     AsyncTaskId drainedStoreTask = -1;
     AsyncTaskId loadTask = -1;
     unsigned matched = 0;
@@ -5687,7 +5687,7 @@ void doCodePartition(triton::FuncOp funcOp, unsigned numBuffers) {
       auto it = bufferIdToChannel.find(info.targetBufferId);
       if (it == bufferIdToChannel.end() || !it->second->getSrcOp())
         continue;
-      auto loop = info.firstStore->getParentOfType<scf::ForOp>();
+      LoopLikeOpInterface loop = getParentPersistentLoop(info.firstStore);
       if (!loop)
         continue;
       auto lTaskIds = getAsyncTaskIds(it->second->getSrcOp());
@@ -5715,60 +5715,77 @@ void doCodePartition(triton::FuncOp funcOp, unsigned numBuffers) {
            << "(same-partition staging)");
     } else if (matched && outerLoop && loadTask != drainedStoreTask) {
       MLIRContext *ctx = funcOp.getContext();
-      // Create the synthetic reuse token at function entry.
-      OpBuilder entryB(funcOp);
-      entryB.setInsertionPointToStart(&funcOp.getBody().front());
-      Value reuseToken = ttnvws::CreateTokenOp::create(
-          entryB, funcOp.getLoc(), /*numBuffers=*/1,
-          ttnvws::TokenLoadType::LocalStoreOp);
 
-      // producer_acquire (load task) at the top of the outer loop body. The
-      // phase must flip once per outer iteration, so feed getBufferIdxAndPhase
-      // a 0-based iteration counter. Normalize as (iv - lb) / step rather than
-      // the raw induction variable so the parity is correct for any lower bound
-      // / step; when the loop is already normalized (lb=0, step=1 -- the AutoWS
-      // persistent case, whose body carries the real tile id separately) this
-      // is just the induction variable and the extra arith is folded away.
-      Operation *firstBodyOp = &outerLoop.getBody()->front();
-      OpBuilderWithAsyncTaskIds acqBuilder(firstBodyOp);
-      acqBuilder.setInsertionPoint(firstBodyOp);
-      acqBuilder.setAsynTaskIdsFromArray({loadTask});
-      Location acqLoc = firstBodyOp->getLoc();
-      Value iterIdx = outerLoop.getInductionVar();
-      APInt lbVal, stepVal;
-      bool lbIsZero =
-          matchPattern(outerLoop.getLowerBound(), m_ConstantInt(&lbVal)) &&
-          lbVal.isZero();
-      bool stepIsOne =
-          matchPattern(outerLoop.getStep(), m_ConstantInt(&stepVal)) &&
-          stepVal.isOne();
-      if (!lbIsZero || !stepIsOne) {
-        Value rel = acqBuilder.createWithAsyncTaskIds<arith::SubIOp>(
-            acqLoc, iterIdx, outerLoop.getLowerBound());
-        iterIdx = acqBuilder.createWithAsyncTaskIds<arith::DivUIOp>(
-            acqLoc, rel, outerLoop.getStep());
+      Block *outerBody = getPersistentLoopBody(outerLoop);
+      // A `for` exposes its iteration count as the induction variable; a
+      // `while` has none, so fall back to the AutoWS iteration counter carried
+      // through its after region.
+      Value iterIdx = outerLoop.getSingleInductionVar().value_or(Value());
+      if (auto whileOp = dyn_cast<scf::WhileOp>(outerLoop.getOperation()))
+        iterIdx = getWhileIterationCounter(whileOp);
+      if (!outerBody || !iterIdx) {
+        LDBG("Step 7.5: could not derive persistent-loop iteration; "
+             "cross-tile WAR barrier not inserted (unhandled)");
+      } else {
+        // Create the synthetic reuse token at function entry.
+        OpBuilder entryB(funcOp);
+        entryB.setInsertionPointToStart(&funcOp.getBody().front());
+        Value reuseToken = ttnvws::CreateTokenOp::create(
+            entryB, funcOp.getLoc(), /*numBuffers=*/1,
+            ttnvws::TokenLoadType::LocalStoreOp);
+
+        // producer_acquire (load task) at the top of the outer loop body. The
+        // phase must flip once per outer iteration, so feed
+        // getBufferIdxAndPhase a 0-based iteration counter. Normalize as (iv -
+        // lb) / step rather than the raw induction variable so the parity is
+        // correct for any lower bound / step; when the loop is already
+        // normalized (lb=0, step=1 -- the AutoWS persistent case, whose body
+        // carries the real tile id separately) this is just the induction
+        // variable and the extra arith is folded away.
+        Operation *firstBodyOp = &outerBody->front();
+        OpBuilderWithAsyncTaskIds acqBuilder(firstBodyOp);
+        acqBuilder.setInsertionPoint(firstBodyOp);
+        acqBuilder.setAsynTaskIdsFromArray({loadTask});
+        Location acqLoc = firstBodyOp->getLoc();
+        if (auto forOp = dyn_cast<scf::ForOp>(outerLoop.getOperation())) {
+          APInt lbVal, stepVal;
+          bool lbIsZero =
+              matchPattern(forOp.getLowerBound(), m_ConstantInt(&lbVal)) &&
+              lbVal.isZero();
+          bool stepIsOne =
+              matchPattern(forOp.getStep(), m_ConstantInt(&stepVal)) &&
+              stepVal.isOne();
+          if (!lbIsZero || !stepIsOne) {
+            Value rel = acqBuilder.createWithAsyncTaskIds<arith::SubIOp>(
+                acqLoc, iterIdx, forOp.getLowerBound());
+            iterIdx = acqBuilder.createWithAsyncTaskIds<arith::DivUIOp>(
+                acqLoc, rel, forOp.getStep());
+          }
+        }
+        Value ivExt = iterIdx;
+        if (!iterIdx.getType().isInteger(64))
+          ivExt = acqBuilder.createWithAsyncTaskIds<arith::ExtUIOp>(
+              acqLoc, acqBuilder.getIntegerType(64), iterIdx);
+        auto idxPhase =
+            getBufferIdxAndPhase(acqBuilder, acqLoc, ivExt, /*numBuffers=*/1);
+        acqBuilder.createWithAsyncTaskIds<ttnvws::ProducerAcquireOp>(
+            acqLoc, reuseToken, idxPhase.first, idxPhase.second,
+            WSBarrierAttr::forDstTask(ctx, drainedStoreTask).build(ctx));
+
+        // consumer_release at the bottom of the drained-store task, after its
+        // TMA store waits have completed.
+        Operation *term = outerBody->getTerminator();
+        OpBuilderWithAsyncTaskIds relBuilder(term);
+        relBuilder.setInsertionPoint(term);
+        relBuilder.setAsynTaskIdsFromArray({drainedStoreTask});
+        Value bufIdx = relBuilder.createWithAsyncTaskIds<arith::ConstantIntOp>(
+            term->getLoc(), 0, 32);
+        relBuilder.createWithAsyncTaskIds<ttnvws::ConsumerReleaseOp>(
+            term->getLoc(), reuseToken, bufIdx,
+            WSBarrierAttr::forDstTask(ctx, loadTask).build(ctx));
+        LDBG("Step 7.5: inserted cross-tile staging-reuse WAR barrier (load "
+             << loadTask << " -> drained store " << drainedStoreTask << ")");
       }
-      Value ivExt = acqBuilder.createWithAsyncTaskIds<arith::ExtUIOp>(
-          acqLoc, acqBuilder.getIntegerType(64), iterIdx);
-      auto idxPhase =
-          getBufferIdxAndPhase(acqBuilder, acqLoc, ivExt, /*numBuffers=*/1);
-      acqBuilder.createWithAsyncTaskIds<ttnvws::ProducerAcquireOp>(
-          acqLoc, reuseToken, idxPhase.first, idxPhase.second,
-          WSBarrierAttr::forDstTask(ctx, drainedStoreTask).build(ctx));
-
-      // consumer_release at the bottom of the drained-store task, after its
-      // TMA store waits have completed.
-      Operation *term = outerLoop.getBody()->getTerminator();
-      OpBuilderWithAsyncTaskIds relBuilder(term);
-      relBuilder.setInsertionPoint(term);
-      relBuilder.setAsynTaskIdsFromArray({drainedStoreTask});
-      Value bufIdx = relBuilder.createWithAsyncTaskIds<arith::ConstantIntOp>(
-          term->getLoc(), 0, 32);
-      relBuilder.createWithAsyncTaskIds<ttnvws::ConsumerReleaseOp>(
-          term->getLoc(), reuseToken, bufIdx,
-          WSBarrierAttr::forDstTask(ctx, loadTask).build(ctx));
-      LDBG("Step 7.5: inserted cross-tile staging-reuse WAR barrier (load "
-           << loadTask << " -> drained store " << drainedStoreTask << ")");
     }
   }
 
