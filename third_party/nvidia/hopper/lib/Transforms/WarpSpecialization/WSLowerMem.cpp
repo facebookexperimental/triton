@@ -255,7 +255,8 @@ Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
                             Operation *headProducer, Operation *headConsumer,
                             Operation *headConsumerSameLevel,
                             ArrayRef<int> additionalConsumerTaskIds,
-                            DictionaryAttr consumerWaitConstraints) {
+                            DictionaryAttr consumerWaitConstraints,
+                            bool twoCTADirectWait) {
   // Callers group at least one load behind each fused barrier. Make the
   // precondition explicit instead of dereferencing front() blind below.
   if (tmaLoads.empty())
@@ -337,15 +338,18 @@ Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
       loc, builder.getI32Type(), phase);
   Value waitPred =
       builder.createWithAsyncTaskIds<arith::ConstantIntOp>(loc, 1, 1);
+  bool directTwoCTAWait = twoCTA && twoCTADirectWait;
   Value followerWaitPred;
   Value peerBarrier;
   if (twoCTA) {
     TwoCTAPairRank rank = buildTwoCTAPairRank(builder, loc);
     waitPred = builder.createWithAsyncTaskIds<arith::CmpIOp>(
         loc, arith::CmpIPredicate::eq, rank.rankInPair, rank.zero);
-    followerWaitPred = builder.createWithAsyncTaskIds<arith::CmpIOp>(
-        loc, arith::CmpIPredicate::ne, rank.rankInPair, rank.zero);
-    peerBarrier = mapBarrierTo2CTAPeer(builder, loc, consBarrier, rank.ctaId);
+    if (!directTwoCTAWait) {
+      followerWaitPred = builder.createWithAsyncTaskIds<arith::CmpIOp>(
+          loc, arith::CmpIPredicate::ne, rank.rankInPair, rank.zero);
+      peerBarrier = mapBarrierTo2CTAPeer(builder, loc, consBarrier, rank.ctaId);
+    }
   }
 
   // Create one WaitBarrierOp per consumer task ID.
@@ -353,7 +357,7 @@ Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
   builder.createWithAsyncTaskIds<ttng::WaitBarrierOp>(
       loc, consBarrier, phase, waitPred, /*deps=*/ValueRange{},
       consumerWaitConstraints);
-  if (twoCTA) {
+  if (twoCTA && !directTwoCTAWait) {
     // The hardware CTA-group TMA transaction completes the leader's local
     // mbarrier. Relay that completion to the follower's corresponding local
     // barrier, then let the follower wait on it. A cluster barrier is not
@@ -372,7 +376,7 @@ Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
     builder.createWithAsyncTaskIds<ttng::WaitBarrierOp>(
         loc, consBarrier, phase, waitPred,
         /*deps=*/ValueRange{}, consumerWaitConstraints);
-    if (twoCTA) {
+    if (twoCTA && !directTwoCTAWait) {
       builder.createWithAsyncTaskIds<ttng::FenceAsyncSharedOp>(
           loc, /*bCluster=*/false);
       builder.createWithAsyncTaskIds<ttng::ArriveBarrierOp>(
