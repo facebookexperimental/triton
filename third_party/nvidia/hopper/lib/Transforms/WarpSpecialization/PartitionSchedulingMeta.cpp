@@ -147,6 +147,7 @@ enum class OpCategory {
   MemDescView,   // Memory descriptor views
   EpilogueStore, // Descriptor stores
   TMAReduction,  // TMA reduction operations
+  Relay,         // One-warp 2-CTA DSMEM completion relay
   DataPartition, // Ops exclusive to one MMA's slice
   Correction,    // Cross-iteration MMA users
   Default        // Everything else
@@ -168,6 +169,8 @@ static llvm::StringRef toString(OpCategory category) {
     return "EpilogueStore";
   case OpCategory::TMAReduction:
     return "TMAReduction";
+  case OpCategory::Relay:
+    return "Relay";
   case OpCategory::Correction:
     return "Correction";
   case OpCategory::DataPartition:
@@ -342,6 +345,7 @@ struct PartitionLayout {
   Partition *loadPartition = nullptr;
   Partition *epiloguePartition = nullptr;
   Partition *epilogueStorePartition = nullptr;
+  Partition *relayPartition = nullptr;
   Partition *defaultPartition = nullptr; // computed alias
   SmallVector<Partition *, 2> computationPartitions;
 
@@ -415,6 +419,7 @@ public:
     categorizeMMAs();
     categorizeEpilogueStores();
     categorizeTMAReductions();
+    categorizeRelays();
     categorizeCorrectionOps(); // Before DataPartition to prevent stealing
     categorizeDataPartitionOps();
   }
@@ -478,10 +483,11 @@ public:
 
     // Group ops by category in deterministic order
     constexpr OpCategory categoryOrder[] = {
-        OpCategory::MMA,           OpCategory::Load,
-        OpCategory::MemDescView,   OpCategory::EpilogueStore,
-        OpCategory::TMAReduction,  OpCategory::Correction,
-        OpCategory::DataPartition, OpCategory::Default};
+        OpCategory::MMA,          OpCategory::Load,
+        OpCategory::MemDescView,  OpCategory::EpilogueStore,
+        OpCategory::TMAReduction, OpCategory::Correction,
+        OpCategory::Relay,        OpCategory::DataPartition,
+        OpCategory::Default};
 
     for (OpCategory cat : categoryOrder) {
       SmallVector<const CategorizedOp *> ops;
@@ -945,6 +951,12 @@ private:
     }
   }
 
+  void categorizeRelays() {
+    getLoopBodyRegion(mainLoop).walk([&](ttng::TwoCTAPeerRelayOp relay) {
+      addCategorizedOp(relay, OpCategory::Relay);
+    });
+  }
+
   void addCategorizedOp(Operation *op, OpCategory cat,
                         unsigned dataPartitionId = 0,
                         Operation *parentMMA = nullptr) {
@@ -985,6 +997,7 @@ static PartitionLayout createPartitionLayout(PartitionSet &schedule,
       !categorizer.getOpsInCategory(OpCategory::TMAReduction).empty();
   bool hasEpilogue =
       !categorizer.getOpsInCategory(OpCategory::EpilogueStore).empty();
+  bool hasRelay = !categorizer.getOpsInCategory(OpCategory::Relay).empty();
   bool hasMMAv5 = categorizer.hasMMAv5();
   // No-MMA reduction kernels (RMS norm / LayerNorm / softmax-only): no MMA and
   // no TMA-atomic reduce, but an in-register tt.reduce. These need a reduction
@@ -1032,6 +1045,11 @@ static PartitionLayout createPartitionLayout(PartitionSet &schedule,
   if (options.separateEpilogueStore && hasEpilogue && !deferLoadPartition) {
     layout.epilogueStorePartition = schedule.addPartition(0);
     layout.epilogueStorePartition->setType("epilogue_store");
+  }
+
+  if (hasRelay) {
+    layout.relayPartition = schedule.addPartition(0);
+    layout.relayPartition->setType("relay");
   }
 
   // Load partition: created last so it gets the highest partition index,
@@ -1568,6 +1586,9 @@ getInitialSchedule(LoopLikeOpInterface mainLoop,
   Partition *epiloguePartition = layout.epiloguePartition;
   Partition *correctionPartition = layout.correctionPartition;
   Partition *reductionPartition = layout.reductionPartition;
+
+  for (const auto &catOp : categorizer.getOpsInCategory(OpCategory::Relay))
+    tryScheduleOp(layout.relayPartition, catOp.op);
 
   // For backward compatibility: use default as fallback
   if (!correctionPartition)
@@ -2109,8 +2130,30 @@ getInitialSchedule(LoopLikeOpInterface mainLoop,
   schedulePostLoopOps(mainLoop, schedule, layout, localSchedOpts,
                       categorizer.getOpToDpIdMap(), dpIdToPartition);
 
-  // Update defaultPartition after computation partitions are created.
-  layout.defaultPartition = layout.getDefaultPartition();
+  // Match the explicit TLX backward layout for dependent 2-CTA attention.
+  // The eight-warp base group owns computation/epilogue, while the TMEM/TMA
+  // reduction is a specialized four-warp group. Selecting computation as the
+  // default here lets memory planning see the final role placement; changing a
+  // four-warp computation partition to eight warps after planning introduces a
+  // full-tile relayout buffer and can exceed the Blackwell SMEM limit.
+  ModuleOp module = mainLoop->getParentOfType<ModuleOp>();
+  bool preferComputationDefault =
+      module && module->hasAttr("ttng.two-ctas") && layout.relayPartition &&
+      layout.reductionPartition && dataPartitionFactor == 1 &&
+      localSchedOpts.mergeEpilogueToComputation && sharedComputePartition;
+  if (preferComputationDefault) {
+    layout.makeDefaultPartition(schedule, sharedComputePartition, mainLoop);
+    // Match TLX's specialized task order as well: reduction, GEMM, load,
+    // relay. Besides making IR comparison direct, this keeps warp-group and
+    // requested-register arrays role-aligned in downstream passes.
+    schedule.swapPartitions(1, layout.reductionPartition->getIndex(), mainLoop);
+    schedule.swapPartitions(2, layout.gemmPartition->getIndex(), mainLoop);
+  }
+
+  // Update the fallback default after computation partitions are created.
+  // makeDefaultPartition already set the deliberate 2-CTA default above.
+  if (!preferComputationDefault)
+    layout.defaultPartition = layout.getDefaultPartition();
 
   // Scan partitions for one that requires 4 warps (TMEM or WarpGroupDot
   // ops) and promote it to index 0 so it becomes the default warp group.
