@@ -1,6 +1,7 @@
 #ifndef NV_DIALECT_HOPPER_TRANSFORMS_CODEPARTITIONUTILITY_H_
 #define NV_DIALECT_HOPPER_TRANSFORMS_CODEPARTITIONUTILITY_H_
 
+#include "mlir/Interfaces/LoopLikeInterface.h"
 #include "nvidia/include/Dialect/NVWS/IR/Dialect.h"
 #include "triton/Analysis/Allocation.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
@@ -235,6 +236,28 @@ constexpr static char kWarpSpecializeGeneratedBarrierAttrName[] =
 bool enclosing(scf::IfOp ifOp, Operation *op);
 bool enclosing(scf::ForOp forOp, Operation *op);
 bool enclosing(scf::WhileOp whileOp, Operation *op);
+
+// --- Persistent outer-loop helpers (scf.for / scf.while unified) ------------
+//
+// AutoWS accepts either an `scf.for` or a CLC-style `scf.while` as the
+// persistent outer-tile loop. `LoopLikeOpInterface` unions the two forms; the
+// helpers below cover the pieces that interface does not model -- which region
+// is the specialized body, and where a while's iteration counter lives.
+
+// Innermost enclosing persistent loop of \p op: the enclosing `scf.for` when
+// there is one, otherwise the enclosing `scf.while`. Null when neither exists.
+LoopLikeOpInterface getParentPersistentLoop(Operation *op);
+
+// The block AutoWS specializes for \p loop: the body of an `scf.for`, the
+// after-region body of an `scf.while`. Null for any other loop-like op.
+Block *getPersistentLoopBody(LoopLikeOpInterface loop);
+
+// The after-region argument of \p whileOp that advances once per iteration,
+// i.e. the AutoWS accumulation counter whose mapped `scf.yield` recurrence is
+// `arg + 1`. `scf.condition` may forward only a subset of the before
+// arguments, so each after argument is mapped through it before the yielded
+// value is inspected. Null when no such counter exists.
+Value getWhileIterationCounter(scf::WhileOp whileOp);
 
 /// Returns true if \p tmemAlloc has a MMAv5OpInterface user inside \p forOp
 /// whose acc_dep token is a loop iter_arg of \p forOp and whose output
