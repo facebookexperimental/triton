@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .models import (
     InputCase,
@@ -131,6 +132,64 @@ def _resolve_harness_paths(kernel: Path, harness: Path | None, cases: Path | Non
     return harness, cases, target
 
 
+def _expected_cuda_major(arch: str) -> int | None:
+    normalized = arch.lower().replace("-", "_").replace(" ", "_")
+    if normalized in {"hopper", "h100", "sm90", "sm_90"}:
+        return 9
+    if normalized in {"blackwell", "b200", "gb200", "sm100", "sm_100"}:
+        return 10
+    return None
+
+
+def _probe_cuda_compute_capability(device: str | None) -> tuple[int, int]:
+    try:
+        import torch
+    except ImportError as error:
+        raise SystemExit(
+            "CUDA target validation requires torch to be importable"
+        ) from error
+    if not torch.cuda.is_available():
+        raise SystemExit("CUDA target selected, but no CUDA device is available")
+    torch_device = torch.device(device or "cuda")
+    if torch_device.type != "cuda":
+        raise SystemExit(f"CUDA target selected, but target device is {device!r}")
+    device_index = torch_device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    return torch.cuda.get_device_capability(device_index)
+
+
+def _validate_host_matches_target(
+    target: KernelTarget,
+    arch: str | None,
+    capability_probe: Callable[[str | None], tuple[int, int]] = _probe_cuda_compute_capability,
+) -> None:
+    if target.backend != "cuda":
+        return
+    expected_major = _expected_cuda_major(arch or target.architecture)
+    if expected_major is None:
+        return
+    previous_environment: dict[str, str | None] = {}
+    try:
+        for key, value in target.environment.items():
+            previous_environment[key] = os.environ.get(key)
+            os.environ[key] = value
+        actual_major, actual_minor = capability_probe(target.device)
+    finally:
+        for key, value in previous_environment.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+    if actual_major != expected_major:
+        expected = f"sm_{expected_major}x"
+        actual = f"sm_{actual_major}{actual_minor}"
+        raise SystemExit(
+            f"--arch {arch or target.architecture} expects {expected}, "
+            f"but {target.device or 'cuda'} is {actual}"
+        )
+
+
 def main() -> int:
     args = _parse_args()
     harness_path, cases_path, target_path = _resolve_harness_paths(args.kernel, args.harness, args.cases, args.target, args.arch)
@@ -151,6 +210,7 @@ def main() -> int:
         device=target_payload.get("device"),
         environment=target_payload.get("environment", {}),
     )
+    _validate_host_matches_target(target, args.arch)
     budget = _budget_from_args(args)
     # CLI always evaluates via the optimizer's SubprocessHarness. The legacy
     # --harness-mode flag is kept for compatibility and documented as such;

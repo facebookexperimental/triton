@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from .cli import _resolve_harness_paths
+from .cli import _resolve_harness_paths, _validate_host_matches_target
 from .harness import StandaloneHarness
 from .models import (
     CaseEvaluation,
@@ -137,6 +137,31 @@ class ScoringTest(unittest.TestCase):
 
 
 class HarnessTest(unittest.TestCase):
+    def test_cuda_arch_validation_rejects_mismatched_host(self) -> None:
+        target = KernelTarget("cuda", "B200", device="cuda:0")
+        with self.assertRaisesRegex(SystemExit, "expects sm_10x.*is sm_90"):
+            _validate_host_matches_target(
+                target,
+                "blackwell",
+                capability_probe=lambda device: (9, 0),
+            )
+
+    def test_cuda_arch_validation_accepts_matching_host(self) -> None:
+        target = KernelTarget("cuda", "B200", device="cuda:0")
+        _validate_host_matches_target(
+            target,
+            "blackwell",
+            capability_probe=lambda device: (10, 0),
+        )
+
+    def test_host_arch_validation_does_not_probe_cuda(self) -> None:
+        target = KernelTarget("cpu", "host", device="cpu")
+
+        def fail_probe(device: str | None) -> tuple[int, int]:
+            raise AssertionError("CPU target should not probe CUDA")
+
+        _validate_host_matches_target(target, "host", capability_probe=fail_probe)
+
     def test_resolves_arch_first_harness_layout(self) -> None:
         kernel = Path("gemm.py")
         harness, cases, target = _resolve_harness_paths(
