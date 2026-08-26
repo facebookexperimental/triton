@@ -6,7 +6,9 @@
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Transforms/Passes.h"
 #include "nvidia/hopper/include/Transforms/Passes.h"
+#include "triton/Dialect/Triton/IR/DiscardableAttributes.h"
 #include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
+#include "llvm/Support/JSON.h"
 #include <list>
 #include <unordered_set>
 
@@ -19,6 +21,39 @@ namespace mlir {
 #define DEBUG_TYPE "nvgpu-ws-utility"
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
 #define LDBG(X) LLVM_DEBUG(DBGS() << X << "\n")
+
+SmallVector<bool> getAutoWSBooleanFlags(triton::FuncOp funcOp,
+                                        ArrayRef<StringRef> keys) {
+  SmallVector<bool> flags(keys.size(), false);
+  unsigned pending = keys.size();
+  if (pending == 0)
+    return flags;
+  funcOp.walk([&](Operation *op) {
+    auto attr = op->getAttrOfType<StringAttr>(tt::kAutoWSAnnotationAttrName);
+    if (!attr)
+      return WalkResult::advance();
+    auto parsed = llvm::json::parse(attr.getValue());
+    if (!parsed) {
+      llvm::consumeError(parsed.takeError());
+      return WalkResult::advance();
+    }
+    auto *object = parsed->getAsObject();
+    if (!object)
+      return WalkResult::advance();
+    for (unsigned i = 0; i < keys.size(); ++i) {
+      if (flags[i] || !object->getBoolean(keys[i]).value_or(false))
+        continue;
+      flags[i] = true;
+      --pending;
+    }
+    return pending == 0 ? WalkResult::interrupt() : WalkResult::advance();
+  });
+  return flags;
+}
+
+bool getAutoWSBooleanFlag(triton::FuncOp funcOp, StringRef key) {
+  return getAutoWSBooleanFlags(funcOp, {key}).front();
+}
 
 void removeWarpSpecMetadata(triton::FuncOp funcOp) {
   // The canonical set of attributes AutoWS stamps on ops/loops. `removeAttr` is

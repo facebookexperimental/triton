@@ -29,6 +29,25 @@ namespace tt = mlir::triton;
 constexpr llvm::StringLiteral kAtomicBroadcastCopiesAttrName =
     "ttg.atomic_broadcast_copies";
 
+// Boolean opt-in switches carried by the `tt.autows` JSON annotation
+// (tt::kAutoWSAnnotationAttrName). Named here so every pass that reads one
+// shares a single source of truth for the spelling.
+constexpr llvm::StringLiteral kAutoWSFuseFinalStatsKey =
+    "two_cta_fuse_final_stats";
+constexpr llvm::StringLiteral kAutoWSFuseAccSlicesKey =
+    "two_cta_fuse_acc_slices";
+constexpr llvm::StringLiteral kAutoWSTwoCTADirectWaitKey =
+    "two_cta_tma_direct_wait";
+
+// Answer a set of `tt.autows` boolean switches with one walk over funcOp: each
+// annotated op's JSON is parsed once for all keys, and the walk stops as soon
+// as every key has been seen set. Returns one entry per requested key, in the
+// order the keys were given. A switch is on when any annotation in the
+// function sets it to true.
+SmallVector<bool> getAutoWSBooleanFlags(triton::FuncOp funcOp,
+                                        ArrayRef<StringRef> keys);
+bool getAutoWSBooleanFlag(triton::FuncOp funcOp, StringRef key);
+
 // Strip every warp-specialization metadata attribute that AutoWS stamps on
 // ops/loops. Every graceful-reject path must call this so the downstream
 // tritongpu-pipeline pass sees a plain, compilable non-WS kernel; a leftover WS
@@ -338,7 +357,8 @@ optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
                  Value phase, Operation *headProducer, Operation *headConsumer,
                  Operation *headConsumerSameLevel,
                  ArrayRef<int> additionalConsumerTaskIds = {},
-                 DictionaryAttr consumerWaitConstraints = {});
+                 DictionaryAttr consumerWaitConstraints = {},
+                 bool twoCTADirectWait = false);
 void specializeRegion(triton::FuncOp funcOp, unsigned requestedRegisters);
 Value createBufferView(OpBuilderWithAsyncTaskIds &builder, Value alloc,
                        Value idx);
