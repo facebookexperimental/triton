@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from .cli import _resolve_harness_paths
 from .harness import StandaloneHarness
 from .models import (
     CaseEvaluation,
@@ -136,6 +137,38 @@ class ScoringTest(unittest.TestCase):
 
 
 class HarnessTest(unittest.TestCase):
+    def test_resolves_arch_first_harness_layout(self) -> None:
+        kernel = Path("gemm.py")
+        harness, cases, target = _resolve_harness_paths(
+            kernel, None, None, None, "hopper"
+        )
+        self.assertEqual(
+            harness,
+            Path(__file__).with_name("harnesses")
+            / "hopper"
+            / "targets"
+            / "gemm"
+            / "harness.py",
+        )
+        self.assertEqual(cases.name, "cases.json")
+        self.assertEqual(target.name, "target.json")
+
+    def test_default_arch_only_uses_arches_with_matching_target(self) -> None:
+        kernel = Path("vector_add.py")
+        harness, cases, target = _resolve_harness_paths(
+            kernel, None, None, None, None
+        )
+        self.assertEqual(
+            harness,
+            Path(__file__).with_name("harnesses")
+            / "host"
+            / "targets"
+            / "vector_add"
+            / "harness.py",
+        )
+        self.assertEqual(cases.name, "cases.json")
+        self.assertEqual(target.name, "target.json")
+
     def test_standalone_harness_evaluates_fake_kernel(self) -> None:
         harness = StandaloneHarness(
             Path(__file__).with_name("testdata") / "fake_harness.py"

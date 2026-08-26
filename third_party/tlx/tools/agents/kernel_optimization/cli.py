@@ -33,7 +33,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--arch",
         default=None,
-        help="Target arch under harnesses/<kernel>/targets/<arch> (e.g. blackwell, hopper, host). Defaults to first available.",
+        help="Target arch under harnesses/<arch>/targets/<kernel> (e.g. blackwell, hopper, host). Defaults to first available.",
     )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--max-rounds", type=int, default=5)
@@ -102,19 +102,23 @@ def _budget_from_args(args: argparse.Namespace) -> OptimizationBudget:
 
 
 def _resolve_harness_paths(kernel: Path, harness: Path | None, cases: Path | None, target: Path | None, arch: str | None) -> tuple[Path, Path, Path]:
-    # Kernel-only invocation: infer harness/cases/target from harnesses/<stem>/targets/<arch>/
-    # e.g. --kernel gemm.py -> harnesses/gemm/targets/blackwell/{harness.py,cases.json,target.json}
-    # Harness must be colocated with cases (kernel-specific), so both are resolved together.
+    # Kernel-only invocation: infer harness/cases/target from
+    # harnesses/<arch>/targets/<stem>/
+    # e.g. --kernel gemm.py -> harnesses/blackwell/targets/gemm/{harness.py,cases.json,target.json}
+    # Harness must be colocated with cases (target-specific), so both are resolved together.
     base = Path(__file__).resolve().parent / "harnesses"
     stem = kernel.stem  # gemm, vector_add, etc.
-    candidate_base = base / stem
-    if candidate_base.exists() and (harness is None or cases is None or target is None):
-        archs = sorted([p.name for p in (candidate_base / "targets").iterdir() if p.is_dir()]) if (candidate_base / "targets").exists() else []
+    if base.exists() and (harness is None or cases is None or target is None):
+        archs = sorted(
+            p.name
+            for p in base.iterdir()
+            if p.is_dir() and (p / "targets" / stem).is_dir()
+        )
         chosen = arch or (archs[0] if archs else None)
         if chosen is None:
             chosen = "blackwell" if harness is None else None
         if chosen is not None:
-            tdir = candidate_base / "targets" / chosen
+            tdir = base / chosen / "targets" / stem
             if harness is None and (tdir / "harness.py").exists():
                 harness = tdir / "harness.py"
             if cases is None and (tdir / "cases.json").exists():
@@ -123,7 +127,7 @@ def _resolve_harness_paths(kernel: Path, harness: Path | None, cases: Path | Non
                 target = tdir / "target.json"
     if harness is None or cases is None or target is None:
         missing = [n for n, v in [("harness", harness), ("cases", cases), ("target", target)] if v is None]
-        raise SystemExit(f"missing required {'/'.join(missing)}; pass them explicitly or use a kernel with harnesses/<name>/targets/<arch>/")
+        raise SystemExit(f"missing required {'/'.join(missing)}; pass them explicitly or use a kernel with harnesses/<arch>/targets/<name>/")
     return harness, cases, target
 
 

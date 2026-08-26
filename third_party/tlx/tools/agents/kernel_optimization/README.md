@@ -59,7 +59,7 @@ python -m third_party.tlx.tools.agents.kernel_optimization.cli \
   --provider codex --arch blackwell
 ```
 
-`--arch` selects `harnesses/<kernel>/targets/<arch>`; `harness`/`cases`/`target` can also be passed explicitly.
+`--arch` selects `harnesses/<arch>/targets/<kernel>`; `harness`/`cases`/`target` can also be passed explicitly.
 
 `--reference-kernel` is optional: a trusted oracle kernel. When provided it is persisted to `reference_kernel.py` in the output dir, exposed to harness workers via `TLX_REFERENCE_KERNEL_PATH`, and shown (truncated) to Codex in the prompt as comparison context. `verify` may load it to compare candidate vs reference.
 
@@ -96,7 +96,7 @@ isolation in the CLI path; `StandaloneHarness` is available via the Python API.
 
 ## TLX GEMM example
 
-`harnesses/gemm/targets/blackwell/harness.py` runs any complete candidate source that exports
+`harnesses/blackwell/targets/gemm/harness.py` runs any complete candidate source that exports
 `matmul(a, b)`. It compares against `torch.matmul`, benchmarks with
 `triton.testing.do_bench`, and reports latency and TFLOP/s. Set `TRITON_PROTON=1`
 to also collect a Triton Proton trace (returned inside `profile()`).
@@ -111,12 +111,13 @@ to also collect a Triton Proton trace (returned inside `profile()`).
   `{"ncu": {"sm_throughput": ...}}`. Large CSV traces can be written to a file and
   returned as `{"artifact": "path/to/trace.csv"}` — the agent will spill >1MB payloads.
 
-Target-specific `harness.py`/`cases.json`/`target.json` live colocated under `harnesses/<kernel>/targets/<arch>/` (B200,
-`sm_100` for blackwell and H100, `sm_90` for hopper); pick `targets/<arch>` that matches the
-device you are tuning for. Pass an existing TLX tutorial such as
+Target-specific `harness.py`/`cases.json`/`target.json` live colocated under `harnesses/<arch>/targets/<kernel>/` (B200,
+`sm_100` for blackwell and H100, `sm_90` for hopper); pick `--arch` to match the
+device you are tuning for. Architecture-wide notes, known optimization tricks, and shared
+target metadata can live directly under `harnesses/<arch>/`. Pass an existing TLX tutorial such as
 `third_party/tlx/tutorials/blackwell_gemm_ws.py` as `--kernel`.
 
-`harnesses/vector_add/targets/host/harness.py` is a minimal CPU-friendly harness for smoke tests
+`harnesses/host/targets/vector_add/harness.py` is a minimal CPU-friendly harness for smoke tests
 without a real GPU. Candidate must export `vector_add(a, b)`; on CPU the benchmark uses
 synthetic `LATENCY_US` timing so unit tests pass on any host.
 
