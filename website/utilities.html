@@ -93,6 +93,20 @@
 <pre><code class="language-python">    all_safe = tlx.warp_all(per_lane_safe)
     any_active = tlx.warp_any(per_lane_active)</code></pre>
 <p>Prefer these semantic reductions when code only needs an all/any result. They do not expose a hardware ballot bit mask.</p>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.warp_predicate(predicate, inits, body, args=(), wave_uniform=False)</code> <strong>[AMD]</strong></div></div>
+<p>Executes <code>body(*inits, *args)</code> with the hardware execution mask restricted to lanes where <code>predicate</code> is true. Active lanes receive the values returned by <code>body</code>; inactive lanes keep their corresponding values from <code>inits</code>. A single carried tensor is returned directly, while multiple carried tensors are returned as a tuple.</p>
+<p>A scalar predicate controls its physical lane. For a tensor predicate, the elements owned by each lane are OR-reduced to form that lane's execution bit. Unlike <code>tlx.warp_all</code> and <code>tlx.warp_any</code>, this does not make the predicate uniform across the wave.</p>
+<pre><code class="language-python">    @triton.jit
+    def scale_active(acc, scale):
+        return acc * scale
+
+    acc = tlx.warp_predicate(
+        active,
+        acc,
+        scale_active,
+        args=(scale,),
+    )</code></pre>
+<p><code>body</code> must be an <code>@triton.jit</code> function that returns the same number and types of tensors as <code>inits</code>. It must contain straight-line computation and no cross-wave synchronization. Reductions, dots, and layout shuffles are allowed only with <code>wave_uniform=True</code>, which asserts that every lane in a wave observes the same predicate. Cross-warp reductions, nested dynamic control flow, and other nested regions are unsupported. This operation is currently lowered only by the AMD backend.</p>
 <div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.prefetch(pointer, level=&quot;L2&quot;, mask=None, tensormap=False)</code> <strong>[sm90+]</strong> issues a non-blocking prefetch hint for pointer-based scattered/gather loads. This complements <code>tlx.async_descriptor_prefetch_tensor</code> (which works on TMA tensor descriptors) by supporting raw pointer tensors.</div></div>
 <p>Additionally, if <code>tensormap</code> is specified to <code>True</code>, the API instead does a prefetch of tensor map object (TMA descriptor) and ignores other parameters other than <code>pointer</code>.</p>
 <table><thead><tr><th>Level</th><th>PTX</th><th>Description</th></tr></thead><tbody><tr><td><code>&quot;L1&quot;</code></td><td><code>prefetch.global.L1</code></td><td>Prefetch into L1 and L2 cache</td></tr><tr><td><code>&quot;L2&quot;</code></td><td><code>prefetch.global.L2</code></td><td>Prefetch into L2 cache only (default)</td></tr></tbody></table>

@@ -1,4 +1,5 @@
 import re
+import builtins
 
 import triton.language.core as tl
 import triton.runtime.driver as driver
@@ -54,6 +55,90 @@ def thread_id(axis, _semantic=None):
     if axis not in (0, 1, 2):
         raise ValueError(f"thread_id axis must be 0, 1, or 2 but got {axis}")
     return tl.tensor(_semantic.builder.create_thread_id(axis), tl.int32)
+
+
+@tl.builtin
+def num_warps(_semantic=None):
+    """Return the number of warps executing the current kernel."""
+    return tl.constexpr(_semantic.builder.options.num_warps)
+
+
+@tl.builtin
+def warp_predicate(predicate, inits, body, args=(), wave_uniform=False, _semantic=None, _generator=None):
+    """Execute ``body`` under an AMD per-lane execution predicate.
+
+    A scalar predicate supplies the execution bit for the current physical
+    lane. For a tensor predicate, elements owned by one lane are OR-reduced to
+    that lane's execution bit. A wavefront skips ``body`` when none of its
+    lanes are active. Active lanes receive the values returned by
+    ``body(*inits, *args)``; inactive lanes keep ``inits``. The body must be an
+    ``@triton.jit`` function containing straight-line computation without
+    cross-wave synchronization. Bodies containing reductions, dots, or layout
+    shuffles must pass ``wave_uniform=True`` to declare that the predicate has
+    the same value for every lane in each wavefront. Cross-warp reductions and
+    other nested regions are rejected. The body must return exactly the same
+    number and types of tensors as ``inits``. A tensor predicate's shape must
+    match each carried tensor or a common leading shape (for example, one row
+    predicate for row-major matrices).
+
+    This operation has no cross-wave synchronization and is currently lowered
+    only by the AMD backend.
+    """
+    if isinstance(inits, tl.tensor):
+        inits = (inits, )
+    elif not isinstance(inits, (builtins.tuple, builtins.list, tl.tuple)):
+        raise TypeError("warp_predicate inits must be a tensor, tuple, or list")
+    if not isinstance(args, (builtins.tuple, builtins.list, tl.tuple)):
+        args = (args, )
+
+    inits = builtins.list(inits)
+    args = builtins.list(args)
+    if not inits:
+        raise ValueError("warp_predicate requires at least one carried value")
+    if not all(isinstance(value, tl.tensor) for value in inits):
+        raise TypeError("warp_predicate carried values must be tensors")
+
+    predicate = _semantic.to_tensor(predicate)
+    if predicate.dtype != tl.int1:
+        raise TypeError(f"warp_predicate predicate must have bool dtype, got {predicate.dtype}")
+    wave_uniform = tl._unwrap_if_constexpr(wave_uniform)
+    if not isinstance(wave_uniform, builtins.bool):
+        raise TypeError(f"warp_predicate wave_uniform must be a bool, got {type(wave_uniform).__name__}")
+
+    builder = _semantic.builder
+    block = builder.new_block()
+    insertion_point = builder.get_insertion_point()
+    try:
+        builder.set_insertion_point_to_start(block)
+        body_result = _generator.call_JitFunction(body, inits + args, kwargs={})
+        if isinstance(body_result, tl.tensor):
+            results = [body_result]
+        elif isinstance(body_result, (builtins.tuple, builtins.list, tl.tuple)):
+            results = builtins.list(body_result)
+        else:
+            raise TypeError("warp_predicate body must return a tensor, tuple, or list")
+        if len(results) != len(inits):
+            raise TypeError(f"warp_predicate body returned {len(results)} values for {len(inits)} carried values")
+        for index, (init, result) in enumerate(zip(inits, results)):
+            if not isinstance(result, tl.tensor):
+                raise TypeError(f"warp_predicate result {index} is not a tensor")
+            if result.type != init.type:
+                raise TypeError(f"warp_predicate result {index} has type {result.type}, expected {init.type}")
+        builder.create_predicate_yield_op([result.handle for result in results])
+    finally:
+        builder.restore_insertion_point(insertion_point)
+
+    result_types = [result.type.to_ir(builder) for result in results]
+    op = builder.create_warp_predicate_op(
+        result_types,
+        predicate.handle,
+        [init.handle for init in inits],
+        wave_uniform,
+    )
+    op.get_region(0).push_back(block)
+    builder.set_insertion_point_after(op)
+    merged = [tl.tensor(op.get_result(index), result.type) for index, result in enumerate(results)]
+    return merged[0] if len(merged) == 1 else builtins.tuple(merged)
 
 
 @tl.builtin

@@ -108,6 +108,12 @@ TritonGPUConversionTarget::TritonGPUConversionTarget(
     return false;
   });
 
+  addDynamicallyLegalOp<WarpPredicateOp>([&](WarpPredicateOp op) -> bool {
+    return typeConverter.isLegal(&op.getRegion()) && typeConverter.isLegal(op);
+  });
+  addDynamicallyLegalOp<PredicateYieldOp>(
+      [&](PredicateYieldOp op) -> bool { return typeConverter.isLegal(op); });
+
   addDynamicallyLegalOp<
       triton::gpu::AsyncCopyGlobalToLocalOp, triton::gpu::LocalLoadOp,
       triton::gpu::LocalStoreOp, triton::gpu::RemoteShmemStoreOp,

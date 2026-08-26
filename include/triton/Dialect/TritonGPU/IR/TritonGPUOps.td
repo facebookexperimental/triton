@@ -830,6 +830,49 @@ def TTG_WarpReturnOp
   let assemblyFormat = "attr-dict";
 }
 
+def TTG_WarpPredicateOp : TTG_Op<"warp_predicate", [
+  RecursiveMemoryEffects, RecursivelySpeculatable
+]> {
+  let summary = "run a region under a per-lane predicate";
+  let description = [{
+    Executes `$region` with the per-thread execution mask restricted to lanes
+    where `$predicate` is true. A scalar predicate supplies the execution bit
+    for the current physical lane. For a tensor predicate, all elements owned
+    by one lane are OR-reduced to its execution bit. If no lane in a wavefront
+    has the predicate set, the region is skipped for that wavefront without
+    cross-warp synchronization. Lanes where that bit is false keep the
+    corresponding `$inits` value. The region implicitly captures values from
+    above and is terminated by `ttg.predicate_yield`.
+
+    The region must contain exactly one block and may not contain nested
+    dynamic control flow. Cross-lane operations require `wave_uniform`, which
+    declares that every lane in each wavefront observes the same predicate.
+    Reductions spanning multiple warps remain unsupported. Other operations
+    with nested regions are rejected. Each init, result, and yielded value at
+    a given position must have the same type. A tensor predicate must have the
+    same leading logical shape and lane ownership as every tensor carried
+    through the region.
+  }];
+
+  let arguments = (ins TT_BoolLike:$predicate, Variadic<AnyType>:$inits,
+                       OptionalAttr<UnitAttr>:$wave_uniform);
+  let results = (outs Variadic<AnyType>:$results);
+  let regions = (region SizedRegion<1>:$region);
+
+  let assemblyFormat = [{
+    $predicate `(` $inits `)` $region attr-dict `:` functional-type(operands, results)
+  }];
+  let hasVerifier = 1;
+}
+
+def TTG_PredicateYieldOp : TTG_Op<"predicate_yield", [
+  Pure, Terminator, ReturnLike, HasParent<"WarpPredicateOp">
+]> {
+  let summary = "yield values from a ttg.warp_predicate region";
+  let arguments = (ins Variadic<AnyType>:$values);
+  let assemblyFormat = "($values^)? attr-dict (`:` type($values)^)?";
+}
+
 def TTG_Clock64Op
     : TTG_Op<"clock64", [MemoryEffects<[MemRead<DefaultResource>,
                                         MemWrite<DefaultResource>]>]> {
