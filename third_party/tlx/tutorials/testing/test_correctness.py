@@ -2049,6 +2049,8 @@ _TLX_GFX950_HSTU_VARIANTS = [
     "kv_parallel_fa_schedule",
     "kv_parallel_fa_schedule_mask_peel",
     "kv_parallel_fa_schedule_mask_peel_resident_k",
+    "kv_parallel_fa_schedule_mask_peel_resident_k_dr_resident",
+    "kv_parallel_fa_schedule_mask_peel_resident_k_dr_early_do_t",
     "kv_parallel_fa_schedule_bn256_direct_qdo_g2l",
 ]
 
