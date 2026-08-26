@@ -893,7 +893,7 @@ def _fwd_control_tile(
         m += tl.math.log2(l)
         offs_m = start_m * EFFECTIVE_BLOCK_M + group_id * BLOCK_M_SPLIT + tl.arange(0, BLOCK_M_SPLIT)
         m_ptrs = M + off_hz * N_CTX + offs_m
-        tl.store(m_ptrs, tl.reshape(m, [BLOCK_M_SPLIT]))
+        tl.store(m_ptrs, tl.reshape(m, [BLOCK_M_SPLIT]), mask=offs_m < N_CTX)
 
         # Normalize the completed accumulator into the output staging tile;
         # the epilog task owns publication to global memory.
@@ -1753,7 +1753,11 @@ def _attn_fwd_ws_kernel(
                 if USE_2CTA:
                     tlx.barrier_arrive(qk_empties[cid], 1, remote_cta_rank=0)
                     m_out = m_i * qk_scale if RESCALE_OPT else m_i
-                    tl.store(M + off_hz * N_CTX + offs_m, tl.math.log2(l_i) + m_out)
+                    tl.store(
+                        M + off_hz * N_CTX + offs_m,
+                        tl.math.log2(l_i) + m_out,
+                        mask=offs_m < N_CTX,
+                    )
                     _, phase = get_bufidx_phase(tile_count, 1)
                     tlx.barrier_wait(acc_empties[cid], phase)
                     tlx.barrier_wait(o_empties[cid], phase ^ 1)
