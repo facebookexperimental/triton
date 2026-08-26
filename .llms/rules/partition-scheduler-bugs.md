@@ -172,6 +172,12 @@
 - **Companion**: `ws_code_partition_empty_producer_guard.mlir` now runs `--nvgpu-partition-scheduling-meta` before `--nvgpu-warp-specialization`. Its raw kernel carries no `ttg.partition`, so under the new gate the pass rejected it early and the test silently stopped covering bug #7 — while its pre-fix output had been pinning 4 unlowered `nvws.descriptor_load` ops and no `ttg.warp_specialize`. With PSM in the pipeline it gets real partitions, emits physical WS regions, and reaches `createChannelPost` as intended.
 - **Key insight**: `tt.warp_specialize` on a loop is a *request*, not a decision. Any pass that rewrites ops on the strength of that marker must first confirm partitions exist, because the pass that undoes the rewrite only runs when they do.
 
+### 23. Dead scalar rematerialization clones create descriptor-load self-consumers (2026-08-18, fixed)
+- **Symptom**: BM128 2-CTA FA backward is nondeterministically numerically wrong after rebasing; dV reports first, but dK/dQ are also corrupted.
+- **Root cause**: partition scheduling clones the `m`/`delta` convert-layout chain into the load task, but those clones are dead. Descriptor-load conversion counted the dead task-3 users when assigning the replacement `local_load`, creating a producer-task self-consumer channel and unsafe TMA-buffer rotation.
+- **Fix**: before converting each descriptor load, recursively erase only dead `convert_layout`/`broadcast`/`expand_dims` rematerialization chains, then derive consumer task IDs from the remaining users. Whole-function DCE is intentionally avoided because test/debug IR may contain unrelated dead consumers.
+- **Regression**: `ws_code_partition.mlir` pins the alloc set after the dead chain is erased. The `ws_remove_redundant_tmem_zero_bwd_bm128_inner.mlir` assertion that both rank-1 statistic `local_load`s belong only to computation task 0 is added with that fixture, which a later commit introduces.
+
 ## Debugging Workflow
 - `t.dump` captures IR after each WarpSpec pass (doTaskIdPropagate → doBufferAllocation → doMemoryPlanner → doCodePartition → ...)
 - IR after PartitionSchedulingMeta uses `ttg.partition = array<i32: N>` attributes (not `async_task_id`)
