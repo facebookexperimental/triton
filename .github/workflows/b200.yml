@@ -94,7 +94,7 @@ jobs:
     env:
       CONDA_ENV: meta-triton
       SETUP_SCRIPT: /workspace/setup_instance.sh
-    timeout-minutes: 30
+    timeout-minutes: 120
     permissions:
       id-token: write
       contents: read
