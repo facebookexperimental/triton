@@ -1,3 +1,4 @@
+#include "lib/Dialect/TritonGPU/Transforms/WarpSpecialization/PartitionAttrs.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "triton/Conversion/TritonGPUToLLVM/Passes.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
@@ -30,6 +31,29 @@ static int32_t minRegistersForRegion(Region &region, bool instrumented,
   return instrumented || regionUsesAssertOrPrint(region)
              ? std::max(minRegisters, kMinRegistersForAssertOrPrint)
              : minRegisters;
+}
+
+// A module with exactly one AutoWS-generated WarpSpecializeOp can use direct
+// warp-ID dispatch. Require the AutoWS tag so manual TLX is not opted in
+// implicitly; TLX requests this lowering via async_tasks(exclusive=True).
+static void enableSingleWarpSpecializeForAutoWS(ModuleOp mod) {
+  if (mod->hasAttr(AttrSingleWarpSpecializeName))
+    return;
+
+  SmallVector<WarpSpecializeOp> wsOps;
+  mod.walk([&](WarpSpecializeOp op) { wsOps.push_back(op); });
+  if (wsOps.size() != 1)
+    return;
+
+  bool hasAutoWSTag = false;
+  wsOps.front()->walk([&](Operation *op) {
+    if (!op->hasAttr(kWarpSpecializeTagAttrName))
+      return WalkResult::advance();
+    hasAutoWSTag = true;
+    return WalkResult::interrupt();
+  });
+  if (hasAutoWSTag)
+    setHasSingleWarpSpecialize(mod, true);
 }
 
 // Given a `ttg.warp_specialize` with a certain number of existing warps, pad it
@@ -98,6 +122,7 @@ struct AllocateWarpGroups
   void runOnOperation() override {
     ModuleOp mod = getOperation();
     bool laterInstrumentation = instrumented.getValue();
+    enableSingleWarpSpecializeForAutoWS(mod);
 
     // First determine the maximum number of extra warps.
     int maxExtraWarps = 0;

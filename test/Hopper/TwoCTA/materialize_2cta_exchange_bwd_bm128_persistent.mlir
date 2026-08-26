@@ -1,5 +1,6 @@
 // RUN: triton-opt %s --nvgpu-materialize-2cta-exchange | FileCheck %s --check-prefix=SHAPE
 // RUN: triton-opt %s --nvgpu-materialize-2cta-exchange | FileCheck %s --check-prefix=CLEAN
+// RUN: triton-opt %s --tritongpu-optimize-partition-warps | FileCheck %s --check-prefix=WARPS
 
 // Full TTGIR captured immediately before NVGPUMaterialize2CTAExchange from
 // the non-causal persistent BM128 2-CTA configuration after AutoWS and
@@ -17,6 +18,12 @@
 // SHAPE-COUNT-2: ttng.tmem_load
 // CLEAN-NOT: ttng.two_cta_peer_gather
 // CLEAN-NOT: ttng.two_cta_peer_relay
+// WARPS: partition0({{.*}}) num_warps(1)
+// WARPS: partition1({{.*}}) num_warps(1)
+// WARPS: partition2({{.*}}) num_warps(1)
+// The single-CTA eight-warp computation override changes this kernel's
+// layouts and exceeds the Blackwell SMEM limit. Keep its computed four warps.
+// WARPS: partition3({{.*}}) num_warps(4)
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [8, 4], warpsPerCTA = [4, 1], order = [1, 0]}>
 #blocked1 = #ttg.blocked<{sizePerThread = [1, 2, 4], threadsPerWarp = [8, 1, 4], warpsPerCTA = [4, 1, 1], order = [1, 2, 0]}>
