@@ -472,6 +472,31 @@ def get_packages():
 
     yield "triton.language.extra.tlx"
 
+    # The TLX op library. find_packages() does follow the symlink once it
+    # exists, but on a fresh tree add_links() may not have run yet, so
+    # enumerate from the source directory instead of the link target.
+    yield "triton.tlx"
+    for pkg in _tlx_ops_packages():
+        yield pkg
+
+
+def _tlx_ops_dir():
+    return os.path.abspath(os.path.join(os.path.dirname(__file__), "third_party", "tlx", "ops"))
+
+
+def _tlx_ops_packages():
+    """Every package under third_party/tlx/ops, as triton.tlx.ops.* names."""
+    root = _tlx_ops_dir()
+    if not os.path.isdir(root):
+        return
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d != "__pycache__"]
+        if "__init__.py" not in filenames:
+            continue
+        rel = os.path.relpath(dirpath, root)
+        suffix = "" if rel == "." else "." + rel.replace(os.sep, ".")
+        yield f"triton.tlx.ops{suffix}"
+
 
 def add_link_to_backends(external_only):
     for backend in backends:
@@ -510,6 +535,12 @@ def add_link_to_tlx():
     src_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "third_party", "tlx", "language", "tlx"))
     install_dir = os.path.join(os.path.dirname(__file__), "python", "triton", "language", "extra", "tlx")
     update_symlink(install_dir, src_dir)
+
+    # The op library lands at triton.tlx.ops. python/triton/tlx/__init__.py is
+    # a real committed file, so only `ops` is linked; that keeps the source
+    # name honest (ops/ holds ops) while users get the short public path.
+    ops_install_dir = os.path.join(os.path.dirname(__file__), "python", "triton", "tlx", "ops")
+    update_symlink(ops_install_dir, _tlx_ops_dir())
 
 
 def add_links(external_only):
