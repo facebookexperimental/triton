@@ -797,7 +797,18 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90"} {
   tt.func @cluster_barrier_invalid() {
-    // expected-error @below {{requires ttg.num-ctas > 1}}
+    // expected-error @below {{requires more than one CTA per cluster}}
+    ttng.cluster_barrier
+    tt.return
+  }
+}
+
+// -----
+
+// An explicit CUDA-style physical cluster is also a valid multi-CTA cluster,
+// even though the logical Triton layout remains single-CTA.
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32, ttg.target = "cuda:90"} {
+  tt.func @cluster_barrier_explicit_cluster_valid() {
     ttng.cluster_barrier
     tt.return
   }
@@ -1411,6 +1422,30 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
       %b: tensor<256xf8E8M0FNU, #blocked>) {
     // expected-error @below {{'ttng.packed_arith' op unsupported add signature e4m3x4 <- (e4m3x4, ue8m0x4)}}
     %0 = ttng.packed_arith add %a, %b : (tensor<256xf8E4M3FN, #blocked>, tensor<256xf8E8M0FNU, #blocked>) -> tensor<256xf8E4M3FN, #blocked>
+    tt.return
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [4, 1], order = [1, 0], CGALayout = [[1, 0]]}>
+module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @peer_gather_requires_two_ctas(
+      %src: tensor<64x64xf16, #blocked>) {
+    // expected-error @below {{'ttng.two_cta_peer_gather' op currently supports exactly two CTAs}}
+    %0 = ttng.two_cta_peer_gather %src split_dim = 0 num_ctas = 4 : tensor<64x64xf16, #blocked> -> tensor<64x64xf16, #blocked>
+    tt.return
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [4, 1], order = [1, 0], CGALayout = [[1, 0]]}>
+module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @peer_gather_preserves_elements(
+      %src: tensor<64x64xf16, #blocked>) {
+    // expected-error @below {{'ttng.two_cta_peer_gather' op source and result must preserve element type and element count}}
+    %0 = ttng.two_cta_peer_gather %src split_dim = 0 num_ctas = 2 : tensor<64x64xf16, #blocked> -> tensor<32x64xf16, #blocked>
     tt.return
   }
 }
