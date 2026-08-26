@@ -2689,6 +2689,8 @@ def _tlx_gfx950_hstu_fa_front(
     Q_OUT_LAYOUT: tl.constexpr,
     IS_MASKLESS: tl.constexpr,
     RESIDENT_K_SCORE: tl.constexpr,
+    DR_RESIDENT: tl.constexpr,
+    EARLY_DO_T: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
     dv = tlx.require_layout(dv, MMA_ND, pin=False)
@@ -2698,6 +2700,8 @@ def _tlx_gfx950_hstu_fa_front(
     else:
         k_operand = tlx.local_load(k_buffer, layout=K_NM_LAYOUT, relaxed=True)
     q_t = tlx.local_load(tlx.local_trans(q_slice), layout=QT_LAYOUT, relaxed=True)
+    if EARLY_DO_T:
+        do_t = tlx.local_load(tlx.local_trans(do_slice), layout=QT_LAYOUT, relaxed=True)
     # Triton TR011: pin tensor-core behavior across compiler default changes.
     scores = tl.dot(
         k_operand,
@@ -2712,7 +2716,8 @@ def _tlx_gfx950_hstu_fa_front(
         registers_per_group=score_registers_per_group,
     )
     if IS_MASKLESS:
-        do_t = tlx.local_load(tlx.local_trans(do_slice), layout=QT_LAYOUT, relaxed=True)
+        if not EARLY_DO_T:
+            do_t = tlx.local_load(tlx.local_trans(do_slice), layout=QT_LAYOUT, relaxed=True)
         # Triton TR011: pin tensor-core behavior across compiler default changes.
         da = tl.dot(
             v_operand,
@@ -2763,7 +2768,8 @@ def _tlx_gfx950_hstu_fa_front(
         a = tl.where(valid, r * scaled_sig, zero)
 
     if not IS_MASKLESS:
-        do_t = tlx.local_load(tlx.local_trans(do_slice), layout=QT_LAYOUT, relaxed=True)
+        if not EARLY_DO_T:
+            do_t = tlx.local_load(tlx.local_trans(do_slice), layout=QT_LAYOUT, relaxed=True)
         # Triton TR011: pin tensor-core behavior across compiler default changes.
         da = tl.dot(
             v_operand,
@@ -2783,6 +2789,12 @@ def _tlx_gfx950_hstu_fa_front(
     dr = da * (scaled_sig + a * (one - sig))
     if not IS_MASKLESS:
         dr = tl.where(valid, dr, zero)
+    if DR_RESIDENT:
+        dr = tlx.amd_register_resident(
+            dr,
+            register_class="vgpr",
+            registers_per_group=8,
+        )
 
     a_nd = tl.reshape(a.to(tl.bfloat16), (BLOCK_N // 128, 2, 2, 2, 16, 16))
     a_nd = tl.permute(a_nd, (0, 2, 3, 1, 4, 5))
@@ -2850,6 +2862,8 @@ def _tlx_gfx950_hstu_fa_phase(
     DIRECT_QDO_G2L: tl.constexpr,
     IS_MASKLESS: tl.constexpr,
     RESIDENT_K_SCORE: tl.constexpr,
+    DR_RESIDENT: tl.constexpr,
+    EARLY_DO_T: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
     start_m = query_tile * 16 + phase * 16
@@ -2878,6 +2892,8 @@ def _tlx_gfx950_hstu_fa_phase(
         Q_OUT_LAYOUT,
         IS_MASKLESS,
         RESIDENT_K_SCORE,
+        DR_RESIDENT,
+        EARLY_DO_T,
         BLOCK_N,
     )
     if PREFETCH_NEXT:
@@ -3020,6 +3036,8 @@ def _tlx_gfx950_hstu_fa_outer_block(
     DIRECT_QDO_G2L: tl.constexpr,
     IS_MASKLESS: tl.constexpr,
     RESIDENT_K_SCORE: tl.constexpr,
+    DR_RESIDENT: tl.constexpr,
+    EARLY_DO_T: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
     outer_stage = outer_offset % 2
@@ -3080,6 +3098,8 @@ def _tlx_gfx950_hstu_fa_outer_block(
             DIRECT_QDO_G2L,
             IS_MASKLESS,
             RESIDENT_K_SCORE,
+            DR_RESIDENT,
+            EARLY_DO_T,
             BLOCK_N,
         )
     dk, dv, v_operand = _tlx_gfx950_hstu_fa_phase(
@@ -3123,6 +3143,8 @@ def _tlx_gfx950_hstu_fa_outer_block(
         DIRECT_QDO_G2L,
         IS_MASKLESS,
         RESIDENT_K_SCORE,
+        DR_RESIDENT,
+        EARLY_DO_T,
         BLOCK_N,
     )
     return dk, dv, v_operand
@@ -3160,6 +3182,8 @@ def _tlx_gfx950_hstu_fa_schedule_bwd_kernel(  # noqa: TR001
     DIRECT_QDO_G2L: tl.constexpr,
     MASK_PEEL: tl.constexpr,
     RESIDENT_K_SCORE: tl.constexpr,
+    DR_RESIDENT: tl.constexpr,
+    EARLY_DO_T: tl.constexpr,
 ):
     BLOCK_M: tl.constexpr = 16
     OUTER_M: tl.constexpr = 64
@@ -3547,6 +3571,8 @@ def _tlx_gfx950_hstu_fa_schedule_bwd_kernel(  # noqa: TR001
                 DIRECT_QDO_G2L,
                 False,
                 RESIDENT_K_SCORE,
+                DR_RESIDENT,
+                EARLY_DO_T,
                 BLOCK_N,
             )
         for outer_offset in tl.range(maskless_begin, maskless_end, loop_unroll_factor=1):
@@ -3588,6 +3614,8 @@ def _tlx_gfx950_hstu_fa_schedule_bwd_kernel(  # noqa: TR001
                 DIRECT_QDO_G2L,
                 True,
                 RESIDENT_K_SCORE,
+                DR_RESIDENT,
+                EARLY_DO_T,
                 BLOCK_N,
             )
         for outer_offset in tl.range(maskless_end, active_outer_blocks, loop_unroll_factor=1):
@@ -3629,6 +3657,8 @@ def _tlx_gfx950_hstu_fa_schedule_bwd_kernel(  # noqa: TR001
                 DIRECT_QDO_G2L,
                 False,
                 RESIDENT_K_SCORE,
+                DR_RESIDENT,
+                EARLY_DO_T,
                 BLOCK_N,
             )
     else:
@@ -3671,6 +3701,8 @@ def _tlx_gfx950_hstu_fa_schedule_bwd_kernel(  # noqa: TR001
                 DIRECT_QDO_G2L,
                 False,
                 RESIDENT_K_SCORE,
+                DR_RESIDENT,
+                EARLY_DO_T,
                 BLOCK_N,
             )
 
@@ -5331,6 +5363,8 @@ def tlx_gfx950_ragged_attention_bwd(
     fa_schedule_direct_qdo_g2l: bool = False,
     fa_schedule_mask_peel: bool = False,
     fa_schedule_resident_k_score: bool = False,
+    fa_schedule_dr_resident: bool = False,
+    fa_schedule_early_do_t: bool = False,
     num_softmax_heads: int = 0,
     M: Optional[torch.Tensor] = None,
     Out: Optional[torch.Tensor] = None,
@@ -5450,6 +5484,8 @@ def tlx_gfx950_ragged_attention_bwd(
             DIRECT_QDO_G2L=fa_schedule_direct_qdo_g2l,
             MASK_PEEL=fa_schedule_mask_peel,
             RESIDENT_K_SCORE=fa_schedule_resident_k_score,
+            DR_RESIDENT=fa_schedule_dr_resident,
+            EARLY_DO_T=fa_schedule_early_do_t,
             num_warps=4,
             num_stages=1,
             matrix_instr_nonkdim=16,
@@ -5696,6 +5732,8 @@ class TlxGfx950RaggedAttentionFunction(torch.autograd.Function):
                 fa_schedule_direct_qdo_g2l=getattr(ctx, "fa_schedule_direct_qdo_g2l", False),
                 fa_schedule_mask_peel=getattr(ctx, "fa_schedule_mask_peel", False),
                 fa_schedule_resident_k_score=getattr(ctx, "fa_schedule_resident_k_score", False),
+                fa_schedule_dr_resident=getattr(ctx, "fa_schedule_dr_resident", False),
+                fa_schedule_early_do_t=getattr(ctx, "fa_schedule_early_do_t", False),
                 num_softmax_heads=ctx.num_softmax_heads,
                 M=ctx.M,
                 Out=ctx.out,
@@ -5805,6 +5843,37 @@ class TlxGfx950RaggedAttentionKVParallelFAScheduleMaskPeelResidentKFunction(TlxG
         ctx.fa_schedule_direct_qdo_g2l = True
         ctx.fa_schedule_mask_peel = True
         ctx.fa_schedule_resident_k_score = True
+        return TlxGfx950RaggedAttentionFunction.backward(ctx, dout)
+
+
+class TlxGfx950RaggedAttentionKVParallelFAScheduleMaskPeelResidentKDRResidentFunction(TlxGfx950RaggedAttentionFunction):
+
+    @staticmethod
+    # pyre-ignore[14]
+    def backward(ctx, dout: torch.Tensor):
+        ctx.native_mfma_dq_warps = 4
+        ctx.kv_parallel = True
+        ctx.fa_schedule = True
+        ctx.fa_schedule_direct_qdo_g2l = True
+        ctx.fa_schedule_mask_peel = True
+        ctx.fa_schedule_resident_k_score = True
+        ctx.fa_schedule_dr_resident = True
+        return TlxGfx950RaggedAttentionFunction.backward(ctx, dout)
+
+
+class TlxGfx950RaggedAttentionKVParallelFAScheduleMaskPeelResidentKDREarlyDOTFunction(TlxGfx950RaggedAttentionFunction):
+
+    @staticmethod
+    # pyre-ignore[14]
+    def backward(ctx, dout: torch.Tensor):
+        ctx.native_mfma_dq_warps = 4
+        ctx.kv_parallel = True
+        ctx.fa_schedule = True
+        ctx.fa_schedule_direct_qdo_g2l = True
+        ctx.fa_schedule_mask_peel = True
+        ctx.fa_schedule_resident_k_score = True
+        ctx.fa_schedule_dr_resident = True
+        ctx.fa_schedule_early_do_t = True
         return TlxGfx950RaggedAttentionFunction.backward(ctx, dout)
 
 
@@ -6116,24 +6185,33 @@ def _tlx_gfx950_ragged_attention_fwd_fake(
 # `tlx_bw_hstu_attention.tlx_bw_hstu_mha` so both can be driven from one harness.
 
 BWD_VARIANTS = {
-    "default": TlxGfx950RaggedAttentionFunction,
-    "native_mfma_4wave": TlxGfx950RaggedAttentionNativeMFMA4WaveFunction,
-    "native_mfma_8wave": TlxGfx950RaggedAttentionNativeMFMA8WaveFunction,
-    "kv_parallel": TlxGfx950RaggedAttentionKVParallelFunction,
+    "default":
+    TlxGfx950RaggedAttentionFunction,
+    "native_mfma_4wave":
+    TlxGfx950RaggedAttentionNativeMFMA4WaveFunction,
+    "native_mfma_8wave":
+    TlxGfx950RaggedAttentionNativeMFMA8WaveFunction,
+    "kv_parallel":
+    TlxGfx950RaggedAttentionKVParallelFunction,
     "kv_parallel_native_mfma_4wave": (TlxGfx950RaggedAttentionKVParallelNativeMFMA4WaveFunction),
-    "kv_parallel_fa_schedule": TlxGfx950RaggedAttentionKVParallelFAScheduleFunction,
+    "kv_parallel_fa_schedule":
+    TlxGfx950RaggedAttentionKVParallelFAScheduleFunction,
     "kv_parallel_fa_schedule_direct_qdo_g2l": (TlxGfx950RaggedAttentionKVParallelFAScheduleDirectQDOG2LFunction),
     "kv_parallel_fa_schedule_mask_peel": (TlxGfx950RaggedAttentionKVParallelFAScheduleMaskPeelFunction),
     "kv_parallel_fa_schedule_mask_peel_resident_k":
     (TlxGfx950RaggedAttentionKVParallelFAScheduleMaskPeelResidentKFunction),
+    "kv_parallel_fa_schedule_mask_peel_resident_k_dr_resident":
+    (TlxGfx950RaggedAttentionKVParallelFAScheduleMaskPeelResidentKDRResidentFunction),
+    "kv_parallel_fa_schedule_mask_peel_resident_k_dr_early_do_t":
+    (TlxGfx950RaggedAttentionKVParallelFAScheduleMaskPeelResidentKDREarlyDOTFunction),
     "kv_parallel_fa_schedule_bn256": (TlxGfx950RaggedAttentionKVParallelFAScheduleBN256Function),
     "kv_parallel_fa_schedule_bn256_direct_qdo_g2l":
     (TlxGfx950RaggedAttentionKVParallelFAScheduleBN256DirectQDOG2LFunction),
 }
 
-# BN128 resident-K mask-peel is the best backward at N >= 2048; the BN256
-# direct-load variant still wins at N == 1024.
-DEFAULT_BWD_VARIANT: str = "kv_parallel_fa_schedule_mask_peel_resident_k"
+# Cumulative tip of the schedule stack: resident-K mask-peel + register-resident
+# dR + preloaded dO transpose.
+DEFAULT_BWD_VARIANT: str = "kv_parallel_fa_schedule_mask_peel_resident_k_dr_early_do_t"
 
 
 def tlx_gfx950_hstu_mha(
