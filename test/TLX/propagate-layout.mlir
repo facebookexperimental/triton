@@ -105,6 +105,43 @@ module attributes {tlx.has_tlx_ops = true, "ttg.num-ctas" = 1 : i32, "ttg.num-wa
 }
 
 // -----
+// Carried rows with identical lane ownership may use different register
+// ordering. The shared predicate can select either ordering because EXEC is
+// controlled per lane, not per register.
+
+#register_order_old = #ttg.blocked<{sizePerThread = [4], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+#register_order_a = #ttg.linear<{register = [[1], [2]], lane = [[4], [8], [16], [32], [64], [128]], warp = [], block = []}>
+#register_order_b = #ttg.linear<{register = [[2], [1]], lane = [[4], [8], [16], [32], [64], [128]], warp = [], block = []}>
+
+module attributes {tlx.has_tlx_ops = true, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  // CHECK-DAG: #[[$REGISTER_ORDER_A:.*]] = #ttg.linear<{register = {{\[\[}}1], [2{{\]\]}}
+  // CHECK-DAG: #[[$REGISTER_ORDER_B:.*]] = #ttg.linear<{register = {{\[\[}}2], [1{{\]\]}}
+  // CHECK-LABEL: tt.func public @allow_register_reordered_carried_rows
+  tt.func public @allow_register_reordered_carried_rows(
+      %predicate: tensor<256xi1, #register_order_old>,
+      %lhs: tensor<256xf32, #register_order_old>,
+      %rhs: tensor<256xf32, #register_order_old>)
+      -> (tensor<256xf32, #register_order_old>, tensor<256xf32, #register_order_old>) {
+    // CHECK-DAG: %[[PREDICATE:.*]] = ttg.convert_layout %{{.*}} : tensor<256xi1, #{{.*}}> -> tensor<256xi1, #[[$REGISTER_ORDER_A]]>
+    // CHECK: %[[RESULT:.*]]:2 = ttg.warp_predicate %[[PREDICATE]](%{{.*}}, %{{.*}}) {
+    %result:2 = ttg.warp_predicate %predicate (%lhs, %rhs) {
+      %lhs_native = ttg.convert_layout %lhs : tensor<256xf32, #register_order_old> -> tensor<256xf32, #register_order_a>
+      %lhs_next = arith.addf %lhs_native, %lhs_native : tensor<256xf32, #register_order_a>
+      %lhs_old = ttg.convert_layout %lhs_next : tensor<256xf32, #register_order_a> -> tensor<256xf32, #register_order_old>
+      %rhs_native = ttg.convert_layout %rhs : tensor<256xf32, #register_order_old> -> tensor<256xf32, #register_order_b>
+      %rhs_next = arith.addf %rhs_native, %rhs_native : tensor<256xf32, #register_order_b>
+      %rhs_old = ttg.convert_layout %rhs_next : tensor<256xf32, #register_order_b> -> tensor<256xf32, #register_order_old>
+      // CHECK: ttg.predicate_yield %{{.*}}, %{{.*}} : tensor<256xf32, #[[$REGISTER_ORDER_A]]>, tensor<256xf32, #[[$REGISTER_ORDER_B]]>
+      ttg.predicate_yield %lhs_old, %rhs_old : tensor<256xf32, #register_order_old>, tensor<256xf32, #register_order_old>
+    } : (tensor<256xi1, #register_order_old>, tensor<256xf32, #register_order_old>, tensor<256xf32, #register_order_old>) -> (tensor<256xf32, #register_order_old>, tensor<256xf32, #register_order_old>)
+    // CHECK: } : (tensor<256xi1, #[[$REGISTER_ORDER_A]]>, tensor<256xf32, #[[$REGISTER_ORDER_A]]>, tensor<256xf32, #[[$REGISTER_ORDER_B]]>) -> (tensor<256xf32, #[[$REGISTER_ORDER_A]]>, tensor<256xf32, #[[$REGISTER_ORDER_B]]>)
+    // CHECK-DAG: ttg.convert_layout %[[RESULT]]#0 : tensor<256xf32, #[[$REGISTER_ORDER_A]]> -> tensor<256xf32, #{{.*}}>
+    // CHECK-DAG: ttg.convert_layout %[[RESULT]]#1 : tensor<256xf32, #[[$REGISTER_ORDER_B]]> -> tensor<256xf32, #{{.*}}>
+    tt.return %result#0, %result#1 : tensor<256xf32, #register_order_old>, tensor<256xf32, #register_order_old>
+  }
+}
+
+// -----
 // A sibling that computes directly in the old layout must consume a restored
 // value instead of being optimistically retyped with the first region. Its
 // initial ownership is likewise a provisional TLX layout-propagation state.

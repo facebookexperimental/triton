@@ -3158,9 +3158,10 @@ def _attn_fwd_cluster_persistent_pipeline(
                         pid_m = tl.where(idx % 2 == 0, half, NUM_M_BLOCKS - 1 - half)
                     else:
                         pid_m = idx
-                    # Safe to reuse the LDS slots across units: the outer loop
-                    # has num_stages=1 and _attn_cluster_tile drains all async
-                    # load groups before it returns.
+                    # The tile drains its async producer groups before it
+                    # returns. The barrier below separately closes the
+                    # consumer-to-refill hazard before these LDS slots are
+                    # reused by the next persistent tile.
                     _attn_cluster_tile(
                         pid_m,
                         off_z,
@@ -3197,6 +3198,7 @@ def _attn_fwd_cluster_persistent_pipeline(
                         False,
                         IS_CAUSAL,
                     )
+                    tl.debug_barrier()
 
 
 # Short cluster kernels can exhaust ROCm event resources in the entropy

@@ -235,8 +235,9 @@ public:
           auto candidateType =
               RankedTensorType::get(predicateType.getShape(),
                                     predicateType.getElementType(), encoding);
-          if (ttg::toLinearLayout(selectedType) !=
-              ttg::toLinearLayout(candidateType))
+          if (!ttg::isLayoutEquivalentIgnoringRegisterOrder(
+                  ttg::toLinearLayout(selectedType),
+                  ttg::toLinearLayout(candidateType)))
             conflictingPredicateEncoding = true;
         }
       }

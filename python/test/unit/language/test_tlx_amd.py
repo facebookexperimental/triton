@@ -575,6 +575,49 @@ def test_amd_fa_cluster_one_tile_prefix_handoff_codegen_gfx950():
     assert ".vgpr_spill_count: 0" in amdgcn
 
 
+def test_amd_fa_cluster_persistent_reuse_waits_for_lds_consumers_gfx950():
+    """Persistent tiles rendezvous before their LDS slots are reused."""
+    batch, heads, n_ctx, head_dim = 2, 9, 1024, 128
+    tensor = MockTensor(torch.bfloat16, (batch, heads, n_ctx, head_dim))
+    strides = (heads * n_ctx * head_dim, n_ctx * head_dim, head_dim, 1)
+
+    with knobs.runtime.scope():
+        knobs.runtime.override_arch = "gfx950"
+        compiled = _amd_fa_cluster_module._attn_fwd_cluster_persistent_pipeline.warmup(
+            tensor,
+            tensor,
+            tensor,
+            tensor,
+            *strides,
+            *strides,
+            *strides,
+            *strides,
+            batch,
+            H=heads,
+            N_CTX=n_ctx,
+            sm_scale=1.0 / head_dim**0.5,
+            BLOCK_M=256,
+            BLOCK_N=64,
+            BUF_DEPTH=2,
+            HEAD_DIM=head_dim,
+            USE_DIRECT_LOAD=False,
+            IS_CAUSAL=True,
+            NUM_M_BLOCKS=n_ctx // 256,
+            NUM_SMS=16,
+            NUM_XCDS=4,
+            grid=(16, ),
+            num_warps=8,
+            num_stages=3,
+            waves_per_eu=2,
+            enable_sched_group_barrier_scheduler=False,
+        )
+
+    ttgir = compiled.asm["ttgir"]
+    output_stores = re.findall(r"amdg\.buffer_store[^\n]*\n\s+ttg\.barrier all", ttgir)
+    # A causal persistent work unit statically contains two tile bodies.
+    assert len(output_stores) == 2
+
+
 def test_amd_fa_cluster_n1024_fp16_qk_handoff_uses_result_barrier_gfx950():
     """The long BM128 prefix anchors both QK groups before reusing K0."""
     batch, heads, n_ctx, head_dim = 1, 64, 1024, 128
