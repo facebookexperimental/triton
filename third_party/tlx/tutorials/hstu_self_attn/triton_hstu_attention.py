@@ -591,6 +591,11 @@ def _get_bw_configs() -> List[triton.Config]:
     if _AUTOWS_CFG.autows:
         _w = _AUTOWS_CFG.warps
         _bm = _AUTOWS_CFG.bwd_bm
+        # Dedicated dQ TMEM plus the dK/dV accumulators exceeds Blackwell's
+        # 512-column budget at BM128. Keep reuse configs on the BM64 plan even
+        # when an older caller still requests the pre-reuse tile size.
+        if _AUTOWS_CFG.dq_reuse:
+            _bm = min(_bm, 64)
         _bn = _AUTOWS_CFG.bwd_bn
         _ns = _AUTOWS_CFG.bwd_stages
         # SEQUENCE_PARALLEL=True -> one KV block per program => a single M loop
@@ -609,6 +614,9 @@ def _get_bw_configs() -> List[triton.Config]:
                 },
                 num_stages=_ns,
                 num_warps=_w,
+                # Match TLX: 80 regs/thread for the 1-warp GEMM/load groups,
+                # 192 for the 8-warp computation group, and ~80 left for default.
+                minRegAutoWS=80,
                 maxRegAutoWS=192,
                 pre_hook=_bwd_pre_hook,
                 generate_subtiled_region=_AUTOWS_CFG.dkdv_subtile > 1,
@@ -656,6 +664,34 @@ def backward_d_activation(dact_qk_trans, sig_trans, qk_trans, scale, valid_mask_
     dqk_trans = dact_qk_trans * sig_trans * (1 + qk_trans * (1 - sig_trans)) * scale
     dqk_trans = tl.where(valid_mask_trans, dqk_trans, 0)
     return dqk_trans
+
+
+@triton.jit
+def backward_activation_prescaled(qk_trans, alpha, scale, valid_mask_trans, k):
+    half_qk = qk_trans * (alpha * 0.5)
+    one_plus_tanh = _fma_f32(tanh_approx_fp32(half_qk), 1.0, 1.0)
+    one_plus_tanh = tl.where(valid_mask_trans, one_plus_tanh, 0.0)
+    act_qk_trans = (half_qk * one_plus_tanh * scale).to(k.dtype)
+    return half_qk, one_plus_tanh, act_qk_trans
+
+
+# Unmasked counterpart of backward_activation_prescaled. Not called yet: the
+# caller arrives with the optional explicit MASK_IF branch (D114610694), whose
+# unmasked arm skips the tl.where instead of folding it into one_plus_tanh.
+# Kept here so the masked/unmasked pair stays next to the activation it mirrors.
+@triton.jit
+def backward_activation_prescaled_unmasked(qk_trans, alpha, scale, k):
+    half_qk = qk_trans * (alpha * 0.5)
+    one_plus_tanh = _fma_f32(tanh_approx_fp32(half_qk), 1.0, 1.0)
+    act_qk_trans = (half_qk * one_plus_tanh * scale).to(k.dtype)
+    return half_qk, one_plus_tanh, act_qk_trans
+
+
+@triton.jit
+def backward_d_activation_prescaled(dact_qk_trans, one_plus_tanh, half_qk, scale):
+    one_minus_tanh = _fma_f32(one_plus_tanh, -1.0, 2.0)
+    derivative = _fma_f32(half_qk, one_minus_tanh, 1.0)
+    return dact_qk_trans * one_plus_tanh * derivative * (scale * 0.5)
 
 
 @triton.jit
@@ -1005,7 +1041,17 @@ def _hstu_attn_bwd_one_block_0(  # noqa C901
         HAS_NUM_TARGETS,
         HAS_MAX_ATTN_LEN,
     )
-    qk_trans, sig_trans, act_qk_trans = backward_activation(qk_trans, alpha, scale, valid_mask_trans, k)
+    # The prescaled path folds alpha and the 0.5 into its inputs, so its first two
+    # results are NOT the non-reuse quantities: half_qk is qk*alpha/2 rather than
+    # qk*alpha, and one_plus_tanh is 1+tanh(half_qk) rather than the sigmoid (it is
+    # 2x it). backward_d_activation_prescaled is written against those meanings, so
+    # bind them under their real names instead of reusing qk_trans/sig_trans, which
+    # would read as the non-reuse quantities to anyone adding code below.
+    if DQ_REUSE:
+        half_qk, one_plus_tanh, act_qk_trans = backward_activation_prescaled(qk_trans, alpha, scale, valid_mask_trans,
+                                                                             k)
+    else:
+        qk_trans, sig_trans, act_qk_trans = backward_activation(qk_trans, alpha, scale, valid_mask_trans, k)
     # compute dv
     if ENABLE_TMA:
         do = device_desc_do.load([(desc_row_q + start_m).to(tl.int32), (off_h * stride_doh).to(tl.int32)])
@@ -1033,21 +1079,12 @@ def _hstu_attn_bwd_one_block_0(  # noqa C901
     )
 
     # compute dk and dq
-    dqk_trans = backward_d_activation(dact_qk_trans, sig_trans, qk_trans, scale, valid_mask_trans)
+    if DQ_REUSE:
+        dqk_trans = backward_d_activation_prescaled(dact_qk_trans, one_plus_tanh, half_qk, scale)
+    else:
+        dqk_trans = backward_d_activation(dact_qk_trans, sig_trans, qk_trans, scale, valid_mask_trans)
     dqk_trans = dqk_trans.to(k.dtype)
 
-    # Note: the factor `alpha` is delayed until the end of the function to reduce the cost
-    dk += tl.dot(
-        dqk_trans,
-        tl.trans(q_trans),
-        allow_tf32=ALLOW_TF32,
-        # dsT (opndA) MUST live in SMEM, not TMEM. Left unannotated it defaults to
-        # TMEM and the planner column-packs it into id2 (the qk_trans buffer), where
-        # the qk MMA's useAcc=false full-overwrite races this cross-stage (stage-1)
-        # read -> corrupt grads. TLX keeps dsT in a dedicated SMEM buffer (ds_tiles);
-        # opndA,smem,1,8 mirrors that (and FA bwd's dsT-in-smem convention).
-        attrs=({"stage": "1", "order": "1", "channels": ["opndA,smem,1,8", "opndD,tmem,1,10"]} if DQ_REUSE else None),
-    )
     if DQ_REDUCE and ENABLE_TMA:
         # dq via TMA reduce-add. Compute dq TRANSPOSED with the SAME dot as acc_dq
         # (tl.trans(k) is a cheap memdesc_trans on the SMEM k tile), then transpose
@@ -1056,12 +1093,16 @@ def _hstu_attn_bwd_one_block_0(  # noqa C901
         # keeps the MMA structure meta-WS can partition. DQ is pre-zeroed; the head
         # slice is selected by the store column offset (device_desc_dq base has only
         # the seq offset). Mirrors triton_bw_cross_attention.py's autoWS dq reduce.
-        dq_trans = (tl.dot(
-            tl.trans(k),
-            dqk_trans,
-            allow_tf32=ALLOW_TF32,
-            attrs=({"stage": "1", "order": "1", "channels": ["opndD,tmem,1,5"]} if DQ_REUSE else None),
-        ) * alpha)
+        dq_trans = (
+            tl.dot(
+                tl.trans(k),
+                dqk_trans,
+                allow_tf32=ALLOW_TF32,
+                # Keep dQ in a distinct TMEM allocation, matching TLX. Reusing
+                # dP's id5 leaves 128 columns free, which the persistent TMEM
+                # post-pass spends on a second dV accumulator copy.
+                attrs=({"stage": "1", "order": "1", "channels": ["opndD,tmem,1,11"]} if DQ_REUSE else None),
+            ) * alpha)
         dq = tl.trans(dq_trans).to(k.dtype)
         # Subtile the dq reduce into DQ_ITERS contiguous column-subtiles
         # (matches FA bwd's DQ_SUBTILE); each is an independent store_reduce the
@@ -1091,6 +1132,21 @@ def _hstu_attn_bwd_one_block_0(  # noqa C901
             ATOMIC_ADD=ATOMIC_ADD,
             ALLOW_TF32=ALLOW_TF32,
         )
+
+    # dQ and dK intentionally share the same stage/order annotation. Equal-cluster
+    # MMAs retain program order, so placing dK after dQ matches the TLX schedule.
+    # The factor `alpha` is delayed until the end of the function to reduce cost.
+    dk += tl.dot(
+        dqk_trans,
+        tl.trans(q_trans),
+        allow_tf32=ALLOW_TF32,
+        # dsT (opndA) MUST live in SMEM, not TMEM. Left unannotated it defaults to
+        # TMEM and the planner column-packs it into id2 (the qk_trans buffer), where
+        # the qk MMA's useAcc=false full-overwrite races this cross-stage (stage-1)
+        # read -> corrupt grads. TLX keeps dsT in a dedicated SMEM buffer (ds_tiles);
+        # opndA,smem,1,8 mirrors that (and FA bwd's dsT-in-smem convention).
+        attrs=({"stage": "1", "order": "1", "channels": ["opndA,smem,1,8", "opndD,tmem,1,10"]} if DQ_REUSE else None),
+    )
     return dk, dv
 
 
