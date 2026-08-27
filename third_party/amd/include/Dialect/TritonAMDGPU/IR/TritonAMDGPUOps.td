@@ -874,19 +874,20 @@ def ScheduledMfmaOp : TT_AMDGPU_Op<"scheduled_mfma"> {
     intentionally carried through the surrounding software pipeline.
     `accumulator_role` is `transient` for a phase-local result or `persistent`
     for an accumulator carried across phases. `accumulator_register_class` is
-    `auto`, `agpr`, or `vgpr`; `auto` lets target lowering derive storage from
-    the lifetime role, while an explicit class supports kernels whose two
-    persistent accumulator sets intentionally occupy complementary physical
-    files. `initialize` starts the native accumulators from zero. Completion
+    `auto`, `agpr`, or `vgpr`; `auto` selects VGPRs on CDNA3 and derives CDNA4
+    storage from the lifetime role, while an explicit class supports kernels
+    whose two persistent accumulator sets intentionally occupy complementary
+    physical files. `initialize` starts the native accumulators from zero. Completion
     of transient result fragments is represented separately by `mfma_commit`.
 
     All active lanes of a wave must execute this operation uniformly. This is
     an explicit source contract because LLVM inline assembly cannot represent
     a convergent-call attribute on the pinned compiler revision.
 
-    The contract supports CDNA4 BF16 or F16 inputs, F32 accumulators, one or
-    more K fragments per wave, and native 32x32x16 or 16x16x32 instruction
-    shapes.
+    The contract supports BF16 or F16 inputs and F32 accumulators on CDNA3 and
+    CDNA4. It accepts one or more K fragments per wave and the target's native
+    instruction shapes: 32x32x8 or 16x16x16 on CDNA3, and 32x32x16 or
+    16x16x32 on CDNA4.
   }];
 
   let arguments = (ins TT_Tensor:$a, TT_Tensor:$b, TT_Tensor:$acc,

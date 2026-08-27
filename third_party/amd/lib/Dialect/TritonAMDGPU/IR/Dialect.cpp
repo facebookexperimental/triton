@@ -624,16 +624,21 @@ LogicalResult BufferLoadToLocalOp::verify() {
   return emitError() << "BufferLoadToLocal unsupported on target architecture";
 }
 
-static LogicalResult verifyCDNA4Only(Operation *op) {
+static FailureOr<unsigned> getScheduledMfmaVersion(Operation *op) {
   auto mod = op->getParentOfType<ModuleOp>();
   if (!mod)
-    return success();
+    return 0;
   auto arch = mlir::getAMDArch(mod);
-  // Keep low-level, target-free IR tests valid, but reject a known target
-  // before lowering architecture-specific MFMA hazards and register roles.
-  if (!arch || *arch == "gfx950")
-    return success();
-  return op->emitOpError("is supported only on CDNA4 (gfx950)");
+  // Keep low-level, target-free IR tests valid. A zero version means that the
+  // encoding itself selects the supported CDNA generation below.
+  if (!arch)
+    return 0;
+  if (*arch == "gfx942")
+    return 3;
+  if (*arch == "gfx950")
+    return 4;
+  return op->emitOpError(
+      "is supported only on CDNA3 (gfx942) and CDNA4 (gfx950)");
 }
 
 LogicalResult BufferLoadOp::verify() {
@@ -800,7 +805,8 @@ LogicalResult MfmaCommitOp::inferReturnTypes(
 LogicalResult MfmaCommitOp::verify() {
   namespace ttg = mlir::triton::gpu;
 
-  if (failed(verifyCDNA4Only(getOperation())))
+  FailureOr<unsigned> targetVersion = getScheduledMfmaVersion(getOperation());
+  if (failed(targetVersion))
     return failure();
   if (getInputs().size() != getOutputs().size())
     return emitOpError("requires one output for every input");
@@ -820,9 +826,15 @@ LogicalResult MfmaCommitOp::verify() {
     if (tensorTy.getElementType().isF32()) {
       auto mfma =
           dyn_cast_or_null<ttg::AMDMfmaEncodingAttr>(tensorTy.getEncoding());
-      if (!mfma || mfma.getVersion() != 4 || !mfma.hasUnitTilesPerWarp())
+      if (!mfma || !llvm::is_contained({3u, 4u}, mfma.getVersion()) ||
+          !mfma.hasUnitTilesPerWarp())
         return emitOpError() << "input " << index
-                             << " must use a unit-tile CDNA4 MFMA layout";
+                             << " must use a unit-tile CDNA3/CDNA4 MFMA layout";
+      if (*targetVersion != 0 && mfma.getVersion() != *targetVersion)
+        return emitOpError()
+               << "input " << index << " uses MFMA version "
+               << mfma.getVersion() << ", but the target requires "
+               << "version " << *targetVersion;
       if (!input.hasOneUse())
         return emitOpError()
                << "input " << index
@@ -837,15 +849,22 @@ LogicalResult MfmaCommitOp::verify() {
       continue;
     }
 
-    if (tensorTy.getElementType().isBF16()) {
+    if (tensorTy.getElementType().isBF16() ||
+        tensorTy.getElementType().isF16()) {
       auto dot = dyn_cast<ttg::DotOperandEncodingAttr>(tensorTy.getEncoding());
       auto mfma = dot ? dyn_cast<ttg::AMDMfmaEncodingAttr>(dot.getParent())
                       : ttg::AMDMfmaEncodingAttr();
-      if (!dot || !mfma || mfma.getVersion() != 4 ||
+      if (!dot || !mfma || !llvm::is_contained({3u, 4u}, mfma.getVersion()) ||
           !llvm::is_contained({4u, 8u}, dot.getKWidth()))
         return emitOpError()
                << "input " << index
-               << " must use a CDNA4 BF16 dot-operand layout with kWidth=4/8";
+               << " must use a matching BF16 or F16 dot-operand layout with "
+                  "kWidth=4/8";
+      if (*targetVersion != 0 && mfma.getVersion() != *targetVersion)
+        return emitOpError()
+               << "input " << index << " uses MFMA version "
+               << mfma.getVersion() << ", but the target requires "
+               << "version " << *targetVersion;
       ArrayRef<unsigned> instr = mfma.getInstrShape();
       int64_t fragmentElements =
           dot.getOpIdx() == 0 ? instr[0] * instr[2] : instr[2] * instr[1];
@@ -881,7 +900,8 @@ LogicalResult MfmaCommitOp::verify() {
 LogicalResult ScheduledMfmaOp::verify() {
   namespace ttg = mlir::triton::gpu;
 
-  if (failed(verifyCDNA4Only(getOperation())))
+  FailureOr<unsigned> targetVersion = getScheduledMfmaVersion(getOperation());
+  if (failed(targetVersion))
     return failure();
 
   auto aTy = getA().getType();
@@ -905,15 +925,25 @@ LogicalResult ScheduledMfmaOp::verify() {
         "operand and accumulator matrix shapes are inconsistent");
 
   auto mfma = dyn_cast<ttg::AMDMfmaEncodingAttr>(accTy.getEncoding());
-  if (!mfma || mfma.getVersion() != 4 || !mfma.hasUnitTilesPerWarp() ||
-      mfma.getElementBitWidth() != 32)
+  if (!mfma || !llvm::is_contained({3u, 4u}, mfma.getVersion()) ||
+      !mfma.hasUnitTilesPerWarp() || mfma.getElementBitWidth() != 32)
     return emitOpError(
-        "requires a CDNA4 F32 MFMA accumulator with unit tiles per wave");
+        "requires a CDNA3/CDNA4 F32 MFMA accumulator with unit tiles per wave");
+  if (*targetVersion != 0 && mfma.getVersion() != *targetVersion)
+    return emitOpError() << "uses MFMA version " << mfma.getVersion()
+                         << ", but the target requires version "
+                         << *targetVersion;
   ArrayRef<unsigned> instrShape = mfma.getInstrShape();
-  if (instrShape != ArrayRef<unsigned>({32, 32, 16}) &&
-      instrShape != ArrayRef<unsigned>({16, 16, 32}))
-    return emitOpError(
-        "supports only native 32x32x16 and 16x16x32 MFMA shapes");
+  bool isCDNA3Shape = instrShape == ArrayRef<unsigned>({32, 32, 8}) ||
+                      instrShape == ArrayRef<unsigned>({16, 16, 16});
+  bool isCDNA4Shape = instrShape == ArrayRef<unsigned>({32, 32, 16}) ||
+                      instrShape == ArrayRef<unsigned>({16, 16, 32});
+  if ((mfma.getVersion() == 3 && !isCDNA3Shape) ||
+      (mfma.getVersion() == 4 && !isCDNA4Shape))
+    return emitOpError() << "MFMA encoding version " << mfma.getVersion()
+                         << " supports only its native 32x32x"
+                         << (mfma.getVersion() == 3 ? 8 : 16) << " and 16x16x"
+                         << (mfma.getVersion() == 3 ? 16 : 32) << " shapes";
 
   auto aDot = dyn_cast<ttg::DotOperandEncodingAttr>(aTy.getEncoding());
   auto bDot = dyn_cast<ttg::DotOperandEncodingAttr>(bTy.getEncoding());
@@ -938,11 +968,10 @@ LogicalResult ScheduledMfmaOp::verify() {
     return emitOpError(
         "requires one batch and matching nonempty K fragments per wave");
 
-  // Lowering packs dot operands into eight-element BF16 vectors, which are
-  // the per-lane inputs of one native CDNA4 MFMA.  A kWidth=4 layout therefore
-  // needs an even number of logical K repetitions; otherwise the operand only
-  // describes half of a native K fragment and cannot be lowered.
-  constexpr int64_t elementsPerNativeKFragment = 8;
+  // The native input width per lane is four elements on CDNA3 and eight on
+  // CDNA4. A smaller kWidth therefore needs enough logical K repetitions to
+  // fill a complete native fragment.
+  int64_t elementsPerNativeKFragment = mfma.getVersion() == 3 ? 4 : 8;
   int64_t logicalKElements = aRep[2] * aDot.getKWidth();
   if (logicalKElements % elementsPerNativeKFragment != 0)
     return emitOpError(

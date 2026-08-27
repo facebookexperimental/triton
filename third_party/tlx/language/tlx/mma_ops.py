@@ -130,7 +130,7 @@ def amd_scheduled_mfma(
     initialize: tl.constexpr = False,
     _semantic=None,
 ):
-    """Update native CDNA4 MFMA fragments with source-controlled scheduling.
+    """Update native CDNA3/CDNA4 MFMA fragments with source scheduling.
 
     Unlike ``tl.dot``, which represents one logical matrix product and carries
     no accumulator-lifetime or register-class contract, this operation exposes
@@ -142,10 +142,10 @@ def amd_scheduled_mfma(
     operation. ``"transient"`` describes a phase-local chain: ``auto`` storage
     selects VGPRs and lowering uses ROCDL MFMA intrinsics so LLVM can model
     instruction latency and hazards. ``"persistent"`` describes a chain
-    carried across phases: ``auto`` storage selects AGPRs and lowering uses
-    register-constrained inline assembly. An explicit
-    ``accumulator_register_class`` overrides that default, allowing two
-    persistent accumulator sets to occupy complementary register files.
+    carried across phases and lowering uses register-constrained inline
+    assembly. ``auto`` storage selects VGPRs on CDNA3 and AGPRs on CDNA4. An
+    explicit ``accumulator_register_class`` overrides that default, allowing
+    two persistent accumulator sets to occupy complementary register files.
     """
     resident_operand = tl._unwrap_if_constexpr(resident_operand)
     accumulator_role = tl._unwrap_if_constexpr(accumulator_role)

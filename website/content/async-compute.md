@@ -137,8 +137,8 @@
 
 ## Explicit MFMA scheduling
 
-> **[gfx950]** — the source-scheduled operations are restricted to CDNA4
-> (`gfx950`) native BF16 MFMA layouts.
+> **[gfx942, gfx950]** — the source-scheduled operations support CDNA3 and
+> CDNA4 native BF16/F16 MFMA layouts.
 
 - `tl.dot(a, b, acc)` preserves a TLX-pinned accumulator layout, so whole dots
   need no AMD-specific wrapper.
@@ -158,7 +158,7 @@
   `registers_per_group` from 1 through 32.
 - `tlx.amd_scheduled_mfma(...)` exposes independent native MFMA accumulator
   chains in deterministic N-major, M-minor, K-reduction source order.
-- `tlx.amd_mfma_commit(value, preserve)` applies the CDNA4 MFMA result hazard
+- `tlx.amd_mfma_commit(value, preserve)` applies the target MFMA result hazard
   boundary while threading a live dot-operand dependency.
 - `tlx.amd_sched_barrier(mask=0)` prevents selected AMD machine-instruction
   classes from crossing a source boundary. It is a scheduling marker, not a
@@ -171,7 +171,9 @@ element types, and native fragment widths before lowering.
 Unlike `tl.dot`, `amd_scheduled_mfma` carries an explicit `accumulator_role`.
 `transient` selects the latency-aware intrinsic path for phase-local work;
 `persistent` selects register-constrained lowering for a chain carried across
-phases. Neither role changes the numerical matrix operation.
+phases. Its `auto` accumulator storage uses VGPRs on CDNA3 and AGPRs on CDNA4;
+an explicit register class overrides that choice. Neither role changes the
+numerical matrix operation.
 
 ## Scaled dot
 

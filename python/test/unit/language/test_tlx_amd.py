@@ -21,7 +21,7 @@ import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
 from triton import knobs
-from triton._internal_testing import is_hip, is_hip_cdna4, is_hip_gfx1250
+from triton._internal_testing import is_hip, is_hip_cdna3, is_hip_cdna4, is_hip_gfx1250
 from triton.compiler.compiler import ASTSource, compile as triton_compile
 from triton.compiler.errors import CompilationError
 from triton.backends.amd import compiler as amd_compiler
@@ -134,6 +134,11 @@ def compile_for_target(fn, signature, constexprs, target):
 def compile_for_gfx950(fn, signature, constexprs):
     """Compile a TLX kernel for gfx950 and return the compiled object."""
     return compile_for_target(fn, signature, constexprs, GFX950)
+
+
+def compile_for_gfx942(fn, signature, constexprs):
+    """Compile a TLX kernel for gfx942 and return the compiled object."""
+    return compile_for_target(fn, signature, constexprs, GFX942)
 
 
 @pytest.mark.parametrize(
@@ -2177,8 +2182,172 @@ def test_amd_scheduled_mfma_compiles_gfx950():
     assert "s_nop 5" in compiled.asm["llir"]
 
 
-def test_amd_scheduled_mfma_rejects_non_cdna4():
-    with pytest.raises(RuntimeError, match=r"scheduled_mfma.*only on CDNA4"):
+@triton.jit
+def _amd_scheduled_mfma_gfx942_kernel(
+    a_ptr,
+    b_ptr,
+    output_ptr,
+    PERSISTENT: tl.constexpr,
+    TRANSPOSED: tl.constexpr,
+    INSTR_K: tl.constexpr,
+):
+    mma: tl.constexpr = tlx.amd_mfma_layout(
+        version=3,
+        instr_shape=[16, 16, INSTR_K],
+        transposed=TRANSPOSED,
+        warps_per_cta=[1, 4],
+    )
+    dot0: tl.constexpr = tlx.dot_operand_layout(0, mma, k_width=4)
+    dot1: tl.constexpr = tlx.dot_operand_layout(1, mma, k_width=4)
+    rows = tl.arange(0, 32)
+    reduction = tl.arange(0, 32)
+    cols = tl.arange(0, 128)
+    a = tlx.require_layout(
+        tl.load(a_ptr + rows[:, None] * 32 + reduction[None, :]),
+        dot0,
+        pin=False,
+    )
+    b = tlx.require_layout(
+        tl.load(b_ptr + reduction[:, None] * 128 + cols[None, :]),
+        dot1,
+        pin=False,
+    )
+    acc = tl.full((32, 128), 7.0, tl.float32)
+    acc = tlx.require_layout(acc, mma, pin=False)
+    if PERSISTENT:
+        result = tlx.amd_scheduled_mfma(
+            a,
+            b,
+            acc,
+            accumulator_role="persistent",
+            initialize=True,
+        )
+    else:
+        result = tlx.amd_scheduled_mfma(
+            a,
+            b,
+            acc,
+            accumulator_role="transient",
+            initialize=True,
+        )
+        result, _ = tlx.amd_mfma_commit(result, b)
+    offsets = output_ptr + rows[:, None] * 128 + cols[None, :]
+    offsets = tlx.require_layout(offsets, mma, pin=False)
+    tl.store(offsets, result)
+
+
+@triton.jit
+def _amd_scheduled_mfma_32x32_gfx942_kernel(a_ptr, b_ptr, output_ptr):
+    mma: tl.constexpr = tlx.amd_mfma_layout(
+        version=3,
+        instr_shape=[32, 32, 8],
+        transposed=True,
+        warps_per_cta=[1, 4],
+    )
+    dot0: tl.constexpr = tlx.dot_operand_layout(0, mma, k_width=4)
+    dot1: tl.constexpr = tlx.dot_operand_layout(1, mma, k_width=4)
+    rows = tl.arange(0, 32)
+    reduction = tl.arange(0, 16)
+    cols = tl.arange(0, 128)
+    a = tlx.require_layout(
+        tl.load(a_ptr + rows[:, None] * 16 + reduction[None, :]),
+        dot0,
+        pin=False,
+    )
+    b = tlx.require_layout(
+        tl.load(b_ptr + reduction[:, None] * 128 + cols[None, :]),
+        dot1,
+        pin=False,
+    )
+    acc = tlx.zeros((32, 128), tl.float32, layout=mma)
+    result = tlx.amd_scheduled_mfma(
+        a,
+        b,
+        acc,
+        accumulator_role="transient",
+        initialize=True,
+    )
+    offsets = output_ptr + rows[:, None] * 128 + cols[None, :]
+    offsets = tlx.require_layout(offsets, mma, pin=False)
+    tl.store(offsets, result)
+
+
+@triton.jit
+def _amd_scheduled_mfma_large_gfx942_kernel(a_ptr, b_ptr, output_ptr):
+    mma: tl.constexpr = tlx.amd_mfma_layout(
+        version=3,
+        instr_shape=[16, 16, 16],
+        transposed=True,
+        warps_per_cta=[2, 4],
+    )
+    dot0: tl.constexpr = tlx.dot_operand_layout(0, mma, k_width=4)
+    dot1: tl.constexpr = tlx.dot_operand_layout(1, mma, k_width=4)
+    rows = tl.arange(0, 256)
+    reduction = tl.arange(0, 32)
+    cols = tl.arange(0, 256)
+    a = tlx.require_layout(
+        tl.load(a_ptr + rows[:, None] * 32 + reduction[None, :]),
+        dot0,
+        pin=False,
+    )
+    b = tlx.require_layout(
+        tl.load(b_ptr + reduction[:, None] * 256 + cols[None, :]),
+        dot1,
+        pin=False,
+    )
+    acc = tlx.zeros((256, 256), tl.float32, layout=mma)
+    acc = tlx.amd_scheduled_mfma(a, b, acc, accumulator_role="persistent")
+    acc = tlx.amd_scheduled_mfma(a, b, acc, accumulator_role="persistent")
+    offsets = output_ptr + rows[:, None] * 256 + cols[None, :]
+    offsets = tlx.require_layout(offsets, mma, pin=False)
+    tl.store(offsets, acc)
+
+
+@pytest.mark.parametrize("elem_ty", ["bf16", "fp16"])
+@pytest.mark.parametrize("persistent", [False, True])
+def test_amd_scheduled_mfma_compiles_gfx942(elem_ty, persistent):
+    compiled = compile_for_gfx942(
+        _amd_scheduled_mfma_gfx942_kernel,
+        signature={
+            "a_ptr": f"*{elem_ty}",
+            "b_ptr": f"*{elem_ty}",
+            "output_ptr": "*fp32",
+            "PERSISTENT": "constexpr",
+            "TRANSPOSED": "constexpr",
+            "INSTR_K": "constexpr",
+        },
+        constexprs={"PERSISTENT": persistent, "TRANSPOSED": True, "INSTR_K": 16},
+    )
+    asm_ty = "f16" if elem_ty == "fp16" else "bf16"
+    assert "amdg.scheduled_mfma" in compiled.asm["ttir"]
+    assert f"v_mfma_f32_16x16x16_{asm_ty}" in compiled.asm["amdgcn"]
+    if persistent:
+        assert f'asm sideeffect "s_nop 3\\0Av_mfma_f32_16x16x16_{asm_ty}' in compiled.asm["llir"]
+        assert 'asm sideeffect "s_nop 9"' in compiled.asm["llir"]
+        # Unlike gfx950, gfx942 `persistent` + `auto` keeps the accumulator in
+        # VGPRs: LLVM schedules AGPR spill reads ahead of the source-level
+        # drain, so an AGPR accumulator can be read before the MFMA retires.
+        assert '"=&v,v,v"' in compiled.asm["llir"]
+        assert '"=&a,v,v"' not in compiled.asm["llir"]
+    else:
+        intrinsic_ty = "f16" if elem_ty == "fp16" else "bf16.1k"
+        assert f"@llvm.amdgcn.mfma.f32.16x16x16{intrinsic_ty}" in compiled.asm["llir"]
+        assert 'asm sideeffect "v_mfma' not in compiled.asm["llir"]
+
+
+@pytest.mark.parametrize("elem_ty", ["bf16", "fp16"])
+def test_amd_scheduled_mfma_32x32_compiles_gfx942(elem_ty):
+    compiled = compile_for_gfx942(
+        _amd_scheduled_mfma_32x32_gfx942_kernel,
+        signature={"a_ptr": f"*{elem_ty}", "b_ptr": f"*{elem_ty}", "output_ptr": "*fp32"},
+        constexprs={},
+    )
+    asm_ty = "f16" if elem_ty == "fp16" else "bf16"
+    assert f"v_mfma_f32_32x32x8_{asm_ty}" in compiled.asm["amdgcn"]
+
+
+def test_amd_scheduled_mfma_rejects_target_version_mismatch():
+    with pytest.raises(RuntimeError, match=r"scheduled_mfma.*target requires version 3"):
         compile_for_target(
             _amd_scheduled_mfma_kernel,
             signature={
@@ -2190,6 +2359,95 @@ def test_amd_scheduled_mfma_rejects_non_cdna4():
             constexprs={"K_WIDTH": 8},
             target=GFX942,
         )
+
+
+def test_amd_scheduled_mfma_rejects_unsupported_target():
+    with pytest.raises(RuntimeError, match=r"scheduled_mfma.*only on CDNA3.*and CDNA4"):
+        compile_for_target(
+            _amd_scheduled_mfma_kernel,
+            signature={
+                "a_ptr": "*bf16",
+                "b_ptr": "*bf16",
+                "output_ptr": "*fp32",
+                "K_WIDTH": "constexpr",
+            },
+            constexprs={"K_WIDTH": 8},
+            target=GFX1250,
+        )
+
+
+def test_amd_scheduled_mfma_rejects_non_native_gfx942_shape():
+    with pytest.raises(RuntimeError, match=r"version 3 supports only its native 32x32x8 and 16x16x16 shapes"):
+        compile_for_gfx942(
+            _amd_scheduled_mfma_gfx942_kernel,
+            signature={
+                "a_ptr": "*fp16",
+                "b_ptr": "*fp16",
+                "output_ptr": "*fp32",
+                "PERSISTENT": "constexpr",
+                "TRANSPOSED": "constexpr",
+                "INSTR_K": "constexpr",
+            },
+            constexprs={"PERSISTENT": False, "TRANSPOSED": True, "INSTR_K": 32},
+        )
+
+
+@pytest.mark.skipif(not is_hip_cdna3(), reason="Requires gfx942 hardware")
+@pytest.mark.parametrize("persistent", [False, True])
+@pytest.mark.parametrize("transposed", [False, True])
+def test_amd_scheduled_mfma_multifragment_correct_gfx942(persistent, transposed):
+    torch.manual_seed(0)
+    a = torch.randn((32, 32), device="cuda", dtype=torch.float16)
+    b = torch.randn((32, 128), device="cuda", dtype=torch.float16)
+    actual = torch.empty((32, 128), device="cuda", dtype=torch.float32)
+    _amd_scheduled_mfma_gfx942_kernel[(1, )](
+        a,
+        b,
+        actual,
+        PERSISTENT=persistent,
+        TRANSPOSED=transposed,
+        INSTR_K=16,
+        num_warps=4,
+        matrix_instr_nonkdim=16,
+    )
+    torch.testing.assert_close(actual, a.float() @ b.float(), atol=2e-3, rtol=2e-3)
+
+
+@pytest.mark.skipif(not is_hip_cdna3(), reason="Requires gfx942 hardware")
+def test_amd_scheduled_mfma_large_persistent_correct_gfx942():
+    torch.manual_seed(0)
+    a = torch.randn((256, 32), device="cuda", dtype=torch.float16)
+    b = torch.randn((32, 256), device="cuda", dtype=torch.float16)
+    actual = torch.empty((256, 256), device="cuda", dtype=torch.float32)
+    _amd_scheduled_mfma_large_gfx942_kernel[(1, )](
+        a,
+        b,
+        actual,
+        num_warps=8,
+        matrix_instr_nonkdim=16,
+    )
+    torch.testing.assert_close(actual, 2 * (a.float() @ b.float()), atol=4e-3, rtol=2e-3)
+
+
+def test_amd_scheduled_mfma_round_robin_order_gfx942():
+    compiled = compile_for_gfx942(
+        _amd_scheduled_mfma_gfx942_kernel,
+        signature={
+            "a_ptr": "*fp16",
+            "b_ptr": "*fp16",
+            "output_ptr": "*fp32",
+            "PERSISTENT": "constexpr",
+            "TRANSPOSED": "constexpr",
+            "INSTR_K": "constexpr",
+        },
+        constexprs={"PERSISTENT": True, "TRANSPOSED": True, "INSTR_K": 16},
+    )
+    mnemonic = "v_mfma_f32_16x16x16_f16"
+    mfmas = [line.strip() for line in compiled.asm["amdgcn"].splitlines() if mnemonic in line]
+    assert len(mfmas) == 8
+    destinations = [line.split(mnemonic, 1)[1].strip().split(",", 1)[0] for line in mfmas]
+    assert len(set(destinations[:4])) == 4
+    assert destinations[4:] == destinations[:4]
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
