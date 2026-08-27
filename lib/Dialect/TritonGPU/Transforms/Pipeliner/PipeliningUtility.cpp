@@ -865,3 +865,34 @@ void triton::removePipeliningAttributes(ModuleOp moduleOp) {
     op->removeAttr(mlir::triton::kScheduledMaxStageAttrName);
   });
 }
+
+bool triton::isLoopTripCountKnownPositive(scf::ForOp loop,
+                                          DominanceInfo &domInfo) {
+  // Crudely match llvm.assume(ub > lb) or llvm.assume(lb < ub), the form
+  // tl.assume(hi > lo) lowers to. Kept deliberately syntactic: the assume
+  // must reference the loop's own bound SSA values, and must dominate the
+  // loop -- an assume placed after it, or under a sibling branch, asserts
+  // nothing at the point the trip count is taken.
+  auto isDominatingAssume = [&](Operation *op) {
+    return isa<LLVM::AssumeOp>(op) && domInfo.properlyDominates(op, loop);
+  };
+  for (Operation *user : loop.getUpperBound().getUsers()) {
+    auto cmp = dyn_cast<arith::CmpIOp>(user);
+    if (!cmp)
+      continue;
+    if (llvm::none_of(cmp->getUsers(), isDominatingAssume))
+      continue;
+    bool unsignedCmp = loop.getUnsignedCmp();
+    if (cmp.getPredicate() ==
+            (unsignedCmp ? arith::CmpIPredicate::ugt : arith::CmpIPredicate::sgt) &&
+        cmp.getLhs() == loop.getUpperBound() &&
+        cmp.getRhs() == loop.getLowerBound())
+      return true;
+    if (cmp.getPredicate() ==
+            (unsignedCmp ? arith::CmpIPredicate::ult : arith::CmpIPredicate::slt) &&
+        cmp.getLhs() == loop.getLowerBound() &&
+        cmp.getRhs() == loop.getUpperBound())
+      return true;
+  }
+  return false;
+}
