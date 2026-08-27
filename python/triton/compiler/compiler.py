@@ -593,7 +593,11 @@ class CompiledKernel:
         device = active_driver.get_current_device()
         utils = active_driver.utils
         # create launcher
-        self._run = active_driver.launcher_cls(self.src, self.metadata)
+        run = active_driver.launcher_cls(self.src, self.metadata)
+        if hasattr(run, "launcher_bytes") and run.launcher_bytes is not None:
+            # Used by external runtimes such as NativeRT.
+            self.asm["launcher.so"] = run.launcher_bytes
+        self._run = run
         # not enough shared memory to run the kernel
         max_shared = _max_shared_mem(device, utils)
         if self.metadata.shared > max_shared:
