@@ -2325,8 +2325,8 @@ def test_amd_scheduled_mfma_compiles_gfx942(elem_ty, persistent):
         assert f'asm sideeffect "s_nop 3\\0Av_mfma_f32_16x16x16_{asm_ty}' in compiled.asm["llir"]
         assert 'asm sideeffect "s_nop 9"' in compiled.asm["llir"]
         # Unlike gfx950, gfx942 `persistent` + `auto` keeps the accumulator in
-        # VGPRs: LLVM schedules AGPR spill reads ahead of the source-level
-        # drain, so an AGPR accumulator can be read before the MFMA retires.
+        # VGPRs: with AGPRs, LLVM emits v_accvgpr_read of the asm result ahead
+        # of the source-level drain, reading it before the MFMA retires.
         assert '"=&v,v,v"' in compiled.asm["llir"]
         assert '"=&a,v,v"' not in compiled.asm["llir"]
     else:
@@ -2374,7 +2374,8 @@ def test_amd_scheduled_mfma_rejects_non_native_gfx942_shape():
                 "INSTR_K": "constexpr",
             },
             constexprs={"PERSISTENT": False, "TRANSPOSED": True, "INSTR_K": 32},
-            # v_mfma_f32_16x16x32_fp16 (supported by CDNA3) will be emitted
+            # 16x16x32 is CDNA4-native, so the v3 verifier rejects it and
+            # nothing is emitted
         )
 
 
