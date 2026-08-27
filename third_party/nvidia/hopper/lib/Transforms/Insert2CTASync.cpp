@@ -27,9 +27,11 @@
 #include "nvidia/include/Dialect/NVGPU/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/Triton/IR/DiscardableAttributes.h"
 #include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/Support/JSON.h"
 
 using namespace mlir;
 namespace ttg = triton::gpu;
@@ -167,6 +169,30 @@ static Value computeBarrierPhase(OpBuilder &builder, Location loc,
   return arith::TruncIOp::create(builder, loc, builder.getI32Type(), rem);
 }
 
+static bool hasAutoWSBoolean(Operation *op, StringRef key) {
+  auto attr = op->getAttrOfType<StringAttr>(triton::kAutoWSAnnotationAttrName);
+  if (!attr)
+    return false;
+  auto parsed = llvm::json::parse(attr.getValue());
+  if (!parsed) {
+    llvm::consumeError(parsed.takeError());
+    return false;
+  }
+  auto *object = parsed->getAsObject();
+  return object && object->getBoolean(key).value_or(false);
+}
+
+static bool hasAutoWSBoolean(ModuleOp module, StringRef key) {
+  bool enabled = false;
+  module.walk([&](Operation *op) {
+    if (!hasAutoWSBoolean(op, key))
+      return WalkResult::advance();
+    enabled = true;
+    return WalkResult::interrupt();
+  });
+  return enabled;
+}
+
 // Insert the "arrive remote, wait local" cross-CTA sync ops before a 2-CTA
 // MMA. The barrier must be allocated externally (before the containing loop
 // if the MMA is in a loop).
@@ -240,9 +266,21 @@ struct Insert2CTASync : public impl::NVGPUInsert2CTASyncBase<Insert2CTASync> {
 
     // Collect 2-CTA MMA ops that need cross-CTA sync insertion.
     SmallVector<ttng::TCGen5MMAOp> twoCTAMMAOps;
+    bool skipCollectiveContractionSync =
+        hasAutoWSBoolean(moduleOp, "two_cta_skip_collective_sync");
     moduleOp->walk([&](ttng::TCGen5MMAOp mma) {
-      if (mma.getTwoCtas())
-        twoCTAMMAOps.push_back(mma);
+      if (!mma.getTwoCtas())
+        return;
+      auto dependency =
+          mma->getAttrOfType<StringAttr>("ttng.two_cta_dependency");
+      bool isCollectiveContraction =
+          dependency && dependency.getValue() == "collective_contraction";
+      bool syncCoveredByPrior =
+          hasAutoWSBoolean(mma.getOperation(), "two_cta_sync_covered_by_prior");
+      if (isCollectiveContraction &&
+          (skipCollectiveContractionSync || syncCoveredByPrior))
+        return;
+      twoCTAMMAOps.push_back(mma);
     });
 
     if (twoCTAMMAOps.empty())
