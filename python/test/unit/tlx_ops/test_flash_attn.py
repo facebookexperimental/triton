@@ -21,6 +21,8 @@ pytestmark = pytest.mark.skipif(not is_blackwell(), reason="tlx.ops.flash_attn i
 
 torch.manual_seed(0)
 
+ARCH = "sm100"
+
 #  Hardware agnostic testsuite ``[Z, H, N_CTX, HEAD_DIM, causal]``
 SHAPES = [
     [1, 1, 256, 64, False],
@@ -61,10 +63,10 @@ def _assert_close(out, ref, dtype):
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
 @pytest.mark.parametrize("Z, H, N_CTX, HEAD_DIM, causal", SHAPES)
 def test_flash_attn_fwd(Z, H, N_CTX, HEAD_DIM, causal, dtype):
-    from triton.tlx.ops.kernels.flash_attn import sm100
+    from triton.tlx.ops import flash_attn as tlx_flash_attn
 
     q, k, v = _qkv(Z, H, N_CTX, HEAD_DIM, dtype)
-    out = sm100.flash_attn(q, k, v, causal=causal, space="smoke")
+    out = tlx_flash_attn(q, k, v, causal=causal, arch=ARCH, space="smoke")
     _assert_close(out, _sdpa(q, k, v, causal), dtype)
 
 
@@ -73,13 +75,13 @@ def test_flash_attn_fwd(Z, H, N_CTX, HEAD_DIM, causal, dtype):
 @pytest.mark.parametrize("Z, H, N_CTX, HEAD_DIM, causal", SHAPES)
 def test_flash_attn_bwd(Z, H, N_CTX, HEAD_DIM, causal, dtype):
     """The kernel carries the full backward path even though the op defers it."""
-    from triton.tlx.ops.kernels.flash_attn import sm100
+    from triton.tlx.ops import flash_attn as tlx_flash_attn
 
     q, k, v = _qkv(Z, H, N_CTX, HEAD_DIM, dtype, requires_grad=True)
     rq, rk, rv = (t.detach().clone().requires_grad_() for t in (q, k, v))
     do = torch.randn_like(q)
 
-    sm100.flash_attn(q, k, v, causal=causal, space="smoke").backward(do)
+    tlx_flash_attn(q, k, v, causal=causal, arch=ARCH, space="smoke").backward(do)
     _sdpa(rq, rk, rv, causal).backward(do)
 
     for got, want in ((q.grad, rq.grad), (k.grad, rk.grad), (v.grad, rv.grad)):

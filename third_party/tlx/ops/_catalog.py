@@ -101,23 +101,34 @@ def _arches_for(op: str) -> list[str]:
     return sorted(s.arch for s in CATALOG if s.op == op)
 
 
-def impl_for(op: str) -> tuple[Callable[..., Any], OpSpec]:
-    """The blessed callable for `op` on this target, plus its spec.
+def impl_for(op: str, arch: Optional[str] = None) -> tuple[Callable[..., Any], OpSpec]:
+    """The blessed callable for `op`, plus its spec.
 
     Raises rather than falling back: a silent fallback turns "TLX is not
     running here" into an unexplained performance cliff.
+
+    An explicit `arch` pins the entry instead of detecting one. The capability
+    check is then skipped -- the caller has asserted the target, and checking a
+    pinned arch against the running device would reject the very case pinning
+    exists for.
     """
-    target = _target()
-    arch = target.key
     available = ", ".join(_arches_for(op)) or "(nothing yet)"
-    if not arch:
-        raise UnsupportedOp(f"tlx.ops.{op}: no GPU visible. Available on: {available}")
+    if arch is None:
+        target = _target()
+        if not target.key:
+            raise UnsupportedOp(f"tlx.ops.{op}: no GPU visible. Available on: {available}")
+        spec = _BY_KEY.get((op, target.key))
+        if spec is None:
+            raise UnsupportedOp(f"tlx.ops.{op} has no implementation for {target.key}. "
+                                f"Available on: {available}")
+        missing = spec.requires - _capabilities(target)
+        if missing:
+            raise UnsupportedOp(f"{spec} needs {sorted(missing)}, which {target.key} does not report")
+        return _load(spec.impl), spec
+
     spec = _BY_KEY.get((op, arch))
     if spec is None:
-        raise UnsupportedOp(f"tlx.ops.{op} has no implementation for {arch}. Available on: {available}")
-    missing = spec.requires - _capabilities(target)
-    if missing:
-        raise UnsupportedOp(f"{spec} needs {sorted(missing)}, which {arch} does not report")
+        raise UnsupportedOp(f"tlx.ops.{op} has no implementation for arch={arch!r}. Available on: {available}")
     return _load(spec.impl), spec
 
 

@@ -19,6 +19,8 @@ pytestmark = pytest.mark.skipif(not is_blackwell(), reason="tlx.ops.hstu_attn is
 
 torch.manual_seed(0)
 
+ARCH = "sm100"
+
 #  Hardware agnostic testsuite ``[Z, MAX_SEQ_LEN, H, HEAD_DIM, causal]``
 SHAPES = [
     [1, 256, 4, 128, True],
@@ -66,12 +68,12 @@ def _float_ref(q, k, v, offsets, attn_scale, alpha, causal):
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
 @pytest.mark.parametrize("Z, MAX_SEQ_LEN, H, HEAD_DIM, causal", SHAPES)
 def test_hstu_attn(Z, MAX_SEQ_LEN, H, HEAD_DIM, causal, dtype):
-    from triton.tlx.ops.kernels.hstu_attn import sm100
+    from triton.tlx.ops import hstu_attn as tlx_hstu_attn
 
     q, k, v, offsets, attn_scale = _inputs(Z, MAX_SEQ_LEN, H, HEAD_DIM, dtype)
     alpha = 1.0 / HEAD_DIM
 
-    out = sm100.hstu_attn(q, k, v, offsets, MAX_SEQ_LEN, alpha, causal=causal, attn_scale=attn_scale, space="smoke")
+    out = tlx_hstu_attn(q, k, v, offsets, MAX_SEQ_LEN, attn_scale, alpha=alpha, causal=causal, arch=ARCH, space="smoke")
 
     ref = _float_ref(q, k, v, offsets, attn_scale, alpha, causal).to(out.dtype)
     precision = REL_PRECISION[dtype]

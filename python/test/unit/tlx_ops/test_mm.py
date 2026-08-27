@@ -27,6 +27,8 @@ pytestmark = pytest.mark.skipif(not is_blackwell(), reason="tlx.ops.mm is sm100-
 
 torch.manual_seed(0)
 
+ARCH = "sm100"
+
 # The heuristic space builds exactly one config per shape, so exceeding this is
 # a compile-time regression rather than a slow test.
 MAX_SECONDS_PER_CASE = 60
@@ -68,7 +70,7 @@ def _operand(rows, cols, dtype, row_major):
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
 @pytest.mark.parametrize("M, N, K, a_row_major, b_row_major", SHAPES)
 def test_mm(M, N, K, a_row_major, b_row_major, dtype):
-    from triton.tlx.ops.kernels.mm import sm100
+    from triton.tlx.ops import mm as tlx_mm
 
     a = _operand(M, K, dtype, a_row_major)
     b = _operand(K, N, dtype, b_row_major)
@@ -77,7 +79,7 @@ def test_mm(M, N, K, a_row_major, b_row_major, dtype):
 
     torch.cuda.synchronize()
     started = time.perf_counter()
-    out = sm100.mm(a, b, space="heuristic")
+    out = tlx_mm(a, b, arch=ARCH, space="heuristic")
     torch.cuda.synchronize()
     elapsed = time.perf_counter() - started
     assert elapsed < MAX_SECONDS_PER_CASE, (f"mm({M}x{N}x{K}, {dtype}) took {elapsed:.1f}s, "

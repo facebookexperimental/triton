@@ -5314,9 +5314,32 @@ class _AttentionFunction(torch.autograd.Function):
 CONFIGS = get_fwd_persistent_configs
 BWD_CONFIGS_FULL = get_hstu_bwd_configs
 
-#: Smoke spaces are the full lists: both are short, and the shape-dependent
-#: pruners can empty a subset on shapes the full list covers.
-SMOKE_CONFIGS = get_fwd_persistent_configs
+
+def _dedupe_by_path(config_list, axes):
+    """First real config per distinct combination of `axes`.
+
+    A subset of the shipped list rather than hand-authored entries: the pruners
+    reject configs that do not fit the target, so an invented combination can be
+    pruned away entirely.
+    """
+    seen, out = set(), []
+    for cfg in config_list:
+        key = tuple(cfg.kwargs.get(a) for a in axes)
+        if key not in seen:
+            seen.add(key)
+            out.append(cfg)
+    return out
+
+
+#: Smoke forward space: the pipeline depth and tile grouping, which are the
+#: structurally distinct paths. The full space is 48 configs, but the other
+#: three axes it varies (NUM_REGS_CORR/ACT/EPI) are register-budget tuning and
+#: lower identically -- autotuning them per shape cost ~8 minutes of L1 for no
+#: extra coverage.
+SMOKE_CONFIGS = lambda: _dedupe_by_path(  # noqa: E731
+    get_fwd_persistent_configs(), ("NUM_BUFFERS_KV", "GROUP_SIZE_N"))
+
+#: Backward smoke space is the full one -- it is only a few entries.
 BWD_CONFIGS_SMOKE = get_hstu_bwd_configs
 
 
