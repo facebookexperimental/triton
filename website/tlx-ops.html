@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Production-ready TLX kernels, one blessed implementation per op and architecture.">
+  <title>tlx.ops · FBTriton</title>
+  <link rel="stylesheet" href="assets/tlx.css?v=20260824c">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="../"><span>FBTriton</span></a>
+    <nav class="topnav" aria-label="Top-level sections"><a href="triton.html">Triton</a>
+<a href="tlx.html">TLX</a>
+<a href="tlx-ops.html" data-current="true">tlx.ops</a>
+<a href="torchtlx.html">TorchTLX</a>
+<a href="ci.html">CI</a>
+<a href="tooling.html">Tooling</a></nav>
+    <a class="repo-link" href="https://github.com/facebookexperimental/triton" target="_blank" rel="noreferrer">View on GitHub ↗</a>
+  </header>
+  <div class="shell">
+<aside class="sidebar">
+      <p class="eyebrow">TLX op library</p>
+      <nav><a href="tlx-ops.html" aria-current="page">tlx.ops</a>
+<a class="sub" href="#what-tlx-ops-is">What tlx.ops is</a>
+<a class="sub" href="#interface">Interface</a>
+<a class="sub" href="#structure">Structure</a>
+<a class="sub" href="#current-availability">Current availability</a></nav>
+    </aside>
+    <main>
+      <p class="eyebrow">TLX op library</p>
+      <h1>tlx.ops</h1>
+      <p class="lede">Production-ready TLX kernels, one blessed implementation per op and architecture.</p>
+      <article><p><code>tlx.ops</code> is a curated library of production-ready GPU kernels written in TLX, shipped as part of the FBTriton wheel and callable directly from Python.</p>
+<h2 id="what-tlx-ops-is">What tlx.ops is</h2>
+<p>TLX ships dozens of kernels under <code>third_party/tlx/tutorials/</code>. They are fast and well understood, but they were never an API: the only way to call one was to import the tutorial module and reach for whichever host wrapper it happened to export, along with its config lists and prune hooks. Which file to import, and which of several variants was the good one, was tribal knowledge.</p>
+<p><code>tlx.ops</code> turns that body of work into a library.</p>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><strong>Promotion, not rewriting.</strong> Kernels are promoted from <code>tutorials/</code> once they are performant and proven in production. The tutorial copy stays where it is and is frozen; the promoted copy is where fixes and performance work land.</div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><strong>One blessed kernel per (op, arch).</strong> Where several tutorial variants exist for the same operation on the same part, the catalog picks the best one. Callers do not choose between <code>ws</code>, <code>clc</code> and <code>2cta</code> — that taxonomy stays internal, which also means a kernel can be re-blessed without an API change.</div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><strong>A higher bar on the way in.</strong> Promotion requires correctness coverage in CI. Every cataloged op runs a hardware-agnostic shape sweep across dtypes and memory layouts on real hardware.</div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><strong><code>tutorials/</code> becomes a playground.</strong> As ops take over coverage, the tutorial tree is intended to become a scratch space for experiments rather than a de facto library, with CI attention moving to <code>tlx.ops</code>.</div></div>
+<h2 id="interface">Interface</h2>
+<pre><code class="language-python">from triton.tlx.ops import mm as tlx_mm
+
+out = tlx_mm(a, b)</code></pre>
+<p>Architecture is detected from the current device, so the same code runs wherever the op is available. If an op has no implementation for the current GPU it raises <code>UnsupportedOp</code>, naming the architectures where it does exist — it never silently falls back to torch, because a silent fallback turns "TLX is not running here" into an unexplained performance cliff.</p>
+<p>An architecture can be pinned explicitly, which is mainly useful in tests and benchmarks:</p>
+<pre><code class="language-python">out = tlx_mm(a, b, arch=&quot;sm100&quot;)</code></pre>
+<p>Architectures are named the way PTX and the ROCm toolchain name them — <code>sm90</code>, <code>sm100</code>, <code>gfx942</code>, <code>gfx950</code> — rather than by marketing name. The same strings appear in the directory layout and in dispatch, so there is one vocabulary rather than a mapping table between three.</p>
+<h2 id="structure">Structure</h2>
+<pre><code>third_party/tlx/
+    ops/                          -&gt; (symlink) python/triton/tlx/ops
+        __init__.py               the public functions; this file is the API
+        _catalog.py               (op, arch) -&gt; implementation, plus dispatch
+        kernels/
+            mm/                   sm90.py  sm100.py  gfx942.py  gfx950.py
+            addmm/                gfx942.py
+            flash_attn/           sm90.py  sm100.py
+            hstu_attn/            sm100.py  gfx942.py
+            ...
+    tutorials/                    unchanged; frozen once promoted</code></pre>
+<p>Kernels are grouped by op, then by architecture, so an op's coverage is visible by listing one directory. A file named for an architecture is an entry point; underscore-prefixed siblings such as <code>_util.py</code> or <code>_reference.py</code> are private helpers for that op.</p>
+<p>The catalog itself is a static table mapping <code>(op, arch)</code> to an import path as a plain string, resolved on first call. Importing <code>triton.tlx.ops</code> therefore never imports a kernel module or builds an autotune config table, and an architecture you are not running is never touched.</p>
+<h2 id="current-availability">Current availability</h2>
+<p>The library is new and the catalog is being filled in incrementally. Available today, all on Blackwell:</p>
+<table><thead><tr><th>Op</th><th>Architecture</th><th>Notes</th></tr></thead><tbody><tr><td><code>mm</code></td><td><code>sm100</code></td><td>fp16 / bf16, either operand row- or column-major</td></tr><tr><td><code>flash_attn</code></td><td><code>sm100</code></td><td>forward and backward, causal and non-causal</td></tr><tr><td><code>hstu_attn</code></td><td><code>sm100</code></td><td>ragged sequences, SiLU-scaled scores</td></tr></tbody></table>
+<p>Cataloged and queued for promotion, in rough priority order: <code>mm</code>, <code>addmm</code> and <code>bmm</code> on <code>sm90</code>, <code>gfx942</code> and <code>gfx950</code>; <code>flash_attn</code> on the AMD parts; then the workload ops — <code>gdpa</code>, <code>grouped_gemm</code>, <code>addmm_glu</code>, <code>paged_decode</code>, <code>ikbo_fa</code>, <code>ikbo_lce</code>, <code>multi_cta_layernorm</code>, <code>cross_attention</code> and <code>bmm_shared_a</code>.</p>
+<p>An op is either in the catalog for a given architecture or it is not; there is no partially-working state. <code>UnsupportedOp</code> tells you which architectures a given op currently covers.</p></article>
+<footer class="pager"><a href="tlx.html">← TLX</a><a class="next" href="torchtlx.html">TorchTLX →</a></footer>
+    </main>
+  </div>
+</body>
+</html>
