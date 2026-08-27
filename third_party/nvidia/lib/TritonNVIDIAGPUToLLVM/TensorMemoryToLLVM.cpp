@@ -516,6 +516,21 @@ static void combinePartialReductions(Location loc,
   }
 }
 
+struct TensorMemoryWaitOpConversion
+    : public ConvertOpToLLVMPattern<triton::nvidia_gpu::TMEMWaitOp> {
+  using ConvertOpToLLVMPattern::ConvertOpToLLVMPattern;
+
+  LogicalResult
+  matchAndRewrite(triton::nvidia_gpu::TMEMWaitOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto kind = op.getKind() == TMEMWaitKind::LOAD
+                    ? NVVM::Tcgen05WaitKind::LOAD
+                    : NVVM::Tcgen05WaitKind::STORE;
+    rewriter.replaceOpWithNewOp<NVVM::Tcgen05WaitOp>(op, kind);
+    return success();
+  }
+};
+
 struct TensorMemoryLoadOpConversion
     : public ConvertOpToLLVMPattern<triton::nvidia_gpu::TMEMLoadOp> {
   using ConvertOpToLLVMPattern::ConvertOpToLLVMPattern;
@@ -551,10 +566,9 @@ struct TensorMemoryLoadOpConversion
 
     Value resultStruct = packUniqueTensorElements(
         loc, getTypeConverter(), resultVals, rewriter, op.getType());
-    // Wait insertion could be moved to the TTGIR level if needed.
-    NVVM::Tcgen05WaitOp::create(rewriter, loc, NVVM::Tcgen05WaitKind::LOAD);
+    // TMEM waits are inserted at the TTGIR level for memory ordering.
 
-    // tcgen05.ld.red is async, redval registers aren't valid until the wait
+    // tcgen05.ld.red honors true register dependencies without a wait.
     if (redOp)
       combinePartialReductions(loc, rewriter, redvalVals, *redOp, useNaN);
 
@@ -594,7 +608,6 @@ struct TensorMemoryStoreOpConversion
     if (failed(lowerTMemLdStFromTypes(loc, rewriter, regTy, memTy, tmemBase,
                                       maxnreg, pred, llvmElemTy, srcValues)))
       return failure();
-    NVVM::Tcgen05WaitOp::create(rewriter, loc, NVVM::Tcgen05WaitKind::STORE);
 
     rewriter.eraseOp(op);
     return success();
@@ -635,7 +648,6 @@ struct TensorMemoryAllocOpConversion
                                         maxnreg, b.i1_val(true), llvmElemTy,
                                         srcValues)))
         return failure();
-      NVVM::Tcgen05WaitOp::create(rewriter, loc, NVVM::Tcgen05WaitKind::STORE);
     }
     // Cast to address space 3 as the shared memory object uses 3.
     // TODO: clean this up and use either a int or ptr address space 6
@@ -1093,7 +1105,8 @@ void mlir::triton::NVIDIA::populateTensorMemoryOpToLLVMPattern(
     PatternBenefit benefit) {
   patterns.add<TensorMemoryCopyOpConversion, TensorMemoryShiftOpConversion,
                TensorMemoryLoadOpConversion, TensorMemoryStoreOpConversion,
-               TensorMemoryAllocOpConversion>(typeConverter, benefit);
+               TensorMemoryAllocOpConversion, TensorMemoryWaitOpConversion>(
+      typeConverter, benefit);
 }
 
 void mlir::triton::NVIDIA::populateTensorMemorySubviewOpToLLVMPattern(
