@@ -363,7 +363,8 @@ def test_varlen_d128_plan_owns_offsets_and_compact_schedules():
     assert plan.max_q == 40
     assert plan.q_block_sequence.tolist() == [0, 0, 1, 1, 2, 2, 2]
     assert plan.q_block_start.tolist() == [0, 16, 0, 16, 0, 16, 32]
-    assert plan.kv_block_sequence.tolist() == [0, 1, 1, 2]
+    assert plan.num_full_kv_blocks == 1
+    assert plan.kv_block_sequence.tolist() == [1, 0, 1, 2]
     assert plan.kv_block_start.tolist() == [0, 0, 128, 0]
 
     cu_q.fill_(0)
@@ -418,9 +419,17 @@ def _make_varlen_d128_reference_case(q_lengths, kv_lengths, *, heads, seed):
     return q, k, v, out, do, lse, cu_q, cu_kv, scale, (expected_dq, expected_dk, expected_dv)
 
 
+@pytest.mark.parametrize(
+    ("q_lengths", "kv_lengths"),
+    (
+        pytest.param([7, 31, 65], [33, 257, 7], id="mixed-full-tail"),
+        pytest.param([1, 17], [1, 127], id="all-tail"),
+        pytest.param([16, 32], [128, 256], id="all-full"),
+    ),
+)
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
-def test_varlen_d128_interleaved_mixed_lengths_gfx950():
-    case = _make_varlen_d128_reference_case([7, 31, 65], [33, 257, 7], heads=2, seed=401)
+def test_varlen_d128_interleaved_mixed_lengths_gfx950(q_lengths, kv_lengths):
+    case = _make_varlen_d128_reference_case(q_lengths, kv_lengths, heads=2, seed=401)
     q, k, v, out, do, lse, cu_q, cu_kv, scale, expected = case
     plan = amd_fa_varlen_bwd.prepare_varlen_backward(cu_q, cu_kv)
 
@@ -558,7 +567,7 @@ def test_varlen_d128_backward_rejects_noncontiguous_lse():
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
 def test_varlen_d128_interleaved_codegen_is_scratch_free_gfx950():
-    case = _make_varlen_d128_reference_case([16], [128], heads=1, seed=409)
+    case = _make_varlen_d128_reference_case([16], [129], heads=1, seed=409)
     q, k, v, out, do, lse, cu_q, cu_kv, scale, _expected = case
     plan = amd_fa_varlen_bwd.prepare_varlen_backward(cu_q, cu_kv)
     kernels = (
@@ -574,13 +583,14 @@ def test_varlen_d128_interleaved_codegen_is_scratch_free_gfx950():
 
     device = torch.cuda.current_device()
     expected_shared = (256, 64_640, 0)
-    for kernel, shared in zip(kernels, expected_shared, strict=True):
+    expected_specializations = (1, 2, 1)
+    for kernel, shared, specialization_count in zip(kernels, expected_shared, expected_specializations, strict=True):
         compiled_objects = tuple(kernel.device_caches[device][0].values())
-        assert len(compiled_objects) == 1
-        compiled = compiled_objects[0]
-        _assert_scratch_free(kernel.fn.__name__, compiled)
-        assert compiled.metadata.num_warps == 4
-        assert compiled.metadata.shared == shared
+        assert len(compiled_objects) == specialization_count
+        for compiled in compiled_objects:
+            _assert_scratch_free(kernel.fn.__name__, compiled)
+            assert compiled.metadata.num_warps == 4
+            assert compiled.metadata.shared == shared
 
-    interleaved = tuple(kernels[1].device_caches[device][0].values())[0]
-    assert "buffer_atomic_pk_add_bf16" in interleaved.asm["amdgcn"]
+    for interleaved in kernels[1].device_caches[device][0].values():
+        assert "buffer_atomic_pk_add_bf16" in interleaved.asm["amdgcn"]

@@ -48,6 +48,7 @@ class VarlenBackwardPlan:
     total_q: int
     total_kv: int
     max_q: int
+    num_full_kv_blocks: int
 
 
 def _copy_and_validate_cu_seqlens(name: str, value: torch.Tensor) -> tuple[torch.Tensor, list[int]]:
@@ -79,6 +80,27 @@ def _make_block_schedule(lengths: list[int], block: int, device: torch.device) -
     )
 
 
+def _make_partitioned_block_schedule(lengths: list[int], block: int,
+                                     device: torch.device) -> tuple[torch.Tensor, torch.Tensor, int]:
+    full_sequences: list[int] = []
+    full_starts: list[int] = []
+    tail_sequences: list[int] = []
+    tail_starts: list[int] = []
+    for sequence, length in enumerate(lengths):
+        full_end = length // block * block
+        for start in range(0, full_end, block):
+            full_sequences.append(sequence)
+            full_starts.append(start)
+        if full_end < length:
+            tail_sequences.append(sequence)
+            tail_starts.append(full_end)
+    return (
+        torch.tensor(full_sequences + tail_sequences, dtype=torch.int32, device=device),
+        torch.tensor(full_starts + tail_starts, dtype=torch.int32, device=device),
+        len(full_sequences),
+    )
+
+
 def prepare_varlen_backward(cu_seqlens_q: torch.Tensor, cu_seqlens_k: torch.Tensor) -> VarlenBackwardPlan:
     """Prepare reusable compact schedules for immutable packed offsets."""
     if cu_seqlens_q.device != cu_seqlens_k.device:
@@ -91,7 +113,8 @@ def prepare_varlen_backward(cu_seqlens_q: torch.Tensor, cu_seqlens_k: torch.Tens
     q_lengths = [end - begin for begin, end in zip(q_offsets, q_offsets[1:])]
     k_lengths = [end - begin for begin, end in zip(k_offsets, k_offsets[1:])]
     q_block_sequence, q_block_start = _make_block_schedule(q_lengths, _BLOCK_M, cu_seqlens_q.device)
-    kv_block_sequence, kv_block_start = _make_block_schedule(k_lengths, _BLOCK_N, cu_seqlens_q.device)
+    kv_block_sequence, kv_block_start, num_full_kv_blocks = _make_partitioned_block_schedule(
+        k_lengths, _BLOCK_N, cu_seqlens_q.device)
 
     return VarlenBackwardPlan(
         cu_seqlens_q=owned_q,
@@ -104,6 +127,7 @@ def prepare_varlen_backward(cu_seqlens_q: torch.Tensor, cu_seqlens_k: torch.Tens
         total_q=q_offsets[-1],
         total_kv=k_offsets[-1],
         max_q=max(q_lengths),
+        num_full_kv_blocks=num_full_kv_blocks,
     )
 
 
@@ -225,6 +249,7 @@ def _varlen_bwd_interleaved_kernel(
     DQ_ACC,
     DK,
     DV,
+    TASK_OFFSET,
     SM_SCALE: tl.constexpr,
     TOTAL_Q,
     TOTAL_Q_PADDED,
@@ -232,13 +257,14 @@ def _varlen_bwd_interleaved_kernel(
     D: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    FULL_KV_TILE: tl.constexpr,
 ):
     """Compute current dK/dV while consuming the preceding dS phase for dQ."""
     tl.static_assert(D == 128)
     tl.static_assert(BLOCK_M == 16)
     tl.static_assert(BLOCK_N == 128)
 
-    task = tl.program_id(0)
+    task = tl.program_id(0) + TASK_OFFSET
     head = tl.program_id(1)
     batch = tl.load(KVBlockSequence + task)
     n0 = tl.load(KVBlockStart + task)
@@ -299,8 +325,11 @@ def _varlen_bwd_interleaved_kernel(
     offs_d = tl.arange(0, D)
     global_n = kv_start + offs_n
     kv_offsets = (global_n[:, None] * HEADS + head) * D + offs_d[None, :]
-    kv_mask = offs_n[:, None] < kv_len
-    k_token = tlx.async_load(K + kv_offsets, tlx.local_view(k_buffer, 0), mask=kv_mask, other=0.0)
+    if FULL_KV_TILE:
+        k_token = tlx.async_load(K + kv_offsets, tlx.local_view(k_buffer, 0))
+    else:
+        kv_mask = offs_n[:, None] < kv_len
+        k_token = tlx.async_load(K + kv_offsets, tlx.local_view(k_buffer, 0), mask=kv_mask, other=0.0)
     tlx.async_load_commit_group([k_token])
     _issue_qdo_async(
         tlx.local_view(q_buffers, 0),
@@ -319,9 +348,12 @@ def _varlen_bwd_interleaved_kernel(
     tl.debug_barrier()
 
     v_offsets = tlx.require_layout(kv_offsets.to(tl.int32), k_nm_layout, pin=False)
-    v_valid = tlx.require_layout(tl.broadcast_to(kv_mask, (BLOCK_N, D)), k_nm_layout, pin=False)
-    v_zero = tlx.zeros((BLOCK_N, D), tl.bfloat16, layout=k_nm_layout)
-    v_tile = tlx.buffer_load(V, v_offsets, mask=v_valid, other=v_zero)
+    if FULL_KV_TILE:
+        v_tile = tlx.buffer_load(V, v_offsets)
+    else:
+        v_valid = tlx.require_layout(tl.broadcast_to(kv_mask, (BLOCK_N, D)), k_nm_layout, pin=False)
+        v_zero = tlx.zeros((BLOCK_N, D), tl.bfloat16, layout=k_nm_layout)
+        v_tile = tlx.buffer_load(V, v_offsets, mask=v_valid, other=v_zero)
     v_tile = tlx.require_layout(v_tile, k_nm_layout, pin=False)
     dk = tlx.zeros((BLOCK_N, D), tl.float32, layout=mma_nd)
     dv = tlx.zeros((BLOCK_N, D), tl.float32, layout=mma_nd)
@@ -373,7 +405,10 @@ def _varlen_bwd_interleaved_kernel(
             pin=False,
         )
         scores_t = scores_t * score_scale - lse_full
-        valid = (offs_n[:, None] < kv_len) & (rows[None, :] < q_len)
+        if FULL_KV_TILE:
+            valid = tl.broadcast_to(rows[None, :] < q_len, (BLOCK_N, BLOCK_M))
+        else:
+            valid = (offs_n[:, None] < kv_len) & (rows[None, :] < q_len)
         valid = tlx.require_layout(valid, mma_nm, pin=False)
         p_t = tlx.require_layout(tl.where(valid, tl.math.exp2(scores_t), 0.0), mma_nm, pin=False)
         dp_acc = tlx.zeros((BLOCK_N, BLOCK_M), tl.float32, layout=mma_nm)
@@ -431,9 +466,13 @@ def _varlen_bwd_interleaved_kernel(
     dk_scale = tlx.require_layout(tl.full((BLOCK_N, D), SM_SCALE, dtype=tl.float32), mma_nd, pin=False)
     dk *= dk_scale
     output_offsets = tlx.require_layout(kv_offsets.to(tl.int32), mma_nd, pin=False)
-    output_mask = tlx.require_layout(tl.broadcast_to(kv_mask, (BLOCK_N, D)), mma_nd, pin=False)
-    tlx.buffer_store(dk.to(tl.bfloat16), DK, output_offsets, mask=output_mask)
-    tlx.buffer_store(dv.to(tl.bfloat16), DV, output_offsets, mask=output_mask)
+    if FULL_KV_TILE:
+        tlx.buffer_store(dk.to(tl.bfloat16), DK, output_offsets)
+        tlx.buffer_store(dv.to(tl.bfloat16), DV, output_offsets)
+    else:
+        output_mask = tlx.require_layout(tl.broadcast_to(kv_mask, (BLOCK_N, D)), mma_nd, pin=False)
+        tlx.buffer_store(dk.to(tl.bfloat16), DK, output_offsets, mask=output_mask)
+        tlx.buffer_store(dv.to(tl.bfloat16), DV, output_offsets, mask=output_mask)
 
 
 @triton.jit
@@ -541,31 +580,40 @@ def fa_varlen_backward(q, k, v, o, do, lse, plan, sm_scale):
         BLOCK_M=64,
         num_warps=4,
     )
-    _varlen_bwd_interleaved_kernel[(plan.kv_block_sequence.numel(), heads)](
-        q,
-        k,
-        v,
-        do,
-        lse,
-        delta,
-        plan.cu_seqlens_q,
-        plan.cu_seqlens_k,
-        plan.kv_block_sequence,
-        plan.kv_block_start,
-        dq_acc,
-        dk,
-        dv,
-        SM_SCALE=sm_scale,
-        TOTAL_Q=total_q,
-        TOTAL_Q_PADDED=total_q_padded,
-        HEADS=heads,
-        D=head_dim,
-        BLOCK_M=_BLOCK_M,
-        BLOCK_N=_BLOCK_N,
-        num_warps=4,
-        num_stages=1,
-        matrix_instr_nonkdim=16,
+    kv_launches = (
+        (0, plan.num_full_kv_blocks, True),
+        (plan.num_full_kv_blocks, plan.kv_block_sequence.numel() - plan.num_full_kv_blocks, False),
     )
+    for task_offset, task_count, full_kv_tile in kv_launches:
+        if task_count == 0:
+            continue
+        _varlen_bwd_interleaved_kernel[(task_count, heads)](
+            q,
+            k,
+            v,
+            do,
+            lse,
+            delta,
+            plan.cu_seqlens_q,
+            plan.cu_seqlens_k,
+            plan.kv_block_sequence,
+            plan.kv_block_start,
+            dq_acc,
+            dk,
+            dv,
+            task_offset,
+            SM_SCALE=sm_scale,
+            TOTAL_Q=total_q,
+            TOTAL_Q_PADDED=total_q_padded,
+            HEADS=heads,
+            D=head_dim,
+            BLOCK_M=_BLOCK_M,
+            BLOCK_N=_BLOCK_N,
+            FULL_KV_TILE=full_kv_tile,
+            num_warps=4,
+            num_stages=1,
+            matrix_instr_nonkdim=16,
+        )
     _varlen_dq_convert_kernel[(plan.q_block_sequence.numel(), heads)](
         dq_acc,
         plan.cu_seqlens_q,
