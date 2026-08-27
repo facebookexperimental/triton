@@ -1,4 +1,4 @@
-// RUN: triton-opt %s --nvgpu-test-ws-code-partition="num-buffers=1" --mlir-print-debuginfo --mlir-use-nameloc-as-prefix | FileCheck %s
+// RUN: triton-opt %s --nvgpu-test-ws-code-partition="num-buffers=1" --triton-nvidia-interleave-tmem --mlir-print-debuginfo --mlir-use-nameloc-as-prefix | FileCheck %s
 //
 // Regression test: verify that 2-buffer reuse group logic does NOT
 // incorrectly move the accumulator MMA's producer_acquire in the
@@ -56,6 +56,19 @@
 // CHECK-NOT: nvws.producer_acquire
 // CHECK: nvws.consumer_wait {{.*}}loop.cluster = 1{{.*}}loop.stage = 2
 // CHECK: ttng.tc_gen5_mma {{.*}}loop.cluster = 1{{.*}}loop.stage = 2{{.*}}tmem.end = array<i32: {{.+}}>, tmem.start = array<i32: {{.+}}, {{.+}}>
+//
+// QK and P are distinct logical allocations folded onto the same physical
+// TMEM slot (buffer ids 7/8).  The QK MMA and PV MMA execute in task 1, while
+// each QK load and subsequent P store execute in one softmax task.  Those two
+// program-order edges plus the QK-full channel already protect P publication
+// across iterations, so no additional empty wait may be inserted between the
+// P conversion and store.
+// CHECK: arith.truncf {{.*}}async_task_id = array<i32: 4>{{.*}}loop.cluster = 1{{.*}}loop.stage = 2
+// CHECK-NOT: ttng.wait_barrier
+// CHECK: ttng.tmem_store {{.*}}async_task_id = array<i32: 4>{{.*}}loop.cluster = 1{{.*}}loop.stage = 2
+// CHECK: arith.truncf {{.*}}async_task_id = array<i32: 5>{{.*}}loop.cluster = 4{{.*}}loop.stage = 1
+// CHECK-NOT: ttng.wait_barrier
+// CHECK: ttng.tmem_store {{.*}}async_task_id = array<i32: 5>{{.*}}loop.cluster = 4{{.*}}loop.stage = 1
 //
 #blocked = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
 #blocked1 = #ttg.blocked<{sizePerThread = [2], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
