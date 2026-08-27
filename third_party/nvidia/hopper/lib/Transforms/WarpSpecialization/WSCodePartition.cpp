@@ -4018,9 +4018,8 @@ void insertAsyncComm(
               tileBuilder.setInsertionPoint(annotTarget);
               Value tileBufIdx = producerSubtiled.addSharedArg(bufferIdx);
               Value tilePhase = producerSubtiled.addSharedArg(phase);
-              ttnvws::ProducerAcquireOp::create(
-                  tileBuilder, annotTarget->getLoc(), perTileTok, tileBufIdx,
-                  tilePhase,
+              tileBuilder.createWithAsyncTaskIds<ttnvws::ProducerAcquireOp>(
+                  annotTarget->getLoc(), perTileTok, tileBufIdx, tilePhase,
                   WSBarrierAttr::forDstTask(funcOp.getContext(), token.first)
                       .build(funcOp.getContext()));
               LDBG("create inline per-tile ProducerAcquire in SubtiledRegionOp "
@@ -4038,9 +4037,8 @@ void insertAsyncComm(
               tileBufIdx = producerSubtiled.addSharedArg(bufferIdx);
               tilePhase = producerSubtiled.addSharedArg(phase);
             }
-            ttnvws::ProducerAcquireOp::create(
-                tileBuilder, annotTarget->getLoc(), tileToken, tileBufIdx,
-                tilePhase,
+            tileBuilder.createWithAsyncTaskIds<ttnvws::ProducerAcquireOp>(
+                annotTarget->getLoc(), tileToken, tileBufIdx, tilePhase,
                 WSBarrierAttr::forDstTask(funcOp.getContext(), token.first)
                     .build(funcOp.getContext()));
             LDBG("create inline ProducerAcquire in SubtiledRegionOp "
@@ -4212,8 +4210,8 @@ void insertAsyncComm(
               OpBuilderWithAsyncTaskIds tileBuilder(annotTarget);
               tileBuilder.setInsertionPointAfter(annotTarget);
               Value tileBufIdx = commitSubtiled.addSharedArg(bufferIdx);
-              ttnvws::ProducerCommitOp::create(
-                  tileBuilder, annotTarget->getLoc(), perTileTok, tileBufIdx,
+              tileBuilder.createWithAsyncTaskIds<ttnvws::ProducerCommitOp>(
+                  annotTarget->getLoc(), perTileTok, tileBufIdx,
                   WSBarrierAttr::forDstTask(funcOp.getContext(), token.first)
                       .build(funcOp.getContext()));
               emittedSubtiledPerTileProducer.insert(
@@ -4232,8 +4230,8 @@ void insertAsyncComm(
             } else {
               tileBufIdx = commitSubtiled.addSharedArg(bufferIdx);
             }
-            ttnvws::ProducerCommitOp::create(
-                tileBuilder, annotTarget->getLoc(), tileToken, tileBufIdx,
+            tileBuilder.createWithAsyncTaskIds<ttnvws::ProducerCommitOp>(
+                annotTarget->getLoc(), tileToken, tileBufIdx,
                 WSBarrierAttr::forDstTask(funcOp.getContext(), token.first)
                     .build(funcOp.getContext()));
             LDBG("create inline ProducerCommit in SubtiledRegionOp "
@@ -4360,8 +4358,11 @@ void insertAsyncComm(
             tileBufIdx = subtiled.addSharedArg(bufferIdx);
             tilePhase = subtiled.addSharedArg(phase);
           }
-          ttnvws::ConsumerWaitOp::create(tileBuilder, insertTarget->getLoc(),
-                                         tileToken, tileBufIdx, tilePhase);
+          tileBuilder.createWithAsyncTaskIds<ttnvws::ConsumerWaitOp>(
+              insertTarget->getLoc(), tileToken, tileBufIdx, tilePhase,
+              WSBarrierAttr::forDstTask(funcOp.getContext(),
+                                        masterChannel->relation.first)
+                  .build(funcOp.getContext()));
           LDBG("create inline ConsumerWait in SubtiledRegionOp "
                << masterChannel->uniqID << " ");
         } else {
@@ -4463,8 +4464,11 @@ void insertAsyncComm(
           } else {
             tileBufIdx = subtiled.addSharedArg(bufferIdx);
           }
-          ttnvws::ConsumerReleaseOp::create(tileBuilder, insertTarget->getLoc(),
-                                            tileToken, tileBufIdx);
+          tileBuilder.createWithAsyncTaskIds<ttnvws::ConsumerReleaseOp>(
+              insertTarget->getLoc(), tileToken, tileBufIdx,
+              WSBarrierAttr::forDstTask(funcOp.getContext(),
+                                        masterChannel->relation.first)
+                  .build(funcOp.getContext()));
           LDBG("create inline ConsumerRelease in SubtiledRegionOp "
                << masterChannel->uniqID << " ");
         } else {

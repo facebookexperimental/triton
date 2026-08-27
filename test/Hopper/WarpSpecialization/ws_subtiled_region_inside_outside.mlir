@@ -28,16 +28,16 @@
 // (the +0 folds in), guarded by exactly one wait/arrive on the dstTask=2 barrier.
 // CHECK:      %[[LHS:.*]], %[[RHS:.*]] = tt.split
 // CHECK:      arith.truncf %[[LHS]] {async_task_id = array<i32: 0>}
-// CHECK:      ttng.wait_barrier {{.*}}WSBarrier = {dstTask = 2 : i32}
+// CHECK:      ttng.wait_barrier {{.*}}WSBarrier = {channelGraph = array<i32: 2>, dstTask = 2 : i32
 // CHECK:      ttg.local_store
-// CHECK:      ttng.arrive_barrier {{.*}}WSBarrier = {dstTask = 2 : i32}
+// CHECK:      ttng.arrive_barrier {{.*}}WSBarrier = {channelGraph = array<i32: 2>, dstTask = 2 : i32
 //
 // tile 1 is outRHS at the DISTINCT slot accumCnt+1.
 // CHECK:      arith.addi %[[CNT:.*]], %c1_i64 {async_task_id = array<i32: 0>}
 // CHECK:      arith.truncf %[[RHS]] {async_task_id = array<i32: 0>}
-// CHECK:      ttng.wait_barrier {{.*}}WSBarrier = {dstTask = 2 : i32}
+// CHECK:      ttng.wait_barrier {{.*}}WSBarrier = {channelGraph = array<i32: 2>, dstTask = 2 : i32
 // CHECK:      ttg.local_store
-// CHECK:      ttng.arrive_barrier {{.*}}WSBarrier = {dstTask = 2 : i32}
+// CHECK:      ttng.arrive_barrier {{.*}}WSBarrier = {channelGraph = array<i32: 2>, dstTask = 2 : i32
 //
 // Epilogue-store consumer (async_task_id 2). The first column's consumer reads
 // slot accumCnt+0 (= tile 0 = outLHS); the second column's consumer reads the
