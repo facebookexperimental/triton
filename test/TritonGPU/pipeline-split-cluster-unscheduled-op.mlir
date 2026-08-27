@@ -1,10 +1,14 @@
-// RUN: (triton-opt %s -split-input-file -allow-unregistered-dialect -tritongpu-test-pipeline-lower-loop 2>&1 || true) | FileCheck %s
+// RUN: triton-opt %s -split-input-file -allow-unregistered-dialect -tritongpu-test-pipeline-lower-loop > %t 2>&1 || :
+// RUN: FileCheck %s --input-file=%t
 
 // The diagnostic below is emitted via `op.emitError()` in LowerLoops.cpp,
 // which in an assert-enabled build is immediately followed by an assert that
 // aborts, but in an NDEBUG build (e.g. internal @mode/opt) emits cleanly and
 // returns 0. We therefore ignore triton-opt's exit status and let FileCheck
 // arbitrate on the emitted output, so the test is portable across both builds.
+// The output is staged through %t rather than a `( ... || true) | FileCheck`
+// pipeline because lit's internal shell has no subshells, and `||` binds
+// looser than `|` so the status cannot be discarded inline.
 
 // Regression test for the `CoarseSchedule::splitClusterBefore`
 // implicit-insert bug.

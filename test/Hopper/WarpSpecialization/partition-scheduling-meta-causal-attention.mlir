@@ -1,4 +1,4 @@
-// RUN: TRITON_USE_META_WS=1 triton-opt %s --nvgpu-partition-scheduling-meta="merge-epilogue separate-epilogue-store" | FileCheck %s
+// RUN: env TRITON_USE_META_WS=1 triton-opt %s --nvgpu-partition-scheduling-meta="merge-epilogue separate-epilogue-store" | FileCheck %s
 
 // Tests that causal flash attention with map_elementwise masking inside scf.if
 // gets exactly two computation partitions. Without the forward-set fix in
