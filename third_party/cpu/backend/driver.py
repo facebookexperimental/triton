@@ -123,6 +123,14 @@ def make_launcher(constants, signature, ids):
     kernel_fn_args_list = ', '.join(f"arg{i}" for i in kernel_fn_args)
     kernel_fn_arg_types = ', '.join([f"{ty_to_cpp(signature[i])}" for i in kernel_fn_args] + ["uint32_t"] * 6)
 
+    kernel_fn_arg_decls = ""
+    for i, ty in signature_without_constexprs.items():
+        if ty[0] == "*":
+            kernel_fn_arg_decls += f"    auto arg{i} = args[{i}];\n"
+        else:
+            ty_str = ty_to_cpp(ty) + "*"
+            kernel_fn_arg_decls += f"    auto& arg{i} = *reinterpret_cast<{ty_str}>(args[{i}]);\n"
+
     # generate glue code
     src = f"""
 #include <algorithm>
@@ -355,6 +363,24 @@ PyMODINIT_FUNC PyInit___triton_cpu_launcher(void) {{
   PyModule_AddFunctions(m, ModuleMethods);
   return m;
 }}
+
+extern "C" void run_from_nativert(
+    uint32_t gridX,
+    uint32_t gridY,
+    uint32_t gridZ,
+    int num_cpu_threads,
+    void** args,
+    kernel_ptr_t kernel_ptr) {{
+
+{kernel_fn_arg_decls}
+    run_omp_kernels(
+        gridX,
+        gridY,
+        gridZ,
+        num_cpu_threads,
+        kernel_ptr{(',' if len(signature_without_constexprs) > 0 else '')}
+        {', '.join([f"arg{i}" for i in signature_without_constexprs])});
+}}
 """
     return src
 
@@ -368,8 +394,10 @@ class CPULauncher(object):
         constants = {cst_key(key): value for key, value in constants.items()}
         signature = {cst_key(key): value for key, value in src.signature.items()}
         src = make_launcher(constants, signature, ids)
-        mod = compile_launcher_from_src(src, "__triton_cpu_launcher")
+        mod, launcher_path = compile_launcher_from_src(src, "__triton_cpu_launcher")
         self.launch = mod.launch
+        with open(launcher_path, "rb") as f:
+            self.launcher_bytes = f.read()
 
     def __call__(self, *args, **kwargs):
         self.launch(*args, **kwargs)

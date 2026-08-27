@@ -134,7 +134,7 @@ def compile_launcher_from_src(src, name):
             spec = importlib.util.spec_from_file_location(name, cache_path)
             mod = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(mod)
-            return mod
+            return mod, cache_path
         except ImportError:
             logging.getLogger(__name__).warning("Cached CPU launcher could not be loaded; rebuilding it")
             cache_path = None
@@ -157,7 +157,7 @@ def compile_launcher_from_src(src, name):
     spec = importlib.util.spec_from_file_location(name, cache_path)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
-    return mod
+    return mod, cache_path
 
 
 def build_kernel_from_asm(src_path, srcdir):

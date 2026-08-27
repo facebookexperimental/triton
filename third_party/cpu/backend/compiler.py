@@ -52,7 +52,8 @@ class CPUOptions:
     enable_tree_reduction: bool = False
     max_num_imprecise_acc_default: int = 0
     enable_fast_math: bool = True
-    vec_lib: Optional[str] = 'libsleef'
+    # For now, don't use libsleef to avoid library-not-found issues.
+    vec_lib: Optional[str] = None
     # TODO: Try to enable it.
     sanitize_overflow: bool = False
     instrumentation_mode: str = ""
