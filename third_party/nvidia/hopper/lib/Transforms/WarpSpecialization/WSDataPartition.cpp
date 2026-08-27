@@ -580,8 +580,57 @@ static bool shapedResultsCanRepresentDim(Operation *op, unsigned dim) {
 
 static bool getBackwardSliceToPartition(Value v,
                                         DataPartitionScheme &partitionScheme,
-                                        unsigned currentDim) {
+                                        unsigned currentDim,
+                                        bool partitionDependentScalar = false) {
   assert(partitionScheme.isValidPartitionDim(currentDim) && "invalid dim");
+  bool isScalar = getShape(v).empty() && !isa<AsyncTokenType>(v.getType());
+  if (partitionDependentScalar && isScalar) {
+    Operation *op = v.getDefiningOp();
+    if (!op) {
+      // A scalar with no defining op is a block argument. A function argument
+      // is uniform across partitions, so sharing it is correct and sliceOp
+      // leaves it alone. Any other region argument (a loop iter-arg, or an
+      // scf.if / scf.while carried value) may hold a partition-dependent value
+      // this walk cannot see, and sliceOp would slice its whole parent region
+      // even though the walk never registered it. Reject the trial instead of
+      // letting the analysis and the rewrite disagree.
+      auto blockArg = cast<BlockArgument>(v);
+      return isa<triton::FuncOp>(blockArg.getOwner()->getParentOp());
+    }
+    if (!partitionScheme.ops.insert(op)) {
+      if (!isControlFlowOp(op) &&
+          partitionScheme.opPartitionDims[op] != currentDim)
+        return false;
+      return true;
+    }
+    partitionScheme.opPartitionDims[op] = currentDim;
+    if (auto reduceOp = dyn_cast<ReduceOp>(op)) {
+      if (reduceOp.getAxis() != currentDim)
+        return false;
+      // currentDim is the axis being reduced, so it already indexes the
+      // operands' own logical shape and needs no remapping here. Producers
+      // that do move the partition dim (ExpandDimsOp, TransOp, ReshapeOp) are
+      // remapped by the shaped walk below, which the operands enter because
+      // they are tensors rather than scalars.
+      for (Value operand : reduceOp.getOperands()) {
+        assert(getShape(operand).size() > currentDim &&
+               "reduce operand must carry the partitioned dim");
+        if (!getBackwardSliceToPartition(operand, partitionScheme, currentDim))
+          return false;
+      }
+      return true;
+    }
+    if (!op->hasTrait<OpTrait::Elementwise>() && !isa<arith::ConstantOp>(op))
+      return false;
+    for (Value operand : op->getOperands()) {
+      bool operandIsScalar =
+          getShape(operand).empty() && !isa<AsyncTokenType>(operand.getType());
+      if (!getBackwardSliceToPartition(operand, partitionScheme, currentDim,
+                                       operandIsScalar))
+        return false;
+    }
+    return true;
+  }
   if (!needToSlice(v, currentDim, partitionScheme.numPartitions))
     return true;
   if (auto op = v.getDefiningOp()) {
@@ -678,6 +727,11 @@ static bool getBackwardSliceToPartition(Value v,
         partitionScheme.opPartitionDims[storeOp] = currentDim;
         if (!getBackwardSliceToPartition(storeOp.getSrc(), partitionScheme,
                                          currentDim))
+          return false;
+        if (!storeOp.getPred().getDefiningOp<arith::ConstantOp>() &&
+            !getBackwardSliceToPartition(storeOp.getPred(), partitionScheme,
+                                         currentDim,
+                                         /*partitionDependentScalar=*/true))
           return false;
       }
     } else if (op->hasTrait<OpTrait::Elementwise>() ||
@@ -1055,6 +1109,11 @@ static bool getSliceToPartition(Value root,
       if (!getBackwardSliceToPartition(tmemStoreOp.getSrc(), partitionScheme,
                                        currentDim))
         return false;
+      if (!tmemStoreOp.getPred().getDefiningOp<arith::ConstantOp>() &&
+          !getBackwardSliceToPartition(tmemStoreOp.getPred(), partitionScheme,
+                                       currentDim,
+                                       /*partitionDependentScalar=*/true))
+        return false;
     } else if (op->hasTrait<OpTrait::Elementwise>() ||
                isa<StoreOp, AtomicRMWOp, MapElementwiseOp>(op)) {
       for (OpOperand &operand : op->getOpOperands()) {
@@ -1345,7 +1404,8 @@ static Operation *sliceOp(Operation *op, int offset, IRMapping &mappings,
 
   OpBuilderWithAsyncTaskIds builder(op->getContext());
   builder.setAsynTaskIdsFromArray(sliceTaskIds);
-  auto cloneAndSetResultType = [&](Operation *op) {
+  auto cloneAndSetResultType = [&](Operation *op,
+                                   bool preserveResultTypes = false) {
     builder.setInsertionPoint(op);
     auto newOp = builder.clone(*op, mappings);
     setAsyncTaskIds(newOp, sliceTaskIds);
@@ -1360,7 +1420,9 @@ static Operation *sliceOp(Operation *op, int offset, IRMapping &mappings,
     reverseMappings.map(newOp, op);
     // set result shape for all results
     for (auto [v, newV] : llvm::zip(op->getResults(), newOp->getResults())) {
-      bool needRetype = true;
+      bool needRetype = !preserveResultTypes;
+      if (getShape(v).empty() && !isa<AsyncTokenType>(v.getType()))
+        needRetype = false;
       if (dim == DataPartitionScheme::noOpPartitionDim) {
         // Just duplicate the op for noOpPartitionDim
         needRetype = false;
@@ -1492,6 +1554,9 @@ static Operation *sliceOp(Operation *op, int offset, IRMapping &mappings,
             partitionScheme);
     sliceOp(tmemStOp.getDep(), offset, mappings, reverseMappings,
             partitionScheme);
+    if (!tmemStOp.getPred().getDefiningOp<arith::ConstantOp>())
+      sliceOp(tmemStOp.getPred(), offset, mappings, reverseMappings,
+              partitionScheme);
 
     // Slice retype the source operand with a tmem compatible layout.
     auto dstTy = mappings.lookupOrNull(tmemStOp.getDst()).getType();
@@ -1613,6 +1678,12 @@ static Operation *sliceOp(Operation *op, int offset, IRMapping &mappings,
     } else
       newOp = cloneAndSetResultType(op);
   } else if (auto constOp = dyn_cast<arith::ConstantOp>(op)) {
+    if (!isa<ShapedType>(constOp.getType())) {
+      newOp = cloneAndSetResultType(op, /*preserveResultTypes=*/true);
+      // Do not drop original task id as constant folding may lose one constant.
+      setAsyncTaskIds(newOp, getAsyncTaskIds(op));
+      return newOp;
+    }
     builder.setInsertionPoint(op);
     auto valAttr = cast<DenseElementsAttr>(constOp.getValueAttr());
     auto valType = cast<ShapedType>(valAttr.getType());
@@ -2080,11 +2151,15 @@ static Operation *sliceOp(Operation *op, int offset, IRMapping &mappings,
     }
     newOp = op;
   } else if (auto reduceOp = dyn_cast<ReduceOp>(op)) {
-    assert(reduceOp.getAxis() != dim &&
-           "reduce should not happen on the partitioned dimension");
     for (Value operand : op->getOperands())
       sliceOp(operand, offset, mappings, reverseMappings, partitionScheme);
-    newOp = cloneAndSetResultType(op);
+    // A reduction over the partitioned dimension becomes one independent
+    // reduction per data partition. Its operands are sliced, but the reduced
+    // dimension no longer exists in its results, so those result types must
+    // remain unchanged. This is used by FA forward to form one scalar,
+    // warp-uniform accumulator-rescale predicate per M partition.
+    bool reducesPartitionedDim = reduceOp.getAxis() == dim;
+    newOp = cloneAndSetResultType(op, reducesPartitionedDim);
     // recursively set async task ids for child ops
     newOp->walk(
         [&](Operation *childOp) { setAsyncTaskIds(childOp, sliceTaskIds); });
