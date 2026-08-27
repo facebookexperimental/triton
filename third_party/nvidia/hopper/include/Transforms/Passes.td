@@ -46,6 +46,28 @@ def NVGPUWarpSpecialization : Pass<"nvgpu-warp-specialization", "mlir::ModuleOp"
     ];
 }
 
+def NVGPUTestGenerateSubtiledRegion
+    : Pass<"nvgpu-test-generate-subtiled-region", "mlir::ModuleOp"> {
+  let summary = "Test pass: generate subtiled_region ops from split patterns";
+
+  let description = [{
+    This pass finds the GEMM epilogue subtiling pattern:
+      tmem_load -> reshape -> trans{[0,2,1]} -> split
+    followed by per-tile code (truncf, convert_layout, TMA store), and wraps
+    it in a `ttng.subtiled_region` op.
+
+    The pass runs after the memory planner and before code partition in the WS
+    pipeline. It captures the setup chain (tmem_load through split) in the
+    setup region and the per-tile code in the tile region body.
+  }];
+
+  let dependentDialects = [
+    "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect",
+    "mlir::triton::nvws::NVWSDialect",
+    "mlir::arith::ArithDialect"
+  ];
+}
+
 def NVGPUTestWSTaskPartition : Pass<"nvgpu-test-ws-task-partition", "mlir::ModuleOp"> {
   let summary = "test warp specialization task partition";
 

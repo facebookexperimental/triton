@@ -1,4 +1,4 @@
-// RUN: triton-opt %s -split-input-file --triton-nvidia-gpu-test-generate-subtiled-region --triton-nvidia-optimize-tmem-layouts | FileCheck %s
+// RUN: triton-opt %s -split-input-file --nvgpu-test-generate-subtiled-region --triton-nvidia-optimize-tmem-layouts | FileCheck %s
 
 // Test: multi-task chain with pre-hoisted allocs — OptimizeTMemLayouts
 // converts the split to tmem_subslice + tmem_load before the
