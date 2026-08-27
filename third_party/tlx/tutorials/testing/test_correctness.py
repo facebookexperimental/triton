@@ -117,6 +117,9 @@ from triton.language.extra.tlx.tutorials.amd_addmm_gfx950 import (
     addmm as _amd_addmm,
     available_paths as _amd_addmm_paths,
 )
+from triton.language.extra.tlx.tutorials.amd_linear_wgrad_gfx950 import (
+    wgrad as _amd_linear_wgrad,
+)
 from triton.language.extra.tlx.tutorials import amd_hstu_attn as _hstu
 from triton.tools.mxfp import MXScaleTensor
 
@@ -2577,6 +2580,21 @@ def test_amd_standalone_addmm(dtype, bias_2d, split_k):
         torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
     else:
         _check_addmm_all_paths(bias, a, b, dtype=dtype)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
+@pytest.mark.parametrize("input_dim", [512, 2048], ids=["attention", "ffn"])
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware (CDNA4)")
+def test_amd_linear_wgrad(dtype, input_dim):
+    batch, output_dim = 1024, 512
+    torch.manual_seed(0)
+    grad_output = torch.randn(batch, output_dim, device=DEVICE, dtype=dtype) / batch
+    hidden = torch.randn(batch, input_dim, device=DEVICE, dtype=dtype)
+
+    actual = _amd_linear_wgrad(grad_output, hidden)
+    expected = grad_output.T @ hidden
+
+    torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
 
 
 @pytest.mark.parametrize(
