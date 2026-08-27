@@ -1207,6 +1207,19 @@ struct TritonNvidiaGPUInterleaveTMemPass
       m.walk([](Block *block) {
         (void)repairWholeOverwriteReuseWaitPhases(*block);
       });
+
+    // WS code partitioning keeps a structurally redundant P-publication wait
+    // long enough for loop scheduling and TMEM interleaving to observe its
+    // cross-partition ordering edge.  Erase it only after those transformations
+    // have fixed the operation order; removing it in WSCodePartition changes
+    // the schedule and does not reproduce the proven final-IR ablation.
+    SmallVector<WaitBarrierOp> redundantPublicationWaits;
+    m.walk([&](WaitBarrierOp wait) {
+      if (wait->hasAttr("ttng.redundant_publication_wait"))
+        redundantPublicationWaits.push_back(wait);
+    });
+    for (WaitBarrierOp wait : redundantPublicationWaits)
+      wait.erase();
   }
 };
 
