@@ -251,6 +251,15 @@ public:
       resultTypes.push_back(rewriter.getType<AsyncTokenType>());
     auto ifOp = scf::IfOp::create(rewriter, loc, resultTypes, condition,
                                   /*withElseRegion=*/true);
+    if (threadsToken) {
+      // scf::IfOp::build only materializes the region terminators when the op
+      // has no results; with a token result the blocks come back empty.
+      OpBuilder::InsertionGuard g(rewriter);
+      rewriter.setInsertionPointToEnd(ifOp.thenBlock());
+      scf::YieldOp::create(rewriter, loc, ValueRange{incomingToken});
+      rewriter.setInsertionPointToEnd(ifOp.elseBlock());
+      scf::YieldOp::create(rewriter, loc, ValueRange{incomingToken});
+    }
 
     auto thenYield = cast<scf::YieldOp>(ifOp.thenBlock()->getTerminator());
     rewriter.setInsertionPoint(thenYield);
