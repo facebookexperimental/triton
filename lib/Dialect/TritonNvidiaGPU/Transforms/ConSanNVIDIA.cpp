@@ -1,3 +1,4 @@
+#include "triton/Analysis/Allocation.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonInstrument/Transforms/ConSanTargetHooks.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
@@ -29,19 +30,10 @@ Value getLeaderCTAPredicate(ImplicitLocOpBuilder &b, uint32_t broadcastMask) {
                                arith::ConstantIntOp::create(b, 0, 32));
 }
 
-std::optional<uint16_t> getAtomicScratchBroadcastMask(Operation *op) {
-  if (!op->hasAttr("allocation.size") ||
-      !isa<AtomicPollOp, AtomicRMWOp, AtomicCASOp, ttg::LocalAtomicScatterRMWOp,
-           tti::ExperimentalGSanAtomicRMWOp, tti::ExperimentalGSanAtomicCASOp>(
-          op))
-    return std::nullopt;
-
-  Type resultTy = op->getResult(0).getType();
-  if (auto tensorTy = dyn_cast<RankedTensorType>(resultTy)) {
-    auto kBlock = StringAttr::get(op->getContext(), "block");
-    return ttg::toLinearLayout(tensorTy).getFreeVariableMasks().lookup(kBlock);
-  }
-  return static_cast<uint16_t>(ttg::lookupNumCTAs(op) - 1);
+uint32_t getBlockBroadcastMask(Type type) {
+  auto memDescTy = cast<ttg::MemDescType>(type);
+  auto kBlock = StringAttr::get(type.getContext(), "block");
+  return toLinearLayout(memDescTy).getFreeVariableMasks().lookup(kBlock);
 }
 
 } // namespace
@@ -116,17 +108,12 @@ public:
                          Operation *op) const override {
     // mask = 0 means no CTA predication.
     uint32_t mask = 0;
-    auto getBarrierMask = [&](Value barrier) {
-      auto barrierTy = cast<ttg::MemDescType>(barrier.getType());
-      auto kBlock = StringAttr::get(op->getContext(), "block");
-      return toLinearLayout(barrierTy).getFreeVariableMasks().lookup(kBlock);
-    };
     if (auto initOp = dyn_cast<ttng::InitBarrierOp>(op))
-      mask = getBarrierMask(initOp.getAlloc());
+      mask = getBlockBroadcastMask(initOp.getAlloc().getType());
     if (auto waitOp = dyn_cast<ttng::WaitBarrierOp>(op))
-      mask = getBarrierMask(waitOp.getAlloc());
+      mask = getBlockBroadcastMask(waitOp.getAlloc().getType());
     if (auto invalOp = dyn_cast<ttng::InvalBarrierOp>(op))
-      mask = getBarrierMask(invalOp.getAlloc());
+      mask = getBlockBroadcastMask(invalOp.getAlloc().getType());
     if (isa<ttng::BarrierExpectOp, ttng::ArriveBarrierOp>(op)) {
       std::optional<uint32_t> fromCTA;
       if (auto expectOp = dyn_cast<ttng::BarrierExpectOp>(op))
@@ -138,15 +125,16 @@ public:
     }
     if (auto copyOp = dyn_cast<ttng::AsyncTMACopyGlobalToLocalOp>(op)) {
       if (copyOp.getMulticast())
-        mask = getBarrierMask(copyOp.getResult());
+        mask = getBlockBroadcastMask(copyOp.getResult().getType());
     }
     if (auto gatherOp = dyn_cast<ttng::AsyncTMAGatherOp>(op))
       if (gatherOp.getMulticast())
-        mask = getBarrierMask(gatherOp.getResult());
+        mask = getBlockBroadcastMask(gatherOp.getResult().getType());
     if (auto storeOp = dyn_cast<ttng::TMAStoreLikeOpInterface>(op))
-      mask = getBarrierMask(storeOp.getSrc());
-    if (auto scratchMask = getAtomicScratchBroadcastMask(op))
-      mask = *scratchMask;
+      mask = getBlockBroadcastMask(storeOp.getSrc().getType());
+    if (op->hasAttr("allocation.size"))
+      if (auto scratchMask = getAtomicScratchBroadcastMask(op))
+        mask = *scratchMask;
     if (isa<ttng::CLCTryCancelOp>(op) && ttg::lookupNumCTAs(op) > 1) {
       Value ctaId = tti::ExperimentalClusterCTAIdOp::create(b, b.getLoc());
       return arith::CmpIOp::create(b, arith::CmpIPredicate::eq, ctaId,
@@ -172,7 +160,8 @@ public:
   bool hasUnsummarizableCalleeState(Operation *op) const override {
     if (isa<ClusterBarrierOp>(op))
       return true;
-    return getAtomicScratchBroadcastMask(op).value_or(0) != 0;
+    return op->hasAttr("allocation.size") &&
+           getAtomicScratchBroadcastMask(op).value_or(0) != 0;
   }
 
   std::optional<MemEffectsOpInfo>

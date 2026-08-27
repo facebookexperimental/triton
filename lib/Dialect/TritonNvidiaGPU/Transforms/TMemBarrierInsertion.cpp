@@ -1,5 +1,6 @@
 #include "triton/Analysis/Allocation.h"
 #include "triton/Analysis/Membar.h"
+#include "triton/Analysis/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/TensorMemoryUtils.h"
@@ -24,15 +25,7 @@ namespace nvidia_gpu {
 
 namespace {
 
-namespace ttg = triton::gpu;
-
 enum class TMemAccessKind { None, Load, Store, MMA };
-
-// Keep row groups far apart so per-row column intervals do not alias after
-// flattening the physical 2D tensor-memory address space into 1D intervals.
-static constexpr size_t kFlattenedRowStride = size_t{1} << 32;
-static constexpr int kAllocRowGranularity = 64;
-static constexpr int kRowOffsetGranularity = 16;
 
 // Fine grain modeling of TMEM ops as pipelining behavior is not fully
 // represented in ops attributes.
@@ -232,217 +225,24 @@ static bool filterFn(Operation *lhs, Operation *rhs, bool /*lhsIsRead*/,
 }
 
 static bool isTensorMemory(Value value) {
-  auto memDescType = dyn_cast<ttg::MemDescType>(value.getType());
+  auto memDescType = dyn_cast<gpu::MemDescType>(value.getType());
   return memDescType &&
          isa<TensorMemorySpaceAttr>(memDescType.getMemorySpace());
 }
 
-// Offset of a view relative to the root allocation, in physical TMEM
-// coordinates (rows, 32-bit columns).
-struct TMemViewOffset {
-  int64_t row = 0;
-  int64_t col = 0;
-  bool known = true;
-};
-
-// A root allocation reached from a view, together with the view's offset
-// within it. Two views of one allocation can be physically disjoint, so the
-// offset is what lets the interval model tell them apart.
-struct RootAlloc {
-  TMEMAllocOp alloc;
-  TMemViewOffset offset;
-};
-
-static void appendRootAllocs(Value value, SmallVectorImpl<RootAlloc> &allocs,
-                             bool &unknown) {
-  DenseSet<Value> seen;
-  SmallVector<std::pair<Value, TMemViewOffset>> worklist{{value, {}}};
-
-  while (!worklist.empty()) {
-    auto [current, offset] = worklist.pop_back_val();
-    if (!seen.insert(current).second)
-      continue;
-
-    if (auto arg = dyn_cast<BlockArgument>(current)) {
-      Block *block = arg.getOwner();
-      Operation *parentOp = block->getParentOp();
-
-      if (!block->isEntryBlock()) {
-        for (Block *pred : block->getPredecessors()) {
-          auto branch = dyn_cast<BranchOpInterface>(pred->getTerminator());
-          if (!branch) {
-            unknown = true;
-            continue;
-          }
-          auto it = llvm::find(branch->getSuccessors(), block);
-          unsigned successorIndex =
-              std::distance(branch->getSuccessors().begin(), it);
-          SuccessorOperands args = branch.getSuccessorOperands(successorIndex);
-          worklist.push_back(
-              {args.getForwardedOperands()[arg.getArgNumber() -
-                                           args.getProducedOperandCount()],
-               offset});
-        }
-        continue;
-      }
-
-      if (auto ws = dyn_cast<ttg::WarpSpecializePartitionsOp>(parentOp)) {
-        worklist.push_back(
-            {ws.getExplicitCaptures()[arg.getArgNumber()], offset});
-      } else if (auto forOp = dyn_cast<scf::ForOp>(parentOp)) {
-        unsigned idx = arg.getArgNumber() - 1;
-        worklist.push_back({forOp.getYieldedValues()[idx], offset});
-        worklist.push_back({forOp.getInits()[idx], offset});
-      } else if (auto whileOp = dyn_cast<scf::WhileOp>(parentOp)) {
-        unsigned idx = arg.getArgNumber();
-        if (arg.getParentRegion() == &whileOp.getAfter()) {
-          worklist.push_back({whileOp.getConditionOp().getArgs()[idx], offset});
-        } else {
-          worklist.push_back({whileOp.getYieldedValues()[idx], offset});
-          worklist.push_back({whileOp.getInits()[idx], offset});
-        }
-      } else {
-        unknown = true;
-      }
-      continue;
-    }
-
-    Operation *defOp = current.getDefiningOp();
-    if (!defOp) {
-      unknown = true;
-      continue;
-    }
-
-    unsigned resultIndex = cast<OpResult>(current).getResultNumber();
-    // The view ops that carry an offset must be matched before the generic
-    // MemDescViewTrait branch below, which would otherwise shadow them and
-    // discard the offset.
-    if (auto alloc = dyn_cast<TMEMAllocOp>(defOp)) {
-      allocs.push_back({alloc, offset});
-    } else if (auto index = dyn_cast<ttg::MemDescIndexOp>(defOp)) {
-      // Multi-buffered views advance the base pointer by one buffer's worth of
-      // 32-bit columns, matching MemDescIndexOpConversion.
-      APInt indexValue;
-      TMemViewOffset next = offset;
-      if (matchPattern(index.getIndex(), m_ConstantInt(&indexValue)))
-        next.col += indexValue.getSExtValue() *
-                    getTmemAllocSizes(index.getType()).numCols;
-      else
-        next.known = false;
-      worklist.push_back({index.getSrc(), next});
-    } else if (auto slice = dyn_cast<TMEMSubSliceOp>(defOp)) {
-      // getTMemSubSliceOffset packs the column offset in the low 16 bits and
-      // the row offset in the high 16 bits, as TMEMSubSliceOpConversion does.
-      uint32_t packed = getTMemSubSliceOffset(
-          slice.getSrc().getType(), slice.getOffset(), slice.getDim());
-      TMemViewOffset next = offset;
-      next.col += packed & 0xffff;
-      next.row += packed >> 16;
-      worklist.push_back({slice.getSrc(), next});
-    } else if (isa<ttg::MemDescReinterpretOp, ttg::MemDescTransOp,
-                   ttg::MemDescReshapeOp>(defOp)) {
-      // Pure reinterpretations do not move the base pointer.
-      worklist.push_back({defOp->getOperand(0), offset});
-    } else if (defOp->hasTrait<OpTrait::MemDescViewTrait>()) {
-      // Keep walking to the root, but do not pretend the offset is known.
-      TMemViewOffset next = offset;
-      next.known = false;
-      worklist.push_back({defOp->getOperand(0), next});
-    } else if (auto selectOp = dyn_cast<arith::SelectOp>(defOp)) {
-      worklist.push_back({selectOp.getTrueValue(), offset});
-      worklist.push_back({selectOp.getFalseValue(), offset});
-    } else if (auto ifOp = dyn_cast<scf::IfOp>(defOp)) {
-      worklist.push_back({ifOp.thenYield().getOperand(resultIndex), offset});
-      worklist.push_back({ifOp.elseYield().getOperand(resultIndex), offset});
-    } else if (auto forOp = dyn_cast<scf::ForOp>(defOp)) {
-      worklist.push_back({forOp.getYieldedValues()[resultIndex], offset});
-      worklist.push_back({forOp.getInits()[resultIndex], offset});
-    } else if (auto whileOp = dyn_cast<scf::WhileOp>(defOp)) {
-      worklist.push_back(
-          {whileOp.getConditionOp().getArgs()[resultIndex], offset});
-    } else {
-      unknown = true;
-    }
-  }
-}
-
-static SmallVector<AllocationSlice> getTMemSlices(Value value) {
-  SmallVector<RootAlloc> allocs;
-  bool unknown = false;
-  appendRootAllocs(value, allocs, unknown);
-
-  SmallVector<AllocationSlice> slices;
-  auto everything = [&]() -> SmallVector<AllocationSlice> {
-    slices.clear();
-    slices.emplace_back(
-        Interval<size_t>(0, std::numeric_limits<size_t>::max()));
-    return slices;
-  };
-
-  if (unknown || allocs.empty())
-    return everything();
-
-  // The accessed extent is the view's own footprint, not the whole allocation.
-  auto viewTy = dyn_cast<ttg::MemDescType>(value.getType());
-  if (!viewTy)
-    return everything();
-  TMemAllocation viewSize = getTmemAllocSizes(viewTy);
-
-  for (RootAlloc &root : allocs) {
-    auto colAttr =
-        root.alloc->getAttrOfType<IntegerAttr>("tensor_memory_col_offset");
-    auto rowAttr =
-        root.alloc->getAttrOfType<IntegerAttr>("tensor_memory_row_offset");
-    if (!colAttr || !rowAttr)
-      return everything();
-
-    TMemAllocation allocSize = getTmemAllocSizes(root.alloc.getType());
-    // Fall back to the whole allocation when the view offset is not statically
-    // known, so an unresolved view can never look narrower than it is.
-    bool useView = root.offset.known;
-    int64_t colOffset = colAttr.getInt() + (useView ? root.offset.col : 0);
-    int64_t rowOffset = rowAttr.getInt() + (useView ? root.offset.row : 0);
-    int64_t numRows = useView ? viewSize.numRows : allocSize.numRows;
-    int64_t numCols = useView ? viewSize.numCols : allocSize.numCols;
-
-    if (rowOffset % kRowOffsetGranularity != 0 ||
-        numRows % kAllocRowGranularity != 0)
-      return everything();
-
-    int64_t rowGroup = rowOffset / kRowOffsetGranularity;
-    int64_t numRowGroups = numRows / kAllocRowGranularity;
-    for (int64_t row = 0; row < numRowGroups; ++row) {
-      size_t start = static_cast<size_t>(rowGroup + row) * kFlattenedRowStride +
-                     static_cast<size_t>(colOffset);
-      slices.emplace_back(Interval<size_t>(start, start + numCols));
-    }
-  }
-  return slices;
-}
-
-static void appendReadSlices(Value value, Operation *op, BlockInfo *blockInfo) {
-  if (!isTensorMemory(value))
-    return;
-  for (AllocationSlice slice : getTMemSlices(value))
-    blockInfo->syncReadSlices[slice].insert(op);
-}
-
-static void appendWriteSlices(Value value, Operation *op,
-                              BlockInfo *blockInfo) {
-  if (!isTensorMemory(value))
-    return;
-  for (AllocationSlice slice : getTMemSlices(value))
-    blockInfo->syncWriteSlices[slice].insert(op);
-}
-
-static BlockInfo getTMemAccesses(Operation *op) {
-  // Use physical TMEM allocation slices; unknown origins alias all TMEM.
+static BlockInfo getTMemAccesses(Operation *op, BufferRegionAnalysis &regions) {
   BlockInfo accesses;
   for (const MemoryAccess &access : getMemoryAccesses(op)) {
+    if (!isTensorMemory(access.value))
+      continue;
+    // Footprints preserve TMEM rows and columns; a full interval makes unknown
+    // footprints alias all TMEM.
+    AllocationSlice slice(Interval<size_t>{});
+    slice.physicalFootprint = regions.getFootprint(access.value);
     if (access.isRead)
-      appendReadSlices(access.value, op, &accesses);
+      accesses.syncReadSlices[slice].insert(op);
     if (access.isWrite)
-      appendWriteSlices(access.value, op, &accesses);
+      accesses.syncWriteSlices[slice].insert(op);
   }
   return accesses;
 }
@@ -473,29 +273,18 @@ void TMemBarrierAnalysis::update(Operation *op, MembarInfo *membarInfo,
   if (stages.beforeMemoryEffects)
     membarInfo->sync();
 
-  if (isa<triton::CallOp>(op)) {
-    auto call = cast<CallOpInterface>(op);
-    if (auto callee = dyn_cast<FunctionOpInterface>(call.resolveCallable())) {
+  if (auto call = dyn_cast<CallOpInterface>(op)) {
+    if (auto summary = getCallSummary(call, *funcMap)) {
       // Tensor-memory allocation attributes are physical addresses assigned
       // across the whole module, so callee slices need no call-frame offset.
-      MembarInfo calleeMembarInfo = funcMap->lookup(callee);
-      if (membarInfo->pending.isIntersected(calleeMembarInfo.entryBlockInfo,
-                                            filter, &allocation)) {
-        builder->setInsertionPoint(op);
-        insertBarrier(op, builder);
-        membarInfo->sync();
-      }
-      membarInfo->applyCallSummary(calleeMembarInfo);
+      syncIfNeeded(op, summary->entryBlockInfo, membarInfo, builder);
+      membarInfo->applyCallSummary(*summary);
     }
     return;
   }
 
-  BlockInfo curBlockInfo = getTMemAccesses(op);
-  if (membarInfo->pending.isIntersected(curBlockInfo, filter, &allocation)) {
-    builder->setInsertionPoint(op);
-    insertBarrier(op, builder);
-    membarInfo->sync();
-  }
+  BlockInfo curBlockInfo = getTMemAccesses(op, regions);
+  syncIfNeeded(op, curBlockInfo, membarInfo, builder);
 
   membarInfo->addBlockInfo(curBlockInfo);
   // A leading or interior rendezvous must preserve the operation's own effects.
@@ -631,7 +420,7 @@ private:
       return;
     }
 
-    BlockInfo effects = getTMemAccesses(op);
+    BlockInfo effects = getTMemAccesses(op, regions);
     // Include internal scratch barriers even without descriptor memory effects.
     auto stages = getLocalBarrierStages(op, &allocation);
     // Reuse this barrier for incoming hazards only if it precedes the op's TMEM
@@ -699,6 +488,19 @@ private:
   BlockInfo afterBarrier;
 };
 
+template <typename AnalysisT>
+LogicalResult runTMemAnalysis(ModuleOp mod, MembarFilterFn filter = nullptr) {
+  auto solver = createDataFlowSolver();
+  auto *regions = solver->load<BufferRegionAnalysis>(
+      BufferRegionAnalysis::Mode::TensorMemoryOnly);
+  if (failed(solver->initializeAndRun(mod)))
+    return failure();
+  ModuleAllocation allocation(mod);
+  ModuleMembarAnalysis analysis(allocation, std::move(filter));
+  analysis.runAnalysis<AnalysisT>(*regions);
+  return success();
+}
+
 } // namespace
 
 struct TMemWaitInsertionPass
@@ -720,9 +522,8 @@ struct TMemWaitInsertionPass
       return;
     // Run after TMEM and shared-memory barrier insertion. Calls and returns
     // complete pending accesses, so this pass needs no call summaries.
-    ModuleAllocation allocation(mod);
-    ModuleMembarAnalysis analysis(allocation);
-    analysis.runAnalysis<TMemWaitAnalysis>();
+    if (failed(runTMemAnalysis<TMemWaitAnalysis>(mod)))
+      return signalPassFailure();
   }
 };
 
@@ -734,14 +535,18 @@ struct TMemBarrierInsertionPass
 
   void runOnOperation() override {
     ModuleOp mod = getOperation();
-    ModuleAllocation allocation(mod);
+    if (!mod.walk([](Operation *op) {
+              return getTMemAccessKind(op) == TMemAccessKind::None
+                         ? WalkResult::advance() : WalkResult::interrupt();
+            }).wasInterrupted())
+      return;
     TMemAccessCache cache;
     MembarFilterFn filter = [&](Operation *lhs, Operation *rhs, bool lhsIsRead,
                                 bool rhsIsRead, Allocation *allocation) {
       return filterFn(lhs, rhs, lhsIsRead, rhsIsRead, allocation, cache);
     };
-    ModuleMembarAnalysis analysis(allocation, filter);
-    analysis.runAnalysis<TMemBarrierAnalysis>();
+    if (failed(runTMemAnalysis<TMemBarrierAnalysis>(mod, filter)))
+      return signalPassFailure();
   }
 };
 
