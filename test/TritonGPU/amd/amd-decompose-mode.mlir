@@ -1,4 +1,4 @@
-// RUN: TRITON_ENABLE_AMD_MODULO=1 triton-opt %s -split-input-file \
+// RUN: env TRITON_ENABLE_AMD_MODULO=1 triton-opt %s -split-input-file \
 // RUN:   -tritonamdgpu-dot-decompose-and-schedule="mode=decompose" 2>&1 \
 // RUN:   | FileCheck %s --implicit-check-not="amd-modulo: DDG"
 //

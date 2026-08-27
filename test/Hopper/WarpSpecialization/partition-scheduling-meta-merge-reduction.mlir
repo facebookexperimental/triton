@@ -1,4 +1,4 @@
-// RUN: TRITON_USE_META_WS=1 triton-opt %s --nvgpu-partition-scheduling-meta="merge-reduction merge-epilogue-to-computation" | FileCheck %s
+// RUN: env TRITON_USE_META_WS=1 triton-opt %s --nvgpu-partition-scheduling-meta="merge-reduction merge-epilogue-to-computation" | FileCheck %s
 // XFAIL: *
 
 // Regression test for B-3-F1 / T273467650.

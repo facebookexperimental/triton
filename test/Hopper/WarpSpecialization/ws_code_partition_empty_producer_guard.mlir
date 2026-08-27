@@ -1,4 +1,4 @@
-// RUN: TRITON_USE_META_WS=1 triton-opt %s --nvgpu-partition-scheduling-meta --nvgpu-warp-specialization="capability=100" | FileCheck %s
+// RUN: env TRITON_USE_META_WS=1 triton-opt %s --nvgpu-partition-scheduling-meta --nvgpu-warp-specialization="capability=100" | FileCheck %s
 
 // Regression guard for the empty-producer assertion (bug #7 in
 // .llms/rules/partition-scheduler-bugs.md): the `producerTaskIds.size() == 1`

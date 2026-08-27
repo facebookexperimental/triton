@@ -1,4 +1,4 @@
-// RUN: TRITON_ENABLE_AMD_MODULO=1 TRITON_AMD_MODULO_SERIALIZE=1 \
+// RUN: env TRITON_ENABLE_AMD_MODULO=1 TRITON_AMD_MODULO_SERIALIZE=1 \
 // RUN:   TRITON_USE_MODULO_SCHEDULE=1 triton-opt %s -split-input-file \
 // RUN:   -tritonamdgpu-dot-decompose-and-schedule 2>&1 | FileCheck %s
 //

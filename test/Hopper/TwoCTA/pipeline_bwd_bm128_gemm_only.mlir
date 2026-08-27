@@ -1,4 +1,4 @@
-// RUN: TRITON_USE_META_WS=1 triton-opt %s '-tritongpu-schedule-loops=use-meta-ws=true num-stages=2' '--tritongpu-pipeline=num-stages=2' | FileCheck %s
+// RUN: env TRITON_USE_META_WS=1 triton-opt %s '-tritongpu-schedule-loops=use-meta-ws=true num-stages=2' '--tritongpu-pipeline=num-stages=2' | FileCheck %s
 // Regression: warp-specialized loops containing a peer gather or TMA reduction
 // must use lockstep epilogue peeling. Generic epilogue predication cannot mask
 // the gather and independently predicating the reduction desynchronizes sibling
