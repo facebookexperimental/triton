@@ -159,19 +159,19 @@ module attributes {"ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32,
       %115 = arith.trunci %113 {loop.cluster = 1 : i32, loop.stage = 1 : i32, ttg.partition = array<i32: 1>} : i64 to i32
       %116 = ttg.local_alloc %114 {loop.cluster = 2 : i32, loop.stage = 1 : i32, ttg.partition = array<i32: 1>} : (tensor<128x16xf32, #blocked>) -> !ttg.memdesc<128x16xf32, #shared1, #smem, mutable>
       %117 = ttng.async_tma_reduce add, %arg36[%115, %c0_i32] %116 {loop.cluster = 2 : i32, loop.stage = 1 : i32, ttg.partition = array<i32: 1>} : !tt.tensordesc<128x16xf32, #shared1>, !ttg.memdesc<128x16xf32, #shared1, #smem, mutable> -> !ttg.async.token
-      ttng.async_tma_store_token_wait %117   {loop.cluster = 2 : i32, loop.stage = 1 : i32, ttg.partition = array<i32: 1>} : !ttg.async.token
+      nvws.tma_store_wait %116   {loop.cluster = 2 : i32, loop.stage = 1 : i32, ttg.partition = array<i32: 1>} : !ttg.memdesc<128x16xf32, #shared1, #smem, mutable>
       %118 = arith.mulf %outRHS_28, %cst {loop.cluster = 2 : i32, loop.stage = 1 : i32, ttg.partition = array<i32: 1>} : tensor<128x16xf32, #blocked>
       %119 = ttg.local_alloc %118 {loop.cluster = 2 : i32, loop.stage = 1 : i32, ttg.partition = array<i32: 1>} : (tensor<128x16xf32, #blocked>) -> !ttg.memdesc<128x16xf32, #shared1, #smem, mutable>
       %120 = ttng.async_tma_reduce add, %arg36[%115, %c16_i32] %119 {loop.cluster = 2 : i32, loop.stage = 1 : i32, ttg.partition = array<i32: 1>} : !tt.tensordesc<128x16xf32, #shared1>, !ttg.memdesc<128x16xf32, #shared1, #smem, mutable> -> !ttg.async.token
-      ttng.async_tma_store_token_wait %120   {loop.cluster = 2 : i32, loop.stage = 1 : i32, ttg.partition = array<i32: 1>} : !ttg.async.token
+      nvws.tma_store_wait %119   {loop.cluster = 2 : i32, loop.stage = 1 : i32, ttg.partition = array<i32: 1>} : !ttg.memdesc<128x16xf32, #shared1, #smem, mutable>
       %121 = arith.mulf %outLHS_29, %cst {loop.cluster = 2 : i32, loop.stage = 1 : i32, ttg.partition = array<i32: 1>} : tensor<128x16xf32, #blocked>
       %122 = ttg.local_alloc %121 {loop.cluster = 2 : i32, loop.stage = 1 : i32, ttg.partition = array<i32: 1>} : (tensor<128x16xf32, #blocked>) -> !ttg.memdesc<128x16xf32, #shared1, #smem, mutable>
       %123 = ttng.async_tma_reduce add, %arg36[%115, %c32_i32] %122 {loop.cluster = 2 : i32, loop.stage = 1 : i32, ttg.partition = array<i32: 1>} : !tt.tensordesc<128x16xf32, #shared1>, !ttg.memdesc<128x16xf32, #shared1, #smem, mutable> -> !ttg.async.token
-      ttng.async_tma_store_token_wait %123   {loop.cluster = 2 : i32, loop.stage = 1 : i32, ttg.partition = array<i32: 1>} : !ttg.async.token
+      nvws.tma_store_wait %122   {loop.cluster = 2 : i32, loop.stage = 1 : i32, ttg.partition = array<i32: 1>} : !ttg.memdesc<128x16xf32, #shared1, #smem, mutable>
       %124 = arith.mulf %outRHS_30, %cst {loop.cluster = 2 : i32, loop.stage = 1 : i32, ttg.partition = array<i32: 1>} : tensor<128x16xf32, #blocked>
       %125 = ttg.local_alloc %124 {loop.cluster = 2 : i32, loop.stage = 1 : i32, ttg.partition = array<i32: 1>} : (tensor<128x16xf32, #blocked>) -> !ttg.memdesc<128x16xf32, #shared1, #smem, mutable>
       %126 = ttng.async_tma_reduce add, %arg36[%115, %c48_i32] %125 {loop.cluster = 2 : i32, loop.stage = 1 : i32, ttg.partition = array<i32: 1>} : !tt.tensordesc<128x16xf32, #shared1>, !ttg.memdesc<128x16xf32, #shared1, #smem, mutable> -> !ttg.async.token
-      ttng.async_tma_store_token_wait %126   {loop.cluster = 2 : i32, loop.stage = 1 : i32, ttg.partition = array<i32: 1>} : !ttg.async.token
+      nvws.tma_store_wait %125   {loop.cluster = 2 : i32, loop.stage = 1 : i32, ttg.partition = array<i32: 1>} : !ttg.memdesc<128x16xf32, #shared1, #smem, mutable>
       %127 = arith.addi %arg64, %c128_i32 {loop.cluster = 0 : i32, loop.stage = 1 : i32} : i32
       scf.yield %127, %true, %token_16, %token_19, %86, %95, %token_24 : i32, i1, !ttg.async.token, !ttg.async.token, !ttg.async.token, !ttg.async.token, !ttg.async.token
     } {tt.assume_nonempty, tt.merge_epilogue_to_computation = true, tt.scheduled_max_stage = 1 : i32, tt.smem_alloc_algo = 1 : i32, tt.smem_budget = 180000 : i32, tt.tmem_alloc_algo = 2 : i32, tt.warp_specialize, ttg.partition.stages = [0 : i32, 0 : i32, 1 : i32, 0 : i32, 0 : i32], ttg.partition.types = ["computation", "reduction", "gemm", "load", "relay"], ttg.warp_specialize.tag = 0 : i32}
@@ -184,11 +184,11 @@ module attributes {"ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32,
     %40 = arith.truncf %outLHS {ttg.partition = array<i32: 0>} : tensor<128x64xf32, #blocked2> to tensor<128x64xf16, #blocked2>
     %41 = ttg.local_alloc %40 {ttg.partition = array<i32: 0>} : (tensor<128x64xf16, #blocked2>) -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
     %42 = ttng.async_tma_copy_local_to_global %arg46[%16, %c0_i32] %41 {ttg.partition = array<i32: 0>} : !tt.tensordesc<128x64xf16, #shared>, !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> !ttg.async.token
-    ttng.async_tma_store_token_wait %42   {ttg.partition = array<i32: 0>} : !ttg.async.token
+    nvws.tma_store_wait %41   {ttg.partition = array<i32: 0>} : !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
     %43 = arith.truncf %outRHS {ttg.partition = array<i32: 0>} : tensor<128x64xf32, #blocked2> to tensor<128x64xf16, #blocked2>
     %44 = ttg.local_alloc %43 {ttg.partition = array<i32: 0>} : (tensor<128x64xf16, #blocked2>) -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
     %45 = ttng.async_tma_copy_local_to_global %arg46[%16, %c64_i32] %44 {ttg.partition = array<i32: 0>} : !tt.tensordesc<128x64xf16, #shared>, !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> !ttg.async.token
-    ttng.async_tma_store_token_wait %45   {ttg.partition = array<i32: 0>} : !ttg.async.token
+    nvws.tma_store_wait %44   {ttg.partition = array<i32: 0>} : !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
     %46 = tt.reshape %result_11 {ttg.partition = array<i32: 0>} : tensor<128x128xf32, #linear> -> tensor<128x2x64xf32, #linear3>
     %47 = tt.trans %46 {order = array<i32: 0, 2, 1>, ttg.partition = array<i32: 0>} : tensor<128x2x64xf32, #linear3> -> tensor<128x64x2xf32, #linear4>
     %48 = ttg.convert_layout %47 {ttg.partition = array<i32: 0>} : tensor<128x64x2xf32, #linear4> -> tensor<128x64x2xf32, #blocked8>
@@ -198,12 +198,12 @@ module attributes {"ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32,
     %51 = arith.truncf %50 {ttg.partition = array<i32: 0>} : tensor<128x64xf32, #blocked2> to tensor<128x64xf16, #blocked2>
     %52 = ttg.local_alloc %51 {ttg.partition = array<i32: 0>} : (tensor<128x64xf16, #blocked2>) -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
     %53 = ttng.async_tma_copy_local_to_global %arg41[%16, %c0_i32] %52 {ttg.partition = array<i32: 0>} : !tt.tensordesc<128x64xf16, #shared>, !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> !ttg.async.token
-    ttng.async_tma_store_token_wait %53   {ttg.partition = array<i32: 0>} : !ttg.async.token
+    nvws.tma_store_wait %52   {ttg.partition = array<i32: 0>} : !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
     %54 = arith.mulf %outRHS_14, %49 {ttg.partition = array<i32: 0>} : tensor<128x64xf32, #blocked2>
     %55 = arith.truncf %54 {ttg.partition = array<i32: 0>} : tensor<128x64xf32, #blocked2> to tensor<128x64xf16, #blocked2>
     %56 = ttg.local_alloc %55 {ttg.partition = array<i32: 0>} : (tensor<128x64xf16, #blocked2>) -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
     %57 = ttng.async_tma_copy_local_to_global %arg41[%16, %c64_i32] %56 {ttg.partition = array<i32: 0>} : !tt.tensordesc<128x64xf16, #shared>, !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> !ttg.async.token
-    ttng.async_tma_store_token_wait %57   {ttg.partition = array<i32: 0>} : !ttg.async.token
+    nvws.tma_store_wait %56   {ttg.partition = array<i32: 0>} : !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
     tt.return
   }
 }

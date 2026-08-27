@@ -241,7 +241,8 @@ def NVGPUWSTMAStoreLowering : Pass<"nvgpu-ws-tma-store-lowering", "mlir::ModuleO
   }];
 
   let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect",
-                           "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"];
+                           "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect",
+                           "mlir::triton::nvws::NVWSDialect"];
 }
 
 def NVGPUSinkBroadcast : Pass<"nvgpu-sink-broadcast", "mlir::ModuleOp"> {
@@ -261,21 +262,22 @@ def NVGPUTestAnnotateTMAStoreWaits : Pass<"nvgpu-test-annotate-tma-store-waits",
   let summary = "Annotate TMA store waits with can_rotate_by_buffer_count";
 
   let description = [{
-    This pass walks `scf.for` loops to find `ttng.async_tma_store_token_wait`
+    This pass walks `scf.for` loops to find `nvws.tma_store_wait`
     ops whose SMEM buffer has a `buffer.copy` attribute (set by the memory
     planner).  For each such wait, it sets `can_rotate_by_buffer_count = K`
     where K = buffer.copy - 1, indicating that the wait can be delayed by
     up to K iterations because K+1 buffer slots are available.
   }];
 
-  let dependentDialects = ["mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"];
+  let dependentDialects = ["mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect",
+                           "mlir::triton::nvws::NVWSDialect"];
 }
 
 def NVGPUTestTMAStoreTokenWaitReorder : Pass<"nvgpu-test-tma-store-token-wait-reorder", "mlir::ModuleOp"> {
   let summary = "Reschedule TMA store waits using the SWP CoarseSchedule";
 
   let description = [{
-    When a `ttng.async_tma_store_token_wait` op carries the
+    When an `nvws.tma_store_wait` op carries the
     `can_rotate_by_buffer_count` attribute (an integer K representing the
     number of SMEM buffer copies), this pass uses the software pipeliner's
     CoarseSchedule to reschedule the wait K positions forward in the
@@ -293,14 +295,15 @@ def NVGPUTestTMAStoreTokenWaitReorder : Pass<"nvgpu-test-tma-store-token-wait-re
     attempting the reorder.
   }];
 
-  let dependentDialects = ["mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"];
+  let dependentDialects = ["mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect",
+                           "mlir::triton::nvws::NVWSDialect"];
 }
 
 def NVGPUTMAStoreTokenWaitLowering : Pass<"nvgpu-tma-store-token-wait-lowering", "mlir::ModuleOp"> {
-  let summary = "Lower TMAStoreTokenWaitOp with barriers into TMAStoreWaitOp + ArriveBarrierOp";
+  let summary = "Lower NVWS TMAStoreWaitOp into hardware wait and barrier ops";
 
   let description = [{
-    This pass splits `ttng.async_tma_store_token_wait` ops that have attached
+    This pass splits `nvws.tma_store_wait` ops that have attached
     barriers into a `ttng.async_tma_store_wait` followed by one
     `ttng.arrive_barrier` per barrier.  Running this before the LLVM lowering
     pass allows the membar analysis to insert CTA-level barriers (bar.sync 0)
@@ -308,7 +311,8 @@ def NVGPUTMAStoreTokenWaitLowering : Pass<"nvgpu-tma-store-token-wait-lowering",
     before any thread signals the mbarrier.
   }];
 
-  let dependentDialects = ["mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"];
+  let dependentDialects = ["mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect",
+                           "mlir::triton::nvws::NVWSDialect"];
 }
 
 def NVGPUPartitionSchedulingMeta : Pass<"nvgpu-partition-scheduling-meta", "mlir::ModuleOp"> {

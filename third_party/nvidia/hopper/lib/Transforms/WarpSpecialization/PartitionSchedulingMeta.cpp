@@ -7,6 +7,7 @@
 #include "nvidia/hopper/include/Transforms/Passes.h"
 #include "nvidia/hopper/lib/Transforms/WarpSpecialization/CodePartitionUtility.h"
 #include "nvidia/hopper/lib/Transforms/WarpSpecialization/Utility.h"
+#include "nvidia/include/Dialect/NVWS/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/MMAv5PipelineUtility.h"
@@ -30,6 +31,7 @@ static SetVector<int> safeGetPartitionIds(Operation *op) {
 }
 
 namespace ttng = triton::nvidia_gpu;
+namespace ttnvws = triton::nvws;
 
 #define DEBUG_TYPE "tritongpu-partition-scheduling"
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
@@ -38,22 +40,29 @@ namespace {
 
 inline bool isEpilogueStoreOp(Operation *op) {
   return isa<DescriptorStoreOp, ttng::AsyncTMACopyLocalToGlobalOp,
-             ttng::TMAStoreTokenWaitOp>(op);
+             ttnvws::TMAStoreWaitOp>(op);
 }
 
-// A TMAStoreTokenWaitOp that waits on an async_tma_reduce / descriptor_reduce.
+// An NVWS TMAStoreWaitOp that waits on an async_tma_reduce.
 // Such a wait must live in the SAME partition as its reduce (the reduction
 // partition), not the epilogue-store partition: otherwise doCodePartition
 // clones the reduce into the store partition to satisfy the mis-placed wait,
 // reducing e.g. reduce_dq into global twice (double-count / stale-staging
 // garbage). See T279388065.
-inline bool isReduceTokenWait(Operation *op) {
-  if (!isa<ttng::TMAStoreTokenWaitOp>(op))
+inline bool isReduceStoreWait(Operation *op) {
+  auto wait = dyn_cast<ttnvws::TMAStoreWaitOp>(op);
+  if (!wait)
     return false;
-  for (Value v : op->getOperands())
-    if (Operation *d = v.getDefiningOp())
-      if (isa<DescriptorReduceOp, ttng::AsyncTMAReduceOp>(d))
+
+  for (auto it = Block::reverse_iterator(wait->getIterator());
+       it != wait->getBlock()->rend(); ++it) {
+    if (auto reduce = dyn_cast<ttng::AsyncTMAReduceOp>(&*it))
+      if (reduce.getSrc() == wait.getSrc())
         return true;
+    if (auto store = dyn_cast<ttng::AsyncTMACopyLocalToGlobalOp>(&*it))
+      if (store.getSrc() == wait.getSrc())
+        return false;
+  }
   return false;
 }
 
@@ -856,8 +865,8 @@ private:
     }
   }
 
-  // Pick the category for an epilogue-store-like op. A TMAStoreTokenWaitOp must
-  // be co-located with the store/reduce it waits on: when it waits on an
+  // Pick the category for an epilogue-store-like op. An NVWS TMA store wait
+  // must be co-located with the store/reduce it waits on: when it waits on an
   // async_tma_reduce/descriptor_reduce (categorized TMAReduction -> reduction
   // partition, e.g. the reduce_dq store_reduce), categorize it TMAReduction
   // too. Otherwise it is routed to the epilogue-store partition while the
@@ -866,7 +875,7 @@ private:
   // dq is reduced into global twice (double-count / stale-staging garbage).
   // T279388065.
   static OpCategory epilogueStoreCategoryFor(Operation *op) {
-    return isReduceTokenWait(op) ? OpCategory::TMAReduction
+    return isReduceStoreWait(op) ? OpCategory::TMAReduction
                                  : OpCategory::EpilogueStore;
   }
 
@@ -1244,7 +1253,7 @@ static Partition *scheduleUsers(LoopLikeOpInterface loop,
 
 // Schedule post-loop operations (operations outside and after the loop) into
 // the appropriate partition. Epilogue store ops and their transitive users
-// (e.g., TMAStoreTokenWaitOp) go to the epilogue partition. All other post-loop
+// (e.g., NVWS TMAStoreWaitOp) go to the epilogue partition. All other post-loop
 // ops (e.g., tmem_load for accumulator reads, arithmetic for normalization) go
 // to the default partition. This prevents TMEM ops from landing in the
 // epilogue, which would force it to use 4 warps (TMEM lane coverage
@@ -1685,12 +1694,12 @@ getInitialSchedule(LoopLikeOpInterface mainLoop,
     // post-lowering AsyncTMACopyLocalToGlobalOp)
     for (auto loop : loops) {
       getLoopBodyRegion(loop).walk([&](Operation *op) {
-        // A reduce's token_wait belongs in the reduction partition with its
-        // reduce (see isReduceTokenWait); do NOT pull it into the epilogue
+        // A reduce's wait belongs in the reduction partition with its reduce
+        // (see isReduceStoreWait); do NOT pull it into the epilogue
         // partition here, or doCodePartition clones the reduce into the
         // epilogue to satisfy the wait -> double reduce (T279388065). Phase 5's
         // TMAReduction scheduling places it in the reduction partition.
-        if (isEpilogueStoreOp(op) && !isReduceTokenWait(op))
+        if (isEpilogueStoreOp(op) && !isReduceStoreWait(op))
           tryScheduleOp(epiloguePartition, op);
       });
     }
@@ -3038,20 +3047,25 @@ void PartitionSchedulingMeta::runOnOperation() {
                           result->layout.defaultPartition);
       fixupScalarPartitions();
 
-      // Assign partition to TMAStoreTokenWaitOp ops that have no partition.
-      // These arise from early TMA reduce lowering: the wait's token comes
-      // from AsyncTMAReduceOp which was categorized as TMAReduction, but
-      // the wait itself wasn't categorized or propagated. Copy the partition
-      // from the token's defining op.
-      getLoopBodyRegion(loop).walk([&](ttng::TMAStoreTokenWaitOp waitOp) {
+      // Assign a partition to NVWS TMA store waits that have no partition.
+      // These arise from early TMA reduce lowering: the reduce is categorized
+      // as TMAReduction, but the wait itself may not be propagated. Copy the
+      // partition from the matching store-like op on the same staging buffer.
+      getLoopBodyRegion(loop).walk([&](ttnvws::TMAStoreWaitOp waitOp) {
         if (hasPartition(waitOp))
           return;
-        Value token = waitOp.getToken();
-        if (auto *defOp = token.getDefiningOp()) {
-          if (hasPartition(defOp)) {
-            auto ids = getPartitionIds(defOp);
-            setPartition(waitOp, ids);
-          }
+        for (auto it = Block::reverse_iterator(waitOp->getIterator());
+             it != waitOp->getBlock()->rend(); ++it) {
+          Operation *storeOp = &*it;
+          Value src;
+          if (auto store = dyn_cast<ttng::AsyncTMACopyLocalToGlobalOp>(storeOp))
+            src = store.getSrc();
+          else if (auto reduce = dyn_cast<ttng::AsyncTMAReduceOp>(storeOp))
+            src = reduce.getSrc();
+          if (!src || src != waitOp.getSrc() || !hasPartition(storeOp))
+            continue;
+          setPartition(waitOp, getPartitionIds(storeOp));
+          break;
         }
       });
 

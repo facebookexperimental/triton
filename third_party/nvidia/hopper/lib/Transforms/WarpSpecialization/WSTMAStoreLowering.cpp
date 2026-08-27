@@ -5,6 +5,7 @@
 #include "mlir/IR/OperationSupport.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "nvidia/hopper/include/Transforms/Passes.h"
+#include "nvidia/include/Dialect/NVWS/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
@@ -18,6 +19,7 @@
 namespace tt = mlir::triton;
 namespace ttg = mlir::triton::gpu;
 namespace ttng = ::mlir::triton::nvidia_gpu;
+namespace ttnvws = ::mlir::triton::nvws;
 namespace mlir {
 
 #define DEBUG_TYPE "nvgpu-ws-tma-store-lowering"
@@ -32,6 +34,8 @@ static void copyLoopScheduleAttrs(Operation *from, Operation *to) {
 }
 
 void doTMAStoreLowering(triton::FuncOp &funcOp) {
+  // TODO: Move this lowering into AutoWS and/or software pipelining once both
+  // paths can expose TMA store staging buffers before memory planning.
   SmallVector<tt::DescriptorStoreOp> storeOps;
   funcOp.walk([&](tt::DescriptorStoreOp op) {
     // Skip stores with non-trivial reduce semantics.
@@ -91,24 +95,21 @@ void doTMAStoreLowering(triton::FuncOp &funcOp) {
     }
     auto alloc = builder.create<ttg::LocalAllocOp>(allocLoc, memDescType, src);
 
-    // Async TMA copy from local (SMEM) to global, producing a token.
-    auto tokenType = ttg::AsyncTokenType::get(ctx);
+    // Async TMA copy from local (SMEM) to global.
     auto tmaStore = builder.create<ttng::AsyncTMACopyLocalToGlobalOp>(
-        loc, tokenType, desc, storeOp.getIndices(), alloc,
-        tt::EvictionPolicy::NORMAL);
+        loc, desc, storeOp.getIndices(), alloc, tt::EvictionPolicy::NORMAL);
     copyLoopScheduleAttrs(storeOp, tmaStore);
 
-    // Wait for this specific TMA store to finish reading from SMEM.
-    auto waitOp = builder.create<ttng::TMAStoreTokenWaitOp>(
-        loc, tmaStore.getToken(), ValueRange{}, ValueRange{}, ValueRange{},
-        ValueRange{});
+    // Wait for the TMA store queue to finish reading from this staging buffer.
+    auto waitOp = builder.create<ttnvws::TMAStoreWaitOp>(
+        loc, alloc, ValueRange{}, ValueRange{}, ValueRange{}, ValueRange{});
     copyLoopScheduleAttrs(storeOp, waitOp);
 
     storeOp.erase();
   }
 
-  // Also lower DescriptorReduceOp → local_alloc + AsyncTMAReduceOp (with token)
-  // + TMAStoreTokenWaitOp, matching the early TMA store pattern.
+  // Also lower DescriptorReduceOp → local_alloc + AsyncTMAReduceOp +
+  // nvws.tma_store_wait, matching the early TMA store pattern.
   SmallVector<tt::DescriptorReduceOp> reduceOps;
   funcOp.walk([&](tt::DescriptorReduceOp op) { reduceOps.push_back(op); });
 
@@ -154,15 +155,13 @@ void doTMAStoreLowering(triton::FuncOp &funcOp) {
     }
     auto alloc = builder.create<ttg::LocalAllocOp>(allocLoc, memDescType, src);
 
-    auto tokenType = ttg::AsyncTokenType::get(ctx);
     auto tmaReduce = builder.create<ttng::AsyncTMAReduceOp>(
-        loc, tokenType, reduceOp.getKind(), desc, reduceOp.getIndices(), alloc,
+        loc, reduceOp.getKind(), desc, reduceOp.getIndices(), alloc,
         tt::EvictionPolicy::NORMAL);
     copyLoopScheduleAttrs(reduceOp, tmaReduce);
 
-    auto waitOp = builder.create<ttng::TMAStoreTokenWaitOp>(
-        loc, tmaReduce.getToken(), ValueRange{}, ValueRange{}, ValueRange{},
-        ValueRange{});
+    auto waitOp = builder.create<ttnvws::TMAStoreWaitOp>(
+        loc, alloc, ValueRange{}, ValueRange{}, ValueRange{}, ValueRange{});
     copyLoopScheduleAttrs(reduceOp, waitOp);
 
     reduceOp.erase();
@@ -207,48 +206,6 @@ static Value getTMAStoreSource(Operation *op) {
   if (auto reduceOp = dyn_cast<ttng::AsyncTMAReduceOp>(op))
     return reduceOp.getSrc();
   return {};
-}
-
-// Trace the token back to the defining TMA store-like op
-// (AsyncTMACopyLocalToGlobalOp or AsyncTMAReduceOp), handling both direct
-// definitions and loop-carried block arguments. Returns the SMEM source
-// buffer and the defining op.
-static Operation *getDefiningTMAStoreOp(ttng::TMAStoreTokenWaitOp waitOp,
-                                        Value &buffer) {
-  Value token = waitOp.getToken();
-
-  // Direct case: token defined by AsyncTMACopyLocalToGlobalOp.
-  if (auto defOp = token.getDefiningOp<ttng::AsyncTMACopyLocalToGlobalOp>()) {
-    buffer = defOp.getSrc();
-    return defOp;
-  }
-
-  // Direct case: token defined by AsyncTMAReduceOp.
-  if (auto defOp = token.getDefiningOp<ttng::AsyncTMAReduceOp>()) {
-    buffer = defOp.getSrc();
-    return defOp;
-  }
-
-  // Loop-carried case: token is a block argument of an scf.for body.
-  if (auto blockArg = dyn_cast<BlockArgument>(token)) {
-    auto forOp = dyn_cast<scf::ForOp>(blockArg.getOwner()->getParentOp());
-    if (!forOp)
-      return nullptr;
-    unsigned iterArgIdx = blockArg.getArgNumber() - 1;
-    auto yieldOp = cast<scf::YieldOp>(forOp.getBody()->getTerminator());
-    Value yieldedVal = yieldOp.getOperand(iterArgIdx);
-    if (auto defOp =
-            yieldedVal.getDefiningOp<ttng::AsyncTMACopyLocalToGlobalOp>()) {
-      buffer = defOp.getSrc();
-      return defOp;
-    }
-    if (auto defOp = yieldedVal.getDefiningOp<ttng::AsyncTMAReduceOp>()) {
-      buffer = defOp.getSrc();
-      return defOp;
-    }
-  }
-
-  return nullptr;
 }
 
 static bool samePureValue(Value lhs, Value rhs, unsigned depth = 0) {
@@ -300,6 +257,34 @@ static bool sameMemDescValue(Value lhs, Value rhs) {
       return false;
   }
   return true;
+}
+
+// Find the TMA store-like op associated with a wait through their shared
+// staging buffer. Prefer the nearest preceding store, then allow a loop-body
+// wraparound for waits guarding reuse at the start of the next iteration.
+static Operation *getDefiningTMAStoreOp(ttnvws::TMAStoreWaitOp waitOp,
+                                        Value &buffer) {
+  buffer = waitOp.getSrc();
+  auto matches = [&](Operation *op) {
+    return isTMAStoreLikeOp(op) &&
+           sameMemDescValue(getTMAStoreSource(op), buffer);
+  };
+
+  for (auto it = Block::reverse_iterator(waitOp->getIterator());
+       it != waitOp->getBlock()->rend(); ++it) {
+    if (matches(&*it))
+      return &*it;
+  }
+
+  auto forOp = dyn_cast<scf::ForOp>(waitOp->getParentOp());
+  if (!forOp)
+    return nullptr;
+  for (auto it = forOp.getBody()->rbegin(); it != forOp.getBody()->rend();
+       ++it) {
+    if (matches(&*it))
+      return &*it;
+  }
+  return nullptr;
 }
 
 static Value findMemDescBase(Value value) {
@@ -407,7 +392,7 @@ void doAnnotateTMAStoreWaits(triton::FuncOp funcOp) {
   });
   // Annotate waits in counted loops and CLC persistent while loops, including
   // waits nested inside SubtiledRegionOp regions.
-  funcOp.walk([&](ttng::TMAStoreTokenWaitOp waitOp) {
+  funcOp.walk([&](ttnvws::TMAStoreWaitOp waitOp) {
     auto whileOp = waitOp->getParentOfType<scf::WhileOp>();
     if (!waitOp->getParentOfType<scf::ForOp>() &&
         (!whileOp || !isCLCPersistentLoop(whileOp)))
@@ -458,7 +443,7 @@ static bool isInMergedEpilogueLoop(scf::ForOp forOp) {
 // ---------------------------------------------------------------------------
 
 void doValidateTMAStoreAnnotations(triton::FuncOp funcOp) {
-  funcOp.walk([&](ttng::TMAStoreTokenWaitOp waitOp) {
+  funcOp.walk([&](ttnvws::TMAStoreWaitOp waitOp) {
     if (!waitOp->hasAttr(kCanRotateByBufferCount))
       return;
 
@@ -534,16 +519,16 @@ void doTMAStoreWaitReorder(triton::FuncOp funcOp) {
   };
 
   // Straight-line epilogues are not software-pipelined, but can still overlap
-  // a TMA store with independent work.  Delay a token wait until immediately
+  // a TMA store with independent work. Delay a wait until immediately
   // before the next write to a TMA staging view. A wait_group applies to the
   // warp's TMA store queue, not to one descriptor or SMEM allocation, so the
   // final wait for one output can overlap independent setup for the next
   // output and land immediately before that output starts reusing the queue.
-  // This is deliberately limited to direct tokens and staging writers in the
-  // same block. The final use remains a drain.
-  SmallVector<ttng::TMAStoreTokenWaitOp> straightLineWaits;
+  // This is deliberately limited to waits and staging writers in the same
+  // block. The final use remains a drain.
+  SmallVector<ttnvws::TMAStoreWaitOp> straightLineWaits;
   SmallVector<std::pair<scf::WhileOp, Attribute>> whileDrains;
-  funcOp.walk([&](ttng::TMAStoreTokenWaitOp waitOp) {
+  funcOp.walk([&](ttnvws::TMAStoreWaitOp waitOp) {
     if (waitOp->hasAttr(kCanRotateByBufferCount))
       waitOp->removeAttr(kPlannedPendingCount);
 
@@ -556,8 +541,7 @@ void doTMAStoreWaitReorder(triton::FuncOp funcOp) {
     if (!whileOp)
       return;
 
-    auto rotateBy =
-        waitOp->getAttrOfType<IntegerAttr>(kCanRotateByBufferCount);
+    auto rotateBy = waitOp->getAttrOfType<IntegerAttr>(kCanRotateByBufferCount);
     if (!rotateBy || rotateBy.getInt() <= 0)
       return;
     waitOp->setAttr(kPlannedPendingCount,
@@ -573,13 +557,12 @@ void doTMAStoreWaitReorder(triton::FuncOp funcOp) {
     if (!alreadyTracked)
       whileDrains.emplace_back(whileOp, taskIds);
   });
-  for (ttng::TMAStoreTokenWaitOp waitOp : straightLineWaits) {
-    Operation *tmaStore = waitOp.getToken().getDefiningOp();
+  for (ttnvws::TMAStoreWaitOp waitOp : straightLineWaits) {
+    Value buffer;
+    Operation *tmaStore = getDefiningTMAStoreOp(waitOp, buffer);
     if (!tmaStore || !isTMAStoreLikeOp(tmaStore) ||
         tmaStore->getBlock() != waitOp->getBlock())
       continue;
-
-    Value buffer = getTMAStoreSource(tmaStore);
     for (auto it = std::next(waitOp->getIterator()),
               end = waitOp->getBlock()->end();
          it != end; ++it) {
@@ -662,9 +645,9 @@ void doTMAStoreWaitReorder(triton::FuncOp funcOp) {
 
     // Collect annotated TMA store waits that are direct children of this
     // loop and whose defining TMA store is in the same loop.
-    SmallVector<ttng::TMAStoreTokenWaitOp> waits;
+    SmallVector<ttnvws::TMAStoreWaitOp> waits;
     for (auto &op : forOp.getBody()->without_terminator()) {
-      auto waitOp = dyn_cast<ttng::TMAStoreTokenWaitOp>(&op);
+      auto waitOp = dyn_cast<ttnvws::TMAStoreWaitOp>(&op);
       if (!waitOp || !waitOp->hasAttr(kCanRotateByBufferCount))
         continue;
       Value buffer;
@@ -750,7 +733,7 @@ void doTMAStoreWaitReorder(triton::FuncOp funcOp) {
         } else {
           // If the buffer is updated by a different partition, the TMA store
           // must be guarded by that partition's wait_barrier. Reorder before
-          // the barrier so the token wait completes before the target buffer
+          // the barrier so the TMA wait completes before the target buffer
           // can be updated.
           Operation *waitBarrier = findScheduledWaitBarrierBetween(
               tmaStore, targetTMAStore, schedule,
@@ -770,7 +753,7 @@ void doTMAStoreWaitReorder(triton::FuncOp funcOp) {
         // example a merged FA backward epilogue) still place the wait after
         // the target writer's dependency slice and immediately before the
         // staging write. Cross-iteration targets remain schedule-only because
-        // their token must be carried through the pipeline boundary.
+        // their schedule position crosses the pipeline boundary.
         auto targetIt = schedule.find(targetTMAStore);
         bool sameIteration =
             targetIt != schedule.end() && targetStage == targetIt->second.first;
@@ -798,7 +781,7 @@ void doTMAStoreWaitReorder(triton::FuncOp funcOp) {
                    waitOp.getNvwsTokens().empty() &&
                    waitOp.getNvwsTokenIndices().empty()) {
           // Merged epilogue loops are intentionally not expanded by the GPU
-          // pipeliner. Materialize a wraparound token wait as the equivalent
+          // pipeliner. Materialize a wraparound TMA wait as the equivalent
           // queue-wide wait_group before the next iteration's staging writer,
           // then add one queue drain after the loop. This is the concrete
           // prologue/steady-state/epilogue protocol used by TLX.
@@ -864,7 +847,8 @@ struct NVGPUTestTMAStoreTokenWaitReorderPass
 };
 
 // ---------------------------------------------------------------------------
-// Lower TMAStoreTokenWaitOp with barriers into TMAStoreWaitOp + ArriveBarrierOp
+// Lower NVWS::TMAStoreWaitOp with barriers into TMAStoreWaitOp +
+// ArriveBarrierOp
 // ---------------------------------------------------------------------------
 #define GEN_PASS_DEF_NVGPUTMASTORETOKENWAITLOWERING
 #include "nvidia/hopper/include/Transforms/Passes.h.inc"
@@ -954,7 +938,7 @@ static int countTMAStoresInRange(Block::iterator from, Block::iterator to,
 
 static std::optional<int>
 countTMAStoresUntilWait(Block *block, Block::iterator from,
-                        ttng::TMAStoreTokenWaitOp waitOp,
+                        ttnvws::TMAStoreWaitOp waitOp,
                         const ConditionContext &context) {
   if (waitOp->getBlock() == block)
     return countTMAStoresInRange(from, waitOp->getIterator(), context);
@@ -983,104 +967,20 @@ countTMAStoresUntilWait(Block *block, Block::iterator from,
   return std::nullopt;
 }
 
-static std::optional<int>
-computePendingsFromToken(Value token, ttng::TMAStoreTokenWaitOp waitOp,
-                         const ConditionContext &context, unsigned depth = 0) {
-  if (depth > 8)
-    return std::nullopt;
-
-  // Direct case: token defined by a TMA store-like op in same block.
-  auto directDef = token.getDefiningOp();
-  if (directDef && isTMAStoreLikeOp(directDef)) {
-    return countTMAStoresUntilWait(directDef->getBlock(),
-                                   std::next(directDef->getIterator()), waitOp,
-                                   context);
-  }
-
-  // If-result case: count after the defining if, excluding the defining if
-  // itself to match direct-token semantics.
-  if (auto ifOp = token.getDefiningOp<scf::IfOp>()) {
-    return countTMAStoresUntilWait(
-        ifOp->getBlock(), std::next(ifOp->getIterator()), waitOp, context);
-  }
-
-  // Loop result case: the result may come from the loop body yield, or from the
-  // initial iter_arg if the loop executes zero times. Use the conservative
-  // minimum across both paths.
-  if (auto forOp = token.getDefiningOp<scf::ForOp>()) {
-    auto result = cast<OpResult>(token);
-    unsigned iterArgIdx = result.getResultNumber();
-    auto yieldOp = cast<scf::YieldOp>(forOp.getBody()->getTerminator());
-    if (iterArgIdx >= yieldOp.getNumOperands() ||
-        iterArgIdx >= forOp.getInitArgs().size())
-      return std::nullopt;
-
-    Value yieldedVal = yieldOp.getOperand(iterArgIdx);
-    auto yieldDef = yieldedVal.getDefiningOp();
-    if (!yieldDef || !isTMAStoreLikeOp(yieldDef) ||
-        yieldDef->getBlock() != forOp.getBody())
-      return std::nullopt;
-
-    Block *body = forOp.getBody();
-    std::optional<int> afterLoop = countTMAStoresUntilWait(
-        forOp->getBlock(), std::next(forOp->getIterator()), waitOp, context);
-    if (!afterLoop)
-      return std::nullopt;
-
-    int loopPath = countTMAStoresInRange(std::next(yieldDef->getIterator()),
-                                         body->end(), context) +
-                   *afterLoop;
-
-    std::optional<int> initPath = computePendingsFromToken(
-        forOp.getInitArgs()[iterArgIdx], waitOp, context, depth + 1);
-    if (!initPath)
-      return std::nullopt;
-
-    return std::min(loopPath, *initPath);
-  }
-
-  // Loop-carried case: token is a block argument of an scf.for body.
-  if (auto blockArg = dyn_cast<BlockArgument>(token)) {
-    auto forOp = dyn_cast<scf::ForOp>(blockArg.getOwner()->getParentOp());
-    if (!forOp)
-      return std::nullopt;
-
-    unsigned iterArgIdx = blockArg.getArgNumber() - 1;
-    auto yieldOp = cast<scf::YieldOp>(forOp.getBody()->getTerminator());
-    Value yieldedVal = yieldOp.getOperand(iterArgIdx);
-
-    // Trace the yielded value to its defining TMA store-like op.
-    auto defOp = yieldedVal.getDefiningOp();
-    if (!defOp || !isTMAStoreLikeOp(defOp) ||
-        defOp->getBlock() != forOp.getBody())
-      return std::nullopt;
-
-    Block *body = forOp.getBody();
-
-    // Stores after the def until end of loop body (excluding yield).
-    int storesAfterDef = countTMAStoresInRange(std::next(defOp->getIterator()),
-                                               body->end(), context);
-
-    // Stores from start of loop body until the wait.
-    int storesBeforeWait =
-        countTMAStoresInRange(body->begin(), waitOp->getIterator(), context);
-
-    return storesAfterDef + storesBeforeWait;
-  }
-
-  return std::nullopt;
-}
-
-// Compute the pendings value for a TMAStoreTokenWaitOp.
-// pendings = number of TMA store-like ops issued after the token's defining
-// store and before this wait, in program execution order.
-static int computePendings(ttng::TMAStoreTokenWaitOp waitOp) {
+// Compute the pendings value for an NVWS TMAStoreWaitOp. The wait names the
+// staging buffer instead of carrying a synthetic result from the TMA store.
+static int computePendings(ttnvws::TMAStoreWaitOp waitOp) {
   if (auto planned = waitOp->getAttrOfType<IntegerAttr>(kPlannedPendingCount))
     return planned.getInt();
 
+  Value buffer;
+  Operation *store = getDefiningTMAStoreOp(waitOp, buffer);
+  if (!store)
+    return 0;
+
   ConditionContext context = getConditionContext(waitOp);
-  if (std::optional<int> count =
-          computePendingsFromToken(waitOp.getToken(), waitOp, context))
+  if (std::optional<int> count = countTMAStoresUntilWait(
+          store->getBlock(), std::next(store->getIterator()), waitOp, context))
     return *count;
 
   // Fallback: unknown pattern, drain all stores.
@@ -1091,9 +991,9 @@ struct NVGPUTMAStoreTokenWaitLoweringPass
     : public impl::NVGPUTMAStoreTokenWaitLoweringBase<
           NVGPUTMAStoreTokenWaitLoweringPass> {
   void runOnOperation() override {
-    SmallVector<ttng::TMAStoreTokenWaitOp> opsToLower;
+    SmallVector<ttnvws::TMAStoreWaitOp> opsToLower;
     getOperation()->walk(
-        [&](ttng::TMAStoreTokenWaitOp op) { opsToLower.push_back(op); });
+        [&](ttnvws::TMAStoreWaitOp op) { opsToLower.push_back(op); });
     for (auto op : opsToLower) {
       OpBuilder builder(op);
       auto loc = op.getLoc();

@@ -352,7 +352,7 @@ def test_autows_addmm_hoist_convert_before_broadcast():
     ttgir = kernel.asm["ttgir"]
     assert "partition0" in ttgir or "partition1" in ttgir, "Expected warp specialization partitions in IR"
     assert "ttng.async_tma_copy_local_to_global" in ttgir, "Expected TMA store copy in IR"
-    assert "ttng.async_tma_store_token_wait" in ttgir, "Expected TMA store token wait in IR"
+    assert "nvws.tma_store_wait" in ttgir, "Expected NVWS TMA store wait in IR"
     assert "tt.descriptor_store" not in ttgir, "Expected descriptor stores to be lowered"
     assert "can_rotate_by_buffer_count" not in ttgir, "Expected TMA store wait rotation to be resolved"
 

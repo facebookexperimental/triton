@@ -13,7 +13,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     // Explicit planner metadata takes precedence over reconstructing program
     // order after software-pipeline schedule serialization.
     // CHECK: ttng.async_tma_store_wait {pendings = 2 : i32}
-    ttng.async_tma_store_token_wait %tok {planned_pending_count = 2 : i32} : !ttg.async.token
+    nvws.tma_store_wait %src {planned_pending_count = 2 : i32} : !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
     tt.return
   }
 }
@@ -23,10 +23,10 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 #shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
 #smem = #ttg.shared_memory
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
-// Loop-carried token after an unrelated loop-carried value. The wait token's
-// block argument must map to the token yield operand, not the dead value.
-// CHECK-LABEL: loop_carried_token_with_dead_iter_arg
-  tt.func public @loop_carried_token_with_dead_iter_arg(
+// A wait inside a loop names the staging buffer directly, independently of
+// unrelated loop-carried values.
+// CHECK-LABEL: loop_wait_with_dead_iter_arg
+  tt.func public @loop_wait_with_dead_iter_arg(
       %desc: !tt.tensordesc<128x64xf16, #shared>,
       %src: !ttg.memdesc<128x64xf16, #shared, #smem, mutable>,
       %i: i32) {
@@ -36,12 +36,12 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     %init_tok = ttng.async_tma_copy_local_to_global %desc[%i, %i] %src : !tt.tensordesc<128x64xf16, #shared>, !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> !ttg.async.token
     %result:2 = scf.for %iv = %c0 to %c8 step %c1 iter_args(%dead = %i, %carried = %init_tok) -> (i32, !ttg.async.token) {
       %tok = ttng.async_tma_copy_local_to_global %desc[%i, %i] %src : !tt.tensordesc<128x64xf16, #shared>, !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> !ttg.async.token
-      // CHECK: ttng.async_tma_store_wait {pendings = 1 : i32}
-      ttng.async_tma_store_token_wait %carried : !ttg.async.token
+      // CHECK: ttng.async_tma_store_wait {pendings = 0 : i32}
+      nvws.tma_store_wait %src : !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
       scf.yield %dead, %tok : i32, !ttg.async.token
     }
     // CHECK: ttng.async_tma_store_wait {pendings = 0 : i32}
-    ttng.async_tma_store_token_wait %result#1 : !ttg.async.token
+    nvws.tma_store_wait %src : !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
     tt.return
   }
 }
@@ -61,9 +61,9 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     %tok0 = ttng.async_tma_copy_local_to_global %desc[%i, %i] %src0 : !tt.tensordesc<128x64xf16, #shared>, !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> !ttg.async.token
     %tok1 = ttng.async_tma_copy_local_to_global %desc[%i, %i] %src1 : !tt.tensordesc<128x64xf16, #shared>, !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> !ttg.async.token
     // CHECK: ttng.async_tma_store_wait {pendings = 1 : i32}
-    ttng.async_tma_store_token_wait %tok0 : !ttg.async.token
+    nvws.tma_store_wait %src0 : !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
     // CHECK: ttng.async_tma_store_wait {pendings = 0 : i32}
-    ttng.async_tma_store_token_wait %tok1 : !ttg.async.token
+    nvws.tma_store_wait %src1 : !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
     tt.return
   }
 }
@@ -89,12 +89,12 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     %init_tok = ttng.async_tma_copy_local_to_global %desc[%i, %i] %src0 : !tt.tensordesc<128x64xf16, #shared>, !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> !ttg.async.token
     %result = scf.for %iv = %c0 to %c8 step %c1 iter_args(%carried = %init_tok) -> (!ttg.async.token) {
       %tok0 = ttng.async_tma_copy_local_to_global %desc[%i, %i] %src0 : !tt.tensordesc<128x64xf16, #shared>, !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> !ttg.async.token
-      // CHECK: ttng.async_tma_store_wait {pendings = 1 : i32}
-      ttng.async_tma_store_token_wait %carried : !ttg.async.token
+      // CHECK: ttng.async_tma_store_wait {pendings = 0 : i32}
+      nvws.tma_store_wait %src0 : !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
       scf.yield %tok0 : !ttg.async.token
     }
     // CHECK: ttng.async_tma_store_wait {pendings = 0 : i32}
-    ttng.async_tma_store_token_wait %result : !ttg.async.token
+    nvws.tma_store_wait %src0 : !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
     tt.return
   }
 }
@@ -126,11 +126,11 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
       scf.yield %tok0, %tok1, %tok2 : !ttg.async.token, !ttg.async.token, !ttg.async.token
     }
     // CHECK: ttng.async_tma_store_wait {pendings = 2 : i32}
-    ttng.async_tma_store_token_wait %result#0 : !ttg.async.token
+    nvws.tma_store_wait %src0 : !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
     // CHECK: ttng.async_tma_store_wait {pendings = 1 : i32}
-    ttng.async_tma_store_token_wait %result#1 : !ttg.async.token
+    nvws.tma_store_wait %src1 : !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
     // CHECK: ttng.async_tma_store_wait {pendings = 0 : i32}
-    ttng.async_tma_store_token_wait %result#2 : !ttg.async.token
+    nvws.tma_store_wait %src2 : !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
     tt.return
   }
 }
@@ -157,7 +157,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
       %tok2 = ttng.async_tma_copy_local_to_global %desc[%i, %i] %src2 : !tt.tensordesc<128x64xf16, #shared>, !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> !ttg.async.token
     }
     // CHECK: ttng.async_tma_store_wait {pendings = 1 : i32}
-    ttng.async_tma_store_token_wait %tok0 : !ttg.async.token
+    nvws.tma_store_wait %src0 : !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
     tt.return
   }
 }
@@ -187,8 +187,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
       scf.yield %tok0 : !ttg.async.token
     }
     %tok3 = ttng.async_tma_copy_local_to_global %desc[%i, %i] %src2 : !tt.tensordesc<128x64xf16, #shared>, !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> !ttg.async.token
-    // CHECK: ttng.async_tma_store_wait {pendings = 1 : i32}
-    ttng.async_tma_store_token_wait %tok : !ttg.async.token
+    // CHECK: ttng.async_tma_store_wait {pendings = 0 : i32}
+    nvws.tma_store_wait %src0 : !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
     tt.return
   }
 }
@@ -221,8 +221,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
       %tok2 = ttng.async_tma_copy_local_to_global %desc[%i, %i] %src2 : !tt.tensordesc<128x64xf16, #shared>, !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> !ttg.async.token
     }
     scf.if %cond {
-      // CHECK: ttng.async_tma_store_wait {pendings = 2 : i32}
-      ttng.async_tma_store_token_wait %tok : !ttg.async.token
+      // CHECK: ttng.async_tma_store_wait {pendings = 0 : i32}
+      nvws.tma_store_wait %src0 : !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
     }
     tt.return
   }
@@ -253,8 +253,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
       %tok1 = ttng.async_tma_copy_local_to_global %desc[%i, %i] %src1 : !tt.tensordesc<128x64xf16, #shared>, !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> !ttg.async.token
     }
     scf.if %cond1 {
-      // CHECK: ttng.async_tma_store_wait {pendings = 1 : i32}
-      ttng.async_tma_store_token_wait %tok : !ttg.async.token
+      // CHECK: ttng.async_tma_store_wait {pendings = 0 : i32}
+      nvws.tma_store_wait %src0 : !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
     }
     tt.return
   }

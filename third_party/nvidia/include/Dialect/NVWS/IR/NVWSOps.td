@@ -318,6 +318,31 @@ def NVWS_ConsumerReleaseOp : NVWS_Op<"consumer_release"> {
   let assemblyFormat = "$token `,` $idx attr-dict `:` type(operands)";
 }
 
+def NVWS_TMAStoreWaitOp
+    : NVWS_Op<"tma_store_wait", [AttrSizedOperandSegments]> {
+  let summary =
+      "wait for a TMA store to finish reading from shared memory";
+  let arguments = (ins TTG_MemDescType:$src,
+      Variadic<TTG_MemDescType>:$barriers, Variadic<I1>:$barrier_preds,
+      Variadic<AnyType>:$nvws_tokens, Variadic<I32>:$nvws_token_indices);
+  let description = [{
+    Wait for TMA stores to finish reading from the shared-memory staging
+    buffer before it can be rewritten.
+
+    Optionally, after the wait completes, arrive on the given barriers. This
+    is used by warp specialization to embed the consumer release barrier
+    directly into the wait op.
+
+    nvws_tokens / nvws_token_indices carry deferred consumer-release tokens
+    that are resolved into real mbarriers during token lowering.
+  }];
+  let hasCustomAssemblyFormat = 1;
+  let extraClassDeclaration = [{
+    void addBarrier(Value barrier, Value pred);
+    void addToken(Value token, Value idx);
+  }];
+}
+
 def GlobalMemory : Resource<"::mlir::triton::GlobalMemory">;
 def SharedMemory : Resource<"::mlir::triton::gpu::SharedMemory">;
 

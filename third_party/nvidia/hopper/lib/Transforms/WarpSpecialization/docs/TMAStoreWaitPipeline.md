@@ -3,7 +3,7 @@
 **File**: `WSTMAStoreLowering.cpp`, `WSMemoryPlanner.cpp`
 
 After `doTMAStoreLowering` converts `tt::DescriptorStoreOp` into
-`LocalAllocOp` + `AsyncTMACopyLocalToGlobalOp` + `TMAStoreTokenWaitOp`
+`LocalAllocOp` + `AsyncTMACopyLocalToGlobalOp` + `NVWS::TMAStoreWaitOp`
 (see [Memory Lowering](MemoryLowering.md#tma-store-lowering)), the
 memory planner and a sequence of sub-passes handle these staging buffers.
 
@@ -212,7 +212,7 @@ the monolithic pipeline.
 
 **Test pass**: `nvgpu-test-annotate-tma-store-waits` (`NVGPUTestAnnotateTMAStoreWaitsPass`)
 
-This pass inspects every `TMAStoreTokenWaitOp` enclosed by an `scf.for` loop
+This pass inspects every `NVWS::TMAStoreWaitOp` enclosed by an `scf.for` loop
 or an `scf.while` loop containing a CLC scheduler operation. Atomic dynamic-
 persistent loops are deliberately excluded even though they use the same SCF
 operation: their next iteration may represent unrelated work, so rotating an
@@ -303,7 +303,7 @@ loop leaves loop-carried token waits in final TTGIR and loses the drain.
 
 ### Algorithm
 
-For each annotated `TMAStoreTokenWaitOp` with `can_rotate_by_buffer_count = K`:
+For each annotated `NVWS::TMAStoreWaitOp` with `can_rotate_by_buffer_count = K`:
 
 1. **Deserialize the schedule** from the `scf.for` loop. If no schedule
    exists, create a trivial single-stage schedule so the logic can still
@@ -359,7 +359,7 @@ store instead of stalling.
 
 **Pass**: `nvgpu-tma-store-token-wait-lowering`
 
-After reordering, a separate pass lowers each `TMAStoreTokenWaitOp` into
+After reordering, a separate pass lowers each `NVWS::TMAStoreWaitOp` into
 concrete hardware operations:
 
 1. **Compute pendings**: count TMA store-like ops
@@ -370,7 +370,7 @@ concrete hardware operations:
    remain in flight.
 3. **Emit `ArriveBarrierOp`**: for each barrier attached to the wait,
    signals that the SMEM buffer is now free for reuse.
-4. **Erase** the original `TMAStoreTokenWaitOp`.
+4. **Erase** the original `NVWS::TMAStoreWaitOp`.
 
 See also [Memory Lowering](MemoryLowering.md) for the broader context of
 how TMA stores fit into the WS memory lowering pipeline.

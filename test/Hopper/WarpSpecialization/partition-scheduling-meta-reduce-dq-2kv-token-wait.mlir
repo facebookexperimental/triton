@@ -6,7 +6,7 @@
 // reduce/store shape that actually exercises the fix.
 //
 // A dq TMA-atomic reduce (ttng.async_tma_reduce) lives in the loop; its
-// store-completion wait (ttng.async_tma_store_token_wait) consumes the reduce's
+// store-completion wait (nvws.tma_store_wait) consumes the reduce's
 // async token, so PSM must co-locate the wait with the reduce in the reduction
 // partition. Previously PSM categorized the wait as a generic epilogue store and
 // scheduled it into the epilogue partition (where the dk/dv store waits live);
@@ -21,7 +21,7 @@
 // CHECK-LABEL: @reduce_dq_token_wait
 // The dq reduce and its token-wait share the reduction partition...
 // CHECK: ttng.async_tma_reduce add{{.*}}ttg.partition = array<i32: [[RED:[0-9]+]]>
-// CHECK-NEXT: ttng.async_tma_store_token_wait{{.*}}ttg.partition = array<i32: [[RED]]>
+// CHECK-NEXT: nvws.tma_store_wait{{.*}}ttg.partition = array<i32: [[RED]]>
 // ...and it is the ONLY reduce (a duplicate would later be cloned into the
 // epilogue partition):
 // CHECK-NOT: ttng.async_tma_reduce
@@ -30,7 +30,7 @@
 // CHECK: ttg.partition.types = ["reduction", "gemm", "epilogue", "load"]
 // The dk epilogue store token-wait lives in that distinct epilogue partition,
 // confirming the reduce wait was not simply swept in with the epilogue stores:
-// CHECK: ttng.async_tma_store_token_wait{{.*}}ttg.partition = array<i32: 2>
+// CHECK: nvws.tma_store_wait{{.*}}ttg.partition = array<i32: 2>
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [2, 16], warpsPerCTA = [4, 1], order = [1, 0]}>
 #blocked1 = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [1, 32], warpsPerCTA = [4, 1], order = [1, 0]}>
@@ -56,14 +56,14 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
       // reduce's token, so PSM must co-locate it with the reduce (reduction).
       %alloc = ttg.local_alloc %cst : (tensor<64x128xf32, #blocked1>) -> !ttg.memdesc<64x128xf32, #shared1, #smem, mutable>
       %rtok = ttng.async_tma_reduce add, %dq_desc[%off, %off] %alloc : !tt.tensordesc<64x128xf32, #shared1>, !ttg.memdesc<64x128xf32, #shared1, #smem, mutable> -> !ttg.async.token
-      ttng.async_tma_store_token_wait %rtok : !ttg.async.token
+      nvws.tma_store_wait %alloc : !ttg.memdesc<64x128xf32, #shared1, #smem, mutable>
       scf.yield %mma : !ttg.async.token
     } {tt.warp_specialize}
     // dk epilogue store + its wait: token comes from a plain store, so it stays
     // in the distinct epilogue partition.
     %dk_smem = ttg.local_alloc %cstk : (tensor<64x128xbf16, #blocked>) -> !ttg.memdesc<64x128xbf16, #shared, #smem, mutable>
     %stok = ttng.async_tma_copy_local_to_global %dk_desc[%off, %off] %dk_smem : !tt.tensordesc<64x128xbf16, #shared>, !ttg.memdesc<64x128xbf16, #shared, #smem, mutable> -> !ttg.async.token
-    ttng.async_tma_store_token_wait %stok : !ttg.async.token
+    nvws.tma_store_wait %dk_smem : !ttg.memdesc<64x128xbf16, #shared, #smem, mutable>
     tt.return
   }
 }

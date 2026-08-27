@@ -216,7 +216,7 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
         %140 = ttg.convert_layout %139 : tensor<64x128xf32, #linear3> -> tensor<64x128xf32, #blocked1>
         %141 = ttg.local_alloc %140 : (tensor<64x128xf32, #blocked1>) -> !ttg.memdesc<64x128xf32, #shared1, #smem, mutable>
         %142 = ttng.async_tma_reduce add, %24[%81, %46] %141 : !tt.tensordesc<64x128xf32, #shared1>, !ttg.memdesc<64x128xf32, #shared1, #smem, mutable> -> !ttg.async.token
-        ttng.async_tma_store_token_wait %142   : !ttg.async.token
+        nvws.tma_store_wait %141 : !ttg.memdesc<64x128xf32, #shared1, #smem, mutable>
         scf.yield %true, %token_20, %token_23, %token_25, %token_28, %token_30, %132, %138 : i1, !ttg.async.token, !ttg.async.token, !ttg.async.token, !ttg.async.token, !ttg.async.token, !ttg.async.token, !ttg.async.token
       } {tt.list_schedule_pick = 0 : i32, tt.num_stages = 1 : i32, tt.warp_specialize}
       %result_15, %token_16 = ttng.tmem_load %result_11[%69#6] : !ttg.memdesc<64x128xf32, #tmem2, #ttng.tensor_memory, mutable> -> tensor<64x128xf32, #linear2>
@@ -224,13 +224,13 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
       %71 = ttg.convert_layout %70 : tensor<64x128xbf16, #linear2> -> tensor<64x128xbf16, #blocked>
       %72 = ttg.local_alloc %71 : (tensor<64x128xbf16, #blocked>) -> !ttg.memdesc<64x128xbf16, #shared, #smem, mutable>
       %73 = ttng.async_tma_copy_local_to_global %23[%48, %47] %72 : !tt.tensordesc<64x128xbf16, #shared>, !ttg.memdesc<64x128xbf16, #shared, #smem, mutable> -> !ttg.async.token
-      ttng.async_tma_store_token_wait %73   : !ttg.async.token
+      nvws.tma_store_wait %72 : !ttg.memdesc<64x128xbf16, #shared, #smem, mutable>
       %result_17, %token_18 = ttng.tmem_load %result_13[%69#7] : !ttg.memdesc<64x128xf32, #tmem2, #ttng.tensor_memory, mutable> -> tensor<64x128xf32, #linear2>
       %74 = arith.truncf %result_17 : tensor<64x128xf32, #linear2> to tensor<64x128xbf16, #linear2>
       %75 = ttg.convert_layout %74 : tensor<64x128xbf16, #linear2> -> tensor<64x128xbf16, #blocked>
       %76 = ttg.local_alloc %75 : (tensor<64x128xbf16, #blocked>) -> !ttg.memdesc<64x128xbf16, #shared, #smem, mutable>
       %77 = ttng.async_tma_copy_local_to_global %23[%49, %47] %76 : !tt.tensordesc<64x128xbf16, #shared>, !ttg.memdesc<64x128xbf16, #shared, #smem, mutable> -> !ttg.async.token
-      ttng.async_tma_store_token_wait %77   : !ttg.async.token
+      nvws.tma_store_wait %76 : !ttg.memdesc<64x128xbf16, #shared, #smem, mutable>
     }
     tt.return
   }

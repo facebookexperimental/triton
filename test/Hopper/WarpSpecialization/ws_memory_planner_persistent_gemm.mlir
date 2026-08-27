@@ -110,13 +110,13 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
       %c0_36 = ttg.convert_layout %c0 {async_task_id = array<i32: 4>} : tensor<128x64xf16, #blocked4> -> tensor<128x64xf16, #blocked1>
       %0 = ttg.local_alloc %c0_36 {async_task_id = array<i32: 4>} : (tensor<128x64xf16, #blocked1>) -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
       %1 = ttng.async_tma_copy_local_to_global %c_desc_or_ptr[%offs_am_c, %offs_bn_c] %0 {async_task_id = array<i32: 3>} : !tt.tensordesc<128x64xf16, #shared>, !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> !ttg.async.token
-      ttng.async_tma_store_token_wait %1   {async_task_id = array<i32: 3>} : !ttg.async.token
+      nvws.tma_store_wait %0   {async_task_id = array<i32: 3>} : !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
       %c1 = arith.truncf %outRHS {async_task_id = array<i32: 4>} : tensor<128x64xf32, #blocked4> to tensor<128x64xf16, #blocked4>
       %c1_37 = ttg.convert_layout %c1 {async_task_id = array<i32: 4>} : tensor<128x64xf16, #blocked4> -> tensor<128x64xf16, #blocked1>
       %2 = arith.addi %offs_bn_c, %c64_i32 {async_task_id = array<i32: 3>} : i32
       %3 = ttg.local_alloc %c1_37 {async_task_id = array<i32: 4>} : (tensor<128x64xf16, #blocked1>) -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
       %4 = ttng.async_tma_copy_local_to_global %c_desc_or_ptr[%offs_am_c, %2] %3 {async_task_id = array<i32: 3>} : !tt.tensordesc<128x64xf16, #shared>, !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> !ttg.async.token
-      ttng.async_tma_store_token_wait %4   {async_task_id = array<i32: 3>} : !ttg.async.token
+      nvws.tma_store_wait %3   {async_task_id = array<i32: 3>} : !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
       scf.yield {async_task_id = array<i32: 3>} %tile_id_c_24 : i32
     } {async_task_id = array<i32: 0, 1, 2, 3, 4>, tt.data_partition_factor = 1 : i32, tt.smem_alloc_algo = 1 : i32, tt.smem_budget = 200000 : i32, tt.warp_specialize, ttg.partition.stages = [0 : i32, 1 : i32, 0 : i32, 0 : i32, 0 : i32], ttg.partition.types = ["default", "gemm", "load", "epilogue", "computation"], ttg.warp_specialize.tag = 0 : i32}
     tt.return

@@ -1,5 +1,6 @@
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "nvidia/hopper/include/Transforms/WSBarrierReorder.h"
+#include "nvidia/include/Dialect/NVWS/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/Passes.h"
@@ -12,6 +13,7 @@
 #define DEBUG_TYPE "triton-nvidia-interleave-tmem"
 
 namespace ttg = mlir::triton::gpu;
+namespace ttnvws = mlir::triton::nvws;
 
 namespace mlir {
 namespace triton {
@@ -260,18 +262,18 @@ bool mayWriteOrFreeSMem(Operation *op, Value buffer) {
   return false;
 }
 
-// A token wait is "plain" when it carries no barrier operands, i.e. it only
-// waits for the TMA store queue to drain past its own token. "Plain" is about
+// A TMA store wait is "plain" when it carries no barrier operands, i.e. it
+// only waits for the TMA store queue to drain. "Plain" is about
 // barriers specifically: a wait that also gates an mbarrier publishes a signal
 // other partitions observe, so it is not free to move.
-bool isPlainTMAStoreTokenWait(Operation *op) {
-  auto wait = dyn_cast<TMAStoreTokenWaitOp>(op);
+bool isPlainTMAStoreWait(Operation *op) {
+  auto wait = dyn_cast<ttnvws::TMAStoreWaitOp>(op);
   return wait && wait.getBarriers().empty();
 }
 
 bool isTMAStoreLike(Operation *op);
 
-// Sink each barrier-free TMA store token wait as late as the staging buffer
+// Sink each barrier-free TMA store wait as late as the staging buffer
 // allows: down to just before the first following store that may clobber the
 // buffer the store is still reading. Nothing between the store and that point
 // needs the transfer to have completed, so delaying the wait lets the TMEM
@@ -279,23 +281,14 @@ bool isTMAStoreLike(Operation *op);
 // store instead of stalling behind it. The walk stops early at another async
 // reader or at any operation whose memory effects cannot be proven independent
 // of the staging buffer.
-void delayPlainTMAStoreTokenWaits(Block &block) {
-  SmallVector<TMAStoreTokenWaitOp> waits;
+void delayPlainTMAStoreWaits(Block &block) {
+  SmallVector<ttnvws::TMAStoreWaitOp> waits;
   for (Operation &op : block)
-    if (isPlainTMAStoreTokenWait(&op))
-      waits.push_back(cast<TMAStoreTokenWaitOp>(&op));
+    if (isPlainTMAStoreWait(&op))
+      waits.push_back(cast<ttnvws::TMAStoreWaitOp>(&op));
 
-  for (TMAStoreTokenWaitOp wait : waits) {
-    Operation *tmaStore = wait.getToken().getDefiningOp();
-    if (!tmaStore ||
-        !isa<AsyncTMACopyLocalToGlobalOp, AsyncTMAReduceOp>(tmaStore) ||
-        tmaStore->getBlock() != &block)
-      continue;
-    Value staging;
-    if (auto copy = dyn_cast<AsyncTMACopyLocalToGlobalOp>(tmaStore))
-      staging = copy.getSrc();
-    else
-      staging = cast<AsyncTMAReduceOp>(tmaStore).getSrc();
+  for (ttnvws::TMAStoreWaitOp wait : waits) {
+    Value staging = wait.getSrc();
     for (auto it = std::next(wait->getIterator()); it != block.end(); ++it) {
       auto localStore = dyn_cast<ttg::LocalStoreOp>(&*it);
       if (localStore) {
@@ -368,7 +361,7 @@ bool canSinkUseChainPast(Value buffer, ArrayRef<Operation *> useChain,
     if (isa<ArriveBarrierOp>(next))
       return false;
   }
-  if (!isMemoryEffectFree(next) && !isPlainTMAStoreTokenWait(next)) {
+  if (!isMemoryEffectFree(next) && !isPlainTMAStoreWait(next)) {
     SmallVector<MemoryEffects::EffectInstance> effects;
     collectEffects(next, effects);
     for (auto effect : effects) {
@@ -837,7 +830,7 @@ void processBlock(BlockInterleaveInfo &info) {
   // Barrier restoration and TMEM-load sinking may move a load across a token
   // wait that was already positioned before staging reuse. Re-establish that
   // canonical placement so the load/conversion overlaps the prior TMA store.
-  delayPlainTMAStoreTokenWaits(block);
+  delayPlainTMAStoreWaits(block);
 
   SmallVector<Operation *> currentLivenessOrder = getBlockOpOrder(block);
   currentLivenessOrder.push_back(block.getTerminator());

@@ -163,8 +163,8 @@ static const TTGIRToTLXMapping opMappings[] = {
      "Wait for TMA stores to complete"},
     {"ttng.async_tma_store_wait", "tlx.async_descriptor_store_wait",
      "Wait for TMA stores to complete"},
-    {"ttng.async_tma_store_token_wait", "tlx.async_descriptor_store_wait",
-     "Wait for a token-tracked TMA store"},
+    {"nvws.tma_store_wait", "tlx.async_descriptor_store_wait",
+     "Wait for a TMA store staging buffer"},
     {"tt.make_tensor_descriptor", "tlx.make_tensor_descriptor",
      "Create TMA descriptor on device"},
     {"ttng.tensormap_create", "tlx.make_tensor_descriptor",
@@ -1641,8 +1641,8 @@ void printSimplifiedOp(
     return;
   }
 
-  // Token waits are the lowered form of TLX descriptor-store waits.
-  if (opName == "ttng.async_tma_store_token_wait") {
+  // NVWS waits are the lowered form of TLX descriptor-store waits.
+  if (opName == "nvws.tma_store_wait") {
     int pendings = 0;
     if (auto planned = op->getAttrOfType<IntegerAttr>("planned_pending_count"))
       pendings = planned.getInt();

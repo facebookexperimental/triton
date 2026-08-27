@@ -866,7 +866,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
   // CHECK: nvvm.cp.async.bulk.wait_group
   tt.func @tma_copy_local_to_global_with_token_wait(%tma: !tt.tensordesc<128x128xf32, #shared1>, %alloc: !ttg.memdesc<128x128xf32, #shared1, #smem>, %x: i32) {
     %token = ttng.async_tma_copy_local_to_global %tma[%x, %x] %alloc : !tt.tensordesc<128x128xf32, #shared1>, !ttg.memdesc<128x128xf32, #shared1, #smem> -> !ttg.async.token
-    ttng.async_tma_store_token_wait %token : !ttg.async.token
+    nvws.tma_store_wait %alloc : !ttg.memdesc<128x128xf32, #shared1, #smem>
     tt.return
   }
 }
@@ -884,7 +884,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
   tt.func @tma_store_token_wait_with_barriers(%tma: !tt.tensordesc<128x128xf32, #shared1>, %alloc: !ttg.memdesc<128x128xf32, #shared1, #smem>, %x: i32, %barrier: !ttg.memdesc<1xi64, #bar_layout, #smem, mutable>) {
     %true = arith.constant true
     %token = ttng.async_tma_copy_local_to_global %tma[%x, %x] %alloc : !tt.tensordesc<128x128xf32, #shared1>, !ttg.memdesc<128x128xf32, #shared1, #smem> -> !ttg.async.token
-    ttng.async_tma_store_token_wait %token, %barrier[%true] : !ttg.async.token, !ttg.memdesc<1xi64, #bar_layout, #smem, mutable>
+    nvws.tma_store_wait %alloc, %barrier[%true] : !ttg.memdesc<128x128xf32, #shared1, #smem>, !ttg.memdesc<1xi64, #bar_layout, #smem, mutable>
     tt.return
   }
 }

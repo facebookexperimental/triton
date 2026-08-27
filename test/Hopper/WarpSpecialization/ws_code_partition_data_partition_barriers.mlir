@@ -141,11 +141,11 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
       ttg.local_store %1, %_0 {async_task_id = array<i32: 4>} : tensor<128x128xf16, #blocked2> -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
       ttng.fence_async_shared {bCluster = false}
       %3 = ttng.async_tma_copy_local_to_global %c_desc_or_ptr[%offs_am_c, %offs_bn_c] %_0 {async_task_id = array<i32: 3>} : !tt.tensordesc<128x128xf16, #shared>, !ttg.memdesc<128x128xf16, #shared, #smem, mutable> -> !ttg.async.token
-      ttng.async_tma_store_token_wait %3   {async_task_id = array<i32: 3>} : !ttg.async.token
+      nvws.tma_store_wait %_0   {async_task_id = array<i32: 3>} : !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
       ttg.local_store %2, %_1 {async_task_id = array<i32: 4>} : tensor<128x128xf16, #blocked2> -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
       ttng.fence_async_shared {bCluster = false}
       %4 = ttng.async_tma_copy_local_to_global %c_desc_or_ptr[%0, %offs_bn_c] %_1 {async_task_id = array<i32: 3>} : !tt.tensordesc<128x128xf16, #shared>, !ttg.memdesc<128x128xf16, #shared, #smem, mutable> -> !ttg.async.token
-      ttng.async_tma_store_token_wait %4   {async_task_id = array<i32: 3>} : !ttg.async.token
+      nvws.tma_store_wait %_1   {async_task_id = array<i32: 3>} : !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
       scf.yield {async_task_id = array<i32: 3>} %tile_id_c_27 : i32
     } {async_task_id = array<i32: 0, 1, 2, 3, 4>, tt.data_partition_factor = 2 : i32, tt.warp_specialize, ttg.partition.stages = [0 : i32, 1 : i32, 0 : i32, 0 : i32, 0 : i32], ttg.partition.types = ["default", "gemm", "load", "epilogue", "computation"], ttg.warp_specialize.tag = 0 : i32}
     tt.return

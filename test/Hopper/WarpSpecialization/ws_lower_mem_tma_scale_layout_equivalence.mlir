@@ -81,7 +81,7 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
       %o = arith.truncf %accumulator_21 {ttg.partition = array<i32: 0>} : tensor<128x256xf32, #linear> to tensor<128x256xbf16, #linear>
       %o_st = ttg.local_alloc %o {ttg.partition = array<i32: 0>} : (tensor<128x256xbf16, #linear>) -> !ttg.memdesc<128x256xbf16, #shared1, #smem, mutable>
       %o_tok = ttng.async_tma_copy_local_to_global %c_desc[%c0_i32, %c0_i32] %o_st {ttg.partition = array<i32: 2>} : !tt.tensordesc<128x256xbf16, #shared1>, !ttg.memdesc<128x256xbf16, #shared1, #smem, mutable> -> !ttg.async.token
-      ttng.async_tma_store_token_wait %o_tok {ttg.partition = array<i32: 2>} : !ttg.async.token
+      nvws.tma_store_wait %o_st {ttg.partition = array<i32: 2>} : !ttg.memdesc<128x256xbf16, #shared1, #smem, mutable>
       scf.yield %tile_id_c_12 : i32
     } {tt.separate_epilogue_store = true, tt.warp_specialize, ttg.partition.stages = [0 : i32, 1 : i32, 0 : i32, 0 : i32], ttg.partition.types = ["epilogue", "gemm", "epilogue_store", "load"], ttg.warp_specialize.tag = 0 : i32}
     tt.return

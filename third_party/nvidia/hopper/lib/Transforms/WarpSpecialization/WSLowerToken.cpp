@@ -240,7 +240,7 @@ void lowerTokenOperations(Operation *parentOp, int numCTAs,
         producerWarps = nWarps;
       } else if (dyn_cast<ttnvws::ConsumerReleaseOp>(user) ||
                  dyn_cast<ttnvws::ConsumerWaitOp>(user) ||
-                 dyn_cast<ttng::TMAStoreTokenWaitOp>(user)) {
+                 dyn_cast<ttnvws::TMAStoreWaitOp>(user)) {
         auto nWarps = mlir::triton::gpu::lookupNumWarps(user);
         assert(consumerWarps == 0 || consumerWarps == nWarps);
         consumerWarps = nWarps;
@@ -322,7 +322,7 @@ void lowerTokenOperations(Operation *parentOp, int numCTAs,
                                  bufferEmptyCount);
         deprecatedOps.push_back(user);
         return true;
-      } else if (auto op = dyn_cast<ttng::TMAStoreTokenWaitOp>(user)) {
+      } else if (auto op = dyn_cast<ttnvws::TMAStoreWaitOp>(user)) {
         Value truePred = arith::ConstantIntOp::create(builder, loc, 1, 1);
         for (auto [nvwsTok, nvwsIdx] :
              llvm::zip(op.getNvwsTokens(), op.getNvwsTokenIndices())) {

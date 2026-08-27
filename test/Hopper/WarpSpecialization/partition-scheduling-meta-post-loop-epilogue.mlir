@@ -54,7 +54,7 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
 // --- Post-loop: TMA store → epilogue partition ---
 // CHECK: ttng.async_tma_copy_local_to_global
 // CHECK-SAME: ttg.partition = array<i32: [[EPIL]]>
-// CHECK: ttng.async_tma_store_token_wait
+// CHECK: nvws.tma_store_wait
 // CHECK-SAME: ttg.partition = array<i32: [[EPIL]]>
 tt.func public @post_loop_tmem_load_not_in_epilogue(
   %A_desc: !tt.tensordesc<128x64xf16, #shared>,
@@ -115,7 +115,7 @@ tt.func public @post_loop_tmem_load_not_in_epilogue(
   %result_f16 = arith.truncf %result : tensor<128x128xf32, #blocked> to tensor<128x128xf16, #blocked>
   %result_smem = ttg.local_alloc %result_f16 : (tensor<128x128xf16, #blocked>) -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
   %store_tok = ttng.async_tma_copy_local_to_global %C_desc[%c0_i32, %c0_i32] %result_smem : !tt.tensordesc<128x128xf16, #shared>, !ttg.memdesc<128x128xf16, #shared, #smem, mutable> -> !ttg.async.token
-  ttng.async_tma_store_token_wait %store_tok : !ttg.async.token
+  nvws.tma_store_wait %result_smem : !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
 
   tt.return
 }

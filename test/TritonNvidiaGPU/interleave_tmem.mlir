@@ -361,12 +361,12 @@ tt.func @plain_tma_store_token_wait_does_not_block_tmem_load(
   // CHECK:      ttng.async_tma_copy_local_to_global
   // CHECK-NEXT: arith.truncf
   // CHECK-NEXT: ttng.tmem_load
-  // CHECK-NEXT: ttng.async_tma_store_token_wait
+  // CHECK-NEXT: nvws.tma_store_wait
   // CHECK-NEXT: ttg.local_store
   // CHECK-NEXT: arith.truncf
   // CHECK-NEXT: ttg.local_store
   %tok = ttng.async_tma_copy_local_to_global %desc[%c0, %c0] %smem_buf : !tt.tensordesc<128x64xf16, #shared>, !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> !ttg.async.token
-  ttng.async_tma_store_token_wait %tok : !ttg.async.token
+  nvws.tma_store_wait %smem_buf : !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
   %u0 = arith.truncf %v0 : tensor<128x64xf32, #linear64> to tensor<128x64xf16, #linear64>
   ttg.local_store %u0, %smem_buf : tensor<128x64xf16, #linear64> -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
   %u1 = arith.truncf %v1 : tensor<128x64xf32, #linear64> to tensor<128x64xf16, #linear64>
@@ -379,7 +379,7 @@ tt.func @plain_tma_store_token_wait_does_not_block_tmem_load(
 // count before the first staging buffer is reused.
 // CHECK-LABEL: @plain_wait_does_not_cross_next_tma_launch
 // CHECK: %[[TOK0:.*]] = ttng.async_tma_copy_local_to_global
-// CHECK-NEXT: ttng.async_tma_store_token_wait %[[TOK0]]
+// CHECK-NEXT: nvws.tma_store_wait
 // CHECK-NEXT: %[[TOK1:.*]] = ttng.async_tma_copy_local_to_global
 // CHECK-NEXT: ttg.local_store
 tt.func @plain_wait_does_not_cross_next_tma_launch(
@@ -389,10 +389,10 @@ tt.func @plain_wait_does_not_cross_next_tma_launch(
     %buf1: !ttg.memdesc<128x64xf16, #shared, #smem, mutable>) {
   %c0 = arith.constant 0 : i32
   %tok0 = ttng.async_tma_copy_local_to_global %desc[%c0, %c0] %buf0 : !tt.tensordesc<128x64xf16, #shared>, !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> !ttg.async.token
-  ttng.async_tma_store_token_wait %tok0 : !ttg.async.token
+  nvws.tma_store_wait %buf0 : !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
   %tok1 = ttng.async_tma_copy_local_to_global %desc[%c0, %c0] %buf1 : !tt.tensordesc<128x64xf16, #shared>, !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> !ttg.async.token
   ttg.local_store %src, %buf0 : tensor<128x64xf16, #linear64> -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
-  ttng.async_tma_store_token_wait %tok1 : !ttg.async.token
+  nvws.tma_store_wait %buf1 : !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
   tt.return
 }
 
@@ -625,7 +625,7 @@ tt.func @restore_ws_arrive_stops_at_named_barrier(
 // buffer while the store is still in flight.
 // CHECK-LABEL: @wait_stops_at_possibly_aliasing_arg
 // CHECK: = ttng.async_tma_copy_local_to_global {{.*}} %[[BUF0:[0-9a-zA-Z_]+]] :
-// CHECK-NEXT: ttng.async_tma_store_token_wait
+// CHECK-NEXT: nvws.tma_store_wait
 // CHECK-NEXT: ttg.local_store
 // CHECK-NEXT: ttg.local_store %{{.*}}, %[[BUF0]] :
 tt.func public @wait_stops_at_possibly_aliasing_arg(
@@ -645,7 +645,7 @@ tt.func public @wait_stops_at_possibly_aliasing_arg(
   %outRHS = ttg.convert_layout %subtile1 : tensor<128x64xf32, #linear64> -> tensor<128x64xf32, #blocked>
 
   %tok = ttng.async_tma_copy_local_to_global %desc[%c0, %c0] %buf0 : !tt.tensordesc<128x64xf16, #shared>, !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> !ttg.async.token
-  ttng.async_tma_store_token_wait %tok : !ttg.async.token
+  nvws.tma_store_wait %buf0 : !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
   ttg.local_store %v, %buf1 : tensor<128x64xf16, #linear64> -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
   ttg.local_store %v, %buf0 : tensor<128x64xf16, #linear64> -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
 

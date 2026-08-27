@@ -47,7 +47,7 @@ arrive A before arrive B, even if B's group is empty. Optional 2-CTA mode.
 | Op | Purpose |
 |---|---|
 | `ttng.async_tma_store_wait` | Wait for TMA stores to finish reading SMEM (`pendings` count) |
-| `ttng.async_tma_store_token_wait` | Token-based wait for specific TMA store; can arrive on barriers |
+| `nvws.tma_store_wait` | Buffer-based wait for TMA store completion; can arrive on barriers |
 
 ### Fences
 

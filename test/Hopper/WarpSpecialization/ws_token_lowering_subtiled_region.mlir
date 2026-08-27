@@ -135,7 +135,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
           : (tensor<128x64xf16, #blocked>) -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
       %tok0 = ttng.async_tma_copy_local_to_global %c_desc[%offs_am_c, %offs_bn_c] %c0_smem {ttg.partition = array<i32: 2>}
           : !tt.tensordesc<128x64xf16, #shared>, !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> !ttg.async.token
-      ttng.async_tma_store_token_wait %tok0 {ttg.partition = array<i32: 2>} : !ttg.async.token
+      nvws.tma_store_wait %c0_smem {ttg.partition = array<i32: 2>} : !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
 
       // Tile 1: truncf → local_alloc → TMA store
       %c1_trunc = arith.truncf %rhs {ttg.partition = array<i32: 1>}
@@ -147,7 +147,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
           : (tensor<128x64xf16, #blocked>) -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
       %tok1 = ttng.async_tma_copy_local_to_global %c_desc[%offs_am_c, %offs_bn_c2] %c1_smem {ttg.partition = array<i32: 2>}
           : !tt.tensordesc<128x64xf16, #shared>, !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> !ttg.async.token
-      ttng.async_tma_store_token_wait %tok1 {ttg.partition = array<i32: 2>} : !ttg.async.token
+      nvws.tma_store_wait %c1_smem {ttg.partition = array<i32: 2>} : !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
 
       scf.yield %tile_id_c_next : i32
     } {tt.data_partition_factor = 1 : i32, tt.separate_epilogue_store = true, tt.smem_alloc_algo = 0 : i32,

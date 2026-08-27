@@ -82,7 +82,7 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
       %23 = ttg.convert_layout %22 {ttg.partition = array<i32: 0>} : tensor<128x128xf16, #linear> -> tensor<128x128xf16, #blocked1>
       %24 = ttg.local_alloc %23 {ttg.partition = array<i32: 0>} : (tensor<128x128xf16, #blocked1>) -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
       %25 = ttng.async_tma_copy_local_to_global %arg10[%18, %19] %24 {ttg.partition = array<i32: 0>} : !tt.tensordesc<128x128xf16, #shared>, !ttg.memdesc<128x128xf16, #shared, #smem, mutable> -> !ttg.async.token
-      ttng.async_tma_store_token_wait %25   {ttg.partition = array<i32: 0>} : !ttg.async.token
+      nvws.tma_store_wait %24   {ttg.partition = array<i32: 0>} : !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
       // Scatter atomic: non-scalar (tensor of pointers) -> unsupported -> reject.
       %pt = tt.splat %arg15 : !tt.ptr<i32> -> tensor<1x!tt.ptr<i32>, #b1>
       %vt = tt.splat %c1_i32 : i32 -> tensor<1xi32, #b1>
