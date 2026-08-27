@@ -355,6 +355,12 @@ std::pair<SmallVector<Value>, SmallVector<Value>> lowerTMemLdSt(
   auto kRow = str_attr("row");
   bool isStore = !vals.empty();
 
+  auto messageLayout =
+      getTMemLdStMessageLayout(ctx, atom, unpacked, valsPerMessage);
+  assert(succeeded(messageLayout) &&
+         messageLayout->getInDimSize(kReg) == valsPerMessage &&
+         "invalid TMEM message footprint");
+
   tmemBase = b.ptrtoint(i32_ty, tmemBase);
 
   assert(to_vector(reps.getOutDimNames()) ==
@@ -367,7 +373,9 @@ std::pair<SmallVector<Value>, SmallVector<Value>> lowerTMemLdSt(
   };
 
   Value warpId = WarpIdOp::create(rewriter, loc);
-  // Map warpId to rows 32 and 64
+  // Keep this warp-base calculation synchronized with
+  // getTMemLdStWarpAddresses.
+  // Map warpId to rows 32 and 64.
   auto warpIdInGroup = b.and_(warpId, b.i32_val(3));
   tmemBase = b.add(tmemBase, b.shl(warpIdInGroup, b.i32_val(5 + 16)));
   // The block offset is already added to the tmemBase

@@ -26,6 +26,11 @@ inline constexpr StringLiteral kAutoWSStageKey = "stage";
 inline constexpr StringLiteral kAutoWSOrderKey = "order";
 inline constexpr StringLiteral kAutoWSChannelsKey = "channels";
 inline constexpr StringLiteral kAutoWSOperandDTag = "opndD";
+// Set by the frontend on each 2-CTA FA forward contraction ("qk" or "pv") so
+// WSDataPartition can give the two data partitions distinct stage/order once
+// each contraction has a concrete partition index.
+inline constexpr StringLiteral kAutoWSTwoCTAInterleaveRoleKey =
+    "two_cta_interleave_role";
 
 // Each entry of the "channels" array is a comma-separated string laid out as
 //   operand,memory,copies,bufferId[,extra]

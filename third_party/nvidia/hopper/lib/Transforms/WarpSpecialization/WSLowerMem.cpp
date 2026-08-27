@@ -26,6 +26,7 @@
 #include "triton/Tools/Sys/GetEnv.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include <list>
+#include <optional>
 #include <unordered_set>
 
 namespace tt = mlir::triton;
@@ -93,6 +94,33 @@ static void eraseDeadScheduleRematerializations(Value value) {
   }
 }
 
+// Encoding to give a consumer buffer the TMA engine will write directly, or
+// nullopt when the load must not be fused into it. A buffer that already is a
+// legal TMA destination is kept as-is. One that is not may still be reusable:
+// a block-scale alloc carries a #ttg.shared_linear encoding that describes the
+// same layout as the descriptor's NVMMA one, so adopting the descriptor's
+// spelling keeps the direct TMA write and moves no data. Only when the layouts
+// genuinely differ does the load need its own landing buffer.
+static std::optional<Attribute>
+getTMAWritableEncoding(tt::DescriptorLoadOp load, RankedTensorType tensorType,
+                       ttg::MemDescType allocType, Attribute descEnc) {
+  Attribute allocEncoding = allocType.getEncoding();
+  if (isValidTMADestEncoding(allocEncoding, descEnc))
+    return allocEncoding;
+
+  // Same encoding the unfused path below would allocate.
+  Attribute loweredEnc =
+      ttng::getEncodingFromDescriptor(load, tensorType, load.getDesc());
+  auto loweredLayout = dyn_cast_or_null<ttg::LayoutEncodingTrait>(loweredEnc);
+  auto allocLayout = dyn_cast_or_null<ttg::LayoutEncodingTrait>(allocEncoding);
+  if (loweredLayout && allocLayout &&
+      ttg::areLayoutsEquivalent(allocType.getShape(), loweredLayout,
+                                allocLayout))
+    return loweredEnc;
+
+  return std::nullopt;
+}
+
 LogicalResult doConvertDescriptorLoadsToNVWS(triton::FuncOp funcOp) {
   // Schedule rematerialization can leave dead per-task clones attached to a
   // descriptor load. Remove only dead layout-rematerialization chains before
@@ -128,9 +156,19 @@ LogicalResult doConvertDescriptorLoadsToNVWS(triton::FuncOp funcOp) {
     if (soleStore && !isValidTMADestEncoding(
                          soleStore.getDst().getType().getEncoding(), descEnc))
       soleStore = nullptr;
-    if (soleAlloc &&
-        !isValidTMADestEncoding(soleAlloc.getType().getEncoding(), descEnc))
-      soleAlloc = nullptr;
+    Attribute fusedEncoding;
+    if (soleAlloc) {
+      if (auto encoding = getTMAWritableEncoding(
+              load, tensorType, cast<ttg::MemDescType>(soleAlloc.getType()),
+              descEnc)) {
+        fusedEncoding = *encoding;
+      } else {
+        // Don't fuse. Clearing `soleAlloc` does double duty: the load falls
+        // through to its own TMA-compatible buffer below, and the alloc stays
+        // off the erase list since we no longer consume it.
+        soleAlloc = nullptr;
+      }
+    }
 
     OpBuilderWithAsyncTaskIds builder(load);
     builder.setInsertionPoint(load);
@@ -140,7 +178,7 @@ LogicalResult doConvertDescriptorLoadsToNVWS(triton::FuncOp funcOp) {
     } else if (soleAlloc) {
       auto oldType = cast<ttg::MemDescType>(soleAlloc.getType());
       auto bufferType = ttg::MemDescType::get(
-          oldType.getShape(), oldType.getElementType(), oldType.getEncoding(),
+          oldType.getShape(), oldType.getElementType(), fusedEncoding,
           oldType.getMemorySpace(), /*mutableMemory=*/true);
       auto newAlloc = builder.createWithAsyncTaskIds<ttg::LocalAllocOp>(
           soleAlloc.getLoc(), bufferType);

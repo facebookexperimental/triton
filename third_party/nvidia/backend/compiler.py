@@ -1276,7 +1276,7 @@ class CUDABackend(BaseBackend):
             paths = [path for (name, path) in options.extern_libs]
             llvm.link_extern_libs(llvm_mod, paths)
 
-        llvm.optimize_module(llvm_mod, llvm.OPTIMIZE_O3)
+        llvm.optimize_module(llvm_mod, llvm.OPTIMIZE_O3, scalarize_packed_fops=True)
 
         # Get some metadata
         # warp-specialization mutates num_warps

@@ -62,16 +62,26 @@ module attributes {ttg.max_reg_auto_ws = 152 : i32, ttg.min_reg_auto_ws = 24 : i
         // data partition 1 begins. Interleaving the two independent correction
         // chains doubles their live ranges and spills both accumulator halves.
         // CHECK: ttng.tc_gen5_mma
+        // CHECK-SAME: \22order\22:\220\22
+        // CHECK-SAME: \22stage\22:\220\22
         // CHECK: ttng.tmem_load
-        // CHECK: ttng.tmem_load
-        // CHECK: ttng.tmem_store
-        // CHECK: ttng.tc_gen5_mma
-        // CHECK: ttng.tc_gen5_mma
-        // CHECK: ttng.tmem_load
+        // CHECK: }) : (tensor<128xi1, {{.*}}>) -> i1
         // CHECK: ttng.tmem_load
         // CHECK: ttng.tmem_store
         // CHECK: ttng.tc_gen5_mma
-        %qk_20 = ttng.tc_gen5_mma %q_i_load_5, %permute_19, %qk[%qk_16], %false, %true : !ttg.memdesc<256x128xbf16, #shared2, #smem>, !ttg.memdesc<128x128xbf16, #shared3, #smem>, !ttg.memdesc<256x128xf32, #tmem, #ttng.tensor_memory, mutable>
+        // CHECK-SAME: \22order\22:\223\22
+        // CHECK-SAME: \22stage\22:\220\22
+        // CHECK: ttng.tc_gen5_mma
+        // CHECK-SAME: \22order\22:\222\22
+        // CHECK-SAME: \22stage\22:\220\22
+        // CHECK: ttng.tmem_load
+        // CHECK: }) : (tensor<128xi1, {{.*}}>) -> i1
+        // CHECK: ttng.tmem_load
+        // CHECK: ttng.tmem_store
+        // CHECK: ttng.tc_gen5_mma
+        // CHECK-SAME: \22order\22:\221\22
+        // CHECK-SAME: \22stage\22:\221\22
+        %qk_20 = ttng.tc_gen5_mma %q_i_load_5, %permute_19, %qk[%qk_16], %false, %true {tt.autows = "{\22two_cta_interleave_role\22:\22qk\22}"} : !ttg.memdesc<256x128xbf16, #shared2, #smem>, !ttg.memdesc<128x128xbf16, #shared3, #smem>, !ttg.memdesc<256x128xf32, #tmem, #ttng.tensor_memory, mutable>
         %qk_21, %qk_22 = ttng.tmem_load %qk[%qk_20] : !ttg.memdesc<256x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<256x128xf32, #blocked>
         %amax = "tt.reduce"(%qk_21) <{axis = 1 : i32}> ({
         ^bb0(%amax_36: f32, %amax_37: f32):
@@ -82,6 +92,13 @@ module attributes {ttg.max_reg_auto_ws = 152 : i32, ttg.min_reg_auto_ws = 24 : i
         %mask = arith.cmpf ogt, %arg7, %v_5 : tensor<256xf32, #ttg.slice<{dim = 1, parent = #blocked}>>
         %mask_23 = arith.cmpf une, %arg7, %arg7 : tensor<256xf32, #ttg.slice<{dim = 1, parent = #blocked}>>
         %mask_24 = arith.ori %mask, %mask_23 : tensor<256xi1, #ttg.slice<{dim = 1, parent = #blocked}>>
+        // A scalar vote guarding a partitioned TMEM update must be recomputed
+        // independently from each 128-row slice.
+        %rescale_vote = "tt.reduce"(%mask_24) <{axis = 0 : i32}> ({
+        ^bb0(%lhs: i1, %rhs: i1):
+          %vote = arith.ori %lhs, %rhs : i1
+          tt.reduce.return %vote : i1
+        }) : (tensor<256xi1, #ttg.slice<{dim = 1, parent = #blocked}>>) -> i1
         %v_6 = arith.select %mask_24, %arg7, %v_5 : tensor<256xi1, #ttg.slice<{dim = 1, parent = #blocked}>>, tensor<256xf32, #ttg.slice<{dim = 1, parent = #blocked}>>
         %v_8 = arith.mulf %qk_21, %cst_1 : tensor<256x128xf32, #blocked>
         %subscript = tt.expand_dims %v_6 {axis = 1 : i32} : tensor<256xf32, #ttg.slice<{dim = 1, parent = #blocked}>> -> tensor<256x1xf32, #blocked>
@@ -109,12 +126,23 @@ module attributes {ttg.max_reg_auto_ws = 152 : i32, ttg.min_reg_auto_ws = 24 : i
         %inline_triton_result_3_32 = tt.reshape %inline_triton_result_3_31 : tensor<256x2x64xf32, #blocked2> -> tensor<256x128xf32, #blocked>
         %v_13 = arith.truncf %v_10 : tensor<256x128xf32, #blocked> to tensor<256x128xbf16, #blocked>
         %acc_33 = ttng.tmem_alloc %v_13 : (tensor<256x128xbf16, #blocked>) -> !ttg.memdesc<256x128xbf16, #tmem1, #ttng.tensor_memory>
-        %acc_34 = ttng.tmem_store %inline_triton_result_3_32, %acc[%acc_27], %true : tensor<256x128xf32, #blocked> -> !ttg.memdesc<256x128xf32, #tmem, #ttng.tensor_memory, mutable>
-        %acc_35 = ttng.tc_gen5_mma %acc_33, %v_j_load_18, %acc[%acc_34], %true, %true : !ttg.memdesc<256x128xbf16, #tmem1, #ttng.tensor_memory>, !ttg.memdesc<128x128xbf16, #shared2, #smem>, !ttg.memdesc<256x128xf32, #tmem, #ttng.tensor_memory, mutable>
+        %acc_34 = ttng.tmem_store %inline_triton_result_3_32, %acc[%acc_27], %rescale_vote : tensor<256x128xf32, #blocked> -> !ttg.memdesc<256x128xf32, #tmem, #ttng.tensor_memory, mutable>
+        %acc_35 = ttng.tc_gen5_mma %acc_33, %v_j_load_18, %acc[%acc_34], %true, %true {tt.autows = "{\22two_cta_interleave_role\22:\22pv\22}"} : !ttg.memdesc<256x128xbf16, #tmem1, #ttng.tensor_memory>, !ttg.memdesc<128x128xbf16, #shared2, #smem>, !ttg.memdesc<256x128xf32, #tmem, #ttng.tensor_memory, mutable>
         %v_14 = arith.mulf %arg8, %v_12 : tensor<256xf32, #ttg.slice<{dim = 1, parent = #blocked}>>
         %v_3 = arith.addf %v_14, %l_ij : tensor<256xf32, #ttg.slice<{dim = 1, parent = #blocked}>>
         scf.yield %v_6, %v_3, %qk_22, %acc_35 : tensor<256xf32, #ttg.slice<{dim = 1, parent = #blocked}>>, tensor<256xf32, #ttg.slice<{dim = 1, parent = #blocked}>>, !ttg.async.token, !ttg.async.token
       } {tt.disallow_acc_multi_buffer}
+      // The post-loop epilogue is also group-major even though it shares the
+      // outer loop body with the inner KV loop: complete DP0's stats/output
+      // stores before loading DP1's accumulator.
+      // CHECK: symbol = "__nv_log2f"
+      // CHECK: ttng.tmem_load
+      // CHECK: tt.descriptor_store
+      // CHECK: tt.descriptor_store
+      // CHECK: symbol = "__nv_log2f"
+      // CHECK: ttng.tmem_load
+      // CHECK: tt.descriptor_store
+      // CHECK: tt.descriptor_store
       %v_16 = tt.extern_elementwise %acc_9#1 {libname = "", libpath = "", pure = true, symbol = "__nv_log2f"} : (tensor<256xf32, #ttg.slice<{dim = 1, parent = #blocked}>>) -> tensor<256xf32, #ttg.slice<{dim = 1, parent = #blocked}>>
       %v_17 = arith.addf %acc_9#0, %v_16 : tensor<256xf32, #ttg.slice<{dim = 1, parent = #blocked}>>
       %subscript_1 = tt.expand_dims %acc_9#1 {axis = 1 : i32} : tensor<256xf32, #ttg.slice<{dim = 1, parent = #blocked}>> -> tensor<256x1xf32, #blocked>
@@ -123,12 +151,10 @@ module attributes {ttg.max_reg_auto_ws = 152 : i32, ttg.min_reg_auto_ws = 24 : i
       %v_18_12 = arith.divf %acc_10, %v_18 : tensor<256x128xf32, #blocked>
       %subscript_2 = ttg.convert_layout %v_17 : tensor<256xf32, #ttg.slice<{dim = 1, parent = #blocked}>> -> tensor<256xf32, #ttg.slice<{dim = 0, parent = #blocked1}>>
       %subscript_2_13 = tt.expand_dims %subscript_2 {axis = 0 : i32} : tensor<256xf32, #ttg.slice<{dim = 0, parent = #blocked1}>> -> tensor<1x256xf32, #blocked1>
-      // CHECK-COUNT-2: tt.descriptor_store
       tt.descriptor_store %lse_desc_4[%pid_1, %offset_0], %subscript_2_13 : !tt.tensordesc<1x256xf32, #shared1>, tensor<1x256xf32, #blocked1>
       %subscript_3 = ttg.convert_layout %v_18_12 : tensor<256x128xf32, #blocked> -> tensor<256x128xf32, #ttg.slice<{dim = 0, parent = #blocked5}>>
       %subscript_3_14 = tt.expand_dims %subscript_3 {axis = 0 : i32} : tensor<256x128xf32, #ttg.slice<{dim = 0, parent = #blocked5}>> -> tensor<1x256x128xf32, #blocked5>
       %v_19 = arith.truncf %subscript_3_14 : tensor<1x256x128xf32, #blocked5> to tensor<1x256x128xbf16, #blocked5>
-      // CHECK-COUNT-2: tt.descriptor_store
       tt.descriptor_store %o_desc[%pid_1, %offset_0, %c0_i32], %v_19 : !tt.tensordesc<1x256x128xbf16, #shared>, tensor<1x256x128xbf16, #blocked5>
     } {tt.warp_specialize}
     tt.return
