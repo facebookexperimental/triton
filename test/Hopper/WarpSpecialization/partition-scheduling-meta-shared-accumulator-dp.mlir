@@ -1,4 +1,4 @@
-// RUN: TRITON_USE_META_WS=1 triton-opt %s --nvgpu-partition-scheduling-meta | FileCheck %s
+// RUN: env TRITON_USE_META_WS=1 triton-opt %s --nvgpu-partition-scheduling-meta | FileCheck %s
 
 // Test for the accumulator-chain data-partition grouping.
 //
