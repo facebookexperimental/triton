@@ -234,6 +234,16 @@ subtiled region resolves its counter to the nearest real counter-bearing region
 (e.g. the persistent while's after region) rather than to the subtiled region
 itself.
 
+## Direct-grid nonempty loops
+
+For direct-grid inner-loop specialization, the explicit zero store can dominate
+the MMA loop rather than share an enclosing persistent loop with it. A kernel
+may mark that loop `tt.assume_nonempty`; `removeRedundantTmemZeroStores` then
+uses dominance to remove the store because the first MMA iteration is
+guaranteed to execute and initialize operand D. This contract is undefined if
+the loop is empty. The full BM128 pre-pass regression is
+`test/Hopper/WarpSpecialization/ws_remove_redundant_tmem_zero_bwd_bm128_inner.mlir`.
+
 ## Interaction with Reuse Groups
 
 When channels share a reuse group (same `buffer.id`), they share a single
