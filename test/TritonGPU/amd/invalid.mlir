@@ -982,3 +982,70 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
+
+// -----
+
+#v4_on_gfx942_mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [1, 1], instrShape = [16, 16, 32], isTransposed = true}>
+#v4_on_gfx942_lhs = #ttg.dot_op<{opIdx = 0, parent = #v4_on_gfx942_mma, kWidth = 8}>
+#v4_on_gfx942_rhs = #ttg.dot_op<{opIdx = 1, parent = #v4_on_gfx942_mma, kWidth = 8}>
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.target" = "hip:gfx942", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @mfma_commit_rejects_cdna4_encoding_on_cdna3_target(
+      %result: tensor<16x16xf32, #v4_on_gfx942_mma>,
+      %dependency: tensor<32x16xbf16, #v4_on_gfx942_rhs>) {
+    // expected-error @+1 {{input 0 uses MFMA version 4, but the target requires version 3}}
+    %committed, %preserved = amdg.mfma_commit %result, %dependency
+        : tensor<16x16xf32, #v4_on_gfx942_mma>,
+          tensor<32x16xbf16, #v4_on_gfx942_rhs>
+    tt.return
+  }
+}
+
+// -----
+
+// No ttg.target: the encoding version alone must still gate the native shape.
+#untargeted_mma = #ttg.amd_mfma<{version = 3, warpsPerCTA = [1, 1], instrShape = [16, 16, 32], isTransposed = true}>
+#untargeted_lhs = #ttg.dot_op<{opIdx = 0, parent = #untargeted_mma, kWidth = 4}>
+#untargeted_rhs = #ttg.dot_op<{opIdx = 1, parent = #untargeted_mma, kWidth = 4}>
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @scheduled_mfma_rejects_cdna4_shape_on_v3_encoding(
+      %a: tensor<16x32xbf16, #untargeted_lhs>,
+      %b: tensor<32x16xbf16, #untargeted_rhs>) {
+    %acc = arith.constant dense<0.000000e+00> :
+        tensor<16x16xf32, #untargeted_mma>
+    // expected-error @+1 {{MFMA encoding version 3 supports only its native 32x32x8 and 16x16x16 shapes}}
+    %result = amdg.scheduled_mfma %a, %b, %acc
+        resident "none" accumulator "transient"
+        register_class "auto" initialize true
+        : tensor<16x32xbf16, #untargeted_lhs>,
+          tensor<32x16xbf16, #untargeted_rhs>,
+          tensor<16x16xf32, #untargeted_mma>
+          -> tensor<16x16xf32, #untargeted_mma>
+    tt.return
+  }
+}
+
+// -----
+
+#v3_on_gfx950_mma = #ttg.amd_mfma<{version = 3, warpsPerCTA = [1, 1], instrShape = [16, 16, 16], isTransposed = true}>
+#v3_on_gfx950_lhs = #ttg.dot_op<{opIdx = 0, parent = #v3_on_gfx950_mma, kWidth = 4}>
+#v3_on_gfx950_rhs = #ttg.dot_op<{opIdx = 1, parent = #v3_on_gfx950_mma, kWidth = 4}>
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.target" = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @scheduled_mfma_rejects_cdna3_encoding_on_cdna4_target(
+      %a: tensor<16x16xbf16, #v3_on_gfx950_lhs>,
+      %b: tensor<16x16xbf16, #v3_on_gfx950_rhs>) {
+    %acc = arith.constant dense<0.000000e+00> :
+        tensor<16x16xf32, #v3_on_gfx950_mma>
+    // expected-error @+1 {{uses MFMA version 3, but the target requires version 4}}
+    %result = amdg.scheduled_mfma %a, %b, %acc
+        resident "none" accumulator "transient"
+        register_class "auto" initialize true
+        : tensor<16x16xbf16, #v3_on_gfx950_lhs>,
+          tensor<16x16xbf16, #v3_on_gfx950_rhs>,
+          tensor<16x16xf32, #v3_on_gfx950_mma>
+          -> tensor<16x16xf32, #v3_on_gfx950_mma>
+    tt.return
+  }
+}
