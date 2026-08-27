@@ -13,6 +13,7 @@
 #include "mlir/IR/TypeUtilities.h"
 #include "mlir/IR/ValueRange.h"
 #include "mlir/Transforms/DialectConversion.h"
+#include "triton/Analysis/Utility.h"
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
 #include "triton/Dialect/Triton/IR/Types.h"
 #include "triton/Dialect/TritonGPU/IR/Attributes.h"
@@ -771,9 +772,12 @@ struct BufferLoadToLocalOpConversion
     SmallVector<Value> offsetElems =
         unpackTensorElements(loc, llOffset, rewriter, offset.getType());
     SmallVector<Value> otherElems;
-    if (llOther)
+    bool isOtherZeroConst = false;
+    if (llOther) {
       otherElems =
           unpackTensorElements(loc, llOther, rewriter, op.getOther().getType());
+      isOtherZeroConst = isZeroConst(op.getOther());
+    }
 
     auto dstTy = op.getDest().getType();
     auto resElemTy = getTypeConverter()->convertType(dstTy.getElementType());
@@ -847,12 +851,12 @@ struct BufferLoadToLocalOpConversion
       // Buffer-load-to-local supports zero-fill for per-lane masks by adjusting
       // the src offset to be OOB. Redundant-thread predication still needs a
       // branch when there are other values, otherwise inactive threads
-      // zero-fill values loaded by active lanes from another warp.
+      // will lave the lds untorched.
       // Optimization: for warp-uniform thread predicates and no other values we
       // can avoid the branch by selecting an out-of-range *shared* address. The
       // HW will drop the load before fetching the data from global memory so we
       // will not overwrite values.
-      if (isThreadPredWarpUniform && !hasOther) {
+      if (isThreadPredWarpUniform && isOtherZeroConst) {
         Value predicatedAddress =
             selectLdsAddressForPredicate(b, threadPred, shmemAddr);
         auto bufferLoadToLds = bufferEmitter.emitLoadToLds(
@@ -861,8 +865,7 @@ struct BufferLoadToLocalOpConversion
         if (targetInfo.requiresAliasInfoForAsyncOps())
           AMD::addAsyncCopyAliasScope(bufferLoadToLds);
       } else {
-        Value pred =
-            hasOther ? b.and_(threadPred, maybeSwizzledMaskElem) : threadPred;
+        Value pred = b.and_(threadPred, maybeSwizzledMaskElem);
         auto [loadBlock, afterLoadBlock] = emitBranch(rewriter, loc, pred);
 
         auto bufferLoadToLds = bufferEmitter.emitLoadToLds(
