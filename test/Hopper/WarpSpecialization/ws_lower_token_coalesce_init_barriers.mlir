@@ -1,4 +1,4 @@
-// RUN: TRITON_USE_META_WS=1 triton-opt %s --nvgpu-partition-scheduling-meta --nvgpu-warp-specialization | FileCheck %s
+// RUN: env TRITON_USE_META_WS=1 triton-opt %s --nvgpu-partition-scheduling-meta --nvgpu-warp-specialization | FileCheck %s
 
 // Regression guard for token-initialization barrier coalescing in
 // WSLowerToken.cpp. Lowering emits one CTA barrier after initializing each

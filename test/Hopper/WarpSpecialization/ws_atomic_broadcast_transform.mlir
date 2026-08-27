@@ -1,5 +1,5 @@
-// RUN: TRITON_USE_META_WS=1 triton-opt %s --nvgpu-warp-specialization="capability=100 num-stages=3 smem-budget=232448" | FileCheck %s
-// RUN: TRITON_USE_META_WS=1 triton-opt %s --nvgpu-warp-specialization="capability=100 num-stages=3 smem-budget=232448 tile-prefetch-depth=2" | FileCheck %s --check-prefix=DEPTH2
+// RUN: env TRITON_USE_META_WS=1 triton-opt %s --nvgpu-warp-specialization="capability=100 num-stages=3 smem-budget=232448" | FileCheck %s
+// RUN: env TRITON_USE_META_WS=1 triton-opt %s --nvgpu-warp-specialization="capability=100 num-stages=3 smem-budget=232448 tile-prefetch-depth=2" | FileCheck %s --check-prefix=DEPTH2
 
 // Case 2 (transform): a dynamic-persistent matmul whose persistent scf.while
 // claims its next tile via a scalar, loop-carried tt.atomic_rmw replicated to
