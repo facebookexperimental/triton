@@ -261,9 +261,13 @@ public:
       changed = true;
     }
 
-    for (auto [index, result, init, yielded] :
+    for (auto [enumeratedIndex, enumeratedResult, init, yielded] :
          llvm::enumerate(predicateOp.getResults(), predicateOp.getInits(),
                          yieldOp.getValues())) {
+      // Copy out of the structured bindings: capturing one in a lambda is a
+      // C++20 extension and this file is built as C++17.
+      auto index = enumeratedIndex;
+      OpResult result = enumeratedResult;
       auto boundaryConvert = yielded.getDefiningOp<ttg::ConvertLayoutOp>();
       if (!boundaryConvert || !boundaryConvert->hasOneUse())
         continue;
