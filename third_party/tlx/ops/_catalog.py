@@ -70,6 +70,13 @@ CATALOG: tuple[OpSpec, ...] = (
         requires=frozenset({"tma", "tmem"}),
     ),
     OpSpec(
+        op="hstu_attn",
+        arch="gfx950",
+        variant="tlx",
+        impl="kernels.hstu_attn.gfx950:hstu_attn",
+        dtypes=_FP16,
+    ),
+    OpSpec(
         op="kimi_delta_attention",
         arch="sm100",
         variant="ws",
