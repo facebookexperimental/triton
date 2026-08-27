@@ -40,10 +40,17 @@ public:
                   mlir::PatternRewriter &rewriter) const override {
     if (!isa<RankedTensorType>(requireLayoutOp.getSrc().getType()))
       return failure();
+    auto resultType = cast<RankedTensorType>(requireLayoutOp.getType());
+    if (containsPinnedEncoding(resultType.getEncoding())) {
+      rewriter.replaceOpWithNewOp<ttg::RequireLayoutOp>(
+          requireLayoutOp, requireLayoutOp.getType(), requireLayoutOp.getSrc());
+      return success();
+    }
     if (requireLayoutOp.getSrc().getType() == requireLayoutOp.getType()) {
       rewriter.replaceOp(requireLayoutOp, requireLayoutOp.getSrc());
       return success();
     }
+
     auto convert = ttg::ConvertLayoutOp::create(
         rewriter, requireLayoutOp.getLoc(), requireLayoutOp.getType(),
         requireLayoutOp.getSrc());
@@ -261,13 +268,11 @@ public:
       changed = true;
     }
 
-    for (auto [enumeratedIndex, enumeratedResult, init, yielded] :
-         llvm::enumerate(predicateOp.getResults(), predicateOp.getInits(),
-                         yieldOp.getValues())) {
-      // Copy out of the structured bindings: capturing one in a lambda is a
-      // C++20 extension and this file is built as C++17.
-      auto index = enumeratedIndex;
-      OpResult result = enumeratedResult;
+    for (unsigned index = 0, e = predicateOp.getNumResults(); index < e;
+         ++index) {
+      OpResult result = cast<OpResult>(predicateOp.getResult(index));
+      Value init = predicateOp.getInits()[index];
+      Value yielded = yieldOp.getValues()[index];
       auto boundaryConvert = yielded.getDefiningOp<ttg::ConvertLayoutOp>();
       if (!boundaryConvert || !boundaryConvert->hasOneUse())
         continue;

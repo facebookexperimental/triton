@@ -447,6 +447,25 @@ repairUnwrappedReshapes(ArrayRef<::mlir::triton::ReshapeOp> reshapes) {
   return success();
 }
 
+static void lowerRequireLayouts(ModuleOp moduleOp) {
+  SmallVector<ttg::RequireLayoutOp> requireLayouts;
+  moduleOp.walk([&](ttg::RequireLayoutOp op) { requireLayouts.push_back(op); });
+
+  for (ttg::RequireLayoutOp op : requireLayouts) {
+    if (op.getSrc().getType() == op.getType()) {
+      op.getResult().replaceAllUsesWith(op.getSrc());
+      op.erase();
+      continue;
+    }
+
+    OpBuilder builder(op);
+    auto convert = ttg::ConvertLayoutOp::create(builder, op.getLoc(),
+                                                op.getType(), op.getSrc());
+    op.getResult().replaceAllUsesWith(convert.getResult());
+    op.erase();
+  }
+}
+
 static LogicalResult finalizeUserLayouts(ModuleOp moduleOp) {
   SmallVector<::mlir::triton::ReshapeOp> wrappedReshapes;
   moduleOp.walk([&](::mlir::triton::ReshapeOp reshape) {
@@ -490,6 +509,8 @@ static LogicalResult finalizeUserLayouts(ModuleOp moduleOp) {
 
   if (failed(repairUnwrappedReshapes(wrappedReshapes)))
     return failure();
+
+  lowerRequireLayouts(moduleOp);
 
   SmallVector<ttg::ConvertLayoutOp> identityConversions;
   moduleOp.walk([&](ttg::ConvertLayoutOp convert) {
