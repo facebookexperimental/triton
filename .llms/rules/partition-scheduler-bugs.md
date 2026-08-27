@@ -220,6 +220,18 @@
 - **Fix**: before converting each descriptor load, recursively erase only dead `convert_layout`/`broadcast`/`expand_dims` rematerialization chains, then derive consumer task IDs from the remaining users. Whole-function DCE is intentionally avoided because test/debug IR may contain unrelated dead consumers.
 - **Regression**: `ws_code_partition.mlir` pins the alloc set after the dead chain is erased. The `ws_remove_redundant_tmem_zero_bwd_bm128_inner.mlir` assertion that both rank-1 statistic `local_load`s belong only to computation task 0 is added with that fixture, which a later commit introduces.
 
+### 31. BM128 2-CTA FA-bwd single-copy qT load-order cycle (2026-07-28, fixed in kernel)
+- **Symptom**: Pinning qT from two 16 KiB copies to one makes the persistent BM128 2-CTA backward kernel fit Blackwell SMEM, but the kernel deadlocks. The two-copy configuration launches.
+- **Root cause**: Program order put the q load before qT in the shared load partition. On reuse, q waits for its empty barrier from the late dK MMA, while the GEMM partition waits for the next qT at the early qK MMA. With one qT slot this is a cycle; a second qT slot masks it. TLX explicitly issues qT before the previous q load.
+- **Fix**: In the kernel's 2-CTA branch, issue `desc_qt.load` before `desc_q.load` and pin qT with `opndB,smem,1,1`. No compiler change is required because the final AutoWS partition preserves source load order.
+- **Validation**: The pinned `N_CTX=512`, two-stage kernel launches with one qT copy and fits SMEM. Its initially independent dQ unload issue is fixed in #32.
+
+### 32. BM128 2-CTA FA-bwd dQ epilogue duplicates H halves (2026-07-28, fixed in kernel)
+- **Symptom**: The kernel launches, dK/dV are correct, but dQ has max error 1.82-2.24 and correlation near zero. The generated output has bit-identical H columns `0:64` and `64:128`.
+- **Root cause**: The epilogue slices the logical `[64,128]` dQ accumulator. `TwoCTA_RHS` stores that logical tensor physically as `[128,64]`, so logical H slicing reads the same CTA-local physical TMEM bank twice. TLX instead unloads a physical `[128,64]` alias and uses a packed global descriptor.
+- **Fix**: In the BM128 `TLX_DQ_LAYOUT` path, reshape dQ to physical `[BLOCK_M1, HEAD_DIM/2]`, reduce four physical H slices, and address dQ through `[2*N_CTX, HEAD_DIM/2]` with doubled packed-row coordinates.
+- **Validation**: `N_CTX=256` dQ/dK/dV max errors are at most `2.93e-3`. Four `N_CTX=512` persistent launches report dQ/dK `1.953e-3`, dV `1.465e-3`, and zero run-to-run variation. `Z=2`, `H=2`, `N_CTX=256` also passes within `2.93e-3`.
+
 ## Debugging Workflow
 - `t.dump` captures IR after each WarpSpec pass (doTaskIdPropagate → doBufferAllocation → doMemoryPlanner → doCodePartition → ...)
 - IR after PartitionSchedulingMeta uses `ttg.partition = array<i32: N>` attributes (not `async_task_id`)

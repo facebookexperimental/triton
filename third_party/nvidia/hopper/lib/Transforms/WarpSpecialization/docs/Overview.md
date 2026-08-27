@@ -69,6 +69,8 @@ not disable early TMA store lowering.
 when AutoWS assigns registers to non-tensor and tensor partitions. If either
 knob is provided from the Python frontend, its value must be divisible by 8 so
 the emitted register allocation matches the backend warp-group granularity.
+Typed one-warp 2-CTA relay partitions use 40 registers independently of those
+global bounds, matching their wait/fence/publication-only role.
 
 ## Persistent loops (`scf.for` and `scf.while`)
 
@@ -93,7 +95,7 @@ recognizes the `scf.while` outer loop (same doc).
 | `PartitionSchedulingMeta.cpp` | `nvgpu-partition-scheduling-meta` | Partition scheduling for Blackwell (assigns `ttg.partition` attributes), including ordered-subset-carry `scf.while`. See [PartitionSchedulingMeta.md](PartitionSchedulingMeta.md); downstream dynamic/CLC validation is tracked in [WarpSpecializeWhileLoops.md](WarpSpecializeWhileLoops.md) |
 | `Analyze2CTADependencies.cpp` | `nvgpu-analyze-2cta-dependencies` | Classifies dependent 2-CTA MMA operand chains as collective contractions or peer gathers before AutoWS; see [AutoWS2CTABackwardPlan.md](AutoWS2CTABackwardPlan.md) |
 | `Plan2CTAExchange.cpp` | `nvgpu-plan-2cta-exchange` | Inserts an abstract peer-gather SSA dependency before AutoWS scheduling and memory planning |
-| `Materialize2CTAExchange.cpp` | `nvgpu-materialize-2cta-exchange` | Lowers planned peer gathers after pipelining to local stores and async peer stores completed on the existing AutoWS full barrier |
+| `Materialize2CTAExchange.cpp` | `nvgpu-materialize-2cta-exchange` | Lowers planned peer gathers after pipelining; BM64 completes on the existing AutoWS full barrier, while BM128 uses the relay design documented in [AutoWS2CTABackwardPlan.md](AutoWS2CTABackwardPlan.md) |
 | (frontend) | `tl.range` / `tl.condition` → `tt.*` loop attrs | The user-facing AutoWS/pipelining annotations, their IR attributes and consumers, and what works on `scf.while` today: [AutoWSAnnotations.md](AutoWSAnnotations.md) |
 | `WSTaskPartition.cpp` | `doTaskPartition` | Assigns `async_task_id` to anchor ops (loads, dots, stores) — Hopper only |
 | `TaskIdPropagation.cpp` | — | `TaskIdBackwardPropagation` sparse dataflow analysis |
