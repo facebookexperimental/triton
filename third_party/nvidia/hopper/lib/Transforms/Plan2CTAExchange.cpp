@@ -140,7 +140,7 @@ public:
 
   void runOnOperation() override {
     ModuleOp module = getOperation();
-    if (!ttng::is2CTA(module) || module->hasAttr("tlx.has_tlx_ops"))
+    if (!ttg::isPhysicalCluster(module) || module->hasAttr("tlx.has_tlx_ops"))
       return;
 
     WalkResult result = module.walk([&](ttng::TCGen5MMAOp mma) {

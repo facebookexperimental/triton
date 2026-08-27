@@ -68,10 +68,10 @@ Value emitRedundantThreadPredicate(
   Value zero = b.i32_val(0);
   auto [laneId, warpId] = getLaneAndWarpId(rewriter, loc);
 
-  // In TLX clustered kernels, always use zero for blockId instead of cluster
-  // CTA ID This ensures operations execute based on the CTA-local thread ID,
-  // not cluster position
-  bool isClusteredKernel = op && tlx::tlxIsClustered(op);
+  // On a physical `ctas_per_cga` cluster each CTA is its own program, so the
+  // layout's block dimension must index CTA-locally rather than by cluster
+  // rank.
+  bool isClusteredKernel = op && triton::gpu::isPhysicalCluster(op);
 
   Value blockId = (freeVarMasks.lookup(kBlock) == 0 || isClusteredKernel)
                       ? zero

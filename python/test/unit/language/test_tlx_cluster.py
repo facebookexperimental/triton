@@ -55,6 +55,41 @@ def test_cluster_dims(device):
 
 
 @pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper/Blackwell for clusters")
+def test_ctas_per_cga_regroups_grid_without_multiplying(device):
+    """`ctas_per_cga` groups CTAs the grid already has; `num_ctas` spawns more.
+
+    A grid of GRID with a 2-CTA physical cluster must still launch GRID thread
+    blocks -- GRID // 2 clusters -- where the same grid with `num_ctas=2`
+    launches 2 * GRID. Normalizing `ctas_per_cga` to `num_ctas == 1` is what
+    keeps the launcher's `gridX * num_ctas` from multiplying the request, so
+    this pins the launch geometry rather than only the recorded metadata.
+    """
+
+    @triton.jit
+    def count_kernel(counter_ptr):
+        tl.atomic_add(counter_ptr, 1)
+
+    GRID = 1000
+
+    counter = torch.zeros(1, dtype=torch.int32, device=device)
+    physical = count_kernel[(GRID, )](counter, ctas_per_cga=(2, 1, 1))
+    torch.cuda.synchronize()
+    assert counter.item() == GRID, "ctas_per_cga must regroup the grid, not multiply it"
+    assert physical.metadata.num_ctas == 1
+    assert tuple(physical.metadata.cluster_dims) == (2, 1, 1)
+
+    # The contrasting model is asserted through metadata only. Under `num_ctas`
+    # the cluster's CTAs cooperate on a single program, so a scalar atomic runs
+    # once per program rather than once per thread block: the counter reads GRID
+    # under both models and cannot see the extra CTAs. It is a valid probe above
+    # precisely because `ctas_per_cga` pins `num_ctas == 1`, which makes programs
+    # and thread blocks coincide.
+    logical = count_kernel[(GRID, )](counter, num_ctas=2)
+    assert logical.metadata.num_ctas == 2
+    assert tuple(logical.metadata.cluster_dims) == (1, 1, 1)
+
+
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper/Blackwell for clusters")
 def test_cluster_size_1d(device):
 
     @triton.jit

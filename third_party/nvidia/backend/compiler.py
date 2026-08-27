@@ -260,16 +260,27 @@ class CUDAOptions:
         _check_reg_auto_ws_alignment("minRegAutoWS", self.minRegAutoWS)
         _check_reg_auto_ws_alignment("maxRegAutoWS", self.maxRegAutoWS)
 
-        # If ctas_per_cga is set, it overrides cluster_dims with CUDA semantics:
-        # ctas_per_cga defines the cluster shape for regrouping grid CTAs.
-        # num_ctas must be 1 when using ctas_per_cga since it's incompatible with
-        # the multiplicative semantics of num_ctas.
-        if self.ctas_per_cga is not None:
-            # Ensure cluster_dims is all 1s to prevent conflicting cluster specifications.
-            assert (self.cluster_dims == (1, 1, 1) or self.cluster_dims == self.ctas_per_cga), (
-                f"When using ctas_per_cga, cluster_dims must be default (1,1,1) or match ctas_per_cga to avoid conflicting "
-                f"cluster specifications. Got cluster_dims={self.cluster_dims}")
+        # num_ctas and ctas_per_cga are alternative cluster models, not two dials
+        # on one. Under num_ctas the CTAs share a program and its tensors are
+        # distributed across them; under ctas_per_cga each CTA is its own program
+        # and only explicit ops cross between them. The compiler decides which
+        # model a kernel uses by inspecting these, so requesting a cluster more
+        # than one way has no well-defined answer. cluster_dims is the
+        # module-level spelling of the ctas_per_cga shape, so those two may
+        # coexist only when they agree.
+        cluster_shape = self.ctas_per_cga if self.ctas_per_cga is not None else self.cluster_dims
+        mirrors_agree = self.ctas_per_cga is None or self.cluster_dims in ((1, 1, 1), self.ctas_per_cga)
+        if not mirrors_agree or (self.num_ctas > 1 and cluster_shape != (1, 1, 1)):
+            raise ValueError(
+                "a cluster must be requested exactly one way: either num_ctas, or ctas_per_cga "
+                f"(optionally mirrored in cluster_dims). Got num_ctas={self.num_ctas}, "
+                f"ctas_per_cga={self.ctas_per_cga}, cluster_dims={self.cluster_dims}")
 
+        # ctas_per_cga regroups grid CTAs rather than spawning them, so it is
+        # incompatible with the multiplicative semantics of num_ctas. Mirror it
+        # into cluster_dims, which is what reaches the module as
+        # ttg.cluster-dim-*.
+        if self.ctas_per_cga is not None:
             object.__setattr__(self, "cluster_dims", self.ctas_per_cga)
             object.__setattr__(self, "num_ctas", 1)
 

@@ -725,11 +725,26 @@ In WS mode, worker warps sit in a switch loop and never execute main code.
 If the main code contains `barrier.cluster.arrive/wait`, worker warps must
 still participate or the cluster barrier deadlocks.
 
-`ConvertWarpSpecializeToLLVM.cpp` emits a predicated
-`@!isDefault barrier.cluster.arrive.aligned` at kernel entry for worker warps.
-This is gated on `tlxIsClustered(func) || getModuleTwoCTAs(func)` — covering
-both TLX and autoWS 2-CTA kernels. The arrive-once pattern assumes the main
-code has at most one cluster barrier per kernel invocation.
+Rather than have each pass rediscover whether a kernel needs that entry sync,
+the pass that inserts it stamps a marker and the others read it:
+
+1. `maybeInsertClusterSync` (`TritonGPUToLLVM.cpp`) decides. It runs only for a
+   physical cluster (`triton::gpu::isPhysicalCluster`) that contains a remote
+   barrier or a multicast arrive, inserts the kernel-entry cluster sync, and
+   records `tlx.cluster_sync_kernel_init` on the module.
+2. `ConvertWarpSpecializeToLLVM.cpp` reads that marker and emits a predicated
+   `@!isDefault barrier.cluster.arrive.relaxed.aligned` in the entry header, so
+   the worker warps join the barrier the default warps are waiting on.
+3. `ClusterOpsToLLVM.cpp` (`lowerClusterSyncForAllWarps`) reads the same marker
+   and skips its all-warps wrapping for that sync. Wrapping it there as well
+   would add a second worker arrive, imbalancing the barrier.
+
+The arrive-once pattern assumes the main code has at most one cluster barrier
+per kernel invocation.
+
+Note this path is physical-cluster only: a logical `num_ctas > 1` kernel never
+reaches step 1, so its cross-CTA barrier initialization is handled entirely by
+`runCrossCTAMBarrierInitSyncInsertion`.
 
 ### Bugs Fixed for Auto-WS + 2-CTA
 
