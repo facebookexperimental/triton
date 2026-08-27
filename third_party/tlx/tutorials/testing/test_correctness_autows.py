@@ -175,7 +175,7 @@ def test_autows_fa_2cta_non_causal(baseVariant):
 
 @pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell GPU")
 def test_autows_fa_2cta_persistent_multi_iteration():
-    """Cover Q/output staging reuse across persistent tile iterations."""
+    """Cover persistent tile reuse and V staging-slot rotation."""
     config = next(
         (config for config in _autows_fwd_configs if config.kwargs.get("NUM_CTAS") == 2),
         None,
@@ -187,7 +187,7 @@ def test_autows_fa_2cta_persistent_multi_iteration():
     _attn_fwd_persist.cache = {}
 
     sm_scale = 0.5
-    q, k, v = FlashAttention.create_inputs(4, 48, 512, 128)
+    q, k, v = FlashAttention.create_inputs(4, 48, 1024, 128)
     reference = FlashAttention.get_reference(q, k, v, sm_scale, causal=False)
     try:
         actual = _autows_fa(q, k, v, False, sm_scale, "ws_persistent", True, 1, False)
