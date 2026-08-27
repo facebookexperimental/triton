@@ -3,6 +3,7 @@ on:
   push:
     branches:
       - main
+      - release/3.8.x
   pull_request:
   schedule:
     # Every 6 hours at :30 past (00:30, 06:30, 12:30, 18:30 UTC).
