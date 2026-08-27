@@ -4495,6 +4495,34 @@ int triton::gpu::lookupNumCTAs(OpBuilder &rewriter) {
   return triton::gpu::TritonGPUDialect::getNumCTAs(cast<ModuleOp>(op));
 }
 
+bool triton::gpu::isPhysicalCluster(ModuleOp mod) {
+  auto dims = TritonGPUDialect::getClusterDims(mod);
+  return dims[0] * dims[1] * dims[2] > 1;
+}
+
+bool triton::gpu::isPhysicalCluster(Operation *op) {
+  auto mod = dyn_cast<ModuleOp>(op);
+  if (!mod)
+    mod = op->getParentOfType<ModuleOp>();
+  return mod && isPhysicalCluster(mod);
+}
+
+int triton::gpu::lookupPhysicalNumCTAs(Operation *op) {
+  auto mod = dyn_cast<ModuleOp>(op);
+  if (!mod)
+    mod = op->getParentOfType<ModuleOp>();
+  if (!mod)
+    return lookupNumCTAs(op);
+  auto dims = TritonGPUDialect::getClusterDims(mod);
+  int physicalNumCTAs = dims[0] * dims[1] * dims[2];
+  return physicalNumCTAs > 1 ? physicalNumCTAs : lookupNumCTAs(op);
+}
+
+int triton::gpu::lookupPhysicalNumCTAs(OpBuilder &rewriter) {
+  assert(rewriter.getInsertionBlock() && "expected an insertion point");
+  return lookupPhysicalNumCTAs(rewriter.getInsertionBlock()->getParentOp());
+}
+
 bool triton::gpu::areLayoutsEquivalent(ArrayRef<int64_t> shape,
                                        LayoutEncodingTrait lhs,
                                        LayoutEncodingTrait rhs) {
