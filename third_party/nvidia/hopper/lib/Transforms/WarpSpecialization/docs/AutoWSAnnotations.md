@@ -50,6 +50,7 @@ AutoWS inventory.
 | `loop_unroll_factor` | `tt.loop_unroll_factor` | `LoopUnroll` (TTIR) | IR-level unroll |
 | `flatten` | `tt.flatten` | `FuseNestedLoops` | flatten a loop nest |
 | `disallow_acc_multi_buffer` | `tt.disallow_acc_multi_buffer` | pipeliner | keep acc single-buffered |
+| `assume_nonempty` | `tt.assume_nonempty` | `WSCodePartition` (`removeRedundantTmemZeroStores`) | promise the loop runs at least once; must be on the loop containing the MMA |
 | `multi_cta` | `tt.multi_cta` | multi-CTA reduction | cluster-level reduction |
 | `merge_epilogue` / `merge_epilogue_to_computation` / `merge_correction` | `tt.merge_*` | `PartitionSchedulingMeta` (`SchedulingOptions`) | epilogue/correction routing |
 | `separate_epilogue_store` | `tt.separate_epilogue_store` | `PartitionSchedulingMeta` | epilogue store gets own partition |

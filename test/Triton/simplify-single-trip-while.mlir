@@ -114,7 +114,8 @@ tt.func @computed_condition(%arg0: i32) -> i32 {
 // CHECK-NOT: scf.while
 // CHECK: scf.if
 // CHECK: scf.for
-// CHECK: } {tt.data_partition_factor = 2 : i32
+// CHECK: } {tt.assume_nonempty
+// CHECK-SAME: tt.data_partition_factor = 2 : i32
 // CHECK-SAME: tt.disallow_acc_multi_buffer
 // CHECK-SAME: tt.mem_plan_pick = 3 : i32
 // CHECK-SAME: tt.merge_correction = true
@@ -162,7 +163,7 @@ tt.func @forwards_autows(%arg0: i32) -> i32 {
         scf.yield %acc : i32
       }
       scf.yield %false, %inner : i1, i32
-    } attributes {tt.warp_specialize, tt.num_stages = 3 : i32, tt.loop_unroll_factor = 4 : i32, tt.disallow_acc_multi_buffer, tt.flatten, tt.multi_cta, llvm.loop_annotation = true, tt.data_partition_factor = 2 : i32, tt.list_schedule_pick = 1 : i32, tt.mem_plan_pick = 3 : i32, tt.merge_epilogue = true, tt.merge_epilogue_to_computation = true, tt.merge_correction = true, tt.separate_epilogue_store = true, tt.tmem_alloc_algo = 2 : i32, tt.smem_alloc_algo = 1 : i32, tt.smem_budget = 65536 : i32, tt.smem_circular_reuse = true}
+    } attributes {tt.assume_nonempty, tt.warp_specialize, tt.num_stages = 3 : i32, tt.loop_unroll_factor = 4 : i32, tt.disallow_acc_multi_buffer, tt.flatten, tt.multi_cta, llvm.loop_annotation = true, tt.data_partition_factor = 2 : i32, tt.list_schedule_pick = 1 : i32, tt.mem_plan_pick = 3 : i32, tt.merge_epilogue = true, tt.merge_epilogue_to_computation = true, tt.merge_correction = true, tt.separate_epilogue_store = true, tt.tmem_alloc_algo = 2 : i32, tt.smem_alloc_algo = 1 : i32, tt.smem_budget = 65536 : i32, tt.smem_circular_reuse = true}
     scf.yield %while_result : i32
   } else {
     scf.yield %arg0 : i32
