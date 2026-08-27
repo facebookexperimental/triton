@@ -1112,30 +1112,6 @@ static void optimizeEpilogueDependencies(scf::ForOp outerLoop,
           {outerLoop.getBody()->begin(), innerLoop->getIterator()}, inEpilogue);
 }
 
-// Crudely match llvm.assume(ub > lb) or llvm.assume(lb < ub).
-static LogicalResult matchPositiveTripCount(scf::ForOp loop) {
-  for (Operation *user : loop.getUpperBound().getUsers()) {
-    if (auto cmp = dyn_cast<arith::CmpIOp>(user)) {
-      if (llvm::none_of(cmp->getUsers(),
-                        [](Operation *op) { return isa<LLVM::AssumeOp>(op); }))
-        continue;
-      if (cmp.getPredicate() == (loop.getUnsignedCmp()
-                                     ? arith::CmpIPredicate::ugt
-                                     : arith::CmpIPredicate::sgt) &&
-          cmp.getLhs() == loop.getUpperBound() &&
-          cmp.getRhs() == loop.getLowerBound())
-        return success();
-      if (cmp.getPredicate() == (loop.getUnsignedCmp()
-                                     ? arith::CmpIPredicate::ult
-                                     : arith::CmpIPredicate::slt) &&
-          cmp.getLhs() == loop.getLowerBound() &&
-          cmp.getRhs() == loop.getUpperBound())
-        return success();
-    }
-  }
-  return failure();
-}
-
 // Speculate the length of the inner loop such that the loop is known to execute
 // at least once. This way, the inner loop body does not have to be placed
 // inside a conditional in the fused loop, which interacts better with the
@@ -1147,7 +1123,7 @@ static LogicalResult speculateInnerLoopLength(scf::ForOp outerLoop,
   ImplicitLocOpBuilder b(loc, outerLoop);
 
   // Check if the inner loop is known to execute at least once.
-  if (succeeded(matchPositiveTripCount(innerLoop))) {
+  if (triton::isLoopTripCountKnownPositive(innerLoop, domInfo)) {
     innerLoop->setAttr(kMustExecuteAttrName, b.getUnitAttr());
     return success();
   }
