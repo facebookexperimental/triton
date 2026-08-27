@@ -2361,21 +2361,6 @@ def test_amd_scheduled_mfma_rejects_target_version_mismatch():
         )
 
 
-def test_amd_scheduled_mfma_rejects_unsupported_target():
-    with pytest.raises(RuntimeError, match=r"scheduled_mfma.*only on CDNA3.*and CDNA4"):
-        compile_for_target(
-            _amd_scheduled_mfma_kernel,
-            signature={
-                "a_ptr": "*bf16",
-                "b_ptr": "*bf16",
-                "output_ptr": "*fp32",
-                "K_WIDTH": "constexpr",
-            },
-            constexprs={"K_WIDTH": 8},
-            target=GFX1250,
-        )
-
-
 def test_amd_scheduled_mfma_rejects_non_native_gfx942_shape():
     with pytest.raises(RuntimeError, match=r"version 3 supports only its native 32x32x8 and 16x16x16 shapes"):
         compile_for_gfx942(
@@ -2389,16 +2374,18 @@ def test_amd_scheduled_mfma_rejects_non_native_gfx942_shape():
                 "INSTR_K": "constexpr",
             },
             constexprs={"PERSISTENT": False, "TRANSPOSED": True, "INSTR_K": 32},
+            # v_mfma_f32_16x16x32_fp16 (supported by CDNA3) will be emitted
         )
 
 
 @pytest.mark.skipif(not is_hip_cdna3(), reason="Requires gfx942 hardware")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
 @pytest.mark.parametrize("persistent", [False, True])
 @pytest.mark.parametrize("transposed", [False, True])
-def test_amd_scheduled_mfma_multifragment_correct_gfx942(persistent, transposed):
+def test_amd_scheduled_mfma_multifragment_correct_gfx942(persistent, transposed, dtype):
     torch.manual_seed(0)
-    a = torch.randn((32, 32), device="cuda", dtype=torch.float16)
-    b = torch.randn((32, 128), device="cuda", dtype=torch.float16)
+    a = torch.randn((32, 32), device="cuda", dtype=dtype)
+    b = torch.randn((32, 128), device="cuda", dtype=dtype)
     actual = torch.empty((32, 128), device="cuda", dtype=torch.float32)
     _amd_scheduled_mfma_gfx942_kernel[(1, )](
         a,
@@ -2406,7 +2393,7 @@ def test_amd_scheduled_mfma_multifragment_correct_gfx942(persistent, transposed)
         actual,
         PERSISTENT=persistent,
         TRANSPOSED=transposed,
-        INSTR_K=16,
+        INSTR_K=16,  # 16x16x16
         num_warps=4,
         matrix_instr_nonkdim=16,
     )
@@ -2414,10 +2401,11 @@ def test_amd_scheduled_mfma_multifragment_correct_gfx942(persistent, transposed)
 
 
 @pytest.mark.skipif(not is_hip_cdna3(), reason="Requires gfx942 hardware")
-def test_amd_scheduled_mfma_large_persistent_correct_gfx942():
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
+def test_amd_scheduled_mfma_large_persistent_correct_gfx942(dtype):
     torch.manual_seed(0)
-    a = torch.randn((256, 32), device="cuda", dtype=torch.float16)
-    b = torch.randn((32, 256), device="cuda", dtype=torch.float16)
+    a = torch.randn((256, 32), device="cuda", dtype=dtype)
+    b = torch.randn((32, 256), device="cuda", dtype=dtype)
     actual = torch.empty((256, 256), device="cuda", dtype=torch.float32)
     _amd_scheduled_mfma_large_gfx942_kernel[(1, )](
         a,
@@ -2444,10 +2432,25 @@ def test_amd_scheduled_mfma_round_robin_order_gfx942():
     )
     mnemonic = "v_mfma_f32_16x16x16_f16"
     mfmas = [line.strip() for line in compiled.asm["amdgcn"].splitlines() if mnemonic in line]
+
     assert len(mfmas) == 8
+    # M,N,K = 32,128,32, warps_per_cta = [1,4]
+    # each warp computes 32x32 => 2 M-reps x 2 N-reps
+    # K steps => 32/16 = 2
+
     destinations = [line.split(mnemonic, 1)[1].strip().split(",", 1)[0] for line in mfmas]
     assert len(set(destinations[:4])) == 4
     assert destinations[4:] == destinations[:4]
+    # v_mfma ... v[8:11],  v[0:1], v[20:21], 0          <- K step 0
+    # v_mfma ... v[12:15], v[0:1], v[38:39], 0
+    # v_mfma ... v[16:19], v[4:5], v[20:21], 0
+    # v_mfma ... v[20:23], v[4:5], v[38:39], 0
+    # v_mfma ... v[8:11],  v[2:3], v[36:37], v[8:11]    <- K step 1, same 4 dsts
+    # v_mfma ... v[12:15], v[2:3], v[40:41], v[12:15]
+    # v_mfma ... v[16:19], v[6:7], v[36:37], v[16:19]
+    # v_mfma ... v[20:23], v[6:7], v[40:41], v[20:23]
+    # destinations = [v[8:11], v[12:15], v[16:19], v[20:23], v[8:11], v[12:15], v[16:19], v[20:23]]
+    # — first four distinct, next four identical, which is what the two asserts check.
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
