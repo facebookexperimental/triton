@@ -108,6 +108,12 @@ COMPILER_PAGE = Page(
     "AutoWS enablement and knobs, and deterministic reduction ordering.",
     "triton",
 )
+TLX_OPS_PAGE = Page(
+    "tlx-ops",
+    "tlx.ops",
+    "Production-ready TLX kernels, one blessed implementation per op and architecture.",
+    "tlx-ops",
+)
 TORCHTLX_PAGE = Page(
     "torchtlx",
     "TorchTLX",
@@ -132,6 +138,7 @@ TRITON_PAGES = (TRITON_PAGE, COMPILER_PAGE)
 SECTIONS = {
     "triton": TRITON_PAGES,
     "tlx": TLX_PAGES,
+    "tlx-ops": (TLX_OPS_PAGE,),
     "torchtlx": (TORCHTLX_PAGE,),
     "ci": (CI_PAGE,),
     "tooling": (TOOLING_PAGE,),
@@ -140,11 +147,12 @@ SECTION_PAGES = tuple(pages[0] for pages in SECTIONS.values())
 SECTION_LABELS = {
     "triton": "Triton",
     "tlx": "TLX",
+    "tlx-ops": "tlx.ops",
     "torchtlx": "TorchTLX",
     "ci": "CI",
     "tooling": "Tooling",
 }
-PAGES = (HOME_PAGE, *TRITON_PAGES, *TLX_PAGES, TORCHTLX_PAGE, CI_PAGE, TOOLING_PAGE)
+PAGES = (HOME_PAGE, *TRITON_PAGES, *TLX_PAGES, TLX_OPS_PAGE, TORCHTLX_PAGE, CI_PAGE, TOOLING_PAGE)
 
 def page_source(page: Page) -> str:
     """Read a page body from website/content/, falling back to guide_content."""
@@ -381,6 +389,7 @@ def render_page(page: Page, source: str) -> str:
         "home": "Triton at Meta",
         "triton": "Triton compiler",
         "tlx": "TLX documentation",
+        "tlx-ops": "TLX op library",
         "torchtlx": "TorchTLX",
         "ci": "Continuous integration",
         "tooling": "Developer tooling",
