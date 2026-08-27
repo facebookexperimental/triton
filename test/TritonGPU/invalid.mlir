@@ -742,3 +742,199 @@ tt.func public @padded_subview_unsupported_size(%arg0: !ttg.memdesc<2x32x32xf32,
 // expected-error @below {{alignment must be specified outside of the linear layout braces}}
 #shared = #ttg.shared_linear<{offset = [[0, 1], [0, 2], [1, 0], [2, 0]], block = [], alignment = 16}>
 !alignment_in_layout = !ttg.memdesc<4x4xf32, #shared, #ttg.shared_memory>
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+module attributes {"ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @warp_predicate_yield_count(
+      %predicate: tensor<64xi1, #blocked>,
+      %init: tensor<64xf32, #blocked>) -> tensor<64xf32, #blocked> {
+    // expected-error @+1 {{expected equal numbers of inits, results, and yields, but got 1, 1, and 0}}
+    %result = ttg.warp_predicate %predicate (%init) {
+      ttg.predicate_yield
+    } : (tensor<64xi1, #blocked>, tensor<64xf32, #blocked>) -> tensor<64xf32, #blocked>
+    tt.return %result : tensor<64xf32, #blocked>
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+module attributes {"ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @warp_predicate_block_argument(
+      %predicate: tensor<64xi1, #blocked>,
+      %init: tensor<64xf32, #blocked>) -> tensor<64xf32, #blocked> {
+    // expected-error @+1 {{region block must not have arguments}}
+    %result = "ttg.warp_predicate"(%predicate, %init) ({
+    ^bb0(%arg: tensor<64xf32, #blocked>):
+      "ttg.predicate_yield"(%arg) : (tensor<64xf32, #blocked>) -> ()
+    }) : (tensor<64xi1, #blocked>, tensor<64xf32, #blocked>) -> tensor<64xf32, #blocked>
+    tt.return %result : tensor<64xf32, #blocked>
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+module attributes {"ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @warp_predicate_cta_barrier(
+      %predicate: tensor<64xi1, #blocked>,
+      %init: tensor<64xf32, #blocked>) -> tensor<64xf32, #blocked> {
+    // expected-error @+1 {{region may not contain CTA barriers}}
+    %result = ttg.warp_predicate %predicate (%init) {
+      ttg.barrier none
+      ttg.predicate_yield %init : tensor<64xf32, #blocked>
+    } : (tensor<64xi1, #blocked>, tensor<64xf32, #blocked>) -> tensor<64xf32, #blocked>
+    tt.return %result : tensor<64xf32, #blocked>
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+module attributes {"ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @warp_predicate_nested_region(
+      %condition: i1,
+      %predicate: tensor<64xi1, #blocked>,
+      %init: tensor<64xf32, #blocked>) -> tensor<64xf32, #blocked> {
+    // expected-error @+1 {{region may not contain nested dynamic control flow}}
+    %result = ttg.warp_predicate %predicate (%init) {
+      scf.if %condition {
+        scf.yield
+      }
+      ttg.predicate_yield %init : tensor<64xf32, #blocked>
+    } : (tensor<64xi1, #blocked>, tensor<64xf32, #blocked>) -> tensor<64xf32, #blocked>
+    tt.return %result : tensor<64xf32, #blocked>
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @warp_predicate_reduce_region(
+      %predicate: tensor<256xi1, #blocked>,
+      %init: tensor<256xf32, #blocked>) -> tensor<256xf32, #blocked> {
+    // expected-error @+1 {{region reduction axis must be warp-local}}
+    %result = ttg.warp_predicate %predicate (%init) {
+      %sum = "tt.reduce"(%init) <{axis = 0 : i32}> ({
+      ^bb0(%lhs: f32, %rhs: f32):
+        %next = arith.addf %lhs, %rhs : f32
+        tt.reduce.return %next : f32
+      }) : (tensor<256xf32, #blocked>) -> f32
+      ttg.predicate_yield %init : tensor<256xf32, #blocked>
+    } : (tensor<256xi1, #blocked>, tensor<256xf32, #blocked>) -> tensor<256xf32, #blocked>
+    tt.return %result : tensor<256xf32, #blocked>
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 64], warpsPerCTA = [4, 1], order = [1, 0]}>
+#row = #ttg.slice<{dim = 1, parent = #blocked}>
+module attributes {"ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @warp_predicate_requires_uniform_wave_for_local_reduce(
+      %predicate: i1,
+      %init: tensor<4x64xf32, #blocked>) -> tensor<4x64xf32, #blocked> {
+    // expected-error @+1 {{cross-lane operation tt.reduce requires a wave-uniform predicate}}
+    %result = ttg.warp_predicate %predicate (%init) {
+      %sum = "tt.reduce"(%init) <{axis = 1 : i32}> ({
+      ^bb0(%lhs: f32, %rhs: f32):
+        %next = arith.addf %lhs, %rhs : f32
+        tt.reduce.return %next : f32
+      }) : (tensor<4x64xf32, #blocked>) -> tensor<4xf32, #row>
+      ttg.predicate_yield %init : tensor<4x64xf32, #blocked>
+    } : (i1, tensor<4x64xf32, #blocked>) -> tensor<4x64xf32, #blocked>
+    tt.return %result : tensor<4x64xf32, #blocked>
+  }
+}
+
+// -----
+
+#mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [1, 1], instrShape = [32, 32, 16], isTransposed = true}>
+#dot0 = #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 4}>
+#dot1 = #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 4}>
+module attributes {"ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 64 : i32, ttg.target = "hip:gfx950"} {
+  tt.func @warp_predicate_requires_uniform_wave_for_dot(
+      %predicate: i1,
+      %lhs: tensor<32x32xf16, #dot0>,
+      %rhs: tensor<32x32xf16, #dot1>,
+      %acc: tensor<32x32xf32, #mma>) -> tensor<32x32xf32, #mma> {
+    // expected-error @+1 {{cross-lane operation tt.dot requires a wave-uniform predicate}}
+    %result = ttg.warp_predicate %predicate (%acc) {
+      %dot = tt.dot %lhs, %rhs, %acc : tensor<32x32xf16, #dot0> * tensor<32x32xf16, #dot1> -> tensor<32x32xf32, #mma>
+      ttg.predicate_yield %dot : tensor<32x32xf32, #mma>
+    } : (i1, tensor<32x32xf32, #mma>) -> tensor<32x32xf32, #mma>
+    tt.return %result : tensor<32x32xf32, #mma>
+  }
+}
+
+// -----
+
+#row = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 64], warpsPerCTA = [1, 1], order = [1, 0]}>
+#column = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [64, 1], warpsPerCTA = [1, 1], order = [0, 1]}>
+module attributes {"ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @warp_predicate_requires_uniform_wave_for_layout_shuffle(
+      %predicate: i1,
+      %init: tensor<64x64xf32, #row>) -> tensor<64x64xf32, #row> {
+    // expected-error @+1 {{cross-lane operation ttg.convert_layout requires a wave-uniform predicate}}
+    %result = ttg.warp_predicate %predicate (%init) {
+      %local = arith.addf %init, %init : tensor<64x64xf32, #row>
+      %shuffled = ttg.convert_layout %local : tensor<64x64xf32, #row> -> tensor<64x64xf32, #column>
+      ttg.predicate_yield %init : tensor<64x64xf32, #row>
+    } : (i1, tensor<64x64xf32, #row>) -> tensor<64x64xf32, #row>
+    tt.return %result : tensor<64x64xf32, #row>
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+module attributes {"ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @warp_predicate_reduce_axis_out_of_bounds(
+      %predicate: tensor<64xi1, #blocked>,
+      %init: tensor<64xf32, #blocked>) -> tensor<64xf32, #blocked> {
+    %result = ttg.warp_predicate %predicate (%init) {
+      // expected-error @+1 {{axis out of bounds for operand rank 1}}
+      %sum = "tt.reduce"(%init) <{axis = 1 : i32}> ({
+      ^bb0(%lhs: f32, %rhs: f32):
+        %next = arith.addf %lhs, %rhs : f32
+        tt.reduce.return %next : f32
+      }) : (tensor<64xf32, #blocked>) -> f32
+      ttg.predicate_yield %init : tensor<64xf32, #blocked>
+    } : (tensor<64xi1, #blocked>, tensor<64xf32, #blocked>) -> tensor<64xf32, #blocked>
+    tt.return %result : tensor<64xf32, #blocked>
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+module attributes {"ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @warp_predicate_shape_mismatch(
+      %predicate: tensor<64xi1, #blocked>,
+      %init: tensor<128xf32, #blocked>) -> tensor<128xf32, #blocked> {
+    // expected-error @+1 {{predicate shape must be a leading shape of every carried tensor}}
+    %result = ttg.warp_predicate %predicate (%init) {
+      ttg.predicate_yield %init : tensor<128xf32, #blocked>
+    } : (tensor<64xi1, #blocked>, tensor<128xf32, #blocked>) -> tensor<128xf32, #blocked>
+    tt.return %result : tensor<128xf32, #blocked>
+  }
+}
+
+// -----
+
+#predicate = #ttg.linear<{register = [], lane = [[1], [2], [4], [8], [16], [32]], warp = [], block = []}>
+#carried = #ttg.linear<{register = [[1]], lane = [[2], [4], [8], [16], [32], [0]], warp = [], block = []}>
+module attributes {"ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @warp_predicate_lane_ownership_mismatch(
+      %predicate_value: tensor<64xi1, #predicate>,
+      %init: tensor<64xf32, #carried>) -> tensor<64xf32, #carried> {
+    // expected-error @+1 {{predicate and carried tensors must have matching lane ownership}}
+    %result = ttg.warp_predicate %predicate_value (%init) {
+      ttg.predicate_yield %init : tensor<64xf32, #carried>
+    } : (tensor<64xi1, #predicate>, tensor<64xf32, #carried>) -> tensor<64xf32, #carried>
+    tt.return %result : tensor<64xf32, #carried>
+  }
+}

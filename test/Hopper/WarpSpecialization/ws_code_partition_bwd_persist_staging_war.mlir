@@ -1,4 +1,5 @@
 // RUN: triton-opt %s --nvgpu-test-ws-code-partition="num-buffers=2" | FileCheck %s
+// RUN: sed -e '/^    %%c0_i32 = arith.constant/a\    %%c0_i64 = arith.constant {async_task_id = array<i32: 0, 1, 2, 3>} 0 : i64\n    %%c1_i64 = arith.constant {async_task_id = array<i32: 0, 1, 2, 3>} 1 : i64' -e '/^    %%28 = scf.for %%arg48 = %%c0_i32 to %%16 step %%c1_i32 iter_args(%%arg49 = %%9)/c\    %%28:2 = scf.while (%%valid = %%true, %%arg49 = %%9, %%iter = %%c0_i64) : (i1, i32, i64) -> (i32, i64) { scf.condition(%%valid) %%arg49, %%iter : i32, i64 } do { ^bb0(%%arg49: i32, %%iter: i64):' -e '/^      %%65 = arith.addi %%arg49, %%10/a\      %%iter_next = arith.addi %%iter, %%c1_i64 {async_task_id = array<i32: 0, 1, 2, 3>} : i64' -e 's/^      scf.yield {async_task_id = array<i32: 0, 2, 3>} %%65 : i32/      scf.yield {async_task_id = array<i32: 0, 1, 2, 3>} %%true, %%65, %%iter_next : i1, i32, i64/' -e 's/^    } {async_task_id = array<i32: 0, 1, 2, 3>, tt.merge_epilogue_to_computation/    } attributes {async_task_id = array<i32: 0, 1, 2, 3>, tt.merge_epilogue_to_computation/' %s | triton-opt - --nvgpu-test-ws-code-partition="num-buffers=2" | FileCheck %s --check-prefix=WHILE
 
 // Regression test for the persistent FA-bwd dv/dk staging SMEM cross-tile race
 // (bug #9 in .llms/rules/partition-scheduler-bugs.md / D109859261).
@@ -34,6 +35,12 @@
 // Staging task (3) releases the SAME token at the bottom of the outer-loop body
 // (region 4) with a constant buffer index, targeting the load task (2).
 // CHECK: nvws.consumer_release %[[WAR_TOK]], %{{[a-zA-Z0-9_]+}} {async_task_id = array<i32: 3>, constraints = {WSBarrier = {channelGraph = array<i32: 0, 1, 2>, dstTask = 2 : i32, maxRegionId = 4 : i32, minRegionId = 4 : i32, parentId = 1 : i32}}} : tensor<1x!nvws.token>, i32
+
+// CLC keeps the persistent loop as scf.while. Its AutoWS accumulation counter
+// must drive the same dedicated cross-tile token and alternating phase.
+// WHILE-LABEL: @_attn_bwd_persist
+// WHILE: nvws.producer_acquire %[[WHILE_WAR:[a-zA-Z0-9_]+]], %{{[a-zA-Z0-9_]+}}, %{{[a-zA-Z0-9_]+}} {async_task_id = array<i32: 2>, constraints = {WSBarrier = {{{.*}}dstTask = 3 : i32{{.*}}}}} : tensor<1x!nvws.token>, i32, i1
+// WHILE: nvws.consumer_release %[[WHILE_WAR]], %{{[a-zA-Z0-9_]+}} {async_task_id = array<i32: 3>, constraints = {WSBarrier = {{{.*}}dstTask = 2 : i32{{.*}}}}} : tensor<1x!nvws.token>, i32
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [2, 16], warpsPerCTA = [4, 1], order = [1, 0]}>
 #blocked1 = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>

@@ -2,6 +2,8 @@
 # triton kernels. Lets the kernels run under OSS triton (MetaMain2) without buck.
 import functools
 
+import torch
+
 import triton
 import triton.language as tl
 
@@ -24,6 +26,37 @@ def prev_power_of_2(n: int) -> int:
 
 def autotune_max_seq_len(n) -> int:
     return next_power_of_2(int(n))
+
+
+# Round-toward-zero opt-in. Off by default, matching hammer; flip it with
+# set_use_rtz() before the kernels are compiled (it is a tl.constexpr global, so
+# it is baked in at compile time and is not part of the JIT cache key).
+USE_RTZ = tl.constexpr(0)
+
+
+def set_use_rtz(use_rtz: bool) -> None:
+    global USE_RTZ
+    USE_RTZ = tl.constexpr(1) if use_rtz is True else tl.constexpr(0)
+
+
+@triton.jit
+def get_use_rtz() -> bool:
+    return USE_RTZ == 1
+
+
+IS_HIP = tl.constexpr(torch.version.hip is not None)
+
+
+@triton.jit
+def pid_swizzle(pid, off_hz, n_tile_num, HZ):
+    """Swizzle PIDs for AMD L2 cache locality across XCDs.
+
+    On AMD chips, adjacent programs should land on the same XCD for better cache
+    locality. Group size 16 is tuned for MI300X (8 XCDs). No-op on CUDA.
+    """
+    if IS_HIP:
+        off_hz, pid = tl.swizzle2d(off_hz, pid, HZ, n_tile_num, 16)
+    return pid.to(tl.int32), off_hz.to(tl.int32)
 
 
 def triton_autotune(configs, key, **kwargs):

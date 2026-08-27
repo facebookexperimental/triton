@@ -1,0 +1,6 @@
+{
+  "backend": "cuda",
+  "architecture": "B200",
+  "device": "cuda:0",
+  "environment": {}
+}

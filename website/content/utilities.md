@@ -95,6 +95,40 @@
     Prefer these semantic reductions when code only needs an all/any result.
     They do not expose a hardware ballot bit mask.
 
+- `tlx.warp_predicate(predicate, inits, body, args=(), wave_uniform=False)` **[AMD]**
+
+    Executes `body(*inits, *args)` with the hardware execution mask restricted
+    to lanes where `predicate` is true. Active lanes receive the values returned
+    by `body`; inactive lanes keep their corresponding values from `inits`. A
+    single carried tensor is returned directly, while multiple carried tensors
+    are returned as a tuple.
+
+    A scalar predicate controls its physical lane. For a tensor predicate, the
+    elements owned by each lane are OR-reduced to form that lane's execution
+    bit. Unlike `tlx.warp_all` and `tlx.warp_any`, this does not make the
+    predicate uniform across the wave.
+
+    ```python
+    @triton.jit
+    def scale_active(acc, scale):
+        return acc * scale
+
+    acc = tlx.warp_predicate(
+        active,
+        acc,
+        scale_active,
+        args=(scale,),
+    )
+    ```
+
+    `body` must be an `@triton.jit` function that returns the same number and
+    types of tensors as `inits`. It must contain straight-line computation and
+    no cross-wave synchronization. Reductions, dots, and layout shuffles are
+    allowed only with `wave_uniform=True`, which asserts that every lane in a
+    wave observes the same predicate. Cross-warp reductions, nested dynamic
+    control flow, and other nested regions are unsupported. This operation is
+    currently lowered only by the AMD backend.
+
 - `tlx.prefetch(pointer, level="L2", mask=None, tensormap=False)` **[sm90+]** issues a non-blocking prefetch hint for pointer-based scattered/gather loads. This complements `tlx.async_descriptor_prefetch_tensor` (which works on TMA tensor descriptors) by supporting raw pointer tensors.
   Additionally, if `tensormap` is specified to `True`, the API instead does a prefetch of tensor map object (TMA descriptor) and ignores other parameters other than `pointer`.
 

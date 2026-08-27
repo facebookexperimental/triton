@@ -1779,6 +1779,232 @@ def test_amd_fa_cluster(causal, dtype, HEAD_DIM):
     torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
 
 
+@pytest.mark.parametrize(
+    ("dtype", "N_CTX"),
+    [
+        pytest.param(torch.float16, 4096, id="fp16-n4096"),
+        pytest.param(torch.bfloat16, 16384, id="bf16-n16384"),
+    ],
+)
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware (CDNA4)")
+def test_amd_fa_cluster_static_physical_k_row_stride(dtype, N_CTX):
+    """The selected constexpr K row stride preserves arbitrary physical padding."""
+    torch.manual_seed(42)
+    B, H, D = 1, 1, 128
+    q = torch.randn(B, H, N_CTX, D + 5, device=DEVICE, dtype=dtype)[..., :D]
+    k = torch.randn(B, H, N_CTX, D + 7, device=DEVICE, dtype=dtype)[..., :D]
+    v = torch.randn(B, H, N_CTX, D + 9, device=DEVICE, dtype=dtype)[..., :D]
+    sm = 1.0 / math.sqrt(D)
+    ref = torch.nn.functional.scaled_dot_product_attention(q, k, v, scale=sm)
+
+    out = _amd_fa_cluster(q, k, v, sm, False)
+
+    torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize("sm_scale", [1.3, -1.3], ids=["positive", "negative"])
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware (CDNA4)")
+def test_amd_fa_cluster_magnifying_scale_preserves_finite_fp16_inputs(sm_scale):
+    torch.manual_seed(123)
+    B, H, N_CTX, D = 1, 1, 1024, 64
+    q = torch.full((B, H, N_CTX, D), 35000.0, device=DEVICE, dtype=torch.float16)
+    k = torch.ones_like(q)
+    v = torch.randn_like(q)
+    expected = v.float().mean(dim=2, keepdim=True).expand_as(v).to(v.dtype)
+
+    out = _amd_fa_cluster(q, k, v, sm_scale, False, config={"USE_DIRECT_LOAD": False})
+
+    assert torch.isfinite(out).all()
+    torch.testing.assert_close(out, expected, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize("N_CTX", [1024, 4096], ids=["short", "long"])
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware (CDNA4)")
+def test_amd_fa_cluster_magnifying_scale_retains_bf16_accuracy(N_CTX):
+    torch.manual_seed(1170)
+    B, H, D = 1, 4, 128
+    q = torch.randn(B, H, N_CTX, D, device=DEVICE, dtype=torch.bfloat16)
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+    ref = torch.nn.functional.scaled_dot_product_attention(q, k, v, scale=1.3)
+
+    out = _amd_fa_cluster(q, k, v, 1.3, False, config={"USE_DIRECT_LOAD": False})
+
+    torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize("N_CTX", [384, 512, 1024])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware (CDNA4)")
+def test_amd_fa_cluster_short_causal_classes(N_CTX, dtype):
+    torch.manual_seed(42)
+    B, H, D = 1, 8, 128
+    q = torch.randn(B, H, N_CTX, D, device=DEVICE, dtype=dtype)
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+    sm = 1.0 / math.sqrt(D)
+    ref = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True, scale=sm)
+    out = _amd_fa_cluster(q, k, v, sm, True)
+    torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize("sm_scale", [0.0, -0.125], ids=["zero", "negative"])
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware (CDNA4)")
+def test_amd_fa_cluster_short_causal_nonpositive_scale(sm_scale):
+    """Causal mask sentinels remain valid for every accepted softmax scale."""
+    torch.manual_seed(42)
+    B, H, N_CTX, D = 1, 1, 128, 128
+    q = torch.randn(B, H, N_CTX, D, device=DEVICE, dtype=torch.float16)
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+    ref = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True, scale=sm_scale)
+    out = _amd_fa_cluster(q, k, v, sm_scale, True)
+    torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware (CDNA4)")
+def test_amd_fa_cluster_negative_scale_stays_finite():
+    """An unmasked score block remains stable when the accepted scale is negative."""
+    torch.manual_seed(42)
+    B, H, N_CTX, D = 1, 1, 512, 128
+    q = torch.ones((B, H, N_CTX, D), device=DEVICE, dtype=torch.float16)
+    key_rows = torch.where(
+        (torch.arange(N_CTX, device=DEVICE) // 32) % 2 == 0,
+        4.0,
+        -4.0,
+    )
+    k = key_rows[None, None, :, None].expand(B, H, N_CTX, D).to(q.dtype).contiguous()
+    v = torch.randn_like(q)
+    sm_scale = -0.125
+    ref = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True, scale=sm_scale)
+    out = _amd_fa_cluster(q, k, v, sm_scale, True)
+    assert torch.isfinite(out).all()
+    torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware (CDNA4)")
+@pytest.mark.parametrize("N_CTX", [128, 512])
+def test_amd_fa_cluster_short_causal_direct_load(N_CTX):
+    """The direct-load short path normalizes its online-softmax numerator."""
+    torch.manual_seed(42)
+    B, H, D = 1, 1, 128
+    q = torch.randn(B, H, N_CTX, D, device=DEVICE, dtype=torch.float16)
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+    sm = 1.0 / math.sqrt(D)
+    ref = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True, scale=sm)
+    config = {
+        "BLOCK_M": 128,
+        "BLOCK_N": 64,
+        "num_warps": 4,
+        "num_stages": 3,
+        "waves_per_eu": 0,
+        "USE_DIRECT_LOAD": True,
+        "enable_sched_group_barrier_scheduler": False,
+    }
+    out = _amd_fa_cluster(q, k, v, sm, True, config=config)
+    torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize("N_CTX", [128, 256, 512, 1024])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware (CDNA4)")
+def test_amd_fa_cluster_persistent_short_causal_lds_normalizes_once(N_CTX, dtype):
+    """The persistent BM128 LDS path does not renormalize its predicated diagonal."""
+    torch.manual_seed(42)
+    B, H, D = 1, 1, 128
+    q = torch.randn(B, H, N_CTX, D, device=DEVICE, dtype=dtype)
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+    sm = 1.0 / math.sqrt(D)
+    ref = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True, scale=sm)
+    config = {
+        "BLOCK_M": 128,
+        "BLOCK_N": 64,
+        "num_warps": 4,
+        "num_stages": 3,
+        "waves_per_eu": 0,
+        "USE_DIRECT_LOAD": False,
+        "NUM_SMS": 8,
+        "NUM_XCDS": 8,
+        "enable_sched_group_barrier_scheduler": False,
+    }
+    out = _amd_fa_cluster_persistent(q, k, v, sm, True, config=config)
+    torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware (CDNA4)")
+def test_amd_fa_cluster_causal_bm256_direct_load():
+    """The causal BM256 direct path keeps P-by-V in the MFMA accumulator layout."""
+    torch.manual_seed(42)
+    B, H, N_CTX, D = 1, 1, 256, 128
+    q = torch.randn(B, H, N_CTX, D, device=DEVICE, dtype=torch.float16)
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+    sm = 1.0 / math.sqrt(D)
+    ref = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True, scale=sm)
+    config = {
+        "BLOCK_M": 256,
+        "BLOCK_N": 64,
+        "num_warps": 8,
+        "num_stages": 3,
+        "waves_per_eu": 2,
+        "USE_DIRECT_LOAD": True,
+        "enable_sched_group_barrier_scheduler": False,
+    }
+    out = _amd_fa_cluster(q, k, v, sm, True, config=config)
+    torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware (CDNA4)")
+def test_amd_fa_cluster_n2048_four_slot_prefix_handoff(dtype):
+    """The BM256 prefix hands all four aligned diagonal tiles to the pruned tail."""
+    torch.manual_seed(42)
+    B, H, N_CTX, D = 1, 1, 2048, 128
+    q = torch.randn(B, H, N_CTX, D, device=DEVICE, dtype=dtype)
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+    sm = 1.0 / math.sqrt(D)
+    ref = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True, scale=sm)
+    config = {
+        "BLOCK_M": 256,
+        "BLOCK_N": 64,
+        "num_warps": 8,
+        "num_stages": 3,
+        "waves_per_eu": 2,
+        "USE_DIRECT_LOAD": False,
+        "enable_sched_group_barrier_scheduler": False,
+    }
+    out = _amd_fa_cluster(q, k, v, sm, True, config=config)
+    torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware (CDNA4)")
+def test_amd_fa_cluster_lazy_rescale(dtype):
+    """The Gluon-derived split lazy-softmax path is correct without scheduling plugins."""
+    torch.manual_seed(42)
+    B, H, N_CTX, D = 1, 1, 4096, 128
+    q = torch.randn(B, H, N_CTX, D, device=DEVICE, dtype=dtype)
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+    sm = 1.0 / math.sqrt(D)
+    ref = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True, scale=sm)
+    config = {
+        "BLOCK_M": 256,
+        "BLOCK_N": 64,
+        "num_warps": 8,
+        "num_stages": 3,
+        "waves_per_eu": 2,
+        "USE_DIRECT_LOAD": False,
+        "enable_tree_reduction": True,
+        "enable_sched_group_barrier_scheduler": False,
+    }
+    out = _amd_fa_cluster(q, k, v, sm, True, config=config)
+    torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
+
+
 @pytest.mark.parametrize("persistent", [False, True], ids=["direct", "persistent"])
 @pytest.mark.parametrize("causal", [False, True], ids=["nocausal", "causal"])
 @pytest.mark.parametrize("use_direct_load", [None, False, True], ids=["autotune", "lds", "direct-load"])
@@ -1804,6 +2030,43 @@ def test_amd_fa_cluster_block_n_boundaries(persistent, causal, use_direct_load, 
     if persistent:
         config.update({"NUM_SMS": 16, "NUM_XCDS": 4})
     out = kernel(q, k, v, sm, causal, config=config)
+    torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize(
+    "persistent,N_CTX,use_autotune",
+    [
+        (False, 257, False),
+        (True, 129, False),
+        (False, 129, True),
+    ],
+    ids=["direct-ragged", "persistent-ragged", "direct-autotune-ragged"],
+)
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware (CDNA4)")
+def test_amd_fa_cluster_d128_ragged_boundaries(persistent, N_CTX, use_autotune):
+    """Ragged D128 tiles retain the two-slot ring used by the general path."""
+    torch.manual_seed(42)
+    B, H, D = 1, 1, 128
+    q = torch.randn(B, H, N_CTX, D, device=DEVICE, dtype=torch.bfloat16)
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+    sm = 1.0 / math.sqrt(D)
+    ref = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True, scale=sm)
+    kernel = _amd_fa_cluster_persistent if persistent else _amd_fa_cluster
+    config = {}
+    if not use_autotune:
+        config.update({
+            "BLOCK_M": 256,
+            "BLOCK_N": 64,
+            "num_warps": 8,
+            "num_stages": 3,
+            "waves_per_eu": 2,
+            "USE_DIRECT_LOAD": False,
+            "enable_sched_group_barrier_scheduler": False,
+        })
+    if persistent:
+        config.update({"NUM_SMS": 16, "NUM_XCDS": 4})
+    out = kernel(q, k, v, sm, True, config=config)
     torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
 
 
@@ -2014,6 +2277,115 @@ def test_hstu_attention(batch_size, max_seq_len, sparsity, heads, attn_dim, hidd
     out = triton_attn() * max_seq_len
     out_ref = torch_attn() * max_seq_len
     torch.testing.assert_close(out, out_ref, atol=1e-3, rtol=0)
+
+
+# =============================================================================
+# AMD TLX ragged HSTU attention, forward + backward (gfx950)
+# =============================================================================
+
+
+def _load_tlx_gfx950_hstu():
+    """Import the gfx950 TLX HSTU kernel out of the hstu_self_attn directory.
+
+    That directory is a standalone multi-file port, not a package: its modules
+    import each other by bare name (``from stubs import ...``), so the directory
+    has to be on ``sys.path`` first. Same shim tritonbench uses.
+    """
+    import os
+    import sys
+
+    from triton.language.extra.tlx import tutorials as _tut
+
+    kernel_dir = os.path.join(list(_tut.__path__)[0], "hstu_self_attn")
+    if kernel_dir not in sys.path:
+        sys.path.insert(0, kernel_dir)
+    import tlx_gfx950_ragged_hstu_attention as _mod
+
+    return _mod
+
+
+# Silu heads only (num_softmax_heads=0), Dq=Dv=128 and targets present: the
+# preconditions every FA-schedule backward variant enforces.
+_TLX_GFX950_HSTU_VARIANTS = [
+    "default",
+    "kv_parallel_native_mfma_4wave",
+    "kv_parallel_fa_schedule",
+    "kv_parallel_fa_schedule_mask_peel",
+    "kv_parallel_fa_schedule_mask_peel_resident_k",
+    "kv_parallel_fa_schedule_mask_peel_resident_k_dr_resident",
+    "kv_parallel_fa_schedule_mask_peel_resident_k_dr_early_do_t",
+    "kv_parallel_fa_schedule_bn256_direct_qdo_g2l",
+]
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware (CDNA4)")
+@pytest.mark.parametrize("bwd_variant", _TLX_GFX950_HSTU_VARIANTS)
+@pytest.mark.parametrize("max_seq_len", [1024])
+def test_amd_tlx_gfx950_hstu_attention(max_seq_len, bwd_variant):
+    torch.cuda.empty_cache()  # Helps avoid hangs in large tests
+    hstu = _load_tlx_gfx950_hstu()
+
+    batch_size, heads, attn_dim, hidden_dim = 8, 4, 128, 128
+    target_size = 20
+    dtype = torch.bfloat16
+    device = torch.device("cuda")
+    alpha = 1.0 / attn_dim
+
+    torch.manual_seed(1001)
+    lengths = _hstu.generate_sparse_seq_len(size=batch_size, max_seq_len=max_seq_len, sparsity=0.95, device=device)
+    lengths = _hstu.apply_SL(lengths, 2.0, max_seq_len=max_seq_len)
+    num_targets = torch.randint(1, target_size + 1, (batch_size, ), device=device, dtype=lengths.dtype)
+    num_targets = torch.where(num_targets > lengths, lengths, num_targets)
+    seq_offsets = torch.zeros((batch_size + 1, ), dtype=torch.int64, device=device)
+    seq_offsets[1:] = torch.cumsum(lengths, dim=0)
+    L = int(seq_offsets[-1].item())
+
+    x = torch.empty((L, heads, attn_dim * 2 + hidden_dim), dtype=dtype, device=device).uniform_(-0.1, 0.1)
+    q, k, v = torch.split(x, [attn_dim, attn_dim, hidden_dim], dim=-1)
+    q, k, v = (t.detach().clone().requires_grad_() for t in (q, k, v))
+    q_ref, k_ref, v_ref = (t.detach().clone().requires_grad_() for t in (q, k, v))
+    dout = torch.randn_like(q)
+
+    # attn_scale=None -> the kernel folds 1/max_seq_len into the silu, matching
+    # the reference. Scale both sides back up so the comparison is not run at
+    # 1/max_seq_len magnitude.
+    out = hstu.tlx_gfx950_hstu_mha(
+        max_seq_len=max_seq_len,
+        alpha=alpha,
+        q=q,
+        k=k,
+        v=v,
+        seq_offsets=seq_offsets,
+        attn_scale=None,
+        num_targets=num_targets,
+        bwd_variant=bwd_variant,
+    )
+    out_ref = _hstu.torch_hstu_attention(
+        max_seq_len,
+        alpha,
+        q_ref,
+        k_ref,
+        v_ref,
+        seq_offsets,
+        causal=True,
+        dropout_pr=0.0,
+        training=False,
+        num_targets=num_targets,
+    )
+    torch.testing.assert_close(out * max_seq_len, out_ref * max_seq_len, atol=1e-3, rtol=0)
+
+    out.backward(dout)
+    out_ref.backward(dout)
+    # HSTU folds 1/max_seq_len into the activation, so the gradients themselves
+    # are O(1e-5) and a relative-L2 check is dominated by bf16 rounding of
+    # near-zero entries (the bf16 floor alone is ~1.7e-3, and the FA-schedule
+    # backwards land near 2e-2). Use the elementwise tolerance the upstream
+    # kernel is validated with instead: measured worst max-abs error here is
+    # 7e-8 for the ordinary-dot backward and 3.2e-6 for the FA schedules,
+    # against gradients whose max magnitude is 2.3e-5.
+    for name, got, ref in (("dq", q.grad, q_ref.grad), ("dk", k.grad, k_ref.grad), ("dv", v.grad, v_ref.grad)):
+        assert got is not None and ref is not None, name
+        torch.testing.assert_close(got, ref, atol=2e-5, rtol=1.6e-2, msg=lambda m: f"{bwd_variant} {name}: {m}")
 
 
 # =============================================================================

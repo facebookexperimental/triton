@@ -78,9 +78,9 @@ from .mma_ops import (
     dot_scaled,
     extract_slice,
     rematerialized_range,
-    release_layout,
     require_amd_wmma_layout,
     require_layout,
+    release_layout,
     tcgen05_commit,
 )
 from .types import (
@@ -98,6 +98,7 @@ from .types import (
     padded_shared_layout_encoding,
     shared_linear_layout_encoding,
     amd_mfma_layout,
+    slice_layout,
     dot_operand_layout,
     reuse_group,
     reuse_group_ir_type,
@@ -121,9 +122,11 @@ from .utility import (
     cluster_size_1d,
     dtype_of,
     get_fp8_format_name,
+    num_warps,
     size_of,
     stoch_round,
     thread_id,
+    warp_predicate,
 )
 from .mxfp8_utils import _to_mxfp8_block
 from .warp_ops import vote_ballot_sync, warp_all, warp_any, warp_redux
@@ -141,6 +144,7 @@ __all__ = [
     "padded_shared_layout_encoding",
     "shared_linear_layout_encoding",
     "amd_mfma_layout",
+    "slice_layout",
     "dot_operand_layout",
     "tensor_memory_layout_encoding",
     "TMemCTAMode",
@@ -231,11 +235,14 @@ __all__ = [
     "async_dot_scaled",
     "async_dot_wait",
     "require_layout",
+    "release_layout",
     "tcgen05_commit",
     # utility
     "cluster_cta_rank",
     "cluster_size_1d",
     "thread_id",
+    "num_warps",
+    "warp_predicate",
     "async_task_replica_id",
     "dtype_of",
     "get_fp8_format_name",

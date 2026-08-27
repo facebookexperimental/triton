@@ -240,7 +240,13 @@ def require_layout(
 
 @tl.builtin
 def release_layout(x, _semantic=None):
-    """Release a register tensor's explicit layout for a flexible consumer."""
+    """Release a register tensor's explicit layout for a flexible consumer.
+
+     The returned tensor has the same logical shape and element type as ``x``,
+     but downstream operations may choose their own layout.  Use this at a
+     helper or control-flow boundary when a source-scheduled fragment layout is
+     intentionally local to the preceding region.
+     """
     assert isinstance(x, tl.tensor) and x.type.is_block(), "x must be a distributed tensor"
     handle = _semantic.builder.create_release_layout(x.handle)
     return tl.tensor(handle, x.type)
