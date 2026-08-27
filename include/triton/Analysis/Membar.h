@@ -502,7 +502,9 @@ public:
       : moduleAllocation(moduleAllocation), filter(std::move(filter)),
         scratchSync(std::move(scratchSync)) {}
 
-  template <typename AnalysisT = MembarAnalysis> void run() {
+  void run();
+
+  template <typename AnalysisT> void run() {
     // Geometry and interval slices use the same completed allocation, including
     // backend scratch sizes and shared-memory partition offsets.
     auto solver = createDataFlowSolver();
