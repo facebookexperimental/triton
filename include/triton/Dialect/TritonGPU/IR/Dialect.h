@@ -78,6 +78,24 @@ int lookupThreadsPerWarp(OpBuilder &rewriter);
 int lookupNumCTAs(OpBuilder &rewriter);
 int lookupNumCTAs(Operation *op);
 
+// A cluster is requested either logically, through `num_ctas` (tensors are
+// distributed across the CTAs and one program spans them all), or physically,
+// through `ctas_per_cga` (each CTA is its own program and only explicit ops
+// cross between them). The two are mutually exclusive; `CUDAOptions` rejects
+// setting both.
+
+// True when the kernel runs on a physical `ctas_per_cga` cluster, i.e. the
+// `ttg.cluster-dim-*` product exceeds one. Note this asks which *model* is in
+// use; for the CTA count under either model, use `lookupPhysicalNumCTAs`.
+bool isPhysicalCluster(ModuleOp mod);
+bool isPhysicalCluster(Operation *op);
+
+// The number of CTAs actually in a cluster, whichever model requested it.
+// Equals `lookupNumCTAs` unless the kernel uses `ctas_per_cga`. `op` may be the
+// module itself.
+int lookupPhysicalNumCTAs(Operation *op);
+int lookupPhysicalNumCTAs(OpBuilder &rewriter);
+
 // Record/query whether the module contains exactly one `ttg.warp_specialize`
 // op via the `ttg.single-warp-specialize` module attribute. `hasSingle...`
 // returns false when the attribute is absent.

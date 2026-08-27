@@ -176,7 +176,7 @@ struct Insert2CTASync : public impl::NVGPUInsert2CTASyncBase<Insert2CTASync> {
   void runOnOperation() override {
     ModuleOp moduleOp = getOperation();
 
-    if (!ttng::is2CTA(moduleOp))
+    if (!ttg::isPhysicalCluster(moduleOp))
       return;
 
     // Skip TLX kernels — they manage their own cross-CTA sync via

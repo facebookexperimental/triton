@@ -182,7 +182,7 @@ struct Transform2CTALoads
   void runOnOperation() override {
     ModuleOp moduleOp = getOperation();
 
-    if (!ttng::is2CTA(moduleOp))
+    if (!ttg::isPhysicalCluster(moduleOp))
       return;
 
     // TLX kernels manage their own 2-CTA load splitting and synchronization.

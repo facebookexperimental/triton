@@ -539,16 +539,3 @@ void mlir::triton::tlx::setUserPostWsSyncOnMod(Operation *op, bool value) {
   module->setAttr(AttrUserPostWsSyncName,
                   BoolAttr::get(module->getContext(), value));
 }
-
-bool mlir::triton::tlx::tlxIsClustered(Operation *op) {
-  assert(op != nullptr && "expecting nonnull op for checking cluster dims");
-  auto moduleOp = getModuleOp(op);
-  assert(moduleOp != nullptr &&
-         "expecting op nested in a module for checking cluster dims");
-  const SmallVector<int> clusterDims =
-      triton::gpu::TritonGPUDialect::getClusterDims(moduleOp);
-  int clusterSize = 1;
-  for (int d : clusterDims)
-    clusterSize *= d;
-  return clusterSize > 1;
-}

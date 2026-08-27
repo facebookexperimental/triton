@@ -248,9 +248,8 @@ struct ConvertTritonGPUToLLVM
     if (failed(applyPartialConversion(mod, cfTarget, std::move(cfPatterns))))
       return signalPassFailure();
 
-    // Fold CTAId when there is only 1 CTA.
-    int numCTAs = triton::gpu::TritonGPUDialect::getNumCTAs(mod);
-    if (numCTAs == 1 && !tlx::tlxIsClustered(mod)) {
+    // Fold CTAId when there is only 1 CTA, under either cluster model.
+    if (triton::gpu::lookupPhysicalNumCTAs(mod) == 1) {
       mod.walk([](triton::nvgpu::ClusterCTAIdOp id) {
         OpBuilder b(id);
         Value zero = LLVM::createConstantI32(id->getLoc(), b, 0);
@@ -453,7 +452,7 @@ private:
   // If the kernel is clustered, insert cluster sync properly to
   // bootstrap remote bars or tmem
   LogicalResult maybeInsertClusterSync(ModuleOp &mod) {
-    if (!tlx::tlxIsClustered(mod)) {
+    if (!triton::gpu::isPhysicalCluster(mod)) {
       return success();
     }
 
