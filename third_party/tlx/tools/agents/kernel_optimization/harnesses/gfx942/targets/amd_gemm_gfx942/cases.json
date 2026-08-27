@@ -1,0 +1,28 @@
+[
+  {
+    "case_id": "square_4096",
+    "parameters": {
+      "m": 4096, "n": 4096, "k": 4096, "dtype": "float16", "seed": 0,
+      "pin_config": {
+        "BLOCK_M": 256, "BLOCK_N": 256, "BLOCK_K": 32,
+        "GROUP_M": 4, "NUM_BUFFERS": 2, "NUM_XCDS": 8,
+        "num_warps": 8
+      }
+    },
+    "weight": 2.0,
+    "protected": true
+  },
+  {
+    "case_id": "square_8192",
+    "parameters": {
+      "m": 8192, "n": 8192, "k": 8192, "dtype": "float16", "seed": 1,
+      "pin_config": {
+        "BLOCK_M": 256, "BLOCK_N": 256, "BLOCK_K": 32,
+        "GROUP_M": 8, "NUM_BUFFERS": 2, "NUM_XCDS": 8,
+        "num_warps": 8
+      }
+    },
+    "weight": 1.0,
+    "protected": true
+  }
+]

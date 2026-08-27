@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import tempfile
 from dataclasses import dataclass
@@ -10,6 +11,35 @@ from typing import Protocol
 from .models import KernelOptimizationRequest, PerformanceSummary
 from .profiling import compact_profile_summary
 from .source import validate_replacement_source
+
+# third_party/tlx/doc/kernel_opt/<arch>.md -- one human-curated file per
+# architecture. See that directory's README for the contract; the short version
+# is that a human writes it and the agent only ever reads it.
+_KNOWLEDGE_DIR = Path(
+    os.environ.get(
+        "TLX_KERNEL_OPT_KNOWLEDGE_DIR",
+        Path(__file__).resolve().parents[3] / "doc" / "kernel_opt",
+    ))
+
+# target.architecture as written in target.json -> knowledge file stem.
+_ARCH_TO_KNOWLEDGE = {
+    "gfx942": "gfx942",
+    "gfx950": "gfx950",
+    "mi300x": "gfx942",
+    "mi355x": "gfx950",
+}
+
+
+def knowledge_for(architecture: str) -> str | None:
+    """Curated prior for ``architecture``, or None when none has been written."""
+    stem = _ARCH_TO_KNOWLEDGE.get(architecture.strip().lower())
+    if stem is None:
+        return None
+    path = _KNOWLEDGE_DIR / f"{stem}.md"
+    if not path.is_file():
+        return None
+    return path.read_text()
+
 
 TLX_PROMPT_PREAMBLE = """You are optimizing one Triton or TLX kernel against an external deterministic harness.
 The candidate is a complete replacement source file. Preserve every public entry point,
@@ -66,11 +96,13 @@ class CandidateContext:
 
 
 class CandidateProvider(Protocol):
+
     def propose(
         self,
         request: KernelOptimizationRequest,
         context: CandidateContext,
-    ) -> CandidateProposal: ...
+    ) -> CandidateProposal:
+        ...
 
 
 @dataclass
@@ -222,12 +254,29 @@ def _build_prompt(
         if guidance
         else ""
     )
-    return f"""{TLX_PROMPT_PREAMBLE}{guidance_block}{reference_block}
+    # Appended to the generic preamble rather than replacing it: the preamble is
+    # arch-agnostic workflow, this is arch-specific fact. Its two sections are
+    # not equally trustworthy, so the prompt says which is which -- an untested
+    # hypothesis presented as measurement is worse than no prior at all.
+    knowledge = knowledge_for(request.target.architecture)
+    knowledge_block = (
+        f"\nHuman-curated knowledge base for {request.target.architecture}. Treat its\n"
+        "'measured on' section as established fact and its 'ported from' section as\n"
+        "untested hypotheses. Prefer an optimization it supports over one it does not,\n"
+        f"and say which entry you are acting on.\n\n{knowledge}\n"
+        if knowledge
+        else ""
+    )
+    return f"""{TLX_PROMPT_PREAMBLE}{knowledge_block}{guidance_block}{reference_block}
 You are proposing one candidate for the closed loop `build -> verify -> benchmark -> profile -> propose -> repeat`.
 Edit `candidate.py` directly. Do not return source or a diff, and do not claim correctness
 or performance; an external deterministic harness reads the file and decides both.
 Preserve the public entry points expected by the harness. Make one coherent optimization
 that can be diagnosed if it fails.
+
+Base your proposal on the profile data below, not on general intuition. State which
+measurement motivates the change; if the profile does not support any change you are
+confident in, say so and make the smallest well-motivated one.
 
 Target: backend={request.target.backend}, architecture={request.target.architecture}
 Round: {context.round_index}, candidate: {context.candidate_index}
