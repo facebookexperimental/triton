@@ -3,7 +3,23 @@ on:
   push:
     branches:
       - main
+    paths-ignore:
+      - 'third_party/amd/**'
+      - 'third_party/tlx/tutorials/blackwell-*/**'
+      - 'third_party/tlx/tutorials/blackwell-*'
+      - 'third_party/tlx/tutorials/testing/test_correctness_autows.py'
+      - 'third_party/tlx/tutorials/gfx9_gemm/**'
+      - 'third_party/amd/python/test/**'
+      - 'python/test/unit/language/test_tlx_amd.py'
   pull_request:
+    paths-ignore:
+      - 'third_party/amd/**'
+      - 'third_party/tlx/tutorials/blackwell-*/**'
+      - 'third_party/tlx/tutorials/blackwell-*'
+      - 'third_party/tlx/tutorials/testing/test_correctness_autows.py'
+      - 'third_party/tlx/tutorials/gfx9_gemm/**'
+      - 'third_party/amd/python/test/**'
+      - 'python/test/unit/language/test_tlx_amd.py'
   schedule:
     # Every 6 hours at :30 past (00:30, 06:30, 12:30, 18:30 UTC).
     - cron: '30 */6 * * *'
