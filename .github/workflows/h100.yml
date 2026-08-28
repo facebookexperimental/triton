@@ -121,7 +121,7 @@ jobs:
           python -c 'from torchao.prototype.mx_formats.mx_tensor import MXTensor, ScaleCalculationMode'
       - name: Run TLX unit tests
         id: run_unit_tests
-        timeout-minutes: 10
+        timeout-minutes: 5
         run: |
           . "${SETUP_SCRIPT}"
           # TLX-only: the test_tlx_*.py glob covers manual TLX (tlx.async_tasks)
@@ -131,13 +131,13 @@ jobs:
           python -m pytest python/test/unit/language/test_tlx_*.py -v --junitxml=/tmp/tlx-unit.xml
       - name: Run TLX tutorial correctness tests
         id: run_correctness_tests
-        timeout-minutes: 20
+        timeout-minutes: 15
         run: |
           . "${SETUP_SCRIPT}"
           python -m pytest third_party/tlx/tutorials/testing/test_correctness.py -v --junitxml=/tmp/tlx-correctness.xml
       - name: Run runtime unit tests
         id: run_runtime_tests
-        timeout-minutes: 10
+        timeout-minutes: 5
         run: |
           . "${SETUP_SCRIPT}"
           python -m pytest python/test/unit/runtime/test_fast_cache_edge_cases.py python/test/unit/runtime/test_tensordesc_cache.py python/test/unit/runtime/test_triton_dispatcher_factory.py -v --junitxml=/tmp/runtime-unit.xml
@@ -243,5 +243,5 @@ jobs:
       run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}-${{ github.event_name == 'workflow_dispatch' }}
+  group: ${{ github.workflow }}-${{ github.job }}-${{ github.event.pull_request.number || github.sha }}-${{ github.event_name == 'workflow_dispatch' }}
   cancel-in-progress: true
