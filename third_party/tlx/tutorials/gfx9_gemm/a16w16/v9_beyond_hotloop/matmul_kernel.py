@@ -24,6 +24,37 @@ import triton.language.extra.tlx as tlx
 os.environ.setdefault("TRITON_DISABLE_POST_MISCHED", "1")
 
 
+def _swz_offset_bases(shape, contig_dim):
+    """Build the bank-conflict-free operand-tile LDS bit permutation."""
+
+    def basis(dim, i):
+        return [1 << i, 0] if dim == 0 else [0, 1 << i]
+
+    free_dim = 1 - contig_dim
+    contig_bits = int(shape[contig_dim]).bit_length() - 1
+    free_bits = int(shape[free_dim]).bit_length() - 1
+    contig = [basis(contig_dim, i) for i in range(contig_bits)]
+    free = ([basis(free_dim, i) for i in range(4, free_bits)] +
+            [basis(free_dim, i) for i in range(min(4, free_bits))])
+    return contig + free
+
+
+_A_LDS_BASES = tl.constexpr(_swz_offset_bases([256, 64], 1))
+_B_LDS_BASES = tl.constexpr(_swz_offset_bases([64, 128], 0))
+_C_STORE_SIMD_LAYOUT = tlx.layout(
+    shape=((16, 4, 8), (8, 8)),
+    stride=((8, 128, 512), (1, 4096)),
+)
+
+# Linear form of the native [256, 128] gfx950 MFMA accumulator distribution
+# for warpsPerCTA=[4, 2]. Pinning this before f32->f16 prevents the coalesced
+# store requirement from propagating backward and redistributing f32 values.
+_ACCUMULATOR_LAYOUT = tlx.layout(
+    shape=((16, 4, 2, 4), (4, 4, 4)),
+    stride=((128, 4, 16, 2048), (1, 32, 8192)),
+)
+
+
 @triton.jit
 def v9_beyond_hotloop(
     a_ptr,
@@ -80,11 +111,16 @@ def v9_beyond_hotloop(
 
     HALF_N: tl.constexpr = BLOCK_N // 2
 
-    # The bank-conflict-avoiding padded shared layout (shown explicitly in v3)
-    # is now inferred by the compiler from how these buffers feed tl.dot.
-    smem_a = tlx.local_alloc((BLOCK_M, BLOCK_K), tl.float16, 2)
-    smem_b_left = tlx.local_alloc((BLOCK_K, HALF_N), tl.float16, 2)
-    smem_b_right = tlx.local_alloc((BLOCK_K, HALF_N), tl.float16, 2)
+    # Pin the padded-shared offset bases instead of relying on layout inference.
+    # The explicit row/column bit permutation avoids LDS bank conflicts and keeps
+    # the direct-to-LDS buffer loads coalesced for the fixed 256x256x64 tile.
+    a_shared: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases(
+        [(512, 16)], _A_LDS_BASES, [BLOCK_M, BLOCK_K])
+    b_shared: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases(
+        [(512, 16)], _B_LDS_BASES, [BLOCK_K, HALF_N])
+    smem_a = tlx.local_alloc((BLOCK_M, BLOCK_K), tl.float16, 2, layout=a_shared)
+    smem_b_left = tlx.local_alloc((BLOCK_K, HALF_N), tl.float16, 2, layout=b_shared)
+    smem_b_right = tlx.local_alloc((BLOCK_K, HALF_N), tl.float16, 2, layout=b_shared)
 
     offs_am = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_bn = pid_n * BLOCK_N + tl.arange(0, HALF_N)
@@ -189,25 +225,31 @@ def v9_beyond_hotloop(
     acc_left = tl.dot(a, b_left, acc_left)
     b_right = tlx.local_load(smem_b_right[1], relaxed=True)
 
-    # Store left half
-    c_left = acc_left.to(tl.float16)
     offs_cm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_cn_left = pid_n * BLOCK_N + tl.arange(0, HALF_N)
+    offs_cn_right = offs_cn_left + HALF_N
+
+    # Store left half. Keep the regular-K epilogue ordering unchanged so its
+    # generated hot path remains identical to the tuned version.
+    store_layout: tl.constexpr = _C_STORE_SIMD_LAYOUT
+    acc_layout: tl.constexpr = _ACCUMULATOR_LAYOUT
+    acc_left = tlx.require_layout(acc_left, acc_layout)
+    c_left = tlx.require_layout(acc_left.to(tl.float16), store_layout)
+    tlx.assert_same_layout(c_left, store_layout)
     c_left_ptrs = (c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn_left[None, :])
     tl.store(c_left_ptrs, c_left, mask=(offs_cm[:, None] < M) & (offs_cn_left[None, :] < N))
 
     acc_right = tl.dot(a, b_right, acc_right)
 
     # Store right half
-    c_right = acc_right.to(tl.float16)
-    offs_cn_right = pid_n * BLOCK_N + HALF_N + tl.arange(0, HALF_N)
+    acc_right = tlx.require_layout(acc_right, acc_layout)
+    c_right = tlx.require_layout(acc_right.to(tl.float16), store_layout)
     c_right_ptrs = (c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn_right[None, :])
     tl.store(
         c_right_ptrs,
         c_right,
         mask=(offs_cm[:, None] < M) & (offs_cn_right[None, :] < N),
     )
-
 
 def matmul(a, b):
     assert a.shape[1] == b.shape[0], "Incompatible dimensions"
@@ -240,5 +282,6 @@ def matmul(a, b):
         num_warps=8,
         num_stages=1,
         matrix_instr_nonkdim=16,
+        llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"),),
     )
     return c
