@@ -67,6 +67,15 @@ CATALOG: tuple[OpSpec, ...] = (
         dtypes=_FP16,
         requires=frozenset({"tma", "tmem"}),
     ),
+    OpSpec(
+        op="kimi_delta_attention",
+        arch="sm100",
+        variant="ws",
+        impl="kernels.kda.sm100:kimi_delta_attention",
+        dtypes=_FP16,
+        accepts=lambda d: d.get("HEAD_DIM") == 128,
+        requires=frozenset({"tma", "tmem"}),
+    ),
 )
 
 _BY_KEY = {(s.op, s.arch): s for s in CATALOG}
