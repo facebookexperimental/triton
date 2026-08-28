@@ -439,7 +439,7 @@ protected:
                     MembarInfo *membarInfo, OpBuilder *builder,
                     bool cluster = false);
   virtual void insertBarrier(Operation *operation, OpBuilder *builder,
-                               bool cluster = false);
+                             bool cluster = false);
   virtual triton::BarrierStages getBarrierStages(Operation *operation);
 
   Allocation &allocation;
@@ -451,7 +451,7 @@ private:
   // Materialize only the final decisions, after CFG analysis has converged.
   llvm::SmallPtrSet<Operation *, 16> scratchSyncOps;
   SmallVector<AllocationSlice> getAllocationSlices(Value value,
-                                                     Value stageBasis = {});
+                                                   Value stageBasis = {});
 
   MembarSliceFilterFn sliceFilter;
   AccessMode accessMode;

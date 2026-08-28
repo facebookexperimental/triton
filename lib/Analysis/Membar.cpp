@@ -965,9 +965,10 @@ void MembarAnalysis::updateMemoryEffects(Operation *op, MembarInfo *membarInfo,
       if (!isa<triton::gpu::SharedMemorySpaceAttr>(memory.getMemorySpace()))
         continue;
       // Shared effects cover only descriptor elements, including gather/scatter
-      // and async copies. Footprints retain padding, partitions and CTA identity.
+      // and async copies. Footprints retain padding, partitions and CTA
+      // identity.
       for (const AllocationSlice &slice :
-               getAllocationSlices(value, getStageBasis(op))) {
+           getAllocationSlices(value, getStageBasis(op))) {
         if (access.isWrite)
           curBlockInfo.syncWriteSlices[slice].insert(op);
         if (access.isRead)

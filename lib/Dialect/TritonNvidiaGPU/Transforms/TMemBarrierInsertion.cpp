@@ -539,8 +539,10 @@ struct TMemBarrierInsertionPass
     ModuleOp mod = getOperation();
     if (!mod.walk([](Operation *op) {
               return getTMemAccessKind(op) == TMemAccessKind::None
-                         ? WalkResult::advance() : WalkResult::interrupt();
-            }).wasInterrupted())
+                         ? WalkResult::advance()
+                         : WalkResult::interrupt();
+            })
+             .wasInterrupted())
       return;
     TMemAccessCache cache;
     MembarFilterFn filter = [&](Operation *lhs, Operation *rhs, bool lhsIsRead,
