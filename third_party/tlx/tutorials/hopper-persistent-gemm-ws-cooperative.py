@@ -1,6 +1,7 @@
 from typing import Optional
 
 import pytest
+from triton._internal_testing import is_cuda
 import torch
 
 import triton
@@ -8,6 +9,8 @@ import triton.language as tl
 import triton.language.extra.tlx as tlx
 from triton.tools.tensor_descriptor import TensorDescriptor
 
+
+pytestmark = pytest.mark.skipif(not is_cuda(), reason="Requires CUDA backend")
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
 M, N, K = (2176, 2176, 2176)

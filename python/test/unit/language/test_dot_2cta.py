@@ -7,6 +7,8 @@ import triton.language as tl
 from triton._internal_testing import is_blackwell
 from triton.tools.tensor_descriptor import TensorDescriptor
 
+pytestmark = pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell (sm100)")
+
 
 @triton.jit
 def _tl_dot_2cta_data_partition_kernel(
@@ -104,7 +106,6 @@ def _tl_dot_2cta_sliced_dependent_chain_ws_kernel(q_ptr, k_ptr, v_ptr, o_ptr):
 
 
 @pytest.mark.parametrize("DATA_PARTITION_FACTOR", [2])
-@pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell")
 def test_tl_dot_2cta_data_partition(DATA_PARTITION_FACTOR, device):
     torch.manual_seed(0)
     dtype = torch.bfloat16
@@ -211,7 +212,6 @@ def _tl_dot_2cta_persistent_meta_ws_kernel(
 
 @pytest.mark.parametrize("DATA_PARTITION_FACTOR", [1, 2])
 @pytest.mark.parametrize("m", [512, 384])
-@pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell")
 def test_tl_dot_2cta_persistent_meta_ws(DATA_PARTITION_FACTOR, m, device):
     """2-CTA under a persistent meta-WS loop, the convention production kernels use.
 
@@ -277,9 +277,6 @@ def test_tl_dot_2cta_persistent_meta_ws(DATA_PARTITION_FACTOR, m, device):
     ttgir = kernel.asm["ttgir"]
     assert "ttg.warp_specialize" in ttgir
     assert "two_ctas" in ttgir
-
-
-@pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell")
 def test_tl_dot_2cta_sliced_dependent_chain(device):
     torch.manual_seed(0)
     q = torch.randn((256, 128), device=device, dtype=torch.bfloat16)
@@ -308,9 +305,6 @@ def test_tl_dot_2cta_sliced_dependent_chain(device):
     ttgir = compiled.asm["ttgir"]
     assert ttgir.count('ttng.two_cta_dependency = "collective_contraction"') == 2
     assert 'ttng.two_cta_dependency = "requires_peer_gather"' not in ttgir
-
-
-@pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell")
 def test_tl_dot_2cta_sliced_dependent_chain_ws(device):
     torch.manual_seed(0)
     q = torch.randn((256, 128), device=device, dtype=torch.bfloat16)

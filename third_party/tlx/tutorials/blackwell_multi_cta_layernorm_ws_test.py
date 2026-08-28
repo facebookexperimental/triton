@@ -67,6 +67,8 @@ import triton.language.extra.tlx as tlx
 from torch._inductor.runtime.triton_compat import libdevice
 from triton._internal_testing import is_blackwell
 
+
+pytestmark = pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell (sm100)")
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
 NUM_SMS = (torch.cuda.get_device_properties(0).multi_processor_count if torch.cuda.is_available() else 0)
 
@@ -359,9 +361,6 @@ def _torch_layernorm_impl(x, weight, bias, eps=1e-5):
 
 
 torch_layernorm = torch.compile(_torch_layernorm_impl)
-
-
-@pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell GPU for multi-CTA support")
 @pytest.mark.parametrize("M,N", [(4, 16384), (1152, 16384), (1024, 16384), (1024, 32768)])
 @pytest.mark.parametrize("dtype", [torch.float16])
 def test_op(M, N, dtype):

@@ -38,6 +38,9 @@ import triton.language as tl
 from triton.language.extra.tlx.tutorials.blackwell_gemm_2cta import (
     tcgen5_dot_kernel2cta_tma as _tlx_2cta_kernel, )
 from triton.tools.tensor_descriptor import TensorDescriptor
+from triton._internal_testing import is_blackwell
+
+pytestmark = pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell (sm100)")
 
 
 def alloc_fn(size: int, align: int, stream: int | None):
