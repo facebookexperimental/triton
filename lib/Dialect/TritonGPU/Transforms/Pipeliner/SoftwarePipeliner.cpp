@@ -174,22 +174,25 @@ static void expandLoops(ModuleOp moduleOp) {
     loops.push_back(forOp);
   });
   auto metaWS = triton::tools::getBoolEnv("TRITON_USE_META_WS");
-
+  // The partition-type filter below exists to prune the loops that the extra
+  // ScheduleLoops re-run re-staged. That re-run only happens on the 2-CTA path
+  // (see CUDABackend.make_ttgir). On the 1-CTA path every partition loop still
+  // carries its own valid post-WS schedule, so filtering there drops the
+  // epilogue / epilogue_store loops and miscompiles the kernel.
   for (scf::ForOp forOp : loops) {
-    std::optional<StringRef> partitionType;
-    if (metaWS) {
-      if (forOp->getParentOfType<triton::gpu::WarpSpecializeOp>()) {
-        partitionType = getWarpSpecializedPartitionType(forOp);
-        if (!partitionType)
+    if (metaWS && triton::gpu::isPhysicalCluster(forOp) &&
+        forOp->getParentOfType<triton::gpu::WarpSpecializeOp>()) {
+      std::optional<StringRef> partitionType =
+          getWarpSpecializedPartitionType(forOp);
+      if (!partitionType)
+        continue;
+      if (*partitionType == "gemm") {
+        if (!containsMMA(forOp))
           continue;
-        if (*partitionType == "gemm") {
-          if (!containsMMA(forOp))
-            continue;
-        } else if (*partitionType != "load") {
-          // Load-worker loops carry their own software-pipeline schedule and
-          // must be expanded to materialize the TMA prologue.
-          continue;
-        }
+      } else if (*partitionType != "load") {
+        // Load-worker loops carry their own software-pipeline schedule and
+        // must be expanded to materialize the TMA prologue.
+        continue;
       }
     }
     CoarseSchedule schedule;
