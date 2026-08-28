@@ -39,6 +39,14 @@ _CACHE_STATS_ON = os.environ.get("TRITON_CACHE_STATS", "0") == "1"
 _CACHE_STATS_PY: dict = {}  # kernel name -> {event: count}
 
 
+def _active_target_supports_triton_dispatcher() -> bool:
+    try:
+        target = driver.active.get_current_target()
+    except Exception:
+        return False
+    return getattr(target, "backend", None) == "cuda"
+
+
 def _cache_stats_record(name: str, event: str) -> None:
     # Callers must guard with `if _CACHE_STATS_ON`.
     k = _CACHE_STATS_PY.get(name)
@@ -509,7 +517,7 @@ class KernelInterface(Generic[T]):
         # hook — so those still fire (mirrors the run() c_cache fast-path guard).
         if native_create_jit_proxy is not None and getattr(self, 'c_cache', False) \
                 and knobs.nvidia.use_triton_dispatcher \
-                and getattr(driver.active, "is_cpu_backend", False) is not True \
+                and _active_target_supports_triton_dispatcher() \
                 and not self.used_global_vals \
                 and not self.pre_run_hooks and not self.launch_metadata \
                 and not knobs.runtime.launch_enter_hook and not knobs.runtime.launch_exit_hook \
@@ -1051,7 +1059,7 @@ class JITFunction(JITCallable, KernelInterface[T]):
                         if not getattr(kernel, '_dispatcher', None):
                             if _CACHE_STATS_ON:
                                 _cache_stats_record(self._fn_name, "run_fast_py_fallback")
-                            if knobs.nvidia.use_triton_dispatcher:
+                            if knobs.nvidia.use_triton_dispatcher and _active_target_supports_triton_dispatcher():
                                 warnings.warn(
                                     f"[Triton] TRITON_USE_C_DISPATCHER=1 but kernel '{self._fn_name}' has no C "
                                     f"dispatcher, falling back to Python launch",
@@ -1209,7 +1217,8 @@ class JITFunction(JITCallable, KernelInterface[T]):
             else:
                 if _CACHE_STATS_ON:
                     _cache_stats_record(self._fn_name, "run_slow_py_fallback")
-                if knobs.nvidia.use_triton_dispatcher and _disp is None and not is_cpu_backend:
+                if (knobs.nvidia.use_triton_dispatcher and _disp is None
+                        and _active_target_supports_triton_dispatcher()):
                     warnings.warn(
                         f"[Triton] TRITON_USE_C_DISPATCHER=1 but kernel '{self._fn_name}' has no C dispatcher, "
                         f"falling back to Python launch",
