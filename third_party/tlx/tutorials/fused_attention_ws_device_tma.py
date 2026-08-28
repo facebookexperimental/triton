@@ -11,7 +11,6 @@ import triton.language as tl
 from triton.language.extra.cuda.inline_ptx_lib import (
     _fma_f32x2,
     _mul_f32x2,
-    _reduce_fadd2,
     _sub_f32x2,
 )
 from triton.language.extra.subtile_ops import _split_n_2D
@@ -98,7 +97,7 @@ def _attn_fwd_subtile(
     offs_n,
     qk_scale,
     l_i0,
-    l_i1,  # used when FADD2_REDUCE is true
+    l_i1,  # retained for the shared forward-loop interface
     m_i,
     acc,
     v0,
@@ -156,8 +155,18 @@ def _attn_fwd_subtile(
             qk = qk * qk_scale - m_ij[:, None]
         alpha = tl.math.exp2(m_i - m_ij)
 
-    p = tl.math.exp2(qk)
-    if not FADD2_REDUCE:
+    if FADD2_REDUCE:
+        tl.static_assert(MMA_SLICES == 2)
+        # Compute P at the same 64-column granularity consumed by the two PV
+        # MMAs, and combine the independent row sums afterwards.
+        qks = _split_n_2D(qk, MMA_SLICES)
+        p0 = tl.math.exp2(qks[0])
+        l_ij0 = tl.sum(p0, 1)
+        p1 = tl.math.exp2(qks[1])
+        l_ij1 = tl.sum(p1, 1)
+        l_ij = l_ij0 + l_ij1
+    else:
+        p = tl.math.exp2(qk)
         l_ij = tl.sum(p, 1)
 
     # -- update output accumulator --
@@ -178,21 +187,17 @@ def _attn_fwd_subtile(
     else:
         acc = _rescale_accumulator(acc, alpha, SUBTILING, VECT_MUL)
 
-    PM: tl.constexpr = p.shape[0]
-    PN: tl.constexpr = p.shape[1]
-    if FADD2_REDUCE:
-        p0, p1 = p.reshape([PM, 2, PN // 2]).permute(0, 2, 1).split()
-        l_ij0, l_ij1 = tl.reduce((p0, p1), axis=1, combine_fn=_reduce_fadd2)
-        l_i0 = l_i0 * alpha + l_ij0
-        l_i1 = l_i1 * alpha + l_ij1
-
     # prepare p and v for the dot
-    p = p.to(dtype)
     # note that this non transposed v for FP8 is only supported on Blackwell
     if MMA_SLICES == 1:
+        p = p.to(dtype)
         acc = tl.dot(p, v0, acc, two_ctas=TWO_CTAS)
     else:
-        ps = _split_n_2D(p, MMA_SLICES)
+        if FADD2_REDUCE:
+            ps = (p0.to(dtype), p1.to(dtype))
+        else:
+            p = p.to(dtype)
+            ps = _split_n_2D(p, MMA_SLICES)
         acc = tl.dot(
             ps[0],
             v0,
@@ -221,8 +226,7 @@ def _attn_fwd_subtile(
         )
     # update m_i and l_i
     # place this at the end of the loop to reduce register pressure
-    if not FADD2_REDUCE:
-        l_i0 = l_i0 * alpha + l_ij
+    l_i0 = l_i0 * alpha + l_ij
     m_i = m_ij
 
     return l_i0, l_i1, m_i, acc
@@ -396,6 +400,7 @@ configs = [
         pre_hook=_host_descriptor_pre_hook,
         ctas_per_cga=(2, 1, 1),
         allowDependentTwoCTA=True,
+        enable_tree_reduction=True,
     )
 ]
 
@@ -493,10 +498,7 @@ def _attn_fwd_tma_dp(
 
     q0 = desc_q.load([qo_offset_y, 0])
 
-    if FADD2_REDUCE:
-        l_i0_1 = tl.zeros([BLOCK_M // 2], dtype=tl.float32)
-    else:
-        l_i0_1 = 0
+    l_i0_1 = 0
 
     acc0, l_i0_0, l_i0_1, m_i0 = _attn_fwd_inner_oss_dp(
         acc0,
@@ -528,10 +530,7 @@ def _attn_fwd_tma_dp(
         RESCALE_OPT,
     )
 
-    if FADD2_REDUCE:
-        l_i0 = l_i0_0 + l_i0_1
-    else:
-        l_i0 = l_i0_0
+    l_i0 = l_i0_0
 
     if RESCALE_OPT:
         m_i0 *= qk_scale
