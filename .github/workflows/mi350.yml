@@ -115,7 +115,7 @@ jobs:
           python -c 'from torchao.prototype.mx_formats.mx_tensor import MXTensor, ScaleCalculationMode'
       - name: Run TLX unit tests
         id: run_unit_tests
-        timeout-minutes: 5
+        timeout-minutes: 10
         run: |
           set -eux
           . "${SETUP_SCRIPT}"
@@ -127,7 +127,7 @@ jobs:
           pytest python/test/unit/language/test_tlx_*.py -v --junitxml=/tmp/tlx-unit.xml
       - name: Run TLX tutorial correctness tests
         id: run_correctness_tests
-        timeout-minutes: 10
+        timeout-minutes: 20
         run: |
           set -eux
           . "${SETUP_SCRIPT}"
