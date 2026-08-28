@@ -2547,26 +2547,33 @@ def test_amd_mxfp_gemm_tdm_pipelined(TRANSPOSE_B):
 # =============================================================================
 
 
-# The addmm launcher's default `path=None` times its candidate paths against
-# each other with `do_bench` and keeps the winner. Correctness tests pin the
-# path instead, for two reasons: the timing race costs more wall clock than the
-# assertion it guards, and it admits a candidate only once that candidate
-# already agrees with `register` -- so a wrong `inter_wave` would be dropped
-# from the race and the suite would still pass. Iterating `available_paths`
-# asserts every path a shape can take against torch, independently.
-def _check_addmm_all_paths(bias, a, b, dtype=torch.float16):
+# The addmm launcher exposes only paths that are valid default choices. Debug
+# paths can still be pinned explicitly, but they are intentionally excluded from
+# this exact-equality check until they match the canonical result bitwise.
+def _check_addmm_all_paths(bias, a, b):
     ref = torch.addmm(bias, a, b)
     config = Gemm.CONFIGS["amd_standalone_addmm_register"]
     for path in _amd_addmm_paths(bias, a, b):
         out = _amd_addmm(bias, a, b, path=path, config=config)
-        torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2, msg=lambda m, path=path: f"path={path}\n{m}")
+        assert torch.equal(out, ref), f"path={path}"
+
+
+def _check_addmm_default_matches_register_exact(bias, a, b):
+    config = Gemm.CONFIGS["amd_standalone_addmm_register"]
+    expected = _amd_addmm(bias, a, b, path="register", config=config)
+    actual = _amd_addmm(bias, a, b, config=config)
+    assert torch.equal(actual, expected)
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
-@pytest.mark.parametrize("bias_2d,split_k", [(False, 1), (True, 2)], ids=["1d-direct", "2d-split-k"])
+@pytest.mark.parametrize(
+    "bias_2d,split_k,N",
+    [(False, 1, 256), (True, 2, 256), (False, 1, 384)],
+    ids=["1d-direct", "2d-split-k", "1d-direct-n-tail"],
+)
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware (CDNA4)")
-def test_amd_standalone_addmm(dtype, bias_2d, split_k):
-    M, N, K = 256, 256, 2048
+def test_amd_standalone_addmm(dtype, bias_2d, split_k, N):
+    M, K = 256, 2048
     torch.manual_seed(0)
     a = (torch.randn(M, K, device=DEVICE, dtype=dtype) + 1) / K
     b = ((torch.randn(N, K, device=DEVICE, dtype=dtype) + 1) / K).T
@@ -2579,7 +2586,8 @@ def test_amd_standalone_addmm(dtype, bias_2d, split_k):
         out = _amd_addmm(bias, a, b, SPLIT_K=split_k)
         torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
     else:
-        _check_addmm_all_paths(bias, a, b, dtype=dtype)
+        _check_addmm_all_paths(bias, a, b)
+        _check_addmm_default_matches_register_exact(bias, a, b)
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])

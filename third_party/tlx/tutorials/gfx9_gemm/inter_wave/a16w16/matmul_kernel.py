@@ -696,6 +696,12 @@ def a16w16_8wave(
         a_bot_off = tlx.require_layout(a_bot_off, _A_OFFSET_LAYOUT_256)
         b_left_off = tlx.require_layout(b_left_off, _B_OFFSET_LAYOUT_256)
         b_right_off = tlx.require_layout(b_right_off, _B_OFFSET_LAYOUT_256)
+    a_k_mask = offs_k[None, :] < BLOCK_K
+    a_top_mask = (offs_am[:, None] < M) & a_k_mask
+    a_bot_mask = ((offs_am[:, None] + HALF_M) < M) & a_k_mask
+    b_k_mask = offs_k[:, None] < BLOCK_K
+    b_left_mask = b_k_mask & (offs_bn[None, :] < N)
+    b_right_mask = b_k_mask & ((offs_bn[None, :] + HALF_N) < N)
 
     # Keep this pipeline inline: its K-contiguous B producer layout is inferred
     # together with the bank-conflict-free LDS layout. Moving it through a JIT
@@ -721,22 +727,22 @@ def a16w16_8wave(
     n_full = KS // BLOCK_K
     n_pipe = (n_full // 2) * 2
 
-    tlx.buffer_load_to_local(smem_b_left[0], b_ptr, b_left_off + kb)
+    tlx.async_load(b_ptr + b_left_off + kb, smem_b_left[0], mask=b_left_mask, other=0.0)
     tlx.async_load_commit_group()
-    tlx.buffer_load_to_local(smem_a_top[0], a_ptr, a_top_off + ka)
+    tlx.async_load(a_ptr + a_top_off + ka, smem_a_top[0], mask=a_top_mask, other=0.0)
     tlx.async_load_commit_group()
-    tlx.buffer_load_to_local(smem_a_bot[0], a_ptr, a_bot_off + ka)
+    tlx.async_load(a_ptr + a_bot_off + ka, smem_a_bot[0], mask=a_bot_mask, other=0.0)
     tlx.async_load_commit_group()
-    tlx.buffer_load_to_local(smem_b_right[0], b_ptr, b_right_off + kb)
+    tlx.async_load(b_ptr + b_right_off + kb, smem_b_right[0], mask=b_right_mask, other=0.0)
     tlx.async_load_commit_group()
 
-    tlx.buffer_load_to_local(smem_b_left[1], b_ptr, b_left_off_n + kb)
+    tlx.async_load(b_ptr + b_left_off_n + kb, smem_b_left[1], mask=b_left_mask, other=0.0)
     tlx.async_load_commit_group()
-    tlx.buffer_load_to_local(smem_a_top[1], a_ptr, a_top_off_n + ka)
+    tlx.async_load(a_ptr + a_top_off_n + ka, smem_a_top[1], mask=a_top_mask, other=0.0)
     tlx.async_load_commit_group()
-    tlx.buffer_load_to_local(smem_a_bot[1], a_ptr, a_bot_off_n + ka)
+    tlx.async_load(a_ptr + a_bot_off_n + ka, smem_a_bot[1], mask=a_bot_mask, other=0.0)
     tlx.async_load_commit_group()
-    tlx.buffer_load_to_local(smem_b_right[1], b_ptr, b_right_off_n + kb)
+    tlx.async_load(b_ptr + b_right_off_n + kb, smem_b_right[1], mask=b_right_mask, other=0.0)
     tlx.async_load_commit_group()
 
     ka += BLOCK_K * stride_ak * 2
@@ -752,7 +758,7 @@ def a16w16_8wave(
             acc_tl = tl.dot(a_top, b_left, acc_tl)
         with tlx.warp_pipeline_stage("mem", priority=1):
             a_bot = tlx.local_load(smem_a_bot[0], relaxed=True)
-            tlx.buffer_load_to_local(smem_b_left[0], b_ptr, b_left_off + kb)
+            tlx.async_load(b_ptr + b_left_off + kb, smem_b_left[0], mask=b_left_mask, other=0.0)
             tlx.async_load_commit_group()
 
         tlx.async_load_wait_group(5)
@@ -760,7 +766,7 @@ def a16w16_8wave(
             acc_bl = tl.dot(a_bot, b_left, acc_bl)
         with tlx.warp_pipeline_stage("mem", priority=1):
             b_right = tlx.local_load(smem_b_right[0], relaxed=True)
-            tlx.buffer_load_to_local(smem_a_top[0], a_ptr, a_top_off + ka)
+            tlx.async_load(a_ptr + a_top_off + ka, smem_a_top[0], mask=a_top_mask, other=0.0)
             tlx.async_load_commit_group()
 
         tlx.async_load_wait_group(5)
@@ -768,7 +774,7 @@ def a16w16_8wave(
             acc_tr = tl.dot(a_top, b_right, acc_tr)
         with tlx.warp_pipeline_stage("mem", priority=1):
             b_left = tlx.local_load(smem_b_left[1], relaxed=True)
-            tlx.buffer_load_to_local(smem_a_bot[0], a_ptr, a_bot_off + ka)
+            tlx.async_load(a_ptr + a_bot_off + ka, smem_a_bot[0], mask=a_bot_mask, other=0.0)
             tlx.async_load_commit_group()
 
         tlx.async_load_wait_group(5)
@@ -776,7 +782,7 @@ def a16w16_8wave(
             acc_br = tl.dot(a_bot, b_right, acc_br)
         with tlx.warp_pipeline_stage("mem", priority=1):
             a_top = tlx.local_load(smem_a_top[1], relaxed=True)
-            tlx.buffer_load_to_local(smem_b_right[0], b_ptr, b_right_off + kb)
+            tlx.async_load(b_ptr + b_right_off + kb, smem_b_right[0], mask=b_right_mask, other=0.0)
             tlx.async_load_commit_group()
 
         tlx.async_load_wait_group(5)
@@ -784,7 +790,7 @@ def a16w16_8wave(
             acc_tl = tl.dot(a_top, b_left, acc_tl)
         with tlx.warp_pipeline_stage("mem", priority=1):
             a_bot = tlx.local_load(smem_a_bot[1], relaxed=True)
-            tlx.buffer_load_to_local(smem_b_left[1], b_ptr, b_left_off_n + kb)
+            tlx.async_load(b_ptr + b_left_off_n + kb, smem_b_left[1], mask=b_left_mask, other=0.0)
             tlx.async_load_commit_group()
 
         tlx.async_load_wait_group(5)
@@ -792,7 +798,7 @@ def a16w16_8wave(
             acc_bl = tl.dot(a_bot, b_left, acc_bl)
         with tlx.warp_pipeline_stage("mem", priority=1):
             b_right = tlx.local_load(smem_b_right[1], relaxed=True)
-            tlx.buffer_load_to_local(smem_a_top[1], a_ptr, a_top_off_n + ka)
+            tlx.async_load(a_ptr + a_top_off_n + ka, smem_a_top[1], mask=a_top_mask, other=0.0)
             tlx.async_load_commit_group()
 
         tlx.async_load_wait_group(5)
@@ -800,7 +806,7 @@ def a16w16_8wave(
             acc_tr = tl.dot(a_top, b_right, acc_tr)
         with tlx.warp_pipeline_stage("mem", priority=1):
             b_left = tlx.local_load(smem_b_left[0], relaxed=True)
-            tlx.buffer_load_to_local(smem_a_bot[1], a_ptr, a_bot_off_n + ka)
+            tlx.async_load(a_ptr + a_bot_off_n + ka, smem_a_bot[1], mask=a_bot_mask, other=0.0)
             tlx.async_load_commit_group()
 
         tlx.async_load_wait_group(5)
@@ -808,7 +814,7 @@ def a16w16_8wave(
             acc_br = tl.dot(a_bot, b_right, acc_br)
         with tlx.warp_pipeline_stage("mem", priority=1):
             a_top = tlx.local_load(smem_a_top[0], relaxed=True)
-            tlx.buffer_load_to_local(smem_b_right[1], b_ptr, b_right_off_n + kb)
+            tlx.async_load(b_ptr + b_right_off_n + kb, smem_b_right[1], mask=b_right_mask, other=0.0)
             tlx.async_load_commit_group()
             ka += BLOCK_K * stride_ak * 2
             kb += BLOCK_K * stride_bk * 2
