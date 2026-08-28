@@ -21,7 +21,7 @@ from __future__ import annotations
 
 from ._catalog import InvalidInput, UnsupportedOp, check_inputs, impl_for
 
-__all__ = ["mm", "flash_attn", "hstu_attn", "UnsupportedOp", "InvalidInput"]
+__all__ = ["mm", "flash_attn", "hstu_attn", "kimi_delta_attention", "UnsupportedOp", "InvalidInput"]
 
 
 def mm(a, b, *, arch=None, space="full"):
@@ -59,3 +59,13 @@ def hstu_attn(q, k, v, seq_offsets, max_seq_len, attn_scale, alpha=None, causal=
     return fn(q, k, v, seq_offsets, max_seq_len, alpha if alpha is not None else 1.0 / q.shape[-1], causal=causal,
               attn_scale=attn_scale, num_targets=num_targets, max_attn_len=max_attn_len,
               contextual_seq_len=contextual_seq_len, space=space)
+
+
+def kimi_delta_attention(q, k, v, g, beta, *, scale=1.0, cu_seqlens=None, cu_seqlens_cpu=None, arch=None, space="full"):
+    """Kimi Delta Attention over packed `[1, T, H, 128]` fp16/bf16 inputs.
+
+    Returns the TritonBench-compatible `(output, None)` pair.
+    """
+    fn, spec = impl_for("kimi_delta_attention", arch)
+    check_inputs(spec, dtype=q.dtype, HEAD_DIM=q.shape[-1])
+    return fn(q, k, v, g, beta, scale=scale, cu_seqlens=cu_seqlens, cu_seqlens_cpu=cu_seqlens_cpu, space=space)
