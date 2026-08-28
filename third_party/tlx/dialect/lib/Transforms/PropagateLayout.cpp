@@ -42,11 +42,19 @@ public:
       return failure();
     auto resultType = cast<RankedTensorType>(requireLayoutOp.getType());
     if (containsPinnedEncoding(resultType.getEncoding())) {
-      rewriter.replaceOpWithNewOp<ttg::RequireLayoutOp>(
-          requireLayoutOp, requireLayoutOp.getType(), requireLayoutOp.getSrc());
+      auto boundary = ttg::RequireLayoutOp::create(
+          rewriter, requireLayoutOp.getLoc(), requireLayoutOp.getType(),
+          requireLayoutOp.getSrc());
+      if (requireLayoutOp->hasAttr("tlx.rematerialize_coordinates"))
+        boundary->setAttr("tlx.rematerialize_coordinates",
+                          rewriter.getUnitAttr());
+      rewriter.replaceOp(requireLayoutOp, boundary);
       return success();
     }
-    if (requireLayoutOp.getSrc().getType() == requireLayoutOp.getType()) {
+    bool rematerializeCoordinates =
+        requireLayoutOp->hasAttr("tlx.rematerialize_coordinates");
+    if (requireLayoutOp.getSrc().getType() == requireLayoutOp.getType() &&
+        !rematerializeCoordinates) {
       rewriter.replaceOp(requireLayoutOp, requireLayoutOp.getSrc());
       return success();
     }
@@ -54,7 +62,7 @@ public:
     auto convert = ttg::ConvertLayoutOp::create(
         rewriter, requireLayoutOp.getLoc(), requireLayoutOp.getType(),
         requireLayoutOp.getSrc());
-    if (requireLayoutOp->hasAttr("tlx.rematerialize_coordinates"))
+    if (rematerializeCoordinates)
       convert->setAttr("tlx.rematerialize_coordinates", rewriter.getUnitAttr());
     rewriter.replaceOp(requireLayoutOp, convert);
     return success();
