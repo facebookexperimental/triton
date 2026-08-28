@@ -2,6 +2,7 @@
 #define TRITON_TRITONGPU_TRANSFORMS_PIPELINER_PIPELINING_UTILITY_H_
 
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/IR/Dominance.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/DiscardableAttributes.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
@@ -192,6 +193,14 @@ getLastUseOfPipelinedOp(ArrayRef<Operation *> ops, scf::ForOp forOp,
 
 // Clean up attributes passing over schedules across stages in pipelining
 void removePipeliningAttributes(ModuleOp moduleOp);
+
+// True when an `llvm.assume` dominating `loop` proves its trip count is at
+// least one, by asserting `ub > lb` (or the equivalent `lb < ub`) on the
+// loop's own bound values. Matches `tl.assume(hi > lo)` in the frontend.
+// `domInfo` is required because an assume only states a fact at its own
+// program point: one sitting after the loop, or in a region that does not
+// dominate it, proves nothing about the trip count.
+bool isLoopTripCountKnownPositive(scf::ForOp loop, DominanceInfo &domInfo);
 } // namespace triton
 } // namespace mlir
 
