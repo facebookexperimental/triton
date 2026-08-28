@@ -844,6 +844,12 @@ def MfmaCommitOp : TT_AMDGPU_Op<"mfma_commit", [
     fragment widths. Source code does not provide physical register classes,
     tuple sizes, or wait-state counts.
 
+    A boundary that carries a live dot operand hands its F32 results out in
+    VGPRs, so its accumulators must already be VGPR-resident. Committing an
+    AGPR-resident accumulator alongside a live operand places the resulting
+    `v_accvgpr_read_b32` ahead of the hazard padding and is rejected during
+    lowering.
+
     The operation is intentionally side-effecting so the completion and
     liveness boundary cannot be deleted or moved across memory operations.
   }];
@@ -879,6 +885,12 @@ def ScheduledMfmaOp : TT_AMDGPU_Op<"scheduled_mfma"> {
     whose two persistent accumulator sets intentionally occupy complementary
     physical files. `initialize` starts the native accumulators from zero. Completion
     of transient result fragments is represented separately by `mfma_commit`.
+
+    An AGPR-resident accumulator must not reach an `mfma_commit` that also
+    carries a live dot operand: that boundary constrains its F32 results to
+    VGPRs, so the AGPR read is materialized as operand setup and precedes the
+    boundary's hazard padding. Lowering reports this whenever the producing
+    `scheduled_mfma` is visible from the commit.
 
     All active lanes of a wave must execute this operation uniformly. This is
     an explicit source contract because LLVM inline assembly cannot represent

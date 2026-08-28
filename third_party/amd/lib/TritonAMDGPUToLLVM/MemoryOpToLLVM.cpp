@@ -1159,6 +1159,34 @@ public:
   }
 };
 
+static StringRef resolveAccumulatorStorage(triton::amdgpu::ScheduledMfmaOp op,
+                                           const AMD::TargetInfo &targetInfo) {
+  StringRef storage = op.getAccumulatorRegisterClass();
+  if (storage != "auto")
+    return storage;
+  return op.getAccumulatorRole() == "persistent" &&
+                 targetInfo.getISAFamily() == ISAFamily::CDNA4
+             ? "agpr"
+             : "vgpr";
+}
+
+// Return the first accumulator reaching this boundary that its producer pinned
+// into AGPRs, or null if none is provably AGPR-resident.
+static triton::amdgpu::ScheduledMfmaOp
+findAgprResidentAccumulator(triton::amdgpu::MfmaCommitOp op,
+                            const AMD::TargetInfo &targetInfo, size_t &index) {
+  for (auto [inputIndex, input] : llvm::enumerate(op.getInputs())) {
+    if (!cast<RankedTensorType>(input.getType()).getElementType().isF32())
+      continue;
+    auto producer = input.getDefiningOp<triton::amdgpu::ScheduledMfmaOp>();
+    if (producer && resolveAccumulatorStorage(producer, targetInfo) == "agpr") {
+      index = inputIndex;
+      return producer;
+    }
+  }
+  return nullptr;
+}
+
 class MfmaCommitOpConversion
     : public ConvertOpToLLVMPattern<triton::amdgpu::MfmaCommitOp> {
 public:
@@ -1225,6 +1253,15 @@ public:
     bool hasLiveDependency = llvm::any_of(op.getInputs(), [](Value input) {
       return !cast<RankedTensorType>(input.getType()).getElementType().isF32();
     });
+    size_t agprInputIndex = 0;
+    if (hasLiveDependency &&
+        findAgprResidentAccumulator(op, targetInfo, agprInputIndex))
+      return op.emitOpError()
+             << "input " << agprInputIndex
+             << " is an AGPR-resident accumulator committed alongside a live "
+                "dot operand. The AGPR read is materialized ahead of this "
+                "boundary's hazard padding; pin the accumulator with "
+                "accumulator_register_class=\"vgpr\"";
     for (auto [source, converted] :
          llvm::zip(op.getInputs(), adaptor.getInputs())) {
       auto tensorTy = cast<RankedTensorType>(source.getType());
@@ -1431,12 +1468,7 @@ public:
 
     StringRef aStorage = op.getResidentOperand() == "lhs" ? "agpr" : "vgpr";
     StringRef bStorage = op.getResidentOperand() == "rhs" ? "agpr" : "vgpr";
-    StringRef accumulatorStorage = op.getAccumulatorRegisterClass();
-    if (accumulatorStorage == "auto")
-      accumulatorStorage = op.getAccumulatorRole() == "persistent" &&
-                                   targetInfo.getISAFamily() == ISAFamily::CDNA4
-                               ? "agpr"
-                               : "vgpr";
+    StringRef accumulatorStorage = resolveAccumulatorStorage(op, targetInfo);
 
     auto inputConstraint = [](StringRef registerClass) -> StringRef {
       return registerClass == "agpr" ? "a" : "v";

@@ -793,6 +793,25 @@ LogicalResult RegisterHandoffOp::verify() {
       /*registersPerGroup=*/1, /*allowUnencoded=*/true);
 }
 
+static LogicalResult
+verifyNativeMfmaInstrShape(Operation *op,
+                           mlir::triton::gpu::AMDMfmaEncodingAttr mfma,
+                           const Twine &prefix) {
+  ArrayRef<unsigned> instrShape = mfma.getInstrShape();
+  bool isCDNA3Shape = instrShape == ArrayRef<unsigned>({32, 32, 8}) ||
+                      instrShape == ArrayRef<unsigned>({16, 16, 16});
+  bool isCDNA4Shape = instrShape == ArrayRef<unsigned>({32, 32, 16}) ||
+                      instrShape == ArrayRef<unsigned>({16, 16, 32});
+  if ((mfma.getVersion() == 3 && !isCDNA3Shape) ||
+      (mfma.getVersion() == 4 && !isCDNA4Shape))
+    return op->emitOpError()
+           << prefix << "MFMA encoding version " << mfma.getVersion()
+           << " supports only its native 32x32x"
+           << (mfma.getVersion() == 3 ? 8 : 16) << " and 16x16x"
+           << (mfma.getVersion() == 3 ? 16 : 32) << " shapes";
+  return success();
+}
+
 LogicalResult MfmaCommitOp::inferReturnTypes(
     MLIRContext *context, std::optional<Location> location, ValueRange operands,
     DictionaryAttr attributes, PropertyRef properties, RegionRange regions,
@@ -835,6 +854,9 @@ LogicalResult MfmaCommitOp::verify() {
                << "input " << index << " uses MFMA version "
                << mfma.getVersion() << ", but the target requires "
                << "version " << *targetVersion;
+      if (failed(verifyNativeMfmaInstrShape(getOperation(), mfma,
+                                            "input " + Twine(index) + " ")))
+        return failure();
       if (!input.hasOneUse())
         return emitOpError()
                << "input " << index
@@ -865,6 +887,9 @@ LogicalResult MfmaCommitOp::verify() {
                << "input " << index << " uses MFMA version "
                << mfma.getVersion() << ", but the target requires "
                << "version " << *targetVersion;
+      if (failed(verifyNativeMfmaInstrShape(getOperation(), mfma,
+                                            "input " + Twine(index) + " ")))
+        return failure();
       ArrayRef<unsigned> instr = mfma.getInstrShape();
       int64_t fragmentElements =
           dot.getOpIdx() == 0 ? instr[0] * instr[2] : instr[2] * instr[1];
@@ -890,7 +915,7 @@ LogicalResult MfmaCommitOp::verify() {
 
     return emitOpError()
            << "input " << index
-           << " must be an F32 MFMA result or BF16 dot-operand dependency";
+           << " must be an F32 MFMA result or BF16/F16 dot-operand dependency";
   }
   if (!hasMfmaResult)
     return emitOpError("requires at least one MFMA result");
@@ -933,17 +958,9 @@ LogicalResult ScheduledMfmaOp::verify() {
     return emitOpError() << "uses MFMA version " << mfma.getVersion()
                          << ", but the target requires version "
                          << *targetVersion;
+  if (failed(verifyNativeMfmaInstrShape(getOperation(), mfma, /*prefix=*/"")))
+    return failure();
   ArrayRef<unsigned> instrShape = mfma.getInstrShape();
-  bool isCDNA3Shape = instrShape == ArrayRef<unsigned>({32, 32, 8}) ||
-                      instrShape == ArrayRef<unsigned>({16, 16, 16});
-  bool isCDNA4Shape = instrShape == ArrayRef<unsigned>({32, 32, 16}) ||
-                      instrShape == ArrayRef<unsigned>({16, 16, 32});
-  if ((mfma.getVersion() == 3 && !isCDNA3Shape) ||
-      (mfma.getVersion() == 4 && !isCDNA4Shape))
-    return emitOpError() << "MFMA encoding version " << mfma.getVersion()
-                         << " supports only its native 32x32x"
-                         << (mfma.getVersion() == 3 ? 8 : 16) << " and 16x16x"
-                         << (mfma.getVersion() == 3 ? 16 : 32) << " shapes";
 
   auto aDot = dyn_cast<ttg::DotOperandEncodingAttr>(aTy.getEncoding());
   auto bDot = dyn_cast<ttg::DotOperandEncodingAttr>(bTy.getEncoding());

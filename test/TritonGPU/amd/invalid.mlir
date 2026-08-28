@@ -1049,3 +1049,38 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.tar
     tt.return
   }
 }
+
+// -----
+
+// The commit boundary derives its hazard wait from the shape triple, so a
+// shape the encoding version does not have must be rejected rather than
+// silently treated as the version's other native shape.
+#nonnative_result_mma = #ttg.amd_mfma<{version = 3, warpsPerCTA = [1, 1], instrShape = [32, 32, 16], isTransposed = true}>
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.target" = "hip:gfx942", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @mfma_commit_rejects_cdna4_shape_on_v3_result(
+      %result: tensor<32x32xf32, #nonnative_result_mma>) {
+    // expected-error @+1 {{input 0 MFMA encoding version 3 supports only its native 32x32x8 and 16x16x16 shapes}}
+    %committed = amdg.mfma_commit %result
+        : tensor<32x32xf32, #nonnative_result_mma>
+    tt.return
+  }
+}
+
+// -----
+
+#native_result_mma = #ttg.amd_mfma<{version = 3, warpsPerCTA = [1, 1], instrShape = [16, 16, 16], isTransposed = true}>
+#nonnative_dep_mma = #ttg.amd_mfma<{version = 3, warpsPerCTA = [1, 1], instrShape = [16, 16, 32], isTransposed = true}>
+#nonnative_dep_rhs = #ttg.dot_op<{opIdx = 1, parent = #nonnative_dep_mma, kWidth = 4}>
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.target" = "hip:gfx942", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @mfma_commit_rejects_cdna4_shape_on_v3_dependency(
+      %result: tensor<16x16xf32, #native_result_mma>,
+      %dependency: tensor<32x16xbf16, #nonnative_dep_rhs>) {
+    // expected-error @+1 {{input 1 MFMA encoding version 3 supports only its native 32x32x8 and 16x16x16 shapes}}
+    %committed, %preserved = amdg.mfma_commit %result, %dependency
+        : tensor<16x16xf32, #native_result_mma>,
+          tensor<32x16xbf16, #nonnative_dep_rhs>
+    tt.return
+  }
+}
