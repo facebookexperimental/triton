@@ -42,6 +42,27 @@ def is_hopper():
 
 
 @triton.jit
+def _reduce_or(x, y):
+    return x | y
+
+
+@triton.jit
+def _rescale_accumulator(acc, alpha, SUBTILING: tl.constexpr, VECT_MUL: tl.constexpr):
+    BM: tl.constexpr = acc.shape[0]
+    BN: tl.constexpr = acc.shape[1]
+    if SUBTILING:
+        acc0, acc1 = acc.reshape([BM, 2, BN // 2]).permute(0, 2, 1).split()
+        if VECT_MUL == 1 or VECT_MUL == 3:
+            acc0 = _mul_f32x2(acc0, alpha[:, None])
+            acc1 = _mul_f32x2(acc1, alpha[:, None])
+        else:
+            acc0 = acc0 * alpha[:, None]
+            acc1 = acc1 * alpha[:, None]
+        return tl.join(acc0, acc1).permute(0, 2, 1).reshape([BM, BN])
+    return acc * alpha[:, None]
+
+
+@triton.jit
 def _mask_scalar(qk, col_limit_right, s, i):
     col_lim_right_s = col_limit_right - s
     col_lim_right_cur = max(col_lim_right_s, 0)
@@ -89,6 +110,7 @@ def _attn_fwd_subtile(
     FADD2_REDUCE: tl.constexpr,
     MMA_SLICES: tl.constexpr,
     TWO_CTAS: tl.constexpr,
+    RESCALE_OPT: tl.constexpr,
 ):
     qk = tl.dot(
         q,
@@ -110,34 +132,50 @@ def _attn_fwd_subtile(
         col_limit_right = (offs_m - start_n + 1)[:, None]
         qk = _apply_causal_mask(qk, col_limit_right, BLOCK_N)
 
-    m_ij = tl.maximum(m_i, tl.max(qk, 1) * qk_scale)
-
-    if VECT_MUL == 2 or VECT_MUL == 3:
-        qk = _fma_f32x2(qk, qk_scale, -m_ij[:, None])
+    if RESCALE_OPT:
+        m_ij = tl.maximum(m_i, tl.max(qk, 1))
+        alpha_ = (m_i - m_ij) * qk_scale
+        alpha = tl.math.exp2(alpha_)
+        # Skip the accumulator rescale where alpha is within 2^-8 of 1.0: below
+        # that the correction is smaller than the accumulator's fp32 precision,
+        # so paying for the TMEM read-modify-write buys nothing.
+        rescale_mask = alpha_ >= -8.0
+        alpha = tl.where(rescale_mask, 1.0, alpha)
+        m_ij = tl.where(rescale_mask, m_i, m_ij)
+        m_scaled = m_ij * qk_scale
+        if VECT_MUL == 2 or VECT_MUL == 3:
+            qk = _fma_f32x2(qk, qk_scale, -m_scaled[:, None])
+        else:
+            qk = qk * qk_scale - m_scaled[:, None]
     else:
-        qk = qk * qk_scale - m_ij[:, None]
+        m_ij = tl.maximum(m_i, tl.max(qk, 1) * qk_scale)
+        if VECT_MUL == 2 or VECT_MUL == 3:
+            qk = _fma_f32x2(qk, qk_scale, -m_ij[:, None])
+        else:
+            qk = qk * qk_scale - m_ij[:, None]
+        alpha = tl.math.exp2(m_i - m_ij)
 
     p = tl.math.exp2(qk)
-    # -- compute correction factor
-    alpha = tl.math.exp2(m_i - m_ij)
     if not FADD2_REDUCE:
         l_ij = tl.sum(p, 1)
 
     # -- update output accumulator --
-    BM: tl.constexpr = acc.shape[0]
-    BN: tl.constexpr = acc.shape[1]
-
-    if SUBTILING:
-        acc0, acc1 = acc.reshape([BM, 2, BN // 2]).permute(0, 2, 1).split()
-        if VECT_MUL == 1 or VECT_MUL == 3:
-            acc0 = _mul_f32x2(acc0, alpha[:, None])
-            acc1 = _mul_f32x2(acc1, alpha[:, None])
-        else:
-            acc0 = acc0 * alpha[:, None]
-            acc1 = acc1 * alpha[:, None]
-        acc = tl.join(acc0, acc1).permute(0, 2, 1).reshape([BM, BN])
+    if RESCALE_OPT:
+        # Derive the correction vote from the finalized alpha tile.  The
+        # correction task already consumes alpha for the accumulator multiply,
+        # so this lets AutoWS compute the vote beside that load instead of
+        # materializing a second cross-partition needs_rescale channel.
+        needs_rescale = alpha < 1.0
+        should_rescale = tl.reshape(tl.reduce(needs_rescale, axis=0, combine_fn=_reduce_or), ())
+        scaled_acc = _rescale_accumulator(acc, alpha, SUBTILING, VECT_MUL)
+        # Keep this as an eager SSA select until the accumulator is placed in
+        # TMEM. HoistTMEMAlloc first folds it into a predicated TMEM store;
+        # after AutoWS has materialized each data-partition task, the
+        # post-pipeline invocation turns that store into a side-effecting
+        # conditional load/rescale/store.
+        acc = tl.where(should_rescale, scaled_acc, acc)
     else:
-        acc = acc * alpha[:, None]
+        acc = _rescale_accumulator(acc, alpha, SUBTILING, VECT_MUL)
 
     PM: tl.constexpr = p.shape[0]
     PN: tl.constexpr = p.shape[1]
@@ -215,6 +253,7 @@ def _attn_fwd_inner_oss_dp(
     KV_NUM_STAGES: tl.constexpr,
     DP_FACTOR: tl.constexpr,
     TWO_CTAS: tl.constexpr,
+    RESCALE_OPT: tl.constexpr,
 ):
     # range of values handled by this stage
     if STAGE == 1:  # causal = False
@@ -272,6 +311,7 @@ def _attn_fwd_inner_oss_dp(
             FADD2_REDUCE,
             MMA_SLICES,
             TWO_CTAS,
+            RESCALE_OPT,
         )
 
         offsetkv_y += BLOCK_N
@@ -305,6 +345,7 @@ elif supports_host_descriptor():
 else:
     NUM_STAGES_OPTIONS = [3]
 _FWD_USE_CLC = os.environ.get("AUTOWS_FWD_CLC", "0") == "1"
+_FWD_RESCALE_OPT = os.environ.get("AUTOWS_FWD_RESCALE_OPT", "1") == "1"
 _FWD_CLC_SAFE_STAGES = "2" if _FWD_USE_CLC else "4"
 FWD_2CTA_NUM_STAGES = int(os.environ.get("AUTOWS_FWD_NUM_STAGES", _FWD_CLC_SAFE_STAGES))
 FWD_2CTA_BLOCK_M = int(os.environ.get("AUTOWS_FWD_BLOCK_M", "256"))
@@ -323,6 +364,7 @@ configs = [
             "MMA_SLICES": 1,
             "KV_NUM_STAGES": s,
             "OUTER_NUM_STAGES": s,
+            "RESCALE_OPT": _FWD_RESCALE_OPT,
         },
         num_stages=s,
         num_warps=w,
@@ -338,6 +380,7 @@ configs = [
             "MMA_SLICES": FWD_2CTA_MMA_SLICES,
             "KV_NUM_STAGES": FWD_2CTA_KV_NUM_STAGES,
             "OUTER_NUM_STAGES": FWD_2CTA_OUTER_NUM_STAGES,
+            "RESCALE_OPT": _FWD_RESCALE_OPT,
         },
         num_stages=FWD_2CTA_NUM_STAGES,
         num_warps=4,
@@ -412,6 +455,7 @@ def _attn_fwd_tma_dp(
     KV_NUM_STAGES: tl.constexpr,
     DP_FACTOR: tl.constexpr,
     NUM_CTAS: tl.constexpr,
+    RESCALE_OPT: tl.constexpr,
 ):
     start_m = pid  # tl.program_id(0)
     # off_hz = tl.program_id(1)
@@ -465,6 +509,7 @@ def _attn_fwd_tma_dp(
         KV_NUM_STAGES,
         DP_FACTOR,
         NUM_CTAS == 2,
+        RESCALE_OPT,
     )
 
     if FADD2_REDUCE:
@@ -472,6 +517,8 @@ def _attn_fwd_tma_dp(
     else:
         l_i0 = l_i0_0
 
+    if RESCALE_OPT:
+        m_i0 *= qk_scale
     m_i0 += tl.math.log2(l_i0)
     if NUM_CTAS == 2:
         # Match the TLX epilogue's packed-f32 normalization. Keeping adjacent
@@ -521,6 +568,7 @@ def _attn_fwd(
     OUTER_NUM_STAGES: tl.constexpr,
     DP_FACTOR: tl.constexpr,
     NUM_CTAS: tl.constexpr = 1,
+    RESCALE_OPT: tl.constexpr = False,
 ):
     pid = tl.program_id(0)
     off_hz = tl.program_id(1)
@@ -576,6 +624,7 @@ def _attn_fwd(
         KV_NUM_STAGES,
         DP_FACTOR,
         NUM_CTAS,
+        RESCALE_OPT,
     )
 
 
@@ -612,6 +661,7 @@ def _attn_fwd_persist(
     DP_FACTOR: tl.constexpr,
     USE_CLC: tl.constexpr = False,
     NUM_CTAS: tl.constexpr = 1,
+    RESCALE_OPT: tl.constexpr = False,
 ):
     n_tile_num = tl.cdiv(N_CTX, BLOCK_M)
     prog_id = tl.program_id(0)
@@ -691,6 +741,7 @@ def _attn_fwd_persist(
                 KV_NUM_STAGES,
                 DP_FACTOR,
                 NUM_CTAS,
+                RESCALE_OPT,
             )
             scheduler = scheduler.advance()
     else:
@@ -732,6 +783,7 @@ def _attn_fwd_persist(
                 KV_NUM_STAGES,
                 DP_FACTOR,
                 NUM_CTAS,
+                RESCALE_OPT,
             )
             tile_idx += num_progs
 
