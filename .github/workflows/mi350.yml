@@ -3,7 +3,23 @@ on:
   push:
     branches:
       - main
+    paths-ignore:
+      - 'third_party/nvidia/**'
+      - 'third_party/tlx/tutorials/blackwell-*/**'
+      - 'third_party/tlx/tutorials/blackwell-*'
+      - 'third_party/tlx/tutorials/testing/test_correctness_autows.py'
+      - 'python/test/unit/cuda/**'
+      - 'python/test/unit/language/test_tlx_tma.py'
+      - 'third_party/proton/test/**'
   pull_request:
+    paths-ignore:
+      - 'third_party/nvidia/**'
+      - 'third_party/tlx/tutorials/blackwell-*/**'
+      - 'third_party/tlx/tutorials/blackwell-*'
+      - 'third_party/tlx/tutorials/testing/test_correctness_autows.py'
+      - 'python/test/unit/cuda/**'
+      - 'python/test/unit/language/test_tlx_tma.py'
+      - 'third_party/proton/test/**'
   schedule:
     # Every 6 hours at the top of the hour (00:00, 06:00, 12:00, 18:00 UTC).
     - cron: '0 */6 * * *'
