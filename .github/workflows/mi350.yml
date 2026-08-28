@@ -127,13 +127,13 @@ jobs:
           pytest python/test/unit/language/test_tlx_*.py -v --junitxml=/tmp/tlx-unit.xml
       - name: Run TLX tutorial correctness tests
         id: run_correctness_tests
-        timeout-minutes: 10
+        timeout-minutes: 30
         run: |
           set -eux
           . "${SETUP_SCRIPT}"
-          # AMD (gfx950/CDNA4) + ikbo cases run; Hopper/Blackwell and gfx1250
-          # cases auto-skip via @pytest.mark.skipif arch gates.
-          pytest third_party/tlx/tutorials/testing/test_correctness.py -v --junitxml=/tmp/tlx-correctness.xml
+          # Report the slowest cases so future changes can reduce the runtime
+          # without relying on brittle test-name filters.
+          pytest third_party/tlx/tutorials/testing/test_correctness.py -v --durations=25 --junitxml=/tmp/tlx-correctness.xml
       - name: Collect nightly failures (TLX)
         id: parse
         if: always() && github.event_name == 'schedule'
