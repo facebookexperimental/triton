@@ -121,9 +121,6 @@ def _attn_fwd_subtile(
                 "opndD,tmem,1,0",
             ],
             "two_cta_interleave_role": "qk" if TWO_CTAS else None,
-            "two_cta_tma_direct_wait": TWO_CTAS,
-            "two_cta_fuse_final_stats": TWO_CTAS,
-            "two_cta_fuse_acc_slices": TWO_CTAS,
         } if MMA_SLICES == 2 else None),
         two_ctas=TWO_CTAS,
     )
@@ -215,12 +212,6 @@ def _attn_fwd_subtile(
             attrs={
                 "two_cta_interleave_role": "pv" if TWO_CTAS else None,
                 "channels": ["opndA,tmem,1,0,64"],
-                # Inner-warp-specialized (non-persistent) schedules keep both
-                # slices adjacent in one partition, so the first rendezvous
-                # covers the second.  Persistent schedules pipeline the
-                # shared V allocation across iterations and need the second
-                # rendezvous before that slot can rotate.
-                "two_cta_sync_covered_by_prior": TWO_CTAS and INNER_WARP_SPECIALIZE,
             },
             two_ctas=TWO_CTAS,
         )
