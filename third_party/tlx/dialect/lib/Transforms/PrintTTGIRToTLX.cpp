@@ -65,6 +65,7 @@
 #include "mlir/Pass/Pass.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringSet.h"
@@ -1644,7 +1645,8 @@ void printSimplifiedOp(
   // Token waits are the lowered form of TLX descriptor-store waits.
   if (opName == "ttng.async_tma_store_token_wait") {
     int pendings = 0;
-    if (auto planned = op->getAttrOfType<IntegerAttr>("planned_pending_count"))
+    if (auto planned = op->getAttrOfType<IntegerAttr>(
+            triton::nvidia_gpu::kPlannedPendingCount))
       pendings = planned.getInt();
     os << "tlx.async_descriptor_store_wait(" << pendings << ")";
     printLocComment(op, os);

@@ -259,3 +259,74 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
+
+// -----
+
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#bar_layout = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
+// Barrierful wait uses program-order counting (0 intervening stores =>
+// pendings 0). The planned_pending_count attribute is dropped when a
+// barrier is attached via addBarrier, so it must not be present here.
+// CHECK-LABEL: barrier_ignores_planned_pending_count
+  tt.func public @barrier_ignores_planned_pending_count(
+      %desc: !tt.tensordesc<128x64xf16, #shared>,
+      %src: !ttg.memdesc<128x64xf16, #shared, #smem, mutable>,
+      %barrier: !ttg.memdesc<1xi64, #bar_layout, #smem, mutable>,
+      %i: i32) {
+    %tok = ttng.async_tma_copy_local_to_global %desc[%i, %i] %src : !tt.tensordesc<128x64xf16, #shared>, !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> !ttg.async.token
+    %true = arith.constant true
+    // CHECK: ttng.async_tma_store_wait {pendings = 0 : i32}
+    // CHECK: ttng.arrive_barrier
+    ttng.async_tma_store_token_wait %tok, %barrier[%true] : !ttg.async.token, !ttg.memdesc<1xi64, #bar_layout, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#bar_layout = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
+// Barrierful wait with one intervening store: program order gives
+// pendings = 1 (planned would be dropped via addBarrier).
+// CHECK-LABEL: barrier_ignores_planned_with_intervening_store
+  tt.func public @barrier_ignores_planned_with_intervening_store(
+      %desc: !tt.tensordesc<128x64xf16, #shared>,
+      %src0: !ttg.memdesc<128x64xf16, #shared, #smem, mutable>,
+      %src1: !ttg.memdesc<128x64xf16, #shared, #smem, mutable>,
+      %barrier: !ttg.memdesc<1xi64, #bar_layout, #smem, mutable>,
+      %i: i32) {
+    %tok0 = ttng.async_tma_copy_local_to_global %desc[%i, %i] %src0 : !tt.tensordesc<128x64xf16, #shared>, !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> !ttg.async.token
+    %tok1 = ttng.async_tma_copy_local_to_global %desc[%i, %i] %src1 : !tt.tensordesc<128x64xf16, #shared>, !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> !ttg.async.token
+    %true = arith.constant true
+    // CHECK: ttng.async_tma_store_wait {pendings = 1 : i32}
+    ttng.async_tma_store_token_wait %tok0, %barrier[%true] : !ttg.async.token, !ttg.memdesc<1xi64, #bar_layout, #smem, mutable>
+    // CHECK: ttng.async_tma_store_wait {pendings = 0 : i32}
+    ttng.async_tma_store_token_wait %tok1 : !ttg.async.token
+    tt.return
+  }
+}
+
+// -----
+
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
+// nvws_token (deferred barrier) uses program-order counting (planned dropped
+// via addToken).
+// CHECK-LABEL: nvws_token_ignores_planned_pending_count
+  tt.func public @nvws_token_ignores_planned_pending_count(
+      %desc: !tt.tensordesc<128x64xf16, #shared>,
+      %src: !ttg.memdesc<128x64xf16, #shared, #smem, mutable>,
+      %i: i32) {
+    %tok = ttng.async_tma_copy_local_to_global %desc[%i, %i] %src : !tt.tensordesc<128x64xf16, #shared>, !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> !ttg.async.token
+    %nvws_tok = nvws.create_token {loadType = 3 : i32, numBuffers = 1 : i32} : tensor<1x!nvws.token>
+    %c0 = arith.constant 0 : i32
+    // CHECK: ttng.async_tma_store_wait {pendings = 0 : i32}
+    "ttng.async_tma_store_token_wait"(%tok, %nvws_tok, %c0) <{operandSegmentSizes = array<i32: 1, 0, 0, 1, 1>}> : (!ttg.async.token, tensor<1x!nvws.token>, i32) -> ()
+    tt.return
+  }
+}
