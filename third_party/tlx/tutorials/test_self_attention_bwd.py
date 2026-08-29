@@ -31,8 +31,9 @@ from triton._internal_testing import is_blackwell  # noqa: E402
 import bench_self as bs  # noqa: E402
 
 
+
+pytestmark = pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell (sm100)")
 @pytest.mark.parametrize("L,Z", [(256, 4), (512, 2)])
-@pytest.mark.skipif(not is_blackwell(), reason="TLX self-attention backward requires Blackwell GPU")
 def test_self_attention_bwd_triton_vs_tlx(L, Z):
     if not torch.cuda.is_available():
         pytest.skip("requires CUDA")

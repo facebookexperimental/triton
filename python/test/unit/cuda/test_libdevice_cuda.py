@@ -9,6 +9,8 @@ import triton.language as tl
 from triton._internal_testing import is_cuda
 from triton.language.extra import libdevice
 
+pytestmark = pytest.mark.skipif(not is_cuda(), reason="Requires CUDA backend")
+
 
 # -----------------------
 # test extern functions

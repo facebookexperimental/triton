@@ -14,6 +14,8 @@ from triton.language.extra.tlx.tutorials.amd_pa_decode import (
 
 from triton._internal_testing import is_hip, is_hip_cdna4
 
+
+pytestmark = pytest.mark.skipif(not is_hip(), reason="Requires HIP backend")
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
 # Fixed decode problem geometry (GQA, bf16 KV), matching the paged-decode

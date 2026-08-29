@@ -5,14 +5,17 @@ from pathlib import Path
 
 import triton
 
+import pytest
+
 
 def is_hip():
     return triton.runtime.driver.active.get_current_target().backend == "hip"
 
 
+pytestmark = pytest.mark.skipif(not is_hip(), reason="Requires HIP backend")
+
+
 def test_address_sanitizer():
-    if not is_hip():
-        return  #not supported on NV backend
 
     # It is recommended to disable various memory caching strategies both within the ROCm stack and PyTorch
     # This will give the address sanitizer the best chance at finding the memory fault where it originates,

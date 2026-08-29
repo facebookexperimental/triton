@@ -9,7 +9,7 @@ def is_hip():
     return triton.runtime.driver.active.get_current_target().backend == "hip"
 
 
-@pytest.mark.skipif(not is_hip(), reason="link_hsaco only available on HIP backend")
+pytestmark = pytest.mark.skipif(not is_hip(), reason="Requires HIP backend")
 def test_nonexistent_input_reports_lld_error_details():
     """Verify that lld linker errors are captured and surfaced in exceptions.
 
