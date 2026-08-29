@@ -141,26 +141,44 @@ jobs:
           # test_warp_specialization.py, test_tutorial09_warp_specialization.py),
           # which are never collected here and are tested separately.
           pytest python/test/unit/language/test_tlx_*.py -v --junitxml=/tmp/tlx-unit.xml
-      - name: Run TLX tutorial correctness tests
+      - name: Run non-HSTU TLX tutorial correctness tests
         id: run_correctness_tests
         timeout-minutes: 30
         run: |
           set -eux
           . "${SETUP_SCRIPT}"
-          # Report the slowest cases so future changes can reduce the runtime
-          # without relying on brittle test-name filters.
-          pytest third_party/tlx/tutorials/testing/test_correctness.py -v --durations=25 --junitxml=/tmp/tlx-correctness.xml
+          pytest third_party/tlx/tutorials/testing/test_correctness.py \
+            -v \
+            -k "not tlx_gfx950_hstu_attention" \
+            --durations=25 \
+            --junitxml=/tmp/tlx-correctness.xml
+      - name: Run TLX HSTU correctness tests
+        id: run_hstu_tests
+        if: ${{ always() && !cancelled() && steps.run_unit_tests.outcome == 'success' }}
+        timeout-minutes: 30
+        run: |
+          set -eux
+          . "${SETUP_SCRIPT}"
+          # Keep HSTU in a fresh process so earlier tutorial compilations do not
+          # retain host memory while its backward variants are compiled.
+          pytest third_party/tlx/tutorials/testing/test_correctness.py \
+            -v \
+            -k "tlx_gfx950_hstu_attention" \
+            --durations=25 \
+            --junitxml=/tmp/tlx-hstu.xml
       - name: Collect nightly failures (TLX)
         id: parse
         if: always() && github.event_name == 'schedule'
         run: |
           . "${SETUP_SCRIPT}"
           FAILED_FLAG=""
-          if [[ "${{ steps.run_unit_tests.outcome }}" != "success" || "${{ steps.run_correctness_tests.outcome }}" != "success" ]]; then
+          if [[ "${{ steps.run_unit_tests.outcome }}" != "success" ||
+                "${{ steps.run_correctness_tests.outcome }}" != "success" ||
+                "${{ steps.run_hstu_tests.outcome }}" != "success" ]]; then
             FAILED_FLAG="--failed --bucket mi350-tlx-job-failed"
           fi
           python3 .github/scripts/parse_junit_failures.py \
-            --junit /tmp/tlx-unit.xml /tmp/tlx-correctness.xml \
+            --junit /tmp/tlx-unit.xml /tmp/tlx-correctness.xml /tmp/tlx-hstu.xml \
             --workflow "${GITHUB_WORKFLOW}" \
             --job "mi350-tlx-test" \
             ${FAILED_FLAG}
