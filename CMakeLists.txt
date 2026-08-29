@@ -428,8 +428,14 @@ if(TRITON_BUILD_PYTHON_MODULE)
                   ${PYTHON_SRC_PATH}/passes.cc
                   ${PYTHON_SRC_PATH}/interpreter.cc
                   ${PYTHON_SRC_PATH}/llvm.cc
+                  ${PYTHON_SRC_PATH}/LlirSchedule.cpp
                   ${PYTHON_SRC_PATH}/bitequiv.cc
                   ${PYTHON_SRC_PATH}/specialize.cc)
+  # The native LLIR scheduler uses LLVM value handles (CloneFunction/ValueMap);
+  # LLVM is built -fno-rtti, so match it here to avoid an undefined typeinfo
+  # (llvm::CallbackVH) at load time.
+  set_source_files_properties(${PYTHON_SRC_PATH}/LlirSchedule.cpp
+                              PROPERTIES COMPILE_FLAGS "-fno-rtti")
 
   # Link triton with its dependencies
   target_link_libraries(triton PRIVATE ${TRITON_LIBRARIES})

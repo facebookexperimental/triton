@@ -841,6 +841,10 @@ void init_triton_tlx_ir(py::module_ &m) {
            [](TritonOpBuilder &self, Value barrier, Value numThreads) -> void {
              self.create<ttng::NamedBarrierArriveOp>(barrier, numThreads);
            })
+      // AMD scheduling-only fence (no memory/exec barrier). mask selects which
+      // instruction classes may cross (0 = none). Also carries the reserved
+      // sentinel masks that mark an LLIR-scheduler region (see
+      // tlx.sched_region_begin/end + LlirSchedule.cpp).
       .def("create_amd_sched_barrier",
            [](TritonOpBuilder &self, int32_t mask) {
              self.create<ROCDL::SchedBarrier>(
