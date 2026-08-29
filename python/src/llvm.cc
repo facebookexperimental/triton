@@ -11,6 +11,8 @@
 #include "llvm/CodeGen/MIRParser/MIRParser.h"
 #include "llvm/CodeGen/MachineModuleInfo.h"
 #include "llvm/CodeGen/MachineRegisterInfo.h"
+#include "llvm/CodeGen/SchedulerRegistry.h"
+#include "llvm/CodeGen/SelectionDAGISel.h"
 #include "llvm/Config/llvm-config.h"
 #include "llvm/IR/DebugInfo.h"
 #include "llvm/IR/IRBuilder.h"
@@ -32,6 +34,7 @@
 #include "llvm/Plugins/PassPlugin.h"
 #include "llvm/Support/CodeGen.h"
 #include "llvm/Support/Parallel.h"
+#include "llvm/Support/SaveAndRestore.h"
 #include "llvm/Support/Signals.h"
 #include "llvm/Support/SourceMgr.h"
 #include "llvm/Support/TargetSelect.h"
@@ -47,6 +50,7 @@
 #include <csignal>
 #include <cstdio>
 #include <memory>
+#include <mutex>
 #include <nanobind/make_iterator.h>
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/optional.h>
@@ -166,6 +170,29 @@ struct LLVMOptionSettings {
       setFlag("print-after-all", true);
   }
 };
+
+thread_local bool scheduleForRegisters = false;
+
+ScheduleDAGSDNodes *createTritonDAGScheduler(SelectionDAGISel *selector,
+                                             CodeGenOptLevel optLevel) {
+  // LLVM's scheduler callback has no user-data argument. Keep the requested
+  // policy local to the thread performing this compilation.
+  if (scheduleForRegisters && selector->TM.getTargetTriple().isNVPTX())
+    return createBURRListDAGScheduler(selector, optLevel);
+  return createDefaultScheduler(selector, optLevel);
+}
+
+void installTritonDAGScheduler() {
+  static RegisterScheduler scheduler("triton-nvptx",
+                                     "Triton compilation-local NVPTX scheduler",
+                                     createTritonDAGScheduler);
+  auto options = llvm::cl::getRegisteredOptions();
+  auto option = options.find("pre-RA-sched");
+  if (option == options.end())
+    throw std::runtime_error("LLVM SelectionDAG scheduler option is missing");
+  if (option->second->addOccurrence(1, "pre-RA-sched", "triton-nvptx"))
+    throw std::runtime_error("failed to install Triton's LLVM scheduler");
+}
 
 std::unique_ptr<TargetMachine>
 createTargetMachine(llvm::Module *module, std::string proc,
@@ -857,6 +884,8 @@ void init_triton_llvm(py::module_ &m) {
         {
           // when allow_threads goes out of scope, gil will be released
           py::gil_scoped_release allow_threads;
+          llvm::SaveAndRestore schedulingPolicy(scheduleForRegisters,
+                                                sched4reg);
           // create LLVM module from C++
           llvm::LLVMContext context;
           std::unique_ptr<llvm::MemoryBuffer> buffer =
@@ -966,6 +995,10 @@ void init_triton_llvm(py::module_ &m) {
       LLVMInitializeAMDGPUTargetMC();
       LLVMInitializeAMDGPUAsmParser();
       LLVMInitializeAMDGPUAsmPrinter();
+
+      // Installed exactly once, before any target compilation. The dispatcher
+      // reads thread-local state and is safe for parallel codegen.
+      installTritonDAGScheduler();
     });
     // Disable LLVM's internal parallelism. Triton kernels produce small LLVM
     // modules where pass-level parallelism is not beneficial, and LLVM's global
