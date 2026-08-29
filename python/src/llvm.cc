@@ -1,4 +1,3 @@
-#include "lib/Target/LLVMIR/LLVMPasses.h"
 #include "mlir/IR/BuiltinOps.h" // mlir::ModuleOp
 #include "mlir/Target/LLVMIR/LLVMTranslationInterface.h"
 #include "mlir/Target/LLVMIR/ModuleTranslation.h"
@@ -44,7 +43,6 @@
 #include "llvm/Transforms/Instrumentation/AddressSanitizer.h"
 #include "llvm/Transforms/Instrumentation/AddressSanitizerOptions.h"
 #include "llvm/Transforms/Scalar.h"
-#include "llvm/Transforms/Scalar/InstSimplifyPass.h"
 #include <chrono>
 #include <csignal>
 #include <cstdio>
@@ -61,6 +59,14 @@
 #include <unordered_set>
 
 namespace py = nanobind;
+
+namespace llvm {
+struct BreakStructPhiNodesPass
+    : OptionalPassInfoMixin<BreakStructPhiNodesPass> {
+  PreservedAnalyses run(Function &F, FunctionAnalysisManager &AM);
+  static StringRef name() { return "BreakStructPhiNodesPass"; }
+};
+} // namespace llvm
 
 using namespace llvm;
 
@@ -706,8 +712,7 @@ void init_triton_llvm(py::module_ &m) {
       [](llvm::Module *mod, const llvm::OptimizationLevel &opt,
          std::string arch, std::string features, std::vector<std::string> flags,
          bool enable_fp_fusion, bool disable_slp_vectorizer,
-         bool disable_vector_combine, bool expand_masked_div_rem,
-         bool scalarize_packed_fops, bool vectorize_extracted_adds) {
+         bool disable_vector_combine, bool expand_masked_div_rem) {
         if (mlir::triton::tools::getBoolEnv("DISABLE_LLVM_OPT"))
           return;
         // Declare the same flags as codegen even though IR optimization does
@@ -826,16 +831,6 @@ void init_triton_llvm(py::module_ &m) {
           mpm.addPass(AddressSanitizerPass(Opts));
         }
         mpm.addPass(pb.buildPerModuleDefaultPipeline(opt));
-        if (vectorize_extracted_adds || scalarize_packed_fops) {
-          FunctionPassManager fpm;
-          if (vectorize_extracted_adds)
-            fpm.addPass(VectorizeExtractedAddsPass());
-          if (scalarize_packed_fops) {
-            fpm.addPass(ScalarizePackedFOpsPass());
-            fpm.addPass(InstSimplifyPass());
-          }
-          mpm.addPass(createModuleToFunctionPassAdaptor(std::move(fpm)));
-        }
         if (expand_masked_div_rem)
           mpm.addPass(ExpandMaskedDivRemPass());
         mpm.run(*mod, mam);
@@ -850,8 +845,6 @@ void init_triton_llvm(py::module_ &m) {
       py::arg("disable_slp_vectorizer") = false,
       py::arg("disable_vector_combine") = false,
       py::arg("expand_masked_div_rem") = false,
-      py::arg("scalarize_packed_fops") = false,
-      py::arg("vectorize_extracted_adds") = false,
       py::call_guard<py::gil_scoped_release>());
 
   m.def(

@@ -1394,8 +1394,7 @@ class CUDABackend(BaseBackend):
             llvm_mod, llvm.OPTIMIZE_O3,
             # Same LLVM flags as make_ptx: compilations sharing a process only
             # run in parallel while their flag sets are identical.
-            flags=flags, disable_slp_vectorizer=capability == 80, expand_masked_div_rem=True,
-            vectorize_extracted_adds=True, scalarize_packed_fops=False)
+            flags=flags, disable_slp_vectorizer=capability == 80, expand_masked_div_rem=True)
 
         # Get some metadata
         # warp-specialization mutates num_warps
