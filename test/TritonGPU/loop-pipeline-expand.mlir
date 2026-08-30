@@ -60,6 +60,40 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
 
 // -----
 
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: @operand_use_stage
+  // The stage-0 wait is peeled into the prologue using the phase available at
+  // stage 0. In steady state its phase operand is a loop-carried value from
+  // the preceding iteration, as requested by its +1 operand-stage offset.
+  // CHECK: [[BAR:%[0-9]+]] = ttg.local_alloc
+  // CHECK: ttng.wait_barrier [[BAR]], %c0_i32, %true
+  // CHECK: scf.for {{.*}} iter_args([[PREV_PHASE:%arg[0-9]+]] = %c0_i32)
+  // CHECK: [[NEXT_IV:%[0-9]+]] = arith.addi
+  // CHECK: [[NEXT_PHASE:%[0-9]+]] = arith.andi [[NEXT_IV]], %c1_i32
+  // CHECK: ttng.wait_barrier [[BAR]], [[PREV_PHASE]]
+  // CHECK: scf.yield [[NEXT_PHASE]]
+  // CHECK-NOT: loop.operand_stage_offsets
+  tt.func public @operand_use_stage() {
+    %c0 = arith.constant 0 : i32
+    %c1 = arith.constant 1 : i32
+    %c4 = arith.constant 4 : i32
+    %bar = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    scf.for %i = %c0 to %c4 step %c1 : i32 {
+      %parity = arith.andi %i, %c1 {loop.cluster = 0 : i32, loop.stage = 0 : i32} : i32
+      %phase = arith.extui %parity {loop.cluster = 0 : i32, loop.stage = 0 : i32} : i32 to i64
+      %phase_i32 = arith.trunci %phase {loop.cluster = 0 : i32, loop.stage = 0 : i32} : i64 to i32
+      ttng.wait_barrier %bar, %phase_i32 {loop.cluster = 1 : i32, loop.operand_stage_offsets = array<i32: 0, 1>, loop.stage = 0 : i32} : !ttg.memdesc<1xi64, #shared, #smem, mutable>
+      %unused = arith.addi %i, %c1 {loop.cluster = 2 : i32, loop.stage = 1 : i32} : i32
+      scf.yield
+    } {tt.num_stages = 2 : i32, tt.scheduled_max_stage = 1 : i32}
+    tt.return
+  }
+}
+
+// -----
+
 #blocked = #ttg.blocked<{sizePerThread = [1, 64], threadsPerWarp = [32, 1], warpsPerCTA = [8, 1], order = [0, 1]}>
 #shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
 #shared1 = #ttg.nvmma_shared<{swizzlingByteWidth = 64, transposed = false, elementBitWidth = 16}>

@@ -59,12 +59,15 @@ protected:
   ForOp forOp;
   unsigned maxStage = 0;
   DenseMap<Operation *, unsigned> stages;
+  DenseMap<OpOperand *, unsigned> operandUseStages;
   std::vector<Operation *> opOrder;
   Value ub;
   Value lb;
   Value step;
   bool dynamicLoop;
   triton::PipeliningOption::AnnotationlFnType annotateFn = nullptr;
+  triton::PipeliningOption::GetOperandUseStageFnType getOperandUseStageFn =
+      nullptr;
   bool peelEpilogue;
   triton::PipeliningOption::PredicateOpFnType predicateFn = nullptr;
   triton::PipeliningOption::EmitPredicateStageFnType emitPredicateStageFn =
@@ -84,6 +87,10 @@ protected:
   /// the loop return the associated defining op in the loop and its distance to
   /// the Value.
   std::pair<Operation *, int64_t> getDefiningOpAndDistance(Value value);
+
+  /// Return the logical stage at which `operand` is consumed. This can differ
+  /// from the stage where `scheduledOp` is emitted.
+  unsigned getOperandUseStage(Operation *scheduledOp, OpOperand &operand);
 
   /// Return true if the schedule is possible and return false otherwise. A
   /// schedule is correct if all definitions are scheduled before uses.
@@ -190,6 +197,36 @@ bool LoopPipelinerInternal::initializeLoopInfo(
     }
   }
 
+  getOperandUseStageFn = options.getOperandUseStageFn;
+  for (Operation *scheduledOp : opOrder) {
+    unsigned operationStage = stages[scheduledOp];
+    bool invalid = false;
+    scheduledOp->walk([&](Operation *nestedOp) {
+      for (OpOperand &operand : nestedOp->getOpOperands()) {
+        FailureOr<unsigned> useStage = operationStage;
+        if (getOperandUseStageFn)
+          useStage = getOperandUseStageFn(scheduledOp, operand, operationStage);
+        if (failed(useStage)) {
+          invalid = true;
+          return;
+        }
+        if (*useStage < operationStage || *useStage > maxStage) {
+          scheduledOp->emitOpError()
+              << "operand use stage " << *useStage
+              << " must be between the operation stage " << operationStage
+              << " and maximum stage " << maxStage;
+          invalid = true;
+          return;
+        }
+        operandUseStages[&operand] = *useStage;
+      }
+    });
+    if (invalid) {
+      LDBG("--invalid operand use stage -> BAIL");
+      return false;
+    }
+  }
+
   if (!verifySchedule()) {
     LDBG("--invalid schedule: " << op << " -> BAIL");
     return false;
@@ -242,34 +279,43 @@ bool LoopPipelinerInternal::verifySchedule() {
   int64_t numCylesPerIter = opOrder.size();
   // Pre-compute the unrolled cycle of each op.
   DenseMap<Operation *, int64_t> unrolledCyles;
+  DenseMap<Operation *, int64_t> cycles;
   for (int64_t cycle = 0; cycle < numCylesPerIter; cycle++) {
     Operation *def = opOrder[cycle];
     auto it = stages.find(def);
     assert(it != stages.end());
     int64_t stage = it->second;
+    cycles[def] = cycle;
     unrolledCyles[def] = cycle + stage * numCylesPerIter;
   }
   for (Operation *consumer : opOrder) {
-    int64_t consumerCycle = unrolledCyles[consumer];
-    for (Value operand : getNestedOperands(consumer)) {
-      auto [producer, distance] = getDefiningOpAndDistance(operand);
-      if (!producer)
-        continue;
-      auto it = unrolledCyles.find(producer);
-      // Skip producer coming from outside the loop.
-      if (it == unrolledCyles.end())
-        continue;
-      int64_t producerCycle = it->second;
-      if (consumerCycle < producerCycle - numCylesPerIter * distance) {
-        InFlightDiagnostic diag =
-            consumer->emitWarning("operation scheduled before its operands. "
-                                  "Pipelining will be disabled.");
-        diag.attachNote(producer->getLoc())
-            .append("operand defined here: ")
-            .appendOp(*producer, OpPrintingFlags().printGenericOpForm());
-        return false;
+    bool invalid = false;
+    consumer->walk([&](Operation *nestedOp) {
+      for (OpOperand &operand : nestedOp->getOpOperands()) {
+        auto [producer, distance] = getDefiningOpAndDistance(operand.get());
+        if (!producer)
+          continue;
+        auto it = unrolledCyles.find(producer);
+        // Skip producer coming from outside the loop.
+        if (it == unrolledCyles.end())
+          continue;
+        int64_t useStage = getOperandUseStage(consumer, operand);
+        int64_t consumerCycle = cycles[consumer] + useStage * numCylesPerIter;
+        int64_t producerCycle = it->second;
+        if (consumerCycle < producerCycle - numCylesPerIter * distance) {
+          InFlightDiagnostic diag = consumer->emitWarning(
+              "operation scheduled before its operands. Pipelining will be "
+              "disabled.");
+          diag.attachNote(producer->getLoc())
+              .append("operand defined here: ")
+              .appendOp(*producer, OpPrintingFlags().printGenericOpForm());
+          invalid = true;
+          return;
+        }
       }
-    }
+    });
+    if (invalid)
+      return false;
   }
   return true;
 }
@@ -278,16 +324,20 @@ bool LoopPipelinerInternal::verifySchedule() {
 /// operands of nested ops that:
 /// 1) aren't defined within the new op or
 /// 2) are block arguments.
-static Operation *
-cloneAndUpdateOperands(RewriterBase &rewriter, Operation *op,
-                       function_ref<void(OpOperand *newOperand)> callback) {
-  Operation *clone = rewriter.clone(*op);
-  clone->walk<WalkOrder::PreOrder>([&](Operation *nested) {
-    // 'clone' itself will be visited first.
+static Operation *cloneAndUpdateOperands(
+    RewriterBase &rewriter, Operation *op,
+    function_ref<void(OpOperand *oldOperand, OpOperand *newOperand)> callback) {
+  IRMapping mapping;
+  Operation *clone = rewriter.clone(*op, mapping);
+  op->walk<WalkOrder::PreOrder>([&](Operation *nested) {
+    Operation *nestedClone = mapping.lookup(nested);
     for (OpOperand &operand : nested->getOpOperands()) {
       Operation *def = operand.get().getDefiningOp();
-      if ((def && !clone->isAncestor(def)) || isa<BlockArgument>(operand.get()))
-        callback(&operand);
+      if ((def && !op->isAncestor(def)) || isa<BlockArgument>(operand.get())) {
+        OpOperand &newOperand =
+            nestedClone->getOpOperand(operand.getOperandNumber());
+        callback(&operand, &newOperand);
+      }
     }
   });
   return clone;
@@ -335,11 +385,13 @@ LogicalResult LoopPipelinerInternal::emitPrologue(RewriterBase &rewriter) {
     for (Operation *op : opOrder) {
       if (stages[op] > i)
         continue;
-      Operation *newOp =
-          cloneAndUpdateOperands(rewriter, op, [&](OpOperand *newOperand) {
+      Operation *newOp = cloneAndUpdateOperands(
+          rewriter, op, [&](OpOperand *oldOperand, OpOperand *newOperand) {
             auto it = valueMapping.find(newOperand->get());
             if (it != valueMapping.end()) {
-              Value replacement = it->second[i - stages[op]];
+              unsigned useStage =
+                  std::min<unsigned>(getOperandUseStage(op, *oldOperand), i);
+              Value replacement = it->second[i - useStage];
               newOperand->set(replacement);
             }
           });
@@ -383,20 +435,19 @@ llvm::MapVector<Value, LoopPipelinerInternal::LiverangeInfo>
 LoopPipelinerInternal::analyzeCrossStageValues() {
   llvm::MapVector<Value, LoopPipelinerInternal::LiverangeInfo> crossStageValues;
   for (Operation *op : opOrder) {
-    unsigned stage = stages[op];
-
     auto analyzeOperand = [&](OpOperand &operand) {
+      unsigned useStage = getOperandUseStage(op, operand);
       auto [def, distance] = getDefiningOpAndDistance(operand.get());
       if (!def)
         return;
       auto defStage = stages.find(def);
-      if (defStage == stages.end() || defStage->second == stage ||
-          defStage->second == stage + distance)
+      if (defStage == stages.end() || defStage->second == useStage ||
+          defStage->second == useStage + distance)
         return;
-      assert(stage > defStage->second);
+      assert(useStage > defStage->second);
       LiverangeInfo &info = crossStageValues[operand.get()];
       info.defStage = defStage->second;
-      info.lastUseStage = std::max(info.lastUseStage, stage);
+      info.lastUseStage = std::max(info.lastUseStage, useStage);
     };
 
     for (OpOperand &operand : op->getOpOperands())
@@ -411,6 +462,14 @@ LoopPipelinerInternal::analyzeCrossStageValues() {
 std::pair<Operation *, int64_t>
 LoopPipelinerInternal::getDefiningOpAndDistance(Value value) {
   return triton::getDefiningOpAndDistance(forOp, value);
+}
+
+unsigned LoopPipelinerInternal::getOperandUseStage(Operation *scheduledOp,
+                                                   OpOperand &operand) {
+  auto it = operandUseStages.find(&operand);
+  assert(it != operandUseStages.end() &&
+         "operand use stage was not initialized");
+  return it->second;
 }
 
 scf::ForOp LoopPipelinerInternal::createKernelLoop(
@@ -503,7 +562,7 @@ LogicalResult LoopPipelinerInternal::createKernel(
     }
   }
   for (Operation *op : opOrder) {
-    int64_t useStage = stages[op];
+    int64_t operationStage = stages[op];
     auto *newOp = rewriter.clone(*op, mapping);
     SmallVector<OpOperand *> operands;
     // Collect all the operands for the cloned op and its nested ops.
@@ -513,19 +572,20 @@ LogicalResult LoopPipelinerInternal::createKernel(
       }
     });
     for (OpOperand *operand : operands) {
+      int64_t useStage = getOperandUseStage(op, *operand);
       Operation *nestedNewOp = mapping.lookup(operand->getOwner());
       // Special case for the induction variable uses. We replace it with a
       // version incremented based on the stage where it is used.
       if (operand->get() == forOp.getInductionVar()) {
         rewriter.setInsertionPoint(newOp);
 
-        // offset = (maxStage - stages[op]) * step
+        // offset = (maxStage - useStage) * step
         Type t = step.getType();
         Value offset = arith::MulIOp::create(
             rewriter, forOp.getLoc(), step,
             arith::ConstantOp::create(
                 rewriter, forOp.getLoc(),
-                rewriter.getIntegerAttr(t, maxStage - stages[op])));
+                rewriter.getIntegerAttr(t, maxStage - useStage)));
         Value iv = arith::AddIOp::create(rewriter, forOp.getLoc(),
                                          newForOp.getInductionVar(), offset);
         nestedNewOp->setOperand(operand->getOperandNumber(), iv);
@@ -576,9 +636,9 @@ LogicalResult LoopPipelinerInternal::createKernel(
                               newForOp.getRegionIterArgs()[remap->second]);
     }
 
-    if (predicates[useStage]) {
+    if (predicates[operationStage]) {
       OpBuilder::InsertionGuard insertGuard(rewriter);
-      newOp = predicateFn(rewriter, newOp, predicates[useStage]);
+      newOp = predicateFn(rewriter, newOp, predicates[operationStage]);
       if (!newOp)
         return failure();
       // Remap the results to the new predicated one.
@@ -722,11 +782,13 @@ LoopPipelinerInternal::emitEpilogue(RewriterBase &rewriter,
         continue;
       unsigned currentVersion = maxStage - stages[op] + i;
       unsigned nextVersion = currentVersion + 1;
-      Operation *newOp =
-          cloneAndUpdateOperands(rewriter, op, [&](OpOperand *newOperand) {
+      Operation *newOp = cloneAndUpdateOperands(
+          rewriter, op, [&](OpOperand *oldOperand, OpOperand *newOperand) {
             auto it = valueMapping.find(newOperand->get());
             if (it != valueMapping.end()) {
-              Value replacement = it->second[currentVersion];
+              unsigned useStage = getOperandUseStage(op, *oldOperand);
+              unsigned operandVersion = maxStage - useStage + i;
+              Value replacement = it->second[operandVersion];
               newOperand->set(replacement);
             }
           });
