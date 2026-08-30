@@ -3032,6 +3032,9 @@ void insertAsyncComm(
     // own phase, not the owner's inner phase. In FA persistent this covers m_ij
     // / l_i0 read once per tile in the epilogue.
     SmallVector<Channel *> wholeOverwriteBackedgeSiblings;
+    // Inner-loop siblings that start at the whole-overwrite owner's first TMEM
+    // column. Their EMPTY acquire executes at the owner's stage and order.
+    SmallVector<Channel *> wholeOverwriteInnerSiblings;
     // True when masterChannel is the representative of a reuse group whose
     // producer overwrites the whole physical buffer. Used by a debug-only
     // verifier in the emission step to ensure no packed sibling's backward
@@ -3134,24 +3137,44 @@ void insertAsyncComm(
                   return ownerOverwriteLoop && producer &&
                          ownerOverwriteLoop->isProperAncestor(producer);
                 };
+            auto getTmemColumnRange = [](Channel *ch) {
+              Operation *alloc = ch->getAllocOp();
+              assert(alloc && "TMEM reuse channel must have an allocation");
+              auto type = cast<ttg::MemDescType>(alloc->getResult(0).getType());
+              int64_t offset = 0;
+              if (auto attr =
+                      alloc->getAttrOfType<IntegerAttr>("buffer.offset"))
+                offset = attr.getInt();
+              int64_t columns = ttng::getTmemAllocSizes(type).numCols;
+              return std::pair<int64_t, int64_t>{offset, offset + columns};
+            };
+            auto [ownerLo, ownerHi] = getTmemColumnRange(owner);
             for (Channel *sibling : group->channels) {
               if (sibling == owner)
                 continue;
               // Skip siblings all of whose consumers are in the owner
-              // producer's own partition (e.g. the P matrix at offset 0
-              // consumed by the PV MMA in the same gemm partition) - program
+              // producer's own partition (e.g. the P matrix consumed by the
+              // PV MMA in the same gemm partition) - program
               // order orders those.
               if (!hasConsumerOutsideTask(sibling, ownerProducerTask))
                 continue;
-              // Siblings produced within the owner's overwrite loop have the
-              // same cadence as the overwrite and are already ordered by their
-              // own per-iteration channel barriers. Siblings produced outside
-              // that loop may remain live until after the loop, so the next
-              // repeated overwrite must wait for their consumers. In FA
-              // persistent, alpha is inside the loop while m_ij/l_i0 are read
-              // once per tile in the epilogue.
-              if (isProducedWithinOverwriteLoop(sibling))
+              // Most siblings produced within the owner's overwrite loop are
+              // ordered by their own per-iteration barriers.  A narrower
+              // sibling starting at the owner's first column is different:
+              // its own acquire occurs at the later sibling producer, so it
+              // does not stop the earlier whole-allocation owner from
+              // clobbering the previous sibling value.  Make the owner acquire
+              // that sibling's EMPTY barrier too.  This is the qK/dQ edge in
+              // FA-bwd; P begins at a different column and does not qualify.
+              if (isProducedWithinOverwriteLoop(sibling)) {
+                auto [siblingLo, siblingHi] = getTmemColumnRange(sibling);
+                if (siblingLo == ownerLo && siblingHi < ownerHi)
+                  wholeOverwriteInnerSiblings.push_back(sibling);
                 continue;
+              }
+              // Siblings produced outside the loop may remain live until its
+              // epilogue, so the next repeated overwrite waits at outer
+              // cadence using the sibling's phase.
               wholeOverwriteBackedgeSiblings.push_back(sibling);
             }
           }
@@ -4294,6 +4317,124 @@ void insertAsyncComm(
                       .build(funcOp.getContext()));
         }
       }
+    }
+
+    // Same-cadence whole-allocation overwrite dependencies. Emit the missing
+    // sibling EMPTY acquire at the owner's physical schedule position. For
+    // FA-bwd this is dQ(i) EMPTY -> qK(i+1).
+    //
+    // The owner and sibling occupy adjacent pipeline stages. At the owner's
+    // stage, accumCnt is C_t for the first logical iteration and C_t + j in
+    // later iterations. The loop-carried MMA useAccumulator flag is false for
+    // the first iteration and true thereafter. Select the current count on the
+    // first iteration and the preceding count afterwards:
+    //
+    //   phaseCount = useAccumulator ? accumCnt - 1 : accumCnt
+    //
+    // Thus ordinary SWP expansion produces C_t in the prologue and
+    // C_t + j - 1 in steady state, exactly the sibling phase needed by a wait
+    // physically attached to the owner. All generated operations stay at the
+    // owner's stage; no mixed placement/operand-stage support is required.
+    if (!wholeOverwriteInnerSiblings.empty()) {
+      scf::ForOp ownerLoop = headProducer->getParentOfType<scf::ForOp>();
+      assert(ownerLoop &&
+             "inner whole-overwrite reuse requires an enclosing loop");
+
+      Value useAccumulatorFlag;
+      ownerLoop.getBody()->walk([&](ttng::MMAv5OpInterface mma) {
+        if (useAccumulatorFlag ||
+            mma->getParentOfType<scf::ForOp>() != ownerLoop)
+          return;
+        Value candidate = mma.useAccumulator();
+        auto blockArg = dyn_cast<BlockArgument>(candidate);
+        if (!blockArg || blockArg.getOwner() != ownerLoop.getBody() ||
+            blockArg.getArgNumber() == 0)
+          return;
+        unsigned iterArgIdx = blockArg.getArgNumber() - 1;
+        auto yield = cast<scf::YieldOp>(ownerLoop.getBody()->getTerminator());
+        if (matchPattern(ownerLoop.getInitArgs()[iterArgIdx], m_Zero()) &&
+            matchPattern(yield.getOperand(iterArgIdx), m_One()))
+          useAccumulatorFlag = candidate;
+      });
+      assert(useAccumulatorFlag &&
+             "expected a loop-carried MMA useAccumulator flag");
+
+      DenseSet<Value> emittedInnerBarriers;
+      DenseSet<Value> emittedInnerTokens;
+      for (Channel *sib : wholeOverwriteInnerSiblings) {
+        auto sibTokenIt = tokenMap.find(sib);
+        assert(sibTokenIt != tokenMap.end() &&
+               "whole-overwrite sibling must have communication state");
+        auto &sibComm = sibTokenIt->second;
+        Operation *sibProducer = sib->getSrcOp();
+        auto siblingStage =
+            sibProducer->getAttrOfType<IntegerAttr>(tt::kLoopStageAttrName);
+        auto ownerStage =
+            headProducer->getAttrOfType<IntegerAttr>(tt::kLoopStageAttrName);
+        assert(siblingStage && ownerStage &&
+               "inner whole-overwrite reuse requires a scheduled loop");
+        int64_t stageOffset = siblingStage.getInt() - ownerStage.getInt();
+        assert(stageOffset == 1 &&
+               "stage-local phase reconstruction requires the sibling one "
+               "stage after its owner");
+
+        builder.setAsynTaskIdsFromArray(masterChannel->relation.first);
+        builder.setInsertionPoint(headProducer);
+        builder.setLoopScheduleInfoFromOp(headProducer);
+        Value accumCnt =
+            getAccumCount(builder, sibProducer, regionsWithChannels, config,
+                          /*reuseGroupIdx=*/-1);
+        Value one;
+        if (accumCnt.getType().isIndex()) {
+          one = builder.createWithAsyncTaskIds<arith::ConstantIndexOp>(
+              sibProducer->getLoc(), 1);
+        } else {
+          auto intType = cast<IntegerType>(accumCnt.getType());
+          one = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
+              sibProducer->getLoc(), 1, intType.getWidth());
+        }
+        Value previousAccumCnt = builder.createWithAsyncTaskIds<arith::SubIOp>(
+            sibProducer->getLoc(), accumCnt, one);
+        Value phaseCount = builder.createWithAsyncTaskIds<arith::SelectOp>(
+            sibProducer->getLoc(), useAccumulatorFlag, previousAccumCnt,
+            accumCnt);
+        auto [sibBufferIdx, ownerPhase] = getBufferIdxAndPhase(
+            builder, sibProducer->getLoc(), phaseCount, sib->getNumBuffers());
+
+        for (int consumerTask : sib->relation.second) {
+          // A gen5 consumer releases the channel on its consumerBarrier. The
+          // producerBarrier is its FULL completion endpoint and does not
+          // protect the overwrite.
+          auto consumerBarrierIt = sibComm.consumerBarriers.find(consumerTask);
+          if (consumerBarrierIt != sibComm.consumerBarriers.end()) {
+            Value consumerBarrier = consumerBarrierIt->second;
+            if (!emittedInnerBarriers.insert(consumerBarrier).second)
+              continue;
+            Value barrier = getBarrierForPipelineStage(builder, consumerBarrier,
+                                                       sibBufferIdx);
+            Value one = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
+                sibProducer->getLoc(), 1, 1);
+            Value emptyPhase = builder.createWithAsyncTaskIds<arith::XOrIOp>(
+                sibProducer->getLoc(), ownerPhase, one);
+            Value phaseI32 = builder.createWithAsyncTaskIds<arith::ExtUIOp>(
+                sibProducer->getLoc(), builder.getI32Type(), emptyPhase);
+            builder.createWithAsyncTaskIds<ttng::WaitBarrierOp>(
+                sibProducer->getLoc(), barrier, phaseI32);
+            continue;
+          }
+          auto tokenIt = sibComm.tokens.find(consumerTask);
+          assert(tokenIt != sibComm.tokens.end() &&
+                 "whole-overwrite sibling is missing its EMPTY endpoint");
+          Value token = tokenIt->second;
+          if (!emittedInnerTokens.insert(token).second)
+            continue;
+          builder.createWithAsyncTaskIds<ttnvws::ProducerAcquireOp>(
+              sibProducer->getLoc(), token, sibBufferIdx, ownerPhase,
+              WSBarrierAttr::forDstTask(funcOp.getContext(), consumerTask)
+                  .build(funcOp.getContext()));
+        }
+      }
+      builder.clearLoopScheduleInfo();
     }
 
     // Whole-allocation overwrite back-edges. The owner producer repeats in an
