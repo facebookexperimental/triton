@@ -28,7 +28,6 @@ doTaskPartition          (Hopper only; skipped on Blackwell)
   → SoftwarePipeliner::lowerLoops
   → peelPartitionLoops   (first masked tile vs. unmasked remainder)
   → SoftwarePipeliner::expandLoops
-  → SoftwarePipeliner::materializeWholeOverwriteReuseWaits
 ```
 
 On Blackwell, task assignments are expected to come from an earlier partition

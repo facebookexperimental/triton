@@ -39,10 +39,10 @@
 // adjacent (index/phase arith ops sit between them), so we use ordered CHECK
 // (not CHECK-NEXT).
 //
-// The disjoint alpha_1 remains unrelated to the owner. The synthetic same-start
-// alpha_0 and its QK owner get a shared marker that survives software
-// pipelining. SoftwarePipeliner consumes that marker after expansion to combine
-// QK placement with alpha_0's expanded EMPTY-barrier phase.
+// The disjoint alpha_1 remains unrelated to the owner. For the synthetic
+// same-start alpha_0, code partitioning emits an acquire immediately before its
+// QK owner. The acquire has QK's stage/cluster, while its phase operand carries
+// a +1 logical-stage offset selecting alpha_0's stage during SWP expansion.
 //
 // NOTE ON BARRIER FUSION: if a future pass fuses these backward barriers (e.g.
 // onto a combined token, or merges them with the QK acquire; see
@@ -61,8 +61,9 @@
 // CHECK: nvws.producer_acquire %l_i0_{{[0-9_]+}}, {{.*}}async_task_id = array<i32: 1>{{.*}}dstTask = 0
 // Then the inner KV loop, which contains the useC=false QK MMA the back-edges gate:
 // CHECK: scf.for
-// CHECK: tc_gen5_mma {{.*}}ttng.whole_overwrite_reuse_owner = [[REUSE_ID:[0-9]+]] : i32
-// CHECK: ttng.tmem_store {{.*}}ttng.whole_overwrite_reuse_sibling = [[REUSE_ID]] : i32
+// CHECK: nvws.producer_acquire {{.*}}dstTask = 0{{.*}}loop.cluster = 2 : i32, loop.operand_stage_offsets = array<i32: 0, 0, 1>, loop.stage = 1 : i32
+// CHECK-NEXT: {{.*}}ttng.tc_gen5_mma {{.*}}loop.cluster = 2 : i32, loop.stage = 1 : i32
+// CHECK-NOT: ttng.whole_overwrite_reuse
 
 // -----// WarpSpec internal IR Dump After: doMemoryPlanner
 #blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>

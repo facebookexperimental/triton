@@ -656,17 +656,19 @@ deadlocks:
 - **Inner-cadence, same-start narrower siblings** (e.g. FA-bwd `dQ` sharing
   column 0 with the whole-allocation `qK` owner): the sibling's ordinary EMPTY
   acquire occurs at its later producer, so it cannot protect the previous
-  sibling value from the earlier owner overwrite. `WSCodePartition` records the
-  owner/sibling relationship on their producers, but does not emit a wait yet:
-  the owner's `loop.stage` gives the required qK placement while the sibling's
-  `loop.stage` gives the required dQ phase, and one scheduled operation cannot
-  express both. Immediately after modulo expansion, SoftwarePipeliner clones an
-  ordinary wait on the sibling's EMPTY barrier after the owner's own acquire.
-  The steady-state wait uses the already-expanded sibling phase (the previous
-  dQ generation); the prologue wait uses the owner's entry phase and predicate,
-  because no previous dQ producer exists yet. This leaves the wait before any
-  later 2-CTA issue handshake. The rule is based on the TMEM range, not cluster
-  size, and applies to 1-CTA kernels if they use the same layout.
+  sibling value from the earlier owner overwrite. `WSCodePartition` emits the
+  missing acquire immediately before the owner with the owner's `loop.stage`
+  and `loop.cluster`. Its phase operand carries
+  `loop.operand_stage_offsets = [..., siblingStage - ownerStage, ...]`.
+  Software-pipeline expansion therefore uses the owner's stage for placement
+  and predication while selecting the phase value at the sibling's logical
+  stage. During the first peeled owner copy that later phase is unavailable, so
+  expansion uses the latest available entry phase; in steady state the phase is
+  loop-carried by the stage difference and denotes the previous dQ generation.
+  The wait remains before any later 2-CTA issue handshake and, because its
+  placement stage is the owner's, it does not gain a sibling-stage epilogue
+  copy. The rule is based on the TMEM range, not cluster size, and applies to
+  1-CTA kernels if they use the same layout.
 - **Outer-cadence siblings** (produced *outside* the inner loop, e.g.
   `m_ij`/`l_i0`, read once per tile in the epilogue): these are the ones the next
   tile's first inner MMA clobbers. For each such sibling whose consumer is in a
@@ -706,10 +708,9 @@ Without the fix (race):              With the fix (per outer tile):
 `isWholeAllocationOverwriteReuseOwner(ownerCh)` returns true when `ownerCh` is the
 representative (its alloc has no `buffer.offset`) and is a `TmemAllocChannel`
 with `isOperandDNoAcc == true` (set in `createAllocChannel` when the producer MMA's
-`useAccumulator()` is constant-false). Same-start inner siblings are tagged with
-`ttng.whole_overwrite_reuse_owner` / `ttng.whole_overwrite_reuse_sibling` and
-materialized by `materializeWholeOverwriteReuseWaits` after pipeline expansion.
-Outer-cadence siblings are collected in `wholeOverwriteBackedgeSiblings`; a
+`useAccumulator()` is constant-false). Same-start inner siblings are emitted as
+ordinary scheduled acquires with a phase-operand stage offset. Outer-cadence
+siblings are collected in `wholeOverwriteBackedgeSiblings`; a
 debug-only assert in the emission step guards against silently dropping a
 required outer sibling back-edge (the bug class reappearing).
 Regression test:

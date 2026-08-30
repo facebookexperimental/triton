@@ -15,6 +15,7 @@ namespace mlir {
 
 class RewriterBase;
 class Operation;
+class OpOperand;
 class Value;
 
 namespace scf {
@@ -30,6 +31,15 @@ struct PipeliningOption {
   using GetScheduleFnType = std::function<void(
       scf::ForOp, std::vector<std::pair<Operation *, unsigned>> &)>;
   GetScheduleFnType getScheduleFn = nullptr;
+
+  /// Return the logical pipeline stage at which an operand is consumed. The
+  /// operation itself is still emitted at `operationStage`; only the selected
+  /// operand version is taken from the returned stage. Returning failure
+  /// rejects the schedule. The returned stage must be in
+  /// [operationStage, maxStage].
+  using GetOperandUseStageFnType = std::function<FailureOr<unsigned>(
+      Operation *, OpOperand &, unsigned operationStage)>;
+  GetOperandUseStageFnType getOperandUseStageFn = nullptr;
   enum class PipelinerPart {
     Prologue,
     Kernel,
