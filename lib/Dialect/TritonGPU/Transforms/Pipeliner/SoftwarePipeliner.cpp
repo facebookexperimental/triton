@@ -1,5 +1,7 @@
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/UB/IR/UBOps.h"
+#include "mlir/IR/Dominance.h"
+#include "mlir/IR/IRMapping.h"
 #include "mlir/IR/TypeUtilities.h"
 #include "mlir/IR/Verifier.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
@@ -34,6 +36,18 @@
 namespace mlir {
 namespace triton {
 namespace gpu {
+
+static constexpr StringLiteral kWholeOverwriteReuseOwnerAttr =
+    "ttng.whole_overwrite_reuse_owner";
+static constexpr StringLiteral kWholeOverwriteReuseSiblingAttr =
+    "ttng.whole_overwrite_reuse_sibling";
+
+struct WholeOverwriteReuseSpec {
+  Operation *scope;
+  Location ownerLoc;
+  Location siblingLoc;
+  OperationName siblingName;
+};
 
 #define GEN_PASS_DEF_TRITONGPUPIPELINE
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h.inc"
@@ -135,6 +149,196 @@ static bool needsCustomMetaWSEpiloguePeeling(scf::ForOp forOp) {
         return WalkResult::advance();
       })
       .wasInterrupted();
+}
+
+static SmallVector<WholeOverwriteReuseSpec>
+collectWholeOverwriteReuseSpecs(ModuleOp moduleOp) {
+  struct MarkedLocation {
+    Operation *scope;
+    int64_t marker;
+    Location loc;
+    OperationName name;
+  };
+  SmallVector<MarkedLocation> ownerLocs;
+  SmallVector<MarkedLocation> siblingLocs;
+  auto getMarker = [](Operation *op, StringRef name) -> std::optional<int64_t> {
+    if (auto attr = op->getAttrOfType<IntegerAttr>(name))
+      return attr.getInt();
+    return std::nullopt;
+  };
+  moduleOp.walk([&](Operation *op) {
+    Operation *scope = op->getParentOfType<triton::FuncOp>().getOperation();
+    if (auto marker = getMarker(op, kWholeOverwriteReuseOwnerAttr))
+      ownerLocs.push_back({scope, *marker, op->getLoc(), op->getName()});
+    if (auto marker = getMarker(op, kWholeOverwriteReuseSiblingAttr))
+      siblingLocs.push_back({scope, *marker, op->getLoc(), op->getName()});
+  });
+
+  SmallVector<WholeOverwriteReuseSpec> specs;
+  for (const auto &owner : ownerLocs)
+    for (const auto &sibling : siblingLocs)
+      if (sibling.scope == owner.scope && sibling.marker == owner.marker)
+        specs.push_back({owner.scope, owner.loc, sibling.loc, sibling.name});
+  return specs;
+}
+
+// Materialize a cross-stage TMEM reuse wait after modulo expansion. The owner
+// needs the sibling's phase but the owner's placement; one pre-expansion
+// loop.stage cannot express both. WSCodePartition records the relationship on
+// the producers while the reuse group is explicit. Snapshot their locations
+// before expansion because custom expansion paths may rebuild an operation
+// without copying arbitrary attributes; source locations remain stable on all
+// expanded copies. We can then copy the sibling's exact EMPTY-barrier phase to
+// the owner without teaching the generic scheduler a second, TMEM-specific
+// stage coordinate.
+static void
+materializeWholeOverwriteReuseWaits(ModuleOp moduleOp,
+                                    ArrayRef<WholeOverwriteReuseSpec> specs) {
+  auto locationsMatch = [&](nvidia_gpu::TCGen5MMAOp owner, Operation *sibling) {
+    Operation *scope = owner->getParentOfType<triton::FuncOp>().getOperation();
+    return llvm::any_of(specs, [&](const WholeOverwriteReuseSpec &spec) {
+      return scope == spec.scope && owner.getLoc() == spec.ownerLoc &&
+             sibling->getLoc() == spec.siblingLoc &&
+             sibling->getName() == spec.siblingName;
+    });
+  };
+  auto isSiblingCandidate = [&](Operation *sibling) {
+    Operation *scope =
+        sibling->getParentOfType<triton::FuncOp>().getOperation();
+    return llvm::any_of(specs, [&](const WholeOverwriteReuseSpec &spec) {
+      return scope == spec.scope && sibling->getLoc() == spec.siblingLoc &&
+             sibling->getName() == spec.siblingName;
+    });
+  };
+  auto findChannelWait = [](Operation *producer) -> nvidia_gpu::WaitBarrierOp {
+    for (Operation *op = producer->getPrevNode(); op; op = op->getPrevNode()) {
+      if (isa<nvidia_gpu::TCGen5MMAOp>(op))
+        break;
+      auto wait = dyn_cast<nvidia_gpu::WaitBarrierOp>(op);
+      if (!wait)
+        continue;
+      auto constraints = wait->getAttrOfType<DictionaryAttr>("constraints");
+      if (!constraints || !constraints.getAs<DictionaryAttr>("WSBarrier"))
+        continue;
+      if (wait.getLoc() == producer->getLoc())
+        return wait;
+    }
+    return {};
+  };
+
+  moduleOp.walk([&](Block *block) {
+    DominanceInfo dominance(block->getParentOp());
+    auto cloneValueBefore = [&](Value value, Operation *insertBefore,
+                                OpBuilder &builder) -> Value {
+      IRMapping mapping;
+      std::function<Value(Value)> cloneDependency =
+          [&](Value current) -> Value {
+        if (!current || dominance.dominates(current, insertBefore))
+          return current;
+        if (Value mapped = mapping.lookupOrNull(current))
+          return mapped;
+        Operation *def = current.getDefiningOp();
+        if (!def || !isPure(def)) {
+          return {};
+        }
+        for (Value operand : def->getOperands()) {
+          Value mapped = cloneDependency(operand);
+          if (!mapped)
+            return {};
+          mapping.map(operand, mapped);
+        }
+        builder.clone(*def, mapping);
+        return mapping.lookupOrNull(current);
+      };
+      return cloneDependency(value);
+    };
+
+    auto insertReuseWait = [&](nvidia_gpu::TCGen5MMAOp owner,
+                               nvidia_gpu::WaitBarrierOp ownerWait,
+                               nvidia_gpu::WaitBarrierOp siblingWait,
+                               Value phase, Value pred) {
+      for (Operation *op = owner->getPrevNode(); op; op = op->getPrevNode()) {
+        if (isa<nvidia_gpu::TCGen5MMAOp>(op))
+          break;
+        if (auto wait = dyn_cast<nvidia_gpu::WaitBarrierOp>(op);
+            wait && wait.getLoc() == siblingWait.getLoc() &&
+            !wait->getAttr("constraints"))
+          return;
+      }
+      OpBuilder builder(ownerWait);
+      builder.setInsertionPointAfter(ownerWait);
+      Operation *insertBefore = ownerWait->getNextNode();
+      bool hadPred = static_cast<bool>(pred);
+      Value alloc =
+          cloneValueBefore(siblingWait.getAlloc(), insertBefore, builder);
+      phase = cloneValueBefore(phase, insertBefore, builder);
+      pred = cloneValueBefore(pred, insertBefore, builder);
+      if (!alloc || !phase || (hadPred && !pred))
+        return;
+      auto cloned = pred
+                        ? nvidia_gpu::WaitBarrierOp::create(
+                              builder, siblingWait.getLoc(), alloc, phase, pred)
+                        : nvidia_gpu::WaitBarrierOp::create(
+                              builder, siblingWait.getLoc(), alloc, phase);
+      if (Attribute taskIds = siblingWait->getAttr("async_task_id"))
+        cloned->setAttr("async_task_id", taskIds);
+    };
+
+    // Steady-state copies: use the sibling's already-expanded phase at the
+    // preceding owner copy.
+    for (Operation &siblingOp : *block) {
+      Operation *sibling = &siblingOp;
+      if (!isSiblingCandidate(sibling))
+        continue;
+      auto siblingWait = findChannelWait(sibling);
+      if (!siblingWait)
+        continue;
+      for (Operation *candidate = sibling->getPrevNode(); candidate;
+           candidate = candidate->getPrevNode()) {
+        auto owner = dyn_cast<nvidia_gpu::TCGen5MMAOp>(candidate);
+        if (!owner || !locationsMatch(owner, sibling))
+          continue;
+        auto ownerWait = findChannelWait(owner.getOperation());
+        if (!ownerWait)
+          continue;
+        insertReuseWait(owner, ownerWait, siblingWait, siblingWait.getPhase(),
+                        siblingWait.getPred());
+        break;
+      }
+    }
+
+    // Prologue copies: the sibling remains in the nested steady-state loop.
+    // There is no prior sibling generation, so use the owner's entry phase and
+    // predicate against the sibling's EMPTY barrier allocation.
+    for (Operation &op : *block) {
+      auto owner = dyn_cast<nvidia_gpu::TCGen5MMAOp>(&op);
+      if (!owner || !llvm::any_of(specs, [&](const auto &spec) {
+            return owner->getParentOfType<triton::FuncOp>().getOperation() ==
+                       spec.scope &&
+                   owner.getLoc() == spec.ownerLoc;
+          }))
+        continue;
+      auto ownerWait = findChannelWait(owner.getOperation());
+      if (!ownerWait)
+        continue;
+      block->walk([&](Operation *sibling) {
+        if (!isSiblingCandidate(sibling))
+          return;
+        if (sibling->getBlock() == block || !locationsMatch(owner, sibling))
+          return;
+        auto siblingWait = findChannelWait(sibling);
+        if (!siblingWait)
+          return;
+        insertReuseWait(owner, ownerWait, siblingWait, ownerWait.getPhase(),
+                        ownerWait.getPred());
+      });
+    }
+  });
+
+  moduleOp.walk([](Operation *op) {
+    op->removeAttr(kWholeOverwriteReuseOwnerAttr);
+    op->removeAttr(kWholeOverwriteReuseSiblingAttr);
+  });
 }
 
 static void expandLoops(ModuleOp moduleOp) {
@@ -319,8 +523,14 @@ struct PipelinePass : public impl::TritonGPUPipelineBase<PipelinePass> {
           << moduleOp << "\n\n\n";
     }
 
+    // Preserve cross-stage reuse relationships across expansion. Custom
+    // expansion paths do not necessarily copy arbitrary operation attributes,
+    // but they do preserve source locations.
+    auto wholeOverwriteReuseSpecs = collectWholeOverwriteReuseSpecs(moduleOp);
+
     // Apply the pipeline expansion.
     expandLoops(moduleOp);
+    materializeWholeOverwriteReuseWaits(moduleOp, wholeOverwriteReuseSpecs);
     if (dumpIntermediateSteps) {
       ::mlir::triton::tools::mlirDumpsOrDbgs()
           << "// -----// SoftwarePipeliner internal IR Dump After: "

@@ -1,4 +1,5 @@
 // RUN: env TRITON_USE_META_WS=1 triton-opt %s '-tritongpu-schedule-loops=use-meta-ws=true num-stages=2' '--tritongpu-pipeline=num-stages=2' | FileCheck %s
+// RUN: env TRITON_USE_META_WS=1 triton-opt %s '-tritongpu-schedule-loops=use-meta-ws=true num-stages=2' '--tritongpu-pipeline=num-stages=2' | FileCheck %s --check-prefix=REUSE
 // Regression: warp-specialized loops containing a peer gather or TMA reduction
 // must use lockstep epilogue peeling. Generic epilogue predication cannot mask
 // the gather and independently predicating the reduction desynchronizes sibling
@@ -14,6 +15,23 @@
 // loads and loses the prologue/steady-state overlap.
 // CHECK: ttng.async_tma_copy_global_to_local %arg107{{.*}} {async_task_id = array<i32: 3>}
 // CHECK-LABEL: partition3({{.*}}) num_warps(4)
+
+// qK and dQ use different pipeline stages. The added dQ EMPTY wait must keep
+// qK's placement while using dQ's expanded phase. In the prologue there is no
+// preceding dQ producer, so the wait uses qK's entry phase and predicate.
+// REUSE-LABEL: partition0({{.*}}) num_warps(4)
+// REUSE: ttng.wait_barrier %{{.*}}, [[ENTRY_PHASE:%[0-9A-Za-z_#]+]], [[ENTRY_PRED:%[0-9A-Za-z_#]+]] {{.*}}maxRegionId = 2 : i32
+// REUSE-NEXT: [[DQ_ENTRY_BAR:%[0-9A-Za-z_#]+]] = ttg.memdesc_index
+// REUSE-NEXT: ttng.wait_barrier [[DQ_ENTRY_BAR]], [[ENTRY_PHASE]], [[ENTRY_PRED]] {async_task_id = array<i32: 1>}
+// In steady state, clone dQ's concrete phase calculation at qK's position.
+// REUSE: scf.for
+// REUSE: ttng.wait_barrier %{{.*}}, %{{.*}}, %true {{.*}}maxRegionId = 2 : i32
+// REUSE-NEXT: [[DQ_STEADY_BAR:%[0-9A-Za-z_#]+]] = ttg.memdesc_index
+// REUSE-NEXT: [[DQ_STEADY_PHASE:%[0-9A-Za-z_#]+]] = arith.extui [[DQ_RING:%[0-9A-Za-z_#]+]]
+// REUSE-NEXT: ttng.wait_barrier [[DQ_STEADY_BAR]], [[DQ_STEADY_PHASE]] {async_task_id = array<i32: 1>}
+// REUSE: [[DQ_OWN_PHASE:%[0-9A-Za-z_#]+]] = arith.extui [[DQ_RING]]
+// REUSE-NEXT: ttng.wait_barrier %{{.*}}, [[DQ_OWN_PHASE]] {{.*}}maxRegionId = 2 : i32
+// REUSE-NOT: ttng.whole_overwrite_reuse
 //
 // Two input modules: the first is the 5-MMA / 1-peer-gather shape the CHECKs
 // above pin, the second the 10-MMA / 2-peer-gather shape. A third module that
@@ -418,14 +436,14 @@ module {
             %210 = ttg.memdesc_index %arg129[%c0_i32_12] {async_task_id = array<i32: 1>, loop.cluster = 1 : i32, loop.stage = 0 : i32} : !ttg.memdesc<1x1xi64, #shared4, #smem, mutable> -> !ttg.memdesc<1xi64, #shared4, #smem, mutable>
             %211 = arith.xori %208, %true {loop.cluster = 1 : i32, loop.stage = 0 : i32} : i1
             %212 = arith.extui %211 {loop.cluster = 1 : i32, loop.stage = 0 : i32} : i1 to i32
-            ttng.wait_barrier %210, %212 {async_task_id = array<i32: 1>, constraints = {WSBarrier = {channelGraph = array<i32: 2, 3, 4>, dstTask = 4 : i32, maxRegionId = 2 : i32, minRegionId = 2 : i32, parentId = 2 : i32}}, loop.cluster = 1 : i32, loop.stage = 0 : i32} : !ttg.memdesc<1xi64, #shared4, #smem, mutable>
+            ttng.wait_barrier %210, %212 {async_task_id = array<i32: 1>, constraints = {WSBarrier = {channelGraph = array<i32: 2, 3, 4>, dstTask = 4 : i32, maxRegionId = 2 : i32, minRegionId = 2 : i32, parentId = 2 : i32}}, loop.cluster = 1 : i32, loop.stage = 0 : i32} : !ttg.memdesc<1xi64, #shared4, #smem, mutable> loc("qk_reuse")
             %213 = arith.andi %arg149, %c1_i64_6 {async_task_id = array<i32: 1>, loop.cluster = 1 : i32, loop.stage = 0 : i32} : i64
             %214 = arith.trunci %213 {async_task_id = array<i32: 1>, loop.cluster = 1 : i32, loop.stage = 0 : i32} : i64 to i1
             %215 = ttg.memdesc_index %arg75[%c0_i32_12] {async_task_id = array<i32: 1>, loop.cluster = 1 : i32, loop.stage = 0 : i32} : !ttg.memdesc<1x1xi64, #shared4, #smem, mutable> -> !ttg.memdesc<1xi64, #shared4, #smem, mutable>
             %216 = arith.xori %214, %true {async_task_id = array<i32: 1>, loop.cluster = 1 : i32, loop.stage = 0 : i32} : i1
             %217 = arith.extui %216 {async_task_id = array<i32: 1>, loop.cluster = 1 : i32, loop.stage = 0 : i32} : i1 to i32
             ttng.wait_barrier %215, %217 {async_task_id = array<i32: 1>, constraints = {WSBarrier = {direction = "backward", dstTask = 1 : i32}}, loop.cluster = 1 : i32, loop.stage = 0 : i32} : !ttg.memdesc<1xi64, #shared4, #smem, mutable>
-            %218 = ttng.tc_gen5_mma %204, %201, %205[], %false, %true, %206[%true], %209[%true] {async_task_id = array<i32: 1>, is_async, loop.cluster = 1 : i32, loop.stage = 0 : i32, tt.autows = "{\22stage\22: \220\22, \22order\22: \220\22, \22channels\22: [\22opndA,smem,1,0\22, \22opndB,smem,1,1\22, \22opndD,tmem,1,2\22]}", tt.self_latency = 0 : i32, two_ctas} : !ttg.memdesc<128x128xf16, #shared, #smem, mutable>, !ttg.memdesc<128x64xf16, #shared5, #smem, mutable>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.memdesc<1xi64, #shared4, #smem, mutable>, !ttg.memdesc<1xi64, #shared4, #smem, mutable>
+            %218 = ttng.tc_gen5_mma %204, %201, %205[], %false, %true, %206[%true], %209[%true] {async_task_id = array<i32: 1>, is_async, loop.cluster = 1 : i32, loop.stage = 0 : i32, tt.autows = "{\22stage\22: \220\22, \22order\22: \220\22, \22channels\22: [\22opndA,smem,1,0\22, \22opndB,smem,1,1\22, \22opndD,tmem,1,2\22]}", tt.self_latency = 0 : i32, ttng.whole_overwrite_reuse_owner = 7 : i32, two_ctas} : !ttg.memdesc<128x128xf16, #shared, #smem, mutable>, !ttg.memdesc<128x64xf16, #shared5, #smem, mutable>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.memdesc<1xi64, #shared4, #smem, mutable>, !ttg.memdesc<1xi64, #shared4, #smem, mutable> loc("qk_reuse")
             %219 = arith.andi %arg149, %c1_i64_6 {async_task_id = array<i32: 1>, loop.cluster = 5 : i32, loop.stage = 0 : i32} : i64
             %220 = arith.trunci %219 {async_task_id = array<i32: 1>, loop.cluster = 5 : i32, loop.stage = 0 : i32} : i64 to i1
             %221 = arith.andi %arg149, %c1_i64_6 {async_task_id = array<i32: 1>, loop.cluster = 5 : i32, loop.stage = 0 : i32} : i64
@@ -497,8 +515,8 @@ module {
             %279 = ttg.memdesc_index %arg94[%c0_i32_12] {async_task_id = array<i32: 1>, loop.cluster = 2 : i32, loop.stage = 1 : i32} : !ttg.memdesc<1x1xi64, #shared4, #smem, mutable> -> !ttg.memdesc<1xi64, #shared4, #smem, mutable>
             %280 = ttg.memdesc_index %arg133[%c0_i32_12] {async_task_id = array<i32: 1>, loop.cluster = 2 : i32, loop.stage = 1 : i32} : !ttg.memdesc<1x1xi64, #shared4, #smem, mutable> -> !ttg.memdesc<1xi64, #shared4, #smem, mutable>
             %281 = arith.extui %237 {loop.cluster = 2 : i32, loop.stage = 1 : i32} : i1 to i32
-            ttng.wait_barrier %280, %281 {async_task_id = array<i32: 1>, constraints = {WSBarrier = {channelGraph = array<i32: 2, 3, 4>, dstTask = 4 : i32, maxRegionId = 2 : i32, minRegionId = 2 : i32, parentId = 2 : i32}}, loop.cluster = 2 : i32, loop.stage = 1 : i32} : !ttg.memdesc<1xi64, #shared4, #smem, mutable>
-            %282 = ttng.tc_gen5_mma %273, %274, %277[], %false, %true, %278[%true], %279[%true] {async_task_id = array<i32: 1>, is_async, loop.cluster = 2 : i32, loop.stage = 1 : i32, tt.autows = "{\22stage\22: \221\22, \22order\22: \221\22, \22channels\22: [\22opndA,smem,1,8\22, \22opndD,tmem,1,5\22]}", ttng.two_cta_dependency = "requires_peer_gather", two_ctas} : !ttg.memdesc<64x256xf16, #shared5, #smem, mutable>, !ttg.memdesc<256x64xf16, #shared, #smem, mutable>, !ttg.memdesc<64x128xf32, #tmem2, #ttng.tensor_memory, mutable>, !ttg.memdesc<1xi64, #shared4, #smem, mutable>, !ttg.memdesc<1xi64, #shared4, #smem, mutable>
+            ttng.wait_barrier %280, %281 {async_task_id = array<i32: 1>, constraints = {WSBarrier = {channelGraph = array<i32: 2, 3, 4>, dstTask = 4 : i32, maxRegionId = 2 : i32, minRegionId = 2 : i32, parentId = 2 : i32}}, loop.cluster = 2 : i32, loop.stage = 1 : i32} : !ttg.memdesc<1xi64, #shared4, #smem, mutable> loc("dq_reuse")
+            %282 = ttng.tc_gen5_mma %273, %274, %277[], %false, %true, %278[%true], %279[%true] {async_task_id = array<i32: 1>, is_async, loop.cluster = 2 : i32, loop.stage = 1 : i32, tt.autows = "{\22stage\22: \221\22, \22order\22: \221\22, \22channels\22: [\22opndA,smem,1,8\22, \22opndD,tmem,1,5\22]}", ttng.two_cta_dependency = "requires_peer_gather", ttng.whole_overwrite_reuse_sibling = 7 : i32, two_ctas} : !ttg.memdesc<64x256xf16, #shared5, #smem, mutable>, !ttg.memdesc<256x64xf16, #shared, #smem, mutable>, !ttg.memdesc<64x128xf32, #tmem2, #ttng.tensor_memory, mutable>, !ttg.memdesc<1xi64, #shared4, #smem, mutable>, !ttg.memdesc<1xi64, #shared4, #smem, mutable> loc("dq_reuse")
             %283 = arith.addi %arg149, %c1_i64_6 {async_task_id = array<i32: 1>, loop.cluster = 0 : i32, loop.stage = 1 : i32} : i64
             scf.yield {async_task_id = array<i32: 1>} %true, %283 : i1, i64
           } {async_task_id = array<i32: 1>, tt.scheduled_max_stage = 1 : i32, tt.warp_specialize}

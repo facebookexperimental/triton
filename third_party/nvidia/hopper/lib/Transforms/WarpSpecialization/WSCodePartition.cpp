@@ -41,6 +41,11 @@ namespace mlir {
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
 #define LDBG(X) LLVM_DEBUG(DBGS() << X << "\n")
 
+static constexpr StringLiteral kWholeOverwriteReuseOwnerAttr =
+    "ttng.whole_overwrite_reuse_owner";
+static constexpr StringLiteral kWholeOverwriteReuseSiblingAttr =
+    "ttng.whole_overwrite_reuse_sibling";
+
 // After insertAsyncComm creates WSBarrier endpoints with dstTask, inject the
 // channelGraph computed from the full set of channels.
 static void
@@ -3134,24 +3139,55 @@ void insertAsyncComm(
                   return ownerOverwriteLoop && producer &&
                          ownerOverwriteLoop->isProperAncestor(producer);
                 };
+            auto getTmemColumnRange = [](Channel *ch) {
+              Operation *alloc = ch->getAllocOp();
+              assert(alloc && "TMEM reuse channel must have an allocation");
+              auto type = cast<ttg::MemDescType>(alloc->getResult(0).getType());
+              int64_t offset = 0;
+              if (auto attr =
+                      alloc->getAttrOfType<IntegerAttr>("buffer.offset"))
+                offset = attr.getInt();
+              int64_t columns = ttng::getTmemAllocSizes(type).numCols;
+              return std::pair<int64_t, int64_t>{offset, offset + columns};
+            };
+            auto [ownerLo, ownerHi] = getTmemColumnRange(owner);
             for (Channel *sibling : group->channels) {
               if (sibling == owner)
                 continue;
               // Skip siblings all of whose consumers are in the owner
-              // producer's own partition (e.g. the P matrix at offset 0
-              // consumed by the PV MMA in the same gemm partition) - program
+              // producer's own partition (e.g. the P matrix consumed by the
+              // PV MMA in the same gemm partition) - program
               // order orders those.
               if (!hasConsumerOutsideTask(sibling, ownerProducerTask))
                 continue;
-              // Siblings produced within the owner's overwrite loop have the
-              // same cadence as the overwrite and are already ordered by their
-              // own per-iteration channel barriers. Siblings produced outside
-              // that loop may remain live until after the loop, so the next
-              // repeated overwrite must wait for their consumers. In FA
-              // persistent, alpha is inside the loop while m_ij/l_i0 are read
-              // once per tile in the epilogue.
-              if (isProducedWithinOverwriteLoop(sibling))
+              // Most siblings produced within the owner's overwrite loop are
+              // ordered by their own per-iteration barriers.  A narrower
+              // sibling starting at the owner's first column is different:
+              // its own acquire occurs at the later sibling producer, so it
+              // does not stop the earlier whole-allocation owner from
+              // clobbering the previous sibling value.  Make the owner acquire
+              // that sibling's EMPTY barrier too.  This is the qK/dQ edge in
+              // FA-bwd; P begins at a different column and does not qualify.
+              if (isProducedWithinOverwriteLoop(sibling)) {
+                auto [siblingLo, siblingHi] = getTmemColumnRange(sibling);
+                if (siblingLo == ownerLo && siblingHi < ownerHi) {
+                  // This dependency cannot be materialized as an ordinary
+                  // scheduled wait here: qK and dQ have different loop.stage
+                  // values, while one stage controls both a wait's placement
+                  // and its modulo phase. Preserve the reuse relationship on
+                  // the two producers so SoftwarePipeliner can pair their
+                  // already-expanded copies, using qK's final position and
+                  // dQ's final EMPTY-barrier phase.
+                  auto marker = builder.getI32IntegerAttr(reuseGrp2);
+                  headProducer->setAttr(kWholeOverwriteReuseOwnerAttr, marker);
+                  sibling->getSrcOp()->setAttr(kWholeOverwriteReuseSiblingAttr,
+                                               marker);
+                }
                 continue;
+              }
+              // Siblings produced outside the loop may remain live until its
+              // epilogue, so the next repeated overwrite waits at outer
+              // cadence using the sibling's phase.
               wholeOverwriteBackedgeSiblings.push_back(sibling);
             }
           }

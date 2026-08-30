@@ -11,8 +11,13 @@
 //
 // CADENCE MATTERS:
 //   * The QK MMA runs at INNER-loop (KV-block) cadence.
-//   * alpha (col 64) is produced/consumed INSIDE the inner loop (same cadence),
-//     so it is ordered by its own per-iteration barriers and needs NO extra edge.
+//   * alpha_1 (col 64) is produced/consumed INSIDE the inner loop but is
+//     spatially disjoint from the owner's starting column, so its own
+//     per-iteration barriers suffice.
+//   * alpha_0 is placed at col 0 as a synthetic same-start narrower sibling,
+//     matching FA-bwd dQ. Its ordinary EMPTY acquire occurs at the later
+//     sibling producer, so qK must also acquire that barrier before its earlier
+//     whole-allocation overwrite.
 //   * m_ij (col 65) / l_i0 (col 66) are produced/consumed in the OUTER tile
 //     epilogue (outer cadence). The NEXT tile's first inner QK MMA zeros their
 //     columns before the default partition (task 0) finishes reading them in the
@@ -27,16 +32,17 @@
 // phase (not the owner's inner phase) is essential: the naive per-iteration / owner
 // -phase version deadlocks.
 //
-// REQUIRED BARRIERS (the four edges the fix adds, all async_task_id = 1,
+// REQUIRED OUTER-CADENCE BARRIERS (four edges, all async_task_id = 1,
 // dstTask = 0, all appearing BEFORE the inner `scf.for`). Program order is
 // m_ij / l_i0 for dp1 (buffer.id 9) then dp0 (buffer.id 8). The test asserts ALL
 // four are present and precede the useC=false QK `tc_gen5_mma`. They are NOT
 // adjacent (index/phase arith ops sit between them), so we use ordered CHECK
 // (not CHECK-NEXT).
 //
-// alpha is deliberately NOT acquired by task 1 (inner cadence; safe via its own
-// barriers). The pre-existing QK backward (dstTask = 5 for dp0, 4 for dp1) lives
-// INSIDE the inner loop and is unchanged by this fix.
+// The disjoint alpha_1 remains unrelated to the owner. The synthetic same-start
+// alpha_0 and its QK owner get a shared marker that survives software
+// pipelining. SoftwarePipeliner consumes that marker after expansion to combine
+// QK placement with alpha_0's expanded EMPTY-barrier phase.
 //
 // NOTE ON BARRIER FUSION: if a future pass fuses these backward barriers (e.g.
 // onto a combined token, or merges them with the QK acquire; see
@@ -55,7 +61,8 @@
 // CHECK: nvws.producer_acquire %l_i0_{{[0-9_]+}}, {{.*}}async_task_id = array<i32: 1>{{.*}}dstTask = 0
 // Then the inner KV loop, which contains the useC=false QK MMA the back-edges gate:
 // CHECK: scf.for
-// CHECK: tc_gen5_mma {{.*}}, %false, %true
+// CHECK: tc_gen5_mma {{.*}}ttng.whole_overwrite_reuse_owner = [[REUSE_ID:[0-9]+]] : i32
+// CHECK: ttng.tmem_store {{.*}}ttng.whole_overwrite_reuse_sibling = [[REUSE_ID]] : i32
 
 // -----// WarpSpec internal IR Dump After: doMemoryPlanner
 #blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
@@ -91,7 +98,7 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
     %0 = ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = 0 : i32, buffer.tmaStaging = 1 : i32} : () -> !ttg.memdesc<128x128xbf16, #shared, #smem, mutable>
     %1 = ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = 0 : i32, buffer.tmaStaging = 1 : i32} : () -> !ttg.memdesc<128x128xbf16, #shared, #smem, mutable>
     %acc_0 = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 9 : i32, buffer.offset = 0 : i32} : () -> !ttg.memdesc<128x128xbf16, #tmem, #ttng.tensor_memory, mutable>
-    %alpha, %alpha_19 = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 9 : i32, buffer.offset = 64 : i32} : () -> (!ttg.memdesc<128x1xf32, #tmem1, #ttng.tensor_memory, mutable>, !ttg.async.token)
+    %alpha, %alpha_19 = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 9 : i32, buffer.offset = 0 : i32} : () -> (!ttg.memdesc<128x1xf32, #tmem1, #ttng.tensor_memory, mutable>, !ttg.async.token)
     %qk, %qk_20 = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 9 : i32} : () -> (!ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.async.token)
     %acc_1 = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 8 : i32, buffer.offset = 0 : i32} : () -> !ttg.memdesc<128x128xbf16, #tmem, #ttng.tensor_memory, mutable>
     %alpha_21, %alpha_22 = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 8 : i32, buffer.offset = 64 : i32} : () -> (!ttg.memdesc<128x1xf32, #tmem1, #ttng.tensor_memory, mutable>, !ttg.async.token)
