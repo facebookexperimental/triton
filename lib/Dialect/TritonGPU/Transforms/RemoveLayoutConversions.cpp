@@ -670,15 +670,20 @@ static unsigned estimateConvertScratchCost(Value value, Attribute encoding) {
 }
 
 // Compute a score for a layout to guide conflict resolution.
-// Based on sizePerThread (vectorization) for both blocked and linear encodings.
-// Higher score is preferred — layouts with more elements per thread allow
-// better vectorized memory access (ld.shared, st.shared).
+// Based on per-thread contiguity (vectorization) for both blocked and linear
+// encodings. Higher score is preferred — layouts with more contiguous elements
+// per thread allow better vectorized memory access (ld.shared, st.shared).
 static int64_t getLayoutScore(Attribute encoding) {
   SmallVector<unsigned> sizePerThread;
   if (auto blocked = dyn_cast<BlockedEncodingAttr>(encoding)) {
     sizePerThread = SmallVector<unsigned>(blocked.getSizePerThread());
   } else if (auto linear = dyn_cast<LinearEncodingAttr>(encoding)) {
-    sizePerThread = linear.getSizePerThread();
+    // Not getSizePerThread(): it canonicalizes away any trailing register
+    // bases that tile a whole tensor dimension, treating them as reps. A
+    // tmem_load layout holding a full 128-wide row per thread therefore
+    // reports [1, 1] and loses to a narrow blocked layout, which is the
+    // opposite of what this heuristic wants.
+    sizePerThread = linear.getContigPerThread();
   }
   if (sizePerThread.empty())
     return 0;
