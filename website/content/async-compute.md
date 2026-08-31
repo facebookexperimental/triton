@@ -171,9 +171,12 @@ element types, and native fragment widths before lowering.
 Unlike `tl.dot`, `amd_scheduled_mfma` carries an explicit `accumulator_role`.
 `transient` selects the latency-aware intrinsic path for phase-local work;
 `persistent` selects register-constrained lowering for a chain carried across
-phases. Its `auto` accumulator storage uses VGPRs on CDNA3 and AGPRs on CDNA4;
-an explicit register class overrides that choice. Neither role changes the
-numerical matrix operation.
+phases. Its default `auto` accumulator storage follows the role alone, the same
+way on every target: VGPRs for `transient` and AGPRs for `persistent`. An
+explicit register class overrides that choice, and CDNA3 requires one — it
+cannot order an AGPR accumulator read against the MFMA drain, so a persistent
+accumulator there must ask for `"vgpr"` rather than be silently downgraded.
+Neither role changes the numerical matrix operation.
 
 ## Scaled dot
 
