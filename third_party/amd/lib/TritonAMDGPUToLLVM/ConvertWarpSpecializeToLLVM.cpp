@@ -253,9 +253,14 @@ static LogicalResult lowerOneWarpPredicate(WarpPredicateOp op) {
   rewriter.setInsertionPoint(op);
 
   auto asLLVM = [](Value value) -> Value {
-    if (auto cast = value.getDefiningOp<UnrealizedConversionCastOp>())
-      if (cast.getNumOperands() == 1 && cast.getNumResults() == 1)
-        return cast.getOperand(0);
+    // Partial conversion can leave several tensor-to-tensor bridges between a
+    // lowered LLVM value and the type expected by warp_predicate. Walk through
+    // the complete single-value chain before comparing the carried ABI.
+    while (auto cast = value.getDefiningOp<UnrealizedConversionCastOp>()) {
+      if (cast.getNumOperands() != 1 || cast.getNumResults() != 1)
+        break;
+      value = cast.getOperand(0);
+    }
     return value;
   };
 
@@ -288,10 +293,14 @@ static LogicalResult lowerOneWarpPredicate(WarpPredicateOp op) {
     yieldStructs.push_back(value);
     resultTypes.push_back(value.getType());
   }
-  for (auto [init, yielded] : llvm::zip(initStructs, yieldStructs))
+  for (auto [index, values] :
+       llvm::enumerate(llvm::zip(initStructs, yieldStructs))) {
+    auto [init, yielded] = values;
     if (init.getType() != yielded.getType())
-      return op.emitError(
-          "converted init and yield values must have identical types");
+      return op.emitError("converted init and yield values at index ")
+             << index << " must have identical types; init is "
+             << init.getType() << ", yield is " << yielded.getType();
+  }
 
   // Validate every result bridge before changing the CFG. Conversion failure
   // should leave a diagnosable source operation rather than partially inlined
