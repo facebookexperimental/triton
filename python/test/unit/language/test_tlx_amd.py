@@ -2379,6 +2379,68 @@ def test_amd_scheduled_mfma_rejects_non_native_gfx942_shape():
         )
 
 
+@triton.jit
+def _amd_scheduled_mfma_regclass_gfx942_kernel(
+    a_ptr,
+    b_ptr,
+    output_ptr,
+    ACC_CLASS: tl.constexpr,
+):
+    mma: tl.constexpr = tlx.amd_mfma_layout(
+        version=3,
+        instr_shape=[16, 16, 16],
+        transposed=True,
+        warps_per_cta=[1, 4],
+    )
+    dot0: tl.constexpr = tlx.dot_operand_layout(0, mma, k_width=4)
+    dot1: tl.constexpr = tlx.dot_operand_layout(1, mma, k_width=4)
+    rows = tl.arange(0, 32)
+    reduction = tl.arange(0, 32)
+    cols = tl.arange(0, 128)
+    a = tlx.require_layout(tl.load(a_ptr + rows[:, None] * 32 + reduction[None, :]), dot0, pin=False)
+    b = tlx.require_layout(tl.load(b_ptr + reduction[:, None] * 128 + cols[None, :]), dot1, pin=False)
+    acc = tlx.require_layout(tl.zeros((32, 128), tl.float32), mma, pin=False)
+    result = tlx.amd_scheduled_mfma(
+        a,
+        b,
+        acc,
+        accumulator_role="persistent",
+        accumulator_register_class=ACC_CLASS,
+        initialize=True,
+    )
+    tl.store(output_ptr + rows[:, None] * 128 + cols[None, :], result)
+
+
+def test_amd_scheduled_mfma_rejects_explicit_agpr_gfx942():
+    """CDNA3 cannot order the accumulator read against the MFMA drain."""
+    with pytest.raises(RuntimeError, match=r'accumulator_register_class "agpr" is not yet supported on CDNA3'):
+        compile_for_gfx942(
+            _amd_scheduled_mfma_regclass_gfx942_kernel,
+            signature={
+                "a_ptr": "*fp16",
+                "b_ptr": "*fp16",
+                "output_ptr": "*fp32",
+                "ACC_CLASS": "constexpr",
+            },
+            constexprs={"ACC_CLASS": "agpr"},
+        )
+
+
+def test_amd_scheduled_mfma_accepts_explicit_vgpr_gfx942():
+    """The rejection is specific to AGPRs; an explicit VGPR class still works."""
+    compiled = compile_for_gfx942(
+        _amd_scheduled_mfma_regclass_gfx942_kernel,
+        signature={
+            "a_ptr": "*fp16",
+            "b_ptr": "*fp16",
+            "output_ptr": "*fp32",
+            "ACC_CLASS": "constexpr",
+        },
+        constexprs={"ACC_CLASS": "vgpr"},
+    )
+    assert "v_mfma_f32_16x16x16_f16" in compiled.asm["amdgcn"]
+
+
 @pytest.mark.skipif(not is_hip_cdna3(), reason="Requires gfx942 hardware")
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
 @pytest.mark.parametrize("persistent", [False, True])

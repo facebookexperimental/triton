@@ -2,6 +2,7 @@
 #include "AtomicRMWOpsEmitter.h"
 #include "Dialect/TritonAMDGPU/IR/Dialect.h"
 #include "PatternTritonGPUOpToLLVM.h"
+#include "TritonAMDGPUTransforms/MfmaGroup.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/LLVMIR/ROCDLDialect.h"
 #include "mlir/Dialect/Utils/IndexingUtils.h"
@@ -789,64 +790,103 @@ packMfmaDotOperandFragments(Value value, RankedTensorType tensorTy,
   return fragments;
 }
 
+// Passes an MFMA occupies the matrix pipeline for, per LLVM's schedule model
+static FailureOr<int> getMfmaNumPasses(ArrayRef<unsigned> instrShape) {
+  if (instrShape == ArrayRef<unsigned>({32, 32, 8}) ||
+      instrShape == ArrayRef<unsigned>({32, 32, 16}))
+    return 16;
+  if (instrShape == ArrayRef<unsigned>({16, 16, 16}) ||
+      instrShape == ArrayRef<unsigned>({16, 16, 32}))
+    return 8;
+  return failure();
+}
+
+// Wait states between an MFMA writing its destination and any consumer reading
+// it
+static FailureOr<int> getMfmaDrainWaitStates(ISAFamily isaFamily,
+                                             ArrayRef<unsigned> instrShape) {
+  FailureOr<int> numPasses = getMfmaNumPasses(instrShape);
+  if (failed(numPasses))
+    return failure();
+  if (isaFamily == ISAFamily::CDNA3)
+    return *numPasses + 3;
+  // CDNA4 adds one wait state, except for 2-pass instructions.
+  if (isaFamily == ISAFamily::CDNA4)
+    return *numPasses + 3 + (*numPasses != 2 ? 1 : 0);
+  return failure();
+}
+
+struct ScheduledMfmaAsmInfo {
+  StringRef asmMnemonic;
+  // `_1k`: the gfx90a+ bf16 set taking 4 bf16/lane instead of 2, declared as
+  // packed i16, so operands need a bitcast.
+  bool intrinsicOperandsAreI16;
+};
+
+static FailureOr<ScheduledMfmaAsmInfo>
+getScheduledMfmaAsmInfo(StringRef intrinsicName) {
+  if (intrinsicName == ROCDL::mfma_f32_32x32x16_f16::getOperationName())
+    return ScheduledMfmaAsmInfo{"v_mfma_f32_32x32x16_f16", false};
+  if (intrinsicName == ROCDL::mfma_f32_32x32x16_bf16::getOperationName())
+    return ScheduledMfmaAsmInfo{"v_mfma_f32_32x32x16_bf16", false};
+  if (intrinsicName == ROCDL::mfma_f32_16x16x32_f16::getOperationName())
+    return ScheduledMfmaAsmInfo{"v_mfma_f32_16x16x32_f16", false};
+  if (intrinsicName == ROCDL::mfma_f32_16x16x32_bf16::getOperationName())
+    return ScheduledMfmaAsmInfo{"v_mfma_f32_16x16x32_bf16", false};
+  if (intrinsicName == ROCDL::mfma_f32_32x32x8f16::getOperationName())
+    return ScheduledMfmaAsmInfo{"v_mfma_f32_32x32x8_f16", false};
+  if (intrinsicName == ROCDL::mfma_f32_32x32x8bf16_1k::getOperationName())
+    return ScheduledMfmaAsmInfo{"v_mfma_f32_32x32x8_bf16", true};
+  if (intrinsicName == ROCDL::mfma_f32_16x16x16f16::getOperationName())
+    return ScheduledMfmaAsmInfo{"v_mfma_f32_16x16x16_f16", false};
+  if (intrinsicName == ROCDL::mfma_f32_16x16x16bf16_1k::getOperationName())
+    return ScheduledMfmaAsmInfo{"v_mfma_f32_16x16x16_bf16", true};
+  return failure();
+}
+
 struct ScheduledMfmaLoweringInfo {
-  StringRef asmPrefix;
+  // Mnemonic only; the inline-asm path appends the operand list.
+  StringRef asmMnemonic;
   StringRef intrinsicName;
+  // K elements one lane feeds into a single MFMA; sets fragment width.
   int64_t kBase;
+  // Padding before each inline-asm MFMA
   int inputWaitStates;
+  // Padding after the last MFMA
   int drainWaitStates;
+  // Operands must be bitcast to i16 vectors for the `_1k` intrinsics.
   bool intrinsicOperandsAreI16;
 };
 
 static FailureOr<ScheduledMfmaLoweringInfo>
-getScheduledMfmaLoweringInfo(ISAFamily isaFamily, Type elementType,
-                             ArrayRef<unsigned> instrShape) {
-  bool isF16 = elementType.isF16();
-  if (isaFamily == ISAFamily::CDNA4) {
-    if (instrShape == ArrayRef<unsigned>({32, 32, 16}))
-      return ScheduledMfmaLoweringInfo{
-          isF16 ? "v_mfma_f32_32x32x16_f16 $0, $1, $2, "
-                : "v_mfma_f32_32x32x16_bf16 $0, $1, $2, ",
-          isF16 ? ROCDL::mfma_f32_32x32x16_f16::getOperationName()
-                : ROCDL::mfma_f32_32x32x16_bf16::getOperationName(),
-          /*kBase=*/8,
-          /*inputWaitStates=*/4,
-          /*drainWaitStates=*/20,
-          /*intrinsicOperandsAreI16=*/false};
-    if (instrShape == ArrayRef<unsigned>({16, 16, 32}))
-      return ScheduledMfmaLoweringInfo{
-          isF16 ? "v_mfma_f32_16x16x32_f16 $0, $1, $2, "
-                : "v_mfma_f32_16x16x32_bf16 $0, $1, $2, ",
-          isF16 ? ROCDL::mfma_f32_16x16x32_f16::getOperationName()
-                : ROCDL::mfma_f32_16x16x32_bf16::getOperationName(),
-          /*kBase=*/8,
-          /*inputWaitStates=*/4,
-          /*drainWaitStates=*/20,
-          /*intrinsicOperandsAreI16=*/false};
-  }
-  if (isaFamily == ISAFamily::CDNA3) {
-    if (instrShape == ArrayRef<unsigned>({32, 32, 8}))
-      return ScheduledMfmaLoweringInfo{
-          isF16 ? "v_mfma_f32_32x32x8_f16 $0, $1, $2, "
-                : "v_mfma_f32_32x32x8_bf16 $0, $1, $2, ",
-          isF16 ? ROCDL::mfma_f32_32x32x8f16::getOperationName()
-                : ROCDL::mfma_f32_32x32x8bf16_1k::getOperationName(),
-          /*kBase=*/4,
-          /*inputWaitStates=*/4,
-          /*drainWaitStates=*/18,
-          /*intrinsicOperandsAreI16=*/!isF16};
-    if (instrShape == ArrayRef<unsigned>({16, 16, 16}))
-      return ScheduledMfmaLoweringInfo{
-          isF16 ? "v_mfma_f32_16x16x16_f16 $0, $1, $2, "
-                : "v_mfma_f32_16x16x16_bf16 $0, $1, $2, ",
-          isF16 ? ROCDL::mfma_f32_16x16x16f16::getOperationName()
-                : ROCDL::mfma_f32_16x16x16bf16_1k::getOperationName(),
-          /*kBase=*/4,
-          /*inputWaitStates=*/4,
-          /*drainWaitStates=*/10,
-          /*intrinsicOperandsAreI16=*/!isF16};
-  }
-  return failure();
+getScheduledMfmaLoweringInfo(Location loc, ISAFamily isaFamily,
+                             triton::gpu::AMDMfmaEncodingAttr mfma,
+                             Type aElemType, Type bElemType) {
+  // Reuse the backend-wide intrinsic table so this path cannot drift from the
+  // intrinsic the ordinary dot lowering picks for the same layout.
+  ArrayRef<unsigned> instrShape = mfma.getInstrShape();
+  FailureOr<MfmaIntrinsic> intrinsic = MfmaIntrinsic::get(
+      loc, mfma.getVersion(), instrShape[0], instrShape[1], instrShape[2],
+      aElemType, bElemType, /*withScale=*/false, /*useTF32=*/false);
+  if (failed(intrinsic))
+    return failure();
+
+  FailureOr<ScheduledMfmaAsmInfo> asmInfo =
+      getScheduledMfmaAsmInfo(intrinsic->name);
+  if (failed(asmInfo))
+    return failure();
+
+  FailureOr<int> drainWaitStates =
+      getMfmaDrainWaitStates(isaFamily, instrShape);
+  if (failed(drainWaitStates))
+    return failure();
+
+  return ScheduledMfmaLoweringInfo{asmInfo->asmMnemonic,
+                                   intrinsic->name,
+                                   static_cast<int64_t>(intrinsic->kBase),
+                                   /*inputWaitStates=*/4,
+                                   *drainWaitStates,
+                                   asmInfo->intrinsicOperandsAreI16};
 }
 
 static FailureOr<Value>
@@ -1321,9 +1361,9 @@ public:
     constraints += ",~{memory}";
 
     // Preserve the established gfx950 boundary. On gfx942, use the largest
-    // AGPR-to-VGPR read delay among the native layouts carried by this
-    // boundary. LLVM requires 10 wait states for 16x16 results and 18 for
-    // 32x32 results on gfx942.
+    // result-read delay among the native layouts carried by this boundary;
+    // `getMfmaDrainWaitStates` is the same requirement the scheduled-MFMA
+    // lowering pads for, so the two stay in sync.
     int waitStates = 6;
     if (targetInfo.getISAFamily() == ISAFamily::CDNA3) {
       waitStates = 0;
@@ -1333,10 +1373,13 @@ public:
           continue;
         auto mfma =
             cast<triton::gpu::AMDMfmaEncodingAttr>(tensorTy.getEncoding());
-        ArrayRef<unsigned> instrShape = mfma.getInstrShape();
-        waitStates =
-            std::max(waitStates,
-                     instrShape == ArrayRef<unsigned>({32, 32, 8}) ? 18 : 10);
+        FailureOr<int> drainWaitStates = getMfmaDrainWaitStates(
+            targetInfo.getISAFamily(), mfma.getInstrShape());
+        if (failed(drainWaitStates))
+          return rewriter.notifyMatchFailure(
+              op, "commit boundary carries an MFMA layout with no modeled "
+                  "result-read hazard requirement");
+        waitStates = std::max(waitStates, *drainWaitStates);
       }
     }
     std::string waitAsm = mfmaWaitStateAsm(waitStates);
@@ -1407,8 +1450,9 @@ public:
     auto mfma = cast<triton::gpu::AMDMfmaEncodingAttr>(accTy.getEncoding());
     ArrayRef<unsigned> instrShape = mfma.getInstrShape();
     FailureOr<ScheduledMfmaLoweringInfo> maybeInfo =
-        getScheduledMfmaLoweringInfo(targetInfo.getISAFamily(),
-                                     aTy.getElementType(), instrShape);
+        getScheduledMfmaLoweringInfo(loc, targetInfo.getISAFamily(), mfma,
+                                     aTy.getElementType(),
+                                     bTy.getElementType());
     if (failed(maybeInfo))
       return op.emitOpError(
           "has no supported native lowering for this target, element type, "
@@ -1568,7 +1612,8 @@ public:
             // chain is explicitly not a hazard, so this does not serialize
             // the accumulation chain.
             std::string mfmaAsm = mfmaWaitStateAsm(info.inputWaitStates) +
-                                  "\n" + info.asmPrefix.str();
+                                  "\n" + info.asmMnemonic.str() +
+                                  " $0, $1, $2, ";
             mfmaAsm += zeroThisInstruction ? "0" : "$0";
             auto inlineAsm = LLVM::InlineAsmOp::create(
                 rewriter, loc, fragmentTy, asmOperands, mfmaAsm, constraints,
@@ -1584,14 +1629,9 @@ public:
 
     if (!useLatencyAwareIntrinsic) {
       // The consumer is unknown at this point, so use the target-specific
-      // result-read requirement. For gfx950, preserve the established
-      // conservative maximum:
-      // `GFX940_XDL_N_PassWritesVGPROverlappedSrcABWaitStates` is
-      // `NumPasses + 3 + 1` = 20 for a 16-pass MFMA, which exceeds both
-      // `MFMA32x32WritesAGPRAccVgprReadWaitStates` (18) and the function's own
-      // `MaxWaitStates` (19). Sizing the drain for the worst consumer keeps it
-      // sufficient on its own, rather than relying on the next MFMA's input
-      // padding to make up a shortfall.
+      // result-read requirement from `getMfmaDrainWaitStates`. Sizing the drain
+      // for the worst consumer keeps it sufficient on its own, rather than
+      // relying on the next MFMA's input padding to make up a shortfall.
       for (int64_t n = 0; n < numRepN; ++n) {
         for (int64_t m = 0; m < numRepM; ++m) {
           int64_t accumulatorIndex = m * numRepN + n;

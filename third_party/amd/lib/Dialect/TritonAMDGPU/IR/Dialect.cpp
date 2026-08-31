@@ -1021,6 +1021,11 @@ LogicalResult ScheduledMfmaOp::verify() {
       getAccumulatorRegisterClass() != "vgpr")
     return emitOpError(
         "accumulator_register_class must be \"auto\", \"agpr\", or \"vgpr\"");
+  if (getAccumulatorRegisterClass() == "agpr" && mfma.getVersion() == 3)
+    return emitOpError("accumulator_register_class \"agpr\" is not yet "
+                       "supported on CDNA3: the accumulator read is not "
+                       "ordered against the MFMA drain. Use \"auto\" or "
+                       "\"vgpr\".");
   return success();
 }
 

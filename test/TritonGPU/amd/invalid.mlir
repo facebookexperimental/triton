@@ -434,7 +434,13 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.thr
 #half_register_lhs = #ttg.dot_op<{opIdx = 0, parent = #half_register_mma, kWidth = 8}>
 
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.target" = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
-  tt.func @mfma_commit_rejects_partial_register_fragment(
+  // The dependency's encoding is checked for a native instruction shape before
+  // its per-lane fragment is sized. That ordering makes the "positive integral
+  // number of 32-bit registers" diagnostic below unreachable for BF16/F16:
+  // a native version-4 shape always yields 8 elements per lane (128 bits), and
+  // the odd counts that would trip it need K in {4, 12, 20, ...}, which the
+  // shape check rejects first. Pin the diagnostic that actually fires.
+  tt.func @mfma_commit_rejects_non_native_dependency_shape(
       %a: tensor<16x32xbf16, #scheduled_lhs>,
       %b: tensor<32x16xbf16, #scheduled_rhs>,
       %dependency: tensor<16x4xbf16, #half_register_lhs>) {
@@ -447,7 +453,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.tar
           tensor<32x16xbf16, #scheduled_rhs>,
           tensor<16x16xf32, #scheduled_mma>
           -> tensor<16x16xf32, #scheduled_mma>
-    // expected-error @+1 {{input 1 native dot fragment must occupy a positive integral number of 32-bit registers}}
+    // expected-error @+1 {{input 1 MFMA encoding version 4 supports only its native 32x32x16 and 16x16x32 shapes}}
     %committed, %preserved = amdg.mfma_commit %result, %dependency
         : tensor<16x16xf32, #scheduled_mma>,
           tensor<16x4xbf16, #half_register_lhs>
@@ -1081,6 +1087,33 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.tar
     %committed, %preserved = amdg.mfma_commit %result, %dependency
         : tensor<16x16xf32, #native_result_mma>,
           tensor<32x16xbf16, #nonnative_dep_rhs>
+    tt.return
+  }
+}
+
+// -----
+
+// An AGPR-resident accumulator is read back with a compiler-generated
+// v_accvgpr_read that CDNA3's inline-assembly hazard padding cannot order
+// against the MFMA drain, so the explicit class is rejected on that target.
+#agpr_cdna3_mma = #ttg.amd_mfma<{version = 3, warpsPerCTA = [1, 1], instrShape = [16, 16, 16], isTransposed = true}>
+#agpr_cdna3_lhs = #ttg.dot_op<{opIdx = 0, parent = #agpr_cdna3_mma, kWidth = 4}>
+#agpr_cdna3_rhs = #ttg.dot_op<{opIdx = 1, parent = #agpr_cdna3_mma, kWidth = 4}>
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.target" = "hip:gfx942", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @scheduled_mfma_rejects_explicit_agpr_on_cdna3(
+      %a: tensor<16x16xbf16, #agpr_cdna3_lhs>,
+      %b: tensor<16x16xbf16, #agpr_cdna3_rhs>) {
+    %acc = arith.constant dense<0.000000e+00> :
+        tensor<16x16xf32, #agpr_cdna3_mma>
+    // expected-error @+1 {{accumulator_register_class "agpr" is not yet supported on CDNA3}}
+    %result = amdg.scheduled_mfma %a, %b, %acc
+        resident "none" accumulator "persistent"
+        register_class "agpr" initialize true
+        : tensor<16x16xbf16, #agpr_cdna3_lhs>,
+          tensor<16x16xbf16, #agpr_cdna3_rhs>,
+          tensor<16x16xf32, #agpr_cdna3_mma>
+          -> tensor<16x16xf32, #agpr_cdna3_mma>
     tt.return
   }
 }
