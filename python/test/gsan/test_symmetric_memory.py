@@ -17,6 +17,8 @@ from triton.experimental.gsan._testing_utils import (SHADOW_GRANULARITY_BYTES, s
                                                      shadow_tensor_for)
 from triton.experimental.gsan._utils import uint8_cuda_tensor_from_ptr
 
+pytestmark = pytest.mark.skipif(not is_cuda(), reason="Requires CUDA backend")
+
 
 def _get_free_tcp_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
@@ -194,9 +196,6 @@ def _distributed_worker(rank: int, world_size: int, master_port: int, run_subgro
         dist.barrier()
     finally:
         dist.destroy_process_group()
-
-
-@pytest.mark.skipif(not is_cuda(), reason="requires CUDA backend")
 def test_gsan_symmetric_memory_rendezvous():
     if torch.cuda.device_count() < 2:
         pytest.skip("requires 2 CUDA devices")
@@ -209,9 +208,6 @@ def test_gsan_symmetric_memory_rendezvous():
         nprocs=world_size,
         join=True,
     )
-
-
-@pytest.mark.skipif(not is_cuda(), reason="requires CUDA backend")
 def test_gsan_symmetric_memory_rendezvous_subgroup_without_global_zero():
     if torch.cuda.device_count() < 3:
         pytest.skip("requires 3 CUDA devices")
@@ -402,9 +398,6 @@ def _distributed_worker_triton_kernels_convert_dp_to_ep(rank: int, world_size: i
         dist.barrier()
     finally:
         dist.destroy_process_group()
-
-
-@pytest.mark.skipif(not is_cuda(), reason="requires CUDA backend")
 def test_gsan_symmetric_memory_rendezvous_multi_node_simulated():
     if torch.cuda.device_count() < 2:
         pytest.skip("requires 2 CUDA devices")
@@ -417,9 +410,6 @@ def test_gsan_symmetric_memory_rendezvous_multi_node_simulated():
         nprocs=world_size,
         join=True,
     )
-
-
-@pytest.mark.skipif(not is_cuda(), reason="requires CUDA backend")
 def test_gsan_symmetric_memory_with_triton_kernels_convert_dp_to_ep():
     pytest.importorskip("triton_kernels.distributed")
     if torch.cuda.device_count() < 2:

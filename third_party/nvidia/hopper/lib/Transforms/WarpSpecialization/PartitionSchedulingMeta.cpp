@@ -147,6 +147,7 @@ enum class OpCategory {
   MemDescView,   // Memory descriptor views
   EpilogueStore, // Descriptor stores
   TMAReduction,  // TMA reduction operations
+  Relay,         // One-warp 2-CTA DSMEM completion relay
   DataPartition, // Ops exclusive to one MMA's slice
   Correction,    // Cross-iteration MMA users
   Default        // Everything else
@@ -168,6 +169,8 @@ static llvm::StringRef toString(OpCategory category) {
     return "EpilogueStore";
   case OpCategory::TMAReduction:
     return "TMAReduction";
+  case OpCategory::Relay:
+    return "Relay";
   case OpCategory::Correction:
     return "Correction";
   case OpCategory::DataPartition:
@@ -342,6 +345,7 @@ struct PartitionLayout {
   Partition *loadPartition = nullptr;
   Partition *epiloguePartition = nullptr;
   Partition *epilogueStorePartition = nullptr;
+  Partition *relayPartition = nullptr;
   Partition *defaultPartition = nullptr; // computed alias
   SmallVector<Partition *, 2> computationPartitions;
 
@@ -415,6 +419,7 @@ public:
     categorizeMMAs();
     categorizeEpilogueStores();
     categorizeTMAReductions();
+    categorizeRelays();
     categorizeCorrectionOps(); // Before DataPartition to prevent stealing
     categorizeDataPartitionOps();
   }
@@ -478,10 +483,11 @@ public:
 
     // Group ops by category in deterministic order
     constexpr OpCategory categoryOrder[] = {
-        OpCategory::MMA,           OpCategory::Load,
-        OpCategory::MemDescView,   OpCategory::EpilogueStore,
-        OpCategory::TMAReduction,  OpCategory::Correction,
-        OpCategory::DataPartition, OpCategory::Default};
+        OpCategory::MMA,          OpCategory::Load,
+        OpCategory::MemDescView,  OpCategory::EpilogueStore,
+        OpCategory::TMAReduction, OpCategory::Correction,
+        OpCategory::Relay,        OpCategory::DataPartition,
+        OpCategory::Default};
 
     for (OpCategory cat : categoryOrder) {
       SmallVector<const CategorizedOp *> ops;
@@ -523,17 +529,6 @@ private:
     // Collect backward slice for each MMA
     for (auto mmaOp : loopMmas) {
       mmaToSlice[mmaOp] = collectMMABackwardSlice(innermostLoop, mmaOp);
-    }
-
-    // Find shared ops (appear in multiple slices)
-    DenseMap<Operation *, unsigned> opCount;
-    for (auto &[mma, slice] : mmaToSlice) {
-      for (Operation *op : slice)
-        opCount[op]++;
-    }
-    for (auto &[op, count] : opCount) {
-      if (count > 1)
-        sharedOps.insert(op);
     }
 
     // Group dependent MMAs using union-find.
@@ -631,6 +626,22 @@ private:
         accBufToMma[buf] = i;
       else
         unite(i, it->second);
+    }
+
+    // An op is shared only when it feeds MMAs in different dependency groups.
+    // Counting raw MMA slices incorrectly marks common producers of a serial
+    // MMA chain as shared. For example, two K-sliced PV MMAs consume the same
+    // softmax P tile and accumulate into the same output; their P chain must
+    // remain local to that compute group rather than being moved to the
+    // default/correction partition and staged back through SMEM.
+    DenseMap<Operation *, unsigned> opToFirstGroup;
+    for (unsigned i = 0; i < n; ++i) {
+      unsigned group = find(i);
+      for (Operation *op : mmaToSlice[loopMmas[i]]) {
+        auto [it, inserted] = opToFirstGroup.try_emplace(op, group);
+        if (!inserted && it->second != group)
+          sharedOps.insert(op);
+      }
     }
 
     // Count distinct groups that have exclusive (non-shared) ops
@@ -945,6 +956,12 @@ private:
     }
   }
 
+  void categorizeRelays() {
+    getLoopBodyRegion(mainLoop).walk([&](ttng::TwoCTAPeerRelayOp relay) {
+      addCategorizedOp(relay, OpCategory::Relay);
+    });
+  }
+
   void addCategorizedOp(Operation *op, OpCategory cat,
                         unsigned dataPartitionId = 0,
                         Operation *parentMMA = nullptr) {
@@ -985,6 +1002,7 @@ static PartitionLayout createPartitionLayout(PartitionSet &schedule,
       !categorizer.getOpsInCategory(OpCategory::TMAReduction).empty();
   bool hasEpilogue =
       !categorizer.getOpsInCategory(OpCategory::EpilogueStore).empty();
+  bool hasRelay = !categorizer.getOpsInCategory(OpCategory::Relay).empty();
   bool hasMMAv5 = categorizer.hasMMAv5();
   // No-MMA reduction kernels (RMS norm / LayerNorm / softmax-only): no MMA and
   // no TMA-atomic reduce, but an in-register tt.reduce. These need a reduction
@@ -1032,6 +1050,11 @@ static PartitionLayout createPartitionLayout(PartitionSet &schedule,
   if (options.separateEpilogueStore && hasEpilogue && !deferLoadPartition) {
     layout.epilogueStorePartition = schedule.addPartition(0);
     layout.epilogueStorePartition->setType("epilogue_store");
+  }
+
+  if (hasRelay) {
+    layout.relayPartition = schedule.addPartition(0);
+    layout.relayPartition->setType("relay");
   }
 
   // Load partition: created last so it gets the highest partition index,
@@ -1362,7 +1385,7 @@ struct ScheduleResult {
   DenseMap<unsigned, Partition *> dpIdToPartition;
   bool createComputePartitions;
   // True for no-MMA in-register reduction kernels (RMS/LayerNorm). Enables the
-  // scalar-offset partition fixup in runOnOperation; inert for MMA kernels.
+  // scalar-offset partition fixup in runOnOperation.
   bool noMMACompute = false;
 };
 
@@ -1568,6 +1591,9 @@ getInitialSchedule(LoopLikeOpInterface mainLoop,
   Partition *epiloguePartition = layout.epiloguePartition;
   Partition *correctionPartition = layout.correctionPartition;
   Partition *reductionPartition = layout.reductionPartition;
+
+  for (const auto &catOp : categorizer.getOpsInCategory(OpCategory::Relay))
+    tryScheduleOp(layout.relayPartition, catOp.op);
 
   // For backward compatibility: use default as fallback
   if (!correctionPartition)
@@ -1831,26 +1857,39 @@ getInitialSchedule(LoopLikeOpInterface mainLoop,
     }
   }
 
-  // Correction ops (cross-iteration MMA users) go to correction partition
-  // (which is aliased to default for fwd).
-  // Skip entirely when no correction partition is available.
-  Partition *corrDest =
+  // Correction ops (cross-iteration MMA users) normally go to the correction
+  // partition (which is aliased to default for fwd). When ordinary correction
+  // merging is requested for data-partitioned attention, keep each correction
+  // chain with the computation partition that owns its accumulator. Routing
+  // every chain through a single fallback partition both serializes independent
+  // DP groups and makes all of their full accumulator tiles live at once.
+  Partition *sharedCorrDest =
       correctionPartition ? correctionPartition : defaultPartition;
-  if (corrDest) {
-    for (auto mmaOp : mmas) {
-      for (OpOperand &use : mmaOp->getUses()) {
-        auto loop = getEnclosingSupportedLoop(mmaOp);
-        if (use.getOwner() != getLoopBodyTerminator(loop))
-          continue;
-        BlockArgument arg = getLoopCarriedBodyArg(loop, use.getOperandNumber());
-        if (!arg)
-          continue;
-        for (OpOperand &use : arg.getUses()) {
-          tryScheduleOp(corrDest, use.getOwner());
-          scheduleUsers(loop, schedule, corrDest, use.getOwner());
-        }
-        break;
+  for (auto mmaOp : mmas) {
+    Partition *corrDest = sharedCorrDest;
+    if (localSchedOpts.mergeCorrection && dataPartitionFactor > 1) {
+      unsigned dpId = categorizer.getDpId(mmaOp);
+      if (dpId != SHARED_DPID) {
+        auto it = dpIdToPartition.find(dpId);
+        if (it != dpIdToPartition.end())
+          corrDest = it->second;
       }
+    }
+    if (!corrDest)
+      continue;
+    for (OpOperand &mmaUse : mmaOp->getUses()) {
+      auto loop = getEnclosingSupportedLoop(mmaOp);
+      if (mmaUse.getOwner() != getLoopBodyTerminator(loop))
+        continue;
+      BlockArgument arg =
+          getLoopCarriedBodyArg(loop, mmaUse.getOperandNumber());
+      if (!arg)
+        continue;
+      for (OpOperand &argUse : arg.getUses()) {
+        tryScheduleOp(corrDest, argUse.getOwner());
+        scheduleUsers(loop, schedule, corrDest, argUse.getOwner());
+      }
+      break;
     }
   }
 
@@ -2109,8 +2148,31 @@ getInitialSchedule(LoopLikeOpInterface mainLoop,
   schedulePostLoopOps(mainLoop, schedule, layout, localSchedOpts,
                       categorizer.getOpToDpIdMap(), dpIdToPartition);
 
-  // Update defaultPartition after computation partitions are created.
-  layout.defaultPartition = layout.getDefaultPartition();
+  // Match the explicit TLX backward layout for dependent 2-CTA attention.
+  // The eight-warp base group owns computation/epilogue, while the TMEM/TMA
+  // reduction is a specialized four-warp group. Selecting computation as the
+  // default here lets memory planning see the final role placement; changing a
+  // four-warp computation partition to eight warps after planning introduces a
+  // full-tile relayout buffer and can exceed the Blackwell SMEM limit.
+  ModuleOp module = mainLoop->getParentOfType<ModuleOp>();
+  bool preferComputationDefault =
+      module && module->hasAttr(ttng::AttrTwoCTAsName) &&
+      layout.relayPartition && layout.reductionPartition &&
+      dataPartitionFactor == 1 && localSchedOpts.mergeEpilogueToComputation &&
+      sharedComputePartition;
+  if (preferComputationDefault) {
+    layout.makeDefaultPartition(schedule, sharedComputePartition, mainLoop);
+    // Match TLX's specialized task order as well: reduction, GEMM, load,
+    // relay. Besides making IR comparison direct, this keeps warp-group and
+    // requested-register arrays role-aligned in downstream passes.
+    schedule.swapPartitions(1, layout.reductionPartition->getIndex(), mainLoop);
+    schedule.swapPartitions(2, layout.gemmPartition->getIndex(), mainLoop);
+  }
+
+  // Update the fallback default after computation partitions are created.
+  // makeDefaultPartition already set the deliberate 2-CTA default above.
+  if (!preferComputationDefault)
+    layout.defaultPartition = layout.getDefaultPartition();
 
   // Scan partitions for one that requires 4 warps (TMEM or WarpGroupDot
   // ops) and promote it to index 0 so it becomes the default warp group.
@@ -2418,6 +2480,41 @@ void propagatePartitions(LoopLikeOpInterface loop, PartitionSet &schedule,
         }
         continue;
       }
+
+      // A persistent outer loop can contain an inner loop whose body is
+      // already partitioned across all worker roles.  The wrapper then has
+      // multiple defining and sink partitions, but giving it a new partition
+      // only creates a wrapper-only task.  Code partitioning clones the inner
+      // loop into its body partitions and leaves that task empty; the empty
+      // task still consumes a barrier slot and a warp.  Co-own the wrapper by
+      // the partitions already present in its body instead.
+      Operation *nestedLoopOp = nullptr;
+      bool hasOtherNonScalarOp = false;
+      for (Operation *op : cluster.ops) {
+        if (isScalarOp(op) || op->hasTrait<OpTrait::IsTerminator>())
+          continue;
+        if (isa<LoopLikeOpInterface>(op) && !nestedLoopOp) {
+          nestedLoopOp = op;
+          continue;
+        }
+        hasOtherNonScalarOp = true;
+        break;
+      }
+      if (nestedLoopOp && !hasOtherNonScalarOp) {
+        SetVector<Partition *> bodyPartitions;
+        nestedLoopOp->walk([&](Operation *nestedOp) {
+          if (nestedOp == nestedLoopOp)
+            return;
+          for (int id : safeGetPartitionIds(nestedOp))
+            if (Partition *partition = schedule.getPartition(id))
+              bodyPartitions.insert(partition);
+        });
+        if (bodyPartitions.size() > 1) {
+          setPartition(nestedLoopOp, bodyPartitions);
+          continue;
+        }
+      }
+
       Partition *newPartition = schedule.addPartition(0);
       newPartition->setType("computation");
       for (Operation *op : cluster.ops) {
@@ -2866,7 +2963,9 @@ void PartitionSchedulingMeta::runOnOperation() {
     }
     loops.push_back(loop);
   });
-  for (auto [idx, loop] : llvm::enumerate(loops)) {
+  for (auto it : llvm::enumerate(loops)) {
+    auto idx = it.index();
+    LoopLikeOpInterface loop = it.value();
     // Build SchedulingOptions from pass options and per-loop attributes.
     SchedulingOptions schedOpts;
     schedOpts.mergeEpilogue = mergeEpilogue;
@@ -2905,9 +3004,38 @@ void PartitionSchedulingMeta::runOnOperation() {
     }
     {
       PartitionSet &schedule = result->schedule;
+      // Scalar index/offset ops are rematerializable, so propagatePartitions
+      // skips them. No-MMA reductions have no MMA slice to anchor them. Assign
+      // each still-unannotated value-producing op the union of its partitioned
+      // users' ids, iterating to a fixpoint so chains
+      // (muli -> addi -> descriptor_load) resolve.
+      auto fixupScalarPartitions = [&]() {
+        if (!result->noMMACompute)
+          return;
+        bool changed = true;
+        while (changed) {
+          changed = false;
+          getLoopBodyRegion(loop).walk([&](Operation *op) {
+            if (op->getNumResults() == 0 || hasPartition(op))
+              return;
+            SetVector<int> unionIds;
+            for (Operation *user : op->getUsers()) {
+              SetVector<int> userIds = safeGetPartitionIds(user);
+              unionIds.insert(userIds.begin(), userIds.end());
+            }
+            if (!unionIds.empty()) {
+              setPartition(op, unionIds);
+              changed = true;
+            }
+          });
+        }
+      };
+      fixupScalarPartitions();
+
       currentPhase = "propagate";
       propagatePartitions(loop, schedule, result->createComputePartitions,
                           result->layout.defaultPartition);
+      fixupScalarPartitions();
 
       // Assign partition to TMAStoreTokenWaitOp ops that have no partition.
       // These arise from early TMA reduce lowering: the wait's token comes
@@ -2934,37 +3062,55 @@ void PartitionSchedulingMeta::runOnOperation() {
       // propagatePartitions + optimizeSchedule) but before serialization.
       splitDataPartitionedIfOps(loop, schedule);
 
-      // No-MMA reduction kernels (RMS norm / LayerNorm) have no MMA backward
-      // slice to anchor partition assignment for scalar index/offset ops
-      // (e.g. offs_m = tile_id * 64) that feed the descriptor loads/stores.
-      // propagatePartitions skips these (isScalarOp), yet the
-      // tt.warp_specialize verifier requires every op in the loop to carry
-      // ttg.partition. Assign each still-unannotated value-producing op the
-      // union of its partitioned users' ids, iterating to a fixpoint so chains
-      // (muli -> addi -> descriptor_load) resolve. setPartition sorts/dedups
-      // and propagates to region terminators. An offset feeding both load and
-      // store gets both ids and is replicated by code partition (no
-      // cross-partition scalar channel). Gated to the no-MMA case so MMA
-      // kernels are untouched.
-      if (result->noMMACompute) {
-        bool changed = true;
-        while (changed) {
-          changed = false;
-          getLoopBodyRegion(loop).walk([&](Operation *op) {
-            if (op->getNumResults() == 0 || hasPartition(op))
-              return;
-            SetVector<int> unionIds;
-            for (Operation *user : op->getUsers()) {
-              SetVector<int> userIds = safeGetPartitionIds(user);
-              unionIds.insert(userIds.begin(), userIds.end());
-            }
-            if (!unionIds.empty()) {
-              setPartition(op, unionIds);
-              changed = true;
-            }
-          });
+      fixupScalarPartitions();
+
+      // A predicated TMEM read-modify-write becomes an scf.if only after code
+      // specialization. Until then, keep its predicate chain in the same
+      // partition as the store: code partitioning does not materialize scalar
+      // channels. Also pull tensor elementwise ops feeding the scalar chain
+      // into the store partition. The op may have any number of users, as long
+      // as every one of them is already in the store's partition -- otherwise
+      // moving it would drag a value across a partition boundary. FA forward
+      // uses this to compute `alpha < 1` beside the alpha channel load instead
+      // of creating a second tensor channel for the predicate. Its tensor
+      // operands remain ordinary channel boundaries.
+      getLoopBodyRegion(loop).walk([&](ttng::TMEMStoreOp store) {
+        if (!store.getPred().getType().isInteger(1))
+          return;
+        if (store.getPred().getDefiningOp<arith::ConstantOp>())
+          return;
+        SetVector<int> storeIds = safeGetPartitionIds(store);
+        if (storeIds.size() != 1)
+          return;
+        SmallVector<Operation *> worklist;
+        if (Operation *def = store.getPred().getDefiningOp())
+          worklist.push_back(def);
+        DenseSet<Operation *> seen;
+        while (!worklist.empty()) {
+          Operation *op = worklist.pop_back_val();
+          if (!seen.insert(op).second ||
+              op->getParentRegion() != store->getParentRegion())
+            continue;
+          bool hasTensorResult =
+              llvm::any_of(op->getResults(), [](Value result) {
+                return isa<RankedTensorType>(result.getType());
+              });
+          if (hasTensorResult) {
+            if (!op->hasTrait<OpTrait::Elementwise>() ||
+                llvm::any_of(op->getUsers(), [&](Operation *user) {
+                  return safeGetPartitionIds(user) != storeIds;
+                }))
+              continue;
+          }
+          op->walk([&](Operation *nested) { setPartition(nested, storeIds); });
+          for (Value operand : op->getOperands()) {
+            if (hasTensorResult && isa<RankedTensorType>(operand.getType()))
+              continue;
+            if (Operation *def = operand.getDefiningOp())
+              worklist.push_back(def);
+          }
         }
-      }
+      });
 
       // Scalar values are rematerializable and must not become cross-partition
       // channels: WS buffer allocation only materializes ranked tensor values.

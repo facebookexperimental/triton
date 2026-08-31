@@ -35,7 +35,7 @@ if [[ "$MODE" == "lit" ]]; then
         -DLLVM_INCLUDE_DIRS="$LLVM/include" \
         -DLLVM_LIBRARY_DIR="$LLVM/lib" \
         -DLLVM_SYSPATH="$LLVM" \
-        -DTRITON_CODEGEN_BACKENDS="nvidia;amd" \
+        -DTRITON_CODEGEN_BACKENDS="nvidia;amd;cpu" \
         -DTRITON_BUILD_UT=OFF \
         -DLLVM_EXTERNAL_LIT="$(which lit)" . \
      && ninja -C build check-triton-lit-tests-build 2>/dev/null; then

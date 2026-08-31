@@ -55,11 +55,21 @@ jobs:
           # e.g. "pre-commit / pre-commit (code formatting)". Use contains()
           # to match regardless of the caller job key prefix.
           JOBS=$(gh api "repos/${{ github.repository }}/actions/runs/${{ github.event.workflow_run.id }}/jobs")
-          PRE_COMMIT_CONCLUSION=$(echo "$JOBS" | jq -r '.jobs[] | select(.name | contains("pre-commit")) | .conclusion')
+          # The pre-commit job is non-blocking (continue-on-error), so its
+          # conclusion is "success" even when formatting issues exist. The
+          # signal is the "Pre-commit warning" step: it runs only when there
+          # are issues, and is "skipped" otherwise.
+          WARNED=$(echo "$JOBS" | jq -r '
+            [ .jobs[] | select(.name | contains("pre-commit")) | .steps[]?
+              | select(.name == "Pre-commit warning" and .conclusion == "success") ] | length')
+          # Still treat an outright job failure (e.g. infra error) as a signal.
+          PRE_COMMIT_CONCLUSION=$(echo "$JOBS" | jq -r '
+            [ .jobs[] | select(.name | contains("pre-commit")) | .conclusion ]
+            | if any(. == "failure") then "failure" else (.[0] // "") end')
 
           echo "pre_commit_status=${PRE_COMMIT_CONCLUSION}" >> $GITHUB_OUTPUT
 
-          if [ "$PRE_COMMIT_CONCLUSION" == "failure" ]; then
+          if [ "${WARNED:-0}" -gt 0 ] || [ "$PRE_COMMIT_CONCLUSION" == "failure" ]; then
             echo "skip=false" >> $GITHUB_OUTPUT
           else
             echo "skip=true" >> $GITHUB_OUTPUT
@@ -101,9 +111,10 @@ jobs:
 
           {
             echo "${MARKER}"
-            echo "### Pre-commit check failed"
+            echo "### :warning: Pre-commit — formatting issues detected"
             echo ""
-            echo "Formatting issues were detected. [View the failed check](${RUN_URL}) for details."
+            echo "This is a **warning and does not block merging**, but please fix it."
+            echo "[View the check](${RUN_URL}) for the full diff."
             echo ""
             if [ "$HEAD_REPO" != "${{ github.repository }}" ]; then
               echo "**To fix locally:**"

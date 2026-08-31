@@ -3,183 +3,82 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="description" content="Synchronize tasks and distribute persistent work across CTAs.">
-  <title>Barriers and Cluster Launch Control · TLX</title>
-  <link rel="stylesheet" href="assets/tlx.css">
+  <meta name="description" content="Barriers, scheduling barriers, and memory fences.">
+  <title>Synchronization · FBTriton</title>
+  <link rel="stylesheet" href="assets/tlx.css?v=20260824c">
 </head>
 <body>
   <header class="topbar">
-    <a class="brand" href="../"><span>TLX</span> Triton Low-level Language Extensions</a>
+    <a class="brand" href="../"><span>FBTriton</span></a>
+    <nav class="topnav" aria-label="Top-level sections"><a href="triton.html">Triton</a>
+<a href="tlx.html" data-current="true">TLX</a>
+<a href="tlx-ops.html">tlx.ops</a>
+<a href="torchtlx.html">TorchTLX</a>
+<a href="ci.html">CI</a>
+<a href="tooling.html">Tooling</a></nav>
     <a class="repo-link" href="https://github.com/facebookexperimental/triton" target="_blank" rel="noreferrer">View on GitHub ↗</a>
   </header>
   <div class="shell">
-    <aside class="sidebar">
-      <p class="eyebrow">Documentation</p>
-      <nav><a href="../">Overview</a>
-<a href="buffers.html">Local and remote buffers</a>
+<aside class="sidebar">
+      <p class="eyebrow">TLX documentation</p>
+      <nav><a href="tlx.html">Overview</a>
+<a href="buffers.html">Memory</a>
+<a href="global-memory.html">Global memory access</a>
 <a href="async-memory.html">Async memory access</a>
-<a href="async-compute.html">Async tensor core operations</a>
-<a href="synchronization.html" aria-current="page">Barriers and Cluster Launch Control</a>
-<a href="warp-specialization.html">Warp specialization and clustering</a>
+<a href="async-compute.html">Tensor core operations</a>
+<a href="synchronization.html" aria-current="page">Synchronization</a>
+<a class="sub" href="#barriers">Barriers</a>
+<a class="sub" href="#scheduling-barriers">Scheduling barriers</a>
+<a class="sub" href="#memory-fences">Memory fences</a>
+<a href="warp-specialization.html">Warp specialization</a>
+<a href="clusters.html">Clusters and Cluster Launch Control</a>
+<a href="layouts.html">Layout control and diagnostics</a>
 <a href="utilities.html">Other operations</a>
-<a href="kernels.html">Example kernels</a>
-<a href="install-and-test.html">Build, install, and test</a>
-<a href="resources.html">More reading</a></nav>
+<a href="kernels.html">Kernels implemented with TLX</a>
+<a href="testing.html">Testing</a>
+<a href="resources.html">Further reading</a></nav>
     </aside>
     <main>
       <p class="eyebrow">TLX documentation</p>
-      <h1>Barriers and Cluster Launch Control</h1>
-      <p class="lede">Synchronize tasks and distribute persistent work across CTAs.</p>
-      <article><div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>barriers = tlx.alloc_barrier(num_barriers, arrive_count=1)</code> <strong>[Hopper+]</strong></div></div>
+      <h1>Synchronization</h1>
+      <p class="lede">Barriers, scheduling barriers, and memory fences.</p>
+      <article><h2 id="barriers">Barriers</h2>
+<blockquote><p>For the concepts behind these calls — asynchronous barrier semantics, the mbarrier phase model, named vs memory barriers, and producer-consumer patterns — see <a href="https://github.com/facebookexperimental/triton/blob/main/third_party/tlx/doc/tlx_barriers.md" target="_blank" rel="noreferrer">Barrier Support in TLX</a>.</p></blockquote>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>barriers = tlx.alloc_barriers(num_barriers, arrive_count=1)</code> <strong>[sm90+]</strong></div></div>
 <p>Allocates buffer in shared memory and initialize mbarriers with arrive_counts.</p>
 <p>Input:</p>
 <div class="list-item depth-2"><span aria-hidden="true">•</span><div><code>num_barriers</code>: The number of barriers to allocate.</div></div>
-<div class="list-item depth-2"><span aria-hidden="true">•</span><div><code>arrive_counts</code>: The number of threads that need to arrive at the barrier before it can be released.</div></div>
-<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.barrier_wait(bar, phase)</code> <strong>[Hopper+]</strong></div></div>
+<div class="list-item depth-2"><span aria-hidden="true">•</span><div><code>arrive_count</code>: The number of threads that need to arrive at the barrier before it can be released.</div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.barrier_wait(bar, phase)</code> <strong>[sm90+]</strong></div></div>
 <p>Wait until the mbarrier phase completes</p>
-<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.barrier_arrive(bar, arrive_count=1)</code> <strong>[Hopper+]</strong></div></div>
-<p>Perform the arrive operation on an mbarrier</p>
-<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.named_barrier_wait(bar_id, num_threads)</code> <strong>[Hopper+]</strong></div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.barrier_arrive(bar, arrive_count=1, remote_cta_rank=None)</code> <strong>[sm90+]</strong></div></div>
+<p>Perform the arrive operation on an mbarrier. If <code>remote_cta_rank</code> is provided, signals the barrier in the specified remote CTA's shared memory (useful for multi-CTA synchronization). On AMD this requires <code>arrive_count == 1</code>.</p>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.named_barrier_wait(bar_id, num_threads)</code> <strong>[sm90+]</strong></div></div>
 <p>Wait until <code>num_threads</code> total threads have reached the specified named mbarrier phase.</p>
-<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.named_barrier_arrive(bar_id, num_threads)</code> <strong>[Hopper+]</strong></div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.named_barrier_arrive(bar_id, num_threads)</code> <strong>[sm90+]</strong></div></div>
 <p>Signal arrival at a named mbarrier.</p>
 <p>For both APIs, <code>num_threads</code> is the total number of threads required to flip the barrier phase: <code>num_waiting_threads + num_arriving_threads</code>. Wait and Arrive calls for the same barrier phase must use the same value.</p>
-<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.barrier_expect_bytes(bar, bytes)</code> <strong>[Hopper+]</strong></div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.barrier_expect_bytes(bar, bytes)</code> <strong>[sm90+]</strong></div></div>
 <p>Signal a barrier of an expected number of bytes to be copied.</p>
-<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.barrier_arrive(bar, arrive_count=1, remote_cta_rank=None)</code> <strong>[Hopper+]</strong></div></div>
-<p>Perform the arrive operation on an mbarrier. If <code>remote_cta_rank</code> is provided, signals the barrier in the specified remote CTA's shared memory (useful for multi-CTA synchronization).</p>
-<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.amd_sched_barrier(mask=0)</code>  <strong>[AMD]</strong></div></div>
+<h2 id="scheduling-barriers">Scheduling barriers</h2>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.amd_sched_barrier(mask=0)</code> <strong>[amd]</strong></div></div>
 <p>Prevents selected AMD machine-instruction classes from crossing a source boundary. It is a scheduling marker, not a workgroup barrier or memory fence.</p>
-<h3 id="memory-fences">Memory Fences</h3>
-<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.fence(scope)</code> <strong>[Hopper+]</strong> issues a memory fence. The <code>scope</code> argument is required:</div></div>
+<h2 id="memory-fences">Memory fences</h2>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.fence(scope)</code> <strong>[sm90+]</strong> issues a memory fence. The <code>scope</code> argument is required:</div></div>
 <table><thead><tr><th>Scope</th><th>PTX</th><th>Description</th></tr></thead><tbody><tr><td><code>&quot;gpu&quot;</code></td><td><code>fence.acq_rel.gpu</code></td><td>Device-scope fence. Orders prior global/shared memory writes to be visible to all GPU threads.</td></tr><tr><td><code>&quot;sys&quot;</code></td><td><code>fence.acq_rel.sys</code></td><td>System-scope fence. Like <code>&quot;gpu&quot;</code> but also visible to the host CPU.</td></tr><tr><td><code>&quot;async_shared&quot;</code></td><td><code>fence.proxy.async.shared::cta</code></td><td>Proxy fence for async shared memory. Required between <code>local_store</code> and a subsequent TMA store (<code>async_descriptor_store</code>) to the same shared memory.</td></tr></tbody></table>
 <p>Example:</p>
 <pre><code class="language-python">  tlx.local_store(smem_buf, data)
   tlx.fence(&quot;async_shared&quot;)
   tlx.async_descriptor_store(desc, smem_buf, offsets)</code></pre>
-<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.fence_mbarrier_init_cluster(scope)</code> <strong>[Hopper+]</strong> issues a memory fence to make mbarrier init visible to cluster.</div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.fence_mbarrier_init_cluster(scope)</code> <strong>[sm90+]</strong> issues a memory fence to make mbarrier init visible to cluster.</div></div>
 <p>Example:</p>
 <pre><code class="language-python">  bars = tlx.alloc_barriers(num_barriers=1, arrive_count=1)
   tlx.fence_mbarrier_init_cluster()
   tlx.cluster_barrier()
 
   # now bars is ready for cross CTA use
-  tlx.barrier_arrive(bar=bars[0], remote_cta_rank=1)</code></pre>
-<h3 id="cluster-launch-control-clc">Cluster Launch Control (CLC)</h3>
-<p>CLC (Cluster Launch Control) is a Blackwell-specific feature <strong>[Blackwell]</strong> that enables <strong>dynamic persistent kernel</strong> execution with efficient work stealing across thread blocks. It allows CTAs to dynamically acquire tile IDs from a hardware-managed work queue, enabling load balancing without explicit inter-CTA communication.</p>
-<h4 id="clc-api">CLC API</h4>
-<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>context = tlx.clc_create_context(num_consumers=num_consumers)</code> <strong>[Blackwell]</strong></div></div>
-<p>Create a CLC pipeline context with the specified number of stages and expected consumer count.</p>
-<p><strong>Parameters:</strong></p>
-<div class="list-item depth-2"><span aria-hidden="true">•</span><div><code>num_consumers</code>: Number of consumers that will signal completion per tile (typically 3 async tasks × num_CTAs)</div></div>
-<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.clc_producer(context, p_producer=phase, multi_ctas=False)</code> <strong>[Blackwell]</strong></div></div>
-<p>Issue a CLC try_cancel request to acquire a new tile ID.</p>
-<p><strong>Parameters:</strong></p>
-<div class="list-item depth-2"><span aria-hidden="true">•</span><div><code>context</code>: CLC pipeline context from <code>clc_create_context</code></div></div>
-<div class="list-item depth-2"><span aria-hidden="true">•</span><div><code>phase</code>: Current barrier phase (0 or 1, alternates each iteration)</div></div>
-<div class="list-item depth-2"><span aria-hidden="true">•</span><div><code>multi_ctas</code>: Set to <code>True</code> for 2-CTA mode (cluster of 2 CTAs). When enabled, <code>pred_cta0</code> is computed internally from <code>cluster_cta_rank()</code>.</div></div>
-<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tile_id = tlx.clc_consumer(context, p_consumer=phase, multi_ctas=False, k=0, return_3d=False)</code> <strong>[Blackwell]</strong></div></div>
-<p>Decode the tile ID from a CLC response and signal completion.</p>
-<p><strong>Parameters:</strong></p>
-<div class="list-item depth-2"><span aria-hidden="true">•</span><div><code>context</code>: CLC pipeline context from <code>clc_create_context</code></div></div>
-<div class="list-item depth-2"><span aria-hidden="true">•</span><div><code>phase</code>: Current barrier phase</div></div>
-<div class="list-item depth-2"><span aria-hidden="true">•</span><div><code>multi_ctas</code>: Set to <code>True</code> for 2-CTA mode. When enabled, <code>pred_cta0</code> is computed internally.</div></div>
-<div class="list-item depth-2"><span aria-hidden="true">•</span><div><code>return_3d</code>: Set to <code>True</code> to return <code>(ctaIdX, ctaIdY, ctaIdZ)</code> tuple instead of scalar tile_id.</div></div>
-<p><strong>Returns:</strong> The tile ID (already offset by <code>cluster_cta_rank()</code> for unique tile assignments), or -1 if no work available. With <code>return_3d=True</code>, returns <code>(ctaIdX, ctaIdY, ctaIdZ)</code> tuple.</p>
-<h4 id="how-clc-works">How CLC Works</h4>
-<p>CLC uses hardware-assisted work stealing via the PTX instruction:</p>
-<pre><code>clusterlaunchcontrol.try_cancel.async.shared::cta.mbarrier::complete_tx::bytes.multicast::cluster::all.b128</code></pre>
-<p>The <code>.multicast::cluster::all</code> qualifier means the response is <strong>asynchronously written to all CTAs</strong> in the cluster. This enables efficient multi-CTA execution where all CTAs in a cluster receive the same base tile ID.</p>
-<h4 id="clc-synchronization-flow">CLC Synchronization Flow</h4>
-<pre><code>┌─────────────────────────────────────────────────────────────────┐
-│                    CLC Producer (clc_producer)                  │
-├─────────────────────────────────────────────────────────────────┤
-│  1. WAIT:   barrier_wait(bar_empty)      ← Wait for consumers   │
-│  2. EXPECT: barrier_expect_bytes(bar_full, 16)                  │
-│  3. ISSUE:  clc_issue(response, bar_full) ← Hardware request    │
-└─────────────────────────────────────────────────────────────────┘
-                              ↓
-                    [Hardware processes CLC]
-                    [Multicasts response to all CTAs]
-                              ↓
-┌─────────────────────────────────────────────────────────────────┐
-│                    CLC Consumer (clc_consumer)                  │
-├─────────────────────────────────────────────────────────────────┤
-│  1. WAIT:   barrier_wait(bar_full)       ← Wait for response    │
-│  2. QUERY:  tile_id = clc_query(response) ← Extract tile ID     │
-│  3. SIGNAL: barrier_arrive(bar_empty)    ← Release producer     │
-└─────────────────────────────────────────────────────────────────┘</code></pre>
-<h4 id="multi-cta-mode-2-cta-clusters">Multi-CTA Mode (2-CTA Clusters)</h4>
-<p>In multi-CTA mode (<code>multi_ctas=True</code>), multiple CTAs in a cluster work together on adjacent tiles. The key constraint is: <strong>you can arrive at a remote mbarrier, but you cannot wait on a remote mbarrier</strong> (per NVIDIA specification).</p>
-<h5 id="key-principle-arrive-remote-wait-local">Key Principle: "Arrive Remote, Wait Local"</h5>
-<table><thead><tr><th>Operation</th><th>Local mbarrier</th><th>Remote mbarrier</th></tr></thead><tbody><tr><td><code>barrier_wait</code></td><td>✅ Allowed</td><td>❌ Undefined behavior</td></tr><tr><td><code>barrier_arrive</code></td><td>✅ Allowed</td><td>✅ Allowed (via <code>remote_cta_rank</code>)</td></tr></tbody></table>
-<h5 id="example-multi-cta-gemm-with-clc">Example: Multi-CTA GEMM with CLC</h5>
-<pre><code class="language-python">@triton.jit
-def matmul_kernel(..., PAIR_CTA: tl.constexpr):
-    # Create CLC context: 6 consumers for 2-CTA mode (3 tasks × 2 CTAs)
-    clc_context = tlx.clc_create_context(num_consumers= 6 if PAIR_CTA else 3)
-
-    with tlx.async_tasks():
-        with tlx.async_task(&quot;default&quot;):  # Epilogue consumer
-            clc_phase_producer = 1
-            clc_phase_consumer = 0
-            tile_id = start_pid
-
-            while tile_id != -1:
-                # Producer: acquire next tile
-                tlx.clc_producer(clc_context, p_producer=clc_phase_producer, multi_ctas=PAIR_CTA)
-                clc_phase_producer ^= 1
-
-                # ... process tile ...
-
-                # Consumer: get tile ID and signal completion
-                tile_id = tlx.clc_consumer(clc_context, p_consumer=clc_phase_consumer, multi_ctas=PAIR_CTA)
-                clc_phase_consumer ^= 1
-        with tlx.async_task(num_warps=1, num_regs=24):  # MMA consumer
-            clc_phase_consumer = 0
-            tile_id = start_pid
-
-            while tile_id != -1:
-                # ... process tile ...
-
-                # Consumer: get tile ID and signal completion
-                tile_id = tlx.clc_consumer(clc_context, p_consumer=clc_phase_consumer, multi_ctas=PAIR_CTA)
-                clc_phase_consumer ^= 1
-        with tlx.async_task(num_warps=1, num_regs=24):  # producer, TMA load
-            clc_phase_consumer = 0
-            tile_id = start_pid
-
-            while tile_id != -1:
-                # ... process tile ...
-
-                # Consumer: get tile ID and signal completion
-                tile_id = tlx.clc_consumer(clc_context, p_consumer=clc_phase_consumer, multi_ctas=PAIR_CTA)
-                clc_phase_consumer ^= 1
-</code></pre>
-<p>Examples: how mbarriers are communicated in warp specialization</p>
-<pre><code>    phase = 0
-    with tlx.async_tasks():
-        with tlx.async_task(&quot;default&quot;):
-
-            tlx.barrier_wait(bar=b1, phase=phase ^ 1)
-
-            # Placeholder block to do something
-
-            tlx.barrier_arrive(bar=b0)  # Release
-
-        with tlx.async_task(num_warps=4):
-
-            tlx.barrier_wait(bar=b0, phase=phase)  # Wait
-
-            # Some arith ops TODO. add WS
-            offsets = block_start + tl.arange(0, BLOCK_SIZE)
-            mask = offsets &lt; n_elements
-            x = tl.load(x_ptr + offsets, mask=mask)
-            z = x * x
-            tl.store(z_ptr + offsets, z, mask=mask)
-
-            tlx.barrier_arrive(bar=b0)  # Wait</code></pre></article>
-      <footer class="pager"><a href="async-compute.html">← Async tensor core operations</a><a class="next" href="warp-specialization.html">Warp specialization and clustering →</a></footer>
+  tlx.barrier_arrive(bar=bars[0], remote_cta_rank=1)</code></pre></article>
+<footer class="pager"><a href="async-compute.html">← Tensor core operations</a><a class="next" href="warp-specialization.html">Warp specialization →</a></footer>
     </main>
   </div>
 </body>

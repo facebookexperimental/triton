@@ -19,12 +19,15 @@ Extra Credits:
 import os
 
 import pytest
+from triton._internal_testing import is_blackwell, is_hopper
 import torch
 
 import triton
 import triton.language as tl
 from triton.tools.tensor_descriptor import TensorDescriptor
 
+
+pytestmark = pytest.mark.skipif(not (is_hopper() or is_blackwell()), reason="Requires Hopper or Blackwell")
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
 FORCE_ON_DEVICE = os.getenv("FORCE_ON_DEVICE") == "1"
@@ -987,7 +990,6 @@ def attention(q, k, v, causal, sm_scale, baseVariant="ws_persistent", config=Non
 @pytest.mark.parametrize("baseVariant",
                          ["ws"])  # ws_persistent: pre-existing GROUP_SIZE_N issue in this untested tutorial
 @pytest.mark.parametrize("HEAD_DIM", [64, 128])
-@pytest.mark.skipif(not (is_hopper() or is_blackwell()), reason="Requires Hopper or Blackwell GPU")
 def test_op(HEAD_DIM, baseVariant):
     Z, H, N_CTX = 2, 8, 1024
     sm_scale = 0.5
@@ -1002,9 +1004,6 @@ def test_op(HEAD_DIM, baseVariant):
     }
     tri = attention(q, k, v, False, sm_scale, baseVariant, config=dict(cfg)).half()
     torch.testing.assert_close(tri, ref, atol=1e-2, rtol=0)
-
-
-@pytest.mark.skipif(not (is_hopper() or is_blackwell()), reason="Requires Hopper or Blackwell GPU")
 def test_bench():
     Z, H, N, D = 4, 32, 4096, 128
     q = torch.randn((Z, H, N, D), dtype=torch.float16, device="cuda")

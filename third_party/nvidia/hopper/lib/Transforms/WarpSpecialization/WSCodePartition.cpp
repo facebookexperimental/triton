@@ -12,6 +12,7 @@
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/IR/Verifier.h"
 #include "mlir/Interfaces/InferTypeOpInterface.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Transforms/Passes.h"
@@ -771,7 +772,7 @@ Value createBarrierAlloc(triton::FuncOp funcOp, unsigned distance,
       ttg::MemDescType::get({numCTAs}, builder.getI64Type(), barrierEncoding,
                             sharedMemorySpace, /*mutableMemory=*/true);
   Value barrierAlloc = mlir::triton::gpu::LocalAllocOp::create(
-      builder, loc, barrierMemDescType, Value());
+      builder, loc, barrierMemDescType, Value(), /*alignment=*/8);
   barrierAlloc.getDefiningOp()->setAttr(kWarpSpecializeGeneratedBarrierAttrName,
                                         builder.getUnitAttr());
   for (unsigned i = 0; i < distance; i++) {
@@ -977,6 +978,37 @@ static bool checkConsumersInLoops(Channel *channel) {
   return false;
 }
 
+/// Return true when every consumer in `consumerTaskId` can use an MMAv5 inline
+/// completion barrier. Channels that reuse a physical slot must agree on the
+/// mode, so one scalar consumer makes the whole task token-based even when
+/// single-copy channels retain separate tokens.
+static bool taskUsesOnlyGen5Consumers(ArrayRef<Channel *> channels,
+                                      AsyncTaskId consumerTaskId) {
+  bool foundConsumer = false;
+  for (Channel *channel : channels) {
+    if (!llvm::is_contained(channel->relation.second, consumerTaskId))
+      continue;
+
+    SmallVector<Operation *> dstOps;
+    if (channel->channelKind == DataChannelKind::SMEMAlloc)
+      static_cast<AllocChannel *>(channel)->getDstOps(dstOps);
+    else
+      dstOps.push_back(channel->getDstOp());
+
+    for (Operation *dst : dstOps) {
+      for (Operation *consumer : getActualConsumers(dst)) {
+        if (!llvm::is_contained(getAsyncTaskIds(consumer), consumerTaskId))
+          continue;
+        foundConsumer = true;
+        if (!isa<ttng::MMAv5OpInterface>(consumer))
+          return false;
+      }
+    }
+  }
+  assert(foundConsumer && "expected a consumer for the channel task");
+  return true;
+}
+
 void createToken(
     const DenseMap<Channel *, SmallVector<Channel *>>
         &channelsGroupedByConsumers,
@@ -1038,9 +1070,6 @@ void createToken(
     // For each reuse group, choose a representative channel.
     int reuseGrp = channelInReuseGroup(channel, config);
     if (reuseGrp >= 0) {
-      // FIXME: check that the other channels in the reuse group have the same
-      // choice about producerBarrier, and consumerBarriers. If not, we should
-      // not set producerBarrier, and consumerBarriers.
       auto *repChannel = config->getGroup(reuseGrp)->channels[0];
       if (channel != repChannel) {
         // This channel is in a reuse group but is not the representative.
@@ -1049,74 +1078,8 @@ void createToken(
         auto repIt = tokenMap.find(repChannel);
         assert(repIt != tokenMap.end() &&
                "Representative channel should have been processed first");
-        // Copy the representative's CommChannel (producerBarrier +
-        // its own consumerBarriers).
-        CommChannel commChannel = repIt->second;
-
-        // Fix 1 (BwdTmemDotAttrsDeadlock.md): the representative's
-        // consumerBarriers only covers the representative's own
-        // consumer task. For non-representative channels whose
-        // consumer lives in a DIFFERENT task (e.g. FA-bwd
-        // `_BWD_DOT_ATTRS_TMEM` 3-channel reuse group {dpT, dq,
-        // dsT_0}: dpT's consumer is in computation task 3 but
-        // dsT_0's consumer dk MMA is in gemm task 1), allocate a
-        // dedicated gen5 consumer barrier for each missing
-        // consumer task. Without this the dsT_0 channel's
-        // consumer-release path silently drops at line 3522
-        // (`if (commChannel.consumerBarriers.count(consumerTaskId))`
-        // is false), so dk MMA never gets its TMEM-A
-        // completion-barrier attachment and the next iteration's
-        // computation-partition tmem_store deadlocks waiting on
-        // dsT_0's empty mbarrier.
-        auto dstOp = it->second.front()->getDstOp();
-        for (auto consumerAsyncTaskId : channel->relation.second) {
-          if (commChannel.consumerBarriers.count(consumerAsyncTaskId))
-            continue;
-          // Recompute useGen5Barrier for THIS channel's consumer task,
-          // mirroring the logic used for the representative below
-          // (lines 1416-1455).
-          DenseSet<Operation *> actualConsumers;
-          SmallVector<Operation *> dstOps;
-          if (channel->channelKind == DataChannelKind::SMEMAlloc) {
-            auto *cAlloc = static_cast<AllocChannel *>(channel);
-            cAlloc->getDstOps(dstOps);
-          } else {
-            dstOps.push_back(dstOp);
-          }
-          bool useGen5Barrier = true;
-          for (auto *dst : dstOps) {
-            auto consumers = getActualConsumers(dst);
-            for (auto *t : consumers) {
-              SmallVector<AsyncTaskId> asyncTasks = getAsyncTaskIds(t);
-              if (asyncTasks.empty())
-                continue;
-              if (std::find(asyncTasks.begin(), asyncTasks.end(),
-                            consumerAsyncTaskId) != asyncTasks.end()) {
-                actualConsumers.insert(t);
-                if (!isa<ttng::TCGen5MMAOp>(t))
-                  useGen5Barrier = false;
-              }
-            }
-          }
-          if (actualConsumers.empty() || !useGen5Barrier)
-            continue;
-          Value v = createBarrierAlloc(funcOp, channel->getNumBuffers(),
-                                       channel->srcName);
-          commChannel.consumerBarriers[consumerAsyncTaskId] = v;
-          LDBG("createToken Fix1: non-rep channel "
-               << channel->uniqID
-               << " allocated gen5 consumer barrier for task "
-               << consumerAsyncTaskId << " (rep channel " << repChannel->uniqID
-               << " did not cover this task)");
-        }
-
-        // Share the (possibly extended) CommChannel.
-        tokenMap[channel] = commChannel;
-        LDBG("createToken: channel "
-             << channel->uniqID
-             << " shares CommChannel from representative channel "
-             << repChannel->uniqID << " ("
-             << commChannel.consumerBarriers.size() << " consumer barriers)");
+        // The representative classified every channel in the reuse group.
+        tokenMap[channel] = repIt->second;
         continue;
       }
     }
@@ -1163,6 +1126,15 @@ void createToken(
     } else {
       channelsForComm.push_back(channel);
     }
+    SmallVector<Channel *> channelsForClassification = channelsForComm;
+    int physicalReuseGrp =
+        channelInReuseGroup(channel, config, /*reuseBarrier=*/false);
+    if (reuseGrp < 0 && physicalReuseGrp >= 0) {
+      channelsForClassification.clear();
+      auto *group = config->getGroup(physicalReuseGrp);
+      channelsForClassification.append(group->channels.begin(),
+                                       group->channels.end());
+    }
 
     // Check if the channel group needs token-based synchronization.
     // Reuse groups share one CommChannel, so this must consider every channel
@@ -1177,6 +1149,9 @@ void createToken(
             commChannel.consumerBarriers.count(consumerAsyncTaskId))
           continue;
 
+        bool useGen5Barrier = taskUsesOnlyGen5Consumers(
+            channelsForClassification, consumerAsyncTaskId);
+
         // It is possible that this channel has two consumer taskIds.
         // We can have multiple consumer ops for AllocChannel, or one consumer
         // op has multiple actual consumers. Here we collect all consumer ops.
@@ -1188,9 +1163,6 @@ void createToken(
         } else {
           dstOps.push_back(sourceDstOp);
         }
-        // If all actual consumers are MMAv5 ops, we can use their inline
-        // completion barriers for consumer release.
-        bool useGen5Barrier = true;
         for (auto *dst : dstOps) {
           auto consumers = getActualConsumers(dst);
           for (auto *t : consumers) {
@@ -1210,14 +1182,6 @@ void createToken(
             if (std::find(asyncTasks.begin(), asyncTasks.end(),
                           consumerAsyncTaskId) != asyncTasks.end()) {
               actualConsumers.insert(t);
-              // XXX: Op can have multiple async tasks
-
-              // If consumer and producer are not in the same block, but
-              // as long as all consumers are MMAv5 ops, we can use their
-              // inline completion barrier path. Remove
-              // producerOp->getBlock() != t->getBlock()
-              if (!isa<ttng::MMAv5OpInterface>(t))
-                useGen5Barrier = false;
             }
           }
         }
@@ -1398,6 +1362,14 @@ static ttnvws::DescriptorLoadOp getConvertedDescriptorLoad(Operation *srcOp) {
       return nvwsLoad;
   return nullptr;
 }
+
+/// Return true unless every transitive use of `root` is known to preserve the
+/// allocation and its contents. Reusing a source-bearing allocation aliases
+/// its storage, so a write or free through any memdesc view would change the
+/// new consumer's value or lifetime. Region-bearing and region-branching users
+/// are rejected conservatively because this analysis does not follow their
+/// control-flow aliases.
+static bool hasTransitiveInvalidatingEffect(Value root);
 
 // Create a local buffer for register channels. Return the allocated buffer and
 // the new producer (reloaded value).
@@ -2228,13 +2200,22 @@ desyncMMAv5Op(OpBuilderWithAsyncTaskIds &builder, ttng::MMAv5OpInterface mmaOp,
               Value barrierAlloc, Value bufferIdx, Value inPhase,
               Operation *producerOrConsumer, bool asProducerAcquire,
               bool addCompletionBarrier, DictionaryAttr waitConstraints = {},
-              bool releaseOnLastIterOnly = false) {
+              bool releaseOnLastIterOnly = false,
+              Operation *completionMmaOverride = nullptr) {
   // Attach the barrier as an operand of the mma op, either as producerCommit
   // or consumerRelease.
   builder.setInsertionPoint(mmaOp.getOperation());
   builder.setAsyncTaskIdsFromOp(mmaOp.getOperation());
   builder.setLoopScheduleInfoFromOp(mmaOp.getOperation());
   if (addCompletionBarrier) {
+    auto completionMma = mmaOp;
+    if (completionMmaOverride) {
+      completionMma = dyn_cast<ttng::MMAv5OpInterface>(completionMmaOverride);
+      assert(completionMma && "completion override must be an MMAv5 op");
+      builder.setInsertionPoint(completionMma.getOperation());
+      builder.setAsyncTaskIdsFromOp(completionMma.getOperation());
+      builder.setLoopScheduleInfoFromOp(completionMma.getOperation());
+    }
     auto consumerBarrier =
         getBarrierForPipelineStage(builder, barrierAlloc, bufferIdx);
     // assert(mmaOp.getBarriers().empty() && "mmaOp should not have barriers");
@@ -2248,18 +2229,19 @@ desyncMMAv5Op(OpBuilderWithAsyncTaskIds &builder, ttng::MMAv5OpInterface mmaOp,
       // Fire the release only on the last inner iteration so it acts as a
       // single per-outer-iteration release (matches the hand-written TLX
       // kernel's per-KV-block k/v release on the epilogue MMA).
-      auto forOp = mmaOp->template getParentOfType<scf::ForOp>();
+      auto forOp = completionMma->template getParentOfType<scf::ForOp>();
       assert(forOp && "releaseOnLastIterOnly requires an enclosing loop");
       Value nextIv = builder.createWithAsyncTaskIds<arith::AddIOp>(
-          mmaOp->getLoc(), forOp.getInductionVar(), forOp.getStep());
+          completionMma->getLoc(), forOp.getInductionVar(), forOp.getStep());
       pred = builder.createWithAsyncTaskIds<arith::CmpIOp>(
-          mmaOp->getLoc(), arith::CmpIPredicate::sge, nextIv,
+          completionMma->getLoc(), arith::CmpIPredicate::sge, nextIv,
           forOp.getUpperBound());
     } else {
       pred = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
-          mmaOp->getLoc(), true, 1);
+          completionMma->getLoc(), true, 1);
     }
-    mmaOp.addCompletionBarrier(consumerBarrier, pred);
+    completionMma.addCompletionBarrier(consumerBarrier, pred);
+    completionMma.setIsAsync(true);
   }
   mmaOp.setIsAsync(true);
 
@@ -2463,6 +2445,11 @@ void insertAsyncComm(
     const DenseMap<Channel *, Value> &bufferMap,
     const DenseMap<Channel *, std::pair<Operation *, Operation *>> &copyOpMap,
     DenseSet<Operation *> &regionsWithChannels, ReuseConfig *config) {
+
+  // The `tt.autows` switches are fixed for the whole function, so read them
+  // once here instead of re-walking and re-parsing per fused TMA barrier.
+  const bool twoCTADirectWait =
+      getAutoWSBooleanFlag(funcOp, kAutoWSTwoCTADirectWaitKey);
 
   // SubtiledRegionOp is a sequencing marker, not a control flow boundary.
   // Skip it when walking parent chains so that ops inside it are treated
@@ -2839,6 +2826,33 @@ void insertAsyncComm(
       return aTasks == bTasks;
     };
 
+    // Consecutive same-task MMAs may write one operand-D allocation without a
+    // channel between them.  In that case the forward channel ends at the
+    // first writer while the loop-carried backward channel starts at the last
+    // writer.  Treat the two endpoints as one in-place accumulator chain when
+    // pairing the forward/backward channels below.
+    auto inSameOperandDWriterChain = [&](Operation *first,
+                                         Operation *last) -> bool {
+      if (first == last)
+        return true;
+      if (first->getBlock() != last->getBlock() ||
+          !appearsBefore(first, last) || !withSameTask(first, last))
+        return false;
+      auto firstMma = dyn_cast<ttng::MMAv5OpInterface>(first);
+      auto lastMma = dyn_cast<ttng::MMAv5OpInterface>(last);
+      if (!firstMma || !lastMma)
+        return false;
+      auto underlyingAlloc = [](Value value) -> Operation * {
+        while (auto index = value.getDefiningOp<ttg::MemDescIndexOp>())
+          value = index.getSrc();
+        return value.getDefiningOp();
+      };
+      Operation *firstAlloc = underlyingAlloc(firstMma.getAccumulator());
+      Operation *lastAlloc = underlyingAlloc(lastMma.getAccumulator());
+      return firstAlloc && firstAlloc == lastAlloc &&
+             isa<ttng::TMEMAllocOp>(firstAlloc);
+    };
+
     // Return the backward channel if found.
     // Assume chF is a forward channel where producer and consumer are in the
     // same block.
@@ -2862,7 +2876,7 @@ void insertAsyncComm(
         // short-circuits before any op is dereferenced.
         if (ch->getAllocOp() == chF->getAllocOp() &&
             withSameTask(ch->getDstOp(), chF->getSrcOp()) &&
-            ch->getSrcOp() == chF->getDstOp() &&
+            inSameOperandDWriterChain(chF->getDstOp(), ch->getSrcOp()) &&
             chF->getSrcOp()->getBlock() == ch->getSrcOp()->getBlock() &&
             chF->getSrcOp()->getBlock() == ch->getDstOp()->getBlock()) {
           if (appearsBefore(ch->getDstOp(), chF->getSrcOp()))
@@ -2890,7 +2904,7 @@ void insertAsyncComm(
         // filtered out before findTmemStartEnd dereferences freed memory.
         if (ch->getAllocOp() == chB->getAllocOp() &&
             withSameTask(ch->getSrcOp(), chB->getDstOp()) &&
-            ch->getDstOp() == chB->getSrcOp() &&
+            inSameOperandDWriterChain(ch->getDstOp(), chB->getSrcOp()) &&
             chB->getSrcOp()->getBlock() == ch->getSrcOp()->getBlock() &&
             chB->getSrcOp()->getBlock() == ch->getDstOp()->getBlock()) {
           if (appearsBefore(chB->getDstOp(), ch->getSrcOp()))
@@ -2988,10 +3002,13 @@ void insertAsyncComm(
       }
     }
     Operation *producerAcquireForChannelLoop = nullptr;
+    Channel *backwardChannelForLoop = nullptr;
     if (headProducer->getBlock() == headConsumer->getBlock()) {
       auto *bwdCh = isForwardOfChannelLoop(masterChannel);
-      if (bwdCh)
+      if (bwdCh) {
         producerAcquireForChannelLoop = bwdCh->getDstOp();
+        backwardChannelForLoop = bwdCh;
+      }
     }
     // Collapsed chained-accumulator channel (T279388065): the forward commit is
     // on the LAST writer (headProducer), but the reuse/empty producer_acquire
@@ -3681,9 +3698,24 @@ void insertAsyncComm(
                 funcOp.getContext(), masterChannel->relation.first,
                 WSBarrierAttr::kDirectionForward)
                 .build(funcOp.getContext());
+        // Move the completion barrier to the last MMA of a fused producer
+        // range. Only the fused-MMA shape this was designed for qualifies:
+        // both endpoints must be MMAv5 ops of this master channel, so they
+        // commit on the same *commChannel.producerBarrier, and they must sit
+        // in one block so "last in the range" is a well-defined position.
+        Operation *completionMmaOverride = nullptr;
+        if (addCompletionBarrier && tailProducer != headProducer &&
+            isa<ttng::MMAv5OpInterface>(headProducer) &&
+            isa<ttng::MMAv5OpInterface>(tailProducer)) {
+          assert(tailProducer->getBlock() == headProducer->getBlock() &&
+                 "fused MMA completion override expects both producers in one "
+                 "block");
+          completionMmaOverride = tailProducer;
+        }
         desyncMMAv5Op(builder, mmaOp, *commChannel.producerBarrier, bufferIdx,
                       phase, headConsumer, false, addCompletionBarrier,
-                      waitConstraints);
+                      waitConstraints, /*releaseOnLastIterOnly=*/false,
+                      completionMmaOverride);
       }
     }
     // Channel can have multiple consumers.
@@ -3899,9 +3931,20 @@ void insertAsyncComm(
               }
             }
           }
+          Operation *completionMmaOverride = nullptr;
+          if (backwardChannelForLoop &&
+              backwardChannelForLoop->getSrcOp() != mmaOp.getOperation()) {
+            // A forward operand-D channel can end at the first MMA in a
+            // same-task serial writer chain while its paired back edge starts
+            // at the last MMA.  The shared full/empty barrier must be released
+            // only after the last writer commits; attaching it to the first
+            // writer lets a correction task race the remaining MMAs.
+            completionMmaOverride = backwardChannelForLoop->getSrcOp();
+          }
           desyncMMAv5Op(builder, mmaOp, consumerBarrier, bufferIdx, phase,
                         producerAcquirePoint, true, addCompletionBarrier,
-                        waitConstraints, releaseOnLastIterOnly);
+                        waitConstraints, releaseOnLastIterOnly,
+                        completionMmaOverride);
         }
       }
     }
@@ -3919,7 +3962,7 @@ void insertAsyncComm(
                  .second;
       }
       // Use token for producer acquire and consumer release.
-      if (commChannel.consumerBarriers.empty()) {
+      if (!commChannel.consumerBarriers.count(token.first)) {
         // Insert ProducerAcquireOp before the producer.
         auto producerAcquirePoint =
             getSameLevelOp(headConsumer, tmaHeadProducer);
@@ -3947,9 +3990,8 @@ void insertAsyncComm(
               tileBuilder.setInsertionPoint(annotTarget);
               Value tileBufIdx = producerSubtiled.addSharedArg(bufferIdx);
               Value tilePhase = producerSubtiled.addSharedArg(phase);
-              ttnvws::ProducerAcquireOp::create(
-                  tileBuilder, annotTarget->getLoc(), perTileTok, tileBufIdx,
-                  tilePhase,
+              tileBuilder.createWithAsyncTaskIds<ttnvws::ProducerAcquireOp>(
+                  annotTarget->getLoc(), perTileTok, tileBufIdx, tilePhase,
                   WSBarrierAttr::forDstTask(funcOp.getContext(), token.first)
                       .build(funcOp.getContext()));
               LDBG("create inline per-tile ProducerAcquire in SubtiledRegionOp "
@@ -3967,9 +4009,8 @@ void insertAsyncComm(
               tileBufIdx = producerSubtiled.addSharedArg(bufferIdx);
               tilePhase = producerSubtiled.addSharedArg(phase);
             }
-            ttnvws::ProducerAcquireOp::create(
-                tileBuilder, annotTarget->getLoc(), tileToken, tileBufIdx,
-                tilePhase,
+            tileBuilder.createWithAsyncTaskIds<ttnvws::ProducerAcquireOp>(
+                annotTarget->getLoc(), tileToken, tileBufIdx, tilePhase,
                 WSBarrierAttr::forDstTask(funcOp.getContext(), token.first)
                     .build(funcOp.getContext()));
             LDBG("create inline ProducerAcquire in SubtiledRegionOp "
@@ -4141,8 +4182,8 @@ void insertAsyncComm(
               OpBuilderWithAsyncTaskIds tileBuilder(annotTarget);
               tileBuilder.setInsertionPointAfter(annotTarget);
               Value tileBufIdx = commitSubtiled.addSharedArg(bufferIdx);
-              ttnvws::ProducerCommitOp::create(
-                  tileBuilder, annotTarget->getLoc(), perTileTok, tileBufIdx,
+              tileBuilder.createWithAsyncTaskIds<ttnvws::ProducerCommitOp>(
+                  annotTarget->getLoc(), perTileTok, tileBufIdx,
                   WSBarrierAttr::forDstTask(funcOp.getContext(), token.first)
                       .build(funcOp.getContext()));
               emittedSubtiledPerTileProducer.insert(
@@ -4161,8 +4202,8 @@ void insertAsyncComm(
             } else {
               tileBufIdx = commitSubtiled.addSharedArg(bufferIdx);
             }
-            ttnvws::ProducerCommitOp::create(
-                tileBuilder, annotTarget->getLoc(), tileToken, tileBufIdx,
+            tileBuilder.createWithAsyncTaskIds<ttnvws::ProducerCommitOp>(
+                annotTarget->getLoc(), tileToken, tileBufIdx,
                 WSBarrierAttr::forDstTask(funcOp.getContext(), token.first)
                     .build(funcOp.getContext()));
             LDBG("create inline ProducerCommit in SubtiledRegionOp "
@@ -4289,8 +4330,11 @@ void insertAsyncComm(
             tileBufIdx = subtiled.addSharedArg(bufferIdx);
             tilePhase = subtiled.addSharedArg(phase);
           }
-          ttnvws::ConsumerWaitOp::create(tileBuilder, insertTarget->getLoc(),
-                                         tileToken, tileBufIdx, tilePhase);
+          tileBuilder.createWithAsyncTaskIds<ttnvws::ConsumerWaitOp>(
+              insertTarget->getLoc(), tileToken, tileBufIdx, tilePhase,
+              WSBarrierAttr::forDstTask(funcOp.getContext(),
+                                        masterChannel->relation.first)
+                  .build(funcOp.getContext()));
           LDBG("create inline ConsumerWait in SubtiledRegionOp "
                << masterChannel->uniqID << " ");
         } else {
@@ -4338,8 +4382,10 @@ void insertAsyncComm(
       }
 
       // Insert ConsumerReleaseOp, if consumer is not an MMAv5 op. For MMAv5,
-      // MMA lowering will handle the ConsumerReleaseOp.
-      if (commChannel.consumerBarriers.empty()) {
+      // MMA lowering will handle the ConsumerReleaseOp. A channel can mix MMAv5
+      // and non-MMAv5 consumers, so check the barrier per consumer task rather
+      // than treating the whole channel as all-MMAv5 or all-token-based.
+      if (!commChannel.consumerBarriers.count(token.first)) {
         // Route the release off this token's OWN tail consumer, mirroring the
         // per-token tokenHeadConsumer the ConsumerWait uses. The group-wide
         // `tailConsumer` is the last consumer op regardless of task, which for
@@ -4392,8 +4438,11 @@ void insertAsyncComm(
           } else {
             tileBufIdx = subtiled.addSharedArg(bufferIdx);
           }
-          ttnvws::ConsumerReleaseOp::create(tileBuilder, insertTarget->getLoc(),
-                                            tileToken, tileBufIdx);
+          tileBuilder.createWithAsyncTaskIds<ttnvws::ConsumerReleaseOp>(
+              insertTarget->getLoc(), tileToken, tileBufIdx,
+              WSBarrierAttr::forDstTask(funcOp.getContext(),
+                                        masterChannel->relation.first)
+                  .build(funcOp.getContext()));
           LDBG("create inline ConsumerRelease in SubtiledRegionOp "
                << masterChannel->uniqID << " ");
         } else {
@@ -4480,10 +4529,10 @@ void insertAsyncComm(
               funcOp.getContext(), masterChannel->relation.first,
               WSBarrierAttr::kDirectionForward)
               .build(funcOp.getContext());
-      optimizeTMALoads(builder, tmaLoads, *commChannel.producerBarrier,
-                       bufferIdx, bufferIdx, phase, tmaHeadProducer,
-                       headConsumer, consumerWaitPoint,
-                       additionalConsumerTaskIds, waitConstraints);
+      optimizeTMALoads(
+          builder, tmaLoads, *commChannel.producerBarrier, bufferIdx, bufferIdx,
+          phase, tmaHeadProducer, headConsumer, consumerWaitPoint,
+          additionalConsumerTaskIds, waitConstraints, twoCTADirectWait);
     }
   }
 
@@ -4602,8 +4651,13 @@ static void separateLocalAllocWithSrc(triton::FuncOp &funcOp) {
         allocDescType.getMemorySpace(), /*mutableMemory*/ true);
 
     builder.setInsertionPoint(allocOp);
-    auto newAlloc =
-        ttg::LocalAllocOp::create(builder, allocOp.getLoc(), memdescType);
+    ttg::LocalAllocOp newAlloc;
+    if (auto alignment = allocOp.getAlignment())
+      newAlloc = ttg::LocalAllocOp::create(builder, allocOp.getLoc(),
+                                           memdescType, Value(), *alignment);
+    else
+      newAlloc =
+          ttg::LocalAllocOp::create(builder, allocOp.getLoc(), memdescType);
 
     auto originTaskIds = builder.getAsyncTaskIds();
     auto originLoopScheduleInfo = builder.getLoopScheduleInfo();
@@ -4720,43 +4774,78 @@ static void swapTransposedLocalAllocs(triton::FuncOp &funcOp) {
   }
 }
 
-// Merge duplicate local_alloc ops that have:
-// 1. Same source value
-// 2. Same SMEM layout (MemDescType)
-// 3. No modification to the source value between the allocs
-//
-// This optimization is enabled after swapTransposedLocalAllocs, which
-// normalizes transposed allocs to use non-transposed layout so they can
-// share the same buffer.
-//
-// Before:
-//   %val = descriptor_load ...
-//   %a = local_alloc %val -> memdesc<#shared>
-//   ... (no modification to %val) ...
-//   %b = local_alloc %val -> memdesc<#shared>  // same src, same layout
-//
-// After:
-//   %val = descriptor_load ...
-//   %a = local_alloc %val -> memdesc<#shared>
-//   ... (no modification to %val) ...
-//   // %b is replaced with %a
+static bool hasTransitiveInvalidatingEffect(Value root) {
+  SmallVector<Value> worklist = {root};
+  DenseSet<Value> visited;
+  while (!worklist.empty()) {
+    Value value = worklist.pop_back_val();
+    if (!visited.insert(value).second)
+      continue;
+    for (Operation *user : value.getUsers()) {
+      if (user->getNumRegions() != 0 ||
+          isa<scf::YieldOp, scf::ConditionOp>(user))
+        return true;
+      if (auto effects = dyn_cast<MemoryEffectOpInterface>(user)) {
+        SmallVector<MemoryEffects::EffectInstance> instances;
+        effects.getEffects(instances);
+        for (const auto &instance : instances) {
+          if (!isa<MemoryEffects::Write, MemoryEffects::Free>(
+                  instance.getEffect()))
+            continue;
+          if (!instance.getValue() || instance.getValue() == value)
+            return true;
+        }
+      } else if (!isMemoryEffectFree(user)) {
+        return true;
+      }
+      for (Value result : user->getResults()) {
+        if (isa<ttg::MemDescType>(result.getType()))
+          worklist.push_back(result);
+      }
+    }
+  }
+  return false;
+}
+
+/// Return whether two allocations differ only in task ownership. Other
+/// attributes may encode allocation requirements, so they must match before
+/// one allocation can replace the other. Task IDs are merged separately.
+static bool haveCompatibleAllocAttrs(ttg::LocalAllocOp lhs,
+                                     ttg::LocalAllocOp rhs) {
+  auto attrsMatch = [](Operation *a, Operation *b) {
+    for (NamedAttribute attr : a->getAttrs()) {
+      if (attr.getName() == kAsyncTaskIdAttrName)
+        continue;
+      if (b->getAttr(attr.getName()) != attr.getValue())
+        return false;
+    }
+    return true;
+  };
+  return attrsMatch(lhs, rhs) && attrsMatch(rhs, lhs);
+}
+
+/// Coalesce redundant read-only allocations of one descriptor result. The
+/// canonical allocation must dominate the replacement and have the same
+/// MemDescType and allocation attributes. Its task IDs are extended to retain
+/// the ownership recorded on every replaced allocation.
 static void mergeDuplicateLocalAllocs(triton::FuncOp &funcOp) {
-  // Map from (src, memDescType) to the first alloc op with that signature.
-  // We use a vector of pairs since we need to process allocs in program order.
   SmallVector<ttg::LocalAllocOp> allocs;
   funcOp.walk([&](ttg::LocalAllocOp allocOp) {
-    if (allocOp.getSrc())
+    if (!allocOp.getSrc())
+      return;
+    Operation *srcOp = allocOp.getSrc().getDefiningOp();
+    if (srcOp &&
+        (isa<tt::DescriptorLoadOp>(srcOp) || getConvertedDescriptorLoad(srcOp)))
       allocs.push_back(allocOp);
   });
 
-  // Group allocs by source value and MemDescType.
-  // For each group, check if they can be merged.
   DenseMap<Value, SmallVector<ttg::LocalAllocOp>> allocsBySrc;
   for (auto allocOp : allocs) {
     allocsBySrc[allocOp.getSrc()].push_back(allocOp);
   }
 
   SmallVector<ttg::LocalAllocOp> toErase;
+  DominanceInfo dom(funcOp);
 
   for (auto &[src, allocGroup] : allocsBySrc) {
     if (allocGroup.size() < 2)
@@ -4772,21 +4861,16 @@ static void mergeDuplicateLocalAllocs(triton::FuncOp &funcOp) {
       if (typeGroup.size() < 2)
         continue;
 
-      // Sort by program order (using operation order in the IR).
-      // The first alloc in the group is the "canonical" one.
-      // We check if subsequent allocs can be merged into the first.
-      // For now, we do a simple check: if the source value is not modified
-      // between allocs (i.e., src is defined once and not reassigned).
-      // Since SSA values are immutable, if two allocs have the same src,
-      // the source cannot have been modified between them.
-
       ttg::LocalAllocOp firstAlloc = typeGroup[0];
+      if (hasTransitiveInvalidatingEffect(firstAlloc.getResult()))
+        continue;
       for (size_t i = 1; i < typeGroup.size(); ++i) {
         ttg::LocalAllocOp laterAlloc = typeGroup[i];
-
-        // Check dominance: firstAlloc must dominate laterAlloc.
-        // Since we walk in program order, firstAlloc comes before laterAlloc.
-        // We can simply replace laterAlloc's uses with firstAlloc's result.
+        if (!dom.properlyDominates(firstAlloc.getOperation(),
+                                   laterAlloc.getOperation()) ||
+            !haveCompatibleAllocAttrs(firstAlloc, laterAlloc) ||
+            hasTransitiveInvalidatingEffect(laterAlloc.getResult()))
+          continue;
 
         LLVM_DEBUG({
           LDBG("mergeDuplicateLocalAllocs: merging alloc at "
@@ -4796,6 +4880,12 @@ static void mergeDuplicateLocalAllocs(triton::FuncOp &funcOp) {
           LDBG("  type: " << type);
         });
 
+        SmallVector<AsyncTaskId> taskIds = getAsyncTaskIds(firstAlloc);
+        for (AsyncTaskId taskId : getAsyncTaskIds(laterAlloc)) {
+          if (!llvm::is_contained(taskIds, taskId))
+            taskIds.push_back(taskId);
+        }
+        setAsyncTaskIds(firstAlloc, taskIds);
         laterAlloc.getResult().replaceAllUsesWith(firstAlloc.getResult());
         toErase.push_back(laterAlloc);
       }
@@ -4817,7 +4907,15 @@ static void mergeDuplicateLocalAllocs(triton::FuncOp &funcOp) {
 // allocation) prevents the autoWS compiler from creating a
 // cross-partition channel for it.
 void removeRedundantTmemZeroStores(triton::FuncOp funcOp) {
+  DominanceInfo dominance(funcOp);
   auto isConstZeroTensor = [](Value v) -> bool {
+    // Hoisting can materialize an accumulator initializer in the default
+    // partition by converting the zero splat to the TMEM store's register
+    // layout.  Later cleanup can leave a chain of such conversions.  Every
+    // one of them preserves zero and must not hide it from this redundancy
+    // check, so walk the whole chain.
+    while (auto convert = v.getDefiningOp<ttg::ConvertLayoutOp>())
+      v = convert.getSrc();
     auto constOp = v.getDefiningOp<arith::ConstantOp>();
     if (!constOp)
       return false;
@@ -4907,9 +5005,20 @@ void removeRedundantTmemZeroStores(triton::FuncOp funcOp) {
           zeroStoreOp->getParentOfType<scf::ForOp>();
       if (!zeroStoreParentLoop)
         zeroStoreParentLoop = zeroStoreOp->getParentOfType<scf::WhileOp>();
-      if (zeroStoreParentLoop &&
+      bool commonOuterLoop =
+          zeroStoreParentLoop &&
           (zeroStoreParentLoop == mmaParentLoop.getOperation() ||
-           zeroStoreParentLoop->isProperAncestor(mmaParentLoop))) {
+           zeroStoreParentLoop->isProperAncestor(mmaParentLoop));
+      // The loop is known to run at least once either from an explicit
+      // tt.assume_nonempty annotation, or from a tl.assume(hi > lo) on its
+      // bounds, which needs no separate annotation.
+      bool knownNonEmpty =
+          mmaParentLoop->hasAttr("tt.assume_nonempty") ||
+          triton::isLoopTripCountKnownPositive(mmaParentLoop, dominance);
+      bool dominatesKnownNonEmptyLoop =
+          knownNonEmpty &&
+          dominance.properlyDominates(zeroStoreOp, mmaParentLoop);
+      if (commonOuterLoop || dominatesKnownNonEmptyLoop) {
         LLVM_DEBUG({
           LDBG("Removing redundant TMEM zero-store for operand D: "
                << "MMA useAccumulator=false already handles zeroing");
@@ -5036,10 +5145,11 @@ namespace {
 // load must not overwrite that SMEM until the previous tile's staging TMA store
 // has drained. That write-after-read edge uses a dedicated single-buffered
 // cross-partition reuse token — the load task producer_acquires it at the
-// outer-loop top (loop-carried phase) and the staging task consumer_releases it
-// at the bottom — NOT the host operand's own barrier. (An earlier degenerate
-// version emitted a constant bufferIdx=0/phase=0 acquire on the host token that
-// WSLowerToken elided to a no-op.) Intra-partition ordering was already
+// outer-loop top (loop-carried phase) and the task draining the staging buffer
+// consumer_releases it at the bottom — NOT the host operand's own barrier. (An
+// earlier degenerate version emitted a constant bufferIdx=0/phase=0 acquire on
+// the host token that WSLowerToken elided to a no-op.) Intra-partition ordering
+// was already
 // validated by the planner's findReuseCandidate. This is the cross-buffer
 // `allocation.reuseTarget` path, distinct from the A1-A6 same-buffer.id
 // ReuseGroup categories (see docs/ReuseGroups.md "Buffer Replacement").
@@ -5467,6 +5577,83 @@ void doCodePartition(triton::FuncOp funcOp, unsigned numBuffers) {
       mergedChannels.insert(ch);
     }
   }
+
+  // Collapse an ordered run of single-buffer TMEM channels onto its first
+  // member: the representative absorbs the consumer lists of every later
+  // channel whose endpoints pair up with its own, so the whole run needs one
+  // handshake instead of one per channel. `hasFusableEndpoints` picks the
+  // producer/consumer op kinds a run is made of; `requireSameAlloc`
+  // additionally pins the run to one TMEM allocation. Both 2-CTA fusions below
+  // differ only in those two knobs, so a change to the merge rules applies to
+  // both.
+  auto fuseOrderedTmemChannels =
+      [&](ArrayRef<Channel *> candidates,
+          llvm::function_ref<bool(Channel *)> hasFusableEndpoints,
+          bool requireSameAlloc) {
+        auto isFusable = [&](Channel *ch) {
+          return ch->channelKind == DataChannelKind::TMEMAlloc &&
+                 ch->getNumBuffers() == 1 && hasFusableEndpoints(ch);
+        };
+        for (size_t i = 0; i < candidates.size(); ++i) {
+          Channel *rep = candidates[i];
+          if (mergedChannels.contains(rep) || !isFusable(rep))
+            continue;
+          auto repIt = channelsGroupedByConsumers.find(rep);
+          if (repIt == channelsGroupedByConsumers.end())
+            continue;
+          for (size_t j = i + 1; j < candidates.size(); ++j) {
+            Channel *ch = candidates[j];
+            if (mergedChannels.contains(ch) || !isFusable(ch) ||
+                ch->relation != rep->relation ||
+                (requireSameAlloc && ch->getAllocOp() != rep->getAllocOp()) ||
+                ch->getSrcOp()->getBlock() != rep->getSrcOp()->getBlock() ||
+                ch->getDstOp()->getBlock() != rep->getDstOp()->getBlock())
+              continue;
+            auto chIt = channelsGroupedByConsumers.find(ch);
+            if (chIt == channelsGroupedByConsumers.end())
+              continue;
+            repIt->second.append(chIt->second.begin(), chIt->second.end());
+            channelsGroupedByConsumers.erase(chIt);
+            mergedChannels.insert(ch);
+          }
+        }
+      };
+
+  SmallVector<bool> autoWSFuseFlags = getAutoWSBooleanFlags(
+      funcOp, {kAutoWSFuseFinalStatsKey, kAutoWSFuseAccSlicesKey});
+
+  // The 2-CTA FA forward schedule stores its final softmax sum and maximum in
+  // adjacent slots of one physical TMEM allocation, then loads both in the
+  // default partition.  Their producer and consumer ops differ, so the exact
+  // consumer matching above leaves two token handshakes.  TLX uses one: wait
+  // before the first load, release after the last load, acquire before the
+  // first store, and commit after the last store.  Form the same ordered group
+  // only for opted-in, single-buffer TMEM store/load channels whose endpoints
+  // are in the same blocks and tasks.
+  if (autoWSFuseFlags[0]) {
+    auto isStoreToLoad = [](Channel *ch) {
+      return isa<ttng::TMEMStoreOp>(ch->getSrcOp()) &&
+             isa<ttng::TMEMLoadOp>(ch->getDstOp());
+    };
+    for (auto &group : config.groups)
+      fuseOrderedTmemChannels(group.channels, isStoreToLoad,
+                              /*requireSameAlloc=*/false);
+  }
+
+  // A subtiled accumulator has one MMAv5 producer and one TMEM-load consumer
+  // per slice. The slices share an allocation and advance in lockstep, so a
+  // single completion handshake can cover the ordered producer/consumer
+  // range: completion is attached to the last MMA and the wait is placed
+  // before the first load. This matches TLX's one accumulator barrier per
+  // compute group instead of one pair per slice.
+  if (autoWSFuseFlags[1]) {
+    auto isMmaToLoad = [](Channel *ch) {
+      return isa<ttng::MMAv5OpInterface>(ch->getSrcOp()) &&
+             isa<ttng::TMEMLoadOp>(ch->getDstOp());
+    };
+    fuseOrderedTmemChannels(orderedChannels, isMmaToLoad,
+                            /*requireSameAlloc=*/true);
+  }
   orderedChannels.erase(
       llvm::remove_if(orderedChannels,
                       [&](Channel *ch) { return mergedChannels.count(ch); }),
@@ -5501,6 +5688,7 @@ void doCodePartition(triton::FuncOp funcOp, unsigned numBuffers) {
   // rewrites the alloc ops (which would lose the local_store users).
   struct StagingReuseInfo {
     unsigned targetBufferId;
+    AsyncTaskId drainedStoreTask;
     Operation *firstStore;
   };
   SmallVector<StagingReuseInfo> stagingReuseInfos;
@@ -5508,22 +5696,34 @@ void doCodePartition(triton::FuncOp funcOp, unsigned numBuffers) {
     auto reuseAttr =
         allocOp->getAttrOfType<IntegerAttr>("allocation.reuseTarget");
     auto stagingAttr = allocOp->getAttrOfType<IntegerAttr>("buffer.tmaStaging");
-    if (!reuseAttr || !stagingAttr)
+    auto bufferIdAttr = allocOp->getAttrOfType<IntegerAttr>("buffer.id");
+    if (!reuseAttr || !stagingAttr || !bufferIdAttr)
       return;
-    // Find the first local_store user.
+    // Find the first local_store user and the task that launches the TMA store.
     Operation *firstStore = nullptr;
+    SmallVector<AsyncTaskId> drainedStoreTasks;
     for (auto *user : allocOp->getUsers()) {
       if (isa<ttg::LocalStoreOp>(user)) {
         if (!firstStore || user->isBeforeInBlock(firstStore))
           firstStore = user;
       }
+      if (isa<ttng::AsyncTMACopyLocalToGlobalOp, ttng::AsyncTMAReduceOp>(
+              user)) {
+        auto taskIds = getAsyncTaskIds(user);
+        drainedStoreTasks.append(taskIds.begin(), taskIds.end());
+      }
     }
-    if (!firstStore) {
+    if (!firstStore || drainedStoreTasks.empty() ||
+        !llvm::all_of(drainedStoreTasks, [&](AsyncTaskId task) {
+          return task == drainedStoreTasks.front();
+        })) {
       LDBG("Step 4.5: staging alloc has reuseTarget="
-           << reuseAttr.getInt() << " but no local_store user");
+           << reuseAttr.getInt()
+           << " but does not have one local_store/drained-store task");
       return;
     }
-    stagingReuseInfos.push_back({(unsigned)reuseAttr.getInt(), firstStore});
+    stagingReuseInfos.push_back(
+        {(unsigned)reuseAttr.getInt(), drainedStoreTasks.front(), firstStore});
     LDBG("Step 4.5: collected staging reuse: target buffer.id="
          << reuseAttr.getInt() << " firstStore found");
   });
@@ -5556,23 +5756,23 @@ void doCodePartition(triton::FuncOp funcOp, unsigned numBuffers) {
 
   // Step 7.5: Insert a cross-tile WAR barrier for TMA staging SMEM reuse.
   //
-  // The dv/dk TMA-staging buffers alias the v/do operand SMEM
+  // TMA-staging buffers alias operand SMEM
   // (allocation.reuseTarget, realized later by mergeStagingReuseIntoHost). In a
   // persistent (outer-tile) loop the *next* tile's operand load must not
   // overwrite that SMEM until the *previous* tile's staging TMA store has
   // finished reading it. The host operand buffer's own empty barrier is
   // released by its MMA consumer (which finishes before the staging store), and
-  // it cannot carry an extra release from the staging task — the staging task
-  // has a different warp count than the MMA task, which trips the
-  // `consumerWarps == nWarps` assert in WSLowerToken. So emit a dedicated,
+  // it cannot carry an extra release from the task draining the staging buffer
+  // — that task can have a different warp count than the MMA task, which trips
+  // the `consumerWarps == nWarps` assert in WSLowerToken. So emit a dedicated,
   // single-buffered cross-partition token (mirroring the TLX `k_empties`
   // pattern): the load task acquires it at the top of the persistent outer loop
-  // (before the operand loads); the staging task releases it at the bottom
-  // (after the staging stores, which have already drained). The acquire/release
-  // are loop-carried (phase derived from the outer induction variable), so the
-  // edge serializes load(tile N+1) after staging-store(tile N). The load and
-  // staging genuinely alias the same SMEM, so this serialization removes no
-  // legitimate overlap.
+  // (before the operand loads); the drained-store task releases it at the
+  // bottom (after the staging stores, which have already drained). The
+  // acquire/release are loop-carried (phase derived from the outer induction
+  // variable), so the edge serializes load(tile N+1) after staging-store(tile
+  // N). The load and staging genuinely alias the same SMEM, so this
+  // serialization removes no legitimate overlap.
   //
   // MUST run BEFORE Step 8 (insertAsyncComm), whose removeTokenfNotUsed cleanup
   // sweep would otherwise free the freshly-created token (it only has uses once
@@ -5587,23 +5787,28 @@ void doCodePartition(triton::FuncOp funcOp, unsigned numBuffers) {
         bufferIdToChannel[attr.getInt()] = ch;
     }
 
-    // Resolve every staging pair to its (outer loop, staging task, load task).
+    // Resolve every staging pair to its (outer loop, drained-store task, load
+    // task). The task filling the staging allocation is not necessarily the
+    // task draining it: FA forward has two computation tasks filling two output
+    // stagings, while one epilogue-store task launches and waits for both TMA
+    // stores. Releasing from the fill task would either reject the pair as
+    // inconsistent or let the next tile overwrite SMEM while the store reads
+    // it.
     // The cross-tile WAR token is intentionally coarse: a single
     // producer_acquire at the top of the outer-loop body (before *all* operand
     // loads) and a single consumer_release at the bottom (after *all* staging
     // stores) serialize tile N+1's loads behind tile N's staging stores. That
     // covers every aliasing pair *provided* they share one outer loop, one
-    // staging task, and one load task -- which holds for FA-bwd (v/do are
-    // loaded by the load task; dv/dk are stored by the staging task). If a
-    // future kernel spreads staging pairs across different tasks or loops, a
-    // single token cannot cover them all, so detect that and skip rather than
-    // emit a barrier that silently guards only one pair.
+    // drained-store task, and one load task. If a future kernel spreads staging
+    // pairs across different tasks or loops, a single token cannot cover them
+    // all, so detect that and skip rather than emit a barrier that silently
+    // guards only one pair.
     //
     // Derive staging/load tasks from the *matched* entry (not from
     // stagingReuseInfos.front(), which may have been skipped above) so the
     // barrier's task IDs always agree with the selected outer loop.
-    scf::ForOp outerLoop;
-    AsyncTaskId stagingTask = -1;
+    LoopLikeOpInterface outerLoop;
+    AsyncTaskId drainedStoreTask = -1;
     AsyncTaskId loadTask = -1;
     unsigned matched = 0;
     bool consistent = true;
@@ -5611,20 +5816,19 @@ void doCodePartition(triton::FuncOp funcOp, unsigned numBuffers) {
       auto it = bufferIdToChannel.find(info.targetBufferId);
       if (it == bufferIdToChannel.end() || !it->second->getSrcOp())
         continue;
-      auto loop = info.firstStore->getParentOfType<scf::ForOp>();
+      LoopLikeOpInterface loop = getParentPersistentLoop(info.firstStore);
       if (!loop)
         continue;
-      auto sTaskIds = getAsyncTaskIds(info.firstStore);
       auto lTaskIds = getAsyncTaskIds(it->second->getSrcOp());
-      if (sTaskIds.empty() || lTaskIds.empty())
+      if (lTaskIds.empty())
         continue;
-      AsyncTaskId sTask = sTaskIds.front();
+      AsyncTaskId storeTask = info.drainedStoreTask;
       AsyncTaskId lTask = lTaskIds.front();
       if (matched++ == 0) {
         outerLoop = loop;
-        stagingTask = sTask;
+        drainedStoreTask = storeTask;
         loadTask = lTask;
-      } else if (loop != outerLoop || sTask != stagingTask ||
+      } else if (loop != outerLoop || storeTask != drainedStoreTask ||
                  lTask != loadTask) {
         consistent = false;
       }
@@ -5632,66 +5836,85 @@ void doCodePartition(triton::FuncOp funcOp, unsigned numBuffers) {
 
     if (matched && !consistent) {
       LDBG("Step 7.5: staging-reuse pairs span multiple outer loops / load / "
-           "staging tasks; cross-tile WAR barrier not inserted (unhandled)");
-    } else if (matched && outerLoop && loadTask == stagingTask) {
-      LDBG("Step 7.5: load and staging share task "
+           "drained-store tasks; cross-tile WAR barrier not inserted "
+           "(unhandled)");
+    } else if (matched && outerLoop && loadTask == drainedStoreTask) {
+      LDBG("Step 7.5: load and drained store share task "
            << loadTask << "; cross-tile WAR barrier not needed "
            << "(same-partition staging)");
-    } else if (matched && outerLoop && loadTask != stagingTask) {
+    } else if (matched && outerLoop && loadTask != drainedStoreTask) {
       MLIRContext *ctx = funcOp.getContext();
-      // Create the synthetic reuse token at function entry.
-      OpBuilder entryB(funcOp);
-      entryB.setInsertionPointToStart(&funcOp.getBody().front());
-      Value reuseToken = ttnvws::CreateTokenOp::create(
-          entryB, funcOp.getLoc(), /*numBuffers=*/1,
-          ttnvws::TokenLoadType::LocalStoreOp);
 
-      // producer_acquire (load task) at the top of the outer loop body. The
-      // phase must flip once per outer iteration, so feed getBufferIdxAndPhase
-      // a 0-based iteration counter. Normalize as (iv - lb) / step rather than
-      // the raw induction variable so the parity is correct for any lower bound
-      // / step; when the loop is already normalized (lb=0, step=1 -- the AutoWS
-      // persistent case, whose body carries the real tile id separately) this
-      // is just the induction variable and the extra arith is folded away.
-      Operation *firstBodyOp = &outerLoop.getBody()->front();
-      OpBuilderWithAsyncTaskIds acqBuilder(firstBodyOp);
-      acqBuilder.setInsertionPoint(firstBodyOp);
-      acqBuilder.setAsynTaskIdsFromArray({loadTask});
-      Location acqLoc = firstBodyOp->getLoc();
-      Value iterIdx = outerLoop.getInductionVar();
-      APInt lbVal, stepVal;
-      bool lbIsZero =
-          matchPattern(outerLoop.getLowerBound(), m_ConstantInt(&lbVal)) &&
-          lbVal.isZero();
-      bool stepIsOne =
-          matchPattern(outerLoop.getStep(), m_ConstantInt(&stepVal)) &&
-          stepVal.isOne();
-      if (!lbIsZero || !stepIsOne) {
-        Value rel = acqBuilder.createWithAsyncTaskIds<arith::SubIOp>(
-            acqLoc, iterIdx, outerLoop.getLowerBound());
-        iterIdx = acqBuilder.createWithAsyncTaskIds<arith::DivUIOp>(
-            acqLoc, rel, outerLoop.getStep());
+      Block *outerBody = getPersistentLoopBody(outerLoop);
+      // A `for` exposes its iteration count as the induction variable; a
+      // `while` has none, so fall back to the AutoWS iteration counter carried
+      // through its after region.
+      Value iterIdx = outerLoop.getSingleInductionVar().value_or(Value());
+      if (auto whileOp = dyn_cast<scf::WhileOp>(outerLoop.getOperation()))
+        iterIdx = getWhileIterationCounter(whileOp);
+      if (!outerBody || !iterIdx) {
+        LDBG("Step 7.5: could not derive persistent-loop iteration; "
+             "cross-tile WAR barrier not inserted (unhandled)");
+      } else {
+        // Create the synthetic reuse token at function entry.
+        OpBuilder entryB(funcOp);
+        entryB.setInsertionPointToStart(&funcOp.getBody().front());
+        Value reuseToken = ttnvws::CreateTokenOp::create(
+            entryB, funcOp.getLoc(), /*numBuffers=*/1,
+            ttnvws::TokenLoadType::LocalStoreOp);
+
+        // producer_acquire (load task) at the top of the outer loop body. The
+        // phase must flip once per outer iteration, so feed
+        // getBufferIdxAndPhase a 0-based iteration counter. Normalize as (iv -
+        // lb) / step rather than the raw induction variable so the parity is
+        // correct for any lower bound / step; when the loop is already
+        // normalized (lb=0, step=1 -- the AutoWS persistent case, whose body
+        // carries the real tile id separately) this is just the induction
+        // variable and the extra arith is folded away.
+        Operation *firstBodyOp = &outerBody->front();
+        OpBuilderWithAsyncTaskIds acqBuilder(firstBodyOp);
+        acqBuilder.setInsertionPoint(firstBodyOp);
+        acqBuilder.setAsynTaskIdsFromArray({loadTask});
+        Location acqLoc = firstBodyOp->getLoc();
+        if (auto forOp = dyn_cast<scf::ForOp>(outerLoop.getOperation())) {
+          APInt lbVal, stepVal;
+          bool lbIsZero =
+              matchPattern(forOp.getLowerBound(), m_ConstantInt(&lbVal)) &&
+              lbVal.isZero();
+          bool stepIsOne =
+              matchPattern(forOp.getStep(), m_ConstantInt(&stepVal)) &&
+              stepVal.isOne();
+          if (!lbIsZero || !stepIsOne) {
+            Value rel = acqBuilder.createWithAsyncTaskIds<arith::SubIOp>(
+                acqLoc, iterIdx, forOp.getLowerBound());
+            iterIdx = acqBuilder.createWithAsyncTaskIds<arith::DivUIOp>(
+                acqLoc, rel, forOp.getStep());
+          }
+        }
+        Value ivExt = iterIdx;
+        if (!iterIdx.getType().isInteger(64))
+          ivExt = acqBuilder.createWithAsyncTaskIds<arith::ExtUIOp>(
+              acqLoc, acqBuilder.getIntegerType(64), iterIdx);
+        auto idxPhase =
+            getBufferIdxAndPhase(acqBuilder, acqLoc, ivExt, /*numBuffers=*/1);
+        acqBuilder.createWithAsyncTaskIds<ttnvws::ProducerAcquireOp>(
+            acqLoc, reuseToken, idxPhase.first, idxPhase.second,
+            WSBarrierAttr::forDstTask(ctx, drainedStoreTask).build(ctx));
+
+        // consumer_release at the bottom of the drained-store task, after its
+        // TMA store waits have completed.
+        Operation *term = outerBody->getTerminator();
+        OpBuilderWithAsyncTaskIds relBuilder(term);
+        relBuilder.setInsertionPoint(term);
+        relBuilder.setAsynTaskIdsFromArray({drainedStoreTask});
+        Value bufIdx = relBuilder.createWithAsyncTaskIds<arith::ConstantIntOp>(
+            term->getLoc(), 0, 32);
+        relBuilder.createWithAsyncTaskIds<ttnvws::ConsumerReleaseOp>(
+            term->getLoc(), reuseToken, bufIdx,
+            WSBarrierAttr::forDstTask(ctx, loadTask).build(ctx));
+        LDBG("Step 7.5: inserted cross-tile staging-reuse WAR barrier (load "
+             << loadTask << " -> drained store " << drainedStoreTask << ")");
       }
-      Value ivExt = acqBuilder.createWithAsyncTaskIds<arith::ExtUIOp>(
-          acqLoc, acqBuilder.getIntegerType(64), iterIdx);
-      auto idxPhase =
-          getBufferIdxAndPhase(acqBuilder, acqLoc, ivExt, /*numBuffers=*/1);
-      acqBuilder.createWithAsyncTaskIds<ttnvws::ProducerAcquireOp>(
-          acqLoc, reuseToken, idxPhase.first, idxPhase.second,
-          WSBarrierAttr::forDstTask(ctx, stagingTask).build(ctx));
-
-      // consumer_release (staging task) at the bottom, after staging stores.
-      Operation *term = outerLoop.getBody()->getTerminator();
-      OpBuilderWithAsyncTaskIds relBuilder(term);
-      relBuilder.setInsertionPoint(term);
-      relBuilder.setAsynTaskIdsFromArray({stagingTask});
-      Value bufIdx = relBuilder.createWithAsyncTaskIds<arith::ConstantIntOp>(
-          term->getLoc(), 0, 32);
-      relBuilder.createWithAsyncTaskIds<ttnvws::ConsumerReleaseOp>(
-          term->getLoc(), reuseToken, bufIdx,
-          WSBarrierAttr::forDstTask(ctx, loadTask).build(ctx));
-      LDBG("Step 7.5: inserted cross-tile staging-reuse WAR barrier (load "
-           << loadTask << " -> staging " << stagingTask << ")");
     }
   }
 

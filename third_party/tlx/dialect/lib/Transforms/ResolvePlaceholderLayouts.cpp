@@ -401,7 +401,96 @@ static Attribute deepUnwrapTlxWrappers(Attribute attr) {
   return attr;
 }
 
+// A reshape may be built while its source still carries a deferred TLX
+// wrapper. Layout optimization can then retag the source while the wrapper
+// keeps the reshape's previously inferred destination stable. Once wrappers
+// are removed below, the concrete reshape must satisfy Triton's normal layout
+// inference again. Preserve the destination expected by existing consumers
+// with an explicit layout conversion. The conversion may exchange data across
+// threads when downstream layout optimization selected a different ownership.
+static LogicalResult
+repairUnwrappedReshapes(ArrayRef<::mlir::triton::ReshapeOp> reshapes) {
+  for (auto reshape : reshapes) {
+    RankedTensorType srcTy = reshape.getSrc().getType();
+    RankedTensorType oldDstTy = reshape.getType();
+    Attribute srcEnc = srcTy.getEncoding();
+    Attribute oldDstEnc = oldDstTy.getEncoding();
+    if (!srcEnc || !oldDstEnc)
+      continue;
+
+    auto *layout = dyn_cast<::mlir::triton::DialectInferLayoutInterface>(
+        &srcEnc.getDialect());
+    if (!layout)
+      return reshape.emitError(
+          "source layout does not support reshape inference after TLX layout "
+          "finalization");
+
+    Attribute inferredDstEnc = oldDstEnc;
+    if (failed(layout->inferReshapeOpEncoding(
+            srcTy.getShape(), srcEnc, oldDstTy.getShape(), inferredDstEnc,
+            reshape.getAllowReorder(), reshape.getLoc())))
+      return failure();
+    if (succeeded(layout->verifyLayoutsAreEqual(oldDstTy.getShape(),
+                                                inferredDstEnc, oldDstEnc,
+                                                /*loc=*/std::nullopt)))
+      continue;
+
+    RankedTensorType inferredDstTy = RankedTensorType::get(
+        oldDstTy.getShape(), oldDstTy.getElementType(), inferredDstEnc);
+    reshape.getResult().setType(inferredDstTy);
+    OpBuilder builder(reshape);
+    builder.setInsertionPointAfter(reshape);
+    auto convert = ttg::ConvertLayoutOp::create(builder, reshape.getLoc(),
+                                                oldDstTy, reshape.getResult());
+    reshape.getResult().replaceAllUsesExcept(convert.getResult(), convert);
+  }
+  return success();
+}
+
+static void lowerRequireLayouts(ModuleOp moduleOp) {
+  SmallVector<ttg::RequireLayoutOp> requireLayouts;
+  moduleOp.walk([&](ttg::RequireLayoutOp op) { requireLayouts.push_back(op); });
+
+  for (ttg::RequireLayoutOp op : requireLayouts) {
+    bool rematerializeCoordinates =
+        op->hasAttr("tlx.rematerialize_coordinates");
+    if (op.getSrc().getType() == op.getType()) {
+      if (rematerializeCoordinates) {
+        if (auto sourceConvert =
+                op.getSrc().getDefiningOp<ttg::ConvertLayoutOp>()) {
+          sourceConvert->setAttr("tlx.rematerialize_coordinates",
+                                 UnitAttr::get(op.getContext()));
+          op.getResult().replaceAllUsesWith(op.getSrc());
+          op.erase();
+          continue;
+        }
+      } else {
+        op.getResult().replaceAllUsesWith(op.getSrc());
+        op.erase();
+        continue;
+      }
+    }
+
+    OpBuilder builder(op);
+    auto convert = ttg::ConvertLayoutOp::create(builder, op.getLoc(),
+                                                op.getType(), op.getSrc());
+    if (rematerializeCoordinates)
+      convert->setAttr("tlx.rematerialize_coordinates", builder.getUnitAttr());
+    op.getResult().replaceAllUsesWith(convert.getResult());
+    op.erase();
+  }
+}
+
 static LogicalResult finalizeUserLayouts(ModuleOp moduleOp) {
+  SmallVector<::mlir::triton::ReshapeOp> wrappedReshapes;
+  moduleOp.walk([&](::mlir::triton::ReshapeOp reshape) {
+    if (containsUserLayout(reshape.getSrc().getType()) ||
+        containsUserLayout(reshape.getType()) ||
+        containsNoVerifyLayout(reshape.getSrc().getType()) ||
+        containsNoVerifyLayout(reshape.getType()))
+      wrappedReshapes.push_back(reshape);
+  });
+
   mlir::AttrTypeReplacer replacer;
   replacer.addReplacement([](UserLayoutAttr wrapper) -> Attribute {
     return deepUnwrapTlxWrappers(wrapper);
@@ -432,6 +521,22 @@ static LogicalResult finalizeUserLayouts(ModuleOp moduleOp) {
     if (resultType && dense.getType() != resultType)
       cst.setValueAttr(dense.reshape(resultType));
   });
+
+  if (failed(repairUnwrappedReshapes(wrappedReshapes)))
+    return failure();
+
+  lowerRequireLayouts(moduleOp);
+
+  SmallVector<ttg::ConvertLayoutOp> identityConversions;
+  moduleOp.walk([&](ttg::ConvertLayoutOp convert) {
+    if (convert.getSrc().getType() == convert.getType() &&
+        !convert->hasAttr("tlx.rematerialize_coordinates"))
+      identityConversions.push_back(convert);
+  });
+  for (ttg::ConvertLayoutOp convert : identityConversions) {
+    convert.getResult().replaceAllUsesWith(convert.getSrc());
+    convert.erase();
+  }
 
   bool residual = false;
   moduleOp.walk([&](Operation *op) {

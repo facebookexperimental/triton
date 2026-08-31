@@ -1,0 +1,26 @@
+[
+  {
+    "case_id": "square_4096",
+    "parameters": {
+      "m": 4096,
+      "n": 4096,
+      "k": 4096,
+      "dtype": "float16",
+      "seed": 0
+    },
+    "weight": 2.0,
+    "protected": true
+  },
+  {
+    "case_id": "rectangular_8192x4096x2048",
+    "parameters": {
+      "m": 8192,
+      "n": 4096,
+      "k": 2048,
+      "dtype": "float16",
+      "seed": 1
+    },
+    "weight": 1.0,
+    "protected": true
+  }
+]

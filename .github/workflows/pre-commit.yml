@@ -28,16 +28,29 @@ jobs:
             ~/.cache/pre-commit
           key: ${{ runner.os }}-${{ steps.cache-key.outputs.pre_commit_hash }}
       - name: Check pre-commit
+        id: precommit
+        # Formatting issues are reported as a warning, not a hard failure, so
+        # they never block a PR. The "Pre-commit warning" step below is the
+        # marker other workflows key off of (see pre-commit-autofix.yml).
+        continue-on-error: true
         run: |
           python3 -m pip install --upgrade pre-commit
           python3 -m pre_commit run --all-files --verbose
-      - name: Print diff and fix instructions if pre-commit failed
-        if: failure()
+      - name: Pre-commit warning
+        if: steps.precommit.outcome == 'failure'
         run: |
-          echo "### Pre-commit failed — formatting issues detected"
-          echo ""
-          echo "To fix automatically, comment \`/fix-precommit\` on the PR."
-          echo "To fix locally: \`pre-commit run --all-files && git add -A && git commit -m 'fix formatting' && git push\`"
-          echo ""
-          echo "### Diff of required changes:"
-          git diff
+          echo "::warning title=Pre-commit::Formatting issues detected. This is a warning, not a failure — comment /fix-precommit on the PR to fix automatically."
+          {
+            echo "### :warning: Pre-commit — formatting issues detected (non-blocking)"
+            echo ""
+            echo "To fix automatically, comment \`/fix-precommit\` on the PR."
+            echo "To fix locally: \`pre-commit run --all-files && git add -A && git commit -m 'fix formatting' && git push\`"
+            echo ""
+            echo "<details><summary>Diff of required changes</summary>"
+            echo ""
+            echo '```diff'
+            git diff
+            echo '```'
+            echo ""
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"

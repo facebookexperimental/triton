@@ -1770,10 +1770,8 @@ void init_triton_ir(py::module_ &m) {
             auto descTy = cast<triton::TensorDescType>(desc.getType());
             auto resTy = descTy.getSignlessBlockType();
             auto op = self.create<DescriptorLoadOp>(
-                resTy, desc, indices, cacheModifier, evictionPolicy);
-            if (multicast)
-              op->setAttr("tt.multicast",
-                          self.getBuilder().getBoolAttr(*multicast));
+                resTy, desc, indices, cacheModifier, evictionPolicy,
+                multicast.value_or(false));
             return op;
           },
           py::arg("desc"), py::arg("indices"), py::arg("cacheModifier"),
@@ -1868,6 +1866,13 @@ void init_triton_ir(py::module_ &m) {
              return self.createOrFold<UnsplatOp>(arg);
            })
       // // atomic
+      .def("create_atomic_poll",
+           [](TritonOpBuilder &self, Value &ptr, Value &expected,
+              std::optional<Value> timeout, MemSemantic sem,
+              MemSyncScope scope) -> Value {
+             return self.create<AtomicPollOp>(
+                 ptr, expected, timeout.value_or(Value()), sem, scope);
+           })
       .def("create_atomic_cas",
            [](TritonOpBuilder &self, Value &ptr, Value &cmp, Value &val,
               MemSemantic sem, MemSyncScope scope) -> Value {
@@ -2127,7 +2132,8 @@ void init_triton_ir(py::module_ &m) {
       // Warp pipeline border marker (AMD)
       .def("create_warp_pipeline_border",
            [](TritonOpBuilder &self, const std::string &marker, int priority) {
-             auto border = self.create<ROCDL::SchedBarrier>(0);
+             auto border =
+                 self.create<ROCDL::SchedBarrier>(ROCDL::SchedGroupMask::none);
              auto ctx = self.getContext();
              border->setAttr("triton.warp_pipeline.border",
                              StringAttr::get(ctx, marker));
@@ -2150,8 +2156,10 @@ void init_triton_ir(py::module_ &m) {
   // Add custom operations.
   for (const auto &plugin : mlir::triton::plugin::loadPlugins()) {
     for (const auto &op : plugin.listOps()) {
+      std::string wrapped = std::string("create_") + op.name;
       TritonOpBuilderBinding.def(
-          op.name, [op](TritonOpBuilder &self, std::vector<Value> args) {
+          wrapped.c_str(),
+          [op](TritonOpBuilder &self, std::vector<Value> args) {
             args.insert(args.begin(), Value());
             op.addOp(self, args);
             return args[0];

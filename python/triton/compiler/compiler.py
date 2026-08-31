@@ -45,6 +45,10 @@ arg_type_pattern = {
 }
 
 
+def _target_supports_triton_dispatcher(target) -> bool:
+    return getattr(target, "backend", None) == "cuda"
+
+
 def convert_type_repr(x):
     # Currently we only capture the pointer type and assume the pointer is on global memory.
     # TODO: Capture and support shared memory space
@@ -140,18 +144,22 @@ class IRSource:
 
 
 @functools.lru_cache()
+def _max_shared_mem(device, driver_utils):
+    return driver_utils.get_device_properties(device)["max_shared_mem"]
+
+
 def max_shared_mem(device):
-    return driver.active.utils.get_device_properties(device)["max_shared_mem"]
+    return _max_shared_mem(device, driver.active.utils)
 
 
 def parse(full_name, ext, context):
-    if ext == "ttir" or ext == "ttgir":
+    if ext == "ttir" or ext == "ttgir" or ext == "ttcir" or ext == "tttcir":
         module = ir.parse_mlir_module(full_name, context)
         module.context = context
         return module
-    if ext == "llir" or ext == "ptx" or ext == "amdgcn":
+    if ext == "llir" or ext == "ptx" or ext == "amdgcn" or ext == "asm":
         return Path(full_name).read_text(encoding="utf-8")
-    if ext == "cubin" or ext == "hsaco":
+    if ext == "cubin" or ext == "hsaco" or ext == "so":
         return Path(full_name).read_bytes()
 
 
@@ -553,6 +561,7 @@ class CompiledKernel:
         self.module = None
         self.function = None
         self._run = None
+        self._unload_module = None
 
     @property
     def launch_metadata_schema(self):
@@ -568,7 +577,8 @@ class CompiledKernel:
             if knobs.runtime.kernel_unload_hook is not None:
                 knobs.runtime.kernel_unload_hook(self.module, self.function, self.name, self.metadata_group, self.hash)
 
-            driver.active.utils.unload_module(self.module)
+            if self._unload_module is not None:
+                self._unload_module(self.module)
             self.module = None
 
     def _init_handles(self):
@@ -583,11 +593,17 @@ class CompiledKernel:
 
         # Facebook end
 
-        device = driver.active.get_current_device()
+        active_driver = driver.active
+        device = active_driver.get_current_device()
+        utils = active_driver.utils
         # create launcher
-        self._run = driver.active.launcher_cls(self.src, self.metadata)
+        run = active_driver.launcher_cls(self.src, self.metadata)
+        if hasattr(run, "launcher_bytes") and run.launcher_bytes is not None:
+            # Used by external runtimes such as NativeRT.
+            self.asm["launcher.so"] = run.launcher_bytes
+        self._run = run
         # not enough shared memory to run the kernel
-        max_shared = max_shared_mem(device)
+        max_shared = _max_shared_mem(device, utils)
         if self.metadata.shared > max_shared:
             raise_(OutOfResources(self.metadata.shared, max_shared, "shared memory"))
         if hasattr(self.metadata, "tmem_size") and self.metadata.tmem_size is not None:
@@ -600,9 +616,10 @@ class CompiledKernel:
         if knobs.runtime.kernel_load_start_hook is not None:
             knobs.runtime.kernel_load_start_hook(self.module, self.function, self.name, self.metadata_group, self.hash)
         # TODO: n_regs, n_spills should be metadata generated when calling `ptxas`
-        self.module, self.function, self.n_regs, self.n_spills, self.n_max_threads = driver.active.utils.load_binary(
+        self._unload_module = utils.unload_module
+        self.module, self.function, self.n_regs, self.n_spills, self.n_max_threads = utils.load_binary(
             self.name, self.kernel, self.metadata.shared, device)
-        warp_size = driver.active.get_current_target().warp_size
+        warp_size = active_driver.get_current_target().warp_size
         if self.metadata.num_warps * warp_size > self.n_max_threads:
             raise_(OutOfResources(self.metadata.num_warps * warp_size, self.n_max_threads, "threads"))
         if knobs.runtime.kernel_load_end_hook is not None:
@@ -618,7 +635,8 @@ class CompiledKernel:
         self._dispatcher = None
         self._dispatch_arg_indices = None
         self._num_kernel_args = None
-        if knobs.nvidia.use_triton_dispatcher and "launch_metadata" in self.asm:
+        if (knobs.nvidia.use_triton_dispatcher and _target_supports_triton_dispatcher(self.metadata.target)
+                and "launch_metadata" in self.asm):
             try:
                 from triton.backends.nvidia.triton_dispatcher_factory import make_triton_dispatcher
                 schema = json.loads(self.asm["launch_metadata"])
@@ -775,7 +793,8 @@ class CompiledKernel:
             self.run(grid[0], grid[1], grid[2], stream, self.function, self.packed_metadata, launch_metadata,
                      knobs.runtime.launch_enter_hook, knobs.runtime.launch_exit_hook, *args)
 
-        if knobs.nvidia.use_triton_dispatcher and dispatcher is None:
+        if (knobs.nvidia.use_triton_dispatcher and _target_supports_triton_dispatcher(self.metadata.target)
+                and dispatcher is None):
             warnings.warn(
                 f"[Triton] TRITON_USE_C_DISPATCHER=1 but CompiledKernel '{self.name}' has no C dispatcher, "
                 f"falling back to Python runner",

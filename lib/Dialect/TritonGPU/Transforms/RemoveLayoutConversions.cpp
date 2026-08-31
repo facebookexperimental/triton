@@ -39,6 +39,16 @@ namespace mlir::triton::gpu {
 
 namespace {
 
+static bool hasPinnedEncoding(Type type) {
+  if (auto tensorType = dyn_cast<RankedTensorType>(type))
+    return containsPinnedEncoding(tensorType.getEncoding());
+  return false;
+}
+
+static bool isPinnedConvertLayout(ConvertLayoutOp op) {
+  return hasPinnedEncoding(op.getType());
+}
+
 // A layout conversion requested at the source level can acquire a short
 // elementwise/conversion suffix when pinned layouts are materialized.  Layout
 // propagation may then eliminate the marked conversion and retain a later
@@ -127,7 +137,10 @@ public:
   void rewriteForOp(scf::ForOp forOp);
   void rewriteWhileOp(scf::WhileOp whileOp);
   void rewriteIfOp(scf::IfOp ifOp);
+  void rewriteWarpPredicateOp(WarpPredicateOp predicateOp);
+  void rewriteRequireLayoutOp(RequireLayoutOp requireOp);
   void rewriteYieldOp(scf::YieldOp yieldOp);
+  void rewritePredicateYieldOp(PredicateYieldOp yieldOp);
   void rewriteConditionOp(scf::ConditionOp conditionOp);
   void rewriteReduceToScalar(Operation *reduceOp);
   void rewriteAssertOp(AssertOp assertOp);
@@ -313,6 +326,31 @@ static bool hasConvertToMMATransisitiveUse(Operation *op, Attribute encoding) {
       // through the same local-store path as local_store.
       if ((isMMAV3 || isAMDMMA) && isa<LocalAllocOp, LocalStoreOp>(op))
         return true;
+
+      // A warp_predicate result is the lane-wise merge of its corresponding
+      // init and yielded value. Follow those per-result carrier edges when
+      // looking for a later conversion back to the MFMA accumulator layout.
+      if (auto predicateOp = dyn_cast<WarpPredicateOp>(op)) {
+        for (auto [init, result] :
+             llvm::zip(predicateOp.getInits(), predicateOp.getResults())) {
+          Operation *def = init.getDefiningOp();
+          if ((init == currentValue || (def && forwardSlice.count(def))) &&
+              seen.insert(result).second)
+            queue.push_back(result);
+        }
+      }
+      if (auto predicateYield = dyn_cast<PredicateYieldOp>(op)) {
+        auto predicateOp = cast<WarpPredicateOp>(predicateYield->getParentOp());
+        for (OpOperand &operand : predicateYield->getOpOperands()) {
+          Operation *def = operand.get().getDefiningOp();
+          Value result = predicateOp.getResult(operand.getOperandNumber());
+          if ((operand.get() == currentValue ||
+               (def && forwardSlice.count(def))) &&
+              seen.insert(result).second)
+            queue.push_back(result);
+        }
+      }
+
       auto yield = dyn_cast<scf::YieldOp>(op);
       if (!yield)
         continue;
@@ -354,7 +392,7 @@ bool isLayoutAnchor(Operation *op) {
   // explicitly chose that layout, so layout optimization must not rewrite it.
   for (Value result : op->getResults())
     if (auto rankedTy = dyn_cast<RankedTensorType>(result.getType()))
-      if (isa_and_nonnull<PinnedEncodingTrait>(rankedTy.getEncoding()))
+      if (containsPinnedEncoding(rankedTy.getEncoding()))
         return true;
 
   if (isa<DescriptorOpInterface>(op))
@@ -426,7 +464,8 @@ void LayoutPropagation::setEncoding(ValueRange values, LayoutInfo &info,
     bool hasChanged = false;
     for (auto encoding : info.encodings) {
       Attribute dstEncoding;
-      if (isa<ConvertLayoutOp>(op)) {
+      if (auto convertOp = dyn_cast<ConvertLayoutOp>(op);
+          convertOp && !isPinnedConvertLayout(convertOp)) {
         // Try to remove the convert by making the dst encoding match the source
         // encoding.
         dstEncoding = encoding;
@@ -444,6 +483,15 @@ void LayoutPropagation::setEncoding(ValueRange values, LayoutInfo &info,
 SmallVector<Value> LayoutPropagation::propagateToUsers(Value value,
                                                        LayoutInfo &info) {
   SmallVector<Value> changed;
+  auto propagateSameEncoding = [&](Value target) {
+    if (!isa<RankedTensorType>(target.getType()))
+      return;
+    bool hasChanged = false;
+    for (Attribute encoding : info.encodings)
+      hasChanged |= layouts[target].encodings.insert(encoding);
+    if (hasChanged)
+      changed.push_back(target);
+  };
   for (OpOperand &use : value.getUses()) {
     Operation *user = use.getOwner();
     if (auto forOp = dyn_cast<scf::ForOp>(user)) {
@@ -492,6 +540,21 @@ SmallVector<Value> LayoutPropagation::propagateToUsers(Value value,
       setEncoding({afterArg, result}, info, changed, user);
       continue;
     }
+    if (auto predicateOp = dyn_cast<WarpPredicateOp>(user)) {
+      unsigned operandNumber = use.getOperandNumber();
+      // Operand zero is the predicate; every later operand is an init tied to
+      // the result at the preceding index.
+      if (operandNumber > 0 && operandNumber - 1 < predicateOp.getNumResults())
+        propagateSameEncoding(predicateOp.getResult(operandNumber - 1));
+      continue;
+    }
+    if (auto predicateYield = dyn_cast<PredicateYieldOp>(user)) {
+      auto predicateOp = cast<WarpPredicateOp>(predicateYield->getParentOp());
+      unsigned operandNumber = use.getOperandNumber();
+      if (operandNumber < predicateOp.getNumResults())
+        propagateSameEncoding(predicateOp.getResult(operandNumber));
+      continue;
+    }
     if (auto dotWaitOp = dyn_cast<nvidia_gpu::WarpGroupDotWaitOp>(user)) {
       unsigned opIndex = use.getOperandNumber();
       Value result = dotWaitOp->getResult(opIndex);
@@ -507,10 +570,20 @@ SmallVector<Value> LayoutPropagation::propagateToUsers(Value value,
         continue;
       }
     }
+    if (auto reshapeOp = dyn_cast<ReshapeOp>(user);
+        reshapeOp && reshapeOp.getEfficientLayout())
+      continue;
+    if (isa<RequireLayoutOp>(user))
+      continue;
+    if (auto convertOp = dyn_cast<ConvertLayoutOp>(user)) {
+      if (!isPinnedConvertLayout(convertOp))
+        setEncoding(user->getResults(), info, changed, user);
+      continue;
+    }
     if (user->hasTrait<OpTrait::SameOperandsAndResultEncoding>() ||
         user->hasTrait<OpTrait::Elementwise>() ||
-        isa<ReduceOp, ExpandDimsOp, ReshapeOp, TransOp, JoinOp, SplitOp,
-            ConvertLayoutOp>(user)) {
+        isa<ReduceOp, ExpandDimsOp, ReshapeOp, TransOp, JoinOp, SplitOp>(
+            user)) {
       setEncoding(user->getResults(), info, changed, user);
       continue;
     }
@@ -691,8 +764,13 @@ void LayoutPropagation::resolveConflicts() {
     LayoutInfo &info = it.second;
     if (info.encodings.size() <= 1)
       continue;
-    if (op && op->hasAttr("tlx.preserve_layout")) {
-      auto originalType = cast<RankedTensorType>(it.first.getType());
+    auto originalType = cast<RankedTensorType>(it.first.getType());
+    if ((op && op->hasAttr("tlx.preserve_layout")) ||
+        containsPinnedEncoding(originalType.getEncoding())) {
+      // A user pin is an invariant, not merely another profitable anchor.
+      // In particular, a nested no_verify<user_layout<MMA>> must beat a
+      // competing high-vectorization linear layout propagated from its
+      // producer.
       info.encodings.clear();
       info.encodings.insert(originalType.getEncoding());
       continue;
@@ -810,8 +888,12 @@ void LayoutPropagation::rewriteRegion(Region &region) {
         rewriteOp(&op);
         for (Region &R : op.getRegions())
           queue.push_back(&R);
+      } else if (auto requireOp = dyn_cast<RequireLayoutOp>(&op)) {
+        rewriteRequireLayoutOp(requireOp);
       } else if (auto yieldOp = dyn_cast<scf::YieldOp>(&op)) {
         rewriteYieldOp(yieldOp);
+      } else if (auto yieldOp = dyn_cast<PredicateYieldOp>(&op)) {
+        rewritePredicateYieldOp(yieldOp);
       } else if (auto conditionOp = dyn_cast<scf::ConditionOp>(&op)) {
         rewriteConditionOp(conditionOp);
       } else if (reduceToScalar(&op)) {
@@ -948,6 +1030,18 @@ void LayoutPropagation::rewriteIfOp(scf::IfOp ifOp) {
   }
 }
 
+void LayoutPropagation::rewriteWarpPredicateOp(WarpPredicateOp predicateOp) {
+  for (auto [index, init, result] :
+       llvm::enumerate(predicateOp.getInits(), predicateOp.getResults())) {
+    auto it = layouts.find(result);
+    if (it == layouts.end())
+      continue;
+    Attribute encoding = *it->second.encodings.begin();
+    predicateOp->setOperand(index + 1, getValueAs(init, encoding));
+    setEncodingInPlace(result, encoding);
+  }
+}
+
 void LayoutPropagation::rewriteYieldOp(scf::YieldOp yieldOp) {
   Operation *parentOp = yieldOp->getParentOp();
   for (OpOperand &operand : yieldOp->getOpOperands()) {
@@ -962,6 +1056,18 @@ void LayoutPropagation::rewriteYieldOp(scf::YieldOp yieldOp) {
       continue;
     Value newOperand = getValueAs(operand.get(), tensorType.getEncoding());
     yieldOp->setOperand(operand.getOperandNumber(), newOperand);
+  }
+}
+
+void LayoutPropagation::rewritePredicateYieldOp(PredicateYieldOp yieldOp) {
+  auto predicateOp = cast<WarpPredicateOp>(yieldOp->getParentOp());
+  for (OpOperand &operand : yieldOp->getOpOperands()) {
+    auto resultType = dyn_cast<RankedTensorType>(
+        predicateOp.getResult(operand.getOperandNumber()).getType());
+    if (!resultType)
+      continue;
+    yieldOp->setOperand(operand.getOperandNumber(),
+                        getValueAs(operand.get(), resultType.getEncoding()));
   }
 }
 
@@ -1017,6 +1123,10 @@ void LayoutPropagation::rewriteOp(Operation *op) {
     rewriteWhileOp(whileOp);
   else if (auto ifOp = dyn_cast<scf::IfOp>(op))
     rewriteIfOp(ifOp);
+  else if (auto predicateOp = dyn_cast<WarpPredicateOp>(op))
+    rewriteWarpPredicateOp(predicateOp);
+  else if (auto requireOp = dyn_cast<RequireLayoutOp>(op))
+    rewriteRequireLayoutOp(requireOp);
   else {
     Attribute encoding = *layouts[op->getResult(0)].encodings.begin();
     if (canUseResultEncoding(op, encoding)) {
@@ -1033,9 +1143,22 @@ void LayoutPropagation::rewriteOp(Operation *op) {
   }
 }
 
+void LayoutPropagation::rewriteRequireLayoutOp(RequireLayoutOp requireOp) {
+  auto resultType = cast<RankedTensorType>(requireOp.getType());
+  requireOp.getSrcMutable().assign(
+      getValueAs(requireOp.getSrc(), resultType.getEncoding()));
+}
+
 bool canBeRemat(Operation *op) {
   if (op->hasAttr("tlx.preserve_layout"))
     return false;
+  // A pinned result is a semantic boundary.  Cloning its producer in a
+  // different encoding would bypass the user-requested layout even if the
+  // original pinned value is left behind and later deleted as dead code.
+  for (Value result : op->getResults())
+    if (auto rankedTy = dyn_cast<RankedTensorType>(result.getType()))
+      if (containsPinnedEncoding(rankedTy.getEncoding()))
+        return false;
   if (isa<LoadOp, StoreOp>(op))
     return !isExpensiveLoadOrStore(op);
   if (isa<triton::gpu::LocalLoadOp>(op))

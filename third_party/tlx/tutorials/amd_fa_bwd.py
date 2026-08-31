@@ -1,11 +1,15 @@
 """BF16 Flash-Attention backward kernel families for AMD gfx950.
 
-The public ``fa_backward`` wrapper supports the two validated equal-head
-configurations in ``SUPPORTED_SHAPES`` and the causal/non-causal HipKittens GQA
-contract: positive B/Hq/Hkv, Hkv dividing Hq, N a positive multiple of 256,
-and D=128. ``GQA_BENCHMARK_SHAPES`` records the published performance series;
-it is not an allow-list. Other configurations are not part of this
-submission's public contract yet. Run this file with pytest for correctness.
+The public ``fa_backward`` wrapper supports dense contiguous BF16 D64 tensors
+with matching positive batches, Hkv dividing Hq, SQ/SKV at least 256 and
+aligned to 64, SQ no larger than 8,388,544, and SKV no larger than 16,777,152.
+Bottom-right causal D64 additionally requires SQ no larger than SKV. It also
+supports the two validated equal-head configurations in ``SUPPORTED_SHAPES``
+and the causal/non-causal HipKittens GQA contract: positive B/Hq/Hkv, Hkv dividing
+Hq, N a positive multiple of 256, and D=128. ``GQA_BENCHMARK_SHAPES`` records
+the published performance series; it is not an allow-list. Other
+configurations are not part of this submission's public contract yet. Focused
+D64 tests live in ``python/test/unit/language/test_tlx_amd_fa_bwd.py``.
 
 Each launch topology has one stable JIT entry.  Constexpr schedule kwargs pick
 the tuned split, persistent, staged, peeled, or hoisted implementation behind
@@ -21,6 +25,7 @@ not production dispatches and currently spill on the generic TLX lowering.
 """
 
 import dataclasses
+import math
 import os
 
 import pytest
@@ -194,7 +199,16 @@ def _make_gqa_smoke_case(shape=(1, 8, 1, 512, 128), causal=False, seed=0, sm_sca
 
 
 @triton.jit
-def _attn_bwd_preprocess_kernel(O, DO, Delta, N: tl.constexpr, D: tl.constexpr, BLOCK_M: tl.constexpr):
+def _attn_bwd_preprocess_kernel(
+    O,
+    DO,
+    Delta,
+    DQ_ACC,
+    N: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    ZERO_DQ: tl.constexpr,
+):
     batch_head = tl.program_id(1)
     rows = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
     cols = tl.arange(0, D)
@@ -208,13 +222,25 @@ def _attn_bwd_preprocess_kernel(O, DO, Delta, N: tl.constexpr, D: tl.constexpr, 
     o = tl.load(O + tensor_base + offsets, mask=mask, other=0.0).to(tl.float32)
     do = tl.load(DO + tensor_base + offsets, mask=mask, other=0.0).to(tl.float32)
     tl.store(Delta + delta_base + rows, tl.sum(o * do, axis=1), mask=rows < N)
+    if ZERO_DQ:
+        tl.store(DQ_ACC + tensor_base + offsets, 0.0, mask=mask)
 
 
-def _run_bwd_preprocess(o, do, delta):
+def _run_bwd_preprocess(o, do, delta, dq_acc=None):
     batch, heads, n_ctx, head_dim = o.shape
     block_m = 64
     grid = (triton.cdiv(n_ctx, block_m), batch * heads)
-    _attn_bwd_preprocess_kernel[grid](o, do, delta, N=n_ctx, D=head_dim, BLOCK_M=block_m, num_warps=4)
+    _attn_bwd_preprocess_kernel[grid](
+        o,
+        do,
+        delta,
+        dq_acc if dq_acc is not None else delta,
+        N=n_ctx,
+        D=head_dim,
+        BLOCK_M=block_m,
+        ZERO_DQ=dq_acc is not None,
+        num_warps=4,
+    )
 
 
 @triton.jit
@@ -4634,10 +4660,12 @@ def _validate_inputs(q, k, v, o, do, lse):
         n_ctx,
         head_dim,
     ))
-    if not (mha_shape or gqa_shape):
+    d64_shape = _is_supported_d64_shape(tuple(q.shape), tuple(k.shape))
+    if not (mha_shape or gqa_shape or d64_shape):
         supported = sorted(SUPPORTED_SHAPES)
         raise ValueError(f"supported MHA shapes are {supported}; supported GQA shapes "
-                         f"satisfy {_GQA_SHAPE_CONSTRAINT}; got q={tuple(q.shape)}, "
+                         f"satisfy {_GQA_SHAPE_CONSTRAINT}; {_D64_SHAPE_CONSTRAINT}; "
+                         f"got q={tuple(q.shape)}, "
                          f"k={tuple(k.shape)}")
     q_tensors = {"q": q, "o": o, "do": do}
     for name, tensor in q_tensors.items():
@@ -4666,6 +4694,31 @@ def _validate_inputs(q, k, v, o, do, lse):
 
 def fa_backward(q, k, v, o, do, lse, sm_scale, causal):
     _validate_inputs(q, k, v, o, do, lse)
+    if _is_supported_d64_shape(tuple(q.shape), tuple(k.shape)):
+        sm_scale = _validate_d64_sm_scale(sm_scale)
+        if causal and q.shape[2] > k.shape[2]:
+            raise ValueError("D64 bottom-right causal attention requires SQ <= SKV")
+        dispatch = _select_d64_dispatch_for_device(q, k, v, o, do, lse, sm_scale, causal)
+        dq = torch.empty_like(q)
+        dk = torch.empty_like(k)
+        dv = torch.empty_like(v)
+        delta = torch.empty(q.shape[:-1], device=q.device, dtype=torch.float32)
+        _run_bwd_d64(
+            q,
+            k,
+            v,
+            o,
+            do,
+            lse,
+            delta,
+            dq,
+            dk,
+            dv,
+            sm_scale,
+            causal,
+            dispatch,
+        )
+        return dq, dk, dv
     gqa_signature = (
         q.shape[0],
         q.shape[1],
@@ -5170,3 +5223,4915 @@ def test_d256_scratch_producer_covers_consumer(causal):
         poison_scratch=True,
     )
     assert torch.isfinite(dq).all()
+
+
+_D64_VALIDATION_SHAPES = {
+    "mha_square_16k_noncausal": (2, 16384, 16384, 32, 32, 64, False),
+    "mha_square_16k_causal": (2, 16384, 16384, 32, 32, 64, True),
+    "gqa8_square_16k_noncausal": (2, 16384, 16384, 32, 4, 64, False),
+    "gqa8_square_16k_causal": (2, 16384, 16384, 32, 4, 64, True),
+    "gqa8_square_4k_causal": (4, 4096, 4096, 48, 6, 64, True),
+    "gqa8_rect_4k_16k_causal": (4, 4096, 16384, 48, 6, 64, True),
+    "gqa8_rect_4k_8k_causal": (4, 4096, 8192, 48, 6, 64, True),
+    "gqa8_rect_4k_12k_causal": (4, 4096, 12288, 48, 6, 64, True),
+}
+_D64_CAUSAL_GQA8_VALIDATION_CASES = (
+    "gqa8_square_16k_causal",
+    "gqa8_square_4k_causal",
+    "gqa8_rect_4k_16k_causal",
+    "gqa8_rect_4k_8k_causal",
+    "gqa8_rect_4k_12k_causal",
+)
+
+# Explicit AMD buffer operations encode their per-resource byte offset as a
+# nonnegative signed i32. Keep every D64 per-head resource within the same
+# limit enforced by ConvertToBufferOps. The FP32 dQ accumulator is the widest
+# Q-side resource; K/V and their outputs are BF16.
+_AMD_BUFFER_MAX_ADDRESSABLE_BYTES = (1 << 31) - 1
+_D64_HEAD_DIM = 64
+_D64_SEQUENCE_ALIGNMENT = 64
+
+
+def _max_aligned_d64_sequence(element_size_bytes):
+    rows = _AMD_BUFFER_MAX_ADDRESSABLE_BYTES // (_D64_HEAD_DIM * element_size_bytes)
+    return rows - rows % _D64_SEQUENCE_ALIGNMENT
+
+
+_D64_MAX_QUERY_SEQUENCE = _max_aligned_d64_sequence(torch.float32.itemsize)
+_D64_MAX_KV_SEQUENCE = _max_aligned_d64_sequence(torch.bfloat16.itemsize)
+_D64_SHAPE_CONSTRAINT = ("D64 shapes require matching positive batches, positive Hq/Hkv, "
+                         "Hq % Hkv == 0, SQ/SKV >= 256, SQ/SKV multiples of 64, "
+                         f"SQ <= {_D64_MAX_QUERY_SEQUENCE}, SKV <= {_D64_MAX_KV_SEQUENCE}, and D == 64")
+
+
+def _is_supported_d64_shape(q_shape, k_shape):
+    """Return whether dense BF16 D64 tensors match the gfx950 contract."""
+    if len(q_shape) != 4 or len(k_shape) != 4:
+        return False
+    batch, hq, sq, d = q_shape
+    k_batch, hkv, skv, k_d = k_shape
+    return (batch >= 1 and batch == k_batch and hq >= 1 and hkv >= 1 and hq % hkv == 0 and sq >= 256 and skv >= 256
+            and sq % 64 == 0 and skv % 64 == 0 and sq <= _D64_MAX_QUERY_SEQUENCE and skv <= _D64_MAX_KV_SEQUENCE
+            and d == k_d == 64)
+
+
+def _is_d64_fused_n256_eligible(q_shape, k_shape, causal, *, arch, cu_count):
+    if not _is_supported_d64_shape(q_shape, k_shape):
+        return False
+    if causal or arch is None or not arch.startswith("gfx950"):
+        return False
+    if cu_count is None or cu_count < 1:
+        return False
+    batch, hq, sq, _d = q_shape
+    _k_batch, hkv, skv, _k_d = k_shape
+    group_size = hq // hkv
+    owner_ctas = batch * hq * triton.cdiv(skv, 256)
+    return (group_size in (1, 8) and sq >= 4096 and skv >= 4096 and sq % 64 == 0 and skv % 256 == 0
+            and owner_ctas >= cu_count)
+
+
+_D64_MHA_POSITIVE = 0
+_D64_GQA_SIGNED = 1
+_D64_LSE_NATURAL_LOG = 0
+_D64_LSE_NEG_LOG2E = 1
+_D64_DELTA_POSITIVE = 0
+_D64_DELTA_NEGATED = 1
+_D64_CAUSAL_GQA8_KV_SPLITS = 4
+
+# With zero QK scores, selected dQ internally represents LSE as
+# -log(valid_keys) / scale. Keep that unavoidable entropy term within half
+# the FP32 range so the input-dependent score contribution retains headroom.
+_D64_RECIP_LSE_ENTROPY_LIMIT = torch.finfo(torch.float32).max / 2.0
+
+_D64_MHA_POSITIVE_JIT = tl.constexpr(_D64_MHA_POSITIVE)
+_D64_GQA_SIGNED_JIT = tl.constexpr(_D64_GQA_SIGNED)
+_D64_LSE_NATURAL_LOG_JIT = tl.constexpr(_D64_LSE_NATURAL_LOG)
+_D64_LSE_NEG_LOG2E_JIT = tl.constexpr(_D64_LSE_NEG_LOG2E)
+_D64_DELTA_POSITIVE_JIT = tl.constexpr(_D64_DELTA_POSITIVE)
+_D64_DELTA_NEGATED_JIT = tl.constexpr(_D64_DELTA_NEGATED)
+_D64_CAUSAL_GQA8_KV_SPLITS_JIT = tl.constexpr(_D64_CAUSAL_GQA8_KV_SPLITS)
+
+_D64_GQA_SPLIT_FAST = "split_fast"
+_D64_GQA_XCD = "xcd"
+_D64_GQA_XCD_N_FAST = "xcd_n_fast"
+
+_D64_GQA_INDEPENDENT_D32 = "independent_d32"
+_D64_GQA_INTERLEAVED_D32 = "interleaved_d32"
+_D64_GQA_DIRECT_D64 = "direct_d64"
+
+_D64_GQA_INDEPENDENT_D32_JIT = tl.constexpr(_D64_GQA_INDEPENDENT_D32)
+_D64_GQA_INTERLEAVED_D32_JIT = tl.constexpr(_D64_GQA_INTERLEAVED_D32)
+_D64_GQA_DIRECT_D64_JIT = tl.constexpr(_D64_GQA_DIRECT_D64)
+
+
+@dataclasses.dataclass(frozen=True)
+class _D64DQLaunch:
+    launch_tiles: int
+    skip_owner_tail: bool
+    owner_pid_base: int
+    launch_q_tiles: int
+    owner_fragments: int
+    grid_owner_m: int
+
+
+@dataclasses.dataclass(frozen=True)
+class _D64Dispatch:
+    family: str
+    owner_rows: int
+    key_rows: int
+    kv_splits: int
+    selected_causal: bool = False
+    stat_mode: int = _D64_MHA_POSITIVE
+    dq_logical_n: int = 64
+    dq_use_xcd: bool = False
+    dq_launches: tuple[_D64DQLaunch, ...] = ()
+    gqa_grid_mode: str | None = None
+    cyclic_query_split: bool = False
+    dkdv_lifetime: str | None = None
+
+
+_D64_NONCAUSAL_FAMILIES = frozenset({"noncausal_direct_n256", "noncausal_fused_n256"})
+_D64_RETAINED_CAUSAL_FAMILIES = frozenset({"causal_m192", "causal_m256"})
+_D64_SELECTED_CAUSAL_FAMILIES = frozenset({"causal_scheduled_mha", "causal_scheduled_gqa8"})
+_D64_DISPATCH_FAMILIES = (_D64_NONCAUSAL_FAMILIES | _D64_RETAINED_CAUSAL_FAMILIES | _D64_SELECTED_CAUSAL_FAMILIES)
+
+_D64_DQ_KV_STAGES = 2
+
+
+def _d64_selected_causal_owner_rows(sq, skv, group_size):
+    deep_square = (sq == skv and sq % 256 == 0 and (sq >= 16384 or (group_size == 8 and sq >= 4096)))
+    deep_gqa8_rectangle = (group_size == 8 and sq >= 4096 and skv >= 2 * sq and sq % 256 == 0)
+    return 256 if deep_square or deep_gqa8_rectangle else 192
+
+
+def _d64_selected_causal_logical_n(sq, skv, group_size):
+    # Deep GQA8 rectangles use two N32 slices to keep the live score/dP
+    # footprint of four-fragment M256 owners scratch-free while publishing K/V
+    # once per owner; N64 remains better for shallower rectangular recurrences.
+    return 32 if sq == skv or (group_size == 8 and skv >= 2 * sq) else 64
+
+
+def _d64_causal_gqa8_batch_stats4(sq, skv, dispatch):
+    """Stage four adjacent statistics tiles for long direct-D64 walks."""
+    return (dispatch.dkdv_lifetime == _D64_GQA_DIRECT_D64 and not dispatch.cyclic_query_split and sq % 256 == 0
+            and skv >= sq)
+
+
+def _invalid_d64_dispatch(dispatch, reason):
+    raise ValueError(f"invalid D64 dispatch {dispatch.family!r}: {reason}")
+
+
+def _require_d64_dispatch_variant(dispatch, family, *, stat_mode=None, kv_splits=None):
+    if dispatch.family != family:
+        _invalid_d64_dispatch(dispatch, f"family must be {family!r} for this route")
+    if stat_mode is not None and dispatch.stat_mode != stat_mode:
+        _invalid_d64_dispatch(
+            dispatch,
+            f"stat_mode must be {stat_mode}, got {dispatch.stat_mode}",
+        )
+    if kv_splits is not None and dispatch.kv_splits != kv_splits:
+        _invalid_d64_dispatch(
+            dispatch,
+            f"kv_splits must be {kv_splits}, got {dispatch.kv_splits}",
+        )
+
+
+def _validate_d64_dispatch(q_shape, k_shape, causal, dispatch):
+    """Reject dispatch records that would violate a D64 kernel ABI."""
+    if not isinstance(dispatch, _D64Dispatch):
+        raise ValueError("D64 dispatch must be a _D64Dispatch record")
+    if not _is_supported_d64_shape(q_shape, k_shape):
+        raise ValueError(f"unsupported D64 dispatch shapes q={q_shape}, k={k_shape}")
+
+    family = dispatch.family
+    if family not in _D64_DISPATCH_FAMILIES:
+        raise ValueError(f"unknown D64 dispatch family {family!r}")
+    family_is_causal = family not in _D64_NONCAUSAL_FAMILIES
+    if causal != family_is_causal:
+        requirement = "causal" if family_is_causal else "noncausal"
+        _invalid_d64_dispatch(dispatch, f"family requires {requirement} attention")
+
+    _batch, hq, sq, _d = q_shape
+    _k_batch, hkv, skv, _k_d = k_shape
+    group_size = hq // hkv
+
+    def require_field(name, expected):
+        actual = getattr(dispatch, name)
+        if actual != expected:
+            _invalid_d64_dispatch(dispatch, f"{name} must be {expected!r}, got {actual!r}")
+
+    def require_unselected_defaults():
+        require_field("selected_causal", False)
+        require_field("stat_mode", _D64_MHA_POSITIVE)
+        require_field("dq_logical_n", 64)
+        require_field("dq_use_xcd", False)
+        require_field("dq_launches", ())
+        require_field("gqa_grid_mode", None)
+        require_field("cyclic_query_split", False)
+        require_field("dkdv_lifetime", None)
+
+    if family in _D64_NONCAUSAL_FAMILIES:
+        require_field("owner_rows", 32)
+        require_field("key_rows", 256)
+        require_field("kv_splits", 8 if group_size == 8 else 1)
+        require_unselected_defaults()
+        return
+
+    retained_owner_rows = (256 if sq == skv and sq >= 16384 and sq % 256 == 0 else 192)
+    if family in _D64_RETAINED_CAUSAL_FAMILIES:
+        expected_family = "causal_m256" if retained_owner_rows == 256 else "causal_m192"
+        require_field("family", expected_family)
+        require_field("owner_rows", retained_owner_rows)
+        require_field("key_rows", 32 if sq == skv else 64)
+        require_field("kv_splits", 4 if group_size == 8 else 1)
+        require_unselected_defaults()
+        return
+
+    expected_family = ("causal_scheduled_gqa8" if group_size == 8 else "causal_scheduled_mha")
+    if group_size not in (1, 8):
+        _invalid_d64_dispatch(dispatch, "selected causal family requires MHA or GQA8")
+    owner_rows = _d64_selected_causal_owner_rows(sq, skv, group_size)
+    require_field("family", expected_family)
+    require_field("owner_rows", owner_rows)
+    require_field("selected_causal", True)
+    require_field("dq_logical_n", _d64_selected_causal_logical_n(sq, skv, group_size))
+    require_field("dq_use_xcd", _d64_use_dq_xcd(_batch, hkv, sq, skv, owner_rows))
+
+    def require_valid_dq_launches():
+        owners = triton.cdiv(sq, owner_rows)
+        fragments = owner_rows // 64
+        valid_dq_launches = {
+            (_D64DQLaunch(owners, True, 0, 0, fragments, 0), ),
+        }
+        if (owner_rows == 192 and sq >= 8192 and dispatch.dq_use_xcd and sq % 192 == 128 and owners > 1):
+            valid_dq_launches.add((
+                _D64DQLaunch(owners - 1, False, 0, owners - 1, 3, 0),
+                _D64DQLaunch(1, False, owners - 1, 1, 2, 192),
+            ))
+        if dispatch.dq_launches not in valid_dq_launches:
+            _invalid_d64_dispatch(dispatch, "dq_launches must match a full or peeled owner plan")
+
+    if family == "causal_scheduled_mha":
+        require_field("key_rows", 64)
+        require_field("kv_splits", 1)
+        require_field("stat_mode", _D64_MHA_POSITIVE)
+        require_field("gqa_grid_mode", None)
+        require_field("cyclic_query_split", False)
+        require_field("dkdv_lifetime", None)
+        require_valid_dq_launches()
+        return
+
+    require_field("key_rows", 128)
+    require_field("kv_splits", 4)
+    require_field("stat_mode", _D64_GQA_SIGNED)
+    if dispatch.gqa_grid_mode not in {
+            _D64_GQA_SPLIT_FAST,
+            _D64_GQA_XCD,
+            _D64_GQA_XCD_N_FAST,
+    }:
+        _invalid_d64_dispatch(dispatch, "unknown GQA grid mode")
+    if (dispatch.gqa_grid_mode != _D64_GQA_SPLIT_FAST and (_batch * hkv) % 8 != 0):
+        _invalid_d64_dispatch(dispatch, "GQA XCD grid requires B * Hkv divisible by 8")
+    require_field("dkdv_lifetime", _d64_gqa_lifetime(sq, skv))
+    if dispatch.cyclic_query_split and not (dispatch.gqa_grid_mode == _D64_GQA_XCD_N_FAST and sq == skv and skv >= 16384
+                                            and (_batch * hkv) % 8 == 0):
+        _invalid_d64_dispatch(dispatch, "cyclic_query_split requires a deep square XCD N-fast grid")
+    require_valid_dq_launches()
+
+
+def _validate_d64_sm_scale(sm_scale):
+    try:
+        value = float(sm_scale)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError("D64 sm_scale must be finite and nonzero") from None
+    if not math.isfinite(value) or value == 0.0:
+        raise ValueError("D64 sm_scale must be finite and nonzero")
+    return value
+
+
+def _is_d64_scheduled_causal_eligible(
+    q_shape,
+    k_shape,
+    causal,
+    *,
+    arch,
+    cu_count,
+    sm_scale,
+    bases_aligned_16,
+):
+    if not _is_supported_d64_shape(q_shape, k_shape) or not causal:
+        return False
+    if arch is None or not arch.startswith("gfx950"):
+        return False
+    if cu_count is None or cu_count < 1 or not bases_aligned_16:
+        return False
+    try:
+        scale = float(sm_scale)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if not math.isfinite(scale) or scale <= 0.0:
+        return False
+
+    batch, hq, sq, _d = q_shape
+    _k_batch, hkv, skv, _k_d = k_shape
+    if sq > skv or sq % 64 != 0 or skv % 64 != 0:
+        return False
+    if math.log(skv) > scale * _D64_RECIP_LSE_ENTROPY_LIMIT:
+        return False
+    group_size = hq // hkv
+    if group_size == 1:
+        if sq < 4096 or skv < 4096:
+            return False
+    elif group_size == 8:
+        if sq < 1024 or skv < 1024 or skv % 128 != 0:
+            return False
+    else:
+        return False
+
+    owner_rows = _d64_selected_causal_owner_rows(sq, skv, group_size)
+    if batch * hq * triton.cdiv(sq, owner_rows) < 2 * cu_count:
+        return False
+    if group_size == 8:
+        producer_owners = batch * hkv * 4 * triton.cdiv(skv, 128)
+    else:
+        producer_owners = batch * hkv * triton.cdiv(skv, 64)
+    return producer_owners >= 2 * cu_count
+
+
+def _select_d64_dispatch(
+    q_shape,
+    k_shape,
+    causal,
+    *,
+    arch=None,
+    cu_count=None,
+    sm_scale=None,
+    bases_aligned_16=False,
+):
+    """Select D64 ownership from tensor shape and device structure."""
+    if not _is_supported_d64_shape(q_shape, k_shape):
+        raise ValueError(f"unsupported D64 dispatch shapes q={q_shape}, k={k_shape}")
+    _batch, _hq, sq, _d = q_shape
+    _k_batch, hkv, skv, _k_d = k_shape
+    group_size = _hq // hkv
+    if not causal:
+        fused = _is_d64_fused_n256_eligible(q_shape, k_shape, causal, arch=arch, cu_count=cu_count)
+        return _D64Dispatch(
+            "noncausal_fused_n256" if fused else "noncausal_direct_n256",
+            owner_rows=32,
+            key_rows=256,
+            kv_splits=8 if group_size == 8 else 1,
+        )
+    if sq == skv and sq >= 16384 and sq % 256 == 0:
+        retained = _D64Dispatch(
+            "causal_m256",
+            owner_rows=256,
+            key_rows=32,
+            kv_splits=4 if group_size == 8 else 1,
+        )
+    else:
+        retained = _D64Dispatch(
+            "causal_m192",
+            owner_rows=192,
+            key_rows=32 if sq == skv else 64,
+            kv_splits=4 if group_size == 8 else 1,
+        )
+    if not _is_d64_scheduled_causal_eligible(
+            q_shape,
+            k_shape,
+            causal,
+            arch=arch,
+            cu_count=cu_count,
+            sm_scale=sm_scale,
+            bases_aligned_16=bases_aligned_16,
+    ):
+        return retained
+
+    owner_rows = _d64_selected_causal_owner_rows(sq, skv, group_size)
+    dq_logical_n = _d64_selected_causal_logical_n(sq, skv, group_size)
+    dq_use_xcd = _d64_use_dq_xcd(_batch, hkv, sq, skv, owner_rows)
+    dq_launches = _d64_dq_launch_plan(
+        _batch,
+        _hq,
+        hkv,
+        sq,
+        skv,
+        owner_rows,
+        cu_count,
+        True,
+    )
+    if group_size == 8:
+        grid_mode, cyclic_query_split = _d64_gqa_grid_policy(_batch, hkv, sq, skv, cu_count)
+        return _D64Dispatch(
+            "causal_scheduled_gqa8",
+            owner_rows=owner_rows,
+            key_rows=128,
+            kv_splits=_D64_CAUSAL_GQA8_KV_SPLITS,
+            selected_causal=True,
+            stat_mode=_D64_GQA_SIGNED,
+            dq_logical_n=dq_logical_n,
+            dq_use_xcd=dq_use_xcd,
+            dq_launches=dq_launches,
+            gqa_grid_mode=grid_mode,
+            cyclic_query_split=cyclic_query_split,
+            dkdv_lifetime=_d64_gqa_lifetime(sq, skv),
+        )
+    return _D64Dispatch(
+        "causal_scheduled_mha",
+        owner_rows=owner_rows,
+        key_rows=64,
+        kv_splits=1,
+        selected_causal=True,
+        stat_mode=_D64_MHA_POSITIVE,
+        dq_logical_n=dq_logical_n,
+        dq_use_xcd=dq_use_xcd,
+        dq_launches=dq_launches,
+    )
+
+
+def _d64_causal_stat_values(o, do, lse, sm_scale, stat_mode):
+    positive = torch.sum(o.float() * do.float(), dim=-1)
+    if stat_mode == _D64_MHA_POSITIVE:
+        return positive, None
+    if stat_mode == _D64_GQA_SIGNED:
+        return -positive, -lse.float() * math.log2(math.e)
+    raise ValueError(f"unknown D64 stat mode {stat_mode!r}")
+
+
+def _d64_causal_owner_interval(physical_owner, sq, owner_rows):
+    owners = triton.cdiv(sq, owner_rows)
+    if not 0 <= physical_owner < owners:
+        raise ValueError("physical owner is outside the dQ grid")
+    pad = owners * owner_rows - sq
+    reverse_owner = owners - 1 - physical_owner
+    raw = reverse_owner * owner_rows
+    return max(raw - pad, 0), min(raw + owner_rows - pad, sq)
+
+
+def _d64_use_dq_xcd(batch, hkv, sq, skv, owner_rows):
+    single_fragment_tail = (owner_rows == 192 and sq == skv and sq % 192 == 64 and 4096 <= sq < 5120 and hkv % 8 == 0)
+    return (batch * hkv) % 8 == 0 and not single_fragment_tail
+
+
+def _d64_gqa_grid_policy(batch, hkv, sq, skv, cu_count):
+    cyclic = (sq == skv and skv >= 16384 and batch * hkv * 4 >= cu_count and (batch * hkv) % 8 == 0)
+    if cyclic:
+        return _D64_GQA_XCD_N_FAST, True
+    if (batch * hkv) % 8 != 0:
+        return _D64_GQA_SPLIT_FAST, cyclic
+    return _D64_GQA_XCD, False
+
+
+def _d64_decode_gqa_pid(pid, batch, hkv, skv, grid_mode):
+    nt = triton.cdiv(skv, 128)
+    value = pid
+    if grid_mode == _D64_GQA_SPLIT_FAST:
+        split = value % 4
+        value //= 4
+        out_hkv = value % hkv
+        value //= hkv
+        n = value % nt
+        out_batch = value // nt
+        return out_batch, out_hkv, split, n
+    xcd = value % 8
+    value //= 8
+    if grid_mode == _D64_GQA_XCD_N_FAST:
+        n = value % nt
+        value //= nt
+        split = value % 4
+        bkv_group = value // 4
+    elif grid_mode == _D64_GQA_XCD:
+        split = value % 4
+        value //= 4
+        n = value % nt
+        bkv_group = value // nt
+    else:
+        raise ValueError(f"unknown GQA grid mode {grid_mode!r}")
+    bkv = bkv_group * 8 + xcd
+    return bkv // hkv, bkv % hkv, split, n
+
+
+def _d64_causal_physical_frontier(n0, sq, skv, block_m, block_n):
+    diff = skv - sq
+    start_m_blk = max((n0 - diff) // block_m, 0)
+    masked = tuple(m_blk for m_blk in range(start_m_blk, triton.cdiv(sq, block_m))
+                   if n0 + block_n - 1 > m_blk * block_m + diff)
+    return start_m_blk, masked
+
+
+def _d64_gqa_split_ownership(split, query_blocks, cyclic):
+    if not 0 <= split < 4:
+        raise ValueError("GQA split must be in [0, 4)")
+    if cyclic:
+        return tuple((head, m_blk) for head in range(8) for m_blk in range(query_blocks) if m_blk % 4 == split)
+    return tuple((head, m_blk) for head in (2 * split, 2 * split + 1) for m_blk in range(query_blocks))
+
+
+def _d64_gqa_lifetime(sq, skv):
+    if skv > sq:
+        # Shallow rectangles retain the D32 peel for their frequently odd
+        # bottom-right frontier.  At two or more query lengths, the longer
+        # recurrence amortizes full-width D64 ownership and avoids the D32
+        # split/join schedule without increasing the compiled VGPR footprint.
+        if skv < 2 * sq:
+            return _D64_GQA_INTERLEAVED_D32
+        return _D64_GQA_DIRECT_D64
+    if sq == skv and sq >= 1024:
+        # Four-tile statistics staging amortizes the full-width recurrence
+        # across square walks while avoiding the D32 split/join epilogue.
+        return _D64_GQA_DIRECT_D64
+    raise ValueError("selected GQA8 shape has no lifetime mode")
+
+
+def _d64_decode_dq_pid(
+    pid,
+    batch,
+    hq,
+    hkv,
+    launch_tiles,
+    use_xcd,
+    owner_pid_base=0,
+):
+    group = hq // hkv
+    value = pid
+    if use_xcd:
+        xcd = value % 8
+        value //= 8
+        q_in_group = value % group
+        value //= group
+        local_owner = value % launch_tiles
+        bkv_group = value // launch_tiles
+        bkv = bkv_group * 8 + xcd
+        out_hkv = bkv % hkv
+        out_batch = bkv // hkv
+    else:
+        out_hkv = value % hkv
+        value //= hkv
+        q_in_group = value % group
+        value //= group
+        local_owner = value % launch_tiles
+        out_batch = value // launch_tiles
+    return out_batch, out_hkv * group + q_in_group, owner_pid_base + local_owner
+
+
+def _d64_encode_dq_pid(
+    batch_id,
+    hq_id,
+    physical_owner,
+    batch,
+    hq,
+    hkv,
+    launch_tiles,
+    use_xcd,
+    owner_pid_base=0,
+):
+    group = hq // hkv
+    hkv_id, q_in_group = divmod(hq_id, group)
+    local_owner = physical_owner - owner_pid_base
+    if use_xcd:
+        bkv = batch_id * hkv + hkv_id
+        bkv_group, xcd = divmod(bkv, 8)
+        return (((bkv_group * launch_tiles + local_owner) * group + q_in_group) * 8 + xcd)
+    return ((batch_id * launch_tiles + local_owner) * group + q_in_group) * hkv + hkv_id
+
+
+def _d64_dq_launch_plan(
+    batch,
+    hq,
+    hkv,
+    sq,
+    skv,
+    owner_rows,
+    cu_count,
+    host_skip_owner_tail,
+):
+    owners = triton.cdiv(sq, owner_rows)
+    fragments = owner_rows // 64
+    use_xcd = _d64_use_dq_xcd(batch, hkv, sq, skv, owner_rows)
+    peel = (owner_rows == 192 and sq >= 8192 and use_xcd and batch * hq >= cu_count and host_skip_owner_tail
+            and sq % 192 == 128 and owners > 1)
+    if peel:
+        return (
+            _D64DQLaunch(owners - 1, False, 0, owners - 1, 3, 0),
+            _D64DQLaunch(1, False, owners - 1, 1, 2, 192),
+        )
+    return (_D64DQLaunch(owners, host_skip_owner_tail, 0, 0, fragments, 0), )
+
+
+# These intentionally duplicate the scalar formulas in the JIT kernels as
+# host-testable Python reference models.  Keep them separate: sharing helpers
+# across ordinary Python and TLX JIT control flow would blur that boundary.
+def _d64_causal_dq_key_blocks(owner_start, owner_rows, sq, skv, block_n):
+    """Python reference model for the JIT dQ bottom-right key frontier."""
+    return min(skv, owner_start + owner_rows + skv - sq + block_n - 1) // block_n
+
+
+def _d64_causal_dkdv_first_query_block(key_start, sq, skv, block_m):
+    """Python reference model for the JIT dK/dV bottom-right query frontier."""
+    return max(0, key_start - (skv - sq)) // block_m
+
+
+def _d64_causal_triangular_tail_schedule(owner_fragments, valid_fragments, tail_step):
+    """Python reference for one uniform causal-tail fragment visit."""
+    return tuple("skip" if fragment < tail_step or fragment >= valid_fragments else "masked" if fragment ==
+                 tail_step else "unmasked" for fragment in range(owner_fragments))
+
+
+@triton.jit
+def _attn_bwd_d64_fused_n256_update(
+    q_t,
+    do_t,
+    q_nd,
+    do_nd,
+    k_nm,
+    kt_dm,
+    v_nm,
+    lse,
+    delta,
+    dq_acc_base,
+    offs_m,
+    dk,
+    dv,
+    SM_SCALE: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    mma_nm: tl.constexpr,
+    mma_nd: tl.constexpr,
+    mma_dm: tl.constexpr,
+    p_op0_nd: tl.constexpr,
+    ds_op0_nd: tl.constexpr,
+    ds_op1_dm: tl.constexpr,
+):
+    log2e: tl.constexpr = 1.4426950408889634
+    dk = tlx.require_layout(dk, mma_nd, pin=False)
+    dv = tlx.require_layout(dv, mma_nd, pin=False)
+    scores = tlx.zeros((BLOCK_N, BLOCK_M), tl.float32, layout=mma_nm)
+    scores = tl.dot(k_nm, q_t, acc=scores, out_dtype=tl.float32)
+    scale_full = tlx.require_layout(
+        tl.full((BLOCK_N, BLOCK_M), SM_SCALE * log2e, tl.float32),
+        mma_nm,
+        pin=False,
+    )
+    lse_full = tlx.require_layout(
+        tl.broadcast_to(lse[None, :] * log2e, (BLOCK_N, BLOCK_M)),
+        mma_nm,
+        pin=False,
+    )
+    p = tlx.require_layout(tl.math.exp2(scores * scale_full - lse_full), mma_nm, pin=False)
+
+    # Score and dK/dV use compatible CDNA4 16x16x32 MFMA ownership. Preserve
+    # that ownership instead of introducing a generic linear permutation.
+    p_nd = tlx.require_layout(p.to(tl.bfloat16), p_op0_nd, pin=False)
+    dv = tl.dot(p_nd, do_nd, acc=dv, out_dtype=tl.float32)
+
+    dp = tlx.zeros((BLOCK_N, BLOCK_M), tl.float32, layout=mma_nm)
+    dp = tl.dot(v_nm, do_t, acc=dp, out_dtype=tl.float32)
+    delta_full = tlx.require_layout(
+        tl.broadcast_to(delta[None, :], (BLOCK_N, BLOCK_M)),
+        mma_nm,
+        pin=False,
+    )
+    ds = p * (dp - delta_full)
+    ds_bf16 = ds.to(tl.bfloat16)
+
+    ds_nd = tlx.require_layout(ds_bf16, ds_op0_nd, pin=False)
+    dk = tl.dot(ds_nd, q_nd, acc=dk, out_dtype=tl.float32)
+
+    ds_dm = tlx.require_layout(ds_bf16, ds_op1_dm, pin=False)
+    dq = tlx.zeros((D, BLOCK_M), tl.float32, layout=mma_dm)
+    dq = tl.dot(kt_dm, ds_dm, acc=dq, out_dtype=tl.float32)
+    dq_scale = tlx.require_layout(tl.full((D, BLOCK_M), SM_SCALE, tl.float32), mma_dm, pin=False)
+    dq = dq * dq_scale
+    offs_d = tl.arange(0, D)
+    dq_offsets = offs_m[None, :] * D + offs_d[:, None]
+    dq_offsets = tlx.require_layout(dq_offsets.to(tl.int32), mma_dm, pin=False)
+    tlx.buffer_atomic_add(
+        dq_acc_base,
+        dq_offsets,
+        dq,
+        sem="relaxed",
+        contiguity=1,
+    )
+    dk = tlx.require_layout(dk, mma_nd, pin=False)
+    dv = tlx.require_layout(dv, mma_nd, pin=False)
+    return dk, dv
+
+
+@triton.jit
+def _attn_bwd_d64_fused_n256_kernel(
+    Q,
+    K,
+    V,
+    DO,
+    LSE,
+    Delta,
+    DQ_ACC,
+    DK_OWNER,
+    DV_OWNER,
+    SM_SCALE: tl.constexpr,
+    HQ: tl.constexpr,
+    HKV: tl.constexpr,
+    SQ: tl.constexpr,
+    SKV: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    KV_SPLITS: tl.constexpr,
+):
+    tl.static_assert(BLOCK_M == 32 and BLOCK_N == 256 and D == 64)
+    tl.static_assert(SQ % 64 == 0 and SKV % 256 == 0)
+    tl.static_assert(HQ % HKV == 0)
+    tl.static_assert((HQ // HKV == 1 and KV_SPLITS == 1) or (HQ // HKV == 8 and KV_SPLITS == 8))
+    pid_n = tl.program_id(0)
+    pid_hq = tl.program_id(1)
+    pid_b = tl.program_id(2)
+    group_size: tl.constexpr = HQ // HKV
+    pid_hkv = pid_hq // group_size
+    pid_split = pid_hq % group_size
+    q_head = (pid_b * HQ + pid_hq).to(tl.int64)
+    kv_head = (pid_b * HKV + pid_hkv).to(tl.int64)
+    q_base = q_head * SQ * D
+    kv_base = kv_head * SKV * D
+    stats_base = q_head * SQ
+    dq_acc_base = DQ_ACC + q_base
+
+    mma_nm: tl.constexpr = tlx.amd_mfma_layout(
+        version=4,
+        instr_shape=[16, 16, 32],
+        transposed=True,
+        warps_per_cta=[4, 1],
+    )
+    mma_nd: tl.constexpr = tlx.amd_mfma_layout(
+        version=4,
+        instr_shape=[16, 16, 32],
+        transposed=True,
+        warps_per_cta=[4, 1],
+    )
+    mma_dm: tl.constexpr = tlx.amd_mfma_layout(
+        version=4,
+        instr_shape=[16, 16, 32],
+        transposed=True,
+        warps_per_cta=[4, 1],
+    )
+    kv_async_layout: tl.constexpr = tlx.layout(
+        shape=(
+            (2, 2, 2, 2, 2, 2, 2, 2),
+            (2, 2, 2, 2, 2, 2),
+        ),
+        stride=(
+            (8, 16, 32, 64, 128, 256, 4096, 8192),
+            (1, 2, 4, 512, 1024, 2048),
+        ),
+    )
+    k_op0_nm: tl.constexpr = tlx.dot_operand_layout(0, mma_nm, k_width=8)
+    qt_op1_nm: tl.constexpr = tlx.dot_operand_layout(1, mma_nm, k_width=8)
+    v_op0_nm: tl.constexpr = tlx.dot_operand_layout(0, mma_nm, k_width=8)
+    do_t_op1_nm: tl.constexpr = tlx.dot_operand_layout(1, mma_nm, k_width=8)
+    p_op0_nd: tl.constexpr = tlx.dot_operand_layout(0, mma_nd, k_width=4)
+    do_op1_nd: tl.constexpr = tlx.dot_operand_layout(1, mma_nd, k_width=4)
+    ds_op0_nd: tl.constexpr = tlx.dot_operand_layout(0, mma_nd, k_width=4)
+    q_op1_nd: tl.constexpr = tlx.dot_operand_layout(1, mma_nd, k_width=4)
+    kt_op0_dm: tl.constexpr = tlx.dot_operand_layout(0, mma_dm, k_width=4)
+    ds_op1_dm: tl.constexpr = tlx.dot_operand_layout(1, mma_dm, k_width=4)
+
+    kv_layout: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases(
+        [(512, 32)],
+        [
+            [0, 1],
+            [0, 2],
+            [0, 4],
+            [0, 8],
+            [0, 16],
+            [0, 32],
+            [16, 0],
+            [32, 0],
+            [64, 0],
+            [128, 0],
+            [1, 0],
+            [2, 0],
+            [4, 0],
+            [8, 0],
+        ],
+        [BLOCK_N, D],
+    )
+    qdo_layout: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases(
+        [(512, 32)],
+        [
+            [0, 1],
+            [0, 2],
+            [0, 4],
+            [0, 8],
+            [0, 16],
+            [0, 32],
+            [16, 0],
+            [1, 0],
+            [2, 0],
+            [4, 0],
+            [8, 0],
+        ],
+        [BLOCK_M, D],
+    )
+    k_buffer = tlx.local_alloc((BLOCK_N, D), tl.bfloat16, 1, layout=kv_layout)
+    v_buffer = tlx.local_alloc((BLOCK_N, D), tl.bfloat16, 1, layout=kv_layout)
+    q_ring = tlx.local_alloc((BLOCK_M, D), tl.bfloat16, 8, layout=qdo_layout, reuse=k_buffer)
+    do_ring = tlx.local_alloc((BLOCK_M, D), tl.bfloat16, 8, layout=qdo_layout, reuse=v_buffer)
+
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_d = tl.arange(0, D)
+    key_ptrs = kv_base + offs_n[:, None] * D + offs_d[None, :]
+    key_mask = offs_n[:, None] < SKV
+    k_token = tlx.async_load(
+        K + key_ptrs,
+        tlx.local_view(k_buffer, 0),
+        mask=key_mask,
+        other=0.0,
+    )
+    v_token = tlx.async_load(
+        V + key_ptrs,
+        tlx.local_view(v_buffer, 0),
+        mask=key_mask,
+        other=0.0,
+    )
+    tlx.async_load_commit_group([k_token, v_token])
+    kv_wait = tlx.async_load_wait_group(0)
+    k_nm = tlx.local_load(tlx.local_view(k_buffer, 0), token=kv_wait, layout=k_op0_nm)
+    kt_dm = tlx.local_load(
+        tlx.local_trans(tlx.local_view(k_buffer, 0)),
+        token=kv_wait,
+        layout=kt_op0_dm,
+    )
+    v_nm = tlx.local_load(tlx.local_view(v_buffer, 0), token=kv_wait, layout=v_op0_nm)
+    tl.debug_barrier()
+
+    first_m = tl.arange(0, BLOCK_M)
+    first_ptrs = q_base + first_m[:, None] * D + offs_d[None, :]
+    first_q_token = tlx.async_load(Q + first_ptrs, tlx.local_view(q_ring, 0))
+    first_do_token = tlx.async_load(DO + first_ptrs, tlx.local_view(do_ring, 0))
+    tlx.async_load_commit_group([first_q_token, first_do_token])
+
+    dk = tlx.zeros((BLOCK_N, D), tl.float32, layout=mma_nd)
+    dv = tlx.zeros((BLOCK_N, D), tl.float32, layout=mma_nd)
+    num_m_blocks: tl.constexpr = SQ // BLOCK_M
+    for m_block in range(0, num_m_blocks):
+        current_slot = m_block % 2
+        next_slot = 1 - current_slot
+        if m_block + 1 < num_m_blocks:
+            next_m = (m_block + 1) * BLOCK_M + tl.arange(0, BLOCK_M)
+            next_ptrs = q_base + next_m[:, None] * D + offs_d[None, :]
+            next_q_token = tlx.async_load(Q + next_ptrs, tlx.local_view(q_ring, next_slot))
+            next_do_token = tlx.async_load(DO + next_ptrs, tlx.local_view(do_ring, next_slot))
+            tlx.async_load_commit_group([next_q_token, next_do_token])
+            qdo_wait = tlx.async_load_wait_group(1)
+        else:
+            qdo_wait = tlx.async_load_wait_group(0)
+
+        q_view = tlx.local_view(q_ring, current_slot)
+        do_view = tlx.local_view(do_ring, current_slot)
+        q_t = tlx.local_load(tlx.local_trans(q_view), token=qdo_wait, layout=qt_op1_nm)
+        do_t = tlx.local_load(tlx.local_trans(do_view), token=qdo_wait, layout=do_t_op1_nm)
+        q_nd = tlx.local_load(q_view, token=qdo_wait, layout=q_op1_nd)
+        do_nd = tlx.local_load(do_view, token=qdo_wait, layout=do_op1_nd)
+        offs_m = m_block * BLOCK_M + tl.arange(0, BLOCK_M)
+        lse = tl.load(LSE + stats_base + offs_m)
+        delta = tl.load(Delta + stats_base + offs_m)
+        dk, dv = _attn_bwd_d64_fused_n256_update(
+            q_t,
+            do_t,
+            q_nd,
+            do_nd,
+            k_nm,
+            kt_dm,
+            v_nm,
+            lse,
+            delta,
+            dq_acc_base,
+            offs_m,
+            dk,
+            dv,
+            SM_SCALE,
+            D,
+            BLOCK_M,
+            BLOCK_N,
+            mma_nm,
+            mma_nd,
+            mma_dm,
+            p_op0_nd,
+            ds_op0_nd,
+            ds_op1_dm,
+        )
+        tl.debug_barrier()
+
+    output_offsets = offs_n[:, None] * D + offs_d[None, :]
+    output_offsets = tlx.require_layout(output_offsets.to(tl.int32), kv_async_layout, pin=False)
+    dk_scale = tlx.require_layout(tl.full((BLOCK_N, D), SM_SCALE, tl.float32), mma_nd, pin=False)
+    dk_out = tlx.require_layout(
+        (dk * dk_scale).to(tl.bfloat16),
+        kv_async_layout,
+        pin=False,
+    )
+    dv_out = tlx.require_layout(
+        dv.to(tl.bfloat16),
+        kv_async_layout,
+        pin=False,
+    )
+    if KV_SPLITS == 1:
+        output_head = (pid_b * HKV + pid_hkv).to(tl.int64)
+    else:
+        output_head = ((pid_b * HKV + pid_hkv) * KV_SPLITS + pid_split).to(tl.int64)
+    output_base = output_head * SKV * D
+    tlx.buffer_store(dk_out, DK_OWNER + output_base, output_offsets)
+    tlx.buffer_store(dv_out, DV_OWNER + output_base, output_offsets)
+
+
+@triton.jit
+def _attn_bwd_d64_fused_dq_convert_kernel(
+    DQ_ACC,
+    DQ,
+    N: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    batch_head = tl.program_id(1)
+    rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    cols = tl.arange(0, D)
+    base = batch_head.to(tl.int64) * N * D
+    offsets = rows[:, None] * D + cols[None, :]
+    mask = rows[:, None] < N
+    values = tl.load(DQ_ACC + base + offsets, mask=mask, other=0.0)
+    tl.store(DQ + base + offsets, values.to(tl.bfloat16), mask=mask)
+
+
+@triton.jit
+def _attn_bwd_dq_d64_causal_load_q64(
+    Q,
+    O,
+    DO,
+    LSE,
+    DELTA,
+    LSE_TERM,
+    q_base,
+    stats_base,
+    row_start,
+    store_end,
+    SM_SCALE: tl.constexpr,
+    SQ: tl.constexpr,
+    D: tl.constexpr,
+    STAT_MODE: tl.constexpr,
+    q_op0_mn: tl.constexpr,
+):
+    rows = row_start + tl.arange(0, 64)
+    lse = tl.load(LSE + stats_base + rows, mask=rows < store_end, other=0.0)
+    cols = tl.arange(0, D)
+    offsets = (rows[:, None] * D + cols[None, :]).to(tl.int32)
+    offsets = tlx.require_layout(offsets, q_op0_mn, pin=False)
+    mask = tlx.require_layout(tl.broadcast_to(rows[:, None] < store_end, offsets.shape), q_op0_mn, pin=False)
+    zero = tlx.zeros((64, D), tl.bfloat16, layout=q_op0_mn)
+    do = tlx.buffer_load(DO + q_base, offsets, mask=mask, other=zero, contiguity=8)
+    o = tlx.buffer_load(O + q_base, offsets, mask=mask, other=zero, contiguity=8)
+    product = o.to(tl.float32) * do.to(tl.float32)
+    product = tlx.release_layout(product)
+    positive = tl.sum(product, axis=1)
+    # Q is independent of the O*dO reduction. Loading it after that short-lived
+    # product keeps the scheduler from extending Q's interval through the
+    # reduction prologue of every resident owner fragment.
+    q = tlx.buffer_load(Q + q_base, offsets, mask=mask, other=zero, contiguity=8)
+    stat_mask = rows < store_end
+    if STAT_MODE == _D64_MHA_POSITIVE_JIT:
+        score_lse_term = -lse * (1.0 / SM_SCALE)
+        tl.store(DELTA + stats_base + rows, positive, mask=stat_mask)
+    else:
+        tl.static_assert(STAT_MODE == _D64_GQA_SIGNED_JIT)
+        signed = -positive
+        # dQ and the producer share the log2-domain term. Publish it once per
+        # row instead of rescaling it in every resident K owner.
+        producer_lse_term = -lse * 1.4426950408889634
+        # Form both independent statistics before either publication. This
+        # keeps their arithmetic available to the scheduler ahead of the
+        # side-effecting stores and shortens the dQ epilogue dependency chain.
+        tl.store(DELTA + stats_base + rows, signed, mask=stat_mask)
+        tl.store(LSE_TERM + stats_base + rows, producer_lse_term, mask=stat_mask)
+        score_lse_term = producer_lse_term
+        # Q is score-only and remains resident across every owned K slice.
+        # Fold the constant log2 softmax scale here once per owner rather
+        # than multiplying every score fragment after its MFMA.
+        q_scale = tlx.require_layout(
+            tl.full((64, D), SM_SCALE * 1.4426950408889634, tl.float32),
+            q_op0_mn,
+            pin=False,
+        )
+        q = tlx.require_layout(
+            (q.to(tl.float32) * q_scale).to(tl.bfloat16),
+            q_op0_mn,
+            pin=False,
+        )
+    q = tlx.require_layout(q, q_op0_mn, pin=False)
+    do = tlx.require_layout(do, q_op0_mn, pin=False)
+    return q, do, score_lse_term, positive, rows
+
+
+@triton.jit
+def _attn_bwd_dq_d64_causal_step(
+    dq,
+    q,
+    do,
+    row_lse,
+    row_delta,
+    rows,
+    k_source,
+    v_source,
+    kv_source,
+    n0,
+    SM_SCALE: tl.constexpr,
+    SQ: tl.constexpr,
+    SKV: tl.constexpr,
+    D: tl.constexpr,
+    N_OFFSET: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    APPLY_MASK: tl.constexpr,
+    SCORE_PRE_SCALED: tl.constexpr,
+    mma_mn: tl.constexpr,
+    mma_md: tl.constexpr,
+    kt_op1_mn: tl.constexpr,
+    vt_op1_mn: tl.constexpr,
+    ds_op0_md: tl.constexpr,
+    k_op1_md: tl.constexpr,
+):
+    log2e: tl.constexpr = 1.4426950408889634
+    dq = tlx.require_layout(dq, mma_md, pin=False)
+    q = tlx.require_layout(q, tlx.dot_operand_layout(0, mma_mn, k_width=8), pin=False)
+    do = tlx.require_layout(do, tlx.dot_operand_layout(0, mma_mn, k_width=8), pin=False)
+    kt = tlx.require_layout(k_source, kt_op1_mn, pin=False)
+    vt = tlx.require_layout(v_source, vt_op1_mn, pin=False)
+    k_nd = tlx.require_layout(kv_source, k_op1_md, pin=False)
+    row_lse_full = tlx.require_layout(
+        tl.broadcast_to(row_lse[:, None], (64, BLOCK_N)),
+        mma_mn,
+        pin=False,
+    )
+    scores = tlx.zeros((64, BLOCK_N), tl.float32, layout=mma_mn)
+    scores = scores + row_lse_full
+    scores = tl.dot(q, kt, acc=scores, out_dtype=tl.float32)
+    if BLOCK_N == 64:
+        # End the score-MFMA allocation interval before the exp tail.
+        scores = tlx.amd_register_handoff(scores, register_class="vgpr")
+        scores = tlx.require_layout(scores, mma_mn, pin=False)
+
+    # Match the independent MFMA cadence used by the tuned reference: issue
+    # dP while the score recurrence is ready, before its scale/exp tail.
+    row_delta_full = tlx.require_layout(
+        tl.broadcast_to(row_delta[:, None], (64, BLOCK_N)),
+        mma_mn,
+        pin=False,
+    )
+    dp = tlx.zeros((64, BLOCK_N), tl.float32, layout=mma_mn)
+    dp = dp - row_delta_full
+    dp = tl.dot(do, vt, acc=dp, out_dtype=tl.float32)
+
+    if not SCORE_PRE_SCALED:
+        scale = tlx.require_layout(
+            tl.full((64, BLOCK_N), SM_SCALE * log2e, tl.float32),
+            mma_mn,
+            pin=False,
+        )
+        scores = scores * scale
+    if BLOCK_N == 32:
+        # This complete-step path consumes the native one-group result directly;
+        # unlike the split score/dP/finish path, it has no helper boundary.
+        scores = tlx.require_layout(scores, mma_mn, pin=False)
+    if APPLY_MASK:
+        cols = n0 + N_OFFSET + tl.arange(0, BLOCK_N)
+        valid = cols[None, :] <= rows[:, None] + (SKV - SQ)
+        valid = tlx.require_layout(valid, mma_mn, pin=False)
+        negative_inf = tlx.require_layout(
+            tl.full((64, BLOCK_N), float("-inf"), tl.float32),
+            mma_mn,
+            pin=False,
+        )
+        scores = tl.where(valid, scores, negative_inf)
+    p = tlx.require_layout(tl.math.exp2(scores), mma_mn, pin=False)
+    ds = tlx.amd_register_handoff(
+        p * dp,
+        register_class="vgpr",
+    )
+    ds = tlx.require_layout(ds.to(tl.bfloat16), ds_op0_md, pin=False)
+    dq = tl.dot(ds, k_nd, acc=dq, out_dtype=tl.float32)
+    return tlx.require_layout(dq, mma_md, pin=False)
+
+
+@triton.jit
+def _attn_bwd_dq_d64_causal_score32(
+    q,
+    row_lse,
+    kt,
+    SM_SCALE: tl.constexpr,
+    mma_mn: tl.constexpr,
+    q_op0_mn: tl.constexpr,
+    kt_op1_mn: tl.constexpr,
+    SCORE_PRE_SCALED: tl.constexpr,
+):
+    log2e: tl.constexpr = 1.4426950408889634
+    q = tlx.require_layout(q, q_op0_mn, pin=False)
+    kt = tlx.require_layout(kt, kt_op1_mn, pin=False)
+    row_lse_full = tlx.require_layout(tl.broadcast_to(row_lse[:, None], (64, 32)), mma_mn, pin=False)
+    scores = tlx.zeros((64, 32), tl.float32, layout=mma_mn) + row_lse_full
+    scores = tl.dot(q, kt, acc=scores, out_dtype=tl.float32)
+    if not SCORE_PRE_SCALED:
+        scores *= tlx.require_layout(tl.full((64, 32), SM_SCALE * log2e, tl.float32), mma_mn, pin=False)
+    return tlx.require_layout(scores, mma_mn, pin=False)
+
+
+@triton.jit
+def _attn_bwd_dq_d64_causal_dp32(
+    do,
+    row_delta,
+    vt,
+    mma_mn: tl.constexpr,
+    q_op0_mn: tl.constexpr,
+    vt_op1_mn: tl.constexpr,
+):
+    do = tlx.require_layout(do, q_op0_mn, pin=False)
+    vt = tlx.require_layout(vt, vt_op1_mn, pin=False)
+    row_delta_full = tlx.require_layout(tl.broadcast_to(row_delta[:, None], (64, 32)), mma_mn, pin=False)
+    dp = tlx.zeros((64, 32), tl.float32, layout=mma_mn) - row_delta_full
+    dp = tl.dot(do, vt, acc=dp, out_dtype=tl.float32)
+    return tlx.require_layout(dp, mma_mn, pin=False)
+
+
+@triton.jit
+def _attn_bwd_dq_d64_causal_finish32(
+    dq,
+    scores,
+    dp,
+    k_nd,
+    mma_mn: tl.constexpr,
+    mma_md: tl.constexpr,
+    ds_op0_md: tl.constexpr,
+    k_op1_md: tl.constexpr,
+):
+    dq = tlx.require_layout(dq, mma_md, pin=False)
+    scores = tlx.require_layout(scores, mma_mn, pin=False)
+    dp = tlx.require_layout(dp, mma_mn, pin=False)
+    k_nd = tlx.require_layout(k_nd, k_op1_md, pin=False)
+    p = tlx.require_layout(tl.math.exp2(scores), mma_mn, pin=False)
+    ds = tlx.amd_register_handoff(
+        p * dp,
+        register_class="vgpr",
+    )
+    ds = tlx.require_layout(ds.to(tl.bfloat16), ds_op0_md, pin=False)
+    dq = tl.dot(ds, k_nd, acc=dq, out_dtype=tl.float32)
+    return tlx.require_layout(dq, mma_md, pin=False)
+
+
+@triton.jit
+def _attn_bwd_dq_d64_causal_m256_unmasked_n32(
+    dq0,
+    dq1,
+    dq2,
+    dq3,
+    q0,
+    q1,
+    q2,
+    do0,
+    do1,
+    do2,
+    lse0,
+    lse1,
+    lse2,
+    lse3,
+    delta0,
+    delta1,
+    delta2,
+    delta3,
+    rows1,
+    rows2,
+    rows3,
+    q3,
+    do3,
+    k_view,
+    v_view,
+    kv_wait,
+    n0,
+    SM_SCALE: tl.constexpr,
+    SQ: tl.constexpr,
+    SKV: tl.constexpr,
+    D: tl.constexpr,
+    N_OFFSET: tl.constexpr,
+    SCORE_PRE_SCALED: tl.constexpr,
+    mma_mn: tl.constexpr,
+    mma_md: tl.constexpr,
+    q_op0_mn: tl.constexpr,
+    kt_op1_mn: tl.constexpr,
+    vt_op1_mn: tl.constexpr,
+    ds_op0_md: tl.constexpr,
+    k_op1_md: tl.constexpr,
+):
+    """Consume one unmasked N32 half of a four-fragment D64 owner."""
+    tl.static_assert(D == 64)
+    k_slice = tlx.local_slice(k_view, [N_OFFSET, 0], [32, D])
+    v_slice = tlx.local_slice(v_view, [N_OFFSET, 0], [32, D])
+    kt = tlx.local_load(tlx.local_trans(k_slice), token=kv_wait, layout=kt_op1_mn)
+    k_nd = tlx.local_load(k_slice, token=kv_wait, layout=k_op1_md)
+    scores0 = _attn_bwd_dq_d64_causal_score32(q0, lse0, kt, SM_SCALE, mma_mn, q_op0_mn, kt_op1_mn, SCORE_PRE_SCALED)
+    vt = tlx.local_load(tlx.local_trans(v_slice), token=kv_wait, layout=vt_op1_mn)
+    dp0 = _attn_bwd_dq_d64_causal_dp32(do0, delta0, vt, mma_mn, q_op0_mn, vt_op1_mn)
+    dq0 = _attn_bwd_dq_d64_causal_finish32(dq0, scores0, dp0, k_nd, mma_mn, mma_md, ds_op0_md, k_op1_md)
+    dq1 = _attn_bwd_dq_d64_causal_step(dq1, q1, do1, lse1, delta1, rows1, kt, vt, k_nd, n0, SM_SCALE, SQ, SKV, D,
+                                       N_OFFSET, 32, False, SCORE_PRE_SCALED, mma_mn, mma_md, kt_op1_mn, vt_op1_mn,
+                                       ds_op0_md, k_op1_md)
+    dq3 = _attn_bwd_dq_d64_causal_step(dq3, q3, do3, lse3, delta3, rows3, kt, vt, k_nd, n0, SM_SCALE, SQ, SKV, D,
+                                       N_OFFSET, 32, False, SCORE_PRE_SCALED, mma_mn, mma_md, kt_op1_mn, vt_op1_mn,
+                                       ds_op0_md, k_op1_md)
+    scores2 = _attn_bwd_dq_d64_causal_score32(q2, lse2, kt, SM_SCALE, mma_mn, q_op0_mn, kt_op1_mn, SCORE_PRE_SCALED)
+    dp2 = _attn_bwd_dq_d64_causal_dp32(do2, delta2, vt, mma_mn, q_op0_mn, vt_op1_mn)
+    dq2 = _attn_bwd_dq_d64_causal_finish32(dq2, scores2, dp2, k_nd, mma_mn, mma_md, ds_op0_md, k_op1_md)
+    return dq0, dq1, dq2, dq3
+
+
+@triton.jit
+def _attn_bwd_dq_d64_causal_nslice(
+    dq0,
+    dq1,
+    dq2,
+    dq3,
+    q0,
+    q1,
+    q2,
+    do0,
+    do1,
+    do2,
+    lse0,
+    lse1,
+    lse2,
+    lse3,
+    delta0,
+    delta1,
+    delta2,
+    delta3,
+    rows0,
+    rows1,
+    rows2,
+    rows3,
+    q3,
+    do3,
+    k_view,
+    v_view,
+    kv_wait,
+    valid_fragments,
+    tail_step,
+    n0,
+    SM_SCALE: tl.constexpr,
+    SQ: tl.constexpr,
+    SKV: tl.constexpr,
+    D: tl.constexpr,
+    OWNER_FRAGMENTS: tl.constexpr,
+    SKIP_OWNER_TAIL: tl.constexpr,
+    N_OFFSET: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    APPLY_MASK: tl.constexpr,
+    TRIANGULAR_TAIL: tl.constexpr,
+    SCORE_PRE_SCALED: tl.constexpr,
+    mma_mn: tl.constexpr,
+    mma_md: tl.constexpr,
+    q_op0_mn: tl.constexpr,
+    kt_op1_mn: tl.constexpr,
+    vt_op1_mn: tl.constexpr,
+    ds_op0_md: tl.constexpr,
+    k_op1_md: tl.constexpr,
+):
+    dq0 = tlx.require_layout(dq0, mma_md, pin=False)
+    dq1 = tlx.require_layout(dq1, mma_md, pin=False)
+    dq2 = tlx.require_layout(dq2, mma_md, pin=False)
+    dq3 = tlx.require_layout(dq3, mma_md, pin=False)
+    k_slice = tlx.local_slice(k_view, [N_OFFSET, 0], [BLOCK_N, D])
+    v_slice = tlx.local_slice(v_view, [N_OFFSET, 0], [BLOCK_N, D])
+    k_source = tlx.local_load(tlx.local_trans(k_slice), token=kv_wait, layout=kt_op1_mn)
+    kv_source = tlx.local_load(k_slice, token=kv_wait, layout=k_op1_md)
+    v_source = tlx.local_load(tlx.local_trans(v_slice), token=kv_wait, layout=vt_op1_mn)
+    if TRIANGULAR_TAIL:
+        # Tail K/V block j intersects fragment j. Earlier fragments are
+        # wholly future and skipped; later valid fragments are fully causal.
+        if tail_step == 0:
+            dq0 = _attn_bwd_dq_d64_causal_step(
+                dq0,
+                q0,
+                do0,
+                lse0,
+                delta0,
+                rows0,
+                k_source,
+                v_source,
+                kv_source,
+                n0,
+                SM_SCALE,
+                SQ,
+                SKV,
+                D,
+                N_OFFSET,
+                BLOCK_N,
+                True,
+                SCORE_PRE_SCALED,
+                mma_mn,
+                mma_md,
+                kt_op1_mn,
+                vt_op1_mn,
+                ds_op0_md,
+                k_op1_md,
+            )
+            dq0 = tlx.require_layout(dq0, mma_md, pin=False)
+        dq0 = tlx.require_layout(dq0, mma_md, pin=False)
+
+        if not SKIP_OWNER_TAIL or valid_fragments >= 2:
+            if tail_step == 0:
+                dq1 = _attn_bwd_dq_d64_causal_step(
+                    dq1,
+                    q1,
+                    do1,
+                    lse1,
+                    delta1,
+                    rows1,
+                    k_source,
+                    v_source,
+                    kv_source,
+                    n0,
+                    SM_SCALE,
+                    SQ,
+                    SKV,
+                    D,
+                    N_OFFSET,
+                    BLOCK_N,
+                    False,
+                    SCORE_PRE_SCALED,
+                    mma_mn,
+                    mma_md,
+                    kt_op1_mn,
+                    vt_op1_mn,
+                    ds_op0_md,
+                    k_op1_md,
+                )
+                dq1 = tlx.require_layout(dq1, mma_md, pin=False)
+            elif tail_step == 1:
+                dq1 = _attn_bwd_dq_d64_causal_step(
+                    dq1,
+                    q1,
+                    do1,
+                    lse1,
+                    delta1,
+                    rows1,
+                    k_source,
+                    v_source,
+                    kv_source,
+                    n0,
+                    SM_SCALE,
+                    SQ,
+                    SKV,
+                    D,
+                    N_OFFSET,
+                    BLOCK_N,
+                    True,
+                    SCORE_PRE_SCALED,
+                    mma_mn,
+                    mma_md,
+                    kt_op1_mn,
+                    vt_op1_mn,
+                    ds_op0_md,
+                    k_op1_md,
+                )
+                dq1 = tlx.require_layout(dq1, mma_md, pin=False)
+        dq1 = tlx.require_layout(dq1, mma_md, pin=False)
+
+        if OWNER_FRAGMENTS >= 3:
+            if not SKIP_OWNER_TAIL or valid_fragments >= 3:
+                if tail_step < 2:
+                    dq2 = _attn_bwd_dq_d64_causal_step(
+                        dq2,
+                        q2,
+                        do2,
+                        lse2,
+                        delta2,
+                        rows2,
+                        k_source,
+                        v_source,
+                        kv_source,
+                        n0,
+                        SM_SCALE,
+                        SQ,
+                        SKV,
+                        D,
+                        N_OFFSET,
+                        BLOCK_N,
+                        False,
+                        SCORE_PRE_SCALED,
+                        mma_mn,
+                        mma_md,
+                        kt_op1_mn,
+                        vt_op1_mn,
+                        ds_op0_md,
+                        k_op1_md,
+                    )
+                    dq2 = tlx.require_layout(dq2, mma_md, pin=False)
+                elif tail_step == 2:
+                    dq2 = _attn_bwd_dq_d64_causal_step(
+                        dq2,
+                        q2,
+                        do2,
+                        lse2,
+                        delta2,
+                        rows2,
+                        k_source,
+                        v_source,
+                        kv_source,
+                        n0,
+                        SM_SCALE,
+                        SQ,
+                        SKV,
+                        D,
+                        N_OFFSET,
+                        BLOCK_N,
+                        True,
+                        SCORE_PRE_SCALED,
+                        mma_mn,
+                        mma_md,
+                        kt_op1_mn,
+                        vt_op1_mn,
+                        ds_op0_md,
+                        k_op1_md,
+                    )
+                    dq2 = tlx.require_layout(dq2, mma_md, pin=False)
+        dq2 = tlx.require_layout(dq2, mma_md, pin=False)
+
+        if OWNER_FRAGMENTS == 4:
+            if not SKIP_OWNER_TAIL or valid_fragments >= 4:
+                if tail_step < 3:
+                    dq3 = _attn_bwd_dq_d64_causal_step(
+                        dq3,
+                        q3,
+                        do3,
+                        lse3,
+                        delta3,
+                        rows3,
+                        k_source,
+                        v_source,
+                        kv_source,
+                        n0,
+                        SM_SCALE,
+                        SQ,
+                        SKV,
+                        D,
+                        N_OFFSET,
+                        BLOCK_N,
+                        False,
+                        SCORE_PRE_SCALED,
+                        mma_mn,
+                        mma_md,
+                        kt_op1_mn,
+                        vt_op1_mn,
+                        ds_op0_md,
+                        k_op1_md,
+                    )
+                    dq3 = tlx.require_layout(dq3, mma_md, pin=False)
+                elif tail_step == 3:
+                    dq3 = _attn_bwd_dq_d64_causal_step(
+                        dq3,
+                        q3,
+                        do3,
+                        lse3,
+                        delta3,
+                        rows3,
+                        k_source,
+                        v_source,
+                        kv_source,
+                        n0,
+                        SM_SCALE,
+                        SQ,
+                        SKV,
+                        D,
+                        N_OFFSET,
+                        BLOCK_N,
+                        True,
+                        SCORE_PRE_SCALED,
+                        mma_mn,
+                        mma_md,
+                        kt_op1_mn,
+                        vt_op1_mn,
+                        ds_op0_md,
+                        k_op1_md,
+                    )
+                    dq3 = tlx.require_layout(dq3, mma_md, pin=False)
+        dq3 = tlx.require_layout(dq3, mma_md, pin=False)
+    else:
+        dq0 = _attn_bwd_dq_d64_causal_step(
+            dq0,
+            q0,
+            do0,
+            lse0,
+            delta0,
+            rows0,
+            k_source,
+            v_source,
+            kv_source,
+            n0,
+            SM_SCALE,
+            SQ,
+            SKV,
+            D,
+            N_OFFSET,
+            BLOCK_N,
+            APPLY_MASK,
+            SCORE_PRE_SCALED,
+            mma_mn,
+            mma_md,
+            kt_op1_mn,
+            vt_op1_mn,
+            ds_op0_md,
+            k_op1_md,
+        )
+        dq0 = tlx.require_layout(dq0, mma_md, pin=False)
+        if not SKIP_OWNER_TAIL or valid_fragments >= 2:
+            dq1 = _attn_bwd_dq_d64_causal_step(
+                dq1,
+                q1,
+                do1,
+                lse1,
+                delta1,
+                rows1,
+                k_source,
+                v_source,
+                kv_source,
+                n0,
+                SM_SCALE,
+                SQ,
+                SKV,
+                D,
+                N_OFFSET,
+                BLOCK_N,
+                APPLY_MASK,
+                SCORE_PRE_SCALED,
+                mma_mn,
+                mma_md,
+                kt_op1_mn,
+                vt_op1_mn,
+                ds_op0_md,
+                k_op1_md,
+            )
+            dq1 = tlx.require_layout(dq1, mma_md, pin=False)
+        if OWNER_FRAGMENTS >= 3:
+            if not SKIP_OWNER_TAIL or valid_fragments >= 3:
+                dq2 = _attn_bwd_dq_d64_causal_step(
+                    dq2,
+                    q2,
+                    do2,
+                    lse2,
+                    delta2,
+                    rows2,
+                    k_source,
+                    v_source,
+                    kv_source,
+                    n0,
+                    SM_SCALE,
+                    SQ,
+                    SKV,
+                    D,
+                    N_OFFSET,
+                    BLOCK_N,
+                    APPLY_MASK,
+                    SCORE_PRE_SCALED,
+                    mma_mn,
+                    mma_md,
+                    kt_op1_mn,
+                    vt_op1_mn,
+                    ds_op0_md,
+                    k_op1_md,
+                )
+                dq2 = tlx.require_layout(dq2, mma_md, pin=False)
+        if OWNER_FRAGMENTS == 4:
+            if not SKIP_OWNER_TAIL or valid_fragments >= 4:
+                dq3 = _attn_bwd_dq_d64_causal_step(
+                    dq3,
+                    q3,
+                    do3,
+                    lse3,
+                    delta3,
+                    rows3,
+                    k_source,
+                    v_source,
+                    kv_source,
+                    n0,
+                    SM_SCALE,
+                    SQ,
+                    SKV,
+                    D,
+                    N_OFFSET,
+                    BLOCK_N,
+                    APPLY_MASK,
+                    SCORE_PRE_SCALED,
+                    mma_mn,
+                    mma_md,
+                    kt_op1_mn,
+                    vt_op1_mn,
+                    ds_op0_md,
+                    k_op1_md,
+                )
+                dq3 = tlx.require_layout(dq3, mma_md, pin=False)
+    dq0 = tlx.require_layout(dq0, mma_md, pin=False)
+    dq1 = tlx.require_layout(dq1, mma_md, pin=False)
+    dq2 = tlx.require_layout(dq2, mma_md, pin=False)
+    dq3 = tlx.require_layout(dq3, mma_md, pin=False)
+    return dq0, dq1, dq2, dq3
+
+
+@triton.jit
+def _attn_bwd_dq_d64_causal_full_tail_block(
+    dq0,
+    dq1,
+    dq2,
+    dq3,
+    q0,
+    q1,
+    q2,
+    do0,
+    do1,
+    do2,
+    do3,
+    lse0,
+    lse1,
+    lse2,
+    lse3,
+    delta0,
+    delta1,
+    delta2,
+    delta3,
+    rows0,
+    rows1,
+    rows2,
+    rows3,
+    q3,
+    k_buffers,
+    v_buffers,
+    K,
+    V,
+    kv_base,
+    bulk_end_block,
+    SM_SCALE: tl.constexpr,
+    SQ: tl.constexpr,
+    SKV: tl.constexpr,
+    D: tl.constexpr,
+    OWNER_FRAGMENTS: tl.constexpr,
+    SKIP_OWNER_TAIL: tl.constexpr,
+    LOGICAL_N: tl.constexpr,
+    KV_PIPELINE_STAGES: tl.constexpr,
+    TAIL_STEP: tl.constexpr,
+    SCORE_PRE_SCALED: tl.constexpr,
+    kv_async_layout: tl.constexpr,
+    mma_mn: tl.constexpr,
+    mma_md: tl.constexpr,
+    q_op0_mn: tl.constexpr,
+    kt_op1_mn: tl.constexpr,
+    vt_op1_mn: tl.constexpr,
+    ds_op0_md: tl.constexpr,
+    k_op1_md: tl.constexpr,
+):
+    """Consume one statically selected triangular block of a full owner."""
+    tl.static_assert(KV_PIPELINE_STAGES == 2)
+    n_block = bulk_end_block + TAIL_STEP
+    offs_n = tl.arange(0, 64)
+    offs_d = tl.arange(0, D)
+    current_slot = n_block % 2
+    next_slot = 1 - current_slot
+    tl.debug_barrier()
+    if TAIL_STEP + 1 < OWNER_FRAGMENTS:
+        next_offsets = ((n_block + 1) * 64 * D + offs_n[:, None] * D + offs_d[None, :]).to(tl.int32)
+        next_offsets = tlx.require_layout(next_offsets, kv_async_layout, pin=False)
+        next_k = tlx.buffer_load_to_local(tlx.local_view(k_buffers, next_slot), K + kv_base, next_offsets)
+        next_v = tlx.buffer_load_to_local(tlx.local_view(v_buffers, next_slot), V + kv_base, next_offsets)
+        tlx.async_load_commit_group([next_k, next_v])
+        kv_wait = tlx.async_load_wait_group(1)
+    else:
+        kv_wait = tlx.async_load_wait_group(0)
+    k_view = tlx.local_view(k_buffers, current_slot)
+    v_view = tlx.local_view(v_buffers, current_slot)
+    n0 = n_block * 64
+    if LOGICAL_N == 32:
+        dq0, dq1, dq2, dq3 = _attn_bwd_dq_d64_causal_nslice(
+            dq0, dq1, dq2, dq3, q0, q1, q2, do0, do1, do2, lse0, lse1, lse2, lse3, delta0, delta1, delta2, delta3,
+            rows0, rows1, rows2, rows3, q3, do3, k_view, v_view, kv_wait, OWNER_FRAGMENTS, TAIL_STEP, n0, SM_SCALE, SQ,
+            SKV, D, OWNER_FRAGMENTS, SKIP_OWNER_TAIL, 0, 32, True, True, SCORE_PRE_SCALED, mma_mn, mma_md, q_op0_mn,
+            kt_op1_mn, vt_op1_mn, ds_op0_md, k_op1_md)
+        dq0, dq1, dq2, dq3 = _attn_bwd_dq_d64_causal_nslice(
+            dq0, dq1, dq2, dq3, q0, q1, q2, do0, do1, do2, lse0, lse1, lse2, lse3, delta0, delta1, delta2, delta3,
+            rows0, rows1, rows2, rows3, q3, do3, k_view, v_view, kv_wait, OWNER_FRAGMENTS, TAIL_STEP, n0, SM_SCALE, SQ,
+            SKV, D, OWNER_FRAGMENTS, SKIP_OWNER_TAIL, 32, 32, True, True, SCORE_PRE_SCALED, mma_mn, mma_md, q_op0_mn,
+            kt_op1_mn, vt_op1_mn, ds_op0_md, k_op1_md)
+    else:
+        dq0, dq1, dq2, dq3 = _attn_bwd_dq_d64_causal_nslice(
+            dq0, dq1, dq2, dq3, q0, q1, q2, do0, do1, do2, lse0, lse1, lse2, lse3, delta0, delta1, delta2, delta3,
+            rows0, rows1, rows2, rows3, q3, do3, k_view, v_view, kv_wait, OWNER_FRAGMENTS, TAIL_STEP, n0, SM_SCALE, SQ,
+            SKV, D, OWNER_FRAGMENTS, SKIP_OWNER_TAIL, 0, 64, True, True, SCORE_PRE_SCALED, mma_mn, mma_md, q_op0_mn,
+            kt_op1_mn, vt_op1_mn, ds_op0_md, k_op1_md)
+    return dq0, dq1, dq2, dq3
+
+
+@triton.jit
+def _attn_bwd_dq_d64_causal_store_q64(
+    DQ,
+    q_base,
+    dq,
+    row_start,
+    store_end,
+    SM_SCALE: tl.constexpr,
+    D: tl.constexpr,
+    out_layout: tl.constexpr,
+):
+    rows = row_start + tl.arange(0, 64)
+    cols = tl.arange(0, D)
+    local_rows = tl.arange(0, 64)
+    offsets = (local_rows[:, None] * D + cols[None, :]).to(tl.int32)
+    offsets = tlx.require_layout(offsets, out_layout, pin=False)
+    mask = tl.broadcast_to(rows[:, None] < store_end, offsets.shape)
+    mask = tlx.require_layout(mask, out_layout, pin=False)
+    dq = tlx.require_layout(
+        dq,
+        tlx.amd_mfma_layout(
+            version=4,
+            instr_shape=[16, 16, 32],
+            transposed=True,
+            warps_per_cta=[4, 1],
+        ),
+        pin=False,
+    )
+    scale = tlx.require_layout(
+        tl.full((64, D), SM_SCALE, tl.float32),
+        tlx.amd_mfma_layout(
+            version=4,
+            instr_shape=[16, 16, 32],
+            transposed=True,
+            warps_per_cta=[4, 1],
+        ),
+        pin=False,
+    )
+    out = tlx.require_layout((dq * scale).to(tl.bfloat16), out_layout, pin=False)
+    tlx.buffer_store(out, DQ + q_base + row_start * D, offsets, mask=mask)
+
+
+@triton.jit
+def _attn_bwd_dq_d64_causal_impl(
+    Q,
+    K,
+    V,
+    O,
+    DO,
+    LSE,
+    DELTA,
+    LSE_TERM,
+    DQ,
+    SM_SCALE: tl.constexpr,
+    HQ: tl.constexpr,
+    HKV: tl.constexpr,
+    SQ: tl.constexpr,
+    SKV: tl.constexpr,
+    D: tl.constexpr,
+    OWNER_ROWS: tl.constexpr,
+    LOGICAL_N: tl.constexpr,
+    USE_DQ_XCD: tl.constexpr,
+    SKIP_OWNER_TAIL: tl.constexpr,
+    OWNER_PID_BASE: tl.constexpr,
+    LAUNCH_Q_TILES: tl.constexpr,
+    OWNER_FRAGMENTS: tl.constexpr,
+    GRID_OWNER_M: tl.constexpr,
+    KV_PIPELINE_STAGES: tl.constexpr,
+    STAT_MODE: tl.constexpr,
+):
+    tl.static_assert(D == 64)
+    tl.static_assert(HQ % HKV == 0)
+    tl.static_assert(SQ % 64 == 0 and SKV % 64 == 0 and SQ <= SKV)
+    tl.static_assert(OWNER_ROWS == 192 or OWNER_ROWS == 256)
+    tl.static_assert(OWNER_FRAGMENTS == 2 or OWNER_FRAGMENTS == 3 or OWNER_FRAGMENTS == 4)
+    tl.static_assert(LOGICAL_N == 32 or LOGICAL_N == 64)
+    tl.static_assert(KV_PIPELINE_STAGES == 2)
+    tl.static_assert(STAT_MODE == _D64_MHA_POSITIVE_JIT or STAT_MODE == _D64_GQA_SIGNED_JIT)
+    score_pre_scaled: tl.constexpr = STAT_MODE == _D64_GQA_SIGNED_JIT
+
+    grid_owner_m: tl.constexpr = (OWNER_FRAGMENTS * 64 if GRID_OWNER_M == 0 else GRID_OWNER_M)
+    tl.static_assert(grid_owner_m == OWNER_ROWS)
+    num_owners: tl.constexpr = tl.cdiv(SQ, grid_owner_m)
+    launch_q_tiles: tl.constexpr = (num_owners if LAUNCH_Q_TILES == 0 else LAUNCH_Q_TILES)
+    group: tl.constexpr = HQ // HKV
+    value = tl.program_id(0)
+    if USE_DQ_XCD:
+        xcd = value % 8
+        value //= 8
+        q_in_group = value % group
+        value //= group
+        local_owner = value % launch_q_tiles
+        bkv_group = value // launch_q_tiles
+        bkv = bkv_group * 8 + xcd
+        pid_hkv = bkv % HKV
+        pid_b = bkv // HKV
+    else:
+        pid_hkv = value % HKV
+        value //= HKV
+        q_in_group = value % group
+        value //= group
+        local_owner = value % launch_q_tiles
+        pid_b = value // launch_q_tiles
+    pid_hq = pid_hkv * group + q_in_group
+    physical_owner = OWNER_PID_BASE + local_owner
+
+    reverse_owner = num_owners - 1 - physical_owner
+    pad: tl.constexpr = num_owners * grid_owner_m - SQ
+    raw_start = reverse_owner * grid_owner_m
+    owner_start = tl.maximum(raw_start - pad, 0)
+    owner_end = raw_start + grid_owner_m - pad
+    store_end = tl.minimum(owner_end, SQ)
+
+    q_head = (pid_b * HQ + pid_hq).to(tl.int64)
+    kv_head = (pid_b * HKV + pid_hkv).to(tl.int64)
+    q_base = q_head * SQ * D
+    kv_base = kv_head * SKV * D
+    stats_base = q_head * SQ
+
+    mma_mn: tl.constexpr = tlx.amd_mfma_layout(
+        version=4,
+        instr_shape=[16, 16, 32],
+        transposed=True,
+        warps_per_cta=[4, 1],
+    )
+    mma_md: tl.constexpr = tlx.amd_mfma_layout(
+        version=4,
+        instr_shape=[16, 16, 32],
+        transposed=True,
+        warps_per_cta=[4, 1],
+    )
+    q_op0_mn: tl.constexpr = tlx.dot_operand_layout(0, mma_mn, k_width=8)
+    kt_op1_mn: tl.constexpr = tlx.dot_operand_layout(1, mma_mn, k_width=8)
+    vt_op1_mn: tl.constexpr = tlx.dot_operand_layout(1, mma_mn, k_width=8)
+    ds_op0_md: tl.constexpr = tlx.dot_operand_layout(0, mma_md, k_width=4)
+    k_op1_md: tl.constexpr = tlx.dot_operand_layout(1, mma_md, k_width=4)
+
+    kv_async_layout: tl.constexpr = tlx.layout(
+        shape=((2, 2, 2, 2, 2, 2, 2, 2), (2, 2, 2, 2)),
+        stride=((8, 64, 128, 256, 512, 16, 32, 2048), (1, 2, 4, 1024)),
+    )
+    out_layout: tl.constexpr = tlx.layout(
+        shape=((2, 2, 2, 2, 2, 2, 2, 2), (2, 2, 2, 2)),
+        stride=((64, 128, 256, 512, 8, 16, 1024, 2048), (1, 2, 4, 32)),
+    )
+    shared_layout: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases(
+        [(512, 8)],
+        [
+            [0, 1],
+            [0, 2],
+            [0, 4],
+            [0, 8],
+            [1, 0],
+            [2, 0],
+            [4, 0],
+            [8, 0],
+            [0, 16],
+            [0, 32],
+            [16, 0],
+            [32, 0],
+        ],
+        [64, 64],
+    )
+    k_buffers = tlx.local_alloc((64, 64), tl.bfloat16, KV_PIPELINE_STAGES, layout=shared_layout)
+    v_buffers = tlx.local_alloc((64, 64), tl.bfloat16, KV_PIPELINE_STAGES, layout=shared_layout)
+
+    q0, do0, lse0, delta0, rows0 = _attn_bwd_dq_d64_causal_load_q64(
+        Q,
+        O,
+        DO,
+        LSE,
+        DELTA,
+        LSE_TERM,
+        q_base,
+        stats_base,
+        owner_start,
+        store_end,
+        SM_SCALE,
+        SQ,
+        D,
+        STAT_MODE,
+        q_op0_mn,
+    )
+    q1, do1, lse1, delta1, rows1 = _attn_bwd_dq_d64_causal_load_q64(
+        Q,
+        O,
+        DO,
+        LSE,
+        DELTA,
+        LSE_TERM,
+        q_base,
+        stats_base,
+        owner_start + 64,
+        store_end,
+        SM_SCALE,
+        SQ,
+        D,
+        STAT_MODE,
+        q_op0_mn,
+    )
+    if OWNER_FRAGMENTS >= 3:
+        q2, do2, lse2, delta2, rows2 = _attn_bwd_dq_d64_causal_load_q64(
+            Q,
+            O,
+            DO,
+            LSE,
+            DELTA,
+            LSE_TERM,
+            q_base,
+            stats_base,
+            owner_start + 128,
+            store_end,
+            SM_SCALE,
+            SQ,
+            D,
+            STAT_MODE,
+            q_op0_mn,
+        )
+    else:
+        q2, do2, lse2, delta2, rows2 = q0, do0, lse0, delta0, rows0
+    if OWNER_FRAGMENTS == 4:
+        q3, do3, lse3, delta3, rows3 = _attn_bwd_dq_d64_causal_load_q64(
+            Q,
+            O,
+            DO,
+            LSE,
+            DELTA,
+            LSE_TERM,
+            q_base,
+            stats_base,
+            owner_start + 192,
+            store_end,
+            SM_SCALE,
+            SQ,
+            D,
+            STAT_MODE,
+            q_op0_mn,
+        )
+        q3 = tlx.require_layout(q3, q_op0_mn, pin=False)
+        # One 64x64 bf16 fragment over four waves is eight 32-bit registers
+        # per thread, so one group keeps the complete fragment resident.
+        q3 = tlx.amd_register_resident(q3, register_class="agpr", registers_per_group=8)
+    else:
+        q3, do3, lse3, delta3, rows3 = q0, do0, lse0, delta0, rows0
+
+    dq0 = tlx.zeros((64, 64), tl.float32, layout=mma_md)
+    dq1 = tlx.zeros((64, 64), tl.float32, layout=mma_md)
+    dq2 = tlx.zeros((64, 64), tl.float32, layout=mma_md)
+    dq3 = tlx.zeros((64, 64), tl.float32, layout=mma_md)
+
+    offs_n = tl.arange(0, 64)
+    offs_d = tl.arange(0, D)
+    first_offsets = (offs_n[:, None] * D + offs_d[None, :]).to(tl.int32)
+    first_offsets = tlx.require_layout(first_offsets, kv_async_layout, pin=False)
+    first_k = tlx.buffer_load_to_local(tlx.local_view(k_buffers, 0), K + kv_base, first_offsets)
+    first_v = tlx.buffer_load_to_local(tlx.local_view(v_buffers, 0), V + kv_base, first_offsets)
+    tlx.async_load_commit_group([first_k, first_v])
+
+    bulk_end_block = (owner_start + (SKV - SQ)) // 64
+    end_n_block = tl.minimum(
+        (owner_end - 1 + (SKV - SQ)) // 64 + 1,
+        SKV // 64,
+    )
+    valid_fragments = (store_end - owner_start + 63) // 64
+    for n_block in range(0, bulk_end_block):
+        current_slot = n_block % 2
+        next_slot = 1 - current_slot
+        tl.debug_barrier()
+        # Every bulk block precedes at least one owner-tail block, so the
+        # successor is in range and becomes the tail prologue on the final
+        # iteration.
+        next_offsets = ((n_block + 1) * 64 * D + offs_n[:, None] * D + offs_d[None, :]).to(tl.int32)
+        next_offsets = tlx.require_layout(next_offsets, kv_async_layout, pin=False)
+        next_k = tlx.buffer_load_to_local(
+            tlx.local_view(k_buffers, next_slot),
+            K + kv_base,
+            next_offsets,
+        )
+        next_v = tlx.buffer_load_to_local(
+            tlx.local_view(v_buffers, next_slot),
+            V + kv_base,
+            next_offsets,
+        )
+        tlx.async_load_commit_group([next_k, next_v])
+        kv_wait = tlx.async_load_wait_group(1)
+        k_view = tlx.local_view(k_buffers, current_slot)
+        v_view = tlx.local_view(v_buffers, current_slot)
+        n0 = n_block * 64
+        if LOGICAL_N == 32 and OWNER_FRAGMENTS == 4:
+            dq0, dq1, dq2, dq3 = _attn_bwd_dq_d64_causal_m256_unmasked_n32(
+                dq0, dq1, dq2, dq3, q0, q1, q2, do0, do1, do2, lse0, lse1, lse2, lse3, delta0, delta1, delta2, delta3,
+                rows1, rows2, rows3, q3, do3, k_view, v_view, kv_wait, n0, SM_SCALE, SQ, SKV, D, 0, score_pre_scaled,
+                mma_mn, mma_md, q_op0_mn, kt_op1_mn, vt_op1_mn, ds_op0_md, k_op1_md)
+            dq0, dq1, dq2, dq3 = _attn_bwd_dq_d64_causal_m256_unmasked_n32(
+                dq0, dq1, dq2, dq3, q0, q1, q2, do0, do1, do2, lse0, lse1, lse2, lse3, delta0, delta1, delta2, delta3,
+                rows1, rows2, rows3, q3, do3, k_view, v_view, kv_wait, n0, SM_SCALE, SQ, SKV, D, 32, score_pre_scaled,
+                mma_mn, mma_md, q_op0_mn, kt_op1_mn, vt_op1_mn, ds_op0_md, k_op1_md)
+        elif LOGICAL_N == 32:
+            dq0, dq1, dq2, dq3 = _attn_bwd_dq_d64_causal_nslice(
+                dq0, dq1, dq2, dq3, q0, q1, q2, do0, do1, do2, lse0, lse1, lse2, lse3, delta0, delta1, delta2, delta3,
+                rows0, rows1, rows2, rows3, q3, do3, k_view, v_view, kv_wait, valid_fragments, 0, n0, SM_SCALE, SQ, SKV,
+                D, OWNER_FRAGMENTS, SKIP_OWNER_TAIL, 0, 32, False, False, score_pre_scaled, mma_mn, mma_md, q_op0_mn,
+                kt_op1_mn, vt_op1_mn, ds_op0_md, k_op1_md)
+            dq0, dq1, dq2, dq3 = _attn_bwd_dq_d64_causal_nslice(
+                dq0, dq1, dq2, dq3, q0, q1, q2, do0, do1, do2, lse0, lse1, lse2, lse3, delta0, delta1, delta2, delta3,
+                rows0, rows1, rows2, rows3, q3, do3, k_view, v_view, kv_wait, valid_fragments, 0, n0, SM_SCALE, SQ, SKV,
+                D, OWNER_FRAGMENTS, SKIP_OWNER_TAIL, 32, 32, False, False, score_pre_scaled, mma_mn, mma_md, q_op0_mn,
+                kt_op1_mn, vt_op1_mn, ds_op0_md, k_op1_md)
+        else:
+            dq0, dq1, dq2, dq3 = _attn_bwd_dq_d64_causal_nslice(
+                dq0, dq1, dq2, dq3, q0, q1, q2, do0, do1, do2, lse0, lse1, lse2, lse3, delta0, delta1, delta2, delta3,
+                rows0, rows1, rows2, rows3, q3, do3, k_view, v_view, kv_wait, valid_fragments, 0, n0, SM_SCALE, SQ, SKV,
+                D, OWNER_FRAGMENTS, SKIP_OWNER_TAIL, 0, 64, False, False, score_pre_scaled, mma_mn, mma_md, q_op0_mn,
+                kt_op1_mn, vt_op1_mn, ds_op0_md, k_op1_md)
+
+    static_full_tail: tl.constexpr = SQ % OWNER_ROWS == 0 and SKV > SQ
+    dynamic_tail_end = bulk_end_block if static_full_tail else end_n_block
+    for n_block in range(bulk_end_block, dynamic_tail_end):
+        current_slot = n_block % 2
+        next_slot = 1 - current_slot
+        tl.debug_barrier()
+        if n_block + 1 < end_n_block:
+            next_offsets = ((n_block + 1) * 64 * D + offs_n[:, None] * D + offs_d[None, :]).to(tl.int32)
+            next_offsets = tlx.require_layout(next_offsets, kv_async_layout, pin=False)
+            next_k = tlx.buffer_load_to_local(
+                tlx.local_view(k_buffers, next_slot),
+                K + kv_base,
+                next_offsets,
+            )
+            next_v = tlx.buffer_load_to_local(
+                tlx.local_view(v_buffers, next_slot),
+                V + kv_base,
+                next_offsets,
+            )
+            tlx.async_load_commit_group([next_k, next_v])
+            kv_wait = tlx.async_load_wait_group(1)
+        else:
+            kv_wait = tlx.async_load_wait_group(0)
+        k_view = tlx.local_view(k_buffers, current_slot)
+        v_view = tlx.local_view(v_buffers, current_slot)
+        n0 = n_block * 64
+        if LOGICAL_N == 32:
+            dq0, dq1, dq2, dq3 = _attn_bwd_dq_d64_causal_nslice(
+                dq0, dq1, dq2, dq3, q0, q1, q2, do0, do1, do2, lse0, lse1, lse2, lse3, delta0, delta1, delta2, delta3,
+                rows0, rows1, rows2, rows3, q3, do3, k_view, v_view, kv_wait, valid_fragments, n_block - bulk_end_block,
+                n0, SM_SCALE, SQ, SKV, D, OWNER_FRAGMENTS, SKIP_OWNER_TAIL, 0, 32, True, True, score_pre_scaled, mma_mn,
+                mma_md, q_op0_mn, kt_op1_mn, vt_op1_mn, ds_op0_md, k_op1_md)
+            dq0, dq1, dq2, dq3 = _attn_bwd_dq_d64_causal_nslice(
+                dq0, dq1, dq2, dq3, q0, q1, q2, do0, do1, do2, lse0, lse1, lse2, lse3, delta0, delta1, delta2, delta3,
+                rows0, rows1, rows2, rows3, q3, do3, k_view, v_view, kv_wait, valid_fragments, n_block - bulk_end_block,
+                n0, SM_SCALE, SQ, SKV, D, OWNER_FRAGMENTS, SKIP_OWNER_TAIL, 32, 32, True, True, score_pre_scaled,
+                mma_mn, mma_md, q_op0_mn, kt_op1_mn, vt_op1_mn, ds_op0_md, k_op1_md)
+        else:
+            dq0, dq1, dq2, dq3 = _attn_bwd_dq_d64_causal_nslice(
+                dq0, dq1, dq2, dq3, q0, q1, q2, do0, do1, do2, lse0, lse1, lse2, lse3, delta0, delta1, delta2, delta3,
+                rows0, rows1, rows2, rows3, q3, do3, k_view, v_view, kv_wait, valid_fragments, n_block - bulk_end_block,
+                n0, SM_SCALE, SQ, SKV, D, OWNER_FRAGMENTS, SKIP_OWNER_TAIL, 0, 64, True, True, score_pre_scaled, mma_mn,
+                mma_md, q_op0_mn, kt_op1_mn, vt_op1_mn, ds_op0_md, k_op1_md)
+    if static_full_tail:
+        for tail_step in tl.static_range(0, OWNER_FRAGMENTS):
+            dq0, dq1, dq2, dq3 = _attn_bwd_dq_d64_causal_full_tail_block(
+                dq0, dq1, dq2, dq3, q0, q1, q2, do0, do1, do2, do3, lse0, lse1, lse2, lse3, delta0, delta1, delta2,
+                delta3, rows0, rows1, rows2, rows3, q3, k_buffers, v_buffers, K, V, kv_base, bulk_end_block, SM_SCALE,
+                SQ, SKV, D, OWNER_FRAGMENTS, SKIP_OWNER_TAIL, LOGICAL_N, KV_PIPELINE_STAGES, tail_step,
+                score_pre_scaled, kv_async_layout, mma_mn, mma_md, q_op0_mn, kt_op1_mn, vt_op1_mn, ds_op0_md, k_op1_md)
+    tlx.async_load_wait_group(0)
+    tl.debug_barrier()
+
+    _attn_bwd_dq_d64_causal_store_q64(DQ, q_base, dq0, owner_start, store_end, SM_SCALE, D, out_layout)
+    if not SKIP_OWNER_TAIL or owner_start + 64 < store_end:
+        _attn_bwd_dq_d64_causal_store_q64(DQ, q_base, dq1, owner_start + 64, store_end, SM_SCALE, D, out_layout)
+    if OWNER_FRAGMENTS >= 3:
+        if not SKIP_OWNER_TAIL or owner_start + 128 < store_end:
+            _attn_bwd_dq_d64_causal_store_q64(DQ, q_base, dq2, owner_start + 128, store_end, SM_SCALE, D, out_layout)
+    if OWNER_FRAGMENTS == 4:
+        if not SKIP_OWNER_TAIL or owner_start + 192 < store_end:
+            _attn_bwd_dq_d64_causal_store_q64(DQ, q_base, dq3, owner_start + 192, store_end, SM_SCALE, D, out_layout)
+
+
+@triton.jit
+def _attn_bwd_dq_d64_causal_mha_kernel(
+    Q,
+    K,
+    V,
+    O,
+    DO,
+    LSE,
+    DELTA,
+    DQ,
+    SM_SCALE: tl.constexpr,
+    HQ: tl.constexpr,
+    HKV: tl.constexpr,
+    SQ: tl.constexpr,
+    SKV: tl.constexpr,
+    D: tl.constexpr,
+    OWNER_ROWS: tl.constexpr,
+    LOGICAL_N: tl.constexpr,
+    USE_DQ_XCD: tl.constexpr,
+    SKIP_OWNER_TAIL: tl.constexpr,
+    OWNER_PID_BASE: tl.constexpr,
+    LAUNCH_Q_TILES: tl.constexpr,
+    OWNER_FRAGMENTS: tl.constexpr,
+    GRID_OWNER_M: tl.constexpr,
+    KV_PIPELINE_STAGES: tl.constexpr,
+):
+    _attn_bwd_dq_d64_causal_impl(Q, K, V, O, DO, LSE, DELTA, DELTA, DQ, SM_SCALE, HQ, HKV, SQ, SKV, D, OWNER_ROWS,
+                                 LOGICAL_N, USE_DQ_XCD, SKIP_OWNER_TAIL, OWNER_PID_BASE, LAUNCH_Q_TILES,
+                                 OWNER_FRAGMENTS, GRID_OWNER_M, KV_PIPELINE_STAGES, _D64_MHA_POSITIVE_JIT)
+
+
+@triton.jit
+def _attn_bwd_dq_d64_causal_gqa8_kernel(
+    Q,
+    K,
+    V,
+    O,
+    DO,
+    LSE,
+    DELTA,
+    LSE_TERM,
+    DQ,
+    SM_SCALE: tl.constexpr,
+    HQ: tl.constexpr,
+    HKV: tl.constexpr,
+    SQ: tl.constexpr,
+    SKV: tl.constexpr,
+    D: tl.constexpr,
+    OWNER_ROWS: tl.constexpr,
+    LOGICAL_N: tl.constexpr,
+    USE_DQ_XCD: tl.constexpr,
+    SKIP_OWNER_TAIL: tl.constexpr,
+    OWNER_PID_BASE: tl.constexpr,
+    LAUNCH_Q_TILES: tl.constexpr,
+    OWNER_FRAGMENTS: tl.constexpr,
+    GRID_OWNER_M: tl.constexpr,
+    KV_PIPELINE_STAGES: tl.constexpr,
+):
+    _attn_bwd_dq_d64_causal_impl(Q, K, V, O, DO, LSE, DELTA, LSE_TERM, DQ, SM_SCALE, HQ, HKV, SQ, SKV, D, OWNER_ROWS,
+                                 LOGICAL_N, USE_DQ_XCD, SKIP_OWNER_TAIL, OWNER_PID_BASE, LAUNCH_Q_TILES,
+                                 OWNER_FRAGMENTS, GRID_OWNER_M, KV_PIPELINE_STAGES, _D64_GQA_SIGNED_JIT)
+
+
+@triton.jit
+def _d64_mha_issue_stage(
+    Q,
+    DO,
+    LSE,
+    Delta,
+    q_dst,
+    do_dst,
+    lse_dst,
+    delta_dst,
+    m_blk,
+    D: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    q_async_layout: tl.constexpr,
+    stats_async_layout: tl.constexpr,
+):
+    """Stage one complete BM32 Q/dO/natural-stat tile."""
+    rows = m_blk * BLOCK_M + tl.arange(0, BLOCK_M)
+    cols = tl.arange(0, D)
+    q_offsets = (rows[:, None] * D + cols[None, :]).to(tl.int32)
+    q_offsets = tlx.require_layout(q_offsets, q_async_layout, pin=False)
+    stats_offsets = tlx.require_layout(rows.to(tl.int32), stats_async_layout, pin=False)
+    q_token = tlx.buffer_load_to_local(q_dst, Q, q_offsets)
+    do_token = tlx.buffer_load_to_local(do_dst, DO, q_offsets)
+    lse = tlx.buffer_load(LSE, stats_offsets)
+    delta = tlx.buffer_load(Delta, stats_offsets)
+    tlx.local_store(lse_dst, lse)
+    tlx.local_store(delta_dst, delta)
+    tlx.async_load_commit_group([q_token, do_token])
+
+
+@triton.jit
+def _d64_mha_positive_front(
+    q_view,
+    do_view,
+    lse_view,
+    delta_view,
+    stage_wait,
+    k_nm,
+    v_nm,
+    m_blk,
+    n0,
+    SM_SCALE: tl.constexpr,
+    SQ: tl.constexpr,
+    SKV: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    APPLY_CAUSAL_MASK: tl.constexpr,
+    mma_nm: tl.constexpr,
+    q_t_op1_nm: tl.constexpr,
+    p_op0_nd: tl.constexpr,
+):
+    """Reconstruct positive-ABI P and dS from one staged BM32 tile."""
+    log2e: tl.constexpr = 1.4426950408889634
+    q_t = tlx.local_load(tlx.local_trans(q_view), token=stage_wait, layout=q_t_op1_nm)
+    do_t = tlx.local_load(tlx.local_trans(do_view), token=stage_wait, layout=q_t_op1_nm)
+    lse = tlx.local_load(lse_view, token=stage_wait, relaxed=True)
+    delta = tlx.local_load(delta_view, token=stage_wait, relaxed=True)
+
+    scores = tlx.zeros((BLOCK_N, BLOCK_M), tl.float32, layout=mma_nm)
+    scores = tl.dot(k_nm, q_t, acc=scores, out_dtype=tl.float32)
+    score_scale = tlx.require_layout(
+        tl.full((BLOCK_N, BLOCK_M), SM_SCALE, tl.float32),
+        mma_nm,
+        pin=False,
+    )
+    lse_nm = tlx.require_layout(
+        tl.broadcast_to(lse[None, :], (BLOCK_N, BLOCK_M)),
+        mma_nm,
+        pin=False,
+    )
+    log2e_nm = tlx.require_layout(
+        tl.full((BLOCK_N, BLOCK_M), log2e, tl.float32),
+        mma_nm,
+        pin=False,
+    )
+    # P = exp2((QK * SM_SCALE - LSE) * log2(e)).
+    scores = (scores * score_scale - lse_nm) * log2e_nm
+    if APPLY_CAUSAL_MASK:
+        rows = m_blk * BLOCK_M + tl.arange(0, BLOCK_M)
+        cols = n0 + tl.arange(0, BLOCK_N)
+        valid = cols[:, None] <= rows[None, :] + (SKV - SQ)
+        valid = tlx.require_layout(valid, mma_nm, pin=False)
+        negative_inf = tlx.require_layout(
+            tl.full(
+                (BLOCK_N, BLOCK_M),
+                float("-inf"),
+                tl.float32,
+            ),
+            mma_nm,
+            pin=False,
+        )
+        scores = tl.where(valid, scores, negative_inf)
+    p = tlx.require_layout(tl.math.exp2(scores), mma_nm, pin=False)
+
+    dp = tlx.zeros((BLOCK_N, BLOCK_M), tl.float32, layout=mma_nm)
+    dp = tl.dot(v_nm, do_t, acc=dp, out_dtype=tl.float32)
+    delta_nm = tlx.require_layout(
+        tl.broadcast_to(delta[None, :], (BLOCK_N, BLOCK_M)),
+        mma_nm,
+        pin=False,
+    )
+    # dS = P * (dO @ V.T - Delta).
+    ds = p * (dp - delta_nm)
+    p_nd = tlx.require_layout(p.to(tl.bfloat16), p_op0_nd, pin=False)
+    ds_nd = tlx.require_layout(ds.to(tl.bfloat16), p_op0_nd, pin=False)
+    return p_nd, ds_nd
+
+
+@triton.jit
+def _d64_mha_step(
+    dk,
+    dv,
+    q_view,
+    do_view,
+    lse_view,
+    delta_view,
+    stage_wait,
+    k_nm,
+    v_nm,
+    m_blk,
+    n0,
+    SM_SCALE: tl.constexpr,
+    SQ: tl.constexpr,
+    SKV: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    APPLY_CAUSAL_MASK: tl.constexpr,
+    mma_nm: tl.constexpr,
+    mma_nd: tl.constexpr,
+    q_t_op1_nm: tl.constexpr,
+    p_op0_nd: tl.constexpr,
+    q_op1_nd: tl.constexpr,
+):
+    dk = tlx.require_layout(dk, mma_nd, pin=False)
+    dv = tlx.require_layout(dv, mma_nd, pin=False)
+    p_nd, ds_nd = _d64_mha_positive_front(
+        q_view,
+        do_view,
+        lse_view,
+        delta_view,
+        stage_wait,
+        k_nm,
+        v_nm,
+        m_blk,
+        n0,
+        SM_SCALE,
+        SQ,
+        SKV,
+        BLOCK_M,
+        BLOCK_N,
+        APPLY_CAUSAL_MASK,
+        mma_nm,
+        q_t_op1_nm,
+        p_op0_nd,
+    )
+    do_nd = tlx.local_load(do_view, token=stage_wait, layout=q_op1_nd)
+    q_nd = tlx.local_load(q_view, token=stage_wait, layout=q_op1_nd)
+    dv = tl.dot(p_nd, do_nd, acc=dv, out_dtype=tl.float32)
+    dk = tl.dot(ds_nd, q_nd, acc=dk, out_dtype=tl.float32)
+    return (
+        tlx.require_layout(dk, mma_nd, pin=False),
+        tlx.require_layout(dv, mma_nd, pin=False),
+    )
+
+
+@triton.jit
+def _d64_mha_consume(
+    dk,
+    dv,
+    q_view,
+    do_view,
+    lse_view,
+    delta_view,
+    stage_wait,
+    k_nm,
+    v_nm,
+    m_blk,
+    n0,
+    SM_SCALE: tl.constexpr,
+    SQ: tl.constexpr,
+    SKV: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    mma_nm: tl.constexpr,
+    mma_nd: tl.constexpr,
+    q_t_op1_nm: tl.constexpr,
+    p_op0_nd: tl.constexpr,
+    q_op1_nd: tl.constexpr,
+):
+    dk = tlx.require_layout(dk, mma_nd, pin=False)
+    dv = tlx.require_layout(dv, mma_nd, pin=False)
+    if n0 + BLOCK_N - 1 > m_blk * BLOCK_M + (SKV - SQ):
+        dk, dv = _d64_mha_step(
+            dk,
+            dv,
+            q_view,
+            do_view,
+            lse_view,
+            delta_view,
+            stage_wait,
+            k_nm,
+            v_nm,
+            m_blk,
+            n0,
+            SM_SCALE,
+            SQ,
+            SKV,
+            D,
+            BLOCK_M,
+            BLOCK_N,
+            True,
+            mma_nm,
+            mma_nd,
+            q_t_op1_nm,
+            p_op0_nd,
+            q_op1_nd,
+        )
+        dk = tlx.require_layout(dk, mma_nd, pin=False)
+        dv = tlx.require_layout(dv, mma_nd, pin=False)
+    else:
+        dk, dv = _d64_mha_step(
+            dk,
+            dv,
+            q_view,
+            do_view,
+            lse_view,
+            delta_view,
+            stage_wait,
+            k_nm,
+            v_nm,
+            m_blk,
+            n0,
+            SM_SCALE,
+            SQ,
+            SKV,
+            D,
+            BLOCK_M,
+            BLOCK_N,
+            False,
+            mma_nm,
+            mma_nd,
+            q_t_op1_nm,
+            p_op0_nd,
+            q_op1_nd,
+        )
+        dk = tlx.require_layout(dk, mma_nd, pin=False)
+        dv = tlx.require_layout(dv, mma_nd, pin=False)
+    return (
+        tlx.require_layout(dk, mma_nd, pin=False),
+        tlx.require_layout(dv, mma_nd, pin=False),
+    )
+
+
+@triton.jit
+def _attn_bwd_dkdv_d64_causal_mha_kernel(
+    Q,
+    K,
+    V,
+    DO,
+    LSE,
+    Delta,
+    DK,
+    DV,
+    SM_SCALE: tl.constexpr,
+    HQ: tl.constexpr,
+    HKV: tl.constexpr,
+    SQ: tl.constexpr,
+    SKV: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    LSE_MODE: tl.constexpr,
+    DELTA_MODE: tl.constexpr,
+):
+    """Two-wave BM32/BN64 causal MHA owner with direct publication."""
+    tl.static_assert(HQ == HKV)
+    tl.static_assert(D == 64)
+    tl.static_assert(BLOCK_M == 32)
+    tl.static_assert(BLOCK_N == 64)
+    tl.static_assert(SQ % BLOCK_M == 0 and SKV % BLOCK_N == 0)
+    tl.static_assert(SQ % 64 == 0 and SKV % 64 == 0)
+    tl.static_assert(SQ <= SKV)
+    tl.static_assert(LSE_MODE == _D64_LSE_NATURAL_LOG_JIT)
+    tl.static_assert(DELTA_MODE == _D64_DELTA_POSITIVE_JIT)
+
+    value = tl.program_id(0)
+    nt = SKV // BLOCK_N
+    pid_n = value % nt
+    value //= nt
+    pid_hkv = value % HKV
+    pid_b = value // HKV
+    n0 = pid_n * BLOCK_N
+
+    mma_nm: tl.constexpr = tlx.amd_mfma_layout(
+        version=4,
+        instr_shape=[16, 16, 32],
+        transposed=True,
+        warps_per_cta=[2, 1],
+    )
+    mma_nd: tl.constexpr = tlx.amd_mfma_layout(
+        version=4,
+        instr_shape=[16, 16, 32],
+        transposed=True,
+        warps_per_cta=[2, 1],
+    )
+    k_op0_nm: tl.constexpr = tlx.dot_operand_layout(0, mma_nm, k_width=8)
+    v_op0_nm: tl.constexpr = tlx.dot_operand_layout(0, mma_nm, k_width=8)
+    q_t_op1_nm: tl.constexpr = tlx.dot_operand_layout(1, mma_nm, k_width=8)
+    p_op0_nd: tl.constexpr = tlx.dot_operand_layout(0, mma_nd, k_width=4)
+    q_op1_nd: tl.constexpr = tlx.dot_operand_layout(1, mma_nd, k_width=4)
+
+    # Two waves cooperatively copy one BM32xD64 tile with D8 vectors.
+    q_async_layout: tl.constexpr = tlx.layout(
+        shape=((2, 2, 2, 2, 2, 2, 2), (2, 2, 2, 2)),
+        stride=((8, 64, 128, 256, 512, 16, 32), (1, 2, 4, 1024)),
+    )
+    stats_async_layout: tl.constexpr = tlx.layout(
+        shape=((32, 4), ()),
+        stride=((1, 0), ()),
+    )
+    out_layout: tl.constexpr = tlx.layout(
+        shape=((2, 2, 2, 2, 2, 2, 2), (2, 2, 2, 2, 2)),
+        stride=(
+            (64, 128, 256, 512, 8, 16, 1024),
+            (1, 2, 4, 32, 2048),
+        ),
+    )
+    qdo_smem_layout: tl.constexpr = tlx.shared_linear_layout_encoding(
+        offset_bases=[
+            [0, 1],
+            [0, 2],
+            [0, 4],
+            [0, 8],
+            [1, 0],
+            [2, 0],
+            [4, 0],
+            [8, 0],
+            [0, 16],
+            [0, 32],
+            [16, 0],
+        ],
+        block_bases=[],
+        alignment=16,
+    )
+    stats_smem_layout: tl.constexpr = tlx.shared_linear_layout_encoding(
+        offset_bases=[[1], [2], [4], [8], [16]],
+        block_bases=[],
+        alignment=4,
+    )
+    q_ring = tlx.local_alloc((BLOCK_M, D), tl.bfloat16, 2, layout=qdo_smem_layout)
+    do_ring = tlx.local_alloc((BLOCK_M, D), tl.bfloat16, 2, layout=qdo_smem_layout)
+    lse_ring = tlx.local_alloc((BLOCK_M, ), tl.float32, 2, layout=stats_smem_layout)
+    delta_ring = tlx.local_alloc((BLOCK_M, ), tl.float32, 2, layout=stats_smem_layout)
+
+    # K/V are loaded once in their final MFMA operand layouts and remain
+    # resident through the complete bottom-right query frontier.
+    kv_head = (pid_b * HKV + pid_hkv).to(tl.int64)
+    kv_base = kv_head * SKV * D
+    kv_rows = n0 + tl.arange(0, BLOCK_N)
+    kv_cols = tl.arange(0, D)
+    kv_offsets = (kv_rows[:, None] * D + kv_cols[None, :]).to(tl.int32)
+    k_offsets = tlx.require_layout(kv_offsets, k_op0_nm, pin=False)
+    v_offsets = tlx.require_layout(kv_offsets, v_op0_nm, pin=False)
+    k_nm = tlx.buffer_load(K + kv_base, k_offsets)
+    k_nm = tlx.require_layout(k_nm, k_op0_nm, pin=False)
+    v_nm = tlx.buffer_load(V + kv_base, v_offsets)
+    v_nm = tlx.require_layout(v_nm, v_op0_nm, pin=False)
+
+    q_head = (pid_b * HQ + pid_hkv).to(tl.int64)
+    q_base = Q + q_head * SQ * D
+    do_base = DO + q_head * SQ * D
+    stats_base = q_head * SQ
+    lse_base = LSE + stats_base
+    delta_base = Delta + stats_base
+    start_m_blk = tl.maximum((n0 - (SKV - SQ)) // BLOCK_M, 0)
+
+    dk = tlx.zeros((BLOCK_N, D), tl.float32, layout=mma_nd)
+    dv = tlx.zeros((BLOCK_N, D), tl.float32, layout=mma_nd)
+    full_pairs: tl.constexpr = SQ // (2 * BLOCK_M)
+    _d64_mha_issue_stage(
+        q_base,
+        do_base,
+        lse_base,
+        delta_base,
+        tlx.local_view(q_ring, 0),
+        tlx.local_view(do_ring, 0),
+        tlx.local_view(lse_ring, 0),
+        tlx.local_view(delta_ring, 0),
+        start_m_blk,
+        D,
+        BLOCK_M,
+        q_async_layout,
+        stats_async_layout,
+    )
+    for m_pair in range(start_m_blk // 2, full_pairs):
+        m_blk_a = m_pair * 2
+        m_blk_b = m_blk_a + 1
+        _d64_mha_issue_stage(
+            q_base,
+            do_base,
+            lse_base,
+            delta_base,
+            tlx.local_view(q_ring, 1),
+            tlx.local_view(do_ring, 1),
+            tlx.local_view(lse_ring, 1),
+            tlx.local_view(delta_ring, 1),
+            m_blk_b,
+            D,
+            BLOCK_M,
+            q_async_layout,
+            stats_async_layout,
+        )
+        stage_wait = tlx.async_load_wait_group(1)
+        dk, dv = _d64_mha_consume(
+            dk,
+            dv,
+            tlx.local_view(q_ring, 0),
+            tlx.local_view(do_ring, 0),
+            tlx.local_view(lse_ring, 0),
+            tlx.local_view(delta_ring, 0),
+            stage_wait,
+            k_nm,
+            v_nm,
+            m_blk_a,
+            n0,
+            SM_SCALE,
+            SQ,
+            SKV,
+            D,
+            BLOCK_M,
+            BLOCK_N,
+            mma_nm,
+            mma_nd,
+            q_t_op1_nm,
+            p_op0_nd,
+            q_op1_nd,
+        )
+        has_next = m_pair + 1 < full_pairs
+        if has_next:
+            # Retire every relaxed view before overwriting the ping slot.
+            tl.debug_barrier()
+            _d64_mha_issue_stage(
+                q_base,
+                do_base,
+                lse_base,
+                delta_base,
+                tlx.local_view(q_ring, 0),
+                tlx.local_view(do_ring, 0),
+                tlx.local_view(lse_ring, 0),
+                tlx.local_view(delta_ring, 0),
+                m_blk_a + 2,
+                D,
+                BLOCK_M,
+                q_async_layout,
+                stats_async_layout,
+            )
+            stage_wait = tlx.async_load_wait_group(1)
+        else:
+            stage_wait = tlx.async_load_wait_group(0)
+        dk, dv = _d64_mha_consume(
+            dk,
+            dv,
+            tlx.local_view(q_ring, 1),
+            tlx.local_view(do_ring, 1),
+            tlx.local_view(lse_ring, 1),
+            tlx.local_view(delta_ring, 1),
+            stage_wait,
+            k_nm,
+            v_nm,
+            m_blk_b,
+            n0,
+            SM_SCALE,
+            SQ,
+            SKV,
+            D,
+            BLOCK_M,
+            BLOCK_N,
+            mma_nm,
+            mma_nd,
+            q_t_op1_nm,
+            p_op0_nd,
+            q_op1_nd,
+        )
+        if has_next:
+            # Slot one is reused at the top of the next pair.
+            tl.debug_barrier()
+
+    dk_scale = tlx.require_layout(
+        tl.full((BLOCK_N, D), SM_SCALE, tl.float32),
+        mma_nd,
+        pin=False,
+    )
+    dk = tlx.require_layout(dk, mma_nd, pin=False) * dk_scale
+    dv = tlx.require_layout(dv, mma_nd, pin=False)
+    output_offsets = (tl.arange(0, BLOCK_N)[:, None] * D + tl.arange(0, D)[None, :]).to(tl.int32)
+    output_offsets = tlx.require_layout(output_offsets, out_layout, pin=False)
+    dk_out = tlx.require_layout(dk.to(tl.bfloat16), out_layout, pin=False)
+    dv_out = tlx.require_layout(dv.to(tl.bfloat16), out_layout, pin=False)
+    output_base = kv_head * SKV * D + n0 * D
+    tlx.buffer_store(dk_out, DK + output_base, output_offsets)
+    tlx.buffer_store(dv_out, DV + output_base, output_offsets)
+
+
+@triton.jit
+def _d64_gqa8_issue_stage(
+    Q,
+    DO,
+    LSE_TERM,
+    Delta,
+    q_dst,
+    do_dst,
+    lse_dst,
+    delta_dst,
+    m_blk,
+    D: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    q_async_layout: tl.constexpr,
+    stats_async_layout: tl.constexpr,
+):
+    """Issue one complete Q/dO/signed-stat tile as one async group."""
+    rows = m_blk * BLOCK_M + tl.arange(0, BLOCK_M)
+    cols = tl.arange(0, D)
+    q_offsets = (rows[:, None] * D + cols[None, :]).to(tl.int32)
+    q_offsets = tlx.require_layout(q_offsets, q_async_layout, pin=False)
+    stats_offsets = tlx.require_layout(rows.to(tl.int32), stats_async_layout, pin=False)
+    q_token = tlx.buffer_load_to_local(q_dst, Q, q_offsets)
+    do_token = tlx.buffer_load_to_local(do_dst, DO, q_offsets)
+    lse_token = tlx.buffer_load_to_local(lse_dst, LSE_TERM, stats_offsets)
+    delta_token = tlx.buffer_load_to_local(delta_dst, Delta, stats_offsets)
+    tlx.async_load_commit_group([q_token, do_token, lse_token, delta_token])
+
+
+@triton.jit
+def _d64_gqa8_issue_qdo_stage(
+    Q,
+    DO,
+    q_dst,
+    do_dst,
+    m_blk,
+    D: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    q_async_layout: tl.constexpr,
+):
+    """Issue one Q/dO tile as an async group."""
+    rows = m_blk * BLOCK_M + tl.arange(0, BLOCK_M)
+    cols = tl.arange(0, D)
+    q_offsets = (rows[:, None] * D + cols[None, :]).to(tl.int32)
+    q_offsets = tlx.require_layout(q_offsets, q_async_layout, pin=False)
+    q_token = tlx.buffer_load_to_local(q_dst, Q, q_offsets)
+    do_token = tlx.buffer_load_to_local(do_dst, DO, q_offsets)
+    tlx.async_load_commit_group([q_token, do_token])
+
+
+@triton.jit
+def _d64_gqa8_issue_stats4_qdo_stage(
+    Q,
+    DO,
+    LSE_TERM,
+    Delta,
+    q_dst,
+    do_dst,
+    lse_dst,
+    delta_dst,
+    qdo_m_blk,
+    first_stats_m_blk,
+    D: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    q_async_layout: tl.constexpr,
+    stats4_async_layout: tl.constexpr,
+):
+    """Issue Q/dO plus four contiguous statistics tiles as one async group."""
+    rows = qdo_m_blk * BLOCK_M + tl.arange(0, BLOCK_M)
+    cols = tl.arange(0, D)
+    q_offsets = (rows[:, None] * D + cols[None, :]).to(tl.int32)
+    q_offsets = tlx.require_layout(q_offsets, q_async_layout, pin=False)
+    stats_offsets = first_stats_m_blk * BLOCK_M + tl.arange(0, 4 * BLOCK_M)
+    stats_offsets = tl.reshape(stats_offsets, (4, BLOCK_M)).to(tl.int32)
+    stats_offsets = tlx.require_layout(stats_offsets, stats4_async_layout, pin=False)
+    q_token = tlx.buffer_load_to_local(q_dst, Q, q_offsets)
+    do_token = tlx.buffer_load_to_local(do_dst, DO, q_offsets)
+    lse_token = tlx.buffer_load_to_local(lse_dst, LSE_TERM, stats_offsets)
+    delta_token = tlx.buffer_load_to_local(delta_dst, Delta, stats_offsets)
+    tlx.async_load_commit_group([q_token, do_token, lse_token, delta_token])
+
+
+@triton.jit
+def _d64_gqa8_signed_front(
+    q_view,
+    do_view,
+    lse_view,
+    delta_view,
+    stage_wait,
+    k_nm,
+    v_nm,
+    m_blk,
+    n0,
+    SM_SCALE: tl.constexpr,
+    SQ: tl.constexpr,
+    SKV: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    APPLY_CAUSAL_MASK,
+    LATE_DO_T: tl.constexpr,
+    STATS_RANK2: tl.constexpr,
+    mma_nm: tl.constexpr,
+    q_t_op1_nm: tl.constexpr,
+    p_op0_nd: tl.constexpr,
+):
+    """Compute signed-ABI P and dS from one staged BM64 query tile."""
+    q_t = tlx.local_load(tlx.local_trans(q_view), token=stage_wait, layout=q_t_op1_nm)
+    if not LATE_DO_T:
+        do_t = tlx.local_load(tlx.local_trans(do_view), token=stage_wait, layout=q_t_op1_nm)
+    lse_term = tlx.local_load(lse_view, token=stage_wait, relaxed=True)
+    negative_delta = tlx.local_load(delta_view, token=stage_wait, relaxed=True)
+    if STATS_RANK2:
+        lse_term = tl.reshape(lse_term, (BLOCK_M, ))
+        negative_delta = tl.reshape(negative_delta, (BLOCK_M, ))
+
+    # Selected GQA publishes the log2-domain -LSE term. K is resident and
+    # pre-scaled once, so no per-score or per-owner scaling remains here.
+    scores = tlx.require_layout(
+        tl.broadcast_to(lse_term[None, :], (BLOCK_N, BLOCK_M)),
+        mma_nm,
+        pin=False,
+    )
+    scores = tl.dot(k_nm, q_t, acc=scores, out_dtype=tl.float32)
+    if APPLY_CAUSAL_MASK:
+        rows = m_blk * BLOCK_M + tl.arange(0, BLOCK_M)
+        cols = n0 + tl.arange(0, BLOCK_N)
+        valid = cols[:, None] <= rows[None, :] + (SKV - SQ)
+        valid = tlx.require_layout(valid, mma_nm, pin=False)
+        negative_inf = tlx.require_layout(
+            tl.full(
+                (BLOCK_N, BLOCK_M),
+                float("-inf"),
+                tl.float32,
+            ),
+            mma_nm,
+            pin=False,
+        )
+        scores = tl.where(valid, scores, negative_inf)
+    p = tlx.require_layout(tl.math.exp2(scores), mma_nm, pin=False)
+
+    # Selected GQA publishes negative Delta, so this accumulator is exactly
+    # dO@V^T+delta before the P product.
+    dp = tlx.require_layout(
+        tl.broadcast_to(tl.reshape(negative_delta, (1, BLOCK_M)), (BLOCK_N, BLOCK_M)),
+        mma_nm,
+        pin=False,
+    )
+    if LATE_DO_T:
+        # The full-width gradient recurrence benefits when dO starts after the
+        # independent score/exp work and does not remain live across it.
+        do_t = tlx.local_load(tlx.local_trans(do_view), token=stage_wait, layout=q_t_op1_nm)
+    dp = tl.dot(v_nm, do_t, acc=dp, out_dtype=tl.float32)
+    ds = p * dp
+    ds = tlx.amd_register_handoff(
+        ds,
+        register_class="vgpr",
+    )
+    p_nd = tlx.require_layout(p.to(tl.bfloat16), p_op0_nd, pin=False)
+    ds_nd = tlx.require_layout(ds.to(tl.bfloat16), p_op0_nd, pin=False)
+    return p_nd, ds_nd
+
+
+@triton.jit
+def _d64_gqa8_signed_front_loaded_stats(
+    q_view,
+    do_view,
+    lse_values,
+    delta_values,
+    stage_wait,
+    k_nm,
+    v_nm,
+    m_blk,
+    n0,
+    SM_SCALE: tl.constexpr,
+    SQ: tl.constexpr,
+    SKV: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    APPLY_CAUSAL_MASK,
+    BATCHED_STATS: tl.constexpr,
+    STATS_STEP: tl.constexpr,
+    mma_nm: tl.constexpr,
+    q_t_op1_nm: tl.constexpr,
+    p_op0_nd: tl.constexpr,
+):
+    """Signed GQA front for register or four-tile shared statistics."""
+    q_t = tlx.local_load(tlx.local_trans(q_view), token=stage_wait, layout=q_t_op1_nm)
+    if BATCHED_STATS:
+        tl.static_assert(STATS_STEP >= 0 and STATS_STEP < 4)
+        lse_view = tlx.local_slice(lse_values, [STATS_STEP, 0], [1, BLOCK_M])
+        lse_term = tl.reshape(tlx.local_load(lse_view, relaxed=True), (BLOCK_M, ))
+    else:
+        lse_term = lse_values
+    scores = tlx.require_layout(
+        tl.broadcast_to(lse_term[None, :], (BLOCK_N, BLOCK_M)),
+        mma_nm,
+        pin=False,
+    )
+    scores = tl.dot(k_nm, q_t, acc=scores, out_dtype=tl.float32)
+    if APPLY_CAUSAL_MASK:
+        rows = m_blk * BLOCK_M + tl.arange(0, BLOCK_M)
+        cols = n0 + tl.arange(0, BLOCK_N)
+        valid = cols[:, None] <= rows[None, :] + (SKV - SQ)
+        valid = tlx.require_layout(valid, mma_nm, pin=False)
+        negative_inf = tlx.require_layout(
+            tl.full((BLOCK_N, BLOCK_M), float("-inf"), tl.float32),
+            mma_nm,
+            pin=False,
+        )
+        scores = tl.where(valid, scores, negative_inf)
+    p = tlx.require_layout(tl.math.exp2(scores), mma_nm, pin=False)
+    if BATCHED_STATS:
+        delta_view = tlx.local_slice(delta_values, [STATS_STEP, 0], [1, BLOCK_M])
+        negative_delta = tl.reshape(tlx.local_load(delta_view, relaxed=True), (BLOCK_M, ))
+    else:
+        negative_delta = delta_values
+    dp = tlx.require_layout(
+        tl.broadcast_to(tl.reshape(negative_delta, (1, BLOCK_M)), (BLOCK_N, BLOCK_M)),
+        mma_nm,
+        pin=False,
+    )
+    do_t = tlx.local_load(tlx.local_trans(do_view), token=stage_wait, layout=q_t_op1_nm)
+    dp = tl.dot(v_nm, do_t, acc=dp, out_dtype=tl.float32)
+    ds = tlx.amd_register_handoff(
+        p * dp,
+        register_class="vgpr",
+    )
+    p_nd = tlx.require_layout(p.to(tl.bfloat16), p_op0_nd, pin=False)
+    ds_nd = tlx.require_layout(ds.to(tl.bfloat16), p_op0_nd, pin=False)
+    return p_nd, ds_nd
+
+
+@triton.jit
+def _d64_gqa8_direct_d64_step(
+    dk,
+    dv,
+    q_view,
+    do_view,
+    lse_view,
+    delta_view,
+    stage_wait,
+    k_nm,
+    v_nm,
+    m_blk,
+    n0,
+    SM_SCALE: tl.constexpr,
+    SQ: tl.constexpr,
+    SKV: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    APPLY_CAUSAL_MASK,
+    STATS_RANK2: tl.constexpr,
+    mma_nm: tl.constexpr,
+    mma_nd: tl.constexpr,
+    q_t_op1_nm: tl.constexpr,
+    p_op0_nd: tl.constexpr,
+    q_op1_nd: tl.constexpr,
+):
+    dk = tlx.require_layout(dk, mma_nd, pin=False)
+    dv = tlx.require_layout(dv, mma_nd, pin=False)
+    p_nd, ds_nd = _d64_gqa8_signed_front(
+        q_view,
+        do_view,
+        lse_view,
+        delta_view,
+        stage_wait,
+        k_nm,
+        v_nm,
+        m_blk,
+        n0,
+        SM_SCALE,
+        SQ,
+        SKV,
+        D,
+        BLOCK_M,
+        BLOCK_N,
+        APPLY_CAUSAL_MASK,
+        True,
+        STATS_RANK2,
+        mma_nm,
+        q_t_op1_nm,
+        p_op0_nd,
+    )
+    p_nd = tlx.require_layout(p_nd, p_op0_nd, pin=False)
+    ds_nd = tlx.require_layout(ds_nd, p_op0_nd, pin=False)
+    do_nd = tlx.local_load(do_view, token=stage_wait, layout=q_op1_nd)
+    dv = tl.dot(p_nd, do_nd, acc=dv, out_dtype=tl.float32)
+    # Retire the dV operand before materializing Q for the independent dK
+    # update. This preserves the algorithmic order while shortening the
+    # simultaneous operand lifetime in the full-D recurrence.
+    q_nd = tlx.local_load(q_view, token=stage_wait, layout=q_op1_nd)
+    dk = tl.dot(ds_nd, q_nd, acc=dk, out_dtype=tl.float32)
+    return (
+        tlx.require_layout(dk, mma_nd, pin=False),
+        tlx.require_layout(dv, mma_nd, pin=False),
+    )
+
+
+@triton.jit
+def _d64_gqa8_d32_step(
+    dk_d0,
+    dk_d1,
+    dv_d0,
+    dv_d1,
+    q_view,
+    do_view,
+    lse_view,
+    delta_view,
+    stage_wait,
+    k_nm,
+    v_nm,
+    m_blk,
+    n0,
+    SM_SCALE: tl.constexpr,
+    SQ: tl.constexpr,
+    SKV: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    APPLY_CAUSAL_MASK,
+    INTERLEAVED_D32: tl.constexpr,
+    mma_nm: tl.constexpr,
+    mma_nd: tl.constexpr,
+    q_t_op1_nm: tl.constexpr,
+    p_op0_nd: tl.constexpr,
+    q_op1_nd: tl.constexpr,
+):
+    dk_d0 = tlx.require_layout(dk_d0, mma_nd, pin=False)
+    dk_d1 = tlx.require_layout(dk_d1, mma_nd, pin=False)
+    dv_d0 = tlx.require_layout(dv_d0, mma_nd, pin=False)
+    dv_d1 = tlx.require_layout(dv_d1, mma_nd, pin=False)
+    p_nd, ds_nd = _d64_gqa8_signed_front(
+        q_view,
+        do_view,
+        lse_view,
+        delta_view,
+        stage_wait,
+        k_nm,
+        v_nm,
+        m_blk,
+        n0,
+        SM_SCALE,
+        SQ,
+        SKV,
+        D,
+        BLOCK_M,
+        BLOCK_N,
+        APPLY_CAUSAL_MASK,
+        False,
+        False,
+        mma_nm,
+        q_t_op1_nm,
+        p_op0_nd,
+    )
+    if INTERLEAVED_D32:
+        # Interleave low dV/dK then high dV/dK recurrences.
+        do_d0 = tlx.local_load(
+            tlx.local_slice(do_view, [0, 0], [BLOCK_M, D // 2]),
+            token=stage_wait,
+            layout=q_op1_nd,
+        )
+        dv_d0 = tl.dot(p_nd, do_d0, acc=dv_d0, out_dtype=tl.float32)
+        q_d0 = tlx.local_load(
+            tlx.local_slice(q_view, [0, 0], [BLOCK_M, D // 2]),
+            token=stage_wait,
+            layout=q_op1_nd,
+        )
+        dk_d0 = tl.dot(ds_nd, q_d0, acc=dk_d0, out_dtype=tl.float32)
+        do_d1 = tlx.local_load(
+            tlx.local_slice(do_view, [0, D // 2], [BLOCK_M, D // 2]),
+            token=stage_wait,
+            layout=q_op1_nd,
+        )
+        dv_d1 = tl.dot(p_nd, do_d1, acc=dv_d1, out_dtype=tl.float32)
+        q_d1 = tlx.local_load(
+            tlx.local_slice(q_view, [0, D // 2], [BLOCK_M, D // 2]),
+            token=stage_wait,
+            layout=q_op1_nd,
+        )
+        dk_d1 = tl.dot(ds_nd, q_d1, acc=dk_d1, out_dtype=tl.float32)
+    else:
+        # Independent D32 keeps both dV recurrences separate from both dK
+        # recurrences, shortening each scheduler-visible chain.
+        do_d0 = tlx.local_load(
+            tlx.local_slice(do_view, [0, 0], [BLOCK_M, D // 2]),
+            token=stage_wait,
+            layout=q_op1_nd,
+        )
+        dv_d0 = tl.dot(p_nd, do_d0, acc=dv_d0, out_dtype=tl.float32)
+        do_d1 = tlx.local_load(
+            tlx.local_slice(do_view, [0, D // 2], [BLOCK_M, D // 2]),
+            token=stage_wait,
+            layout=q_op1_nd,
+        )
+        dv_d1 = tl.dot(p_nd, do_d1, acc=dv_d1, out_dtype=tl.float32)
+        q_d0 = tlx.local_load(
+            tlx.local_slice(q_view, [0, 0], [BLOCK_M, D // 2]),
+            token=stage_wait,
+            layout=q_op1_nd,
+        )
+        dk_d0 = tl.dot(ds_nd, q_d0, acc=dk_d0, out_dtype=tl.float32)
+        q_d1 = tlx.local_load(
+            tlx.local_slice(q_view, [0, D // 2], [BLOCK_M, D // 2]),
+            token=stage_wait,
+            layout=q_op1_nd,
+        )
+        dk_d1 = tl.dot(ds_nd, q_d1, acc=dk_d1, out_dtype=tl.float32)
+    return (
+        tlx.require_layout(dk_d0, mma_nd, pin=False),
+        tlx.require_layout(dk_d1, mma_nd, pin=False),
+        tlx.require_layout(dv_d0, mma_nd, pin=False),
+        tlx.require_layout(dv_d1, mma_nd, pin=False),
+    )
+
+
+@triton.jit
+def _d64_gqa8_direct_consume(
+    dk,
+    dv,
+    q_view,
+    do_view,
+    lse_view,
+    delta_view,
+    stage_wait,
+    k_nm,
+    v_nm,
+    m_blk,
+    n0,
+    SM_SCALE: tl.constexpr,
+    SQ: tl.constexpr,
+    SKV: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    STATS_RANK2: tl.constexpr,
+    mma_nm: tl.constexpr,
+    mma_nd: tl.constexpr,
+    q_t_op1_nm: tl.constexpr,
+    p_op0_nd: tl.constexpr,
+    q_op1_nd: tl.constexpr,
+):
+    dk = tlx.require_layout(dk, mma_nd, pin=False)
+    dv = tlx.require_layout(dv, mma_nd, pin=False)
+    apply_causal_mask = n0 + BLOCK_N - 1 > m_blk * BLOCK_M + (SKV - SQ)
+    dk, dv = _d64_gqa8_direct_d64_step(
+        dk,
+        dv,
+        q_view,
+        do_view,
+        lse_view,
+        delta_view,
+        stage_wait,
+        k_nm,
+        v_nm,
+        m_blk,
+        n0,
+        SM_SCALE,
+        SQ,
+        SKV,
+        D,
+        BLOCK_M,
+        BLOCK_N,
+        apply_causal_mask,
+        STATS_RANK2,
+        mma_nm,
+        mma_nd,
+        q_t_op1_nm,
+        p_op0_nd,
+        q_op1_nd,
+    )
+    return (
+        tlx.require_layout(dk, mma_nd, pin=False),
+        tlx.require_layout(dv, mma_nd, pin=False),
+    )
+
+
+@triton.jit
+def _d64_gqa8_direct_consume_loaded_stats(
+    dk,
+    dv,
+    q_view,
+    do_view,
+    lse_values,
+    delta_values,
+    stage_wait,
+    k_nm,
+    v_nm,
+    m_blk,
+    n0,
+    SM_SCALE: tl.constexpr,
+    SQ: tl.constexpr,
+    SKV: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    APPLY_CAUSAL_MASK,
+    BATCHED_STATS: tl.constexpr,
+    STATS_STEP: tl.constexpr,
+    mma_nm: tl.constexpr,
+    mma_nd: tl.constexpr,
+    q_t_op1_nm: tl.constexpr,
+    p_op0_nd: tl.constexpr,
+    q_op1_nd: tl.constexpr,
+):
+    dk = tlx.require_layout(dk, mma_nd, pin=False)
+    dv = tlx.require_layout(dv, mma_nd, pin=False)
+    p_nd, ds_nd = _d64_gqa8_signed_front_loaded_stats(
+        q_view,
+        do_view,
+        lse_values,
+        delta_values,
+        stage_wait,
+        k_nm,
+        v_nm,
+        m_blk,
+        n0,
+        SM_SCALE,
+        SQ,
+        SKV,
+        D,
+        BLOCK_M,
+        BLOCK_N,
+        APPLY_CAUSAL_MASK,
+        BATCHED_STATS,
+        STATS_STEP,
+        mma_nm,
+        q_t_op1_nm,
+        p_op0_nd,
+    )
+    p_nd = tlx.require_layout(p_nd, p_op0_nd, pin=False)
+    ds_nd = tlx.require_layout(ds_nd, p_op0_nd, pin=False)
+    do_nd = tlx.local_load(do_view, token=stage_wait, layout=q_op1_nd)
+    dv = tl.dot(p_nd, do_nd, acc=dv, out_dtype=tl.float32)
+    # Match the ordinary statistics path: Q is independent of dV, so keep it
+    # out of the live operand set until the following dK recurrence.
+    q_nd = tlx.local_load(
+        q_view,
+        token=stage_wait,
+        layout=q_op1_nd,
+        rematerialize_coordinates=True,
+    )
+    dk = tl.dot(ds_nd, q_nd, acc=dk, out_dtype=tl.float32)
+    return (
+        tlx.require_layout(dk, mma_nd, pin=False),
+        tlx.require_layout(dv, mma_nd, pin=False),
+    )
+
+
+@triton.jit
+def _d64_gqa8_d32_consume(
+    dk_d0,
+    dk_d1,
+    dv_d0,
+    dv_d1,
+    q_view,
+    do_view,
+    lse_view,
+    delta_view,
+    stage_wait,
+    k_nm,
+    v_nm,
+    m_blk,
+    n0,
+    SM_SCALE: tl.constexpr,
+    SQ: tl.constexpr,
+    SKV: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    INTERLEAVED_D32: tl.constexpr,
+    mma_nm: tl.constexpr,
+    mma_nd: tl.constexpr,
+    q_t_op1_nm: tl.constexpr,
+    p_op0_nd: tl.constexpr,
+    q_op1_nd: tl.constexpr,
+):
+    dk_d0 = tlx.require_layout(dk_d0, mma_nd, pin=False)
+    dk_d1 = tlx.require_layout(dk_d1, mma_nd, pin=False)
+    dv_d0 = tlx.require_layout(dv_d0, mma_nd, pin=False)
+    dv_d1 = tlx.require_layout(dv_d1, mma_nd, pin=False)
+    apply_causal_mask = n0 + BLOCK_N - 1 > m_blk * BLOCK_M + (SKV - SQ)
+    dk_d0, dk_d1, dv_d0, dv_d1 = _d64_gqa8_d32_step(dk_d0, dk_d1, dv_d0, dv_d1, q_view, do_view, lse_view, delta_view,
+                                                    stage_wait, k_nm, v_nm, m_blk, n0, SM_SCALE, SQ, SKV, D, BLOCK_M,
+                                                    BLOCK_N, apply_causal_mask, INTERLEAVED_D32, mma_nm, mma_nd,
+                                                    q_t_op1_nm, p_op0_nd, q_op1_nd)
+    dk_d0 = tlx.require_layout(dk_d0, mma_nd, pin=False)
+    dk_d1 = tlx.require_layout(dk_d1, mma_nd, pin=False)
+    dv_d0 = tlx.require_layout(dv_d0, mma_nd, pin=False)
+    dv_d1 = tlx.require_layout(dv_d1, mma_nd, pin=False)
+    return dk_d0, dk_d1, dv_d0, dv_d1
+
+
+@triton.jit
+def _d64_gqa8_all_head_mblock(
+    dk,
+    dv,
+    Q,
+    DO,
+    LSE_TERM,
+    Delta,
+    q_ring,
+    do_ring,
+    lse_all,
+    delta_all,
+    k_nm,
+    v_nm,
+    group_stats_base,
+    group_q_base,
+    m_blk,
+    n0,
+    SM_SCALE: tl.constexpr,
+    SQ: tl.constexpr,
+    SKV: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    APPLY_CAUSAL_MASK: tl.constexpr,
+    q_async_layout: tl.constexpr,
+    all_head_stats_layout: tl.constexpr,
+    mma_nm: tl.constexpr,
+    mma_nd: tl.constexpr,
+    q_t_op1_nm: tl.constexpr,
+    p_op0_nd: tl.constexpr,
+    q_op1_nd: tl.constexpr,
+):
+    """Consume one query block for all eight heads with a static mask mode."""
+    dk = tlx.require_layout(dk, mma_nd, pin=False)
+    dv = tlx.require_layout(dv, mma_nd, pin=False)
+    rows = m_blk * BLOCK_M + tl.arange(0, BLOCK_M)
+    stat_heads = tl.arange(0, 8)
+    stats_offsets = stat_heads[:, None] * SQ + rows[None, :]
+    stats_offsets = tlx.require_layout(stats_offsets.to(tl.int32), all_head_stats_layout, pin=False)
+    lse_values = tlx.buffer_load(LSE_TERM + group_stats_base, stats_offsets, contiguity=2)
+    delta_values = tlx.buffer_load(Delta + group_stats_base, stats_offsets, contiguity=2)
+    tlx.local_store(lse_all, lse_values)
+    tlx.local_store(delta_all, delta_values)
+
+    cols = tl.arange(0, D)
+    q_offsets = (rows[:, None] * D + cols[None, :]).to(tl.int32)
+    q_offsets = tlx.require_layout(q_offsets, q_async_layout, pin=False)
+    q_token = tlx.buffer_load_to_local(tlx.local_view(q_ring, 0), Q + group_q_base, q_offsets)
+    do_token = tlx.buffer_load_to_local(tlx.local_view(do_ring, 0), DO + group_q_base, q_offsets)
+    tlx.async_load_commit_group([q_token, do_token])
+    tl.debug_barrier()
+
+    for local_head in range(0, 8):
+        current_slot = local_head % 2
+        if local_head + 1 < 8:
+            next_head = local_head + 1
+            next_slot = 1 - current_slot
+            next_head_base = next_head.to(tl.int64) * SQ * D
+            next_q_token = tlx.buffer_load_to_local(
+                tlx.local_view(q_ring, next_slot),
+                Q + group_q_base + next_head_base,
+                q_offsets,
+            )
+            next_do_token = tlx.buffer_load_to_local(
+                tlx.local_view(do_ring, next_slot),
+                DO + group_q_base + next_head_base,
+                q_offsets,
+            )
+            tlx.async_load_commit_group([next_q_token, next_do_token])
+            stage_wait = tlx.async_load_wait_group(1)
+        else:
+            stage_wait = tlx.async_load_wait_group(0)
+        lse_view = tlx.local_slice(lse_all, [local_head, 0], [1, BLOCK_M])
+        delta_view = tlx.local_slice(delta_all, [local_head, 0], [1, BLOCK_M])
+        lse_term = tl.reshape(tlx.local_load(lse_view, relaxed=True), (BLOCK_M, ))
+        negative_delta = tl.reshape(tlx.local_load(delta_view, relaxed=True), (BLOCK_M, ))
+        dk, dv = _d64_gqa8_direct_consume_loaded_stats(
+            dk,
+            dv,
+            tlx.local_view(q_ring, current_slot),
+            tlx.local_view(do_ring, current_slot),
+            lse_term,
+            negative_delta,
+            stage_wait,
+            k_nm,
+            v_nm,
+            m_blk,
+            n0,
+            SM_SCALE,
+            SQ,
+            SKV,
+            D,
+            BLOCK_M,
+            BLOCK_N,
+            APPLY_CAUSAL_MASK,
+            False,
+            0,
+            mma_nm,
+            mma_nd,
+            q_t_op1_nm,
+            p_op0_nd,
+            q_op1_nd,
+        )
+        tl.debug_barrier()
+    return (
+        tlx.require_layout(dk, mma_nd, pin=False),
+        tlx.require_layout(dv, mma_nd, pin=False),
+    )
+
+
+@triton.jit
+def _d64_gqa8_all_head_direct_d64_impl(
+    Q,
+    DO,
+    LSE_TERM,
+    Delta,
+    q_ring,
+    do_ring,
+    lse_all,
+    delta_all,
+    k_nm,
+    v_nm,
+    pid_b,
+    pid_hkv,
+    off_split,
+    n0,
+    start_m_blk,
+    SM_SCALE: tl.constexpr,
+    HQ: tl.constexpr,
+    SQ: tl.constexpr,
+    SKV: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    KV_SPLITS: tl.constexpr,
+    q_async_layout: tl.constexpr,
+    all_head_stats_layout: tl.constexpr,
+    mma_nm: tl.constexpr,
+    mma_nd: tl.constexpr,
+    q_t_op1_nm: tl.constexpr,
+    p_op0_nd: tl.constexpr,
+    q_op1_nd: tl.constexpr,
+):
+    """Walk query blocks outside heads and stage all eight heads' statistics."""
+    dk = tlx.zeros((BLOCK_N, D), tl.float32, layout=mma_nd)
+    dv = tlx.zeros((BLOCK_N, D), tl.float32, layout=mma_nd)
+    num_m_blocks: tl.constexpr = SQ // BLOCK_M
+    split_advance = (off_split - (start_m_blk % KV_SPLITS) + KV_SPLITS) % KV_SPLITS
+    first_m_blk = start_m_blk + split_advance
+    group_head = (pid_b * HQ + pid_hkv * 8).to(tl.int64)
+    group_stats_base = group_head * SQ
+    group_q_base = group_head * SQ * D
+
+    if first_m_blk < num_m_blocks:
+        first_is_masked = n0 + BLOCK_N - 1 > first_m_blk * BLOCK_M + (SKV - SQ)
+        if first_is_masked:
+            dk, dv = _d64_gqa8_all_head_mblock(dk, dv, Q, DO, LSE_TERM, Delta, q_ring, do_ring, lse_all, delta_all,
+                                               k_nm, v_nm, group_stats_base, group_q_base, first_m_blk, n0, SM_SCALE,
+                                               SQ, SKV, D, BLOCK_M, BLOCK_N, True, q_async_layout,
+                                               all_head_stats_layout, mma_nm, mma_nd, q_t_op1_nm, p_op0_nd, q_op1_nd)
+            dk = tlx.require_layout(dk, mma_nd, pin=False)
+            dv = tlx.require_layout(dv, mma_nd, pin=False)
+        else:
+            dk, dv = _d64_gqa8_all_head_mblock(dk, dv, Q, DO, LSE_TERM, Delta, q_ring, do_ring, lse_all, delta_all,
+                                               k_nm, v_nm, group_stats_base, group_q_base, first_m_blk, n0, SM_SCALE,
+                                               SQ, SKV, D, BLOCK_M, BLOCK_N, False, q_async_layout,
+                                               all_head_stats_layout, mma_nm, mma_nd, q_t_op1_nm, p_op0_nd, q_op1_nd)
+            dk = tlx.require_layout(dk, mma_nd, pin=False)
+            dv = tlx.require_layout(dv, mma_nd, pin=False)
+        for m_blk in range(first_m_blk + KV_SPLITS, num_m_blocks, KV_SPLITS):
+            dk, dv = _d64_gqa8_all_head_mblock(dk, dv, Q, DO, LSE_TERM, Delta, q_ring, do_ring, lse_all, delta_all,
+                                               k_nm, v_nm, group_stats_base, group_q_base, m_blk, n0, SM_SCALE, SQ, SKV,
+                                               D, BLOCK_M, BLOCK_N, False, q_async_layout, all_head_stats_layout,
+                                               mma_nm, mma_nd, q_t_op1_nm, p_op0_nd, q_op1_nd)
+    return (
+        tlx.require_layout(dk, mma_nd, pin=False),
+        tlx.require_layout(dv, mma_nd, pin=False),
+    )
+
+
+@triton.jit
+def _d64_gqa8_direct_d64_impl(
+    Q,
+    DO,
+    LSE_TERM,
+    Delta,
+    q_ring,
+    do_ring,
+    lse_ring,
+    delta_ring,
+    k_nm,
+    v_nm,
+    pid_b,
+    pid_hkv,
+    off_split,
+    n0,
+    start_m_blk,
+    SM_SCALE: tl.constexpr,
+    HQ: tl.constexpr,
+    SQ: tl.constexpr,
+    SKV: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    KV_SPLITS: tl.constexpr,
+    CYCLIC_QUERY_SPLIT: tl.constexpr,
+    q_async_layout: tl.constexpr,
+    stats_async_layout: tl.constexpr,
+    mma_nm: tl.constexpr,
+    mma_nd: tl.constexpr,
+    q_t_op1_nm: tl.constexpr,
+    p_op0_nd: tl.constexpr,
+    q_op1_nd: tl.constexpr,
+):
+    """Carry only full-width FP32 dK/dV through the complete owner walk."""
+    tl.static_assert(KV_SPLITS == _D64_CAUSAL_GQA8_KV_SPLITS_JIT)
+    dk = tlx.zeros((BLOCK_N, D), tl.float32, layout=mma_nd)
+    dv = tlx.zeros((BLOCK_N, D), tl.float32, layout=mma_nd)
+    num_m_blocks: tl.constexpr = SQ // BLOCK_M
+    full_pairs: tl.constexpr = num_m_blocks // 2
+    has_odd: tl.constexpr = (num_m_blocks % 2) != 0
+
+    if CYCLIC_QUERY_SPLIT:
+        for local_head in range(0, 8):
+            q_head = (pid_b * HQ + pid_hkv * 8 + local_head).to(tl.int64)
+            q_base = Q + q_head * SQ * D
+            do_base = DO + q_head * SQ * D
+            stats_base = q_head * SQ
+            lse_base = LSE_TERM + stats_base
+            delta_base = Delta + stats_base
+            split_advance = (off_split - (start_m_blk % KV_SPLITS) + KV_SPLITS) % KV_SPLITS
+            first_m_blk = start_m_blk + split_advance
+            if first_m_blk < num_m_blocks:
+                _d64_gqa8_issue_stage(q_base, do_base, lse_base, delta_base, tlx.local_view(q_ring, 0),
+                                      tlx.local_view(do_ring, 0), tlx.local_view(lse_ring, 0),
+                                      tlx.local_view(delta_ring, 0), first_m_blk, D, BLOCK_M, q_async_layout,
+                                      stats_async_layout)
+                sequence_blocks = (num_m_blocks - first_m_blk + KV_SPLITS - 1) // KV_SPLITS
+                sequence_pairs = sequence_blocks // 2
+                for sequence_pair in range(0, sequence_pairs):
+                    m_blk_a = first_m_blk + sequence_pair * 2 * KV_SPLITS
+                    m_blk_b = m_blk_a + KV_SPLITS
+                    # Issue the complete next stage before consuming current.
+                    _d64_gqa8_issue_stage(q_base, do_base, lse_base, delta_base, tlx.local_view(q_ring, 1),
+                                          tlx.local_view(do_ring, 1), tlx.local_view(lse_ring, 1),
+                                          tlx.local_view(delta_ring, 1), m_blk_b, D, BLOCK_M, q_async_layout,
+                                          stats_async_layout)
+                    stage_wait = tlx.async_load_wait_group(1)
+                    dk, dv = _d64_gqa8_direct_consume(dk, dv, tlx.local_view(q_ring, 0), tlx.local_view(do_ring, 0),
+                                                      tlx.local_view(lse_ring, 0), tlx.local_view(delta_ring,
+                                                                                                  0), stage_wait, k_nm,
+                                                      v_nm, m_blk_a, n0, SM_SCALE, SQ, SKV, D, BLOCK_M, BLOCK_N, False,
+                                                      mma_nm, mma_nd, q_t_op1_nm, p_op0_nd, q_op1_nd)
+                    has_next_pair = sequence_pair + 1 < sequence_pairs
+                    has_odd_block = (sequence_blocks % 2) != 0
+                    if has_next_pair or has_odd_block:
+                        # All relaxed views are retired before slot reuse.
+                        tl.debug_barrier()
+                        _d64_gqa8_issue_stage(q_base, do_base, lse_base, delta_base, tlx.local_view(q_ring, 0),
+                                              tlx.local_view(do_ring, 0), tlx.local_view(lse_ring, 0),
+                                              tlx.local_view(delta_ring, 0), m_blk_a + 2 * KV_SPLITS, D, BLOCK_M,
+                                              q_async_layout, stats_async_layout)
+                        stage_wait = tlx.async_load_wait_group(1)
+                    else:
+                        stage_wait = tlx.async_load_wait_group(0)
+                    dk, dv = _d64_gqa8_direct_consume(dk, dv, tlx.local_view(q_ring, 1), tlx.local_view(do_ring, 1),
+                                                      tlx.local_view(lse_ring, 1), tlx.local_view(delta_ring,
+                                                                                                  1), stage_wait, k_nm,
+                                                      v_nm, m_blk_b, n0, SM_SCALE, SQ, SKV, D, BLOCK_M, BLOCK_N, False,
+                                                      mma_nm, mma_nd, q_t_op1_nm, p_op0_nd, q_op1_nd)
+                    if has_next_pair:
+                        tl.debug_barrier()
+                dk = tlx.require_layout(dk, mma_nd, pin=False)
+                dv = tlx.require_layout(dv, mma_nd, pin=False)
+                if (sequence_blocks % 2) != 0:
+                    stage_wait = tlx.async_load_wait_group(0)
+                    m_blk_tail = first_m_blk + (sequence_blocks - 1) * KV_SPLITS
+                    dk, dv = _d64_gqa8_direct_consume(dk, dv, tlx.local_view(q_ring, 0), tlx.local_view(do_ring, 0),
+                                                      tlx.local_view(lse_ring, 0), tlx.local_view(delta_ring,
+                                                                                                  0), stage_wait, k_nm,
+                                                      v_nm, m_blk_tail, n0, SM_SCALE, SQ, SKV, D, BLOCK_M, BLOCK_N,
+                                                      False, mma_nm, mma_nd, q_t_op1_nm, p_op0_nd, q_op1_nd)
+                    dk = tlx.require_layout(dk, mma_nd, pin=False)
+                    dv = tlx.require_layout(dv, mma_nd, pin=False)
+                dk = tlx.require_layout(dk, mma_nd, pin=False)
+                dv = tlx.require_layout(dv, mma_nd, pin=False)
+            if local_head + 1 < 8:
+                tl.debug_barrier()
+    else:
+        pair_start = (start_m_blk // 2) * 2
+        for local_head in tl.static_range(0, 2):
+            query_in_group = off_split * 2 + local_head
+            q_head = (pid_b * HQ + pid_hkv * 8 + query_in_group).to(tl.int64)
+            q_base = Q + q_head * SQ * D
+            do_base = DO + q_head * SQ * D
+            stats_base = q_head * SQ
+            lse_base = LSE_TERM + stats_base
+            delta_base = Delta + stats_base
+            _d64_gqa8_issue_stage(q_base, do_base, lse_base, delta_base, tlx.local_view(q_ring,
+                                                                                        0), tlx.local_view(do_ring, 0),
+                                  tlx.local_view(lse_ring, 0), tlx.local_view(delta_ring, 0), pair_start, D, BLOCK_M,
+                                  q_async_layout, stats_async_layout)
+            for m_pair in range(pair_start // 2, full_pairs):
+                m_blk_a = m_pair * 2
+                m_blk_b = m_blk_a + 1
+                _d64_gqa8_issue_stage(q_base, do_base, lse_base, delta_base, tlx.local_view(q_ring, 1),
+                                      tlx.local_view(do_ring, 1), tlx.local_view(lse_ring, 1),
+                                      tlx.local_view(delta_ring, 1), m_blk_b, D, BLOCK_M, q_async_layout,
+                                      stats_async_layout)
+                stage_wait = tlx.async_load_wait_group(1)
+                dk, dv = _d64_gqa8_direct_consume(dk, dv, tlx.local_view(q_ring, 0), tlx.local_view(do_ring, 0),
+                                                  tlx.local_view(lse_ring, 0), tlx.local_view(delta_ring, 0),
+                                                  stage_wait, k_nm, v_nm, m_blk_a, n0, SM_SCALE, SQ, SKV, D, BLOCK_M,
+                                                  BLOCK_N, False, mma_nm, mma_nd, q_t_op1_nm, p_op0_nd, q_op1_nd)
+                has_following = (m_pair + 1 < full_pairs) or has_odd
+                if has_following:
+                    tl.debug_barrier()
+                    _d64_gqa8_issue_stage(q_base, do_base, lse_base, delta_base, tlx.local_view(q_ring, 0),
+                                          tlx.local_view(do_ring, 0), tlx.local_view(lse_ring, 0),
+                                          tlx.local_view(delta_ring, 0), m_blk_a + 2, D, BLOCK_M, q_async_layout,
+                                          stats_async_layout)
+                    stage_wait = tlx.async_load_wait_group(1)
+                else:
+                    stage_wait = tlx.async_load_wait_group(0)
+                dk, dv = _d64_gqa8_direct_consume(dk, dv, tlx.local_view(q_ring, 1), tlx.local_view(do_ring, 1),
+                                                  tlx.local_view(lse_ring, 1), tlx.local_view(delta_ring, 1),
+                                                  stage_wait, k_nm, v_nm, m_blk_b, n0, SM_SCALE, SQ, SKV, D, BLOCK_M,
+                                                  BLOCK_N, False, mma_nm, mma_nd, q_t_op1_nm, p_op0_nd, q_op1_nd)
+                if m_pair + 1 < full_pairs:
+                    tl.debug_barrier()
+            if has_odd:
+                stage_wait = tlx.async_load_wait_group(0)
+                dk, dv = _d64_gqa8_direct_consume(dk, dv, tlx.local_view(q_ring, 0), tlx.local_view(do_ring, 0),
+                                                  tlx.local_view(lse_ring, 0), tlx.local_view(delta_ring,
+                                                                                              0), stage_wait, k_nm,
+                                                  v_nm, num_m_blocks - 1, n0, SM_SCALE, SQ, SKV, D, BLOCK_M, BLOCK_N,
+                                                  False, mma_nm, mma_nd, q_t_op1_nm, p_op0_nd, q_op1_nd)
+            if local_head + 1 < 2:
+                tl.debug_barrier()
+    return (
+        tlx.require_layout(dk, mma_nd, pin=False),
+        tlx.require_layout(dv, mma_nd, pin=False),
+    )
+
+
+@triton.jit
+def _d64_gqa8_async_stats4_direct_d64_impl(
+    Q,
+    DO,
+    LSE_TERM,
+    Delta,
+    q_ring,
+    do_ring,
+    lse_ring,
+    delta_ring,
+    lse_batch_ring,
+    delta_batch_ring,
+    k_nm,
+    v_nm,
+    pid_b,
+    pid_hkv,
+    off_split,
+    n0,
+    start_m_blk,
+    SM_SCALE: tl.constexpr,
+    HQ: tl.constexpr,
+    SQ: tl.constexpr,
+    SKV: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    q_async_layout: tl.constexpr,
+    stats_async_layout: tl.constexpr,
+    stats4_async_layout: tl.constexpr,
+    mma_nm: tl.constexpr,
+    mma_nd: tl.constexpr,
+    q_t_op1_nm: tl.constexpr,
+    p_op0_nd: tl.constexpr,
+    q_op1_nd: tl.constexpr,
+):
+    """Direct-D64 walk with four-stage Q/dO and double-buffered statistics."""
+    tl.static_assert(SQ % (4 * BLOCK_M) == 0)
+    dk = tlx.zeros((BLOCK_N, D), tl.float32, layout=mma_nd)
+    dv = tlx.zeros((BLOCK_N, D), tl.float32, layout=mma_nd)
+    num_m_blocks: tl.constexpr = SQ // BLOCK_M
+    pair_start = (start_m_blk // 2) * 2
+
+    for local_head in tl.static_range(0, 2):
+        query_in_group = off_split * 2 + local_head
+        q_head = (pid_b * HQ + pid_hkv * 8 + query_in_group).to(tl.int64)
+        q_base = Q + q_head * SQ * D
+        do_base = DO + q_head * SQ * D
+        stats_base = q_head * SQ
+        lse_base = LSE_TERM + stats_base
+        delta_base = Delta + stats_base
+
+        # The causal frontier advances in BM128 units. Peel one pair when it
+        # starts halfway through a four-tile vector-statistics batch.
+        batch_start = pair_start + (pair_start % 4)
+        dk = tlx.require_layout(dk, mma_nd, pin=False)
+        dv = tlx.require_layout(dv, mma_nd, pin=False)
+        if batch_start != pair_start:
+            _d64_gqa8_issue_stage(q_base, do_base, lse_base, delta_base, tlx.local_view(q_ring,
+                                                                                        0), tlx.local_view(do_ring, 0),
+                                  tlx.local_view(lse_ring, 0), tlx.local_view(delta_ring, 0), pair_start, D, BLOCK_M,
+                                  q_async_layout, stats_async_layout)
+            _d64_gqa8_issue_stage(q_base, do_base, lse_base, delta_base, tlx.local_view(q_ring,
+                                                                                        1), tlx.local_view(do_ring, 1),
+                                  tlx.local_view(lse_ring, 1), tlx.local_view(delta_ring, 1), pair_start + 1, D,
+                                  BLOCK_M, q_async_layout, stats_async_layout)
+            stage_wait = tlx.async_load_wait_group(1)
+            dk, dv = _d64_gqa8_direct_consume(dk, dv, tlx.local_view(q_ring, 0), tlx.local_view(do_ring, 0),
+                                              tlx.local_view(lse_ring, 0), tlx.local_view(delta_ring, 0), stage_wait,
+                                              k_nm, v_nm, pair_start, n0, SM_SCALE, SQ, SKV, D, BLOCK_M, BLOCK_N, False,
+                                              mma_nm, mma_nd, q_t_op1_nm, p_op0_nd, q_op1_nd)
+            stage_wait = tlx.async_load_wait_group(0)
+            dk, dv = _d64_gqa8_direct_consume(dk, dv, tlx.local_view(q_ring, 1), tlx.local_view(do_ring, 1),
+                                              tlx.local_view(lse_ring, 1), tlx.local_view(delta_ring, 1), stage_wait,
+                                              k_nm, v_nm, pair_start + 1, n0, SM_SCALE, SQ, SKV, D, BLOCK_M, BLOCK_N,
+                                              False, mma_nm, mma_nd, q_t_op1_nm, p_op0_nd, q_op1_nd)
+            dk = tlx.require_layout(dk, mma_nd, pin=False)
+            dv = tlx.require_layout(dv, mma_nd, pin=False)
+            tl.debug_barrier()
+        dk = tlx.require_layout(dk, mma_nd, pin=False)
+        dv = tlx.require_layout(dv, mma_nd, pin=False)
+
+        if batch_start < num_m_blocks:
+            first_quad = batch_start // 4
+            initial_stats_slot = first_quad % 2
+            _d64_gqa8_issue_stats4_qdo_stage(q_base, do_base, lse_base, delta_base, tlx.local_view(q_ring, 0),
+                                             tlx.local_view(do_ring, 0),
+                                             tlx.local_view(lse_batch_ring, initial_stats_slot),
+                                             tlx.local_view(delta_batch_ring, initial_stats_slot), batch_start,
+                                             batch_start, D, BLOCK_M, q_async_layout, stats4_async_layout)
+            # Keep the async refill and the dV/dK recurrence in one loop so
+            # their overlapping lifetimes remain visible to the scheduler.
+            for m_quad in range(first_quad, num_m_blocks // 4):
+                m0 = m_quad * 4
+                stats_slot = m_quad % 2
+                lse_batch = tlx.local_view(lse_batch_ring, stats_slot)
+                delta_batch = tlx.local_view(delta_batch_ring, stats_slot)
+                for step in tl.static_range(0, 4):
+                    current_slot = step
+                    has_next_quad = m_quad + 1 < num_m_blocks // 4
+                    if step + 1 < 4:
+                        next_slot = step + 1
+                        _d64_gqa8_issue_qdo_stage(q_base, do_base, tlx.local_view(q_ring, next_slot),
+                                                  tlx.local_view(do_ring, next_slot), m0 + step + 1, D, BLOCK_M,
+                                                  q_async_layout)
+                        stage_wait = tlx.async_load_wait_group(1)
+                    elif has_next_quad:
+                        next_stats_slot = 1 - stats_slot
+                        _d64_gqa8_issue_stats4_qdo_stage(q_base, do_base, lse_base, delta_base,
+                                                         tlx.local_view(q_ring, 0), tlx.local_view(do_ring, 0),
+                                                         tlx.local_view(lse_batch_ring, next_stats_slot),
+                                                         tlx.local_view(delta_batch_ring, next_stats_slot), m0 + 4,
+                                                         m0 + 4, D, BLOCK_M, q_async_layout, stats4_async_layout)
+                        stage_wait = tlx.async_load_wait_group(1)
+                    else:
+                        stage_wait = tlx.async_load_wait_group(0)
+                    apply_causal_mask = n0 + BLOCK_N - 1 > (m0 + step) * BLOCK_M + (SKV - SQ)
+                    dk, dv = _d64_gqa8_direct_consume_loaded_stats(dk, dv, tlx.local_view(q_ring, current_slot),
+                                                                   tlx.local_view(do_ring,
+                                                                                  current_slot), lse_batch, delta_batch,
+                                                                   stage_wait, k_nm, v_nm, m0 + step, n0, SM_SCALE, SQ,
+                                                                   SKV, D, BLOCK_M, BLOCK_N, apply_causal_mask, True,
+                                                                   step, mma_nm, mma_nd, q_t_op1_nm, p_op0_nd, q_op1_nd)
+                    if step % 2 == 1:
+                        tl.debug_barrier()
+            dk = tlx.require_layout(dk, mma_nd, pin=False)
+            dv = tlx.require_layout(dv, mma_nd, pin=False)
+        if local_head + 1 < 2:
+            tl.debug_barrier()
+    return (
+        tlx.require_layout(dk, mma_nd, pin=False),
+        tlx.require_layout(dv, mma_nd, pin=False),
+    )
+
+
+@triton.jit
+def _d64_gqa8_d32_impl(
+    Q,
+    DO,
+    LSE_TERM,
+    Delta,
+    q_ring,
+    do_ring,
+    lse_ring,
+    delta_ring,
+    k_nm,
+    v_nm,
+    pid_b,
+    pid_hkv,
+    off_split,
+    n0,
+    start_m_blk,
+    SM_SCALE: tl.constexpr,
+    HQ: tl.constexpr,
+    SQ: tl.constexpr,
+    SKV: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    INTERLEAVED_D32: tl.constexpr,
+    q_async_layout: tl.constexpr,
+    stats_async_layout: tl.constexpr,
+    mma_nm: tl.constexpr,
+    mma_nd: tl.constexpr,
+    q_t_op1_nm: tl.constexpr,
+    p_op0_nd: tl.constexpr,
+    q_op1_nd: tl.constexpr,
+):
+    """Carry only the selected low/high FP32 recurrences until epilogue."""
+    dk_d0 = tlx.zeros((BLOCK_N, D // 2), tl.float32, layout=mma_nd)
+    dk_d1 = tlx.zeros((BLOCK_N, D // 2), tl.float32, layout=mma_nd)
+    dv_d0 = tlx.zeros((BLOCK_N, D // 2), tl.float32, layout=mma_nd)
+    dv_d1 = tlx.zeros((BLOCK_N, D // 2), tl.float32, layout=mma_nd)
+    num_m_blocks: tl.constexpr = SQ // BLOCK_M
+    full_pairs: tl.constexpr = num_m_blocks // 2
+    has_odd: tl.constexpr = (num_m_blocks % 2) != 0
+    peel_frontier = (start_m_blk % 2) != 0
+    pair_start = start_m_blk + (start_m_blk % 2)
+
+    for local_head in tl.static_range(0, 2):
+        query_in_group = off_split * 2 + local_head
+        q_head = (pid_b * HQ + pid_hkv * 8 + query_in_group).to(tl.int64)
+        q_base = Q + q_head * SQ * D
+        do_base = DO + q_head * SQ * D
+        stats_base = q_head * SQ
+        lse_base = LSE_TERM + stats_base
+        delta_base = Delta + stats_base
+        if peel_frontier:
+            _d64_gqa8_issue_stage(q_base, do_base, lse_base, delta_base, tlx.local_view(q_ring,
+                                                                                        0), tlx.local_view(do_ring, 0),
+                                  tlx.local_view(lse_ring, 0), tlx.local_view(delta_ring, 0), start_m_blk, D, BLOCK_M,
+                                  q_async_layout, stats_async_layout)
+            stage_wait = tlx.async_load_wait_group(0)
+            dk_d0, dk_d1, dv_d0, dv_d1 = _d64_gqa8_d32_consume(dk_d0, dk_d1, dv_d0, dv_d1, tlx.local_view(q_ring, 0),
+                                                               tlx.local_view(do_ring, 0), tlx.local_view(lse_ring, 0),
+                                                               tlx.local_view(delta_ring, 0), stage_wait, k_nm, v_nm,
+                                                               start_m_blk, n0, SM_SCALE, SQ, SKV, D, BLOCK_M, BLOCK_N,
+                                                               INTERLEAVED_D32, mma_nm, mma_nd, q_t_op1_nm, p_op0_nd,
+                                                               q_op1_nd)
+            dk_d0 = tlx.require_layout(dk_d0, mma_nd, pin=False)
+            dk_d1 = tlx.require_layout(dk_d1, mma_nd, pin=False)
+            dv_d0 = tlx.require_layout(dv_d0, mma_nd, pin=False)
+            dv_d1 = tlx.require_layout(dv_d1, mma_nd, pin=False)
+            # Every relaxed view is retired before slot-zero reuse.
+            tl.debug_barrier()
+        if pair_start < num_m_blocks:
+            _d64_gqa8_issue_stage(q_base, do_base, lse_base, delta_base, tlx.local_view(q_ring,
+                                                                                        0), tlx.local_view(do_ring, 0),
+                                  tlx.local_view(lse_ring, 0), tlx.local_view(delta_ring, 0), pair_start, D, BLOCK_M,
+                                  q_async_layout, stats_async_layout)
+            for m_pair in range(pair_start // 2, full_pairs):
+                m_blk_a = m_pair * 2
+                m_blk_b = m_blk_a + 1
+                # Issue all next-stage requests before any current-stage read.
+                _d64_gqa8_issue_stage(q_base, do_base, lse_base, delta_base, tlx.local_view(q_ring, 1),
+                                      tlx.local_view(do_ring, 1), tlx.local_view(lse_ring, 1),
+                                      tlx.local_view(delta_ring, 1), m_blk_b, D, BLOCK_M, q_async_layout,
+                                      stats_async_layout)
+                stage_wait = tlx.async_load_wait_group(1)
+                dk_d0, dk_d1, dv_d0, dv_d1 = _d64_gqa8_d32_consume(dk_d0, dk_d1, dv_d0,
+                                                                   dv_d1, tlx.local_view(q_ring, 0),
+                                                                   tlx.local_view(do_ring, 0),
+                                                                   tlx.local_view(lse_ring, 0),
+                                                                   tlx.local_view(delta_ring, 0), stage_wait, k_nm,
+                                                                   v_nm, m_blk_a, n0, SM_SCALE, SQ, SKV, D, BLOCK_M,
+                                                                   BLOCK_N, INTERLEAVED_D32, mma_nm, mma_nd, q_t_op1_nm,
+                                                                   p_op0_nd, q_op1_nd)
+                has_following = (m_pair + 1 < full_pairs) or has_odd
+                if has_following:
+                    # Retire every view before overwriting the ping slot.
+                    tl.debug_barrier()
+                    _d64_gqa8_issue_stage(q_base, do_base, lse_base, delta_base, tlx.local_view(q_ring, 0),
+                                          tlx.local_view(do_ring, 0), tlx.local_view(lse_ring, 0),
+                                          tlx.local_view(delta_ring, 0), m_blk_a + 2, D, BLOCK_M, q_async_layout,
+                                          stats_async_layout)
+                    stage_wait = tlx.async_load_wait_group(1)
+                else:
+                    stage_wait = tlx.async_load_wait_group(0)
+                dk_d0, dk_d1, dv_d0, dv_d1 = _d64_gqa8_d32_consume(dk_d0, dk_d1, dv_d0,
+                                                                   dv_d1, tlx.local_view(q_ring, 1),
+                                                                   tlx.local_view(do_ring, 1),
+                                                                   tlx.local_view(lse_ring, 1),
+                                                                   tlx.local_view(delta_ring, 1), stage_wait, k_nm,
+                                                                   v_nm, m_blk_b, n0, SM_SCALE, SQ, SKV, D, BLOCK_M,
+                                                                   BLOCK_N, INTERLEAVED_D32, mma_nm, mma_nd, q_t_op1_nm,
+                                                                   p_op0_nd, q_op1_nd)
+                if m_pair + 1 < full_pairs:
+                    tl.debug_barrier()
+            dk_d0 = tlx.require_layout(dk_d0, mma_nd, pin=False)
+            dk_d1 = tlx.require_layout(dk_d1, mma_nd, pin=False)
+            dv_d0 = tlx.require_layout(dv_d0, mma_nd, pin=False)
+            dv_d1 = tlx.require_layout(dv_d1, mma_nd, pin=False)
+            if has_odd:
+                stage_wait = tlx.async_load_wait_group(0)
+                dk_d0, dk_d1, dv_d0, dv_d1 = _d64_gqa8_d32_consume(dk_d0, dk_d1, dv_d0,
+                                                                   dv_d1, tlx.local_view(q_ring, 0),
+                                                                   tlx.local_view(do_ring, 0),
+                                                                   tlx.local_view(lse_ring, 0),
+                                                                   tlx.local_view(delta_ring, 0), stage_wait, k_nm,
+                                                                   v_nm, num_m_blocks - 1, n0, SM_SCALE, SQ, SKV, D,
+                                                                   BLOCK_M, BLOCK_N, INTERLEAVED_D32, mma_nm, mma_nd,
+                                                                   q_t_op1_nm, p_op0_nd, q_op1_nd)
+                dk_d0 = tlx.require_layout(dk_d0, mma_nd, pin=False)
+                dk_d1 = tlx.require_layout(dk_d1, mma_nd, pin=False)
+                dv_d0 = tlx.require_layout(dv_d0, mma_nd, pin=False)
+                dv_d1 = tlx.require_layout(dv_d1, mma_nd, pin=False)
+        dk_d0 = tlx.require_layout(dk_d0, mma_nd, pin=False)
+        dk_d1 = tlx.require_layout(dk_d1, mma_nd, pin=False)
+        dv_d0 = tlx.require_layout(dv_d0, mma_nd, pin=False)
+        dv_d1 = tlx.require_layout(dv_d1, mma_nd, pin=False)
+        if local_head + 1 < 2:
+            tl.debug_barrier()
+
+    # This is the only D32 join: both selected recurrences die in epilogue.
+    dk = tl.join(dk_d0, dk_d1)
+    dk = tl.permute(dk, (0, 2, 1))
+    dk = tl.reshape(dk, (BLOCK_N, D))
+    dv = tl.join(dv_d0, dv_d1)
+    dv = tl.permute(dv, (0, 2, 1))
+    dv = tl.reshape(dv, (BLOCK_N, D))
+    return (
+        tlx.require_layout(dk, mma_nd, pin=False),
+        tlx.require_layout(dv, mma_nd, pin=False),
+    )
+
+
+@triton.jit
+def _attn_bwd_dkdv_d64_causal_gqa8_kernel(
+    Q,
+    K,
+    V,
+    DO,
+    LSE_TERM,
+    Delta,
+    DK_PART,
+    DV_PART,
+    SM_SCALE: tl.constexpr,
+    HQ: tl.constexpr,
+    HKV: tl.constexpr,
+    SQ: tl.constexpr,
+    SKV: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    KV_SPLITS: tl.constexpr,
+    USE_GQA_XCD: tl.constexpr,
+    USE_XCD_N_FAST: tl.constexpr,
+    CYCLIC_QUERY_SPLIT: tl.constexpr,
+    BATCH_STATS4: tl.constexpr,
+    LIFETIME_MODE: tl.constexpr,
+    LSE_MODE: tl.constexpr,
+    DELTA_MODE: tl.constexpr,
+):
+    """Resident-K/V causal D64 GQA8 producer with four fixed partials."""
+    tl.static_assert(D == 64 and BLOCK_M == 64 and (BLOCK_N == 64 or BLOCK_N == 128))
+    tl.static_assert(HQ == HKV * 8)
+    tl.static_assert(SQ % BLOCK_M == 0 and SKV % BLOCK_N == 0)
+    tl.static_assert(SQ <= SKV)
+    tl.static_assert(KV_SPLITS == _D64_CAUSAL_GQA8_KV_SPLITS_JIT)
+    tl.static_assert(LSE_MODE == _D64_LSE_NEG_LOG2E_JIT)
+    tl.static_assert(DELTA_MODE == _D64_DELTA_NEGATED_JIT)
+    tl.static_assert(LIFETIME_MODE == _D64_GQA_INDEPENDENT_D32_JIT or LIFETIME_MODE == _D64_GQA_INTERLEAVED_D32_JIT
+                     or LIFETIME_MODE == _D64_GQA_DIRECT_D64_JIT)
+    if USE_XCD_N_FAST:
+        tl.static_assert(USE_GQA_XCD)
+    if CYCLIC_QUERY_SPLIT:
+        tl.static_assert(USE_GQA_XCD and LIFETIME_MODE == _D64_GQA_DIRECT_D64_JIT)
+    if BATCH_STATS4:
+        tl.static_assert(not CYCLIC_QUERY_SPLIT and LIFETIME_MODE == _D64_GQA_DIRECT_D64_JIT)
+
+    value = tl.program_id(0)
+    num_n: tl.constexpr = SKV // BLOCK_N
+    if USE_GQA_XCD:
+        xcd = value % 8
+        value //= 8
+        if USE_XCD_N_FAST:
+            pid_n = value % num_n
+            value //= num_n
+            off_split = value % KV_SPLITS
+            bkv_group = value // KV_SPLITS
+        else:
+            off_split = value % KV_SPLITS
+            value //= KV_SPLITS
+            pid_n = value % num_n
+            bkv_group = value // num_n
+        bkv = bkv_group * 8 + xcd
+        pid_hkv = bkv % HKV
+        pid_b = bkv // HKV
+    else:
+        off_split = value % KV_SPLITS
+        value //= KV_SPLITS
+        pid_hkv = value % HKV
+        value //= HKV
+        pid_n = value % num_n
+        pid_b = value // num_n
+    n0 = pid_n * BLOCK_N
+
+    mma_nm: tl.constexpr = tlx.amd_mfma_layout(
+        version=4,
+        instr_shape=[16, 16, 32],
+        transposed=True,
+        warps_per_cta=[4, 1],
+    )
+    mma_nd: tl.constexpr = tlx.amd_mfma_layout(
+        version=4,
+        instr_shape=[16, 16, 32],
+        transposed=True,
+        warps_per_cta=[4, 1],
+    )
+    k_op0_nm: tl.constexpr = tlx.dot_operand_layout(0, mma_nm, k_width=8)
+    v_op0_nm: tl.constexpr = tlx.dot_operand_layout(0, mma_nm, k_width=8)
+    q_t_op1_nm: tl.constexpr = tlx.dot_operand_layout(1, mma_nm, k_width=8)
+    p_op0_nd: tl.constexpr = tlx.dot_operand_layout(0, mma_nd, k_width=4)
+    q_op1_nd: tl.constexpr = tlx.dot_operand_layout(1, mma_nd, k_width=4)
+
+    q_async_layout: tl.constexpr = tlx.layout(
+        shape=(
+            (2, 2, 2, 2, 2, 2, 2, 2),
+            (2, 2, 2, 2),
+        ),
+        stride=(
+            (8, 64, 128, 256, 512, 16, 32, 2048),
+            (1, 2, 4, 1024),
+        ),
+    )
+    stats_async_layout: tl.constexpr = tlx.layout(
+        shape=((64, 4), ()),
+        stride=((1, 0), ()),
+    )
+    all_head_stats_layout: tl.constexpr = tlx.layout(
+        shape=((8, 32), (2, )),
+        stride=((64, 2), (1, )),
+    )
+    stats4_async_layout: tl.constexpr = tlx.layout(
+        shape=((64, 4), ()),
+        stride=((1, 64), ()),
+    )
+    if BLOCK_N == 64:
+        out_layout: tl.constexpr = tlx.layout(
+            shape=((2, 2, 2, 2, 2, 2, 2, 2), (2, 2, 2, 2)),
+            stride=((64, 128, 256, 512, 8, 16, 1024, 2048), (1, 2, 4, 32)),
+        )
+    else:
+        out_layout: tl.constexpr = tlx.layout(
+            shape=(
+                (2, 2, 2, 2, 2, 2, 2, 2),
+                (2, 2, 2, 2, 2),
+            ),
+            stride=(
+                (64, 128, 256, 512, 8, 16, 1024, 2048),
+                (1, 2, 4, 32, 4096),
+            ),
+        )
+    qdo_smem_layout: tl.constexpr = tlx.shared_linear_layout_encoding(
+        offset_bases=[
+            [0, 1],
+            [0, 2],
+            [0, 4],
+            [0, 8],
+            [1, 0],
+            [2, 0],
+            [4, 0],
+            [8, 0],
+            [0, 16],
+            [0, 32],
+            [16, 0],
+            [32, 0],
+        ],
+        block_bases=[],
+        alignment=16,
+    )
+    stats_smem_layout: tl.constexpr = tlx.shared_linear_layout_encoding(
+        offset_bases=[[1], [2], [4], [8], [16], [32]],
+        block_bases=[],
+        alignment=4,
+    )
+    # XOR head ownership into otherwise row-major bank bits.  Fixed-head
+    # consumers retain full row rank, while the cooperative all-head store is
+    # injective within each 32-lane half-wave.
+    all_head_stats_smem_layout: tl.constexpr = tlx.shared_linear_layout_encoding(
+        offset_bases=[[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [1, 0], [2, 8], [4, 16]],
+        block_bases=[],
+        alignment=8,
+    )
+    stats4_smem_layout: tl.constexpr = tlx.shared_linear_layout_encoding(
+        offset_bases=[[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [1, 0], [2, 0]],
+        block_bases=[],
+        alignment=16,
+    )
+    qdo_stages: tl.constexpr = 4 if BATCH_STATS4 else 2
+    q_ring = tlx.local_alloc((BLOCK_M, D), tl.bfloat16, qdo_stages, layout=qdo_smem_layout)
+    do_ring = tlx.local_alloc((BLOCK_M, D), tl.bfloat16, qdo_stages, layout=qdo_smem_layout)
+    if CYCLIC_QUERY_SPLIT:
+        lse_buffer = tlx.local_alloc((8, BLOCK_M), tl.float32, 1, layout=all_head_stats_smem_layout)
+        delta_buffer = tlx.local_alloc((8, BLOCK_M), tl.float32, 1, layout=all_head_stats_smem_layout)
+        lse_all = tlx.local_view(lse_buffer, 0)
+        delta_all = tlx.local_view(delta_buffer, 0)
+    else:
+        lse_ring = tlx.local_alloc((BLOCK_M, ), tl.float32, 2, layout=stats_smem_layout)
+        delta_ring = tlx.local_alloc((BLOCK_M, ), tl.float32, 2, layout=stats_smem_layout)
+        if BATCH_STATS4:
+            lse_batch_ring = tlx.local_alloc((4, BLOCK_M), tl.float32, 2, layout=stats4_smem_layout)
+            delta_batch_ring = tlx.local_alloc((4, BLOCK_M), tl.float32, 2, layout=stats4_smem_layout)
+
+    # K/V are loaded once into their final MFMA operand layouts and remain
+    # resident through every owned head/BM64 visit. They never round-trip LDS.
+    kv_head = (pid_b * HKV + pid_hkv).to(tl.int64)
+    kv_base = kv_head * SKV * D
+    kv_rows = n0 + tl.arange(0, BLOCK_N)
+    kv_cols = tl.arange(0, D)
+    kv_offsets = (kv_rows[:, None] * D + kv_cols[None, :]).to(tl.int32)
+    k_offsets = tlx.require_layout(kv_offsets, k_op0_nm, pin=False)
+    v_offsets = tlx.require_layout(kv_offsets, v_op0_nm, pin=False)
+    k_nm = tlx.buffer_load(K + kv_base, k_offsets)
+    # K participates only in the score MFMA. Folding the constant softmax
+    # scale into this resident operand amortizes it over every owned query
+    # tile and head.
+    k_scale = tlx.require_layout(
+        tl.full((BLOCK_N, D), SM_SCALE * 1.4426950408889634, tl.float32),
+        k_op0_nm,
+        pin=False,
+    )
+    k_nm = (k_nm.to(tl.float32) * k_scale).to(tl.bfloat16)
+    k_nm = tlx.require_layout(k_nm, k_op0_nm, pin=False)
+    v_nm = tlx.buffer_load(V + kv_base, v_offsets)
+    v_nm = tlx.require_layout(v_nm, v_op0_nm, pin=False)
+
+    # Compute the bottom-right physical frontier once per resident K/V owner.
+    start_m_blk = tl.maximum((n0 - (SKV - SQ)) // BLOCK_M, 0)
+    # Implementations branch on this exact predicate so an unmasked BM64 has
+    # no elementwise causal arithmetic:
+    # n0 + BLOCK_N - 1 > m_blk * BLOCK_M + (SKV - SQ)
+    if LIFETIME_MODE == _D64_GQA_DIRECT_D64_JIT:
+        if CYCLIC_QUERY_SPLIT:
+            dk, dv = _d64_gqa8_all_head_direct_d64_impl(Q, DO, LSE_TERM, Delta, q_ring, do_ring, lse_all, delta_all,
+                                                        k_nm, v_nm, pid_b, pid_hkv, off_split, n0, start_m_blk,
+                                                        SM_SCALE, HQ, SQ, SKV, D, BLOCK_M, BLOCK_N, KV_SPLITS,
+                                                        q_async_layout, all_head_stats_layout, mma_nm, mma_nd,
+                                                        q_t_op1_nm, p_op0_nd, q_op1_nd)
+        elif BATCH_STATS4:
+            dk, dv = _d64_gqa8_async_stats4_direct_d64_impl(Q, DO, LSE_TERM, Delta, q_ring, do_ring, lse_ring,
+                                                            delta_ring, lse_batch_ring, delta_batch_ring, k_nm, v_nm,
+                                                            pid_b, pid_hkv, off_split, n0, start_m_blk, SM_SCALE, HQ,
+                                                            SQ, SKV, D, BLOCK_M, BLOCK_N, q_async_layout,
+                                                            stats_async_layout, stats4_async_layout, mma_nm, mma_nd,
+                                                            q_t_op1_nm, p_op0_nd, q_op1_nd)
+        else:
+            dk, dv = _d64_gqa8_direct_d64_impl(Q, DO, LSE_TERM, Delta, q_ring, do_ring, lse_ring, delta_ring, k_nm,
+                                               v_nm, pid_b, pid_hkv, off_split, n0, start_m_blk, SM_SCALE, HQ, SQ, SKV,
+                                               D, BLOCK_M, BLOCK_N, KV_SPLITS, False, q_async_layout,
+                                               stats_async_layout, mma_nm, mma_nd, q_t_op1_nm, p_op0_nd, q_op1_nd)
+    else:
+        tl.static_assert(not CYCLIC_QUERY_SPLIT)
+        INTERLEAVED_D32: tl.constexpr = (LIFETIME_MODE == _D64_GQA_INTERLEAVED_D32_JIT)
+        dk, dv = _d64_gqa8_d32_impl(Q, DO, LSE_TERM, Delta, q_ring, do_ring, lse_ring, delta_ring, k_nm, v_nm, pid_b,
+                                    pid_hkv, off_split, n0, start_m_blk, SM_SCALE, HQ, SQ, SKV, D, BLOCK_M, BLOCK_N,
+                                    INTERLEAVED_D32, q_async_layout, stats_async_layout, mma_nm, mma_nd, q_t_op1_nm,
+                                    p_op0_nd, q_op1_nd)
+
+    dk_scale = tlx.require_layout(tl.full((BLOCK_N, D), SM_SCALE, tl.float32), mma_nd, pin=False)
+    dk = tlx.require_layout(dk, mma_nd, pin=False) * dk_scale
+    dv = tlx.require_layout(dv, mma_nd, pin=False)
+    output_offsets = (tl.arange(0, BLOCK_N)[:, None] * D + tl.arange(0, D)[None, :]).to(tl.int32)
+    output_offsets = tlx.require_layout(output_offsets, out_layout, pin=False)
+    dk_out = tlx.require_layout(dk.to(tl.bfloat16), out_layout, pin=False)
+    dv_out = tlx.require_layout(dv.to(tl.bfloat16), out_layout, pin=False)
+    partial_head = ((pid_b * HKV + pid_hkv) * KV_SPLITS + off_split).to(tl.int64)
+    partial_base = partial_head * SKV * D + n0 * D
+    tlx.buffer_store(dk_out, DK_PART + partial_base, output_offsets)
+    tlx.buffer_store(dv_out, DV_PART + partial_base, output_offsets)
+
+
+@triton.jit
+def _attn_bwd_dkdv_d64_causal_gqa8_reduce_kernel(
+    DK_PART,
+    DV_PART,
+    DK,
+    DV,
+    HKV: tl.constexpr,
+    SKV: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    KV_SPLITS: tl.constexpr,
+):
+    """Reduce split 0,1,2,3 in FP32, then narrow exactly once."""
+    tl.static_assert(D == 64 and (BLOCK_N == 64 or BLOCK_N == 128) and SKV % BLOCK_N == 0)
+    tl.static_assert(KV_SPLITS == _D64_CAUSAL_GQA8_KV_SPLITS_JIT)
+    pid_n = tl.program_id(0)
+    pid_hkv = tl.program_id(1)
+    pid_b = tl.program_id(2)
+    n0 = pid_n * BLOCK_N
+    if BLOCK_N == 64:
+        out_layout: tl.constexpr = tlx.layout(
+            shape=((2, 2, 2, 2, 2, 2, 2, 2), (2, 2, 2, 2)),
+            stride=((64, 128, 256, 512, 8, 16, 1024, 2048), (1, 2, 4, 32)),
+        )
+    else:
+        out_layout: tl.constexpr = tlx.layout(
+            shape=(
+                (2, 2, 2, 2, 2, 2, 2, 2),
+                (2, 2, 2, 2, 2),
+            ),
+            stride=(
+                (64, 128, 256, 512, 8, 16, 1024, 2048),
+                (1, 2, 4, 32, 4096),
+            ),
+        )
+    offsets = (tl.arange(0, BLOCK_N)[:, None] * D + tl.arange(0, D)[None, :]).to(tl.int32)
+    offsets = tlx.require_layout(offsets, out_layout, pin=False)
+    owner = (pid_b * HKV + pid_hkv).to(tl.int64)
+    split_stride: tl.constexpr = SKV * D
+    partial_base = owner * KV_SPLITS * split_stride + n0 * D
+
+    dk_acc = tlx.zeros((BLOCK_N, D), tl.float32, layout=out_layout)
+    dv_acc = tlx.zeros((BLOCK_N, D), tl.float32, layout=out_layout)
+    for split in tl.static_range(0, KV_SPLITS):
+        dk_part = tlx.buffer_load(DK_PART + partial_base + split * split_stride, offsets)
+        dv_part = tlx.buffer_load(DV_PART + partial_base + split * split_stride, offsets)
+        dk_acc += dk_part.to(tl.float32)
+        dv_acc += dv_part.to(tl.float32)
+
+    output_base = owner * SKV * D + n0 * D
+    dk_out = tlx.require_layout(dk_acc.to(tl.bfloat16), out_layout, pin=False)
+    dv_out = tlx.require_layout(dv_acc.to(tl.bfloat16), out_layout, pin=False)
+    tlx.buffer_store(dk_out, DK + output_base, offsets)
+    tlx.buffer_store(dv_out, DV + output_base, offsets)
+
+
+@triton.jit
+def _attn_bwd_dq_d64_update(
+    q_tile,
+    do_tile,
+    lse,
+    delta,
+    dq,
+    k_tile,
+    k_t,
+    v_t,
+    offs_m,
+    offs_n,
+    SM_SCALE: tl.constexpr,
+    IS_CAUSAL: tl.constexpr,
+    SQ: tl.constexpr,
+    SKV: tl.constexpr,
+):
+    log2e: tl.constexpr = 1.4426950408889634
+    scores = tl.dot(q_tile, k_t)
+    scores = scores * (SM_SCALE * log2e) - lse[:, None] * log2e
+    valid = (offs_m[:, None] < SQ) & (offs_n[None, :] < SKV)
+    if IS_CAUSAL:
+        valid = valid & (offs_n[None, :] <= offs_m[:, None] + (SKV - SQ))
+    scores = tl.where(valid, scores, float("-inf"))
+    p = tl.math.exp2(scores)
+    dp = tl.dot(do_tile, v_t)
+    ds = p * (dp - delta[:, None])
+    return tl.dot(ds.to(tl.bfloat16), k_tile, dq)
+
+
+@triton.jit
+def _attn_bwd_dq_d64_direct_kernel(
+    Q,
+    K,
+    V,
+    DO,
+    LSE,
+    Delta,
+    DQ,
+    SM_SCALE: tl.constexpr,
+    IS_CAUSAL: tl.constexpr,
+    HQ: tl.constexpr,
+    HKV: tl.constexpr,
+    SQ: tl.constexpr,
+    SKV: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    OWNER_ROWS: tl.constexpr,
+):
+    """Query-owned D64 dQ with shared K/V and direct fragment stores."""
+    tl.static_assert(D == 64)
+    tl.static_assert(BLOCK_M == 32 or BLOCK_M == 64)
+    tl.static_assert(BLOCK_N == 32 or BLOCK_N == 64 or BLOCK_N == 256)
+    tl.static_assert(OWNER_ROWS == BLOCK_M or OWNER_ROWS == 192 or OWNER_ROWS == 256)
+    tl.static_assert(HQ % HKV == 0)
+    pid_owner = tl.program_id(0)
+    pid_hq = tl.program_id(1)
+    pid_b = tl.program_id(2)
+    group_size: tl.constexpr = HQ // HKV
+    pid_hkv = pid_hq // group_size
+    offs_d = tl.arange(0, D)
+    q_head = (pid_b * HQ + pid_hq).to(tl.int64)
+    kv_head = (pid_b * HKV + pid_hkv).to(tl.int64)
+    q_base = q_head * SQ * D
+    kv_base = kv_head * SKV * D
+    stats_base = q_head * SQ
+
+    num_owners: tl.constexpr = tl.cdiv(SQ, OWNER_ROWS)
+    logical_owner = num_owners - 1 - pid_owner if IS_CAUSAL else pid_owner
+    owner_start = logical_owner * OWNER_ROWS
+    offs_m0 = owner_start + tl.arange(0, BLOCK_M)
+    qdo_ptrs0 = q_base + offs_m0[:, None] * D + offs_d[None, :]
+    qdo_mask0 = offs_m0[:, None] < SQ
+    q0 = tl.load(Q + qdo_ptrs0, mask=qdo_mask0, other=0.0)
+    do0 = tl.load(DO + qdo_ptrs0, mask=qdo_mask0, other=0.0)
+    lse0 = tl.load(LSE + stats_base + offs_m0, mask=offs_m0 < SQ, other=0.0)
+    delta0 = tl.load(Delta + stats_base + offs_m0, mask=offs_m0 < SQ, other=0.0)
+    dq0 = tl.zeros((BLOCK_M, D), tl.float32)
+    if OWNER_ROWS >= 128:
+        offs_m1 = owner_start + 64 + tl.arange(0, 64)
+        qdo_ptrs1 = q_base + offs_m1[:, None] * D + offs_d[None, :]
+        qdo_mask1 = offs_m1[:, None] < SQ
+        q1 = tl.load(Q + qdo_ptrs1, mask=qdo_mask1, other=0.0)
+        do1 = tl.load(DO + qdo_ptrs1, mask=qdo_mask1, other=0.0)
+        lse1 = tl.load(LSE + stats_base + offs_m1, mask=offs_m1 < SQ, other=0.0)
+        delta1 = tl.load(Delta + stats_base + offs_m1, mask=offs_m1 < SQ, other=0.0)
+        dq1 = tl.zeros((64, D), tl.float32)
+        offs_m2 = owner_start + 128 + tl.arange(0, 64)
+        qdo_ptrs2 = q_base + offs_m2[:, None] * D + offs_d[None, :]
+        qdo_mask2 = offs_m2[:, None] < SQ
+        q2 = tl.load(Q + qdo_ptrs2, mask=qdo_mask2, other=0.0)
+        do2 = tl.load(DO + qdo_ptrs2, mask=qdo_mask2, other=0.0)
+        lse2 = tl.load(LSE + stats_base + offs_m2, mask=offs_m2 < SQ, other=0.0)
+        delta2 = tl.load(Delta + stats_base + offs_m2, mask=offs_m2 < SQ, other=0.0)
+        dq2 = tl.zeros((64, D), tl.float32)
+    if OWNER_ROWS == 256:
+        offs_m3 = owner_start + 192 + tl.arange(0, 64)
+        qdo_ptrs3 = q_base + offs_m3[:, None] * D + offs_d[None, :]
+        qdo_mask3 = offs_m3[:, None] < SQ
+        q3 = tl.load(Q + qdo_ptrs3, mask=qdo_mask3, other=0.0)
+        do3 = tl.load(DO + qdo_ptrs3, mask=qdo_mask3, other=0.0)
+        lse3 = tl.load(LSE + stats_base + offs_m3, mask=offs_m3 < SQ, other=0.0)
+        delta3 = tl.load(Delta + stats_base + offs_m3, mask=offs_m3 < SQ, other=0.0)
+        dq3 = tl.zeros((64, D), tl.float32)
+
+    if BLOCK_N == 32:
+        row_bases: tl.constexpr = [[16, 0], [8, 0], [1, 0], [2, 0], [4, 0]]
+    else:
+        if BLOCK_N == 64:
+            row_bases: tl.constexpr = [[16, 0], [32, 0], [1, 0], [2, 0], [4, 0], [8, 0]]
+        else:
+            row_bases: tl.constexpr = [
+                [16, 0],
+                [32, 0],
+                [64, 0],
+                [128, 0],
+                [1, 0],
+                [2, 0],
+                [4, 0],
+                [8, 0],
+            ]
+    shared_layout: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases(
+        [(512, 32)],
+        [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32]] + row_bases,
+        [BLOCK_N, D],
+    )
+    k_buffer = tlx.local_alloc((BLOCK_N, D), tl.bfloat16, 1, layout=shared_layout)
+    v_buffer = tlx.local_alloc((BLOCK_N, D), tl.bfloat16, 1, layout=shared_layout)
+    if IS_CAUSAL:
+        owner_key_end = tl.minimum(SKV, owner_start + OWNER_ROWS + (SKV - SQ))
+        num_n_blocks = (owner_key_end + BLOCK_N - 1) // BLOCK_N
+    else:
+        num_n_blocks: tl.constexpr = tl.cdiv(SKV, BLOCK_N)
+
+    for n_block in range(0, num_n_blocks):
+        tl.debug_barrier()
+        offs_n = n_block * BLOCK_N + tl.arange(0, BLOCK_N)
+        kv_ptrs = kv_base + offs_n[:, None] * D + offs_d[None, :]
+        kv_mask = offs_n[:, None] < SKV
+        k_token = tlx.async_load(K + kv_ptrs, tlx.local_view(k_buffer, 0), mask=kv_mask, other=0.0)
+        v_token = tlx.async_load(V + kv_ptrs, tlx.local_view(v_buffer, 0), mask=kv_mask, other=0.0)
+        tlx.async_load_commit_group([k_token, v_token])
+        kv_wait = tlx.async_load_wait_group(0)
+        k_tile = tlx.local_load(tlx.local_view(k_buffer, 0), token=kv_wait)
+        k_t = tlx.local_load(tlx.local_trans(tlx.local_view(k_buffer, 0)), token=kv_wait)
+        v_t = tlx.local_load(tlx.local_trans(tlx.local_view(v_buffer, 0)), token=kv_wait)
+        dq0 = _attn_bwd_dq_d64_update(q0, do0, lse0, delta0, dq0, k_tile, k_t, v_t, offs_m0, offs_n, SM_SCALE,
+                                      IS_CAUSAL, SQ, SKV)
+        if OWNER_ROWS >= 128:
+            dq1 = _attn_bwd_dq_d64_update(q1, do1, lse1, delta1, dq1, k_tile, k_t, v_t, offs_m1, offs_n, SM_SCALE,
+                                          IS_CAUSAL, SQ, SKV)
+            dq2 = _attn_bwd_dq_d64_update(q2, do2, lse2, delta2, dq2, k_tile, k_t, v_t, offs_m2, offs_n, SM_SCALE,
+                                          IS_CAUSAL, SQ, SKV)
+        if OWNER_ROWS == 256:
+            dq3 = _attn_bwd_dq_d64_update(q3, do3, lse3, delta3, dq3, k_tile, k_t, v_t, offs_m3, offs_n, SM_SCALE,
+                                          IS_CAUSAL, SQ, SKV)
+
+    tl.store(DQ + qdo_ptrs0, (dq0 * SM_SCALE).to(tl.bfloat16), mask=qdo_mask0)
+    if OWNER_ROWS >= 128:
+        tl.store(DQ + qdo_ptrs1, (dq1 * SM_SCALE).to(tl.bfloat16), mask=qdo_mask1)
+        tl.store(DQ + qdo_ptrs2, (dq2 * SM_SCALE).to(tl.bfloat16), mask=qdo_mask2)
+    if OWNER_ROWS == 256:
+        tl.store(DQ + qdo_ptrs3, (dq3 * SM_SCALE).to(tl.bfloat16), mask=qdo_mask3)
+
+
+@triton.jit
+def _attn_bwd_dkdv_d64_direct_kernel(
+    Q,
+    K,
+    V,
+    DO,
+    LSE,
+    Delta,
+    DK,
+    DV,
+    SM_SCALE: tl.constexpr,
+    IS_CAUSAL: tl.constexpr,
+    HQ: tl.constexpr,
+    HKV: tl.constexpr,
+    SQ: tl.constexpr,
+    SKV: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    KV_SPLITS: tl.constexpr,
+):
+    """KV-owned D64 dK/dV with deterministic FP32 GQA accumulation."""
+    tl.static_assert(D == 64)
+    tl.static_assert(BLOCK_M == 64 and BLOCK_N == 64)
+    tl.static_assert(HQ % HKV == 0)
+    tl.static_assert((HQ // HKV) % KV_SPLITS == 0)
+    pid_n = tl.program_id(0)
+    pid_hkv_split = tl.program_id(1)
+    pid_b = tl.program_id(2)
+    group_size: tl.constexpr = HQ // HKV
+    heads_per_split: tl.constexpr = group_size // KV_SPLITS
+    pid_hkv = pid_hkv_split // KV_SPLITS
+    pid_split = pid_hkv_split % KV_SPLITS
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_d = tl.arange(0, D)
+    kv_head = (pid_b * HKV + pid_hkv).to(tl.int64)
+    kv_base = kv_head * SKV * D
+    kv_ptrs = kv_base + offs_n[:, None] * D + offs_d[None, :]
+    kv_mask = offs_n[:, None] < SKV
+    k_tile = tl.load(K + kv_ptrs, mask=kv_mask, other=0.0)
+    v_tile = tl.load(V + kv_ptrs, mask=kv_mask, other=0.0)
+
+    shared_layout: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases(
+        [(512, 32)],
+        [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [16, 0], [32, 0], [1, 0], [2, 0], [4, 0], [8, 0]],
+        [BLOCK_M, D],
+    )
+    q_buffer = tlx.local_alloc((BLOCK_M, D), tl.bfloat16, 1, layout=shared_layout)
+    do_buffer = tlx.local_alloc((BLOCK_M, D), tl.bfloat16, 1, layout=shared_layout)
+    dk = tl.zeros((BLOCK_N, D), tl.float32)
+    dv = tl.zeros((BLOCK_N, D), tl.float32)
+    num_m_blocks: tl.constexpr = tl.cdiv(SQ, BLOCK_M)
+    if IS_CAUSAL:
+        first_m_block = tl.maximum(0, pid_n * BLOCK_N - (SKV - SQ)) // BLOCK_M
+    else:
+        first_m_block: tl.constexpr = 0
+    causal_shift: tl.constexpr = SKV - SQ
+    log2e: tl.constexpr = 1.4426950408889634
+
+    for local_group_head in tl.static_range(0, heads_per_split):
+        group_head = pid_split * heads_per_split + local_group_head
+        pid_hq = pid_hkv * group_size + group_head
+        q_head = (pid_b * HQ + pid_hq).to(tl.int64)
+        q_base = q_head * SQ * D
+        stats_base = q_head * SQ
+        for m_block in range(first_m_block, num_m_blocks):
+            tl.debug_barrier()
+            offs_m = m_block * BLOCK_M + tl.arange(0, BLOCK_M)
+            qdo_ptrs = q_base + offs_m[:, None] * D + offs_d[None, :]
+            qdo_mask = offs_m[:, None] < SQ
+            q_token = tlx.async_load(Q + qdo_ptrs, tlx.local_view(q_buffer, 0), mask=qdo_mask, other=0.0)
+            do_token = tlx.async_load(DO + qdo_ptrs, tlx.local_view(do_buffer, 0), mask=qdo_mask, other=0.0)
+            tlx.async_load_commit_group([q_token, do_token])
+            qdo_wait = tlx.async_load_wait_group(0)
+            q_tile = tlx.local_load(tlx.local_view(q_buffer, 0), token=qdo_wait)
+            do_tile = tlx.local_load(tlx.local_view(do_buffer, 0), token=qdo_wait)
+            q_t = tlx.local_load(tlx.local_trans(tlx.local_view(q_buffer, 0)), token=qdo_wait)
+            do_t = tlx.local_load(tlx.local_trans(tlx.local_view(do_buffer, 0)), token=qdo_wait)
+            lse = tl.load(LSE + stats_base + offs_m, mask=offs_m < SQ, other=0.0)
+            delta = tl.load(Delta + stats_base + offs_m, mask=offs_m < SQ, other=0.0)
+            scores_t = tl.dot(k_tile, q_t)
+            scores_t = scores_t * (SM_SCALE * log2e) - lse[None, :] * log2e
+            valid = (offs_n[:, None] < SKV) & (offs_m[None, :] < SQ)
+            if IS_CAUSAL:
+                valid = valid & (offs_n[:, None] <= offs_m[None, :] + causal_shift)
+            scores_t = tl.where(valid, scores_t, float("-inf"))
+            p_t = tl.math.exp2(scores_t)
+            dp_t = tl.dot(v_tile, do_t)
+            ds_t = p_t * (dp_t - delta[None, :])
+            dv = tl.dot(p_t.to(tl.bfloat16), do_tile, dv)
+            dk = tl.dot(ds_t.to(tl.bfloat16), q_tile, dk)
+
+    dk *= SM_SCALE
+    if KV_SPLITS == 1:
+        output_ptrs = kv_ptrs
+    else:
+        partial_head = ((pid_b * HKV + pid_hkv) * KV_SPLITS + pid_split).to(tl.int64)
+        output_ptrs = partial_head * SKV * D + offs_n[:, None] * D + offs_d[None, :]
+    tl.store(DK + output_ptrs, dk.to(tl.bfloat16), mask=kv_mask)
+    tl.store(DV + output_ptrs, dv.to(tl.bfloat16), mask=kv_mask)
+
+
+@triton.jit
+def _attn_bwd_dkdv_d64_reduce_kernel(
+    DK_PART,
+    DV_PART,
+    DK,
+    DV,
+    HKV: tl.constexpr,
+    SKV: tl.constexpr,
+    D: tl.constexpr,
+    KV_SPLITS: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """Reduce fixed-order BF16 GQA partials in FP32 and narrow once."""
+    tl.static_assert(D == 64 and BLOCK_N == 64)
+    pid_n = tl.program_id(0)
+    pid_hkv = tl.program_id(1)
+    pid_b = tl.program_id(2)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_d = tl.arange(0, D)
+    mask = offs_n[:, None] < SKV
+    dk = tl.zeros((BLOCK_N, D), tl.float32)
+    dv = tl.zeros((BLOCK_N, D), tl.float32)
+    for split in tl.static_range(0, KV_SPLITS):
+        partial_head = ((pid_b * HKV + pid_hkv) * KV_SPLITS + split).to(tl.int64)
+        partial_ptrs = partial_head * SKV * D + offs_n[:, None] * D + offs_d[None, :]
+        dk += tl.load(DK_PART + partial_ptrs, mask=mask, other=0.0).to(tl.float32)
+        dv += tl.load(DV_PART + partial_ptrs, mask=mask, other=0.0).to(tl.float32)
+    output_head = (pid_b * HKV + pid_hkv).to(tl.int64)
+    output_ptrs = output_head * SKV * D + offs_n[:, None] * D + offs_d[None, :]
+    tl.store(DK + output_ptrs, dk.to(tl.bfloat16), mask=mask)
+    tl.store(DV + output_ptrs, dv.to(tl.bfloat16), mask=mask)
+
+
+def _launch_bwd_d64_dq(q, k, v, do, lse, delta, dq, sm_scale, causal, dispatch):
+    batch, hq, sq, head_dim = q.shape
+    _k_batch, hkv, skv, _k_head_dim = k.shape
+    dq_block_m = 32 if dispatch.owner_rows == 32 else 64
+    _attn_bwd_dq_d64_direct_kernel[(triton.cdiv(sq, dispatch.owner_rows), hq, batch)](
+        q,
+        k,
+        v,
+        do,
+        lse,
+        delta,
+        dq,
+        SM_SCALE=sm_scale,
+        IS_CAUSAL=causal,
+        HQ=hq,
+        HKV=hkv,
+        SQ=sq,
+        SKV=skv,
+        D=head_dim,
+        BLOCK_M=dq_block_m,
+        BLOCK_N=dispatch.key_rows,
+        OWNER_ROWS=dispatch.owner_rows,
+        num_warps=4,
+        matrix_instr_nonkdim=_matrix_instr_nonkdim(),
+    )
+
+
+def _launch_bwd_d64_causal_dq(
+    q,
+    k,
+    v,
+    o,
+    do,
+    lse,
+    delta,
+    lse_term,
+    dq,
+    sm_scale,
+    dispatch,
+):
+    batch, hq, sq, head_dim = q.shape
+    _k_batch, hkv, skv, _k_head_dim = k.shape
+    if dispatch.stat_mode == _D64_MHA_POSITIVE:
+        if lse_term is not None:
+            raise ValueError("MHA positive dQ must not receive lse_term")
+        kernel = _attn_bwd_dq_d64_causal_mha_kernel
+    elif dispatch.stat_mode == _D64_GQA_SIGNED:
+        if lse_term is None:
+            raise ValueError("GQA signed dQ requires lse_term")
+        kernel = _attn_bwd_dq_d64_causal_gqa8_kernel
+    else:
+        raise ValueError(f"unknown dQ stat mode {dispatch.stat_mode!r}")
+
+    for launch in dispatch.dq_launches:
+        grid = (batch * hq * launch.launch_tiles, )
+        args = (q, k, v, o, do, lse, delta)
+        if dispatch.stat_mode == _D64_GQA_SIGNED:
+            args += (lse_term, )
+        args += (dq, )
+        kernel[grid](
+            *args,
+            SM_SCALE=sm_scale,
+            HQ=hq,
+            HKV=hkv,
+            SQ=sq,
+            SKV=skv,
+            D=head_dim,
+            OWNER_ROWS=dispatch.owner_rows,
+            LOGICAL_N=dispatch.dq_logical_n,
+            USE_DQ_XCD=dispatch.dq_use_xcd,
+            SKIP_OWNER_TAIL=launch.skip_owner_tail,
+            OWNER_PID_BASE=launch.owner_pid_base,
+            LAUNCH_Q_TILES=launch.launch_q_tiles,
+            OWNER_FRAGMENTS=launch.owner_fragments,
+            GRID_OWNER_M=launch.grid_owner_m,
+            KV_PIPELINE_STAGES=_D64_DQ_KV_STAGES,
+            num_warps=4,
+            matrix_instr_nonkdim=_matrix_instr_nonkdim(),
+        )
+
+
+def _launch_bwd_d64_causal_mha_dkdv(q, k, v, do, lse, delta, dk, dv, sm_scale, dispatch):
+    batch, hq, sq, head_dim = q.shape
+    _k_batch, hkv, skv, _k_head_dim = k.shape
+    _require_d64_dispatch_variant(
+        dispatch,
+        "causal_scheduled_mha",
+        stat_mode=_D64_MHA_POSITIVE,
+        kv_splits=1,
+    )
+    grid = (batch * hkv * triton.cdiv(skv, 64), )
+    _attn_bwd_dkdv_d64_causal_mha_kernel[grid](
+        q,
+        k,
+        v,
+        do,
+        lse,
+        delta,
+        dk,
+        dv,
+        SM_SCALE=sm_scale,
+        HQ=hq,
+        HKV=hkv,
+        SQ=sq,
+        SKV=skv,
+        D=head_dim,
+        BLOCK_M=32,
+        BLOCK_N=64,
+        LSE_MODE=_D64_LSE_NATURAL_LOG,
+        DELTA_MODE=_D64_DELTA_POSITIVE,
+        num_warps=2,
+        matrix_instr_nonkdim=_matrix_instr_nonkdim(),
+    )
+
+
+def _launch_bwd_d64_causal_gqa8_dkdv(
+    q,
+    k,
+    v,
+    do,
+    lse_term,
+    delta,
+    dk_part,
+    dv_part,
+    sm_scale,
+    dispatch,
+):
+    batch, hq, sq, head_dim = q.shape
+    _k_batch, hkv, skv, _k_head_dim = k.shape
+    _require_d64_dispatch_variant(
+        dispatch,
+        "causal_scheduled_gqa8",
+        stat_mode=_D64_GQA_SIGNED,
+        kv_splits=_D64_CAUSAL_GQA8_KV_SPLITS,
+    )
+    use_gqa_xcd = dispatch.gqa_grid_mode != _D64_GQA_SPLIT_FAST
+    use_xcd_n_fast = dispatch.gqa_grid_mode == _D64_GQA_XCD_N_FAST
+    kv_splits = dispatch.kv_splits
+    block_n = 128
+    batch_stats4 = _d64_causal_gqa8_batch_stats4(sq, skv, dispatch)
+    grid = (batch * hkv * kv_splits * triton.cdiv(skv, block_n), )
+    _attn_bwd_dkdv_d64_causal_gqa8_kernel[grid](
+        q,
+        k,
+        v,
+        do,
+        lse_term,
+        delta,
+        dk_part,
+        dv_part,
+        SM_SCALE=sm_scale,
+        HQ=hq,
+        HKV=hkv,
+        SQ=sq,
+        SKV=skv,
+        D=head_dim,
+        BLOCK_M=64,
+        BLOCK_N=block_n,
+        KV_SPLITS=kv_splits,
+        USE_GQA_XCD=use_gqa_xcd,
+        USE_XCD_N_FAST=use_xcd_n_fast,
+        CYCLIC_QUERY_SPLIT=dispatch.cyclic_query_split,
+        BATCH_STATS4=batch_stats4,
+        LIFETIME_MODE=dispatch.dkdv_lifetime,
+        LSE_MODE=_D64_LSE_NEG_LOG2E,
+        DELTA_MODE=_D64_DELTA_NEGATED,
+        num_warps=4,
+        matrix_instr_nonkdim=_matrix_instr_nonkdim(),
+    )
+
+
+def _launch_bwd_d64_causal_gqa8_reduce(dk_part, dv_part, dk, dv):
+    batch, hkv, skv, head_dim = dk.shape
+    block_n = 64
+    _attn_bwd_dkdv_d64_causal_gqa8_reduce_kernel[(triton.cdiv(skv, block_n), hkv, batch)](
+        dk_part,
+        dv_part,
+        dk,
+        dv,
+        HKV=hkv,
+        SKV=skv,
+        D=head_dim,
+        BLOCK_N=block_n,
+        KV_SPLITS=dk_part.shape[2],
+        num_warps=4,
+    )
+
+
+def _allocate_bwd_d64_kv_partials(k, kv_splits):
+    if kv_splits == 1:
+        return None, None
+    batch, hkv, skv, head_dim = k.shape
+    partial_shape = (batch, hkv, kv_splits, skv, head_dim)
+    dk_part = torch.empty(partial_shape, device=k.device, dtype=k.dtype)
+    return dk_part, torch.empty_like(dk_part)
+
+
+def _allocate_bwd_d64_causal_gqa8_workspaces(q, k):
+    batch, hq, sq, _d = q.shape
+    _kb, hkv, skv, head_dim = k.shape
+    lse_term = torch.empty((batch, hq, sq), device=q.device, dtype=torch.float32)
+    partial_shape = (batch, hkv, _D64_CAUSAL_GQA8_KV_SPLITS, skv, head_dim)
+    dk_part = torch.empty(partial_shape, device=k.device, dtype=torch.bfloat16)
+    return lse_term, dk_part, torch.empty_like(dk_part)
+
+
+def _allocate_bwd_d64_fused_workspaces(q, k, dispatch):
+    _require_d64_dispatch_variant(dispatch, "noncausal_fused_n256")
+    dq_acc = torch.empty_like(q, dtype=torch.float32)
+    if dispatch.kv_splits == 1:
+        return dq_acc, None, None
+    dk_part, dv_part = _allocate_bwd_d64_kv_partials(k, dispatch.kv_splits)
+    return dq_acc, dk_part, dv_part
+
+
+def _launch_bwd_d64_fused_n256(
+    q,
+    k,
+    v,
+    do,
+    lse,
+    delta,
+    dq_acc,
+    dk_owner,
+    dv_owner,
+    sm_scale,
+    dispatch,
+):
+    batch, hq, sq, head_dim = q.shape
+    _k_batch, hkv, skv, _k_head_dim = k.shape
+    _attn_bwd_d64_fused_n256_kernel[(triton.cdiv(skv, 256), hq, batch)](
+        q,
+        k,
+        v,
+        do,
+        lse,
+        delta,
+        dq_acc,
+        dk_owner,
+        dv_owner,
+        SM_SCALE=sm_scale,
+        HQ=hq,
+        HKV=hkv,
+        SQ=sq,
+        SKV=skv,
+        D=head_dim,
+        BLOCK_M=32,
+        BLOCK_N=256,
+        KV_SPLITS=dispatch.kv_splits,
+        num_warps=4,
+        matrix_instr_nonkdim=_matrix_instr_nonkdim(),
+    )
+
+
+def _launch_bwd_d64_fused_dq_convert(dq_acc, dq):
+    batch, hq, sq, head_dim = dq.shape
+    block_m = 64
+    _attn_bwd_d64_fused_dq_convert_kernel[(triton.cdiv(sq, block_m), batch * hq)](
+        dq_acc,
+        dq,
+        N=sq,
+        D=head_dim,
+        BLOCK_M=block_m,
+        num_warps=4,
+    )
+
+
+def _launch_bwd_d64_dkdv(q, k, v, do, lse, delta, dk_target, dv_target, sm_scale, causal, dispatch):
+    batch, hq, sq, head_dim = q.shape
+    _k_batch, hkv, skv, _k_head_dim = k.shape
+    dkdv_block = 64
+    _attn_bwd_dkdv_d64_direct_kernel[(triton.cdiv(skv, dkdv_block), hkv * dispatch.kv_splits, batch)](
+        q,
+        k,
+        v,
+        do,
+        lse,
+        delta,
+        dk_target,
+        dv_target,
+        SM_SCALE=sm_scale,
+        IS_CAUSAL=causal,
+        HQ=hq,
+        HKV=hkv,
+        SQ=sq,
+        SKV=skv,
+        D=head_dim,
+        BLOCK_M=dkdv_block,
+        BLOCK_N=dkdv_block,
+        KV_SPLITS=dispatch.kv_splits,
+        num_warps=4,
+        matrix_instr_nonkdim=_matrix_instr_nonkdim(),
+    )
+
+
+def _launch_bwd_d64_kv_reduce(dk_part, dv_part, dk, dv, dispatch):
+    batch, hkv, skv, head_dim = dk.shape
+    block_n = 64
+    _attn_bwd_dkdv_d64_reduce_kernel[(triton.cdiv(skv, block_n), hkv, batch)](
+        dk_part,
+        dv_part,
+        dk,
+        dv,
+        HKV=hkv,
+        SKV=skv,
+        D=head_dim,
+        KV_SPLITS=dispatch.kv_splits,
+        BLOCK_N=block_n,
+        num_warps=4,
+    )
+
+
+def _run_bwd_d64_direct(q, k, v, do, lse, delta, dq, dk, dv, sm_scale, causal, dispatch):
+    _validate_d64_dispatch(tuple(q.shape), tuple(k.shape), causal, dispatch)
+    if dispatch.family not in {
+            "noncausal_direct_n256",
+            "causal_m192",
+            "causal_m256",
+    }:
+        _invalid_d64_dispatch(dispatch, "family cannot use the direct route")
+    _launch_bwd_d64_dq(q, k, v, do, lse, delta, dq, sm_scale, causal, dispatch)
+    dk_part, dv_part = _allocate_bwd_d64_kv_partials(k, dispatch.kv_splits)
+    dk_target = dk if dk_part is None else dk_part
+    dv_target = dv if dv_part is None else dv_part
+    _launch_bwd_d64_dkdv(q, k, v, do, lse, delta, dk_target, dv_target, sm_scale, causal, dispatch)
+    if dk_part is not None:
+        _launch_bwd_d64_kv_reduce(dk_part, dv_part, dk, dv, dispatch)
+
+
+def _select_d64_dispatch_for_device(q, k, v, o, do, lse, sm_scale, causal):
+    properties = torch.cuda.get_device_properties(q.device)
+    bases_aligned_16 = all(tensor.data_ptr() % 16 == 0 for tensor in (q, k, v, o, do, lse))
+    return _select_d64_dispatch(
+        tuple(q.shape),
+        tuple(k.shape),
+        causal,
+        arch=properties.gcnArchName,
+        cu_count=properties.multi_processor_count,
+        sm_scale=sm_scale,
+        bases_aligned_16=bases_aligned_16,
+    )
+
+
+def _run_bwd_d64(q, k, v, o, do, lse, delta, dq, dk, dv, sm_scale, causal, dispatch):
+    _validate_d64_dispatch(tuple(q.shape), tuple(k.shape), causal, dispatch)
+    if dispatch.family == "causal_scheduled_gqa8":
+        lse_term, dk_part, dv_part = _allocate_bwd_d64_causal_gqa8_workspaces(q, k)
+        _launch_bwd_d64_causal_dq(
+            q,
+            k,
+            v,
+            o,
+            do,
+            lse,
+            delta,
+            lse_term,
+            dq,
+            sm_scale,
+            dispatch,
+        )
+        _launch_bwd_d64_causal_gqa8_dkdv(
+            q,
+            k,
+            v,
+            do,
+            lse_term,
+            delta,
+            dk_part,
+            dv_part,
+            sm_scale,
+            dispatch,
+        )
+        _launch_bwd_d64_causal_gqa8_reduce(dk_part, dv_part, dk, dv)
+        return
+    if dispatch.family == "causal_scheduled_mha":
+        _launch_bwd_d64_causal_dq(
+            q,
+            k,
+            v,
+            o,
+            do,
+            lse,
+            delta,
+            None,
+            dq,
+            sm_scale,
+            dispatch,
+        )
+        _launch_bwd_d64_causal_mha_dkdv(
+            q,
+            k,
+            v,
+            do,
+            lse,
+            delta,
+            dk,
+            dv,
+            sm_scale,
+            dispatch,
+        )
+        return
+    if dispatch.family == "noncausal_fused_n256":
+        dq_acc, dk_part, dv_part = _allocate_bwd_d64_fused_workspaces(q, k, dispatch)
+        dk_owner = dk if dk_part is None else dk_part
+        dv_owner = dv if dv_part is None else dv_part
+        _run_bwd_preprocess(o, do, delta, dq_acc=dq_acc)
+        _launch_bwd_d64_fused_n256(
+            q,
+            k,
+            v,
+            do,
+            lse,
+            delta,
+            dq_acc,
+            dk_owner,
+            dv_owner,
+            sm_scale,
+            dispatch,
+        )
+        _launch_bwd_d64_fused_dq_convert(dq_acc, dq)
+        if dk_part is not None:
+            _launch_bwd_d64_kv_reduce(dk_part, dv_part, dk, dv, dispatch)
+        return
+
+    _run_bwd_preprocess(o, do, delta)
+    _run_bwd_d64_direct(q, k, v, do, lse, delta, dq, dk, dv, sm_scale, causal, dispatch)

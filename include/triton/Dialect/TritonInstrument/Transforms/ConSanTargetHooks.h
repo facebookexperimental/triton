@@ -137,7 +137,6 @@ public:
                                        copyOp.getResult());
       return info;
     }
-
     MemEffectsOpInfo info;
     info.trackingKind = MemEffectsOpInfo::TrackingKind::Barrier;
     auto barrierOp = dyn_cast<ttg::MBarrierOpInterface>(op);

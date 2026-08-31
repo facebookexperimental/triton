@@ -17,6 +17,9 @@ def _has_hopper():
     return is_cuda() and torch.cuda.get_device_capability()[0] >= 9
 
 
+pytestmark = pytest.mark.skipif(not _has_hopper(), reason="Requires Hopper or newer (sm90+)")
+
+
 @pytest.fixture(autouse=True)
 def _auto_tma_env():
     # TMA descriptors are built into global scratch, which needs an allocator.
@@ -34,9 +37,6 @@ def _add_kernel(x_ptr, y_ptr, out_ptr, N, BLOCK: tl.constexpr):
     x = tl.load(x_ptr + offs, mask=mask)
     y = tl.load(y_ptr + offs, mask=mask)
     tl.store(out_ptr + offs, x + y, mask=mask)
-
-
-@pytest.mark.skipif(not _has_hopper(), reason="auto-TMA requires Hopper+ (sm_90)")
 def test_auto_tma_vector_add():
     N = 8192
     x = torch.randn(N, device="cuda", dtype=torch.float16)
@@ -45,9 +45,6 @@ def test_auto_tma_vector_add():
     grid = lambda meta: (triton.cdiv(N, meta["BLOCK"]), )
     _add_kernel[grid](x, y, out, N, BLOCK=256)
     torch.testing.assert_close(out, x + y, atol=1e-2, rtol=1e-2)
-
-
-@pytest.mark.skipif(not _has_hopper(), reason="auto-TMA requires Hopper+ (sm_90)")
 def test_auto_tma_vector_add_non_multiple():
     # N not a multiple of BLOCK exercises the masked / OOB-zero-fill tail.
     N = 8000
@@ -69,9 +66,6 @@ def _scale_2d_kernel(x_ptr, out_ptr, M, N, stride_m, BLOCK_M: tl.constexpr, BLOC
     ptrs = x_ptr + offs_m[:, None] * stride_m + offs_n[None, :]
     x = tl.load(ptrs, mask=mask, other=0.0)
     tl.store(out_ptr + offs_m[:, None] * stride_m + offs_n[None, :], x * 2.0, mask=mask)
-
-
-@pytest.mark.skipif(not _has_hopper(), reason="auto-TMA requires Hopper+ (sm_90)")
 def test_auto_tma_2d_scale():
     M, N = 200, 300  # non-multiples of BLOCK to exercise the mask
     BLOCK_M, BLOCK_N = 64, 64
@@ -80,9 +74,6 @@ def test_auto_tma_2d_scale():
     grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
     _scale_2d_kernel[grid](x, out, M, N, x.stride(0), BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N)
     torch.testing.assert_close(out, x * 2.0, atol=1e-2, rtol=1e-2)
-
-
-@pytest.mark.skipif(not _has_hopper(), reason="auto-TMA requires Hopper+ (sm_90)")
 def test_auto_tma_no_allocator_needed():
     # Host-built TMA (launch.h recipe core) must NOT require a runtime allocator:
     # the CUtensorMap is built on the host, not in device global scratch. With
@@ -109,9 +100,6 @@ def _knob_add_kernel(x_ptr, y_ptr, out_ptr, N, BLOCK: tl.constexpr):
     x = tl.load(x_ptr + offs, mask=mask)
     y = tl.load(y_ptr + offs, mask=mask)
     tl.store(out_ptr + offs, x + y, mask=mask)
-
-
-@pytest.mark.skipif(not _has_hopper(), reason="auto-TMA requires Hopper+ (sm_90)")
 def test_auto_tma_per_call_option():
     # With the global TRITON_AUTO_TMA knob OFF, the per-call `auto_tma` compile
     # option must independently control promotion: auto_tma=True promotes the
@@ -135,9 +123,6 @@ def test_auto_tma_per_call_option():
     k_off = _knob_add_kernel[grid](x, y, out_off, N, BLOCK=BLOCK, auto_tma=False)
     torch.testing.assert_close(out_off, x + y, atol=1e-2, rtol=1e-2)
     assert "tt.descriptor_load" not in k_off.asm["ttir"], "auto_tma=False should stay a plain load"
-
-
-@pytest.mark.skipif(not _has_hopper(), reason="auto-TMA requires Hopper+ (sm_90)")
 def test_auto_tma_autotune_config():
     # auto_tma is an autotunable per-Config option (like num_warps): the
     # autotuner compiles both the non-TMA and TMA variants and picks one; both
@@ -169,9 +154,6 @@ def test_auto_tma_autotune_config():
     grid = lambda meta: (triton.cdiv(N, meta["BLOCK"]), )
     _autotuned_add[grid](x, y, out, N)
     torch.testing.assert_close(out, x + y, atol=1e-2, rtol=1e-2)
-
-
-@pytest.mark.skipif(not _has_hopper(), reason="auto-TMA requires Hopper+ (sm_90)")
 def test_auto_tma_block_over_256_promoted():
     # A BLOCK > 256 load IS auto-TMA promoted: the host recipe encodes a
     # getTMABlockShape-clamped box (<=256) while the descriptor_load keeps the
@@ -199,9 +181,6 @@ def _mixed_block_kernel(a_ptr, b_ptr, oa_ptr, ob_ptr, Na, Nb, BLOCK_A: tl.conste
     mask_b = offs_b < Nb
     b = tl.load(b_ptr + offs_b, mask=mask_b)
     tl.store(ob_ptr + offs_b, b + 2.0, mask=mask_b)
-
-
-@pytest.mark.skipif(not _has_hopper(), reason="auto-TMA requires Hopper+ (sm_90)")
 def test_auto_tma_mixed_promoted_loads():
     # A single kernel with a BLOCK_A=256 load and a BLOCK_B=512 load. With box>256
     # support BOTH promote: the 512 load encodes a getTMABlockShape-clamped (<=256)
@@ -239,9 +218,6 @@ def _ws_scale_store(x_ptr, o_ptr, M, N, stride_m, BLOCK_M: tl.constexpr, BLOCK_N
         mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
         x = tl.load(x_ptr + offs_m[:, None] * stride_m + offs_n[None, :], mask=mask, other=0.0)
         tl.store(o_ptr + offs_m[:, None] * stride_m + offs_n[None, :], x * 2.0, mask=mask)
-
-
-@pytest.mark.skipif(not _has_hopper(), reason="auto-TMA requires Hopper+ (sm_90)")
 def test_auto_tma_store_block_over_256_promoted():
     # STORE path with contiguous box dim BLOCK_N=512 > 256 IS promoted: the store
     # recipe encodes a getTMABlockShape-clamped box and the device
@@ -285,9 +261,6 @@ def _ws_extra_pred_store(x_ptr, o_ptr, M, N, stride_m, BLOCK_M: tl.constexpr, BL
         # extra predicate beyond the rectangular boundary: skip column 0.
         mask = rect & (offs_n[None, :] > 0)
         tl.store(o_ptr + offs_m[:, None] * stride_m + offs_n[None, :], x * 2.0, mask=mask)
-
-
-@pytest.mark.skipif(not _has_hopper(), reason="auto-TMA requires Hopper+ (sm_90)")
 def test_auto_tma_store_nonrectangular_mask_not_promoted():
     # A store whose mask is not a pure rectangular boundary (here: an extra
     # skip-column-0 predicate) must NOT be promoted to a descriptor_store: the TMA
@@ -308,9 +281,6 @@ def test_auto_tma_store_nonrectangular_mask_not_promoted():
     cols = torch.arange(N, device="cuda")[None, :]
     ref = torch.where(cols > 0, x * 2.0, torch.zeros_like(x))
     torch.testing.assert_close(o, ref, atol=1e-2, rtol=1e-2)
-
-
-@pytest.mark.skipif(not _has_hopper(), reason="auto-TMA requires Hopper+ (sm_90)")
 def test_auto_tma_outer_dim_over_256():
     # OUTER (strided) box dim BLOCK_M=512 > 256, inner BLOCK_N=64. getTMABlockShape
     # caps the outer box at 256 and the device lowering multi-copies 512/256=2
@@ -346,9 +316,6 @@ def _ws_load_only_scale(x_ptr, o_ptr, M, N, stride_m, BLOCK_M: tl.constexpr, BLO
         # extra predicate -> STORE is NOT promoted, isolating the load path
         smask = rect & (offs_n[None, :] > 0)
         tl.store(o_ptr + offs_m[:, None] * stride_m + offs_n[None, :], x * 2.0, mask=smask)
-
-
-@pytest.mark.skipif(not _has_hopper(), reason="auto-TMA requires Hopper+ (sm_90)")
 def test_auto_tma_autows_load_over_256():
     # Exercise a host-recipe TMA load inside AutoWS with BLOCK_N > 256.
     M, N = 128, 512
@@ -363,9 +330,6 @@ def test_auto_tma_autows_load_over_256():
     ref[:, 0] = 0.0
     torch.testing.assert_close(o, ref, atol=1e-2, rtol=1e-2)
     assert "tt.descriptor_load" in k.asm["ttir"], "expected the BLOCK_N=512 load to promote"
-
-
-@pytest.mark.skipif(not _has_hopper(), reason="auto-TMA requires Hopper+ (sm_90)")
 def test_auto_tma_metaws_store_over_256():
     # Exercise a promoted store through meta-WS with BLOCK_N > 256.
     M, N = 128, 512
@@ -383,9 +347,6 @@ def test_auto_tma_metaws_store_over_256():
         "meta-WS BLOCK_N=512 load must be auto-TMA promoted (clamped box + multi-copy)")
     assert "tt.descriptor_store" in k.asm["ttir"], (
         "meta-WS BLOCK_N=512 store must be auto-TMA store-promoted (clamped box + multi-copy)")
-
-
-@pytest.mark.skipif(not _has_hopper(), reason="auto-TMA requires Hopper+ (sm_90)")
 def test_auto_tma_device_block_over_256(monkeypatch):
     # DEVICE-descriptor mode (TRITON_AUTO_TMA_DEVICE=1, added in this diff): the load
     # is promoted to an in-kernel tt.make_tensor_descriptor. Contiguous BLOCK_N=512 >

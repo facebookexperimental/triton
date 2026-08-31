@@ -355,6 +355,12 @@ std::pair<SmallVector<Value>, SmallVector<Value>> lowerTMemLdSt(
   auto kRow = str_attr("row");
   bool isStore = !vals.empty();
 
+  auto messageLayout =
+      getTMemLdStMessageLayout(ctx, atom, unpacked, valsPerMessage);
+  assert(succeeded(messageLayout) &&
+         messageLayout->getInDimSize(kReg) == valsPerMessage &&
+         "invalid TMEM message footprint");
+
   tmemBase = b.ptrtoint(i32_ty, tmemBase);
 
   assert(to_vector(reps.getOutDimNames()) ==
@@ -367,7 +373,9 @@ std::pair<SmallVector<Value>, SmallVector<Value>> lowerTMemLdSt(
   };
 
   Value warpId = WarpIdOp::create(rewriter, loc);
-  // Map warpId to rows 32 and 64
+  // Keep this warp-base calculation synchronized with
+  // getTMemLdStWarpAddresses.
+  // Map warpId to rows 32 and 64.
   auto warpIdInGroup = b.and_(warpId, b.i32_val(3));
   tmemBase = b.add(tmemBase, b.shl(warpIdInGroup, b.i32_val(5 + 16)));
   // The block offset is already added to the tmemBase
@@ -548,9 +556,8 @@ struct TensorMemoryLoadOpConversion
         loc, rewriter, regTy, memTy, tmemBase, maxnreg, b.i1_val(true),
         llvmElemTy, {}, redOp, useAbs, useNaN);
 
-    Type structTy = getTypeConverter()->convertType(op.getType());
-    Value resultStruct =
-        packLLElements(loc, getTypeConverter(), resultVals, rewriter, structTy);
+    Value resultStruct = packTensorElements(loc, getTypeConverter(), resultVals,
+                                            rewriter, op.getType());
     // Wait insertion could be moved to the TTGIR level if needed.
     NVVM::Tcgen05WaitOp::create(rewriter, loc, NVVM::Tcgen05WaitKind::LOAD);
 
@@ -562,9 +569,8 @@ struct TensorMemoryLoadOpConversion
     SmallVector<Value> results = {resultStruct};
     if (redOp) {
       // Pack redval values into the red tensor result
-      Type redStructTy = getTypeConverter()->convertType(op.getRed().getType());
-      Value redStruct = packLLElements(loc, getTypeConverter(), redvalVals,
-                                       rewriter, redStructTy);
+      Value redStruct = packTensorElements(loc, getTypeConverter(), redvalVals,
+                                           rewriter, op.getRed().getType());
       results.push_back(redStruct);
     }
 
@@ -590,7 +596,7 @@ struct TensorMemoryStoreOpConversion
     auto regTy = cast<RankedTensorType>(op.getSrc().getType());
 
     SmallVector<Value> srcValues =
-        unpackLLElements(loc, adaptor.getSrc(), rewriter);
+        unpackTensorElements(loc, adaptor.getSrc(), rewriter, regTy);
     auto maxnreg = getContextualMaxNReg(op);
     lowerTMemLdStFromTypes(loc, rewriter, regTy, memTy, tmemBase, maxnreg, pred,
                            llvmElemTy, srcValues);
@@ -629,7 +635,7 @@ struct TensorMemoryAllocOpConversion
       auto llvmElemTy = getTypeConverter()->convertType(regTy.getElementType());
       auto maxnreg = getContextualMaxNReg(op);
       SmallVector<Value> srcValues =
-          unpackLLElements(loc, adaptor.getSrc(), rewriter);
+          unpackTensorElements(loc, adaptor.getSrc(), rewriter, regTy);
       Value ptr = b.inttoptr(base.getType(), allocAddress);
       lowerTMemLdStFromTypes(loc, rewriter, regTy, memTy, ptr, maxnreg,
                              b.i1_val(true), llvmElemTy, srcValues);

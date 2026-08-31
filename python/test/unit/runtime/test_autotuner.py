@@ -32,15 +32,19 @@ def test_config_backend_options():
     tree_config = triton.Config(kwargs={}, enable_tree_reduction=True)
     linear_config = triton.Config(kwargs={}, enable_tree_reduction=False)
     dependent_two_cta_config = triton.Config(kwargs={}, allowDependentTwoCTA=True)
+    packed_i32_config = triton.Config(kwargs={}, enable_nvptx_v2i32=True)
 
     assert "enable_tree_reduction" not in default_config.all_kwargs()
+    assert "enable_nvptx_v2i32" not in default_config.all_kwargs()
     assert tree_config.all_kwargs()["enable_tree_reduction"] is True
     assert linear_config.all_kwargs()["enable_tree_reduction"] is False
     assert "allowDependentTwoCTA" not in default_config.all_kwargs()
     assert dependent_two_cta_config.all_kwargs()["allowDependentTwoCTA"] is True
+    assert packed_i32_config.all_kwargs()["enable_nvptx_v2i32"] is True
 
     amd_backend = HIPBackend(GPUTarget("hip", "gfx942", 64))
     assert amd_backend.parse_options(default_config.all_kwargs()).enable_tree_reduction is False
+    assert amd_backend.parse_options(packed_i32_config.all_kwargs()).enable_nvptx_v2i32 is True
     assert amd_backend.parse_options(tree_config.all_kwargs()).enable_tree_reduction is True
     assert amd_backend.parse_options(linear_config.all_kwargs()).enable_tree_reduction is False
 
@@ -51,6 +55,43 @@ def test_config_backend_options():
     assert h100_backend.parse_options(linear_config.all_kwargs()).enable_tree_reduction is False
     assert blackwell_backend.parse_options(tree_config.all_kwargs()).enable_tree_reduction is True
     assert blackwell_backend.parse_options(dependent_two_cta_config.all_kwargs()).allowDependentTwoCTA is True
+    assert blackwell_backend.parse_options(default_config.all_kwargs()).enable_nvptx_v2i32 is False
+    assert blackwell_backend.parse_options(packed_i32_config.all_kwargs()).enable_nvptx_v2i32 is True
+
+
+def test_c_cache_fallback_forwards_autotune_config_options():
+
+    class Param:
+        is_constexpr = False
+
+    class FakeJITFunction:
+        c_cache = True
+        arg_names = ["x"]
+        params = [Param()]
+
+        def __init__(self):
+            self.run_kwargs = None
+
+        def _get_jit_cache_proxy(self, grid):
+            return None
+
+        def run(self, *args, **kwargs):
+            self.run_kwargs = kwargs
+            return "fallback"
+
+    fn = FakeJITFunction()
+    autotuner = object.__new__(_autotuner.Autotuner)
+    autotuner.fn = fn
+    autotuner.keys = []
+    autotuner._fc_seeded = {None}
+    autotuner._last_key = None
+    config = triton.Config({}, num_warps=4, num_stages=2)
+
+    result = autotuner._try_fast_path((object(), ), {"grid": (1, )}, config)
+
+    assert result == "fallback"
+    assert fn.run_kwargs["num_warps"] == 4
+    assert fn.run_kwargs["num_stages"] == 2
 
 
 @pytest.mark.parametrize('use_cuda_graph', [False, True])

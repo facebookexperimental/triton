@@ -10,6 +10,7 @@
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/Triton/Transforms/LoopPeeling.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonGPU/Transforms/Partition.h"
 #include "triton/Dialect/TritonGPU/Transforms/PartitionLoopPeeling.h"
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h"
 #include "triton/Dialect/TritonGPU/Transforms/PipelineExpander.h"
@@ -64,6 +65,78 @@ static bool hasMMAv5WaitsInLastStage(scf::ForOp forOp,
   return hasMMAv5 && hasWaitInLastStage;
 }
 
+static std::optional<StringRef>
+getWarpSpecializedPartitionType(scf::ForOp forOp) {
+  auto wsOp = forOp->getParentOfType<triton::gpu::WarpSpecializeOp>();
+  if (!wsOp)
+    return std::nullopt;
+  auto typesAttr = wsOp->getAttrOfType<ArrayAttr>(kPartitionTypesAttrName);
+  if (!typesAttr)
+    return std::nullopt;
+
+  SmallVector<StringRef> partitionTypes;
+  for (Attribute attr : typesAttr) {
+    auto type = dyn_cast<StringAttr>(attr);
+    if (!type)
+      return std::nullopt;
+    partitionTypes.push_back(type.getValue());
+  }
+
+  Region *loopRegion = forOp->getParentRegion();
+  if (wsOp.getDefaultRegion().isAncestor(loopRegion))
+    return partitionTypes.empty() ? std::nullopt
+                                  : std::optional(partitionTypes.front());
+
+  auto partitionRegions = wsOp.getPartitionRegions();
+  if (partitionTypes.size() < partitionRegions.size())
+    return std::nullopt;
+  size_t typeOffset = partitionTypes.size() - partitionRegions.size();
+  for (auto [idx, partitionRegion] : llvm::enumerate(partitionRegions)) {
+    if (partitionRegion->isAncestor(loopRegion))
+      return partitionTypes[idx + typeOffset];
+  }
+  return std::nullopt;
+}
+
+static bool containsMMA(scf::ForOp forOp) {
+  return forOp
+      ->walk([](Operation *op) {
+        return isa<triton::nvidia_gpu::MMAv5OpInterface,
+                   triton::DotOpInterface>(op)
+                   ? WalkResult::interrupt()
+                   : WalkResult::advance();
+      })
+      .wasInterrupted();
+}
+
+static bool containsMMAv5(scf::ForOp forOp) {
+  return forOp
+      ->walk([](triton::nvidia_gpu::MMAv5OpInterface) {
+        return WalkResult::interrupt();
+      })
+      .wasInterrupted();
+}
+
+static bool needsCustomMetaWSEpiloguePeeling(scf::ForOp forOp) {
+  Operation *scope = forOp.getOperation();
+  if (auto wsOp = forOp->getParentOfType<triton::gpu::WarpSpecializeOp>())
+    scope = wsOp.getOperation();
+
+  // The generic pipeline expander predicates peeled epilogue operations.
+  // Peer gathers cannot be predicated, and predicating a TMA reduction in one
+  // partition independently of its sibling GEMM partitions breaks their
+  // iteration lockstep. Keep the legacy PredicateStage-based peeling for the
+  // entire warp-specialize operation when either operation is present.
+  return scope
+      ->walk([&](Operation *op) {
+        if (isa<triton::nvidia_gpu::TwoCTAPeerGatherOp,
+                triton::nvidia_gpu::AsyncTMAReduceOp>(op))
+          return WalkResult::interrupt();
+        return WalkResult::advance();
+      })
+      .wasInterrupted();
+}
+
 static void expandLoops(ModuleOp moduleOp) {
   DenseSet<MaskOp> peeledMaskOps;
   auto processPeeledEpilogueOp = [&](RewriterBase &rewriter, Operation *op,
@@ -101,8 +174,27 @@ static void expandLoops(ModuleOp moduleOp) {
     loops.push_back(forOp);
   });
   auto metaWS = triton::tools::getBoolEnv("TRITON_USE_META_WS");
-
+  // The partition-type filter below exists to prune the loops that the extra
+  // ScheduleLoops re-run re-staged. That re-run only happens on the 2-CTA path
+  // (see CUDABackend.make_ttgir). On the 1-CTA path every partition loop still
+  // carries its own valid post-WS schedule, so filtering there drops the
+  // epilogue / epilogue_store loops and miscompiles the kernel.
   for (scf::ForOp forOp : loops) {
+    if (metaWS && triton::gpu::isPhysicalCluster(forOp) &&
+        forOp->getParentOfType<triton::gpu::WarpSpecializeOp>()) {
+      std::optional<StringRef> partitionType =
+          getWarpSpecializedPartitionType(forOp);
+      if (!partitionType)
+        continue;
+      if (*partitionType == "gemm") {
+        if (!containsMMA(forOp))
+          continue;
+      } else if (*partitionType != "load") {
+        // Load-worker loops carry their own software-pipeline schedule and
+        // must be expanded to materialize the TMA prologue.
+        continue;
+      }
+    }
     CoarseSchedule schedule;
     if (failed(schedule.deSerialize(forOp))) {
       continue;
@@ -114,9 +206,22 @@ static void expandLoops(ModuleOp moduleOp) {
 
     std::vector<std::pair<Operation *, unsigned>> finalSchedule =
         schedule.createFinalSchedule(forOp);
+    if (metaWS && containsMMAv5(forOp)) {
+      unsigned maxMMAStage = 0;
+      for (auto &[op, stage] : finalSchedule)
+        if (isa<triton::nvidia_gpu::MMAv5OpInterface>(op))
+          maxMMAStage = std::max(maxMMAStage, stage);
+      for (auto &[op, stage] : finalSchedule) {
+        auto wait = dyn_cast<triton::nvidia_gpu::WaitBarrierOp>(op);
+        if (wait && !wait.getDeps().empty() && stage > maxMMAStage)
+          stage = maxMMAStage;
+      }
+    }
     triton::PipeliningOption options;
+    bool useCustomMetaWSEpilogue =
+        metaWS && needsCustomMetaWSEpiloguePeeling(forOp);
     options.supportDynamicLoops = true;
-    options.peelEpilogue = false;
+    options.peelEpilogue = metaWS && !useCustomMetaWSEpilogue;
     options.predicateFn = wrapInMaskOp;
     options.getScheduleFn =
         [&](scf::ForOp forOp,
@@ -135,8 +240,8 @@ static void expandLoops(ModuleOp moduleOp) {
         !forOp->getParentOfType<triton::gpu::WarpSpecializeOp>() &&
         !keepPredicateStage; // do not peel if we are testing the stage
                              // predication
-    if (metaWS && hasWarpSpec)
-      customEpiloguePeeling = true;
+    if (metaWS)
+      customEpiloguePeeling = useCustomMetaWSEpilogue;
 
     if (keepPredicateStage || customEpiloguePeeling) {
       options.emitPredicateStageFn =

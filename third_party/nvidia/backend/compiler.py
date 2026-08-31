@@ -241,6 +241,7 @@ class CUDAOptions:
     # instead of host TMA recipes. Falls back to knobs.nvidia.auto_tma_device.
     auto_tma_device: bool = False
     enable_tree_reduction: bool = False
+    enable_nvptx_v2i32: bool = False
 
     def __post_init__(self):
         default_libdir = Path(__file__).parent / "lib"
@@ -259,16 +260,27 @@ class CUDAOptions:
         _check_reg_auto_ws_alignment("minRegAutoWS", self.minRegAutoWS)
         _check_reg_auto_ws_alignment("maxRegAutoWS", self.maxRegAutoWS)
 
-        # If ctas_per_cga is set, it overrides cluster_dims with CUDA semantics:
-        # ctas_per_cga defines the cluster shape for regrouping grid CTAs.
-        # num_ctas must be 1 when using ctas_per_cga since it's incompatible with
-        # the multiplicative semantics of num_ctas.
-        if self.ctas_per_cga is not None:
-            # Ensure cluster_dims is all 1s to prevent conflicting cluster specifications.
-            assert (self.cluster_dims == (1, 1, 1) or self.cluster_dims == self.ctas_per_cga), (
-                f"When using ctas_per_cga, cluster_dims must be default (1,1,1) or match ctas_per_cga to avoid conflicting "
-                f"cluster specifications. Got cluster_dims={self.cluster_dims}")
+        # num_ctas and ctas_per_cga are alternative cluster models, not two dials
+        # on one. Under num_ctas the CTAs share a program and its tensors are
+        # distributed across them; under ctas_per_cga each CTA is its own program
+        # and only explicit ops cross between them. The compiler decides which
+        # model a kernel uses by inspecting these, so requesting a cluster more
+        # than one way has no well-defined answer. cluster_dims is the
+        # module-level spelling of the ctas_per_cga shape, so those two may
+        # coexist only when they agree.
+        cluster_shape = self.ctas_per_cga if self.ctas_per_cga is not None else self.cluster_dims
+        mirrors_agree = self.ctas_per_cga is None or self.cluster_dims in ((1, 1, 1), self.ctas_per_cga)
+        if not mirrors_agree or (self.num_ctas > 1 and cluster_shape != (1, 1, 1)):
+            raise ValueError(
+                "a cluster must be requested exactly one way: either num_ctas, or ctas_per_cga "
+                f"(optionally mirrored in cluster_dims). Got num_ctas={self.num_ctas}, "
+                f"ctas_per_cga={self.ctas_per_cga}, cluster_dims={self.cluster_dims}")
 
+        # ctas_per_cga regroups grid CTAs rather than spawning them, so it is
+        # incompatible with the multiplicative semantics of num_ctas. Mirror it
+        # into cluster_dims, which is what reaches the module as
+        # ttg.cluster-dim-*.
+        if self.ctas_per_cga is not None:
             object.__setattr__(self, "cluster_dims", self.ctas_per_cga)
             object.__setattr__(self, "num_ctas", 1)
 
@@ -886,6 +898,7 @@ class CUDABackend(BaseBackend):
                 and opt.ctas_per_cga is not None and opt.allowDependentTwoCTA):
             nvidia.passes.hopper.add_plan_2cta_exchange(pm)
         nvidia.passes.ttnvgpuir.add_optimize_descriptor_encoding(pm)
+        nvidia.passes.ttnvgpuir.add_tma_multicast(pm)
         passes.ttir.add_loop_aware_cse(pm)
         if capability // 10 in [8, 9]:
             passes.ttgpuir.add_fuse_nested_loops(pm)
@@ -1010,6 +1023,16 @@ class CUDABackend(BaseBackend):
                     knobs.nvidia.ws_tile_prefetch_depth,
                     tma_store_pipelining,
                 )
+                # AutoWS clones the original partial schedule into each
+                # partition. Re-schedule those cloned loops so newly inserted
+                # partition-local ops receive stages and unused stages are
+                # pruned before software-pipeline expansion.
+                # Restrict it to the 2-CTA path: on the 1-CTA path the post-WS
+                # schedule is already correct and re-running the scheduler
+                # overwrites it, which silently miscompiles kernels that have a
+                # separate epilogue-store partition.
+                if opt.cluster_dims is not None and max(opt.cluster_dims) >= 2:
+                    passes.ttgpuir.add_schedule_loops(pm, opt.num_stages, knobs.nvidia.use_meta_ws)
             passes.ttgpuir.add_pipeline(pm, opt.num_stages, dump_enabled)
             passes.ttgpuir.add_optimize_partition_warps(pm)
             if (opt.cluster_dims is not None and max(opt.cluster_dims) >= 2 and opt.allowDependentTwoCTA):
@@ -1264,7 +1287,7 @@ class CUDABackend(BaseBackend):
             paths = [path for (name, path) in options.extern_libs]
             llvm.link_extern_libs(llvm_mod, paths)
 
-        llvm.optimize_module(llvm_mod, llvm.OPTIMIZE_O3)
+        llvm.optimize_module(llvm_mod, llvm.OPTIMIZE_O3, scalarize_packed_fops=True)
 
         # Get some metadata
         # warp-specialization mutates num_warps
@@ -1295,6 +1318,8 @@ class CUDABackend(BaseBackend):
         proc = sm_arch_from_capability(cap_llvm)
         features = get_features(opt, cap_llvm)
         flags = ["nvptx-mad-wide-opt"]
+        if opt.enable_nvptx_v2i32:
+            flags.append("nvptx-v2i32")
         canonicalize_gep = "fpsan" in opt.instrumentation_mode
         ret = llvm.translate_to_asm(src, triple, proc, features, flags, opt.enable_fp_fusion, False, canonicalize_gep)
         # Find kernel names (there should only be one)

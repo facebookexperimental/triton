@@ -3,51 +3,61 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="description" content="What TLX is and when to use it.">
-  <title>Overview · TLX</title>
-  <link rel="stylesheet" href="website/assets/tlx.css">
+  <meta name="description" content="Explore Triton, TLX, TorchTLX, and the tooling used to build and optimize GPU kernels.">
+  <title>Overview · FBTriton</title>
+  <link rel="stylesheet" href="website/assets/tlx.css?v=20260824c">
 </head>
 <body>
   <header class="topbar">
-    <a class="brand" href="./"><span>TLX</span> Triton Low-level Language Extensions</a>
+    <a class="brand" href="./"><span>FBTriton</span></a>
+    <nav class="topnav" aria-label="Top-level sections"><a href="website/triton.html">Triton</a>
+<a href="website/tlx.html">TLX</a>
+<a href="website/tlx-ops.html">tlx.ops</a>
+<a href="website/torchtlx.html">TorchTLX</a>
+<a href="website/ci.html">CI</a>
+<a href="website/tooling.html">Tooling</a></nav>
     <a class="repo-link" href="https://github.com/facebookexperimental/triton" target="_blank" rel="noreferrer">View on GitHub ↗</a>
   </header>
-  <div class="shell">
-    <aside class="sidebar">
-      <p class="eyebrow">Documentation</p>
-      <nav><a href="./" aria-current="page">Overview</a>
-<a href="website/buffers.html">Local and remote buffers</a>
-<a href="website/async-memory.html">Async memory access</a>
-<a href="website/async-compute.html">Async tensor core operations</a>
-<a href="website/synchronization.html">Barriers and Cluster Launch Control</a>
-<a href="website/warp-specialization.html">Warp specialization and clustering</a>
-<a href="website/utilities.html">Other operations</a>
-<a href="website/kernels.html">Example kernels</a>
-<a href="website/install-and-test.html">Build, install, and test</a>
-<a href="website/resources.html">More reading</a></nav>
-    </aside>
+  <div class="shell no-sidebar">
+
     <main>
-      <p class="eyebrow">TLX documentation</p>
+      <p class="eyebrow">Triton at Meta</p>
       <h1>Overview</h1>
-      <p class="lede">What TLX is and when to use it.</p>
-      <article><h2 id="introduction">Introduction</h2>
-<p>TLX (Triton Low-level Language Extensions) is a low-level, warp-aware, hardware-near extension of the Triton DSL. It offers intrinsics and warp-specialized operations for fine-grained GPU control, hardware-oriented primitives for advanced kernel development, and explicit constructs for GPU memory, computation, and asynchronous control flow. TLX is designed for expert users pushing Triton closer to the metal.</p>
-<p>Primarily targeting NVIDIA GPUs (for now), TLX extends Triton to support:</p>
-<div class="list-item depth-0"><span aria-hidden="true">•</span><div>Hardware-specific intrinsics (e.g., wgmma, async_copy, barrier)</div></div>
-<div class="list-item depth-0"><span aria-hidden="true">•</span><div>Shared and local memory allocation</div></div>
-<div class="list-item depth-0"><span aria-hidden="true">•</span><div>Instruction-level scheduling and control</div></div>
-<div class="list-item depth-0"><span aria-hidden="true">•</span><div>Cross-warpgroup synchronization</div></div>
-<p>While this approach places more responsibility on the user, it reduces the compiler's role as a performance bottleneck. Although it may introduce divergence across hardware platforms, it empowers users to perform deeper, architecture-specific optimizations without relying solely on compiler heuristics.</p>
-<h2 id="nightly-builds-fbtriton">Nightly builds (fbtriton)</h2>
-<p>Nightly <code>.dev</code> wheels are published to a self-managed index (not PyPI):</p>
-<p>pip install --pre fbtriton \ --index-url https://facebookexperimental.github.io/triton/nightly/simple/</p>
-<p>Each nightly is built from the newest <code>main</code> commit whose GPU/CI checks are all green. <code>triton.__version__</code> reports <code>3.8.0.dev&lt;YYYYMMDD&gt;+fb.git&lt;hash&gt;</code>. Nightlies are retained for ~30 days. Formal releases remain on PyPI (<code>pip install fbtriton</code>).</p>
-<h2 id="gluon-support">Gluon support</h2>
-<p><a href="https://github.com/triton-lang/triton/tree/main/python/triton/experimental/gluon" target="_blank" rel="noreferrer">Gluon</a> (<code>python/triton/experimental/gluon/</code>) is <strong>upstream-synced and not a first-class DSL</strong> here (TLX is the focus) — do Gluon feature/bug work upstream, not in this fork. But since fbtriton is a secondary Triton, we run <strong>fundamental Gluon CI</strong> so we don't silently break it.</p>
-<p><strong>CI:</strong> the <code>b200-gluon-test</code> / <code>mi350-gluon-test</code> jobs run <code>pytest python/test/gluon/</code> (every <code>test_*.py</code>). It is <strong>green</strong>: ~200 passed, ~1600 skipped, 0 failed. The real signal is the compile-only, target-agnostic frontend suite (<code>test_frontend.py</code>, one run covers NVIDIA + AMD codegen via mock <code>GPUTarget</code>); the version-skewed cases below are skipped via <code>python/test/gluon/conftest.py</code> rather than failing the job.</p>
-<p><strong>Fork-side fixes</strong> (Gluon frontend itself unmodified): <code>core.py</code> reduce <code>reduction_ordering</code> compat, <code>semantic.py</code> <code>dot()</code> <code>allow_tf32</code> default, a <code>test_core.py</code> collection fix (a bad cherry-pick left an <code>IndentationError</code>), and regenerated <code>test_frontend.py</code> goldens (upstream-synced — overwritten on next sync).</p>
-<p><strong>Skipped, needs upstream Gluon re-sync — TODO(gluon-ci):</strong> the GPU-execution suites (<code>test_core</code>, <code>test_lowerings</code>, <code>test_consan</code>, <code>test_fpsan</code>, one kernel in <code>test_layout_format_view</code>) were synced from much newer upstream (e.g. <code>test_fpsan.py</code> via bundle #1956) than the pinned Gluon frontend (<code>_semantic.py</code> ~2026-06-29). They require Gluon behavior the frontend doesn't have yet — raw pointer <code>gl.load</code>/<code>gl.store</code> inferring a *distributed* layout — so they fail wholesale with <code>expected ... distributed_type but got block_type</code>. The fix is to sync the Gluon frontend forward (upstream cherry-pick / re-sync), not a local patch. Also skipped: ~9 frontend per-target golden tests (single inline golden can't match every parametrized target) and the <code>create_lds_barrier_wait</code> pybind mismatch. <code>conftest.py</code> lists these; remove/trim it after the re-sync.</p></article>
-      <footer class="pager"><a class="next" href="website/buffers.html">Local and remote buffers →</a></footer>
+      <p class="lede">Explore Triton, TLX, TorchTLX, and the tooling used to build and optimize GPU kernels.</p>
+      <article><p>This site covers four connected parts of Meta's work: the Triton compiler, the TLX low-level programming model, the TorchTLX path that brings TLX kernels into PyTorch 2, and the tools used to understand and improve generated GPU kernels.</p>
+<h2 id="news">News</h2>
+<p>[Aug'26] GPU MODE competition wins:</p>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div>Eigh: #5</div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div>Cholesky: #3</div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div>QR decomposition: #7</div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div>Trimul competition: #1</div></div>
+<p>[Jul'26] TritonParse accepted to ASPLOS 2026</p>
+<h2 id="explore-the-project">Explore the project</h2>
+<table><thead><tr><th>Area</th><th>Focus</th></tr></thead><tbody><tr><td><a href="website/triton.html">Triton</a></td><td>Compiler-managed performance portability, including automatic warp specialization and its roadmap</td></tr><tr><td><a href="website/tlx.html">TLX</a></td><td>Explicit warp-group orchestration, asynchronous memory and tensor-core operations, barriers, and hardware-specific kernel development</td></tr><tr><td><a href="website/torchtlx.html">TorchTLX</a></td><td>TLX-backed Inductor templates, epilogue fusion, and the PyTorch 2 integration path</td></tr><tr><td><a href="website/ci.html">CI</a></td><td>Workflows, runners, nightly failure handling, and per-project test coverage</td></tr><tr><td><a href="website/tooling.html">Tooling</a></td><td>Compilation tracing, profiling, runtime diagnostics, sanitizers, and benchmarking</td></tr></tbody></table>
+<h2 id="install">Install</h2>
+<p>FBTriton installs as the <code>triton</code> package, so <code>import triton</code> resolves to this fork. Uninstall upstream Triton first: both distributions own the same <code>triton/</code> directory, and installing one over the other leaves an inconsistent environment rather than a clean error.</p>
+<pre><code class="language-bash">pip uninstall -y triton
+pip install fbtriton</code></pre>
+<p>Nightly <code>.dev</code> wheels are published to a self-managed index, not PyPI:</p>
+<pre><code class="language-bash">pip install --pre fbtriton \
+  --index-url https://facebookexperimental.github.io/triton/nightly/simple/</code></pre>
+<p>Each nightly is built from the newest <code>main</code> commit whose GPU and CI checks are all green, and reports a version of the form <code>3.8.0.dev&lt;YYYYMMDD&gt;+fb.git&lt;hash&gt;</code>. Nightlies are retained for about 30 days. Binary wheels cover CPython 3.10 through 3.14.</p>
+<p>FBTriton is intended as a drop-in replacement for upstream Triton on a best-effort basis: it tracks upstream closely, and existing Triton kernels are expected to work unchanged. That is not a formal guarantee — if something that works upstream breaks here, please file an issue.</p>
+<h3 id="build-from-source">Build from source</h3>
+<pre><code class="language-bash">git clone https://github.com/facebookexperimental/triton.git
+cd triton
+
+pip install -r python/requirements.txt # build-time dependencies
+pip install -e .</code></pre>
+<p>C++ changes require a rebuild to take effect; Python-only changes do not. Run <code>pre-commit run --all</code> before sending a pull request.</p>
+<h2 id="hardware-support">Hardware support</h2>
+<table><thead><tr><th>Vendor</th><th>Targets</th></tr></thead><tbody><tr><td>NVIDIA</td><td>Hopper (<code>sm90</code>), Blackwell (<code>sm100</code>)</td></tr><tr><td>AMD</td><td>MI300 / CDNA3 (<code>gfx942</code>), MI350 / CDNA4 (<code>gfx950</code>), RDNA4 (<code>gfx1250</code>)</td></tr></tbody></table>
+<p>Support varies per feature. Every operation in the <a href="website/tlx.html">TLX reference</a> carries a tag naming the targets it runs on, and AutoWS requires <code>sm90</code> or newer.</p>
+<h3 id="check-the-install">Check the install</h3>
+<pre><code class="language-bash">python -c &quot;import triton; print(triton.__version__)&quot;
+pytest third_party/tlx/tutorials/testing/test_correctness.py</code></pre>
+<p>The tutorial suite is arch-gated, so cases that do not apply to your GPU skip rather than fail.</p></article>
+
     </main>
   </div>
 </body>

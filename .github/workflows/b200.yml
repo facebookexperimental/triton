@@ -3,7 +3,17 @@ on:
   push:
     branches:
       - main
+    paths-ignore:
+      - 'third_party/amd/**'
+      - 'third_party/tlx/tutorials/gfx9_gemm/**'
+      - 'third_party/amd/python/test/**'
+      - 'python/test/unit/language/test_tlx_amd.py'
   pull_request:
+    paths-ignore:
+      - 'third_party/amd/**'
+      - 'third_party/tlx/tutorials/gfx9_gemm/**'
+      - 'third_party/amd/python/test/**'
+      - 'python/test/unit/language/test_tlx_amd.py'
   schedule:
     # Every 6 hours at :30 past (00:30, 06:30, 12:30, 18:30 UTC).
     - cron: '30 */6 * * *'
@@ -32,6 +42,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v3
+        with:
+          submodules: recursive
       - name: Tune Nvidia GPU
         run: |
           sudo nvidia-smi -pm 1
@@ -92,7 +104,7 @@ jobs:
     env:
       CONDA_ENV: meta-triton
       SETUP_SCRIPT: /workspace/setup_instance.sh
-    timeout-minutes: 30
+    timeout-minutes: 120
     permissions:
       id-token: write
       contents: read
@@ -101,6 +113,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v3
+        with:
+          submodules: recursive
       - name: Tune Nvidia GPU
         run: |
           sudo nvidia-smi -pm 1
@@ -127,11 +141,25 @@ jobs:
           # test_warp_specialization.py, test_tutorial09_warp_specialization.py),
           # which are never collected here and are tested separately.
           python -m pytest python/test/unit/language/test_tlx_*.py -v --junitxml=/tmp/tlx-unit.xml
+      - name: Run TLX op library correctness tests (L1)
+        id: run_ops_tests
+        timeout-minutes: 20
+        run: |
+          . "${SETUP_SCRIPT}"
+          # L1 for the blessed tlx.ops catalog. Each op runs over its
+          # SMOKE_CONFIGS space rather than the full one, so this is minutes
+          # rather than hours while still compiling and launching every config
+          # in that space.
+          python -m pytest python/test/unit/tlx_ops/ -v --junitxml=/tmp/tlx-ops.xml
       - name: Run TLX tutorial correctness tests
         id: run_correctness_tests
         timeout-minutes: 15
         run: |
           . "${SETUP_SCRIPT}"
+          # Still covers the ~30 kernels not yet promoted into tlx.ops, plus
+          # the frozen tutorial copies of the ones that have been. Entries are
+          # retired from here per-kernel as the tutorials themselves go away,
+          # not in one cut.
           python -m pytest third_party/tlx/tutorials/testing/test_correctness.py -v --junitxml=/tmp/tlx-correctness.xml
       - name: Run runtime unit tests
         id: run_runtime_tests
@@ -145,11 +173,11 @@ jobs:
         run: |
           . "${SETUP_SCRIPT}"
           FAILED_FLAG=""
-          if [[ "${{ steps.run_unit_tests.outcome }}" != "success" || "${{ steps.run_correctness_tests.outcome }}" != "success" || "${{ steps.run_runtime_tests.outcome }}" != "success" ]]; then
+          if [[ "${{ steps.run_unit_tests.outcome }}" != "success" || "${{ steps.run_ops_tests.outcome }}" != "success" || "${{ steps.run_correctness_tests.outcome }}" != "success" || "${{ steps.run_runtime_tests.outcome }}" != "success" ]]; then
             FAILED_FLAG="--failed --bucket b200-tlx-job-failed"
           fi
           python3 .github/scripts/parse_junit_failures.py \
-            --junit /tmp/tlx-unit.xml /tmp/tlx-correctness.xml /tmp/runtime-unit.xml \
+            --junit /tmp/tlx-unit.xml /tmp/tlx-ops.xml /tmp/tlx-correctness.xml /tmp/runtime-unit.xml \
             --workflow "${GITHUB_WORKFLOW}" \
             --job "b200-tlx-test" \
             ${FAILED_FLAG}
@@ -169,6 +197,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v3
+        with:
+          submodules: recursive
       - name: Tune Nvidia GPU
         run: |
           sudo nvidia-smi -pm 1
@@ -334,5 +364,5 @@ jobs:
       run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}-${{ github.event_name == 'workflow_dispatch' }}
+  group: ${{ github.workflow }}-${{ github.job }}-${{ github.event.pull_request.number || github.sha }}-${{ github.event_name == 'workflow_dispatch' }}
   cancel-in-progress: true

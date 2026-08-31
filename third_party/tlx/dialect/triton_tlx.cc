@@ -146,6 +146,24 @@ void init_triton_tlx_ir(py::module_ &m) {
              return self.create<ttg::MemDescSubsliceOp>(memDescType, localAlloc,
                                                         offsets);
            })
+      .def("create_memdesc_dynamic_subslice",
+           [](TritonOpBuilder &self, Value localAlloc,
+              std::vector<Value> offsets,
+              std::vector<int64_t> newShape) -> mlir::Value {
+             auto localAllocType = cast<ttg::MemDescType>(localAlloc.getType());
+             auto localAllocShape = localAllocType.getShape();
+             if (localAllocShape.size() != offsets.size() ||
+                 localAllocShape.size() != newShape.size())
+               throw std::runtime_error(
+                   "dynamic subslice offsets and shape must match source rank");
+             auto memDescType = ttg::MemDescType::get(
+                 newShape, localAllocType.getElementType(),
+                 localAllocType.getEncoding(), localAllocType.getMemorySpace(),
+                 /*mutableMemory=*/localAllocType.getMutableMemory(),
+                 localAllocType.getAllocShape());
+             return self.create<ttg::MemDescDynamicSubsliceOp>(
+                 memDescType, localAlloc, offsets);
+           })
       .def("create_amd_extract_slice",
            [](TritonOpBuilder &self, Value source, std::vector<int64_t> shape,
               std::vector<int64_t> offsets) -> Value {
@@ -184,6 +202,14 @@ void init_triton_tlx_ir(py::module_ &m) {
              return self.create<amdgpu::RegisterResidentOp>(
                  input.getType(), input, registerClassAttr,
                  registersPerGroupAttr);
+           })
+      .def("create_amd_register_handoff",
+           [](TritonOpBuilder &self, Value input,
+              const std::string &registerClass) -> Value {
+             auto registerClassAttr =
+                 self.getBuilder().getStringAttr(registerClass);
+             return self.create<amdgpu::RegisterHandoffOp>(
+                 input.getType(), input, registerClassAttr);
            })
       .def("create_amd_mfma_commit",
            [](TritonOpBuilder &self,
@@ -273,7 +299,14 @@ void init_triton_tlx_ir(py::module_ &m) {
       .def("create_release_layout",
            [](TritonOpBuilder &self, Value &v) -> Value {
              if (auto type = dyn_cast<RankedTensorType>(v.getType())) {
-               assert(type.getEncoding() && "Expect layout encoding");
+               auto parentFunc =
+                   v.getParentRegion()->getParentOfType<tt::FuncOp>();
+               bool hasDeferredHelperLayout =
+                   v.getDefiningOp<tt::CallOp>() ||
+                   (parentFunc && parentFunc.getSymVisibility() == "private");
+               if (!type.getEncoding() && !hasDeferredHelperLayout)
+                 throw std::runtime_error(
+                     "release_layout requires an explicit source layout");
                auto newType = RankedTensorType::get(type.getShape(),
                                                     type.getElementType());
                return self.create<tlx::ReleaseLayoutOp>(newType, v);
@@ -624,6 +657,29 @@ void init_triton_tlx_ir(py::module_ &m) {
                  context, version, warpsPerCta, instrShape, transposed,
                  cgaLayout, tilesPerWarp, elementBitWidth));
            })
+      .def(
+          "make_slice_encoding_attr",
+          [](TritonOpBuilder &self, unsigned dim,
+             Attribute parentEnc) -> Attribute {
+            auto context = self.getBuilder().getContext();
+            auto parent = dyn_cast<ttg::DistributedEncodingTrait>(parentEnc);
+            auto parentLayout = dyn_cast<ttg::LayoutEncodingTrait>(parentEnc);
+            if (!parent || !parentLayout)
+              throw std::runtime_error(
+                  "make_slice_encoding_attr: parent must be a ranked "
+                  "distributed layout");
+            unsigned rank = parentLayout.getRank();
+            if (rank <= 1)
+              throw std::runtime_error(
+                  "make_slice_encoding_attr: parent layout must have at "
+                  "least rank >= 2");
+            if (dim >= rank)
+              throw std::runtime_error(
+                  "make_slice_encoding_attr: slice dim=" + std::to_string(dim) +
+                  " must be less than the parent rank=" + std::to_string(rank));
+            return mlir::cast<Attribute>(
+                ttg::SliceEncodingAttr::get(context, dim, parent));
+          })
       .def("make_linear_encoding_attr",
            [](TritonOpBuilder &self, std::vector<std::vector<int>> regBases,
               std::vector<std::vector<int>> laneBases,
@@ -787,7 +843,14 @@ void init_triton_tlx_ir(py::module_ &m) {
            })
       .def("create_amd_sched_barrier",
            [](TritonOpBuilder &self, int32_t mask) {
-             self.create<ROCDL::SchedBarrier>(mask);
+             self.create<ROCDL::SchedBarrier>(
+                 static_cast<ROCDL::SchedGroupMask>(mask));
+           })
+      .def("create_warp_vote",
+           [](TritonOpBuilder &self, Value pred,
+              const std::string &kind) -> mlir::Value {
+             return self.create<ttg::WarpVoteOp>(
+                 pred, self.getBuilder().getStringAttr(kind));
            })
       .def("create_barrier_expect",
            [](TritonOpBuilder &self, Value mbarrerLoc, int expectBytes,
@@ -1327,6 +1390,21 @@ void init_triton_tlx_ir(py::module_ &m) {
       .def("create_warp_return_op",
            [](TritonOpBuilder &self) -> void {
              self.create<ttg::WarpReturnOp>();
+           })
+      .def(
+          "create_warp_predicate_op",
+          [](TritonOpBuilder &self, std::vector<Type> &resultTypes,
+             Value predicate, std::vector<Value> &inits,
+             bool waveUniform) -> Operation * {
+            UnitAttr waveUniformAttr =
+                waveUniform ? self.getBuilder().getUnitAttr() : UnitAttr();
+            return self.create<ttg::WarpPredicateOp>(resultTypes, predicate,
+                                                     inits, waveUniformAttr);
+          },
+          py::rv_policy::reference)
+      .def("create_predicate_yield_op",
+           [](TritonOpBuilder &self, std::vector<Value> &values) -> void {
+             self.create<ttg::PredicateYieldOp>(values);
            })
       .def(
           "create_async_load",

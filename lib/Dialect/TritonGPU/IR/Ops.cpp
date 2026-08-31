@@ -323,8 +323,11 @@ struct CanonicalizeConvertFromConvert
   mlir::LogicalResult
   matchAndRewrite(ConvertLayoutOp op,
                   PatternRewriter &rewriter) const override {
-    // Convert to the same layout is redundant.
+    // Convert to the same layout is redundant unless it carries a backend
+    // request that must follow the conversion surviving layout propagation.
     if (op->getResultTypes() == op->getOperandTypes()) {
+      if (op->hasAttr("tlx.rematerialize_coordinates"))
+        return failure();
       rewriter.replaceOp(op, op->getOperands());
       return success();
     }
@@ -1324,6 +1327,46 @@ LogicalResult MemDescSubsliceOp::verify() {
   return success();
 }
 
+LogicalResult MemDescDynamicSubsliceOp::verify() {
+  auto srcTy = getSrc().getType();
+  auto dstTy = getType();
+  if (srcTy.getElementType() != dstTy.getElementType())
+    return emitError("result element type must match descriptor element type");
+  if (srcTy.getEncoding() != dstTy.getEncoding())
+    return emitError("source and result must have the same encoding");
+  if (srcTy.getMemorySpace() != dstTy.getMemorySpace())
+    return emitError("source and result must have the same memory space");
+  if (srcTy.getMutableMemory() != dstTy.getMutableMemory())
+    return emitError("source and result must have the same mutability");
+  if (srcTy.getRank() != dstTy.getRank())
+    return emitError("result rank must equal source rank");
+  if (getOffsets().size() != static_cast<size_t>(srcTy.getRank()))
+    return emitError("offsets must have the same rank as the source");
+  if (srcTy.getAllocShape() != dstTy.getAllocShape())
+    return emitError("result must preserve the source allocation shape");
+
+  Attribute srcEnc = srcTy.getEncoding();
+  if (!isa<SharedEncodingTrait>(srcEnc))
+    return emitError("source and result must use a shared-memory encoding");
+  Attribute concreteSrcEnc = triton::unwrapTlxWrappers(srcEnc);
+  if (isa<PartitionedSharedEncodingAttr>(concreteSrcEnc))
+    return emitError(
+        "dynamic subslices do not support partitioned shared encodings");
+
+  bool slicesAnyDimension = false;
+  for (int dim = 0; dim < srcTy.getRank(); ++dim) {
+    int64_t srcSize = srcTy.getDimSize(dim);
+    int64_t dstSize = dstTy.getDimSize(dim);
+    if (dstSize <= 0 || dstSize > srcSize)
+      return emitError("result dimensions must be positive and no larger than "
+                       "the corresponding source dimensions");
+    slicesAnyDimension |= dstSize != srcSize;
+  }
+  if (!slicesAnyDimension)
+    return emitError("dynamic subslice must narrow at least one dimension");
+  return success();
+}
+
 // -- WarpSpecializeOp --
 
 RegionRange WarpSpecializeOp::getPartitionRegions() {
@@ -1354,12 +1397,12 @@ void WarpSpecializeOp::getSuccessorRegions(
   // And the default region branches transparently back to the parent.
   if (src.getTerminatorPredecessorOrNull()->getParentRegion() ==
       &getDefaultRegion())
-    successors.push_back(RegionSuccessor::parent());
+    successors.push_back(RegionSuccessor(getOperation()));
 }
 
 ValueRange WarpSpecializeOp::getSuccessorInputs(RegionSuccessor successor) {
   // When returning to parent, the successor inputs are the op results.
-  return successor.isParent() ? getResults() : ValueRange();
+  return successor.isOperation() ? getResults() : ValueRange();
 }
 
 void WarpSpecializePartitionsOp::getSuccessorRegions(
@@ -1625,6 +1668,211 @@ LogicalResult WarpYieldOp::verify() {
   return success();
 }
 
+LogicalResult WarpPredicateOp::verify() {
+  if (!getRegion().hasOneBlock())
+    return emitOpError("region must contain exactly one block");
+  if (getRegion().front().getNumArguments() != 0)
+    return emitOpError("region block must not have arguments");
+
+  auto yield = dyn_cast<PredicateYieldOp>(getRegion().front().getTerminator());
+  if (!yield)
+    return emitOpError("region must terminate with ttg.predicate_yield");
+
+  if (getInits().size() != getNumResults() ||
+      yield.getNumOperands() != getNumResults()) {
+    return emitOpError("expected equal numbers of inits, results, and yields, "
+                       "but got ")
+           << getInits().size() << ", " << getNumResults() << ", and "
+           << yield.getNumOperands();
+  }
+
+  for (auto [index, init, result, yielded] :
+       llvm::enumerate(getInits(), getResults(), yield.getValues())) {
+    Type expected = init.getType();
+    if (result.getType() != expected || yielded.getType() != expected) {
+      return emitOpError("init, result, and yield #")
+             << index << " must have the same type, but got " << expected
+             << ", " << result.getType() << ", and " << yielded.getType();
+    }
+  }
+
+  auto predicateType = dyn_cast<RankedTensorType>(getPredicate().getType());
+  if (predicateType) {
+    if (predicateType.getRank() == 0)
+      return emitOpError(
+          "tensor predicate must have positive rank; use a scalar i1 instead");
+    // TLX initially assigns provisional concrete layouts during TTIR-to-TTGIR
+    // conversion, then reconciles them during layout propagation. Shape is
+    // already stable and can be checked here, but exact lane ownership must be
+    // deferred until those layouts are resolved. AMD lowering repeats the
+    // ownership check before expanding this op to lane-wise LLVM values.
+    ModuleOp module = getOperation()->getParentOfType<ModuleOp>();
+    bool hasProvisionalTlxLayouts =
+        module && module->hasAttr("tlx.has_tlx_ops");
+    for (Value init : getInits()) {
+      auto initType = dyn_cast<RankedTensorType>(init.getType());
+      if (!initType)
+        continue;
+      if (initType.getRank() < predicateType.getRank() ||
+          !llvm::equal(predicateType.getShape(),
+                       initType.getShape().take_front(predicateType.getRank())))
+        return emitOpError(
+            "predicate shape must be a leading shape of every carried tensor");
+
+      // Layout-free TTIR, TLX modules undergoing layout propagation, and TLX
+      // no-verify placeholders do not yet have final distributed encodings.
+      Attribute predicateEncoding = predicateType.getEncoding();
+      Attribute initEncoding = initType.getEncoding();
+      if (!predicateEncoding || !initEncoding)
+        continue;
+      if (!isa<DistributedEncodingTrait>(predicateEncoding) ||
+          !isa<DistributedEncodingTrait>(initEncoding))
+        return emitOpError(
+            "expected distributed encodings on tensor predicate and carried "
+            "tensor");
+      if (hasProvisionalTlxLayouts)
+        continue;
+      if (triton::encodingContainsTlxNoVerifyLayout(predicateEncoding) ||
+          triton::encodingContainsTlxNoVerifyLayout(initEncoding))
+        continue;
+
+      Attribute projectedEncoding = initEncoding;
+      for (int rank = initType.getRank(); rank > predicateType.getRank();
+           --rank)
+        projectedEncoding = SliceEncodingAttr::get(
+            getContext(), rank - 1,
+            cast<DistributedEncodingTrait>(projectedEncoding));
+      auto projectedType = RankedTensorType::get(predicateType.getShape(),
+                                                 predicateType.getElementType(),
+                                                 projectedEncoding);
+      if (!isLayoutEquivalentIgnoringRegisterOrder(
+              toLinearLayout(projectedType), toLinearLayout(predicateType)))
+        return emitOpError(
+            "predicate and carried tensors must have matching lane ownership");
+    }
+  } else if (!getPredicate().getType().isInteger(1)) {
+    return emitOpError("expected an i1 or distributed tensor predicate");
+  }
+
+  WalkResult nestedControlFlow = getRegion().walk([&](Operation *nested) {
+    // A nested warp predicate is lowered independently after its enclosing
+    // predicate has been converted to CFG. Its own verifier checks the nested
+    // body; do not mistake its region for dynamic control flow in this one.
+    if (nested != getOperation() && isa<WarpPredicateOp>(nested))
+      return WalkResult::skip();
+    if (nested == getOperation() || !isa<RegionBranchOpInterface>(nested))
+      return WalkResult::advance();
+    return WalkResult::interrupt();
+  });
+  if (nestedControlFlow.wasInterrupted())
+    return emitOpError("region may not contain nested dynamic control flow");
+
+  bool waveUniform = getWaveUniform().value_or(false);
+  Operation *unsupportedRegion = nullptr;
+  Operation *crossLaneOp = nullptr;
+  triton::ReduceOp crossWarpReduce;
+  WalkResult nestedRegion = getRegion().walk([&](Operation *nested) {
+    // Nested predicates are a supported composition. Validate their own
+    // regions separately instead of applying the enclosing predicate's
+    // reduction/region restrictions to the inner body.
+    if (nested != getOperation() && isa<WarpPredicateOp>(nested))
+      return WalkResult::skip();
+    if (nested->getNumRegions() == 0)
+      return WalkResult::advance();
+    auto reduce = dyn_cast<triton::ReduceOp>(nested);
+    if (!reduce) {
+      unsupportedRegion = nested;
+      return WalkResult::interrupt();
+    }
+
+    unsigned axis = reduce.getAxis();
+    // Leave malformed reductions to ReduceOp's verifier. In particular, do
+    // not index the distributed layout with an out-of-range axis while the
+    // enclosing WarpPredicateOp is being verified first.
+    bool hasInvalidSource = false;
+    for (Value src : reduce.getSrcs()) {
+      auto srcType = dyn_cast<RankedTensorType>(src.getType());
+      if (!srcType || axis >= srcType.getRank()) {
+        hasInvalidSource = true;
+        break;
+      }
+    }
+    if (hasInvalidSource)
+      return WalkResult::advance();
+    for (Value src : reduce.getSrcs()) {
+      auto srcType = cast<RankedTensorType>(src.getType());
+      // WarpPredicateOp is present in layout-free TTIR before conversion to
+      // TTGIR. Defer the ownership check until the converter assigns the
+      // distributed encoding; verification runs again on the converted op.
+      if (!srcType.getEncoding())
+        continue;
+      if (getWarpsPerCTA(srcType)[axis] != 1) {
+        crossWarpReduce = reduce;
+        return WalkResult::interrupt();
+      }
+    }
+    if (!waveUniform) {
+      crossLaneOp = reduce;
+      return WalkResult::interrupt();
+    }
+    return WalkResult::advance();
+  });
+  if (nestedRegion.wasInterrupted()) {
+    if (crossWarpReduce)
+      return emitOpError("region reduction axis must be warp-local");
+    if (crossLaneOp)
+      return emitOpError("cross-lane operation ")
+             << crossLaneOp->getName() << " requires a wave-uniform predicate";
+    return emitOpError("region may not contain nested operation ")
+           << unsupportedRegion->getName();
+  }
+
+  if (!waveUniform) {
+    getRegion().walk([&](Operation *nested) {
+      if (crossLaneOp)
+        return WalkResult::interrupt();
+      if (nested != getOperation() && isa<WarpPredicateOp>(nested))
+        return WalkResult::skip();
+      if (isa<triton::DotOp>(nested)) {
+        crossLaneOp = nested;
+        return WalkResult::interrupt();
+      }
+      if (auto convert = dyn_cast<ConvertLayoutOp>(nested);
+          convert && !isConvertTrivial(convert)) {
+        Region *sourceRegion = convert.getSrc().getParentRegion();
+        bool captured = sourceRegion != &getRegion() &&
+                        !getRegion().isAncestor(sourceRegion);
+        bool boundary = convert->hasOneUse() &&
+                        llvm::any_of(yield.getValues(), [&](Value value) {
+                          return value == convert;
+                        });
+        // Layout propagation moves captured conversions before EXEC is
+        // restricted and yielded conversions after reconvergence. Only an
+        // internal shuffle truly executes under the predicate.
+        if (!captured && !boundary) {
+          crossLaneOp = nested;
+          return WalkResult::interrupt();
+        }
+      }
+      return WalkResult::advance();
+    });
+    if (crossLaneOp)
+      return emitOpError("cross-lane operation ")
+             << crossLaneOp->getName() << " requires a wave-uniform predicate";
+  }
+
+  WalkResult barrier = getRegion().walk([&](Operation *nested) {
+    if (nested != getOperation() && isa<WarpPredicateOp>(nested))
+      return WalkResult::skip();
+    return isa<BarrierOp>(nested) ? WalkResult::interrupt()
+                                  : WalkResult::advance();
+  });
+  if (barrier.wasInterrupted())
+    return emitOpError("region may not contain CTA barriers");
+
+  return success();
+}
+
 // Get the size of a scalar type when stored in shared memory.
 // TODO: Generalize this as needed.
 size_t getSharedMemorySize(Type type) {
@@ -1667,6 +1915,23 @@ uint64_t WarpSpecializeOp::getCaptureAlign() {
 unsigned WarpSpecializeOp::getTotalPartitionWarps() {
   ArrayRef<int32_t> numWarps = getPartitionNumWarps();
   return std::accumulate(numWarps.begin(), numWarps.end(), 0);
+}
+
+//===----------------------------------------------------------------------===//
+// WarpVoteOp
+//===----------------------------------------------------------------------===//
+
+LogicalResult WarpVoteOp::verify() {
+  if (getKind() != "all" && getKind() != "any")
+    return emitOpError("kind must be \"all\" or \"any\"");
+  // Frontend TTIR is intentionally unencoded. TritonGPU conversion preserves
+  // this op while assigning its predicate a concrete distributed encoding, at
+  // which point the verifier can enforce physical per-lane cardinality.
+  auto predType = getPred().getType();
+  if (predType.getEncoding() && getTotalElemsPerThread(predType) != 1)
+    return emitOpError(
+        "predicate must distribute exactly one element per lane");
+  return success();
 }
 
 //===----------------------------------------------------------------------===//

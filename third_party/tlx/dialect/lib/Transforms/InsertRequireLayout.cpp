@@ -291,9 +291,20 @@ static Attribute computeSharedEncFromDotEnc(ttg::DotOperandEncodingAttr dotEnc,
       using amdgpu::ISAFamily;
       if (llvm::is_contained({ISAFamily::CDNA4, ISAFamily::GFX1250},
                              targetFeatures.getISAFamily())) {
+        // A subview retains the parent allocation shape in its MemDescType.
+        // Build inferred padding against that allocation, because the padded
+        // encoding's linear component is verified against allocShape even
+        // when the local_load consumes only a smaller logical view.
+        auto composeType = type;
+        if (!isBufferLoadToLocal && type.getShape() != type.getAllocShape()) {
+          auto allocShape = type.getAllocShape();
+          composeType = ttg::MemDescType::get(
+              allocShape, type.getElementType(), type.getEncoding(),
+              type.getMemorySpace(), type.getMutableMemory(), allocShape);
+        }
         if (auto padded = composePaddedLayout(
                 targetFeatures, dotEnc.getOpIdx(), dotEnc.getKWidth(),
-                cast<ttg::TensorOrMemDesc>(type), paddedOrder, dotEnc,
+                cast<ttg::TensorOrMemDesc>(composeType), paddedOrder, dotEnc,
                 /*useAsyncCopy=*/true)) {
           // `composePaddedLayout` returns the bank-conflict-avoiding padded
           // layout, derived from the DOT (read) order. Its linear component is
@@ -414,8 +425,9 @@ static Value findMemDescRoot(Value memdesc) {
     // anchors and dot-consumer discovery meet on the full buffer even when
     // WMMA consumes a sliced or transposed view.
     if (isa<ttg::MemDescIndexOp, ttg::MemDescReinterpretOp,
-            ttg::MemDescSubsliceOp, ttg::MemDescTransOp, ttg::MemDescReshapeOp,
-            tlx::RequireLayoutOp>(def)) {
+            ttg::MemDescSubsliceOp, ttg::MemDescDynamicSubsliceOp,
+            ttg::MemDescTransOp, ttg::MemDescReshapeOp, tlx::RequireLayoutOp>(
+            def)) {
       root = def->getOperand(0);
       continue;
     }
@@ -437,8 +449,9 @@ static bool isFedByAnyMemDescUser(Value memdesc) {
       // local_load(transpose(subslice)), and already-constrained aliases are
       // recognized as users of the same allocation.
       if (isa<ttg::MemDescIndexOp, ttg::MemDescReinterpretOp,
-              ttg::MemDescSubsliceOp, ttg::MemDescTransOp,
-              ttg::MemDescReshapeOp, tlx::RequireLayoutOp>(u))
+              ttg::MemDescSubsliceOp, ttg::MemDescDynamicSubsliceOp,
+              ttg::MemDescTransOp, ttg::MemDescReshapeOp, tlx::RequireLayoutOp>(
+              u))
         worklist.insert(u->getResult(0));
     }
   }
@@ -491,8 +504,9 @@ static amdgpu::BufferLoadToLocalOp findBufferProducer(Value memdesc) {
       if (auto buf = dyn_cast<amdgpu::BufferLoadToLocalOp>(u))
         return buf;
       if (isa<ttg::MemDescIndexOp, ttg::MemDescReinterpretOp,
-              ttg::MemDescSubsliceOp, ttg::MemDescTransOp,
-              ttg::MemDescReshapeOp, tlx::RequireLayoutOp>(u))
+              ttg::MemDescSubsliceOp, ttg::MemDescDynamicSubsliceOp,
+              ttg::MemDescTransOp, ttg::MemDescReshapeOp, tlx::RequireLayoutOp>(
+              u))
         worklist.insert(u->getResult(0));
     }
   }
@@ -602,8 +616,9 @@ computeBufferViewOrder(Value memdesc, triton::ModuleAxisInfoAnalysis &axis) {
     if (isa<ttg::MemDescTransOp>(def))
       swapped = !swapped;
     if (isa<ttg::MemDescIndexOp, ttg::MemDescReinterpretOp,
-            ttg::MemDescSubsliceOp, ttg::MemDescTransOp, ttg::MemDescReshapeOp,
-            tlx::RequireLayoutOp>(def)) {
+            ttg::MemDescSubsliceOp, ttg::MemDescDynamicSubsliceOp,
+            ttg::MemDescTransOp, ttg::MemDescReshapeOp, tlx::RequireLayoutOp>(
+            def)) {
       v = def->getOperand(0);
       continue;
     }
@@ -815,8 +830,9 @@ public:
     // source memdesc, which lets the alloc converge to the meet of
     // every sibling subview's dot-consumer state.
     if (isa<ttg::MemDescIndexOp, ttg::MemDescReinterpretOp,
-            ttg::MemDescSubsliceOp, ttg::MemDescTransOp, ttg::MemDescReshapeOp,
-            tlx::RequireLayoutOp>(op)) {
+            ttg::MemDescSubsliceOp, ttg::MemDescDynamicSubsliceOp,
+            ttg::MemDescTransOp, ttg::MemDescReshapeOp, tlx::RequireLayoutOp>(
+            op)) {
       for (const auto resultLattice : results) {
         for (auto [i, operandLattice] : llvm::enumerate(operands)) {
           if (!isa<ttg::MemDescType>(op->getOpOperand(i).get().getType()))

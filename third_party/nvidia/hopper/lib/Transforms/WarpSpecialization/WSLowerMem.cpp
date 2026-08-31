@@ -14,7 +14,6 @@
 #include "mlir/Support/LogicalResult.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "mlir/Transforms/Passes.h"
-#include "mlir/Transforms/RegionUtils.h"
 #include "nvidia/include/Dialect/NVGPU/IR/Dialect.h"
 #include "nvidia/include/Dialect/NVWS/IR/Dialect.h"
 #include "triton/Analysis/Utility.h"
@@ -25,7 +24,9 @@
 #include "triton/Dialect/TritonGPU/Transforms/TritonGPUConversion.h"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/TMAUtilities.h"
 #include "triton/Tools/Sys/GetEnv.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include <list>
+#include <optional>
 #include <unordered_set>
 
 namespace tt = mlir::triton;
@@ -61,15 +62,83 @@ static bool isValidTMADestEncoding(Attribute bufferEnc, Attribute descEnc) {
          descNvmma.getFp4Padded() == nvmma.getFp4Padded();
 }
 
+static bool isScheduleRematerialization(Operation *op) {
+  return isa<ttg::ConvertLayoutOp, tt::BroadcastOp, tt::ExpandDimsOp>(op);
+}
+
+static void eraseDeadScheduleRematerializations(Value value) {
+  SmallVector<Operation *> worklist(value.getUsers());
+  SmallVector<Operation *> candidates;
+  llvm::SmallPtrSet<Operation *, 8> visited;
+  while (!worklist.empty()) {
+    Operation *op = worklist.pop_back_val();
+    if (!isScheduleRematerialization(op))
+      continue;
+    if (!visited.insert(op).second)
+      continue;
+    candidates.push_back(op);
+    for (Value result : op->getResults())
+      llvm::append_range(worklist, result.getUsers());
+  }
+
+  bool changed = true;
+  while (changed) {
+    changed = false;
+    for (Operation *&op : llvm::reverse(candidates)) {
+      if (op && op->use_empty()) {
+        op->erase();
+        op = nullptr;
+        changed = true;
+      }
+    }
+  }
+}
+
+// Encoding to give a consumer buffer the TMA engine will write directly, or
+// nullopt when the load must not be fused into it. A buffer that already is a
+// legal TMA destination is kept as-is. One that is not may still be reusable:
+// a block-scale alloc carries a #ttg.shared_linear encoding that describes the
+// same layout as the descriptor's NVMMA one, so adopting the descriptor's
+// spelling keeps the direct TMA write and moves no data. Only when the layouts
+// genuinely differ does the load need its own landing buffer.
+static std::optional<Attribute>
+getTMAWritableEncoding(tt::DescriptorLoadOp load, RankedTensorType tensorType,
+                       ttg::MemDescType allocType, Attribute descEnc) {
+  Attribute allocEncoding = allocType.getEncoding();
+  if (isValidTMADestEncoding(allocEncoding, descEnc))
+    return allocEncoding;
+
+  // Same encoding the unfused path below would allocate.
+  Attribute loweredEnc =
+      ttng::getEncodingFromDescriptor(load, tensorType, load.getDesc());
+  auto loweredLayout = dyn_cast_or_null<ttg::LayoutEncodingTrait>(loweredEnc);
+  auto allocLayout = dyn_cast_or_null<ttg::LayoutEncodingTrait>(allocEncoding);
+  if (loweredLayout && allocLayout &&
+      ttg::areLayoutsEquivalent(allocType.getShape(), loweredLayout,
+                                allocLayout))
+    return loweredEnc;
+
+  return std::nullopt;
+}
+
 LogicalResult doConvertDescriptorLoadsToNVWS(triton::FuncOp funcOp) {
+  // Schedule rematerialization can leave dead per-task clones attached to a
+  // descriptor load. Remove only dead layout-rematerialization chains before
+  // deriving the replacement local_load's consumer task IDs; whole-function
+  // DCE would also erase intentionally dead consumers in test/debug IR.
   SmallVector<tt::DescriptorLoadOp> loads;
   funcOp.walk([&](tt::DescriptorLoadOp load) { loads.push_back(load); });
 
   for (tt::DescriptorLoadOp load : loads) {
+    eraseDeadScheduleRematerializations(load.getResult());
+    if (load.getResult().use_empty()) {
+      load.erase();
+      continue;
+    }
+
     auto tensorType = dyn_cast<RankedTensorType>(load.getType());
     if (!tensorType)
       return load.emitError("expected a ranked tensor descriptor load result");
-
     Attribute descEnc =
         cast<tt::TensorDescType>(load.getDesc().getType()).getSharedLayout();
 
@@ -87,9 +156,19 @@ LogicalResult doConvertDescriptorLoadsToNVWS(triton::FuncOp funcOp) {
     if (soleStore && !isValidTMADestEncoding(
                          soleStore.getDst().getType().getEncoding(), descEnc))
       soleStore = nullptr;
-    if (soleAlloc &&
-        !isValidTMADestEncoding(soleAlloc.getType().getEncoding(), descEnc))
-      soleAlloc = nullptr;
+    Attribute fusedEncoding;
+    if (soleAlloc) {
+      if (auto encoding = getTMAWritableEncoding(
+              load, tensorType, cast<ttg::MemDescType>(soleAlloc.getType()),
+              descEnc)) {
+        fusedEncoding = *encoding;
+      } else {
+        // Don't fuse. Clearing `soleAlloc` does double duty: the load falls
+        // through to its own TMA-compatible buffer below, and the alloc stays
+        // off the erase list since we no longer consume it.
+        soleAlloc = nullptr;
+      }
+    }
 
     OpBuilderWithAsyncTaskIds builder(load);
     builder.setInsertionPoint(load);
@@ -99,7 +178,7 @@ LogicalResult doConvertDescriptorLoadsToNVWS(triton::FuncOp funcOp) {
     } else if (soleAlloc) {
       auto oldType = cast<ttg::MemDescType>(soleAlloc.getType());
       auto bufferType = ttg::MemDescType::get(
-          oldType.getShape(), oldType.getElementType(), oldType.getEncoding(),
+          oldType.getShape(), oldType.getElementType(), fusedEncoding,
           oldType.getMemorySpace(), /*mutableMemory=*/true);
       auto newAlloc = builder.createWithAsyncTaskIds<ttg::LocalAllocOp>(
           soleAlloc.getLoc(), bufferType);
@@ -255,7 +334,8 @@ Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
                             Operation *headProducer, Operation *headConsumer,
                             Operation *headConsumerSameLevel,
                             ArrayRef<int> additionalConsumerTaskIds,
-                            DictionaryAttr consumerWaitConstraints) {
+                            DictionaryAttr consumerWaitConstraints,
+                            bool twoCTADirectWait) {
   // Callers group at least one load behind each fused barrier. Make the
   // precondition explicit instead of dereferencing front() blind below.
   if (tmaLoads.empty())
@@ -337,15 +417,18 @@ Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
       loc, builder.getI32Type(), phase);
   Value waitPred =
       builder.createWithAsyncTaskIds<arith::ConstantIntOp>(loc, 1, 1);
+  bool directTwoCTAWait = twoCTA && twoCTADirectWait;
   Value followerWaitPred;
   Value peerBarrier;
   if (twoCTA) {
     TwoCTAPairRank rank = buildTwoCTAPairRank(builder, loc);
     waitPred = builder.createWithAsyncTaskIds<arith::CmpIOp>(
         loc, arith::CmpIPredicate::eq, rank.rankInPair, rank.zero);
-    followerWaitPred = builder.createWithAsyncTaskIds<arith::CmpIOp>(
-        loc, arith::CmpIPredicate::ne, rank.rankInPair, rank.zero);
-    peerBarrier = mapBarrierTo2CTAPeer(builder, loc, consBarrier, rank.ctaId);
+    if (!directTwoCTAWait) {
+      followerWaitPred = builder.createWithAsyncTaskIds<arith::CmpIOp>(
+          loc, arith::CmpIPredicate::ne, rank.rankInPair, rank.zero);
+      peerBarrier = mapBarrierTo2CTAPeer(builder, loc, consBarrier, rank.ctaId);
+    }
   }
 
   // Create one WaitBarrierOp per consumer task ID.
@@ -353,7 +436,7 @@ Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
   builder.createWithAsyncTaskIds<ttng::WaitBarrierOp>(
       loc, consBarrier, phase, waitPred, /*deps=*/ValueRange{},
       consumerWaitConstraints);
-  if (twoCTA) {
+  if (twoCTA && !directTwoCTAWait) {
     // The hardware CTA-group TMA transaction completes the leader's local
     // mbarrier. Relay that completion to the follower's corresponding local
     // barrier, then let the follower wait on it. A cluster barrier is not
@@ -372,7 +455,7 @@ Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
     builder.createWithAsyncTaskIds<ttng::WaitBarrierOp>(
         loc, consBarrier, phase, waitPred,
         /*deps=*/ValueRange{}, consumerWaitConstraints);
-    if (twoCTA) {
+    if (twoCTA && !directTwoCTAWait) {
       builder.createWithAsyncTaskIds<ttng::FenceAsyncSharedOp>(
           loc, /*bCluster=*/false);
       builder.createWithAsyncTaskIds<ttng::ArriveBarrierOp>(

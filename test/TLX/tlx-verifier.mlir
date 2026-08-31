@@ -70,3 +70,39 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.shar
     tt.return
   }
 }
+
+// -----
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @release_layout_requires_encoded_source(
+      %arg: tensor<128xf32>) -> tensor<128xf32> {
+    // expected-error @+1 {{requires the source tensor to have a layout encoding}}
+    %result = tlx.release_layout %arg : tensor<128xf32> -> tensor<128xf32>
+    tt.return %result : tensor<128xf32>
+  }
+}
+
+// -----
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
+  // A private helper argument may acquire an encoding when TLX Fixup
+  // specializes the helper ABI from a concrete call site.
+  tt.func private @release_layout_defers_private_helper_source(
+      %arg: tensor<128xf32>) -> tensor<128xf32> {
+    %result = tlx.release_layout %arg : tensor<128xf32> -> tensor<128xf32>
+    tt.return %result : tensor<128xf32>
+  }
+}
+
+// -----
+
+#release_shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#release_user_shared = #tlx.user_layout<#release_shared>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @release_layout_accepts_encoded_source(
+      %arg: tensor<128xf32, #release_user_shared>) -> tensor<128xf32> {
+    %result = tlx.release_layout %arg
+        : tensor<128xf32, #release_user_shared> -> tensor<128xf32>
+    tt.return %result : tensor<128xf32>
+  }
+}

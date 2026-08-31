@@ -337,14 +337,15 @@ state.
   a dedicated single-buffered **cross-partition** reuse token (not the host
   operand's own barrier, whose consumer warp count differs and would trip
   `WSLowerToken`'s `consumerWarps == nWarps`): the load task `producer_acquire`s
-  it at the top of the outer loop with a loop-carried phase (from the induction
-  variable), and the staging task `consumer_release`s it at the bottom after the
-  staging stores drain. (An earlier degenerate version emitted a constant
+  it at the top of the outer loop with a loop-carried phase (from the normalized
+  induction variable for `scf.for`, or the AutoWS `+1` accumulation counter for
+  a CLC `scf.while`), and the staging task `consumer_release`s it at the bottom
+  after the staging stores drain. (An earlier degenerate version emitted a constant
   `bufferIdx=0`/`phase=0` acquire on the host token that `WSLowerToken` elided to
   a no-op — harmless on the single-tile path, a cross-tile SMEM race on the
   persistent path. Bug #9 / D109859261; see
   [TMAStoreWaitPipeline.md](TMAStoreWaitPipeline.md) and
-  `.llms/rules/partition-scheduler-bugs.md` #9, lit test
+  `.llms/rules/partition-scheduler-bugs.md` #9/#28, lit test
   `ws_code_partition_bwd_persist_staging_war.mlir`.)
 
 - **TMEM channels**: Inserts a `sliceAndReinterpretMDTMEM` op at the
@@ -376,8 +377,8 @@ about the ordering of `producer_acquire` across the two channels.
 
 | Mechanism | Condition | Insertion Point |
 |-----------|-----------|-----------------|
-| `ProducerAcquireOp` (token-based) | `consumerBarriers` empty | Before `headProducer` (or `producerAcquireForChannelLoop`) |
-| `WaitBarrierOp` (gen5 inline) | `consumerBarriers` populated | Before the producer, via `desyncMMAv5Op(..., asProducerAcquire=true)` |
+| `ProducerAcquireOp` (token-based) | Consumer task absent from `consumerBarriers` | Before `headProducer` (or `producerAcquireForChannelLoop`) |
+| `WaitBarrierOp` (gen5 inline) | Consumer task present in `consumerBarriers` | Before the producer, via `desyncMMAv5Op(..., asProducerAcquire=true)` |
 
 The variable `producerAcquireForChannelLoop` already handles the case of
 **forward/backward channel loops** (same alloc, same block, cycle through

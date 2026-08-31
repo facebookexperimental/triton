@@ -206,12 +206,16 @@ def ikbo_lce(
     embeddings_cand,
     embeddings_user,
     cand_to_user_index,
+    config=None,
 ):
     """IKBO LCE: candidate GEMM + in-kernel user broadcast.
 
     Two-phase computation:
       1. User: user_res = W_user @ E_user  (via torch.matmul, computed once)
       2. Fused: out[b] = W_cand @ E_cand[b] + user_res[u(b)]  (Triton kernel)
+
+    ``config=None`` autotunes over `_autotune_configs`; an explicit config dict
+    bypasses the autotuner, as in the Blackwell/Hopper tutorials.
     """
     B, K, N = embeddings_cand.shape
     M = compression_w_cand.size(0)
@@ -222,9 +226,7 @@ def ikbo_lce(
         dtype=embeddings_cand.dtype,
     )
 
-    grid = lambda META: (B * triton.cdiv(M, META["BM"]) * triton.cdiv(N, META["BN"]), )
-
-    _ikbo_lce_kernel[grid](
+    args = (
         compression_w_cand,
         embeddings_cand,
         cand_to_user_index,
@@ -242,5 +244,12 @@ def ikbo_lce(
         out.stride(1),
         out.stride(2),
     )
+
+    if config is not None:
+        grid = (B * triton.cdiv(M, config["BM"]) * triton.cdiv(N, config["BN"]), )
+        _ikbo_lce_kernel.fn[grid](*args, **config)
+    else:
+        grid = lambda META: (B * triton.cdiv(M, META["BM"]) * triton.cdiv(N, META["BN"]), )
+        _ikbo_lce_kernel[grid](*args)
 
     return out

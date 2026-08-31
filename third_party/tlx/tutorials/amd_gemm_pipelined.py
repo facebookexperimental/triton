@@ -233,8 +233,8 @@ def matmul_kernel_pipelined_mi300(a_ptr, b_ptr, c_ptr, M, N, K, stride_am, strid
 
 
 def matmul(a, b, config=None):
-    # config is accepted for a uniform launcher signature; this kernel is
-    # autotuned over `configs`, so the argument is intentionally unused.
+    # config=None autotunes over `configs`; an explicit config dict launches
+    # that config directly, matching the other tutorial launchers.
     # Check constraints.
     assert a.shape[1] == b.shape[0], "Incompatible dimensions"
     assert a.is_contiguous(), "Matrix A must be contiguous"
@@ -242,13 +242,18 @@ def matmul(a, b, config=None):
     K, N = b.shape
     # Allocates output (dtype follows the inputs so fp16/bf16 both round-trip).
     c = torch.empty((M, N), device=a.device, dtype=a.dtype)
-    # 1D launch kernel where each block gets its own program.
-    grid = lambda META: (triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(N, META['BLOCK_SIZE_N']), )
-    matmul_kernel_pipelined_mi300[grid](
+    args = (
         a, b, c,  #
         M, N, K,  #
         a.stride(0), a.stride(1),  #
         b.stride(0), b.stride(1),  #
         c.stride(0), c.stride(1),  #
     )
+    if config is not None:
+        grid = (triton.cdiv(M, config['BLOCK_SIZE_M']) * triton.cdiv(N, config['BLOCK_SIZE_N']), )
+        matmul_kernel_pipelined_mi300.fn[grid](*args, **config)
+    else:
+        # 1D launch kernel where each block gets its own program.
+        grid = lambda META: (triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(N, META['BLOCK_SIZE_N']), )
+        matmul_kernel_pipelined_mi300[grid](*args)
     return c

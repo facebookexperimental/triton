@@ -40,17 +40,17 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
   // CHECK:      %[[MOD:[0-9]+]] = arith.subi %[[CNT]], %[[MUL]] {async_task_id = array<i32: 0>}
   // CHECK:      %[[IDX:[0-9]+]] = arith.trunci %[[MOD]] {async_task_id = array<i32: 0>} : i64 to i32
   // CHECK:      ttg.memdesc_index %{{[0-9]+}}[%[[IDX]]] {async_task_id = array<i32: 0>} : !ttg.memdesc<3x128x64xf16
-  // CHECK:      ttng.wait_barrier {{.*}}WSBarrier = {dstTask = 2 : i32}
+  // CHECK:      ttng.wait_barrier {{.*}}WSBarrier = {channelGraph = array<i32: 2>, dstTask = 2 : i32
   // CHECK:      ttg.local_store
-  // CHECK:      ttng.arrive_barrier {{.*}}WSBarrier = {dstTask = 2 : i32}
+  // CHECK:      ttng.arrive_barrier {{.*}}WSBarrier = {channelGraph = array<i32: 2>, dstTask = 2 : i32
   //
   // The second subtile (tileIdx 1) flattens to `addi accumCnt, %c1_i64`, giving a
   // DISTINCT barrier generation -- the property the buggy shared-index version
   // lacked (it deadlocked).
   // CHECK:      arith.addi %[[CNT]], %c1_i64 {async_task_id = array<i32: 0>}
-  // CHECK:      ttng.wait_barrier {{.*}}WSBarrier = {dstTask = 2 : i32}
+  // CHECK:      ttng.wait_barrier {{.*}}WSBarrier = {channelGraph = array<i32: 2>, dstTask = 2 : i32
   // CHECK:      ttg.local_store
-  // CHECK:      ttng.arrive_barrier {{.*}}WSBarrier = {dstTask = 2 : i32}
+  // CHECK:      ttng.arrive_barrier {{.*}}WSBarrier = {channelGraph = array<i32: 2>, dstTask = 2 : i32
   tt.func public @matmul_kernel_tma_persistent_ws(%arg0: !tt.tensordesc<128x64xf16, #shared>, %arg1: i32, %arg2: i32, %arg3: i64, %arg4: i64, %arg5: !tt.tensordesc<128x64xf16, #shared>, %arg6: i32, %arg7: i32, %arg8: i64, %arg9: i64, %arg10: !tt.tensordesc<128x64xf16, #shared>, %arg11: i32, %arg12: i32, %arg13: i64, %arg14: i64, %arg15: i32 {tt.divisibility = 16 : i32}, %arg16: i32 {tt.divisibility = 16 : i32}, %arg17: i32 {tt.divisibility = 16 : i32}) attributes {noinline = false} {
     %false = arith.constant false
     %true = arith.constant true

@@ -42,6 +42,15 @@ def _clc_issue(
     return _semantic.builder.clc_issue(clc_response_addr.handle, barrier.handle)
 
 
+def _use_multi_cta_sync(multi_ctas, _semantic):
+    multi_ctas = tl._unwrap_if_constexpr(multi_ctas)
+    if not multi_ctas:
+        return False
+    options = _semantic.builder.options
+    cluster_dims = options.cluster_dims or (1, 1, 1)
+    return options.num_ctas > 1 or any(dim > 1 for dim in cluster_dims)
+
+
 @tl.builtin
 def _clc_query(
     clc_response_addr: tlx.clc_response,
@@ -77,7 +86,7 @@ def clc_create_context(num_consumers, num_stages: tl.tensor = 1, _semantic=None)
 
 
 @tl.builtin
-def clc_producer(context, p_producer=None, multi_ctas: bool = False, k=0, _semantic=None):
+def clc_producer(context, p_producer=None, multi_ctas: bool = True, k=0, _semantic=None):
     """
     Issue a CLC try_cancel request from the first CTA in the cluster.
 
@@ -95,7 +104,8 @@ def clc_producer(context, p_producer=None, multi_ctas: bool = False, k=0, _seman
         context: CLC pipeline context created by clc_create_context
         k: Stage index
         p_producer: Phase for producer
-        multi_ctas: If True, compute pred_cta0 internally from cluster_cta_rank()
+        multi_ctas: If True (the default), use cluster-aware synchronization
+            when the compilation options specify multiple CTAs.
 
     PTX instruction generated:
         clusterlaunchcontrol.try_cancel.async.shared::cta.mbarrier::complete_tx::bytes.multicast::cluster::all.b128
@@ -104,8 +114,10 @@ def clc_producer(context, p_producer=None, multi_ctas: bool = False, k=0, _seman
     bar_full = local_view(context._clc_mbars_full, k, _semantic=_semantic)
     response = local_view(context._clc_responses, k, _semantic=_semantic)
 
+    use_multi_cta_sync = _use_multi_cta_sync(multi_ctas, _semantic)
+
     # Compute pred_cta0 internally for multi-CTA mode
-    if multi_ctas:
+    if use_multi_cta_sync:
         cta_rank = cluster_cta_rank(_semantic=_semantic)
         zero = _semantic.builder.get_int32(0)
         pred_cta0_handle = _semantic.builder.create_icmpEQ(cta_rank.handle, zero)
@@ -130,7 +142,7 @@ def clc_producer(context, p_producer=None, multi_ctas: bool = False, k=0, _seman
 
 
 @tl.builtin
-def clc_consumer(context, p_consumer=None, multi_ctas: bool = False, k=0, return_3d: bool = False, _semantic=None):
+def clc_consumer(context, p_consumer=None, multi_ctas: bool = True, k=0, return_3d: bool = False, _semantic=None):
     """
     Decode the tile ID from a CLC response and signal completion.
 
@@ -148,7 +160,8 @@ def clc_consumer(context, p_consumer=None, multi_ctas: bool = False, k=0, return
         context: CLC pipeline context created by clc_create_context
         k: Stage index
         p_consumer: Phase for consumer
-        multi_ctas: If True, compute pred_cta0 internally and use remote signaling
+        multi_ctas: If True (the default), use cluster-aware remote signaling
+            when the compilation options specify multiple CTAs.
         return_3d: If True, return (ctaIdX, ctaIdY, ctaIdZ) tuple instead of scalar tile_id
 
     Returns the tile ID if successful, otherwise -1.
@@ -168,6 +181,8 @@ def clc_consumer(context, p_consumer=None, multi_ctas: bool = False, k=0, return
     # before reading the CLC response.
     barrier_wait(bar_full, p_consumer, _semantic=_semantic)
 
+    use_multi_cta_sync = _use_multi_cta_sync(multi_ctas, _semantic)
+
     # Extract tile_id from the CLC response.
     stolen_tile_ids = _clc_query(response, _semantic=_semantic)
     stolen_tile_id = stolen_tile_ids[0]
@@ -180,7 +195,7 @@ def clc_consumer(context, p_consumer=None, multi_ctas: bool = False, k=0, return
     zero = _semantic.builder.get_int32(0)
     pred_has_tile_handle = _semantic.builder.create_icmpSGE(stolen_tile_id.handle, zero)
     pred_has_tile = tl.tensor(pred_has_tile_handle, tl.int1)
-    if multi_ctas:
+    if use_multi_cta_sync:
         # Arrive at CTA 0's bar_empty via remote_cta_rank=0
         # (barrier_arrive handles remote_view internally)
         barrier_arrive(bar_empty, tl.constexpr(1), 0, pred=pred_has_tile, _semantic=_semantic)

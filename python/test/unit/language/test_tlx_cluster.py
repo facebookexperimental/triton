@@ -4,6 +4,7 @@ import torch
 import triton
 import triton.language as tl
 from triton._internal_testing import is_hopper_or_newer, is_blackwell
+from triton.backends.compiler import GPUTarget
 import triton.language.extra.tlx as tlx
 
 
@@ -51,6 +52,41 @@ def test_cluster_dims(device):
     assert kernel.metadata.ctas_per_cga == (2, 1, 1)
     assert ('"ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32'
             in k.asm["ttgir"])
+
+
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper/Blackwell for clusters")
+def test_ctas_per_cga_regroups_grid_without_multiplying(device):
+    """`ctas_per_cga` groups CTAs the grid already has; `num_ctas` spawns more.
+
+    A grid of GRID with a 2-CTA physical cluster must still launch GRID thread
+    blocks -- GRID // 2 clusters -- where the same grid with `num_ctas=2`
+    launches 2 * GRID. Normalizing `ctas_per_cga` to `num_ctas == 1` is what
+    keeps the launcher's `gridX * num_ctas` from multiplying the request, so
+    this pins the launch geometry rather than only the recorded metadata.
+    """
+
+    @triton.jit
+    def count_kernel(counter_ptr):
+        tl.atomic_add(counter_ptr, 1)
+
+    GRID = 1000
+
+    counter = torch.zeros(1, dtype=torch.int32, device=device)
+    physical = count_kernel[(GRID, )](counter, ctas_per_cga=(2, 1, 1))
+    torch.cuda.synchronize()
+    assert counter.item() == GRID, "ctas_per_cga must regroup the grid, not multiply it"
+    assert physical.metadata.num_ctas == 1
+    assert tuple(physical.metadata.cluster_dims) == (2, 1, 1)
+
+    # The contrasting model is asserted through metadata only. Under `num_ctas`
+    # the cluster's CTAs cooperate on a single program, so a scalar atomic runs
+    # once per program rather than once per thread block: the counter reads GRID
+    # under both models and cannot see the extra CTAs. It is a valid probe above
+    # precisely because `ctas_per_cga` pins `num_ctas == 1`, which makes programs
+    # and thread blocks coincide.
+    logical = count_kernel[(GRID, )](counter, num_ctas=2)
+    assert logical.metadata.num_ctas == 2
+    assert tuple(logical.metadata.cluster_dims) == (1, 1, 1)
 
 
 @pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper/Blackwell for clusters")
@@ -453,12 +489,71 @@ def test_cluster_launch_control(BLOCK_SIZE, device):
     assert re.search((r"clusterlaunchcontrol.try_cancel"), ptx, flags=re.DOTALL)
     assert re.search((r"clusterlaunchcontrol.query_cancel.is_canceled.pred.b128"), ptx, flags=re.DOTALL)
     assert re.search((r"clusterlaunchcontrol.query_cancel.get_first_ctaid.v4.b32.b128"), ptx, flags=re.DOTALL)
+    assert "mapa.shared::cluster" not in ptx
 
     query_instr = ptx.index("clusterlaunchcontrol.query_cancel.get_first_ctaid.v4.b32.b128")
     fence_instr = ptx.index("fence.proxy.async.shared::cta")
     assert 0 < query_instr < fence_instr
 
     assert torch.count_nonzero(output) == size
+
+
+@triton.jit
+def _clc_default_multi_ctas_kernel(NUM_CONSUMERS: tl.constexpr):
+    clc_context = tlx.clc_create_context(NUM_CONSUMERS)
+    tlx.clc_producer(clc_context, 1)
+    tlx.clc_consumer(clc_context, 0)
+
+
+@triton.jit
+def _clc_explicit_multi_ctas_kernel(NUM_CONSUMERS: tl.constexpr, MULTI_CTAS: tl.constexpr):
+    clc_context = tlx.clc_create_context(NUM_CONSUMERS)
+    tlx.clc_producer(clc_context, 1, multi_ctas=MULTI_CTAS)
+    tlx.clc_consumer(clc_context, 0, multi_ctas=MULTI_CTAS)
+
+
+@pytest.mark.parametrize(
+    "ctas_per_cga,num_consumers,multi_ctas,expect_remote",
+    [
+        ((1, 1, 1), 1, None, False),
+        ((2, 1, 1), 2, None, True),
+        ((2, 1, 1), 1, False, False),
+    ],
+)
+def test_cluster_launch_control_multi_ctas_frontend(ctas_per_cga, num_consumers, multi_ctas, expect_remote):
+    if multi_ctas is None:
+        src = triton.compiler.ASTSource(
+            fn=_clc_default_multi_ctas_kernel,
+            signature={"NUM_CONSUMERS": "constexpr"},
+            constexprs={"NUM_CONSUMERS": num_consumers},
+        )
+    else:
+        src = triton.compiler.ASTSource(
+            fn=_clc_explicit_multi_ctas_kernel,
+            signature={"NUM_CONSUMERS": "constexpr", "MULTI_CTAS": "constexpr"},
+            constexprs={"NUM_CONSUMERS": num_consumers, "MULTI_CTAS": multi_ctas},
+        )
+    kernel = triton.compile(
+        src,
+        target=GPUTarget("cuda", 100, 32),
+        options={"ctas_per_cga": ctas_per_cga},
+    )
+    ttir = kernel.asm["ttir"]
+    ttgir = kernel.asm["ttgir"]
+    ptx = kernel.asm["ptx"]
+
+    assert ttir.count("nvg.cluster_id") == 1
+    expected_equalities = 2 if expect_remote else 1
+    assert ttir.count("arith.cmpi eq") == expected_equalities
+
+    if expect_remote:
+        assert "ttng.map_to_remote_buffer" in ttgir
+        assert "mapa.shared::cluster" in ptx
+    else:
+        assert "ttng.map_to_remote_buffer" not in ttgir
+        assert "mapa.shared::cluster" not in ptx
+
+    assert "multicast::cluster::all" in ptx
 
 
 @pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
@@ -525,7 +620,7 @@ def test_cluster_launch_control_3d(GRID_DIMS, device):
 @pytest.mark.parametrize("CLUSTER_SIZE", [2, 4])
 def test_cluster_launch_control_multi_cta(CLUSTER_SIZE, device):
     """
-    Test CLC with 2-CTA clusters (multi_ctas=True).
+    Test CLC with multi-CTA clusters using the default cluster-aware path.
 
     Verifies that:
     1. Both CTAs call barrier_expect_bytes (unpredicated) on their own local bar_full,
@@ -555,7 +650,7 @@ def test_cluster_launch_control_multi_cta(CLUSTER_SIZE, device):
 
         while tile_id != -1:
             # CLC producer
-            tlx.clc_producer(clc_context, clc_phase_producer, multi_ctas=True)
+            tlx.clc_producer(clc_context, clc_phase_producer)
             clc_phase_producer ^= 1
 
             block_start = tile_id * BLOCK_SIZE
@@ -569,7 +664,7 @@ def test_cluster_launch_control_multi_cta(CLUSTER_SIZE, device):
             tl.store(z_ptr + offsets, output, mask=mask)
 
             # CLC consumer
-            tile_id = tlx.clc_consumer(clc_context, clc_phase_consumer, multi_ctas=True)
+            tile_id = tlx.clc_consumer(clc_context, clc_phase_consumer)
             clc_phase_consumer ^= 1
 
     torch.manual_seed(0)

@@ -608,7 +608,7 @@ class Autotuner(KernelInterface):
         # Check if we can use the C-level autotune proxy
         if (native_create_autotune_proxy is not None and getattr(self.fn, 'c_cache', False)
                 and knobs.nvidia.use_autotune_c_cache and knobs.nvidia.use_triton_dispatcher and len(self.configs) > 1
-                and knobs.autotuning.listener is None):
+                and knobs.autotuning.listener is None and getattr(driver.active, "is_cpu_backend", False) is not True):
             proxy = getattr(self, '_autotune_proxy', None)
             if proxy is None:
                 # Compute key_indices: positions in arg_names for autotuner key fields
@@ -647,6 +647,8 @@ class Autotuner(KernelInterface):
 
     def _seed_autotune_proxy(self, key, config):
         """Insert a key→config mapping into the C autotune proxy table."""
+        if getattr(driver.active, "is_cpu_backend", False) is True:
+            return
         proxy = getattr(self, '_autotune_proxy', None)
         if proxy is None or native_autotune_proxy_insert is None:
             return
@@ -713,6 +715,9 @@ class Autotuner(KernelInterface):
         Returns None when preconditions aren't met (no c_cache, callable
         grid that can't be evaluated, extra kwargs, etc.).
         """
+        if getattr(driver.active, "is_cpu_backend", False) is True:
+            return None
+
         input_grid = kwargs.get('grid')
         if input_grid is None or not getattr(self.fn, 'c_cache', False):
             return None
@@ -780,21 +785,21 @@ class Autotuner(KernelInterface):
                         _padded = _padded + (None, ) * (len(self.fn.params) - len(_padded))
                     native_fast_dispatch_insert(self.fn, _padded, self.fn.params, self.fn._fc_options_hash, kernel,
                                                 _disp, getattr(kernel, '_dispatch_arg_indices', None))
-                    # Only enable the meta-less steady-state fast path (self.fn[grid](*full_args)
-                    # below) once a native dispatcher exists to carry the winning config's
-                    # compilation options. Without one -- e.g. dispatcher creation failed with
-                    # "Too many kernel args" -- steady-state falls back to a plain JIT launch that
-                    # recompiles at the default num_warps/num_stages and silently drops the config's
-                    # values, miscompiling kernels pinned to a non-default num_warps. Leaving
-                    # _seed_key unseeded re-runs this seed branch (a full run(**_meta) that honors
-                    # the config) on every call instead.
+                    # Only enter steady-state proxy dispatch once a native dispatcher exists.
+                    # Without one -- e.g. dispatcher creation failed with "Too many kernel args"
+                    # -- leaving _seed_key unseeded keeps every launch on this full run(**_meta)
+                    # path and preserves the winning config's compilation options.
                     self._fc_seeded.add(_seed_key)
             return kernel
 
-        # Steady-state: dispatch via JITCacheProxy (fastest path).
-        # The C cache stores dispatch_arg_indices per entry so it correctly
-        # selects only the args the dispatcher expects (handles None ptr args).
-        return self.fn[evaluated_grid](*full_args)
+        # Steady-state: use JITCacheProxy when available. If proxy creation is
+        # bypassed or fails, retain the winning config's compilation options on
+        # the Python run() fallback rather than silently using backend defaults.
+        get_proxy = getattr(self.fn, '_get_jit_cache_proxy', None)
+        proxy = get_proxy(evaluated_grid) if get_proxy is not None else None
+        if proxy is not None:
+            return proxy(*full_args)
+        return self.fn.run(*full_args, grid=evaluated_grid, warmup=False, **_meta)
 
     def run(self, *args, **kwargs):
         self.nargs = dict(zip(self.arg_names, args))
@@ -1084,6 +1089,9 @@ class Config:
     :ivar enable_tree_reduction: use tree-shaped, vectorized in-thread reductions. If unset, use the
         backend's architecture-specific default.
     :type enable_tree_reduction: bool | None
+    :ivar enable_nvptx_v2i32: opt in to NVPTX v2i32 register legalization. Off by default;
+        the packed form costs an unpack/repack per use and no integer op is legal on it.
+    :type enable_nvptx_v2i32: bool | None
     """
 
     @staticmethod
@@ -1116,6 +1124,7 @@ class Config:
         auto_tma=None,
         enable_tree_reduction=None,
         allowDependentTwoCTA=None,
+        enable_nvptx_v2i32=None,
     ):
         self.kwargs = kwargs
         self.num_warps = num_warps
@@ -1140,6 +1149,7 @@ class Config:
         # knob; True/False lets the autotuner A/B auto-TMA per shape.
         self.auto_tma = auto_tma
         self.enable_tree_reduction = enable_tree_reduction
+        self.enable_nvptx_v2i32 = enable_nvptx_v2i32
 
     def __setstate__(self, state):
         self.kwargs = state.get("kwargs", {})
@@ -1161,6 +1171,7 @@ class Config:
         self.allowDependentTwoCTA = state.get("allowDependentTwoCTA", None)
         self.auto_tma = state.get("auto_tma", None)
         self.enable_tree_reduction = state.get("enable_tree_reduction", None)
+        self.enable_nvptx_v2i32 = state.get("enable_nvptx_v2i32", None)
 
     def all_kwargs(self):
         return {
@@ -1185,6 +1196,7 @@ class Config:
                     ("auto_tma", self.auto_tma),
                     ("enable_tree_reduction", self.enable_tree_reduction),
                     ("allowDependentTwoCTA", self.allowDependentTwoCTA),
+                    ("enable_nvptx_v2i32", self.enable_nvptx_v2i32),
                 ) if v is not None
             },
         }
@@ -1208,6 +1220,7 @@ class Config:
         res.append(f"multicast: {self.multicast}")
         res.append(f"auto_tma: {self.auto_tma}")
         res.append(f"enable_tree_reduction: {self.enable_tree_reduction}")
+        res.append(f"enable_nvptx_v2i32: {self.enable_nvptx_v2i32}")
         return ", ".join(res)
 
     def __hash__(self):

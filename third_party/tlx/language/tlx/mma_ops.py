@@ -86,11 +86,36 @@ def amd_register_resident(
     """
     register_class = tl._unwrap_if_constexpr(register_class)
     registers_per_group = tl._unwrap_if_constexpr(registers_per_group)
-    assert isinstance(value, tl.tensor), "value must be a distributed tensor"
+    assert isinstance(value, tl.tensor) and value.type.is_block(), "value must be a distributed tensor"
+    assert value.dtype.is_int() or value.dtype.is_floating(), "value elements must be integer or floating-point"
+    assert value.dtype.primitive_bitwidth in (16, 32), "value elements must be 16 or 32 bits"
     assert register_class in ("agpr", "vgpr"), ('register_class must be either "agpr" or "vgpr"')
     assert (isinstance(registers_per_group, int) and not isinstance(registers_per_group, bool) and registers_per_group
             in (1, 2, 4, 8, 16, 32)), "registers_per_group must be a power of two between 1 and 32"
     handle = _semantic.builder.create_amd_register_resident(value.handle, register_class, registers_per_group)
+    return tl.tensor(handle, value.type)
+
+
+@tl.builtin
+def amd_register_handoff(
+    value,
+    register_class: tl.constexpr = "vgpr",
+    _semantic=None,
+):
+    """Start a new AMD register-allocation interval for a tensor value.
+
+    Each 32-bit native register value is passed unchanged through an independent
+    tied register constraint, so this expresses a local allocation/scheduling
+    handoff without requiring the complete tensor to be resident at one point.
+    Use :func:`amd_register_resident` when simultaneous whole-tensor residency
+    is the intended software-pipeline contract.
+    """
+    register_class = tl._unwrap_if_constexpr(register_class)
+    assert isinstance(value, tl.tensor) and value.type.is_block(), "value must be a distributed tensor"
+    assert value.dtype.is_int() or value.dtype.is_floating(), "value elements must be integer or floating-point"
+    assert value.dtype.primitive_bitwidth in (16, 32), "value elements must be 16 or 32 bits"
+    assert register_class in ("agpr", "vgpr"), ('register_class must be either "agpr" or "vgpr"')
+    handle = _semantic.builder.create_amd_register_handoff(value.handle, register_class)
     return tl.tensor(handle, value.type)
 
 
@@ -200,13 +225,30 @@ def require_layout(
     assert isinstance(pin, bool), f"pin must be a constexpr bool, got {type(pin).__name__}"
     assert isinstance(late_address_compute, bool), ("late_address_compute must be a constexpr bool, got "
                                                     f"{type(late_address_compute).__name__}")
-    enc = layout.to_ir(_semantic.builder, x.shape, x.dtype)
+    if isinstance(layout, tlx.layout):
+        enc = layout.to_ir(_semantic.builder, x.shape, x.dtype)
+    else:
+        enc = layout.to_ir(_semantic.builder)
     handle = _semantic.builder.create_require_layout(
         x.handle,
         enc,
         pin=pin,
         late_address_compute=late_address_compute,
     )
+    return tl.tensor(handle, x.type)
+
+
+@tl.builtin
+def release_layout(x, _semantic=None):
+    """Release a register tensor's explicit layout for a flexible consumer.
+
+     The returned tensor has the same logical shape and element type as ``x``,
+     but downstream operations may choose their own layout.  Use this at a
+     helper or control-flow boundary when a source-scheduled fragment layout is
+     intentionally local to the preceding region.
+     """
+    assert isinstance(x, tl.tensor) and x.type.is_block(), "x must be a distributed tensor"
+    handle = _semantic.builder.create_release_layout(x.handle)
     return tl.tensor(handle, x.type)
 
 

@@ -16,6 +16,12 @@ def test_amd_mfma_tiles_per_warp_uses_warp_rank():
     assert tiled.tiles_per_warp == [2, 2]
 
 
+def test_slice_layout_rejects_negative_dimension():
+    mma = tlx.amd_mfma_layout(4, [32, 32, 16], True, [4, 1])
+    with pytest.raises(ValueError, match="dim must be non-negative"):
+        tlx.slice_layout(mma, dim=-1)
+
+
 # The FA4 "separable" layout for a 128x128 TMEM tile, written purely as
 # shape/stride (a CuTe thread-value layout). The two top-level modes are
 # (thread, value); strides are flat row-major offsets into the tile
@@ -98,6 +104,15 @@ def _pinned_fma_helper(a, b, c):
 # forward softmax kernel's pinned QK layout).
 def _row_per_thread_layout():
     return tlx.layout(shape=((32, 4), (128, )), stride=((128, 4096), (1, )))
+
+
+def _column_per_thread_layout():
+    return tlx.layout(shape=((32, 4), (128, )), stride=((1, 32), (128, )))
+
+
+_COLUMN_PER_THREAD_LINEAR = ("#ttg.linear<{register = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0], [64, 0]], "
+                             "lane = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16]], "
+                             "warp = [[0, 32], [0, 64]], block = []}>")
 
 
 @pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
@@ -367,6 +382,47 @@ def test_pinned_propagates_through_cast():
     assert "no_verify_layout" not in compiled.asm["ttgir"]
 
 
+@pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
+def test_require_layout_after_release_reanchors_layout():
+    """A release boundary should permit a later explicit pin to establish a new
+    hard layout anchor. The current layout-removal path drops that second pin
+    when its only consumer is a layout-flexible local_store."""
+
+    @triton.jit
+    def kernel(ROW: tl.constexpr, COL: tl.constexpr):
+        offs = tl.arange(0, 128)
+        x = offs[:, None].to(tl.float32) + offs[None, :].to(tl.float32)
+        row = tlx.require_layout(x, ROW)
+        col = tlx.require_layout(tlx.release_layout(row), COL)
+        out_buf = tlx.local_alloc((128, 128), tl.float32, tl.constexpr(1))
+        tlx.local_store(tlx.local_view(out_buf, 0), col)
+
+    compiled = kernel.warmup(_row_per_thread_layout(), _column_per_thread_layout(), grid=(1, ), num_warps=4)
+    ttgir = compiled.asm["ttgir"]
+    assert _COLUMN_PER_THREAD_LINEAR in ttgir
+    _assert_no_layout_residue(ttgir)
+
+
+@pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
+def test_require_layout_after_release_reanchors_tmem_store():
+    """A user pin that feeds a TMEM local_store must not be erased by the
+    convert-layout cleanup before the required TMEM-compatible store layout."""
+
+    @triton.jit
+    def kernel(ROW: tl.constexpr, COL: tl.constexpr):
+        offs = tl.arange(0, 128)
+        x = offs[:, None].to(tl.float32) + offs[None, :].to(tl.float32)
+        row = tlx.require_layout(x, ROW)
+        store_value = tlx.require_layout(tlx.release_layout(row), COL)
+        out_buf = tlx.local_alloc((128, 128), tl.float32, tl.constexpr(1), tlx.storage_kind.tmem)
+        tlx.local_store(tlx.local_view(out_buf, 0), store_value)
+
+    compiled = kernel.warmup(_row_per_thread_layout(), _column_per_thread_layout(), grid=(1, ), num_warps=4)
+    ttgir = compiled.asm["ttgir"]
+    assert _COLUMN_PER_THREAD_LINEAR in ttgir
+    _assert_no_layout_residue(ttgir)
+
+
 @pytest.mark.skipif(not is_cuda(), reason="Need CUDA")
 def test_dump_layout_cute(capfd, monkeypatch):
     """`tlx.dump_layout` prints the resolved layout in CuTe Shape:Stride form to
@@ -513,9 +569,9 @@ def test_swizzled_layout_lowers_to_swizzled_shared():
 # ---------------------------------------------------------------------------
 # "Does the compiler understand user layouts?" -- adversarial end-to-end cases.
 #
-# Every user-pinned layout rides through the pipeline as #tlx.user_layout<...>
-# and must (a) survive to the final TTGIR as the exact concrete layout the user
-# asked for, and (b) leave no #tlx.user_layout / no_verify_layout residue.
+# Every user-pinned layout must (a) survive to the final TTGIR as the exact
+# concrete layout the user asked for, and (b) leave no #tlx.user_layout,
+# no_verify_layout, or ttg.require_layout residue.
 # ---------------------------------------------------------------------------
 
 
@@ -525,6 +581,7 @@ def _assert_no_layout_residue(ttgir):
     # `tlx.user_layout` (see triton_tlx.cc), which must not trip this check.
     assert "#tlx.user_layout" not in ttgir, "user-layout wrapper encoding leaked into final IR"
     assert "#tlx.no_verify_layout" not in ttgir, "no-verify wrapper encoding leaked into final IR"
+    assert "ttg.require_layout" not in ttgir, "require_layout boundary leaked into final IR"
 
 
 @pytest.mark.skipif(not is_cuda(), reason="Need CUDA")
@@ -1021,6 +1078,85 @@ def test_tlx_dot_preserves_explicit_accumulator_layout_on_cdna4():
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Need gfx950 (CDNA4)")
+def test_mfma_split_concat_preserves_logical_columns_on_cdna4():
+    """Order-preserving reshape/split/join reconstructs an MFMA score tile.
+
+    Flash attention carries N8 probability fragments across source stages and
+    later reassembles them for its row sum and P-by-V dot.  Marking these
+    reshapes reorderable changes their logical register interpretation: the
+    shapes still verify, but every reconstructed row can contain wrong values.
+    """
+
+    @triton.jit
+    def split_cols(x):
+        x0, x1 = x.reshape([x.shape[0], 2, x.shape[1] // 2]).permute(0, 2, 1).split()
+        return x0, x1
+
+    @triton.jit
+    def concat_cols(x0, x1):
+        return tl.join(x0, x1).permute(0, 2, 1).reshape([x0.shape[0], x0.shape[1] + x1.shape[1]])
+
+    @triton.jit
+    def sum_rows_chain4(x):
+        x_01, x_23 = split_cols(x)
+        x_0, x_1 = split_cols(x_01)
+        x_2, x_3 = split_cols(x_23)
+        return tl.sum(x_0 + x_1 + x_2 + x_3, 1)
+
+    @triton.jit
+    def kernel(X, Recon, Chain, Direct, MMA: tl.constexpr):
+        rows = tl.arange(0, 256)
+        cols = tl.arange(0, 64)
+        offsets = rows[:, None] * 64 + cols[None, :]
+        x = tlx.require_layout(tl.load(X + offsets), MMA)
+        x_lo, x_hi = split_cols(x)
+        reconstructed = concat_cols(x_lo, x_hi)
+        chain = sum_rows_chain4(x)
+        direct = tl.sum(x, 1)
+        tl.store(Recon + offsets, reconstructed)
+        tl.store(Chain + rows, chain)
+        tl.store(Direct + rows, direct)
+
+    mma = tlx.amd_mfma_layout(4, [32, 32, 16], True, [8, 1])
+    torch.manual_seed(7)
+    x = torch.rand((256, 64), device=DEVICE, dtype=torch.float32)
+    reconstructed = torch.empty_like(x)
+    chain = torch.empty((256, ), device=DEVICE, dtype=torch.float32)
+    direct = torch.empty_like(chain)
+    compiled = kernel[(1, )](x, reconstructed, chain, direct, mma, num_warps=8, enable_tree_reduction=True)
+
+    reference = x.sum(1)
+    torch.testing.assert_close(reconstructed, x, atol=0, rtol=0)
+    torch.testing.assert_close(chain, reference, atol=1e-5, rtol=1e-6)
+    torch.testing.assert_close(direct, reference, atol=1e-5, rtol=1e-6)
+    _assert_no_layout_residue(compiled.asm["ttgir"])
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Need gfx950 (CDNA4)")
+def test_slice_layout_matches_mfma_row_reduction_on_cdna4():
+    """The public slice layout names the rank-1 result of an MFMA row sum."""
+    mma = tlx.amd_mfma_layout(4, [32, 32, 16], True, [8, 1])
+    rows = tlx.slice_layout(mma, dim=1)
+
+    @triton.jit
+    def kernel(X, Y, MMA: tl.constexpr, ROWS: tl.constexpr):
+        offs_m = tl.arange(0, 256)
+        offs_n = tl.arange(0, 64)
+        offsets = offs_m[:, None] * 64 + offs_n[None, :]
+        x = tlx.require_layout(tl.load(X + offsets), MMA)
+        reduced = tl.reduce(x, 1, _pinned_add_combine)
+        reduced = tlx.require_layout(reduced, ROWS)
+        tlx.assert_same_layout(reduced, ROWS)
+        tl.store(Y + offs_m, reduced)
+
+    x = torch.rand((256, 64), device=DEVICE, dtype=torch.float32)
+    y = torch.empty((256, ), device=DEVICE, dtype=torch.float32)
+    compiled = kernel[(1, )](x, y, mma, rows, num_warps=8, enable_tree_reduction=True)
+    torch.testing.assert_close(y, x.sum(1), atol=1e-5, rtol=1e-6)
+    _assert_no_layout_residue(compiled.asm["ttgir"])
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Need gfx950 (CDNA4)")
 def test_user_pinned_swizzled_padded_survives_amd():
     """A user-pinned *swizzled* padded_shared (built with `with_bases`) survives
     to final TTGIR as #ttg.padded_shared with the explicit {offset = ...} form,
@@ -1252,3 +1388,100 @@ def test_pinned_loop_carried_dot_operand_amd():
     assert "#ttg.amd_mfma" in ttgir
     _assert_no_layout_residue(ttgir)
     assert compiled.asm.get("amdgcn")
+
+
+@triton.jit
+def _fa_pin_helper_result(value, layout: tl.constexpr):
+    # The pin originates inside the helper, so its return operand is the only
+    # authoritative layout witness for the helper result ABI.
+    return tlx.require_layout(value, layout)
+
+
+@triton.jit
+def _fa_workitems_to_mfma_rows(workitems):
+    rows, _ = workitems.reshape([8, 2, 32]).permute(0, 2, 1).split()
+    return rows.reshape([256])
+
+
+@triton.jit
+def _fa_mfma_rows_to_workitems(rows):
+    per_warp_rows = rows.reshape([8, 32])
+    return tl.broadcast_to(per_warp_rows[:, None, :], (8, 2, 32)).reshape([512])
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Need gfx950 (CDNA4)")
+def test_cute_layout_with_standard_casts_on_cdna4():
+    physical = tlx.layout(
+        shape=((64, ), ()),
+        stride=((1, ), ()),
+    )
+
+    @triton.jit
+    def kernel(X, Y, Bits, PHYSICAL: tl.constexpr):
+        offsets = tl.arange(0, 64)
+        values = tl.load(X + offsets)
+        pinned = tlx.require_layout(values, PHYSICAL)
+        narrowed = pinned.to(tl.bfloat16)
+        widened = narrowed.to(tl.float32)
+        bits = pinned.to(tl.int32, bitcast=True)
+        tl.store(Y + offsets, widened)
+        tl.store(Bits + offsets, bits)
+
+    x = torch.linspace(-3.0, 3.0, 64, device=DEVICE, dtype=torch.float32)
+    y = torch.empty_like(x)
+    bits = torch.empty(64, device=DEVICE, dtype=torch.int32)
+    compiled = kernel.warmup(x, y, bits, physical, grid=(1, ), num_warps=1)
+    kernel[(1, )](x, y, bits, physical, num_warps=1)
+
+    torch.testing.assert_close(y, x.to(torch.bfloat16).float(), atol=0, rtol=0)
+    torch.testing.assert_close(bits, x.view(torch.int32), atol=0, rtol=0)
+    assert "#ttg.linear" in compiled.asm["ttir"]
+    assert "#tlx.no_verify_layout" not in compiled.asm["ttgir"]
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Need gfx950 (CDNA4)")
+def test_internally_pinned_helper_result_specializes_abi_on_cdna4():
+    layout = tlx.amd_mfma_layout(4, [32, 32, 16], True, [8, 1])
+
+    @triton.jit
+    def kernel(Y, LAYOUT: tl.constexpr):
+        row = tl.arange(0, 256)
+        col = tl.arange(0, 32)
+        value = tl.full((256, 32), 3.0, tl.float32)
+        pinned = _fa_pin_helper_result(value, LAYOUT)
+        tl.store(Y + row[:, None] * 32 + col[None, :], pinned)
+
+    y = torch.empty((256 * 32, ), device=DEVICE, dtype=torch.float32)
+    compiled = kernel.warmup(y, layout, grid=(1, ), num_warps=8)
+    kernel[(1, )](y, layout, num_warps=8)
+    torch.testing.assert_close(y, torch.full_like(y, 3.0), atol=0, rtol=0)
+    assert "#tlx.no_verify_layout" not in compiled.asm["ttgir"]
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Need gfx950 (CDNA4)")
+def test_concrete_mfma_layout_reconciles_elementwise_broadcast_on_cdna4():
+    mma = tlx.amd_mfma_layout(4, [32, 32, 16], True, [8, 1])
+    store = tlx.layout(
+        shape=((64, 8), (16, )),
+        stride=((16, 1024), (1, )),
+    )
+
+    @triton.jit
+    def kernel(Y, MMA: tl.constexpr, STORE: tl.constexpr):
+        acc = tlx.require_layout(tl.full((256, 32), 2.0, tl.float32), MMA)
+        source_rows = tl.arange(0, 256).to(tl.float32) + 1.0
+        workitems = _fa_mfma_rows_to_workitems(source_rows)
+        rows = _fa_workitems_to_mfma_rows(workitems)
+        out = (acc * rows[:, None]).to(tl.bfloat16)
+        out = tlx.require_layout(out, STORE)
+        row = tl.arange(0, 256)
+        col = tl.arange(0, 32)
+        tl.store(Y + row[:, None] * 32 + col[None, :], out)
+
+    y = torch.full((256 * 32, ), float("nan"), device=DEVICE, dtype=torch.bfloat16)
+    compiled = kernel.warmup(y, mma, store, grid=(1, ), num_warps=8)
+    kernel[(1, )](y, mma, store, num_warps=8)
+    expected = (2 * torch.arange(1, 257, device=DEVICE, dtype=torch.float32)).to(torch.bfloat16)
+    expected = expected[:, None].broadcast_to((256, 32)).flatten()
+    torch.testing.assert_close(y, expected, atol=0, rtol=0)
+    assert "#tlx.no_verify_layout" not in compiled.asm["ttgir"]

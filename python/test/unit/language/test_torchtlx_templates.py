@@ -138,6 +138,55 @@ class TestTLXTemplates(TestCase):
             pass  # Both TMA and tl.store paths are valid
 
     @unittest.skipIf(
+        not has_datacenter_blackwell_tma_device(),
+        "Need Blackwell with device-side TMA support in Triton",
+    )
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    @parametrize("layout", ("a_col", "b_col", "both_col"))
+    def test_tlx_matmul_ws_column_major(self, layout: str):
+        """A column-major operand goes through the transposed TMA descriptor path.
+
+        A column-major (M, K) operand has strides (1, M), so its .T is a row-major
+        (K, M) view of the same memory. The template describes that view, loads the
+        flipped tile shape, and recovers the MMA operand with tlx.local_trans -- no
+        contiguous copy. tlx_mode=force makes the TLX template the only choice, so a
+        layout it cannot handle fails here rather than quietly losing autotune.
+        """
+
+        def mm(a, b):
+            return torch.mm(a, b)
+
+        # Saturated (Rule 7) so the heuristic picks SPLIT_K=1: a split-K config would
+        # trip the separate reduce-k launch bug, which has nothing to do with layout.
+        M, K, N = 4096, 2048, 4096
+        dtype = torch.bfloat16
+        a = torch.randn((M, K), dtype=dtype, device=GPU_TYPE)
+        b = torch.randn((K, N), dtype=dtype, device=GPU_TYPE)
+        if layout in ("a_col", "both_col"):
+            a = a.t().contiguous().t()
+        if layout in ("b_col", "both_col"):
+            b = b.t().contiguous().t()
+
+        with config.patch({
+                "triton.tlx_mode": "force",
+                "force_disable_caches": True,
+                "enable_caching_generated_triton_templates": False,
+        }):
+            c_actual, code = run_and_get_code(torch.compile(mm), a, b)
+            c_expected = mm(a, b)
+
+        torch.testing.assert_close(c_actual, c_expected, atol=0.01, rtol=0.01)
+
+        # Both layout branches are constexpr and so both appear in the emitted source;
+        # the compiled-in flag is what says which one Triton folded to.
+        code_str = "\n".join(code)
+        self.assertIn("triton_tem_fused_tlx_mm", code_str)
+        if layout in ("a_col", "both_col"):
+            self.assertIn("A_ROW_MAJOR : tl.constexpr = False", code_str)
+        if layout in ("b_col", "both_col"):
+            self.assertIn("B_ROW_MAJOR : tl.constexpr = False", code_str)
+
+    @unittest.skipIf(
         not is_gfx950(),
         "Need AMD MI350X (gfx950) for the TLX warp-pipe addmm template",
     )
@@ -573,15 +622,87 @@ class TestTLXTemplates(TestCase):
         code_str = "\n".join(code)
         self.assertIn("triton_tem", code_str)
 
+    @unittest.skipIf(
+        not is_gfx950(),
+        "Need AMD MI350X (gfx950) for the TLX persistent warp-pipe addmm template",
+    )
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    @parametrize("K", (1024, 1032))
+    def test_tlx_addmm_persistent_warppipe_split_k(self, K: int):
+        """Persistent split-K handles complete and partial final K tiles."""
+        from triton.language.extra.tlx.inductor import mm_templates as _tlx_mm
+        from triton.language.extra.tlx.inductor import registry as _tlx_registry
+
+        # With the one 64x64 tile config this is 136 output tiles. SPLIT_K=2 creates
+        # 272 work items on 256 CUs, so the first 16 programs execute the persistent
+        # loop twice and exercise its cross-work-item LDS reuse. K=1024 covers full
+        # BLOCK_K tiles; K=1032 is fp16 16-byte aligned but leaves an 8-element tail.
+        M, N = 1088, 512
+        dtype = torch.float16
+        a = torch.randn(M, K, device=GPU_TYPE, dtype=dtype)
+        w = torch.randn(N, K, device=GPU_TYPE, dtype=dtype)
+        bias = torch.randn(N, device=GPU_TYPE, dtype=dtype)
+
+        def addmm(bias, a, w):
+            return torch.addmm(bias, a, w.t())
+
+        def _only_persistent(templates, op_name="mm"):
+            from torch._inductor.kernel.mm import mm_template
+
+            uids = {getattr(t, "uid", None) for t in templates}
+            if op_name == "addmm" and mm_template.uid in uids:
+                if _tlx_mm.gfx950_addmm_persistent_warppipe_template.uid not in uids:
+                    templates.append(_tlx_mm.gfx950_addmm_persistent_warppipe_template)
+            return templates
+
+        heuristic = _tlx_registry.Gfx950AddMMPersistentWarpPipeConfigHeuristic
+        get_configs = heuristic._get_template_configs_impl
+
+        def _split_k_two_only(instance, kernel_inputs, op_name):
+            for template_kwargs in get_configs(instance, kernel_inputs, op_name):
+                if template_kwargs.get("SPLIT_K") == 2:
+                    yield template_kwargs
+
+        with (
+                mock.patch.object(_tlx_mm, "append_tlx", _only_persistent),
+                mock.patch.object(
+                    heuristic,
+                    "WARPPIPE_CONFIGS",
+                    [(64, 64, 64, 8, 8, 3)],
+                ),
+                mock.patch.object(
+                    heuristic,
+                    "_get_template_configs_impl",
+                    _split_k_two_only,
+                ),
+                mock.patch.dict(
+                    _tlx_registry.os.environ,
+                    {"TORCHINDUCTOR_TLX_SPLIT_K": "1"},
+                ),
+                config.patch({
+                    "triton.tlx_mode": "force",
+                    "force_disable_caches": True,
+                    "max_autotune": True,
+                    "max_autotune_gemm_backends": "TRITON",
+                    "enable_caching_generated_triton_templates": False,
+                }),
+        ):
+            c_actual, code = run_and_get_code(torch.compile(addmm), bias, a, w)
+
+        c_expected = (a.float() @ w.t().float() + bias.float()).to(dtype)
+        torch.testing.assert_close(c_actual, c_expected, atol=3e-2, rtol=3e-2)
+
+        code_str = "\n".join(code)
+        self.assertIn("split_k_ws", code_str)
+        self.assertIn("_reduce_k", code_str)
+
 
 class TestWarpPipeSplitKCodegen(TestCase):
-    """Deterministic codegen check for the AMD warp-pipe split-K template.
+    """Deterministic codegen checks for the AMD warp-pipe split-K templates.
 
-    The e2e test above relies on autotune *selecting* a SPLIT_K > 1 config (highly
-    reliable on a 2-tile shape, but a timing decision). This test renders the
-    `gfx950_addmm_warppipe` jinja template directly with SPLIT_K=2 vs SPLIT_K=1 -- no
-    GPU, no autotune -- so the split-K branches are *guaranteed* covered even if
-    autotune ever stops picking split-K, and it runs on any host (not gfx950-gated).
+    The per-tile e2e test relies on autotune *selecting* a SPLIT_K > 1 config. These
+    tests render both warp-pipe Jinja templates directly with SPLIT_K=2 vs SPLIT_K=1,
+    so their split-K interfaces are covered without a GPU or autotune timing decision.
     """
 
     @unittest.skipIf(not has_tlx(), "TLX not available")
@@ -613,6 +734,34 @@ class TestWarpPipeSplitKCodegen(TestCase):
         # SPLIT_K == 1 must take the plain data-parallel path: no split-id, no workspace,
         # full-K loop, and store via store_output (not the reduce workspace).
         self.assertNotIn("split_id = (pid % SPLIT_K)", nosplit)
+        self.assertNotIn("split_k_ws", nosplit)
+        self.assertIn("k_lo = 0", nosplit)
+        self.assertIn("store_output", nosplit)
+
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    def test_persistent_warppipe_split_k_template_render(self):
+        import jinja2
+        from triton.language.extra.tlx.inductor.mm_templates import load_tlx_template
+
+        source = load_tlx_template("gfx950_addmm_persistent_warppipe")
+        hooks = {
+            "def_kernel": lambda *a, **k: "def _kernel(A, B, out_ptr0):",
+            "size": lambda *a, **k: "0",
+            "stride": lambda *a, **k: "1",
+            "output_ptr": lambda *a, **k: "out_ptr0",
+            "store_output": lambda *a, **k: "# store_output(...)",
+        }
+        tmpl = jinja2.Environment().from_string(source)
+        split = tmpl.render(SPLIT_K=2, **hooks)
+        nosplit = tmpl.render(SPLIT_K=1, **hooks)
+
+        self.assertIn("num_work_items = num_tiles * SPLIT_K", split)
+        self.assertIn("split_id = (work_id % SPLIT_K)", split)
+        self.assertIn("base = K_ITERS // SPLIT_K", split)
+        self.assertIn("k_lo = split_id * base", split)
+        self.assertIn("tl.store(split_k_ws + ws_off, acc", split)
+
+        self.assertNotIn("split_id = (work_id % SPLIT_K)", nosplit)
         self.assertNotIn("split_k_ws", nosplit)
         self.assertIn("k_lo = 0", nosplit)
         self.assertIn("store_output", nosplit)
@@ -775,6 +924,100 @@ class TestSplitK(TestCase):
         self.assertIn("_reduce_k", code_str)
         # relu is fused into the reducer, so no separate pointwise kernel
         self.assertNotIn("triton_poi_", code_str)
+
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    def test_split_k_template_keeps_output_ptr(self):
+        """The SPLIT_K > 1 branch must reference output_ptr(). No GPU needed.
+
+        Split-K writes fp32 partials to split_k_ws and never calls store_output(), so
+        without an explicit output_ptr() reference Inductor prunes out_ptr0 from the
+        kernel signature. The autotune benchmark harness still passes `out`
+        positionally, so the trailing argument lands on the launcher's `stream`
+        parameter and every SPLIT_K > 1 candidate dies with "too many positional
+        arguments ... 'stream' must be passed as a keyword argument" before it can be
+        measured. Rendering the jinja directly pins the reference regardless of which
+        config autotune happens to select.
+        """
+        import jinja2
+        from triton.language.extra.tlx.inductor.mm_templates import load_tlx_template
+
+        source = load_tlx_template("blackwell_gemm_ws")
+
+        # Count output_ptr() invocations rather than grepping the rendered text: it is
+        # calling the hook, not the spelling of the emitted line, that registers the
+        # buffer in the kernel signature.
+        output_ptr_calls = []
+
+        def output_ptr(*a, **k):
+            output_ptr_calls.append(1)
+            return "out_ptr0"
+
+        hooks = {
+            "def_kernel": lambda *a, **k: "def _kernel(A, B, out_ptr0):",
+            "size": lambda *a, **k: "0",
+            "stride": lambda *a, **k: "1",
+            "output_ptr": output_ptr,
+            "store_output": lambda *a, **k: "# store_output(...)",
+            "compute_epilogue": lambda *a, **k: "# compute_epilogue(...)",
+        }
+        tmpl = jinja2.Environment().from_string(source)
+        common = dict(TMA_EPILOGUE_STORE=0, INTERLEAVE_EPILOGUE=0, **hooks)
+
+        split = tmpl.render(SPLIT_K=4, **common)
+        self.assertIn("split_k_ws", split)
+        self.assertTrue(output_ptr_calls, "SPLIT_K > 1 must reference output_ptr()")
+
+        # Negative control: the plain data-parallel path stores through store_output,
+        # which registers the output buffer on its own, so output_ptr() is not needed.
+        output_ptr_calls.clear()
+        nosplit = tmpl.render(SPLIT_K=1, **common)
+        self.assertFalse(output_ptr_calls)
+        self.assertNotIn("split_k_ws", nosplit)
+
+    @unittest.skipIf(
+        not has_datacenter_blackwell_tma_device(),
+        "Need Blackwell with device-side TMA support in Triton",
+    )
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    def test_split_k_candidate_survives_autotune_in_allow_mode(self):
+        """A SPLIT_K > 1 candidate must survive being stood up by the benchmark harness.
+
+        The other split-K tests here run in force mode, where the heuristic config is
+        the only choice and autotuning short-circuits -- so the candidate is never
+        handed to the benchmark harness and its arg-count mismatch stays invisible.
+        allow mode makes it compete against the autotune pool, which is what every
+        undersaturated large-K shape does in practice, and is the path that used to
+        raise "'stream' must be passed as a keyword argument".
+        """
+        from triton.language.extra.tlx.inductor.registry import get_heuristic_config
+
+        def mm(a, b):
+            return torch.mm(a, b)
+
+        # 8 MN tiles (128x64) on 148 SMs -> deeply undersaturated, and K=8192 leaves
+        # each of 4 splits well above the 4-K-tile floor, so Rule 6 picks SPLIT_K > 1.
+        M, K, N = 256, 8192, 256
+        heuristic = get_heuristic_config(M, N, K)
+        # Guard against the heuristic drifting and silently turning this into a
+        # SPLIT_K=1 test that no longer covers the split-K benchmark path.
+        self.assertGreater(heuristic.get("SPLIT_K", 1) if heuristic else 1, 1)
+
+        a = torch.randn(M, K, dtype=torch.float16, device=GPU_TYPE)
+        b = torch.randn(K, N, dtype=torch.float16, device=GPU_TYPE)
+
+        with (
+                config.patch({
+                    "triton.tlx_mode": "allow",
+                    "max_autotune": True,
+                    "max_autotune_gemm_backends": "TRITON",
+                    "force_disable_caches": True,
+                    "enable_caching_generated_triton_templates": False,
+                }),
+                tlx_config.patch(use_heuristic_config=True, ),
+        ):
+            c_actual = torch.compile(mm)(a, b)
+
+        torch.testing.assert_close(c_actual, mm(a, b), atol=0.01, rtol=0.01)
 
 
 class TestReduceKKernel(TestCase):
