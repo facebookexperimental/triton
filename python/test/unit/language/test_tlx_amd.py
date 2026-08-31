@@ -5360,11 +5360,9 @@ def _async_load_1d_kernel(
     offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offs < n_elements
     buf = tlx.local_alloc((BLOCK_SIZE, ), tl.float32, 1)
-
     if INITIALIZE_LOCAL:
         val = tl.zeros((BLOCK_SIZE, ), tl.float32)
         tlx.local_store(tlx.local_view(buf, 0), val)
-
     tok = tlx.async_load(src_ptr + offs, tlx.local_view(buf, 0), mask=mask, other=OTHER_VAL)
     tlx.async_load_commit_group([tok])
     tlx.async_load_wait_group(0)
@@ -5388,11 +5386,9 @@ def _buffer_load_to_local_1d_kernel(
     offs = (pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)).to(tl.int32)
     mask = offs < n_elements
     buf = tlx.local_alloc((BLOCK_SIZE, ), tl.float32, 1)
-
     if INITIALIZE_LOCAL:
         val = tl.zeros((BLOCK_SIZE, ), tl.float32)
         tlx.local_store(tlx.local_view(buf, 0), val)
-
     tlx.buffer_load_to_local(tlx.local_view(buf, 0), src_ptr, offs, mask=mask, other=OTHER_VAL)
     tlx.async_load_commit_group()
     tlx.async_load_wait_group(0)
