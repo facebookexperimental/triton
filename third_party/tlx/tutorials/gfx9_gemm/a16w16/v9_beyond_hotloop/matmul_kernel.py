@@ -161,20 +161,20 @@ def v9_beyond_hotloop(
     # ── Main loop: step 2, four regions per body (identical to v8) ──
     for k in tl.range(0, iterMax - 2, 2, num_stages=1):
         # ──── Region 0 ────
+        tlx.async_load_wait_group(2)
         with tlx.warp_pipeline_stage("mfma", priority=0):
             acc_left = tl.dot(a, b_left, acc_left)
         with tlx.warp_pipeline_stage("mem", priority=1):
-            tlx.async_load_wait_group(2)
             b_right = tlx.local_load(smem_b_right[0], relaxed=True)
             tlx.buffer_load_to_local(smem_a[0], a_ptr, a_off + a_k)
             tlx.buffer_load_to_local(smem_b_left[0], b_ptr, bl_off + b_k)
             tlx.async_load_commit_group()
 
         # ──── Region 1 ────
+        tlx.async_load_wait_group(2)
         with tlx.warp_pipeline_stage("mfma", priority=0):
             acc_right = tl.dot(a, b_right, acc_right)
         with tlx.warp_pipeline_stage("mem", priority=1):
-            tlx.async_load_wait_group(2)
             a = tlx.local_load(smem_a[1], relaxed=True)
             b_left = tlx.local_load(smem_b_left[1], relaxed=True)
             tlx.buffer_load_to_local(smem_b_right[0], b_ptr, br_off + b_k)
@@ -183,20 +183,20 @@ def v9_beyond_hotloop(
             b_k += BLOCK_K * stride_bk
 
         # ──── Region 2 ────
+        tlx.async_load_wait_group(2)
         with tlx.warp_pipeline_stage("mfma", priority=0):
             acc_left = tl.dot(a, b_left, acc_left)
         with tlx.warp_pipeline_stage("mem", priority=1):
-            tlx.async_load_wait_group(2)
             b_right = tlx.local_load(smem_b_right[1], relaxed=True)
             tlx.buffer_load_to_local(smem_a[1], a_ptr, a_off + a_k)
             tlx.buffer_load_to_local(smem_b_left[1], b_ptr, bl_off + b_k)
             tlx.async_load_commit_group()
 
         # ──── Region 3 ────
+        tlx.async_load_wait_group(2)
         with tlx.warp_pipeline_stage("mfma", priority=0):
             acc_right = tl.dot(a, b_right, acc_right)
         with tlx.warp_pipeline_stage("mem", priority=1):
-            tlx.async_load_wait_group(2)
             a = tlx.local_load(smem_a[0], relaxed=True)
             b_left = tlx.local_load(smem_b_left[0], relaxed=True)
             tlx.buffer_load_to_local(smem_b_right[1], b_ptr, br_off + b_k)
