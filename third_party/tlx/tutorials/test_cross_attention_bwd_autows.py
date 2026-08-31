@@ -33,6 +33,8 @@ import bench_bwd as bb  # noqa: E402
 import triton_bw_cross_attention as xa  # noqa: E402
 
 
+
+pytestmark = pytest.mark.skipif(not (is_hopper() or is_blackwell()), reason="Requires Hopper or Blackwell")
 def _reset_captured_globals(module):
     """Clear every Triton jit function's captured ``used_global_vals`` in ``module``.
 
@@ -73,7 +75,7 @@ _SHAPES = [(256, 64, 2), (256, 128, 2), (256, 192, 2), (256, 256, 2)]
 
 @pytest.mark.parametrize("ns", [1, 2])
 @pytest.mark.parametrize("Lq,Lkv,Z", _SHAPES)
-@pytest.mark.skipif(not is_blackwell(), reason="Hand-written TLX backward requires a Blackwell GPU")
+@pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell (sm100) — hand-written TLX backward")
 def test_cross_attention_bwd_autows(Lq, Lkv, Z, ns):
     if not torch.cuda.is_available():
         pytest.skip("requires CUDA")
@@ -115,7 +117,7 @@ _SHARED_SHAPES = [(256, 256, 2), (256, 384, 2), (256, 512, 2)]
 
 @pytest.mark.parametrize("ns", [1, 2])
 @pytest.mark.parametrize("Lq,Lkv,Z", _SHARED_SHAPES)
-@pytest.mark.skipif(not is_blackwell(), reason="Hand-written TLX backward requires a Blackwell GPU")
+@pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell (sm100) — hand-written TLX backward")
 def test_cross_attention_bwd_tlx_2kv(Lq, Lkv, Z, ns):
     """TLX 2-KV-block data-partitioned reduce_dq (BwdVariant.TLX_2KV), shared-KV.
     Must match the torch-float reference and be run-to-run deterministic."""
@@ -156,7 +158,6 @@ _AUTOWS_2KV_SHAPES = [(256, 256, 2), (256, 320, 2), (256, 384, 2), (256, 512, 2)
     "variant",
     [xa.BwdVariant.TRITON_AUTOWS_2KV, xa.BwdVariant.TRITON_AUTOWS_2KV_HOST_TMA],
 )
-@pytest.mark.skipif(not (is_hopper() or is_blackwell()), reason="Requires Hopper or Blackwell GPU")
 def test_cross_attention_bwd_autows_2kv(Lq, Lkv, Z, ns, variant, monkeypatch):
     """MANUAL 2-KV-block data-partition reduce_dq (BwdVariant.TRITON_AUTOWS_2KV),
     shared-KV + compute fold, warp specialization ON (milestone 2). Two KV blocks

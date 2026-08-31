@@ -1,16 +1,18 @@
 # Codebase Architecture
 
 ## Compilation Pipeline
-Python DSL → TTIR (Triton IR) → TTGIR (Triton GPU IR) → LLVM IR → PTX/AMDGPU
+Python DSL → TTIR → GPU: TTGIR → LLVM IR → PTX/AMDGPU; CPU: TTCIR → TTTCIR → LLVM IR → native code
 
 ## Subsystems
 - **TLX DSL** (`third_party/tlx/language/tlx/`): Python frontend for low-level GPU primitives
 - **TLX Dialect** (`third_party/tlx/dialect/`): MLIR dialect (C++/TableGen) for TLX ops
-- **TLX Tutorials/Kernels** (`third_party/tlx/tutorials/`): Reference kernel implementations (Hopper/Blackwell GEMM and Flash Attention variants)
+- **TLX Tutorials/Kernels** (`third_party/tlx/tutorials/`): Reference kernel implementations (Hopper/Blackwell GEMM and
+  Flash Attention variants)
 - **Core Triton compiler** (`python/triton/compiler/`, `lib/`, `include/`): TTIR and TTGIR lowering
 - **NVIDIA backend** (`third_party/nvidia/`): PTX codegen, CUDA-specific passes
 - **AMD backend** (`third_party/amd/`): AMDGPU codegen
-- **Gluon** (`python/triton/experimental/gluon/`): Experimental high-level abstraction layer (upstream-synced, do not modify)
+- **Gluon** (`python/triton/experimental/gluon/`): Experimental high-level abstraction layer (upstream-synced, do not
+  modify)
 
 ## Glossary
 - **CTA**: Cooperative Thread Array (= thread block). A cluster groups multiple CTAs.
@@ -57,7 +59,10 @@ Always validate correctness before anything else.
 - Run all tests: `pytest third_party/tlx/tutorials/testing/test_correctness.py`
 - Run a single kernel: `pytest third_party/tlx/tutorials/testing/test_correctness.py::test_<kernel_name>`
 
-Available kernels: `blackwell_gemm_ws`, `blackwell_gemm_clc`, `blackwell_gemm_pipelined`, `blackwell_gemm_2cta`, `blackwell_fa_ws`, `blackwell_fa_ws_persistent`, `blackwell_fa_ws_pipelined`, `blackwell_fa_ws_pipelined_persistent`, `hopper_gemm_pipelined`, `hopper_gemm_ws`, `hopper_fa_ws`, `hopper_fa_ws_pipelined`, `hopper_fa_ws_pipelined_pingpong`, `hopper_fa_ws_pipelined_pingpong_persistent`
+Available kernels: `blackwell_gemm_ws`, `blackwell_gemm_clc`, `blackwell_gemm_pipelined`, `blackwell_gemm_2cta`,
+`blackwell_fa_ws`, `blackwell_fa_ws_persistent`, `blackwell_fa_ws_pipelined`, `blackwell_fa_ws_pipelined_persistent`,
+`hopper_gemm_pipelined`, `hopper_gemm_ws`, `hopper_fa_ws`, `hopper_fa_ws_pipelined`, `hopper_fa_ws_pipelined_pingpong`,
+`hopper_fa_ws_pipelined_pingpong_persistent`
 
 - For other kernels: `pytest third_party/tlx/tutorials/<KERNEL.py>`
 

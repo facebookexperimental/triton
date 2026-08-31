@@ -1714,6 +1714,7 @@ def _load_tlx_gfx9_inter_wave_bench_module(module_name="_tlx_amd_test_gfx9_inter
     try:
         sys.modules["matmul_kernel"] = SimpleNamespace(
             matmul=lambda _a, _b: None,
+            streamk_matmul=lambda _a, _b: None,
             MIN_K=128,
             KERNEL_NAME="a16w16_8wave",
         )

@@ -43,12 +43,13 @@ def TlxPropagateLayout : Pass<"tlx-propagate-layout", "mlir::ModuleOp"> {
       tensor values when the tensor lattice reaches a concrete encoding
     - applying consensus-based updates for RegionBranchOpInterface carriers and
       `ttg.warp_specialize` partition captures/arguments
-    - lowering residual tensor constraints to `ttg.convert_layout`
+    - lowering residual unpinned tensor constraints to `ttg.convert_layout`
+    - lowering residual pinned tensor constraints to `ttg.require_layout`
     - validating post-conditions such as the absence of unresolved
       DummyTMEMLayoutAttr allocations
 
     Tensor and memdesc constraints are either folded away when propagation
-    successfully retags the producer, or lowered to `ttg.convert_layout`.
+    successfully retags the producer, or lowered to an explicit TTGIR boundary.
   }];
 
   let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect",
@@ -124,14 +125,15 @@ def TLXFinalizeUserLayouts : Pass<"tlx-finalize-user-layouts", "mlir::ModuleOp">
 
   let description = [{
     Unwraps every remaining `#tlx.user_layout<L>` encoding on a RankedTensorType
-    (a user-pinned *register* layout on a `ttg.local_load`) back to its concrete
-    wrapped layout `L`, and verifies none remain.
+    back to its concrete wrapped layout `L`, defensively lowers any remaining
+    `ttg.require_layout` boundaries to ordinary `ttg.convert_layout`, and
+    verifies none remain.
 
     User-pinned register layouts are kept wrapped through the layout-optimization
-    passes (remove-layout-conversions, accelerate-matmul, optimize-dot-operands):
-    the wrapper carries `PinnedEncodingTrait`, so those passes anchor the load and
-    do not rewrite it. This pass runs after them to retire the marker. (Shared
-    user layouts on `local_alloc` are unwrapped much earlier, in
+    passes (remove-layout-conversions, accelerate-matmul, optimize-dot-operands)
+    as `ttg.require_layout` boundaries whose result wrapper carries
+    `PinnedEncodingTrait`. This pass runs after them to retire the boundary and
+    marker. (Shared user layouts on `local_alloc` are unwrapped much earlier, in
     tlx-propagate-layout, since nothing rewrites a buffer's shared encoding.)
   }];
 

@@ -39,6 +39,16 @@ namespace mlir::triton::gpu {
 
 namespace {
 
+static bool hasPinnedEncoding(Type type) {
+  if (auto tensorType = dyn_cast<RankedTensorType>(type))
+    return containsPinnedEncoding(tensorType.getEncoding());
+  return false;
+}
+
+static bool isPinnedConvertLayout(ConvertLayoutOp op) {
+  return hasPinnedEncoding(op.getType());
+}
+
 // A layout conversion requested at the source level can acquire a short
 // elementwise/conversion suffix when pinned layouts are materialized.  Layout
 // propagation may then eliminate the marked conversion and retain a later
@@ -128,6 +138,7 @@ public:
   void rewriteWhileOp(scf::WhileOp whileOp);
   void rewriteIfOp(scf::IfOp ifOp);
   void rewriteWarpPredicateOp(WarpPredicateOp predicateOp);
+  void rewriteRequireLayoutOp(RequireLayoutOp requireOp);
   void rewriteYieldOp(scf::YieldOp yieldOp);
   void rewritePredicateYieldOp(PredicateYieldOp yieldOp);
   void rewriteConditionOp(scf::ConditionOp conditionOp);
@@ -367,27 +378,6 @@ static bool hasConvertToMMATransisitiveUse(Operation *op, Attribute encoding) {
 }
 // Facebook end
 
-// A frontend may defer verification by wrapping a user pin in another layout
-// attribute (for example #tlx.no_verify_layout<#tlx.user_layout<...>>).  The
-// PinnedEncodingTrait is therefore not necessarily implemented by the
-// top-level encoding.  Detect it anywhere in the attribute tree so a deferred
-// hard constraint remains a hard constraint in this pass.
-static bool containsPinnedEncoding(Attribute encoding) {
-  if (!encoding)
-    return false;
-  if (isa<PinnedEncodingTrait>(encoding))
-    return true;
-
-  bool pinned = false;
-  encoding.walkImmediateSubElements(
-      [&](Attribute nested) {
-        if (!pinned)
-          pinned = containsPinnedEncoding(nested);
-      },
-      [](Type) {});
-  return pinned;
-}
-
 // Return true if the op is an op with a layout we don't want to change. We will
 // propagate the layout starting from anchor ops.
 bool isLayoutAnchor(Operation *op) {
@@ -474,7 +464,8 @@ void LayoutPropagation::setEncoding(ValueRange values, LayoutInfo &info,
     bool hasChanged = false;
     for (auto encoding : info.encodings) {
       Attribute dstEncoding;
-      if (isa<ConvertLayoutOp>(op)) {
+      if (auto convertOp = dyn_cast<ConvertLayoutOp>(op);
+          convertOp && !isPinnedConvertLayout(convertOp)) {
         // Try to remove the convert by making the dst encoding match the source
         // encoding.
         dstEncoding = encoding;
@@ -582,10 +573,17 @@ SmallVector<Value> LayoutPropagation::propagateToUsers(Value value,
     if (auto reshapeOp = dyn_cast<ReshapeOp>(user);
         reshapeOp && reshapeOp.getEfficientLayout())
       continue;
+    if (isa<RequireLayoutOp>(user))
+      continue;
+    if (auto convertOp = dyn_cast<ConvertLayoutOp>(user)) {
+      if (!isPinnedConvertLayout(convertOp))
+        setEncoding(user->getResults(), info, changed, user);
+      continue;
+    }
     if (user->hasTrait<OpTrait::SameOperandsAndResultEncoding>() ||
         user->hasTrait<OpTrait::Elementwise>() ||
-        isa<ReduceOp, ExpandDimsOp, ReshapeOp, TransOp, JoinOp, SplitOp,
-            ConvertLayoutOp>(user)) {
+        isa<ReduceOp, ExpandDimsOp, ReshapeOp, TransOp, JoinOp, SplitOp>(
+            user)) {
       setEncoding(user->getResults(), info, changed, user);
       continue;
     }
@@ -890,6 +888,8 @@ void LayoutPropagation::rewriteRegion(Region &region) {
         rewriteOp(&op);
         for (Region &R : op.getRegions())
           queue.push_back(&R);
+      } else if (auto requireOp = dyn_cast<RequireLayoutOp>(&op)) {
+        rewriteRequireLayoutOp(requireOp);
       } else if (auto yieldOp = dyn_cast<scf::YieldOp>(&op)) {
         rewriteYieldOp(yieldOp);
       } else if (auto yieldOp = dyn_cast<PredicateYieldOp>(&op)) {
@@ -1125,6 +1125,8 @@ void LayoutPropagation::rewriteOp(Operation *op) {
     rewriteIfOp(ifOp);
   else if (auto predicateOp = dyn_cast<WarpPredicateOp>(op))
     rewriteWarpPredicateOp(predicateOp);
+  else if (auto requireOp = dyn_cast<RequireLayoutOp>(op))
+    rewriteRequireLayoutOp(requireOp);
   else {
     Attribute encoding = *layouts[op->getResult(0)].encodings.begin();
     if (canUseResultEncoding(op, encoding)) {
@@ -1139,6 +1141,12 @@ void LayoutPropagation::rewriteOp(Operation *op) {
       llvm::report_fatal_error("unexpected op in rewrite");
     }
   }
+}
+
+void LayoutPropagation::rewriteRequireLayoutOp(RequireLayoutOp requireOp) {
+  auto resultType = cast<RankedTensorType>(requireOp.getType());
+  requireOp.getSrcMutable().assign(
+      getValueAs(requireOp.getSrc(), resultType.getEncoding()));
 }
 
 bool canBeRemat(Operation *op) {

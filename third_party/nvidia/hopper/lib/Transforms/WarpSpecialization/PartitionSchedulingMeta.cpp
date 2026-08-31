@@ -2963,10 +2963,9 @@ void PartitionSchedulingMeta::runOnOperation() {
     }
     loops.push_back(loop);
   });
-  for (auto [idx, enumeratedLoop] : llvm::enumerate(loops)) {
-    // Copy out of the structured binding: capturing one in a lambda is a C++20
-    // extension and this file is built as C++17.
-    LoopLikeOpInterface loop = enumeratedLoop;
+  for (auto it : llvm::enumerate(loops)) {
+    auto idx = it.index();
+    LoopLikeOpInterface loop = it.value();
     // Build SchedulingOptions from pass options and per-loop attributes.
     SchedulingOptions schedOpts;
     schedOpts.mergeEpilogue = mergeEpilogue;

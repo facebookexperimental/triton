@@ -45,6 +45,10 @@ arg_type_pattern = {
 }
 
 
+def _target_supports_triton_dispatcher(target) -> bool:
+    return getattr(target, "backend", None) == "cuda"
+
+
 def convert_type_repr(x):
     # Currently we only capture the pointer type and assume the pointer is on global memory.
     # TODO: Capture and support shared memory space
@@ -631,7 +635,8 @@ class CompiledKernel:
         self._dispatcher = None
         self._dispatch_arg_indices = None
         self._num_kernel_args = None
-        if knobs.nvidia.use_triton_dispatcher and "launch_metadata" in self.asm:
+        if (knobs.nvidia.use_triton_dispatcher and _target_supports_triton_dispatcher(self.metadata.target)
+                and "launch_metadata" in self.asm):
             try:
                 from triton.backends.nvidia.triton_dispatcher_factory import make_triton_dispatcher
                 schema = json.loads(self.asm["launch_metadata"])
@@ -788,7 +793,8 @@ class CompiledKernel:
             self.run(grid[0], grid[1], grid[2], stream, self.function, self.packed_metadata, launch_metadata,
                      knobs.runtime.launch_enter_hook, knobs.runtime.launch_exit_hook, *args)
 
-        if knobs.nvidia.use_triton_dispatcher and dispatcher is None:
+        if (knobs.nvidia.use_triton_dispatcher and _target_supports_triton_dispatcher(self.metadata.target)
+                and dispatcher is None):
             warnings.warn(
                 f"[Triton] TRITON_USE_C_DISPATCHER=1 but CompiledKernel '{self.name}' has no C dispatcher, "
                 f"falling back to Python runner",

@@ -37,6 +37,7 @@ Implemented today:
 mm/sm100.py
 flash_attn/sm100.py
 hstu_attn/sm100.py
+kda/sm100.py
 ```
 
 Current kernel selections for the rest of the catalog:
@@ -49,6 +50,7 @@ kernels/
     flash_attn/           sm90.py  sm100.py            (fwd + bwd)
     hstu_attn/            sm100.py  gfx942.py
                           _util.py  _stubs.py  _reference.py
+    kda/                  sm100.py
     gdpa/                 sm100.py  gfx950.py
     grouped_gemm/         sm100.py  gfx950.py
     addmm_glu/            gfx950.py

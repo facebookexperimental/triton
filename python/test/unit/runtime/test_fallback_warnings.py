@@ -8,11 +8,20 @@ are aware of the fallback.
 import warnings
 from unittest.mock import patch
 
+import pytest
 import torch
 import triton
 import triton.language as tl
 from triton import knobs
 from triton.compiler.compiler import ASTSource, compile as triton_compile
+
+
+def _is_cuda_target():
+    try:
+        target = triton.runtime.driver.active.get_current_target()
+    except RuntimeError:
+        return False
+    return target is not None and target.backend == "cuda"
 
 
 @triton.jit
@@ -35,6 +44,7 @@ def _compile_kernel(fn, signature, constexprs=None, attrs=None):
 class TestDispatcherFallbackWarning:
     """Tests for TRITON_USE_C_DISPATCHER fallback warnings."""
 
+    @pytest.mark.skipif(not _is_cuda_target(), reason="C dispatcher fallback warning is CUDA-only")
     def test_dispatcher_fallback_warning_in_compiled_kernel_getitem(self, monkeypatch):
         """CompiledKernel.__getitem__ should warn when dispatcher flag is on but _dispatcher is None."""
         monkeypatch.setenv("TRITON_USE_C_DISPATCHER", "1")
@@ -75,6 +85,7 @@ class TestDispatcherFallbackWarning:
             dispatcher_warnings = [x for x in w if "TRITON_USE_C_DISPATCHER" in str(x.message)]
             assert len(dispatcher_warnings) == 0
 
+    @pytest.mark.skipif(not _is_cuda_target(), reason="C dispatcher fallback warning is CUDA-only")
     def test_dispatcher_fallback_warning_in_jit_run(self, monkeypatch):
         """JITFunction.run() should warn when dispatcher flag is on but kernel has no dispatcher."""
         monkeypatch.setenv("TRITON_USE_C_DISPATCHER", "1")
@@ -181,6 +192,7 @@ class TestCCacheFallbackWarning:
             assert len(cache_warnings) == 0, (f"Expected 0 C cache bypass warnings, got {len(cache_warnings)}. "
                                               f"All warnings: {[str(x.message) for x in w]}")
 
+    @pytest.mark.skipif(not _is_cuda_target(), reason="C dispatcher fallback warning is CUDA-only")
     def test_c_cache_hit_no_dispatcher_warning(self, monkeypatch):
         """When dispatcher flag is on but kernel has no dispatcher, run() should warn."""
         monkeypatch.setenv("TRITON_ENABLE_C_CACHE", "1")
@@ -224,6 +236,7 @@ class TestCCacheFallbackWarning:
 class TestProxyFallbackWarning:
     """Tests for JIT proxy creation fallback warning."""
 
+    @pytest.mark.skipif(not _is_cuda_target(), reason="C JIT proxy is CUDA-only")
     def test_proxy_creation_failure_warning(self, monkeypatch):
         """Should warn when native_create_jit_proxy returns None."""
         monkeypatch.setenv("TRITON_ENABLE_C_CACHE", "1")

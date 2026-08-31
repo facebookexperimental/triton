@@ -45,6 +45,9 @@ def _is_sm90plus() -> bool:
     return major >= 9  # Hopper (sm_90) and Blackwell (sm_100)
 
 
+pytestmark = pytest.mark.skipif(not _is_sm90plus(), reason="Requires Hopper or newer (sm90+)")
+
+
 # ---------------------------------------------------------------------------
 # 1. Non-WS 2D strided promotion + numerics
 # ---------------------------------------------------------------------------
@@ -58,9 +61,6 @@ def _scale_2d_strided(x_ptr, out_ptr, M, N, stride_xm, stride_om, BLOCK_M: tl.co
     # Row-major x: innermost (offs_n) is contiguous -> auto-TMA eligible.
     x = tl.load(x_ptr + offs_m[:, None] * stride_xm + offs_n[None, :], mask=mask, other=0.0)
     tl.store(out_ptr + offs_m[:, None] * stride_om + offs_n[None, :], x * 2.0, mask=mask)
-
-
-@pytest.mark.skipif(not _is_sm90plus(), reason="auto-TMA promotion requires sm_90+")
 def test_auto_tma_2d_strided_numerics():
     M, N = 512, 384
     BLOCK_M, BLOCK_N = 64, 64
@@ -100,9 +100,6 @@ def _gemm_nows(a_ptr, b_ptr, c_ptr, M, N, K, stride_am, stride_bn, stride_cm, BL
         acc = tl.dot(a, b.T, acc)
     tl.store(c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :], acc.to(tl.float16),
              mask=(offs_m[:, None] < M) & (offs_n[None, :] < N))
-
-
-@pytest.mark.skipif(not _is_sm90plus(), reason="auto-TMA promotion requires sm_90+")
 def test_auto_tma_gemm_nows():
     """Isolates the auto-TMA DOT-operand path WITHOUT warp specialization."""
     M, N, K = 256, 256, 256
@@ -126,9 +123,6 @@ def test_auto_tma_gemm_nows():
     assert "tt.descriptor_load" in kernel.asm["ttir"], "expected auto-TMA promotion"
     ref = (A.to(torch.float32) @ B.T.to(torch.float32)).to(dtype)
     torch.testing.assert_close(ref, C, atol=0.05, rtol=0.05)
-
-
-@pytest.mark.skipif(not _is_sm90plus(), reason="auto-TMA promotion requires sm_90+")
 def test_auto_tma_gemm_nows_device(monkeypatch):
     """Phase A: addptr loads promoted to a DEVICE-built tt.make_tensor_descriptor
     (TRITON_AUTO_TMA_DEVICE=1), not the host-recipe path. Verifies the pass
@@ -193,9 +187,6 @@ def _batched_scale(x_ptr, out_ptr, B, M, N, stride_b, stride_m, BLOCK_M: tl.cons
     ob = out_ptr + pid_b * stride_b
     x = tl.load(xb + offs_m[:, None] * stride_m + offs_n[None, :], mask=mask, other=0.0)
     tl.store(ob + offs_m[:, None] * stride_m + offs_n[None, :], x * 2.0, mask=mask)
-
-
-@pytest.mark.skipif(not _is_sm90plus(), reason="auto-TMA promotion requires sm_90+")
 def test_auto_tma_batched_device(monkeypatch):
     """per-program base (pid_b*stride_b) must fold into the DEVICE descriptor base
     (make_tensor_descriptor(addptr(x, off), ...)), giving a per-batch view."""
@@ -280,9 +271,6 @@ def _ws_auto_tma_matmul(
         c = acc.to(tl.float16)
         tl.store(c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :], c,
                  mask=(offs_m[:, None] < M) & (offs_n[None, :] < N))
-
-
-@pytest.mark.skipif(not _is_sm90plus(), reason="WS + auto-TMA requires sm_90+")
 def test_ws_auto_tma_data_partition_numerics():
     M, N, K = 512, 512, 512
     BLOCK_M, BLOCK_N, BLOCK_K = 256, 128, 64  # dp=2 needs BLOCK_M=256 (256/2=128) so Blackwell tcgen05.mma M=128 is satisfied per partition
@@ -388,7 +376,6 @@ def _ws_autotma_perf_matmul(
     reason="perf benchmark (large GEMMs via do_bench); set TRITON_RUN_PERF=1 to run",
 )
 @pytest.mark.parametrize("M, N, K", [(2048, 2048, 2048), (4096, 4096, 4096), (8192, 8192, 8192)])
-@pytest.mark.skipif(not _is_sm90plus(), reason="WS + auto-TMA requires sm_90+")
 def test_ws_auto_tma_perf(M, N, K):
     """Perf: autoWS + dp=2 GEMM (self-contained _ws_autotma_perf_matmul),
     auto-TMA off vs on (same kernel; only the loads change from cp.async to
@@ -494,7 +481,6 @@ def _bench_autotma_variant(grid, A, B, C, M, N, K, BLOCK_M, BLOCK_N, BLOCK_K, GR
     reason="perf benchmark (autotuner over large GEMMs); set TRITON_RUN_PERF=1 to run",
 )
 @pytest.mark.parametrize("M, N, K", [(256, 256, 256), (4096, 4096, 4096), (8192, 8192, 8192)])
-@pytest.mark.skipif(not _is_sm90plus(), reason="WS + auto-TMA requires sm_90+")
 def test_ws_auto_tma_autotuner_picks_faster(M, N, K):
     """Perf study: the autotuner selects auto_tma=True only when it is actually
     faster. Two Configs (identical except auto_tma) are autotuned over a WS+dp
@@ -590,7 +576,6 @@ def _bench_scale_variant(grid, x, out, M, N, BLOCK_M, BLOCK_N, auto_tma):
     reason="perf benchmark (autotuner over elementwise); set TRITON_RUN_PERF=1 to run",
 )
 @pytest.mark.parametrize("M, N", [(512, 512), (4096, 4096)])
-@pytest.mark.skipif(not _is_sm90plus(), reason="auto-TMA requires sm_90+")
 def test_scale_auto_tma_autotuner_picks_faster(M, N):
     """Perf study (False direction): on a memory-bound elementwise scale there is
     no compute to overlap the copy with, so auto-TMA is at best neutral and often
@@ -678,9 +663,6 @@ def _plain_fa_fwd(Q, K, V, O, sm_scale, N_CTX, stride_h, stride_m, BLOCK_M: tl.c
         m_i = m_ij
     acc = acc / l_i[:, None]
     tl.store(o_base + offs_m[:, None] * stride_m + offs_d[None, :], acc.to(tl.float16), mask=offs_m[:, None] < N_CTX)
-
-
-@pytest.mark.skipif(not _is_sm90plus(), reason="auto-TMA promotion requires sm_90+")
 def test_plain_fa_fwd_device(monkeypatch):
     """A plain-pointer FA fwd (no descriptors, no warp_specialize): the Q/K/V
     loads are auto-TMA promoted to DEVICE make_tensor_descriptor + descriptor_load
@@ -757,9 +739,6 @@ def _plain_fa_fwd_ws(Q, K, V, O, sm_scale, N_CTX, stride_h, stride_m, BLOCK_M: t
         m_i = m_ij
     acc = acc / l_i[:, None]
     tl.store(o_base + offs_m[:, None] * stride_m + offs_d[None, :], acc.to(tl.float16), mask=offs_m[:, None] < N_CTX)
-
-
-@pytest.mark.skipif(not _is_sm90plus(), reason="WS + auto-TMA requires sm_90+")
 def test_plain_fa_fwd_ws_device(monkeypatch):
     """plain-pointer FA + warp_specialize: loads auto-TMA'd to device descriptors,
     loop warp-specialized, numerics vs torch SDPA."""
@@ -815,9 +794,6 @@ def _run_plain_fa_ws(q, k, v, o, sm_scale, N_CTX, BLOCK_M, BLOCK_N, HEAD_DIM):
         triton.knobs.nvidia.disable_wsbarrier_reorder = True
         return _plain_fa_fwd_ws[grid](q, k, v, o, sm_scale, N_CTX, q.stride(1), q.stride(2), BLOCK_M=BLOCK_M,
                                       BLOCK_N=BLOCK_N, HEAD_DIM=HEAD_DIM, num_warps=4, num_stages=2, maxRegAutoWS=192)
-
-
-@pytest.mark.skipif(not _is_sm90plus(), reason="WS + auto-TMA requires sm_90+")
 @pytest.mark.parametrize("N_CTX", [512, 1024, 2048])
 @pytest.mark.parametrize("HEAD_DIM", [64, 128])
 def test_plain_fa_fwd_ws_shapes(monkeypatch, N_CTX, HEAD_DIM):
@@ -842,7 +818,6 @@ def test_plain_fa_fwd_ws_shapes(monkeypatch, N_CTX, HEAD_DIM):
     os.environ.get("TRITON_RUN_PERF", "0") != "1",
     reason="perf benchmark (large FA via do_bench); set TRITON_RUN_PERF=1 to run",
 )
-@pytest.mark.skipif(not _is_sm90plus(), reason="WS + auto-TMA requires sm_90+")
 def test_perf_plain_fa_fwd_ws(monkeypatch):
     """Perf of the plain-pointer FA + WS + auto-TMA at a representative shape,
     with accuracy vs torch SDPA. Prints TFLOP/s (pin a free GPU)."""

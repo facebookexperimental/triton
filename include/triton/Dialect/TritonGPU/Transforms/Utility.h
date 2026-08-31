@@ -47,6 +47,13 @@ Value getMemAccessPtr(Operation *op);
 // Return bitwidth of tensor element
 unsigned getElementBitWidth(RankedTensorType type);
 
+// True if `encoding` is, or nests anywhere, an encoding implementing
+// ttg::PinnedEncodingTrait. Frontends may wrap a pinned encoding in another
+// layout attribute (for example #tlx.no_verify_layout<#tlx.user_layout<...>>),
+// so callers that enforce hard user layout anchors need to recurse through the
+// attribute tree instead of checking only the top-level encoding.
+bool containsPinnedEncoding(Attribute encoding);
+
 // Calculate the optimal number of elements per thread for a given operation
 // along an axis with greatest continuity.
 unsigned

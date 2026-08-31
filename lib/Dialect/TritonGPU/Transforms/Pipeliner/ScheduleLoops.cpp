@@ -823,10 +823,9 @@ scheduleKeyOpsAnnotation(scf::ForOp forOp,
   for (int i = 0; i < numClusters; ++i)
     clusters.push_back(schedule.clusters.newAtBack());
 
-  for (auto &[op, entryKey] : latencySchedule) {
-    // Copy out of the structured binding: capturing one in a lambda is a C++20
-    // extension and this file is built as C++17.
-    auto key = entryKey;
+  for (auto &entry : latencySchedule) {
+    Operation *op = entry.first;
+    auto key = entry.second;
     auto cluster = llvm::find_if(prefetchClusters, [&](const auto &entry) {
       return entry.first == key;
     });

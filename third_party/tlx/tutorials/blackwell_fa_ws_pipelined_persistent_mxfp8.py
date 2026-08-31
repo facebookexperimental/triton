@@ -1331,6 +1331,7 @@ def _attn_fwd_mxf8_ws(sm_scale, desc_m,  #
 def _attn_bwd_preprocess(
     O,
     DO,  #
+    DQ,
     Delta,  #
     H,
     N_CTX,  #
@@ -1356,6 +1357,7 @@ def _attn_bwd_preprocess(
     o = tl.load(O + o_offsets, mask=o_mask, other=0.0)
     do = tl.load(DO + o_offsets, mask=o_mask, other=0.0).to(tl.float32)
     delta = tl.sum(o * do, axis=1)
+    tl.store(DQ + o_offsets, 0.0, mask=o_mask)
     tl.store(Delta + base + off_m, delta, mask=off_m < N_CTX)
 
 
@@ -1581,8 +1583,11 @@ def _softmax_recompute_quantization_iter(
             tlx.barrier_arrive(dp_empties[0])
 
         dsT = _mul_f32x2(pT_slices[subtile_id], _sub_f32x2(dpT, Di[None, :]))
-        # NaN sanitization (boundary tiles)
-        dsT = tl.where(dsT == dsT, dsT, 0.0)
+        # Masked causal tiles can manufacture NaNs at inactive positions. The
+        # non-causal path is fully tiled and has no inactive lanes, so keep the
+        # compare/select off its steady-state dS critical path.
+        if MASK:
+            dsT = tl.where(dsT == dsT, dsT, 0.0)
         # Quantize dS twice: dK consumes dS^T, while dQ consumes dS
         # with the opposite reduction axis and therefore needs a
         # separate blockscaled encoding.
@@ -2346,7 +2351,7 @@ def _attn_bwd_mxf8_ws(
             tlx.async_descriptor_store_wait(0)
 
         # ----- Reduction warp: TMA atomic-reduce-add of dQ to GMEM -----
-        with tlx.async_task(num_warps=4, registers=112):
+        with tlx.async_task(num_warps=4, registers=96):
             tile_idx = tile_idx_start
             blk_idx = 0
             for _i in range(tiles_per_sm):
@@ -3032,7 +3037,10 @@ def attention_bwd(
 
     y_dim = Z * H * N_CTX
 
-    # Compute Delta = rowsum(O * dO) into an [Z, H, N_CTX] FP32 buffer.
+    # Fuse dQ initialization into the Delta preprocess launch.
+    dq = torch.empty(q.shape, device=q.device, dtype=torch.float32)
+    dk = torch.empty(k.shape, device=k.device, dtype=torch.bfloat16)
+    dv = torch.empty(v.shape, device=v.device, dtype=torch.bfloat16)
     delta = torch.empty_like(M)
 
     PRE_BLOCK_M = 32
@@ -3041,17 +3049,13 @@ def attention_bwd(
     _attn_bwd_preprocess[preproc_grid](
         o,
         do_preproc,
+        dq,
         delta,
         H,
         N_CTX,
         HEAD_DIM=HEAD_DIM,
         BLOCK_M=PRE_BLOCK_M,
     )
-
-    # Allocate outputs. dQ is FP32 (TMA reduce-add accumulation target).
-    dq = torch.zeros(q.shape, device=q.device, dtype=torch.float32)
-    dk = torch.zeros(k.shape, device=k.device, dtype=torch.bfloat16)
-    dv = torch.zeros(v.shape, device=v.device, dtype=torch.bfloat16)
 
     dummy_block = [1, 1, 1, 1]
     dummy_5d = [1, 1, 1, 1, 1]
