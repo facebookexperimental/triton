@@ -883,8 +883,10 @@ def ScheduledMfmaOp : TT_AMDGPU_Op<"scheduled_mfma"> {
     `auto`, `agpr`, or `vgpr`; `auto` means VGPRs for `transient` and AGPRs for
     `persistent` on every target, while an explicit class supports kernels
     whose two persistent accumulator sets intentionally occupy complementary
-    physical files. CDNA3 rejects any AGPR accumulator, including one named by
-    `auto`, so a persistent accumulator there must request `vgpr`.
+    physical files. On CDNA3 the compiler-generated AGPR read is not ordered
+    against the MFMA drain, so any AGPR accumulator is rejected there,
+    including one named by `auto`: a persistent accumulator must request
+    `vgpr`.
     `initialize` starts the native accumulators from zero. Completion
     of transient result fragments is represented separately by `mfma_commit`.
 

@@ -147,9 +147,10 @@ def amd_scheduled_mfma(
     ``accumulator_register_class`` overrides that default, allowing two
     persistent accumulator sets to occupy complementary register files.
 
-    CDNA3 rejects AGPR accumulators, so a ``"persistent"`` chain there must
-    pass ``accumulator_register_class="vgpr"``; the default is an error rather
-    than a silent downgrade.
+    On CDNA3 the compiler-generated AGPR read is not ordered against the MFMA
+    drain, so AGPR accumulators are rejected there and a ``"persistent"`` chain
+    must pass ``accumulator_register_class="vgpr"``; the default is an error
+    rather than a silent downgrade.
     """
     resident_operand = tl._unwrap_if_constexpr(resident_operand)
     accumulator_role = tl._unwrap_if_constexpr(accumulator_role)

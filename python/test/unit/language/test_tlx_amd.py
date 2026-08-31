@@ -2220,7 +2220,8 @@ def _amd_scheduled_mfma_gfx942_kernel(
             b,
             acc,
             accumulator_role="persistent",
-            # CDNA3 has no AGPR accumulator, so it cannot take the default.
+            # On CDNA3 the compiler-generated AGPR read is not ordered
+            # against the MFMA drain, so the accumulator stays in VGPRs.
             accumulator_register_class="vgpr",
             initialize=True,
         )
@@ -2239,7 +2240,7 @@ def _amd_scheduled_mfma_gfx942_kernel(
 
 
 @triton.jit
-def _amd_scheduled_mfma_32x32_gfx942_kernel(a_ptr, b_ptr, output_ptr):
+def _amd_scheduled_mfma_32x32_gfx942_kernel(a_ptr, b_ptr, output_ptr, PERSISTENT: tl.constexpr):
     mma: tl.constexpr = tlx.amd_mfma_layout(
         version=3,
         instr_shape=[32, 32, 8],
@@ -2262,13 +2263,25 @@ def _amd_scheduled_mfma_32x32_gfx942_kernel(a_ptr, b_ptr, output_ptr):
         pin=False,
     )
     acc = tlx.zeros((32, 128), tl.float32, layout=mma)
-    result = tlx.amd_scheduled_mfma(
-        a,
-        b,
-        acc,
-        accumulator_role="transient",
-        initialize=True,
-    )
+    if PERSISTENT:
+        result = tlx.amd_scheduled_mfma(
+            a,
+            b,
+            acc,
+            accumulator_role="persistent",
+            # On CDNA3 the compiler-generated AGPR read is not ordered
+            # against the MFMA drain, so the accumulator stays in VGPRs.
+            accumulator_register_class="vgpr",
+            initialize=True,
+        )
+    else:
+        result = tlx.amd_scheduled_mfma(
+            a,
+            b,
+            acc,
+            accumulator_role="transient",
+            initialize=True,
+        )
     offsets = output_ptr + rows[:, None] * 128 + cols[None, :]
     offsets = tlx.require_layout(offsets, mma, pin=False)
     tl.store(offsets, result)
@@ -2339,14 +2352,44 @@ def test_amd_scheduled_mfma_compiles_gfx942(elem_ty, persistent):
 
 
 @pytest.mark.parametrize("elem_ty", ["bf16", "fp16"])
-def test_amd_scheduled_mfma_32x32_compiles_gfx942(elem_ty):
+@pytest.mark.parametrize("persistent", [False, True])
+def test_amd_scheduled_mfma_32x32_compiles_gfx942(elem_ty, persistent):
     compiled = compile_for_gfx942(
         _amd_scheduled_mfma_32x32_gfx942_kernel,
-        signature={"a_ptr": f"*{elem_ty}", "b_ptr": f"*{elem_ty}", "output_ptr": "*fp32"},
-        constexprs={},
+        signature={
+            "a_ptr": f"*{elem_ty}",
+            "b_ptr": f"*{elem_ty}",
+            "output_ptr": "*fp32",
+            "PERSISTENT": "constexpr",
+        },
+        constexprs={"PERSISTENT": persistent},
     )
     asm_ty = "f16" if elem_ty == "fp16" else "bf16"
     assert f"v_mfma_f32_32x32x8_{asm_ty}" in compiled.asm["amdgcn"]
+
+
+@pytest.mark.skipif(not is_hip_cdna3(), reason="Requires gfx942 hardware")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
+@pytest.mark.parametrize("persistent", [False, True])
+def test_amd_scheduled_mfma_32x32_correct_gfx942(persistent, dtype):
+    """The mnemonic check above cannot see a fragment packing or ordering bug.
+
+    A 32x32x8 fragment is 16 accumulator registers per lane against the
+    16x16x16 path's 4, so it exercises a different packing.
+    """
+    torch.manual_seed(0)
+    a = torch.randn((32, 16), device="cuda", dtype=dtype)
+    b = torch.randn((16, 128), device="cuda", dtype=dtype)
+    actual = torch.empty((32, 128), device="cuda", dtype=torch.float32)
+    _amd_scheduled_mfma_32x32_gfx942_kernel[(1, )](
+        a,
+        b,
+        actual,
+        PERSISTENT=persistent,
+        num_warps=4,
+        matrix_instr_nonkdim=32,
+    )
+    torch.testing.assert_close(actual, a.float() @ b.float(), atol=2e-3, rtol=2e-3)
 
 
 def test_amd_scheduled_mfma_rejects_target_version_mismatch():
@@ -2414,9 +2457,13 @@ def _amd_scheduled_mfma_regclass_gfx942_kernel(
     tl.store(output_ptr + rows[:, None] * 128 + cols[None, :], result)
 
 
-def test_amd_scheduled_mfma_rejects_explicit_agpr_gfx942():
-    """CDNA3 cannot order the accumulator read against the MFMA drain."""
-    with pytest.raises(RuntimeError, match=r'accumulator_register_class "agpr" is not yet supported on CDNA3'):
+# The default resolves a persistent accumulator to AGPRs, so it is rejected
+# for the same reason the explicit class is: CDNA3 cannot order the
+# accumulator read against the MFMA drain.
+@pytest.mark.parametrize("acc_class", ["agpr", None], ids=["explicit_agpr", "default"])
+def test_amd_scheduled_mfma_rejects_agpr_accumulator_gfx942(acc_class):
+    reported = acc_class if acc_class is not None else "auto"
+    with pytest.raises(RuntimeError, match=f'accumulator_register_class "{reported}" is not yet supported on CDNA3'):
         compile_for_gfx942(
             _amd_scheduled_mfma_regclass_gfx942_kernel,
             signature={
@@ -2425,22 +2472,7 @@ def test_amd_scheduled_mfma_rejects_explicit_agpr_gfx942():
                 "output_ptr": "*fp32",
                 "ACC_CLASS": "constexpr",
             },
-            constexprs={"ACC_CLASS": "agpr"},
-        )
-
-
-def test_amd_scheduled_mfma_rejects_default_persistent_class_gfx942():
-    """The default names AGPRs for a persistent chain, so CDNA3 rejects it too."""
-    with pytest.raises(RuntimeError, match=r'accumulator_register_class "auto" is not yet supported on CDNA3'):
-        compile_for_gfx942(
-            _amd_scheduled_mfma_regclass_gfx942_kernel,
-            signature={
-                "a_ptr": "*fp16",
-                "b_ptr": "*fp16",
-                "output_ptr": "*fp32",
-                "ACC_CLASS": "constexpr",
-            },
-            constexprs={"ACC_CLASS": None},
+            constexprs={"ACC_CLASS": acc_class},
         )
 
 
@@ -2535,7 +2567,8 @@ def test_amd_scheduled_mfma_round_robin_order_gfx942():
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
-def test_amd_scheduled_mfma_initialize_discards_acc_gfx950():
+@pytest.mark.parametrize("k_width", [8, 4])
+def test_amd_scheduled_mfma_correct_gfx950(k_width):
     torch.manual_seed(0)
     a = torch.randn((16, 32), device="cuda", dtype=torch.bfloat16)
     b = torch.randn((32, 64), device="cuda", dtype=torch.bfloat16)
@@ -2544,24 +2577,7 @@ def test_amd_scheduled_mfma_initialize_discards_acc_gfx950():
         a,
         b,
         actual,
-        K_WIDTH=8,
-        num_warps=4,
-        matrix_instr_nonkdim=16,
-    )
-    torch.testing.assert_close(actual, a.float() @ b.float(), atol=2e-4, rtol=2e-4)
-
-
-@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
-def test_amd_scheduled_mfma_kwidth4_correct_gfx950():
-    torch.manual_seed(0)
-    a = torch.randn((16, 32), device="cuda", dtype=torch.bfloat16)
-    b = torch.randn((32, 64), device="cuda", dtype=torch.bfloat16)
-    actual = torch.empty((16, 64), device="cuda", dtype=torch.float32)
-    _amd_scheduled_mfma_kernel[(1, )](
-        a,
-        b,
-        actual,
-        K_WIDTH=4,
+        K_WIDTH=k_width,
         num_warps=4,
         matrix_instr_nonkdim=16,
     )

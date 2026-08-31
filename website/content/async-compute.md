@@ -173,9 +173,10 @@ Unlike `tl.dot`, `amd_scheduled_mfma` carries an explicit `accumulator_role`.
 `persistent` selects register-constrained lowering for a chain carried across
 phases. Its default `auto` accumulator storage follows the role alone, the same
 way on every target: VGPRs for `transient` and AGPRs for `persistent`. An
-explicit register class overrides that choice, and CDNA3 requires one — it
-cannot order an AGPR accumulator read against the MFMA drain, so a persistent
-accumulator there must ask for `"vgpr"` rather than be silently downgraded.
+explicit register class overrides that choice, and CDNA3 requires one — the
+compiler-generated AGPR read is not ordered against the MFMA drain there, so a
+persistent accumulator must ask for `"vgpr"` rather than be silently
+downgraded.
 Neither role changes the numerical matrix operation.
 
 ## Scaled dot
