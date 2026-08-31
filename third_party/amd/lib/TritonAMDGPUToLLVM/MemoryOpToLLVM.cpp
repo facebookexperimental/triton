@@ -1199,27 +1199,24 @@ public:
   }
 };
 
-static StringRef resolveAccumulatorStorage(triton::amdgpu::ScheduledMfmaOp op,
-                                           const AMD::TargetInfo &targetInfo) {
+// `auto` derives storage from the role alone, identically on every target.
+// Targets that cannot honor it reject it in the verifier.
+static StringRef resolveAccumulatorStorage(triton::amdgpu::ScheduledMfmaOp op) {
   StringRef storage = op.getAccumulatorRegisterClass();
   if (storage != "auto")
     return storage;
-  return op.getAccumulatorRole() == "persistent" &&
-                 targetInfo.getISAFamily() == ISAFamily::CDNA4
-             ? "agpr"
-             : "vgpr";
+  return op.getAccumulatorRole() == "persistent" ? "agpr" : "vgpr";
 }
 
 // Return the first accumulator reaching this boundary that its producer pinned
 // into AGPRs, or null if none is provably AGPR-resident.
 static triton::amdgpu::ScheduledMfmaOp
-findAgprResidentAccumulator(triton::amdgpu::MfmaCommitOp op,
-                            const AMD::TargetInfo &targetInfo, size_t &index) {
+findAgprResidentAccumulator(triton::amdgpu::MfmaCommitOp op, size_t &index) {
   for (auto [inputIndex, input] : llvm::enumerate(op.getInputs())) {
     if (!cast<RankedTensorType>(input.getType()).getElementType().isF32())
       continue;
     auto producer = input.getDefiningOp<triton::amdgpu::ScheduledMfmaOp>();
-    if (producer && resolveAccumulatorStorage(producer, targetInfo) == "agpr") {
+    if (producer && resolveAccumulatorStorage(producer) == "agpr") {
       index = inputIndex;
       return producer;
     }
@@ -1294,8 +1291,7 @@ public:
       return !cast<RankedTensorType>(input.getType()).getElementType().isF32();
     });
     size_t agprInputIndex = 0;
-    if (hasLiveDependency &&
-        findAgprResidentAccumulator(op, targetInfo, agprInputIndex))
+    if (hasLiveDependency && findAgprResidentAccumulator(op, agprInputIndex))
       return op.emitOpError()
              << "input " << agprInputIndex
              << " is an AGPR-resident accumulator committed alongside a live "
@@ -1512,7 +1508,7 @@ public:
 
     StringRef aStorage = op.getResidentOperand() == "lhs" ? "agpr" : "vgpr";
     StringRef bStorage = op.getResidentOperand() == "rhs" ? "agpr" : "vgpr";
-    StringRef accumulatorStorage = resolveAccumulatorStorage(op, targetInfo);
+    StringRef accumulatorStorage = resolveAccumulatorStorage(op);
 
     auto inputConstraint = [](StringRef registerClass) -> StringRef {
       return registerClass == "agpr" ? "a" : "v";

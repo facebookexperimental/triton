@@ -1117,3 +1117,30 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.tar
     tt.return
   }
 }
+
+// -----
+
+// "auto" names AGPRs for a persistent accumulator, so CDNA3 rejects it too.
+// Such kernels must request "vgpr" instead of "auto" meaning a different class
+// than it does on CDNA4.
+#auto_cdna3_mma = #ttg.amd_mfma<{version = 3, warpsPerCTA = [1, 1], instrShape = [16, 16, 16], isTransposed = true}>
+#auto_cdna3_lhs = #ttg.dot_op<{opIdx = 0, parent = #auto_cdna3_mma, kWidth = 4}>
+#auto_cdna3_rhs = #ttg.dot_op<{opIdx = 1, parent = #auto_cdna3_mma, kWidth = 4}>
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.target" = "hip:gfx942", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @scheduled_mfma_rejects_persistent_auto_on_cdna3(
+      %a: tensor<16x16xbf16, #auto_cdna3_lhs>,
+      %b: tensor<16x16xbf16, #auto_cdna3_rhs>) {
+    %acc = arith.constant dense<0.000000e+00> :
+        tensor<16x16xf32, #auto_cdna3_mma>
+    // expected-error @+1 {{accumulator_register_class "auto" is not yet supported on CDNA3 for a "persistent" accumulator}}
+    %result = amdg.scheduled_mfma %a, %b, %acc
+        resident "none" accumulator "persistent"
+        register_class "auto" initialize true
+        : tensor<16x16xbf16, #auto_cdna3_lhs>,
+          tensor<16x16xbf16, #auto_cdna3_rhs>,
+          tensor<16x16xf32, #auto_cdna3_mma>
+          -> tensor<16x16xf32, #auto_cdna3_mma>
+    tt.return
+  }
+}

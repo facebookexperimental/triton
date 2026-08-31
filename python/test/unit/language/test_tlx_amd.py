@@ -2220,6 +2220,8 @@ def _amd_scheduled_mfma_gfx942_kernel(
             b,
             acc,
             accumulator_role="persistent",
+            # CDNA3 has no AGPR accumulator, so it cannot take the default.
+            accumulator_register_class="vgpr",
             initialize=True,
         )
     else:
@@ -2296,8 +2298,8 @@ def _amd_scheduled_mfma_large_gfx942_kernel(a_ptr, b_ptr, output_ptr):
         pin=False,
     )
     acc = tlx.zeros((256, 256), tl.float32, layout=mma)
-    acc = tlx.amd_scheduled_mfma(a, b, acc, accumulator_role="persistent")
-    acc = tlx.amd_scheduled_mfma(a, b, acc, accumulator_role="persistent")
+    acc = tlx.amd_scheduled_mfma(a, b, acc, accumulator_role="persistent", accumulator_register_class="vgpr")
+    acc = tlx.amd_scheduled_mfma(a, b, acc, accumulator_role="persistent", accumulator_register_class="vgpr")
     offsets = output_ptr + rows[:, None] * 256 + cols[None, :]
     offsets = tlx.require_layout(offsets, mma, pin=False)
     tl.store(offsets, acc)
@@ -2323,10 +2325,11 @@ def test_amd_scheduled_mfma_compiles_gfx942(elem_ty, persistent):
     assert f"v_mfma_f32_16x16x16_{asm_ty}" in compiled.asm["amdgcn"]
     if persistent:
         assert f'asm sideeffect "s_nop 3\\0Av_mfma_f32_16x16x16_{asm_ty}' in compiled.asm["llir"]
-        assert 'asm sideeffect "s_nop 9"' in compiled.asm["llir"]
-        # Unlike gfx950, gfx942 `persistent` + `auto` keeps the accumulator in
-        # VGPRs: with AGPRs, LLVM emits v_accvgpr_read of the asm result ahead
-        # of the source-level drain, reading it before the MFMA retires.
+        # 8 passes + 3 = 11 wait states for a CDNA3 16x16x16 result read.
+        assert 'asm sideeffect "s_nop 10"' in compiled.asm["llir"]
+        # gfx942 has to pin the accumulator to VGPRs: with AGPRs, LLVM emits
+        # v_accvgpr_read of the asm result ahead of the source-level drain,
+        # reading it before the MFMA retires.
         assert '"=&v,v,v"' in compiled.asm["llir"]
         assert '"=&a,v,v"' not in compiled.asm["llir"]
     else:
@@ -2423,6 +2426,21 @@ def test_amd_scheduled_mfma_rejects_explicit_agpr_gfx942():
                 "ACC_CLASS": "constexpr",
             },
             constexprs={"ACC_CLASS": "agpr"},
+        )
+
+
+def test_amd_scheduled_mfma_rejects_default_persistent_class_gfx942():
+    """The default names AGPRs for a persistent chain, so CDNA3 rejects it too."""
+    with pytest.raises(RuntimeError, match=r'accumulator_register_class "auto" is not yet supported on CDNA3'):
+        compile_for_gfx942(
+            _amd_scheduled_mfma_regclass_gfx942_kernel,
+            signature={
+                "a_ptr": "*fp16",
+                "b_ptr": "*fp16",
+                "output_ptr": "*fp32",
+                "ACC_CLASS": "constexpr",
+            },
+            constexprs={"ACC_CLASS": None},
         )
 
 
@@ -2669,7 +2687,8 @@ def test_amd_scheduled_mfma_persistent_acc_lowering_gfx950(elem_ty):
     assert f'asm sideeffect "s_nop 3\\0Av_mfma_f32_16x16x32_{asm_ty}' in llir
     assert '"=a,v,v"' in llir
     assert f"@llvm.amdgcn.mfma.f32.16x16x32.{asm_ty}" not in llir
-    assert 'asm sideeffect "s_nop 15\\0As_nop 3"' in llir
+    # 8 passes + 3 + 1 = 12 wait states for a CDNA4 16x16x32 result read.
+    assert 'asm sideeffect "s_nop 11"' in llir
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")

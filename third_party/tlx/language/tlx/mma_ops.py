@@ -139,13 +139,17 @@ def amd_scheduled_mfma(
     lowering infers that lifetime instead of receiving an explicit role.
 
     ``accumulator_role`` controls the lowering contract, not the numerical
-    operation. ``"transient"`` describes a phase-local chain: ``auto`` storage
+    operation. ``"transient"`` describes a phase-local chain: default storage
     selects VGPRs and lowering uses ROCDL MFMA intrinsics so LLVM can model
     instruction latency and hazards. ``"persistent"`` describes a chain
     carried across phases and lowering uses register-constrained inline
-    assembly. ``auto`` storage selects VGPRs on CDNA3 and AGPRs on CDNA4. An
-    explicit ``accumulator_register_class`` overrides that default, allowing
-    two persistent accumulator sets to occupy complementary register files.
+    assembly; default storage selects AGPRs on every target. An explicit
+    ``accumulator_register_class`` overrides that default, allowing two
+    persistent accumulator sets to occupy complementary register files.
+
+    CDNA3 rejects AGPR accumulators, so a ``"persistent"`` chain there must
+    pass ``accumulator_register_class="vgpr"``; the default is an error rather
+    than a silent downgrade.
     """
     resident_operand = tl._unwrap_if_constexpr(resident_operand)
     accumulator_role = tl._unwrap_if_constexpr(accumulator_role)

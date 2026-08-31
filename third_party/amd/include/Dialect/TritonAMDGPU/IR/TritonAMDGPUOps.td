@@ -880,10 +880,12 @@ def ScheduledMfmaOp : TT_AMDGPU_Op<"scheduled_mfma"> {
     intentionally carried through the surrounding software pipeline.
     `accumulator_role` is `transient` for a phase-local result or `persistent`
     for an accumulator carried across phases. `accumulator_register_class` is
-    `auto`, `agpr`, or `vgpr`; `auto` selects VGPRs on CDNA3 and derives CDNA4
-    storage from the lifetime role, while an explicit class supports kernels
+    `auto`, `agpr`, or `vgpr`; `auto` means VGPRs for `transient` and AGPRs for
+    `persistent` on every target, while an explicit class supports kernels
     whose two persistent accumulator sets intentionally occupy complementary
-    physical files. `initialize` starts the native accumulators from zero. Completion
+    physical files. CDNA3 rejects any AGPR accumulator, including one named by
+    `auto`, so a persistent accumulator there must request `vgpr`.
+    `initialize` starts the native accumulators from zero. Completion
     of transient result fragments is represented separately by `mfma_commit`.
 
     An AGPR-resident accumulator must not reach an `mfma_commit` that also
