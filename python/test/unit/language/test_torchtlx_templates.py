@@ -2251,6 +2251,39 @@ class TestFlexAttentionChoiceRegistration(TestCase):
             ),
         )
 
+    def test_flex_backward_checked_loads_match_utility_abi(self):
+        """Checked pointer loads must pass PyTorch's index-dtype argument."""
+        import ast
+
+        from triton.language.extra.tlx.inductor.mm_templates import load_tlx_template
+
+        def load_checked_2d(
+            ptr,
+            offs_m,
+            offs_n,
+            stride_m,
+            stride_n,
+            is_divisible_m,
+            is_divisible_n,
+            m_len,
+            n_len,
+            index_dtype,
+        ):
+            return index_dtype
+
+        source = load_tlx_template("gfx950_flex_attention_bwd")
+        call_sources = [line.partition("=")[2].strip() for line in source.splitlines() if "= load_checked_2d(" in line]
+        self.assertTrue(call_sources)
+
+        utility_signature = inspect.signature(load_checked_2d)
+        for call_source in call_sources:
+            call = ast.parse(call_source, mode="eval").body
+            self.assertIsInstance(call, ast.Call)
+            self.assertFalse(call.keywords)
+            argument_names = [argument.id for argument in call.args]
+            bound = utility_signature.bind(*argument_names)
+            self.assertEqual("INDEX_DTYPE", bound.arguments["index_dtype"])
+
 
 @instantiate_parametrized_tests
 class TestFlexAttention(TestCase):
