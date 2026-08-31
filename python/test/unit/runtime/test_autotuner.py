@@ -27,6 +27,35 @@ def test_entropy_warmup_sample_budget(probe_ms, expected):
     assert _autotuner._entropy_warmup_sample_limit(probe_ms, 250) == expected
 
 
+def test_cpu_backend_skips_cuda_entropy_benchmark(monkeypatch, fresh_knobs):
+    expected = [1.0, 0.5, 1.5]
+    calls = []
+
+    def fixed_benchmarker(kernel_call, **kwargs):
+        calls.append(kwargs)
+        return expected
+
+    class FakeCPUDriver:
+        is_cpu_backend = True
+
+        def get_benchmarker(self):
+            return fixed_benchmarker
+
+        def get_empty_cache_for_benchmark(self):
+            raise AssertionError("CPU autotuning must not use the CUDA entropy benchmarker")
+
+    monkeypatch.setattr(_autotuner.driver, "_active", FakeCPUDriver())
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    fresh_knobs.autotuning.use_entropy = True
+
+    autotuner = object.__new__(_autotuner.Autotuner)
+    autotuner._do_bench = None
+    result = autotuner.do_bench(lambda: None, quantiles=(0.5, 0.2, 0.8))
+
+    assert result == expected
+    assert len(calls) == 1
+
+
 def test_config_backend_options():
     default_config = triton.Config(kwargs={})
     tree_config = triton.Config(kwargs={}, enable_tree_reduction=True)
