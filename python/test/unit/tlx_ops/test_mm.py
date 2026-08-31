@@ -1,19 +1,7 @@
 """L1 correctness for ``tlx.ops.mm``.
 
-TODO(split-K remainder tile): ``[1000, 1000, 1024]`` and ``[64, 4096, 4096]``
-are commented out of SHAPES below because they FAIL. Re-enable them with the
-fix -- they are the regression test for it.
-
-Split-K gives wrong results when M is not a multiple of BLOCK_SIZE_M: partials
-go into a (SPLIT_K * M, N) workspace that the reduction reads at fixed M
-strides, and the masked edge tile breaks that correspondence.
-
-Measured at M=1000, N=1000, K=1024, BLOCK_SIZE_M=256 (relative L2 vs torch):
-SPLIT_K=1 -> 0.0 exact, =2 -> 1.04e-1, =4 -> 1.30e-1.
-
-Pre-existing, not a promotion artifact: reproduces as
-`blackwell_gemm_ws.matmul(a, b, config=get_heuristic_config(...))`. Reachable in
-production -- the heuristic picks SPLIT_K=4 for both shapes. Not yet filed.
+Black-box: everything here goes through the public ``tlx.ops.mm``. The split-K
+workspace layout is covered white-box in ``test_mm_splitk.py``.
 """
 
 import time
@@ -49,14 +37,12 @@ SHAPES = [
     # M not a multiple of any plausible block size -- masked edge tile.
     [136, 256, 128, True, True],
     # Non-power-of-two in M and N together.
-    # TODO(split-K remainder tile): fails, see module docstring.
-    # [1000, 1000, 1024, True, True],
+    [1000, 1000, 1024, True, True],
     # K-heavy: few output tiles, long reduction. Split-K territory, the one
     # path that runs a second kernel.
     [256, 256, 16384, True, True],
     # Tall-skinny: most of the grid idle.
-    # TODO(split-K remainder tile): fails, see module docstring.
-    # [64, 4096, 4096, True, True],
+    [64, 4096, 4096, True, True],
 ]
 
 REL_PRECISION = {torch.float16: 1e-3, torch.bfloat16: 8e-3}
