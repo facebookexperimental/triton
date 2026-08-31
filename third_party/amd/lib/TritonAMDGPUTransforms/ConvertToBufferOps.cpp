@@ -522,7 +522,7 @@ struct ConvertTritonLoadToBufferLoad : public mlir::OpRewritePattern<SourceOp> {
       auto splatOp = tensorPtr.getDefiningOp<triton::SplatOp>();
       Value basePtr = splatOp.getSrc();
       Value maybeOther{};
-      if (op.getOther() && !isZeroConst(op.getOther()))
+      if (op.getOther())
         maybeOther = op.getOther();
       Value maybeMask{};
       if (op.getMask() && !isSplatOneConstTensor(op.getMask()))

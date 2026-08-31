@@ -5333,3 +5333,159 @@ def test_amd_sched_barrier_compiles_gfx950():
         constexprs={"BLOCK": 64},
     )
     assert "llvm.amdgcn.sched.barrier" in compiled.asm["llir"]
+
+
+# ---------------------------------------------------------------------------
+# Tests: buffer_load_to_local vs async_load equivalence.
+#
+# The commit 02a6a3ed4a fixed how buffer_load_to_local handles other=None when
+# a mask is present: masked-out elements leave unchanged, matching the
+# behavior global_load_to_local.  These tests exercise that fix by comparing 
+# the two load paths across several mask/other combinations.
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _async_load_1d_kernel(
+    src_ptr,
+    out_ptr,
+    n_elements,
+    BLOCK_SIZE: tl.constexpr,
+    OTHER_VAL: tl.constexpr,
+    HAS_WRITE_MASK: tl.constexpr,
+):
+    """Load via async_load (pointer-tensor path) and write result to output."""
+    pid = tl.program_id(0)
+    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offs < n_elements
+    buf = tlx.local_alloc((BLOCK_SIZE, ), tl.float32, 1)
+    tok = tlx.async_load(src_ptr + offs, tlx.local_view(buf, 0), mask=mask, other=OTHER_VAL)
+    tlx.async_load_commit_group([tok])
+    tlx.async_load_wait_group(0)
+    val = tlx.local_load(tlx.local_view(buf, 0))
+    write_mask = offs < n_elements if HAS_WRITE_MASK else None
+    tl.store(out_ptr + offs, val, mask=write_mask)
+
+
+@triton.jit
+def _buffer_load_to_local_1d_kernel(
+    src_ptr,
+    out_ptr,
+    n_elements,
+    BLOCK_SIZE: tl.constexpr,
+    OTHER_VAL: tl.constexpr,
+    HAS_WRITE_MASK: tl.constexpr,
+):
+    """Load via buffer_load_to_local (scalar-ptr + offsets path) and write result to output."""
+    pid = tl.program_id(0)
+    offs = (pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)).to(tl.int32)
+    mask = offs < n_elements
+    buf = tlx.local_alloc((BLOCK_SIZE, ), tl.float32, 1)
+    tlx.buffer_load_to_local(tlx.local_view(buf, 0), src_ptr, offs, mask=mask, other=OTHER_VAL)
+    tlx.async_load_commit_group()
+    tlx.async_load_wait_group(0)
+    val = tlx.local_load(tlx.local_view(buf, 0))
+    write_mask = offs < n_elements if HAS_WRITE_MASK else None
+    tl.store(out_ptr + offs, val, mask=write_mask)
+
+
+def _run_load_to_local_1d(device, kernel_fn, size, n_valid, other_val, block_size=256, has_write_mask=True):
+    """Helper: run a 1D load-to-local kernel and return the output tensor.
+
+    Uses float32 with block_size=256 and num_warps=4 so each thread handles
+    exactly one 32-bit element.  This gives per-element mask granularity that
+    is compatible with the 32-bit minimum direct-to-LDS width on CDNA4.
+    """
+    x = torch.randn(size, dtype=torch.float32, device=device)
+    out = torch.full((size, ), float("nan"), dtype=torch.float32, device=device)
+    grid = (triton.cdiv(size, block_size), )
+    kernel_fn[grid](
+        x,
+        out,
+        n_valid,
+        BLOCK_SIZE=block_size,
+        OTHER_VAL=other_val,
+        HAS_WRITE_MASK=has_write_mask,
+        num_warps=4,
+        num_stages=1,
+        
+    )
+    return x, out
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_buffer_load_to_local_no_mask(device):
+    """buffer_load_to_local without mask matches async_load without mask."""
+    size = 256
+    torch.manual_seed(42)
+    x_a, out_a = _run_load_to_local_1d(device, _async_load_1d_kernel, size, size, None)
+    torch.manual_seed(42)
+    x_b, out_b = _run_load_to_local_1d(device, _buffer_load_to_local_1d_kernel, size, size, None)
+    torch.testing.assert_close(out_a, out_b)
+    torch.testing.assert_close(out_a, x_a)
+    
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_buffer_load_to_local_masked_other_none(device):
+    """buffer_load_to_local with mask and other=None zero-fills masked elements, matching async_load."""
+    size = 256
+    n_valid = 128
+    torch.manual_seed(42)
+    x_a, out_a = _run_load_to_local_1d(device, _async_load_1d_kernel, size, n_valid, None, has_write_mask=False)
+    torch.manual_seed(42)
+    x_b, out_b = _run_load_to_local_1d(device, _buffer_load_to_local_1d_kernel, size, n_valid, None, has_write_mask=False)
+    # Valid region must match the source data.
+    torch.testing.assert_close(out_a[:n_valid], x_a[:n_valid])
+    torch.testing.assert_close(out_b[:n_valid], x_b[:n_valid])
+    # Masked region must be nan in both paths.
+    assert torch.all(torch.isnan(out_a[n_valid:]))
+    assert torch.all(torch.isnan(out_b[n_valid:]))
+    # Overall outputs must be identical.
+    torch.testing.assert_close(out_a, out_b, equal_nan=True)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_buffer_load_to_local_masked_other_zero(device):
+    """buffer_load_to_local with mask and other=0.0 zero-fills masked elements, matching async_load."""
+    size = 256
+    n_valid = 128
+    torch.manual_seed(42)
+    x_a, out_a = _run_load_to_local_1d(device, _async_load_1d_kernel, size, n_valid, 0.0, has_write_mask=False)
+    torch.manual_seed(42)
+    x_b, out_b = _run_load_to_local_1d(device, _buffer_load_to_local_1d_kernel, size, n_valid, 0.0, has_write_mask=False)
+    torch.testing.assert_close(out_a[:n_valid], x_a[:n_valid])
+    torch.testing.assert_close(out_b[:n_valid], x_b[:n_valid])
+    torch.testing.assert_close(out_b[n_valid:], torch.zeros(size - n_valid, dtype=torch.float32, device=device))
+    torch.testing.assert_close(out_a[n_valid:], torch.zeros(size - n_valid, dtype=torch.float32, device=device))
+    torch.testing.assert_close(out_a, out_b)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+@pytest.mark.parametrize("n_valid", [128, 200], ids=["half", "near_full"])
+def test_buffer_load_to_local_masked_other_none_boundary(device, n_valid):
+    """buffer_load_to_local with other=None at various mask boundaries."""
+    size = 256
+    torch.manual_seed(42)
+    x_a, out_a = _run_load_to_local_1d(device, _async_load_1d_kernel, size, n_valid, None)
+    torch.manual_seed(42)
+    x_b, out_b = _run_load_to_local_1d(device, _buffer_load_to_local_1d_kernel, size, n_valid, None)
+    torch.testing.assert_close(out_a[:n_valid], x_a[:n_valid])
+    torch.testing.assert_close(out_b[:n_valid], x_b[:n_valid])
+    torch.testing.assert_close(out_a, out_b, equal_nan=True)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_buffer_load_to_local_multi_cta_masked_other_none(device):
+    """buffer_load_to_local with mask, other=None, and multiple CTAs (partial last tile)."""
+    # Two CTAs: first full (256 elements), second partial (128 valid out of 256).
+    size = 512
+    n_valid = 384  # First CTA fully valid, second CTA half masked.
+    block_size = 256
+    torch.manual_seed(42)
+    x_a, out_a = _run_load_to_local_1d(device, _async_load_1d_kernel, size, n_valid, None, block_size=block_size)
+    torch.manual_seed(42)
+    x_b, out_b = _run_load_to_local_1d(device, _buffer_load_to_local_1d_kernel, size, n_valid, None,
+                                       block_size=block_size)
+    torch.testing.assert_close(out_a[:n_valid], x_a[:n_valid])
+    torch.testing.assert_close(out_b[:n_valid], x_b[:n_valid])
+    torch.testing.assert_close(out_a, out_b, equal_nan=True)
