@@ -60,7 +60,7 @@ CATALOG: tuple[OpSpec, ...] = (
         requires=frozenset({"tma", "tmem"}),
     ),
     OpSpec(
-        op="hstu_attn",
+        op="hstu_attn_dev",
         arch="sm100",
         variant="ws",
         impl="kernels.hstu_attn.sm100:hstu_attn",
@@ -70,7 +70,7 @@ CATALOG: tuple[OpSpec, ...] = (
         requires=frozenset({"tma", "tmem"}),
     ),
     OpSpec(
-        op="hstu_attn",
+        op="hstu_attn_dev",
         arch="gfx950",
         variant="tlx",
         impl="kernels.hstu_attn.gfx950:hstu_attn",

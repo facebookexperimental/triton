@@ -1,4 +1,4 @@
-"""gfx950 HSTU ragged attention -- the `tlx.ops.hstu_attn` implementation."""
+"""gfx950 HSTU ragged attention -- the `tlx.ops.hstu_attn_dev` implementation."""
 
 from typing import List, Optional, Tuple
 

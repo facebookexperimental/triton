@@ -1,4 +1,4 @@
-"""L1 correctness for `tlx.ops.hstu_attn`.
+"""L1 correctness for `tlx.ops.hstu_attn_dev`.
 
 No compile-time cap as in test_mm.py: this kernel has no shape heuristic, so the
 correctness caller autotunes a small space and wall-clock says nothing about
@@ -71,7 +71,7 @@ def _float_ref(q, k, v, offsets, attn_scale, alpha, causal):
 @pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell GPU")
 @pytest.mark.parametrize("Z, MAX_SEQ_LEN, H, HEAD_DIM, causal", SM100_SHAPES)
 def test_hstu_attn_sm100(Z, MAX_SEQ_LEN, H, HEAD_DIM, causal, dtype):
-    from triton.tlx.ops import hstu_attn as tlx_hstu_attn
+    from triton.tlx.ops import hstu_attn_dev as tlx_hstu_attn
 
     q, k, v, offsets, attn_scale = _inputs(Z, MAX_SEQ_LEN, H, HEAD_DIM, dtype)
     alpha = 1.0 / HEAD_DIM
@@ -116,8 +116,8 @@ def _gfx950_inputs(batch_size, max_seq_len, H, attn_dim, hidden_dim, dtype):
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware (CDNA4)")
 @pytest.mark.parametrize("batch_size, MAX_SEQ_LEN, H, ATTN_DIM, HIDDEN_DIM", GFX950_SHAPES)
 def test_hstu_attn_gfx950(batch_size, MAX_SEQ_LEN, H, ATTN_DIM, HIDDEN_DIM):
-    from triton.tlx.ops import hstu_attn as tlx_hstu_attn
-    from triton.tlx.ops.kernels.hstu_attn import gfx950 as hstu_gfx950
+    from triton.tlx.ops import hstu_attn_dev as tlx_hstu_attn
+    from triton.tlx.ops.kernels.hstu_attn.gfx950 import torch_hstu_attention as torch_hstu_attn_ref
 
     torch.cuda.empty_cache()
     dtype = torch.bfloat16
@@ -126,7 +126,7 @@ def test_hstu_attn_gfx950(batch_size, MAX_SEQ_LEN, H, ATTN_DIM, HIDDEN_DIM):
 
     out = tlx_hstu_attn(q, k, v, offsets, MAX_SEQ_LEN, None, alpha=alpha, causal=True, num_targets=num_targets,
                         arch=GFX950_ARCH, space="smoke")
-    ref = hstu_gfx950.torch_hstu_attention(
+    ref = torch_hstu_attn_ref(
         MAX_SEQ_LEN,
         alpha,
         q,
