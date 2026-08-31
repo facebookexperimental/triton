@@ -419,7 +419,9 @@ class CMakeBuild(build_ext):
         subprocess.check_call(["cmake", "--build", ".", "--target", "mlir-doc"], cwd=cmake_dir)
 
 
-backends = [*BackendInstaller.copy(["nvidia", "amd", "cpu"]), *BackendInstaller.copy_externals()]
+_default_backends = ["nvidia", "amd", "cpu"]
+_selected_backends = os.environ.get("TRITON_CODEGEN_BACKENDS", ";".join(_default_backends)).split(";")
+backends = [*BackendInstaller.copy(_selected_backends), *BackendInstaller.copy_externals()]
 
 
 def get_package_dirs():
