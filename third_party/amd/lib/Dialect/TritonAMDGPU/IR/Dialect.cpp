@@ -1021,8 +1021,9 @@ LogicalResult ScheduledMfmaOp::verify() {
       getAccumulatorRegisterClass() != "vgpr")
     return emitOpError(
         "accumulator_register_class must be \"auto\", \"agpr\", or \"vgpr\"");
-  // "auto" means AGPRs for a persistent accumulator, which CDNA3 cannot order
-  // against the MFMA drain. Reject it instead of substituting VGPRs.
+  // `auto` now means the same thing on both (VGPRs for transient, AGPRs for
+  // persistent) and the only asymmetry left is CDNA3 rejecting the AGPR
+  // resolution.
   bool wantsAgpr = getAccumulatorRegisterClass() == "agpr" ||
                    (getAccumulatorRegisterClass() == "auto" &&
                     getAccumulatorRole() == "persistent");

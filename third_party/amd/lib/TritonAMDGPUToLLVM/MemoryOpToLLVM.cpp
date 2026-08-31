@@ -1199,6 +1199,20 @@ public:
   }
 };
 
+// Validate the encoding version against targetInfo in the lowering
+static LogicalResult verifyMfmaVersionMatchesTarget(
+    Operation *op, triton::gpu::AMDMfmaEncodingAttr mfma, ISAFamily isaFamily) {
+  if (!llvm::is_contained({ISAFamily::CDNA3, ISAFamily::CDNA4}, isaFamily))
+    return op->emitOpError(
+        "is supported only on CDNA3 (gfx942) and CDNA4 (gfx950)");
+  unsigned expected = isaFamily == ISAFamily::CDNA3 ? 3 : 4;
+  if (mfma.getVersion() != expected)
+    return op->emitOpError() << "carries a version " << mfma.getVersion()
+                             << " MFMA layout, which does not match the CDNA"
+                             << expected << " target";
+  return success();
+}
+
 // `auto` derives storage from the role alone, identically on every target.
 // Targets that cannot honor it reject it in the verifier.
 static StringRef resolveAccumulatorStorage(triton::amdgpu::ScheduledMfmaOp op) {
@@ -1243,6 +1257,16 @@ public:
                             targetInfo.getISAFamily()))
       return op.emitOpError(
           "is supported only on CDNA3 (gfx942) and CDNA4 (gfx950)");
+    for (Value input : op.getInputs()) {
+      auto tensorTy = cast<RankedTensorType>(input.getType());
+      Attribute encoding = tensorTy.getEncoding();
+      auto mfma = dyn_cast<triton::gpu::AMDMfmaEncodingAttr>(encoding);
+      if (auto dot = dyn_cast<triton::gpu::DotOperandEncodingAttr>(encoding))
+        mfma = dyn_cast<triton::gpu::AMDMfmaEncodingAttr>(dot.getParent());
+      if (mfma && failed(verifyMfmaVersionMatchesTarget(
+                      op, mfma, targetInfo.getISAFamily())))
+        return failure();
+    }
     auto loc = op.getLoc();
     auto *ctx = rewriter.getContext();
     auto typeConverter = getTypeConverter();
@@ -1444,6 +1468,9 @@ public:
     auto bTy = cast<RankedTensorType>(op.getB().getType());
     auto accTy = cast<RankedTensorType>(op.getAcc().getType());
     auto mfma = cast<triton::gpu::AMDMfmaEncodingAttr>(accTy.getEncoding());
+    if (failed(verifyMfmaVersionMatchesTarget(op, mfma,
+                                              targetInfo.getISAFamily())))
+      return failure();
     ArrayRef<unsigned> instrShape = mfma.getInstrShape();
     FailureOr<ScheduledMfmaLoweringInfo> maybeInfo =
         getScheduledMfmaLoweringInfo(loc, targetInfo.getISAFamily(), mfma,
