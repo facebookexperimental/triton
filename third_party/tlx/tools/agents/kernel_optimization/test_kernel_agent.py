@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import io
+import json
 import tempfile
 import unittest
+from contextlib import redirect_stderr
 from pathlib import Path
 
-from .cli import _resolve_harness_paths, _validate_host_matches_target
-from .harness import StandaloneHarness
+from .cli import _parse_args, _resolve_harness_paths, _validate_host_matches_target
+from .harness import StandaloneHarness, SubprocessHarness
 from .models import (
     CaseEvaluation,
     InputCase,
@@ -19,9 +22,22 @@ from .models import (
     per_case_speedups,
     weighted_geometric_speedup,
 )
-from .optimizer import KernelOptimizer
-from .providers import CandidateProposal, FixedCandidateProvider, MockLLMProvider
-from .source import extract_python_source, source_digest, validate_kernel_source
+from .optimizer import KernelOptimizer, _profile_log_parts
+from .profiling import ProfileRequest
+from .providers import (
+    CandidateContext,
+    CandidateProposal,
+    FixedCandidateProvider,
+    MockLLMProvider,
+    _build_prompt,
+)
+from .source import (
+    apply_candidate_diff,
+    extract_python_source,
+    source_digest,
+    validate_kernel_source,
+    validate_replacement_source,
+)
 
 
 class ScoringTest(unittest.TestCase):
@@ -75,12 +91,134 @@ class ScoringTest(unittest.TestCase):
             extract_python_source("Explanation\n```python\nVALUE = 1\n```"),
             "VALUE = 1\n",
         )
+        self.assertEqual(
+            extract_python_source(
+                "```python\nVALUE = 1\nOTHER = 2\n```\n"
+                "```python\nVALUE = 3\n```\n```python\nif:\n```"
+            ),
+            "VALUE = 1\nOTHER = 2\n",
+        )
         with self.assertRaisesRegex(ValueError, "not valid Python"):
             extract_python_source("```python\nif:\n```")
+
+    def test_codex_prompt_has_generic_and_target_guidance(self) -> None:
+        target_guidance = (
+            "Preserve the producer/consumer barrier phases. "
+            "Do not retry BLOCK_SIZE=256 because baseline profiling rejected it."
+        )
+        request = KernelOptimizationRequest(
+            kernel_source="VALUE = 1\n",
+            harness_path=Path(__file__),
+            cases=(InputCase("target", {"mode": "bwd"}),),
+            target=KernelTarget(
+                "cuda", "blackwell", optimization_guidance=target_guidance
+            ),
+            budget=OptimizationBudget(),
+            output_dir=Path("/tmp/tlx-agent-test"),
+        )
+        prompt = _build_prompt(
+            request,
+            CandidateContext(
+                round_index=1,
+                candidate_index=0,
+                current_source=request.kernel_source,
+                current_performance=_performance(("target", 100.0)),
+                previous_diagnostics=(),
+            ),
+        )
+        self.assertIn("Evidence-driven optimization workflow", prompt)
+        self.assertIn("Keep measurement scopes separate", prompt)
+        self.assertIn("exactly one testable hypothesis", prompt)
+        self.assertIn(".claude/skills/tlx-api-reference/SKILL.md", prompt)
+        self.assertIn("Frozen target-specific optimization guidance", prompt)
+        self.assertIn(target_guidance, prompt)
+        self.assertNotIn("MXFP8", prompt)
+        self.assertNotIn("DQ_REDUCE_NCOL", prompt)
+        self.assertIn("edit `candidate.py`", prompt)
+        self.assertIn("Do not modify any other file", prompt)
+        self.assertIn("do not print source code or a patch", prompt)
+        self.assertIn("candidate_metadata.json", prompt)
+        self.assertIn("expected_effect", prompt)
+
+    def test_codex_prompt_compacts_profile_and_preserves_scope_boundaries(self) -> None:
+        request = KernelOptimizationRequest(
+            kernel_source="VALUE = 1\n",
+            harness_path=Path(__file__),
+            cases=(InputCase("target", {"mode": "bwd"}),),
+            target=KernelTarget("cuda", "blackwell"),
+            budget=OptimizationBudget(),
+            output_dir=Path("/tmp/tlx-agent-test"),
+        )
+        performance = PerformanceSummary(
+            cases=(
+                CaseEvaluation(
+                    case_id="target",
+                    verification=VerificationResult(True),
+                    timing=TimingSamples((100.0, 100.0, 100.0)),
+                    profile={
+                        "level": "deep",
+                        "raw": "x" * 5000,
+                        "proton": {
+                            "totals": {
+                                "wrapper_us": 1.0,
+                                "main_kernel_us": 2.0,
+                                "non_main_kernel_us": 3.0,
+                            }
+                        },
+                    },
+                ),
+            )
+        )
+        prompt = _build_prompt(
+            request,
+            CandidateContext(1, 0, request.kernel_source, performance, ()),
+        )
+        self.assertIn("infer task overlap from a launch timeline", prompt)
+        self.assertIn("diagnostic intra-kernel traces", prompt)
+        self.assertIn("wrapper_us", prompt)
+        self.assertNotIn("xxxxx", prompt)
+
+    def test_applies_candidate_unified_diff(self) -> None:
+        current = "VALUE = 1\n\ndef kernel():\n    return VALUE\n"
+        output = """```diff
+--- candidate.py
++++ candidate.py
+@@ -1 +1 @@
+-VALUE = 1
++VALUE = 2
+```
+"""
+        self.assertEqual(
+            apply_candidate_diff(output, current),
+            "VALUE = 2\n\ndef kernel():\n    return VALUE\n",
+        )
+
+    def test_rejects_response_without_candidate_diff(self) -> None:
+        with self.assertRaisesRegex(ValueError, "candidate.py unified diff"):
+            apply_candidate_diff("```python\nVALUE = 2\n```", "VALUE = 1\n")
+
+    def test_replacement_source_requires_all_top_level_symbols(self) -> None:
+        current = "def kernel():\n    return 1\n\ndef wrapper():\n    return kernel()\n"
+        with self.assertRaisesRegex(ValueError, "missing top-level symbols: wrapper"):
+            validate_replacement_source("def kernel():\n    return 2\n", current)
+
+    def test_replacement_source_rejects_unexpectedly_short_source(self) -> None:
+        current = "def kernel():\n    return 1\n" + ("VALUE = 1\n" * 100)
+        with self.assertRaisesRegex(ValueError, "unexpectedly short"):
+            validate_replacement_source("def kernel():\n    return 2\n", current)
 
     def test_validate_kernel_source_rejects_empty(self) -> None:
         with self.assertRaisesRegex(ValueError, "empty"):
             validate_kernel_source("   \n")
+
+    def test_kernel_optimization_request_disables_diagnostic_proton_by_default(self) -> None:
+        request = KernelOptimizationRequest(
+            kernel_source="VALUE = 1\n",
+            harness_path=Path(__file__),
+            cases=(InputCase("a", {}),),
+            target=KernelTarget("fake", "fake"),
+        )
+        self.assertFalse(request.diagnostic_proton_intra_kernel)
 
     def test_failed_protected_case_is_not_promotable(self) -> None:
         summary = PerformanceSummary(
@@ -134,6 +272,40 @@ class ScoringTest(unittest.TestCase):
 
     def test_source_digest_stable(self) -> None:
         self.assertEqual(source_digest("VALUE = 1\n"), source_digest("VALUE = 1\n  \n"))
+
+
+class CliTest(unittest.TestCase):
+    def test_commit_winner_is_enabled_by_default(self) -> None:
+        args = _parse_args(["--kernel", "kernel.py", "--output-dir", "/tmp/out"])
+        self.assertTrue(args.commit_winner)
+
+    def test_commit_winner_can_be_disabled(self) -> None:
+        args = _parse_args(
+            [
+                "--kernel",
+                "kernel.py",
+                "--output-dir",
+                "/tmp/out",
+                "--no-commit-winner",
+            ]
+        )
+        self.assertFalse(args.commit_winner)
+
+    def test_diagnostic_proton_intra_kernel_is_disabled_by_default(self) -> None:
+        args = _parse_args(["--kernel", "kernel.py", "--output-dir", "/tmp/out"])
+        self.assertFalse(args.diagnostic_proton_intra_kernel)
+
+    def test_diagnostic_proton_intra_kernel_can_be_enabled(self) -> None:
+        args = _parse_args(
+            [
+                "--kernel",
+                "kernel.py",
+                "--output-dir",
+                "/tmp/out",
+                "--diagnostic-proton-intra-kernel",
+            ]
+        )
+        self.assertTrue(args.diagnostic_proton_intra_kernel)
 
 
 class HarnessTest(unittest.TestCase):
@@ -211,6 +383,129 @@ class HarnessTest(unittest.TestCase):
         self.assertTrue(all(case.verification.passed for case in performance.cases))
         self.assertEqual(performance.cases[0].profile.get("bottleneck"), "synthetic")
 
+    def test_subprocess_harness_evaluates_legacy_profile_signature(self) -> None:
+        harness = SubprocessHarness(
+            Path(__file__).with_name("testdata") / "fake_harness.py",
+            timeout_seconds=30.0,
+        )
+        performance = harness.evaluate(
+            "LATENCY_US = 50\nCORRECT = True\n",
+            (InputCase("a", {"scale": 1.0}),),
+            KernelTarget("fake", "fake"),
+            benchmark_repetitions=2,
+            profile=True,
+        )
+        self.assertEqual(performance.cases[0].profile.get("bottleneck"), "synthetic")
+
+    def test_profile_request_passed_after_benchmark_with_case_artifact_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            harness_path = Path(tmp) / "three_arg_harness.py"
+            harness_path.write_text(
+                "from pathlib import Path\n"
+                "def build(kernel_source, target):\n"
+                "    return {'success': True, 'artifact': {'events': []}}\n"
+                "def verify(artifact, case):\n"
+                "    artifact['events'].append('verify')\n"
+                "    return {'passed': True}\n"
+                "def benchmark(artifact, case, repetitions):\n"
+                "    artifact['events'].append('benchmark')\n"
+                "    return {'samples_us': [10.0] * repetitions}\n"
+                "def profile(artifact, case, request):\n"
+                "    artifact['events'].append('profile')\n"
+                "    assert artifact['events'] == ['verify', 'benchmark', 'profile']\n"
+                "    path = Path(request['artifacts_dir'])\n"
+                "    assert path.is_absolute()\n"
+                "    assert path.exists()\n"
+                "    return {'request': request, 'events': artifact['events']}\n"
+            )
+            artifacts_dir = Path(tmp) / "profiles"
+            performance = StandaloneHarness(harness_path).evaluate(
+                "source",
+                (InputCase("shape/128?case", {}),),
+                KernelTarget("fake", "fake"),
+                benchmark_repetitions=2,
+                profile=ProfileRequest(
+                    level="deep",
+                    tools=("ncu",),
+                    experiment_id="r001-c000",
+                    artifacts_dir=artifacts_dir,
+                    reason="unit test",
+                ),
+            )
+            profile = performance.cases[0].profile
+            request = profile["request"]
+            self.assertEqual(request["level"], "deep")
+            self.assertEqual(request["tools"], ["ncu"])
+            per_case_dir = Path(str(request["artifacts_dir"]))
+            self.assertEqual(per_case_dir.parent, artifacts_dir)
+            self.assertTrue(per_case_dir.exists())
+            self.assertNotIn("/", per_case_dir.name)
+            self.assertEqual(profile["events"], ["verify", "benchmark", "profile"])
+
+    def test_subprocess_harness_passes_three_arg_profile_request(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            harness_path = Path(tmp) / "three_arg_subprocess_harness.py"
+            harness_path.write_text(
+                "from pathlib import Path\n"
+                "def build(kernel_source, target):\n"
+                "    return {'success': True, 'artifact': {}}\n"
+                "def verify(artifact, case):\n"
+                "    return {'passed': True}\n"
+                "def benchmark(artifact, case, repetitions):\n"
+                "    return {'samples_us': [11.0] * repetitions}\n"
+                "def profile(artifact, case, request):\n"
+                "    return {'case_id': case['case_id'], 'request': request, 'exists': Path(request['artifacts_dir']).exists()}\n"
+            )
+            artifacts_dir = Path(tmp) / "profiles"
+            performance = SubprocessHarness(harness_path, timeout_seconds=30.0).evaluate(
+                "source",
+                (InputCase("case a", {}),),
+                KernelTarget("fake", "fake"),
+                benchmark_repetitions=2,
+                profile={
+                    "level": "summary",
+                    "tools": ["proton"],
+                    "experiment_id": "baseline",
+                    "artifacts_dir": str(artifacts_dir),
+                    "reason": "unit test",
+                },
+            )
+            profile = performance.cases[0].profile
+            self.assertEqual(profile["case_id"], "case a")
+            self.assertTrue(profile["exists"])
+            request = profile["request"]
+            self.assertEqual(request["tools"], ["proton"])
+            self.assertEqual(Path(str(request["artifacts_dir"])).parent, artifacts_dir)
+
+    def test_large_profile_spills_to_raw_profile_when_artifacts_dir_available(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            harness_path = Path(tmp) / "big_profile_harness.py"
+            harness_path.write_text(
+                "def build(kernel_source, target):\n"
+                "    return {'success': True, 'artifact': {}}\n"
+                "def verify(artifact, case):\n"
+                "    return {'passed': True}\n"
+                "def benchmark(artifact, case, repetitions):\n"
+                "    return {'samples_us': [12.0] * repetitions}\n"
+                "def profile(artifact, case, request):\n"
+                "    return {'big': 'x' * 2000000}\n"
+            )
+            artifacts_dir = Path(tmp) / "profiles"
+            performance = StandaloneHarness(harness_path).evaluate(
+                "source",
+                (InputCase("a", {}),),
+                KernelTarget("fake", "fake"),
+                benchmark_repetitions=2,
+                profile=ProfileRequest(artifacts_dir=artifacts_dir),
+            )
+            profile = performance.cases[0].profile
+            self.assertEqual(profile["truncated"], True)
+            artifact = Path(str(profile["artifact"]))
+            self.assertTrue(artifact.is_absolute())
+            self.assertTrue(artifact.exists())
+            self.assertEqual(artifact.name, "raw_profile.json")
+            self.assertGreater(profile["size_bytes"], 1_000_000)
+
     def test_standalone_harness_reports_build_error(self) -> None:
         harness = StandaloneHarness(
             Path(__file__).with_name("testdata") / "fake_harness.py"
@@ -259,6 +554,75 @@ class HarnessTest(unittest.TestCase):
 
 
 class KernelOptimizerTest(unittest.TestCase):
+    def test_reports_performance_after_each_evaluation(self) -> None:
+        provider = FixedCandidateProvider(
+            [
+                CandidateProposal("LATENCY_US = 120\nCORRECT = True\n", "slower"),
+                CandidateProposal("LATENCY_US = 80\nCORRECT = True\n", "faster"),
+            ]
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            stderr = io.StringIO()
+            with redirect_stderr(stderr):
+                result = KernelOptimizer(provider).optimize(
+                    KernelOptimizationRequest(
+                        kernel_source="LATENCY_US = 100\nCORRECT = True\n",
+                        harness_path=Path(__file__).with_name("testdata")
+                        / "fake_harness.py",
+                        cases=(InputCase("a", {"scale": 1.0}),),
+                        target=KernelTarget("fake", "fake"),
+                        budget=OptimizationBudget(
+                            max_rounds=1,
+                            candidates_per_round=2,
+                            min_speedup=1.01,
+                            benchmark_repetitions=3,
+                        ),
+                        output_dir=Path(directory),
+                    )
+                )
+
+            output = stderr.getvalue()
+            self.assertIn("[tlx-agent] baseline status=baseline", output)
+            self.assertIn("median=100.000us", output)
+            self.assertIn("[tlx-agent] r001-c000 status=rejected", output)
+            self.assertIn("speedup=0.8333x", output)
+            self.assertIn("[tlx-agent] r001-c001 change='faster'", output)
+            self.assertIn("[tlx-agent] r001-c001 status=promoted", output)
+            self.assertIn("speedup=1.2500x", output)
+            self.assertIn("decision=correct and exceeded speedup threshold", output)
+            self.assertIn("ncu=unavailable", output)
+            self.assertIn("[tlx-agent] final status=revalidated", output)
+            self.assertTrue(result.success)
+
+    def test_continues_after_round_without_promotion(self) -> None:
+        provider = FixedCandidateProvider(
+            [
+                CandidateProposal("LATENCY_US = 120\nCORRECT = True\n", "slower"),
+                CandidateProposal("LATENCY_US = 80\nCORRECT = True\n", "faster"),
+            ]
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            result = KernelOptimizer(provider).optimize(
+                KernelOptimizationRequest(
+                    kernel_source="LATENCY_US = 100\nCORRECT = True\n",
+                    harness_path=Path(__file__).with_name("testdata")
+                    / "fake_harness.py",
+                    cases=(InputCase("a", {"scale": 1.0}),),
+                    target=KernelTarget("fake", "fake"),
+                    budget=OptimizationBudget(
+                        max_rounds=2,
+                        candidates_per_round=1,
+                        min_speedup=1.01,
+                        benchmark_repetitions=3,
+                    ),
+                    output_dir=Path(directory),
+                )
+            )
+            self.assertTrue(result.success)
+            self.assertEqual(result.best_kernel, "LATENCY_US = 80\nCORRECT = True\n")
+            self.assertEqual(result.experiments[1].status, "rejected")
+            self.assertEqual(result.experiments[2].status, "promoted")
+
     def test_rejects_incorrect_candidate_and_promotes_faster_candidate(self) -> None:
         provider = FixedCandidateProvider(
             [
@@ -299,6 +663,297 @@ class KernelOptimizerTest(unittest.TestCase):
             self.assertTrue((Path(directory) / "baseline_profile.json").exists())
             self.assertTrue((Path(directory) / "best_profile.json").exists())
 
+    def test_optimizer_uses_profile_policy_and_records_profile_paths(self) -> None:
+        provider = FixedCandidateProvider(
+            [CandidateProposal("LATENCY_US = 80\nCORRECT = True\nNCU_US = 90\n", "faster")]
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            harness_path = _write_policy_harness(Path(tmp))
+            output_dir = Path(tmp) / "out"
+            result = KernelOptimizer(provider).optimize(
+                KernelOptimizationRequest(
+                    kernel_source="LATENCY_US = 100\nCORRECT = True\nNCU_US = 100\n",
+                    harness_path=harness_path,
+                    cases=(InputCase("case/a", {"scale": 1.0}),),
+                    target=KernelTarget("fake", "fake"),
+                    budget=OptimizationBudget(
+                        max_rounds=1,
+                        candidates_per_round=1,
+                        min_speedup=1.01,
+                        benchmark_repetitions=2,
+                    ),
+                    output_dir=output_dir,
+                )
+            )
+
+        baseline_request = result.baseline.cases[0].profile["request"]
+        candidate_request = result.experiments[1].performance.cases[0].profile["request"]  # type: ignore[union-attr]
+        final_request = result.final.cases[0].profile["request"]
+        self.assertEqual(baseline_request["level"], "deep")
+        self.assertEqual(baseline_request["tools"], ["proton_launch", "ncu"])
+        self.assertEqual(baseline_request["reason"], "baseline")
+        self.assertEqual(
+            Path(str(baseline_request["artifacts_dir"])).parent,
+            output_dir / "experiments" / "baseline" / "profile_artifacts",
+        )
+        self.assertEqual(candidate_request["level"], "summary")
+        self.assertEqual(candidate_request["reason"], "candidate")
+        self.assertEqual(
+            Path(str(candidate_request["artifacts_dir"])).parent,
+            output_dir / "experiments" / "r001-c000" / "profile_artifacts",
+        )
+        self.assertEqual(final_request["level"], "deep")
+        self.assertEqual(final_request["reason"], "final")
+        self.assertEqual(
+            Path(str(final_request["artifacts_dir"])).parent,
+            output_dir / "experiments" / "final" / "profile_artifacts",
+        )
+        self.assertEqual(
+            result.experiments[0].profile_path,
+            output_dir / "experiments" / "baseline" / "profile.json",
+        )
+        self.assertEqual(
+            result.experiments[1].profile_path,
+            output_dir / "experiments" / "r001-c000" / "profile.json",
+        )
+        self.assertTrue(result.success)
+
+    def test_near_threshold_candidate_gets_deep_profile_rerun(self) -> None:
+        provider = FixedCandidateProvider(
+            [CandidateProposal("LATENCY_US = 100\nCORRECT = True\nTAG = 1\n", "same")]
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            result = KernelOptimizer(provider).optimize(
+                KernelOptimizationRequest(
+                    kernel_source="LATENCY_US = 100\nCORRECT = True\n",
+                    harness_path=_write_policy_harness(Path(tmp)),
+                    cases=(InputCase("a", {}),),
+                    target=KernelTarget("fake", "fake"),
+                    budget=OptimizationBudget(
+                        max_rounds=1,
+                        candidates_per_round=1,
+                        min_speedup=1.01,
+                        benchmark_repetitions=2,
+                    ),
+                    output_dir=Path(tmp) / "out",
+                )
+            )
+        candidate_request = result.experiments[1].performance.cases[0].profile["request"]  # type: ignore[union-attr]
+        self.assertEqual(candidate_request["level"], "deep")
+        self.assertEqual(candidate_request["reason"], "near_threshold")
+        self.assertFalse(result.success)
+
+    def test_ncu_regression_diagnostic_vetoes_candidate(self) -> None:
+        provider = FixedCandidateProvider(
+            [CandidateProposal("LATENCY_US = 80\nCORRECT = True\nNCU_US = 102\n", "fast-wrapper")]
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            stderr = io.StringIO()
+            with redirect_stderr(stderr):
+                result = KernelOptimizer(provider).optimize(
+                    KernelOptimizationRequest(
+                        kernel_source="LATENCY_US = 100\nCORRECT = True\nNCU_US = 100\n",
+                        harness_path=_write_policy_harness(Path(tmp)),
+                        cases=(InputCase("a", {}),),
+                        target=KernelTarget("fake", "fake"),
+                        budget=OptimizationBudget(
+                            max_rounds=1,
+                            candidates_per_round=1,
+                            min_speedup=1.01,
+                            benchmark_repetitions=2,
+                        ),
+                        output_dir=Path(tmp) / "out",
+                    )
+                )
+        self.assertFalse(result.success)
+        self.assertEqual(result.experiments[1].status, "rejected")
+        self.assertIn("NCU duration regressed", stderr.getvalue())
+
+    def test_missing_ncu_does_not_veto_candidate(self) -> None:
+        provider = FixedCandidateProvider(
+            [CandidateProposal("LATENCY_US = 80\nCORRECT = True\n", "faster")]
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            result = KernelOptimizer(provider).optimize(
+                KernelOptimizationRequest(
+                    kernel_source="LATENCY_US = 100\nCORRECT = True\n",
+                    harness_path=_write_policy_harness(Path(tmp)),
+                    cases=(InputCase("a", {}),),
+                    target=KernelTarget("fake", "fake"),
+                    budget=OptimizationBudget(
+                        max_rounds=1,
+                        candidates_per_round=1,
+                        min_speedup=1.01,
+                        benchmark_repetitions=2,
+                    ),
+                    output_dir=Path(tmp) / "out",
+                )
+            )
+        self.assertTrue(result.success)
+        self.assertEqual(result.experiments[1].status, "promoted")
+
+    def test_diagnostic_proton_log_includes_capture_summary(self) -> None:
+        trace_path = "/tmp/selected_cta.chrome_trace"
+        parts = _profile_log_parts(
+            {
+                "diagnostic_proton_intra_kernel": {
+                    "diagnostic_proton_intra_kernel": {
+                        "valid": True,
+                        "selected_cta": 6,
+                        "logical_coordinates": {
+                            "start_n": 3840,
+                            "logical_block": 31,
+                            "curr_m": 3968,
+                            "mma_producer_j": 32,
+                            "load_input_j": 31,
+                        },
+                        "dominant_waits": [
+                            {"name": "reduction_wait_dq", "duration": 2.852}
+                        ],
+                        "trace_path": trace_path,
+                    }
+                }
+            }
+        )
+        self.assertIn("proton.intra.valid=true", parts)
+        self.assertIn("proton.intra.cta=6", parts)
+        self.assertIn(
+            "proton.intra.tile=start_n:3840/logical_block:31/curr_m:3968/mma_producer_j:32/load_input_j:31",
+            parts,
+        )
+        self.assertIn(
+            "proton.intra.dominant_wait=reduction_wait_dq:2.852us", parts
+        )
+        self.assertIn(f"proton.intra.trace={trace_path}", parts)
+
+    def test_diagnostic_proton_profiles_baseline_and_successful_final_only(self) -> None:
+        provider = FixedCandidateProvider(
+            [
+                CandidateProposal("LATENCY_US = 120\nCORRECT = True\nNCU_US = 100\n", "slower"),
+                CandidateProposal("LATENCY_US = 80\nCORRECT = True\nNCU_US = 90\n", "faster"),
+            ]
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            output_dir = root / "out"
+            result = KernelOptimizer(provider).optimize(
+                KernelOptimizationRequest(
+                    kernel_source="LATENCY_US = 100\nCORRECT = True\nNCU_US = 100\n",
+                    harness_path=_write_policy_harness(root),
+                    cases=(InputCase("a", {}),),
+                    target=KernelTarget("fake", "fake"),
+                    budget=OptimizationBudget(
+                        max_rounds=1,
+                        candidates_per_round=2,
+                        min_speedup=1.01,
+                        benchmark_repetitions=2,
+                    ),
+                    output_dir=output_dir,
+                    diagnostic_proton_intra_kernel=True,
+                )
+            )
+            requests = _read_profile_requests(root)
+            baseline_profile = _read_json(output_dir / "baseline_profile.json")
+            best_profile = _read_json(output_dir / "best_profile.json")
+
+        diagnostic_requests = [
+            request
+            for request in requests
+            if request["tools"] == ["proton_intra_kernel"]
+        ]
+        self.assertEqual(
+            [(request["experiment_id"], request["reason"]) for request in diagnostic_requests],
+            [("baseline", "baseline_diagnostic"), ("final", "final_winner_diagnostic")],
+        )
+        candidate_diagnostics = [
+            request
+            for request in diagnostic_requests
+            if request["experiment_id"].startswith("r")
+        ]
+        self.assertEqual(candidate_diagnostics, [])
+        self.assertTrue(result.success)
+        self.assertEqual(result.experiments[1].status, "rejected")
+        self.assertEqual(result.experiments[2].status, "promoted")
+        self.assertEqual(result.final.aggregate_speedup, 1.25)
+        self.assertIn("diagnostic_proton_intra_kernel", result.baseline.cases[0].profile)
+        self.assertIn("diagnostic_proton_intra_kernel", result.final.cases[0].profile)
+        self.assertNotIn(
+            "diagnostic_proton_intra_kernel",
+            result.experiments[1].performance.cases[0].profile,  # type: ignore[union-attr]
+        )
+        baseline_diag = baseline_profile["a"]["diagnostic_proton_intra_kernel"]
+        self.assertEqual(baseline_diag["tools"], ["proton_intra_kernel"])
+        self.assertEqual(baseline_diag["artifacts"]["trace"], "/tmp/proton.trace")
+        self.assertNotIn("trace_events", baseline_diag)
+        self.assertEqual(best_profile["a"]["diagnostic_proton_intra_kernel"]["summary"]["granularity"], "warp")
+
+    def test_diagnostic_proton_does_not_duplicate_final_when_baseline_wins(self) -> None:
+        provider = FixedCandidateProvider(
+            [CandidateProposal("LATENCY_US = 120\nCORRECT = True\nNCU_US = 100\n", "slower")]
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            result = KernelOptimizer(provider).optimize(
+                KernelOptimizationRequest(
+                    kernel_source="LATENCY_US = 100\nCORRECT = True\nNCU_US = 100\n",
+                    harness_path=_write_policy_harness(root),
+                    cases=(InputCase("a", {}),),
+                    target=KernelTarget("fake", "fake"),
+                    budget=OptimizationBudget(
+                        max_rounds=1,
+                        candidates_per_round=1,
+                        min_speedup=1.01,
+                        benchmark_repetitions=2,
+                    ),
+                    output_dir=root / "out",
+                    diagnostic_proton_intra_kernel=True,
+                )
+            )
+            requests = _read_profile_requests(root)
+
+        diagnostic_requests = [
+            request
+            for request in requests
+            if request["tools"] == ["proton_intra_kernel"]
+        ]
+        self.assertFalse(result.success)
+        self.assertEqual(
+            [(request["experiment_id"], request["reason"]) for request in diagnostic_requests],
+            [("baseline", "baseline_diagnostic")],
+        )
+        self.assertIn("diagnostic_proton_intra_kernel", result.final.cases[0].profile)
+
+    def test_diagnostic_proton_is_promotion_neutral(self) -> None:
+        provider = FixedCandidateProvider(
+            [CandidateProposal("LATENCY_US = 80\nCORRECT = True\nNCU_US = 90\n", "faster")]
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            result = KernelOptimizer(provider).optimize(
+                KernelOptimizationRequest(
+                    kernel_source="LATENCY_US = 100\nCORRECT = True\nNCU_US = 100\n",
+                    harness_path=_write_policy_harness(root),
+                    cases=(InputCase("a", {}),),
+                    target=KernelTarget("fake", "fake"),
+                    budget=OptimizationBudget(
+                        max_rounds=1,
+                        candidates_per_round=1,
+                        min_speedup=1.01,
+                        benchmark_repetitions=2,
+                    ),
+                    output_dir=root / "out",
+                    diagnostic_proton_intra_kernel=True,
+                )
+            )
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.experiments[1].status, "promoted")
+        self.assertEqual(result.final.aggregate_speedup, 1.25)
+        self.assertEqual(
+            result.final.cases[0].profile["diagnostic_proton_intra_kernel"]["ncu"]["summary"]["duration_us"],
+            999999.0,
+        )
+
     def test_profile_payload_caps_large_values(self) -> None:
         # Use a harness that returns a >1MB profile to exercise spill logic.
         provider = FixedCandidateProvider(
@@ -333,6 +988,69 @@ class KernelOptimizerTest(unittest.TestCase):
                 )
                 # Optimizer should complete without error even with oversized profile.
                 self.assertIsNotNone(result)
+
+
+def _write_policy_harness(directory: Path) -> Path:
+    harness_path = directory / "policy_harness.py"
+    log_path = directory / "profile_requests.jsonl"
+    harness_path.write_text(
+        "from __future__ import annotations\n"
+        "import json\n"
+        "import re\n"
+        f"LOG_PATH = {str(log_path)!r}\n"
+        "def build(kernel_source, target):\n"
+        "    del target\n"
+        "    latency = re.search(r'LATENCY_US\\s*=\\s*([0-9.]+)', kernel_source)\n"
+        "    correct = re.search(r'CORRECT\\s*=\\s*(True|False)', kernel_source)\n"
+        "    ncu = re.search(r'NCU_US\\s*=\\s*([0-9.]+)', kernel_source)\n"
+        "    if latency is None or correct is None:\n"
+        "        return {'success': False, 'diagnostics': 'missing fake kernel controls'}\n"
+        "    artifact = {\n"
+        "        'latency_us': float(latency.group(1)),\n"
+        "        'correct': correct.group(1) == 'True',\n"
+        "        'ncu_us': float(ncu.group(1)) if ncu else None,\n"
+        "    }\n"
+        "    return {'success': True, 'artifact': artifact}\n"
+        "def verify(artifact, case):\n"
+        "    del case\n"
+        "    return {'passed': artifact['correct'], 'diagnostics': '' if artifact['correct'] else 'wrong'}\n"
+        "def benchmark(artifact, case, repetitions):\n"
+        "    scale = float(case.get('parameters', {}).get('scale', 1.0))\n"
+        "    return {'samples_us': [artifact['latency_us'] * scale] * repetitions}\n"
+        "def profile(artifact, case, request):\n"
+        "    del case\n"
+        "    with open(LOG_PATH, 'a') as stream:\n"
+        "        stream.write(json.dumps(request, sort_keys=True) + '\\n')\n"
+        "    tools = request.get('tools', []) if request else []\n"
+        "    if tools == ['proton_intra_kernel']:\n"
+        "        return {\n"
+        "            'level': request['level'],\n"
+        "            'tools': tools,\n"
+        "            'request': request,\n"
+        "            'summary': {'active_warps': 8, 'granularity': request.get('granularity')},\n"
+        "            'ncu': {'summary': {'duration_us': 999999.0}},\n"
+        "            'artifacts': {'trace': '/tmp/proton.trace'},\n"
+        "            'trace_events': [{'raw': 'event'}],\n"
+        "            'raw_profile': 'raw trace blob',\n"
+        "        }\n"
+        "    proton = {'totals': {'wrapper_us': 1.0, 'main_kernel_us': 2.0, 'non_main_kernel_us': 3.0}}\n"
+        "    payload = {'request': request, 'proton': proton}\n"
+        "    if artifact['ncu_us'] is not None:\n"
+        "        payload['ncu'] = {'summary': {'duration_us': artifact['ncu_us']}}\n"
+        "    return payload\n"
+    )
+    return harness_path
+
+
+def _read_profile_requests(directory: Path) -> list[dict[str, object]]:
+    path = directory / "profile_requests.jsonl"
+    return [json.loads(line) for line in path.read_text().splitlines()]
+
+
+def _read_json(path: Path) -> dict[str, object]:
+    payload = json.loads(path.read_text())
+    assert isinstance(payload, dict)
+    return payload
 
 
 def _performance(*values: tuple[str, float]) -> PerformanceSummary:

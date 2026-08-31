@@ -180,6 +180,7 @@ Triton and TLX development use a small set of complementary tools. Start from th
 | CUTracer | Inspecting SASS-level execution, warp progress, TMA/MMA activity, deadlocks, and race candidates |
 | Compute Sanitizer | Runtime checks for invalid memory access, uninitialized values, synchronization errors, and shared-memory hazards |
 | TritonBench | Reproducible kernel and workload benchmarking across implementations and shapes |
+| [TLX Agent](tlx-agent.html) | Running a harness-driven optimization loop with correctness, profiling, promotion, and winner commits |
 | Proton | Instrumenting Triton kernels and collecting performance data with low-level execution context |
 | triton-lint | Static checks for common Triton correctness and performance anti-patterns |
 
@@ -190,6 +191,7 @@ Triton and TLX development use a small set of complementary tools. Start from th
 - Use Triton-MPP or a hardware profiler to classify the performance limit.
 - Add CUTracer or Compute Sanitizer only when runtime ordering, races, or memory access are suspect.
 - Confirm improvements with TritonBench or the repository's correctness and performance harnesses.
+- Use the [TLX Agent](tlx-agent.html) when you want that validated harness to drive an automated candidate, profiling, and promotion loop.
 
 The [debugging guide](debugging.html) provides symptom-driven workflows for performance and numerical issues.
 """,

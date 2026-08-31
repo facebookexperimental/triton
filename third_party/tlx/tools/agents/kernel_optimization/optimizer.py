@@ -1,22 +1,336 @@
 from __future__ import annotations
 
+import sys
 import tempfile
 import time
+from collections.abc import Mapping
 from dataclasses import replace
 from pathlib import Path
+from typing import Any
 
 from .artifacts import ArtifactStore
 from .harness import HarnessExecutionError, SubprocessHarness
 from .models import (
     ExperimentSummary,
+    InputCase,
     KernelOptimizationRequest,
     KernelOptimizationResult,
+    PerformanceSummary,
     is_promotable,
     passes_protected_cases,
+    per_case_speedups,
     weighted_geometric_speedup,
+)
+from .profiling import (
+    ProfileRequest,
+    compact_profile_summary,
+    extract_ncu_duration_us,
+    ncu_regression_diagnostic,
 )
 from .providers import CandidateContext, CandidateProvider, CodexCandidateProvider
 from .source import source_digest
+
+_PROFILE_TOOLS = ("proton_launch", "ncu")
+_DIAGNOSTIC_PROFILE_TOOLS = ("proton_intra_kernel",)
+_DIAGNOSTIC_PROFILE_KEY = "diagnostic_proton_intra_kernel"
+_NEAR_THRESHOLD_WINDOW = 0.01
+
+
+def _profile_request(
+    artifacts_dir: Path,
+    experiment_id: str,
+    *,
+    level: str,
+    reason: str,
+) -> ProfileRequest:
+    return ProfileRequest(
+        level=level,
+        tools=_PROFILE_TOOLS,
+        experiment_id=experiment_id,
+        artifacts_dir=artifacts_dir / "experiments" / experiment_id / "profile_artifacts",
+        reason=reason,
+    )
+
+
+def _diagnostic_profile_request(
+    artifacts_dir: Path,
+    experiment_id: str,
+    *,
+    reason: str,
+) -> ProfileRequest:
+    return ProfileRequest(
+        level="deep",
+        tools=_DIAGNOSTIC_PROFILE_TOOLS,
+        experiment_id=experiment_id,
+        artifacts_dir=artifacts_dir
+        / "experiments"
+        / experiment_id
+        / "diagnostic_profile_artifacts",
+        reason=reason,
+        diagnostic_only=True,
+        granularity="warp",
+    )
+
+
+def _profiles_by_case(performance: PerformanceSummary) -> dict[str, dict[str, Any]]:
+    return {evaluation.case_id: dict(evaluation.profile) for evaluation in performance.cases}
+
+
+def _diagnostic_error_profiles(
+    cases: tuple[InputCase, ...], error: Exception
+) -> dict[str, dict[str, Any]]:
+    return {
+        case.case_id: {"error": f"{type(error).__name__}: {error}"}
+        for case in cases
+    }
+
+
+def _collect_diagnostic_profiles(
+    harness: SubprocessHarness,
+    source: str,
+    request: KernelOptimizationRequest,
+    artifacts_dir: Path,
+    experiment_id: str,
+    *,
+    reason: str,
+) -> dict[str, dict[str, Any]]:
+    try:
+        performance = harness.evaluate(
+            source,
+            request.cases,
+            request.target,
+            request.budget.benchmark_repetitions,
+            profile=_diagnostic_profile_request(
+                artifacts_dir,
+                experiment_id,
+                reason=reason,
+            ),
+        )
+    except Exception as error:  # noqa: BLE001
+        return _diagnostic_error_profiles(request.cases, error)
+    return _profiles_by_case(performance)
+
+
+def _merge_diagnostic_profiles(
+    performance: PerformanceSummary,
+    diagnostic_profiles: Mapping[str, Mapping[str, Any]],
+) -> PerformanceSummary:
+    if not diagnostic_profiles:
+        return performance
+    merged_cases = []
+    for evaluation in performance.cases:
+        diagnostic_profile = diagnostic_profiles.get(evaluation.case_id)
+        if not diagnostic_profile:
+            merged_cases.append(evaluation)
+            continue
+        profile = dict(evaluation.profile)
+        profile[_DIAGNOSTIC_PROFILE_KEY] = compact_profile_summary(diagnostic_profile)
+        merged_cases.append(replace(evaluation, profile=profile))
+    return replace(performance, cases=tuple(merged_cases))
+
+
+def _report_candidate_summary(experiment_id: str, proposal: object) -> None:
+    fields = (
+        ("hypothesis", getattr(proposal, "hypothesis", "")),
+        ("evidence", getattr(proposal, "evidence", "")),
+        ("change", getattr(proposal, "summary", "")),
+        ("expected", getattr(proposal, "expected_effect", "")),
+        ("risk", getattr(proposal, "risk", "")),
+    )
+    details = " ".join(
+        f"{name}={value!r}" for name, value in fields if value
+    ) or "change='candidate source edited'"
+    print(f"[tlx-agent] {experiment_id} {details}", file=sys.stderr, flush=True)
+
+
+def _report_performance(
+    experiment_id: str,
+    status: str,
+    performance: PerformanceSummary | None,
+    *,
+    baseline: PerformanceSummary | None = None,
+    cases: tuple[InputCase, ...] = (),
+    diagnostics: str = "",
+) -> None:
+    parts = [f"[tlx-agent] {experiment_id} status={status}"]
+    if performance is not None:
+        parts.append(f"aggregate_speedup={performance.aggregate_speedup:.4f}x")
+        speedups = (
+            per_case_speedups(baseline, performance, cases)
+            if baseline is not None
+            else {}
+        )
+        for evaluation in performance.cases:
+            case_parts = [
+                evaluation.case_id,
+                "correct" if evaluation.verification.passed else "incorrect",
+            ]
+            if evaluation.timing is not None:
+                timing = evaluation.timing
+                case_parts.extend(
+                    (
+                        f"median={timing.median_us:.3f}us",
+                        f"p95={timing.p95_us:.3f}us",
+                        f"cv={timing.coefficient_of_variation:.4f}",
+                    )
+                )
+            speedup = speedups.get(evaluation.case_id)
+            if speedup is not None:
+                case_parts.append(f"speedup={speedup:.4f}x")
+            case_parts.extend(_profile_log_parts(evaluation.profile))
+            parts.append("case=" + ",".join(case_parts))
+    if diagnostics:
+        parts.append(f"diagnostics={diagnostics}")
+    print(" ".join(parts), file=sys.stderr, flush=True)
+
+
+def _profile_log_parts(profile: Mapping[str, Any]) -> list[str]:
+    if not profile:
+        return ["ncu=unavailable"]
+    compact = compact_profile_summary(profile)
+    parts: list[str] = []
+    proton_totals = _find_mapping_with_keys(
+        compact,
+        frozenset({"wrapper_us", "main_kernel_us", "non_main_kernel_us"}),
+    ) or _find_mapping_with_keys(
+        profile,
+        frozenset({"wrapper_us", "main_kernel_us", "non_main_kernel_us"}),
+    )
+    if proton_totals is not None:
+        for label, key in (
+            ("proton.wrapper_us", "wrapper_us"),
+            ("proton.main_kernel_us", "main_kernel_us"),
+            ("proton.non_main_kernel_us", "non_main_kernel_us"),
+        ):
+            value = _coerce_float(proton_totals.get(key))
+            if value is not None:
+                parts.append(f"{label}={value:.3f}")
+    ncu_duration = extract_ncu_duration_us(compact)
+    if ncu_duration is None:
+        ncu_duration = extract_ncu_duration_us(profile)
+    if ncu_duration is not None:
+        parts.append(f"ncu.duration_us={ncu_duration:.3f}")
+    else:
+        parts.append("ncu=unavailable")
+    diagnostic = compact.get(_DIAGNOSTIC_PROFILE_KEY)
+    if not isinstance(diagnostic, Mapping):
+        diagnostic = profile.get(_DIAGNOSTIC_PROFILE_KEY)
+    if isinstance(diagnostic, Mapping):
+        intra = diagnostic.get(_DIAGNOSTIC_PROFILE_KEY)
+        if not isinstance(intra, Mapping):
+            intra = diagnostic
+        valid = intra.get("valid")
+        if isinstance(valid, bool):
+            parts.append(f"proton.intra.valid={str(valid).lower()}")
+        selected_cta = intra.get("selected_cta")
+        if selected_cta is not None:
+            parts.append(f"proton.intra.cta={selected_cta}")
+        coordinates = intra.get("logical_coordinates")
+        if isinstance(coordinates, Mapping):
+            coordinate_text = "/".join(
+                f"{key}:{coordinates[key]}"
+                for key in (
+                    "start_n",
+                    "logical_block",
+                    "curr_m",
+                    "mma_producer_j",
+                    "load_input_j",
+                )
+                if key in coordinates
+            )
+            if coordinate_text:
+                parts.append(f"proton.intra.tile={coordinate_text}")
+        waits = intra.get("dominant_waits")
+        if isinstance(waits, list) and waits and isinstance(waits[0], Mapping):
+            wait_name = waits[0].get("name")
+            wait_duration = _coerce_float(waits[0].get("duration"))
+            if wait_name and wait_duration is not None:
+                parts.append(
+                    f"proton.intra.dominant_wait={wait_name}:{wait_duration:.3f}us"
+                )
+        trace_path = intra.get("trace_path")
+        if trace_path:
+            parts.append(f"proton.intra.trace={trace_path}")
+    error = compact.get("error")
+    if error:
+        parts.append(f"profile.error={error}")
+    artifact = compact.get("artifact")
+    if artifact:
+        parts.append(f"profile.artifact={artifact}")
+    return parts
+
+
+def _find_mapping_with_keys(
+    value: Any,
+    keys: frozenset[str],
+) -> Mapping[str, Any] | None:
+    if isinstance(value, Mapping):
+        if keys.issubset({str(key) for key in value.keys()}):
+            return value
+        for item in value.values():
+            match = _find_mapping_with_keys(item, keys)
+            if match is not None:
+                return match
+    if isinstance(value, list | tuple):
+        for item in value:
+            match = _find_mapping_with_keys(item, keys)
+            if match is not None:
+                return match
+    return None
+
+
+def _coerce_float(value: Any) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, int | float):
+        return float(value)
+    try:
+        return float(str(value).strip().replace(",", ""))
+    except ValueError:
+        return None
+
+
+def _is_correct_and_stable(
+    performance: PerformanceSummary,
+    budget: object,
+    cases: tuple[InputCase, ...],
+) -> bool:
+    case_by_id = {case.case_id: case for case in cases}
+    for evaluation in performance.cases:
+        case = case_by_id.get(evaluation.case_id)
+        protected = case.protected if case is not None else True
+        if not evaluation.verification.passed:
+            if protected:
+                return False
+            continue
+        if evaluation.timing is None:
+            return False
+        if evaluation.timing.coefficient_of_variation > budget.max_cv:
+            return False
+    return True
+
+
+def _is_near_threshold(speedup: float, threshold: float) -> bool:
+    return threshold - _NEAR_THRESHOLD_WINDOW <= speedup <= threshold + _NEAR_THRESHOLD_WINDOW
+
+
+def _ncu_regression_diagnostics(
+    baseline: PerformanceSummary,
+    candidate: PerformanceSummary,
+) -> str:
+    baseline_by_case = {evaluation.case_id: evaluation for evaluation in baseline.cases}
+    diagnostics: list[str] = []
+    for evaluation in candidate.cases:
+        baseline_evaluation = baseline_by_case.get(evaluation.case_id)
+        if baseline_evaluation is None:
+            continue
+        diagnostic = ncu_regression_diagnostic(
+            baseline_evaluation.profile,
+            evaluation.profile,
+        )
+        if diagnostic:
+            diagnostics.append(f"{evaluation.case_id}: {diagnostic}")
+    return "; ".join(diagnostics)
 
 
 class KernelOptimizer:
@@ -45,17 +359,30 @@ class KernelOptimizer:
             request.cases,
             request.target,
             request.budget.benchmark_repetitions,
-            profile=True,
+            profile=_profile_request(
+                artifacts_dir,
+                "baseline",
+                level="deep",
+                reason="baseline",
+            ),
         )
         if not passes_protected_cases(baseline, request.cases):
             raise HarnessExecutionError(
                 "baseline failed one or more protected correctness cases"
             )
         baseline = replace(baseline, aggregate_speedup=1.0)
-        baseline_profiles = {
-            evaluation.case_id: dict(evaluation.profile) for evaluation in baseline.cases
-        }
-        store.write_profile("baseline", baseline_profiles)
+        if request.diagnostic_proton_intra_kernel:
+            baseline_diagnostics = _collect_diagnostic_profiles(
+                harness,
+                request.kernel_source,
+                request,
+                artifacts_dir,
+                "baseline",
+                reason="baseline_diagnostic",
+            )
+            baseline = _merge_diagnostic_profiles(baseline, baseline_diagnostics)
+        baseline_profiles = _profiles_by_case(baseline)
+        baseline_profile_path = store.write_profile("baseline", baseline_profiles)
         store.write_aggregated_profile("baseline_profile", baseline_profiles)
         experiments = [
             ExperimentSummary(
@@ -65,9 +392,11 @@ class KernelOptimizer:
                 status="baseline",
                 source_path=baseline_source_path,
                 performance=baseline,
+                profile_path=baseline_profile_path,
             )
         ]
         store.write_json("experiments/baseline/result.json", baseline)
+        _report_performance("baseline", "baseline", baseline)
 
         best_source = request.kernel_source
         best_performance = baseline
@@ -91,6 +420,7 @@ class KernelOptimizer:
                 experiment_id = f"r{round_index:03d}-c{candidate_index:03d}"
                 proposal = None
                 try:
+                    _report_performance(experiment_id, "generating", None)
                     proposal = self._provider.propose(
                         request,
                         CandidateContext(
@@ -101,33 +431,66 @@ class KernelOptimizer:
                             previous_diagnostics=tuple(diagnostics),
                         ),
                     )
+                    _report_candidate_summary(experiment_id, proposal)
                     digest = source_digest(proposal.source)
                     if digest in seen_sources:
                         raise ValueError("candidate source duplicates an earlier experiment")
                     seen_sources.add(digest)
                     source_path = store.write_source(experiment_id, proposal.source)
+                    _report_performance(experiment_id, "evaluating", None)
                     performance = harness.evaluate(
                         proposal.source,
                         request.cases,
                         request.target,
                         request.budget.benchmark_repetitions,
-                        profile=True,
+                        profile=_profile_request(
+                            artifacts_dir,
+                            experiment_id,
+                            level="summary",
+                            reason="candidate",
+                        ),
                     )
-                    # Persist per-case profiles for this candidate regardless of promotion.
-                    perf_profiles = {
-                        evaluation.case_id: dict(evaluation.profile)
-                        for evaluation in performance.cases
-                    }
-                    store.write_profile(experiment_id, perf_profiles)
                     speedup = weighted_geometric_speedup(
                         baseline, performance, request.cases
                     )
-                    performance = replace(
-                        performance, aggregate_speedup=speedup
-                    )
+                    performance = replace(performance, aggregate_speedup=speedup)
+                    if _is_correct_and_stable(
+                        performance,
+                        request.budget,
+                        request.cases,
+                    ) and _is_near_threshold(speedup, request.budget.min_speedup):
+                        _report_performance(
+                            experiment_id,
+                            "near-threshold-profiling",
+                            performance,
+                            baseline=baseline,
+                            cases=request.cases,
+                            diagnostics="reason=near_threshold",
+                        )
+                        performance = harness.evaluate(
+                            proposal.source,
+                            request.cases,
+                            request.target,
+                            request.budget.benchmark_repetitions,
+                            profile=_profile_request(
+                                artifacts_dir,
+                                experiment_id,
+                                level="deep",
+                                reason="near_threshold",
+                            ),
+                        )
+                        speedup = weighted_geometric_speedup(
+                            baseline, performance, request.cases
+                        )
+                        performance = replace(performance, aggregate_speedup=speedup)
+                    # Persist per-case profiles for this candidate regardless of promotion.
+                    perf_profiles = _profiles_by_case(performance)
+                    profile_path = store.write_profile(experiment_id, perf_profiles)
+                    ncu_diagnostics = _ncu_regression_diagnostics(baseline, performance)
                     status = (
                         "promoted"
-                        if is_promotable(performance, request.budget, request.cases)
+                        if not ncu_diagnostics
+                        and is_promotable(performance, request.budget, request.cases)
                         and speedup > best_performance.aggregate_speedup
                         else "rejected"
                     )
@@ -139,6 +502,40 @@ class KernelOptimizer:
                         source_path=source_path,
                         performance=performance,
                         mutation_summary=proposal.summary,
+                        hypothesis=proposal.hypothesis,
+                        evidence=proposal.evidence,
+                        expected_effect=proposal.expected_effect,
+                        risk=proposal.risk,
+                        profile_path=profile_path,
+                    )
+                    rejection_diagnostics = "; ".join(
+                        f"{evaluation.case_id}: {evaluation.verification.diagnostics}"
+                        for evaluation in performance.cases
+                        if not evaluation.verification.passed
+                        and evaluation.verification.diagnostics
+                    )
+                    if status == "rejected" and rejection_diagnostics:
+                        diagnostics.append(
+                            f"{experiment_id}: rejected: {rejection_diagnostics}"
+                        )
+                    if status == "rejected" and ncu_diagnostics:
+                        diagnostics.append(
+                            f"{experiment_id}: rejected: {ncu_diagnostics}"
+                        )
+                    decision = (
+                        "correct and exceeded speedup threshold"
+                        if status == "promoted"
+                        else ncu_diagnostics
+                        or rejection_diagnostics
+                        or f"speedup below {request.budget.min_speedup:.4f}x threshold"
+                    )
+                    _report_performance(
+                        experiment_id,
+                        status,
+                        performance,
+                        baseline=baseline,
+                        cases=request.cases,
+                        diagnostics=f"decision={decision}",
                     )
                     if status == "promoted":
                         best_source = proposal.source
@@ -160,6 +557,12 @@ class KernelOptimizer:
                         source_path=source_path,
                         diagnostics=message,
                     )
+                    _report_performance(
+                        experiment_id,
+                        "failed",
+                        None,
+                        diagnostics=message,
+                    )
                 experiments.append(experiment)
                 store.write_json(
                     f"experiments/{experiment_id}/result.json", experiment
@@ -167,15 +570,19 @@ class KernelOptimizer:
             if exhausted:
                 break
             if not promoted_this_round:
-                stopping_reason = "no_promotable_candidate"
-                break
+                stopping_reason = "round_budget_exhausted"
 
         final_profile = harness.evaluate(
             best_source,
             request.cases,
             request.target,
             request.budget.benchmark_repetitions,
-            profile=True,
+            profile=_profile_request(
+                artifacts_dir,
+                "final",
+                level="deep",
+                reason="final",
+            ),
         )
         final_profile = replace(
             final_profile,
@@ -183,19 +590,45 @@ class KernelOptimizer:
                 baseline, final_profile, request.cases
             ),
         )
-        final_profiles = {
-            evaluation.case_id: dict(evaluation.profile) for evaluation in final_profile.cases
-        }
-        if best_experiment_id != "baseline" and not is_promotable(
-            final_profile, request.budget, request.cases
+        final_ncu_diagnostics = _ncu_regression_diagnostics(baseline, final_profile)
+        if best_experiment_id != "baseline" and (
+            final_ncu_diagnostics
+            or not is_promotable(final_profile, request.budget, request.cases)
         ):
+            if final_ncu_diagnostics:
+                diagnostics.append(f"final: rejected: {final_ncu_diagnostics}")
             best_source = request.kernel_source
             final_profile = baseline
             final_profiles = baseline_profiles
             best_experiment_id = "baseline"
             stopping_reason = "finalist_revalidation_failed"
-        else:
+        elif best_experiment_id != "baseline":
+            if request.diagnostic_proton_intra_kernel:
+                final_diagnostics = _collect_diagnostic_profiles(
+                    harness,
+                    best_source,
+                    request,
+                    artifacts_dir,
+                    "final",
+                    reason="final_winner_diagnostic",
+                )
+                final_profile = _merge_diagnostic_profiles(
+                    final_profile, final_diagnostics
+                )
+            final_profiles = _profiles_by_case(final_profile)
             best_profiles = final_profiles
+        else:
+            final_profile = baseline
+            final_profiles = baseline_profiles
+        store.write_profile("final", final_profiles)
+        _report_performance(
+            "final",
+            "revalidated" if best_experiment_id != "baseline" else "baseline",
+            final_profile,
+            baseline=baseline,
+            cases=request.cases,
+            diagnostics=final_ncu_diagnostics,
+        )
         store.write_aggregated_profile("best_profile", best_profiles)
         # Doc-compatible alias: experiments.json mirrors the experiments list.
         store.write_json("experiments.json", tuple(experiments))

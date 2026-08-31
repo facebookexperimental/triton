@@ -57,6 +57,12 @@ python -m third_party.tlx.tools.agents.kernel_optimization.cli \
   --output-dir /tmp/tlx-kernel-agent-run \
   --max-rounds 5 \
   --provider codex --arch blackwell
+
+# A revalidated winner is committed by default:
+python -m third_party.tlx.tools.agents.kernel_optimization.cli \
+  --kernel my_kernel.py --output-dir /tmp/tlx-kernel-agent-run \
+  --vcs auto \
+  --commit-message "Optimize my kernel with TLX agent"
 ```
 
 `--arch` selects `harnesses/<arch>/targets/<kernel>`; `harness`/`cases`/`target` can also be passed explicitly.
@@ -66,6 +72,24 @@ python -m third_party.tlx.tools.agents.kernel_optimization.cli \
 `--provider` is `codex` (default, shells `codex exec`) or `mock` (deterministic stub for
 CI that replays canned candidates or echoes the current source). When `codex` is not
 installed the provider fails fast with a clear error suggesting `--provider mock`.
+
+Winner commits are enabled by default and run only after successful final revalidation.
+Use `--no-commit-winner` for artifact-only runs. The CLI
+finds the repository from the absolute kernel path and supports `--vcs auto|git|hg` without
+using `sl`. Every generated commit includes the body line `TLX agent authored`. Existing
+unrelated staged and dirty work is preserved. If the target was already dirty, only the
+baseline-to-winner delta is committed and the original target edits remain unstaged/dirty;
+overlapping edits fail safely. Exit code `3` means optimization succeeded but commit failed,
+and `best_kernel.py` remains available. Commit metadata is written to `auto_commit.json`.
+
+The optimizer reports baseline, every candidate, and final revalidation performance
+to stderr as soon as each evaluation completes. Each line includes status, aggregate
+speedup, and per-case correctness, median, p95, CV, and speedup. Each try also logs a
+bounded hypothesis/change/expected-effect/risk summary before evaluation and a concise
+decision afterward. A requested commit emits one `commit status=committed|failed` event
+with VCS, revision, repository, target file, subject, and attribution. Kernel source is
+never printed to the live log. The final JSON remains on stdout so callers can parse it
+independently of live progress.
 
 `--budget` accepts an optional JSON file that overrides the `--max-*` / `--min-speedup` /
 `--max-cv` flags (`{max_rounds, candidates_per_round, max_candidate_seconds,
@@ -84,6 +108,7 @@ result.json                 # KernelOptimizationResult (success, baseline, final
 experiments.json            # alias of result.experiments (Google Doc compatibility)
 baseline_profile.json       # aggregated per-case profile for the baseline
 best_profile.json           # aggregated per-case profile for the promoted winner
+auto_commit.json             # present when --commit-winner reaches finalization
 artifacts/profile_traces/   # spilled large profile payloads
 experiments/
   baseline/{kernel.py, result.json, profile.json}
@@ -98,18 +123,25 @@ isolation in the CLI path; `StandaloneHarness` is available via the Python API.
 
 `harnesses/blackwell/targets/gemm/harness.py` runs any complete candidate source that exports
 `matmul(a, b)`. It compares against `torch.matmul`, benchmarks with
-`triton.testing.do_bench`, and reports latency and TFLOP/s. Set `TRITON_PROTON=1`
-to also collect a Triton Proton trace (returned inside `profile()`).
+`triton.testing.do_bench`, and reports latency and TFLOP/s. Its optional three-argument
+`profile(build_artifact, case, request)` honors structured profile requests: `proton_launch`
+collects one Triton launch-attribution-only Proton tree under the per-case artifacts
+directory, and `ncu` writes a one-launch replay runner plus command/query/stdout/stderr/report
+artifacts before returning normalized supported metrics. Missing tools, unsupported metrics,
+and profiler failures are returned as profile diagnostics so correctness and benchmark results
+remain usable. `proton_intra_kernel` is intentionally unsupported by the reference harness and
+requires a target-supplied instrumented replay; the harness never rewrites candidate source.
 
 ### Profiling recipes
 
-- **Triton Proton / Triton-MPP:** inside `profile()` wrap the kernel with
-  `import triton.profiler as proton; proton.start("matmul"); module.matmul(a,b); proton.deactivate()`
-  and return `{"proton_trace": ...}`. The agent persists it as-is.
-- **NCU:** shell `ncu --csv --metrics sm__throughput.avg.pct_of_peak_sustained_elapsed ...`
-  on a single rep, parse stdout, and return a small dict like
-  `{"ncu": {"sm_throughput": ...}}`. Large CSV traces can be written to a file and
-  returned as `{"artifact": "path/to/trace.csv"}` — the agent will spill >1MB payloads.
+- **Triton Proton launch attribution:** request `tools=["proton_launch"]` with an absolute
+  `artifacts_dir`. The reference GEMM harness warms up, synchronizes, starts Proton with
+  `hook="triton"` and tree data, runs one matmul, flushes/deactivates, saves raw tree JSON and
+  any `.hatchet` artifact, then parses `launch_attribution_only` totals.
+- **NCU:** request `tools=["ncu"]`. The reference GEMM harness queries metrics from the active
+  `ncu`/GPU, selects supported summary or deep aliases, runs a replay script importing the exact
+  candidate source path, saves command/query/CSV/stderr artifacts, and returns unsupported metrics
+  as `null` plus diagnostics.
 
 Target-specific `harness.py`/`cases.json`/`target.json` live colocated under `harnesses/<arch>/targets/<kernel>/` (B200,
 `sm_100` for blackwell and H100, `sm_90` for hopper); pick `--arch` to match the
