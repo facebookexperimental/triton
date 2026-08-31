@@ -530,6 +530,7 @@ def TT_JoinOp : TT_Op<"join", [Pure, SameTypeOperands]> {
   let assemblyFormat =
       "$lhs `,` $rhs attr-dict `:` type($lhs) `->` type($result)";
   let hasVerifier = 1;
+  let hasFolder = 1;
 }
 
 def TT_SplitOp : TT_Op<"split", [Pure, InferTypeOpAdaptorWithIsCompatible,
@@ -548,6 +549,7 @@ def TT_SplitOp : TT_Op<"split", [Pure, InferTypeOpAdaptorWithIsCompatible,
   let arguments = (ins TT_Tensor:$src);
   let results = (outs TT_Tensor:$outLHS, TT_Tensor:$outRHS);
   let assemblyFormat = "$src attr-dict `:` type($src) `->` type($outLHS)";
+  let hasFolder = 1;
 }
 
 def TT_TransOp : TT_Op<"trans", [Pure, TransposeOpInterface,
