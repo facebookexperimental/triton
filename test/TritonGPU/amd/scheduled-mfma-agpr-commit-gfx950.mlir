@@ -20,7 +20,9 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.tar
           tensor<32x16xbf16, #rhs>,
           tensor<16x16xf32, #mma>
           -> tensor<16x16xf32, #mma>
-    // expected-error @+1 {{input 0 is an AGPR-resident accumulator committed alongside a live dot operand}}
+    // The commit op is illegal after this pass, so refusing it fails the pass.
+    // expected-error @+2 {{input 0 is an AGPR-resident accumulator committed alongside a live dot operand}}
+    // expected-error @+1 {{failed to legalize operation 'amdg.mfma_commit'}}
     %committed, %preserved = amdg.mfma_commit %result, %b
         : tensor<16x16xf32, #mma>,
           tensor<32x16xbf16, #rhs>
