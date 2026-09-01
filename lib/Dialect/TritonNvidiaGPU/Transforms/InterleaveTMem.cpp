@@ -788,6 +788,147 @@ DenseMap<Operation *, DictionaryAttr> buildTMemLoadConstraints(Block &block) {
   return memOpConstraints;
 }
 
+// Prefer materializing a TMEM operand before an independent SMEM operand when
+// both feed the same pure operation.  Code partitioning places each channel
+// consumer immediately before its first use, which can otherwise leave the
+// SMEM load/broadcast live across the TMEM load.  Delay the complete SMEM
+// consumer channel until the TMEM channel has completed.  Both the wait and
+// release are allowed to cross the intervening channel only when the WS
+// ordered-region metadata proves that reordering safe.
+//
+// This does not shorten a live range on its own; it swaps which of the two
+// values is live across the other's channel.  It pays off when the SMEM value
+// is the cheaper one to hold, which is the shape this was written for (a
+// narrow scalar broadcast against a wide TMEM tile).  The selection below is
+// purely structural and does not compare the two footprints or chain lengths,
+// so a wide SMEM operand or a long SMEM consumer chain can raise peak
+// register pressure instead of lowering it.  Adding a width or length guard
+// needs a policy decision and ideally evidence that the adverse shape occurs
+// in practice; until then the qualifying conditions are the structural ones
+// only, and this comment states the intent rather than an enforced invariant.
+bool prioritizeTMemOperand(Block &block) {
+  bool changed = false;
+  SmallVector<TMEMLoadOp> tmemLoads;
+  for (Operation &op : block)
+    if (auto load = dyn_cast<TMEMLoadOp>(&op))
+      tmemLoads.push_back(load);
+
+  for (TMEMLoadOp tmemLoad : tmemLoads) {
+    Value tmemValue = tmemLoad.getResult();
+    Operation *commonUser = nullptr;
+    while (tmemValue.hasOneUse()) {
+      Operation *user = *tmemValue.user_begin();
+      if (!isPure(user))
+        break;
+      if (user->getNumOperands() != 1 || user->getNumResults() != 1) {
+        commonUser = user;
+        break;
+      }
+      tmemValue = user->getResult(0);
+    }
+    if (!commonUser || !isPure(commonUser) || commonUser->getBlock() != &block)
+      continue;
+
+    for (Value operand : commonUser->getOperands()) {
+      if (operand == tmemValue)
+        continue;
+
+      SmallVector<Operation *> reverseChain;
+      Value current = operand;
+      ttg::LocalLoadOp localLoad;
+      while (Operation *def = current.getDefiningOp()) {
+        if (def->getBlock() != &block || !def->hasOneUse())
+          break;
+        if (auto load = dyn_cast<ttg::LocalLoadOp>(def)) {
+          localLoad = load;
+          break;
+        }
+        if (!isPure(def) || def->getNumOperands() != 1 ||
+            def->getNumResults() != 1)
+          break;
+        reverseChain.push_back(def);
+        current = def->getOperand(0);
+      }
+      if (!localLoad || !localLoad->isBeforeInBlock(tmemLoad))
+        continue;
+
+      auto acquire = dyn_cast_or_null<WaitBarrierOp>(localLoad->getPrevNode());
+      if (!acquire || !hasWSBarrierConstraints(acquire.getConstraints()))
+        continue;
+      SmallVector<Operation *> acquirePrefix;
+      llvm::SmallPtrSet<Operation *, 8> movingOps{acquire, localLoad};
+      for (Operation *op = acquire->getPrevNode(); op && isPure(op);
+           op = op->getPrevNode()) {
+        bool usedOnlyByMovingOps =
+            llvm::all_of(op->getUsers(), [&](Operation *user) {
+              return movingOps.contains(user);
+            });
+        if (!usedOnlyByMovingOps)
+          break;
+        acquirePrefix.push_back(op);
+        movingOps.insert(op);
+      }
+
+      SmallVector<Operation *> releasePrefix;
+      Operation *releaseCandidate = localLoad->getNextNode();
+      while (releaseCandidate && isPure(releaseCandidate)) {
+        releasePrefix.push_back(releaseCandidate);
+        releaseCandidate = releaseCandidate->getNextNode();
+      }
+      auto release = dyn_cast_or_null<ArriveBarrierOp>(releaseCandidate);
+      if (!release || !hasWSBarrierConstraints(release.getConstraints()))
+        continue;
+
+      bool safe = true;
+      for (Operation *op = release->getNextNode(); op && op != commonUser;
+           op = op->getNextNode()) {
+        if (auto arrive = dyn_cast<ArriveBarrierOp>(op)) {
+          if (!hasWSBarrierConstraints(arrive.getConstraints()) ||
+              !canAdvanceWSBarrierArrivePastWait(arrive.getConstraints(),
+                                                 acquire.getConstraints())) {
+            safe = false;
+            break;
+          }
+          continue;
+        }
+        if (auto wait = dyn_cast<WaitBarrierOp>(op)) {
+          // The release is an arrive that ends up after this wait. Delaying
+          // an arrive past a wait is the cycle sinkWSArrives guards with the
+          // same predicate; requiring only that the wait carries constraints
+          // would let the SMEM empty-arrive sink past a wait whose producer
+          // is blocked on it.
+          if (!hasWSBarrierConstraints(wait.getConstraints()) ||
+              !canAdvanceWSBarrierArrivePastWait(release.getConstraints(),
+                                                 wait.getConstraints())) {
+            safe = false;
+            break;
+          }
+          continue;
+        }
+        if (!canAdvanceWSBarrier(release.getConstraints(), op)) {
+          safe = false;
+          break;
+        }
+      }
+      if (!safe)
+        continue;
+
+      for (Operation *op : llvm::reverse(acquirePrefix))
+        op->moveBefore(commonUser);
+      acquire->moveBefore(commonUser);
+      localLoad->moveBefore(commonUser);
+      for (Operation *op : releasePrefix)
+        op->moveBefore(commonUser);
+      release->moveBefore(commonUser);
+      for (Operation *op : llvm::reverse(reverseChain))
+        op->moveBefore(commonUser);
+      changed = true;
+      break;
+    }
+  }
+  return changed;
+}
+
 void processBlock(BlockInterleaveInfo &info) {
   Block &block = *info.block;
   SmallVector<Operation *> originalOrder = getBlockOpOrder(block);
@@ -878,12 +1019,26 @@ struct TritonNvidiaGPUInterleaveTMemPass
     SmallVector<BlockInterleaveInfo> blocksToProcess;
     m.walk([&](Block *block) {
       BlockInterleaveInfo info = collectBlockInterleaveInfo(block);
+      if (info.tmemLoadCount > 0)
+        prioritizeTMemOperand(*block);
       if (info.tmemLoadCount < 2)
         return;
       blocksToProcess.push_back(std::move(info));
     });
     for (auto &info : blocksToProcess)
       processBlock(info);
+    // WS code partitioning keeps a structurally redundant P-publication wait
+    // long enough for loop scheduling and TMEM interleaving to observe its
+    // cross-partition ordering edge.  Erase it only after those transformations
+    // have fixed the operation order; removing it in WSCodePartition changes
+    // the schedule and does not reproduce the proven final-IR ablation.
+    SmallVector<WaitBarrierOp> redundantPublicationWaits;
+    m.walk([&](WaitBarrierOp wait) {
+      if (wait->hasAttr("ttng.redundant_publication_wait"))
+        redundantPublicationWaits.push_back(wait);
+    });
+    for (WaitBarrierOp wait : redundantPublicationWaits)
+      wait.erase();
   }
 };
 

@@ -137,6 +137,31 @@ static bool needsCustomMetaWSEpiloguePeeling(scf::ForOp forOp) {
       .wasInterrupted();
 }
 
+static FailureOr<unsigned> getOperandUseStageFromAttr(Operation *scheduledOp,
+                                                      OpOperand &operand,
+                                                      unsigned operationStage) {
+  if (operand.getOwner() != scheduledOp)
+    return operationStage;
+  auto offsets = scheduledOp->getAttrOfType<DenseI32ArrayAttr>(
+      kLoopOperandStageOffsetsAttrName);
+  if (!offsets)
+    return operationStage;
+  if (offsets.size() != scheduledOp->getNumOperands()) {
+    scheduledOp->emitOpError()
+        << kLoopOperandStageOffsetsAttrName << " must contain "
+        << scheduledOp->getNumOperands() << " entries, but has "
+        << offsets.size();
+    return failure();
+  }
+  int32_t offset = offsets.asArrayRef()[operand.getOperandNumber()];
+  if (offset < 0) {
+    scheduledOp->emitOpError() << kLoopOperandStageOffsetsAttrName
+                               << " does not support negative offsets";
+    return failure();
+  }
+  return operationStage + static_cast<unsigned>(offset);
+}
+
 static void expandLoops(ModuleOp moduleOp) {
   DenseSet<MaskOp> peeledMaskOps;
   auto processPeeledEpilogueOp = [&](RewriterBase &rewriter, Operation *op,
@@ -228,6 +253,7 @@ static void expandLoops(ModuleOp moduleOp) {
             std::vector<std::pair<Operation *, unsigned>> &schedule) {
           schedule = finalSchedule;
         };
+    options.getOperandUseStageFn = getOperandUseStageFromAttr;
 
     // Testing feature: allow for unresolved predicate stage ops
     // in the loop body.

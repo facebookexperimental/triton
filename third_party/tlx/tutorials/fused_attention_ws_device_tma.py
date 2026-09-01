@@ -121,9 +121,6 @@ def _attn_fwd_subtile(
                 "opndD,tmem,1,0",
             ],
             "two_cta_interleave_role": "qk" if TWO_CTAS else None,
-            "two_cta_tma_direct_wait": TWO_CTAS,
-            "two_cta_fuse_final_stats": TWO_CTAS,
-            "two_cta_fuse_acc_slices": TWO_CTAS,
         } if MMA_SLICES == 2 else None),
         two_ctas=TWO_CTAS,
     )
@@ -161,8 +158,10 @@ def _attn_fwd_subtile(
         # MMAs, and combine the independent row sums afterwards.
         qks = _split_n_2D(qk, MMA_SLICES)
         p0 = tl.math.exp2(qks[0])
+        p0_dot = p0.to(dtype)
         l_ij0 = tl.sum(p0, 1)
         p1 = tl.math.exp2(qks[1])
+        p1_dot = p1.to(dtype)
         l_ij1 = tl.sum(p1, 1)
         l_ij = l_ij0 + l_ij1
     else:
@@ -194,7 +193,7 @@ def _attn_fwd_subtile(
         acc = tl.dot(p, v0, acc, two_ctas=TWO_CTAS)
     else:
         if FADD2_REDUCE:
-            ps = (p0.to(dtype), p1.to(dtype))
+            ps = (p0_dot, p1_dot)
         else:
             p = p.to(dtype)
             ps = _split_n_2D(p, MMA_SLICES)
@@ -215,12 +214,6 @@ def _attn_fwd_subtile(
             attrs={
                 "two_cta_interleave_role": "pv" if TWO_CTAS else None,
                 "channels": ["opndA,tmem,1,0,64"],
-                # Inner-warp-specialized (non-persistent) schedules keep both
-                # slices adjacent in one partition, so the first rendezvous
-                # covers the second.  Persistent schedules pipeline the
-                # shared V allocation across iterations and need the second
-                # rendezvous before that slot can rotate.
-                "two_cta_sync_covered_by_prior": TWO_CTAS and INNER_WARP_SPECIALIZE,
             },
             two_ctas=TWO_CTAS,
         )

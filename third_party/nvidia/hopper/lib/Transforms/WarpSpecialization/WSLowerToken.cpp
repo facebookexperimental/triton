@@ -12,6 +12,7 @@
 #include "triton/Dialect/Triton/IR/Types.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "llvm/ADT/STLExtras.h"
@@ -85,6 +86,26 @@ Value getMBarrierPhaseBit(OpBuilder &builder, Operation *op,
   return curPhase;
 }
 
+static void propagatePhaseOperandStageOffset(Operation *source,
+                                             unsigned sourcePhaseOperand,
+                                             Operation *target,
+                                             unsigned targetPhaseOperand) {
+  auto offsets = source->getAttrOfType<DenseI32ArrayAttr>(
+      tt::kLoopOperandStageOffsetsAttrName);
+  if (!offsets)
+    return;
+  assert(offsets.size() == source->getNumOperands() &&
+         "invalid operand stage offset annotation");
+  for (auto [index, offset] : llvm::enumerate(offsets.asArrayRef()))
+    assert((index == sourcePhaseOperand || offset == 0) &&
+           "token lowering only preserves a phase operand stage offset");
+
+  SmallVector<int32_t> targetOffsets(target->getNumOperands(), 0);
+  targetOffsets[targetPhaseOperand] = offsets.asArrayRef()[sourcePhaseOperand];
+  target->setAttr(tt::kLoopOperandStageOffsetsAttrName,
+                  DenseI32ArrayAttr::get(target->getContext(), targetOffsets));
+}
+
 void processProducerAcquireOp(OpBuilder &builder, ttnvws::ProducerAcquireOp op,
                               Value bufferEmpty) {
   auto loc = op.getLoc();
@@ -97,6 +118,9 @@ void processProducerAcquireOp(OpBuilder &builder, ttnvws::ProducerAcquireOp op,
   assert(op.getOperation()->hasAttr("async_task_id"));
   setAsyncTaskIds(waitOp, getAsyncTaskIds(op.getOperation()));
   copyLoopScheduleInfo(waitOp, op);
+  propagatePhaseOperandStageOffset(op, op.getPhaseMutable().getOperandNumber(),
+                                   waitOp,
+                                   waitOp.getPhaseMutable().getOperandNumber());
 }
 
 void processProducerCommitOp(OpBuilder &builder, ttnvws::ProducerCommitOp op,
