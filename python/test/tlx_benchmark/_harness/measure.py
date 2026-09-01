@@ -165,7 +165,7 @@ def relative_interdecile_range(values, median: Optional[float] = None) -> Option
     return (deciles[8] - deciles[0]) / med
 
 
-def percentiles(values, wanted=(50, 95, 99)) -> tuple:
+def percentiles(values, wanted=(50, 90, 99)) -> tuple:
     """Nearest-rank percentiles, so every returned value is an observed sample.
 
     Interpolating would invent a latency the kernel never produced, which is
@@ -195,7 +195,7 @@ def summarize(replicates: list[list[float]], remove_outliers: bool = True) -> St
     pooled = [x for k in kept_per_replicate for x in k]
 
     mean = statistics.median_low(means)
-    p50, p95, p99 = percentiles(pooled, (50, 95, 99))
+    p50, p90, p99 = percentiles(pooled, (50, 90, 99))
     cv = (statistics.stdev(pooled) / mean) if len(pooled) > 1 and mean else 0.0
     rel_idr = relative_interdecile_range(pooled, p50) if p50 else float("inf")
     if len(means) > 1 and mean:
@@ -207,7 +207,7 @@ def summarize(replicates: list[list[float]], remove_outliers: bool = True) -> St
         mean=mean,
         cv=cv,
         p50=p50,
-        p95=p95,
+        p90=p90,
         p99=p99,
         min=min(pooled),
         max=max(pooled),

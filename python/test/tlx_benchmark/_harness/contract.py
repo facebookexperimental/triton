@@ -92,7 +92,7 @@ class Stat:
     #: distribution rather than the worst descheduled iteration.
     cv: float
     p50: float
-    p95: float
+    p90: float
     p99: float
     min: float
     max: float

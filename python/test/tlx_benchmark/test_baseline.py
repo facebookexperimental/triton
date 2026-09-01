@@ -121,12 +121,11 @@ def test_table_reports_compile_time_replicates_and_throughput_error():
     rendered = report_mod.table([r])
 
     header, _, row = rendered.splitlines()[:3]
-    for column in ("input", "tlx mean", "TFLOP/s", "+-TF/s", "CV%", "reps", "compile"):
+    for column in ("input", "ref mean", "tlx mean", "speedup", "compile", "reps", "CV%", "p50", "p90", "p99"):
         assert column in header
-    assert "shape" not in header and "rIDR" not in header
+    assert "shape" not in header and "TF/s" not in header
 
     assert "0.69s" in row  # sub-10s compile keeps two decimals
-    assert " 1004 " in row  # throughput is a bare value, error lives elsewhere
     assert "3" in row  # replicate count
 
 
@@ -153,10 +152,9 @@ def test_input_column_is_op_supplied_and_defined_in_the_legend():
     assert "input  = (M x K) @ (K x N), with operand layouts" in rendered
 
 
-def test_percentile_table_shows_the_tail_with_its_ratio():
+def test_one_table_carries_the_tail_too():
+    """A single row, not a summary table plus a percentile table."""
     r = judge(BIG, TLX, REF, tlx_host_us=HOST_US)
     rendered = report_mod.render([r], env={})
-    assert "Percentiles (microseconds):" in rendered
-    header = [ln for ln in rendered.splitlines() if "tlx p99" in ln][0]
-    for column in ("tlx p50", "tlx p95", "tlx p99", "p99/p50", "ref p50"):
-        assert column in header
+    assert "Percentiles" not in rendered
+    assert len([ln for ln in rendered.splitlines() if ln.startswith("-" * 20)]) == 1

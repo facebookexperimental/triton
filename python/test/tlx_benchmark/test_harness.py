@@ -159,9 +159,9 @@ def test_percentiles_are_observed_samples_not_interpolations():
     from _harness import percentiles
 
     values = [1.0] * 98 + [5.0, 9.0]
-    p50, p95, p99 = percentiles(values)
-    assert (p50, p95, p99) == (1.0, 1.0, 5.0)
-    assert all(v in values for v in (p50, p95, p99))
+    p50, p90, p99 = percentiles(values)
+    assert (p50, p90, p99) == (1.0, 1.0, 5.0)
+    assert all(v in values for v in (p50, p90, p99))
 
 
 def test_summarize_reports_the_tail():

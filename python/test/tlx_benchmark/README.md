@@ -187,9 +187,10 @@ torch indices are remapped by `CUDA_VISIBLE_DEVICES` while NVML and
 A run reports `mean` and `CV%` (`sd/mean` over the within-run samples, after IQR
 rejection) because that is the conventional way to summarize a latency
 distribution and it compares across kernels of wildly different absolute speed.
-A separate table gives p50/p95/p99 and the p99/p50 ratio, because a mean and a
-CV together still cannot show a tail: two kernels can match on both and differ
-entirely at p99.
+The same row carries p50/p90/p99, because a mean and a CV together still cannot
+show a tail: two kernels can match on both and differ entirely at p99.
+Percentiles are nearest-rank, so every printed value is a latency the kernel
+actually produced rather than an interpolation between two it did not.
 
 The **gate** reads neither. It reads `rel_max_deviation` -- the between-run
 deviation of the replicate means -- because that is the uncertainty on the

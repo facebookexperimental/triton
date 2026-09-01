@@ -88,7 +88,7 @@ def save(op: str, arch: str, results: Sequence[Result], env: dict) -> pathlib.Pa
                 "tlx_mean_ms": r.tlx.mean if r.tlx else None,
                 "ref_mean_ms": r.ref.mean if r.ref else None,
                 "tlx_p50_ms": r.tlx.p50 if r.tlx else None,
-                "tlx_p95_ms": r.tlx.p95 if r.tlx else None,
+                "tlx_p90_ms": r.tlx.p90 if r.tlx else None,
                 "tlx_p99_ms": r.tlx.p99 if r.tlx else None,
                 "tlx_tflops": r.tlx_tflops,
                 "t_cold_s": r.t_cold_s,
