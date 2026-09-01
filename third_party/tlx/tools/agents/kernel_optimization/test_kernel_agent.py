@@ -422,11 +422,11 @@ class HarnessTest(unittest.TestCase):
             performance = StandaloneHarness(harness_path).evaluate(
                 "source",
                 (InputCase("shape/128?case", {}),),
-                KernelTarget("fake", "fake"),
+                KernelTarget("cuda", "blackwell"),
                 benchmark_repetitions=2,
                 profile=ProfileRequest(
                     level="deep",
-                    tools=("ncu",),
+                    tools=("native_profiler",),
                     experiment_id="r001-c000",
                     artifacts_dir=artifacts_dir,
                     reason="unit test",
@@ -460,11 +460,11 @@ class HarnessTest(unittest.TestCase):
             performance = SubprocessHarness(harness_path, timeout_seconds=30.0).evaluate(
                 "source",
                 (InputCase("case a", {}),),
-                KernelTarget("fake", "fake"),
+                KernelTarget("cuda", "blackwell"),
                 benchmark_repetitions=2,
                 profile={
                     "level": "summary",
-                    "tools": ["proton"],
+                    "tools": ["proton_launch", "native_profiler"],
                     "experiment_id": "baseline",
                     "artifacts_dir": str(artifacts_dir),
                     "reason": "unit test",
@@ -474,7 +474,7 @@ class HarnessTest(unittest.TestCase):
             self.assertEqual(profile["case_id"], "case a")
             self.assertTrue(profile["exists"])
             request = profile["request"]
-            self.assertEqual(request["tools"], ["proton"])
+            self.assertEqual(request["tools"], ["proton_launch", "ncu"])
             self.assertEqual(Path(str(request["artifacts_dir"])).parent, artifacts_dir)
 
     def test_large_profile_spills_to_raw_profile_when_artifacts_dir_available(self) -> None:

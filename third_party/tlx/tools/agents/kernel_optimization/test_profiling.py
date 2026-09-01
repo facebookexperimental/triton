@@ -15,6 +15,7 @@ from .profiling import (
     parse_ncu_query_metrics,
     parse_proton_launch_attribution,
     per_case_profile_request,
+    resolve_profile_request_for_target,
     resolve_profile_tools,
     select_ncu_metric_names,
 )
@@ -78,6 +79,21 @@ class ProfileRequestTest(unittest.TestCase):
         self.assertEqual(
             resolve_profile_tools(("native_profiler",)),
             ("native_profiler",),
+        )
+
+    def test_resolves_native_profiler_for_target_backend(self) -> None:
+        payload = ProfileRequest(
+            tools=("proton_launch", "native_profiler", "ncu"),
+        ).to_json()
+        cuda = resolve_profile_request_for_target(payload, {"backend": "cuda"})
+        assert cuda is not None
+        self.assertEqual(cuda["tools"], ["proton_launch", "ncu"])
+
+        amd = resolve_profile_request_for_target(payload, {"backend": "hip"})
+        assert amd is not None
+        self.assertEqual(
+            amd["tools"],
+            ["proton_launch", "native_profiler", "ncu"],
         )
 
     def test_per_case_profile_request_expands_absolute_dir(self) -> None:

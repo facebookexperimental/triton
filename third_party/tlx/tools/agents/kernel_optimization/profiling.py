@@ -229,6 +229,24 @@ def resolve_profile_tools(
     return tuple(resolved)
 
 
+def resolve_profile_request_for_target(
+    request_payload: Mapping[str, Any] | bool | None,
+    target: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    request = normalize_profile_request(request_payload)
+    if request is None:
+        return None
+    backend = str(target.get("backend", "")).strip().lower()
+    native_profiler = "ncu" if backend in {"cuda", "nvidia"} else None
+    return replace(
+        request,
+        tools=resolve_profile_tools(
+            request.tools,
+            native_profiler=native_profiler,
+        ),
+    ).to_json()
+
+
 def profile_accepts_request(profile_fn: Callable[..., Any]) -> bool:
     try:
         signature = inspect.signature(profile_fn)

@@ -28,6 +28,7 @@ from .profiling import (
     invoke_profile,
     per_case_profile_request,
     profile_request_to_json,
+    resolve_profile_request_for_target,
 )
 
 
@@ -92,7 +93,10 @@ class SubprocessHarness:
             "cases": to_json_value(cases),
             "target": to_json_value(target),
             "benchmark_repetitions": benchmark_repetitions,
-            "profile": profile_request_to_json(profile),
+            "profile": resolve_profile_request_for_target(
+                profile_request_to_json(profile),
+                to_json_value(target),  # type: ignore[arg-type]
+            ),
         }
         worker_path = Path(__file__).with_name("worker.py")
         environment = os.environ.copy()
@@ -190,7 +194,10 @@ class StandaloneHarness:
         # Reuse worker normalization helpers for consistency.
         from .worker import _normalize_build, _normalize_timing, _normalize_verification
 
-        profile_payload_root = profile_request_to_json(profile)
+        profile_payload_root = resolve_profile_request_for_target(
+            profile_request_to_json(profile),
+            target_dict,
+        )
         build_result = harness.build(kernel_source, dict(target_dict))  # type: ignore[arg-type]
         success, artifact, diagnostics = _normalize_build(build_result)
         if not success:
