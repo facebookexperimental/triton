@@ -21,10 +21,11 @@ or under pytest, for the junitxml that the existing b200 reporting consumes::
     CUDA_VISIBLE_DEVICES=0 third_party/tlx/denoise.sh \\
         python -m pytest python/test/tlx_benchmark/bench_mm.py
 
-``--measure`` matters. ``latency`` is minutes; ``compile`` is roughly four
-minutes *per case* at ``--space full``, because a cold first call to
-``tlx.ops.mm`` autotunes several hundred configs. They are separate modes so
-that the fast one stays fast.
+``--measure`` defaults to ``all``: latency and cold-compile together, which at
+the default ``--space heuristic`` costs about 0.7s of extra cold compile per
+case. At ``--space full`` the cold pass instead costs roughly four minutes *per
+case*, because a first call autotunes several hundred configs -- hence the
+separate ``latency`` mode.
 """
 
 from __future__ import annotations
@@ -140,8 +141,10 @@ def supported() -> bool:
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--measure", choices=("latency", "compile", "all"), default="latency",
-                        help="latency is minutes; compile is ~4 min per case at --space full")
+    parser.add_argument(
+        "--measure", choices=("latency", "compile", "all"), default="all",
+        help="'all' is the default and is cheap at --space heuristic (~0.7s of cold "
+        "compile per case); at --space full the cold pass costs ~4 min PER CASE")
     parser.add_argument("--space", choices=("full", "heuristic", "smoke"), default="heuristic",
                         help="autotune search space; 'heuristic' is what tlx.ops.mm now uses by default")
     parser.add_argument("--dtype", choices=("fp16", "bf16", "both"), default="both")

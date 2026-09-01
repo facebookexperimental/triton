@@ -22,7 +22,7 @@ CUDA_VISIBLE_DEVICES=0 third_party/tlx/denoise.sh \
 
 | flag | choices | meaning |
 |---|---|---|
-| `--measure` | `latency` `compile` `all` | `latency` is minutes; `compile` is ~4 min **per case** at `--space full` |
+| `--measure` | `all` `latency` `compile` | defaults to `all`; cheap at `--space heuristic` (~0.7 s cold compile per case), ~4 min **per case** at `--space full` |
 | `--space` | `full` `heuristic` `smoke` | defaults to `heuristic`, matching `tlx.ops.mm` |
 | `--dtype` | `fp16` `bf16` `both` | |
 | `--guard` | `off` `report` `enforce` | `enforce` exits non-zero on a regression or compile-cap breach |

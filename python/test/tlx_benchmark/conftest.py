@@ -8,8 +8,10 @@ interfaces that drift.
 
 def pytest_addoption(parser):
     group = parser.getgroup("tlx-benchmark")
-    group.addoption("--measure", choices=("latency", "compile", "all"), default="latency",
-                    help="latency is minutes; compile is ~4 min per case at --space full")
+    group.addoption(
+        "--measure", choices=("latency", "compile", "all"), default="all",
+        help="'all' is cheap at --space heuristic (~0.7s cold compile per case); "
+        "at --space full the cold pass costs ~4 min PER CASE")
     group.addoption("--space", choices=("full", "heuristic", "smoke"), default="heuristic",
                     help="autotune search space; 'heuristic' is what tlx.ops.mm now uses by default")
     group.addoption("--guard", choices=("off", "report", "enforce"), default="report",
