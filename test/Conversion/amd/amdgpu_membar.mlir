@@ -330,4 +330,57 @@ tt.func @missing_barrier_reused_allocation(%A: !tt.ptr<f16>, %B: !tt.ptr<f16>) {
   tt.return
 }
 
+// tlx.workgroup_barrier lowers to `rocdl.sched.barrier none; ttg.barrier local;
+// rocdl.sched.barrier none`. When Membar scans forward from an async wait for a
+// sync point it must look THROUGH the scheduling-only sched fences to reach the
+// real ttg.barrier; otherwise it treats the first sched fence as a stopping
+// point and inserts a redundant barrier right after the wait, doubling the
+// workgroup barrier in a hand-rolled ping-pong. Here the wait is immediately
+// followed by the sched/barrier bracket, so the forward scan actually reaches
+// the sched fences (this fails without the look-through: an extra
+// `ttg.barrier local` appears between the async_wait and the first sched fence).
+// CHECK-LABEL: workgroup_barrier_after_async_wait_needs_no_barrier
+tt.func @workgroup_barrier_after_async_wait_needs_no_barrier(%A: !tt.ptr<f16>) {
+  %offset = arith.constant dense<0> : tensor<128x32xi32, #AL>
+  %alloc = ttg.local_alloc {allocation.offset = 0 : i32} : () -> !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  %async1 = amdg.buffer_load_to_local %A[%offset] into %alloc : <f16>[tensor<128x32xi32, #AL>] -> <128x32xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  %token1 = ttg.async_commit_group tokens %async1
+  %wait1 = amdg.async_wait %token1 {num_inst = 0 : i32}
+  // No barrier is inserted between the async wait and the workgroup barrier; the
+  // wait's deferred barrier is satisfied by the real ttg.barrier below.
+  // CHECK: amdg.async_wait
+  // CHECK-NOT: ttg.barrier local
+  // CHECK: rocdl.sched.barrier
+  // CHECK-NEXT: ttg.barrier local
+  // CHECK-NEXT: rocdl.sched.barrier
+  // CHECK-NOT: ttg.barrier local
+  rocdl.sched.barrier none
+  ttg.barrier local
+  rocdl.sched.barrier none
+  %read = ttg.local_load %alloc token %wait1 {ttg.amdg.syncedViaAsyncWait = true} : !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable> -> tensor<128x32xf16, #AL>
+  tt.return
+}
+
+// A lone scheduling fence is NOT a sync point. After looking through the sched
+// fence the forward scan reaches the local_load's memory effect with no real
+// ttg.barrier in between, so Membar must still insert a barrier after the wait.
+// This guards the look-through against over-suppressing genuinely needed
+// barriers.
+// CHECK-LABEL: lone_sched_fence_still_needs_barrier
+tt.func @lone_sched_fence_still_needs_barrier(%A: !tt.ptr<f16>) {
+  %offset = arith.constant dense<0> : tensor<128x32xi32, #AL>
+  %alloc = ttg.local_alloc {allocation.offset = 0 : i32} : () -> !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  %async1 = amdg.buffer_load_to_local %A[%offset] into %alloc : <f16>[tensor<128x32xi32, #AL>] -> <128x32xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  %token1 = ttg.async_commit_group tokens %async1
+  %wait1 = amdg.async_wait %token1 {num_inst = 0 : i32}
+  // The wait's deferred barrier is inserted before the lone sched fence.
+  // CHECK: amdg.async_wait
+  // CHECK-NEXT: ttg.barrier local
+  // CHECK-NEXT: rocdl.sched.barrier
+  // CHECK-NEXT: ttg.local_load
+  rocdl.sched.barrier none
+  %read = ttg.local_load %alloc token %wait1 {ttg.amdg.syncedViaAsyncWait = true} : !ttg.memdesc<128x32xf16, #A_SHARED, #ttg.shared_memory, mutable> -> tensor<128x32xf16, #AL>
+  tt.return
+}
+
 }
