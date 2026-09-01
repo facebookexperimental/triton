@@ -12,6 +12,7 @@ from .harness import HarnessExecutionError, SubprocessHarness
 from .models import (
     InputCase,
     KernelOptimizationRequest,
+    KernelOptimizationResult,
     KernelTarget,
     OptimizationBudget,
     passes_protected_cases,
@@ -224,6 +225,55 @@ def _validate_host_matches_target(
         )
 
 
+def _commit_body(result: KernelOptimizationResult) -> str:
+    baseline_by_id = {case.case_id: case for case in result.baseline.cases}
+    rows: list[tuple[str, str, str, str, str, str, str]] = []
+    for winner in result.final.cases:
+        baseline = baseline_by_id.get(winner.case_id)
+        baseline_timing = baseline.timing if baseline else None
+        winner_timing = winner.timing
+        if baseline_timing is not None and winner_timing is not None:
+            speedup = baseline_timing.median_us / winner_timing.median_us
+            baseline_us = f"{baseline_timing.median_us:.2f}"
+            winner_us = f"{winner_timing.median_us:.2f}"
+            speedup_text = f"{speedup:.4f}x"
+            baseline_cv = f"{100.0 * baseline_timing.coefficient_of_variation:.2f}%"
+            winner_cv = f"{100.0 * winner_timing.coefficient_of_variation:.2f}%"
+        else:
+            baseline_us = winner_us = speedup_text = baseline_cv = winner_cv = "n/a"
+        rows.append(
+            (
+                winner.case_id,
+                baseline_us,
+                winner_us,
+                speedup_text,
+                baseline_cv,
+                winner_cv,
+                "pass" if winner.verification.passed else "fail",
+            )
+        )
+
+    headers = ("Case", "Baseline us", "Winner us", "Speedup", "Base CV", "Winner CV", "Correct")
+    widths = [len(header) for header in headers]
+    for row in rows:
+        for index, value in enumerate(row):
+            widths[index] = max(widths[index], len(value))
+
+    def format_row(row: tuple[str, ...]) -> str:
+        return "  ".join(value.ljust(widths[index]) for index, value in enumerate(row)).rstrip()
+
+    table = [format_row(headers), format_row(tuple("-" * width for width in widths))]
+    table.extend(format_row(row) for row in rows)
+    validation = (
+        "Performance:\n"
+        f"Final revalidation for {result.winner_experiment_id}:\n"
+        + "\n".join(table)
+        + f"\nWeighted aggregate speedup: {result.final.aggregate_speedup:.4f}x."
+    )
+    summary = result.winner_commit_summary.strip()
+    return f"{summary}\n\n{validation}" if summary else validation
+
+
 def _report_commit(commit_result: object) -> None:
     result = commit_result
     parts = [
@@ -288,13 +338,15 @@ def main() -> int:
     )
     kernel_path = args.kernel.resolve()
     kernel_source = kernel_path.read_text()
-    commit_subject = args.commit_message or f"Optimize {kernel_path.name} with TLX agent"
+    fallback_commit_subject = f"Optimize {kernel_path.name} with TLX agent"
     commit_snapshot = None
     if args.commit_winner:
         try:
             commit_snapshot = prepare_auto_commit(kernel_path, kernel_source, args.vcs)
         except Exception as error:  # noqa: BLE001
-            commit_result = failed_auto_commit(None, commit_subject, error)
+            commit_result = failed_auto_commit(
+                None, args.commit_message or fallback_commit_subject, error
+            )
             _report_commit(commit_result)
             print(json.dumps(to_json_value(commit_result), indent=2, sort_keys=True))
             return 3
@@ -313,6 +365,11 @@ def main() -> int:
     exit_code = 0 if result.success else 2
     if args.commit_winner and result.success:
         assert commit_snapshot is not None
+        commit_subject = (
+            args.commit_message
+            or result.winner_commit_title
+            or fallback_commit_subject
+        )
 
         def validate_committed_source(committed_source: str) -> None:
             harness = SubprocessHarness(harness_path, budget.max_candidate_seconds)
@@ -335,6 +392,7 @@ def main() -> int:
                 commit_snapshot,
                 result.best_kernel,
                 commit_subject,
+                body=_commit_body(result),
                 validate_committed_source=validate_committed_source,
             )
         except Exception as error:  # noqa: BLE001

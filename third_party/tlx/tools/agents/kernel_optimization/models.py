@@ -176,6 +176,8 @@ class ExperimentSummary:
     evidence: str = ""
     expected_effect: str = ""
     risk: str = ""
+    commit_title: str = ""
+    commit_summary: str = ""
     profile_path: Path | None = None
 
 
@@ -204,6 +206,9 @@ class KernelOptimizationResult:
     experiments: tuple[ExperimentSummary, ...]
     artifacts_dir: Path
     stopping_reason: str
+    winner_experiment_id: str = "baseline"
+    winner_commit_title: str = ""
+    winner_commit_summary: str = ""
     auto_commit: AutoCommitResult | None = None
 
 
