@@ -121,12 +121,12 @@ def test_table_reports_compile_time_replicates_and_throughput_error():
     rendered = report_mod.table([r])
 
     header, _, row = rendered.splitlines()[:3]
-    for column in ("input", "ref mean", "tlx mean", "speedup", "compile", "reps", "CV%", "p50", "p90", "p99"):
+    for column in ("input", "ref us", "tlx us", "speedup", "compile", "reps", "CV%", "p50 us", "p90 us", "p99 us"):
         assert column in header
     assert "shape" not in header and "TF/s" not in header
 
     assert "0.69s" in row  # sub-10s compile keeps two decimals
-    assert "3" in row  # replicate count
+    assert "3x120" in row  # 3 replicates of 120 timed iterations each
 
 
 def test_table_marks_compile_as_absent_when_not_measured():
@@ -158,3 +158,22 @@ def test_one_table_carries_the_tail_too():
     rendered = report_mod.render([r], env={})
     assert "Percentiles" not in rendered
     assert len([ln for ln in rendered.splitlines() if ln.startswith("-" * 20)]) == 1
+
+
+def test_speedup_direction_is_stated_and_correct():
+    """`ref us / tlx us`, so >1 means TLX is faster.
+
+    The direction is only checkable if the reader knows these are latencies
+    rather than throughput -- under the throughput reading the column looks
+    inverted -- so the units are in the headers and the definition is in the
+    legend.
+    """
+    faster = judge(BIG, summarize([[1.0] * 120] * 3), summarize([[2.0] * 120] * 3), tlx_host_us=HOST_US)
+    slower = judge(BIG, summarize([[2.0] * 120] * 3), summarize([[1.0] * 120] * 3), tlx_host_us=HOST_US)
+    assert faster.speedup == pytest.approx(2.0)
+    assert slower.speedup == pytest.approx(0.5)
+
+    rendered = report_mod.render([faster], env={})
+    assert "ref us" in rendered and "tlx us" in rendered
+    assert "speedup = ref us / tlx us" in rendered
+    assert "MICROSECONDS" in rendered

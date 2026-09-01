@@ -45,6 +45,17 @@ _WARMUP_REP_BY_ESTIMATE = ((1.0, (25, 100)), (10.0, (25, 100)), (float("inf"), (
 DEFAULT_WARMUP_MS = 3000
 DEFAULT_REP_MS = 3000
 
+#: Timed kernel executions per replicate, floor.
+#:
+#: The 3s window already delivers far more than this for anything fast -- a
+#: 1095us kernel gets ~2700 iterations, a 52us one ~57000 -- but the window is
+#: a *time* budget, so a slow kernel silently gets fewer. At 3ms per call the
+#: window yields exactly 1000; anything slower would fall under it. Raising the
+#: window to hold the floor costs wall clock only for kernels that are already
+#: slow, and it keeps the sample count from quietly depending on how fast the
+#: kernel happens to be.
+MIN_ITERS_PER_REPLICATE = 1000
+
 #: Number of independent measurement replicates per case.
 #:
 #: This is the only thing that measures the quantity the guard depends on --
@@ -252,20 +263,25 @@ def measure(fn: Callable, *, warmup: Optional[int] = None, rep: Optional[int] = 
 
     The measurement is repeated ``replicates`` times because that, and only
     that, measures the quantity the guard depends on: how reproducible the
-    reported p50 is. Each replicate re-warms, so between-replicate variation
-    picks up the slow drift a single long window cannot see.
+    reported mean is. Each replicate re-warms, so between-replicate variation
+    picks up the slow drift a single long window cannot see. Every replicate
+    times at least ``MIN_ITERS_PER_REPLICATE`` iterations.
 
     The window defaults to ``DEFAULT_WARMUP_MS`` / ``DEFAULT_REP_MS``. Pass
     ``auto_window=True`` to size it from a runtime estimate instead, which is
     tritonbench's default policy but under-warms sub-10ms kernels badly enough
     to dominate the result -- see ``DEFAULT_WARMUP_MS``.
     """
+    estimate_ms = estimate_runtime_ms(fn, grad_to_none=grad_to_none)
     if auto_window:
-        estimate_ms = estimate_runtime_ms(fn, grad_to_none=grad_to_none)
         warmup_ms, rep_ms = resolve_warmup_and_rep(warmup, rep, estimate_ms)
     else:
         warmup_ms = DEFAULT_WARMUP_MS if warmup is None else warmup
         rep_ms = DEFAULT_REP_MS if rep is None else rep
+    if rep is None and estimate_ms:
+        # do_bench derives its iteration count as rep_ms / estimate_ms, so this
+        # is how a minimum sample count is expressed to it.
+        rep_ms = max(rep_ms, MIN_ITERS_PER_REPLICATE * estimate_ms)
     runs = [
         triton.testing.do_bench(fn, warmup=warmup_ms, rep=rep_ms, grad_to_none=grad_to_none, return_mode="all")
         for _ in range(max(1, replicates))

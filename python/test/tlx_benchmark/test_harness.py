@@ -171,3 +171,17 @@ def test_summarize_reports_the_tail():
     assert stat.p50 == 1.0
     assert stat.p99 == 5.0
     assert stat.p99 / stat.p50 == 5.0
+
+
+def test_min_iterations_floor_is_expressed_as_a_time_window():
+    """do_bench takes a time budget, so a sample-count floor has to be
+    translated into one. Without it a slow kernel silently gets fewer samples
+    than a fast one, and the sample count depends on the thing being measured.
+    """
+    from _harness import MIN_ITERS_PER_REPLICATE
+
+    assert MIN_ITERS_PER_REPLICATE >= 1000
+    # At the default window a 3ms kernel lands exactly on the floor; anything
+    # slower needs the window widened to hold it.
+    assert DEFAULT_REP_MS / 3.0 == MIN_ITERS_PER_REPLICATE
+    assert max(DEFAULT_REP_MS, MIN_ITERS_PER_REPLICATE * 10.0) == 10000

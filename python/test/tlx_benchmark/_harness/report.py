@@ -37,6 +37,21 @@ def _fmt_us(stat) -> str:
     return _us(stat.mean) if stat else "        -"
 
 
+def _fmt_reps(result) -> str:
+    """``10x2740`` -- replicates, and timed iterations within each.
+
+    Both numbers matter and neither substitutes for the other: the iteration
+    count is what makes one replicate's mean precise, and the replicate count
+    is what makes the reported mean reproducible. Showing only the first
+    flatters a drifting machine; showing only the second reads as if the whole
+    result rested on ten samples.
+    """
+    if not result.tlx:
+        return "-"
+    per = result.tlx.n_kept // max(1, result.tlx.replicates)
+    return f"{result.tlx.replicates}x{per}"
+
+
 def _fmt_cv(result) -> str:
     """Coefficient of variation of the within-run samples, as a percentage."""
     return f"{result.tlx.cv * 100:.1f}" if result.tlx else "-"
@@ -50,15 +65,15 @@ def _fmt_compile(result) -> str:
 
 def table(results: Sequence[Result]) -> str:
     lines = [
-        f"{'input':<34} {'dtype':<8} {'ref mean':>9} {'tlx mean':>9} {'speedup':>8} {'compile':>8} "
-        f"{'reps':>4} {'CV%':>6} {'p50':>9} {'p90':>9} {'p99':>9}  status",
+        f"{'input':<34} {'dtype':<8} {'ref us':>9} {'tlx us':>9} {'speedup':>8} {'compile':>8} "
+        f"{'reps':>10} {'CV%':>6} {'p50 us':>9} {'p90 us':>9} {'p99 us':>9}  status",
         "-" * 140,
     ]
     for r in results:
         lines.append(f"{r.case.input:<34} {r.case.dtype:<8} {_fmt_us(r.ref)} {_fmt_us(r.tlx)} "
                      f"{(f'{r.speedup:.3f}x' if r.speedup else '-'):>8} "
                      f"{_fmt_compile(r):>8} "
-                     f"{(str(r.tlx.replicates) if r.tlx else '-'):>4} "
+                     f"{_fmt_reps(r):>10} "
                      f"{_fmt_cv(r):>6} "
                      f"{(_us(r.tlx.p50) if r.tlx else '        -')} "
                      f"{(_us(r.tlx.p90) if r.tlx else '        -')} "
@@ -89,7 +104,11 @@ def write_json(results: Sequence[Result], env: dict, path: str | pathlib.Path) -
 
 
 #: Explains the columns whose meaning is not obvious from the header.
-LEGEND = ("latencies in microseconds. mean = median of the per-replicate means, the headline value.\n"
+LEGEND = ("Every latency column is MICROSECONDS, lower is better. `ref us` and `tlx us` are the mean\n"
+          "        (median of the per-replicate means); p50/p90/p99 are of the pooled samples.\n"
+          "speedup = ref us / tlx us, so >1 means TLX is faster. Stated because the direction is only\n"
+          "        checkable if you know these are latencies and not throughput.\n"
+          "reps = replicates x timed iterations each (>=1000 per replicate, enforced).\n"
           "CV%  = coefficient of variation within a run, sd/mean, after IQR rejection.\n"
           "The gate reads NEITHER CV nor the percentiles: it reads the between-run deviation of the\n"
           "replicate means, which is the uncertainty on the headline rather than the width of one run.\n"
