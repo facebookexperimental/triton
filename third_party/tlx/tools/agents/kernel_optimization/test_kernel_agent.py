@@ -6,7 +6,9 @@ import tempfile
 import unittest
 from contextlib import redirect_stderr
 from pathlib import Path
+from unittest.mock import Mock, patch
 
+from . import optimizer as optimizer_module
 from .cli import _parse_args, _resolve_harness_paths, _validate_host_matches_target
 from .harness import StandaloneHarness, SubprocessHarness
 from .models import (
@@ -662,6 +664,79 @@ class KernelOptimizerTest(unittest.TestCase):
             # Profile artifacts written by the optimizer.
             self.assertTrue((Path(directory) / "baseline_profile.json").exists())
             self.assertTrue((Path(directory) / "best_profile.json").exists())
+
+    def test_failed_final_revalidation_restores_baseline_best_profile(self) -> None:
+        baseline_source = "LATENCY_US = 100\nCORRECT = True\n"
+        candidate_source = "LATENCY_US = 80\nCORRECT = True\n"
+        baseline = PerformanceSummary(
+            cases=(
+                CaseEvaluation(
+                    case_id="a",
+                    verification=VerificationResult(True),
+                    timing=TimingSamples((100.0, 100.0)),
+                    profile={"marker": "baseline"},
+                ),
+            )
+        )
+        candidate = PerformanceSummary(
+            cases=(
+                CaseEvaluation(
+                    case_id="a",
+                    verification=VerificationResult(True),
+                    timing=TimingSamples((80.0, 80.0)),
+                    profile={"marker": "candidate"},
+                ),
+            )
+        )
+        rejected_final = PerformanceSummary(
+            cases=(
+                CaseEvaluation(
+                    case_id="a",
+                    verification=VerificationResult(True),
+                    timing=TimingSamples((120.0, 120.0)),
+                    profile={"marker": "rejected-final"},
+                ),
+            )
+        )
+        harness = Mock()
+        harness.evaluate.side_effect = [baseline, candidate, rejected_final]
+        provider = FixedCandidateProvider(
+            [CandidateProposal(candidate_source, "faster before final revalidation")]
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            output_dir = Path(directory)
+            with patch.object(
+                optimizer_module,
+                "SubprocessHarness",
+                return_value=harness,
+            ):
+                result = KernelOptimizer(provider).optimize(
+                    KernelOptimizationRequest(
+                        kernel_source=baseline_source,
+                        harness_path=output_dir / "unused_harness.py",
+                        cases=(InputCase("a", {}),),
+                        target=KernelTarget("fake", "fake"),
+                        budget=OptimizationBudget(
+                            max_rounds=1,
+                            candidates_per_round=1,
+                            min_speedup=1.01,
+                            benchmark_repetitions=2,
+                        ),
+                        output_dir=output_dir,
+                    )
+                )
+            baseline_profile = _read_json(output_dir / "baseline_profile.json")
+            best_profile = _read_json(output_dir / "best_profile.json")
+            final_profile = _read_json(output_dir / "experiments/final/profile.json")
+
+            self.assertFalse(result.success)
+            self.assertEqual(result.stopping_reason, "finalist_revalidation_failed")
+            self.assertEqual(result.best_kernel, baseline_source)
+            self.assertEqual(result.final.cases[0].profile["marker"], "baseline")
+            self.assertEqual((output_dir / "best_kernel.py").read_text(), baseline_source)
+            self.assertEqual(best_profile, baseline_profile)
+            self.assertEqual(final_profile, baseline_profile)
 
     def test_optimizer_uses_profile_policy_and_records_profile_paths(self) -> None:
         provider = FixedCandidateProvider(

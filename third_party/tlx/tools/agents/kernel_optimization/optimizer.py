@@ -600,6 +600,7 @@ class KernelOptimizer:
             best_source = request.kernel_source
             final_profile = baseline
             final_profiles = baseline_profiles
+            best_profiles = baseline_profiles
             best_experiment_id = "baseline"
             stopping_reason = "finalist_revalidation_failed"
         elif best_experiment_id != "baseline":
