@@ -260,6 +260,42 @@ def _profile_log_parts(profile: Mapping[str, Any]) -> list[str]:
     return parts
 
 
+def _rejection_feedback(
+    experiment_id: str,
+    proposal: object,
+    performance: PerformanceSummary,
+    baseline: PerformanceSummary,
+    cases: tuple[InputCase, ...],
+    decision: str,
+) -> str:
+    parts = [
+        f"{experiment_id}: rejected",
+        f"hypothesis={getattr(proposal, 'hypothesis', '')!r}",
+        f"change={getattr(proposal, 'summary', '')!r}",
+        f"decision={decision}",
+        f"aggregate_speedup={performance.aggregate_speedup:.4f}x",
+    ]
+    speedups = per_case_speedups(baseline, performance, cases)
+    for evaluation in performance.cases:
+        case_parts = [
+            evaluation.case_id,
+            "correct" if evaluation.verification.passed else "incorrect",
+        ]
+        if evaluation.timing is not None:
+            case_parts.extend(
+                (
+                    f"median={evaluation.timing.median_us:.3f}us",
+                    f"cv={evaluation.timing.coefficient_of_variation:.4f}",
+                )
+            )
+        speedup = speedups.get(evaluation.case_id)
+        if speedup is not None:
+            case_parts.append(f"speedup={speedup:.4f}x")
+        case_parts.extend(_profile_log_parts(evaluation.profile))
+        parts.append("case=" + ",".join(case_parts))
+    return " ".join(parts)[:4000]
+
+
 def _find_mapping_with_keys(
     value: Any,
     keys: frozenset[str],
@@ -514,14 +550,6 @@ class KernelOptimizer:
                         if not evaluation.verification.passed
                         and evaluation.verification.diagnostics
                     )
-                    if status == "rejected" and rejection_diagnostics:
-                        diagnostics.append(
-                            f"{experiment_id}: rejected: {rejection_diagnostics}"
-                        )
-                    if status == "rejected" and ncu_diagnostics:
-                        diagnostics.append(
-                            f"{experiment_id}: rejected: {ncu_diagnostics}"
-                        )
                     decision = (
                         "correct and exceeded speedup threshold"
                         if status == "promoted"
@@ -529,6 +557,17 @@ class KernelOptimizer:
                         or rejection_diagnostics
                         or f"speedup below {request.budget.min_speedup:.4f}x threshold"
                     )
+                    if status == "rejected":
+                        diagnostics.append(
+                            _rejection_feedback(
+                                experiment_id,
+                                proposal,
+                                performance,
+                                baseline,
+                                request.cases,
+                                decision,
+                            )
+                        )
                     _report_performance(
                         experiment_id,
                         status,

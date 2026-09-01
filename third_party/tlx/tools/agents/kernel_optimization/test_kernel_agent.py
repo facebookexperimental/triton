@@ -596,6 +596,61 @@ class KernelOptimizerTest(unittest.TestCase):
             self.assertIn("[tlx-agent] final status=revalidated", output)
             self.assertTrue(result.success)
 
+    def test_rejected_candidate_evidence_reaches_next_proposal(self) -> None:
+        contexts: list[CandidateContext] = []
+        proposals = [
+            CandidateProposal(
+                "LATENCY_US = 120\nCORRECT = True\n",
+                summary="increase tile size",
+                hypothesis="larger tiles improve reuse",
+            ),
+            CandidateProposal(
+                "LATENCY_US = 80\nCORRECT = True\n",
+                summary="reduce tile size",
+            ),
+        ]
+
+        class RecordingProvider:
+            def propose(
+                self,
+                request: KernelOptimizationRequest,
+                context: CandidateContext,
+            ) -> CandidateProposal:
+                del request
+                contexts.append(context)
+                return proposals.pop(0)
+
+        with tempfile.TemporaryDirectory() as directory:
+            result = KernelOptimizer(RecordingProvider()).optimize(
+                KernelOptimizationRequest(
+                    kernel_source="LATENCY_US = 100\nCORRECT = True\n",
+                    harness_path=Path(__file__).with_name("testdata")
+                    / "fake_harness.py",
+                    cases=(InputCase("a", {"scale": 1.0}),),
+                    target=KernelTarget("fake", "fake"),
+                    budget=OptimizationBudget(
+                        max_rounds=1,
+                        candidates_per_round=2,
+                        min_speedup=1.01,
+                        benchmark_repetitions=3,
+                    ),
+                    output_dir=Path(directory),
+                )
+            )
+
+        self.assertTrue(result.success)
+        self.assertEqual(len(contexts), 2)
+        feedback = contexts[1].previous_diagnostics[-1]
+        self.assertIn("r001-c000: rejected", feedback)
+        self.assertIn("hypothesis='larger tiles improve reuse'", feedback)
+        self.assertIn("change='increase tile size'", feedback)
+        self.assertIn("decision=speedup below 1.0100x threshold", feedback)
+        self.assertIn("aggregate_speedup=0.8333x", feedback)
+        self.assertIn("median=120.000us", feedback)
+        self.assertIn("cv=0.0000", feedback)
+        self.assertIn("speedup=0.8333x", feedback)
+        self.assertIn("ncu=unavailable", feedback)
+
     def test_continues_after_round_without_promotion(self) -> None:
         provider = FixedCandidateProvider(
             [
