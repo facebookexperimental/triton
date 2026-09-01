@@ -8,11 +8,13 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable
 
+from .harness import HarnessExecutionError, SubprocessHarness
 from .models import (
     InputCase,
     KernelOptimizationRequest,
     KernelTarget,
     OptimizationBudget,
+    passes_protected_cases,
     to_json_value,
 )
 from .optimizer import KernelOptimizer
@@ -311,9 +313,29 @@ def main() -> int:
     exit_code = 0 if result.success else 2
     if args.commit_winner and result.success:
         assert commit_snapshot is not None
+
+        def validate_committed_source(committed_source: str) -> None:
+            harness = SubprocessHarness(harness_path, budget.max_candidate_seconds)
+            validation = harness.evaluate(
+                committed_source,
+                cases,
+                target,
+                budget.benchmark_repetitions,
+            )
+            args.output_dir.joinpath("commit_revalidation.json").write_text(
+                json.dumps(to_json_value(validation), indent=2, sort_keys=True) + "\n"
+            )
+            if not passes_protected_cases(validation, cases):
+                raise HarnessExecutionError(
+                    "merged commit source failed one or more protected correctness cases"
+                )
+
         try:
             commit_result = commit_winner(
-                commit_snapshot, result.best_kernel, commit_subject
+                commit_snapshot,
+                result.best_kernel,
+                commit_subject,
+                validate_committed_source=validate_committed_source,
             )
         except Exception as error:  # noqa: BLE001
             commit_result = failed_auto_commit(commit_snapshot, commit_subject, error)

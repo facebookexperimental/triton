@@ -5,7 +5,7 @@ import subprocess
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Callable, Literal
 
 from .models import AutoCommitResult
 
@@ -314,10 +314,21 @@ def _commit_hg(
 
 
 def commit_winner(
-    snapshot: AutoCommitSnapshot, winner_source: str, subject: str
+    snapshot: AutoCommitSnapshot,
+    winner_source: str,
+    subject: str,
+    *,
+    validate_committed_source: Callable[[str], None] | None = None,
 ) -> AutoCommitResult:
     _verify_snapshot(snapshot)
     committed_source = merge_winner_delta(snapshot, winner_source)
+    if committed_source != winner_source:
+        if validate_committed_source is None:
+            raise AutoCommitError(
+                "dirty-target winner requires validation of the merged commit source"
+            )
+        validate_committed_source(committed_source)
+    _verify_snapshot(snapshot)
     if snapshot.vcs == "git":
         revision = _commit_git(snapshot, committed_source, winner_source, subject)
     else:

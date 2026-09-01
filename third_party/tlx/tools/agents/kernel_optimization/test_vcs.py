@@ -41,11 +41,19 @@ class GitAutoCommitTest(unittest.TestCase):
         (root / "dirty.txt").write_text("dirty\n")
         snapshot = prepare_auto_commit(kernel, baseline)
 
+        validated: list[str] = []
         result = commit_winner(
-            snapshot, "A = 2\nKEEP = 1\nKEEP2 = 1\nB = 2\n", "Tune kernel"
+            snapshot,
+            "A = 2\nKEEP = 1\nKEEP2 = 1\nB = 2\n",
+            "Tune kernel",
+            validate_committed_source=validated.append,
         )
 
         self.assertTrue(result.success)
+        self.assertEqual(
+            validated,
+            ["A = 1\nKEEP = 1\nKEEP2 = 1\nB = 2\n"],
+        )
         self.assertEqual(
             _run(["git", "show", "HEAD:kernels/kernel.py"], root),
             "A = 1\nKEEP = 1\nKEEP2 = 1\nB = 2\n",
@@ -59,6 +67,49 @@ class GitAutoCommitTest(unittest.TestCase):
             "kernels/kernel.py",
         )
         self.assertIn(ATTRIBUTION, _run(["git", "log", "-1", "--format=%B"], root))
+
+    def test_rejects_dirty_target_without_merged_source_validation(self) -> None:
+        temporary, root, kernel = self._repo()
+        self.addCleanup(temporary.cleanup)
+        kernel.write_text("A = 2\nKEEP = 1\nKEEP2 = 1\nB = 1\n")
+        snapshot = prepare_auto_commit(kernel, kernel.read_text())
+        before = _run(["git", "rev-parse", "HEAD"], root)
+
+        with self.assertRaisesRegex(AutoCommitError, "requires validation"):
+            commit_winner(
+                snapshot,
+                "A = 2\nKEEP = 1\nKEEP2 = 1\nB = 2\n",
+                "Tune kernel",
+            )
+
+        self.assertEqual(before, _run(["git", "rev-parse", "HEAD"], root))
+        self.assertEqual(
+            kernel.read_text(), "A = 2\nKEEP = 1\nKEEP2 = 1\nB = 1\n"
+        )
+
+    def test_rejects_dirty_target_when_merged_source_validation_fails(self) -> None:
+        temporary, root, kernel = self._repo()
+        self.addCleanup(temporary.cleanup)
+        kernel.write_text("A = 2\nKEEP = 1\nKEEP2 = 1\nB = 1\n")
+        snapshot = prepare_auto_commit(kernel, kernel.read_text())
+        before = _run(["git", "rev-parse", "HEAD"], root)
+
+        def reject(source: str) -> None:
+            self.assertEqual(source, "A = 1\nKEEP = 1\nKEEP2 = 1\nB = 2\n")
+            raise AutoCommitError("merged source failed correctness")
+
+        with self.assertRaisesRegex(AutoCommitError, "failed correctness"):
+            commit_winner(
+                snapshot,
+                "A = 2\nKEEP = 1\nKEEP2 = 1\nB = 2\n",
+                "Tune kernel",
+                validate_committed_source=reject,
+            )
+
+        self.assertEqual(before, _run(["git", "rev-parse", "HEAD"], root))
+        self.assertEqual(
+            kernel.read_text(), "A = 2\nKEEP = 1\nKEEP2 = 1\nB = 1\n"
+        )
 
     def test_rejects_overlapping_dirty_target(self) -> None:
         temporary, root, kernel = self._repo()
@@ -100,11 +151,19 @@ class HgAutoCommitTest(unittest.TestCase):
             other.write_text("dirty\n")
             snapshot = prepare_auto_commit(kernel, kernel.read_text())
 
+            validated: list[str] = []
             result = commit_winner(
-                snapshot, "A = 2\nKEEP = 1\nKEEP2 = 1\nB = 2\n", "Tune kernel"
+                snapshot,
+                "A = 2\nKEEP = 1\nKEEP2 = 1\nB = 2\n",
+                "Tune kernel",
+                validate_committed_source=validated.append,
             )
 
             self.assertTrue(result.success)
+            self.assertEqual(
+                validated,
+                ["A = 1\nKEEP = 1\nKEEP2 = 1\nB = 2\n"],
+            )
             self.assertEqual(
                 _run(["hg", "cat", "-r", ".", "kernel.py"], root),
                 "A = 1\nKEEP = 1\nKEEP2 = 1\nB = 2\n",
