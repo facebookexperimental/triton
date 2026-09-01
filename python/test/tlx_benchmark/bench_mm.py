@@ -99,7 +99,7 @@ def run_case(case: Case, *, space: str, measure_compile: bool, baseline: dict):
     return result
 
 
-def run(*, space="full", measure_compile=False, dtypes=("fp16", "bf16"), strict=False):
+def run(*, space="heuristic", measure_compile=False, dtypes=("fp16", "bf16"), strict=False):
     baseline = baseline_mod.load(OP, ARCH, space)
     env = capture_env()
     results = []
@@ -142,8 +142,8 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--measure", choices=("latency", "compile", "all"), default="latency",
                         help="latency is minutes; compile is ~4 min per case at --space full")
-    parser.add_argument("--space", choices=("full", "heuristic", "smoke"), default="full",
-                        help="autotune search space; 'full' is what tlx.ops.mm uses by default")
+    parser.add_argument("--space", choices=("full", "heuristic", "smoke"), default="heuristic",
+                        help="autotune search space; 'heuristic' is what tlx.ops.mm now uses by default")
     parser.add_argument("--dtype", choices=("fp16", "bf16", "both"), default="both")
     parser.add_argument("--guard", choices=("off", "report", "enforce"), default="report",
                         help="enforce exits non-zero on a regression or a compile-cap breach")

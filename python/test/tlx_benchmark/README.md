@@ -23,7 +23,7 @@ CUDA_VISIBLE_DEVICES=0 third_party/tlx/denoise.sh \
 | flag | choices | meaning |
 |---|---|---|
 | `--measure` | `latency` `compile` `all` | `latency` is minutes; `compile` is ~4 min **per case** at `--space full` |
-| `--space` | `full` `heuristic` `smoke` | `full` is what `tlx.ops.mm` uses by default |
+| `--space` | `full` `heuristic` `smoke` | defaults to `heuristic`, matching `tlx.ops.mm` |
 | `--dtype` | `fp16` `bf16` `both` | |
 | `--guard` | `off` `report` `enforce` | `enforce` exits non-zero on a regression or compile-cap breach |
 | `--json` | path | the machine-readable artifact |
@@ -204,19 +204,36 @@ diagnostic for whether the *machine* was steady.
 The cost is three replicates per provider per case, which is the only way to
 observe reproducibility at all.
 
-### Compile time: `space="full"` is over the cap by 2×
+### Compile time: `space="full"` was over the cap by 2×, so the default changed
 
-`tlx.ops.mm(a, b)` defaults to `space="full"`. On a cold Triton cache:
+`tlx.ops.mm(a, b)` used to default to `space="full"`. On a cold Triton cache:
 
 | shape | `t_cold` | compilations | configs benchmarked |
 |---|---|---|---|
 | 1024³ | 284.6 s | 350 | 348 |
 | 8192³ | 221.3 s | 252 | 300 |
 
-Against a 120 s cap, so a first call is 2× over. The cap is absolute rather
-than relative to a baseline because cuBLAS has no compile step to be worse
-than, and because a relative gate ratchets — three 15% regressions pass
-individually and double the wait.
+Against a 120 s cap, so a first call was 2× over. **`tlx.ops.mm` now defaults
+to `space="heuristic"`** — one analytically chosen config. Measured at 1024³ on
+the same box:
+
+| default | `t_cold` | compilations | configs |
+|---|---|---|---|
+| `space="heuristic"` (new default) | **0.69 s** | 2 | — |
+| `space="full"` (explicit opt-in) | 283.26 s | 349 | 348 |
+
+410× faster and comfortably inside the cap. The trade is real and is the
+caller's to make: tuned configs are worth up to ~4× on small shapes
+(1024³: 40.6 µs heuristic vs 10.4 µs full), so `space="full"` remains available.
+
+`flash_attn`, `hstu_attn` and `kimi_delta_attention` still default to `"full"`.
+Their only other space is `"smoke"`, which selects for lowering-path coverage
+rather than speed, so defaulting to it would quietly ship a bad config. Each
+needs its own `heuristic_config` before it can follow `mm`.
+
+The cap is absolute rather than relative to a baseline because cuBLAS has no
+compile step to be worse than, and because a relative gate ratchets — three 15%
+regressions pass individually and double the wait.
 
 `n_compiles` and `n_configs` come from `triton.knobs.compilation.listener` and
 `triton.knobs.autotuning.listener`, so they are op-agnostic and require no
@@ -240,12 +257,24 @@ This is an op inefficiency, not a harness problem — the workspace could be
 cached per `(shape, config)` like the L2 flush buffer already is. Not filed;
 out of scope for this suite, recorded here because the harness is what found it.
 
+### FIXED — split-K remainder tile
+
+`[1000, 1000, 1024]` and `[64, 4096, 4096]` were disabled for a split-K bug and
+are now **re-enabled**: fixed upstream by #3401 and verified on the rebase, both
+0.0% wrong, as is the smaller repro `[4160, 512, 512]` which measured 4.0% wrong
+before. They stay in the list as the regression test for that fix. L1 is 28
+tests in 19.6 s.
+
 ### TODO — `NUM_CTAS=2` is wrong whenever the grid has more than one N-tile
 
-Found by merging the perf shapes into the shared list: `1000000×512×512`
-failed L1 correctness immediately, and *not* for the known split-K reason —
-this one has `SPLIT_K=1`. 49.9% of output elements are wrong, which is almost
-exactly one CTA of each pair. Full measurement table and the control row are in
+**Still reproduces after #3401** — a different bug, with `SPLIT_K=1`. Found by
+merging the perf shapes into the shared list: `1000000×512×512` failed L1
+immediately. 49.9% of output elements are wrong, almost exactly one CTA of each
+pair. **Pre-existing, not a promotion artifact**: the identical 49.9%
+reproduces through the original tutorial entry point
+`blackwell_gemm_ws.matmul(a, b, config=get_heuristic_config(...))`. Status is
+**bypassed, not fixed** — the shape is commented out so a wrong-answer path
+cannot be benchmarked. Full measurement table and the control row are in
 `ops/kernels/mm/_shapes.py`; the shape is commented out there with a TODO.
 
 Two things make this worse than an ordinary correctness bug. The heuristic
@@ -275,18 +304,17 @@ host cost per call falls from ~56 µs to ~28 µs — exactly the predicted effec
 Tuned small shapes are also ~4× faster than the heuristic config picks
 (1024³: 40.6 µs → 10.4 µs), so the heuristic is leaving a lot on the table.
 
-### The committed baseline is `space="heuristic"`, and that is a stopgap
+### The committed baseline is `space="heuristic"`
 
 `baselines/mm.sm100.json` records 8 cases — the four compute-bound shapes in
 fp16 and bf16 — at 0.92–1.06× cuBLAS and ~1000–1073 TFLOP/s. The 16 host-bound
 cases are refused rather than recorded.
 
-It is a heuristic-space baseline because a full-space one is blocked by the
-leak above, and `space="full"` is what users actually get. `load()` therefore
-refuses to compare a baseline recorded at one space against a run at another:
-mm 1024³ is 40.6 µs at heuristic and 10.4 µs at full, so a cross-space
-comparison would report a 4× "regression" that is only a different search
-space. Re-record at full space once the leak is fixed.
+This now matches `tlx.ops.mm`'s own default, so the baseline describes the path
+users actually take. `load()` still refuses to compare a baseline recorded at
+one space against a run at another: mm 1024³ is 40.6 µs at heuristic and 10.4 µs
+at full, so a cross-space comparison would report a 4× "regression" that is only
+a different search space.
 
 ### Known limitation — the clock trace spans the whole run
 

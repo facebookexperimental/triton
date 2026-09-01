@@ -16,26 +16,16 @@ different code path AND moves the TMA 16-byte stride constraint to a different
 dimension: row-major A constrains K, column-major A constrains M. dtype is a
 separate parametrize axis in each suite.
 
-TODO(split-K remainder tile): ``[1000, 1000, 1024]`` and ``[64, 4096, 4096]``
-are commented out below because they FAIL correctness. Re-enable them with the
-fix -- they are the regression test for it.
-
-Split-K gives wrong results when M is not a multiple of BLOCK_SIZE_M: partials
-go into a (SPLIT_K * M, N) workspace that the reduction reads at fixed M
-strides, and the masked edge tile breaks that correspondence.
-
-Measured at M=1000, N=1000, K=1024, BLOCK_SIZE_M=256 (relative L2 vs torch):
-SPLIT_K=1 -> 0.0 exact, =2 -> 1.04e-1, =4 -> 1.30e-1.
-
-Pre-existing, not a promotion artifact: reproduces as
-``blackwell_gemm_ws.matmul(a, b, config=get_heuristic_config(...))``. Reachable
-in production -- the heuristic picks SPLIT_K=4 for both shapes. Not yet filed.
-Also reproduces at ``[4160, 512, 512]`` (SPLIT_K=2, M % 256 == 64, 4.0% of
-elements wrong), which is a smaller repro than either shape above.
+FIXED (split-K remainder tile): ``[1000, 1000, 1024]`` and ``[64, 4096, 4096]``
+were disabled here for a split-K bug -- wrong results when M was not a multiple
+of BLOCK_SIZE_M -- and are now RE-ENABLED. Fixed upstream by #3401, verified on
+this rebase: both are 0.0% wrong, as is the smaller repro ``[4160, 512, 512]``
+(SPLIT_K=2, M % 256 == 64), which measured 4.0% wrong before. They stay in the
+list as the regression test for that fix.
 
 TODO(NUM_CTAS=2 multi-N-tile): ``[1000000, 512, 512]`` is commented out below
-because it FAILS correctness, and for a **different** reason than the split-K
-bug -- this one has ``SPLIT_K=1``.
+because it FAILS correctness. It is a **different** bug from the split-K one
+above -- this one has ``SPLIT_K=1`` -- and it STILL REPRODUCES after #3401.
 
 Whenever the heuristic picks ``NUM_CTAS=2`` and the grid has more than one
 N-tile, 49.9% of output elements are wrong -- almost exactly one CTA of each
@@ -55,7 +45,14 @@ remainder-tile problem -- 999936 is an exact multiple of both 256 and 512.
 
 Reachable in production: the heuristic selects ``NUM_CTAS=2`` for ordinary
 large-M shapes. Worse, autotuning cannot save you, because it ranks configs by
-speed without checking their results. Not yet filed.
+speed without checking their results.
+
+Pre-existing, not a promotion artifact: the identical 49.9% reproduces through
+the original tutorial entry point,
+``blackwell_gemm_ws.matmul(a, b, config=get_heuristic_config(M, N, K, num_sms))``.
+Not yet filed. Status here is BYPASSED, not fixed -- the shape is commented out
+so a wrong-answer path cannot be benchmarked, per this project's rule of never
+xfailing or loosening to go green.
 """
 
 from __future__ import annotations
@@ -81,15 +78,14 @@ SHAPES: list[list] = [
     [2048, 2048, 2048, False, False],
     # M not a multiple of any plausible block size -- masked edge tile.
     [136, 256, 128, True, True],
-    # Non-power-of-two in M and N together.
-    # TODO(split-K remainder tile): fails, see module docstring.
-    # [1000, 1000, 1024, True, True],
+    # Non-power-of-two in M and N together. Regression test for the split-K
+    # remainder-tile fix (#3401).
+    [1000, 1000, 1024, True, True],
     # K-heavy: few output tiles, long reduction. Split-K territory, the one
     # path that runs a second kernel.
     [256, 256, 16384, True, True],
-    # Tall-skinny: most of the grid idle.
-    # TODO(split-K remainder tile): fails, see module docstring.
-    # [64, 4096, 4096, True, True],
+    # Tall-skinny: most of the grid idle. Also a regression test for #3401.
+    [64, 4096, 4096, True, True],
 
     # ---- compute-bound, added for perf ------------------------------------
     # Taken from tritonbench's gemm BUILDIN_SHAPES so the numbers are

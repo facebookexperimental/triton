@@ -2,82 +2,85 @@
   "arch": "sm100",
   "cases": {
     "mm/sm100/bfloat16/8192x8192x1024xTruexTrue": {
-      "ref_p50_ms": 0.12191999703645706,
-      "speedup": 0.9225181858782401,
+      "ref_p50_ms": 0.12595200538635254,
+      "speedup": 0.9248121106952205,
       "t_cold_s": null,
-      "tlx_p50_ms": 0.1321599930524826,
-      "tlx_tflops": 1039.943709874599
+      "tlx_p50_ms": 0.13619199395179749,
+      "tlx_tflops": 1009.1558944400493
     },
     "mm/sm100/bfloat16/8192x8192x16384xTruexTrue": {
-      "ref_p50_ms": 2.011136054992676,
-      "speedup": 0.981018953832198,
+      "ref_p50_ms": 2.02345609664917,
+      "speedup": 0.96391772423834,
       "t_cold_s": null,
-      "tlx_p50_ms": 2.0500481128692627,
-      "tlx_tflops": 1072.669095787333
+      "tlx_p50_ms": 2.0992000102996826,
+      "tlx_tflops": 1047.5529938845923
     },
     "mm/sm100/bfloat16/8192x8192x8192xTruexFalse": {
-      "ref_p50_ms": 1.0771839618682861,
-      "speedup": 1.0414900608591278,
+      "ref_p50_ms": 1.0843520164489746,
+      "speedup": 1.0421010375409168,
       "t_cold_s": null,
-      "tlx_p50_ms": 1.0342719554901123,
-      "tlx_tflops": 1063.0778703218075
+      "tlx_p50_ms": 1.040544033050537,
+      "tlx_tflops": 1056.6699657606887
     },
     "mm/sm100/bfloat16/8192x8192x8192xTruexTrue": {
-      "ref_p50_ms": 1.0720959901809692,
-      "speedup": 1.044813852234483,
+      "ref_p50_ms": 1.0813759565353394,
+      "speedup": 1.0485602009816513,
       "t_cold_s": null,
-      "tlx_p50_ms": 1.0261119604110718,
-      "tlx_tflops": 1071.5318310250702
+      "tlx_p50_ms": 1.0312960147857666,
+      "tlx_tflops": 1066.1455217631224
     },
     "mm/sm100/float16/8192x8192x1024xTruexTrue": {
-      "ref_p50_ms": 0.130048006772995,
-      "speedup": 0.9403054962255791,
+      "ref_p50_ms": 0.13417600095272064,
+      "speedup": 0.9424589615722165,
       "t_cold_s": null,
-      "tlx_p50_ms": 0.1383039951324463,
-      "tlx_tflops": 993.745360286824
+      "tlx_p50_ms": 0.14236800372600555,
+      "tlx_tflops": 965.3781037522183
     },
     "mm/sm100/float16/8192x8192x16384xTruexTrue": {
-      "ref_p50_ms": 2.1432321071624756,
-      "speedup": 0.9834805211741637,
+      "ref_p50_ms": 2.1483519077301025,
+      "speedup": 0.9794012341042853,
       "t_cold_s": null,
-      "tlx_p50_ms": 2.179231882095337,
-      "tlx_tflops": 1009.08181163247
+      "tlx_p50_ms": 2.1935360431671143,
+      "tlx_tflops": 1002.5015373702103
     },
     "mm/sm100/float16/8192x8192x8192xTruexFalse": {
-      "ref_p50_ms": 1.151968002319336,
-      "speedup": 1.0377342159482803,
+      "ref_p50_ms": 1.150879979133606,
+      "speedup": 1.0320831244247217,
       "t_cold_s": null,
-      "tlx_p50_ms": 1.1100800037384033,
-      "tlx_tflops": 990.4796267595018
+      "tlx_p50_ms": 1.1151039600372314,
+      "tlx_tflops": 986.0171492344886
     },
     "mm/sm100/float16/8192x8192x8192xTruexTrue": {
-      "ref_p50_ms": 1.1459200382232666,
-      "speedup": 1.057715040166036,
+      "ref_p50_ms": 1.149791955947876,
+      "speedup": 1.0495398855785838,
       "t_cold_s": null,
-      "tlx_p50_ms": 1.0833920240402222,
-      "tlx_tflops": 1014.8788281416953
+      "tlx_p50_ms": 1.09552001953125,
+      "tlx_tflops": 1003.643573986405
     }
   },
   "env": {
     "cuda": "13.0",
     "cuda_visible_devices": "6",
-    "foreign_processes": [],
+    "foreign_processes": [
+      {
+        "pid": 502525,
+        "used_mib": 1084.0
+      }
+    ],
     "gpu": {
       "available": true,
       "driver": "580.82.07",
-      "event_reason_names": [
-        "gpu_idle"
-      ],
-      "event_reasons": 1,
+      "event_reason_names": [],
+      "event_reasons": 0,
       "index": 6,
       "max_power_limit_w": 850.0,
       "max_sm_clock_mhz": 1965.0,
       "name": "NVIDIA B200",
       "persistence_mode": "Enabled",
-      "power_draw_w": 241.48,
+      "power_draw_w": 668.12,
       "power_limit_w": 750.0,
       "sm_clock_mhz": 1845.0,
-      "temperature_c": 39.0,
+      "temperature_c": 56.0,
       "uuid": "GPU-943ba66a-a081-9872-322f-e352decbce3e"
     },
     "host": "devgpu006.maz2.facebook.com",
@@ -87,19 +90,24 @@
     "nvml": true,
     "run": {
       "clock_trace": {
-        "degrading": [],
-        "max_mhz": 1845,
-        "median_mhz": 1845,
-        "min_mhz": 495,
-        "reasons": [
-          "sw_power_cap"
+        "degrading": [
+          "sw_thermal_slowdown"
         ],
-        "samples": 13611,
-        "spread": 0.5365853658536586,
+        "max_mhz": 1965,
+        "median_mhz": 1552,
+        "min_mhz": 562,
+        "reasons": [
+          "sw_power_cap",
+          "sw_thermal_slowdown"
+        ],
+        "samples": 20672,
+        "spread": 0.6333762886597938,
         "stable": false
       },
-      "elapsed_s": 687.8435584579129,
-      "problems": []
+      "elapsed_s": 1042.462134272093,
+      "problems": [
+        "1 other process(es) on this GPU: pid 502525 (1084 MiB)"
+      ]
     },
     "space": "heuristic",
     "torch": "2.12.0+cu130",
@@ -120,8 +128,12 @@
     "mm/sm100/bfloat16/2048x2048x2048xFalsexFalse",
     "mm/sm100/float16/136x256x128xTruexTrue",
     "mm/sm100/bfloat16/136x256x128xTruexTrue",
+    "mm/sm100/float16/1000x1000x1024xTruexTrue",
+    "mm/sm100/bfloat16/1000x1000x1024xTruexTrue",
     "mm/sm100/float16/256x256x16384xTruexTrue",
-    "mm/sm100/bfloat16/256x256x16384xTruexTrue"
+    "mm/sm100/bfloat16/256x256x16384xTruexTrue",
+    "mm/sm100/float16/64x4096x4096xTruexTrue",
+    "mm/sm100/bfloat16/64x4096x4096xTruexTrue"
   ],
   "op": "mm"
 }

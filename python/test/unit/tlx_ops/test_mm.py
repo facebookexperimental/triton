@@ -1,4 +1,10 @@
 """L1 correctness for ``tlx.ops.mm``.
+
+The shape list lives in ``triton.tlx.ops.kernels.mm._shapes`` and is shared
+with the perf suite (``python/test/tlx_benchmark/bench_mm.py``), so a shape
+disabled here is automatically not benchmarked either. One shape is currently
+commented out there for a NUM_CTAS=2 bug -- see that module's docstring for the
+measurement table and the control case.
 """
 
 import time

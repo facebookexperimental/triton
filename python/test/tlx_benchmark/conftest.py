@@ -10,8 +10,8 @@ def pytest_addoption(parser):
     group = parser.getgroup("tlx-benchmark")
     group.addoption("--measure", choices=("latency", "compile", "all"), default="latency",
                     help="latency is minutes; compile is ~4 min per case at --space full")
-    group.addoption("--space", choices=("full", "heuristic", "smoke"), default="full",
-                    help="autotune search space; 'full' is what tlx.ops.* uses by default")
+    group.addoption("--space", choices=("full", "heuristic", "smoke"), default="heuristic",
+                    help="autotune search space; 'heuristic' is what tlx.ops.mm now uses by default")
     group.addoption("--guard", choices=("off", "report", "enforce"), default="report",
                     help="enforce fails the test on a regression or a compile-cap breach")
     group.addoption("--json", default=None, help="write the machine-readable artifact here")
