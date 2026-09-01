@@ -197,3 +197,25 @@ def test_throughput_columns_are_blank_without_a_flop_count():
     r = judge(BIG, TLX, REF, tlx_host_us=HOST_US)
     assert r.flop_count is None
     assert "-" in report_mod.table([r]).splitlines()[2]
+
+
+def test_first_run_records_instead_of_gating(tmp_path, monkeypatch):
+    """A machine with no baseline has nothing to regress against.
+
+    Gating there would either fail everything or pass everything, and both are
+    indistinguishable from a real result. Recording, and saying so, is the only
+    honest outcome -- which is what lets the suite be one no-argument command.
+    """
+    import _harness.baseline as baseline_mod
+
+    monkeypatch.setattr(baseline_mod, "BASELINE_DIR", tmp_path)
+    assert baseline_mod.load("mm", "sm100") == {}
+
+    good = judge(BIG, TLX, REF, tlx_host_us=HOST_US)
+    baseline_mod.save("mm", "sm100", [good], env={"space": "heuristic"})
+
+    # Second run now has something to compare against.
+    recorded = baseline_mod.load("mm", "sm100", "heuristic")
+    assert recorded[BIG.key]["speedup"] == pytest.approx(good.speedup)
+    # ...and a run at a different search space still does not.
+    assert baseline_mod.load("mm", "sm100", "full") == {}

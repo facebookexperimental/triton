@@ -12,42 +12,35 @@ drift is visible.
 Always under `denoise.sh`, which fixes the power cap and binds to the GPU-local
 NUMA node. Numbers taken without it are not comparable to anything.
 
-The deterministic command — what CI and any review agent should use:
+One command, no arguments:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 third_party/tlx/denoise.sh \
-    python python/test/tlx_benchmark/bench_mm.py \
-        --measure latency --space full --guard enforce --json /tmp/mm.json
+python/test/tlx_benchmark/run.sh
 ```
+
+It picks the idlest GPU, applies `denoise.sh`, measures latency and cold compile
+for every case, writes `/tmp/tlx_benchmark/mm.sm100.json`, and gates against the
+committed baseline. **The first run on a machine has no baseline to gate
+against, so it records one and says so**; every run after that enforces.
+
+`run.sh --pytest` does the same through pytest, for the junitxml the b200
+reporting pipeline consumes. Any `bench_mm.py` flag passes through:
 
 | flag | choices | meaning |
 |---|---|---|
 | `--measure` | `all` `latency` `compile` | defaults to `all`; cheap at `--space heuristic` (~0.7 s cold compile per case), ~4 min **per case** at `--space full` |
-| `--space` | `full` `heuristic` `smoke` | defaults to `heuristic`, matching `tlx.ops.mm` |
+| `--space` | `heuristic` `full` `smoke` | defaults to `heuristic`, matching `tlx.ops.mm` |
 | `--dtype` | `fp16` `bf16` `both` | |
-| `--guard` | `off` `report` `enforce` | `enforce` exits non-zero on a regression or compile-cap breach |
-| `--replicates` | int | independent measurements per case; what the gate reads (default 10, each >=1000 timed iterations) |
-| `--json` | path | machine-readable artifact (defaults to `/tmp/tlx_benchmark/mm.sm100.json`) |
-| `--update-baseline` | | record this run; refuses noisy and host-bound cases |
+| `--guard` | `enforce` `report` `off` | `enforce` exits non-zero on a regression or compile-cap breach |
+| `--replicates` | int | independent measurements per case; what the gate reads (default 10, each ≥1000 timed iterations) |
+| `--json` | path | defaults to `/tmp/tlx_benchmark/mm.sm100.json` |
+| `--update-baseline` | | re-record even though one exists |
 | `--strict-env` | | fail rather than warn when the environment is not denoised |
-
-`pytest` is the secondary front end, for the junitxml the b200 reporting
-pipeline already consumes. It takes exactly the same options, and
-`test_ops_perf.py` discovers every `bench_*.py`, so there is still one benchmark
-file per op:
-
-```bash
-CUDA_VISIBLE_DEVICES=0 third_party/tlx/denoise.sh \
-    python -m pytest python/test/tlx_benchmark/test_ops_perf.py --guard enforce
-```
 
 The harness's own unit tests need no GPU:
 
 ```bash
-python -m pytest python/test/tlx_benchmark/test_harness.py \
-    python/test/tlx_benchmark/test_denoise.py \
-    python/test/tlx_benchmark/test_compile.py \
-    python/test/tlx_benchmark/test_baseline.py
+python -m pytest python/test/tlx_benchmark -q --ignore=python/test/tlx_benchmark/test_ops_perf.py
 ```
 
 ## Status

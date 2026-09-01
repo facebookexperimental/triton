@@ -14,7 +14,7 @@ def pytest_addoption(parser):
         "at --space full the cold pass costs ~4 min PER CASE")
     group.addoption("--space", choices=("full", "heuristic", "smoke"), default="heuristic",
                     help="autotune search space; 'heuristic' is what tlx.ops.mm now uses by default")
-    group.addoption("--guard", choices=("off", "report", "enforce"), default="report",
+    group.addoption("--guard", choices=("off", "report", "enforce"), default="enforce",
                     help="enforce fails the test on a regression or a compile-cap breach")
     group.addoption("--replicates", type=int, default=None,
                     help="independent measurements per case; this is what the noise gate reads")

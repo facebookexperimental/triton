@@ -9,17 +9,18 @@ Shapes come from ``triton.tlx.ops.kernels.mm._shapes``, shared with the L1
 correctness suite, so a shape disabled for a correctness bug cannot remain
 benchmarked here.
 
-Run it two ways. As a deterministic command, which is what CI and any review
-agent should use::
+Run it with no arguments::
 
-    CUDA_VISIBLE_DEVICES=0 third_party/tlx/denoise.sh \\
-        python python/test/tlx_benchmark/bench_mm.py \\
-            --measure latency --guard enforce --json /tmp/mm.json
+    python/test/tlx_benchmark/run.sh
 
-or under pytest, for the junitxml that the existing b200 reporting consumes::
+That wrapper picks an idle GPU and applies ``denoise.sh``; this module then
+measures latency and cold compile for every case, writes the JSON artifact, and
+gates against the committed baseline. The first run on a machine has nothing to
+gate against, so it records a baseline instead and says so.
 
-    CUDA_VISIBLE_DEVICES=0 third_party/tlx/denoise.sh \\
-        python -m pytest python/test/tlx_benchmark/bench_mm.py
+Or under pytest, for the junitxml that the b200 reporting consumes::
+
+    python/test/tlx_benchmark/run.sh --pytest
 
 ``--measure`` defaults to ``all``: latency and cold-compile together, which at
 the default ``--space heuristic`` costs about 0.7s of extra cold compile per
@@ -171,7 +172,7 @@ def main(argv=None) -> int:
     parser.add_argument("--space", choices=("full", "heuristic", "smoke"), default="heuristic",
                         help="autotune search space; 'heuristic' is what tlx.ops.mm now uses by default")
     parser.add_argument("--dtype", choices=("fp16", "bf16", "both"), default="both")
-    parser.add_argument("--guard", choices=("off", "report", "enforce"), default="report",
+    parser.add_argument("--guard", choices=("off", "report", "enforce"), default="enforce",
                         help="enforce exits non-zero on a regression or a compile-cap breach")
     parser.add_argument(
         "--replicates", type=int, default=DEFAULT_REPLICATES,
@@ -179,10 +180,15 @@ def main(argv=None) -> int:
         f"(default {DEFAULT_REPLICATES}, ~6s each per provider)")
     parser.add_argument("--json", default=DEFAULT_JSON, help=f"machine-readable artifact (default {DEFAULT_JSON})")
     parser.add_argument("--update-baseline", action="store_true",
-                        help="record this run as the baseline; refuses noisy and host-bound cases")
+                        help="re-record the baseline even if one exists (a missing one is recorded "
+                        "automatically)")
     parser.add_argument("--strict-env", action="store_true",
                         help="fail instead of warning when the environment is not denoised")
     args = parser.parse_args(argv)
+
+    # Whether there is anything to compare against decides what this run means,
+    # so it has to be known before the run rather than inferred after it.
+    had_baseline = bool(baseline_mod.load(OP, ARCH, args.space))
 
     results, env = run(
         space=args.space,
@@ -193,9 +199,15 @@ def main(argv=None) -> int:
     )
     print(report_mod.render(results, env, args.json))
 
-    if args.update_baseline:
-        print(f"baseline written: {baseline_mod.save(OP, ARCH, results, env)}")
+    if args.update_baseline or not had_baseline:
+        path = baseline_mod.save(OP, ARCH, results, env)
+        # A first run has nothing to regress against, so it records instead of
+        # gating. Saying so matters: a green run that gated nothing and a green
+        # run that gated everything look identical otherwise.
+        why = "re-recorded" if had_baseline else "no baseline existed, so this run established one"
+        print(f"\nbaseline {why}: {path}")
         return 0
+
     if args.guard == "enforce" and report_mod.failures(results):
         return 1
     return 0
