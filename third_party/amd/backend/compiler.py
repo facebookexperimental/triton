@@ -155,7 +155,7 @@ def assemble_amdgcn(assembly: str, processor: str, features: str) -> bytes:
     status = library.triton_amdgpu_assemble(
         source,
         len(source),
-        amd.TARGET_TRIPLE.encode("utf-8"),
+        amd.get_target_triple(processor).encode("utf-8"),
         processor.encode("utf-8"),
         features.encode("utf-8"),
         ctypes.byref(object_file),
@@ -857,11 +857,12 @@ class HIPBackend(BaseBackend):
         llvm.init_targets()
         context = llvm.context()
         llvm_mod = llvm.to_module(mod, context)
-        amd.attach_target_triple(llvm_mod)
+        target_triple = amd.get_target_triple(options.arch)
+        amd.attach_target_triple(llvm_mod, options.arch)
         target_features = ""
         if knobs.compilation.enable_asan:
             target_features = '+xnack'
-        llvm.attach_datalayout(llvm_mod, amd.TARGET_TRIPLE, options.arch, target_features, get_llvm_flags(options.arch),
+        llvm.attach_datalayout(llvm_mod, target_triple, options.arch, target_features, get_llvm_flags(options.arch),
                                "")
 
         # Set various control constants on the LLVM module so that device
@@ -988,8 +989,7 @@ class HIPBackend(BaseBackend):
         features = get_amdgpu_codegen_features(options.arch, src, options.disable_packed_fp32_ops)
         ir_hash = hashlib.sha256(src.encode("utf-8")).hexdigest()
         dump_file_id = names[0] + "_" + ir_hash
-        # Beta bindings predate amd.get_target_triple; TARGET_TRIPLE is the same value.
-        target_triple = amd.TARGET_TRIPLE
+        target_triple = amd.get_target_triple(options.arch)
         if knobs.amd.dump_mir:
             _ = llvm.translate_to_mir(src, target_triple, options.arch, features, flags, options.enable_fp_fusion,
                                       dump_file_id)
