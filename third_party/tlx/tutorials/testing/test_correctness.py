@@ -2565,18 +2565,18 @@ def test_amd_mxfp_gemm_tdm_pipelined(TRANSPOSE_B):
 # already agrees with `register` -- so a wrong `inter_wave` would be dropped
 # from the race and the suite would still pass. Iterating `available_paths`
 # asserts every path a shape can take against torch, independently.
-def _check_addmm_all_paths(bias, a, b):
+def _check_addmm_all_paths(bias, a, b, split_k=None):
     ref = torch.addmm(bias, a, b)
     config = Gemm.CONFIGS["amd_standalone_addmm_register"]
     for path in _amd_addmm_paths(bias, a, b):
-        out = _amd_addmm(bias, a, b, path=path, config=config)
+        out = _amd_addmm(bias, a, b, SPLIT_K=split_k, path=path, config=config)
         torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2, msg=lambda m, path=path: f"path={path}\n{m}")
 
 
-def _check_addmm_default_matches_register_exact(bias, a, b):
+def _check_addmm_default_matches_register_exact(bias, a, b, split_k):
     config = Gemm.CONFIGS["amd_standalone_addmm_register"]
-    expected = _amd_addmm(bias, a, b, path="register", config=config)
-    actual = _amd_addmm(bias, a, b, config=config)
+    expected = _amd_addmm(bias, a, b, SPLIT_K=split_k, path="register", config=config)
+    actual = _amd_addmm(bias, a, b, SPLIT_K=split_k, config=config)
     assert torch.equal(actual, expected)
 
 
@@ -2601,8 +2601,8 @@ def test_amd_standalone_addmm(dtype, bias_2d, split_k, N):
         out = _amd_addmm(bias, a, b, SPLIT_K=split_k)
         torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
     else:
-        _check_addmm_all_paths(bias, a, b)
-        _check_addmm_default_matches_register_exact(bias, a, b)
+        _check_addmm_all_paths(bias, a, b, split_k)
+        _check_addmm_default_matches_register_exact(bias, a, b, split_k)
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
