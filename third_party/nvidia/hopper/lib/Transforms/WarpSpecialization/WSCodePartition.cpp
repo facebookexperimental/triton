@@ -4032,13 +4032,18 @@ void insertAsyncComm(
             // writer lets a correction task race the remaining MMAs.
             completionMmaOverride = backwardChannelForLoop->getSrcOp();
           }
-          auto waitOp = desyncMMAv5Op(
-              builder, mmaOp, consumerBarrier, bufferIdx, phase,
-              producerAcquirePoint, true, addCompletionBarrier, waitConstraints,
-              releaseOnLastIterOnly, completionMmaOverride);
-          if (orderedByWholeTmemOverwrite)
-            waitOp->setAttr("ttng.redundant_publication_wait",
-                            UnitAttr::get(funcOp.getContext()));
+          if (orderedByWholeTmemOverwrite) {
+            // The whole-overwrite chain already closes the reuse cycle, so
+            // this channel needs neither an empty wait before publication nor
+            // a matching completion arrival on the consuming MMA. Keep the
+            // MMA asynchronous for its remaining channels.
+            mmaOp.setIsAsync(true);
+          } else {
+            desyncMMAv5Op(builder, mmaOp, consumerBarrier, bufferIdx, phase,
+                          producerAcquirePoint, true, addCompletionBarrier,
+                          waitConstraints, releaseOnLastIterOnly,
+                          completionMmaOverride);
+          }
         }
       }
     }

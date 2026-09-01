@@ -1,4 +1,5 @@
 // RUN: triton-opt %s --nvgpu-test-ws-code-partition="num-buffers=1" --triton-nvidia-interleave-tmem --mlir-print-debuginfo --mlir-use-nameloc-as-prefix | FileCheck %s
+// RUN: triton-opt %s --nvgpu-test-ws-code-partition="num-buffers=1" --mlir-print-debuginfo --mlir-use-nameloc-as-prefix | FileCheck %s --check-prefix=CP --implicit-check-not=ttng.redundant_publication_wait
 //
 // Regression test: verify that 2-buffer reuse group logic does NOT
 // incorrectly move the accumulator MMA's producer_acquire in the
@@ -62,7 +63,15 @@
 // each QK load and subsequent P store execute in one softmax task.  Those two
 // program-order edges plus the QK-full channel already protect P publication
 // across iterations, so no additional empty wait may be inserted between the
-// P conversion and store.
+// P conversion and store.  Check both immediately after code partitioning and
+// after InterleaveTMem so a later pass cannot become responsible for deleting
+// a synchronization edge that code partitioning already proved redundant.
+// CP: arith.truncf {{.*}}async_task_id = array<i32: 4>{{.*}}loop.cluster = 1{{.*}}loop.stage = 2
+// CP-NOT: ttng.wait_barrier
+// CP: ttng.tmem_store {{.*}}async_task_id = array<i32: 4>{{.*}}loop.cluster = 1{{.*}}loop.stage = 2
+// CP: arith.truncf {{.*}}async_task_id = array<i32: 5>{{.*}}loop.cluster = 4{{.*}}loop.stage = 1
+// CP-NOT: ttng.wait_barrier
+// CP: ttng.tmem_store {{.*}}async_task_id = array<i32: 5>{{.*}}loop.cluster = 4{{.*}}loop.stage = 1
 // CHECK: arith.truncf {{.*}}async_task_id = array<i32: 4>{{.*}}loop.cluster = 1{{.*}}loop.stage = 2
 // CHECK-NOT: ttng.wait_barrier
 // CHECK: ttng.tmem_store {{.*}}async_task_id = array<i32: 4>{{.*}}loop.cluster = 1{{.*}}loop.stage = 2
