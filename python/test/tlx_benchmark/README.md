@@ -15,16 +15,25 @@ NUMA node. Numbers taken without it are not comparable to anything.
 One command, no arguments:
 
 ```bash
-python/test/tlx_benchmark/run.sh
+python python/test/tlx_benchmark/bench_mm.py
 ```
 
-It picks the idlest GPU, applies `denoise.sh`, measures latency and cold compile
-for every case, writes `/tmp/tlx_benchmark/mm.sm100.json`, and gates against the
-committed baseline. **The first run on a machine has no baseline to gate
-against, so it records one and says so**; every run after that enforces.
+It picks the least-used GPU, pins clocks/power/NUMA for the duration and puts
+them back afterwards, measures latency and cold compile for every case, writes
+`/tmp/tlx_benchmark/mm.sm100.json`, and gates against the committed baseline.
+**The first run on a machine has no baseline to gate against, so it records one
+and says so**; every run after that enforces.
 
-`run.sh --pytest` does the same through pytest, for the junitxml the b200
-reporting pipeline consumes. Any `bench_mm.py` flag passes through:
+```
+device: gpu1 NVIDIA B200 (least used, 4 MiB in use)
+  denoise: persistence mode
+  denoise: power cap 750 W
+  denoise: clock lock 1965 MHz
+  denoise: NUMA node 0 (192 CPUs)
+```
+
+`python -m pytest python/test/tlx_benchmark/test_ops_perf.py -s` does the same
+through pytest, for the junitxml the b200 reporting pipeline consumes.
 
 | flag | choices | meaning |
 |---|---|---|
@@ -36,6 +45,8 @@ reporting pipeline consumes. Any `bench_mm.py` flag passes through:
 | `--json` | path | defaults to `/tmp/tlx_benchmark/mm.sm100.json` |
 | `--update-baseline` | | re-record even though one exists |
 | `--strict-env` | | fail rather than warn when the environment is not denoised |
+| `--device` | int or `auto` | which GPU; `auto` (default) is the least-used one |
+| `--no-denoise` | | skip the governing; numbers will not be comparable |
 
 The harness's own unit tests need no GPU:
 
@@ -121,13 +132,29 @@ Two consequences worth carrying forward:
    1105 µs vs 9 µs). The speedup ratio is therefore slightly biased against
    TLX. Fixing it means hoisting the per-call work out of `mm()`.
 
+### Governing is in-process, and duplicated from `denoise.sh`
+
+`denoise.py` both applies and verifies. Applying it in Python is what makes the
+suite a single command with no wrapper; the cost is a second definition of
+"denoised" that can drift from the shell script. The mitigation is that the
+verification is behavioural — it reads what the GPU is doing, not what was
+configured — so it will notice if this copy stops working.
+
+Each step is independent and best-effort. Without passwordless sudo the power
+and clock steps are skipped and NUMA binding still applies, which matters
+because NUMA is the lever measured to help here and needs no privilege. What
+actually held is printed and recorded in the artifact, rather than what was
+attempted.
+
+The AMD path mirrors `denoise.sh`'s `rocm-smi` handling (`--setperfdeterminism`,
+`--setpoweroverdrive`, `HIP_VISIBLE_DEVICES`, sysfs NUMA via
+`/sys/class/drm/cardN`) and **has not been run on hardware** — there is no AMD
+card on the box this was written on. It degrades to "not governed" rather than
+failing.
+
 ### `-lgc` does not lock the clock for compute-bound work on B200
 
-`denoise.py` verifies the environment; it does not re-implement `denoise.sh`,
-because duplicating privileged shell logic would give two definitions of
-"denoised" and the copy would drift.
-
-The first version of that verification checked "is the SM clock near maximum?"
+The first version of the verification checked "is the SM clock near maximum?"
 and was wrong. Sampling the clock during a sustained 8192³ fp16 GEMM, with and
 without `nvidia-smi -lgc 1965`:
 

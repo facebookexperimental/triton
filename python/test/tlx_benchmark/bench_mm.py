@@ -11,16 +11,17 @@ benchmarked here.
 
 Run it with no arguments::
 
-    python/test/tlx_benchmark/run.sh
+    python python/test/tlx_benchmark/bench_mm.py
 
-That wrapper picks an idle GPU and applies ``denoise.sh``; this module then
+It picks the least-used GPU, pins clocks, power and NUMA for the duration,
 measures latency and cold compile for every case, writes the JSON artifact, and
 gates against the committed baseline. The first run on a machine has nothing to
-gate against, so it records a baseline instead and says so.
+gate against, so it records a baseline instead and says so. ``--device N``
+overrides the choice; ``--no-denoise`` skips the governing.
 
 Or under pytest, for the junitxml that the b200 reporting consumes::
 
-    python/test/tlx_benchmark/run.sh --pytest
+    python -m pytest python/test/tlx_benchmark/test_ops_perf.py -s
 
 ``--measure`` defaults to ``all``: latency and cold-compile together, which at
 the default ``--space heuristic`` costs about 0.7s of extra cold compile per
@@ -32,6 +33,7 @@ separate ``latency`` mode.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 
 import torch
@@ -42,6 +44,7 @@ sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent))
 
 from _harness import (DEFAULT_REPLICATES, Case, Status, capture_env, cold_compile,  # noqa: E402
                       host_overhead_us, measure, stable)
+from _harness.denoise import Governor, select_device  # noqa: E402
 from _harness import baseline as baseline_mod  # noqa: E402
 from _harness import report as report_mod  # noqa: E402
 
@@ -120,9 +123,11 @@ def run_case(case: Case, *, space: str, measure_compile: bool, baseline: dict, r
 
 
 def run(*, space="heuristic", measure_compile=True, dtypes=("fp16", "bf16"), strict=False,
-        replicates=DEFAULT_REPLICATES):
+        replicates=DEFAULT_REPLICATES, governor=None):
     baseline = baseline_mod.load(OP, ARCH, space)
     env = capture_env()
+    if governor is not None:
+        env["governed"] = governor.to_dict()
     results = []
     with stable(strict=strict) as info:
         for case in cases(dtypes):
@@ -165,6 +170,9 @@ def supported() -> bool:
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--device", default="auto", help="GPU index, or 'auto' (default) for the least-used one")
+    parser.add_argument("--no-denoise", action="store_true",
+                        help="skip clock/power/NUMA governing; numbers will not be comparable")
     parser.add_argument(
         "--measure", choices=("latency", "compile", "all"), default="all",
         help="'all' is the default and is cheap at --space heuristic (~0.7s of cold "
@@ -186,17 +194,34 @@ def main(argv=None) -> int:
                         help="fail instead of warning when the environment is not denoised")
     args = parser.parse_args(argv)
 
+    # Pick and pin the GPU before torch touches CUDA. Selection has to happen
+    # here rather than in a wrapper script so that the suite is one command,
+    # and it has to happen before the first CUDA call because the visibility
+    # variable is read once at context creation.
+    device = select_device(args.device)
+    if device is not None:
+        os.environ[device.visibility_env] = str(device.index)
+        print(f"device: gpu{device.index} {device.name} "
+              f"({'least used' if args.device == 'auto' else 'requested'}, "
+              f"{device.memory_used_mib:.0f} MiB in use)")
+
     # Whether there is anything to compare against decides what this run means,
     # so it has to be known before the run rather than inferred after it.
     had_baseline = bool(baseline_mod.load(OP, ARCH, args.space))
 
-    results, env = run(
-        space=args.space,
-        measure_compile=args.measure in ("compile", "all"),
-        dtypes=("fp16", "bf16") if args.dtype == "both" else (args.dtype, ),
-        strict=args.strict_env,
-        replicates=args.replicates,
-    )
+    with Governor(device, enable=not args.no_denoise) as governor:
+        for step in governor.applied:
+            print(f"  denoise: {step}")
+        for step in governor.skipped:
+            print(f"  denoise: SKIPPED {step}")
+        results, env = run(
+            space=args.space,
+            measure_compile=args.measure in ("compile", "all"),
+            dtypes=("fp16", "bf16") if args.dtype == "both" else (args.dtype, ),
+            strict=args.strict_env,
+            replicates=args.replicates,
+            governor=governor,
+        )
     print(report_mod.render(results, env, args.json))
 
     if args.update_baseline or not had_baseline:

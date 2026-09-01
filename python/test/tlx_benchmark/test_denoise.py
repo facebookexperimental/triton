@@ -111,3 +111,63 @@ def test_clock_trace_degradation_overrides_a_tight_spread():
 def test_clock_trace_unknown_without_samples():
     assert ClockTrace(samples=0).stable is None
     assert ClockTrace(samples=0).to_dict()["stable"] is None
+
+
+def test_power_target_matches_the_part():
+    """Same table as denoise.sh. A *fixed* cap is the point, not a high one:
+    an unpinned cap is one more thing that can differ between two runs being
+    compared."""
+    from _harness.denoise import AMD, NVIDIA, Device
+
+    assert Device(NVIDIA, 0, "NVIDIA B200").power_target_w == 750
+    assert Device(NVIDIA, 0, "NVIDIA H100 80GB HBM3").power_target_w == 700
+    assert Device(NVIDIA, 0, "NVIDIA GB200").power_target_w == 1200
+    assert Device(AMD, 0, "MI350X").power_target_w == 1000
+    assert Device(AMD, 0, "MI355X").power_target_w == 1400
+    # Unknown parts get no target rather than a guessed one; the governor then
+    # leaves the card's own limit alone.
+    assert Device(NVIDIA, 0, "NVIDIA L4").power_target_w is None
+
+
+def test_visibility_variable_follows_the_vendor():
+    from _harness.denoise import AMD, NVIDIA, Device
+
+    assert Device(NVIDIA, 2, "NVIDIA B200").visibility_env == "CUDA_VISIBLE_DEVICES"
+    assert Device(AMD, 2, "MI350X").visibility_env == "HIP_VISIBLE_DEVICES"
+
+
+def test_auto_selection_picks_the_least_used_gpu(monkeypatch):
+    """By free memory, not by index: on a shared box a co-tenant is the failure
+    mode most likely to go unnoticed, and index 0 is as likely to be busy as
+    any other."""
+    import _harness.denoise as denoise_mod
+    from _harness.denoise import NVIDIA, Device
+
+    fleet = [
+        Device(NVIDIA, 0, "NVIDIA B200", memory_used_mib=14178),
+        Device(NVIDIA, 1, "NVIDIA B200", memory_used_mib=4),
+        Device(NVIDIA, 2, "NVIDIA B200", memory_used_mib=1254),
+    ]
+    monkeypatch.setattr(denoise_mod, "list_devices", lambda: fleet)
+    assert denoise_mod.select_device("auto").index == 1
+    assert denoise_mod.select_device("2").index == 2
+    with pytest.raises(ValueError):
+        denoise_mod.select_device("9")
+
+
+def test_governor_is_inert_without_a_device():
+    """No GPU is a reason to report honestly, not to crash."""
+    from _harness.denoise import Governor
+
+    with Governor(None) as g:
+        pass
+    assert g.applied == []
+    assert g.skipped and "no GPU" in g.skipped[0]
+
+
+def test_governor_can_be_disabled():
+    from _harness.denoise import Governor, NVIDIA, Device
+
+    with Governor(Device(NVIDIA, 0, "NVIDIA B200"), enable=False) as g:
+        pass
+    assert g.applied == []
