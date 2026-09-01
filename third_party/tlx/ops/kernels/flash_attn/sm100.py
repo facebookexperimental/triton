@@ -1428,11 +1428,10 @@ def _attn_fwd_ws_kernel(
 
     USE_2CTA: tl.constexpr = NUM_CTAS == 2
     tl.static_assert(not USE_2CTA or BLOCK_M == 256)
-    FAST_BF16: tl.constexpr = (tlx.dtype_of(desc_v) == tl.bfloat16 and POLICY == POLICY_DENSE and NUM_MMA_SLICES == 2
-                               and STAGE == 1 and not RESCALE_OPT)
     FAST_F16_CAPABLE: tl.constexpr = (tlx.dtype_of(desc_v) == tl.float16 and NUM_MMA_SLICES == 4 and not RESCALE_OPT
                                       and not USE_2CTA)
-    USE_FAST_FIXED: tl.constexpr = FAST_FIXED and (FAST_BF16 or FAST_F16_CAPABLE)
+    # BF16 fixed-gauge row sums are too imprecise for the softmax metadata reused by backward.
+    USE_FAST_FIXED: tl.constexpr = FAST_FIXED and FAST_F16_CAPABLE
     USE_FAST_F16: tl.constexpr = USE_FAST_FIXED and FAST_F16_CAPABLE
     FUSE_EPILOG: tl.constexpr = USE_FAST_FIXED and not USE_2CTA
     DIRECT_SCHED: tl.constexpr = USE_2CTA or USE_FAST_F16
