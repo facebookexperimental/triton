@@ -132,6 +132,8 @@
         next_buf = ((tile_id + 1) % NUM_BUFFERS).to(tl.int32)
         k_prefetch = (k_lo + tile_id + NUM_BUFFERS) * BLOCK_K
 
+        # Keep every wave's LDS reads ahead of the leading wave's buffer refill.
+        tlx.async_load_wait_group(NUM_BUFFERS - 2)
         with tlx.warp_pipeline_stage("mfma", priority=0):
             acc = tl.dot(a_tile, b_tile, acc, allow_tf32=ALLOW_TF32, out_dtype=ACC_TYPE)
 
@@ -144,14 +146,6 @@
             tlx.async_load_commit_group([tok_a, tok_b])
             a_tile = tlx.local_load(tlx.local_view(smemA, next_buf))
             b_tile = tlx.local_load(tlx.local_trans(tlx.local_view(smemB, next_buf)))
-
-        # loop-tail wait (Hongtao P2419921423): keep NUM_BUFFERS-2 commit groups in flight. With
-        # single A+B commits this counts tiles directly. Race-free because local_load(next_buf)
-        # above reads a buffer committed >=2 iters ago, made complete by the PREVIOUS iteration's
-        # tail wait; NUM_BUFFERS=2 -> wait(0) fully drains each iter (correct, serial). Replaces
-        # the earlier in-loop async_load_wait_group((NUM_BUFFERS-2)*2) before local_load, which
-        # fixed the same RAW race with separate A/B commits.
-        tlx.async_load_wait_group(NUM_BUFFERS - 2)
 
     acc = tl.dot(a_tile, b_tile, acc, allow_tf32=ALLOW_TF32, out_dtype=ACC_TYPE)
     tlx.async_load_wait_group(0)
