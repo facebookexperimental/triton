@@ -1,13 +1,21 @@
-"""Perf and compile-time guard for ``tlx.ops.mm`` on Blackwell.
+"""Perf and compile-time guard for ``tlx.ops.mm``.
 
 The flagship op file, and the template for every other one. Everything
 op-specific is here -- the reference implementation, the FLOP formula, the
 input builder -- and everything about *how* to measure lives in ``_harness``.
 Adding an op should mean copying this file and changing those three things.
 
-Shapes come from ``triton.tlx.ops.kernels.mm._shapes``, shared with the L1
-correctness suite, so a shape disabled for a correctness bug cannot remain
-benchmarked here.
+Runs on whichever architecture the box has an ``mm`` entry for -- sm100 and
+gfx942 today. The arch decides three things: which shapes run, which baseline is
+gated against, and where the artifact lands. It is resolved from the part name
+via smi rather than via torch, because a CUDA context created before ``--device``
+is applied would ignore it.
+
+Shapes come from that arch's kernel module (``PERF_SHAPES``), which is a slice of
+the lists in ``triton.tlx.ops.kernels.mm._shapes`` that the L1 correctness suite
+reads in full. So a shape disabled for a correctness bug cannot remain
+benchmarked here, while a shape belonging to another arch is not benchmarked on
+this one.
 
 Run it with no arguments::
 
@@ -33,30 +41,58 @@ separate ``latency`` mode.
 from __future__ import annotations
 
 import argparse
+import functools
+import importlib
 import os
 import sys
 
 import torch
 
-from triton.tlx.ops.kernels.mm._shapes import SHAPES, flops, operand
+from triton.tlx.ops.kernels.mm._shapes import flops, operand
 
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent))
 
 from _harness import (DEFAULT_REPLICATES, Case, Status, capture_env, cold_compile,  # noqa: E402
                       host_overhead_us, measure, stable)
-from _harness.denoise import Governor, select_device  # noqa: E402
+from _harness.denoise import Governor, list_devices, select_device  # noqa: E402
 from _harness import baseline as baseline_mod  # noqa: E402
 from _harness import report as report_mod  # noqa: E402
 
 OP = "mm"
-ARCH = "sm100"
 DTYPES = {"fp16": torch.float16, "bf16": torch.bfloat16}
 
-#: Where the machine-readable artifact goes when nothing is asked for. Written
-#: unconditionally: the JSON is the interface a review agent reads, and making
-#: it opt-in meant the common invocation produced nothing to read. Not in the
-#: repo -- it is a per-run output, not a checked-in one.
-DEFAULT_JSON = f"/tmp/tlx_benchmark/{OP}.{ARCH}.json"
+
+@functools.lru_cache(maxsize=1)
+def arch() -> str | None:
+    """Catalog key for the GPU under test, or None if ``mm`` has no entry.
+
+    Read off the part name via smi rather than via torch, because this is called
+    before the device is pinned and a CUDA context created here would ignore
+    ``--device``. Takes device 0: a box with two different parts in it is not a
+    machine anyone should be gating perf on.
+    """
+    devices = list_devices()
+    return devices[0].arch if devices else None
+
+
+def shapes() -> list[list]:
+    """This arch's real-world shapes, read off its kernel module.
+
+    Perf runs one arch's list; correctness runs the union of all of them. See
+    ``kernels/mm/_shapes.py`` for why they differ.
+    """
+    return importlib.import_module(f"triton.tlx.ops.kernels.mm.{arch()}").PERF_SHAPES
+
+
+def default_json() -> str:
+    """Where the machine-readable artifact goes when nothing is asked for.
+
+    Written unconditionally: the JSON is the interface a review agent reads, and
+    making it opt-in meant the common invocation produced nothing to read. Not
+    in the repo -- it is a per-run output, not a checked-in one.
+    """
+    return f"/tmp/tlx_benchmark/{OP}.{arch()}.json"
+
 
 #: What one row of the report describes, printed in the legend. An mm case is a
 #: product shape plus the memory layout of each operand -- the layout is not
@@ -72,8 +108,8 @@ def _label(shape) -> str:
 
 def cases(dtypes=("fp16", "bf16")) -> list[Case]:
     return [
-        Case(op=OP, arch=ARCH, dtype=str(DTYPES[d]).removeprefix("torch."), shape=tuple(shape), label=_label(shape))
-        for shape in SHAPES
+        Case(op=OP, arch=arch(), dtype=str(DTYPES[d]).removeprefix("torch."), shape=tuple(shape), label=_label(shape))
+        for shape in shapes()
         for d in dtypes
     ]
 
@@ -94,7 +130,7 @@ def run_case(case: Case, *, space: str, measure_compile: bool, baseline: dict, r
     from triton.tlx.ops import mm as tlx_mm
 
     a, b = _operands(case)
-    tlx_fn = lambda: tlx_mm(a, b, arch=ARCH, space=space)  # noqa: E731
+    tlx_fn = lambda: tlx_mm(a, b, arch=arch(), space=space)  # noqa: E731
     ref_fn = lambda: torch.matmul(a, b)  # noqa: E731
 
     compile_stat = cold_compile(tlx_fn) if measure_compile else None
@@ -124,7 +160,7 @@ def run_case(case: Case, *, space: str, measure_compile: bool, baseline: dict, r
 
 def run(*, space="heuristic", measure_compile=True, dtypes=("fp16", "bf16"), strict=False,
         replicates=DEFAULT_REPLICATES, governor=None):
-    baseline = baseline_mod.load(OP, ARCH, space)
+    baseline = baseline_mod.load(OP, arch(), space)
     env = capture_env()
     if governor is not None:
         env["governed"] = governor.to_dict()
@@ -158,9 +194,7 @@ def _errored(case: Case, exc: Exception):
 
 def supported() -> bool:
     """Whether this op can run on the current device at all."""
-    from triton._internal_testing import is_blackwell
-
-    return is_blackwell()
+    return arch() is not None
 
 
 # --------------------------------------------------------------------------
@@ -186,7 +220,7 @@ def main(argv=None) -> int:
         "--replicates", type=int, default=DEFAULT_REPLICATES,
         help=f"independent measurements per case; this is what the noise gate reads "
         f"(default {DEFAULT_REPLICATES}, ~6s each per provider)")
-    parser.add_argument("--json", default=DEFAULT_JSON, help=f"machine-readable artifact (default {DEFAULT_JSON})")
+    parser.add_argument("--json", default=default_json(), help=f"machine-readable artifact (default {default_json()})")
     parser.add_argument("--update-baseline", action="store_true",
                         help="re-record the baseline even if one exists (a missing one is recorded "
                         "automatically)")
@@ -207,7 +241,7 @@ def main(argv=None) -> int:
 
     # Whether there is anything to compare against decides what this run means,
     # so it has to be known before the run rather than inferred after it.
-    had_baseline = bool(baseline_mod.load(OP, ARCH, args.space))
+    had_baseline = bool(baseline_mod.load(OP, arch(), args.space))
 
     with Governor(device, enable=not args.no_denoise) as governor:
         for step in governor.applied:
@@ -225,7 +259,7 @@ def main(argv=None) -> int:
     print(report_mod.render(results, env, args.json))
 
     if args.update_baseline or not had_baseline:
-        path = baseline_mod.save(OP, ARCH, results, env)
+        path = baseline_mod.save(OP, arch(), results, env)
         # A first run has nothing to regress against, so it records instead of
         # gating. Saying so matters: a green run that gated nothing and a green
         # run that gated everything look identical otherwise.

@@ -39,11 +39,11 @@ def test_op_perf(module_name, pytestconfig):
     from _harness import baseline as baseline_mod
     from _harness import report as report_mod
 
-    print("\n" + report_mod.render(results, env, pytestconfig.getoption("--json") or bench.DEFAULT_JSON))
+    print("\n" + report_mod.render(results, env, pytestconfig.getoption("--json") or bench.default_json()))
 
-    if pytestconfig.getoption("--update-baseline") or not baseline_mod.load(bench.OP, bench.ARCH,
+    if pytestconfig.getoption("--update-baseline") or not baseline_mod.load(bench.OP, bench.arch(),
                                                                             pytestconfig.getoption("--space")):
-        print(f"baseline recorded: {baseline_mod.save(bench.OP, bench.ARCH, results, env)}")
+        print(f"baseline recorded: {baseline_mod.save(bench.OP, bench.arch(), results, env)}")
         return
     if pytestconfig.getoption("--guard") == "enforce":
         bad = report_mod.failures(results)

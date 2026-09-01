@@ -9,10 +9,9 @@ drift is visible.
 
 ## Running
 
-Always under `denoise.sh`, which fixes the power cap and binds to the GPU-local
-NUMA node. Numbers taken without it are not comparable to anything.
-
-One command, no arguments:
+One command, no arguments — and **not** under `denoise.sh`. This suite fixes the
+power cap and binds to the GPU-local NUMA node itself, in-process; numbers taken
+with `--no-denoise` are not comparable to anything.
 
 ```bash
 python python/test/tlx_benchmark/bench_mm.py
@@ -20,9 +19,14 @@ python python/test/tlx_benchmark/bench_mm.py
 
 It picks the least-used GPU, pins clocks/power/NUMA for the duration and puts
 them back afterwards, measures latency and cold compile for every case, writes
-`/tmp/tlx_benchmark/mm.sm100.json`, and gates against the committed baseline.
+`/tmp/tlx_benchmark/mm.<arch>.json`, and gates against the committed baseline.
 **The first run on a machine has no baseline to gate against, so it records one
 and says so**; every run after that enforces.
+
+The arch is detected, not passed: `sm100` and `gfx942` are the two `mm` entries
+today. It decides which shapes run, which baseline is gated, and where the
+artifact lands, and it is read off the part name via smi rather than via torch,
+because a CUDA context created before `--device` is applied would ignore it.
 
 ```
 device: gpu1 NVIDIA B200 (least used, 4 MiB in use)
@@ -42,7 +46,7 @@ through pytest, for the junitxml the b200 reporting pipeline consumes.
 | `--dtype` | `fp16` `bf16` `both` | |
 | `--guard` | `enforce` `report` `off` | `enforce` exits non-zero on a regression or compile-cap breach |
 | `--replicates` | int | independent measurements per case; what the gate reads (default 5; the window is sized so they total ≥1000 iterations) |
-| `--json` | path | defaults to `/tmp/tlx_benchmark/mm.sm100.json` |
+| `--json` | path | defaults to `/tmp/tlx_benchmark/mm.<arch>.json` |
 | `--update-baseline` | | re-record even though one exists |
 | `--strict-env` | | fail rather than warn when the environment is not denoised |
 | `--device` | int or `auto` | which GPU; `auto` (default) is the least-used one |
@@ -127,7 +131,9 @@ Two consequences worth carrying forward:
 
 1. **The shared shape list will produce host-bound perf cases.** Correctness
    needs small shapes; perf cannot gate them. That is a reported status rather
-   than a reason to split the list.
+   than a reason to split the list. It *is* the reason the lists are split by
+   provenance (`SYNTHETIC` / `REALWORLD_<arch>`) rather than by suite: perf runs
+   one arch's real-world list, correctness runs the union of everything.
 2. **Even at 8192³, TLX pays a ~4% host tax that torch does not** (43 µs on
    1105 µs vs 9 µs). The speedup ratio is therefore slightly biased against
    TLX. Fixing it means hoisting the per-call work out of `mm()`.
@@ -147,10 +153,32 @@ actually held is printed and recorded in the artifact, rather than what was
 attempted.
 
 The AMD path mirrors `denoise.sh`'s `rocm-smi` handling (`--setperfdeterminism`,
-`--setpoweroverdrive`, `HIP_VISIBLE_DEVICES`, sysfs NUMA via
-`/sys/class/drm/cardN`) and **has not been run on hardware** — there is no AMD
-card on the box this was written on. It degrades to "not governed" rather than
-failing.
+`--setpoweroverdrive`, `HIP_VISIBLE_DEVICES`, sysfs NUMA) and degrades to "not
+governed" rather than failing.
+
+It has now **run on MI300X hardware**, which it had not when it was written, and
+that first run found one real bug and one remaining gap.
+
+The bug: NUMA binding was silently skipped for every GPU except index 0. The
+code resolved the node through `/sys/class/drm/card<index>`, treating the
+rocm-smi device index as a DRM card index. They are different numbering schemes
+and only coincide at 0 — on an 8-GPU MI300X box rocm-smi's card6 is
+`0000:c8:00.0`, which sysfs enumerates as `card40`. Reading `card6` finds a node
+with no `numa_node` file, so the governor reported "GPU-local node unknown" and
+ran unbound. It now resolves through the PCI bus id (`rocm-smi --showbus` →
+`/sys/bus/pci/devices/<bdf>/numa_node`, lowercasing the domain rocm-smi prints in
+caps). This is the same class of mistake as the NVIDIA-side UUID indirection
+noted below, for the same reason: a device index means nothing outside the tool
+that issued it. `test_amd_numa_node_resolves_through_pci_not_the_drm_index`
+pins it.
+
+The gap: `check()` and `stable()` are NVIDIA-only. On AMD they report
+`nvidia-smi unavailable: cannot verify NUMA, tenancy, or the GPU operating
+point`, so a run is *governed* but not *verified* — there is no equivalent of
+the clock/throttle trace, and a co-tenant process would go unnoticed. The
+governing half is what the measured stability comes from, so this is a
+reporting hole rather than a measurement one, but it should be closed with the
+`rocm-smi` equivalents.
 
 ### `-lgc` does not lock the clock for compute-bound work on B200
 
@@ -353,8 +381,11 @@ Tuned small shapes are also ~4× faster than the heuristic config picks
 ### The committed baseline is `space="heuristic"`
 
 `baselines/mm.sm100.json` records 8 cases — the four compute-bound shapes in
-fp16 and bf16 — at 0.92–1.06× cuBLAS and ~1000–1073 TFLOP/s. The 16 host-bound
-cases are refused rather than recorded.
+fp16 and bf16 — at 0.92–1.06× cuBLAS and ~1000–1073 TFLOP/s. It predates the
+list split and so was recorded when the perf run still covered the synthetic
+shapes too; the 16 host-bound cases among them were refused rather than
+recorded. Perf now runs `REALWORLD_SM100` only, so those cases no longer arise.
+`baselines/mm.gfx942.json` is the MI300X equivalent.
 
 This now matches `tlx.ops.mm`'s own default, so the baseline describes the path
 users actually take. `load()` still refuses to compare a baseline recorded at

@@ -136,6 +136,60 @@ def test_visibility_variable_follows_the_vendor():
     assert Device(AMD, 2, "MI350X").visibility_env == "HIP_VISIBLE_DEVICES"
 
 
+def test_sampler_join_does_not_shadow_thread_internals():
+    """``_stop`` is a Thread *method*, not a free name for a flag.
+
+    Regression test. ``_Sampler`` held its stop flag in ``self._stop``, which
+    shadows the method CPython calls from inside ``join()``, so every successful
+    join raised ``TypeError: 'Event' object is not callable``. It fired at the
+    very end of ``stable()``, discarding a whole run's results after all the
+    measurement was already done. Nothing arch-specific about it -- any join
+    that succeeds hits it.
+    """
+    from _harness.denoise import _Sampler
+
+    sampler = _Sampler(uuid=None)
+    sampler.start()
+    trace = sampler.finish()  # raised TypeError before the rename
+    assert trace.samples == 0  # no NVML handle, so nothing was collected
+    assert not sampler.is_alive()
+
+
+def test_arch_matches_the_part():
+    """The catalog key is read off the part, before any CUDA context exists."""
+    from _harness.denoise import AMD, NVIDIA, Device
+
+    assert Device(NVIDIA, 0, "NVIDIA B200").arch == "sm100"
+    assert Device(AMD, 0, "MI300X").arch == "gfx942"
+    # "GB200" contains "B200"; both map to sm100, but the longer key must win so
+    # the table stays correct if they ever diverge.
+    assert Device(NVIDIA, 0, "NVIDIA GB200").arch == "sm100"
+    # No entry yet -- None, not a guess. bench_mm turns this into a skip.
+    assert Device(AMD, 0, "MI350X").arch is None
+
+
+def test_amd_numa_node_resolves_through_pci_not_the_drm_index(tmp_path, monkeypatch):
+    """rocm-smi's device index is not the DRM card index.
+
+    Regression test. The first version read ``/sys/class/drm/card<index>``,
+    which only coincides at 0: on an 8-GPU MI300X box rocm-smi's card6 is
+    ``0000:c8:00.0``, enumerated by sysfs as ``card40``. Every device but the
+    first silently got "GPU-local node unknown" and ran unbound.
+    """
+    from _harness import denoise
+
+    pci = tmp_path / "0000:c8:00.0"
+    pci.mkdir()
+    (pci / "numa_node").write_text("1\n")
+    monkeypatch.setattr(denoise, "_PCI_DEVICES", str(tmp_path))
+    # rocm-smi reports the domain in uppercase; sysfs spells it lowercase.
+    monkeypatch.setattr(denoise, "_rocm", lambda args: "device,PCI Bus\ncard6,0000:C8:00.0")
+
+    assert denoise._amd_numa_node(6) == 1
+    # A device whose bus id is not in the listing gets None, not another's node.
+    assert denoise._amd_numa_node(7) is None
+
+
 def test_auto_selection_picks_the_least_used_gpu(monkeypatch):
     """By free memory, not by index: on a shared box a co-tenant is the failure
     mode most likely to go unnoticed, and index 0 is as likely to be busy as

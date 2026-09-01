@@ -1,14 +1,39 @@
-"""Shapes for ``tlx.ops.mm`` on Blackwell -- the single source of truth.
+"""Shapes for ``tlx.ops.mm`` -- the single source of truth, across architectures.
 
-Both suites import this list:
+Three lists, and the split is by *provenance*, not by which suite reads them:
 
-* correctness -- ``python/test/unit/tlx_ops/test_mm.py``
-* performance -- ``python/test/tlx_benchmark/bench_mm.py``
+* :data:`SYNTHETIC` -- hand-picked to exercise a code path (edge tiles, layouts,
+  split-K). Nobody asked for these shapes; they exist to break the kernel.
+* :data:`REALWORLD_SM100` -- compute-bound shapes users actually run on Blackwell.
+* :data:`REALWORLD_GFX942` -- the same, requested for MI300X.
 
-Sharing is deliberate, and the invariant it buys is worth more than the
-convenience: a shape commented out for a correctness bug cannot stay
-benchmarkable. Benchmarking a path that returns wrong answers produces a
-number that looks like signal and is not.
+Both suites import from here:
+
+* correctness -- ``python/test/unit/tlx_ops/test_mm.py`` runs :data:`ALL`, the
+  union, on whatever GPU is present.
+* performance -- ``python/test/tlx_benchmark/bench_<op>.py`` runs only the
+  current arch's real-world list, reached through that arch's kernel module
+  (``sm100.PERF_SHAPES`` / ``gfx942.PERF_SHAPES``).
+
+Correctness runs the union and perf does not, for two different reasons. A
+synthetic edge-tile shape is too small to gate a *number* on -- the perf suite
+would report it ``HOST_BOUND`` and refuse to gate it anyway -- but it is exactly
+what catches a masking bug. And another arch's real-world shapes are free
+correctness coverage: they are real geometries nobody chose with this kernel in
+mind, which is what makes them good at finding assumptions. Perf is the
+opposite: a Blackwell number for an MI300X-requested shape answers a question
+nobody asked, and costs minutes to produce.
+
+The union is what buys the invariant that matters: a shape commented out for a
+correctness bug cannot stay benchmarked. Benchmarking a path that returns wrong
+answers produces a number that looks like signal and is not.
+
+**A shape in the union is not necessarily runnable on every arch.** ``sm100``
+requires 16-byte-aligned TMA descriptor strides and declines anything else with
+``InvalidInput``; ``gfx942`` loads through plain strided pointers and has no
+such constraint. The correctness suite treats a declined shape as a skip, so
+each arch runs the subset it admits. Today exactly one entry is affected:
+``REALWORLD_GFX942``'s ``K = 1894`` shape, which sm100 declines.
 
 Entries are ``[M, N, K, a_row_major, b_row_major]``. Layout belongs in the
 entry rather than in a separate axis because a column-major operand is a
@@ -57,14 +82,13 @@ xfailing or loosening to go green.
 
 from __future__ import annotations
 
-#: ``[M, N, K, a_row_major, b_row_major]``
+#: ``[M, N, K, a_row_major, b_row_major]`` -- path coverage, not real workloads.
 #:
-#: Correctness-motivated entries come first, then the compute-bound entries the
-#: perf suite needs. The perf suite reports the small entries as ``HOST_BOUND``
-#: rather than gating them: ``tlx.ops.mm`` costs 43-63us of host time per call,
-#: so anything under roughly 300us measures Python rather than the kernel. They
-#: stay because correctness needs them, and the status says so honestly.
-SHAPES: list[list] = [
+#: Correctness-only. Most are far too small to time: ``tlx.ops.mm`` costs 43-63us
+#: of host time per call, so anything under roughly 300us measures Python rather
+#: than the kernel, and the perf suite would refuse to gate them anyway. They
+#: earn their place by breaking things, not by being fast.
+SYNTHETIC: list[list] = [
     # Square, both row-major -- the baseline path, small and large.
     [256, 256, 256, True, True],
     [1024, 1024, 1024, True, True],
@@ -81,16 +105,25 @@ SHAPES: list[list] = [
     # Non-power-of-two in M and N together. Regression test for the split-K
     # remainder-tile fix (#3401).
     [1000, 1000, 1024, True, True],
+    # Same, but with a partial K tile: 200 is 6 full 32-wide tiles plus 8, so
+    # the masked tail of the reduction runs. Every other entry has K divisible
+    # by 32 and never exercises it. Carried over from the gfx942 tutorial's
+    # odd-shape test, which this list replaced; K=200 rather than that test's
+    # 130 because 130 fails sm100's 16-byte TMA stride rule and would have
+    # restored the coverage on one arch only.
+    [1000, 1000, 200, True, True],
     # K-heavy: few output tiles, long reduction. Split-K territory, the one
     # path that runs a second kernel.
     [256, 256, 16384, True, True],
     # Tall-skinny: most of the grid idle. Also a regression test for #3401.
     [64, 4096, 4096, True, True],
+]
 
-    # ---- compute-bound, added for perf ------------------------------------
-    # Taken from tritonbench's gemm BUILDIN_SHAPES so the numbers are
-    # comparable to a tritonbench run of the same shape.
-    #
+#: Compute-bound Blackwell shapes. ``bench_mm.py`` gates on these.
+#:
+#: Taken from tritonbench's gemm BUILDIN_SHAPES so the numbers are comparable to
+#: a tritonbench run of the same shape.
+REALWORLD_SM100: list[list] = [
     # Square flagship: the only entry where host overhead is a small enough
     # fraction (43us on 1105us) for the speedup ratio to be nearly unbiased.
     [8192, 8192, 8192, True, True],
@@ -106,6 +139,60 @@ SHAPES: list[list] = [
     # TODO(NUM_CTAS=2 multi-N-tile): fails, see module docstring.
     # [1000000, 512, 512, True, True],
 ]
+
+#: MI300X shapes users asked for, ordered by how much time they cost in
+#: aggregate -- shape latency times how often it occurs -- so entry 0 is the one
+#: worth the most. Truncated at ten, which the source measurement puts at ~90%
+#: of the total deficit against the vendor library.
+#:
+#: These are recorded geometries, so they are irregular in ways synthetic shapes
+#: never are, and that is the point of carrying them:
+#:
+#: * ``K = 1894`` is odd. On gfx942 that is merely unaligned; on sm100 it fails
+#:   the 16-byte TMA stride rule outright (1894 * 2 = 3788, 3788 % 16 == 12), so
+#:   ``tlx.ops.mm`` declines it there. It is the only entry any arch declines.
+#: * ``N = 192`` and ``N = 256`` against multi-hundred-thousand ``M`` are narrow
+#:   and very tall -- power-of-two N tiles either underfill or need a second
+#:   epilogue path.
+#: * ``N = 242432`` is the opposite extreme and the largest working set here at
+#:   roughly 5 GB, which still fits comfortably on both MI300X and B200.
+#:
+#: Several were requested as fused ``addmm``. ``tlx.ops.mm`` has no bias, so what
+#: is carried here is the GEMM geometry only -- the bias is a separate epilogue
+#: question and does not change the tile the kernel has to pick.
+REALWORLD_GFX942: list[list] = [
+    [819200, 192, 1024, True, True],
+    # The odd-K entry. sm100 declines this one; see above.
+    [4096, 242432, 1894, True, True],
+    [1024, 20480, 6144, True, True],
+    [2048, 10240, 25408, True, True],
+    [61440, 5120, 2048, True, True],
+    [2252800, 256, 256, True, True],
+    [61440, 3840, 4096, True, True],
+    [4096, 4096, 2048, True, True],
+    [61440, 5120, 7744, True, True],
+    [1024, 6144, 4096, True, True],
+]
+
+
+def _union(*lists: list[list]) -> list[list]:
+    """Concatenate, dropping later duplicates and keeping first-seen order.
+
+    The lists are independently sourced, so an overlap is possible and would
+    otherwise silently double a correctness case's runtime.
+    """
+    seen, out = set(), []
+    for shapes in lists:
+        for shape in shapes:
+            key = tuple(shape)
+            if key not in seen:
+                seen.add(key)
+                out.append(shape)
+    return out
+
+
+#: Every shape, for the correctness suite. Perf never reads this.
+ALL: list[list] = _union(SYNTHETIC, REALWORLD_SM100, REALWORLD_GFX942)
 
 
 def operand(rows, cols, dtype, row_major, device="cuda"):

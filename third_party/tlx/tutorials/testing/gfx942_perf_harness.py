@@ -180,7 +180,7 @@ class OpSpec(NamedTuple):
     bias or a batch dimension just returns more tensors.
     """
 
-    name: str  # e.g. "amd_gemm_gfx942", used in the table title and plot name
+    name: str  # e.g. "amd_addmm_gfx942", used in the table title and plot name
     axes: tuple  # shape axis labels, e.g. ("M", "N", "K")
     shapes: list  # list of tuples, each matching `axes`
     make_inputs: Callable  # (shape, dtype) -> tuple of tensors

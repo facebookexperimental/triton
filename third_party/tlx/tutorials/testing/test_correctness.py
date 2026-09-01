@@ -83,8 +83,6 @@ from triton.language.extra.tlx.tutorials.amd_gemm_warp_pipeline import (
     matmul as _amd_gemm_warp_pipeline, )
 from triton.language.extra.tlx.tutorials.amd_gemm_pipelined import (
     matmul as _amd_gemm_pipelined, )
-from triton.language.extra.tlx.tutorials.amd_gemm_gfx942 import (
-    matmul as _amd_gemm_gfx942, )
 from triton.language.extra.tlx.tutorials.amd_addmm_gfx942 import (
     addmm as _amd_addmm_gfx942, )
 from triton.language.extra.tlx.tutorials.amd_bmm_gfx942 import (
@@ -120,8 +118,7 @@ from triton.language.extra.tlx.tutorials.amd_addmm_gfx950 import (
     available_paths as _amd_addmm_paths,
 )
 from triton.language.extra.tlx.tutorials.gfx9_gemm.inter_wave.a16w16.matmul_kernel import (
-    _needs_i64_offsets as _amd_gemm_needs_i64_offsets,
-)
+    _needs_i64_offsets as _amd_gemm_needs_i64_offsets, )
 from triton.language.extra.tlx.tutorials import amd_hstu_attn as _hstu
 from triton.tools.mxfp import MXScaleTensor
 
@@ -2437,13 +2434,6 @@ def test_amd_gemm_pipelined(dtype):
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
-@pytest.mark.skipif(not is_hip_cdna3(), reason="Requires gfx942 hardware (MI300X / CDNA3)")
-def test_amd_gemm_gfx942(dtype):
-    # Autotuned kernel: no fixed config (config=None).
-    Gemm.run_test(_amd_gemm_gfx942, None, dtype=dtype)
-
-
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
 @pytest.mark.parametrize("bias_shape", ["1d", "2d"])
 @pytest.mark.skipif(not is_hip_cdna3(), reason="Requires gfx942 hardware (MI300X / CDNA3)")
 def test_amd_addmm_gfx942(bias_shape, dtype):
@@ -2481,16 +2471,6 @@ def test_amd_bmm_gfx942_distinct_a(dtype):
     a = (torch.randn((B, M, K), device=DEVICE, dtype=dtype) + 1) / K
     b = (torch.randn((B, K, N), device=DEVICE, dtype=dtype) + 1) / K
     torch.testing.assert_close(_amd_bmm_gfx942(a, b), torch.bmm(a, b))
-
-
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
-@pytest.mark.skipif(not is_hip_cdna3(), reason="Requires gfx942 hardware (MI300X / CDNA3)")
-def test_amd_gemm_gfx942_odd_shapes(dtype):
-    # M/N wraparound + masked store, and a partial K tile -- none of which the
-    # block-aligned Gemm.SHAPES exercise. Small shapes also make the autotuner
-    # prune down to the narrow tiles, covering that path.
-    shapes = [(255, 129, 130), (1000, 1000, 200), (64, 64, 4096), (3000, 500, 700)]
-    Gemm.run_test(_amd_gemm_gfx942, None, shapes=shapes, dtype=dtype)
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])

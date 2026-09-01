@@ -22,7 +22,6 @@ Each kernel is an importable module under `third_party/tlx/tutorials/`.
 |---|---|---|---|---|
 | `amd_gemm_warp_pipeline.py` | GEMM | `test_amd_gemm_warp_pipeline` | `test_amd_gemm_perf.py` (`warp_pipeline`) | `is_hip_cdna4` |
 | `amd_gemm_pipelined.py` | GEMM (LDS pipeline) | `test_amd_gemm_pipelined` | `test_amd_gemm_perf.py` (`pipelined`) | `is_hip` |
-| `amd_gemm_gfx942.py` | GEMM (MI300X, autotuned) | `test_amd_gemm_gfx942`, `test_amd_gemm_gfx942_odd_shapes` | `test_amd_gemm_gfx942_perf.py` | `is_hip_cdna3` |
 | `amd_addmm_gfx942.py` | addmm (MI300X, autotuned) | `test_amd_addmm_gfx942` | `test_amd_addmm_gfx942_perf.py` | `is_hip_cdna3` |
 | `amd_bmm_gfx942.py` | BMM (MI300X, autotuned) | `test_amd_bmm_gfx942`, `test_amd_bmm_gfx942_distinct_a` | `test_amd_bmm_gfx942_perf.py` | `is_hip_cdna3` |
 | `amd_fa_pipelined.py` | Flash Attention | `test_amd_fa_pipelined` | `test_amd_fa_perf.py` (`simple`, `prefetch`) | `is_hip_cdna4` |
@@ -37,9 +36,15 @@ Each kernel is an importable module under `third_party/tlx/tutorials/`.
 (`is_hip_cdna3()`). `gfx1250` is a separate, newer target (`is_hip_gfx1250()`). On
 gfx950, both the gfx1250-only and the gfx942-only GEMM tests auto-skip.
 
-The MI300X kernel is the only gfx942 entry and has **no CI runner** — the MI350
-workflow is gfx950, so `test_amd_gemm_gfx942*` always skips there. Run it by hand
-on an MI300X box.
+MI300X GEMM is **not** in this table: it was promoted out of the tutorials into
+`tlx.ops.mm` (`third_party/tlx/ops/kernels/mm/gfx942.py`). Its correctness is
+`python/test/unit/tlx_ops/test_mm.py` and its perf is
+`python python/test/tlx_benchmark/bench_mm.py`, which governs the machine itself
+and so is **not** wrapped in `denoise.sh`. The addmm and bmm tutorials still
+import shared primitives from that op module.
+
+The gfx942 entries have **no CI runner** — the MI350 workflow is gfx950, so
+they always skip there. Run them by hand on an MI300X box.
 
 ## Correctness
 

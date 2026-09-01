@@ -1,6 +1,6 @@
 """Pin a candidate's Triton autotuner to one config, without touching the kernel.
 
-`amd_gemm_gfx942` searches 42 configs per (M, N, K). Left alone that makes the
+`tlx.ops.mm` at `space="full"` searches 42 configs per (M, N, K). Left alone that makes the
 promote/reject gate measure *tile selection* rather than the structural change
 the candidate actually made -- two candidates can differ only in which tile the
 autotuner happened to pick -- and it makes every evaluation pay the search.

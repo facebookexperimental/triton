@@ -423,24 +423,28 @@ class _Sampler(threading.Thread):
     """Watches the operating point in the background at ~20 Hz."""
 
     def __init__(self, uuid: Optional[str]):
-        # ``daemon`` must be set on the instance, and the NVML handle must not
-        # be called ``_handle``: both names belong to Thread.
+        # Three names here belong to Thread and must not be reused: ``daemon``
+        # (set via the constructor), ``_handle`` (hence ``_nvml_handle``), and
+        # ``_stop``. The last one is not a flag but a *method* CPython calls
+        # from inside ``join()``; shadowing it with an Event made every
+        # successful join raise ``TypeError: 'Event' object is not callable``,
+        # which discarded a whole run's results at the very end.
         super().__init__(daemon=True)
         self._nvml_handle = nvml().handle(uuid)
-        self._stop = threading.Event()
+        self._stopped = threading.Event()
         self.clocks: list[int] = []
         self.reasons = 0
 
     def run(self):
-        while not self._stop.is_set():
+        while not self._stopped.is_set():
             got = nvml().sample(self._nvml_handle)
             if got is not None:
                 self.clocks.append(got[0])
                 self.reasons |= got[1]
-            self._stop.wait(SAMPLE_INTERVAL_S)
+            self._stopped.wait(SAMPLE_INTERVAL_S)
 
     def finish(self) -> ClockTrace:
-        self._stop.set()
+        self._stopped.set()
         self.join(timeout=5)
         if not self.clocks:
             return ClockTrace(samples=0)
@@ -532,6 +536,22 @@ POWER_TARGET_W = {
 #: did nothing and determinism is the working knob.
 AMD_DETERMINISM_MHZ = 2100
 
+#: Part name -> ``tlx.ops`` catalog arch key.
+#:
+#: Resolved from the part rather than from torch because the arch is needed
+#: *before* the first CUDA call: the visibility variable that pins the device is
+#: read once at context creation, so anything that initializes a context first
+#: silently defeats ``--device``. ``list_devices`` is smi-based and does not.
+#:
+#: Longer names first, as in ``POWER_TARGET_W``: the lookup is a substring test,
+#: so "B200" would otherwise swallow "GB200".
+ARCH_BY_PART = {
+    "GB200": "sm100",
+    "GB300": "sm100",
+    "B200": "sm100",
+    "MI300X": "gfx942",
+}
+
 
 @dataclasses.dataclass(frozen=True)
 class Device:
@@ -550,6 +570,14 @@ class Device:
         for part, watts in POWER_TARGET_W.items():
             if part.lower() in self.name.lower().replace(" ", ""):
                 return watts
+        return None
+
+    @property
+    def arch(self) -> Optional[str]:
+        """``tlx.ops`` catalog key for this part, or None if it has no entry."""
+        for part, key in ARCH_BY_PART.items():
+            if part.lower() in self.name.lower().replace(" ", ""):
+                return key
         return None
 
 
@@ -631,14 +659,38 @@ def select_device(spec: str = "auto") -> Optional[Device]:
     return min(devices, key=lambda d: d.memory_used_mib)
 
 
+#: Where sysfs enumerates PCI devices. A module constant so the resolution above
+#: can be tested without a GPU.
+_PCI_DEVICES = "/sys/bus/pci/devices"
+
+
 def _amd_numa_node(index: int) -> Optional[int]:
-    try:
-        link = os.path.realpath(f"/sys/class/drm/card{index}/device")
-        with open(f"{link}/numa_node") as fh:
-            node = int(fh.read().strip())
-    except (OSError, ValueError):
-        return None
-    return node if node >= 0 else None
+    """GPU-local NUMA node for a *rocm-smi* device index.
+
+    Resolved through the PCI bus id, not through ``/sys/class/drm/card<index>``.
+    Those two indices are different numbering schemes and only coincide at 0: on
+    an 8-GPU MI300X box rocm-smi's card6 is ``0000:c8:00.0``, which sysfs
+    enumerates as ``card40``. Reading ``card6`` there finds a node with no
+    ``numa_node`` at all, so binding was silently skipped for every device but
+    the first -- and NUMA binding is the one lever here that needs no privilege
+    and was measured to matter.
+
+    This mirrors the UUID indirection the NVIDIA path already needs, for the
+    same underlying reason: a device index is only meaningful to the tool that
+    issued it.
+    """
+    bus = _rocm(["-d", str(index), "--showbus", "--csv"]) or ""
+    for line in bus.splitlines():
+        fields = [f.strip() for f in line.split(",")]
+        # e.g. "card6,0000:C8:00.0"; sysfs spells the domain in lowercase.
+        if len(fields) >= 2 and fields[0].lower() == f"card{index}":
+            try:
+                with open(f"{_PCI_DEVICES}/{fields[1].lower()}/numa_node") as fh:
+                    node = int(fh.read().strip())
+            except (OSError, ValueError):
+                return None
+            return node if node >= 0 else None
+    return None
 
 
 class Governor(contextlib.AbstractContextManager):
