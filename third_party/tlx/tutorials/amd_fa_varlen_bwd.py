@@ -1,11 +1,12 @@
 """Packed variable-length BF16 D128 attention backward for gfx950.
 
 Each workgroup owns a KV tile and a subset of its mapped query heads.  The
-baseline path uses BN128/BM16 phases; long non-causal split-GQA uses masked
-BN256/BM32 phases and forms dQ as two native BM16 accumulator chains.  Split
-workgroups reduce their BF16 dK/dV partials in FP32.  Independent KV owners
-combine dQ contributions with BF16 atomics in a guarded native layout,
-followed by a conversion to packed THD order.
+baseline path uses BN128/BM16 phases and supports non-causal MHA/GQA plus
+causal self-attention MHA; long non-causal split-GQA uses masked BN256/BM32
+phases and forms dQ as two native BM16 accumulator chains.  Split workgroups
+reduce their BF16 dK/dV partials in FP32.  Independent KV owners combine dQ
+contributions with BF16 atomics in a guarded native layout, followed by a
+conversion to packed THD order.
 
 Call :func:`prepare_varlen_backward` once and reuse the resulting plan with
 :func:`fa_varlen_backward`.  Plan creation performs one device-to-host
@@ -60,6 +61,7 @@ class VarlenBackwardPlan:
     total_kv: int
     max_q: int
     num_full_kv_blocks: int
+    qk_offsets_equal: bool
 
 
 def _copy_and_validate_cu_seqlens(name: str, value: torch.Tensor) -> tuple[torch.Tensor, list[int]]:
@@ -173,6 +175,7 @@ def prepare_varlen_backward(cu_seqlens_q: torch.Tensor, cu_seqlens_k: torch.Tens
         total_kv=k_offsets[-1],
         max_q=max(q_lengths),
         num_full_kv_blocks=num_full_kv_blocks,
+        qk_offsets_equal=q_offsets == k_offsets,
     )
 
 
@@ -828,6 +831,8 @@ def _varlen_bwd_interleaved_kernel(
     BLOCK_N: tl.constexpr,
     FULL_KV_TILE: tl.constexpr,
     KV_SPLITS: tl.constexpr,
+    IS_CAUSAL: tl.constexpr,
+    V_STRIDE_T: tl.constexpr,
 ):
     """Compute current dK/dV while consuming the preceding dS phase for dQ."""
     tl.static_assert(D == 128)
@@ -853,7 +858,9 @@ def _varlen_bwd_interleaved_kernel(
     q_len = (q_end - q_start).to(tl.int32)
     kv_len = (kv_end - kv_start).to(tl.int32)
     q_blocks = (q_len + BLOCK_M - 1) // BLOCK_M
-    total_steps = heads_per_split * q_blocks
+    first_q_block = n0 // BLOCK_M if IS_CAUSAL else 0
+    active_q_blocks = q_blocks - first_q_block
+    total_steps = heads_per_split * active_q_blocks
 
     qdo_layout: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases(
         [(512, 32)],
@@ -919,7 +926,7 @@ def _varlen_bwd_interleaved_kernel(
         q_start,
         q_len,
         kv_head * group_size + split * heads_per_split,
-        0,
+        first_q_block,
         HQ,
         D,
         BLOCK_M,
@@ -927,13 +934,19 @@ def _varlen_bwd_interleaved_kernel(
     initial_wait = tlx.async_load_wait_group(0)
     tl.debug_barrier()
 
-    v_offsets = tlx.require_layout(kv_offsets.to(tl.int32), k_nm_layout, pin=False)
+    if IS_CAUSAL:
+        v_base = V + kv_start * V_STRIDE_T + kv_head.to(tl.int64) * D
+        v_offsets = offs_n[:, None] * V_STRIDE_T + offs_d[None, :]
+    else:
+        v_base = V
+        v_offsets = kv_offsets
+    v_offsets = tlx.require_layout(v_offsets.to(tl.int32), k_nm_layout, pin=False)
     if FULL_KV_TILE:
-        v_tile = tlx.buffer_load(V, v_offsets)
+        v_tile = tlx.buffer_load(v_base, v_offsets)
     else:
         v_valid = tlx.require_layout(tl.broadcast_to(kv_mask, (BLOCK_N, D)), k_nm_layout, pin=False)
         v_zero = tlx.zeros((BLOCK_N, D), tl.bfloat16, layout=k_nm_layout)
-        v_tile = tlx.buffer_load(V, v_offsets, mask=v_valid, other=v_zero)
+        v_tile = tlx.buffer_load(v_base, v_offsets, mask=v_valid, other=v_zero)
     v_tile = tlx.require_layout(v_tile, k_nm_layout, pin=False)
     dk = tlx.zeros((BLOCK_N, D), tl.float32, layout=mma_nd)
     dv = tlx.zeros((BLOCK_N, D), tl.float32, layout=mma_nd)
@@ -944,18 +957,18 @@ def _varlen_bwd_interleaved_kernel(
         current_slot = step % 2
         next_slot = 1 - current_slot
         if KV_SPLITS > 1 and heads_per_split == 1:
-            q_step = step
+            q_step = first_q_block + step
             q_head = kv_head * group_size + split
             next_step = tl.minimum(step + 1, total_steps - 1)
-            next_q_step = next_step
+            next_q_step = first_q_block + next_step
             next_q_head = q_head
         else:
-            group_index = step // q_blocks
-            q_step = step % q_blocks
+            group_index = step // active_q_blocks
+            q_step = first_q_block + step % active_q_blocks
             q_head = kv_head * group_size + split * heads_per_split + group_index
             next_step = tl.minimum(step + 1, total_steps - 1)
-            next_group_index = next_step // q_blocks
-            next_q_step = next_step % q_blocks
+            next_group_index = next_step // active_q_blocks
+            next_q_step = first_q_block + next_step % active_q_blocks
             next_q_head = kv_head * group_size + split * heads_per_split + next_group_index
         _issue_qdo_async(
             tlx.local_view(q_buffers, next_slot),
@@ -1002,7 +1015,24 @@ def _varlen_bwd_interleaved_kernel(
         else:
             valid = (offs_n[:, None] < kv_len) & (rows[None, :] < q_len)
         valid = tlx.require_layout(valid, mma_nm, pin=False)
-        p_t = tlx.require_layout(tl.where(valid, tl.math.exp2(scores_t), 0.0), mma_nm, pin=False)
+        if IS_CAUSAL:
+            query_fragment = q_step - first_q_block
+            if query_fragment < BLOCK_N // BLOCK_M:
+                causal_n = n0 + tlx.rematerialized_range(0, BLOCK_N, 32, placement=step)
+                causal_m = q_step * BLOCK_M + tlx.rematerialized_range(0, BLOCK_M, 33, placement=step)
+                causal_valid = causal_n[:, None] <= causal_m[None, :]
+                causal_valid = tlx.require_layout(causal_valid, mma_nm, pin=False)
+                valid = valid & causal_valid
+            neg_inf = tlx.require_layout(
+                tl.full((BLOCK_N, BLOCK_M), float("-inf"), dtype=tl.float32),
+                mma_nm,
+                pin=False,
+            )
+            scores_t = tl.where(valid, scores_t, neg_inf)
+            scores_t = tlx.require_layout(scores_t, mma_nm, pin=False)
+            p_t = tlx.require_layout(tl.math.exp2(scores_t), mma_nm, pin=False)
+        else:
+            p_t = tlx.require_layout(tl.where(valid, tl.math.exp2(scores_t), 0.0), mma_nm, pin=False)
         dp_acc = tlx.zeros((BLOCK_N, BLOCK_M), tl.float32, layout=mma_nm)
         dp_t = tl.dot(v_tile, do_t, acc=dp_acc, out_dtype=dp_acc.dtype)
         delta_full = tlx.require_layout(
@@ -1022,11 +1052,11 @@ def _varlen_bwd_interleaved_kernel(
         if step > 0:
             previous_step = step - 1
             if KV_SPLITS > 1 and heads_per_split == 1:
-                previous_q_step = previous_step
+                previous_q_step = first_q_block + previous_step
                 previous_q_head = kv_head * group_size + split
             else:
-                previous_group_index = previous_step // q_blocks
-                previous_q_step = previous_step % q_blocks
+                previous_group_index = previous_step // active_q_blocks
+                previous_q_step = first_q_block + previous_step % active_q_blocks
                 previous_q_head = kv_head * group_size + split * heads_per_split + previous_group_index
             previous_dq_acc_base = ((previous_q_head.to(tl.int64) * TOTAL_Q_PADDED + q_scratch_start) * D).to(tl.int32)
             previous_ds = tlx.local_load(tlx.local_view(ds_buffers, 1 - current_slot), layout=ds_md_layout)
@@ -1050,11 +1080,11 @@ def _varlen_bwd_interleaved_kernel(
     tl.debug_barrier()
     last_step = total_steps - 1
     if KV_SPLITS > 1 and heads_per_split == 1:
-        last_q_step = last_step
+        last_q_step = first_q_block + last_step
         last_q_head = kv_head * group_size + split
     else:
-        last_group_index = last_step // q_blocks
-        last_q_step = last_step % q_blocks
+        last_group_index = last_step // active_q_blocks
+        last_q_step = first_q_block + last_step % active_q_blocks
         last_q_head = kv_head * group_size + split * heads_per_split + last_group_index
     last_dq_acc_base = ((last_q_head.to(tl.int64) * TOTAL_Q_PADDED + q_scratch_start) * D).to(tl.int32)
     last_ds = tlx.local_load(tlx.local_view(ds_buffers, last_step % 2), layout=ds_md_layout)
@@ -1158,7 +1188,7 @@ def _varlen_dq_convert_kernel(
     tl.store(DQ + output_offsets, values, mask=valid)
 
 
-def _validate_backward_inputs(q, k, v, o, do, lse, plan, sm_scale):
+def _validate_backward_inputs(q, k, v, o, do, lse, plan, sm_scale, causal):
     if not isinstance(plan, VarlenBackwardPlan):
         raise TypeError("plan must be a VarlenBackwardPlan")
     if not math.isfinite(float(sm_scale)):
@@ -1173,6 +1203,10 @@ def _validate_backward_inputs(q, k, v, o, do, lse, plan, sm_scale):
         raise ValueError("packed backward requires positive Q and KV head counts")
     if heads % kv_heads != 0:
         raise ValueError("packed D128 backward requires Q heads divisible by KV heads")
+    if causal and not plan.qk_offsets_equal:
+        raise ValueError("causal packed backward requires identical Q and KV cumulative offsets")
+    if causal and heads != kv_heads:
+        raise ValueError("causal packed backward currently requires equal Q and KV head counts")
     if head_dim != 128 or kv_dim != 128:
         raise ValueError("packed backward currently requires head dimension 128")
     _validate_i32_buffer_offsets(
@@ -1188,11 +1222,23 @@ def _validate_backward_inputs(q, k, v, o, do, lse, plan, sm_scale):
             raise ValueError(f"{name} must match q shape and device")
         if tensor.dtype is not torch.bfloat16 or not tensor.is_contiguous():
             raise ValueError(f"{name} must be contiguous bfloat16 THD")
-    for name, tensor in {"k": k, "v": v}.items():
-        if tensor.shape != k.shape or tensor.device != q.device:
-            raise ValueError(f"{name} must match k shape and q device")
-        if tensor.dtype is not torch.bfloat16 or not tensor.is_contiguous():
-            raise ValueError(f"{name} must be contiguous bfloat16 THD")
+    if k.shape != (total_kv, kv_heads, head_dim) or k.device != q.device:
+        raise ValueError("k must match its packed THD shape and q device")
+    if k.dtype is not torch.bfloat16 or not k.is_contiguous():
+        raise ValueError("k must be contiguous bfloat16 THD")
+    if v.shape != k.shape or v.device != q.device:
+        raise ValueError("v must match k shape and q device")
+    if v.dtype is not torch.bfloat16:
+        raise ValueError("v must be bfloat16 THD")
+    if causal:
+        dense_head_axes = v.stride(-1) == 1 and v.stride(-2) == head_dim
+        nonoverlapping_tokens = v.stride(0) >= kv_heads * head_dim
+        if not dense_head_axes or not nonoverlapping_tokens:
+            raise ValueError("causal v must have dense head/D axes and a positive non-overlapping token stride")
+        if plan.max_q * v.stride(0) > _I32_BUFFER_BF16_ELEMENTS:
+            raise ValueError("causal V sequence stride exceeds the signed 32-bit byte-offset range")
+    elif not v.is_contiguous():
+        raise ValueError("v must be contiguous bfloat16 THD")
     if plan.cu_seqlens_q.device != q.device or plan.cu_seqlens_k.device != q.device:
         raise ValueError("the prepared plan and inputs must be on the same device")
     if lse.shape != (heads, total_q) or lse.device != q.device or lse.dtype is not torch.float32:
@@ -1204,9 +1250,15 @@ def _validate_backward_inputs(q, k, v, o, do, lse, plan, sm_scale):
         raise ValueError(f"gfx950 is required, got {arch}")
 
 
-def fa_varlen_backward(q, k, v, o, do, lse, plan, sm_scale):
-    """Run packed BF16 D128 non-causal MHA/GQA backward using a prepared plan."""
-    _validate_backward_inputs(q, k, v, o, do, lse, plan, sm_scale)
+def fa_varlen_backward(q, k, v, o, do, lse, plan, sm_scale, causal=False):
+    """Run packed BF16 D128 backward using a prepared immutable-offset plan.
+
+    Non-causal mode supports MHA/GQA with independent Q and KV offsets.  Causal
+    mode is limited to self-attention MHA, so Q/KV offsets and head counts must
+    match.  Its V input may have a larger token stride when the head and D axes
+    remain dense, as in TritonBench's ``v_storage[:, 0]`` view.
+    """
+    _validate_backward_inputs(q, k, v, o, do, lse, plan, sm_scale, causal)
     total_q, heads, head_dim = q.shape
     total_kv, kv_heads, _ = k.shape
     group_size = heads // kv_heads
@@ -1214,7 +1266,7 @@ def fa_varlen_backward(q, k, v, o, do, lse, plan, sm_scale):
     total_q_padded = total_q + plan.batch * (_BLOCK_M - 1)
     dq = torch.empty_like(q)
     dk = torch.empty_like(k)
-    dv = torch.empty_like(v)
+    dv = torch.empty_like(k)
     dk_part, dv_part = _allocate_varlen_dkdv_partials(k, kv_splits)
     if dk_part is None:
         kv_splits = 1
@@ -1296,6 +1348,8 @@ def fa_varlen_backward(q, k, v, o, do, lse, plan, sm_scale):
                 BLOCK_N=_BLOCK_N,
                 FULL_KV_TILE=full_kv_tile,
                 KV_SPLITS=kv_splits,
+                IS_CAUSAL=causal,
+                V_STRIDE_T=v.stride(0),
                 num_warps=4,
                 num_stages=1,
                 matrix_instr_nonkdim=16,
