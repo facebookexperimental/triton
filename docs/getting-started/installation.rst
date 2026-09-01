@@ -50,3 +50,25 @@ You can then test your installation by running the tests:
 
       # Or, to run tests without a GPU
       make test-nogpu
+
+----------------------------------------
+uTLX: standalone TLX for upstream Triton
+----------------------------------------
+
+`triton-utlx <https://pypi.org/project/triton-utlx/>`_ (uTLX) distributes TLX -- a low-level, warp-aware extension of the Triton DSL, with intrinsics for asynchronous copies, warp-group MMA, barriers, and shared/tensor-memory buffers -- as a Triton plugin, so it does not require switching to the `FBTriton <https://github.com/facebookexperimental/triton>`_ fork:
+
+.. code-block:: bash
+
+      pip install torch
+      pip install triton-utlx
+
+      export TRITON_PLUGIN_PATHS=$(python -c \
+        "import utlx_plugin, os; print(os.path.join(os.path.dirname(utlx_plugin.__file__), 'libutlx.so'))")
+
+``TRITON_PLUGIN_PATHS`` is a colon-separated list of plugin shared libraries, and nothing sets it for you. Plugins additionally load only into a Triton built with ``TRITON_EXT_ENABLED``, which exposes the ``libtriton`` symbols they link against; a Triton built without it warns and skips the plugin rather than failing outright.
+
+The ``triton`` that ships with a PyTorch release has ``TRITON_EXT_ENABLED`` on by default. To run against a Triton you build yourself instead, turn it on at build time:
+
+.. code-block:: bash
+
+      TRITON_EXT_ENABLED=ON pip install -e . --no-build-isolation
