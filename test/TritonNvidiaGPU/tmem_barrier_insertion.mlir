@@ -390,8 +390,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
     %true = arith.constant true
     %0 = ttng.tmem_alloc {tensor_memory_col_offset = 0 : i32, tensor_memory_row_offset = 0 : i32} : () -> !ttg.memdesc<128x128xf32, #tmem128, #ttng.tensor_memory, mutable>
     ttg.barrier local
-    %rd = ttng.tmem_subslice %0 {N = 0 : i32} : !ttg.memdesc<128x128xf32, #tmem128, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x64xf32, #tmem128x64, #ttng.tensor_memory, mutable>
-    %wr = ttng.tmem_subslice %0 {N = 64 : i32} : !ttg.memdesc<128x128xf32, #tmem128, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x64xf32, #tmem128x64, #ttng.tensor_memory, mutable>
+    %rd = ttng.tmem_subslice %0 {dim = 1 : i32, offset = 0 : i32} : !ttg.memdesc<128x128xf32, #tmem128, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x64xf32, #tmem128x64, #ttng.tensor_memory, mutable>
+    %wr = ttng.tmem_subslice %0 {dim = 1 : i32, offset = 64 : i32} : !ttg.memdesc<128x128xf32, #tmem128, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x64xf32, #tmem128x64, #ttng.tensor_memory, mutable>
     %1 = ttng.tmem_load %rd : !ttg.memdesc<128x64xf32, #tmem128x64, #ttng.tensor_memory, mutable> -> tensor<128x64xf32, #blocked>
     ttng.tmem_store %arg0, %wr, %true : tensor<128x64xf32, #blocked> -> !ttg.memdesc<128x64xf32, #tmem128x64, #ttng.tensor_memory, mutable>
     tt.return
@@ -407,8 +407,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
     %true = arith.constant true
     %0 = ttng.tmem_alloc {tensor_memory_col_offset = 0 : i32, tensor_memory_row_offset = 0 : i32} : () -> !ttg.memdesc<128x128xf32, #tmem128, #ttng.tensor_memory, mutable>
     ttg.barrier local
-    %rd = ttng.tmem_subslice %0 {N = 64 : i32} : !ttg.memdesc<128x128xf32, #tmem128, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x64xf32, #tmem128x64, #ttng.tensor_memory, mutable>
-    %wr = ttng.tmem_subslice %0 {N = 64 : i32} : !ttg.memdesc<128x128xf32, #tmem128, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x64xf32, #tmem128x64, #ttng.tensor_memory, mutable>
+    %rd = ttng.tmem_subslice %0 {dim = 1 : i32, offset = 64 : i32} : !ttg.memdesc<128x128xf32, #tmem128, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x64xf32, #tmem128x64, #ttng.tensor_memory, mutable>
+    %wr = ttng.tmem_subslice %0 {dim = 1 : i32, offset = 64 : i32} : !ttg.memdesc<128x128xf32, #tmem128, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x64xf32, #tmem128x64, #ttng.tensor_memory, mutable>
     %1 = ttng.tmem_load %rd : !ttg.memdesc<128x64xf32, #tmem128x64, #ttng.tensor_memory, mutable> -> tensor<128x64xf32, #blocked>
     ttng.tmem_store %arg0, %wr, %true : tensor<128x64xf32, #blocked> -> !ttg.memdesc<128x64xf32, #tmem128x64, #ttng.tensor_memory, mutable>
     tt.return
@@ -454,7 +454,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
       %arg0: tensor<128x64xf32, #blocked64>) {
     %true = arith.constant true
     %0 = ttng.tmem_alloc {tensor_memory_col_offset = 0 : i32, tensor_memory_row_offset = 0 : i32} : () -> !ttg.memdesc<128x128xf32, #tmem128, #ttng.tensor_memory, mutable>
-    %1 = ttng.tmem_subslice %0 {N = 0 : i32} : !ttg.memdesc<128x128xf32, #tmem128, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x64xf32, #ttng.tensor_memory_encoding<blockM = 128, blockN = 64, colStride = 1>, #ttng.tensor_memory, mutable, 128x128>
+    %1 = ttng.tmem_subslice %0 {dim = 1 : i32, offset = 0 : i32} : !ttg.memdesc<128x128xf32, #tmem128, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x64xf32, #ttng.tensor_memory_encoding<blockM = 128, blockN = 64, colStride = 1>, #ttng.tensor_memory, mutable, 128x128>
     ttg.barrier local
     %2 = ttng.tmem_load %0 : !ttg.memdesc<128x128xf32, #tmem128, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #blocked>
     ttng.tmem_store %arg0, %1, %true : tensor<128x64xf32, #blocked64> -> !ttg.memdesc<128x64xf32, #ttng.tensor_memory_encoding<blockM = 128, blockN = 64, colStride = 1>, #ttng.tensor_memory, mutable, 128x128>
@@ -574,7 +574,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32} {
       %arg0: tensor<128x64xf32, #blocked64_8>) {
     %true = arith.constant true
     %0 = ttng.tmem_alloc {tensor_memory_col_offset = 0 : i32, tensor_memory_row_offset = 0 : i32} : () -> !ttg.memdesc<128x128xf32, #tmem128, #ttng.tensor_memory, mutable>
-    %1 = ttng.tmem_subslice %0 {N = 0 : i32} : !ttg.memdesc<128x128xf32, #tmem128, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x64xf32, #ttng.tensor_memory_encoding<blockM = 128, blockN = 64, colStride = 1>, #ttng.tensor_memory, mutable, 128x128>
+    %1 = ttng.tmem_subslice %0 {dim = 1 : i32, offset = 0 : i32} : !ttg.memdesc<128x128xf32, #tmem128, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x64xf32, #ttng.tensor_memory_encoding<blockM = 128, blockN = 64, colStride = 1>, #ttng.tensor_memory, mutable, 128x128>
     ttg.barrier local
     %2 = ttng.tmem_load %0 : !ttg.memdesc<128x128xf32, #tmem128, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #blocked8>
     ttng.tmem_store %arg0, %1, %true : tensor<128x64xf32, #blocked64_8> -> !ttg.memdesc<128x64xf32, #ttng.tensor_memory_encoding<blockM = 128, blockN = 64, colStride = 1>, #ttng.tensor_memory, mutable, 128x128>

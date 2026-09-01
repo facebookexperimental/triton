@@ -1214,6 +1214,7 @@ class Config:
         res.append(f"num_ctas: {self.num_ctas}")
         res.append(f"num_stages: {self.num_stages}")
         res.append(f"maxnreg: {self.maxnreg}")
+        res.append(f"ir_override: {self.ir_override}")
         res.append(f"minRegAutoWS: {self.minRegAutoWS}")
         res.append(f"maxRegAutoWS: {self.maxRegAutoWS}")
         res.append(f"pingpongAutoWS: {self.pingpongAutoWS}")

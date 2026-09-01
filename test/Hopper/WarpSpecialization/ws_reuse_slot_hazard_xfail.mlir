@@ -55,7 +55,7 @@ module attributes {"ttg.num-warps" = 8 : i32, "ttg.threads-per-warp" = 32 : i32,
     ttng.init_barrier %dsT_full, 1 : !ttg.memdesc<1xi64, #shared3, #smem, mutable>
 
     // dsT aliases slot[N=0] reinterpreted f32->f16 (same physical columns).
-    %sub = ttng.tmem_subslice %slot {N = 0 : i32} : !ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<1x128x64xf32, #tmem1, #ttng.tensor_memory, mutable, 1x128x128>
+    %sub = ttng.tmem_subslice %slot {offset = 0 : i32} : !ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<1x128x64xf32, #tmem1, #ttng.tensor_memory, mutable, 1x128x128>
     %re = ttg.memdesc_reinterpret %sub : !ttg.memdesc<1x128x64xf32, #tmem1, #ttng.tensor_memory, mutable, 1x128x128> -> !ttg.memdesc<1x128x128xf16, #tmem3, #ttng.tensor_memory, mutable>
 
     // --- computation partition (task 3): write dsT into the slot, then signal.

@@ -14,7 +14,9 @@
 #include "triton/Dialect/TritonNvidiaGPU/IR/TensorMemoryUtils.h"
 #include "triton/Tools/LayoutUtils.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/Support/MathExtras.h"
 #include "llvm/Support/raw_ostream.h"
+#include <algorithm>
 
 using namespace mlir;
 using namespace mlir::triton;
@@ -425,22 +427,6 @@ lowerTMemLdStFromInfo(Location loc, ConversionPatternRewriter &rewriter,
                       std::optional<TMEMLoadReduceModifier> redOp, bool useAbs,
                       bool useNaN) {
   bool isStore = !vals.empty();
-  if (info.broadcast) {
-    auto removeBroadcast = std::move(info.broadcast.value());
-    info.broadcast = std::nullopt;
-
-    auto inVals = to_vector(vals);
-    if (isStore) {
-      inVals = removeBroadcast.apply(inVals);
-    }
-    auto [outVals, redvalVals] =
-        lowerTMemLdStFromInfo(loc, rewriter, info, pred, llvmElemTy, inVals,
-                              tmemBase, redOp, useAbs, useNaN);
-    if (!isStore) {
-      outVals = broadcastAs(outVals, info.reps);
-    }
-    return {outVals, redvalVals};
-  }
   if (llvmElemTy.getIntOrFloatBitWidth() < 32) {
     unsigned bitwidth = llvmElemTy.getIntOrFloatBitWidth();
     bool padding = false;
@@ -556,8 +542,8 @@ struct TensorMemoryLoadOpConversion
         loc, rewriter, regTy, memTy, tmemBase, maxnreg, b.i1_val(true),
         llvmElemTy, {}, redOp, useAbs, useNaN);
 
-    Value resultStruct = packTensorElements(loc, getTypeConverter(), resultVals,
-                                            rewriter, op.getType());
+    Value resultStruct = packUniqueTensorElements(
+        loc, getTypeConverter(), resultVals, rewriter, op.getType());
     // Wait insertion could be moved to the TTGIR level if needed.
     NVVM::Tcgen05WaitOp::create(rewriter, loc, NVVM::Tcgen05WaitKind::LOAD);
 
@@ -569,8 +555,8 @@ struct TensorMemoryLoadOpConversion
     SmallVector<Value> results = {resultStruct};
     if (redOp) {
       // Pack redval values into the red tensor result
-      Value redStruct = packTensorElements(loc, getTypeConverter(), redvalVals,
-                                           rewriter, op.getRed().getType());
+      Value redStruct = packUniqueTensorElements(
+          loc, getTypeConverter(), redvalVals, rewriter, op.getRed().getType());
       results.push_back(redStruct);
     }
 
@@ -596,7 +582,7 @@ struct TensorMemoryStoreOpConversion
     auto regTy = cast<RankedTensorType>(op.getSrc().getType());
 
     SmallVector<Value> srcValues =
-        unpackTensorElements(loc, adaptor.getSrc(), rewriter, regTy);
+        unpackUniqueTensorElements(loc, adaptor.getSrc(), rewriter);
     auto maxnreg = getContextualMaxNReg(op);
     lowerTMemLdStFromTypes(loc, rewriter, regTy, memTy, tmemBase, maxnreg, pred,
                            llvmElemTy, srcValues);
@@ -635,7 +621,7 @@ struct TensorMemoryAllocOpConversion
       auto llvmElemTy = getTypeConverter()->convertType(regTy.getElementType());
       auto maxnreg = getContextualMaxNReg(op);
       SmallVector<Value> srcValues =
-          unpackTensorElements(loc, adaptor.getSrc(), rewriter, regTy);
+          unpackUniqueTensorElements(loc, adaptor.getSrc(), rewriter);
       Value ptr = b.inttoptr(base.getType(), allocAddress);
       lowerTMemLdStFromTypes(loc, rewriter, regTy, memTy, ptr, maxnreg,
                              b.i1_val(true), llvmElemTy, srcValues);
@@ -712,7 +698,23 @@ static LogicalResult copySharedToTmem(ConversionPatternRewriter &rewriter,
   auto cvt = tmemLl.invertAndCompose(shmemLl);
 
   auto bitwidth = srcTy.getElementType().getIntOrFloatBitWidth();
-  auto atom = getTMemCopyAtom(cvt, bitwidth);
+  uint32_t holeMask = 0;
+  // Zero col bases are physical holes. Compact them for the SMEM descriptor,
+  // then skip the corresponding physical TMEM ranges when issuing copies.
+  if (isa<TensorMemoryEncodingAttr>(dstTy.getEncoding())) {
+    for (auto [i, basis] : llvm::enumerate(tmemLl.getBases().lookup(kCol))) {
+      if (llvm::all_of(basis, [](int32_t component) { return component == 0; }))
+        holeMask |= uint32_t{1} << i;
+    }
+  }
+  auto compact = holeMask ? cvt.removeZeroBasesAlongDim(kCol) : cvt;
+  unsigned contiguousCols = holeMask
+                                ? uint32_t{1} << llvm::countr_zero(holeMask)
+                                : compact.getInDimSize(kCol);
+  auto atom = getTMemCopyAtom(
+      compact.resizeInDim(
+          kCol, std::min<unsigned>(contiguousCols, compact.getInDimSize(kCol))),
+      bitwidth);
   // Get shmem ptr
   Type elemTy = typeConverter->convertType(srcTy.getElementType());
   auto smemObj =
@@ -723,10 +725,11 @@ static LogicalResult copySharedToTmem(ConversionPatternRewriter &rewriter,
   // once we have access to the lbo/sbo
   const SmallVector<unsigned> instrShape = {32, atom.bCol / bitwidth};
   auto kWarp = str_attr("warp");
-  auto cvtWarp = cvt.reshapeIns({{kRow, 32},
-                                 {kWarp, 4},
-                                 {kCol, cvt.getInDimSize(kCol)},
-                                 {kBlock, cvt.getInDimSize(kBlock)}})
+  auto cvtWarp = compact
+                     .reshapeIns({{kRow, 32},
+                                  {kWarp, 4},
+                                  {kCol, compact.getInDimSize(kCol)},
+                                  {kBlock, compact.getInDimSize(kBlock)}})
                      .sublayout({kRow, kCol}, to_vector(cvt.getOutDimNames()));
 
   auto loader = DotOpMmaSmemLoader::build(loc, rewriter, cvtWarp, bitwidth,
@@ -751,11 +754,15 @@ static LogicalResult copySharedToTmem(ConversionPatternRewriter &rewriter,
            strideRow * (64 / 8));
   }
 
+  int logicalCol = 0;
   for (int col = 0; col < cvt.getInDimSize(kCol); col += instrShape[1]) {
-    auto desc = loader->smemLoad(0, col, rewriter, loc);
+    if (col & holeMask)
+      continue;
+    auto desc = loader->smemLoad(0, logicalCol, rewriter, loc);
     auto tmemAddr =
         b.add(b.ptrtoint(i32_ty, baseDst), b.i32_val(col * bitwidth / 32));
     createTcgen05Cp(rewriter, loc, tmemAddr, desc, pred, atom, twoCTAs);
+    logicalCol += instrShape[1];
   }
   return success();
 }
@@ -955,7 +962,7 @@ struct TMEMSubSliceOpConversion
     // subslice indexes into; upstream #7777 can pass the result type only
     // because it preserves the source encoding.
     auto srcTy = cast<MemDescType>(op.getSrc().getType());
-    uint32_t offset = getTMemSubSliceOffset(srcTy, op.getN());
+    uint32_t offset = getTMemSubSliceOffset(srcTy, op.getOffset(), op.getDim());
 
     Value tmemBase = adaptor.getSrc();
     Value offsetVal = b.i32_val(offset);
