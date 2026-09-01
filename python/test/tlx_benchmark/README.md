@@ -26,7 +26,8 @@ CUDA_VISIBLE_DEVICES=0 third_party/tlx/denoise.sh \
 | `--space` | `full` `heuristic` `smoke` | defaults to `heuristic`, matching `tlx.ops.mm` |
 | `--dtype` | `fp16` `bf16` `both` | |
 | `--guard` | `off` `report` `enforce` | `enforce` exits non-zero on a regression or compile-cap breach |
-| `--json` | path | the machine-readable artifact |
+| `--replicates` | int | independent measurements per case; what the noise gate reads (default 10) |
+| `--json` | path | machine-readable artifact (defaults to `/tmp/tlx_benchmark/mm.sm100.json`) |
 | `--update-baseline` | | record this run; refuses noisy and host-bound cases |
 | `--strict-env` | | fail rather than warn when the environment is not denoised |
 

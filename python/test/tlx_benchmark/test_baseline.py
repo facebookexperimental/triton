@@ -112,25 +112,42 @@ def test_load_missing_baseline_is_not_an_error(tmp_path, monkeypatch):
 def test_table_reports_compile_time_replicates_and_throughput_error():
     """The headline columns a reviewer actually reads.
 
-    TFLOP/s carries its uncertainty because throughput is inversely
-    proportional to latency, so it inherits the same replicate-to-replicate
-    spread the gate reads -- printing it bare invites treating it as exact.
+    Throughput stays a single number and its uncertainty gets its own column,
+    derived from the same replicate-to-replicate spread the gate reads -- one
+    definition of "uncertainty" across the table and the verdict beside it.
     """
     r = judge(BIG, TLX, REF, tlx_host_us=HOST_US, compile_stat=CompileStat(t_cold_s=0.69, n_configs=None))
     r.tlx_tflops = 1004.0
     rendered = report_mod.table([r])
 
     header, _, row = rendered.splitlines()[:3]
-    for column in ("TFLOP/s", "reps", "repro", "width", "compile"):
+    for column in ("input", "TFLOP/s", "+-TF/s", "reps", "noise%", "compile"):
         assert column in header
+    assert "shape" not in header and "width" not in header
 
     assert "0.69s" in row  # sub-10s compile keeps two decimals
-    assert " 3 " in row  # three replicates
-    assert "1004+-" in row  # throughput with its error range
+    assert " 1004 " in row  # throughput is a bare value, error lives elsewhere
+    assert "3" in row  # replicate count
 
 
 def test_table_marks_compile_as_absent_when_not_measured():
     r = judge(BIG, TLX, REF, tlx_host_us=HOST_US)
     r.tlx_tflops = 1004.0
     assert r.t_cold_s is None
-    assert "+-" in report_mod.table([r]).splitlines()[2]
+    assert report_mod.table([r]).splitlines()[2].rstrip().endswith("ok")
+
+
+def test_input_column_is_op_supplied_and_defined_in_the_legend():
+    """``(8192, 8192, 8192, True, False)`` says nothing on its own; only the op
+    module knows the tuple means a product shape plus operand layouts."""
+    labelled = Case(op="mm", arch="sm100", dtype="float16", shape=(8192, 8192, 8192, True, False),
+                    label="8192x8192x8192 A:row B:col")
+    assert labelled.input == "8192x8192x8192 A:row B:col"
+    assert labelled.to_dict()["input"] == labelled.input
+    # An op that supplies no label still renders.
+    assert BIG.input == "8192x8192x8192xTruexTrue"
+
+    r = judge(labelled, TLX, REF, tlx_host_us=HOST_US)
+    rendered = report_mod.render([r], env={"input_spec": "(M x K) @ (K x N), with operand layouts"})
+    assert "A:row B:col" in rendered
+    assert "input  = (M x K) @ (K x N), with operand layouts" in rendered

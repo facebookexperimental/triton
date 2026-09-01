@@ -33,19 +33,30 @@ def _fmt_us(stat) -> str:
     return f"{stat.p50 * 1e3:9.1f}" if stat else "        -"
 
 
-def _fmt_tflops(result) -> str:
-    """``1004 +-1``.
+def _fmt_tflops_err(result) -> str:
+    """Absolute uncertainty on throughput, in TFLOP/s.
 
-    Throughput is inversely proportional to latency, so its relative
-    uncertainty is the latency's: the same replicate-to-replicate spread that
-    the noise gate reads. Printing it next to the value stops a reader treating
-    a headline TFLOP/s as exact when it is not.
+    Derived from the same replicate-to-replicate spread the gate reads, rather
+    than from a separately computed standard deviation. One definition of
+    "uncertainty" across the table and the pass/fail decision is worth more
+    than a more conventional statistic that could disagree with the verdict
+    printed beside it. Throughput is inversely proportional to latency, so it
+    inherits the latency's relative uncertainty directly.
     """
-    if not result.tlx_tflops:
+    if not result.tlx_tflops or not result.tlx:
         return "-"
+    return f"{result.tlx_tflops * result.tlx.spread:.1f}"
+
+
+def _fmt_noise(result) -> str:
+    """``0.1/5.6`` -- run-to-run reproducibility, then within-run width.
+
+    One column rather than two: they are the same phenomenon measured at two
+    scales, and the second only ever exists to explain the first.
+    """
     if not result.tlx:
-        return f"{result.tlx_tflops:.0f}"
-    return f"{result.tlx_tflops:.0f}+-{result.tlx_tflops * result.tlx.spread:.0f}"
+        return "-"
+    return f"{result.tlx.spread * 100:.1f}/{result.tlx.within_spread * 100:.1f}"
 
 
 def _fmt_compile(result) -> str:
@@ -56,21 +67,20 @@ def _fmt_compile(result) -> str:
 
 def table(results: Sequence[Result]) -> str:
     lines = [
-        f"{'shape':<28} {'dtype':<8} {'tlx us':>9} {'ref us':>9} {'speedup':>8} "
-        f"{'TFLOP/s':>12} {'reps':>4} {'repro':>7} {'width':>7} {'compile':>8}  status",
-        "-" * 128,
+        f"{'input':<34} {'dtype':<8} {'tlx us':>9} {'ref us':>9} {'speedup':>8} "
+        f"{'TFLOP/s':>8} {'+-TF/s':>7} {'reps':>4} {'noise%':>10} {'compile':>8}  status",
+        "-" * 134,
     ]
     for r in results:
-        shape = "x".join(str(s) for s in r.case.shape)
-        lines.append(f"{shape:<28} {r.case.dtype:<8} {_fmt_us(r.tlx)} {_fmt_us(r.ref)} "
+        lines.append(f"{r.case.input:<34} {r.case.dtype:<8} {_fmt_us(r.tlx)} {_fmt_us(r.ref)} "
                      f"{(f'{r.speedup:.3f}x' if r.speedup else '-'):>8} "
-                     f"{_fmt_tflops(r):>12} "
+                     f"{(f'{r.tlx_tflops:.0f}' if r.tlx_tflops else '-'):>8} "
+                     f"{_fmt_tflops_err(r):>7} "
                      f"{(str(r.tlx.replicates) if r.tlx else '-'):>4} "
-                     f"{(f'{r.tlx.spread * 100:.1f}%' if r.tlx else '-'):>7} "
-                     f"{(f'{r.tlx.within_spread * 100:.1f}%' if r.tlx else '-'):>7} "
+                     f"{_fmt_noise(r):>10} "
                      f"{_fmt_compile(r):>8}  {_MARK[r.status]}")
         for note in r.notes:
-            lines.append(f"{'':<28} {'':<8} -> {note}")
+            lines.append(f"{'':<34} {'':<8} -> {note}")
     return "\n".join(lines)
 
 
@@ -94,8 +104,17 @@ def write_json(results: Sequence[Result], env: dict, path: str | pathlib.Path) -
     return path
 
 
+#: Explains the columns whose meaning is not obvious from the header.
+LEGEND = ("noise% = run-to-run reproducibility of the p50 / within-run p10-p90 width. "
+          "The gate reads the first.\n"
+          "+-TF/s = the same run-to-run figure expressed as absolute throughput.")
+
+
 def render(results: Sequence[Result], env: dict, json_path: Optional[str] = None) -> str:
-    out = [table(results), "", summary(results)]
+    legend = LEGEND
+    if env.get("input_spec"):
+        legend = f"input  = {env['input_spec']}\n{legend}"
+    out = [table(results), "", legend, "", summary(results)]
     if json_path:
         out.append(f"artifact: {write_json(results, env, json_path)}")
     bad = failures(results)

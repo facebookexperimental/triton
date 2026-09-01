@@ -46,9 +46,16 @@ DEFAULT_REP_MS = 3000
 
 #: Number of independent measurement replicates per case.
 #:
-#: Three is the smallest number from which a spread can be read at all, and the
-#: cost is linear: at the 3s/3s window each replicate is ~6s per provider.
-DEFAULT_REPLICATES = 3
+#: This is the only thing that measures the quantity the guard depends on --
+#: how reproducible the reported p50 is -- so it is worth spending on. Three is
+#: the bare minimum from which any spread can be read; ten makes the figure
+#: stable rather than merely present, and shrinks the uncertainty on it by
+#: roughly sqrt(10/3).
+#:
+#: Cost is linear and not trivial: at the 3s/3s window each replicate is ~6s per
+#: provider, so ten replicates over two providers is ~2 min per case. Lower it
+#: with --replicates for a quick look.
+DEFAULT_REPLICATES = 10
 
 #: A case whose reported p50 does not reproduce this closely across replicates
 #: gets no perf verdict.

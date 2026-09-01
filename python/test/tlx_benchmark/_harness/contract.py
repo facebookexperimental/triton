@@ -43,13 +43,29 @@ class Case:
     arch: str
     dtype: str  # bare torch name, e.g. "float16"
     shape: tuple  # op-defined and JSON-serializable; for mm, (M, N, K, a_rm, b_rm)
+    #: Human-readable rendering of ``shape``, supplied by the op module because
+    #: only it knows what the tuple means. ``(8192, 8192, 8192, True, False)``
+    #: says nothing; "8192x8192x8192 A:row B:col" says what was measured. Falls
+    #: back to the raw tuple so a new op need not provide one.
+    label: str = ""
 
     @property
     def key(self) -> str:
         return f"{self.op}/{self.arch}/{self.dtype}/{'x'.join(str(s) for s in self.shape)}"
 
+    @property
+    def input(self) -> str:
+        return self.label or "x".join(str(s) for s in self.shape)
+
     def to_dict(self) -> dict:
-        return {"op": self.op, "arch": self.arch, "dtype": self.dtype, "shape": list(self.shape), "key": self.key}
+        return {
+            "op": self.op,
+            "arch": self.arch,
+            "dtype": self.dtype,
+            "shape": list(self.shape),
+            "input": self.input,
+            "key": self.key,
+        }
 
 
 @dataclasses.dataclass(frozen=True)

@@ -16,7 +16,9 @@ def pytest_addoption(parser):
                     help="autotune search space; 'heuristic' is what tlx.ops.mm now uses by default")
     group.addoption("--guard", choices=("off", "report", "enforce"), default="report",
                     help="enforce fails the test on a regression or a compile-cap breach")
-    group.addoption("--json", default=None, help="write the machine-readable artifact here")
+    group.addoption("--replicates", type=int, default=None,
+                    help="independent measurements per case; this is what the noise gate reads")
+    group.addoption("--json", default=None, help="machine-readable artifact (default: bench module's)")
     group.addoption("--update-baseline", action="store_true",
                     help="record this run as the baseline; refuses noisy and host-bound cases")
     group.addoption("--strict-env", action="store_true",
