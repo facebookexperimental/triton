@@ -40,14 +40,29 @@ public:
                   mlir::PatternRewriter &rewriter) const override {
     if (!isa<RankedTensorType>(requireLayoutOp.getSrc().getType()))
       return failure();
-    if (requireLayoutOp.getSrc().getType() == requireLayoutOp.getType()) {
+    auto resultType = cast<RankedTensorType>(requireLayoutOp.getType());
+    if (containsPinnedEncoding(resultType.getEncoding())) {
+      auto boundary = ttg::RequireLayoutOp::create(
+          rewriter, requireLayoutOp.getLoc(), requireLayoutOp.getType(),
+          requireLayoutOp.getSrc());
+      if (requireLayoutOp->hasAttr("tlx.rematerialize_coordinates"))
+        boundary->setAttr("tlx.rematerialize_coordinates",
+                          rewriter.getUnitAttr());
+      rewriter.replaceOp(requireLayoutOp, boundary);
+      return success();
+    }
+    bool rematerializeCoordinates =
+        requireLayoutOp->hasAttr("tlx.rematerialize_coordinates");
+    if (requireLayoutOp.getSrc().getType() == requireLayoutOp.getType() &&
+        !rematerializeCoordinates) {
       rewriter.replaceOp(requireLayoutOp, requireLayoutOp.getSrc());
       return success();
     }
+
     auto convert = ttg::ConvertLayoutOp::create(
         rewriter, requireLayoutOp.getLoc(), requireLayoutOp.getType(),
         requireLayoutOp.getSrc());
-    if (requireLayoutOp->hasAttr("tlx.rematerialize_coordinates"))
+    if (rematerializeCoordinates)
       convert->setAttr("tlx.rematerialize_coordinates", rewriter.getUnitAttr());
     rewriter.replaceOp(requireLayoutOp, convert);
     return success();
@@ -261,13 +276,11 @@ public:
       changed = true;
     }
 
-    for (auto [enumeratedIndex, enumeratedResult, init, yielded] :
-         llvm::enumerate(predicateOp.getResults(), predicateOp.getInits(),
-                         yieldOp.getValues())) {
-      // Copy out of the structured bindings: capturing one in a lambda is a
-      // C++20 extension and this file is built as C++17.
-      auto index = enumeratedIndex;
-      OpResult result = enumeratedResult;
+    for (unsigned index = 0, e = predicateOp.getNumResults(); index < e;
+         ++index) {
+      OpResult result = cast<OpResult>(predicateOp.getResult(index));
+      Value init = predicateOp.getInits()[index];
+      Value yielded = yieldOp.getValues()[index];
       auto boundaryConvert = yielded.getDefiningOp<ttg::ConvertLayoutOp>();
       if (!boundaryConvert || !boundaryConvert->hasOneUse())
         continue;

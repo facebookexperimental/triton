@@ -6,6 +6,8 @@ import triton.language as tl
 from triton._internal_testing import is_hip
 
 
+
+pytestmark = pytest.mark.skipif(not is_hip(), reason="Requires HIP backend")
 @triton.jit
 def _add_kernel(x, y, output, n_elements):
     BLOCK_SIZE: tl.constexpr = 256
@@ -21,9 +23,6 @@ def _add_kernel(x, y, output, n_elements):
 @triton.jit
 def _tuple_scale_kernel(inputs, output, SCALE: tl.constexpr):
     tl.store(output, (tl.load(inputs[0]) + tl.load(inputs[1])) * SCALE)
-
-
-@pytest.mark.skipif(not is_hip(), reason="Requires HIP")
 def test_flat_signature_launcher():
     n_elements = 1025
     x = torch.randn(n_elements, device="cuda")
@@ -37,9 +36,6 @@ def test_flat_signature_launcher():
     _add_kernel[grid](x, y, output, n_elements)
 
     torch.testing.assert_close(output, x + y)
-
-
-@pytest.mark.skipif(not is_hip(), reason="Requires HIP")
 def test_structured_signature_launcher_fallback():
     x = torch.tensor([11.0], device="cuda")
     y = torch.tensor([31.0], device="cuda")

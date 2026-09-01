@@ -93,6 +93,8 @@ from triton.language.extra.tlx.tutorials.amd_bmm_gfx942 import (
 )
 from triton.language.extra.tlx.tutorials.gfx9_gemm.inter_wave.a16w16.matmul_kernel_split_m import (
     matmul as _amd_gemm_pingpong, )
+from triton.language.extra.tlx.tutorials.gfx9_gemm.a16w16.v9_beyond_hotloop.matmul_kernel import (
+    matmul as _amd_gemm_v9_beyond_hotloop, )
 from triton.language.extra.tlx.tutorials.amd_bmm import (
     bmm as _amd_bmm,
     make_bmm_inputs as _amd_bmm_inputs,
@@ -1039,11 +1041,7 @@ def test_blackwell_fa_ws_pipelined_persistent_2cta_pruning():
         N_CTX=1024,
     )
     assert any(config.kwargs.get("NUM_CTAS", 1) == 2 for config in selected)
-    assert all(
-        config.kwargs["NUM_BUFFERS_KV"] == 3
-        for config in selected
-        if config.kwargs.get("NUM_CTAS", 1) == 2
-    )
+    assert all(config.kwargs["NUM_BUFFERS_KV"] == 3 for config in selected if config.kwargs.get("NUM_CTAS", 1) == 2)
 
 
 @pytest.mark.parametrize("Z,H", [(4, 8), (4, 48), (24, 8)])
@@ -2417,6 +2415,19 @@ def test_amd_gemm_pingpong(dtype):
         a = (torch.randn((M, K), device=DEVICE, dtype=dtype) + 1) / K
         b = (torch.randn((K, N), device=DEVICE, dtype=dtype) + 1) / K
         torch.testing.assert_close(_amd_gemm_pingpong(a, b), torch.matmul(a, b))
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_amd_gemm_v9_beyond_hotloop_is_deterministic():
+    M, N, K = 131072, 512, 256
+    torch.manual_seed(0)
+    a = torch.randn((M, K), device=DEVICE, dtype=torch.float16)
+    b = torch.randn((N, K), device=DEVICE, dtype=torch.float16).T
+    reference = torch.matmul(a, b)
+
+    for _ in range(5):
+        actual = _amd_gemm_v9_beyond_hotloop(a, b)
+        torch.testing.assert_close(actual, reference, atol=0, rtol=0)
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])

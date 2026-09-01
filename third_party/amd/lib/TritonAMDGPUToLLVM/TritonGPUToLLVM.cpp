@@ -214,6 +214,11 @@ public:
     // to LLVM by TritonAMDGPUConvertWarpSpecializeToLLVM.
     addLegalOp<triton::gpu::WarpPredicateOp>();
     addLegalOp<triton::gpu::PredicateYieldOp>();
+    // These have no lowering after this pass, so a pattern that bails out
+    // must fail the conversion instead of leaving the op behind. The rest of
+    // the dialect stays unmarked: some of it is lowered later.
+    addIllegalOp<triton::amdgpu::ScheduledMfmaOp>();
+    addIllegalOp<triton::amdgpu::MfmaCommitOp>();
   }
 };
 

@@ -10,6 +10,11 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any
 
+try:
+    from .profiling import compact_profile_output, invoke_profile, per_case_profile_request
+except ImportError:  # pragma: no cover - subprocess script execution path
+    from profiling import compact_profile_output, invoke_profile, per_case_profile_request
+
 
 def _load_harness(path: Path) -> ModuleType:
     spec = importlib.util.spec_from_file_location("tlx_kernel_agent_user_harness", path)
@@ -93,19 +98,15 @@ def _main() -> int:
             )
             if request.get("profile") and hasattr(harness, "profile"):
                 try:
-                    raw_profile = harness.profile(artifact, case)
-                    if not isinstance(raw_profile, Mapping):
-                        raise TypeError("profile() must return a mapping")
-                    # Cap inline JSON size to 1MB to keep response bounded.
-                    serialized = json.dumps(dict(raw_profile))
-                    if len(serialized) > 1_000_000:
-                        case_result["profile"] = {
-                            "error": "profile payload exceeded inline limit (1MB)",
-                            "size_bytes": len(serialized),
-                            "truncated_keys": list(raw_profile.keys()),
-                        }
-                    else:
-                        case_result["profile"] = dict(raw_profile)
+                    profile_request = per_case_profile_request(
+                        request.get("profile"), case["case_id"]
+                    )
+                    raw_profile = invoke_profile(
+                        harness.profile, artifact, case, profile_request
+                    )
+                    case_result["profile"] = compact_profile_output(
+                        raw_profile, profile_request
+                    )
                 except Exception as error:  # noqa: BLE001
                     case_result["profile"] = {
                         "error": f"{type(error).__name__}: {error}"

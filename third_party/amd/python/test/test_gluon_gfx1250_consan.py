@@ -11,6 +11,8 @@ import os
 from triton._internal_testing import is_hip_gfx1250
 
 
+
+pytestmark = pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires GFX1250")
 def _run_consan_subprocess(test_name, *args, timeout=120):
     """Run a ConSan test kernel in a subprocess and return captured stderr.
 
@@ -29,9 +31,6 @@ def _run_consan_subprocess(test_name, *args, timeout=120):
         proc.kill()
         _, stderr = proc.communicate()
     return stderr.decode(errors="replace")
-
-
-@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires GFX1250")
 @pytest.mark.parametrize("FAILURE", [True, False])
 def test_ws_store_wait_load(FAILURE):
     """
@@ -47,9 +46,6 @@ def test_ws_store_wait_load(FAILURE):
     else:
         assert "device assertion failed" not in stderr_str, \
             f"Unexpected ConSan violation in stderr:\n{stderr_str}"
-
-
-@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires GFX1250")
 @pytest.mark.parametrize("FAILURE", [True, False])
 def test_ws_load_wait_store(FAILURE):
     """
@@ -65,9 +61,6 @@ def test_ws_load_wait_store(FAILURE):
     else:
         assert "device assertion failed" not in stderr_str, \
             f"Unexpected ConSan violation in stderr:\n{stderr_str}"
-
-
-@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires GFX1250")
 def test_deadlock_two_partitions():
     """
     Verifies that ConSan detects a deadlock when two warp-specialize partitions
@@ -76,9 +69,6 @@ def test_deadlock_two_partitions():
     stderr_str = _run_consan_subprocess("deadlock_two_partitions")
 
     assert "Deadlock detected" in stderr_str, f"Expected 'Deadlock detected' in stderr, got:\n{stderr_str}"
-
-
-@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires GFX1250")
 def test_deadlock_overarrival():
     """
     Verifies that ConSan detects a deadlock caused by over-arrival on an mbarrier.
@@ -87,9 +77,6 @@ def test_deadlock_overarrival():
     stderr_str = _run_consan_subprocess("deadlock_overarrival")
 
     assert "Deadlock detected" in stderr_str, f"Expected 'Deadlock detected' in stderr, got:\n{stderr_str}"
-
-
-@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires GFX1250")
 def test_deadlock_underarrival():
     """
     Verifies that ConSan detects a deadlock caused by under-arrival on mbarriers.
@@ -99,9 +86,6 @@ def test_deadlock_underarrival():
     stderr_str = _run_consan_subprocess("deadlock_underarrival")
 
     assert "Deadlock detected" in stderr_str, f"Expected 'Deadlock detected' in stderr, got:\n{stderr_str}"
-
-
-@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires GFX1250")
 def test_deadlock_different_phases():
     """
     Positive test: verifies ConSan does NOT report a false deadlock when two
@@ -111,9 +95,6 @@ def test_deadlock_different_phases():
 
     assert "device assertion failed" not in stderr_str, \
         f"Unexpected ConSan violation in stderr:\n{stderr_str}"
-
-
-@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires GFX1250")
 def test_barrier_underflow():
     """
     Verifies that ConSan detects a barrier arrive underflow when each thread
@@ -124,9 +105,6 @@ def test_barrier_underflow():
 
     assert "Barrier arrive underflow" in stderr_str, \
         f"Expected 'Barrier arrive underflow' in stderr, got:\n{stderr_str}"
-
-
-@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires GFX1250")
 @pytest.mark.parametrize("MISSING_BAR", [True, False])
 @pytest.mark.parametrize("OVERLAP", [True, False])
 def test_aliasing_shared_visibility(MISSING_BAR, OVERLAP):
@@ -147,9 +125,6 @@ def test_aliasing_shared_visibility(MISSING_BAR, OVERLAP):
     else:
         assert "device assertion failed" not in stderr_str, \
             f"Unexpected ConSan violation in stderr:\n{stderr_str}"
-
-
-@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires GFX1250")
 @pytest.mark.parametrize("MISSING_BAR", ["none", "1", "2"])
 def test_ws_two_loads_two_bars(MISSING_BAR):
     """
@@ -169,9 +144,6 @@ def test_ws_two_loads_two_bars(MISSING_BAR):
     else:
         assert "device assertion failed" not in stderr_str, \
             f"Unexpected ConSan violation in stderr:\n{stderr_str}"
-
-
-@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires GFX1250")
 @pytest.mark.parametrize("FAILURE", [True, False])
 def test_ws_two_loads_one_bar(FAILURE):
     """
@@ -190,9 +162,6 @@ def test_ws_two_loads_one_bar(FAILURE):
     else:
         assert "device assertion failed" not in stderr_str, \
             f"Unexpected ConSan violation in stderr:\n{stderr_str}"
-
-
-@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires GFX1250")
 @pytest.mark.parametrize("MISSING_BAR", ["none", "0", "1"])
 def test_ws_two_loads_two_bars_loop(MISSING_BAR):
     """
@@ -211,9 +180,6 @@ def test_ws_two_loads_two_bars_loop(MISSING_BAR):
     else:
         assert "device assertion failed" not in stderr_str, \
             f"Unexpected ConSan violation in stderr:\n{stderr_str}"
-
-
-@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires GFX1250")
 @pytest.mark.parametrize("FAILURE", [True, False])
 def test_ws_load_ordering(FAILURE):
     """
@@ -231,9 +197,6 @@ def test_ws_load_ordering(FAILURE):
     else:
         assert "device assertion failed" not in stderr_str, \
             f"Unexpected ConSan violation in stderr:\n{stderr_str}"
-
-
-@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires GFX1250")
 @pytest.mark.parametrize("MISSING_BAR", ["none", "1", "2"])
 def test_ws_different_warp_sizes(MISSING_BAR):
     """
@@ -250,9 +213,6 @@ def test_ws_different_warp_sizes(MISSING_BAR):
     else:
         assert "device assertion failed" not in stderr_str, \
             f"Unexpected ConSan violation in stderr:\n{stderr_str}"
-
-
-@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires GFX1250")
 @pytest.mark.parametrize("FAILURE", [True, False])
 def test_async_tdm_kernel(FAILURE):
     """
@@ -270,9 +230,6 @@ def test_async_tdm_kernel(FAILURE):
     else:
         assert "device assertion failed" not in stderr_str, \
             f"Unexpected ConSan violation in stderr:\n{stderr_str}"
-
-
-@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires GFX1250")
 @pytest.mark.parametrize("FAILURE", [True, False])
 def test_async_tdm_kernel_2bufs_1bar(FAILURE):
     """
@@ -287,9 +244,6 @@ def test_async_tdm_kernel_2bufs_1bar(FAILURE):
     else:
         assert "device assertion failed" not in stderr_str, \
             f"Unexpected ConSan violation in stderr:\n{stderr_str}"
-
-
-@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires GFX1250")
 @pytest.mark.parametrize("FAILURE", [True, False])
 def test_tdm_interleave_kernel(FAILURE):
     """
@@ -304,9 +258,6 @@ def test_tdm_interleave_kernel(FAILURE):
     else:
         assert "device assertion failed" not in stderr_str, \
             f"Unexpected ConSan violation in stderr:\n{stderr_str}"
-
-
-@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires GFX1250")
 @pytest.mark.parametrize("FAILURE", [True, False])
 def test_consan_async_copy(FAILURE):
     """
@@ -321,9 +272,6 @@ def test_consan_async_copy(FAILURE):
     else:
         assert "device assertion failed" not in stderr_str, \
             f"Unexpected ConSan violation in stderr:\n{stderr_str}"
-
-
-@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires GFX1250")
 @pytest.mark.parametrize("FAILURE", [True, False])
 def test_consan_tdm_store(FAILURE):
     """
@@ -339,9 +287,6 @@ def test_consan_tdm_store(FAILURE):
     else:
         assert "device assertion failed" not in stderr_str, \
             f"Unexpected ConSan violation in stderr:\n{stderr_str}"
-
-
-@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires GFX1250")
 @pytest.mark.parametrize("FAILURE", [True, False])
 def test_consan_tdm_load_no_barrier(FAILURE):
     """
@@ -357,9 +302,6 @@ def test_consan_tdm_load_no_barrier(FAILURE):
     else:
         assert "device assertion failed" not in stderr_str, \
             f"Unexpected ConSan violation in stderr:\n{stderr_str}"
-
-
-@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires GFX1250")
 @pytest.mark.parametrize("FAILURE", [True, False])
 def test_consan_tdm_two_bufs_one_wait(FAILURE):
     """
@@ -375,9 +317,6 @@ def test_consan_tdm_two_bufs_one_wait(FAILURE):
     else:
         assert "device assertion failed" not in stderr_str, \
             f"Unexpected ConSan violation in stderr:\n{stderr_str}"
-
-
-@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires GFX1250")
 @pytest.mark.parametrize("FAILURE", [True, False])
 def test_consan_tdm_load_store_combined(FAILURE):
     """
@@ -393,9 +332,6 @@ def test_consan_tdm_load_store_combined(FAILURE):
     else:
         assert "device assertion failed" not in stderr_str, \
             f"Unexpected ConSan violation in stderr:\n{stderr_str}"
-
-
-@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires GFX1250")
 @pytest.mark.parametrize("FAILURE", [True, False])
 def test_consan_tdm_cross_partition(FAILURE):
     """
@@ -412,9 +348,6 @@ def test_consan_tdm_cross_partition(FAILURE):
     else:
         assert "device assertion failed" not in stderr_str, \
             f"Unexpected ConSan violation in stderr:\n{stderr_str}"
-
-
-@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires GFX1250")
 @pytest.mark.parametrize("FAILURE", [True, False])
 def test_consan_tdm_cross_partition_load_store(FAILURE):
     """

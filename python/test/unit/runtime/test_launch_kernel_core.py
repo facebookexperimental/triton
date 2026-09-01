@@ -19,6 +19,8 @@ import triton.language as tl
 from triton import knobs
 from triton._internal_testing import is_cuda
 
+pytestmark = pytest.mark.skipif(not is_cuda(), reason="Requires CUDA backend")
+
 
 @contextlib.contextmanager
 def force_launch_kernel_path():
@@ -56,9 +58,6 @@ def _scalar_mix_kernel(x_ptr, out_ptr, fscale, iadd, N, BLOCK: tl.constexpr):
     mask = offs < N
     x = tl.load(x_ptr + offs, mask=mask)
     tl.store(out_ptr + offs, x * fscale + iadd, mask=mask)
-
-
-@pytest.mark.skipif(not is_cuda(), reason="Requires CUDA")
 def test_launchkernel_path_add_numerics():
     N = 4096
     x = torch.randn(N, device="cuda")
@@ -69,17 +68,11 @@ def test_launchkernel_path_add_numerics():
         _add_kernel[grid](x, y, out, N, BLOCK=256)
     torch.testing.assert_close(out, x + y)
     assert counter["calls"] > 0, "launchKernel path was not exercised"
-
-
-@pytest.mark.skipif(not is_cuda(), reason="Requires CUDA")
 def test_launchkernel_path_nop_zero_args():
     with force_launch_kernel_path() as counter:
         _nop_kernel[(1, )]()
     torch.cuda.synchronize()
     assert counter["calls"] > 0, "launchKernel path was not exercised"
-
-
-@pytest.mark.skipif(not is_cuda(), reason="Requires CUDA")
 def test_launchkernel_path_mixed_scalar_args():
     N = 2048
     x = torch.randn(N, device="cuda")
@@ -89,9 +82,6 @@ def test_launchkernel_path_mixed_scalar_args():
         _scalar_mix_kernel[grid](x, out, 2.5, 3, N, BLOCK=128)
     torch.testing.assert_close(out, x * 2.5 + 3)
     assert counter["calls"] > 0, "launchKernel path was not exercised"
-
-
-@pytest.mark.skipif(not is_cuda(), reason="Requires CUDA")
 def test_launchkernel_path_empty_grid():
     """An empty (0) grid must be a no-op, not a CUDA error — the shared core
     skips a zero-sized grid (parity with the legacy JIT _launch)."""
@@ -105,9 +95,6 @@ def test_launchkernel_path_empty_grid():
     # out must be untouched (kernel never ran)
     torch.testing.assert_close(out, torch.zeros(N, device="cuda"))
     assert counter["calls"] > 0, "launchKernel path was not exercised"
-
-
-@pytest.mark.skipif(not is_cuda(), reason="Requires CUDA")
 def test_launchkernel_path_host_tma_passthrough():
     """Host-side TMA: Python builds the CUtensorMap; launchKernel passes it
     through args_buf as an ordinary (is_tma=0) param to the shared core."""

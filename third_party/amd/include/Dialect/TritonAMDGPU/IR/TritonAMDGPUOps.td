@@ -844,6 +844,12 @@ def MfmaCommitOp : TT_AMDGPU_Op<"mfma_commit", [
     fragment widths. Source code does not provide physical register classes,
     tuple sizes, or wait-state counts.
 
+    A boundary that carries a live dot operand hands its F32 results out in
+    VGPRs, so its accumulators must already be VGPR-resident. Committing an
+    AGPR-resident accumulator alongside a live operand places the resulting
+    `v_accvgpr_read_b32` ahead of the hazard padding and is rejected during
+    lowering.
+
     The operation is intentionally side-effecting so the completion and
     liveness boundary cannot be deleted or moved across memory operations.
   }];
@@ -874,19 +880,30 @@ def ScheduledMfmaOp : TT_AMDGPU_Op<"scheduled_mfma"> {
     intentionally carried through the surrounding software pipeline.
     `accumulator_role` is `transient` for a phase-local result or `persistent`
     for an accumulator carried across phases. `accumulator_register_class` is
-    `auto`, `agpr`, or `vgpr`; `auto` lets target lowering derive storage from
-    the lifetime role, while an explicit class supports kernels whose two
-    persistent accumulator sets intentionally occupy complementary physical
-    files. `initialize` starts the native accumulators from zero. Completion
+    `auto`, `agpr`, or `vgpr`; `auto` means VGPRs for `transient` and AGPRs for
+    `persistent` on every target, while an explicit class supports kernels
+    whose two persistent accumulator sets intentionally occupy complementary
+    physical files. On CDNA3 the compiler-generated AGPR read is not ordered
+    against the MFMA drain, so any AGPR accumulator is rejected there,
+    including one named by `auto`: a persistent accumulator must request
+    `vgpr`.
+    `initialize` starts the native accumulators from zero. Completion
     of transient result fragments is represented separately by `mfma_commit`.
+
+    An AGPR-resident accumulator must not reach an `mfma_commit` that also
+    carries a live dot operand: that boundary constrains its F32 results to
+    VGPRs, so the AGPR read is materialized as operand setup and precedes the
+    boundary's hazard padding. Lowering reports this whenever the producing
+    `scheduled_mfma` is visible from the commit.
 
     All active lanes of a wave must execute this operation uniformly. This is
     an explicit source contract because LLVM inline assembly cannot represent
     a convergent-call attribute on the pinned compiler revision.
 
-    The contract supports CDNA4 BF16 or F16 inputs, F32 accumulators, one or
-    more K fragments per wave, and native 32x32x16 or 16x16x32 instruction
-    shapes.
+    The contract supports BF16 or F16 inputs and F32 accumulators on CDNA3 and
+    CDNA4. It accepts one or more K fragments per wave and the target's native
+    instruction shapes: 32x32x8 or 16x16x16 on CDNA3, and 32x32x16 or
+    16x16x32 on CDNA4.
   }];
 
   let arguments = (ins TT_Tensor:$a, TT_Tensor:$b, TT_Tensor:$acc,

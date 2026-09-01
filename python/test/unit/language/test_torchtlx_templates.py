@@ -228,6 +228,185 @@ class TestTLXTemplates(TestCase):
 
     @unittest.skipIf(
         not is_gfx950(),
+        "Need AMD MI350X (gfx950) for the TLX inter-wave addmm template",
+    )
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    @parametrize("dtype", (torch.float16, torch.bfloat16))
+    @parametrize("k", (256, 328))
+    @parametrize("column_major_b", (False, True))
+    def test_tlx_addmm_interwave(
+        self,
+        dtype: torch.dtype,
+        k: int,
+        column_major_b: bool,
+    ):
+        """The gfx950 inter-wave template handles B layouts and M/K tails."""
+        from triton.language.extra.tlx.inductor import mm_templates as _tlx_mm
+        from triton.language.extra.tlx.inductor import registry as _tlx_registry
+
+        M, K, N = 256, k, 256
+        a = torch.randn(M, K, device=GPU_TYPE, dtype=dtype)
+        torch._dynamo.mark_dynamic(a, 0)
+        b = (
+            torch.randn(N, K, device=GPU_TYPE, dtype=dtype).t()
+            if column_major_b
+            else torch.randn(K, N, device=GPU_TYPE, dtype=dtype)
+        )
+        bias = torch.randn(N, device=GPU_TYPE, dtype=dtype)
+
+        def addmm(bias, a, b):
+            return torch.addmm(bias, a, b)
+
+        def _only_interwave(templates, op_name="mm"):
+            from torch._inductor.kernel.mm import mm_template
+
+            uids = {getattr(t, "uid", None) for t in templates}
+            if op_name == "addmm" and mm_template.uid in uids:
+                template = _tlx_mm.gfx950_addmm_interwave_template
+                if template.uid not in uids:
+                    templates.append(template)
+            return templates
+
+        with (
+            mock.patch.object(_tlx_mm, "append_tlx", _only_interwave),
+            mock.patch.object(
+                _tlx_registry.Gfx950AddMMInterWaveTemplateConfigHeuristic,
+                "INTERWAVE_CONFIGS",
+                [(256, 256, 64, 4, 8, 0, 8)],
+            ),
+            config.patch(
+                {
+                    "triton.tlx_mode": "force",
+                    "force_disable_caches": True,
+                    "max_autotune": True,
+                    "max_autotune_gemm_backends": "TRITON",
+                    "enable_caching_generated_triton_templates": False,
+                }
+            ),
+        ):
+            compiled_addmm = torch.compile(addmm)
+            c_actual, code = run_and_get_code(compiled_addmm, bias, a, b)
+
+            # Reuse the same symbolic-M graph with a non-tile-aligned runtime M.
+            a_tail = torch.randn(M + 8, K, device=GPU_TYPE, dtype=dtype)
+            c_tail_actual = compiled_addmm(bias, a_tail, b)
+
+        c_expected = (a.float() @ b.float() + bias.float()).to(dtype)
+        c_tail_expected = (a_tail.float() @ b.float() + bias.float()).to(dtype)
+        torch.testing.assert_close(c_actual, c_expected, atol=2e-2, rtol=2e-2)
+        torch.testing.assert_close(
+            c_tail_actual, c_tail_expected, atol=2e-2, rtol=2e-2
+        )
+        self.assertIn("smem_a_top", "\n".join(code))
+
+    @unittest.skipIf(
+        not is_gfx950(),
+        "Need AMD MI350X (gfx950) for the TLX inter-wave addmm template",
+    )
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    def test_tlx_addmm_interwave_symbolic_m_xcd(self):
+        """The 8-XCD remap preserves the index type for a symbolic M expression."""
+        from triton.language.extra.tlx.inductor import mm_templates as _tlx_mm
+        from triton.language.extra.tlx.inductor import registry as _tlx_registry
+
+        batch, rows, K, N = 32, 2000, 256, 512
+        a = torch.randn(batch, rows, K, device=GPU_TYPE, dtype=torch.float16)
+        torch._dynamo.mark_dynamic(a, 0)
+        b = torch.randn(N, K, device=GPU_TYPE, dtype=torch.float16).t()
+        bias = torch.randn(N, device=GPU_TYPE, dtype=torch.float16)
+
+        def addmm(bias, a, b):
+            return torch.addmm(bias, a.flatten(0, 1), b)
+
+        def _add_interwave(templates, op_name="mm"):
+            from torch._inductor.kernel.mm import mm_template
+
+            uids = {getattr(t, "uid", None) for t in templates}
+            if op_name == "addmm" and mm_template.uid in uids:
+                template = _tlx_mm.gfx950_addmm_interwave_template
+                if template.uid not in uids:
+                    templates.append(template)
+            return templates
+
+        with (
+            mock.patch.object(_tlx_mm, "append_tlx", _add_interwave),
+            mock.patch.object(
+                _tlx_registry.Gfx950AddMMInterWaveTemplateConfigHeuristic,
+                "INTERWAVE_CONFIGS",
+                [(256, 256, 64, 4, 8, 0, 8)],
+            ),
+            config.patch(
+                {
+                    "triton.tlx_mode": "force",
+                    "force_disable_caches": True,
+                    "max_autotune": True,
+                    "max_autotune_gemm_backends": "TRITON",
+                    "autotune_fallback_to_aten": False,
+                    "test_configs.autotune_choice_name_regex": (
+                        "tlx_gfx950_addmm_interwave"
+                    ),
+                    "enable_caching_generated_triton_templates": False,
+                }
+            ),
+        ):
+            c_actual, code = run_and_get_code(torch.compile(addmm), bias, a, b)
+
+        c_expected = addmm(bias, a, b)
+        torch.testing.assert_close(c_actual, c_expected, atol=2e-2, rtol=2e-2)
+        self.assertIn("smem_a_top", "\n".join(code))
+
+    @unittest.skipIf(
+        not is_gfx950(),
+        "Need AMD MI350X (gfx950) for the TLX inter-wave addmm template",
+    )
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    @parametrize("shape", ((1024, 864, 1024), (64000, 256, 256)))
+    def test_tlx_addmm_interwave_real_autotune(self, shape: tuple[int, int, int]):
+        """The registered inter-wave choice competes on production B layouts."""
+        from torch._inductor.select_algorithm import TritonTemplateCaller
+        from triton.language.extra.tlx.inductor import registry as _tlx_registry  # noqa: F401
+
+        M, K, N = shape
+        a = torch.randn(M, K, device=GPU_TYPE, dtype=torch.float16)
+        b = torch.randn(N, K, device=GPU_TYPE, dtype=torch.float16).t()
+        bias = torch.randn(N, device=GPU_TYPE, dtype=torch.float16)
+
+        benchmarked = []
+        benchmark = TritonTemplateCaller.benchmark
+
+        def record_benchmark(choice, *args, out):
+            benchmarked.append(choice.name)
+            return benchmark(choice, *args, out=out)
+
+        with (
+            mock.patch.object(TritonTemplateCaller, "benchmark", record_benchmark),
+            config.patch(
+                {
+                    "triton.tlx_mode": "allow",
+                    "force_disable_caches": True,
+                    "max_autotune": True,
+                    "max_autotune_gemm_backends": "ATEN,TRITON",
+                    "enable_caching_generated_triton_templates": False,
+                }
+            ),
+        ):
+            c_actual, code = run_and_get_code(
+                torch.compile(torch.addmm), bias, a, b
+            )
+
+        c_expected = torch.addmm(bias, a, b)
+        torch.testing.assert_close(c_actual, c_expected, atol=2e-2, rtol=2e-2)
+        self.assertTrue(code)
+        self.assertTrue(
+            any("tlx_gfx950_addmm_interwave" in name for name in benchmarked),
+            benchmarked,
+        )
+        self.assertTrue(
+            any(name.startswith("triton_mm") for name in benchmarked), benchmarked
+        )
+
+    @unittest.skipIf(
+        not is_gfx950(),
         "Need AMD MI350X (gfx950) for the TLX warp-pipe addmm template",
     )
     @unittest.skipIf(not has_tlx(), "TLX not available")
@@ -695,6 +874,35 @@ class TestTLXTemplates(TestCase):
         code_str = "\n".join(code)
         self.assertIn("split_k_ws", code_str)
         self.assertIn("_reduce_k", code_str)
+
+
+class TestInterWaveTemplateCodegen(TestCase):
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    def test_interwave_template_renders_four_quadrants(self):
+        import jinja2
+        from triton.language.extra.tlx.inductor.mm_templates import load_tlx_template
+
+        source = load_tlx_template("gfx950_addmm_interwave")
+        stores = []
+
+        def store_output(indices, val, mask, **kwargs):
+            stores.append((indices, val, mask, kwargs["val_shape"]))
+            return f"tl.store(A, {val}, mask={mask})"
+
+        hooks = {
+            "def_kernel": lambda *args, **kwargs: "def _kernel(A, B):",
+            "size": lambda *args, **kwargs: "256",
+            "stride": lambda *args, **kwargs: "1",
+            "store_output": store_output,
+        }
+        rendered = jinja2.Environment().from_string(source).render(**hooks)
+
+        compile(rendered, "<gfx950_addmm_interwave>", "exec")
+        self.assertEqual(4, len(stores))
+        self.assertCountEqual(
+            ["acc_tl", "acc_bl", "acc_tr", "acc_br"],
+            [store[1] for store in stores],
+        )
 
 
 class TestWarpPipeSplitKCodegen(TestCase):

@@ -83,6 +83,15 @@ gfx950_addmm_warppipe_template = TritonTemplate(
     source=load_tlx_template("gfx950_addmm_warppipe"),
 )
 
+# gfx950-only inter-wave addmm candidate derived from the a16w16 tutorial. The
+# tutorial is tuned for K-contiguous (column-major) B; the Inductor integration
+# also supports N-contiguous B with a layout-specific shared-memory swizzle.
+gfx950_addmm_interwave_template = TritonTemplate(
+    name="tlx_gfx950_addmm_interwave",
+    grid=mm_grid,
+    source=load_tlx_template("gfx950_addmm_interwave"),
+)
+
 # TLX warp-pipelined bmm template (MI350X/gfx950). Same warp-pipe core as the addmm, plus a
 # batch axis on the grid + a per-batch int64 base advance. B is the standard torch.bmm [BATCH,K,N]
 # row-major layout (loaded as (BLOCK_K, BLOCK_N) tiles, no transpose). Selection via TLX_MODE.
@@ -127,6 +136,9 @@ def _append_tlx_amd(templates, op_name):
 
         uids = {getattr(t, "uid", None) for t in templates}
         if mm_template.uid in uids:
+            # Inter-wave candidate for contiguous row- or column-major B.
+            if gfx950_addmm_interwave_template.uid not in uids:
+                templates.append(gfx950_addmm_interwave_template)
             # per-tile warp-pipe (existing candidate)
             if gfx950_addmm_warppipe_template.uid not in uids:
                 templates.append(gfx950_addmm_warppipe_template)

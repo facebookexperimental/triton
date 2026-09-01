@@ -447,6 +447,40 @@ repairUnwrappedReshapes(ArrayRef<::mlir::triton::ReshapeOp> reshapes) {
   return success();
 }
 
+static void lowerRequireLayouts(ModuleOp moduleOp) {
+  SmallVector<ttg::RequireLayoutOp> requireLayouts;
+  moduleOp.walk([&](ttg::RequireLayoutOp op) { requireLayouts.push_back(op); });
+
+  for (ttg::RequireLayoutOp op : requireLayouts) {
+    bool rematerializeCoordinates =
+        op->hasAttr("tlx.rematerialize_coordinates");
+    if (op.getSrc().getType() == op.getType()) {
+      if (rematerializeCoordinates) {
+        if (auto sourceConvert =
+                op.getSrc().getDefiningOp<ttg::ConvertLayoutOp>()) {
+          sourceConvert->setAttr("tlx.rematerialize_coordinates",
+                                 UnitAttr::get(op.getContext()));
+          op.getResult().replaceAllUsesWith(op.getSrc());
+          op.erase();
+          continue;
+        }
+      } else {
+        op.getResult().replaceAllUsesWith(op.getSrc());
+        op.erase();
+        continue;
+      }
+    }
+
+    OpBuilder builder(op);
+    auto convert = ttg::ConvertLayoutOp::create(builder, op.getLoc(),
+                                                op.getType(), op.getSrc());
+    if (rematerializeCoordinates)
+      convert->setAttr("tlx.rematerialize_coordinates", builder.getUnitAttr());
+    op.getResult().replaceAllUsesWith(convert.getResult());
+    op.erase();
+  }
+}
+
 static LogicalResult finalizeUserLayouts(ModuleOp moduleOp) {
   SmallVector<::mlir::triton::ReshapeOp> wrappedReshapes;
   moduleOp.walk([&](::mlir::triton::ReshapeOp reshape) {
@@ -491,9 +525,12 @@ static LogicalResult finalizeUserLayouts(ModuleOp moduleOp) {
   if (failed(repairUnwrappedReshapes(wrappedReshapes)))
     return failure();
 
+  lowerRequireLayouts(moduleOp);
+
   SmallVector<ttg::ConvertLayoutOp> identityConversions;
   moduleOp.walk([&](ttg::ConvertLayoutOp convert) {
-    if (convert.getSrc().getType() == convert.getType())
+    if (convert.getSrc().getType() == convert.getType() &&
+        !convert->hasAttr("tlx.rematerialize_coordinates"))
       identityConversions.push_back(convert);
   });
   for (ttg::ConvertLayoutOp convert : identityConversions) {

@@ -4,8 +4,10 @@ import pathlib
 
 import triton
 
-from triton._internal_testing import is_hip_cdna4, is_hip_gfx1250, to_triton, numpy_random
+from triton._internal_testing import is_hip, is_hip_cdna4, is_hip_gfx1250, to_triton, numpy_random
 
+
+pytestmark = pytest.mark.skipif(not is_hip(), reason="Requires HIP backend")
 num_ctas_list = [1]
 
 GPU_DIALECT = "ttg"

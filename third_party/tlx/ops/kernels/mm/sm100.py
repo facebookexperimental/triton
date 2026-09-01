@@ -403,6 +403,14 @@ def get_cuda_autotune_config():
     ]
 
 
+def _padded_num_pid_m(M, BLOCK_SIZE_M, NUM_CTAS):
+    return -((-M) // BLOCK_SIZE_M // NUM_CTAS) * NUM_CTAS
+
+
+def _workspace_rows_per_split(M, BLOCK_SIZE_M, NUM_CTAS):
+    return _padded_num_pid_m(M, BLOCK_SIZE_M, NUM_CTAS) * BLOCK_SIZE_M
+
+
 def matmul_tma_set_block_size_hook(nargs):
     BLOCK_M = nargs["BLOCK_SIZE_M"]
     BLOCK_N = nargs["BLOCK_SIZE_N"]
@@ -429,7 +437,8 @@ def matmul_tma_set_block_size_hook(nargs):
     if SPLIT_K > 1:
         M = nargs["M"]
         N = nargs["N"]
-        workspace = torch.empty((SPLIT_K * M, N), device=nargs["c_desc"].base.device, dtype=nargs["c_desc"].base.dtype)
+        rows = SPLIT_K * _workspace_rows_per_split(M, BLOCK_M, NUM_CTAS)
+        workspace = torch.empty((rows, N), device=nargs["c_desc"].base.device, dtype=nargs["c_desc"].base.dtype)
         nargs["workspace_desc"].base = workspace
         nargs["workspace_desc"].shape = list(workspace.shape)
     else:
@@ -687,7 +696,6 @@ def _process_tile_epilogue_inner(
     num_pid_m,
     num_mn_tiles,
     GROUP_SIZE_M,
-    M,
     BLOCK_SIZE_M,
     BLOCK_SIZE_N,
     EPILOGUE_SUBTILE,
@@ -715,7 +723,8 @@ def _process_tile_epilogue_inner(
     if SPLIT_K > 1:
         split_id = tile_id // num_mn_tiles
         out_desc = workspace_desc
-        row_base = split_id * M
+        # Tile-grid stride, not M; mirrors _workspace_rows_per_split.
+        row_base = split_id * num_pid_m * BLOCK_SIZE_M
     else:
         out_desc = c_desc
         row_base = 0
@@ -1105,11 +1114,14 @@ def _reduce_k_kernel(
     c_ptr,
     M,
     N,
+    ROWS_PER_SPLIT,
     SPLIT_K: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     OUTPUT_DTYPE: tl.constexpr,
 ):
+    # Row stride between splits: padded tile-grid height, not M. Callers derive
+    # it from the allocation.
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
     offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
@@ -1119,7 +1131,7 @@ def _reduce_k_kernel(
 
     acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for s in range(SPLIT_K):
-        ws_offs = base_offs + s * M * N
+        ws_offs = base_offs + s * ROWS_PER_SPLIT * N
         partial = tl.load(workspace_ptr + ws_offs, mask=mask, other=0.0)
         acc += partial.to(tl.float32)
 
@@ -1155,6 +1167,7 @@ def reduce_post_hook(nargs, exception=None):
             c,
             M,
             N,
+            workspace.shape[0] // split_k,
             SPLIT_K=split_k,
             BLOCK_SIZE_M=32,
             BLOCK_SIZE_N=32,
@@ -1308,7 +1321,6 @@ def matmul_kernel_tma_ws_blackwell(
                         num_pid_m=num_pid_m,
                         num_mn_tiles=num_mn_tiles,
                         GROUP_SIZE_M=GROUP_SIZE_M,
-                        M=M,
                         BLOCK_SIZE_M=BLOCK_SIZE_M,
                         BLOCK_SIZE_N=BLOCK_SIZE_N,
                         EPILOGUE_SUBTILE=EPILOGUE_SUBTILE,
@@ -1599,10 +1611,8 @@ def mm(a, b, *, space="full"):
     workspace_desc = TensorDescriptor(c, c.shape, c.stride(), dummy_block)
 
     def grid(META):
-        num_ctas = META["NUM_CTAS"]
-        num_pid_m = triton.cdiv(M, META["BLOCK_SIZE_M"])
+        num_pid_m = _padded_num_pid_m(M, META["BLOCK_SIZE_M"], META["NUM_CTAS"])
         num_pid_n = triton.cdiv(N, META["BLOCK_SIZE_N"])
-        num_pid_m = (num_pid_m + num_ctas - 1) // num_ctas * num_ctas
         return (num_pid_m * num_pid_n * META["SPLIT_K"], )
 
     kernel = _tuned(space, (M, N, K) if space == "heuristic" else None)
@@ -1628,6 +1638,7 @@ def mm(a, b, *, space="full"):
             c,
             M,
             N,
+            workspace_desc.base.shape[0] // split_k,
             SPLIT_K=split_k,
             BLOCK_SIZE_M=32,
             BLOCK_SIZE_N=32,

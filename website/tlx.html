@@ -22,6 +22,7 @@
 <aside class="sidebar">
       <p class="eyebrow">TLX documentation</p>
       <nav><a href="tlx.html" aria-current="page">Overview</a>
+<a class="sub" href="#optimize-tlx-kernels">Optimize TLX kernels</a>
 <a class="sub" href="#hardware-tags">Hardware tags</a>
 <a href="buffers.html">Memory</a>
 <a href="global-memory.html">Global memory access</a>
@@ -47,6 +48,8 @@
 <div class="list-item depth-0"><span aria-hidden="true">•</span><div>Instruction-level scheduling and control</div></div>
 <div class="list-item depth-0"><span aria-hidden="true">•</span><div>Cross-warpgroup synchronization</div></div>
 <p>While this approach places more responsibility on the user, it reduces the compiler's role as a performance bottleneck. Although it may introduce divergence across hardware platforms, it empowers users to perform deeper, architecture-specific optimizations without relying solely on compiler heuristics.</p>
+<h2 id="optimize-tlx-kernels">Optimize TLX kernels</h2>
+<p>Use the <a href="tlx-agent.html">TLX Agent</a> to run a harness-driven optimization loop with isolated candidates, correctness gates, Proton and hardware profiling, final revalidation, and an optional local winner commit. Running it through a coding agent is recommended because the coding agent can prepare and freeze the workload-specific harness before invoking the TLX Agent CLI.</p>
 <h2 id="hardware-tags">Hardware tags</h2>
 <p>Every operation below is tagged with the targets it runs on, using the architecture ids from <code>triton._internal_testing</code> — the same vocabulary the rest of this repo uses:</p>
 <table><thead><tr><th>Tag</th><th>Hardware</th></tr></thead><tbody><tr><td><code>sm90</code></td><td>NVIDIA Hopper</td></tr><tr><td><code>sm100</code></td><td>NVIDIA Blackwell</td></tr><tr><td><code>sm90+</code></td><td>Hopper and newer NVIDIA</td></tr><tr><td><code>gfx942</code></td><td>AMD MI300 (CDNA3)</td></tr><tr><td><code>gfx950</code></td><td>AMD MI350 (CDNA4)</td></tr><tr><td><code>gfx942+</code></td><td>MI300 and newer AMD</td></tr><tr><td><code>gfx1250</code></td><td>AMD RDNA4</td></tr><tr><td><code>amd</code></td><td>All AMD targets</td></tr></tbody></table>

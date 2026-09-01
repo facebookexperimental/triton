@@ -24,6 +24,8 @@ from triton.language.extra.tlx.tutorials.fused_attention_ws_device_tma_dp import
 
 from triton._internal_testing import is_blackwell
 
+
+pytestmark = pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell (sm100)")
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
 # =============================================================================
@@ -75,7 +77,6 @@ class FlashAttention:
 @pytest.mark.parametrize("GROUP_SIZE_N", [1])
 @pytest.mark.parametrize("maxRegAutoWS", [152, 192])
 @pytest.mark.parametrize("pingpongAutoWS", [True, False])
-@pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell GPU")
 def test_autows_fa_dp_non_causal(SUBTILING, SUBTILING_P, VECT_MUL, FADD2_REDUCE, BLOCK_N, GROUP_SIZE_N, maxRegAutoWS,
                                  pingpongAutoWS):
     config = FlashAttention.CONFIGS["autows_fa_dp"].copy()
@@ -109,7 +110,6 @@ def test_autows_fa_dp_non_causal(SUBTILING, SUBTILING_P, VECT_MUL, FADD2_REDUCE,
 @pytest.mark.parametrize("GROUP_SIZE_N", [4])
 @pytest.mark.parametrize("maxRegAutoWS", [152, 192])
 @pytest.mark.parametrize("pingpongAutoWS", [False])
-@pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell GPU")
 def test_autows_fa_dp_causal(SUBTILING, SUBTILING_P, VECT_MUL, FADD2_REDUCE, BLOCK_N, GROUP_SIZE_N, maxRegAutoWS,
                              pingpongAutoWS):
     config = FlashAttention.CONFIGS["autows_fa_dp"].copy()
@@ -138,7 +138,6 @@ def test_autows_fa_dp_causal(SUBTILING, SUBTILING_P, VECT_MUL, FADD2_REDUCE, BLO
 @pytest.mark.parametrize("VECT_MUL", [0, 1])
 @pytest.mark.parametrize("FADD2_REDUCE", [False])
 @pytest.mark.parametrize("baseVariant", ["ws_persistent", "ws"])
-@pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell GPU")
 def test_autows_fa_non_causal(SUBTILING, VECT_MUL, FADD2_REDUCE, baseVariant):
     sm_scale = 0.5
     for Z, H, N_CTX, HEAD_DIM in FlashAttention.SHAPES:
@@ -149,7 +148,6 @@ def test_autows_fa_non_causal(SUBTILING, VECT_MUL, FADD2_REDUCE, baseVariant):
 
 
 @pytest.mark.parametrize("baseVariant", ["ws_persistent", "ws"])
-@pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell GPU")
 def test_autows_fa_2cta_non_causal(baseVariant):
     config = next(
         (config for config in _autows_fwd_configs if config.kwargs.get("NUM_CTAS") == 2),
@@ -171,9 +169,6 @@ def test_autows_fa_2cta_non_causal(baseVariant):
     finally:
         kernel.configs = old_configs
         kernel.cache = old_cache
-
-
-@pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell GPU")
 def test_autows_fa_2cta_persistent_multi_iteration():
     """Cover persistent tile reuse and V staging-slot rotation."""
     config = next(
@@ -198,7 +193,6 @@ def test_autows_fa_2cta_persistent_multi_iteration():
 
 
 @pytest.mark.parametrize("N_CTX", [1024, 4096])
-@pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell GPU")
 def test_autows_fa_rescale_opt_long_sequence(N_CTX):
     """Cover the optimized accumulator update at both target sequence lengths."""
     num_ctas = int(os.environ.get("AUTOWS_FWD_NUM_CTAS", "1"))
@@ -224,9 +218,6 @@ def test_autows_fa_rescale_opt_long_sequence(N_CTX):
     finally:
         _attn_fwd_persist.configs = old_configs
         _attn_fwd_persist.cache = old_cache
-
-
-@pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell GPU")
 @pytest.mark.skipif(
     os.environ.get("AUTOWS_FWD_CLC") != "1" or os.environ.get("AUTOWS_FWD_NUM_CTAS") != "2",
     reason="Run with AUTOWS_FWD_CLC=1 and AUTOWS_FWD_NUM_CTAS=2",
@@ -268,7 +259,6 @@ def test_autows_fa_rescale_opt_clc_repeated_high_grid():
 @pytest.mark.parametrize("VECT_MUL", [0, 1])
 @pytest.mark.parametrize("FADD2_REDUCE", [False])
 @pytest.mark.parametrize("baseVariant", ["ws_persistent", "ws"])
-@pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell GPU")
 def test_autows_fa_causal(SUBTILING, VECT_MUL, FADD2_REDUCE, baseVariant):
     sm_scale = 0.5
     for Z, H, N_CTX, HEAD_DIM in FlashAttention.SHAPES:

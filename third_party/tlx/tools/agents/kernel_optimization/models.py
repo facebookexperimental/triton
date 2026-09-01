@@ -31,6 +31,7 @@ class KernelTarget:
     architecture: str
     device: str | None = None
     environment: Mapping[str, str] = field(default_factory=dict)
+    optimization_guidance: str = ""
 
 
 @dataclass(frozen=True)
@@ -66,6 +67,7 @@ class KernelOptimizationRequest:
     strategy: str = "best_first"
     reference_kernel_source: str | None = None
     output_dir: Path | None = None
+    diagnostic_proton_intra_kernel: bool = False
 
     def __post_init__(self) -> None:
         if not self.kernel_source.strip():
@@ -170,7 +172,27 @@ class ExperimentSummary:
     performance: PerformanceSummary | None = None
     diagnostics: str = ""
     mutation_summary: str = ""
+    hypothesis: str = ""
+    evidence: str = ""
+    expected_effect: str = ""
+    risk: str = ""
     profile_path: Path | None = None
+
+
+@dataclass(frozen=True)
+class AutoCommitResult:
+    requested: bool
+    success: bool
+    vcs: str | None = None
+    repo_root: Path | None = None
+    target_path: Path | None = None
+    target_relpath: str | None = None
+    base_revision: str | None = None
+    commit_revision: str | None = None
+    subject: str | None = None
+    attribution: str = "TLX agent authored"
+    dirty_target_at_start: bool = False
+    diagnostics: str = ""
 
 
 @dataclass(frozen=True)
@@ -182,6 +204,7 @@ class KernelOptimizationResult:
     experiments: tuple[ExperimentSummary, ...]
     artifacts_dir: Path
     stopping_reason: str
+    auto_commit: AutoCommitResult | None = None
 
 
 def weighted_geometric_speedup(
