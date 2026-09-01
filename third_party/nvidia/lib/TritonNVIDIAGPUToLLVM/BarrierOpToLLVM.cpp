@@ -544,6 +544,18 @@ struct NamedBarrierArriveOpConversion
   }
 };
 
+template <typename OpTy>
+struct NamedBarrierIdOpConversion : public ConvertOpToLLVMPattern<OpTy> {
+  using ConvertOpToLLVMPattern<OpTy>::ConvertOpToLLVMPattern;
+
+  LogicalResult
+  matchAndRewrite(OpTy op, typename OpTy::Adaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    rewriter.replaceOp(op, adaptor.getValue());
+    return success();
+  }
+};
+
 struct NamedBarrierWaitOpConversion
     : public ConvertOpToLLVMPattern<triton::nvidia_gpu::NamedBarrierWaitOp> {
   using ConvertOpToLLVMPattern<
@@ -920,6 +932,9 @@ void mlir::triton::NVIDIA::populateBarrierOpToLLVMPatterns(
   patterns.add<BarrierExpectConversion>(typeConverter, benefit);
   patterns.add<ArriveBarrierOpConversion>(typeConverter, benefit, targetInfo);
   // Meta Triton CLC + named-barrier + vote-ballot patterns
+  patterns.add<NamedBarrierIdOpConversion<ttng::UserNamedBarrierIdOp>,
+               NamedBarrierIdOpConversion<ttng::CompilerNamedBarrierIdOp>>(
+      typeConverter, benefit);
   patterns.add<NamedBarrierArriveOpConversion>(typeConverter, benefit);
   patterns.add<NamedBarrierWaitOpConversion>(typeConverter, benefit);
   patterns.add<AsyncCLCTryCancelOpConversion>(typeConverter, benefit);

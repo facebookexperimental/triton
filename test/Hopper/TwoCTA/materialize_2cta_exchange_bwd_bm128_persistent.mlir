@@ -10,7 +10,8 @@
 // SHAPE-DAG: ttg.local_store {{.*}} tensor<128x64xf16
 // SHAPE-DAG: ttg.async_remote_shmem_copy
 // Warp-specialize uses IDs 0-6 after padding; the relay takes the next slot.
-// SHAPE-DAG: %[[BAR:.+]] = arith.constant 7 : i32
+// SHAPE-DAG: %[[BARID:.+]] = arith.constant 7 : i32
+// SHAPE-DAG: %[[BAR:.+]] = ttng.compiler_named_barrier_id %[[BARID]]
 // SHAPE-DAG: ttng.wait_barrier_named %[[BAR]],
 // SHAPE-DAG: ttng.fence_async_shared
 // SHAPE-DAG: ttng.tmem_subslice {{.*}} {N = 0 : i32

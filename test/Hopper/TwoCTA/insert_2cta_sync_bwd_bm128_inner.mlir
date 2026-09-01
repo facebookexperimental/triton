@@ -376,16 +376,17 @@ module attributes {"ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32,
         ttng.barrier_expect %dsT_dq_1_271, 16384, %true : !ttg.memdesc<1xi64, #shared3, #smem, mutable>
         %dsT_dq_284 = nvg.cluster_id
         %dsT_dq_285 = arith.cmpi eq, %dsT_dq_284, %c0_i32 : i32
+        %dsT_dq_staging_bar = ttng.compiler_named_barrier_id %c7_i32 : i32
         scf.if %dsT_dq_285 {
           ttg.local_store %dsT_dq_279, %dsT_dq_282 : tensor<128x64xf16, #linear1> -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable, 256x64>
           ttg.local_store %dsT_dq_281, %dsT_dq_1_266 : tensor<128x64xf16, #linear1> -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
-          ttng.wait_barrier_named %c7_i32, %c256_i32 : i32, i32
+          ttng.wait_barrier_named %dsT_dq_staging_bar, %c256_i32 : !ttng.named_barrier_id, i32
           ttng.fence_async_shared {bCluster = false}
           ttg.async_remote_shmem_copy %dsT_dq_1_266, rank %c1_i32, %dsT_dq_282 barrier %dsT_dq_1_271 : !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable, 256x64> barrier_ty !ttg.memdesc<1xi64, #shared3, #smem, mutable>
         } else {
           ttg.local_store %dsT_dq_281, %dsT_dq_283 : tensor<128x64xf16, #linear1> -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable, 256x64>
           ttg.local_store %dsT_dq_279, %dsT_dq_1_266 : tensor<128x64xf16, #linear1> -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
-          ttng.wait_barrier_named %c7_i32, %c256_i32 : i32, i32
+          ttng.wait_barrier_named %dsT_dq_staging_bar, %c256_i32 : !ttng.named_barrier_id, i32
           ttng.fence_async_shared {bCluster = false}
           ttg.async_remote_shmem_copy %dsT_dq_1_266, rank %c0_i32, %dsT_dq_283 barrier %dsT_dq_1_271 : !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable, 256x64> barrier_ty !ttg.memdesc<1xi64, #shared3, #smem, mutable>
         }
