@@ -146,7 +146,8 @@ A structured profile request contains these fields:
 
 Field meanings:
 
-- `level`: `summary`, `deep`, or `diagnostic`.
+- `level`: `summary` or `deep`; use `diagnostic_only: true` for
+  instrumentation-only requests.
 - `tools`: profiler names requested by the agent, such as `proton` plus any
   target-specific tool from `targets/<vendor>/`.
 - `experiment_id`: stable baseline, round, or candidate identifier used in
