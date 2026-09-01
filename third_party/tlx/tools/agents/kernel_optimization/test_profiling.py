@@ -148,6 +148,17 @@ class ProfileParsingTest(unittest.TestCase):
         self.assertAlmostEqual(normalized["summary"]["sm_throughput_pct"], 75.5)
         self.assertIsNone(normalized["summary"]["dram_throughput_pct"])
 
+    def test_normalizes_local_memory_load_bytes(self) -> None:
+        metric = "l1tex__t_bytes_pipe_lsu_mem_local_op_ld.sum"
+        selected = select_ncu_metric_names((metric,), "deep")
+        self.assertEqual(selected["metrics"]["local_load_bytes"], metric)
+
+        normalized = normalize_ncu_metrics(
+            {metric: {"value": 4096.0, "unit": "byte"}},
+            "deep",
+        )
+        self.assertEqual(normalized["registers"]["local_load_bytes"], 4096.0)
+
     def test_parse_ncu_query_metrics_accepts_csv_and_plain_text(self) -> None:
         csv_metrics = parse_ncu_query_metrics(
             "Metric Name,Description\n"

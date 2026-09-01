@@ -62,7 +62,7 @@ DEEP_NCU_METRIC_ALIASES: Mapping[str, tuple[str, ...]] = {
     "registers_per_thread": ("launch__registers_per_thread",),
     "achieved_occupancy_pct": ("sm__warps_active.avg.pct_of_peak_sustained_active",),
     "theoretical_occupancy_pct": ("launch__occupancy_limit_registers",),
-    "local_load_bytes": ("memory_l1_wavefronts_shared",),
+    "local_load_bytes": ("l1tex__t_bytes_pipe_lsu_mem_local_op_ld.sum",),
     "local_store_bytes": ("l1tex__t_bytes_pipe_lsu_mem_local_op_st.sum",),
     "spill_loads": ("launch__sass_reg_spill_loads",),
     "spill_stores": ("launch__sass_reg_spill_stores",),
