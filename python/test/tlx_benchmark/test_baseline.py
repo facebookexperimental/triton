@@ -127,6 +127,7 @@ def test_table_reports_compile_time_replicates_and_throughput_error():
 
     assert "0.69s" in row  # sub-10s compile keeps two decimals
     assert "3x120" in row  # 3 replicates of 120 timed iterations each
+    assert " 1004 " in row  # throughput, from the mean latency
 
 
 def test_table_marks_compile_as_absent_when_not_measured():

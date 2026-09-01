@@ -65,13 +65,14 @@ def _fmt_compile(result) -> str:
 
 def table(results: Sequence[Result]) -> str:
     lines = [
-        f"{'input':<34} {'dtype':<8} {'ref us':>9} {'tlx us':>9} {'speedup':>8} {'compile':>8} "
+        f"{'input':<34} {'dtype':<8} {'ref us':>9} {'tlx us':>9} {'speedup':>8} {'TFLOP/s':>8} {'compile':>8} "
         f"{'reps':>10} {'CV%':>6} {'p50 us':>9} {'p90 us':>9} {'p99 us':>9}  status",
-        "-" * 140,
+        "-" * 149,
     ]
     for r in results:
         lines.append(f"{r.case.input:<34} {r.case.dtype:<8} {_fmt_us(r.ref)} {_fmt_us(r.tlx)} "
                      f"{(f'{r.speedup:.3f}x' if r.speedup else '-'):>8} "
+                     f"{(f'{r.tlx_tflops:.0f}' if r.tlx_tflops else '-'):>8} "
                      f"{_fmt_compile(r):>8} "
                      f"{_fmt_reps(r):>10} "
                      f"{_fmt_cv(r):>6} "
@@ -108,6 +109,8 @@ LEGEND = ("Every latency column is MICROSECONDS, lower is better. `ref us` and `
           "        (median of the per-replicate means); p50/p90/p99 are of the pooled samples.\n"
           "speedup = ref us / tlx us, so >1 means TLX is faster. Stated because the direction is only\n"
           "        checkable if you know these are latencies and not throughput.\n"
+          "TFLOP/s = TLX throughput at the mean latency. The reference's is speedup x this, and is\n"
+          "        in the JSON artifact.\n"
           "reps = replicates x timed iterations each (>=1000 per replicate, enforced).\n"
           "CV%  = coefficient of variation within a run, sd/mean, after IQR rejection.\n"
           "The gate reads NEITHER CV nor the percentiles: it reads the between-run deviation of the\n"
