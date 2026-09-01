@@ -210,6 +210,28 @@ def _tl_dot_2cta_persistent_meta_ws_kernel(
         c_desc.store([offs_m, offs_n], acc.to(tl.bfloat16))
 
 
+@triton.jit
+def _tl_dot_2cta_truncated_b_kernel(a_desc, b_desc, c_desc):
+    """Exercise a descriptor-fed B producer before a 2CTA dot."""
+    start_pid = tl.program_id(0)
+    for tile_id in tl.range(
+            start_pid,
+            2,
+            2,
+            warp_specialize=True,
+            data_partition_factor=1,
+    ):
+        offs_m = tile_id * 128
+        acc = tl.zeros([128, 256], dtype=tl.float32)
+        for offs_k in range(0, 128, 64):
+            a = a_desc.load([offs_m, offs_k])
+            # Preserve the explicit producer rounding point.  The 2CTA load
+            # transform must split the descriptor before recreating this cast.
+            b = b_desc.load([offs_k, 0]).to(tl.bfloat16)
+            acc = tl.dot(a, b, acc, two_ctas=True)
+        c_desc.store([offs_m, 0], acc.to(tl.bfloat16))
+
+
 @pytest.mark.parametrize("DATA_PARTITION_FACTOR", [1, 2])
 @pytest.mark.parametrize("m", [512, 384])
 def test_tl_dot_2cta_persistent_meta_ws(DATA_PARTITION_FACTOR, m, device):
@@ -277,6 +299,42 @@ def test_tl_dot_2cta_persistent_meta_ws(DATA_PARTITION_FACTOR, m, device):
     ttgir = kernel.asm["ttgir"]
     assert "ttg.warp_specialize" in ttgir
     assert "two_ctas" in ttgir
+
+
+def test_tl_dot_2cta_truncated_b(device):
+    torch.manual_seed(0)
+    a = torch.randn((256, 128), device=device, dtype=torch.bfloat16)
+    b = torch.randn((128, 256), device=device, dtype=torch.float32)
+    c = torch.empty((256, 256), device=device, dtype=torch.bfloat16)
+
+    a_desc = TensorDescriptor(a, a.shape, a.stride(), [128, 64])
+    b_desc = TensorDescriptor(b, b.shape, b.stride(), [64, 256])
+    c_desc = TensorDescriptor(c, c.shape, c.stride(), [128, 256])
+
+    def alloc_fn(size: int, align: int, stream: Optional[int]):
+        return torch.empty(size, dtype=torch.int8, device=device)
+
+    triton.set_allocator(alloc_fn)
+    with triton.knobs.nvidia.scope():
+        triton.knobs.nvidia.use_meta_ws = True
+        compiled = _tl_dot_2cta_truncated_b_kernel[(2, )](
+            a_desc,
+            b_desc,
+            c_desc,
+            num_warps=8,
+            num_stages=4,
+            ctas_per_cga=(2, 1, 1),
+        )
+
+    reference = torch.matmul(a.float(), b.to(torch.bfloat16).float()).to(
+        torch.bfloat16
+    )
+    torch.testing.assert_close(c, reference, atol=1.0, rtol=2e-2)
+
+    ttgir = compiled.asm["ttgir"]
+    assert "ttg.warp_specialize" in ttgir
+    assert "two_ctas" in ttgir
+    assert "!tt.tensordesc<64x128xf32" in ttgir
 def test_tl_dot_2cta_sliced_dependent_chain(device):
     torch.manual_seed(0)
     q = torch.randn((256, 128), device=device, dtype=torch.bfloat16)
