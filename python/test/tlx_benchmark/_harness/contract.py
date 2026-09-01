@@ -72,26 +72,26 @@ class Case:
 class Stat:
     """A summarized latency measurement, in milliseconds.
 
-    ``spread`` is the **reproducibility of ``p50`` across independent
-    replicates**, not the width of any one replicate's distribution. Those are
-    very different quantities and the gate needs the first: with a few thousand
-    samples the median is far more stable than the distribution is wide.
-    Measured on B200, mm 8192^3 has a decile width of ~6% -- the power-governed
-    clock wanders -- while its p50 reproduces to 1.7%. Gating on the width
-    would reject a case whose reported number is in fact solid.
-
-    ``within_spread`` keeps that width as a diagnostic: it is what says whether
-    the *machine* was steady, and it correlates with the sampled clock trace.
+    Two dispersion figures, at two different scales, and the distinction is
+    load-bearing. ``rel_max_deviation`` is BETWEEN runs and ``rel_idr`` is
+    WITHIN one; with a few thousand samples per run the median is far more
+    stable than the distribution around it is wide. Measured on B200, mm 8192^3
+    has a within-run relative interdecile range of ~6% -- the power-governed
+    clock wanders -- while its p50 reproduces between runs to 1.7%. The gate
+    reads the first; gating on the second rejected cases whose reported number
+    was in fact solid.
     """
 
     p50: float
     min: float
     max: float
     mean: float
-    #: (max - median) / median over the replicate p50s. The noise gate.
-    spread: float
-    #: (p90 - p10) / p50 of the pooled samples. Diagnostic only.
-    within_spread: float
+    #: Relative maximum deviation of the replicate p50s from their median:
+    #: ``max|p50_i - median(p50)| / median(p50)``. Between runs. The gate.
+    rel_max_deviation: float
+    #: Relative interdecile range of the pooled samples: ``(p90 - p10) / p50``.
+    #: Within a run. Diagnostic -- it says whether the machine was steady.
+    rel_idr: float
     replicates: int
     n_kept: int
     n_raw: int

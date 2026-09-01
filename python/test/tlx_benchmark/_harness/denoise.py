@@ -40,7 +40,7 @@ import threading
 import time
 from typing import Optional
 
-from .measure import quantile_spread
+from .measure import relative_interdecile_range
 
 #: nvml.h clock event ("throttle") reason bits.
 EVENT_REASONS = {
@@ -62,12 +62,12 @@ EVENT_REASONS = {
 #: about the measured window.
 DEGRADING_REASONS = 0x8 | 0x20 | 0x40 | 0x80
 
-#: Relative spread of the SM clock across a measured window, above which the
-#: operating point moved enough to be worth reporting. The trace covers warmup
-#: as well as measurement, so some ramp is expected and this is deliberately
-#: loose -- it is a diagnostic, not the gate. The gate is the measured latency
-#: spread against ``measure.NOISE_FLOOR``.
-CLOCK_SPREAD_LIMIT = 0.10
+#: Relative interdecile range of the SM clock across a measured window, above
+#: which the operating point moved enough to be worth reporting. The trace
+#: covers warmup as well as measurement, so some ramp is expected and this is
+#: deliberately loose -- it is a diagnostic, not the gate. The gate is the
+#: latency's between-run figure against ``measure.MAX_REPLICATE_DEVIATION``.
+MAX_CLOCK_IDR = 0.10
 
 #: Interval between operating-point samples. NVML costs ~16us per sample, so
 #: 20 Hz is free even next to a host-bound case.
@@ -180,23 +180,23 @@ class ClockTrace:
     min_mhz: Optional[int] = None
     median_mhz: Optional[int] = None
     max_mhz: Optional[int] = None
-    #: ``(p90 - p10) / median``, not ``(max - min)``.
+    #: Relative interdecile range, ``(p90 - p10) / median``, not ``(max - min)``.
     #:
     #: The window necessarily contains the ramp from idle -- measured on B200,
     #: the card sits at 990 MHz until the first launch and settles to ~830 under
     #: load -- so a min/max spread is ~25% on every run, healthy or not, and
     #: carries no information. Quantiles ignore the handful of ramp samples for
     #: the same reason the latency path rejects outliers.
-    spread: Optional[float] = None
+    rel_idr: Optional[float] = None
     #: Union of every reason seen, and the degrading subset of it.
     reasons: tuple = ()
     degrading: tuple = ()
 
     @property
     def stable(self) -> Optional[bool]:
-        if self.spread is None:
+        if self.rel_idr is None:
             return None
-        return self.spread <= CLOCK_SPREAD_LIMIT and not self.degrading
+        return self.rel_idr <= MAX_CLOCK_IDR and not self.degrading
 
     def to_dict(self) -> dict:
         d = dataclasses.asdict(self)
@@ -450,7 +450,7 @@ class _Sampler(threading.Thread):
             min_mhz=min(self.clocks),
             median_mhz=med,
             max_mhz=max(self.clocks),
-            spread=quantile_spread(self.clocks, med),
+            rel_idr=relative_interdecile_range(self.clocks, med),
             reasons=tuple(decode_event_reasons(self.reasons)),
             degrading=tuple(decode_event_reasons(self.reasons & DEGRADING_REASONS)),
         )

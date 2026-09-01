@@ -121,9 +121,9 @@ def test_table_reports_compile_time_replicates_and_throughput_error():
     rendered = report_mod.table([r])
 
     header, _, row = rendered.splitlines()[:3]
-    for column in ("input", "TFLOP/s", "+-TF/s", "reps", "noise%", "compile"):
+    for column in ("input", "TFLOP/s", "+-TF/s", "reps", "rIDR%", "compile"):
         assert column in header
-    assert "shape" not in header and "width" not in header
+    assert "shape" not in header and "noise" not in header
 
     assert "0.69s" in row  # sub-10s compile keeps two decimals
     assert " 1004 " in row  # throughput is a bare value, error lives elsewhere

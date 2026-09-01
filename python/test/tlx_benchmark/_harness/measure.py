@@ -60,13 +60,13 @@ DEFAULT_REPLICATES = 10
 #: A case whose reported p50 does not reproduce this closely across replicates
 #: gets no perf verdict.
 #:
-#: Compared against ``Stat.spread``, which is replicate-to-replicate
-#: reproducibility -- NOT the width of one replicate's distribution. Measured on
-#: a denoised B200, compute-bound shapes reproduce to 0.4-1.7%, so 2% is the
-#: achievable floor plus a little margin. An earlier version compared this
-#: number against the distribution width (5-7% for the same shapes, because the
-#: power-governed clock wanders) and rejected healthy cases.
-NOISE_FLOOR = 0.02
+#: Compared against ``Stat.rel_max_deviation`` -- BETWEEN-run reproducibility,
+#: NOT the within-run ``rel_idr``. Measured on a denoised B200, compute-bound
+#: shapes reproduce to 0.4-1.7%, so 2% is the achievable floor plus a little
+#: margin. An earlier version compared this number against the within-run
+#: figure (5-7% for the same shapes, because the power-governed clock wanders)
+#: and rejected healthy cases.
+MAX_REPLICATE_DEVIATION = 0.02
 
 #: A case is host-bound when its latency is below this multiple of the host
 #: cost of issuing one call.
@@ -132,7 +132,7 @@ def reject_outliers_iqr(data: list[float]) -> list[float]:
 
     Ported from tritonbench ``Latency._remove_outliers_iqr``. Its job is to
     remove the occasional descheduled sample, not to make a noisy run look
-    clean -- the spread is computed *after* rejection and still gates the
+    clean -- dispersion is computed *after* rejection and still gates the
     verdict, so a genuinely unstable machine cannot be filtered into a PASS.
     """
     if len(data) <= 3:
@@ -144,7 +144,7 @@ def reject_outliers_iqr(data: list[float]) -> list[float]:
     return [x for x in data if lo <= x <= hi]
 
 
-def quantile_spread(values, median: Optional[float] = None) -> Optional[float]:
+def relative_interdecile_range(values, median: Optional[float] = None) -> Optional[float]:
     """``(p90 - p10) / median``: the width of a distribution, robustly.
 
     Not ``(max - min)`` and not ``(max - p50)``. Those are extreme-value
@@ -168,9 +168,9 @@ def summarize(replicates: list[list[float]], remove_outliers: bool = True) -> St
     """Collapse independent replicates into the reported statistic.
 
     Accepts a list of per-replicate sample lists. A single flat list is also
-    accepted and treated as one replicate, in which case ``spread`` cannot be
-    measured and is reported as the within-replicate width instead -- the
-    conservative direction, since that width is the larger number.
+    accepted and treated as one replicate, in which case ``rel_max_deviation``
+    cannot be measured and falls back to the within-run ``rel_idr`` -- the
+    conservative direction, since that is the larger number.
     """
     if replicates and not isinstance(replicates[0], list):
         replicates = [replicates]  # a bare sample list
@@ -184,19 +184,19 @@ def summarize(replicates: list[list[float]], remove_outliers: bool = True) -> St
     pooled = [x for k in kept_per_replicate for x in k]
 
     p50 = statistics.median_low(p50s)
-    within = quantile_spread(pooled, p50) if p50 else float("inf")
+    rel_idr = relative_interdecile_range(pooled, p50) if p50 else float("inf")
     if len(p50s) > 1 and p50:
-        spread = max(max(p50s) - p50, p50 - min(p50s)) / p50
+        rel_max_deviation = max(max(p50s) - p50, p50 - min(p50s)) / p50
     else:
-        spread = within
+        rel_max_deviation = rel_idr
 
     return Stat(
         p50=p50,
         min=min(pooled),
         max=max(pooled),
         mean=statistics.fmean(pooled),
-        spread=spread,
-        within_spread=within,
+        rel_max_deviation=rel_max_deviation,
+        rel_idr=rel_idr,
         replicates=len(p50s),
         n_kept=len(pooled),
         n_raw=sum(len(r) for r in replicates),

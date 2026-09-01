@@ -24,11 +24,11 @@ from typing import Optional, Sequence
 
 from .compile import CompileStat
 from .contract import Case, Result, Stat, Status
-from .measure import HOST_BOUND_RATIO, NOISE_FLOOR
+from .measure import HOST_BOUND_RATIO, MAX_REPLICATE_DEVIATION
 
 #: A case may be this much slower than its baseline speedup before it fails.
-#: Set against a measured 0.4-1.7% across-run spread on denoised compute-bound
-#: shapes, so it is roughly three times the noise floor -- tight enough to catch
+#: Set against a measured 0.4-1.7% between-run deviation on denoised
+#: compute-bound shapes, so it is roughly three times that -- tight enough to catch
 #: a real regression, loose enough not to fire on one.
 SPEEDUP_TOLERANCE = 0.05
 
@@ -130,10 +130,10 @@ def judge(
                             f"launch path, not the kernel")
         return result
 
-    if tlx.spread > NOISE_FLOOR:
+    if tlx.rel_max_deviation > MAX_REPLICATE_DEVIATION:
         result.status = Status.NOISY
-        result.notes.append(f"spread {tlx.spread * 100:.1f}% exceeds the {NOISE_FLOOR * 100:.0f}% noise floor; "
-                            f"no perf verdict claimed")
+        result.notes.append(f"p50 varied {tlx.rel_max_deviation * 100:.1f}% across {tlx.replicates} replicates, over "
+                            f"the {MAX_REPLICATE_DEVIATION * 100:.0f}% limit; no perf verdict claimed")
         return result
 
     # Compile time is absolute and independent of the perf comparison, so it is

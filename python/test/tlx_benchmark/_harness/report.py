@@ -45,18 +45,17 @@ def _fmt_tflops_err(result) -> str:
     """
     if not result.tlx_tflops or not result.tlx:
         return "-"
-    return f"{result.tlx_tflops * result.tlx.spread:.1f}"
+    return f"{result.tlx_tflops * result.tlx.rel_max_deviation:.1f}"
 
 
-def _fmt_noise(result) -> str:
-    """``0.1/5.6`` -- run-to-run reproducibility, then within-run width.
+def _fmt_rel_idr(result) -> str:
+    """Within-run relative interdecile range, as a percentage.
 
-    One column rather than two: they are the same phenomenon measured at two
-    scales, and the second only ever exists to explain the first.
+    Only the within-run figure: the between-run one is already on the row as
+    the absolute uncertainty in ``+-TF/s``, so printing both would state the
+    same measurement twice in different units.
     """
-    if not result.tlx:
-        return "-"
-    return f"{result.tlx.spread * 100:.1f}/{result.tlx.within_spread * 100:.1f}"
+    return f"{result.tlx.rel_idr * 100:.1f}" if result.tlx else "-"
 
 
 def _fmt_compile(result) -> str:
@@ -68,7 +67,7 @@ def _fmt_compile(result) -> str:
 def table(results: Sequence[Result]) -> str:
     lines = [
         f"{'input':<34} {'dtype':<8} {'tlx us':>9} {'ref us':>9} {'speedup':>8} "
-        f"{'TFLOP/s':>8} {'+-TF/s':>7} {'reps':>4} {'noise%':>10} {'compile':>8}  status",
+        f"{'TFLOP/s':>8} {'+-TF/s':>7} {'reps':>4} {'rIDR%':>7} {'compile':>8}  status",
         "-" * 134,
     ]
     for r in results:
@@ -77,7 +76,7 @@ def table(results: Sequence[Result]) -> str:
                      f"{(f'{r.tlx_tflops:.0f}' if r.tlx_tflops else '-'):>8} "
                      f"{_fmt_tflops_err(r):>7} "
                      f"{(str(r.tlx.replicates) if r.tlx else '-'):>4} "
-                     f"{_fmt_noise(r):>10} "
+                     f"{_fmt_rel_idr(r):>7} "
                      f"{_fmt_compile(r):>8}  {_MARK[r.status]}")
         for note in r.notes:
             lines.append(f"{'':<34} {'':<8} -> {note}")
@@ -105,9 +104,10 @@ def write_json(results: Sequence[Result], env: dict, path: str | pathlib.Path) -
 
 
 #: Explains the columns whose meaning is not obvious from the header.
-LEGEND = ("noise% = run-to-run reproducibility of the p50 / within-run p10-p90 width. "
-          "The gate reads the first.\n"
-          "+-TF/s = the same run-to-run figure expressed as absolute throughput.")
+LEGEND = ("+-TF/s = between-run uncertainty: max deviation of the replicate p50s from their median,\n"
+          "         in absolute throughput. This is what the gate reads.\n"
+          "rIDR%   = within-run relative interdecile range, (p90-p10)/p50 over the pooled samples.\n"
+          "         Diagnostic: it says whether the machine was steady, not whether the result is.")
 
 
 def render(results: Sequence[Result], env: dict, json_path: Optional[str] = None) -> str:

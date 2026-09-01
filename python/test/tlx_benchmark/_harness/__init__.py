@@ -12,11 +12,11 @@ from .compile import COLD_COMPILE_CAP_S, CompileStat, cold_compile, fresh_triton
 from . import baseline, report
 from .baseline import SPEEDUP_TOLERANCE, judge
 from .contract import SCHEMA_VERSION, Case, Result, Stat, Status, artifact
-from .denoise import (CLOCK_SPREAD_LIMIT, DEGRADING_REASONS, EVENT_REASONS, ClockTrace, GpuState, capture_env, check,
+from .denoise import (MAX_CLOCK_IDR, DEGRADING_REASONS, EVENT_REASONS, ClockTrace, GpuState, capture_env, check,
                       decode_event_reasons, foreign_processes, gpu_state, numa_bound, numa_node, nvml, parse_cpulist,
                       stable)
-from .measure import (DEFAULT_REP_MS, DEFAULT_REPLICATES, DEFAULT_WARMUP_MS, HOST_BOUND_RATIO, NOISE_FLOOR,
-                      estimate_runtime_ms, host_overhead_us, measure, quantile_spread, reject_outliers_iqr,
+from .measure import (DEFAULT_REP_MS, DEFAULT_REPLICATES, DEFAULT_WARMUP_MS, HOST_BOUND_RATIO, MAX_REPLICATE_DEVIATION,
+                      estimate_runtime_ms, host_overhead_us, measure, relative_interdecile_range, reject_outliers_iqr,
                       resolve_warmup_and_rep, summarize)
 
 __all__ = [
@@ -35,7 +35,7 @@ __all__ = [
     "Stat",
     "Status",
     "artifact",
-    "CLOCK_SPREAD_LIMIT",
+    "MAX_CLOCK_IDR",
     "DEGRADING_REASONS",
     "EVENT_REASONS",
     "ClockTrace",
@@ -49,13 +49,13 @@ __all__ = [
     "numa_node",
     "nvml",
     "parse_cpulist",
-    "quantile_spread",
+    "relative_interdecile_range",
     "stable",
     "DEFAULT_REP_MS",
     "DEFAULT_REPLICATES",
     "DEFAULT_WARMUP_MS",
     "HOST_BOUND_RATIO",
-    "NOISE_FLOOR",
+    "MAX_REPLICATE_DEVIATION",
     "estimate_runtime_ms",
     "host_overhead_us",
     "measure",

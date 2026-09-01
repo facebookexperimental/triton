@@ -8,7 +8,7 @@ against invented numbers.
 
 import pytest
 
-from _harness import CLOCK_SPREAD_LIMIT, ClockTrace, GpuState, decode_event_reasons, parse_cpulist, quantile_spread  # noqa: E501
+from _harness import MAX_CLOCK_IDR, ClockTrace, GpuState, decode_event_reasons, parse_cpulist, relative_interdecile_range  # noqa: E501
 from _harness.denoise import DEGRADING_REASONS
 
 
@@ -69,7 +69,7 @@ def test_gpu_state_unknown_without_nvidia_smi():
     assert GpuState(available=False).event_reason_names == []
 
 
-def test_quantile_spread_ignores_the_idle_ramp():
+def test_relative_interdecile_range_ignores_the_idle_ramp():
     """The real failure this replaced: a 6 s window on a denoised B200 sampled
     120 clocks, ~830 MHz throughout except the handful before the first launch
     at the 990 MHz idle clock. min/max called that a 26% spread and every run
@@ -78,32 +78,32 @@ def test_quantile_spread_ignores_the_idle_ramp():
     ramp = [990, 985, 970, 950, 900]
     values = ramp + steady
     assert (max(values) - min(values)) / 830 > 0.15  # what min/max would have said
-    assert quantile_spread(values) < CLOCK_SPREAD_LIMIT
+    assert relative_interdecile_range(values) < MAX_CLOCK_IDR
 
 
-def test_quantile_spread_still_sees_real_movement():
+def test_relative_interdecile_range_still_sees_real_movement():
     drifting = list(range(700, 1000, 3))  # a card sliding across the window
-    assert quantile_spread(drifting) > CLOCK_SPREAD_LIMIT
+    assert relative_interdecile_range(drifting) > MAX_CLOCK_IDR
 
 
-def test_quantile_spread_degrades_to_min_max_on_tiny_samples():
-    assert quantile_spread([100, 110], median=100) == pytest.approx(0.1)
-    assert quantile_spread([]) is None
+def test_relative_interdecile_range_degrades_to_min_max_on_tiny_samples():
+    assert relative_interdecile_range([100, 110], median=100) == pytest.approx(0.1)
+    assert relative_interdecile_range([]) is None
 
 
 def test_clock_trace_stability():
-    ramping = ClockTrace(samples=21, min_mhz=802, median_mhz=832, max_mhz=990, spread=0.23)
+    ramping = ClockTrace(samples=21, min_mhz=802, median_mhz=832, max_mhz=990, rel_idr=0.23)
     assert ramping.stable is False
 
-    steady = ClockTrace(samples=120, min_mhz=828, median_mhz=832, max_mhz=990, spread=0.014)
-    assert steady.spread < CLOCK_SPREAD_LIMIT
+    steady = ClockTrace(samples=120, min_mhz=828, median_mhz=832, max_mhz=990, rel_idr=0.014)
+    assert steady.rel_idr < MAX_CLOCK_IDR
     assert steady.stable is True
 
 
 def test_clock_trace_degradation_overrides_a_tight_spread():
     """A card that thermally slowed but happened to do so smoothly is still
     not a valid measurement."""
-    trace = ClockTrace(samples=100, min_mhz=828, median_mhz=832, max_mhz=840, spread=0.01,
+    trace = ClockTrace(samples=100, min_mhz=828, median_mhz=832, max_mhz=840, rel_idr=0.01,
                        reasons=("hw_thermal_slowdown", ), degrading=("hw_thermal_slowdown", ))
     assert trace.stable is False
 
