@@ -40,6 +40,8 @@ import threading
 import time
 from typing import Optional
 
+from .measure import quantile_spread
+
 #: nvml.h clock event ("throttle") reason bits.
 EVENT_REASONS = {
     0x1: "gpu_idle",
@@ -74,19 +76,6 @@ SAMPLE_INTERVAL_S = 0.05
 
 def decode_event_reasons(mask: int) -> list[str]:
     return sorted(name for bit, name in EVENT_REASONS.items() if mask & bit)
-
-
-def quantile_spread(values, median: Optional[float] = None) -> Optional[float]:
-    """``(p90 - p10) / median``, the ramp-tolerant width of a sample set."""
-    if not values:
-        return None
-    med = statistics.median(values) if median is None else median
-    if not med:
-        return None
-    if len(values) < 10:  # too few points for deciles to mean anything
-        return (max(values) - min(values)) / med
-    deciles = statistics.quantiles(sorted(values), n=10)
-    return (deciles[8] - deciles[0]) / med
 
 
 # --------------------------------------------------------------------------

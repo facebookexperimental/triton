@@ -54,19 +54,29 @@ class Case:
 
 @dataclasses.dataclass(frozen=True)
 class Stat:
-    """A summarized latency distribution, in milliseconds.
+    """A summarized latency measurement, in milliseconds.
 
-    ``spread`` is the larger one-sided deviation from the median, relative --
-    ``max(max - p50, p50 - min) / p50`` -- matching how tritonbench reports
-    variance, so the two are read the same way. It is the input to the noise
-    gate, not a perf number.
+    ``spread`` is the **reproducibility of ``p50`` across independent
+    replicates**, not the width of any one replicate's distribution. Those are
+    very different quantities and the gate needs the first: with a few thousand
+    samples the median is far more stable than the distribution is wide.
+    Measured on B200, mm 8192^3 has a decile width of ~6% -- the power-governed
+    clock wanders -- while its p50 reproduces to 1.7%. Gating on the width
+    would reject a case whose reported number is in fact solid.
+
+    ``within_spread`` keeps that width as a diagnostic: it is what says whether
+    the *machine* was steady, and it correlates with the sampled clock trace.
     """
 
     p50: float
     min: float
     max: float
     mean: float
+    #: (max - median) / median over the replicate p50s. The noise gate.
     spread: float
+    #: (p90 - p10) / p50 of the pooled samples. Diagnostic only.
+    within_spread: float
+    replicates: int
     n_kept: int
     n_raw: int
 

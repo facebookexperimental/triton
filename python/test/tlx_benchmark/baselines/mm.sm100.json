@@ -1,0 +1,127 @@
+{
+  "arch": "sm100",
+  "cases": {
+    "mm/sm100/bfloat16/8192x8192x1024xTruexTrue": {
+      "ref_p50_ms": 0.12191999703645706,
+      "speedup": 0.9225181858782401,
+      "t_cold_s": null,
+      "tlx_p50_ms": 0.1321599930524826,
+      "tlx_tflops": 1039.943709874599
+    },
+    "mm/sm100/bfloat16/8192x8192x16384xTruexTrue": {
+      "ref_p50_ms": 2.011136054992676,
+      "speedup": 0.981018953832198,
+      "t_cold_s": null,
+      "tlx_p50_ms": 2.0500481128692627,
+      "tlx_tflops": 1072.669095787333
+    },
+    "mm/sm100/bfloat16/8192x8192x8192xTruexFalse": {
+      "ref_p50_ms": 1.0771839618682861,
+      "speedup": 1.0414900608591278,
+      "t_cold_s": null,
+      "tlx_p50_ms": 1.0342719554901123,
+      "tlx_tflops": 1063.0778703218075
+    },
+    "mm/sm100/bfloat16/8192x8192x8192xTruexTrue": {
+      "ref_p50_ms": 1.0720959901809692,
+      "speedup": 1.044813852234483,
+      "t_cold_s": null,
+      "tlx_p50_ms": 1.0261119604110718,
+      "tlx_tflops": 1071.5318310250702
+    },
+    "mm/sm100/float16/8192x8192x1024xTruexTrue": {
+      "ref_p50_ms": 0.130048006772995,
+      "speedup": 0.9403054962255791,
+      "t_cold_s": null,
+      "tlx_p50_ms": 0.1383039951324463,
+      "tlx_tflops": 993.745360286824
+    },
+    "mm/sm100/float16/8192x8192x16384xTruexTrue": {
+      "ref_p50_ms": 2.1432321071624756,
+      "speedup": 0.9834805211741637,
+      "t_cold_s": null,
+      "tlx_p50_ms": 2.179231882095337,
+      "tlx_tflops": 1009.08181163247
+    },
+    "mm/sm100/float16/8192x8192x8192xTruexFalse": {
+      "ref_p50_ms": 1.151968002319336,
+      "speedup": 1.0377342159482803,
+      "t_cold_s": null,
+      "tlx_p50_ms": 1.1100800037384033,
+      "tlx_tflops": 990.4796267595018
+    },
+    "mm/sm100/float16/8192x8192x8192xTruexTrue": {
+      "ref_p50_ms": 1.1459200382232666,
+      "speedup": 1.057715040166036,
+      "t_cold_s": null,
+      "tlx_p50_ms": 1.0833920240402222,
+      "tlx_tflops": 1014.8788281416953
+    }
+  },
+  "env": {
+    "cuda": "13.0",
+    "cuda_visible_devices": "6",
+    "foreign_processes": [],
+    "gpu": {
+      "available": true,
+      "driver": "580.82.07",
+      "event_reason_names": [
+        "gpu_idle"
+      ],
+      "event_reasons": 1,
+      "index": 6,
+      "max_power_limit_w": 850.0,
+      "max_sm_clock_mhz": 1965.0,
+      "name": "NVIDIA B200",
+      "persistence_mode": "Enabled",
+      "power_draw_w": 241.48,
+      "power_limit_w": 750.0,
+      "sm_clock_mhz": 1845.0,
+      "temperature_c": 39.0,
+      "uuid": "GPU-943ba66a-a081-9872-322f-e352decbce3e"
+    },
+    "host": "devgpu006.maz2.facebook.com",
+    "measure_compile": false,
+    "numa_bound": true,
+    "numa_node": 1,
+    "nvml": true,
+    "run": {
+      "clock_trace": {
+        "degrading": [],
+        "max_mhz": 1845,
+        "median_mhz": 1845,
+        "min_mhz": 495,
+        "reasons": [
+          "sw_power_cap"
+        ],
+        "samples": 13611,
+        "spread": 0.5365853658536586,
+        "stable": false
+      },
+      "elapsed_s": 687.8435584579129,
+      "problems": []
+    },
+    "space": "heuristic",
+    "torch": "2.12.0+cu130",
+    "triton": "3.8.0+fb"
+  },
+  "not_baselined": [
+    "mm/sm100/float16/256x256x256xTruexTrue",
+    "mm/sm100/bfloat16/256x256x256xTruexTrue",
+    "mm/sm100/float16/1024x1024x1024xTruexTrue",
+    "mm/sm100/bfloat16/1024x1024x1024xTruexTrue",
+    "mm/sm100/float16/2048x512x1024xTruexTrue",
+    "mm/sm100/bfloat16/2048x512x1024xTruexTrue",
+    "mm/sm100/float16/512x4096x1024xTruexFalse",
+    "mm/sm100/bfloat16/512x4096x1024xTruexFalse",
+    "mm/sm100/float16/1024x2048x512xFalsexTrue",
+    "mm/sm100/bfloat16/1024x2048x512xFalsexTrue",
+    "mm/sm100/float16/2048x2048x2048xFalsexFalse",
+    "mm/sm100/bfloat16/2048x2048x2048xFalsexFalse",
+    "mm/sm100/float16/136x256x128xTruexTrue",
+    "mm/sm100/bfloat16/136x256x128xTruexTrue",
+    "mm/sm100/float16/256x256x16384xTruexTrue",
+    "mm/sm100/bfloat16/256x256x16384xTruexTrue"
+  ],
+  "op": "mm"
+}

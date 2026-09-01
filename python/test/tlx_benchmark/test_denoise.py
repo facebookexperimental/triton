@@ -8,7 +8,7 @@ against invented numbers.
 
 import pytest
 
-from _harness import CLOCK_SPREAD_LIMIT, ClockTrace, GpuState, decode_event_reasons, parse_cpulist, quantile_spread
+from _harness import CLOCK_SPREAD_LIMIT, ClockTrace, GpuState, decode_event_reasons, parse_cpulist, quantile_spread  # noqa: E501
 from _harness.denoise import DEGRADING_REASONS
 
 

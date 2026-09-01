@@ -9,18 +9,44 @@ drift is visible.
 
 ## Running
 
-Always under `denoise.sh`, which locks clocks and power and binds to the
-GPU-local NUMA node. Numbers taken without it are not comparable to anything.
+Always under `denoise.sh`, which fixes the power cap and binds to the GPU-local
+NUMA node. Numbers taken without it are not comparable to anything.
+
+The deterministic command — what CI and any review agent should use:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 third_party/tlx/denoise.sh \
-    python -m pytest python/test/tlx_benchmark/bench_mm.py
+    python python/test/tlx_benchmark/bench_mm.py \
+        --measure latency --space full --guard enforce --json /tmp/mm.json
+```
+
+| flag | choices | meaning |
+|---|---|---|
+| `--measure` | `latency` `compile` `all` | `latency` is minutes; `compile` is ~4 min **per case** at `--space full` |
+| `--space` | `full` `heuristic` `smoke` | `full` is what `tlx.ops.mm` uses by default |
+| `--dtype` | `fp16` `bf16` `both` | |
+| `--guard` | `off` `report` `enforce` | `enforce` exits non-zero on a regression or compile-cap breach |
+| `--json` | path | the machine-readable artifact |
+| `--update-baseline` | | record this run; refuses noisy and host-bound cases |
+| `--strict-env` | | fail rather than warn when the environment is not denoised |
+
+`pytest` is the secondary front end, for the junitxml the b200 reporting
+pipeline already consumes. It takes exactly the same options, and
+`test_ops_perf.py` discovers every `bench_*.py`, so there is still one benchmark
+file per op:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 third_party/tlx/denoise.sh \
+    python -m pytest python/test/tlx_benchmark/test_ops_perf.py --guard enforce
 ```
 
 The harness's own unit tests need no GPU:
 
 ```bash
-python -m pytest python/test/tlx_benchmark/test_harness.py
+python -m pytest python/test/tlx_benchmark/test_harness.py \
+    python/test/tlx_benchmark/test_denoise.py \
+    python/test/tlx_benchmark/test_compile.py \
+    python/test/tlx_benchmark/test_baseline.py
 ```
 
 ## Status
@@ -28,12 +54,12 @@ python -m pytest python/test/tlx_benchmark/test_harness.py
 | Phase | Content | State |
 |---|---|---|
 | 0 | contract + shared shape list | done |
-| 1 | `measure.py` — latency, outlier rejection, host-overhead detection | done |
-| 2 | `denoise.py` — environment verification, operating-point trace, env capture | done |
-| 3 | `compile.py` — `t_cold`, absolute 120 s cap | todo |
-| 4 | `bench_mm.py` | todo |
-| 5 | `baseline.py` / `report.py` — the guard | todo |
-| 6 | CI wiring, opt-in per PR | todo |
+| 1 | `measure.py` — latency, replicates, outlier rejection, host-overhead | done |
+| 2 | `denoise.py` — environment verification, operating-point trace | done |
+| 3 | `compile.py` — `t_cold`, absolute 120 s cap | done |
+| 4 | `bench_mm.py` — flagship op file and the CLI above | done |
+| 5 | `baseline.py` / `report.py` — the guard | done |
+| 6 | agent-facing entry point over the deterministic command | todo |
 
 ## Design decisions and the measurements behind them
 
@@ -84,8 +110,13 @@ synchronization:
 At 2048³ the whole measured latency is *less* than the host cost of issuing the
 call: the GPU idles waiting for the launch, and what we would be gating is
 `TensorDescriptor` construction and caching-allocator behaviour. Such cases get
-`Status.HOST_BOUND` — reported with their numbers, never gated. See
-`HOST_BOUND_RATIO` in `_harness/measure.py`.
+`Status.HOST_BOUND` — reported with their numbers, never gated.
+
+`HOST_BOUND_RATIO` is 1.5, not something larger, and the reasoning matters: the
+host issues iteration N+1 while the GPU runs iteration N, so host cost does not
+*add* to latency — it only starves the GPU once it exceeds kernel time. A first
+attempt at 5.0 flagged `8192×8192×1024` (138 µs measured, 42 µs host, and torch
+needs 128 µs for the same work) as unmeasurable, which is plainly wrong.
 
 Two consequences worth carrying forward:
 
@@ -150,6 +181,52 @@ dropped to 742 MHz), and device identity has to be resolved by UUID, since
 torch indices are remapped by `CUDA_VISIBLE_DEVICES` while NVML and
 `nvidia-smi` index physical devices.
 
+### The gate is p50 reproducibility, not distribution width
+
+These are very different quantities, and an earlier version conflated them.
+Measured on a denoised B200 at the default window, `--space heuristic`, three
+replicates:
+
+| mm shape (fp16) | p50 reproducibility | decile width |
+|---|---|---|
+| 8192×8192×8192 | 0.2% | 5.6% |
+| 8192×8192×1024 | 0.0% | 1.7% |
+| 8192×8192×16384 | 0.1% | 2.4% |
+| 8192×8192×8192, B col-major | 0.0% | 4.7% |
+
+With a few thousand samples the median is far more stable than the distribution
+is wide — the 5.6% width is the power-governed clock wandering, and it
+correlates with the sampled clock trace. Gating on width rejected cases whose
+reported number was solid. `Stat.spread` is therefore the replicate-to-replicate
+figure and drives `NOISE_FLOOR = 2%`; `Stat.within_spread` keeps the width as a
+diagnostic for whether the *machine* was steady.
+
+The cost is three replicates per provider per case, which is the only way to
+observe reproducibility at all.
+
+### Compile time: `space="full"` is over the cap by 2×
+
+`tlx.ops.mm(a, b)` defaults to `space="full"`. On a cold Triton cache:
+
+| shape | `t_cold` | compilations | configs benchmarked |
+|---|---|---|---|
+| 1024³ | 284.6 s | 350 | 348 |
+| 8192³ | 221.3 s | 252 | 300 |
+
+Against a 120 s cap, so a first call is 2× over. The cap is absolute rather
+than relative to a baseline because cuBLAS has no compile step to be worse
+than, and because a relative gate ratchets — three 15% regressions pass
+individually and double the wait.
+
+`n_compiles` and `n_configs` come from `triton.knobs.compilation.listener` and
+`triton.knobs.autotuning.listener`, so they are op-agnostic and require no
+access to a kernel module's autotuner. They are what make a breach actionable:
+a slow first call is almost always "pruning left too many configs", not "the
+compiler got slower".
+
+This is also why `--measure` splits `latency` from `compile`. At ~4 minutes per
+case the two together would be a two-hour run.
+
 ### TODO — `tlx.ops.mm` allocates a workspace on every launch
 
 `sm100.py::matmul_tma_set_block_size_hook` is the autotuner config `pre_hook`,
@@ -162,3 +239,60 @@ which is what identifies the mechanism.
 This is an op inefficiency, not a harness problem — the workspace could be
 cached per `(shape, config)` like the L2 flush buffer already is. Not filed;
 out of scope for this suite, recorded here because the harness is what found it.
+
+### TODO — `NUM_CTAS=2` is wrong whenever the grid has more than one N-tile
+
+Found by merging the perf shapes into the shared list: `1000000×512×512`
+failed L1 correctness immediately, and *not* for the known split-K reason —
+this one has `SPLIT_K=1`. 49.9% of output elements are wrong, which is almost
+exactly one CTA of each pair. Full measurement table and the control row are in
+`ops/kernels/mm/_shapes.py`; the shape is commented out there with a TODO.
+
+Two things make this worse than an ordinary correctness bug. The heuristic
+picks `NUM_CTAS=2` for ordinary large-M shapes, so it is reachable in
+production. And autotuning cannot rescue it, because the autotuner ranks
+configs by speed without ever checking their results — a wrong-answer config
+can win.
+
+It is also the argument for the shared shape list. This shape existed only in
+tritonbench's perf set; putting perf and correctness on one list is what ran it
+through `assert_close`.
+
+### TODO — `space="full"` leaks GPU memory during autotuning
+
+The first attempt at a full-space baseline OOMed after 7 shapes with **178 GiB
+allocated** (not merely cached — `empty_cache()` between cases does not help,
+the memory is live). Same `pre_hook` as above: it allocates
+`torch.empty((SPLIT_K * M, N))` per config, and at `SPLIT_K=24, 8192×8192` that
+is 3.2 GB for a *single* config out of ~348.
+
+Consequence beyond this suite: `tlx.ops.mm` cannot be called with its default
+`space="full"` across several large shapes in one process.
+
+The same run confirmed the host-overhead diagnosis outright. At full space the
+tuned configs choose `SPLIT_K=1`, no workspace is allocated per launch, and
+host cost per call falls from ~56 µs to ~28 µs — exactly the predicted effect.
+Tuned small shapes are also ~4× faster than the heuristic config picks
+(1024³: 40.6 µs → 10.4 µs), so the heuristic is leaving a lot on the table.
+
+### The committed baseline is `space="heuristic"`, and that is a stopgap
+
+`baselines/mm.sm100.json` records 8 cases — the four compute-bound shapes in
+fp16 and bf16 — at 0.92–1.06× cuBLAS and ~1000–1073 TFLOP/s. The 16 host-bound
+cases are refused rather than recorded.
+
+It is a heuristic-space baseline because a full-space one is blocked by the
+leak above, and `space="full"` is what users actually get. `load()` therefore
+refuses to compare a baseline recorded at one space against a run at another:
+mm 1024³ is 40.6 µs at heuristic and 10.4 µs at full, so a cross-space
+comparison would report a 4× "regression" that is only a different search
+space. Re-record at full space once the leak is fixed.
+
+### Known limitation — the clock trace spans the whole run
+
+`stable()` wraps the entire run rather than each case, so its trace includes
+the idle gaps between cases (allocation, compilation, host-overhead sampling).
+Over an 11-minute baseline run that reads as `spread 0.54, stable: false` even
+on a clean machine, which is not wrong but is not useful either. The per-case
+signal that does gate is the latency reproducibility. Making the trace per-case
+is straightforward and not yet done.
