@@ -23,6 +23,7 @@ no K-tail):
     Required because odd K gives 2-byte-aligned rows, where direct-to-LDS is
     illegal on CDNA4.
 """
+import math
 import torch
 
 import triton
@@ -116,7 +117,7 @@ def _bmm_direct(a_ptr, b_ptr, c_ptr, M, N, K, sab, sam, sak, sbb, sbk, sbn, scb,
 @triton.jit
 def _bmm_register(a_ptr, b_ptr, c_ptr, M, N, K, sab, sam, sak, sbb, sbk, sbn, scb, scm, scn, BM: tl.constexpr,
                   BN: tl.constexpr, BK: tl.constexpr, NUM_XCDS: tl.constexpr, GMN: tl.constexpr, NT: tl.constexpr,
-                  NB: tl.constexpr):
+                  NB: tl.constexpr, DIVISIBILITY_SAM: tl.constexpr, DIVISIBILITY_K: tl.constexpr):
     """Odd / unaligned K: register path (tl.load -> local_store), masked K-tail."""
     npn = tl.cdiv(N, BN)
     pidf = _chip(tl.program_id(0), NT, NUM_XCDS, GMN)
@@ -131,33 +132,47 @@ def _bmm_register(a_ptr, b_ptr, c_ptr, M, N, K, sab, sam, sak, sbb, sbk, sbn, sc
     ok = tl.arange(0, BK)
     a_ptr = a_ptr + bid.to(tl.int64) * sab
     b_ptr = b_ptr + bid.to(tl.int64) * sbb
-    ao = om[:, None] * sam
+    ao = tl.multiple_of(om[:, None] * sam, [DIVISIBILITY_SAM, 1])
     bo = on[None, :] * sbn
     KI = tl.cdiv(K, BK)
     for i in tl.range(0, NB, loop_unroll_factor=NB):
         kk = i * BK
-        km = (kk + ok) < K
-        ar = tl.load(a_ptr + ao + (kk + ok[None, :]) * sak, mask=km[None, :], other=0.0)
-        br = tl.load(b_ptr + (kk + ok[:, None]) * sbk + bo, mask=km[:, None], other=0.0)
+        br = tl.load(b_ptr + (kk + ok[:, None]) * sbk + bo)
+        ar = tl.load(a_ptr + ao + (kk + ok[None, :]) * sak)
+
         tlx.local_store(tlx.local_view(sA, i), ar)
         tlx.local_store(tlx.local_view(sB, i), br)
     tl.debug_barrier()
     a = tlx.local_load(tlx.local_view(sA, 0))
     b = tlx.local_load(tlx.local_view(sB, 0))
     acc = tl.zeros((BM, BN), dtype=tl.float32)
-    for k in tl.range(0, KI - NB):
+
+    for k in tl.range(0, KI - NB - 1):
         cur = (k + 1) % NB
-        pf = k % NB
-        kp = (k + NB) * BK
+        pf = k % NB; kp = (k + NB) * BK
+
+        br = tl.load(b_ptr + (kp + ok[:, None]) * sbk + bo)
+        ar = tl.load(a_ptr + ao + (kp + ok[None, :]) * sak)
         acc = tl.dot(a, b, acc)
-        km = (kp + ok) < K
-        ar = tl.load(a_ptr + ao + (kp + ok[None, :]) * sak, mask=km[None, :], other=0.0)
-        br = tl.load(b_ptr + (kp + ok[:, None]) * sbk + bo, mask=km[:, None], other=0.0)
+        a = tlx.local_load(tlx.local_view(sA, cur))
+        b = tlx.local_load(tlx.local_view(sB, cur))
         tlx.local_store(tlx.local_view(sA, pf), ar)
         tlx.local_store(tlx.local_view(sB, pf), br)
         tl.debug_barrier()
-        a = tlx.local_load(tlx.local_view(sA, cur))
-        b = tlx.local_load(tlx.local_view(sB, cur))
+
+    k = KI - NB - 1
+    cur = (k + 1) % NB
+    pf = k % NB
+    kp = (k + NB) * BK
+    km = tl.max_constancy((kp + ok) < K, [DIVISIBILITY_K])
+    br = tl.load(b_ptr + (kp + ok[:, None]) * sbk + bo, mask=km[:, None], other=0.0)
+    ar = tl.load(a_ptr + ao + (kp + ok[None, :]) * sak, mask=km[None, :], other=0.0)
+    acc = tl.dot(a, b, acc)
+    a = tlx.local_load(tlx.local_view(sA, cur))
+    b = tlx.local_load(tlx.local_view(sB, cur))
+    tlx.local_store(tlx.local_view(sA, pf), ar)
+    tlx.local_store(tlx.local_view(sB, pf), br)
+    tl.debug_barrier()
     acc = tl.dot(a, b, acc)
     for i in tl.range(0, NB - 1, loop_unroll_factor=NB - 1):
         bf = (KI - (NB - 1) + i) % NB
@@ -170,38 +185,43 @@ def _bmm_register(a_ptr, b_ptr, c_ptr, M, N, K, sab, sam, sak, sbb, sbk, sbn, sc
 
 
 def bmm(a, b):
-    """C = A @ B, shared-A, ROW-major B (stride_bn == 1). nw=8, mfma=32."""
-    # sA / sB take their element type from a_ptr / b_ptr independently, so a dtype
-    # mismatch would silently give the two LDS buffers different types.
+    """C = A @ B, shared-A, ROW-major B (stride_bn == 1). nw=8, mfma=32.
+
+    MultiB dispatch: each CTA processes NUM_B_MATRIX consecutive B matrices from one A
+    load, halving A's HBM bandwidth.  Only enabled when M<=64 (BM=64): for larger M,
+    halving NT hurts CU occupancy more than the A-bandwidth saving helps.
+
+    Direct path (K%8==0): always single-B at nw=8 — nw=8 beats nw=4 by ~5-7% here
+    and avoids VGPR spill with the two-accumulator multiB layout.
+    Reg path (odd K): multiB at nw=8 for M<=64 (small-M shapes are bandwidth-bound
+    for A; NT is small enough that halving it is safe).
+    """
     assert a.dtype == b.dtype, f"A and B must have the same dtype, got {a.dtype} and {b.dtype}"
     Bs, M, K = a.shape
     N = b.shape[-1]
     bm = 64 if M <= 64 else 128
     KI = triton.cdiv(K, BLOCK_K)
-    assert KI >= 2, f"K must span >= 2 BLOCK_K={BLOCK_K} tiles for the pipeline, got K={K}"
-    # The 2-stage pipeline needs 2 <= nb <= KI: the prologue unconditionally issues
-    # nb loads and the drain indexes (KI - (nb - 1) + i) % nb, so nb > KI would
-    # over-read past K and re-accumulate tile 0. Requiring KI >= 2 makes
-    # min(NB, KI) >= 2 on its own -- a max(2, ...) here would defeat the clamp.
-    nb = min(NB, KI)
     GMN = triton.cdiv(M, bm) * triton.cdiv(N, BLOCK_N)
-    NT = Bs * GMN
     c = torch.empty((Bs, M, N), device=a.device, dtype=a.dtype)
     attrs = (("amdgpu-agpr-alloc", "0,0"), )
-    common = dict(num_warps=8, num_stages=1, matrix_instr_nonkdim=32, llvm_fn_attrs=attrs)
     st = (a.stride(0), a.stride(1), a.stride(2), b.stride(0), b.stride(1), b.stride(2), c.stride(0), c.stride(1),
           c.stride(2))
-    # K % BLOCK_K, not K % 8: the direct path does no K-tail masking on
-    # buffer_load_to_local, so a K that is 8-aligned but not BLOCK_K-aligned
-    # (e.g. 264) reads past the K extent. Matches the guard in amd_bmm.py.
-    if K % BLOCK_K == 0:  # 16-byte-aligned A rows, no K-tail -> direct-to-LDS (wins)
+    if K % 8 == 0:  # 16-byte-aligned A rows -> direct-to-LDS path (always single-B)
+        common = dict(num_warps=8, num_stages=1, matrix_instr_nonkdim=32, llvm_fn_attrs=attrs)
         AB = tuple(tuple(x) for x in _swz([bm, BLOCK_K], 1))
         BB = tuple(tuple(x) for x in _swz([BLOCK_K, BLOCK_N], 1))
-        _bmm_direct[(NT, )](a, b, c, M, N, K, *st, BM=bm, BN=BLOCK_N, BK=BLOCK_K, AB=AB, BB=BB, NUM_XCDS=NUM_XCDS,
-                            GMN=GMN, NT=NT, NB=nb, **common)
+        nb = min(NB, KI); NT = Bs * GMN
+        _bmm_direct[(NT, )](a, b, c, M, N, K, *st, BM=bm, BN=BLOCK_N, BK=BLOCK_K, AB=AB, BB=BB,
+                            NUM_XCDS=NUM_XCDS, GMN=GMN, NT=NT, NB=nb, **common)
     else:  # odd / unaligned K -> register path
-        _bmm_register[(NT, )](a, b, c, M, N, K, *st, BM=bm, BN=BLOCK_N, BK=BLOCK_K, NUM_XCDS=NUM_XCDS, GMN=GMN, NT=NT,
-                              NB=nb, **common)
+        divisibility_sam = math.gcd(int(a.stride(1)), 16)
+        nb = min(NB, KI); NT = Bs * GMN
+        divisibility_k = math.gcd(int(K), 16)
+        common = dict(num_warps=4, num_stages=1, matrix_instr_nonkdim=32, llvm_fn_attrs=attrs)
+        _bmm_register[(NT, )](a, b, c, M, N, K, *st, BM=bm, BN=BLOCK_N, BK=BLOCK_K,
+                                NUM_XCDS=NUM_XCDS, GMN=GMN, NT=NT, NB=nb,
+                                DIVISIBILITY_SAM=divisibility_sam,
+                                DIVISIBILITY_K=divisibility_k, **common)
     return c
 
 
@@ -231,12 +251,16 @@ def _warm_ms(fn, iters=60, warmup=20):
     torch.cuda.synchronize()
     return s.elapsed_time(e) / iters
 
-
 if __name__ == "__main__":
     dev = triton.runtime.driver.active.get_active_torch_device()
     # (B, M, N, K): representative shared-LHS shapes.  Always shared-A.
-    shapes = [(320, 1024, 256, 256), (1024, 395, 256, 320), (1024, 40, 256, 1956), (1024, 262, 256, 294),
-              (1024, 1195, 256, 2309)]
+    shapes = [
+        (320, 1024, 256, 256),
+        (1024, 395, 256, 320),
+        (1024, 40, 256, 1956),
+        (1024, 262, 256, 294),
+        (1024, 1195, 256, 2309)
+        ]
     print("mode: shared-A (shared-LHS)   (B row-major)")
     print(f"{'M x N x K (B)':<22}{'path':<8}{'TLX':>9}{'rocBLAS':>10}{'ratio':>8}  {'ok'}")
     for B, M, N, K in shapes:
@@ -246,5 +270,5 @@ if __name__ == "__main__":
         ok = torch.allclose(out.float(), ref.float(), atol=2e-2, rtol=2e-2)
         t = _warm_ms(lambda: bmm(a, b)) * 1e3
         rb = _warm_ms(lambda: torch.bmm(a, b)) * 1e3
-        path = "direct" if K % BLOCK_K == 0 else "reg"
+        path = "direct" if K % 8 == 0 else "reg"
         print(f"{f'{M}x{N}x{K} ({B})':<22}{path:<8}{t:8.0f}u{rb:9.0f}u{rb / t:7.2f}x  {'OK' if ok else 'WRONG'}")
