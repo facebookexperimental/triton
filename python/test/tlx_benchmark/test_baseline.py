@@ -121,13 +121,13 @@ def test_table_reports_compile_time_replicates_and_throughput_error():
     rendered = report_mod.table([r])
 
     header, _, row = rendered.splitlines()[:3]
-    for column in ("input", "ref us", "tlx us", "speedup", "compile", "reps", "CV%", "p50 us", "p90 us", "p99 us"):
+    for column in ("input", "ref TF/s", "tlx TF/s", "speedup", "compile", "reps", "CV%", "p50 TF/s", "p90 TF/s",
+                   "p99 TF/s"):
         assert column in header
-    assert "shape" not in header and "TF/s" not in header
+    assert "shape" not in header and " us" not in header
 
     assert "0.69s" in row  # sub-10s compile keeps two decimals
     assert "3x120" in row  # 3 replicates of 120 timed iterations each
-    assert " 1004 " in row  # throughput, from the mean latency
 
 
 def test_table_marks_compile_as_absent_when_not_measured():
@@ -157,7 +157,7 @@ def test_one_table_carries_the_tail_too():
     """A single row, not a summary table plus a percentile table."""
     r = judge(BIG, TLX, REF, tlx_host_us=HOST_US)
     rendered = report_mod.render([r], env={})
-    assert "Percentiles" not in rendered
+    assert "Percentiles (microseconds):" not in rendered  # no second table
     assert len([ln for ln in rendered.splitlines() if ln.startswith("-" * 20)]) == 1
 
 
@@ -175,6 +175,25 @@ def test_speedup_direction_is_stated_and_correct():
     assert slower.speedup == pytest.approx(0.5)
 
     rendered = report_mod.render([faster], env={})
-    assert "ref us" in rendered and "tlx us" in rendered
-    assert "speedup = ref us / tlx us" in rendered
-    assert "MICROSECONDS" in rendered
+    assert "ref TF/s" in rendered and "tlx TF/s" in rendered
+    assert "speedup = tlx TF/s / ref TF/s" in rendered
+    assert "HIGHER is better" in rendered
+
+
+def test_throughput_columns_descend_across_percentiles():
+    """pNN is a latency percentile converted to throughput, so a higher
+    percentile is a SLOWER iteration and therefore a LOWER number. Worth
+    pinning: read the other way round the tail looks like it improves.
+    """
+    r = judge(BIG, TLX, REF, tlx_host_us=HOST_US)
+    r.flop_count = 2 * 8192**3
+    row = report_mod.table([r]).splitlines()[2].split()
+    p50, p90, p99 = (float(x) for x in row[-4:-1])
+    assert p50 >= p90 >= p99
+
+
+def test_throughput_columns_are_blank_without_a_flop_count():
+    """An op that supplies no FLOP formula still renders rather than crashing."""
+    r = judge(BIG, TLX, REF, tlx_host_us=HOST_US)
+    assert r.flop_count is None
+    assert "-" in report_mod.table([r]).splitlines()[2]

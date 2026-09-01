@@ -184,13 +184,18 @@ torch indices are remapped by `CUDA_VISIBLE_DEVICES` while NVML and
 
 ### Headline is mean + CV; the gate is between-run reproducibility of the mean
 
-A run reports `mean` and `CV%` (`sd/mean` over the within-run samples, after IQR
-rejection) because that is the conventional way to summarize a latency
-distribution and it compares across kernels of wildly different absolute speed.
-The same row carries p50/p90/p99, because a mean and a CV together still cannot
-show a tail: two kernels can match on both and differ entirely at p99.
-Percentiles are nearest-rank, so every printed value is a latency the kernel
-actually produced rather than an interpolation between two it did not.
+Every metric column is TFLOP/s, higher better: `ref`/`tlx` at the mean latency,
+and p50/p90/p99 at those latency percentiles. Because the percentiles are taken
+on latency and then converted, the three descend — p99 is the *worst-case*
+throughput. Percentiles are nearest-rank, so each is derived from a latency the
+kernel actually produced rather than an interpolation between two it did not.
+
+`CV%` is `sd/mean` over the within-run latency samples after IQR rejection.
+Normalizing against the mean is what lets a 52 µs kernel and a 1095 µs one be
+compared on stability at all; a bare standard deviation cannot.
+
+Mean and CV together still cannot show a tail — two kernels can match on both
+and diverge entirely at p99 — which is why the percentiles share the row.
 
 The **gate** reads neither. It reads `rel_max_deviation` -- the between-run
 deviation of the replicate means -- because that is the uncertainty on the

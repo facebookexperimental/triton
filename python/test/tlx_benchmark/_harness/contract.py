@@ -125,6 +125,10 @@ class Result:
     speedup: Optional[float] = None
     tlx_tflops: Optional[float] = None
     ref_tflops: Optional[float] = None
+    #: Useful FLOPs for this case, supplied by the op module. Carried rather
+    #: than only the derived throughputs so the report can express any latency
+    #: -- including the percentiles -- in the same units as the headline.
+    flop_count: Optional[int] = None
     #: Host-side per-call cost, microseconds. Carried in the artifact because
     #: it is what distinguishes "the kernel got slower" from "the launch path
     #: got slower", and the two have nothing to do with each other.
@@ -146,6 +150,7 @@ class Result:
             "speedup": self.speedup,
             "tlx_tflops": self.tlx_tflops,
             "ref_tflops": self.ref_tflops,
+            "flop_count": self.flop_count,
             "tlx_host_us": self.tlx_host_us,
             "ref_host_us": self.ref_host_us,
             "t_cold_s": self.t_cold_s,

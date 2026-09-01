@@ -106,6 +106,7 @@ def run_case(case: Case, *, space: str, measure_compile: bool, baseline: dict, r
     result = baseline_mod.judge(case, tlx, ref, tlx_host_us=host_us, compile_stat=compile_stat,
                                 baseline=baseline.get(case.key))
     M, N, K = case.shape[0], case.shape[1], case.shape[2]
+    result.flop_count = flops(M, N, K)
     result.tlx_tflops = flops(M, N, K) / (tlx.mean * 1e-3) / 1e12
     if ref.mean:
         result.ref_tflops = flops(M, N, K) / (ref.mean * 1e-3) / 1e12

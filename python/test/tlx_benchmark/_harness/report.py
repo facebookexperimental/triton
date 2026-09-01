@@ -29,12 +29,11 @@ _MARK = {
 FAILING = (Status.REGRESSED, Status.SLOW_COMPILE, Status.ERROR)
 
 
-def _us(value) -> str:
-    return f"{value * 1e3:9.1f}"
-
-
-def _fmt_us(stat) -> str:
-    return _us(stat.mean) if stat else "        -"
+def _tf(result, latency_ms) -> str:
+    """Throughput at a given latency, in TFLOP/s."""
+    if not result.flop_count or not latency_ms:
+        return "        -"
+    return f"{result.flop_count / (latency_ms * 1e-3) / 1e12:9.0f}"
 
 
 def _fmt_reps(result) -> str:
@@ -65,20 +64,20 @@ def _fmt_compile(result) -> str:
 
 def table(results: Sequence[Result]) -> str:
     lines = [
-        f"{'input':<34} {'dtype':<8} {'ref us':>9} {'tlx us':>9} {'speedup':>8} {'TFLOP/s':>8} {'compile':>8} "
-        f"{'reps':>10} {'CV%':>6} {'p50 us':>9} {'p90 us':>9} {'p99 us':>9}  status",
-        "-" * 149,
+        f"{'input':<34} {'dtype':<8} {'ref TF/s':>9} {'tlx TF/s':>9} {'speedup':>8} {'compile':>8} "
+        f"{'reps':>10} {'CV%':>6} {'p50 TF/s':>9} {'p90 TF/s':>9} {'p99 TF/s':>9}  status",
+        "-" * 150,
     ]
     for r in results:
-        lines.append(f"{r.case.input:<34} {r.case.dtype:<8} {_fmt_us(r.ref)} {_fmt_us(r.tlx)} "
+        lines.append(f"{r.case.input:<34} {r.case.dtype:<8} "
+                     f"{_tf(r, r.ref.mean if r.ref else None)} {_tf(r, r.tlx.mean if r.tlx else None)} "
                      f"{(f'{r.speedup:.3f}x' if r.speedup else '-'):>8} "
-                     f"{(f'{r.tlx_tflops:.0f}' if r.tlx_tflops else '-'):>8} "
                      f"{_fmt_compile(r):>8} "
                      f"{_fmt_reps(r):>10} "
                      f"{_fmt_cv(r):>6} "
-                     f"{(_us(r.tlx.p50) if r.tlx else '        -')} "
-                     f"{(_us(r.tlx.p90) if r.tlx else '        -')} "
-                     f"{(_us(r.tlx.p99) if r.tlx else '        -')}  {_MARK[r.status]}")
+                     f"{_tf(r, r.tlx.p50 if r.tlx else None)} "
+                     f"{_tf(r, r.tlx.p90 if r.tlx else None)} "
+                     f"{_tf(r, r.tlx.p99 if r.tlx else None)}  {_MARK[r.status]}")
         for note in r.notes:
             lines.append(f"{'':<34} {'':<8} -> {note}")
     return "\n".join(lines)
@@ -105,14 +104,14 @@ def write_json(results: Sequence[Result], env: dict, path: str | pathlib.Path) -
 
 
 #: Explains the columns whose meaning is not obvious from the header.
-LEGEND = ("Every latency column is MICROSECONDS, lower is better. `ref us` and `tlx us` are the mean\n"
-          "        (median of the per-replicate means); p50/p90/p99 are of the pooled samples.\n"
-          "speedup = ref us / tlx us, so >1 means TLX is faster. Stated because the direction is only\n"
-          "        checkable if you know these are latencies and not throughput.\n"
-          "TFLOP/s = TLX throughput at the mean latency. The reference's is speedup x this, and is\n"
-          "        in the JSON artifact.\n"
+LEGEND = ("Every throughput column is TFLOP/s, HIGHER is better. `ref`/`tlx` are at the mean latency\n"
+          "        (median of the per-replicate means). Latencies are in the JSON artifact.\n"
+          "speedup = tlx TF/s / ref TF/s, so >1 means TLX is faster.\n"
+          "pNN TF/s = throughput at the pNN *latency*, so the columns descend: p99 is the worst-case\n"
+          "        throughput, not the best. Percentiles are nearest-rank over the pooled samples.\n"
           "reps = replicates x timed iterations each (>=1000 per replicate, enforced).\n"
-          "CV%  = coefficient of variation within a run, sd/mean, after IQR rejection.\n"
+          "CV%  = coefficient of variation of the latency samples within a run, sd/mean, after IQR\n"
+          "        rejection.\n"
           "The gate reads NEITHER CV nor the percentiles: it reads the between-run deviation of the\n"
           "replicate means, which is the uncertainty on the headline rather than the width of one run.\n"
           "That figure is in the JSON artifact, and in the note printed when it trips.")
