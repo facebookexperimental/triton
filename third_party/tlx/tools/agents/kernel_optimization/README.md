@@ -123,26 +123,26 @@ isolation in the CLI path; `StandaloneHarness` is available via the Python API.
 
 `harnesses/blackwell/targets/gemm/harness.py` runs any complete candidate source that exports
 `matmul(a, b)`. It compares against `torch.matmul`, benchmarks with
-`triton.testing.do_bench`, and reports latency and TFLOP/s. Its optional three-argument
-`profile(build_artifact, case, request)` honors structured profile requests: `proton_launch`
-collects one Triton launch-attribution-only Proton tree under the per-case artifacts
-directory, and `native_profiler` selects the target platform profiler. NVIDIA harnesses map
-it to NCU, which writes a one-launch replay runner plus command/query/stdout/stderr/report
-artifacts before returning normalized supported metrics. Missing tools, unsupported metrics,
-and profiler failures are returned as profile diagnostics so correctness and benchmark results
-remain usable. `proton_intra_kernel` is intentionally unsupported by the reference harness and
-requires a target-supplied instrumented replay; the harness never rewrites candidate source.
+`triton.testing.do_bench`, and reports latency and TFLOP/s. Its legacy two-argument
+`profile(build_artifact, case)` returns latency and throughput, and can optionally collect a
+basic Proton trace when `TRITON_PROTON` is set. It does not implement structured profile
+requests or NCU collection.
 
-### Profiling recipes
+### Target-supplied profiling
 
-- **Triton Proton launch attribution:** request `tools=["proton_launch"]` with an absolute
-  `artifacts_dir`. The reference GEMM harness warms up, synchronizes, starts Proton with
-  `hook="triton"` and tree data, runs one matmul, flushes/deactivates, saves raw tree JSON and
-  any `.hatchet` artifact, then parses `launch_attribution_only` totals.
-- **Native profiler:** request `tools=["native_profiler"]`. Each target harness maps this
-  portable name to its platform profiler. NVIDIA harnesses map it to NCU, select supported
-  summary or deep metrics, save command/query/CSV/stderr artifacts, and return unsupported
-  metrics as `null` plus diagnostics. Explicit `ncu` remains a compatible NVIDIA-only request.
+A target harness may implement `profile(build_artifact, case, request)` to honor structured
+profile requests. Missing tools, unsupported metrics, and profiler failures should be returned
+as diagnostics so correctness and benchmark results remain usable.
+
+- **Triton Proton launch attribution:** handle `tools=["proton_launch"]` with an absolute
+  `artifacts_dir`. A supporting harness should warm up, synchronize, collect one
+  launch-attribution-only Proton tree, save raw artifacts, and return normalized totals.
+- **Native profiler:** handle `tools=["native_profiler"]` by mapping this portable name to the
+  target platform profiler. NVIDIA requests are resolved to NCU, and a supporting harness may
+  collect summary or deep metrics and save command/query/CSV/stderr artifacts. Explicit `ncu`
+  remains a compatible NVIDIA-only request.
+- **Diagnostic instrumentation:** `proton_intra_kernel` requires a target-supplied instrumented
+  replay. Instrumented source and timing must never be benchmarked, promoted, or committed.
 
 Target-specific `harness.py`/`cases.json`/`target.json` live colocated under `harnesses/<arch>/targets/<kernel>/` (B200,
 `sm_100` for blackwell and H100, `sm_90` for hopper); pick `--arch` to match the
