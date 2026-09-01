@@ -10,7 +10,7 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
-from typing import Mapping, Protocol, runtime_checkable
+from typing import Any, Mapping, Protocol, runtime_checkable
 
 from .models import (
     CaseEvaluation,
@@ -21,6 +21,14 @@ from .models import (
     TimingSamples,
     VerificationResult,
     to_json_value,
+)
+from .profiling import (
+    ProfileRequest,
+    compact_profile_output,
+    invoke_profile,
+    per_case_profile_request,
+    profile_request_to_json,
+    resolve_profile_request_for_target,
 )
 
 
@@ -55,7 +63,10 @@ class KernelHarness(Protocol):
     ) -> list[float] | Mapping[str, JsonValue]: ...
 
     def profile(
-        self, build_artifact: object, case: Mapping[str, JsonValue]
+        self,
+        build_artifact: object,
+        case: Mapping[str, JsonValue],
+        request: Mapping[str, JsonValue] | None = None,
     ) -> Mapping[str, JsonValue]: ...
 
 
@@ -75,14 +86,17 @@ class SubprocessHarness:
         cases: tuple[InputCase, ...],
         target: KernelTarget,
         benchmark_repetitions: int,
-        profile: bool = False,
+        profile: bool | ProfileRequest | Mapping[str, Any] = False,
     ) -> PerformanceSummary:
         request = {
             "kernel_source": kernel_source,
             "cases": to_json_value(cases),
             "target": to_json_value(target),
             "benchmark_repetitions": benchmark_repetitions,
-            "profile": profile,
+            "profile": resolve_profile_request_for_target(
+                profile_request_to_json(profile),
+                to_json_value(target),  # type: ignore[arg-type]
+            ),
         }
         worker_path = Path(__file__).with_name("worker.py")
         environment = os.environ.copy()
@@ -169,7 +183,7 @@ class StandaloneHarness:
         cases: tuple[InputCase, ...],
         target: KernelTarget,
         benchmark_repetitions: int,
-        profile: bool = False,
+        profile: bool | ProfileRequest | Mapping[str, Any] = False,
     ) -> PerformanceSummary:
         harness = _load_harness(self.harness_path)
         if not hasattr(harness, "build") or not hasattr(harness, "verify") or not hasattr(harness, "benchmark"):
@@ -180,6 +194,10 @@ class StandaloneHarness:
         # Reuse worker normalization helpers for consistency.
         from .worker import _normalize_build, _normalize_timing, _normalize_verification
 
+        profile_payload_root = resolve_profile_request_for_target(
+            profile_request_to_json(profile),
+            target_dict,
+        )
         build_result = harness.build(kernel_source, dict(target_dict))  # type: ignore[arg-type]
         success, artifact, diagnostics = _normalize_build(build_result)
         if not success:
@@ -205,21 +223,15 @@ class StandaloneHarness:
                     warmup_count=int(timing_norm.get("warmup_count", 0)),
                     cache_policy=str(timing_norm.get("cache_policy", "unspecified")),
                 )
-                if profile and hasattr(harness, "profile"):
+                if profile_payload_root and hasattr(harness, "profile"):
                     try:
-                        raw_profile = harness.profile(artifact, dict(case_dict))  # type: ignore[arg-type]
-                        if not isinstance(raw_profile, Mapping):
-                            raise TypeError("profile() must return a mapping")
-                        # Cap inline size to keep PerformanceSummary bounded.
-                        serialized = json.dumps(dict(raw_profile))
-                        if len(serialized) > 1_000_000:
-                            profile_payload = {
-                                "error": "profile payload exceeded inline limit (1MB)",
-                                "size_bytes": len(serialized),
-                                "truncated_keys": list(raw_profile.keys()),
-                            }
-                        else:
-                            profile_payload = dict(raw_profile)
+                        profile_request = per_case_profile_request(
+                            profile_payload_root, case.case_id
+                        )
+                        raw_profile = invoke_profile(
+                            harness.profile, artifact, dict(case_dict), profile_request
+                        )
+                        profile_payload = compact_profile_output(raw_profile, profile_request)
                     except Exception as error:  # noqa: BLE001
                         profile_payload = {"error": f"{type(error).__name__}: {error}"}
             evaluations.append(

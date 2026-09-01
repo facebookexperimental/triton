@@ -1,51 +1,48 @@
 from __future__ import annotations
 
+import json
 import subprocess
+import tempfile
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Protocol
 
 from .models import KernelOptimizationRequest, PerformanceSummary
-from .source import extract_python_source
+from .profiling import compact_profile_summary
+from .source import validate_replacement_source
 
-TLX_PROMPT_PREAMBLE = """You are optimizing a Triton/TLX GPU kernel.
+TLX_PROMPT_PREAMBLE = """You are optimizing one Triton or TLX kernel against an external deterministic harness.
+The candidate is a complete replacement source file. Preserve every public entry point,
+algorithmic contract, supported workload, and synchronization invariant required by the
+harness and target guidance.
 
-Grouped MXFP8 target: C_g = A_g @ B_g.T for g in [0, G), A_g is E4M3 [M_g, K]
-and B_g is E4M3 [N, K], one E8M0 scale per 32 K values. Scales are swizzled
-to 5-D [1, rows//128, K//128, 2, 256] for tlx.async_dot_scaled.
+Evidence-driven optimization workflow:
+1. Keep measurement scopes separate. The public benchmark, individual kernel profiles,
+   Proton launch attribution, and diagnostic intra-kernel traces may cover different work.
+   Do not subtract unrelated measurements or infer task overlap from a launch timeline.
+2. Treat lower end-to-end benchmark latency with passing correctness as the promotion goal.
+   Use target profiler duration, utilization, traffic, occupancy, registers, and stalls as
+   explanatory evidence rather than standalone optimization targets.
+3. Choose exactly one testable hypothesis and one coherent change. Map measured evidence to
+   the narrowest relevant subsystem, and use failed hypotheses as exclusions in later rounds.
+4. For warp-specialized or asynchronous kernels, change barriers, buffer counts, aliases,
+   task scheduling, or visibility only with an explicit producer/consumer and lifetime proof.
+5. Treat changes inside the noise floor as inconclusive. Do not repeat a configuration when
+   benchmark and profile evidence show that it did not affect the targeted bottleneck.
 
-References you should follow (prefer grouped_gemm.py:752 for scheduling,
-blackwell_gemm_ws_mxfp8.py / fburl.com/code/wdyi24fn for MX):
-- Grouped scheduling (genai/msl/ops/kernels/tlx/gemm/grouped_gemm.py:752
-  _tlx_grouped_gemm_blackwell): 3 async_tasks (producer TMA / MMA async_dot
-  / epilogue TMEM), split_sizes per-group M (_get_group_sizes), flat vs
-  persistent dispatch via counter_ptr atomicAdd + tile_id_smem DSMEM +
-  remote_shmem_store + fence.proxy.async.shared::cluster, GROUP_SIZE_M
-  swizzle via _compute_pid, 1CTA/2CTA (cluster_cta_rank, cta_bars,
-  remote_cta_rank), NUM_SMEM_BUFFERS / NUM_TMEM_BUFFERS / EPILOGUE_SUBTILE
-  pipeline, _get_tile_grid / _producer_fetch_tile_idx_2cta, tmem_empty/full
-  mbarriers.
-- MX block-scaled MMA (third_party/tlx/tutorials/blackwell_gemm_ws_mxfp8.py  # fburl.com/code/wdyi24fn):
-  BLOCK_SIZE_M==128 required for scaled MMA, tlx.async_dot_scaled on E4M3+E8M0
-  with tlx.dtype_of(desc), swizzled scales [1, REP_M, REP_K, 2, 256] via
-  TensorDescriptor + async_descriptor_load + barrier_expect_bytes, REP_K=
-  BLOCK_K//32//4, tlx.local_trans on B, tmem empty/full + smem empty/full
-  phases via get_bufidx_phase, tlx.tcgen05_commit.
+TLX API guidance:
+- Treat `.claude/skills/tlx-api-reference/SKILL.md` in the target repository as the primary
+  TLX API reference when present.
+- Reuse APIs, synchronization patterns, and architecture-specific examples already used by
+  the supplied source and nearby code. Do not invent APIs or transplant incompatible target
+  patterns.
 
-Optimization axes to tune (pick 1-2 per candidate, keep harness verifiable):
-- GROUP_SIZE_M in {1, 4, 8, 64} — swizzle order of M vs N tiles.
-- NUM_SMEM_BUFFERS in {3, 4, 6} and NUM_TMEM_BUFFERS in {1, 2} — pipeline depth.
-- NUM_CTAS in {1, 2} — only use 2 with a persistent counter + DSMEM tile_idx
-  path and ctas_per_cga=(2,1,1); remember 2-CTA needs full B-scale reload.
-- BLOCK_SIZE_K 128 vs 256 — must stay %128; larger reduces K tiles but grows SMEM.
-Promote from the flat-grid tl.dot baseline to TMA + TMEM + tlx.async_dot_scaled
-when cases have K>=256 (form is block-scaled MXFP8, scale tiling assumes K%128==0).
-
-TLX essentials:
-- `import triton.language as tl` and `import triton.language.extra.tlx as tlx`
-- Warp spec: `with tlx.async_tasks(exclusive=True, no_ending_cluster_sync=True, mbarrier_try_wait_suspend_ns=50000): with tlx.async_task("default"): ... with tlx.async_task(num_warps=1, num_regs=24): ...`
-- Memory: `tlx.local_alloc(shape, dtype, num_buffers, tlx.storage_kind.tmem)` + `tlx.alloc_barriers`, `tlx.async_descriptor_load`, `tlx.barrier_wait/arrive/expect_bytes`, `tlx.local_slice/load/store`, `tlx.barrier_arrive` + `tcgen05_commit`
-- Persistent grouped GEMMs: `tlx.local_alloc((1,), tl.int32, NUM_TILE_BUFFERS)` for tile_id_smem, `tlx.remote_shmem_store` / `local_load` for 2-CTA, `tl.atomic_add(counter_ptr, 1 or 2)` for dispatch.
-- Follow https://www.internalfb.com/wiki/Triton_Core/Agentic_Reference/ and third_party/tlx/doc/tlx_barriers.md.
+The complete current source is available as `candidate.py` in your writable working
+directory. Edit that file directly and leave it as the complete replacement source. Also
+write `candidate_metadata.json` containing exactly these short string fields: `hypothesis`,
+`evidence`, `change`, `expected_effect`, and `risk`. Each field must be one line and under
+240 characters. Do not modify any other file. Keep the final response to one short plain-text
+summary; do not print source code or a patch.
 """
 
 
@@ -53,6 +50,10 @@ TLX essentials:
 class CandidateProposal:
     source: str
     summary: str = ""
+    hypothesis: str = ""
+    evidence: str = ""
+    expected_effect: str = ""
+    risk: str = ""
 
 
 @dataclass(frozen=True)
@@ -110,10 +111,30 @@ class MockLLMProvider:
         return CandidateProposal(source=context.current_source, summary="mock-echo")
 
 
+def _read_candidate_metadata(path: Path) -> dict[str, str]:
+    fields = ("hypothesis", "evidence", "change", "expected_effect", "risk")
+    fallback = {field: "" for field in fields}
+    if not path.exists():
+        return fallback
+    try:
+        payload = json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return fallback
+    if not isinstance(payload, dict):
+        return fallback
+    return {
+        field: " ".join(str(payload.get(field, "")).split())[:240]
+        for field in fields
+    }
+
+
 @dataclass(frozen=True)
 class CodexCandidateProvider:
-    model: str = "sonnet"
+    model: str | None = None
     timeout_seconds: float = 300.0
+
+    # Candidate generation is source-in/source-out. The model must never mutate
+    # the live checkout; harness workers materialize and evaluate returned source.
 
     def propose(
         self,
@@ -122,35 +143,57 @@ class CodexCandidateProvider:
     ) -> CandidateProposal:
         prompt = _build_prompt(request, context)
         try:
-            completed = subprocess.run(
-                [
+            with tempfile.TemporaryDirectory(prefix="tlx-agent-candidate-") as directory:
+                workspace = Path(directory)
+                candidate_path = workspace / "candidate.py"
+                output_path = workspace / "last-message.txt"
+                metadata_path = workspace / "candidate_metadata.json"
+                candidate_path.write_text(context.current_source)
+                command = [
                     "codex",
                     "exec",
                     "--skip-git-repo-check",
-                    "-m",
-                    self.model,
                     "--sandbox",
                     "workspace-write",
-                    prompt,
-                ],
-                text=True,
-                capture_output=True,
-                timeout=self.timeout_seconds,
-                check=False,
-            )
+                    "--cd",
+                    str(workspace),
+                    "--output-last-message",
+                    str(output_path),
+                ]
+                if self.model:
+                    command.extend(("--model", self.model))
+                command.append("-")
+                completed = subprocess.run(
+                    command,
+                    input=prompt,
+                    text=True,
+                    capture_output=True,
+                    timeout=self.timeout_seconds,
+                    check=False,
+                )
+                if completed.returncode != 0:
+                    diagnostics = completed.stderr.strip().splitlines()
+                    raise RuntimeError(
+                        f"candidate generator exited with code {completed.returncode}: "
+                        + " | ".join(diagnostics[-8:])
+                    )
+                source = candidate_path.read_text()
+                metadata = _read_candidate_metadata(metadata_path)
         except FileNotFoundError as error:
             raise RuntimeError(
                 "codex binary not found; install it or use --provider mock"
             ) from error
-        if completed.returncode != 0:
-            raise RuntimeError(
-                f"candidate generator exited with code {completed.returncode}: "
-                f"{completed.stderr.strip()}"
-            )
-        source = extract_python_source(completed.stdout)
         if not source.strip():
             raise RuntimeError("candidate generator returned empty source")
-        return CandidateProposal(source=source, summary="Codex-generated candidate")
+        validate_replacement_source(source, context.current_source)
+        return CandidateProposal(
+            source=source,
+            summary=metadata["change"] or "Codex-edited candidate",
+            hypothesis=metadata["hypothesis"],
+            evidence=metadata["evidence"],
+            expected_effect=metadata["expected_effect"],
+            risk=metadata["risk"],
+        )
 
 
 def _build_prompt(
@@ -166,17 +209,23 @@ def _build_prompt(
         f"{case.timing.median_us if case.timing else 'unavailable'}, "
         f"p95_us={case.timing.p95_us if case.timing else 'unavailable'}, "
         f"cv={case.timing.coefficient_of_variation if case.timing else 'unavailable'}, "
-        f"profile={dict(case.profile)}"
+        f"profile={compact_profile_summary(case.profile)}"
         for case in context.current_performance.cases
     )
     diagnostics = "\n".join(context.previous_diagnostics[-5:]) or "None"
     reference_block = ""
     if getattr(request, "reference_kernel_source", None):
         reference_block = f"\nReference kernel (oracle, do not copy verbatim — use for correctness/performance comparison):\n```python\n{request.reference_kernel_source[:4000]}\n```\n"
-    return f"""{TLX_PROMPT_PREAMBLE}{reference_block}
+    guidance = request.target.optimization_guidance.strip()
+    guidance_block = (
+        f"\nFrozen target-specific optimization guidance:\n{guidance}\n"
+        if guidance
+        else ""
+    )
+    return f"""{TLX_PROMPT_PREAMBLE}{guidance_block}{reference_block}
 You are proposing one candidate for the closed loop `build -> verify -> benchmark -> profile -> propose -> repeat`.
-Return exactly one complete replacement source file. Do not return a diff and do not
-claim correctness or performance; an external deterministic harness decides both.
+Edit `candidate.py` directly. Do not return source or a diff, and do not claim correctness
+or performance; an external deterministic harness reads the file and decides both.
 Preserve the public entry points expected by the harness. Make one coherent optimization
 that can be diagnosed if it fails.
 
@@ -191,8 +240,5 @@ Current measurements:
 Recent failed-candidate diagnostics:
 {diagnostics}
 
-Current source:
-```python
-{context.current_source}
-```
+Current source: read and edit `candidate.py` in the working directory.
 """
