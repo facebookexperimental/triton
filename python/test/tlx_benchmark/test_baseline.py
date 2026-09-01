@@ -121,13 +121,13 @@ def test_table_reports_compile_time_replicates_and_throughput_error():
     rendered = report_mod.table([r])
 
     header, _, row = rendered.splitlines()[:3]
-    for column in ("input", "ref TF/s", "tlx TF/s", "speedup", "compile", "reps", "CV%", "p50 TF/s", "p90 TF/s",
-                   "p99 TF/s"):
+    for column in ("input", "ref TF/s", "tlx TF/s", "speedup", "compile", "CV%", "p50 TF/s", "p90 TF/s", "p99 TF/s",
+                   "samples"):
         assert column in header
     assert "shape" not in header and " us" not in header
 
     assert "0.69s" in row  # sub-10s compile keeps two decimals
-    assert "3x120" in row  # 3 replicates of 120 timed iterations each
+    assert " 360 " in row  # 3 replicates x 120 timed iterations, as one total
 
 
 def test_table_marks_compile_as_absent_when_not_measured():

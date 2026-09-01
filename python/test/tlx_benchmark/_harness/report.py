@@ -36,19 +36,15 @@ def _tf(result, latency_ms) -> str:
     return f"{result.flop_count / (latency_ms * 1e-3) / 1e12:9.0f}"
 
 
-def _fmt_reps(result) -> str:
-    """``10x2740`` -- replicates, and timed iterations within each.
+def _fmt_samples(result) -> str:
+    """Total timed kernel invocations behind the row.
 
-    Both numbers matter and neither substitutes for the other: the iteration
-    count is what makes one replicate's mean precise, and the replicate count
-    is what makes the reported mean reproducible. Showing only the first
-    flatters a drifting machine; showing only the second reads as if the whole
-    result rested on ten samples.
+    One number, not a replicates-by-iterations pair: the split matters to the
+    harness -- replicates make the result reproducible, iterations make each
+    run precise -- but a reader of the table only needs to know how much
+    evidence is behind it. The breakdown is in the artifact.
     """
-    if not result.tlx:
-        return "-"
-    per = result.tlx.n_kept // max(1, result.tlx.replicates)
-    return f"{result.tlx.replicates}x{per}"
+    return str(result.tlx.n_kept) if result.tlx else "-"
 
 
 def _fmt_cv(result) -> str:
@@ -65,7 +61,7 @@ def _fmt_compile(result) -> str:
 def table(results: Sequence[Result]) -> str:
     lines = [
         f"{'input':<34} {'dtype':<8} {'ref TF/s':>9} {'tlx TF/s':>9} {'speedup':>8} {'compile':>8} "
-        f"{'reps':>10} {'CV%':>6} {'p50 TF/s':>9} {'p90 TF/s':>9} {'p99 TF/s':>9}  status",
+        f"{'samples':>8} {'CV%':>6} {'p50 TF/s':>9} {'p90 TF/s':>9} {'p99 TF/s':>9}  status",
         "-" * 150,
     ]
     for r in results:
@@ -73,7 +69,7 @@ def table(results: Sequence[Result]) -> str:
                      f"{_tf(r, r.ref.mean if r.ref else None)} {_tf(r, r.tlx.mean if r.tlx else None)} "
                      f"{(f'{r.speedup:.3f}x' if r.speedup else '-'):>8} "
                      f"{_fmt_compile(r):>8} "
-                     f"{_fmt_reps(r):>10} "
+                     f"{_fmt_samples(r):>8} "
                      f"{_fmt_cv(r):>6} "
                      f"{_tf(r, r.tlx.p50 if r.tlx else None)} "
                      f"{_tf(r, r.tlx.p90 if r.tlx else None)} "
@@ -109,7 +105,7 @@ LEGEND = ("Every throughput column is TFLOP/s, HIGHER is better. `ref`/`tlx` are
           "speedup = tlx TF/s / ref TF/s, so >1 means TLX is faster.\n"
           "pNN TF/s = throughput at the pNN *latency*, so the columns descend: p99 is the worst-case\n"
           "        throughput, not the best. Percentiles are nearest-rank over the pooled samples.\n"
-          "reps = replicates x timed iterations each (>=1000 per replicate, enforced).\n"
+          "samples = total timed kernel invocations behind the row, over all replicates.\n"
           "CV%  = coefficient of variation of the latency samples within a run, sd/mean, after IQR\n"
           "        rejection.\n"
           "The gate reads NEITHER CV nor the percentiles: it reads the between-run deviation of the\n"
