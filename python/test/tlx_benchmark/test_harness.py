@@ -9,8 +9,8 @@ import json
 
 import pytest
 
-from _harness import (DEFAULT_REP_MS, DEFAULT_WARMUP_MS, HOST_BOUND_RATIO, MAX_REPLICATE_DEVIATION, SCHEMA_VERSION,
-                      Case, Result, Status, artifact, reject_outliers_iqr, resolve_warmup_and_rep, summarize)
+from _harness import (DEFAULT_WARMUP_MS, HOST_BOUND_RATIO, MAX_REPLICATE_DEVIATION, SCHEMA_VERSION, Case, Result,
+                      Status, artifact, reject_outliers_iqr, resolve_warmup_and_rep, summarize)
 
 
 def test_resolve_warmup_and_rep_scales_with_kernel_cost():
@@ -112,15 +112,14 @@ def test_case_key_is_stable_and_readable():
     assert case.key == "mm/sm100/float16/1024x2048x512xTruexFalse"
 
 
-def test_default_window_is_not_the_estimate_table():
-    """The fixed 3s/3s window is load-bearing, not incidental.
+def test_warmup_is_not_taken_from_the_estimate_table():
+    """The 3s warmup is load-bearing, not incidental.
 
-    Sizing the window from the estimate table hands a ~1ms kernel a 25ms
-    warmup, which measured 13.9% across-run spread on a clock-locked B200
-    against 1.7% at 3s/3s. If someone reverts the default to the table, this
-    test should be the thing that argues back.
+    Sizing it from the estimate table hands a ~1ms kernel a 25ms warmup, which
+    measured 13.9% between-run spread on a clock-locked B200 against 1.7% at
+    3s. If someone reverts the default to the table, this should argue back.
     """
-    assert (DEFAULT_WARMUP_MS, DEFAULT_REP_MS) == (3000, 3000)
+    assert DEFAULT_WARMUP_MS == 3000
     assert resolve_warmup_and_rep(None, None, 1.0) == (25, 100)
 
 
@@ -171,17 +170,3 @@ def test_summarize_reports_the_tail():
     assert stat.p50 == 1.0
     assert stat.p99 == 5.0
     assert stat.p99 / stat.p50 == 5.0
-
-
-def test_min_iterations_floor_is_expressed_as_a_time_window():
-    """do_bench takes a time budget, so a sample-count floor has to be
-    translated into one. Without it a slow kernel silently gets fewer samples
-    than a fast one, and the sample count depends on the thing being measured.
-    """
-    from _harness import MIN_ITERS_PER_REPLICATE
-
-    assert MIN_ITERS_PER_REPLICATE >= 1000
-    # At the default window a 3ms kernel lands exactly on the floor; anything
-    # slower needs the window widened to hold it.
-    assert DEFAULT_REP_MS / 3.0 == MIN_ITERS_PER_REPLICATE
-    assert max(DEFAULT_REP_MS, MIN_ITERS_PER_REPLICATE * 10.0) == 10000

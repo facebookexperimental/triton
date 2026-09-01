@@ -41,7 +41,7 @@ through pytest, for the junitxml the b200 reporting pipeline consumes.
 | `--space` | `heuristic` `full` `smoke` | defaults to `heuristic`, matching `tlx.ops.mm` |
 | `--dtype` | `fp16` `bf16` `both` | |
 | `--guard` | `enforce` `report` `off` | `enforce` exits non-zero on a regression or compile-cap breach |
-| `--replicates` | int | independent measurements per case; what the gate reads (default 10, each ≥1000 timed iterations) |
+| `--replicates` | int | independent measurements per case; what the gate reads (default 5; the window is sized so they total ≥1000 iterations) |
 | `--json` | path | defaults to `/tmp/tlx_benchmark/mm.sm100.json` |
 | `--update-baseline` | | re-record even though one exists |
 | `--strict-env` | | fail rather than warn when the environment is not denoised |
@@ -241,8 +241,14 @@ reported number was solid. `Stat.spread` is therefore the replicate-to-replicate
 figure and drives `NOISE_FLOOR = 2%`; `Stat.within_spread` keeps the width as a
 diagnostic for whether the *machine* was steady.
 
-The cost is three replicates per provider per case, which is the only way to
-observe reproducibility at all.
+Replicates are the only way to observe reproducibility at all, but they are not
+where the samples come from: the measurement window is sized from a
+**total-sample quota** (≥1000 across all replicates) rather than fixed, so the
+evidence behind a number does not depend on how fast the kernel happens to be.
+A fixed 3 s window gave a 52 µs kernel 50× the samples of a 2.2 ms one, and cost
+56 minutes to do it. The quota plus a 200 ms window floor brings a full run to
+about 15 minutes. Warmup stays at 3 s per replicate — that is the part measured
+to matter, and it dominates a replicate's cost.
 
 ### Compile time: `space="full"` was over the cap by 2×, so the default changed
 

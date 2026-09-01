@@ -34,40 +34,39 @@ from .contract import Stat
 #: tritonbench ``utils/constants.py::DEFAULT_WARMUP_REP_BY_ESTIMATED_KERNEL_MS``.
 _WARMUP_REP_BY_ESTIMATE = ((1.0, (25, 100)), (10.0, (25, 100)), (float("inf"), (3000, 3000)))
 
-#: Default measurement window, in ms. NOT the estimate-based table above, which
-#: is opt-in via ``auto_window=True``.
+#: Warmup per replicate, in ms. NOT the estimate-based table above, which is
+#: opt-in via ``auto_window=True``.
 #:
 #: The table gives a ~1 ms kernel a 25 ms warmup -- about 24 iterations -- which
 #: is nowhere near thermal steady state. Measured on a clock-locked B200,
-#: mm 8192x8192x8192 fp16 moved from 13.9% to 1.7% across-run p50 spread purely
-#: by going from the table's window to 3s/3s. 3000/3000 is also what the team
-#: already passes to tritonbench for TLX perf runs, so this matches practice.
+#: mm 8192x8192x8192 fp16 moved from 13.9% to 1.7% between-run spread when the
+#: window went from the table's to 3s. This is the expensive part of a replicate
+#: and the part that is load-bearing, so it is not sized down.
 DEFAULT_WARMUP_MS = 3000
-DEFAULT_REP_MS = 3000
 
-#: Timed kernel executions per replicate, floor.
+#: Total timed iterations across all replicates, floor.
 #:
-#: The 3s window already delivers far more than this for anything fast -- a
-#: 1095us kernel gets ~2700 iterations, a 52us one ~57000 -- but the window is
-#: a *time* budget, so a slow kernel silently gets fewer. At 3ms per call the
-#: window yields exactly 1000; anything slower would fall under it. Raising the
-#: window to hold the floor costs wall clock only for kernels that are already
-#: slow, and it keeps the sample count from quietly depending on how fast the
-#: kernel happens to be.
-MIN_ITERS_PER_REPLICATE = 1000
+#: The measurement window is derived from this rather than fixed, because what
+#: matters is how many samples stand behind the number, not how many
+#: milliseconds were spent collecting them -- a fixed window silently gives a
+#: fast kernel 50x the samples of a slow one.
+MIN_TOTAL_SAMPLES = 1000
+
+#: Floor on the measurement window itself, in ms.
+#:
+#: Without it a fast kernel meets the sample quota in ~10 ms, which is a short
+#: enough slice of time to catch a single scheduling artefact and call it the
+#: answer. Costs nothing: warmup dominates a replicate regardless.
+MIN_REP_MS = 200
 
 #: Number of independent measurement replicates per case.
 #:
-#: This is the only thing that measures the quantity the guard depends on --
-#: how reproducible the reported p50 is -- so it is worth spending on. Three is
-#: the bare minimum from which any spread can be read; ten makes the figure
-#: stable rather than merely present, and shrinks the uncertainty on it by
-#: roughly sqrt(10/3).
-#:
-#: Cost is linear and not trivial: at the 3s/3s window each replicate is ~6s per
-#: provider, so ten replicates over two providers is ~2 min per case. Lower it
-#: with --replicates for a quick look.
-DEFAULT_REPLICATES = 10
+#: Replicates exist only to catch drift *between* runs -- within a run the mean
+#: is already precise once the sample quota is met -- so this is the smallest
+#: number giving a usable spread rather than the largest affordable. Three is
+#: the bare minimum from which any spread can be read; five leaves margin
+#: without multiplying the warmup, which is what dominates a replicate.
+DEFAULT_REPLICATES = 5
 
 #: A case whose reported p50 does not reproduce this closely across replicates
 #: gets no perf verdict.
@@ -176,6 +175,20 @@ def relative_interdecile_range(values, median: Optional[float] = None) -> Option
     return (deciles[8] - deciles[0]) / med
 
 
+def window_for(estimate_ms: float, replicates: int) -> float:
+    """Measurement window, in ms, that meets the total-sample quota.
+
+    ``do_bench`` derives its iteration count as ``rep_ms / estimate_ms``, so a
+    sample count has to be expressed to it as a duration. Deriving the window
+    instead of fixing it is what keeps the evidence behind a number from
+    depending on how fast the kernel happens to be.
+    """
+    if not estimate_ms:
+        return MIN_REP_MS
+    per_replicate = math.ceil(MIN_TOTAL_SAMPLES / max(1, replicates))
+    return max(MIN_REP_MS, per_replicate * estimate_ms)
+
+
 def percentiles(values, wanted=(50, 90, 99)) -> tuple:
     """Nearest-rank percentiles, so every returned value is an observed sample.
 
@@ -264,24 +277,23 @@ def measure(fn: Callable, *, warmup: Optional[int] = None, rep: Optional[int] = 
     The measurement is repeated ``replicates`` times because that, and only
     that, measures the quantity the guard depends on: how reproducible the
     reported mean is. Each replicate re-warms, so between-replicate variation
-    picks up the slow drift a single long window cannot see. Every replicate
-    times at least ``MIN_ITERS_PER_REPLICATE`` iterations.
+    picks up the slow drift a single long window cannot see. The window is
+    sized so the replicates together time at least ``MIN_TOTAL_SAMPLES``
+    iterations.
 
-    The window defaults to ``DEFAULT_WARMUP_MS`` / ``DEFAULT_REP_MS``. Pass
+    The warmup defaults to ``DEFAULT_WARMUP_MS`` and the measurement window is
+    derived from ``MIN_TOTAL_SAMPLES`` (see ``window_for``). Pass
     ``auto_window=True`` to size it from a runtime estimate instead, which is
     tritonbench's default policy but under-warms sub-10ms kernels badly enough
     to dominate the result -- see ``DEFAULT_WARMUP_MS``.
     """
     estimate_ms = estimate_runtime_ms(fn, grad_to_none=grad_to_none)
+    replicates = max(1, replicates)
     if auto_window:
         warmup_ms, rep_ms = resolve_warmup_and_rep(warmup, rep, estimate_ms)
     else:
         warmup_ms = DEFAULT_WARMUP_MS if warmup is None else warmup
-        rep_ms = DEFAULT_REP_MS if rep is None else rep
-    if rep is None and estimate_ms:
-        # do_bench derives its iteration count as rep_ms / estimate_ms, so this
-        # is how a minimum sample count is expressed to it.
-        rep_ms = max(rep_ms, MIN_ITERS_PER_REPLICATE * estimate_ms)
+        rep_ms = rep if rep is not None else window_for(estimate_ms, replicates)
     runs = [
         triton.testing.do_bench(fn, warmup=warmup_ms, rep=rep_ms, grad_to_none=grad_to_none, return_mode="all")
         for _ in range(max(1, replicates))
