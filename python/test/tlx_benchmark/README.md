@@ -182,13 +182,26 @@ dropped to 742 MHz), and device identity has to be resolved by UUID, since
 torch indices are remapped by `CUDA_VISIBLE_DEVICES` while NVML and
 `nvidia-smi` index physical devices.
 
-### The gate is p50 reproducibility, not distribution width
+### Headline is mean + CV; the gate is between-run reproducibility of the mean
+
+A run reports `mean` and `CV%` (`sd/mean` over the within-run samples, after IQR
+rejection) because that is the conventional way to summarize a latency
+distribution and it compares across kernels of wildly different absolute speed.
+A separate table gives p50/p95/p99 and the p99/p50 ratio, because a mean and a
+CV together still cannot show a tail: two kernels can match on both and differ
+entirely at p99.
+
+The **gate** reads neither. It reads `rel_max_deviation` -- the between-run
+deviation of the replicate means -- because that is the uncertainty on the
+headline number, whereas CV is the width of one run.
+
+### Why the gate is between-run, not within-run
 
 These are very different quantities, and an earlier version conflated them.
 Measured on a denoised B200 at the default window, `--space heuristic`, three
 replicates:
 
-| mm shape (fp16) | p50 reproducibility | decile width |
+| mm shape (fp16) | between-run reproducibility | within-run dispersion |
 |---|---|---|
 | 8192×8192×8192 | 0.2% | 5.6% |
 | 8192×8192×1024 | 0.0% | 1.7% |

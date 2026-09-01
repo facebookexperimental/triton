@@ -85,8 +85,11 @@ def save(op: str, arch: str, results: Sequence[Result], env: dict) -> pathlib.Pa
         "cases": {
             r.case.key: {
                 "speedup": r.speedup,
+                "tlx_mean_ms": r.tlx.mean if r.tlx else None,
+                "ref_mean_ms": r.ref.mean if r.ref else None,
                 "tlx_p50_ms": r.tlx.p50 if r.tlx else None,
-                "ref_p50_ms": r.ref.p50 if r.ref else None,
+                "tlx_p95_ms": r.tlx.p95 if r.tlx else None,
+                "tlx_p99_ms": r.tlx.p99 if r.tlx else None,
                 "tlx_tflops": r.tlx_tflops,
                 "t_cold_s": r.t_cold_s,
             }
@@ -116,23 +119,23 @@ def judge(
     untrustworthy would be worse than reporting nothing.
     """
     result = Result(case=case, tlx=tlx, ref=ref, tlx_host_us=tlx_host_us, ref_host_us=None)
-    if ref is not None and ref.p50 and tlx.p50:
-        result.speedup = ref.p50 / tlx.p50
+    if ref is not None and ref.mean and tlx.mean:
+        result.speedup = ref.mean / tlx.mean
 
     if compile_stat is not None:
         result.t_cold_s = compile_stat.t_cold_s
         result.n_configs = compile_stat.n_configs
 
-    if tlx_host_us is not None and tlx.p50 * 1e3 < HOST_BOUND_RATIO * tlx_host_us:
+    if tlx_host_us is not None and tlx.mean * 1e3 < HOST_BOUND_RATIO * tlx_host_us:
         result.status = Status.HOST_BOUND
-        result.notes.append(f"latency {tlx.p50 * 1e3:.0f}us is under {HOST_BOUND_RATIO:g}x the "
+        result.notes.append(f"latency {tlx.mean * 1e3:.0f}us is under {HOST_BOUND_RATIO:g}x the "
                             f"{tlx_host_us:.0f}us host cost of issuing the call; this measures the "
                             f"launch path, not the kernel")
         return result
 
     if tlx.rel_max_deviation > MAX_REPLICATE_DEVIATION:
         result.status = Status.NOISY
-        result.notes.append(f"p50 varied {tlx.rel_max_deviation * 100:.1f}% across {tlx.replicates} replicates, over "
+        result.notes.append(f"mean varied {tlx.rel_max_deviation * 100:.1f}% across {tlx.replicates} replicates, over "
                             f"the {MAX_REPLICATE_DEVIATION * 100:.0f}% limit; no perf verdict claimed")
         return result
 
@@ -158,8 +161,8 @@ def judge(
         else:
             result.notes.append(f"speedup {result.speedup:.3f}x vs baseline {was:.3f}x ({change * 100:+.1f}%)")
 
-    was_ms = baseline.get("tlx_p50_ms")
-    if was_ms and abs(tlx.p50 / was_ms - 1.0) > LATENCY_DRIFT_NOTE:
-        result.notes.append(f"absolute latency drifted {((tlx.p50 / was_ms) - 1) * 100:+.0f}% from baseline "
+    was_ms = baseline.get("tlx_mean_ms")
+    if was_ms and abs(tlx.mean / was_ms - 1.0) > LATENCY_DRIFT_NOTE:
+        result.notes.append(f"absolute latency drifted {((tlx.mean / was_ms) - 1) * 100:+.0f}% from baseline "
                             f"({was_ms * 1e3:.0f}us); informational, machines differ")
     return result

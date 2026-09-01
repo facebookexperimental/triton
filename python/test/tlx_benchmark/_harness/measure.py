@@ -22,6 +22,7 @@ each port names its source.
 
 from __future__ import annotations
 
+import math
 import statistics
 from typing import Callable, Iterable, Optional
 
@@ -60,12 +61,12 @@ DEFAULT_REPLICATES = 10
 #: A case whose reported p50 does not reproduce this closely across replicates
 #: gets no perf verdict.
 #:
-#: Compared against ``Stat.rel_max_deviation`` -- BETWEEN-run reproducibility,
-#: NOT the within-run ``rel_idr``. Measured on a denoised B200, compute-bound
-#: shapes reproduce to 0.4-1.7%, so 2% is the achievable floor plus a little
-#: margin. An earlier version compared this number against the within-run
-#: figure (5-7% for the same shapes, because the power-governed clock wanders)
-#: and rejected healthy cases.
+#: Compared against ``Stat.rel_max_deviation`` -- BETWEEN-run reproducibility of
+#: the reported mean, NOT the within-run ``cv``. Measured on a denoised B200,
+#: compute-bound shapes reproduce to 0.4-1.7%, so 2% is the achievable floor
+#: plus a little margin. An earlier version compared this number against a
+#: within-run figure (5-7% for the same shapes, because the power-governed
+#: clock wanders) and rejected healthy cases.
 MAX_REPLICATE_DEVIATION = 0.02
 
 #: A case is host-bound when its latency is below this multiple of the host
@@ -164,13 +165,23 @@ def relative_interdecile_range(values, median: Optional[float] = None) -> Option
     return (deciles[8] - deciles[0]) / med
 
 
+def percentiles(values, wanted=(50, 95, 99)) -> tuple:
+    """Nearest-rank percentiles, so every returned value is an observed sample.
+
+    Interpolating would invent a latency the kernel never produced, which is
+    exactly the wrong thing for a tail figure.
+    """
+    ordered = sorted(values)
+    n = len(ordered)
+    return tuple(ordered[min(n - 1, max(0, math.ceil(q / 100 * n) - 1))] for q in wanted)
+
+
 def summarize(replicates: list[list[float]], remove_outliers: bool = True) -> Stat:
     """Collapse independent replicates into the reported statistic.
 
     Accepts a list of per-replicate sample lists. A single flat list is also
     accepted and treated as one replicate, in which case ``rel_max_deviation``
-    cannot be measured and falls back to the within-run ``rel_idr`` -- the
-    conservative direction, since that is the larger number.
+    cannot be measured and falls back to the within-run ``cv``.
     """
     if replicates and not isinstance(replicates[0], list):
         replicates = [replicates]  # a bare sample list
@@ -180,24 +191,29 @@ def summarize(replicates: list[list[float]], remove_outliers: bool = True) -> St
 
     kept_per_replicate = [reject_outliers_iqr(r) if remove_outliers else list(r) for r in replicates]
     kept_per_replicate = [k or r for k, r in zip(kept_per_replicate, replicates)]
-    p50s = [statistics.median_low(k) for k in kept_per_replicate]
+    means = [statistics.fmean(k) for k in kept_per_replicate]
     pooled = [x for k in kept_per_replicate for x in k]
 
-    p50 = statistics.median_low(p50s)
+    mean = statistics.median_low(means)
+    p50, p95, p99 = percentiles(pooled, (50, 95, 99))
+    cv = (statistics.stdev(pooled) / mean) if len(pooled) > 1 and mean else 0.0
     rel_idr = relative_interdecile_range(pooled, p50) if p50 else float("inf")
-    if len(p50s) > 1 and p50:
-        rel_max_deviation = max(max(p50s) - p50, p50 - min(p50s)) / p50
+    if len(means) > 1 and mean:
+        rel_max_deviation = max(max(means) - mean, mean - min(means)) / mean
     else:
-        rel_max_deviation = rel_idr
+        rel_max_deviation = cv
 
     return Stat(
+        mean=mean,
+        cv=cv,
         p50=p50,
+        p95=p95,
+        p99=p99,
         min=min(pooled),
         max=max(pooled),
-        mean=statistics.fmean(pooled),
         rel_max_deviation=rel_max_deviation,
         rel_idr=rel_idr,
-        replicates=len(p50s),
+        replicates=len(means),
         n_kept=len(pooled),
         n_raw=sum(len(r) for r in replicates),
     )

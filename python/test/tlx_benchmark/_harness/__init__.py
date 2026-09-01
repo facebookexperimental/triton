@@ -16,8 +16,8 @@ from .denoise import (MAX_CLOCK_IDR, DEGRADING_REASONS, EVENT_REASONS, ClockTrac
                       decode_event_reasons, foreign_processes, gpu_state, numa_bound, numa_node, nvml, parse_cpulist,
                       stable)
 from .measure import (DEFAULT_REP_MS, DEFAULT_REPLICATES, DEFAULT_WARMUP_MS, HOST_BOUND_RATIO, MAX_REPLICATE_DEVIATION,
-                      estimate_runtime_ms, host_overhead_us, measure, relative_interdecile_range, reject_outliers_iqr,
-                      resolve_warmup_and_rep, summarize)
+                      estimate_runtime_ms, host_overhead_us, measure, percentiles, relative_interdecile_range,
+                      reject_outliers_iqr, resolve_warmup_and_rep, summarize)
 
 __all__ = [
     "baseline",
@@ -59,6 +59,7 @@ __all__ = [
     "estimate_runtime_ms",
     "host_overhead_us",
     "measure",
+    "percentiles",
     "reject_outliers_iqr",
     "resolve_warmup_and_rep",
     "summarize",

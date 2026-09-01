@@ -82,15 +82,27 @@ class Stat:
     was in fact solid.
     """
 
+    #: The headline value. Reported rather than the median because a mean plus
+    #: a coefficient of variation is the conventional way to summarize a
+    #: latency distribution, and because the tail matters for a kernel: a
+    #: median hides a slow p99 completely.
+    mean: float
+    #: Coefficient of variation of the pooled samples, ``sd / mean``. The
+    #: headline dispersion. Computed after IQR rejection, so it describes the
+    #: distribution rather than the worst descheduled iteration.
+    cv: float
     p50: float
+    p95: float
+    p99: float
     min: float
     max: float
-    mean: float
-    #: Relative maximum deviation of the replicate p50s from their median:
-    #: ``max|p50_i - median(p50)| / median(p50)``. Between runs. The gate.
+    #: Relative maximum deviation of the replicate means from their median:
+    #: ``max|mean_i - median(mean)| / median(mean)``. BETWEEN runs, and what
+    #: the gate reads -- it is the uncertainty on the headline number, which
+    #: CV (a within-run figure) is not.
     rel_max_deviation: float
-    #: Relative interdecile range of the pooled samples: ``(p90 - p10) / p50``.
-    #: Within a run. Diagnostic -- it says whether the machine was steady.
+    #: Relative interdecile range of the pooled samples, ``(p90 - p10) / p50``.
+    #: Robust companion to ``cv``; kept in the artifact, not in the table.
     rel_idr: float
     replicates: int
     n_kept: int

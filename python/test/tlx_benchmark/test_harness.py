@@ -55,7 +55,7 @@ def test_dispersion_survives_outlier_rejection():
     """
     stat = summarize([10.0, 12.0, 8.0, 11.0, 9.0, 10.5, 9.5, 11.5, 8.5])
     assert stat.n_kept == stat.n_raw
-    assert stat.rel_max_deviation > 0.15
+    assert stat.cv > 0.10
 
 
 def test_between_run_deviation_is_not_within_run_dispersion():
@@ -69,8 +69,8 @@ def test_between_run_deviation_is_not_within_run_dispersion():
     wide_but_reproducible = [[9.0, 10.0, 11.0] * 40, [9.0, 10.0, 11.0] * 40, [9.0, 10.0, 11.0] * 40]
     stat = summarize(wide_but_reproducible, remove_outliers=False)
     assert stat.replicates == 3
-    assert stat.rel_idr > 0.15
-    assert stat.rel_max_deviation == pytest.approx(0.0)
+    assert stat.cv > 0.05  # each run is wide
+    assert stat.rel_max_deviation == pytest.approx(0.0)  # but they agree exactly
 
 
 def test_between_run_deviation_catches_a_drifting_machine():
@@ -81,12 +81,12 @@ def test_between_run_deviation_catches_a_drifting_machine():
     assert stat.rel_max_deviation == pytest.approx(0.06, abs=0.005)
 
 
-def test_single_replicate_falls_back_to_the_wider_number():
-    """With one replicate reproducibility is unmeasurable, so report the
-    distribution width -- the conservative direction."""
+def test_single_replicate_falls_back_to_within_run_dispersion():
+    """With one replicate the between-run figure is unmeasurable, so it falls
+    back to CV rather than silently reporting zero uncertainty."""
     stat = summarize([[9.0, 10.0, 11.0] * 40], remove_outliers=False)
     assert stat.replicates == 1
-    assert stat.rel_max_deviation == stat.rel_idr > 0.15
+    assert stat.rel_max_deviation == stat.cv > 0.05
 
 
 def test_rel_idr_is_a_decile_width_not_an_extreme():
@@ -148,3 +148,26 @@ def test_artifact_is_json_serializable_and_versioned():
     assert doc["results"][0]["case"]["key"] == case.key
     assert doc["results"][0]["status"] == "pass"
     assert doc["results"][0]["ref"] is None
+
+
+def test_percentiles_are_observed_samples_not_interpolations():
+    """A tail figure must be a latency the kernel actually produced.
+
+    Interpolating between neighbours would invent one, which is precisely the
+    wrong thing when the point of p99 is to name a real slow iteration.
+    """
+    from _harness import percentiles
+
+    values = [1.0] * 98 + [5.0, 9.0]
+    p50, p95, p99 = percentiles(values)
+    assert (p50, p95, p99) == (1.0, 1.0, 5.0)
+    assert all(v in values for v in (p50, p95, p99))
+
+
+def test_summarize_reports_the_tail():
+    """CV and the mean together still cannot show a tail: these samples have a
+    modest CV while p99 is 5x the median."""
+    stat = summarize([[1.0] * 98 + [5.0, 9.0]] * 3, remove_outliers=False)
+    assert stat.p50 == 1.0
+    assert stat.p99 == 5.0
+    assert stat.p99 / stat.p50 == 5.0

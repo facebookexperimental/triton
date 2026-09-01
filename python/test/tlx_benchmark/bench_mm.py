@@ -106,9 +106,9 @@ def run_case(case: Case, *, space: str, measure_compile: bool, baseline: dict, r
     result = baseline_mod.judge(case, tlx, ref, tlx_host_us=host_us, compile_stat=compile_stat,
                                 baseline=baseline.get(case.key))
     M, N, K = case.shape[0], case.shape[1], case.shape[2]
-    result.tlx_tflops = flops(M, N, K) / (tlx.p50 * 1e-3) / 1e12
-    if ref.p50:
-        result.ref_tflops = flops(M, N, K) / (ref.p50 * 1e-3) / 1e12
+    result.tlx_tflops = flops(M, N, K) / (tlx.mean * 1e-3) / 1e12
+    if ref.mean:
+        result.ref_tflops = flops(M, N, K) / (ref.mean * 1e-3) / 1e12
 
     # The operands are freed when this frame exits; empty_cache then returns the
     # blocks to the driver so the next case (up to 2 GB at 1000000x512) can be
