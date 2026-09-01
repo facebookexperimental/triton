@@ -1,10 +1,4 @@
 """L1 correctness for ``tlx.ops.mm``.
-
-The shape list lives in ``triton.tlx.ops.kernels.mm._shapes`` and is shared
-with the perf suite (``python/test/tlx_benchmark/bench_mm.py``), so a shape
-disabled here is automatically not benchmarked either. Two shapes are
-currently commented out there for a split-K remainder-tile bug -- see that
-module's docstring for the measurement and the root cause.
 """
 
 import time

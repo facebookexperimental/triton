@@ -33,6 +33,29 @@ pip install fbtriton
 Nightly wheels, source builds, supported hardware, and compatibility notes are
 on the [project site](https://facebookexperimental.github.io/triton/).
 
+### uTLX: standalone TLX for upstream Triton
+
+TLX also ships standalone as
+[`triton-utlx`](https://pypi.org/project/triton-utlx/), which provides the same
+`tlx` module as a Triton plugin rather than as a fork of Triton:
+
+```bash
+pip install torch
+pip install triton-utlx
+
+export TRITON_PLUGIN_PATHS=$(python -c \
+  "import utlx_plugin, os; print(os.path.join(os.path.dirname(utlx_plugin.__file__), 'libutlx.so'))")
+```
+
+Plugins load only into a Triton built with `TRITON_EXT_ENABLED`. The `triton`
+that ships with a PyTorch release has it on by default; to use a Triton you
+build yourself, enable it at build time from a checkout of
+[upstream Triton](https://github.com/triton-lang/triton):
+
+```bash
+TRITON_EXT_ENABLED=ON pip install -e . --no-build-isolation
+```
+
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for building from source, running the

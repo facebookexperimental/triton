@@ -9,7 +9,7 @@ try:
 except RuntimeError:
     target = None
 
-if target is None:
+if target is None or target.backend == "cpu":
     pytest.skip("No active GPU driver", allow_module_level=True)
 
 backend = make_backend(target)

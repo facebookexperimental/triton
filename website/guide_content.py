@@ -24,6 +24,7 @@ This site covers four connected parts of Meta's work: the Triton compiler, the T
 |---|---|
 | [Triton](website/triton.html) | Compiler-managed performance portability, including automatic warp specialization and its roadmap |
 | [TLX](website/tlx.html) | Explicit warp-group orchestration, asynchronous memory and tensor-core operations, barriers, and hardware-specific kernel development |
+| [uTLX](https://pypi.org/project/triton-utlx/) | The same TLX programming model packaged as a standalone plugin for upstream Triton, for users who are not on this fork |
 | [TorchTLX](website/torchtlx.html) | TLX-backed Inductor templates, epilogue fusion, and the PyTorch 2 integration path |
 | [CI](website/ci.html) | Workflows, runners, nightly failure handling, and per-project test coverage |
 | [Tooling](website/tooling.html) | Compilation tracing, profiling, runtime diagnostics, sanitizers, and benchmarking |
@@ -59,6 +60,30 @@ pip install -e .
 ```
 
 C++ changes require a rebuild to take effect; Python-only changes do not. Run `pre-commit run --all` before sending a pull request.
+
+### uTLX: standalone TLX for upstream Triton
+
+TLX is also published on its own as [`triton-utlx`](https://pypi.org/project/triton-utlx/), which ships the same `tlx` module as a Triton plugin rather than as a fork of Triton. Reach for it when replacing your `triton` install with FBTriton is not an option — the programming model is the one documented under [TLX](website/tlx.html).
+
+```bash
+pip install torch
+pip install triton-utlx
+```
+
+Plugins load only into a Triton built with `TRITON_EXT_ENABLED`, which exposes the `libtriton` symbols they link against. The `triton` that ships with a PyTorch release has it on by default, so `torch` is enough. To run against a Triton you build yourself instead, turn it on at build time from a checkout of [triton-lang/triton](https://github.com/triton-lang/triton):
+
+```bash
+TRITON_EXT_ENABLED=ON pip install -e . --no-build-isolation
+```
+
+Either way, point `TRITON_PLUGIN_PATHS` — a colon-separated list of shared libraries — at the `libutlx.so` inside the installed package:
+
+```bash
+export TRITON_PLUGIN_PATHS=$(python -c \
+  "import utlx_plugin, os; print(os.path.join(os.path.dirname(utlx_plugin.__file__), 'libutlx.so'))")
+```
+
+Nothing sets that variable for you, and a Triton built without `TRITON_EXT_ENABLED` warns and skips the plugin rather than failing outright, so an unset or ignored path shows up as unregistered TLX ops rather than a load error.
 
 ## Hardware support
 
