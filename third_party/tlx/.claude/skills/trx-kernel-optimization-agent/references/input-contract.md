@@ -148,8 +148,9 @@ Field meanings:
 
 - `level`: `summary` or `deep`; use `diagnostic_only: true` for
   instrumentation-only requests.
-- `tools`: profiler names requested by the agent, such as `proton` plus any
-  target-specific tool from `targets/<vendor>/`.
+- `tools`: profiler intents requested by the agent. `proton_launch` collects
+  launch attribution, while `native_profiler` is mapped by the target harness
+  to its platform profiler, such as NCU on NVIDIA.
 - `experiment_id`: stable baseline, round, or candidate identifier used in
   artifact names and profile metadata.
 - `artifacts_dir`: absolute directory where raw profiler outputs and commands

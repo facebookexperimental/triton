@@ -148,7 +148,7 @@ Profiling is staged so expensive evidence is collected where it can change a
 decision:
 
 - Proton attributes wrapper, launch, main-kernel, and non-main-kernel time.
-- NVIDIA NCU summary and deep profiles expose duration, throughput, occupancy, registers, memory traffic, tensor activity, and stall metrics.
+- The portable `native_profiler` request selects the target platform profiler. NVIDIA harnesses map it to NCU for duration, throughput, occupancy, register, memory-traffic, tensor-activity, and stall metrics.
 - Optional per-warp Proton instrumentation can answer intra-kernel attribution questions for warp-specialized pipelines.
 
 An ordinary Proton launch timeline does not prove that `tlx.async_task` regions

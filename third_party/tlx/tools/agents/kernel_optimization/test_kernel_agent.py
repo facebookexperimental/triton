@@ -690,19 +690,22 @@ class KernelOptimizerTest(unittest.TestCase):
         candidate_request = result.experiments[1].performance.cases[0].profile["request"]  # type: ignore[union-attr]
         final_request = result.final.cases[0].profile["request"]
         self.assertEqual(baseline_request["level"], "deep")
-        self.assertEqual(baseline_request["tools"], ["proton_launch", "ncu"])
+        expected_tools = ["proton_launch", "native_profiler"]
+        self.assertEqual(baseline_request["tools"], expected_tools)
         self.assertEqual(baseline_request["reason"], "baseline")
         self.assertEqual(
             Path(str(baseline_request["artifacts_dir"])).parent,
             output_dir / "experiments" / "baseline" / "profile_artifacts",
         )
         self.assertEqual(candidate_request["level"], "summary")
+        self.assertEqual(candidate_request["tools"], expected_tools)
         self.assertEqual(candidate_request["reason"], "candidate")
         self.assertEqual(
             Path(str(candidate_request["artifacts_dir"])).parent,
             output_dir / "experiments" / "r001-c000" / "profile_artifacts",
         )
         self.assertEqual(final_request["level"], "deep")
+        self.assertEqual(final_request["tools"], expected_tools)
         self.assertEqual(final_request["reason"], "final")
         self.assertEqual(
             Path(str(final_request["artifacts_dir"])).parent,
@@ -740,6 +743,10 @@ class KernelOptimizerTest(unittest.TestCase):
             )
         candidate_request = result.experiments[1].performance.cases[0].profile["request"]  # type: ignore[union-attr]
         self.assertEqual(candidate_request["level"], "deep")
+        self.assertEqual(
+            candidate_request["tools"],
+            ["proton_launch", "native_profiler"],
+        )
         self.assertEqual(candidate_request["reason"], "near_threshold")
         self.assertFalse(result.success)
 

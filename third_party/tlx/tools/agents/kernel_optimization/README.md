@@ -126,7 +126,8 @@ isolation in the CLI path; `StandaloneHarness` is available via the Python API.
 `triton.testing.do_bench`, and reports latency and TFLOP/s. Its optional three-argument
 `profile(build_artifact, case, request)` honors structured profile requests: `proton_launch`
 collects one Triton launch-attribution-only Proton tree under the per-case artifacts
-directory, and `ncu` writes a one-launch replay runner plus command/query/stdout/stderr/report
+directory, and `native_profiler` selects the target platform profiler. NVIDIA harnesses map
+it to NCU, which writes a one-launch replay runner plus command/query/stdout/stderr/report
 artifacts before returning normalized supported metrics. Missing tools, unsupported metrics,
 and profiler failures are returned as profile diagnostics so correctness and benchmark results
 remain usable. `proton_intra_kernel` is intentionally unsupported by the reference harness and
@@ -138,10 +139,10 @@ requires a target-supplied instrumented replay; the harness never rewrites candi
   `artifacts_dir`. The reference GEMM harness warms up, synchronizes, starts Proton with
   `hook="triton"` and tree data, runs one matmul, flushes/deactivates, saves raw tree JSON and
   any `.hatchet` artifact, then parses `launch_attribution_only` totals.
-- **NCU:** request `tools=["ncu"]`. The reference GEMM harness queries metrics from the active
-  `ncu`/GPU, selects supported summary or deep aliases, runs a replay script importing the exact
-  candidate source path, saves command/query/CSV/stderr artifacts, and returns unsupported metrics
-  as `null` plus diagnostics.
+- **Native profiler:** request `tools=["native_profiler"]`. Each target harness maps this
+  portable name to its platform profiler. NVIDIA harnesses map it to NCU, select supported
+  summary or deep metrics, save command/query/CSV/stderr artifacts, and return unsupported
+  metrics as `null` plus diagnostics. Explicit `ncu` remains a compatible NVIDIA-only request.
 
 Target-specific `harness.py`/`cases.json`/`target.json` live colocated under `harnesses/<arch>/targets/<kernel>/` (B200,
 `sm_100` for blackwell and H100, `sm_90` for hopper); pick `--arch` to match the

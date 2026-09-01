@@ -30,7 +30,7 @@ from .profiling import (
 from .providers import CandidateContext, CandidateProvider, CodexCandidateProvider
 from .source import source_digest
 
-_PROFILE_TOOLS = ("proton_launch", "ncu")
+_PROFILE_TOOLS = ("proton_launch", "native_profiler")
 _DIAGNOSTIC_PROFILE_TOOLS = ("proton_intra_kernel",)
 _DIAGNOSTIC_PROFILE_KEY = "diagnostic_proton_intra_kernel"
 _NEAR_THRESHOLD_WINDOW = 0.01

@@ -103,7 +103,7 @@ Harnesses that implement `profile` should accept a structured request with:
 ```json
 {
   "level": "summary",
-  "tools": ["proton", "ncu"],
+  "tools": ["proton_launch", "native_profiler"],
   "experiment_id": "stable candidate or baseline id",
   "artifacts_dir": "/absolute/path/to/profile-artifacts",
   "reason": "why this profile was requested",
@@ -120,9 +120,9 @@ Profiling has three distinct layers:
 
 - Proton wrapper/launch attribution: read `references/proton-profiling.md` and
   collect for every correctness-passing candidate.
-- Target summary/deep profiling: for CUDA/NVIDIA, read
-  `targets/nvidia/ncu-profiling.md`; other backends use their own target guide
-  or the generic profile contract.
+- Target summary/deep profiling: request `native_profiler`; each target harness
+  maps it to its platform tool. For CUDA/NVIDIA, this is NCU and the harness
+  should follow `targets/nvidia/ncu-profiling.md`.
 - Diagnostic-only Proton intra-kernel instrumentation: use only for attribution
   questions that cannot be answered from wrapper timelines or target counters.
 

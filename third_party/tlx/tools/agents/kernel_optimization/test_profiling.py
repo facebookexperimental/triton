@@ -15,6 +15,7 @@ from .profiling import (
     parse_ncu_query_metrics,
     parse_proton_launch_attribution,
     per_case_profile_request,
+    resolve_profile_tools,
     select_ncu_metric_names,
 )
 
@@ -31,7 +32,7 @@ class ProfileRequestTest(unittest.TestCase):
             mapped = normalize_profile_request(
                 {
                     "level": "deep",
-                    "tools": ["ncu"],
+                    "tools": ["native_profiler"],
                     "experiment_id": "baseline",
                     "artifacts_dir": directory,
                     "reason": "baseline profile",
@@ -39,7 +40,7 @@ class ProfileRequestTest(unittest.TestCase):
             )
             assert mapped is not None
             self.assertEqual(mapped.level, "deep")
-            self.assertEqual(mapped.tools, ("ncu",))
+            self.assertEqual(mapped.tools, ("native_profiler",))
             self.assertEqual(mapped.artifacts_dir, Path(directory))
 
     def test_validates_request_shape(self) -> None:
@@ -61,6 +62,23 @@ class ProfileRequestTest(unittest.TestCase):
             granularity="warp",
         )
         self.assertEqual(request.granularity, "warp")
+
+    def test_resolves_native_profiler_and_deduplicates_aliases(self) -> None:
+        self.assertEqual(
+            resolve_profile_tools(
+                ("proton_launch", "native_profiler", "ncu"),
+                native_profiler="ncu",
+            ),
+            ("proton_launch", "ncu"),
+        )
+        self.assertEqual(
+            resolve_profile_tools((), native_profiler="ncu", default=("ncu",)),
+            ("ncu",),
+        )
+        self.assertEqual(
+            resolve_profile_tools(("native_profiler",)),
+            ("native_profiler",),
+        )
 
     def test_per_case_profile_request_expands_absolute_dir(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -142,6 +160,10 @@ class ProfileParsingTest(unittest.TestCase):
                 "summary": {"duration_us": 1.0},
                 "raw": "x" * 5000,
                 "ncu": {"raw_metrics": {"huge": "blob"}, "summary": {"duration_us": 1.0}},
+                "native_profiler": {
+                    "raw": "x" * 5000,
+                    "summary": {"duration_us": 1.0},
+                },
                 "diagnostic_proton_intra_kernel": {
                     "summary": {"active_warps": 8},
                     "trace_events": [{"raw": "event"}],
@@ -153,6 +175,8 @@ class ProfileParsingTest(unittest.TestCase):
         self.assertEqual(compact["level"], "summary")
         self.assertNotIn("raw", compact)
         self.assertNotIn("raw_metrics", compact["ncu"])
+        self.assertIn("native_profiler", compact)
+        self.assertNotIn("raw", compact["native_profiler"])
         diagnostic = compact["diagnostic_proton_intra_kernel"]
         self.assertNotIn("trace_events", diagnostic)
         self.assertEqual(diagnostic["artifacts"]["trace"], "/tmp/proton.trace")

@@ -212,6 +212,23 @@ def per_case_profile_request(
     return replace(request, artifacts_dir=case_dir).to_json()
 
 
+def resolve_profile_tools(
+    tools: Iterable[object],
+    *,
+    native_profiler: str | None = None,
+    default: Iterable[object] = (),
+) -> tuple[str, ...]:
+    """Resolve target-neutral profiler names while preserving request order."""
+    requested = tuple(str(tool) for tool in tools) or tuple(str(tool) for tool in default)
+    resolved: list[str] = []
+    for tool in requested:
+        if tool == "native_profiler" and native_profiler is not None:
+            tool = native_profiler
+        if tool not in resolved:
+            resolved.append(tool)
+    return tuple(resolved)
+
+
 def profile_accepts_request(profile_fn: Callable[..., Any]) -> bool:
     try:
         signature = inspect.signature(profile_fn)
@@ -433,6 +450,7 @@ def compact_profile_summary(profile: Mapping[str, Any]) -> dict[str, Any]:
         "summary",
         "proton",
         "ncu",
+        "native_profiler",
         "diagnostics",
         "diagnostic_proton_intra_kernel",
         "artifacts",
