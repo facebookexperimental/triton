@@ -26,6 +26,7 @@ from typing import Any, Generator
 
 log = logging.getLogger(__name__)
 
+import sympy
 import torch
 from torch._inductor import config
 from torch._inductor.kernel_inputs import KernelInputs, MMKernelInputs
@@ -74,6 +75,7 @@ from .mm_templates import (
     gfx950_addmm_warppipe_template,
     gfx950_bmm_warppipe_template,
     blackwell_gemm_ws_template,
+    gfx950_addmm_interwave_template,
 )
 
 
@@ -110,6 +112,15 @@ def _amd_num_xcds() -> int:
     classes in ``tlx.hw.resources``.
     """
     return current_target().num_xcds
+
+
+def _is_gfx950() -> bool:
+    if not torch.version.hip:
+        return False
+    try:
+        return "gfx950" in torch.cuda.get_device_properties(0).gcnArchName
+    except (AssertionError, AttributeError, RuntimeError):
+        return False
 
 
 def _select_group_size_m(M: int, N: int, block_m: int) -> int:
@@ -1072,6 +1083,121 @@ class BlackwellGemmWSConfigMixin(TMATemplateConfigMixin):
 
 
 @register_template_heuristic(
+    gfx950_addmm_interwave_template.uid,
+    "cuda",
+    register=IS_ROCM,
+    op_name="addmm",
+)
+class Gfx950AddMMInterWaveTemplateConfigHeuristic(
+    AddMMConfigMixin, ROCmMMTemplateConfigHeuristic
+):
+    """Narrow config gate for the gfx950 a16w16 inter-wave kernel.
+
+    The reference kernel consumes row-major A directly and relies on a fixed
+    two-buffer, four-quadrant LDS layout. It accepts either row-major B or the
+    column-major B view produced by nn.Linear weights.
+    """
+
+    # (BLOCK_M, BLOCK_N, BLOCK_K, GROUP_M, num_warps, waves_per_eu, NUM_XCDS)
+    INTERWAVE_CONFIGS = [
+        (256, 256, 64, 4, 8, 0, 8),
+        (256, 256, 64, 4, 8, 0, 1),
+        (128, 256, 64, 1, 8, 0, 1),
+        (128, 128, 64, 4, 8, 0, 8),
+        (128, 128, 64, 1, 4, 0, 1),
+        (128, 128, 64, 1, 4, 1, 1),
+        (128, 128, 64, 8, 4, 0, 1),
+        (128, 128, 64, 16, 4, 0, 1),
+    ]
+
+    def _get_template_configs_impl(self, kernel_inputs, op_name):
+        if not isinstance(kernel_inputs, MMKernelInputs) or not _is_gfx950():
+            return
+        if kernel_inputs.dtype(kernel_inputs._mat1_idx) not in (
+            torch.float16,
+            torch.bfloat16,
+        ):
+            return
+
+        m, n, k = kernel_inputs.mnk_symbolic()
+        strides = kernel_inputs.strides_hinted()
+        a_strides = strides[kernel_inputs._mat1_idx]
+        b_strides = strides[kernel_inputs._mat2_idx]
+        static_values = (n, k, *a_strides[-2:], *b_strides[-2:])
+        if not all(isinstance(value, (int, sympy.Integer)) for value in static_values):
+            return
+
+        sizevars = V.graph.sizevars
+        m_is_static = isinstance(m, (int, sympy.Integer))
+        m_int = _sizevar_hint(sizevars, m, -1)
+        if m_int <= 0:
+            return
+        n_int, k_int, stride_am, stride_ak, stride_bk, stride_bn = (
+            int(value) for value in static_values
+        )
+        b_is_row_major = stride_bn == 1
+        b_is_col_major = stride_bk == 1
+        if stride_ak != 1 or not (b_is_row_major or b_is_col_major):
+            return
+
+        itemsize = torch.finfo(kernel_inputs.dtype(kernel_inputs._mat1_idx)).bits // 8
+        b_row_stride = stride_bk if b_is_row_major else stride_bn
+        if stride_am * itemsize % 16 != 0 or b_row_stride * itemsize % 16 != 0:
+            return
+
+        int32_max = 2**31 - 1
+        max_a_offset = (m_int - 1) * stride_am + (k_int - 1) * stride_ak
+        max_b_offset = (k_int - 1) * stride_bk + (n_int - 1) * stride_bn
+        if (
+            max_a_offset >= int32_max
+            or max_b_offset >= int32_max
+            or not sizevars.guard_or_false(
+                sympy.Lt((m - 1) * stride_am + (k_int - 1) * stride_ak, int32_max)
+            )
+        ):
+            return
+
+        out_dtype = kernel_inputs.out_dtype()
+        for (
+            block_m,
+            block_n,
+            block_k,
+            group_m,
+            num_warps,
+            waves_per_eu,
+            config_num_xcds,
+        ) in self.INTERWAVE_CONFIGS:
+            if n_int % block_n != 0 or k_int < 2 * block_k:
+                continue
+
+            selected_group_m = (
+                4
+                if m_int == n_int and k_int >= 8192
+                else (2 if m_int <= 1024 and n_int >= 16384 else group_m)
+            )
+            num_xcds = 1 if m_int == n_int and k_int >= 8192 else config_num_xcds
+            triton_config = self.triton_config(
+                1,
+                num_warps,
+                BLOCK_M=block_m,
+                BLOCK_N=block_n,
+                BLOCK_K=block_k,
+                GROUP_M=selected_group_m,
+                NUM_XCDS=num_xcds,
+                B_COL_MAJOR=b_is_col_major and not b_is_row_major,
+                HAS_M_TAIL=not m_is_static or m_int % block_m != 0,
+                HAS_REGISTER_TAIL=k_int % (2 * block_k) != 0,
+                matrix_instr_nonkdim=16,
+                waves_per_eu=waves_per_eu,
+                kpack=get_default_kpack(block_k),
+                llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"),),
+            )
+            yield self._convert_config_to_template_kwargs(
+                triton_config, m, n, k, out_dtype
+            )
+
+
+@register_template_heuristic(
     gfx950_addmm_warppipe_template.uid, "cuda", register=IS_ROCM, op_name="addmm"
 )
 class Gfx950AddMMWarpPipeConfigHeuristic(
@@ -1695,6 +1821,14 @@ def _tlx_store_output(  # type: ignore[no-untyped-def]
         # the regular TMA mode that OSS store_output will select.
         self._tlx_async_tma_store_active = True
     try:
+        if not hasattr(V.interpreter, "current_node") and hasattr(
+            V.graph, "current_node"
+        ):
+            # Template choices can be materialized during GraphLowering, before
+            # the separate interpreter virtual is installed. CSEProxy still
+            # needs the active FX node while rendering the addmm epilogue.
+            with V.set_interpreter_handler(V.graph):
+                return _orig_store_output(self, *args, **kwargs)
         return _orig_store_output(self, *args, **kwargs)
     finally:
         self._tlx_async_tma_store_active = False

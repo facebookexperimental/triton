@@ -1,0 +1,456 @@
+{{def_kernel("A", "B")}}
+    # gfx950 8-wave inter-wave addmm. This is intentionally a separate template
+    # from the general warp-pipe: it requires row-major A, a square 128 or 256
+    # tile, BLOCK_K=64, and exactly two LDS buffers. B remains logically [K, N]
+    # in LDS for both physical layouts; the swizzle's contiguous axis follows
+    # the globally contiguous B dimension.
+    M = {{size("A", 0)}}
+    N = {{size("B", 1)}}
+    K = {{size("A", 1)}}
+    if M * N == 0:
+        return
+
+    stride_am = {{stride("A", 0)}}
+    stride_ak = {{stride("A", 1)}}
+    stride_bk = {{stride("B", 0)}}
+    stride_bn = {{stride("B", 1)}}
+    tl.assume(stride_am > 0)
+    tl.assume(stride_ak > 0)
+    tl.assume(stride_bk > 0)
+    tl.assume(stride_bn > 0)
+
+    pid = tl.program_id(0).to(INDEX_DTYPE)
+    grid_m = (M + BLOCK_M - 1) // BLOCK_M
+    grid_n = (N + BLOCK_N - 1) // BLOCK_N
+    grid_mn = grid_m * grid_n
+
+    if NUM_XCDS != 1:
+        pids_per_xcd = (grid_mn + NUM_XCDS - 1) // NUM_XCDS
+        tall_xcds = grid_mn % NUM_XCDS
+        # Keep both dynamic branches in the grid index's dtype. Backed symbolic
+        # M uses i64, while a bare NUM_XCDS literal is inferred as i32.
+        tall_xcds = (
+            tall_xcds + NUM_XCDS if tall_xcds == 0 else tall_xcds
+        )
+        xcd = pid % NUM_XCDS
+        local_pid = pid // NUM_XCDS
+        if xcd < tall_xcds:
+            pid = xcd * pids_per_xcd + local_pid
+        else:
+            pid = (
+                tall_xcds * pids_per_xcd
+                + (xcd - tall_xcds) * (pids_per_xcd - 1)
+                + local_pid
+            )
+
+    if GROUP_M == 1:
+        pid_m = pid // grid_n
+        pid_n = pid % grid_n
+    else:
+        num_pid_in_group = GROUP_M * grid_n
+        group_id = pid // num_pid_in_group
+        first_pid_m = group_id * GROUP_M
+        group_size_m = min(grid_m - first_pid_m, GROUP_M)
+        pid_m = first_pid_m + (pid % num_pid_in_group) % group_size_m
+        pid_n = (pid % num_pid_in_group) // group_size_m
+
+    HALF_M: tl.constexpr = BLOCK_M // 2
+    HALF_N: tl.constexpr = BLOCK_N // 2
+
+    if BLOCK_M == 256:
+        a_bases: tl.constexpr = [
+            [0, 1],
+            [0, 2],
+            [0, 4],
+            [0, 8],
+            [0, 16],
+            [0, 32],
+            [16, 0],
+            [32, 0],
+            [64, 0],
+            [1, 0],
+            [2, 0],
+            [4, 0],
+            [8, 0],
+        ]
+    else:
+        a_bases: tl.constexpr = [
+            [0, 1],
+            [0, 2],
+            [0, 4],
+            [0, 8],
+            [0, 16],
+            [0, 32],
+            [16, 0],
+            [32, 0],
+            [1, 0],
+            [2, 0],
+            [4, 0],
+            [8, 0],
+        ]
+{% if B_COL_MAJOR %}
+    if BLOCK_N == 256:
+        # Match the tutorial kernel: K is physically contiguous, so put B's K
+        # dimension in the low register bits while preserving logical [K, N].
+        b_bases: tl.constexpr = [
+            [1, 0],
+            [2, 0],
+            [4, 0],
+            [8, 0],
+            [16, 0],
+            [32, 0],
+            [0, 16],
+            [0, 32],
+            [0, 64],
+            [0, 1],
+            [0, 2],
+            [0, 4],
+            [0, 8],
+        ]
+    else:
+        b_bases: tl.constexpr = [
+            [1, 0],
+            [2, 0],
+            [4, 0],
+            [8, 0],
+            [16, 0],
+            [32, 0],
+            [0, 16],
+            [0, 32],
+            [0, 1],
+            [0, 2],
+            [0, 4],
+            [0, 8],
+        ]
+{% else %}
+    if BLOCK_N == 256:
+        # Keep B's row-major N dimension in the low register bits so the
+        # direct-to-LDS path emits contiguous 128-bit global loads.
+        b_bases: tl.constexpr = [
+            [0, 1],
+            [0, 2],
+            [0, 4],
+            [0, 8],
+            [0, 16],
+            [0, 32],
+            [0, 64],
+            [16, 0],
+            [32, 0],
+            [1, 0],
+            [2, 0],
+            [4, 0],
+            [8, 0],
+        ]
+    else:
+        b_bases: tl.constexpr = [
+            [0, 1],
+            [0, 2],
+            [0, 4],
+            [0, 8],
+            [0, 16],
+            [0, 32],
+            [16, 0],
+            [32, 0],
+            [1, 0],
+            [2, 0],
+            [4, 0],
+            [8, 0],
+        ]
+{% endif %}
+
+    a_shared: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases(
+        [(512, 16)], a_bases, [HALF_M, BLOCK_K]
+    )
+    smem_a_top = tlx.local_alloc(
+        (HALF_M, BLOCK_K), tlx.dtype_of(A), 2, layout=a_shared
+    )
+    smem_a_bot = tlx.local_alloc(
+        (HALF_M, BLOCK_K), tlx.dtype_of(A), 2, layout=a_shared
+    )
+    b_shared: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases(
+        [(512, 16)], b_bases, [BLOCK_K, HALF_N]
+    )
+    smem_b_left = tlx.local_alloc(
+        (BLOCK_K, HALF_N), tlx.dtype_of(B), 2, layout=b_shared
+    )
+    smem_b_right = tlx.local_alloc(
+        (BLOCK_K, HALF_N), tlx.dtype_of(B), 2, layout=b_shared
+    )
+
+    # Backed dynamic dimensions arrive as i64. The registry guards the largest
+    # A/B byte offsets below INT32_MAX, so narrowing the direct-to-LDS indices is
+    # safe and satisfies TLX's buffer-load offset contract.
+    offs_am = (pid_m * BLOCK_M + tl.arange(0, HALF_M)).to(tl.int32)
+    offs_bn = (pid_n * BLOCK_N + tl.arange(0, HALF_N)).to(tl.int32)
+    offs_k = tl.arange(0, BLOCK_K)
+
+{% if HAS_M_TAIL %}
+    # Async direct-to-LDS loads cannot be masked inside a warp-pipeline stage.
+    # Redirect out-of-range rows to row zero; their accumulators are discarded
+    # by the masked output store.
+    offs_am_top = tl.where(offs_am < M, offs_am, 0)
+    offs_am_bot = offs_am + HALF_M
+    offs_am_bot = tl.where(offs_am_bot < M, offs_am_bot, 0)
+    a_top_off = offs_am_top[:, None] * stride_am + offs_k[None, :] * stride_ak
+    a_bot_off = offs_am_bot[:, None] * stride_am + offs_k[None, :] * stride_ak
+{% else %}
+    a_top_off = offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak
+    a_bot_off = a_top_off + HALF_M * stride_am
+{% endif %}
+    b_left_off = offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn
+    b_right_off = b_left_off + HALF_N * stride_bn
+
+    a_top_off_n = a_top_off + BLOCK_K * stride_ak
+    a_bot_off_n = a_bot_off + BLOCK_K * stride_ak
+    b_left_off_n = b_left_off + BLOCK_K * stride_bk
+    b_right_off_n = b_right_off + BLOCK_K * stride_bk
+
+    ka = tl.zeros([], dtype=tl.int32)
+    kb = tl.zeros([], dtype=tl.int32)
+
+    acc_tl = tl.zeros((HALF_M, HALF_N), dtype=ACC_TYPE)
+    acc_bl = tl.zeros((HALF_M, HALF_N), dtype=ACC_TYPE)
+    acc_tr = tl.zeros((HALF_M, HALF_N), dtype=ACC_TYPE)
+    acc_br = tl.zeros((HALF_M, HALF_N), dtype=ACC_TYPE)
+
+    n_full = K // BLOCK_K
+    n_pipe = (n_full // 2) * 2
+
+    tlx.buffer_load_to_local(smem_b_left[0], B, b_left_off + kb)
+    tlx.async_load_commit_group()
+    tlx.buffer_load_to_local(smem_a_top[0], A, a_top_off + ka)
+    tlx.async_load_commit_group()
+    tlx.buffer_load_to_local(smem_a_bot[0], A, a_bot_off + ka)
+    tlx.async_load_commit_group()
+    tlx.buffer_load_to_local(smem_b_right[0], B, b_right_off + kb)
+    tlx.async_load_commit_group()
+
+    tlx.buffer_load_to_local(smem_b_left[1], B, b_left_off_n + kb)
+    tlx.async_load_commit_group()
+    tlx.buffer_load_to_local(smem_a_top[1], A, a_top_off_n + ka)
+    tlx.async_load_commit_group()
+    tlx.buffer_load_to_local(smem_a_bot[1], A, a_bot_off_n + ka)
+    tlx.async_load_commit_group()
+    tlx.buffer_load_to_local(smem_b_right[1], B, b_right_off_n + kb)
+    tlx.async_load_commit_group()
+
+    ka += 2 * BLOCK_K * stride_ak
+    kb += 2 * BLOCK_K * stride_bk
+
+    tlx.async_load_wait_group(6)
+    b_left = tlx.local_load(smem_b_left[0], relaxed=True)
+    a_top = tlx.local_load(smem_a_top[0], relaxed=True)
+
+    # Triton TR011: make the dot precision/performance contract explicit.
+    for _k in tl.range(0, n_pipe - 2, 2, num_stages=1):
+        tlx.async_load_wait_group(5)
+        with tlx.warp_pipeline_stage("mfma", priority=0):
+            acc_tl = tl.dot(
+                a_top, b_left, acc_tl, allow_tf32=ALLOW_TF32, out_dtype=ACC_TYPE
+            )
+        with tlx.warp_pipeline_stage("mem", priority=1):
+            a_bot = tlx.local_load(smem_a_bot[0], relaxed=True)
+            tlx.buffer_load_to_local(smem_b_left[0], B, b_left_off + kb)
+            tlx.async_load_commit_group()
+
+        tlx.async_load_wait_group(5)
+        with tlx.warp_pipeline_stage("mfma", priority=0):
+            acc_bl = tl.dot(
+                a_bot, b_left, acc_bl, allow_tf32=ALLOW_TF32, out_dtype=ACC_TYPE
+            )
+        with tlx.warp_pipeline_stage("mem", priority=1):
+            b_right = tlx.local_load(smem_b_right[0], relaxed=True)
+            tlx.buffer_load_to_local(smem_a_top[0], A, a_top_off + ka)
+            tlx.async_load_commit_group()
+
+        tlx.async_load_wait_group(5)
+        with tlx.warp_pipeline_stage("mfma", priority=0):
+            acc_tr = tl.dot(
+                a_top, b_right, acc_tr, allow_tf32=ALLOW_TF32, out_dtype=ACC_TYPE
+            )
+        with tlx.warp_pipeline_stage("mem", priority=1):
+            b_left = tlx.local_load(smem_b_left[1], relaxed=True)
+            tlx.buffer_load_to_local(smem_a_bot[0], A, a_bot_off + ka)
+            tlx.async_load_commit_group()
+
+        tlx.async_load_wait_group(5)
+        with tlx.warp_pipeline_stage("mfma", priority=0):
+            acc_br = tl.dot(
+                a_bot, b_right, acc_br, allow_tf32=ALLOW_TF32, out_dtype=ACC_TYPE
+            )
+        with tlx.warp_pipeline_stage("mem", priority=1):
+            a_top = tlx.local_load(smem_a_top[1], relaxed=True)
+            tlx.buffer_load_to_local(smem_b_right[0], B, b_right_off + kb)
+            tlx.async_load_commit_group()
+
+        tlx.async_load_wait_group(5)
+        with tlx.warp_pipeline_stage("mfma", priority=0):
+            acc_tl = tl.dot(
+                a_top, b_left, acc_tl, allow_tf32=ALLOW_TF32, out_dtype=ACC_TYPE
+            )
+        with tlx.warp_pipeline_stage("mem", priority=1):
+            a_bot = tlx.local_load(smem_a_bot[1], relaxed=True)
+            tlx.buffer_load_to_local(smem_b_left[1], B, b_left_off_n + kb)
+            tlx.async_load_commit_group()
+
+        tlx.async_load_wait_group(5)
+        with tlx.warp_pipeline_stage("mfma", priority=0):
+            acc_bl = tl.dot(
+                a_bot, b_left, acc_bl, allow_tf32=ALLOW_TF32, out_dtype=ACC_TYPE
+            )
+        with tlx.warp_pipeline_stage("mem", priority=1):
+            b_right = tlx.local_load(smem_b_right[1], relaxed=True)
+            tlx.buffer_load_to_local(smem_a_top[1], A, a_top_off_n + ka)
+            tlx.async_load_commit_group()
+
+        tlx.async_load_wait_group(5)
+        with tlx.warp_pipeline_stage("mfma", priority=0):
+            acc_tr = tl.dot(
+                a_top, b_right, acc_tr, allow_tf32=ALLOW_TF32, out_dtype=ACC_TYPE
+            )
+        with tlx.warp_pipeline_stage("mem", priority=1):
+            b_left = tlx.local_load(smem_b_left[0], relaxed=True)
+            tlx.buffer_load_to_local(smem_a_bot[1], A, a_bot_off_n + ka)
+            tlx.async_load_commit_group()
+
+        tlx.async_load_wait_group(5)
+        with tlx.warp_pipeline_stage("mfma", priority=0):
+            acc_br = tl.dot(
+                a_bot, b_right, acc_br, allow_tf32=ALLOW_TF32, out_dtype=ACC_TYPE
+            )
+        with tlx.warp_pipeline_stage("mem", priority=1):
+            a_top = tlx.local_load(smem_a_top[0], relaxed=True)
+            tlx.buffer_load_to_local(smem_b_right[1], B, b_right_off_n + kb)
+            tlx.async_load_commit_group()
+            ka += 2 * BLOCK_K * stride_ak
+            kb += 2 * BLOCK_K * stride_bk
+
+    acc_tl = tl.dot(
+        a_top, b_left, acc_tl, allow_tf32=ALLOW_TF32, out_dtype=ACC_TYPE
+    )
+    tlx.async_load_wait_group(5)
+    a_bot = tlx.local_load(smem_a_bot[0], relaxed=True)
+
+    acc_bl = tl.dot(
+        a_bot, b_left, acc_bl, allow_tf32=ALLOW_TF32, out_dtype=ACC_TYPE
+    )
+    tlx.async_load_wait_group(4)
+    b_right = tlx.local_load(smem_b_right[0], relaxed=True)
+
+    acc_tr = tl.dot(
+        a_top, b_right, acc_tr, allow_tf32=ALLOW_TF32, out_dtype=ACC_TYPE
+    )
+    tlx.async_load_wait_group(3)
+    b_left = tlx.local_load(smem_b_left[1], relaxed=True)
+
+    acc_br = tl.dot(
+        a_bot, b_right, acc_br, allow_tf32=ALLOW_TF32, out_dtype=ACC_TYPE
+    )
+    tlx.async_load_wait_group(2)
+    a_top = tlx.local_load(smem_a_top[1], relaxed=True)
+
+    acc_tl = tl.dot(
+        a_top, b_left, acc_tl, allow_tf32=ALLOW_TF32, out_dtype=ACC_TYPE
+    )
+    tlx.async_load_wait_group(1)
+    a_bot = tlx.local_load(smem_a_bot[1], relaxed=True)
+
+    acc_bl = tl.dot(
+        a_bot, b_left, acc_bl, allow_tf32=ALLOW_TF32, out_dtype=ACC_TYPE
+    )
+    tlx.async_load_wait_group(0)
+    b_right = tlx.local_load(smem_b_right[1], relaxed=True)
+
+    acc_tr = tl.dot(
+        a_top, b_right, acc_tr, allow_tf32=ALLOW_TF32, out_dtype=ACC_TYPE
+    )
+    acc_br = tl.dot(
+        a_bot, b_right, acc_br, allow_tf32=ALLOW_TF32, out_dtype=ACC_TYPE
+    )
+
+    if HAS_REGISTER_TAIL:
+        offs_am_bot = offs_am + HALF_M
+        offs_bn_right = offs_bn + HALF_N
+        for kk in tl.range(n_pipe * BLOCK_K, K, BLOCK_K, num_stages=1):
+            offs_kt = kk + offs_k
+            k_mask = offs_kt < K
+            a_top_t = tl.load(
+                A + offs_am[:, None] * stride_am + offs_kt[None, :] * stride_ak,
+                mask=(offs_am[:, None] < M) & k_mask[None, :],
+                other=0.0,
+            )
+            a_bot_t = tl.load(
+                A
+                + offs_am_bot[:, None] * stride_am
+                + offs_kt[None, :] * stride_ak,
+                mask=(offs_am_bot[:, None] < M) & k_mask[None, :],
+                other=0.0,
+            )
+            b_left_t = tl.load(
+                B + offs_kt[:, None] * stride_bk + offs_bn[None, :] * stride_bn,
+                mask=k_mask[:, None] & (offs_bn[None, :] < N),
+                other=0.0,
+            )
+            b_right_t = tl.load(
+                B
+                + offs_kt[:, None] * stride_bk
+                + offs_bn_right[None, :] * stride_bn,
+                mask=k_mask[:, None] & (offs_bn_right[None, :] < N),
+                other=0.0,
+            )
+            acc_tl = tl.dot(
+                a_top_t,
+                b_left_t,
+                acc_tl,
+                allow_tf32=ALLOW_TF32,
+                out_dtype=ACC_TYPE,
+            )
+            acc_bl = tl.dot(
+                a_bot_t,
+                b_left_t,
+                acc_bl,
+                allow_tf32=ALLOW_TF32,
+                out_dtype=ACC_TYPE,
+            )
+            acc_tr = tl.dot(
+                a_top_t,
+                b_right_t,
+                acc_tr,
+                allow_tf32=ALLOW_TF32,
+                out_dtype=ACC_TYPE,
+            )
+            acc_br = tl.dot(
+                a_bot_t,
+                b_right_t,
+                acc_br,
+                allow_tf32=ALLOW_TF32,
+                out_dtype=ACC_TYPE,
+            )
+
+    rows_top = pid_m * BLOCK_M + tl.arange(0, HALF_M).to(tl.int32)
+    rows_bot = rows_top + HALF_M
+    cols_left = pid_n * BLOCK_N + tl.arange(0, HALF_N).to(tl.int32)
+    cols_right = cols_left + HALF_N
+    idx_m_top = rows_top[:, None]
+    idx_m_bot = rows_bot[:, None]
+    idx_n_left = cols_left[None, :]
+    idx_n_right = cols_right[None, :]
+
+    if HALF_M == 128 and HALF_N == 128:
+        c_layout: tl.constexpr = tlx.layout(
+            shape=((16, 4, 8), (8, 4)),
+            stride=((8, 128, 512), (1, 4096)),
+        )
+        acc_tl = tlx.require_layout(acc_tl, c_layout)
+        acc_bl = tlx.require_layout(acc_bl, c_layout)
+        acc_tr = tlx.require_layout(acc_tr, c_layout)
+        acc_br = tlx.require_layout(acc_br, c_layout)
+    mask_tl = (idx_m_top < M) & (idx_n_left < N)
+    mask_bl = (idx_m_bot < M) & (idx_n_left < N)
+    mask_tr = (idx_m_top < M) & (idx_n_right < N)
+    mask_br = (idx_m_bot < M) & (idx_n_right < N)
+
+    {{store_output(("idx_m_top", "idx_n_left"), "acc_tl", "mask_tl", val_shape=("HALF_M", "HALF_N"))}}
+    {{store_output(("idx_m_bot", "idx_n_left"), "acc_bl", "mask_bl", val_shape=("HALF_M", "HALF_N"))}}
+    {{store_output(("idx_m_top", "idx_n_right"), "acc_tr", "mask_tr", val_shape=("HALF_M", "HALF_N"))}}
+    {{store_output(("idx_m_bot", "idx_n_right"), "acc_br", "mask_br", val_shape=("HALF_M", "HALF_N"))}}
