@@ -3,18 +3,23 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable
 
+from .harness import HarnessExecutionError, SubprocessHarness
 from .models import (
     InputCase,
     KernelOptimizationRequest,
     KernelTarget,
     OptimizationBudget,
+    passes_protected_cases,
     to_json_value,
 )
 from .optimizer import KernelOptimizer
 from .providers import CodexCandidateProvider, MockLLMProvider
+from .vcs import commit_winner, failed_auto_commit, prepare_auto_commit
 
 
 def _load_json(path: Path) -> Any:
@@ -22,7 +27,7 @@ def _load_json(path: Path) -> Any:
         return json.load(stream)
 
 
-def _parse_args() -> argparse.Namespace:
+def _parse_args(arguments: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Optimize a Triton or TLX kernel with a deterministic harness."
     )
@@ -44,7 +49,27 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--min-speedup", type=float, default=1.01)
     parser.add_argument("--max-cv", type=float, default=0.10)
     parser.add_argument("--benchmark-repetitions", type=int, default=10)
-    parser.add_argument("--model", default="sonnet")
+    parser.add_argument("--model", default=None)
+    parser.add_argument(
+        "--commit-winner",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Commit a successfully revalidated winner to the kernel's repository "
+            "(default: enabled; use --no-commit-winner to disable)."
+        ),
+    )
+    parser.add_argument(
+        "--commit-message",
+        default=None,
+        help="Commit subject; the TLX agent attribution is always added to the body.",
+    )
+    parser.add_argument(
+        "--vcs",
+        choices=["auto", "git", "hg"],
+        default="auto",
+        help="Version control for --commit-winner; auto detects from --kernel.",
+    )
     parser.add_argument(
         "--provider",
         choices=["codex", "mock"],
@@ -63,12 +88,21 @@ def _parse_args() -> argparse.Namespace:
         help="Collect harness profile() for baseline and candidates (default: profile is always collected).",
     )
     parser.add_argument(
+        "--diagnostic-proton-intra-kernel",
+        action="store_true",
+        default=False,
+        help=(
+            "Collect diagnostic-only per-warp proton_intra_kernel traces for the "
+            "baseline and final winner only."
+        ),
+    )
+    parser.add_argument(
         "--budget",
         type=Path,
         default=None,
         help="Optional JSON file that overrides --max-* / --min-speedup / --max-cv flags.",
     )
-    return parser.parse_args()
+    return parser.parse_args(arguments)
 
 
 def _budget_from_args(args: argparse.Namespace) -> OptimizationBudget:
@@ -190,6 +224,27 @@ def _validate_host_matches_target(
         )
 
 
+def _report_commit(commit_result: object) -> None:
+    result = commit_result
+    parts = [
+        "[tlx-agent] commit",
+        f"status={'committed' if result.success else 'failed'}",
+        f"vcs={result.vcs or 'unknown'}",
+    ]
+    if result.commit_revision:
+        parts.append(f"id={result.commit_revision}")
+    if result.repo_root:
+        parts.append(f"repo={result.repo_root}")
+    if result.target_relpath:
+        parts.append(f"file={result.target_relpath}")
+    if result.subject:
+        parts.append(f"subject={json.dumps(result.subject)}")
+    parts.append(f"attribution={json.dumps(result.attribution)}")
+    if result.diagnostics:
+        parts.append(f"diagnostics={json.dumps(result.diagnostics)}")
+    print(" ".join(parts), file=sys.stderr, flush=True)
+
+
 def main() -> int:
     args = _parse_args()
     harness_path, cases_path, target_path = _resolve_harness_paths(args.kernel, args.harness, args.cases, args.target, args.arch)
@@ -209,6 +264,7 @@ def main() -> int:
         architecture=str(target_payload["architecture"]),
         device=target_payload.get("device"),
         environment=target_payload.get("environment", {}),
+        optimization_guidance=str(target_payload.get("optimization_guidance", "")),
     )
     _validate_host_matches_target(target, args.arch)
     budget = _budget_from_args(args)
@@ -230,19 +286,70 @@ def main() -> int:
             model=args.model, timeout_seconds=budget.max_candidate_seconds
         )
     )
+    kernel_path = args.kernel.resolve()
+    kernel_source = kernel_path.read_text()
+    commit_subject = args.commit_message or f"Optimize {kernel_path.name} with TLX agent"
+    commit_snapshot = None
+    if args.commit_winner:
+        try:
+            commit_snapshot = prepare_auto_commit(kernel_path, kernel_source, args.vcs)
+        except Exception as error:  # noqa: BLE001
+            commit_result = failed_auto_commit(None, commit_subject, error)
+            _report_commit(commit_result)
+            print(json.dumps(to_json_value(commit_result), indent=2, sort_keys=True))
+            return 3
     reference_source = args.reference_kernel.read_text() if args.reference_kernel else None
     request = KernelOptimizationRequest(
-        kernel_source=args.kernel.read_text(),
+        kernel_source=kernel_source,
         reference_kernel_source=reference_source,
         harness_path=harness_path,
         cases=cases,
         target=target,
         budget=budget,
         output_dir=args.output_dir,
+        diagnostic_proton_intra_kernel=args.diagnostic_proton_intra_kernel,
     )
     result = KernelOptimizer(provider).optimize(request)
+    exit_code = 0 if result.success else 2
+    if args.commit_winner and result.success:
+        assert commit_snapshot is not None
+
+        def validate_committed_source(committed_source: str) -> None:
+            harness = SubprocessHarness(harness_path, budget.max_candidate_seconds)
+            validation = harness.evaluate(
+                committed_source,
+                cases,
+                target,
+                budget.benchmark_repetitions,
+            )
+            args.output_dir.joinpath("commit_revalidation.json").write_text(
+                json.dumps(to_json_value(validation), indent=2, sort_keys=True) + "\n"
+            )
+            if not passes_protected_cases(validation, cases):
+                raise HarnessExecutionError(
+                    "merged commit source failed one or more protected correctness cases"
+                )
+
+        try:
+            commit_result = commit_winner(
+                commit_snapshot,
+                result.best_kernel,
+                commit_subject,
+                validate_committed_source=validate_committed_source,
+            )
+        except Exception as error:  # noqa: BLE001
+            commit_result = failed_auto_commit(commit_snapshot, commit_subject, error)
+            exit_code = 3
+        result = replace(result, auto_commit=commit_result)
+        _report_commit(commit_result)
+        args.output_dir.joinpath("auto_commit.json").write_text(
+            json.dumps(to_json_value(commit_result), indent=2, sort_keys=True) + "\n"
+        )
+        args.output_dir.joinpath("result.json").write_text(
+            json.dumps(to_json_value(result), indent=2, sort_keys=True) + "\n"
+        )
     print(json.dumps(to_json_value(result), indent=2, sort_keys=True))
-    return 0 if result.success else 2
+    return exit_code
 
 
 if __name__ == "__main__":

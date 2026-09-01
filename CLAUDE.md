@@ -83,5 +83,3 @@ changes. Instead, if the PR is large, explain the order to review changes
 entirely.
 
 Don't overwrite existing commits.
-
-Disclose that the PR was authored with Claude.

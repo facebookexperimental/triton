@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Harness-driven optimization for Triton and TLX kernels.">
+  <title>TLX Agent · FBTriton</title>
+  <link rel="stylesheet" href="assets/tlx.css?v=20260824c">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="../"><span>FBTriton</span></a>
+    <nav class="topnav" aria-label="Top-level sections"><a href="triton.html">Triton</a>
+<a href="tlx.html">TLX</a>
+<a href="tlx-ops.html">tlx.ops</a>
+<a href="torchtlx.html">TorchTLX</a>
+<a href="ci.html">CI</a>
+<a href="tooling.html" data-current="true">Tooling</a></nav>
+    <a class="repo-link" href="https://github.com/facebookexperimental/triton" target="_blank" rel="noreferrer">View on GitHub ↗</a>
+  </header>
+  <div class="shell">
+<aside class="sidebar">
+      <p class="eyebrow">Developer tooling</p>
+      <nav><a href="tooling.html">Overview</a>
+<a href="tlx-agent.html" aria-current="page">TLX Agent</a>
+<a class="sub" href="#when-to-use-it">When to use it</a>
+<a class="sub" href="#recommended-run-through-a-coding-agent">Recommended: run through a coding agent</a>
+<a class="sub" href="#input-contract">Input contract</a>
+<a class="sub" href="#prepare-and-freeze-the-target-bundle">Prepare and freeze the target bundle</a>
+<a class="sub" href="#run-the-cli">Run the CLI</a>
+<a class="sub" href="#optimization-loop">Optimization loop</a>
+<a class="sub" href="#live-log-and-artifacts">Live log and artifacts</a>
+<a class="sub" href="#profiling">Profiling</a>
+<a class="sub" href="#promotion-and-final-validation">Promotion and final validation</a>
+<a class="sub" href="#version-control-behavior">Version-control behavior</a></nav>
+    </aside>
+    <main>
+      <p class="eyebrow">Developer tooling</p>
+      <h1>TLX Agent</h1>
+      <p class="lede">Harness-driven optimization for Triton and TLX kernels.</p>
+      <article><p>TLX Agent is a harness-driven optimization loop for complete Triton and TLX kernel source files. It turns a fixed workload and a trusted measurement contract into isolated candidate experiments, then promotes only a correct, measured, and revalidated winner.</p>
+<blockquote><p>The harness owns truth. TLX Agent does not invent correctness criteria or change the benchmark while it searches.</p></blockquote>
+<h2 id="when-to-use-it">When to use it</h2>
+<p>Use TLX Agent when you have an existing kernel and a concrete workload to optimize. A request can start through a higher-level coding agent or by invoking the public CLI directly.</p>
+<p>You provide the kernel path, target workload, hardware, and optional search budget. If an exact target bundle does not already exist, the higher-level agent prepares and validates one before the optimization loop starts.</p>
+<h2 id="recommended-run-through-a-coding-agent">Recommended: run through a coding agent</h2>
+<p>The recommended entry point is a coding agent that can inspect the repository, prepare the measurement contract, and supervise the run. Ask it to use the TLX kernel optimization agent rather than asking it to optimize the kernel manually.</p>
+<p>For example:</p>
+<pre><code class="language-text">Use the TLX kernel optimization agent to optimize
+&lt;absolute-kernel-path&gt; for BATCH=4, H=32, N_CTX=8192,
+HEAD_DIM=128, causal=false, mode=bwd on B200.
+Use the repository&#x27;s authoritative correctness and performance tests,
+return the live-log path when the run starts, and report the validated winner.</code></pre>
+<p>The coding agent should then:</p>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div>Read the bundled TLX Agent Skill and translate the request into the public CLI contract.</div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div>Find or prepare the exact target bundle, validate and negative-test it, then freeze it for the run.</div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div>Launch the public CLI instead of manually reproducing the optimization loop.</div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div>Return the absolute live-log path as soon as the run starts so progress is observable.</div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div>Monitor failures and requirements outside the frozen contract while TLX Agent owns candidate generation, profiling, correctness gates, promotion, and the winner commit.</div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div>Report the final workload, baseline and winner latency, speedup, variance, correctness, artifacts, and commit result.</div></div>
+<p>This route is preferred because the coding agent handles repository-specific setup and recovery while the TLX Agent retains one consistent, measurable optimization policy. Direct CLI use remains available when you already have a validated frozen bundle.</p>
+<h2 id="input-contract">Input contract</h2>
+<table><thead><tr><th>Input</th><th>Purpose</th></tr></thead><tbody><tr><td><code>kernel.py</code></td><td>Complete source file under optimization</td></tr><tr><td><code>harness.py</code></td><td>Builds, verifies, benchmarks, and optionally profiles a candidate</td></tr><tr><td><code>cases.json</code></td><td>Workloads, weights, and protected correctness cases</td></tr><tr><td><code>target.json</code></td><td>Backend, architecture, device, environment, and target-specific guidance</td></tr><tr><td><code>reference_kernel.py</code></td><td>Optional trusted correctness oracle</td></tr><tr><td><code>budget.json</code></td><td>Optional round, timeout, speedup, variance, and repetition limits</td></tr><tr><td><code>output/</code></td><td>Fresh directory for logs, candidates, profiles, and final results</td></tr></tbody></table>
+<p>The harness exposes four operations:</p>
+<pre><code class="language-python">def build(kernel_source: str, target: dict): ...
+def verify(build_artifact, case: dict): ...
+def benchmark(build_artifact, case: dict, repetitions: int): ...
+def profile(build_artifact, case: dict, request: dict | None = None): ...</code></pre>
+<p><code>profile</code> is optional. The other operations form the correctness and performance boundary for every experiment.</p>
+<h2 id="prepare-and-freeze-the-target-bundle">Prepare and freeze the target bundle</h2>
+<p>The higher-level coding agent owns target-bundle preparation. It should:</p>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div>Find an existing bundle that exactly matches the kernel entry point, workload, mode, backend, and architecture, or derive one from the authoritative correctness test and production benchmark.</div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div>Run the untouched kernel through build, verification, repeated benchmarking, and summary profiling.</div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div>Confirm that an invalid candidate fails to build and an incorrect but compilable candidate fails verification.</div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div>Put kernel-specific invariants, known failed experiments, and profiler-to-knob guidance in <code>target.json</code> as <code>optimization_guidance</code>.</div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div>Record absolute paths and content hashes, then freeze <code>harness.py</code>, <code>cases.json</code>, and <code>target.json</code> for the duration of the run.</div></div>
+<p>Candidate generation must not edit the frozen bundle. This prevents the search from improving its score by weakening correctness or changing the workload.</p>
+<h2 id="run-the-cli">Run the CLI</h2>
+<p>From the repository root:</p>
+<pre><code class="language-bash">PYTHONPATH=&lt;repo-root&gt; python -m third_party.tlx.tools.agents.kernel_optimization.cli \
+  --kernel &lt;absolute-kernel.py&gt; \
+  --harness &lt;absolute-bundle/harness.py&gt; \
+  --cases &lt;absolute-bundle/cases.json&gt; \
+  --target &lt;absolute-bundle/target.json&gt; \
+  --output-dir &lt;absolute-output-dir&gt; \
+  --provider codex \
+  --max-rounds 5 \
+  --candidates-per-round 2 \
+  --max-candidate-seconds 600 \
+  --max-total-seconds 3600 \
+  --min-speedup 1.01 \
+  --max-cv 0.10 \
+  --benchmark-repetitions 10</code></pre>
+<p>Add <code>--reference-kernel</code>, <code>--budget</code>, <code>--arch</code>, or <code>--model</code> only when the run requires them. Winner commits are enabled by default; use <code>--no-commit-winner</code> for an artifact-only run.</p>
+<h2 id="optimization-loop">Optimization loop</h2>
+<p>Every candidate follows the same closed loop:</p>
+<pre><code class="language-text">build -&gt; verify -&gt; benchmark -&gt; profile -&gt; decide -&gt; repeat</code></pre>
+<p>TLX Agent keeps candidate generation outside the live checkout. Each proposal changes one measured subsystem and records its hypothesis, evidence, expected effect, and risk. Incorrect, duplicate, unstable, and materially slower candidates are rejected. Failed hypotheses and hardware evidence feed the next round instead of being silently retried.</p>
+<p>The current best candidate receives stronger profiling and final revalidation before it can replace the original source.</p>
+<h2 id="live-log-and-artifacts">Live log and artifacts</h2>
+<p>Progress is written to stderr so it can be tee'd to a stable live-log path. The final structured result is written to stdout and the output directory.</p>
+<p>The live log reports:</p>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div>Baseline, candidate, promotion, rejection, and final-validation status.</div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div>The candidate hypothesis, evidence, change, expected effect, and risk.</div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div>Per-case correctness, median, p95, coefficient of variation, and speedup.</div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div>Compact Proton and target-profiler evidence when available.</div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div>Winner-commit status and diagnostics.</div></div>
+<p>Full kernel source is not printed in the live log. Candidate source, raw profiler reports, commands, normalized summaries, and the final winner remain in the artifact directory for inspection.</p>
+<h2 id="profiling">Profiling</h2>
+<p>Profiling is staged so expensive evidence is collected where it can change a decision:</p>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div>Proton attributes wrapper, launch, main-kernel, and non-main-kernel time.</div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div>NVIDIA NCU summary and deep profiles expose duration, throughput, occupancy, registers, memory traffic, tensor activity, and stall metrics.</div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div>Optional per-warp Proton instrumentation can answer intra-kernel attribution questions for warp-specialized pipelines.</div></div>
+<p>An ordinary Proton launch timeline does not prove that <code>tlx.async_task</code> regions overlap. Per-warp instrumentation must select aligned logical work across task warps, and the instrumented source is diagnostic-only: it is never benchmarked, promoted, or committed.</p>
+<h2 id="promotion-and-final-validation">Promotion and final validation</h2>
+<p>A candidate is promotable only when every protected case passes, weighted speedup reaches the configured threshold, variance stays within budget, and hardware profiling shows no material main-kernel regression. It must also beat the current best candidate.</p>
+<p>The finalist is rebuilt and revalidated with the frozen bundle. A generated <code>best_kernel.py</code> without final revalidation is not a completed run.</p>
+<h2 id="version-control-behavior">Version-control behavior</h2>
+<p>After successful final validation, TLX Agent creates a local winner commit by default. It detects Git or Mercurial from the kernel path, commits only the baseline-to-winner delta, preserves unrelated staged and dirty work, and adds <code>TLX agent authored</code> to the commit body.</p>
+<p>If the live kernel changed during the run or edits overlap unsafely, the Agent keeps the winner artifact and reports a commit failure instead of overwriting user work. Submitting, landing, or pushing the commit is always a separate explicit action.</p></article>
+<footer class="pager"><a href="tooling.html">← Tooling</a></footer>
+    </main>
+  </div>
+</body>
+</html>

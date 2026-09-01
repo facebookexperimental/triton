@@ -132,8 +132,15 @@ TOOLING_PAGE = Page(
     "Tools for tracing, profiling, validating, and benchmarking Triton kernels.",
     "tooling",
 )
+TLX_AGENT_PAGE = Page(
+    "tlx-agent",
+    "TLX Agent",
+    "Harness-driven optimization for Triton and TLX kernels.",
+    "tooling",
+)
 
 TRITON_PAGES = (TRITON_PAGE, COMPILER_PAGE)
+TOOLING_PAGES = (TOOLING_PAGE, TLX_AGENT_PAGE)
 
 SECTIONS = {
     "triton": TRITON_PAGES,
@@ -141,7 +148,7 @@ SECTIONS = {
     "tlx-ops": (TLX_OPS_PAGE,),
     "torchtlx": (TORCHTLX_PAGE,),
     "ci": (CI_PAGE,),
-    "tooling": (TOOLING_PAGE,),
+    "tooling": TOOLING_PAGES,
 }
 SECTION_PAGES = tuple(pages[0] for pages in SECTIONS.values())
 SECTION_LABELS = {
@@ -152,7 +159,15 @@ SECTION_LABELS = {
     "ci": "CI",
     "tooling": "Tooling",
 }
-PAGES = (HOME_PAGE, *TRITON_PAGES, *TLX_PAGES, TLX_OPS_PAGE, TORCHTLX_PAGE, CI_PAGE, TOOLING_PAGE)
+PAGES = (
+    HOME_PAGE,
+    *TRITON_PAGES,
+    *TLX_PAGES,
+    TLX_OPS_PAGE,
+    TORCHTLX_PAGE,
+    CI_PAGE,
+    *TOOLING_PAGES,
+)
 
 def page_source(page: Page) -> str:
     """Read a page body from website/content/, falling back to guide_content."""
