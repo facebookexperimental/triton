@@ -434,7 +434,13 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.thr
 #half_register_lhs = #ttg.dot_op<{opIdx = 0, parent = #half_register_mma, kWidth = 8}>
 
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.target" = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
-  tt.func @mfma_commit_rejects_partial_register_fragment(
+  // The dependency's encoding is checked for a native instruction shape before
+  // its per-lane fragment is sized. That ordering makes the "positive integral
+  // number of 32-bit registers" diagnostic below unreachable for BF16/F16:
+  // a native version-4 shape always yields 8 elements per lane (128 bits), and
+  // the odd counts that would trip it need K in {4, 12, 20, ...}, which the
+  // shape check rejects first. Pin the diagnostic that actually fires.
+  tt.func @mfma_commit_rejects_non_native_dependency_shape(
       %a: tensor<16x32xbf16, #scheduled_lhs>,
       %b: tensor<32x16xbf16, #scheduled_rhs>,
       %dependency: tensor<16x4xbf16, #half_register_lhs>) {
@@ -447,7 +453,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.tar
           tensor<32x16xbf16, #scheduled_rhs>,
           tensor<16x16xf32, #scheduled_mma>
           -> tensor<16x16xf32, #scheduled_mma>
-    // expected-error @+1 {{input 1 native dot fragment must occupy a positive integral number of 32-bit registers}}
+    // expected-error @+1 {{input 1 MFMA encoding version 4 supports only its native 32x32x16 and 16x16x32 shapes}}
     %committed, %preserved = amdg.mfma_commit %result, %dependency
         : tensor<16x16xf32, #scheduled_mma>,
           tensor<16x4xbf16, #half_register_lhs>
@@ -979,6 +985,162 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
   ) {
     // expected-error @+1 {{is inconsistent with the shared memory allocation layout}}
     %token = amdg.async_tdm_copy_global_to_local %tensorDesc into %memDesc : !tt.tensordesc<64x64xf16, #load_desc> -> !ttg.memdesc<64x64xf16, #load_alloc, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+#v4_on_gfx942_mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [1, 1], instrShape = [16, 16, 32], isTransposed = true}>
+#v4_on_gfx942_lhs = #ttg.dot_op<{opIdx = 0, parent = #v4_on_gfx942_mma, kWidth = 8}>
+#v4_on_gfx942_rhs = #ttg.dot_op<{opIdx = 1, parent = #v4_on_gfx942_mma, kWidth = 8}>
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.target" = "hip:gfx942", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @mfma_commit_rejects_cdna4_encoding_on_cdna3_target(
+      %result: tensor<16x16xf32, #v4_on_gfx942_mma>,
+      %dependency: tensor<32x16xbf16, #v4_on_gfx942_rhs>) {
+    // expected-error @+1 {{input 0 uses MFMA version 4, but the target requires version 3}}
+    %committed, %preserved = amdg.mfma_commit %result, %dependency
+        : tensor<16x16xf32, #v4_on_gfx942_mma>,
+          tensor<32x16xbf16, #v4_on_gfx942_rhs>
+    tt.return
+  }
+}
+
+// -----
+
+// No ttg.target: the encoding version alone must still gate the native shape.
+#untargeted_mma = #ttg.amd_mfma<{version = 3, warpsPerCTA = [1, 1], instrShape = [16, 16, 32], isTransposed = true}>
+#untargeted_lhs = #ttg.dot_op<{opIdx = 0, parent = #untargeted_mma, kWidth = 4}>
+#untargeted_rhs = #ttg.dot_op<{opIdx = 1, parent = #untargeted_mma, kWidth = 4}>
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @scheduled_mfma_rejects_cdna4_shape_on_v3_encoding(
+      %a: tensor<16x32xbf16, #untargeted_lhs>,
+      %b: tensor<32x16xbf16, #untargeted_rhs>) {
+    %acc = arith.constant dense<0.000000e+00> :
+        tensor<16x16xf32, #untargeted_mma>
+    // expected-error @+1 {{MFMA encoding version 3 supports only its native 32x32x8 and 16x16x16 shapes}}
+    %result = amdg.scheduled_mfma %a, %b, %acc
+        resident "none" accumulator "transient"
+        register_class "auto" initialize true
+        : tensor<16x32xbf16, #untargeted_lhs>,
+          tensor<32x16xbf16, #untargeted_rhs>,
+          tensor<16x16xf32, #untargeted_mma>
+          -> tensor<16x16xf32, #untargeted_mma>
+    tt.return
+  }
+}
+
+// -----
+
+#v3_on_gfx950_mma = #ttg.amd_mfma<{version = 3, warpsPerCTA = [1, 1], instrShape = [16, 16, 16], isTransposed = true}>
+#v3_on_gfx950_lhs = #ttg.dot_op<{opIdx = 0, parent = #v3_on_gfx950_mma, kWidth = 4}>
+#v3_on_gfx950_rhs = #ttg.dot_op<{opIdx = 1, parent = #v3_on_gfx950_mma, kWidth = 4}>
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.target" = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @scheduled_mfma_rejects_cdna3_encoding_on_cdna4_target(
+      %a: tensor<16x16xbf16, #v3_on_gfx950_lhs>,
+      %b: tensor<16x16xbf16, #v3_on_gfx950_rhs>) {
+    %acc = arith.constant dense<0.000000e+00> :
+        tensor<16x16xf32, #v3_on_gfx950_mma>
+    // expected-error @+1 {{uses MFMA version 3, but the target requires version 4}}
+    %result = amdg.scheduled_mfma %a, %b, %acc
+        resident "none" accumulator "transient"
+        register_class "auto" initialize true
+        : tensor<16x16xbf16, #v3_on_gfx950_lhs>,
+          tensor<16x16xbf16, #v3_on_gfx950_rhs>,
+          tensor<16x16xf32, #v3_on_gfx950_mma>
+          -> tensor<16x16xf32, #v3_on_gfx950_mma>
+    tt.return
+  }
+}
+
+// -----
+
+// The commit boundary derives its hazard wait from the shape triple, so a
+// shape the encoding version does not have must be rejected rather than
+// silently treated as the version's other native shape.
+#nonnative_result_mma = #ttg.amd_mfma<{version = 3, warpsPerCTA = [1, 1], instrShape = [32, 32, 16], isTransposed = true}>
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.target" = "hip:gfx942", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @mfma_commit_rejects_cdna4_shape_on_v3_result(
+      %result: tensor<32x32xf32, #nonnative_result_mma>) {
+    // expected-error @+1 {{input 0 MFMA encoding version 3 supports only its native 32x32x8 and 16x16x16 shapes}}
+    %committed = amdg.mfma_commit %result
+        : tensor<32x32xf32, #nonnative_result_mma>
+    tt.return
+  }
+}
+
+// -----
+
+#native_result_mma = #ttg.amd_mfma<{version = 3, warpsPerCTA = [1, 1], instrShape = [16, 16, 16], isTransposed = true}>
+#nonnative_dep_mma = #ttg.amd_mfma<{version = 3, warpsPerCTA = [1, 1], instrShape = [16, 16, 32], isTransposed = true}>
+#nonnative_dep_rhs = #ttg.dot_op<{opIdx = 1, parent = #nonnative_dep_mma, kWidth = 4}>
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.target" = "hip:gfx942", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @mfma_commit_rejects_cdna4_shape_on_v3_dependency(
+      %result: tensor<16x16xf32, #native_result_mma>,
+      %dependency: tensor<32x16xbf16, #nonnative_dep_rhs>) {
+    // expected-error @+1 {{input 1 MFMA encoding version 3 supports only its native 32x32x8 and 16x16x16 shapes}}
+    %committed, %preserved = amdg.mfma_commit %result, %dependency
+        : tensor<16x16xf32, #native_result_mma>,
+          tensor<32x16xbf16, #nonnative_dep_rhs>
+    tt.return
+  }
+}
+
+// -----
+
+// An AGPR-resident accumulator is read back with a compiler-generated
+// v_accvgpr_read that CDNA3's inline-assembly hazard padding cannot order
+// against the MFMA drain, so the explicit class is rejected on that target.
+#agpr_cdna3_mma = #ttg.amd_mfma<{version = 3, warpsPerCTA = [1, 1], instrShape = [16, 16, 16], isTransposed = true}>
+#agpr_cdna3_lhs = #ttg.dot_op<{opIdx = 0, parent = #agpr_cdna3_mma, kWidth = 4}>
+#agpr_cdna3_rhs = #ttg.dot_op<{opIdx = 1, parent = #agpr_cdna3_mma, kWidth = 4}>
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.target" = "hip:gfx942", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @scheduled_mfma_rejects_explicit_agpr_on_cdna3(
+      %a: tensor<16x16xbf16, #agpr_cdna3_lhs>,
+      %b: tensor<16x16xbf16, #agpr_cdna3_rhs>) {
+    %acc = arith.constant dense<0.000000e+00> :
+        tensor<16x16xf32, #agpr_cdna3_mma>
+    // expected-error @+1 {{accumulator_register_class "agpr" is not yet supported on CDNA3}}
+    %result = amdg.scheduled_mfma %a, %b, %acc
+        resident "none" accumulator "persistent"
+        register_class "agpr" initialize true
+        : tensor<16x16xbf16, #agpr_cdna3_lhs>,
+          tensor<16x16xbf16, #agpr_cdna3_rhs>,
+          tensor<16x16xf32, #agpr_cdna3_mma>
+          -> tensor<16x16xf32, #agpr_cdna3_mma>
+    tt.return
+  }
+}
+
+// -----
+
+// "auto" names AGPRs for a persistent accumulator, so CDNA3 rejects it too.
+// Such kernels must request "vgpr" instead of "auto" meaning a different class
+// than it does on CDNA4.
+#auto_cdna3_mma = #ttg.amd_mfma<{version = 3, warpsPerCTA = [1, 1], instrShape = [16, 16, 16], isTransposed = true}>
+#auto_cdna3_lhs = #ttg.dot_op<{opIdx = 0, parent = #auto_cdna3_mma, kWidth = 4}>
+#auto_cdna3_rhs = #ttg.dot_op<{opIdx = 1, parent = #auto_cdna3_mma, kWidth = 4}>
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.target" = "hip:gfx942", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @scheduled_mfma_rejects_persistent_auto_on_cdna3(
+      %a: tensor<16x16xbf16, #auto_cdna3_lhs>,
+      %b: tensor<16x16xbf16, #auto_cdna3_rhs>) {
+    %acc = arith.constant dense<0.000000e+00> :
+        tensor<16x16xf32, #auto_cdna3_mma>
+    // expected-error @+1 {{accumulator_register_class "auto" is not yet supported on CDNA3 for a "persistent" accumulator}}
+    %result = amdg.scheduled_mfma %a, %b, %acc
+        resident "none" accumulator "persistent"
+        register_class "auto" initialize true
+        : tensor<16x16xbf16, #auto_cdna3_lhs>,
+          tensor<16x16xbf16, #auto_cdna3_rhs>,
+          tensor<16x16xf32, #auto_cdna3_mma>
+          -> tensor<16x16xf32, #auto_cdna3_mma>
     tt.return
   }
 }
