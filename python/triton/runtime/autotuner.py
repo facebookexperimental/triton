@@ -427,6 +427,11 @@ class Autotuner(KernelInterface):
         return self._do_bench
 
     def _make_entropy_benchmarker(self):
+        # CUDA may be visible while autotuning a CPU kernel. CUDA events do not
+        # measure synchronous CPU launches, so use the CPU driver's benchmarker.
+        if getattr(driver.active, "is_cpu_backend", False) is True:
+            return None
+
         import torch
 
         if not torch.cuda.is_available():
