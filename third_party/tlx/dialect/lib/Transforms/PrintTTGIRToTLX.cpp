@@ -657,6 +657,10 @@ std::string getElementTypeName(Type type) {
 struct LocalAllocInfo {
   bool isBarrierAlloc = false;
   int barrierCount = 0;
+  // Arrive count of the barrier (init_barrier's `count`); default 1.
+  int arriveCount = 1;
+  // Set when the slots disagree on arrive count, which has no TLX spelling.
+  bool conflictingArriveCounts = false;
   // For regular allocs: shape (excluding first dim which is count),
   // element type, count
   SmallVector<int64_t> shape;
@@ -684,12 +688,35 @@ LocalAllocInfo analyzeLocalAlloc(Operation *localAllocOp) {
     bool foundInitBarrier = false;
     int initBarrierCount = 0;
 
+    // One allocation emits one alloc call, so its slots must agree on the
+    // arrive count; there is no TLX spelling for a per-slot count.
+    auto recordArriveCount = [&](Operation *initOp) {
+      auto cAttr = initOp->getAttrOfType<IntegerAttr>("count");
+      if (!cAttr)
+        return;
+      if (foundInitBarrier && cAttr.getInt() != info.arriveCount) {
+        localAllocOp->emitError("barrier slots with differing arrive counts do "
+                                "not round-trip to TLX");
+        info.conflictingArriveCounts = true;
+      }
+      info.arriveCount = cAttr.getInt();
+    };
+
     for (Operation *user : allocResult.getUsers()) {
-      if (user->getName().getStringRef() == "ttg.memdesc_index") {
+      StringRef userName = user->getName().getStringRef();
+      // Single-slot barrier, used directly with no memdesc_index.
+      if (userName == "ttng.init_barrier") {
+        recordArriveCount(user);
+        foundInitBarrier = true;
+        initBarrierCount++;
+        continue;
+      }
+      if (userName == "ttg.memdesc_index") {
         // Check if memdesc_index result is used by init_barrier
         for (Value result : user->getResults()) {
           for (Operation *indexUser : result.getUsers()) {
             if (indexUser->getName().getStringRef() == "ttng.init_barrier") {
+              recordArriveCount(indexUser);
               foundInitBarrier = true;
               initBarrierCount++;
             }
@@ -1368,12 +1395,30 @@ void printSimplifiedOp(
     auto it = allocInfoMap.find(op);
     if (it != allocInfoMap.end()) {
       const LocalAllocInfo &info = it->second;
+      if (info.isBarrierAlloc && info.conflictingArriveCounts) {
+        // Any single count here would be wrong for the other slots.
+        os << "# unsupported: barrier slots with differing arrive counts";
+        printLocComment(op, os);
+        return;
+      }
       if (info.isBarrierAlloc) {
         // Print as result = tlx.alloc_barriers(count)
         if (op->getNumResults() > 0) {
           os << getValueName(op->getResult(0), argSubstitutionMap) << " = ";
         }
-        os << "tlx.alloc_barriers(" << info.barrierCount << ")";
+        // An arrive count that is a positive multiple of the warp size is a
+        // warp barrier: every thread arrives, rather than one leader per warp.
+        ModuleOp mod = op->getParentOfType<ModuleOp>();
+        int warpSize = mod ? ttg::TritonGPUDialect::getThreadsPerWarp(mod) : 32;
+        if (info.arriveCount >= warpSize && info.arriveCount % warpSize == 0) {
+          os << "tlx.alloc_warp_barrier(" << info.barrierCount << ", "
+             << (info.arriveCount / warpSize) << ")";
+        } else if (info.arriveCount != 1) {
+          os << "tlx.alloc_barriers(" << info.barrierCount << ", "
+             << info.arriveCount << ")";
+        } else {
+          os << "tlx.alloc_barriers(" << info.barrierCount << ")";
+        }
         printLocComment(op, os);
         return;
       } else {
@@ -2816,6 +2861,15 @@ public:
   void runOnOperation() override {
     ModuleOp m = getOperation();
 
+    // Ops the printer cannot represent report a diagnostic. Count those so the
+    // pass fails, rather than handing back a silently incomplete kernel.
+    unsigned numErrors = 0;
+    ScopedDiagnosticHandler countErrors(m.getContext(), [&](Diagnostic &diag) {
+      if (diag.getSeverity() == DiagnosticSeverity::Error)
+        ++numErrors;
+      return failure();
+    });
+
     // Build the lookup map
     static llvm::StringMap<StringRef> opNameMap = buildOpNameMap();
 
@@ -2870,6 +2924,8 @@ public:
     }
 
     valueNameCacheStorage = nullptr;
+    if (numErrors > 0)
+      signalPassFailure();
   }
 };
 
