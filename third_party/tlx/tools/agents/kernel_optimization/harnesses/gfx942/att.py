@@ -24,9 +24,8 @@ select a compatible driver when the system default is older than the runtime.
 When ATT is absent -- or advertised but broken at run time -- :func:`collect`
 degrades to counters rather than failing the optimization round.
 
-Traces are written under ``output_dir`` and are **not** cleaned up: they are the
-evidence behind a promotion decision, and a run's worth of them is large. Point
-``TLX_ATT_OUTPUT_ROOT`` somewhere with room, and prune it between runs.
+Traces under ``output_dir`` are never cleaned up (they are promotion evidence) and
+are large. Point ``TLX_ATT_OUTPUT_ROOT`` somewhere with room and prune between runs.
 """
 
 from __future__ import annotations
@@ -152,10 +151,9 @@ def collect(
 ) -> dict[str, Any]:
     """Trace one dispatch of ``kernel_path`` and return a compact summary.
 
-    Falls back to counter collection when ATT is unavailable *or* when the ATT
-    run itself fails -- a driver can advertise ``--att`` and still have no usable
-    decoder -- and reports which mode ran so a reader never mistakes counters for
-    a thread trace.
+    Falls back to counters when ATT is unavailable or when the ATT run fails -- a
+    driver can advertise ``--att`` and still lack a usable decoder. Reports which
+    mode ran, so counters are never mistaken for a thread trace.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
     cap = capability()
@@ -225,9 +223,8 @@ def _run(
             "0xF",  # gfx9 default: all four SIMDs
             "--kernel-include-regex",
             kernel_regex,
-            # One dispatch only. The target resolves to a single autotuner
-            # config, so each call is one dispatch and (warmup + 1) is the
-            # steady-state one. See att_child's docstring.
+            # One dispatch per call (single autotuner config), so warmup + 1
+            # is the steady-state one. See att_child's docstring.
             "--kernel-iteration-range",
             f"[{warmup + 1}]",
         ]
@@ -322,8 +319,7 @@ def _summarize_att(output_dir: Path) -> dict[str, Any]:
                             for path in stats_files},
         }
 
-    # Parse once. Metric columns become floats up front so nothing downstream
-    # has to re-parse or defend against a value that already got through.
+    # Metric columns to float up front, so nothing downstream re-parses.
     rows: list[dict[str, Any]] = []
     for path in instruction_files:
         with path.open(newline="") as stream:

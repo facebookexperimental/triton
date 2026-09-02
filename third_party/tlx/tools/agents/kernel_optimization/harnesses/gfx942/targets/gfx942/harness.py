@@ -1,28 +1,16 @@
-"""Optimization harness for the TLX MI300X (gfx942 / CDNA3) GEMM op.
+"""Optimization harness for `third_party/tlx/ops/kernels/mm/gfx942.py`.
 
-Targets `third_party/tlx/ops/kernels/mm/gfx942.py`, whose `matmul` alias reaches
-`mm`'s default `space="heuristic"`.
+Three departures from the blackwell/hopper GEMM harnesses, all forced by the part:
 
-Differs from the blackwell/hopper GEMM harnesses in three ways that are all
-forced by the part rather than by taste:
-
-**Timing method.** `do_bench` is not used. Its burst-and-sleep pattern was
-measured at 14-20% burst-to-burst variation on this part, which would swamp the
-1.01 default promotion threshold and make promotion a coin flip. This harness
-reuses `gfx942_perf_harness.measure_samples` -- warm continuously until clocks
-settle, then one timed window -- so the samples the optimizer computes its
-median and CV over are the real per-call distribution.
-
-**No autotune search to control for.** `space="heuristic"` resolves to a single
-config per (M, N, K), so the gate is pinned by construction: a candidate is
-judged on its structural change and cannot win by landing on a luckier tile.
-Nothing here filters the autotuner, and `profile()` reports one latency rather
-than a pinned/unpinned pair. Pointing this harness at a kernel that *does*
-search would reintroduce tile selection as a confound.
-
-**ATT profiling.** `profile()` shells rocprofv3 rather than profiling in
-process, because ATT requires the application to be launched underneath it. See
-`../../att.py`.
+- **No `do_bench`.** Its burst-and-sleep pattern does not let clocks settle here;
+  the spread swamps the 1.01 promotion threshold. Uses
+  `gfx942_perf_harness.measure_samples` instead.
+- **No autotune search to control for.** `matmul` reaches `mm`'s default
+  `space="heuristic"`, one config per (M, N, K), so the gate is pinned by
+  construction. Pointing this at a searching kernel reintroduces tile selection
+  as a confound.
+- **ATT profiling out of process** (`../../att.py`): rocprofv3 must launch the
+  application, so `profile()` cannot trace itself.
 """
 
 from __future__ import annotations
@@ -41,8 +29,8 @@ from typing import Any
 
 import torch
 
-# `harnesses/gfx942/`, which holds the shared att/inputs modules. The harness is
-# loaded by file path with no package context, so this is how they resolve.
+# Loaded by file path with no package context, so the shared modules in
+# `harnesses/gfx942/` need an explicit path entry.
 _ARCH_DIR = Path(__file__).resolve().parents[2]
 if str(_ARCH_DIR) not in sys.path:
     sys.path.insert(0, str(_ARCH_DIR))
@@ -50,17 +38,14 @@ if str(_ARCH_DIR) not in sys.path:
 import att  # noqa: E402
 from inputs import make_inputs  # noqa: E402
 
-# Importing this sets TRITON_DISABLE_POST_MISCHED / TRITON_USE_C_DISPATCHER
-# before the first kernel launch, which is also what `target.json` puts in the
-# worker's environment. Both are needed: `target.json` covers the worker, this
-# covers a harness imported directly.
+# Sets TRITON_DISABLE_POST_MISCHED / TRITON_USE_C_DISPATCHER on import, covering
+# a directly-imported harness; `target.json` covers the worker.
 from triton.language.extra.tlx.tutorials.testing.gfx942_perf_harness import (  # noqa: E402
     measure_samples, )
 
 ENTRY_POINT = "matmul"
 
-# Enough samples for a meaningful median and CV without bloating the response
-# JSON; the perf harness caps its window at 4000 iterations.
+# Caps the response JSON; the perf harness window runs to 4000 iterations.
 MAX_SAMPLES = 2000
 
 
@@ -103,10 +88,7 @@ def verify(artifact: tuple[Any, ...], case: dict[str, Any]) -> dict[str, Any]:
             "diagnostics": f"in-process correctness: {type(error).__name__}: {error}",
         }
 
-    # The gate disables post-misched and the C dispatcher, but users and the
-    # repository correctness suite execute this kernel in a default environment.
-    # Validate that path in a fresh process so the harness' performance settings
-    # cannot hide a config that only works under them.
+    # Users run without the gate's performance env, so re-check there.
     default_check = _verify_default_environment(Path(source_path), case)
     if not default_check["passed"]:
         return {
@@ -118,9 +100,7 @@ def verify(artifact: tuple[Any, ...], case: dict[str, Any]) -> dict[str, Any]:
     metrics: dict[str, Any] = {"default_environment_verified": True}
     reference = _reference_module()
     if reference is not None:
-        # An oracle beyond torch: if the trusted kernel and the candidate agree
-        # more tightly than either agrees with torch, a torch-only check can hide
-        # a real regression inside the tolerance band.
+        # Tighter than torch: a regression can hide inside the assert_close band.
         try:
             reference_output = getattr(reference, ENTRY_POINT)(a, b)
             metrics["max_abs_diff_vs_reference"] = float((actual.float() - reference_output.float()).abs().max())
@@ -147,9 +127,7 @@ def _verify_default_environment(kernel_path: Path, case: dict[str, Any], timeout
             check=False,
         )
     except subprocess.TimeoutExpired:
-        # Not a correctness verdict: a slow or contended host must not be
-        # reported as a wrong answer. The caller sees `timed_out` and can
-        # distinguish it from a real mismatch.
+        # Not a correctness verdict -- a contended host is not a wrong answer.
         return {
             "passed":
             False,
@@ -164,7 +142,7 @@ def _verify_default_environment(kernel_path: Path, case: dict[str, Any], timeout
 
 
 def benchmark(artifact: tuple[Any, ...], case: dict[str, Any], repetitions: int) -> dict[str, Any]:
-    del repetitions  # the settled-clock window sizes itself; see module docstring
+    del repetitions  # the settled-clock window sizes itself
     _, module, _ = artifact
     a, b = make_inputs(case)
     call = getattr(module, ENTRY_POINT)
