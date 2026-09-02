@@ -902,7 +902,6 @@ void fillTDMDescriptor(RewriterBase &rewriter, Location loc,
 
   // Update group0 with addresses
   Value ldsAddr = b.ptrtoint(i32_ty, dstPtr);
-
   if (!pred)
     pred = vecGet(b, groups[0], 0);
 
@@ -1208,6 +1207,10 @@ int64_t computePerPartitionSliceStride(
 }
 
 // Emit the raw TDM intrinsic call from already-filled descriptor groups.
+// Pads the group operands to the fixed 4 x <4xi32> + 1 x <8xi32> ABI, appends
+// the aux-bits operand, and selects the load/store intrinsic name.  Both the
+// standalone and fused emitters go through here so the intrinsic operand ABI
+// is defined in one place.
 void emitTDMRawIntrinsic(RewriterBase &rewriter, Location loc,
                          ArrayRef<Value> inputGroups, bool isLoad,
                          int32_t auxBits) {
@@ -1215,9 +1218,10 @@ void emitTDMRawIntrinsic(RewriterBase &rewriter, Location loc,
   auto v4i32Ty = VectorType::get(4, rewriter.getI32Type());
   auto v8i32Ty = VectorType::get(8, rewriter.getI32Type());
   SmallVector<Value, 6> groups(inputGroups.begin(), inputGroups.end());
+  // Pad to 4 vector groups (intrinsic always takes 4 group operands).
   while (groups.size() < 4)
     groups.push_back(LLVM::ZeroOp::create(rewriter, loc, v4i32Ty));
-  groups.push_back(LLVM::ZeroOp::create(rewriter, loc, v8i32Ty));
+  groups.push_back(LLVM::ZeroOp::create(rewriter, loc, v8i32Ty)); // group4
   groups.push_back(b.i32_val(auxBits));
   const char *intrinsicName = isLoad ? "llvm.amdgcn.tensor.load.to.lds"
                                      : "llvm.amdgcn.tensor.store.from.lds";
@@ -1733,4 +1737,5 @@ void emitTDMLoadFused(RewriterBase &rewriter, Location loc,
 
   emitTDMRawIntrinsic(rewriter, loc, selectedGroups, /*isLoad=*/true, auxBits);
 }
+
 } // namespace mlir::LLVM::AMD

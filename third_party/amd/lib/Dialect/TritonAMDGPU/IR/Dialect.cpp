@@ -1084,7 +1084,6 @@ LogicalResult validateWarpUsedHint(Operation *op, uint32_t hint,
   if (hint == 0)
     return op->emitOpError("warp_used_hint must have at least one bit set");
 
-  // Bits above num_warps - 1 must be zero (no warp at those positions).
   uint32_t numWarpsMask = (uint32_t{1} << numWarps) - 1;
   if ((hint & ~numWarpsMask) != 0)
     return op->emitOpError("warp_used_hint = ")
@@ -1097,11 +1096,6 @@ LogicalResult validateWarpUsedHint(Operation *op, uint32_t hint,
            << K << " must be a power of two (got hint "
            << llvm::formatv("{0:x}", hint) << ")";
 
-  // Axis-aligned check.  Anchor at i0 = lsb(hint) and OR the shifted
-  // warp indices: `support` is the bits that vary across the active
-  // set.  Legal iff popcount(support) == log2(K) -- pigeonhole forces
-  // the K shifted indices to hit every subset of `support`, i.e. the
-  // active set is selectable by a single mask check.
   unsigned i0 = llvm::countr_zero(hint);
   uint32_t support = 0;
   for (uint32_t mask = hint; mask != 0; mask &= mask - 1) {
