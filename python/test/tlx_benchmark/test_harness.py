@@ -1,16 +1,3 @@
-"""Unit tests for everything in ``_harness``. No GPU required, runs in seconds.
-
-One file, because the split that matters in this directory is not one-per-module
--- it is *these* against ``test_ops_perf.py``, which launches real kernels and
-takes minutes. Sections below follow the ``_harness`` modules.
-
-The measurement policy is the part of this suite most likely to be wrong in a
-way that silently produces plausible numbers, so it gets tested directly rather
-than only through a benchmark run. ``summarize`` is unit-agnostic, so most tests
-feed it bare numbers; the ones that care that the reported unit is TFLOP/s say
-so.
-"""
-
 import json
 import os
 
@@ -42,23 +29,12 @@ def test_resolve_warmup_and_rep_explicit_wins():
 
 
 def test_warmup_is_an_iteration_count_not_a_duration():
-    """A duration makes warmup cost scale inversely with kernel speed.
-
-    At 3000ms a 0.1ms kernel got 30,000 warmup iterations and a 30ms kernel got
-    100 -- the fast shapes, which dominate a sweep, paid the most. As an
-    iteration count every case warms the same amount of work.
-    """
     assert DEFAULT_WARMUP_ITERS == 100
     # The estimate table is still reachable, but only via auto_window=True.
     assert resolve_warmup_and_rep(None, None, 1.0) == (25, 100)
 
 
 def test_one_replicate_by_default_and_the_quota_binds_directly():
-    """With one replicate the quota is the sample count, not a fifth of it.
-
-    At 5 replicates the window was max(200ms, (quota/5) x latency), so the
-    200ms floor decided it for anything under 10ms and the quota was inert.
-    """
     from _harness import window_for
 
     assert DEFAULT_REPLICATES == 1
@@ -68,9 +44,6 @@ def test_one_replicate_by_default_and_the_quota_binds_directly():
 
 
 def test_p99_needs_the_quota_to_be_worth_printing():
-    """Percentiles are nearest-rank, so p99 of n samples is one observation
-    unless n is large. At 100 it is the second-largest value; at 500 it is five
-    deep. This is why the quota is 500 and not 100."""
     from _harness import percentiles
 
     at_100 = percentiles(list(range(100)), (50, 95, 99))
@@ -80,12 +53,6 @@ def test_p99_needs_the_quota_to_be_worth_printing():
 
 
 def test_single_replicate_reports_deviation_as_unmeasured():
-    """None, not 0.0 and not cv.
-
-    0.0 would claim perfect reproducibility from one run; falling back to cv
-    would relabel a within-run figure as a between-run one, which is the exact
-    conflation the two fields exist to keep apart.
-    """
     stat = summarize([[1.0, 2.0, 3.0] * 40], remove_outliers=False)
     assert stat.replicates == 1
     assert stat.rel_max_deviation is None
@@ -119,24 +86,12 @@ def test_summarize_rejects_outliers_before_summarizing():
 
 
 def test_dispersion_survives_outlier_rejection():
-    """A wide-but-not-outlying distribution must stay wide.
-
-    This is the property the gate depends on: IQR rejection must not be able to
-    launder an unstable machine into a tight-looking result.
-    """
     stat = summarize([10.0, 12.0, 8.0, 11.0, 9.0, 10.5, 9.5, 11.5, 8.5])
     assert stat.n_kept == stat.n_raw
     assert stat.cv > 0.10
 
 
 def test_between_run_deviation_is_not_within_run_dispersion():
-    """The distinction the gate rests on.
-
-    Measured on B200, mm 8192^3 has a ~6% decile width -- the power-governed
-    clock wanders -- while its p50 reproduces to 1.7%. Gating on the within-run
-    figure rejected a case whose reported number was solid, so the gate reads
-    `rel_max_deviation` and `rel_idr` is kept only as a diagnostic.
-    """
     wide_but_reproducible = [[9.0, 10.0, 11.0] * 40, [9.0, 10.0, 11.0] * 40, [9.0, 10.0, 11.0] * 40]
     stat = summarize(wide_but_reproducible, remove_outliers=False)
     assert stat.replicates == 3
@@ -145,7 +100,6 @@ def test_between_run_deviation_is_not_within_run_dispersion():
 
 
 def test_between_run_deviation_catches_a_drifting_machine():
-    """Tight within each replicate, but the level moves between them."""
     drifting = [[10.0] * 120, [10.6] * 120, [11.2] * 120]
     stat = summarize(drifting, remove_outliers=False)
     assert stat.rel_idr > 0.05  # pooled, so the drift shows here too
@@ -153,12 +107,6 @@ def test_between_run_deviation_catches_a_drifting_machine():
 
 
 def test_rel_idr_is_a_decile_width_not_an_extreme():
-    """A single hiccup in a long run must not read as instability.
-
-    (max - p50) does not shrink as samples accumulate, so a threshold against
-    it measures sample count rather than stability. One 3x sample in 200 tight
-    ones is what a descheduled iteration looks like.
-    """
     times = [10.0] * 200 + [30.0]
     stat = summarize(times, remove_outliers=False)
     assert (stat.max - stat.p50) / stat.p50 == pytest.approx(2.0)
@@ -176,11 +124,6 @@ def test_summarize_rejects_empty():
 
 
 def test_percentiles_are_observed_samples_not_interpolations():
-    """A tail figure must be a value the kernel actually produced.
-
-    Interpolating between neighbours would invent one, which is precisely the
-    wrong thing when the point of p99 is to name a real iteration.
-    """
     from _harness import percentiles
 
     values = [1.0] * 98 + [5.0, 9.0]
@@ -190,8 +133,6 @@ def test_percentiles_are_observed_samples_not_interpolations():
 
 
 def test_summarize_reports_the_tail():
-    """CV and the mean together still cannot show a tail: these samples have a
-    modest CV while p99 is 5x the median."""
     stat = summarize([[1.0] * 98 + [5.0, 9.0]] * 3, remove_outliers=False)
     assert stat.p50 == 1.0
     assert stat.p99 == 5.0
@@ -204,23 +145,14 @@ def test_summarize_reports_the_tail():
 
 
 def test_to_tflops_inverts_per_sample():
-    """1 TFLOP of work in 1 ms is 1000 TFLOP/s, and twice the time is half."""
     assert to_tflops([1.0, 2.0, 4.0], flop_count=1e12) == [1000.0, 500.0, 250.0]
 
 
 def test_to_tflops_drops_nonpositive_samples():
-    """A zero-length sample is a clock artefact, not an infinitely fast
-    kernel; dividing by it would put an inf in the mean."""
     assert to_tflops([1.0, 0.0, -1.0, 2.0], flop_count=1e12) == [1000.0, 500.0]
 
 
 def test_conversion_is_per_sample_so_the_tail_is_not_flattened():
-    """The reason the conversion is upstream of ``summarize``.
-
-    ``flop_count / mean(latency)`` is a single number with no distribution
-    attached; converting per sample is what lets a slow iteration show up as a
-    low-throughput one. These latencies have a 5x tail, and it survives.
-    """
     latencies = [1.0] * 98 + [5.0, 9.0]
     stat = summarize([to_tflops(latencies, flop_count=1e12)], remove_outliers=False)
     assert stat.min == pytest.approx(1000 / 9)  # the 9 ms iteration
@@ -228,12 +160,6 @@ def test_conversion_is_per_sample_so_the_tail_is_not_flattened():
 
 
 def test_throughput_percentiles_ascend_so_p99_is_the_best_case():
-    """The one thing that is easy to get backwards.
-
-    Throughput is 1/latency, so a literal percentile of TFLOP/s runs the
-    opposite way to the latency reading everyone has in their head: p99 is the
-    iteration only 1% beat, and the slow tail is ``min``.
-    """
     latencies = [10.0] * 90 + [9.0] * 10  # ten fast iterations
     stat = summarize([to_tflops(latencies, flop_count=1e12)], remove_outliers=False)
     assert stat.p50 < stat.p95 <= stat.p99
@@ -242,7 +168,6 @@ def test_throughput_percentiles_ascend_so_p99_is_the_best_case():
 
 
 def test_summarize_records_its_unit():
-    """The artifact must never require inferring the unit from magnitudes."""
     assert summarize([1.0, 2.0]).unit == "tflops"
     assert summarize([1.0, 2.0], unit="ms").unit == "ms"
 
@@ -262,11 +187,6 @@ def test_status_vocabulary_is_exactly_the_four_documented():
 
 
 def test_noisy_is_not_a_failure_but_pip_and_error_are():
-    """`noisy` says the machine would not hold still, not that the code is slow.
-
-    Failing on it would train people to ignore the suite, which is the failure
-    mode that matters more than any single missed regression.
-    """
     from _harness.report import FAILING
 
     assert Status.NOISY not in FAILING
@@ -292,8 +212,6 @@ def test_artifact_is_json_serializable_and_versioned():
 
 
 def _stat(cv=0.0, mean=1.0):
-    """A Stat with a chosen CV and mean TFLOP/s, for exercising the verdict
-    rules directly. Higher ``mean`` is faster."""
     from _harness.contract import Stat
 
     return Stat(mean=mean, cv=cv, p50=mean, p95=mean, p99=mean, min=mean, max=mean, rel_max_deviation=0.0, rel_idr=0.0,
@@ -305,13 +223,6 @@ def _case():
 
 
 def test_gate_thresholds_are_the_documented_ones():
-    """The README defines these, and it is the spec of record.
-
-    All four are ABSOLUTE rather than ratios against a recorded baseline. For
-    compile time that is the only thing available -- cuBLAS has no compile step
-    to be relatively worse than -- and for the rest a relative gate ratchets:
-    three 15% regressions each pass on their own and together double the wait.
-    """
     assert MAX_CV == 0.03
     assert MIN_SPEEDUP == 0.9
     assert COLD_COMPILE_CAP_S == 120.0
@@ -321,12 +232,6 @@ def test_gate_thresholds_are_the_documented_ones():
 
 
 def test_wrong_answer_outranks_every_perf_claim():
-    """A fast wrong answer is `error`, not `ok` and not `pip`.
-
-    The autotuner ranks configs by speed without checking their results, so a
-    wrong-answer config can win outright. Timing one produces a number that
-    looks like signal and is not.
-    """
     from _harness import verdict
 
     # Fast enough to pass on speed, and perfectly steady -- but wrong.
@@ -335,18 +240,34 @@ def test_wrong_answer_outranks_every_perf_claim():
     assert "49.9%" in r.notes[0]
 
 
-def test_noisy_outranks_pip_so_an_untrustworthy_number_makes_no_perf_claim():
+def test_pip_outranks_noisy_so_a_slow_shape_is_never_hidden_by_jitter():
     from _harness import verdict
 
-    # Slow enough to be pip AND noisy; noisy must win.
     r = verdict.judge(_case(), _stat(cv=0.10, mean=1.0), _stat(mean=10.0), correct=True)
+    assert r.status is Status.PIP
+    assert r.speedup < MIN_SPEEDUP
+    # The softness of the number is still reported, just not as the verdict.
+    assert any("CV" in n for n in r.notes)
+
+
+def test_noisy_decides_only_among_cases_that_are_otherwise_fine():
+    from _harness import verdict
+
+    r = verdict.judge(_case(), _stat(cv=0.10, mean=1.0), _stat(mean=1.0), correct=True)
     assert r.status is Status.NOISY
-    assert r.speedup is not None and r.speedup < MIN_SPEEDUP
+
+
+def test_compile_cap_outranks_noisy_because_it_is_a_separate_pass():
+    from _harness import verdict
+    from _harness.compile import CompileStat
+
+    over = CompileStat(t_cold_s=300.0, cap_s=COLD_COMPILE_CAP_S)
+    r = verdict.judge(_case(), _stat(cv=0.10, mean=1.0), _stat(mean=1.0), compile_stat=over, correct=True)
+    assert r.status is Status.PIP
+    assert "300s" in r.notes[0]
 
 
 def test_speedup_is_a_throughput_ratio_so_above_one_is_still_faster():
-    """The numerator moved when the unit did. Getting this backwards would
-    invert every verdict while still producing plausible-looking numbers."""
     from _harness import verdict
 
     r = verdict.judge(_case(), _stat(mean=1200.0), _stat(mean=1000.0), correct=True)
@@ -372,11 +293,6 @@ def test_pip_fires_on_the_compile_cap_even_when_the_kernel_is_fast():
 
 
 def test_judging_reads_nothing_from_disk():
-    """Statelessness is the property that makes this a one-shot command.
-
-    If a recorded baseline ever comes back, this test should be the thing that
-    argues about it first.
-    """
     import ast
     import inspect
 
@@ -451,10 +367,6 @@ def test_decode_event_reasons():
 
 
 def test_sw_power_cap_is_not_degrading():
-    """Measured: a B200 under an 8192^3 fp16 GEMM reports sw_power_cap
-    continuously, with or without ``nvidia-smi -lgc``. Counting it as
-    degradation would flag every healthy run, so the signal has to exclude it.
-    """
     from _harness.denoise import DEGRADING_REASONS
 
     assert not DEGRADING_REASONS & 0x4
@@ -464,13 +376,6 @@ def test_sw_power_cap_is_not_degrading():
 
 
 def test_no_clock_lock_check_exists():
-    """Regression guard for the phase-2 finding.
-
-    An earlier version asserted "the SM clock must be near maximum". On B200
-    that is false for every compute-bound run -- the card is power-governed at
-    ~830/1965 MHz whether or not the clock is pinned -- so the check fired on
-    correct runs. If someone reintroduces it, this should argue back.
-    """
     import _harness
 
     assert not hasattr(_harness, "clocks_locked")
@@ -503,10 +408,6 @@ def test_gpu_state_unknown_without_nvidia_smi():
 
 
 def test_relative_interdecile_range_ignores_the_idle_ramp():
-    """The real failure this replaced: a 6 s window on a denoised B200 sampled
-    120 clocks, ~830 MHz throughout except the handful before the first launch
-    at the 990 MHz idle clock. min/max called that a 26% spread and every run
-    unstable; deciles see the steady state."""
     steady = [830] * 110
     ramp = [990, 985, 970, 950, 900]
     values = ramp + steady
@@ -534,8 +435,6 @@ def test_clock_trace_stability():
 
 
 def test_clock_trace_degradation_overrides_a_tight_spread():
-    """A card that thermally slowed but happened to do so smoothly is still
-    not a valid measurement."""
     trace = ClockTrace(samples=100, min_mhz=828, median_mhz=832, max_mhz=840, rel_idr=0.01,
                        reasons=("hw_thermal_slowdown", ), degrading=("hw_thermal_slowdown", ))
     assert trace.stable is False
@@ -547,9 +446,6 @@ def test_clock_trace_unknown_without_samples():
 
 
 def test_power_target_matches_the_part():
-    """Same table as denoise.sh. A *fixed* cap is the point, not a high one:
-    an unpinned cap is one more thing that can differ between two runs being
-    compared."""
     from _harness.denoise import AMD, NVIDIA, Device
 
     assert Device(NVIDIA, 0, "NVIDIA B200").power_target_w == 750
@@ -570,15 +466,6 @@ def test_visibility_variable_follows_the_vendor():
 
 
 def test_sampler_join_does_not_shadow_thread_internals():
-    """``_stop`` is a Thread *method*, not a free name for a flag.
-
-    Regression test. ``_Sampler`` held its stop flag in ``self._stop``, which
-    shadows the method CPython calls from inside ``join()``, so every successful
-    join raised ``TypeError: 'Event' object is not callable``. It fired at the
-    very end of ``stable()``, discarding a whole run's results after all the
-    measurement was already done. Nothing arch-specific about it -- any join
-    that succeeds hits it.
-    """
     from _harness.denoise import _Sampler
 
     sampler = _Sampler(uuid=None)
@@ -589,7 +476,6 @@ def test_sampler_join_does_not_shadow_thread_internals():
 
 
 def test_arch_matches_the_part():
-    """The catalog key is read off the part, before any CUDA context exists."""
     from _harness.denoise import AMD, NVIDIA, Device
 
     assert Device(NVIDIA, 0, "NVIDIA B200").arch == "sm100"
@@ -602,13 +488,6 @@ def test_arch_matches_the_part():
 
 
 def test_amd_numa_node_resolves_through_pci_not_the_drm_index(tmp_path, monkeypatch):
-    """rocm-smi's device index is not the DRM card index.
-
-    Regression test. The first version read ``/sys/class/drm/card<index>``,
-    which only coincides at 0: on an 8-GPU MI300X box rocm-smi's card6 is
-    ``0000:c8:00.0``, enumerated by sysfs as ``card40``. Every device but the
-    first silently got "GPU-local node unknown" and ran unbound.
-    """
     from _harness import denoise
 
     pci = tmp_path / "0000:c8:00.0"
@@ -624,9 +503,6 @@ def test_amd_numa_node_resolves_through_pci_not_the_drm_index(tmp_path, monkeypa
 
 
 def test_auto_selection_picks_the_least_used_gpu(monkeypatch):
-    """By free memory, not by index: on a shared box a co-tenant is the failure
-    mode most likely to go unnoticed, and index 0 is as likely to be busy as
-    any other."""
     import _harness.denoise as denoise_mod
     from _harness.denoise import NVIDIA, Device
 
@@ -643,7 +519,6 @@ def test_auto_selection_picks_the_least_used_gpu(monkeypatch):
 
 
 def test_governor_is_inert_without_a_device():
-    """No GPU is a reason to report honestly, not to crash."""
     from _harness.denoise import Governor
 
     with Governor(None) as g:

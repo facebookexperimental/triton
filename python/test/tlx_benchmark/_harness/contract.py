@@ -1,13 +1,3 @@
-"""The vocabulary the harness produces and the report consumes.
-
-Kept in its own module so ``measure`` / ``compile`` / ``verdict`` / ``report``
-share a vocabulary without depending on each other.
-
-The JSON that ``report`` emits is a stable, versioned artifact: it is what CI
-uploads and what a review agent reads *instead of parsing stdout*. Treat it as
-an interface -- bump ``SCHEMA_VERSION`` on any incompatible change.
-"""
-
 from __future__ import annotations
 
 import dataclasses
@@ -21,12 +11,6 @@ SCHEMA_VERSION = 2
 
 
 class Status(str, enum.Enum):
-    """Per-case outcome. The four the README defines, and no more.
-
-    Every threshold behind these is absolute, so a verdict depends only on the
-    run that produced it -- there is no recorded baseline to compare against.
-    That is what lets the suite be a single stateless command.
-    """
 
     OK = "ok"  # everything else
     PIP = "pip"  # perf improvement pending: too slow, or too slow to compile
@@ -36,8 +20,6 @@ class Status(str, enum.Enum):
 
 @dataclasses.dataclass(frozen=True)
 class Case:
-    """One benchmarked point. ``key`` identifies it in the JSON artifact, so it
-    must be stable across runs and readable in a diff."""
 
     op: str
     arch: str
@@ -73,33 +55,8 @@ class Case:
 
 @dataclasses.dataclass(frozen=True)
 class Stat:
-    """A summarized measurement. ``unit`` says of what; ``tflops`` by default.
-
-    Every value-typed field below is in that unit, and the conversion happened
-    per timed iteration, upstream in ``measure`` -- so ``cv`` and the
-    percentiles describe the distribution of the reported quantity rather than
-    the distribution of something else that was divided into it afterwards.
-
-    **Percentiles are literal.** Over TFLOP/s samples they ascend: ``p99`` is
-    the fast tail, beaten by only 1% of iterations, and the slow tail is
-    ``min``. This is the inverse of the latency reading, where p99 is the bad
-    case, and it is the one thing about this dataclass that is easy to get
-    backwards.
-
-    Three dispersion figures at two different scales, and the distinction is
-    worth keeping straight. ``cv`` and ``rel_idr`` are WITHIN one run;
-    ``rel_max_deviation`` is BETWEEN runs. With a few thousand samples per run
-    the median is far more stable than the distribution around it is wide:
-    measured on B200, mm 8192^3 has a within-run interdecile range of ~6% --
-    the power-governed clock wandering -- while its p50 reproduces between runs
-    to 1.7%.
-
-    **The README makes ``cv`` the gate**, so a case is judged on whether the
-    machine held still while measuring. Note that reads the wider of the two
-    scales: the between-run figures on that same B200 run were 0.0-0.2%, so
-    ``rel_max_deviation`` stays computed and stays in the artifact as the
-    diagnostic for "did the number reproduce", which is a different question.
-    """
+    # Percentiles are literal over TFLOP/s samples, so they ASCEND: p99 is the FAST
+    # tail and the slow tail is `min`. The inverse of the latency reading.
 
     #: The headline value. Reported rather than the median because a mean plus
     #: a coefficient of variation is the conventional way to summarize a
@@ -142,7 +99,6 @@ class Stat:
 
 @dataclasses.dataclass
 class Result:
-    """Everything measured for one case, plus the verdict."""
 
     case: Case
     status: Status = Status.OK
@@ -189,9 +145,6 @@ class Result:
 
 
 def artifact(results: Sequence[Result], env: dict[str, Any]) -> dict:
-    """The top-level JSON document. ``env`` records what the numbers depend on
-    -- GPU, driver, clock-lock state -- because a latency without that context
-    is not comparable to anything."""
     return {
         "schema_version": SCHEMA_VERSION,
         "env": env,

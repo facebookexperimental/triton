@@ -1,12 +1,3 @@
-"""pytest options for the perf suite.
-
-Deliberately the same names and choices as the ``bench_<op>.py`` CLI, so the
-two entry points are one interface with two front ends rather than two
-interfaces that drift. ``--device`` is absent because pytest owns process
-startup and the GPU is already pinned by the time a test runs.
-"""
-
-
 def pytest_addoption(parser):
     group = parser.getgroup("tlx-benchmark")
     group.addoption(

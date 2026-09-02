@@ -24,29 +24,11 @@ DTYPES = {"fp16": torch.float16, "bf16": torch.bfloat16}
 
 @functools.lru_cache(maxsize=1)
 def arch() -> str | None:
-    """Catalog key for the GPU under test, or None if ``mm`` has no entry.
-
-    Read off the part name via smi rather than via torch, because this is called
-    before the device is pinned and a CUDA context created here would ignore
-    ``--device``. Takes device 0: a box with two different parts in it is not a
-    machine anyone should be gating perf on.
-    """
     devices = list_devices()
     return devices[0].arch if devices else None
 
 
 def shapes(synthetic: bool = False) -> list[list]:
-    """One list or the other, never both.
-
-    Default is this arch's focus list -- the shapes someone actually runs. It
-    may be empty for an arch that has no capture yet, which is not an error.
-
-    ``synthetic=True`` swaps in the correctness list instead. Those shapes exist
-    to break the kernel (masked edge tiles, partial K, odd layouts) and most are
-    far too small for a number to mean much -- ``tlx.ops.mm`` costs tens of
-    microseconds of host time per call, so anything under roughly 300us measures
-    Python. Worth timing deliberately, not worth timing every run.
-    """
     if synthetic:
         from triton.tlx.ops.kernels.mm._shapes import SYNTHETIC
 
@@ -55,30 +37,10 @@ def shapes(synthetic: bool = False) -> list[list]:
 
 
 def default_json() -> str:
-    """Where the machine-readable artifact goes when nothing is asked for.
-
-    Written unconditionally: the JSON is the interface a review agent reads, and
-    making it opt-in meant the common invocation produced nothing to read. Not
-    in the repo -- it is a per-run output, not a checked-in one.
-    """
     return f"/tmp/tlx_benchmark/{OP}.{arch()}.json"
 
 
-#: What one row of the report describes, printed in the legend. An mm case is a
-#: product shape plus the memory layout of each operand -- the layout is not
-#: decoration, it selects a different kernel path and moves the TMA alignment
-#: constraint to a different dimension.
-INPUT_SPEC = ("(M x K) @ (K x N) with each operand's recorded strides; [[a0, a1], [b0, b1]]. "
-              "A leading stride wider than the row is a slice of a padded buffer, and 0 is a broadcast.")
-
-
 def cases(head: int | None = None, synthetic: bool = False) -> list[Case]:
-    """Every case, or the first ``head`` of them.
-
-    One case per entry, not a dtype cross-product: each shape carries the dtype
-    it was captured in, so running it in the other precision would measure a
-    workload nobody has.
-    """
     out = [
         # dtype is a Case field, so it is dropped from `shape` -- carrying it in
         # both duplicates it in the key and in the report.
@@ -100,13 +62,6 @@ REL_PRECISION = {"float16": 1e-3, "bfloat16": 8e-3}
 
 
 def _accuracy(out, ref_out, dtype: str) -> tuple[bool, str]:
-    """Whether TLX's output matches the reference, and why not if it does not.
-
-    Timing a kernel without checking it produces a number that looks like signal
-    and is not -- and the autotuner ranks configs by speed without ever looking
-    at their results, so a wrong-answer config can win. Cheap next to the
-    measurement window, and it runs once per case rather than per iteration.
-    """
     precision = REL_PRECISION[dtype]
     try:
         torch.testing.assert_close(out, ref_out, atol=precision * ref_out.abs().max().item(), rtol=precision)
@@ -116,12 +71,6 @@ def _accuracy(out, ref_out, dtype: str) -> tuple[bool, str]:
 
 
 def run_case(case: Case, *, space: str):
-    """Measure one case and judge it.
-
-    Latency and cold-compile are two passes over two different cache states:
-    ``t_cold`` needs an empty Triton cache and steady-state latency needs a
-    warm one, so neither can be derived from the other's call.
-    """
     from triton.tlx.ops import mm as tlx_mm
 
     a, b = _operands(case)
@@ -172,7 +121,6 @@ def run(*, space="heuristic", head=None, synthetic=False, governor=None):
     # artifacts are only comparable when this matches.
     env["space"] = space
     env["replicates"] = DEFAULT_REPLICATES
-    env["input_spec"] = INPUT_SPEC
     if head:
         env["head"] = head
     env["shapes"] = "synthetic" if synthetic else "focus"
@@ -189,7 +137,6 @@ def _errored(case: Case, exc: Exception):
 
 
 def supported() -> bool:
-    """Whether this op can run on the current device at all."""
     return arch() is not None
 
 

@@ -1,14 +1,3 @@
-"""pytest front end over every ``bench_<op>.py`` in this directory.
-
-One generic discoverer rather than a shim per op, so "one benchmark file per
-op" stays literally true. The CLI in each ``bench_<op>.py`` is the primary
-interface -- this exists for the junitxml that the b200 reporting pipeline
-already consumes.
-
-Every option is shared with that CLI (see ``conftest.py``), so the two front
-ends cannot drift into different behaviour.
-"""
-
 import importlib
 import pathlib
 import sys

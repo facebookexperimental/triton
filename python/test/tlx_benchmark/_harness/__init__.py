@@ -1,13 +1,3 @@
-"""Reusable measurement core for the TLX op perf suite.
-
-Public surface only; everything else in this package is private. Depends on
-``torch`` and ``triton`` alone -- no tritonbench wheel. Where behaviour is
-ported from tritonbench, the porting module names its source.
-
-Modules land per phase: ``denoise`` (2), ``compile`` (3), ``verdict`` and
-``report`` (5).
-"""
-
 from .compile import COLD_COMPILE_CAP_S, CompileStat, cold_compile, fresh_triton_cache, prewarm
 from . import report, verdict
 from .verdict import MAX_CV, MIN_SPEEDUP, judge
