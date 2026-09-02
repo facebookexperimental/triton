@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from contextlib import redirect_stderr
 from pathlib import Path
+from unittest import mock
 from unittest.mock import Mock, patch
 
 from . import optimizer as optimizer_module
@@ -17,6 +18,7 @@ from .cli import (
     _validate_host_matches_target,
 )
 from .harness import StandaloneHarness, SubprocessHarness
+from .harnesses.gfx942 import att
 from .models import (
     AutoCommitResult,
     CaseEvaluation,
@@ -42,6 +44,7 @@ from .providers import (
     MockLLMProvider,
     _build_prompt,
     _read_candidate_metadata,
+    knowledge_for,
 )
 from .source import (
     apply_candidate_diff,
@@ -53,6 +56,7 @@ from .source import (
 
 
 class ScoringTest(unittest.TestCase):
+
     def test_weighted_geometric_speedup(self) -> None:
         cases = (
             InputCase("large", {}, weight=3.0),
@@ -62,7 +66,7 @@ class ScoringTest(unittest.TestCase):
         candidate = _performance(("large", 50.0), ("small", 80.0))
         self.assertAlmostEqual(
             weighted_geometric_speedup(baseline, candidate, cases),
-            (2.0**3 * 0.5) ** 0.25,
+            (2.0**3 * 0.5)**0.25,
         )
 
     def test_per_case_speedups(self) -> None:
@@ -76,19 +80,17 @@ class ScoringTest(unittest.TestCase):
     def test_per_case_speedups_none_for_failed_case(self) -> None:
         cases = (InputCase("a", {}), InputCase("b", {}, protected=False))
         baseline = _performance(("a", 100.0), ("b", 40.0))
-        candidate = PerformanceSummary(
-            cases=(
-                CaseEvaluation(
-                    case_id="a",
-                    verification=VerificationResult(True),
-                    timing=TimingSamples((50.0, 50.0, 50.0)),
-                ),
-                CaseEvaluation(
-                    case_id="b",
-                    verification=VerificationResult(False),
-                ),
-            )
-        )
+        candidate = PerformanceSummary(cases=(
+            CaseEvaluation(
+                case_id="a",
+                verification=VerificationResult(True),
+                timing=TimingSamples((50.0, 50.0, 50.0)),
+            ),
+            CaseEvaluation(
+                case_id="b",
+                verification=VerificationResult(False),
+            ),
+        ))
         result = per_case_speedups(baseline, candidate, cases)
         self.assertEqual(result["b"], None)
 
@@ -387,13 +389,11 @@ class ScoringTest(unittest.TestCase):
 
     def test_failed_protected_case_is_not_promotable(self) -> None:
         summary = PerformanceSummary(
-            cases=(
-                CaseEvaluation(
-                    case_id="case",
-                    verification=VerificationResult(False),
-                    timing=None,
-                ),
-            ),
+            cases=(CaseEvaluation(
+                case_id="case",
+                verification=VerificationResult(False),
+                timing=None,
+            ), ),
             aggregate_speedup=2.0,
         )
         self.assertFalse(is_promotable(summary, OptimizationBudget()))
@@ -404,19 +404,17 @@ class ScoringTest(unittest.TestCase):
             InputCase("diagnostic", {}, protected=False),
         )
         baseline = _performance(("required", 100.0), ("diagnostic", 100.0))
-        candidate = PerformanceSummary(
-            cases=(
-                CaseEvaluation(
-                    case_id="required",
-                    verification=VerificationResult(True),
-                    timing=TimingSamples((50.0, 50.0, 50.0)),
-                ),
-                CaseEvaluation(
-                    case_id="diagnostic",
-                    verification=VerificationResult(False),
-                ),
-            )
-        )
+        candidate = PerformanceSummary(cases=(
+            CaseEvaluation(
+                case_id="required",
+                verification=VerificationResult(True),
+                timing=TimingSamples((50.0, 50.0, 50.0)),
+            ),
+            CaseEvaluation(
+                case_id="diagnostic",
+                verification=VerificationResult(False),
+            ),
+        ))
         speedup = weighted_geometric_speedup(baseline, candidate, cases)
         candidate = PerformanceSummary(candidate.cases, speedup)
         self.assertEqual(speedup, 2.0)
@@ -424,13 +422,11 @@ class ScoringTest(unittest.TestCase):
 
     def test_noisy_timing_is_not_promotable(self) -> None:
         summary = PerformanceSummary(
-            cases=(
-                CaseEvaluation(
-                    case_id="case",
-                    verification=VerificationResult(True),
-                    timing=TimingSamples((1.0, 10.0, 1.0)),
-                ),
-            ),
+            cases=(CaseEvaluation(
+                case_id="case",
+                verification=VerificationResult(True),
+                timing=TimingSamples((1.0, 10.0, 1.0)),
+            ), ),
             aggregate_speedup=2.0,
         )
         self.assertFalse(is_promotable(summary, OptimizationBudget(max_cv=0.1)))
@@ -534,6 +530,7 @@ class CliTest(unittest.TestCase):
 
 
 class HarnessTest(unittest.TestCase):
+
     def test_cuda_arch_validation_rejects_mismatched_host(self) -> None:
         target = KernelTarget("cuda", "B200", device="cuda:0")
         with self.assertRaisesRegex(SystemExit, "expects sm_10x.*is sm_90"):
@@ -559,42 +556,45 @@ class HarnessTest(unittest.TestCase):
 
         _validate_host_matches_target(target, "host", capability_probe=fail_probe)
 
+    def test_hip_arch_validation_accepts_matching_host(self) -> None:
+        target = KernelTarget("hip", "gfx942", device="cuda:0")
+        _validate_host_matches_target(
+            target,
+            "gfx942",
+            gcn_probe=lambda device: "gfx942",
+        )
+
+    def test_hip_arch_validation_rejects_mismatched_host(self) -> None:
+        target = KernelTarget("hip", "gfx942", device="cuda:0")
+        with self.assertRaisesRegex(SystemExit, "expects gfx942.*is gfx950"):
+            _validate_host_matches_target(
+                target,
+                "gfx942",
+                gcn_probe=lambda device: "gfx950",
+            )
+
     def test_resolves_arch_first_harness_layout(self) -> None:
         kernel = Path("gemm.py")
-        harness, cases, target = _resolve_harness_paths(
-            kernel, None, None, None, "hopper"
-        )
+        harness, cases, target = _resolve_harness_paths(kernel, None, None, None, "hopper")
         self.assertEqual(
             harness,
-            Path(__file__).with_name("harnesses")
-            / "hopper"
-            / "targets"
-            / "gemm"
-            / "harness.py",
+            Path(__file__).with_name("harnesses") / "hopper" / "targets" / "gemm" / "harness.py",
         )
         self.assertEqual(cases.name, "cases.json")
         self.assertEqual(target.name, "target.json")
 
     def test_default_arch_only_uses_arches_with_matching_target(self) -> None:
         kernel = Path("vector_add.py")
-        harness, cases, target = _resolve_harness_paths(
-            kernel, None, None, None, None
-        )
+        harness, cases, target = _resolve_harness_paths(kernel, None, None, None, None)
         self.assertEqual(
             harness,
-            Path(__file__).with_name("harnesses")
-            / "host"
-            / "targets"
-            / "vector_add"
-            / "harness.py",
+            Path(__file__).with_name("harnesses") / "host" / "targets" / "vector_add" / "harness.py",
         )
         self.assertEqual(cases.name, "cases.json")
         self.assertEqual(target.name, "target.json")
 
     def test_standalone_harness_evaluates_fake_kernel(self) -> None:
-        harness = StandaloneHarness(
-            Path(__file__).with_name("testdata") / "fake_harness.py"
-        )
+        harness = StandaloneHarness(Path(__file__).with_name("testdata") / "fake_harness.py")
         cases = (InputCase("a", {"scale": 1.0}), InputCase("b", {"scale": 2.0}))
         target = KernelTarget("fake", "fake")
         performance = harness.evaluate(
@@ -732,10 +732,8 @@ class HarnessTest(unittest.TestCase):
             self.assertGreater(profile["size_bytes"], 1_000_000)
 
     def test_standalone_harness_reports_build_error(self) -> None:
-        harness = StandaloneHarness(
-            Path(__file__).with_name("testdata") / "fake_harness.py"
-        )
-        cases = (InputCase("a", {}),)
+        harness = StandaloneHarness(Path(__file__).with_name("testdata") / "fake_harness.py")
+        cases = (InputCase("a", {}), )
         target = KernelTarget("fake", "fake")
         with self.assertRaisesRegex(Exception, "missing fake kernel controls"):
             harness.evaluate(
@@ -746,16 +744,14 @@ class HarnessTest(unittest.TestCase):
             )
 
     def test_mock_provider_replays_canned_candidates(self) -> None:
-        provider = MockLLMProvider(
-            canned=(
-                CandidateProposal("LATENCY_US = 80\nCORRECT = True\n", "first"),
-                CandidateProposal("LATENCY_US = 60\nCORRECT = True\n", "second"),
-            )
-        )
+        provider = MockLLMProvider(canned=(
+            CandidateProposal("LATENCY_US = 80\nCORRECT = True\n", "first"),
+            CandidateProposal("LATENCY_US = 60\nCORRECT = True\n", "second"),
+        ))
         request = KernelOptimizationRequest(
             kernel_source="LATENCY_US = 100\nCORRECT = True\n",
             harness_path=Path(__file__).with_name("testdata") / "fake_harness.py",
-            cases=(InputCase("a", {"scale": 1.0}),),
+            cases=(InputCase("a", {"scale": 1.0}), ),
             target=KernelTarget("fake", "fake"),
         )
         from .models import PerformanceSummary as PS
@@ -776,6 +772,37 @@ class HarnessTest(unittest.TestCase):
         )
         self.assertEqual(first.source, "LATENCY_US = 80\nCORRECT = True\n")
         self.assertEqual(second.source, "LATENCY_US = 60\nCORRECT = True\n")
+
+    def test_knowledge_is_returned_for_a_curated_arch_and_not_invented(self) -> None:
+        self.assertIn("gfx942", knowledge_for("gfx942") or "")
+        self.assertIsNone(knowledge_for("sm100"), "no curated file exists for sm100 yet")
+
+    def test_knowledge_is_appended_to_the_generic_preamble(self) -> None:
+        # Append, not replace: the preamble is arch-agnostic workflow and the
+        # knowledge file is arch-specific fact. An earlier version substituted
+        # one for the other and silently dropped the workflow rules.
+        request = KernelOptimizationRequest(
+            kernel_source="VALUE = 1\n",
+            harness_path=Path(__file__),
+            cases=(InputCase("a", {}), ),
+            target=KernelTarget("hip", "gfx942"),
+        )
+        dummy_perf = PerformanceSummary(cases=(), aggregate_speedup=1.0)
+        prompt = _build_prompt(request, CandidateContext(0, 0, request.kernel_source, dummy_perf, ()))
+        self.assertIn("Evidence-driven optimization workflow", prompt)
+        self.assertIn("Human-curated knowledge base for gfx942", prompt)
+
+    def test_prompt_has_no_knowledge_block_for_an_uncurated_arch(self) -> None:
+        request = KernelOptimizationRequest(
+            kernel_source="VALUE = 1\n",
+            harness_path=Path(__file__),
+            cases=(InputCase("a", {}), ),
+            target=KernelTarget("cuda", "sm100"),
+        )
+        dummy_perf = PerformanceSummary(cases=(), aggregate_speedup=1.0)
+        prompt = _build_prompt(request, CandidateContext(0, 0, request.kernel_source, dummy_perf, ()))
+        self.assertIn("Evidence-driven optimization workflow", prompt)
+        self.assertNotIn("Human-curated knowledge base", prompt)
 
 
 class CommitBodyTest(unittest.TestCase):
@@ -1125,20 +1152,17 @@ class KernelOptimizerTest(unittest.TestCase):
             self.assertEqual(result.experiments[2].status, "promoted")
 
     def test_rejects_incorrect_candidate_and_promotes_faster_candidate(self) -> None:
-        provider = FixedCandidateProvider(
-            [
-                CandidateProposal("LATENCY_US = 1\nCORRECT = False\n", "wrong"),
-                CandidateProposal("LATENCY_US = 80\nCORRECT = True\n", "faster"),
-                CandidateProposal("LATENCY_US = 90\nCORRECT = True\n", "slower"),
-                CandidateProposal("LATENCY_US = 70\nCORRECT = True\n", "faster again"),
-            ]
-        )
+        provider = FixedCandidateProvider([
+            CandidateProposal("LATENCY_US = 1\nCORRECT = False\n", "wrong"),
+            CandidateProposal("LATENCY_US = 80\nCORRECT = True\n", "faster"),
+            CandidateProposal("LATENCY_US = 90\nCORRECT = True\n", "slower"),
+            CandidateProposal("LATENCY_US = 70\nCORRECT = True\n", "faster again"),
+        ])
         with tempfile.TemporaryDirectory() as directory:
             result = KernelOptimizer(provider).optimize(
                 KernelOptimizationRequest(
                     kernel_source="LATENCY_US = 100\nCORRECT = True\n",
-                    harness_path=Path(__file__).with_name("testdata")
-                    / "fake_harness.py",
+                    harness_path=Path(__file__).with_name("testdata") / "fake_harness.py",
                     cases=(
                         InputCase("a", {"scale": 1.0}, weight=2.0),
                         InputCase("b", {"scale": 2.0}),
@@ -1151,8 +1175,7 @@ class KernelOptimizerTest(unittest.TestCase):
                         benchmark_repetitions=3,
                     ),
                     output_dir=Path(directory),
-                )
-            )
+                ))
             self.assertTrue(result.success)
             self.assertEqual(result.best_kernel, "LATENCY_US = 70\nCORRECT = True\n")
             self.assertAlmostEqual(result.final.aggregate_speedup, 100 / 70)
@@ -1537,27 +1560,23 @@ class KernelOptimizerTest(unittest.TestCase):
 
     def test_profile_payload_caps_large_values(self) -> None:
         # Use a harness that returns a >1MB profile to exercise spill logic.
-        provider = FixedCandidateProvider(
-            [CandidateProposal("LATENCY_US = 100\nCORRECT = True\n", "same")]
-        )
+        provider = FixedCandidateProvider([CandidateProposal("LATENCY_US = 100\nCORRECT = True\n", "same")])
         with tempfile.TemporaryDirectory() as tmp:
             harness_path = Path(tmp) / "big_profile_harness.py"
-            harness_path.write_text(
-                "def build(kernel_source, target):\n"
-                "    return {'success': True, 'artifact': {}}\n"
-                "def verify(artifact, case):\n"
-                "    return {'passed': True}\n"
-                "def benchmark(artifact, case, repetitions):\n"
-                "    return {'samples_us': [10.0]*repetitions}\n"
-                "def profile(artifact, case):\n"
-                "    return {'big': 'x' * 2000000}\n"
-            )
+            harness_path.write_text("def build(kernel_source, target):\n"
+                                    "    return {'success': True, 'artifact': {}}\n"
+                                    "def verify(artifact, case):\n"
+                                    "    return {'passed': True}\n"
+                                    "def benchmark(artifact, case, repetitions):\n"
+                                    "    return {'samples_us': [10.0]*repetitions}\n"
+                                    "def profile(artifact, case):\n"
+                                    "    return {'big': 'x' * 2000000}\n")
             with tempfile.TemporaryDirectory() as directory:
                 result = KernelOptimizer(provider).optimize(
                     KernelOptimizationRequest(
                         kernel_source="LATENCY_US = 100\nCORRECT = True\n",
                         harness_path=harness_path,
-                        cases=(InputCase("a", {}),),
+                        cases=(InputCase("a", {}), ),
                         target=KernelTarget("fake", "fake"),
                         budget=OptimizationBudget(
                             max_rounds=1,
@@ -1565,10 +1584,63 @@ class KernelOptimizerTest(unittest.TestCase):
                             benchmark_repetitions=2,
                         ),
                         output_dir=Path(directory),
-                    )
-                )
+                    ))
                 # Optimizer should complete without error even with oversized profile.
-                self.assertIsNotNone(result)
+        self.assertIsNotNone(result)
+
+
+class Gfx942AttTest(unittest.TestCase):
+
+    def test_parser_rejects_header_only_stats(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            stats = Path(directory) / "stats_dispatch.csv"
+            stats.write_text('"CodeObj","Vaddr","Instruction","Hitcount","Latency",'
+                             '"Stall","Idle","Source"\n')
+            result = att._summarize_att(Path(directory))
+        self.assertIn("header but no instruction rows", result["parse_error"])
+
+    def test_parser_accepts_real_att_columns(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            stats = Path(directory) / "stats_dispatch.csv"
+            stats.write_text('"CodeObj","Vaddr","Instruction","Hitcount","Latency",'
+                             '"Stall","Idle","Source"\n'
+                             '1,100,"s_barrier",2,20,12,1,"kernel.py:10"\n'
+                             '1,104,"v_mfma_f32_16x16x16_f16 v[0:3]",4,30,8,0,'
+                             '"kernel.py:11"\n')
+            result = att._summarize_att(Path(directory))
+        self.assertEqual(result["instruction_rows"], 2)
+        self.assertEqual(result["totals"]["stall"], 20.0)
+        self.assertEqual(
+            [row["opcode"] for row in result["stall_by_opcode"]],
+            ["barrier", "mfma"],
+        )
+
+    def test_att_command_selects_one_based_warm_dispatch(self) -> None:
+        completed = __import__("subprocess").CompletedProcess([], 0, "", "")
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(
+                att, "_rocprofv3",
+                return_value="/opt/rocprofv3"), mock.patch.object(att.subprocess, "run", return_value=completed) as run:
+            att._run(
+                mode="att",
+                kernel_path=Path("kernel.py"),
+                case={"case_id": "case", "parameters": {}},
+                output_dir=Path(directory),
+                entry_point="matmul",
+                kernel_regex=".*matmul.*",
+                warmup=3,
+                pin_config=None,
+                timeout_s=1,
+            )
+        command = run.call_args.args[0]
+        self.assertIn("--kernel-trace", command)
+        self.assertEqual(command[command.index("--kernel-iteration-range") + 1], "[4]")
+        self.assertEqual(command[command.index("--att-target-cu") + 1], "0")
+
+    def test_rocprofv3_override(self) -> None:
+        with mock.patch.dict("os.environ", {"TLX_ROCPROFV3": "/opt/rocm-dev/bin/rocprofv3"}), mock.patch.object(
+                att.shutil, "which", return_value="/opt/rocm-dev/bin/rocprofv3") as which:
+            self.assertEqual(att._rocprofv3(), "/opt/rocm-dev/bin/rocprofv3")
+        which.assert_called_once_with("/opt/rocm-dev/bin/rocprofv3")
 
 
 def _write_policy_harness(directory: Path) -> Path:
@@ -1635,16 +1707,12 @@ def _read_json(path: Path) -> dict[str, object]:
 
 
 def _performance(*values: tuple[str, float]) -> PerformanceSummary:
-    return PerformanceSummary(
-        cases=tuple(
-            CaseEvaluation(
-                case_id=case_id,
-                verification=VerificationResult(True),
-                timing=TimingSamples((latency, latency, latency)),
-            )
-            for case_id, latency in values
-        )
-    )
+    return PerformanceSummary(cases=tuple(
+        CaseEvaluation(
+            case_id=case_id,
+            verification=VerificationResult(True),
+            timing=TimingSamples((latency, latency, latency)),
+        ) for case_id, latency in values))
 
 
 if __name__ == "__main__":
