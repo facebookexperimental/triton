@@ -102,9 +102,17 @@ if [[ "$GPU_VENDOR" == "nvidia" ]]; then
         NUMA_NODE=$(<"$NUMA_NODE_FILE")
     fi
 elif [[ "$GPU_VENDOR" == "amd" ]]; then
-    DRM_DEVICE=$(readlink -f "/sys/class/drm/card${HIP_VISIBLE_DEVICES}/device" 2>/dev/null || true)
-    if [[ -r "$DRM_DEVICE/numa_node" ]]; then
-        NUMA_NODE=$(<"$DRM_DEVICE/numa_node")
+    # Via the PCI bus id, like the nvidia branch above -- NOT via
+    # /sys/class/drm/card$HIP_VISIBLE_DEVICES. The rocm-smi device index and the
+    # DRM card index are different numbering schemes that only coincide at 0: on
+    # an 8-GPU MI300X box rocm-smi's card6 is 0000:c8:00.0, which sysfs
+    # enumerates as card40. The old form found no numa_node and silently ran
+    # unbound for every device but the first.
+    AMD_PCI_BUS_ID=$(rocm-smi -d "$HIP_VISIBLE_DEVICES" --showbus --csv 2>/dev/null \
+        | awk -F, -v c="card${HIP_VISIBLE_DEVICES}" 'tolower($1)==c {print tolower($2)}' | tr -d '[:space:]')
+    NUMA_NODE_FILE="/sys/bus/pci/devices/$AMD_PCI_BUS_ID/numa_node"
+    if [[ -n "$AMD_PCI_BUS_ID" && -r "$NUMA_NODE_FILE" ]]; then
+        NUMA_NODE=$(<"$NUMA_NODE_FILE")
     fi
 fi
 
