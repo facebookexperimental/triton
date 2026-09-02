@@ -767,26 +767,14 @@ private:
 
   int64_t getDivisibility(OpTy op, const AxisInfo &lhs, const AxisInfo &rhs,
                           int dim) override {
-    auto resTy = dyn_cast<RankedTensorType>(op.getType());
-    constexpr bool isUnsigned = std::is_same_v<OpTy, arith::RemUIOp>;
-    // Divisibility applies to the base of each resulting contiguity group. If
-    // signed remainder cannot preserve a partial group, the old group-base
-    // divisibility does not apply to every now-scalar result.
-    bool preservesContiguousGroup =
-        isUnsigned ||
-        (resTy && AxisInfoVisitor::isContiguousDim(lhs, resTy.getShape(), dim));
-    if (rhs.getConstancy(dim) > 1 && preservesContiguousGroup) {
-      // lhs: d_lhs * k = gcd(d_lhs, d_rhs) * k' * k = gcd(d_lhs, d_rhs) * k''
-      // rhs: d_rhs * p = gcd(d_lhs, d_rhs) * p' * p = gcd(d_lhs, d_rhs) * p''
-      // lhs = gcd(d_lhs, d_rhs) * k'' = gcd(d_lhs, d_rhs) * d + r
-      // r must be divisible by gcd(d_lhs, d_rhs)
-      return gcd(lhs.getDivisibility(dim), rhs.getDivisibility(dim));
-    }
-    // Otherwise we shouldn't assume any divisibility.
-    // For example:
-    // lhs: [2, 2, 4, 4], rhs: [0, 1, 2, 3]
-    // lhs % rhs = [0, 0, 0, 1]
-    return 1;
+    auto contiguity = getContiguity(op, lhs, rhs, dim);
+    auto divisibility = gcd(lhs.getDivisibility(dim), rhs.getDivisibility(dim));
+    // New group bases inside an operand's contiguous group have offsets that
+    // are multiples of the result contiguity.
+    if (lhs.getContiguity(dim) > contiguity ||
+        rhs.getContiguity(dim) > contiguity)
+      divisibility = gcd(divisibility, contiguity);
+    return divisibility;
   };
 };
 
