@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from .vcs import (
+from third_party.tlx.tools.agents.rd_panel.kernel_optimization.vcs import (
     ATTRIBUTION,
     AutoCommitError,
     AutoCommitSession,
