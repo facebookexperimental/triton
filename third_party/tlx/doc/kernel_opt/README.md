@@ -26,6 +26,9 @@ from blind exploration.
 
 ## How it is consumed
 
-A harness under `harnesses/<arch>/` reads the file for its own arch and the
-provider injects it into the candidate prompt preamble. Nothing else parses
-these files, so prose is fine; keep the section headings stable.
+`providers.knowledge_for()` looks up `<target.architecture>.md` here (see
+`_ARCH_ALIASES` for the marketing-name spellings) and appends it to the
+candidate prompt preamble. Adding a new arch needs only a file named after the
+`architecture` field of that arch's `target.json`. Nothing parses these files,
+so prose is fine; keep the section headings stable, since the prompt tells the
+model to trust "measured on" over "ported from".

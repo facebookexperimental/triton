@@ -8,10 +8,12 @@ exactly one of them:
 
     warmup dispatches 1..W, then the traced dispatch W+1.
 
-That determinism only holds while the autotuner is pinned to a single config
-(``TLX_AGENT_PIN_CONFIG``); an unpinned run issues one dispatch per config
-during the search and the iteration range would land somewhere arbitrary inside
-it. :mod:`att` always sets the pin for this reason.
+That determinism requires one dispatch per call, which holds because the target
+resolves to a single autotuner config (`mm`'s `space="heuristic"`) --
+`Autotuner.run` skips benchmarking entirely unless `len(self.configs) > 1`. A
+candidate that widens the search space would issue one dispatch per config on
+the first call and the iteration range would land somewhere arbitrary inside it;
+:func:`att._summarize_att`'s traced-dispatch count is the check on that.
 
 Everything arrives by environment variable rather than argv because rocprofv3
 owns the command line.
@@ -25,6 +27,8 @@ import os
 import sys
 from pathlib import Path
 from types import ModuleType
+
+from inputs import make_inputs  # same directory; sys.path[0] is this script's dir
 
 
 def _load(path: Path) -> ModuleType:
@@ -45,31 +49,8 @@ def main() -> int:
     entry_point = os.environ.get("TLX_ATT_ENTRY", "matmul")
     warmup = int(os.environ.get("TLX_ATT_WARMUP", "3"))
 
-    parameters = case["parameters"]
-    device = parameters.get("device", "cuda")
-    dtype = getattr(torch, parameters.get("dtype", "float16"))
-    generator = torch.Generator(device=device)
-    generator.manual_seed(int(parameters.get("seed", 0)))
-    a = torch.randn(
-        (int(parameters["m"]), int(parameters["k"])),
-        device=device,
-        dtype=dtype,
-        generator=generator,
-    )
-    b = torch.randn(
-        (int(parameters["k"]), int(parameters["n"])),
-        device=device,
-        dtype=dtype,
-        generator=generator,
-    )
-
-    module = _load(kernel_path)
-    pin_config = os.environ.get("TLX_AGENT_PIN_CONFIG")
-    if pin_config:
-        import pinning  # same directory; sys.path[0] is this script's dir
-
-        pinning.pin(module, json.loads(pin_config))
-    call = getattr(module, entry_point)
+    a, b = make_inputs(case)
+    call = getattr(_load(kernel_path), entry_point)
 
     # Warmup also absorbs JIT compilation, so the traced dispatch measures the
     # steady-state kernel rather than a cold-cache first launch.

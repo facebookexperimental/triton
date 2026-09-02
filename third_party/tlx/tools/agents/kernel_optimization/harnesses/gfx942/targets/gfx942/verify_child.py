@@ -1,7 +1,11 @@
-"""Check an agent candidate through the default, unpinned user launch path.
+"""Check an agent candidate through the default user launch path.
 
 Spawned by ``harness._verify_default_environment()`` on every ``verify`` call, so a
-candidate is also checked without the autotuner pin the rest of the harness applies.
+candidate is also checked without the performance environment the gate runs under
+(``TRITON_DISABLE_POST_MISCHED`` / ``TRITON_USE_C_DISPATCHER``).
+
+Note this shares the parent's Triton compile cache, so it re-checks the *launch
+environment*, not a cold compile.
 """
 
 from __future__ import annotations
@@ -11,6 +15,11 @@ import json
 import os
 import sys
 from pathlib import Path
+
+# `harnesses/gfx942/`, which holds the shared inputs module.
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from inputs import make_inputs  # noqa: E402
 
 
 def main() -> int:
@@ -27,16 +36,8 @@ def main() -> int:
     sys.modules["tlx_verify_candidate"] = module
     spec.loader.exec_module(module)
 
-    parameters = case["parameters"]
-    device = parameters.get("device", "cuda")
-    dtype = getattr(torch, parameters.get("dtype", "float16"))
-    k = int(parameters["k"])
-    torch.manual_seed(int(parameters.get("seed", 0)))
-    a = (torch.randn((int(parameters["m"]), k), device=device, dtype=dtype) + 1) / k
-    b = (torch.randn((k, int(parameters["n"])), device=device, dtype=dtype) + 1) / k
-
-    actual = getattr(module, entry_point)(a, b)
-    torch.testing.assert_close(actual, torch.matmul(a, b))
+    a, b = make_inputs(case)
+    torch.testing.assert_close(getattr(module, entry_point)(a, b), torch.matmul(a, b))
     return 0
 
 
