@@ -89,7 +89,7 @@ def get_heuristic_config(M, N, K, num_sms=148):
                 "BLOCK_SIZE_M": 256,
                 "BLOCK_SIZE_N": 128,
                 "BLOCK_SIZE_K": 128,
-                "GROUP_SIZE_M": _select_group_size_m(M, N, 256),
+                "GROUP_SIZE_M": _select_group_size_m(M, N, 256, num_ctas=2),
                 "NUM_SMEM_BUFFERS": 2,
                 "NUM_TMEM_BUFFERS": 2,
                 "NUM_MMA_GROUPS": 2,
@@ -109,7 +109,7 @@ def get_heuristic_config(M, N, K, num_sms=148):
                     "BLOCK_SIZE_M": 256,
                     "BLOCK_SIZE_N": 256,
                     "BLOCK_SIZE_K": 128,
-                    "GROUP_SIZE_M": _select_group_size_m(M, N, 256),
+                    "GROUP_SIZE_M": _select_group_size_m(M, N, 256, num_ctas=2),
                     "NUM_SMEM_BUFFERS": 2,
                     "NUM_TMEM_BUFFERS": 1,
                     "NUM_MMA_GROUPS": 2,
@@ -125,7 +125,7 @@ def get_heuristic_config(M, N, K, num_sms=148):
                     "BLOCK_SIZE_M": 256,
                     "BLOCK_SIZE_N": 256,
                     "BLOCK_SIZE_K": 64,
-                    "GROUP_SIZE_M": _select_group_size_m(M, N, 256),
+                    "GROUP_SIZE_M": _select_group_size_m(M, N, 256, num_ctas=2),
                     "NUM_SMEM_BUFFERS": 4,
                     "NUM_TMEM_BUFFERS": 1,
                     "NUM_MMA_GROUPS": 2,
@@ -330,7 +330,7 @@ def get_heuristic_config(M, N, K, num_sms=148):
                 "BLOCK_SIZE_M": bm,
                 "BLOCK_SIZE_N": bn,
                 "BLOCK_SIZE_K": bk,
-                "GROUP_SIZE_M": _select_group_size_m(M, N, bm),
+                "GROUP_SIZE_M": _select_group_size_m(M, N, bm, num_ctas=num_ctas),
                 "NUM_SMEM_BUFFERS": num_smem_buffers,
                 "NUM_TMEM_BUFFERS": num_tmem_buffers,
                 "NUM_MMA_GROUPS": num_mma_groups,
@@ -345,7 +345,7 @@ def get_heuristic_config(M, N, K, num_sms=148):
     return best_config
 
 
-def _select_group_size_m(M, N, block_m):
+def _select_group_size_m(M, N, block_m, num_ctas=1):
     """
     Select GROUP_SIZE_M based on the golden rule for tile scheduling.
 
@@ -357,19 +357,27 @@ def _select_group_size_m(M, N, block_m):
     - When M >> N: Use small GROUP_SIZE_M to reuse B (smaller dimension)
     - When N >> M: Use large GROUP_SIZE_M to reuse A (smaller dimension)
     - When M ~ N: Use moderate GROUP_SIZE_M for L2 locality
+
+    Rounded up to a multiple of num_ctas: correctness, not tuning. See the
+    pairing gate in preprocess_configs.
     """
     num_m_tiles = (M + block_m - 1) // block_m
     ratio = M / max(N, 1)
 
     if ratio > 10:
         # M >> N: sweep M, reuse B
-        return 1
+        group = 1
     elif ratio < 0.1:
         # N >> M: sweep N, reuse A
-        return min(64, num_m_tiles)
+        group = min(64, num_m_tiles)
     else:
         # Balanced: moderate group size for L2 locality
-        return min(8, num_m_tiles)
+        group = min(8, num_m_tiles)
+
+    if num_ctas > 1:
+        # Round up to a multiple of num_ctas. Required for correctness
+        group = max(num_ctas, -(-group // num_ctas) * num_ctas)
+    return group
 
 
 def get_cuda_autotune_config():
@@ -1551,6 +1559,11 @@ def heuristic_config(M, N, K):
     if cfg is None:
         return None
     cfg = dict(cfg)
+    # The heuristic path bypasses preprocess_configs, so check its gate here.
+    group_m, num_ctas = cfg["GROUP_SIZE_M"], cfg.get("NUM_CTAS", 1)
+    if group_m % num_ctas != 0:
+        raise AssertionError(f"heuristic config for {M}x{N}x{K} has GROUP_SIZE_M={group_m} with "
+                             f"NUM_CTAS={num_ctas}; paired CTAs would straddle two pid_n values")
     ctas_per_cga = cfg.pop("ctas_per_cga", None)
     pre_hook = cfg.pop("pre_hook", None) or matmul_tma_set_block_size_hook
     return [triton.Config(cfg, num_warps=4, num_stages=1, pre_hook=pre_hook, ctas_per_cga=ctas_per_cga)]
