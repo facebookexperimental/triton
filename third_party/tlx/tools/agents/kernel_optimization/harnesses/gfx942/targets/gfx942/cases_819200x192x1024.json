@@ -1,0 +1,10 @@
+[
+  {
+    "case_id": "tall_narrow_n_819200x192x1024",
+    "parameters": {
+      "m": 819200, "n": 192, "k": 1024, "dtype": "float16", "seed": 0
+    },
+    "weight": 1.0,
+    "protected": true
+  }
+]

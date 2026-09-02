@@ -65,6 +65,13 @@ def _parse_args(arguments: list[str] | None = None) -> argparse.Namespace:
             "adopting the prior winner."
         ),
     )
+    parser.add_argument(
+        "--result-format",
+        choices=["full", "summary", "none"],
+        default="full",
+        help=("Final stdout payload: full JSON (default), a compact JSON summary, or nothing. "
+              "Full results are always persisted under --output-dir."),
+    )
     parser.add_argument("--max-rounds", type=int, default=5)
     parser.add_argument("--candidates-per-round", type=int, default=2)
     parser.add_argument("--max-candidate-seconds", type=float, default=600.0)
@@ -479,6 +486,23 @@ def _report_commit(commit_result: object) -> None:
     print(" ".join(parts), file=sys.stderr, flush=True)
 
 
+def _print_result(result: Any, output_dir: Path, result_format: str) -> None:
+    if result_format == "none":
+        return
+    if result_format == "full":
+        print(json.dumps(to_json_value(result), indent=2, sort_keys=True))
+        return
+    summary = {
+        "artifacts_dir": str(output_dir),
+        "result_json": str(output_dir / "result.json"),
+        "stopping_reason": result.stopping_reason,
+        "success": result.success,
+        "final_speedup": result.final.aggregate_speedup,
+        "experiments": len(result.experiments),
+    }
+    print(json.dumps(summary, indent=2, sort_keys=True))
+
+
 def main() -> int:
     args = _parse_args()
     harness_path, cases_path, target_path = _resolve_harness_paths(args.kernel, args.harness, args.cases, args.target,
@@ -581,7 +605,7 @@ def main() -> int:
         )
     if result.stopping_reason in {"promotion_commit_failed", "rollback_commit_failed"}:
         exit_code = 3
-    print(json.dumps(to_json_value(result), indent=2, sort_keys=True))
+    _print_result(result, args.output_dir, args.result_format)
     return exit_code
 
 

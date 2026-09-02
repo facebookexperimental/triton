@@ -103,8 +103,12 @@ speedup, and per-case correctness, median, p95, CV, and speedup. Each try also l
 bounded hypothesis/change/expected-effect/risk summary before evaluation and a concise
 decision afterward. A requested commit emits one `commit status=committed|failed` event
 with VCS, revision, repository, target file, subject, and attribution. Kernel source is
-never printed to the live log. The final JSON remains on stdout so callers can parse it
-independently of live progress.
+never printed to the live log. The final JSON remains on stdout by default so callers can
+parse it independently of live progress. For interactive runs, pass `--result-format summary`
+to print only the outcome and artifact paths; `--result-format none` leaves only the live
+stderr log. The complete result is always persisted as `<output-dir>/result.json`.
+Exit code `0` means a winner was promoted, `2` means the run completed without a qualifying
+winner, and `3` means optimization succeeded but committing the winner failed.
 
 `--budget` accepts an optional JSON file that overrides the `--max-*` / `--min-speedup` /
 `--max-cv` flags (`{max_rounds, candidates_per_round, max_candidate_seconds,
@@ -114,6 +118,18 @@ max_total_seconds, min_speedup, max_cv, benchmark_repetitions}`).
 contains `{backend, architecture, device, environment}`. The harness receives the full
 `target` dict (including `environment` merged into `os.environ` for the worker) and each
 `case` dict verbatim.
+
+The gfx942 MM bundle also includes `cases_819200x192x1024.json` for focused work on the
+tall, narrow-N shape. Select it with `--cases` so the default square regression gate remains
+unchanged:
+
+```bash
+python -m third_party.tlx.tools.agents.kernel_optimization.cli \
+  --kernel third_party/tlx/ops/kernels/mm/gfx942.py --arch gfx942 \
+  --cases third_party/tlx/tools/agents/kernel_optimization/harnesses/gfx942/targets/gfx942/cases_819200x192x1024.json \
+  --output-dir /tmp/tlx-agent-gfx942-mm --provider codex \
+  --no-commit-winner --result-format summary
+```
 
 The output directory contains:
 
@@ -236,5 +252,5 @@ python -m third_party.tlx.tools.agents.kernel_optimization.cli \
   --output-dir /tmp/tlx-agent-h100 \
   --max-rounds 3 --candidates-per-round 4 \
   --max-candidate-seconds 600 --max-total-seconds 3600 \
-  --provider codex
+  --provider codex --result-format summary
 ```
