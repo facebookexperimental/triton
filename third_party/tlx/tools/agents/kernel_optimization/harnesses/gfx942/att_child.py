@@ -19,24 +19,12 @@ Inputs arrive by environment variable because rocprofv3 owns the command line.
 
 from __future__ import annotations
 
-import importlib.util
 import json
 import os
-import sys
 from pathlib import Path
-from types import ModuleType
 
 from inputs import make_inputs  # same directory; sys.path[0] is this script's dir
-
-
-def _load(path: Path) -> ModuleType:
-    spec = importlib.util.spec_from_file_location("tlx_att_candidate", path)
-    if spec is None or spec.loader is None:
-        raise RuntimeError(f"cannot load candidate from {path}")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["tlx_att_candidate"] = module
-    spec.loader.exec_module(module)
-    return module
+from loader import load_candidate
 
 
 def main() -> int:
@@ -48,7 +36,7 @@ def main() -> int:
     warmup = int(os.environ.get("TLX_ATT_WARMUP", "3"))
 
     a, b = make_inputs(case)
-    call = getattr(_load(kernel_path), entry_point)
+    call = getattr(load_candidate(kernel_path, suffix='att_candidate'), entry_point)
 
     # Absorbs JIT compilation, so the traced dispatch is not a cold first launch.
     for _ in range(warmup):
