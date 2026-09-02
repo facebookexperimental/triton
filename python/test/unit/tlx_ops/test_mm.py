@@ -66,6 +66,9 @@ MAX_SECONDS_PER_CASE = 60
 
 REL_PRECISION = {torch.float16: 1e-3, torch.bfloat16: 8e-3}
 
+# The reference below is only ground truth in true fp32.
+assert torch.get_float32_matmul_precision() == "highest"
+
 
 @pytest.mark.parametrize("M, N, K, a_strides, b_strides, dtype_name", _shapes())
 def test_mm(M, N, K, a_strides, b_strides, dtype_name):
@@ -91,9 +94,9 @@ def test_mm(M, N, K, a_strides, b_strides, dtype_name):
     assert elapsed < MAX_SECONDS_PER_CASE, (f"mm({M}x{N}x{K}, {dtype}) took {elapsed:.1f}s, "
                                             f"over the {MAX_SECONDS_PER_CASE}s budget")
 
-    ref = torch.matmul(a, b)
+    ref = a.float() @ b.float()
     precision = REL_PRECISION[dtype]
-    torch.testing.assert_close(out, ref, atol=precision * ref.abs().max().item(), rtol=precision)
+    torch.testing.assert_close(out.float(), ref, atol=precision * ref.abs().max().item(), rtol=precision)
 
     # These are multi-gigabyte operands at the top of the focus lists; without
     # this the union OOMs partway through rather than at a diagnosable point.
