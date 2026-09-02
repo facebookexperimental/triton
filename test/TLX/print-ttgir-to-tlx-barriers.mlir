@@ -80,6 +80,43 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     ttng.wait_barrier %view, %c0_i32, %true : !ttg.memdesc<1xi64, #shared, #smem, mutable>
     tt.return
   }
+
+  // An arrive count is an attribute, not an operand, and is emitted positionally.
+  // CHECK-LABEL: def arrive_with_count(
+  // CHECK: tlx.barrier_arrive({{.*}}, 2)
+  tt.func public @arrive_with_count() attributes {noinline = false} {
+    %bar = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    ttng.init_barrier %bar, 1 : !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    ttng.arrive_barrier %bar, 2 : !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    tt.return
+  }
+
+  // A predicate is an optional operand and must be named, not passed
+  // positionally into the arrive_count slot.
+  // CHECK-LABEL: def arrive_with_predicate(
+  // CHECK: tlx.barrier_arrive({{.*}}, pred=
+  tt.func public @arrive_with_predicate() attributes {noinline = false} {
+    %c0_i32 = arith.constant 0 : i32
+    %pid = tt.get_program_id x : i32
+    %pred = arith.cmpi sgt, %pid, %c0_i32 : i32
+    %bar = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    ttng.init_barrier %bar, 1 : !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    ttng.arrive_barrier %bar, 1, %pred : !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    tt.return
+  }
+
+  // A perThread arrive needs no keyword: barrier_arrive picks the per-thread
+  // lowering off the barrier, which alloc_warp_barrier restores.
+  // CHECK-LABEL: def per_thread_arrive(
+  // CHECK: tlx.alloc_warp_barrier(1, 4)
+  // CHECK: tlx.barrier_arrive(
+  // CHECK-NOT: per_thread=
+  tt.func public @per_thread_arrive() attributes {noinline = false} {
+    %bar = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    ttng.init_barrier %bar, 128 : !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    ttng.arrive_barrier %bar, 1 {perThread} : !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    tt.return
+  }
 }
 
 // -----
@@ -124,6 +161,28 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     %v1 = ttg.memdesc_index %bar[%c1_i32] : !ttg.memdesc<2x1xi64, #shared, #smem, mutable> -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
     ttng.init_barrier %v0, 1 : !ttg.memdesc<1xi64, #shared, #smem, mutable>
     ttng.init_barrier %v1, 2 : !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+// A multicast arrive signals every CTA in its equivalence class; emitting it
+// as a local arrive would silently drop the multicast. It needs more than one
+// CTA and the identity CGA layout, hence a separate module.
+
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0], CGALayout = [[1]]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32, "ttg.cluster-dim-x" = 2 : i32} {
+
+  // CHECK-LABEL: def multicast_arrive(
+  // CHECK: # unsupported: multicast arrive_barrier (ctaMask=1)
+  // CHECK-NOT: tlx.barrier_arrive(
+  tt.func public @multicast_arrive() attributes {noinline = false} {
+    %bar = ttg.local_alloc : () -> !ttg.memdesc<2xi64, #shared, #smem, mutable>
+    ttng.init_barrier %bar, 1 : !ttg.memdesc<2xi64, #shared, #smem, mutable>
+    // expected-error @+1 {{multicast arrive_barrier does not round-trip to TLX}}
+    ttng.arrive_barrier %bar, 1 {ctaMask = 1 : i32} : !ttg.memdesc<2xi64, #shared, #smem, mutable>
     tt.return
   }
 }
