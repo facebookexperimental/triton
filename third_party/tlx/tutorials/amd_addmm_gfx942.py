@@ -5,7 +5,7 @@ The gfx950 sibling, ``amd_addmm_gfx950.py``, does not run here. It is built on
 loads fail to legalize on CDNA3, and its tile overflows the LDS budget besides
 (measured: ``OutOfResources ... Required: 67456, Hardware limit: 65536``).
 
-So this is the ``amd_gemm_gfx942`` kernel with the bias folded into the
+So this is the ``tlx.ops.mm`` gfx942 kernel with the bias folded into the
 epilogue: the same register-staged operand path (``tl.load`` -> VGPR ->
 ``tlx.local_store`` -> LDS -> ``tlx.local_load`` -> MFMA), the same autotuned
 tile and LDS ring depth, the same 64 KB CDNA3 budget pruning. See that file for
@@ -30,7 +30,7 @@ import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
 
-from triton.language.extra.tlx.tutorials.amd_gemm_gfx942 import (
+from triton.tlx.ops.kernels.mm.gfx942 import (
     CDNA3_LDS_BYTES,
     NUM_XCDS,
     _xcd_remap,
@@ -62,7 +62,7 @@ def addmm_kernel_gfx942(
     NUM_BUFFERS: tl.constexpr,
     NUM_XCDS: tl.constexpr,
 ):
-    """C = bias + A @ B, register-staged LDS ring (see amd_gemm_gfx942)."""
+    """C = bias + A @ B, register-staged LDS ring (see ops/kernels/mm/gfx942.py)."""
     tl.assume(stride_am > 0)
     tl.assume(stride_ak > 0)
     tl.assume(stride_bk > 0)
@@ -127,7 +127,7 @@ def addmm_kernel_gfx942(
         b_tile = tlx.local_load(tlx.local_view(smem_b, buf))
         acc = tl.dot(a_tile, b_tile, acc)
 
-    # Epilogue: the only difference from amd_gemm_gfx942. The accumulator is
+    # Epilogue: the only difference from ops/kernels/mm/gfx942.py. The accumulator is
     # already in registers, so the bias costs one masked load and one add. A 1-D
     # (N,) bias arrives with stride_biasm == 0, which broadcasts it down the rows
     # for free -- no separate code path.
@@ -144,7 +144,7 @@ def addmm_kernel_gfx942(
 
 
 def _configs():
-    """Same tile space as amd_gemm_gfx942 -- the hot loop is identical."""
+    """Same tile space as ops/kernels/mm/gfx942.py -- the hot loop is identical."""
     tiles = [
         (64, 64, 64, 4),
         (128, 128, 32, 4),

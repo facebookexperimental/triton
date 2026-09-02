@@ -109,8 +109,14 @@ class Measurement(NamedTuple):
         return 100.0 * (self.hi_ms - self.lo_ms) / self.ms if self.ms > 0 else float("nan")
 
 
-def measure(fn, warmup_s=DEFAULT_WARMUP_S, rep_s=DEFAULT_REP_S) -> Measurement:
-    """Time ``fn`` over one continuous window after a settling warmup."""
+def measure_samples(fn, warmup_s=DEFAULT_WARMUP_S, rep_s=DEFAULT_REP_S) -> list[float]:
+    """Per-iteration times (ms, in execution order) from one continuous window.
+
+    The raw form of :func:`measure`, split out so callers that want the whole
+    distribution -- the kernel-optimization harness computes its own median and
+    coefficient of variation -- get it from the same settling method rather than
+    reimplementing it and drifting.
+    """
     fn()
     torch.cuda.synchronize()
 
@@ -139,12 +145,17 @@ def measure(fn, warmup_s=DEFAULT_WARMUP_S, rep_s=DEFAULT_REP_S) -> Measurement:
         ends[i].record()
     torch.cuda.synchronize()
 
-    times = sorted(s.elapsed_time(e) for s, e in zip(starts, ends))
+    return [s.elapsed_time(e) for s, e in zip(starts, ends)]
+
+
+def measure(fn, warmup_s=DEFAULT_WARMUP_S, rep_s=DEFAULT_REP_S) -> Measurement:
+    """Time ``fn`` over one continuous window after a settling warmup."""
+    times = sorted(measure_samples(fn, warmup_s=warmup_s, rep_s=rep_s))
 
     def q(frac):
         return times[min(len(times) - 1, max(0, int(frac * len(times))))]
 
-    return Measurement(ms=q(QUANTILES[0]), lo_ms=q(QUANTILES[1]), hi_ms=q(QUANTILES[2]), iters=n_iters)
+    return Measurement(ms=q(QUANTILES[0]), lo_ms=q(QUANTILES[1]), hi_ms=q(QUANTILES[2]), iters=len(times))
 
 
 def add_measurement_args(parser):
@@ -169,7 +180,7 @@ class OpSpec(NamedTuple):
     bias or a batch dimension just returns more tensors.
     """
 
-    name: str  # e.g. "amd_gemm_gfx942", used in the table title and plot name
+    name: str  # e.g. "amd_addmm_gfx942", used in the table title and plot name
     axes: tuple  # shape axis labels, e.g. ("M", "N", "K")
     shapes: list  # list of tuples, each matching `axes`
     make_inputs: Callable  # (shape, dtype) -> tuple of tensors
