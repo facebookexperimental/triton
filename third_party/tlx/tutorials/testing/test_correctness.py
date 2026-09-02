@@ -2595,6 +2595,36 @@ def test_amd_gemm_output_offset_width_selection(monkeypatch):
     assert [use_i64_c_offsets for _, use_i64_c_offsets in launches] == [False, True]
 
 
+@pytest.mark.parametrize(
+    "split_k,defer_epilogue",
+    [(2, False), (1, True)],
+    ids=["split-k", "deferred-epilogue"],
+)
+def test_amd_gemm_rejects_large_workspace(split_k, defer_epilogue):
+    M, N, K = 262145, 2048, 256
+    a = torch.empty((M, K), device="meta", dtype=torch.float16)
+    b = torch.empty((K, N), device="meta", dtype=torch.float16)
+
+    with pytest.raises(ValueError, match="FP32 workspace exceeds signed-i32 byte offsets"):
+        _amd_gemm._launch(
+            a,
+            b,
+            SPLIT_K=split_k,
+            TILE=(256, 256),
+            DEFER_EPILOGUE=defer_epilogue,
+        )
+
+
+def test_amd_gemm_rejects_large_bias():
+    M, N, K = 925210, 4096, 128
+    a = torch.empty((M, K), device="meta", dtype=torch.float16)
+    b = torch.empty((K, N), device="meta", dtype=torch.float16)
+    bias = torch.empty((M, N), device="meta", dtype=torch.float16)
+
+    with pytest.raises(ValueError, match="bias exceeds signed-i32 byte offsets"):
+        _amd_gemm._launch(a, b, bias=bias, SPLIT_K=1, TILE=(256, 256))
+
+
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware (CDNA4)")
 def test_amd_gemm_large_output_offsets():
     M, N, K = 925210, 4096, 1024

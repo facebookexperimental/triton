@@ -1407,6 +1407,11 @@ def _launch(a, b, bias=None, SPLIT_K=None, TILE=None, K_LIMIT=None, DEFER_EPILOG
         assert bias.shape == (M, N), f"Bias must expand to ({M}, {N}), got {tuple(bias.shape)}"
         assert bias.device == a.device, "Bias and matrix operands must be on the same device"
         assert bias.dtype == a.dtype, "Bias and matrix operands must have the same dtype"
+        if _needs_i64_offsets(bias):
+            raise ValueError(
+                "gfx950 inter-wave GEMM bias exceeds signed-i32 byte offsets; "
+                f"shape={tuple(bias.shape)}, strides={bias.stride()}"
+            )
     if TILE is not None:
         BM, BN = TILE
         grid_mn = triton.cdiv(M, BM) * triton.cdiv(N, BN)
@@ -1425,10 +1430,17 @@ def _launch(a, b, bias=None, SPLIT_K=None, TILE=None, K_LIMIT=None, DEFER_EPILOG
     c = torch.empty((M, N), device=a.device, dtype=a.dtype)
     GRID_MN = triton.cdiv(M, BM) * triton.cdiv(N, BN)
     if SPLIT_K > 1 or DEFER_EPILOGUE:
+        workspace_shape = (SPLIT_K * M, N)
+        workspace_view = torch.empty(workspace_shape, device="meta", dtype=torch.float32)
+        if _needs_i64_offsets(workspace_view):
+            raise ValueError(
+                "gfx950 inter-wave GEMM FP32 workspace exceeds signed-i32 byte offsets; "
+                f"shape={workspace_shape}, SPLIT_K={SPLIT_K}, DEFER_EPILOGUE={DEFER_EPILOGUE}"
+            )
         # fp32 workspace: partials are stored without a rounding step, so the
         # split-K result matches a single fp32-accumulated GEMM (an fp16 workspace
         # would lose ~1e-1 near cancellation). The reduce sums in fp32 too.
-        workspace = torch.empty((SPLIT_K * M, N), device=a.device, dtype=torch.float32)
+        workspace = torch.empty(workspace_shape, device=a.device, dtype=torch.float32)
     else:
         workspace = c  # dummy; the kernel writes c_ptr directly when SPLIT_K==1
     bias_ptr = bias if bias is not None else c
