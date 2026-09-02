@@ -39,9 +39,7 @@ def _load_json(path: Path) -> Any:
 
 
 def _parse_args(arguments: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Optimize a Triton or TLX kernel with a deterministic harness."
-    )
+    parser = argparse.ArgumentParser(description="Optimize a Triton or TLX kernel with a deterministic harness.")
     parser.add_argument("--kernel", type=Path, required=True)
     parser.add_argument(
         "--reference-kernel", type=Path, default=None, help=
@@ -79,10 +77,8 @@ def _parse_args(arguments: list[str] | None = None) -> argparse.Namespace:
         "--commit-winner",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help=(
-            "Commit a successfully revalidated winner to the kernel's repository "
-            "(default: enabled; use --no-commit-winner to disable)."
-        ),
+        help=("Commit a successfully revalidated winner to the kernel's repository "
+              "(default: enabled; use --no-commit-winner to disable)."),
     )
     parser.add_argument(
         "--commit-message",
@@ -116,10 +112,8 @@ def _parse_args(arguments: list[str] | None = None) -> argparse.Namespace:
         "--diagnostic-proton-intra-kernel",
         action="store_true",
         default=False,
-        help=(
-            "Collect diagnostic-only per-warp proton_intra_kernel traces for the "
-            "baseline and final winner only."
-        ),
+        help=("Collect diagnostic-only per-warp proton_intra_kernel traces for the "
+              "baseline and final winner only."),
     )
     parser.add_argument(
         "--budget",
@@ -180,6 +174,50 @@ def _resolve_harness_paths(kernel: Path, harness: Path | None, cases: Path | Non
             f"missing required {'/'.join(missing)}; pass them explicitly or use a kernel with harnesses/<arch>/targets/<name>/"
         )
     return harness, cases, target
+
+
+# Curated optimization knowledge, resolved from the frozen bundle rather than
+# from a global doc tree, so a run's prompt is reproducible from its recorded
+# bundle hashes. `references/input-contract.md` is explicit that this knowledge
+# belongs in `optimization_guidance` and not in the generic candidate provider.
+#
+#   harnesses/<arch>/knowledge.md                      -- architecture-wide
+#   harnesses/<arch>/targets/<kernel>/optimization_guidance.md  -- this target
+#
+# Both are optional and are concatenated ahead of target.json's inline string,
+# widest scope first. Adding an architecture therefore means adding a directory.
+ARCH_KNOWLEDGE_FILE = "knowledge.md"
+TARGET_GUIDANCE_FILE = "optimization_guidance.md"
+
+# A prompt-size ceiling. The candidate prompt also carries the preamble, the
+# reference kernel and every case's profile; unbounded guidance would crowd them
+# out silently. Truncation is announced in the text so the model never treats a
+# cut-off document as complete.
+#
+# The shipped gfx942 bundle resolves to ~8 KB, so this is roughly 2x headroom.
+# It is a backstop against a runaway document, not a budget to fill: guidance
+# that does not change what a candidate would do is costing every prompt.
+MAX_GUIDANCE_BYTES = 16384
+
+
+def _resolve_guidance(target_path: Path, inline: str) -> str:
+    """Bundle knowledge files plus ``target.json``'s inline string, widest first."""
+    target_dir = target_path.resolve().parent
+    # harnesses/<arch>/targets/<kernel>/target.json -> harnesses/<arch>
+    arch_dir = target_dir.parent.parent
+    sections: list[str] = []
+    for path in (arch_dir / ARCH_KNOWLEDGE_FILE, target_dir / TARGET_GUIDANCE_FILE):
+        if path.is_file():
+            text = path.read_text().strip()
+            if text:
+                sections.append(f"--- {path.name} ({path.parent.name}) ---\n{text}")
+    if inline.strip():
+        sections.append(inline.strip())
+    guidance = "\n\n".join(sections)
+    if len(guidance) > MAX_GUIDANCE_BYTES:
+        guidance = (guidance[:MAX_GUIDANCE_BYTES] +
+                    f"\n\n[truncated at {MAX_GUIDANCE_BYTES} bytes; read the bundle files for the rest]")
+    return guidance
 
 
 def _expected_cuda_major(arch: str) -> int | None:
@@ -471,7 +509,7 @@ def main() -> int:
         architecture=str(target_payload["architecture"]),
         device=target_payload.get("device"),
         environment=target_payload.get("environment", {}),
-        optimization_guidance=str(target_payload.get("optimization_guidance", "")),
+        optimization_guidance=_resolve_guidance(target_path, str(target_payload.get("optimization_guidance", ""))),
     )
     _validate_host_matches_target(target, args.arch)
     budget = _budget_from_args(args)
@@ -486,13 +524,8 @@ def main() -> int:
             "(StandaloneHarness); CLI still uses subprocess isolation.",
             file=_sys.stderr,
         )
-    provider = (
-        MockLLMProvider()
-        if args.provider == "mock"
-        else CodexCandidateProvider(
-            model=args.model, timeout_seconds=budget.max_candidate_seconds
-        )
-    )
+    provider = (MockLLMProvider() if args.provider == "mock" else CodexCandidateProvider(
+        model=args.model, timeout_seconds=budget.max_candidate_seconds))
     kernel_path = args.kernel.resolve()
     kernel_source = kernel_path.read_text()
     fallback_commit_subject = f"Optimize {kernel_path.name} with TLX agent"

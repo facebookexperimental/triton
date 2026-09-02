@@ -12,8 +12,10 @@ from unittest.mock import Mock, patch
 from . import optimizer as optimizer_module
 from .artifacts import load_prior_run_evidence
 from .cli import (
+    MAX_GUIDANCE_BYTES,
     _commit_body,
     _parse_args,
+    _resolve_guidance,
     _resolve_harness_paths,
     _validate_host_matches_target,
 )
@@ -44,7 +46,6 @@ from .providers import (
     MockLLMProvider,
     _build_prompt,
     _read_candidate_metadata,
-    knowledge_for,
 )
 from .source import (
     apply_candidate_diff,
@@ -573,6 +574,49 @@ class HarnessTest(unittest.TestCase):
                 gcn_probe=lambda device: "gfx950",
             )
 
+    def _bundle(self, root: Path, arch_knowledge: str | None, target_guidance: str | None) -> Path:
+        target_dir = root / "harnesses" / "arch" / "targets" / "kernel"
+        target_dir.mkdir(parents=True)
+        if arch_knowledge is not None:
+            (target_dir.parent.parent / "knowledge.md").write_text(arch_knowledge)
+        if target_guidance is not None:
+            (target_dir / "optimization_guidance.md").write_text(target_guidance)
+        return target_dir / "target.json"
+
+    def test_guidance_concatenates_arch_then_target_then_inline(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            target = self._bundle(Path(directory), "ARCH FACTS", "TARGET FACTS")
+            guidance = _resolve_guidance(target, "INLINE")
+        # Widest scope first, so a target-specific note reads as a refinement of
+        # the arch note rather than contradicting something the model saw later.
+        self.assertLess(guidance.index("ARCH FACTS"), guidance.index("TARGET FACTS"))
+        self.assertLess(guidance.index("TARGET FACTS"), guidance.index("INLINE"))
+
+    def test_guidance_tolerates_each_source_being_absent(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.assertEqual(_resolve_guidance(self._bundle(root / "a", None, None), ""), "")
+            self.assertIn("ONLY ARCH", _resolve_guidance(self._bundle(root / "b", "ONLY ARCH", None), ""))
+            self.assertIn("ONLY TARGET", _resolve_guidance(self._bundle(root / "c", None, "ONLY TARGET"), ""))
+            self.assertEqual(_resolve_guidance(self._bundle(root / "d", "  \n ", None), " "), "")
+
+    def test_guidance_truncation_is_announced(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            target = self._bundle(Path(directory), "x" * (MAX_GUIDANCE_BYTES * 2), None)
+            guidance = _resolve_guidance(target, "")
+        # Silently cutting the document would let the model treat a fragment as
+        # the whole prior.
+        self.assertIn("truncated", guidance)
+        self.assertLess(len(guidance), MAX_GUIDANCE_BYTES + 200)
+
+    def test_shipped_gfx942_bundle_supplies_guidance(self) -> None:
+        target = (Path(__file__).with_name("harnesses") / "gfx942" / "targets" / "gfx942" / "target.json")
+        guidance = _resolve_guidance(target, "")
+        self.assertIn("knowledge.md", guidance)
+        self.assertIn("optimization_guidance.md", guidance)
+        # A shipped bundle must never reach the agent already cut off.
+        self.assertNotIn("truncated", guidance)
+
     def test_resolves_arch_first_harness_layout(self) -> None:
         kernel = Path("gemm.py")
         harness, cases, target = _resolve_harness_paths(kernel, None, None, None, "hopper")
@@ -773,26 +817,22 @@ class HarnessTest(unittest.TestCase):
         self.assertEqual(first.source, "LATENCY_US = 80\nCORRECT = True\n")
         self.assertEqual(second.source, "LATENCY_US = 60\nCORRECT = True\n")
 
-    def test_knowledge_is_returned_for_a_curated_arch_and_not_invented(self) -> None:
-        self.assertIn("gfx942", knowledge_for("gfx942") or "")
-        self.assertIsNone(knowledge_for("sm100"), "no curated file exists for sm100 yet")
-
-    def test_knowledge_is_appended_to_the_generic_preamble(self) -> None:
+    def test_guidance_is_appended_to_the_generic_preamble(self) -> None:
         # Append, not replace: the preamble is arch-agnostic workflow and the
-        # knowledge file is arch-specific fact. An earlier version substituted
-        # one for the other and silently dropped the workflow rules.
+        # guidance is target-specific fact. An earlier version substituted one
+        # for the other and silently dropped the workflow rules.
         request = KernelOptimizationRequest(
             kernel_source="VALUE = 1\n",
             harness_path=Path(__file__),
             cases=(InputCase("a", {}), ),
-            target=KernelTarget("hip", "gfx942"),
+            target=KernelTarget("hip", "gfx942", optimization_guidance="Ring depth is not the lever."),
         )
         dummy_perf = PerformanceSummary(cases=(), aggregate_speedup=1.0)
         prompt = _build_prompt(request, CandidateContext(0, 0, request.kernel_source, dummy_perf, ()))
         self.assertIn("Evidence-driven optimization workflow", prompt)
-        self.assertIn("Human-curated knowledge base for gfx942", prompt)
+        self.assertIn("Ring depth is not the lever.", prompt)
 
-    def test_prompt_has_no_knowledge_block_for_an_uncurated_arch(self) -> None:
+    def test_prompt_has_no_guidance_block_when_the_bundle_supplies_none(self) -> None:
         request = KernelOptimizationRequest(
             kernel_source="VALUE = 1\n",
             harness_path=Path(__file__),
@@ -802,7 +842,19 @@ class HarnessTest(unittest.TestCase):
         dummy_perf = PerformanceSummary(cases=(), aggregate_speedup=1.0)
         prompt = _build_prompt(request, CandidateContext(0, 0, request.kernel_source, dummy_perf, ()))
         self.assertIn("Evidence-driven optimization workflow", prompt)
-        self.assertNotIn("Human-curated knowledge base", prompt)
+        self.assertNotIn("Frozen target-specific optimization guidance", prompt)
+
+    def test_provider_never_reads_knowledge_from_outside_the_bundle(self) -> None:
+        # input-contract.md: "Do not put such knowledge into the generic
+        # candidate provider." The provider must know only that a guidance
+        # string exists, never how to find one on disk.
+        import inspect
+
+        from . import providers
+
+        source = inspect.getsource(providers)
+        self.assertNotIn("knowledge_for", source)
+        self.assertNotIn("kernel_opt", source)
 
 
 class CommitBodyTest(unittest.TestCase):
