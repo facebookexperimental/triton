@@ -551,8 +551,8 @@ def TTNG_WaitBarrierOp
     Blocks the program progress until the mbarrier object in `alloc` completes
     its current phase.
 
-    This lowers a waitloop using PTX instruction
-    mbarrier.try_wait.parity.shared::cta.b64.
+    This lowers a waitloop using the PTX instruction
+    mbarrier.try_wait.parity{.acquire.cluster}.shared::cta.b64.
 
     Accepts an optional list of memory dependencies. If present, it is assumed
     that any of the dependencies may be accessed until the barrier completes.
@@ -1462,18 +1462,20 @@ def TTNG_TMEMSubSliceOp : TTNG_Op<"tmem_subslice", [Pure, MemDescViewTrait]> {
   let description = [{
     This operation takes a subslice of a tensor memory allocation and returns a
     new descriptor containing the address and a view of the subslice.
-    This is similar to ttg.memdesc_subslice except we can only slice along the
-    inner dimension of a 2D memdesc, as this is the only supported slice for
-    TMEM.
+    This is similar to ttg.memdesc_subslice and can slice either of the trailing
+    two tensor-memory dimensions, including non-contiguous views within a CTA.
   }];
-  let arguments = (ins TTG_MemDescType:$src, I32Attr:$N);
+  let arguments = (ins TTG_MemDescType:$src, I32Attr:$offset,
+                       DefaultValuedAttr<I32Attr, "1">:$dim);
 
   let assemblyFormat = [{
     $src attr-dict `:` qualified(type($src)) `->` qualified(type($result))
   }];
 
-  let builders = [OpBuilder<(ins "Value":$alloc, "int":$offset, "int":$size)>,
-  ];
+  let builders = [
+      OpBuilder<(ins "Value":$alloc, "int":$offset, "int":$size)>,
+      OpBuilder<(ins "Value":$alloc, "int":$offset, "int":$size, "int":$dim)>,
+    ];
   let results = (outs TTG_MemDescType:$result);
   let hasVerifier = 1;
 }
@@ -1486,6 +1488,8 @@ def TTNG_TMEMCopyOp : TTNG_Op<"tmem_copy"> {
     2D blocks stored contiguously in SMEM are copied into TMEM as specified by the destination address.
     This op lowers to the PTX instruction tcgen05.cp. This supports writing to
     the scales TMEM layout as well as the default TMEM layout.
+    For the default layout, each contiguous TMEM row segment must contain at
+    least 128 bits, the minimum width supported by tcgen05.cp.
     Currently, the semantics are different when writing to the TMEM scale layout.
 
     In the case of the default layout, the copy doesn't change the logical

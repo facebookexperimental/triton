@@ -16,6 +16,8 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
 
+#include <algorithm>
+
 using namespace mlir;
 using namespace mlir::triton;
 using namespace mlir::triton::gpu;
@@ -716,8 +718,10 @@ LogicalResult AuxDataMap::populateAndPassToWarpSpecialize(
       arith::CmpIOp::create(b, arith::CmpIPredicate::eq, ctaId, zero);
   ExperimentalLockReleaseOp::create(b, lockVal, isCTA0);
   if (numCTAs > 1) {
-    auto clusterBarrier = ClusterBarrierOp::create(b, b.getLoc());
-    internalClusterBarriers.push_back(clusterBarrier.getOperation());
+    auto clusterBarriers = hooks.createInitClusterBarrier(b);
+    assert(!clusterBarriers.empty() &&
+           "target must provide a cluster initialization barrier");
+    llvm::append_range(internalClusterBarriers, clusterBarriers);
   } else {
     BarrierOp::create(b, b.getLoc(), AddrSpace::Local);
   }
@@ -779,6 +783,7 @@ LogicalResult AuxDataMap::getBuffersAndBarriers(
     return failure();
 
   SmallVector<std::pair<Value, RegionInfo>> candidates[numMemTypes];
+  SmallVector<std::pair<Operation *, BufferRegion>> scratchCandidates;
   DenseSet<Value> seenValues;
   auto collectCandidates = [&](Value value) {
     if (!seenValues.insert(value).second)
@@ -796,19 +801,33 @@ LogicalResult AuxDataMap::getBuffersAndBarriers(
     candidates[static_cast<int>(*memType)].push_back(
         {value, analysis->getLatticeElement(value)->getValue()});
   };
-  module.walk([&](Operation *op) {
-    auto info = hooks.getMemEffectsOpInfo(op);
-    if (!info)
-      return;
-    if (info->trackingKind == MemEffectsOpInfo::TrackingKind::CommitCount &&
-        info->commitKind == CommitKind::AsyncCp)
+  WalkResult walkResult = module.walk([&](Operation *op) -> WalkResult {
+    auto infoOr = hooks.getMemEffectsOpInfo(op);
+    if (failed(infoOr))
+      return WalkResult::interrupt();
+    if (!*infoOr)
+      return WalkResult::advance();
+    const MemEffectsOpInfo &info = **infoOr;
+    if (info.trackingKind == MemEffectsOpInfo::TrackingKind::CommitCount &&
+        info.commitKind == CommitKind::AsyncCp)
       hasAsyncCopyReads |= llvm::any_of(
-          info->operandEffects, [](const MemEffectsOpInfo::Effects &e) {
+          info.operandEffects, [](const MemEffectsOpInfo::Effects &e) {
             return e.rw == MemEffectsOpInfo::Effects::Read;
           });
-    for (const auto &effect : info->operandEffects)
-      collectCandidates(effect.buf);
+    for (const auto &effect : info.operandEffects) {
+      if (auto *value = std::get_if<Value>(&effect.buffer)) {
+        collectCandidates(*value);
+      } else {
+        scratchCandidates.push_back(
+            {op, std::get<MemEffectsOpInfo::Effects::StaticSharedBuffer>(
+                     effect.buffer)
+                     .region});
+      }
+    }
+    return WalkResult::advance();
   });
+  if (walkResult.wasInterrupted())
+    return failure();
 
   analysis->calculateUsedBufferRegions(module);
   barrierRegions = analysis->getAllUsedBufferRegions(
@@ -821,6 +840,12 @@ LogicalResult AuxDataMap::getBuffersAndBarriers(
                           : BufferRegionAnalysis::TENSOR_MEMORY;
     SmallVector<BufferRegion> regions =
         analysis->getAllUsedBufferRegions(regionType);
+    if (memType == MemType::SHARED_MEM) {
+      for (const auto &[op, region] : scratchCandidates)
+        regions.push_back(region);
+      llvm::sort(regions);
+      regions.erase(std::unique(regions.begin(), regions.end()), regions.end());
+    }
     bufRegions[iMemType] = regions;
     bool hasUnknown = analysis->hasUnknownUsedBufferRegions(regionType);
     if (regions.empty() && !hasUnknown)
@@ -860,6 +885,23 @@ LogicalResult AuxDataMap::getBuffersAndBarriers(
         }
       }
       bufferCandidates[iMemType].try_emplace(value, std::move(stateCandidates));
+    }
+
+    if (memType == MemType::SHARED_MEM) {
+      for (const auto &[op, region] : scratchCandidates) {
+        auto it = llvm::lower_bound(regions, region);
+        if (it == regions.end() || !(*it == region)) {
+          InFlightDiagnostic diag = op->emitError(
+              "compiler scratch region is absent from the ConSan registry: ");
+          region.print(diag);
+          return failure();
+        }
+        uint32_t id = std::distance(regions.begin(), it);
+        BufferStateCandidates stateCandidates;
+        stateCandidates.cases.push_back(
+            {region.baseOffset, bufferStatePlans[iMemType].regionMasks[id], 1});
+        scratchBufferCandidates.try_emplace(op, std::move(stateCandidates));
+      }
     }
 
     if (!bufRegions[iMemType].empty())

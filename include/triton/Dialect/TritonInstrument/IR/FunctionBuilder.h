@@ -3,6 +3,7 @@
 
 #include "triton/Dialect/TritonInstrument/IR/Utility.h"
 
+#include <optional>
 #include <string>
 #include <variant>
 
@@ -72,6 +73,16 @@ public:
 
 private:
   SmallVector<Arg> args;
+};
+
+/// A byte-addressed memory region materialized in the address representation
+/// used by ConSan's buffer descriptors. The base may come from either an SSA
+/// memdesc or a compiler-owned static shared-memory allocation.
+struct MaterializedBufferRegion {
+  // Masked runtime address in the memory object's address space. For shared
+  // memory this includes the function's shared-memory base pointer.
+  Value baseAddress;
+  uint32_t length;
 };
 
 class FunctionBuilder {

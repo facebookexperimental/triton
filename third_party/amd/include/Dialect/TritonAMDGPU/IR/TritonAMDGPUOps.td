@@ -1026,10 +1026,11 @@ def AsyncTDMCopyGlobalToLocalOp
     it sends an "LDS atomic arrive" to signal its completion.
 
     `warp_used_hint` is an optional i32 bitmask performance hint for
-    partial TDM copy: bit `n` (LSB = warp 0) means warp `n` issues the
-    instruction; bits above `num_warps - 1` must be zero.  Same data
-    lands in shared memory either way -- only emission changes:
-    `K = popcount(hint)` warps cover the block, the rest are pred-off.
+    partial TDM copy: bit `n` (LSB = warp 0) means warp `n` carries a
+    real descriptor; bits above `num_warps - 1` must be zero. Same data
+    lands in shared memory either way: `K = popcount(hint)` active warps
+    cover the block, while inactive warps still issue the TDM instruction
+    with a null descriptor.
 
     For "all warps participate", omit the attribute (preferred) or pass
     a full bitmask `K = num_warps`; an explicit `warp_used_hint = 0` is
@@ -1148,6 +1149,8 @@ def AsyncTDMCopyLocalToGlobalOp
           Arg<Optional<TTG_MemDescType>, "", [MemWrite<SharedMemory>]>:$barrier,
           DefaultValuedAttr<TT_CacheModifierAttr,
                             "triton::CacheModifier::NONE">:$cache);
+
+  let results = (outs TTG_AsyncToken:$token);
 
   let assemblyFormat = [{
     $desc `from` $src (`,` `barrier` `=` $barrier^)?

@@ -657,6 +657,10 @@ std::string getElementTypeName(Type type) {
 struct LocalAllocInfo {
   bool isBarrierAlloc = false;
   int barrierCount = 0;
+  // Arrive count of the barrier (init_barrier's `count`); default 1.
+  int arriveCount = 1;
+  // Set when the slots disagree on arrive count, which has no TLX spelling.
+  bool conflictingArriveCounts = false;
   // For regular allocs: shape (excluding first dim which is count),
   // element type, count
   SmallVector<int64_t> shape;
@@ -684,12 +688,35 @@ LocalAllocInfo analyzeLocalAlloc(Operation *localAllocOp) {
     bool foundInitBarrier = false;
     int initBarrierCount = 0;
 
+    // One allocation emits one alloc call, so its slots must agree on the
+    // arrive count; there is no TLX spelling for a per-slot count.
+    auto recordArriveCount = [&](Operation *initOp) {
+      auto cAttr = initOp->getAttrOfType<IntegerAttr>("count");
+      if (!cAttr)
+        return;
+      if (foundInitBarrier && cAttr.getInt() != info.arriveCount) {
+        localAllocOp->emitError("barrier slots with differing arrive counts do "
+                                "not round-trip to TLX");
+        info.conflictingArriveCounts = true;
+      }
+      info.arriveCount = cAttr.getInt();
+    };
+
     for (Operation *user : allocResult.getUsers()) {
-      if (user->getName().getStringRef() == "ttg.memdesc_index") {
+      StringRef userName = user->getName().getStringRef();
+      // Single-slot barrier, used directly with no memdesc_index.
+      if (userName == "ttng.init_barrier") {
+        recordArriveCount(user);
+        foundInitBarrier = true;
+        initBarrierCount++;
+        continue;
+      }
+      if (userName == "ttg.memdesc_index") {
         // Check if memdesc_index result is used by init_barrier
         for (Value result : user->getResults()) {
           for (Operation *indexUser : result.getUsers()) {
             if (indexUser->getName().getStringRef() == "ttng.init_barrier") {
+              recordArriveCount(indexUser);
               foundInitBarrier = true;
               initBarrierCount++;
             }
@@ -1368,12 +1395,30 @@ void printSimplifiedOp(
     auto it = allocInfoMap.find(op);
     if (it != allocInfoMap.end()) {
       const LocalAllocInfo &info = it->second;
+      if (info.isBarrierAlloc && info.conflictingArriveCounts) {
+        // Any single count here would be wrong for the other slots.
+        os << "# unsupported: barrier slots with differing arrive counts";
+        printLocComment(op, os);
+        return;
+      }
       if (info.isBarrierAlloc) {
         // Print as result = tlx.alloc_barriers(count)
         if (op->getNumResults() > 0) {
           os << getValueName(op->getResult(0), argSubstitutionMap) << " = ";
         }
-        os << "tlx.alloc_barriers(" << info.barrierCount << ")";
+        // An arrive count that is a positive multiple of the warp size is a
+        // warp barrier: every thread arrives, rather than one leader per warp.
+        ModuleOp mod = op->getParentOfType<ModuleOp>();
+        int warpSize = mod ? ttg::TritonGPUDialect::getThreadsPerWarp(mod) : 32;
+        if (info.arriveCount >= warpSize && info.arriveCount % warpSize == 0) {
+          os << "tlx.alloc_warp_barrier(" << info.barrierCount << ", "
+             << (info.arriveCount / warpSize) << ")";
+        } else if (info.arriveCount != 1) {
+          os << "tlx.alloc_barriers(" << info.barrierCount << ", "
+             << info.arriveCount << ")";
+        } else {
+          os << "tlx.alloc_barriers(" << info.barrierCount << ")";
+        }
         printLocComment(op, os);
         return;
       } else {
@@ -1831,6 +1876,34 @@ void printSimplifiedOp(
     return;
   }
 
+  // ttng.arrive_barrier: `count` is an attribute and `pred` an optional
+  // operand, but the generic mapping printed both positionally.
+  if (opName == "ttng.arrive_barrier") {
+    // A multicast arrive has no TLX spelling; leave a marker instead of an
+    // arrive that would look local but mean something else.
+    auto ctaMask = op->getAttrOfType<IntegerAttr>("ctaMask");
+    if (ctaMask && ctaMask.getInt() != 0) {
+      op->emitError("multicast arrive_barrier does not round-trip to TLX");
+      os << "# unsupported: multicast arrive_barrier (ctaMask="
+         << ctaMask.getInt() << ")";
+      printLocComment(op, os);
+      return;
+    }
+    os << "tlx.barrier_arrive("
+       << getValueName(op->getOperand(0), argSubstitutionMap);
+    // count is required on this op, but tolerate its absence on hand-written
+    // IR rather than crash; 1 is the value the op defaults to anyway.
+    auto countAttr = op->getAttrOfType<IntegerAttr>("count");
+    int64_t count = countAttr ? countAttr.getInt() : 1;
+    if (count != 1)
+      os << ", " << count;
+    if (op->getNumOperands() >= 2)
+      os << ", pred=" << getValueName(op->getOperand(1), argSubstitutionMap);
+    os << ")";
+    printLocComment(op, os);
+    return;
+  }
+
   // Get the TLX name or use original
   auto it = opNameMap.find(opName);
   StringRef tlxName = (it != opNameMap.end()) ? it->second : opName;
@@ -1866,6 +1939,60 @@ void printSimplifiedOp(
   os << ")";
 
   printLocComment(op, os);
+}
+
+// tt.map_elementwise carries its per-element computation in a region; pack > 1
+// runs that body over several elements at once, which has no elementwise form.
+bool isInlinableMapElementwise(Operation *op) {
+  auto pack = op->getAttrOfType<IntegerAttr>("pack");
+  return op->getName().getStringRef() == "tt.map_elementwise" &&
+         op->getNumRegions() > 0 && op->getNumResults() > 0 &&
+         !op->getRegion(0).empty() && pack && pack.getInt() == 1;
+}
+
+// Inline a tt.map_elementwise body as elementwise tensor ops, as
+// map_elementwise is only a scheduling hint.
+void printMapElementwise(
+    Operation *op, llvm::raw_ostream &os,
+    const llvm::StringMap<StringRef> &opNameMap,
+    const DenseMap<Operation *, LocalAllocInfo> &allocInfoMap,
+    llvm::DenseSet<Operation *> &skippedOps, unsigned indent,
+    DenseMap<Value, Value> *argSubstitutionMap) {
+  DenseMap<Value, Value> bodySubst;
+  if (argSubstitutionMap)
+    bodySubst = *argSubstitutionMap;
+  Block &bb = op->getRegion(0).front();
+  for (unsigned i = 0; i < bb.getNumArguments() && i < op->getNumOperands();
+       ++i) {
+    Value target = op->getOperand(i);
+    if (argSubstitutionMap) {
+      auto it = argSubstitutionMap->find(target);
+      if (it != argSubstitutionMap->end())
+        target = it->second;
+    }
+    bodySubst[bb.getArgument(i)] = target;
+  }
+  for (Operation &bodyOp : bb) {
+    if (bodyOp.getName().getStringRef() == "tt.map_elementwise.return") {
+      for (unsigned k = 0; k < indent; ++k)
+        os << "  ";
+      // One tuple assignment so a multi-result map binds every result; result i
+      // is named in the enclosing scope, returned operand i in the inlined body.
+      assert(op->getNumResults() == bodyOp.getNumOperands() &&
+             "map_elementwise must return one value per result");
+      unsigned n = std::min(op->getNumResults(), bodyOp.getNumOperands());
+      for (unsigned i = 0; i < n; ++i)
+        os << (i ? ", " : "")
+           << getValueName(op->getResult(i), argSubstitutionMap);
+      os << " = ";
+      for (unsigned i = 0; i < n; ++i)
+        os << (i ? ", " : "") << getValueName(bodyOp.getOperand(i), &bodySubst);
+      printLocComment(op, os);
+    } else if (!shouldSkipOp(&bodyOp, allocInfoMap, skippedOps)) {
+      printSimplifiedOp(&bodyOp, os, opNameMap, allocInfoMap, indent,
+                        &bodySubst);
+    }
+  }
 }
 
 // Print a block
@@ -2023,6 +2150,12 @@ void printBlock(Block &block, llvm::raw_ostream &os,
       continue;
     }
 
+    if (isInlinableMapElementwise(&op)) {
+      printMapElementwise(&op, os, opNameMap, allocInfoMap, skippedOps, indent,
+                          argSubstitutionMap);
+      continue;
+    }
+
     // Special handling for tt.reduce — detect combiner and emit tl.max/tl.sum
     if (op.getName().getStringRef() == "tt.reduce" && op.getNumRegions() > 0 &&
         op.getNumResults() > 0) {
@@ -2176,6 +2309,11 @@ void printBlockOps(Block &block, llvm::raw_ostream &os,
     if (op.getName().getStringRef() == "scf.if") {
       printIfOp(&op, os, opNameMap, allocInfoMap, skippedOps, indent,
                 argSubstitutionMap);
+      continue;
+    }
+    if (isInlinableMapElementwise(&op)) {
+      printMapElementwise(&op, os, opNameMap, allocInfoMap, skippedOps, indent,
+                          argSubstitutionMap);
       continue;
     }
     // Special handling for tt.reduce in CF printer
@@ -2751,6 +2889,15 @@ public:
   void runOnOperation() override {
     ModuleOp m = getOperation();
 
+    // Ops the printer cannot represent report a diagnostic. Count those so the
+    // pass fails, rather than handing back a silently incomplete kernel.
+    unsigned numErrors = 0;
+    ScopedDiagnosticHandler countErrors(m.getContext(), [&](Diagnostic &diag) {
+      if (diag.getSeverity() == DiagnosticSeverity::Error)
+        ++numErrors;
+      return failure();
+    });
+
     // Build the lookup map
     static llvm::StringMap<StringRef> opNameMap = buildOpNameMap();
 
@@ -2805,6 +2952,8 @@ public:
     }
 
     valueNameCacheStorage = nullptr;
+    if (numErrors > 0)
+      signalPassFailure();
   }
 };
 

@@ -2050,6 +2050,16 @@ LogicalResult TMEMCopyOp::verify() {
     if (srcTy.getElementType().getIntOrFloatBitWidth() != 32) {
       return emitOpError("Source element type should be 32-bit.");
     }
+    auto tmemLl = toLinearLayout(dstTy);
+    auto kCol = StringAttr::get(getContext(), "col");
+    auto colBases = tmemLl.getBases().lookup(kCol);
+    auto firstHole = llvm::find_if(colBases, [](ArrayRef<int32_t> basis) {
+      return llvm::all_of(basis,
+                          [](int32_t component) { return component == 0; });
+    });
+    if (std::distance(colBases.begin(), firstHole) < 2)
+      return emitOpError("The destination must have at least 128 contiguous "
+                         "bits per TMEM row.");
   }
   // Given that we want to support flexible input SMEM shapes, kinds of shape
   // checking we can do here are limited. For simplicity, shape checking is
@@ -2064,20 +2074,23 @@ LogicalResult TMEMSubSliceOp::verify() {
 
   if (!isa<triton::nvidia_gpu::TensorMemorySpaceAttr>(srcTy.getMemorySpace()))
     return emitOpError("The source must be a tensor memory buffer.");
-  // Meta Triton divergence: TMEM subslices may be higher-rank (multibuffered)
-  // and may reduce blockN (packed/reuse), so we do not enforce upstream #7777's
-  // rank==2 / same-encoding / same-allocShape restrictions. We require equal
-  // rank and innermost-dimension slicing instead.
   if (srcTy.getRank() != dstTy.getRank())
     return emitOpError(
         "The destination must have the same rank as the source.");
-  if (getN() < 0 || getN() + dstTy.getShape().back() > srcTy.getShape().back())
+  if (srcTy.getRank() < 2)
+    return emitOpError("Tensor memory buffers must have rank at least 2.");
+  int32_t dim = getDim();
+  if (dim < 0 || dim > 1)
+    return emitOpError("The slice dimension must be 0 or 1.");
+  unsigned sliceDim = srcTy.getRank() - 2 + dim;
+  int32_t offset = getOffset();
+  if (offset < 0 ||
+      offset + dstTy.getDimSize(sliceDim) > srcTy.getDimSize(sliceDim))
     return emitOpError("Subslice range exceeds source shape.");
-  for (auto [srcDim, dstDim] :
-       llvm::zip(srcTy.getShape().drop_back(), dstTy.getShape().drop_back())) {
-    if (srcDim != dstDim)
-      return emitOpError(
-          "Only slicing along the innermost dimension is supported.");
+  for (unsigned i = 0; i < srcTy.getRank(); ++i) {
+    if (i != sliceDim && srcTy.getDimSize(i) != dstTy.getDimSize(i))
+      return emitOpError("The result must have the same size as the source in "
+                         "the dimensions that are not being sliced.");
   }
 
   Attribute srcEncoding = srcTy.getEncoding();
@@ -2118,43 +2131,67 @@ LogicalResult TMEMSubSliceOp::verify() {
     if (dstScaleEncoding.getCGALayout() != scaleEncoding.getCGALayout())
       return emitOpError(
           "The destination must have the same CTASplit size as the source.");
-  } else if (!isa<triton::tlx::DummyTMEMLayoutAttr>(dstEncoding)) {
-    return emitOpError(
-        "The destination must use the same TMEM encoding kind as the source.");
+  } else {
+    if (!isa<triton::tlx::DummyTMEMLayoutAttr>(dstEncoding))
+      return emitOpError("The destination must use the same TMEM encoding kind "
+                         "as the source.");
+    return success();
   }
-  // Checks adopted from upstream #7777 that are compatible with Meta Triton's
-  // higher-rank / reduced-blockN subslices.
   if (srcTy.getElementType() != dstTy.getElementType())
     return emitOpError(
         "The source and result must have the same element type.");
-  auto offset = getN();
-  if (offset & (dstTy.getShape().back() - 1)) {
+  auto srcShape = srcTy.getShape().take_back(2);
+  auto dstShape = dstTy.getShape().take_back(2);
+  if (offset & (dstShape[dim] - 1))
     return emitError("The split offset may not touch the tile");
-  }
-  if (offset >= srcTy.getShape().back()) {
-    return emitError("The split offset may not exceed the source shape");
-  }
-  return mlir::success();
+  auto srcLL = toLinearLayout(srcShape, srcEncoding);
+  auto isTrimmed = [&](ArrayRef<int32_t> basis) {
+    return basis[dim] >= dstShape[dim];
+  };
+  auto kBlock = StringAttr::get(getContext(), "block");
+  if (llvm::any_of(srcLL.getBases().lookup(kBlock), isTrimmed))
+    return emitOpError("The result may not be sliced across CTAs.");
+
+  auto dims = standardOutDimNames(getContext(), 2);
+  auto logical = static_cast<int32_t>(offset);
+  SmallVector<std::pair<StringAttr, int32_t>> logicalOffset = {
+      {dims[0], dim == 0 ? logical : 0}, {dims[1], dim == 1 ? logical : 0}};
+  auto rowCol = srcLL.pseudoinvert().apply(logicalOffset);
+  if (uint64_t(rowCol[1].second) * srcTy.getElementTypeBitWidth() % 32 != 0)
+    return emitOpError(
+        "The split offset must be 32-bit aligned in tensor memory.");
+
+  return success();
 }
 
 void TMEMSubSliceOp::build(OpBuilder &builder, OperationState &state,
                            Value alloc, int offset, int size) {
+  build(builder, state, alloc, offset, size, 1);
+}
+
+void TMEMSubSliceOp::build(OpBuilder &builder, OperationState &state,
+                           Value alloc, int offset, int size, int dim) {
   auto allocTy = cast<triton::gpu::MemDescType>(alloc.getType());
   SmallVector<int64_t> shape(allocTy.getShape());
-  shape.back() = size;
+  unsigned sliceDim = shape.size() - 2 + dim;
+  shape[sliceDim] = size;
   Attribute newEncoding = allocTy.getEncoding();
-  if (auto encoding = dyn_cast<triton::nvidia_gpu::TensorMemoryEncodingAttr>(
-          allocTy.getEncoding())) {
-    unsigned newBlockN = std::min<unsigned>(encoding.getBlockN(), size);
-    newEncoding = triton::nvidia_gpu::TensorMemoryEncodingAttr::get(
-        builder.getContext(), encoding.getBlockM(), newBlockN,
-        encoding.getColStride(), encoding.getCGALayout(), encoding.getTwoCTAs(),
-        encoding.getCtaMode(), encoding.getFp4Padded());
+  if (dim == 1) {
+    auto encoding = dyn_cast<triton::nvidia_gpu::TensorMemoryEncodingAttr>(
+        allocTy.getEncoding());
+    if (encoding) {
+      unsigned newBlockN = std::min<unsigned>(encoding.getBlockN(), size);
+      newEncoding = triton::nvidia_gpu::TensorMemoryEncodingAttr::get(
+          builder.getContext(), encoding.getBlockM(), newBlockN,
+          encoding.getColStride(), encoding.getCGALayout(),
+          encoding.getTwoCTAs(), encoding.getCtaMode(),
+          encoding.getFp4Padded());
+    }
   }
   auto subsliceType = gpu::MemDescType::get(
       shape, allocTy.getElementType(), newEncoding, allocTy.getMemorySpace(),
       allocTy.getMutableMemory(), allocTy.getAllocShape());
-  build(builder, state, subsliceType, alloc, offset);
+  build(builder, state, subsliceType, alloc, offset, dim);
 }
 
 // -- SubtiledRegionOp --

@@ -119,6 +119,9 @@ from triton.language.extra.tlx.tutorials.amd_addmm_gfx950 import (
     addmm as _amd_addmm,
     available_paths as _amd_addmm_paths,
 )
+from triton.language.extra.tlx.tutorials.gfx9_gemm.inter_wave.a16w16 import (
+    matmul_kernel as _amd_gemm,
+)
 from triton.language.extra.tlx.tutorials import amd_hstu_attn as _hstu
 from triton.tools.mxfp import MXScaleTensor
 
@@ -2562,19 +2565,106 @@ def test_amd_mxfp_gemm_tdm_pipelined(TRANSPOSE_B):
 # already agrees with `register` -- so a wrong `inter_wave` would be dropped
 # from the race and the suite would still pass. Iterating `available_paths`
 # asserts every path a shape can take against torch, independently.
-def _check_addmm_all_paths(bias, a, b, dtype=torch.float16):
+def test_amd_gemm_offset_width_selection():
+    i32_max_element = (1 << 30) - 1
+    within_i32 = torch.empty((i32_max_element + 1, ), device="meta", dtype=torch.float16)
+    beyond_i32 = torch.empty((i32_max_element + 2, ), device="meta", dtype=torch.float16)
+
+    assert not _amd_gemm._needs_i64_offsets(within_i32)
+    assert _amd_gemm._needs_i64_offsets(beyond_i32)
+
+
+def test_amd_gemm_output_offset_width_selection(monkeypatch):
+    launches = []
+
+    class FakeKernel:
+
+        def __getitem__(self, grid):
+
+            def launch(*args, **kwargs):
+                launches.append((grid, kwargs["USE_I64_C_OFFSETS"]))
+
+            return launch
+
+    monkeypatch.setattr(_amd_gemm, "a16w16_8wave", FakeKernel())
+    for M, N in [(256, 256), (925210, 4096)]:
+        a = torch.empty((M, 128), device="meta", dtype=torch.float16)
+        b = torch.empty((128, N), device="meta", dtype=torch.float16)
+        _amd_gemm._launch(a, b, SPLIT_K=1, TILE=(256, 256))
+
+    assert [use_i64_c_offsets for _, use_i64_c_offsets in launches] == [False, True]
+
+
+@pytest.mark.parametrize(
+    "split_k,defer_epilogue",
+    [(2, False), (1, True)],
+    ids=["split-k", "deferred-epilogue"],
+)
+def test_amd_gemm_rejects_large_workspace(split_k, defer_epilogue):
+    M, N, K = 262145, 2048, 256
+    a = torch.empty((M, K), device="meta", dtype=torch.float16)
+    b = torch.empty((K, N), device="meta", dtype=torch.float16)
+
+    with pytest.raises(ValueError, match="FP32 workspace exceeds signed-i32 byte offsets"):
+        _amd_gemm._launch(
+            a,
+            b,
+            SPLIT_K=split_k,
+            TILE=(256, 256),
+            DEFER_EPILOGUE=defer_epilogue,
+        )
+
+
+def test_amd_gemm_rejects_large_bias():
+    M, N, K = 925210, 4096, 128
+    a = torch.empty((M, K), device="meta", dtype=torch.float16)
+    b = torch.empty((K, N), device="meta", dtype=torch.float16)
+    bias = torch.empty((M, N), device="meta", dtype=torch.float16)
+
+    with pytest.raises(ValueError, match="bias exceeds signed-i32 byte offsets"):
+        _amd_gemm._launch(a, b, bias=bias, SPLIT_K=1, TILE=(256, 256))
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware (CDNA4)")
+def test_amd_gemm_large_output_offsets():
+    M, N, K = 925210, 4096, 1024
+    a = torch.zeros((M, K), device=DEVICE, dtype=torch.float16)
+    a[-1].fill_(1)
+    b = torch.ones((K, N), device=DEVICE, dtype=torch.float16)
+
+    out = _amd_gemm._launch(a, b, SPLIT_K=1, TILE=(256, 256))
+
+    assert not _amd_gemm._needs_i64_offsets(a)
+    assert not _amd_gemm._needs_i64_offsets(b)
+    assert _amd_gemm._needs_i64_offsets(out)
+    assert out[0, 0].item() == 0.0
+    torch.testing.assert_close(out[-1], torch.full_like(out[-1], K))
+
+
+def _check_addmm_all_paths(bias, a, b, split_k=None):
     ref = torch.addmm(bias, a, b)
     config = Gemm.CONFIGS["amd_standalone_addmm_register"]
     for path in _amd_addmm_paths(bias, a, b):
-        out = _amd_addmm(bias, a, b, path=path, config=config)
+        out = _amd_addmm(bias, a, b, SPLIT_K=split_k, path=path, config=config)
         torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2, msg=lambda m, path=path: f"path={path}\n{m}")
 
 
+def _check_addmm_default_matches_register_exact(bias, a, b, split_k):
+    config = Gemm.CONFIGS["amd_standalone_addmm_register"]
+    expected = _amd_addmm(bias, a, b, SPLIT_K=split_k, path="register", config=config)
+    actual = _amd_addmm(bias, a, b, SPLIT_K=split_k, config=config)
+    assert torch.equal(actual, expected)
+
+
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
-@pytest.mark.parametrize("bias_2d,split_k", [(False, 1), (True, 2)], ids=["1d-direct", "2d-split-k"])
+@pytest.mark.parametrize(
+    "bias_2d,split_k,N",
+    [(False, 1, 256), (True, 2, 256), (False, 1, 384)],
+    ids=["1d-direct", "2d-split-k", "1d-direct-n-tail"],
+)
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware (CDNA4)")
-def test_amd_standalone_addmm(dtype, bias_2d, split_k):
-    M, N, K = 256, 256, 2048
+def test_amd_standalone_addmm(dtype, bias_2d, split_k, N):
+    M, K = 256, 2048
     torch.manual_seed(0)
     a = (torch.randn(M, K, device=DEVICE, dtype=dtype) + 1) / K
     b = ((torch.randn(N, K, device=DEVICE, dtype=dtype) + 1) / K).T
@@ -2587,7 +2677,8 @@ def test_amd_standalone_addmm(dtype, bias_2d, split_k):
         out = _amd_addmm(bias, a, b, SPLIT_K=split_k)
         torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
     else:
-        _check_addmm_all_paths(bias, a, b, dtype=dtype)
+        _check_addmm_all_paths(bias, a, b, split_k)
+        _check_addmm_default_matches_register_exact(bias, a, b, split_k)
 
 
 @pytest.mark.parametrize(

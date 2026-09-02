@@ -592,6 +592,9 @@ def a16w16_8wave(
     SPLIT_K: tl.constexpr,
     ADD_BIAS: tl.constexpr,
     HAS_REGISTER_TAIL: tl.constexpr,
+    USE_I64_A_OFFSETS: tl.constexpr,
+    USE_I64_B_OFFSETS: tl.constexpr,
+    USE_I64_C_OFFSETS: tl.constexpr,
     PIN_OFFSET_LAYOUT: tl.constexpr,
     DEFER_EPILOGUE: tl.constexpr,
 ):
@@ -611,8 +614,14 @@ def a16w16_8wave(
     # keeps enough divisibility for #linear.
     split_id = tl.program_id(0) // GRID_MN
     pid = tl.program_id(0) % GRID_MN
-    ak_split = split_id * KS * stride_ak
-    bk_split = split_id * KS * stride_bk
+    if USE_I64_A_OFFSETS:
+        ak_split = split_id.to(tl.int64) * KS * stride_ak
+    else:
+        ak_split = split_id * KS * stride_ak
+    if USE_I64_B_OFFSETS:
+        bk_split = split_id.to(tl.int64) * KS * stride_bk
+    else:
+        bk_split = split_id * KS * stride_bk
     num_pid_m = tl.cdiv(M, BLOCK_M)
     num_pid_n = tl.cdiv(N, BLOCK_N)
 
@@ -682,20 +691,37 @@ def a16w16_8wave(
     offs_bn = pid_n * BLOCK_N + tl.arange(0, HALF_N)
     offs_k = tl.arange(0, BLOCK_K)
 
-    a_row_off = offs_am[:, None] * stride_am
-    b_col_off = offs_bn[None, :] * stride_bn
+    # Widen coordinates before multiplying by strides so large tensors cannot
+    # overflow while constructing the pointer offset.
+    if USE_I64_A_OFFSETS:
+        a_row_off = offs_am.to(tl.int64)[:, None] * stride_am
+        a_k_off = offs_k.to(tl.int64)[None, :] * stride_ak
+    else:
+        a_row_off = offs_am[:, None] * stride_am
+        a_k_off = offs_k[None, :] * stride_ak
+    if USE_I64_B_OFFSETS:
+        b_col_off = offs_bn.to(tl.int64)[None, :] * stride_bn
+        b_k_off = offs_k.to(tl.int64)[:, None] * stride_bk
+    else:
+        b_col_off = offs_bn[None, :] * stride_bn
+        b_k_off = offs_k[:, None] * stride_bk
     if PIN_OFFSET_LAYOUT:
         a_row_off = tl.multiple_of(a_row_off, (8, 8))
         b_col_off = tl.multiple_of(b_col_off, (8, 8))
-    a_top_off = a_row_off + offs_k[None, :] * stride_ak
+    a_top_off = a_row_off + a_k_off
     a_bot_off = a_top_off + HALF_M * stride_am
-    b_left_off = offs_k[:, None] * stride_bk + b_col_off
+    b_left_off = b_k_off + b_col_off
     b_right_off = b_left_off + HALF_N * stride_bn
     if PIN_OFFSET_LAYOUT:
         a_top_off = tlx.require_layout(a_top_off, _A_OFFSET_LAYOUT_256)
         a_bot_off = tlx.require_layout(a_bot_off, _A_OFFSET_LAYOUT_256)
         b_left_off = tlx.require_layout(b_left_off, _B_OFFSET_LAYOUT_256)
         b_right_off = tlx.require_layout(b_right_off, _B_OFFSET_LAYOUT_256)
+    a_k_mask = offs_k[None, :] < BLOCK_K
+    a_top_mask = (offs_am[:, None] < M) & a_k_mask
+    a_bot_mask = ((offs_am[:, None] + HALF_M) < M) & a_k_mask
+    b_left_mask = tl.broadcast_to(offs_bn[None, :] < N, b_left_off.shape)
+    b_right_mask = tl.broadcast_to((offs_bn[None, :] + HALF_N) < N, b_right_off.shape)
 
     # Keep this pipeline inline: its K-contiguous B producer layout is inferred
     # together with the bank-conflict-free LDS layout. Moving it through a JIT
@@ -721,22 +747,22 @@ def a16w16_8wave(
     n_full = KS // BLOCK_K
     n_pipe = (n_full // 2) * 2
 
-    tlx.buffer_load_to_local(smem_b_left[0], b_ptr, b_left_off + kb)
+    tlx.async_load(b_ptr + b_left_off + kb, smem_b_left[0], mask=b_left_mask, other=0.0)
     tlx.async_load_commit_group()
-    tlx.buffer_load_to_local(smem_a_top[0], a_ptr, a_top_off + ka)
+    tlx.async_load(a_ptr + a_top_off + ka, smem_a_top[0], mask=a_top_mask, other=0.0)
     tlx.async_load_commit_group()
-    tlx.buffer_load_to_local(smem_a_bot[0], a_ptr, a_bot_off + ka)
+    tlx.async_load(a_ptr + a_bot_off + ka, smem_a_bot[0], mask=a_bot_mask, other=0.0)
     tlx.async_load_commit_group()
-    tlx.buffer_load_to_local(smem_b_right[0], b_ptr, b_right_off + kb)
+    tlx.async_load(b_ptr + b_right_off + kb, smem_b_right[0], mask=b_right_mask, other=0.0)
     tlx.async_load_commit_group()
 
-    tlx.buffer_load_to_local(smem_b_left[1], b_ptr, b_left_off_n + kb)
+    tlx.async_load(b_ptr + b_left_off_n + kb, smem_b_left[1], mask=b_left_mask, other=0.0)
     tlx.async_load_commit_group()
-    tlx.buffer_load_to_local(smem_a_top[1], a_ptr, a_top_off_n + ka)
+    tlx.async_load(a_ptr + a_top_off_n + ka, smem_a_top[1], mask=a_top_mask, other=0.0)
     tlx.async_load_commit_group()
-    tlx.buffer_load_to_local(smem_a_bot[1], a_ptr, a_bot_off_n + ka)
+    tlx.async_load(a_ptr + a_bot_off_n + ka, smem_a_bot[1], mask=a_bot_mask, other=0.0)
     tlx.async_load_commit_group()
-    tlx.buffer_load_to_local(smem_b_right[1], b_ptr, b_right_off_n + kb)
+    tlx.async_load(b_ptr + b_right_off_n + kb, smem_b_right[1], mask=b_right_mask, other=0.0)
     tlx.async_load_commit_group()
 
     ka += BLOCK_K * stride_ak * 2
@@ -752,7 +778,7 @@ def a16w16_8wave(
             acc_tl = tl.dot(a_top, b_left, acc_tl)
         with tlx.warp_pipeline_stage("mem", priority=1):
             a_bot = tlx.local_load(smem_a_bot[0], relaxed=True)
-            tlx.buffer_load_to_local(smem_b_left[0], b_ptr, b_left_off + kb)
+            tlx.async_load(b_ptr + b_left_off + kb, smem_b_left[0], mask=b_left_mask, other=0.0)
             tlx.async_load_commit_group()
 
         tlx.async_load_wait_group(5)
@@ -760,7 +786,7 @@ def a16w16_8wave(
             acc_bl = tl.dot(a_bot, b_left, acc_bl)
         with tlx.warp_pipeline_stage("mem", priority=1):
             b_right = tlx.local_load(smem_b_right[0], relaxed=True)
-            tlx.buffer_load_to_local(smem_a_top[0], a_ptr, a_top_off + ka)
+            tlx.async_load(a_ptr + a_top_off + ka, smem_a_top[0], mask=a_top_mask, other=0.0)
             tlx.async_load_commit_group()
 
         tlx.async_load_wait_group(5)
@@ -768,7 +794,7 @@ def a16w16_8wave(
             acc_tr = tl.dot(a_top, b_right, acc_tr)
         with tlx.warp_pipeline_stage("mem", priority=1):
             b_left = tlx.local_load(smem_b_left[1], relaxed=True)
-            tlx.buffer_load_to_local(smem_a_bot[0], a_ptr, a_bot_off + ka)
+            tlx.async_load(a_ptr + a_bot_off + ka, smem_a_bot[0], mask=a_bot_mask, other=0.0)
             tlx.async_load_commit_group()
 
         tlx.async_load_wait_group(5)
@@ -776,7 +802,7 @@ def a16w16_8wave(
             acc_br = tl.dot(a_bot, b_right, acc_br)
         with tlx.warp_pipeline_stage("mem", priority=1):
             a_top = tlx.local_load(smem_a_top[1], relaxed=True)
-            tlx.buffer_load_to_local(smem_b_right[0], b_ptr, b_right_off + kb)
+            tlx.async_load(b_ptr + b_right_off + kb, smem_b_right[0], mask=b_right_mask, other=0.0)
             tlx.async_load_commit_group()
 
         tlx.async_load_wait_group(5)
@@ -784,7 +810,7 @@ def a16w16_8wave(
             acc_tl = tl.dot(a_top, b_left, acc_tl)
         with tlx.warp_pipeline_stage("mem", priority=1):
             a_bot = tlx.local_load(smem_a_bot[1], relaxed=True)
-            tlx.buffer_load_to_local(smem_b_left[1], b_ptr, b_left_off_n + kb)
+            tlx.async_load(b_ptr + b_left_off_n + kb, smem_b_left[1], mask=b_left_mask, other=0.0)
             tlx.async_load_commit_group()
 
         tlx.async_load_wait_group(5)
@@ -792,7 +818,7 @@ def a16w16_8wave(
             acc_bl = tl.dot(a_bot, b_left, acc_bl)
         with tlx.warp_pipeline_stage("mem", priority=1):
             b_right = tlx.local_load(smem_b_right[1], relaxed=True)
-            tlx.buffer_load_to_local(smem_a_top[1], a_ptr, a_top_off_n + ka)
+            tlx.async_load(a_ptr + a_top_off_n + ka, smem_a_top[1], mask=a_top_mask, other=0.0)
             tlx.async_load_commit_group()
 
         tlx.async_load_wait_group(5)
@@ -800,7 +826,7 @@ def a16w16_8wave(
             acc_tr = tl.dot(a_top, b_right, acc_tr)
         with tlx.warp_pipeline_stage("mem", priority=1):
             b_left = tlx.local_load(smem_b_left[0], relaxed=True)
-            tlx.buffer_load_to_local(smem_a_bot[1], a_ptr, a_bot_off_n + ka)
+            tlx.async_load(a_ptr + a_bot_off_n + ka, smem_a_bot[1], mask=a_bot_mask, other=0.0)
             tlx.async_load_commit_group()
 
         tlx.async_load_wait_group(5)
@@ -808,7 +834,7 @@ def a16w16_8wave(
             acc_br = tl.dot(a_bot, b_right, acc_br)
         with tlx.warp_pipeline_stage("mem", priority=1):
             a_top = tlx.local_load(smem_a_top[0], relaxed=True)
-            tlx.buffer_load_to_local(smem_b_right[1], b_ptr, b_right_off_n + kb)
+            tlx.async_load(b_ptr + b_right_off_n + kb, smem_b_right[1], mask=b_right_mask, other=0.0)
             tlx.async_load_commit_group()
             ka += BLOCK_K * stride_ak * 2
             kb += BLOCK_K * stride_bk * 2
@@ -874,6 +900,20 @@ def a16w16_8wave(
     m_bot = offs_cm_bot[:, None] < M
     n_left = offs_cn_left[None, :] < N
     n_right = offs_cn_right[None, :] < N
+    if USE_I64_C_OFFSETS:
+        c_row_top = offs_cm_top.to(tl.int64)[:, None] * stride_cm
+        c_row_bot = offs_cm_bot.to(tl.int64)[:, None] * stride_cm
+        c_col_left = offs_cn_left.to(tl.int64)[None, :] * stride_cn
+        c_col_right = offs_cn_right.to(tl.int64)[None, :] * stride_cn
+    else:
+        c_row_top = offs_cm_top[:, None] * stride_cm
+        c_row_bot = offs_cm_bot[:, None] * stride_cm
+        c_col_left = offs_cn_left[None, :] * stride_cn
+        c_col_right = offs_cn_right[None, :] * stride_cn
+    c_top_left = c_row_top + c_col_left
+    c_bot_left = c_row_bot + c_col_left
+    c_top_right = c_row_top + c_col_right
+    c_bot_right = c_row_bot + c_col_right
 
     if SPLIT_K == 1 and not DEFER_EPILOGUE:
         if ADD_BIAS:
@@ -921,23 +961,15 @@ def a16w16_8wave(
             # remove-layout-conversions / AMD optimize-epilogue so the store stays
             # a wide dwordx4. Fails compilation if a future change drops the pin.
             tlx.assert_same_layout(c_tl, L)
-            tl.store(c_ptr + stride_cm * offs_cm_top[:, None] + stride_cn * offs_cn_left[None, :], c_tl,
-                     mask=m_top & n_left)
-            tl.store(c_ptr + stride_cm * offs_cm_bot[:, None] + stride_cn * offs_cn_left[None, :],
-                     tlx.require_layout(acc_bl.to(et), L), mask=m_bot & n_left)
-            tl.store(c_ptr + stride_cm * offs_cm_top[:, None] + stride_cn * offs_cn_right[None, :],
-                     tlx.require_layout(acc_tr.to(et), L), mask=m_top & n_right)
-            tl.store(c_ptr + stride_cm * offs_cm_bot[:, None] + stride_cn * offs_cn_right[None, :],
-                     tlx.require_layout(acc_br.to(et), L), mask=m_bot & n_right)
+            tl.store(c_ptr + c_top_left, c_tl, mask=m_top & n_left)
+            tl.store(c_ptr + c_bot_left, tlx.require_layout(acc_bl.to(et), L), mask=m_bot & n_left)
+            tl.store(c_ptr + c_top_right, tlx.require_layout(acc_tr.to(et), L), mask=m_top & n_right)
+            tl.store(c_ptr + c_bot_right, tlx.require_layout(acc_br.to(et), L), mask=m_bot & n_right)
         else:
-            tl.store(c_ptr + stride_cm * offs_cm_top[:, None] + stride_cn * offs_cn_left[None, :], acc_tl.to(et),
-                     mask=m_top & n_left)
-            tl.store(c_ptr + stride_cm * offs_cm_bot[:, None] + stride_cn * offs_cn_left[None, :], acc_bl.to(et),
-                     mask=m_bot & n_left)
-            tl.store(c_ptr + stride_cm * offs_cm_top[:, None] + stride_cn * offs_cn_right[None, :], acc_tr.to(et),
-                     mask=m_top & n_right)
-            tl.store(c_ptr + stride_cm * offs_cm_bot[:, None] + stride_cn * offs_cn_right[None, :], acc_br.to(et),
-                     mask=m_bot & n_right)
+            tl.store(c_ptr + c_top_left, acc_tl.to(et), mask=m_top & n_left)
+            tl.store(c_ptr + c_bot_left, acc_bl.to(et), mask=m_bot & n_left)
+            tl.store(c_ptr + c_top_right, acc_tr.to(et), mask=m_top & n_right)
+            tl.store(c_ptr + c_bot_right, acc_br.to(et), mask=m_bot & n_right)
     else:
         # Split-K: every split writes its fp32 partial into its workspace slice
         # (rows [split_id*M, split_id*M+M)). Mask stays in relative-M coords; the
@@ -1355,6 +1387,15 @@ def choose_split_k(M, N, K):
     return choose_tile(M, N, K)[2]
 
 
+def _needs_i64_offsets(tensor):
+    """Return whether this view can address beyond signed i32 byte offsets."""
+    if any(stride < 0 for stride in tensor.stride()):
+        return True
+    max_element_offset = sum((size - 1) * stride for size, stride in zip(tensor.shape, tensor.stride()))
+    max_byte_offset = max_element_offset * tensor.element_size()
+    return max_byte_offset > (1 << 31) - 1
+
+
 def _launch(a, b, bias=None, SPLIT_K=None, TILE=None, K_LIMIT=None, DEFER_EPILOGUE=False):
     """Launch the shared gfx950 GEMM core, optionally with a fused bias."""
     M, input_k = a.shape
@@ -1366,6 +1407,11 @@ def _launch(a, b, bias=None, SPLIT_K=None, TILE=None, K_LIMIT=None, DEFER_EPILOG
         assert bias.shape == (M, N), f"Bias must expand to ({M}, {N}), got {tuple(bias.shape)}"
         assert bias.device == a.device, "Bias and matrix operands must be on the same device"
         assert bias.dtype == a.dtype, "Bias and matrix operands must have the same dtype"
+        if _needs_i64_offsets(bias):
+            raise ValueError(
+                "gfx950 inter-wave GEMM bias exceeds signed-i32 byte offsets; "
+                f"shape={tuple(bias.shape)}, strides={bias.stride()}"
+            )
     if TILE is not None:
         BM, BN = TILE
         grid_mn = triton.cdiv(M, BM) * triton.cdiv(N, BN)
@@ -1384,15 +1430,23 @@ def _launch(a, b, bias=None, SPLIT_K=None, TILE=None, K_LIMIT=None, DEFER_EPILOG
     c = torch.empty((M, N), device=a.device, dtype=a.dtype)
     GRID_MN = triton.cdiv(M, BM) * triton.cdiv(N, BN)
     if SPLIT_K > 1 or DEFER_EPILOGUE:
+        workspace_shape = (SPLIT_K * M, N)
+        workspace_view = torch.empty(workspace_shape, device="meta", dtype=torch.float32)
+        if _needs_i64_offsets(workspace_view):
+            raise ValueError(
+                "gfx950 inter-wave GEMM FP32 workspace exceeds signed-i32 byte offsets; "
+                f"shape={workspace_shape}, SPLIT_K={SPLIT_K}, DEFER_EPILOGUE={DEFER_EPILOGUE}"
+            )
         # fp32 workspace: partials are stored without a rounding step, so the
         # split-K result matches a single fp32-accumulated GEMM (an fp16 workspace
         # would lose ~1e-1 near cancellation). The reduce sums in fp32 too.
-        workspace = torch.empty((SPLIT_K * M, N), device=a.device, dtype=torch.float32)
+        workspace = torch.empty(workspace_shape, device=a.device, dtype=torch.float32)
     else:
         workspace = c  # dummy; the kernel writes c_ptr directly when SPLIT_K==1
     bias_ptr = bias if bias is not None else c
     stride_bias_m = bias.stride(0) if bias is not None else 0
     stride_bias_n = bias.stride(1) if bias is not None else 0
+    use_i64_c_offsets = _needs_i64_offsets(c)
     a16w16_8wave[(GRID_MN * SPLIT_K, )](
         a,
         b,
@@ -1420,6 +1474,9 @@ def _launch(a, b, bias=None, SPLIT_K=None, TILE=None, K_LIMIT=None, DEFER_EPILOG
         SPLIT_K=SPLIT_K,
         ADD_BIAS=bias is not None,
         HAS_REGISTER_TAIL=KS % (2 * BLOCK_K) != 0,
+        USE_I64_A_OFFSETS=_needs_i64_offsets(a),
+        USE_I64_B_OFFSETS=_needs_i64_offsets(b),
+        USE_I64_C_OFFSETS=use_i64_c_offsets,
         PIN_OFFSET_LAYOUT=K_LIMIT is not None,
         DEFER_EPILOGUE=DEFER_EPILOGUE,
         num_warps=NUM_WARPS,

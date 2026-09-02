@@ -238,6 +238,38 @@ Value createBufferDescriptor(ImplicitLocOpBuilder &b, Value offsetI32,
   return arith::OrIOp::create(b, lengthShifted, offsetI64);
 }
 
+// Return the descriptor rows whose entire byte interval is covered by
+// [offset, offset + length). Restricting completion-barrier proxy state by
+// containment (rather than overlap) prevents a partial async write from
+// publishing generic accesses to bytes it did not write.
+Value createBuffersContainedInRegionMask(ImplicitLocOpBuilder &b, Value buffers,
+                                         Value offsetI32, Value lengthI32) {
+  auto buffersType = cast<RankedTensorType>(buffers.getType());
+  Value offsetMask =
+      tti::createConstIntTensor(b, b.getLoc(), 0xffffffff, buffersType);
+  Value shift = tti::createConstIntTensor(b, b.getLoc(), 32, buffersType);
+  Value zero = tti::createConstIntTensor(b, b.getLoc(), 0, buffersType);
+  Value bufferOffsets = arith::AndIOp::create(b, buffers, offsetMask);
+  Value bufferLengths = arith::ShRUIOp::create(b, buffers, shift);
+  Value bufferEnds = arith::AddIOp::create(b, bufferOffsets, bufferLengths);
+
+  Value regionOffsetI64 = arith::ExtUIOp::create(b, b.getI64Type(), offsetI32);
+  Value regionLengthI64 = arith::ExtUIOp::create(b, b.getI64Type(), lengthI32);
+  Value regionEndI64 =
+      arith::AddIOp::create(b, regionOffsetI64, regionLengthI64);
+  Value regionOffset = triton::SplatOp::create(b, buffersType, regionOffsetI64);
+  Value regionEnd = triton::SplatOp::create(b, buffersType, regionEndI64);
+
+  Value startsInside = arith::CmpIOp::create(b, arith::CmpIPredicate::uge,
+                                             bufferOffsets, regionOffset);
+  Value endsInside = arith::CmpIOp::create(b, arith::CmpIPredicate::ule,
+                                           bufferEnds, regionEnd);
+  Value nonEmpty =
+      arith::CmpIOp::create(b, arith::CmpIPredicate::ne, bufferLengths, zero);
+  return arith::AndIOp::create(
+      b, nonEmpty, arith::AndIOp::create(b, startsInside, endsInside));
+}
+
 std::tuple<Block *, Block *, Block *> createIfBlock(ImplicitLocOpBuilder &b,
                                                     Value cnd) {
   // #prevBlock
