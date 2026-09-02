@@ -117,6 +117,7 @@ dev-install: dev-install-requires dev-install-triton
 .PHONY: dev-install-llvm
 .NOPARALLEL: dev-install-llvm
 dev-install-llvm:
+	git submodule update --init --recursive
 	LLVM_BUILD_PATH=$(LLVM_BUILD_PATH) scripts/build-llvm-project.sh
 	LLVM_INCLUDE_DIRS=$(LLVM_BUILD_PATH)/include \
 		LLVM_LIBRARY_DIR=$(LLVM_BUILD_PATH)/lib \
