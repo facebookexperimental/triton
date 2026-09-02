@@ -1093,6 +1093,8 @@ class CUDABackend(BaseBackend):
         # after all other passes that may introduce layout conversions.
         terminal_smem_budget = (0 if knobs.nvidia.disable_budget_aware_layout_conversion else smem_budget)
         passes.ttgpuir.add_remove_layout_conversions(pm, terminal_smem_budget)
+        # add_remove_layout_conversions needs a CSE after it.
+        passes.ttir.add_loop_aware_cse(pm)
         # Retire user-pinned register layout markers (#tlx.user_layout) only after
         # ALL layout-rewriting passes have run (optimize_tmem_layouts reads the
         # marker; every remove_layout_conversions / reduce_data_duplication above
