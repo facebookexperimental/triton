@@ -51,6 +51,17 @@ CATALOG: tuple[OpSpec, ...] = (
         requires=frozenset({"tma", "tmem"}),
     ),
     OpSpec(
+        op="mm",
+        arch="gfx942",
+        variant="lds_ring",
+        impl="kernels.mm.gfx942:mm",
+        dtypes=_FP16,
+        # No `accepts`: operands are read through explicit strides rather than a
+        # descriptor, so there is no alignment rule to fail. This arch therefore
+        # admits shapes sm100 declines -- see kernels/mm/_shapes.py.
+        requires=frozenset(),
+    ),
+    OpSpec(
         op="flash_attn",
         arch="sm100",
         variant="ws_pipelined_persistent",
