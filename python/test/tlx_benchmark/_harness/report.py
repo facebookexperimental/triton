@@ -140,6 +140,6 @@ def render(results: Sequence[Result], env: dict, json_path: Optional[str] = None
     bad = failures(results)
     if bad:
         out.append("")
-        out.append("FAILING:")
+        out.append("Issues:")
         out.extend(f"  {r.case.key}: {'; '.join(r.notes) or _MARK[r.status]}" for r in bad)
     return "\n".join(out)

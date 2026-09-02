@@ -35,15 +35,23 @@ def arch() -> str | None:
     return devices[0].arch if devices else None
 
 
-def shapes() -> list[list]:
-    """Synthetic shapes plus this arch's focus list.
+def shapes(synthetic: bool = False) -> list[list]:
+    """One list or the other, never both.
 
-    L2 measures the synthetic shapes as well as validating them, and leaves out
-    only *other* arches' focus lists. See ``kernels/mm/_shapes.py``.
+    Default is this arch's focus list -- the shapes someone actually runs. It
+    may be empty for an arch that has no capture yet, which is not an error.
+
+    ``synthetic=True`` swaps in the correctness list instead. Those shapes exist
+    to break the kernel (masked edge tiles, partial K, odd layouts) and most are
+    far too small for a number to mean much -- ``tlx.ops.mm`` costs tens of
+    microseconds of host time per call, so anything under roughly 300us measures
+    Python. Worth timing deliberately, not worth timing every run.
     """
-    from triton.tlx.ops.kernels.mm._shapes import SYNTHETIC
+    if synthetic:
+        from triton.tlx.ops.kernels.mm._shapes import SYNTHETIC
 
-    return list(SYNTHETIC) + list(importlib.import_module(f"triton.tlx.ops.kernels.mm.{arch()}").PERF_SHAPES)
+        return list(SYNTHETIC)
+    return list(importlib.import_module(f"triton.tlx.ops.kernels.mm.{arch()}").PERF_SHAPES)
 
 
 def default_json() -> str:
@@ -64,7 +72,7 @@ INPUT_SPEC = ("(M x K) @ (K x N) with each operand's recorded strides; [[a0, a1]
               "A leading stride wider than the row is a slice of a padded buffer, and 0 is a broadcast.")
 
 
-def cases(head: int | None = None) -> list[Case]:
+def cases(head: int | None = None, synthetic: bool = False) -> list[Case]:
     """Every case, or the first ``head`` of them.
 
     One case per entry, not a dtype cross-product: each shape carries the dtype
@@ -75,7 +83,7 @@ def cases(head: int | None = None) -> list[Case]:
         # dtype is a Case field, so it is dropped from `shape` -- carrying it in
         # both duplicates it in the key and in the report.
         Case(op=OP, arch=arch(), dtype=str(DTYPES[entry[5]]).removeprefix("torch."), shape=tuple(entry[:5]),
-             label=label(*entry)) for entry in shapes()
+             label=label(*entry)) for entry in shapes(synthetic)
     ]
     return out[:head] if head else out
 
@@ -148,13 +156,13 @@ def run_case(case: Case, *, space: str):
     return result
 
 
-def run(*, space="heuristic", head=None, governor=None):
+def run(*, space="heuristic", head=None, synthetic=False, governor=None):
     env = capture_env()
     if governor is not None:
         env["governed"] = governor.to_dict()
     results = []
     with stable() as info:
-        for case in cases(head):
+        for case in cases(head, synthetic):
             try:
                 results.append(run_case(case, space=space))
             except Exception as exc:  # a broken case must not hide the others
@@ -167,6 +175,7 @@ def run(*, space="heuristic", head=None, governor=None):
     env["input_spec"] = INPUT_SPEC
     if head:
         env["head"] = head
+    env["shapes"] = "synthetic" if synthetic else "focus"
     env["run"] = {k: info[k] for k in ("problems", "clock_trace", "elapsed_s") if k in info}
     return results, env
 
@@ -197,6 +206,10 @@ def main(argv=None) -> int:
         help="autotune search space; 'heuristic' is what tlx.ops.mm uses by default, and "
         "measuring anything else measures a path users do not take")
     parser.add_argument("--head", type=int, default=None, metavar="N", help="only the first N cases, for a quick look")
+    parser.add_argument(
+        "--synthetic", action="store_true",
+        help="run the correctness shapes instead of this arch's focus list; they are "
+        "mostly too small to time, so this is for looking, not for gating")
     parser.add_argument("--json", default=default_json(), help=f"machine-readable artifact (default {default_json()})")
     args = parser.parse_args(argv)
 
@@ -218,7 +231,12 @@ def main(argv=None) -> int:
             print(f"  denoise: {step}")
         for step in governor.skipped:
             print(f"  denoise: SKIPPED {step}")
-        results, env = run(space=args.space, head=args.head, governor=governor)
+        results, env = run(space=args.space, head=args.head, synthetic=args.synthetic, governor=governor)
+    if not results:
+        # An empty focus list is legitimate -- an arch may have no capture yet --
+        # but a silent zero-row table reads like a pass. Say which list was empty.
+        print(f"no {'synthetic' if args.synthetic else 'focus'} shapes for {arch()}; nothing measured")
+        return 0
     print(report_mod.render(results, env, args.json))
 
     return 1 if report_mod.failures(results) else 0

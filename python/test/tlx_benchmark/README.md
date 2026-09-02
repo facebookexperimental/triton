@@ -18,8 +18,10 @@ options:
   --space {heuristic,full,smoke}
                         autotune search space; 'heuristic' is what tlx.ops.mm uses by default, and measuring anything
                         else measures a path users do not take
-  --head N              only the first N cases, for a quick look; never writes the baseline
-  --json JSON           machine-readable artifact (default /tmp/tlx_benchmark/mm.sm100.json)
+  --head N              only the first N cases, for a quick look
+  --synthetic           run the correctness shapes instead of this arch's focus list; they are
+                        mostly too small to time, so this is for looking, not for gating
+  --json JSON           machine-readable artifact (default /tmp/tlx_benchmark/mm.<arch>.json)
 ```
 
 - built in (default on) denoise (freq-lock)
@@ -28,7 +30,8 @@ options:
 
 ## Metric report
 
-1. Input info (varying between ops): e.g. "3000000x256x1024 A:row B:col bfloat16" for mm
+1. Input info (varying between ops), e.g. for mm:
+   `((), {'dtype': 'bf16', 'strides': '[[32768, 1], [12800, 1]]', 'M': '2304', 'N': '12800', 'K': '32768'})`
 2. Core metrics: ref (TFLOP/s), TLX (TFLOP/s), speedup, compile time
 3. Additional stats: samples, CV%, p50, p95, p99 (all based on TFLOP/s)
 4. status: ok/pip/noisy/error/...
@@ -38,32 +41,29 @@ pip: speedup < 0.9 or compile time > 2 min
 noisy: CV% > 3%
 ok: everything else
 
-TFLOP/s is the unit the harness **measures in**, not a conversion applied to the
-report: each timed iteration is turned into TFLOP/s before outlier rejection, so
-CV% and the percentiles describe the throughput distribution. Two consequences:
+Stats are computed on per-iteration TFLOP/s, not converted from latency. So the
+percentiles ascend: p99 is the best case, `min` (artifact only) the worst.
 
-- `speedup` = TLX TFLOP/s / ref TFLOP/s. Above 1 still means TLX is faster.
-- The percentiles are **literal**, so they ascend: `p99` is the *best* case,
-  beaten by 1% of iterations. The worst case is `min`, in the JSON artifact.
-  This is the opposite of the latency reading.
+speedup = TLX / ref. >1 means TLX is faster.
 
-Latencies are not reported. Recover one as `flop_count / TFLOP/s`; both are in
-the artifact. `tlx_host_us` stays in microseconds — host-side launch cost is not
-device work, and expressing it as throughput would claim the GPU did those FLOPs
-during it.
+Latency is not reported: it is `flop_count / TFLOP/s`, both in the artifact.
+`tlx_host_us` stays in microseconds — host launch cost is not device work.
 
 ## Tests
 
-Two files, and the split is unit-vs-GPU rather than one-per-module:
+- `test_harness.py` — `_harness` unit tests. No GPU, ~3s.
+- `test_ops_perf.py` — pytest front end over each `bench_<op>.py`. Real kernels,
+  minutes. CI's junitxml comes from here.
 
-- `test_harness.py` — every `_harness` unit test. No GPU, runs in ~3s.
-- `test_ops_perf.py` — the pytest front end over each `bench_<op>.py`. Launches
-  real kernels and takes minutes; this is the one CI's junitxml comes from.
-
-So `pytest test_harness.py` while iterating on the harness, and don't run
-`pytest .` unless you meant to start a benchmark.
+`pytest .` runs both, so it starts a benchmark.
 
 ## shapes
 
-1. Synthetic (general): used by L1 (correctness) and L2 (performance)
-2. Focus shapes (vary between arch): used by L2 only. Need to match the GPU arch. e.g. mm shapes sm100 and mm shapes gfx942
+1. Synthetic (general): L1 only.
+2. Focus shapes (arch specific): L2. Need to match the GPU arch. e.g. mm shapes sm100 and mm shapes gfx942
+
+`--synthetic` runs list 1 under L2 instead. The focus list may be empty.
+
+Each entry carries its own strides and dtype, so there is no dtype
+cross-product. Strides, not a row/col flag: a leading stride wider than the row
+is a padded slice, and 0 is a broadcast.

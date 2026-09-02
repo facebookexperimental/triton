@@ -30,6 +30,7 @@ def test_op_perf(module_name, pytestconfig):
     results, env = bench.run(
         space=pytestconfig.getoption("--space"),
         head=pytestconfig.getoption("--head"),
+        synthetic=pytestconfig.getoption("--synthetic"),
     )
     from _harness import report as report_mod
 
