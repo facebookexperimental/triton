@@ -229,6 +229,72 @@ class HIPBackend(BaseBackend):
             metadata.shared,
         )
 
+    def make_launch_metadata(self, metadata, src):
+        """Describe the HIP launch ABI for the meta-specific C dispatcher."""
+
+        def _get(key, default=None):
+            if isinstance(metadata, dict):
+                return metadata.get(key, default)
+            return getattr(metadata, key, default)
+
+        constants = getattr(src, "constants", {})
+        constant_keys = set()
+        for key in constants:
+            if isinstance(key, str):
+                constant_keys.add((src.fn.arg_names.index(key), ) if hasattr(src, "fn") else (key, ))
+            elif isinstance(key, tuple):
+                constant_keys.add(key)
+            else:
+                constant_keys.add((key, ))
+
+        arg_names = src.fn.arg_names if hasattr(src, "fn") else None
+        attrs = getattr(src, "attrs", {})
+        args = []
+        for idx, (key, ty) in enumerate(src.signature.items()):
+            if (idx, ) in constant_keys:
+                continue
+            name = key if isinstance(key, str) else (arg_names[idx] if arg_names and idx < len(arg_names) else str(idx))
+            arg_entry = {"name": name, "type": str(ty), "index": idx}
+            for attr_name, attr_value in attrs.get((idx, ), []):
+                if attr_name == "tt.divisibility":
+                    arg_entry["divisible_by"] = attr_value
+            args.append(arg_entry)
+
+        constants_dict = {}
+        for key, value in constants.items():
+            if isinstance(key, tuple):
+                str_key = str(key[0]) if len(key) == 1 else str(key)
+            elif isinstance(key, str) and arg_names:
+                str_key = str(arg_names.index(key))
+            else:
+                str_key = str(key)
+            constants_dict[str_key] = value if isinstance(value,
+                                                          (int, float, bool, str)) or value is None else str(value)
+
+        cluster_dims = _get("cluster_dims") or (1, 1, 1)
+        preferred_cluster_dims = _get("preferred_ctas_per_cga") or (0, 0, 0)
+        return {
+            "abi_version": 1,
+            "entry_name": _get("name", ""),
+            "num_warps": _get("num_warps"),
+            "num_ctas": _get("num_ctas"),
+            "shared_mem": _get("shared", 0),
+            "warp_size": _get("warp_size", self.target.warp_size),
+            "cluster_dims": list(cluster_dims),
+            "preferred_cluster_dims": list(preferred_cluster_dims),
+            "launch_cooperative_grid": _get("launch_cooperative_grid", False),
+            "launch_cluster": _get("launch_cluster", False),
+            "launch_pdl": _get("launch_pdl", False),
+            "global_scratch_size": _get("global_scratch_size", 0),
+            "global_scratch_align": _get("global_scratch_align", 1),
+            "profile_scratch_size": _get("profile_scratch_size", 0),
+            "profile_scratch_align": _get("profile_scratch_align", 1),
+            "tmem_size": _get("tmem_size", 0),
+            "args": args,
+            "constants": constants_dict,
+            "tensordesc_meta": _get("tensordesc_meta") or [],
+        }
+
     def get_codegen_implementation(self, options):
         return {"min_dot_size": get_min_dot_size(self.target)}
 

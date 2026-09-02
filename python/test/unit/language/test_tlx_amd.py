@@ -126,14 +126,14 @@ def test_amd_sched_group_barrier_options_are_cache_keyed_and_validated():
         amd_compiler.HIPOptions(arch="gfx950", sched_group_barrier_required_region_count=-1)
 
 
-def compile_for_target(fn, signature, constexprs, target):
-    src = ASTSource(fn=fn, signature=signature, constexprs=constexprs)
+def compile_for_target(fn, signature, constexprs, target, attrs=None):
+    src = ASTSource(fn=fn, signature=signature, constexprs=constexprs, attrs=attrs)
     return triton_compile(src, target=target)
 
 
-def compile_for_gfx950(fn, signature, constexprs):
+def compile_for_gfx950(fn, signature, constexprs, attrs=None):
     """Compile a TLX kernel for gfx950 and return the compiled object."""
-    return compile_for_target(fn, signature, constexprs, GFX950)
+    return compile_for_target(fn, signature, constexprs, GFX950, attrs=attrs)
 
 
 def compile_for_gfx942(fn, signature, constexprs):
@@ -3590,6 +3590,55 @@ def test_async_load_noncontiguous_gather_gfx950(device):
     token = n % PAGE
     ref = v[page, token // 8, :, token % 8]
     torch.testing.assert_close(out, ref)
+
+
+# ---------------------------------------------------------------------------
+# Test: async_load can gather/transpose a physically contiguous subgroup.
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _async_load_gather_transpose_kernel(v_ptr, output_ptr):
+    n = tl.arange(0, 128)
+    d = tl.arange(0, 64)
+    n_u32 = n.to(tl.uint32)
+    page = (n_u32 // 64).to(tl.int32)
+    token_u32 = n_u32 % 64
+    token_group = (token_u32 // 8).to(tl.int32)
+    token_in_group = (token_u32 % 8).to(tl.int32)
+    ptrs = (v_ptr + page[:, None] * 4096 + token_group[:, None] * 512 + d[None, :] * 8 + token_in_group[:, None])
+
+    buffers = tlx.local_alloc((128, 64), tl.bfloat16, 2)
+    view = tlx.local_view(buffers, 0)
+    token = tlx.async_load(ptrs, view)
+    tlx.async_load_commit_group([token])
+    tlx.async_load_wait_group(0)
+    value = tlx.local_load(view)
+    tl.store(output_ptr + n[:, None] * 64 + d[None, :], value)
+
+
+def test_async_load_gather_transpose_compiles_gfx950(device):
+    """A grouped gather-transpose should lower to a 128-bit direct LDS load."""
+    compiled = compile_for_gfx950(
+        _async_load_gather_transpose_kernel,
+        signature={"v_ptr": "*bf16", "output_ptr": "*bf16"},
+        constexprs={},
+        # Runtime JIT launches attach this base-pointer alignment
+        # automatically; ASTSource compile-only signatures do not.
+        attrs={(0, ): [("tt.divisibility", 16)]},
+    )
+    assert re.search(r"(buffer_load_dwordx4.*lds|global_load_lds_dwordx4)", compiled.asm["amdgcn"])
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_async_load_gather_transpose_correctness_gfx950(device):
+    """The direct gather-transpose produces the logical [token, head_dim] view."""
+    v = torch.arange(2 * 8 * 64 * 8, device=device, dtype=torch.float32)
+    v = v.reshape(2, 8, 64, 8).to(torch.bfloat16)
+    output = torch.empty((128, 64), device=device, dtype=torch.bfloat16)
+    _async_load_gather_transpose_kernel[(1, )](v, output, num_warps=4)
+    expected = v.permute(0, 1, 3, 2).reshape(128, 64)
+    torch.testing.assert_close(output, expected, rtol=0, atol=0)
 
 
 # ---------------------------------------------------------------------------

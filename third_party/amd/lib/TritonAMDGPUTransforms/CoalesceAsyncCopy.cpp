@@ -8,6 +8,7 @@
 #include "triton/Analysis/AxisInfo.h"
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
+#include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Tools/LayoutUtils.h"
 
 #undef DEBUG_TYPE
@@ -94,18 +95,94 @@ decomposeAsyncCopyToSync(ttg::AsyncCopyGlobalToLocalOp copyOp,
   return success();
 }
 
+// Retarget the simple local_alloc -> memdesc_index* view graph used by explicit
+// TLX async loads.  Changing the shared order is semantics-preserving: memdesc
+// users address logical tensor coordinates through the encoding.  Restrict
+// this to unswizzled allocations and index-only view graphs; reshape/transpose
+// views require composing their result encodings and are intentionally left to
+// the existing path.
+static LogicalResult
+retargetSimpleSharedOrder(ttg::AsyncCopyGlobalToLocalOp copyOp,
+                          ArrayRef<unsigned> order) {
+  auto dstTy = copyOp.getResult().getType();
+  auto sharedEnc =
+      dyn_cast<ttg::SwizzledSharedEncodingAttr>(dstTy.getEncoding());
+  if (!sharedEnc || sharedEnc.getVec() != 1 || sharedEnc.getPerPhase() != 1 ||
+      sharedEnc.getMaxPhase() != 1)
+    return failure();
+  if (sharedEnc.getOrder() == order)
+    return success();
+
+  SmallVector<Value> values;
+  Value root = copyOp.getResult();
+  values.push_back(root);
+  while (auto indexOp = root.getDefiningOp<ttg::MemDescIndexOp>()) {
+    root = indexOp.getSrc();
+    values.push_back(root);
+  }
+  if (!root.getDefiningOp<ttg::LocalAllocOp>())
+    return failure();
+
+  // Include sibling index views and reject view operations whose encoding
+  // cannot be retagged without composition.
+  SmallVector<Value> worklist{root};
+  llvm::SmallDenseSet<Value> seen;
+  while (!worklist.empty()) {
+    Value value = worklist.pop_back_val();
+    if (!seen.insert(value).second)
+      continue;
+    values.push_back(value);
+    for (Operation *user : value.getUsers()) {
+      if (auto indexOp = dyn_cast<ttg::MemDescIndexOp>(user)) {
+        worklist.push_back(indexOp.getResult());
+        continue;
+      }
+      if (auto otherCopy = dyn_cast<ttg::AsyncCopyGlobalToLocalOp>(user)) {
+        // Different copies could prefer different orders.  Keep this
+        // transformation conservative rather than allowing greedy rewriting
+        // to flip a shared allocation between layouts.
+        if (otherCopy != copyOp)
+          return failure();
+        continue;
+      }
+      if (isa<ttg::LocalLoadOp>(user))
+        continue;
+      return failure();
+    }
+  }
+
+  auto newSharedEnc = ttg::SwizzledSharedEncodingAttr::get(
+      copyOp.getContext(), 1, 1, 1, order, sharedEnc.getCGALayout());
+  for (Value value : values) {
+    auto oldTy = dyn_cast<ttg::MemDescType>(value.getType());
+    if (!oldTy)
+      continue;
+    auto newTy =
+        ttg::MemDescType::get(oldTy.getShape(), oldTy.getElementType(),
+                              newSharedEnc, oldTy.getMemorySpace(),
+                              oldTy.getMutableMemory(), oldTy.getAllocShape());
+    if (newTy != oldTy)
+      value.setType(newTy);
+  }
+  return success();
+}
+
 // On gfx9 global and buffer loads directly to shared memory need to write
 // coalesced. This pattern converts the layout of the src, mask and other to
 // ensure the owned data per thread is contiguous and does no exceed the
 // supported load vector size.
 struct CoalesceAsyncCopyWrites
     : public OpRewritePattern<ttg::AsyncCopyGlobalToLocalOp> {
-  CoalesceAsyncCopyWrites(const triton::AMD::TargetInfo &targetInfo,
-                          const DenseMap<ttg::AsyncCopyGlobalToLocalOp,
-                                         unsigned> &asyncCopyContiguity,
-                          MLIRContext *ctx)
+  CoalesceAsyncCopyWrites(
+      const triton::AMD::TargetInfo &targetInfo,
+      const DenseMap<ttg::AsyncCopyGlobalToLocalOp, unsigned>
+          &asyncCopyContiguity,
+      const DenseMap<ttg::AsyncCopyGlobalToLocalOp, ttg::BlockedEncodingAttr>
+          &coalescedAsyncCopyEncodings,
+      MLIRContext *ctx)
       : OpRewritePattern(ctx), targetInfo{targetInfo},
-        asyncCopyContiguity{std::move(asyncCopyContiguity)} {}
+        asyncCopyContiguity{asyncCopyContiguity},
+        coalescedAsyncCopyEncodings{coalescedAsyncCopyEncodings} {}
 
   LogicalResult matchAndRewrite(ttg::AsyncCopyGlobalToLocalOp copyOp,
                                 PatternRewriter &rewriter) const override {
@@ -160,17 +237,34 @@ struct CoalesceAsyncCopyWrites
     loadContig =
         fitToValidDirectToLdsVecSize(loadContig, elemBitWidth, targetInfo);
 
+    ttg::DistributedEncodingTrait forcedSrcEnc;
+    if (loadContig == 0 && !targetInfo.supportsDirectToLdsScatter()) {
+      // The current shared order may select a strided global dimension.  On
+      // gfx9 this can leave a bf16/fp16 copy at an unsupported 16-bit width.
+      // If the destination is a simple TLX allocation, make its contiguous
+      // dimension agree with the pointer's AxisInfo-selected dimension.  This
+      // keeps both global reads and LDS writes coalesced and lets local_load
+      // consume the logical tensor without an explicit LDS transpose.
+      auto it = coalescedAsyncCopyEncodings.find(copyOp);
+      if (it != coalescedAsyncCopyEncodings.end()) {
+        auto idealEnc = it->second;
+        auto idealOrder = idealEnc.getOrder();
+        auto contigPerThread = idealEnc.getSizePerThread();
+        unsigned idealContig = fitToValidDirectToLdsVecSize(
+            contigPerThread[idealOrder[0]], elemBitWidth, targetInfo);
+        if (idealContig > 0 &&
+            succeeded(retargetSimpleSharedOrder(copyOp, idealOrder))) {
+          forcedSrcEnc = idealEnc;
+          loadContig = idealContig;
+          dstTy = cast<ttg::MemDescType>(copyOp.getResult().getType());
+        }
+      }
+    }
     if (loadContig == 0) {
-      // No supported direct-to-LDS vector width for this copy. On CDNA the
-      // per-thread width can collapse below a legal direct-to-LDS bitwidth
-      // (only 32- or 128-bit are supported), e.g. an fp16 load whose width
-      // becomes 16-bit: a masked partial-K load, or a non-16-element-aligned
-      // global row stride. This holds for both swizzled and padded dsts --
-      // `canLoadDirectToLDS` (and thus the LLVM lowering) rejects the
-      // sub-32-bit width regardless -- so the op would fail to legalize later
-      // in ConvertTritonAMDGPUToLLVM (`unrealized_conversion_cast`). Fall back
-      // to a synchronous tt.load + ttg.local_store instead of leaving an
-      // un-lowerable op.
+      // No supported direct-to-LDS vector width remains after trying to
+      // coalesce both the source and a simple destination allocation. Preserve
+      // the upstream correctness fallback for masked, unaligned, or complex
+      // copies that cannot be retargeted safely.
       return decomposeAsyncCopyToSync(copyOp, rewriter);
     }
 
@@ -182,8 +276,14 @@ struct CoalesceAsyncCopyWrites
 
     ttg::DistributedEncodingTrait newDistEnc;
 
-    if (LLVM::AMD::canLoadDirectToLDS(targetInfo, srcTy, dstTy.getEncoding(),
+    if (!forcedSrcEnc &&
+        LLVM::AMD::canLoadDirectToLDS(targetInfo, srcTy, dstTy.getEncoding(),
                                       dstTy.getAllocShape(), loadContig)) {
+      if (copyOp.getContiguity() < loadContig) {
+        rewriter.modifyOpInPlace(copyOp,
+                                 [&]() { copyOp.setContiguity(loadContig); });
+        return success();
+      }
       return rewriter.notifyMatchFailure(copyOp, "already writes coalesced");
     }
     // Check if we support load contig because canLoadDirectToLds can change it
@@ -192,7 +292,9 @@ struct CoalesceAsyncCopyWrites
                                          "unable to find supported vector size "
                                          "based on src and dst encodings");
 
-    if (isa<ttg::SwizzledSharedEncodingAttr>(dstTy.getEncoding())) {
+    if (forcedSrcEnc) {
+      newDistEnc = forcedSrcEnc;
+    } else if (isa<ttg::SwizzledSharedEncodingAttr>(dstTy.getEncoding())) {
       // For swizzled layouts we apply the swizzling during lowering so we only
       // adjust the sizePerThread of the blocked encoding to avoid strided
       // writes into LDS
@@ -273,6 +375,8 @@ struct CoalesceAsyncCopyWrites
 private:
   const triton::AMD::TargetInfo &targetInfo;
   const DenseMap<ttg::AsyncCopyGlobalToLocalOp, unsigned> &asyncCopyContiguity;
+  const DenseMap<ttg::AsyncCopyGlobalToLocalOp, ttg::BlockedEncodingAttr>
+      &coalescedAsyncCopyEncodings;
 };
 
 } // anonymous namespace
@@ -307,6 +411,8 @@ public:
     // after every IR change.
     AMD::ModuleAxisInfoAnalysis axisAnalysis(m);
     DenseMap<ttg::AsyncCopyGlobalToLocalOp, unsigned> asyncCopyContiguity;
+    DenseMap<ttg::AsyncCopyGlobalToLocalOp, ttg::BlockedEncodingAttr>
+        coalescedAsyncCopyEncodings;
     m->walk([&](ttg::AsyncCopyGlobalToLocalOp copyOp) {
       unsigned contiguity =
           mlir::LLVM::AMD::getContiguity(copyOp.getSrc(), axisAnalysis);
@@ -315,9 +421,40 @@ public:
             std::min<unsigned>(contiguity, axisAnalysis.getMaskAlignment(mask));
       }
       asyncCopyContiguity.insert({copyOp, contiguity});
+
+      // Compute a layout-independent source vectorization candidate.  The
+      // generic getContiguity helper clips to the *current* register order,
+      // which is precisely what must change for a gather-transpose.
+      if (!copyOp.getMask()) {
+        auto srcTy = cast<RankedTensorType>(copyOp.getSrc().getType());
+        auto *srcInfo = axisAnalysis.getAxisInfo(copyOp.getSrc());
+        if (srcInfo) {
+          auto order = getOrderFromContiguity(srcInfo->getContiguity());
+          unsigned dim = order[0];
+          unsigned elemBitWidth = triton::getPointeeBitWidth(srcTy);
+          unsigned elemByteWidth = std::max(elemBitWidth / 8, 1u);
+          unsigned srcContig = srcInfo->getContiguity(dim);
+          unsigned srcAlign = std::max<int64_t>(
+              srcInfo->getDivisibility(dim) / elemByteWidth, 1);
+          unsigned perThread =
+              std::min({srcContig, srcAlign, 128 / elemBitWidth});
+          int numWarps = ttg::lookupNumWarps(copyOp);
+          int threadsPerWarp = ttg::TritonGPUDialect::getThreadsPerWarp(m);
+          auto shapePerCTA = ttg::getShapePerCTA(srcTy);
+          unsigned fairShare = std::max<int64_t>(
+              product<int64_t>(shapePerCTA) / (numWarps * threadsPerWarp), 1);
+          perThread = std::min(perThread, fairShare);
+          SmallVector<unsigned> sizePerThread(srcTy.getRank(), 1);
+          sizePerThread[dim] = perThread;
+          auto idealEnc = ttg::BlockedEncodingAttr::get(
+              context, srcTy.getShape(), sizePerThread, order, numWarps,
+              threadsPerWarp, ttg::getCGALayout(srcTy.getEncoding()));
+          coalescedAsyncCopyEncodings.try_emplace(copyOp, idealEnc);
+        }
+      }
     });
     patterns.add<CoalesceAsyncCopyWrites>(targetInfo, asyncCopyContiguity,
-                                          context);
+                                          coalescedAsyncCopyEncodings, context);
 
     if (applyPatternsGreedily(m, std::move(patterns)).failed())
       signalPassFailure();

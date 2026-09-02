@@ -46,7 +46,7 @@ arg_type_pattern = {
 
 
 def _target_supports_triton_dispatcher(target) -> bool:
-    return getattr(target, "backend", None) == "cuda"
+    return getattr(target, "backend", None) in ("cuda", "hip")
 
 
 def convert_type_repr(x):
@@ -638,7 +638,10 @@ class CompiledKernel:
         if (knobs.nvidia.use_triton_dispatcher and _target_supports_triton_dispatcher(self.metadata.target)
                 and "launch_metadata" in self.asm):
             try:
-                from triton.backends.nvidia.triton_dispatcher_factory import make_triton_dispatcher
+                if self.metadata.target.backend == "hip":
+                    from triton.backends.amd.triton_dispatcher_factory import make_triton_dispatcher
+                else:
+                    from triton.backends.nvidia.triton_dispatcher_factory import make_triton_dispatcher
                 schema = json.loads(self.asm["launch_metadata"])
                 # Build both values before assigning to self so that a failure
                 # in either step leaves both attributes as None (atomic assignment).

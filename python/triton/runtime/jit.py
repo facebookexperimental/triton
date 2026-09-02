@@ -44,7 +44,7 @@ def _active_target_supports_triton_dispatcher() -> bool:
         target = driver.active.get_current_target()
     except Exception:
         return False
-    return getattr(target, "backend", None) == "cuda"
+    return getattr(target, "backend", None) in ("cuda", "hip")
 
 
 def _cache_stats_record(name: str, event: str) -> None:

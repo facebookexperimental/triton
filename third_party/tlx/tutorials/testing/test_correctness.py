@@ -70,12 +70,19 @@ from triton.language.extra.tlx.tutorials.amd_fa_cluster import (
     attention as _amd_fa_cluster, )
 from triton.language.extra.tlx.tutorials.amd_fa_cluster import (
     persistent_attention as _amd_fa_cluster_persistent, )
+from triton.language.extra.tlx.ops.amd_pa_decode import (
+    pa_decode_tlx as _amd_pa_decode,
+    allocate_5d_kv_cache as _amd_pa_decode_allocate_5d,
+    allocate_pa_decode_workspace as _amd_pa_decode_allocate_workspace,
+    get_pa_decode_config as _amd_pa_decode_get_config,
+    reshape_and_cache_5d as _amd_pa_decode_reshape_and_cache_5d,
+)
 from triton.language.extra.tlx.tutorials.amd_fa_bwd import (
     fa_backward as _amd_fa_backward, )
 from triton.language.extra.tlx.tutorials.amd_pa_decode import (
-    pa_decode_tlx as _amd_pa_decode,
     build_inputs as _amd_pa_decode_build_inputs,
     ref_decode as _amd_pa_decode_ref,
+    unpack_5d_kv_cache as _amd_pa_decode_unpack_5d,
 )
 from triton.language.extra.tlx.tutorials.amd_tdm_gemm_pipelined import (
     matmul as _amd_tdm_gemm_pipelined, )
@@ -120,8 +127,7 @@ from triton.language.extra.tlx.tutorials.amd_addmm_gfx950 import (
     available_paths as _amd_addmm_paths,
 )
 from triton.language.extra.tlx.tutorials.gfx9_gemm.inter_wave.a16w16.matmul_kernel import (
-    _needs_i64_offsets as _amd_gemm_needs_i64_offsets,
-)
+    _needs_i64_offsets as _amd_gemm_needs_i64_offsets, )
 from triton.language.extra.tlx.tutorials import amd_hstu_attn as _hstu
 from triton.tools.mxfp import MXScaleTensor
 
@@ -2126,8 +2132,9 @@ def test_amd_fa_bwd_d64(B, Hq, Hkv, N_CTX, causal):
 
 @pytest.mark.parametrize("query_length", [1, 2, 3, 4], ids=lambda q: f"qlen{q}")
 @pytest.mark.parametrize("num_splits", [1, 4], ids=["split1", "split4"])
+@pytest.mark.parametrize("cache_layout", ["4d", "5d"])
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware (CDNA4)")
-def test_amd_pa_decode(num_splits, query_length):
+def test_amd_pa_decode(num_splits, query_length, cache_layout):
     """Split-K paged decode with bf16 KV cache and GQA, incl. multi-token
     prediction (query_length 1-4). Reference is dense fp32 attention gathered
     from the page table with bottom-right causal masking over the query block.
@@ -2140,19 +2147,21 @@ def test_amd_pa_decode(num_splits, query_length):
     sm_scale = 1.0 / math.sqrt(head_dim)
 
     query, key_cache, value_cache, context_lens, block_tables = _amd_pa_decode_build_inputs(
-        num_seqs, ctx_lens, num_q_heads, num_kv_heads, head_dim, page_size, query_length=query_length, device=DEVICE)
+        num_seqs, ctx_lens, num_q_heads, num_kv_heads, head_dim, page_size, query_length=query_length, device=DEVICE,
+        cache_layout=cache_layout)
 
+    ref = _amd_pa_decode_ref(query, key_cache, value_cache, context_lens, block_tables, sm_scale, num_q_heads,
+                             num_kv_heads, query_length)
     out = torch.empty_like(query)
     _amd_pa_decode(out, query, key_cache, value_cache, context_lens, block_tables, sm_scale, query_length=query_length,
                    num_splits=num_splits)
 
-    ref = _amd_pa_decode_ref(query, key_cache, value_cache, context_lens, block_tables, sm_scale, num_q_heads,
-                             num_kv_heads, query_length)
     torch.testing.assert_close(out.float(), ref, atol=2e-2, rtol=2e-2)
 
 
+@pytest.mark.parametrize("cache_layout", ["4d", "5d"])
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware (CDNA4)")
-def test_amd_pa_decode_page64_high_splits():
+def test_amd_pa_decode_page64_high_splits(cache_layout):
     num_kv_heads, group = 2, 4
     num_q_heads = num_kv_heads * group
     head_dim, page_size = 64, 64
@@ -2160,17 +2169,19 @@ def test_amd_pa_decode_page64_high_splits():
     sm_scale = 1.0 / math.sqrt(head_dim)
 
     query, key_cache, value_cache, context_lens, block_tables = _amd_pa_decode_build_inputs(
-        len(ctx_lens), ctx_lens, num_q_heads, num_kv_heads, head_dim, page_size, device=DEVICE)
+        len(ctx_lens), ctx_lens, num_q_heads, num_kv_heads, head_dim, page_size, device=DEVICE,
+        cache_layout=cache_layout)
+    ref = _amd_pa_decode_ref(query, key_cache, value_cache, context_lens, block_tables, sm_scale, num_q_heads,
+                             num_kv_heads, 1)
     out = torch.empty_like(query)
     _amd_pa_decode(out, query, key_cache, value_cache, context_lens, block_tables, sm_scale, num_splits=128)
 
-    ref = _amd_pa_decode_ref(query, key_cache, value_cache, context_lens, block_tables, sm_scale, num_q_heads,
-                             num_kv_heads, 1)
     torch.testing.assert_close(out.float(), ref, atol=2e-2, rtol=2e-2)
 
 
+@pytest.mark.parametrize("cache_layout", ["4d", "5d"])
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware (CDNA4)")
-def test_amd_pa_decode_page16_tile_boundaries():
+def test_amd_pa_decode_page16_tile_boundaries(cache_layout):
     num_kv_heads, group = 2, 4
     num_q_heads = num_kv_heads * group
     head_dim, page_size = 128, 16
@@ -2178,13 +2189,195 @@ def test_amd_pa_decode_page16_tile_boundaries():
     sm_scale = 1.0 / math.sqrt(head_dim)
 
     query, key_cache, value_cache, context_lens, block_tables = _amd_pa_decode_build_inputs(
-        len(ctx_lens), ctx_lens, num_q_heads, num_kv_heads, head_dim, page_size, device=DEVICE)
+        len(ctx_lens), ctx_lens, num_q_heads, num_kv_heads, head_dim, page_size, device=DEVICE,
+        cache_layout=cache_layout)
+    ref = _amd_pa_decode_ref(query, key_cache, value_cache, context_lens, block_tables, sm_scale, num_q_heads,
+                             num_kv_heads, 1)
     out = torch.empty_like(query)
     _amd_pa_decode(out, query, key_cache, value_cache, context_lens, block_tables, sm_scale, num_splits=4)
 
-    ref = _amd_pa_decode_ref(query, key_cache, value_cache, context_lens, block_tables, sm_scale, num_q_heads,
-                             num_kv_heads, 1)
     torch.testing.assert_close(out.float(), ref, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("strided", [False, True], ids=["contiguous", "strided"])
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware (CDNA4)")
+def test_amd_pa_decode_5d_incremental_cache_update(dtype, strided):
+    """Slot-mapped writes populate packed storage without a 4-D staging cache."""
+    torch.manual_seed(42)
+    num_blocks, num_kv_heads, page_size, head_dim = 5, 2, 16, 64
+    key_cache, value_cache = _amd_pa_decode_allocate_5d(num_blocks, num_kv_heads, page_size, head_dim, dtype=dtype,
+                                                        device=DEVICE)
+    if strided:
+        x = key_cache.shape[-1]
+        key_cache = torch.empty(num_blocks, num_kv_heads, head_dim // x, page_size, x * 2, dtype=dtype,
+                                device=DEVICE)[..., ::2]
+        value_cache = torch.empty(num_blocks, num_kv_heads, page_size // x, head_dim, x * 2, dtype=dtype,
+                                  device=DEVICE)[..., ::2]
+    key_cache.zero_()
+    value_cache.zero_()
+
+    if strided:
+        key = torch.randn(7, num_kv_heads, head_dim * 2, dtype=dtype, device=DEVICE)[..., ::2]
+        value = torch.randn(7, num_kv_heads, head_dim * 2, dtype=dtype, device=DEVICE)[..., ::2]
+    else:
+        key = torch.randn(7, num_kv_heads, head_dim, dtype=dtype, device=DEVICE)
+        value = torch.randn_like(key)
+    # Deliberately shuffled across blocks, with one padding token (-1). Splitting
+    # the launch models two successive decode updates into the same cache.
+    slots = torch.tensor([31, 0, 64, 18, -1, 47, 5], dtype=torch.int64, device=DEVICE)
+    _amd_pa_decode_reshape_and_cache_5d(key[:3], value[:3], key_cache, value_cache, slots[:3])
+    _amd_pa_decode_reshape_and_cache_5d(key[3:], value[3:], key_cache, value_cache, slots[3:])
+
+    actual_key, actual_value = _amd_pa_decode_unpack_5d(key_cache, value_cache)
+    expected_key = torch.zeros_like(actual_key)
+    expected_value = torch.zeros_like(actual_value)
+    for token, slot in enumerate(slots.tolist()):
+        if slot >= 0:
+            block, offset = divmod(slot, page_size)
+            expected_key[block, :, offset, :] = key[token]
+            expected_value[block, :, offset, :] = value[token]
+
+    torch.testing.assert_close(actual_key, expected_key, atol=0, rtol=0)
+    torch.testing.assert_close(actual_value, expected_value, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("page_size", [16, 64], ids=lambda p: f"p{p}")
+@pytest.mark.parametrize("num_splits", [1, 4], ids=["fused", "split4"])
+@pytest.mark.parametrize("query_length", [1, 4], ids=lambda q: f"qlen{q}")
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware (CDNA4)")
+def test_amd_pa_decode_5d_streaming_register(page_size, num_splits, query_length):
+    """Packed K/V register pipeline matches dense attention across KV tiles."""
+    num_kv_heads, group, head_dim = 2, 8, 64
+    num_q_heads = num_kv_heads * group
+    ctx_lens = [513, 2049]
+    sm_scale = 1.0 / math.sqrt(head_dim)
+    query, key_cache, value_cache, context_lens, block_tables = _amd_pa_decode_build_inputs(
+        len(ctx_lens),
+        ctx_lens,
+        num_q_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        query_length=query_length,
+        device=DEVICE,
+        cache_layout="5d",
+    )
+    ref = _amd_pa_decode_ref(query, key_cache, value_cache, context_lens, block_tables, sm_scale, num_q_heads,
+                             num_kv_heads, query_length)
+    out = torch.empty_like(query)
+    workspace = None
+    config = None
+    if page_size == 64 and num_splits == 4 and query_length == 1:
+        # Exercise the cached-config, allocation-free serving path once; other
+        # cases retain internal selection/allocation so both APIs stay covered.
+        config = _amd_pa_decode_get_config(
+            query,
+            key_cache,
+            value_cache,
+            block_tables,
+            query_length=query_length,
+            num_splits=num_splits,
+            streaming_kv=True,
+        )
+        workspace = _amd_pa_decode_allocate_workspace(query, key_cache, config)
+    _amd_pa_decode(
+        out,
+        query,
+        key_cache,
+        value_cache,
+        context_lens,
+        block_tables,
+        sm_scale,
+        query_length=query_length,
+        num_splits=num_splits,
+        streaming_kv=True,
+        workspace=workspace,
+        config=config,
+    )
+    torch.testing.assert_close(out.float(), ref, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize("num_splits", [1, 2, 32], ids=["fused", "split2", "split32"])
+@pytest.mark.parametrize("page_size", [16, 64], ids=["p16", "p64"])
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware (CDNA4)")
+def test_amd_pa_decode_gluon_compat(page_size, num_splits):
+    """The qlen1/group8 Gluon-compatible ownership and K prefetch path is correct."""
+    num_kv_heads, group, head_dim = 2, 8, 64
+    num_q_heads = num_kv_heads * group
+    ctx_lens = [257, 513]
+    sm_scale = 1.0 / math.sqrt(head_dim)
+    query, key_cache, value_cache, context_lens, block_tables = _amd_pa_decode_build_inputs(
+        len(ctx_lens),
+        ctx_lens,
+        num_q_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        device=DEVICE,
+        cache_layout="5d",
+    )
+    ref = _amd_pa_decode_ref(
+        query,
+        key_cache,
+        value_cache,
+        context_lens,
+        block_tables,
+        sm_scale,
+        num_q_heads,
+        num_kv_heads,
+        1,
+    )
+    out = torch.empty_like(query)
+    _amd_pa_decode(
+        out,
+        query,
+        key_cache,
+        value_cache,
+        context_lens,
+        block_tables,
+        sm_scale,
+        query_length=1,
+        num_splits=num_splits,
+        gluon_compat=True,
+    )
+    torch.testing.assert_close(out.float(), ref, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize("context", [8192, 32768], ids=["8k", "32k"])
+@pytest.mark.parametrize("page_size", [16, 64], ids=["p16", "p64"])
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware (CDNA4)")
+def test_amd_pa_decode_b1_auto_probability_lds_config(page_size, context):
+    """Production B1 shapes select the 32-split compact probability-LDS path."""
+    num_kv_heads, group, head_dim = 8, 8, 64
+    x = 8
+    query = torch.empty((1, num_kv_heads * group, head_dim), dtype=torch.bfloat16, device=DEVICE)
+    key_cache = torch.empty((1, num_kv_heads, head_dim // x, page_size, x), dtype=torch.bfloat16, device=DEVICE)
+    value_cache = torch.empty((1, num_kv_heads, page_size // x, head_dim, x), dtype=torch.bfloat16, device=DEVICE)
+    block_tables = torch.empty((1, context // page_size), dtype=torch.int32, device=DEVICE)
+
+    config = _amd_pa_decode_get_config(
+        query,
+        key_cache,
+        value_cache,
+        block_tables,
+        max_context_len=context,
+    )
+    assert config.gluon_compat
+    assert config.streaming_kv
+    assert config.num_splits == 32
+    assert config.block_n == 256
+    assert config.num_warps == 4
+
+    control = _amd_pa_decode_get_config(
+        query,
+        key_cache,
+        value_cache,
+        block_tables,
+        max_context_len=context,
+        gluon_compat=False,
+    )
+    assert not control.gluon_compat
 
 
 # =============================================================================

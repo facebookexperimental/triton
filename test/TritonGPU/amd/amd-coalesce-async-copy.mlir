@@ -213,6 +213,37 @@ tt.func @async_copy_with_padding_different_vec(%input: tensor<256x!tt.ptr<f32>, 
 
 // -----
 
+#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 64], warpsPerCTA = [4, 1], order = [1, 0]}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.target" = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+// A gather-transpose can be contiguous along dimension 0 even though the
+// initial register and shared layouts select dimension 1. Retarget a simple
+// TLX allocation and its index view so gfx950 can issue a 128-bit direct load.
+// CHECK: #[[$GATHER_BLOCKED:.*]] = #ttg.blocked<{sizePerThread = [8, 1], threadsPerWarp = [16, 4], warpsPerCTA = [1, 4], order = [0, 1]}>
+// CHECK: #[[$GATHER_SHARED:.*]] = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0, 1]}>
+// CHECK-LABEL: async_copy_gather_transpose
+tt.func @async_copy_gather_transpose(
+    %input: tensor<128x64x!tt.ptr<bf16>, #blocked>
+        {tt.contiguity = dense<[8, 1]> : tensor<2xi32>,
+         tt.divisibility = dense<[16, 2]> : tensor<2xi32>}) {
+  // CHECK: %[[ALLOC:.*]] = ttg.local_alloc : () -> !ttg.memdesc<2x128x64xbf16, #[[$GATHER_SHARED]], #smem, mutable>
+  %smem = ttg.local_alloc : () -> !ttg.memdesc<2x128x64xbf16, #shared, #smem, mutable>
+  %c0 = arith.constant 0 : i32
+  // CHECK: %[[VIEW:.*]] = ttg.memdesc_index %[[ALLOC]]
+  // CHECK-SAME: !ttg.memdesc<128x64xbf16, #[[$GATHER_SHARED]], #smem, mutable>
+  %view = ttg.memdesc_index %smem[%c0] : !ttg.memdesc<2x128x64xbf16, #shared, #smem, mutable> -> !ttg.memdesc<128x64xbf16, #shared, #smem, mutable>
+  // CHECK: %[[SRC:.*]] = ttg.convert_layout %{{.*}} : {{.*}} -> tensor<128x64x!tt.ptr<bf16>, #[[$GATHER_BLOCKED]]>
+  // CHECK: ttg.async_copy_global_to_local %[[SRC]], %[[VIEW]]
+  // CHECK-SAME: contiguity = 8
+  %token = ttg.async_copy_global_to_local %input, %view : tensor<128x64x!tt.ptr<bf16>, #blocked> -> <128x64xbf16, #shared, #smem, mutable>
+  %value = ttg.local_load %view : !ttg.memdesc<128x64xbf16, #shared, #smem, mutable> -> tensor<128x64xbf16, #blocked>
+  tt.return
+}
+}
+
+// -----
+
 #blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>
 #shared = #ttg.padded_shared<[64:+4] {offset = [[1], [2], [4], [8], [64], [128], [16], [32]], block = []}>
 #smem = #ttg.shared_memory

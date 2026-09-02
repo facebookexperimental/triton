@@ -471,6 +471,7 @@ def get_packages():
         yield "triton.profiler"
 
     yield "triton.language.extra.tlx"
+    yield "triton.language.extra.tlx.ops"
 
     # The TLX op library. find_packages() does follow the symlink once it
     # exists, but on a fresh tree add_links() may not have run yet, so
