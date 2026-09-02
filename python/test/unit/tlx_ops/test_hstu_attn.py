@@ -93,12 +93,11 @@ def test_non_causal_rejected():
     bit-identical to an honoured one and nothing downstream can notice.
     """
     from triton.tlx.ops import InvalidInput
-    from triton.tlx.ops import hstu_attn as tlx_hstu_attn
+    from triton.tlx.ops import hstu_attn_dev as tlx_hstu_attn
 
     q, k, v, offsets, attn_scale = _inputs(2, 512, 4, 128, torch.bfloat16)
     with pytest.raises(InvalidInput, match="causal"):
-        tlx_hstu_attn(q, k, v, offsets, 512, attn_scale, alpha=1.0 / 128, causal=False, arch=SM100_ARCH,
-                      space="smoke")
+        tlx_hstu_attn(q, k, v, offsets, 512, attn_scale, alpha=1.0 / 128, causal=False, arch=SM100_ARCH, space="smoke")
 
 
 def _gfx950_inputs(batch_size, max_seq_len, H, attn_dim, hidden_dim, dtype):
