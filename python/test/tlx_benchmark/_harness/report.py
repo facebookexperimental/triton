@@ -15,25 +15,28 @@ from .contract import Result, Status, artifact
 
 #: Marks that survive a terminal with no colour and a diff with no rendering.
 _MARK = {
-    Status.PASS: "ok",
-    Status.REGRESSED: "REGRESSED",
-    Status.SLOW_COMPILE: "SLOW-COMPILE",
+    Status.OK: "ok",
+    Status.PIP: "PIP",
     Status.NOISY: "noisy",
-    Status.HOST_BOUND: "host-bound",
     Status.ERROR: "ERROR",
 }
 
-#: Statuses that should fail an enforcing run. ``NOISY`` and ``HOST_BOUND`` are
-#: deliberately absent: neither is a claim that the code got worse, and failing
-#: on them would train people to ignore the suite.
-FAILING = (Status.REGRESSED, Status.SLOW_COMPILE, Status.ERROR)
+#: Statuses that fail the run. ``NOISY`` is deliberately absent: it is not a
+#: claim that the code is slow, only that the machine would not hold still, and
+#: failing on it would train people to ignore the suite.
+FAILING = (Status.PIP, Status.ERROR)
 
 
-def _tf(result, latency_ms) -> str:
-    """Throughput at a given latency, in TFLOP/s."""
-    if not result.flop_count or not latency_ms:
+def _tf(value) -> str:
+    """A TFLOP/s figure, column-width. No arithmetic: the harness measures in
+    this unit, so the report's job here is formatting and nothing else."""
+    if not value:
         return "        -"
-    return f"{result.flop_count / (latency_ms * 1e-3) / 1e12:9.0f}"
+    return f"{value:9.0f}"
+
+
+def _stat(stat, field: str):
+    return getattr(stat, field) if stat else None
 
 
 def _fmt_samples(result) -> str:
@@ -48,34 +51,44 @@ def _fmt_samples(result) -> str:
 
 
 def _fmt_cv(result) -> str:
-    """Coefficient of variation of the within-run samples, as a percentage."""
+    """Coefficient of variation of the within-run TFLOP/s samples, as a
+    percentage."""
     return f"{result.tlx.cv * 100:.1f}" if result.tlx else "-"
 
 
 def _fmt_compile(result) -> str:
     if result.t_cold_s is None:
-        return "-"  # --measure latency; no cold pass was run
+        return "-"  # no cold pass was run for this case
     return f"{result.t_cold_s:.2f}s" if result.t_cold_s < 10 else f"{result.t_cold_s:.0f}s"
 
 
 def table(results: Sequence[Result]) -> str:
+    """One row per case.
+
+    The input column is sized to its contents rather than fixed. An op names its
+    own inputs and mm's rendering is ~100 characters, so a fixed width silently
+    pushed every later column out of alignment. There is no separate dtype
+    column: mm carries dtype inside the input string, and a second copy in its
+    own column is noise.
+    """
+    width = max([len(r.case.input) for r in results] + [len("input")])
     lines = [
-        f"{'input':<34} {'dtype':<8} {'ref TF/s':>9} {'tlx TF/s':>9} {'speedup':>8} {'compile':>8} "
-        f"{'samples':>8} {'CV%':>6} {'p50 TF/s':>9} {'p90 TF/s':>9} {'p99 TF/s':>9}  status",
-        "-" * 150,
+        f"{'input':<{width}} {'ref TF/s':>9} {'tlx TF/s':>9} {'speedup':>8} {'compile':>8} "
+        f"{'samples':>8} {'CV%':>6} {'p50 TF/s':>9} {'p95 TF/s':>9} {'p99 TF/s':>9}  status",
+        "-" * (width + 84),
     ]
     for r in results:
-        lines.append(f"{r.case.input:<34} {r.case.dtype:<8} "
-                     f"{_tf(r, r.ref.mean if r.ref else None)} {_tf(r, r.tlx.mean if r.tlx else None)} "
+        lines.append(f"{r.case.input:<{width}} "
+                     f"{_tf(_stat(r.ref, 'mean'))} {_tf(_stat(r.tlx, 'mean'))} "
                      f"{(f'{r.speedup:.3f}x' if r.speedup else '-'):>8} "
                      f"{_fmt_compile(r):>8} "
                      f"{_fmt_samples(r):>8} "
                      f"{_fmt_cv(r):>6} "
-                     f"{_tf(r, r.tlx.p50 if r.tlx else None)} "
-                     f"{_tf(r, r.tlx.p90 if r.tlx else None)} "
-                     f"{_tf(r, r.tlx.p99 if r.tlx else None)}  {_MARK[r.status]}")
+                     f"{_tf(_stat(r.tlx, 'p50'))} "
+                     f"{_tf(_stat(r.tlx, 'p95'))} "
+                     f"{_tf(_stat(r.tlx, 'p99'))}  {_MARK[r.status]}")
         for note in r.notes:
-            lines.append(f"{'':<34} {'':<8} -> {note}")
+            lines.append(f"{'':<{width}} -> {note}")
     return "\n".join(lines)
 
 
@@ -100,17 +113,21 @@ def write_json(results: Sequence[Result], env: dict, path: str | pathlib.Path) -
 
 
 #: Explains the columns whose meaning is not obvious from the header.
-LEGEND = ("Every throughput column is TFLOP/s, HIGHER is better. `ref`/`tlx` are at the mean latency\n"
-          "        (median of the per-replicate means). Latencies are in the JSON artifact.\n"
+LEGEND = ("Every number here is TFLOP/s, HIGHER is better -- each timed iteration is converted to\n"
+          "        TFLOP/s before any statistic is taken, so CV and the percentiles describe the\n"
+          "        throughput distribution, not a latency one. `ref`/`tlx` are the mean (median of the\n"
+          "        per-replicate means).\n"
           "speedup = tlx TF/s / ref TF/s, so >1 means TLX is faster.\n"
-          "pNN TF/s = throughput at the pNN *latency*, so the columns descend: p99 is the worst-case\n"
-          "        throughput, not the best. Percentiles are nearest-rank over the pooled samples.\n"
+          "pNN TF/s = literal percentile of the TFLOP/s samples, so the columns ASCEND: p99 is the\n"
+          "        BEST case, beaten by 1% of iterations. The worst case is `min` in the JSON\n"
+          "        artifact. Nearest-rank over the pooled samples, so each is an observed iteration.\n"
           "samples = total timed kernel invocations behind the row, over all replicates.\n"
-          "CV%  = coefficient of variation of the latency samples within a run, sd/mean, after IQR\n"
-          "        rejection.\n"
-          "The gate reads NEITHER CV nor the percentiles: it reads the between-run deviation of the\n"
-          "replicate means, which is the uncertainty on the headline rather than the width of one run.\n"
-          "That figure is in the JSON artifact, and in the note printed when it trips.")
+          "CV%  = coefficient of variation of the TFLOP/s samples within a run, sd/mean, after IQR\n"
+          "        rejection. This is the noise gate: over 3% and the row is `noisy` with no perf\n"
+          "        verdict claimed.\n"
+          "status: ok | PIP (speedup < 0.9x, or cold compile over 2 min) | noisy | ERROR (raised, or\n"
+          "        the output did not match the reference). Every threshold is absolute -- there is no\n"
+          "        recorded baseline, so a verdict depends only on the run that produced it.")
 
 
 def render(results: Sequence[Result], env: dict, json_path: Optional[str] = None) -> str:

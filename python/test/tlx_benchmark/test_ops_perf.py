@@ -27,24 +27,13 @@ def test_op_perf(module_name, pytestconfig):
     if not bench.supported():
         pytest.skip(f"{bench.OP} has no implementation for this device")
 
-    kwargs = {}
-    if pytestconfig.getoption("--replicates"):
-        kwargs["replicates"] = pytestconfig.getoption("--replicates")
     results, env = bench.run(
         space=pytestconfig.getoption("--space"),
-        measure_compile=pytestconfig.getoption("--measure") in ("compile", "all"),
-        strict=pytestconfig.getoption("--strict-env"),
-        **kwargs,
+        head=pytestconfig.getoption("--head"),
     )
-    from _harness import baseline as baseline_mod
     from _harness import report as report_mod
 
     print("\n" + report_mod.render(results, env, pytestconfig.getoption("--json") or bench.default_json()))
 
-    if pytestconfig.getoption("--update-baseline") or not baseline_mod.load(bench.OP, bench.arch(),
-                                                                            pytestconfig.getoption("--space")):
-        print(f"baseline recorded: {baseline_mod.save(bench.OP, bench.arch(), results, env)}")
-        return
-    if pytestconfig.getoption("--guard") == "enforce":
-        bad = report_mod.failures(results)
-        assert not bad, "\n".join(f"{r.case.key}: {'; '.join(r.notes)}" for r in bad)
+    bad = report_mod.failures(results)
+    assert not bad, "\n".join(f"{r.case.key}: {'; '.join(r.notes)}" for r in bad)

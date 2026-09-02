@@ -18,7 +18,7 @@ close to a no-op for compute-bound work. A "clocks are not locked" check would
 have fired on every correct run. What ``denoise.sh`` actually contributes for
 this workload is a *fixed* power cap, persistence mode, and NUMA binding; the
 rest of the stability comes from warming to steady state (see
-``measure.DEFAULT_WARMUP_MS``).
+``measure.DEFAULT_WARMUP_ITERS``).
 
 So verification here is behavioural: watch the operating point rather than the
 configuration that was meant to produce it.

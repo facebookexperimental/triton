@@ -17,11 +17,11 @@ import triton.language.extra.tlx as tlx
 from triton.language.extra.tlx.warp_spec import get_bufidx_phase
 from triton.tools.tensor_descriptor import TensorDescriptor
 
-from ._shapes import REALWORLD_SM100
+from ._shapes import SM100_FOCUS
 
 #: The shapes `bench_mm.py` gates on for this arch. Correctness runs the union
 #: of every arch's list; perf runs only its own.
-PERF_SHAPES = REALWORLD_SM100
+PERF_SHAPES = SM100_FOCUS
 
 
 # Cached SM count — never changes during program lifetime.

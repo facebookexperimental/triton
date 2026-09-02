@@ -1,18 +1,11 @@
 """L1 correctness for ``tlx.ops.mm``.
 
-Runs :data:`ALL` -- every architecture's shapes, not just this GPU's. The lists
-live in ``triton.tlx.ops.kernels.mm._shapes`` and are shared with the perf suite
-(``python/test/tlx_benchmark/bench_mm.py``), so a shape disabled here is
-automatically not benchmarked either. One shape is currently commented out there
-for a NUM_CTAS=2 bug -- see that module's docstring for the measurement table
-and the control case.
+Runs the synthetic list plus this arch's focus list -- the same set the perf
+suite measures. Shapes live in ``triton.tlx.ops.kernels.mm._shapes``, so one
+disabled for a correctness bug is automatically not benchmarked either.
 
-Running the union is the point rather than an accident: another architecture's
-real-world shapes are geometries nobody chose with *this* kernel in mind, which
-is what makes them good at finding assumptions it did not know it had. The cost
-is that not every shape is admissible everywhere -- sm100 needs 16-byte-aligned
-TMA strides and gfx942 does not -- so a shape the op declines is reported as a
-skip with the reason, never as a pass.
+A shape the op declines (sm100 requires 16-byte-aligned TMA strides; gfx942 has
+no such constraint) is reported as a skip with the reason, never as a pass.
 """
 
 import time
@@ -22,7 +15,7 @@ import torch
 
 from triton._internal_testing import is_blackwell, is_hip_cdna3
 from triton.tlx.ops import InvalidInput, UnsupportedOp
-from triton.tlx.ops.kernels.mm._shapes import ALL, operand
+from triton.tlx.ops.kernels.mm._shapes import SYNTHETIC, operand
 
 
 def _arch():
@@ -36,6 +29,33 @@ def _arch():
 
 ARCH = _arch()
 
+
+def _assert_strides(t, wanted):
+    """The operand has the recorded layout.
+
+    A dim of extent 1 is exempt: its stride addresses nothing, so a captured 0
+    and torch's own value describe the same bytes.
+    """
+    for dim, (got, want) in enumerate(zip(t.stride(), wanted)):
+        if t.shape[dim] != 1:
+            assert got == want, f"dim {dim}: stride {got}, recorded {want}"
+
+
+def _shapes():
+    """Synthetic plus this arch's focus list -- not every arch's.
+
+    An earlier version ran the union, on the argument that another arch's real
+    geometries are free coverage. That stopped being free once the sm100 list
+    grew past a handful: correctness would inherit the whole perf sweep.
+    """
+    import importlib
+
+    if ARCH is None:
+        return list(SYNTHETIC)
+    focus = importlib.import_module(f"triton.tlx.ops.kernels.mm.{ARCH}").PERF_SHAPES
+    return list(SYNTHETIC) + list(focus)
+
+
 pytestmark = pytest.mark.skipif(ARCH is None, reason="tlx.ops.mm has no implementation for this GPU")
 
 torch.manual_seed(0)
@@ -47,15 +67,15 @@ MAX_SECONDS_PER_CASE = 60
 REL_PRECISION = {torch.float16: 1e-3, torch.bfloat16: 8e-3}
 
 
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
-@pytest.mark.parametrize("M, N, K, a_row_major, b_row_major", ALL)
-def test_mm(M, N, K, a_row_major, b_row_major, dtype):
+@pytest.mark.parametrize("M, N, K, a_strides, b_strides, dtype_name", _shapes())
+def test_mm(M, N, K, a_strides, b_strides, dtype_name):
+    dtype = {"fp16": torch.float16, "bf16": torch.bfloat16}[dtype_name]
     from triton.tlx.ops import mm as tlx_mm
 
-    a = operand(M, K, dtype, a_row_major)
-    b = operand(K, N, dtype, b_row_major)
-    assert a.is_contiguous() == a_row_major
-    assert b.is_contiguous() == b_row_major
+    a = operand(M, K, a_strides, dtype)
+    b = operand(K, N, b_strides, dtype)
+    _assert_strides(a, a_strides)
+    _assert_strides(b, b_strides)
 
     torch.cuda.synchronize()
     started = time.perf_counter()
@@ -75,7 +95,7 @@ def test_mm(M, N, K, a_row_major, b_row_major, dtype):
     precision = REL_PRECISION[dtype]
     torch.testing.assert_close(out, ref, atol=precision * ref.abs().max().item(), rtol=precision)
 
-    # These are multi-gigabyte operands at the top of the real-world lists; without
+    # These are multi-gigabyte operands at the top of the focus lists; without
     # this the union OOMs partway through rather than at a diagnosable point.
     del a, b, out, ref
     torch.cuda.empty_cache()

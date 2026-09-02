@@ -33,11 +33,11 @@ import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
 
-from ._shapes import REALWORLD_GFX942
+from ._shapes import GFX942_FOCUS
 
 #: The shapes `bench_mm.py` gates on for this arch. Correctness runs the union
 #: of every arch's list; perf runs only its own.
-PERF_SHAPES = REALWORLD_GFX942
+PERF_SHAPES = GFX942_FOCUS
 
 # MI300X: 8 XCDs, 304 CUs. Consecutive program ids are dispatched round-robin
 # across the XCDs, so the remap below undoes that to restore tile locality.
