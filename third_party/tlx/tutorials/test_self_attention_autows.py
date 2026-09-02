@@ -107,6 +107,14 @@ D = 128
 H = 2
 
 
+def _subprocess_env():
+    env = os.environ.copy()
+    # A Buck par's sys.executable does not reconstruct the parent test
+    # runner's link-tree paths when it launches a script directly.
+    env["PYTHONPATH"] = os.pathsep.join(sys.path)
+    return env
+
+
 def _torch_ref(q, k, v, do, so, asc):
     """Float autograd HSTU-SiLU causal self-attention reference."""
     qf = q.detach().float().requires_grad_(True)
@@ -231,7 +239,7 @@ def test_self_attention_bwd_autows_dqreduce(L, Z):
     # (no HSTU_SELF_* env needed).
     r = subprocess.run(
         [sys.executable, __file__, "--run-dqreduce", str(L), str(Z)],
-        env=dict(os.environ),
+        env=_subprocess_env(),
         capture_output=True,
         text=True,
         timeout=900,
@@ -249,7 +257,7 @@ def test_self_attention_bwd_autows_clc(L, Z):
         pytest.skip("requires CUDA")
     r = subprocess.run(
         [sys.executable, __file__, "--run-clc", str(L), str(Z)],
-        env=dict(os.environ),
+        env=_subprocess_env(),
         capture_output=True,
         text=True,
         timeout=900,
@@ -276,7 +284,7 @@ def test_self_attention_fwd_autows_fadp(L, Z):
     # importing the kernel; no HSTU_SELF_* env needed.
     r = subprocess.run(
         [sys.executable, __file__, "--run-fadp", str(L), str(Z)],
-        env=dict(os.environ),
+        env=_subprocess_env(),
         capture_output=True,
         text=True,
         timeout=900,
@@ -304,7 +312,7 @@ def test_self_attention_fwd_autows_compiler_dp2(L, Z):
     # before importing the kernel; no HSTU_SELF_* env needed.
     r = subprocess.run(
         [sys.executable, __file__, "--run-fwd", str(L), str(Z)],
-        env=dict(os.environ),
+        env=_subprocess_env(),
         capture_output=True,
         text=True,
         timeout=900,

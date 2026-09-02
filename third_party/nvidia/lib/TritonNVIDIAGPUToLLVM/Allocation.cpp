@@ -65,8 +65,8 @@ static unsigned getNumScratchElemsSwizzledCvt(RankedTensorType srcTy,
   auto [smem, _] = triton::gpu::optimalSwizzling(srcLayout, dstLayout, srcTiles,
                                                  dstTiles, bitwidth);
   auto reps = smem.getInDimSize(StringAttr::get(ctx, "reps"));
-  // The smem has the same cta layout as the srcLayout, so we use that instead
-  // We remove the number of elements that are duplicated in the cta layout
+  // The smem has the same CGA layout as srcLayout, so use that instead.
+  // Remove the number of elements duplicated in the CGA layout.
   auto nBlocks = product(triton::gpu::getCTASplitNum(srcTy.getEncoding()));
   return smem.getTotalOutDimSizeProduct() / (reps * nBlocks);
 }
@@ -75,6 +75,8 @@ std::function<unsigned(Operation *)>
 getNvidiaAllocationAnalysisScratchSizeFn(TargetInfoBase &targetInfo) {
   auto allocation = [&targetInfo](Operation *op) -> unsigned {
     if (auto cvtOp = dyn_cast<triton::gpu::ConvertLayoutOp>(op)) {
+      if (cvtUsesForcedWarpShuffle(cvtOp))
+        return 0;
       auto srcTy = cvtOp.getSrc().getType();
       auto dstTy = cvtOp.getType();
       if (hasNpotShape(srcTy) || hasNpotShape(dstTy)) {

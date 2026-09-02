@@ -62,8 +62,8 @@ struct TMemAccessInfo {
 static Region *getWarpScope(Operation *op) {
   for (Region *region = op->getParentRegion(); region;) {
     Operation *parent = region->getParentOp();
-    if (isa_and_nonnull<ttg::WarpSpecializeOp,
-                        ttg::WarpSpecializePartitionsOp>(parent))
+    if (isa_and_nonnull<ttg::WarpSpecializeOp, ttg::WarpSpecializePartitionsOp>(
+            parent))
       return region;
     region = parent ? parent->getParentRegion() : nullptr;
   }
@@ -98,7 +98,8 @@ static std::optional<uint32_t> getTMemBaseAddress(Value value) {
              (static_cast<uint32_t>(row.getInt()) << 16);
     }
     if (auto slice = dyn_cast<TMEMSubSliceOp>(defOp)) {
-      offset += getTMemSubSliceOffset(slice.getSrc().getType(), slice.getN());
+      offset += getTMemSubSliceOffset(slice.getSrc().getType(),
+                                      slice.getOffset(), slice.getDim());
       value = slice.getSrc();
       continue;
     }
@@ -144,9 +145,9 @@ static std::optional<TMemAccessInfo> getTMemAccessInfo(Operation *op) {
   if (!baseAddress)
     return std::nullopt;
 
-  auto addressesByWarp = getTMemLdStWarpAddresses(
-      accessOp->regType, accessOp->memDescType, getContextualMaxNReg(op),
-      *baseAddress);
+  auto addressesByWarp =
+      getTMemLdStWarpAddresses(accessOp->regType, accessOp->memDescType,
+                               getContextualMaxNReg(op), *baseAddress);
   if (failed(addressesByWarp) || addressesByWarp->size() != *numWarps)
     return std::nullopt;
 
@@ -331,11 +332,8 @@ static void appendRootAllocs(Value value, SmallVectorImpl<RootAlloc> &allocs,
     } else if (auto slice = dyn_cast<TMEMSubSliceOp>(defOp)) {
       // getTMemSubSliceOffset packs the column offset in the low 16 bits and
       // the row offset in the high 16 bits, as TMEMSubSliceOpConversion does.
-      // This tree's tmem_subslice predates upstream's (offset, dim) form: it
-      // carries a single $N and can only slice the inner (column) dimension,
-      // which is exactly upstream's dim=1 default.
-      uint32_t packed =
-          getTMemSubSliceOffset(slice.getSrc().getType(), slice.getN());
+      uint32_t packed = getTMemSubSliceOffset(
+          slice.getSrc().getType(), slice.getOffset(), slice.getDim());
       TMemViewOffset next = offset;
       next.col += packed & 0xffff;
       next.row += packed >> 16;

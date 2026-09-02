@@ -4,10 +4,8 @@ No compile-time cap as in test_mm.py: this kernel has no shape heuristic, so the
 correctness caller autotunes a small space and wall-clock says nothing about
 compile time.
 
-TODO(causal flag ignored): the non-causal shape is commented out of SHAPES
-because it FAILS. `causal=False` returns output bit-identical to `causal=True`,
-so the kernel is always causal and the flag is silently dropped. Re-enable the
-shape once it is honoured -- it is the regression test for it.
+The op is causal-only, so every shape here is causal and `causal=False` is a
+rejection case rather than a numerics case -- see `test_non_causal_rejected`.
 """
 
 import pytest
@@ -32,8 +30,6 @@ SHAPES = [
     [2, 1024, 4, 128, True],
     [8, 128, 4, 128, True],
     [2, 256, 16, 64, True],
-    # TODO(causal flag ignored): fails, see module docstring.
-    # [2, 512, 4, 128, False],
     [1, 2048, 2, 128, True],
 ]
 
@@ -78,3 +74,18 @@ def test_hstu_attn(Z, MAX_SEQ_LEN, H, HEAD_DIM, causal, dtype):
     ref = _float_ref(q, k, v, offsets, attn_scale, alpha, causal).to(out.dtype)
     precision = REL_PRECISION[dtype]
     torch.testing.assert_close(out, ref, atol=precision * ref.abs().max().item(), rtol=precision)
+
+
+def test_non_causal_rejected():
+    """`causal=False` must raise rather than return the causal answer.
+
+    Causality is structural -- the KV block range and the score mask are both
+    unconditionally causal, and the flag reaches neither -- so a dropped flag is
+    bit-identical to an honoured one and nothing downstream can notice.
+    """
+    from triton.tlx.ops import InvalidInput
+    from triton.tlx.ops import hstu_attn as tlx_hstu_attn
+
+    q, k, v, offsets, attn_scale = _inputs(2, 512, 4, 128, torch.bfloat16)
+    with pytest.raises(InvalidInput, match="causal"):
+        tlx_hstu_attn(q, k, v, offsets, 512, attn_scale, alpha=1.0 / 128, causal=False, arch=ARCH, space="smoke")

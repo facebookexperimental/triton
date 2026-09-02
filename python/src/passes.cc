@@ -85,8 +85,15 @@ void init_triton_passes_ttgpuir(py::module_ &m) {
   ADD_PASS_OPTION_WRAPPER_1("add_f32_dot_tc", createTritonGPUF32DotTC, bool);
   ADD_PASS_OPTION_WRAPPER_1("add_optimize_dot_operands",
                             createTritonGPUOptimizeDotOperands, bool);
-  ADD_PASS_OPTION_WRAPPER_1("add_remove_layout_conversions",
-                            createTritonGPURemoveLayoutConversions, unsigned);
+  m.def(
+      "add_remove_layout_conversions",
+      [](mlir::PassManager &pm, unsigned smemBudget,
+         bool disableRematSplitting) {
+        pm.addPass(createTritonGPURemoveLayoutConversions(
+            {smemBudget, disableRematSplitting}));
+      },
+      py::arg("pm"), py::arg("smem_budget") = 0,
+      py::arg("disable_remat_splitting") = false);
   ADD_PASS_WRAPPER_0("add_reduce_data_duplication",
                      createTritonGPUReduceDataDuplication);
   ADD_PASS_WRAPPER_0("add_allocate_warp_groups",

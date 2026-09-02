@@ -617,7 +617,8 @@ LogicalResult BufferRegionAnalysis::visitOperation(
     if (in.isUnknown())
       return propagateRegions(in);
     uint32_t relativeOffset = ttng::getTMemSubSliceOffset(
-        tmemSubsliceOp.getType(), tmemSubsliceOp.getN());
+        tmemSubsliceOp.getSrc().getType(), tmemSubsliceOp.getOffset(),
+        tmemSubsliceOp.getDim());
     for (const BufferRegionView &view : in.views)
       regionInfo.views.insert(getMemDescView(
           view.storageBase, view.affineOffset + relativeOffset,

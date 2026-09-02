@@ -453,9 +453,18 @@ Value mlir::triton::createAlloc(Operation *insertBefore, RankedTensorType ty,
   return alloc;
 }
 
+bool mlir::triton::canPipelineTMALoad(Operation *op) {
+  auto tensorTy = cast<RankedTensorType>(op->getResultTypes()[0]);
+  auto sharedEncoding = getSharedEncoding(op);
+  int64_t stageSizeInBits = product(ttg::getAllocationShapePerCTA(
+                                sharedEncoding, tensorTy.getShape())) *
+                            tensorTy.getElementTypeBitWidth();
+  return stageSizeInBits % (ttng::TMA_ALIGN * 8) == 0;
+}
+
 bool mlir::triton::canBeAsyncLoad(Operation *op) {
   if (mlir::triton::isTMALoad(op)) {
-    return true;
+    return canPipelineTMALoad(op);
   }
   assert(isa<tt::LoadOp>(op));
   ttg::SharedEncodingTrait sharedEncoding = mlir::triton::getSharedEncoding(op);
@@ -883,13 +892,13 @@ bool triton::isLoopTripCountKnownPositive(scf::ForOp loop,
     if (llvm::none_of(cmp->getUsers(), isDominatingAssume))
       continue;
     bool unsignedCmp = loop.getUnsignedCmp();
-    if (cmp.getPredicate() ==
-            (unsignedCmp ? arith::CmpIPredicate::ugt : arith::CmpIPredicate::sgt) &&
+    if (cmp.getPredicate() == (unsignedCmp ? arith::CmpIPredicate::ugt
+                                           : arith::CmpIPredicate::sgt) &&
         cmp.getLhs() == loop.getUpperBound() &&
         cmp.getRhs() == loop.getLowerBound())
       return true;
-    if (cmp.getPredicate() ==
-            (unsignedCmp ? arith::CmpIPredicate::ult : arith::CmpIPredicate::slt) &&
+    if (cmp.getPredicate() == (unsignedCmp ? arith::CmpIPredicate::ult
+                                           : arith::CmpIPredicate::slt) &&
         cmp.getLhs() == loop.getLowerBound() &&
         cmp.getRhs() == loop.getUpperBound())
       return true;

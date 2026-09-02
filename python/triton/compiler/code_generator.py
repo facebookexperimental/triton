@@ -628,7 +628,9 @@ class CodeGenerator(ast.NodeVisitor):
         results = []
         for item in items:
             self.set_value(comp.target.id, item)
-            results.append(self.visit(node.elt))
+            # Apply the comprehension's `if` filters (the conditions are constexpr).
+            if all(self.visit(cond) for cond in comp.ifs):
+                results.append(self.visit(node.elt))
         return tl_tuple(results)
 
     # By design, only non-kernel functions can return

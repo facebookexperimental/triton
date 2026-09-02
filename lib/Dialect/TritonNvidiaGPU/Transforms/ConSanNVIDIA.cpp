@@ -29,6 +29,21 @@ Value getLeaderCTAPredicate(ImplicitLocOpBuilder &b, uint32_t broadcastMask) {
                                arith::ConstantIntOp::create(b, 0, 32));
 }
 
+std::optional<uint16_t> getAtomicScratchBroadcastMask(Operation *op) {
+  if (!op->hasAttr("allocation.size") ||
+      !isa<AtomicPollOp, AtomicRMWOp, AtomicCASOp, ttg::LocalAtomicScatterRMWOp,
+           tti::ExperimentalGSanAtomicRMWOp, tti::ExperimentalGSanAtomicCASOp>(
+          op))
+    return std::nullopt;
+
+  Type resultTy = op->getResult(0).getType();
+  if (auto tensorTy = dyn_cast<RankedTensorType>(resultTy)) {
+    auto kBlock = StringAttr::get(op->getContext(), "block");
+    return ttg::toLinearLayout(tensorTy).getFreeVariableMasks().lookup(kBlock);
+  }
+  return static_cast<uint16_t>(ttg::lookupNumCTAs(op) - 1);
+}
+
 } // namespace
 
 class NVIDIAConSanHooks : public tti::ConSanTargetHooks {
@@ -138,7 +153,17 @@ public:
     return getLeaderCTAPredicate(b, mask);
   }
 
-  std::optional<MemEffectsOpInfo>
+  SmallVector<Operation *>
+  createInitClusterBarrier(ImplicitLocOpBuilder &b) const override {
+    return {ClusterBarrierOp::create(b, b.getLoc()).getOperation()};
+  }
+
+  std::optional<uint16_t>
+  getScratchCTABroadcastMask(Operation *op) const override {
+    return getAtomicScratchBroadcastMask(op);
+  }
+
+  FailureOr<std::optional<MemEffectsOpInfo>>
   getMemEffectsOpInfo(Operation *op) const override {
     std::optional<MemEffectsOpInfo> info;
     if (auto expectOp = dyn_cast<ttng::BarrierExpectOp>(op)) {
@@ -326,7 +351,19 @@ public:
       info->barriers.push_back(
           {arriveOp.getBarrier(), nullptr, (int)arriveOp.getCount()});
     }
-    return info ? info : ConSanTargetHooks::getMemEffectsOpInfo(op);
+    auto baseInfo = ConSanTargetHooks::getMemEffectsOpInfo(op);
+    if (failed(baseInfo))
+      return failure();
+    if (!info)
+      return std::move(*baseInfo);
+    if (*baseInfo) {
+      for (auto &effect : (**baseInfo).operandEffects) {
+        if (std::holds_alternative<
+                MemEffectsOpInfo::Effects::StaticSharedBuffer>(effect.buffer))
+          info->operandEffects.push_back(std::move(effect));
+      }
+    }
+    return std::move(info);
   }
 
   SmallVector<CommitKindDesc>

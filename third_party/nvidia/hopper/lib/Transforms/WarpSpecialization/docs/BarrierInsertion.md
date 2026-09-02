@@ -234,7 +234,7 @@ The dQ MMA's operand D is NOT a separate TMEM allocation. It is derived from
 the dpT allocation via:
 
 ```
-%dpT_86 = tmem_subslice %dpT_9 {N = 0}        → cols 0-63 of dpT (128×128)
+%dpT_86 = tmem_subslice %dpT_9 {offset = 0}        → cols 0-63 of dpT (128×128)
 %dpT_87 = memdesc_reinterpret %dpT_86          → 1×128×64
 %dq_88  = memdesc_index %dpT_87[0]             → 128×64
 dQ MMA writes to %dq_88

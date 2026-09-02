@@ -4,6 +4,10 @@
 #include "mlir/IR/Operation.h"
 #include "triton/Analysis/Allocation.h"
 
+namespace mlir {
+class DialectRegistry;
+}
+
 namespace mlir::triton::AMD {
 
 // Filter function used in the AMDGPU backend to remove dependencies that do
@@ -15,6 +19,15 @@ namespace mlir::triton::AMD {
 // proven independent by the generic Membar allocation-slice analysis.
 bool membarFilter(Operation *op1, Operation *op2, bool op1IsRead,
                   bool op2IsRead, Allocation *allocation);
+
+// Registers an external interface model marking the AMD scheduling-only fences
+// rocdl.sched.barrier / rocdl.sched.group.barrier with
+// ttg::SchedulingBarrierOpInterface. Membar's forward scan for a sync point
+// looks THROUGH ops carrying that interface (they have no cross-wave memory
+// semantics), so it does not insert a redundant barrier around the real
+// ttg.barrier that a tlx.workgroup_barrier interposes. Attaching via a dialect
+// extension keeps the core Membar analysis free of any ROCDL dependency.
+void registerSchedulingBarrierExternalModel(DialectRegistry &registry);
 } // namespace mlir::triton::AMD
 
 #endif

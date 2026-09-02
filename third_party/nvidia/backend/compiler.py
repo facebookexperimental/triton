@@ -271,10 +271,9 @@ class CUDAOptions:
         cluster_shape = self.ctas_per_cga if self.ctas_per_cga is not None else self.cluster_dims
         mirrors_agree = self.ctas_per_cga is None or self.cluster_dims in ((1, 1, 1), self.ctas_per_cga)
         if not mirrors_agree or (self.num_ctas > 1 and cluster_shape != (1, 1, 1)):
-            raise ValueError(
-                "a cluster must be requested exactly one way: either num_ctas, or ctas_per_cga "
-                f"(optionally mirrored in cluster_dims). Got num_ctas={self.num_ctas}, "
-                f"ctas_per_cga={self.ctas_per_cga}, cluster_dims={self.cluster_dims}")
+            raise ValueError("a cluster must be requested exactly one way: either num_ctas, or ctas_per_cga "
+                             f"(optionally mirrored in cluster_dims). Got num_ctas={self.num_ctas}, "
+                             f"ctas_per_cga={self.ctas_per_cga}, cluster_dims={self.cluster_dims}")
 
         # ctas_per_cga regroups grid CTAs rather than spawning them, so it is
         # incompatible with the multiplicative semantics of num_ctas. Mirror it
@@ -1085,7 +1084,7 @@ class CUDABackend(BaseBackend):
         passes.common.add_canonicalizer(pm)
         if "fpsan" in opt.instrumentation_mode:
             passes.ttgpuir.add_fp_sanitizer(pm)
-            passes.ttgpuir.add_remove_layout_conversions(pm, 0)
+            passes.ttgpuir.add_remove_layout_conversions(pm, 0, True)
             passes.common.add_canonicalizer(pm)
             passes.common.add_cse(pm)
         # Budget-aware layout conversion elimination — runs last to ensure
@@ -1153,7 +1152,7 @@ class CUDABackend(BaseBackend):
         if "fpsan" in options.instrumentation_mode:
             passes.ttgpuir.add_fp_sanitizer(pm)
         if any(mode in options.instrumentation_mode for mode in ["consan", "fpsan"]):
-            passes.ttgpuir.add_remove_layout_conversions(pm, 0)
+            passes.ttgpuir.add_remove_layout_conversions(pm, 0, True)
             passes.common.add_canonicalizer(pm)
             passes.common.add_cse(pm)
 

@@ -244,6 +244,7 @@ struct AuxDataMap {
   // cases for each memdesc.
   triton::BufferStatePlan bufferStatePlans[numMemTypes];
   DenseMap<Value, BufferStateCandidates> bufferCandidates[numMemTypes];
+  DenseMap<Operation *, BufferStateCandidates> scratchBufferCandidates;
 
   // Beta compatibility: legacy FunctionBuilder entry points still consume
   // packed descriptors and an optional alias expansion matrix.
