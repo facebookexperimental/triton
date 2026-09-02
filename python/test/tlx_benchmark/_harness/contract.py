@@ -1,43 +1,25 @@
-"""The vocabulary the harness produces and the baseline consumes.
-
-Kept in its own module so ``measure`` / ``compile`` / ``baseline`` / ``report``
-share a vocabulary without depending on each other.
-
-The JSON that ``report`` emits is a stable, versioned artifact: it is what CI
-uploads and what a review agent reads *instead of parsing stdout*. Treat it as
-an interface -- bump ``SCHEMA_VERSION`` on any incompatible change.
-"""
-
 from __future__ import annotations
 
 import dataclasses
 import enum
 from typing import Any, Optional, Sequence
 
-SCHEMA_VERSION = 1
+#: 2: ``Stat`` is TFLOP/s rather than milliseconds, and the redundant
+#: ``Result.tlx_tflops`` / ``ref_tflops`` are gone -- they were
+#: ``flop_count / mean_latency``, which ``Stat.mean`` now is.
+SCHEMA_VERSION = 2
 
 
 class Status(str, enum.Enum):
-    """Per-case outcome. Only ``PASS`` and ``NOISY`` are reachable before the
-    guard lands in phase 5; the rest are declared here so the schema is stable
-    from the first artifact."""
 
-    PASS = "pass"
-    REGRESSED = "regressed"  # slower than baseline by more than the tolerance
-    SLOW_COMPILE = "slow_compile"  # t_cold over the absolute cap
-    NOISY = "noisy"  # spread over the noise floor; no perf verdict is claimed
-    # Latency is dominated by host-side launch cost, so the number describes
-    # Python rather than the kernel. Reported, never gated. Distinct from NOISY
-    # because the cause and the fix are different: NOISY is the machine,
-    # HOST_BOUND is the op's per-call overhead against a too-small shape.
-    HOST_BOUND = "host_bound"
-    ERROR = "error"  # the case raised
+    OK = "ok"  # everything else
+    PIP = "pip"  # perf improvement pending: too slow, or too slow to compile
+    NOISY = "noisy"  # CV over the limit; no perf verdict is claimed
+    ERROR = "error"  # the case raised, or returned the wrong answer
 
 
 @dataclasses.dataclass(frozen=True)
 class Case:
-    """One benchmarked point. ``key`` is also the baseline lookup key, so it
-    must be stable across runs and readable in a diff."""
 
     op: str
     arch: str
@@ -51,7 +33,10 @@ class Case:
 
     @property
     def key(self) -> str:
-        return f"{self.op}/{self.arch}/{self.dtype}/{'x'.join(str(s) for s in self.shape)}"
+        # Flattened, because a shape element may be a tuple (mm carries operand
+        # strides) and str() on one puts parens and spaces in the artifact key.
+        parts = ("_".join(str(x) for x in s) if isinstance(s, (tuple, list)) else str(s) for s in self.shape)
+        return f"{self.op}/{self.arch}/{self.dtype}/{'x'.join(parts)}"
 
     @property
     def input(self) -> str:
@@ -70,43 +55,43 @@ class Case:
 
 @dataclasses.dataclass(frozen=True)
 class Stat:
-    """A summarized latency measurement, in milliseconds.
-
-    Two dispersion figures, at two different scales, and the distinction is
-    load-bearing. ``rel_max_deviation`` is BETWEEN runs and ``rel_idr`` is
-    WITHIN one; with a few thousand samples per run the median is far more
-    stable than the distribution around it is wide. Measured on B200, mm 8192^3
-    has a within-run relative interdecile range of ~6% -- the power-governed
-    clock wanders -- while its p50 reproduces between runs to 1.7%. The gate
-    reads the first; gating on the second rejected cases whose reported number
-    was in fact solid.
-    """
+    # Percentiles are literal over TFLOP/s samples, so they ASCEND: p99 is the FAST
+    # tail and the slow tail is `min`. The inverse of the latency reading.
 
     #: The headline value. Reported rather than the median because a mean plus
     #: a coefficient of variation is the conventional way to summarize a
-    #: latency distribution, and because the tail matters for a kernel: a
-    #: median hides a slow p99 completely.
+    #: distribution, and because the tail matters for a kernel: a median hides
+    #: a slow iteration completely.
     mean: float
     #: Coefficient of variation of the pooled samples, ``sd / mean``. The
     #: headline dispersion. Computed after IQR rejection, so it describes the
     #: distribution rather than the worst descheduled iteration.
     cv: float
+    #: Nearest-rank percentiles of the pooled samples, so each is an observed
+    #: iteration. In TFLOP/s these ASCEND -- see the class docstring.
     p50: float
-    p90: float
+    p95: float
     p99: float
+    #: In TFLOP/s, ``min`` is the slowest iteration and ``max`` the fastest.
     min: float
     max: float
     #: Relative maximum deviation of the replicate means from their median:
-    #: ``max|mean_i - median(mean)| / median(mean)``. BETWEEN runs, and what
-    #: the gate reads -- it is the uncertainty on the headline number, which
-    #: CV (a within-run figure) is not.
-    rel_max_deviation: float
+    #: ``max|mean_i - median(mean)| / median(mean)``. BETWEEN runs -- it is the
+    #: uncertainty on the headline number, which CV (a within-run figure) is
+    #: not. Dimensionless, so unaffected by the unit.
+    rel_max_deviation: Optional[float]
     #: Relative interdecile range of the pooled samples, ``(p90 - p10) / p50``.
     #: Robust companion to ``cv``; kept in the artifact, not in the table.
+    #: Dimensionless.
     rel_idr: float
     replicates: int
     n_kept: int
     n_raw: int
+    #: What the value-typed fields are in. ``tflops`` for anything the report
+    #: prints; ``ms`` when ``measure`` was called without a ``flop_count``.
+    #: Recorded rather than assumed so a consumer of the JSON never has to
+    #: infer the unit from the magnitudes.
+    unit: str = "tflops"
 
     def to_dict(self) -> dict:
         return dataclasses.asdict(self)
@@ -114,20 +99,21 @@ class Stat:
 
 @dataclasses.dataclass
 class Result:
-    """Everything measured for one case, plus the verdict."""
 
     case: Case
-    status: Status = Status.PASS
+    status: Status = Status.OK
+    #: Both in TFLOP/s. There is no separate ``tlx_tflops`` field: it used to
+    #: be ``flop_count / tlx.mean_latency``, which is exactly what ``tlx.mean``
+    #: is now, and two spellings of one number is two things to keep in sync.
     tlx: Optional[Stat] = None
     ref: Optional[Stat] = None
-    #: ref.p50 / tlx.p50 -- the enforcing metric, because a ratio measured on
-    #: one machine in one run is immune to clock and thermal drift.
+    #: tlx.mean / ref.mean -- the enforcing metric, because a ratio measured on
+    #: one machine in one run is immune to clock and thermal drift. Above 1
+    #: means TLX is faster, in throughput as it did in latency.
     speedup: Optional[float] = None
-    tlx_tflops: Optional[float] = None
-    ref_tflops: Optional[float] = None
-    #: Useful FLOPs for this case, supplied by the op module. Carried rather
-    #: than only the derived throughputs so the report can express any latency
-    #: -- including the percentiles -- in the same units as the headline.
+    #: Useful FLOPs for one call, supplied by the op module. Kept even though
+    #: the throughputs are already derived from it, because it is what lets a
+    #: consumer recover a latency, and what says which FLOPs were counted.
     flop_count: Optional[int] = None
     #: Host-side per-call cost, microseconds. Carried in the artifact because
     #: it is what distinguishes "the kernel got slower" from "the launch path
@@ -148,8 +134,6 @@ class Result:
             "tlx": self.tlx.to_dict() if self.tlx else None,
             "ref": self.ref.to_dict() if self.ref else None,
             "speedup": self.speedup,
-            "tlx_tflops": self.tlx_tflops,
-            "ref_tflops": self.ref_tflops,
             "flop_count": self.flop_count,
             "tlx_host_us": self.tlx_host_us,
             "ref_host_us": self.ref_host_us,
@@ -161,9 +145,6 @@ class Result:
 
 
 def artifact(results: Sequence[Result], env: dict[str, Any]) -> dict:
-    """The top-level JSON document. ``env`` records what the numbers depend on
-    -- GPU, driver, clock-lock state -- because a latency without that context
-    is not comparable to anything."""
     return {
         "schema_version": SCHEMA_VERSION,
         "env": env,
