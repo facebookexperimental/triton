@@ -1876,6 +1876,34 @@ void printSimplifiedOp(
     return;
   }
 
+  // ttng.arrive_barrier: `count` is an attribute and `pred` an optional
+  // operand, but the generic mapping printed both positionally.
+  if (opName == "ttng.arrive_barrier") {
+    // A multicast arrive has no TLX spelling; leave a marker instead of an
+    // arrive that would look local but mean something else.
+    auto ctaMask = op->getAttrOfType<IntegerAttr>("ctaMask");
+    if (ctaMask && ctaMask.getInt() != 0) {
+      op->emitError("multicast arrive_barrier does not round-trip to TLX");
+      os << "# unsupported: multicast arrive_barrier (ctaMask="
+         << ctaMask.getInt() << ")";
+      printLocComment(op, os);
+      return;
+    }
+    os << "tlx.barrier_arrive("
+       << getValueName(op->getOperand(0), argSubstitutionMap);
+    // count is required on this op, but tolerate its absence on hand-written
+    // IR rather than crash; 1 is the value the op defaults to anyway.
+    auto countAttr = op->getAttrOfType<IntegerAttr>("count");
+    int64_t count = countAttr ? countAttr.getInt() : 1;
+    if (count != 1)
+      os << ", " << count;
+    if (op->getNumOperands() >= 2)
+      os << ", pred=" << getValueName(op->getOperand(1), argSubstitutionMap);
+    os << ")";
+    printLocComment(op, os);
+    return;
+  }
+
   // Get the TLX name or use original
   auto it = opNameMap.find(opName);
   StringRef tlxName = (it != opNameMap.end()) ? it->second : opName;
