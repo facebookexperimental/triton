@@ -21,13 +21,18 @@ entire ``--att*`` option group unless they find a legacy decoder on
 ``ROCPROF_ATT_LIBRARY_PATH``. Newer drivers bundle
 ``librocprof-trace-decoder`` and expose ATT directly. ``TLX_ROCPROFV3`` can
 select a compatible driver when the system default is older than the runtime.
-When ATT is absent, :func:`collect` degrades to counters rather than failing
-the optimization round.
+When ATT is absent -- or advertised but broken at run time -- :func:`collect`
+degrades to counters rather than failing the optimization round.
+
+Traces are written under ``output_dir`` and are **not** cleaned up: they are the
+evidence behind a promotion decision, and a run's worth of them is large. Point
+``TLX_ATT_OUTPUT_ROOT`` somewhere with room, and prune it between runs.
 """
 
 from __future__ import annotations
 
 import csv
+import functools
 import json
 import os
 import re
@@ -61,8 +66,6 @@ FALLBACK_PMC = (
     "SQ_INSTS_LDS",
 )
 
-_HELP_CACHE: dict[str, Any] | None = None
-
 
 def _rocprofv3() -> str | None:
     override = os.environ.get("TLX_ROCPROFV3")
@@ -71,54 +74,51 @@ def _rocprofv3() -> str | None:
     return shutil.which("rocprofv3")
 
 
+@functools.lru_cache(maxsize=1)
 def capability() -> dict[str, Any]:
     """Probe whether this rocprofv3 exposes ATT, and if not, say why.
 
     Cached per process: it shells ``rocprofv3 --help``, which is not free and
     cannot change underneath a single worker.
     """
-    global _HELP_CACHE
-    if _HELP_CACHE is not None:
-        return _HELP_CACHE
     binary = _rocprofv3()
     if binary is None:
-        _HELP_CACHE = {
+        return {
             "att_available":
             False,
             "reason": (f"TLX_ROCPROFV3={os.environ['TLX_ROCPROFV3']!r} is not executable"
                        if os.environ.get("TLX_ROCPROFV3") else "rocprofv3 not on PATH"),
             "searched": [],
         }
-        return _HELP_CACHE
     try:
         help_text = subprocess.run([binary, "--help"], capture_output=True, text=True, timeout=60, check=False).stdout
     except (OSError, subprocess.SubprocessError) as error:
-        _HELP_CACHE = {
+        return {
             "att_available": False,
             "reason": f"could not run rocprofv3 --help: {error}",
             "searched": [],
         }
-        return _HELP_CACHE
-    available = "--att" in help_text
     searched = _decoder_search_path()
-    found = sorted(
-        str(path)
-        for directory in searched
-        for pattern in DECODER_GLOBS
-        for path in directory.glob(pattern)
-        if path.is_file())
-    _HELP_CACHE = {
-        "att_available": available,
-        "rocprofv3": binary,
-        "decoders_found": found,
+    result = {
+        "att_available":
+        "--att" in help_text,
+        "rocprofv3":
+        binary,
+        "decoders_found":
+        sorted(
+            str(path)
+            for directory in searched
+            for pattern in DECODER_GLOBS
+            for path in directory.glob(pattern)
+            if path.is_file()),
         "searched": [str(p) for p in searched],
     }
-    if not available:
-        _HELP_CACHE["reason"] = (f"{binary} does not expose ATT. Set TLX_ROCPROFV3 to a newer "
-                                 "rocprofv3 with librocprof-trace-decoder, or install the legacy "
-                                 "libatt_decoder_trace.so at the top level of a directory on "
-                                 "ROCPROF_ATT_LIBRARY_PATH.")
-    return _HELP_CACHE
+    if not result["att_available"]:
+        result["reason"] = (f"{binary} does not expose ATT. Set TLX_ROCPROFV3 to a newer "
+                            "rocprofv3 with librocprof-trace-decoder, or install the legacy "
+                            "libatt_decoder_trace.so at the top level of a directory on "
+                            "ROCPROF_ATT_LIBRARY_PATH.")
+    return result
 
 
 def _decoder_search_path() -> list[Path]:
@@ -132,14 +132,12 @@ def _decoder_search_path() -> list[Path]:
         if binary is not None:
             rocm_root = Path(binary).resolve().parent.parent
             raw.append(str(rocm_root / "lib"))
-    seen: list[Path] = []
+    ordered: list[Path] = []
     for entry in raw:
-        if not entry:
-            continue
         path = Path(entry)
-        if path not in seen:
-            seen.append(path)
-    return seen
+        if entry and path not in ordered:
+            ordered.append(path)
+    return ordered
 
 
 def collect(
@@ -150,42 +148,41 @@ def collect(
     entry_point: str = "matmul",
     kernel_regex: str = ".*matmul.*",
     warmup: int = 3,
-    pin_config: dict[str, Any] | None = None,
     timeout_s: float = 900.0,
 ) -> dict[str, Any]:
     """Trace one dispatch of ``kernel_path`` and return a compact summary.
 
-    Falls back to counter collection when ATT is unavailable, and reports which
-    mode ran so a reader never mistakes counters for a thread trace.
+    Falls back to counter collection when ATT is unavailable *or* when the ATT
+    run itself fails -- a driver can advertise ``--att`` and still have no usable
+    decoder -- and reports which mode ran so a reader never mistakes counters for
+    a thread trace.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
-    run_dir = Path(tempfile.mkdtemp(prefix="run-", dir=output_dir))
     cap = capability()
+
+    def run(mode: str) -> dict[str, Any]:
+        return _run(
+            mode=mode,
+            kernel_path=kernel_path,
+            case=case,
+            output_dir=Path(tempfile.mkdtemp(prefix=f"{mode}-", dir=output_dir)),
+            entry_point=entry_point,
+            kernel_regex=kernel_regex,
+            warmup=warmup,
+            timeout_s=timeout_s,
+        )
+
     if cap["att_available"]:
-        result = _run(
-            mode="att",
-            kernel_path=kernel_path,
-            case=case,
-            output_dir=run_dir,
-            entry_point=entry_point,
-            kernel_regex=kernel_regex,
-            warmup=warmup,
-            pin_config=pin_config,
-            timeout_s=timeout_s,
-        )
+        result = run("att")
+        if "error" not in result:
+            result["capability"] = cap
+            return result
+        att_error = result["error"]
     else:
-        result = _run(
-            mode="counters",
-            kernel_path=kernel_path,
-            case=case,
-            output_dir=run_dir,
-            entry_point=entry_point,
-            kernel_regex=kernel_regex,
-            warmup=warmup,
-            pin_config=pin_config,
-            timeout_s=timeout_s,
-        )
-        result["att_unavailable_reason"] = cap.get("reason", "")
+        att_error = cap.get("reason", "")
+
+    result = run("counters")
+    result["att_unavailable_reason"] = att_error
     result["capability"] = cap
     return result
 
@@ -199,7 +196,6 @@ def _run(
     entry_point: str,
     kernel_regex: str,
     warmup: int,
-    pin_config: dict[str, Any] | None,
     timeout_s: float,
 ) -> dict[str, Any]:
     binary = _rocprofv3()
@@ -229,8 +225,9 @@ def _run(
             "0xF",  # gfx9 default: all four SIMDs
             "--kernel-include-regex",
             kernel_regex,
-            # One dispatch only. With the config pinned there is no autotune
-            # search, so dispatch (warmup + 1) is the steady-state call.
+            # One dispatch only. The target resolves to a single autotuner
+            # config, so each call is one dispatch and (warmup + 1) is the
+            # steady-state one. See att_child's docstring.
             "--kernel-iteration-range",
             f"[{warmup + 1}]",
         ]
@@ -251,8 +248,6 @@ def _run(
     environment["TLX_ATT_KERNEL"] = str(kernel_path)
     environment["TLX_ATT_ENTRY"] = entry_point
     environment["TLX_ATT_WARMUP"] = str(warmup)
-    if pin_config:
-        environment["TLX_AGENT_PIN_CONFIG"] = json.dumps(pin_config)
 
     command = [*profiler_args, "--", sys.executable, str(child)]
     try:
@@ -327,12 +322,22 @@ def _summarize_att(output_dir: Path) -> dict[str, Any]:
                             for path in stats_files},
         }
 
+    # Parse once. Metric columns become floats up front so nothing downstream
+    # has to re-parse or defend against a value that already got through.
     rows: list[dict[str, Any]] = []
     for path in instruction_files:
         with path.open(newline="") as stream:
             for raw in csv.DictReader(stream):
-                normalized = {(key or "").strip().lower(): (value or "").strip() for key, value in raw.items()}
-                rows.append(normalized)
+                row = {(key or "").strip().lower(): (value or "").strip() for key, value in raw.items()}
+                for field in _ATT_NUMERIC_COLUMNS:
+                    try:
+                        row[field] = float(row.get(field) or 0.0)
+                    except ValueError:
+                        return {
+                            "parse_error": f"ATT stats CSV has a non-numeric {field}: {row.get(field)!r}",
+                            "csv_files": [str(p.relative_to(output_dir)) for p in instruction_files],
+                        }
+                rows.append(row)
 
     if not rows:
         return {
@@ -340,40 +345,13 @@ def _summarize_att(output_dir: Path) -> dict[str, Any]:
             "csv_files": [str(p.relative_to(output_dir)) for p in instruction_files],
         }
 
-    invalid_numeric: list[dict[str, str]] = []
+    totals = {field: sum(row[field] for row in rows) for field in _ATT_NUMERIC_COLUMNS}
+
+    by_opcode: dict[str, dict[str, float]] = defaultdict(lambda: dict.fromkeys(_ATT_NUMERIC_COLUMNS, 0.0))
     for row in rows:
+        counters = by_opcode[_opcode_class(row.get("instruction", ""))]
         for field in _ATT_NUMERIC_COLUMNS:
-            value = row.get(field, "")
-            try:
-                float(value or 0.0)
-            except ValueError:
-                invalid_numeric.append({"field": field, "value": value})
-                if len(invalid_numeric) == 5:
-                    break
-        if len(invalid_numeric) == 5:
-            break
-    if invalid_numeric:
-        return {
-            "parse_error": "ATT stats CSV contains non-numeric metric values",
-            "examples": invalid_numeric,
-            "csv_files": [str(p.relative_to(output_dir)) for p in instruction_files],
-        }
-
-    def number(row: dict[str, Any], key: str) -> float:
-        try:
-            return float(row.get(key) or 0.0)
-        except ValueError as error:  # validated above; keep the invariant local
-            raise AssertionError(f"invalid ATT {key}: {row.get(key)!r}") from error
-
-    totals = {field: sum(number(row, field) for row in rows) for field in ("hitcount", "latency", "stall", "idle")}
-
-    by_opcode: dict[str,
-                    dict[str,
-                         float]] = defaultdict(lambda: {"hitcount": 0.0, "latency": 0.0, "stall": 0.0, "idle": 0.0})
-    for row in rows:
-        opcode = _opcode_class(row.get("instruction", ""))
-        for field in ("hitcount", "latency", "stall", "idle"):
-            by_opcode[opcode][field] += number(row, field)
+            counters[field] += row[field]
 
     stall_total = totals["stall"] or 1.0
     opcode_rollup = sorted(
@@ -388,7 +366,7 @@ def _summarize_att(output_dir: Path) -> dict[str, Any]:
         reverse=True,
     )[:_TOP_N_OPCODES]
 
-    top_sites = sorted(rows, key=lambda row: number(row, "stall"), reverse=True)[:_TOP_N_SITES]
+    top_sites = sorted(rows, key=lambda row: row["stall"], reverse=True)[:_TOP_N_SITES]
     return {
         "totals":
         totals,
@@ -397,12 +375,11 @@ def _summarize_att(output_dir: Path) -> dict[str, Any]:
         "top_stall_sites": [{
             "vaddr": row.get("vaddr", ""),
             "instruction": row.get("instruction", ""),
-            "hitcount": number(row, "hitcount"),
-            "latency": number(row, "latency"),
-            "stall": number(row, "stall"),
-            "idle": number(row, "idle"),
             "source": row.get("source", ""),
-        } for row in top_sites],
+            **{field: row[field]
+               for field in _ATT_NUMERIC_COLUMNS},
+        }
+                            for row in top_sites],
         "instruction_rows":
         len(rows),
         "csv_files": [str(p.relative_to(output_dir)) for p in instruction_files],
