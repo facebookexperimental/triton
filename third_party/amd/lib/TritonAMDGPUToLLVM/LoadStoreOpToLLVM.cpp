@@ -778,6 +778,7 @@ struct BufferLoadToLocalOpConversion
           unpackTensorElements(loc, llOther, rewriter, op.getOther().getType());
       isOtherZeroConst = isZeroConst(op.getOther());
     }
+    bool hasMask = llMask != nullptr;
 
     auto dstTy = op.getDest().getType();
     auto resElemTy = getTypeConverter()->convertType(dstTy.getElementType());
@@ -856,7 +857,7 @@ struct BufferLoadToLocalOpConversion
       // can avoid the branch by selecting an out-of-range *shared* address. The
       // HW will drop the load before fetching the data from global memory so we
       // will not overwrite values.
-      if (isThreadPredWarpUniform && isOtherZeroConst) {
+      if (isThreadPredWarpUniform && ((!hasMask) || isOtherZeroConst)) {
         Value predicatedAddress =
             selectLdsAddressForPredicate(b, threadPred, shmemAddr);
         auto bufferLoadToLds = bufferEmitter.emitLoadToLds(
