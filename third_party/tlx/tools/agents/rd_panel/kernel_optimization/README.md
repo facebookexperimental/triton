@@ -1,9 +1,14 @@
 # TLX Kernel Optimization Agent
 
 This directory contains the TLX-local optimization loop for standalone Triton and TLX
-kernels. It lives inside the TLX codebase (`third_party/tlx/tools/agents/kernel_optimization/`) and
+kernels. It lives inside the TLX R&D panel
+(`third_party/tlx/tools/agents/rd_panel/kernel_optimization/`) and
 is the canonical location for the loop in this checkout; a future sync to
 `third_party/tlx/` will copy from here.
+
+Panel responsibilities are defined by the panel directories under the parent
+`agents/` directory. The build panel owns this
+package's `test_*.py` files and fixtures.
 
 The language used by the kernel is not part of the control-plane contract. A
 user-supplied harness owns compilation, correctness, timing, and profiling.
@@ -39,7 +44,7 @@ is persisted per case.
 
 The default harness mode is **subprocess isolation** (`worker.py` subprocess per candidate):
 candidate state and imported kernel modules never leak across evaluations. An in-process
-`StandaloneHarness` is available programmatically (via `from third_party.tlx.tools.agents.kernel_optimization.harness import StandaloneHarness`)
+`StandaloneHarness` is available programmatically (via `from third_party.tlx.tools.agents.rd_panel.kernel_optimization.harness import StandaloneHarness`)
 for debugging and unit tests.
 
 Build/verify/benchmark/profile run in a new subprocess for every source candidate via
@@ -52,7 +57,7 @@ group. Large profile payloads (>1MB inline JSON) are spilled to
 Run the module directly from the Triton source repository root:
 
 ```bash
-python -m third_party.tlx.tools.agents.kernel_optimization.cli \
+python -m third_party.tlx.tools.agents.rd_panel.kernel_optimization.cli \
   --kernel my_kernel.py --reference-kernel reference_kernel.py \
   --output-dir /tmp/tlx-kernel-agent-run \
   --max-rounds 5 \
@@ -65,7 +70,7 @@ python -m third_party.tlx.tools.agents.kernel_optimization.cli \
   --provider codex --arch blackwell
 
 # A revalidated winner is committed by default:
-python -m third_party.tlx.tools.agents.kernel_optimization.cli \
+python -m third_party.tlx.tools.agents.rd_panel.kernel_optimization.cli \
   --kernel my_kernel.py --output-dir /tmp/tlx-kernel-agent-run \
   --vcs auto \
   --commit-message "Optimize my kernel with TLX agent"
@@ -124,9 +129,9 @@ tall, narrow-N shape. Select it with `--cases` so the default square regression 
 unchanged:
 
 ```bash
-python -m third_party.tlx.tools.agents.kernel_optimization.cli \
+python -m third_party.tlx.tools.agents.rd_panel.kernel_optimization.cli \
   --kernel third_party/tlx/ops/kernels/mm/gfx942.py --arch gfx942 \
-  --cases third_party/tlx/tools/agents/kernel_optimization/harnesses/gfx942/targets/gfx942/cases_819200x192x1024.json \
+  --cases third_party/tlx/tools/agents/rd_panel/kernel_optimization/harnesses/gfx942/targets/gfx942/cases_819200x192x1024.json \
   --output-dir /tmp/tlx-agent-gfx942-mm --provider codex \
   --no-commit-winner --result-format summary
 ```
@@ -199,11 +204,13 @@ device you are tuning for. Pass an existing TLX tutorial such as
 
 ### Curated optimization knowledge
 
-Two optional markdown files in the bundle are concatenated ahead of
-`target.json`'s inline `optimization_guidance` string, widest scope first, and
-delivered as that one field:
+Three optional markdown files in the bundle are concatenated ahead of
+`target.json`'s inline `optimization_guidance` string. TL strategy comes first,
+followed by knowledge from broadest to narrowest scope, and the resolved text is
+delivered as one field:
 
 ```text
+harnesses/<arch>/targets/<kernel>/tl-agent.md               # TL strategy
 harnesses/<arch>/knowledge.md                              # architecture-wide
 harnesses/<arch>/targets/<kernel>/optimization_guidance.md # this target
 ```
@@ -217,9 +224,10 @@ truncation announced in the text.
 
 The contract for the content:
 
-- **Human-write-only.** Agents read these files. A finding is promoted into one
-  by a human who has read the evidence; agent output lands in `experiments/`
-  under the run's output dir.
+- **Knowledge-agent-owned and human-reviewed.** The TL agent proposes findings
+  but does not edit these files. The knowledge agent may promote a generalized
+  finding only after a human has reviewed the evidence; raw agent output stays
+  in `experiments/` under the run's output directory.
 - **Mechanism, method and structure — not measurements.** Prefer how the hardware
   behaves, how to measure it correctly, and how the search space is shaped. A
   detailed figure copied in here goes stale with nothing to notice, and invites a
@@ -246,7 +254,7 @@ synthetic `LATENCY_US` timing so unit tests pass on any host.
 
 ```bash
 # Kernel-only: arch auto-resolved, or pass --arch hopper for H100
-python -m third_party.tlx.tools.agents.kernel_optimization.cli \
+python -m third_party.tlx.tools.agents.rd_panel.kernel_optimization.cli \
   --kernel my_gemm_kernel.py --reference-kernel baseline_gemm.py \
   --arch hopper \
   --output-dir /tmp/tlx-agent-h100 \

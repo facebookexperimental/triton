@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from .profiling import (
+from third_party.tlx.tools.agents.rd_panel.kernel_optimization.profiling import (
     ProfileRequest,
     compact_profile_summary,
     export_ncu_report_details,

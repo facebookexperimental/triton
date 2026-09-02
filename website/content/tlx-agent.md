@@ -88,7 +88,7 @@ from improving its score by weakening correctness or changing the workload.
 From the repository root:
 
 ```bash
-PYTHONPATH=<repo-root> python -m third_party.tlx.tools.agents.kernel_optimization.cli \
+PYTHONPATH=<repo-root> python -m third_party.tlx.tools.agents.rd_panel.kernel_optimization.cli \
   --kernel <absolute-kernel.py> \
   --harness <absolute-bundle/harness.py> \
   --cases <absolute-bundle/cases.json> \

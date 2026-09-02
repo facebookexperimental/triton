@@ -183,10 +183,11 @@ def _resolve_harness_paths(kernel: Path, harness: Path | None, cases: Path | Non
     return harness, cases, target
 
 
-# Curated knowledge lives in the frozen bundle, not a global doc tree, so a run's
-# prompt is reproducible from its recorded bundle hashes. Per
-# `references/input-contract.md` it must not reach the candidate provider.
+# TL strategy and curated knowledge live in the frozen bundle, not a global doc
+# tree, so a run's prompt is reproducible from its recorded bundle hashes. Per
+# `references/input-contract.md` the provider receives only their resolved text.
 ARCH_KNOWLEDGE_FILE = "knowledge.md"
+TL_AGENT_FILE = "tl-agent.md"
 TARGET_GUIDANCE_FILE = "optimization_guidance.md"
 
 # Backstop against a runaway document, not a budget to fill -- the prompt also
@@ -201,7 +202,11 @@ def _resolve_guidance(target_path: Path, inline: str) -> str:
     # harnesses/<arch>/targets/<kernel>/target.json -> harnesses/<arch>
     arch_dir = target_dir.parent.parent
     sections: list[str] = []
-    for path in (arch_dir / ARCH_KNOWLEDGE_FILE, target_dir / TARGET_GUIDANCE_FILE):
+    for path in (
+        target_dir / TL_AGENT_FILE,
+        arch_dir / ARCH_KNOWLEDGE_FILE,
+        target_dir / TARGET_GUIDANCE_FILE,
+    ):
         if path.is_file():
             text = path.read_text().strip()
             if text:

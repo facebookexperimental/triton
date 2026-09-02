@@ -9,9 +9,9 @@ from pathlib import Path
 from unittest import mock
 from unittest.mock import Mock, patch
 
-from . import optimizer as optimizer_module
-from .artifacts import load_prior_run_evidence
-from .cli import (
+from third_party.tlx.tools.agents.rd_panel.kernel_optimization import optimizer as optimizer_module
+from third_party.tlx.tools.agents.rd_panel.kernel_optimization.artifacts import load_prior_run_evidence
+from third_party.tlx.tools.agents.rd_panel.kernel_optimization.cli import (
     MAX_GUIDANCE_BYTES,
     _commit_body,
     _parse_args,
@@ -20,9 +20,9 @@ from .cli import (
     _resolve_harness_paths,
     _validate_host_matches_target,
 )
-from .harness import StandaloneHarness, SubprocessHarness
-from .harnesses.gfx942 import att
-from .models import (
+from third_party.tlx.tools.agents.rd_panel.kernel_optimization.harness import StandaloneHarness, SubprocessHarness
+from third_party.tlx.tools.agents.rd_panel.kernel_optimization.harnesses.gfx942 import att
+from third_party.tlx.tools.agents.rd_panel.kernel_optimization.models import (
     AutoCommitResult,
     CaseEvaluation,
     InputCase,
@@ -38,9 +38,9 @@ from .models import (
     per_case_speedups,
     weighted_geometric_speedup,
 )
-from .optimizer import KernelOptimizer, _profile_log_parts
-from .profiling import ProfileRequest
-from .providers import (
+from third_party.tlx.tools.agents.rd_panel.kernel_optimization.optimizer import KernelOptimizer, _profile_log_parts
+from third_party.tlx.tools.agents.rd_panel.kernel_optimization.profiling import ProfileRequest
+from third_party.tlx.tools.agents.rd_panel.kernel_optimization.providers import (
     CandidateContext,
     CandidateProposal,
     FixedCandidateProvider,
@@ -48,13 +48,15 @@ from .providers import (
     _build_prompt,
     _read_candidate_metadata,
 )
-from .source import (
+from third_party.tlx.tools.agents.rd_panel.kernel_optimization.source import (
     apply_candidate_diff,
     extract_python_source,
     source_digest,
     validate_kernel_source,
     validate_replacement_source,
 )
+
+KERNEL_OPTIMIZATION_DIR = Path(__file__).resolve().parents[1] / "rd_panel" / "kernel_optimization"
 
 
 class ScoringTest(unittest.TestCase):
@@ -601,20 +603,28 @@ class HarnessTest(unittest.TestCase):
                 gcn_probe=lambda device: "gfx950",
             )
 
-    def _bundle(self, root: Path, arch_knowledge: str | None, target_guidance: str | None) -> Path:
+    def _bundle(
+        self,
+        root: Path,
+        arch_knowledge: str | None,
+        target_guidance: str | None,
+        tl_strategy: str | None = None,
+    ) -> Path:
         target_dir = root / "harnesses" / "arch" / "targets" / "kernel"
         target_dir.mkdir(parents=True)
         if arch_knowledge is not None:
             (target_dir.parent.parent / "knowledge.md").write_text(arch_knowledge)
         if target_guidance is not None:
             (target_dir / "optimization_guidance.md").write_text(target_guidance)
+        if tl_strategy is not None:
+            (target_dir / "tl-agent.md").write_text(tl_strategy)
         return target_dir / "target.json"
 
-    def test_guidance_concatenates_arch_then_target_then_inline(self) -> None:
+    def test_guidance_concatenates_tl_strategy_then_knowledge_then_inline(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            target = self._bundle(Path(directory), "ARCH FACTS", "TARGET FACTS")
+            target = self._bundle(Path(directory), "ARCH FACTS", "TARGET FACTS", "TL STRATEGY")
             guidance = _resolve_guidance(target, "INLINE")
-        # Widest scope first: a target note refines the arch note, not vice versa.
+        self.assertLess(guidance.index("TL STRATEGY"), guidance.index("ARCH FACTS"))
         self.assertLess(guidance.index("ARCH FACTS"), guidance.index("TARGET FACTS"))
         self.assertLess(guidance.index("TARGET FACTS"), guidance.index("INLINE"))
 
@@ -634,11 +644,18 @@ class HarnessTest(unittest.TestCase):
         self.assertLess(len(guidance), MAX_GUIDANCE_BYTES + 200)
 
     def test_shipped_gfx942_bundle_supplies_guidance(self) -> None:
-        target = (Path(__file__).with_name("harnesses") / "gfx942" / "targets" / "gfx942" / "target.json")
+        target = KERNEL_OPTIMIZATION_DIR / "harnesses" / "gfx942" / "targets" / "gfx942" / "target.json"
         guidance = _resolve_guidance(target, "")
+        self.assertIn("tl-agent.md", guidance)
         self.assertIn("knowledge.md", guidance)
         self.assertIn("optimization_guidance.md", guidance)
         # A shipped bundle must never reach the agent already cut off.
+        self.assertNotIn("truncated", guidance)
+
+    def test_shipped_blackwell_bundle_supplies_tl_strategy(self) -> None:
+        target = KERNEL_OPTIMIZATION_DIR / "harnesses" / "blackwell" / "targets" / "gemm" / "target.json"
+        guidance = _resolve_guidance(target, "")
+        self.assertIn("tl-agent.md", guidance)
         self.assertNotIn("truncated", guidance)
 
     def test_resolves_arch_first_harness_layout(self) -> None:
@@ -646,7 +663,7 @@ class HarnessTest(unittest.TestCase):
         harness, cases, target = _resolve_harness_paths(kernel, None, None, None, "hopper")
         self.assertEqual(
             harness,
-            Path(__file__).with_name("harnesses") / "hopper" / "targets" / "gemm" / "harness.py",
+            KERNEL_OPTIMIZATION_DIR / "harnesses" / "hopper" / "targets" / "gemm" / "harness.py",
         )
         self.assertEqual(cases.name, "cases.json")
         self.assertEqual(target.name, "target.json")
@@ -656,7 +673,7 @@ class HarnessTest(unittest.TestCase):
         harness, cases, target = _resolve_harness_paths(kernel, None, None, None, None)
         self.assertEqual(
             harness,
-            Path(__file__).with_name("harnesses") / "host" / "targets" / "vector_add" / "harness.py",
+            KERNEL_OPTIMIZATION_DIR / "harnesses" / "host" / "targets" / "vector_add" / "harness.py",
         )
         self.assertEqual(cases.name, "cases.json")
         self.assertEqual(target.name, "target.json")
@@ -822,13 +839,13 @@ class HarnessTest(unittest.TestCase):
             cases=(InputCase("a", {"scale": 1.0}), ),
             target=KernelTarget("fake", "fake"),
         )
-        from .models import PerformanceSummary as PS
+        from third_party.tlx.tools.agents.rd_panel.kernel_optimization.models import PerformanceSummary as PS
 
         ctx = provider.propose.__code__  # touch to avoid unused
         del ctx
         # Simulate two sequential proposals via the same provider instance.
         dummy_perf = PS(cases=())
-        from .providers import CandidateContext
+        from third_party.tlx.tools.agents.rd_panel.kernel_optimization.providers import CandidateContext
 
         first = provider.propose(
             request,
@@ -872,7 +889,7 @@ class HarnessTest(unittest.TestCase):
         # candidate provider."
         import inspect
 
-        from . import providers
+        from third_party.tlx.tools.agents.rd_panel.kernel_optimization import providers
 
         source = inspect.getsource(providers)
         self.assertNotIn("knowledge_for", source)
