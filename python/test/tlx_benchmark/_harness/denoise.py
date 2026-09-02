@@ -1,28 +1,7 @@
-"""Environment verification and capture.
-
-``third_party/tlx/denoise.sh`` remains the thing that *applies* the lock. This
-module deliberately does not re-implement it in Python: duplicating privileged
-shell logic would give two sources of truth for what "denoised" means, and the
-copy would drift.
-
-What it does is verify the environment, watch the GPU's operating point while a
-case is measured, and record all of it into the artifact -- a latency reported
-without its environment is not comparable to anything, and phase 1 measured how
-large that difference is (13.9% vs 1.7% across-run spread on one kernel).
-
-**Do not check for a locked SM clock.** Measured on B200: under a sustained
-8192x8192x8192 fp16 GEMM the card runs at ~830 MHz and reports ``sw_power_cap``
-whether or not ``nvidia-smi -lgc 1965`` has been applied -- the operating point
-is set by the power budget long before the clock cap binds, so ``-lgc`` is
-close to a no-op for compute-bound work. A "clocks are not locked" check would
-have fired on every correct run. What ``denoise.sh`` actually contributes for
-this workload is a *fixed* power cap, persistence mode, and NUMA binding; the
-rest of the stability comes from warming to steady state (see
-``measure.DEFAULT_WARMUP_MS``).
-
-So verification here is behavioural: watch the operating point rather than the
-configuration that was meant to produce it.
-"""
+# Do NOT check for a locked SM clock: measured on B200, a sustained 8192^3 fp16
+# GEMM runs at ~830 MHz reporting sw_power_cap whether or not `nvidia-smi -lgc
+# 1965` was applied. What denoise contributes is a fixed power cap, persistence
+# mode and NUMA binding. A clock-lock check would fail on every correct run.
 
 from __future__ import annotations
 
@@ -102,9 +81,6 @@ class _Nvml:
         self.lib = lib
 
     def handle(self, uuid: Optional[str]):
-        """Resolve by UUID, never by index: NVML indexes physical devices while
-        torch indexes whatever ``CUDA_VISIBLE_DEVICES`` left visible, so the two
-        numbering schemes routinely disagree."""
         if self.lib is None or not uuid:
             return None
         h = ctypes.c_void_p()
@@ -113,7 +89,6 @@ class _Nvml:
         return h
 
     def sample(self, handle) -> Optional[tuple[int, int]]:
-        """``(SM clock MHz, active event-reason mask)``."""
         if self.lib is None or handle is None:
             return None
         sm, reasons = ctypes.c_uint(), ctypes.c_ulonglong()
@@ -141,8 +116,6 @@ def nvml() -> _Nvml:
 
 @dataclasses.dataclass(frozen=True)
 class GpuState:
-    """A point-in-time reading. Every field is optional so a machine without
-    ``nvidia-smi`` degrades to "unknown" rather than crashing."""
 
     available: bool
     index: Optional[int] = None
@@ -170,11 +143,6 @@ class GpuState:
 
 @dataclasses.dataclass(frozen=True)
 class ClockTrace:
-    """The GPU's operating point over a measured window.
-
-    This is the honest replacement for a "are the clocks locked?" question: it
-    reports where the card actually ran and whether it stayed there.
-    """
 
     samples: int
     min_mhz: Optional[int] = None
@@ -229,12 +197,6 @@ def _num(text: str) -> Optional[float]:
 
 
 def gpu_uuid(device: int = 0) -> Optional[str]:
-    """The physical UUID of a torch device index.
-
-    Indices are not usable for talking to NVML or ``nvidia-smi``: torch sees
-    indices remapped by ``CUDA_VISIBLE_DEVICES``, so torch device 0 is routinely
-    a different card than physical device 0. The UUID is stable across all three.
-    """
     try:
         import torch
 
@@ -248,7 +210,6 @@ def gpu_uuid(device: int = 0) -> Optional[str]:
 
 
 def gpu_state(uuid: Optional[str] = None, device: int = 0) -> GpuState:
-    """Read the current state of the GPU this process is using."""
     uuid = uuid or gpu_uuid(device)
     out = _smi([f"--query-gpu={_QUERY}", "--format=csv,noheader,nounits"])
     if out is None:
@@ -276,11 +237,6 @@ def gpu_state(uuid: Optional[str] = None, device: int = 0) -> GpuState:
 
 
 def foreign_processes(uuid: Optional[str] = None, device: int = 0) -> list[dict]:
-    """Other processes holding memory on our GPU.
-
-    A co-tenant makes every number on the card meaningless, and on a shared dev
-    box it is the failure mode most likely to go unnoticed.
-    """
     uuid = uuid or gpu_uuid(device)
     out = _smi(["--query-compute-apps=gpu_uuid,pid,used_memory", "--format=csv,noheader,nounits"])
     if not out:
@@ -302,7 +258,6 @@ def foreign_processes(uuid: Optional[str] = None, device: int = 0) -> list[dict]
 
 
 def parse_cpulist(text: str) -> set[int]:
-    """Parse a sysfs cpulist such as ``0-95,192-287``."""
     cpus: set[int] = set()
     for part in text.strip().split(","):
         if not part:
@@ -316,7 +271,6 @@ def parse_cpulist(text: str) -> set[int]:
 
 
 def numa_node(uuid: Optional[str] = None, device: int = 0) -> Optional[int]:
-    """The NUMA node local to our GPU, via sysfs."""
     uuid = uuid or gpu_uuid(device)
     out = _smi(["--query-gpu=uuid,pci.bus_id", "--format=csv,noheader"])
     if not out:
@@ -340,11 +294,6 @@ def numa_node(uuid: Optional[str] = None, device: int = 0) -> Optional[int]:
 
 
 def numa_bound(node: Optional[int]) -> Optional[bool]:
-    """Whether this process is confined to the GPU-local node's CPUs.
-
-    This is also the most reliable signal that ``denoise.sh`` wrapped the run,
-    since it is the one effect that is unambiguous and machine-independent.
-    """
     if node is None:
         return None
     try:
@@ -362,7 +311,6 @@ def numa_bound(node: Optional[int]) -> Optional[bool]:
 
 
 def capture_env(device: int = 0) -> dict:
-    """The ``env`` block of the artifact: everything the numbers depend on."""
     import torch
 
     import triton
@@ -385,11 +333,6 @@ def capture_env(device: int = 0) -> dict:
 
 
 def check(device: int = 0) -> list[str]:
-    """Everything wrong with the environment, in plain language.
-
-    Empty means the numbers are trustworthy. Each entry names the fix, because
-    whoever reads it is usually not whoever wrote it.
-    """
     problems = []
     uuid = gpu_uuid(device)
     state = gpu_state(uuid, device)
@@ -420,27 +363,30 @@ def check(device: int = 0) -> list[str]:
 
 
 class _Sampler(threading.Thread):
-    """Watches the operating point in the background at ~20 Hz."""
 
     def __init__(self, uuid: Optional[str]):
-        # ``daemon`` must be set on the instance, and the NVML handle must not
-        # be called ``_handle``: both names belong to Thread.
+        # Three names here belong to Thread and must not be reused: ``daemon``
+        # (set via the constructor), ``_handle`` (hence ``_nvml_handle``), and
+        # ``_stop``. The last one is not a flag but a *method* CPython calls
+        # from inside ``join()``; shadowing it with an Event made every
+        # successful join raise ``TypeError: 'Event' object is not callable``,
+        # which discarded a whole run's results at the very end.
         super().__init__(daemon=True)
         self._nvml_handle = nvml().handle(uuid)
-        self._stop = threading.Event()
+        self._stopped = threading.Event()
         self.clocks: list[int] = []
         self.reasons = 0
 
     def run(self):
-        while not self._stop.is_set():
+        while not self._stopped.is_set():
             got = nvml().sample(self._nvml_handle)
             if got is not None:
                 self.clocks.append(got[0])
                 self.reasons |= got[1]
-            self._stop.wait(SAMPLE_INTERVAL_S)
+            self._stopped.wait(SAMPLE_INTERVAL_S)
 
     def finish(self) -> ClockTrace:
-        self._stop.set()
+        self._stopped.set()
         self.join(timeout=5)
         if not self.clocks:
             return ClockTrace(samples=0)
@@ -458,15 +404,6 @@ class _Sampler(threading.Thread):
 
 @contextlib.contextmanager
 def stable(device: int = 0, strict: bool = False, watch: bool = True):
-    """Hold the process still, and watch what the GPU does meanwhile.
-
-    Freezes the GC so a collection cannot land inside a measurement window, and
-    samples the SM clock and event reasons throughout, so the artifact records
-    where the card actually ran rather than where it was configured to run.
-
-    Yields a dict that gains ``clock_trace`` and ``elapsed_s`` on exit.
-    ``strict`` turns environment problems into an error instead of a warning.
-    """
     import warnings
 
     problems = check(device)
@@ -532,6 +469,22 @@ POWER_TARGET_W = {
 #: did nothing and determinism is the working knob.
 AMD_DETERMINISM_MHZ = 2100
 
+#: Part name -> ``tlx.ops`` catalog arch key.
+#:
+#: Resolved from the part rather than from torch because the arch is needed
+#: *before* the first CUDA call: the visibility variable that pins the device is
+#: read once at context creation, so anything that initializes a context first
+#: silently defeats ``--device``. ``list_devices`` is smi-based and does not.
+#:
+#: Longer names first, as in ``POWER_TARGET_W``: the lookup is a substring test,
+#: so "B200" would otherwise swallow "GB200".
+ARCH_BY_PART = {
+    "GB200": "sm100",
+    "GB300": "sm100",
+    "B200": "sm100",
+    "MI300X": "gfx942",
+}
+
 
 @dataclasses.dataclass(frozen=True)
 class Device:
@@ -550,6 +503,13 @@ class Device:
         for part, watts in POWER_TARGET_W.items():
             if part.lower() in self.name.lower().replace(" ", ""):
                 return watts
+        return None
+
+    @property
+    def arch(self) -> Optional[str]:
+        for part, key in ARCH_BY_PART.items():
+            if part.lower() in self.name.lower().replace(" ", ""):
+                return key
         return None
 
 
@@ -572,7 +532,6 @@ def vendor() -> Optional[str]:
 
 
 def list_devices() -> list[Device]:
-    """Every GPU on the box, with how much memory is already in use."""
     which = vendor()
     if which == NVIDIA:
         out = _smi(["--query-gpu=index,name,uuid,memory.used", "--format=csv,noheader,nounits"]) or ""
@@ -597,11 +556,6 @@ def list_devices() -> list[Device]:
 
 
 def _amd_name(index: int) -> str:
-    """Identify by device id and GFX version, not by "Card Series".
-
-    On CDNA data-center parts the series string is often just "AMD Radeon
-    Graphics", which distinguishes nothing.
-    """
     info = _rocm(["-d", str(index), "--showproductname"]) or ""
     blob = info.lower()
     for marker, part in (("0x74a0", "MI300X"), ("0x74a1", "MI300X"), ("mi300", "MI300X"), ("gfx942", "MI300X"),
@@ -613,12 +567,6 @@ def _amd_name(index: int) -> str:
 
 
 def select_device(spec: str = "auto") -> Optional[Device]:
-    """Resolve ``--device``. ``auto`` picks the least-used GPU.
-
-    By free memory rather than by index: on a shared box a co-tenant is the
-    failure mode most likely to go unnoticed, and index 0 is as likely to be
-    busy as any other.
-    """
     devices = list_devices()
     if not devices:
         return None
@@ -631,26 +579,29 @@ def select_device(spec: str = "auto") -> Optional[Device]:
     return min(devices, key=lambda d: d.memory_used_mib)
 
 
+#: Where sysfs enumerates PCI devices. A module constant so the resolution above
+#: can be tested without a GPU.
+_PCI_DEVICES = "/sys/bus/pci/devices"
+
+
 def _amd_numa_node(index: int) -> Optional[int]:
-    try:
-        link = os.path.realpath(f"/sys/class/drm/card{index}/device")
-        with open(f"{link}/numa_node") as fh:
-            node = int(fh.read().strip())
-    except (OSError, ValueError):
-        return None
-    return node if node >= 0 else None
+    # Via the PCI bus id, not /sys/class/drm/card<index>: the rocm-smi device index
+    # and the DRM card index only coincide at 0 (rocm-smi card6 is card40 here).
+    bus = _rocm(["-d", str(index), "--showbus", "--csv"]) or ""
+    for line in bus.splitlines():
+        fields = [f.strip() for f in line.split(",")]
+        # e.g. "card6,0000:C8:00.0"; sysfs spells the domain in lowercase.
+        if len(fields) >= 2 and fields[0].lower() == f"card{index}":
+            try:
+                with open(f"{_PCI_DEVICES}/{fields[1].lower()}/numa_node") as fh:
+                    node = int(fh.read().strip())
+            except (OSError, ValueError):
+                return None
+            return node if node >= 0 else None
+    return None
 
 
 class Governor(contextlib.AbstractContextManager):
-    """Pin the machine's operating point for the duration of a run, and put it
-    back afterwards.
-
-    Everything is best-effort and each step is independent: without passwordless
-    sudo the power and clock steps are skipped, but NUMA binding -- which needs
-    no privilege and is the one lever measured to matter here -- still applies.
-    A partially governed run is still worth taking, and ``check()`` reports what
-    actually held rather than what was attempted.
-    """
 
     def __init__(self, device: Optional[Device], enable: bool = True):
         self.device = device

@@ -1,25 +1,3 @@
-"""Steady-state latency measurement.
-
-Sampling is **blocked**, deliberately: a provider's whole warmup+measure window
-runs to completion before the next provider starts. That is what tritonbench
-does -- ``utils/triton_op.py`` reduces over providers per input, each fully
-measured -- and matching it is what keeps our absolute milliseconds comparable
-to a tritonbench run of the same shape.
-
-The measurement loop itself is ``triton.testing.do_bench``, which already
-flushes L2 before every rep and records per-rep events. What this module adds
-around it is tritonbench's default policy, ported rather than imported:
-
-* size warmup/rep from a cheap runtime estimate
-  (``components/do_bench/utils.py``, ``utils/constants.py``)
-* reject outliers by IQR and summarize on the median
-  (``Latency`` in ``components/do_bench/run.py``)
-
-Ported and not imported because this suite must not depend on the tritonbench
-wheel. The behaviour is intended to match; the debt is that it can drift, so
-each port names its source.
-"""
-
 from __future__ import annotations
 
 import math
@@ -34,23 +12,32 @@ from .contract import Stat
 #: tritonbench ``utils/constants.py::DEFAULT_WARMUP_REP_BY_ESTIMATED_KERNEL_MS``.
 _WARMUP_REP_BY_ESTIMATE = ((1.0, (25, 100)), (10.0, (25, 100)), (float("inf"), (3000, 3000)))
 
-#: Warmup per replicate, in ms. NOT the estimate-based table above, which is
-#: opt-in via ``auto_window=True``.
+#: Warmup before the measured window, in ITERATIONS rather than milliseconds.
 #:
-#: The table gives a ~1 ms kernel a 25 ms warmup -- about 24 iterations -- which
-#: is nowhere near thermal steady state. Measured on a clock-locked B200,
-#: mm 8192x8192x8192 fp16 moved from 13.9% to 1.7% between-run spread when the
-#: window went from the table's to 3s. This is the expensive part of a replicate
-#: and the part that is load-bearing, so it is not sized down.
-DEFAULT_WARMUP_MS = 3000
+#: A duration was the wrong unit. Expressed as 3000ms it handed a 0.1ms kernel
+#: 30,000 warmup iterations and a 30ms kernel 100 -- the fast shapes, which are
+#: most of a sweep, paid the most for the least reason. Across 300 shapes that
+#: was 97% of all launches, discarded.
+#:
+#: What a case actually needs here is *its own* steady state: cold L2 for these
+#: operands, and the one-time allocator and autotuner work. Thermal steady
+#: state, which the old 3000ms was sized for (13.9% -> 1.7% between-run spread
+#: on a single shape measured in isolation), is a property of the sweep -- the
+#: GPU never cools between 300 consecutive cases -- not of each case.
+DEFAULT_WARMUP_ITERS = 100
 
-#: Total timed iterations across all replicates, floor.
+#: Total timed iterations, floor.
 #:
 #: The measurement window is derived from this rather than fixed, because what
 #: matters is how many samples stand behind the number, not how many
 #: milliseconds were spent collecting them -- a fixed window silently gives a
 #: fast kernel 50x the samples of a slow one.
-MIN_TOTAL_SAMPLES = 1000
+#:
+#: 500 rather than 100 because of the tail columns. Percentiles are nearest-rank
+#: so every one is an observed sample: at n=100, p99 is the 99th smallest, i.e.
+#: a single observation, and p95 is the sixth-largest. 500 puts p99 five samples
+#: deep, which is the least that makes the column worth printing.
+MIN_TOTAL_SAMPLES = 500
 
 #: Floor on the measurement window itself, in ms.
 #:
@@ -61,12 +48,17 @@ MIN_REP_MS = 200
 
 #: Number of independent measurement replicates per case.
 #:
-#: Replicates exist only to catch drift *between* runs -- within a run the mean
-#: is already precise once the sample quota is met -- so this is the smallest
-#: number giving a usable spread rather than the largest affordable. Three is
-#: the bare minimum from which any spread can be read; five leaves margin
-#: without multiplying the warmup, which is what dominates a replicate.
-DEFAULT_REPLICATES = 5
+#: One. Replicates existed only to measure ``rel_max_deviation`` -- drift
+#: BETWEEN runs, which a single contiguous window is blind to because its
+#: samples share one thermal state, one clock trajectory and one allocation.
+#: That figure was the gate; the README made ``cv`` the gate instead, and cv is
+#: a within-run quantity that needs no second run.
+#:
+#: So replicates now cost 5x the warmup for a statistic nothing reads. In a
+#: sweep the sweep itself is the drift detector: a machine that moves shows up
+#: as later shapes reading differently. Raise this if drift per case ever needs
+#: to be a per-case verdict again.
+DEFAULT_REPLICATES = 1
 
 #: A case whose reported p50 does not reproduce this closely across replicates
 #: gets no perf verdict.
@@ -79,31 +71,22 @@ DEFAULT_REPLICATES = 5
 #: clock wanders) and rejected healthy cases.
 MAX_REPLICATE_DEVIATION = 0.02
 
-#: A case is host-bound when its latency is below this multiple of the host
-#: cost of issuing one call.
-#:
-#: The host issues iteration N+1 while the GPU runs iteration N, so host
-#: overhead does not add to latency -- it only starves the GPU once it exceeds
-#: kernel time. The threshold is therefore just above 1, not far above it. An
-#: earlier value of 5.0 flagged mm 8192x8192x1024 (138us measured against 42us
-#: host, and torch needs 128us for the same work, so the kernel plainly
-#: dominates) as unmeasurable.
+#: Host-side per-call cost is still measured by ``host_overhead_us`` and still
+#: recorded in the artifact, but it no longer produces a status of its own --
+#: the README's four statuses have no ``host_bound``. It stays as a diagnostic
+#: because it is what distinguishes "the kernel got slower" from "the launch
+#: path got slower", and the two have nothing to do with each other.
 #:
 #: Measured on B200: ``tlx.ops.mm`` costs 43-63us of host time per call -- 4
 #: TensorDescriptor constructions, the autotuner key lookup, and, when
 #: SPLIT_K > 1, a fresh ``torch.empty((SPLIT_K*M, N))`` in the config pre_hook
 #: -- against ~9us for ``torch.matmul``. At mm 2048x2048x2048 the whole measured
 #: latency was 54us while host cost alone was 63us: the GPU idles waiting for
-#: the launch and the number describes Python.
-HOST_BOUND_RATIO = 1.5
+#: the launch and the number describes Python. Such a case now reports its
+#: numbers like any other; read ``tlx_host_us`` before trusting a small shape.
 
 
 def resolve_warmup_and_rep(warmup: Optional[int], rep: Optional[int], estimate_ms: float) -> tuple[int, int]:
-    """Pick warmup/rep windows (in ms) for a kernel of this cost.
-
-    Long kernels get much longer windows, since a 100 ms rep window around a
-    50 ms kernel is two samples.
-    """
     for upper, (default_warmup, default_rep) in _WARMUP_REP_BY_ESTIMATE:
         if estimate_ms <= upper:
             break
@@ -111,11 +94,6 @@ def resolve_warmup_and_rep(warmup: Optional[int], rep: Optional[int], estimate_m
 
 
 def estimate_runtime_ms(fn: Callable, iters: int = 5, grad_to_none: Optional[Iterable] = None) -> float:
-    """Rough per-iteration cost, used only to size the real measurement.
-
-    Deliberately cheap and deliberately not trusted as a result: the GPU is not
-    at steady state here.
-    """
     di = triton.runtime.driver.active.get_device_interface()
     cache = triton.runtime.driver.active.get_empty_cache_for_benchmark()
 
@@ -139,13 +117,6 @@ def estimate_runtime_ms(fn: Callable, iters: int = 5, grad_to_none: Optional[Ite
 
 
 def reject_outliers_iqr(data: list[float]) -> list[float]:
-    """Drop points outside 1.5 IQR of the quartiles, preserving order.
-
-    Ported from tritonbench ``Latency._remove_outliers_iqr``. Its job is to
-    remove the occasional descheduled sample, not to make a noisy run look
-    clean -- dispersion is computed *after* rejection and still gates the
-    verdict, so a genuinely unstable machine cannot be filtered into a PASS.
-    """
     if len(data) <= 3:
         return list(data)
     quantiles = statistics.quantiles(sorted(data), n=100)
@@ -156,14 +127,6 @@ def reject_outliers_iqr(data: list[float]) -> list[float]:
 
 
 def relative_interdecile_range(values, median: Optional[float] = None) -> Optional[float]:
-    """``(p90 - p10) / median``: the width of a distribution, robustly.
-
-    Not ``(max - min)`` and not ``(max - p50)``. Those are extreme-value
-    statistics: with thousands of samples they measure the worst single
-    scheduling hiccup in the run and do not shrink as evidence accumulates, so
-    a threshold against them says more about sample count than about stability.
-    Deciles converge.
-    """
     if not values:
         return None
     med = statistics.median(values) if median is None else median
@@ -176,37 +139,24 @@ def relative_interdecile_range(values, median: Optional[float] = None) -> Option
 
 
 def window_for(estimate_ms: float, replicates: int) -> float:
-    """Measurement window, in ms, that meets the total-sample quota.
-
-    ``do_bench`` derives its iteration count as ``rep_ms / estimate_ms``, so a
-    sample count has to be expressed to it as a duration. Deriving the window
-    instead of fixing it is what keeps the evidence behind a number from
-    depending on how fast the kernel happens to be.
-    """
     if not estimate_ms:
         return MIN_REP_MS
     per_replicate = math.ceil(MIN_TOTAL_SAMPLES / max(1, replicates))
     return max(MIN_REP_MS, per_replicate * estimate_ms)
 
 
-def percentiles(values, wanted=(50, 90, 99)) -> tuple:
-    """Nearest-rank percentiles, so every returned value is an observed sample.
+def to_tflops(samples: Iterable[float], flop_count: float) -> list[float]:
+    scale = flop_count / 1e12 * 1e3  # FLOP -> TFLOP, and ms -> s
+    return [scale / ms for ms in samples if ms > 0]
 
-    Interpolating would invent a latency the kernel never produced, which is
-    exactly the wrong thing for a tail figure.
-    """
+
+def percentiles(values, wanted=(50, 90, 99)) -> tuple:
     ordered = sorted(values)
     n = len(ordered)
     return tuple(ordered[min(n - 1, max(0, math.ceil(q / 100 * n) - 1))] for q in wanted)
 
 
-def summarize(replicates: list[list[float]], remove_outliers: bool = True) -> Stat:
-    """Collapse independent replicates into the reported statistic.
-
-    Accepts a list of per-replicate sample lists. A single flat list is also
-    accepted and treated as one replicate, in which case ``rel_max_deviation``
-    cannot be measured and falls back to the within-run ``cv``.
-    """
+def summarize(replicates: list[list[float]], remove_outliers: bool = True, unit: str = "tflops") -> Stat:
     if replicates and not isinstance(replicates[0], list):
         replicates = [replicates]  # a bare sample list
     replicates = [r for r in replicates if r]
@@ -219,19 +169,23 @@ def summarize(replicates: list[list[float]], remove_outliers: bool = True) -> St
     pooled = [x for k in kept_per_replicate for x in k]
 
     mean = statistics.median_low(means)
-    p50, p90, p99 = percentiles(pooled, (50, 90, 99))
+    p50, p95, p99 = percentiles(pooled, (50, 95, 99))
     cv = (statistics.stdev(pooled) / mean) if len(pooled) > 1 and mean else 0.0
     rel_idr = relative_interdecile_range(pooled, p50) if p50 else float("inf")
     if len(means) > 1 and mean:
         rel_max_deviation = max(max(means) - mean, mean - min(means)) / mean
     else:
-        rel_max_deviation = cv
+        # One replicate has nothing to deviate from. None, not 0.0 and not cv:
+        # the first would claim perfect reproducibility and the second would
+        # quietly relabel a within-run figure as a between-run one, which is
+        # the exact conflation this field exists to avoid.
+        rel_max_deviation = None
 
     return Stat(
         mean=mean,
         cv=cv,
         p50=p50,
-        p90=p90,
+        p95=p95,
         p99=p99,
         min=min(pooled),
         max=max(pooled),
@@ -240,17 +194,11 @@ def summarize(replicates: list[list[float]], remove_outliers: bool = True) -> St
         replicates=len(means),
         n_kept=len(pooled),
         n_raw=sum(len(r) for r in replicates),
+        unit=unit,
     )
 
 
 def host_overhead_us(fn: Callable, iters: int = 300) -> float:
-    """Median wall-clock cost of *issuing* ``fn``, in microseconds.
-
-    Times the call without synchronizing, so it captures the host-side work --
-    argument marshalling, descriptor construction, allocation, launch -- and
-    not the kernel. Compared against the measured latency, this is what tells
-    us whether a case is host-bound and therefore ungateable.
-    """
     import time
 
     di = triton.runtime.driver.active.get_device_interface()
@@ -265,37 +213,27 @@ def host_overhead_us(fn: Callable, iters: int = 300) -> float:
     return statistics.median(samples)
 
 
-def measure(fn: Callable, *, warmup: Optional[int] = None, rep: Optional[int] = None, auto_window: bool = False,
-            replicates: int = DEFAULT_REPLICATES, grad_to_none: Optional[Iterable] = None,
-            remove_outliers: bool = True) -> Stat:
-    """Measure ``fn`` to steady state and return its latency.
-
-    ``fn`` must be callable with no arguments and should launch exactly the
-    work under test -- input construction belongs outside, or it is measured
-    too.
-
-    The measurement is repeated ``replicates`` times because that, and only
-    that, measures the quantity the guard depends on: how reproducible the
-    reported mean is. Each replicate re-warms, so between-replicate variation
-    picks up the slow drift a single long window cannot see. The window is
-    sized so the replicates together time at least ``MIN_TOTAL_SAMPLES``
-    iterations.
-
-    The warmup defaults to ``DEFAULT_WARMUP_MS`` and the measurement window is
-    derived from ``MIN_TOTAL_SAMPLES`` (see ``window_for``). Pass
-    ``auto_window=True`` to size it from a runtime estimate instead, which is
-    tritonbench's default policy but under-warms sub-10ms kernels badly enough
-    to dominate the result -- see ``DEFAULT_WARMUP_MS``.
-    """
+def measure(fn: Callable, *, flop_count: Optional[float] = None, warmup: Optional[int] = None,
+            rep: Optional[int] = None, auto_window: bool = False, replicates: int = DEFAULT_REPLICATES,
+            grad_to_none: Optional[Iterable] = None, remove_outliers: bool = True) -> Stat:
+    # replicates>1 re-warms each time and measures drift BETWEEN runs
+    # (rel_max_deviation); that is no longer the gate, hence the default of 1.
+    # Window sizing is inherently temporal -- `do_bench` derives its iteration
+    # count from a duration -- so this half of the function stays in ms no
+    # matter what the caller wants reported.
     estimate_ms = estimate_runtime_ms(fn, grad_to_none=grad_to_none)
     replicates = max(1, replicates)
     if auto_window:
         warmup_ms, rep_ms = resolve_warmup_and_rep(warmup, rep, estimate_ms)
     else:
-        warmup_ms = DEFAULT_WARMUP_MS if warmup is None else warmup
+        # do_bench takes a duration, so the iteration count is converted here
+        # against the same estimate that sizes the window.
+        warmup_ms = (DEFAULT_WARMUP_ITERS * estimate_ms) if warmup is None else warmup
         rep_ms = rep if rep is not None else window_for(estimate_ms, replicates)
     runs = [
         triton.testing.do_bench(fn, warmup=warmup_ms, rep=rep_ms, grad_to_none=grad_to_none, return_mode="all")
         for _ in range(max(1, replicates))
     ]
-    return summarize(runs, remove_outliers=remove_outliers)
+    if flop_count:
+        return summarize([to_tflops(r, flop_count) for r in runs], remove_outliers=remove_outliers, unit="tflops")
+    return summarize(runs, remove_outliers=remove_outliers, unit="ms")

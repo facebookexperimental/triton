@@ -1,127 +1,88 @@
-"""Shapes for ``tlx.ops.mm`` on Blackwell -- the single source of truth.
-
-Both suites import this list:
-
-* correctness -- ``python/test/unit/tlx_ops/test_mm.py``
-* performance -- ``python/test/tlx_benchmark/bench_mm.py``
-
-Sharing is deliberate, and the invariant it buys is worth more than the
-convenience: a shape commented out for a correctness bug cannot stay
-benchmarkable. Benchmarking a path that returns wrong answers produces a
-number that looks like signal and is not.
-
-Entries are ``[M, N, K, a_row_major, b_row_major]``. Layout belongs in the
-entry rather than in a separate axis because a column-major operand is a
-different code path AND moves the TMA 16-byte stride constraint to a different
-dimension: row-major A constrains K, column-major A constrains M. dtype is a
-separate parametrize axis in each suite.
-
-FIXED (split-K remainder tile): ``[1000, 1000, 1024]`` and ``[64, 4096, 4096]``
-were disabled here for a split-K bug -- wrong results when M was not a multiple
-of BLOCK_SIZE_M -- and are now RE-ENABLED. Fixed upstream by #3401, verified on
-this rebase: both are 0.0% wrong, as is the smaller repro ``[4160, 512, 512]``
-(SPLIT_K=2, M % 256 == 64), which measured 4.0% wrong before. They stay in the
-list as the regression test for that fix.
-
-TODO(NUM_CTAS=2 multi-N-tile): ``[1000000, 512, 512]`` is commented out below
-because it FAILS correctness. It is a **different** bug from the split-K one
-above -- this one has ``SPLIT_K=1`` -- and it STILL REPRODUCES after #3401.
-
-Whenever the heuristic picks ``NUM_CTAS=2`` and the grid has more than one
-N-tile, 49.9% of output elements are wrong -- almost exactly one CTA of each
-pair. Measured at fp16, comparing against ``torch.matmul``:
-
-    999936  x 512  x 512   BM=256 BN=128 NUM_CTAS=2  ->  49.9% wrong
-    999936  x 1024 x 512   BM=256 BN=128 NUM_CTAS=2  ->  49.9% wrong
-    999936  x 2048 x 512   BM=256 BN=128 NUM_CTAS=2  ->  49.9% wrong
-    65536   x 512  x 512   BM=256 BN=128 NUM_CTAS=2  ->  49.9% wrong
-    65536   x 512  x 1024  BM=256 BN=256 NUM_CTAS=2  ->  49.9% wrong
-    999936  x 512  x 1024  BM=256 BN=256 NUM_CTAS=2  ->  49.9% wrong
-    131072  x 256  x 512   BM=256 BN=256 NUM_CTAS=2  ->   0.0% wrong
-
-The last row is the control and identifies the trigger: N == BN there, so
-``num_pid_n == 1``. Every failing row has more than one N-tile. Not a
-remainder-tile problem -- 999936 is an exact multiple of both 256 and 512.
-
-Reachable in production: the heuristic selects ``NUM_CTAS=2`` for ordinary
-large-M shapes. Worse, autotuning cannot save you, because it ranks configs by
-speed without checking their results.
-
-Pre-existing, not a promotion artifact: the identical 49.9% reproduces through
-the original tutorial entry point,
-``blackwell_gemm_ws.matmul(a, b, config=get_heuristic_config(M, N, K, num_sms))``.
-Not yet filed. Status here is BYPASSED, not fixed -- the shape is commented out
-so a wrong-answer path cannot be benchmarked, per this project's rule of never
-xfailing or loosening to go green.
-"""
-
 from __future__ import annotations
 
-#: ``[M, N, K, a_row_major, b_row_major]``
-#:
-#: Correctness-motivated entries come first, then the compute-bound entries the
-#: perf suite needs. The perf suite reports the small entries as ``HOST_BOUND``
-#: rather than gating them: ``tlx.ops.mm`` costs 43-63us of host time per call,
-#: so anything under roughly 300us measures Python rather than the kernel. They
-#: stay because correctness needs them, and the status says so honestly.
-SHAPES: list[list] = [
-    # Square, both row-major -- the baseline path, small and large.
-    [256, 256, 256, True, True],
-    [1024, 1024, 1024, True, True],
-    # Rectangular.
-    [2048, 512, 1024, True, True],
-    # Column-major B: descriptor sees B.T, so the constraint lands on K.
-    [512, 4096, 1024, True, False],
-    # Column-major A: descriptor sees A.T, so the constraint lands on M.
-    [1024, 2048, 512, False, True],
-    # Both column-major.
-    [2048, 2048, 2048, False, False],
-    # M not a multiple of any plausible block size -- masked edge tile.
-    [136, 256, 128, True, True],
-    # Non-power-of-two in M and N together. Regression test for the split-K
-    # remainder-tile fix (#3401).
-    [1000, 1000, 1024, True, True],
-    # K-heavy: few output tiles, long reduction. Split-K territory, the one
-    # path that runs a second kernel.
-    [256, 256, 16384, True, True],
-    # Tall-skinny: most of the grid idle. Also a regression test for #3401.
-    [64, 4096, 4096, True, True],
+# Entries are [M, N, K, a_strides, b_strides, dtype]. A is (M, K), B is (K, N);
+# row-major is (trailing, 1), column-major is (1, leading).
 
-    # ---- compute-bound, added for perf ------------------------------------
-    # Taken from tritonbench's gemm BUILDIN_SHAPES so the numbers are
-    # comparable to a tritonbench run of the same shape.
-    #
-    # Square flagship: the only entry where host overhead is a small enough
-    # fraction (43us on 1105us) for the speedup ratio to be nearly unbiased.
-    [8192, 8192, 8192, True, True],
-    # Same output tile count, K-light: epilogue- rather than MMA-bound.
-    [8192, 8192, 1024, True, True],
-    # K-heavy: long reduction over few output tiles.
-    [8192, 8192, 16384, True, True],
-    # Column-major B at a compute-bound size: the transposed-descriptor path
-    # is a different kernel, so it needs its own number and not just its own
-    # correctness case.
-    [8192, 8192, 8192, True, False],
-    # Production-shaped huge-M, from the same tritonbench list.
-    # TODO(NUM_CTAS=2 multi-N-tile): fails, see module docstring.
-    # [1000000, 512, 512, True, True],
+SYNTHETIC: list[list] = [
+    [256, 256, 256, (256, 1), (256, 1), "fp16"],
+    [1024, 1024, 1024, (1024, 1), (1024, 1), "fp16"],
+    [2048, 512, 1024, (1024, 1), (512, 1), "fp16"],
+    [512, 4096, 1024, (1024, 1), (1, 1024), "fp16"],
+    [1024, 2048, 512, (1, 1024), (2048, 1), "fp16"],
+    [2048, 2048, 2048, (1, 2048), (1, 2048), "fp16"],
+    [136, 256, 128, (128, 1), (256, 1), "fp16"],
+    [1000, 1000, 1024, (1024, 1), (1000, 1), "fp16"],
+    [1000, 1000, 200, (200, 1), (1000, 1), "fp16"],
+    [256, 256, 16384, (16384, 1), (256, 1), "fp16"],
+    [64, 4096, 4096, (4096, 1), (4096, 1), "fp16"],
+    [256, 256, 256, (256, 1), (256, 1), "bf16"],
+    [1024, 1024, 1024, (1024, 1), (1024, 1), "bf16"],
+    [2048, 512, 1024, (1024, 1), (512, 1), "bf16"],
+    [512, 4096, 1024, (1024, 1), (1, 1024), "bf16"],
+    [1024, 2048, 512, (1, 1024), (2048, 1), "bf16"],
+    [2048, 2048, 2048, (1, 2048), (1, 2048), "bf16"],
+    [136, 256, 128, (128, 1), (256, 1), "bf16"],
+    [1000, 1000, 1024, (1024, 1), (1000, 1), "bf16"],
+    [1000, 1000, 200, (200, 1), (1000, 1), "bf16"],
+    [256, 256, 16384, (16384, 1), (256, 1), "bf16"],
+    [64, 4096, 4096, (4096, 1), (4096, 1), "bf16"],
+]
+
+# The compute-bound shapes the perf suite gates on for this arch.
+SM100_FOCUS: list[list] = [
+    [8192, 8192, 8192, (8192, 1), (8192, 1), "fp16"],
+    [8192, 8192, 8192, (8192, 1), (8192, 1), "bf16"],
+    [8192, 8192, 1024, (1024, 1), (8192, 1), "fp16"],
+    [8192, 8192, 1024, (1024, 1), (8192, 1), "bf16"],
+    [8192, 8192, 16384, (16384, 1), (8192, 1), "fp16"],
+    [8192, 8192, 16384, (16384, 1), (8192, 1), "bf16"],
+    [8192, 8192, 8192, (8192, 1), (1, 8192), "fp16"],
+    [8192, 8192, 8192, (8192, 1), (1, 8192), "bf16"],
 ]
 
 
-def operand(rows, cols, dtype, row_major, device="cuda"):
-    """One ``mm`` operand, with the requested memory layout.
+def _union(*lists: list[list]) -> list[list]:
+    seen, out = set(), []
+    for shapes in lists:
+        for shape in shapes:
+            key = tuple(shape)
+            if key not in seen:
+                seen.add(key)
+                out.append(shape)
+    return out
 
-    A column-major operand is built as a transposed view of a contiguous
-    ``(cols, rows)`` buffer, so it is genuinely non-contiguous rather than
-    contiguous-and-relabelled. Both suites build inputs through this function
-    so that the perf numbers describe the tensors correctness validated.
+
+ALL: list[list] = _union(SYNTHETIC, SM100_FOCUS)
+
+
+def operand(rows, cols, strides, dtype, device="cuda"):
+    """A (rows, cols) tensor whose strides are exactly `strides`.
+
+    Recorded strides carry three things a row/column-major flag cannot:
+    a leading stride wider than the row (a slice of a padded buffer),
+    stride 0 (a broadcast operand), and which of the two dims is contiguous.
     """
     import torch
 
-    t = torch.randn((rows, cols), device=device, dtype=dtype)
-    return t if row_major else t.T.contiguous().T
+    s0, s1 = strides
+    if s0 == 0:  # broadcast down the rows
+        # At rows == 1 the expand is a no-op and stride(0) stays `cols`. That is
+        # not a miss: a stride on a dim of extent 1 addresses nothing, so the
+        # element layout is identical either way.
+        return torch.randn((1, cols), device=device, dtype=dtype).expand(rows, cols)
+    if s1 == 1:  # row-major, possibly padded to s0 >= cols
+        return torch.randn((rows, s0), device=device, dtype=dtype)[:, :cols]
+    if s0 == 1:  # column-major, possibly padded to s1 >= rows
+        return torch.randn((cols, s1), device=device, dtype=dtype)[:, :rows].T
+    raise ValueError(f"unsupported strides {strides} for ({rows}, {cols})")
+
+
+def label(M, N, K, a_strides, b_strides, dtype) -> str:
+    """The report's input column, in the capture's own notation."""
+    strides = f"[[{a_strides[0]}, {a_strides[1]}], [{b_strides[0]}, {b_strides[1]}]]"
+    return (f"((), {{'dtype': '{dtype}', 'strides': '{strides}', "
+            f"'M': '{M}', 'N': '{N}', 'K': '{K}'}})")
 
 
 def flops(M, N, K):
-    """Multiply-accumulate FLOPs for an ``(M, K) @ (K, N)`` product."""
     return 2 * M * N * K
