@@ -3,8 +3,8 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="description" content="GEMM and attention kernels implemented with TLX.">
-  <title>Kernels implemented with TLX · FBTriton</title>
+  <meta name="description" content="GEMM and attention examples implemented with TLX.">
+  <title>Tutorial kernels · FBTriton</title>
   <link rel="stylesheet" href="assets/tlx.css?v=20260824c">
 </head>
 <body>
@@ -12,7 +12,6 @@
     <a class="brand" href="../"><span>FBTriton</span></a>
     <nav class="topnav" aria-label="Top-level sections"><a href="triton.html">Triton</a>
 <a href="tlx.html" data-current="true">TLX</a>
-<a href="tlx-ops.html">tlx.ops</a>
 <a href="torchtlx.html">TorchTLX</a>
 <a href="ci.html">CI</a>
 <a href="tooling.html">Tooling</a></nav>
@@ -31,18 +30,19 @@
 <a href="clusters.html">Clusters and Cluster Launch Control</a>
 <a href="layouts.html">Layout control and diagnostics</a>
 <a href="utilities.html">Other operations</a>
-<a href="kernels.html" aria-current="page">Kernels implemented with TLX</a>
+<a href="kernels.html" aria-current="page">Tutorial kernels</a>
 <a class="sub" href="#gemm-kernels">GEMM kernels</a>
 <a class="sub" href="#attention-kernels">Attention kernels</a>
 <a class="sub" href="#amd-kernels-gfx950-cdna4">AMD kernels (gfx950 / CDNA4)</a>
 <a class="sub" href="#amd-kernels-gfx1250">AMD kernels (gfx1250)</a>
+<a href="tlx-ops.html">High-performance kernels</a>
 <a href="testing.html">Testing</a>
 <a href="resources.html">Further reading</a></nav>
     </aside>
     <main>
       <p class="eyebrow">TLX documentation</p>
-      <h1>Kernels implemented with TLX</h1>
-      <p class="lede">GEMM and attention kernels implemented with TLX.</p>
+      <h1>Tutorial kernels</h1>
+      <p class="lede">GEMM and attention examples implemented with TLX.</p>
       <article><h2 id="gemm-kernels">GEMM kernels</h2>
 <p><a href="https://github.com/facebookexperimental/triton/blob/main/third_party/tlx/tutorials/hopper_gemm_pipelined.py" target="_blank" rel="noreferrer">Pipelined GEMM on Hopper</a></p>
 <p><a href="https://github.com/facebookexperimental/triton/blob/main/third_party/tlx/tutorials/hopper_gemm_ws.py" target="_blank" rel="noreferrer">Warp-specialized GEMM on Hopper</a></p>
@@ -67,7 +67,7 @@
 <h2 id="amd-kernels-gfx1250">AMD kernels (gfx1250)</h2>
 <p><a href="https://github.com/facebookexperimental/triton/blob/main/third_party/tlx/tutorials/amd_tdm_gemm_pipelined.py" target="_blank" rel="noreferrer">TDM-pipelined GEMM</a></p>
 <p><a href="https://github.com/facebookexperimental/triton/blob/main/third_party/tlx/tutorials/amd_mxfp_gemm_tdm_pipelined.py" target="_blank" rel="noreferrer">MXFP TDM-pipelined GEMM</a></p></article>
-<footer class="pager"><a href="utilities.html">← Other operations</a><a class="next" href="testing.html">Testing →</a></footer>
+<footer class="pager"><a href="utilities.html">← Other operations</a><a class="next" href="tlx-ops.html">High-performance kernels →</a></footer>
     </main>
   </div>
 </body>

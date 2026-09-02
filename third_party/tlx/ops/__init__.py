@@ -33,7 +33,7 @@ from __future__ import annotations
 
 from ._catalog import InvalidInput, UnsupportedOp, check_inputs, impl_for
 
-__all__ = ["mm", "flash_attn", "hstu_attn", "kimi_delta_attention", "UnsupportedOp", "InvalidInput"]
+__all__ = ["mm", "flash_attn", "hstu_attn_dev", "kimi_delta_attention", "UnsupportedOp", "InvalidInput"]
 
 
 def mm(a, b, *, arch=None, space="heuristic"):
@@ -62,8 +62,8 @@ def flash_attn(q, k, v, causal=False, sm_scale=None, *, arch=None, space="full")
     return fn(q, k, v, causal, sm_scale, space=space)
 
 
-def hstu_attn(q, k, v, seq_offsets, max_seq_len, attn_scale, alpha=None, causal=True, num_targets=None, max_attn_len=0,
-              contextual_seq_len=0, *, arch=None, space="full"):
+def hstu_attn_dev(q, k, v, seq_offsets, max_seq_len, attn_scale, alpha=None, causal=True, num_targets=None,
+                  max_attn_len=0, contextual_seq_len=0, *, arch=None, space="full"):
     """HSTU ragged attention over `(total_tokens, H, HEAD_DIM)` fp16/bf16. Differentiable.
 
     Scores are SiLU-scaled rather than softmaxed, which is why this is its own
@@ -73,7 +73,7 @@ def hstu_attn(q, k, v, seq_offsets, max_seq_len, attn_scale, alpha=None, causal=
     Causal-only: `causal=False` raises `InvalidInput`. The argument is kept so
     the intent is stated at the call site rather than assumed.
     """
-    fn, spec = impl_for("hstu_attn", arch)
+    fn, spec = impl_for("hstu_attn_dev", arch)
     check_inputs(spec, dtype=q.dtype, HEAD_DIM=q.shape[-1], causal=causal)
     return fn(q, k, v, seq_offsets, max_seq_len, alpha if alpha is not None else 1.0 / q.shape[-1], causal=causal,
               attn_scale=attn_scale, num_targets=num_targets, max_attn_len=max_attn_len,

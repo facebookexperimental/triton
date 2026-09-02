@@ -1,4 +1,4 @@
-"""Blackwell (sm100) HSTU ragged attention -- the `tlx.ops.hstu_attn` impl.
+"""Blackwell (sm100) HSTU ragged attention -- the `tlx.ops.hstu_attn_dev` impl.
 
 Promoted from `tutorials/hstu_self_attn/`, now frozen.
 
@@ -5401,7 +5401,7 @@ def hstu_attn(
     """HSTU ragged attention over `(total_tokens, H, HEAD_DIM)`. Differentiable.
 
     `seq_offsets` is `(B + 1,)` prefix offsets. `space` is "full" for perf or
-    "smoke" for correctness; not exposed on `tlx.ops.hstu_attn`.
+    "smoke" for correctness; not exposed on `tlx.ops.hstu_attn_dev`.
 
     Causal-only; see the `causal=False` rejection below.
     """

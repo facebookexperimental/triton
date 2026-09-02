@@ -60,7 +60,7 @@ CATALOG: tuple[OpSpec, ...] = (
         requires=frozenset({"tma", "tmem"}),
     ),
     OpSpec(
-        op="hstu_attn",
+        op="hstu_attn_dev",
         arch="sm100",
         variant="ws",
         impl="kernels.hstu_attn.sm100:hstu_attn",
@@ -68,6 +68,13 @@ CATALOG: tuple[OpSpec, ...] = (
         # Causal-only, non-causal is not supported yet
         accepts=lambda d: bool(d.get("causal", True)),
         requires=frozenset({"tma", "tmem"}),
+    ),
+    OpSpec(
+        op="hstu_attn_dev",
+        arch="gfx950",
+        variant="tlx",
+        impl="kernels.hstu_attn.gfx950:hstu_attn",
+        dtypes=_FP16,
     ),
     OpSpec(
         op="kimi_delta_attention",

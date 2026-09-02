@@ -1,3 +1,5 @@
+"""gfx950 HSTU ragged attention -- the `tlx.ops.hstu_attn_dev` implementation."""
+
 from typing import List, Optional, Tuple
 
 import triton
@@ -726,6 +728,37 @@ def triton_hstu_attention_fwd(
     )
 
     return out
+
+
+def hstu_attn(
+    q,
+    k,
+    v,
+    seq_offsets,
+    max_seq_len,
+    alpha,
+    causal=True,
+    attn_scale=None,
+    num_targets=None,
+    max_attn_len=0,
+    contextual_seq_len=0,
+    *,
+    space="full",
+):
+    """HSTU ragged attention over `(total_tokens, H, HEAD_DIM)` on gfx950."""
+    del attn_scale, space
+    return triton_hstu_attention_fwd(
+        max_seq_len,
+        alpha,
+        q,
+        k,
+        v,
+        seq_offsets,
+        causal,
+        num_targets,
+        max_attn_len,
+        contextual_seq_len,
+    )
 
 
 def switch_to_contiguous_if_needed(x: torch.Tensor) -> torch.Tensor:
