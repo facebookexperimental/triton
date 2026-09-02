@@ -162,14 +162,16 @@ Three things we could not settle from the text:
    returned. Did your implementation add a secondary criterion, or did the
    solver's default choice happen to be usable?
 
-Relatedly: was `U = 300` used for all four reported cases, or does it vary per
-case? And — smallest possible ask with the largest value — could you share the
-concrete `C` and `C'` for the Blackwell forward case?
+Relatedly: we read "In our experiments, we pick U = 300" as one global value
+across all four reported cases — is that right? And — smallest possible ask
+with the largest value — could you share the concrete `C` and `C'` for the
+Blackwell forward case?
 
-### Q7. How do compiler cycle measurements project onto the reservation table?
+### Q7. How do per-operation cycle estimates project onto the reservation table?
 
 The paper defines the final reservation table but, as far as we can tell, not
-the projection from measured per-operation cycle counts onto it. We split each
+the projection onto it from the per-operation cycle estimates (which section 5
+says come from documentation or direct measurement). We split each
 table into maximal constant-demand runs and normalize the run durations
 independently, which keeps the integer demand vectors exact, but this is our
 construction rather than yours.
@@ -188,10 +190,12 @@ input preparation, and solved in seconds under another.
 
 For the reported 19 s / 269 s / 64 s: does your implementation seed the ascent
 at a resource or recurrence lower bound (MinII) rather than 1, warm-start the
-SMT queries, or bound them in time? And roughly how does the reported time
-split between the ZLP, the modulo ILP calls and the SMT calls? This would tell
-us whether a large timing discrepancy on our side signals a wrong input world
-or merely a different search prefix.
+SMT queries, or bound them in time? Section 5.2 already accounts for the
+normalization ZLP (global minima in under 500 ms in all cases), so the split
+we cannot see is between the modulo-scheduling ILP calls (CBC) and the SMT
+calls (Yices): roughly how does the reported time divide between those two?
+This would tell us whether a large timing discrepancy on our side signals a
+wrong input world or merely a different search prefix.
 
 ---
 
