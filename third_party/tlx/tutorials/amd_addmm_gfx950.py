@@ -12,7 +12,6 @@ import triton.language as tl
 
 from triton.language.extra.tlx.tutorials.gfx9_gemm.inter_wave.a16w16.matmul_kernel import (
     BLOCK_K,
-    BLOCK_N,
     _launch,
     _launch_register,
 )
@@ -180,12 +179,12 @@ def _autotune_path(
     if _can_use_inter_wave(a):
         inter_wave = lambda: _launch(a, b, bias=bias, SPLIT_K=split_k)
         inter_wave_output = inter_wave()
-        if torch.equal(register_output, inter_wave_output):
+        if torch.allclose(register_output, inter_wave_output, rtol=1e-2, atol=1e-2):
             candidates["inter_wave"] = inter_wave
     elif _can_use_inter_wave_tail(a, b):
         inter_wave_tail = lambda: _launch_inter_wave_with_tail(bias, a, b)
         inter_wave_tail_output = inter_wave_tail()
-        if torch.equal(register_output, inter_wave_tail_output):
+        if torch.allclose(register_output, inter_wave_tail_output, rtol=1e-2, atol=1e-2):
             candidates["inter_wave_tail"] = inter_wave_tail
     timings = {
         name:

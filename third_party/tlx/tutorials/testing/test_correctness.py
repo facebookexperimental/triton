@@ -119,6 +119,9 @@ from triton.language.extra.tlx.tutorials.amd_addmm_gfx950 import (
     addmm as _amd_addmm,
     available_paths as _amd_addmm_paths,
 )
+from triton.language.extra.tlx.tutorials.gfx9_gemm.inter_wave.a16w16.matmul_kernel import (
+    _needs_i64_offsets as _amd_gemm_needs_i64_offsets,
+)
 from triton.language.extra.tlx.tutorials.amd_linear_wgrad_gfx950 import (
     wgrad as _amd_linear_wgrad,
 )
@@ -2565,6 +2568,15 @@ def test_amd_mxfp_gemm_tdm_pipelined(TRANSPOSE_B):
 # already agrees with `register` -- so a wrong `inter_wave` would be dropped
 # from the race and the suite would still pass. Iterating `available_paths`
 # asserts every path a shape can take against torch, independently.
+def test_amd_gemm_offset_width_selection():
+    i32_max_element = (1 << 30) - 1
+    within_i32 = torch.empty((i32_max_element + 1, ), device="meta", dtype=torch.float16)
+    beyond_i32 = torch.empty((i32_max_element + 2, ), device="meta", dtype=torch.float16)
+
+    assert not _amd_gemm_needs_i64_offsets(within_i32)
+    assert _amd_gemm_needs_i64_offsets(beyond_i32)
+
+
 def _check_addmm_all_paths(bias, a, b, split_k=None):
     ref = torch.addmm(bias, a, b)
     config = Gemm.CONFIGS["amd_standalone_addmm_register"]

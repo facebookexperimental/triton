@@ -592,6 +592,8 @@ def a16w16_8wave(
     SPLIT_K: tl.constexpr,
     ADD_BIAS: tl.constexpr,
     HAS_REGISTER_TAIL: tl.constexpr,
+    USE_I64_A_OFFSETS: tl.constexpr,
+    USE_I64_B_OFFSETS: tl.constexpr,
     PIN_OFFSET_LAYOUT: tl.constexpr,
     DEFER_EPILOGUE: tl.constexpr,
 ):
@@ -611,8 +613,14 @@ def a16w16_8wave(
     # keeps enough divisibility for #linear.
     split_id = tl.program_id(0) // GRID_MN
     pid = tl.program_id(0) % GRID_MN
-    ak_split = split_id * KS * stride_ak
-    bk_split = split_id * KS * stride_bk
+    if USE_I64_A_OFFSETS:
+        ak_split = split_id.to(tl.int64) * KS * stride_ak
+    else:
+        ak_split = split_id * KS * stride_ak
+    if USE_I64_B_OFFSETS:
+        bk_split = split_id.to(tl.int64) * KS * stride_bk
+    else:
+        bk_split = split_id * KS * stride_bk
     num_pid_m = tl.cdiv(M, BLOCK_M)
     num_pid_n = tl.cdiv(N, BLOCK_N)
 
@@ -682,14 +690,26 @@ def a16w16_8wave(
     offs_bn = pid_n * BLOCK_N + tl.arange(0, HALF_N)
     offs_k = tl.arange(0, BLOCK_K)
 
-    a_row_off = offs_am[:, None] * stride_am
-    b_col_off = offs_bn[None, :] * stride_bn
+    # Widen coordinates before multiplying by strides so large tensors cannot
+    # overflow while constructing the pointer offset.
+    if USE_I64_A_OFFSETS:
+        a_row_off = offs_am.to(tl.int64)[:, None] * stride_am
+        a_k_off = offs_k.to(tl.int64)[None, :] * stride_ak
+    else:
+        a_row_off = offs_am[:, None] * stride_am
+        a_k_off = offs_k[None, :] * stride_ak
+    if USE_I64_B_OFFSETS:
+        b_col_off = offs_bn.to(tl.int64)[None, :] * stride_bn
+        b_k_off = offs_k.to(tl.int64)[:, None] * stride_bk
+    else:
+        b_col_off = offs_bn[None, :] * stride_bn
+        b_k_off = offs_k[:, None] * stride_bk
     if PIN_OFFSET_LAYOUT:
         a_row_off = tl.multiple_of(a_row_off, (8, 8))
         b_col_off = tl.multiple_of(b_col_off, (8, 8))
-    a_top_off = a_row_off + offs_k[None, :] * stride_ak
+    a_top_off = a_row_off + a_k_off
     a_bot_off = a_top_off + HALF_M * stride_am
-    b_left_off = offs_k[:, None] * stride_bk + b_col_off
+    b_left_off = b_k_off + b_col_off
     b_right_off = b_left_off + HALF_N * stride_bn
     if PIN_OFFSET_LAYOUT:
         a_top_off = tlx.require_layout(a_top_off, _A_OFFSET_LAYOUT_256)
@@ -699,9 +719,8 @@ def a16w16_8wave(
     a_k_mask = offs_k[None, :] < BLOCK_K
     a_top_mask = (offs_am[:, None] < M) & a_k_mask
     a_bot_mask = ((offs_am[:, None] + HALF_M) < M) & a_k_mask
-    b_k_mask = offs_k[:, None] < BLOCK_K
-    b_left_mask = b_k_mask & (offs_bn[None, :] < N)
-    b_right_mask = b_k_mask & ((offs_bn[None, :] + HALF_N) < N)
+    b_left_mask = tl.broadcast_to(offs_bn[None, :] < N, b_left_off.shape)
+    b_right_mask = tl.broadcast_to((offs_bn[None, :] + HALF_N) < N, b_right_off.shape)
 
     # Keep this pipeline inline: its K-contiguous B producer layout is inferred
     # together with the bank-conflict-free LDS layout. Moving it through a JIT
@@ -1361,6 +1380,15 @@ def choose_split_k(M, N, K):
     return choose_tile(M, N, K)[2]
 
 
+def _needs_i64_offsets(tensor):
+    """Return whether this view can address beyond signed i32 byte offsets."""
+    if any(stride < 0 for stride in tensor.stride()):
+        return True
+    max_element_offset = sum((size - 1) * stride for size, stride in zip(tensor.shape, tensor.stride()))
+    max_byte_offset = max_element_offset * tensor.element_size()
+    return max_byte_offset > (1 << 31) - 1
+
+
 def _launch(a, b, bias=None, SPLIT_K=None, TILE=None, K_LIMIT=None, DEFER_EPILOGUE=False):
     """Launch the shared gfx950 GEMM core, optionally with a fused bias."""
     M, input_k = a.shape
@@ -1426,6 +1454,8 @@ def _launch(a, b, bias=None, SPLIT_K=None, TILE=None, K_LIMIT=None, DEFER_EPILOG
         SPLIT_K=SPLIT_K,
         ADD_BIAS=bias is not None,
         HAS_REGISTER_TAIL=KS % (2 * BLOCK_K) != 0,
+        USE_I64_A_OFFSETS=_needs_i64_offsets(a),
+        USE_I64_B_OFFSETS=_needs_i64_offsets(b),
         PIN_OFFSET_LAYOUT=K_LIMIT is not None,
         DEFER_EPILOGUE=DEFER_EPILOGUE,
         num_warps=NUM_WARPS,
