@@ -1192,11 +1192,11 @@ class CUDABackend(BaseBackend):
         tlx_dump_dir = None
         tlx_saved_fd = None
         tlx_capture_file = None
-        if knobs.nvidia.dump_tlx_benchmark:
+        if knobs.compilation.dump_tlx_benchmark:
             from triton.tools.tlx_benchmark_gen import setup_tlx_dump
 
             tlx_dump_dir, tlx_saved_fd, tlx_capture_file = setup_tlx_dump(pm, tlx.tlx_passes)
-        elif knobs.nvidia.dump_ttgir_to_tlx:
+        elif knobs.compilation.dump_ttgir_to_tlx:
             tlx.tlx_passes.add_tlx_print_ttgir_to_tlx(pm)
         # instrumentation point here so we can override IRs above (e.g., ttir and ttgir)
         if CUDABackend.instrumentation:
@@ -1238,13 +1238,15 @@ class CUDABackend(BaseBackend):
         if CUDABackend.instrumentation:
             CUDABackend.instrumentation.patch("llvmir_to_llvm", pm, mod.context)
 
-        pm.run(mod, "make_llir")
+        try:
+            pm.run(mod, "make_llir")
+        finally:
+            # finalize_tlx_dump restores the stdout fd setup_tlx_dump redirected,
+            # so it has to run even when the pipeline raises.
+            if tlx_dump_dir is not None:
+                from triton.tools.tlx_benchmark_gen import finalize_tlx_dump
 
-        # After pm.run(), restore stdout and generate TLX benchmark artifacts
-        if tlx_dump_dir is not None:
-            from triton.tools.tlx_benchmark_gen import finalize_tlx_dump
-
-            finalize_tlx_dump(tlx_dump_dir, tlx_saved_fd, tlx_capture_file, metadata)
+                finalize_tlx_dump(tlx_dump_dir, tlx_saved_fd, tlx_capture_file, metadata)
 
         if knobs.compilation.dump_ir_extract_di_local_variables:
             # comments below on why separate it
