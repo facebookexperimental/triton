@@ -587,8 +587,7 @@ class HarnessTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             target = self._bundle(Path(directory), "ARCH FACTS", "TARGET FACTS")
             guidance = _resolve_guidance(target, "INLINE")
-        # Widest scope first, so a target-specific note reads as a refinement of
-        # the arch note rather than contradicting something the model saw later.
+        # Widest scope first: a target note refines the arch note, not vice versa.
         self.assertLess(guidance.index("ARCH FACTS"), guidance.index("TARGET FACTS"))
         self.assertLess(guidance.index("TARGET FACTS"), guidance.index("INLINE"))
 
@@ -604,8 +603,6 @@ class HarnessTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             target = self._bundle(Path(directory), "x" * (MAX_GUIDANCE_BYTES * 2), None)
             guidance = _resolve_guidance(target, "")
-        # Silently cutting the document would let the model treat a fragment as
-        # the whole prior.
         self.assertIn("truncated", guidance)
         self.assertLess(len(guidance), MAX_GUIDANCE_BYTES + 200)
 
@@ -818,9 +815,8 @@ class HarnessTest(unittest.TestCase):
         self.assertEqual(second.source, "LATENCY_US = 60\nCORRECT = True\n")
 
     def test_guidance_is_appended_to_the_generic_preamble(self) -> None:
-        # Append, not replace: the preamble is arch-agnostic workflow and the
-        # guidance is target-specific fact. An earlier version substituted one
-        # for the other and silently dropped the workflow rules.
+        # Append, not replace: an earlier version substituted one for the other
+        # and silently dropped the workflow rules.
         request = KernelOptimizationRequest(
             kernel_source="VALUE = 1\n",
             harness_path=Path(__file__),
@@ -846,8 +842,7 @@ class HarnessTest(unittest.TestCase):
 
     def test_provider_never_reads_knowledge_from_outside_the_bundle(self) -> None:
         # input-contract.md: "Do not put such knowledge into the generic
-        # candidate provider." The provider must know only that a guidance
-        # string exists, never how to find one on disk.
+        # candidate provider."
         import inspect
 
         from . import providers
@@ -1687,6 +1682,22 @@ class Gfx942AttTest(unittest.TestCase):
         self.assertIn("--kernel-trace", command)
         self.assertEqual(command[command.index("--kernel-iteration-range") + 1], "[4]")
         self.assertEqual(command[command.index("--att-target-cu") + 1], "0")
+
+    def test_collect_falls_back_to_counters_when_the_att_run_fails(self) -> None:
+        # Advertised --att can still fail at run time; without the fallback the
+        # round would have no profile at all.
+        calls: list[str] = []
+
+        def fake_run(*, mode, **_):
+            calls.append(mode)
+            return {"mode": mode, "error": "decoder missing"} if mode == "att" else {"mode": mode, "counters": {}}
+
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(
+                att, "capability", return_value={"att_available": True}), mock.patch.object(att, "_run", fake_run):
+            result = att.collect(kernel_path=Path("k.py"), case={"case_id": "c"}, output_dir=Path(directory))
+        self.assertEqual(calls, ["att", "counters"])
+        self.assertEqual(result["mode"], "counters")
+        self.assertEqual(result["att_unavailable_reason"], "decoder missing")
 
     def test_rocprofv3_override(self) -> None:
         with mock.patch.dict("os.environ", {"TLX_ROCPROFV3": "/opt/rocm-dev/bin/rocprofv3"}), mock.patch.object(

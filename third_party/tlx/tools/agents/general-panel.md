@@ -15,13 +15,43 @@ Role boundaries follow from it, and are uniform:
 | Role | In | Out | May run commands | May conclude |
 |---|---|---|---|---|
 | profiler | request | raw profiler output | yes | no |
-| worker | plan | artifacts + CLI verdict | yes | no |
-| TL | profiles, tickets | plans, report | **no** | no |
+| worker | finding | artifacts + CLI verdict | yes | no |
+| TL | profiles, tickets | findings, report | **no** | no |
 | manager | reports | decision | no | **yes** |
 
 Nothing that reasons may execute; nothing that executes may conclude.
 
-## 2. Curating knowledge: mechanism over measurement
+## 2. Findings and insights are different things
+
+- A **finding** is a proposed change that might improve perf and can be verified
+  quickly. Proposed by the TL agent, validated by a worker through the CLI.
+  Cheap, high-volume, per-hypothesis. Findings — including the ones that did not
+  work — are recorded in the run artifacts automatically. No approval.
+- An **insight** is general: one level of abstraction above a finding, true
+  beyond the hypothesis that produced it. Recorded by the knowledge agent into
+  the bundle's `knowledge.md` / `optimization_guidance.md`. **Every update needs
+  human expert review.**
+- Findings do not graduate to insights by being true once. A finding becomes an
+  insight when it generalizes, and a human says so.
+
+A finding carries a **predicted signal** — the profile quantity the TL expects to
+move (a stall class, an occupancy limiter, a traffic figure). The CLI decides
+promotion on wall-clock alone; the manager separately compares the post-run
+profile against that prediction, giving three outcomes:
+
+| Outcome | CLI verdict | Predicted signal | Feeds the knowledge agent |
+|---|---|---|---|
+| confirmed | promoted | moved | yes |
+| unexplained win | promoted | did not move | **no** |
+| rejected | not promoted | either | as a dead end |
+
+An unexplained win still ships — the harness decided, and the manager does not
+override it (§1). But it must not assert a mechanism, because the mechanism it
+would assert is exactly the one the profile failed to support. "Faster" and
+"faster for the predicted reason" are different claims, and only the second is
+insight material.
+
+## 3. Curating knowledge: mechanism over measurement
 
 Guidance files under `harnesses/<arch>/` prefer **methodology, logic, structure
 and mechanism**. Detailed numbers do not belong in them.
@@ -41,23 +71,32 @@ and mechanism**. Detailed numbers do not belong in them.
   from a neighbouring part is a hypothesis, and the prompt weighs the two
   differently.
 
-## 3. Anti-slop is a gate, not an agent
+## 4. Anti-slop is a gate, not an agent
 
 Enforce mechanically on every panel output rather than asking an agent to be
 careful: each claim resolves to a real location, and each cited path exists. The
 failure this prevents is real and recent — a knowledge file shipped with five
 figures attributed to a docstring that did not contain them, through review.
 
-## 4. Agent definitions are human-owned
+## 5. Agent definitions are human-owned
 
 Agent and panel definitions are checked in and reviewed as code. **No agent edits
 an agent definition**, including its own. Manager and TL definitions in
 particular change only by human edit.
 
-## 5. Measurement is serialized
+## 6. Measurement is serialized
 
 One benchmark at a time, on a pinned GPU, under `denoise.sh`. Not a resourcing
 choice: concurrent load perturbs clocks, power and thermals even on another GPU
 of the same node, and the promotion gate is a timing comparison. Generation,
 compile and correctness may run in parallel (own git worktree, own
 `TRITON_CACHE_DIR`); the benchmark step may not.
+
+## 7. The loop closes on the shape set, not on the ticket
+
+A ticket names a shape group, but `tlx.ops` gates on the whole of `_shapes.py`,
+shared by the L1 correctness and L2 perf suites. A winner tuned on two shapes can
+regress a third, or move which tile wins elsewhere. So a promotion re-enters the
+perf-bench panel: the worker re-runs the full shape set, and the manager confirms
+no regression before the diff is published. A local win that is a global loss must
+not reach review.

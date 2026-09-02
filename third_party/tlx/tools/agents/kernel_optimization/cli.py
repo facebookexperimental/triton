@@ -176,27 +176,15 @@ def _resolve_harness_paths(kernel: Path, harness: Path | None, cases: Path | Non
     return harness, cases, target
 
 
-# Curated optimization knowledge, resolved from the frozen bundle rather than
-# from a global doc tree, so a run's prompt is reproducible from its recorded
-# bundle hashes. `references/input-contract.md` is explicit that this knowledge
-# belongs in `optimization_guidance` and not in the generic candidate provider.
-#
-#   harnesses/<arch>/knowledge.md                      -- architecture-wide
-#   harnesses/<arch>/targets/<kernel>/optimization_guidance.md  -- this target
-#
-# Both are optional and are concatenated ahead of target.json's inline string,
-# widest scope first. Adding an architecture therefore means adding a directory.
+# Curated knowledge lives in the frozen bundle, not a global doc tree, so a run's
+# prompt is reproducible from its recorded bundle hashes. Per
+# `references/input-contract.md` it must not reach the candidate provider.
 ARCH_KNOWLEDGE_FILE = "knowledge.md"
 TARGET_GUIDANCE_FILE = "optimization_guidance.md"
 
-# A prompt-size ceiling. The candidate prompt also carries the preamble, the
-# reference kernel and every case's profile; unbounded guidance would crowd them
-# out silently. Truncation is announced in the text so the model never treats a
-# cut-off document as complete.
-#
-# The shipped gfx942 bundle resolves to ~8 KB, so this is roughly 2x headroom.
-# It is a backstop against a runaway document, not a budget to fill: guidance
-# that does not change what a candidate would do is costing every prompt.
+# Backstop against a runaway document, not a budget to fill -- the prompt also
+# carries the preamble, reference kernel and profiles. ~2x the shipped gfx942
+# bundle. Truncation is announced so a fragment is never read as complete.
 MAX_GUIDANCE_BYTES = 16384
 
 

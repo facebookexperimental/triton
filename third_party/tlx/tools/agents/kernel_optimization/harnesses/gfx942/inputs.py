@@ -1,14 +1,8 @@
-"""Operand construction for the gfx942 harness and its two child processes.
+"""Operand construction shared by the gfx942 harness and its two child processes.
 
-Shared so the in-process gate, the default-environment correctness check and
-the rocprofv3 traced dispatch all run the same kernel on the same data. They
-previously built inputs three times, and the ATT child's copy had drifted to a
-different distribution.
-
-The distribution matches ``testing/test_correctness.py``'s GEMM case, which is
-the tolerance the repository's real correctness suite applies. Large unscaled
-random inputs plus the default fp16 ``assert_close`` band let schedule changes
-through the agent gate that that suite rejects.
+Distribution matches ``testing/test_correctness.py``'s GEMM case: unscaled random
+inputs plus the default fp16 ``assert_close`` band pass schedule changes that the
+repository's correctness suite rejects.
 """
 
 from __future__ import annotations

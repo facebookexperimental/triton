@@ -8,15 +8,13 @@ exactly one of them:
 
     warmup dispatches 1..W, then the traced dispatch W+1.
 
-That determinism requires one dispatch per call, which holds because the target
-resolves to a single autotuner config (`mm`'s `space="heuristic"`) --
-`Autotuner.run` skips benchmarking entirely unless `len(self.configs) > 1`. A
-candidate that widens the search space would issue one dispatch per config on
-the first call and the iteration range would land somewhere arbitrary inside it;
-:func:`att._summarize_att`'s traced-dispatch count is the check on that.
+One dispatch per call holds only while the target resolves to a single autotuner
+config (`mm`'s `space="heuristic"`); `Autotuner.run` skips benchmarking unless
+`len(self.configs) > 1`. A candidate that widens the search space would issue one
+dispatch per config on the first call, landing the iteration range somewhere
+arbitrary -- :mod:`att`'s traced-dispatch count is the check on that.
 
-Everything arrives by environment variable rather than argv because rocprofv3
-owns the command line.
+Inputs arrive by environment variable because rocprofv3 owns the command line.
 """
 
 from __future__ import annotations
@@ -52,8 +50,7 @@ def main() -> int:
     a, b = make_inputs(case)
     call = getattr(_load(kernel_path), entry_point)
 
-    # Warmup also absorbs JIT compilation, so the traced dispatch measures the
-    # steady-state kernel rather than a cold-cache first launch.
+    # Absorbs JIT compilation, so the traced dispatch is not a cold first launch.
     for _ in range(warmup):
         call(a, b)
     torch.cuda.synchronize()

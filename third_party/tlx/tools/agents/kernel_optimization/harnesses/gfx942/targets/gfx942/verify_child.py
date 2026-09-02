@@ -1,11 +1,8 @@
-"""Check an agent candidate through the default user launch path.
+"""Check a candidate without the gate's performance environment.
 
-Spawned by ``harness._verify_default_environment()`` on every ``verify`` call, so a
-candidate is also checked without the performance environment the gate runs under
-(``TRITON_DISABLE_POST_MISCHED`` / ``TRITON_USE_C_DISPATCHER``).
-
-Note this shares the parent's Triton compile cache, so it re-checks the *launch
-environment*, not a cold compile.
+Spawned per ``verify`` by ``harness._verify_default_environment()``, with
+``TRITON_DISABLE_POST_MISCHED`` / ``TRITON_USE_C_DISPATCHER`` unset. Shares the
+parent's Triton compile cache, so this re-checks the launch environment only.
 """
 
 from __future__ import annotations
@@ -16,7 +13,7 @@ import os
 import sys
 from pathlib import Path
 
-# `harnesses/gfx942/`, which holds the shared inputs module.
+# Shared inputs module lives in `harnesses/gfx942/`.
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from inputs import make_inputs  # noqa: E402
