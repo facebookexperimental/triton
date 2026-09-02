@@ -1,4 +1,4 @@
-// RUN: TRITON_ENABLE_AMD_MODULO=1 triton-opt %s -split-input-file \
+// RUN: env TRITON_ENABLE_AMD_MODULO=1 triton-opt %s -split-input-file \
 // RUN:   -tritonamdgpu-dot-decompose-and-schedule 2>&1 | FileCheck %s
 //
 // Steps 4.7 + 4.8: AMD warp-pipeline cluster partitioning and s_setprio

@@ -1051,6 +1051,7 @@ static PyObject *launchKernel(PyObject *self, PyObject *args) {
   PyObject *arg_annotations = NULL;
   Py_buffer signature;
   PyObject *kernel_args = NULL;
+  PyObject *fast_kernel_args = NULL;
   if (!PyArg_ParseTuple(args, "piiiKKOO(iii)OOOiOy*O", &launch_cooperative_grid,
                         &gridX, &gridY, &gridZ, &_stream, &_function,
                         &global_scratch_obj, &profile_scratch_obj, &num_warps,
@@ -1068,14 +1069,31 @@ static PyObject *launchKernel(PyObject *self, PyObject *args) {
   uint8_t *extractor_data = (uint8_t *)signature.buf;
   Py_ssize_t num_args = signature.len;
 
-  // Extract kernel parameters - flatten tuples & remove constexpr.
-  PyObject **args_data = (PyObject **)alloca(num_args * sizeof(PyObject *));
-  if (args_data == NULL) {
-    goto cleanup;
-  }
-  int list_idx = 0;
-  if (!extractArgs(args_data, &list_idx, kernel_args, arg_annotations)) {
-    goto cleanup;
+  // Flat runtime signatures need no constexpr filtering or tuple flattening.
+  // Keep the annotation walk for structured signatures only.
+  PyObject **args_data;
+  if (arg_annotations == Py_None) {
+    fast_kernel_args = PySequence_Fast(
+        kernel_args, "Expected kernel_args to be a sequence or iterable");
+    if (!fast_kernel_args) {
+      goto cleanup;
+    }
+    if (PySequence_Fast_GET_SIZE(fast_kernel_args) != num_args) {
+      PyErr_Format(PyExc_TypeError,
+                   "Expected %zd kernel arguments, received %zd", num_args,
+                   PySequence_Fast_GET_SIZE(fast_kernel_args));
+      goto cleanup;
+    }
+    args_data = PySequence_Fast_ITEMS(fast_kernel_args);
+  } else {
+    args_data = (PyObject **)alloca(num_args * sizeof(PyObject *));
+    if (args_data == NULL) {
+      goto cleanup;
+    }
+    int list_idx = 0;
+    if (!extractArgs(args_data, &list_idx, kernel_args, arg_annotations)) {
+      goto cleanup;
+    }
   }
 
   // Number of parameters passed to kernel. + 2 for global & profile scratch.
@@ -1120,10 +1138,12 @@ static PyObject *launchKernel(PyObject *self, PyObject *args) {
   if (PyErr_Occurred()) {
     goto cleanup;
   }
+  Py_XDECREF(fast_kernel_args);
   PyBuffer_Release(&signature);
   Py_RETURN_NONE;
 
 cleanup:
+  Py_XDECREF(fast_kernel_args);
   PyBuffer_Release(&signature);
   return NULL;
 }
@@ -1220,8 +1240,9 @@ static inline int hip_td_extract_ptr(PyObject *obj, hipDeviceptr_t *out) {
   hipError_t status = hipSymbolTable.hipPointerGetAttribute(
       &device_ptr, HIP_POINTER_ATTRIBUTE_DEVICE_POINTER, *out);
   if (status == hipErrorInvalidValue) {
-    PyErr_SetString(PyExc_ValueError,
-                    "Pointer argument cannot be accessed from Triton (cpu tensor?)");
+    PyErr_SetString(
+        PyExc_ValueError,
+        "Pointer argument cannot be accessed from Triton (cpu tensor?)");
     (void)hipSymbolTable.hipGetLastError();
     return -1;
   }
@@ -1321,7 +1342,8 @@ static PyObject *HIPTritonDispatcher_vectorcall(PyObject *callable,
     return NULL;
   }
   if (nargs != HIP_TD_FIXED_ARGS + self->num_args) {
-    PyErr_Format(PyExc_TypeError, "HIP _TritonDispatcher expected %d args, got %zd",
+    PyErr_Format(PyExc_TypeError,
+                 "HIP _TritonDispatcher expected %d args, got %zd",
                  HIP_TD_FIXED_ARGS + self->num_args, nargs);
     return NULL;
   }
@@ -1350,17 +1372,21 @@ static PyObject *HIPTritonDispatcher_new(PyTypeObject *type, PyObject *args,
   unsigned long long function;
   int num_warps, num_ctas, shared_mem, launch_cooperative_grid, warp_size;
   PyObject *arg_type_codes;
-  static char *kwlist[] = {"function", "num_warps", "num_ctas", "shared_mem",
-                           "launch_cooperative_grid", "warp_size",
-                           "arg_type_codes", NULL};
-  if (!PyArg_ParseTupleAndKeywords(args, kwargs, "KiiiiiO", kwlist, &function,
-                                   &num_warps, &num_ctas, &shared_mem,
-                                   &launch_cooperative_grid, &warp_size,
-                                   &arg_type_codes))
+  static char *kwlist[] = {"function",
+                           "num_warps",
+                           "num_ctas",
+                           "shared_mem",
+                           "launch_cooperative_grid",
+                           "warp_size",
+                           "arg_type_codes",
+                           NULL};
+  if (!PyArg_ParseTupleAndKeywords(
+          args, kwargs, "KiiiiiO", kwlist, &function, &num_warps, &num_ctas,
+          &shared_mem, &launch_cooperative_grid, &warp_size, &arg_type_codes))
     return NULL;
 
-  PyObject *types = PySequence_Fast(arg_type_codes,
-                                    "arg_type_codes must be a sequence");
+  PyObject *types =
+      PySequence_Fast(arg_type_codes, "arg_type_codes must be a sequence");
   if (!types)
     return NULL;
   Py_ssize_t num_args = PySequence_Fast_GET_SIZE(types);

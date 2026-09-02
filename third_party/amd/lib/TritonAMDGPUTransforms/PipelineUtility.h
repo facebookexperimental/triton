@@ -11,7 +11,7 @@ namespace mlir {
 namespace triton::AMD {
 constexpr char AttrBypassLDS[] = "amdg.bypass_lds_load";
 constexpr char AttrTwoDotSchedule[] = "amdg.two_dot_schedule";
-}
+} // namespace triton::AMD
 
 // This function will
 // - deserialize schedule and numStages from IR.
@@ -28,6 +28,9 @@ void lowerLoops(ModuleOp moduleOp, bool useAsyncCopy, bool usePingpong);
 // pipeline (change #4) can reuse the expander after it re-buffers + serializes
 // its own modulo-derived schedule, without going through lowerLoops.
 void expandLoops(ModuleOp moduleOp);
+
+// Pipeline the TDM stores and scatter in the loop.
+bool pipelineTDMStores(scf::ForOp forOp);
 
 // LoadInfo encapsulates a load's key aspects wrt scheduling. The `distToUse`
 // and `use` fields grab values from getIndirectLevel() which is a thin wrapper

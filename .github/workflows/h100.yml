@@ -3,7 +3,23 @@ on:
   push:
     branches:
       - main
+    paths-ignore:
+      - 'third_party/amd/**'
+      - 'third_party/tlx/tutorials/blackwell-*/**'
+      - 'third_party/tlx/tutorials/blackwell-*'
+      - 'third_party/tlx/tutorials/testing/test_correctness_autows.py'
+      - 'third_party/tlx/tutorials/gfx9_gemm/**'
+      - 'third_party/amd/python/test/**'
+      - 'python/test/unit/language/test_tlx_amd.py'
   pull_request:
+    paths-ignore:
+      - 'third_party/amd/**'
+      - 'third_party/tlx/tutorials/blackwell-*/**'
+      - 'third_party/tlx/tutorials/blackwell-*'
+      - 'third_party/tlx/tutorials/testing/test_correctness_autows.py'
+      - 'third_party/tlx/tutorials/gfx9_gemm/**'
+      - 'third_party/amd/python/test/**'
+      - 'python/test/unit/language/test_tlx_amd.py'
   schedule:
     # Every 6 hours at :30 past (00:30, 06:30, 12:30, 18:30 UTC).
     - cron: '30 */6 * * *'
@@ -30,6 +46,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v3
+        with:
+          submodules: recursive
       - name: Tune Nvidia GPU
         run: |
           sudo nvidia-smi -pm 1
@@ -90,7 +108,7 @@ jobs:
     env:
       CONDA_ENV: meta-triton
       SETUP_SCRIPT: /workspace/setup_instance.sh
-    timeout-minutes: 30
+    timeout-minutes: 120
     permissions:
       id-token: write
       contents: read
@@ -99,6 +117,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v3
+        with:
+          submodules: recursive
       - name: Tune Nvidia GPU
         run: |
           sudo nvidia-smi -pm 1
@@ -131,17 +151,23 @@ jobs:
         run: |
           . "${SETUP_SCRIPT}"
           python -m pytest third_party/tlx/tutorials/testing/test_correctness.py -v --junitxml=/tmp/tlx-correctness.xml
+      - name: Run runtime unit tests
+        id: run_runtime_tests
+        timeout-minutes: 5
+        run: |
+          . "${SETUP_SCRIPT}"
+          python -m pytest python/test/unit/runtime/test_fast_cache_edge_cases.py python/test/unit/runtime/test_tensordesc_cache.py python/test/unit/runtime/test_triton_dispatcher_factory.py -v --junitxml=/tmp/runtime-unit.xml
       - name: Collect nightly failures (TLX)
         id: parse
         if: always() && github.event_name == 'schedule'
         run: |
           . "${SETUP_SCRIPT}"
           FAILED_FLAG=""
-          if [[ "${{ steps.run_unit_tests.outcome }}" != "success" || "${{ steps.run_correctness_tests.outcome }}" != "success" ]]; then
+          if [[ "${{ steps.run_unit_tests.outcome }}" != "success" || "${{ steps.run_correctness_tests.outcome }}" != "success" || "${{ steps.run_runtime_tests.outcome }}" != "success" ]]; then
             FAILED_FLAG="--failed --bucket h100-tlx-job-failed"
           fi
           python3 .github/scripts/parse_junit_failures.py \
-            --junit /tmp/tlx-unit.xml /tmp/tlx-correctness.xml \
+            --junit /tmp/tlx-unit.xml /tmp/tlx-correctness.xml /tmp/runtime-unit.xml \
             --workflow "${GITHUB_WORKFLOW}" \
             --job "h100-tlx-test" \
             ${FAILED_FLAG}
@@ -233,5 +259,5 @@ jobs:
       run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}-${{ github.event_name == 'workflow_dispatch' }}
+  group: ${{ github.workflow }}-${{ github.job }}-${{ github.event.pull_request.number || github.sha }}-${{ github.event_name == 'workflow_dispatch' }}
   cancel-in-progress: true

@@ -1,7 +1,8 @@
-// RUN: triton-opt %s -split-input-file --allocate-shared-memory --convert-triton-amdgpu-to-llvm=gfx-arch=gfx90a -cse | FileCheck %s --check-prefix=GFX90A
-// RUN: triton-opt %s -split-input-file --allocate-shared-memory --convert-triton-amdgpu-to-llvm=gfx-arch=gfx942 -cse | FileCheck %s --check-prefix=GFX942
-// RUN: triton-opt %s -split-input-file --allocate-shared-memory --convert-triton-amdgpu-to-llvm=gfx-arch=gfx950 -cse | FileCheck %s --check-prefix=GFX950
-// RUN: triton-opt %s -split-input-file --allocate-shared-memory --convert-triton-amdgpu-to-llvm=gfx-arch=gfx1250 -cse | FileCheck %s --check-prefix=GFX1250
+// RUN: triton-opt %s -split-input-file --allocate-shared-memory --convert-triton-amdgpu-to-llvm='gfx-arch=gfx90a enable-tree-reduction=true' -cse | FileCheck %s --check-prefix=GFX90A
+// RUN: triton-opt %s -split-input-file --allocate-shared-memory --convert-triton-amdgpu-to-llvm='gfx-arch=gfx942 enable-tree-reduction=true' -cse | FileCheck %s --check-prefix=GFX942
+// RUN: triton-opt %s -split-input-file --allocate-shared-memory --convert-triton-amdgpu-to-llvm='gfx-arch=gfx950 enable-tree-reduction=true' -cse | FileCheck %s --check-prefix=GFX950
+// RUN: triton-opt %s -split-input-file --allocate-shared-memory --convert-triton-amdgpu-to-llvm='gfx-arch=gfx1250 enable-tree-reduction=true' -cse | FileCheck %s --check-prefix=GFX1250
+// RUN: triton-opt %s -split-input-file --allocate-shared-memory --convert-triton-amdgpu-to-llvm='gfx-arch=gfx942 enable-tree-reduction=false' -cse | FileCheck %s --check-prefix=LINEAR
 
 #blocked_reduce = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [1, 64], warpsPerCTA = [1, 1], order = [1, 0]}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 64 : i32} {
@@ -9,6 +10,9 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.thr
   // GFX942: llvm.fadd {{.*}} : vector<2xf16>
   // GFX950-LABEL: reduce_f16
   // GFX950: llvm.fadd {{.*}} : vector<2xf16>
+  // LINEAR-LABEL: reduce_f16
+  // LINEAR-NOT: vector<2xf16>
+  // LINEAR: llvm.fadd {{.*}} : f16
   tt.func public @reduce_f16(%arg0: tensor<1x256xf16, #blocked_reduce>) {
     %0 = "tt.reduce"(%arg0) <{axis = 1 : i32}> ({
     ^bb0(%a: f16, %b: f16):
@@ -24,12 +28,51 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.thr
   // GFX942: llvm.fadd {{.*}} : vector<2xf32>
   // GFX950-LABEL: reduce_f32
   // GFX950: llvm.fadd {{.*}} : vector<2xf32>
+  // LINEAR-LABEL: reduce_f32
+  // LINEAR-NOT: vector<2xf32>
+  // LINEAR: llvm.fadd {{.*}} : f32
   tt.func public @reduce_f32(%arg0: tensor<1x256xf32, #blocked_reduce>) {
     %0 = "tt.reduce"(%arg0) <{axis = 1 : i32}> ({
     ^bb0(%a: f32, %b: f32):
       %sum = arith.addf %a, %b : f32
       tt.reduce.return %sum : f32
     }) : (tensor<1x256xf32, #blocked_reduce>) -> tensor<1xf32, #ttg.slice<{dim = 1, parent = #blocked_reduce}>>
+    tt.return
+  }
+}
+
+// -----
+
+#mfma_reduce = #ttg.amd_mfma<{version = 4, warpsPerCTA = [8, 1], instrShape = [32, 32, 16], isTransposed = true}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, "ttg.threads-per-warp" = 64 : i32} {
+  // This MFMA layout gives each thread 32 values on the reduction axis, split
+  // into eight register-contiguous spans of four. A regression flattened all
+  // 32 values into one dependency chain:
+  //
+  //   (((span0[0] + ... + span0[3]) + span1[0]) + span1[1]) + ...
+  //
+  // That long chain prevented LLVM from packing adjacent loop-carried values
+  // and caused severe VGPR spilling in Flash Attention. The required lowering
+  // finishes each four-value span first and immediately merges that partial:
+  //
+  //   running = reduce(span0); running += reduce(span1); ...
+  //
+  // Checking that operation seven merges the two completed span results makes
+  // the flattened form fail: its operation seven still consumes a raw value.
+  // LINEAR-LABEL: reduce_mfma_f32_in_contiguous_spans
+  // LINEAR: %[[SPAN0_01:.*]] = llvm.fadd %{{.*}}, %{{.*}} : f32
+  // LINEAR-NEXT: %[[SPAN0_012:.*]] = llvm.fadd %[[SPAN0_01]], %{{.*}} : f32
+  // LINEAR-NEXT: %[[SPAN0:.*]] = llvm.fadd %[[SPAN0_012]], %{{.*}} : f32
+  // LINEAR-NEXT: %[[SPAN1_01:.*]] = llvm.fadd %{{.*}}, %{{.*}} : f32
+  // LINEAR-NEXT: %[[SPAN1_012:.*]] = llvm.fadd %[[SPAN1_01]], %{{.*}} : f32
+  // LINEAR-NEXT: %[[SPAN1:.*]] = llvm.fadd %[[SPAN1_012]], %{{.*}} : f32
+  // LINEAR-NEXT: %[[RUNNING:.*]] = llvm.fadd %[[SPAN0]], %[[SPAN1]] : f32
+  tt.func public @reduce_mfma_f32_in_contiguous_spans(%arg0: tensor<256x64xf32, #mfma_reduce>) {
+    %0 = "tt.reduce"(%arg0) <{axis = 1 : i32}> ({
+    ^bb0(%a: f32, %b: f32):
+      %sum = arith.addf %a, %b : f32
+      tt.reduce.return %sum : f32
+    }) : (tensor<256x64xf32, #mfma_reduce>) -> tensor<256xf32, #ttg.slice<{dim = 1, parent = #mfma_reduce}>>
     tt.return
   }
 }
@@ -112,6 +155,47 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.thr
       %min = arith.minnumf %a, %b : f32
       tt.reduce.return %min : f32
     }) : (tensor<1x128xf32, #blocked_reduce>) -> tensor<1xf32, #ttg.slice<{dim = 1, parent = #blocked_reduce}>>
+    tt.return
+  }
+}
+
+// -----
+
+// Register bit 0 is separated from bits 2--4 by a lane bit, forming eight
+// two-value register groups along the reduction axis. Since both warp bits
+// also move that axis, this exercises the multi-group reduction path.
+#multi_group = #ttg.linear<{register = [[1, 0], [4, 0], [8, 0], [16, 0]], lane = [[2, 0], [32, 0], [64, 0], [0, 1], [0, 2], [0, 4]], warp = [[128, 0], [256, 0]], block = []}>
+#rows = #ttg.slice<{dim = 0, parent = #multi_group}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 64 : i32} {
+  // Unordered reductions may merge all eight groups before vectorization:
+  // 16 register values become eight packed pairs and one seven-node vector
+  // tree, followed by a single horizontal scalar add.
+  // GFX950-LABEL: reduce_multi_register_groups_unordered
+  // GFX950-COUNT-7: llvm.fadd {{.*}} : vector<2xf32>
+  // GFX950-NOT: llvm.fadd {{.*}} : vector<2xf32>
+  // GFX950: llvm.extractelement
+  // GFX950: llvm.extractelement
+  // GFX950: llvm.fadd {{.*}} : f32
+  tt.func public @reduce_multi_register_groups_unordered(%arg0: tensor<512x8xf32, #multi_group>) {
+    %0 = "tt.reduce"(%arg0) <{axis = 0 : i32, reduction_ordering = "unordered"}> ({
+    ^bb0(%a: f32, %b: f32):
+      %sum = arith.addf %a, %b : f32
+      tt.reduce.return %sum : f32
+    }) : (tensor<512x8xf32, #multi_group>) -> tensor<8xf32, #rows>
+    tt.return
+  }
+
+  // Explicitly ordered reductions continue to reduce each register group
+  // independently and therefore do not use packed vector combines.
+  // GFX950-LABEL: reduce_multi_register_groups_inner_tree
+  // GFX950-NOT: vector<2xf32>
+  // GFX950: llvm.return
+  tt.func public @reduce_multi_register_groups_inner_tree(%arg0: tensor<512x8xf32, #multi_group>) {
+    %0 = "tt.reduce"(%arg0) <{axis = 0 : i32, reduction_ordering = "inner_tree"}> ({
+    ^bb0(%a: f32, %b: f32):
+      %sum = arith.addf %a, %b : f32
+      tt.reduce.return %sum : f32
+    }) : (tensor<512x8xf32, #multi_group>) -> tensor<8xf32, #rows>
     tt.return
   }
 }

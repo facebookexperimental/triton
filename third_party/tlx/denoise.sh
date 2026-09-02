@@ -92,27 +92,29 @@ elif [[ "$GPU_VENDOR" == "amd" ]]; then
     ) >/dev/null
 fi
 
-# TODO: Automate NUMA node detection. On one devgpu, device 6 is attached to
-# NUMA node 3. This is how to discover that mapping:
-#
-# `nvidia-smi -i 6 -pm 1` prints the PCI bus ID (00000000:C6:00.0)
-#
-# You can also get this from `nvidia-smi -x -q` and looking for minor_number
-# and pci_bus_id
-#
-# Then, `cat /sys/bus/pci/devices/0000:c6:00.0/numa_node` prints 3
-# is it always the case that device N is on numa node N/2? :shrug:
-#
-# Maybe automate this process or figure out if it always holds?
-#
-# ... Or you can just `nvidia-smi topo -mp` and it will just print out exactly
-# what you want, like this:
+NUMA_NODE=""
+if [[ "$GPU_VENDOR" == "nvidia" ]]; then
+    PCI_BUS_ID=$(nvidia-smi -i "$CUDA_VISIBLE_DEVICES" --query-gpu=pci.bus_id --format=csv,noheader | tr '[:upper:]' '[:lower:]')
+    # nvidia-smi uses an eight-digit PCI domain; sysfs uses four digits.
+    PCI_BUS_ID=$(printf '%s' "$PCI_BUS_ID" | sed -E 's/^[0-9a-f]{4}([0-9a-f]{4}:)/\1/')
+    NUMA_NODE_FILE="/sys/bus/pci/devices/$PCI_BUS_ID/numa_node"
+    if [[ -r "$NUMA_NODE_FILE" ]]; then
+        NUMA_NODE=$(<"$NUMA_NODE_FILE")
+    fi
+elif [[ "$GPU_VENDOR" == "amd" ]]; then
+    DRM_DEVICE=$(readlink -f "/sys/class/drm/card${HIP_VISIBLE_DEVICES}/device" 2>/dev/null || true)
+    if [[ -r "$DRM_DEVICE/numa_node" ]]; then
+        NUMA_NODE=$(<"$DRM_DEVICE/numa_node")
+    fi
+fi
 
-#       GPU0    GPU1    GPU2    GPU3    GPU4    GPU5    GPU6    GPU7    mlx5_0  mlx5_1  mlx5_2  mlx5_3  CPU Affinity    NUMA Affinity
-# GPU0   X      PXB     SYS     SYS     SYS     SYS     SYS     SYS     NODE    SYS     SYS     SYS     0-23,96-119     0
-# GPU6  SYS     SYS     SYS     SYS     SYS     SYS      X      PXB     SYS     SYS     SYS     NODE    72-95,168-191   3
-
-numactl -m 0 -c 0 "$@"
+if [[ "$NUMA_NODE" =~ ^[0-9]+$ ]]; then
+    echo "Binding CPU and memory to NUMA node $NUMA_NODE"
+    numactl --membind="$NUMA_NODE" --cpunodebind="$NUMA_NODE" "$@"
+else
+    echo "Warning: Could not determine a valid GPU-local NUMA node; running without NUMA binding" >&2
+    "$@"
+fi
 
 # Unlock GPU clock
 if [[ "$GPU_VENDOR" == "nvidia" ]]; then

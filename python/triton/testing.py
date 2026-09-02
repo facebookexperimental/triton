@@ -1,4 +1,5 @@
 import functools
+import gc
 import math
 import os
 import statistics
@@ -60,6 +61,25 @@ def _summarize_statistics(times, quantiles, return_mode):
 
 
 @contextmanager
+def cuda_graph_without_gc(*args, **kwargs):
+    # A loaded Triton CompiledKernel may be finalized by Python's cyclic GC.
+    # Its destructor unloads the CUDA module, which is illegal during CUDA
+    # stream capture and invalidates the graph. Keep GC disabled only for the
+    # capture window and restore the caller's previous GC state afterwards.
+    import torch
+
+    gc_was_enabled = gc.isenabled()
+    if gc_was_enabled:
+        gc.disable()
+    try:
+        with torch.cuda.graph(*args, **kwargs) as graph:
+            yield graph
+    finally:
+        if gc_was_enabled:
+            gc.enable()
+
+
+@contextmanager
 def _proton_bench_session():
     import triton.profiler as proton
 
@@ -108,8 +128,11 @@ def do_bench_cudagraph(fn, rep=20, grad_to_none=None, quantiles=None, return_mod
     :type grad_to_none: torch.tensor, optional
     :param return_mode: The statistical measure to return. Options are "min", "max", "mean", "median", or "all". Default is "mean".
     :type return_mode: str
+    :return: The runtime(s) in milliseconds: a single float for a scalar ``return_mode``, or a list of floats if ``quantiles`` is set or ``return_mode="all"``.
+    :rtype: float | list[float]
     """
     import torch
+
     assert return_mode in ["min", "max", "mean", "median", "all"]
 
     with torch.cuda.stream(torch.cuda.Stream()):
@@ -142,7 +165,7 @@ def do_bench_cudagraph(fn, rep=20, grad_to_none=None, quantiles=None, return_mod
         # step 2 - construct a cuda graph with `n_repeat` unrolled function calls to minimize
         # host overhead
         g = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(g):
+        with cuda_graph_without_gc(g):
             for _ in range(n_repeat):
                 if grad_to_none is not None:
                     for x in grad_to_none:
@@ -181,6 +204,8 @@ def do_bench_cudagraph_proton(fn, rep=20, grad_to_none=None, quantiles=None, ret
     :type grad_to_none: torch.tensor, optional
     :param return_mode: The statistical measure to return. Options are "min", "max", "mean", "median", or "all". Default is "mean".
     :type return_mode: str
+    :return: The runtime(s) in milliseconds: a single float for a scalar ``return_mode``, or a list of floats if ``quantiles`` is set or ``return_mode="all"``.
+    :rtype: float | list[float]
     """
     assert return_mode in ["min", "max", "mean", "median", "all"]
 
@@ -217,7 +242,7 @@ def do_bench_cudagraph_proton(fn, rep=20, grad_to_none=None, quantiles=None, ret
             cache = runtime.driver.active.get_empty_cache_for_benchmark()
             g = torch.cuda.CUDAGraph()
             scope_prefix = f"proton.{uuid.uuid4().hex}."
-            with torch.cuda.graph(g):
+            with cuda_graph_without_gc(g):
                 for i in range(n_repeat):
                     if grad_to_none is not None:
                         for x in grad_to_none:
@@ -239,9 +264,10 @@ def do_bench_cudagraph_proton(fn, rep=20, grad_to_none=None, quantiles=None, ret
         return _summarize_statistics(times, quantiles, return_mode)
 
 
-def do_bench(fn, warmup=25, rep=100, grad_to_none=None, quantiles=None, return_mode="mean"):
+def do_bench(fn, warmup=25, rep=100, grad_to_none=None, quantiles=None, return_mode="mean",
+             measure_time_with_hooks=False):
     """
-    Benchmark the runtime of the provided function. By default, returns the mean runtime of :code:`fn` as a single float.
+    Benchmark the runtime of the provided function. By default, returns the mean runtime (in milliseconds) of :code:`fn` as a single float.
 
     :param fn: Function to benchmark
     :type fn: Callable
@@ -261,8 +287,7 @@ def do_bench(fn, warmup=25, rep=100, grad_to_none=None, quantiles=None, return_m
         the fastest and slowest run respectively. ``"all"`` returns the raw list of
         per-run timings in ms. Default is ``"mean"``.
     :type return_mode: str
-    :return: A single float by default, a list of floats if ``quantiles`` is provided,
-        or a list of all per-run timings if ``return_mode="all"``.
+    :return: The runtime(s) in milliseconds: a single float for a scalar ``return_mode``, or a list of floats if ``quantiles`` is set or ``return_mode="all"``.
     :rtype: float | list[float]
     """
     assert return_mode in ["min", "max", "mean", "median", "all"]
@@ -285,32 +310,41 @@ def do_bench(fn, warmup=25, rep=100, grad_to_none=None, quantiles=None, return_m
     di.synchronize()
     estimate_ms = start_event.elapsed_time(end_event) / 5
 
-    # compute number of warmup and repeat
-    n_warmup = max(1, int(warmup / estimate_ms))
-    n_repeat = max(1, int(rep / estimate_ms))
-    start_event = [di.Event(enable_timing=True) for i in range(n_repeat)]
-    end_event = [di.Event(enable_timing=True) for i in range(n_repeat)]
-    # Warm-up
-    for _ in range(n_warmup):
-        fn()
-    # Benchmark
-    for i in range(n_repeat):
-        # we don't want `fn` to accumulate gradient values
-        # if it contains a backward pass. So we clear the
-        # provided gradients
-        if grad_to_none is not None:
-            for x in grad_to_none:
-                x.grad = None
-        # we clear the L2 cache before each run
-        runtime.driver.active.clear_cache(cache)
-        # record time of `fn`
-        start_event[i].record()
-        fn()
-        end_event[i].record()
-    # Record clocks
-    di.synchronize()
-    times = [s.elapsed_time(e) for s, e in zip(start_event, end_event)]
-    return _summarize_statistics(times, quantiles, return_mode)
+    # CPU launches are synchronous, so entry/exit hooks can measure the kernel
+    # execution more precisely than host-side event timing.
+    if measure_time_with_hooks:
+        di.enable_hook_timing()
+
+    try:
+        # compute number of warmup and repeat
+        n_warmup = max(1, int(warmup / estimate_ms))
+        n_repeat = max(1, int(rep / estimate_ms))
+        start_event = [di.Event(enable_timing=True) for i in range(n_repeat)]
+        end_event = [di.Event(enable_timing=True) for i in range(n_repeat)]
+        # Warm-up
+        for _ in range(n_warmup):
+            fn()
+        # Benchmark
+        for i in range(n_repeat):
+            # we don't want `fn` to accumulate gradient values
+            # if it contains a backward pass. So we clear the
+            # provided gradients
+            if grad_to_none is not None:
+                for x in grad_to_none:
+                    x.grad = None
+            # we clear the L2 cache before each run
+            runtime.driver.active.clear_cache(cache)
+            # record time of `fn`
+            start_event[i].record()
+            fn()
+            end_event[i].record()
+        # Record clocks
+        di.synchronize()
+        times = [s.elapsed_time(e) for s, e in zip(start_event, end_event)]
+        return _summarize_statistics(times, quantiles, return_mode)
+    finally:
+        if measure_time_with_hooks:
+            di.disable_hook_timing()
 
 
 def do_bench_proton(fn, warmup=25, rep=100, grad_to_none=None, quantiles=None, return_mode="mean"):
@@ -334,6 +368,8 @@ def do_bench_proton(fn, warmup=25, rep=100, grad_to_none=None, quantiles=None, r
     :type quantiles: list[float], optional
     :param return_mode: The statistical measure to return. Options are "min", "max", "mean", "median", or "all". Default is "mean".
     :type return_mode: str
+    :return: The runtime(s) in milliseconds: a single float for a scalar ``return_mode``, or a list of floats if ``quantiles`` is set or ``return_mode="all"``.
+    :rtype: float | list[float]
     """
     assert return_mode in ["min", "max", "mean", "median", "all"]
 

@@ -108,36 +108,45 @@ TritonGPUConversionTarget::TritonGPUConversionTarget(
     return false;
   });
 
+  addDynamicallyLegalOp<WarpPredicateOp>([&](WarpPredicateOp op) -> bool {
+    return typeConverter.isLegal(&op.getRegion()) && typeConverter.isLegal(op);
+  });
+  addDynamicallyLegalOp<PredicateYieldOp>(
+      [&](PredicateYieldOp op) -> bool { return typeConverter.isLegal(op); });
+
   addDynamicallyLegalOp<
       triton::gpu::AsyncCopyGlobalToLocalOp, triton::gpu::LocalLoadOp,
       triton::gpu::LocalStoreOp, triton::gpu::RemoteShmemStoreOp,
       triton::gpu::LocalGatherOp, triton::gpu::LocalScatterOp,
       triton::gpu::AsyncRemoteShmemStoreOp, triton::nvidia_gpu::PrefetchOp,
+      triton::nvidia_gpu::TwoCTAPeerGatherOp,
       triton::nvidia_gpu::WarpGroupDotWaitOp,
       triton::nvidia_gpu::VoteBallotSyncOp, triton::tlx::RequireLayoutOp,
       triton::tlx::ReleaseLayoutOp, triton::tlx::LocalAliasOp,
-      triton::tlx::DumpLayoutOp, triton::amdgpu::BufferLoadOp,
-      triton::amdgpu::BufferStoreOp, triton::amdgpu::BufferLoadToLocalOp,
-      triton::amdgpu::RematerializedRangeOp>([&](Operation *op) -> bool {
-    // make sure every RankedTensorType operand has encoding
-    for (auto operandType : op->getOperandTypes()) {
-      if (auto rankedTensorType = dyn_cast<RankedTensorType>(operandType)) {
-        if (rankedTensorType.getEncoding() == nullptr) {
-          return false;
+      triton::tlx::DumpLayoutOp, triton::gpu::WarpVoteOp,
+      triton::amdgpu::BufferLoadOp, triton::amdgpu::BufferStoreOp,
+      triton::amdgpu::BufferLoadToLocalOp,
+      triton::amdgpu::RematerializedRangeOp, triton::amdgpu::RegisterHandoffOp>(
+      [&](Operation *op) -> bool {
+        // make sure every RankedTensorType operand has encoding
+        for (auto operandType : op->getOperandTypes()) {
+          if (auto rankedTensorType = dyn_cast<RankedTensorType>(operandType)) {
+            if (rankedTensorType.getEncoding() == nullptr) {
+              return false;
+            }
+          }
         }
-      }
-    }
 
-    // make sure result type has encoding if it is RankedTensorType
-    for (auto resultType : op->getResultTypes()) {
-      if (auto rankedTensorType = dyn_cast<RankedTensorType>(resultType)) {
-        if (rankedTensorType.getEncoding() == nullptr) {
-          return false;
+        // make sure result type has encoding if it is RankedTensorType
+        for (auto resultType : op->getResultTypes()) {
+          if (auto rankedTensorType = dyn_cast<RankedTensorType>(resultType)) {
+            if (rankedTensorType.getEncoding() == nullptr) {
+              return false;
+            }
+          }
         }
-      }
-    }
-    return true;
-  });
+        return true;
+      });
 
   addDynamicallyLegalOp<triton::FuncOp>([](triton::FuncOp funcOp) -> bool {
     auto check = [](auto types) {

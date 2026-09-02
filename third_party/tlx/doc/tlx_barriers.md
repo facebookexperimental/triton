@@ -97,8 +97,8 @@ Barrier operations can be classified into three categories: a)
 
 ## TLX Barriers
 
-TLX provides two categories of barriers: a) named barriers and b) memory
-barriers.
+TLX provides three categories of barriers: a) named barriers, b) memory
+barriers, and c) workgroup barriers (AMD).
 
 ### Named Barriers
 
@@ -110,8 +110,11 @@ barriers.
 
 - Named barriers do not have to be allocated or initialized.
 
-- Wait and Arrive are called with the count of expected threads to
-  arrive at the barrier.
+- Wait and Arrive are called with the total number of threads required
+  to flip the barrier phase. This includes threads that execute Wait
+  and threads that execute Arrive: *num_waiting_threads +
+  num_arriving_threads*. Wait and Arrive calls for the same barrier
+  phase must use the same thread count.
 
 - All threads in the warp participate in the arrive operation, so the
   thread count should be *number of warps \* threads per warp*.
@@ -122,14 +125,17 @@ barriers.
 #### APIs
 
 - ***tlx.named_barrier_wait(bar_id, num_threads)***
-  Wait until num_threads threads have reached the phase of the *bar_id*
-  named barrier. num_threads has to be a multiple of warp size, i.e.,
-  a multiple of 32.
+  Wait until *num_threads* total threads have reached the phase of the
+  *bar_id* named barrier. The waiting threads contribute to this total,
+  so *num_threads* is the number of waiting threads plus the number of
+  arriving threads. It must match the count passed to Arrive and be a
+  multiple of warp size, i.e., a multiple of 32.
 
 - ***tlx.named_barrier_arrive(bar_id, num_threads)***
-  Signal arrival at *bar_id* named barrier with an arrival count of
-  *num_threads*. num_threads has to be a multiple of warp size, i.e.,
-  a multiple of 32.
+  Signal arrival at the *bar_id* named barrier. *num_threads* is the
+  total number of threads required to flip the barrier phase, including
+  both waiting and arriving threads. It must match the count passed to
+  Wait and be a multiple of warp size, i.e., a multiple of 32.
 
 | TLX | MLIR | PTX |
 |----|----|----|
@@ -286,6 +292,36 @@ while !done:
   | tlx.barrier_expect_bytes | ttng::BarrierExpectOp | [<u>mbarrier.expect_tx</u>](http://mbarrier.expect_tx) |
   | tlx.barrier_wait | ttng::WaitBarrierOp | [<u>mbarrier.try_wait</u>](http://mbarrier.try_wait) |
   | tlx.barrier_arrive | ttng::ArriveBarrierOp | [<u>mbarrier.arrive</u>](http://mbarrier.arrive) |
+
+### Workgroup Barriers (AMD)
+
+- **Note:** Workgroup barriers are only supported on AMD (CDNA).
+
+- Unlike the NVIDIA named/memory barriers above, these are the plain CDNA
+  workgroup rendezvous used at hand-rolled ping-pong cluster borders. They are
+  synchronous and take no phase or arrival count.
+
+#### APIs
+
+- ***tlx.workgroup_barrier()***
+  Full-workgroup barrier with an LDS (shared-memory) memory fence. Lowers to a
+  local `s_barrier` bracketed by scheduler barriers so instructions cannot be
+  hoisted across it. This is the barrier used at hand-rolled ping-pong cluster
+  borders (pairs with *tlx.cond_barrier* for the phase shift).
+
+- ***tlx.cond_barrier(pred)***
+  Conditionally execute a workgroup barrier. Threads for which *pred* is true
+  participate in an `s_barrier`; the rest fall through without waiting. This
+  deliberately diverges the two halves of a workgroup to phase-shift warp groups
+  for hand-rolled block ping-pong, and sets no memory fence. The caller MUST
+  guarantee reconvergence: pair a *cond_barrier(pred)* before a loop with a
+  *cond_barrier(~pred)* after it so every thread crosses the same total number of
+  barriers.
+
+  | TLX [<u>barriers</u>](https://github.com/facebookexperimental/triton/blob/tlx/third_party/tlx/language/tlx/barrier.py) | MLIR | AMDGPU |
+  |----|----|----|
+  | tlx.workgroup_barrier | rocdl::SchedBarrier + ttg::BarrierOp (local) + rocdl::SchedBarrier | s_barrier |
+  | tlx.cond_barrier | amdgpu::CondBarrierOp | s_barrier (conditional) |
 
 ### Examples
 

@@ -1,7 +1,7 @@
-// RUN: TRITON_USE_MODULO_SCHEDULE=1 triton-opt %s -split-input-file \
+// RUN: env TRITON_USE_MODULO_SCHEDULE=1 triton-opt %s -split-input-file \
 // RUN:   -tritonamdgpu-dot-decompose-and-schedule=mode=modulo 2>&1 \
 // RUN:   | FileCheck %s --check-prefix=SCHEDULE
-// RUN: TRITON_USE_MODULO_SCHEDULE=1 triton-opt %s -split-input-file \
+// RUN: env TRITON_USE_MODULO_SCHEDULE=1 triton-opt %s -split-input-file \
 // RUN:   -tritonamdgpu-dot-decompose-and-schedule=mode=modulo 2>/dev/null \
 // RUN:   | triton-opt -split-input-file -tritonamdgpu-pipeline 2>&1 \
 // RUN:   | FileCheck %s

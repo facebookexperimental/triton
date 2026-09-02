@@ -8,56 +8,64 @@
 // CHECK-LABEL: @_attn_bwd_annotated
 // CHECK: scf.for
 
-// --- Cluster 1: loads and address computation (stage 0) ---
-// CHECK: tt.descriptor_load {{.*}} {loop.cluster = 1 : i32, loop.stage = 0 : i32}
-// CHECK: ttg.local_alloc {{.*}} {loop.cluster = 1 : i32, loop.stage = 0 : i32}
-// CHECK: ttg.memdesc_trans {{.*}} {loop.cluster = 1 : i32, loop.stage = 0 : i32
-// CHECK: tt.load {{.*}} {loop.cluster = 1 : i32, loop.stage = 0 : i32}
+// Latency ops land in the dedicated prefetch clusters 1-3, which the pass
+// creates ahead of the annotated MMA clusters 4-7. Loads are ranked by the
+// wavefront (stage + order) of their earliest annotated consumer, except for
+// the two metadata tt.loads, which carry their own tt.autows stage/order.
 
-// --- qkT MMA: stage 0, cluster 1 ---
-// CHECK: ttng.tc_gen5_mma {{.*}} {loop.cluster = 1 : i32, loop.stage = 0 : i32
-
-// --- Cluster 4: qkT result consumption + softmax (stage 0) ---
-// CHECK: ttg.convert_layout {{.*}} {loop.cluster = 4 : i32, loop.stage = 0 : i32}
-// CHECK: ttng.tmem_load {{.*}} {loop.cluster = 4 : i32, loop.stage = 0 : i32}
-// CHECK: arith.subf {{.*}} {loop.cluster = 4 : i32, loop.stage = 0 : i32}
-// CHECK: math.exp2 {{.*}} {loop.cluster = 4 : i32, loop.stage = 0 : i32}
-
+// --- qkT operands: prefetched in cluster 1, m metadata load in cluster 2 ---
 // CHECK: tt.descriptor_load {{.*}} {loop.cluster = 1 : i32, loop.stage = 0 : i32}
 // CHECK: ttg.local_alloc {{.*}} {loop.cluster = 4 : i32, loop.stage = 0 : i32}
-// CHECK: arith.truncf {{.*}} {loop.cluster = 4 : i32, loop.stage = 0 : i32}
-// CHECK: ttng.tmem_alloc {{.*}} {loop.cluster = 4 : i32, loop.stage = 0 : i32}
-
-// --- dv MMA: stage 0, cluster 4 ---
-// CHECK: ttng.tc_gen5_mma {{.*}} {loop.cluster = 4 : i32, loop.stage = 0 : i32
-
-// CHECK: tt.load {{.*}} {loop.cluster = 1 : i32, loop.stage = 0 : i32}
 // CHECK: ttg.memdesc_trans {{.*}} {loop.cluster = 4 : i32, loop.stage = 0 : i32
+// CHECK: tt.load {{.*}} {loop.cluster = 2 : i32, loop.stage = 0 : i32
 
-// --- dpT MMA: stage 0, cluster 4 ---
+// --- qkT MMA (tt.autows stage 0, order 0): stage 0, cluster 4 ---
 // CHECK: ttng.tc_gen5_mma {{.*}} {loop.cluster = 4 : i32, loop.stage = 0 : i32
 
-// --- Cluster 2: dpT result consumption + dk/dq operand prep (stage 1) ---
-// CHECK: ttng.tmem_load {{.*}} {loop.cluster = 2 : i32, loop.stage = 1 : i32}
-// CHECK: arith.subf {{.*}} {loop.cluster = 2 : i32, loop.stage = 1 : i32}
-// CHECK: arith.mulf {{.*}} {loop.cluster = 2 : i32, loop.stage = 1 : i32}
-// CHECK: arith.truncf {{.*}} {loop.cluster = 2 : i32, loop.stage = 1 : i32}
-// CHECK: ttng.tmem_alloc {{.*}} {loop.cluster = 2 : i32, loop.stage = 1 : i32}
+// --- Cluster 7: qkT result consumption + softmax (stage 0) ---
+// CHECK: ttg.convert_layout {{.*}} {loop.cluster = 7 : i32, loop.stage = 0 : i32}
+// CHECK: ttng.tmem_load {{.*}} {loop.cluster = 7 : i32, loop.stage = 0 : i32}
+// CHECK: arith.subf {{.*}} {loop.cluster = 7 : i32, loop.stage = 0 : i32}
+// CHECK: math.exp2 {{.*}} {loop.cluster = 7 : i32, loop.stage = 0 : i32}
 
-// --- dk MMA: stage 1, cluster 2 ---
-// CHECK: ttng.tc_gen5_mma {{.*}} {loop.cluster = 2 : i32, loop.stage = 1 : i32
+// CHECK: tt.descriptor_load {{.*}} {loop.cluster = 2 : i32, loop.stage = 0 : i32}
+// CHECK: ttg.local_alloc {{.*}} {loop.cluster = 7 : i32, loop.stage = 0 : i32}
+// CHECK: arith.truncf {{.*}} {loop.cluster = 7 : i32, loop.stage = 0 : i32}
+// CHECK: ttng.tmem_alloc {{.*}} {loop.cluster = 7 : i32, loop.stage = 0 : i32}
 
-// CHECK: ttg.local_alloc {{.*}} {loop.cluster = 2 : i32, loop.stage = 1 : i32}
-// CHECK: ttg.memdesc_trans {{.*}} {loop.cluster = 2 : i32, loop.stage = 1 : i32
+// --- dv MMA (tt.autows stage 0, order 2): stage 0, cluster 7 ---
+// CHECK: ttng.tc_gen5_mma {{.*}} {loop.cluster = 7 : i32, loop.stage = 0 : i32
 
-// --- dq MMA: stage 1, cluster 2 ---
-// CHECK: ttng.tc_gen5_mma {{.*}} {loop.cluster = 2 : i32, loop.stage = 1 : i32
+// --- Di metadata load: its own tt.autows stage 0/order 4 puts it in the last
+// --- prefetch cluster at stage 0, rather than the stage 1 its dk/dq consumers
+// --- would have inferred.
+// CHECK: tt.load {{.*}} {loop.cluster = 3 : i32, loop.stage = 0 : i32
+// CHECK: ttg.memdesc_trans {{.*}} {loop.cluster = 7 : i32, loop.stage = 0 : i32
 
-// --- dq epilogue: tmem_load + reduce (stage 1, cluster 2) ---
-// CHECK: ttng.tmem_load {{.*}} {loop.cluster = 2 : i32, loop.stage = 1 : i32}
-// CHECK: arith.mulf {{.*}} {loop.cluster = 2 : i32, loop.stage = 1 : i32}
-// CHECK: ttg.convert_layout {{.*}} {loop.cluster = 2 : i32, loop.stage = 1 : i32}
-// CHECK: tt.descriptor_reduce {{.*}} {loop.cluster = 2 : i32, loop.stage = 1 : i32}
+// --- dpT MMA (tt.autows stage 0, order 2): stage 0, cluster 7 ---
+// CHECK: ttng.tc_gen5_mma {{.*}} {loop.cluster = 7 : i32, loop.stage = 0 : i32
+
+// --- Cluster 5: dpT result consumption + dk/dq operand prep (stage 1) ---
+// CHECK: ttng.tmem_load {{.*}} {loop.cluster = 5 : i32, loop.stage = 1 : i32}
+// CHECK: arith.subf {{.*}} {loop.cluster = 5 : i32, loop.stage = 1 : i32}
+// CHECK: arith.mulf {{.*}} {loop.cluster = 5 : i32, loop.stage = 1 : i32}
+// CHECK: arith.truncf {{.*}} {loop.cluster = 5 : i32, loop.stage = 1 : i32}
+// CHECK: ttng.tmem_alloc {{.*}} {loop.cluster = 5 : i32, loop.stage = 1 : i32}
+
+// --- dk MMA (tt.autows stage 1, order 1): stage 1, cluster 5 ---
+// CHECK: ttng.tc_gen5_mma {{.*}} {loop.cluster = 5 : i32, loop.stage = 1 : i32
+
+// CHECK: ttg.local_alloc {{.*}} {loop.cluster = 5 : i32, loop.stage = 1 : i32}
+// CHECK: ttg.memdesc_trans {{.*}} {loop.cluster = 5 : i32, loop.stage = 1 : i32
+
+// --- dq MMA (tt.autows stage 1, order 1): stage 1, cluster 5 ---
+// CHECK: ttng.tc_gen5_mma {{.*}} {loop.cluster = 5 : i32, loop.stage = 1 : i32
+
+// --- dq epilogue: tmem_load + reduce (stage 1, cluster 5) ---
+// CHECK: ttng.tmem_load {{.*}} {loop.cluster = 5 : i32, loop.stage = 1 : i32}
+// CHECK: arith.mulf {{.*}} {loop.cluster = 5 : i32, loop.stage = 1 : i32}
+// CHECK: ttg.convert_layout {{.*}} {loop.cluster = 5 : i32, loop.stage = 1 : i32}
+// CHECK: tt.descriptor_reduce {{.*}} {loop.cluster = 5 : i32, loop.stage = 1 : i32}
 
 // CHECK: } {tt.scheduled_max_stage = 1 : i32, tt.warp_specialize}
 
@@ -122,7 +130,7 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
       %41 = tt.splat %arg44 : i32 -> tensor<128xi32, #blocked2>
       %42 = arith.addi %41, %23 : tensor<128xi32, #blocked2>
       %43 = tt.addptr %24, %42 : tensor<128x!tt.ptr<f32>, #blocked2>, tensor<128xi32, #blocked2>
-      %44 = tt.load %43 {tt.latency = 1 : i32} : tensor<128x!tt.ptr<f32>, #blocked2>
+      %44 = tt.load %43 {tt.autows = "{\22stage\22: \220\22, \22order\22: \222\22}", tt.latency = 1 : i32} : tensor<128x!tt.ptr<f32>, #blocked2>
       // qkT MMA
       %45 = ttng.tc_gen5_mma %19, %40, %result[%arg46], %false, %true {tt.autows = "{\"stage\": \"0\", \"order\": \"0\"}", tt.self_latency = 1 : i32} : !ttg.memdesc<128x128xbf16, #shared, #smem>, !ttg.memdesc<128x128xbf16, #shared2, #smem>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
       %46 = ttg.convert_layout %44 : tensor<128xf32, #blocked2> -> tensor<128xf32, #ttg.slice<{dim = 0, parent = #blocked}>>
@@ -138,7 +146,7 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
       // dv MMA
       %54 = ttng.tc_gen5_mma %result_15, %52, %result_1[%arg47], %arg45, %true {tt.autows = "{\"stage\": \"0\", \"order\": \"2\"}", tt.self_latency = 1 : i32} : !ttg.memdesc<128x128xbf16, #tmem1, #ttng.tensor_memory>, !ttg.memdesc<128x128xbf16, #shared, #smem>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
       %55 = tt.addptr %25, %42 : tensor<128x!tt.ptr<f32>, #blocked2>, tensor<128xi32, #blocked2>
-      %56 = tt.load %55 {tt.latency = 1 : i32} : tensor<128x!tt.ptr<f32>, #blocked2>
+      %56 = tt.load %55 {tt.autows = "{\22stage\22: \220\22, \22order\22: \224\22}", tt.latency = 1 : i32} : tensor<128x!tt.ptr<f32>, #blocked2>
       %57 = ttg.memdesc_trans %52 {order = array<i32: 1, 0>} : !ttg.memdesc<128x128xbf16, #shared, #smem> -> !ttg.memdesc<128x128xbf16, #shared2, #smem>
       // dpT MMA
       %58 = ttng.tc_gen5_mma %21, %57, %result_3[%arg48], %false, %true {tt.autows = "{\"stage\": \"0\", \"order\": \"2\"}", tt.self_latency = 1 : i32} : !ttg.memdesc<128x128xbf16, #shared, #smem>, !ttg.memdesc<128x128xbf16, #shared2, #smem>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>

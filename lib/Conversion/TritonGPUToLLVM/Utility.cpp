@@ -298,8 +298,14 @@ Value matrixVectorProd(TritonLLVMOpBuilder &b, const LinearLayout &A, Value x) {
   return b.or_(orPart, xorPart, /*disjoint=*/true);
 }
 
-bool cvtAlwaysUseWarpShuffle(ConvertLayoutOp cvt) {
-  return cvt->getParentOp()->hasAttrOfType<UnitAttr>("always_use_warp_shuffle");
+FailureOr<bool> cvtAlwaysUseWarpShuffle(ConvertLayoutOp cvt) {
+  if (cvtUsesForcedWarpShuffle(cvt))
+    return true;
+  if (!cvtIsWarpShuffleForced(cvt))
+    return false;
+  cvt.emitError("'always_use_warp_shuffle' requires a warp-local layout "
+                "conversion");
+  return failure();
 }
 
 Value maybeAnd(OpBuilder &builder, Location loc, Value a, Value b) {
@@ -819,14 +825,19 @@ materializeLocalAddrs(Location loc, triton::gpu::MemDescType memDescTy,
                       RewriterBase &rewriter) {
   auto b = TritonLLVMOpBuilder(loc, rewriter);
 
-  // Get the subslice affine offset (non-zero for memdesc subslices)
-  Value affineOffset = smemObj.getShmemOffset(loc, rewriter, memDescTy);
+  // Get the subslice affine offset and target CTA.
+  auto [affineOffset, affineBlockOffset] =
+      smemObj.getShmemOffsetAndBlock(loc, rewriter, memDescTy);
+  bool hasAffineBlock =
+      SharedMemoryObject::getMaskSpanOffsetsAndBlocks(memDescTy).second != 0;
   auto bitwidth = getIntOrFloatOrPtrBitWidth(llvmElemTy);
   SmallVector<LocalSharedMemoryAddress> addrs;
   addrs.reserve(offsetAndBlock.size());
   for (auto [offset, blockId] : offsetAndBlock) {
-    // For subslices, the physical offset is computed as:
+    // For subslices, the physical offset and target CTA are computed as:
     //   physical_offset = L⁻¹(coords) ⊕ L⁻¹(subslice_logical_offset)
+    //   target_cta = block(L⁻¹(coords)) ⊕
+    //                block(L⁻¹(subslice_logical_offset))
     //
     // We use XOR for consistency with lowerLdSt. MemDescSubsliceOp::verify()
     // enforces:
@@ -836,6 +847,11 @@ materializeLocalAddrs(Location loc, triton::gpu::MemDescType memDescTy,
     // These constraints ensure the bit ranges of L⁻¹(coords) and
     // L⁻¹(subslice_offset) are disjoint, so XOR and addition are equivalent.
     offset = b.xor_(offset, affineOffset);
+    if (hasAffineBlock) {
+      if (!blockId)
+        blockId = b.i32_val(0);
+      blockId = b.xor_(blockId, affineBlockOffset);
+    }
 
     // Add padding offset for padded layouts (non-linear component)
     Value ptr;
@@ -862,6 +878,7 @@ FailureOr<LocalAtomicScatterRMWInfo> prepareLocalAtomicScatterRMW(
     Value inputValues, Value mask, ConversionPatternRewriter &rewriter,
     const TargetInfoBase &targetInfo, const LLVMTypeConverter *typeConverter) {
   auto loc = op.getLoc();
+  auto *ctx = op.getContext();
   auto valuesTy = cast<RankedTensorType>(op.getValues().getType());
   auto memDescTy = cast<triton::gpu::MemDescType>(op.getDst().getType());
   if (isa<triton::gpu::PartitionedSharedEncodingAttr>(
@@ -872,36 +889,30 @@ FailureOr<LocalAtomicScatterRMWInfo> prepareLocalAtomicScatterRMW(
   auto llvmElemTy = typeConverter->convertType(memDescTy.getElementType());
   auto smemObj =
       LLVM::getSharedMemoryObjectFromStruct(loc, dst, llvmElemTy, rewriter);
-  SmallVector<Value> idxValues = unpackLLElements(loc, indices, rewriter);
-  SmallVector<Value> values = unpackLLElements(loc, inputValues, rewriter);
+  SmallVector<Value> idxValues =
+      unpackUniqueTensorElements(loc, indices, rewriter);
+  SmallVector<Value> values =
+      unpackUniqueTensorElements(loc, inputValues, rewriter);
   SmallVector<Value> maskValues;
   if (mask)
-    maskValues = unpackLLElements(loc, mask, rewriter);
+    maskValues = unpackUniqueTensorElements(loc, mask, rewriter);
 
   LinearLayout regLayout = triton::gpu::toLinearLayout(valuesTy);
   auto freeVarMasks = regLayout.getFreeVariableMasks();
   auto removeBroadcast = actionRemoveBroadcastedRegs(regLayout);
   Value threadPred = triton::gpu::emitRedundantThreadPredicate(
       freeVarMasks, rewriter, loc, targetInfo);
-  LinearLayout activeRegLayout = regLayout;
-  if (!removeBroadcast.isIdentity()) {
-    activeRegLayout = removeBroadcast.apply(regLayout);
-    values = removeBroadcast.apply(values);
-    idxValues = removeBroadcast.apply(idxValues);
-    if (!maskValues.empty())
-      maskValues = removeBroadcast.apply(maskValues);
-  }
+  LinearLayout activeRegLayout =
+      regLayout.removeZeroBasesAlongDim(str_attr("register"));
   auto offsetAndBlock =
       computeBlockLocalOffsets(loc, memDescTy, activeRegLayout, idxValues,
                                op.getAxis(), rewriter, targetInfo);
-  SmallVector<Value> ptrs = llvm::map_to_vector(
-      materializeLocalAddrs(loc, memDescTy, smemObj, llvmElemTy, offsetAndBlock,
-                            rewriter),
-      [](const LocalSharedMemoryAddress &addr) { return addr.ptr; });
+  SmallVector<LocalSharedMemoryAddress> addrs = materializeLocalAddrs(
+      loc, memDescTy, smemObj, llvmElemTy, offsetAndBlock, rewriter);
 
   return LocalAtomicScatterRMWInfo{valuesTy,        llvmElemTy, regLayout,
                                    removeBroadcast, threadPred, values,
-                                   maskValues,      ptrs};
+                                   maskValues,      addrs};
 }
 
 SmallVector<std::pair<unsigned, unsigned>>
@@ -954,6 +965,7 @@ lowerLdStShared(Location loc, MLIRContext *ctx, LinearLayout cvt,
                 Type llvmElemTy, ArrayRef<Value> smemBases,
                 ArrayRef<std::pair<unsigned, unsigned>> paddingShifts,
                 Value affineOffset, uint64_t maskSpanAffineOffset,
+                Value affineBlockOffset, uint64_t maskSpanAffineBlock,
                 RewriterBase &rewriter, const TargetInfoBase &targetInfo,
                 std::optional<int> maybeMaxVecElems, Operation *localLoadOp,
                 std::optional<Value> ctaRank, std::optional<Value> barrierPtr,
@@ -1022,8 +1034,9 @@ lowerLdStShared(Location loc, MLIRContext *ctx, LinearLayout cvt,
           targetInfo.rematerializeDistributedCoordinate(rewriter, loc, warpId);
   }
   return lowerLdSt(loc, ctx, cvt, valsArray, llvmElemTy, smemBases,
-                   paddingShifts, affineOffset, maskSpanAffineOffset, laneId,
-                   warpId, rewriter, targetInfo, maybeMaxVecElems, emitLdSt,
+                   paddingShifts, affineOffset, maskSpanAffineOffset,
+                   affineBlockOffset, maskSpanAffineBlock, laneId, warpId,
+                   rewriter, targetInfo, maybeMaxVecElems, emitLdSt,
                    barrierPtr);
 }
 SmallVector<Value> lowerLdSt(
@@ -1031,7 +1044,8 @@ SmallVector<Value> lowerLdSt(
     ArrayRef<Value> valsArray, // Input for store, output for load
     Type llvmElemTy, ArrayRef<Value> smemBases,
     ArrayRef<std::pair<unsigned, unsigned>> paddingShifts, Value affineOffset,
-    uint64_t maskSpanAffineOffset, Value laneId, Value warpId,
+    uint64_t maskSpanAffineOffset, Value affineBlockOffset,
+    uint64_t maskSpanAffineBlock, Value laneId, Value warpId,
     RewriterBase &rewriter, const TargetInfoBase &targetInfo,
     std::optional<int> maybeMaxVecElems,
     std::function<SmallVector<Value>(RewriterBase &, Location, ArrayRef<Value>,
@@ -1050,12 +1064,14 @@ SmallVector<Value> lowerLdSt(
   auto kOffset = str_attr("offset");
   auto kPartition = str_attr("partition");
   auto bitwidth = getIntOrFloatOrPtrBitWidth(llvmElemTy);
-  bool hasBlock = cvt.hasInDim(kBlock) && cvt.hasOutDim(kBlock);
+  bool hasBlockInput = cvt.hasInDim(kBlock);
+  bool hasBlockOutput = cvt.hasOutDim(kBlock);
   bool blockIsBroadcast =
-      hasBlock &&
+      !hasBlockInput ||
       cvt.sublayoutIsZero({kBlock}, to_vector(cvt.getOutDimNames()));
-  bool crossCTA =
-      hasBlock && !blockIsBroadcast && !cvt.isIdentityOnOutDim(kBlock);
+  bool crossCTA = hasBlockOutput &&
+                  (maskSpanAffineBlock != 0 ||
+                   (!blockIsBroadcast && !cvt.isIdentityOnOutDim(kBlock)));
 
   // Either we have multiple bases with a matching partition dimension,
   // or we have a single base.
@@ -1103,7 +1119,7 @@ SmallVector<Value> lowerLdSt(
   }
   LinearLayout addrLayout(addrBases, reps.getOutDims(), false);
   auto [nAdditive, permStrides] = actionAdditiveStrides(
-      reps, addrLayout, maskSpanAffineOffset, elemsPerVec);
+      reps, addrLayout, maskSpanAffineOffset, maskSpanAffineBlock, elemsPerVec);
   reps = permStrides.apply(reps);
 
   if (isPartitioned) {
@@ -1122,11 +1138,12 @@ SmallVector<Value> lowerLdSt(
       LinearLayout::zeros1D(bitwidth / 8, kReg, kOffset, bitwidth / 8);
   auto i8AddrLayout = i8Tile * addrLayout;
 
-  Value blockId = b.i32_val(0);
-  bool useBlockId =
+  bool layoutUsesBlockId =
       reps.hasInDim(kBlock) &&
       !reps.sublayoutIsZero({kBlock}, to_vector(reps.getOutDimNames())) &&
       !reps.isTrivialOver({kBlock});
+  bool useBlockId = layoutUsesBlockId || maskSpanAffineBlock != 0;
+  Value blockId = b.i32_val(0);
   if (useBlockId) {
     blockId = targetInfo.getClusterCTAId(rewriter, loc);
   }
@@ -1142,6 +1159,8 @@ SmallVector<Value> lowerLdSt(
   Value targetCtaId;
   if (crossCTA) {
     targetCtaId = baseI8AndCTA[1].second;
+    if (maskSpanAffineBlock != 0)
+      targetCtaId = b.xor_(targetCtaId, affineBlockOffset);
   }
 
   // It's fine that we don't compute the offset in bytes as affineOffset
@@ -1272,8 +1291,10 @@ SmallVector<Value> lowerLocalLdSt(
     }
     return outVals;
   }
-  auto affineOffset = smemObj.getShmemOffset(loc, rewriter, srcTy);
-  auto maskSpanAffineOffset = smemObj.getMaskSpanOffsets(srcTy);
+  auto [affineOffset, affineBlockOffset] =
+      smemObj.getShmemOffsetAndBlock(loc, rewriter, srcTy);
+  auto [maskSpanAffineOffset, maskSpanAffineBlock] =
+      smemObj.getMaskSpanOffsetsAndBlocks(srcTy);
 
   // Extract padding info from padded encoding (standalone or inside
   // partitioned)
@@ -1293,8 +1314,9 @@ SmallVector<Value> lowerLocalLdSt(
                                smemObj.getBases().end());
   return lowerLdStShared(loc, ctx, cvt, valsArray, llvmElemTy, smemBases,
                          paddingShifts, affineOffset, maskSpanAffineOffset,
-                         rewriter, targetInfo, maybeMaxVecElems, localLoadOp,
-                         ctaRank, barrierPtr, distributedCoordinates);
+                         affineBlockOffset, maskSpanAffineBlock, rewriter,
+                         targetInfo, maybeMaxVecElems, localLoadOp, ctaRank,
+                         barrierPtr, distributedCoordinates);
 }
 
 SmallVector<Value> unpackLLElements(Location loc, Value llvmStruct,
@@ -1470,6 +1492,30 @@ std::optional<LLVM::AtomicOrdering> getMemoryOrdering(MemSemantic memOrdering) {
     return LLVM::AtomicOrdering::acq_rel;
   default:
     return {};
+  }
+}
+
+void insertAtomicOrderingBarriers(Operation *op, MemSemantic memOrdering,
+                                  bool emitBarrierAfter, RewriterBase &rewriter,
+                                  const TargetInfoBase &targetInfo) {
+  auto emitBarrier = [&] {
+    if (triton::gpu::lookupNumCTAs(op) == 1)
+      targetInfo.barrier(op->getLoc(), rewriter, triton::gpu::AddrSpace::Local);
+    else
+      targetInfo.clusterBarrier(op->getLoc(), rewriter, op);
+  };
+
+  if (memOrdering == MemSemantic::RELEASE ||
+      memOrdering == MemSemantic::ACQUIRE_RELEASE) {
+    OpBuilder::InsertionGuard guard(rewriter);
+    rewriter.setInsertionPoint(op);
+    emitBarrier();
+  }
+  if (emitBarrierAfter && (memOrdering == MemSemantic::ACQUIRE ||
+                           memOrdering == MemSemantic::ACQUIRE_RELEASE)) {
+    OpBuilder::InsertionGuard guard(rewriter);
+    rewriter.setInsertionPointAfter(op);
+    emitBarrier();
   }
 }
 
@@ -1664,8 +1710,8 @@ SmallVector<Type> SharedMemoryObject::getTypes() const {
   return types;
 }
 
-uint64_t
-SharedMemoryObject::getMaskSpanOffsets(triton::gpu::MemDescType srcTy) {
+std::pair<uint64_t, uint64_t> SharedMemoryObject::getMaskSpanOffsetsAndBlocks(
+    triton::gpu::MemDescType srcTy) {
   auto ctx = srcTy.getContext();
   auto shape = srcTy.getShape();
   auto allocShape = srcTy.getAllocShape();
@@ -1675,44 +1721,50 @@ SharedMemoryObject::getMaskSpanOffsets(triton::gpu::MemDescType srcTy) {
 
   // Early exist when there is no subview
   if (allocShape == shape) {
-    return 0;
+    return {0, 0};
   }
   auto totalLl =
       triton::gpu::isPaddedEncoding(srcTy.getEncoding())
           ? triton::gpu::paddedLinearLayout(allocShape, srcTy.getEncoding())
           : triton::gpu::toLinearLayout(allocShape, srcTy.getEncoding());
-  auto dimNames = standardOutDimNames(ctx, shape.size());
   // Map from dimNames to offset, block
   auto invLl = totalLl.pseudoinvert();
   SmallVector<std::pair<StringAttr, int32_t>> logicalOffsets;
-  for (auto dim : standardOutDimNames(srcTy.getContext(), shape.size())) {
+  for (auto dim : standardOutDimNames(ctx, shape.size())) {
     logicalOffsets.push_back({dim, 0});
   }
 
-  auto ret = 0;
+  uint64_t offsetMask = 0;
+  uint64_t blockMask = 0;
   for (auto [dim, shapes] : llvm::enumerate(llvm::zip(shape, allocShape))) {
     auto [shape, allocShape] = shapes;
     for (int j = llvm::Log2_32(shape); j < llvm::Log2_32(allocShape); ++j) {
       logicalOffsets[dim].second = 1 << j;
       auto offsetAndBlock = invLl.apply(logicalOffsets);
-      ret |= offsetAndBlock[0].second;
-      assert(offsetAndBlock[1].second == 0);
+      offsetMask |= offsetAndBlock[0].second;
+      blockMask |= offsetAndBlock[1].second;
     }
     // Reset the offset for the next dimension
     logicalOffsets[dim].second = 0;
   }
-  return ret;
+  return {offsetMask, blockMask};
 }
 
-Value SharedMemoryObject::getShmemOffset(Location loc, RewriterBase &rewriter,
-                                         triton::gpu::MemDescType srcTy) const {
+uint64_t
+SharedMemoryObject::getMaskSpanOffsets(triton::gpu::MemDescType srcTy) {
+  return getMaskSpanOffsetsAndBlocks(srcTy).first;
+}
+
+std::pair<Value, Value> SharedMemoryObject::getShmemOffsetAndBlock(
+    Location loc, RewriterBase &rewriter,
+    triton::gpu::MemDescType srcTy) const {
   auto ctx = srcTy.getContext();
   auto b = TritonLLVMOpBuilder(loc, rewriter);
 
   // If it did not have a memdesc_subslice we don't need to compute the offset
   // as it is zero
   if (!isAffineSharedMemoryAccess(srcTy)) {
-    return b.i32_val(0);
+    return {b.i32_val(0), b.i32_val(0)};
   }
 
   // We return the offset without the padding. The padding will be added in the
@@ -1730,13 +1782,14 @@ Value SharedMemoryObject::getShmemOffset(Location loc, RewriterBase &rewriter,
     logicalOffsets.push_back({dim, offset});
   }
 
-  // We don't allow for non-trivial block dimensions in the shared memory
-  // layout. We have in practice that offsetAndBlock[1].second is zero, but we
-  // cannot assert that without constant propagation so we just discard it.
-  auto offset =
-      applyLinearLayout(loc, rewriter, ll.pseudoinvert(), logicalOffsets)[0]
-          .second;
-  return offset;
+  auto offsetAndBlock =
+      applyLinearLayout(loc, rewriter, ll.pseudoinvert(), logicalOffsets);
+  return {offsetAndBlock[0].second, offsetAndBlock[1].second};
+}
+
+Value SharedMemoryObject::getShmemOffset(Location loc, RewriterBase &rewriter,
+                                         triton::gpu::MemDescType srcTy) const {
+  return getShmemOffsetAndBlock(loc, rewriter, srcTy).first;
 }
 
 Value SharedMemoryObject::getShmemAffineBase(
@@ -2360,11 +2413,10 @@ void finalizeTensorAtomicResults(Operation *op, RankedTensorType tensorTy,
                                  const LLVMTypeConverter *typeConverter) {
   auto *ctx = rewriter.getContext();
   auto loc = op->getLoc();
-  Type structTy = typeConverter->convertType(tensorTy);
   if (!op->hasAttr("allocation.offset")) {
     // No broadcasting, just pack the values into a struct
     Value resultStruct =
-        packLLElements(loc, typeConverter, resultVals, rewriter, structTy);
+        packTensorElements(loc, typeConverter, resultVals, rewriter, tensorTy);
     rewriter.replaceOp(op, {resultStruct});
     return;
   }
@@ -2422,7 +2474,8 @@ void finalizeTensorAtomicResults(Operation *op, RankedTensorType tensorTy,
   SmallVector<Value> smemBases = {smemBase};
   lowerLdSt(loc, ctx, storeCvt, uniqueResultVals, valueElemTy, smemBases,
             /*paddingShifts=*/{}, /*affineOffset=*/b.i32_val(0),
-            /*maskSpanAffineOffset=*/0, laneId, warpId, rewriter, targetInfo,
+            /*maskSpanAffineOffset=*/0, /*affineBlockOffset=*/Value(),
+            /*maskSpanAffineBlock=*/0, laneId, warpId, rewriter, targetInfo,
             /*maybeMaxVecElems=*/{}, emitSt,
             /*barrierPtr=*/std::nullopt);
   if (crossCTA)
@@ -2433,15 +2486,15 @@ void finalizeTensorAtomicResults(Operation *op, RankedTensorType tensorTy,
   resultVals =
       lowerLdSt(loc, ctx, loadCvt, /*valsArray=*/{}, valueElemTy, smemBases,
                 /*paddingShifts=*/{}, /*affineOffset=*/b.i32_val(0),
-                /*maskSpanAffineOffset=*/0, laneId, warpId, rewriter,
-                targetInfo, /*maybeMaxVecElems=*/{}, emitLd,
+                /*maskSpanAffineOffset=*/0, /*affineBlockOffset=*/Value(),
+                /*maskSpanAffineBlock=*/0, laneId, warpId, rewriter, targetInfo,
+                /*maybeMaxVecElems=*/{}, emitLd,
                 /*barrierPtr=*/std::nullopt);
   if (!removeRegBroadcast.isIdentity())
     resultVals = broadcastAs(resultVals, regLayout);
-
   // Create the result struct and replace the operation
-  Value resultStruct =
-      packLLElements(loc, typeConverter, resultVals, rewriter, structTy);
+  Value resultStruct = packUniqueTensorElements(loc, typeConverter, resultVals,
+                                                rewriter, tensorTy);
   rewriter.replaceOp(op, {resultStruct});
 }
 

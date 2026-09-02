@@ -687,6 +687,7 @@ public:
     auto oldAType = dotOp.getA().getType();
     auto oldBType = dotOp.getB().getType();
     bool useTwoCTAs;
+    auto tmemCTAMode = triton::nvidia_gpu::TensorMemoryCTAMode::DEFAULT;
     if (dotOp.getTwoCtas()) {
       auto mod = dotOp->getParentOfType<ModuleOp>();
       auto clusterDims = triton::gpu::TritonGPUDialect::getClusterDims(mod);
@@ -696,14 +697,15 @@ public:
                "cluster-dim-x is "
             << clusterDims[0] << ". Falling back to 1-CTA MMA.";
         useTwoCTAs = false;
-      } else if (oldRetType.getShape()[0] < 128) {
+      } else if (oldRetType.getShape()[0] < 64) {
         dotOp.emitWarning()
-            << "two_ctas=True with BLOCK_M < 128 is not yet supported; "
-               "m=64 2-CTA requires TensorMemoryCTAMode TwoCTA_LHS/RHS. "
+            << "two_ctas=True with BLOCK_M < 64 is not supported. "
                "Falling back to 1-CTA MMA.";
         useTwoCTAs = false;
       } else {
         useTwoCTAs = true;
+        if (oldRetType.getShape()[0] == 64)
+          tmemCTAMode = triton::nvidia_gpu::TensorMemoryCTAMode::TwoCTA_RHS;
       }
     } else {
       // NYI: PTX 13+ requires all tcgen instructions in a kernel to have a
@@ -728,7 +730,7 @@ public:
     unsigned colStride = 32 / bitwidth;
     Attribute accEncoding = triton::nvidia_gpu::TensorMemoryEncodingAttr::get(
         context, instrShape[0], instrShape[1], colStride, CGALayout, useTwoCTAs,
-        triton::nvidia_gpu::TensorMemoryCTAMode::DEFAULT);
+        tmemCTAMode);
     Attribute tensorMemorySpace =
         triton::nvidia_gpu::TensorMemorySpaceAttr::get(context);
     MemDescType accMemDescType =
@@ -799,11 +801,15 @@ public:
       return elemType == ScaleDotElemType::E2M1;
     };
 
+    bool isFP4xFP4 = isFP4(aElemType) && isFP4(bElemType);
     // TODO: Enable mixed-precision mxfp for sm120
-    if (!((isFP8(aElemType) && isFP8(bElemType)) ||
-          (isFP4(aElemType) && isFP4(bElemType)))) {
+    if (!((isFP8(aElemType) && isFP8(bElemType)) || isFP4xFP4)) {
       return rewriter.notifyMatchFailure(
           dotOp, "only FP8xFP8 and FP4xFP4 are supported on sm120");
+    }
+    if (isFP4xFP4 && (!dotOp.getLhsKPack() || !dotOp.getRhsKPack())) {
+      return rewriter.notifyMatchFailure(
+          dotOp, "SM120 native FP4xFP4 requires K-packed operands");
     }
 
     auto scaleElemType = dotOp.getAScale().getType().getElementType();

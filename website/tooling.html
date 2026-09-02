@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Tools for tracing, profiling, validating, and benchmarking Triton kernels.">
+  <title>Tooling · FBTriton</title>
+  <link rel="stylesheet" href="assets/tlx.css?v=20260824c">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="../"><span>FBTriton</span></a>
+    <nav class="topnav" aria-label="Top-level sections"><a href="triton.html">Triton</a>
+<a href="tlx.html">TLX</a>
+<a href="tlx-ops.html">tlx.ops</a>
+<a href="torchtlx.html">TorchTLX</a>
+<a href="ci.html">CI</a>
+<a href="tooling.html" data-current="true">Tooling</a></nav>
+    <a class="repo-link" href="https://github.com/facebookexperimental/triton" target="_blank" rel="noreferrer">View on GitHub ↗</a>
+  </header>
+  <div class="shell">
+<aside class="sidebar">
+      <p class="eyebrow">Developer tooling</p>
+      <nav><a href="tooling.html" aria-current="page">Overview</a>
+<a class="sub" href="#suggested-workflow">Suggested workflow</a>
+<a href="tlx-agent.html">TLX Agent</a></nav>
+    </aside>
+    <main>
+      <p class="eyebrow">Developer tooling</p>
+      <h1>Tooling</h1>
+      <p class="lede">Tools for tracing, profiling, validating, and benchmarking Triton kernels.</p>
+      <article><p>Triton and TLX development use a small set of complementary tools. Start from the question you need to answer rather than collecting every trace at once.</p>
+<table><thead><tr><th>Tool</th><th>Best used for</th></tr></thead><tbody><tr><td>TritonParse</td><td>Capturing compilation and launch events, extracting reproductions, comparing IR, and bisecting compiler regressions</td></tr><tr><td>Triton-MPP</td><td>Classifying compute, memory, occupancy, and latency bottlenecks with targeted profiling passes</td></tr><tr><td>CUTracer</td><td>Inspecting SASS-level execution, warp progress, TMA/MMA activity, deadlocks, and race candidates</td></tr><tr><td>Compute Sanitizer</td><td>Runtime checks for invalid memory access, uninitialized values, synchronization errors, and shared-memory hazards</td></tr><tr><td>TritonBench</td><td>Reproducible kernel and workload benchmarking across implementations and shapes</td></tr><tr><td><a href="tlx-agent.html">TLX Agent</a></td><td>Running a harness-driven optimization loop with correctness, profiling, promotion, and winner commits</td></tr><tr><td>Proton</td><td>Instrumenting Triton kernels and collecting performance data with low-level execution context</td></tr><tr><td>triton-lint</td><td>Static checks for common Triton correctness and performance anti-patterns</td></tr></tbody></table>
+<h2 id="suggested-workflow">Suggested workflow</h2>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div>Create a stable single-kernel reproduction with fixed shapes and configuration.</div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div>Use TritonParse to preserve compilation inputs and compare good and bad builds.</div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div>Use Triton-MPP or a hardware profiler to classify the performance limit.</div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div>Add CUTracer or Compute Sanitizer only when runtime ordering, races, or memory access are suspect.</div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div>Confirm improvements with TritonBench or the repository's correctness and performance harnesses.</div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div>Use the <a href="tlx-agent.html">TLX Agent</a> when you want that validated harness to drive an automated candidate, profiling, and promotion loop.</div></div>
+<p>The <a href="debugging.html">debugging guide</a> provides symptom-driven workflows for performance and numerical issues.</p></article>
+<footer class="pager"><a class="next" href="tlx-agent.html">TLX Agent →</a></footer>
+    </main>
+  </div>
+</body>
+</html>

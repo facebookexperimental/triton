@@ -126,6 +126,62 @@ def TTNG_ClusterArriveOp : TTNG_Op<"cluster_arrive", []> {
   let hasVerifier = 1;
 }
 
+def TTNG_TwoCTAPeerGatherOp : TTNG_Op<"two_cta_peer_gather", [
+    MemoryEffects<[MemRead<SharedMemory>, MemWrite<SharedMemory>]>
+  ]> {
+  let summary = "Abstract peer gather for a dependent 2-CTA MMA operand";
+
+  let description = [{
+    Represents the cross-CTA exchange needed to reconstruct a complete logical
+    tensor from two CTA-owned slices. This is an explicit operation, rather
+    than hidden transformation state, because its producer-consumer edge and
+    result lifetime must be visible to partition scheduling, channel creation,
+    and memory planning before the concrete DSMEM protocol can be selected.
+    A later pass materializes local/remote stores and synchronization.
+
+    `src` and `result` are rank-two tensors with the same element count and
+    element type. The result may have a different shape to represent the
+    physical layout consumed by the dependent MMA.
+  }];
+
+  let arguments = (ins
+    TT_Tensor:$src,
+    I32Attr:$splitDim,
+    I32Attr:$numCTAs
+  );
+  let results = (outs TT_Tensor:$result);
+
+  let assemblyFormat = [{
+    $src `split_dim` `=` $splitDim `num_ctas` `=` $numCTAs attr-dict
+    `:` type($src) `->` type($result)
+  }];
+  let hasVerifier = 1;
+}
+
+def TTNG_TwoCTAPeerRelayOp : TTNG_Op<"two_cta_peer_relay", [
+    MemoryEffects<[MemRead<SharedMemory>, MemWrite<SharedMemory>]>
+  ]> {
+  let summary = "Relay completion of a dependent 2-CTA peer gather";
+
+  let description = [{
+    Marks the shared-memory destination of a two-CTA peer gather for a
+    dedicated one-warp relay partition. AutoWS creates an independent channel
+    from the gather producer to this consumer. The post-WS materialization
+    pass redirects remote DSMEM completion to that channel and lowers this op
+    to publication on the MMA consumer channel. Keeping the relay as an
+    explicit operation makes that otherwise synchronization-only task visible
+    to partition allocation and prevents it from being folded into a compute
+    partition whose other warps do not participate.
+  }];
+
+  let arguments = (ins
+    Arg<TTG_MemDescType, "", [MemRead<SharedMemory>]>:$src
+  );
+
+  let assemblyFormat = "$src attr-dict `:` type($src)";
+  let hasVerifier = 1;
+}
+
 def TTNG_ClusterWaitOp : TTNG_Op<"cluster_wait", []> {
   let assemblyFormat = "attr-dict";
   let hasVerifier = 1;
@@ -293,6 +349,14 @@ def TTNG_CLCAdvanceOp
     splits the fetch into an (overlap-hoisted) async issue and a wait+load+decode,
     infers the phase, and drops unused coordinates. One per persistent-loop
     iteration.
+
+    In a clustered launch, this operation represents one cluster-scoped claim.
+    Lowering elects exactly one CTA to issue the request and distributes the
+    response to every CTA in the cluster. `isValid` is therefore
+    cluster-uniform. The (`x`, `y`, `z`) results are reconstructed for each CTA
+    from the claimed cluster base and may differ along clustered dimensions.
+    Which CTA issues the request is a lowering detail and is not observable in
+    the operation semantics.
   }];
 
   let results = (outs I1:$isValid, I32:$x, I32:$y, I32:$z);
@@ -322,6 +386,9 @@ def TTNG_CLCTryCancelAsyncOp
     `clc_read` awaits it and returns the decoded tile. References no mbarrier or
     buffer. Effectful (claims a pending cluster) so it is neither DCE'd nor
     hoisted out of the persistent loop.
+
+    In a clustered launch, the token represents one cluster-scoped request.
+    Exactly one CTA issues it; CTA election is a lowering detail.
   }];
 
   let results = (outs TTG_AsyncToken:$token);
@@ -337,6 +404,11 @@ def TTNG_CLCReadOp
     Consumer half of the async CLC fetch started by `clc_try_cancel_async`: awaits
     the token and returns the decoded tile -- `isValid` plus the (`x`, `y`, `z`)
     program-id coordinates. References no mbarrier or buffer.
+
+    For a cluster-scoped token, the response is distributed to every CTA in the
+    cluster. `isValid` is identical for every CTA, while (`x`, `y`, `z`) are
+    reconstructed per CTA from the claimed cluster base. The identity of the
+    issuing CTA is not part of this operation's semantics.
   }];
 
   let arguments = (ins TTG_AsyncToken:$token);
@@ -479,8 +551,8 @@ def TTNG_WaitBarrierOp
     Blocks the program progress until the mbarrier object in `alloc` completes
     its current phase.
 
-    This lowers a waitloop using PTX instruction
-    mbarrier.try_wait.parity.shared::cta.b64.
+    This lowers a waitloop using the PTX instruction
+    mbarrier.try_wait.parity{.acquire.cluster}.shared::cta.b64.
 
     Accepts an optional list of memory dependencies. If present, it is assumed
     that any of the dependencies may be accessed until the barrier completes.
@@ -1390,18 +1462,20 @@ def TTNG_TMEMSubSliceOp : TTNG_Op<"tmem_subslice", [Pure, MemDescViewTrait]> {
   let description = [{
     This operation takes a subslice of a tensor memory allocation and returns a
     new descriptor containing the address and a view of the subslice.
-    This is similar to ttg.memdesc_subslice except we can only slice along the
-    inner dimension of a 2D memdesc, as this is the only supported slice for
-    TMEM.
+    This is similar to ttg.memdesc_subslice and can slice either of the trailing
+    two tensor-memory dimensions, including non-contiguous views within a CTA.
   }];
-  let arguments = (ins TTG_MemDescType:$src, I32Attr:$N);
+  let arguments = (ins TTG_MemDescType:$src, I32Attr:$offset,
+                       DefaultValuedAttr<I32Attr, "1">:$dim);
 
   let assemblyFormat = [{
     $src attr-dict `:` qualified(type($src)) `->` qualified(type($result))
   }];
 
-  let builders = [OpBuilder<(ins "Value":$alloc, "int":$offset, "int":$size)>,
-  ];
+  let builders = [
+      OpBuilder<(ins "Value":$alloc, "int":$offset, "int":$size)>,
+      OpBuilder<(ins "Value":$alloc, "int":$offset, "int":$size, "int":$dim)>,
+    ];
   let results = (outs TTG_MemDescType:$result);
   let hasVerifier = 1;
 }
@@ -1414,6 +1488,8 @@ def TTNG_TMEMCopyOp : TTNG_Op<"tmem_copy"> {
     2D blocks stored contiguously in SMEM are copied into TMEM as specified by the destination address.
     This op lowers to the PTX instruction tcgen05.cp. This supports writing to
     the scales TMEM layout as well as the default TMEM layout.
+    For the default layout, each contiguous TMEM row segment must contain at
+    least 128 bits, the minimum width supported by tcgen05.cp.
     Currently, the semantics are different when writing to the TMEM scale layout.
 
     In the case of the default layout, the copy doesn't change the logical

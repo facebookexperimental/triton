@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Assign warps to concurrent tasks and build explicit pipelines.">
+  <title>Warp specialization · FBTriton</title>
+  <link rel="stylesheet" href="assets/tlx.css?v=20260824c">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="../"><span>FBTriton</span></a>
+    <nav class="topnav" aria-label="Top-level sections"><a href="triton.html">Triton</a>
+<a href="tlx.html" data-current="true">TLX</a>
+<a href="tlx-ops.html">tlx.ops</a>
+<a href="torchtlx.html">TorchTLX</a>
+<a href="ci.html">CI</a>
+<a href="tooling.html">Tooling</a></nav>
+    <a class="repo-link" href="https://github.com/facebookexperimental/triton" target="_blank" rel="noreferrer">View on GitHub ↗</a>
+  </header>
+  <div class="shell">
+<aside class="sidebar">
+      <p class="eyebrow">TLX documentation</p>
+      <nav><a href="tlx.html">Overview</a>
+<a href="buffers.html">Memory</a>
+<a href="global-memory.html">Global memory access</a>
+<a href="async-memory.html">Async memory access</a>
+<a href="async-compute.html">Tensor core operations</a>
+<a href="synchronization.html">Synchronization</a>
+<a href="warp-specialization.html" aria-current="page">Warp specialization</a>
+<a class="sub" href="#warp-pipeline">Warp pipeline</a>
+<a href="clusters.html">Clusters and Cluster Launch Control</a>
+<a href="layouts.html">Layout control and diagnostics</a>
+<a href="utilities.html">Other operations</a>
+<a href="kernels.html">Kernels implemented with TLX</a>
+<a href="testing.html">Testing</a>
+<a href="resources.html">Further reading</a></nav>
+    </aside>
+    <main>
+      <p class="eyebrow">TLX documentation</p>
+      <h1>Warp specialization</h1>
+      <p class="lede">Assign warps to concurrent tasks and build explicit pipelines.</p>
+      <article><div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.async_tasks</code> and <code>tlx.async_task</code> <strong>[sm90+]</strong></div></div>
+<pre><code>    with tlx.async_tasks()
+        with tlx.async_task(&quot;default&quot;)
+            ...
+        with tlx.async_task(num_warps=4)
+            ...</code></pre>
+<p><code>tlx.async_tasks</code> opens a multi-tasking region where independent asynchronous tasks can be declared. Each task executes in parallel using a dedicated subset of warps within the thread block.</p>
+<p><code>tlx.async_task(&quot;default&quot;)</code> defines the default task, also known as the trunk. It uses the available warps not explicitly reserved by other tasks.</p>
+<p><code>tlx.async_task(num_warps=4)</code> defines a warp-specialized asynchronous task that explicitly reserves 4 warps in addition to those used by the trunk task.</p>
+<h3 id="async-tasks-parameters">async_tasks Parameters</h3>
+<table><thead><tr><th>Parameter</th><th>Description</th></tr></thead><tbody><tr><td><code>exclusive</code></td><td>Assert this is the only one <code>tlx.async_tasks</code> in the kernel for more efficient PTX. Default to False.</td></tr><tr><td><code>no_ending_cluster_sync</code></td><td>This suppresses compiler generated cluster sync at end of Warp Spec. Should only be used if user guarantees all cross CTA SMEM/TMEM access are done by end of WS default task. Default to False.</td></tr><tr><td><code>mbarrier_try_wait_suspend_ns</code></td><td>On Blackwell, use the four-operand <code>mbarrier.try_wait.parity</code> form with this suspend hint for waits in the kernel. <code>None</code> is unspecified, <code>0</code> explicitly disables the hint, and positive values enable it. If multiple <code>async_tasks</code> regions specify a value, the minimum explicit value is used module-wide. Default to None.</td></tr></tbody></table>
+<h3 id="async-task-parameters">async_task Parameters</h3>
+<table><thead><tr><th>Parameter</th><th>Description</th></tr></thead><tbody><tr><td><code>&quot;default&quot;</code></td><td>First positional argument to mark this as the default/trunk task</td></tr><tr><td><code>num_warps</code></td><td>Number of warps to reserve for this task</td></tr><tr><td><code>num_regs</code></td><td>Number of registers per thread (optional, for register allocation tuning). It is supported by both default and non-default tasks and must be divisible by 8.</td></tr><tr><td><code>replicate</code></td><td>Number of replicas for this task (default: 1). Creates multiple copies of the task region</td></tr><tr><td><code>warp_group_start_id</code></td><td>Starting warp ID for this task (optional). Allows explicit control over warp assignment</td></tr></tbody></table>
+<h3 id="default-task-register-budget">Default Task Register Budget</h3>
+<p>Register budgets are specified per thread. When the default task does not set <code>num_regs</code>, register allocation keeps the original donation model: non-default warp groups receive their requested budgets, and the default task receives the remaining registers.</p>
+<p>Setting <code>num_regs</code> on the default task selects a fixed budget instead:</p>
+<pre><code class="language-python">with tlx.async_tasks():
+    with tlx.async_task(&quot;default&quot;, num_regs=80):
+        ...
+    with tlx.async_task(num_warps=4, num_regs=24):
+        ...</code></pre>
+<p>In this example, the default and non-default tasks receive 80 and 24 registers per thread, respectively. The default task does not absorb unused registers. Non-default warp groups without an explicit budget evenly share the remaining register pool. If every task has a fixed budget, any surplus is left unused. The compiler may raise a request to the hardware or instrumentation safety minimum when required.</p>
+<h3 id="explicit-warp-assignment-with-warp-group-start-id">Explicit Warp Assignment with warp_group_start_id</h3>
+<p>By default, the compiler automatically assigns warp IDs to each task. However, you can use <code>warp_group_start_id</code> to explicitly specify which warps each task should use. This is useful for:</p>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div>Fine-grained control over warp-to-task mapping</div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div>Ensuring specific hardware resource allocation</div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div>Advanced optimization scenarios</div></div>
+<p><strong>Example:</strong></p>
+<pre><code class="language-python">with tlx.async_tasks():
+    with tlx.async_task(&quot;default&quot;):  # Uses warps 0-3 (from num_warps=4 kernel param)
+        # Producer task
+        ...
+    with tlx.async_task(num_warps=2, warp_group_start_id=4, replicate=2):
+        # Two replicas, each using 2 warps
+        # Replica 0: warps 4-5
+        # Replica 1: warps 6-7
+        ...
+    with tlx.async_task(num_warps=1, warp_group_start_id=8):
+        # Consumer task using warp 8
+        ...</code></pre>
+<p><strong>Validation Rules:</strong></p>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div>Warp ranges must not overlap between tasks</div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div>Non-default tasks must not overlap with the default region (warps 0 to kernel's <code>num_warps</code>)</div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div>When using <code>warp_group_start_id</code>, it must be specified for ALL non-default tasks or NONE</div></div>
+<h2 id="warp-pipeline">Warp pipeline</h2>
+<blockquote><p><strong>[gfx950]</strong> — AMD MI350 (CDNA4); not available on MI300.</p></blockquote>
+<p><code>tlx.warp_pipeline_stage(label, *, priority=None)</code> is a context manager that marks explicit pipeline stage boundaries inside a loop. The compiler partitions the loop body at these boundaries and inserts conditional barriers so that one warp group executes one stage ahead of the other, overlapping memory latency with compute.</p>
+<p><strong>This is an explicit partitioning marker, not an automatic optimization.</strong> Correctness depends on the user's buffering and synchronization structure. In particular:</p>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div>Use multi-buffered shared memory (typically triple buffering with <code>NUM_BUFFERS=3</code>) to prevent data races between warp groups accessing the same buffer.</div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div>Use explicit <code>tlx.async_load_wait_group()</code> to ensure data is ready before consumption.</div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div>Handle prologue (prefetch) and epilogue (drain) around the main loop.</div></div>
+<p>See the gfx1250 warp-pipeline GEMM example (<code>third_party/amd/python/examples/gluon/f16_gemm_warp_pipeline_gfx1250.py</code>) for the full pattern.</p>
+<table><thead><tr><th>Parameter</th><th>Type</th><th>Description</th></tr></thead><tbody><tr><td><code>label</code></td><td><code>str</code></td><td>Stage name for diagnostics (e.g. <code>&quot;load&quot;</code>, <code>&quot;compute&quot;</code>)</td></tr><tr><td><code>priority</code></td><td><code>int</code> (0-3), optional</td><td>Hardware scheduling hint, maps to <code>s_setprio</code>. Higher = more urgent.</td></tr></tbody></table>
+<p>Auto software pipelining is automatically disabled on loops that contain warp pipeline stages.</p>
+<p>Example (simplified — see gfx1250 example for production pattern):</p>
+<pre><code class="language-python">import triton.language.extra.tlx as tlx
+
+@triton.jit
+def gemm_kernel(..., BLOCK_K: tl.constexpr, NUM_BUFFERS: tl.constexpr):
+    buf_A = tlx.local_alloc((BLOCK_M, BLOCK_K), tl.float16, NUM_BUFFERS)
+    buf_B = tlx.local_alloc((BLOCK_K, BLOCK_N), tl.float16, NUM_BUFFERS)
+
+    # Prologue: prefetch NUM_BUFFERS-1 tiles into shared memory
+    for i in tl.range(0, NUM_BUFFERS - 1, loop_unroll_factor=NUM_BUFFERS - 1):
+        tlx.async_load(a_ptrs, tlx.local_view(buf_A, i), mask=...)
+        tlx.async_load(b_ptrs, tlx.local_view(buf_B, i), mask=...)
+        tlx.async_load_commit_group()
+        a_ptrs += BLOCK_K * stride_ak; b_ptrs += BLOCK_K * stride_bk
+    tlx.async_load_wait_group(NUM_BUFFERS - 2)
+
+    # Main loop with warp pipelining
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for k in tl.range(NUM_BUFFERS - 1, K_ITERS):
+        consumer = (k - (NUM_BUFFERS - 1)) % NUM_BUFFERS
+        producer = k % NUM_BUFFERS
+        with tlx.warp_pipeline_stage(&quot;lds_load&quot;, priority=1):
+            a_tile = tlx.local_load(tlx.local_view(buf_A, consumer))
+            b_tile = tlx.local_load(tlx.local_view(buf_B, consumer))
+        tlx.async_load_wait_group(0)
+        with tlx.warp_pipeline_stage(&quot;compute_and_load&quot;, priority=0):
+            tlx.async_load(a_ptrs, tlx.local_view(buf_A, producer), mask=...)
+            tlx.async_load_commit_group()
+            acc = tl.dot(a_tile, b_tile, acc)
+
+    # Epilogue: drain remaining buffers
+    ...</code></pre></article>
+<footer class="pager"><a href="synchronization.html">← Synchronization</a><a class="next" href="clusters.html">Clusters and Cluster Launch Control →</a></footer>
+    </main>
+  </div>
+</body>
+</html>

@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Thread, type, timing, and stochastic-rounding utilities.">
+  <title>Other operations · FBTriton</title>
+  <link rel="stylesheet" href="assets/tlx.css?v=20260824c">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="../"><span>FBTriton</span></a>
+    <nav class="topnav" aria-label="Top-level sections"><a href="triton.html">Triton</a>
+<a href="tlx.html" data-current="true">TLX</a>
+<a href="tlx-ops.html">tlx.ops</a>
+<a href="torchtlx.html">TorchTLX</a>
+<a href="ci.html">CI</a>
+<a href="tooling.html">Tooling</a></nav>
+    <a class="repo-link" href="https://github.com/facebookexperimental/triton" target="_blank" rel="noreferrer">View on GitHub ↗</a>
+  </header>
+  <div class="shell">
+<aside class="sidebar">
+      <p class="eyebrow">TLX documentation</p>
+      <nav><a href="tlx.html">Overview</a>
+<a href="buffers.html">Memory</a>
+<a href="global-memory.html">Global memory access</a>
+<a href="async-memory.html">Async memory access</a>
+<a href="async-compute.html">Tensor core operations</a>
+<a href="synchronization.html">Synchronization</a>
+<a href="warp-specialization.html">Warp specialization</a>
+<a href="clusters.html">Clusters and Cluster Launch Control</a>
+<a href="layouts.html">Layout control and diagnostics</a>
+<a href="utilities.html" aria-current="page">Other operations</a>
+<a class="sub" href="#tlx-assume-uniform">`tlx.assume_uniform`</a>
+<a href="kernels.html">Kernels implemented with TLX</a>
+<a href="testing.html">Testing</a>
+<a href="resources.html">Further reading</a></nav>
+    </aside>
+    <main>
+      <p class="eyebrow">TLX documentation</p>
+      <h1>Other operations</h1>
+      <p class="lede">Thread, type, timing, and stochastic-rounding utilities.</p>
+      <article><div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.thread_id(axis)</code> <strong>[sm90+]</strong></div></div>
+<p>Returns the id of the current thread instance along the given <code>axis</code>.</p>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.dtype_of(v)</code> <strong>[sm90+]</strong></div></div>
+<p>Returns the dtype of a tensor or tensor descriptor.</p>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.size_of(dtype)</code> <strong>[sm90+]</strong></div></div>
+<p>Returns the size in bytes of a given Triton dtype. This is useful for dynamically computing memory sizes based on dtype, especially in barrier synchronization code.</p>
+<p>Example:</p>
+<pre><code class="language-python">    # Instead of hardcoding size values
+    tlx.barrier_expect_bytes(barrier, 2 * BLOCK_M * BLOCK_K)  # Assumes float16
+
+    # Use size_of for dtype-aware computation
+    tlx.barrier_expect_bytes(barrier,
+                           tlx.size_of(tlx.dtype_of(desc)) * BLOCK_M * BLOCK_K)</code></pre>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.clock64()</code> <strong>[sm90+]</strong></div></div>
+<p>Returns the current 64-bit hardware clock value. E.g,</p>
+<pre><code>        start = tlx.clock64()
+        # ... kernel code ...
+        end = tlx.clock64()
+        elapsed = end - start  # Number of clock cycles elapsed</code></pre>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.stoch_round(src, dst_dtype, rand_bits)</code> <strong>[sm100]</strong></div></div>
+<p>Performs hardware-accelerated stochastic rounding for FP32→FP8/BF16/F16 conversions on Blackwell GPUs (compute capability ≥ 100). Uses PTX <code>cvt.rs.satfinite</code> instructions for probabilistic rounding.</p>
+<p><strong>Why Use Stochastic Rounding:</strong></p>
+<div class="list-item depth-2"><span aria-hidden="true">•</span><div>Reduces bias in low-precision training/inference by randomly rounding up or down</div></div>
+<div class="list-item depth-2"><span aria-hidden="true">•</span><div>Improves numerical accuracy compared to deterministic rounding (e.g., round-to-nearest-even)</div></div>
+<div class="list-item depth-2"><span aria-hidden="true">•</span><div>Particularly beneficial when accumulating many small updates in FP8/FP16</div></div>
+<p><strong>Performance Characteristics:</strong></p>
+<div class="list-item depth-2"><span aria-hidden="true">•</span><div>Hardware-accelerated: Uses native Blackwell instructions (cvt.rs.satfinite)</div></div>
+<div class="list-item depth-2"><span aria-hidden="true">•</span><div>Minimal overhead: Similar throughput to deterministic rounding</div></div>
+<div class="list-item depth-2"><span aria-hidden="true">•</span><div>Memory bandwidth: Requires additional random bits (uint32 per element)</div></div>
+<p>Parameters:</p>
+<div class="list-item depth-2"><span aria-hidden="true">•</span><div><code>src</code>: Source FP32 tensor</div></div>
+<div class="list-item depth-2"><span aria-hidden="true">•</span><div><code>dst_dtype</code>: Destination dtype (FP8 E5M2, FP8 E4M3FN, BF16, or FP16)</div></div>
+<div class="list-item depth-2"><span aria-hidden="true">•</span><div><code>rand_bits</code>: Random bits (uint32 tensor) for entropy, same shape as src</div></div>
+<div class="list-item depth-3"><span aria-hidden="true">•</span><div><strong>Important:</strong> Use <code>n_rounds=7</code> with <code>tl.randint4x()</code> for sufficient entropy</div></div>
+<div class="list-item depth-3"><span aria-hidden="true">•</span><div>Fewer rounds may result in biased rounding behavior</div></div>
+<div class="list-item depth-3"><span aria-hidden="true">•</span><div>Different seeds produce different rounding decisions for better statistical properties</div></div>
+<p>Example:</p>
+<pre><code class="language-python">        # Generate random bits for entropy
+        # n_rounds=7 provides sufficient randomness for unbiased stochastic rounding
+        offsets = tl.arange(0, BLOCK_SIZE // 4)
+        r0, r1, r2, r3 = tl.randint4x(seed, offsets, n_rounds=7)
+        rbits = tl.join(tl.join(r0, r1), tl.join(r2, r3)).reshape(x.shape)
+
+        # Apply stochastic rounding
+        y = tlx.stoch_round(x, tlx.dtype_of(y_ptr), rbits)</code></pre>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.vote_ballot_sync(mask, pred)</code> <strong>[sm90+]</strong></div></div>
+<p>Collects a predicate from each thread in the warp and returns a 32-bit mask where each bit represents the predicate value from the corresponding lane. Only threads specified by <code>mask</code> participate in the vote.</p>
+<pre><code>        ballot_result = tlx.vote_ballot_sync(0xFFFFFFFF, pred)</code></pre>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.warp_all(pred)</code> / <code>tlx.warp_any(pred)</code> <strong>[sm90+, gfx942+]</strong></div></div>
+<p>Reduce one distributed predicate per physical lane to a warp-uniform scalar <code>i1</code>. Non-boolean inputs are compared with zero first. <code>warp_all</code> is true only if every lane contributes true; <code>warp_any</code> is true if at least one lane contributes true.</p>
+<p>These are physical-lane votes, not logical tensor-axis reductions. <code>tl.all</code> and <code>tl.max</code> reduce a tensor dimension and retain tensor layout semantics, whereas these operations produce a scalar suitable for a uniform branch. The predicate must distribute exactly one element per lane; compilation fails if its resolved layout gives a lane zero or multiple elements.</p>
+<pre><code class="language-python">    all_safe = tlx.warp_all(per_lane_safe)
+    any_active = tlx.warp_any(per_lane_active)</code></pre>
+<p>Prefer these semantic reductions when code only needs an all/any result. They do not expose a hardware ballot bit mask.</p>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.warp_predicate(predicate, inits, body, args=(), wave_uniform=False)</code> <strong>[AMD]</strong></div></div>
+<p>Executes <code>body(*inits, *args)</code> with the hardware execution mask restricted to lanes where <code>predicate</code> is true. Active lanes receive the values returned by <code>body</code>; inactive lanes keep their corresponding values from <code>inits</code>. A single carried tensor is returned directly, while multiple carried tensors are returned as a tuple.</p>
+<p>A scalar predicate controls its physical lane. For a tensor predicate, the elements owned by each lane are OR-reduced to form that lane's execution bit. Unlike <code>tlx.warp_all</code> and <code>tlx.warp_any</code>, this does not make the predicate uniform across the wave.</p>
+<pre><code class="language-python">    @triton.jit
+    def scale_active(acc, scale):
+        return acc * scale
+
+    acc = tlx.warp_predicate(
+        active,
+        acc,
+        scale_active,
+        args=(scale,),
+    )</code></pre>
+<p><code>body</code> must be an <code>@triton.jit</code> function that returns the same number and types of tensors as <code>inits</code>. It must contain straight-line computation and no cross-wave synchronization. Reductions, dots, and layout shuffles are allowed only with <code>wave_uniform=True</code>, which asserts that every lane in a wave observes the same predicate. Cross-warp reductions, nested dynamic control flow, and other nested regions are unsupported. This operation is currently lowered only by the AMD backend.</p>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div><code>tlx.prefetch(pointer, level=&quot;L2&quot;, mask=None, tensormap=False)</code> <strong>[sm90+]</strong> issues a non-blocking prefetch hint for pointer-based scattered/gather loads. This complements <code>tlx.async_descriptor_prefetch_tensor</code> (which works on TMA tensor descriptors) by supporting raw pointer tensors.</div></div>
+<p>Additionally, if <code>tensormap</code> is specified to <code>True</code>, the API instead does a prefetch of tensor map object (TMA descriptor) and ignores other parameters other than <code>pointer</code>.</p>
+<table><thead><tr><th>Level</th><th>PTX</th><th>Description</th></tr></thead><tbody><tr><td><code>&quot;L1&quot;</code></td><td><code>prefetch.global.L1</code></td><td>Prefetch into L1 and L2 cache</td></tr><tr><td><code>&quot;L2&quot;</code></td><td><code>prefetch.global.L2</code></td><td>Prefetch into L2 cache only (default)</td></tr></tbody></table>
+<p>Example:</p>
+<pre><code class="language-python">  offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+  mask = offsets &lt; n_elements
+  tlx.prefetch(input_ptr + offsets, level=&quot;L2&quot;, mask=mask)
+  x = tl.load(input_ptr + offsets, mask=mask)
+
+  ...
+  # desc_in can be host side descriptor or device side like this:
+  desc_in = tl.make_tensor_descriptor(
+            input_ptr,
+            shape=[M, N],
+            strides=[N, 1],
+            block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_N],
+        )
+  tlx.prefetch(desc_in, tensormap=True)</code></pre>
+<h2 id="tlx-assume-uniform"><code>tlx.assume_uniform</code></h2>
+<p>Assert that a scalar holds the same value in every lane of the wave.</p>
+<pre><code class="language-python">value = tlx.assume_uniform(value)</code></pre>
+<table><thead><tr><th>Argument</th><th>Type</th><th>Description</th></tr></thead><tbody><tr><td><code>value</code></td><td>scalar pointer, or 16/32/64-bit int or float</td><td>Value asserted to be wave-uniform. Narrower types are not supported.</td></tr></tbody></table>
+<p><strong>Returns</strong>: <code>value</code>, unchanged.</p>
+<p>The main use is buffer operations, which keep their base pointer in the scalar (SGPR) resource descriptor, so it has to be wave-uniform. When the backend cannot prove that it is — most commonly because the pointer was loaded from memory — it falls back to a per-lane waterfall loop around every access. <code>tlx.assume_uniform</code> tells the backend to take uniformity as given:</p>
+<pre><code class="language-python">base = tl.load(ptr_array + gid).to(tl.pointer_type(tl.float16))
+base = tlx.assume_uniform(base)
+data = tlx.buffer_load(base, offsets)</code></pre>
+<p>Lowers to <code>amdg.assume_uniform</code>, which is eventually lowered to <code>llvm.amdgcn.readfirstlane</code> — that makes the result uniform by construction as far as LLVM's uniformity analysis is concerned. On non-AMD backends it is a no-op that returns its argument. Nothing verifies the assertion: if the value is not actually uniform, every lane silently gets lane 0's value.</p></article>
+<footer class="pager"><a href="layouts.html">← Layout control and diagnostics</a><a class="next" href="kernels.html">Kernels implemented with TLX →</a></footer>
+    </main>
+  </div>
+</body>
+</html>

@@ -1,0 +1,59 @@
+#include "triton/Dialect/Triton/IR/Dialect.h"
+
+#include <numeric>
+
+#include "cpu/include/Dialect/TritonCPU/IR/Dialect.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/IR/DialectImplementation.h"
+#include "mlir/IR/OpImplementation.h"
+#include "mlir/Transforms/DialectConversion.h"
+#include "triton/Analysis/Utility.h"
+#include "triton/Dialect/Triton/IR/Utility.h"
+#include "triton/Tools/Sys/GetEnv.h"
+#include "llvm/ADT/TypeSwitch.h"
+
+#include "cpu/include/Dialect/TritonCPU/IR/Dialect.cpp.inc"
+
+using namespace mlir;
+using namespace mlir::triton;
+using namespace mlir::triton::cpu;
+
+//===----------------------------------------------------------------------===//
+// Attribute methods
+//===----------------------------------------------------------------------===//
+#define GET_ATTRDEF_CLASSES
+#include "cpu/include/Dialect/TritonCPU/IR/TritonCPUAttrDefs.cpp.inc"
+
+/// Parse an attribute registered to this dialect.
+::mlir::Attribute
+TritonCPUDialect::parseAttribute(::mlir::DialectAsmParser &parser,
+                                 ::mlir::Type type) const {
+  llvm_unreachable("parse stub called");
+}
+
+/// Print an attribute registered to this dialect.
+void TritonCPUDialect::printAttribute(::mlir::Attribute attr,
+                                      ::mlir::DialectAsmPrinter &os) const {
+  llvm_unreachable("print stub called");
+}
+
+void TritonCPUDialect::initialize() {
+  registerTypes();
+
+  addAttributes<
+#define GET_ATTRDEF_LIST
+#include "cpu/include/Dialect/TritonCPU/IR/TritonCPUAttrDefs.cpp.inc"
+      >();
+  addOperations<
+#define GET_OP_LIST
+#include "cpu/include/Dialect/TritonCPU/IR/Ops.cpp.inc"
+#include "cpu/include/Dialect/TritonCPU/IR/OpsEnums.cpp.inc"
+      >();
+}
+
+// verify TritonCPU ops
+LogicalResult TritonCPUDialect::verifyOperationAttribute(Operation *op,
+                                                         NamedAttribute attr) {
+  // TODO: fill this.
+  return success();
+}

@@ -15,15 +15,16 @@
 #include "triton/Tools/LayoutUtils.h"
 #include "triton/Tools/LinearLayout.h"
 #include "llvm/Support/Casting.h"
-#include <pybind11/pybind11.h>
-#include <pybind11/stl.h>
-#include <pybind11/stl_bind.h>
+#include <nanobind/nanobind.h>
+#include <nanobind/stl/optional.h>
+#include <nanobind/stl/pair.h>
+#include <nanobind/stl/string.h>
+#include <nanobind/stl/vector.h>
 
-namespace py = pybind11;
+namespace py = nanobind;
 
-// Defined in ir.cc. Declared here rather than in ir.h so ir.h stays
-// pybind11-free and matches upstream; the pybind11 builder class is only
-// needed by this python-binding TU and ir.cc.
+// Defined in ir.cc. Declared here rather than in ir.h so ir.h stays free of
+// Python binding implementation details and matches upstream.
 namespace ir {
 extern py::class_<TritonOpBuilder> *getBuilderClass();
 } // namespace ir
@@ -36,6 +37,15 @@ namespace ttng = triton::nvidia_gpu;
 namespace tlx = triton::tlx;
 namespace amdgpu = triton::amdgpu;
 namespace ttag = triton::amdgpu;
+
+// Element type of a CLC (Cluster Launch Control) response buffer. A CLC
+// response is a 16-byte opaque hardware object, so each stage is stored as one
+// `ui128`. Single source of truth: both `create_alloc_clc_responses` and the
+// `get_clc_response_element_ty` binding used by `tlx.clc_response_type.to_ir()`
+// go through here so the allocation and the frontend type can never diverge.
+static mlir::Type getCLCResponseElementType(mlir::OpBuilder &builder) {
+  return builder.getIntegerType(128, /*signed=*/false);
+}
 
 // Construct a CGAEncodingAttr from legacy (CTAsPerCGA, CTASplitNum, CTAOrder)
 // params. The single-CTA case must go through get1CTALayout: feeding all-1
@@ -75,7 +85,23 @@ makeCGALayoutFromBases(mlir::MLIRContext *ctx,
                                    tt::LinearLayout(std::move(bases), outDims));
 }
 
-void init_triton_tlx_ir(py::module &&m) {
+// Memdesc view ops must infer their result from the concrete shared layout,
+// not from a TLX wrapper carrying the user pin. Bridge the source to that
+// concrete encoding while retaining the pin on the allocation itself.
+static Value materializeConcreteMemDesc(TritonOpBuilder &builder, Value value) {
+  auto type = cast<ttg::MemDescType>(value.getType());
+  Attribute encoding = type.getEncoding();
+  Attribute concrete = tlx::getEffectiveEncoding(encoding);
+  if (concrete == encoding)
+    return value;
+
+  auto concreteType = ttg::MemDescType::get(
+      type.getShape(), type.getElementType(), concrete, type.getMemorySpace(),
+      type.getMutableMemory(), type.getAllocShape());
+  return builder.create<tlx::RequireLayoutOp>(concreteType, value);
+}
+
+void init_triton_tlx_ir(py::module_ &m) {
   auto *builder_cls = ir::getBuilderClass();
   builder_cls
       ->def(
@@ -103,6 +129,7 @@ void init_triton_tlx_ir(py::module &&m) {
            [](TritonOpBuilder &self, Value localAlloc,
               std::vector<int32_t> offsets,
               std::vector<int64_t> newShape) -> mlir::Value {
+             localAlloc = materializeConcreteMemDesc(self, localAlloc);
              auto localAllocType = cast<ttg::MemDescType>(localAlloc.getType());
              auto localAllocShape = localAllocType.getShape();
              assert(localAllocShape.size() == offsets.size() &&
@@ -118,6 +145,24 @@ void init_triton_tlx_ir(py::module &&m) {
 
              return self.create<ttg::MemDescSubsliceOp>(memDescType, localAlloc,
                                                         offsets);
+           })
+      .def("create_memdesc_dynamic_subslice",
+           [](TritonOpBuilder &self, Value localAlloc,
+              std::vector<Value> offsets,
+              std::vector<int64_t> newShape) -> mlir::Value {
+             auto localAllocType = cast<ttg::MemDescType>(localAlloc.getType());
+             auto localAllocShape = localAllocType.getShape();
+             if (localAllocShape.size() != offsets.size() ||
+                 localAllocShape.size() != newShape.size())
+               throw std::runtime_error(
+                   "dynamic subslice offsets and shape must match source rank");
+             auto memDescType = ttg::MemDescType::get(
+                 newShape, localAllocType.getElementType(),
+                 localAllocType.getEncoding(), localAllocType.getMemorySpace(),
+                 /*mutableMemory=*/localAllocType.getMutableMemory(),
+                 localAllocType.getAllocShape());
+             return self.create<ttg::MemDescDynamicSubsliceOp>(
+                 memDescType, localAlloc, offsets);
            })
       .def("create_amd_extract_slice",
            [](TritonOpBuilder &self, Value source, std::vector<int64_t> shape,
@@ -157,6 +202,14 @@ void init_triton_tlx_ir(py::module &&m) {
              return self.create<amdgpu::RegisterResidentOp>(
                  input.getType(), input, registerClassAttr,
                  registersPerGroupAttr);
+           })
+      .def("create_amd_register_handoff",
+           [](TritonOpBuilder &self, Value input,
+              const std::string &registerClass) -> Value {
+             auto registerClassAttr =
+                 self.getBuilder().getStringAttr(registerClass);
+             return self.create<amdgpu::RegisterHandoffOp>(
+                 input.getType(), input, registerClassAttr);
            })
       .def("create_amd_mfma_commit",
            [](TritonOpBuilder &self,
@@ -246,7 +299,14 @@ void init_triton_tlx_ir(py::module &&m) {
       .def("create_release_layout",
            [](TritonOpBuilder &self, Value &v) -> Value {
              if (auto type = dyn_cast<RankedTensorType>(v.getType())) {
-               assert(type.getEncoding() && "Expect layout encoding");
+               auto parentFunc =
+                   v.getParentRegion()->getParentOfType<tt::FuncOp>();
+               bool hasDeferredHelperLayout =
+                   v.getDefiningOp<tt::CallOp>() ||
+                   (parentFunc && parentFunc.getSymVisibility() == "private");
+               if (!type.getEncoding() && !hasDeferredHelperLayout)
+                 throw std::runtime_error(
+                     "release_layout requires an explicit source layout");
                auto newType = RankedTensorType::get(type.getShape(),
                                                     type.getElementType());
                return self.create<tlx::ReleaseLayoutOp>(newType, v);
@@ -310,7 +370,7 @@ void init_triton_tlx_ir(py::module &&m) {
             return self.create<ttg::LocalLoadOp>(newType, subView,
                                                  asyncToken.value_or(Value()));
           },
-          py::arg("subView"), py::arg("asyncToken"),
+          py::arg("subView"), py::arg("asyncToken").none(),
           py::arg("layoutEncoding") = std::nullopt)
       .def("create_local_store",
            [](TritonOpBuilder &self, Value &dst, Value &regValues) -> void {
@@ -538,6 +598,26 @@ void init_triton_tlx_ir(py::module &&m) {
                                                  versionMinor, warpsPerCTA,
                                                  CTALayout, instrShape)));
            })
+      .def("make_amd_wmma_encoding_attr",
+           [](TritonOpBuilder &self, unsigned version, bool transposed,
+              std::vector<std::vector<int32_t>> &warpBases,
+              std::vector<std::vector<int32_t>> &regBases,
+              std::vector<unsigned> &instrShape, unsigned rank) -> Attribute {
+             auto ctx = self.getBuilder().getContext();
+             auto kReg = mlir::StringAttr::get(ctx, "register");
+             auto kWarp = mlir::StringAttr::get(ctx, "warp");
+             auto ctaLayout =
+                 tt::LinearLayout({{kReg, regBases}, {kWarp, warpBases}},
+                                  tt::standardOutDimNames(ctx, rank));
+             auto cgaLayout = ttg::CGAEncodingAttr::get1CTALayout(ctx, rank);
+             return mlir::cast<Attribute>(ttg::AMDWmmaEncodingAttr::get(
+                 ctx, version, ctaLayout, transposed, cgaLayout, instrShape));
+           })
+      .def(
+          "make_i32_array_attr",
+          [](TritonOpBuilder &self, std::vector<int32_t> &values) -> Attribute {
+            return self.getBuilder().getDenseI32ArrayAttr(values);
+          })
       .def("make_dot_operand_encoding_attr",
            [](TritonOpBuilder &self, Value opnd, unsigned opIdx,
               Attribute parentEnc) -> Attribute {
@@ -577,6 +657,29 @@ void init_triton_tlx_ir(py::module &&m) {
                  context, version, warpsPerCta, instrShape, transposed,
                  cgaLayout, tilesPerWarp, elementBitWidth));
            })
+      .def(
+          "make_slice_encoding_attr",
+          [](TritonOpBuilder &self, unsigned dim,
+             Attribute parentEnc) -> Attribute {
+            auto context = self.getBuilder().getContext();
+            auto parent = dyn_cast<ttg::DistributedEncodingTrait>(parentEnc);
+            auto parentLayout = dyn_cast<ttg::LayoutEncodingTrait>(parentEnc);
+            if (!parent || !parentLayout)
+              throw std::runtime_error(
+                  "make_slice_encoding_attr: parent must be a ranked "
+                  "distributed layout");
+            unsigned rank = parentLayout.getRank();
+            if (rank <= 1)
+              throw std::runtime_error(
+                  "make_slice_encoding_attr: parent layout must have at "
+                  "least rank >= 2");
+            if (dim >= rank)
+              throw std::runtime_error(
+                  "make_slice_encoding_attr: slice dim=" + std::to_string(dim) +
+                  " must be less than the parent rank=" + std::to_string(rank));
+            return mlir::cast<Attribute>(
+                ttg::SliceEncodingAttr::get(context, dim, parent));
+          })
       .def("make_linear_encoding_attr",
            [](TritonOpBuilder &self, std::vector<std::vector<int>> regBases,
               std::vector<std::vector<int>> laneBases,
@@ -595,8 +698,14 @@ void init_triton_tlx_ir(py::module &&m) {
                                    {kBlock, std::vector<std::vector<int>>{}}},
                                   outDims,
                                   /*requiresSurjective=*/true);
-             return tlx::wrapNoVerifyLayout(mlir::cast<Attribute>(
-                 ttg::LinearEncodingAttr::get(context, std::move(ll))));
+             Attribute encoding =
+                 ttg::isPermutationMatrixLayout(ll)
+                     ? mlir::cast<Attribute>(
+                           ttg::LinearEncodingAttr::get(context, std::move(ll)))
+                     : mlir::cast<Attribute>(
+                           ttg::GenericLinearEncodingAttr::get(context,
+                                                               std::move(ll)));
+             return tlx::wrapNoVerifyLayout(encoding);
            })
       .def("make_dummy_register_layout_attr",
            [](TritonOpBuilder &self, std::vector<int64_t> shape,
@@ -699,26 +808,31 @@ void init_triton_tlx_ir(py::module &&m) {
               Value pred) -> void {
              self.create<ttng::WaitBarrierOp>(mbarrerLoc, phase, pred);
            })
-      .def("create_barrier_arrive",
-           [](TritonOpBuilder &self, Value mbarrerLoc, int arriveCount,
-              std::optional<Value> pred) -> void {
-             if (pred.has_value())
-               self.create<ttng::ArriveBarrierOp>(mbarrerLoc, arriveCount,
-                                                  pred.value());
-             else
-               self.create<ttng::ArriveBarrierOp>(mbarrerLoc, arriveCount);
-           })
-      .def("create_warp_barrier_arrive",
-           [](TritonOpBuilder &self, Value mbarrierLoc, int arriveCount,
-              std::optional<Value> pred) -> void {
-             if (pred.has_value())
-               self.create<ttng::ArriveBarrierOp>(mbarrierLoc, arriveCount,
-                                                  pred.value(),
-                                                  /*perThread=*/true);
-             else
-               self.create<ttng::ArriveBarrierOp>(mbarrierLoc, arriveCount,
-                                                  /*perThread=*/true);
-           })
+      .def(
+          "create_barrier_arrive",
+          [](TritonOpBuilder &self, Value mbarrerLoc, int arriveCount,
+             std::optional<Value> pred) -> void {
+            if (pred.has_value())
+              self.create<ttng::ArriveBarrierOp>(mbarrerLoc, arriveCount,
+                                                 pred.value());
+            else
+              self.create<ttng::ArriveBarrierOp>(mbarrerLoc, arriveCount);
+          },
+          py::arg("mbarrerLoc"), py::arg("arriveCount"), py::arg("pred").none())
+      .def(
+          "create_warp_barrier_arrive",
+          [](TritonOpBuilder &self, Value mbarrierLoc, int arriveCount,
+             std::optional<Value> pred) -> void {
+            if (pred.has_value())
+              self.create<ttng::ArriveBarrierOp>(mbarrierLoc, arriveCount,
+                                                 pred.value(),
+                                                 /*perThread=*/true);
+            else
+              self.create<ttng::ArriveBarrierOp>(mbarrierLoc, arriveCount,
+                                                 /*perThread=*/true);
+          },
+          py::arg("mbarrierLoc"), py::arg("arriveCount"),
+          py::arg("pred").none())
       .def("create_named_barrier_wait",
            [](TritonOpBuilder &self, Value barrier, Value numThreads) -> void {
              self.create<ttng::NamedBarrierWaitOp>(barrier, numThreads);
@@ -729,7 +843,14 @@ void init_triton_tlx_ir(py::module &&m) {
            })
       .def("create_amd_sched_barrier",
            [](TritonOpBuilder &self, int32_t mask) {
-             self.create<ROCDL::SchedBarrier>(mask);
+             self.create<ROCDL::SchedBarrier>(
+                 static_cast<ROCDL::SchedGroupMask>(mask));
+           })
+      .def("create_warp_vote",
+           [](TritonOpBuilder &self, Value pred,
+              const std::string &kind) -> mlir::Value {
+             return self.create<ttg::WarpVoteOp>(
+                 pred, self.getBuilder().getStringAttr(kind));
            })
       .def("create_barrier_expect",
            [](TritonOpBuilder &self, Value mbarrerLoc, int expectBytes,
@@ -745,24 +866,26 @@ void init_triton_tlx_ir(py::module &&m) {
            [](TritonOpBuilder &self) -> void {
              self.create<ttng::FenceMBarrierInitReleaseClusterOp>();
            })
-      .def("create_tmem_alloc",
-           [](TritonOpBuilder &self, std::vector<int64_t> shape,
-              Type &elementType, Attribute &encoding,
-              std::optional<Value> alias,
-              std::optional<Value> storageAlias) -> mlir::Value {
-             auto context = self.getBuilder().getContext();
-             auto memorySpace = ttng::TensorMemorySpaceAttr::get(context);
-             auto memDesc =
-                 ttg::MemDescType::get(shape, elementType, encoding,
-                                       memorySpace, /*mutableMemory=*/true);
-             if (alias)
-               return self.create<tlx::LocalAliasOp>(memDesc, *alias);
-             else if (storageAlias)
-               return self.create<tlx::StorageAliasLocalAllocOp>(memDesc,
-                                                                 *storageAlias);
-             else
-               return self.create<ttng::TMEMAllocOp>(memDesc, nullptr);
-           })
+      .def(
+          "create_tmem_alloc",
+          [](TritonOpBuilder &self, std::vector<int64_t> shape,
+             Type &elementType, Attribute &encoding, std::optional<Value> alias,
+             std::optional<Value> storageAlias) -> mlir::Value {
+            auto context = self.getBuilder().getContext();
+            auto memorySpace = ttng::TensorMemorySpaceAttr::get(context);
+            auto memDesc =
+                ttg::MemDescType::get(shape, elementType, encoding, memorySpace,
+                                      /*mutableMemory=*/true);
+            if (alias)
+              return self.create<tlx::LocalAliasOp>(memDesc, *alias);
+            else if (storageAlias)
+              return self.create<tlx::StorageAliasLocalAllocOp>(memDesc,
+                                                                *storageAlias);
+            else
+              return self.create<ttng::TMEMAllocOp>(memDesc, nullptr);
+          },
+          py::arg("shape"), py::arg("elementType"), py::arg("encoding"),
+          py::arg("alias").none(), py::arg("storageAlias").none())
       .def(
           "create_tmem_load",
           [](TritonOpBuilder &self, Value subView, Attribute &layoutEncoding,
@@ -794,8 +917,8 @@ void init_triton_tlx_ir(py::module &&m) {
                                                subView);
             return loadOp;
           },
-          py::arg("subView"), py::arg("layoutEncoding"), py::arg("asyncToken"),
-          py::arg("userLayout") = false)
+          py::arg("subView"), py::arg("layoutEncoding"),
+          py::arg("asyncToken").none(), py::arg("userLayout") = false)
       .def("create_tmem_store",
            [](TritonOpBuilder &self, Value &dst, Value &src) -> void {
              Value pred = self.create<arith::ConstantIntOp>(1, 1);
@@ -815,41 +938,50 @@ void init_triton_tlx_ir(py::module &&m) {
              assert(size > 0 && size <= dimN - offset && "Invalid size");
              return self.create<ttng::TMEMSubSliceOp>(src, offset, size);
            })
-      .def("create_tcgen5_dot",
-           [](TritonOpBuilder &self, mlir::Value &a, mlir::Value &b,
-              mlir::Value &d, std::optional<Value> useD,
-              std::optional<Value> pred, bool twoCTAs,
-              std::vector<Value> mBarriers, bool isAsync) -> void {
-             Value predTrue = self.create<arith::ConstantIntOp>(1, 1);
-             std::vector<Value> barrierPreds(mBarriers.size(), predTrue);
-             auto tokType = self.getBuilder().getType<ttg::AsyncTokenType>();
-             self.create<ttng::TCGen5MMAOp>(
-                 tokType, a, b, d, Value(),
-                 useD.has_value() ? useD.value() : predTrue /*useD*/,
-                 pred.has_value() ? pred.value() : predTrue /*pred*/, twoCTAs,
-                 /*multicast=*/false, ValueRange(mBarriers),
-                 ValueRange(barrierPreds), isAsync);
-           })
-      .def("create_tcgen5_dot_scaled",
-           [](TritonOpBuilder &self, Value a, Value b, Value d, Value aScale,
-              Value bScale, tt::ScaleDotElemType aType,
-              tt::ScaleDotElemType bType, std::optional<Value> useD,
-              std::optional<Value> pred, bool twoCTAs,
-              std::vector<Value> mBarriers, bool isAsync) -> void {
-             Value predTrue = self.create<arith::ConstantIntOp>(1, 1);
-             std::vector<Value> barrierPreds(mBarriers.size(), predTrue);
-             auto tokType = self.getBuilder().getType<ttg::AsyncTokenType>();
-             // assert aScale and bScale are in either smem or tmem
-             assert(isa<ttg::MemDescType>(aScale.getType()) &&
-                    "Expect MemDescType for aScale");
-             assert(isa<ttg::MemDescType>(bScale.getType()) &&
-                    "Expect MemDescType for bScale");
-             self.create<ttng::TCGen5MMAScaledOp>(
-                 tokType, a, b, d, Value(), aScale, bScale, aType, bType,
-                 useD.has_value() ? useD.value() : predTrue /*useD*/,
-                 pred.has_value() ? pred.value() : predTrue /*pred*/, twoCTAs,
-                 ValueRange(mBarriers), ValueRange(barrierPreds), isAsync);
-           })
+      .def(
+          "create_tcgen5_dot",
+          [](TritonOpBuilder &self, mlir::Value &a, mlir::Value &b,
+             mlir::Value &d, std::optional<Value> useD,
+             std::optional<Value> pred, bool twoCTAs,
+             std::vector<Value> mBarriers, bool isAsync) -> void {
+            Value predTrue = self.create<arith::ConstantIntOp>(1, 1);
+            std::vector<Value> barrierPreds(mBarriers.size(), predTrue);
+            auto tokType = self.getBuilder().getType<ttg::AsyncTokenType>();
+            self.create<ttng::TCGen5MMAOp>(
+                tokType, a, b, d, Value(),
+                useD.has_value() ? useD.value() : predTrue /*useD*/,
+                pred.has_value() ? pred.value() : predTrue /*pred*/, twoCTAs,
+                /*multicast=*/false, ValueRange(mBarriers),
+                ValueRange(barrierPreds), isAsync);
+          },
+          py::arg("a"), py::arg("b"), py::arg("d"), py::arg("useD").none(),
+          py::arg("pred").none(), py::arg("twoCTAs"), py::arg("mBarriers"),
+          py::arg("isAsync"))
+      .def(
+          "create_tcgen5_dot_scaled",
+          [](TritonOpBuilder &self, Value a, Value b, Value d, Value aScale,
+             Value bScale, tt::ScaleDotElemType aType,
+             tt::ScaleDotElemType bType, std::optional<Value> useD,
+             std::optional<Value> pred, bool twoCTAs,
+             std::vector<Value> mBarriers, bool isAsync) -> void {
+            Value predTrue = self.create<arith::ConstantIntOp>(1, 1);
+            std::vector<Value> barrierPreds(mBarriers.size(), predTrue);
+            auto tokType = self.getBuilder().getType<ttg::AsyncTokenType>();
+            // assert aScale and bScale are in either smem or tmem
+            assert(isa<ttg::MemDescType>(aScale.getType()) &&
+                   "Expect MemDescType for aScale");
+            assert(isa<ttg::MemDescType>(bScale.getType()) &&
+                   "Expect MemDescType for bScale");
+            self.create<ttng::TCGen5MMAScaledOp>(
+                tokType, a, b, d, Value(), aScale, bScale, aType, bType,
+                useD.has_value() ? useD.value() : predTrue /*useD*/,
+                pred.has_value() ? pred.value() : predTrue /*pred*/, twoCTAs,
+                ValueRange(mBarriers), ValueRange(barrierPreds), isAsync);
+          },
+          py::arg("a"), py::arg("b"), py::arg("d"), py::arg("aScale"),
+          py::arg("bScale"), py::arg("aType"), py::arg("bType"),
+          py::arg("useD").none(), py::arg("pred").none(), py::arg("twoCTAs"),
+          py::arg("mBarriers"), py::arg("isAsync"))
       .def("create_tcgen05_commit",
            [](TritonOpBuilder &self, Value &barrier, Value &pred) -> void {
              self.create<ttng::TCGen5CommitOp>(barrier, pred,
@@ -865,32 +997,51 @@ void init_triton_tlx_ir(py::module &&m) {
               unsigned pendings) -> mlir::Value {
              return self.create<ttg::AsyncWaitOp>(asyncTokens, pendings);
            })
-      .def("create_async_tdm_copy_global_to_local",
-           [](TritonOpBuilder &self, Value desc, Value result,
-              std::optional<Value> barrier) -> mlir::Value {
-             // The op is now pure: tile offsets and predicate are applied to
-             // the descriptor beforehand via create_update_tensor_descriptor.
-             return self.create<amdgpu::AsyncTDMCopyGlobalToLocalOp>(
-                 desc, result, barrier.value_or(Value()));
-           })
-      .def("create_async_tdm_copy_local_to_global",
-           [](TritonOpBuilder &self, Value desc, Value src,
-              std::optional<Value> barrier) {
-             self.create<amdgpu::AsyncTDMCopyLocalToGlobalOp>(
-                 desc, src, barrier.value_or(Value()));
-           })
-      .def("create_update_tensor_descriptor",
-           [](TritonOpBuilder &self, Value desc, std::vector<Value> addOffsets,
-              std::vector<Value> setBounds, std::optional<Value> pred,
-              bool clampBounds) -> Value {
-             Value res = self.create<amdgpu::UpdateTensorDescriptorOp>(
-                 desc.getType(), desc, ValueRange(addOffsets),
-                 ValueRange(setBounds), pred.value_or(Value()));
-             if (clampBounds)
-               res.getDefiningOp()->setAttr("clamp_bounds",
-                                            self.getBuilder().getUnitAttr());
-             return res;
-           })
+      .def(
+          "create_async_tdm_copy_global_to_local",
+          [](TritonOpBuilder &self, Value desc, Value result,
+             std::optional<Value> barrier) -> mlir::Value {
+            // The op is now pure: tile offsets and predicate are applied to
+            // the descriptor beforehand via create_update_tensor_descriptor.
+            return self.create<amdgpu::AsyncTDMCopyGlobalToLocalOp>(
+                desc, result, barrier.value_or(Value()));
+          },
+          py::arg("desc"), py::arg("result"), py::arg("barrier").none())
+      .def(
+          "create_async_tdm_fused_copy_global_to_local",
+          [](TritonOpBuilder &self, std::vector<Value> descs,
+             std::vector<Value> dests, std::vector<int32_t> warpUsedHints,
+             tt::CacheModifier cacheModifier) -> mlir::Value {
+            auto tokenType = self.getBuilder().getType<ttg::AsyncTokenType>();
+            auto hints = self.getBuilder().getDenseI32ArrayAttr(warpUsedHints);
+            return self.create<amdgpu::AsyncTDMFusedCopyGlobalToLocalOp>(
+                tokenType, descs, dests, hints, cacheModifier);
+          },
+          py::arg("descs"), py::arg("dests"), py::arg("warpUsedHints"),
+          py::arg("cacheModifier") = tt::CacheModifier::NONE)
+      .def(
+          "create_async_tdm_copy_local_to_global",
+          [](TritonOpBuilder &self, Value desc, Value src,
+             std::optional<Value> barrier) {
+            self.create<amdgpu::AsyncTDMCopyLocalToGlobalOp>(
+                desc, src, barrier.value_or(Value()));
+          },
+          py::arg("desc"), py::arg("src"), py::arg("barrier").none())
+      .def(
+          "create_update_tensor_descriptor",
+          [](TritonOpBuilder &self, Value desc, std::vector<Value> addOffsets,
+             std::vector<Value> setBounds, std::optional<Value> pred,
+             bool clampBounds) -> Value {
+            Value res = self.create<amdgpu::UpdateTensorDescriptorOp>(
+                desc.getType(), desc, ValueRange(addOffsets),
+                ValueRange(setBounds), pred.value_or(Value()));
+            if (clampBounds)
+              res.getDefiningOp()->setAttr("clamp_bounds",
+                                           self.getBuilder().getUnitAttr());
+            return res;
+          },
+          py::arg("desc"), py::arg("addOffsets"), py::arg("setBounds"),
+          py::arg("pred").none(), py::arg("clampBounds"))
       .def("create_tdm_prefetch",
            [](TritonOpBuilder &self, Value desc, std::vector<Value> indices,
               Value pred, bool speculative) {
@@ -918,7 +1069,8 @@ void init_triton_tlx_ir(py::module &&m) {
       .def("create_memdesc_reshape",
            [](TritonOpBuilder &self, Value &src,
               std::vector<int64_t> shape) -> mlir::Value {
-             return self.create<ttg::MemDescReshapeOp>(src, shape);
+             Value reshapeSrc = materializeConcreteMemDesc(self, src);
+             return self.create<ttg::MemDescReshapeOp>(reshapeSrc, shape);
            })
       .def(
           "create_memdesc_reinterpret",
@@ -954,60 +1106,64 @@ void init_triton_tlx_ir(py::module &&m) {
              return ttg::MemDescType::get(shape, elementType, encoding,
                                           memorySpace, /*mutableMemory=*/true);
            })
-      .def("create_local_alloc",
-           [](TritonOpBuilder &self, std::vector<int64_t> shape,
-              Type &elementType, Attribute &encoding,
-              std::optional<Value> alias,
-              std::optional<Value> storageAlias) -> mlir::Value {
-             auto context = self.getBuilder().getContext();
-             auto memorySpace = ttg::SharedMemorySpaceAttr::get(context);
-             auto memDesc =
-                 ttg::MemDescType::get(shape, elementType, encoding,
-                                       memorySpace, /*mutableMemory=*/true);
-             if (alias)
-               return self.create<tlx::LocalAliasOp>(memDesc, *alias);
-             else if (storageAlias)
-               return self.create<tlx::StorageAliasLocalAllocOp>(memDesc,
-                                                                 *storageAlias);
-             else
-               return self.create<ttg::LocalAllocOp>(memDesc);
-           })
-      .def("create_storage_alias_spec",
-           [](TritonOpBuilder &self, const std::string &storage,
-              std::optional<int64_t> bufferSizeBytes) -> mlir::Value {
-             auto context = self.getBuilder().getContext();
+      .def(
+          "create_local_alloc",
+          [](TritonOpBuilder &self, std::vector<int64_t> shape,
+             Type &elementType, Attribute &encoding, std::optional<Value> alias,
+             std::optional<Value> storageAlias) -> mlir::Value {
+            auto context = self.getBuilder().getContext();
+            auto memorySpace = ttg::SharedMemorySpaceAttr::get(context);
+            auto memDesc =
+                ttg::MemDescType::get(shape, elementType, encoding, memorySpace,
+                                      /*mutableMemory=*/true);
+            if (alias)
+              return self.create<tlx::LocalAliasOp>(memDesc, *alias);
+            else if (storageAlias)
+              return self.create<tlx::StorageAliasLocalAllocOp>(memDesc,
+                                                                *storageAlias);
+            else
+              return self.create<ttg::LocalAllocOp>(memDesc);
+          },
+          py::arg("shape"), py::arg("elementType"), py::arg("encoding"),
+          py::arg("alias").none(), py::arg("storageAlias").none())
+      .def(
+          "create_storage_alias_spec",
+          [](TritonOpBuilder &self, const std::string &storage,
+             std::optional<int64_t> bufferSizeBytes) -> mlir::Value {
+            auto context = self.getBuilder().getContext();
 
-             // Parse storage kind (smemCluster is not allowed)
-             tlx::StorageKind storageKind;
-             if (storage == "smem") {
-               storageKind = tlx::StorageKind::smem;
-             } else if (storage == "tmem") {
-               storageKind = tlx::StorageKind::tmem;
-             } else if (storage == "smemCluster") {
-               throw std::invalid_argument("smemCluster storage is not "
-                                           "supported for storage_alias_spec");
-             } else {
-               throw std::invalid_argument("Unknown storage type: " + storage);
-             }
+            // Parse storage kind (smemCluster is not allowed)
+            tlx::StorageKind storageKind;
+            if (storage == "smem") {
+              storageKind = tlx::StorageKind::smem;
+            } else if (storage == "tmem") {
+              storageKind = tlx::StorageKind::tmem;
+            } else if (storage == "smemCluster") {
+              throw std::invalid_argument("smemCluster storage is not "
+                                          "supported for storage_alias_spec");
+            } else {
+              throw std::invalid_argument("Unknown storage type: " + storage);
+            }
 
-             // Create the result type
-             auto resultType = tlx::StorageAliasSpecType::get(
-                 context, storageKind, bufferSizeBytes);
+            // Create the result type
+            auto resultType = tlx::StorageAliasSpecType::get(
+                context, storageKind, bufferSizeBytes);
 
-             // Create the attributes
-             auto storageAttr = tlx::StorageKindAttr::get(context, storageKind);
-             mlir::IntegerAttr bufferSizeAttr = nullptr;
-             if (bufferSizeBytes) {
-               bufferSizeAttr =
-                   self.getBuilder().getI64IntegerAttr(*bufferSizeBytes);
-             }
-             // buffer_shape is computed by the StorageAliasSizeDefinition pass
-             mlir::DenseI64ArrayAttr bufferShapeAttr = nullptr;
+            // Create the attributes
+            auto storageAttr = tlx::StorageKindAttr::get(context, storageKind);
+            mlir::IntegerAttr bufferSizeAttr = nullptr;
+            if (bufferSizeBytes) {
+              bufferSizeAttr =
+                  self.getBuilder().getI64IntegerAttr(*bufferSizeBytes);
+            }
+            // buffer_shape is computed by the StorageAliasSizeDefinition pass
+            mlir::DenseI64ArrayAttr bufferShapeAttr = nullptr;
 
-             // Create the operation
-             return self.create<tlx::StorageAliasSpecOp>(
-                 resultType, storageAttr, bufferSizeAttr, bufferShapeAttr);
-           })
+            // Create the operation
+            return self.create<tlx::StorageAliasSpecOp>(
+                resultType, storageAttr, bufferSizeAttr, bufferShapeAttr);
+          },
+          py::arg("storage"), py::arg("bufferSizeBytes").none())
       .def("create_reuse_group",
            [](TritonOpBuilder &self, const std::vector<mlir::Value> &elements,
               const std::string &groupKind, int64_t groupSize) -> mlir::Value {
@@ -1054,14 +1210,25 @@ void init_triton_tlx_ir(py::module &&m) {
              // This links the storage_alias_spec to the reuse_group tree
              self.create<tlx::SetBufferOverlapOp>(storageAliasSpec, overlapDef);
            })
+      // The element type of a CLC response buffer. A CLC response is a 16-byte
+      // opaque hardware object, so it is stored as one `ui128` per stage. This
+      // is exposed to Python so that `tlx.clc_response_type.to_ir()` rebuilds
+      // the exact same memdesc type as `create_alloc_clc_responses` below --
+      // any divergence only shows up when a CLC context crosses a `tt.call`
+      // (a CLC context passed into a @triton.jit helper), where the callee's
+      // parameter type is rebuilt from the frontend type and TTIR verification
+      // then fails with a `tt.call` operand type mismatch.
+      .def("get_clc_response_element_ty",
+           [](TritonOpBuilder &self) -> Type {
+             return getCLCResponseElementType(self.getBuilder());
+           })
       .def("create_alloc_clc_responses",
            [](TritonOpBuilder &self, int numResponses,
               Attribute clcResEncoding) -> mlir::Value {
              auto context = self.getBuilder().getContext();
              auto memorySpace = ttg::SharedMemorySpaceAttr::get(context);
              auto memDescType = ttg::MemDescType::get(
-                 {numResponses},
-                 self.getBuilder().getIntegerType(128, /*signed=*/false),
+                 {numResponses}, getCLCResponseElementType(self.getBuilder()),
                  clcResEncoding, memorySpace, /*mutableMemory=*/true);
 
              mlir::Value bufferViews =
@@ -1153,12 +1320,14 @@ void init_triton_tlx_ir(py::module &&m) {
              self.create<ttng::AsyncTMAPrefetchOp>(desc, coord, pred,
                                                    evictionPolicy);
            })
-      .def("create_prefetch",
-           [](TritonOpBuilder &self, Value ptr, std::optional<Value> mask,
-              CacheModifier cache) -> void {
-             Value maskVal = mask.has_value() ? mask.value() : Value();
-             self.create<ttng::PrefetchOp>(ptr, maskVal, cache);
-           })
+      .def(
+          "create_prefetch",
+          [](TritonOpBuilder &self, Value ptr, std::optional<Value> mask,
+             CacheModifier cache) -> void {
+            Value maskVal = mask.has_value() ? mask.value() : Value();
+            self.create<ttng::PrefetchOp>(ptr, maskVal, cache);
+          },
+          py::arg("ptr"), py::arg("mask").none(), py::arg("cache"))
       .def("create_prefetch_tensormap",
            [](TritonOpBuilder &self, Value desc) -> void {
              self.create<ttng::PrefetchTensormapOp>(desc);
@@ -1193,21 +1362,27 @@ void init_triton_tlx_ir(py::module &&m) {
              self.create<ttng::FenceOp>(
                  StringAttr::get(self.getContext(), scope));
            }) // Warp specialize ops
-      .def("create_warp_specialize_op",
-           [](TritonOpBuilder &self, std::vector<int> partitionNumWarps,
-              std::optional<std::vector<int>> requestedRegisters,
-              int numPartitionRegions,
-              std::optional<std::vector<int>> warpGroupStartIds)
-               -> ttg::WarpSpecializeOp {
-             ArrayRef<Type> dummyTypes;
-             auto wsOp = self.create<ttg::WarpSpecializeOp>(
-                 dummyTypes, partitionNumWarps, numPartitionRegions);
+      .def(
+          "create_warp_specialize_op",
+          [](TritonOpBuilder &self, std::vector<int> partitionNumWarps,
+             std::optional<std::vector<int>> requestedRegisters,
+             std::optional<int> defaultRequestedRegisters,
+             int numPartitionRegions,
+             std::optional<std::vector<int>> warpGroupStartIds)
+              -> ttg::WarpSpecializeOp {
+            ArrayRef<Type> dummyTypes;
+            auto wsOp = self.create<ttg::WarpSpecializeOp>(
+                dummyTypes, partitionNumWarps, numPartitionRegions);
 
-             wsOp.setRequestedRegisters(requestedRegisters);
-             wsOp.setWarpGroupStartIds(warpGroupStartIds);
+            wsOp.setRequestedRegisters(requestedRegisters);
+            wsOp.setDefaultRequestedRegisters(defaultRequestedRegisters);
+            wsOp.setWarpGroupStartIds(warpGroupStartIds);
 
-             return wsOp;
-           })
+            return wsOp;
+          },
+          py::arg("partitionNumWarps"), py::arg("requestedRegisters").none(),
+          py::arg("defaultRequestedRegisters").none(),
+          py::arg("numPartitionRegions"), py::arg("warpGroupStartIds").none())
       .def("create_warp_yield_op",
            [](TritonOpBuilder &self) -> void {
              self.create<ttg::WarpYieldOp>(ValueRange{});
@@ -1216,18 +1391,39 @@ void init_triton_tlx_ir(py::module &&m) {
            [](TritonOpBuilder &self) -> void {
              self.create<ttg::WarpReturnOp>();
            })
-      .def("create_async_load",
-           [](TritonOpBuilder &self, Value ptrTensor, Value result,
-              std::optional<Value> mask, std::optional<Value> other,
-              CacheModifier cacheModifier, EvictionPolicy evictionPolicy,
-              bool isVolatile, std::optional<Value> bulkSize,
-              std::optional<Value> barrier, bool useBulk) -> mlir::Value {
-             return self.create<ttg::AsyncCopyGlobalToLocalOp>(
-                 ptrTensor, result, mask.value_or(Value()),
-                 other.value_or(Value()), bulkSize.value_or(Value()),
-                 barrier.value_or(Value()), cacheModifier, evictionPolicy,
-                 isVolatile, useBulk);
+      .def(
+          "create_warp_predicate_op",
+          [](TritonOpBuilder &self, std::vector<Type> &resultTypes,
+             Value predicate, std::vector<Value> &inits,
+             bool waveUniform) -> Operation * {
+            UnitAttr waveUniformAttr =
+                waveUniform ? self.getBuilder().getUnitAttr() : UnitAttr();
+            return self.create<ttg::WarpPredicateOp>(resultTypes, predicate,
+                                                     inits, waveUniformAttr);
+          },
+          py::rv_policy::reference)
+      .def("create_predicate_yield_op",
+           [](TritonOpBuilder &self, std::vector<Value> &values) -> void {
+             self.create<ttg::PredicateYieldOp>(values);
            })
+      .def(
+          "create_async_load",
+          [](TritonOpBuilder &self, Value ptrTensor, Value result,
+             std::optional<Value> mask, std::optional<Value> other,
+             CacheModifier cacheModifier, EvictionPolicy evictionPolicy,
+             bool isVolatile, std::optional<Value> bulkSize,
+             std::optional<Value> barrier, bool useBulk) -> mlir::Value {
+            return self.create<ttg::AsyncCopyGlobalToLocalOp>(
+                ptrTensor, result, mask.value_or(Value()),
+                other.value_or(Value()), bulkSize.value_or(Value()),
+                barrier.value_or(Value()), cacheModifier, evictionPolicy,
+                isVolatile, useBulk);
+          },
+          py::arg("ptrTensor"), py::arg("result"), py::arg("mask").none(),
+          py::arg("other").none(), py::arg("cacheModifier"),
+          py::arg("evictionPolicy"), py::arg("isVolatile"),
+          py::arg("bulkSize").none(), py::arg("barrier").none(),
+          py::arg("useBulk"))
       .def("create_clock64",
            [](TritonOpBuilder &self) -> mlir::Value {
              return self.create<triton::gpu::Clock64Op>(
@@ -1243,6 +1439,23 @@ void init_triton_tlx_ir(py::module &&m) {
              threadId = self.create<arith::IndexCastOp>(
                  self.getBuilder().getI32Type(), threadId);
              return threadId;
+           })
+      .def("create_cond_barrier",
+           [](TritonOpBuilder &self, Value pred) -> void {
+             // Conditional s_barrier: only lanes with pred==true participate.
+             // Deliberately diverges the two warp-halves to phase-shift a
+             // hand-rolled ping-pong; caller must pair cond_barrier(pred) with
+             // cond_barrier(~pred) so all threads cross the same barrier count.
+             self.create<amdgpu::CondBarrierOp>(pred);
+           })
+      .def("create_workgroup_barrier",
+           [](TritonOpBuilder &self) -> void {
+             // Fenced full-workgroup barrier: a local (LDS-fenced) ttg.barrier
+             // bracketed by SchedBarrier(0) guards so the scheduler cannot hoist
+             // ops across the ping-pong cluster border.
+             self.create<ROCDL::SchedBarrier>(ROCDL::SchedGroupMask::none);
+             self.create<ttg::BarrierOp>(ttg::AddrSpace::Local);
+             self.create<ROCDL::SchedBarrier>(ROCDL::SchedGroupMask::none);
            })
       .def("create_cvt_rs",
            [](TritonOpBuilder &self, Value &src, Type &dstType,
@@ -1299,46 +1512,62 @@ void init_triton_tlx_ir(py::module &&m) {
                  paddingOption);
            })
       // AMD buffer ops
-      .def("create_buffer_load",
-           [](TritonOpBuilder &self, Value ptr, Value offsets,
-              std::optional<Value> mask, std::optional<Value> other,
-              tt::CacheModifier cache, uint32_t contiguity) -> Value {
-             auto offsetsType = cast<RankedTensorType>(offsets.getType());
-             auto ptrType = cast<tt::PointerType>(ptr.getType());
-             auto resultType = RankedTensorType::get(offsetsType.getShape(),
-                                                     ptrType.getPointeeType(),
-                                                     offsetsType.getEncoding());
-             return self.create<ttag::BufferLoadOp>(
-                 resultType, ptr, offsets, Value() /*stride*/, cache,
-                 mask.value_or(Value()), other.value_or(Value()), contiguity);
-           })
-      .def("create_buffer_store",
-           [](TritonOpBuilder &self, Value storedValue, Value ptr,
-              Value offsets, std::optional<Value> mask,
-              tt::CacheModifier cache) {
-             self.create<ttag::BufferStoreOp>(storedValue, ptr, offsets,
-                                              Value() /*stride*/, cache,
-                                              mask.value_or(Value()));
-           })
-      .def("create_buffer_atomic_rmw",
-           [](TritonOpBuilder &self, tt::RMWOp op, Value ptr, Value offsets,
-              Value value, tt::MemSemantic sem, tt::MemSyncScope scope,
-              std::optional<Value> mask, uint32_t contiguity) -> Value {
-             return self.create<ttag::BufferAtomicRMWOp>(
-                 value.getType(), op, ptr, offsets, value, Value() /*stride*/,
-                 sem, scope, mask.value_or(Value()), contiguity);
-           })
-      .def("create_buffer_load_to_local",
-           [](TritonOpBuilder &self, Value dest, Value ptr, Value offsets,
-              std::optional<Value> mask, std::optional<Value> other,
-              tt::CacheModifier cache) -> Value {
-             return self.create<ttag::BufferLoadToLocalOp>(
-                 dest, ptr, offsets, mask.value_or(Value()),
-                 other.value_or(Value()), Value() /*stride*/, cache);
+      .def(
+          "create_buffer_load",
+          [](TritonOpBuilder &self, Value ptr, Value offsets,
+             std::optional<Value> mask, std::optional<Value> other,
+             tt::CacheModifier cache, uint32_t contiguity) -> Value {
+            auto offsetsType = cast<RankedTensorType>(offsets.getType());
+            auto ptrType = cast<tt::PointerType>(ptr.getType());
+            auto resultType = RankedTensorType::get(offsetsType.getShape(),
+                                                    ptrType.getPointeeType(),
+                                                    offsetsType.getEncoding());
+            return self.create<ttag::BufferLoadOp>(
+                resultType, ptr, offsets, Value() /*stride*/, cache,
+                mask.value_or(Value()), other.value_or(Value()), contiguity);
+          },
+          py::arg("ptr"), py::arg("offsets"), py::arg("mask").none(),
+          py::arg("other").none(), py::arg("cache"), py::arg("contiguity"))
+      .def(
+          "create_buffer_store",
+          [](TritonOpBuilder &self, Value storedValue, Value ptr, Value offsets,
+             std::optional<Value> mask, tt::CacheModifier cache) {
+            self.create<ttag::BufferStoreOp>(storedValue, ptr, offsets,
+                                             Value() /*stride*/, cache,
+                                             mask.value_or(Value()));
+          },
+          py::arg("storedValue"), py::arg("ptr"), py::arg("offsets"),
+          py::arg("mask").none(), py::arg("cache"))
+      .def(
+          "create_buffer_atomic_rmw",
+          [](TritonOpBuilder &self, tt::RMWOp op, Value ptr, Value offsets,
+             Value value, tt::MemSemantic sem, tt::MemSyncScope scope,
+             std::optional<Value> mask, uint32_t contiguity) -> Value {
+            return self.create<ttag::BufferAtomicRMWOp>(
+                value.getType(), op, ptr, offsets, value, Value() /*stride*/,
+                sem, scope, mask.value_or(Value()), contiguity);
+          },
+          py::arg("op"), py::arg("ptr"), py::arg("offsets"), py::arg("value"),
+          py::arg("sem"), py::arg("scope"), py::arg("mask").none(),
+          py::arg("contiguity"))
+      .def(
+          "create_buffer_load_to_local",
+          [](TritonOpBuilder &self, Value dest, Value ptr, Value offsets,
+             std::optional<Value> mask, std::optional<Value> other,
+             tt::CacheModifier cache) -> Value {
+            return self.create<ttag::BufferLoadToLocalOp>(
+                dest, ptr, offsets, mask.value_or(Value()),
+                other.value_or(Value()), Value() /*stride*/, cache);
+          },
+          py::arg("dest"), py::arg("ptr"), py::arg("offsets"),
+          py::arg("mask").none(), py::arg("other").none(), py::arg("cache"))
+      .def("create_assume_uniform",
+           [](TritonOpBuilder &self, Value value) -> Value {
+             return self.create<ttag::AssumeUniformOp>(value.getType(), value);
            });
 }
 
-void init_triton_tlx_passes(py::module &&m) {
+void init_triton_tlx_passes(py::module_ &m) {
   ADD_PASS_WRAPPER_0("add_tlx_propagate_layout", tlx::createTlxPropagateLayout);
   ADD_PASS_WRAPPER_0("add_tlx_insert_require_layout",
                      tlx::createTLXInsertRequireLayout);
@@ -1370,7 +1599,7 @@ void init_triton_tlx_passes(py::module &&m) {
         });
 }
 
-void init_triton_tlx(py::module &&m) {
+void init_triton_tlx(py::module_ &m) {
   // load dialects
   m.def("load_dialects", [](mlir::MLIRContext &context) {
     mlir::DialectRegistry registry;
@@ -1380,6 +1609,8 @@ void init_triton_tlx(py::module &&m) {
     context.loadAllAvailableDialects();
   });
 
-  init_triton_tlx_ir(m.def_submodule("tlx_ir"));
-  init_triton_tlx_passes(m.def_submodule("tlx_passes"));
+  auto ir = m.def_submodule("tlx_ir");
+  init_triton_tlx_ir(ir);
+  auto passes = m.def_submodule("tlx_passes");
+  init_triton_tlx_passes(passes);
 }

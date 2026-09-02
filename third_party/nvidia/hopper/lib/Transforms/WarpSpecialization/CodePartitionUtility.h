@@ -1,6 +1,8 @@
 #ifndef NV_DIALECT_HOPPER_TRANSFORMS_CODEPARTITIONUTILITY_H_
 #define NV_DIALECT_HOPPER_TRANSFORMS_CODEPARTITIONUTILITY_H_
 
+#include "mlir/Interfaces/LoopLikeInterface.h"
+#include "nvidia/include/Dialect/NVWS/IR/Dialect.h"
 #include "triton/Analysis/Allocation.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
@@ -26,6 +28,25 @@ namespace tt = mlir::triton;
 // (WSMemoryPlanner) share one source of truth for the name.
 constexpr llvm::StringLiteral kAtomicBroadcastCopiesAttrName =
     "ttg.atomic_broadcast_copies";
+
+// Boolean opt-in switches carried by the `tt.autows` JSON annotation
+// (tt::kAutoWSAnnotationAttrName). Named here so every pass that reads one
+// shares a single source of truth for the spelling.
+constexpr llvm::StringLiteral kAutoWSFuseFinalStatsKey =
+    "two_cta_fuse_final_stats";
+constexpr llvm::StringLiteral kAutoWSFuseAccSlicesKey =
+    "two_cta_fuse_acc_slices";
+constexpr llvm::StringLiteral kAutoWSTwoCTADirectWaitKey =
+    "two_cta_tma_direct_wait";
+
+// Answer a set of `tt.autows` boolean switches with one walk over funcOp: each
+// annotated op's JSON is parsed once for all keys, and the walk stops as soon
+// as every key has been seen set. Returns one entry per requested key, in the
+// order the keys were given. A switch is on when any annotation in the
+// function sets it to true.
+SmallVector<bool> getAutoWSBooleanFlags(triton::FuncOp funcOp,
+                                        ArrayRef<StringRef> keys);
+bool getAutoWSBooleanFlag(triton::FuncOp funcOp, StringRef key);
 
 // Strip every warp-specialization metadata attribute that AutoWS stamps on
 // ops/loops. Every graceful-reject path must call this so the downstream
@@ -235,6 +256,28 @@ bool enclosing(scf::IfOp ifOp, Operation *op);
 bool enclosing(scf::ForOp forOp, Operation *op);
 bool enclosing(scf::WhileOp whileOp, Operation *op);
 
+// --- Persistent outer-loop helpers (scf.for / scf.while unified) ------------
+//
+// AutoWS accepts either an `scf.for` or a CLC-style `scf.while` as the
+// persistent outer-tile loop. `LoopLikeOpInterface` unions the two forms; the
+// helpers below cover the pieces that interface does not model -- which region
+// is the specialized body, and where a while's iteration counter lives.
+
+// Innermost enclosing persistent loop of \p op: the enclosing `scf.for` when
+// there is one, otherwise the enclosing `scf.while`. Null when neither exists.
+LoopLikeOpInterface getParentPersistentLoop(Operation *op);
+
+// The block AutoWS specializes for \p loop: the body of an `scf.for`, the
+// after-region body of an `scf.while`. Null for any other loop-like op.
+Block *getPersistentLoopBody(LoopLikeOpInterface loop);
+
+// The after-region argument of \p whileOp that advances once per iteration,
+// i.e. the AutoWS accumulation counter whose mapped `scf.yield` recurrence is
+// `arg + 1`. `scf.condition` may forward only a subset of the before
+// arguments, so each after argument is mapped through it before the yielded
+// value is inspected. Null when no such counter exists.
+Value getWhileIterationCounter(scf::WhileOp whileOp);
+
 /// Returns true if \p tmemAlloc has a MMAv5OpInterface user inside \p forOp
 /// whose acc_dep token is a loop iter_arg of \p forOp and whose output
 /// token is yielded back to the same iter_arg position. This indicates
@@ -307,15 +350,15 @@ void getBufferIdxAndPhase(OpBuilderWithAsyncTaskIds &builder, Operation *op,
 Value getBarrierForPipelineStage(OpBuilderWithAsyncTaskIds &builder,
                                  Value barrierAlloc, Value bufferIdx);
 
-Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
-                            SmallVector<tt::DescriptorLoadOp> &tmaLoads,
-                            SmallVector<Value> &buffers, Value barrierAlloc,
-                            Value bufferIdx, Value bufferIdxExtract,
-                            Value phase, Operation *headProducer,
-                            Operation *headConsumer,
-                            Operation *headConsumerSameLevel,
-                            ArrayRef<int> additionalConsumerTaskIds = {},
-                            DictionaryAttr consumerWaitConstraints = {});
+Operation *
+optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
+                 SmallVector<triton::nvws::DescriptorLoadOp> &tmaLoads,
+                 Value barrierAlloc, Value bufferIdx, Value bufferIdxExtract,
+                 Value phase, Operation *headProducer, Operation *headConsumer,
+                 Operation *headConsumerSameLevel,
+                 ArrayRef<int> additionalConsumerTaskIds = {},
+                 DictionaryAttr consumerWaitConstraints = {},
+                 bool twoCTADirectWait = false);
 void specializeRegion(triton::FuncOp funcOp, unsigned requestedRegisters);
 Value createBufferView(OpBuilderWithAsyncTaskIds &builder, Value alloc,
                        Value idx);

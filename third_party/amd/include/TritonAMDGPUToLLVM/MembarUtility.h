@@ -4,30 +4,30 @@
 #include "mlir/IR/Operation.h"
 #include "triton/Analysis/Allocation.h"
 
+namespace mlir {
+class DialectRegistry;
+}
+
 namespace mlir::triton::AMD {
 
-// Filter function used in the AMDGPU backend to filter unnecessary barriers
-// during Membar Analysis. Filters applied by this function:
-// 1) Do not create barriers between AsyncCopyGlobalToLocal and LocalLoad if the
-// LocalLoad is synced by AsyncWait. This prevents a redundant barrier between
-// LocalLoad and prefetches because membar cannot see that subviews from the
-// same shared allocation do not alias when pipelining loads. See
-// amdgpu_membar.mlir for examples. This filter can produce wrong IR/assembly if
-// we pipeline with a single buffer in lds because it filters out a required
-// ttg.barrier between the LocalLoad and the prefetches. However the pipeliner
-// will always use at least 2 buffers so this IR cannot be produced. Example
-// membar input IR to produce incorrect results:
-//   %tile_a = ttg.memdesc_index
-//   %1 = AsyncCopyGlobalToLocal %ptr %tile_a
-//   scf.for
-//     %2 = AsyncWait %1
-//      # Membar will add a required ttg.barrier here
-//     %3 = LocalLoad %tile_a
-//      # Requires ttg.barrier but filter will prevent it
-//     %4 = AsyncCopyGlobalToLocal %ptr_2 %tile_a
-//     scf.yield
+// Filter function used in the AMDGPU backend to remove dependencies that do
+// not require a workgroup barrier. AsyncWait synchronization only filters the
+// producer-to-consumer RAW edge from an async LDS write to its LocalLoad. It
+// does not filter the consumer-to-producer WAR edge when that LDS slice is
+// refilled: every workgroup consumer must release a cooperatively owned slice
+// before any wave overwrites it. Distinct constant memdesc_index slices are
+// proven independent by the generic Membar allocation-slice analysis.
 bool membarFilter(Operation *op1, Operation *op2, bool op1IsRead,
                   bool op2IsRead, Allocation *allocation);
+
+// Registers an external interface model marking the AMD scheduling-only fences
+// rocdl.sched.barrier / rocdl.sched.group.barrier with
+// ttg::SchedulingBarrierOpInterface. Membar's forward scan for a sync point
+// looks THROUGH ops carrying that interface (they have no cross-wave memory
+// semantics), so it does not insert a redundant barrier around the real
+// ttg.barrier that a tlx.workgroup_barrier interposes. Attaching via a dialect
+// extension keeps the core Membar analysis free of any ROCDL dependency.
+void registerSchedulingBarrierExternalModel(DialectRegistry &registry);
 } // namespace mlir::triton::AMD
 
 #endif

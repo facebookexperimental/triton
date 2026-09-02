@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Correctness and performance scripts for the TLX tutorial kernels.">
+  <title>Testing · FBTriton</title>
+  <link rel="stylesheet" href="assets/tlx.css?v=20260824c">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="../"><span>FBTriton</span></a>
+    <nav class="topnav" aria-label="Top-level sections"><a href="triton.html">Triton</a>
+<a href="tlx.html" data-current="true">TLX</a>
+<a href="tlx-ops.html">tlx.ops</a>
+<a href="torchtlx.html">TorchTLX</a>
+<a href="ci.html">CI</a>
+<a href="tooling.html">Tooling</a></nav>
+    <a class="repo-link" href="https://github.com/facebookexperimental/triton" target="_blank" rel="noreferrer">View on GitHub ↗</a>
+  </header>
+  <div class="shell">
+<aside class="sidebar">
+      <p class="eyebrow">TLX documentation</p>
+      <nav><a href="tlx.html">Overview</a>
+<a href="buffers.html">Memory</a>
+<a href="global-memory.html">Global memory access</a>
+<a href="async-memory.html">Async memory access</a>
+<a href="async-compute.html">Tensor core operations</a>
+<a href="synchronization.html">Synchronization</a>
+<a href="warp-specialization.html">Warp specialization</a>
+<a href="clusters.html">Clusters and Cluster Launch Control</a>
+<a href="layouts.html">Layout control and diagnostics</a>
+<a href="utilities.html">Other operations</a>
+<a href="kernels.html">Kernels implemented with TLX</a>
+<a href="testing.html" aria-current="page">Testing</a>
+<a class="sub" href="#test-suites-by-project">Test suites by project</a>
+<a class="sub" href="#correctness">Correctness</a>
+<a class="sub" href="#performance">Performance</a>
+<a href="resources.html">Further reading</a></nav>
+    </aside>
+    <main>
+      <p class="eyebrow">TLX documentation</p>
+      <h1>Testing</h1>
+      <p class="lede">Correctness and performance scripts for the TLX tutorial kernels.</p>
+      <article><h2 id="test-suites-by-project">Test suites by project</h2>
+<table><thead><tr><th>Project</th><th>Command</th></tr></thead><tbody><tr><td>TLX tutorial kernels</td><td><code>pytest third_party/tlx/tutorials/testing/test_correctness.py</code></td></tr><tr><td>TLX language</td><td><code>pytest python/test/unit/language/test_tlx_*.py</code></td></tr><tr><td>AutoWS</td><td><code>pytest python/test/unit/language/test_autows_*.py</code></td></tr><tr><td>TorchTLX</td><td><code>pytest python/test/unit/language/test_torchtlx_*.py</code></td></tr></tbody></table>
+<p>Every suite is arch-gated, so cases that do not apply to the GPU you are on skip rather than fail. The <code>test_tlx_*.py</code> glob covers manual TLX (<code>tlx.async_tasks</code>) and structurally excludes the AutoWS suites, which are tested separately. Which of these run in CI, and on which runners, is described under <a href="ci.html">CI</a>.</p>
+<h2 id="correctness">Correctness</h2>
+<p><code>[TLX_VERSION=&lt;kernel_name&gt;] pytest third_party/tlx/tutorials/testing/test_correctness.py</code></p>
+<p>By default only one autotune config will be used by correctness test.</p>
+<p>All kernels — Hopper, Blackwell, and AMD — share this one file; each test is arch-gated with <code>@pytest.mark.skipif</code>, so on any given GPU only the relevant cases run and the rest skip. To run just the AMD/IKBO cases:</p>
+<p><code>pytest third_party/tlx/tutorials/testing/test_correctness.py -k &quot;amd or ikbo&quot;</code></p>
+<p>(on gfx950 the gfx1250-only GEMM cases skip automatically).</p>
+<h2 id="performance">Performance</h2>
+<p><code>third_party/tlx/denoise.sh third_party/tlx/tutorials/testing/test_hopper_gemm_perf.py [--version {ws|pipelined}]</code></p>
+<p><code>third_party/tlx/denoise.sh third_party/tlx/tutorials/testing/test_hopper_fa_perf.py [--version {ws|ws_pipelined|ws_pipelined_pingpong|ws_pipelined_pingpong_persistent}]</code></p>
+<p><code>third_party/tlx/denoise.sh third_party/tlx/tutorials/testing/test_blackwell_gemm_perf.py [--version {ws|pipelined|clc|2cta}]</code></p>
+<p><code>third_party/tlx/denoise.sh third_party/tlx/tutorials/testing/test_blackwell_fa_perf.py [--version {ws|ws_persistent|ws_pipelined|ws_pipelined_persistent|clc}]</code></p>
+<p><code>denoise.sh</code> wraps AMD runs too (it applies NUMA pinning and runs the benchmark; the GPU clock/power lock is NVIDIA-only and is simply skipped on AMD). gfx950 / CDNA4:</p>
+<p><code>third_party/tlx/denoise.sh python third_party/tlx/tutorials/testing/test_amd_gemm_perf.py [--version {warp_pipeline|pipelined}]</code></p>
+<p><code>third_party/tlx/denoise.sh python third_party/tlx/tutorials/testing/test_amd_fa_perf.py [--version {simple|prefetch|persistent|cluster}]</code></p>
+<p>Without <code>--version</code>, AMD FA perf runs <code>simple</code>, <code>prefetch</code>, and <code>persistent</code>; select <code>cluster</code> explicitly because it is D=128-only.</p>
+<p><code>third_party/tlx/denoise.sh python third_party/tlx/tutorials/testing/test_amd_addmm_glu_perf.py [--version {tlx_baseline|tlx_simple_async|tlx_optimized_async|tlx_optimized|tlx_persistent}]</code></p>
+<p><code>third_party/tlx/denoise.sh python third_party/tlx/tutorials/testing/test_amd_ikbo_fa_perf.py</code>  (IKBO Flash Attention)</p>
+<p><code>third_party/tlx/denoise.sh python third_party/tlx/tutorials/testing/test_amd_ikbo_lce_perf.py</code>  (IKBO LCE — distinct op, not attention)</p>
+<p>gfx1250:</p>
+<p><code>third_party/tlx/denoise.sh python third_party/tlx/tutorials/testing/test_amd_mxfp_gemm_perf.py [--transpose-b]</code></p></article>
+<footer class="pager"><a href="kernels.html">← Kernels implemented with TLX</a><a class="next" href="resources.html">Further reading →</a></footer>
+    </main>
+  </div>
+</body>
+</html>

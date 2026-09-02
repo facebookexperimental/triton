@@ -477,11 +477,13 @@ LinearLayout ReduceOpHelper::reducedRegLaneLayout(RankedTensorType srcTy,
                                                   int axis) {
   auto *ctx = srcTy.getContext();
   auto kReg = StringAttr::get(ctx, "register");
+  auto kLane = StringAttr::get(ctx, "lane");
   auto reduced = toLinearLayout(srcTy);
   reduced = actionRemoveBroadcastedRegs(reduced).apply(reduced);
   reduced = moveAxisBasesToFront(reduced, axis).apply(reduced);
   reduced = zeroBasesAlongDimAndReorder(reduced, axis, kReg);
   reduced = actionRemoveBroadcastedRegs(reduced).apply(reduced);
+  reduced = zeroBasesAlongDimAndReorder(reduced, axis, kLane);
   return reduced;
 }
 
@@ -1467,6 +1469,25 @@ bool cvtNeedsWarpShuffle(RankedTensorType srcTy, RankedTensorType dstTy) {
     return (factors.mixedTranspositions.size() < 2);
   }
   return false;
+}
+
+bool cvtCanUseWarpShuffle(RankedTensorType srcTy, RankedTensorType dstTy) {
+  auto layout = minimalCvtLayout(srcTy, dstTy);
+  MLIRContext *ctx = srcTy.getContext();
+  auto kBlock = StringAttr::get(ctx, "block");
+  auto kWarp = StringAttr::get(ctx, "warp");
+  auto dims = layout.getInDimNames();
+  return !llvm::is_contained(dims, kBlock) && !llvm::is_contained(dims, kWarp);
+}
+
+bool cvtIsWarpShuffleForced(triton::gpu::ConvertLayoutOp cvt) {
+  auto func = cvt->getParentOfType<FunctionOpInterface>();
+  return func->hasAttrOfType<UnitAttr>("always_use_warp_shuffle");
+}
+
+bool cvtUsesForcedWarpShuffle(triton::gpu::ConvertLayoutOp cvt) {
+  return cvtIsWarpShuffleForced(cvt) &&
+         cvtCanUseWarpShuffle(cvt.getSrc().getType(), cvt.getType());
 }
 
 bool cvtNeedsSharedMemory(RankedTensorType srcTy, RankedTensorType dstTy) {

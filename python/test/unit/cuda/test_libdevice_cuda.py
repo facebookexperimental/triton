@@ -9,6 +9,8 @@ import triton.language as tl
 from triton._internal_testing import is_cuda
 from triton.language.extra import libdevice
 
+pytestmark = pytest.mark.skipif(not is_cuda(), reason="Requires CUDA backend")
+
 
 # -----------------------
 # test extern functions
@@ -70,6 +72,9 @@ def builtin_libdevice_unary_kernel(
     x = tl.load(x_ptr + offsets, mask=mask)
 
     if OP == "exp":
+        builtin = tl.exp(x)
+        external = libdevice.exp(x)
+    elif OP == "fast_exp":
         builtin = tl.exp(x)
         external = libdevice.fast_expf(x)
     elif OP == "sqrt_rn":
@@ -162,7 +167,7 @@ def _random_payloads(generator, n_elements):
 
 
 @pytest.mark.parametrize(
-    "op", ["exp", "exp2", "log", "log2", "sin", "cos", "sqrt_rn", "rsqrt", "erf", "floor", "ceil"]
+    "op", ["exp", "fast_exp", "exp2", "log", "log2", "sin", "cos", "sqrt_rn", "rsqrt", "erf", "floor", "ceil"]
 )
 def test_fpsan_libdevice_unary_equivalence(op, fresh_knobs):
     if not is_cuda() or not torch.cuda.is_available():

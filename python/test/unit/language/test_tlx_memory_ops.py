@@ -670,7 +670,7 @@ def test_tmem_scale_subslice_compile(SCALE_OFFSET):
     assert "tensor_memory_scales_encoding" in ttgir
     assert len(subslice_ops) == 1
     assert len(copy_ops) == 1
-    assert f"N = {SCALE_OFFSET} : i32" in subslice_ops[0]
+    assert f"offset = {SCALE_OFFSET} : i32" in subslice_ops[0]
     assert f"!ttg.memdesc<128x{SCALE_BLOCK_N}xi8" in subslice_ops[0]
     assert f"!ttg.memdesc<128x{SCALE_SLICE_N}xi8" in subslice_ops[0]
     assert f"!ttg.memdesc<128x{SCALE_SLICE_N}xi8" in copy_ops[0]

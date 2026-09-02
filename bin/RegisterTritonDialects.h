@@ -1,6 +1,9 @@
 #pragma once
 #include "amd/include/Dialect/TritonAMDGPU/IR/Dialect.h"
 #include "amd/include/TritonAMDGPUTransforms/Passes.h"
+#ifdef TRITON_ENABLE_CPU_BACKEND
+#include "cpu/include/TritonCPU/Registration.h"
+#endif
 #include "mlir/Dialect/LLVMIR/Transforms/InlinerInterfaceImpl.h"
 #include "nvidia/include/Dialect/NVGPU/IR/Dialect.h"
 #include "nvidia/include/Dialect/NVWS/IR/Dialect.h"
@@ -71,6 +74,10 @@ void registerTestScopeIdAllocationPass();
 } // namespace test
 } // namespace mlir
 
+namespace mlir::triton::AMD {
+void registerSchedulingBarrierExternalModel(mlir::DialectRegistry &registry);
+} // namespace mlir::triton::AMD
+
 inline void registerTritonDialects(mlir::DialectRegistry &registry) {
   mlir::registerAllPasses();
   mlir::triton::registerTritonPasses();
@@ -136,6 +143,7 @@ inline void registerTritonDialects(mlir::DialectRegistry &registry) {
   mlir::registerTritonAMDGPUConvertToTensorOps();
   mlir::registerTritonAMDGPUOptimizeBufferOpPtr();
   mlir::registerTritonAMDGPUDotDecomposeAndSchedule();
+  mlir::registerTritonAMDGPUSchedGroupBarrierScheduler();
   mlir::registerTritonAMDGPUInThreadTranspose();
   mlir::registerTritonAMDGPUCoalesceAsyncCopy();
   mlir::registerTritonAMDGPUCoalesceBufferOps();
@@ -158,6 +166,7 @@ inline void registerTritonDialects(mlir::DialectRegistry &registry) {
   mlir::registerNVGPUModuloLower();
   mlir::registerNVGPUListSchedule();
   mlir::registerNVGPULLMSchedule();
+  mlir::registerNVGPUJointSolverSchedule();
 
   // Proton passes
   mlir::test::proton::registerTestScopeIdAllocationPass();
@@ -171,6 +180,10 @@ inline void registerTritonDialects(mlir::DialectRegistry &registry) {
 
   // TLX passes
   mlir::triton::tlx::registerPasses();
+
+#ifdef TRITON_ENABLE_CPU_BACKEND
+  mlir::triton::cpu::registerTritonCPU(registry);
+#endif
 
   // Register plugin passes and dialects.
   for (const auto &plugin : mlir::triton::plugin::loadPlugins()) {
@@ -190,4 +203,6 @@ inline void registerTritonDialects(mlir::DialectRegistry &registry) {
       mlir::triton::proton::ProtonDialect,
       mlir::triton::proton::gpu::ProtonGPUDialect, mlir::ROCDL::ROCDLDialect,
       mlir::triton::gluon::GluonDialect, mlir::triton::tlx::TLXDialect>();
+
+  mlir::triton::AMD::registerSchedulingBarrierExternalModel(registry);
 }

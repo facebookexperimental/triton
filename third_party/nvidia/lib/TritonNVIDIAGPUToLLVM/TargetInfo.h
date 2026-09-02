@@ -20,6 +20,10 @@ public:
   Value ballot(RewriterBase &rewriter, Location loc, Type type,
                Value cmp) const override;
 
+  Value getGlobalTimer(RewriterBase &rewriter, Location loc) const override;
+
+  StringRef getAtomicSyncScope(MemSyncScope scope) const override;
+
   void barrier(Location loc, RewriterBase &rewriter,
                triton::gpu::AddrSpace targets) const override;
   void clusterBarrier(Location loc, RewriterBase &rewriter,
@@ -34,6 +38,8 @@ public:
   Value loadDShared(RewriterBase &rewriter, Location loc, Value ptr,
                     Value ctaId, Type elemTy, Value pred,
                     Operation *localLoadOp = nullptr) const override;
+  Value mapDShared(RewriterBase &rewriter, Location loc, Value ptr, Value ctaId,
+                   Value pred) const;
 
   void copyBulkSharedToRemoteShared(RewriterBase &rewriter, Location loc,
                                     Value srcPtr, Value dstPtr,
@@ -97,6 +103,10 @@ public:
   int getPtxVersion() const { return ptxVersion; }
   int getComputeCapability() const {
     return targetFeatures.getComputeCapability();
+  }
+  bool supportsMbarrierMulticast() const {
+    // mbarrier.arrive.multicast was introduced in PTX 9.4 for Rubin.
+    return targetFeatures.supportsMbarMulticast() && ptxVersion >= 94;
   }
   const triton::nvidia_gpu::TargetFeatures &getTargetFeatures() const {
     return targetFeatures;

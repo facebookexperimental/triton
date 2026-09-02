@@ -286,6 +286,15 @@ def TLX_ReleaseLayoutOp : TLX_Op<"release_layout",
                                   Pure]> {
   let summary = "release specific layout for a register buffer";
 
+  let description = [{
+    `tlx.release_layout` marks the boundary after which tensor layout
+    propagation may choose an encoding independently of the source. The
+    source normally has an explicit layout. An encoding-free private helper
+    argument or call result is also accepted because TLX Fixup may specialize
+    that helper ABI from a concrete call site. The result may be unencoded in
+    TTIR or carry the layout selected during TTGIR propagation.
+  }];
+
   let arguments = (ins TT_Tensor:$src);
 
   let results = (outs TT_Tensor:$result);
@@ -293,6 +302,7 @@ def TLX_ReleaseLayoutOp : TLX_Op<"release_layout",
   let assemblyFormat = "$src attr-dict `:` type($src) `->` type($result)";
 
   let hasFolder = 1;
+  let hasVerifier = 1;
 }
 
 def TLX_AssertSameLayoutOp : TLX_Op<"assert_same_layout", []> {

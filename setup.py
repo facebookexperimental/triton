@@ -20,7 +20,7 @@ from setuptools.command.sdist import sdist
 
 from dataclasses import dataclass
 
-import pybind11
+import nanobind
 
 try:
     from setuptools.command.bdist_wheel import bdist_wheel
@@ -241,16 +241,11 @@ class CMakeBuild(build_ext):
         for ext in self.extensions:
             self.build_extension(ext)
 
-    def get_pybind11_cmake_args(self):
-        pybind11_sys_path = get_env_with_keys(["PYBIND11_SYSPATH"])
-        if pybind11_sys_path:
-            pybind11_include_dir = os.path.join(pybind11_sys_path, "include")
-        else:
-            pybind11_include_dir = pybind11.get_include()
-        return [f"-Dpybind11_INCLUDE_DIR='{pybind11_include_dir}'", f"-Dpybind11_DIR='{pybind11.get_cmake_dir()}'"]
+    def get_nanobind_cmake_args(self):
+        return [f"-Dnanobind_ROOT='{nanobind.cmake_dir()}'"]
 
     def get_proton_cmake_args(self):
-        cmake_args = self.get_pybind11_cmake_args()
+        cmake_args = self.get_nanobind_cmake_args()
         cupti_include_dir = get_env_with_keys(["TRITON_CUPTI_INCLUDE_PATH"])
         if cupti_include_dir == "":
             cupti_include_dir = os.path.join(get_base_dir(), "third_party", "nvidia", "backend", "include")
@@ -296,7 +291,7 @@ class CMakeBuild(build_ext):
         lit_dir = shutil.which('lit')
         ninja_dir = shutil.which('ninja')
         assert ninja_dir is not None, "ninja not found!"
-        thirdparty_cmake_args = self.get_pybind11_cmake_args()
+        thirdparty_cmake_args = self.get_nanobind_cmake_args()
         extdir = os.path.abspath(os.path.dirname(self.get_ext_fullpath(ext.path)))
         wheeldir = os.path.dirname(extdir)
 
@@ -424,7 +419,7 @@ class CMakeBuild(build_ext):
         subprocess.check_call(["cmake", "--build", ".", "--target", "mlir-doc"], cwd=cmake_dir)
 
 
-backends = [*BackendInstaller.copy(["nvidia", "amd"]), *BackendInstaller.copy_externals()]
+backends = [*BackendInstaller.copy(["nvidia", "amd", "cpu"]), *BackendInstaller.copy_externals()]
 
 
 def get_package_dirs():
@@ -478,6 +473,31 @@ def get_packages():
     yield "triton.language.extra.tlx"
     yield "triton.language.extra.tlx.ops"
 
+    # The TLX op library. find_packages() does follow the symlink once it
+    # exists, but on a fresh tree add_links() may not have run yet, so
+    # enumerate from the source directory instead of the link target.
+    yield "triton.tlx"
+    for pkg in _tlx_ops_packages():
+        yield pkg
+
+
+def _tlx_ops_dir():
+    return os.path.abspath(os.path.join(os.path.dirname(__file__), "third_party", "tlx", "ops"))
+
+
+def _tlx_ops_packages():
+    """Every package under third_party/tlx/ops, as triton.tlx.ops.* names."""
+    root = _tlx_ops_dir()
+    if not os.path.isdir(root):
+        return
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d != "__pycache__"]
+        if "__init__.py" not in filenames:
+            continue
+        rel = os.path.relpath(dirpath, root)
+        suffix = "" if rel == "." else "." + rel.replace(os.sep, ".")
+        yield f"triton.tlx.ops{suffix}"
+
 
 def add_link_to_backends(external_only):
     for backend in backends:
@@ -516,6 +536,12 @@ def add_link_to_tlx():
     src_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "third_party", "tlx", "language", "tlx"))
     install_dir = os.path.join(os.path.dirname(__file__), "python", "triton", "language", "extra", "tlx")
     update_symlink(install_dir, src_dir)
+
+    # The op library lands at triton.tlx.ops. python/triton/tlx/__init__.py is
+    # a real committed file, so only `ops` is linked; that keeps the source
+    # name honest (ops/ holds ops) while users get the short public path.
+    ops_install_dir = os.path.join(os.path.dirname(__file__), "python", "triton", "tlx", "ops")
+    update_symlink(ops_install_dir, _tlx_ops_dir())
 
 
 def add_links(external_only):

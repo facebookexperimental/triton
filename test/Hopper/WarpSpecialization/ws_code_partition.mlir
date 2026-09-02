@@ -142,18 +142,16 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 
 // -----
 
-// CHECK-DAG: #[[$SHARED:.*]] = #ttg.nvmma_shared<{swizzlingByteWidth = 0, transposed = false, elementBitWidth = 32, rank = 1}>
-// CHECK-DAG: #[[$SHARED1:.*]] = #ttg.nvmma_shared<{swizzlingByteWidth = 64, transposed = false, elementBitWidth = 8}>
+// CHECK-DAG: #[[$SHARED:.*]] = #ttg.nvmma_shared<{swizzlingByteWidth = 64, transposed = false, elementBitWidth = 8}>
 // CHECK-LABEL: @_fbgemm_grouped_gemm_fp8_rowwise_ws
-// CHECK-DAG: ttg.local_alloc {{.*}} : () -> !ttg.memdesc<1x64x64xf8E4M3FN, #[[$SHARED1]], #smem, mutable>
-// CHECK-DAG: ttg.local_alloc {{.*}} : () -> !ttg.memdesc<1x128x64xf8E4M3FN, #[[$SHARED1]], #smem, mutable>
-// CHECK-DAG: ttg.local_alloc {{.*}} : () -> !ttg.memdesc<1x128xf32, #[[$SHARED]], #smem, mutable>
+// CHECK-DAG: ttg.local_alloc {{.*}} : () -> !ttg.memdesc<1x64x64xf8E4M3FN, #[[$SHARED]], #smem, mutable>
+// CHECK-DAG: ttg.local_alloc {{.*}} : () -> !ttg.memdesc<1x128x64xf8E4M3FN, #[[$SHARED]], #smem, mutable>
 // CHECK: ttg.warp_specialize
 // CHECK: partition0
 // CHECK: ttg.memdesc_trans
 // CHECK: ttng.warp_group_dot
 // CHECK: partition1
-// CHECK: ttg.local_load
+// CHECK-NOT: ttg.local_load
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [2, 2], order = [1, 0]}>
 #blocked1 = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>

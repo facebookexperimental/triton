@@ -1,4 +1,4 @@
-// RUN: TRITON_USE_META_WS=1 triton-opt %s --nvgpu-partition-scheduling-meta --nvgpu-warp-specialization | FileCheck %s
+// RUN: env TRITON_USE_META_WS=1 triton-opt %s --nvgpu-partition-scheduling-meta --nvgpu-warp-specialization | FileCheck %s
 
 // Regression guard for the no-MMA reduction materialization crash: the
 // `attr.size() == 1 && "expected exactly 1 partition element"` assertion in

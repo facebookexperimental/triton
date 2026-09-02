@@ -335,7 +335,6 @@ getMemDescSubsliceUnpaddedOffsets(ttg::MemDescSubsliceOp op) {
   return MemDescSubsliceOffsets{static_cast<uint32_t>(byteOffset),
                                 partitionOffset, blockOffset};
 }
-
 std::optional<triton::BufferRegionAnalysis::RegionType> getRegionType(Value v) {
   if (isUsedAsBarrier(v))
     return triton::BufferRegionAnalysis::RegionType::BARRIER;
@@ -607,12 +606,19 @@ LogicalResult BufferRegionAnalysis::visitOperation(
           view.affineCTAOffset ^ relativeOffset.ctaOffset));
     return propagateRegions(regionInfo);
   }
+  if (isa<ttg::MemDescDynamicSubsliceOp>(op)) {
+    // The runtime offset prevents selecting one exact affine region.  Keep
+    // the source allocation's regions so alias and membar analyses remain
+    // conservative without degrading every shared-memory access to unknown.
+    return propagateRegions(operands[0]->getValue());
+  }
   if (auto tmemSubsliceOp = dyn_cast<ttng::TMEMSubSliceOp>(op)) {
     const RegionInfo &in = operands[0]->getValue();
     if (in.isUnknown())
       return propagateRegions(in);
     uint32_t relativeOffset = ttng::getTMemSubSliceOffset(
-        tmemSubsliceOp.getType(), tmemSubsliceOp.getN());
+        tmemSubsliceOp.getSrc().getType(), tmemSubsliceOp.getOffset(),
+        tmemSubsliceOp.getDim());
     for (const BufferRegionView &view : in.views)
       regionInfo.views.insert(getMemDescView(
           view.storageBase, view.affineOffset + relativeOffset,

@@ -344,7 +344,7 @@ class shared_linear_layout_encoding(shared_layout_encoding):
 
 
 class amd_mfma_layout(layout_encoding):
-    """gfx950 MFMA distributed layout for explicit shared-load consumers."""
+    """AMD MFMA distributed layout for explicit shared-load consumers."""
 
     def __init__(self, version, instr_shape, transposed, warps_per_cta, element_bitwidth=32, tiles_per_warp=None,
                  cga_layout=None):
@@ -372,6 +372,38 @@ class amd_mfma_layout(layout_encoding):
         del shape, element_type
         return builder.make_amd_mfma_encoding_attr(self.version, self.warps_per_cta, self.instr_shape, self.transposed,
                                                    self.cga_layout, self.tiles_per_warp, self.element_bitwidth)
+
+
+class slice_layout(layout_encoding):
+    """Rank-reduced view of a distributed parent layout.
+
+    This is the explicit-layout counterpart of the encoding inferred for a
+    reduction result. Keeping the parent is important because a later
+    ``expand_dims`` reconstructs that parent layout.
+    """
+
+    def __init__(self, parent, dim):
+        super().__init__()
+        self.parent = tl._unwrap_if_constexpr(parent)
+        self.dim = int(dim)
+        if not isinstance(self.parent, layout_encoding):
+            raise TypeError("slice_layout parent must be a TLX layout encoding")
+        if self.dim < 0:
+            raise ValueError("slice_layout dim must be non-negative")
+
+    def to_ir(self, builder: ir.builder, shape=None, element_type=None) -> None:
+        del shape
+        parent = self.parent.to_ir(builder, element_type=element_type)
+        return builder.make_slice_encoding_attr(self.dim, parent)
+
+    def __repr__(self):
+        return f"slice_layout<dim={self.dim}, parent={self.parent!r}>"
+
+    def __eq__(self, other):
+        return isinstance(other, slice_layout) and self.dim == other.dim and self.parent == other.parent
+
+    def __hash__(self):
+        return hash((self.__class__.__name__, self.dim, self.parent))
 
 
 class dot_operand_layout(layout_encoding):
@@ -614,8 +646,9 @@ class layout(layout_encoding):
     matching tuple of **flat, row-major offsets** into the tile. The author only
     speaks shape/stride; the compiler decomposes each mode `(2^k, s)` into bits
     `s, 2s, ..., 2^(k-1)s`, splits the thread bits into lane (the low
-    `log2(threads_per_warp)`) and warp (the rest), maps the value bits to
-    registers, and builds the corresponding `#linear` encoding to propagate.
+    `log2(threads_per_warp)`) and warp (the rest), and maps the value bits to
+    registers. Permutation layouts resolve to ``#ttg.linear``; layouts with
+    swizzled warp bases resolve to ``#ttg.generic_linear``.
 
     Example (separable QK layout, tile [N=128, M=128], row-major flat offset
     = ``n * 128 + m``):
@@ -1356,11 +1389,21 @@ class clc_response_type(buffered_tensor_type):
     # both of which are opaque objects with fixed size
 
     def __init__(self, num: int, layout: Optional[swizzled_shared_layout_encoding]):
+        # A CLC response is a 16-byte opaque hardware object, i.e. one `ui128`
+        # per stage. Triton has no 128-bit `tl.dtype`, so the base class is
+        # given `tl.int64` as a placeholder and `to_ir` below builds the real
+        # element type through the builder instead of from `self.element_ty`.
         super().__init__(tl.int64, [1], num, storage_kind.smem, layout)
 
     def _unflatten_ir(self, handles: List[ir.value], cursor: int) -> Tuple[clc_response, int]:
         value = clc_response(handles[cursor], self.num, self.layout)
         return value, cursor + 1
+
+    def mangle(self) -> str:
+        # Distinct from buffered_tensor_type/mbarrier_type, whose mangles are
+        # derived from the (placeholder) int64 element type and would otherwise
+        # collide with this one for the same shape.
+        return f"clc_response_{self.num}"
 
     def to_ir(self, builder: ir.builder) -> None:
         if self.num >= 1:
@@ -1369,7 +1412,13 @@ class clc_response_type(buffered_tensor_type):
             shape = self.shape
         return builder.get_memdesc_type(
             shape,
-            self.element_ty.to_ir(builder),
+            # NOT self.element_ty: the allocation created by
+            # create_alloc_clc_responses uses `ui128`. Using the placeholder
+            # int64 here builds a different memdesc type whenever this type is
+            # reconstructed -- notably for a @triton.jit callee's parameter when
+            # a CLC context crosses a tt.call -- which fails TTIR verification
+            # with a `tt.call` operand type mismatch.
+            builder.get_clc_response_element_ty(),
             self.layout.to_ir(builder),
             self.storage.value,
         )

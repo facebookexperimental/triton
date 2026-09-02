@@ -11,10 +11,36 @@ add_triton_ut(
   SRCS z3_constraint_encoder_test.cpp
   LIBS
     TritonGPUModuloCore
+    TritonGPUTransforms
+    TritonNvidiaGPUTransforms
+)
+
+add_triton_ut(
+  NAME ModuloScheduleTest
+  SRCS modulo_schedule_test.cpp
+  LIBS
+    TritonGPUModuloCore
+    TritonGPUTransforms
+    TritonNvidiaGPUTransforms
+)
+
+add_triton_ut(
+  NAME JointSolverFallbackTest
+  SRCS joint_solver_fallback_test.cpp
+  LIBS
+    TritonGPUModuloCore
+    TritonGPUTransforms
+    TritonNvidiaGPUTransforms
 )
 
 if(TRITON_ENABLE_Z3_JOINT_SOLVER)
   target_compile_definitions(Z3ConstraintEncoderTest
+    PRIVATE TRITON_ENABLE_Z3_JOINT_SOLVER=1
+  )
+  target_compile_definitions(ModuloScheduleTest
+    PRIVATE TRITON_ENABLE_Z3_JOINT_SOLVER=1
+  )
+  target_compile_definitions(JointSolverFallbackTest
     PRIVATE TRITON_ENABLE_Z3_JOINT_SOLVER=1
   )
 endif()

@@ -11,7 +11,9 @@ from triton.language.extra.tlx.tutorials.amd_gemm_warp_pipeline import (
 from triton.language.extra.tlx.tutorials.amd_gemm_pipelined import (
     matmul as _amd_gemm_pipelined, )
 from triton.language.extra.tlx.tutorials.gfx9_gemm.inter_wave.a16w16.matmul_kernel import (
-    matmul as _amd_gemm_interwave, )
+    matmul as _amd_gemm_interwave,
+    streamk_matmul as _amd_gemm_interwave_streamk,
+)
 from triton.language.extra.tlx.tutorials.gfx9_gemm.inter_wave.a16w16.matmul_kernel_split_m import (
     matmul as _amd_gemm_pingpong, )
 
@@ -35,6 +37,7 @@ MATMUL_METHODS = {
     "warp_pipeline": lambda a, b: _amd_gemm_warp_pipeline(a, b, config=_WARP_PIPELINE_CONFIG),
     "pipelined": lambda a, b: _amd_gemm_pipelined(a, b),
     "interwave": lambda a, b: _amd_gemm_interwave(a, b),
+    "interwave_streamk": lambda a, b: _amd_gemm_interwave_streamk(a, b),
     "pingpong": lambda a, b: _amd_gemm_pingpong(a, b),
 }
 

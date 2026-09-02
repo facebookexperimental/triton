@@ -6,18 +6,54 @@
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Transforms/Passes.h"
 #include "nvidia/hopper/include/Transforms/Passes.h"
+#include "triton/Dialect/Triton/IR/DiscardableAttributes.h"
 #include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
+#include "llvm/Support/JSON.h"
 #include <list>
 #include <unordered_set>
 
 namespace tt = mlir::triton;
 namespace ttg = mlir::triton::gpu;
 namespace ttng = ::mlir::triton::nvidia_gpu;
+namespace ttnvws = ::mlir::triton::nvws;
 namespace mlir {
 
 #define DEBUG_TYPE "nvgpu-ws-utility"
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
 #define LDBG(X) LLVM_DEBUG(DBGS() << X << "\n")
+
+SmallVector<bool> getAutoWSBooleanFlags(triton::FuncOp funcOp,
+                                        ArrayRef<StringRef> keys) {
+  SmallVector<bool> flags(keys.size(), false);
+  unsigned pending = keys.size();
+  if (pending == 0)
+    return flags;
+  funcOp.walk([&](Operation *op) {
+    auto attr = op->getAttrOfType<StringAttr>(tt::kAutoWSAnnotationAttrName);
+    if (!attr)
+      return WalkResult::advance();
+    auto parsed = llvm::json::parse(attr.getValue());
+    if (!parsed) {
+      llvm::consumeError(parsed.takeError());
+      return WalkResult::advance();
+    }
+    auto *object = parsed->getAsObject();
+    if (!object)
+      return WalkResult::advance();
+    for (unsigned i = 0; i < keys.size(); ++i) {
+      if (flags[i] || !object->getBoolean(keys[i]).value_or(false))
+        continue;
+      flags[i] = true;
+      --pending;
+    }
+    return pending == 0 ? WalkResult::interrupt() : WalkResult::advance();
+  });
+  return flags;
+}
+
+bool getAutoWSBooleanFlag(triton::FuncOp funcOp, StringRef key) {
+  return getAutoWSBooleanFlags(funcOp, {key}).front();
+}
 
 void removeWarpSpecMetadata(triton::FuncOp funcOp) {
   // The canonical set of attributes AutoWS stamps on ops/loops. `removeAttr` is
@@ -84,6 +120,50 @@ bool enclosing(scf::WhileOp whileOp, Operation *op) {
   return whileOp->isProperAncestor(op);
 }
 
+LoopLikeOpInterface getParentPersistentLoop(Operation *op) {
+  if (auto forOp = op->getParentOfType<scf::ForOp>())
+    return forOp;
+  if (auto whileOp = op->getParentOfType<scf::WhileOp>())
+    return whileOp;
+  return {};
+}
+
+Block *getPersistentLoopBody(LoopLikeOpInterface loop) {
+  if (auto forOp = dyn_cast<scf::ForOp>(loop.getOperation()))
+    return forOp.getBody();
+  if (auto whileOp = dyn_cast<scf::WhileOp>(loop.getOperation()))
+    return whileOp.getAfterBody();
+  return nullptr;
+}
+
+Value getWhileIterationCounter(scf::WhileOp whileOp) {
+  auto forwarded = whileOp.getConditionOp().getArgs();
+  auto yielded = whileOp.getYieldedValues();
+  for (BlockArgument afterArg : whileOp.getAfterArguments()) {
+    unsigned afterIdx = afterArg.getArgNumber();
+    if (afterIdx >= forwarded.size())
+      continue;
+    auto beforeArg = dyn_cast<BlockArgument>(forwarded[afterIdx]);
+    if (!beforeArg || beforeArg.getOwner() != whileOp.getBeforeBody() ||
+        beforeArg.getArgNumber() >= yielded.size())
+      continue;
+    auto add = yielded[beforeArg.getArgNumber()].getDefiningOp<arith::AddIOp>();
+    if (!add)
+      continue;
+    Value increment;
+    if (add.getLhs() == afterArg)
+      increment = add.getRhs();
+    else if (add.getRhs() == afterArg)
+      increment = add.getLhs();
+    else
+      continue;
+    auto one = increment.getDefiningOp<arith::ConstantIntOp>();
+    if (one && one.value() == 1)
+      return afterArg;
+  }
+  return {};
+}
+
 bool hasLoopCarriedAccToken(Operation *tmemAlloc, scf::ForOp forOp) {
   for (auto *user : tmemAlloc->getResult(0).getUsers()) {
     auto mmaOp = dyn_cast<ttng::MMAv5OpInterface>(user);
@@ -139,7 +219,7 @@ Operation *AllocChannel::getSrcOp() {
     Operation *user = skipIdxOp(usr);
     if (!user)
       continue;
-    if (isa<ttg::LocalStoreOp>(user))
+    if (isa<ttg::LocalStoreOp, ttnvws::DescriptorLoadOp>(user))
       return user;
     if (isa<ttng::AsyncTMACopyGlobalToLocalOp>(user))
       return user;
@@ -163,7 +243,7 @@ static void getAllConsumers(AllocChannel *ch,
     Operation *user = skipIdxOp(usr);
     if (!user)
       continue;
-    if (!isa<ttg::LocalStoreOp>(user) &&
+    if (!isa<ttg::LocalStoreOp, ttnvws::DescriptorLoadOp>(user) &&
         !isa<ttng::AsyncTMACopyGlobalToLocalOp>(user))
       consumers.push_back(user);
   }
@@ -1764,8 +1844,8 @@ static bool isKeyOp(Operation *op) {
     return true;
 
   // Load operations
-  if (isa<tt::DescriptorLoadOp, tt::LoadOp, ttng::TMEMLoadOp, ttg::LocalLoadOp>(
-          op))
+  if (isa<ttnvws::DescriptorLoadOp, tt::LoadOp, ttng::TMEMLoadOp,
+          ttg::LocalLoadOp>(op))
     return true;
 
   // Store operations
@@ -1870,9 +1950,10 @@ static std::string getKeyOpDescription(Operation *op) {
   }
 
   // For loads, show source and result
-  if (auto loadOp = dyn_cast<tt::DescriptorLoadOp>(op)) {
+  if (auto loadOp = dyn_cast<ttnvws::DescriptorLoadOp>(op)) {
+    // NVWS "result" is the destination memdesc operand, not an SSA result.
     ss << opName << " " << formatInput(loadOp.getDesc()) << " -> "
-       << formatOutput(loadOp.getResult());
+       << formatInput(loadOp.getResult());
     return result;
   }
   if (auto loadOp = dyn_cast<tt::LoadOp>(op)) {
@@ -2093,7 +2174,7 @@ static std::string getKeyOpLabel(Operation *op) {
     std::string aName = getValueDisplayName(mmaOp.getA());
     std::string bName = getValueDisplayName(mmaOp.getB());
     label += outputName + " = " + opName + "(" + aName + ", " + bName + ")";
-  } else if (isa<tt::DescriptorLoadOp, tt::LoadOp, ttng::TMEMLoadOp,
+  } else if (isa<ttnvws::DescriptorLoadOp, tt::LoadOp, ttng::TMEMLoadOp,
                  ttg::LocalLoadOp>(op)) {
     // Load: out = load(src)
     std::string inputs = getTensorInputs(op);
@@ -3488,7 +3569,7 @@ static void createAllocChannel(Operation *allocOp, mlir::DominanceInfo &dom,
         // Alloc associated with operand D can have multiple producers.
         assert(mmaOp.getAccumulator() != allocOp->getResult(0));
         consumers.push_back(user);
-      } else if (isa<ttg::LocalStoreOp>(user)) {
+      } else if (isa<ttg::LocalStoreOp, ttnvws::DescriptorLoadOp>(user)) {
         assert(producerOp == nullptr);
         producerOp = user;
       } else if (auto subtiled = dyn_cast<ttng::SubtiledRegionOp>(user)) {
@@ -3551,9 +3632,16 @@ static void createAllocChannel(Operation *allocOp, mlir::DominanceInfo &dom,
   SmallVector<int> consumerTaskIds;
   DenseSet<int> seenTaskIds;
   for (auto *consumer : consumers) {
-    for (int id : getAsyncTaskIds(consumer)) {
-      if (seenTaskIds.insert(id).second)
-        consumerTaskIds.push_back(id);
+    SmallVector<Operation *> taskOwners = {consumer};
+    // A memdesc view can carry boundary task IDs that do not all consume the
+    // buffer. Descriptor channels synchronize with the terminal consumers.
+    if (isa<ttnvws::DescriptorLoadOp>(producerOp))
+      taskOwners = getActualConsumers(consumer);
+    for (Operation *taskOwner : taskOwners) {
+      for (int id : getAsyncTaskIds(taskOwner)) {
+        if (seenTaskIds.insert(id).second)
+          consumerTaskIds.push_back(id);
+      }
     }
   }
 
@@ -3710,42 +3798,50 @@ Operation *getSameLevelOp(Operation *p, Operation *c) {
 };
 
 // When the consumer is a local_alloc loading from shared memory to registers,
-// look ahead for the actual consumers, usually dot ops, that can directly
-// use shared memory. The local_alloc will be removed later.
+// look ahead for the actual consumers, usually dot ops, that can directly use
+// shared memory. Address-only memdesc views are not consumers: follow them to
+// their transitive users so the channel's release is placed after the last
+// operation that reads the buffer. The local_alloc will be removed later.
 SmallVector<Operation *> getActualConsumers(Operation *consumerOp) {
-  // TransOp is not a real consumer. It caculates the shared memory
-  // address for the real consumer. Continue to find its transitive users
-  // recursively. Return all transitive users;
-  auto goThroughTrans = [&](Operation *user) -> DenseSet<Operation *> {
+  // Keep this in sync with WSCodePartition.cpp's isMemDescView: every
+  // address-only memdesc view must be followed, or the release lands after the
+  // view instead of the real reader and the buffer is recycled early (a
+  // shared-buffer WAR race). tt::TransOp is the tensor-level analogue.
+  auto isView = [](Operation *op) {
+    return isa<tt::TransOp, ttg::MemDescIndexOp, ttg::MemDescSubsliceOp,
+               ttg::MemDescReinterpretOp, ttg::MemDescTransOp,
+               ttg::MemDescReshapeOp>(op);
+  };
+  auto goThroughViews = [&](Operation *user) -> DenseSet<Operation *> {
     DenseSet<Operation *> users;
     DenseSet<Operation *> visited;
-    SmallVector<Operation *> transUsers;
-    transUsers.push_back(user);
-    while (!transUsers.empty()) {
-      auto transUser = transUsers.pop_back_val();
-      visited.insert(transUser);
-      if (isa<tt::TransOp, ttg::MemDescTransOp>(transUser)) {
-        for (auto transitiveUser : transUser->getUsers()) {
+    SmallVector<Operation *> viewUsers;
+    viewUsers.push_back(user);
+    while (!viewUsers.empty()) {
+      auto viewUser = viewUsers.pop_back_val();
+      if (!visited.insert(viewUser).second)
+        continue;
+      if (isView(viewUser)) {
+        for (auto transitiveUser : viewUser->getUsers()) {
           if (!visited.count(transitiveUser))
-            transUsers.push_back(transitiveUser);
+            viewUsers.push_back(transitiveUser);
         }
       } else {
-        users.insert(transUser);
+        users.insert(viewUser);
       }
     }
     return users;
   };
-  if (isa<ttg::MemDescTransOp>(consumerOp)) {
-    auto users = goThroughTrans(consumerOp);
+  if (isView(consumerOp)) {
+    auto users = goThroughViews(consumerOp);
     return SmallVector<Operation *>(users.begin(), users.end());
   }
   if (isa<ttg::LocalAllocOp>(consumerOp)) {
     DenseSet<Operation *> users;
     for (auto user : consumerOp->getUsers()) {
-      if (isa<tt::TransOp, ttg::MemDescTransOp>(user)) {
-        auto transUsers = goThroughTrans(user);
-        for (auto *tUsr : transUsers)
-          users.insert(tUsr);
+      if (isView(user)) {
+        auto viewUsers = goThroughViews(user);
+        users.insert(viewUsers.begin(), viewUsers.end());
       } else {
         users.insert(user);
       }

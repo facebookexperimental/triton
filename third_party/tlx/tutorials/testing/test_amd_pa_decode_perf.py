@@ -3,6 +3,7 @@ import math
 import os
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 import triton
@@ -12,17 +13,33 @@ from triton.language.extra.tlx.ops.amd_pa_decode import (
     pa_decode_tlx as _pa_decode_tlx,
     build_inputs as _build_inputs,
     get_pa_decode_config as _get_pa_decode_config,
+    ref_decode as _ref_decode,
 )
 
-from triton._internal_testing import is_hip
+from triton._internal_testing import is_hip, is_hip_cdna4
 
+pytestmark = pytest.mark.skipif(not is_hip(), reason="Requires HIP backend")
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
 # Fixed decode problem geometry (GQA, bf16 KV), matching the paged-decode
 # correctness case. The sweep varies batch x context x query_length.
 NUM_KV_HEADS = 8
 QUERY_GROUP_SIZE = 8
+NUM_Q_HEADS = NUM_KV_HEADS * QUERY_GROUP_SIZE
+HEAD_DIM = 64
+PAGE_SIZE = 16
 
+
+def _check_aiter_available():
+    try:
+        import aiter  # noqa: F401
+
+        return True
+    except Exception:
+        return False
+
+
+_AITER_AVAILABLE = _check_aiter_available()
 DECODE_METHODS = (
     "aiter_common",
     "sglang",
@@ -35,7 +52,8 @@ DECODE_METHODS = (
 )
 # PR #2306 target comparison: standalone AITER common/HIP, SGLang's actual
 # vectorized-5D wrapper (which calls AITER Gluon), and native TLX 5D.
-DEFAULT_DECODE_VERSIONS = ["aiter_common", "sglang", "tlx_5d"]
+DEFAULT_DECODE_VERSIONS = ["aiter_common", "sglang", "tlx_5d"] if _AITER_AVAILABLE else ["tlx_5d"]
+CORRECTNESS_METHODS = ("tlx", "aiter_gluon") if _AITER_AVAILABLE else ("tlx", )
 
 
 def _make_decode_fn(
@@ -90,6 +108,9 @@ def _make_decode_fn(
             )
 
         return _run_tlx
+
+    if not _AITER_AVAILABLE:
+        return None
 
     num_seqs = q.shape[0] // qlen
     context_partition_size = 256
@@ -203,19 +224,7 @@ def _make_decode_fn(
     )
 
 
-def create_benchmark(
-    versions,
-    qlen,
-    head_dim,
-    page_size,
-    warmup_ms=100,
-    rep_ms=200,
-    shared_page_pool=False,
-):
-    if qlen != 1 and "sglang" in versions:
-        raise ValueError("SGLang's vectorized_5d decode wrapper only supports query_length=1")
-    line_vals = list(versions)
-    line_names = list(versions)
+def get_x_values():
     # (BATCH, N_CTX)
     x_vals = [
         (1, 8192),
@@ -228,10 +237,27 @@ def create_benchmark(
         (8, 131072),
     ]
 
+    return x_vals
+
+
+def create_benchmark(
+    versions,
+    qlen,
+    head_dim,
+    page_size,
+    warmup_ms=100,
+    rep_ms=200,
+    shared_page_pool=False,
+):
+    if qlen != 1 and any(provider in versions for provider in ("sglang", "sglang_tlx")):
+        raise ValueError("SGLang's vectorized_5d decode wrapper only supports query_length=1")
+    line_vals = list(versions)
+    line_names = list(versions)
+
     @triton.testing.perf_report(
         triton.testing.Benchmark(
             x_names=["BATCH", "N_CTX"],
-            x_vals=x_vals,
+            x_vals=get_x_values(),
             line_arg="provider",
             line_vals=line_vals,
             line_names=line_names,
@@ -278,16 +304,62 @@ def create_benchmark(
             QUERY_GROUP_SIZE,
             head_dim,
         )
+        if fn is None:
+            return float("nan"), float("nan"), float("nan")
         quantiles = [0.5, 0.2, 0.8]
         ms, min_ms, max_ms = triton.testing.do_bench(fn, quantiles=quantiles, warmup=warmup_ms, rep=rep_ms)
 
         # Decode reads the whole KV cache once (K + V, bf16): report effective
         # HBM read bandwidth, the meaningful metric for this memory-bound op.
-        kv_bytes = 2 * BATCH * NUM_KV_HEADS * N_CTX * head_dim * 2
+        # Use actual tensor sizes: with pool_pages sharing, multiple sequences
+        # map to the same physical pages, so BATCH*N_CTX overcounts HBM bytes.
+        kv_bytes = (kc.numel() + vc.numel()) * kc.element_size()
         tbps = lambda ms: kv_bytes * 1e-12 / (ms * 1e-3)
         return tbps(ms), tbps(max_ms), tbps(min_ms)
 
     return benchmark
+
+
+@pytest.mark.parametrize("provider", CORRECTNESS_METHODS)
+@pytest.mark.parametrize("query_length", [1, 2, 3, 4], ids=lambda q: f"qlen{q}")
+@pytest.mark.parametrize("batch, n_ctx", get_x_values())
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware (CDNA4)")
+def test_correctness(batch, n_ctx, query_length, provider):
+    sm_scale = 1.0 / (HEAD_DIM**0.5)
+    ctx_lens = [n_ctx] * batch
+    query, key_cache, value_cache, context_lens, block_tables = _build_inputs(
+        batch,
+        ctx_lens,
+        NUM_Q_HEADS,
+        NUM_KV_HEADS,
+        HEAD_DIM,
+        PAGE_SIZE,
+        query_length=query_length,
+        device=DEVICE,
+        cache_layout="4d" if provider == "tlx" else "5d",
+    )
+    out = torch.empty_like(query)
+    fn = _make_decode_fn(
+        provider,
+        out,
+        query,
+        key_cache,
+        value_cache,
+        context_lens,
+        block_tables,
+        sm_scale,
+        query_length,
+        n_ctx,
+        NUM_KV_HEADS,
+        QUERY_GROUP_SIZE,
+        HEAD_DIM,
+    )
+    if fn is None:
+        pytest.skip(f"{provider} not available")
+    fn()
+    ref = _ref_decode(query, key_cache, value_cache, context_lens, block_tables, sm_scale, NUM_Q_HEADS, NUM_KV_HEADS,
+                      query_length)
+    torch.testing.assert_close(out.float(), ref, atol=2e-2, rtol=2e-2)
 
 
 if __name__ == "__main__":
@@ -312,6 +384,8 @@ if __name__ == "__main__":
     parser.add_argument("--page-sizes", type=int, nargs="+", default=[16])
     parser.add_argument(
         "--shared-page-pool",
+        "--use_cache_pool",
+        dest="shared_page_pool",
         action="store_true",
         help="Reproduce PR #2306 page reuse; large-batch results measure substantial L2 reuse.",
     )

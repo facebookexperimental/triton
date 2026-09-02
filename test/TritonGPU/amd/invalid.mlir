@@ -1,5 +1,21 @@
 // RUN: triton-opt --split-input-file %s --verify-diagnostics
 
+// A pinned layout is still subject to the physical TDM layout constraints.
+#tdm_bad_swizzle = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 2, order = [1, 0]}>
+#tdm_bad_pinned = #tlx.user_layout<#tdm_bad_swizzle>
+#tdm_bad_smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @tdm_pinned_layout_still_validated(
+      %desc: !tt.tensordesc<32x32xf16>,
+      %buf: !ttg.memdesc<32x32xf16, #tdm_bad_pinned, #tdm_bad_smem, mutable>) {
+    // expected-error @+1 {{TDM does not support swizzling}}
+    %token = amdg.async_tdm_copy_global_to_local %desc into %buf : !tt.tensordesc<32x32xf16> -> !ttg.memdesc<32x32xf16, #tdm_bad_pinned, #tdm_bad_smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
 // expected-error @+1 {{WMMA version must be in the [1, 3] range}}
 #wmma = #ttg.amd_wmma<{version = 0, isTranspose = false, ctaLayout = {warp = [[0, 1], [1, 0]]}}>
 module attributes {"ttg.num-warps" = 4 : i32, "ttg.num-ctas" = 1 : i32, "ttg.threads-per-warp" = 32 : i32} {
@@ -227,6 +243,91 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     amdg.async_tdm_copy_local_to_global %tensorDesc from %memDesc: !ttg.memdesc<128x64xf16, #shared_2_intervals, #smem, mutable> -> !tt.tensordesc<128x64xf16>
     tt.return
   }
+
+  tt.func public @tdm_load_two_padding_intervals(
+    %tensorDesc: !tt.tensordesc<128x64xf16>,
+    %memDesc: !ttg.memdesc<128x64xf16, #shared_2_intervals, #smem, mutable>
+  ) {
+    // expected-error @+1 {{TDM load only supports a single interval-padding pair}}
+    %0 = amdg.async_tdm_copy_global_to_local %tensorDesc into %memDesc : !tt.tensordesc<128x64xf16> -> !ttg.memdesc<128x64xf16, #shared_2_intervals, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+// Fused TDM verifier coverage.
+#fused = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @fused_tdm_overlapping_hints(
+      %a: !tt.tensordesc<64x64xf16>, %b: !tt.tensordesc<64x64xf16>,
+      %da: !ttg.memdesc<64x64xf16, #fused, #smem, mutable>,
+      %db: !ttg.memdesc<64x64xf16, #fused, #smem, mutable>) {
+    // expected-error @+1 {{requires pairwise-disjoint warp_used_hint values}}
+    %0 = amdg.async_tdm_fused_copy_global_to_local %a, %b into %da, %db {warp_used_hints = array<i32: 3, 3>} : !tt.tensordesc<64x64xf16>, !tt.tensordesc<64x64xf16> -> !ttg.memdesc<64x64xf16, #fused, #smem, mutable>, !ttg.memdesc<64x64xf16, #fused, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+#fused = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @fused_tdm_rank_mismatch(
+      %a: !tt.tensordesc<64x64xf16>, %b: !tt.tensordesc<64x64x1xf16>,
+      %da: !ttg.memdesc<64x64xf16, #fused, #smem, mutable>,
+      %db: !ttg.memdesc<64x64x1xf16, #fused, #smem, mutable>) {
+    // expected-error @+1 {{requires all member descriptors to have the same rank}}
+    %0 = amdg.async_tdm_fused_copy_global_to_local %a, %b into %da, %db {warp_used_hints = array<i32: 3, 12>} : !tt.tensordesc<64x64xf16>, !tt.tensordesc<64x64x1xf16> -> !ttg.memdesc<64x64xf16, #fused, #smem, mutable>, !ttg.memdesc<64x64x1xf16, #fused, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+#fused = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @fused_tdm_element_width_mismatch(
+      %a: !tt.tensordesc<64x64xf16>, %b: !tt.tensordesc<64x64xf16>,
+      %da: !ttg.memdesc<64x64xf32, #fused, #smem, mutable>,
+      %db: !ttg.memdesc<64x64xf16, #fused, #smem, mutable>) {
+    // expected-error @+1 {{requires each descriptor and its destination to have the same element bitwidth}}
+    %0 = amdg.async_tdm_fused_copy_global_to_local %a, %b into %da, %db {warp_used_hints = array<i32: 3, 12>} : !tt.tensordesc<64x64xf16>, !tt.tensordesc<64x64xf16> -> !ttg.memdesc<64x64xf32, #fused, #smem, mutable>, !ttg.memdesc<64x64xf16, #fused, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+#fused = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @fused_tdm_one_member(
+      %desc: !tt.tensordesc<64x64xf16>,
+      %dst: !ttg.memdesc<64x64xf16, #fused, #smem, mutable>) {
+    // expected-error @+1 {{requires 2 to 4 members}}
+    %0 = amdg.async_tdm_fused_copy_global_to_local %desc into %dst {warp_used_hints = array<i32: 15>} : !tt.tensordesc<64x64xf16> -> !ttg.memdesc<64x64xf16, #fused, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+#multi_pad = #ttg.padded_shared<[32:+4, 64:+4] {order = [1, 0], shape = [64, 64]}>
+#fused = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @fused_tdm_multi_padding_pairs(
+      %a: !tt.tensordesc<64x64xf16>, %b: !tt.tensordesc<64x64xf16>,
+      %da: !ttg.memdesc<64x64xf16, #multi_pad, #smem, mutable>,
+      %db: !ttg.memdesc<64x64xf16, #fused, #smem, mutable>) {
+    // expected-error @+1 {{TDM load only supports a single interval-padding pair}}
+    %0 = amdg.async_tdm_fused_copy_global_to_local %a, %b into %da, %db {warp_used_hints = array<i32: 3, 12>} : !tt.tensordesc<64x64xf16>, !tt.tensordesc<64x64xf16> -> !ttg.memdesc<64x64xf16, #multi_pad, #smem, mutable>, !ttg.memdesc<64x64xf16, #fused, #smem, mutable>
+    tt.return
+  }
 }
 
 // -----
@@ -251,6 +352,19 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.thr
     // expected-error @+1 {{requires an integer or floating-point element type}}
     %0 = amdg.register_resident %arg0 class "agpr" groups 1
         : tensor<64x!tt.ptr<f32>, #distributed>
+    tt.return
+  }
+}
+
+// -----
+
+#handoff_distributed = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @register_handoff_requires_complete_native_groups(
+      %arg0: tensor<64xf16, #handoff_distributed>) {
+    // expected-error @+1 {{requires 1 elements per thread to be divisible by the 2-element native tuple}}
+    %0 = amdg.register_handoff %arg0 class "vgpr"
+        : tensor<64xf16, #handoff_distributed>
     tt.return
   }
 }
@@ -320,7 +434,13 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.thr
 #half_register_lhs = #ttg.dot_op<{opIdx = 0, parent = #half_register_mma, kWidth = 8}>
 
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.target" = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
-  tt.func @mfma_commit_rejects_partial_register_fragment(
+  // The dependency's encoding is checked for a native instruction shape before
+  // its per-lane fragment is sized. That ordering makes the "positive integral
+  // number of 32-bit registers" diagnostic below unreachable for BF16/F16:
+  // a native version-4 shape always yields 8 elements per lane (128 bits), and
+  // the odd counts that would trip it need K in {4, 12, 20, ...}, which the
+  // shape check rejects first. Pin the diagnostic that actually fires.
+  tt.func @mfma_commit_rejects_non_native_dependency_shape(
       %a: tensor<16x32xbf16, #scheduled_lhs>,
       %b: tensor<32x16xbf16, #scheduled_rhs>,
       %dependency: tensor<16x4xbf16, #half_register_lhs>) {
@@ -333,10 +453,82 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.tar
           tensor<32x16xbf16, #scheduled_rhs>,
           tensor<16x16xf32, #scheduled_mma>
           -> tensor<16x16xf32, #scheduled_mma>
-    // expected-error @+1 {{input 1 native dot fragment must occupy a positive integral number of 32-bit registers}}
+    // expected-error @+1 {{input 1 MFMA encoding version 4 supports only its native 32x32x16 and 16x16x32 shapes}}
     %committed, %preserved = amdg.mfma_commit %result, %dependency
         : tensor<16x16xf32, #scheduled_mma>,
           tensor<16x4xbf16, #half_register_lhs>
+    tt.return
+  }
+}
+
+// -----
+
+#scheduled_mismatch_mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [1, 1], instrShape = [16, 16, 32], isTransposed = true}>
+#scheduled_mismatch_lhs = #ttg.dot_op<{opIdx = 0, parent = #scheduled_mismatch_mma, kWidth = 4}>
+#scheduled_mismatch_rhs = #ttg.dot_op<{opIdx = 1, parent = #scheduled_mismatch_mma, kWidth = 8}>
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.target" = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @scheduled_mfma_rejects_mismatched_kwidth(
+      %a: tensor<16x32xbf16, #scheduled_mismatch_lhs>,
+      %b: tensor<32x16xbf16, #scheduled_mismatch_rhs>) {
+    %acc = arith.constant dense<0.000000e+00> :
+        tensor<16x16xf32, #scheduled_mismatch_mma>
+    // expected-error @+1 {{operand dot layouts must use the same kWidth}}
+    %result = amdg.scheduled_mfma %a, %b, %acc
+        resident "none" accumulator "transient"
+        register_class "auto" initialize true
+        : tensor<16x32xbf16, #scheduled_mismatch_lhs>,
+          tensor<32x16xbf16, #scheduled_mismatch_rhs>,
+          tensor<16x16xf32, #scheduled_mismatch_mma>
+          -> tensor<16x16xf32, #scheduled_mismatch_mma>
+    tt.return
+  }
+}
+
+// -----
+
+#scheduled_unsupported_mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [1, 1], instrShape = [16, 16, 32], isTransposed = true}>
+#scheduled_unsupported_lhs = #ttg.dot_op<{opIdx = 0, parent = #scheduled_unsupported_mma, kWidth = 16}>
+#scheduled_unsupported_rhs = #ttg.dot_op<{opIdx = 1, parent = #scheduled_unsupported_mma, kWidth = 16}>
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.target" = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @scheduled_mfma_rejects_unsupported_kwidth(
+      %a: tensor<16x64xbf16, #scheduled_unsupported_lhs>,
+      %b: tensor<64x16xbf16, #scheduled_unsupported_rhs>) {
+    %acc = arith.constant dense<0.000000e+00> :
+        tensor<16x16xf32, #scheduled_unsupported_mma>
+    // expected-error @+1 {{operand A must use the matching opIdx=0, kWidth=4/8 dot layout}}
+    %result = amdg.scheduled_mfma %a, %b, %acc
+        resident "none" accumulator "transient"
+        register_class "auto" initialize true
+        : tensor<16x64xbf16, #scheduled_unsupported_lhs>,
+          tensor<64x16xbf16, #scheduled_unsupported_rhs>,
+          tensor<16x16xf32, #scheduled_unsupported_mma>
+          -> tensor<16x16xf32, #scheduled_unsupported_mma>
+    tt.return
+  }
+}
+
+// -----
+
+#scheduled_partial_k_mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [1, 1], instrShape = [16, 16, 32], isTransposed = true}>
+#scheduled_partial_k_lhs = #ttg.dot_op<{opIdx = 0, parent = #scheduled_partial_k_mma, kWidth = 4}>
+#scheduled_partial_k_rhs = #ttg.dot_op<{opIdx = 1, parent = #scheduled_partial_k_mma, kWidth = 4}>
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.target" = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @scheduled_mfma_rejects_partial_native_k_fragment(
+      %a: tensor<16x16xbf16, #scheduled_partial_k_lhs>,
+      %b: tensor<16x16xbf16, #scheduled_partial_k_rhs>) {
+    %acc = arith.constant dense<0.000000e+00> :
+        tensor<16x16xf32, #scheduled_partial_k_mma>
+    // expected-error @+1 {{operand K ownership must contain complete native MFMA fragments}}
+    %result = amdg.scheduled_mfma %a, %b, %acc
+        resident "none" accumulator "transient"
+        register_class "auto" initialize true
+        : tensor<16x16xbf16, #scheduled_partial_k_lhs>,
+          tensor<16x16xbf16, #scheduled_partial_k_rhs>,
+          tensor<16x16xf32, #scheduled_partial_k_mma>
+          -> tensor<16x16xf32, #scheduled_partial_k_mma>
     tt.return
   }
 }
@@ -622,6 +814,23 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 
 // -----
 
+#shared_inner_dynamic = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#partitioned_dynamic = #ttg.partitioned_shared<{numPartitions = 2, numGroups = 2, partitionDim = 0, partitionLayout = #shared_inner_dynamic}>
+#smem_dynamic = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @dynamic_subslice_partitioned(
+    %src: !ttg.memdesc<8x16xf16, #partitioned_dynamic, #smem_dynamic, mutable>,
+    %row: i32
+  ) {
+    %zero = arith.constant 0 : i32
+    // expected-error @+1 {{dynamic subslices do not support partitioned shared encodings}}
+    %view = ttg.memdesc_dynamic_subslice %src[%row, %zero] : !ttg.memdesc<8x16xf16, #partitioned_dynamic, #smem_dynamic, mutable> -> !ttg.memdesc<1x16xf16, #partitioned_dynamic, #smem_dynamic, mutable, 8x16>
+    tt.return
+  }
+}
+
+// -----
+
 #fp4_src = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [8, 8], warpsPerCTA = [1, 1], order = [1, 0]}>
 #fp4_dst = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [8, 8], warpsPerCTA = [1, 1], order = [1, 0]}>
 #fp4_dst_bad = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [8, 8], warpsPerCTA = [1, 1], order = [1, 0]}>
@@ -776,6 +985,162 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
   ) {
     // expected-error @+1 {{is inconsistent with the shared memory allocation layout}}
     %token = amdg.async_tdm_copy_global_to_local %tensorDesc into %memDesc : !tt.tensordesc<64x64xf16, #load_desc> -> !ttg.memdesc<64x64xf16, #load_alloc, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+#v4_on_gfx942_mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [1, 1], instrShape = [16, 16, 32], isTransposed = true}>
+#v4_on_gfx942_lhs = #ttg.dot_op<{opIdx = 0, parent = #v4_on_gfx942_mma, kWidth = 8}>
+#v4_on_gfx942_rhs = #ttg.dot_op<{opIdx = 1, parent = #v4_on_gfx942_mma, kWidth = 8}>
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.target" = "hip:gfx942", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @mfma_commit_rejects_cdna4_encoding_on_cdna3_target(
+      %result: tensor<16x16xf32, #v4_on_gfx942_mma>,
+      %dependency: tensor<32x16xbf16, #v4_on_gfx942_rhs>) {
+    // expected-error @+1 {{input 0 uses MFMA version 4, but the target requires version 3}}
+    %committed, %preserved = amdg.mfma_commit %result, %dependency
+        : tensor<16x16xf32, #v4_on_gfx942_mma>,
+          tensor<32x16xbf16, #v4_on_gfx942_rhs>
+    tt.return
+  }
+}
+
+// -----
+
+// No ttg.target: the encoding version alone must still gate the native shape.
+#untargeted_mma = #ttg.amd_mfma<{version = 3, warpsPerCTA = [1, 1], instrShape = [16, 16, 32], isTransposed = true}>
+#untargeted_lhs = #ttg.dot_op<{opIdx = 0, parent = #untargeted_mma, kWidth = 4}>
+#untargeted_rhs = #ttg.dot_op<{opIdx = 1, parent = #untargeted_mma, kWidth = 4}>
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @scheduled_mfma_rejects_cdna4_shape_on_v3_encoding(
+      %a: tensor<16x32xbf16, #untargeted_lhs>,
+      %b: tensor<32x16xbf16, #untargeted_rhs>) {
+    %acc = arith.constant dense<0.000000e+00> :
+        tensor<16x16xf32, #untargeted_mma>
+    // expected-error @+1 {{MFMA encoding version 3 supports only its native 32x32x8 and 16x16x16 shapes}}
+    %result = amdg.scheduled_mfma %a, %b, %acc
+        resident "none" accumulator "transient"
+        register_class "auto" initialize true
+        : tensor<16x32xbf16, #untargeted_lhs>,
+          tensor<32x16xbf16, #untargeted_rhs>,
+          tensor<16x16xf32, #untargeted_mma>
+          -> tensor<16x16xf32, #untargeted_mma>
+    tt.return
+  }
+}
+
+// -----
+
+#v3_on_gfx950_mma = #ttg.amd_mfma<{version = 3, warpsPerCTA = [1, 1], instrShape = [16, 16, 16], isTransposed = true}>
+#v3_on_gfx950_lhs = #ttg.dot_op<{opIdx = 0, parent = #v3_on_gfx950_mma, kWidth = 4}>
+#v3_on_gfx950_rhs = #ttg.dot_op<{opIdx = 1, parent = #v3_on_gfx950_mma, kWidth = 4}>
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.target" = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @scheduled_mfma_rejects_cdna3_encoding_on_cdna4_target(
+      %a: tensor<16x16xbf16, #v3_on_gfx950_lhs>,
+      %b: tensor<16x16xbf16, #v3_on_gfx950_rhs>) {
+    %acc = arith.constant dense<0.000000e+00> :
+        tensor<16x16xf32, #v3_on_gfx950_mma>
+    // expected-error @+1 {{uses MFMA version 3, but the target requires version 4}}
+    %result = amdg.scheduled_mfma %a, %b, %acc
+        resident "none" accumulator "transient"
+        register_class "auto" initialize true
+        : tensor<16x16xbf16, #v3_on_gfx950_lhs>,
+          tensor<16x16xbf16, #v3_on_gfx950_rhs>,
+          tensor<16x16xf32, #v3_on_gfx950_mma>
+          -> tensor<16x16xf32, #v3_on_gfx950_mma>
+    tt.return
+  }
+}
+
+// -----
+
+// The commit boundary derives its hazard wait from the shape triple, so a
+// shape the encoding version does not have must be rejected rather than
+// silently treated as the version's other native shape.
+#nonnative_result_mma = #ttg.amd_mfma<{version = 3, warpsPerCTA = [1, 1], instrShape = [32, 32, 16], isTransposed = true}>
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.target" = "hip:gfx942", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @mfma_commit_rejects_cdna4_shape_on_v3_result(
+      %result: tensor<32x32xf32, #nonnative_result_mma>) {
+    // expected-error @+1 {{input 0 MFMA encoding version 3 supports only its native 32x32x8 and 16x16x16 shapes}}
+    %committed = amdg.mfma_commit %result
+        : tensor<32x32xf32, #nonnative_result_mma>
+    tt.return
+  }
+}
+
+// -----
+
+#native_result_mma = #ttg.amd_mfma<{version = 3, warpsPerCTA = [1, 1], instrShape = [16, 16, 16], isTransposed = true}>
+#nonnative_dep_mma = #ttg.amd_mfma<{version = 3, warpsPerCTA = [1, 1], instrShape = [16, 16, 32], isTransposed = true}>
+#nonnative_dep_rhs = #ttg.dot_op<{opIdx = 1, parent = #nonnative_dep_mma, kWidth = 4}>
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.target" = "hip:gfx942", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @mfma_commit_rejects_cdna4_shape_on_v3_dependency(
+      %result: tensor<16x16xf32, #native_result_mma>,
+      %dependency: tensor<32x16xbf16, #nonnative_dep_rhs>) {
+    // expected-error @+1 {{input 1 MFMA encoding version 3 supports only its native 32x32x8 and 16x16x16 shapes}}
+    %committed, %preserved = amdg.mfma_commit %result, %dependency
+        : tensor<16x16xf32, #native_result_mma>,
+          tensor<32x16xbf16, #nonnative_dep_rhs>
+    tt.return
+  }
+}
+
+// -----
+
+// An AGPR-resident accumulator is read back with a compiler-generated
+// v_accvgpr_read that CDNA3's inline-assembly hazard padding cannot order
+// against the MFMA drain, so the explicit class is rejected on that target.
+#agpr_cdna3_mma = #ttg.amd_mfma<{version = 3, warpsPerCTA = [1, 1], instrShape = [16, 16, 16], isTransposed = true}>
+#agpr_cdna3_lhs = #ttg.dot_op<{opIdx = 0, parent = #agpr_cdna3_mma, kWidth = 4}>
+#agpr_cdna3_rhs = #ttg.dot_op<{opIdx = 1, parent = #agpr_cdna3_mma, kWidth = 4}>
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.target" = "hip:gfx942", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @scheduled_mfma_rejects_explicit_agpr_on_cdna3(
+      %a: tensor<16x16xbf16, #agpr_cdna3_lhs>,
+      %b: tensor<16x16xbf16, #agpr_cdna3_rhs>) {
+    %acc = arith.constant dense<0.000000e+00> :
+        tensor<16x16xf32, #agpr_cdna3_mma>
+    // expected-error @+1 {{accumulator_register_class "agpr" is not yet supported on CDNA3}}
+    %result = amdg.scheduled_mfma %a, %b, %acc
+        resident "none" accumulator "persistent"
+        register_class "agpr" initialize true
+        : tensor<16x16xbf16, #agpr_cdna3_lhs>,
+          tensor<16x16xbf16, #agpr_cdna3_rhs>,
+          tensor<16x16xf32, #agpr_cdna3_mma>
+          -> tensor<16x16xf32, #agpr_cdna3_mma>
+    tt.return
+  }
+}
+
+// -----
+
+// "auto" names AGPRs for a persistent accumulator, so CDNA3 rejects it too.
+// Such kernels must request "vgpr" instead of "auto" meaning a different class
+// than it does on CDNA4.
+#auto_cdna3_mma = #ttg.amd_mfma<{version = 3, warpsPerCTA = [1, 1], instrShape = [16, 16, 16], isTransposed = true}>
+#auto_cdna3_lhs = #ttg.dot_op<{opIdx = 0, parent = #auto_cdna3_mma, kWidth = 4}>
+#auto_cdna3_rhs = #ttg.dot_op<{opIdx = 1, parent = #auto_cdna3_mma, kWidth = 4}>
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.target" = "hip:gfx942", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @scheduled_mfma_rejects_persistent_auto_on_cdna3(
+      %a: tensor<16x16xbf16, #auto_cdna3_lhs>,
+      %b: tensor<16x16xbf16, #auto_cdna3_rhs>) {
+    %acc = arith.constant dense<0.000000e+00> :
+        tensor<16x16xf32, #auto_cdna3_mma>
+    // expected-error @+1 {{accumulator_register_class "auto" is not yet supported on CDNA3 for a "persistent" accumulator}}
+    %result = amdg.scheduled_mfma %a, %b, %acc
+        resident "none" accumulator "persistent"
+        register_class "auto" initialize true
+        : tensor<16x16xbf16, #auto_cdna3_lhs>,
+          tensor<16x16xbf16, #auto_cdna3_rhs>,
+          tensor<16x16xf32, #auto_cdna3_mma>
+          -> tensor<16x16xf32, #auto_cdna3_mma>
     tt.return
   }
 }

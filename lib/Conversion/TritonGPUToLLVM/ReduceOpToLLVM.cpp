@@ -1,5 +1,6 @@
 #include "ReduceScanCommon.h"
 
+#include <iterator>
 #include <map>
 #include <memory>
 #include <numeric>
@@ -19,6 +20,7 @@
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/ClusterBarrierMbarAllocator.h"
 #include "triton/Tools/GenericSwizzling.h"
 #include "triton/Tools/LayoutUtils.h"
+#include "llvm/Support/MathExtras.h"
 
 using namespace mlir;
 using namespace mlir::triton;
@@ -34,10 +36,11 @@ struct ReduceOpConversion
     : public ConvertTritonGPUReduceScanToLLVMPattern<triton::ReduceOp> {
 public:
   ReduceOpConversion(LLVMTypeConverter &typeConverter,
-                     const TargetInfoBase &targetInfo, PatternBenefit benefit)
+                     const TargetInfoBase &targetInfo, PatternBenefit benefit,
+                     bool enableTreeReduction)
       : ConvertTritonGPUReduceScanToLLVMPattern<triton::ReduceOp>(typeConverter,
                                                                   benefit),
-        targetInfo(targetInfo) {}
+        targetInfo(targetInfo), enableTreeReduction(enableTreeReduction) {}
 
   LogicalResult
   matchAndRewrite(triton::ReduceOp op, OpAdaptor adaptor,
@@ -58,6 +61,7 @@ public:
 
 private:
   const TargetInfoBase &targetInfo;
+  bool enableTreeReduction;
 
   bool isInnerTree(triton::ReduceOp op) const {
     auto attr = op.getReductionOrderingAttr();
@@ -83,6 +87,8 @@ private:
         vals = removeBroadcast.apply(vals);
     }
 
+    std::tie(regLl, accs) =
+        reduceWithinThreads(op, std::move(regLl), std::move(accs), rewriter);
     std::tie(regLl, accs) =
         reduceWithinWarps(op, std::move(regLl), std::move(accs), rewriter);
 
@@ -136,8 +142,8 @@ private:
     for (unsigned i = 0; i < op.getNumOperands(); ++i) {
       if (auto resultTy =
               dyn_cast<RankedTensorType>(op.getResult()[i].getType())) {
-        results[i] = packLLElements(loc, getTypeConverter(), accs[i], rewriter,
-                                    resultTy);
+        results[i] = packTensorElements(loc, getTypeConverter(), accs[i],
+                                        rewriter, resultTy);
       } else {
         assert(accs[i].size() == 1 && "expected scalar reduce result");
         results[i] = accs[i][0];
@@ -212,15 +218,21 @@ private:
     return success();
   }
 
-  // Reduce values using a tree of the given arity. Arity=3 generates
-  // combine(combine(a, b), c) groups that LLVM folds into ternary
-  // instructions (e.g. v_maximum3_f32 on AMD).
+  // Reduce values using a tree of the given arity. Arity=1 performs a linear
+  // fold. Arity=3 generates combine(combine(a, b), c) groups that LLVM folds
+  // into ternary instructions (e.g. v_maximum3_f32 on AMD).
   SmallVector<Value> treeReduce(Location loc,
                                 ConversionPatternRewriter &rewriter,
                                 Region &combineOp,
                                 SmallVector<SmallVector<Value>> values,
                                 unsigned arity) const {
-    assert(!values.empty() && arity >= 2);
+    assert(!values.empty() && arity >= 1);
+    if (arity == 1) {
+      SmallVector<Value> acc;
+      for (auto &cur : values)
+        accumulate(loc, rewriter, combineOp, acc, cur);
+      return acc;
+    }
     while (values.size() > 1) {
       SmallVector<SmallVector<Value>> next;
       for (size_t i = 0; i < values.size(); i += arity) {
@@ -307,7 +319,7 @@ private:
     unsigned srcElems = getTotalElemsPerThread(types[0]);
     SmallVector<SmallVector<Value>> srcValues(srcElems);
     for (unsigned i = 0; i < op.getNumOperands(); ++i) {
-      auto values = unpackLLElements(loc, operands[i], rewriter);
+      auto values = unpackTensorElements(loc, operands[i], rewriter, types[i]);
 
       assert(values.size() == srcValues.size());
       for (unsigned j = 0; j < srcValues.size(); ++j) {
@@ -323,8 +335,10 @@ private:
     auto operands = adaptor.getOperands();
     SmallVector<SmallVector<Value>> srcValues;
     srcValues.reserve(op.getNumOperands());
-    for (unsigned i = 0; i < op.getNumOperands(); ++i)
-      srcValues.push_back(unpackLLElements(loc, operands[i], rewriter));
+    for (unsigned i = 0; i < op.getNumOperands(); ++i) {
+      srcValues.push_back(unpackTensorElements(loc, operands[i], rewriter,
+                                               op.getInputTypes()[i]));
+    }
     return srcValues;
   }
 
@@ -450,11 +464,13 @@ private:
           ArrayRef<Value>(permutedInVals).slice(i * tileSize, tileSize);
       lowerLdStShared(loc, ctx, storeCvt, tileInVals, llvmElemTy, smemBase,
                       /*paddingShifts=*/{}, affineOffset, maskSpanAffineOffset,
-                      rewriter, targetInfo);
+                      /*affineBlockOffset=*/Value(),
+                      /*maskSpanAffineBlock=*/0, rewriter, targetInfo);
       emitBarrier();
       auto tileOutVals = lowerLdStShared(
           loc, ctx, loadCvt, {}, llvmElemTy, smemBase, /*paddingShifts=*/{},
-          affineOffset, maskSpanAffineOffset, rewriter, targetInfo);
+          affineOffset, maskSpanAffineOffset, /*affineBlockOffset=*/Value(),
+          /*maskSpanAffineBlock=*/0, rewriter, targetInfo);
       llvm::append_range(outVals, tileOutVals);
     }
 
@@ -627,9 +643,12 @@ private:
       for (int idx : group)
         groupValues.push_back(srcValues[idx]);
 
-      auto vectorizeKind = helper.getInThreadVectorizeOpKind(
-          groupValues.size(), targetInfo.supportBitwidth16Elementwise(),
-          targetInfo.supportBitwidth32Elementwise());
+      auto vectorizeKind = enableTreeReduction
+                               ? helper.getInThreadVectorizeOpKind(
+                                     groupValues.size(),
+                                     targetInfo.supportBitwidth16Elementwise(),
+                                     targetInfo.supportBitwidth32Elementwise())
+                               : ReduceOpHelper::InThreadVectorizeOpKind::None;
       if (vectorizeKind == ReduceOpHelper::InThreadVectorizeOpKind::None)
         return reduceValueSequence(op.getLoc(), op, std::move(groupValues),
                                    rewriter);
@@ -670,25 +689,28 @@ private:
       return result;
     };
 
+    // Unordered reductions may combine all register groups that contribute to
+    // the same output element.  Keeping the groups separate forces each
+    // vectorized group to be reduced to a scalar before the partial results
+    // are combined, which introduces one horizontal vector reduction per
+    // group.  Merge them first so vector packing stays live across the whole
+    // in-thread reduction and is unpacked only once.
+    std::map<SmallVector<unsigned>, SmallVector<int>> mergedRegGroups;
     for (auto &[groupKey, group] : regGroups) {
-      auto reduced = reduceGroup(group);
       auto key = groupKey;
       key[axis] = 0;
-      bool isFirst = accs.find(key) == accs.end();
-      if (isFirst) {
-        accs[key] = std::move(reduced);
-        indices[key] = srcIndices[group.front()];
-      } else {
-        accumulate(op.getLoc(), rewriter, op.getCombineOp(), accs[key],
-                   reduced);
-      }
+      llvm::append_range(mergedRegGroups[key], group);
+    }
+    for (auto &[key, group] : mergedRegGroups) {
+      accs[key] = reduceGroup(group);
+      indices[key] = srcIndices[group.front()];
     }
   }
 
   std::pair<LinearLayout, SmallVector<SmallVector<Value>>>
-  reduceWithinWarps(triton::ReduceOp op, LinearLayout layout,
-                    SmallVector<SmallVector<Value>> accs,
-                    ConversionPatternRewriter &rewriter) const {
+  reduceWithinThreads(triton::ReduceOp op, LinearLayout layout,
+                      SmallVector<SmallVector<Value>> accs,
+                      ConversionPatternRewriter &rewriter) const {
     auto *ctx = op.getContext();
     auto loc = op.getLoc();
     unsigned axis = op.getAxis();
@@ -701,9 +723,12 @@ private:
     }
 
     ReduceOpHelper helper(op);
-    auto vectorizeKind = helper.getInThreadVectorizeOpKind(
-        axisPack, targetInfo.supportBitwidth16Elementwise(),
-        targetInfo.supportBitwidth32Elementwise());
+    auto vectorizeKind =
+        enableTreeReduction
+            ? helper.getInThreadVectorizeOpKind(
+                  axisPack, targetInfo.supportBitwidth16Elementwise(),
+                  targetInfo.supportBitwidth32Elementwise())
+            : ReduceOpHelper::InThreadVectorizeOpKind::None;
     bool vectorize =
         vectorizeKind != ReduceOpHelper::InThreadVectorizeOpKind::None;
 
@@ -734,9 +759,16 @@ private:
         vectorCombineRegion ? *vectorCombineRegion : op.getCombineOp();
 
     Operation &combinerOp = combineRegion.front().front();
-    unsigned arity = targetInfo.getReductionTreeArity(&combinerOp);
+    unsigned arity =
+        enableTreeReduction ? targetInfo.getReductionTreeArity(&combinerOp) : 1;
+    // A linear fold still needs bounded dependency chains. The contiguous
+    // register span is the lowering contract used by the legacy path: reduce
+    // one span, immediately merge it into the running result, then continue.
+    // Flattening all spans into one chain prevents LLVM from packing adjacent
+    // loop-carried values and sharply increases register pressure.
+    unsigned linearChunkSize = helper.getContigPerThreadOnReductionAxis();
 
-    // Perform a tree reduction
+    // Perform the in-thread reduction.
     unsigned numOperands = accs.size();
     SmallVector<SmallVector<Value>> reduced(numOperands);
     unsigned regs = accs.front().size();
@@ -748,8 +780,23 @@ private:
           cur[opIdx] = accs[opIdx][regBase + i];
         vals.push_back(std::move(cur));
       }
-      auto acc =
-          treeReduce(loc, rewriter, combineRegion, std::move(vals), arity);
+      SmallVector<Value> acc;
+      if (arity == 1 && linearChunkSize < vals.size()) {
+        auto numChunks =
+            llvm::divideCeil(vals.size(), static_cast<size_t>(linearChunkSize));
+        for (size_t chunkIdx : llvm::seq(numChunks)) {
+          size_t begin = chunkIdx * linearChunkSize;
+          size_t end = std::min(begin + linearChunkSize, vals.size());
+          SmallVector<SmallVector<Value>> chunk(
+              std::make_move_iterator(vals.begin() + begin),
+              std::make_move_iterator(vals.begin() + end));
+          auto partial =
+              treeReduce(loc, rewriter, combineRegion, std::move(chunk), 1);
+          accumulate(loc, rewriter, combineRegion, acc, partial);
+        }
+      } else {
+        acc = treeReduce(loc, rewriter, combineRegion, std::move(vals), arity);
+      }
       for (unsigned opIdx = 0; opIdx < numOperands; ++opIdx)
         reduced[opIdx].push_back(acc[opIdx]);
     }
@@ -764,8 +811,76 @@ private:
     }
 
     layout = ReduceOpHelper::zeroBasesAlongDimAndReorder(layout, axis, kReg);
-    layout = actionRemoveBroadcastedRegs(layout).apply(layout);
+    layout = layout.removeZeroBasesAlongDim(kReg);
     return {std::move(layout), std::move(accs)};
+  }
+
+  // Reduce lane bases that move the reduction axis. The mask identifies the
+  // lane-id bits that distinguish values belonging to the same reduction.
+  std::pair<LinearLayout, SmallVector<SmallVector<Value>>>
+  reduceWithinWarps(triton::ReduceOp op, LinearLayout layout,
+                    SmallVector<SmallVector<Value>> accs,
+                    ConversionPatternRewriter &rewriter) const {
+    auto *ctx = op.getContext();
+    auto kLane = str_attr("lane");
+    const auto &laneBases = layout.getBases().lookup(kLane);
+    unsigned reduceLaneIdMask = 0;
+    for (unsigned bit = 0; bit < laneBases.size(); ++bit) {
+      if (laneBases[bit][op.getAxis()] != 0)
+        reduceLaneIdMask |= 1u << bit;
+    }
+    if (reduceLaneIdMask == 0)
+      return {std::move(layout), std::move(accs)};
+
+    for (unsigned reg = 0; reg < accs.front().size(); ++reg) {
+      SmallVector<Value> acc(op.getNumOperands());
+      for (unsigned i = 0; i < op.getNumOperands(); ++i)
+        acc[i] = accs[i][reg];
+
+      warpReduceLaneMask(rewriter, op, acc, reduceLaneIdMask);
+
+      for (unsigned i = 0; i < op.getNumOperands(); ++i)
+        accs[i][reg] = acc[i];
+    }
+
+    layout = ReduceOpHelper::zeroBasesAlongDimAndReorder(layout, op.getAxis(),
+                                                         kLane);
+    return {std::move(layout), std::move(accs)};
+  }
+
+  void warpReduceLaneMask(ConversionPatternRewriter &rewriter,
+                          triton::ReduceOp op, SmallVector<Value> &acc,
+                          unsigned reduceLaneIdMask) const {
+    auto moduleOp = op->getParentOfType<ModuleOp>();
+    unsigned warpSize =
+        triton::gpu::TritonGPUDialect::getThreadsPerWarp(moduleOp);
+    assert(reduceLaneIdMask < warpSize &&
+           "expected reduce lane ID mask to be smaller than the warp size");
+
+    unsigned firstBit = llvm::countr_zero(reduceLaneIdMask);
+    unsigned numBits = llvm::popcount(reduceLaneIdMask);
+    unsigned contiguousMask = ((1u << numBits) - 1) << firstBit;
+
+    // Keep target-specific optimized reductions for the common contiguous
+    // case. Non-contiguous lane distributions require one XOR shuffle per
+    // participating lane-id bit.
+    if (reduceLaneIdMask == contiguousMask) {
+      warpReduce(rewriter, op.getLoc(), acc, op, 1u << numBits, 1u << firstBit);
+      return;
+    }
+
+    // Preserve upstream's established inverse bit order for reductions whose
+    // participating lane-id bits cannot use the contiguous target hook.
+    for (int bit = llvm::Log2_32(warpSize) - 1; bit >= 0; --bit) {
+      unsigned mask = 1u << bit;
+      if ((reduceLaneIdMask & mask) == 0)
+        continue;
+      SmallVector<Value> shuffled(op.getNumOperands());
+      for (unsigned i = 0; i < op.getNumOperands(); ++i)
+        shuffled[i] =
+            targetInfo.shuffleXor(rewriter, op.getLoc(), acc[i], mask);
+      accumulate(op.getLoc(), rewriter, op.getCombineOp(), acc, shuffled);
+    }
   }
 
   // Apply warp reduction across the given number of contiguous lanes using op
@@ -853,8 +968,8 @@ private:
 
       for (unsigned i = 0; i < op.getNumOperands(); ++i) {
         auto resultTy = cast<RankedTensorType>(op.getResult()[i].getType());
-        results[i] = packLLElements(loc, getTypeConverter(), resultVals[i],
-                                    rewriter, resultTy);
+        results[i] = packTensorElements(loc, getTypeConverter(), resultVals[i],
+                                        rewriter, resultTy);
       }
     } else {
       SmallVector<SmallVector<Value>> groupVals;
@@ -1101,8 +1216,8 @@ private:
 
         for (unsigned i = 0; i < op.getNumOperands(); ++i) {
           auto resultTy = cast<RankedTensorType>(op.getResult()[i].getType());
-          results[i] = packLLElements(loc, getTypeConverter(), resultVals[i],
-                                      rewriter, resultTy);
+          results[i] = packTensorElements(loc, getTypeConverter(),
+                                          resultVals[i], rewriter, resultTy);
         }
       } else {
         SmallVector<Value> vals = loadAndReduceScalarRegGroups(
@@ -1145,8 +1260,8 @@ private:
           resultVals[j] = b.load(elemTy, readPtr);
         }
 
-        results[i] = packLLElements(loc, getTypeConverter(), resultVals,
-                                    rewriter, resultTy);
+        results[i] = packTensorElements(loc, getTypeConverter(), resultVals,
+                                        rewriter, resultTy);
       } else {
         // 0d-tensor -> scalar
         results[i] = b.load(elemTy, smemBases[i]);
@@ -1160,5 +1275,14 @@ private:
 void mlir::triton::populateReduceOpToLLVMPatterns(
     LLVMTypeConverter &typeConverter, RewritePatternSet &patterns,
     const TargetInfoBase &targetInfo, PatternBenefit benefit) {
-  patterns.add<ReduceOpConversion>(typeConverter, targetInfo, benefit);
+  populateReduceOpToLLVMPatternsWithOptions(typeConverter, patterns, targetInfo,
+                                            benefit, true);
+}
+
+void mlir::triton::populateReduceOpToLLVMPatternsWithOptions(
+    LLVMTypeConverter &typeConverter, RewritePatternSet &patterns,
+    const TargetInfoBase &targetInfo, PatternBenefit benefit,
+    bool enableTreeReduction) {
+  patterns.add<ReduceOpConversion>(typeConverter, targetInfo, benefit,
+                                   enableTreeReduction);
 }

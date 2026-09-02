@@ -19,6 +19,8 @@ import triton.language as tl
 import triton.language.extra.tlx as tlx
 from triton._internal_testing import is_hopper_or_newer
 
+
+pytestmark = pytest.mark.skipif(not is_hopper_or_newer(), reason="Requires Hopper or newer (sm90+)")
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
 

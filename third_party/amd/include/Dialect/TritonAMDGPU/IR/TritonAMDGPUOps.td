@@ -254,6 +254,29 @@ def CondBarrierOp : TT_AMDGPU_Op<"cond_barrier"> {
 }
 
 //===----------------------------------------------------------------------===//
+// AssumeUniformOp
+//===----------------------------------------------------------------------===//
+
+def TT_AMDGPU_UniformScalar : AnyTypeOf<[I16, I32, I64, F16, BF16, F32, F64, TT_Ptr],
+                                        "16/32/64-bit scalar or pointer">;
+
+def AssumeUniformOp : TT_AMDGPU_Op<"assume_uniform", [Pure, SameOperandsAndResultType]> {
+  let summary = "Assert that a scalar value is wave-uniform";
+
+  let description = [{
+    Returns `src` unchanged, but tells the backend that its value is the same in
+    every lane of the wave. Lowers to `llvm.amdgcn.readfirstlane`, which makes
+    the result uniform by construction as far as LLVM's uniformity analysis is
+    concerned.
+  }];
+
+  let arguments = (ins TT_AMDGPU_UniformScalar:$src);
+  let results = (outs TT_AMDGPU_UniformScalar:$result);
+
+  let assemblyFormat = "$src attr-dict `:` type($src)";
+}
+
+//===----------------------------------------------------------------------===//
 // BufferLoadOp
 //===----------------------------------------------------------------------===//
 
@@ -772,24 +795,60 @@ def RegisterResidentOp : TT_AMDGPU_Op<"register_resident", [
 }
 
 //===----------------------------------------------------------------------===//
+// RegisterHandoffOp
+//===----------------------------------------------------------------------===//
+
+def RegisterHandoffOp : TT_AMDGPU_Op<"register_handoff", [
+    SameOperandsAndResultType]> {
+  let summary = "Start independent native AMD register-allocation intervals";
+  let description = [{
+    Returns `input` unchanged while passing each per-thread 32-bit native
+    register value through an independent tied register constraint. This starts
+    local allocation intervals without requiring the complete tensor to be
+    resident at one point.
+
+    Use `register_resident` when simultaneous whole-tensor residency is the
+    software-pipeline contract. Neither operation prescribes physical register
+    numbers or changes numerical results. The operation is intentionally
+    side-effecting: distinct source occurrences are distinct allocation
+    boundaries and must not be merged by CSE or moved out of their surrounding
+    software-pipeline stage.
+  }];
+
+  let arguments = (ins TT_Tensor:$input, StrAttr:$register_class);
+  let results = (outs TT_Tensor:$result);
+
+  let assemblyFormat = [{
+    $input `class` $register_class attr-dict `:` type($input)
+  }];
+
+  let hasVerifier = 1;
+}
+
+//===----------------------------------------------------------------------===//
 // MfmaCommitOp
 //===----------------------------------------------------------------------===//
 
 def MfmaCommitOp : TT_AMDGPU_Op<"mfma_commit", [
-    DeclareOpInterfaceMethods<InferTypeOpInterface>,
-    AllTypesMatch<["inputs", "outputs"]>]> {
+    DeclareOpInterfaceMethods<InferTypeOpInterface>]> {
   let summary = "Commit native vector MFMA fragments with live dependencies";
   let description = [{
     Returns every input unchanged after applying the architecture-defined MFMA
-    result hazard. One or more inputs must be direct transient
-    `scheduled_mfma` results. Additional dot operands are non-numerical live
-    dependencies, and their corresponding outputs may be consumed by the
-    following source stage. Multiple independent native results can therefore
-    share one completion boundary without first assembling a logical tensor.
+    result hazard. Inputs may be direct transient `scheduled_mfma` results
+    followed by dot-operand live dependencies, or a set of direct persistent
+    results at an epilogue boundary. Multiple independent native results can
+    therefore share one completion boundary without first assembling a
+    logical tensor.
 
     Distributed MFMA and dot layouts determine storage roles and native
     fragment widths. Source code does not provide physical register classes,
     tuple sizes, or wait-state counts.
+
+    A boundary that carries a live dot operand hands its F32 results out in
+    VGPRs, so its accumulators must already be VGPR-resident. Committing an
+    AGPR-resident accumulator alongside a live operand places the resulting
+    `v_accvgpr_read_b32` ahead of the hazard padding and is rejected during
+    lowering.
 
     The operation is intentionally side-effecting so the completion and
     liveness boundary cannot be deleted or moved across memory operations.
@@ -812,27 +871,39 @@ def ScheduledMfmaOp : TT_AMDGPU_Op<"scheduled_mfma"> {
   let description = [{
     Computes the full per-wave Cartesian product of the native fragments in
     `a` and `b`, replacing every corresponding fragment in `acc`. Native
-    instructions are emitted in N-major, M-minor, K-reduction order, so each
-    output fragment remains an independent dependency chain while consecutive
-    native K fragments stay on that chain.
+    instructions are emitted in K-major, N-major, M-minor order. This
+    round-robins each K slice over the independent output fragments before
+    returning to an accumulator dependency chain, while preserving one SSA
+    chain per output fragment.
 
     `resident_operand` is `none`, `lhs`, or `rhs` and identifies an input
     intentionally carried through the surrounding software pipeline.
     `accumulator_role` is `transient` for a phase-local result or `persistent`
     for an accumulator carried across phases. `accumulator_register_class` is
-    `auto`, `agpr`, or `vgpr`; `auto` lets target lowering derive storage from
-    the lifetime role, while an explicit class supports kernels whose two
-    persistent accumulator sets intentionally occupy complementary physical
-    files. `initialize` starts the native accumulators from zero. Completion
+    `auto`, `agpr`, or `vgpr`; `auto` means VGPRs for `transient` and AGPRs for
+    `persistent` on every target, while an explicit class supports kernels
+    whose two persistent accumulator sets intentionally occupy complementary
+    physical files. On CDNA3 the compiler-generated AGPR read is not ordered
+    against the MFMA drain, so any AGPR accumulator is rejected there,
+    including one named by `auto`: a persistent accumulator must request
+    `vgpr`.
+    `initialize` starts the native accumulators from zero. Completion
     of transient result fragments is represented separately by `mfma_commit`.
+
+    An AGPR-resident accumulator must not reach an `mfma_commit` that also
+    carries a live dot operand: that boundary constrains its F32 results to
+    VGPRs, so the AGPR read is materialized as operand setup and precedes the
+    boundary's hazard padding. Lowering reports this whenever the producing
+    `scheduled_mfma` is visible from the commit.
 
     All active lanes of a wave must execute this operation uniformly. This is
     an explicit source contract because LLVM inline assembly cannot represent
     a convergent-call attribute on the pinned compiler revision.
 
-    The initial contract supports CDNA4 BF16 inputs, F32 accumulators, one or
-    more K fragments per wave, and native 32x32x16 or 16x16x32 instruction
-    shapes.
+    The contract supports BF16 or F16 inputs and F32 accumulators on CDNA3 and
+    CDNA4. It accepts one or more K fragments per wave and the target's native
+    instruction shapes: 32x32x8 or 16x16x16 on CDNA3, and 32x32x16 or
+    16x16x32 on CDNA4.
   }];
 
   let arguments = (ins TT_Tensor:$a, TT_Tensor:$b, TT_Tensor:$acc,
@@ -955,10 +1026,11 @@ def AsyncTDMCopyGlobalToLocalOp
     it sends an "LDS atomic arrive" to signal its completion.
 
     `warp_used_hint` is an optional i32 bitmask performance hint for
-    partial TDM copy: bit `n` (LSB = warp 0) means warp `n` issues the
-    instruction; bits above `num_warps - 1` must be zero.  Same data
-    lands in shared memory either way -- only emission changes:
-    `K = popcount(hint)` warps cover the block, the rest are pred-off.
+    partial TDM copy: bit `n` (LSB = warp 0) means warp `n` carries a
+    real descriptor; bits above `num_warps - 1` must be zero. Same data
+    lands in shared memory either way: `K = popcount(hint)` active warps
+    cover the block, while inactive warps still issue the TDM instruction
+    with a null descriptor.
 
     For "all warps participate", omit the attribute (preferred) or pass
     a full bitmask `K = num_warps`; an explicit `warp_used_hint = 0` is
@@ -1014,6 +1086,40 @@ def AsyncTDMCopyGlobalToLocalOp
 }
 
 //===----------------------------------------------------------------------===//
+// AsyncTDMFusedCopyGlobalToLocalOp
+//===----------------------------------------------------------------------===//
+
+def AsyncTDMFusedCopyGlobalToLocalOp
+    : TT_AMDGPU_Op<"async_tdm_fused_copy_global_to_local",
+                   [SameVariadicOperandSize]> {
+  let summary = "Fuse multiple TDM global-to-local copies into one async "
+                "operation";
+
+  let description = [{
+    This operation represents an explicit 2-4 member fused TDM load. Each
+    member provides a positioned tensor descriptor, destination shared-memory
+    descriptor, and `warp_used_hint`. Member hints must be legal and pairwise
+    disjoint. All members share one cache modifier.
+  }];
+
+  let arguments = (ins
+    Arg<Variadic<TT_TensorDescType>, "", [MemRead<GlobalMemory>]>:$descs,
+    Arg<Variadic<TTG_MemDescType>, "", [MemWrite<SharedMemory>]>:$dests,
+    DenseI32ArrayAttr:$warp_used_hints,
+    DefaultValuedAttr<TT_CacheModifierAttr,
+                      "triton::CacheModifier::NONE">:$cache
+  );
+
+  let results = (outs TTG_AsyncToken:$token);
+
+  let assemblyFormat = [{
+    $descs `into` $dests attr-dict `:` qualified(type($descs)) `->` qualified(type($dests))
+  }];
+
+  let hasVerifier = 1;
+}
+
+//===----------------------------------------------------------------------===//
 // AsyncTDMCopyLocalToGlobalOp
 //===----------------------------------------------------------------------===//
 
@@ -1043,6 +1149,8 @@ def AsyncTDMCopyLocalToGlobalOp
           Arg<Optional<TTG_MemDescType>, "", [MemWrite<SharedMemory>]>:$barrier,
           DefaultValuedAttr<TT_CacheModifierAttr,
                             "triton::CacheModifier::NONE">:$cache);
+
+  let results = (outs TTG_AsyncToken:$token);
 
   let assemblyFormat = [{
     $desc `from` $src (`,` `barrier` `=` $barrier^)?
@@ -1159,7 +1267,8 @@ def AsyncTDMWait : TT_AMDGPU_Op<"async_tdm_wait", [MemWaitOpTrait]> {
     This is necessary to ensure that data is available in the LDS (load, gather)
     or HBM (store, scatter) before it is used.
 
-    This operation counts the number of TDM IR operations (AsyncTDMCopyGlobalToLocalOp,
+    This operation counts the number of TDM IR operations
+    (AsyncTDMCopyGlobalToLocalOp, AsyncTDMFusedCopyGlobalToLocalOp,
     AsyncTDMCopyLocalToGlobalOp, AsyncTDMScatterOp, AsyncTDMGatherOp).
   }];
   let results = (outs TTG_AsyncToken:$retToken);

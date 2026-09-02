@@ -29,6 +29,22 @@ namespace mlir {
 
 using namespace triton;
 
+bool containsPinnedEncoding(Attribute encoding) {
+  if (!encoding)
+    return false;
+  if (isa<triton::gpu::PinnedEncodingTrait>(encoding))
+    return true;
+
+  bool pinned = false;
+  encoding.walkImmediateSubElements(
+      [&](Attribute nested) {
+        if (!pinned)
+          pinned = containsPinnedEncoding(nested);
+      },
+      [](Type) {});
+  return pinned;
+}
+
 SmallVector<unsigned, 3> mmaVersionToInstrShape(int version,
                                                 const ArrayRef<int64_t> &shape,
                                                 Type eltType, int numWarps) {
@@ -375,9 +391,15 @@ static Attribute inferDstEncoding(triton::ReduceOp op, Attribute encoding) {
   // If the input is rank 1, the output is a scalar value.
   if (cast<ttg::LayoutEncodingTrait>(encoding).getRank() == 1)
     return {};
-  return triton::gpu::SliceEncodingAttr::get(
-      op->getContext(), op.getAxis(),
-      cast<ttg::DistributedEncodingTrait>(encoding));
+  Attribute dstEncoding;
+  auto *inferLayout =
+      encoding.getDialect()
+          .getRegisteredInterface<DialectInferLayoutInterface>();
+  if (!inferLayout ||
+      failed(inferLayout->inferReduceOpEncoding(
+          encoding, op.getAxis(), dstEncoding, /*loc=*/std::nullopt)))
+    return {};
+  return dstEncoding;
 }
 
 static Attribute inferDstEncoding(triton::ExpandDimsOp op, Attribute encoding) {
@@ -1612,7 +1634,8 @@ ttg::LocalAllocOp findShmemAlloc(Value operand) {
   // allowed in between.
   Value transitiveOperand = operand;
   while (isa_and_nonnull<ttg::ConvertLayoutOp, tt::TransOp, ttg::MemDescTransOp,
-                         ttg::MemDescReshapeOp, ttg::MemDescSubsliceOp>(
+                         ttg::MemDescReshapeOp, ttg::MemDescSubsliceOp,
+                         ttg::MemDescDynamicSubsliceOp>(
              transitiveOperand.getDefiningOp()) ||
          isa<BlockArgument>(transitiveOperand)) {
     if (auto blockArg = dyn_cast<BlockArgument>(transitiveOperand)) {
@@ -1806,6 +1829,14 @@ void replaceUsesAndPropagateType(
           oldType.getShape(), oldType.getElementType(), oldType.getEncoding(),
           oldType.getMemorySpace(), isMutable, oldType.getAllocShape());
       newVal = ttg::MemDescSubsliceOp::create(
+          builder, subslice.getLoc(), newDstType, val, subslice.getOffsets());
+    } else if (auto subslice = dyn_cast<ttg::MemDescDynamicSubsliceOp>(user)) {
+      ttg::MemDescType oldType = subslice.getType();
+      bool isMutable = cast<ttg::MemDescType>(val.getType()).getMutableMemory();
+      Type newDstType = ttg::MemDescType::get(
+          oldType.getShape(), oldType.getElementType(), oldType.getEncoding(),
+          oldType.getMemorySpace(), isMutable, oldType.getAllocShape());
+      newVal = ttg::MemDescDynamicSubsliceOp::create(
           builder, subslice.getLoc(), newDstType, val, subslice.getOffsets());
     } else if (auto trans = dyn_cast<ttg::MemDescTransOp>(user)) {
       newVal = ttg::MemDescTransOp::create(builder, trans.getLoc(), val,

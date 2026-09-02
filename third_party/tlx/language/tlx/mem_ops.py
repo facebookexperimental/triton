@@ -26,6 +26,31 @@ def _verify_buffer_ops(ptr, offsets, mask=None, other=None):
 
 
 @tl.builtin
+def assume_uniform(value, _semantic=None):
+    """
+    Assert that a scalar holds the same value in every lane of the wave.
+
+    Returns `value` unchanged. On AMD this emits amdg.assume_uniform, lowered to
+    `v_readfirstlane`. On other backends it is a no-op.
+
+    AMD buffer ops keep their base pointer in the scalar (SGPR) resource
+    descriptor, so it has to be wave-uniform. When the backend cannot prove that
+    it is (most commonly because the pointer was loaded from memory), it falls
+    back to a per-lane waterfall loop around every access.
+
+    Args:
+        value: Scalar pointer, or a 16/32/64-bit integer or float. Narrower
+            types are not supported by `v_readfirstlane`.
+    """
+    ty = value.type
+    assert ty.is_ptr() or ty.primitive_bitwidth >= 16, \
+        f"assume_uniform expects a scalar pointer or a 16/32/64-bit value, got {ty}"
+    if _semantic.builder.options.backend_name != "hip":
+        return value
+    return tl.tensor(_semantic.builder.create_assume_uniform(value.handle), ty)
+
+
+@tl.builtin
 def buffer_load(
     ptr,
     offsets,
@@ -793,26 +818,46 @@ def subslice(
 @tl.builtin
 def local_slice(
     buffer: tlx.buffered_tensor,
-    offset: list[int],
+    offset: list[int | tl.tensor],
     shape: list[int],
     _semantic=None,
 ) -> tlx.buffered_tensor:
+    """Return a same-rank local-memory subview.
+
+    SMEM offsets may be integers, constexprs, or runtime scalar i32 tensors.
+    When any offset is runtime-valued, the dynamic subslice IR operation is
+    used. Runtime offsets must keep the view within the source allocation and
+    satisfy the same tile-alignment contract as static offsets; violating
+    either condition is undefined behavior.
+    """
+    has_runtime_offset = any(isinstance(value, tl.tensor) for value in offset)
     if buffer.type.storage == tlx.storage_kind.tmem:
         # TMEM can only slice along the innermost dimension
+        assert not has_runtime_offset, "runtime local_slice offsets are only supported for SMEM"
         assert len(offset) == 2 and len(shape) == 2
         assert offset[0] == 0
         assert shape[0] == buffer.type.shape[0]
         return subslice(buffer, offset[1], shape[1], _semantic=_semantic)
+
+    if has_runtime_offset:
+        assert buffer.type.storage == tlx.storage_kind.smem, "runtime local_slice offsets are only supported for SMEM"
+        unwrapped_shape = [tl._unwrap_if_constexpr(dim) for dim in shape]
+        assert len(offset) == len(
+            buffer.type.shape) == len(unwrapped_shape), "local_slice offset and shape must match the source rank"
+        offset_handles = [_semantic._convert_elem_to_ir_value(value, require_i64=False) for value in offset]
+        slice_handle = _semantic.builder.create_memdesc_dynamic_subslice(buffer.handle, offset_handles, unwrapped_shape)
+        shape = unwrapped_shape
     else:
         slice_handle = _semantic.builder.create_memdesc_subslice(buffer.handle, offset, shape)
-        return tlx.buffered_tensor(
-            slice_handle,
-            buffer.type.scalar,
-            shape,
-            0,
-            buffer.type.storage,
-            buffer.type.layout,
-        )
+
+    return tlx.buffered_tensor(
+        slice_handle,
+        buffer.type.scalar,
+        shape,
+        0,
+        buffer.type.storage,
+        buffer.type.layout,
+    )
 
 
 @tl.builtin
@@ -831,6 +876,9 @@ def async_load(
 ) -> tlx.async_token:
     """
     Loads buffer from global to local memory asynchronously.
+
+    When ``mask`` is provided and ``other`` is omitted, masked destination
+    elements are filled with zero.
 
     When ``bulk=True``, emits a single ``cp.async.bulk`` instruction instead of
     per-thread ``cp.async`` copies. Requirements for bulk mode:
@@ -893,9 +941,11 @@ def async_load(
     assert bulk_size is None, "bulk_size requires bulk=True"
     assert barrier is None, "barrier requires bulk=True"
 
-    # Unwrap constexpr and convert to tensor (same as tl.load)
+    # Unwrap constexpr, apply the TLX zero-fill default, and convert to tensor.
     mask = tl._unwrap_if_constexpr(mask)
     other = tl._unwrap_if_constexpr(other)
+    if mask is not None and other is None:
+        other = 0.0
     if mask is not None:
         mask = _semantic.to_tensor(mask)
     if other is not None:
@@ -967,9 +1017,24 @@ def local_load(
     """
     Loads buffer from local or tensor memory into a distributed tensor.
 
+    ``token`` (optional) carries an explicit async-wait dependency to the load.
+
     ``layout`` (optional) pins the register layout of the loaded value, written
     as a ``tlx.layout(...)`` (Shape:Stride). It is mapped to a ``#linear``
     encoding so the compiler propagates it back and avoids ``convert_layout``.
+
+    ``relaxed=False`` does not infer or insert an async wait. Without a
+    ``token``, AMD lowering retains conservative producer-to-consumer
+    dependency and wait-count tracking. The caller must issue an async wait
+    before consuming a tile produced by asynchronous copies.
+
+    ``relaxed=True`` tells AMD lowering that a preceding async wait already
+    orders the LDS load after its async producer, avoiding a redundant
+    producer-to-consumer dependency and wait count when no ``token`` is
+    threaded to the load. Membar analysis materializes the workgroup barrier
+    required after the memory-wait operation. This marker does not release the
+    tile for a later refill: reusing the same LDS slice still requires the
+    consumer-to-refill workgroup barrier inferred by membar analysis.
 
     ``rematerialize_coordinates=True`` starts fresh lane/warp address live
     ranges at this load. This can avoid keeping a cheap LDS address live
@@ -1372,7 +1437,7 @@ def async_descriptor_load(
         cache,
         eviction,
         False,
-        two_ctas,
+        bool(two_ctas),
     )
 
 
@@ -1417,18 +1482,89 @@ def _handle_i32_pred(pred, _semantic):
     return pred
 
 
+def _updated_tensor_descriptor(desc, handle):
+    if isinstance(desc, tl.tensor_descriptor):
+        return tl.tensor_descriptor(handle, list(desc.shape.values), list(desc.strides.values), desc.block_type)
+    return tl.tensor_descriptor_base(handle, desc.block_type)
+
+
+@tl.builtin
+def update_tensor_descriptor(
+    desc: tl.tensor_descriptor_base,
+    add_offsets: Optional[list[tl.tensor]] = None,
+    set_bounds: Optional[list[tl.tensor]] = None,
+    pred: tl.tensor = None,
+    clamp_bounds: tl.constexpr = False,
+    _semantic=None,
+) -> tl.tensor_descriptor_base:
+    """Return a new AMD TDM descriptor with selected fields updated.
+
+    ``add_offsets`` advances the tile position in element units without
+    changing its bounds. ``set_bounds`` rewrites the absolute per-dimension
+    bounds, while ``pred`` replaces the inherited descriptor predicate.
+    ``clamp_bounds=True`` derives the remaining bounds by subtracting the
+    offsets; it requires ``add_offsets`` and is mutually exclusive with
+    ``set_bounds``.
+    """
+    assert isinstance(desc, tl.tensor_descriptor_base)
+    arch = _semantic.builder.options.arch
+    assert is_amd_tdm_target(arch), (
+        f"update_tensor_descriptor is only available on AMD TDM-capable targets, got arch={arch}")
+    if add_offsets is None and set_bounds is None and pred is None:
+        raise ValueError("tlx.update_tensor_descriptor requires at least one of add_offsets, set_bounds, pred")
+
+    clamp_bounds = bool(tl._unwrap_if_constexpr(clamp_bounds))
+    if clamp_bounds:
+        if add_offsets is None:
+            raise ValueError("tlx.update_tensor_descriptor: clamp_bounds requires add_offsets")
+        if set_bounds is not None:
+            raise ValueError("tlx.update_tensor_descriptor: clamp_bounds and set_bounds are mutually exclusive")
+
+    rank = len(desc.block_shape)
+    add_offset_handles = []
+    if add_offsets is not None:
+        if len(add_offsets) != rank:
+            raise ValueError(f"add_offsets must have length {rank} (descriptor rank), got {len(add_offsets)}")
+        add_offset_handles = _semantic._convert_to_ir_values(add_offsets, require_i64=False)
+
+    set_bounds_handles = []
+    if set_bounds is not None:
+        if len(set_bounds) != rank:
+            raise ValueError(f"set_bounds must have length {rank} (descriptor rank), got {len(set_bounds)}")
+        set_bounds_handles = _semantic._convert_to_ir_values(set_bounds, require_i64=False)
+
+    pred_handle = None
+    if pred is not None:
+        pred_handle = _handle_i32_pred(pred, _semantic).handle
+
+    handle = _semantic.builder.create_update_tensor_descriptor(
+        desc.handle,
+        add_offset_handles,
+        set_bounds_handles,
+        pred_handle,
+        clamp_bounds,
+    )
+    return _updated_tensor_descriptor(desc, handle)
+
+
 @tl.builtin
 def async_amd_descriptor_load(
     desc: tl.tensor_descriptor_base,
     result: tlx.buffered_tensor,
-    offsets: list[tl.tensor],
+    offsets: Optional[list[tl.tensor]] = None,
     pred: tl.tensor = None,
+    clamp_bounds: tl.constexpr = True,
     _semantic=None,
 ) -> tlx.async_token:
     """Asynchronous descriptor load from global to a local buffer (AMD).
 
     Lowers to ``amdgpu.async_tdm_copy_global_to_local``; synchronize with
     :func:`async_amd_descriptor_wait`.
+
+    Pass a descriptor positioned by :func:`update_tensor_descriptor` with
+    ``offsets=None`` to avoid a redundant update. Supplying ``offsets`` is a
+    convenience that advances the descriptor and clamps its remaining bounds
+    by default; set ``clamp_bounds=False`` for position-only advancement.
 
     Available only on AMD TDM-capable targets (gfx1250+).
     """
@@ -1437,7 +1573,8 @@ def async_amd_descriptor_load(
     assert is_amd_tdm_target(arch), (
         f"async_amd_descriptor_load is only available on AMD TDM-capable targets, got arch={arch}")
     ndim = len(desc.block_shape)
-    assert len(offsets) == ndim, f"expected {ndim} offsets, but got {len(offsets)}"
+    if offsets is not None:
+        assert len(offsets) == ndim, f"expected {ndim} offsets, but got {len(offsets)}"
 
     layout = result.type.layout
     if not getattr(layout, "_tlx_default", False):
@@ -1451,13 +1588,27 @@ def async_amd_descriptor_load(
                 stacklevel=2,
             )
 
-    offsets_handles = _semantic._convert_to_ir_values(offsets, require_i64=False)
-    # The copy op is now pure: position the descriptor (tile offsets + predicate,
-    # with clamped OOB bounds) first, then issue the copy from it.
-    pred32 = _handle_i32_pred(True if pred is None else pred, _semantic)
-    positioned_desc = _semantic.builder.create_update_tensor_descriptor(desc.handle, offsets_handles, [], pred32.handle,
-                                                                        True,  # clamp_bounds
-                                                                        )
+    positioned_desc = desc.handle
+    if offsets is not None:
+        offsets_handles = _semantic._convert_to_ir_values(offsets, require_i64=False)
+        clamp_bounds = bool(tl._unwrap_if_constexpr(clamp_bounds))
+        pred32 = _handle_i32_pred(True if pred is None else pred, _semantic)
+        positioned_desc = _semantic.builder.create_update_tensor_descriptor(
+            desc.handle,
+            offsets_handles,
+            [],
+            pred32.handle,
+            clamp_bounds,
+        )
+    elif pred is not None:
+        pred32 = _handle_i32_pred(pred, _semantic)
+        positioned_desc = _semantic.builder.create_update_tensor_descriptor(
+            desc.handle,
+            [],
+            [],
+            pred32.handle,
+            False,
+        )
     token_handle = _semantic.builder.create_async_tdm_copy_global_to_local(
         positioned_desc,
         result.handle,
@@ -1467,16 +1618,76 @@ def async_amd_descriptor_load(
 
 
 @tl.builtin
+def async_amd_descriptor_load_fused(
+    members,
+    cache_modifier: str = "",
+    _semantic=None,
+) -> tlx.async_token:
+    """Emit one fused AMD TDM load for two to four members.
+
+    Each member is ``(positioned_desc, destination, warp_used_hint)``. The
+    descriptor must already carry its tile offsets, predicate, and bounds; use
+    :func:`update_tensor_descriptor` before this operation when needed. Member
+    hints must be legal, pairwise-disjoint bitmasks. All members share one
+    cache modifier.
+    """
+    arch = _semantic.builder.options.arch
+    assert is_amd_tdm_target(arch), (
+        f"async_amd_descriptor_load_fused is only available on AMD TDM-capable targets, got arch={arch}")
+    members = tl._unwrap_if_constexpr(members)
+    if not 2 <= len(members) <= 4:
+        raise ValueError(f"async_amd_descriptor_load_fused requires 2 to 4 members, got {len(members)}")
+
+    desc_handles = []
+    dest_handles = []
+    warp_used_hints = []
+    rank = None
+    for index, member in enumerate(members):
+        member = tl._unwrap_if_constexpr(member)
+        if len(member) != 3:
+            raise ValueError("fused TDM members must be (descriptor, destination, warp_used_hint) tuples")
+        desc, dest, warp_used_hint = member
+        if not isinstance(desc, tl.tensor_descriptor_base):
+            raise TypeError(f"fused TDM member {index}: expected a tensor descriptor")
+        if not isinstance(dest, tlx.buffered_tensor):
+            raise TypeError(f"fused TDM member {index}: expected a buffered tensor destination")
+        if rank is None:
+            rank = len(desc.block_shape)
+        if len(desc.block_shape) != rank:
+            raise ValueError("fused TDM requires all descriptors to have the same rank")
+        warp_used_hint = tl._unwrap_if_constexpr(warp_used_hint)
+        if warp_used_hint is None:
+            raise ValueError(f"fused TDM member {index}: warp_used_hint is required")
+        desc_handles.append(desc.handle)
+        dest_handles.append(dest.handle)
+        warp_used_hints.append(int(warp_used_hint))
+
+    cache = _semantic._str_to_load_cache_modifier(cache_modifier)
+    token_handle = _semantic.builder.create_async_tdm_fused_copy_global_to_local(
+        desc_handles,
+        dest_handles,
+        warp_used_hints,
+        cache,
+    )
+    return tlx.async_token(token_handle)
+
+
+@tl.builtin
 def async_amd_descriptor_store(
     desc: tl.tensor_descriptor_base,
     source: tlx.buffered_tensor,
-    offsets: list[tl.tensor],
+    offsets: Optional[list[tl.tensor]] = None,
+    clamp_bounds: tl.constexpr = True,
     _semantic=None,
 ) -> None:
     """Asynchronous descriptor store from a local buffer to global (AMD).
 
     Lowers to ``amdgpu.async_tdm_copy_local_to_global``; synchronize with
     :func:`async_amd_descriptor_wait`.
+
+    ``offsets=None`` stores through an already positioned descriptor. When
+    offsets are supplied, the convenience update clamps remaining bounds by
+    default; set ``clamp_bounds=False`` for position-only advancement.
 
     Available only on AMD TDM-capable targets (gfx1250+).
     """
@@ -1485,7 +1696,8 @@ def async_amd_descriptor_store(
     assert is_amd_tdm_target(arch), (
         f"async_amd_descriptor_store is only available on AMD TDM-capable targets, got arch={arch}")
     ndim = len(desc.block_shape)
-    assert len(offsets) == ndim, f"expected {ndim} offsets, but got {len(offsets)}"
+    if offsets is not None:
+        assert len(offsets) == ndim, f"expected {ndim} offsets, but got {len(offsets)}"
 
     layout = source.type.layout
     if not getattr(layout, "_tlx_default", False):
@@ -1499,12 +1711,17 @@ def async_amd_descriptor_store(
                 stacklevel=2,
             )
 
-    offsets_handles = _semantic._convert_to_ir_values(offsets, require_i64=False)
-    # Position the descriptor (tile offsets + clamped OOB bounds); stores take no
-    # predicate. The copy op is now pure and reads from the positioned descriptor.
-    positioned_desc = _semantic.builder.create_update_tensor_descriptor(desc.handle, offsets_handles, [], None,
-                                                                        True,  # clamp_bounds
-                                                                        )
+    positioned_desc = desc.handle
+    if offsets is not None:
+        clamp_bounds = bool(tl._unwrap_if_constexpr(clamp_bounds))
+        offsets_handles = _semantic._convert_to_ir_values(offsets, require_i64=False)
+        positioned_desc = _semantic.builder.create_update_tensor_descriptor(
+            desc.handle,
+            offsets_handles,
+            [],
+            None,
+            clamp_bounds,
+        )
     _semantic.builder.create_async_tdm_copy_local_to_global(
         positioned_desc,
         source.handle,

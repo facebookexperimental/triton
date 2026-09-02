@@ -1,4 +1,4 @@
-// RUN: triton-opt --tlx-print-ttgir-to-tlx %s | FileCheck %s
+// RUN: triton-opt --tlx-print-ttgir-to-tlx %s -split-input-file | FileCheck %s
 
 // Test TTGIR to TLX simplified output on FlashAttention persistent kernel
 // The pass outputs simplified TLX-style code:
@@ -26,9 +26,11 @@
 
 // Verify MMA operations are replaced
 // CHECK-DAG: tlx.async_dot(
+// CHECK-DAG: use_acc=False, pred=True, mBarriers=[{{[^]]+}}], two_ctas=True, force_async=True
+// CHECK-DAG: tlx.tcgen05_commit({{[^,)]+}}, two_ctas=True)
 
 // Verify TMA operations are replaced
-// CHECK-DAG: tlx.async_descriptor_load(
+// CHECK-DAG: tlx.async_descriptor_load({{.*}}two_ctas=True)
 // CHECK-DAG: tlx.async_descriptor_store(
 
 // Verify memory operations are replaced
@@ -56,12 +58,13 @@
 #shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
 #shared1 = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
 #shared2 = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = true, elementBitWidth = 16}>
+#shared3 = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 32}>
 #smem = #ttg.shared_memory
 #tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
 #tmem1 = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
 #tmem2 = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
 #tmem3 = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
-module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32, ttg.max_reg_auto_ws = 152 : i32, ttg.min_reg_auto_ws = 24 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32, ttg.max_reg_auto_ws = 152 : i32, ttg.min_reg_auto_ws = 24 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32, "ttng.two-ctas" = true} {
   tt.func public @_attn_fwd_persist(%sm_scale: f32, %M: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %Z: i32, %H: i32 {tt.divisibility = 16 : i32}, %desc_q: !tt.ptr<bf16> {tt.divisibility = 16 : i32}, %desc_k: !tt.ptr<bf16> {tt.divisibility = 16 : i32}, %desc_v: !tt.ptr<bf16> {tt.divisibility = 16 : i32}, %desc_o: !tt.ptr<bf16> {tt.divisibility = 16 : i32}) attributes {noinline = false} {
     %c0_i32 = arith.constant 0 : i32
     %c1_i32 = arith.constant 1 : i32
@@ -276,9 +279,9 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
         %acc_14 = arith.xori %alpha_13, %true {async_task_id = array<i32: 0>} : i1
         %acc_15 = arith.extui %acc_14 {async_task_id = array<i32: 0>} : i1 to i32
         ttng.wait_barrier %97, %acc_15, %true {async_task_id = array<i32: 0>} : !ttg.memdesc<1xi64, #shared, #smem, mutable>
-        %acc_16 = ttng.tmem_subslice %acc_10 {N = 0 : i32} : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x64xf32, #tmem1, #ttng.tensor_memory, mutable, 128x128>
-        %acc_17 = ttng.tmem_subslice %acc_10 {N = 64 : i32} : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x64xf32, #tmem1, #ttng.tensor_memory, mutable, 128x128>
-        %qk_18 = ttng.tmem_subslice %qk_1 {N = 64 : i32, async_task_id = array<i32: 0>} : !ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<1x128x1xf32, #tmem2, #ttng.tensor_memory, mutable, 1x128x128>
+        %acc_16 = ttng.tmem_subslice %acc_10 {offset = 0 : i32} : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x64xf32, #tmem1, #ttng.tensor_memory, mutable, 128x128>
+        %acc_17 = ttng.tmem_subslice %acc_10 {offset = 64 : i32} : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x64xf32, #tmem1, #ttng.tensor_memory, mutable, 128x128>
+        %qk_18 = ttng.tmem_subslice %qk_1 {offset = 64 : i32, async_task_id = array<i32: 0>} : !ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<1x128x1xf32, #tmem2, #ttng.tensor_memory, mutable, 1x128x128>
         %qk_19 = ttg.memdesc_reinterpret %qk_18 {async_task_id = array<i32: 0>} : !ttg.memdesc<1x128x1xf32, #tmem2, #ttng.tensor_memory, mutable, 1x128x128> -> !ttg.memdesc<1x128x1xf32, #tmem2, #ttng.tensor_memory, mutable>
         %alpha_20 = ttg.memdesc_index %qk_19[%c0_i32] {async_task_id = array<i32: 0>} : !ttg.memdesc<1x128x1xf32, #tmem2, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x1xf32, #tmem2, #ttng.tensor_memory, mutable>
         %98 = ttg.memdesc_index %48[%c0_i32] {async_task_id = array<i32: 0>} : !ttg.memdesc<1x1xi64, #shared, #smem, mutable> -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
@@ -309,9 +312,9 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
           %acc_102 = arith.xori %alpha_101, %true {async_task_id = array<i32: 0>} : i1
           %acc_103 = arith.extui %acc_102 {async_task_id = array<i32: 0>} : i1 to i32
           ttng.wait_barrier %128, %acc_103 {async_task_id = array<i32: 0>} : !ttg.memdesc<1xi64, #shared, #smem, mutable>
-          %acc_104 = ttng.tmem_subslice %acc_11 {N = 0 : i32} : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x64xf32, #tmem1, #ttng.tensor_memory, mutable, 128x128>
-          %acc_105 = ttng.tmem_subslice %acc_11 {N = 64 : i32} : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x64xf32, #tmem1, #ttng.tensor_memory, mutable, 128x128>
-          %qk_106 = ttng.tmem_subslice %qk {N = 64 : i32, async_task_id = array<i32: 0>} : !ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<1x128x1xf32, #tmem2, #ttng.tensor_memory, mutable, 1x128x128>
+          %acc_104 = ttng.tmem_subslice %acc_11 {offset = 0 : i32} : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x64xf32, #tmem1, #ttng.tensor_memory, mutable, 128x128>
+          %acc_105 = ttng.tmem_subslice %acc_11 {offset = 64 : i32} : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x64xf32, #tmem1, #ttng.tensor_memory, mutable, 128x128>
+          %qk_106 = ttng.tmem_subslice %qk {offset = 64 : i32, async_task_id = array<i32: 0>} : !ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<1x128x1xf32, #tmem2, #ttng.tensor_memory, mutable, 1x128x128>
           %qk_107 = ttg.memdesc_reinterpret %qk_106 {async_task_id = array<i32: 0>} : !ttg.memdesc<1x128x1xf32, #tmem2, #ttng.tensor_memory, mutable, 1x128x128> -> !ttg.memdesc<1x128x1xf32, #tmem2, #ttng.tensor_memory, mutable>
           %alpha_108 = ttg.memdesc_index %qk_107[%c0_i32] {async_task_id = array<i32: 0>} : !ttg.memdesc<1x128x1xf32, #tmem2, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x1xf32, #tmem2, #ttng.tensor_memory, mutable>
           %129 = ttg.memdesc_index %44[%c0_i32] {async_task_id = array<i32: 0>} : !ttg.memdesc<1x1xi64, #shared, #smem, mutable> -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
@@ -367,9 +370,9 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
         %acc_36 = arith.xori %alpha_35, %true {async_task_id = array<i32: 0>} : i1
         %acc_37 = arith.extui %acc_36 {async_task_id = array<i32: 0>} : i1 to i32
         ttng.wait_barrier %101, %acc_37 {async_task_id = array<i32: 0>} : !ttg.memdesc<1xi64, #shared, #smem, mutable>
-        %acc_38 = ttng.tmem_subslice %acc_11 {N = 0 : i32} : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x64xf32, #tmem1, #ttng.tensor_memory, mutable, 128x128>
-        %acc_39 = ttng.tmem_subslice %acc_11 {N = 64 : i32} : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x64xf32, #tmem1, #ttng.tensor_memory, mutable, 128x128>
-        %qk_40 = ttng.tmem_subslice %qk {N = 64 : i32, async_task_id = array<i32: 0>} : !ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<1x128x1xf32, #tmem2, #ttng.tensor_memory, mutable, 1x128x128>
+        %acc_38 = ttng.tmem_subslice %acc_11 {offset = 0 : i32} : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x64xf32, #tmem1, #ttng.tensor_memory, mutable, 128x128>
+        %acc_39 = ttng.tmem_subslice %acc_11 {offset = 64 : i32} : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x64xf32, #tmem1, #ttng.tensor_memory, mutable, 128x128>
+        %qk_40 = ttng.tmem_subslice %qk {offset = 64 : i32, async_task_id = array<i32: 0>} : !ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<1x128x1xf32, #tmem2, #ttng.tensor_memory, mutable, 1x128x128>
         %qk_41 = ttg.memdesc_reinterpret %qk_40 {async_task_id = array<i32: 0>} : !ttg.memdesc<1x128x1xf32, #tmem2, #ttng.tensor_memory, mutable, 1x128x128> -> !ttg.memdesc<1x128x1xf32, #tmem2, #ttng.tensor_memory, mutable>
         %alpha_42 = ttg.memdesc_index %qk_41[%c0_i32] {async_task_id = array<i32: 0>} : !ttg.memdesc<1x128x1xf32, #tmem2, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x1xf32, #tmem2, #ttng.tensor_memory, mutable>
         %102 = ttg.memdesc_index %44[%c0_i32] {async_task_id = array<i32: 0>} : !ttg.memdesc<1x1xi64, #shared, #smem, mutable> -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
@@ -394,7 +397,7 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
         %104 = ttg.memdesc_index %76[%c0_i32] {async_task_id = array<i32: 0>} : !ttg.memdesc<1x1xi64, #shared, #smem, mutable> -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
         ttng.arrive_barrier %104, 1 {async_task_id = array<i32: 0>} : !ttg.memdesc<1xi64, #shared, #smem, mutable>
         %offsetkv_y_57 = arith.addi %offsetkv_y_33, %c1_i64 {async_task_id = array<i32: 0>} : i64
-        %qk_58 = ttng.tmem_subslice %qk_1 {N = 66 : i32, async_task_id = array<i32: 0>} : !ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<1x128x1xf32, #tmem2, #ttng.tensor_memory, mutable, 1x128x128>
+        %qk_58 = ttng.tmem_subslice %qk_1 {offset = 66 : i32, async_task_id = array<i32: 0>} : !ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<1x128x1xf32, #tmem2, #ttng.tensor_memory, mutable, 1x128x128>
         %qk_59 = ttg.memdesc_reinterpret %qk_58 {async_task_id = array<i32: 0>} : !ttg.memdesc<1x128x1xf32, #tmem2, #ttng.tensor_memory, mutable, 1x128x128> -> !ttg.memdesc<1x128x1xf32, #tmem2, #ttng.tensor_memory, mutable>
         %offsetkv_y_60 = ttg.memdesc_index %qk_59[%c0_i32] {async_task_id = array<i32: 0>} : !ttg.memdesc<1x128x1xf32, #tmem2, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x1xf32, #tmem2, #ttng.tensor_memory, mutable>
         %105 = ttg.memdesc_index %72[%c0_i32] {async_task_id = array<i32: 0>} : !ttg.memdesc<1x1xi64, #shared, #smem, mutable> -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
@@ -406,7 +409,7 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
         %m_i0_62 = tt.reshape %m_i0_61 {async_task_id = array<i32: 0>} : tensor<128x1xf32, #blocked3> -> tensor<128xf32, #linear>
         %m_i0_63 = ttg.convert_layout %m_i0_62 : tensor<128xf32, #linear> -> tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked}>>
         %m_i0_64 = math.log2 %m_i0_62 {async_task_id = array<i32: 0>} : tensor<128xf32, #linear>
-        %qk_65 = ttng.tmem_subslice %qk_1 {N = 65 : i32, async_task_id = array<i32: 0>} : !ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<1x128x1xf32, #tmem2, #ttng.tensor_memory, mutable, 1x128x128>
+        %qk_65 = ttng.tmem_subslice %qk_1 {offset = 65 : i32, async_task_id = array<i32: 0>} : !ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<1x128x1xf32, #tmem2, #ttng.tensor_memory, mutable, 1x128x128>
         %qk_66 = ttg.memdesc_reinterpret %qk_65 {async_task_id = array<i32: 0>} : !ttg.memdesc<1x128x1xf32, #tmem2, #ttng.tensor_memory, mutable, 1x128x128> -> !ttg.memdesc<1x128x1xf32, #tmem2, #ttng.tensor_memory, mutable>
         %offsetkv_y_67 = ttg.memdesc_index %qk_66[%c0_i32] {async_task_id = array<i32: 0>} : !ttg.memdesc<1x128x1xf32, #tmem2, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x1xf32, #tmem2, #ttng.tensor_memory, mutable>
         %107 = ttg.memdesc_index %68[%c0_i32] {async_task_id = array<i32: 0>} : !ttg.memdesc<1x1xi64, #shared, #smem, mutable> -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
@@ -440,7 +443,7 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
         ttg.local_store %112, %113 {async_task_id = array<i32: 0>} : tensor<128x128xbf16, #blocked> -> !ttg.memdesc<128x128xbf16, #shared1, #smem, mutable>
         %117 = ttg.memdesc_index %32[%c0_i32] {async_task_id = array<i32: 0>} : !ttg.memdesc<1x1xi64, #shared, #smem, mutable> -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
         ttng.arrive_barrier %117, 1 {async_task_id = array<i32: 0>} : !ttg.memdesc<1xi64, #shared, #smem, mutable>
-        %qk_79 = ttng.tmem_subslice %qk {N = 66 : i32, async_task_id = array<i32: 0>} : !ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<1x128x1xf32, #tmem2, #ttng.tensor_memory, mutable, 1x128x128>
+        %qk_79 = ttng.tmem_subslice %qk {offset = 66 : i32, async_task_id = array<i32: 0>} : !ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<1x128x1xf32, #tmem2, #ttng.tensor_memory, mutable, 1x128x128>
         %qk_80 = ttg.memdesc_reinterpret %qk_79 {async_task_id = array<i32: 0>} : !ttg.memdesc<1x128x1xf32, #tmem2, #ttng.tensor_memory, mutable, 1x128x128> -> !ttg.memdesc<1x128x1xf32, #tmem2, #ttng.tensor_memory, mutable>
         %offsetkv_y_81 = ttg.memdesc_index %qk_80[%c0_i32] {async_task_id = array<i32: 0>} : !ttg.memdesc<1x128x1xf32, #tmem2, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x1xf32, #tmem2, #ttng.tensor_memory, mutable>
         %118 = ttg.memdesc_index %64[%c0_i32] {async_task_id = array<i32: 0>} : !ttg.memdesc<1x1xi64, #shared, #smem, mutable> -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
@@ -451,7 +454,7 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
         %m_i0_83 = tt.reshape %m_i0_82 {async_task_id = array<i32: 0>} : tensor<128x1xf32, #blocked3> -> tensor<128xf32, #linear>
         %m_i0_84 = ttg.convert_layout %m_i0_83 : tensor<128xf32, #linear> -> tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked}>>
         %m_i0_85 = math.log2 %m_i0_83 {async_task_id = array<i32: 0>} : tensor<128xf32, #linear>
-        %qk_86 = ttng.tmem_subslice %qk {N = 65 : i32, async_task_id = array<i32: 0>} : !ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<1x128x1xf32, #tmem2, #ttng.tensor_memory, mutable, 1x128x128>
+        %qk_86 = ttng.tmem_subslice %qk {offset = 65 : i32, async_task_id = array<i32: 0>} : !ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<1x128x1xf32, #tmem2, #ttng.tensor_memory, mutable, 1x128x128>
         %qk_87 = ttg.memdesc_reinterpret %qk_86 {async_task_id = array<i32: 0>} : !ttg.memdesc<1x128x1xf32, #tmem2, #ttng.tensor_memory, mutable, 1x128x128> -> !ttg.memdesc<1x128x1xf32, #tmem2, #ttng.tensor_memory, mutable>
         %offsetkv_y_88 = ttg.memdesc_index %qk_87[%c0_i32] {async_task_id = array<i32: 0>} : !ttg.memdesc<1x128x1xf32, #tmem2, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x1xf32, #tmem2, #ttng.tensor_memory, mutable>
         %120 = ttg.memdesc_index %60[%c0_i32] {async_task_id = array<i32: 0>} : !ttg.memdesc<1x1xi64, #shared, #smem, mutable> -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
@@ -542,7 +545,8 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
         %qk_43 = arith.xori %qk_42, %true_20 : i1
         %qk_44 = arith.extui %qk_43 : i1 to i32
         ttng.wait_barrier %105, %qk_44, %true_20 {async_task_id = array<i32: 1>} : !ttg.memdesc<1xi64, #shared, #smem, mutable>
-        ttng.tc_gen5_mma %q0_40, %k_38, %qk_39, %false, %true_20, %104[%true_20] {async_task_id = array<i32: 1>, is_async, tt.self_latency = 1 : i32} : !ttg.memdesc<128x128xbf16, #shared1, #smem, mutable>, !ttg.memdesc<128x128xbf16, #shared2, #smem, mutable>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.memdesc<1xi64, #shared, #smem, mutable>
+        ttng.tc_gen5_mma %q0_40, %k_38, %qk_39, %false, %true_20, %104[%true_20] {async_task_id = array<i32: 1>, is_async, two_ctas, tt.self_latency = 1 : i32} : !ttg.memdesc<128x128xbf16, #shared1, #smem, mutable>, !ttg.memdesc<128x128xbf16, #shared2, #smem, mutable>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.memdesc<1xi64, #shared, #smem, mutable>
+        ttng.tc_gen5_commit %104, %true_20 {async_task_id = array<i32: 1>} : !ttg.memdesc<1xi64, #shared, #smem, mutable>
         %qk_45 = ttg.memdesc_index %qk_8[%c0_i32_23] {async_task_id = array<i32: 1>} : !ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
         %q0_46 = ttg.memdesc_index %q0_9[%c0_i32_23] {async_task_id = array<i32: 1>} : !ttg.memdesc<1x128x128xbf16, #shared1, #smem, mutable> -> !ttg.memdesc<128x128xbf16, #shared1, #smem, mutable>
         %106 = ttg.memdesc_index %arg19[%k_34] {async_task_id = array<i32: 1>} : !ttg.memdesc<3x1xi64, #shared, #smem, mutable> -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
@@ -557,7 +561,7 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
         %v_51 = arith.trunci %v_50 {async_task_id = array<i32: 1>} : i64 to i32
         %v_52 = arith.andi %v_48, %c1_i64_18 {async_task_id = array<i32: 1>} : i64
         %v_53 = arith.trunci %v_52 {async_task_id = array<i32: 1>} : i64 to i1
-        %qk_54 = ttng.tmem_subslice %qk_6 {N = 0 : i32, async_task_id = array<i32: 1>} : !ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<1x128x64xf32, #tmem1, #ttng.tensor_memory, mutable, 1x128x128>
+        %qk_54 = ttng.tmem_subslice %qk_6 {offset = 0 : i32, async_task_id = array<i32: 1>} : !ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<1x128x64xf32, #tmem1, #ttng.tensor_memory, mutable, 1x128x128>
         %qk_55 = ttg.memdesc_reinterpret %qk_54 {async_task_id = array<i32: 1>} : !ttg.memdesc<1x128x64xf32, #tmem1, #ttng.tensor_memory, mutable, 1x128x128> -> !ttg.memdesc<1x128x128xbf16, #tmem3, #ttng.tensor_memory, mutable>
         %acc_56 = ttg.memdesc_index %qk_55[%c0_i32_23] {async_task_id = array<i32: 1>} : !ttg.memdesc<1x128x128xbf16, #tmem3, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x128xbf16, #tmem3, #ttng.tensor_memory, mutable>
         %v_57 = ttg.memdesc_index %v_5[%v_51] {async_task_id = array<i32: 1>} : !ttg.memdesc<3x128x128xbf16, #shared1, #smem, mutable> -> !ttg.memdesc<128x128xbf16, #shared1, #smem, mutable>
@@ -595,7 +599,7 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
           ttng.tc_gen5_mma %q0_40, %k_90, %qk_39, %false, %true_20, %104[%true_20] {async_task_id = array<i32: 1>, is_async, tt.self_latency = 1 : i32} : !ttg.memdesc<128x128xbf16, #shared1, #smem, mutable>, !ttg.memdesc<128x128xbf16, #shared2, #smem, mutable>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.memdesc<1xi64, #shared, #smem, mutable>
           %acc_95 = arith.andi %tile_idx_78, %c1_i64_18 {async_task_id = array<i32: 1>} : i64
           %acc_96 = arith.trunci %acc_95 {async_task_id = array<i32: 1>} : i64 to i1
-          %qk_97 = ttng.tmem_subslice %qk_8 {N = 0 : i32, async_task_id = array<i32: 1>} : !ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<1x128x64xf32, #tmem1, #ttng.tensor_memory, mutable, 1x128x128>
+          %qk_97 = ttng.tmem_subslice %qk_8 {offset = 0 : i32, async_task_id = array<i32: 1>} : !ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<1x128x64xf32, #tmem1, #ttng.tensor_memory, mutable, 1x128x128>
           %qk_98 = ttg.memdesc_reinterpret %qk_97 {async_task_id = array<i32: 1>} : !ttg.memdesc<1x128x64xf32, #tmem1, #ttng.tensor_memory, mutable, 1x128x128> -> !ttg.memdesc<1x128x128xbf16, #tmem3, #ttng.tensor_memory, mutable>
           %acc_99 = ttg.memdesc_index %qk_98[%c0_i32_23] {async_task_id = array<i32: 1>} : !ttg.memdesc<1x128x128xbf16, #tmem3, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x128xbf16, #tmem3, #ttng.tensor_memory, mutable>
           %acc_100 = arith.addi %tile_idx_79, %c1_i64_18 {async_task_id = array<i32: 1>} : i64
@@ -638,7 +642,7 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
         %offsetkv_y_62 = arith.addi %offsetkv_y_60#1, %c1_i64_18 {async_task_id = array<i32: 1>} : i64
         %acc_63 = arith.andi %offsetkv_y_60#1, %c1_i64_18 {async_task_id = array<i32: 1>} : i64
         %acc_64 = arith.trunci %acc_63 {async_task_id = array<i32: 1>} : i64 to i1
-        %qk_65 = ttng.tmem_subslice %qk_8 {N = 0 : i32, async_task_id = array<i32: 1>} : !ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<1x128x64xf32, #tmem1, #ttng.tensor_memory, mutable, 1x128x128>
+        %qk_65 = ttng.tmem_subslice %qk_8 {offset = 0 : i32, async_task_id = array<i32: 1>} : !ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<1x128x64xf32, #tmem1, #ttng.tensor_memory, mutable, 1x128x128>
         %qk_66 = ttg.memdesc_reinterpret %qk_65 {async_task_id = array<i32: 1>} : !ttg.memdesc<1x128x64xf32, #tmem1, #ttng.tensor_memory, mutable, 1x128x128> -> !ttg.memdesc<1x128x128xbf16, #tmem3, #ttng.tensor_memory, mutable>
         %acc_67 = ttg.memdesc_index %qk_66[%c0_i32_23] {async_task_id = array<i32: 1>} : !ttg.memdesc<1x128x128xbf16, #tmem3, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x128xbf16, #tmem3, #ttng.tensor_memory, mutable>
         %acc_68 = arith.addi %offsetkv_y_60#2, %c1_i64_18 {async_task_id = array<i32: 1>} : i64
@@ -724,7 +728,7 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
         %98 = ttg.memdesc_index %arg11[%c0_i32_23] {async_task_id = array<i32: 2>} : !ttg.memdesc<1x1xi64, #shared, #smem, mutable> -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
         ttng.barrier_expect %98, 32768 {async_task_id = array<i32: 2>}, %true_17 : !ttg.memdesc<1xi64, #shared, #smem, mutable>
         %q0_44 = ttg.memdesc_index %q0_7[%c0_i32_23] {async_task_id = array<i32: 2>} : !ttg.memdesc<1x128x128xbf16, #shared1, #smem, mutable> -> !ttg.memdesc<128x128xbf16, #shared1, #smem, mutable>
-        ttng.async_tma_copy_global_to_local %desc_q_29[%qo_offset_y_39, %c0_i32_23] %q0_44, %98, %true_17 {async_task_id = array<i32: 2>} : !tt.tensordesc<128x128xbf16, #shared1>, !ttg.memdesc<1xi64, #shared, #smem, mutable> -> !ttg.memdesc<128x128xbf16, #shared1, #smem, mutable>
+        ttng.async_tma_copy_global_to_local %desc_q_29[%qo_offset_y_39, %c0_i32_23] %q0_44, %98, %true_17 {async_task_id = array<i32: 2>, two_cta = true} : !tt.tensordesc<128x128xbf16, #shared1>, !ttg.memdesc<1xi64, #shared, #smem, mutable> -> !ttg.memdesc<128x128xbf16, #shared1, #smem, mutable>
         %99 = ttg.memdesc_index %arg10[%c0_i32_23] {async_task_id = array<i32: 2>} : !ttg.memdesc<1x1xi64, #shared, #smem, mutable> -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
         ttng.barrier_expect %99, 32768 {async_task_id = array<i32: 2>}, %true_17 : !ttg.memdesc<1xi64, #shared, #smem, mutable>
         %q0_45 = ttg.memdesc_index %q0_9[%c0_i32_23] {async_task_id = array<i32: 2>} : !ttg.memdesc<1x128x128xbf16, #shared1, #smem, mutable> -> !ttg.memdesc<128x128xbf16, #shared1, #smem, mutable>
@@ -891,7 +895,7 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
           %alpha_58 = math.exp2 %alpha {async_task_id = array<i32: 4>} : tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked}>>
           %alpha_59 = ttg.convert_layout %alpha_58 : tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked}>> -> tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked3}>>
           %alpha_60 = tt.expand_dims %alpha_59 {async_task_id = array<i32: 4>, axis = 1 : i32} : tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked3}>> -> tensor<128x1xf32, #blocked3>
-          %qk_61 = ttng.tmem_subslice %qk_8 {N = 64 : i32, async_task_id = array<i32: 4>} : !ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<1x128x1xf32, #tmem2, #ttng.tensor_memory, mutable, 1x128x128>
+          %qk_61 = ttng.tmem_subslice %qk_8 {offset = 64 : i32, async_task_id = array<i32: 4>} : !ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<1x128x1xf32, #tmem2, #ttng.tensor_memory, mutable, 1x128x128>
           %qk_62 = ttg.memdesc_reinterpret %qk_61 {async_task_id = array<i32: 4>} : !ttg.memdesc<1x128x1xf32, #tmem2, #ttng.tensor_memory, mutable, 1x128x128> -> !ttg.memdesc<1x128x1xf32, #tmem2, #ttng.tensor_memory, mutable>
           %alpha_63 = ttg.memdesc_index %qk_62[%c0_i32_23] {async_task_id = array<i32: 4>} : !ttg.memdesc<1x128x1xf32, #tmem2, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x1xf32, #tmem2, #ttng.tensor_memory, mutable>
           %103 = ttg.memdesc_index %arg43[%c0_i32_23] {async_task_id = array<i32: 4>} : !ttg.memdesc<1x1xi64, #shared, #smem, mutable> -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
@@ -907,7 +911,7 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
             tt.reduce.return %l_ij_76 {async_task_id = array<i32: 4>} : f32
           }) {async_task_id = array<i32: 4>} : (tensor<128x128xf32, #blocked>) -> tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked}>>
           %p_66 = arith.truncf %p {async_task_id = array<i32: 4>} : tensor<128x128xf32, #blocked> to tensor<128x128xbf16, #blocked>
-          %qk_67 = ttng.tmem_subslice %qk_8 {N = 0 : i32, async_task_id = array<i32: 4>} : !ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<1x128x64xf32, #tmem1, #ttng.tensor_memory, mutable, 1x128x128>
+          %qk_67 = ttng.tmem_subslice %qk_8 {offset = 0 : i32, async_task_id = array<i32: 4>} : !ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<1x128x64xf32, #tmem1, #ttng.tensor_memory, mutable, 1x128x128>
           %qk_68 = ttg.memdesc_reinterpret %qk_67 {async_task_id = array<i32: 4>} : !ttg.memdesc<1x128x64xf32, #tmem1, #ttng.tensor_memory, mutable, 1x128x128> -> !ttg.memdesc<1x128x128xbf16, #tmem3, #ttng.tensor_memory, mutable>
           %acc_69 = ttg.memdesc_index %qk_68[%c0_i32_23] {async_task_id = array<i32: 4>} : !ttg.memdesc<1x128x128xbf16, #tmem3, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x128xbf16, #tmem3, #ttng.tensor_memory, mutable>
           %105 = ttg.memdesc_index %arg25[%c0_i32_23] {async_task_id = array<i32: 4>} : !ttg.memdesc<1x1xi64, #shared, #smem, mutable> -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
@@ -924,7 +928,7 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
         } {async_task_id = array<i32: 4>, tt.warp_specialize}
         %offsetkv_y_30 = ttg.convert_layout %offsetkv_y#1 : tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked}>> -> tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked3}>>
         %offsetkv_y_31 = tt.expand_dims %offsetkv_y_30 {async_task_id = array<i32: 4>, axis = 1 : i32} : tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked3}>> -> tensor<128x1xf32, #blocked3>
-        %qk_32 = ttng.tmem_subslice %qk_8 {N = 65 : i32, async_task_id = array<i32: 4>} : !ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<1x128x1xf32, #tmem2, #ttng.tensor_memory, mutable, 1x128x128>
+        %qk_32 = ttng.tmem_subslice %qk_8 {offset = 65 : i32, async_task_id = array<i32: 4>} : !ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<1x128x1xf32, #tmem2, #ttng.tensor_memory, mutable, 1x128x128>
         %qk_33 = ttg.memdesc_reinterpret %qk_32 {async_task_id = array<i32: 4>} : !ttg.memdesc<1x128x1xf32, #tmem2, #ttng.tensor_memory, mutable, 1x128x128> -> !ttg.memdesc<1x128x1xf32, #tmem2, #ttng.tensor_memory, mutable>
         %offsetkv_y_34 = ttg.memdesc_index %qk_33[%c0_i32_23] {async_task_id = array<i32: 4>} : !ttg.memdesc<1x128x1xf32, #tmem2, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x1xf32, #tmem2, #ttng.tensor_memory, mutable>
         %offsetkv_y_35 = arith.andi %arg61, %c1_i64_18 {async_task_id = array<i32: 4>} : i64
@@ -938,7 +942,7 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
         ttng.arrive_barrier %98, 1 {async_task_id = array<i32: 4>} : !ttg.memdesc<1xi64, #shared, #smem, mutable>
         %offsetkv_y_39 = ttg.convert_layout %offsetkv_y#0 : tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked}>> -> tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked3}>>
         %offsetkv_y_40 = tt.expand_dims %offsetkv_y_39 {async_task_id = array<i32: 4>, axis = 1 : i32} : tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked3}>> -> tensor<128x1xf32, #blocked3>
-        %qk_41 = ttng.tmem_subslice %qk_8 {N = 66 : i32, async_task_id = array<i32: 4>} : !ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<1x128x1xf32, #tmem2, #ttng.tensor_memory, mutable, 1x128x128>
+        %qk_41 = ttng.tmem_subslice %qk_8 {offset = 66 : i32, async_task_id = array<i32: 4>} : !ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<1x128x1xf32, #tmem2, #ttng.tensor_memory, mutable, 1x128x128>
         %qk_42 = ttg.memdesc_reinterpret %qk_41 {async_task_id = array<i32: 4>} : !ttg.memdesc<1x128x1xf32, #tmem2, #ttng.tensor_memory, mutable, 1x128x128> -> !ttg.memdesc<1x128x1xf32, #tmem2, #ttng.tensor_memory, mutable>
         %offsetkv_y_43 = ttg.memdesc_index %qk_42[%c0_i32_23] {async_task_id = array<i32: 4>} : !ttg.memdesc<1x128x1xf32, #tmem2, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x1xf32, #tmem2, #ttng.tensor_memory, mutable>
         %99 = ttg.memdesc_index %arg51[%c0_i32_23] {async_task_id = array<i32: 4>} : !ttg.memdesc<1x1xi64, #shared, #smem, mutable> -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
@@ -1006,7 +1010,7 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
           %alpha_58 = math.exp2 %alpha {async_task_id = array<i32: 5>} : tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked}>>
           %alpha_59 = ttg.convert_layout %alpha_58 : tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked}>> -> tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked3}>>
           %alpha_60 = tt.expand_dims %alpha_59 {async_task_id = array<i32: 5>, axis = 1 : i32} : tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked3}>> -> tensor<128x1xf32, #blocked3>
-          %qk_61 = ttng.tmem_subslice %qk_6 {N = 64 : i32, async_task_id = array<i32: 5>} : !ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<1x128x1xf32, #tmem2, #ttng.tensor_memory, mutable, 1x128x128>
+          %qk_61 = ttng.tmem_subslice %qk_6 {offset = 64 : i32, async_task_id = array<i32: 5>} : !ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<1x128x1xf32, #tmem2, #ttng.tensor_memory, mutable, 1x128x128>
           %qk_62 = ttg.memdesc_reinterpret %qk_61 {async_task_id = array<i32: 5>} : !ttg.memdesc<1x128x1xf32, #tmem2, #ttng.tensor_memory, mutable, 1x128x128> -> !ttg.memdesc<1x128x1xf32, #tmem2, #ttng.tensor_memory, mutable>
           %alpha_63 = ttg.memdesc_index %qk_62[%c0_i32_23] {async_task_id = array<i32: 5>} : !ttg.memdesc<1x128x1xf32, #tmem2, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x1xf32, #tmem2, #ttng.tensor_memory, mutable>
           %103 = ttg.memdesc_index %arg45[%c0_i32_23] {async_task_id = array<i32: 5>} : !ttg.memdesc<1x1xi64, #shared, #smem, mutable> -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
@@ -1022,7 +1026,7 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
             tt.reduce.return %l_ij_76 {async_task_id = array<i32: 5>} : f32
           }) {async_task_id = array<i32: 5>} : (tensor<128x128xf32, #blocked>) -> tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked}>>
           %p_66 = arith.truncf %p {async_task_id = array<i32: 5>} : tensor<128x128xf32, #blocked> to tensor<128x128xbf16, #blocked>
-          %qk_67 = ttng.tmem_subslice %qk_6 {N = 0 : i32, async_task_id = array<i32: 5>} : !ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<1x128x64xf32, #tmem1, #ttng.tensor_memory, mutable, 1x128x128>
+          %qk_67 = ttng.tmem_subslice %qk_6 {offset = 0 : i32, async_task_id = array<i32: 5>} : !ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<1x128x64xf32, #tmem1, #ttng.tensor_memory, mutable, 1x128x128>
           %qk_68 = ttg.memdesc_reinterpret %qk_67 {async_task_id = array<i32: 5>} : !ttg.memdesc<1x128x64xf32, #tmem1, #ttng.tensor_memory, mutable, 1x128x128> -> !ttg.memdesc<1x128x128xbf16, #tmem3, #ttng.tensor_memory, mutable>
           %acc_69 = ttg.memdesc_index %qk_68[%c0_i32_23] {async_task_id = array<i32: 5>} : !ttg.memdesc<1x128x128xbf16, #tmem3, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x128xbf16, #tmem3, #ttng.tensor_memory, mutable>
           %105 = ttg.memdesc_index %arg22[%c0_i32_23] {async_task_id = array<i32: 5>} : !ttg.memdesc<1x1xi64, #shared, #smem, mutable> -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
@@ -1039,7 +1043,7 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
         } {async_task_id = array<i32: 5>, tt.warp_specialize}
         %offsetkv_y_30 = ttg.convert_layout %offsetkv_y#1 : tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked}>> -> tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked3}>>
         %offsetkv_y_31 = tt.expand_dims %offsetkv_y_30 {async_task_id = array<i32: 5>, axis = 1 : i32} : tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked3}>> -> tensor<128x1xf32, #blocked3>
-        %qk_32 = ttng.tmem_subslice %qk_6 {N = 65 : i32, async_task_id = array<i32: 5>} : !ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<1x128x1xf32, #tmem2, #ttng.tensor_memory, mutable, 1x128x128>
+        %qk_32 = ttng.tmem_subslice %qk_6 {offset = 65 : i32, async_task_id = array<i32: 5>} : !ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<1x128x1xf32, #tmem2, #ttng.tensor_memory, mutable, 1x128x128>
         %qk_33 = ttg.memdesc_reinterpret %qk_32 {async_task_id = array<i32: 5>} : !ttg.memdesc<1x128x1xf32, #tmem2, #ttng.tensor_memory, mutable, 1x128x128> -> !ttg.memdesc<1x128x1xf32, #tmem2, #ttng.tensor_memory, mutable>
         %offsetkv_y_34 = ttg.memdesc_index %qk_33[%c0_i32_23] {async_task_id = array<i32: 5>} : !ttg.memdesc<1x128x1xf32, #tmem2, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x1xf32, #tmem2, #ttng.tensor_memory, mutable>
         %offsetkv_y_35 = arith.andi %arg61, %c1_i64_18 {async_task_id = array<i32: 5>} : i64
@@ -1053,7 +1057,7 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
         ttng.arrive_barrier %98, 1 {async_task_id = array<i32: 5>} : !ttg.memdesc<1xi64, #shared, #smem, mutable>
         %offsetkv_y_39 = ttg.convert_layout %offsetkv_y#0 : tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked}>> -> tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked3}>>
         %offsetkv_y_40 = tt.expand_dims %offsetkv_y_39 {async_task_id = array<i32: 5>, axis = 1 : i32} : tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked3}>> -> tensor<128x1xf32, #blocked3>
-        %qk_41 = ttng.tmem_subslice %qk_6 {N = 66 : i32, async_task_id = array<i32: 5>} : !ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<1x128x1xf32, #tmem2, #ttng.tensor_memory, mutable, 1x128x128>
+        %qk_41 = ttng.tmem_subslice %qk_6 {offset = 66 : i32, async_task_id = array<i32: 5>} : !ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<1x128x1xf32, #tmem2, #ttng.tensor_memory, mutable, 1x128x128>
         %qk_42 = ttg.memdesc_reinterpret %qk_41 {async_task_id = array<i32: 5>} : !ttg.memdesc<1x128x1xf32, #tmem2, #ttng.tensor_memory, mutable, 1x128x128> -> !ttg.memdesc<1x128x1xf32, #tmem2, #ttng.tensor_memory, mutable>
         %offsetkv_y_43 = ttg.memdesc_index %qk_42[%c0_i32_23] {async_task_id = array<i32: 5>} : !ttg.memdesc<1x128x1xf32, #tmem2, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x1xf32, #tmem2, #ttng.tensor_memory, mutable>
         %99 = ttg.memdesc_index %arg55[%c0_i32_23] {async_task_id = array<i32: 5>} : !ttg.memdesc<1x1xi64, #shared, #smem, mutable> -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
@@ -1067,5 +1071,57 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
       ttg.warp_return {async_task_id = array<i32: 5>}
     } : (i32, i32, !ttg.memdesc<1x1xi64, #shared, #smem, mutable>, !ttg.memdesc<1x1xi64, #shared, #smem, mutable>, !ttg.memdesc<3x128x128xbf16, #shared1, #smem, mutable>, !ttg.memdesc<3x1xi64, #shared, #smem, mutable>, !ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.memdesc<1x128x128xbf16, #shared1, #smem, mutable>, !ttg.memdesc<1x1xi64, #shared, #smem, mutable>, !ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.memdesc<1x128x128xbf16, #shared1, #smem, mutable>, !ttg.memdesc<3x1xi64, #shared, #smem, mutable>, !ttg.memdesc<1x1xi64, #shared, #smem, mutable>, !ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.memdesc<1x1xi64, #shared, #smem, mutable>, !ttg.memdesc<1x1xi64, #shared, #smem, mutable>, !ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.memdesc<1x1xi64, #shared, #smem, mutable>, !ttg.memdesc<1x1xi64, #shared, #smem, mutable>, !ttg.memdesc<1x1xi64, #shared, #smem, mutable>, !ttg.memdesc<1x1xi64, #shared, #smem, mutable>, !tt.ptr<bf16>, !tt.ptr<bf16>, !tt.ptr<bf16>, !tt.ptr<bf16>, !ttg.memdesc<1x128x128xbf16, #shared1, #smem, mutable>, !ttg.memdesc<1x128x128xbf16, #shared1, #smem, mutable>, f32, !ttg.memdesc<1x1xi64, #shared, #smem, mutable>, !ttg.memdesc<1x1xi64, #shared, #smem, mutable>, !ttg.memdesc<1x1xi64, #shared, #smem, mutable>, !ttg.memdesc<1x1xi64, #shared, #smem, mutable>, !ttg.memdesc<1x1xi64, #shared, #smem, mutable>, !ttg.memdesc<1x1xi64, #shared, #smem, mutable>, !ttg.memdesc<1x1xi64, #shared, #smem, mutable>, !ttg.memdesc<1x1xi64, #shared, #smem, mutable>, !ttg.memdesc<1x1xi64, #shared, #smem, mutable>, !ttg.memdesc<1x1xi64, #shared, #smem, mutable>, !ttg.memdesc<1x1xi64, #shared, #smem, mutable>, !ttg.memdesc<1x1xi64, #shared, #smem, mutable>, !ttg.memdesc<1x1xi64, #shared, #smem, mutable>, !ttg.memdesc<1x1xi64, #shared, #smem, mutable>, !ttg.memdesc<1x1xi64, #shared, #smem, mutable>, !ttg.memdesc<1x1xi64, #shared, #smem, mutable>, !ttg.memdesc<1x1xi64, #shared, #smem, mutable>, !ttg.memdesc<1x1xi64, #shared, #smem, mutable>, !ttg.memdesc<1x1xi64, #shared, #smem, mutable>, !ttg.memdesc<1x1xi64, #shared, #smem, mutable>, !ttg.memdesc<1x1xi64, #shared, #smem, mutable>, !ttg.memdesc<1x1xi64, #shared, #smem, mutable>, !ttg.memdesc<1x1xi64, #shared, #smem, mutable>, !ttg.memdesc<1x1xi64, #shared, #smem, mutable>) -> ()
     tt.return
+  }
+
+  // CHECK: def planned_store_wait(
+  // CHECK: tlx.async_descriptor_store_wait(1)
+  tt.func public @planned_store_wait(%tok: !ttg.async.token) {
+    ttng.async_tma_store_token_wait %tok {planned_pending_count = 1 : i32} : !ttg.async.token
+    tt.return
+  }
+
+  // CHECK: def diagnostic_memory_ops(
+  // CHECK: var_{{[0-9]+}} = tlx.local_slice({{.*}}, [128, 0], [128, 64])
+  // CHECK: tlx.async_remote_shmem_copy(
+  // CHECK: tlx.async_descriptor_store({{.*}}, store_reduce="and")
+  tt.func public @diagnostic_memory_ops(
+      %desc: !tt.tensordesc<32x32xi32, #shared3>, %rank: i32, %x: i32) {
+    %parent = ttg.local_alloc : () -> !ttg.memdesc<256x64xf16, #shared1, #smem, mutable>
+    %src = ttg.local_alloc : () -> !ttg.memdesc<128x64xf16, #shared1, #smem, mutable>
+    %dst = ttg.memdesc_subslice %parent[128, 0] : !ttg.memdesc<256x64xf16, #shared1, #smem, mutable> -> !ttg.memdesc<128x64xf16, #shared1, #smem, mutable, 256x64>
+    %bars = ttg.local_alloc : () -> !ttg.memdesc<1x1xi64, #shared, #smem, mutable>
+    %bar = ttg.memdesc_index %bars[%x] : !ttg.memdesc<1x1xi64, #shared, #smem, mutable> -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    ttg.async_remote_shmem_copy %src, rank %rank, %dst barrier %bar : !ttg.memdesc<128x64xf16, #shared1, #smem, mutable> -> !ttg.memdesc<128x64xf16, #shared1, #smem, mutable, 256x64> barrier_ty !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    %reduce_src = ttg.local_alloc : () -> !ttg.memdesc<32x32xi32, #shared3, #smem, mutable>
+    ttng.async_tma_reduce and, %desc[%x, %x] %reduce_src : !tt.tensordesc<32x32xi32, #shared3>, !ttg.memdesc<32x32xi32, #shared3, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+module {
+  // CHECK-LABEL: def clc_while(
+  // CHECK: tlx.async_descriptor_store_wait(1)
+  // CHECK: arg2 = arg0
+  // CHECK: while True:
+  // CHECK-NEXT:   var_{{[0-9]+}} = arg2 < arg1
+  // CHECK-NEXT:   if not var_{{[0-9]+}}:
+  // CHECK-NEXT:     var_{{[0-9]+}} = arg2
+  // CHECK-NEXT:     break
+  // CHECK-NEXT:   var_{{[0-9]+}} = arg2 + arg1
+  // CHECK-NEXT:   arg2 = var_{{[0-9]+}}
+  tt.func public @clc_while(%start: i32, %limit: i32) -> i32 {
+    %token = ub.poison : !ttg.async.token
+    ttng.async_tma_store_token_wait %token {planned_pending_count = 1 : i32} : !ttg.async.token
+    %result = scf.while (%iter = %start) : (i32) -> i32 {
+      %keep_going = arith.cmpi slt, %iter, %limit : i32
+      scf.condition(%keep_going) %iter : i32
+    } do {
+    ^bb0(%body_iter: i32):
+      %next = arith.addi %body_iter, %limit : i32
+      scf.yield %next : i32
+    }
+    tt.return %result : i32
   }
 }

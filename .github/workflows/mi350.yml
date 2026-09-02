@@ -3,7 +3,23 @@ on:
   push:
     branches:
       - main
+    paths-ignore:
+      - 'third_party/nvidia/**'
+      - 'third_party/tlx/tutorials/blackwell-*/**'
+      - 'third_party/tlx/tutorials/blackwell-*'
+      - 'third_party/tlx/tutorials/testing/test_correctness_autows.py'
+      - 'python/test/unit/cuda/**'
+      - 'python/test/unit/language/test_tlx_tma.py'
+      - 'third_party/proton/test/**'
   pull_request:
+    paths-ignore:
+      - 'third_party/nvidia/**'
+      - 'third_party/tlx/tutorials/blackwell-*/**'
+      - 'third_party/tlx/tutorials/blackwell-*'
+      - 'third_party/tlx/tutorials/testing/test_correctness_autows.py'
+      - 'python/test/unit/cuda/**'
+      - 'python/test/unit/language/test_tlx_tma.py'
+      - 'third_party/proton/test/**'
   schedule:
     # Every 6 hours at the top of the hour (00:00, 06:00, 12:00, 18:00 UTC).
     - cron: '0 */6 * * *'
@@ -36,6 +52,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v3
+        with:
+          submodules: recursive
       - name: Checkout TritonBench (Optional)
         id: tritonbench_pr
         if: github.event_name == 'pull_request'
@@ -84,7 +102,7 @@ jobs:
       CONDA_ENV: pytorch
       UV_VENV_DIR: /workspace/uv_venvs
       SETUP_SCRIPT: /workspace/setup_instance.sh
-    timeout-minutes: 30
+    timeout-minutes: 120
     permissions:
       id-token: write
       contents: read
@@ -93,6 +111,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v3
+        with:
+          submodules: recursive
       - name: Checkout Tritonbench
         uses: actions/checkout@v3
         with:
@@ -123,13 +143,13 @@ jobs:
           pytest python/test/unit/language/test_tlx_*.py -v --junitxml=/tmp/tlx-unit.xml
       - name: Run TLX tutorial correctness tests
         id: run_correctness_tests
-        timeout-minutes: 10
+        timeout-minutes: 30
         run: |
           set -eux
           . "${SETUP_SCRIPT}"
-          # AMD (gfx950/CDNA4) + ikbo cases run; Hopper/Blackwell and gfx1250
-          # cases auto-skip via @pytest.mark.skipif arch gates.
-          pytest third_party/tlx/tutorials/testing/test_correctness.py -v --junitxml=/tmp/tlx-correctness.xml
+          # Report the slowest cases so future changes can reduce the runtime
+          # without relying on brittle test-name filters.
+          pytest third_party/tlx/tutorials/testing/test_correctness.py -v --durations=25 --junitxml=/tmp/tlx-correctness.xml
       - name: Collect nightly failures (TLX)
         id: parse
         if: always() && github.event_name == 'schedule'
@@ -162,6 +182,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v3
+        with:
+          submodules: recursive
       - name: Checkout Tritonbench
         uses: actions/checkout@v3
         with:
@@ -329,5 +351,5 @@ jobs:
       run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}-${{ github.event_name == 'workflow_dispatch' }}
+  group: ${{ github.workflow }}-${{ github.job }}-${{ github.event.pull_request.number || github.sha }}-${{ github.event_name == 'workflow_dispatch' }}
   cancel-in-progress: true

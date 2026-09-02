@@ -86,11 +86,36 @@ def amd_register_resident(
     """
     register_class = tl._unwrap_if_constexpr(register_class)
     registers_per_group = tl._unwrap_if_constexpr(registers_per_group)
-    assert isinstance(value, tl.tensor), "value must be a distributed tensor"
+    assert isinstance(value, tl.tensor) and value.type.is_block(), "value must be a distributed tensor"
+    assert value.dtype.is_int() or value.dtype.is_floating(), "value elements must be integer or floating-point"
+    assert value.dtype.primitive_bitwidth in (16, 32), "value elements must be 16 or 32 bits"
     assert register_class in ("agpr", "vgpr"), ('register_class must be either "agpr" or "vgpr"')
     assert (isinstance(registers_per_group, int) and not isinstance(registers_per_group, bool) and registers_per_group
             in (1, 2, 4, 8, 16, 32)), "registers_per_group must be a power of two between 1 and 32"
     handle = _semantic.builder.create_amd_register_resident(value.handle, register_class, registers_per_group)
+    return tl.tensor(handle, value.type)
+
+
+@tl.builtin
+def amd_register_handoff(
+    value,
+    register_class: tl.constexpr = "vgpr",
+    _semantic=None,
+):
+    """Start a new AMD register-allocation interval for a tensor value.
+
+    Each 32-bit native register value is passed unchanged through an independent
+    tied register constraint, so this expresses a local allocation/scheduling
+    handoff without requiring the complete tensor to be resident at one point.
+    Use :func:`amd_register_resident` when simultaneous whole-tensor residency
+    is the intended software-pipeline contract.
+    """
+    register_class = tl._unwrap_if_constexpr(register_class)
+    assert isinstance(value, tl.tensor) and value.type.is_block(), "value must be a distributed tensor"
+    assert value.dtype.is_int() or value.dtype.is_floating(), "value elements must be integer or floating-point"
+    assert value.dtype.primitive_bitwidth in (16, 32), "value elements must be 16 or 32 bits"
+    assert register_class in ("agpr", "vgpr"), ('register_class must be either "agpr" or "vgpr"')
+    handle = _semantic.builder.create_amd_register_handoff(value.handle, register_class)
     return tl.tensor(handle, value.type)
 
 
@@ -105,7 +130,7 @@ def amd_scheduled_mfma(
     initialize: tl.constexpr = False,
     _semantic=None,
 ):
-    """Update native CDNA4 MFMA fragments with source-controlled scheduling.
+    """Update native CDNA3/CDNA4 MFMA fragments with source scheduling.
 
     Unlike ``tl.dot``, which represents one logical matrix product and carries
     no accumulator-lifetime or register-class contract, this operation exposes
@@ -114,13 +139,18 @@ def amd_scheduled_mfma(
     lowering infers that lifetime instead of receiving an explicit role.
 
     ``accumulator_role`` controls the lowering contract, not the numerical
-    operation. ``"transient"`` describes a phase-local chain: ``auto`` storage
+    operation. ``"transient"`` describes a phase-local chain: default storage
     selects VGPRs and lowering uses ROCDL MFMA intrinsics so LLVM can model
     instruction latency and hazards. ``"persistent"`` describes a chain
-    carried across phases: ``auto`` storage selects AGPRs and lowering uses
-    register-constrained inline assembly. An explicit
+    carried across phases and lowering uses register-constrained inline
+    assembly; default storage selects AGPRs on every target. An explicit
     ``accumulator_register_class`` overrides that default, allowing two
     persistent accumulator sets to occupy complementary register files.
+
+    On CDNA3 the compiler-generated AGPR read is not ordered against the MFMA
+    drain, so AGPR accumulators are rejected there and a ``"persistent"`` chain
+    must pass ``accumulator_register_class="vgpr"``; the default is an error
+    rather than a silent downgrade.
     """
     resident_operand = tl._unwrap_if_constexpr(resident_operand)
     accumulator_role = tl._unwrap_if_constexpr(accumulator_role)
@@ -150,22 +180,25 @@ def amd_scheduled_mfma(
 
 
 @tl.builtin
-def amd_mfma_commit(value, preserve, _semantic=None):
-    """Commit transient MFMA results and thread a live dot operand.
+def amd_mfma_commit(value, preserve=None, _semantic=None):
+    """Commit MFMA results and optionally thread a live dot operand.
 
     ``value`` may be one tensor or a tuple of independent transient
     ``amd_scheduled_mfma`` results. The returned copy of ``preserve`` can be
-    consumed by the next source stage to make its residency explicit.
+    consumed by the next source stage to make its residency explicit. With no
+    ``preserve``, the values form one persistent-AGPR epilogue boundary.
     """
     single_value = isinstance(value, tl.tensor)
     values = (value, ) if single_value else value
     assert isinstance(values,
                       (tuple, tl.tuple)) and len(values) > 0, ("value must be a tensor or nonempty tensor tuple")
     assert all(isinstance(item, tl.tensor) for item in values), ("value must contain only tensors")
-    assert isinstance(preserve, tl.tensor), "preserve must be a tensor"
-    inputs = tuple(values) + (preserve, )
+    assert preserve is None or isinstance(preserve, tl.tensor), ("preserve must be None or a tensor")
+    inputs = tuple(values) + (() if preserve is None else (preserve, ))
     handles = _semantic.builder.create_amd_mfma_commit([item.handle for item in inputs])
     outputs = tuple(tl.tensor(handle, item.type) for handle, item in zip(handles, inputs))
+    if preserve is None:
+        return outputs[0] if single_value else outputs
     if single_value:
         return outputs[0], outputs[-1]
     return outputs
@@ -197,13 +230,30 @@ def require_layout(
     assert isinstance(pin, bool), f"pin must be a constexpr bool, got {type(pin).__name__}"
     assert isinstance(late_address_compute, bool), ("late_address_compute must be a constexpr bool, got "
                                                     f"{type(late_address_compute).__name__}")
-    enc = layout.to_ir(_semantic.builder, x.shape, x.dtype)
+    if isinstance(layout, tlx.layout):
+        enc = layout.to_ir(_semantic.builder, x.shape, x.dtype)
+    else:
+        enc = layout.to_ir(_semantic.builder)
     handle = _semantic.builder.create_require_layout(
         x.handle,
         enc,
         pin=pin,
         late_address_compute=late_address_compute,
     )
+    return tl.tensor(handle, x.type)
+
+
+@tl.builtin
+def release_layout(x, _semantic=None):
+    """Release a register tensor's explicit layout for a flexible consumer.
+
+     The returned tensor has the same logical shape and element type as ``x``,
+     but downstream operations may choose their own layout.  Use this at a
+     helper or control-flow boundary when a source-scheduled fragment layout is
+     intentionally local to the preceding region.
+     """
+    assert isinstance(x, tl.tensor) and x.type.is_block(), "x must be a distributed tensor"
+    handle = _semantic.builder.create_release_layout(x.handle)
     return tl.tensor(handle, x.type)
 
 
@@ -267,6 +317,81 @@ def require_tmem_scales_layout(src: tlx.buffered_tensor, _builder=None):
     layout = tlx.tensor_memory_scales_layout_encoding.make_default()
     layout_handle = layout.to_ir(_builder)
     return _builder.create_require_layout(src.handle, layout_handle)
+
+
+@tl.builtin
+def require_amd_wmma_layout(
+        src,
+        version: tl.constexpr = 3,
+        transposed: tl.constexpr = True,
+        warp_bases: tl.constexpr = ((0, 2), (2, 0)),
+        reg_bases: tl.constexpr = ((0, 1), (1, 0)),
+        instr_shape: tl.constexpr = (16, 16, 128),
+        _semantic=None,
+):
+    """Pin a tensor to an explicit AMD WMMA register layout."""
+    version = int(tl._unwrap_if_constexpr(version))
+    transposed = bool(tl._unwrap_if_constexpr(transposed))
+    warp_bases = [list(row) for row in tl._unwrap_if_constexpr(warp_bases)]
+    reg_bases = [list(row) for row in tl._unwrap_if_constexpr(reg_bases)]
+    instr_shape = list(tl._unwrap_if_constexpr(instr_shape))
+    rank = len(src.shape)
+    layout_handle = _semantic.builder.make_amd_wmma_encoding_attr(
+        version,
+        transposed,
+        warp_bases,
+        reg_bases,
+        instr_shape,
+        rank,
+    )
+    handle = _semantic.builder.create_require_layout(src.handle, layout_handle, pin=True)
+    return tl.tensor(handle, src.type)
+
+
+@tl.builtin
+def dot_scaled(
+    lhs,
+    lhs_scale,
+    lhs_format,
+    rhs,
+    rhs_scale,
+    rhs_format,
+    acc=None,
+    fast_math=False,
+    lhs_k_pack=True,
+    rhs_k_pack=True,
+    out_dtype=tl.float32,
+    tiles_per_warp: tl.constexpr = None,
+    _semantic=None,
+):
+    """Call ``tl.dot_scaled`` with an optional AMD WMMA tile schedule."""
+    result = tl.dot_scaled(
+        lhs,
+        lhs_scale,
+        lhs_format,
+        rhs,
+        rhs_scale,
+        rhs_format,
+        acc,
+        fast_math,
+        lhs_k_pack,
+        rhs_k_pack,
+        out_dtype,
+        _semantic=_semantic,
+    )
+    tiles_per_warp = tl._unwrap_if_constexpr(tiles_per_warp)
+    if tiles_per_warp is not None:
+        tiles_per_warp = [int(tile) for tile in tiles_per_warp]
+        rank = len(result.shape)
+        if len(tiles_per_warp) != rank:
+            raise ValueError(f"tiles_per_warp requires {rank} entries, got {len(tiles_per_warp)}")
+        if any(tile <= 0 for tile in tiles_per_warp):
+            raise ValueError("tiles_per_warp entries must be positive")
+        result.handle.set_attr(
+            "amdg.wmma_tiles_per_warp",
+            _semantic.builder.make_i32_array_attr(tiles_per_warp),
+        )
+    return result
 
 
 def _get_use_acc_handle(use_acc: tl.constexpr | tl.tensor | None, _builder):
@@ -368,8 +493,8 @@ def async_dot(
         handles = [t.handle for t in mBarriers]
         is_async = force_async or len(handles) > 0
         use_acc_handle = _get_use_acc_handle(use_acc, _semantic.builder)
-        output = _semantic.builder.create_tcgen5_dot(A_handle, B_handle, acc_handle, use_acc_handle, pred, two_ctas,
-                                                     handles, is_async)
+        output = _semantic.builder.create_tcgen5_dot(A_handle, B_handle, acc_handle, use_acc_handle, pred,
+                                                     bool(two_ctas), handles, bool(is_async))
         return tl.tensor(output, tl.void)
     else:
         mma_layout = _semantic.builder.make_nv_mma_encoding_attr(A_handle, acc_handle, version, 0,
@@ -472,11 +597,9 @@ def async_dot_scaled(
     # Blackwell block-scaled tcgen05.mma (PTX ISA 9.3, Table 42): the per-CTA
     # instruction shape is fixed to M=128 with N a multiple of 8 in [8, 256]. K is
     # only lower-bounded because the lowering splits the K blocks across instructions.
-    # Gap: the ISA allows N up to 256, but the current lowering rejects blockN==256 for
-    # the scaled op (see InsertTmemAref.cpp), so we cap N at 128 until that is fixed.
     assert M == 128, f"M must be 128 for the scaled MMA, but got {M}"
     assert K >= 16, "K must be at least 16"
-    assert 8 <= N <= 128 and N % 8 == 0, f"N must be a multiple of 8 in [8, 128], but got {N}"
+    assert 8 <= N <= 256 and N % 8 == 0, f"N must be a multiple of 8 in [8, 256], but got {N}"
 
     assert isinstance(A, tlx.buffered_tensor), "input must be a buffered tensor"
     assert isinstance(B, tlx.buffered_tensor), "input must be a buffered tensor"
@@ -545,9 +668,9 @@ def async_dot_scaled(
         B_type,
         use_acc_handle,
         pred,
-        two_ctas,
+        bool(two_ctas),
         bar_handles,
-        is_async,
+        bool(is_async),
     )
     return tl.tensor(output, tl.void)
 

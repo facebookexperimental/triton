@@ -19,10 +19,31 @@ namespace mlir {
 namespace triton {
 namespace tlx {
 
+static bool containsUserLayout(Attribute attr) {
+  if (!attr)
+    return false;
+  if (isa<UserLayoutAttr>(attr))
+    return true;
+  bool found = false;
+  attr.walkImmediateSubElements(
+      [&](Attribute a) { found |= containsUserLayout(a); }, [&](Type t) {});
+  return found;
+}
+
+static bool containsUserLayout(Type type) {
+  if (!type)
+    return false;
+  bool found = false;
+  type.walkImmediateSubElements(
+      [&](Attribute a) { found |= containsUserLayout(a); },
+      [&](Type t) { found |= containsUserLayout(t); });
+  return found;
+}
+
 //-- RequireLayoutOp --
 
 OpFoldResult RequireLayoutOp::fold(FoldAdaptor) {
-  if (getType() == getSrc().getType()) {
+  if (getType() == getSrc().getType() && !containsUserLayout(getType())) {
     // no-op
     return getSrc();
   }
@@ -37,6 +58,18 @@ OpFoldResult ReleaseLayoutOp::fold(FoldAdaptor) {
     return getSrc();
   }
   return {};
+}
+
+LogicalResult ReleaseLayoutOp::verify() {
+  auto srcType = cast<RankedTensorType>(getSrc().getType());
+  Attribute srcEncoding = srcType.getEncoding();
+  auto parentFunc = getOperation()->getParentOfType<triton::FuncOp>();
+  bool hasDeferredHelperLayout =
+      getSrc().getDefiningOp<triton::CallOp>() ||
+      (parentFunc && parentFunc.getSymVisibility() == "private");
+  if (!srcEncoding && !hasDeferredHelperLayout)
+    return emitOpError("requires the source tensor to have a layout encoding");
+  return success();
 }
 
 //-- StorageAliasSpecOp --

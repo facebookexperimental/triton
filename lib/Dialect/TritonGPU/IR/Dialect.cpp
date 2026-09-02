@@ -2099,11 +2099,18 @@ SharedLinearEncodingAttr::toLinearLayout(ArrayRef<int64_t> shape) const {
   const auto &ll = getLinearLayout();
   auto outDimNames = llvm::to_vector(ll.getOutDimNames());
   assert(shape.size() == outDimNames.size());
-  // We don't support automatic broadcasting for shared linear layouts
-  for (auto [size, llSize] : llvm::zip(shape, ll.getOutDimSizes())) {
-    assert(size == llSize);
+  LinearLayout result = ll;
+  // A memdesc_subslice retains its parent's encoding and carries its physical
+  // base separately.  Permit the logical tile to shrink by dropping bases
+  // outside the subview; growing would be implicit broadcasting and remains
+  // unsupported.
+  for (auto [dim, size, llSize] :
+       llvm::zip(outDimNames, shape, ll.getOutDimSizes())) {
+    assert(size <= llSize);
+    if (size < llSize)
+      result = result.resizeOutDim(dim, size);
   }
-  return ll;
+  return result;
 }
 
 //===----------------------------------------------------------------------===//
@@ -3545,22 +3552,27 @@ struct TritonGPUInferLayoutInterface
     return success();
   }
 
-  LogicalResult
-  verifyLayoutsAreEqual(ArrayRef<int64_t> shape, Attribute expected,
-                        Attribute got,
-                        std::optional<Location> loc) const override {
+  LogicalResult verifyLayoutsAreEqual(ArrayRef<int64_t> shape,
+                                      Attribute expected, Attribute got,
+                                      std::optional<Location> loc,
+                                      bool ignoreRegBroadcast) const override {
     if (expected == got) {
       return success();
     }
     if (!expected || !got)
       return failure();
 
-    // Check whether the encodings are structurally the same.
-    if (!areLayoutsEquivalent(shape, cast<LayoutEncodingTrait>(expected),
-                              cast<LayoutEncodingTrait>(got))) {
+    auto expectedLL =
+        toLinearLayout(shape, cast<LayoutEncodingTrait>(expected));
+    auto gotLL = toLinearLayout(shape, cast<LayoutEncodingTrait>(got));
+    if (ignoreRegBroadcast) {
+      auto kReg = StringAttr::get(getContext(), "register");
+      expectedLL = expectedLL.removeZeroBasesAlongDim(kReg);
+      gotLL = gotLL.removeZeroBasesAlongDim(kReg);
+    }
+    if (expectedLL != gotLL)
       return emitOptionalError(loc, "Expected result encoding ", expected,
                                " but was ", got);
-    }
     return success();
   }
 
@@ -3623,13 +3635,12 @@ struct TritonGPUInferLayoutInterface
       SmallVector<int64_t> joinedShape(shape);
       joinedShape.push_back(2);
       auto parent = enc.getParent();
-      auto parentLL = toLinearLayout(joinedShape, parent);
 
       Attribute splitEnc;
       auto result = inferSplitOpEncoding(parent, splitEnc, joinedShape, loc);
       if (succeeded(result) &&
-          areLayoutsEquivalent(shape, cast<LayoutEncodingTrait>(splitEnc),
-                               cast<LayoutEncodingTrait>(srcEnc))) {
+          succeeded(verifyLayoutsAreEqual(shape, splitEnc, srcEnc, {},
+                                          /*ignoreRegBroadcast=*/true))) {
         dstEnc = parent;
         return success();
       }
@@ -3648,16 +3659,16 @@ struct TritonGPUInferLayoutInterface
         ret.insert(ret.begin(), ret.size());
         return ret;
       };
-      auto ctall = enc.getCGALayout().getLinearLayout();
+      auto cgaLl = enc.getCGALayout().getLinearLayout();
       auto kBlock = StringAttr::get(enc.getContext(), "block");
       auto newDim = standardOutDimNames(
-          enc.getContext(), ctall.getNumOutDims() + 1)[ctall.getNumOutDims()];
-      ctall *= LinearLayout::identity1D(1, kBlock, newDim);
+          enc.getContext(), cgaLl.getNumOutDims() + 1)[cgaLl.getNumOutDims()];
+      cgaLl *= LinearLayout::identity1D(1, kBlock, newDim);
       dstEnc = BlockedEncodingAttr::get(
           enc.getContext(), append(enc.getSizePerThread(), 2),
           append(enc.getThreadsPerWarp(), 1), append(enc.getWarpsPerCTA(), 1),
           appendMajorDim(enc.getOrder()),
-          CGAEncodingAttr::get(enc.getContext(), std::move(ctall)));
+          CGAEncodingAttr::get(enc.getContext(), std::move(cgaLl)));
       return success();
     }
 
@@ -3693,19 +3704,19 @@ struct TritonGPUInferLayoutInterface
                           (enc.getCGALayout().getCTAsPerCGA().back() == 1));
     if (isSimpleSplit) {
       SmallVector<unsigned> newOrder(enc.getOrder());
-      auto ctall = enc.getCGALayout().getLinearLayout();
+      auto cgaLl = enc.getCGALayout().getLinearLayout();
       int splitDim = newOrder.size() - 1;
       // Remove splitDim from order.
       newOrder.erase(std::remove(newOrder.begin(), newOrder.end(), splitDim),
                      newOrder.end());
-      // Remove last dimension from ctall.
-      ctall = ctall.squeezeOuts(to_vector(ctall.getOutDimNames()).back());
+      // Remove the last dimension from the CGA layout.
+      cgaLl = cgaLl.squeezeOuts(to_vector(cgaLl.getOutDimNames()).back());
       dstEnc = BlockedEncodingAttr::get(
           enc.getContext(), //
           ArrayRef(enc.getSizePerThread()).drop_back(1),
           ArrayRef(enc.getThreadsPerWarp()).drop_back(1),
           ArrayRef(enc.getWarpsPerCTA()).drop_back(1), ArrayRef(newOrder),
-          CGAEncodingAttr::get(enc.getContext(), std::move(ctall)));
+          CGAEncodingAttr::get(enc.getContext(), std::move(cgaLl)));
       return success();
     }
 
@@ -4482,6 +4493,34 @@ int triton::gpu::lookupNumCTAs(OpBuilder &rewriter) {
       rewriter.getInsertionBlock()->getParentOp()->getParentOfType<ModuleOp>();
   assert(op && "cannot check number of CTAs outside of module");
   return triton::gpu::TritonGPUDialect::getNumCTAs(cast<ModuleOp>(op));
+}
+
+bool triton::gpu::isPhysicalCluster(ModuleOp mod) {
+  auto dims = TritonGPUDialect::getClusterDims(mod);
+  return dims[0] * dims[1] * dims[2] > 1;
+}
+
+bool triton::gpu::isPhysicalCluster(Operation *op) {
+  auto mod = dyn_cast<ModuleOp>(op);
+  if (!mod)
+    mod = op->getParentOfType<ModuleOp>();
+  return mod && isPhysicalCluster(mod);
+}
+
+int triton::gpu::lookupPhysicalNumCTAs(Operation *op) {
+  auto mod = dyn_cast<ModuleOp>(op);
+  if (!mod)
+    mod = op->getParentOfType<ModuleOp>();
+  if (!mod)
+    return lookupNumCTAs(op);
+  auto dims = TritonGPUDialect::getClusterDims(mod);
+  int physicalNumCTAs = dims[0] * dims[1] * dims[2];
+  return physicalNumCTAs > 1 ? physicalNumCTAs : lookupNumCTAs(op);
+}
+
+int triton::gpu::lookupPhysicalNumCTAs(OpBuilder &rewriter) {
+  assert(rewriter.getInsertionBlock() && "expected an insertion point");
+  return lookupPhysicalNumCTAs(rewriter.getInsertionBlock()->getParentOp());
 }
 
 bool triton::gpu::areLayoutsEquivalent(ArrayRef<int64_t> shape,

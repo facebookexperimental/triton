@@ -7,10 +7,14 @@ add_triton_library(TritonGPUModuloCore
   ModuloScheduling/AMDLatencyModel.cpp
   ModuloScheduling/AMDWarpPipelinePartition.cpp
   ModuloScheduling/DataDependenceGraph.cpp
+  ModuloScheduling/JointSolverFallback.cpp
+  ModuloScheduling/JointSolverScheduler.cpp
   ModuloScheduling/ModuloReservationTable.cpp
   ModuloScheduling/SwingScheduler.cpp
   ModuloScheduling/ExhaustiveScheduler.cpp
   ModuloScheduling/Z3ConstraintEncoder.cpp
+  ModuloScheduling/Z3JointSolver.cpp
+  ModuloScheduling/Z3JointSolutionValidator.cpp
   ModuloScheduling/ModuloScheduleGraph.cpp
 
   LINK_LIBS PUBLIC
@@ -28,6 +32,9 @@ if(TRITON_ENABLE_Z3_JOINT_SOLVER)
 endif()
 
 add_triton_library(NVHopperTransforms
+  Analyze2CTADependencies.cpp
+  Plan2CTAExchange.cpp
+  Materialize2CTAExchange.cpp
   MultiCTAReduction.cpp
   WarpSpecialization.cpp
   WarpSpecialization/CodePartitionUtility.cpp
@@ -58,6 +65,7 @@ add_triton_library(NVHopperTransforms
   ModuloScheduling/ModuloSchedulePass.cpp
   ModuloScheduling/ModuloWSPartitionPass.cpp
   ModuloScheduling/LLMSchedulePass.cpp
+  ModuloScheduling/JointSolverSchedulePass.cpp
   ModuloScheduling/ModuloBufferAllocPass.cpp
   ModuloScheduling/ModuloExpandPass.cpp
   ModuloScheduling/ModuloLowerPass.cpp

@@ -197,18 +197,18 @@ struct TritonExpandDimsPattern
     SmallVector<unsigned, 4> retOrder(retShape.size());
     std::iota(retOrder.begin(), retOrder.end(), 0);
 
-    auto ctaLl = argEncoding.getCGALayout().getLinearLayout();
-    auto kBlock = *ctaLl.getInDimNames().begin();
+    auto cgaLl = argEncoding.getCGALayout().getLinearLayout();
+    auto kBlock = *cgaLl.getInDimNames().begin();
     auto *ctx = kBlock.getContext();
     auto newDim = standardOutDimNames(ctx, newRank)[newRank - 1];
-    ctaLl *= LinearLayout::identity1D(1, kBlock, newDim);
+    cgaLl *= LinearLayout::identity1D(1, kBlock, newDim);
     // Move last dim to op.getAxis(). nb is this a std::rotate?
     auto newOrder = to_vector(llvm::seq<int32_t>(newRank));
     for (int i = newRank - 1; i >= op.getAxis() + 1; --i) {
       std::swap(newOrder[i], newOrder[i - 1]);
     }
-    ctaLl = transposeLinearLayout(ctaLl, newOrder);
-    auto retCGALayout = CGAEncodingAttr::get(ctx, std::move(ctaLl));
+    cgaLl = transposeLinearLayout(cgaLl, newOrder);
+    auto retCGALayout = CGAEncodingAttr::get(ctx, std::move(cgaLl));
     triton::gpu::BlockedEncodingAttr retEncoding =
         triton::gpu::BlockedEncodingAttr::get(getContext(), retSizePerThread,
                                               retThreadsPerWarp, retWarpsPerCTA,
@@ -565,6 +565,32 @@ public:
   }
 };
 
+class TritonWarpPredicatePattern : public OpConversionPattern<WarpPredicateOp> {
+public:
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(WarpPredicateOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    SmallVector<Type> resultTypes;
+    if (failed(
+            getTypeConverter()->convertTypes(op.getResultTypes(), resultTypes)))
+      return rewriter.notifyMatchFailure(op, "could not convert result types");
+
+    auto newOp = WarpPredicateOp::create(
+        rewriter, op.getLoc(), resultTypes, adaptor.getPredicate(),
+        adaptor.getInits(), op.getWaveUniformAttr());
+    rewriter.inlineRegionBefore(op.getRegion(), newOp.getRegion(),
+                                newOp.getRegion().end());
+    if (failed(rewriter.convertRegionTypes(&newOp.getRegion(),
+                                           *getTypeConverter())))
+      return rewriter.notifyMatchFailure(op, "could not convert body types");
+
+    rewriter.replaceOp(op, newOp.getResults());
+    return success();
+  }
+};
+
 struct TTNGPrefetchPattern
     : public OpConversionPattern<triton::nvidia_gpu::PrefetchOp> {
   using OpConversionPattern::OpConversionPattern;
@@ -611,6 +637,8 @@ void populateTritonPatterns(TritonGPUTypeConverter &typeConverter,
       TritonDotPattern,
       TritonMapElementwisePattern,
       TritonWarpSpecializePattern,
+      TritonWarpPredicatePattern,
+      GenericOpPattern<PredicateYieldOp>,
       GatherScatterOpPattern<DescriptorGatherOp>,
       GatherScatterOpPattern<DescriptorScatterOp>,
       GenericOpPattern<triton::LoadOp>,
@@ -620,6 +648,7 @@ void populateTritonPatterns(TritonGPUTypeConverter &typeConverter,
       GenericOpPattern<triton::ExternElementwiseOp>,
       GenericOpPattern<triton::PrintOp>,
       GenericOpPattern<triton::AssertOp>,
+      GenericOpPattern<triton::AtomicPollOp>,
       GenericOpPattern<triton::AtomicCASOp>,
       GenericOpPattern<triton::AtomicRMWOp>,
       GenericOpPattern<triton::DescriptorLoadOp>,
@@ -634,6 +663,7 @@ void populateTritonPatterns(TritonGPUTypeConverter &typeConverter,
       GenericOpPattern<triton::gpu::LocalLoadOp>,
       GenericOpPattern<triton::gpu::LocalGatherOp>,
       GenericOpPattern<triton::gpu::LocalScatterOp>,
+      GenericOpPattern<triton::nvidia_gpu::TwoCTAPeerGatherOp>,
       GenericOpPattern<triton::nvidia_gpu::WarpGroupDotWaitOp>,
       GenericOpPattern<triton::nvidia_gpu::VoteBallotSyncOp>,
       TTNGPrefetchPattern>(typeConverter, context);
@@ -647,6 +677,8 @@ void populateTritonPatterns(TritonGPUTypeConverter &typeConverter,
 void populateTLXPatterns(TritonGPUTypeConverter &typeConverter,
                             RewritePatternSet &patterns) {
   MLIRContext *context = patterns.getContext();
+  patterns.add<GenericOpPattern<triton::gpu::WarpVoteOp>>(typeConverter,
+                                                          context);
   patterns.add<GenericOpPattern<triton::tlx::RequireLayoutOp>>(typeConverter, context);
   patterns.add<GenericOpPattern<triton::tlx::ReleaseLayoutOp>>(typeConverter,
                                                            context);
@@ -659,7 +691,11 @@ void populateTLXPatterns(TritonGPUTypeConverter &typeConverter,
                                                                 context);
   patterns.add<GenericOpPattern<triton::amdgpu::BufferLoadToLocalOp>>(
       typeConverter, context);
+  patterns.add<GenericOpPattern<triton::amdgpu::AssumeUniformOp>>(typeConverter,
+                                                                  context);
   patterns.add<GenericOpPattern<triton::amdgpu::RematerializedRangeOp>>(
+      typeConverter, context);
+  patterns.add<GenericOpPattern<triton::amdgpu::RegisterHandoffOp>>(
       typeConverter, context);
 }
 

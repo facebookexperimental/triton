@@ -421,6 +421,29 @@ def test_tuple_assignment_constexpr_tuple_normalizes_recursively():
     run_parser(kernel)
 
 
+def test_list_comprehension_if_filter():
+
+    @triton.jit
+    def kernel():
+        # an `if` filter drops the elements whose condition is false
+        vals: tl.constexpr = [x for x in (10, 20, 30, 40) if x >= 30]
+        tl.static_assert(len(vals) == 2)
+        tl.static_assert(vals[0] == 30)
+        tl.static_assert(vals[1] == 40)
+
+        # multiple `if` clauses compose as "and"
+        multi: tl.constexpr = [x for x in (0, 1, 2, 3, 4, 5) if x > 1 if x % 2 == 0]
+        tl.static_assert(len(multi) == 2)
+        tl.static_assert(multi[0] == 2)
+        tl.static_assert(multi[1] == 4)
+
+        # an unfiltered comprehension is unchanged
+        allv: tl.constexpr = [x for x in (10, 20, 30, 40)]
+        tl.static_assert(len(allv) == 4)
+
+    run_parser(kernel)
+
+
 def test_named_expr_respects_prior_constexpr_annotation():
 
     @triton.jit
@@ -770,6 +793,45 @@ def test_atomic_scalar_masks():
     tl.atomic_or(ptrs, 1, mask=True)
     # CHECK: {{.*}} = tt.atomic_rmw xor, acq_rel, gpu
     tl.atomic_xor(ptrs, 1, mask=True)
+
+
+@filecheck_test
+@triton.jit
+def test_atomic_poll():
+    # CHECK-LABEL: test_atomic_poll
+    ptr = tl.to_tensor(0).to(tl.int64).to(tl.pointer_type(tl.int32), bitcast=True)
+    # CHECK: %{{.*}} = tt.atomic_poll relaxed, sys, %{{.*}}, %{{.*}} : !tt.ptr<i32>, i32 -> i1
+    tl.atomic_poll(ptr, 1, sem="relaxed", scope="sys")
+
+
+@filecheck_test
+@triton.jit
+def test_atomic_poll_timeout():
+    # CHECK-LABEL: test_atomic_poll_timeout
+    ptr = tl.to_tensor(0).to(tl.int64).to(tl.pointer_type(tl.int32), bitcast=True)
+    # CHECK: %{{.*}} = tt.atomic_poll acquire, gpu, %{{.*}}, %{{.*}} timeout %{{.*}} : !tt.ptr<i32>, i32 -> i1
+    tl.atomic_poll(ptr, 1, timeout_ns=1000)
+
+
+@doesnt_compile
+@triton.jit
+def test_atomic_poll_rejects_tensor_pointer():
+    ptrs = tl.full((1, ), 0, tl.int64).to(tl.pointer_type(tl.int32), bitcast=True)
+    tl.atomic_poll(ptrs, 1)
+
+
+@doesnt_compile
+@triton.jit
+def test_atomic_poll_rejects_release_semantics():
+    ptr = tl.to_tensor(0).to(tl.int64).to(tl.pointer_type(tl.int32), bitcast=True)
+    tl.atomic_poll(ptr, 1, sem="release")
+
+
+@doesnt_compile
+@triton.jit
+def test_atomic_poll_rejects_negative_timeout():
+    ptr = tl.to_tensor(0).to(tl.int64).to(tl.pointer_type(tl.int32), bitcast=True)
+    tl.atomic_poll(ptr, 1, timeout_ns=-1)
 
 
 @pytest.mark.interpreter

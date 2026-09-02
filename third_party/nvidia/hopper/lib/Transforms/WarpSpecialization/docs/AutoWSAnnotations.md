@@ -60,6 +60,35 @@ AutoWS inventory.
 See `PartitionSchedulingMeta.md` for how the `merge_*` / `separate_epilogue_store`
 knobs shape the partition layout.
 
+## Operation scheduling annotations
+
+AutoWS kernels may also attach `tt.autows` to individual dot operations and
+latency-bearing loads. A dot annotation has `stage` and `order` fields and
+defines the computation order within an annotated loop. `ScheduleLoops` keeps
+that dot order unchanged while placing loads from each dot's backward slice in
+dedicated prefetch clusters. The default load rank is:
+
+```text
+(dot stage + dot order, dot stage, dot order)
+```
+
+This rank expresses the prefetch wavefront independently of the computation
+wavefront. For example, a stage-zero input for the next contraction can be
+issued before a stage-one input for the current contraction.
+
+`tensor_descriptor.load(..., attrs={"stage": "0", "order": "2"})` supplies an
+explicit load rank when dependency inference is insufficient, such as scalar
+metadata shared by multiple contractions. Explicit load annotations override
+the inferred consumer rank. Loads outside every annotated dot's backward slice
+retain dependency-based scheduling.
+
+Both fields are JSON **strings** holding a decimal integer, matching the dot
+annotation encoding; the frontend rejects non-string `attrs` values so an
+integer cannot be silently dropped by the compiler-side parse. An annotation
+that is not a JSON object, is missing a field, or holds a non-integer string
+is ignored with a `-debug-only=triton-loop-pipeline` message and the op falls
+back to the inferred rank.
+
 ## Status on `scf.while` (current gaps)
 
 The unified tile scheduler (`triton.language.schedule`) drives a persistent

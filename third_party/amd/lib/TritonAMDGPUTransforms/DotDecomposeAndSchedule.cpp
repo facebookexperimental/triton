@@ -614,8 +614,7 @@ static LogicalResult applyMSplit(const DotPartitionPlan &plan,
       // implicit cap).
       if (stride > 0 && dotIdx < nM * nN &&
           (dotIdx % static_cast<unsigned>(stride)) == 0) {
-        ROCDL::SchedBarrier::create(builder, loc,
-                                    /*mask=*/0);
+        ROCDL::SchedBarrier::create(builder, loc, ROCDL::SchedGroupMask::none);
       }
     }
   }
@@ -965,6 +964,9 @@ static void runModuloExpand(ModuleOp module) {
 static void runAMDModuloScaffold(ModuleOp module,
                                  bool serializeForExpansion = false) {
   triton::gpu::AMDLatencyModel model;
+  // No forced backend on the AMD path: TRITON_USE_MODULO_SCHEDULE is the only
+  // input. Resolved once so every loop in this module uses one backend.
+  const std::string scheduleAlgo = triton::gpu::getActiveScheduleAlgo();
   // Collect loops first — E2 mutates loop bodies, so don't mutate during walk.
   SmallVector<scf::ForOp> loops;
   module.walk([&](scf::ForOp f) { loops.push_back(f); });
@@ -986,7 +988,7 @@ static void runAMDModuloScaffold(ModuleOp module,
     // E1: run the core modulo scheduler (rau/SMS, selected by
     // TRITON_USE_MODULO_SCHEDULE; default rau) and annotate each op with its
     // stage/order so a downstream expansion can consume the schedule.
-    auto schedOr = triton::gpu::runModuloScheduling(ddg);
+    auto schedOr = triton::gpu::runModuloScheduling(ddg, scheduleAlgo);
     if (!succeeded(schedOr)) {
       os << " II=FAILED";
       forOp.emitRemark() << os.str();
@@ -1004,7 +1006,7 @@ static void runAMDModuloScaffold(ModuleOp module,
         // the largest scheduled cycle fits within stages 0 and 1.
         int minII = std::max(computedMinII, maxAbsoluteCycle / 2 + 1);
         auto constrained = triton::gpu::runModuloScheduling(
-            ddg, /*maxII=*/0, /*maxBacktracks=*/20, minII);
+            ddg, scheduleAlgo, /*maxII=*/0, /*maxBacktracks=*/20, minII);
         if (failed(constrained))
           break;
         sched = *constrained;
@@ -1165,7 +1167,8 @@ static void runAMDModuloScaffold(ModuleOp module,
         int64_t stage = stageOf(op);
         if (prevStage >= 0 && stage != prevStage) {
           OpBuilder bb(op);
-          ROCDL::SchedBarrier::create(bb, op->getLoc(), /*mask=*/0);
+          ROCDL::SchedBarrier::create(bb, op->getLoc(),
+                                      ROCDL::SchedGroupMask::none);
           ++nbar;
         }
         prevStage = stage;

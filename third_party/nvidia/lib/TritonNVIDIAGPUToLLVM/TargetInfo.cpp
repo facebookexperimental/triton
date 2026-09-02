@@ -149,6 +149,24 @@ Value TargetInfo::ballot(RewriterBase &rewriter, Location loc, Type type,
                                   NVVM::VoteSyncKind::ballot);
 }
 
+Value TargetInfo::getGlobalTimer(RewriterBase &rewriter, Location loc) const {
+  return LLVM::createLLVMIntrinsicCallOp(
+             rewriter, loc, "llvm.nvvm.read.ptx.sreg.globaltimer", i64_ty, {})
+      .getResult(0);
+}
+
+StringRef TargetInfo::getAtomicSyncScope(MemSyncScope scope) const {
+  switch (scope) {
+  case MemSyncScope::CTA:
+    return "block";
+  case MemSyncScope::GPU:
+    return "device";
+  case MemSyncScope::SYSTEM:
+    return {};
+  }
+  llvm_unreachable("unknown memory synchronization scope");
+}
+
 void TargetInfo::barrier(Location loc, RewriterBase &rewriter,
                          triton::gpu::AddrSpace targets) const {
   auto b = TritonLLVMOpBuilder(loc, rewriter);
@@ -192,6 +210,11 @@ static Value mapa(RewriterBase &rewriter, Location loc, Value ptr, Value ctaid,
   auto *ctaidOpr = builder.newOperand(ctaid, "r");
   mapaInstr(dstOpr, ptrOpr, ctaidOpr).predicate(pred, "b");
   return builder.launch(rewriter, loc, clusterPtrTy, /*hasSideEffect=*/false);
+}
+
+Value TargetInfo::mapDShared(RewriterBase &rewriter, Location loc, Value ptr,
+                             Value ctaId, Value pred) const {
+  return ctaId ? mapa(rewriter, loc, ptr, ctaId, pred) : ptr;
 }
 
 static std::string getConstraintForBitwidth(unsigned bitwidth) {
@@ -251,6 +274,28 @@ void TargetInfo::storeDShared(RewriterBase &rewriter, Location loc, Value ptr,
     }
     storeDShared(rewriter, loc, ptr, ctaId, packLLVector(loc, vals, rewriter),
                  pred, barrierPtr);
+    return;
+  }
+
+  // st.async.mbarrier::complete_tx::bytes does not accept b8/b16 element
+  // types, including vector forms such as v2.b16. Pack sub-32-bit values into
+  // b32 units before selecting the PTX instruction. Unlike ordinary DSMEM
+  // stores, this applies even when the original vector has four or fewer
+  // elements.
+  if (barrierPtr.has_value() && elemBitwidth < 32) {
+    int elemsPerPack = 32 / elemBitwidth;
+    assert(vec % elemsPerPack == 0 &&
+           "async DSMEM store must contain whole b32 units");
+    SmallVector<Value> oldVals = unpackLLVector(loc, val, rewriter);
+    SmallVector<Value> newVals;
+    for (int i = 0; i < vec / elemsPerPack; ++i) {
+      Value packed = packLLVector(
+          loc, ArrayRef(oldVals).slice(i * elemsPerPack, elemsPerPack),
+          rewriter);
+      newVals.push_back(b.bitcast(packed, i32_ty));
+    }
+    storeDShared(rewriter, loc, ptr, ctaId,
+                 packLLVector(loc, newVals, rewriter), pred, barrierPtr);
     return;
   }
 

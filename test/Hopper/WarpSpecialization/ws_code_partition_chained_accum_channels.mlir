@@ -111,4 +111,49 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     } {async_task_id = array<i32: 0, 1>}
     tt.return
   }
+
+// ---- Case 3: loop-carried read, rescale store, then two chained dots ----
+// The forward operand-D channel ends at MMA1, while the deferred backward
+// channel starts at MMA2.  They still form one channel loop because both MMAs
+// are consecutive same-task writers of the same accumulator.
+//
+// CHECK-LABEL: @chained_accum_back_edge
+// CHECK: ttg.local_alloc {alignment = 8 : i32, ttg.ws_generated_barrier}
+// CHECK: ttg.warp_specialize
+// CHECK: ttng.wait_barrier
+// CHECK: ttng.tmem_load
+// CHECK: ttng.tmem_store
+// CHECK: nvws.producer_commit
+// CHECK: partition0
+// CHECK: nvws.consumer_wait
+// The shared full/empty completion barrier must be attached to the LAST writer
+// of the chain (MMA2), not the first: attaching it to MMA1 would let the
+// correction task race the remaining MMAs.  Pin that by the printed operand
+// types -- MMA1's type list ends at the accumulator memdesc (the `[^!]*`
+// forbids a following `, !ttg.memdesc<1xi64, ...>` barrier type), while MMA2
+// carries the barrier memdesc.
+// CHECK:      ttng.tc_gen5_mma
+// CHECK-SAME: #ttng.tensor_memory{{[^!]*}}>{{$}}
+// CHECK:      ttng.tc_gen5_mma
+// CHECK-SAME: , !ttg.memdesc<1xi64
+  tt.func public @chained_accum_back_edge(
+      %a: !ttg.memdesc<128x128xbf16, #shared, #smem, mutable>,
+      %b: !ttg.memdesc<128x128xbf16, #shared, #smem, mutable>,
+      %c: !ttg.memdesc<128x128xbf16, #shared, #smem, mutable>,
+      %d: !ttg.memdesc<128x128xbf16, #shared, #smem, mutable>,
+      %lb: i32, %ub: i32, %step: i32) attributes {noinline = false} {
+    %true = arith.constant {async_task_id = array<i32: 0, 1>} true
+    %half = arith.constant {async_task_id = array<i32: 0>} dense<5.000000e-01> : tensor<128x128xf32, #blocked>
+    %acc, %acc_tok = ttng.tmem_alloc {async_task_id = array<i32: 0, 1>, buffer.copy = 1 : i32, buffer.id = 2 : i32} : () -> (!ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.async.token)
+    scf.for %iv = %lb to %ub step %step iter_args(%tok = %acc_tok) -> (!ttg.async.token) : i32 {
+      %old, %load_tok = ttng.tmem_load %acc[%tok] {async_task_id = array<i32: 0>} : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #blocked>
+      %scaled = arith.mulf %old, %half {async_task_id = array<i32: 0>} : tensor<128x128xf32, #blocked>
+      %store_tok = ttng.tmem_store %scaled, %acc[%load_tok], %true {async_task_id = array<i32: 0>} : tensor<128x128xf32, #blocked> -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+      %t1 = ttng.tc_gen5_mma %a, %b, %acc[%store_tok], %true, %true {async_task_id = array<i32: 1>, tt.self_latency = 1 : i32} : !ttg.memdesc<128x128xbf16, #shared, #smem, mutable>, !ttg.memdesc<128x128xbf16, #shared, #smem, mutable>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+      %t2 = ttng.tc_gen5_mma %c, %d, %acc[%t1], %true, %true {async_task_id = array<i32: 1>, tt.self_latency = 1 : i32} : !ttg.memdesc<128x128xbf16, #shared, #smem, mutable>, !ttg.memdesc<128x128xbf16, #shared, #smem, mutable>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+      scf.yield %t2 : !ttg.async.token
+    } {async_task_id = array<i32: 0, 1>}
+    tt.return
+  }
+
 }

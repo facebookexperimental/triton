@@ -1,5 +1,6 @@
 #include "mlir/IR/Dominance.h"
 #include "triton/Analysis/Utility.h"
+#include "triton/Dialect/Triton/IR/DiscardableAttributes.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/MMAv5PipelineUtility.h"
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h"
@@ -699,6 +700,49 @@ scheduleKeyOpsUpstream(scf::ForOp forOp,
   return schedule;
 }
 
+// Parse a tt.autows JSON annotation of the form {"stage": "0", "order": "2"}.
+// Both fields must be present as decimal integer *strings*. Any deviation is
+// reported through LDBG and returns nullopt so the caller falls back to
+// inferred scheduling; the annotation is user input and must never abort the
+// compiler.
+static std::optional<std::pair<int, int>>
+parseAutoWSStageOrder(Operation *op, StringRef context) {
+  auto attr = op->getAttrOfType<StringAttr>(tt::kAutoWSAnnotationAttrName);
+  if (!attr)
+    return std::nullopt;
+  auto parsed = llvm::json::parse(attr.getValue());
+  if (!parsed) {
+    llvm::consumeError(parsed.takeError());
+    LDBG(context << ": ignoring " << tt::kAutoWSAnnotationAttrName
+                 << " annotation that is not valid JSON: " << attr.getValue());
+    return std::nullopt;
+  }
+  auto *obj = parsed->getAsObject();
+  if (!obj) {
+    LDBG(context << ": ignoring " << tt::kAutoWSAnnotationAttrName
+                 << " annotation that is not a JSON object: "
+                 << attr.getValue());
+    return std::nullopt;
+  }
+  auto stageStr = obj->getString(tt::kAutoWSStageKey);
+  auto orderStr = obj->getString(tt::kAutoWSOrderKey);
+  if (!stageStr || !orderStr) {
+    LDBG(context << ": ignoring " << tt::kAutoWSAnnotationAttrName
+                 << " annotation missing string \"" << tt::kAutoWSStageKey
+                 << "\"/\"" << tt::kAutoWSOrderKey
+                 << "\" fields: " << attr.getValue());
+    return std::nullopt;
+  }
+  int stage, order;
+  if (stageStr->getAsInteger(10, stage) || orderStr->getAsInteger(10, order)) {
+    LDBG(context << ": ignoring " << tt::kAutoWSAnnotationAttrName
+                 << " annotation with non-integer stage/order: "
+                 << attr.getValue());
+    return std::nullopt;
+  }
+  return std::make_pair(stage, order);
+}
+
 // Schedule key ops based on user-provided tt.autows annotations on MMA ops.
 // The tt.autows attribute is a JSON string like {"stage": "0", "order": "2"}
 // that specifies the desired stage and cluster for each MMA.
@@ -707,31 +751,13 @@ CoarseSchedule
 scheduleKeyOpsAnnotation(scf::ForOp forOp,
                          const DenseMap<Operation *, int> &opLatency,
                          int defaultNumStages) {
-  // Collect all latency ops and MMA ops with annotations.
-  SmallVector<Operation *> latOps;
+  // Collect MMA ops with annotations.
   SmallVector<std::tuple<ttng::MMAv5OpInterface, int, int>> annotatedMMAs;
 
   for (auto &op : forOp.getBody()->without_terminator()) {
-    if (opLatency.count(&op))
-      latOps.push_back(&op);
     if (auto mmaOp = dyn_cast<ttng::MMAv5OpInterface>(&op)) {
-      if (auto attr = op.getAttrOfType<StringAttr>("tt.autows")) {
-        auto parsed = llvm::json::parse(attr.getValue());
-        if (!parsed) {
-          llvm::consumeError(parsed.takeError());
-          continue;
-        }
-        auto *obj = parsed->getAsObject();
-        if (!obj)
-          continue;
-        auto stageStr = obj->getString("stage");
-        auto clusterStr = obj->getString("order");
-        if (!stageStr || !clusterStr)
-          continue;
-        int stage = std::stoi(stageStr->str());
-        int cluster = std::stoi(clusterStr->str());
-        annotatedMMAs.push_back({mmaOp, stage, cluster});
-      }
+      if (auto stageOrder = parseAutoWSStageOrder(&op, "annotated MMA"))
+        annotatedMMAs.push_back({mmaOp, stageOrder->first, stageOrder->second});
     }
   }
 
@@ -747,21 +773,73 @@ scheduleKeyOpsAnnotation(scf::ForOp forOp,
   }
 
   CoarseSchedule schedule(numStages);
+
+  // Schedule latency operations in dedicated prefetch clusters ahead of the
+  // annotated MMA clusters. Rank a load by the wavefront of its earliest
+  // annotated consumer: stage + order, then stage. This keeps stage-0 inputs
+  // for the next contraction ahead of stage-1 inputs for the current
+  // contraction when they share a compute-order cluster (FA backward's dOt
+  // before delayed q), without changing the annotated MMA execution order.
+  DenseMap<Operation *, std::tuple<int, int, int>> latencySchedule;
+  DenseSet<Operation *> explicitlyScheduledLatency;
+  SmallVector<std::tuple<int, int, int>> prefetchKeys;
+  for (auto &[mma, stage, order] : annotatedMMAs) {
+    SetVector<Operation *> backwardSlice;
+    BackwardSliceOptions options;
+    options.omitBlockArguments = true;
+    options.omitUsesFromAbove = false;
+    (void)getBackwardSlice(mma, &backwardSlice, options);
+    std::tuple<int, int, int> key = {stage + order, stage, order};
+    for (Operation *dependency : backwardSlice) {
+      if (!opLatency.count(dependency))
+        continue;
+      if (auto stageOrder =
+              parseAutoWSStageOrder(dependency, "annotated load")) {
+        auto [loadStage, loadOrder] = *stageOrder;
+        latencySchedule[dependency] = {loadStage + loadOrder, loadStage,
+                                       loadOrder};
+        explicitlyScheduledLatency.insert(dependency);
+        continue;
+      }
+      if (explicitlyScheduledLatency.contains(dependency))
+        continue;
+      auto it = latencySchedule.find(dependency);
+      if (it == latencySchedule.end() || key < it->second)
+        latencySchedule[dependency] = key;
+    }
+  }
+  for (auto &[op, key] : latencySchedule)
+    prefetchKeys.push_back(key);
+  llvm::sort(prefetchKeys);
+  prefetchKeys.erase(std::unique(prefetchKeys.begin(), prefetchKeys.end()),
+                     prefetchKeys.end());
+
+  SmallVector<std::pair<std::tuple<int, int, int>, CoarseSchedule::Cluster>>
+      prefetchClusters;
+  for (auto key : prefetchKeys)
+    prefetchClusters.push_back({key, schedule.clusters.newAtBack()});
+
   SmallVector<CoarseSchedule::Cluster> clusters;
   for (int i = 0; i < numClusters; ++i)
     clusters.push_back(schedule.clusters.newAtBack());
+
+  for (auto &entry : latencySchedule) {
+    Operation *op = entry.first;
+    auto key = entry.second;
+    auto cluster = llvm::find_if(prefetchClusters, [&](const auto &entry) {
+      return entry.first == key;
+    });
+    assert(cluster != prefetchClusters.end());
+    schedule.insert(op, std::get<1>(key), cluster->second);
+  }
 
   // Assign annotated MMAs to their specified stage/cluster.
   for (auto &[mma, stage, cluster] : annotatedMMAs) {
     schedule.insert(mma, stage, clusters[cluster]);
   }
 
-  // Schedule latency ops (loads, etc.) to stage 0, cluster 0.
-  for (auto *op : latOps) {
-    if (schedule.count(op))
-      continue;
-    schedule.insert(op, 0, clusters[0]);
-  }
+  // Latency ops outside annotated MMA backward slices remain unscheduled;
+  // scheduleDependencies() places them with their first scheduled consumer.
 
   LDBG("scheduleKeyOpsAnnotation: scheduled "
        << annotatedMMAs.size() << " annotated MMAs with " << numStages
@@ -913,7 +991,8 @@ void scheduleLoop(scf::ForOp forOp, const DenseMap<Operation *, int> &opLatency,
   // Check if any MMA op has tt.autows annotations.
   bool hasAnnotations = false;
   for (auto &op : forOp.getBody()->without_terminator()) {
-    if (isa<ttng::MMAv5OpInterface>(&op) && op.hasAttr("tt.autows")) {
+    if (isa<ttng::MMAv5OpInterface>(&op) &&
+        op.hasAttr(tt::kAutoWSAnnotationAttrName)) {
       hasAnnotations = true;
       break;
     }

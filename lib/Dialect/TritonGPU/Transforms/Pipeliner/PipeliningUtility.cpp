@@ -211,13 +211,22 @@ Operation *mlir::triton::predicateOp(RewriterBase &rewriter, Operation *op,
   }
   // Ops without a built-in pred operand: wrap in scf.if.
   //
-  // The TMA "store" family (copy local->global, reduce, scatter) all write to
-  // global memory but have no mask/pred operand, so they cannot be masked in
-  // place. They must be predicated when the pipeliner peels prologue/epilogue
-  // iterations of a dynamic loop: executing a store/reduce/scatter for an
-  // iteration past the real trip count would corrupt the output (e.g. a
-  // spurious atomic add for a TMA reduce). Guard them with scf.if(pred).
-  if (isa<ttng::AsyncTMACopyLocalToGlobalOp, ttng::AsyncTMAReduceOp,
+  // Synchronous descriptor loads/gathers and the TMA "store" family have no
+  // mask/pred operand, so they cannot be masked in place. They must be
+  // predicated when the pipeliner peels prologue/epilogue iterations of a
+  // dynamic loop. Guard them with scf.if(pred); result-producing operations
+  // yield poison on the inactive path because their consumers are predicated
+  // by the same pipeline-stage condition.
+  //
+  // tt.descriptor_load / tt.descriptor_gather reach this path only outside
+  // warp specialization. Under autoWS the loads have already been rewritten to
+  // nvws.descriptor_load / nvws.descriptor_gather, which LowerAref turns into
+  // ttng.async_tma_copy_global_to_local carrying a real `pred` operand, so
+  // those are masked in place and never need the scf.if wrapper. An nvws load
+  // arriving here would hit the "doesn't know how to predicate" error below
+  // rather than being silently mishandled.
+  if (isa<tt::DescriptorLoadOp, tt::DescriptorGatherOp,
+          ttng::AsyncTMACopyLocalToGlobalOp, ttng::AsyncTMAReduceOp,
           ttng::AsyncTMAScatterOp, ttng::TMAStoreTokenWaitOp>(op)) {
     rewriter.setInsertionPoint(op);
     bool hasResults = op->getNumResults() > 0;
@@ -444,9 +453,18 @@ Value mlir::triton::createAlloc(Operation *insertBefore, RankedTensorType ty,
   return alloc;
 }
 
+bool mlir::triton::canPipelineTMALoad(Operation *op) {
+  auto tensorTy = cast<RankedTensorType>(op->getResultTypes()[0]);
+  auto sharedEncoding = getSharedEncoding(op);
+  int64_t stageSizeInBits = product(ttg::getAllocationShapePerCTA(
+                                sharedEncoding, tensorTy.getShape())) *
+                            tensorTy.getElementTypeBitWidth();
+  return stageSizeInBits % (ttng::TMA_ALIGN * 8) == 0;
+}
+
 bool mlir::triton::canBeAsyncLoad(Operation *op) {
   if (mlir::triton::isTMALoad(op)) {
-    return true;
+    return canPipelineTMALoad(op);
   }
   assert(isa<tt::LoadOp>(op));
   ttg::SharedEncodingTrait sharedEncoding = mlir::triton::getSharedEncoding(op);
@@ -855,4 +873,35 @@ void triton::removePipeliningAttributes(ModuleOp moduleOp) {
     op->removeAttr(mlir::triton::kLoopClusterAttrName);
     op->removeAttr(mlir::triton::kScheduledMaxStageAttrName);
   });
+}
+
+bool triton::isLoopTripCountKnownPositive(scf::ForOp loop,
+                                          DominanceInfo &domInfo) {
+  // Crudely match llvm.assume(ub > lb) or llvm.assume(lb < ub), the form
+  // tl.assume(hi > lo) lowers to. Kept deliberately syntactic: the assume
+  // must reference the loop's own bound SSA values, and must dominate the
+  // loop -- an assume placed after it, or under a sibling branch, asserts
+  // nothing at the point the trip count is taken.
+  auto isDominatingAssume = [&](Operation *op) {
+    return isa<LLVM::AssumeOp>(op) && domInfo.properlyDominates(op, loop);
+  };
+  for (Operation *user : loop.getUpperBound().getUsers()) {
+    auto cmp = dyn_cast<arith::CmpIOp>(user);
+    if (!cmp)
+      continue;
+    if (llvm::none_of(cmp->getUsers(), isDominatingAssume))
+      continue;
+    bool unsignedCmp = loop.getUnsignedCmp();
+    if (cmp.getPredicate() == (unsignedCmp ? arith::CmpIPredicate::ugt
+                                           : arith::CmpIPredicate::sgt) &&
+        cmp.getLhs() == loop.getUpperBound() &&
+        cmp.getRhs() == loop.getLowerBound())
+      return true;
+    if (cmp.getPredicate() == (unsignedCmp ? arith::CmpIPredicate::ult
+                                           : arith::CmpIPredicate::slt) &&
+        cmp.getLhs() == loop.getLowerBound() &&
+        cmp.getRhs() == loop.getUpperBound())
+      return true;
+  }
+  return false;
 }

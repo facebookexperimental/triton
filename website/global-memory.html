@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Address global memory directly with scalar-base buffer operations.">
+  <title>Global memory access · FBTriton</title>
+  <link rel="stylesheet" href="assets/tlx.css?v=20260824c">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="../"><span>FBTriton</span></a>
+    <nav class="topnav" aria-label="Top-level sections"><a href="triton.html">Triton</a>
+<a href="tlx.html" data-current="true">TLX</a>
+<a href="tlx-ops.html">tlx.ops</a>
+<a href="torchtlx.html">TorchTLX</a>
+<a href="ci.html">CI</a>
+<a href="tooling.html">Tooling</a></nav>
+    <a class="repo-link" href="https://github.com/facebookexperimental/triton" target="_blank" rel="noreferrer">View on GitHub ↗</a>
+  </header>
+  <div class="shell">
+<aside class="sidebar">
+      <p class="eyebrow">TLX documentation</p>
+      <nav><a href="tlx.html">Overview</a>
+<a href="buffers.html">Memory</a>
+<a href="global-memory.html" aria-current="page">Global memory access</a>
+<a class="sub" href="#tlx-buffer-load">`tlx.buffer_load`</a>
+<a class="sub" href="#tlx-buffer-store">`tlx.buffer_store`</a>
+<a class="sub" href="#tlx-buffer-atomic-add">`tlx.buffer_atomic_add`</a>
+<a class="sub" href="#example-buffer-load-and-store">Example: buffer load and store</a>
+<a href="async-memory.html">Async memory access</a>
+<a href="async-compute.html">Tensor core operations</a>
+<a href="synchronization.html">Synchronization</a>
+<a href="warp-specialization.html">Warp specialization</a>
+<a href="clusters.html">Clusters and Cluster Launch Control</a>
+<a href="layouts.html">Layout control and diagnostics</a>
+<a href="utilities.html">Other operations</a>
+<a href="kernels.html">Kernels implemented with TLX</a>
+<a href="testing.html">Testing</a>
+<a href="resources.html">Further reading</a></nav>
+    </aside>
+    <main>
+      <p class="eyebrow">TLX documentation</p>
+      <h1>Global memory access</h1>
+      <p class="lede">Address global memory directly with scalar-base buffer operations.</p>
+      <article><blockquote><p><strong>[gfx950]</strong> — available on AMD MI350 (CDNA4) only; not available on MI300.</p></blockquote>
+<p>Buffer operations access global memory via a scalar base pointer and a tensor of i32 element offsets, rather than a tensor of pointers. This maps directly to AMD's hardware buffer instructions, which use a resource descriptor and byte offsets, enabling the hardware to do out-of-bounds checking and cache optimization.</p>
+<h2 id="tlx-buffer-load"><code>tlx.buffer_load</code></h2>
+<p>Load a tensor of values from global memory.</p>
+<pre><code class="language-python">result = tlx.buffer_load(
+    ptr, offsets, mask=None, other=None, cache=None, contiguity=1
+)</code></pre>
+<table><thead><tr><th>Argument</th><th>Type</th><th>Description</th></tr></thead><tbody><tr><td><code>ptr</code></td><td>scalar pointer</td><td>Base address in global memory.</td></tr><tr><td><code>offsets</code></td><td>i32 tensor</td><td>Per-element byte offsets from <code>ptr</code>.</td></tr><tr><td><code>mask</code></td><td>bool tensor, optional</td><td>When <code>mask[i]</code> is <code>False</code>, the element is not loaded.</td></tr><tr><td><code>other</code></td><td>tensor or scalar, optional</td><td>Value used for masked-out elements (where <code>mask[i]</code> is <code>False</code>).</td></tr><tr><td><code>cache</code></td><td>str, optional</td><td>Cache modifier (e.g. <code>&quot;.ca&quot;</code>, <code>&quot;.cg&quot;</code>).</td></tr><tr><td><code>contiguity</code></td><td>constexpr int</td><td>Trusted positive power-of-two vectorization width; it must divide each thread's element count.</td></tr></tbody></table>
+<p><strong>Returns</strong>: A tensor with the same shape as <code>offsets</code> and element type matching the pointee type of <code>ptr</code>.</p>
+<p>Lowers to <code>amdg.buffer_load</code>, which is eventually lowered to <code>rocdl.raw.ptr.buffer.load</code>.</p>
+<h2 id="tlx-buffer-store"><code>tlx.buffer_store</code></h2>
+<p>Store a tensor of values to global memory.</p>
+<pre><code class="language-python">tlx.buffer_store(stored_value, ptr, offsets, mask=None, cache=None)</code></pre>
+<table><thead><tr><th>Argument</th><th>Type</th><th>Description</th></tr></thead><tbody><tr><td><code>stored_value</code></td><td>tensor</td><td>Values to write.</td></tr><tr><td><code>ptr</code></td><td>scalar pointer</td><td>Base address in global memory.</td></tr><tr><td><code>offsets</code></td><td>i32 tensor</td><td>Per-element byte offsets from <code>ptr</code>.</td></tr><tr><td><code>mask</code></td><td>bool tensor, optional</td><td>When <code>mask[i]</code> is <code>False</code>, the element is not written.</td></tr><tr><td><code>cache</code></td><td>str, optional</td><td>Cache modifier.</td></tr></tbody></table>
+<p><strong>Returns</strong>: Nothing.</p>
+<p>Lowers to <code>amdg.buffer_store</code>, which is eventually lowered to <code>rocdl.raw.ptr.buffer.store</code>.</p>
+<h2 id="tlx-buffer-atomic-add"><code>tlx.buffer_atomic_add</code></h2>
+<p>Atomically add a tensor through an AMD scalar resource descriptor.</p>
+<pre><code class="language-python">previous = tlx.buffer_atomic_add(
+    ptr, offsets, value, mask=None, sem=None, scope=None, contiguity=1
+)</code></pre>
+<p><code>contiguity</code> is the same trusted per-thread adjacency width accepted by <code>buffer_load</code>; values greater than one also preserve the selected layout. The operation returns the values observed before the additions. FP16 and BF16 use packed two-element instructions, so <code>contiguity</code> must be at least two and any mask must be uniform for each adjacent pair. Compilation fails if mask analysis reduces the legal vector width below two.</p>
+<h2 id="example-buffer-load-and-store">Example: buffer load and store</h2>
+<pre><code class="language-python">import triton.language.extra.tlx as tlx
+
+@triton.jit
+def kernel(src_ptr, dst_ptr, BLOCK_SIZE: tl.constexpr):
+    offsets = tl.arange(0, BLOCK_SIZE).to(tl.int32)
+    mask = offsets &lt; BLOCK_SIZE
+
+    # Load from global memory using buffer semantics
+    data = tlx.buffer_load(src_ptr, offsets, mask=mask, other=0.0)
+
+    # Store to global memory using buffer semantics
+    tlx.buffer_store(data, dst_ptr, offsets, mask=mask)</code></pre>
+<p>For the async global-to-shared variant, see the warp-pipeline GEMM example (<code>third_party/amd/python/examples/gluon/f16_gemm_warp_pipeline_gfx1250.py</code>).</p></article>
+<footer class="pager"><a href="buffers.html">← Memory</a><a class="next" href="async-memory.html">Async memory access →</a></footer>
+    </main>
+  </div>
+</body>
+</html>

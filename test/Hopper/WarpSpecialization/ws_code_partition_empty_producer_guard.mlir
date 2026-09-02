@@ -1,4 +1,4 @@
-// RUN: TRITON_USE_META_WS=1 triton-opt %s --nvgpu-warp-specialization="capability=100" | FileCheck %s
+// RUN: env TRITON_USE_META_WS=1 triton-opt %s --nvgpu-partition-scheduling-meta --nvgpu-warp-specialization="capability=100" | FileCheck %s
 
 // Regression guard for the empty-producer assertion (bug #7 in
 // .llms/rules/partition-scheduler-bugs.md): the `producerTaskIds.size() == 1`
@@ -14,10 +14,23 @@
 // test fails with empty FileCheck input. The guard is the load-bearing change:
 // the separateLocalAllocWithSrc source-task-id and optimizeSchedule cleanup
 // hunks are not required to keep this kernel passing.
+//
+// PartitionSchedulingMeta is part of the RUN pipeline because the raw kernel
+// below carries no `ttg.partition`, and warp specialization now rejects a
+// function with no partitions before it rewrites anything (see the no-partition
+// gate in WarpSpecialization.cpp). PSM is what assigns them in production, so
+// running it here is what the pipeline actually does -- and it is what gets
+// this kernel far enough to reach `createChannelPost` at all. Without PSM the
+// pass bailed out early and this test silently stopped covering bug #7, while
+// pinning IR that still held unlowered `nvws.descriptor_load` ops.
 
 // CHECK-LABEL: @_attn_bwd_persist
 // CHECK: scf.for
 // CHECK: tt.warp_specialize
+// Partitions are real: the pass must emit physical warp-specialize regions and
+// leave no unlowered NVWS descriptor load behind.
+// CHECK: ttg.warp_specialize
+// CHECK-NOT: nvws.descriptor_load
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
 #blocked1 = #ttg.blocked<{sizePerThread = [1, 32], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>

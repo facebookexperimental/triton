@@ -12,6 +12,8 @@ import functools
 import warnings
 from pathlib import Path
 
+MAX_INT_32 = 2**31 - 1
+
 
 def get_min_dot_size(target: GPUTarget):
     # We fallback to use FMA and cast arguments if certain configurations is
@@ -33,16 +35,16 @@ def is_async_copy_enabled(arch):
     return ((arch in ["gfx950", "gfx1250"]) if knobs.amd.use_async_copy is None else knobs.amd.use_async_copy)
 
 
-def is_coexec_scheduler_supported(arch):
+def is_coexec_scheduler_enabled(arch):
+    if knobs.amd.use_coexec_scheduler is not None:
+        return knobs.amd.use_coexec_scheduler
     return arch in ["gfx1250"]
 
 
 def is_expert_scheduling_enabled(arch):
-    if arch not in ["gfx1250"]:
-        return False
-    if knobs.amd.use_expert_scheduling is None:
-        return True
-    return knobs.amd.use_expert_scheduling
+    if knobs.amd.use_expert_scheduling is not None:
+        return knobs.amd.use_expert_scheduling
+    return arch in ["gfx1250"]
 
 
 def is_fpsan_supported(arch):
@@ -77,6 +79,8 @@ def _get_codegen_flags(options):
         flags.append("sink-insts-to-avoid-spills")
     if options.regclass_priority_trumps_globalness:
         flags.append("greedy-regclass-priority-trumps-globalness")
+    if options.disable_unclustered_high_rp_reschedule:
+        flags.append("amdgpu-disable-unclustered-high-rp-reschedule")
     return flags
 
 
@@ -102,6 +106,8 @@ class HIPOptions:
     launch_cooperative_grid: bool = False
     launch_cluster: bool = False  # No-op placeholder
     multicast: bool = False  # No-op placeholder (TMA multicast is NVIDIA-only)
+    enable_tree_reduction: bool = False
+    enable_nvptx_v2i32: bool = False  # No-op placeholder (NVPTX-only)
     matrix_instr_nonkdim: int = 0
     kpack: int = 1
     allow_flush_denorm: bool = False
@@ -124,6 +130,16 @@ class HIPOptions:
     reverse_local_assignment: bool = False
     sink_insts_to_avoid_spills: bool = False
     regclass_priority_trumps_globalness: bool = False
+    # Keep the pre-RA scheduler from replacing a pressure-sensitive schedule
+    # with the generic unclustered high-RP strategy. This is cache-keyed and
+    # per kernel so unrelated kernels retain the default pressure policy.
+    disable_unclustered_high_rp_reschedule: bool = False
+
+    # Cache-keyed, per-kernel schedule-group-barrier planning. Keep this name
+    # distinct from the pre-existing TTGIR dot-decomposition scheduler.
+    enable_sched_group_barrier_scheduler: bool = False
+    sched_group_barrier_mfma_per_dwordx4: int = 4
+    sched_group_barrier_required_region_count: int = 0
 
     def __post_init__(self):
         gfx_major = int(self.arch[3:-2])  # Drop "gfx" prefix and minor/patch number
@@ -138,6 +154,11 @@ class HIPOptions:
             object.__setattr__(self, "kpack", 1)
 
         object.__setattr__(self, 'llvm_fn_attrs', _parse_llvm_fn_attrs(self.llvm_fn_attrs))
+
+        if self.sched_group_barrier_mfma_per_dwordx4 <= 0:
+            raise ValueError("sched_group_barrier_mfma_per_dwordx4 must be positive")
+        if self.sched_group_barrier_required_region_count < 0:
+            raise ValueError("sched_group_barrier_required_region_count must be non-negative")
 
         default_libdir = Path(__file__).parent / "lib"
         extern_libs = {} if self.extern_libs is None else dict(self.extern_libs)
@@ -193,6 +214,11 @@ class HIPBackend(BaseBackend):
 
         if "enable_fp_fusion" not in opts:
             args["enable_fp_fusion"] = knobs.language.default_fp_fusion
+        if "enable_sched_group_barrier_scheduler" not in opts:
+            # Keep the environment variable as an experimental default. An
+            # explicit per-config value takes precedence so autotuning can
+            # select the scheduler independently for each kernel variant.
+            args["enable_sched_group_barrier_scheduler"] = knobs.amd.enable_ttgir_schedule
         args.update({k: opts[k] for k in HIPOptions.__dataclass_fields__.keys() if k in opts and opts[k] is not None})
         return HIPOptions(**args)
 
@@ -227,8 +253,7 @@ class HIPBackend(BaseBackend):
         for idx, (key, ty) in enumerate(src.signature.items()):
             if (idx, ) in constant_keys:
                 continue
-            name = key if isinstance(key, str) else (
-                arg_names[idx] if arg_names and idx < len(arg_names) else str(idx))
+            name = key if isinstance(key, str) else (arg_names[idx] if arg_names and idx < len(arg_names) else str(idx))
             arg_entry = {"name": name, "type": str(ty), "index": idx}
             for attr_name, attr_value in attrs.get((idx, ), []):
                 if attr_name == "tt.divisibility":
@@ -243,8 +268,8 @@ class HIPBackend(BaseBackend):
                 str_key = str(arg_names.index(key))
             else:
                 str_key = str(key)
-            constants_dict[str_key] = value if isinstance(value, (int, float, bool, str)) or value is None else str(
-                value)
+            constants_dict[str_key] = value if isinstance(value,
+                                                          (int, float, bool, str)) or value is None else str(value)
 
         cluster_dims = _get("cluster_dims") or (1, 1, 1)
         preferred_cluster_dims = _get("preferred_ctas_per_cga") or (0, 0, 0)
@@ -304,12 +329,14 @@ class HIPBackend(BaseBackend):
         elif HIPBackend._torch_available:
             import torch
 
-        MAX_INT_32 = 2**31 - 1
         if hasattr(arg, "ptr_range"):
             return arg.ptr_range() <= MAX_INT_32
         if (HIPBackend._torch_available and isinstance(arg, torch.Tensor) and hasattr(arg, "untyped_storage")):
             return arg.untyped_storage().size() <= MAX_INT_32
         return False
+
+    def get_tensor_size_specialization_threshold(self):
+        return MAX_INT_32 if knobs.amd.use_buffer_ops else None
 
     @staticmethod
     def parse_attr(desc):
@@ -422,8 +449,7 @@ class HIPBackend(BaseBackend):
         else:
             amd.passes.ttgpuir.add_schedule_loops(pm, options.num_stages)
             amd.passes.ttgpuir.add_pipeline(pm, use_async_copy, use_block_pingpong)
-        if use_async_copy:
-            amd.passes.ttgpuir.add_coalesce_async_copy(pm, options.arch)
+        amd.passes.ttgpuir.add_coalesce_async_copy(pm, options.arch, use_async_copy)
         amd.passes.ttgpuir.add_convert_to_tensor_ops(pm)
         # Phase 0 — opt-in TTGIR-level scheduler scaffold. No-ops unless
         # TRITON_ENABLE_TTGIR_SCHED=1 (also re-checked inside the pass).
@@ -477,6 +503,12 @@ class HIPBackend(BaseBackend):
         # kernels) and as the last pass before pm.run so the cleanup passes above do
         # not strip the priority markers before the pipeliner consumes them.
         amd.passes.ttgpuir.add_warp_pipeline(pm)
+        if options.enable_sched_group_barrier_scheduler:
+            amd.passes.ttgpuir.add_sched_group_barrier_scheduler(
+                pm,
+                options.sched_group_barrier_mfma_per_dwordx4,
+                options.sched_group_barrier_required_region_count,
+            )
         if options.instrumentation_mode == "fpsan":
             amd.passes.ttgpuir.add_fp_sanitizer(pm)
             passes.ttgpuir.add_fp_sanitizer(pm)
@@ -542,7 +574,12 @@ class HIPBackend(BaseBackend):
         ## 3. __HIP_FTZ is default to 1 and not exposed as a kernel argument.
         ##    For now it is used as a controller for developers only.
         __HIP_FTZ = True
-        amd.passes.ttgpuir.add_to_llvmir(pm, options.arch, __HIP_FTZ)
+        amd.passes.ttgpuir.add_to_llvmir(
+            pm,
+            options.arch,
+            __HIP_FTZ,
+            options.enable_tree_reduction,
+        )
         amd.passes.ttgpuir.add_warp_specialize_to_llvm(pm, options.arch)
         passes.common.add_canonicalizer(pm)
         passes.common.add_cse(pm)
@@ -618,17 +655,15 @@ class HIPBackend(BaseBackend):
             total_warps_num = total_num_warps
         kernel_fn.add_fn_attr("amdgpu-flat-work-group-size", f"1,{total_warps_num*options.warp_size}")
         kernel_fn.add_fn_attr("uniform-work-group-size", "true")
-        # LLVM AMDGPU backend supports the attribute "amdgpu-waves-per-eu"="<min>[, <max>]".
-        # This attribute may be attached to a kernel function definition and is an optimization hint.
-        # <min> parameter specifies the requested minimum number of waves per EU, and optional <max> parameter
-        # specifies the requested maximum number of waves per EU (must be >= <min> if specified).
-        # If <max> is omitted, then there is no restriction on the maximum number of waves per EU other than
-        # the one dictated by the hardware for which the kernel is compiled. Passing 0, 0 as <min>, <max>
-        # implies the default behavior (no limits).
-        # Specifying N, N forces LLVM to focus on a single register count, simplifies some heuristics
-        # and may improve scheduling.
-        kernel_fn.add_fn_attr("amdgpu-waves-per-eu", f"{options.waves_per_eu}, {options.waves_per_eu}")
-        if is_coexec_scheduler_supported(options.arch) and options.num_warps <= 4:
+        # "amdgpu-waves-per-eu"="<min>[,<max>]" allows controlling the minimal and (optional)
+        # maximal number of waves per SIMD. If <max> is omitted, then no restriction other than
+        # whatever allowed by the hardware for occupancy.
+        # Specifying "N,N" forces LLVM to focus on a single register budget, simplifies some
+        # heuristics and may improve scheduling.
+        if options.waves_per_eu != 0:
+            kernel_fn.add_fn_attr("amdgpu-waves-per-eu", f"{options.waves_per_eu},{options.waves_per_eu}")
+
+        if is_coexec_scheduler_enabled(options.arch) and options.num_warps <= 4:
             kernel_fn.add_fn_attr("amdgpu-sched-strategy", "coexec")
 
         denormal_mode = "preserve-sign" if options.allow_flush_denorm else "ieee"

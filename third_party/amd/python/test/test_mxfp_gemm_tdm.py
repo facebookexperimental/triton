@@ -21,6 +21,8 @@ import pytest
 from triton.tools.mxfp import MXScaleTensor, MXFP4Tensor
 from triton._internal_testing import is_hip_gfx1250
 
+
+pytestmark = pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires GFX1250")
 # ============================================================================
 # Constants
 # ============================================================================
@@ -350,7 +352,6 @@ def run_mxfp_gemm(
 @pytest.mark.parametrize("BM, BN, BK", [(128, 128, 128)])
 @pytest.mark.parametrize("dtype_a", ['float8_e5m2', 'float8_e4m3', 'float4'])
 @pytest.mark.parametrize("dtype_b", ['float8_e5m2', 'float8_e4m3', 'float4'])
-@pytest.mark.skipif(not is_hip_gfx1250(), reason="Scaled dot with TDM is only tested on gfx1250.")
 def test_mxgemm(M, N, K, BM, BN, BK, dtype_a, dtype_b):
     """Test MXFP GEMM with descriptor loads and pre-shuffled scales."""
 

@@ -69,29 +69,6 @@ static void pickDescriptorLoadStoreLayout(
   });
 }
 
-// A value pinned via tlx.require_layout(pin=True) carries a PinnedEncodingTrait
-// (#tlx.user_layout), possibly under a #tlx.no_verify_layout wrapper that
-// resolve-placeholder-layouts peels only after coalesce runs. Walk the TLX
-// wrapper chain to detect the pin (used for both a pinned load result and a
-// pinned store value operand).
-static bool hasRecursivePin(Attribute enc) {
-  for (Attribute e = enc; e && e.getDialect().getNamespace() == "tlx";) {
-    if (isa<PinnedEncodingTrait>(e))
-      return true;
-    Attribute inner;
-    e.walkImmediateSubElements(
-        [&](Attribute sub) {
-          if (!inner)
-            inner = sub;
-        },
-        [](Type) {});
-    if (!inner || inner == e)
-      break;
-    e = inner;
-  }
-  return false;
-}
-
 struct CoalescePass : public impl::TritonGPUCoalesceBase<CoalescePass> {
   using impl::TritonGPUCoalesceBase<CoalescePass>::TritonGPUCoalesceBase;
 
@@ -156,7 +133,7 @@ struct CoalescePass : public impl::TritonGPUCoalesceBase<CoalescePass> {
         // purpose. The pin (PinnedEncodingTrait) may sit under a
         // #tlx.no_verify_layout wrapper here (peeled later by
         // resolve-placeholder).
-        if (hasRecursivePin(resultType.getEncoding()))
+        if (containsPinnedEncoding(resultType.getEncoding()))
           return;
       } else {
         // Not a memory operation we handle
@@ -203,7 +180,7 @@ struct CoalescePass : public impl::TritonGPUCoalesceBase<CoalescePass> {
         if (auto store = dyn_cast<triton::StoreOp>(curr)) {
           if (auto vt =
                   dyn_cast<RankedTensorType>(store.getValue().getType())) {
-            if (hasRecursivePin(vt.getEncoding())) {
+            if (containsPinnedEncoding(vt.getEncoding())) {
               Attribute concrete = triton::unwrapTlxWrappers(vt.getEncoding());
               if (isa_and_nonnull<DistributedEncodingTrait>(concrete))
                 pinned = concrete;

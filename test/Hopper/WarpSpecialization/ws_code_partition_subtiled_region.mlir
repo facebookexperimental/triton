@@ -1,9 +1,8 @@
 // RUN: triton-opt %s --nvgpu-test-ws-code-partition="num-buffers=1" | FileCheck %s
-// XFAIL: *
 
 // Test: Code partition with SubtiledRegionOps for epilogue subtiling.
 // Regression test for B-11-F1 / T273485415.
-// Inline consumer-side subtiled NVWS tokens must carry WSBarrier destination
+// Inline subtiled NVWS tokens must carry task IDs and WSBarrier destination
 // metadata so WSBarrierAnalysis can inject channel graph metadata.
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
@@ -20,8 +19,12 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
   // CHECK: partition0
   // CHECK:   ttng.subtiled_region
   // CHECK:     nvws.producer_acquire
+  // CHECK-SAME: channelGraph = array<i32: 2>
+  // CHECK-SAME: dstTask = 2 : i32
   // CHECK:     ttg.local_store
   // CHECK:     nvws.producer_commit
+  // CHECK-SAME: channelGraph = array<i32: 2>
+  // CHECK-SAME: dstTask = 2 : i32
   //
   // Partition 1 (store): SubtiledRegionOp with inline consumer ops
   // CHECK: partition1

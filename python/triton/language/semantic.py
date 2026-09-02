@@ -984,8 +984,8 @@ class TritonSemantic(Generic[TensorTy]):
                 raise ValueError(f"Padding option {padding_option} not supported")
         return padding
 
-    def _str_to_sem(self, sem_option):
-        sem = ir.MEM_SEMANTIC.ACQUIRE_RELEASE
+    def _str_to_sem(self, sem_option, default=ir.MEM_SEMANTIC.ACQUIRE_RELEASE):
+        sem = default
         if sem_option:
             if sem_option == "acquire":
                 sem = ir.MEM_SEMANTIC.ACQUIRE
@@ -1104,14 +1104,16 @@ class TritonSemantic(Generic[TensorTy]):
         return tl.tensor_descriptor_base(handle, block_ty)
 
     def descriptor_load(self, desc: tl.tensor_descriptor_base, offsets, cache_modifier: str, eviction_policy: str,
-                        latency: Optional[int], multicast: Optional[bool] = None) -> TensorTy:
+                        latency: Optional[int], multicast: Optional[bool] = None, attrs=None) -> TensorTy:
         assert isinstance(desc, tl.tensor_descriptor_base), \
             f"expected a tensor descriptor, got {type(desc).__name__}"
         ndim = len(desc.block_shape)
         assert len(offsets) == ndim, f"expected {ndim} offsets, but got {len(offsets)}"
 
         offsets = self._convert_to_ir_values(offsets, require_i64=False)
-        if multicast is not None and not isinstance(multicast, bool):
+        if multicast is None:
+            multicast = getattr(self.builder.options, "multicast", False)
+        if not isinstance(multicast, bool):
             raise TypeError(f"multicast must be a constexpr bool or None, got {multicast}")
         x = self.builder.create_descriptor_load(
             desc.handle,
@@ -1124,7 +1126,17 @@ class TritonSemantic(Generic[TensorTy]):
             if not isinstance(latency, int) or latency < 0:
                 raise TypeError(
                     f"If provided, latency argument to load must be a non-negative integer. Found: {latency}")
-            x.handle.set_attr("tt.latency", self.builder.get_int32_attr(latency))
+            x.set_attr("tt.latency", self.builder.get_int32_attr(latency))
+        if attrs is not None:
+            if not isinstance(attrs, dict):
+                raise TypeError(f"attrs must be a dict, got {type(attrs).__name__}")
+            # The compiler reads tt.autows as a JSON object of string->string;
+            # a JSON number would be silently ignored, so reject it here.
+            for key, value in attrs.items():
+                if not isinstance(key, str) or not isinstance(value, str):
+                    raise TypeError("attrs keys and values must be strings, got "
+                                    f"{key!r}: {value!r}. Use e.g. attrs={{'stage': '0', 'order': '2'}}")
+            x.set_attr("tt.autows", self.builder.get_string_attr(json.dumps(attrs)))
         return self.tensor(x, desc.block_type)
 
     def validate_store_like(self, desc: tl.tensor_descriptor_base, value: TensorTy, offsets) -> None:
@@ -1355,6 +1367,41 @@ class TritonSemantic(Generic[TensorTy]):
     #########
     # atomic
     #########
+
+    def atomic_poll(self, ptr: TensorTy, expected: TensorTy, sem: str, scope: str,
+                    timeout_ns: Optional[TensorTy]) -> TensorTy:
+        if isinstance(timeout_ns, int) and timeout_ns < 0:
+            raise ValueError("atomic_poll timeout_ns must be non-negative")
+        if timeout_ns is not None:
+            timeout_ns = self.to_tensor(timeout_ns)
+        if ptr.type.is_block():
+            raise ValueError("atomic_poll only supports a pointer to a scalar")
+        if not ptr.type.is_ptr():
+            raise ValueError(f"Unsupported ptr type {ptr.type.__repr__()} in `tl.atomic_poll`")
+        if expected.type.is_block():
+            raise ValueError("Expected value argument cannot be block type")
+
+        element_ty = ptr.type.element_ty
+        if not element_ty.is_int() or element_ty.primitive_bitwidth not in [16, 32, 64]:
+            raise ValueError("atomic_poll only supports integer elements with width {16, 32, 64}")
+        expected = self.cast(expected, element_ty)
+
+        sem = self._str_to_sem(sem, default=ir.MEM_SEMANTIC.ACQUIRE)
+        if sem not in [ir.MEM_SEMANTIC.ACQUIRE, ir.MEM_SEMANTIC.RELAXED]:
+            raise ValueError("atomic_poll only supports acquire and relaxed semantics")
+        scope = self._str_to_scope(scope)
+        if timeout_ns is not None:
+            if timeout_ns.type.is_block() or not timeout_ns.type.is_int():
+                raise ValueError("atomic_poll timeout_ns must be a scalar integer")
+            timeout_ns = self.cast(timeout_ns, tl.uint64)
+        handle = self.builder.create_atomic_poll(
+            ptr.handle,
+            expected.handle,
+            ir.value() if timeout_ns is None else timeout_ns.handle,
+            sem,
+            scope,
+        )
+        return self.tensor(handle, tl.int1)
 
     def atomic_cas(self, ptr: TensorTy, cmp: TensorTy, val: TensorTy, sem: str, scope: str) -> TensorTy:
         sem = self._str_to_sem(sem)
@@ -1715,7 +1762,7 @@ class TritonSemantic(Generic[TensorTy]):
                 acc_handle,
                 input_precision,
                 max_num_imprecise_acc,
-                two_ctas,
+                bool(two_ctas),
             ),
             result_type,
         )
@@ -2084,9 +2131,12 @@ class TritonSemantic(Generic[TensorTy]):
         elem_size = base.dtype.element_ty.primitive_bitwidth // 8
         contig_dim_size = tl._unwrap_if_constexpr(block_shape[-1])
         if contig_dim_size * elem_size < 16:
-            raise ValueError(
-                f"Descriptor block shape must have at least 16 bytes in the last dimension, but got {contig_dim_size} * {elem_size} = {contig_dim_size * elem_size} bytes"
-            )
+            message = (f"Descriptor block shape must have at least 16 bytes in the last dimension, but got "
+                       f"{contig_dim_size} * {elem_size} = {contig_dim_size * elem_size} bytes")
+            if self.builder.options.backend_name == "cpu":
+                warnings.warn(message)
+            else:
+                raise ValueError(message)
 
         last_stride = tl._unwrap_if_constexpr(strides[-1])
         if last_stride != 1:

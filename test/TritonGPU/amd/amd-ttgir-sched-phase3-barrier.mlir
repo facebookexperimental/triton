@@ -1,18 +1,18 @@
-// RUN: TRITON_ENABLE_TTGIR_SCHED=1 TRITON_TTGIR_SCHED_APPLY=1 triton-opt %s \
+// RUN: env TRITON_ENABLE_TTGIR_SCHED=1 TRITON_TTGIR_SCHED_APPLY=1 triton-opt %s \
 // RUN:   -split-input-file -tritonamdgpu-dot-decompose-and-schedule \
 // RUN:   2>&1 | FileCheck %s --check-prefix=DEFAULT
 //
-// RUN: TRITON_ENABLE_TTGIR_SCHED=1 TRITON_TTGIR_SCHED_APPLY=1 \
+// RUN: env TRITON_ENABLE_TTGIR_SCHED=1 TRITON_TTGIR_SCHED_APPLY=1 \
 // RUN:   TRITON_TTGIR_SCHED_BARRIER_STRIDE=0 triton-opt %s \
 // RUN:   -split-input-file -tritonamdgpu-dot-decompose-and-schedule \
 // RUN:   2>&1 | FileCheck %s --check-prefix=DISABLED
 //
-// RUN: TRITON_ENABLE_TTGIR_SCHED=1 TRITON_TTGIR_SCHED_APPLY=1 \
+// RUN: env TRITON_ENABLE_TTGIR_SCHED=1 TRITON_TTGIR_SCHED_APPLY=1 \
 // RUN:   TRITON_TTGIR_SCHED_BARRIER_STRIDE=1 triton-opt %s \
 // RUN:   -split-input-file -tritonamdgpu-dot-decompose-and-schedule \
 // RUN:   2>&1 | FileCheck %s --check-prefix=PERDOT
 //
-// Phase 3: insert `rocdl.sched.barrier 0` between scheduling regions to
+// Phase 3: insert `rocdl.sched.barrier none` between scheduling regions to
 // prevent LLVM misched from reordering sub-dots across boundaries.
 // `TRITON_TTGIR_SCHED_BARRIER_STRIDE` controls the stride:
 //   * default (env unset) → one barrier per M-row (stride = numPartitionsN)
@@ -30,7 +30,7 @@
 // Default stride: 7 sched.barrier ops.
 // DEFAULT-LABEL: tt.func @v8_like_dot_phase3
 // DEFAULT-COUNT-32: tt.dot {{.*}} -> tensor<32x32xf32
-// DEFAULT-COUNT-7: rocdl.sched.barrier 0
+// DEFAULT-COUNT-7: rocdl.sched.barrier none
 // DEFAULT: amdg.concat
 // DEFAULT-NOT: rocdl.sched.barrier
 
@@ -42,7 +42,7 @@
 // STRIDE=1: 31 sched.barrier ops (one between every adjacent sub-dot pair).
 // PERDOT-LABEL: tt.func @v8_like_dot_phase3
 // PERDOT-COUNT-32: tt.dot {{.*}} -> tensor<32x32xf32
-// PERDOT-COUNT-31: rocdl.sched.barrier 0
+// PERDOT-COUNT-31: rocdl.sched.barrier none
 // PERDOT: amdg.concat
 // PERDOT-NOT: rocdl.sched.barrier
 

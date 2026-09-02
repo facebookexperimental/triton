@@ -9,12 +9,11 @@
 // CHECK-LABEL: @swap_transposed_alloc
 //
 // After buffer allocation, the dsT alloc is swapped to non-transposed #shared
-// layout and hoisted above the loop. The first two allocs are the original
-// k_smem/q_smem buffers; dsT remains after them because hoisting preserves
-// producer order.
-// CHECK: ttg.local_alloc : () -> !ttg.memdesc<128x128xbf16, #shared, #smem, mutable>
-// CHECK: ttg.local_alloc : () -> !ttg.memdesc<128x128xbf16, #shared, #smem, mutable>
+// layout and hoisted above the loop. Descriptor conversion now precedes
+// hoisting, so the cross-partition dsT/dq buffer is placed before the
+// descriptor destination buffers.
 // CHECK: %[[B0:.*]] = ttg.local_alloc : () -> !ttg.memdesc<128x128xbf16, #shared, #smem, mutable>
+// CHECK: ttg.local_alloc : () -> !ttg.memdesc<128x128xbf16, #shared, #smem, mutable>
 //
 // Inside the loop, memdesc_trans goes from #shared (non-transposed) to #shared1
 // (transposed), confirming the swap happened:
@@ -53,6 +52,112 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
       %dq_tok = ttng.tc_gen5_mma %dq_trans, %k_smem, %dq[%dq_dep], %use_d, %true {async_task_id = array<i32: 0>} : !ttg.memdesc<128x128xbf16, #shared, #smem>, !ttg.memdesc<128x128xbf16, #shared, #smem>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
       scf.yield %true, %dk_tok, %dq_tok, %prev : i1, !ttg.async.token, !ttg.async.token, i1
     } {async_task_id = array<i32: 0, 1, 2, 3>, tt.warp_specialize}
+    tt.return
+  }
+}
+
+// -----
+
+// CHECK-LABEL: @descriptor_allocs_with_write
+// CHECK-COUNT-2: ttg.local_alloc
+
+#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [4, 1], order = [1, 0]}>
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#smem = #ttg.shared_memory
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @descriptor_allocs_with_write(%desc: !tt.tensordesc<128x64xf16, #shared>, %replacement: tensor<128x64xf16, #blocked>) attributes {noinline = false} {
+    %c0 = arith.constant {async_task_id = array<i32: 0>} 0 : i32
+    %tile = tt.descriptor_load %desc[%c0, %c0] {async_task_id = array<i32: 0>} : !tt.tensordesc<128x64xf16, #shared> -> tensor<128x64xf16, #blocked>
+    %alloc0 = ttg.local_alloc %tile {async_task_id = array<i32: 0>} : (tensor<128x64xf16, #blocked>) -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+    ttg.local_store %replacement, %alloc0 {async_task_id = array<i32: 0>} : tensor<128x64xf16, #blocked> -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+    %alloc1 = ttg.local_alloc %tile {async_task_id = array<i32: 0>} : (tensor<128x64xf16, #blocked>) -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+// CHECK-LABEL: @descriptor_allocs_in_sibling_regions
+// CHECK-COUNT-2: ttg.local_alloc
+
+#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [4, 1], order = [1, 0]}>
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#smem = #ttg.shared_memory
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @descriptor_allocs_in_sibling_regions(%desc: !tt.tensordesc<128x64xf16, #shared>, %cond: i1) attributes {noinline = false} {
+    %c0 = arith.constant {async_task_id = array<i32: 0>} 0 : i32
+    %tile = tt.descriptor_load %desc[%c0, %c0] {async_task_id = array<i32: 0>} : !tt.tensordesc<128x64xf16, #shared> -> tensor<128x64xf16, #blocked>
+    scf.if %cond {
+      %alloc0 = ttg.local_alloc %tile {async_task_id = array<i32: 0>} : (tensor<128x64xf16, #blocked>) -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+    } else {
+      %alloc1 = ttg.local_alloc %tile {async_task_id = array<i32: 0>} : (tensor<128x64xf16, #blocked>) -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+    }
+    tt.return
+  }
+}
+
+// -----
+
+// CHECK-LABEL: @descriptor_alloc_forwarded_through_loop
+// CHECK-COUNT-2: ttg.local_alloc
+
+#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [4, 1], order = [1, 0]}>
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#smem = #ttg.shared_memory
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @descriptor_alloc_forwarded_through_loop(%desc: !tt.tensordesc<128x64xf16, #shared>, %replacement: tensor<128x64xf16, #blocked>) attributes {noinline = false} {
+    %c0 = arith.constant {async_task_id = array<i32: 0>} 0 : i32
+    %c1 = arith.constant {async_task_id = array<i32: 0>} 1 : i32
+    %tile = tt.descriptor_load %desc[%c0, %c0] {async_task_id = array<i32: 0>} : !tt.tensordesc<128x64xf16, #shared> -> tensor<128x64xf16, #blocked>
+    %alloc0 = ttg.local_alloc %tile {async_task_id = array<i32: 0>} : (tensor<128x64xf16, #blocked>) -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+    %result = scf.for %iv = %c0 to %c1 step %c1 iter_args(%buffer = %alloc0) -> (!ttg.memdesc<128x64xf16, #shared, #smem, mutable>) : i32 {
+      ttg.local_store %replacement, %buffer {async_task_id = array<i32: 0>} : tensor<128x64xf16, #blocked> -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+      scf.yield %buffer : !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+    } {async_task_id = array<i32: 0>}
+    %alloc1 = ttg.local_alloc %tile {async_task_id = array<i32: 0>} : (tensor<128x64xf16, #blocked>) -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+// CHECK-LABEL: @descriptor_allocs_with_different_attrs
+// CHECK-DAG: ttg.local_alloc {{.*}}alignment = 16 : i32
+// CHECK-DAG: ttg.local_alloc {{.*}}alignment = 32 : i32
+// CHECK-NOT: ttg.local_alloc
+
+#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [4, 1], order = [1, 0]}>
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#smem = #ttg.shared_memory
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @descriptor_allocs_with_different_attrs(%desc: !tt.tensordesc<128x64xf16, #shared>) attributes {noinline = false} {
+    %c0 = arith.constant {async_task_id = array<i32: 0>} 0 : i32
+    %tile = tt.descriptor_load %desc[%c0, %c0] {async_task_id = array<i32: 0>} : !tt.tensordesc<128x64xf16, #shared> -> tensor<128x64xf16, #blocked>
+    %alloc0 = ttg.local_alloc %tile {alignment = 16 : i32, async_task_id = array<i32: 0>} : (tensor<128x64xf16, #blocked>) -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+    %alloc1 = ttg.local_alloc %tile {alignment = 32 : i32, async_task_id = array<i32: 0>} : (tensor<128x64xf16, #blocked>) -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+// CHECK-LABEL: @descriptor_allocs_merge_task_ids
+// CHECK: ttg.local_store {{.*}} {async_task_id = array<i32: 1, 3>}
+
+#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [4, 1], order = [1, 0]}>
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#smem = #ttg.shared_memory
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @descriptor_allocs_merge_task_ids(%desc: !tt.tensordesc<128x64xf16, #shared>) attributes {noinline = false} {
+    %c0 = arith.constant {async_task_id = array<i32: 0, 2>} 0 : i32
+    %tile = tt.descriptor_load %desc[%c0, %c0] {async_task_id = array<i32: 0, 2>} : !tt.tensordesc<128x64xf16, #shared> -> tensor<128x64xf16, #blocked>
+    %alloc0 = ttg.local_alloc %tile {async_task_id = array<i32: 3>} : (tensor<128x64xf16, #blocked>) -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+    %alloc1 = ttg.local_alloc %tile {async_task_id = array<i32: 1>} : (tensor<128x64xf16, #blocked>) -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
     tt.return
   }
 }

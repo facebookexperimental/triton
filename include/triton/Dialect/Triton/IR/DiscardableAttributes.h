@@ -12,6 +12,34 @@ inline constexpr StringLiteral kDisallowAccMultiBufferAttrName =
 inline constexpr StringLiteral kWarpSpecializeAttrName = "tt.warp_specialize";
 inline constexpr StringLiteral kScheduledMaxStageAttrName =
     "tt.scheduled_max_stage";
+inline constexpr StringLiteral kDataPartitionFactorAttrName =
+    "tt.data_partition_factor";
+
+// AutoWS annotation on an MMA op: a JSON object carrying the desired schedule
+// and, optionally, the channels the operands travel through, e.g.
+//   {"stage": "0", "order": "2", "channels": ["opndD,tmem,1,0"]}
+// The names below are the single source of truth for everyone who reads or
+// writes that annotation (ScheduleLoops, AssignLatencies, WSMemoryPlanner,
+// WSDataPartition).
+inline constexpr StringLiteral kAutoWSAnnotationAttrName = "tt.autows";
+inline constexpr StringLiteral kAutoWSStageKey = "stage";
+inline constexpr StringLiteral kAutoWSOrderKey = "order";
+inline constexpr StringLiteral kAutoWSChannelsKey = "channels";
+inline constexpr StringLiteral kAutoWSOperandDTag = "opndD";
+// Set by the frontend on each 2-CTA FA forward contraction ("qk" or "pv") so
+// WSDataPartition can give the two data partitions distinct stage/order once
+// each contraction has a concrete partition index.
+inline constexpr StringLiteral kAutoWSTwoCTAInterleaveRoleKey =
+    "two_cta_interleave_role";
+
+// Each entry of the "channels" array is a comma-separated string laid out as
+//   operand,memory,copies,bufferId[,extra]
+// e.g. "opndA,tmem,1,2,64" or "opndD,tmem,1,7". Readers split on ',' and index
+// the buffer id positionally, so the layout is recorded here next to the keys
+// rather than as a bare literal at each parse site.
+inline constexpr unsigned kAutoWSChannelBufferIdField = 3;
+inline constexpr unsigned kAutoWSChannelMinFields = 4;
+inline constexpr unsigned kAutoWSChannelMaxFields = 5;
 
 enum class AutoWSLoopAttrPropagation {
   NotForwarded,

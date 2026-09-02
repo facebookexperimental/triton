@@ -238,4 +238,9 @@ while continuing to pipeline only the nested K `scf.for`.
 - [x] Unified dynamic atomic scheduler correctness validated on Blackwell.
 - [x] Unified CLC scheduler correctness validated on Blackwell with an
   unannotated inner K loop.
+- [x] Clustered CLC state is hoisted before AutoWS and explicitly captured by
+  every isolated partition; 1-CTA and 2-CTA CLC outer-while matmul are covered.
+- [ ] Pipelined 2-CTA FA inside the CLC outer while. One inner stage is correct;
+  two or more stages currently re-arm a QK MMA completion barrier before the
+  prior phase is observed.
 - [ ] Hopper runtime validation of the unified dynamic atomic scheduler.

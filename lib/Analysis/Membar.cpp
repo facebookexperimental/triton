@@ -10,46 +10,44 @@
 
 namespace mlir {
 
-/// Given a value that may be produced by a chain of memdesc_index operations,
-/// narrow the parent buffer's interval to the sub-range actually accessed.
-/// memdesc_index selects a contiguous slice along the leading dimension, so if
-/// the index is a compile-time constant we can compute the exact byte range.
-/// This avoids false hazards when different indices of the same buffer are
-/// accessed (e.g. initializing elements of a barrier array).
+/// Given a value produced by memdesc_index, possibly wrapped in transparent
+/// memdesc views, narrow the parent buffer's interval to the sub-range actually
+/// accessed. memdesc_index selects a contiguous slice along the leading
+/// dimension, so a compile-time constant index identifies an exact byte range.
+/// Nested memdesc_index operations are verifier-invalid.
 static Interval<size_t> narrowIntervalForSubview(Value value,
                                                  Interval<size_t> interval) {
-  while (auto indexOp = value.getDefiningOp<triton::gpu::MemDescIndexOp>()) {
-    auto parentType =
-        cast<triton::gpu::MemDescType>(indexOp.getSrc().getType());
-
-    // Only narrow when the index is a compile-time constant.
-    APInt indexVal;
-    if (!matchPattern(indexOp.getIndex(), m_ConstantInt(&indexVal)))
+  triton::gpu::MemDescIndexOp indexOp;
+  while (Operation *defOp = value.getDefiningOp()) {
+    if ((indexOp = dyn_cast<triton::gpu::MemDescIndexOp>(defOp)))
       break;
-
-    int64_t idx = indexVal.getSExtValue();
-    int64_t dim0 = parentType.getShape()[0];
-    size_t totalSize = interval.end() - interval.start();
-
-    // Ensure the stride divides evenly (should always hold for well-formed IR).
-    if (dim0 <= 0 || totalSize % dim0 != 0)
-      break;
-
-    size_t stride = totalSize / dim0;
-    size_t newStart = interval.start() + idx * stride;
-    size_t newEnd = newStart + stride;
-    interval = Interval<size_t>(newStart, newEnd);
-
-    // Continue tracing through the parent in case of nested indexing.
-    value = indexOp.getSrc();
+    if (!defOp->hasTrait<OpTrait::MemDescViewTrait>())
+      return interval;
+    value = defOp->getOperand(0);
   }
-  return interval;
+  if (!indexOp)
+    return interval;
+
+  APInt indexVal;
+  if (!matchPattern(indexOp.getIndex(), m_ConstantInt(&indexVal)))
+    return interval;
+
+  auto parentType = cast<triton::gpu::MemDescType>(indexOp.getSrc().getType());
+  int64_t dim0 = parentType.getShape()[0];
+  size_t totalSize = interval.end() - interval.start();
+  if (dim0 <= 0 || totalSize % dim0 != 0)
+    return interval;
+
+  size_t stride = totalSize / dim0;
+  size_t newStart = interval.start() + indexVal.getSExtValue() * stride;
+  return Interval<size_t>(newStart, newStart + stride);
 }
 
 AllocationSlice::AllocationSlice(Value value,
                                  Interval<size_t> allocationInterval,
                                  Allocation::BufferId bufferId)
-    : allocationInterval(allocationInterval), bufferId(bufferId) {
+    : allocationInterval(narrowIntervalForSubview(value, allocationInterval)),
+      bufferId(bufferId) {
   auto accessTy = cast<triton::gpu::MemDescType>(value.getType());
   this->accessTy = accessTy;
 
@@ -236,7 +234,7 @@ void MembarOrFenceAnalysis::visitTerminator(
     SmallVector<RegionSuccessor> regions;
     br.getSuccessorRegions(RegionBranchPoint::parent(), regions);
     for (RegionSuccessor &region : regions) {
-      if (region.isParent()) {
+      if (region.isOperation()) {
         successors.emplace_back(br->getBlock(), br->getIterator());
       } else {
         Block &block = region.getSuccessor()->front();
@@ -256,7 +254,7 @@ void MembarOrFenceAnalysis::visitTerminator(
     SmallVector<RegionSuccessor> regions;
     br.getSuccessorRegions(operands, regions);
     for (RegionSuccessor &region : regions) {
-      if (region.isParent()) {
+      if (region.isOperation()) {
         Operation *parent = br->getParentOp();
         successors.emplace_back(parent->getBlock(), parent->getIterator());
       } else {
@@ -280,6 +278,12 @@ void MembarAnalysis::insertBarrier(Operation *op, OpBuilder *builder) {
 }
 
 bool containsLocalBarrier(Operation *op) {
+  if (isa<triton::AtomicPollOp>(op))
+    return true;
+  if (auto atomic = dyn_cast<triton::AtomicRMWOp>(op))
+    return atomic.getSem() != triton::MemSemantic::RELAXED;
+  if (auto atomic = dyn_cast<triton::AtomicCASOp>(op))
+    return atomic.getSem() != triton::MemSemantic::RELAXED;
   if (isa<gpu::BarrierOp>(op))
     return true;
   if (isa<triton::nvidia_gpu::ClusterBarrierOp>(op))
@@ -294,9 +298,18 @@ bool containsLocalBarrier(Operation *op) {
 }
 
 // Returns true if the same block has a later wait or local barrier before any
-// memory effect or nested control flow.
+// memory effect or nested control flow. Scheduling-only fences carrying
+// ttg::SchedulingBarrierOpInterface (e.g. the AMD rocdl.sched.barrier that
+// brackets the real ttg.barrier a tlx.workgroup_barrier interposes) have no
+// cross-wave memory semantics and are skipped: treating one as a stopping point
+// would make Membar insert a redundant barrier right after the async wait --
+// doubling the workgroup barrier and stalling a hand-written ping-pong
+// schedule.
 static bool hasSyncPointBeforeMemoryEffect(Operation *op) {
   for (Operation *next = op->getNextNode(); next; next = next->getNextNode()) {
+    if (isa<triton::gpu::SchedulingBarrierOpInterface>(next))
+      continue;
+
     if (containsLocalBarrier(next) ||
         next->hasTrait<mlir::OpTrait::MemWaitOpTrait>())
       return true;
@@ -367,6 +380,7 @@ void MembarAnalysis::update(Operation *op, BlockInfo *blockInfo,
                  allocation->getAllBufferIdsWithAliases(value)) {
               if (bufferId != Allocation::InvalidBufferId) {
                 auto interval = allocation->getAllocatedInterval(bufferId);
+                interval = narrowIntervalForSubview(value, interval);
                 auto slice = AllocationSlice(value, interval, bufferId);
 
                 if (isa<MemoryEffects::Write>(effectInstance.getEffect()))

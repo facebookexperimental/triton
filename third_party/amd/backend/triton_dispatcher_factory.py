@@ -48,6 +48,7 @@ def make_triton_dispatcher(schema, function: int):
         num_ctas=schema["num_ctas"],
         shared_mem=schema["shared_mem"],
         launch_cooperative_grid=1 if schema.get("launch_cooperative_grid", False) else 0,
-        warp_size=schema.get("warp_size", driver.active.get_current_target().warp_size),
+        warp_size=schema.get("warp_size",
+                             driver.active.get_current_target().warp_size),
         arg_type_codes=type_codes,
     )

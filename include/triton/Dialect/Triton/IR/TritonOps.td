@@ -306,6 +306,37 @@ def TT_StoreOp
 //
 // Atomic Ops
 //
+def TT_AtomicPollOp : TT_Op<"atomic_poll", [
+  TypesMatchWith<"ptr type matches expected type", "expected", "ptr",
+                 "getPointerTypeSameShape($_self)">
+]> {
+    let summary = "poll an atomic value";
+
+    let description = [{
+        Repeatedly load from $ptr with relaxed semantics on a single thread
+        until the loaded value equals $expected. For acquire semantics, issue
+        an acquire fence only after a successful poll. Other threads wait for
+        the polling thread to finish.
+    }];
+
+    let arguments = (ins
+      Arg<TT_Ptr, "", [MemRead<GlobalMemory>, MemWrite<GlobalMemory>]>:$ptr,
+      TT_Int:$expected,
+      Optional<I64>:$timeout,
+      TT_MemSemanticAttr:$sem,
+      TT_MemSyncScopeAttr:$scope
+    );
+
+    let results = (outs I1:$result);
+
+    let assemblyFormat = [{
+      $sem `,` $scope `,` $ptr `,` $expected (`timeout` $timeout^)?
+      attr-dict `:` qualified(type($ptr)) `,` type($expected) `->` type($result)
+    }];
+
+    let hasVerifier = 1;
+}
+
 def TT_AtomicRMWOp
     : TT_Op<"atomic_rmw",
             [SameOperandsAndResultShape, SameOperandsAndResultEncoding,
@@ -441,6 +472,9 @@ def TT_ReshapeOp : TT_Op<"reshape", [Pure, SameOperandsAndResultElementType]> {
   let hasCanonicalizeMethod = 1;
   let hasFolder = 1;
   let hasVerifier = 1;
+  let extraClassDeclaration = [{
+    std::optional<unsigned> getExpandDimsAxis();
+  }];
 }
 
 def TT_BroadcastOp : TT_Op<"broadcast", [Pure, SameOperandsAndResultElementType,
@@ -497,7 +531,7 @@ def TT_JoinOp : TT_Op<"join", [Pure, SameTypeOperands]> {
   let hasVerifier = 1;
 }
 
-def TT_SplitOp : TT_Op<"split", [Pure, InferTensorTypeOpWithLayoutEquivalence,
+def TT_SplitOp : TT_Op<"split", [Pure, InferTypeOpAdaptorWithIsCompatible,
                                  TypesMatchWith<"outLHS and outRHS types match",
                                                 "outLHS", "outRHS", "$_self">,
 ]> {
@@ -1208,7 +1242,8 @@ def TT_DescriptorLoadOp
           DefaultValuedAttr<TT_CacheModifierAttr,
                             "::mlir::triton::CacheModifier::NONE">:$cache,
           DefaultValuedAttr<TT_EvictionPolicyAttr,
-                            "::mlir::triton::EvictionPolicy::NORMAL">:$evict);
+                            "::mlir::triton::EvictionPolicy::NORMAL">:$evict,
+          DefaultValuedAttr<BoolAttr, "false">:$multicast);
 
   let results = (outs TT_Tensor:$result);
 

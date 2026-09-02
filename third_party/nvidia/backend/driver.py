@@ -121,11 +121,11 @@ class CudaUtils(object):
         # launch.h"` would not resolve. Substituting the header text keeps a
         # single source of truth (launch.h) while making the compile
         # self-contained.
-        driver_src = Path(os.path.join(dirname, "driver.c")).read_text()
+        driver_src = Path(os.path.join(dirname, "driver.c")).read_text(encoding="utf-8")
         launch_h_path = next((p for p in _launch_h_candidates if os.path.exists(p)), None)
         if launch_h_path is None:
             raise FileNotFoundError(f"launch.h not found in any of: {_launch_h_candidates}")
-        launch_h_src = Path(launch_h_path).read_text()
+        launch_h_src = Path(launch_h_path).read_text(encoding="utf-8")
         include_marker = '#include "nvidia/backend/launch.h"'
         if include_marker not in driver_src:
             raise RuntimeError(f"driver.c must contain the marker {include_marker!r} for "

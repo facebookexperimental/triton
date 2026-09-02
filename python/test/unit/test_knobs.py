@@ -1,6 +1,7 @@
 import os
 import pytest
 import shutil
+import sys
 import triton
 from triton._C.libtriton import get_cache_invalidating_env_vars  # type: ignore[attr-defined]
 from triton._internal_testing import is_hip
@@ -291,6 +292,118 @@ def test_nvidia_tool(fresh_knobs, tmp_path, monkeypatch):
     monkeypatch.delenv("PTXAS_OPTIONS")
     assert Path(fresh_knobs.nvidia.ptxas.path).resolve() == default_ptxas.resolve()
     assert fresh_knobs.nvidia.ptxas_options is None
+
+
+def _fake_tool(path, body):
+    """A stand-in for ptxas: a script running `body` under this interpreter."""
+    path.write_text(f"#!{sys.executable}\nimport sys\n{body}\n")
+    path.chmod(0o755)
+    return path
+
+
+def test_nvidia_tool_probe_reports_reason(tmp_path):
+    probe = triton.knobs.NvidiaTool.probe
+
+    tool, reason = probe(str(tmp_path / "absent"))
+    assert tool is None
+    assert reason == "no such file"
+
+    # The case that motivated this: present and executable, but killed at exec.
+    broken = _fake_tool(tmp_path / "broken", 'sys.stderr.write("undefined symbol: unw_backtrace\\n"); sys.exit(127)')
+    tool, reason = probe(str(broken))
+    assert tool is None
+    assert "exited with status 127" in reason
+    assert "undefined symbol: unw_backtrace" in reason
+
+    # Executable, but not a runnable image: exec fails with ENOEXEC, an OSError
+    # that is not FileNotFoundError, and it has to come back as a reason rather
+    # than propagate out of the candidate loop. ENOEXEC rather than a cleared
+    # execute bit so the case does not depend on who runs the test.
+    not_a_binary = tmp_path / "not-a-binary"
+    not_a_binary.write_bytes(b"\x7fnot an ELF header\n")
+    not_a_binary.chmod(0o755)
+    tool, reason = probe(str(not_a_binary))
+    assert tool is None
+    assert reason.startswith("cannot execute: ")
+
+    unparseable = _fake_tool(tmp_path / "unparseable", 'print("not a version string")')
+    tool, reason = probe(str(unparseable))
+    assert tool is None
+    assert "release X.Y" in reason
+
+    good = _fake_tool(tmp_path / "good", 'print("Cuda compilation tools, release 12.8, V12.8.93")')
+    tool, reason = probe(str(good))
+    assert reason is None
+    assert tool.version == "12.8"
+
+
+def test_nvidia_tool_probe_truncates_output(tmp_path):
+    noisy = _fake_tool(tmp_path / "noisy", 'sys.stderr.write("E" * 100000); sys.exit(1)')
+    _, reason = triton.knobs.NvidiaTool.probe(str(noisy))
+    assert len(reason) < 4096
+    assert reason.startswith("`--version` exited with status 1: ...")
+
+
+def test_nvidia_tool_error_lists_all_candidates(fresh_knobs, tmp_path, monkeypatch):
+    broken = _fake_tool(tmp_path / "broken-ptxas", 'sys.stderr.write("boom\\n"); sys.exit(127)')
+    absent = tmp_path / "absent-ptxas"
+
+    # Both candidates must fail for transform() to raise.
+    monkeypatch.setattr(type(fresh_knobs.nvidia).__dict__["ptxas"], "default_path", str(absent))
+    monkeypatch.setenv("TRITON_PTXAS_PATH", str(broken))
+
+    with pytest.raises(RuntimeError) as excinfo:
+        fresh_knobs.nvidia.ptxas
+
+    msg = str(excinfo.value)
+    assert "Cannot find ptxas" in msg
+    # The interpreter running the fake tool is free to add its own noise to the
+    # captured stream, so `boom` is not necessarily flush against the status --
+    # only assert it lands in the broken candidate's reason.
+    broken_prefix = f"{broken}: `--version` exited with status 127:"
+    absent_reason = f"{absent}: no such file"
+    assert broken_prefix in msg
+    assert absent_reason in msg
+    broken_reason = msg.split(broken_prefix, 1)[1].split(absent_reason, 1)[0]
+    assert "boom" in broken_reason
+
+
+def test_nvidia_tool_env_hook(fresh_knobs, tmp_path, monkeypatch):
+    # A tool that dies unless a specific variable is scrubbed from its
+    # environment -- the shape of an inherited LD_PRELOAD that only resolves
+    # inside the host interpreter.
+    poison = "TRITON_TEST_POISONED_ENV"
+    tool = _fake_tool(
+        tmp_path / "ptxas", 'import os\n'
+        f'if os.environ.get("{poison}"):\n'
+        '    sys.stderr.write("undefined symbol: unw_backtrace\\n"); sys.exit(127)\n'
+        'print("Cuda compilation tools, release 12.8, V12.8.93")')
+    monkeypatch.setenv(poison, "1")
+
+    # Drive both directions explicitly rather than relying on the ambient value:
+    # `fresh_knobs` deliberately does not reset `nvidia`, and a packager may have
+    # installed a hook at import (fbcode's `set_configs()` does). `scope()`
+    # snapshots `nvidia.__dict__` and restores it on exit, so whatever was
+    # installed survives this test.
+    with fresh_knobs.nvidia.scope():
+        # No hook: the environment is inherited as-is, so the tool dies.
+        fresh_knobs.nvidia.tool_env = None
+        assert fresh_knobs.nvidia.get_tool_env() is None
+        triton.knobs.NvidiaTool.probe.cache_clear()
+        tool_obj, reason = triton.knobs.NvidiaTool.probe(str(tool))
+        assert tool_obj is None
+        assert "unw_backtrace" in reason
+
+        # With a hook that scrubs the marker, the same tool resolves.
+        fresh_knobs.nvidia.tool_env = lambda: {k: v for k, v in os.environ.items() if k != poison}
+        triton.knobs.NvidiaTool.probe.cache_clear()
+        tool_obj, reason = triton.knobs.NvidiaTool.probe(str(tool))
+        assert reason is None
+        assert tool_obj.version == "12.8"
+
+    # `probe` is lru_cached per path and the cache is process-wide; don't leave
+    # entries behind that were resolved under this test's hook.
+    triton.knobs.NvidiaTool.probe.cache_clear()
 
 
 def test_opt_bool(fresh_knobs_including_libraries, monkeypatch):

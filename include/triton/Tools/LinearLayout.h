@@ -3,6 +3,7 @@
 
 #include <cstdint>
 #include <numeric>
+#include <optional>
 #include <ostream>
 #include <string>
 #include <utility>
@@ -10,12 +11,15 @@
 
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/ValueRange.h"
+#include "triton/Tools/ModularArithmetic.h"
 #include "llvm/ADT/Hashing.h"
 #include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SetVector.h"
 
 namespace mlir::triton {
+
+struct LinearLayoutSolveResult;
 
 // # High-level overview of linear layouts
 //
@@ -834,14 +838,21 @@ public:
   // One requirement we *don't* have is that S is injective; we allow two shmem
   // offsets to hold the same 2D index.  If S is not injective,
   // the algorithm chooses the smallest offset for a given (lane, warp).
+  // Requires a supported solution; use tryInvertAndCompose otherwise.
   [[nodiscard]] LinearLayout invertAndCompose(const LinearLayout &outer) const;
+
+  // Recoverable form for callers admitting modular layouts.
+  [[nodiscard]] LinearLayoutSolveResult
+  tryInvertAndCompose(const LinearLayout &outer) const;
 
   // Get the layout that is the inverse of this layout.
   [[nodiscard]] LinearLayout invert() const;
   // Compute and return a psueodinverse of this layout. This is a layout such
   // that `B = A.psuedoinvert()` implies that `A(B(x)) = I`. If `A` is
   // invertible, then this returns `A^-1`.
+  // Requires a supported solution; use tryPseudoinvert otherwise.
   [[nodiscard]] LinearLayout pseudoinvert() const;
+  [[nodiscard]] LinearLayoutSolveResult tryPseudoinvert() const;
 
   // For each in-dim, returns a bitmask of the "free variables" in the layout
   // function.
@@ -903,11 +914,19 @@ private:
                                                     const LinearLayout &B);
 
   // Modular lstsq: solve AX = B over Z/nZ using CRT factorization.
-  static LinearLayout lstsqModular(const LinearLayout &A,
-                                   const LinearLayout &B);
+  static LinearLayoutSolveResult lstsqModular(const LinearLayout &A,
+                                              const LinearLayout &B);
 
   // Solve AX = B (least-squares over GF(2) or modular).
-  static LinearLayout lstsq(const LinearLayout &A, const LinearLayout &B);
+  static LinearLayoutSolveResult lstsq(const LinearLayout &A,
+                                       const LinearLayout &B);
+};
+
+struct LinearLayoutSolveResult {
+  ModularSolveStatus status;
+  std::optional<LinearLayout> layout;
+
+  bool succeeded() const { return status == ModularSolveStatus::Success; }
 };
 
 inline llvm::raw_ostream &operator<<(llvm::raw_ostream &os,

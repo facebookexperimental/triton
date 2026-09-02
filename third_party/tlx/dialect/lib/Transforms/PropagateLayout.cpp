@@ -9,6 +9,7 @@
 #include "triton/Dialect/TritonGPU/IR/Types.h"
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
@@ -39,14 +40,29 @@ public:
                   mlir::PatternRewriter &rewriter) const override {
     if (!isa<RankedTensorType>(requireLayoutOp.getSrc().getType()))
       return failure();
-    if (requireLayoutOp.getSrc().getType() == requireLayoutOp.getType()) {
+    auto resultType = cast<RankedTensorType>(requireLayoutOp.getType());
+    if (containsPinnedEncoding(resultType.getEncoding())) {
+      auto boundary = ttg::RequireLayoutOp::create(
+          rewriter, requireLayoutOp.getLoc(), requireLayoutOp.getType(),
+          requireLayoutOp.getSrc());
+      if (requireLayoutOp->hasAttr("tlx.rematerialize_coordinates"))
+        boundary->setAttr("tlx.rematerialize_coordinates",
+                          rewriter.getUnitAttr());
+      rewriter.replaceOp(requireLayoutOp, boundary);
+      return success();
+    }
+    bool rematerializeCoordinates =
+        requireLayoutOp->hasAttr("tlx.rematerialize_coordinates");
+    if (requireLayoutOp.getSrc().getType() == requireLayoutOp.getType() &&
+        !rematerializeCoordinates) {
       rewriter.replaceOp(requireLayoutOp, requireLayoutOp.getSrc());
       return success();
     }
+
     auto convert = ttg::ConvertLayoutOp::create(
         rewriter, requireLayoutOp.getLoc(), requireLayoutOp.getType(),
         requireLayoutOp.getSrc());
-    if (requireLayoutOp->hasAttr("tlx.rematerialize_coordinates"))
+    if (rematerializeCoordinates)
       convert->setAttr("tlx.rematerialize_coordinates", rewriter.getUnitAttr());
     rewriter.replaceOp(requireLayoutOp, convert);
     return success();
@@ -159,6 +175,221 @@ public:
   }
 };
 
+// `ttg.warp_predicate` restricts EXEC before entering its region. A layout
+// conversion that redistributes values across waves therefore cannot remain in
+// the region: a skipped wave would not participate in the shuffle. Layout
+// inference commonly introduces exactly that shape around an MFMA body:
+//
+//   old init -> warp_predicate { ... MFMA value -> old layout -> yield }
+//
+// Move captured conversions before the EXEC restriction and move conversions
+// on yielded values across the region boundary. The latter changes the carried
+// type to the body's native layout and converts back after all waves have
+// reconverged. Since convert_layout preserves the logical tensor, the
+// old->new->old round trip also preserves every inactive lane's init value.
+class HoistWarpPredicateLayoutConversions
+    : public mlir::OpRewritePattern<ttg::WarpPredicateOp> {
+public:
+  using OpRewritePattern::OpRewritePattern;
+
+  mlir::LogicalResult
+  matchAndRewrite(ttg::WarpPredicateOp predicateOp,
+                  mlir::PatternRewriter &rewriter) const override {
+    bool changed = false;
+
+    auto yieldOp = dyn_cast<ttg::PredicateYieldOp>(
+        predicateOp.getRegion().front().getTerminator());
+    if (!yieldOp)
+      return failure();
+
+    auto predicateType =
+        dyn_cast<RankedTensorType>(predicateOp.getPredicate().getType());
+    std::optional<Attribute> predicateEncoding;
+    bool conflictingPredicateEncoding = false;
+    // Determine the physical row ownership before moving or retyping anything.
+    // One execution predicate cannot safely control carried row values whose
+    // native layouts assign those rows to different lanes.
+    for (auto [result, init, yielded] :
+         llvm::zip(predicateOp.getResults(), predicateOp.getInits(),
+                   yieldOp.getValues())) {
+      auto oldType = dyn_cast<RankedTensorType>(result.getType());
+      auto boundaryConvert = yielded.getDefiningOp<ttg::ConvertLayoutOp>();
+      auto bodyType =
+          boundaryConvert
+              ? dyn_cast<RankedTensorType>(boundaryConvert.getSrc().getType())
+              : RankedTensorType();
+      bool hasHoistableBoundary =
+          boundaryConvert && boundaryConvert->hasOneUse() && oldType &&
+          bodyType && oldType != bodyType &&
+          oldType.getShape() == bodyType.getShape() &&
+          oldType.getElementType() == bodyType.getElementType() &&
+          (init.getType() == oldType || init.getType() == bodyType) &&
+          yielded.getType() == oldType;
+      RankedTensorType nativeType = hasHoistableBoundary ? bodyType : oldType;
+      if (predicateType && nativeType &&
+          nativeType.getRank() >= predicateType.getRank() &&
+          llvm::equal(
+              predicateType.getShape(),
+              nativeType.getShape().take_front(predicateType.getRank()))) {
+        Attribute encoding = nativeType.getEncoding();
+        if (!isa<ttg::DistributedEncodingTrait>(encoding))
+          return predicateOp.emitError(
+              "expected distributed encodings on warp_predicate carried "
+              "tensors");
+        for (int rank = nativeType.getRank(); rank > predicateType.getRank();
+             --rank)
+          encoding = ttg::SliceEncodingAttr::get(
+              predicateOp.getContext(), rank - 1,
+              cast<ttg::DistributedEncodingTrait>(encoding));
+        if (!predicateEncoding) {
+          predicateEncoding = encoding;
+        } else {
+          auto selectedType = RankedTensorType::get(
+              predicateType.getShape(), predicateType.getElementType(),
+              *predicateEncoding);
+          auto candidateType =
+              RankedTensorType::get(predicateType.getShape(),
+                                    predicateType.getElementType(), encoding);
+          if (!ttg::isLayoutEquivalentIgnoringRegisterOrder(
+                  ttg::toLinearLayout(selectedType),
+                  ttg::toLinearLayout(candidateType)))
+            conflictingPredicateEncoding = true;
+        }
+      }
+    }
+    if (conflictingPredicateEncoding)
+      return predicateOp.emitError(
+          "carried row values require conflicting predicate layouts");
+
+    // Captured tensor conversions (for example Q -> dot operand layout) must
+    // execute with the full CTA active. Collect first because moving while
+    // walking the region invalidates the walk.
+    SmallVector<ttg::ConvertLayoutOp> capturedConversions;
+    predicateOp.getRegion().walk([&](ttg::ConvertLayoutOp convertOp) {
+      Region *sourceRegion = convertOp.getSrc().getParentRegion();
+      if (sourceRegion != &predicateOp.getRegion() &&
+          !predicateOp.getRegion().isAncestor(sourceRegion))
+        capturedConversions.push_back(convertOp);
+    });
+    for (ttg::ConvertLayoutOp convertOp : capturedConversions) {
+      rewriter.moveOpBefore(convertOp, predicateOp);
+      changed = true;
+    }
+
+    for (unsigned index = 0, e = predicateOp.getNumResults(); index < e;
+         ++index) {
+      OpResult result = cast<OpResult>(predicateOp.getResult(index));
+      Value init = predicateOp.getInits()[index];
+      Value yielded = yieldOp.getValues()[index];
+      auto boundaryConvert = yielded.getDefiningOp<ttg::ConvertLayoutOp>();
+      if (!boundaryConvert || !boundaryConvert->hasOneUse())
+        continue;
+
+      auto oldType = dyn_cast<RankedTensorType>(result.getType());
+      auto bodyType =
+          dyn_cast<RankedTensorType>(boundaryConvert.getSrc().getType());
+      if (!oldType || !bodyType || oldType == bodyType ||
+          oldType.getShape() != bodyType.getShape() ||
+          oldType.getElementType() != bodyType.getElementType() ||
+          (init.getType() != oldType && init.getType() != bodyType) ||
+          yielded.getType() != oldType)
+        continue;
+
+      // Convert the false-path value before EXEC is restricted.
+      Value convertedInit = init;
+      if (init.getType() == oldType) {
+        rewriter.setInsertionPoint(predicateOp);
+        convertedInit = ttg::ConvertLayoutOp::create(
+            rewriter, predicateOp.getLoc(), bodyType, init);
+      }
+
+      // Consecutive predicated regions can keep their carried values in the
+      // native body layout. Record ordinary consumers that still require the
+      // old type, and recognize an old->body bridge inserted when the sibling
+      // region happened to be rewritten first.
+      auto siblingAcceptsBodyType = [&](OpOperand &use) {
+        auto sibling = dyn_cast<ttg::WarpPredicateOp>(use.getOwner());
+        // Operand zero is the predicate, not a carried value.
+        if (!sibling || use.getOperandNumber() == 0)
+          return false;
+        unsigned siblingIndex = use.getOperandNumber() - 1;
+        if (siblingIndex >= sibling.getNumResults())
+          return false;
+        if (sibling.getResult(siblingIndex).getType() == bodyType)
+          return true;
+        if (sibling.getResult(siblingIndex).getType() != oldType ||
+            !sibling.getRegion().hasOneBlock())
+          return false;
+        auto siblingYield = dyn_cast<ttg::PredicateYieldOp>(
+            sibling.getRegion().front().getTerminator());
+        if (!siblingYield || siblingIndex >= siblingYield.getNumOperands())
+          return false;
+        auto siblingBoundary = siblingYield.getValues()[siblingIndex]
+                                   .getDefiningOp<ttg::ConvertLayoutOp>();
+        return siblingBoundary && siblingBoundary->hasOneUse() &&
+               siblingBoundary.getSrc().getType() == bodyType;
+      };
+      SmallVector<OpOperand *> oldLayoutUses;
+      SmallVector<ttg::ConvertLayoutOp> siblingBridges;
+      for (OpOperand &use : result.getUses()) {
+        if (siblingAcceptsBodyType(use))
+          continue;
+        auto convert = dyn_cast<ttg::ConvertLayoutOp>(use.getOwner());
+        if (convert && convert.getSrc() == result &&
+            convert.getType() == bodyType) {
+          siblingBridges.push_back(convert);
+          continue;
+        }
+        oldLayoutUses.push_back(&use);
+      }
+
+      rewriter.modifyOpInPlace(predicateOp, [&] {
+        predicateOp->setOperand(index + 1, convertedInit);
+        result.setType(bodyType);
+      });
+      rewriter.modifyOpInPlace(yieldOp, [&] {
+        yieldOp->setOperand(index, boundaryConvert.getSrc());
+      });
+
+      for (ttg::ConvertLayoutOp bridge : siblingBridges) {
+        rewriter.replaceAllUsesWith(bridge.getResult(), result);
+        rewriter.eraseOp(bridge);
+      }
+
+      // Restore the original type only for non-predicate consumers. A sibling
+      // warp_predicate is rewritten to the same body type and consumes the
+      // result directly, avoiding a redundant new->old->new round trip.
+      if (!oldLayoutUses.empty()) {
+        rewriter.setInsertionPointAfter(predicateOp);
+        Value convertedResult = ttg::ConvertLayoutOp::create(
+            rewriter, predicateOp.getLoc(), oldType, result);
+        for (OpOperand *use : oldLayoutUses)
+          use->set(convertedResult);
+      }
+
+      rewriter.eraseOp(boundaryConvert);
+      changed = true;
+    }
+
+    if (predicateType && predicateEncoding) {
+      auto wavePredicateType = RankedTensorType::get(
+          predicateType.getShape(), predicateType.getElementType(),
+          *predicateEncoding);
+      if (wavePredicateType != predicateType) {
+        rewriter.setInsertionPoint(predicateOp);
+        Value wavePredicate = ttg::ConvertLayoutOp::create(
+            rewriter, predicateOp.getLoc(), wavePredicateType,
+            predicateOp.getPredicate());
+        rewriter.modifyOpInPlace(
+            predicateOp, [&] { predicateOp->setOperand(0, wavePredicate); });
+        changed = true;
+      }
+    }
+
+    return success(changed);
+  }
+};
+
 static RankedTensorType getNewTensorType(RankedTensorType origType,
                                          Attribute encoding) {
   return RankedTensorType::get(origType.getShape(), origType.getElementType(),
@@ -170,9 +401,7 @@ static bool isRetaggableTensorProducerValue(Value value) {
     return false;
 
   Operation *definingOp = value.getDefiningOp();
-  // Sparse dataflow handles the RegionBranchOpInterface edge consistency; if
-  // all incoming values agree, retagging the region result is safe.
-  return isa_and_nonnull<ttg::LocalLoadOp, RegionBranchOpInterface>(definingOp);
+  return isa_and_nonnull<ttg::LocalLoadOp>(definingOp);
 }
 
 static Type getTensorCandidateType(Value value, DataFlowSolver &solver,
@@ -312,9 +541,30 @@ collectRegionBranchSuccessors(RegionBranchOpInterface branchOp,
   }
 }
 
+using TensorTypeMap = llvm::DenseMap<Value, Type>;
+
+struct TensorRegionInfo {
+  llvm::DenseSet<Value> blockedValues;
+  TensorTypeMap regionTypes;
+};
+
+// The type an incoming region edge value actually contributes to the consensus.
+static Type getTensorEdgeType(Value value, DataFlowSolver &solver,
+                              const llvm::DenseSet<Value> &blockedValues,
+                              const TensorTypeMap &regionTypes) {
+  auto tensorType = cast<RankedTensorType>(value.getType());
+  // Region carriers must use the type realizable by their nested input edges.
+  if (auto it = regionTypes.find(value); it != regionTypes.end())
+    return it->second;
+  if (!isRetaggableTensorProducerValue(value))
+    return tensorType;
+  return getTensorCandidateType(value, solver, blockedValues);
+}
+
 static std::optional<Type>
 getTensorConsensusType(ValueRange values, DataFlowSolver &solver,
-                       const llvm::DenseSet<Value> &blockedValues) {
+                       const llvm::DenseSet<Value> &blockedValues,
+                       const TensorTypeMap &regionTypes) {
   if (values.empty())
     return std::nullopt;
 
@@ -323,7 +573,8 @@ getTensorConsensusType(ValueRange values, DataFlowSolver &solver,
     if (!isa<RankedTensorType>(value.getType()))
       return std::nullopt;
 
-    Type candidateType = getTensorCandidateType(value, solver, blockedValues);
+    Type candidateType =
+        getTensorEdgeType(value, solver, blockedValues, regionTypes);
     if (!consensusType) {
       consensusType = candidateType;
       continue;
@@ -334,12 +585,69 @@ getTensorConsensusType(ValueRange values, DataFlowSolver &solver,
   return consensusType;
 }
 
-static llvm::DenseSet<Value>
-computeBlockedTensorValues(triton::FuncOp funcOp, DataFlowSolver &solver) {
-  llvm::DenseSet<Value> blockedValues;
+static TensorTypeMap
+computeTensorRegionTypes(triton::FuncOp funcOp, DataFlowSolver &solver,
+                         const llvm::DenseSet<Value> &blockedValues) {
+  TensorTypeMap regionTypes;
+  funcOp.walk([&](RegionBranchOpInterface branchOp) {
+    SmallVector<RegionSuccessor> successors;
+    collectRegionBranchSuccessors(branchOp, successors);
+    for (RegionSuccessor successor : successors) {
+      for (Value input : branchOp.getSuccessorInputs(successor)) {
+        if (isa<RankedTensorType>(input.getType()))
+          regionTypes.try_emplace(
+              input, getTensorCandidateType(input, solver, blockedValues));
+      }
+    }
+  });
+
   bool changed = true;
   while (changed) {
     changed = false;
+    funcOp.walk<WalkOrder::PostOrder>([&](RegionBranchOpInterface branchOp) {
+      SmallVector<RegionSuccessor> successors;
+      collectRegionBranchSuccessors(branchOp, successors);
+      for (RegionSuccessor successor : successors) {
+        ValueRange inputs = branchOp.getSuccessorInputs(successor);
+        for (auto [index, input] : llvm::enumerate(inputs)) {
+          auto tensorType = dyn_cast<RankedTensorType>(input.getType());
+          if (!tensorType)
+            continue;
+
+          SmallVector<Value> predecessors;
+          branchOp.getPredecessorValues(successor, index, predecessors);
+          if (predecessors.empty())
+            continue;
+
+          std::optional<Type> consensus = getTensorConsensusType(
+              ValueRange(predecessors), solver, blockedValues, regionTypes);
+          Type type = consensus.value_or(input.getType());
+          if (blockedValues.contains(input) ||
+              isa_and_nonnull<UserLayoutAttr>(tensorType.getEncoding()))
+            type = input.getType();
+          auto it = regionTypes.find(input);
+          assert(it != regionTypes.end() && "expected seeded region type");
+          if (it == regionTypes.end())
+            continue;
+          if (it->second == type)
+            continue;
+          it->second = type;
+          changed = true;
+        }
+      }
+    });
+  }
+  return regionTypes;
+}
+
+static TensorRegionInfo computeTensorRegionInfo(triton::FuncOp funcOp,
+                                                DataFlowSolver &solver) {
+  TensorRegionInfo info;
+  bool changed = true;
+  while (changed) {
+    changed = false;
+    info.regionTypes =
+        computeTensorRegionTypes(funcOp, solver, info.blockedValues);
     funcOp.walk([&](RegionBranchOpInterface branchOp) {
       SmallVector<RegionSuccessor> successors;
       collectRegionBranchSuccessors(branchOp, successors);
@@ -355,55 +663,41 @@ computeBlockedTensorValues(triton::FuncOp funcOp, DataFlowSolver &solver) {
           if (predecessorValues.empty())
             continue;
 
-          if (getTensorConsensusType(ValueRange(predecessorValues), solver,
-                                     blockedValues))
+          bool successorBlocked = info.blockedValues.contains(successorInput);
+          if (!successorBlocked &&
+              getTensorConsensusType(ValueRange(predecessorValues), solver,
+                                     info.blockedValues, info.regionTypes))
             continue;
 
-          LDBG("Blocking tensor carrier value due to inconsistent predecessor "
-               "layouts at "
-               << branchOp->getName());
-          changed |= blockedValues.insert(successorInput).second;
+          if (!successorBlocked)
+            LDBG("Blocking tensor carrier value due to inconsistent "
+                 "predecessor layouts at "
+                 << branchOp->getName());
+          changed |= info.blockedValues.insert(successorInput).second;
           for (Value predecessorValue : predecessorValues) {
             if (!isa<RankedTensorType>(predecessorValue.getType()))
               continue;
-            changed |= blockedValues.insert(predecessorValue).second;
+            changed |= info.blockedValues.insert(predecessorValue).second;
           }
         }
       }
-
-      return WalkResult::advance();
     });
   }
 
-  return blockedValues;
+  return info;
 }
 
-static void
-updateTensorRegionBranchTypes(triton::FuncOp funcOp, DataFlowSolver &solver,
-                              const llvm::DenseSet<Value> &blockedValues) {
+static void updateTensorRegionBranchTypes(triton::FuncOp funcOp,
+                                          const TensorTypeMap &regionTypes) {
   funcOp.walk<WalkOrder::PostOrder>([&](RegionBranchOpInterface branchOp) {
     SmallVector<RegionSuccessor> successors;
     collectRegionBranchSuccessors(branchOp, successors);
 
-    bool changed = true;
-    while (changed) {
-      changed = false;
-      for (RegionSuccessor successor : successors) {
-        ValueRange successorInputs = branchOp.getSuccessorInputs(successor);
-        for (auto [index, successorInput] : llvm::enumerate(successorInputs)) {
-          if (!isa<RankedTensorType>(successorInput.getType()))
-            continue;
-
-          SmallVector<Value> predecessorValues;
-          branchOp.getPredecessorValues(successor, index, predecessorValues);
-          std::optional<Type> consensusType = getTensorConsensusType(
-              ValueRange(predecessorValues), solver, blockedValues);
-          if (!consensusType || successorInput.getType() == *consensusType)
-            continue;
-
-          successorInput.setType(*consensusType);
-          changed = true;
-        }
+    for (RegionSuccessor successor : successors) {
+      for (Value input : branchOp.getSuccessorInputs(successor)) {
+        auto it = regionTypes.find(input);
+        if (it != regionTypes.end() && input.getType() != it->second)
+          input.setType(it->second);
       }
     }
   });
@@ -473,8 +767,7 @@ public:
     if (failed(solver.initializeAndRun(op)))
       return signalPassFailure();
 
-    llvm::DenseSet<Value> blockedTensorValues =
-        computeBlockedTensorValues(funcOp, solver);
+    TensorRegionInfo tensorRegionInfo = computeTensorRegionInfo(funcOp, solver);
 
     WalkResult typeRewriteWalk = funcOp.walk([&](mlir::Operation *op) {
       if (isa<tlx::RequireLayoutOp>(op))
@@ -523,7 +816,8 @@ public:
 
       for (Value result : op->getResults()) {
         if (!isa<ttg::MemDescType>(result.getType())) {
-          rewriteTensorValueFromLattice(result, solver, blockedTensorValues);
+          rewriteTensorValueFromLattice(result, solver,
+                                        tensorRegionInfo.blockedValues);
           continue;
         }
 
@@ -535,7 +829,7 @@ public:
     if (typeRewriteWalk.wasInterrupted())
       return signalPassFailure();
 
-    updateTensorRegionBranchTypes(funcOp, solver, blockedTensorValues);
+    updateTensorRegionBranchTypes(funcOp, tensorRegionInfo.regionTypes);
 
     // Verify that no DummyTMEMLayoutAttr remains after layout propagation.
     bool hasDummyLayout = false;
@@ -561,6 +855,7 @@ public:
     patterns.add<ReleaseLayoutPattern>(context);
     patterns.add<FoldRetaggedLocalAllocLoad>(context);
     patterns.add<FoldLocalAllocLoadFallback>(context);
+    patterns.add<HoistWarpPredicateLayoutConversions>(context);
 
     if (applyPatternsGreedily(getOperation(), std::move(patterns)).failed())
       signalPassFailure();

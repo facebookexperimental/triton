@@ -100,6 +100,12 @@ struct ConvertTritonGPUToLLVM
                          bool enableConcurrencySanitizer)
       : ConvertTritonGPUToLLVMBase(
             {computeCapability, ptxVersion, enableConcurrencySanitizer}) {}
+  ConvertTritonGPUToLLVM(int32_t computeCapability, int32_t ptxVersion,
+                         bool enableConcurrencySanitizer,
+                         bool enableTreeReduction)
+      : ConvertTritonGPUToLLVMBase({computeCapability, ptxVersion,
+                                    enableConcurrencySanitizer,
+                                    enableTreeReduction}) {}
 
   void runOnOperation() override {
     MLIRContext *context = &getContext();
@@ -178,14 +184,23 @@ struct ConvertTritonGPUToLLVM
     populateLoadStoreOpToLLVMPatterns(typeConverter, targetInfo,
                                       computeCapability, patterns,
                                       axisInfoAnalysis, benefit);
-    mlir::triton::populateReduceOpToLLVMPatterns(typeConverter, patterns,
-                                                 targetInfo, benefit);
+    mlir::triton::populateReduceOpToLLVMPatternsWithOptions(
+        typeConverter, patterns, targetInfo, benefit, enableTreeReduction);
     mlir::triton::populateScanOpToLLVMPatterns(typeConverter, patterns,
                                                targetInfo, benefit);
     mlir::triton::populateGatherOpToLLVMPatterns(typeConverter, patterns,
                                                  targetInfo, benefit);
+    bool isCrossCluster =
+        computeCapability >= 90 &&
+        triton::gpu::TritonGPUDialect::getNumCTAs(mod) >= 2 &&
+        mod.walk([](Operation *op) {
+             return ttng::isDistributedMultiCTAOp(op, /*isRead=*/true)
+                        ? WalkResult::interrupt()
+                        : WalkResult::advance();
+           })
+            .wasInterrupted();
     populateBarrierOpToLLVMPatterns(typeConverter, patterns, benefit,
-                                    targetInfo);
+                                    targetInfo, isCrossCluster);
     populateClusterOpsToLLVMPatterns(typeConverter, patterns, benefit,
                                      targetInfo);
     mlir::triton::populateHistogramOpToLLVMPatterns(typeConverter, patterns,
@@ -242,9 +257,8 @@ struct ConvertTritonGPUToLLVM
     if (failed(applyPartialConversion(mod, cfTarget, std::move(cfPatterns))))
       return signalPassFailure();
 
-    // Fold CTAId when there is only 1 CTA.
-    int numCTAs = triton::gpu::TritonGPUDialect::getNumCTAs(mod);
-    if (numCTAs == 1 && !tlx::tlxIsClustered(mod)) {
+    // Fold CTAId when there is only 1 CTA, under either cluster model.
+    if (triton::gpu::lookupPhysicalNumCTAs(mod) == 1) {
       mod.walk([](triton::nvgpu::ClusterCTAIdOp id) {
         OpBuilder b(id);
         Value zero = LLVM::createConstantI32(id->getLoc(), b, 0);
@@ -447,7 +461,7 @@ private:
   // If the kernel is clustered, insert cluster sync properly to
   // bootstrap remote bars or tmem
   LogicalResult maybeInsertClusterSync(ModuleOp &mod) {
-    if (!tlx::tlxIsClustered(mod)) {
+    if (!triton::gpu::isPhysicalCluster(mod)) {
       return success();
     }
 
@@ -553,6 +567,15 @@ createConvertTritonGPUToLLVMPass(int32_t computeCapability, int32_t ptxVersion,
                                  bool enableConcurrencySanitizer) {
   return std::make_unique<ConvertTritonGPUToLLVM>(computeCapability, ptxVersion,
                                                   enableConcurrencySanitizer);
+}
+
+std::unique_ptr<OperationPass<ModuleOp>>
+createConvertTritonGPUToLLVMPass(int32_t computeCapability, int32_t ptxVersion,
+                                 bool enableConcurrencySanitizer,
+                                 bool enableTreeReduction) {
+  return std::make_unique<ConvertTritonGPUToLLVM>(computeCapability, ptxVersion,
+                                                  enableConcurrencySanitizer,
+                                                  enableTreeReduction);
 }
 
 bool NVIDIA::canSkipBarSync(Operation *before, Operation *after,

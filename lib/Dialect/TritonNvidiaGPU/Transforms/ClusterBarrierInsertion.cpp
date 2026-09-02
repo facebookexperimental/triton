@@ -2,6 +2,7 @@
 #include "triton/Analysis/Allocation.h"
 #include "triton/Analysis/Membar.h"
 #include "triton/Analysis/Utility.h"
+#include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 
@@ -18,12 +19,21 @@ namespace mlir {
 namespace triton {
 namespace nvidia_gpu {
 
-namespace {
-
 namespace ttg = mlir::triton::gpu;
 namespace ttng = mlir::triton::nvidia_gpu;
 
-static bool isDistributedMultiCTAOp(Operation *op, bool isRead) {
+static bool hasTCGen5CommitCrossCTA(Operation *op) {
+  SmallVector<Value> descs;
+  if (auto mma = dyn_cast<ttng::MMAv5OpInterface>(op))
+    descs = mma.getCompletionDescs();
+  else if (auto commit = dyn_cast<ttng::TCGen5CommitOp>(op))
+    llvm::append_range(descs, commit.getDescs());
+  else
+    return false;
+  return !ttng::getCTABroadcastMasks(ttng::getModuleTwoCTAs(op), descs).empty();
+}
+
+bool isDistributedMultiCTAOp(Operation *op, bool isRead) {
   if (auto cvt = dyn_cast<ttg::ConvertLayoutOp>(op)) {
     if (!isRead)
       return false;
@@ -40,20 +50,17 @@ static bool isDistributedMultiCTAOp(Operation *op, bool isRead) {
     auto splitNum = ttg::getCTASplitNum(srcTy.getEncoding());
     return splitNum[reduce.getAxis()] > 1;
   }
-  if (auto mma = dyn_cast<ttng::TCGen5MMAOp>(op)) {
-    return mma.getTwoCtas();
-  } else if (auto mmaScaled = dyn_cast<ttng::TCGen5MMAScaledOp>(op)) {
-    // TODO: Change when we support scaled MMA with 2CTAs
-    assert(!ttng::getModuleTwoCTAs(op->getParentOfType<ModuleOp>()) &&
-           "Scaled MMA with 2CTAs not supported");
-    return false;
-  } else if (auto tma = dyn_cast<ttng::AsyncTMACopyGlobalToLocalOp>(op)) {
-    return tma.getMulticast();
-  } else if (auto tma = dyn_cast<ttng::AsyncTMAGatherOp>(op)) {
+  if (isa<ttng::CLCTryCancelOp, ttng::AsyncSharedStoreOp>(op)) {
+    return ttg::lookupNumCTAs(op) > 1;
+  } else if (isa<ttng::TMEMCopyOp>(op)) {
+    return ttng::getModuleTwoCTAs(op);
+  } else if (auto tma = dyn_cast<ttng::TMALoadLikeOpInterface>(op)) {
     return tma.getMulticast();
   }
-  return false;
+  return hasTCGen5CommitCrossCTA(op);
 }
+
+namespace {
 
 static bool isPreAllocAliasSliceFilter(const AllocationSlice &lhsSlice,
                                        const AllocationSlice &rhsSlice,
@@ -88,25 +95,22 @@ usesTrackedBarrierInCrossCTAConsumerOp(Operation *op,
     return value && valueAliasesTrackedBuffers(value, tracked, allocation);
   };
 
-  if (auto mma = dyn_cast<ttng::TCGen5MMAOp>(op)) {
-    return mma.getTwoCtas() && llvm::any_of(mma.getBarriers(), aliasesTracked);
-  }
-  if (auto mmaScaled = dyn_cast<ttng::TCGen5MMAScaledOp>(op)) {
-    return mmaScaled.getTwoCtas() &&
-           llvm::any_of(mmaScaled.getBarriers(), aliasesTracked);
+  if (auto mma = dyn_cast<ttng::MMAv5OpInterface>(op)) {
+    auto barrierOp = cast<ttg::MBarrierOpInterface>(op);
+    return hasTCGen5CommitCrossCTA(op) &&
+           llvm::any_of(barrierOp.getBarriers(), aliasesTracked);
   }
   if (auto commit = dyn_cast<ttng::TCGen5CommitOp>(op)) {
-    return ttng::getModuleTwoCTAs(op) && aliasesTracked(commit.getBarrier());
+    return hasTCGen5CommitCrossCTA(op) && aliasesTracked(commit.getBarrier());
   }
-  if (auto tma = dyn_cast<ttng::AsyncTMACopyGlobalToLocalOp>(op)) {
-    return tma.getMulticast() && !tma.getMulticastTargets() &&
-           aliasesTracked(tma.getBarrier());
-  }
-  if (auto tma = dyn_cast<ttng::AsyncTMAGatherOp>(op)) {
+  if (auto tma = dyn_cast<ttng::TMALoadLikeOpInterface>(op)) {
     return tma.getMulticast() && aliasesTracked(tma.getBarrier());
   }
   if (auto clc = dyn_cast<ttng::CLCTryCancelOp>(op)) {
     return aliasesTracked(clc.getMbarrier());
+  }
+  if (auto store = dyn_cast<ttng::AsyncSharedStoreOp>(op)) {
+    return aliasesTracked(store.getMbarrier());
   }
   return false;
 }
@@ -168,6 +172,12 @@ static bool opUsesTrackedMBarrier(Operation *op,
           return WalkResult::interrupt();
         return WalkResult::advance();
       })
+      .wasInterrupted();
+}
+
+static bool hasWarpSpecializeOp(FunctionOpInterface funcOp) {
+  return funcOp
+      ->walk([](ttg::WarpSpecializeOp) { return WalkResult::interrupt(); })
       .wasInterrupted();
 }
 
@@ -336,6 +346,19 @@ void ClusterBarrierAnalysis::update(Operation *op, BlockInfo *blockInfo,
   if (isa<ttng::ClusterWaitOp>(op)) {
     blockInfo->sync();
     return;
+  }
+
+  // Any path from distributed shared memory use to kernel exit must include a
+  // cluster barrier. A return-site barrier is only reached by default warps in
+  // warp-specialized kernels; their lowering must provide any terminal sync.
+  if (op->hasTrait<OpTrait::ReturnLike>() &&
+      isa<FunctionOpInterface>(op->getParentOp())) {
+    auto funcOp = cast<FunctionOpInterface>(op->getParentOp());
+    if (triton::isKernel(funcOp) && !hasWarpSpecializeOp(funcOp)) {
+      builder->setInsertionPoint(op);
+      ttng::ClusterBarrierOp::create(*builder, op->getLoc());
+      blockInfo->sync();
+    }
   }
 
   BlockInfo curBlockInfo;

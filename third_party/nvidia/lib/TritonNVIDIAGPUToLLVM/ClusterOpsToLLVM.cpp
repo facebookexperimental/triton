@@ -319,7 +319,7 @@ struct ClusterBarrierOpConversion
     Value pred = b.icmp_eq(threadId, b.i32_val(0));
     int numCTAs = triton::gpu::lookupNumCTAs(op);
     bool relaxed = op.getRelaxed() && targetInfo.getPtxVersion() >= 86;
-    if (targetInfo.getTargetFeatures().supportsMbarMulticast()) {
+    if (targetInfo.supportsMbarrierMulticast()) {
       Value ctaId = NVVM::ClusterId::create(rewriter, loc, i32_ty);
       // Exclude the issuing CTA: the mbarriers expect numCTAs - 1 arrivals.
       Value peerMask =
@@ -413,8 +413,9 @@ struct InitializeWSClusterBarriers
       return;
 
     auto funcs = mod.getOps<LLVM::LLVMFuncOp>();
-    auto kernelIt = llvm::find_if(
-        funcs, [](LLVM::LLVMFuncOp func) { return triton::isKernel(func); });
+    auto kernelIt = llvm::find_if(funcs, [](LLVM::LLVMFuncOp func) {
+      return func->hasAttr(NVVM::NVVMDialect::getKernelFuncAttrName());
+    });
     if (kernelIt == funcs.end())
       return;
     LLVM::LLVMFuncOp kernel = *kernelIt;

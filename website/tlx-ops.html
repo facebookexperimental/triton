@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Production-ready TLX kernels, one blessed implementation per op and architecture.">
+  <title>tlx.ops · FBTriton</title>
+  <link rel="stylesheet" href="assets/tlx.css?v=20260824c">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="../"><span>FBTriton</span></a>
+    <nav class="topnav" aria-label="Top-level sections"><a href="triton.html">Triton</a>
+<a href="tlx.html">TLX</a>
+<a href="tlx-ops.html" data-current="true">tlx.ops</a>
+<a href="torchtlx.html">TorchTLX</a>
+<a href="ci.html">CI</a>
+<a href="tooling.html">Tooling</a></nav>
+    <a class="repo-link" href="https://github.com/facebookexperimental/triton" target="_blank" rel="noreferrer">View on GitHub ↗</a>
+  </header>
+  <div class="shell">
+<aside class="sidebar">
+      <p class="eyebrow">TLX op library</p>
+      <nav><a href="tlx-ops.html" aria-current="page">tlx.ops</a>
+<a class="sub" href="#what-tlx-ops-is">What tlx.ops is</a>
+<a class="sub" href="#interface">Interface</a>
+<a class="sub" href="#structure">Structure</a>
+<a class="sub" href="#current-availability">Current availability</a></nav>
+    </aside>
+    <main>
+      <p class="eyebrow">TLX op library</p>
+      <h1>tlx.ops</h1>
+      <p class="lede">Production-ready TLX kernels, one blessed implementation per op and architecture.</p>
+      <article><p>Production-ready kernels promoted from the TLX tutorials into the FBTriton op library.</p>
+<h2 id="what-tlx-ops-is">What tlx.ops is</h2>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div>Promote performant and prod-impactful ops from TLX tutorials into the FBTriton op library.</div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div>Catalog existing OSS TLX kernels and pick the best kernel per (arch, op).</div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div>Enforce the highest quality bar for both code change and CI.</div></div>
+<div class="list-item depth-0"><span aria-hidden="true">•</span><div>Demote <code>tutorials/</code> to a playground scratch with no CI coverage.</div></div>
+<h2 id="interface">Interface</h2>
+<pre><code class="language-python">from triton.tlx.ops import mm as tlx_mm
+
+out = tlx_mm(a, b, arch=&quot;sm100&quot;)</code></pre>
+<p><code>sm100</code> rather than <code>blackwell</code>, to align with the PTX convention.</p>
+<h2 id="structure">Structure</h2>
+<pre><code>third_party/tlx/
+    ops/                    -&gt; (symlink) python/triton/tlx/ops
+        kernels/
+            mm/          sm90.py  sm100.py  gfx942.py  gfx950.py
+            addmm/       gfx942.py
+            bmm/         gfx942.py
+            ...</code></pre>
+<h2 id="current-availability">Current availability</h2>
+<p>Implemented today:</p>
+<pre><code>mm/sm100.py
+flash_attn/sm100.py
+hstu_attn/sm100.py
+kda/sm100.py</code></pre>
+<p>Current kernel selections for the rest of the catalog:</p>
+<pre><code>kernels/
+    mm/                   sm90.py  sm100.py  gfx942.py  gfx950.py
+    addmm/                gfx942.py
+    bmm/                  gfx942.py
+    flash_attn/           sm90.py  sm100.py            (fwd + bwd)
+    hstu_attn/            sm100.py  gfx942.py
+                          _util.py  _stubs.py  _reference.py
+    kda/                  sm100.py
+    gdpa/                 sm100.py  gfx950.py
+    grouped_gemm/         sm100.py  gfx950.py
+    addmm_glu/            gfx950.py
+    paged_decode/         gfx950.py
+    ikbo_fa/              gfx950.py
+    ikbo_lce/             gfx950.py
+    multi_cta_layernorm/  sm100.py
+    cross_attention/      sm100.py
+    bmm_shared_a/         gfx950.py</code></pre></article>
+<footer class="pager"><a href="tlx.html">← TLX</a><a class="next" href="torchtlx.html">TorchTLX →</a></footer>
+    </main>
+  </div>
+</body>
+</html>

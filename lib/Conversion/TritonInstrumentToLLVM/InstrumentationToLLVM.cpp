@@ -22,10 +22,6 @@ namespace ttg = tt::gpu;
 namespace tti = mlir::triton::instrument;
 namespace ttng = mlir::triton::nvidia_gpu;
 
-// The first 24 bits of the shared memory object are CTA-invariant
-// The next 4 bits are the CTA index
-constexpr uint32_t kSharedMemoryObjectMask = (1u << 24) - 1;
-
 ////////////////////////////////////////////
 // Utility functions
 ////////////////////////////////////////////
@@ -46,8 +42,10 @@ Value createMemDescToI32(RewriterBase &rewriter, Location loc,
   auto offset = smemObj.getShmemOffset(loc, rewriter, memDescTy);
   auto elemSize = srcElemTy.getIntOrFloatBitWidth() / 8;
   offset = b.mul(offset, b.i32_val(elemSize));
-  return b.and_(b.add(offset, b.ptrtoint(i32Ty, smemObj.getBase())),
-                b.i32_val(kSharedMemoryObjectMask));
+  Value base = b.ptrtoint(i32Ty, smemObj.getBase());
+  Value address = b.add(offset, base);
+  Value mask = b.i32_val(tti::kSharedMemoryObjectMask);
+  return b.and_(address, mask);
 }
 
 ////////////////////////////////////////////
@@ -123,7 +121,7 @@ struct BufferDescriptorsOpConversion
 
     SmallVector<uint64_t> maskVals(offsets.size(),
                                    op.getMemType() == tti::MemType::SHARED_MEM
-                                       ? kSharedMemoryObjectMask
+                                       ? tti::kSharedMemoryObjectMask
                                        : 0xffffffffu);
     Value maskTensor =
         createInitializedIntArrayTensor(rewriter, loc, encoding, maskVals);
@@ -352,7 +350,7 @@ public:
 
     Value address = b.add(base, b.i32_val(op.getOffset()));
     if (op.getMemType() == tti::MemType::SHARED_MEM)
-      address = b.and_(address, b.i32_val(kSharedMemoryObjectMask));
+      address = b.and_(address, b.i32_val(tti::kSharedMemoryObjectMask));
     rewriter.replaceOp(op, address);
     return success();
   }
@@ -449,7 +447,8 @@ struct LocalGatherOpConversion
     Type llvmElemTy = typeConverter->convertType(memDescTy.getElementType());
     auto smemObj = LLVM::getSharedMemoryObjectFromStruct(loc, adaptor.getSrc(),
                                                          llvmElemTy, rewriter);
-    auto idxValues = unpackLLElements(loc, adaptor.getIndices(), rewriter);
+    auto idxValues = unpackTensorElements(loc, adaptor.getIndices(), rewriter,
+                                          op.getIndices().getType());
     SmallVector<Value> offsets(adaptor.getOffsets());
 
     auto offsetAndBlock = computeLocalOffsetsWithLogicalOffsets(
@@ -463,7 +462,8 @@ struct LocalGatherOpConversion
           return targetInfo.loadDShared(rewriter, loc, addr.ptr, addr.ctaId,
                                         llvmElemTy, b.true_val());
         });
-    Value result = packLLElements(loc, typeConverter, results, rewriter, regTy);
+    Value result =
+        packTensorElements(loc, typeConverter, results, rewriter, regTy);
 
     rewriter.replaceOp(op, result);
     return success();

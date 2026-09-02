@@ -163,9 +163,7 @@ def test_hip_jit_proxy_accepts_fixed_compiler_options(monkeypatch):
 
     with force_dispatcher():
         # Populate the compiled-kernel and C specialization caches.
-        _disp_add[(17, )](
-            x, y, out, N, BLOCK=BLOCK, num_warps=4, waves_per_eu=0
-        )
+        _disp_add[(17, )](x, y, out, N, BLOCK=BLOCK, num_warps=4, waves_per_eu=0)
         torch.cuda.synchronize()
 
         # Use a fresh static-grid proxy with the same specialization. If the
@@ -175,9 +173,7 @@ def test_hip_jit_proxy_accepts_fixed_compiler_options(monkeypatch):
             raise AssertionError("fixed compiler options fell back to JITFunction.run")
 
         monkeypatch.setattr(_disp_add, "run", fail_python_dispatch)
-        _disp_add[(19, )](
-            x, y, out, N, BLOCK=BLOCK, num_warps=4, waves_per_eu=0
-        )
+        _disp_add[(19, )](x, y, out, N, BLOCK=BLOCK, num_warps=4, waves_per_eu=0)
 
     torch.cuda.synchronize()
     torch.testing.assert_close(out, x + y)

@@ -61,11 +61,12 @@ struct ConvertLayoutOpConversion
       return op.emitError("ConvertLayoutOp  supports GenericLinearEncoding "
                           " only when the conversion is transfer between "
                           "values in the same thread.");
-    bool alwaysUseWarpShuffle = cvtAlwaysUseWarpShuffle(op);
+    FailureOr<bool> alwaysUseWarpShuffle = cvtAlwaysUseWarpShuffle(op);
+    if (failed(alwaysUseWarpShuffle))
+      return failure();
     assert(to_vector(conversion.getInDimNames()) ==
            to_vector(conversion.getOutDimNames()));
     if (llvm::is_contained(dims, kBlock) || llvm::is_contained(dims, kWarp)) {
-      assert(!alwaysUseWarpShuffle);
       // Transfer between values in the same CTA, or across CTAs. We move values
       // through (distributed) shared memory.
       transferSwizzlingLocalMem(op, adaptor.getSrc(), rewriter);
@@ -74,7 +75,7 @@ struct ConvertLayoutOpConversion
       // Case 3. Transfer between values in the same warp, in which case we try
       //         to move values using warp shuffles, though if the pattern is
       //         expensive enough we fall back to using shared memory
-      if (cvtNeedsWarpShuffle(srcTy, dstTy) || alwaysUseWarpShuffle)
+      if (cvtNeedsWarpShuffle(srcTy, dstTy) || *alwaysUseWarpShuffle)
         return transferWithinWarp(op, adaptor, rewriter);
 
       transferSwizzlingLocalMem(op, adaptor.getSrc(), rewriter);
@@ -120,16 +121,15 @@ struct ConvertLayoutOpConversion
     auto kRegister = str_attr("register");
     assert(!cvtNeedsSharedMemory(op.getSrc().getType(), op.getType()));
 
-    auto srcTy = op.getSrc().getType();
-    auto dstTy = op.getType();
-    auto inVals = unpackLLElements(loc, adaptor.getSrc(), rewriter);
+    auto inVals = unpackTensorElements(loc, adaptor.getSrc(), rewriter,
+                                       op.getSrc().getType());
     SmallVector<Value> outVals(conversion.getInDimSize(kRegister));
     for (int i = 0; i < outVals.size(); i++) {
       auto srcIdx = conversion.apply({{kRegister, i}}).begin()->second;
       outVals[i] = inVals[srcIdx];
     }
-    Value result = packLLElements(loc, getTypeConverter(), outVals, rewriter,
-                                  op.getType());
+    Value result = packTensorElements(loc, getTypeConverter(), outVals,
+                                      rewriter, op.getType());
     rewriter.replaceOp(op, result);
     return success();
   }
@@ -165,7 +165,8 @@ struct ConvertLayoutOpConversion
     std::pair<Value, Value> coordinates = distributedCoordinates
                                               ? *distributedCoordinates
                                               : getLaneAndWarpId(rewriter, loc);
-    auto [laneId, warpId] = coordinates;
+    Value laneId = coordinates.first;
+    Value warpId = coordinates.second;
     auto elemPtrTy = ptr_ty(ctx, targetInfo.getSharedAddressSpace());
     smemBase = b.bitcast(smemBase, elemPtrTy);
 
@@ -374,7 +375,8 @@ struct ConvertLayoutOpConversion
       // Store
       lowerLdStShared(loc, ctx, storeCvt, tileInVals, llvmElemTy, smemBase,
                       /*paddingShifts=*/{}, affineOffset, maskSpanAffineOffset,
-                      rewriter, targetInfo,
+                      /*affineBlockOffset=*/Value(),
+                      /*maskSpanAffineBlock=*/0, rewriter, targetInfo,
                       /*maybeMaxVecElems=*/{},
                       /*localLoadOp=*/nullptr,
                       /*ctaRank=*/{},
@@ -383,7 +385,8 @@ struct ConvertLayoutOpConversion
       // Load
       auto tileOutVals = lowerLdStShared(
           loc, ctx, loadCvt, {}, llvmElemTy, smemBase, /*paddingShifts=*/{},
-          affineOffset, maskSpanAffineOffset, rewriter, targetInfo,
+          affineOffset, maskSpanAffineOffset, /*affineBlockOffset=*/Value(),
+          /*maskSpanAffineBlock=*/0, rewriter, targetInfo,
           /*maybeMaxVecElems=*/{},
           /*localLoadOp=*/nullptr,
           /*ctaRank=*/{},
@@ -405,11 +408,13 @@ struct ConvertLayoutOpConversion
 
     auto srcLayout = toLinearLayout(srcTy);
     auto dstLayout = toLinearLayout(dstTy);
+    srcLayout = srcLayout.removeZeroBasesAlongDim(str_attr("register"));
+    dstLayout = dstLayout.removeZeroBasesAlongDim(str_attr("register"));
 
     auto llvmElemTy = getTypeConverter()->convertType(srcTy.getElementType());
     auto smemBase =
         LLVM::getSharedMemoryBase(loc, rewriter, targetInfo, op.getOperation());
-    auto inVals = unpackLLElements(loc, src, rewriter);
+    auto inVals = unpackUniqueTensorElements(loc, src, rewriter);
 
     std::optional<std::pair<Value, Value>> distributedCoordinates;
     if (op->hasAttr("tlx.rematerialize_coordinates")) {
@@ -423,8 +428,8 @@ struct ConvertLayoutOpConversion
         loc, rewriter, srcLayout, dstLayout, inVals, llvmElemTy, smemBase, op,
         distributedCoordinates);
 
-    Value result =
-        packLLElements(loc, getTypeConverter(), outVals, rewriter, dstTy);
+    Value result = packUniqueTensorElements(loc, getTypeConverter(), outVals,
+                                            rewriter, dstTy);
     rewriter.replaceOp(op, result);
   }
 
@@ -467,13 +472,7 @@ struct ConvertLayoutOpConversion
     // Here, R denotes the number of 32-bit registers in use after packing (or
     // splitting, if applied to 64-bit types or pointers), and in the `Swap`
     // method, `m` denotes the number of mixed transpositions passed in.
-    auto inVals = unpackLLElements(loc, adaptor.getSrc(), rewriter);
-
-    // To avoid unnecessary data movement, we remove any broadcasting in the
-    // register dimension from the `inVals`.
-    auto srcLayout = toLinearLayout(srcTy);
-    auto removeBroadcastSrc = actionRemoveBroadcastedRegs(srcLayout);
-    inVals = removeBroadcastSrc.apply(inVals);
+    auto inVals = unpackUniqueTensorElements(loc, adaptor.getSrc(), rewriter);
 
     // If the target layout has a larger register dimension than the source
     // layout, then we broadcast along the register dimension to match size. The
@@ -575,16 +574,11 @@ struct ConvertLayoutOpConversion
     // If `dstLayout` has a smaller `kReg` dimension than `srcLayout` after
     // broadcasting is removed, then drop the extra registers from `outVals`.
     auto dstLayout = toLinearLayout(dstTy);
-    auto removeBroadcastDst = actionRemoveBroadcastedRegs(dstLayout);
-    auto strippedDstLayout = removeBroadcastDst.apply(dstLayout);
+    auto strippedDstLayout = dstLayout.removeZeroBasesAlongDim(kReg);
     outVals.resize(strippedDstLayout.getInDimSize(kReg));
 
-    // Introduce broadcasting in registers if expected by `dstLayout`.
-    if (!removeBroadcastDst.isIdentity())
-      outVals = broadcastAs(outVals, dstLayout);
-
-    Value result = packLLElements(loc, getTypeConverter(), outVals, rewriter,
-                                  op.getType());
+    Value result = packUniqueTensorElements(loc, getTypeConverter(), outVals,
+                                            rewriter, dstTy);
     rewriter.replaceOp(op, result);
     return success();
   }

@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <vector>
 
 #include "triton/Dialect/Triton/IR/Utility.h"
@@ -1429,10 +1430,31 @@ LinearLayout toLinearLayout(RankedTensorType type) {
 }
 
 LinearLayout toLinearLayout(MemDescType type) {
-  // Pass in the allocation shape. Then when using invertAndCompose it will
-  // trim the allocationShape to the shape if they are different.
-  // We also remove the first dimension of the allocationShape if there was a
-  // call to memdesc_index
+  // For TMEM we instantiate the subview directly. This is possible
+  // as TMEM has no swizzling.
+  if (isa<TensorMemoryEncodingAttr, TensorMemoryScalesEncodingAttr>(
+          type.getEncoding())) {
+    auto shape = type.getShape().take_back(2);
+    auto allocShape = type.getAllocShape().take_back(2);
+    auto ll = toLinearLayout(allocShape, type.getEncoding());
+    auto outDims = llvm::to_vector(ll.getOutDimNames());
+    // Trim the shape
+    for (auto [dim, size] : llvm::zip_equal(outDims, shape))
+      ll = ll.resizeOutDim(dim, size);
+
+    auto kCol = StringAttr::get(type.getContext(), "col");
+    int nColBases = ll.getInDimSizeLog2(kCol);
+    int bitwidth = type.getElementType().getIntOrFloatBitWidth();
+    int minColBases = llvm::Log2_32(32 / bitwidth);
+    while (nColBases > minColBases &&
+           llvm::all_of(ll.getBasis(kCol, nColBases - 1),
+                        [](int32_t v) { return v == 0; }))
+      --nColBases;
+    return ll.resizeInDim(kCol, 1u << nColBases);
+  }
+  // Shared memory needs the allocation shape so that invertAndCompose can trim
+  // subviews. We also remove the first dimension of the allocation shape if
+  // there was a call to memdesc_index.
   auto shape = type.getAllocShape().take_back(type.getRank());
   return toLinearLayout(shape, type.getEncoding());
 }
@@ -1453,6 +1475,31 @@ LinearLayout toLinearLayout(ArrayRef<int64_t> shape, Attribute layout) {
   auto *ctx = layout.getContext();
   return ctx->getLoadedDialect<TritonGPUDialect>()->toLinearLayout(shape,
                                                                    layout);
+}
+
+bool isLayoutEquivalentIgnoringRegisterOrder(const LinearLayout &lhs,
+                                             const LinearLayout &rhs) {
+  if (lhs.getOutDims() != rhs.getOutDims() ||
+      lhs.getBases().size() != rhs.getBases().size())
+    return false;
+
+  for (auto [lhsDim, rhsDim] : llvm::zip(lhs.getBases(), rhs.getBases())) {
+    if (lhsDim.first != rhsDim.first)
+      return false;
+    if (lhsDim.first.getValue() != "register") {
+      if (lhsDim.second != rhsDim.second)
+        return false;
+      continue;
+    }
+
+    auto lhsRegisterBases = lhsDim.second;
+    auto rhsRegisterBases = rhsDim.second;
+    std::sort(lhsRegisterBases.begin(), lhsRegisterBases.end());
+    std::sort(rhsRegisterBases.begin(), rhsRegisterBases.end());
+    if (lhsRegisterBases != rhsRegisterBases)
+      return false;
+  }
+  return true;
 }
 
 LinearLayout paddedLinearLayout(ArrayRef<int64_t> shape, Attribute encoding) {

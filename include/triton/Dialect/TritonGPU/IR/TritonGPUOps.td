@@ -43,6 +43,26 @@ def TTG_ConvertLayoutOp
   let assemblyFormat = "$src attr-dict `:` type($src) `->` type($result)";
 }
 
+def TTG_RequireLayoutOp
+    : TTG_Op<"require_layout", [SameOperandsAndResultShape,
+                                SameOperandsAndResultElementType, Pure]> {
+  let summary = "preserve a user-requested layout boundary";
+
+  let description = [{
+    `ttg.require_layout` is a semantic layout boundary produced from a
+    source-level pinned layout request. Unlike `ttg.convert_layout`, it must not
+    be treated as a transparent cast by layout canonicalization or
+    rematerialization. Layout optimization may insert conversions around it, but
+    the boundary itself is retired only after those passes have run.
+  }];
+
+  let arguments = (ins TT_Tensor:$src);
+
+  let results = (outs TT_Tensor:$result);
+
+  let assemblyFormat = "$src attr-dict `:` type($src) `->` type($result)";
+}
+
 def TTG_AsyncWaitOp : TTG_Op<"async_wait", [MemWaitOpTrait]> {
   let summary = "Ensure all specified async_copy_* operations are complete.";
   let description = [{
@@ -50,7 +70,7 @@ def TTG_AsyncWaitOp : TTG_Op<"async_wait", [MemWaitOpTrait]> {
     It takes zero or more `asyncToken` plus an integer `num` that specifies how many async copy groups can remain
     outstanding after the `async_wait` op is completed. `num = 0` waits until all groups of async copies are complete.
 
-    This operation does not provide any syncronisation in the CTA, if syncronisation is needed use `ttg.local_barrier`
+    This operation does not provide any synchronization in the CTA, if synchronization is needed use `ttg.local_barrier`
     in addition to this operation.
   }];
 
@@ -299,6 +319,32 @@ def TTG_MemDescSubsliceOp
   let results = (outs TTG_MemDescType:$result);
 
   let hasFolder = 1;
+  let hasVerifier = 1;
+}
+
+def TTG_MemDescDynamicSubsliceOp
+    : TTG_Op<"memdesc_dynamic_subslice", [Pure, MemDescViewTrait]> {
+  let summary = "take a runtime-offset subview of a shared-memory descriptor";
+
+  let description = [{
+    This operation returns a descriptor for a same-rank subview whose logical
+    offsets are runtime i32 values.  It is the dynamic counterpart of
+    `ttg.memdesc_subslice`.  The caller must guarantee that runtime offsets
+    keep the result in bounds and satisfy the same tile-alignment contract as
+    static subslice offsets; violating either condition is undefined behavior.
+
+    Dynamic partition selection is not supported, so partitioned shared
+    encodings are rejected by the verifier.
+  }];
+
+  let arguments = (ins TTG_MemDescType:$src, Variadic<I32>:$offsets);
+  let results = (outs TTG_MemDescType:$result);
+
+  let assemblyFormat = [{
+    $src `[` $offsets `]` attr-dict `:` qualified(type($src))
+    `->` qualified(type($result))
+  }];
+
   let hasVerifier = 1;
 }
 
@@ -713,6 +759,7 @@ def TTG_WarpSpecializeOp
   let arguments = (ins DenseI32ArrayAttr:$partitionNumWarps,
       OptionalAttr<DenseI32ArrayAttr>:$warpGroupStartIds,
       OptionalAttr<DenseI32ArrayAttr>:$requestedRegisters,
+      OptionalAttr<I32Attr>:$defaultRequestedRegisters,
       OptionalAttr<DenseI32ArrayAttr>:$actualRegisters);
   let results = (outs Variadic<AnyType>:$defaultPassthrough);
 
@@ -803,6 +850,49 @@ def TTG_WarpReturnOp
   let assemblyFormat = "attr-dict";
 }
 
+def TTG_WarpPredicateOp : TTG_Op<"warp_predicate", [
+  RecursiveMemoryEffects, RecursivelySpeculatable
+]> {
+  let summary = "run a region under a per-lane predicate";
+  let description = [{
+    Executes `$region` with the per-thread execution mask restricted to lanes
+    where `$predicate` is true. A scalar predicate supplies the execution bit
+    for the current physical lane. For a tensor predicate, all elements owned
+    by one lane are OR-reduced to its execution bit. If no lane in a wavefront
+    has the predicate set, the region is skipped for that wavefront without
+    cross-warp synchronization. Lanes where that bit is false keep the
+    corresponding `$inits` value. The region implicitly captures values from
+    above and is terminated by `ttg.predicate_yield`.
+
+    The region must contain exactly one block and may not contain nested
+    dynamic control flow. Cross-lane operations require `wave_uniform`, which
+    declares that every lane in each wavefront observes the same predicate.
+    Reductions spanning multiple warps remain unsupported. Other operations
+    with nested regions are rejected. Each init, result, and yielded value at
+    a given position must have the same type. A tensor predicate must have the
+    same leading logical shape and lane ownership as every tensor carried
+    through the region.
+  }];
+
+  let arguments = (ins TT_BoolLike:$predicate, Variadic<AnyType>:$inits,
+                       OptionalAttr<UnitAttr>:$wave_uniform);
+  let results = (outs Variadic<AnyType>:$results);
+  let regions = (region SizedRegion<1>:$region);
+
+  let assemblyFormat = [{
+    $predicate `(` $inits `)` $region attr-dict `:` functional-type(operands, results)
+  }];
+  let hasVerifier = 1;
+}
+
+def TTG_PredicateYieldOp : TTG_Op<"predicate_yield", [
+  Pure, Terminator, ReturnLike, HasParent<"WarpPredicateOp">
+]> {
+  let summary = "yield values from a ttg.warp_predicate region";
+  let arguments = (ins Variadic<AnyType>:$values);
+  let assemblyFormat = "($values^)? attr-dict (`:` type($values)^)?";
+}
+
 def TTG_Clock64Op
     : TTG_Op<"clock64", [MemoryEffects<[MemRead<DefaultResource>,
                                         MemWrite<DefaultResource>]>]> {
@@ -818,17 +908,17 @@ def TTG_BarrierOp : TTG_Op<"barrier"> {
     The `barrier` op synchronises the execution and all operations between the selected address spaces for all
     threads in the CTA. It is used to coordinate communication between threads in the CTA.
 
-    This operation waits until all threads in the CTA have reached a `barrier` (for syncronisation) and operations
+    This operation waits until all threads in the CTA have reached a `barrier` (for synchronization) and operations
     between the selected address spaces made by these threads prior to the op are visible to all threads in the CTA.
 
     Data hazards between threads accessing the same memory can be avoided by synchronising the
     specified scope in-between these accesses with a `barrier`.
 
-    A `barrier` operation only provides syncronisation and memory guarantees on the selected address spaces in the CTA.
+    A `barrier` operation only provides synchronization and memory guarantees on the selected address spaces in the CTA.
 
     The mandatory `addrspace` attribute is a bitmask describing which address spaces will be visible when the `barrier` completes:
 
-    * `none`         control-only syncronisation (no memory ordering).
+    * `none`         control-only synchronization (no memory ordering).
     * `local`        shared-memory operations are complete and visible CTA-wide.
     * `global_read`  global memory reads are complete and visible CTA-wide.
     * `global_write` global memory writes are complete and visible CTA-wide.
@@ -879,6 +969,24 @@ def TTG_WarpIdOp : TTG_Op<"warp_id", [Pure]> {
   let results = (outs I32:$result);
 
   let assemblyFormat = "attr-dict";
+}
+
+def TTG_WarpVoteOp : TTG_Op<"warp_vote", [Pure]> {
+  let summary = "Reduce one predicate per lane to a warp-uniform boolean";
+
+  let description = [{
+    Each lane contributes its single distributed `i1` value. The uniform i1
+    result is the logical `all` or `any` reduction across the physical warp,
+    selected by `kind`.
+
+    The predicate tensor must distribute exactly one element to each lane.
+  }];
+
+  let arguments = (ins TT_BoolTensor:$pred, StrAttr:$kind);
+  let results = (outs I1:$result);
+
+  let assemblyFormat = "$pred $kind attr-dict `:` type($pred) `->` type($result)";
+  let hasVerifier = 1;
 }
 
 #endif // TRITONGPU_OPS

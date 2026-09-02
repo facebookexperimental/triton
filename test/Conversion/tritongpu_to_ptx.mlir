@@ -1,9 +1,9 @@
-// RUN: triton-opt %s --allocate-shared-memory-nv='compute-capability=90 ptx-version=83' --convert-triton-gpu-to-llvm='compute-capability=90 ptx-version=83' --convert-nv-gpu-to-llvm | mlir-translate --mlir-to-llvmir | opt -O3 -S | llc -mtriple nvptx64-nvidia-cuda -mcpu=sm_90 -mattr=+ptx83 | FileCheck --check-prefixes CHECK,SM90 --dump-input-context=20 %s
-// RUN: triton-opt %s --allocate-shared-memory-nv='compute-capability=80 ptx-version=83' --convert-triton-gpu-to-llvm='compute-capability=80 ptx-version=83' --convert-nv-gpu-to-llvm | mlir-translate --mlir-to-llvmir | opt -O3 -S | llc -mtriple nvptx64-nvidia-cuda -mcpu=sm_80 -mattr=+ptx83 | FileCheck --check-prefixes CHECK,SM80 --dump-input-context=20 %s
-// RUN: triton-opt %s --allocate-shared-memory-nv='compute-capability=100 ptx-version=87' --convert-triton-gpu-to-llvm='compute-capability=100 ptx-version=87' --convert-nv-gpu-to-llvm | mlir-translate --mlir-to-llvmir | opt -O3 -S | llc -mtriple nvptx64-nvidia-cuda -mcpu=sm_100 -mattr=+ptx87 | FileCheck --check-prefixes CHECK,SM100 --dump-input-context=20 %s
-// RUN: triton-opt %s --convert-triton-gpu-to-llvm='compute-capability=80 ptx-version=83' -cse | FileCheck --check-prefix=VEC80 --dump-input-context=20 %s
-// RUN: triton-opt %s --convert-triton-gpu-to-llvm='compute-capability=90 ptx-version=83' -cse | FileCheck --check-prefix=VEC90 --dump-input-context=20 %s
-// RUN: triton-opt %s --convert-triton-gpu-to-llvm='compute-capability=100 ptx-version=87' -cse | FileCheck --check-prefix=VEC100 --dump-input-context=20 %s
+// RUN: triton-opt %s --allocate-shared-memory-nv='compute-capability=90 ptx-version=83' --convert-triton-gpu-to-llvm='compute-capability=90 ptx-version=83 enable-tree-reduction=true' --convert-nv-gpu-to-llvm | mlir-translate --mlir-to-llvmir | opt -O3 -S | llc -mtriple nvptx64-nvidia-cuda -mcpu=sm_90 -mattr=+ptx83 | FileCheck --check-prefixes CHECK,SM90 --dump-input-context=20 %s
+// RUN: triton-opt %s --allocate-shared-memory-nv='compute-capability=80 ptx-version=83' --convert-triton-gpu-to-llvm='compute-capability=80 ptx-version=83 enable-tree-reduction=true' --convert-nv-gpu-to-llvm | mlir-translate --mlir-to-llvmir | opt -O3 -S | llc -mtriple nvptx64-nvidia-cuda -mcpu=sm_80 -mattr=+ptx83 | FileCheck --check-prefixes CHECK,SM80 --dump-input-context=20 %s
+// RUN: triton-opt %s --allocate-shared-memory-nv='compute-capability=100 ptx-version=87' --convert-triton-gpu-to-llvm='compute-capability=100 ptx-version=87 enable-tree-reduction=true' --convert-nv-gpu-to-llvm | mlir-translate --mlir-to-llvmir | opt -O3 -S | llc -mtriple nvptx64-nvidia-cuda -mcpu=sm_100 -mattr=+ptx87 | FileCheck --check-prefixes CHECK,SM100 --dump-input-context=20 %s
+// RUN: triton-opt %s --convert-triton-gpu-to-llvm='compute-capability=80 ptx-version=83 enable-tree-reduction=true' -cse | FileCheck --check-prefix=VEC80 --dump-input-context=20 %s
+// RUN: triton-opt %s --convert-triton-gpu-to-llvm='compute-capability=90 ptx-version=83 enable-tree-reduction=true' -cse | FileCheck --check-prefix=VEC90 --dump-input-context=20 %s
+// RUN: triton-opt %s --convert-triton-gpu-to-llvm='compute-capability=100 ptx-version=87 enable-tree-reduction=true' -cse | FileCheck --check-prefix=VEC100 --dump-input-context=20 %s
 
 
 #blocked = #ttg.blocked<{sizePerThread = [8], threadsPerWarp = [32], warpsPerCTA = [2], order = [0]}>
@@ -86,6 +86,52 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 2 : i32, "ttg.thr
     %2 = tt.splat %ptr : !tt.ptr<f16> -> tensor<256x!tt.ptr<f16>, #blocked>
     %3 = tt.addptr %2, %1 : tensor<256x!tt.ptr<f16>, #blocked>, tensor<256xi32, #blocked>
     tt.store %3, %0 : tensor<256x!tt.ptr<f16>, #blocked>
+    tt.return
+  }
+
+  // CHECK-LABEL: atomic_poll_relaxed_gpu
+  // CHECK: ld.relaxed.gpu.global.b32
+  // CHECK-NOT: fence.acquire
+  tt.func public @atomic_poll_relaxed_gpu(%ptr: !tt.ptr<i32>, %expected: i32, %out: !tt.ptr<i32>) {
+    %matched = tt.atomic_poll relaxed, gpu, %ptr, %expected {allocation.offset = 0 : i32} : !tt.ptr<i32>, i32 -> i1
+    %result = arith.extui %matched : i1 to i32
+    tt.store %out, %result : !tt.ptr<i32>
+    tt.return
+  }
+
+  // CHECK-LABEL: atomic_poll_acquire_cta
+  // CHECK: ld.relaxed.cta.global.b32
+  // SM80: fence.acq_rel.cta
+  // SM90: fence.acq_rel.cta
+  // SM100: fence.acquire.cta
+  tt.func public @atomic_poll_acquire_cta(%ptr: !tt.ptr<i32>, %expected: i32, %out: !tt.ptr<i32>) {
+    %matched = tt.atomic_poll acquire, cta, %ptr, %expected {allocation.offset = 0 : i32} : !tt.ptr<i32>, i32 -> i1
+    %result = arith.extui %matched : i1 to i32
+    tt.store %out, %result : !tt.ptr<i32>
+    tt.return
+  }
+
+  // CHECK-LABEL: atomic_poll_acquire_gpu
+  // CHECK: ld.relaxed.gpu.global.b32
+  // SM80: fence.acq_rel.gpu
+  // SM90: fence.acq_rel.gpu
+  // SM100: fence.acquire.gpu
+  tt.func public @atomic_poll_acquire_gpu(%ptr: !tt.ptr<i32>, %expected: i32, %out: !tt.ptr<i32>) {
+    %matched = tt.atomic_poll acquire, gpu, %ptr, %expected {allocation.offset = 0 : i32} : !tt.ptr<i32>, i32 -> i1
+    %result = arith.extui %matched : i1 to i32
+    tt.store %out, %result : !tt.ptr<i32>
+    tt.return
+  }
+
+  // CHECK-LABEL: atomic_poll_acquire_sys
+  // CHECK: ld.relaxed.sys.global.b32
+  // SM80: fence.acq_rel.sys
+  // SM90: fence.acq_rel.sys
+  // SM100: fence.acquire.sys
+  tt.func public @atomic_poll_acquire_sys(%ptr: !tt.ptr<i32>, %expected: i32, %out: !tt.ptr<i32>) {
+    %matched = tt.atomic_poll acquire, sys, %ptr, %expected {allocation.offset = 0 : i32} : !tt.ptr<i32>, i32 -> i1
+    %result = arith.extui %matched : i1 to i32
+    tt.store %out, %result : !tt.ptr<i32>
     tt.return
   }
 

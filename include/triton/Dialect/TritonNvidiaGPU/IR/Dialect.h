@@ -79,7 +79,11 @@ PackedArithInstructionSpec getPackedArithInstructionSpec(PackedArithOp op);
 unsigned getPackedArithFp4Axis(PackedArithOp op);
 
 constexpr static char AttrTwoCTAsName[] = "ttng.two-ctas";
+constexpr static char AttrTwoCTALoadName[] = "two_cta_load";
 
+/// Whether the kernel issues paired-CTA (`cta_group::2`) MMA. This is not the
+/// same question as whether it runs on a cluster, which is
+/// `triton::gpu::isPhysicalCluster`.
 inline bool getModuleTwoCTAs(ModuleOp mod) {
   auto attr = mod->getAttrOfType<BoolAttr>(AttrTwoCTAsName);
   return attr ? attr.getValue() : false;
@@ -87,21 +91,6 @@ inline bool getModuleTwoCTAs(ModuleOp mod) {
 
 inline bool getModuleTwoCTAs(Operation *op) {
   return getModuleTwoCTAs(op->getParentOfType<ModuleOp>());
-}
-
-/// Check if any cluster dimension >= 2 (2-CTA mode).
-inline bool is2CTA(ModuleOp mod) {
-  for (auto name :
-       {"ttg.cluster-dim-x", "ttg.cluster-dim-y", "ttg.cluster-dim-z"}) {
-    if (auto attr = mod->getAttrOfType<IntegerAttr>(name))
-      if (attr.getInt() >= 2)
-        return true;
-  }
-  return false;
-}
-
-inline bool is2CTA(Operation *op) {
-  return is2CTA(op->getParentOfType<ModuleOp>());
 }
 
 // Returns the required ordering of repeated TMEM scale blocks for one
@@ -160,7 +149,8 @@ LinearLayout getTileLayout(MLIRContext *ctx, TMemAccessAtom atom, bool unpacked,
 
 TMemAllocation getTmemAllocSizes(gpu::MemDescType memDescType);
 
-uint32_t getTMemSubSliceOffset(gpu::MemDescType memDescType, int32_t nOffset);
+uint32_t getTMemSubSliceOffset(gpu::MemDescType memDescType, int32_t offset,
+                               int32_t dim);
 
 SmallVector<gpu::DistributedEncodingTrait>
 getTmemCompatibleLayouts(gpu::MemDescType memType, unsigned numWarps,

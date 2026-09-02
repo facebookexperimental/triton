@@ -1,0 +1,366 @@
+:root {
+  color-scheme: light dark;
+  --bg: #0b1020;
+  --surface: #121a2d;
+  --surface-2: #18233b;
+  --text: #e8edf7;
+  --muted: #a7b1c4;
+  --line: #2b3854;
+  --accent: #4599ff;
+  --accent-2: #9fb5ff;
+  --brand-bg: #1877f2;
+  --brand-fg: #ffffff;
+  --code: #080c17;
+  --max-width: 920px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  margin: 0;
+  background:
+    radial-gradient(circle at 80% -20%, rgb(62 90 150 / 25%), transparent 35rem),
+    var(--bg);
+  color: var(--text);
+  font: 16px/1.65 Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+a {
+  color: var(--accent-2);
+  text-decoration-thickness: 1px;
+  text-underline-offset: 0.18em;
+}
+
+a:hover {
+  color: var(--accent);
+}
+
+.topbar {
+  align-items: center;
+  backdrop-filter: blur(14px);
+  background: rgb(11 16 32 / 88%);
+  border-bottom: 1px solid var(--line);
+  display: grid;
+  gap: 24px;
+  grid-template-columns: 1fr auto 1fr;
+  height: 68px;
+  padding: 0 32px;
+  position: sticky;
+  top: 0;
+  z-index: 10;
+}
+
+.brand {
+  color: var(--text);
+  font-size: 0.95rem;
+  font-weight: 650;
+  text-decoration: none;
+}
+
+.brand span {
+  background: var(--brand-bg);
+  border-radius: 6px;
+  color: var(--brand-fg);
+  display: inline-block;
+  font-weight: 850;
+  letter-spacing: 0.04em;
+  padding: 2px 9px;
+}
+
+.repo-link {
+  color: var(--muted);
+  font-size: 0.9rem;
+  justify-self: end;
+  text-decoration: none;
+}
+
+.topnav {
+  display: flex;
+  gap: 4px;
+}
+
+.topnav a {
+  border-radius: 7px;
+  color: var(--muted);
+  font-size: 0.9rem;
+  font-weight: 650;
+  padding: 7px 12px;
+  text-decoration: none;
+}
+
+.topnav a:hover,
+.topnav a[data-current="true"] {
+  background: var(--surface-2);
+  color: var(--text);
+}
+
+.shell {
+  display: grid;
+  grid-template-columns: 250px minmax(0, var(--max-width));
+  gap: 56px;
+  justify-content: center;
+  padding: 54px 34px 100px;
+}
+
+.shell.no-sidebar {
+  grid-template-columns: minmax(0, var(--max-width));
+}
+
+.sidebar {
+  align-self: start;
+  max-height: calc(100vh - 132px);
+  overflow-y: auto;
+  padding-bottom: 16px;
+  position: sticky;
+  top: 112px;
+}
+
+.eyebrow {
+  color: var(--accent);
+  font-size: 0.86rem;
+  font-weight: 700;
+  letter-spacing: 0.09em;
+  margin: 0 0 10px;
+  text-transform: uppercase;
+}
+
+.sidebar nav {
+  border-left: 1px solid var(--line);
+  display: grid;
+}
+
+.sidebar nav a {
+  color: var(--muted);
+  font-size: 0.9rem;
+  padding: 7px 0 7px 18px;
+  text-decoration: none;
+}
+
+.sidebar nav a[aria-current="page"] {
+  border-left: 2px solid var(--accent);
+  color: var(--text);
+  font-weight: 700;
+  margin-left: -1px;
+}
+
+.sidebar nav a.sub {
+  font-size: 0.82rem;
+  opacity: 0.85;
+  padding: 4px 0 4px 32px;
+}
+
+main {
+  min-width: 0;
+}
+
+main > h1 {
+  font-size: clamp(1.9rem, 3.2vw, 2.6rem);
+  letter-spacing: -0.02em;
+  line-height: 1.15;
+  margin: 0;
+  max-width: 850px;
+}
+
+.lede {
+  color: var(--muted);
+  font-size: 1.08rem;
+  line-height: 1.55;
+  margin: 14px 0 40px;
+  max-width: 700px;
+}
+
+article h1 {
+  font-size: 2rem;
+  margin-top: 2.5rem;
+}
+
+article h2 {
+  border-top: 1px solid var(--line);
+  font-size: 1.65rem;
+  margin-top: 3.6rem;
+  padding-top: 1.5rem;
+}
+
+article h3 {
+  color: #d5def0;
+  font-size: 1.2rem;
+  margin-top: 2.5rem;
+}
+
+article h4 {
+  color: #c7d1e5;
+  font-size: 1rem;
+  margin-top: 2rem;
+}
+
+article p {
+  max-width: 78ch;
+}
+
+blockquote {
+  background: var(--surface);
+  border-left: 3px solid var(--accent);
+  border-radius: 0 8px 8px 0;
+  color: var(--muted);
+  margin: 1.5rem 0;
+  padding: 12px 18px;
+}
+
+blockquote p {
+  margin: 0;
+}
+
+code {
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  font: 0.88em/1.4 "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  padding: 0.1em 0.35em;
+}
+
+pre {
+  background: var(--code);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  box-shadow: 0 14px 40px rgb(0 0 0 / 18%);
+  line-height: 1.5;
+  margin: 1.4rem 0;
+  overflow-x: auto;
+  padding: 18px 20px;
+}
+
+pre code {
+  background: transparent;
+  border: 0;
+  padding: 0;
+}
+
+.list-item {
+  display: grid;
+  gap: 10px;
+  grid-template-columns: 12px minmax(0, 1fr);
+  margin: 0.5rem 0;
+  max-width: 78ch;
+}
+
+.list-item > span {
+  color: var(--accent);
+}
+
+.list-item.depth-1 {
+  margin-left: 1.5rem;
+}
+
+.list-item.depth-2,
+.list-item.depth-3 {
+  margin-left: 3rem;
+}
+
+table {
+  border-collapse: collapse;
+  display: block;
+  margin: 1.5rem 0;
+  max-width: 100%;
+  overflow-x: auto;
+  width: max-content;
+}
+
+th,
+td {
+  border: 1px solid var(--line);
+  padding: 9px 13px;
+  text-align: left;
+  vertical-align: top;
+}
+
+th {
+  background: var(--surface-2);
+}
+
+.pager {
+  border-top: 1px solid var(--line);
+  display: flex;
+  justify-content: space-between;
+  margin-top: 64px;
+  padding-top: 24px;
+}
+
+.pager .next {
+  margin-left: auto;
+}
+
+@media (max-width: 820px) {
+  .topbar {
+    gap: 10px;
+    padding: 0 18px;
+  }
+
+  .topnav {
+    gap: 0;
+  }
+
+  .topnav a {
+    font-size: 0.8rem;
+    padding: 6px 7px;
+  }
+
+  .repo-link {
+    font-size: 0;
+  }
+
+  .repo-link::after {
+    content: "GitHub ↗";
+    font-size: 0.9rem;
+  }
+
+  .shell {
+    display: block;
+    padding: 34px 20px 72px;
+  }
+
+  .sidebar {
+    max-height: none;
+    margin-bottom: 48px;
+    overflow: visible;
+    position: static;
+  }
+
+  .sidebar nav {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  main > h1 {
+    font-size: 2rem;
+  }
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg: #f7f9fc;
+    --surface: #fff;
+    --surface-2: #edf2f8;
+    --text: #172033;
+    --muted: #526079;
+    --line: #d8e0ec;
+    --accent: #1877f2;
+    --accent-2: #345dcc;
+    --brand-bg: #1877f2;
+    --brand-fg: #ffffff;
+    --code: #f0f4f9;
+  }
+
+  .topbar {
+    background: rgb(247 249 252 / 90%);
+  }
+
+  article h3,
+  article h4 {
+    color: var(--text);
+  }
+}

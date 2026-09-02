@@ -285,14 +285,31 @@ def test_async_tasks_region_error(device):
     assert "division by zero" in exc_msg, "\n\nExpected 'division by zero' but got: \n\n" + exc_msg + "\n\n"
 
 
-def test_default_task_rejects_registers():
-    """Specifying registers on the default async_task is banned because the
-    default always receives leftover registers from the partition budget."""
-    with pytest.raises(AssertionError, match="Cannot specify registers"):
-        tlx.async_task("default", registers=128)
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
+def test_default_task_register_budget(device):
 
-    with pytest.raises(AssertionError, match="Cannot specify registers"):
-        tlx.async_task("default", num_regs=128)
+    @triton.jit
+    def register_budget_kernel(default_out, worker_out):
+        with tlx.async_tasks():
+            with tlx.async_task("default", num_regs=80):
+                tl.store(default_out, 1)
+            with tlx.async_task(num_warps=4, num_regs=24):
+                tl.store(worker_out, 2)
+
+    default_out = torch.empty((), device=device, dtype=torch.int32)
+    worker_out = torch.empty((), device=device, dtype=torch.int32)
+    kernel = register_budget_kernel[(1, )](default_out, worker_out, num_warps=4)
+
+    ttgir = kernel.asm["ttgir"]
+    assert "defaultRequestedRegisters = 80 : i32" in ttgir
+    assert default_out.item() == 1
+    assert worker_out.item() == 2
+
+
+@pytest.mark.parametrize("kwargs", [{"num_regs": 128}, {"registers": 128}])
+def test_default_task_accepts_registers(kwargs):
+    task = tlx.async_task("default", **kwargs)
+    assert task.num_regs == 128
 
 
 @pytest.mark.parametrize(
@@ -302,9 +319,13 @@ def test_default_task_rejects_registers():
         {"registers": 25},
     ],
 )
-def test_async_task_rejects_unaligned_registers(kwargs):
+@pytest.mark.parametrize("task_args", [(), ("default", )])
+def test_async_task_rejects_unaligned_registers(kwargs, task_args):
     with pytest.raises(ValueError, match="divisible by 8"):
-        tlx.async_task(num_warps=1, **kwargs)
+        if task_args:
+            tlx.async_task(*task_args, **kwargs)
+        else:
+            tlx.async_task(num_warps=1, **kwargs)
 
 
 @pytest.mark.parametrize(

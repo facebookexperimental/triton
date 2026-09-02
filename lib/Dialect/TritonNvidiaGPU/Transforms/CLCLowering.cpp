@@ -20,6 +20,7 @@
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Transforms/RegionUtils.h"
 #include "third_party/nvidia/include/Dialect/NVGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
@@ -167,18 +168,42 @@ struct CLCMaterializePass
         replaceWhileOpWithNewSignature(b, whileOp, {zero}, {i32});
     whileOp->erase();
 
-    // Response buffer + completion mbarrier, allocated before the loop. The
-    // barrier ops take a single-buffer view of the (1-deep) barrier allocation.
-    // Explicit clusters also use a second barrier to rendezvous before reuse.
-    b.setInsertionPoint(newLoop);
+    // Response buffer + completion mbarrier, allocated before the loop. When
+    // AutoWS has already placed the loop in a worker partition, hoist the
+    // clustered CLC *allocations* before the enclosing specialization. Only the
+    // allocations move -- the tile-id computation and every other CLC op stay
+    // inside the loop. Besides extending the allocations' lifetime across the
+    // specialized loop, this keeps the cluster init rendezvous outside the
+    // partition: cluster sync nested in a WS partition is only executed by that
+    // partition's warps and would deadlock.
+    Operation *allocAnchor = newLoop;
+    bool hoistedBeforeWarpSpecialize = false;
+    if (clusterSize > 1)
+      if (auto ws = newLoop->getParentOfType<ttg::WarpSpecializeOp>()) {
+        allocAnchor = ws;
+        hoistedBeforeWarpSpecialize = true;
+      }
+    b.setInsertionPoint(allocAnchor);
     Value resp = createClcResponseAlloc(b, loc);
-    Value barAlloc = createBarrierAlloc(newLoop, /*numBarriers=*/1);
+    Value barAlloc = createBarrierAlloc(allocAnchor, /*numBarriers=*/1);
     Value bar = createSingleBufferView(b, barAlloc, 0);
     Value emptyBar;
     if (clusterSize > 1) {
       Value emptyBarAlloc =
-          createBarrierAlloc(newLoop, /*numBarriers=*/1, clusterSize);
+          createBarrierAlloc(allocAnchor, /*numBarriers=*/1, clusterSize);
       emptyBar = createSingleBufferView(b, emptyBarAlloc, 0);
+
+      // The CLC response is multicast to every CTA's completion barrier, and
+      // every CTA later arrives on rank zero's empty barrier through cluster
+      // shared memory. Top-level barriers hoisted before AutoWS are covered by
+      // the backend's entry init fence and cluster rendezvous; adding another
+      // rendezvous here would omit worker warps and deadlock. Non-WS/nested
+      // allocations still need an explicit publication point.
+      if (!hoistedBeforeWarpSpecialize) {
+        FenceMBarrierInitReleaseClusterOp::create(b, loc);
+        ClusterArriveOp::create(b, loc, /*relaxed=*/false);
+        ClusterWaitOp::create(b, loc);
+      }
     }
 
     // Forward the phase from the before-region into the after-region and read
@@ -250,6 +275,24 @@ struct CLCMaterializePass
     Value toggled =
         arith::XOrIOp::create(yb, yieldOp.getLoc(), phaseAfter, one);
     yieldOp.getResultsMutable().append(toggled);
+
+    // Worker partition regions are isolated from above. Thread the hoisted CLC
+    // state through their explicit capture list after all materialized uses
+    // have been created, matching the capture construction in WSSpecialize.
+    if (auto ws = dyn_cast<ttg::WarpSpecializeOp>(allocAnchor)) {
+      SmallVector<Value> captures{resp, bar, emptyBar};
+      auto partitions = ws.getPartitionOp();
+      for (Value capture : captures) {
+        if (!capture)
+          continue;
+        partitions->insertOperands(partitions.getNumOperands(), capture);
+        for (Region *region : ws.getPartitionRegions()) {
+          BlockArgument arg =
+              region->addArgument(capture.getType(), capture.getLoc());
+          replaceAllUsesInRegionWith(capture, arg, *region);
+        }
+      }
+    }
 
     return success();
   }

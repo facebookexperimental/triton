@@ -99,7 +99,10 @@ def get_fwd_persistent_configs() -> List[triton.Config]:
         for qk_wait in [False]  # True, False]
         for slice_mask in [True]  # , False]
     ]
-    return configs
+    # Profiling/CI mode: compile a single representative forward config.  The
+    # backward benchmark only needs forward to construct its autograd graph;
+    # autotuning all forward candidates otherwise dominates setup time.
+    return configs[:1] if os.environ.get("HSTU_SELF_PIN") == "1" else configs
 
 
 def prune_configs_by_hdim(configs, named_args, **kwargs):
@@ -2396,7 +2399,7 @@ def _hstu_bwd_host_descriptor_pre_hook(nargs):
 
 
 def get_hstu_bwd_configs() -> List[triton.Config]:
-    return [
+    configs = [
         triton.Config(
             {
                 "BLOCK_M1": 128,
@@ -2445,6 +2448,7 @@ def get_hstu_bwd_configs() -> List[triton.Config]:
         # HSTU_SELF_PIN=1 -> one config (fast compile for tritonbench --mode bwd).
         for er in ([1] if os.environ.get("HSTU_SELF_PIN") == "1" else [1, 2])
     ]
+    return configs[:1] if os.environ.get("HSTU_SELF_PIN") == "1" else configs
 
 
 @triton.autotune(configs=get_hstu_bwd_configs(), key=["AUTOTUNE_MAX_SEQ_LEN", "HEAD_DIM"])
@@ -5215,7 +5219,7 @@ class _AttentionFunction(torch.autograd.Function):
             stride_mm=stride_mm,
             num_softmax_heads=num_softmax_heads,
             num_targets=num_targets,
-            causal=True,
+            causal=causal,
             max_attn_len=max_attn_len,
             full_attn_size=full_attn_size,
             contextual_seq_len=contextual_seq_len,
@@ -5319,6 +5323,8 @@ def tlx_bw_hstu_mha(
     contextual_seq_len: int = 0,
     causal: bool = True,
 ) -> torch.Tensor:
+    if not causal:
+        raise ValueError("tlx_bw_hstu_mha is causal-only; causal=False is not implemented")
     return _AttentionFunction.apply(
         max_seq_len,
         alpha,

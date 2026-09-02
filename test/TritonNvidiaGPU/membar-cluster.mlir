@@ -81,6 +81,8 @@ module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
   // CHECK-NEXT: ttng.cluster_barrier {relaxed = true}
   // CHECK-NEXT: ttg.warp_specialize
   // CHECK: ttng.wait_barrier
+  // CHECK-NOT: ttng.cluster_barrier
+  // CHECK: tt.return
   tt.func @insert_fence_and_relaxed_cluster_barrier_before_warp_specialize(%idx: i32) {
     %c0 = arith.constant 0 : i32
     %c1 = arith.constant 1 : i32
@@ -206,6 +208,17 @@ module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 
 // -----
 
+module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: @end_cluster_barrier_without_shared_memory
+  // CHECK-NEXT: ttng.cluster_barrier
+  // CHECK-NEXT: tt.return
+  tt.func @end_cluster_barrier_without_shared_memory() {
+    tt.return
+  }
+}
+
+// -----
+
 #sharedA = #ttg.nvmma_shared<{swizzlingByteWidth = 64, transposed = false, elementBitWidth = 16, CGALayout = [[1, 0]]}>
 #sharedB = #ttg.nvmma_shared<{swizzlingByteWidth = 64, transposed = false, elementBitWidth = 16, CGALayout = [[0, 1]]}>
 #barrierEnc = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0], CGALayout = [[1]]}>
@@ -221,6 +234,7 @@ module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 8 : i32, "ttng.tw
   // CHECK: ttng.cluster_arrive
   // CHECK: ttng.cluster_wait
   // CHECK: ttg.local_store
+  // CHECK: ttng.cluster_barrier
   // CHECK: tt.return
   tt.func @mma_v5_two_ctas_wait_barrier_no_cluster() -> tensor<256x32xf16, #blocked> {
     %a = ttg.local_alloc : () -> !ttg.memdesc<256x32xf16, #sharedA, #smem, mutable>
@@ -312,7 +326,9 @@ module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
   // CHECK-LABEL: @no_cluster_convert_block_trivial
   // CHECK-NOT: ttng.cluster_arrive
   // CHECK-NOT: ttng.cluster_wait
-  // CHECK: tt.return
+  // CHECK: ttg.local_load
+  // CHECK-NEXT: ttng.cluster_barrier
+  // CHECK-NEXT: tt.return
   tt.func @no_cluster_convert_block_trivial() -> tensor<256x128xf16, #blockedSrc> {
     %cst = arith.constant dense<0.000000e+00> : tensor<256x128xf16, #blockedSrc>
     %cvt = ttg.convert_layout %cst : tensor<256x128xf16, #blockedSrc> -> tensor<256x128xf16, #blockedDst>
@@ -370,11 +386,13 @@ module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 #smem = #ttg.shared_memory
 
 module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
-  // Negative test: no cluster barrier should be inserted for multiCTA reduce when the axis is not split
+  // No dependency barrier is needed when the reduction axis is not split.
   // CHECK-LABEL: @no_cluster_reduce_unsplit_axis
   // CHECK-NOT: ttng.cluster_arrive
   // CHECK-NOT: ttng.cluster_wait
-  // CHECK: tt.return
+  // CHECK: ttg.local_load
+  // CHECK-NEXT: ttng.cluster_barrier
+  // CHECK-NEXT: tt.return
   tt.func @no_cluster_reduce_unsplit_axis() -> tensor<256xf16, #slice1> {
     %cst = arith.constant dense<0.000000e+00> : tensor<256x128xf16, #blockedSplitM>
     %red = "tt.reduce"(%cst) ({
@@ -527,6 +545,80 @@ module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 
 // -----
 
+#blockedStore = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0], CGALayout = [[0]]}>
+#sharedStore = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0], CGALayout = [[0]]}>
+#barrierStore = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0], CGALayout = [[1]]}>
+#smem = #ttg.shared_memory
+
+module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
+  // Async shared stores can complete per-CTA barriers remotely, so the init
+  // must be visible throughout the cluster before the store is issued.
+  // CHECK-LABEL: @cluster_async_shared_store_with_per_cta_barrier
+  // CHECK: ttng.init_barrier
+  // CHECK-NEXT: ttng.fence_mbarrier_init_release_cluster
+  // CHECK-NEXT: ttng.cluster_barrier {relaxed = true}
+  // CHECK-NEXT: ttng.async_shared_store
+  // CHECK: tt.return
+  tt.func @cluster_async_shared_store_with_per_cta_barrier(%src: tensor<128xi32, #blockedStore>) {
+    %dst = ttg.local_alloc : () -> !ttg.memdesc<128xi32, #sharedStore, #smem, mutable>
+    %barrier = ttg.local_alloc : () -> !ttg.memdesc<2xi64, #barrierStore, #smem, mutable>
+    ttng.init_barrier %barrier, 1 : !ttg.memdesc<2xi64, #barrierStore, #smem, mutable>
+    ttng.async_shared_store %src, %dst, %barrier : tensor<128xi32, #blockedStore> -> !ttg.memdesc<128xi32, #sharedStore, #smem, mutable>, !ttg.memdesc<2xi64, #barrierStore, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+#sharedCommit = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16, CGALayout = [[0, 0]]}>
+#barrierCommit = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0], CGALayout = [[1]]}>
+#smem = #ttg.shared_memory
+
+module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  // A commit with multicast descriptors can complete per-CTA barriers on
+  // other CTAs even when this is not a two-CTA MMA kernel.
+  // CHECK-LABEL: @cluster_tc_gen5_commit_multicast_with_per_cta_barrier
+  // CHECK: ttng.init_barrier
+  // CHECK-NEXT: ttng.fence_mbarrier_init_release_cluster
+  // CHECK-NEXT: ttng.cluster_barrier {relaxed = true}
+  // CHECK-NEXT: ttng.tc_gen5_commit
+  // CHECK: tt.return
+  tt.func @cluster_tc_gen5_commit_multicast_with_per_cta_barrier(%desc: !ttg.memdesc<128x128xf16, #sharedCommit, #smem>) {
+    %barrier = ttg.local_alloc : () -> !ttg.memdesc<2xi64, #barrierCommit, #smem, mutable>
+    ttng.init_barrier %barrier, 1 : !ttg.memdesc<2xi64, #barrierCommit, #smem, mutable>
+    ttng.tc_gen5_commit %barrier descs %desc : !ttg.memdesc<2xi64, #barrierCommit, #smem, mutable>, !ttg.memdesc<128x128xf16, #sharedCommit, #smem>
+    tt.return
+  }
+}
+
+// -----
+
+#sharedMMA = #ttg.nvmma_shared<{swizzlingByteWidth = 32, transposed = false, elementBitWidth = 16, CGALayout = [[0, 0]]}>
+#barrierMMA = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0], CGALayout = [[1]]}>
+#tmemMMA = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1, CGALayout = [[0, 0]]>
+#smem = #ttg.shared_memory
+
+module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  // Multicast MMA completion also fans out to per-CTA barriers without
+  // requiring a two-CTA MMA.
+  // CHECK-LABEL: @cluster_tc_gen5_mma_multicast_with_per_cta_barrier
+  // CHECK: ttng.init_barrier
+  // CHECK-NEXT: ttng.fence_mbarrier_init_release_cluster
+  // CHECK-NEXT: ttng.cluster_barrier {relaxed = true}
+  // CHECK-NEXT: ttng.tc_gen5_mma
+  // CHECK: tt.return
+  tt.func @cluster_tc_gen5_mma_multicast_with_per_cta_barrier(%a: !ttg.memdesc<128x128xf16, #sharedMMA, #smem>, %b: !ttg.memdesc<128x128xf16, #sharedMMA, #smem>, %acc: !ttg.memdesc<128x128xf32, #tmemMMA, #ttng.tensor_memory, mutable>) {
+    %false = arith.constant false
+    %true = arith.constant true
+    %barrier = ttg.local_alloc : () -> !ttg.memdesc<2xi64, #barrierMMA, #smem, mutable>
+    ttng.init_barrier %barrier, 1 : !ttg.memdesc<2xi64, #barrierMMA, #smem, mutable>
+    ttng.tc_gen5_mma %a, %b, %acc, %false, %true, %barrier[%true] {is_async, multicast} : !ttg.memdesc<128x128xf16, #sharedMMA, #smem>, !ttg.memdesc<128x128xf16, #sharedMMA, #smem>, !ttg.memdesc<128x128xf32, #tmemMMA, #ttng.tensor_memory, mutable>, !ttg.memdesc<2xi64, #barrierMMA, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
 #nvmma = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16, CGALayout = [[0, 0]]}>
 #barrierEnc = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0], CGALayout = [[0]]}>
 #blocked = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [8, 4], warpsPerCTA = [4, 1], order = [0, 1], CGALayout = [[1, 0]]}>
@@ -542,7 +634,8 @@ module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
   // CHECK: ttng.wait_barrier
   // CHECK-NOT: ttng.cluster_arrive
   // CHECK-NOT: ttng.cluster_wait
-  // CHECK: tt.return
+  // CHECK: ttng.cluster_barrier
+  // CHECK-NEXT: tt.return
   tt.func @no_cluster_when_same_allocation(%desc: !tt.tensordesc<64x128xf16, #nvmma>) -> tensor<64x128xf16, #blocked> {
     %c0 = arith.constant 0 : i32
     %true = arith.constant true

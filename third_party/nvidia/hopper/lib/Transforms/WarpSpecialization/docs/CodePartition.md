@@ -55,7 +55,8 @@ See [Buffer Allocation](BufferAllocation.md) for details.
 
 ```
 Step 0:   swapTransposedLocalAllocs   — normalize transposed alloc layouts
-Step 0.5: mergeDuplicateLocalAllocs   — deduplicate allocs with same source
+Step 0.5: mergeDuplicateLocalAllocs   — deduplicate allocs with same source/type
+Step 0.75: hoistDescriptorLoadBuffers — hoist pre-converted NVWS destinations
 Step 1:   collectAsyncChannels        — discover channels
 Step 2:   reorderEpilogOps            — interleave epilogue stores
 Step 3:   createBuffer                — allocate buffers (single copy)
@@ -149,6 +150,18 @@ Creates synchronization tokens for each channel group:
 - Results are stored in a `CommChannel` struct per channel, containing
   `tokens` (per consumer task ID), optional `producerBarrier` (for TMA/gen5),
   and optional `consumerBarriers` (for gen5 inline barriers).
+
+Channels can mix gen5 and non-gen5 consumers. In that case, gen5 consumers use
+their inline completion barrier while non-gen5 consumers still get token-based
+producer acquire and consumer release operations. Synchronization insertion must
+therefore check `consumerBarriers` per consumer task ID rather than treating the
+whole channel as all-gen5 or all-token-based.
+
+Channels in a reuse group classify synchronization mode collectively by
+consumer task ID because they reuse the same physical slot. An inline barrier
+is used for a task only when every consumer in that task across the group is
+MMAv5; otherwise the whole task uses token synchronization. Multi-buffer groups
+share tokens, while single-copy groups retain separate tokens.
 
 ## Synchronization Insertion
 

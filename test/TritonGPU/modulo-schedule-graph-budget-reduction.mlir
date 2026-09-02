@@ -1,5 +1,5 @@
-// RUN: TRITON_MODULO_SMEM_BUDGET_KB=448 triton-opt %s -allow-unregistered-dialect -split-input-file -nvgpu-modulo-schedule="print-schedule-graph" 2>&1 | FileCheck %s --check-prefix=GRAPH
-// RUN: TRITON_MODULO_SMEM_BUDGET_KB=448 triton-opt %s -allow-unregistered-dialect -split-input-file -nvgpu-modulo-schedule | FileCheck %s --check-prefix=IR
+// RUN: env TRITON_MODULO_SMEM_BUDGET_KB=448 triton-opt %s -allow-unregistered-dialect -split-input-file -nvgpu-modulo-schedule="print-schedule-graph" 2>&1 | FileCheck %s --check-prefix=GRAPH
+// RUN: env TRITON_MODULO_SMEM_BUDGET_KB=448 triton-opt %s -allow-unregistered-dialect -split-input-file -nvgpu-modulo-schedule | FileCheck %s --check-prefix=IR
 
 //===----------------------------------------------------------------------===//
 // Regression tests for Step 4.6 budget reduction (reduceBufferGroup +
@@ -110,6 +110,9 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
 // member would be hammered down to count=1 while its peer stayed high and the
 // shared physical footprint never dropped.
 //
+// CHECK: [Step4.6] Reduced SMEM buf1 (+ co-consumed/merge peers) to count=2
+// Footprint dropped below the 458752 B budget after refreshing physical buffers:
+// CHECK: [Step4.6] Budget: SMEM 393264/458752 OK
 // Both co-consumed operands end at the SAME count=2 (not one collapsed to 1):
 // GRAPH-LABEL: [PASS-A] === Inner ScheduleGraph ===
 // GRAPH-DAG: %buf0 = modulo.alloc SMEM [2 x 128x512 x f16]{{.*}}262144 bytes total

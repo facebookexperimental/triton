@@ -80,6 +80,7 @@
 using namespace mlir;
 namespace tt = ::mlir::triton;
 namespace ttg = ::mlir::triton::gpu;
+namespace ttng = ::mlir::triton::nvidia_gpu;
 
 namespace mlir {
 namespace triton {
@@ -107,6 +108,10 @@ static const TTGIRToTLXMapping opMappings[] = {
      "Wait on named hardware barrier"},
     {"ttng.named_barrier_arrive", "tlx.named_barrier_arrive",
      "Arrive at named hardware barrier"},
+    {"ttng.wait_barrier_named", "tlx.named_barrier_wait",
+     "Wait on named hardware barrier"},
+    {"ttng.arrive_barrier_named", "tlx.named_barrier_arrive",
+     "Arrive at named hardware barrier"},
 
     // Memory allocation operations - local_alloc is handled specially
     // ttng.tmem_alloc: handled specially in printSimplifiedOp
@@ -133,10 +138,13 @@ static const TTGIRToTLXMapping opMappings[] = {
      "Reinterpret buffer dtype/shape"},
     {"ttng.tmem_subslice", "tlx.subslice", "TMEM subslice (Blackwell)"},
     {"ttg.memdesc_index", "tlx.local_view", "Index into memdesc"},
+    {"ttg.memdesc_subslice", "tlx.subslice", "Slice a memory descriptor"},
 
     // Async copy operations (cp.async)
     {"ttg.async_load", "tlx.async_load",
      "Async load from global to shared memory"},
+    {"ttg.async_copy_global_to_local", "tlx.async_load",
+     "Async bulk copy from global to shared memory"},
     {"ttg.async_commit_group", "tlx.async_load_commit_group",
      "Commit async load group"},
     {"ttg.async_wait", "tlx.async_load_wait_group",
@@ -155,6 +163,8 @@ static const TTGIRToTLXMapping opMappings[] = {
      "Wait for TMA stores to complete"},
     {"ttng.async_tma_store_wait", "tlx.async_descriptor_store_wait",
      "Wait for TMA stores to complete"},
+    {"ttng.async_tma_store_token_wait", "tlx.async_descriptor_store_wait",
+     "Wait for a token-tracked TMA store"},
     {"tt.make_tensor_descriptor", "tlx.make_tensor_descriptor",
      "Create TMA descriptor on device"},
     {"ttng.tensormap_create", "tlx.make_tensor_descriptor",
@@ -194,6 +204,8 @@ static const TTGIRToTLXMapping opMappings[] = {
      "Store to remote CTA's shared memory"},
     {"ttng.async_remote_store", "tlx.async_remote_shmem_store",
      "Async store to remote CTA's shared memory"},
+    {"ttg.async_remote_shmem_copy", "tlx.async_remote_shmem_copy",
+     "Async copy to a remote CTA's shared memory"},
 
     // Warp specialization
     {"ttg.warp_specialize", "tlx.warp_specialize",
@@ -245,6 +257,8 @@ static const TTGIRToTLXMapping opMappings[] = {
     {"tt.get_num_programs", "tl.num_programs", "Get number of programs"},
     {"tt.map_elementwise", "tl.map_elementwise", "Map elementwise operation"},
     {"tt.return", "return", "Return from function"},
+    {"tt.elementwise_inline_asm", "tl.inline_asm_elementwise",
+     "Elementwise inline assembly"},
 
     // Math dialect operations
     {"math.exp", "tl.math.exp", "Natural exponential"},
@@ -265,6 +279,7 @@ static const TTGIRToTLXMapping opMappings[] = {
 
     // GPU operations
     {"gpu.barrier", "gpu.barrier", "GPU barrier"},
+    {"nvg.cluster_id", "tlx.cluster_cta_rank", "CTA rank in cluster"},
 };
 
 // Infix operator mapping for binary arith ops
@@ -374,8 +389,8 @@ static std::string formatSSAName(StringRef raw) {
     name.pop_back();
   if (!name.empty() && name[0] == '%')
     name = name.substr(1);
-  if (!name.empty() && std::all_of(name.begin(), name.end(),
-                                   [](char c) { return std::isdigit(c); }))
+  std::replace(name.begin(), name.end(), '#', '_');
+  if (!name.empty() && std::isdigit(name.front()))
     name = "var_" + name;
   return name;
 }
@@ -642,6 +657,10 @@ std::string getElementTypeName(Type type) {
 struct LocalAllocInfo {
   bool isBarrierAlloc = false;
   int barrierCount = 0;
+  // Arrive count of the barrier (init_barrier's `count`); default 1.
+  int arriveCount = 1;
+  // Set when the slots disagree on arrive count, which has no TLX spelling.
+  bool conflictingArriveCounts = false;
   // For regular allocs: shape (excluding first dim which is count),
   // element type, count
   SmallVector<int64_t> shape;
@@ -669,12 +688,35 @@ LocalAllocInfo analyzeLocalAlloc(Operation *localAllocOp) {
     bool foundInitBarrier = false;
     int initBarrierCount = 0;
 
+    // One allocation emits one alloc call, so its slots must agree on the
+    // arrive count; there is no TLX spelling for a per-slot count.
+    auto recordArriveCount = [&](Operation *initOp) {
+      auto cAttr = initOp->getAttrOfType<IntegerAttr>("count");
+      if (!cAttr)
+        return;
+      if (foundInitBarrier && cAttr.getInt() != info.arriveCount) {
+        localAllocOp->emitError("barrier slots with differing arrive counts do "
+                                "not round-trip to TLX");
+        info.conflictingArriveCounts = true;
+      }
+      info.arriveCount = cAttr.getInt();
+    };
+
     for (Operation *user : allocResult.getUsers()) {
-      if (user->getName().getStringRef() == "ttg.memdesc_index") {
+      StringRef userName = user->getName().getStringRef();
+      // Single-slot barrier, used directly with no memdesc_index.
+      if (userName == "ttng.init_barrier") {
+        recordArriveCount(user);
+        foundInitBarrier = true;
+        initBarrierCount++;
+        continue;
+      }
+      if (userName == "ttg.memdesc_index") {
         // Check if memdesc_index result is used by init_barrier
         for (Value result : user->getResults()) {
           for (Operation *indexUser : result.getUsers()) {
             if (indexUser->getName().getStringRef() == "ttng.init_barrier") {
+              recordArriveCount(indexUser);
               foundInitBarrier = true;
               initBarrierCount++;
             }
@@ -863,6 +905,13 @@ void printIfOp(Operation *op, llvm::raw_ostream &os,
                llvm::DenseSet<Operation *> &skippedOps, unsigned indent,
                DenseMap<Value, Value> *argSubstitutionMap = nullptr);
 
+// Print scf.while with explicit condition and loop-carried assignments.
+void printWhileOp(Operation *op, llvm::raw_ostream &os,
+                  const llvm::StringMap<StringRef> &opNameMap,
+                  const DenseMap<Operation *, LocalAllocInfo> &allocInfoMap,
+                  llvm::DenseSet<Operation *> &skippedOps, unsigned indent,
+                  DenseMap<Value, Value> *argSubstitutionMap = nullptr);
+
 // Print scf.for in Python range syntax
 void printForOp(Operation *op, llvm::raw_ostream &os,
                 const llvm::StringMap<StringRef> &opNameMap,
@@ -1030,6 +1079,67 @@ void printIfOp(Operation *op, llvm::raw_ostream &os,
       os << elseStr;
     }
   }
+}
+
+// Print scf.while as a Python loop while preserving both SCF regions:
+// the before region computes the condition and the after region is the body.
+void printWhileOp(Operation *op, llvm::raw_ostream &os,
+                  const llvm::StringMap<StringRef> &opNameMap,
+                  const DenseMap<Operation *, LocalAllocInfo> &allocInfoMap,
+                  llvm::DenseSet<Operation *> &skippedOps, unsigned indent,
+                  DenseMap<Value, Value> *argSubstitutionMap) {
+  auto whileOp = cast<scf::WhileOp>(op);
+  Block &before = whileOp.getBefore().front();
+  Block &after = whileOp.getAfter().front();
+  auto conditionOp = whileOp.getConditionOp();
+
+  // Initialize the values carried into the before region.
+  for (auto [arg, init] : llvm::zip(before.getArguments(), op->getOperands())) {
+    for (unsigned i = 0; i < indent; ++i)
+      os << "  ";
+    os << getValueName(arg, argSubstitutionMap) << " = "
+       << getValueName(init, argSubstitutionMap) << "\n";
+  }
+
+  for (unsigned i = 0; i < indent; ++i)
+    os << "  ";
+  os << "while True:\n";
+
+  // The before region executes at the start of every iteration. Its terminator
+  // is rendered below as the loop exit rather than as a generic operation.
+  skippedOps.insert(conditionOp);
+  printRegion(whileOp.getBefore(), os, opNameMap, allocInfoMap, skippedOps,
+              indent + 1, argSubstitutionMap);
+
+  for (unsigned i = 0; i < indent + 1; ++i)
+    os << "  ";
+  os << "if not "
+     << getValueName(conditionOp.getCondition(), argSubstitutionMap) << ":\n";
+  for (auto [result, forwarded] :
+       llvm::zip(op->getResults(), conditionOp.getArgs())) {
+    for (unsigned i = 0; i < indent + 2; ++i)
+      os << "  ";
+    os << getValueName(result, argSubstitutionMap) << " = "
+       << getValueName(forwarded, argSubstitutionMap) << "\n";
+  }
+  for (unsigned i = 0; i < indent + 2; ++i)
+    os << "  ";
+  os << "break\n";
+
+  // scf.condition forwards values into the after-region arguments. Substitute
+  // them while printing the body instead of emitting misleading no-op
+  // assignments when MLIR gives corresponding region arguments the same name.
+  DenseMap<Value, Value> whileSubstitutions;
+  if (argSubstitutionMap)
+    whileSubstitutions = *argSubstitutionMap;
+  for (auto [arg, forwarded] :
+       llvm::zip(after.getArguments(), conditionOp.getArgs()))
+    whileSubstitutions[arg] = forwarded;
+
+  // scf.yield carries the next values back to the before-region arguments.
+  SmallVector<Value> yieldTargets(before.getArguments());
+  printRegion(whileOp.getAfter(), os, opNameMap, allocInfoMap, skippedOps,
+              indent + 1, &whileSubstitutions, yieldTargets);
 }
 
 // Helper to check if a region has meaningful operations (not just skipped ops)
@@ -1285,12 +1395,30 @@ void printSimplifiedOp(
     auto it = allocInfoMap.find(op);
     if (it != allocInfoMap.end()) {
       const LocalAllocInfo &info = it->second;
+      if (info.isBarrierAlloc && info.conflictingArriveCounts) {
+        // Any single count here would be wrong for the other slots.
+        os << "# unsupported: barrier slots with differing arrive counts";
+        printLocComment(op, os);
+        return;
+      }
       if (info.isBarrierAlloc) {
         // Print as result = tlx.alloc_barriers(count)
         if (op->getNumResults() > 0) {
           os << getValueName(op->getResult(0), argSubstitutionMap) << " = ";
         }
-        os << "tlx.alloc_barriers(" << info.barrierCount << ")";
+        // An arrive count that is a positive multiple of the warp size is a
+        // warp barrier: every thread arrives, rather than one leader per warp.
+        ModuleOp mod = op->getParentOfType<ModuleOp>();
+        int warpSize = mod ? ttg::TritonGPUDialect::getThreadsPerWarp(mod) : 32;
+        if (info.arriveCount >= warpSize && info.arriveCount % warpSize == 0) {
+          os << "tlx.alloc_warp_barrier(" << info.barrierCount << ", "
+             << (info.arriveCount / warpSize) << ")";
+        } else if (info.arriveCount != 1) {
+          os << "tlx.alloc_barriers(" << info.barrierCount << ", "
+             << info.arriveCount << ")";
+        } else {
+          os << "tlx.alloc_barriers(" << info.barrierCount << ")";
+        }
         printLocComment(op, os);
         return;
       } else {
@@ -1485,7 +1613,11 @@ void printSimplifiedOp(
         os << ", ";
       os << getValueName(coords[i], argSubstitutionMap);
     }
-    os << "], " << getValueName(barrier, argSubstitutionMap) << ")";
+    os << "], " << getValueName(barrier, argSubstitutionMap);
+    if (auto twoCTA = op->getAttrOfType<BoolAttr>("two_cta");
+        twoCTA && twoCTA.getValue())
+      os << ", two_ctas=True";
+    os << ")";
     printLocComment(op, os);
     return;
   }
@@ -1533,6 +1665,64 @@ void printSimplifiedOp(
     return;
   }
 
+  // ttng.async_tma_reduce: the TLX API represents a TMA reduction as an
+  // async descriptor store with store_reduce set.
+  if (opName == "ttng.async_tma_reduce" && op->getNumOperands() >= 3) {
+    Value desc = op->getOperand(0);
+    Value src = op->getOperand(op->getNumOperands() - 1);
+    os << "tlx.async_descriptor_store("
+       << getValueName(desc, argSubstitutionMap) << ", "
+       << getValueName(src, argSubstitutionMap) << ", [";
+    for (unsigned i = 1; i + 1 < op->getNumOperands(); ++i) {
+      if (i > 1)
+        os << ", ";
+      os << getValueName(op->getOperand(i), argSubstitutionMap);
+    }
+    StringRef kind = "unknown";
+    if (auto reduce = dyn_cast<ttng::AsyncTMAReduceOp>(op))
+      kind = tt::stringifyDescriptorReduceKind(reduce.getKind());
+    os << "], store_reduce=\"" << kind << "\")";
+    printLocComment(op, os);
+    return;
+  }
+
+  // Token waits are the lowered form of TLX descriptor-store waits.
+  if (opName == "ttng.async_tma_store_token_wait") {
+    int pendings = 0;
+    if (auto planned = op->getAttrOfType<IntegerAttr>("planned_pending_count"))
+      pendings = planned.getInt();
+    os << "tlx.async_descriptor_store_wait(" << pendings << ")";
+    printLocComment(op, os);
+    return;
+  }
+
+  if (opName == "ttg.memdesc_subslice" && op->getNumResults() == 1) {
+    auto dstType = dyn_cast<ttg::MemDescType>(op->getResult(0).getType());
+    auto offsets = op->getAttrOfType<DenseI32ArrayAttr>("offsets");
+    os << getValueName(op->getResult(0), argSubstitutionMap)
+       << " = tlx.local_slice("
+       << getValueName(op->getOperand(0), argSubstitutionMap) << ", [";
+    if (offsets) {
+      llvm::interleaveComma(offsets.asArrayRef(), os);
+    }
+    os << "], [";
+    if (dstType)
+      llvm::interleaveComma(dstType.getShape(), os);
+    os << "])";
+    printLocComment(op, os);
+    return;
+  }
+
+  if (opName == "ttg.async_remote_shmem_copy" && op->getNumOperands() == 4) {
+    os << "tlx.async_remote_shmem_copy("
+       << getValueName(op->getOperand(0), argSubstitutionMap) << ", "
+       << getValueName(op->getOperand(1), argSubstitutionMap) << ", "
+       << getValueName(op->getOperand(2), argSubstitutionMap) << ", "
+       << getValueName(op->getOperand(3), argSubstitutionMap) << ")";
+    printLocComment(op, os);
+    return;
+  }
+
   // tma_store_wait: emit with pendings attribute
   if (opName == "ttng.tma_store_wait" ||
       opName == "ttng.async_tma_store_wait") {
@@ -1558,7 +1748,9 @@ void printSimplifiedOp(
       int idx = 3 + sizes[3]; // skip a,b,d,acc_dep
       os << ", use_acc="
          << getValueName(op->getOperand(idx), argSubstitutionMap);
-      idx += 2; // skip useD, pred
+      ++idx;
+      os << ", pred=" << getValueName(op->getOperand(idx), argSubstitutionMap);
+      ++idx;
       int numBarriers = sizes[6];
       if (numBarriers > 0) {
         os << ", mBarriers=[";
@@ -1569,6 +1761,10 @@ void printSimplifiedOp(
         }
         os << "]";
       }
+      if (op->hasAttr("two_ctas"))
+        os << ", two_ctas=True";
+      if (op->hasAttr("is_async"))
+        os << ", force_async=True";
     }
     os << ")";
     printLocComment(op, os);
@@ -1578,7 +1774,10 @@ void printSimplifiedOp(
   // ttng.tc_gen5_commit: emit tcgen05_commit(barrier)
   if (opName == "ttng.tc_gen5_commit") {
     os << "tlx.tcgen05_commit("
-       << getValueName(op->getOperand(0), argSubstitutionMap) << ")";
+       << getValueName(op->getOperand(0), argSubstitutionMap);
+    if (op->getNumOperands() > 1)
+      os << ", two_ctas=True";
+    os << ")";
     printLocComment(op, os);
     return;
   }
@@ -1714,6 +1913,60 @@ void printSimplifiedOp(
   printLocComment(op, os);
 }
 
+// tt.map_elementwise carries its per-element computation in a region; pack > 1
+// runs that body over several elements at once, which has no elementwise form.
+bool isInlinableMapElementwise(Operation *op) {
+  auto pack = op->getAttrOfType<IntegerAttr>("pack");
+  return op->getName().getStringRef() == "tt.map_elementwise" &&
+         op->getNumRegions() > 0 && op->getNumResults() > 0 &&
+         !op->getRegion(0).empty() && pack && pack.getInt() == 1;
+}
+
+// Inline a tt.map_elementwise body as elementwise tensor ops, as
+// map_elementwise is only a scheduling hint.
+void printMapElementwise(
+    Operation *op, llvm::raw_ostream &os,
+    const llvm::StringMap<StringRef> &opNameMap,
+    const DenseMap<Operation *, LocalAllocInfo> &allocInfoMap,
+    llvm::DenseSet<Operation *> &skippedOps, unsigned indent,
+    DenseMap<Value, Value> *argSubstitutionMap) {
+  DenseMap<Value, Value> bodySubst;
+  if (argSubstitutionMap)
+    bodySubst = *argSubstitutionMap;
+  Block &bb = op->getRegion(0).front();
+  for (unsigned i = 0; i < bb.getNumArguments() && i < op->getNumOperands();
+       ++i) {
+    Value target = op->getOperand(i);
+    if (argSubstitutionMap) {
+      auto it = argSubstitutionMap->find(target);
+      if (it != argSubstitutionMap->end())
+        target = it->second;
+    }
+    bodySubst[bb.getArgument(i)] = target;
+  }
+  for (Operation &bodyOp : bb) {
+    if (bodyOp.getName().getStringRef() == "tt.map_elementwise.return") {
+      for (unsigned k = 0; k < indent; ++k)
+        os << "  ";
+      // One tuple assignment so a multi-result map binds every result; result i
+      // is named in the enclosing scope, returned operand i in the inlined body.
+      assert(op->getNumResults() == bodyOp.getNumOperands() &&
+             "map_elementwise must return one value per result");
+      unsigned n = std::min(op->getNumResults(), bodyOp.getNumOperands());
+      for (unsigned i = 0; i < n; ++i)
+        os << (i ? ", " : "")
+           << getValueName(op->getResult(i), argSubstitutionMap);
+      os << " = ";
+      for (unsigned i = 0; i < n; ++i)
+        os << (i ? ", " : "") << getValueName(bodyOp.getOperand(i), &bodySubst);
+      printLocComment(op, os);
+    } else if (!shouldSkipOp(&bodyOp, allocInfoMap, skippedOps)) {
+      printSimplifiedOp(&bodyOp, os, opNameMap, allocInfoMap, indent,
+                        &bodySubst);
+    }
+  }
+}
+
 // Print a block
 void printBlock(Block &block, llvm::raw_ostream &os,
                 const llvm::StringMap<StringRef> &opNameMap,
@@ -1791,7 +2044,8 @@ void printBlock(Block &block, llvm::raw_ostream &os,
       }
       bool first = true;
       for (auto &name : argNames) {
-        if (skipArgs.count(name))
+        if (skipArgs.count(name) || name.find(".shape.") != std::string::npos ||
+            name.find(".stride.") != std::string::npos)
           continue;
         if (!first)
           os << ", ";
@@ -1816,13 +2070,25 @@ void printBlock(Block &block, llvm::raw_ostream &os,
     // targets, otherwise skip entirely
     if (op.getName().getStringRef() == "scf.yield") {
       if (!yieldTargets.empty()) {
-        // Print assignments: yieldTarget = yieldOperand
-        for (unsigned i = 0; i < op.getNumOperands() && i < yieldTargets.size();
-             ++i) {
+        // Emit the iter-arg updates as a single tuple assignment: scf.yield has
+        // parallel-copy semantics, so sequential `t = v` statements would let a
+        // later target read an already-updated one, desyncing barrier phases
+        // and deadlocking warp-specialized kernels.
+        unsigned n = std::min((size_t)op.getNumOperands(), yieldTargets.size());
+        SmallVector<std::string> lhs, rhs;
+        for (unsigned i = 0; i < n; ++i) {
+          lhs.push_back(getValueName(yieldTargets[i], argSubstitutionMap));
+          rhs.push_back(getValueName(op.getOperand(i), argSubstitutionMap));
+        }
+        if (!lhs.empty()) {
           for (unsigned j = 0; j < indent; ++j)
             os << "  ";
-          os << getValueName(yieldTargets[i], argSubstitutionMap) << " = "
-             << getValueName(op.getOperand(i), argSubstitutionMap) << "\n";
+          for (unsigned i = 0; i < lhs.size(); ++i)
+            os << (i ? ", " : "") << lhs[i];
+          os << " = ";
+          for (unsigned i = 0; i < rhs.size(); ++i)
+            os << (i ? ", " : "") << rhs[i];
+          os << "\n";
         }
       }
       // Skip yield in TLX output (either handled above or just skip)
@@ -1846,6 +2112,19 @@ void printBlock(Block &block, llvm::raw_ostream &os,
     if (op.getName().getStringRef() == "scf.if") {
       printIfOp(&op, os, opNameMap, allocInfoMap, skippedOps, indent,
                 argSubstitutionMap);
+      continue;
+    }
+
+    // Special handling for scf.while - preserve condition/body and carries.
+    if (op.getName().getStringRef() == "scf.while") {
+      printWhileOp(&op, os, opNameMap, allocInfoMap, skippedOps, indent,
+                   argSubstitutionMap);
+      continue;
+    }
+
+    if (isInlinableMapElementwise(&op)) {
+      printMapElementwise(&op, os, opNameMap, allocInfoMap, skippedOps, indent,
+                          argSubstitutionMap);
       continue;
     }
 
@@ -2004,6 +2283,11 @@ void printBlockOps(Block &block, llvm::raw_ostream &os,
                 argSubstitutionMap);
       continue;
     }
+    if (isInlinableMapElementwise(&op)) {
+      printMapElementwise(&op, os, opNameMap, allocInfoMap, skippedOps, indent,
+                          argSubstitutionMap);
+      continue;
+    }
     // Special handling for tt.reduce in CF printer
     if (op.getName().getStringRef() == "tt.reduce" && op.getNumRegions() > 0 &&
         op.getNumResults() > 0) {
@@ -2091,6 +2375,12 @@ void printBlockArgAssignments(Block *dest, OperandRange operands,
                               llvm::raw_ostream &os, unsigned indent,
                               DenseMap<Value, Value> *argSubstitutionMap,
                               int skipArgIdx = -1) {
+  // Emit block-argument updates as a single tuple assignment so a back-edge to
+  // a loop header follows parallel-copy semantics (all sources read before any
+  // target is updated). Sequential `dest = src` statements would let a later
+  // assignment read an already-updated earlier target; see the scf.yield
+  // handler for the same reasoning.
+  SmallVector<std::string> lhs, rhs;
   for (unsigned i = 0; i < dest->getNumArguments() && i < operands.size();
        ++i) {
     if ((int)i == skipArgIdx)
@@ -2099,11 +2389,20 @@ void printBlockArgAssignments(Block *dest, OperandRange operands,
         getValueName(dest->getArgument(i), argSubstitutionMap);
     std::string srcName = getValueName(operands[i], argSubstitutionMap);
     if (destName != srcName) {
-      for (unsigned j = 0; j < indent; ++j)
-        os << "  ";
-      os << destName << " = " << srcName << "\n";
+      lhs.push_back(destName);
+      rhs.push_back(srcName);
     }
   }
+  if (lhs.empty())
+    return;
+  for (unsigned j = 0; j < indent; ++j)
+    os << "  ";
+  for (unsigned i = 0; i < lhs.size(); ++i)
+    os << (i ? ", " : "") << lhs[i];
+  os << " = ";
+  for (unsigned i = 0; i < rhs.size(); ++i)
+    os << (i ? ", " : "") << rhs[i];
+  os << "\n";
 }
 
 // Detect if a header block represents a for-loop: iter starts at init,
@@ -2562,6 +2861,15 @@ public:
   void runOnOperation() override {
     ModuleOp m = getOperation();
 
+    // Ops the printer cannot represent report a diagnostic. Count those so the
+    // pass fails, rather than handing back a silently incomplete kernel.
+    unsigned numErrors = 0;
+    ScopedDiagnosticHandler countErrors(m.getContext(), [&](Diagnostic &diag) {
+      if (diag.getSeverity() == DiagnosticSeverity::Error)
+        ++numErrors;
+      return failure();
+    });
+
     // Build the lookup map
     static llvm::StringMap<StringRef> opNameMap = buildOpNameMap();
 
@@ -2616,6 +2924,8 @@ public:
     }
 
     valueNameCacheStorage = nullptr;
+    if (numErrors > 0)
+      signalPassFailure();
   }
 };
 

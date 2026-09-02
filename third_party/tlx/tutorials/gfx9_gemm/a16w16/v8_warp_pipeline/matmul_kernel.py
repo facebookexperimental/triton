@@ -119,9 +119,8 @@ def v8_warp_pipeline(
             b_left = tlx.local_load(smem_b_left[1], relaxed=True)
             tlx.buffer_load_to_local(smem_b_right[0], b_ptr, br_off + b_k)
             tlx.async_load_commit_group()
-
-        a_k += BLOCK_K * stride_ak
-        b_k += BLOCK_K * stride_bk
+            a_k += BLOCK_K * stride_ak
+            b_k += BLOCK_K * stride_bk
 
         # ──── Region 2 ────
         with tlx.warp_pipeline_stage("mfma", priority=0):
@@ -142,9 +141,10 @@ def v8_warp_pipeline(
             b_left = tlx.local_load(smem_b_left[0], relaxed=True)
             tlx.buffer_load_to_local(smem_b_right[1], b_ptr, br_off + b_k)
             tlx.async_load_commit_group()
-
-        a_k += BLOCK_K * stride_ak
-        b_k += BLOCK_K * stride_bk
+            # Keep the trailing scalar updates in the final stage. Otherwise
+            # WarpPipeliner creates an extra cluster containing only these adds.
+            a_k += BLOCK_K * stride_ak
+            b_k += BLOCK_K * stride_bk
 
     # ── Epilogue: drain the last two K iterations ──
     acc_left = tl.dot(a, b_left, acc_left)
