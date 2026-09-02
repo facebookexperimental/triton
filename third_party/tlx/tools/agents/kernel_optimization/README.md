@@ -178,9 +178,49 @@ non-null when those tools are available.
 
 Target-specific `harness.py`/`cases.json`/`target.json` live colocated under `harnesses/<arch>/targets/<kernel>/` (B200,
 `sm_100` for blackwell and H100, `sm_90` for hopper); pick `--arch` to match the
-device you are tuning for. Architecture-wide notes, known optimization tricks, and shared
-target metadata can live directly under `harnesses/<arch>/`. Pass an existing TLX tutorial such as
+device you are tuning for. Pass an existing TLX tutorial such as
 `third_party/tlx/tutorials/blackwell_gemm_ws.py` as `--kernel`.
+
+### Curated optimization knowledge
+
+Two optional markdown files in the bundle are concatenated ahead of
+`target.json`'s inline `optimization_guidance` string, widest scope first, and
+delivered as that one field:
+
+```text
+harnesses/<arch>/knowledge.md                              # architecture-wide
+harnesses/<arch>/targets/<kernel>/optimization_guidance.md # this target
+```
+
+Keeping them in the bundle is deliberate: the bundle is frozen and content-hashed
+for the run, so the prompt a run saw is reproducible from its recorded hashes. A
+global doc tree read at prompt-build time is not. Adding an architecture means
+adding a directory; the candidate provider stays kernel- and arch-neutral and
+never reads these paths itself. The resolved block is capped at 8 KB, with the
+truncation announced in the text.
+
+The contract for the content:
+
+- **Human-write-only.** Agents read these files. A finding is promoted into one
+  by a human who has read the evidence; agent output lands in `experiments/`
+  under the run's output dir.
+- **Mechanism, method and structure — not measurements.** Prefer how the hardware
+  behaves, how to measure it correctly, and how the search space is shaped. A
+  detailed figure copied in here goes stale with nothing to notice, and invites a
+  candidate to pattern-match on the number instead of the mechanism that produced
+  it. Cite where the evidence lives; do not reproduce it.
+- **Do not restate a hardware quantity.** `hw/resources.py` is ground truth for
+  CU/XCD counts, LDS and SMEM budgets, and executable heuristics tune against it.
+  Cite the attribute and record the consequence, so a correction propagates
+  instead of forking. Same reasoning, applied to numbers the codebase owns.
+- **Every claim is still evidence-backed** — the evidence is cited by location
+  (a run's artifacts, a benchmark suite, a docstring), not pasted in.
+- **Measured-on-this-arch and ported-from-another-arch are separate sections.**
+  A CDNA4 result is a hypothesis for CDNA3, not a fact about it; the prompt tells
+  the model to weigh them differently, so mixing them removes that signal.
+- **Concise beats complete.** This text is injected into every candidate prompt.
+  An entry that does not change what a candidate would do costs tokens for
+  nothing.
 
 `harnesses/host/targets/vector_add/harness.py` is a minimal CPU-friendly harness for smoke tests
 without a real GPU. Candidate must export `vector_add(a, b)`; on CPU the benchmark uses
