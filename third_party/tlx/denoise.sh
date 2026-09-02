@@ -60,9 +60,19 @@ if [[ "$GPU_VENDOR" == "nvidia" ]]; then
     ) >/dev/null
 
 elif [[ "$GPU_VENDOR" == "amd" ]]; then
-    export HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES:=4}"
+    # PyTorch on ROCm accepts either visibility variable, but rocprof rejects
+    # conflicting CUDA/HIP masks. Keep the caller's spelling and use a separate
+    # physical index for rocm-smi instead of exporting the other variable.
+    if [[ -n "${HIP_VISIBLE_DEVICES:-}" ]]; then
+        AMD_DEVICE="$HIP_VISIBLE_DEVICES"
+    elif [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
+        AMD_DEVICE="$CUDA_VISIBLE_DEVICES"
+    else
+        export HIP_VISIBLE_DEVICES=4
+        AMD_DEVICE="$HIP_VISIBLE_DEVICES"
+    fi
 
-    GPU_INFO=$(rocm-smi -d "$HIP_VISIBLE_DEVICES" --showproductname 2>/dev/null)
+    GPU_INFO=$(rocm-smi -d "$AMD_DEVICE" --showproductname 2>/dev/null)
     # "Card Series" is often just "AMD Radeon Graphics" on CDNA data-center parts (e.g. MI350),
     # so identify by the PCI device id ("Card Model") and GFX version, which are reliable; keep
     # Series only for display. (MI350/MI355 both report gfx950, so match device id before gfx.)
@@ -83,12 +93,12 @@ elif [[ "$GPU_VENDOR" == "amd" ]]; then
     DETERMINISM_CLK="${DETERMINISM_CLK:=2100}"
 
     echo "Detected $GPU_NAME"
-    echo "Locking GPU $HIP_VISIBLE_DEVICES sclk to ${DETERMINISM_CLK} MHz (perf-determinism) + power cap ${DESIRED_POWER} W"
+    echo "Locking GPU $AMD_DEVICE sclk to ${DETERMINISM_CLK} MHz (perf-determinism) + power cap ${DESIRED_POWER} W"
 
     # Lock GPU clocks via perf-determinism and apply power overdrive (both best-effort under sudo)
     (
-        sudo rocm-smi -d "$HIP_VISIBLE_DEVICES" --setperfdeterminism "$DETERMINISM_CLK"
-        sudo rocm-smi -d "$HIP_VISIBLE_DEVICES" --setpoweroverdrive "$DESIRED_POWER"
+        sudo rocm-smi -d "$AMD_DEVICE" --setperfdeterminism "$DETERMINISM_CLK"
+        sudo rocm-smi -d "$AMD_DEVICE" --setpoweroverdrive "$DESIRED_POWER"
     ) >/dev/null
 fi
 
@@ -103,13 +113,13 @@ if [[ "$GPU_VENDOR" == "nvidia" ]]; then
     fi
 elif [[ "$GPU_VENDOR" == "amd" ]]; then
     # Via the PCI bus id, like the nvidia branch above -- NOT via
-    # /sys/class/drm/card$HIP_VISIBLE_DEVICES. The rocm-smi device index and the
+    # /sys/class/drm/card$AMD_DEVICE. The rocm-smi device index and the
     # DRM card index are different numbering schemes that only coincide at 0: on
     # an 8-GPU MI300X box rocm-smi's card6 is 0000:c8:00.0, which sysfs
     # enumerates as card40. The old form found no numa_node and silently ran
     # unbound for every device but the first.
-    AMD_PCI_BUS_ID=$(rocm-smi -d "$HIP_VISIBLE_DEVICES" --showbus --csv 2>/dev/null \
-        | awk -F, -v c="card${HIP_VISIBLE_DEVICES}" 'tolower($1)==c {print tolower($2)}' | tr -d '[:space:]')
+    AMD_PCI_BUS_ID=$(rocm-smi -d "$AMD_DEVICE" --showbus --csv 2>/dev/null \
+        | awk -F, -v c="card${AMD_DEVICE}" 'tolower($1)==c {print tolower($2)}' | tr -d '[:space:]')
     NUMA_NODE_FILE="/sys/bus/pci/devices/$AMD_PCI_BUS_ID/numa_node"
     if [[ -n "$AMD_PCI_BUS_ID" && -r "$NUMA_NODE_FILE" ]]; then
         NUMA_NODE=$(<"$NUMA_NODE_FILE")
@@ -119,9 +129,11 @@ fi
 if [[ "$NUMA_NODE" =~ ^[0-9]+$ ]]; then
     echo "Binding CPU and memory to NUMA node $NUMA_NODE"
     numactl --membind="$NUMA_NODE" --cpunodebind="$NUMA_NODE" "$@"
+    CHILD_STATUS=$?
 else
     echo "Warning: Could not determine a valid GPU-local NUMA node; running without NUMA binding" >&2
     "$@"
+    CHILD_STATUS=$?
 fi
 
 # Unlock GPU clock
@@ -132,7 +144,9 @@ if [[ "$GPU_VENDOR" == "nvidia" ]]; then
     ) >/dev/null
 elif [[ "$GPU_VENDOR" == "amd" ]]; then
     (
-        sudo rocm-smi -d "$HIP_VISIBLE_DEVICES" --resetperfdeterminism
-        sudo rocm-smi -d "$HIP_VISIBLE_DEVICES" --resetpoweroverdrive
+        sudo rocm-smi -d "$AMD_DEVICE" --resetperfdeterminism
+        sudo rocm-smi -d "$AMD_DEVICE" --resetpoweroverdrive
     ) >/dev/null
 fi
+
+exit "$CHILD_STATUS"

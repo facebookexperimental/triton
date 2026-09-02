@@ -15,6 +15,7 @@ from .cli import (
     MAX_GUIDANCE_BYTES,
     _commit_body,
     _parse_args,
+    _print_result,
     _resolve_guidance,
     _resolve_harness_paths,
     _validate_host_matches_target,
@@ -484,6 +485,32 @@ class PriorRunEvidenceTest(unittest.TestCase):
 
 
 class CliTest(unittest.TestCase):
+    def test_result_format_defaults_to_full(self) -> None:
+        args = _parse_args(["--kernel", "kernel.py", "--output-dir", "/tmp/out"])
+        self.assertEqual(args.result_format, "full")
+
+    def test_summary_result_omits_large_case_payloads(self) -> None:
+        result = Mock(
+            success=False,
+            stopping_reason="round_budget_exhausted",
+            final=Mock(aggregate_speedup=1.0),
+            experiments=(Mock(), Mock()),
+        )
+        stream = io.StringIO()
+        with mock.patch("sys.stdout", stream):
+            _print_result(result, Path("/tmp/out"), "summary")
+        self.assertEqual(
+            json.loads(stream.getvalue()),
+            {
+                "artifacts_dir": "/tmp/out",
+                "result_json": "/tmp/out/result.json",
+                "stopping_reason": "round_budget_exhausted",
+                "success": False,
+                "final_speedup": 1.0,
+                "experiments": 2,
+            },
+        )
+
     def test_commit_winner_is_enabled_by_default(self) -> None:
         args = _parse_args(["--kernel", "kernel.py", "--output-dir", "/tmp/out"])
         self.assertTrue(args.commit_winner)
