@@ -77,4 +77,19 @@ def MBarrierOpInterface : OpInterface<"MBarrierOpInterface"> {
   ];
 }
 
+def SchedulingBarrierOpInterface : OpInterface<"SchedulingBarrierOpInterface"> {
+  let description = [{
+    Marker interface for scheduling-only fence operations that carry no
+    cross-wave memory semantics (e.g. the AMD rocdl.sched.barrier /
+    rocdl.sched.group.barrier that bracket the real ttg.barrier a
+    tlx.workgroup_barrier interposes). The Membar analysis looks THROUGH ops
+    carrying this interface when scanning forward for a sync point; treating one
+    as a stopping point would make it insert a redundant workgroup barrier.
+    Backends attach this to their ops via an external model, so the core
+    analysis stays free of any backend-dialect dependency.
+  }];
+
+  let cppNamespace = "::mlir::triton::gpu";
+}
+
 #endif // TRITONGPU_OP_INTERFACES

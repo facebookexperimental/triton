@@ -298,9 +298,18 @@ bool containsLocalBarrier(Operation *op) {
 }
 
 // Returns true if the same block has a later wait or local barrier before any
-// memory effect or nested control flow.
+// memory effect or nested control flow. Scheduling-only fences carrying
+// ttg::SchedulingBarrierOpInterface (e.g. the AMD rocdl.sched.barrier that
+// brackets the real ttg.barrier a tlx.workgroup_barrier interposes) have no
+// cross-wave memory semantics and are skipped: treating one as a stopping point
+// would make Membar insert a redundant barrier right after the async wait --
+// doubling the workgroup barrier and stalling a hand-written ping-pong
+// schedule.
 static bool hasSyncPointBeforeMemoryEffect(Operation *op) {
   for (Operation *next = op->getNextNode(); next; next = next->getNextNode()) {
+    if (isa<triton::gpu::SchedulingBarrierOpInterface>(next))
+      continue;
+
     if (containsLocalBarrier(next) ||
         next->hasTrait<mlir::OpTrait::MemWaitOpTrait>())
       return true;
