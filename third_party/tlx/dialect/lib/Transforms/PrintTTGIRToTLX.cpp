@@ -1392,6 +1392,20 @@ void printSimplifiedOp(
 
   // Special handling for local_alloc
   if (opName == "ttg.local_alloc") {
+    // A ui128 buffer is a CLC response allocation; that element type has no
+    // TLX spelling, so emit the dedicated allocator.
+    if (auto memDescType =
+            dyn_cast<ttg::MemDescType>(op->getResult(0).getType())) {
+      if (memDescType.getElementType().isUnsignedInteger(128)) {
+        os << getValueName(op->getResult(0), argSubstitutionMap) << " = ";
+        int64_t num = 1;
+        for (int64_t dim : memDescType.getShape())
+          num *= dim;
+        os << "tlx._alloc_clc_responses(" << num << ")";
+        printLocComment(op, os);
+        return;
+      }
+    }
     auto it = allocInfoMap.find(op);
     if (it != allocInfoMap.end()) {
       const LocalAllocInfo &info = it->second;
@@ -1900,6 +1914,40 @@ void printSimplifiedOp(
     if (op->getNumOperands() >= 2)
       os << ", pred=" << getValueName(op->getOperand(1), argSubstitutionMap);
     os << ")";
+    printLocComment(op, os);
+    return;
+  }
+
+  // nvg.cluster_id: the CLC-persistent lowering replaces the source's
+  // tl.program_id(0) with the cluster id, identical for single-CTA clusters.
+  if (opName == "nvg.cluster_id") {
+    if (op->getNumResults() > 0)
+      os << getValueName(op->getResult(0), argSubstitutionMap) << " = ";
+    os << "tl.program_id(axis=0)";
+    printLocComment(op, os);
+    return;
+  }
+
+  // ttng.async_clc_try_cancel(mbar, response): TLX takes (response, barrier).
+  if (opName == "ttng.async_clc_try_cancel") {
+    os << "tlx._clc_issue("
+       << getValueName(op->getOperand(1), argSubstitutionMap) << ", "
+       << getValueName(op->getOperand(0), argSubstitutionMap) << ")";
+    printLocComment(op, os);
+    return;
+  }
+
+  // ttng.clc_query_cancel(response): decodes the stolen tile's 3D CTA id,
+  // or (-1, -1, -1) when no work was claimed.
+  if (opName == "ttng.clc_query_cancel") {
+    unsigned nres = op->getNumResults();
+    for (unsigned i = 0; i < nres; ++i)
+      os << (i ? ", " : "")
+         << getValueName(op->getResult(i), argSubstitutionMap);
+    if (nres > 0)
+      os << " = ";
+    os << "tlx._clc_query("
+       << getValueName(op->getOperand(0), argSubstitutionMap) << ")";
     printLocComment(op, os);
     return;
   }
