@@ -16,7 +16,6 @@ Three departures from the blackwell/hopper GEMM harnesses, all forced by the par
 from __future__ import annotations
 
 import functools
-import importlib.util
 import json
 import os
 import statistics
@@ -37,6 +36,7 @@ if str(_ARCH_DIR) not in sys.path:
 
 import att  # noqa: E402
 from inputs import make_inputs  # noqa: E402
+from loader import load_candidate  # noqa: E402
 
 # Sets TRITON_DISABLE_POST_MISCHED / TRITON_USE_C_DISPATCHER on import, covering
 # a directly-imported harness; `target.json` covers the worker.
@@ -59,7 +59,7 @@ def build(kernel_source: str, target: dict[str, Any]) -> dict[str, Any]:
     source_path = Path(directory.name) / "candidate.py"
     source_path.write_text(kernel_source)
     try:
-        module = _load_module(source_path)
+        module = load_candidate(source_path)
     except Exception as error:  # noqa: BLE001
         directory.cleanup()
         return {
@@ -193,17 +193,6 @@ def _reference_module() -> ModuleType | None:
     if not path or not Path(path).is_file():
         return None
     try:
-        return _load_module(Path(path), name="tlx_gfx942_reference")
+        return load_candidate(Path(path), suffix="reference")
     except Exception:  # noqa: BLE001
         return None
-
-
-def _load_module(path: Path, name: str | None = None) -> ModuleType:
-    module_name = name or f"tlx_gfx942_candidate_{path.parent.name}"
-    spec = importlib.util.spec_from_file_location(module_name, path)
-    if spec is None or spec.loader is None:
-        raise RuntimeError(f"cannot load candidate from {path}")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = module
-    spec.loader.exec_module(module)
-    return module
