@@ -275,8 +275,23 @@ def _pa_decode_partition_kernel(
     # gathered in one load so the MFMA K-dim stays BLOCK_N-wide even at small
     # PAGE_SIZE. The LDS path below uses a depth-2 software pipeline; the packed
     # register path relies on instruction scheduling across current K/V/QK/PV.
-    row_page = offs_n // PAGE_SIZE
-    row_in_page = offs_n % PAGE_SIZE
+    if CACHE_5D:
+        # These coordinates are non-negative by construction. Express their
+        # quotient/remainder as unsigned operations so AxisInfo can soundly
+        # retain partial packed-group information without assumptions about
+        # signed math. Leave the conventional 4D path unchanged.
+        offs_n_u32 = offs_n.to(tl.uint32)
+        row_page = (offs_n_u32 // PAGE_SIZE).to(tl.int32)
+        row_in_page_u32 = offs_n_u32 % PAGE_SIZE
+        row_in_page = row_in_page_u32.to(tl.int32)
+        offs_d_u32 = offs_d.to(tl.uint32)
+        d_group = (offs_d_u32 // CACHE_PACK_X).to(tl.int32)
+        d_in_group = (offs_d_u32 % CACHE_PACK_X).to(tl.int32)
+        value_group = (row_in_page_u32 // CACHE_PACK_X).to(tl.int32)
+        value_in_group = (row_in_page_u32 % CACHE_PACK_X).to(tl.int32)
+    else:
+        row_page = offs_n // PAGE_SIZE
+        row_in_page = offs_n % PAGE_SIZE
     num_tiles = tl.cdiv(end_page - start_page, PAGES_PER_TILE)
 
     if STREAMING_KV and num_tiles > 0:
@@ -454,12 +469,11 @@ def _pa_decode_partition_kernel(
                            tl.where(row_page < end_page - start_page, start_page + row_page, end_page - 1) *
                            stride_bt_p)
         if CACHE_5D:
-            k_ptrs = (Kc + physical[:, None] * stride_kc_b + kv_head * stride_kc_h +
-                      (offs_d[None, :] // CACHE_PACK_X) * stride_kc_d + row_in_page[:, None] * stride_kc_p +
-                      (offs_d[None, :] % CACHE_PACK_X) * stride_kc_x)
+            k_ptrs = (Kc + physical[:, None] * stride_kc_b + kv_head * stride_kc_h + d_group[None, :] * stride_kc_d +
+                      row_in_page[:, None] * stride_kc_p + d_in_group[None, :] * stride_kc_x)
             v_ptrs = (Vc + physical[:, None] * stride_vc_b + kv_head * stride_vc_h +
-                      (row_in_page[:, None] // CACHE_PACK_X) * stride_vc_p + offs_d[None, :] * stride_vc_d +
-                      (row_in_page[:, None] % CACHE_PACK_X) * stride_vc_x)
+                      value_group[:, None] * stride_vc_p + offs_d[None, :] * stride_vc_d +
+                      value_in_group[:, None] * stride_vc_x)
             # Loading the page table hides these facts from AxisInfo: within
             # each packed subgroup K is contiguous in D and V is contiguous in
             # N. Restore the 16-byte vector/alignment facts for direct-to-LDS.
@@ -490,11 +504,11 @@ def _pa_decode_partition_kernel(
                                      tl.where(n_page_of_row < end_page, n_page_of_row, end_page - 1) * stride_bt_p)
                 if CACHE_5D:
                     nk_ptrs = (Kc + n_physical[:, None] * stride_kc_b + kv_head * stride_kc_h +
-                               (offs_d[None, :] // CACHE_PACK_X) * stride_kc_d + row_in_page[:, None] * stride_kc_p +
-                               (offs_d[None, :] % CACHE_PACK_X) * stride_kc_x)
+                               d_group[None, :] * stride_kc_d + row_in_page[:, None] * stride_kc_p +
+                               d_in_group[None, :] * stride_kc_x)
                     nv_ptrs = (Vc + n_physical[:, None] * stride_vc_b + kv_head * stride_vc_h +
-                               (row_in_page[:, None] // CACHE_PACK_X) * stride_vc_p + offs_d[None, :] * stride_vc_d +
-                               (row_in_page[:, None] % CACHE_PACK_X) * stride_vc_x)
+                               value_group[:, None] * stride_vc_p + offs_d[None, :] * stride_vc_d +
+                               value_in_group[:, None] * stride_vc_x)
                     nk_ptrs = tl.multiple_of(nk_ptrs, (2, 16))
                     nk_ptrs = tl.max_contiguous(nk_ptrs, (1, CACHE_PACK_X))
                     nv_ptrs = tl.multiple_of(nv_ptrs, (16, 2))

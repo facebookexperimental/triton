@@ -3601,9 +3601,12 @@ def test_async_load_noncontiguous_gather_gfx950(device):
 def _async_load_gather_transpose_kernel(v_ptr, output_ptr):
     n = tl.arange(0, 128)
     d = tl.arange(0, 64)
-    page = n // 64
-    token = n % 64
-    ptrs = (v_ptr + page[:, None] * 4096 + (token[:, None] // 8) * 512 + d[None, :] * 8 + token[:, None] % 8)
+    n_u32 = n.to(tl.uint32)
+    page = (n_u32 // 64).to(tl.int32)
+    token_u32 = n_u32 % 64
+    token_group = (token_u32 // 8).to(tl.int32)
+    token_in_group = (token_u32 % 8).to(tl.int32)
+    ptrs = (v_ptr + page[:, None] * 4096 + token_group[:, None] * 512 + d[None, :] * 8 + token_in_group[:, None])
 
     buffers = tlx.local_alloc((128, 64), tl.bfloat16, 2)
     view = tlx.local_view(buffers, 0)
