@@ -8,10 +8,22 @@ This module is the API contract; everything under it is private -- reaching into
 per (op, arch), so there is no `variant=` argument, and architecture never
 appears in caller code.
 
-Two keyword-only overrides exist for testing and benchmarking, both defaulting
-to the plain behaviour: `arch=` pins an entry instead of detecting one, and
-`space=` selects the autotune search space ("full" for perf, "heuristic" or
-"smoke" for correctness, where the kernel offers them).
+Two keyword-only overrides exist for testing and benchmarking: `arch=` pins an
+entry instead of detecting one, and `space=` selects the autotune search space.
+
+`space=` defaults to "heuristic" -- a single config chosen analytically -- for
+any op that offers one, so that a first call stays interactive. Measured on
+B200, `mm` at `space="full"` takes 221-285s on a cold Triton cache (348 configs
+compiled and benchmarked for a 1024x1024x1024 product) and also accumulates
+tens of GB of autotune workspaces; at "heuristic" the same call is under a
+second. Pass `space="full"` explicitly to buy back the tuned configs, which are
+worth up to ~4x on small shapes.
+
+Ops with no heuristic yet -- flash_attn, hstu_attn, kimi_delta_attention --
+still default to "full". Their remaining space is "smoke", which selects for
+lowering-path coverage rather than speed, so defaulting to it would quietly
+ship a bad config. Each needs its own `heuristic_config` before it can follow
+`mm`.
 
 An op with no implementation for the current GPU raises `UnsupportedOp` -- it
 never falls back to torch.
@@ -24,8 +36,12 @@ from ._catalog import InvalidInput, UnsupportedOp, check_inputs, impl_for
 __all__ = ["mm", "flash_attn", "hstu_attn", "kimi_delta_attention", "UnsupportedOp", "InvalidInput"]
 
 
-def mm(a, b, *, arch=None, space="full"):
-    """`a @ b`, for `(M, K) @ (K, N)` fp16/bf16. Either operand may be column-major."""
+def mm(a, b, *, arch=None, space="heuristic"):
+    """`a @ b`, for `(M, K) @ (K, N)` fp16/bf16. Either operand may be column-major.
+
+    Defaults to a single analytically chosen config so the first call stays
+    interactive; pass `space="full"` to autotune. See the module docstring.
+    """
     fn, spec = impl_for("mm", arch)
     # Mirror the kernel's operand prep: a non-contiguous operand is fed to its
     # descriptor transposed, so that is the stride TMA must find aligned.
