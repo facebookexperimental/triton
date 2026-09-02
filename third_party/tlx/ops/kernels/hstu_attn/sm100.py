@@ -5224,7 +5224,7 @@ class _AttentionFunction(torch.autograd.Function):
             stride_mm=stride_mm,
             num_softmax_heads=num_softmax_heads,
             num_targets=num_targets,
-            causal=True,
+            causal=causal,
             max_attn_len=max_attn_len,
             full_attn_size=full_attn_size,
             contextual_seq_len=contextual_seq_len,
@@ -5402,7 +5402,11 @@ def hstu_attn(
 
     `seq_offsets` is `(B + 1,)` prefix offsets. `space` is "full" for perf or
     "smoke" for correctness; not exposed on `tlx.ops.hstu_attn`.
+
+    Causal-only; see the `causal=False` rejection below.
     """
+    if not causal:
+        raise ValueError("hstu_attn is causal-only; causal=False is not implemented")
     global _SPACE
     _SPACE = space
     return _AttentionFunction.apply(

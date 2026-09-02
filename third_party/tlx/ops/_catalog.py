@@ -65,6 +65,8 @@ CATALOG: tuple[OpSpec, ...] = (
         variant="ws",
         impl="kernels.hstu_attn.sm100:hstu_attn",
         dtypes=_FP16,
+        # Causal-only, non-causal is not supported yet
+        accepts=lambda d: bool(d.get("causal", True)),
         requires=frozenset({"tma", "tmem"}),
     ),
     OpSpec(

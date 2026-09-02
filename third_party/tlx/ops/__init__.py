@@ -69,9 +69,12 @@ def hstu_attn(q, k, v, seq_offsets, max_seq_len, attn_scale, alpha=None, causal=
     Scores are SiLU-scaled rather than softmaxed, which is why this is its own
     op. `seq_offsets` is `(B + 1,)` prefix offsets; `alpha` defaults to
     `1 / HEAD_DIM`.
+
+    Causal-only: `causal=False` raises `InvalidInput`. The argument is kept so
+    the intent is stated at the call site rather than assumed.
     """
     fn, spec = impl_for("hstu_attn", arch)
-    check_inputs(spec, dtype=q.dtype, HEAD_DIM=q.shape[-1])
+    check_inputs(spec, dtype=q.dtype, HEAD_DIM=q.shape[-1], causal=causal)
     return fn(q, k, v, seq_offsets, max_seq_len, alpha if alpha is not None else 1.0 / q.shape[-1], causal=causal,
               attn_scale=attn_scale, num_targets=num_targets, max_attn_len=max_attn_len,
               contextual_seq_len=contextual_seq_len, space=space)
