@@ -39,7 +39,8 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
     %n_tile_num = arith.constant 127 : i32
     %c64_i32 = arith.constant 64 : i32
     %true = arith.constant true
-    %cst_28 = arith.constant dense<0.000000e+00> : tensor<128x128xf32, #blocked1>
+    %cst_28 = arith.constant dense<0.000000e+00> : tensor<128x128xf32, #blocked>
+    %cst_28_layout = ttg.convert_layout %cst_28 : tensor<128x128xf32, #blocked> -> tensor<128x128xf32, #blocked1>
     %n_tile_num_29 = arith.addi %N_CTX, %n_tile_num : i32
     %n_tile_num_30 = arith.divsi %n_tile_num_29, %c128_i32 : i32
     %prog_id = tt.get_program_id x : i32
@@ -88,8 +89,8 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
       %dv, %dv_50 = ttng.tmem_alloc : () -> (!ttg.memdesc<128x128xf32, #tmem1, #ttng.tensor_memory, mutable>, !ttg.async.token)
       %dq, %dq_51 = ttng.tmem_alloc {ttg.partition = array<i32: 0>} : () -> (!ttg.memdesc<64x128xf32, #tmem2, #ttng.tensor_memory, mutable>, !ttg.async.token)
       %dk, %dk_52 = ttng.tmem_alloc : () -> (!ttg.memdesc<128x128xf32, #tmem1, #ttng.tensor_memory, mutable>, !ttg.async.token)
-      %dk_53 = ttng.tmem_store %cst_28, %dk[%dk_52], %true {ttg.partition = array<i32: 0>} : tensor<128x128xf32, #blocked1> -> !ttg.memdesc<128x128xf32, #tmem1, #ttng.tensor_memory, mutable>
-      %dv_54 = ttng.tmem_store %cst_28, %dv[%dv_50], %true {ttg.partition = array<i32: 0>} : tensor<128x128xf32, #blocked1> -> !ttg.memdesc<128x128xf32, #tmem1, #ttng.tensor_memory, mutable>
+      %dk_53 = ttng.tmem_store %cst_28_layout, %dk[%dk_52], %true {ttg.partition = array<i32: 0>} : tensor<128x128xf32, #blocked1> -> !ttg.memdesc<128x128xf32, #tmem1, #ttng.tensor_memory, mutable>
+      %dv_54 = ttng.tmem_store %cst_28_layout, %dv[%dv_50], %true {ttg.partition = array<i32: 0>} : tensor<128x128xf32, #blocked1> -> !ttg.memdesc<128x128xf32, #tmem1, #ttng.tensor_memory, mutable>
       %curr_m:7 = scf.for %curr_m_68 = %c0_i32 to %num_steps step %c1_i32 iter_args(%arg47 = %c0_i32, %arg48 = %false, %qkT_69 = %qkT_48, %dpT_70 = %dpT_49, %dv_71 = %dv_54, %dq_72 = %dq_51, %dk_73 = %dk_53) -> (i32, i1, !ttg.async.token, !ttg.async.token, !ttg.async.token, !ttg.async.token, !ttg.async.token)  : i32 {
         %q = arith.extsi %arg47 {loop.cluster = 1 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 0>} : i32 to i64
         %q_74 = arith.addi %off_bh_40, %q {loop.cluster = 1 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 0>} : i64
