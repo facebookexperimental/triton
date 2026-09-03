@@ -3,6 +3,7 @@
 #include "triton/Dialect/Triton/IR/OpInterfaces.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h"
+#include "triton/Dialect/TritonGPU/Transforms/PtxInterpUtils.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 
@@ -133,7 +134,12 @@ std::optional<std::pair<Operation *, int>>
 findZeroInitOp(Value accUse, scf::ForOp forOp, bool &loopArgIsZero) {
   Value v = accUse;
   if (auto arg = dyn_cast<BlockArgument>(v)) {
-    assert(arg.getOwner() == forOp.getBody());
+    // A zero-preserving op can also consume a value captured from an outer
+    // block (for example the scale operand of a packed multiply).  Such a
+    // value is not the accumulator loop argument and does not establish a
+    // zero origin.
+    if (arg.getOwner() != forOp.getBody())
+      return std::nullopt;
     if (isConstantZeroTensor(forOp.getInitArgs()[arg.getArgNumber() - 1])) {
       loopArgIsZero = true;
     }
@@ -145,6 +151,37 @@ findZeroInitOp(Value accUse, scf::ForOp forOp, bool &loopArgIsZero) {
     return std::nullopt;
   }
   if (auto selOp = dyn_cast<arith::SelectOp>(defOp)) {
+    // A select can preserve the same zero-initialized loop accumulator along
+    // both arms without either arm being a literal zero.  Attention's
+    // conditional rescale is the canonical example:
+    //
+    //   scaled = acc * alpha
+    //   acc = select should_rescale, scaled, acc
+    //
+    // Both arms are zero on the first iteration, so the first MMA can
+    // initialize operand D directly.  Trace the arms independently: sharing
+    // loopArgIsZero while visiting the first arm would otherwise make an
+    // unsupported second arm look zero-preserving.
+    bool trueLoopArgIsZero = false;
+    bool falseLoopArgIsZero = false;
+    auto trueOrigin =
+        findZeroInitOp(selOp.getTrueValue(), forOp, trueLoopArgIsZero);
+    auto falseOrigin =
+        findZeroInitOp(selOp.getFalseValue(), forOp, falseLoopArgIsZero);
+    if (!trueOrigin && !falseOrigin && trueLoopArgIsZero &&
+        falseLoopArgIsZero) {
+      loopArgIsZero = true;
+      return std::nullopt;
+    }
+    // The asymmetric case is deliberately not propagated: one arm preserving
+    // the zero loop arg says nothing about the other, so the select as a whole
+    // is not zero-preserving. Discarding the per-arm flags and falling through
+    // to the scalar-condition path below is the conservative choice.
+
+    // Rewriting a conditional zero into a scalar use-accumulator flag requires
+    // a scalar condition.  Tensor conditions are nevertheless safe in the
+    // both-arms-preserve-zero case handled above because the condition itself
+    // does not affect first-iteration initialization.
     if (!selOp.getCondition().getType().isInteger(1))
       return std::nullopt;
     if (isConstantZeroTensor(selOp.getTrueValue()) ||
@@ -166,7 +203,7 @@ findZeroInitOp(Value accUse, scf::ForOp forOp, bool &loopArgIsZero) {
       return std::make_pair(ifOp, resultIndex);
     }
   }
-  if (auto multOp = dyn_cast<arith::MulFOp>(defOp)) {
+  if (isMulOp(defOp)) {
     auto output1 = findZeroInitOp(defOp->getOperand(0), forOp, loopArgIsZero);
     if (output1.has_value()) {
       return output1;
