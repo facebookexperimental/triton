@@ -2955,6 +2955,12 @@ void printRegion(Region &region, llvm::raw_ostream &os,
                  llvm::DenseSet<Operation *> &skippedOps, unsigned indent,
                  DenseMap<Value, Value> *argSubstitutionMap,
                  ArrayRef<Value> yieldTargets) {
+  // A substitution recorded while printing an op (scf.for maps its results
+  // onto its iter_args) must outlive it for the siblings that consume it.
+  DenseMap<Value, Value> ownedSubstitutionMap;
+  if (!argSubstitutionMap)
+    argSubstitutionMap = &ownedSubstitutionMap;
+
   // For multi-block regions with CF control flow, use the CF-aware printer
   if (std::distance(region.begin(), region.end()) > 1) {
     printCFRegion(region, os, opNameMap, allocInfoMap, skippedOps, indent,
