@@ -212,6 +212,45 @@ bool hasLatenciesAssigned(scf::ForOp forOp,
   return false;
 }
 
+// A descriptor value shared by an MMA path and an ordinary register path is
+// materialized as a multi-consumer TMA buffer by Meta WS. With three or more
+// software-pipeline stages, a later single-buffer TMA acquire can be hoisted
+// ahead of the forwarding copy that publishes the current value to MMA,
+// forming a producer/consumer cycle. Keep this narrow pattern at two stages
+// until the pipeline scheduler models that cross-task dependency directly.
+static bool hasMixedDescriptorLoadConsumers(scf::ForOp forOp) {
+  auto isForwardingOp = [](Operation *op) {
+    return isa<ttg::LocalAllocOp, ttg::LocalLoadOp, ttg::MemDescTransOp,
+               ttg::MemDescReshapeOp, ttg::MemDescSubsliceOp,
+               ttg::ConvertLayoutOp, tt::TransOp, tt::ReshapeOp>(op);
+  };
+
+  for (auto load : forOp.getOps<tt::DescriptorLoadOp>()) {
+    bool hasDotConsumer = false;
+    bool hasNonDotConsumer = false;
+    SmallVector<Operation *> worklist(load->getUsers());
+    DenseSet<Operation *> visited;
+    while (!worklist.empty() && !(hasDotConsumer && hasNonDotConsumer)) {
+      Operation *consumer = worklist.pop_back_val();
+      if (!visited.insert(consumer).second)
+        continue;
+      if (isa<tt::DotOpInterface>(consumer)) {
+        hasDotConsumer = true;
+        continue;
+      }
+      if (isForwardingOp(consumer)) {
+        for (Value result : consumer->getResults())
+          llvm::append_range(worklist, result.getUsers());
+        continue;
+      }
+      hasNonDotConsumer = true;
+    }
+    if (hasDotConsumer && hasNonDotConsumer)
+      return true;
+  }
+  return false;
+}
+
 // Determine the chain of dots in the given set of users for a dot.
 std::tuple<SmallVector<ttng::MMAv5OpInterface>, bool>
 computeDotChain(ttng::MMAv5OpInterface dotOp,
@@ -396,6 +435,8 @@ CoarseSchedule scheduleKeyOpsMetaWS(scf::ForOp forOp,
 
   // Schedule parallel dot pattern.
   int maxStages = getNumStagesOrDefault(forOp, defaultNumStages);
+  if (maxStages > 2 && hasMixedDescriptorLoadConsumers(forOp))
+    maxStages = 2;
   int maxPossibleDistance = maxStages - 1 + minDistance;
   // Compute the longest path to the yield for each operation reachable
   // from any latency operation. We also use this to embed stage information
