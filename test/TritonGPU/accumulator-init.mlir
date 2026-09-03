@@ -311,6 +311,87 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
     tt.return %17 : tensor<128x16xf32, #mma1>
   }
 
+// CHECK-LABEL: @packed_mul_zero_init
+// CHECK-DAG: %[[FALSE:.+]] = arith.constant false
+// CHECK: scf.for {{.*}} iter_args(%[[ACC:.+]] = {{.*}}, %[[USE_ACC:.+]] = %[[FALSE]])
+// CHECK: tt.elementwise_inline_asm {{.*}} %[[ACC]], {{.*}}
+// CHECK: ttng.warp_group_dot {{.*}}, {{.*}}, {{.*}}, %[[USE_ACC]]
+  tt.func @packed_mul_zero_init(%A: !ttg.memdesc<128x64xf16, #shared, #smem>, %B: !ttg.memdesc<64x16xf16, #shared1, #smem>, %scale: tensor<128x16xf32, #mma1>) -> tensor<128x16xf32, #mma1> {
+    %c0_i32 = arith.constant 0 : i32
+    %cst = arith.constant dense<0.000000e+00> : tensor<128x16xf32, #mma1>
+    %c1_i32 = arith.constant 1 : i32
+    %c8_i32 = arith.constant 8 : i32
+    %result = scf.for %i = %c0_i32 to %c8_i32 step %c1_i32 iter_args(%acc = %cst) -> (tensor<128x16xf32, #mma1>) : i32 {
+      %scaled = tt.elementwise_inline_asm "mul.f32x2 $0, $2, $4;" {constraints = "=r,=r,r,r,r,r", packed_element = 2 : i32, pure = true} %acc, %scale : tensor<128x16xf32, #mma1>, tensor<128x16xf32, #mma1> -> tensor<128x16xf32, #mma1>
+      %next = ttng.warp_group_dot %A, %B, %scaled : !ttg.memdesc<128x64xf16, #shared, #smem> * !ttg.memdesc<64x16xf16, #shared1, #smem> -> tensor<128x16xf32, #mma1>
+      scf.yield %next : tensor<128x16xf32, #mma1>
+    }
+    tt.return %result : tensor<128x16xf32, #mma1>
+  }
+
+// CHECK-LABEL: @select_preserves_packed_mul_zero_init
+// CHECK-DAG: %[[FALSE:.+]] = arith.constant false
+// CHECK: scf.for {{.*}} iter_args(%[[ACC:.+]] = {{.*}}, %[[USE_ACC:.+]] = %[[FALSE]])
+// CHECK: %[[SCALED:.+]] = tt.elementwise_inline_asm {{.*}} %[[ACC]], {{.*}}
+// CHECK: %[[SELECTED:.+]] = arith.select {{.*}}, %[[SCALED]], %[[ACC]]
+// CHECK: ttng.warp_group_dot {{.*}}, {{.*}}, %[[SELECTED]], %[[USE_ACC]]
+  tt.func @select_preserves_packed_mul_zero_init(%A: !ttg.memdesc<128x64xf16, #shared, #smem>, %B: !ttg.memdesc<64x16xf16, #shared1, #smem>, %scale: tensor<128x16xf32, #mma1>, %condition: tensor<128x16xi1, #mma1>) -> tensor<128x16xf32, #mma1> {
+    %c0_i32 = arith.constant 0 : i32
+    %cst = arith.constant dense<0.000000e+00> : tensor<128x16xf32, #mma1>
+    %c1_i32 = arith.constant 1 : i32
+    %c8_i32 = arith.constant 8 : i32
+    %result = scf.for %i = %c0_i32 to %c8_i32 step %c1_i32 iter_args(%acc = %cst) -> (tensor<128x16xf32, #mma1>) : i32 {
+      %scaled = tt.elementwise_inline_asm "mul.f32x2 $0, $2, $4;" {constraints = "=r,=r,r,r,r,r", packed_element = 2 : i32, pure = true} %acc, %scale : tensor<128x16xf32, #mma1>, tensor<128x16xf32, #mma1> -> tensor<128x16xf32, #mma1>
+      %selected = arith.select %condition, %scaled, %acc : tensor<128x16xi1, #mma1>, tensor<128x16xf32, #mma1>
+      %next = ttng.warp_group_dot %A, %B, %selected : !ttg.memdesc<128x64xf16, #shared, #smem> * !ttg.memdesc<64x16xf16, #shared1, #smem> -> tensor<128x16xf32, #mma1>
+      scf.yield %next : tensor<128x16xf32, #mma1>
+    }
+    tt.return %result : tensor<128x16xf32, #mma1>
+  }
+
+// The packed mul as the kernels actually emit it: movs around a single
+// mul.f32x2 (see inline_ptx_lib.py _mul_f32x2). Zero still propagates, so the
+// init must fold -- a matcher insisting on one instruction would reject every
+// real producer and silently disable this optimization.
+// CHECK-LABEL: @packed_mul_block_zero_init
+// CHECK-DAG: %[[FALSE:.+]] = arith.constant false
+// CHECK: scf.for {{.*}} iter_args(%[[ACC:.+]] = {{.*}}, %[[USE_ACC:.+]] = %[[FALSE]])
+// CHECK: ttng.warp_group_dot {{.*}}, {{.*}}, {{.*}}, %[[USE_ACC]]
+  tt.func @packed_mul_block_zero_init(%A: !ttg.memdesc<128x64xf16, #shared, #smem>, %B: !ttg.memdesc<64x16xf16, #shared1, #smem>, %scale: tensor<128x16xf32, #mma1>) -> tensor<128x16xf32, #mma1> {
+    %c0_i32 = arith.constant 0 : i32
+    %cst = arith.constant dense<0.000000e+00> : tensor<128x16xf32, #mma1>
+    %c1_i32 = arith.constant 1 : i32
+    %c8_i32 = arith.constant 8 : i32
+    %result = scf.for %i = %c0_i32 to %c8_i32 step %c1_i32 iter_args(%acc = %cst) -> (tensor<128x16xf32, #mma1>) : i32 {
+      %scaled = tt.elementwise_inline_asm "{\0A  .reg .b64 ra, rb, rc;\0A  mov.b64 ra, { $2, $3 };\0A  mov.b64 rb, { $4, $5 };\0A  mul.f32x2 rc, ra, rb;\0A  mov.b64 { $0, $1 }, rc;\0A}" {constraints = "=r,=r,r,r,r,r", packed_element = 2 : i32, pure = true} %acc, %scale : tensor<128x16xf32, #mma1>, tensor<128x16xf32, #mma1> -> tensor<128x16xf32, #mma1>
+      %next = ttng.warp_group_dot %A, %B, %scaled : !ttg.memdesc<128x64xf16, #shared, #smem> * !ttg.memdesc<64x16xf16, #shared1, #smem> -> tensor<128x16xf32, #mma1>
+      scf.yield %next : tensor<128x16xf32, #mma1>
+    }
+    tt.return %result : tensor<128x16xf32, #mma1>
+  }
+
+// This asm multiplies and THEN adds, so 0 * scale + 1.0 = 1.0 and the zero is
+// NOT preserved. It still contains the mul.f32x2 token and satisfies every
+// structural check, so a substring match would wrongly fold the init and
+// corrupt the first iteration. The accumulator must stay explicit: no
+// use-accumulator flag is threaded through the loop.
+// CHECK-LABEL: @packed_mul_then_add_no_zero_init
+// CHECK-NOT: arith.constant false
+// CHECK: scf.for {{.*}} iter_args({{.*}}) ->
+// CHECK: ttng.warp_group_dot
+  tt.func @packed_mul_then_add_no_zero_init(%A: !ttg.memdesc<128x64xf16, #shared, #smem>, %B: !ttg.memdesc<64x16xf16, #shared1, #smem>, %scale: tensor<128x16xf32, #mma1>) -> tensor<128x16xf32, #mma1> {
+    %c0_i32 = arith.constant 0 : i32
+    %cst = arith.constant dense<0.000000e+00> : tensor<128x16xf32, #mma1>
+    %c1_i32 = arith.constant 1 : i32
+    %c8_i32 = arith.constant 8 : i32
+    %result = scf.for %i = %c0_i32 to %c8_i32 step %c1_i32 iter_args(%acc = %cst) -> (tensor<128x16xf32, #mma1>) : i32 {
+      %scaled = tt.elementwise_inline_asm "mul.f32x2 $0, $2, $4;\0Aadd.f32x2 $0, $0, $0;" {constraints = "=r,=r,r,r,r,r", packed_element = 2 : i32, pure = true} %acc, %scale : tensor<128x16xf32, #mma1>, tensor<128x16xf32, #mma1> -> tensor<128x16xf32, #mma1>
+      %next = ttng.warp_group_dot %A, %B, %scaled : !ttg.memdesc<128x64xf16, #shared, #smem> * !ttg.memdesc<64x16xf16, #shared1, #smem> -> tensor<128x16xf32, #mma1>
+      scf.yield %next : tensor<128x16xf32, #mma1>
+    }
+    tt.return %result : tensor<128x16xf32, #mma1>
+  }
+
 // CHECK-LABEL: @if_defines_alternative
 // CHECK: %[[ACC_NEXT:.+]] = ttng.warp_group_dot {{.*}}, {{.*}}, {{.*}}, %arg{{.*}} : !ttg.memdesc
   tt.func @if_defines_alternative(%A: !ttg.memdesc<128x64xf16, #shared, #smem>, %B: !ttg.memdesc<64x16xf16, #shared1, #smem>, %arg0: !tt.ptr<f16> {tt.divisibility = 16 : i32}, %arg1: !tt.ptr<f16> {tt.divisibility = 16 : i32}, %ext: i32, %inc: tensor<64x16xi32, #blocked> {tt.divisibility = 16 : i32}) -> tensor<128x16xf32, #mma1> {
