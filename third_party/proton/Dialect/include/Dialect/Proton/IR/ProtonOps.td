@@ -36,10 +36,20 @@ def PT_RecordOp : PT_Op<"record", [
   }];
   let arguments = (
     ins UnitAttr: $isStart,
-    StrAttr: $name
+    StrAttr: $name,
+    Optional<I1>: $predicate
   );
 
-  let assemblyFormat = "(`start` $isStart^):(`end`)? $name attr-dict";
+  let builders = [
+    OpBuilder<(ins "bool":$isStart, "StringAttr":$name), [{
+      build($_builder, $_state, isStart, name,
+            /*predicate=*/static_cast<mlir::Value>(nullptr));
+    }]>
+  ];
+
+  let hasVerifier = 1;
+
+  let assemblyFormat = "(`start` $isStart^):(`end`)? $name (`if` $predicate^)? attr-dict";
 }
 
 #endif // PROTON_OPS

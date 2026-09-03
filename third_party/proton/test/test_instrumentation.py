@@ -225,6 +225,42 @@ def test_record(method, fresh_knobs, tmp_path: pathlib.Path):
     assert "line: " in loc_line and "line: 0" not in loc_line
 
 
+def test_record_predicate_ir(fresh_knobs, tmp_path: pathlib.Path):
+    fresh_knobs.compilation.disable_line_info = False
+
+    @triton.jit
+    def add_kernel(x_ptr, y_ptr, output_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
+        offsets = tl.program_id(axis=0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < n_elements
+        pred = tl.program_id(axis=0) == 0
+        pl.record(True, "record_dynamic", predicate=pred)
+        pl.record(False, "record_dynamic", predicate=pred)
+        pl.enter_scope("emit_dynamic", predicate=pred)
+        pl.exit_scope("emit_dynamic", predicate=pred)
+        pl.enter_scope("compile_time_false", predicate=False)
+        pl.exit_scope("compile_time_false", predicate=False)
+        output = tl.load(x_ptr + offsets, mask=mask) + tl.load(y_ptr + offsets, mask=mask)
+        tl.store(output_ptr + offsets, output, mask=mask)
+
+    size = 256
+    x = torch.rand(size, device="cuda")
+    y = torch.rand(size, device="cuda")
+    output = torch.empty_like(x)
+    temp_file = tmp_path / "test_record_predicate_ir.hatchet"
+
+    proton.start(str(temp_file.with_suffix("")), backend="instrumentation")
+    pgm = add_kernel[(1, )](x, y, output, size, BLOCK_SIZE=1024, num_warps=4)
+    proton.finalize()
+
+    ttir = pgm.asm["ttir"]
+    assert "proton.record start \"record_dynamic\" if %" in ttir
+    assert "proton.record end \"record_dynamic\" if %" in ttir
+    assert "proton.record start \"emit_dynamic\" if %" in ttir
+    assert "proton.record end \"emit_dynamic\" if %" in ttir
+    assert "compile_time_false" not in ttir
+    assert "scf.if" not in ttir
+
+
 def test_select_ids(tmp_path: pathlib.Path):
     from contextlib import contextmanager
 
