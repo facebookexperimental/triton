@@ -43,6 +43,11 @@ Evidence-driven optimization workflow:
    task scheduling, or visibility only with an explicit producer/consumer and lifetime proof.
 5. Treat changes inside the noise floor as inconclusive. Do not repeat a configuration when
    benchmark and profile evidence show that it did not affect the targeted bottleneck.
+6. Keep a per-shape outcome matrix. When prior candidates contain complementary validated
+   wins, the Technical Lead owns a combined finding: use the narrowest symbolic shape
+   predicate that preserves each win, have the Worker implement it, and require full-shape
+   revalidation. Do not combine a branch that fails to beat the current incumbent on the
+   shapes it would serve.
 
 TLX API guidance:
 - Treat `.claude/skills/tlx-api-reference/SKILL.md` in the target repository as the primary
