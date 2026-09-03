@@ -38,6 +38,13 @@ struct MemDescOperand {
   std::optional<int> offset;
 };
 
+// `tlx.less_reg_mma`, propagated to the module by the TLX Fixup pass from
+// `tlx.async_tasks(less_reg_mma=True)`. See `DotOpMmaSmemLoader::smemLoad`.
+inline bool hasLessRegMMA(Operation *op) {
+  auto mod = op->getParentOfType<ModuleOp>();
+  return mod && mod->hasAttr("tlx.less_reg_mma");
+}
+
 // Abstract class to calculate the address of a shared or tensor memory slice.
 class DotOpMmaMemLoader {
 public:
@@ -54,13 +61,14 @@ public:
   DotOpMmaSmemLoader() = default;
 
   DotOpMmaSmemLoader(MMASMEMDescriptor desc, Value baseSrcb128,
-                     LinearLayout llInv)
-      : desc(desc), baseSrcb128(baseSrcb128), ll(std::move(llInv)) {}
+                     LinearLayout llInv, bool lessRegMMA)
+      : desc(desc), baseSrcb128(baseSrcb128), ll(std::move(llInv)),
+        lessRegMMA(lessRegMMA) {}
 
   static FailureOr<DotOpMmaSmemLoader>
   build(Location loc, RewriterBase &rewriter, gpu::MemDescType memTy,
         Value smemBase, ArrayRef<unsigned> instrShape, unsigned MNdim,
-        int mmaVersion, bool isFp4 = false,
+        int mmaVersion, bool lessRegMMA, bool isFp4 = false,
         std::optional<RankedTensorType> mmaTy = std::nullopt) {
     auto ctx = rewriter.getContext();
     auto kOffset = str_attr("offset");
@@ -86,13 +94,13 @@ public:
       // The instr_shape comes in number of elements already
     }
     return build(loc, rewriter, llInv, bitwidth, smemBase, instrShape, MNdim,
-                 mmaVersion, mmaTy);
+                 mmaVersion, lessRegMMA, mmaTy);
   }
 
   static FailureOr<DotOpMmaSmemLoader>
   build(Location loc, RewriterBase &rewriter, const LinearLayout &ll,
         int bitwidth, Value smemBase, ArrayRef<unsigned> instrShape,
-        unsigned MNdim, int mmaVersion,
+        unsigned MNdim, int mmaVersion, bool lessRegMMA,
         std::optional<RankedTensorType> mmaTy = std::nullopt) {
     // ll is a map from two dimensions (dim0, dim1) or (row, col) into offsets
     // and blocks
@@ -159,7 +167,7 @@ public:
     if (failed(desc))
       return failure();
 
-    return DotOpMmaSmemLoader{*desc, baseSrcb128, ll};
+    return DotOpMmaSmemLoader{*desc, baseSrcb128, ll, lessRegMMA};
   }
 
   Value smemLoad(int a, int b, ConversionPatternRewriter &rewriter,
@@ -185,21 +193,28 @@ public:
     // Compute the base address at runtime to prevent LLVM from folding the
     // per-tile offset into a unique 64-bit constant. This produces a short
     // dependency chain (add→and→zext→add) that helps hide WGMMA latency.
-
-    // NOTE: intentionally use inline PTX with *side-effecting* here to
-    // compute an address. This hack is to prevent LLVM CSE which could
-    // cause two distant MMA sharing the same SMEM operand which would have
-    // a very long live range and cause register spill when there're many mma
-    // instructions. This way each MMA computes its own operand.
-    // TODO: do it for TMEM operand too?
-    PTXBuilder ptxBuilder;
-    auto &addInstr = *ptxBuilder.create("add.s32");
-    auto *addOut = ptxBuilder.newOperand("=r");
-    auto *addLhs = ptxBuilder.newOperand(baseSrcb128, "r");
-    auto *addRhs = ptxBuilder.newOperand(tb.i32_val(smemByteOffsetb128), "r");
-    addInstr(addOut, addLhs, addRhs);
-    Value fullAddrb128 =
-        ptxBuilder.launch(rewriter, loc, i32_ty, /*hasSideEffect=*/true);
+    Value fullAddrb128;
+    if (lessRegMMA) {
+      // NOTE: intentionally use inline PTX with *side-effecting* here to
+      // compute an address. This hack is to prevent LLVM CSE which could
+      // cause two distant MMA sharing the same SMEM operand which would have
+      // a very long live range and cause register spill when there're many mma
+      // instructions. This way each MMA computes its own operand.
+      // Opt-in via `tlx.async_tasks(less_reg_mma=True)`: it costs one extra
+      // add per MMA operand, so it only pays off in MMA-heavy tasks that
+      // actually spill.
+      // TODO: do it for TMEM operand too?
+      PTXBuilder ptxBuilder;
+      auto &addInstr = *ptxBuilder.create("add.s32");
+      auto *addOut = ptxBuilder.newOperand("=r");
+      auto *addLhs = ptxBuilder.newOperand(baseSrcb128, "r");
+      auto *addRhs = ptxBuilder.newOperand(tb.i32_val(smemByteOffsetb128), "r");
+      addInstr(addOut, addLhs, addRhs);
+      fullAddrb128 =
+          ptxBuilder.launch(rewriter, loc, i32_ty, /*hasSideEffect=*/true);
+    } else {
+      fullAddrb128 = tb.add(baseSrcb128, tb.i32_val(smemByteOffsetb128));
+    }
     Value addrMasked = tb.and_(fullAddrb128, tb.i32_val(0x7FFF));
     Value addr64 = tb.zext(i64_ty, addrMasked);
     Value descVal = tb.add(tb.int_val(64, currDesc.descriptor), addr64);
@@ -216,6 +231,9 @@ private:
   MMASMEMDescriptor desc;
   Value baseSrcb128;
   LinearLayout ll;
+  // Initialized here, unlike its neighbours, because the defaulted default
+  // constructor is used (`DotOpMmaSmemLoader aLoader;` in WGMMA.cpp).
+  bool lessRegMMA = false;
 
   static FailureOr<MMASMEMDescriptor>
   getDescriptor(Location loc, const LinearLayout &ll,
