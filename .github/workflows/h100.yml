@@ -4,6 +4,8 @@ on:
     branches:
       - main
   pull_request:
+    branches-ignore:
+      - release/3.8.x
   schedule:
     # Every 6 hours at :30 past (00:30, 06:30, 12:30, 18:30 UTC).
     - cron: '30 */6 * * *'
