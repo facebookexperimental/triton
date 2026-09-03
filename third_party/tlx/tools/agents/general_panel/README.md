@@ -3,6 +3,8 @@
 These are cross-cutting rules shared by the R&D, build, and perf-bench panels.
 Role-specific strategy belongs in the owning panel, not here.
 
+![TLX agent panel organization](../panel-organization.svg)
+
 ## 1. The harness decides
 
 The `kernel_optimization` CLI owns build, verification, benchmarking, and the
