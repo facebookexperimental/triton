@@ -2446,11 +2446,6 @@ void insertAsyncComm(
     const DenseMap<Channel *, std::pair<Operation *, Operation *>> &copyOpMap,
     DenseSet<Operation *> &regionsWithChannels, ReuseConfig *config) {
 
-  // The `tt.autows` switches are fixed for the whole function, so read them
-  // once here instead of re-walking and re-parsing per fused TMA barrier.
-  const bool twoCTADirectWait =
-      getAutoWSBooleanFlag(funcOp, kAutoWSTwoCTADirectWaitKey);
-
   // SubtiledRegionOp is a sequencing marker, not a control flow boundary.
   // Skip it when walking parent chains so that ops inside it are treated
   // as being at the same nesting level as the parent block.
@@ -4529,10 +4524,10 @@ void insertAsyncComm(
               funcOp.getContext(), masterChannel->relation.first,
               WSBarrierAttr::kDirectionForward)
               .build(funcOp.getContext());
-      optimizeTMALoads(
-          builder, tmaLoads, *commChannel.producerBarrier, bufferIdx, bufferIdx,
-          phase, tmaHeadProducer, headConsumer, consumerWaitPoint,
-          additionalConsumerTaskIds, waitConstraints, twoCTADirectWait);
+      optimizeTMALoads(builder, tmaLoads, *commChannel.producerBarrier,
+                       bufferIdx, bufferIdx, phase, tmaHeadProducer,
+                       headConsumer, consumerWaitPoint,
+                       additionalConsumerTaskIds, waitConstraints);
     }
   }
 
@@ -5578,82 +5573,6 @@ void doCodePartition(triton::FuncOp funcOp, unsigned numBuffers) {
     }
   }
 
-  // Collapse an ordered run of single-buffer TMEM channels onto its first
-  // member: the representative absorbs the consumer lists of every later
-  // channel whose endpoints pair up with its own, so the whole run needs one
-  // handshake instead of one per channel. `hasFusableEndpoints` picks the
-  // producer/consumer op kinds a run is made of; `requireSameAlloc`
-  // additionally pins the run to one TMEM allocation. Both 2-CTA fusions below
-  // differ only in those two knobs, so a change to the merge rules applies to
-  // both.
-  auto fuseOrderedTmemChannels =
-      [&](ArrayRef<Channel *> candidates,
-          llvm::function_ref<bool(Channel *)> hasFusableEndpoints,
-          bool requireSameAlloc) {
-        auto isFusable = [&](Channel *ch) {
-          return ch->channelKind == DataChannelKind::TMEMAlloc &&
-                 ch->getNumBuffers() == 1 && hasFusableEndpoints(ch);
-        };
-        for (size_t i = 0; i < candidates.size(); ++i) {
-          Channel *rep = candidates[i];
-          if (mergedChannels.contains(rep) || !isFusable(rep))
-            continue;
-          auto repIt = channelsGroupedByConsumers.find(rep);
-          if (repIt == channelsGroupedByConsumers.end())
-            continue;
-          for (size_t j = i + 1; j < candidates.size(); ++j) {
-            Channel *ch = candidates[j];
-            if (mergedChannels.contains(ch) || !isFusable(ch) ||
-                ch->relation != rep->relation ||
-                (requireSameAlloc && ch->getAllocOp() != rep->getAllocOp()) ||
-                ch->getSrcOp()->getBlock() != rep->getSrcOp()->getBlock() ||
-                ch->getDstOp()->getBlock() != rep->getDstOp()->getBlock())
-              continue;
-            auto chIt = channelsGroupedByConsumers.find(ch);
-            if (chIt == channelsGroupedByConsumers.end())
-              continue;
-            repIt->second.append(chIt->second.begin(), chIt->second.end());
-            channelsGroupedByConsumers.erase(chIt);
-            mergedChannels.insert(ch);
-          }
-        }
-      };
-
-  SmallVector<bool> autoWSFuseFlags = getAutoWSBooleanFlags(
-      funcOp, {kAutoWSFuseFinalStatsKey, kAutoWSFuseAccSlicesKey});
-
-  // The 2-CTA FA forward schedule stores its final softmax sum and maximum in
-  // adjacent slots of one physical TMEM allocation, then loads both in the
-  // default partition.  Their producer and consumer ops differ, so the exact
-  // consumer matching above leaves two token handshakes.  TLX uses one: wait
-  // before the first load, release after the last load, acquire before the
-  // first store, and commit after the last store.  Form the same ordered group
-  // only for opted-in, single-buffer TMEM store/load channels whose endpoints
-  // are in the same blocks and tasks.
-  if (autoWSFuseFlags[0]) {
-    auto isStoreToLoad = [](Channel *ch) {
-      return isa<ttng::TMEMStoreOp>(ch->getSrcOp()) &&
-             isa<ttng::TMEMLoadOp>(ch->getDstOp());
-    };
-    for (auto &group : config.groups)
-      fuseOrderedTmemChannels(group.channels, isStoreToLoad,
-                              /*requireSameAlloc=*/false);
-  }
-
-  // A subtiled accumulator has one MMAv5 producer and one TMEM-load consumer
-  // per slice. The slices share an allocation and advance in lockstep, so a
-  // single completion handshake can cover the ordered producer/consumer
-  // range: completion is attached to the last MMA and the wait is placed
-  // before the first load. This matches TLX's one accumulator barrier per
-  // compute group instead of one pair per slice.
-  if (autoWSFuseFlags[1]) {
-    auto isMmaToLoad = [](Channel *ch) {
-      return isa<ttng::MMAv5OpInterface>(ch->getSrcOp()) &&
-             isa<ttng::TMEMLoadOp>(ch->getDstOp());
-    };
-    fuseOrderedTmemChannels(orderedChannels, isMmaToLoad,
-                            /*requireSameAlloc=*/true);
-  }
   orderedChannels.erase(
       llvm::remove_if(orderedChannels,
                       [&](Channel *ch) { return mergedChannels.count(ch); }),
