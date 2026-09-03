@@ -13,6 +13,8 @@ on:
   release:
     types: [published]
   pull_request:
+    branches-ignore:
+      - release/3.8.x
     paths: [.github/workflows/create_release.yml]
 
 jobs:

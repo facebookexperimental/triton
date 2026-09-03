@@ -24,6 +24,8 @@ on:
       pythons:  { type: string, required: false, default: '["cp310","cp311","cp312","cp313","cp314"]' }
       arches:   { type: string, required: false, default: '["x86_64","aarch64"]' }
   pull_request:
+    branches-ignore:
+      - release/3.8.x
     paths:
       - .github/workflows/wheels_fb.yml
 

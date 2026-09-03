@@ -2,7 +2,9 @@ name: Integration Tests
 on:
   workflow_dispatch:
   pull_request:
-    branches-ignore: ['llvm-**']
+    branches-ignore:
+      - 'llvm-**'
+      - release/3.8.x
   merge_group:
     branches: [main, 'dev-**']
     types: [checks_requested]
