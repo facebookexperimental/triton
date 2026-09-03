@@ -31,33 +31,40 @@ def disable_semantic(semantic_name: str):
     _SEMANTICS.remove(_ALL_SEMANTICS[semantic_name])
 
 
-def record(is_start: tl.constexpr, scope_name: tl.constexpr, semantic):
+@builtin
+def record(is_start: tl.constexpr, scope_name: tl.constexpr, predicate=True, _semantic=None):
     if not flags.instrumentation_on:
         return
-    _check_supported_semantic(semantic)
+    _check_supported_semantic(_semantic)
     is_start = tl._unwrap_if_constexpr(is_start)
     scope_name = tl._unwrap_if_constexpr(scope_name)
-    return tl.tensor(triton_proton.create_proton_record(semantic.builder, is_start, scope_name), tl.void)
+    predicate = tl._unwrap_if_constexpr(predicate)
+    if predicate is False:
+        return
+    predicate_handle = None if predicate is True else predicate.handle
+    handle = triton_proton.create_proton_record(_semantic.builder, is_start, scope_name, predicate_handle)
+    return tl.tensor(handle, tl.void)
 
 
 @builtin
-def enter_scope(name: tl.constexpr, _semantic=None):
-    record(is_start=True, scope_name=name, semantic=_semantic)
+def enter_scope(name: tl.constexpr, predicate=True, _semantic=None):
+    record(is_start=True, scope_name=name, predicate=predicate, _semantic=_semantic)
 
 
 @builtin
-def exit_scope(name: tl.constexpr, _semantic=None):
-    record(is_start=False, scope_name=name, semantic=_semantic)
+def exit_scope(name: tl.constexpr, predicate=True, _semantic=None):
+    record(is_start=False, scope_name=name, predicate=predicate, _semantic=_semantic)
 
 
 class scope:
 
-    def __init__(self, name: str, _semantic=None):
+    def __init__(self, name: str, predicate=True, _semantic=None):
         self.name = name
+        self.predicate = predicate
         self.semantic = _semantic
 
     def __enter__(self):
-        enter_scope(self.name, _semantic=self.semantic)
+        enter_scope(self.name, predicate=self.predicate, _semantic=self.semantic)
 
     def __exit__(self, exc_type, exc_value, traceback):
-        exit_scope(self.name, _semantic=self.semantic)
+        exit_scope(self.name, predicate=self.predicate, _semantic=self.semantic)

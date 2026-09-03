@@ -105,7 +105,8 @@ LogicalResult replaceProtonRecordOp(OpBuilder &builder, FuncOp func,
                                                      clkType, metricType);
           int scopeId = scopeInfo.getOpScopeId(record);
           gpu::CircularStoreOp::create(builder, record.getLoc(), newSegment,
-                                       counter, record.getIsStart(), scopeId);
+                                       counter, record.getIsStart(), scopeId,
+                                       record.getPredicate());
           record.erase();
         });
 
@@ -132,7 +133,8 @@ LogicalResult replaceProtonRecordOp(OpBuilder &builder, FuncOp func,
                                                clkType, metricType);
     int scopeId = scopeInfo.getOpScopeId(record);
     gpu::CircularStoreOp::create(builder, record.getLoc(), segment, counter,
-                                 record.getIsStart(), scopeId);
+                                 record.getIsStart(), scopeId,
+                                 record.getPredicate());
     record.erase();
   });
 

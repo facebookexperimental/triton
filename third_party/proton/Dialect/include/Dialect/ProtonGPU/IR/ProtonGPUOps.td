@@ -47,13 +47,22 @@ def PTG_CircularStoreOp : PTG_Op<"circular_store", [
     PTG_SegmentType:$segment,
     AnyTypeOf<[I32, I64]>:$counter,
     UnitAttr:$isStart,
-    I32Attr:$scopeId
+    I32Attr:$scopeId,
+    Optional<I1>:$predicate
   );
+
+  let builders = [
+    OpBuilder<(ins "Value":$segment, "Value":$counter, "bool":$isStart,
+                   "int32_t":$scopeId), [{
+      build($_builder, $_state, segment, counter, isStart, scopeId,
+            /*predicate=*/static_cast<mlir::Value>(nullptr));
+    }]>
+  ];
 
   let hasVerifier = 1;
 
   let assemblyFormat = [{
-    (`start` $isStart^):(`end`)? $segment `,` $counter attr-dict `:`
+    (`start` $isStart^):(`end`)? $segment `,` $counter (`if` $predicate^)? attr-dict `:`
     qualified(type($segment)) `,` type($counter)
   }];
 }

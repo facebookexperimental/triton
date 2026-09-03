@@ -3,11 +3,17 @@
 module {
   // CHECK-LABEL: proton_record
   tt.func @proton_record() {
+    // CHECK: %[[PRED:.*]] = arith.constant true
     // CHECK: proton.record start "name0"
     // CHECK: proton.record end "name0"
+    // CHECK: proton.record start "name1" if %[[PRED]]
+    // CHECK: proton.record end "name1" if %[[PRED]]
     // CHECK-NEXT: tt.return
+    %pred = arith.constant true
     proton.record start "name0"
     proton.record end "name0"
+    proton.record start "name1" if %pred
+    proton.record end "name1" if %pred
     tt.return
   }
 } // end module
@@ -26,6 +32,8 @@ module attributes {"ttg.num-warps" = 8 : i32} {
     // CHECK-NEXT: proton_gpu.init_ctx
     // CHECK-NEXT: proton_gpu.read_counter
     // CHECK-NEXT: proton_gpu.circular_store start
+    // CHECK-NEXT: %[[PRED:.*]] = arith.constant true
+    // CHECK-NEXT: proton_gpu.circular_store end {{.*}} if %[[PRED]]
     // CHECK-NEXT: ttg.barrier
     // CHECK-NEXT: proton_gpu.save_ctx
     // CHECK-NEXT: proton_gpu.finalize
@@ -37,6 +45,8 @@ module attributes {"ttg.num-warps" = 8 : i32} {
     proton_gpu.init_ctx %1 : !tt.ptr<i32>
     %3 = proton_gpu.read_counter : i32
     proton_gpu.circular_store start %seg, %3 {scopeId = 0 : i32} : !proton_gpu.segment<256, #shared, warp>, i32
+    %pred = arith.constant true
+    proton_gpu.circular_store end %seg, %3 if %pred {scopeId = 0 : i32} : !proton_gpu.segment<256, #shared, warp>, i32
     ttg.barrier global_read|global_write|local
     proton_gpu.save_ctx %seg, %1: !proton_gpu.segment<256, #shared, warp>, !tt.ptr<i32>
     proton_gpu.finalize %seg, %1 : !proton_gpu.segment<256, #shared, warp>, !tt.ptr<i32>
