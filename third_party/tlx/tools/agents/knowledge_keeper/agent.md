@@ -14,5 +14,4 @@ Never choose experiments, dispatch workers, or edit TL strategy. Never commit a 
 
 ## Callback
 
-Return either a proposed knowledge patch with evidence and scope, `no_generalizable_insight` with a reason, or `needs_approval` identifying the exact human review required. A rejected or unexplained win must not be promoted as a confirmed mechanism.
-
+Return exactly one explicit outcome: `NOTHING_TO_UPDATE` with the reason no confirmed result generalizes, or `PROPOSAL_REQUIRES_APPROVAL` with the proposed text, evidence, scope, and exact human review required. Include `affects_tl_reasoning=yes|no`. When it is `yes`, the Manager must pause all further TL findings and Worker dispatch until the human approves or rejects the proposal. A rejected or unexplained win must not be promoted as a confirmed mechanism.

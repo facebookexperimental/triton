@@ -147,13 +147,94 @@ def _report_candidate_summary(experiment_id: str, proposal: object) -> None:
         ("hypothesis", getattr(proposal, "hypothesis", "")),
         ("evidence", getattr(proposal, "evidence", "")),
         ("change", getattr(proposal, "summary", "")),
-        ("expected", getattr(proposal, "expected_effect", "")),
+        ("predicted_signal", getattr(proposal, "expected_effect", "")),
         ("risk", getattr(proposal, "risk", "")),
+        ("falsifier", getattr(proposal, "falsifier", "")),
+        ("scope", getattr(proposal, "change_scope", "kernel-python")),
     )
     details = " ".join(
         f"{name}={value!r}" for name, value in fields if value
     ) or "change='candidate source edited'"
-    print(f"[tlx-agent] {experiment_id} {details}", file=sys.stderr, flush=True)
+    print(
+        f"[tlx-agent] TL_FINDING id={experiment_id} {details} recipient=worker",
+        file=sys.stderr,
+        flush=True,
+    )
+    print(
+        f"[tlx-agent] WORKER_REPORT worker={experiment_id} {details} recipient=TL",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
+def _correctness_counts(performance: PerformanceSummary) -> tuple[int, int]:
+    return (
+        sum(case.verification.passed for case in performance.cases),
+        len(performance.cases),
+    )
+
+
+def _report_correctness_callback(
+    experiment_id: str,
+    performance: PerformanceSummary,
+) -> None:
+    passed, total = _correctness_counts(performance)
+    status = "PASS" if passed == total else "FAIL"
+    print(
+        f"[tlx-agent] CORRECTNESS_CALLBACK worker={experiment_id} status={status} "
+        f"shapes={passed}/{total} recipient=worker,TL",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
+def _report_worker_final(
+    experiment_id: str,
+    proposal: object,
+    source_path: Path,
+    correctness: PerformanceSummary,
+) -> None:
+    passed, total = _correctness_counts(correctness)
+    status = "PASS" if passed == total else "FAIL"
+    scope = getattr(proposal, "change_scope", "kernel-python") or "kernel-python"
+    print(
+        f"[tlx-agent] FINAL worker={experiment_id} scope={scope} "
+        f"files=kernel-python:1,compiler:0 artifact={source_path} "
+        f"correctness_callback={status}({passed}/{total}) recipient=TL",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
+def _report_tl_perf_request(experiment_id: str, case_count: int) -> None:
+    print(
+        f"[tlx-agent] TL_PERF_REQUEST worker={experiment_id} shapes=ALL({case_count}) "
+        "recipient=performance-validator",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
+def _report_perf_callback(
+    experiment_id: str,
+    performance: PerformanceSummary | None,
+    *,
+    expected_cases: int,
+    status: str,
+) -> None:
+    if performance is None:
+        shape_text = f"0/{expected_cases}"
+        correct_text = f"0/{expected_cases}"
+    else:
+        passed, total = _correctness_counts(performance)
+        shape_text = f"{len(performance.cases)}/{expected_cases}"
+        correct_text = f"{passed}/{total}"
+    print(
+        f"[tlx-agent] PERF_CALLBACK worker={experiment_id} status={status} "
+        f"shapes={shape_text} correctness={correct_text} recipient=TL",
+        file=sys.stderr,
+        flush=True,
+    )
 
 
 def _report_performance(
@@ -483,6 +564,12 @@ class KernelOptimizer:
         ]
         store.write_json("experiments/baseline/result.json", baseline)
         _report_performance("baseline", "baseline", baseline)
+        _report_perf_callback(
+            "baseline",
+            baseline,
+            expected_cases=len(request.cases),
+            status="BASELINE",
+        )
 
         best_source = request.kernel_source
         best_performance = baseline
@@ -548,23 +635,54 @@ class KernelOptimizer:
                         )
                         raise ValueError(f"candidate source duplicates {origin}")
                     seen_sources.add(digest)
-                    _report_performance(experiment_id, "evaluating", None)
-                    performance = harness.evaluate(
+                    _report_performance(experiment_id, "correctness", None)
+                    correctness = harness.evaluate(
                         proposal.source,
                         request.cases,
                         request.target,
                         request.budget.benchmark_repetitions,
-                        profile=_profile_request(
-                            artifacts_dir,
+                        benchmark=False,
+                    )
+                    _report_correctness_callback(experiment_id, correctness)
+                    _report_worker_final(
+                        experiment_id,
+                        proposal,
+                        candidate_artifacts.source_path,
+                        correctness,
+                    )
+                    if not passes_protected_cases(correctness, request.cases):
+                        performance = replace(correctness, aggregate_speedup=0.0)
+                        speedup = 0.0
+                        _report_perf_callback(
                             experiment_id,
-                            level="summary",
-                            reason="candidate",
-                        ),
-                    )
-                    speedup = weighted_geometric_speedup(
-                        baseline, performance, request.cases
-                    )
-                    performance = replace(performance, aggregate_speedup=speedup)
+                            None,
+                            expected_cases=len(request.cases),
+                            status="BLOCKED_BY_CORRECTNESS",
+                        )
+                    else:
+                        _report_tl_perf_request(experiment_id, len(request.cases))
+                        performance = harness.evaluate(
+                            proposal.source,
+                            request.cases,
+                            request.target,
+                            request.budget.benchmark_repetitions,
+                            profile=_profile_request(
+                                artifacts_dir,
+                                experiment_id,
+                                level="summary",
+                                reason="candidate",
+                            ),
+                        )
+                        speedup = weighted_geometric_speedup(
+                            baseline, performance, request.cases
+                        )
+                        performance = replace(performance, aggregate_speedup=speedup)
+                        _report_perf_callback(
+                            experiment_id,
+                            performance,
+                            expected_cases=len(request.cases),
+                            status="MEASURED",
+                        )
                     if _is_correct_and_stable(
                         performance,
                         request.budget,
@@ -594,6 +712,12 @@ class KernelOptimizer:
                             baseline, performance, request.cases
                         )
                         performance = replace(performance, aggregate_speedup=speedup)
+                        _report_perf_callback(
+                            experiment_id,
+                            performance,
+                            expected_cases=len(request.cases),
+                            status="REMEASURED",
+                        )
                     # Persist per-case profiles for this candidate regardless of promotion.
                     perf_profiles = _profiles_by_case(performance)
                     profile_path = store.write_profile(experiment_id, perf_profiles)
@@ -621,6 +745,8 @@ class KernelOptimizer:
                         risk=proposal.risk,
                         commit_title=proposal.commit_title,
                         commit_summary=proposal.commit_summary,
+                        falsifier=proposal.falsifier,
+                        change_scope=proposal.change_scope,
                         profile_path=profile_path,
                     )
                     rejection_diagnostics = "; ".join(

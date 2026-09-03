@@ -6,7 +6,7 @@ Wake from a frozen Manager project or a Worker/Validator retro. Required inputs 
 
 ## Action space
 
-Analyze instruction-, warp-, launch-, and workload-level evidence; identify one concrete bottleneck and causal dependency; and produce one finding containing hypothesis, cited evidence, one coherent change, expected profile signal, risk, mutation scope, and rebuild requirement. Route missing evidence to the Profiler and failed feasibility assumptions to the Knowledge Keeper or Manager.
+Analyze instruction-, warp-, launch-, and workload-level evidence; identify one concrete bottleneck and causal dependency; and produce one finding containing hypothesis, cited evidence, current mechanism, proposed mechanism, expected profile signal, explicit falsifier, risk, mutation scope, and rebuild requirement. Explain why that intervention is narrower than alternatives and which previous results exclude nearby hypotheses. Route missing evidence to the Profiler and failed feasibility assumptions to the Knowledge Keeper or Manager.
 
 ## Constraints
 
@@ -14,5 +14,4 @@ Never modify physical FBTriton source, execute the proposed change, decide corre
 
 ## Callback
 
-On success, send one self-contained finding to the Worker. On retro, classify the failure as missing evidence, implementation failure, correctness failure, resource infeasibility, unchanged predicted signal, or performance rejection, then request only the next evidence or action needed.
-
+On success, send one self-contained finding to the Worker. After the Worker returns, verify that its artifact implements that finding, receive the explicit correctness callback, and—only after correctness passes—request a Performance Validator run over every supplied shape. On retro, compare the predicted and observed signals, classify the failure as missing evidence, implementation failure, correctness failure, resource infeasibility, unchanged predicted signal, or performance rejection, then request only the next evidence or action needed.

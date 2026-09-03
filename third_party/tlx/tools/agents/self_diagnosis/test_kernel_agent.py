@@ -1111,6 +1111,10 @@ class KernelOptimizerTest(unittest.TestCase):
 
             output = stderr.getvalue()
             self.assertIn("[tlx-agent] baseline status=baseline", output)
+            self.assertIn(
+                "PERF_CALLBACK worker=baseline status=BASELINE shapes=1/1",
+                output,
+            )
             self.assertIn("median=100.000us", output)
             self.assertIn("[tlx-agent] r001-c000 status=artifacts", output)
             self.assertIn("incremental_patch=", output)
@@ -1121,7 +1125,21 @@ class KernelOptimizerTest(unittest.TestCase):
             self.assertIn("[tlx-agent] r001-c000 incremental-diff-end", output)
             self.assertIn("[tlx-agent] r001-c000 status=rejected", output)
             self.assertIn("speedup=0.8333x", output)
-            self.assertIn("[tlx-agent] r001-c001 change='faster'", output)
+            self.assertIn("TL_FINDING id=r001-c001", output)
+            self.assertIn("change='faster'", output)
+            self.assertIn("WORKER_REPORT worker=r001-c001", output)
+            self.assertIn(
+                "CORRECTNESS_CALLBACK worker=r001-c001 status=PASS shapes=1/1",
+                output,
+            )
+            self.assertIn("FINAL worker=r001-c001 scope=kernel-python", output)
+            self.assertIn("artifact=", output)
+            self.assertIn("correctness_callback=PASS(1/1) recipient=TL", output)
+            self.assertIn("TL_PERF_REQUEST worker=r001-c001 shapes=ALL(1)", output)
+            self.assertIn(
+                "PERF_CALLBACK worker=r001-c001 status=MEASURED shapes=1/1",
+                output,
+            )
             self.assertIn("[tlx-agent] r001-c001 status=promoted", output)
             self.assertIn("speedup=1.2500x", output)
             self.assertIn("decision=correct and exceeded speedup threshold", output)
@@ -1319,7 +1337,12 @@ class KernelOptimizerTest(unittest.TestCase):
             )
         )
         harness = Mock()
-        harness.evaluate.side_effect = [baseline, candidate, rejected_final]
+        harness.evaluate.side_effect = [
+            baseline,
+            candidate,
+            candidate,
+            rejected_final,
+        ]
         provider = FixedCandidateProvider(
             [CandidateProposal(candidate_source, "faster before final revalidation")]
         )

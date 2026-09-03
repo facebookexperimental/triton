@@ -55,7 +55,10 @@ The complete current source is available as `candidate.py` in your writable work
 directory. Edit that file directly and leave it as the complete replacement source. Also
 write `candidate_metadata.json` with integer `schema_version` set to 1 and these string
 fields: `hypothesis`, `evidence`, `change`, `expected_effect`, `risk`, `commit_title`,
-and `commit_summary`. The first five fields must each be one line and under 240 characters.
+`commit_summary`, `falsifier`, and `change_scope`. The first six fields other than
+`commit_summary` must each be one line and under 240 characters.
+`change_scope` must be one of `config-only`, `kernel-python`, `compiler-native`, or
+`tooling`; this source-replacement provider normally uses one of the first two.
 `commit_title` must be an imperative, one-line title under 80 characters that describes the
 actual source change, without performance claims or attribution. `commit_summary` must be
 under 4000 characters and contain exactly two clearly labeled
@@ -79,6 +82,8 @@ class CandidateProposal:
     risk: str = ""
     commit_title: str = ""
     commit_summary: str = ""
+    falsifier: str = ""
+    change_scope: str = "kernel-python"
 
 
 @dataclass(frozen=True)
@@ -142,6 +147,8 @@ _SHORT_METADATA_FIELDS = (
     "change",
     "expected_effect",
     "risk",
+    "falsifier",
+    "change_scope",
 )
 
 
@@ -274,6 +281,8 @@ class CodexCandidateProvider:
             risk=metadata["risk"],
             commit_title=metadata["commit_title"],
             commit_summary=metadata["commit_summary"],
+            falsifier=metadata["falsifier"],
+            change_scope=metadata["change_scope"] or "kernel-python",
         )
 
 
