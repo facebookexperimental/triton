@@ -5004,11 +5004,11 @@ void removeRedundantTmemZeroStores(triton::FuncOp funcOp) {
           zeroStoreParentLoop &&
           (zeroStoreParentLoop == mmaParentLoop.getOperation() ||
            zeroStoreParentLoop->isProperAncestor(mmaParentLoop));
-      // The loop is known to run at least once either from an explicit
-      // tt.assume_nonempty annotation, or from a tl.assume(hi > lo) on its
-      // bounds, which needs no separate annotation.
+      // The loop is known to run at least once from a tl.assume(hi > lo) on its
+      // bounds. Unlike a loop annotation, that binds to the loop's own bound
+      // SSA values, so it cannot be forwarded onto an inner loop nobody
+      // asserted.
       bool knownNonEmpty =
-          mmaParentLoop->hasAttr("tt.assume_nonempty") ||
           triton::isLoopTripCountKnownPositive(mmaParentLoop, dominance);
       bool dominatesKnownNonEmptyLoop =
           knownNonEmpty &&
