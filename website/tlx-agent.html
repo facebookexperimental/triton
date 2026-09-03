@@ -77,7 +77,7 @@ def profile(build_artifact, case: dict, request: dict | None = None): ...</code>
 <p>Candidate generation must not edit the frozen bundle. This prevents the search from improving its score by weakening correctness or changing the workload.</p>
 <h2 id="run-the-cli">Run the CLI</h2>
 <p>From the repository root:</p>
-<pre><code class="language-bash">PYTHONPATH=&lt;repo-root&gt; python -m third_party.tlx.tools.agents.rd_panel.kernel_optimization.cli \
+<pre><code class="language-bash">PYTHONPATH=&lt;repo-root&gt; python -m third_party.tlx.tools.agents.manager.cli \
   --kernel &lt;absolute-kernel.py&gt; \
   --harness &lt;absolute-bundle/harness.py&gt; \
   --cases &lt;absolute-bundle/cases.json&gt; \

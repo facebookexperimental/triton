@@ -193,9 +193,9 @@ async-task or warp mapping files, and the exact commands that generated them.
 Large payloads are spilled into the agent artifact directory automatically.
 
 Generic Proton guidance lives in
-`third_party/tlx/tools/agents/kernel_optimization/docs/profiling/proton.md`.
+`third_party/tlx/tools/agents/profiler/docs/proton.md`.
 CUDA/NVIDIA bundles must follow
-`third_party/tlx/tools/agents/kernel_optimization/docs/profiling/nvidia-ncu.md`.
+`third_party/tlx/tools/agents/profiler/docs/nvidia-ncu.md`.
 Other targets must not fabricate
 NVIDIA fields. Unsupported counters are omitted or represented as `null` with
 diagnostics, never silently converted to zero.
