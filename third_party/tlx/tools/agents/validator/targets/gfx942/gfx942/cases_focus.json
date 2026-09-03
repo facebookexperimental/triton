@@ -1,0 +1,62 @@
+[
+  {
+    "case_id": "tall_narrow_n_819200x192x1024",
+    "parameters": {"m": 819200, "n": 192, "k": 1024, "dtype": "float16", "seed": 0},
+    "weight": 1.0,
+    "protected": true
+  },
+  {
+    "case_id": "wide_n_4096x242432x1894",
+    "parameters": {"m": 4096, "n": 242432, "k": 1894, "dtype": "float16", "seed": 1},
+    "weight": 1.0,
+    "protected": true
+  },
+  {
+    "case_id": "wide_n_1024x20480x6144",
+    "parameters": {"m": 1024, "n": 20480, "k": 6144, "dtype": "float16", "seed": 2},
+    "weight": 1.0,
+    "protected": true
+  },
+  {
+    "case_id": "target_2048x10240x25408",
+    "parameters": {"m": 2048, "n": 10240, "k": 25408, "dtype": "float16", "seed": 3},
+    "weight": 10.0,
+    "protected": true
+  },
+  {
+    "case_id": "large_61440x5120x2048",
+    "parameters": {"m": 61440, "n": 5120, "k": 2048, "dtype": "float16", "seed": 4},
+    "weight": 1.0,
+    "protected": true
+  },
+  {
+    "case_id": "tall_narrow_n_2252800x256x256",
+    "parameters": {"m": 2252800, "n": 256, "k": 256, "dtype": "float16", "seed": 5},
+    "weight": 1.0,
+    "protected": true
+  },
+  {
+    "case_id": "large_61440x3840x4096",
+    "parameters": {"m": 61440, "n": 3840, "k": 4096, "dtype": "float16", "seed": 6},
+    "weight": 1.0,
+    "protected": true
+  },
+  {
+    "case_id": "square_4096x4096x2048",
+    "parameters": {"m": 4096, "n": 4096, "k": 2048, "dtype": "float16", "seed": 7},
+    "weight": 1.0,
+    "protected": true
+  },
+  {
+    "case_id": "large_k_61440x5120x7744",
+    "parameters": {"m": 61440, "n": 5120, "k": 7744, "dtype": "float16", "seed": 8},
+    "weight": 1.0,
+    "protected": true
+  },
+  {
+    "case_id": "wide_n_1024x6144x4096",
+    "parameters": {"m": 1024, "n": 6144, "k": 4096, "dtype": "float16", "seed": 9},
+    "weight": 1.0,
+    "protected": true
+  }
+]
