@@ -3,9 +3,9 @@
 Each workgroup owns a KV tile and a subset of its mapped query heads.  The
 baseline path uses BN128/BM16 phases; long non-causal split-GQA uses masked
 BN256/BM32 phases and forms dQ as two native BM16 accumulator chains.  Split
-workgroups reduce their BF16 dK/dV partials in FP32.  Independent KV owners
-combine dQ contributions with BF16 atomics in a guarded native layout,
-followed by a conversion to packed THD order.
+workgroups preserve FP32 dK/dV partials through their final reduction.
+Independent KV owners combine dQ contributions with BF16 atomics in a guarded
+native layout, followed by a conversion to packed THD order.
 
 Call :func:`prepare_varlen_backward` once and reuse the resulting plan with
 :func:`fa_varlen_backward`.  Plan creation performs one device-to-host
@@ -32,6 +32,11 @@ _WIDE_BLOCK_M = 32
 _WIDE_BLOCK_N = 256
 _HEAD_DIM = 128
 _I32_BUFFER_BF16_ELEMENTS = 1 << 30
+_I32_BUFFER_FP32_ELEMENTS = _I32_BUFFER_BF16_ELEMENTS // 2
+# Local gfx950 sweeps found that the BM32/BN256 split kernel's wider tiles and
+# dK/dV reduction amortize their overhead at roughly 1024 query-head/BM16-block
+# phases per KV head.  This keeps max-Q 300/400 workloads on BM16/BN128 while
+# the max-Q 5662 SGLang-like GQA3/GQA8 workloads use the split path.
 _VARLEN_GQA_SPLIT_WORK_THRESHOLD = 1024
 
 
@@ -201,10 +206,10 @@ def _select_varlen_kernel_blocks(group_size: int, kv_splits: int) -> tuple[int, 
 
 
 def _allocate_varlen_dkdv_partials(k: torch.Tensor, kv_splits: int) -> tuple[torch.Tensor | None, torch.Tensor | None]:
-    if kv_splits == 1 or k.numel() * kv_splits > _I32_BUFFER_BF16_ELEMENTS:
+    if kv_splits == 1 or k.numel() * kv_splits > _I32_BUFFER_FP32_ELEMENTS:
         return None, None
     total_kv, kv_heads, head_dim = k.shape
-    dk_part = torch.empty((total_kv, kv_heads, kv_splits, head_dim), dtype=k.dtype, device=k.device)
+    dk_part = torch.empty((total_kv, kv_heads, kv_splits, head_dim), dtype=torch.float32, device=k.device)
     return dk_part, torch.empty_like(dk_part)
 
 
@@ -798,8 +803,8 @@ def _varlen_bwd_interleaved_bm32_kernel(
     output_offsets = tlx.require_layout(output_offsets, kv_native_layout, pin=False)
     output_mask = tl.broadcast_to((store_n < kv_valid_rows)[:, None], (BLOCK_N, D))
     output_mask = tlx.require_layout(output_mask, kv_native_layout, pin=False)
-    tlx.buffer_store(dk.to(tl.bfloat16), output_ptr, output_offsets, mask=output_mask)
-    tlx.buffer_store(dv.to(tl.bfloat16), output_v_ptr, output_offsets, mask=output_mask)
+    tlx.buffer_store(dk, output_ptr, output_offsets, mask=output_mask)
+    tlx.buffer_store(dv, output_v_ptr, output_offsets, mask=output_mask)
 
 
 @triton.jit
@@ -1080,13 +1085,16 @@ def _varlen_bwd_interleaved_kernel(
     else:
         partial_offsets = (((global_n[:, None] * HKV + kv_head) * KV_SPLITS + split) * D + offs_d[None, :])
         output_offsets = tlx.require_layout(partial_offsets.to(tl.int32), mma_nd, pin=False)
+    if KV_SPLITS == 1:
+        dk = dk.to(tl.bfloat16)
+        dv = dv.to(tl.bfloat16)
     if FULL_KV_TILE:
-        tlx.buffer_store(dk.to(tl.bfloat16), DK, output_offsets)
-        tlx.buffer_store(dv.to(tl.bfloat16), DV, output_offsets)
+        tlx.buffer_store(dk, DK, output_offsets)
+        tlx.buffer_store(dv, DV, output_offsets)
     else:
         output_mask = tlx.require_layout(tl.broadcast_to(kv_mask, (BLOCK_N, D)), mma_nd, pin=False)
-        tlx.buffer_store(dk.to(tl.bfloat16), DK, output_offsets, mask=output_mask)
-        tlx.buffer_store(dv.to(tl.bfloat16), DV, output_offsets, mask=output_mask)
+        tlx.buffer_store(dk, DK, output_offsets, mask=output_mask)
+        tlx.buffer_store(dv, DV, output_offsets, mask=output_mask)
 
 
 @triton.jit
