@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import difflib
 import hashlib
 import re
 import subprocess
@@ -110,6 +111,23 @@ def validate_replacement_source(candidate: str, current: str) -> None:
 
 def canonicalize_source(source: str) -> str:
     return source.strip() + "\n"
+
+
+def source_diff(
+    before: str,
+    after: str,
+    *,
+    fromfile: str,
+    tofile: str,
+) -> str:
+    return "".join(
+        difflib.unified_diff(
+            canonicalize_source(before).splitlines(keepends=True),
+            canonicalize_source(after).splitlines(keepends=True),
+            fromfile=fromfile,
+            tofile=tofile,
+        )
+    )
 
 
 def source_digest(source: str) -> str:

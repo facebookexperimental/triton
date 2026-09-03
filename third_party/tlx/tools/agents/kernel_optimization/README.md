@@ -58,6 +58,12 @@ python -m third_party.tlx.tools.agents.kernel_optimization.cli \
   --max-rounds 5 \
   --provider codex --arch blackwell
 
+# Continue from a completed run without adopting its winner:
+python -m third_party.tlx.tools.agents.kernel_optimization.cli \
+  --kernel my_kernel.py --output-dir /tmp/tlx-kernel-agent-next \
+  --prior-run /tmp/tlx-kernel-agent-run \
+  --provider codex --arch blackwell
+
 # A revalidated winner is committed by default:
 python -m third_party.tlx.tools.agents.kernel_optimization.cli \
   --kernel my_kernel.py --output-dir /tmp/tlx-kernel-agent-run \
@@ -67,20 +73,29 @@ python -m third_party.tlx.tools.agents.kernel_optimization.cli \
 
 `--arch` selects `harnesses/<arch>/targets/<kernel>`; `harness`/`cases`/`target` can also be passed explicitly.
 
+`--prior-run` accepts a completed output directory or its `experiments.json`. It
+imports recomputed source hashes for exact cross-run deduplication and bounded,
+sanitized experiment evidence for candidate prompts. It never mutates prior
+artifacts or adopts the prior winner; the current kernel is always rebuilt and
+validated as the new baseline.
+
 `--reference-kernel` is optional: a trusted oracle kernel. When provided it is persisted to `reference_kernel.py` in the output dir, exposed to harness workers via `TLX_REFERENCE_KERNEL_PATH`, and shown (truncated) to Codex in the prompt as comparison context. `verify` may load it to compare candidate vs reference.
 
 `--provider` is `codex` (default, shells `codex exec`) or `mock` (deterministic stub for
 CI that replays canned candidates or echoes the current source). When `codex` is not
 installed the provider fails fast with a clear error suggesting `--provider mock`.
 
-Winner commits are enabled by default and run only after successful final revalidation.
-Use `--no-commit-winner` for artifact-only runs. The CLI
+Promotion checkpoint commits are enabled by default. Every candidate that passes the
+promotion gates is committed immediately before the next candidate is generated. Use
+`--no-commit-winner` for artifact-only runs. The CLI
 finds the repository from the absolute kernel path and supports `--vcs auto|git|hg` without
-using `sl`. Every generated commit includes the body line `TLX agent authored`. Existing
-unrelated staged and dirty work is preserved. If the target was already dirty, only the
-baseline-to-winner delta is committed and the original target edits remain unstaged/dirty;
-overlapping edits fail safely. Exit code `3` means optimization succeeded but commit failed,
-and `best_kernel.py` remains available. Commit metadata is written to `auto_commit.json`.
+using `sl`. Every promoted-candidate commit includes the body line `TLX agent authored`.
+Existing unrelated staged and dirty work is preserved. If the target was already dirty, only
+the Agent delta is committed and the original target edits remain unstaged/dirty; overlapping
+edits fail safely. If final revalidation fails after promotions, the Agent creates a forward
+rollback commit without the winner attribution and keeps the checkpoint commits in history.
+Exit code `3` means a promotion or rollback commit failed. Ordered commit metadata is written
+to `promotion_commits.json`; the compatibility summary remains in `auto_commit.json`.
 
 The optimizer reports baseline, every candidate, and final revalidation performance
 to stderr as soon as each evaluation completes. Each line includes status, aggregate
@@ -112,11 +127,20 @@ auto_commit.json             # present when --commit-winner reaches finalization
 artifacts/profile_traces/   # spilled large profile payloads
 experiments/
   baseline/{kernel.py, result.json, profile.json}
-  r001-c000/{kernel.py, result.json, profile.json}
+  r001-c000/{kernel.py, incremental.patch, cumulative.patch, result.json, profile.json}
   r001-c001/...
 ```
 
-`--harness-mode` is retained for compatibility and currently always uses subprocess
+Every returned candidate source is cached before deduplication, compilation, correctness,
+or performance evaluation. `incremental.patch` compares against the exact current-best
+parent used to generate that action; `cumulative.patch` compares against the original run
+baseline. The live log records the absolute artifact paths and prints the complete incremental
+patch between `incremental-diff-begin` and `incremental-diff-end` markers before evaluation.
+Failed, duplicate, and rejected candidates keep these artifacts and log entries. If the
+provider fails before returning source, the experiment has no patch paths because no candidate
+exists to diff.
+
+`--harness-mode` is retained for compatibility
 isolation in the CLI path; `StandaloneHarness` is available via the Python API.
 
 ## TLX GEMM example
@@ -130,17 +154,25 @@ requests or NCU collection.
 
 ### Target-supplied profiling
 
+Canonical workflow guidance lives in `docs/profiling/proton.md` for Proton and
+`docs/profiling/nvidia-ncu.md` for NVIDIA NCU. These documents guide harness and
+run orchestration; they are not injected into candidate source prompts.
+
 A target harness may implement `profile(build_artifact, case, request)` to honor structured
 profile requests. Missing tools, unsupported metrics, and profiler failures should be returned
-as diagnostics so correctness and benchmark results remain usable.
+as diagnostics so correctness and benchmark results remain usable. Before freezing a CUDA
+bundle, smoke-test that an expected Proton main launch has nonzero time and NCU duration is
+non-null when those tools are available.
 
 - **Triton Proton launch attribution:** handle `tools=["proton_launch"]` with an absolute
   `artifacts_dir`. A supporting harness should warm up, synchronize, collect one
-  launch-attribution-only Proton tree, save raw artifacts, and return normalized totals.
+  launch-attribution-only Proton tree, save raw artifacts, and call
+  `parse_proton_launch_attribution()` with the target's exact `main_scope`.
 - **Native profiler:** handle `tools=["native_profiler"]` by mapping this portable name to the
-  target platform profiler. NVIDIA requests are resolved to NCU, and a supporting harness may
-  collect summary or deep metrics and save command/query/CSV/stderr artifacts. Explicit `ncu`
-  remains a compatible NVIDIA-only request.
+  target platform profiler. NVIDIA requests are resolved to NCU. Collect into an `.ncu-rep`,
+  then call `export_ncu_report_details()` to persist and parse the details CSV; collection
+  stdout contains status messages rather than metric rows when `--export` is used. Explicit
+  `ncu` remains a compatible NVIDIA-only request.
 - **Diagnostic instrumentation:** `proton_intra_kernel` requires a target-supplied instrumented
   replay. Instrumented source and timing must never be benchmarked, promoted, or committed.
 

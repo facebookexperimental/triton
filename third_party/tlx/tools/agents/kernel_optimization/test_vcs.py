@@ -6,7 +6,15 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from .vcs import ATTRIBUTION, AutoCommitError, commit_winner, prepare_auto_commit
+from .vcs import (
+    ATTRIBUTION,
+    AutoCommitError,
+    AutoCommitSession,
+    commit_promotion,
+    commit_rollback,
+    commit_winner,
+    prepare_auto_commit,
+)
 
 
 def _run(command: list[str], cwd: Path) -> str:
@@ -71,6 +79,82 @@ class GitAutoCommitTest(unittest.TestCase):
         self.assertIn("Fold the scale into the exponent.", message)
         self.assertEqual(message.count(ATTRIBUTION), 1)
         self.assertTrue(message.rstrip().endswith(ATTRIBUTION))
+
+    def test_sequential_promotion_commits_and_forward_rollback(self) -> None:
+        temporary, root, kernel = self._repo()
+        self.addCleanup(temporary.cleanup)
+        baseline = kernel.read_text()
+        session = AutoCommitSession.create(prepare_auto_commit(kernel, baseline))
+
+        first = commit_promotion(
+            session,
+            "A = 2\nKEEP = 1\nKEEP2 = 1\nB = 1\n",
+            "First promotion",
+        )
+        second = commit_promotion(
+            session,
+            "A = 2\nKEEP = 1\nKEEP2 = 1\nB = 2\n",
+            "Second promotion",
+        )
+
+        self.assertEqual(
+            _run(["git", "rev-parse", "HEAD^"], root).strip(),
+            first.commit_revision,
+        )
+        self.assertEqual(
+            _run(["git", "rev-parse", "HEAD"], root).strip(),
+            second.commit_revision,
+        )
+        self.assertEqual(len(session.promotion_commits), 2)
+        self.assertEqual(kernel.read_text(), "A = 2\nKEEP = 1\nKEEP2 = 1\nB = 2\n")
+
+        rollback = commit_rollback(session, "Rollback promotions")
+
+        self.assertEqual(
+            _run(["git", "rev-parse", "HEAD"], root).strip(),
+            rollback.commit_revision,
+        )
+        self.assertEqual(_run(["git", "show", "HEAD:kernels/kernel.py"], root), baseline)
+        self.assertEqual(kernel.read_text(), baseline)
+        messages = _run(["git", "log", "-3", "--format=%B%x00"], root)
+        self.assertEqual(messages.count(ATTRIBUTION), 2)
+        self.assertEqual(rollback.attribution, "")
+
+    def test_sequential_promotions_preserve_dirty_target(self) -> None:
+        temporary, root, kernel = self._repo()
+        self.addCleanup(temporary.cleanup)
+        kernel.write_text("A = 2\nKEEP = 1\nKEEP2 = 1\nB = 1\n")
+        baseline = kernel.read_text()
+        session = AutoCommitSession.create(prepare_auto_commit(kernel, baseline))
+
+        commit_promotion(
+            session,
+            "A = 2\nKEEP = 1\nKEEP2 = 2\nB = 1\n",
+            "First promotion",
+            validate_committed_source=lambda source: None,
+        )
+        commit_promotion(
+            session,
+            "A = 2\nKEEP = 1\nKEEP2 = 2\nB = 2\n",
+            "Second promotion",
+            validate_committed_source=lambda source: None,
+        )
+
+        self.assertEqual(
+            _run(["git", "show", "HEAD:kernels/kernel.py"], root),
+            "A = 1\nKEEP = 1\nKEEP2 = 2\nB = 2\n",
+        )
+        self.assertEqual(
+            kernel.read_text(),
+            "A = 2\nKEEP = 1\nKEEP2 = 2\nB = 2\n",
+        )
+
+        commit_rollback(session, "Rollback promotions")
+        self.assertEqual(
+            _run(["git", "show", "HEAD:kernels/kernel.py"], root),
+            "A = 1\nKEEP = 1\nKEEP2 = 1\nB = 1\n",
+        )
+        self.assertEqual(kernel.read_text(), baseline)
 
     def test_rejects_dirty_target_without_merged_source_validation(self) -> None:
         temporary, root, kernel = self._repo()
