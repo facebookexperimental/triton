@@ -149,3 +149,16 @@ module attributes {"ttg.target" = "cuda:0", "ttg.num-ctas" = 1 : i32, "ttg.num-w
     tt.return
   }
 }
+
+// -----
+
+#shared0 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.target" = "cuda:0", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @semaphore_released_mask_outside_depth() {
+    %buf = ttg.local_alloc : () -> !ttg.memdesc<3x1xi32, #shared0, #smem, mutable>
+    // expected-error @below {{released_mask has bits outside semaphore depth 3}}
+    %sem = nvws.semaphore.create %buf released = 8 : !nvws.semaphore<[!ttg.memdesc<3x1xi32, #shared0, #smem, mutable>]>
+    tt.return
+  }
+}
