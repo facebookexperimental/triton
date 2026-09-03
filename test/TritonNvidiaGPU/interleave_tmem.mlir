@@ -344,6 +344,26 @@ tt.func @raise_wait_stops_at_non_ws_wait(
   tt.return
 }
 
+// A WS wait cannot be raised above an init_barrier. Nothing about init is
+// arrive-like, so the older hasArriveLikeSemantics fallthrough let the wait
+// cross it; routing raiseWSWaits through canRaiseWSWaitPast rejects every
+// barrier-like op instead, which keeps a wait from rising above the
+// initialization of the barrier it waits on.
+// CHECK-LABEL: @raise_wait_stops_at_init_barrier
+tt.func @raise_wait_stops_at_init_barrier(
+    %bar1: !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>,
+    %phase: i32) {
+  %alloc = ttng.tmem_alloc : () -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+  %unused = ttng.tmem_load %alloc : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #linear128>
+  // CHECK: ttng.init_barrier
+  // CHECK-NEXT: ttng.tmem_load
+  // CHECK-NEXT: ttng.wait_barrier
+  // CHECK-SAME: WSBarrier
+  ttng.init_barrier %bar1, 1 : !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>
+  ttng.wait_barrier %bar1, %phase {constraints = {WSBarrier = {channelGraph = array<i32: 2>}}} : !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>
+  tt.return
+}
+
 // WS barriers cannot move past non-barrier ops with arrive-like semantics.
 // CHECK-LABEL: @no_reorder_across_arrive_like_op
 tt.func @no_reorder_across_arrive_like_op(
