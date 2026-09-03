@@ -164,9 +164,18 @@ def _kda_ws_fwd_kernel(  # noqa: C901
     mma_tinv_out = tlx.local_alloc((BT, BT), dtype, 1)
     mma_lhs_small = tlx.local_alloc((BT, BT), dtype, 1, tlx.storage_kind.tmem)
     mma_small0 = tlx.local_alloc((BT, BT), tl.float32, 1, tlx.storage_kind.tmem)
-    mma_state_reads = tlx.local_alloc((D, D), tl.float32, 1, tlx.storage_kind.tmem)
+    # mma_gamma shares its TMEM buffer with mma_state_reads as equal peers;
+    # the spec sizes the buffer for the largest referencer (mma_state_reads).
+    mma_state_reads_storage_alias = tlx.storage_alias_spec(storage=tlx.storage_kind.tmem)
+    mma_state_reads = tlx.local_alloc((D, D), tl.float32, 1, tlx.storage_kind.tmem, reuse=mma_state_reads_storage_alias)
     mma_u = tlx.local_alloc((BT, D), tl.float32, 1, tlx.storage_kind.tmem)
-    mma_gamma = tlx.local_alloc((D, BT), tl.float32, 1, tlx.storage_kind.tmem, reuse=mma_state_reads)
+    mma_gamma = tlx.local_alloc((D, BT), tl.float32, 1, tlx.storage_kind.tmem, reuse=mma_state_reads_storage_alias)
+    mma_state_reads_storage_alias.set_buffer_overlap(
+        tlx.reuse_group(
+            mma_state_reads,
+            mma_gamma,
+            group_type=tlx.reuse_group_type.shared,
+        ))
     mma_state = tlx.local_alloc((D, D), tl.float32, 1, tlx.storage_kind.tmem)
 
     full = tlx.alloc_barriers(num_barriers=NBUF)
@@ -624,7 +633,11 @@ def _kda_ws_fwd_kernel(  # noqa: C901
         # async MMA needs the "default" compute task to be a full warpgroup.
         # registers=232 on the compute task + 24 on the 1-warp producer keeps the
         # whole 64K register file in the hands of the warps that hold the tiles.
-        triton.Config({}, num_warps=8, num_stages=1)
+        triton.Config(
+            {},
+            num_warps=8,
+            num_stages=1,
+        )
     ],
     key=["H", "D", "BT"],
 )
@@ -705,11 +718,19 @@ def _kda_bwd_kernel(  # noqa: C901
     # it loaded), turning the tile into [q_bar; k_bar] with no second allocation.
     qk_buf = tlx.local_alloc((BT2, D), dtype, NBUF)
     r_buf = tlx.local_alloc((BT2, D), dtype, NBUF)  # do (TMA) | dKS
-    s_buf = tlx.local_alloc((D, D), dtype, NBUF)  # S_in (TMA)
-    g_buf = tlx.local_alloc((BT, D), dtype, NBUF)  # g (TMA)
+    s_buf_storage_alias = tlx.storage_alias_spec(storage=tlx.storage_kind.smem)
+    s_buf = tlx.local_alloc((D, D), dtype, NBUF, reuse=s_buf_storage_alias)  # S_in (TMA)
+    g_buf_storage_alias = tlx.storage_alias_spec(storage=tlx.storage_kind.smem)
+    g_buf = tlx.local_alloc((BT, D), dtype, NBUF, reuse=g_buf_storage_alias)  # g (TMA)
     # k_hat overwrites g: g's only reader is the cumsum MMA, so the MMA's
     # completion barrier already orders the rewrite.
-    kh_buf = tlx.local_alloc((BT, D), dtype, NBUF, reuse=g_buf)
+    kh_buf = tlx.local_alloc((BT, D), dtype, NBUF, reuse=g_buf_storage_alias)
+    g_buf_storage_alias.set_buffer_overlap(
+        tlx.reuse_group(
+            g_buf,
+            kh_buf,
+            group_type=tlx.reuse_group_type.shared,
+        ))
     wa_buf = tlx.local_alloc((BT, D), dtype, NBUF)  # v (TMA) -> betaU -> dU -> dgamma
     # decayed dS, bf16 MMA operand; once its two dots retire the tile is
     # recycled for dU/dv/dq and the dk drain, which is what lets the rhs/U
@@ -728,7 +749,13 @@ def _kda_bwd_kernel(  # noqa: C901
     # tile (32 of the 128 registers per thread, held across the whole
     # epilogue), five masked global stores and their convergences; TMA's own
     # bounds clipping also replaces the row mask on the partial chunk.
-    dg_buf = tlx.local_alloc((BT, D), tl.float32, 1, reuse=s_buf)
+    dg_buf = tlx.local_alloc((BT, D), tl.float32, 1, reuse=s_buf_storage_alias)
+    s_buf_storage_alias.set_buffer_overlap(
+        tlx.reuse_group(
+            s_buf,
+            dg_buf,
+            group_type=tlx.reuse_group_type.shared,
+        ))
     # Zk gets its own tile so the g/k_hat tile has no reader left once group
     # F retires. That is what frees the gate branch for prefetching; it also
     # carries dbeta's U term between groups D and E.
@@ -739,7 +766,10 @@ def _kda_bwd_kernel(  # noqa: C901
     acc_ds = tlx.local_alloc((D, D), tl.float32, 1, tlx.storage_kind.tmem)
     acc_a = tlx.local_alloc((BT, D), tl.float32, 1, tlx.storage_kind.tmem)
     acc_b = tlx.local_alloc((BT, D), tl.float32, 1, tlx.storage_kind.tmem)
-    acc_c = tlx.local_alloc((BT, D), tl.float32, 1, tlx.storage_kind.tmem)
+    # The C-state accumulators below share one TMEM buffer as equal peers
+    # (no primary owner); the compiler sizes it for the largest referencer.
+    acc_c_storage_alias = tlx.storage_alias_spec(storage=tlx.storage_kind.tmem)
+    acc_c = tlx.local_alloc((BT, D), tl.float32, 1, tlx.storage_kind.tmem, reuse=acc_c_storage_alias)
     # dbeta's U term as a dot instead of an axis-1 reduction: reducing a bf16
     # [C,D] product along dim 1 costs a widening tree (PRMT/IMAD/FADD2, 79 of the
     # body's 176 PRMT). Summing over d in two K=C halves lets the existing
@@ -751,7 +781,7 @@ def _kda_bwd_kernel(  # noqa: C901
     # Transposed cumsum lands here so exp(Gamma) can be read out as a TMEM
     # column instead of an axis-0 reduction. It shares acc_c with the A-matrix
     # accumulator, whose first write is a chunk stage later.
-    acc_gt = tlx.local_alloc((D, BT), tl.float32, 1, tlx.storage_kind.tmem, reuse=acc_c)
+    acc_gt = tlx.local_alloc((D, BT), tl.float32, 1, tlx.storage_kind.tmem, reuse=acc_c_storage_alias)
 
     # Two arrival barriers: the gate branch (g, q, k) is waited on first so the
     # cumsum dot and the exp2/scale work overlap the remaining 60% of the
@@ -787,7 +817,16 @@ def _kda_bwd_kernel(  # noqa: C901
     du_view = tlx.local_slice(sd_buf[0], [BT, 0], [BT, D])
     p_lo = tlx.local_slice(p_buf[0], [0, 0], [BT, BT])
     p_hi = tlx.local_slice(p_buf[0], [BT, 0], [BT, BT])
-    acc_aa = tlx.local_alloc((BT2, BT), tl.float32, 1, tlx.storage_kind.tmem, reuse=acc_c)
+    acc_aa = tlx.local_alloc((BT2, BT), tl.float32, 1, tlx.storage_kind.tmem, reuse=acc_c_storage_alias)
+    # acc_c, acc_gt, and acc_aa fully overlap: this is unnecessary in the all shared
+    # use case but this is better practice.
+    acc_c_storage_alias.set_buffer_overlap(
+        tlx.reuse_group(
+            acc_c,
+            acc_gt,
+            acc_aa,
+            group_type=tlx.reuse_group_type.shared,
+        ))
     acc_c_lo = tlx.subslice(acc_c[0], 0, BT)
 
     it = 0
