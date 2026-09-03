@@ -488,16 +488,19 @@ def test_varlen_d128_kernel_block_selection(group_size, kv_splits, expected):
 
 def test_varlen_d128_kv_partial_workspace_shapes():
     k = torch.empty((257, 2, 128), device="meta", dtype=torch.bfloat16)
-    max_size_k = torch.empty((2**23, 1, 128), device="meta", dtype=torch.bfloat16)
+    max_size_k = torch.empty((2**20, 1, 128), device="meta", dtype=torch.bfloat16)
+    oversized_k = torch.empty((2**20 + 1, 1, 128), device="meta", dtype=torch.bfloat16)
 
     direct_dk, direct_dv = amd_fa_varlen_bwd._allocate_varlen_dkdv_partials(k, 1)
     split_dk, split_dv = amd_fa_varlen_bwd._allocate_varlen_dkdv_partials(k, 3)
-    oversized_dk, oversized_dv = amd_fa_varlen_bwd._allocate_varlen_dkdv_partials(max_size_k, 4)
+    max_size_dk, max_size_dv = amd_fa_varlen_bwd._allocate_varlen_dkdv_partials(max_size_k, 4)
+    oversized_dk, oversized_dv = amd_fa_varlen_bwd._allocate_varlen_dkdv_partials(oversized_k, 4)
 
     assert direct_dk is direct_dv is None
+    assert max_size_dk is not None and max_size_dv is not None
     assert oversized_dk is oversized_dv is None
     assert split_dk.shape == split_dv.shape == (257, 2, 3, 128)
-    assert split_dk.dtype is split_dv.dtype is torch.bfloat16
+    assert split_dk.dtype is split_dv.dtype is torch.float32
     assert split_dk.device.type == split_dv.device.type == "meta"
 
 
