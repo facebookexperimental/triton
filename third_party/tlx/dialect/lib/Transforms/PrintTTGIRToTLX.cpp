@@ -370,6 +370,17 @@ StringRef getCmpFOperator(int64_t predicate) {
   }
 }
 
+// True if `v` is a constant-true i1. Such a predicate is the default, so it is
+// elided rather than emitted.
+bool isConstantTrue(Value v) {
+  Operation *def = v.getDefiningOp();
+  if (!def || def->getName().getStringRef() != "arith.constant")
+    return false;
+  if (auto intAttr = def->getAttrOfType<IntegerAttr>("value"))
+    return intAttr.getValue().isOne();
+  return false;
+}
+
 // Build a lookup map for fast operation name lookup
 llvm::StringMap<StringRef> buildOpNameMap() {
   llvm::StringMap<StringRef> map;
@@ -1590,11 +1601,25 @@ void printSimplifiedOp(
     return;
   }
 
-  // ttng.wait_barrier: emit barrier_wait(bar, phase) without pred
+  // ttng.wait_barrier: emit barrier_wait(bar, phase[, pred=...]).
   if (opName == "ttng.wait_barrier" && op->getNumOperands() >= 2) {
     os << "tlx.barrier_wait("
        << getValueName(op->getOperand(0), argSubstitutionMap) << ", "
-       << getValueName(op->getOperand(1), argSubstitutionMap) << ")";
+       << getValueName(op->getOperand(1), argSubstitutionMap);
+    // After (alloc, phase) come an optional i1 predicate and variadic memdesc
+    // dependency buffers. Only the predicate changes whether the wait executes,
+    // so emit that and skip the deps.
+    Value pred;
+    for (unsigned i = 2; i < op->getNumOperands(); ++i) {
+      Value v = op->getOperand(i);
+      if (!isa<ttg::MemDescType>(v.getType())) {
+        pred = v;
+        break;
+      }
+    }
+    if (pred && !isConstantTrue(pred))
+      os << ", pred=" << getValueName(pred, argSubstitutionMap);
+    os << ")";
     printLocComment(op, os);
     return;
   }
@@ -1762,9 +1787,12 @@ void printSimplifiedOp(
       int idx = 3 + sizes[3]; // skip a,b,d,acc_dep
       os << ", use_acc="
          << getValueName(op->getOperand(idx), argSubstitutionMap);
-      ++idx;
-      os << ", pred=" << getValueName(op->getOperand(idx), argSubstitutionMap);
-      ++idx;
+      // The predicate operand follows useD, and guards whether the dot runs
+      // at all.
+      Value mmaPred = op->getOperand(idx + 1);
+      idx += 2; // skip useD, pred
+      if (!isConstantTrue(mmaPred))
+        os << ", pred=" << getValueName(mmaPred, argSubstitutionMap);
       int numBarriers = sizes[6];
       if (numBarriers > 0) {
         os << ", mBarriers=[";
