@@ -156,7 +156,11 @@ def benchmark(artifact: tuple[Any, ...], case: dict[str, Any], repetitions: int)
     }
 
 
-def profile(artifact: tuple[Any, ...], case: dict[str, Any]) -> dict[str, Any]:
+def profile(
+    artifact: tuple[Any, ...],
+    case: dict[str, Any],
+    request: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     _, module, source_path = artifact
     a, b = make_inputs(case)
     call = getattr(module, ENTRY_POINT)
@@ -169,6 +173,18 @@ def profile(artifact: tuple[Any, ...], case: dict[str, Any]) -> dict[str, Any]:
         "latency_ms": latency_ms,
         "tflops": flops * 1e-12 / (latency_ms * 1e-3),
     }
+
+    # Full-shape validation and instruction tracing have different scopes. Every
+    # supplied case is benchmarked, but rocprof ATT is expensive enough that a
+    # campaign marks only its primary case for deep tracing. Summary candidate
+    # passes retain their latency/throughput evidence without launching ATT.
+    level = str((request or {}).get("level", "deep"))
+    if level != "deep":
+        result["att"] = {"valid": False, "status": "summary_profile"}
+        return result
+    if not case["parameters"].get("profile", False):
+        result["att"] = {"valid": False, "status": "non_primary_case"}
+        return result
 
     # Per-instruction thread trace, in a fresh process under rocprofv3.
     trace_root = Path(os.environ.get("TLX_ATT_OUTPUT_ROOT", tempfile.gettempdir())) / "tlx-att" / str(case["case_id"])
