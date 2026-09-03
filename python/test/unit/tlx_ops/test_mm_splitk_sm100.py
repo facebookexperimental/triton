@@ -113,6 +113,25 @@ def test_heuristic_configs_have_a_sound_workspace(M, N, K):
         assert rows >= written, f"heuristic config for {M}x{N}x{K} on {num_sms} SMs has an aliasing workspace: {cfg}"
 
 
+@pytest.mark.parametrize("M, N, K", [
+    (64512, 128, 512),
+    (1000000, 512, 512),
+    (3159809, 384, 384),
+])
+def test_tall_m_heuristic_cluster_fits_one_group(M, N, K):
+    cfg = sm100.get_heuristic_config(M, N, K, num_sms=148)
+    assert cfg["NUM_CTAS"] == 2
+    assert cfg["GROUP_SIZE_M"] % cfg["NUM_CTAS"] == 0
+
+    assert cfg["GROUP_SIZE_M"] >= cfg["NUM_CTAS"]
+
+
+# --------------------------------------------------------------------------
+# GPU: the layout tests above check the host arithmetic. This checks that the
+# device actually agrees with it, which no amount of host-side reasoning can.
+# --------------------------------------------------------------------------
+
+
 @contextlib.contextmanager
 def _pinned_config(overrides):
     """Force ``space="heuristic"`` to compile exactly one config.
@@ -144,11 +163,17 @@ def _pinned_config(overrides):
         sm100._tuned.cache_clear()
 
 
+<<<<<<< HEAD:python/test/unit/tlx_ops/test_mm_splitk_sm100.py
+=======
+# ``(M, N, K, NUM_CTAS)``. Each runs across SPLIT_KS_GPU and must agree.
+>>>>>>> 7e237ca59 ([TLX.ops] Fix SM100 MM input and cluster correctness):python/test/unit/tlx_ops/test_mm_splitk.py
 GPU_SHAPES = [
     # M % BLOCK_SIZE_M != 0 -- the reported bug (BLOCK_SIZE_M=256 -> 24 rows over).
     (1000, 1000, 1024, 1),
     # Whole region overhangs: one tile of 128 rows holds only 64 real rows.
     (64, 4096, 4096, 1),
+    # Regression for narrow N tiles with two CTAs and two MMA groups.
+    (384, 512, 8192, 2),
 ]
 
 SPLIT_KS_GPU = [1, 4]
@@ -165,7 +190,10 @@ def test_output_is_independent_of_split_k(M, N, K, NUM_CTAS, SPLIT_K):
     a = torch.randn((M, K), device="cuda", dtype=dtype)
     b = torch.randn((K, N), device="cuda", dtype=dtype)
 
-    with _pinned_config({"SPLIT_K": SPLIT_K, "NUM_CTAS": NUM_CTAS}):
+    overrides = {"SPLIT_K": SPLIT_K, "NUM_CTAS": NUM_CTAS}
+    if NUM_CTAS == 2:
+        overrides["GROUP_SIZE_M"] = 2
+    with _pinned_config(overrides):
         torch.cuda.synchronize()
         started = time.perf_counter()
         out = tlx_mm(a, b, arch=ARCH, space="heuristic")

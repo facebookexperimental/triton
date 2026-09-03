@@ -17,6 +17,7 @@ import triton.language.extra.tlx as tlx
 from triton.language.extra.tlx.warp_spec import get_bufidx_phase
 from triton.tools.tensor_descriptor import TensorDescriptor
 
+from ._layout import descriptor_layout
 from ._shapes import SM100_FOCUS
 
 #: The shapes `bench_mm.py` gates on for this arch. Correctness runs the union
@@ -365,19 +366,15 @@ def _select_group_size_m(M, N, block_m, num_ctas=1):
     ratio = M / max(N, 1)
 
     if ratio > 10:
-        # M >> N: sweep M, reuse B
-        group = 1
+        # M >> N: sweep M, reuse B. A cluster must stay inside one group.
+        group_size = 1
     elif ratio < 0.1:
         # N >> M: sweep N, reuse A
-        group = min(64, num_m_tiles)
+        group_size = min(64, num_m_tiles)
     else:
         # Balanced: moderate group size for L2 locality
-        group = min(8, num_m_tiles)
-
-    if num_ctas > 1:
-        # Round up to a multiple of num_ctas. Required for correctness
-        group = max(num_ctas, -(-group // num_ctas) * num_ctas)
-    return group
+        group_size = min(8, num_m_tiles)
+    return max(num_ctas, math.ceil(group_size / num_ctas) * num_ctas)
 
 
 def get_cuda_autotune_config():
@@ -1615,15 +1612,15 @@ def mm(a, b, *, space="full"):
 
     # A column-major operand's .T is a row-major view of the same memory, so the
     # descriptor flips and the MMA operand is recovered by a metadata-only
-    # transpose. No copy.
-    a_row_major = a.is_contiguous()
-    b_row_major = b.is_contiguous()
+    # transpose. No copy. Padded row-major views keep their original orientation.
+    a_layout = descriptor_layout(a, "a")
+    b_layout = descriptor_layout(b, "b")
+    a_row_major = a_layout.row_major
+    b_row_major = b_layout.row_major
 
     dummy_block = [1, 1]
-    a_src = a if a_row_major else a.T
-    b_src = b if b_row_major else b.T
-    a_desc = TensorDescriptor(a_src, a_src.shape, a_src.stride(), dummy_block)
-    b_desc = TensorDescriptor(b_src, b_src.shape, b_src.stride(), dummy_block)
+    a_desc = TensorDescriptor(a_layout.source, a_layout.source.shape, a_layout.source.stride(), dummy_block)
+    b_desc = TensorDescriptor(b_layout.source, b_layout.source.shape, b_layout.source.stride(), dummy_block)
     c_desc = TensorDescriptor(c, c.shape, c.stride(), dummy_block)
 
     # Dummy workspace; the pre_hook sizes a real one once SPLIT_K is known.
