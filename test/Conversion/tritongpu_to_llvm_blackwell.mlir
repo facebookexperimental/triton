@@ -1697,9 +1697,17 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, tlx.less
 #shared2 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
 #tmem = #ttng.tensor_memory_encoding<blockM = 64, blockN = 64, colStride = 1>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32} {
+  // Each operand's address computation is emitted just before its MMA, so the
+  // CHECK-NOTs must be interleaved with the MMAs to cover the whole body: a
+  // single trailing CHECK-NOT would only scan from the last MMA to the end and
+  // pass vacuously.
   // CHECK-LABEL: @two_mma_shared_smem_operand_default
-  // CHECK-COUNT-2: tcgen05.mma.cta_group::1.kind::f16
   // CHECK-NOT: add.s32
+  // CHECK: tcgen05.mma.cta_group::1.kind::f16
+  // CHECK-NOT: add.s32
+  // CHECK: tcgen05.mma.cta_group::1.kind::f16
+  // CHECK-NOT: add.s32
+  // CHECK: llvm.return
   tt.func @two_mma_shared_smem_operand_default(%a: !ttg.memdesc<64x16xf16, #shared, #ttg.shared_memory>,
                        %b: !ttg.memdesc<16x64xf16, #shared1, #ttg.shared_memory>,
                        %c: !ttg.memdesc<64x64xf32, #tmem, #ttng.tensor_memory, mutable>,
