@@ -1142,7 +1142,7 @@ class KernelOptimizerTest(unittest.TestCase):
             )
             self.assertIn("[tlx-agent] r001-c001 status=promoted", output)
             self.assertIn("speedup=1.2500x", output)
-            self.assertIn("decision=correct and exceeded speedup threshold", output)
+            self.assertIn("decision=correct, stable, and beat the incumbent", output)
             self.assertIn("ncu=unavailable", output)
             self.assertIn("[tlx-agent] final status=revalidated", output)
             self.assertEqual(result.winner_experiment_id, "r001-c001")

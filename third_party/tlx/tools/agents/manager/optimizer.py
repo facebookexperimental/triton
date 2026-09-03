@@ -444,6 +444,41 @@ def _is_near_threshold(speedup: float, threshold: float) -> bool:
     return threshold - _NEAR_THRESHOLD_WINDOW <= speedup <= threshold + _NEAR_THRESHOLD_WINDOW
 
 
+def _rejection_decision(
+    performance: PerformanceSummary,
+    *,
+    speedup: float,
+    best_speedup: float,
+    min_speedup: float,
+    max_cv: float,
+    ncu_diagnostics: str,
+    correctness_diagnostics: str,
+) -> str:
+    if ncu_diagnostics:
+        return ncu_diagnostics
+    if correctness_diagnostics:
+        return correctness_diagnostics
+    if speedup < min_speedup:
+        return f"speedup below {min_speedup:.4f}x threshold"
+    unstable = [
+        evaluation.case_id
+        for evaluation in performance.cases
+        if evaluation.verification.passed
+        and (
+            evaluation.timing is None
+            or evaluation.timing.coefficient_of_variation > max_cv
+        )
+    ]
+    if unstable:
+        return (
+            f"unstable or missing timing above max_cv={max_cv:.4f}: "
+            + ",".join(unstable)
+        )
+    if speedup <= best_speedup:
+        return f"did not beat incumbent aggregate_speedup={best_speedup:.4f}x"
+    return "candidate did not satisfy the promotion policy"
+
+
 def _ncu_regression_diagnostics(
     baseline: PerformanceSummary,
     candidate: PerformanceSummary,
@@ -756,11 +791,17 @@ class KernelOptimizer:
                         and evaluation.verification.diagnostics
                     )
                     decision = (
-                        "correct and exceeded speedup threshold"
+                        "correct, stable, and beat the incumbent"
                         if status == "promoted"
-                        else ncu_diagnostics
-                        or rejection_diagnostics
-                        or f"speedup below {request.budget.min_speedup:.4f}x threshold"
+                        else _rejection_decision(
+                            performance,
+                            speedup=speedup,
+                            best_speedup=best_performance.aggregate_speedup,
+                            min_speedup=request.budget.min_speedup,
+                            max_cv=request.budget.max_cv,
+                            ncu_diagnostics=ncu_diagnostics,
+                            correctness_diagnostics=rejection_diagnostics,
+                        )
                     )
                     if status == "rejected":
                         diagnostics.append(
