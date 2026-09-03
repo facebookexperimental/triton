@@ -133,6 +133,19 @@ performance callback reports measured/expected coverage and concise results for 
 supplied shape. Incorrect candidates receive `BLOCKED_BY_CORRECTNESS`; their output is
 never timed.
 
+TL retains a per-shape outcome matrix rather than reducing every Worker to one aggregate
+number. A candidate that wins locally and regresses elsewhere triggers
+`TL_COMBINATION_DECISION`: TL either specifies a combined version with a justified symbolic
+shape predicate or records why the local result does not beat the incumbent on the region it
+would serve. A Worker implements the composition; TL never edits the kernel directly, and
+the combined artifact repeats correctness and full-shape performance validation.
+
+After final validation, TL also emits `PR_STRATEGY`. It recommends one bundled PR when the
+changes form a single causal unit or require one another, and separate ordered PRs when they
+are independently useful/revertible, cross ownership boundaries, or separate kernel and
+compiler concerns. Manager presents that recommendation for human approval; Build Agent
+performs the approved commits/publication and does not redesign the stack.
+
 `--budget` accepts an optional JSON file that overrides the `--max-*` / `--min-speedup` /
 `--max-cv` flags (`{max_rounds, candidates_per_round, max_candidate_seconds,
 max_total_seconds, min_speedup, max_cv, benchmark_repetitions}`).

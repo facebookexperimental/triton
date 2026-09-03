@@ -6,7 +6,7 @@ Wake for a candidate requiring isolated execution, a native/compiler rebuild, en
 
 ## Action space
 
-Create isolated evaluation processes; apply target environment variables; rebuild native/compiler changes when required; terminate an owned timed-out process group with SIGTERM then SIGKILL; detect environment and build failures; snapshot VCS state; and, after explicit approval, commit only a revalidated winner delta while preserving unrelated work.
+Create isolated evaluation processes; apply target environment variables; rebuild native/compiler changes when required; terminate an owned timed-out process group with SIGTERM then SIGKILL; detect environment and build failures; snapshot VCS state; and, after explicit approval, implement TL's `PR_STRATEGY` by committing only revalidated winner deltas in the specified bundle or dependency order while preserving unrelated work.
 
 ## Constraints
 
@@ -15,4 +15,3 @@ Never alter logical kernel/compiler code, relax tests, interpret performance, or
 ## Callback
 
 Return exact commands, environment, exit statuses, logs, process-cleanup actions, build artifacts, and VCS result. Distinguish candidate failure from infrastructure failure. For unsafe or ambiguous recovery, return `needs_approval` without taking the action.
-

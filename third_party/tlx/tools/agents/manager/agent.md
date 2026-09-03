@@ -6,7 +6,7 @@ Wake when a human supplies a kernel-optimization request, or when an agent retur
 
 ## Action space
 
-Freeze the project specification and validation bundle; dispatch profiling, finding, implementation, build, and validation work; enforce budgets and state transitions; accept deterministic harness verdicts; compare a finding's predicted signal with measured evidence; and report the final outcome to the human. Require Worker-to-TL handoff, an explicit correctness callback, then a TL-requested Performance Validator pass over every supplied shape for each correctness-valid candidate. The Manager may select an eligible agent implementation, but model choice does not change the role contract.
+Freeze the project specification and validation bundle; dispatch profiling, finding, implementation, build, and validation work; enforce budgets and state transitions; accept deterministic harness verdicts; compare a finding's predicted signal with measured evidence; and report the final outcome to the human. Require Worker-to-TL handoff, an explicit correctness callback, then a TL-requested Performance Validator pass over every supplied shape for each correctness-valid candidate. Carry TL's `PR_STRATEGY` recommendation, dependency order, and review boundaries into the human approval request without silently repackaging it. The Manager may select an eligible agent implementation, but model choice does not change the role contract.
 
 ## Constraints
 
