@@ -9,7 +9,12 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from . import optimizer as optimizer_module
-from .cli import _parse_args, _resolve_harness_paths, _validate_host_matches_target
+from .cli import (
+    _commit_body,
+    _parse_args,
+    _resolve_harness_paths,
+    _validate_host_matches_target,
+)
 from .harness import StandaloneHarness, SubprocessHarness
 from .models import (
     CaseEvaluation,
@@ -32,6 +37,7 @@ from .providers import (
     FixedCandidateProvider,
     MockLLMProvider,
     _build_prompt,
+    _read_candidate_metadata,
 )
 from .source import (
     apply_candidate_diff,
@@ -140,7 +146,42 @@ class ScoringTest(unittest.TestCase):
         self.assertIn("Do not modify any other file", prompt)
         self.assertIn("do not print source code or a patch", prompt)
         self.assertIn("candidate_metadata.json", prompt)
+        self.assertIn("schema_version", prompt)
+        self.assertIn("commit_title", prompt)
+        self.assertIn("actual source change", prompt)
+        self.assertIn("commit_summary", prompt)
+        self.assertIn("Change summary:", prompt)
+        self.assertIn("Why:", prompt)
+        self.assertIn("Performance:", prompt)
+        self.assertIn("external harness adds", prompt)
         self.assertIn("expected_effect", prompt)
+
+    def test_candidate_metadata_reads_summary_and_builds_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "candidate_metadata.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "hypothesis": "  reduce   work ",
+                        "change": "Fold a constant scale.",
+                        "commit_title": "Fold half scale into dS encoding",
+                        "commit_summary": "Change summary:\nFold the scale into the encoded exponent.\n\nWhy:\nReduce repeated arithmetic while preserving the generic fallback.",
+                    }
+                )
+            )
+            metadata = _read_candidate_metadata(path)
+            self.assertEqual(metadata["hypothesis"], "reduce work")
+            self.assertEqual(metadata["commit_title"], "Fold half scale into dS encoding")
+            self.assertIn("encoded exponent", metadata["commit_summary"])
+            self.assertIn("generic fallback", metadata["commit_summary"])
+
+            path.write_text(json.dumps({"change": "Fold a constant scale."}))
+            fallback = _read_candidate_metadata(path)
+            self.assertEqual(fallback["commit_title"], "Fold a constant scale")
+            self.assertIn("Change summary:", fallback["commit_summary"])
+            self.assertIn("Fold a constant scale.", fallback["commit_summary"])
+            self.assertIn("Why:", fallback["commit_summary"])
 
     def test_codex_prompt_compacts_profile_and_preserves_scope_boundaries(self) -> None:
         request = KernelOptimizationRequest(
@@ -555,12 +596,51 @@ class HarnessTest(unittest.TestCase):
         self.assertEqual(second.source, "LATENCY_US = 60\nCORRECT = True\n")
 
 
+class CommitBodyTest(unittest.TestCase):
+    def test_includes_winner_summary_and_per_case_perf(self) -> None:
+        baseline = _performance(("large", 100.0), ("small", 50.0))
+        final = PerformanceSummary(
+            cases=_performance(("large", 80.0), ("small", 40.0)).cases,
+            aggregate_speedup=1.25,
+        )
+        from .models import KernelOptimizationResult
+
+        result = KernelOptimizationResult(
+            success=True,
+            best_kernel="source",
+            baseline=baseline,
+            final=final,
+            experiments=(),
+            artifacts_dir=Path("/tmp/result"),
+            stopping_reason="round_budget_exhausted",
+            winner_experiment_id="r001-c000",
+            winner_commit_summary="Fold the scale into the encoded exponent.",
+        )
+        body = _commit_body(result)
+        self.assertIn("Fold the scale into the encoded exponent.", body)
+        self.assertIn("Performance:", body)
+        self.assertIn("large", body)
+        self.assertIn("100.00", body)
+        self.assertIn("80.00", body)
+        self.assertIn("1.2500x", body)
+        self.assertIn("Weighted aggregate speedup: 1.2500x", body)
+        self.assertIn("Correct", body)
+
+
 class KernelOptimizerTest(unittest.TestCase):
     def test_reports_performance_after_each_evaluation(self) -> None:
         provider = FixedCandidateProvider(
             [
                 CandidateProposal("LATENCY_US = 120\nCORRECT = True\n", "slower"),
-                CandidateProposal("LATENCY_US = 80\nCORRECT = True\n", "faster"),
+                CandidateProposal(
+                    "LATENCY_US = 80\nCORRECT = True\n",
+                    "faster",
+                    commit_title="Use faster latency path",
+                    commit_summary=(
+                        "Change summary:\nUse the faster path.\n\n"
+                        "Why:\nReduce measured latency."
+                    ),
+                ),
             ]
         )
         with tempfile.TemporaryDirectory() as directory:
@@ -594,6 +674,9 @@ class KernelOptimizerTest(unittest.TestCase):
             self.assertIn("decision=correct and exceeded speedup threshold", output)
             self.assertIn("ncu=unavailable", output)
             self.assertIn("[tlx-agent] final status=revalidated", output)
+            self.assertEqual(result.winner_experiment_id, "r001-c001")
+            self.assertEqual(result.winner_commit_title, "Use faster latency path")
+            self.assertIn("Use the faster path.", result.winner_commit_summary)
             self.assertTrue(result.success)
 
     def test_rejected_candidate_evidence_reaches_next_proposal(self) -> None:

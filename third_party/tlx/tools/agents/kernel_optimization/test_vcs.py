@@ -46,6 +46,7 @@ class GitAutoCommitTest(unittest.TestCase):
             snapshot,
             "A = 2\nKEEP = 1\nKEEP2 = 1\nB = 2\n",
             "Tune kernel",
+            body="Fold the scale into the exponent.\n\nTLX agent authored",
             validate_committed_source=validated.append,
         )
 
@@ -66,7 +67,10 @@ class GitAutoCommitTest(unittest.TestCase):
             _run(["git", "show", "--format=", "--name-only", "HEAD"], root).strip(),
             "kernels/kernel.py",
         )
-        self.assertIn(ATTRIBUTION, _run(["git", "log", "-1", "--format=%B"], root))
+        message = _run(["git", "log", "-1", "--format=%B"], root)
+        self.assertIn("Fold the scale into the exponent.", message)
+        self.assertEqual(message.count(ATTRIBUTION), 1)
+        self.assertTrue(message.rstrip().endswith(ATTRIBUTION))
 
     def test_rejects_dirty_target_without_merged_source_validation(self) -> None:
         temporary, root, kernel = self._repo()

@@ -195,8 +195,15 @@ def merge_winner_delta(snapshot: AutoCommitSnapshot, winner_source: str) -> str:
     return completed.stdout
 
 
-def _commit_message(subject: str) -> str:
-    return f"{subject.rstrip()}\n\n{ATTRIBUTION}\n"
+def _commit_message(subject: str, body: str = "") -> str:
+    cleaned_body = "\n".join(
+        line for line in body.replace("\x00", "").splitlines() if line.strip() != ATTRIBUTION
+    ).strip()
+    paragraphs = [subject.rstrip()]
+    if cleaned_body:
+        paragraphs.append(cleaned_body)
+    paragraphs.append(ATTRIBUTION)
+    return "\n\n".join(paragraphs) + "\n"
 
 
 def _verify_snapshot(snapshot: AutoCommitSnapshot) -> None:
@@ -222,7 +229,11 @@ def _verify_snapshot(snapshot: AutoCommitSnapshot) -> None:
 
 
 def _commit_git(
-    snapshot: AutoCommitSnapshot, committed_source: str, winner_source: str, subject: str
+    snapshot: AutoCommitSnapshot,
+    committed_source: str,
+    winner_source: str,
+    subject: str,
+    body: str = "",
 ) -> str:
     assert snapshot.file_mode is not None
     root = snapshot.repo_root
@@ -253,7 +264,7 @@ def _commit_git(
     commit = _run(
         ["git", "commit-tree", tree, "-p", snapshot.base_revision],
         cwd=root,
-        input_text=_commit_message(subject),
+        input_text=_commit_message(subject, body),
     ).stdout.strip()
     _run(
         [
@@ -287,14 +298,18 @@ def _commit_git(
 
 
 def _commit_hg(
-    snapshot: AutoCommitSnapshot, committed_source: str, winner_source: str, subject: str
+    snapshot: AutoCommitSnapshot,
+    committed_source: str,
+    winner_source: str,
+    subject: str,
+    body: str = "",
 ) -> str:
     root = snapshot.repo_root
     snapshot.target_path.write_text(committed_source)
     succeeded = False
     try:
         _run(
-            ["hg", "commit", "-m", _commit_message(subject), snapshot.target_relpath],
+            ["hg", "commit", "-m", _commit_message(subject, body), snapshot.target_relpath],
             cwd=root,
         )
         succeeded = True
@@ -317,6 +332,7 @@ def commit_winner(
     snapshot: AutoCommitSnapshot,
     winner_source: str,
     subject: str,
+    body: str = "",
     *,
     validate_committed_source: Callable[[str], None] | None = None,
 ) -> AutoCommitResult:
@@ -330,9 +346,9 @@ def commit_winner(
         validate_committed_source(committed_source)
     _verify_snapshot(snapshot)
     if snapshot.vcs == "git":
-        revision = _commit_git(snapshot, committed_source, winner_source, subject)
+        revision = _commit_git(snapshot, committed_source, winner_source, subject, body)
     else:
-        revision = _commit_hg(snapshot, committed_source, winner_source, subject)
+        revision = _commit_hg(snapshot, committed_source, winner_source, subject, body)
     return AutoCommitResult(
         requested=True,
         success=True,

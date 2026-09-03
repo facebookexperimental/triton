@@ -437,6 +437,8 @@ class KernelOptimizer:
         best_source = request.kernel_source
         best_performance = baseline
         best_experiment_id = "baseline"
+        best_commit_title = ""
+        best_commit_summary = ""
         best_profiles = baseline_profiles
         diagnostics: list[str] = []
         seen_sources = {source_digest(request.kernel_source)}
@@ -542,6 +544,8 @@ class KernelOptimizer:
                         evidence=proposal.evidence,
                         expected_effect=proposal.expected_effect,
                         risk=proposal.risk,
+                        commit_title=proposal.commit_title,
+                        commit_summary=proposal.commit_summary,
                         profile_path=profile_path,
                     )
                     rejection_diagnostics = "; ".join(
@@ -580,6 +584,8 @@ class KernelOptimizer:
                         best_source = proposal.source
                         best_performance = performance
                         best_experiment_id = experiment_id
+                        best_commit_title = proposal.commit_title
+                        best_commit_summary = proposal.commit_summary
                         best_profiles = perf_profiles
                         promoted_this_round = True
                 except Exception as error:  # noqa: BLE001
@@ -641,6 +647,8 @@ class KernelOptimizer:
             final_profiles = baseline_profiles
             best_profiles = baseline_profiles
             best_experiment_id = "baseline"
+            best_commit_title = ""
+            best_commit_summary = ""
             stopping_reason = "finalist_revalidation_failed"
         elif best_experiment_id != "baseline":
             if request.diagnostic_proton_intra_kernel:
@@ -681,6 +689,9 @@ class KernelOptimizer:
             experiments=tuple(experiments),
             artifacts_dir=artifacts_dir,
             stopping_reason=stopping_reason,
+            winner_experiment_id=best_experiment_id,
+            winner_commit_title=best_commit_title,
+            winner_commit_summary=best_commit_summary,
         )
         store.write_json("result.json", result)
         return result
