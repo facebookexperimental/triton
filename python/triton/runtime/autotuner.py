@@ -108,12 +108,14 @@ class _OnlineLinearRegression:
 
 class _EntropyCriterion:
 
+    DEFAULT_MIN_WARMUP_SAMPLES = 20
+
     def __init__(
         self,
         max_angle: float = 0.048,
         min_r2: float = 0.36,
         window_size: int = 299,
-        min_warmup_samples: int = 20,
+        min_warmup_samples: int = DEFAULT_MIN_WARMUP_SAMPLES,
         entropy_window_size: int = 500,
     ) -> None:
         self.max_angle = max_angle
@@ -177,13 +179,17 @@ class _EntropyCriterion:
                 self._sum_count_log_count += new_count * math.log2(new_count)
 
 
+def _entropy_warmup_sample_limit(probe_ms: float, budget_ms: int) -> int:
+    """Convert the warmup time budget to a bounded number of kernel launches."""
+    return max(1, min(10000, int(budget_ms / probe_ms)))
+
+
 def _entropy_warmup(kernel_call, clear_cache, torch, entropy_window_size=500, regr_window_size=299, max_samples=10000):
     """Adaptive warmup using entropy convergence. Returns (n_samples, avg_ms)."""
     crit = _EntropyCriterion(
         max_angle=0.048,
         min_r2=0.36,
         window_size=regr_window_size,
-        min_warmup_samples=20,
         entropy_window_size=entropy_window_size,
     )
     rounding_factor = 3
@@ -427,6 +433,8 @@ class Autotuner(KernelInterface):
             return None
 
         rep = knobs.autotuning.rep
+        warmup = knobs.autotuning.warmup
+        fixed_benchmarker = driver.active.get_benchmarker()
         _WARMUP_BUDGET_MS = 250
 
         def entropy_benchmarker(kernel_call, quantiles):
@@ -447,6 +455,16 @@ class Autotuner(KernelInterface):
 
             # Scale windows so wall-clock warmup stays within budget
             probe_ms = max(probe_ms, 0.001)
+            max_samples = _entropy_warmup_sample_limit(probe_ms, _WARMUP_BUDGET_MS)
+            # If the minimum sample count cannot fit in the budget, use the
+            # existing fixed-time benchmarker.
+            if max_samples < _EntropyCriterion.DEFAULT_MIN_WARMUP_SAMPLES:
+                return fixed_benchmarker(
+                    kernel_call,
+                    warmup=warmup,
+                    rep=rep,
+                    quantiles=quantiles,
+                )
             entropy_window = min(500, max(50, int(_WARMUP_BUDGET_MS / probe_ms)))
             regr_window = max(20, int(entropy_window * 0.6))
 
@@ -456,6 +474,7 @@ class Autotuner(KernelInterface):
                 torch,
                 entropy_window_size=entropy_window,
                 regr_window_size=regr_window,
+                max_samples=max_samples,
             )
             avg_ms = n_warmup[1]
             n_repeat = max(10, int(rep / avg_ms)) if avg_ms > 0 else 100
@@ -589,7 +608,8 @@ class Autotuner(KernelInterface):
         # Check if we can use the C-level autotune proxy
         if (native_create_autotune_proxy is not None and getattr(self.fn, 'c_cache', False)
                 and knobs.nvidia.use_autotune_c_cache and knobs.nvidia.use_triton_dispatcher and len(self.configs) > 1
-                and knobs.autotuning.listener is None):
+                and knobs.autotuning.listener is None
+                and getattr(driver.active, "is_cpu_backend", False) is not True):
             proxy = getattr(self, '_autotune_proxy', None)
             if proxy is None:
                 # Compute key_indices: positions in arg_names for autotuner key fields
@@ -628,6 +648,8 @@ class Autotuner(KernelInterface):
 
     def _seed_autotune_proxy(self, key, config):
         """Insert a key→config mapping into the C autotune proxy table."""
+        if getattr(driver.active, "is_cpu_backend", False) is True:
+            return
         proxy = getattr(self, '_autotune_proxy', None)
         if proxy is None or native_autotune_proxy_insert is None:
             return
@@ -694,6 +716,9 @@ class Autotuner(KernelInterface):
         Returns None when preconditions aren't met (no c_cache, callable
         grid that can't be evaluated, extra kwargs, etc.).
         """
+        if getattr(driver.active, "is_cpu_backend", False) is True:
+            return None
+
         input_grid = kwargs.get('grid')
         if input_grid is None or not getattr(self.fn, 'c_cache', False):
             return None
@@ -761,21 +786,21 @@ class Autotuner(KernelInterface):
                         _padded = _padded + (None, ) * (len(self.fn.params) - len(_padded))
                     native_fast_dispatch_insert(self.fn, _padded, self.fn.params, self.fn._fc_options_hash, kernel,
                                                 _disp, getattr(kernel, '_dispatch_arg_indices', None))
-                    # Only enable the meta-less steady-state fast path (self.fn[grid](*full_args)
-                    # below) once a native dispatcher exists to carry the winning config's
-                    # compilation options. Without one -- e.g. dispatcher creation failed with
-                    # "Too many kernel args" -- steady-state falls back to a plain JIT launch that
-                    # recompiles at the default num_warps/num_stages and silently drops the config's
-                    # values, miscompiling kernels pinned to a non-default num_warps. Leaving
-                    # _seed_key unseeded re-runs this seed branch (a full run(**_meta) that honors
-                    # the config) on every call instead.
+                    # Only enter steady-state proxy dispatch once a native dispatcher exists.
+                    # Without one -- e.g. dispatcher creation failed with "Too many kernel args"
+                    # -- leaving _seed_key unseeded keeps every launch on this full run(**_meta)
+                    # path and preserves the winning config's compilation options.
                     self._fc_seeded.add(_seed_key)
             return kernel
 
-        # Steady-state: dispatch via JITCacheProxy (fastest path).
-        # The C cache stores dispatch_arg_indices per entry so it correctly
-        # selects only the args the dispatcher expects (handles None ptr args).
-        return self.fn[evaluated_grid](*full_args)
+        # Steady-state: use JITCacheProxy when available. If proxy creation is
+        # bypassed or fails, retain the winning config's compilation options on
+        # the Python run() fallback rather than silently using backend defaults.
+        get_proxy = getattr(self.fn, '_get_jit_cache_proxy', None)
+        proxy = get_proxy(evaluated_grid) if get_proxy is not None else None
+        if proxy is not None:
+            return proxy(*full_args)
+        return self.fn.run(*full_args, grid=evaluated_grid, warmup=False, **_meta)
 
     def run(self, *args, **kwargs):
         self.nargs = dict(zip(self.arg_names, args))
@@ -1058,6 +1083,12 @@ class Config:
     :type preferred_ctas_per_cga: tuple[int, int, int]
     :ivar multicast: default policy for compiler-selected TMA multicast loads.
     :type multicast: bool
+    :ivar enable_tree_reduction: use tree-shaped, vectorized in-thread reductions. If unset, use the
+        backend's architecture-specific default.
+    :type enable_tree_reduction: bool | None
+    :ivar enable_nvptx_v2i32: opt in to NVPTX v2i32 register legalization. Off by default;
+        the packed form costs an unpack/repack per use and no integer op is legal on it.
+    :type enable_nvptx_v2i32: bool | None
     """
 
     @staticmethod
@@ -1088,6 +1119,8 @@ class Config:
         preferred_ctas_per_cga=None,
         multicast=False,
         auto_tma=None,
+        enable_tree_reduction=None,
+        enable_nvptx_v2i32=None,
     ):
         self.kwargs = kwargs
         self.num_warps = num_warps
@@ -1110,6 +1143,8 @@ class Config:
         # Per-config auto-TMA toggle. None -> defer to the global TRITON_AUTO_TMA
         # knob; True/False lets the autotuner A/B auto-TMA per shape.
         self.auto_tma = auto_tma
+        self.enable_tree_reduction = enable_tree_reduction
+        self.enable_nvptx_v2i32 = enable_nvptx_v2i32
 
     def __setstate__(self, state):
         self.kwargs = state.get("kwargs", {})
@@ -1129,6 +1164,8 @@ class Config:
         self.preferred_ctas_per_cga = state.get("preferred_ctas_per_cga", None)
         self.multicast = state.get("multicast", False)
         self.auto_tma = state.get("auto_tma", None)
+        self.enable_tree_reduction = state.get("enable_tree_reduction", None)
+        self.enable_nvptx_v2i32 = state.get("enable_nvptx_v2i32", None)
 
     def all_kwargs(self):
         return {
@@ -1151,6 +1188,8 @@ class Config:
                     ("preferred_ctas_per_cga", self.preferred_ctas_per_cga),
                     ("multicast", self.multicast),
                     ("auto_tma", self.auto_tma),
+                    ("enable_tree_reduction", self.enable_tree_reduction),
+                    ("enable_nvptx_v2i32", self.enable_nvptx_v2i32),
                 ) if v is not None
             },
         }
@@ -1173,6 +1212,8 @@ class Config:
         res.append(f"preferred_ctas_per_cga: {self.preferred_ctas_per_cga}")
         res.append(f"multicast: {self.multicast}")
         res.append(f"auto_tma: {self.auto_tma}")
+        res.append(f"enable_tree_reduction: {self.enable_tree_reduction}")
+        res.append(f"enable_nvptx_v2i32: {self.enable_nvptx_v2i32}")
         return ", ".join(res)
 
     def __hash__(self):

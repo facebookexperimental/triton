@@ -7,6 +7,8 @@ on:
     paths:
       - cmake/llvm-build-info.json
   pull_request:
+    branches-ignore:
+      - release/3.8.x
     paths:
       - .github/workflows/llvm-build.yml
       - cmake/llvm-build-info.json

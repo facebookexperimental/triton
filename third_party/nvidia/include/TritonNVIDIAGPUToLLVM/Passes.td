@@ -31,6 +31,9 @@ def ConvertTritonGPUToLLVM : Pass<"convert-triton-gpu-to-llvm", "mlir::ModuleOp"
         Option<"enableConcurrencySanitizer", "enable-concurrency-sanitizer",
                "bool", /*default*/"false",
                "run ConSan after fence and membar preparation">,
+        Option<"enableTreeReduction", "enable-tree-reduction",
+               "bool", /*default*/"false",
+               "use tree-shaped, vectorized in-thread reductions">,
     ];
 }
 

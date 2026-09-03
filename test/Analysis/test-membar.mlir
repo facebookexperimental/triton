@@ -1367,3 +1367,31 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
     tt.return %sum : tensor<128x32xf16, #blockedCallDst>
   }
 }
+
+// -----
+
+// A write to one constant subview index followed by a read of a DIFFERENT
+// constant index of the same buffer are disjoint (narrowIntervalForSubview gives
+// each index its own byte interval), so no barrier is required. If the
+// narrowIntervalForSubview call is dropped the two indices alias the whole
+// allocation, the read looks like a RAW hazard, and a spurious barrier appears --
+// the regression a bad merge introduced. The init_barrier/inval_barrier subview
+// tests pass via the init/inval-skip path and never exercise this narrowing,
+// which is why they did not catch the removal.
+#AL = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
+#A_SHARED = #ttg.swizzled_shared<{vec = 2, perPhase = 2, maxPhase = 4, order = [1, 0]}>
+module attributes {"ttg.num-warps" = 4 : i32, "ttg.num-ctas" = 1 : i32} {
+// CHECK-LABEL: subview_different_index_no_barrier
+tt.func @subview_different_index_no_barrier(%A : !tt.ptr<f16>) {
+  %c0 = arith.constant 0 : i32
+  %c1 = arith.constant 1 : i32
+  %a_ptr = tt.splat %A : !tt.ptr<f16> -> tensor<16x16x!tt.ptr<f16>, #AL>
+  %alloc = ttg.local_alloc : () -> !ttg.memdesc<2x16x16xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  %sv0 = ttg.memdesc_index %alloc[%c0] : !ttg.memdesc<2x16x16xf16, #A_SHARED, #ttg.shared_memory, mutable> -> !ttg.memdesc<16x16xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  %sv1 = ttg.memdesc_index %alloc[%c1] : !ttg.memdesc<2x16x16xf16, #A_SHARED, #ttg.shared_memory, mutable> -> !ttg.memdesc<16x16xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  %0 = ttg.async_copy_global_to_local %a_ptr, %sv0 : tensor<16x16x!tt.ptr<f16>, #AL> -> !ttg.memdesc<16x16xf16, #A_SHARED, #ttg.shared_memory, mutable>
+  // CHECK-NOT: ttg.barrier local
+  %1 = ttg.local_load %sv1 : !ttg.memdesc<16x16xf16, #A_SHARED, #ttg.shared_memory, mutable> -> tensor<16x16xf16, #AL>
+  tt.return
+}
+}

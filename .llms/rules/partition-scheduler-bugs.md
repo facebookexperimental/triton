@@ -138,6 +138,12 @@
 - **Fix**: when `originalLoad` is unavailable, include the channel's producer task in the staging-fusion key. Same-task subtiles still fuse, but concurrent data partitions targeting the same descriptor receive distinct `buffer.id`s.
 - **Tests**: `ws_memory_planner_tma_store_staging_cap.mlir` checks distinct IDs for two null-origin producer tasks. `test_hopper_matmul_tma_warp_specialize[False-True-2-True-False-4-3-64-128-128-8192-8192-1024]` passes and its final TTGIR contains two one-copy staging allocations instead of one two-copy reuse group.
 
+### 23. Subtiled channel endpoints miss WSBarrier graph metadata (2026-08-25, fixed)
+- **Symptom**: epilogue-subtiled AutoWS GEMM leaves the output-staging producer-acquire wait annotated only with `WSBarrier.dstTask`. Without `channelGraph` or ordered-region metadata, barrier reordering conservatively refuses to move an independent TMEM consumer-release arrive past it, pinning grouped TMEM loads before the staging pipeline.
+- **Root cause** (`WSCodePartition.cpp`, `insertAsyncComm`): inline NVWS endpoints inside `SubtiledRegionOp` tile bodies were created with the generated static `Op::create` builders instead of `OpBuilderWithAsyncTaskIds::createWithAsyncTaskIds`, so they had no task ID when `injectChannelGraphOnWSBarrierEndpoints` ran. The inline consumer wait/release also omitted `WSBarrier.dstTask` entirely. The later subtiled-region lowering assigned task IDs, but graph injection had already completed.
+- **Fix**: create all inline producer-acquire/commit and consumer-wait/release endpoints through `createWithAsyncTaskIds`, and attach the reverse destination task to consumer endpoints. This makes every endpoint visible to channel-graph and ordered-region injection before subtiled-region lowering.
+- **Lit test**: `ws_code_partition_subtiled_region.mlir` is no longer XFAIL and checks `channelGraph` plus `dstTask` on all four inline endpoints.
+
 ## Debugging Workflow
 - `t.dump` captures IR after each WarpSpec pass (doTaskIdPropagate → doBufferAllocation → doMemoryPlanner → doCodePartition → ...)
 - IR after PartitionSchedulingMeta uses `ttg.partition = array<i32: N>` attributes (not `async_task_id`)

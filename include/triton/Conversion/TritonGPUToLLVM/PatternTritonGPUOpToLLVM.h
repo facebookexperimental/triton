@@ -68,6 +68,11 @@ void populateReduceOpToLLVMPatterns(LLVMTypeConverter &typeConverter,
                                     RewritePatternSet &patterns,
                                     const TargetInfoBase &targetInfo,
                                     PatternBenefit benefit);
+void populateReduceOpToLLVMPatternsWithOptions(LLVMTypeConverter &typeConverter,
+                                               RewritePatternSet &patterns,
+                                               const TargetInfoBase &targetInfo,
+                                               PatternBenefit benefit,
+                                               bool enableTreeReduction);
 void populateScanOpToLLVMPatterns(LLVMTypeConverter &typeConverter,
                                   RewritePatternSet &patterns,
                                   const TargetInfoBase &targetInfo,

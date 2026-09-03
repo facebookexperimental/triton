@@ -9,6 +9,7 @@
 #include "triton/Dialect/TritonGPU/IR/Types.h"
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
@@ -166,9 +167,7 @@ static bool isRetaggableTensorProducerValue(Value value) {
     return false;
 
   Operation *definingOp = value.getDefiningOp();
-  // Sparse dataflow handles the RegionBranchOpInterface edge consistency; if
-  // all incoming values agree, retagging the region result is safe.
-  return isa_and_nonnull<ttg::LocalLoadOp, RegionBranchOpInterface>(definingOp);
+  return isa_and_nonnull<ttg::LocalLoadOp>(definingOp);
 }
 
 static Type getTensorCandidateType(Value value, DataFlowSolver &solver,
@@ -308,9 +307,30 @@ collectRegionBranchSuccessors(RegionBranchOpInterface branchOp,
   }
 }
 
+using TensorTypeMap = llvm::DenseMap<Value, Type>;
+
+struct TensorRegionInfo {
+  llvm::DenseSet<Value> blockedValues;
+  TensorTypeMap regionTypes;
+};
+
+// The type an incoming region edge value actually contributes to the consensus.
+static Type getTensorEdgeType(Value value, DataFlowSolver &solver,
+                              const llvm::DenseSet<Value> &blockedValues,
+                              const TensorTypeMap &regionTypes) {
+  auto tensorType = cast<RankedTensorType>(value.getType());
+  // Region carriers must use the type realizable by their nested input edges.
+  if (auto it = regionTypes.find(value); it != regionTypes.end())
+    return it->second;
+  if (!isRetaggableTensorProducerValue(value))
+    return tensorType;
+  return getTensorCandidateType(value, solver, blockedValues);
+}
+
 static std::optional<Type>
 getTensorConsensusType(ValueRange values, DataFlowSolver &solver,
-                       const llvm::DenseSet<Value> &blockedValues) {
+                       const llvm::DenseSet<Value> &blockedValues,
+                       const TensorTypeMap &regionTypes) {
   if (values.empty())
     return std::nullopt;
 
@@ -319,7 +339,8 @@ getTensorConsensusType(ValueRange values, DataFlowSolver &solver,
     if (!isa<RankedTensorType>(value.getType()))
       return std::nullopt;
 
-    Type candidateType = getTensorCandidateType(value, solver, blockedValues);
+    Type candidateType =
+        getTensorEdgeType(value, solver, blockedValues, regionTypes);
     if (!consensusType) {
       consensusType = candidateType;
       continue;
@@ -330,12 +351,69 @@ getTensorConsensusType(ValueRange values, DataFlowSolver &solver,
   return consensusType;
 }
 
-static llvm::DenseSet<Value>
-computeBlockedTensorValues(triton::FuncOp funcOp, DataFlowSolver &solver) {
-  llvm::DenseSet<Value> blockedValues;
+static TensorTypeMap
+computeTensorRegionTypes(triton::FuncOp funcOp, DataFlowSolver &solver,
+                         const llvm::DenseSet<Value> &blockedValues) {
+  TensorTypeMap regionTypes;
+  funcOp.walk([&](RegionBranchOpInterface branchOp) {
+    SmallVector<RegionSuccessor> successors;
+    collectRegionBranchSuccessors(branchOp, successors);
+    for (RegionSuccessor successor : successors) {
+      for (Value input : branchOp.getSuccessorInputs(successor)) {
+        if (isa<RankedTensorType>(input.getType()))
+          regionTypes.try_emplace(
+              input, getTensorCandidateType(input, solver, blockedValues));
+      }
+    }
+  });
+
   bool changed = true;
   while (changed) {
     changed = false;
+    funcOp.walk<WalkOrder::PostOrder>([&](RegionBranchOpInterface branchOp) {
+      SmallVector<RegionSuccessor> successors;
+      collectRegionBranchSuccessors(branchOp, successors);
+      for (RegionSuccessor successor : successors) {
+        ValueRange inputs = branchOp.getSuccessorInputs(successor);
+        for (auto [index, input] : llvm::enumerate(inputs)) {
+          auto tensorType = dyn_cast<RankedTensorType>(input.getType());
+          if (!tensorType)
+            continue;
+
+          SmallVector<Value> predecessors;
+          branchOp.getPredecessorValues(successor, index, predecessors);
+          if (predecessors.empty())
+            continue;
+
+          std::optional<Type> consensus = getTensorConsensusType(
+              ValueRange(predecessors), solver, blockedValues, regionTypes);
+          Type type = consensus.value_or(input.getType());
+          if (blockedValues.contains(input) ||
+              isa_and_nonnull<UserLayoutAttr>(tensorType.getEncoding()))
+            type = input.getType();
+          auto it = regionTypes.find(input);
+          assert(it != regionTypes.end() && "expected seeded region type");
+          if (it == regionTypes.end())
+            continue;
+          if (it->second == type)
+            continue;
+          it->second = type;
+          changed = true;
+        }
+      }
+    });
+  }
+  return regionTypes;
+}
+
+static TensorRegionInfo computeTensorRegionInfo(triton::FuncOp funcOp,
+                                                DataFlowSolver &solver) {
+  TensorRegionInfo info;
+  bool changed = true;
+  while (changed) {
+    changed = false;
+    info.regionTypes =
+        computeTensorRegionTypes(funcOp, solver, info.blockedValues);
     funcOp.walk([&](RegionBranchOpInterface branchOp) {
       SmallVector<RegionSuccessor> successors;
       collectRegionBranchSuccessors(branchOp, successors);
@@ -351,55 +429,41 @@ computeBlockedTensorValues(triton::FuncOp funcOp, DataFlowSolver &solver) {
           if (predecessorValues.empty())
             continue;
 
-          if (getTensorConsensusType(ValueRange(predecessorValues), solver,
-                                     blockedValues))
+          bool successorBlocked = info.blockedValues.contains(successorInput);
+          if (!successorBlocked &&
+              getTensorConsensusType(ValueRange(predecessorValues), solver,
+                                     info.blockedValues, info.regionTypes))
             continue;
 
-          LDBG("Blocking tensor carrier value due to inconsistent predecessor "
-               "layouts at "
-               << branchOp->getName());
-          changed |= blockedValues.insert(successorInput).second;
+          if (!successorBlocked)
+            LDBG("Blocking tensor carrier value due to inconsistent "
+                 "predecessor layouts at "
+                 << branchOp->getName());
+          changed |= info.blockedValues.insert(successorInput).second;
           for (Value predecessorValue : predecessorValues) {
             if (!isa<RankedTensorType>(predecessorValue.getType()))
               continue;
-            changed |= blockedValues.insert(predecessorValue).second;
+            changed |= info.blockedValues.insert(predecessorValue).second;
           }
         }
       }
-
-      return WalkResult::advance();
     });
   }
 
-  return blockedValues;
+  return info;
 }
 
-static void
-updateTensorRegionBranchTypes(triton::FuncOp funcOp, DataFlowSolver &solver,
-                              const llvm::DenseSet<Value> &blockedValues) {
+static void updateTensorRegionBranchTypes(triton::FuncOp funcOp,
+                                          const TensorTypeMap &regionTypes) {
   funcOp.walk<WalkOrder::PostOrder>([&](RegionBranchOpInterface branchOp) {
     SmallVector<RegionSuccessor> successors;
     collectRegionBranchSuccessors(branchOp, successors);
 
-    bool changed = true;
-    while (changed) {
-      changed = false;
-      for (RegionSuccessor successor : successors) {
-        ValueRange successorInputs = branchOp.getSuccessorInputs(successor);
-        for (auto [index, successorInput] : llvm::enumerate(successorInputs)) {
-          if (!isa<RankedTensorType>(successorInput.getType()))
-            continue;
-
-          SmallVector<Value> predecessorValues;
-          branchOp.getPredecessorValues(successor, index, predecessorValues);
-          std::optional<Type> consensusType = getTensorConsensusType(
-              ValueRange(predecessorValues), solver, blockedValues);
-          if (!consensusType || successorInput.getType() == *consensusType)
-            continue;
-
-          successorInput.setType(*consensusType);
-          changed = true;
-        }
+    for (RegionSuccessor successor : successors) {
+      for (Value input : branchOp.getSuccessorInputs(successor)) {
+        auto it = regionTypes.find(input);
+        if (it != regionTypes.end() && input.getType() != it->second)
+          input.setType(it->second);
       }
     }
   });
@@ -469,8 +533,7 @@ public:
     if (failed(solver.initializeAndRun(op)))
       return signalPassFailure();
 
-    llvm::DenseSet<Value> blockedTensorValues =
-        computeBlockedTensorValues(funcOp, solver);
+    TensorRegionInfo tensorRegionInfo = computeTensorRegionInfo(funcOp, solver);
 
     WalkResult typeRewriteWalk = funcOp.walk([&](mlir::Operation *op) {
       if (isa<tlx::RequireLayoutOp>(op))
@@ -519,7 +582,8 @@ public:
 
       for (Value result : op->getResults()) {
         if (!isa<ttg::MemDescType>(result.getType())) {
-          rewriteTensorValueFromLattice(result, solver, blockedTensorValues);
+          rewriteTensorValueFromLattice(result, solver,
+                                        tensorRegionInfo.blockedValues);
           continue;
         }
 
@@ -531,7 +595,7 @@ public:
     if (typeRewriteWalk.wasInterrupted())
       return signalPassFailure();
 
-    updateTensorRegionBranchTypes(funcOp, solver, blockedTensorValues);
+    updateTensorRegionBranchTypes(funcOp, tensorRegionInfo.regionTypes);
 
     // Verify that no DummyTMEMLayoutAttr remains after layout propagation.
     bool hasDummyLayout = false;

@@ -97,6 +97,7 @@ recognizes the `scf.while` outer loop (same doc).
 | `WSTMAStoreLowering.cpp` | `doValidateTMAStoreAnnotations` | Safety check: strip invalid annotations |
 | `WSTMAStoreLowering.cpp` | `doTMAStoreWaitReorder` | Reschedule TMA store waits using SWP CoarseSchedule |
 | `TMEMAlloc1D.cpp` | `TMEM1DAllocator` | 1D tensor memory allocation for cross-partition values |
+| `TMemBarrierInsertion.cpp` | `triton-nvidia-gpu-tmem-barrier-insertion` | Inserts CTA barriers for TMEM reuse and elides hazards proven warp-local; see [TMEMBarrierInsertion.md](TMEMBarrierInsertion.md) |
 | `CodePartitionUtility.cpp` | — | Channel data structures, operand D handling, barrier fusion, buffer management |
 | `Utility.cpp` | — | `AsyncTaskId` helpers, `OpBuilderWithAsyncTaskIds` |
 
@@ -109,7 +110,7 @@ recognizes the `scf.while` outer loop (same doc).
 | `CodePartitionUtility.h` | `Channel`, `AllocChannel`, `TmemAllocChannel`, `ReuseGroup`, `ReuseConfig`, `CommChannel` |
 | `TMEMUtils.h` | `TMEM1DAllocator`, `sliceAndReinterpretMDTMEM`, `createTMEMDesc` |
 | `WSBarrierAnalysis.h` | `WSBarrierAttr`, `buildChannelGraph`, `buildWSBarrierOrderedRegionRanges`, `injectChannelGraph` — channel graph and ordered-region construction for barrier constraints |
-| `nvidia/hopper/include/Transforms/WSBarrierReorder.h` | `canAdvanceWSBarrier`, `canAdvanceWSBarrierArrivePastWait`, `sinkWSArrives`, `raiseWSWaits`, `buildBarrierToMemoryOpMap`, `optimizeWSBarrierLocations` — barrier reordering utilities consumed by `InterleaveTMem` |
+| `WSBarrierReorder.h` | `canAdvanceWSBarrier`, `canAdvanceWSBarrierArrivePastWait`, `sinkWSArrives`, `raiseWSWaits`, `buildBarrierToMemoryOpMap`, `optimizeWSBarrierLocations` — barrier reordering utilities consumed by `InterleaveTMem` |
 
 ## Glossary
 
@@ -140,6 +141,7 @@ recognizes the `scf.while` outer loop (same doc).
 - [Accumulation Counters](AccumulationCounters.md) — accumulation counter infrastructure for multi-buffering
 - [Operand D Handling](OperandDHandling.md) — MMA accumulator lifecycle through WS
 - [TMEM Allocation Heuristics](TMEMAllocationHeuristics.md) — TMEM memory planning algorithms
+- [TMEM Barrier Insertion](TMEMBarrierInsertion.md) — physical-address ownership rules for warp-local barrier elision
 - [SMEM Allocation Design](SmemAllocationDesign.md) — SMEM budget-aware allocation
 - [Memory Planner Search](MemoryPlannerSearch.md) — high-level guide to the TMEM/SMEM plan-space allocator (heuristics → search → post-pass, module seams, knobs)
 - [Barrier Fusion](BarrierFusion.md) — TMA fusion, tcgen05_commit combining

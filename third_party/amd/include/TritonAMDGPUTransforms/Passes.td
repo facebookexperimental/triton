@@ -310,6 +310,8 @@ def TritonAMDGPUCoalesceAsyncCopy
   let options =
       [Option<"gfxArch", "gfx-arch", "std::string", /*default=*/"std::string{}",
               "Specify the GFX architecture name, e.g., gfx942, gfx950, etc.">,
+       Option<"useAsyncCopy", "use_async_copy", "bool", /*default=*/"true",
+              "Whether the pipeline automatically generates async copies">,
   ];
 }
 

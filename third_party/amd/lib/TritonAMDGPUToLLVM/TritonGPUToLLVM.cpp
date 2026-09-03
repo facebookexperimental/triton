@@ -79,6 +79,13 @@ struct ConvertTritonAMDGPUToLLVM
     this->ftz = ftz;
   }
 
+  ConvertTritonAMDGPUToLLVM(StringRef gfxArch, bool ftz,
+                            bool enableTreeReduction) {
+    this->gfxArch = gfxArch.str();
+    this->ftz = ftz;
+    this->enableTreeReduction = enableTreeReduction;
+  }
+
   void getDependentDialects(DialectRegistry &registry) const override {
     registry
         .insert<LLVM::LLVMDialect, NVVM::NVVMDialect, mlir::ROCDL::ROCDLDialect,
@@ -184,8 +191,9 @@ struct ConvertTritonAMDGPUToLLVM
     AMD::populateTensorPtrOpsToLLVMPatterns(typeConverter, patterns,
                                             AMDBenefit);
 
-    populatePatterns7(mlir::triton::populateReduceOpToLLVMPatterns,
-                      commonBenefit);
+    mlir::triton::populateReduceOpToLLVMPatternsWithOptions(
+        typeConverter, patterns, targetInfo, commonBenefit,
+        enableTreeReduction);
     populatePatterns7(mlir::triton::populateScanOpToLLVMPatterns,
                       commonBenefit);
     populatePatterns5(mlir::triton::populateViewOpToLLVMPatterns,
@@ -284,6 +292,13 @@ namespace mlir::triton {
 std::unique_ptr<OperationPass<ModuleOp>>
 createConvertTritonAMDGPUToLLVMPass(StringRef gfxArch, bool ftz) {
   return std::make_unique<ConvertTritonAMDGPUToLLVM>(gfxArch, ftz);
+}
+
+std::unique_ptr<OperationPass<ModuleOp>>
+createConvertTritonAMDGPUToLLVMPass(StringRef gfxArch, bool ftz,
+                                    bool enableTreeReduction) {
+  return std::make_unique<ConvertTritonAMDGPUToLLVM>(
+      gfxArch, ftz, enableTreeReduction);
 }
 
 } // namespace mlir::triton
