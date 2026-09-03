@@ -891,12 +891,6 @@ def TT_ElementwiseInlineAsmOp
 
     The asm block is given `packed_element` elements at a time.  Exactly which
     elems it receives is unspecified.
-    Incomplete groups are padded with undefined inputs, and the corresponding
-    padded outputs are discarded.
-
-    When `pure` is false, each logical group of packed elements executes the
-    asm block once, even if the tensor layout replicates those elements across
-    physical threads.
   }];
 
   let arguments = (ins StrAttr:$asm_string, StrAttr:$constraints,
