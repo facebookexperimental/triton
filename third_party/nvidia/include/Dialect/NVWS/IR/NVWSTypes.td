@@ -46,6 +46,22 @@ def NVWS_ArefType : NVWS_TypeDef<"Aref", "aref"> {
   let assemblyFormat = "`<` $baseType `>`";
 }
 
+def NVWS_SemaphoreType : NVWS_TypeDef<"Semaphore", "semaphore"> {
+  let summary = "Semaphore with embedded buffer type";
+  let description = [{
+    A semaphore guards access to a multi-buffered allocation. It embeds the
+    buffer types, and infers the number of pipeline stages from their leading
+    dimension. Multiple semaphores can share the same buffer and will use a
+    shared stage counter.
+  }];
+  let parameters = (ins "TypeArrayAttr":$baseType);
+  let assemblyFormat = "`<` $baseType `>`";
+  let extraClassDeclaration = [{
+    int getNumStages() const;
+  }];
+  let genVerifyDecl = 1;
+}
+
 def NVWS_TokenType : NVWS_TypeDef<"Token", "token">;
 
 #endif // NVWS_TYPES
