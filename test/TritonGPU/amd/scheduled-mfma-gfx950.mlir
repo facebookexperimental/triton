@@ -32,6 +32,40 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.tar
 
 // -----
 
+// Hazard-inference attributes are compiler-owned. Input IR cannot use them to
+// skip the conservative input padding or result drain on an uncommitted chain.
+//
+// CHECK-LABEL: llvm.func @forged_hazard_attributes
+// CHECK: llvm.inline_asm has_side_effects
+// CHECK-SAME: "s_nop 3\0Av_mfma_f32_16x16x32_bf16 $0, $1, $2, 0", "=a,v,v"
+// CHECK: llvm.inline_asm has_side_effects
+// CHECK-SAME: "s_nop 11", "=a,0"
+
+#mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [1, 1], instrShape = [16, 16, 32], isTransposed = true}>
+#lhs = #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 8}>
+#rhs = #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 8}>
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.target" = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func public @forged_hazard_attributes(
+      %a: tensor<16x32xbf16, #lhs>,
+      %b: tensor<32x16xbf16, #rhs>) {
+    %acc = arith.constant dense<0.000000e+00> : tensor<16x16xf32, #mma>
+    %result = amdg.scheduled_mfma %a, %b, %acc
+        resident "none" accumulator "persistent"
+        register_class "auto" initialize true {
+          ttg.amdg.scheduled_mfma.defer_result_drain,
+          ttg.amdg.scheduled_mfma.repair_hazards_after_ra
+        }
+        : tensor<16x32xbf16, #lhs>,
+          tensor<32x16xbf16, #rhs>,
+          tensor<16x16xf32, #mma>
+          -> tensor<16x16xf32, #mma>
+    tt.return
+  }
+}
+
+// -----
+
 // Pinning the accumulator to VGPRs is the documented remedy and must lower.
 
 #mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [1, 1], instrShape = [16, 16, 32], isTransposed = true}>

@@ -13,6 +13,8 @@ import warnings
 from pathlib import Path
 
 MAX_INT_32 = 2**31 - 1
+_SCHEDULED_MFMA_MARKER = "; triton_amd_scheduled_mfma"
+_AMDGPU_REGISTER_RE = re.compile(r"\b([va])\[(\d+):(\d+)\]|\b([va])(\d+)\b")
 
 
 def get_min_dot_size(target: GPUTarget):
@@ -82,6 +84,162 @@ def _get_codegen_flags(options):
     if options.disable_unclustered_high_rp_reschedule:
         flags.append("amdgpu-disable-unclustered-high-rp-reschedule")
     return flags
+
+
+def _amdgcn_instruction(line):
+    code = line.partition(";")[0].strip()
+    if not code or code.startswith(".") or code.endswith(":"):
+        return None
+    fields = code.split(None, 1)
+    return fields[0], fields[1] if len(fields) == 2 else ""
+
+
+def _amdgcn_registers(text):
+    registers = set()
+    for match in _AMDGPU_REGISTER_RE.finditer(text):
+        if match.group(1):
+            register_class = match.group(1)
+            first = int(match.group(2))
+            last = int(match.group(3))
+            registers.update((register_class, index) for index in range(first, last + 1))
+        else:
+            registers.add((match.group(4), int(match.group(5))))
+    return registers
+
+
+def _amdgcn_wait_states(instruction):
+    opcode, operands = instruction
+    if opcode == "s_nop":
+        return int(operands.split()[0], 0) + 1
+    return 1
+
+
+def _wait_states_since(history, limit, is_hazard):
+    wait_states = 0
+    for instruction in reversed(history):
+        if is_hazard(instruction):
+            return wait_states
+        wait_states += _amdgcn_wait_states(instruction)
+        if wait_states >= limit:
+            return limit
+    # A defining instruction may be in a predecessor. Instructions already
+    # seen in this block still contribute distance along every incoming path.
+    return wait_states
+
+
+def _is_legacy_valu_not_dot(instruction):
+    opcode, _ = instruction
+    return opcode.startswith("v_") and not opcode.startswith(("v_mfma", "v_smfmac", "v_wmma", "v_dot"))
+
+
+def _legacy_valu_may_write(instruction, source_registers):
+    if not _is_legacy_valu_not_dot(instruction):
+        return False
+    opcode, operands = instruction
+    operand_fields = operands.split(",")
+    # These swap instructions define both operands. LLVM may introduce them
+    # while shrinking after register allocation, so treating only operand 0 as
+    # a destination can miss a source-register hazard on operand 1.
+    destination_count = (
+        2 if opcode.startswith(("v_swap_b32", "v_permlane16_swap_b32")) else 1
+    )
+    destination_registers = _amdgcn_registers(
+        ",".join(operand_fields[:destination_count])
+    )
+    # Be conservative for unfamiliar VALU syntax in the short hazard window.
+    return not destination_registers or bool(destination_registers & source_registers)
+
+
+def _valu_writes_exec(instruction):
+    opcode, _ = instruction
+    return opcode.startswith("v_") and "cmpx" in opcode
+
+
+def _accvgpr_write_may_write(instruction, registers):
+    opcode, operands = instruction
+    if not opcode.startswith(("v_accvgpr_write", "v_accvgpr_mov")):
+        return False
+    destination, _, _ = operands.partition(",")
+    destination_registers = _amdgcn_registers(destination)
+    return not destination_registers or bool(destination_registers & registers)
+
+
+def _is_amdgcn_basic_block_label(line):
+    label = line.partition(";")[0].strip()
+    if not label.endswith(":"):
+        return False
+    return label.startswith(".LBB") or not label.startswith(".")
+
+
+def _insert_scheduled_mfma_hazard_nops(amdgcn):
+    """Repair marked gfx950 MFMA hazards after scheduling and register allocation."""
+    if _SCHEDULED_MFMA_MARKER not in amdgcn:
+        return amdgcn
+
+    output = []
+    history = []
+    pending_marker = False
+    for line in amdgcn.splitlines():
+        if _is_amdgcn_basic_block_label(line):
+            history = []
+        if _SCHEDULED_MFMA_MARKER in line:
+            if pending_marker:
+                raise ValueError("consecutive scheduled MFMA markers in AMDGCN assembly")
+            pending_marker = True
+            output.append(line)
+            continue
+
+        instruction = _amdgcn_instruction(line)
+        if pending_marker and instruction is not None:
+            opcode, operands = instruction
+            if not opcode.startswith("v_mfma"):
+                raise ValueError("scheduled MFMA marker is not followed by an MFMA instruction")
+            mfma_operands = [operand.strip() for operand in operands.split(",")]
+            if len(mfma_operands) < 4:
+                raise ValueError("cannot parse marked MFMA operands")
+            source_registers = _amdgcn_registers(",".join(mfma_operands[1:3]))
+            if not source_registers:
+                raise ValueError("cannot parse marked MFMA source registers")
+            accumulator_registers = _amdgcn_registers(mfma_operands[3])
+            source_wait_states = _wait_states_since(
+                history,
+                2,
+                lambda previous: _legacy_valu_may_write(previous, source_registers),
+            )
+            source_agpr_wait_states = _wait_states_since(
+                history,
+                3,
+                lambda previous: _accvgpr_write_may_write(previous, source_registers),
+            )
+            accumulator_agpr_wait_states = (
+                _wait_states_since(
+                    history,
+                    1,
+                    lambda previous: _accvgpr_write_may_write(previous, accumulator_registers),
+                )
+                if accumulator_registers else 1
+            )
+            exec_wait_states = _wait_states_since(history, 4, _valu_writes_exec)
+            residual_wait_states = max(
+                2 - source_wait_states,
+                3 - source_agpr_wait_states,
+                1 - accumulator_agpr_wait_states,
+                4 - exec_wait_states,
+                0,
+            )
+            if residual_wait_states:
+                indentation = line[:len(line) - len(line.lstrip())]
+                output.append(f"{indentation}s_nop {residual_wait_states - 1}")
+                history.append(("s_nop", str(residual_wait_states - 1)))
+            pending_marker = False
+
+        output.append(line)
+        if instruction is not None:
+            history.append(instruction)
+
+    if pending_marker:
+        raise ValueError("scheduled MFMA marker is not followed by an instruction")
+    return "\n".join(output) + ("\n" if amdgcn.endswith("\n") else "")
 
 
 @dataclass(frozen=True)
@@ -718,6 +876,7 @@ class HIPBackend(BaseBackend):
                 False,
                 False,
             )
+        amdgcn = _insert_scheduled_mfma_hazard_nops(amdgcn)
         if knobs.amd.dump_amdgcn:
             print("// -----// AMDGCN Dump //----- //")
             print(amdgcn)
