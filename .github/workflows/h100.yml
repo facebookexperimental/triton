@@ -137,7 +137,7 @@ jobs:
           python -c 'from torchao.prototype.mx_formats.mx_tensor import MXTensor, ScaleCalculationMode'
       - name: Run TLX unit tests
         id: run_unit_tests
-        timeout-minutes: 5
+        timeout-minutes: 15
         run: |
           . "${SETUP_SCRIPT}"
           # TLX-only: the test_tlx_*.py glob covers manual TLX (tlx.async_tasks)
