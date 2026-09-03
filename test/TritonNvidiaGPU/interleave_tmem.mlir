@@ -18,8 +18,6 @@ tt.func public @sink_load(%arg0: !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_m
                           %arg2: !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>)
                           -> (tensor<128x64xf16, #blocked>, tensor<128x64xf16, #blocked>, tensor<128x128xf16, #blocked>) {
 
-  // CHECK: ttng.tmem_load
-  // CHECK-NEXT: ttg.convert_layout
   %subslice0 = ttng.tmem_subslice %arg0 {offset = 0 : i32} : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x64xf32, #tmem, #ttng.tensor_memory, mutable, 128x128>
   %subtile0 = ttng.tmem_load %subslice0 : !ttg.memdesc<128x64xf32, #tmem, #ttng.tensor_memory, mutable, 128x128> -> tensor<128x64xf32, #linear64>
   %outLHS = ttg.convert_layout %subtile0 : tensor<128x64xf32, #linear64> -> tensor<128x64xf32, #blocked>
@@ -28,9 +26,11 @@ tt.func public @sink_load(%arg0: !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_m
   %outRHS = ttg.convert_layout %subtile1 : tensor<128x64xf32, #linear64> -> tensor<128x64xf32, #blocked>
 
   // CHECK: ttg.local_alloc
-  // CHECK-NEXT: arith.truncf
-  // CHECK-NEXT: ttng.tmem_load
-  // CHECK-NEXT: ttg.convert_layout
+  // CHECK: [[LHS:%.+]] = ttng.tmem_load
+  // CHECK-NEXT: [[LHS_LAYOUT:%.+]] = ttg.convert_layout [[LHS]]
+  // CHECK-NEXT: arith.truncf [[LHS_LAYOUT]]
+  // CHECK-NEXT: [[RHS:%.+]] = ttng.tmem_load
+  // CHECK-NEXT: [[RHS_LAYOUT:%.+]] = ttg.convert_layout [[RHS]]
   %4 = ttg.local_alloc %arg1 : (tensor<128x128xf16, #blocked>) -> !ttg.memdesc<128x128xf16, #shared, #smem>
   %5 = arith.truncf %outLHS : tensor<128x64xf32, #blocked> to tensor<128x64xf16, #blocked>
 
@@ -40,7 +40,7 @@ tt.func public @sink_load(%arg0: !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_m
   %6 = arith.truncf %outRHS : tensor<128x64xf32, #blocked> to tensor<128x64xf16, #blocked>
 
   // CHECK: ttng.tmem_store
-  // CHECK-NEXT: arith.truncf
+  // CHECK-NEXT: arith.truncf [[RHS_LAYOUT]]
   // CHECK: ttng.tmem_load
   // CHECK-NEXT: ttg.convert_layout
   // CHECK-NEXT: "unknow_may_side_effect"() : () -> ()
@@ -54,8 +54,8 @@ tt.func public @sink_load(%arg0: !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_m
   tt.return %5, %6, %9 : tensor<128x64xf16, #blocked>, tensor<128x64xf16, #blocked>, tensor<128x128xf16, #blocked>
 }
 
-// CHECK-LABEL: @sink_loads_to_fresh_ranges
-tt.func public @sink_loads_to_fresh_ranges(%arg0: !ttg.memdesc<128x256xf32, #tmem, #ttng.tensor_memory, mutable>)
+// CHECK-LABEL: @sink_split_loads_greedily
+tt.func public @sink_split_loads_greedily(%arg0: !ttg.memdesc<128x256xf32, #tmem, #ttng.tensor_memory, mutable>)
     -> (tensor<128x64xf32, #blocked>, tensor<128x64xf32, #blocked>, tensor<128x64xf32, #blocked>, tensor<128x64xf32, #blocked>) {
   %bias0_h = arith.constant dense<1.0> : tensor<128x1xf16, #blocked>
   %bias1_h = arith.constant dense<2.0> : tensor<128x1xf16, #blocked>
@@ -66,8 +66,6 @@ tt.func public @sink_loads_to_fresh_ranges(%arg0: !ttg.memdesc<128x256xf32, #tme
   %slice2 = ttng.tmem_subslice %arg0 {offset = 128 : i32} : !ttg.memdesc<128x256xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x64xf32, #tmem, #ttng.tensor_memory, mutable, 128x256>
   %slice3 = ttng.tmem_subslice %arg0 {offset = 192 : i32} : !ttg.memdesc<128x256xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x64xf32, #tmem, #ttng.tensor_memory, mutable, 128x256>
 
-  // CHECK: [[L0:%.+]] = ttng.tmem_load
-  // CHECK-NEXT: [[V0:%.+]] = ttg.convert_layout [[L0]]
   %load0 = ttng.tmem_load %slice0 : !ttg.memdesc<128x64xf32, #tmem, #ttng.tensor_memory, mutable, 128x256> -> tensor<128x64xf32, #linear64>
   %val0 = ttg.convert_layout %load0 : tensor<128x64xf32, #linear64> -> tensor<128x64xf32, #blocked>
   %load1 = ttng.tmem_load %slice1 : !ttg.memdesc<128x64xf32, #tmem, #ttng.tensor_memory, mutable, 128x256> -> tensor<128x64xf32, #linear64>
@@ -77,35 +75,37 @@ tt.func public @sink_loads_to_fresh_ranges(%arg0: !ttg.memdesc<128x256xf32, #tme
   %load3 = ttng.tmem_load %slice3 : !ttg.memdesc<128x64xf32, #tmem, #ttng.tensor_memory, mutable, 128x256> -> tensor<128x64xf32, #linear64>
   %val3 = ttg.convert_layout %load3 : tensor<128x64xf32, #linear64> -> tensor<128x64xf32, #blocked>
 
-  // CHECK-NEXT: [[B0F:%.+]] = arith.extf
+  // CHECK: [[B0F:%.+]] = arith.extf
   // CHECK-NEXT: [[B0:%.+]] = tt.broadcast [[B0F]]
-  // CHECK-NEXT: [[O0:%.+]] = arith.addf [[V0]], [[B0]]
   %bias0_f = arith.extf %bias0_h : tensor<128x1xf16, #blocked> to tensor<128x1xf32, #blocked>
   %bias0 = tt.broadcast %bias0_f : tensor<128x1xf32, #blocked> -> tensor<128x64xf32, #blocked>
   %out0 = arith.addf %val0, %bias0 : tensor<128x64xf32, #blocked>
 
-  // CHECK-NEXT: [[L1:%.+]] = ttng.tmem_load
-  // CHECK-NEXT: [[V1:%.+]] = ttg.convert_layout [[L1]]
   // CHECK-NEXT: [[B1F:%.+]] = arith.extf
   // CHECK-NEXT: [[B1:%.+]] = tt.broadcast [[B1F]]
-  // CHECK-NEXT: [[O1:%.+]] = arith.addf [[V1]], [[B1]]
   %bias1_f = arith.extf %bias1_h : tensor<128x1xf16, #blocked> to tensor<128x1xf32, #blocked>
   %bias1 = tt.broadcast %bias1_f : tensor<128x1xf32, #blocked> -> tensor<128x64xf32, #blocked>
   %out1 = arith.addf %val1, %bias1 : tensor<128x64xf32, #blocked>
 
-  // CHECK-NEXT: [[L2:%.+]] = ttng.tmem_load
-  // CHECK-NEXT: [[V2:%.+]] = ttg.convert_layout [[L2]]
   // CHECK-NEXT: [[B2F:%.+]] = arith.extf
   // CHECK-NEXT: [[B2:%.+]] = tt.broadcast [[B2F]]
-  // CHECK-NEXT: [[O2:%.+]] = arith.addf [[V2]], [[B2]]
   %bias2_f = arith.extf %bias2_h : tensor<128x1xf16, #blocked> to tensor<128x1xf32, #blocked>
   %bias2 = tt.broadcast %bias2_f : tensor<128x1xf32, #blocked> -> tensor<128x64xf32, #blocked>
   %out2 = arith.addf %val2, %bias2 : tensor<128x64xf32, #blocked>
 
-  // CHECK-NEXT: [[L3:%.+]] = ttng.tmem_load
-  // CHECK-NEXT: [[V3:%.+]] = ttg.convert_layout [[L3]]
   // CHECK-NEXT: [[B3F:%.+]] = arith.extf
   // CHECK-NEXT: [[B3:%.+]] = tt.broadcast [[B3F]]
+  // CHECK-NEXT: [[L0:%.+]] = ttng.tmem_load
+  // CHECK-NEXT: [[V0:%.+]] = ttg.convert_layout [[L0]]
+  // CHECK-NEXT: [[O0:%.+]] = arith.addf [[V0]], [[B0]]
+  // CHECK-NEXT: [[L1:%.+]] = ttng.tmem_load
+  // CHECK-NEXT: [[V1:%.+]] = ttg.convert_layout [[L1]]
+  // CHECK-NEXT: [[O1:%.+]] = arith.addf [[V1]], [[B1]]
+  // CHECK-NEXT: [[L2:%.+]] = ttng.tmem_load
+  // CHECK-NEXT: [[V2:%.+]] = ttg.convert_layout [[L2]]
+  // CHECK-NEXT: [[O2:%.+]] = arith.addf [[V2]], [[B2]]
+  // CHECK-NEXT: [[L3:%.+]] = ttng.tmem_load
+  // CHECK-NEXT: [[V3:%.+]] = ttg.convert_layout [[L3]]
   // CHECK-NEXT: [[O3:%.+]] = arith.addf [[V3]], [[B3]]
   %bias3_f = arith.extf %bias3_h : tensor<128x1xf16, #blocked> to tensor<128x1xf32, #blocked>
   %bias3 = tt.broadcast %bias3_f : tensor<128x1xf32, #blocked> -> tensor<128x64xf32, #blocked>
@@ -135,9 +135,9 @@ tt.func @interleave_load_store_ws() {
       %cur_acc = ttg.memdesc_index %arg0[%i] : !ttg.memdesc<2x128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
 
       // CHECK-NEXT: [[S0:%.+]] = ttng.tmem_subslice %{{.+}} {offset = 0 : i32}
+      // CHECK-NEXT: [[S1:%.+]] = ttng.tmem_subslice %{{.+}} {offset = 64 : i32}
       // CHECK-NEXT: [[L0:%.+]] = ttng.tmem_load [[S0]]
       // CHECK-NEXT: [[M0:%.+]] = arith.mulf [[L0]]
-      // CHECK-NEXT: [[S1:%.+]] = ttng.tmem_subslice %{{.+}} {offset = 64 : i32}
       // CHECK-NEXT: ttng.tmem_store [[M0]], [[S0]]
       %slice0 = ttng.tmem_subslice %cur_acc {offset = 0 : i32} : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x64xf32, #tmem, #ttng.tensor_memory, mutable, 128x128>
       %val0 = ttng.tmem_load %slice0 : !ttg.memdesc<128x64xf32, #tmem, #ttng.tensor_memory, mutable, 128x128> -> tensor<128x64xf32, #linear64>
@@ -167,8 +167,10 @@ tt.func @arrive_barrier(%arg0: !ttg.memdesc<1xi64, #barrier_shared, #smem, mutab
   // CHECK-COUNT-2: ttng.tmem_alloc
   %alloc = ttng.tmem_alloc : () -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
   %noalias_alloc = ttng.tmem_alloc : () -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
-  // CHECK-NEXT: tmem_load
+  // The load sinks past the store because the two allocations do not alias, but
+  // stops at the unconstrained arrive.
   // CHECK-NEXT: tmem_store
+  // CHECK-NEXT: tmem_load
   %0 = ttng.tmem_load %alloc : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #linear128>
   ttng.tmem_store %cst, %noalias_alloc, %true : tensor<128x128xf32, #linear128> -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
   // CHECK-NEXT: arrive_barrier
@@ -184,15 +186,18 @@ tt.func @arrive_restore_after_operand_defs(
   %c0 = arith.constant 0 : i32
   %cst = arith.constant dense<0.0> : tensor<128x128xf32, #linear128>
   %alloc = ttng.tmem_alloc : () -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+  // The load cannot sink past a store to the same allocation.
+  // CHECK: ttng.tmem_load
+  // CHECK-NEXT: ttng.tmem_store
   %unused = ttng.tmem_load %alloc : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #linear128>
-  // CHECK: ttng.tmem_store
   ttng.tmem_store %cst, %alloc, %true : tensor<128x128xf32, #linear128> -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+  // The restored arrive must still land after the def of its barrier operand.
   // CHECK-NEXT: [[BAR:%.+]] = ttg.memdesc_index
   %bar = ttg.memdesc_index %arg0[%c0] : !ttg.memdesc<1x1xi64, #barrier_shared, #smem, mutable> -> !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>
   %use0 = arith.addi %c0, %c0 : i32
-  // CHECK-NEXT: arith.addi
   // CHECK-NEXT: ttng.arrive_barrier [[BAR]], 1
   ttng.arrive_barrier %bar, 1 {constraints = {WSBarrier = {channelGraph = array<i32: 1>}}} : !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>
+  // CHECK-NEXT: arith.addi
   // CHECK-NEXT: arith.addi
   %use1 = arith.addi %use0, %c0 : i32
   "user"(%unused, %use1) : (tensor<128x128xf32, #linear128>, i32) -> ()
@@ -200,21 +205,24 @@ tt.func @arrive_restore_after_operand_defs(
 }
 
 // CHECK-LABEL: @sink_alloc_op
+// The block holds allocs and no load, so the worklist gate admits it on the
+// allocs alone. Each alloc/subview pair sinks to just before the store that
+// consumes it, which reverses the two pairs relative to program order.
 tt.func @sink_alloc_op(%arg0: tensor<128x128xf32, #linear128>) {
   %c0 = arith.constant 0 : i32
   %true = arith.constant true
 
-  // CHECK: [[ALLOC0:%.+]] = ttng.tmem_alloc
-  %alloc0 = ttng.tmem_alloc : () -> !ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable>
-  // CHECK-NEXT: [[SUBVIEW0:%.+]] = ttg.memdesc_index [[ALLOC0]]
-  %subview0 = ttg.memdesc_index %alloc0[%c0] : !ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
-  // CHECK-NEXT: [[ALLOC1:%.+]] = ttng.tmem_alloc
-  %alloc1 = ttng.tmem_alloc : () -> !ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+  // CHECK: [[ALLOC1:%.+]] = ttng.tmem_alloc
   // CHECK-NEXT: [[SUBVIEW1:%.+]] = ttg.memdesc_index [[ALLOC1]]
-  %subview1 = ttg.memdesc_index %alloc1[%c0] : !ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
   // CHECK-NEXT: tmem_store %arg0, [[SUBVIEW1]]
-  ttng.tmem_store %arg0, %subview1, %true : tensor<128x128xf32, #linear128> -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+  // CHECK-NEXT: [[ALLOC0:%.+]] = ttng.tmem_alloc
+  // CHECK-NEXT: [[SUBVIEW0:%.+]] = ttg.memdesc_index [[ALLOC0]]
   // CHECK-NEXT: tmem_store %arg0, [[SUBVIEW0]]
+  %alloc0 = ttng.tmem_alloc : () -> !ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+  %subview0 = ttg.memdesc_index %alloc0[%c0] : !ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+  %alloc1 = ttng.tmem_alloc : () -> !ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+  %subview1 = ttg.memdesc_index %alloc1[%c0] : !ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+  ttng.tmem_store %arg0, %subview1, %true : tensor<128x128xf32, #linear128> -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
   ttng.tmem_store %arg0, %subview0, %true : tensor<128x128xf32, #linear128> -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
   tt.return
 }
@@ -228,10 +236,19 @@ tt.func @sink_arrive_past_wait_disjoint(
     %phase: i32) {
   %alloc = ttng.tmem_alloc : () -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
   %unused = ttng.tmem_load %alloc : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #linear128>
-  // CHECK: ttng.wait_barrier {{.*}}channelGraph = array<i32: 2>
-  // CHECK: ttng.arrive_barrier {{.*}}channelGraph = array<i32: 2>
-  // CHECK: ttng.wait_barrier {{.*}}channelGraph = array<i32: 1>
-  // CHECK: ttng.arrive_barrier {{.*}}channelGraph = array<i32: 1>
+  // The cg2 arrive sinks past the disjoint cg1 wait, and the cg1 wait rises past
+  // the disjoint cg2 arrive, leaving both waits ahead of both arrives.
+  //
+  // The two arrives are intentionally left unordered. Both scan back to the
+  // same tmem_load when barrier restoration builds its barrier-to-memory-op
+  // map, and that map is a DenseMap, so whichever arrive restoration visits
+  // second is the one that ends up adjacent to the load. CHECK-NEXT here would
+  // pin an order that varies with DenseMap iteration.
+  // CHECK:      ttng.wait_barrier {{.*}}channelGraph = array<i32: 2>
+  // CHECK-NEXT: ttng.wait_barrier {{.*}}channelGraph = array<i32: 1>
+  // CHECK:      ttng.tmem_load
+  // CHECK-DAG:  ttng.arrive_barrier {{.*}}channelGraph = array<i32: 2>
+  // CHECK-DAG:  ttng.arrive_barrier {{.*}}channelGraph = array<i32: 1>
   ttng.wait_barrier %bar1, %phase {constraints = {WSBarrier = {channelGraph = array<i32: 2>}}} : !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>
   ttng.arrive_barrier %bar1, 1 {constraints = {WSBarrier = {channelGraph = array<i32: 2>}}} : !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>
   ttng.wait_barrier %bar2, %phase {constraints = {WSBarrier = {channelGraph = array<i32: 1>}}} : !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>
@@ -359,10 +376,11 @@ tt.func @plain_tma_store_token_wait_does_not_block_tmem_load(
   %s1 = ttng.tmem_subslice %alloc {offset = 64 : i32} : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x64xf32, #tmem, #ttng.tensor_memory, mutable, 128x128>
   %v1 = ttng.tmem_load %s1 : !ttg.memdesc<128x64xf32, #tmem, #ttng.tensor_memory, mutable, 128x128> -> tensor<128x64xf32, #linear64>
   // CHECK:      ttng.async_tma_copy_local_to_global
-  // CHECK-NEXT: arith.truncf
   // CHECK-NEXT: ttng.tmem_load
+  // CHECK-NEXT: arith.truncf
   // CHECK-NEXT: ttng.async_tma_store_token_wait
   // CHECK-NEXT: ttg.local_store
+  // CHECK-NEXT: ttng.tmem_load
   // CHECK-NEXT: arith.truncf
   // CHECK-NEXT: ttg.local_store
   %tok = ttng.async_tma_copy_local_to_global %desc[%c0, %c0] %smem_buf : !tt.tensordesc<128x64xf16, #shared>, !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> !ttg.async.token
@@ -393,6 +411,13 @@ tt.func @plain_wait_does_not_cross_next_tma_launch(
   %tok1 = ttng.async_tma_copy_local_to_global %desc[%c0, %c0] %buf1 : !tt.tensordesc<128x64xf16, #shared>, !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> !ttg.async.token
   ttg.local_store %src, %buf0 : tensor<128x64xf16, #linear64> -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
   ttng.async_tma_store_token_wait %tok1 : !ttg.async.token
+  // The worklist gate admits a block only if it holds a TMEM load or alloc, so
+  // without these the pass would skip the block and never run token-wait
+  // delaying at all. They sit after the stores so they cannot perturb the
+  // sequence above: the alloc is pinned by its use and the load has nowhere
+  // left to sink.
+  %alloc = ttng.tmem_alloc : () -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+  %unused = ttng.tmem_load %alloc : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #linear128>
   tt.return
 }
 
@@ -541,37 +566,73 @@ tt.func @split_tmem_loads_all_sink(
   ttg.local_store %t1, %smem_buf : tensor<128x64xf16, #linear64> -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
   ttng.arrive_barrier %store_bar1, 1 {constraints = {WSBarrier = {channelGraph = array<i32: 2>}}} : !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>
 
-  // Expected: the tmem_loads stay before their same-channel arrive when the
-  // final order cannot improve their fresh live ranges.
+  // Expected: the second load sinks past the first load's consumer, so the two
+  // subtile values are no longer live at the same time.
   //
   // CHECK:      ttng.wait_barrier %{{.*}}, %{{.*}} :
   // CHECK-NEXT: ttng.tmem_load
-  // CHECK-NEXT: ttng.tmem_load
-  // CHECK-NEXT: ttng.arrive_barrier {{.*}}channelGraph = array<i32: 1, 3>
-  // CHECK-NEXT: ttng.wait_barrier {{.*}}channelGraph = array<i32: 2>
   // CHECK-NEXT: arith.truncf
+  // CHECK-NEXT: ttng.wait_barrier {{.*}}channelGraph = array<i32: 2>
   // CHECK-NEXT: ttg.local_store
   // CHECK-NEXT: ttng.arrive_barrier {{.*}}channelGraph = array<i32: 2>
-  // With global barrier normalization disabled, the load chain still carries
-  // its own arrive across the independent store-channel wait. This covers the
-  // targeted epilogue path used by FA backward.
-  // TARGETED:      ttng.tmem_load
+  // CHECK-NEXT: ttng.tmem_load
+  // CHECK-NEXT: ttng.arrive_barrier {{.*}}channelGraph = array<i32: 1, 3>
+  // CHECK-NEXT: arith.truncf
+  // With global barrier normalization disabled, each load carries its own
+  // arrive across the independent store-channel wait, so each subtile reaches
+  // its own consumer and the two are never live at once. The arrive ends up
+  // behind both loads, which is what keeps the release correct. This covers
+  // the targeted epilogue path used by FA backward.
+  // TARGETED:      ttng.wait_barrier %{{.*}}, %{{.*}} :
   // TARGETED-NEXT: ttng.wait_barrier {{.*}}channelGraph = array<i32: 2>
+  // TARGETED-NEXT: ttng.tmem_load
   // TARGETED-NEXT: arith.truncf
+  // TARGETED-NEXT: ttg.local_store
+  // TARGETED-NEXT: ttng.arrive_barrier {{.*}}channelGraph = array<i32: 2>
+  // TARGETED-NEXT: ttng.wait_barrier {{.*}}channelGraph = array<i32: 2>
   // TARGETED-NEXT: ttng.tmem_load
   // TARGETED-NEXT: ttng.arrive_barrier {{.*}}channelGraph = array<i32: 1, 3>
+  // TARGETED-NEXT: arith.truncf
   tt.return
 }
 
-// When the final order does not reduce overlapping tmem_load liveness, restore
-// the original block order.
-// CHECK-LABEL: @rollback_when_overlap_profile_unchanged
-tt.func @rollback_when_overlap_profile_unchanged() {
+// Only an arrive that already follows the load is absorbed. The leading
+// same-channel arrive is never visited by the forward walk, so it stays put
+// while the trailing one is carried across the store-channel wait.
+// CHECK-LABEL: @arrive_before_load_not_absorbed
+// TARGETED-LABEL: @arrive_before_load_not_absorbed
+tt.func @arrive_before_load_not_absorbed(
+    %bar: !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>,
+    %store_bar: !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>,
+    %smem_buf: !ttg.memdesc<128x64xf16, #shared, #smem, mutable>,
+    %phase: i32) {
+  %alloc = ttng.tmem_alloc : () -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+  %s0 = ttng.tmem_subslice %alloc {offset = 0 : i32} : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x64xf32, #tmem, #ttng.tensor_memory, mutable, 128x128>
+
+  // TARGETED:      ttng.arrive_barrier {{.*}}channelGraph = array<i32: 1, 3>
+  // TARGETED-NEXT: ttng.wait_barrier {{.*}}channelGraph = array<i32: 2>
+  // TARGETED-NEXT: ttng.tmem_load
+  // TARGETED-NEXT: ttng.arrive_barrier {{.*}}channelGraph = array<i32: 1, 3>
+  // TARGETED-NEXT: arith.truncf
+  // TARGETED-NEXT: ttg.local_store
+  ttng.arrive_barrier %bar, 1 {constraints = {WSBarrier = {channelGraph = array<i32: 1, 3>}}} : !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>
+  %v0 = ttng.tmem_load %s0 : !ttg.memdesc<128x64xf32, #tmem, #ttng.tensor_memory, mutable, 128x128> -> tensor<128x64xf32, #linear64>
+  ttng.arrive_barrier %bar, 1 {constraints = {WSBarrier = {channelGraph = array<i32: 1, 3>}}} : !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>
+  ttng.wait_barrier %store_bar, %phase {constraints = {WSBarrier = {channelGraph = array<i32: 2>}}} : !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>
+  %t0 = arith.truncf %v0 : tensor<128x64xf32, #linear64> to tensor<128x64xf16, #linear64>
+  ttg.local_store %t0, %smem_buf : tensor<128x64xf16, #linear64> -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+  tt.return
+}
+
+// An op with unknown side effects blocks sinking. Both loads move up to that
+// boundary but do not cross it.
+// CHECK-LABEL: @unknown_side_effect_blocks_sinking
+tt.func @unknown_side_effect_blocks_sinking() {
   %alloc = ttng.tmem_alloc : () -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
 
   // CHECK:      [[S0:%.+]] = ttng.tmem_subslice %{{.*}} {offset = 0 : i32}
-  // CHECK-NEXT: [[V0:%.+]] = ttng.tmem_load [[S0]]
   // CHECK-NEXT: [[S1:%.+]] = ttng.tmem_subslice %{{.*}} {offset = 64 : i32}
+  // CHECK-NEXT: [[V0:%.+]] = ttng.tmem_load [[S0]]
   // CHECK-NEXT: [[V1:%.+]] = ttng.tmem_load [[S1]]
   // CHECK-NEXT: "unknown_may_side_effect"
   // CHECK-NEXT: "user"([[V0]])
@@ -607,7 +668,10 @@ tt.func @restore_ws_arrive_stops_at_named_barrier(
   %out0 = arith.addf %v0, %bias0 : tensor<128x64xf32, #linear64>
   %out1 = arith.addf %v1, %bias1 : tensor<128x64xf32, #linear64>
 
-  // CHECK: ttng.tmem_store
+  // CHECK: ttng.tmem_load
+  // CHECK-NEXT: arith.addf
+  // CHECK-NEXT: ttng.tmem_load
+  // CHECK-NEXT: arith.addf
   // CHECK-NEXT: ttng.wait_barrier_named
   // CHECK-NEXT: ttng.arrive_barrier
   // CHECK-SAME: channelGraph = array<i32: 4>
