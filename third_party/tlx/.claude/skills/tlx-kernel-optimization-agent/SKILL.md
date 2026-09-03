@@ -86,7 +86,7 @@ receives layout-conversion efficiency guidance, CUDA/NVIDIA targets additionally
 receive async TMA output publication guidance, and Blackwell targets additionally
 receive persistent CLC scheduling and persistent pipeline efficiency guidance.
 Canonical profiling workflow documentation lives under
-`third_party/tlx/tools/agents/kernel_optimization/docs/profiling/` and is not
+`third_party/tlx/tools/agents/profiler/docs/` and is not
 injected as source guidance. Keep workload-specific
 invariants and exclusions in `target.json.optimization_guidance`; they are applied
 after the built-in target skills.
@@ -132,12 +132,12 @@ mapping, and command files as artifacts, and reference them with absolute paths.
 Profiling has three distinct layers:
 
 - Proton wrapper/launch attribution: read
-  `third_party/tlx/tools/agents/kernel_optimization/docs/profiling/proton.md` and
+  `third_party/tlx/tools/agents/profiler/docs/proton.md` and
   collect for every correctness-passing candidate.
 - Target summary/deep profiling: request `native_profiler`; each target harness
   maps it to its platform tool. For CUDA/NVIDIA, this is NCU and the harness
   should follow
-  `third_party/tlx/tools/agents/kernel_optimization/docs/profiling/nvidia-ncu.md`.
+  `third_party/tlx/tools/agents/profiler/docs/nvidia-ncu.md`.
 - Diagnostic-only Proton intra-kernel instrumentation: use only for attribution
   questions that cannot be answered from wrapper timelines or target counters.
 
@@ -164,7 +164,7 @@ promoted, committed, or used as speedup evidence.
 Select target profiling guidance from `target.json`:
 
 - CUDA/NVIDIA: read
-  `third_party/tlx/tools/agents/kernel_optimization/docs/profiling/nvidia-ncu.md`.
+  `third_party/tlx/tools/agents/profiler/docs/nvidia-ncu.md`.
 - Other backends: use a sibling target guide when present; otherwise use the
   vendor-neutral `profile()` contract without inventing NVIDIA requirements.
 

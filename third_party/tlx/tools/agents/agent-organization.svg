@@ -1,0 +1,88 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="900" viewBox="0 0 1600 900" role="img" aria-labelledby="title description">
+  <title id="title">FBTriton agent organization</title>
+  <desc id="description">The Manager dispatches profiling, causal analysis, implementation, build, and validation work. Confirmed findings may be proposed to the Knowledge Keeper for human-approved durable guidance. Self Diagnosis checks the complete agent system.</desc>
+  <defs>
+    <marker id="arrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
+      <path d="M0 1H6V0L12 6 6 12V11H0Z" fill="#4599ff"/>
+    </marker>
+    <style>
+      .title { fill: #f2f6ff; font: 800 34px Inter, sans-serif; letter-spacing: 2px; }
+      .subtitle { fill: #94a2ba; font: 16px Inter, sans-serif; }
+      .name { fill: #f6f8fc; font: 800 18px Inter, sans-serif; }
+      .detail { fill: #aab7cd; font: 13px Inter, sans-serif; }
+      .path { fill: #8d9bb3; font: 12px monospace; }
+      .node { fill: #121b30; stroke: #526585; stroke-width: 2; }
+      .flow { fill: none; stroke: #4599ff; stroke-width: 3; marker-end: url(#arrow); }
+      .support { fill: none; stroke: #7f8ba3; stroke-width: 2; stroke-dasharray: 8 7; marker-end: url(#arrow); }
+    </style>
+  </defs>
+  <rect width="1600" height="900" fill="#080c17"/>
+  <text x="64" y="68" class="title">FBTRITON AGENT TEAM</text>
+  <text x="64" y="98" class="subtitle">one role per folder · explicit handoffs · deterministic validation</text>
+
+  <g transform="translate(610 135)">
+    <rect width="380" height="105" rx="8" class="node" stroke="#ef6f91"/>
+    <text x="28" y="42" class="name">MANAGER · THE JUDGE</text>
+    <text x="28" y="68" class="detail">scope · dispatch · budgets · verdict</text>
+    <text x="28" y="90" class="path">manager/</text>
+  </g>
+
+  <g transform="translate(90 350)">
+    <rect width="250" height="105" rx="8" class="node"/>
+    <text x="24" y="40" class="name">PROFILER · SEER</text>
+    <text x="24" y="67" class="detail">raw measurement evidence</text>
+    <text x="24" y="90" class="path">profiler/</text>
+  </g>
+  <g transform="translate(390 350)">
+    <rect width="250" height="105" rx="8" class="node"/>
+    <text x="24" y="40" class="name">TL · SHERIFF</text>
+    <text x="24" y="67" class="detail">one causal finding</text>
+    <text x="24" y="90" class="path">tl/</text>
+  </g>
+  <g transform="translate(690 350)">
+    <rect width="250" height="105" rx="8" class="node"/>
+    <text x="24" y="40" class="name">WORKER · VILLAGER</text>
+    <text x="24" y="67" class="detail">isolated source candidate</text>
+    <text x="24" y="90" class="path">worker/</text>
+  </g>
+  <g transform="translate(990 350)">
+    <rect width="250" height="105" rx="8" class="node"/>
+    <text x="24" y="40" class="name">BUILD · WITCH</text>
+    <text x="24" y="67" class="detail">environment · isolation · VCS</text>
+    <text x="24" y="90" class="path">build_agent/</text>
+  </g>
+  <g transform="translate(1290 350)">
+    <rect width="250" height="105" rx="8" class="node"/>
+    <text x="24" y="40" class="name">VALIDATOR · GUARD</text>
+    <text x="24" y="67" class="detail">correctness · performance</text>
+    <text x="24" y="90" class="path">validator/</text>
+  </g>
+
+  <path d="M215 350V290H800V250" class="flow"/>
+  <path d="M800 240V290H515V340" class="flow"/>
+  <path d="M640 403H680" class="flow"/>
+  <path d="M940 403H980" class="flow"/>
+  <path d="M1240 403H1280" class="flow"/>
+  <path d="M1415 350V290H990" class="flow"/>
+
+  <g transform="translate(310 620)">
+    <rect width="380" height="105" rx="8" class="node" stroke="#f3a846"/>
+    <text x="28" y="40" class="name">KNOWLEDGE KEEPER · PRIEST</text>
+    <text x="28" y="67" class="detail">human-approved durable insight</text>
+    <text x="28" y="90" class="path">knowledge_keeper/</text>
+  </g>
+  <g transform="translate(910 620)">
+    <rect width="380" height="105" rx="8" class="node" stroke="#40c58a"/>
+    <text x="28" y="40" class="name">SELF DIAGNOSIS</text>
+    <text x="28" y="67" class="detail">agent-system regression suite</text>
+    <text x="28" y="90" class="path">self_diagnosis/</text>
+  </g>
+
+  <path d="M610 673H500V465" class="support"/>
+  <path d="M1100 620V475" class="support"/>
+  <path d="M800 240V580H690" class="support"/>
+  <path d="M990 673H800V250" class="support"/>
+
+  <text x="64" y="840" class="subtitle">PROFILE → FINDING → IMPLEMENT → BUILD → VALIDATE → MANAGER VERDICT → HUMAN-APPROVED KNOWLEDGE</text>
+</svg>
