@@ -1,0 +1,271 @@
+{
+ "num_groups_used": 21,
+ "num_active_groups": 21,
+ "active_groups": [
+  0,
+  1,
+  2,
+  3,
+  4,
+  5,
+  6,
+  7,
+  8,
+  9,
+  10,
+  11,
+  12,
+  13,
+  14,
+  15,
+  16,
+  17,
+  18,
+  19,
+  20
+ ],
+ "group_sizes": {
+  "0": 2,
+  "1": 1,
+  "2": 1,
+  "3": 1,
+  "4": 1,
+  "5": 1,
+  "6": 1,
+  "7": 1,
+  "8": 1,
+  "9": 1,
+  "10": 1,
+  "11": 1,
+  "12": 1,
+  "13": 1,
+  "14": 1,
+  "15": 1,
+  "16": 1,
+  "17": 1,
+  "18": 1,
+  "19": 3,
+  "20": 6
+ },
+ "group_ops": {
+  "0": {
+   "descriptor_load": 2
+  },
+  "1": {
+   "mulf": 1
+  },
+  "2": {
+   "mulf": 1
+  },
+  "3": {
+   "exp2": 1
+  },
+  "4": {
+   "tmem_load": 1
+  },
+  "5": {
+   "reduce": 1
+  },
+  "6": {
+   "mulf": 1
+  },
+  "7": {
+   "tmem_load": 1
+  },
+  "8": {
+   "convert_layout": 1
+  },
+  "9": {
+   "subf": 1
+  },
+  "10": {
+   "broadcast": 1
+  },
+  "11": {
+   "truncf": 1
+  },
+  "12": {
+   "reduce": 1
+  },
+  "13": {
+   "maxnumf": 1
+  },
+  "14": {
+   "subf": 1
+  },
+  "15": {
+   "exp2": 1
+  },
+  "16": {
+   "expand_dims": 1
+  },
+  "17": {
+   "mulf": 1
+  },
+  "18": {
+   "broadcast": 1
+  },
+  "19": {
+   "addf": 1,
+   "expand_dims": 1,
+   "tmem_store": 1
+  },
+  "20": {
+   "local_alloc": 2,
+   "memdesc_trans": 1,
+   "tc_gen5_mma": 2,
+   "tmem_alloc": 1
+  }
+ },
+ "tma_isolated": true,
+ "tma_groups": [
+  0
+ ],
+ "tma_single_group": true,
+ "mma_groups": [
+  20
+ ],
+ "mma_single_group": true,
+ "exp_groups": [
+  3,
+  15
+ ],
+ "softmax_two_groups": true,
+ "tmem_groups": [
+  4,
+  7
+ ],
+ "rescale_groups": [
+  4,
+  7
+ ],
+ "rescale_separate": false,
+ "fa4_role_groups": {
+  "variable_latency": [
+   0
+  ],
+  "tensor_core": [
+   20
+  ],
+  "softmax": [
+   3,
+   15
+  ],
+  "rescale": [
+   4,
+   7
+  ]
+ },
+ "fa4_roles_disjoint": true,
+ "fa4_roles_cover_active": false,
+ "softmax_phase_offsets": {
+  "3": [
+   1
+  ],
+  "15": [
+   1
+  ]
+ },
+ "fa4_like": false,
+ "vl_groups": [
+  0
+ ],
+ "compute_groups": [
+  1,
+  2,
+  3,
+  4,
+  5,
+  6,
+  7,
+  8,
+  9,
+  10,
+  11,
+  12,
+  13,
+  14,
+  15,
+  16,
+  17,
+  18,
+  19
+ ],
+ "exp_group_counts": {
+  "3": 1,
+  "15": 1
+ },
+ "exp_tmem_source_search_max_depth": 4,
+ "exp_tmem_sources": {
+  "13": [],
+  "18": [
+   8
+  ]
+ },
+ "exp_tmem_sources_in_group": {
+  "13": [],
+  "18": []
+ },
+ "exp_reads_tmem_in_group": false,
+ "reduction_staging_nodes": [],
+ "reduction_staging_group_counts": {},
+ "bwd_2wg_pingpong": false,
+ "bwd_3wg_fa4": false,
+ "criteria": {
+  "softmax_marker": "op_kind contains 'exp2' (proxy for the paper's 'softmax calculations', Fig 9 / p.10)",
+  "tmem_source_search_max_depth": 4,
+  "tmem_source_rule": "backward BFS over ALL curated edges (E is homogeneous; token edges desugared at curation, curated-ddg-0.2 section 3), stop at first tmem_load; ALL sources must share the exp node's group (operationalizes p.12 'two groups read accumulators from Tensor Memory')",
+  "staging_rule": "curated src (regs>1) of a curation-removed edge into a curation-dropped descriptor_reduce node, read from curation_manifest (curated-ddg-0.2 section 4-D1); operationalizes p.12 'stages accumulators in shared memory for the outgoing atomic reduction'; unavailable without a curation manifest, in which case bwd_2wg_pingpong and bwd_3wg_fa4 are null rather than false",
+  "compute_group_rule": "active_groups - vl_groups - mma_groups (reading of p.12 'two/three groups of warps'); curated G has no infra nodes, so every group is active",
+  "rescale_rule": "residual tmem_load groups minus VL/MMA/exp groups (operationalizes p.10 'accumulator rescaling ... third group')",
+  "tma_isolated_rule": "TMA groups admit occupancy==0 nodes (allocs adjacent to TMA loads in Fig 9; node.occupancy is a curated observational field, curated-ddg-0.2 section 2)",
+  "two_exp_rule": "exactly 2 exp2 nodes, one per group (sub-tiling realization assumption)",
+  "group_rule": "a group is one distinct physical warp set; the paper assigns every operation a set of warps and has no group label",
+  "curation_manifest": "40ac892c201ea9aa826ac364407efbf4876a9078470c436882e91397d5523b61"
+ },
+ "curation_manifest_sha256": "40ac892c201ea9aa826ac364407efbf4876a9078470c436882e91397d5523b61",
+ "regime": "prepared",
+ "ii": 3,
+ "length": 4,
+ "wall_s": 0.3,
+ "preparation": {
+  "regime": "prepared",
+  "prepared_sources_sha256": "6eab67cdaa298b2e036fb33ba5220834ba16e87caeacf2288d0c51f271091439",
+  "curated_ddg_sha256": "20501ee1daaaeda57da0f050b38c502248577c5f362504cad844b804c197d96d",
+  "raw_ddg_sha256": "804efdc8b3f8bf7353ce5e0358e82c904c0a0e9888abe1cf46b9281dd26cece2",
+  "assumptions": {
+   "a1_pool_members": "one entry per node, non-zero edge latencies, non-zero spills",
+   "a2_issue_width": 128,
+   "a2_elementwise_dialects": [
+    "arith",
+    "math"
+   ],
+   "a3_async_tokens_keep_measured_cost": true,
+   "a4_tmem_functional_unit": "TMEM",
+   "b1_cluster_tolerance": [
+    11,
+    10
+   ],
+   "b2_floor_divisor": 32,
+   "b3_zlp": "paper_joint_solver.normalize.normalize_costs",
+   "b4_second_objective": "maximize sum(C') at F = F*",
+   "b5_u": 150
+  },
+  "health": {
+   "pool_size": 75,
+   "positive_entries": 66,
+   "collapsed_entries": 59,
+   "collapse_ratio": 0.8939,
+   "survivor_spread": 1.0,
+   "distinct_survivors": [
+    1
+   ],
+   "objective_f": 320,
+   "first_stage_sum": 7,
+   "second_stage_sum": 7,
+   "u": 150,
+   "clusters": 13
+  },
+  "b5_u_applied": 150
+ }
+}

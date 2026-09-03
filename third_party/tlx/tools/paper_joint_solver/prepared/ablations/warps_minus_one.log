@@ -1,0 +1,23 @@
+[preparation] {"clusters": 16, "collapse_ratio": 0.1607, "collapsed_entries": 18, "distinct_survivors": [1, 2, 3, 4, 7, 10, 14, 22], "first_stage_sum": 16, "objective_f": 348, "pool_size": 129, "positive_entries": 112, "second_stage_sum": 272, "survivor_spread": 22.0, "u": 300}
+[probe] {'ii': 25, 'L': 55, 'result': 'unsat'}
+[probe] {'ii': 25, 'L': 56, 'result': 'unsat'}
+[probe] {'ii': 25, 'L': 57, 'result': 'unsat'}
+[probe] {'ii': 25, 'L': 58, 'result': 'unsat'}
+[probe] {'ii': 25, 'L': 59, 'result': 'unsat'}
+[probe] {'ii': 25, 'L': 60, 'result': 'unsat'}
+[probe] {'ii': 25, 'L': 61, 'result': 'unsat'}
+[probe] {'ii': 25, 'L': 62, 'result': 'unsat'}
+[probe] {'ii': 25, 'L': 63, 'result': 'unsat'}
+[probe] {'ii': 25, 'L': 64, 'result': 'unsat'}
+[probe] {'ii': 25, 'L': 65, 'result': 'unsat'}
+[probe] {'ii': 25, 'L': 66, 'result': 'unsat'}
+[probe] {'ii': 25, 'L': 67, 'result': 'unsat'}
+[probe] {'ii': 25, 'L': 68, 'result': 'unsat'}
+[probe] {'ii': 25, 'L': 69, 'result': 'unsat'}
+[probe] {'ii': 25, 'L': 70, 'result': 'unsat'}
+[probe] {'ii': 25, 'L': 71, 'result': 'unsat'}
+[probe] {'ii': 25, 'L': 72, 'result': 'unsat'}
+[probe] {'ii': 25, 'L': 73, 'result': 'unsat'}
+[probe] {'ii': 25, 'L': 74, 'result': 'unsat'}
+[probe] {'ii': 25, 'L': 75, 'result': 'unsat'}
+[prepared probe] I=25 unsat 21/21 -> prepared/ablations/warps_minus_one.json

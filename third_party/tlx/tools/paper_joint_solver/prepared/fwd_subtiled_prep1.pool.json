@@ -1,0 +1,1209 @@
+{
+ "regime": "prepared",
+ "prepared_sources_sha256": "6eab67cdaa298b2e036fb33ba5220834ba16e87caeacf2288d0c51f271091439",
+ "curated_ddg_sha256": "938a953dec1bc79e44c3891e2c451cbe4dcc337751db86e5e4e88c7d6eecf50c",
+ "raw_ddg_sha256": "4874fb0869dbb12b67dcb36a6e0b3df0c5bf06f953b460629201801c13af38b5",
+ "assumptions": {
+  "a1_pool_members": "one entry per node, non-zero edge latencies, non-zero spills",
+  "a2_issue_width": 128,
+  "a2_elementwise_dialects": [
+   "arith",
+   "math"
+  ],
+  "a3_async_tokens_keep_measured_cost": true,
+  "a4_tmem_functional_unit": "TMEM",
+  "b1_cluster_tolerance": [
+   11,
+   10
+  ],
+  "b2_floor_divisor": 32,
+  "b3_zlp": "paper_joint_solver.normalize.normalize_costs",
+  "b4_second_objective": "maximize sum(C') at F = F*",
+  "b5_u": 300
+ },
+ "health": {
+  "pool_size": 129,
+  "positive_entries": 112,
+  "collapsed_entries": 18,
+  "collapse_ratio": 0.1607,
+  "survivor_spread": 22.0,
+  "distinct_survivors": [
+   1,
+   2,
+   3,
+   4,
+   7,
+   10,
+   14,
+   22
+  ],
+  "objective_f": 348,
+  "first_stage_sum": 16,
+  "second_stage_sum": 272,
+  "u": 300,
+  "clusters": 16
+ },
+ "pool": [
+  {
+   "kind": "node",
+   "key": 2,
+   "basis": "occupancy",
+   "raw": 96,
+   "clustered": 96,
+   "processed": 96,
+   "scaled": 2
+  },
+  {
+   "kind": "node",
+   "key": 3,
+   "basis": "occupancy",
+   "raw": 96,
+   "clustered": 96,
+   "processed": 96,
+   "scaled": 2
+  },
+  {
+   "kind": "node",
+   "key": 4,
+   "basis": "occupancy",
+   "raw": 0,
+   "clustered": 0,
+   "processed": 0,
+   "scaled": 0
+  },
+  {
+   "kind": "node",
+   "key": 5,
+   "basis": "occupancy",
+   "raw": 0,
+   "clustered": 0,
+   "processed": 0,
+   "scaled": 0
+  },
+  {
+   "kind": "node",
+   "key": 6,
+   "basis": "occupancy",
+   "raw": 0,
+   "clustered": 0,
+   "processed": 0,
+   "scaled": 0
+  },
+  {
+   "kind": "node",
+   "key": 7,
+   "basis": "occupancy",
+   "raw": 128,
+   "clustered": 131,
+   "processed": 131,
+   "scaled": 3
+  },
+  {
+   "kind": "node",
+   "key": 8,
+   "basis": "occupancy",
+   "raw": 64,
+   "clustered": 66,
+   "processed": 66,
+   "scaled": 2
+  },
+  {
+   "kind": "node",
+   "key": 9,
+   "basis": "occupancy",
+   "raw": 76,
+   "clustered": 76,
+   "processed": 76,
+   "scaled": 2
+  },
+  {
+   "kind": "node",
+   "key": 10,
+   "basis": "elementwise",
+   "raw": 1,
+   "clustered": 1,
+   "processed": 0,
+   "scaled": 0
+  },
+  {
+   "kind": "node",
+   "key": 11,
+   "basis": "elementwise",
+   "raw": 1,
+   "clustered": 1,
+   "processed": 0,
+   "scaled": 0
+  },
+  {
+   "kind": "node",
+   "key": 12,
+   "basis": "elementwise",
+   "raw": 1,
+   "clustered": 1,
+   "processed": 0,
+   "scaled": 0
+  },
+  {
+   "kind": "node",
+   "key": 13,
+   "basis": "occupancy",
+   "raw": 0,
+   "clustered": 0,
+   "processed": 0,
+   "scaled": 0
+  },
+  {
+   "kind": "node",
+   "key": 14,
+   "basis": "elementwise",
+   "raw": 32,
+   "clustered": 30,
+   "processed": 30,
+   "scaled": 1
+  },
+  {
+   "kind": "node",
+   "key": 15,
+   "basis": "occupancy",
+   "raw": 0,
+   "clustered": 0,
+   "processed": 0,
+   "scaled": 0
+  },
+  {
+   "kind": "node",
+   "key": 16,
+   "basis": "occupancy",
+   "raw": 0,
+   "clustered": 0,
+   "processed": 0,
+   "scaled": 0
+  },
+  {
+   "kind": "node",
+   "key": 17,
+   "basis": "elementwise",
+   "raw": 32,
+   "clustered": 30,
+   "processed": 30,
+   "scaled": 1
+  },
+  {
+   "kind": "node",
+   "key": 18,
+   "basis": "occupancy",
+   "raw": 32,
+   "clustered": 30,
+   "processed": 30,
+   "scaled": 1
+  },
+  {
+   "kind": "node",
+   "key": 19,
+   "basis": "occupancy",
+   "raw": 159,
+   "clustered": 159,
+   "processed": 159,
+   "scaled": 4
+  },
+  {
+   "kind": "node",
+   "key": 20,
+   "basis": "elementwise",
+   "raw": 32,
+   "clustered": 30,
+   "processed": 30,
+   "scaled": 1
+  },
+  {
+   "kind": "node",
+   "key": 21,
+   "basis": "occupancy",
+   "raw": 0,
+   "clustered": 0,
+   "processed": 0,
+   "scaled": 0
+  },
+  {
+   "kind": "node",
+   "key": 22,
+   "basis": "occupancy",
+   "raw": 0,
+   "clustered": 0,
+   "processed": 0,
+   "scaled": 0
+  },
+  {
+   "kind": "node",
+   "key": 23,
+   "basis": "occupancy",
+   "raw": 0,
+   "clustered": 0,
+   "processed": 0,
+   "scaled": 0
+  },
+  {
+   "kind": "node",
+   "key": 24,
+   "basis": "occupancy",
+   "raw": 0,
+   "clustered": 0,
+   "processed": 0,
+   "scaled": 0
+  },
+  {
+   "kind": "node",
+   "key": 25,
+   "basis": "occupancy",
+   "raw": 128,
+   "clustered": 131,
+   "processed": 131,
+   "scaled": 3
+  },
+  {
+   "kind": "node",
+   "key": 26,
+   "basis": "elementwise",
+   "raw": 64,
+   "clustered": 66,
+   "processed": 66,
+   "scaled": 2
+  },
+  {
+   "kind": "node",
+   "key": 27,
+   "basis": "occupancy",
+   "raw": 24,
+   "clustered": 25,
+   "processed": 0,
+   "scaled": 0
+  },
+  {
+   "kind": "node",
+   "key": 28,
+   "basis": "occupancy",
+   "raw": 128,
+   "clustered": 131,
+   "processed": 131,
+   "scaled": 3
+  },
+  {
+   "kind": "node",
+   "key": 29,
+   "basis": "elementwise",
+   "raw": 1,
+   "clustered": 1,
+   "processed": 0,
+   "scaled": 0
+  },
+  {
+   "kind": "node",
+   "key": 30,
+   "basis": "elementwise",
+   "raw": 1,
+   "clustered": 1,
+   "processed": 0,
+   "scaled": 0
+  },
+  {
+   "kind": "node",
+   "key": 31,
+   "basis": "occupancy",
+   "raw": 128,
+   "clustered": 131,
+   "processed": 131,
+   "scaled": 3
+  },
+  {
+   "kind": "node",
+   "key": 32,
+   "basis": "occupancy",
+   "raw": 64,
+   "clustered": 66,
+   "processed": 66,
+   "scaled": 2
+  },
+  {
+   "kind": "node",
+   "key": 33,
+   "basis": "occupancy",
+   "raw": 76,
+   "clustered": 76,
+   "processed": 76,
+   "scaled": 2
+  },
+  {
+   "kind": "node",
+   "key": 34,
+   "basis": "elementwise",
+   "raw": 1,
+   "clustered": 1,
+   "processed": 0,
+   "scaled": 0
+  },
+  {
+   "kind": "node",
+   "key": 35,
+   "basis": "elementwise",
+   "raw": 1,
+   "clustered": 1,
+   "processed": 0,
+   "scaled": 0
+  },
+  {
+   "kind": "node",
+   "key": 36,
+   "basis": "elementwise",
+   "raw": 1,
+   "clustered": 1,
+   "processed": 0,
+   "scaled": 0
+  },
+  {
+   "kind": "node",
+   "key": 37,
+   "basis": "occupancy",
+   "raw": 0,
+   "clustered": 0,
+   "processed": 0,
+   "scaled": 0
+  },
+  {
+   "kind": "node",
+   "key": 38,
+   "basis": "elementwise",
+   "raw": 32,
+   "clustered": 30,
+   "processed": 30,
+   "scaled": 1
+  },
+  {
+   "kind": "node",
+   "key": 39,
+   "basis": "occupancy",
+   "raw": 0,
+   "clustered": 0,
+   "processed": 0,
+   "scaled": 0
+  },
+  {
+   "kind": "node",
+   "key": 40,
+   "basis": "occupancy",
+   "raw": 0,
+   "clustered": 0,
+   "processed": 0,
+   "scaled": 0
+  },
+  {
+   "kind": "node",
+   "key": 41,
+   "basis": "elementwise",
+   "raw": 32,
+   "clustered": 30,
+   "processed": 30,
+   "scaled": 1
+  },
+  {
+   "kind": "node",
+   "key": 42,
+   "basis": "occupancy",
+   "raw": 32,
+   "clustered": 30,
+   "processed": 30,
+   "scaled": 1
+  },
+  {
+   "kind": "node",
+   "key": 43,
+   "basis": "occupancy",
+   "raw": 159,
+   "clustered": 159,
+   "processed": 159,
+   "scaled": 4
+  },
+  {
+   "kind": "node",
+   "key": 44,
+   "basis": "elementwise",
+   "raw": 32,
+   "clustered": 30,
+   "processed": 30,
+   "scaled": 1
+  },
+  {
+   "kind": "node",
+   "key": 45,
+   "basis": "occupancy",
+   "raw": 0,
+   "clustered": 0,
+   "processed": 0,
+   "scaled": 0
+  },
+  {
+   "kind": "node",
+   "key": 46,
+   "basis": "occupancy",
+   "raw": 0,
+   "clustered": 0,
+   "processed": 0,
+   "scaled": 0
+  },
+  {
+   "kind": "node",
+   "key": 47,
+   "basis": "occupancy",
+   "raw": 0,
+   "clustered": 0,
+   "processed": 0,
+   "scaled": 0
+  },
+  {
+   "kind": "node",
+   "key": 48,
+   "basis": "occupancy",
+   "raw": 0,
+   "clustered": 0,
+   "processed": 0,
+   "scaled": 0
+  },
+  {
+   "kind": "node",
+   "key": 49,
+   "basis": "occupancy",
+   "raw": 128,
+   "clustered": 131,
+   "processed": 131,
+   "scaled": 3
+  },
+  {
+   "kind": "node",
+   "key": 50,
+   "basis": "elementwise",
+   "raw": 64,
+   "clustered": 66,
+   "processed": 66,
+   "scaled": 2
+  },
+  {
+   "kind": "node",
+   "key": 51,
+   "basis": "occupancy",
+   "raw": 24,
+   "clustered": 25,
+   "processed": 0,
+   "scaled": 0
+  },
+  {
+   "kind": "node",
+   "key": 52,
+   "basis": "occupancy",
+   "raw": 128,
+   "clustered": 131,
+   "processed": 131,
+   "scaled": 3
+  },
+  {
+   "kind": "node",
+   "key": 53,
+   "basis": "elementwise",
+   "raw": 1,
+   "clustered": 1,
+   "processed": 0,
+   "scaled": 0
+  },
+  {
+   "kind": "node",
+   "key": 54,
+   "basis": "elementwise",
+   "raw": 1,
+   "clustered": 1,
+   "processed": 0,
+   "scaled": 0
+  },
+  {
+   "kind": "edge",
+   "key": 7,
+   "basis": "edge-latency",
+   "raw": 900,
+   "clustered": 900,
+   "processed": 900,
+   "scaled": 22
+  },
+  {
+   "kind": "edge",
+   "key": 8,
+   "basis": "edge-latency",
+   "raw": 133,
+   "clustered": 131,
+   "processed": 131,
+   "scaled": 3
+  },
+  {
+   "kind": "edge",
+   "key": 9,
+   "basis": "edge-latency",
+   "raw": 133,
+   "clustered": 131,
+   "processed": 131,
+   "scaled": 3
+  },
+  {
+   "kind": "edge",
+   "key": 10,
+   "basis": "edge-latency",
+   "raw": 133,
+   "clustered": 131,
+   "processed": 131,
+   "scaled": 3
+  },
+  {
+   "kind": "edge",
+   "key": 11,
+   "basis": "edge-latency",
+   "raw": 115,
+   "clustered": 115,
+   "processed": 115,
+   "scaled": 3
+  },
+  {
+   "kind": "edge",
+   "key": 18,
+   "basis": "edge-latency",
+   "raw": 4,
+   "clustered": 4,
+   "processed": 0,
+   "scaled": 0
+  },
+  {
+   "kind": "edge",
+   "key": 19,
+   "basis": "edge-latency",
+   "raw": 4,
+   "clustered": 4,
+   "processed": 0,
+   "scaled": 0
+  },
+  {
+   "kind": "edge",
+   "key": 20,
+   "basis": "edge-latency",
+   "raw": 34,
+   "clustered": 34,
+   "processed": 34,
+   "scaled": 1
+  },
+  {
+   "kind": "edge",
+   "key": 23,
+   "basis": "edge-latency",
+   "raw": 32,
+   "clustered": 30,
+   "processed": 30,
+   "scaled": 1
+  },
+  {
+   "kind": "edge",
+   "key": 24,
+   "basis": "edge-latency",
+   "raw": 285,
+   "clustered": 276,
+   "processed": 276,
+   "scaled": 7
+  },
+  {
+   "kind": "edge",
+   "key": 25,
+   "basis": "edge-latency",
+   "raw": 285,
+   "clustered": 276,
+   "processed": 276,
+   "scaled": 7
+  },
+  {
+   "kind": "edge",
+   "key": 26,
+   "basis": "edge-latency",
+   "raw": 422,
+   "clustered": 422,
+   "processed": 422,
+   "scaled": 10
+  },
+  {
+   "kind": "edge",
+   "key": 27,
+   "basis": "edge-latency",
+   "raw": 26,
+   "clustered": 25,
+   "processed": 0,
+   "scaled": 0
+  },
+  {
+   "kind": "edge",
+   "key": 32,
+   "basis": "edge-latency",
+   "raw": 266,
+   "clustered": 276,
+   "processed": 276,
+   "scaled": 7
+  },
+  {
+   "kind": "edge",
+   "key": 33,
+   "basis": "edge-latency",
+   "raw": 266,
+   "clustered": 276,
+   "processed": 276,
+   "scaled": 7
+  },
+  {
+   "kind": "edge",
+   "key": 34,
+   "basis": "edge-latency",
+   "raw": 69,
+   "clustered": 66,
+   "processed": 66,
+   "scaled": 2
+  },
+  {
+   "kind": "edge",
+   "key": 35,
+   "basis": "edge-latency",
+   "raw": 48,
+   "clustered": 48,
+   "processed": 48,
+   "scaled": 1
+  },
+  {
+   "kind": "edge",
+   "key": 36,
+   "basis": "edge-latency",
+   "raw": 559,
+   "clustered": 559,
+   "processed": 559,
+   "scaled": 14
+  },
+  {
+   "kind": "edge",
+   "key": 39,
+   "basis": "edge-latency",
+   "raw": 900,
+   "clustered": 900,
+   "processed": 900,
+   "scaled": 22
+  },
+  {
+   "kind": "edge",
+   "key": 40,
+   "basis": "edge-latency",
+   "raw": 133,
+   "clustered": 131,
+   "processed": 131,
+   "scaled": 3
+  },
+  {
+   "kind": "edge",
+   "key": 41,
+   "basis": "edge-latency",
+   "raw": 133,
+   "clustered": 131,
+   "processed": 131,
+   "scaled": 3
+  },
+  {
+   "kind": "edge",
+   "key": 42,
+   "basis": "edge-latency",
+   "raw": 133,
+   "clustered": 131,
+   "processed": 131,
+   "scaled": 3
+  },
+  {
+   "kind": "edge",
+   "key": 43,
+   "basis": "edge-latency",
+   "raw": 115,
+   "clustered": 115,
+   "processed": 115,
+   "scaled": 3
+  },
+  {
+   "kind": "edge",
+   "key": 50,
+   "basis": "edge-latency",
+   "raw": 4,
+   "clustered": 4,
+   "processed": 0,
+   "scaled": 0
+  },
+  {
+   "kind": "edge",
+   "key": 51,
+   "basis": "edge-latency",
+   "raw": 4,
+   "clustered": 4,
+   "processed": 0,
+   "scaled": 0
+  },
+  {
+   "kind": "edge",
+   "key": 52,
+   "basis": "edge-latency",
+   "raw": 34,
+   "clustered": 34,
+   "processed": 34,
+   "scaled": 1
+  },
+  {
+   "kind": "edge",
+   "key": 55,
+   "basis": "edge-latency",
+   "raw": 32,
+   "clustered": 30,
+   "processed": 30,
+   "scaled": 1
+  },
+  {
+   "kind": "edge",
+   "key": 56,
+   "basis": "edge-latency",
+   "raw": 285,
+   "clustered": 276,
+   "processed": 276,
+   "scaled": 7
+  },
+  {
+   "kind": "edge",
+   "key": 57,
+   "basis": "edge-latency",
+   "raw": 285,
+   "clustered": 276,
+   "processed": 276,
+   "scaled": 7
+  },
+  {
+   "kind": "edge",
+   "key": 58,
+   "basis": "edge-latency",
+   "raw": 422,
+   "clustered": 422,
+   "processed": 422,
+   "scaled": 10
+  },
+  {
+   "kind": "edge",
+   "key": 59,
+   "basis": "edge-latency",
+   "raw": 26,
+   "clustered": 25,
+   "processed": 0,
+   "scaled": 0
+  },
+  {
+   "kind": "edge",
+   "key": 64,
+   "basis": "edge-latency",
+   "raw": 266,
+   "clustered": 276,
+   "processed": 276,
+   "scaled": 7
+  },
+  {
+   "kind": "edge",
+   "key": 65,
+   "basis": "edge-latency",
+   "raw": 266,
+   "clustered": 276,
+   "processed": 276,
+   "scaled": 7
+  },
+  {
+   "kind": "edge",
+   "key": 66,
+   "basis": "edge-latency",
+   "raw": 69,
+   "clustered": 66,
+   "processed": 66,
+   "scaled": 2
+  },
+  {
+   "kind": "edge",
+   "key": 67,
+   "basis": "edge-latency",
+   "raw": 48,
+   "clustered": 48,
+   "processed": 48,
+   "scaled": 1
+  },
+  {
+   "kind": "edge",
+   "key": 68,
+   "basis": "edge-latency",
+   "raw": 559,
+   "clustered": 559,
+   "processed": 559,
+   "scaled": 14
+  },
+  {
+   "kind": "spill",
+   "key": 8,
+   "basis": "spill",
+   "raw": 30,
+   "clustered": 30,
+   "processed": 30,
+   "scaled": 1
+  },
+  {
+   "kind": "spill",
+   "key": 9,
+   "basis": "spill",
+   "raw": 30,
+   "clustered": 30,
+   "processed": 30,
+   "scaled": 1
+  },
+  {
+   "kind": "spill",
+   "key": 10,
+   "basis": "spill",
+   "raw": 30,
+   "clustered": 30,
+   "processed": 30,
+   "scaled": 1
+  },
+  {
+   "kind": "spill",
+   "key": 11,
+   "basis": "spill",
+   "raw": 30,
+   "clustered": 30,
+   "processed": 30,
+   "scaled": 1
+  },
+  {
+   "kind": "spill",
+   "key": 12,
+   "basis": "spill",
+   "raw": 30,
+   "clustered": 30,
+   "processed": 30,
+   "scaled": 1
+  },
+  {
+   "kind": "spill",
+   "key": 13,
+   "basis": "spill",
+   "raw": 30,
+   "clustered": 30,
+   "processed": 30,
+   "scaled": 1
+  },
+  {
+   "kind": "spill",
+   "key": 14,
+   "basis": "spill",
+   "raw": 30,
+   "clustered": 30,
+   "processed": 30,
+   "scaled": 1
+  },
+  {
+   "kind": "spill",
+   "key": 15,
+   "basis": "spill",
+   "raw": 30,
+   "clustered": 30,
+   "processed": 30,
+   "scaled": 1
+  },
+  {
+   "kind": "spill",
+   "key": 16,
+   "basis": "spill",
+   "raw": 30,
+   "clustered": 30,
+   "processed": 30,
+   "scaled": 1
+  },
+  {
+   "kind": "spill",
+   "key": 17,
+   "basis": "spill",
+   "raw": 30,
+   "clustered": 30,
+   "processed": 30,
+   "scaled": 1
+  },
+  {
+   "kind": "spill",
+   "key": 18,
+   "basis": "spill",
+   "raw": 30,
+   "clustered": 30,
+   "processed": 30,
+   "scaled": 1
+  },
+  {
+   "kind": "spill",
+   "key": 19,
+   "basis": "spill",
+   "raw": 30,
+   "clustered": 30,
+   "processed": 30,
+   "scaled": 1
+  },
+  {
+   "kind": "spill",
+   "key": 20,
+   "basis": "spill",
+   "raw": 30,
+   "clustered": 30,
+   "processed": 30,
+   "scaled": 1
+  },
+  {
+   "kind": "spill",
+   "key": 22,
+   "basis": "spill",
+   "raw": 30,
+   "clustered": 30,
+   "processed": 30,
+   "scaled": 1
+  },
+  {
+   "kind": "spill",
+   "key": 23,
+   "basis": "spill",
+   "raw": 30,
+   "clustered": 30,
+   "processed": 30,
+   "scaled": 1
+  },
+  {
+   "kind": "spill",
+   "key": 24,
+   "basis": "spill",
+   "raw": 30,
+   "clustered": 30,
+   "processed": 30,
+   "scaled": 1
+  },
+  {
+   "kind": "spill",
+   "key": 25,
+   "basis": "spill",
+   "raw": 30,
+   "clustered": 30,
+   "processed": 30,
+   "scaled": 1
+  },
+  {
+   "kind": "spill",
+   "key": 26,
+   "basis": "spill",
+   "raw": 30,
+   "clustered": 30,
+   "processed": 30,
+   "scaled": 1
+  },
+  {
+   "kind": "spill",
+   "key": 29,
+   "basis": "spill",
+   "raw": 30,
+   "clustered": 30,
+   "processed": 30,
+   "scaled": 1
+  },
+  {
+   "kind": "spill",
+   "key": 30,
+   "basis": "spill",
+   "raw": 30,
+   "clustered": 30,
+   "processed": 30,
+   "scaled": 1
+  },
+  {
+   "kind": "spill",
+   "key": 32,
+   "basis": "spill",
+   "raw": 30,
+   "clustered": 30,
+   "processed": 30,
+   "scaled": 1
+  },
+  {
+   "kind": "spill",
+   "key": 33,
+   "basis": "spill",
+   "raw": 30,
+   "clustered": 30,
+   "processed": 30,
+   "scaled": 1
+  },
+  {
+   "kind": "spill",
+   "key": 34,
+   "basis": "spill",
+   "raw": 30,
+   "clustered": 30,
+   "processed": 30,
+   "scaled": 1
+  },
+  {
+   "kind": "spill",
+   "key": 35,
+   "basis": "spill",
+   "raw": 30,
+   "clustered": 30,
+   "processed": 30,
+   "scaled": 1
+  },
+  {
+   "kind": "spill",
+   "key": 36,
+   "basis": "spill",
+   "raw": 30,
+   "clustered": 30,
+   "processed": 30,
+   "scaled": 1
+  },
+  {
+   "kind": "spill",
+   "key": 37,
+   "basis": "spill",
+   "raw": 30,
+   "clustered": 30,
+   "processed": 30,
+   "scaled": 1
+  },
+  {
+   "kind": "spill",
+   "key": 38,
+   "basis": "spill",
+   "raw": 30,
+   "clustered": 30,
+   "processed": 30,
+   "scaled": 1
+  },
+  {
+   "kind": "spill",
+   "key": 39,
+   "basis": "spill",
+   "raw": 30,
+   "clustered": 30,
+   "processed": 30,
+   "scaled": 1
+  },
+  {
+   "kind": "spill",
+   "key": 40,
+   "basis": "spill",
+   "raw": 30,
+   "clustered": 30,
+   "processed": 30,
+   "scaled": 1
+  },
+  {
+   "kind": "spill",
+   "key": 41,
+   "basis": "spill",
+   "raw": 30,
+   "clustered": 30,
+   "processed": 30,
+   "scaled": 1
+  },
+  {
+   "kind": "spill",
+   "key": 42,
+   "basis": "spill",
+   "raw": 30,
+   "clustered": 30,
+   "processed": 30,
+   "scaled": 1
+  },
+  {
+   "kind": "spill",
+   "key": 43,
+   "basis": "spill",
+   "raw": 30,
+   "clustered": 30,
+   "processed": 30,
+   "scaled": 1
+  },
+  {
+   "kind": "spill",
+   "key": 44,
+   "basis": "spill",
+   "raw": 30,
+   "clustered": 30,
+   "processed": 30,
+   "scaled": 1
+  },
+  {
+   "kind": "spill",
+   "key": 46,
+   "basis": "spill",
+   "raw": 30,
+   "clustered": 30,
+   "processed": 30,
+   "scaled": 1
+  },
+  {
+   "kind": "spill",
+   "key": 47,
+   "basis": "spill",
+   "raw": 30,
+   "clustered": 30,
+   "processed": 30,
+   "scaled": 1
+  },
+  {
+   "kind": "spill",
+   "key": 48,
+   "basis": "spill",
+   "raw": 30,
+   "clustered": 30,
+   "processed": 30,
+   "scaled": 1
+  },
+  {
+   "kind": "spill",
+   "key": 49,
+   "basis": "spill",
+   "raw": 30,
+   "clustered": 30,
+   "processed": 30,
+   "scaled": 1
+  },
+  {
+   "kind": "spill",
+   "key": 50,
+   "basis": "spill",
+   "raw": 30,
+   "clustered": 30,
+   "processed": 30,
+   "scaled": 1
+  },
+  {
+   "kind": "spill",
+   "key": 53,
+   "basis": "spill",
+   "raw": 30,
+   "clustered": 30,
+   "processed": 30,
+   "scaled": 1
+  },
+  {
+   "kind": "spill",
+   "key": 54,
+   "basis": "spill",
+   "raw": 30,
+   "clustered": 30,
+   "processed": 30,
+   "scaled": 1
+  }
+ ]
+}
