@@ -200,6 +200,8 @@ class ExperimentSummary:
     risk: str = ""
     commit_title: str = ""
     commit_summary: str = ""
+    falsifier: str = ""
+    change_scope: str = ""
     profile_path: Path | None = None
     auto_commit: AutoCommitResult | None = None
 

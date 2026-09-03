@@ -125,6 +125,14 @@ stderr log. The complete result is always persisted as `<output-dir>/result.json
 Exit code `0` means a winner was promoted, `2` means the run completed without a qualifying
 winner, and `3` means optimization succeeded but committing the winner failed.
 
+Each candidate follows an observable handshake: `TL_FINDING -> WORKER_REPORT ->
+CORRECTNESS_CALLBACK -> FINAL worker -> TL_PERF_REQUEST -> PERF_CALLBACK -> TL_DECISION`.
+The worker record classifies its scope (`config-only`, `kernel-python`,
+`compiler-native`, or `tooling`) and always ends with the correctness callback. The
+performance callback reports measured/expected coverage and concise results for every
+supplied shape. Incorrect candidates receive `BLOCKED_BY_CORRECTNESS`; their output is
+never timed.
+
 `--budget` accepts an optional JSON file that overrides the `--max-*` / `--min-speedup` /
 `--max-cv` flags (`{max_rounds, candidates_per_round, max_candidate_seconds,
 max_total_seconds, min_speedup, max_cv, benchmark_repetitions}`).

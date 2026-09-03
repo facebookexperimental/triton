@@ -87,12 +87,15 @@ class SubprocessHarness:
         target: KernelTarget,
         benchmark_repetitions: int,
         profile: bool | ProfileRequest | Mapping[str, Any] = False,
+        *,
+        benchmark: bool = True,
     ) -> PerformanceSummary:
         request = {
             "kernel_source": kernel_source,
             "cases": to_json_value(cases),
             "target": to_json_value(target),
             "benchmark_repetitions": benchmark_repetitions,
+            "benchmark": benchmark,
             "profile": resolve_profile_request_for_target(
                 profile_request_to_json(profile),
                 to_json_value(target),  # type: ignore[arg-type]
@@ -184,6 +187,8 @@ class StandaloneHarness:
         target: KernelTarget,
         benchmark_repetitions: int,
         profile: bool | ProfileRequest | Mapping[str, Any] = False,
+        *,
+        benchmark: bool = True,
     ) -> PerformanceSummary:
         harness = _load_harness(self.harness_path)
         if not hasattr(harness, "build") or not hasattr(harness, "verify") or not hasattr(harness, "benchmark"):
@@ -215,7 +220,7 @@ class StandaloneHarness:
             )
             timing: TimingSamples | None = None
             profile_payload: Mapping[str, JsonValue] = {}
-            if verification.passed:
+            if verification.passed and benchmark:
                 benchmark_raw = harness.benchmark(artifact, dict(case_dict), benchmark_repetitions)  # type: ignore[arg-type]
                 timing_norm = _normalize_timing(benchmark_raw)
                 timing = TimingSamples(

@@ -93,7 +93,7 @@ def _main() -> int:
             "timing": None,
             "profile": {},
         }
-        if verification["passed"]:
+        if verification["passed"] and request.get("benchmark", True):
             case_result["timing"] = _normalize_timing(
                 harness.benchmark(artifact, case, repetitions)
             )
