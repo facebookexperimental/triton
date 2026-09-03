@@ -43,6 +43,7 @@ struct CircularStoreDataPack {
 
 CircularStoreDataPack
 lowerCircularStoreOpHelper(CircularStoreOp op, Value segmentStruct,
+                           Value predicate,
                            ConversionPatternRewriter &rewriter);
 
 SmallVector<FunctionOpInterface> getTritonFunctions(ModuleOp mod);

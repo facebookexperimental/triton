@@ -34,6 +34,28 @@ module attributes {"ttg.num-warps" = 8 : i32} {
 // -----
 
 module attributes {"ttg.num-warps" = 8 : i32} {
+  // CHECK-LABEL: predicated_record
+  tt.func @predicated_record(%pred: i1) {
+    // CHECK: %[[SCRATCH:.*]] = ttg.global_scratch_alloc
+    // CHECK: proton_gpu.initialize %[[SCRATCH]] : !tt.ptr<i32>
+    // CHECK: %[[BUF:.*]] = ttg.local_alloc
+    // CHECK: %[[SEGMENT:.*]] = proton_gpu.segment_alloc %[[BUF]]
+    // CHECK: %[[START:.*]] = proton_gpu.read_counter : i32
+    // CHECK: proton_gpu.circular_store start %[[SEGMENT]], %[[START]] if %arg0 {scopeId = 0 : i32}
+    // CHECK: %[[END:.*]] = proton_gpu.read_counter : i32
+    // CHECK: proton_gpu.circular_store end %[[SEGMENT]], %[[END]] if %arg0 {scopeId = 0 : i32}
+    // CHECK: ttg.barrier local|global_read|global_write
+    // CHECK: proton_gpu.finalize %[[SEGMENT]], %[[SCRATCH]]
+    // CHECK: tt.return
+    proton.record start "name0" if %pred
+    proton.record end "name0" if %pred
+    tt.return
+  }
+}
+
+// -----
+
+module attributes {"ttg.num-warps" = 8 : i32} {
   // CHECK-LABEL: scf_record
   tt.func @scf_record() {
     %i = arith.constant 0 : index

@@ -114,6 +114,28 @@ module attributes {"ttg.num-warps" = 8 : i32} {
 
 #shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
 #smem = #ttg.shared_memory
+module attributes {"ttg.num-warps" = 8 : i32} {
+  // CHECK-LABEL: convert_predicated_circular_smem_store
+  llvm.func @convert_predicated_circular_smem_store(%pred: i1) {
+    // CHECK-DAG: %[[BASE_PRED:.*]] = llvm.icmp "ne" %{{.*}}, %{{.*}} : i32
+    // CHECK-DAG: %[[WARP_STORE_PRED:.*]] = llvm.and %[[BASE_PRED]], %{{.*}} : i1
+    // CHECK-DAG: %[[STORE_PRED:.*]] = llvm.and %[[WARP_STORE_PRED]], %arg0 : i1
+    // CHECK-DAG: %[[ADVANCE_PRED:.*]] = llvm.and %[[BASE_PRED]], %arg0 : i1
+    // CHECK-DAG: %[[NEXT_IDX:.*]] = llvm.select %[[ADVANCE_PRED]], %{{.*}}, %{{.*}} : i1, i32
+    // CHECK: llvm.store %[[NEXT_IDX]], %{{.*}} : i32, !llvm.ptr
+    // CHECK: llvm.inline_asm has_side_effects{{.*}}st.shared.v2.b32{{.*}}%[[STORE_PRED]] :
+    %0 = ttg.local_alloc : () -> !ttg.memdesc<512xi32, #shared, #smem, mutable>
+    %3 = proton_gpu.segment_alloc %0 : !ttg.memdesc<512xi32, #shared, #smem, mutable> -> !proton_gpu.segment<2048, #smem, warp, [0, 1]>
+    %8 = proton_gpu.read_counter : i32
+    proton_gpu.circular_store start %3, %8 if %pred {scopeId = 1 : i32} : !proton_gpu.segment<2048, #smem, warp, [0, 1]>, i32
+    llvm.return
+  }
+}
+
+// -----
+
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
 module attributes {"ttg.num-warps" = 8 : i32, ttg.profile_scratch_memory_alignment = 128 : i32, ttg.profile_scratch_memory_size = 384 : i32} {
   // CHECK-LABEL: convert_smem_initialize
   // CHECK-DAG: llvm.cond_br %{{.*}}, ^bb1, ^bb2
