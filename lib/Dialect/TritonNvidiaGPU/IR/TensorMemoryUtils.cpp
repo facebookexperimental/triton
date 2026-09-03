@@ -2,6 +2,7 @@
 
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Tools/LayoutUtils.h"
+#include "llvm/ADT/DenseSet.h"
 
 #include <algorithm>
 #include <tuple>
@@ -321,6 +322,105 @@ computeTMemLdStEncodingInfo(RankedTensorType regTy, MemDescType memTy,
   bool isScales = isa<TensorMemoryScalesEncodingAttr>(memTy.getEncoding());
   int bitwidth = memTy.getElementTypeBitWidth();
   return lowerTMemLdSt(cvt, maxnreg, bitwidth, isScales, emitError);
+}
+
+FailureOr<LinearLayout>
+getTMemLdStMessageLayout(MLIRContext *ctx, TMemAccessAtom atom, bool unpacked,
+                         int numRegsPerMessage) {
+  auto kReg = StringAttr::get(ctx, "register");
+  auto kCol = StringAttr::get(ctx, "col");
+  LinearLayout atomLayout =
+      getTileLayout(ctx, atom, unpacked, /*withWarp=*/false);
+  int32_t atomRegs = atomLayout.getInDimSize(kReg);
+  if (numRegsPerMessage % atomRegs != 0)
+    return failure();
+  return atomLayout * LinearLayout::identity1D(numRegsPerMessage / atomRegs,
+                                                kReg, kCol);
+}
+
+FailureOr<SmallVector<DenseSet<uint32_t>>>
+getTMemLdStWarpAddresses(RankedTensorType regTy, MemDescType memTy,
+                         int maxnreg, uint32_t baseAddress) {
+  auto info = computeTMemLdStEncodingInfo(regTy, memTy, maxnreg);
+  if (failed(info))
+    return failure();
+
+  auto *ctx = regTy.getContext();
+  auto kReg = StringAttr::get(ctx, "register");
+  auto kLane = StringAttr::get(ctx, "lane");
+  auto kWarp = StringAttr::get(ctx, "warp");
+  auto kRow = StringAttr::get(ctx, "row");
+  auto kCol = StringAttr::get(ctx, "col");
+  const LinearLayout &reps = info->reps;
+  if (!reps.hasInDim(kReg) || !reps.hasInDim(kLane) || !reps.hasInDim(kWarp))
+    return failure();
+
+  auto getRowCol = [&](const auto &outputs) {
+    std::optional<uint32_t> row;
+    std::optional<uint32_t> col;
+    for (auto [name, value] : outputs) {
+      if (name == kRow)
+        row = value;
+      else if (name == kCol)
+        col = value;
+    }
+    return std::make_pair(row, col);
+  };
+  auto encode = [](uint32_t row, uint32_t col) {
+    assert(col < (1u << 16) && "TMEM column offset must fit in 16 bits");
+    return (row << 16) | col;
+  };
+
+  auto messageLayout = getTMemLdStMessageLayout(
+      ctx, info->atom, info->unpacked, info->numRegsPerMessage);
+  if (failed(messageLayout))
+    return failure();
+
+  SmallVector<uint32_t> messageOffsets;
+  for (int32_t messageReg = 0;
+       messageReg < messageLayout->getInDimSize(kReg); ++messageReg) {
+    for (int32_t lane = 0; lane < messageLayout->getInDimSize(kLane); ++lane) {
+      auto [row, col] = getRowCol(
+          messageLayout->apply({{kReg, messageReg}, {kLane, lane}}));
+      if (!row || !col)
+        return failure();
+      messageOffsets.push_back(encode(*row, *col));
+    }
+  }
+
+  SmallVector<DenseSet<uint32_t>> addressesByWarp;
+  addressesByWarp.resize(reps.getInDimSize(kWarp));
+  for (int32_t warp = 0; warp < reps.getInDimSize(kWarp); ++warp) {
+    // Keep this warp-base calculation synchronized with lowerTMemLdSt.
+    uint32_t warpOffset = (warp & 3) << (5 + 16);
+    if (reps.getInDimSize(kWarp) > 4) {
+      auto [row, col] =
+          getRowCol(reps.apply({{kReg, 0}, {kLane, 0}, {kWarp, warp}}));
+      if (!row || !col)
+        return failure();
+      warpOffset += encode(*row, *col);
+    }
+
+    DenseSet<uint32_t> addresses;
+    for (int32_t reg = 0; reg < reps.getInDimSize(kReg);
+         reg += info->numRegsPerMessage) {
+      auto [messageRow, messageCol] =
+          getRowCol(reps.apply({{kReg, reg}, {kLane, 0}, {kWarp, 0}}));
+      if (!messageRow || !messageCol)
+        return failure();
+      uint32_t messageOffset = encode(*messageRow, *messageCol);
+
+      for (uint32_t inMessageOffset : messageOffsets) {
+        uint32_t address =
+            baseAddress + warpOffset + messageOffset + inMessageOffset;
+        addresses.insert(address);
+        if (info->secondHalfOffset)
+          addresses.insert(address + *info->secondHalfOffset);
+      }
+    }
+    addressesByWarp[warp] = std::move(addresses);
+  }
+  return addressesByWarp;
 }
 
 bool supportsTMemLoadReduce(RankedTensorType regTy, MemDescType memTy,

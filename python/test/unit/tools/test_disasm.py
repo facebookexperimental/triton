@@ -26,7 +26,9 @@ def test_extract_handles_large_instruction_offsets(monkeypatch):
     # cuobjdump widens instruction offsets to 5+ hex digits past 64 KiB.
     # Make sure the parser keeps consuming instructions instead of stopping at
     # /*10000*/.
-    def fake_check_output(cmd):
+    # **kwargs so the fake keeps accepting whatever extra arguments extract()
+    # forwards to subprocess (e.g. env=); this test is about offset parsing.
+    def fake_check_output(cmd, **kwargs):
         assert cmd == ["/fake/cuobjdump", "-sass", "fake.cubin"]
         return b"""Function : test_kernel
 .headerflags    @"EF_CUDA_SM103 EF_CUDA_PTX_SM(EF_CUDA_SM103)"

@@ -1,7 +1,8 @@
-// RUN: triton-opt %s -split-input-file --allocate-shared-memory --convert-triton-amdgpu-to-llvm=gfx-arch=gfx90a -cse | FileCheck %s --check-prefix=GFX90A
-// RUN: triton-opt %s -split-input-file --allocate-shared-memory --convert-triton-amdgpu-to-llvm=gfx-arch=gfx942 -cse | FileCheck %s --check-prefix=GFX942
-// RUN: triton-opt %s -split-input-file --allocate-shared-memory --convert-triton-amdgpu-to-llvm=gfx-arch=gfx950 -cse | FileCheck %s --check-prefix=GFX950
-// RUN: triton-opt %s -split-input-file --allocate-shared-memory --convert-triton-amdgpu-to-llvm=gfx-arch=gfx1250 -cse | FileCheck %s --check-prefix=GFX1250
+// RUN: triton-opt %s -split-input-file --allocate-shared-memory --convert-triton-amdgpu-to-llvm='gfx-arch=gfx90a enable-tree-reduction=true' -cse | FileCheck %s --check-prefix=GFX90A
+// RUN: triton-opt %s -split-input-file --allocate-shared-memory --convert-triton-amdgpu-to-llvm='gfx-arch=gfx942 enable-tree-reduction=true' -cse | FileCheck %s --check-prefix=GFX942
+// RUN: triton-opt %s -split-input-file --allocate-shared-memory --convert-triton-amdgpu-to-llvm='gfx-arch=gfx950 enable-tree-reduction=true' -cse | FileCheck %s --check-prefix=GFX950
+// RUN: triton-opt %s -split-input-file --allocate-shared-memory --convert-triton-amdgpu-to-llvm='gfx-arch=gfx1250 enable-tree-reduction=true' -cse | FileCheck %s --check-prefix=GFX1250
+// RUN: triton-opt %s -split-input-file --allocate-shared-memory --convert-triton-amdgpu-to-llvm='gfx-arch=gfx942 enable-tree-reduction=false' -cse | FileCheck %s --check-prefix=LINEAR
 
 #blocked_reduce = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [1, 64], warpsPerCTA = [1, 1], order = [1, 0]}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 64 : i32} {
@@ -9,6 +10,9 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.thr
   // GFX942: llvm.fadd {{.*}} : vector<2xf16>
   // GFX950-LABEL: reduce_f16
   // GFX950: llvm.fadd {{.*}} : vector<2xf16>
+  // LINEAR-LABEL: reduce_f16
+  // LINEAR-NOT: vector<2xf16>
+  // LINEAR: llvm.fadd {{.*}} : f16
   tt.func public @reduce_f16(%arg0: tensor<1x256xf16, #blocked_reduce>) {
     %0 = "tt.reduce"(%arg0) <{axis = 1 : i32}> ({
     ^bb0(%a: f16, %b: f16):
@@ -24,6 +28,9 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.thr
   // GFX942: llvm.fadd {{.*}} : vector<2xf32>
   // GFX950-LABEL: reduce_f32
   // GFX950: llvm.fadd {{.*}} : vector<2xf32>
+  // LINEAR-LABEL: reduce_f32
+  // LINEAR-NOT: vector<2xf32>
+  // LINEAR: llvm.fadd {{.*}} : f32
   tt.func public @reduce_f32(%arg0: tensor<1x256xf32, #blocked_reduce>) {
     %0 = "tt.reduce"(%arg0) <{axis = 1 : i32}> ({
     ^bb0(%a: f32, %b: f32):

@@ -4,6 +4,8 @@
 #include "mlir/IR/BuiltinTypes.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Tools/LinearLayout.h"
+#include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/SmallVector.h"
 
 #include <cstdint>
 #include <functional>
@@ -31,6 +33,18 @@ FailureOr<TMemLdStEncodingInfo>
 computeTMemLdStEncodingInfo(RankedTensorType regTy, gpu::MemDescType memTy,
                             int maxnreg,
                             std::function<InFlightDiagnostic()> emitError = {});
+
+// Return the complete per-message footprint, including vectorization beyond
+// the base instruction atom.
+FailureOr<LinearLayout>
+getTMemLdStMessageLayout(MLIRContext *ctx, TMemAccessAtom atom, bool unpacked,
+                         int numRegsPerMessage);
+
+// Return the physical tensor-memory word addresses touched by each warp when
+// lowering a tmem_load or tmem_store with these types.
+FailureOr<SmallVector<DenseSet<uint32_t>>>
+getTMemLdStWarpAddresses(RankedTensorType regTy, gpu::MemDescType memTy,
+                         int maxnreg, uint32_t baseAddress = 0);
 
 // Check whether a tmem_load with register layout `regTy` reading from `memTy`
 // can be supported with a fused reduction along the N dimension. This is the

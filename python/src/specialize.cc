@@ -40,6 +40,14 @@ specialize_arg(PyObject *backend, PyObject *arg, bool is_const,
 
 static bool init_called = false;
 
+static bool is_python_finalizing() {
+#if PY_VERSION_HEX >= 0x030D0000
+  return Py_IsFinalizing() != 0;
+#else
+  return _Py_IsFinalizing() != 0;
+#endif
+}
+
 // --- dispatch/cache stats (opt-in via TRITON_CACHE_STATS=1) ------------------
 // Counts hit vs fallback per dispatch path, per kernel, so owners can find
 // kernels that silently miss the C fast path once the flags are on by default.
@@ -119,6 +127,8 @@ struct TritonTensorAccessAPI {
   int (*extract_tensordesc)(PyObject *td_obj, uint64_t *out_data_ptr,
                             int64_t *out_shape, int64_t *out_strides,
                             int max_ndim);
+  int8_t (*is_cuda_tensor)(PyObject *);
+  int (*extract_tensor_metadata)(PyObject *, uint64_t *, uint64_t *);
 };
 static TritonTensorAccessAPI *g_tensor_api = nullptr;
 
@@ -786,6 +796,7 @@ struct FastCache {
   FCEntry *table;
   size_t capacity;
   size_t count;
+  uint64_t tensor_size_threshold = 0;
 
   FastCache() : n_params(0), table(nullptr), capacity(0), count(0) {
     memset(param_meta, 0, sizeof(param_meta));
@@ -1080,14 +1091,30 @@ slow_path:
   return is_const ? (TC_PTR_CONST_BASE + code) : (TC_PTR_BASE + code);
 }
 
-static int fc_get_tensor_alignment(PyObject *arg) {
-  // Fast path: direct struct access via torch_bridge
-  if (g_tensor_api) {
+static int fc_get_tensor_specialization(PyObject *arg, uint64_t threshold,
+                                        bool align) {
+  int size_bit = 0;
+  if (threshold) {
+    // Unknown size cannot be keyed safely; use Python specialization.
+    if (!g_tensor_api || !g_tensor_api->extract_tensor_metadata)
+      return -1;
+    uint64_t ptr;
+    uint64_t storage_size;
+    if (g_tensor_api->extract_tensor_metadata(arg, &ptr, &storage_size) < 0)
+      return -1;
+    size_bit = storage_size <= threshold ? 2 : 0;
+    if (!align)
+      return size_bit;
+    if (ptr != 0)
+      return ((ptr & 15) == 0 ? 1 : 0) | size_bit;
+  } else if (!align) {
+    return 0;
+  } else if (g_tensor_api) {
     uint64_t ptr = g_tensor_api->get_data_ptr(arg);
     if (ptr != 0)
       return (ptr & 15) == 0 ? 1 : 0;
-    // ptr==0: either not a torch tensor or zero-size tensor — fall through
   }
+
   PyObject *ptr_obj = PyObject_CallMethodNoArgs(arg, data_ptr_attr);
   if (!ptr_obj)
     return -1;
@@ -1095,10 +1122,13 @@ static int fc_get_tensor_alignment(PyObject *arg) {
   Py_DECREF(ptr_obj);
   if (PyErr_Occurred())
     return -1;
-  return (ptr & 15) == 0 ? 1 : 0;
+  return ((ptr & 15) == 0 ? 1 : 0) | size_bit;
 }
 
 static void fc_capsule_destructor(PyObject *capsule) {
+  // Cached Python objects may already be partially finalized at process exit.
+  if (is_python_finalizing())
+    return;
   FastCache *c = (FastCache *)PyCapsule_GetPointer(capsule, "FastCache");
   if (c)
     delete c;
@@ -1312,15 +1342,14 @@ static bool fc_build_key(FCCacheKey &key, FastCache *cache,
       key.slots[i].type_code = tc;
       bool spec = !meta.do_not_specialize;
       bool align_flag = !meta.do_not_specialize_on_alignment;
-      if (spec && align_flag) {
-        int a = fc_get_tensor_alignment(arg);
-        if (a < 0) {
+      if (spec) {
+        int value = fc_get_tensor_specialization(
+            arg, cache->tensor_size_threshold, align_flag);
+        if (value < 0) {
           PyErr_Clear();
           return false;
         }
-        key.slots[i].align_bit = (uint8_t)a;
-      } else if (spec) {
-        key.slots[i].align_bit = 0;
+        key.slots[i].align_bit = (uint8_t)value;
       } else {
         key.slots[i].align_bit = 255;
       }
@@ -1347,15 +1376,14 @@ static bool fc_build_key(FCCacheKey &key, FastCache *cache,
         key.slots[i].type_code = tc;
         bool spec = !meta.do_not_specialize;
         bool align_flag = !meta.do_not_specialize_on_alignment;
-        if (spec && align_flag) {
-          int a = fc_get_tensor_alignment(arg);
-          if (a < 0) {
+        if (spec) {
+          int value = fc_get_tensor_specialization(
+              arg, cache->tensor_size_threshold, align_flag);
+          if (value < 0) {
             PyErr_Clear();
             return false;
           }
-          key.slots[i].align_bit = (uint8_t)a;
-        } else if (spec) {
-          key.slots[i].align_bit = 0;
+          key.slots[i].align_bit = (uint8_t)value;
         } else {
           key.slots[i].align_bit = 255;
         }
@@ -1537,6 +1565,23 @@ PyObject *native_fast_dispatch_insert(PyObject *self, PyObject *const *args,
   if (!cache) {
     PyErr_Clear();
     Py_RETURN_NONE;
+  }
+
+  // Binding precedes insertion, so the threshold is available by the time the
+  // first entry is built. Before then, lookups skip key construction entirely.
+  if (cache->count == 0) {
+    PyObject *value =
+        PyObject_GetAttrString(jit_fn, "_fc_tensor_size_threshold");
+    if (!value) {
+      PyErr_Clear();
+      Py_RETURN_NONE;
+    }
+    cache->tensor_size_threshold = PyLong_AsUnsignedLongLong(value);
+    Py_DECREF(value);
+    if (PyErr_Occurred()) {
+      PyErr_Clear();
+      Py_RETURN_NONE;
+    }
   }
 
   FCCacheKey key;

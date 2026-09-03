@@ -34,10 +34,11 @@ struct ReduceOpConversion
     : public ConvertTritonGPUReduceScanToLLVMPattern<triton::ReduceOp> {
 public:
   ReduceOpConversion(LLVMTypeConverter &typeConverter,
-                     const TargetInfoBase &targetInfo, PatternBenefit benefit)
+                     const TargetInfoBase &targetInfo, PatternBenefit benefit,
+                     bool enableTreeReduction)
       : ConvertTritonGPUReduceScanToLLVMPattern<triton::ReduceOp>(typeConverter,
                                                                   benefit),
-        targetInfo(targetInfo) {}
+        targetInfo(targetInfo), enableTreeReduction(enableTreeReduction) {}
 
   LogicalResult
   matchAndRewrite(triton::ReduceOp op, OpAdaptor adaptor,
@@ -58,6 +59,7 @@ public:
 
 private:
   const TargetInfoBase &targetInfo;
+  bool enableTreeReduction;
 
   bool isInnerTree(triton::ReduceOp op) const {
     auto attr = op.getReductionOrderingAttr();
@@ -212,15 +214,21 @@ private:
     return success();
   }
 
-  // Reduce values using a tree of the given arity. Arity=3 generates
-  // combine(combine(a, b), c) groups that LLVM folds into ternary
-  // instructions (e.g. v_maximum3_f32 on AMD).
+  // Reduce values using a tree of the given arity. Arity=1 performs a linear
+  // fold. Arity=3 generates combine(combine(a, b), c) groups that LLVM folds
+  // into ternary instructions (e.g. v_maximum3_f32 on AMD).
   SmallVector<Value> treeReduce(Location loc,
                                 ConversionPatternRewriter &rewriter,
                                 Region &combineOp,
                                 SmallVector<SmallVector<Value>> values,
                                 unsigned arity) const {
-    assert(!values.empty() && arity >= 2);
+    assert(!values.empty() && arity >= 1);
+    if (arity == 1) {
+      SmallVector<Value> acc;
+      for (auto &cur : values)
+        accumulate(loc, rewriter, combineOp, acc, cur);
+      return acc;
+    }
     while (values.size() > 1) {
       SmallVector<SmallVector<Value>> next;
       for (size_t i = 0; i < values.size(); i += arity) {
@@ -627,9 +635,12 @@ private:
       for (int idx : group)
         groupValues.push_back(srcValues[idx]);
 
-      auto vectorizeKind = helper.getInThreadVectorizeOpKind(
-          groupValues.size(), targetInfo.supportBitwidth16Elementwise(),
-          targetInfo.supportBitwidth32Elementwise());
+      auto vectorizeKind = enableTreeReduction
+                               ? helper.getInThreadVectorizeOpKind(
+                                     groupValues.size(),
+                                     targetInfo.supportBitwidth16Elementwise(),
+                                     targetInfo.supportBitwidth32Elementwise())
+                               : ReduceOpHelper::InThreadVectorizeOpKind::None;
       if (vectorizeKind == ReduceOpHelper::InThreadVectorizeOpKind::None)
         return reduceValueSequence(op.getLoc(), op, std::move(groupValues),
                                    rewriter);
@@ -701,9 +712,12 @@ private:
     }
 
     ReduceOpHelper helper(op);
-    auto vectorizeKind = helper.getInThreadVectorizeOpKind(
-        axisPack, targetInfo.supportBitwidth16Elementwise(),
-        targetInfo.supportBitwidth32Elementwise());
+    auto vectorizeKind =
+        enableTreeReduction
+            ? helper.getInThreadVectorizeOpKind(
+                  axisPack, targetInfo.supportBitwidth16Elementwise(),
+                  targetInfo.supportBitwidth32Elementwise())
+            : ReduceOpHelper::InThreadVectorizeOpKind::None;
     bool vectorize =
         vectorizeKind != ReduceOpHelper::InThreadVectorizeOpKind::None;
 
@@ -734,7 +748,8 @@ private:
         vectorCombineRegion ? *vectorCombineRegion : op.getCombineOp();
 
     Operation &combinerOp = combineRegion.front().front();
-    unsigned arity = targetInfo.getReductionTreeArity(&combinerOp);
+    unsigned arity =
+        enableTreeReduction ? targetInfo.getReductionTreeArity(&combinerOp) : 1;
 
     // Perform a tree reduction
     unsigned numOperands = accs.size();
@@ -1160,5 +1175,14 @@ private:
 void mlir::triton::populateReduceOpToLLVMPatterns(
     LLVMTypeConverter &typeConverter, RewritePatternSet &patterns,
     const TargetInfoBase &targetInfo, PatternBenefit benefit) {
-  patterns.add<ReduceOpConversion>(typeConverter, targetInfo, benefit);
+  populateReduceOpToLLVMPatternsWithOptions(typeConverter, patterns, targetInfo,
+                                            benefit, true);
+}
+
+void mlir::triton::populateReduceOpToLLVMPatternsWithOptions(
+    LLVMTypeConverter &typeConverter, RewritePatternSet &patterns,
+    const TargetInfoBase &targetInfo, PatternBenefit benefit,
+    bool enableTreeReduction) {
+  patterns.add<ReduceOpConversion>(typeConverter, targetInfo, benefit,
+                                   enableTreeReduction);
 }

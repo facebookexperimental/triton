@@ -38,6 +38,85 @@ module attributes {tlx.has_explicit_local_mem_access = true, "ttg.num-ctas" = 1 
 }
 
 // -----
+#blocked_nested = #ttg.blocked<{sizePerThread = [2, 2], threadsPerWarp = [4, 16], warpsPerCTA = [4, 1], order = [1, 0]}>
+#mma_nested = #ttg.amd_mfma<{version = 3, warpsPerCTA = [2, 2], instrShape = [16, 16, 16], isTransposed = true}>
+#dot_nested = #ttg.dot_op<{opIdx = 0, parent = #mma_nested, kWidth = 4}>
+#shared_nested = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#smem_nested = #ttg.shared_memory
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx942", "ttg.threads-per-warp" = 64 : i32} {
+  // CHECK-DAG: #[[$NESTED_BLOCKED:.*]] = #ttg.blocked<{sizePerThread = [2, 2], threadsPerWarp = [4, 16], warpsPerCTA = [4, 1], order = [1, 0]}>
+  // CHECK-DAG: #[[$NESTED_MMA:.*]] = #ttg.amd_mfma<{version = 3, warpsPerCTA = [2, 2], instrShape = [16, 16, 16], isTransposed = true}>
+  // CHECK-LABEL: @nested_non_retaggable_edge
+  tt.func public @nested_non_retaggable_edge(
+      %cond: i1,
+      %x: tensor<64x32xf32, #blocked_nested>) -> tensor<64x32xbf16, #dot_nested> {
+    %trunc = arith.truncf %x : tensor<64x32xf32, #blocked_nested> to tensor<64x32xbf16, #blocked_nested>
+    %alloc = ttg.local_alloc %trunc : (tensor<64x32xbf16, #blocked_nested>) -> !ttg.memdesc<64x32xbf16, #shared_nested, #smem_nested>
+    // CHECK: ttg.local_load {{.*}} -> tensor<64x32xbf16, #[[$NESTED_BLOCKED]]>
+    %load = ttg.local_load %alloc : !ttg.memdesc<64x32xbf16, #shared_nested, #smem_nested> -> tensor<64x32xbf16, #blocked_nested>
+    // CHECK: scf.if {{.*}} -> (tensor<64x32xbf16, #[[$NESTED_BLOCKED]]>)
+    %selected = scf.if %cond -> (tensor<64x32xbf16, #blocked_nested>) {
+      %inner = scf.if %cond -> (tensor<64x32xbf16, #blocked_nested>) {
+        scf.yield %trunc : tensor<64x32xbf16, #blocked_nested>
+      } else {
+        scf.yield %trunc : tensor<64x32xbf16, #blocked_nested>
+      }
+      scf.yield %inner : tensor<64x32xbf16, #blocked_nested>
+    } else {
+      scf.yield %load : tensor<64x32xbf16, #blocked_nested>
+    }
+    %required = tlx.require_layout %selected : tensor<64x32xbf16, #blocked_nested> -> tensor<64x32xbf16, #dot_nested>
+    tt.return %required : tensor<64x32xbf16, #dot_nested>
+  }
+
+  // CHECK-LABEL: @nested_blocked_inward
+  tt.func public @nested_blocked_inward(
+      %cond: i1,
+      %x: tensor<64x32xf32, #blocked_nested>,
+      %buf: !ttg.memdesc<64x32xbf16, #shared_nested, #smem_nested>) -> tensor<64x32xbf16, #dot_nested> {
+    %trunc = arith.truncf %x : tensor<64x32xf32, #blocked_nested> to tensor<64x32xbf16, #blocked_nested>
+    // CHECK: ttg.local_load {{.*}} -> tensor<64x32xbf16, #[[$NESTED_BLOCKED]]>
+    %load = ttg.local_load %buf : !ttg.memdesc<64x32xbf16, #shared_nested, #smem_nested> -> tensor<64x32xbf16, #blocked_nested>
+    // CHECK: scf.if {{.*}} -> (tensor<64x32xbf16, #[[$NESTED_BLOCKED]]>)
+    %selected = scf.if %cond -> (tensor<64x32xbf16, #blocked_nested>) {
+      %inner = scf.if %cond -> (tensor<64x32xbf16, #blocked_nested>) {
+        scf.yield %load : tensor<64x32xbf16, #blocked_nested>
+      } else {
+        scf.yield %load : tensor<64x32xbf16, #blocked_nested>
+      }
+      scf.yield %inner : tensor<64x32xbf16, #blocked_nested>
+    } else {
+      scf.yield %trunc : tensor<64x32xbf16, #blocked_nested>
+    }
+    %required = tlx.require_layout %selected : tensor<64x32xbf16, #blocked_nested> -> tensor<64x32xbf16, #dot_nested>
+    tt.return %required : tensor<64x32xbf16, #dot_nested>
+  }
+
+  // CHECK-LABEL: @nested_retaggable_edges
+  tt.func public @nested_retaggable_edges(
+      %cond: i1,
+      %buf: !ttg.memdesc<64x32xbf16, #shared_nested, #smem_nested>) -> tensor<64x32xbf16, #dot_nested> {
+    // CHECK: ttg.local_load {{.*}} -> tensor<64x32xbf16, #ttg.dot_op<{opIdx = 0, parent = #[[$NESTED_MMA]], kWidth = 4}>>
+    %load = ttg.local_load %buf : !ttg.memdesc<64x32xbf16, #shared_nested, #smem_nested> -> tensor<64x32xbf16, #blocked_nested>
+    // CHECK: scf.if {{.*}} -> (tensor<64x32xbf16, #ttg.dot_op<{opIdx = 0, parent = #[[$NESTED_MMA]], kWidth = 4}>>)
+    %selected = scf.if %cond -> (tensor<64x32xbf16, #blocked_nested>) {
+      // CHECK: scf.if {{.*}} -> (tensor<64x32xbf16, #ttg.dot_op<{opIdx = 0, parent = #[[$NESTED_MMA]], kWidth = 4}>>)
+      %inner = scf.if %cond -> (tensor<64x32xbf16, #blocked_nested>) {
+        scf.yield %load : tensor<64x32xbf16, #blocked_nested>
+      } else {
+        scf.yield %load : tensor<64x32xbf16, #blocked_nested>
+      }
+      scf.yield %inner : tensor<64x32xbf16, #blocked_nested>
+    } else {
+      scf.yield %load : tensor<64x32xbf16, #blocked_nested>
+    }
+    %required = tlx.require_layout %selected : tensor<64x32xbf16, #blocked_nested> -> tensor<64x32xbf16, #dot_nested>
+    tt.return %required : tensor<64x32xbf16, #dot_nested>
+  }
+}
+
+// -----
 // Test that when tensor propagation through an scf.for carrier cannot make the
 // init value and the backedge agree, the pipeline keeps an explicit layout
 // conversion instead of retagging the loop-carried tensor.

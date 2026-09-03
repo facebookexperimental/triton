@@ -83,7 +83,8 @@ def get_ptxas_version(arch: int = 80):
     mock_ver = knobs.nvidia.mock_ptx_version
     if mock_ver is not None:
         return mock_ver  # This is not really a version of ptxas, but it is good enough for testing
-    version = subprocess.check_output([get_ptxas(arch).path, "--version"]).decode("utf-8")
+    version = subprocess.check_output([get_ptxas(arch).path, "--version"],
+                                      env=knobs.nvidia.get_tool_env()).decode("utf-8")
     return version
 
 
@@ -238,6 +239,8 @@ class CUDAOptions:
     # Emit device-side descriptors (make_tensor_descriptor + descriptor_load/store)
     # instead of host TMA recipes. Falls back to knobs.nvidia.auto_tma_device.
     auto_tma_device: bool = False
+    enable_tree_reduction: bool = False
+    enable_nvptx_v2i32: bool = False
 
     def __post_init__(self):
         default_libdir = Path(__file__).parent / "lib"
@@ -311,6 +314,11 @@ class CUDABackend(BaseBackend):
         args = {"arch": knobs.runtime.override_arch or f"sm{self.target.arch}"}
         args.update({k: opts[k] for k in CUDAOptions.__dataclass_fields__.keys() if k in opts if opts[k] is not None})
         capability = int(self._parse_arch(args["arch"]))
+
+        if "enable_tree_reduction" not in args:
+            # Preserve the established ordering before Blackwell while using
+            # linear ordering for the Blackwell workloads it targets.
+            args["enable_tree_reduction"] = capability < 100
 
         if args.get("num_ctas", 1) > 1 and capability < 90:
             raise ValueError((f"num_ctas > 1 requires NVIDIA SM90+ (Hopper). "
@@ -1040,6 +1048,8 @@ class CUDABackend(BaseBackend):
         # after all other passes that may introduce layout conversions.
         terminal_smem_budget = (0 if knobs.nvidia.disable_budget_aware_layout_conversion else smem_budget)
         passes.ttgpuir.add_remove_layout_conversions(pm, terminal_smem_budget)
+        # add_remove_layout_conversions needs a CSE after it.
+        passes.ttir.add_loop_aware_cse(pm)
         # Retire user-pinned register layout markers (#tlx.user_layout) only after
         # ALL layout-rewriting passes have run (optimize_tmem_layouts reads the
         # marker; every remove_layout_conversions / reduce_data_duplication above
@@ -1152,7 +1162,13 @@ class CUDABackend(BaseBackend):
         nvidia.passes.ttnvgpuir.add_proxy_fence_insertion(pm, capability)
         nvidia.passes.hopper.add_tma_store_token_wait_lowering(pm)
         nvidia.passes.ttnvgpuir.add_tmem_barrier_insertion(pm)
-        nvidia.passes.ttgpuir.add_to_llvmir(pm, capability, ptx_version, "consan" in options.instrumentation_mode)
+        nvidia.passes.ttgpuir.add_to_llvmir(
+            pm,
+            capability,
+            ptx_version,
+            "consan" in options.instrumentation_mode,
+            options.enable_tree_reduction,
+        )
         nvidia.passes.ttnvgpuir.add_initialize_ws_cluster_barriers(pm, capability, ptx_version)
         passes.ttgpuir.add_canonicalize_llvm_ir(pm)
         passes.common.add_cse(pm)
@@ -1230,7 +1246,12 @@ class CUDABackend(BaseBackend):
             paths = [path for (name, path) in options.extern_libs]
             llvm.link_extern_libs(llvm_mod, paths)
 
-        llvm.optimize_module(llvm_mod, llvm.OPTIMIZE_O3, disable_slp_vectorizer=disable_slp_vectorizer)
+        llvm.optimize_module(
+            llvm_mod,
+            llvm.OPTIMIZE_O3,
+            disable_slp_vectorizer=disable_slp_vectorizer,
+            scalarize_packed_fops=True,
+        )
 
         # Get some metadata
         # warp-specialization mutates num_warps
@@ -1261,6 +1282,8 @@ class CUDABackend(BaseBackend):
         proc = sm_arch_from_capability(cap_llvm)
         features = get_features(opt, cap_llvm)
         flags = ["nvptx-mad-wide-opt"]
+        if opt.enable_nvptx_v2i32:
+            flags.append("nvptx-v2i32")
         canonicalize_gep = "fpsan" in opt.instrumentation_mode
         ret = llvm.translate_to_asm(src, triple, proc, features, flags, opt.enable_fp_fusion, False, canonicalize_gep)
         # Find kernel names (there should only be one)
@@ -1351,7 +1374,8 @@ class CUDABackend(BaseBackend):
                 fbin,
             ]
             try:
-                subprocess.run(ptxas_cmd, check=True, close_fds=False, stderr=flog)
+                subprocess.run(ptxas_cmd, check=True, close_fds=False, stderr=flog,
+                               env=knobs.nvidia.get_tool_env())
                 if knobs.nvidia.dump_ptxas_log:
                     with open(flog.name) as log_file:
                         print(log_file.read())
