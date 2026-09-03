@@ -19,7 +19,7 @@
   },
   {
     "case_id": "target_2048x10240x25408",
-    "parameters": {"m": 2048, "n": 10240, "k": 25408, "dtype": "float16", "seed": 3},
+    "parameters": {"m": 2048, "n": 10240, "k": 25408, "dtype": "float16", "seed": 3, "profile": true},
     "weight": 10.0,
     "protected": true
   },
