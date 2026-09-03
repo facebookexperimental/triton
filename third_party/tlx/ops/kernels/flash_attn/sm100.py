@@ -3524,7 +3524,10 @@ def _attn_bwd_ws(
         cluster_cta_rank = 0
         is_leader = True  # noqa: F841
 
-    with tlx.async_tasks(exclusive=not DIRECT_DQ_OUTPUT):
+    # `less_reg_mma`: the MMA task issues many dots over the same SMEM
+    # operands, so a CSE-d operand descriptor stays live across all of them and
+    # spills. Give each MMA its own address computation instead.
+    with tlx.async_tasks(exclusive=not DIRECT_DQ_OUTPUT, less_reg_mma=True):
         # compute
         with tlx.async_task("default"):
             blk_idx = 0

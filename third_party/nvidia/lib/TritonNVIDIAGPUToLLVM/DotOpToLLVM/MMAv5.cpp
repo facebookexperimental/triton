@@ -531,15 +531,13 @@ struct DotConversion {
   CreateMMAInstFn createMMAInst;
 };
 
-LogicalResult convertDotImpl(const LLVMTypeConverter &typeConverter,
-                             ConversionPatternRewriter &rewriter, Location loc,
-                             Value a, Value b, Value loadedA, Value loadedB,
-                             MemDescType dTensorTy, Value useDFlag, Value pred,
-                             ValueRange barriers, ValueRange barrierPreds,
-                             bool twoCTAs, bool tlxPairedMMA,
-                             ValueRange commitDescs, bool opKindIsMXFP4,
-                             const ttng::TargetFeatures &targetFeatures,
-                             const DotConversion &op) {
+LogicalResult convertDotImpl(
+    const LLVMTypeConverter &typeConverter, ConversionPatternRewriter &rewriter,
+    Location loc, Value a, Value b, Value loadedA, Value loadedB,
+    MemDescType dTensorTy, Value useDFlag, Value pred, ValueRange barriers,
+    ValueRange barrierPreds, bool twoCTAs, bool tlxPairedMMA,
+    ValueRange commitDescs, bool opKindIsMXFP4, bool lessRegMMA,
+    const ttng::TargetFeatures &targetFeatures, const DotConversion &op) {
   auto tb = TritonLLVMOpBuilder(loc, rewriter);
 
   // Only run mma on one thread. We currently use elect as ptxas is not able to
@@ -630,8 +628,9 @@ LogicalResult convertDotImpl(const LLVMTypeConverter &typeConverter,
         std::make_unique<DotOpMmaV5TmemLoader>(DotOpMmaV5TmemLoader::build(
             loc, rewriter, aTensorTy, baseA, op.numBitsPerElementA));
   } else {
-    auto loader = DotOpMmaSmemLoader::build(loc, rewriter, aTensorTy, baseA,
-                                            aOperandShape, 0, 5, isFp4a);
+    auto loader =
+        DotOpMmaSmemLoader::build(loc, rewriter, aTensorTy, baseA,
+                                  aOperandShape, 0, 5, lessRegMMA, isFp4a);
     if (failed(loader)) {
       return mlir::emitError(loc, "failed to find valid tcgen05.mma layout for "
                                   "operand A in shared memory ")
@@ -643,8 +642,8 @@ LogicalResult convertDotImpl(const LLVMTypeConverter &typeConverter,
   }
 
   auto isFp4b = op.numBitsPerElementB == 4;
-  auto bLoader = DotOpMmaSmemLoader::build(loc, rewriter, bTensorTy, baseB,
-                                           bOperandShape, 1, 5, isFp4b);
+  auto bLoader = DotOpMmaSmemLoader::build(
+      loc, rewriter, bTensorTy, baseB, bOperandShape, 1, 5, lessRegMMA, isFp4b);
   if (failed(bLoader)) {
     return mlir::emitError(loc, "failed to find valid tcgen05.mma layout for "
                                 "operand B in shared memory ")
@@ -784,12 +783,12 @@ LogicalResult convertDot(const LLVMTypeConverter &typeConverter,
                   useInitAcc, desc.aInTmem, twoCTAs, collectorB);
   };
 
-  return convertDotImpl(typeConverter, rewriter, loc, op.getA(), op.getB(),
-                        adaptor.getA(), adaptor.getB(), dTensorTy,
-                        adaptor.getUseD(), adaptor.getPred(),
-                        adaptor.getBarriers(), adaptor.getBarrierPreds(),
-                        twoCTAs, tlx::tlxEnablePairedMMA(op), commitDescs,
-                        /*opKindIsMXFP4=*/false, targetFeatures, dot);
+  return convertDotImpl(
+      typeConverter, rewriter, loc, op.getA(), op.getB(), adaptor.getA(),
+      adaptor.getB(), dTensorTy, adaptor.getUseD(), adaptor.getPred(),
+      adaptor.getBarriers(), adaptor.getBarrierPreds(), twoCTAs,
+      tlx::tlxEnablePairedMMA(op), commitDescs,
+      /*opKindIsMXFP4=*/false, hasLessRegMMA(op), targetFeatures, dot);
 }
 
 int64_t getFormatBitSize(ScaleDotElemType type) {
@@ -974,7 +973,7 @@ LogicalResult convertScaledDot(const LLVMTypeConverter &typeConverter,
                         adaptor.getUseD(), adaptor.getPred(),
                         adaptor.getBarriers(), adaptor.getBarrierPreds(),
                         twoCTAs, tlx::tlxEnablePairedMMA(op), commitDescs,
-                        opKindIsMXFP4, targetFeatures, dot);
+                        opKindIsMXFP4, hasLessRegMMA(op), targetFeatures, dot);
 }
 
 //===----------------------------------------------------------------------===//
