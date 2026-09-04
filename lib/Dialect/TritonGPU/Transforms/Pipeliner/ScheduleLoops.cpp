@@ -212,45 +212,6 @@ bool hasLatenciesAssigned(scf::ForOp forOp,
   return false;
 }
 
-// A descriptor value shared by an MMA path and an ordinary register path is
-// materialized as a multi-consumer TMA buffer by Meta WS. With three or more
-// software-pipeline stages, a later single-buffer TMA acquire can be hoisted
-// ahead of the forwarding copy that publishes the current value to MMA,
-// forming a producer/consumer cycle. Keep this narrow pattern at two stages
-// until the pipeline scheduler models that cross-task dependency directly.
-static bool hasMixedDescriptorLoadConsumers(scf::ForOp forOp) {
-  auto isForwardingOp = [](Operation *op) {
-    return isa<ttg::LocalAllocOp, ttg::LocalLoadOp, ttg::MemDescTransOp,
-               ttg::MemDescReshapeOp, ttg::MemDescSubsliceOp,
-               ttg::ConvertLayoutOp, tt::TransOp, tt::ReshapeOp>(op);
-  };
-
-  for (auto load : forOp.getOps<tt::DescriptorLoadOp>()) {
-    bool hasDotConsumer = false;
-    bool hasNonDotConsumer = false;
-    SmallVector<Operation *> worklist(load->getUsers());
-    DenseSet<Operation *> visited;
-    while (!worklist.empty() && !(hasDotConsumer && hasNonDotConsumer)) {
-      Operation *consumer = worklist.pop_back_val();
-      if (!visited.insert(consumer).second)
-        continue;
-      if (isa<tt::DotOpInterface>(consumer)) {
-        hasDotConsumer = true;
-        continue;
-      }
-      if (isForwardingOp(consumer)) {
-        for (Value result : consumer->getResults())
-          llvm::append_range(worklist, result.getUsers());
-        continue;
-      }
-      hasNonDotConsumer = true;
-    }
-    if (hasDotConsumer && hasNonDotConsumer)
-      return true;
-  }
-  return false;
-}
-
 // Determine the chain of dots in the given set of users for a dot.
 std::tuple<SmallVector<ttng::MMAv5OpInterface>, bool>
 computeDotChain(ttng::MMAv5OpInterface dotOp,
@@ -435,8 +396,6 @@ CoarseSchedule scheduleKeyOpsMetaWS(scf::ForOp forOp,
 
   // Schedule parallel dot pattern.
   int maxStages = getNumStagesOrDefault(forOp, defaultNumStages);
-  if (maxStages > 2 && hasMixedDescriptorLoadConsumers(forOp))
-    maxStages = 2;
   int maxPossibleDistance = maxStages - 1 + minDistance;
   // Compute the longest path to the yield for each operation reachable
   // from any latency operation. We also use this to embed stage information
@@ -572,6 +531,59 @@ CoarseSchedule scheduleKeyOpsMetaWS(scf::ForOp forOp,
     auto [d, _] = computeDistance(latOp);
     if (d > maxDistance)
       maxDistance = d;
+  }
+
+  // A descriptor result can be consumed both as registers and through a
+  // local_alloc feeding MMA.  AutoWS lowers that shape through a staging
+  // buffer and materializes the MMA allocation with a forwarding copy on the
+  // load partition.  Keep that publication in the stage immediately after
+  // the descriptor load.  Otherwise the forwarding copy can inherit the last
+  // compute stage; the next iteration's single-buffer producer acquire may
+  // then block the same load partition before it publishes the current MMA
+  // operand, forming a cycle with MMA.
+  //
+  // MMA-only descriptor loads are fused directly into their allocation and
+  // need no adjustment.
+  for (auto load : forOp.getOps<tt::DescriptorLoadOp>()) {
+    SmallVector<ttg::LocalAllocOp> mmaAllocs;
+    bool hasRegisterConsumer = false;
+    for (Operation *user : load->getUsers()) {
+      auto alloc = dyn_cast<ttg::LocalAllocOp>(user);
+      if (!alloc) {
+        hasRegisterConsumer = true;
+        continue;
+      }
+      SmallVector<Operation *> worklist(alloc->getUsers());
+      DenseSet<Operation *> visited;
+      bool feedsMma = false;
+      while (!worklist.empty() && !feedsMma) {
+        Operation *consumer = worklist.pop_back_val();
+        if (!visited.insert(consumer).second)
+          continue;
+        if (isa<tt::DotOpInterface>(consumer)) {
+          feedsMma = true;
+          break;
+        }
+        if (!consumer->hasTrait<OpTrait::MemDescViewTrait>())
+          continue;
+        for (Value result : consumer->getResults())
+          llvm::append_range(worklist, result.getUsers());
+      }
+      if (feedsMma)
+        mmaAllocs.push_back(alloc);
+    }
+    if (!hasRegisterConsumer || mmaAllocs.empty())
+      continue;
+
+    auto loadIt = distance.find(load);
+    if (loadIt == distance.end() || loadIt->second <= 0)
+      continue;
+    int publicationDistance = loadIt->second - 1;
+    for (ttg::LocalAllocOp alloc : mmaAllocs) {
+      auto allocIt = distance.find(alloc);
+      if (allocIt != distance.end())
+        allocIt->second = std::max(allocIt->second, publicationDistance);
+    }
   }
 
   // Assign stage to each op reachable from a latency op
