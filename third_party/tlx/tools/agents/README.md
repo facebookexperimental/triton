@@ -6,7 +6,7 @@ The roles are Manager, Knowledge Keeper, TL, Profiler, Worker, Build, Validator,
 Self Diagnosis. Shared behavior is expressed through imports and handoff contracts rather
 than panel inheritance.
 
-![FBTriton agent organization](agent-organization.svg)
+![Kernel optimization role organization](agent-organization.svg)
 
 | Role | Directory | Primary ownership |
 |---|---|---|
@@ -74,7 +74,7 @@ python -m third_party.tlx.tools.agents.manager.cli \
   --provider codex --arch blackwell
 
 # Continue from a completed run without adopting its winner:
-python -m third_party.tlx.tools.agents.kernel_optimization.cli \
+python -m third_party.tlx.tools.agents.manager.cli \
   --kernel my_kernel.py --output-dir /tmp/tlx-kernel-agent-next \
   --prior-run /tmp/tlx-kernel-agent-run \
   --provider codex --arch blackwell
@@ -83,7 +83,7 @@ python -m third_party.tlx.tools.agents.kernel_optimization.cli \
 python -m third_party.tlx.tools.agents.manager.cli \
   --kernel my_kernel.py --output-dir /tmp/tlx-kernel-agent-run \
   --vcs auto \
-  --commit-message "Optimize my kernel with TLX agent"
+  --commit-message "gfx942 mm 2048×10240×25408"
 ```
 
 `--arch` selects `validator/targets/<arch>/<kernel>`; `harness`/`cases`/`target` can also be passed explicitly.
@@ -104,7 +104,9 @@ Promotion checkpoint commits are enabled by default. Every candidate that passes
 promotion gates is committed immediately before the next candidate is generated. Use
 `--no-commit-winner` for artifact-only runs. The CLI
 finds the repository from the absolute kernel path and supports `--vcs auto|git|hg` without
-using `sl`. Every promoted-candidate commit includes the body line `TLX agent authored`.
+using `sl`. Every promoted-candidate commit describes what changed and why it works, records
+correctness and per-shape before/after performance, and includes the generic body line
+`Kernel optimization agent authored`.
 Existing unrelated staged and dirty work is preserved. If the target was already dirty, only
 the Agent delta is committed and the original target edits remain unstaged/dirty; overlapping
 edits fail safely. If final revalidation fails after promotions, the Agent creates a forward
@@ -145,6 +147,13 @@ changes form a single causal unit or require one another, and separate ordered P
 are independently useful/revertible, cross ownership boundaries, or separate kernel and
 compiler concerns. Manager presents that recommendation for human approval; Build Agent
 performs the approved commits/publication and does not redesign the stack.
+
+Every kernel-optimization PR carries a low-key swimlane SVG titled from architecture,
+operation, and primary shape. Its commit message and review summary include correctness
+sign-off plus primary-shape latency before and after with speedup. The review summary explains
+the causal mechanism rather than reporting only an aggregate number. When a Knowledge Keeper
+proposal is approved, Manager includes that patch in the same kernel PR. Production kernel
+changes stay terse: no benchmark diary, agent narration, or nonessential explanatory prose.
 
 `--budget` accepts an optional JSON file that overrides the `--max-*` / `--min-speedup` /
 `--max-cv` flags (`{max_rounds, candidates_per_round, max_candidate_seconds,

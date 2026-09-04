@@ -10,7 +10,7 @@ from typing import Callable, Literal
 from ..manager.models import AutoCommitResult
 
 VcsKind = Literal["git", "hg"]
-ATTRIBUTION = "TLX agent authored"
+ATTRIBUTION = "Kernel optimization agent authored"
 
 
 class AutoCommitError(RuntimeError):

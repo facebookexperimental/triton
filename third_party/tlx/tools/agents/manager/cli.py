@@ -4,9 +4,9 @@ import argparse
 import json
 import os
 import sys
-from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable
+from xml.sax.saxutils import escape
 
 from ..build_agent.harness import HarnessExecutionError, SubprocessHarness
 from ..build_agent.vcs import (
@@ -23,7 +23,6 @@ from .models import (
     ExperimentSummary,
     InputCase,
     KernelOptimizationRequest,
-    KernelOptimizationResult,
     KernelTarget,
     OptimizationBudget,
     PerformanceSummary,
@@ -90,7 +89,7 @@ def _parse_args(arguments: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--commit-message",
         default=None,
-        help="Commit subject; the TLX agent attribution is always added to the body.",
+        help="Commit subject; correctness, performance, rationale, and generic attribution are added to the body.",
     )
     parser.add_argument(
         "--vcs",
@@ -370,16 +369,6 @@ def _performance_commit_body(
     return f"{summary}\n\n{validation}" if summary else validation
 
 
-def _commit_body(result: KernelOptimizationResult) -> str:
-    return _performance_commit_body(
-        result.baseline,
-        result.final,
-        result.winner_experiment_id,
-        result.winner_commit_summary,
-        "Final revalidation",
-    )
-
-
 class _PromotionAutoCommitter:
     def __init__(
         self,
@@ -456,7 +445,7 @@ class _PromotionAutoCommitter:
         return result
 
     def rollback_to_baseline(self, diagnostics: str) -> AutoCommitResult:
-        subject = f"Revert TLX agent promotions after failed final revalidation"
+        subject = "Revert TLX agent promotions after failed final revalidation"
         try:
             result = commit_rollback(self._session, subject, diagnostics)
         except Exception as error:  # noqa: BLE001
@@ -489,7 +478,252 @@ def _report_commit(commit_result: object) -> None:
     print(" ".join(parts), file=sys.stderr, flush=True)
 
 
-def _print_result(result: Any, output_dir: Path, result_format: str) -> None:
+def _primary_case(cases: tuple[InputCase, ...]) -> InputCase | None:
+    if not cases:
+        return None
+    return max(enumerate(cases), key=lambda item: (item[1].weight, -item[0]))[1]
+
+
+def _review_title(
+    kernel_path: Path,
+    target: KernelTarget,
+    cases: tuple[InputCase, ...],
+) -> str:
+    operation = kernel_path.parent.name
+    primary = _primary_case(cases)
+    parameters = primary.parameters if primary is not None else {}
+    dimensions = [parameters.get(name) for name in ("m", "n", "k")]
+    if all(isinstance(value, int | float) for value in dimensions):
+        shape = "×".join(str(int(value)) for value in dimensions)
+        return f"{target.architecture} {operation} {shape}"
+    return f"{target.architecture} {operation}"
+
+
+def _winning_lineage(result: Any) -> list[Any]:
+    by_id = {
+        experiment.experiment_id: experiment
+        for experiment in result.experiments
+    }
+    winner = None
+    for experiment in reversed(result.experiments):
+        if experiment.status != "promoted" or not experiment.source_path.is_file():
+            continue
+        if experiment.source_path.read_text() == result.best_kernel:
+            winner = experiment
+            break
+    lineage: list[Any] = []
+    while winner is not None and winner.experiment_id != "baseline":
+        lineage.append(winner)
+        winner = by_id.get(winner.parent_id)
+    lineage.reverse()
+    return lineage
+
+
+def _review_metadata(
+    result: Any,
+    cases: tuple[InputCase, ...],
+    title: str,
+    output_dir: Path,
+) -> dict[str, Any]:
+    baseline_by_id = {case.case_id: case for case in result.baseline.cases}
+    final_by_id = {case.case_id: case for case in result.final.cases}
+    passed = sum(case.verification.passed for case in result.final.cases)
+    total = len(result.final.cases)
+    correctness = f"{'PASS' if passed == total else 'FAIL'} ({passed}/{total} cases)"
+
+    performance: list[dict[str, Any]] = []
+    for case in cases:
+        before = baseline_by_id.get(case.case_id)
+        after = final_by_id.get(case.case_id)
+        before_us = before.timing.median_us if before and before.timing else None
+        after_us = after.timing.median_us if after and after.timing else None
+        speedup = before_us / after_us if before_us and after_us else None
+        performance.append(
+            {
+                "case_id": case.case_id,
+                "before_us": before_us,
+                "after_us": after_us,
+                "speedup": speedup,
+                "protected": case.protected,
+            }
+        )
+
+    primary = _primary_case(cases)
+    primary_performance = next(
+        (
+            row
+            for row in performance
+            if primary is not None and row["case_id"] == primary.case_id
+        ),
+        None,
+    )
+    lineage = _winning_lineage(result)
+    what_changed = [
+        experiment.mutation_summary
+        for experiment in lineage
+        if experiment.mutation_summary
+    ]
+    why_it_works = [
+        " ".join(
+            part
+            for part in (
+                experiment.hypothesis,
+                experiment.expected_effect,
+            )
+            if part
+        )
+        for experiment in lineage
+    ]
+    why_it_works = [item for item in why_it_works if item]
+    evidence = [experiment.evidence for experiment in lineage if experiment.evidence]
+    return {
+        "title": title,
+        "correctness_signoff": correctness,
+        "primary_case": primary.case_id if primary is not None else None,
+        "primary_performance": primary_performance,
+        "aggregate_speedup": result.final.aggregate_speedup,
+        "what_changed": what_changed,
+        "why_it_works": why_it_works,
+        "evidence": evidence,
+        "per_case_performance": performance,
+        "swimlane": str(output_dir / "swimlane.svg"),
+        "knowledge": "Include the human-approved Knowledge Keeper patch in the kernel PR.",
+    }
+
+
+def _format_review_summary(review: dict[str, Any]) -> str:
+    lines = [str(review["title"]), "", "What changed"]
+    lines.extend(f"- {item}" for item in review["what_changed"] or ["No winner was promoted."])
+    lines.extend(("", "Why it works"))
+    lines.extend(f"- {item}" for item in review["why_it_works"] or ["No confirmed mechanism."])
+    if review["evidence"]:
+        lines.extend(("", "Evidence"))
+        lines.extend(f"- {item}" for item in review["evidence"])
+    lines.extend(("", "Correctness", f"- {review['correctness_signoff']}", "", "Performance"))
+    primary = review["primary_performance"]
+    if primary and primary["before_us"] is not None and primary["after_us"] is not None:
+        lines.append(
+            f"- {primary['case_id']}: {primary['before_us']:.3f} us -> "
+            f"{primary['after_us']:.3f} us ({primary['speedup']:.4f}x)"
+        )
+    lines.append(f"- Weighted aggregate: {review['aggregate_speedup']:.4f}x")
+    lines.extend(
+        f"- {row['case_id']}: {row['before_us']:.3f} us -> {row['after_us']:.3f} us "
+        f"({row['speedup']:.4f}x)"
+        for row in review["per_case_performance"]
+        if row["before_us"] is not None and row["after_us"] is not None
+    )
+    lines.extend(
+        (
+            "",
+            "Review artifacts",
+            f"- Swimlane: {review['swimlane']}",
+            f"- Knowledge: {review['knowledge']}",
+        )
+    )
+    return "\n".join(lines) + "\n"
+
+
+def _commit_body(review: dict[str, Any]) -> str:
+    primary = review["primary_performance"]
+    performance = "Performance: unavailable"
+    if primary and primary["before_us"] is not None and primary["after_us"] is not None:
+        performance = (
+            f"Performance: {primary['case_id']} {primary['before_us']:.3f} us -> "
+            f"{primary['after_us']:.3f} us ({primary['speedup']:.4f}x)"
+        )
+    what = " ".join(review["what_changed"]) or "No promoted source change."
+    why = " ".join(review["why_it_works"]) or "No confirmed mechanism."
+    return "\n".join(
+        (
+            f"What changed: {what}",
+            f"Why it works: {why}",
+            f"Correctness: {review['correctness_signoff']}",
+            performance,
+            f"Weighted aggregate: {review['aggregate_speedup']:.4f}x",
+        )
+    )
+
+
+def _write_swimlane(review: dict[str, Any], output_dir: Path) -> Path:
+    path = output_dir / "swimlane.svg"
+    primary = review["primary_performance"]
+    performance = "No promoted performance result"
+    if primary and primary["before_us"] is not None and primary["after_us"] is not None:
+        performance = (
+            f"{primary['before_us']:.3f} us → {primary['after_us']:.3f} us · "
+            f"{primary['speedup']:.4f}x"
+        )
+    what = " ".join(review["what_changed"]) or "No promoted source change"
+    why = " ".join(review["why_it_works"]) or "No confirmed mechanism"
+
+    roles = (
+        ("MANAGER", "scope · verdict", "#ef6f91"),
+        ("PROFILER", "raw evidence", "#aa7cff"),
+        ("TL", "what · why · PR plan", "#55a4ff"),
+        ("WORKER", "minimal isolated change", "#38c9c4"),
+        ("BUILD", "environment · VCS", "#f3a846"),
+        ("CORRECTNESS", review["correctness_signoff"], "#40c58a"),
+        ("PERFORMANCE", performance, "#a7cf4b"),
+        ("KNOWLEDGE", "approved patch · same PR", "#e979b4"),
+    )
+    boxes = []
+    arrows = []
+    for index, (name, detail, color) in enumerate(roles):
+        x = 24 + index * 194
+        boxes.append(
+            f'<g transform="translate({x} 120)">'
+            f'<rect width="174" height="104" rx="8" fill="#121b2d" '
+            f'stroke="{color}" stroke-width="3"/>'
+            f'<rect width="174" height="34" rx="8" fill="{color}"/>'
+            f'<text x="12" y="23" class="role">{escape(name)}</text>'
+            f'<text x="12" y="61" class="detail">{escape(detail[:28])}</text>'
+            f'</g>'
+        )
+        if index < len(roles) - 1:
+            arrows.append(
+                f'<path d="M{x + 174} 172H{x + 194}" class="flow"/>'
+            )
+    svg = f'''<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="520" viewBox="0 0 1600 520" role="img" aria-labelledby="title description">
+  <title id="title">{escape(str(review["title"]))}</title>
+  <desc id="description">Kernel optimization handoffs, validation, and review packaging.</desc>
+  <defs>
+    <marker id="arrow" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0 0L9 4.5L0 9Z" fill="#9fb0cb"/></marker>
+    <style>
+      .title {{ fill:#f5f8ff; font:800 30px Inter,sans-serif; }}
+      .subtitle {{ fill:#a9b7d0; font:14px Inter,sans-serif; }}
+      .role {{ fill:#07101f; font:800 13px Inter,sans-serif; }}
+      .detail {{ fill:#d9e1ef; font:12px Inter,sans-serif; }}
+      .label {{ fill:#86a6d7; font:800 13px Inter,sans-serif; }}
+      .body {{ fill:#e4eaf5; font:13px Inter,sans-serif; }}
+      .flow {{ fill:none; stroke:#9fb0cb; stroke-width:2; marker-end:url(#arrow); }}
+    </style>
+  </defs>
+  <rect width="1600" height="520" fill="#070b14"/>
+  <text x="24" y="48" class="title">{escape(str(review["title"]))}</text>
+  <text x="24" y="76" class="subtitle">profile → reason → implement → build → correctness → performance → knowledge → review</text>
+  {''.join(boxes)}
+  {''.join(arrows)}
+  <rect x="24" y="270" width="1552" height="208" rx="10" fill="#101827" stroke="#314565"/>
+  <text x="44" y="304" class="label">WHAT CHANGED</text>
+  <text x="44" y="330" class="body">{escape(what[:210])}</text>
+  <text x="44" y="370" class="label">WHY IT WORKS</text>
+  <text x="44" y="396" class="body">{escape(why[:210])}</text>
+  <text x="44" y="436" class="label">SIGN-OFF</text>
+  <text x="146" y="436" class="body">{escape(str(review["correctness_signoff"]))} · {escape(performance)}</text>
+</svg>
+'''
+    path.write_text(svg)
+    return path
+
+
+def _print_result(
+    result: Any,
+    output_dir: Path,
+    result_format: str,
+    review: dict[str, Any] | None = None,
+) -> None:
     if result_format == "none":
         return
     if result_format == "full":
@@ -503,6 +737,17 @@ def _print_result(result: Any, output_dir: Path, result_format: str) -> None:
         "final_speedup": result.final.aggregate_speedup,
         "experiments": len(result.experiments),
     }
+    if review is not None:
+        summary.update(
+            {
+                "title": review["title"],
+                "correctness_signoff": review["correctness_signoff"],
+                "primary_performance": review["primary_performance"],
+                "what_changed": review["what_changed"],
+                "why_it_works": review["why_it_works"],
+                "review_summary": str(output_dir / "review_summary.txt"),
+            }
+        )
     print(json.dumps(summary, indent=2, sort_keys=True))
 
 
@@ -543,15 +788,14 @@ def main() -> int:
         model=args.model, timeout_seconds=budget.max_candidate_seconds))
     kernel_path = args.kernel.resolve()
     kernel_source = kernel_path.read_text()
-    fallback_commit_subject = f"Optimize {kernel_path.name} with TLX agent"
+    review_title = _review_title(kernel_path, target, cases)
+    commit_subject = args.commit_message or review_title
     commit_snapshot = None
     if args.commit_winner:
         try:
             commit_snapshot = prepare_auto_commit(kernel_path, kernel_source, args.vcs)
         except Exception as error:  # noqa: BLE001
-            commit_result = failed_auto_commit(
-                None, args.commit_message or fallback_commit_subject, error
-            )
+            commit_result = failed_auto_commit(None, commit_subject, error)
             _report_commit(commit_result)
             print(json.dumps(to_json_value(commit_result), indent=2, sort_keys=True))
             return 3
@@ -597,10 +841,15 @@ def main() -> int:
             target,
             budget,
             args.output_dir,
-            fallback_commit_subject,
+            review_title,
             args.commit_message,
         )
     result = KernelOptimizer(provider).optimize(request, promotion_committer)
+    review = _review_metadata(result, cases, review_title, args.output_dir)
+    _write_swimlane(review, args.output_dir)
+    args.output_dir.joinpath("review_summary.txt").write_text(
+        _format_review_summary(review)
+    )
     exit_code = 0 if result.success else 2
     if result.auto_commit is not None:
         args.output_dir.joinpath("auto_commit.json").write_text(
@@ -608,7 +857,7 @@ def main() -> int:
         )
     if result.stopping_reason in {"promotion_commit_failed", "rollback_commit_failed"}:
         exit_code = 3
-    _print_result(result, args.output_dir, args.result_format)
+    _print_result(result, args.output_dir, args.result_format, review)
     return exit_code
 
 

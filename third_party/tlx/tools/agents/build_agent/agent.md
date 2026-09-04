@@ -6,7 +6,7 @@ Wake for a candidate requiring isolated execution, a native/compiler rebuild, en
 
 ## Action space
 
-Create isolated evaluation processes; apply target environment variables; rebuild native/compiler changes when required; terminate an owned timed-out process group with SIGTERM then SIGKILL; detect environment and build failures; snapshot VCS state; and, after explicit approval, implement TL's `PR_STRATEGY` by committing only revalidated winner deltas in the specified bundle or dependency order while preserving unrelated work.
+Create isolated evaluation processes; apply target environment variables; rebuild native/compiler changes when required; terminate an owned timed-out process group with SIGTERM then SIGKILL; detect environment and build failures; snapshot VCS state; and, after explicit approval, implement TL's `PR_STRATEGY` by committing only revalidated winner deltas in the specified bundle or dependency order while preserving unrelated work. A kernel-optimization commit includes the winner, its low-key swimlane SVG, and any human-approved Knowledge Keeper patch. Its message records correctness sign-off and primary-shape performance before and after with speedup.
 
 ## Constraints
 

@@ -116,7 +116,8 @@ def profile(build_artifact, case: dict, request: dict | None = None): ...</code>
 <p>A candidate is promotable only when every protected case passes, weighted speedup reaches the configured threshold, variance stays within budget, and hardware profiling shows no material main-kernel regression. It must also beat the current best candidate.</p>
 <p>The finalist is rebuilt and revalidated with the frozen bundle. A generated <code>best_kernel.py</code> without final revalidation is not a completed run.</p>
 <h2 id="version-control-behavior">Version-control behavior</h2>
-<p>After successful final validation, TLX Agent creates a local winner commit by default. It detects Git or Mercurial from the kernel path, commits only the baseline-to-winner delta, preserves unrelated staged and dirty work, and adds <code>TLX agent authored</code> to the commit body.</p>
+<p>Each candidate that passes the promotion gates is checkpointed in a local commit before the next candidate is generated. The agent detects Git or Mercurial from the kernel path, preserves unrelated staged and dirty work, and records the change, rationale, correctness, per-shape performance, and <code>Kernel optimization agent authored</code> in each promotion commit.</p>
+<p>If final revalidation fails after promotions, the agent creates a forward rollback commit while retaining the checkpoint history for diagnosis.</p>
 <p>If the live kernel changed during the run or edits overlap unsafely, the Agent keeps the winner artifact and reports a commit failure instead of overwriting user work. Submitting, landing, or pushing the commit is always a separate explicit action.</p></article>
 <footer class="pager"><a href="tooling.html">← Tooling</a></footer>
     </main>

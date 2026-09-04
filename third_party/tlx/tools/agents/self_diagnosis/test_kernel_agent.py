@@ -4,6 +4,7 @@ import io
 import json
 import tempfile
 import unittest
+import xml.etree.ElementTree as ET
 from contextlib import redirect_stderr
 from pathlib import Path
 from unittest import mock
@@ -13,11 +14,14 @@ from third_party.tlx.tools.agents.manager import optimizer as optimizer_module
 from third_party.tlx.tools.agents.manager.cli import (
     MAX_GUIDANCE_BYTES,
     _commit_body,
+    _format_review_summary,
     _parse_args,
     _print_result,
     _resolve_guidance,
     _resolve_harness_paths,
+    _review_title,
     _validate_host_matches_target,
+    _write_swimlane,
 )
 from third_party.tlx.tools.agents.build_agent.harness import StandaloneHarness, SubprocessHarness
 from third_party.tlx.tools.agents.manager.models import (
@@ -489,6 +493,60 @@ class PriorRunEvidenceTest(unittest.TestCase):
 
 
 class CliTest(unittest.TestCase):
+    def test_review_title_uses_arch_operation_and_primary_shape(self) -> None:
+        title = _review_title(
+            Path("/repo/mm/gfx942.py"),
+            KernelTarget("hip", "gfx942"),
+            (
+                InputCase("small", {"m": 1, "n": 2, "k": 3}),
+                InputCase(
+                    "primary",
+                    {"m": 2048, "n": 10240, "k": 25408},
+                    weight=10,
+                ),
+            ),
+        )
+        self.assertEqual(title, "gfx942 mm 2048×10240×25408")
+
+    def test_review_and_commit_text_include_cause_correctness_and_perf(self) -> None:
+        review = {
+            "title": "gfx942 mm 2048×10240×25408",
+            "what_changed": ["Use a one-buffer long-K fallback."],
+            "why_it_works": ["It avoids an under-filled device-wave tail."],
+            "evidence": ["The target grid had 320 workgroups for 304 CUs."],
+            "correctness_signoff": "PASS (10/10 cases)",
+            "primary_performance": {
+                "case_id": "target",
+                "before_us": 3589.623,
+                "after_us": 2362.834,
+                "speedup": 1.5192,
+            },
+            "aggregate_speedup": 1.2461,
+            "per_case_performance": [],
+            "swimlane": "/tmp/run/swimlane.svg",
+            "knowledge": "Include approved knowledge.",
+        }
+        commit_body = _commit_body(review)
+        self.assertIn("What changed: Use a one-buffer", commit_body)
+        self.assertIn("Why it works: It avoids", commit_body)
+        self.assertIn("Correctness: PASS (10/10 cases)", commit_body)
+        self.assertIn("3589.623 us -> 2362.834 us (1.5192x)", commit_body)
+        summary = _format_review_summary(review)
+        self.assertIn("What changed", summary)
+        self.assertIn("Why it works", summary)
+        self.assertIn("Correctness", summary)
+        self.assertIn("Performance", summary)
+        self.assertIn("Swimlane: /tmp/run/swimlane.svg", summary)
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = _write_swimlane(review, Path(directory))
+            ET.parse(path)
+            svg = path.read_text()
+            self.assertIn("gfx942 mm 2048×10240×25408", svg)
+            self.assertIn("WHAT CHANGED", svg)
+            self.assertIn("WHY IT WORKS", svg)
+            self.assertIn("PASS (10/10 cases)", svg)
+
     def test_result_format_defaults_to_full(self) -> None:
         args = _parse_args(["--kernel", "kernel.py", "--output-dir", "/tmp/out"])
         self.assertEqual(args.result_format, "full")
@@ -901,37 +959,6 @@ class HarnessTest(unittest.TestCase):
         source = inspect.getsource(providers)
         self.assertNotIn("knowledge_for", source)
         self.assertNotIn("kernel_opt", source)
-
-
-class CommitBodyTest(unittest.TestCase):
-    def test_includes_winner_summary_and_per_case_perf(self) -> None:
-        baseline = _performance(("large", 100.0), ("small", 50.0))
-        final = PerformanceSummary(
-            cases=_performance(("large", 80.0), ("small", 40.0)).cases,
-            aggregate_speedup=1.25,
-        )
-        from .models import KernelOptimizationResult
-
-        result = KernelOptimizationResult(
-            success=True,
-            best_kernel="source",
-            baseline=baseline,
-            final=final,
-            experiments=(),
-            artifacts_dir=Path("/tmp/result"),
-            stopping_reason="round_budget_exhausted",
-            winner_experiment_id="r001-c000",
-            winner_commit_summary="Fold the scale into the encoded exponent.",
-        )
-        body = _commit_body(result)
-        self.assertIn("Fold the scale into the encoded exponent.", body)
-        self.assertIn("Performance:", body)
-        self.assertIn("large", body)
-        self.assertIn("100.00", body)
-        self.assertIn("80.00", body)
-        self.assertIn("1.2500x", body)
-        self.assertIn("Weighted aggregate speedup: 1.2500x", body)
-        self.assertIn("Correct", body)
 
 
 class KernelOptimizerTest(unittest.TestCase):
@@ -1749,7 +1776,6 @@ class Gfx942AttTest(unittest.TestCase):
                 entry_point="matmul",
                 kernel_regex=".*matmul.*",
                 warmup=3,
-                pin_config=None,
                 timeout_s=1,
             )
         command = run.call_args.args[0]

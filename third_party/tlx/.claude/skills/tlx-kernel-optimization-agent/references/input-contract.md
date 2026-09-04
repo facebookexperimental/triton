@@ -341,7 +341,7 @@ raise it only when the harness documents unavoidable variance.
 ```bash
 cd /home/hoy/triton-fb
 PYTHONPATH=/home/hoy/triton-fb \
-python -m third_party.tlx.tools.agents.kernel_optimization.cli \
+python -m third_party.tlx.tools.agents.manager.cli \
   --kernel /absolute/path/to/kernel.py \
   --reference-kernel /absolute/path/to/reference_kernel.py \
   --harness /absolute/path/to/target-bundle/harness.py \

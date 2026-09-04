@@ -10,7 +10,7 @@ Analyze instruction-, warp-, launch-, and workload-level evidence; identify one 
 
 ## Constraints
 
-Never modify physical FBTriton source, execute the proposed change, decide correctness/performance, publish a PR, or update durable knowledge. Never produce an intuition-only plan when the target's profiling contract requires evidence. Do not blindly merge unrelated optimizations: a combined finding requires separately validated shape-local wins, compatible invariants, a symbolic predicate justified by measured shape features, and a falsifier for every branch. PR packaging is a technical recommendation, not permission to commit or publish.
+Never modify physical kernel/compiler source, execute the proposed change, decide correctness/performance, publish a PR, or update durable knowledge. Never produce an intuition-only plan when the target's profiling contract requires evidence. Direct the Worker to remove nonessential strings, comments, docstrings, and narrative experiment history from production code. Keep source changes small and literal; retain explanatory text only when it protects a non-obvious correctness, synchronization, or hardware invariant. Do not blindly merge unrelated optimizations: a combined finding requires separately validated shape-local wins, compatible invariants, a symbolic predicate justified by measured shape features, and a falsifier for every branch. PR packaging is a technical recommendation, not permission to commit or publish.
 
 ## Callback
 
