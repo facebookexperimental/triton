@@ -350,15 +350,18 @@ void getBufferIdxAndPhase(OpBuilderWithAsyncTaskIds &builder, Operation *op,
 Value getBarrierForPipelineStage(OpBuilderWithAsyncTaskIds &builder,
                                  Value barrierAlloc, Value bufferIdx);
 
-Operation *
-optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
-                 SmallVector<triton::nvws::DescriptorLoadOp> &tmaLoads,
-                 Value barrierAlloc, Value bufferIdx, Value bufferIdxExtract,
-                 Value phase, Operation *headProducer, Operation *headConsumer,
-                 Operation *headConsumerSameLevel,
-                 ArrayRef<int> additionalConsumerTaskIds = {},
-                 DictionaryAttr consumerWaitConstraints = {},
-                 bool twoCTADirectWait = false);
+struct TMAConsumerWaitInfo {
+  AsyncTaskId taskId;
+  Operation *consumer;
+  Operation *insertionPoint;
+};
+
+Operation *optimizeTMALoads(
+    OpBuilderWithAsyncTaskIds &builder,
+    SmallVector<triton::nvws::DescriptorLoadOp> &tmaLoads, Value barrierAlloc,
+    Value bufferIdx, Value bufferIdxExtract, Value phase,
+    Operation *headProducer, ArrayRef<TMAConsumerWaitInfo> consumerWaits,
+    DictionaryAttr consumerWaitConstraints = {}, bool twoCTADirectWait = false);
 void specializeRegion(triton::FuncOp funcOp, unsigned requestedRegisters);
 Value createBufferView(OpBuilderWithAsyncTaskIds &builder, Value alloc,
                        Value idx);
