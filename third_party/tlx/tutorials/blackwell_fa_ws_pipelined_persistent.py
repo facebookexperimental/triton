@@ -72,7 +72,7 @@ configs = [
         num_stages=1,
         num_warps=4,
         pre_hook=_host_descriptor_pre_hook,
-    ) for kv in [3, 6] for grp_n in [1, 4] for (rescale_opt, where, fast_fixed) in [
+    ) for kv in [3, 6] for grp_n in [1, 2, 4, 8, 16, 32, 64] for (rescale_opt, where, fast_fixed) in [
         (False, False, True),
         (False, False, False),
         (True, False, False),
@@ -129,13 +129,24 @@ def prune_configs_by_hdim(configs, named_args, **kwargs):
     N_CTX = kwargs["N_CTX"]
     STAGE = kwargs["STAGE"]
     target_kv_buffers = 6 if HEAD_DIM == 64 else 3
-    target_group_size_n = 4 if STAGE == 3 else 1
+    if STAGE == 3:
+        h = int(named_args["H"])
+        bytes_per_head = 2 * N_CTX * HEAD_DIM * 2
+        capacity_heads = max(1, (50 * 1024 * 1024) // bytes_per_head)
+        if capacity_heads >= h:
+            l2_group_size_n = 1 << (h - 1).bit_length()
+        else:
+            l2_group_size_n = 1 << (capacity_heads.bit_length() - 1)
+        l2_group_size_n = min(64, l2_group_size_n)
+        target_group_sizes = ((4,) if h < 4 else (4, l2_group_size_n))
+    else:
+        target_group_sizes = (1,)
     pruned = []
     for conf in configs:
         kv = conf.kwargs.get("NUM_BUFFERS_KV", 0)
         grp_n = conf.kwargs.get("GROUP_SIZE_N", 0)
         is_2cta = conf.kwargs.get("NUM_CTAS", 1) > 1
-        if grp_n != target_group_size_n:
+        if grp_n not in target_group_sizes:
             continue
         if is_2cta:
             num_ctas = conf.kwargs["NUM_CTAS"]
@@ -289,13 +300,27 @@ def _compute_offsets(
     STAGE: tl.constexpr,
     GROUP_SIZE_N: tl.constexpr,
 ):
-    group_id = tile_idx // num_pid_in_group
-    first_pid_n = group_id * GROUP_SIZE_N
-    group_size_n = min(num_pid_n - first_pid_n, GROUP_SIZE_N)
-    start_m = (tile_idx % num_pid_in_group) // group_size_n
-    off_hz = first_pid_n + (tile_idx % group_size_n)
-    off_z = off_hz // H
-    off_h = off_hz % H
+    if STAGE == 3 and GROUP_SIZE_N > 4:
+        num_pid_m = tl.cdiv(N_CTX, BLOCK_M)
+        tiles_per_batch = num_pid_m * H
+        off_z = tile_idx // tiles_per_batch
+        tile_in_batch = tile_idx % tiles_per_batch
+        section_id = tile_in_batch // (num_pid_m * GROUP_SIZE_N)
+        first_head = section_id * GROUP_SIZE_N
+        group_size_n = min(H - first_head, GROUP_SIZE_N)
+        tile_in_section = tile_in_batch - section_id * num_pid_m * GROUP_SIZE_N
+        start_m = tile_in_section // group_size_n
+        off_h = first_head + tile_in_section % group_size_n
+        start_m = num_pid_m - 1 - start_m
+        off_hz = off_z * H + off_h
+    else:
+        group_id = tile_idx // num_pid_in_group
+        first_pid_n = group_id * GROUP_SIZE_N
+        group_size_n = min(num_pid_n - first_pid_n, GROUP_SIZE_N)
+        start_m = (tile_idx % num_pid_in_group) // group_size_n
+        off_hz = first_pid_n + (tile_idx % group_size_n)
+        off_z = off_hz // H
+        off_h = off_hz % H
     offset_y = off_z * (N_CTX * H) + off_h * N_CTX
     qo_offset_y = offset_y + start_m * BLOCK_M
     lo, hi = _get_fused_loop_bounds(start_m, N_CTX, BLOCK_M, STAGE)
@@ -1549,7 +1574,7 @@ def _fwd_mma_tile(
 
 @triton.autotune(
     configs=configs,
-    key=["N_CTX", "HEAD_DIM", "STAGE"],
+    key=["N_CTX", "HEAD_DIM", "H", "Z", "STAGE"],
     prune_configs_by={"early_config_prune": prune_configs_by_hdim},
 )
 @triton.jit
