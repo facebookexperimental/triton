@@ -68,16 +68,18 @@ configs = [
             "USE_WHERE": where,  # used when RESCALE_OPT is True
             "USE_WARP_BARRIER": uwb,
             "FAST_FIXED": fast_fixed,
+            "COMPACT_CLC": compact_clc,
         },
         num_stages=1,
         num_warps=4,
         pre_hook=_host_descriptor_pre_hook,
-    ) for kv in [3, 6] for grp_n in [1, 4] for (rescale_opt, where, fast_fixed) in [
+    ) for kv in [3, 6] for grp_n in [1, 2, 4, 8, 16, 32, 64] for (rescale_opt, where, fast_fixed) in [
         (False, False, True),
         (False, False, False),
         (True, False, False),
         (True, True, False),
     ] for uwb in [False, True]
+    for compact_clc in ([False, True] if grp_n > 4 and uwb and not fast_fixed else [False])
 ] + [
     triton.Config(
         {
@@ -94,6 +96,7 @@ configs = [
             "USE_WARP_BARRIER": False,
             "NUM_CTAS": 2,
             "FAST_FIXED": fast_fixed,
+            "COMPACT_CLC": False,
         },
         num_stages=1,
         num_warps=4,
@@ -129,13 +132,24 @@ def prune_configs_by_hdim(configs, named_args, **kwargs):
     N_CTX = kwargs["N_CTX"]
     STAGE = kwargs["STAGE"]
     target_kv_buffers = 6 if HEAD_DIM == 64 else 3
-    target_group_size_n = 4 if STAGE == 3 else 1
+    if STAGE == 3:
+        h = int(named_args["H"])
+        bytes_per_head = 2 * N_CTX * HEAD_DIM * 2
+        capacity_heads = max(1, (50 * 1024 * 1024) // bytes_per_head)
+        if capacity_heads >= h:
+            l2_group_size_n = 1 << (h - 1).bit_length()
+        else:
+            l2_group_size_n = 1 << (capacity_heads.bit_length() - 1)
+        l2_group_size_n = min(64, l2_group_size_n)
+        target_group_sizes = ((4,) if h < 4 else (4, l2_group_size_n))
+    else:
+        target_group_sizes = (1,)
     pruned = []
     for conf in configs:
         kv = conf.kwargs.get("NUM_BUFFERS_KV", 0)
         grp_n = conf.kwargs.get("GROUP_SIZE_N", 0)
         is_2cta = conf.kwargs.get("NUM_CTAS", 1) > 1
-        if grp_n != target_group_size_n:
+        if grp_n not in target_group_sizes:
             continue
         if is_2cta:
             num_ctas = conf.kwargs["NUM_CTAS"]
@@ -150,7 +164,15 @@ def prune_configs_by_hdim(configs, named_args, **kwargs):
     return pruned
 
 
-_S2_F16_GAUGE = tl.constexpr(0.055517269)
+_RCP_LN2 = tl.constexpr(1.4426950408889634)
+_ROUNDING_GAUGE = tl.constexpr(0.055517269)
+_BF16_FIXED_GAUGE = tl.constexpr(4.055517269)
+_CAUSAL_FIXED_GAUGE_HEADROOM = tl.constexpr(64.0)
+_EXP2_MAGIC = tl.constexpr(12582912.0)
+_EXP2_BF16_SCALE = tl.constexpr(128.0)
+_EXP2_BF16_BIAS = tl.constexpr(126.0)
+_EXP2_F16_SCALE = tl.constexpr(1024.0)
+_EXP2_F16_BIAS = tl.constexpr(14.0)
 
 
 @core.builtin
@@ -190,19 +212,17 @@ def _s2_exp2_bf16(x, a2, b2m, _semantic=None):
         """
         {
             .reg .b64 ra, rb, rc, rd;
-            .reg .b32 v0, v1, pk, zz, uu, mk, c0;
+            .reg .b32 v0, v1, pk, uu, mk, c0;
             mov.b64 ra, { $1, $2 };
             mov.b64 rb, { $3, $4 };
             mov.b64 rc, { $5, $6 };
             fma.rn.f32x2 rd, ra, rb, rc;
             mov.b64 { v0, v1 }, rd;
             prmt.b32 pk, v0, v1, 0x5410;
-            mov.b32 zz, 0;
             mov.b32 mk, 0x00400040;
             add.s16x2 uu, pk, mk;
             mov.b32 c0, 0x3f3b3f3b;
-            fma.rn.bf16x2 pk, uu, c0, pk;
-            max.bf16x2 pk, pk, zz;
+            fma.rn.relu.bf16x2 pk, uu, c0, pk;
             mov.b32 $0, pk;
         }
         """,
@@ -282,14 +302,65 @@ def _compute_offsets(
     BLOCK_M: tl.constexpr,
     STAGE: tl.constexpr,
     GROUP_SIZE_N: tl.constexpr,
+    NUM_PID_M_STATIC: tl.constexpr,
+    GRID_X_STATIC: tl.constexpr,
 ):
-    group_id = tile_idx // num_pid_in_group
-    first_pid_n = group_id * GROUP_SIZE_N
-    group_size_n = min(num_pid_n - first_pid_n, GROUP_SIZE_N)
-    start_m = (tile_idx % num_pid_in_group) // group_size_n
-    off_hz = first_pid_n + (tile_idx % group_size_n)
-    off_z = off_hz // H
-    off_h = off_hz % H
+    if STAGE == 3 and GROUP_SIZE_N > 4:
+        if GRID_X_STATIC > 0:
+            head_lane = tile_idx % GRID_X_STATIC
+            grid_row = tile_idx // GRID_X_STATIC
+            head_chunks = H // GRID_X_STATIC
+            rows_per_batch: tl.constexpr = NUM_PID_M_STATIC * head_chunks
+            off_z = grid_row // rows_per_batch
+            row_in_batch = grid_row % rows_per_batch
+            if H <= GROUP_SIZE_N:
+                m_in_section = row_in_batch // head_chunks
+                head_chunk = row_in_batch % head_chunks
+                off_h = head_chunk * GRID_X_STATIC + head_lane
+            else:
+                chunks_per_full_section: tl.constexpr = GROUP_SIZE_N // GRID_X_STATIC
+                rows_per_full_section: tl.constexpr = NUM_PID_M_STATIC * chunks_per_full_section
+                full_sections: tl.constexpr = H // GROUP_SIZE_N
+                tail_heads: tl.constexpr = H % GROUP_SIZE_N
+                if tail_heads == 0:
+                    section_id = row_in_batch // rows_per_full_section
+                    row_in_section = row_in_batch % rows_per_full_section
+                    m_in_section = row_in_section // chunks_per_full_section
+                    head_chunk = row_in_section % chunks_per_full_section
+                else:
+                    full_rows: tl.constexpr = full_sections * rows_per_full_section
+                    in_tail = row_in_batch >= full_rows
+                    full_row = row_in_batch % rows_per_full_section
+                    tail_chunks: tl.constexpr = tail_heads // GRID_X_STATIC
+                    tail_row = row_in_batch - full_rows
+                    section_id = tl.where(in_tail, full_sections, row_in_batch // rows_per_full_section)
+                    m_in_section = tl.where(in_tail, tail_row // tail_chunks,
+                                            full_row // chunks_per_full_section)
+                    head_chunk = tl.where(in_tail, tail_row % tail_chunks, full_row % chunks_per_full_section)
+                off_h = section_id * GROUP_SIZE_N + head_chunk * GRID_X_STATIC + head_lane
+            start_m = NUM_PID_M_STATIC - 1 - m_in_section
+            off_hz = off_z * H + off_h
+        else:
+            num_pid_m = tl.cdiv(N_CTX, BLOCK_M)
+            tiles_per_batch = num_pid_m * H
+            off_z = tile_idx // tiles_per_batch
+            tile_in_batch = tile_idx % tiles_per_batch
+            section_id = tile_in_batch // (num_pid_m * GROUP_SIZE_N)
+            first_head = section_id * GROUP_SIZE_N
+            group_size_n = min(H - first_head, GROUP_SIZE_N)
+            tile_in_section = tile_in_batch - section_id * num_pid_m * GROUP_SIZE_N
+            start_m = tile_in_section // group_size_n
+            off_h = first_head + tile_in_section % group_size_n
+            start_m = num_pid_m - 1 - start_m
+            off_hz = off_z * H + off_h
+    else:
+        group_id = tile_idx // num_pid_in_group
+        first_pid_n = group_id * GROUP_SIZE_N
+        group_size_n = min(num_pid_n - first_pid_n, GROUP_SIZE_N)
+        start_m = (tile_idx % num_pid_in_group) // group_size_n
+        off_hz = first_pid_n + (tile_idx % group_size_n)
+        off_z = off_hz // H
+        off_h = off_hz % H
     offset_y = off_z * (N_CTX * H) + off_h * N_CTX
     qo_offset_y = offset_y + start_m * BLOCK_M
     lo, hi = _get_fused_loop_bounds(start_m, N_CTX, BLOCK_M, STAGE)
@@ -385,7 +456,7 @@ def _fwd_softmax_tile_1cta(
                         col_limit_right = (offs_m - (start_n + fragment_id * 32) + 1)[:, None]
                         qk_fragment = _apply_causal_mask(qk_fragment, col_limit_right, 32)
                     m_i = tl.maximum(m_i, tl.max(qk_fragment, 1) * qk_scale)
-                m_i = tl.ceil(m_i) + _S2_F16_GAUGE
+                m_i = tl.ceil(m_i) + _ROUNDING_GAUGE
             l_ij = tl.zeros([BLOCK_M // 2], dtype=tl.float32)
             p_pending = tl.zeros([BLOCK_M // 2, 32], dtype=out_dtype)
             for fragment_id in tl.static_range(0, 4):
@@ -400,8 +471,8 @@ def _fwd_softmax_tile_1cta(
                 if FAST_BF16:
                     p_h = _s2_exp2_bf16(
                         qk_fragment,
-                        qk_scale * 128.0,
-                        12582912.0 + 128.0 * (126.0 - m_i[:, None]),
+                        qk_scale * _EXP2_BF16_SCALE,
+                        _EXP2_MAGIC + _EXP2_BF16_SCALE * (_EXP2_BF16_BIAS - m_i[:, None]),
                     )
                 elif STAGE == 2:
                     p_i = tl.math.exp2(_fma_f32x2(qk_fragment, qk_scale, -m_i[:, None]))
@@ -409,8 +480,8 @@ def _fwd_softmax_tile_1cta(
                 else:
                     p_h = _s2_exp2_f16(
                         qk_fragment,
-                        qk_scale * 1024.0,
-                        12582912.0 + 1024.0 * (14.0 - m_i[:, None]),
+                        qk_scale * _EXP2_F16_SCALE,
+                        _EXP2_MAGIC + _EXP2_F16_SCALE * (_EXP2_F16_BIAS - m_i[:, None]),
                     )
                 if (FAST_BF16 or FAST_F16) and fragment_id % 2 == 0:
                     p_pending = p_h
@@ -538,15 +609,6 @@ def _fwd_softmax_tile_2cta(
     for start_n in tl.range(lo, hi, BLOCK_N):
         _, qk_phase = get_bufidx_phase(accum_cnt_qk, 1)
         tlx.barrier_wait(tlx.local_view(qk_fulls, cid), qk_phase)
-        if gauge_cnt == 0:
-            for fragment_id in tl.static_range(0, 4):
-                qk_fragment = tlx.local_load(tlx.subslice(
-                    tlx.local_view(qk_tiles, cid),
-                    fragment_id * 32,
-                    32,
-                ))
-                m_i = tl.maximum(m_i, tl.max(qk_fragment, 1) * qk_scale)
-            m_i = tl.ceil(m_i) + 0.055517269
         l_ij = tl.zeros([BLOCK_M // 2], dtype=tl.float32)
         p_pending = tl.zeros([BLOCK_M // 2, 32], dtype=out_dtype)
         for fragment_id in tl.static_range(0, 4):
@@ -557,8 +619,8 @@ def _fwd_softmax_tile_2cta(
             ))
             p_h = _s2_exp2_bf16(
                 qk_fragment,
-                qk_scale * 128.0,
-                12582912.0 + 128.0 * (126.0 - m_i[:, None]),
+                qk_scale * _EXP2_BF16_SCALE,
+                _EXP2_MAGIC + _EXP2_BF16_SCALE * (_EXP2_BF16_BIAS - _BF16_FIXED_GAUGE),
             )
             if fragment_id < 2:
                 p_fragment = tlx.local_slice(
@@ -585,6 +647,10 @@ def _fwd_softmax_tile_2cta(
                     remote_cta_rank=0,
                 )
             l_ij += tl.reduce(p_h, axis=1, combine_fn=_reduce_bf16).to(tl.float32)
+            if gauge_cnt == 0:
+                m_i = tl.maximum(m_i, tl.max(qk_fragment, 1) * qk_scale)
+        if gauge_cnt == 0:
+            m_i = tl.ceil(m_i)
         l_i += l_ij
         accum_cnt_qk += 1
         gauge_cnt += 1
@@ -792,6 +858,133 @@ def _fwd_softmax_tile(
 
 
 @triton.jit
+def _fwd_fixed_2cta_control_tile(
+    tile_id,
+    tile_count,
+    accum_cnt_qk,
+    gauge_cnt,
+    sm_scale,
+    M,
+    H,
+    num_pid_n,
+    num_pid_in_group,
+    N_CTX,
+    desc_v,
+    desc_o,
+    qk_fulls,
+    qk_tiles,
+    p_fulls,
+    p_tiles,
+    acc_empties,
+    acc_tiles,
+    qk_empties,
+    o_empties,
+    o_fulls,
+    o_tiles,
+    cluster_cta_rank,
+    BLOCK_M: tl.constexpr,
+    BLOCK_M_SPLIT: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    EFFECTIVE_BLOCK_M: tl.constexpr,
+    GROUP_SIZE_N: tl.constexpr,
+    NUM_PID_M_STATIC: tl.constexpr,
+    GRID_X_STATIC: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    NUM_MMA_SLICES: tl.constexpr,
+    RESCALE_OPT: tl.constexpr,
+    STAGE: tl.constexpr,
+):
+    start_m, off_hz, lo, hi, _, _ = _compute_offsets(
+        tile_id,
+        H,
+        num_pid_n,
+        num_pid_in_group,
+        N_CTX,
+        EFFECTIVE_BLOCK_M,
+        STAGE,
+        GROUP_SIZE_N,
+        NUM_PID_M_STATIC,
+        GRID_X_STATIC,
+    )
+    m_i = tl.zeros([BLOCK_M_SPLIT], dtype=tl.float32) - float("inf")
+    l_i = tl.zeros([BLOCK_M_SPLIT], dtype=tl.float32)
+    qk_scale = sm_scale * _RCP_LN2
+    gauge_cnt -= gauge_cnt
+    cid = 0
+    offs_m = (start_m * EFFECTIVE_BLOCK_M) + (cluster_cta_rank * BLOCK_M_SPLIT +
+                                                 tl.arange(0, BLOCK_M_SPLIT))
+    if STAGE & 1:
+        m_i, l_i, accum_cnt_qk, gauge_cnt = _fwd_softmax_tile_2cta(
+            qk_fulls,
+            qk_tiles,
+            p_fulls,
+            p_tiles,
+            cid,
+            accum_cnt_qk,
+            gauge_cnt,
+            qk_scale,
+            m_i,
+            l_i,
+            start_m,
+            N_CTX,
+            tlx.dtype_of(desc_v),
+            BLOCK_M,
+            BLOCK_N,
+            NUM_MMA_SLICES,
+            STAGE=4 - STAGE,
+        )
+    if STAGE & 2:
+        m_i, l_i, accum_cnt_qk, gauge_cnt = _fwd_softmax_tile_2cta(
+            qk_fulls,
+            qk_tiles,
+            p_fulls,
+            p_tiles,
+            cid,
+            accum_cnt_qk,
+            gauge_cnt,
+            qk_scale,
+            m_i,
+            l_i,
+            start_m,
+            N_CTX,
+            tlx.dtype_of(desc_v),
+            BLOCK_M,
+            BLOCK_N,
+            NUM_MMA_SLICES,
+            STAGE=2,
+        )
+
+    tlx.barrier_arrive(qk_empties[cid], 1, remote_cta_rank=0)
+    m_out = m_i * qk_scale if RESCALE_OPT else m_i
+    l_bits = l_i.to(tl.int32, bitcast=True)
+    l_bits += (4 - m_out.to(tl.int32)) << 23
+    l_for_m = l_bits.to(tl.float32, bitcast=True)
+    m_out += _ROUNDING_GAUGE
+    tl.store(M + off_hz * N_CTX + offs_m, tl.math.log2(l_for_m) + m_out)
+    _, phase = get_bufidx_phase(tile_count, 1)
+    tlx.barrier_wait(acc_empties[cid], phase)
+    tlx.barrier_wait(o_empties[cid], phase ^ 1)
+    scale = (1 / l_i)[:, None]
+    for slice_id in tl.static_range(0, NUM_MMA_SLICES):
+        subslice = tlx.subslice(
+            acc_tiles[cid],
+            HEAD_DIM * slice_id // NUM_MMA_SLICES,
+            HEAD_DIM // NUM_MMA_SLICES,
+        )
+        acc = _mul_f32x2(tlx.local_load(subslice), scale)
+        acc = acc.to(tlx.dtype_of(desc_o))
+        subslice_o = tlx.local_slice(
+            o_tiles[cid],
+            [0, HEAD_DIM * slice_id // NUM_MMA_SLICES],
+            [BLOCK_M_SPLIT, HEAD_DIM // NUM_MMA_SLICES],
+        )
+        tlx.local_store(subslice_o, acc)
+    tlx.fence("async_shared")
+    tlx.barrier_arrive(o_fulls[cid])
+    return accum_cnt_qk, gauge_cnt
+
+
+@triton.jit
 def _fwd_control_tile(
     tile_id,
     tile_count,
@@ -821,6 +1014,8 @@ def _fwd_control_tile(
     BLOCK_N: tl.constexpr,
     EFFECTIVE_BLOCK_M: tl.constexpr,
     GROUP_SIZE_N: tl.constexpr,
+    NUM_PID_M_STATIC: tl.constexpr,
+    GRID_X_STATIC: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     NUM_CTAS: tl.constexpr,
     NUM_GROUPS_PER_CTA: tl.constexpr,
@@ -842,6 +1037,8 @@ def _fwd_control_tile(
         EFFECTIVE_BLOCK_M,
         STAGE,
         GROUP_SIZE_N,
+        NUM_PID_M_STATIC,
+        GRID_X_STATIC,
     )
     control_lo = hi if SKIP_RESCALE else lo
     # Rescale the live output accumulator when the online-softmax gauge changes.
@@ -907,7 +1104,7 @@ def _fwd_control_tile(
         else:
             tlx.barrier_arrive(qk_empties[cid])
         if RESCALE_OPT:
-            m = m * sm_scale * 1.44269504
+            m = m * sm_scale * _RCP_LN2
         m += tl.math.log2(l)
         offs_m = start_m * EFFECTIVE_BLOCK_M + group_id * BLOCK_M_SPLIT + tl.arange(0, BLOCK_M_SPLIT)
         m_ptrs = M + off_hz * N_CTX + offs_m
@@ -933,15 +1130,46 @@ def _fwd_control_tile(
                 [BLOCK_M_SPLIT, HEAD_DIM // NUM_MMA_SLICES],
             )
             tlx.local_store(subslice_o, acc)
-        tlx.fence("async_shared")
         if FUSE_EPILOG:
             qo_offset_y_split = qo_offset_y + group_id * BLOCK_M_SPLIT
-            tlx.async_descriptor_store(desc_o, o_tiles[cid], [qo_offset_y_split, 0])
+            tlx.async_descriptor_store(
+                desc_o, o_tiles[cid], [qo_offset_y_split, 0], eviction_policy="evict_first")
             tlx.async_descriptor_store_wait(0)
             tlx.barrier_arrive(o_empties[cid])
         else:
             tlx.barrier_arrive(o_fulls[cid])
     return accum_cnt
+
+
+@triton.jit
+def _fwd_load_first_k_tile(
+    accum_cnt_k,
+    lo,
+    hi,
+    kv_offset_y,
+    desc_k,
+    k_tiles,
+    k_fulls,
+    k_empties,
+    K_BYTES_PER_ELEM: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    NUM_BUFFERS_KV: tl.constexpr,
+    cluster_cta_rank,
+    NUM_CTAS: tl.constexpr,
+):
+    buf, phase = get_bufidx_phase(accum_cnt_k, NUM_BUFFERS_KV)
+    tlx.barrier_wait(k_empties[buf], phase ^ 1)
+    if cluster_cta_rank == 0:
+        tlx.barrier_expect_bytes(k_fulls[buf], K_BYTES_PER_ELEM * BLOCK_N * HEAD_DIM)
+    tlx.async_descriptor_load(
+        desc_k,
+        k_tiles[buf],
+        [kv_offset_y + cluster_cta_rank * (BLOCK_N // NUM_CTAS), 0],
+        k_fulls[buf],
+        two_ctas=True,
+    )
+    return accum_cnt_k + (hi - lo) // BLOCK_N
 
 
 @triton.jit
@@ -975,6 +1203,7 @@ def _fwd_load_tile(
     v_empties=None,
     NUM_GROUPS_PER_CTA: tl.constexpr = 2,
     NUM_CTAS: tl.constexpr = 1,
+    SKIP_FIRST_K: tl.constexpr = False,
 ):
     USE_2CTA: tl.constexpr = NUM_CTAS == 2
     # load q0
@@ -992,7 +1221,23 @@ def _fwd_load_tile(
                 q_fulls[q_id],
                 two_ctas=True,
             )
-        for _ in tl.range(lo, hi, BLOCK_N):
+        if SKIP_FIRST_K:
+            buf, phase = get_bufidx_phase(accum_cnt_kv, NUM_BUFFERS_KV)
+            tlx.barrier_wait(v_empties[buf], phase ^ 1)
+            if cluster_cta_rank == 0:
+                tlx.barrier_expect_bytes(v_fulls[buf], V_BYTES_PER_ELEM * BLOCK_N * HEAD_DIM)
+            tlx.async_descriptor_load(
+                desc_v,
+                v_tiles[buf],
+                [kv_offset_y, cluster_cta_rank * (HEAD_DIM // NUM_CTAS)],
+                v_fulls[buf],
+                two_ctas=True,
+            )
+            kv_offset_y += BLOCK_N
+            accum_cnt_kv += 1
+
+        loop_start = lo + BLOCK_N if SKIP_FIRST_K else lo
+        for _ in tl.range(loop_start, hi, BLOCK_N):
             buf, phase = get_bufidx_phase(accum_cnt_kv, NUM_BUFFERS_KV)
             tlx.barrier_wait(kv_empties[buf], phase ^ 1)
             tlx.barrier_wait(v_empties[buf], phase ^ 1)
@@ -1146,6 +1391,8 @@ def _fwd_mma_tile(
         mBarriers=[qk_fulls[0]],
         two_ctas=USE_2CTA,
     )
+    if USE_2CTA and SKIP_RESCALE and lo + BLOCK_N >= hi:
+        tlx.tcgen05_commit(q_empties[q_bufIdx], two_ctas=USE_2CTA)
 
     # -- compute q1 @ k ----
     tlx.barrier_wait(q_fulls[q_bufIdx + NUM_BUFFERS_Q], q_phase)
@@ -1158,6 +1405,8 @@ def _fwd_mma_tile(
         mBarriers=[qk_fulls[1], kv_empties[k_bufIdx]],
         two_ctas=USE_2CTA,
     )
+    if USE_2CTA and SKIP_RESCALE and lo + BLOCK_N >= hi:
+        tlx.tcgen05_commit(q_empties[q_bufIdx + NUM_BUFFERS_Q], two_ctas=USE_2CTA)
 
     _, qk_phase = get_bufidx_phase(accum_cnt_qk, 1)
 
@@ -1225,6 +1474,8 @@ def _fwd_mma_tile(
             mBarriers=[qk_fulls[0]],
             two_ctas=USE_2CTA,
         )
+        if USE_2CTA and SKIP_RESCALE and i + BLOCK_N >= hi:
+            tlx.tcgen05_commit(q_empties[q_bufIdx], two_ctas=USE_2CTA)
 
         # -- compute p1 @ v from the previous iteration----
         if USE_2CTA:
@@ -1277,6 +1528,8 @@ def _fwd_mma_tile(
             mBarriers=[qk_fulls[1], kv_empties[k_bufIdx]],
             two_ctas=USE_2CTA,
         )
+        if USE_2CTA and SKIP_RESCALE and i + BLOCK_N >= hi:
+            tlx.tcgen05_commit(q_empties[q_bufIdx + NUM_BUFFERS_Q], two_ctas=USE_2CTA)
 
         # -- compute p0 @ v ----
         # wait for the V buffer to be populated by the producer
@@ -1318,8 +1571,9 @@ def _fwd_mma_tile(
                     two_ctas=USE_2CTA,
                 )
 
-    tlx.tcgen05_commit(q_empties[q_bufIdx], two_ctas=USE_2CTA)
-    tlx.tcgen05_commit(q_empties[q_bufIdx + NUM_BUFFERS_Q], two_ctas=USE_2CTA)
+    if not SKIP_RESCALE or not USE_2CTA:
+        tlx.tcgen05_commit(q_empties[q_bufIdx], two_ctas=USE_2CTA)
+        tlx.tcgen05_commit(q_empties[q_bufIdx + NUM_BUFFERS_Q], two_ctas=USE_2CTA)
     tlx.tcgen05_commit(acc_empties[0], two_ctas=USE_2CTA)
 
     # -- compute p1 @ v ----
@@ -1368,15 +1622,15 @@ def _fwd_mma_tile(
 
 @triton.autotune(
     configs=configs,
-    key=["N_CTX", "HEAD_DIM", "STAGE"],
+    key=["N_CTX", "HEAD_DIM", "H", "Z", "STAGE"],
     prune_configs_by={"early_config_prune": prune_configs_by_hdim},
 )
 @triton.jit
 def _attn_fwd_ws(
     sm_scale,
     M,  #
-    Z,
-    H,
+    Z: tl.constexpr,
+    H: tl.constexpr,
     desc_q,
     desc_k,
     desc_v,
@@ -1400,18 +1654,22 @@ def _attn_fwd_ws(
     POLICY: tl.constexpr = POLICY_DENSE,
     DENSE_REGS: tl.constexpr = 200,
     FAST_FIXED: tl.constexpr = True,
+    NUM_PID_M_STATIC: tl.constexpr = 1,
+    GRID_X_STATIC: tl.constexpr = 1,
+    COMPACT_CLC: tl.constexpr = False,
 ):
     _attn_fwd_ws_kernel(sm_scale, M, Z, H, desc_q, desc_k, desc_v, desc_o, N_CTX, HEAD_DIM, BLOCK_M, BLOCK_N, STAGE,
                         NUM_BUFFERS_Q, NUM_BUFFERS_KV, NUM_BUFFERS_QK, NUM_MMA_GROUPS, NUM_MMA_SLICES, GROUP_SIZE_N,
-                        RESCALE_OPT, USE_WHERE, USE_WARP_BARRIER, NUM_CTAS, PIPELINED, POLICY, DENSE_REGS, FAST_FIXED)
+                        RESCALE_OPT, USE_WHERE, USE_WARP_BARRIER, NUM_CTAS, PIPELINED, POLICY, DENSE_REGS, FAST_FIXED,
+                        NUM_PID_M_STATIC, GRID_X_STATIC, COMPACT_CLC)
 
 
 @triton.jit
 def _attn_fwd_ws_kernel(
     sm_scale,
     M,  #
-    Z,
-    H,
+    Z: tl.constexpr,
+    H: tl.constexpr,
     desc_q,
     desc_k,
     desc_v,
@@ -1435,6 +1693,9 @@ def _attn_fwd_ws_kernel(
     POLICY: tl.constexpr = POLICY_DENSE,
     DENSE_REGS: tl.constexpr = 200,
     FAST_FIXED: tl.constexpr = True,
+    NUM_PID_M_STATIC: tl.constexpr = 1,
+    GRID_X_STATIC: tl.constexpr = 1,
+    COMPACT_CLC: tl.constexpr = False,
 ):
     tl.static_assert(NUM_MMA_GROUPS == 2)
     tl.static_assert(NUM_BUFFERS_QK == 1)
@@ -1449,6 +1710,19 @@ def _attn_fwd_ws_kernel(
     USE_FAST_F16: tl.constexpr = USE_FAST_FIXED and FAST_F16_CAPABLE
     FUSE_EPILOG: tl.constexpr = USE_FAST_FIXED and not USE_2CTA
     DIRECT_SCHED: tl.constexpr = USE_2CTA or USE_FAST_F16
+    USE_GRID_LPT: tl.constexpr = (
+        STAGE == 3
+        and COMPACT_CLC
+        and GROUP_SIZE_N > 4
+    )
+    LPT_GRID_X: tl.constexpr = (
+        GRID_X_STATIC
+        if USE_GRID_LPT and GRID_X_STATIC <= GROUP_SIZE_N
+        else min(GROUP_SIZE_N, GRID_X_STATIC & -GRID_X_STATIC)
+        if USE_GRID_LPT
+        else 1
+    )
+    OFFSET_GRID_X: tl.constexpr = LPT_GRID_X if USE_GRID_LPT else 0
     cluster_cta_rank = tlx.cluster_cta_rank() if USE_2CTA else 0
     is_leader = (not USE_2CTA) or (cluster_cta_rank % 2 == 0)
 
@@ -1470,12 +1744,16 @@ def _attn_fwd_ws_kernel(
     # original grid
     #   triton.cdiv(q.shape[2], META["BLOCK_M"]),
     #   q.shape[0] * q.shape[1],
-    start_pid = tl.program_id(0) // NUM_CTAS
     num_pid_m = tl.cdiv(N_CTX, EFFECTIVE_BLOCK_M)
     num_pid_n = Z * H
     num_pid_in_group = num_pid_m * GROUP_SIZE_N
     num_tiles = num_pid_m * num_pid_n
-    persistent_stride = tl.num_programs(0) // NUM_CTAS
+    if USE_GRID_LPT:
+        start_pid = tl.program_id(0) + LPT_GRID_X * tl.program_id(1)
+        persistent_stride = tl.num_programs(0) * tl.num_programs(1)
+    else:
+        start_pid = tl.program_id(0) // NUM_CTAS
+        persistent_stride = tl.num_programs(0) // NUM_CTAS
 
     # allocate SMEM buffers and barriers
     NUM_Q_BUFS: tl.constexpr = NUM_GROUPS_PER_CTA * NUM_BUFFERS_Q
@@ -1607,13 +1885,52 @@ def _attn_fwd_ws_kernel(
         # correction group
         with tlx.async_task("default"):
             accum_cnt = 0
+            accum_cnt_qk = 0
+            gauge_cnt = 0
             tile_count = 0
             tile_id = start_pid
             clc_phase_producer = 1
             clc_phase_consumer = 0
             while tile_id != -1:
                 # Publish this persistent tile, then finalize its M and O outputs.
-                if not USE_2CTA:
+                if USE_2CTA and USE_FAST_FIXED:
+                    accum_cnt_qk, gauge_cnt = _fwd_fixed_2cta_control_tile(
+                        tile_id,
+                        tile_count,
+                        accum_cnt_qk,
+                        gauge_cnt,
+                        sm_scale,
+                        M,
+                        H,
+                        num_pid_n,
+                        num_pid_in_group,
+                        N_CTX,
+                        desc_v,
+                        desc_o,
+                        qk_fulls,
+                        qk_tiles,
+                        p_fulls,
+                        p_tiles,
+                        acc_empties,
+                        acc_tiles,
+                        qk_empties,
+                        o_empties,
+                        o_fulls,
+                        o_tiles,
+                        cluster_cta_rank,
+                        BLOCK_M,
+                        BLOCK_M_SPLIT,
+                        BLOCK_N,
+                        EFFECTIVE_BLOCK_M,
+                        GROUP_SIZE_N,
+                        NUM_PID_M_STATIC,
+                        OFFSET_GRID_X,
+                        HEAD_DIM,
+                        NUM_MMA_SLICES,
+                        RESCALE_OPT,
+                        STAGE,
+                    )
+                else:
                     if not DIRECT_SCHED:
                         tlx.clc_producer(clc_context, clc_phase_producer)
                         clc_phase_producer ^= 1
@@ -1646,6 +1963,8 @@ def _attn_fwd_ws_kernel(
                         BLOCK_N,
                         EFFECTIVE_BLOCK_M,
                         GROUP_SIZE_N,
+                        NUM_PID_M_STATIC,
+                        OFFSET_GRID_X,
                         HEAD_DIM,
                         NUM_CTAS,
                         NUM_GROUPS_PER_CTA,
@@ -1663,11 +1982,22 @@ def _attn_fwd_ws_kernel(
                     next_tile_id = tile_id + persistent_stride
                     tile_id = tl.where(next_tile_id < num_tiles, next_tile_id, -1)
                 else:
-                    tile_id = tlx.clc_consumer(clc_context, clc_phase_consumer)
+                    if USE_GRID_LPT:
+                        cta_x, cta_y, cta_z = tlx.clc_consumer(
+                            clc_context, clc_phase_consumer, return_3d=True
+                        )
+                        tile_id = tl.where(
+                            cta_x >= 0,
+                            cta_x + LPT_GRID_X * (cta_y + tl.num_programs(1) * cta_z),
+                            -1,
+                        )
+                    else:
+                        tile_id = tlx.clc_consumer(clc_context, clc_phase_consumer)
                     clc_phase_consumer ^= 1
 
         # softmax groups
-        with tlx.async_task(num_warps=4, registers=DENSE_REGS if USE_2CTA else 168, replicate=NUM_GROUPS_PER_CTA):
+        with tlx.async_task(num_warps=4, registers=DENSE_REGS if USE_2CTA else 168,
+                            replicate=1 if USE_2CTA and USE_FAST_FIXED else NUM_GROUPS_PER_CTA):
             accum_cnt_qk = 0
             gauge_cnt = 0
             tile_count = 0
@@ -1685,6 +2015,8 @@ def _attn_fwd_ws_kernel(
                     EFFECTIVE_BLOCK_M,
                     STAGE,
                     GROUP_SIZE_N,
+                    NUM_PID_M_STATIC,
+                    OFFSET_GRID_X,
                 )
                 # initialize pointer to m and l
                 m_i = tl.zeros([BLOCK_M_SPLIT], dtype=tl.float32) - float("inf")
@@ -1694,11 +2026,11 @@ def _attn_fwd_ws_kernel(
                 if not USE_FAST_FIXED:
                     l_i += 1.0
                 qk_scale = sm_scale
-                qk_scale *= 1.44269504  # 1/log(2)
+                qk_scale *= _RCP_LN2
                 p_dtype = tlx.dtype_of(desc_v)
 
-                if USE_2CTA:
-                    cid = tlx.async_task_replica_id()
+                if USE_2CTA and USE_FAST_FIXED:
+                    cid = 1
                     group_id = cid * NUM_CTAS + cluster_cta_rank
                 else:
                     cid = tlx.async_task_replica_id()
@@ -1770,9 +2102,13 @@ def _attn_fwd_ws_kernel(
                 if USE_2CTA:
                     tlx.barrier_arrive(qk_empties[cid], 1, remote_cta_rank=0)
                     m_out = m_i * qk_scale if RESCALE_OPT else m_i
+                    l_bits = l_i.to(tl.int32, bitcast=True)
+                    l_bits += (4 - m_out.to(tl.int32)) << 23
+                    l_for_m = l_bits.to(tl.float32, bitcast=True)
+                    m_out += _ROUNDING_GAUGE
                     tl.store(
                         M + off_hz * N_CTX + offs_m,
-                        tl.math.log2(l_i) + m_out,
+                        tl.math.log2(l_for_m) + m_out,
                         mask=offs_m < N_CTX,
                     )
                     _, phase = get_bufidx_phase(tile_count, 1)
@@ -1796,7 +2132,6 @@ def _attn_fwd_ws_kernel(
                     tlx.fence("async_shared")
                     tlx.barrier_arrive(o_fulls[cid])
                 else:
-                    # prepare l_i for the epilog
                     tlx.local_store(l_tiles[cid], tl.join(l_i, l_i) if SCALAR_N == 2 else l_i[:, None])
                     tlx.local_store(m_tiles[cid], tl.join(m_i, m_i) if SCALAR_N == 2 else m_i[:, None])
                     tlx.barrier_arrive(l_fulls[cid])
@@ -1805,7 +2140,17 @@ def _attn_fwd_ws_kernel(
                     next_tile_id = tile_id + persistent_stride
                     tile_id = tl.where(next_tile_id < num_tiles, next_tile_id, -1)
                 else:
-                    tile_id = tlx.clc_consumer(clc_context, clc_phase_consumer)
+                    if USE_GRID_LPT:
+                        cta_x, cta_y, cta_z = tlx.clc_consumer(
+                            clc_context, clc_phase_consumer, return_3d=True
+                        )
+                        tile_id = tl.where(
+                            cta_x >= 0,
+                            cta_x + LPT_GRID_X * (cta_y + tl.num_programs(1) * cta_z),
+                            -1,
+                        )
+                    else:
+                        tile_id = tlx.clc_consumer(clc_context, clc_phase_consumer)
                     clc_phase_consumer ^= 1
 
         # mma group
@@ -1826,6 +2171,8 @@ def _attn_fwd_ws_kernel(
                     EFFECTIVE_BLOCK_M,
                     STAGE,
                     GROUP_SIZE_N,
+                    NUM_PID_M_STATIC,
+                    OFFSET_GRID_X,
                 )
                 if USE_2CTA:
                     if is_leader:
@@ -1897,8 +2244,55 @@ def _attn_fwd_ws_kernel(
                     next_tile_id = tile_id + persistent_stride
                     tile_id = tl.where(next_tile_id < num_tiles, next_tile_id, -1)
                 else:
-                    tile_id = tlx.clc_consumer(clc_context, clc_phase_consumer)
+                    if USE_GRID_LPT:
+                        cta_x, cta_y, cta_z = tlx.clc_consumer(
+                            clc_context, clc_phase_consumer, return_3d=True
+                        )
+                        tile_id = tl.where(
+                            cta_x >= 0,
+                            cta_x + LPT_GRID_X * (cta_y + tl.num_programs(1) * cta_z),
+                            -1,
+                        )
+                    else:
+                        tile_id = tlx.clc_consumer(clc_context, clc_phase_consumer)
                     clc_phase_consumer ^= 1
+
+        if USE_2CTA and USE_FAST_FIXED:
+            with tlx.async_task(num_warps=1, registers=24):
+                accum_cnt_k = 0
+                tile_id = start_pid
+                while tile_id != -1:
+                    _, _, lo, hi, _, kv_offset_y = _compute_offsets(
+                        tile_id,
+                        H,
+                        num_pid_n,
+                        num_pid_in_group,
+                        N_CTX,
+                        EFFECTIVE_BLOCK_M,
+                        STAGE,
+                        GROUP_SIZE_N,
+                        NUM_PID_M_STATIC,
+                        OFFSET_GRID_X,
+                    )
+                    accum_cnt_k = _fwd_load_first_k_tile(
+                        accum_cnt_k,
+                        lo,
+                        hi,
+                        kv_offset_y,
+                        desc_k,
+                        k_tiles,
+                        k_fulls,
+                        k_empties,
+                        K_BYTES_PER_ELEM,
+                        BLOCK_N,
+                        HEAD_DIM,
+                        NUM_BUFFERS_KV,
+                        cluster_cta_rank,
+                        NUM_CTAS,
+                    )
+                    tlx.named_barrier_wait(15, 64)
+                    next_tile_id = tile_id + persistent_stride
+                    tile_id = tl.where(next_tile_id < num_tiles, next_tile_id, -1)
 
         # Q/K/V loader role; output publication remains in the epilog task.
         with tlx.async_task(num_warps=1, registers=24):
@@ -1916,6 +2310,8 @@ def _attn_fwd_ws_kernel(
                     EFFECTIVE_BLOCK_M,
                     STAGE,
                     GROUP_SIZE_N,
+                    NUM_PID_M_STATIC,
+                    OFFSET_GRID_X,
                 )
                 if USE_2CTA:
                     accum_cnt_kv = _fwd_load_tile(
@@ -1948,7 +2344,10 @@ def _attn_fwd_ws_kernel(
                         v_empties,
                         NUM_GROUPS_PER_CTA,
                         NUM_CTAS,
+                        SKIP_FIRST_K=USE_FAST_FIXED,
                     )
+                    if USE_FAST_FIXED:
+                        tlx.named_barrier_arrive(15, 64)
                 else:
                     accum_cnt_kv = _fwd_load_tile(
                         tile_count,
@@ -1981,7 +2380,17 @@ def _attn_fwd_ws_kernel(
                     next_tile_id = tile_id + persistent_stride
                     tile_id = tl.where(next_tile_id < num_tiles, next_tile_id, -1)
                 else:
-                    tile_id = tlx.clc_consumer(clc_context, clc_phase_consumer)
+                    if USE_GRID_LPT:
+                        cta_x, cta_y, cta_z = tlx.clc_consumer(
+                            clc_context, clc_phase_consumer, return_3d=True
+                        )
+                        tile_id = tl.where(
+                            cta_x >= 0,
+                            cta_x + LPT_GRID_X * (cta_y + tl.num_programs(1) * cta_z),
+                            -1,
+                        )
+                    else:
+                        tile_id = tlx.clc_consumer(clc_context, clc_phase_consumer)
                     clc_phase_consumer ^= 1
 
         # epilog group
@@ -2002,22 +2411,48 @@ def _attn_fwd_ws_kernel(
                         EFFECTIVE_BLOCK_M,
                         STAGE,
                         GROUP_SIZE_N,
+                        NUM_PID_M_STATIC,
+                        OFFSET_GRID_X,
                     )
                     _, phase = get_bufidx_phase(tile_count, 1)
-                    for cid in tl.static_range(0, NUM_GROUPS_PER_CTA):
-                        group_id = cid * NUM_CTAS + cluster_cta_rank
-                        tlx.barrier_wait(o_fulls[cid], phase)
-                        qo_offset_y_split = qo_offset_y + group_id * BLOCK_M_SPLIT
-                        tlx.async_descriptor_store(desc_o, o_tiles[cid], [qo_offset_y_split, 0])
+                    if USE_FAST_FIXED and NUM_GROUPS_PER_CTA == 2:
+                        for cid in tl.static_range(0, NUM_GROUPS_PER_CTA):
+                            group_id = cid * NUM_CTAS + cluster_cta_rank
+                            tlx.barrier_wait(o_fulls[cid], phase)
+                            qo_offset_y_split = qo_offset_y + group_id * BLOCK_M_SPLIT
+                            tlx.async_descriptor_store(
+                                desc_o, o_tiles[cid], [qo_offset_y_split, 0], eviction_policy="evict_first")
+                        tlx.async_descriptor_store_wait(1)
+                        tlx.barrier_arrive(o_empties[0])
                         tlx.async_descriptor_store_wait(0)
-                        tlx.barrier_arrive(o_empties[cid])
+                        tlx.barrier_arrive(o_empties[1])
+                    else:
+                        for cid in tl.static_range(0, NUM_GROUPS_PER_CTA):
+                            group_id = cid * NUM_CTAS + cluster_cta_rank
+                            tlx.barrier_wait(o_fulls[cid], phase)
+                            qo_offset_y_split = qo_offset_y + group_id * BLOCK_M_SPLIT
+                            tlx.async_descriptor_store(
+                                desc_o, o_tiles[cid], [qo_offset_y_split, 0], eviction_policy="evict_first")
+                        for cid in tl.static_range(0, NUM_GROUPS_PER_CTA):
+                            tlx.async_descriptor_store_wait(NUM_GROUPS_PER_CTA - 1 - cid)
+                            tlx.barrier_arrive(o_empties[cid])
 
                     tile_count += 1
                     if DIRECT_SCHED:
                         next_tile_id = tile_id + persistent_stride
                         tile_id = tl.where(next_tile_id < num_tiles, next_tile_id, -1)
                     else:
-                        tile_id = tlx.clc_consumer(clc_context, clc_phase_consumer)
+                        if USE_GRID_LPT:
+                            cta_x, cta_y, cta_z = tlx.clc_consumer(
+                                clc_context, clc_phase_consumer, return_3d=True
+                            )
+                            tile_id = tl.where(
+                                cta_x >= 0,
+                                cta_x + LPT_GRID_X * (cta_y + tl.num_programs(1) * cta_z),
+                                -1,
+                            )
+                        else:
+                            tile_id = tlx.clc_consumer(clc_context, clc_phase_consumer)
                         clc_phase_consumer ^= 1
 
 
@@ -3273,7 +3708,7 @@ def _attn_bwd_ws(
     DIRECT_DQ_OUTPUT: tl.constexpr = SCALE_QK_IN_KERNEL
     DQ_READ_DONE_BAR: tl.constexpr = 12
     NUM_REDUCE_THREADS: tl.constexpr = 4 * 32
-    qk_scale = sm_scale * 1.4426950408889634
+    qk_scale = sm_scale * _RCP_LN2
 
     # Compute bytes per element for each tensor type
     Q_BYTES_PER_ELEM: tl.constexpr = tlx.size_of(tlx.dtype_of(desc_q))
@@ -4167,7 +4602,7 @@ def _select_forward_plan(q, k, v, causal):
         pipelined=pipelined,
         policy=policy,
         num_ctas=(2 if head_dim == 128 and q.dtype == torch.bfloat16 and not causal and q.shape == k.shape
-                  and q.shape == v.shape and (n_ctx == 1024 or n_ctx >= 4096) else 1),
+                  and q.shape == v.shape and n_ctx >= 1024 else 1),
     )
 
 
@@ -4189,7 +4624,7 @@ class _attention(torch.autograd.Function):
         # Note that on Hopper we cannot perform a FP8 dot with a non-transposed second tensor
         y_dim = q.shape[0] * q.shape[1] * q.shape[2]
 
-        use_s1_2cta = plan.num_ctas == 2
+        use_2cta = plan.num_ctas == 2
         dummy_block = [128, HEAD_DIM_K] if plan.pipelined else [1, 1]
         desc_q = TensorDescriptor(
             q,
@@ -4201,13 +4636,13 @@ class _attention(torch.autograd.Function):
             v,
             shape=[y_dim, HEAD_DIM_K],
             strides=[HEAD_DIM_K, 1],
-            block_shape=[128, 64] if use_s1_2cta else dummy_block,
+            block_shape=[128, 64] if use_2cta else dummy_block,
         )
         desc_k = TensorDescriptor(
             k,
             shape=[y_dim, HEAD_DIM_K],
             strides=[HEAD_DIM_K, 1],
-            block_shape=[64, 128] if use_s1_2cta else dummy_block,
+            block_shape=[64, 128] if use_2cta else dummy_block,
         )
         desc_o = TensorDescriptor(
             o,
@@ -4224,8 +4659,15 @@ class _attention(torch.autograd.Function):
         if plan.pipelined:
             work_ctas = (triton.cdiv(q.shape[2], FWD_BLOCK_M.value * plan.num_ctas) * q.shape[0] * q.shape[1] *
                          plan.num_ctas)
-            grid = (min(torch.cuda.get_device_properties(q.device).multi_processor_count, work_ctas)
-                    if use_s1_2cta else work_ctas, )
+            if use_2cta:
+                full_ctas = min(torch.cuda.get_device_properties(q.device).multi_processor_count, work_ctas)
+                full_clusters = full_ctas // plan.num_ctas
+                work_clusters = work_ctas // plan.num_ctas
+                persistent_waves = triton.cdiv(work_clusters, full_clusters)
+                packed_clusters = triton.cdiv(work_clusters, persistent_waves)
+                grid = (packed_clusters * plan.num_ctas, )
+            else:
+                grid = (work_ctas, )
             _attn_fwd_ws.fn[grid](
                 sm_scale,
                 M,  #
@@ -4252,18 +4694,32 @@ class _attention(torch.autograd.Function):
                 NUM_CTAS=plan.num_ctas,
                 PIPELINED=True,
                 POLICY=plan.policy,
-                DENSE_REGS=176 if use_s1_2cta else 168,
+                DENSE_REGS=176 if use_2cta else 168,
                 FAST_FIXED=True,
+                NUM_PID_M_STATIC=triton.cdiv(q.shape[2], 256 * plan.num_ctas),
+                GRID_X_STATIC=q.shape[1],
+                COMPACT_CLC=False,
                 num_stages=1,
                 num_warps=4,
-                **({"ctas_per_cga": (2, 1, 1)} if use_s1_2cta else {}),
+                **({"ctas_per_cga": (2, 1, 1)} if use_2cta else {}),
                 **extra_kern_args,
             )
         else:
 
             def grid(META):
                 num_ctas = META.get("NUM_CTAS") or 1
-                n_clusters = triton.cdiv(q.shape[2], META["BLOCK_M"] * num_ctas) * q.shape[0] * q.shape[1]
+                num_pid_m = triton.cdiv(q.shape[2], META["BLOCK_M"] * num_ctas)
+                group = META["GROUP_SIZE_N"]
+                if (
+                    causal
+                    and group > 4
+                    and META.get("COMPACT_CLC", False)
+                    and num_ctas == 1
+                ):
+                    grid_x = min(group, q.shape[1])
+                    sections = triton.cdiv(q.shape[1], group)
+                    return (grid_x, num_pid_m * sections * q.shape[0])
+                n_clusters = num_pid_m * q.shape[0] * q.shape[1]
                 return (n_clusters * num_ctas, )
 
             _attn_fwd_ws[grid](
@@ -4281,6 +4737,8 @@ class _attention(torch.autograd.Function):
                 PIPELINED=False,
                 POLICY=plan.policy,
                 DENSE_REGS=168,
+                NUM_PID_M_STATIC=triton.cdiv(q.shape[2], 256),
+                GRID_X_STATIC=q.shape[1],
                 **extra_kern_args,
             )
         ctx.grid = grid
@@ -4316,8 +4774,7 @@ class _attention(torch.autograd.Function):
             dq_accum = torch.zeros([BATCH, N_HEAD, N_CTX, ctx.HEAD_DIM], device=q.device, dtype=torch.float32)
         PRE_BLOCK = 128
         BLK_SLICE_FACTOR = 2
-        RCP_LN2 = 1.4426950408889634  # = 1.0 / ln(2)
-        arg_k = k if direct_dq_output else k * (ctx.sm_scale * RCP_LN2)
+        arg_k = k if direct_dq_output else k * (ctx.sm_scale * _RCP_LN2.value)
         assert N_CTX % PRE_BLOCK == 0
         pre_grid = (N_CTX // PRE_BLOCK, BATCH * N_HEAD)
         delta = torch.empty_like(M)
@@ -4478,8 +4935,17 @@ def attention(q, k, v, sm_scale, causal, config=None):
 
     num_ctas = config.get("NUM_CTAS", 1)
     assert q.shape[2] % (config["BLOCK_M"] * num_ctas) == 0 or num_ctas == 1
-    grid0 = (triton.cdiv(q.shape[2], config["BLOCK_M"] * num_ctas) * q.shape[0] * q.shape[1] * num_ctas)
-    grid = (grid0, 1, 1)
+    num_pid_m = triton.cdiv(q.shape[2], config["BLOCK_M"] * num_ctas)
+    if (
+        causal
+        and config["GROUP_SIZE_N"] > 4
+        and config.get("COMPACT_CLC", False)
+        and num_ctas == 1
+    ):
+        grid = _compact_clc_grid(q.shape[1], config["GROUP_SIZE_N"], num_pid_m, q.shape[0])
+    else:
+        grid0 = num_pid_m * q.shape[0] * q.shape[1] * num_ctas
+        grid = (grid0, 1, 1)
     launch_kwargs = {}
     if num_ctas > 1:
         launch_kwargs["ctas_per_cga"] = (num_ctas, 1, 1)
@@ -4495,6 +4961,8 @@ def attention(q, k, v, sm_scale, causal, config=None):
         N_CTX=q.shape[2],
         HEAD_DIM=HEAD_DIM_K,
         STAGE=stage,
+        NUM_PID_M_STATIC=num_pid_m,
+        GRID_X_STATIC=q.shape[1],
         num_stages=1,
         **launch_kwargs,
         **config,

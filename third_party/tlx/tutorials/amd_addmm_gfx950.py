@@ -48,6 +48,7 @@ def _path_key(
     a: torch.Tensor,
     b: torch.Tensor,
     split_k,
+    config,
 ) -> tuple[object, ...]:
     return (
         a.device.type,
@@ -59,6 +60,7 @@ def _path_key(
         a.stride(),
         b.stride(),
         split_k,
+        tuple(sorted(config.items())) if config is not None else None,
     )
 
 
@@ -167,13 +169,14 @@ def _autotune_path(
     a: torch.Tensor,
     b: torch.Tensor,
     split_k,
+    config=None,
 ) -> str:
-    key = _path_key(bias, a, b, split_k)
+    key = _path_key(bias, a, b, split_k, config)
     cached = _PATH_CACHE.get(key)
     if cached is not None:
         return cached
 
-    register = lambda: _launch_register(a, b, bias=bias)
+    register = lambda: _launch_register(a, b, bias=bias, config=config)
     register_output = register()
     candidates = {"register": register}
     if _can_use_inter_wave(a):
@@ -236,4 +239,11 @@ def addmm(bias: torch.Tensor, a: torch.Tensor, b: torch.Tensor, SPLIT_K=None, pa
         if path not in valid:
             raise ValueError(f"Path {path!r} is not valid for this shape; valid paths are {valid}")
         return _dispatch(path, bias_2d, a, b, SPLIT_K, config=config)
-    return _dispatch(_autotune_path(bias_2d, a, b, SPLIT_K), bias_2d, a, b, SPLIT_K, config=config)
+    return _dispatch(
+        _autotune_path(bias_2d, a, b, SPLIT_K, config=config),
+        bias_2d,
+        a,
+        b,
+        SPLIT_K,
+        config=config,
+    )
