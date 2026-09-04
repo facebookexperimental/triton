@@ -124,11 +124,12 @@ static Value findWhileIterationCounter(scf::WhileOp whileOp) {
   return {};
 }
 
-// Compute the rendezvous phase from loops that execute within the lifetime of
-// the barrier. phaseScope is the operation containing the barrier allocation;
-// loops outside it reinitialize the barrier and must not affect its phase.
-static Value computeBarrierPhase(OpBuilder &builder, Location loc,
-                                 Operation *mma, Operation *phaseScope) {
+// Linearized iteration index across the loops that execute within the lifetime
+// of the barrier. phaseScope is the operation containing the barrier
+// allocation; loops outside it reinitialize the barrier and must not
+// contribute. Returns null when no enclosing loop contributes an index.
+static Value computeLinearBarrierIter(OpBuilder &builder, Location loc,
+                                      Operation *mma, Operation *phaseScope) {
   Value linearIter;
   Value stride = arith::ConstantIntOp::create(builder, loc, 1, 64);
   for (Operation *parent = mma->getParentOp(); parent && parent != phaseScope;
@@ -159,28 +160,132 @@ static Value computeBarrierPhase(OpBuilder &builder, Location loc,
     stride = arith::MulIOp::create(builder, loc, stride, tripCount);
   }
 
-  if (!linearIter)
-    return arith::ConstantIntOp::create(builder, loc, 0, 32);
+  return linearIter;
+}
 
-  Value two = arith::ConstantIntOp::create(builder, loc, 2, 64);
-  Value rem = arith::RemUIOp::create(builder, loc, linearIter, two);
-  return arith::TruncIOp::create(builder, loc, builder.getI32Type(), rem);
+// Slot and phase for a `depth`-deep barrier array, matching how the operand
+// SMEM buffers rotate: slot = iter % depth, phase = (iter / depth) & 1.
+struct SlotAndPhase {
+  Value slot;  // i32 in [0, depth); null when depth == 1 (always slot 0)
+  Value phase; // i32, 0 or 1
+};
+
+static SlotAndPhase computeSlotAndPhase(OpBuilder &builder, Location loc,
+                                        Value linearIter, unsigned depth) {
+  auto i32Ty = builder.getI32Type();
+  if (!linearIter) {
+    Value zero = arith::ConstantIntOp::create(builder, loc, 0, 32);
+    return {zero, zero};
+  }
+  Value one = arith::ConstantIntOp::create(builder, loc, 1, 64);
+  // Single-buffered: the only slot is 0, left null so the caller uses the base
+  // index directly, and the phase is the raw parity. Emit it exactly as the
+  // single-slot barrier always did, so depth-1 kernels keep identical IR.
+  if (depth == 1) {
+    Value two = arith::ConstantIntOp::create(builder, loc, 2, 64);
+    Value rem = arith::RemUIOp::create(builder, loc, linearIter, two);
+    return {/*slot=*/Value(),
+            arith::TruncIOp::create(builder, loc, i32Ty, rem)};
+  }
+  Value depthVal = arith::ConstantIntOp::create(builder, loc, depth, 64);
+  Value slot = arith::RemUIOp::create(builder, loc, linearIter, depthVal);
+  Value gen = arith::DivUIOp::create(builder, loc, linearIter, depthVal);
+  Value phase = arith::AndIOp::create(builder, loc, gen, one);
+  return {arith::TruncIOp::create(builder, loc, i32Ty, slot),
+          arith::TruncIOp::create(builder, loc, i32Ty, phase)};
+}
+
+// Walk a memdesc value back to the MemDescIndexOp that selects its buffer,
+// looking through the view ops that preserve the underlying allocation. The set
+// matches the other view walkers in this backend -- memDescRoot in
+// WSCodePartition.cpp and getRootBuffer in CodePartitionUtility.cpp -- and it
+// has to: a transposed B operand reaches the MMA through a memdesc_trans, and
+// stopping there would report it as unbuffered and shrink the barrier back to
+// one slot, which is the deadlock this pass exists to prevent.
+static ttg::MemDescIndexOp findBufferIndex(Value v) {
+  while (v) {
+    Operation *def = v.getDefiningOp();
+    if (!def)
+      return {};
+    if (auto idxOp = dyn_cast<ttg::MemDescIndexOp>(def))
+      return idxOp;
+    if (isa<ttg::MemDescTransOp, ttg::MemDescSubsliceOp, ttg::MemDescReshapeOp,
+            ttg::MemDescReinterpretOp>(def)) {
+      v = def->getOperand(0);
+      continue;
+    }
+    return {};
+  }
+  return {};
+}
+
+// Buffer count of the allocation behind `v`. Returns 0 when it is not a view
+// into a buffer array -- i.e. a single, non-rotating buffer.
+static unsigned getAllocDepth(Value v) {
+  auto idxOp = findBufferIndex(v);
+  if (!idxOp)
+    return 0;
+  auto srcTy = cast<ttg::MemDescType>(idxOp.getSrc().getType());
+  return srcTy.getRank() > 0 ? srcTy.getShape()[0] : 0;
+}
+
+// The cross-CTA barrier must rotate over as many slots as the MMA's operand
+// SMEM buffers: the follower CTA can run ahead by up to that depth (its loads
+// are gated on the leader's MMA releasing a slot), and a shallower barrier
+// would let it lap the phase bit and deadlock the pair. Mirrors TLX, which
+// allocates its 2-CTA barrier with NUM_SMEM_BUFFERS slots.
+static unsigned getOperandPipelineDepth(ttng::MMAv5OpInterface mma) {
+  // Floor of 1: operands that are not multi-buffered cannot be produced ahead,
+  // so the follower cannot drift and a single slot is correct.
+  unsigned depth = 1;
+  auto consider = [&](Value v) { depth = std::max(depth, getAllocDepth(v)); };
+  consider(mma.getA());
+  consider(mma.getB());
+  // The MMA's completion barriers are allocated at the same channel depth.
+  for (Value bar : mma.getCompletionBarriers())
+    consider(bar);
+
+  // Cross-check the planner's own annotation when it is still present; they
+  // are emitted together, so a mismatch means something rewrote one of them.
+  if (auto idxOp = findBufferIndex(mma.getB())) {
+    if (auto *allocOp = idxOp.getSrc().getDefiningOp()) {
+      if (auto copies = allocOp->getAttrOfType<IntegerAttr>("buffer.copy")) {
+        unsigned annotated = copies.getInt();
+        if (annotated > depth) {
+          // Should not happen (both are emitted from the planner's numCopies),
+          // but trust the larger value: too few slots deadlocks the CTA pair.
+          allocOp->emitWarning()
+              << "buffer.copy=" << annotated << " exceeds allocation depth "
+              << depth << "; 2-CTA sync uses buffer.copy";
+          depth = annotated;
+        }
+      }
+    }
+  }
+  return depth;
 }
 
 // Insert the "arrive remote, wait local" cross-CTA sync ops before a 2-CTA
 // MMA. The barrier must be allocated externally (before the containing loop
 // if the MMA is in a loop).
-static void insertSyncBeforeMMA(ttng::TCGen5MMAOp mma, Value barrierAlloc,
-                                Operation *phaseScope,
-                                unsigned barrierIdx = 0) {
-  MLIRContext *ctx = mma.getContext();
-  Location loc = mma.getLoc();
+static void insertSyncBeforeMMA(ttng::MMAv5OpInterface mma, Value barrierAlloc,
+                                Operation *phaseScope, unsigned baseIdx,
+                                unsigned depth) {
+  MLIRContext *ctx = mma->getContext();
+  Location loc = mma->getLoc();
   OpBuilder builder(mma);
   auto i32Ty = builder.getI32Type();
 
-  // Get this MMA's barrier view from the per-loop barrier allocation.
+  // This MMA owns `depth` consecutive slots starting at baseIdx, rotating with
+  // its operand buffers so a follower CTA that runs ahead lands on a distinct
+  // slot instead of lapping a single barrier's phase bit.
+  Value linearIter = computeLinearBarrierIter(builder, loc, mma, phaseScope);
+  SlotAndPhase sp = computeSlotAndPhase(builder, loc, linearIter, depth);
+  Value idx = arith::ConstantIntOp::create(builder, loc, baseIdx, 32);
+  if (depth > 1)
+    idx = arith::AddIOp::create(builder, loc, idx, sp.slot);
   Value barrierView =
-      triton::createSingleBufferView(builder, barrierAlloc, barrierIdx);
+      triton::createSingleBufferView(builder, barrierAlloc, idx);
 
   // Get CTA rank within the cluster.
   Value ctaRank = nvgpu::ClusterCTAIdOp::create(builder, loc, i32Ty);
@@ -205,10 +310,6 @@ static void insertSyncBeforeMMA(ttng::TCGen5MMAOp mma, Value barrierAlloc,
   // Both CTAs arrive on leader's barrier (count=1 each, total=2).
   ttng::ArriveBarrierOp::create(builder, loc, remoteBar, /*count=*/1u);
 
-  // Compute phase from iterations within the barrier's lifetime.
-  // WaitBarrierOp expects I32 for the phase parameter.
-  Value phase = computeBarrierPhase(builder, loc, mma, phaseScope);
-
   // Only leader CTA waits: pred = (ctaRank % 2 == 0).
   Value two = arith::ConstantIntOp::create(builder, loc, 2, 32);
   Value zero = arith::ConstantIntOp::create(builder, loc, 0, 32);
@@ -220,7 +321,7 @@ static void insertSyncBeforeMMA(ttng::TCGen5MMAOp mma, Value barrierAlloc,
   // PTX mbarrier.try_wait only supports .shared (local), not .shared::cluster.
   // The local barrier IS the leader's barrier — both CTAs arrived on it via
   // the remote mapping, so the leader can wait on it locally.
-  ttng::WaitBarrierOp::create(builder, loc, barrierView, phase, isLeader);
+  ttng::WaitBarrierOp::create(builder, loc, barrierView, sp.phase, isLeader);
 
   LDBG("Inserted cross-CTA sync before MMA at " << loc);
 }
@@ -239,8 +340,8 @@ struct Insert2CTASync : public impl::NVGPUInsert2CTASyncBase<Insert2CTASync> {
       return;
 
     // Collect 2-CTA MMA ops that need cross-CTA sync insertion.
-    SmallVector<ttng::TCGen5MMAOp> twoCTAMMAOps;
-    moduleOp->walk([&](ttng::TCGen5MMAOp mma) {
+    SmallVector<ttng::MMAv5OpInterface> twoCTAMMAOps;
+    moduleOp->walk([&](ttng::MMAv5OpInterface mma) {
       if (mma.getTwoCtas())
         twoCTAMMAOps.push_back(mma);
     });
@@ -252,8 +353,8 @@ struct Insert2CTASync : public impl::NVGPUInsert2CTASyncBase<Insert2CTASync> {
 
     // Group MMAs by their containing scf.for loop. Allocate one cross-CTA
     // barrier slot per MMA in each loop.
-    DenseMap<Operation *, SmallVector<ttng::TCGen5MMAOp>> loopToMMAs;
-    SmallVector<ttng::TCGen5MMAOp> nonLoopMMAs;
+    DenseMap<Operation *, SmallVector<ttng::MMAv5OpInterface>> loopToMMAs;
+    SmallVector<ttng::MMAv5OpInterface> nonLoopMMAs;
 
     for (auto mma : twoCTAMMAOps) {
       auto forOp = mma->getParentOfType<scf::ForOp>();
@@ -281,7 +382,15 @@ struct Insert2CTASync : public impl::NVGPUInsert2CTASyncBase<Insert2CTASync> {
       // from the producer warp group initializes it).
       Value barrierAlloc;
       Operation *phaseScope;
-      unsigned numBarriers = mmas.size();
+      // Each MMA gets `depth` consecutive slots, where depth is its operand
+      // pipeline depth: that is the furthest a follower CTA can drift.
+      SmallVector<unsigned> depths;
+      unsigned numBarriers = 0;
+      for (auto mma : mmas) {
+        unsigned d = getOperandPipelineDepth(mma);
+        depths.push_back(d);
+        numBarriers += d;
+      }
       auto wsOp = forOp->getParentOfType<ttg::WarpSpecializeOp>();
       if (!wsOp) {
         // Pre-WS path: standard alloc before the for loop.
@@ -348,8 +457,12 @@ struct Insert2CTASync : public impl::NVGPUInsert2CTASyncBase<Insert2CTASync> {
         phaseScope = wsOp->getParentOp();
       }
 
-      for (unsigned i = 0; i < numBarriers; ++i)
-        insertSyncBeforeMMA(mmas[i], barrierAlloc, phaseScope, i);
+      unsigned baseIdx = 0;
+      for (auto [mma, depth] : llvm::zip(mmas, depths)) {
+        LDBG("  MMA slots [" << baseIdx << ", " << baseIdx + depth << ")");
+        insertSyncBeforeMMA(mma, barrierAlloc, phaseScope, baseIdx, depth);
+        baseIdx += depth;
+      }
     }
 
     // Process standalone MMAs (rare: single-iteration epilogue).
@@ -391,7 +504,8 @@ struct Insert2CTASync : public impl::NVGPUInsert2CTASyncBase<Insert2CTASync> {
                                                   /*arriveCount=*/2);
         phaseScope = mma->getParentOp();
       }
-      insertSyncBeforeMMA(mma, barrierAlloc, phaseScope);
+      insertSyncBeforeMMA(mma, barrierAlloc, phaseScope, /*baseIdx=*/0,
+                          /*depth=*/1);
     }
   }
 };

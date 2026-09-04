@@ -369,6 +369,11 @@ def NVGPUInsert2CTASync : Pass<"nvgpu-insert-2cta-sync", "mlir::ModuleOp"> {
     This pattern is compatible with warp specialization because the sync
     ops are inserted after the pipeline pass, and the MMA hardware handles
     the actual cross-CTA execution synchronization.
+
+    The barrier is multi-buffered to the depth of the MMA's SMEM operand
+    buffers and indexed by the same slot/phase, so a follower CTA that runs
+    ahead within the operand pipeline lands on a distinct slot instead of
+    lapping a single barrier's phase bit.
   }];
 
   let dependentDialects = [

@@ -235,3 +235,143 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
+
+// -----
+
+// Multi-buffered operands: the cross-CTA barrier must be allocated at the same
+// depth as the operand buffers and indexed by the same rotating slot/phase.
+// With a single slot and a bare parity phase, a follower CTA that runs ahead
+// within the operand pipeline laps the phase bit and the CTA pair deadlocks.
+
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#shared1 = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = true, elementBitWidth = 16}>
+#smem = #ttg.shared_memory
+#tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
+
+// CHECK-LABEL: @test_2cta_sync_multibuffered_operands
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32, "ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32} {
+  tt.func @test_2cta_sync_multibuffered_operands(
+      %abuf: !ttg.memdesc<3x128x64xf16, #shared, #smem, mutable>,
+      %bbuf: !ttg.memdesc<3x64x128xf16, #shared1, #smem, mutable>,
+      %acc: !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>,
+      %acc_tok: !ttg.async.token) {
+    %true = arith.constant true
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c4 = arith.constant 4 : index
+    %c0_i32 = arith.constant 0 : i32
+    // Barrier array is 3 deep (matching the operand buffers), not 1.
+    // CHECK: %[[BARS:.*]] = ttg.local_alloc : () -> !ttg.memdesc<3x1xi64
+    // CHECK-COUNT-3: ttng.init_barrier %{{.*}}, 2
+    // CHECK: scf.for
+    // Slot = iter % 3, phase = (iter / 3) & 1 -- not a bare parity.
+    // CHECK:   %[[D:.*]] = arith.constant 3 : i64
+    // CHECK:   %[[SLOT:.*]] = arith.remui %{{.*}}, %[[D]]
+    // CHECK:   %[[GEN:.*]] = arith.divui %{{.*}}, %[[D]]
+    // CHECK:   arith.andi %[[GEN]]
+    // CHECK:   %[[IDX:.*]] = arith.addi
+    // CHECK:   %[[BAR:.*]] = ttg.memdesc_index %[[BARS]][%[[IDX]]]
+    // CHECK:   ttng.map_to_remote_buffer %[[BAR]]
+    // CHECK:   ttng.arrive_barrier
+    // CHECK:   ttng.wait_barrier %[[BAR]]
+    // CHECK:   ttng.tc_gen5_mma
+    scf.for %iv = %c0 to %c4 step %c1 {
+      %a = ttg.memdesc_index %abuf[%c0_i32] : !ttg.memdesc<3x128x64xf16, #shared, #smem, mutable> -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+      %b = ttg.memdesc_index %bbuf[%c0_i32] : !ttg.memdesc<3x64x128xf16, #shared1, #smem, mutable> -> !ttg.memdesc<64x128xf16, #shared1, #smem, mutable>
+      %tok = ttng.tc_gen5_mma %a, %b, %acc[%acc_tok], %true, %true {two_ctas} :
+        !ttg.memdesc<128x64xf16, #shared, #smem, mutable>,
+        !ttg.memdesc<64x128xf16, #shared1, #smem, mutable>,
+        !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+    }
+    tt.return
+  }
+}
+
+// -----
+
+// The pass must reach tc_gen5_mma_scaled too, not just the plain MMA. It walks
+// MMAv5OpInterface for exactly this reason: a 2-CTA scaled MMA that gets no
+// rendezvous runs the collective MMA without waiting for the peer's B half.
+#shared_s = #ttg.nvmma_shared<{swizzlingByteWidth = 64, transposed = false, elementBitWidth = 8}>
+#smem_s = #ttg.shared_memory
+#tmem_s = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1, twoCTAs = true>
+#tmem_scales_s = #ttng.tensor_memory_scales_encoding<>
+
+// CHECK-LABEL: @test_2cta_sync_scaled_mma
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32, "ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32} {
+  tt.func @test_2cta_sync_scaled_mma(
+      %abuf: !ttg.memdesc<2x128x64xi8, #shared_s, #smem_s, mutable>,
+      %bbuf: !ttg.memdesc<2x64x64xi8, #shared_s, #smem_s, mutable>,
+      %sa: !ttg.memdesc<128x2xi8, #tmem_scales_s, #ttng.tensor_memory>,
+      %sb: !ttg.memdesc<128x2xi8, #tmem_scales_s, #ttng.tensor_memory>,
+      %acc: !ttg.memdesc<128x128xf32, #tmem_s, #ttng.tensor_memory, mutable>,
+      %acc_tok: !ttg.async.token) {
+    %true = arith.constant true
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c4 = arith.constant 4 : index
+    %c0_i32 = arith.constant 0 : i32
+    // Barrier array matches the depth-2 operand buffers, and the rendezvous is
+    // emitted before the scaled MMA.
+    // CHECK: %[[BARS:.*]] = ttg.local_alloc : () -> !ttg.memdesc<2x1xi64
+    // CHECK-COUNT-2: ttng.init_barrier %{{.*}}, 2
+    // CHECK: scf.for
+    // CHECK:   %[[BAR:.*]] = ttg.memdesc_index %[[BARS]]
+    // CHECK:   ttng.map_to_remote_buffer %[[BAR]]
+    // CHECK:   ttng.arrive_barrier
+    // CHECK:   ttng.wait_barrier %[[BAR]]
+    // CHECK:   ttng.tc_gen5_mma_scaled
+    scf.for %iv = %c0 to %c4 step %c1 {
+      %a = ttg.memdesc_index %abuf[%c0_i32] : !ttg.memdesc<2x128x64xi8, #shared_s, #smem_s, mutable> -> !ttg.memdesc<128x64xi8, #shared_s, #smem_s, mutable>
+      %b = ttg.memdesc_index %bbuf[%c0_i32] : !ttg.memdesc<2x64x64xi8, #shared_s, #smem_s, mutable> -> !ttg.memdesc<64x64xi8, #shared_s, #smem_s, mutable>
+      %tok = ttng.tc_gen5_mma_scaled %a, %b, %acc[%acc_tok], %sa, %sb, %true, %true lhs = e4m3 rhs = e4m3 {two_ctas} :
+        !ttg.memdesc<128x64xi8, #shared_s, #smem_s, mutable>,
+        !ttg.memdesc<64x64xi8, #shared_s, #smem_s, mutable>,
+        !ttg.memdesc<128x128xf32, #tmem_s, #ttng.tensor_memory, mutable>,
+        !ttg.memdesc<128x2xi8, #tmem_scales_s, #ttng.tensor_memory>,
+        !ttg.memdesc<128x2xi8, #tmem_scales_s, #ttng.tensor_memory>
+    }
+    tt.return
+  }
+}
+
+// -----
+
+// B is multi-buffered but reaches the MMA through a memdesc_trans, and A is
+// single-buffered so nothing else supplies the depth. The view walk has to
+// follow the trans or the barrier collapses to one slot and the pair can lap
+// the phase bit -- the deadlock this pass prevents.
+#shared_t = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#shared_tb = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = true, elementBitWidth = 16}>
+#smem_t = #ttg.shared_memory
+#tmem_t = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
+
+// CHECK-LABEL: @test_2cta_sync_transposed_b_depth
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32, "ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32} {
+  tt.func @test_2cta_sync_transposed_b_depth(
+      %a: !ttg.memdesc<128x64xf16, #shared_t, #smem_t, mutable>,
+      %bbuf: !ttg.memdesc<4x128x64xf16, #shared_t, #smem_t, mutable>,
+      %acc: !ttg.memdesc<128x128xf32, #tmem_t, #ttng.tensor_memory, mutable>,
+      %acc_tok: !ttg.async.token) {
+    %true = arith.constant true
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c8 = arith.constant 8 : index
+    %c0_i32 = arith.constant 0 : i32
+    // Depth must come from B through the trans: 4 slots, not 1.
+    // CHECK: ttg.local_alloc : () -> !ttg.memdesc<4x1xi64
+    // CHECK: %[[D:.*]] = arith.constant 4 : i64
+    // CHECK: arith.remui %{{.*}}, %[[D]]
+    // CHECK: arith.divui %{{.*}}, %[[D]]
+    // CHECK: ttng.tc_gen5_mma
+    scf.for %iv = %c0 to %c8 step %c1 {
+      %bslot = ttg.memdesc_index %bbuf[%c0_i32] : !ttg.memdesc<4x128x64xf16, #shared_t, #smem_t, mutable> -> !ttg.memdesc<128x64xf16, #shared_t, #smem_t, mutable>
+      %bt = ttg.memdesc_trans %bslot {order = array<i32: 1, 0>} : !ttg.memdesc<128x64xf16, #shared_t, #smem_t, mutable> -> !ttg.memdesc<64x128xf16, #shared_tb, #smem_t, mutable>
+      %tok = ttng.tc_gen5_mma %a, %bt, %acc[%acc_tok], %true, %true {two_ctas} :
+        !ttg.memdesc<128x64xf16, #shared_t, #smem_t, mutable>,
+        !ttg.memdesc<64x128xf16, #shared_tb, #smem_t, mutable>,
+        !ttg.memdesc<128x128xf32, #tmem_t, #ttng.tensor_memory, mutable>
+    }
+    tt.return
+  }
+}
