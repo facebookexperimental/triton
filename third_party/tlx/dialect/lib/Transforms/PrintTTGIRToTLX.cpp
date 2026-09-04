@@ -872,6 +872,19 @@ static Value resolveThroughCasts(Value v) {
   return v;
 }
 
+// An scf loop's region arguments are bound in the emitted Python, by the
+// iter_args init line and the body's parallel copies; captures are not.
+static bool isLoopCarriedBlockArg(Value v) {
+  auto blockArg = dyn_cast<BlockArgument>(v);
+  if (!blockArg)
+    return false;
+  Operation *parent = blockArg.getOwner()->getParentOp();
+  if (!parent)
+    return false;
+  StringRef parentName = parent->getName().getStringRef();
+  return parentName == "scf.for" || parentName == "scf.while";
+}
+
 // Forward declarations
 void printRegion(Region &region, llvm::raw_ostream &os,
                  const llvm::StringMap<StringRef> &opNameMap,
@@ -977,7 +990,8 @@ void printForOp(Operation *op, llvm::raw_ostream &os,
     // and need proper initialization (e.g., from ub.poison in the TTIR).
     // Detect by checking: no defining op + is BlockArgument + is tensor/f32
     bool needsInit = false;
-    if (!resolved.getDefiningOp() && isa<BlockArgument>(resolved)) {
+    if (!resolved.getDefiningOp() && isa<BlockArgument>(resolved) &&
+        !isLoopCarriedBlockArg(resolved)) {
       Type type = resolved.getType();
       if (isa<RankedTensorType>(type) || type.isF32())
         needsInit = true;
