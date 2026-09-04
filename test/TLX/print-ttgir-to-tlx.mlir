@@ -1126,3 +1126,53 @@ module {
     tt.return %result : i32
   }
 }
+
+// -----
+
+// A loop whose iter_arg is initialized from a previous loop's result must carry
+// that accumulator over, not be re-initialized.
+//
+// The printer synthesizes an initializer for a block argument that has no
+// defining op, because a warp_specialize region capture is not bound anywhere
+// in the emitted Python. An scf loop's iter_arg is also a block argument with
+// no defining op, but it *is* bound -- by the init line above the loop and the
+// parallel copies at the end of the body. Chaining two loops makes the second
+// loop's init resolve, through the warp_specialize substitution map, onto the
+// first loop's iter_arg, so the synthetic initializer would overwrite a live
+// accumulator with -inf.
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: def ws_chained_loops(
+  // CHECK: [[ACC:[a-z0-9_]+]] = cst
+  // CHECK: for {{[a-z0-9_]+}} in range(
+  // CHECK: [[ACC]] = {{[a-z0-9_]+}}
+  // The carry between the two loops, and not a fresh -inf tensor.
+  // CHECK: [[ACC]] = [[ACC]]
+  // CHECK-NOT: tl.full({{.*}}-inf
+  // CHECK: for {{[a-z0-9_]+}} in range(
+  tt.func public @ws_chained_loops(%n: i32) attributes {noinline = false} {
+    ttg.warp_specialize(%n) attributes {requestedRegisters = array<i32: 24>}
+    default {
+      %c0_i32 = arith.constant 0 : i32
+      %c1_i32 = arith.constant 1 : i32
+      %zero = arith.constant dense<0.000000e+00> : tensor<256xf32, #blocked>
+      %one = arith.constant dense<1.000000e+00> : tensor<256xf32, #blocked>
+      %l1 = scf.for %i = %c0_i32 to %n step %c1_i32 iter_args(%acc = %zero)
+          -> (tensor<256xf32, #blocked>) : i32 {
+        %a = arith.addf %acc, %one : tensor<256xf32, #blocked>
+        scf.yield %a : tensor<256xf32, #blocked>
+      }
+      %l2 = scf.for %j = %c0_i32 to %n step %c1_i32 iter_args(%acc2 = %l1)
+          -> (tensor<256xf32, #blocked>) : i32 {
+        %b = arith.mulf %acc2, %one : tensor<256xf32, #blocked>
+        scf.yield %b : tensor<256xf32, #blocked>
+      }
+      ttg.warp_yield
+    }
+    partition0(%arg0: i32) num_warps(1) {
+      ttg.warp_return
+    } : (i32) -> ()
+    tt.return
+  }
+}
