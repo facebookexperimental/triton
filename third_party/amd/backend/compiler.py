@@ -484,6 +484,16 @@ class HIPBackend(BaseBackend):
         pm = ir.pass_manager(mod.context)
         pm.enable_debug()
         amd.passes.ttgpuir.add_update_async_wait_count(pm, options.arch)
+        # Print TTGIR to TLX mapping before final emission (for debugging/analysis)
+        tlx_dump_dir = None
+        tlx_saved_fd = None
+        tlx_capture_file = None
+        if knobs.compilation.dump_tlx_benchmark:
+            from triton.tools.tlx_benchmark_gen import setup_tlx_dump
+
+            tlx_dump_dir, tlx_saved_fd, tlx_capture_file = setup_tlx_dump(pm, tlx.tlx_passes)
+        elif knobs.compilation.dump_ttgir_to_tlx:
+            tlx.tlx_passes.add_tlx_print_ttgir_to_tlx(pm)
         amd.passes.ttgpuir.add_warp_pipeline_conversion(pm, options.arch)
         passes.convert.add_scf_to_cf(pm)
         passes.gluon.add_inliner(pm)
@@ -533,7 +543,15 @@ class HIPBackend(BaseBackend):
 
         amd.passes.ttgpuir.add_builtin_func_to_llvmir(pm, options.arch, __HIP_FTZ)
         passes.convert.add_reconcile_unrealized_casts(pm)
-        pm.run(mod, "make_llir")
+        try:
+            pm.run(mod, "make_llir")
+        finally:
+            # finalize_tlx_dump restores the stdout fd setup_tlx_dump redirected,
+            # so it has to run even when the pipeline raises.
+            if tlx_dump_dir is not None:
+                from triton.tools.tlx_benchmark_gen import finalize_tlx_dump
+
+                finalize_tlx_dump(tlx_dump_dir, tlx_saved_fd, tlx_capture_file, metadata)
 
         if knobs.compilation.dump_ir_extract_di_local_variables:
             # comments below on why separate it
