@@ -1331,6 +1331,21 @@ void printLocComment(Operation *op, llvm::raw_ostream &os) {
   os << "\n";
 }
 
+// Resolve an operand of an AttrSizedOperandSegments op by declared position.
+// Absent optional groups have size 0, so positional reads shift.
+static Value getSegmentOperand(Operation *op, unsigned segmentIdx) {
+  auto segments = op->getAttrOfType<DenseI32ArrayAttr>("operandSegmentSizes");
+  if (!segments)
+    return nullptr;
+  ArrayRef<int32_t> sizes = segments.asArrayRef();
+  if (segmentIdx >= sizes.size() || sizes[segmentIdx] == 0)
+    return nullptr;
+  unsigned start = 0;
+  for (unsigned i = 0; i < segmentIdx; ++i)
+    start += sizes[i];
+  return start < op->getNumOperands() ? op->getOperand(start) : nullptr;
+}
+
 // Print operation in simplified TLX format
 void printSimplifiedOp(
     Operation *op, llvm::raw_ostream &os,
@@ -1990,6 +2005,75 @@ void printSimplifiedOp(
       os << " = ";
     os << "tlx._clc_query("
        << getValueName(op->getOperand(0), argSubstitutionMap) << ")";
+    printLocComment(op, os);
+    return;
+  }
+
+  // AMD buffer ops address global memory as base pointer + offset tensor,
+  // which Triton spells `ptr + offsets`. `stride` is a codegen hint.
+  if (opName == "amdg.buffer_load" || opName == "amdg.buffer_store" ||
+      opName == "amdg.buffer_load_to_local") {
+    // Declared operand order differs per op; see TritonAMDGPUOps.td.
+    Value value, dest, ptr, offsets, mask, other;
+    if (opName == "amdg.buffer_load") {
+      ptr = getSegmentOperand(op, 0);
+      offsets = getSegmentOperand(op, 1);
+      mask = getSegmentOperand(op, 3);
+      other = getSegmentOperand(op, 4);
+    } else if (opName == "amdg.buffer_store") {
+      value = getSegmentOperand(op, 0);
+      ptr = getSegmentOperand(op, 1);
+      offsets = getSegmentOperand(op, 2);
+      mask = getSegmentOperand(op, 4);
+    } else {
+      dest = getSegmentOperand(op, 0);
+      ptr = getSegmentOperand(op, 1);
+      offsets = getSegmentOperand(op, 2);
+      mask = getSegmentOperand(op, 3);
+      other = getSegmentOperand(op, 4);
+    }
+
+    // Guard every non-optional segment, not just ptr/offsets: getValueName
+    // dereferences the Value, so a missing one would crash rather than print.
+    if (!ptr || !offsets || (opName == "amdg.buffer_store" && !value) ||
+        (opName == "amdg.buffer_load_to_local" && !dest)) {
+      op->emitError("buffer op is missing a required operand and does not "
+                    "round-trip to TLX");
+      os << "# unsupported: " << opName << " (malformed operands)";
+      printLocComment(op, os);
+      return;
+    }
+
+    std::string addr = getValueName(ptr, argSubstitutionMap) + " + " +
+                       getValueName(offsets, argSubstitutionMap);
+
+    if (opName == "amdg.buffer_store") {
+      os << "tl.store(" << addr << ", "
+         << getValueName(value, argSubstitutionMap);
+    } else if (opName == "amdg.buffer_load") {
+      if (op->getNumResults() > 0)
+        os << getValueName(op->getResult(0), argSubstitutionMap) << " = ";
+      os << "tl.load(" << addr;
+    } else {
+      // buffer_load_to_local returns an async token, like tlx.async_load.
+      if (op->getNumResults() > 0)
+        os << getValueName(op->getResult(0), argSubstitutionMap) << " = ";
+      os << "tlx.async_load(" << addr << ", "
+         << getValueName(dest, argSubstitutionMap);
+    }
+    if (mask)
+      os << ", mask=" << getValueName(mask, argSubstitutionMap);
+    if (other)
+      os << ", other=" << getValueName(other, argSubstitutionMap);
+    os << ")";
+    printLocComment(op, os);
+    return;
+  }
+
+  // llvm.intr.assume is a tl.assume from the source kernel.
+  if (opName == "llvm.intr.assume" && op->getNumOperands() == 1) {
+    os << "tl.assume(" << getValueName(op->getOperand(0), argSubstitutionMap)
+       << ")";
     printLocComment(op, os);
     return;
   }
