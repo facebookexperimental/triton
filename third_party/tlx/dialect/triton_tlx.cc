@@ -10,6 +10,7 @@
 #include "tlx/dialect/include/Transforms/Passes.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Tools/LayoutUtils.h"
@@ -571,6 +572,37 @@ void init_triton_tlx_ir(py::module_ &m) {
                    context, /*swizzlingByteWidth=*/0, transposed,
                    elemType.getIntOrFloatBitWidth(), fp4Padded, CTALayout));
              }
+           })
+      .def("make_nv_mma_tiled_shared_linear_encoding_attr",
+           [](TritonOpBuilder &self, std::vector<int64_t> atomShape,
+              std::vector<unsigned> order, Type &elemType,
+              std::vector<unsigned> CTAsPerCGA,
+              std::vector<unsigned> CTASplitNum, std::vector<unsigned> CTAOrder,
+              bool fp4Padded, bool swizzled,
+              std::vector<int64_t> tileShape, unsigned alignment) {
+             assert(atomShape.size() == order.size());
+             assert(order.size() == CTAsPerCGA.size());
+             assert(CTAsPerCGA.size() == CTASplitNum.size());
+             assert(CTASplitNum.size() == CTAOrder.size());
+             assert(tileShape.size() == atomShape.size());
+
+             auto context = self.getBuilder().getContext();
+             auto CTALayout =
+                 makeCGALayout(context, CTAsPerCGA, CTASplitNum, CTAOrder);
+             ttg::NVMMASharedEncodingAttr atomLayout;
+             if (swizzled) {
+               atomLayout = ttg::NVMMASharedEncodingAttr::get(
+                   context, atomShape, order, CTALayout, elemType, fp4Padded);
+             } else {
+               bool transposed = order.size() > 1 ? (order[0] == 0) : false;
+               atomLayout = ttg::NVMMASharedEncodingAttr::get(
+                   context, /*swizzlingByteWidth=*/0, transposed,
+                   elemType.getIntOrFloatBitWidth(), fp4Padded, CTALayout);
+             }
+             auto linearLayout = ttg::nvmmaSharedToLinearLayout(
+                 tileShape, atomLayout, ttg::TMAMode::Tiled);
+             return mlir::cast<Attribute>(ttg::SharedLinearEncodingAttr::get(
+                 context, std::move(linearLayout), alignment));
            })
       .def("make_nv_mma_encoding_attr",
            [](TritonOpBuilder &self, Value opndA, Value opndAcc,
