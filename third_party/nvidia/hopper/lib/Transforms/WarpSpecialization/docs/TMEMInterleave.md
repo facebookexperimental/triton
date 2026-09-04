@@ -1,22 +1,41 @@
 # TMEM Interleave
 
-`triton-nvidia-interleave-tmem` tries to reduce overlapping liveness between
-`ttng.tmem_load` values. It does this by moving TMEM loads and their pure
-single-use chains closer to their consumers, while also moving warp-specialized
-barriers when those barriers are known to protect independent channels.
+`triton-nvidia-interleave-tmem` moves `ttng.tmem_load` values and TMEM
+allocation ops later in their block, and moves warp-specialized barriers when
+those barriers are known to protect independent channels.
+
+The pass has one objective: **distance a load from its producer.**
+`ttng.tc_gen5_mma` is asynchronous, so the consuming `ttng.tmem_load` cannot
+retire until the MMA completes. The gap between them is exactly the amount of
+independent work available to cover that latency. When producer and consumer
+sit in the same partition there is no other warpgroup to hide behind, so that
+gap has to come from instruction scheduling. This applies to every load,
+whether or not the accumulator is split.
+
+Sinking also shortens the load's own register live range, and when an
+accumulator is read as several subtiles it tends to keep the subtiles from
+being live at once. That is a useful side effect, not a guarantee, and it is
+not what the pass optimizes for. A chain grows through adjacent pure users, so
+a sinking load absorbs its consumer and carries it along; that isolates the
+subtile value but drags the consumer's *other* operands into a longer live
+range. Peak register pressure can come out unchanged even when every subtile
+value is separated. Treat subtile liveness as a property to observe, not one
+the pass establishes — the measurements that justify this pass are latency
+measurements.
 
 The pass is scheduled as a module pass, but its algorithm is block-local:
 
-1. Build a worklist of blocks with at least two direct `ttng.tmem_load` ops.
+1. Build a worklist of blocks holding at least one direct `ttng.tmem_load` or
+   `ttng.tmem_alloc` op.
 2. For each block, collect the TMEM loads and TMEM allocation ops that may move.
 3. Reorder WS barriers within that block to unblock legal movement.
 4. Sink eligible TMEM loads and allocation ops within that block.
 5. Restore WS barriers near the memory operations they guard.
-6. Run rollback analysis for that block before processing the next block.
 
-Blocks with fewer than two direct `ttng.tmem_load` ops are skipped. They cannot
-benefit from the pass objective because there is no in-block TMEM load overlap
-to isolate.
+A block holding neither op is skipped. The skip is not just an optimization:
+steps 3 and 5 walk the whole block rather than the collected worklist, so
+without it a block with no TMEM at all would still have its WS barriers and its
+plain TMA store token waits repositioned for no benefit.
 
 ## Barrier Movement
 
@@ -37,98 +56,90 @@ For each candidate load, the pass forms a movable chain starting at the
 chain can sink as a unit as long as the move remains legal for the underlying
 TMEM buffer and for the channel constraints associated with the load.
 
-The load-sinking target is the first legal position where the load starts after
-the previous comparable TMEM load's value live range. The pass does not sink a
-load all the way to its consumer once that fresh-range target has been reached.
-This keeps independent operand-preparation work, such as bias cast/broadcast
-chains feeding the eventual add, close to that consumer when the extra sinking
-is not needed to isolate TMEM values.
+Every load sinks greedily, as far as legality allows. Split loads are processed
+in program order, so each one can move next to its own consumer without making
+later subtile values live early. The first load is not kept as an anchor: it is
+subject to the same legality checks and movement as every later load.
 
 Split TMEM loads can inherit the `channelGraph` constraints from the guarding
 arrive barrier. This lets loads from the same TMEM allocation, but different
 subtiles, sink independently around store-channel waits when the channels are
 disjoint.
 
+A chain cannot sink past the arrive that releases the buffer it is reading,
+because that would let the release fire before the read. Instead the chain
+absorbs that arrive and the two move together, which delays the release rather
+than reordering it against the load. Only an arrive that already follows the
+load is a candidate: the chain walk starts after the chain, so a preceding
+arrive is never visited. An arrive whose constraints differ belongs to another
+channel and stays subject to the ordinary legality checks. Once a chain has
+picked up its own arrive it may also pass a second constrained arrive, since
+two arrives only delay signals.
+
 Plain `ttng.async_tma_store_token_wait` ops do not block TMEM load sinking by
 themselves. They wait for a TMA store to finish reading SMEM, but do not carry
 WS barrier semantics unless they include attached barrier operands. Barrier-
 bearing token waits still block movement like other arrive-like operations.
 
-## Rollback
+## No Rollback
 
-The pass keeps a block transformation only when finalized lowering improves the
-overlapping liveness of comparable TMEM loads. The decision is made after final
-barrier restoration, because the final barrier positions can affect load
-liveness.
+The pass applies its transformation unconditionally. It does not snapshot the
+block, score the result, and restore the original order on a bad score.
 
-Rollback uses overlapping liveness occupancy, not total live-range length:
+A previous version did, keyed on an overlapping-liveness profile. That metric
+only ever measured how many candidate load values were simultaneously live, so
+it was structurally unable to see producer-to-consumer distance — the thing the
+pass exists to widen. A rewrite that opened that gap and shortened a live range
+scored as "unchanged" and was discarded. The metric also could not fire at all
+on a block with no multi-load group, and the rollback treated that absence of
+evidence as grounds to reject, undoing the alloc sinking that had already
+happened.
 
-```cpp
-struct OverlapLiveness {
-  // One entry per contiguous block-order span where at least one candidate
-  // tmem_load value is live.
-  SmallVector<unsigned> numLiveTMEMLoads;
-  // Entries from numLiveTMEMLoads greater than 1, sorted descending. This is
-  // the comparison key.
-  SmallVector<unsigned> overlapProfile;
-};
-```
+If a scoring heuristic is reintroduced, it has to see distance and not just
+overlap. A peak simultaneous count captures multiplicative register pressure
+and is blind to the durational pressure and latency exposure this pass targets;
+an integral over the liveness curve would subsume the old metric rather than
+trade against it.
 
-The implementation may compute temporary start/end positions for each load, but
-those ranges are not the acceptance metric. `numLiveTMEMLoads` records only
-spans where at least one candidate load is live. If two TMEM loads are back to
-back and both values are live after the second load, the important value is `2`;
-the brief prefix where only one load is live is ignored for the pass objective.
+## Follow-up Barrier Placement
 
-`overlapProfile` is built by dropping all `1` entries from
-`numLiveTMEMLoads` and sorting the remaining counts descending. A group is
-improved when the final profile is lexicographically smaller than the original
-profile.
+After this pass restores each wait beside its guarded load,
+`triton-nvidia-unify-ws-barrier-locations` may raise a related AutoWS wait to a
+common location when only load preparation, casts, and broadcast work separate
+the waits. See
+[WS Barrier Location Unification](WSBarrierLocationUnification.md).
 
-Examples:
+An earlier revision of this document declared that reshaping barriers for
+codegen was out of scope, on the grounds that the placement which best exposes
+a broadcast to ptxas is not generally the placement which best distances a load
+from its producer. The observation stands: on a block where both apply, the two
+objectives really can want different placements. What has changed is that there
+is now a basis for deciding between them.
 
-- `[4, 2] -> [4, 1, 1]` succeeds because the profiles are `[4, 2] -> [4]`.
-- `[4, 2] -> [3, 3]` succeeds because the maximum overlap decreases.
-- `[4, 2] -> [4, 3]` fails.
-- `[2, 2, 2, 2] -> [4]` fails because the maximum overlap got worse.
+Running the unification pass second does not by itself resolve anything — it
+just means the codegen objective always wins where it applies. The resolution
+is that "where it applies" is now narrow. Unification requires a broadcast
+whose result is register-heavy, because that is the only case where the
+register relief it buys outweighs the MMA-latency overlap it gives up. On the
+`addmm` epilogue that motivated it, that trade removed a 23 KB spill, which is
+a larger effect than the scheduling distance this pass gives up on the same
+block. Where the broadcast is small, unification declines and this pass's
+placement stands.
 
-Do not treat a shorter non-overlapping tail, earlier last use, or smaller total
-live range as sufficient on its own. The pass goal is specifically to isolate
-TMEM load values that were live at the same time.
-
-### Candidate Groups
-
-Rollback compares loads in block-local candidate groups. The current grouping
-uses:
-
-1. The derived `memOpConstraints` / `channelGraph` dictionary for the load.
-2. The root TMEM allocation returned by `findBufferAccess(load.getSrc())`.
-
-Groups with fewer than two loads are ignored. Groups whose original
-`overlapProfile` is empty are also ignored because there was no overlap to
-improve.
-
-### Restore Behavior
-
-Before mutating a block, the pass records the original order of non-terminator
-ops. If no candidate group had initial overlap, or if any initially-overlapping
-group fails to improve, the pass restores that block by moving the same
-operations back into the recorded order.
-
-Rollback is intentionally block-level. The pass moves both memory ops and
-barriers inside a block, and a load's final liveness often depends on their
-coupled placement. Per-load rollback is possible as a future refinement, but it
-must preserve shared barrier placement and avoid making another load group's
-overlap profile worse.
+So the conflict is decided in favor of codegen only on measured evidence, and
+only for the shape of block where that evidence applies. If a case turns up
+where the distance mattered more despite a large broadcast, the floor in
+unification is the knob to revisit — not the ordering of the two passes.
 
 ## Testing
 
 Coverage lives in `test/TritonNvidiaGPU/interleave_tmem.mlir` and should
 include:
 
-- single-load blocks staying unchanged
-- split-load cases where overlap improves and the transformation is kept
-- rollback cases where the final overlap profile does not improve
+- single-load blocks, where the load sinks away from its producing MMA
+- split-load cases where each load reaches its own consumer independently
+- loads whose sinking is blocked by aliasing or barrier constraints, which must
+  stay put
 
 After changing the C++ implementation, rebuild before testing:
 
