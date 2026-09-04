@@ -88,6 +88,10 @@ python -m third_party.tlx.tools.agents.manager.cli \
 
 `--arch` selects `validator/targets/<arch>/<kernel>`; `harness`/`cases`/`target` can also be passed explicitly.
 
+Manager mirrors its chronological stdout and stderr to `manager.log` under
+`--output-dir`. The log is created before harness validation, so it also retains
+diagnostics and tracebacks from runs that stop before `result.json` is written.
+
 A case may declare `"required_profile": "att"` in its parameters. Manager then
 requires one successfully decoded ATT dispatch with instruction rows during baseline
 preflight and final validation. Counter fallback remains available as a diagnostic but

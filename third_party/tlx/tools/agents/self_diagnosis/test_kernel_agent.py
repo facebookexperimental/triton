@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import sys
 import tempfile
 import unittest
 import xml.etree.ElementTree as ET
@@ -11,6 +12,7 @@ from pathlib import Path
 from unittest import mock
 from unittest.mock import Mock, patch
 
+from third_party.tlx.tools.agents.manager import cli as cli_module
 from third_party.tlx.tools.agents.manager import optimizer as optimizer_module
 from third_party.tlx.tools.agents.manager.cli import (
     MAX_GUIDANCE_BYTES,
@@ -574,6 +576,7 @@ class CliTest(unittest.TestCase):
             json.loads(stream.getvalue()),
             {
                 "artifacts_dir": "/tmp/out",
+                "manager_log": "/tmp/out/manager.log",
                 "result_json": "/tmp/out/result.json",
                 "stopping_reason": "round_budget_exhausted",
                 "success": False,
@@ -585,6 +588,41 @@ class CliTest(unittest.TestCase):
     def test_commit_winner_is_enabled_by_default(self) -> None:
         args = _parse_args(["--kernel", "kernel.py", "--output-dir", "/tmp/out"])
         self.assertTrue(args.commit_winner)
+
+    def test_manager_log_mirrors_terminal_output_and_tracebacks(self) -> None:
+        def fail(_args):
+            print("stdout before failure")
+            print("stderr before failure", file=sys.stderr)
+            raise RuntimeError("synthetic manager failure")
+
+        with tempfile.TemporaryDirectory() as directory:
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with mock.patch.object(cli_module, "_run", side_effect=fail), mock.patch(
+                "sys.stdout", stdout
+            ), mock.patch("sys.stderr", stderr):
+                exit_code = cli_module.main(
+                    [
+                        "--kernel",
+                        "kernel.py",
+                        "--output-dir",
+                        directory,
+                    ]
+                )
+
+            log = Path(directory, "manager.log").read_text()
+
+        self.assertEqual(exit_code, 1)
+        for expected in (
+            "[tlx-agent] LOG path=",
+            "stdout before failure",
+            "stderr before failure",
+            "RuntimeError: synthetic manager failure",
+        ):
+            self.assertIn(expected, log)
+        self.assertIn("stdout before failure", stdout.getvalue())
+        self.assertIn("stderr before failure", stderr.getvalue())
+        self.assertIn("RuntimeError: synthetic manager failure", stderr.getvalue())
 
     def test_prior_run_arg_parses(self) -> None:
         args = _parse_args(

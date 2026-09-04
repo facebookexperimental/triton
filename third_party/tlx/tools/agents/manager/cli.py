@@ -4,8 +4,9 @@ import argparse
 import json
 import os
 import sys
+import traceback
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, TextIO
 from xml.sax.saxutils import escape
 
 from ..build_agent.harness import HarnessExecutionError, SubprocessHarness
@@ -30,6 +31,27 @@ from .models import (
     to_json_value,
 )
 from .optimizer import KernelOptimizer
+
+
+class _TeeTextIO:
+    def __init__(self, terminal: TextIO, log: TextIO) -> None:
+        self._terminal = terminal
+        self._log = log
+
+    def write(self, text: str) -> int:
+        self._terminal.write(text)
+        self._log.write(text)
+        return len(text)
+
+    def flush(self) -> None:
+        self._terminal.flush()
+        self._log.flush()
+
+    def isatty(self) -> bool:
+        return self._terminal.isatty()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._terminal, name)
 
 
 def _load_json(path: Path) -> Any:
@@ -731,6 +753,7 @@ def _print_result(
         return
     summary = {
         "artifacts_dir": str(output_dir),
+        "manager_log": str(output_dir / "manager.log"),
         "result_json": str(output_dir / "result.json"),
         "stopping_reason": result.stopping_reason,
         "success": result.success,
@@ -751,8 +774,7 @@ def _print_result(
     print(json.dumps(summary, indent=2, sort_keys=True))
 
 
-def main() -> int:
-    args = _parse_args()
+def _run(args: argparse.Namespace) -> int:
     harness_path, cases_path, target_path = _resolve_harness_paths(args.kernel, args.harness, args.cases, args.target,
                                                                    args.arch)
     case_payloads = _load_json(cases_path)
@@ -859,6 +881,37 @@ def main() -> int:
         exit_code = 3
     _print_result(result, args.output_dir, args.result_format, review)
     return exit_code
+
+
+def main(arguments: list[str] | None = None) -> int:
+    args = _parse_args(arguments)
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    log_path = args.output_dir / "manager.log"
+    with log_path.open("w", encoding="utf-8", buffering=1) as log:
+        stdout = sys.stdout
+        stderr = sys.stderr
+        sys.stdout = _TeeTextIO(stdout, log)
+        sys.stderr = _TeeTextIO(stderr, log)
+        try:
+            print(
+                f"[tlx-agent] LOG path={str(log_path.resolve())!r}",
+                file=sys.stderr,
+                flush=True,
+            )
+            return _run(args)
+        except SystemExit as error:
+            if error.code not in (None, 0):
+                print(error.code, file=sys.stderr, flush=True)
+            return error.code if isinstance(error.code, int) else 1
+        except KeyboardInterrupt:
+            traceback.print_exc(file=sys.stderr)
+            return 130
+        except Exception:  # noqa: BLE001
+            traceback.print_exc(file=sys.stderr)
+            return 1
+        finally:
+            sys.stdout = stdout
+            sys.stderr = stderr
 
 
 if __name__ == "__main__":
