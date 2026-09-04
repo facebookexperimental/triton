@@ -317,9 +317,9 @@ class shared_linear_layout_encoding(shared_layout_encoding):
     """Explicit linear shared-memory mapping used by Gluon K-tile paths.
 
     Unlike :class:`padded_shared_layout_encoding`, this encoding has no
-    implicit interval padding.  Each offset basis maps one shared-memory bit
-    to a tensor dimension, which lets CDNA4 transpose reads consume a physical
-    row-major 16x16 tile image without an intermediate register permutation.
+    implicit interval padding. Each offset basis maps one shared-memory bit
+    to a tensor dimension. NVMMA layouts can also defer materializing these
+    bases until an IR builder is available.
     """
 
     def __init__(self, offset_bases, block_bases=None, alignment=16):
@@ -327,20 +327,53 @@ class shared_linear_layout_encoding(shared_layout_encoding):
         self.offset_bases = [list(map(int, basis)) for basis in offset_bases]
         self.block_bases = [list(map(int, basis)) for basis in (block_bases or [])]
         self.alignment = int(alignment)
+        self._nv_mma_atom = None
         assert self.offset_bases and len(self.offset_bases[0]) > 0
         rank = len(self.offset_bases[0])
         assert all(len(basis) == rank for basis in self.offset_bases)
         assert all(len(basis) == rank for basis in self.block_bases)
         assert self.alignment > 0 and (self.alignment & (self.alignment - 1)) == 0
 
+    @classmethod
+    def from_nv_mma(cls, atom_layout, tile_shape, alignment=1024):
+        result = cls.__new__(cls)
+        shared_layout_encoding.__init__(result)
+        result.offset_bases = []
+        result.block_bases = []
+        result.alignment = int(alignment)
+        result._nv_mma_atom = atom_layout
+        result.tile_shape = list(map(int, tile_shape))
+        assert len(result.tile_shape) == len(atom_layout.shape)
+        assert result.alignment > 0 and (result.alignment & (result.alignment - 1)) == 0
+        return result
+
     def make_permute(self, dims):
+        if self._nv_mma_atom is not None:
+            return shared_linear_layout_encoding.from_nv_mma(
+                self._nv_mma_atom.make_permute(dims),
+                [self.tile_shape[d] for d in dims],
+                self.alignment,
+            )
         # SharedLinear is used as a physical image; preserve the bit bases and
         # let the consumer's memdesc_trans describe the logical permutation.
-        del dims
         return self
 
     def to_ir(self, builder: ir.builder) -> None:
-        return builder.make_shared_linear_encoding_attr(self.offset_bases, self.block_bases, self.alignment)
+        if self._nv_mma_atom is None:
+            return builder.make_shared_linear_encoding_attr(self.offset_bases, self.block_bases, self.alignment)
+        atom = self._nv_mma_atom
+        return builder.make_nv_mma_tiled_shared_linear_encoding_attr(
+            [int(tl._unwrap_if_constexpr(x)) for x in atom.shape],
+            [int(tl._unwrap_if_constexpr(x)) for x in atom.order],
+            atom.elemType.to_ir(builder),
+            [int(tl._unwrap_if_constexpr(x)) for x in atom.numCTAsPerCGA],
+            [int(tl._unwrap_if_constexpr(x)) for x in atom.numCTASplit],
+            [int(tl._unwrap_if_constexpr(x)) for x in atom.numCTAOrder],
+            bool(tl._unwrap_if_constexpr(atom.fp4Padded)),
+            bool(tl._unwrap_if_constexpr(atom.swizzled)),
+            self.tile_shape,
+            self.alignment,
+        )
 
 
 class amd_mfma_layout(layout_encoding):
@@ -546,15 +579,21 @@ class nv_mma_shared_layout_encoding(shared_layout_encoding):
 
     def to_ir(self, builder: ir.builder) -> None:
         return builder.make_nv_mma_shared_encoding_attr(
-            [int(x) for x in self.shape],
-            self.order,
+            [int(tl._unwrap_if_constexpr(x)) for x in self.shape],
+            [int(tl._unwrap_if_constexpr(x)) for x in self.order],
             self.elemType.to_ir(builder),
-            self.numCTAsPerCGA,
-            self.numCTASplit,
-            self.numCTAOrder,
-            self.fp4Padded,
-            self.swizzled,
+            [int(tl._unwrap_if_constexpr(x)) for x in self.numCTAsPerCGA],
+            [int(tl._unwrap_if_constexpr(x)) for x in self.numCTASplit],
+            [int(tl._unwrap_if_constexpr(x)) for x in self.numCTAOrder],
+            bool(tl._unwrap_if_constexpr(self.fp4Padded)),
+            bool(tl._unwrap_if_constexpr(self.swizzled)),
         )
+
+    def tile_to_shape(self, tile_shape, alignment=1024):
+        return shared_linear_layout_encoding.from_nv_mma(self, tile_shape, alignment)
+
+    def make_shared_linear(self, alignment=1024, tile_shape=None):
+        return self.tile_to_shape(tile_shape or self.shape, alignment)
 
     def __str__(self) -> str:
         return f"nv_mma_shared_layout_encoding<{self.shape}, {self.order}, {self.elemType}, {self.numCTAsPerCGA}, {self.numCTASplit}, {self.numCTAOrder}, {self.fp4Padded}, {self.swizzled}>"
