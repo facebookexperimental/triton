@@ -195,9 +195,11 @@ struct Transform2CTALoads
       originalDescTypes.try_emplace(descLoad.getDesc(), descType);
     });
 
-    // Collect 2-CTA MMA ops.
-    SmallVector<ttng::TCGen5MMAOp> twoCTAMMAOps;
-    moduleOp->walk([&](ttng::TCGen5MMAOp mma) {
+    // Collect 2-CTA MMA ops. Walk the shared MMAv5 interface so both the plain
+    // (tc_gen5_mma) and scaled (tc_gen5_mma_scaled) ops are handled by one
+    // path.
+    SmallVector<ttng::MMAv5OpInterface> twoCTAMMAOps;
+    moduleOp->walk([&](ttng::MMAv5OpInterface mma) {
       if (mma.getTwoCtas())
         twoCTAMMAOps.push_back(mma);
     });
@@ -209,12 +211,20 @@ struct Transform2CTALoads
 
     DenseSet<Operation *> splitTransformedMMAs;
     for (auto mma : twoCTAMMAOps) {
-      if (splitTransformedMMAs.contains(mma))
+      Operation *op = mma.getOperation();
+      if (splitTransformedMMAs.contains(op))
         continue;
-      if (succeeded(transformSplitBLoad(mma, splitTransformedMMAs)))
-        continue;
-      if (failed(transformBLoad(mma)))
-        LDBG("Skipped MMA at " << mma.getLoc()
+      // Both paths halve the B descriptor; they differ in how many MMAs consume
+      // the load. transformSplitBLoad handles a source-level tt.split feeding
+      // two MMAs by making two subslice views of one buffer, and only a plain
+      // MMA has that split. A scaled MMA has a single consumer and uses
+      // transformBLoad below.
+      if (auto plain = dyn_cast<ttng::TCGen5MMAOp>(op)) {
+        if (succeeded(transformSplitBLoad(plain, splitTransformedMMAs)))
+          continue;
+      }
+      if (failed(transformBLoad(mma.getB(), op)))
+        LDBG("Skipped MMA at " << op->getLoc()
                                << " (B not from descriptor load)");
     }
 
@@ -410,9 +420,11 @@ struct Transform2CTALoads
     return success();
   }
 
-  LogicalResult transformBLoad(ttng::TCGen5MMAOp mma) {
+  LogicalResult transformBLoad(Value b, Operation *mma) {
+    if (!b)
+      return failure();
     // Trace B operand back to DescriptorLoadOp.
-    FailureOr<BLoadTrace> trace = traceToDescriptorLoad(mma.getB());
+    FailureOr<BLoadTrace> trace = traceToDescriptorLoad(b);
     if (failed(trace))
       return failure();
     auto descLoad = trace->descLoad;
@@ -440,7 +452,7 @@ struct Transform2CTALoads
       return failure();
     }
 
-    MLIRContext *ctx = mma.getContext();
+    MLIRContext *ctx = mma->getContext();
     auto elemType = descType.getElementType();
     auto sharedLayout =
         shrinkSwizzleForShape(descType.getSharedLayout(), newBlockShape);
@@ -559,7 +571,7 @@ struct Transform2CTALoads
     if (makeDesc && makeDesc.getResult().use_empty())
       makeDesc.erase();
 
-    LDBG("Transformed B load for 2-CTA MMA at " << mma.getLoc());
+    LDBG("Transformed B load for 2-CTA MMA at " << mma->getLoc());
     return success();
   }
 };

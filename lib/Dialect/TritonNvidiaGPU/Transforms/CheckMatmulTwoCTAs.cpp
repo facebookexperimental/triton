@@ -94,6 +94,11 @@ public:
     WalkResult result = mod.walk([&](Operation *op) {
       if (auto dotOp = dyn_cast<tt::DotOp>(op))
         return checkTwoCTA(op, dotOp.getTwoCtas());
+      // Runs before tt.dot_scaled is lowered, so match the scaled op here too.
+      // Otherwise ttng.two-ctas stays false and every downstream tcgen05
+      // lowering that reads getModuleTwoCTAs sees the wrong value.
+      if (auto dotScaledOp = dyn_cast<tt::DotScaledOp>(op))
+        return checkTwoCTA(op, dotScaledOp.getTwoCtas());
       if (auto mmaOp = dyn_cast<ttng::TCGen5MMAOp>(op))
         return checkTwoCTA(op, mmaOp.getTwoCtas());
       if (auto scaledOp = dyn_cast<ttng::TCGen5MMAScaledOp>(op))
