@@ -26,7 +26,8 @@
 
 // Verify MMA operations are replaced
 // CHECK-DAG: tlx.async_dot(
-// CHECK-DAG: use_acc=False, pred=True, mBarriers=[{{[^]]+}}], two_ctas=True, force_async=True
+// A constant-true predicate is the default and is elided.
+// CHECK-DAG: use_acc=False, mBarriers=[{{[^]]+}}], two_ctas=True, force_async=True
 // CHECK-DAG: tlx.tcgen05_commit({{[^,)]+}}, two_ctas=True)
 
 // Verify TMA operations are replaced
