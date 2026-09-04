@@ -59,8 +59,8 @@ Defined in `include/triton/Dialect/TritonNvidiaGPU/IR/TritonNvidiaGPUOps.td`.
 ### Passes
 
 #### 1. GenerateSubtiledRegion
-**File:** `lib/Dialect/TritonNvidiaGPU/Transforms/GenerateSubtiledRegion.cpp`
-**Pass:** `triton-nvidia-gpu-test-generate-subtiled-region`
+**File:** `third_party/nvidia/hopper/lib/Transforms/WarpSpecialization/GenerateSubtiledRegion.cpp`
+**Pass:** `nvgpu-test-generate-subtiled-region`
 
 Finds `tmem_load → reshape → trans{[0,2,1]} → split` patterns and wraps the
 per-tile chains into `SubtiledRegionOp`s.

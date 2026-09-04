@@ -2,19 +2,21 @@
 // META_WS_ONLY
 #include "lib/Dialect/TritonGPU/Transforms/WarpSpecialization/PartitionAttrs.h"
 #include "mlir/IR/IRMapping.h"
+#include "nvidia/hopper/include/Transforms/Passes.h"
+#include "nvidia/include/Dialect/NVWS/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
-#include "triton/Dialect/TritonNvidiaGPU/Transforms/Passes.h"
 #include "llvm/ADT/MapVector.h"
 #include "llvm/Support/Debug.h"
 
 namespace mlir {
+
+#define GEN_PASS_DEF_NVGPUTESTGENERATESUBTILEDREGION
+#include "nvidia/hopper/include/Transforms/Passes.h.inc"
+
 namespace triton {
 namespace nvidia_gpu {
-
-#define GEN_PASS_DEF_TRITONNVIDIAGPUTESTGENERATESUBTILEDREGIONPASS
-#include "triton/Dialect/TritonNvidiaGPU/Transforms/Passes.h.inc"
 
 namespace {
 
@@ -1378,70 +1380,75 @@ bool tryGenerateForSplit(triton::SplitOp splitOp) {
   return true;
 }
 
-namespace {
-
-class TritonNvidiaGPUTestGenerateSubtiledRegionPass
-    : public impl::TritonNvidiaGPUTestGenerateSubtiledRegionPassBase<
-          TritonNvidiaGPUTestGenerateSubtiledRegionPass> {
-public:
-  using TritonNvidiaGPUTestGenerateSubtiledRegionPassBase::
-      TritonNvidiaGPUTestGenerateSubtiledRegionPassBase;
-
-  void runOnOperation() override {
-    // Collect root splits (those tracing to tmem_load) in function bodies.
-    // Process them one at a time, re-walking after each success to avoid
-    // dangling pointers from erased inner splits. Track failed splits to
-    // avoid infinite loops on splits that can't be processed (e.g.,
-    // multi-task N-tile).
-    DenseSet<Operation *> failedSplits;
-    bool changed = true;
-    while (changed) {
-      changed = false;
-      SmallVector<triton::SplitOp> splitOps;
-      auto feedsIntoSubtiledRegion = [](triton::SplitOp splitOp) {
-        SmallVector<Value> worklist;
-        for (Value r : splitOp->getResults())
-          worklist.push_back(r);
-        DenseSet<Value> visited;
-        while (!worklist.empty()) {
-          Value v = worklist.pop_back_val();
-          if (!visited.insert(v).second)
-            continue;
-          for (Operation *user : v.getUsers()) {
-            if (isa<SubtiledRegionOp>(user))
-              return true;
-            for (Value r : user->getResults())
-              worklist.push_back(r);
-          }
-        }
-        return false;
-      };
-      getOperation().walk([&](triton::SplitOp splitOp) {
-        if (failedSplits.contains(splitOp.getOperation()))
-          return;
-        if (splitOp->getParentOfType<SubtiledRegionOp>())
-          return;
-        if (feedsIntoSubtiledRegion(splitOp))
-          return;
-        splitOps.push_back(splitOp);
-      });
-      for (auto splitOp : splitOps) {
-        auto tmemLoad = traceSetupChain(splitOp);
-        if (!tmemLoad)
+static void generateSubtiledRegions(ModuleOp moduleOp) {
+  // Collect root splits (those tracing to tmem_load) in function bodies.
+  // Process them one at a time, re-walking after each success to avoid
+  // dangling pointers from erased inner splits. Track failed splits to avoid
+  // infinite loops on splits that can't be processed (e.g., multi-task
+  // N-tile).
+  DenseSet<Operation *> failedSplits;
+  bool changed = true;
+  while (changed) {
+    changed = false;
+    SmallVector<triton::SplitOp> splitOps;
+    auto feedsIntoSubtiledRegion = [](triton::SplitOp splitOp) {
+      SmallVector<Value> worklist;
+      for (Value r : splitOp->getResults())
+        worklist.push_back(r);
+      DenseSet<Value> visited;
+      while (!worklist.empty()) {
+        Value v = worklist.pop_back_val();
+        if (!visited.insert(v).second)
           continue;
-        if (tryGenerateForSplit(splitOp)) {
-          changed = true;
-        } else {
-          failedSplits.insert(splitOp);
+        for (Operation *user : v.getUsers()) {
+          if (isa<SubtiledRegionOp>(user))
+            return true;
+          for (Value r : user->getResults())
+            worklist.push_back(r);
         }
-        break;
       }
+      return false;
+    };
+    moduleOp.walk([&](triton::SplitOp splitOp) {
+      if (failedSplits.contains(splitOp.getOperation()))
+        return;
+      if (splitOp->getParentOfType<SubtiledRegionOp>())
+        return;
+      if (feedsIntoSubtiledRegion(splitOp))
+        return;
+      splitOps.push_back(splitOp);
+    });
+    for (auto splitOp : splitOps) {
+      auto tmemLoad = traceSetupChain(splitOp);
+      if (!tmemLoad)
+        continue;
+      if (tryGenerateForSplit(splitOp)) {
+        changed = true;
+      } else {
+        failedSplits.insert(splitOp);
+      }
+      break;
     }
   }
-};
-
-} // anonymous namespace
+}
 
 } // namespace nvidia_gpu
 } // namespace triton
+
+namespace {
+
+class NVGPUTestGenerateSubtiledRegionPass
+    : public impl::NVGPUTestGenerateSubtiledRegionBase<
+          NVGPUTestGenerateSubtiledRegionPass> {
+public:
+  using impl::NVGPUTestGenerateSubtiledRegionBase<
+      NVGPUTestGenerateSubtiledRegionPass>::NVGPUTestGenerateSubtiledRegionBase;
+
+  void runOnOperation() override {
+    triton::nvidia_gpu::generateSubtiledRegions(getOperation());
+  }
+};
+
+} // namespace
+
 } // namespace mlir

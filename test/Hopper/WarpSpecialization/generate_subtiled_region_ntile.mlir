@@ -1,4 +1,4 @@
-// RUN: triton-opt %s --triton-nvidia-gpu-test-generate-subtiled-region | FileCheck %s
+// RUN: triton-opt %s --nvgpu-test-generate-subtiled-region | FileCheck %s
 
 // Note: N-tile tests are in a separate file from the 2-tile tests to avoid
 // heap corruption from split-input-file when inner splits are erased.

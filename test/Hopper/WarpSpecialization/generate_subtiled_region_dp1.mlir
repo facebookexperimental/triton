@@ -1,4 +1,4 @@
-// RUN: triton-opt %s -split-input-file --triton-nvidia-gpu-test-generate-subtiled-region | FileCheck %s
+// RUN: triton-opt %s -split-input-file --nvgpu-test-generate-subtiled-region | FileCheck %s
 
 // Test: DP=1 epilogue subtiling with convert_layout in chain.
 // The split feeds into truncf → convert_layout → local_store for each tile.

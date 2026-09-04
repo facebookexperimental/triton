@@ -1,4 +1,4 @@
-// RUN: triton-opt %s -split-input-file --triton-nvidia-gpu-test-generate-subtiled-region | FileCheck %s
+// RUN: triton-opt %s -split-input-file --nvgpu-test-generate-subtiled-region | FileCheck %s
 
 // Test: SAME-TASK epilogue subtiling (separate_epilogue_store=False).
 // The per-tile truncf -> local_store -> async_tma_copy_local_to_global ->

@@ -16,7 +16,6 @@
 #include "triton/Dialect/TritonGPU/Transforms/Schedule.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
-#include "triton/Dialect/TritonNvidiaGPU/Transforms/Passes.h"
 #include "triton/Tools/Sys/Dump.h"
 #include "llvm/Support/LogicalResult.h"
 
@@ -86,8 +85,7 @@ void doLowerRemainingSubtiledRegions(triton::FuncOp funcOp) {
 void doGenerateSubtiledRegion(triton::FuncOp funcOp) {
   auto moduleOp = funcOp->getParentOfType<ModuleOp>();
   PassManager pm(moduleOp.getContext());
-  pm.addPass(triton::nvidia_gpu::
-                 createTritonNvidiaGPUTestGenerateSubtiledRegionPass());
+  pm.addPass(createNVGPUTestGenerateSubtiledRegion());
   // OptimizeTMemLayouts runs later via add_optimize_tmem_layouts in
   // compiler.py. This avoids transforming bare splits into tmem_subslice
   // ops that lack async_task_id and would crash createAllocChannel.

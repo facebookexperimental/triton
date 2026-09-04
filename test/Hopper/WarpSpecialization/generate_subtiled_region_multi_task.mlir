@@ -1,4 +1,4 @@
-// RUN: triton-opt %s -split-input-file --triton-nvidia-gpu-test-generate-subtiled-region | FileCheck %s
+// RUN: triton-opt %s -split-input-file --nvgpu-test-generate-subtiled-region | FileCheck %s
 
 // Test: multi-task chain produces two SubtiledRegionOps.
 // Compute ops (truncf + local_store) have task [3], TMA copy has task [4].
