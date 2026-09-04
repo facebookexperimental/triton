@@ -2002,10 +2002,10 @@ def test_amd_late_address_compute_compiles_gfx950():
 
 
 @triton.jit
-def _amd_register_handoff_kernel(x_ptr, y_ptr, REGISTER_CLASS: tl.constexpr):
+def _amd_register_class_anchor_kernel(x_ptr, y_ptr, REGISTER_CLASS: tl.constexpr):
     offsets = tl.arange(0, 2048)
     values = tl.load(x_ptr + offsets)
-    values = tlx.amd_register_handoff(values, register_class=REGISTER_CLASS)
+    values = tlx.amd_register_class_anchor(values, register_class=REGISTER_CLASS)
     tl.store(y_ptr + offsets, values)
 
 
@@ -2017,37 +2017,37 @@ def _amd_register_handoff_kernel(x_ptr, y_ptr, REGISTER_CLASS: tl.constexpr):
         pytest.param("agpr", "fp32", id="agpr-fp32"),
     ],
 )
-def test_amd_register_handoff_compiles_gfx950(register_class, element_type):
+def test_amd_register_class_anchor_compiles_gfx950(register_class, element_type):
     compiled = compile_for_gfx950(
-        _amd_register_handoff_kernel,
+        _amd_register_class_anchor_kernel,
         signature={"x_ptr": f"*{element_type}", "y_ptr": f"*{element_type}"},
         constexprs={"REGISTER_CLASS": register_class},
     )
     ttir = compiled.asm["ttir"]
-    assert ttir.count("amdg.register_handoff") == 1
+    assert ttir.count("amdg.register_class_anchor") == 1
     assert f'class "{register_class}"' in ttir
     assert "groups" not in ttir
     assert "tt.elementwise_inline_asm" not in ttir
     assert "amdg.register_resident" not in ttir
     llir = compiled.asm["llir"]
-    assert "amdg.register_handoff" not in llir
+    assert "amdg.register_class_anchor" not in llir
     register_constraint = "a" if register_class == "agpr" else "v"
     constraint = f'"={register_constraint},0"'
-    handoff_asm = [line for line in llir.splitlines() if constraint in line]
+    anchor_asm = [line for line in llir.splitlines() if constraint in line]
     expected_asm = 4 if element_type == "fp16" else 8
-    assert len(handoff_asm) == expected_asm
-    assert all("sideeffect" in line for line in handoff_asm)
+    assert len(anchor_asm) == expected_asm
+    assert all("sideeffect" in line for line in anchor_asm)
 
 
 @triton.jit
-def _invalid_amd_register_handoff_kernel(
+def _invalid_amd_register_class_anchor_kernel(
     x_ptr,
     y_ptr,
     REGISTER_CLASS: tl.constexpr,
 ):
     offsets = tl.arange(0, 1024)
     values = tl.load(x_ptr + offsets)
-    values = tlx.amd_register_handoff(
+    values = tlx.amd_register_class_anchor(
         values,
         register_class=REGISTER_CLASS,
     )
@@ -2061,10 +2061,10 @@ def _invalid_amd_register_handoff_kernel(
         pytest.param("vgpr", "i8", "value elements must be 16 or 32 bits", id="element-width"),
     ],
 )
-def test_amd_register_handoff_rejects_invalid_contract(register_class, element_type, message):
+def test_amd_register_class_anchor_rejects_invalid_contract(register_class, element_type, message):
     with pytest.raises(CompilationError, match=message):
         compile_for_gfx950(
-            _invalid_amd_register_handoff_kernel,
+            _invalid_amd_register_class_anchor_kernel,
             signature={"x_ptr": f"*{element_type}", "y_ptr": f"*{element_type}"},
             constexprs={
                 "REGISTER_CLASS": register_class,
@@ -2074,10 +2074,10 @@ def test_amd_register_handoff_rejects_invalid_contract(register_class, element_t
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
 @pytest.mark.parametrize("register_class", ["vgpr", "agpr"])
-def test_amd_register_handoff_correct_gfx950(register_class):
+def test_amd_register_class_anchor_correct_gfx950(register_class):
     x = torch.arange(2048, device="cuda", dtype=torch.float32)
     actual = torch.empty_like(x)
-    _amd_register_handoff_kernel[(1, )](x, actual, register_class, num_warps=4)
+    _amd_register_class_anchor_kernel[(1, )](x, actual, register_class, num_warps=4)
     torch.testing.assert_close(actual, x)
 
 

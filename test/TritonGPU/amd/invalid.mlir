@@ -358,13 +358,13 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.thr
 
 // -----
 
-#handoff_distributed = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+#anchor_distributed = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 64 : i32} {
-  tt.func @register_handoff_requires_complete_native_groups(
-      %arg0: tensor<64xf16, #handoff_distributed>) {
+  tt.func @register_class_anchor_requires_complete_native_groups(
+      %arg0: tensor<64xf16, #anchor_distributed>) {
     // expected-error @+1 {{requires 1 elements per thread to be divisible by the 2-element native tuple}}
-    %0 = amdg.register_handoff %arg0 class "vgpr"
-        : tensor<64xf16, #handoff_distributed>
+    %0 = amdg.register_class_anchor %arg0 class "vgpr"
+        : tensor<64xf16, #anchor_distributed>
     tt.return
   }
 }

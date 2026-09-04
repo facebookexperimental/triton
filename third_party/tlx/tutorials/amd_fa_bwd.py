@@ -6274,8 +6274,8 @@ def _attn_bwd_dq_d64_causal_step(
     scores = scores + row_lse_full
     scores = tl.dot(q, kt, acc=scores, out_dtype=tl.float32)
     if BLOCK_N == 64:
-        # End the score-MFMA allocation interval before the exp tail.
-        scores = tlx.amd_register_handoff(scores, register_class="vgpr")
+        # Anchor the score value in VGPRs before the exp tail.
+        scores = tlx.amd_register_class_anchor(scores, register_class="vgpr")
         scores = tlx.require_layout(scores, mma_mn, pin=False)
 
     # Match the independent MFMA cadence used by the tuned reference: issue
@@ -6311,7 +6311,7 @@ def _attn_bwd_dq_d64_causal_step(
         )
         scores = tl.where(valid, scores, negative_inf)
     p = tlx.require_layout(tl.math.exp2(scores), mma_mn, pin=False)
-    ds = tlx.amd_register_handoff(
+    ds = tlx.amd_register_class_anchor(
         p * dp,
         register_class="vgpr",
     )
@@ -6375,7 +6375,7 @@ def _attn_bwd_dq_d64_causal_finish32(
     dp = tlx.require_layout(dp, mma_mn, pin=False)
     k_nd = tlx.require_layout(k_nd, k_op1_md, pin=False)
     p = tlx.require_layout(tl.math.exp2(scores), mma_mn, pin=False)
-    ds = tlx.amd_register_handoff(
+    ds = tlx.amd_register_class_anchor(
         p * dp,
         register_class="vgpr",
     )
@@ -8034,7 +8034,7 @@ def _d64_gqa8_signed_front(
         do_t = tlx.local_load(tlx.local_trans(do_view), token=stage_wait, layout=q_t_op1_nm)
     dp = tl.dot(v_nm, do_t, acc=dp, out_dtype=tl.float32)
     ds = p * dp
-    ds = tlx.amd_register_handoff(
+    ds = tlx.amd_register_class_anchor(
         ds,
         register_class="vgpr",
     )
@@ -8105,7 +8105,7 @@ def _d64_gqa8_signed_front_loaded_stats(
     )
     do_t = tlx.local_load(tlx.local_trans(do_view), token=stage_wait, layout=q_t_op1_nm)
     dp = tl.dot(v_nm, do_t, acc=dp, out_dtype=tl.float32)
-    ds = tlx.amd_register_handoff(
+    ds = tlx.amd_register_class_anchor(
         p * dp,
         register_class="vgpr",
     )

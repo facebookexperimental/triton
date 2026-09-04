@@ -203,12 +203,12 @@ void init_triton_tlx_ir(py::module_ &m) {
                  input.getType(), input, registerClassAttr,
                  registersPerGroupAttr);
            })
-      .def("create_amd_register_handoff",
+      .def("create_amd_register_class_anchor",
            [](TritonOpBuilder &self, Value input,
               const std::string &registerClass) -> Value {
              auto registerClassAttr =
                  self.getBuilder().getStringAttr(registerClass);
-             return self.create<amdgpu::RegisterHandoffOp>(
+             return self.create<amdgpu::RegisterClassAnchorOp>(
                  input.getType(), input, registerClassAttr);
            })
       .def("create_amd_mfma_commit",

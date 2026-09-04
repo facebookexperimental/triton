@@ -71,7 +71,7 @@ from .mem_ops import (
 )
 from .mma_ops import (
     amd_mfma_commit,
-    amd_register_handoff,
+    amd_register_class_anchor,
     amd_register_resident,
     amd_scheduled_mfma,
     async_dot,
@@ -154,7 +154,7 @@ __all__ = [
     "storage_kind",
     "layout",
     "amd_mfma_commit",
-    "amd_register_handoff",
+    "amd_register_class_anchor",
     "amd_register_resident",
     "amd_scheduled_mfma",
     "extract_slice",

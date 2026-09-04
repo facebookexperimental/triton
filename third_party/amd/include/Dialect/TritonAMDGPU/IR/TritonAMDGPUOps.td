@@ -768,18 +768,19 @@ def RematerializedRangeOp : TT_AMDGPU_Op<"rematerialized_range", [
 
 def RegisterResidentOp : TT_AMDGPU_Op<"register_resident", [
     Pure, SameOperandsAndResultType]> {
-  let summary = "Keep a distributed tensor in native AMD register tuples";
+  let summary = "Constrain native AMD register tuples at one allocation point";
   let description = [{
-    Returns `input` unchanged while assigning its packed per-thread values to
-    the requested AMD vector register class. `registers_per_group` is the
-    number of consecutive 32-bit registers represented by each
-    allocator-visible tuple. The distributed tensor encoding is preserved
-    exactly, so this allocation-only identity does not introduce a layout
-    conversion or an LDS round trip.
+    Returns `input` unchanged while exposing all packed per-thread groups to
+    the allocator at one common point in the requested AMD vector register
+    class. `registers_per_group` is the number of consecutive 32-bit registers
+    in each tuple; separate tuples need not be adjacent. The distributed tensor
+    encoding is preserved exactly, so this identity does not introduce a
+    layout conversion or an LDS round trip.
 
-    This is a general lifetime contract for values intentionally carried
-    across a software pipeline. It does not prescribe physical register
-    numbers, and target lowering emits no machine instruction.
+    This does not prescribe physical register numbers, reserve the registers
+    for the value's entire lifetime, prevent copies or spills, or guarantee an
+    occupancy level. The empty target-assembly boundary itself emits no ISA
+    instruction, although satisfying its constraints can affect allocation.
   }];
 
   let arguments = (ins TT_Tensor:$input, StrAttr:$register_class,
@@ -795,24 +796,26 @@ def RegisterResidentOp : TT_AMDGPU_Op<"register_resident", [
 }
 
 //===----------------------------------------------------------------------===//
-// RegisterHandoffOp
+// RegisterClassAnchorOp
 //===----------------------------------------------------------------------===//
 
-def RegisterHandoffOp : TT_AMDGPU_Op<"register_handoff", [
+def RegisterClassAnchorOp : TT_AMDGPU_Op<"register_class_anchor", [
     SameOperandsAndResultType]> {
-  let summary = "Start independent native AMD register-allocation intervals";
+  let summary = "Apply independent native AMD register-class anchors";
   let description = [{
     Returns `input` unchanged while passing each per-thread 32-bit native
-    register value through an independent tied register constraint. This starts
-    local allocation intervals without requiring the complete tensor to be
-    resident at one point.
+    register value through an independent tied register constraint. This
+    creates a source-local allocation and scheduling anchor without requiring
+    the complete tensor to be resident at one point. A tied input and output
+    may be coalesced, so the operation does not guarantee a distinct physical
+    live interval, a copy, a shorter live range, spill avoidance, or an
+    occupancy level.
 
     Use `register_resident` when simultaneous whole-tensor residency is the
-    software-pipeline contract. Neither operation prescribes physical register
-    numbers or changes numerical results. The operation is intentionally
-    side-effecting: distinct source occurrences are distinct allocation
-    boundaries and must not be merged by CSE or moved out of their surrounding
-    software-pipeline stage.
+    software-pipeline contract. Neither operation changes numerical results.
+    The operation is intentionally side-effecting: distinct source occurrences
+    are distinct anchors and must not be merged by CSE or moved out of their
+    surrounding software-pipeline stage.
   }];
 
   let arguments = (ins TT_Tensor:$input, StrAttr:$register_class);
@@ -852,6 +855,8 @@ def MfmaCommitOp : TT_AMDGPU_Op<"mfma_commit", [
 
     The operation is intentionally side-effecting so the completion and
     liveness boundary cannot be deleted or moved across memory operations.
+    It is a wave-local MFMA boundary, not a waitcnt, hardware memory fence,
+    workgroup barrier, or cross-wave synchronization operation.
   }];
 
   let arguments = (ins Variadic<TT_Tensor>:$inputs);
@@ -876,17 +881,20 @@ def ScheduledMfmaOp : TT_AMDGPU_Op<"scheduled_mfma"> {
     returning to an accumulator dependency chain, while preserving one SSA
     chain per output fragment.
 
-    `resident_operand` is `none`, `lhs`, or `rhs` and identifies an input
-    intentionally carried through the surrounding software pipeline.
+    On the persistent lowering path, `resident_operand` is `none`, `lhs`, or
+    `rhs` and selects an input to constrain to AGPRs; the other input uses
+    VGPRs. The transient intrinsic path does not add those source-class
+    constraints, so a carried source needs a separate `register_resident`
+    boundary when hard residency is required.
     `accumulator_role` is `transient` for a phase-local result or `persistent`
     for an accumulator carried across phases. `accumulator_register_class` is
-    `auto`, `agpr`, or `vgpr`; `auto` means VGPRs for `transient` and AGPRs for
-    `persistent` on every target, while an explicit class supports kernels
-    whose two persistent accumulator sets intentionally occupy complementary
-    physical files. On CDNA3 the compiler-generated AGPR read is not ordered
-    against the MFMA drain, so any AGPR accumulator is rejected there,
-    including one named by `auto`: a persistent accumulator must request
-    `vgpr`.
+    `auto`, `agpr`, or `vgpr`. Persistent lowering honors this field: `auto`
+    selects AGPRs, while an explicit class supports kernels whose persistent
+    accumulator sets intentionally occupy complementary register classes. The
+    transient intrinsic path leaves physical accumulator placement to LLVM.
+    On CDNA3 the compiler-generated AGPR read is not ordered against the MFMA
+    drain, so any AGPR accumulator request is rejected, including persistent
+    `auto`: a persistent accumulator must request `vgpr`.
     `initialize` starts the native accumulators from zero. Completion
     of transient result fragments is represented separately by `mfma_commit`.
 
