@@ -204,6 +204,9 @@ class ExperimentSummary:
     change_scope: str = ""
     profile_path: Path | None = None
     auto_commit: AutoCommitResult | None = None
+    plan_id: str = ""
+    tl_retro_path: Path | None = None
+    plan_pool_revision: int = 0
 
 
 @dataclass(frozen=True)

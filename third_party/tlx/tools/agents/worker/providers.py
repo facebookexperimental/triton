@@ -6,7 +6,7 @@ import tempfile
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Mapping, Protocol
 
 from ..manager.models import KernelOptimizationRequest, KernelTarget, PerformanceSummary
 from ..profiler.profiling import compact_profile_summary
@@ -63,7 +63,8 @@ The complete current source is available as `candidate.py` in your writable work
 directory. Edit that file directly and leave it as the complete replacement source. Also
 write `candidate_metadata.json` with integer `schema_version` set to 1 and these string
 fields: `hypothesis`, `evidence`, `change`, `expected_effect`, `risk`, `commit_title`,
-`commit_summary`, `falsifier`, and `change_scope`. The first six fields other than
+`commit_summary`, `falsifier`, `change_scope`, and `plan_id`; it may also contain
+`pending_plans` and `drop_plan_ids` for the TL proposal-pool refresh. The first six fields other than
 `commit_summary` must each be one line and under 240 characters.
 `change_scope` must be one of `config-only`, `kernel-python`, `compiler-native`, or
 `tooling`; this source-replacement provider normally uses one of the first two.
@@ -93,6 +94,9 @@ class CandidateProposal:
     commit_summary: str = ""
     falsifier: str = ""
     change_scope: str = "kernel-python"
+    plan_id: str = ""
+    pending_plans: tuple[Mapping[str, str], ...] = ()
+    drop_plan_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -102,6 +106,8 @@ class CandidateContext:
     current_source: str
     current_performance: PerformanceSummary
     previous_diagnostics: tuple[str, ...]
+    proposal_pool: tuple[Mapping[str, str], ...] = ()
+    latest_retro: Mapping[str, Any] | None = None
 
 
 class CandidateProvider(Protocol):
@@ -198,10 +204,13 @@ def _fallback_commit_summary(metadata: dict[str, str]) -> str:
     return _clean_commit_summary(f"Change summary:\n{change}\n\nWhy:\n{why}")
 
 
-def _read_candidate_metadata(path: Path) -> dict[str, str]:
+def _read_candidate_metadata(path: Path) -> dict[str, Any]:
     metadata = {field: "" for field in _SHORT_METADATA_FIELDS}
     metadata["commit_title"] = ""
     metadata["commit_summary"] = ""
+    metadata["plan_id"] = ""
+    metadata["pending_plans"] = ()
+    metadata["drop_plan_ids"] = ()
     if path.exists():
         try:
             payload = json.loads(path.read_text())
@@ -216,6 +225,31 @@ def _read_candidate_metadata(path: Path) -> dict[str, str]:
             metadata["commit_summary"] = _clean_commit_summary(
                 payload.get("commit_summary", "")
             )
+            metadata["plan_id"] = _clean_short_metadata(payload.get("plan_id", ""))
+            pending = payload.get("pending_plans", [])
+            if isinstance(pending, list):
+                metadata["pending_plans"] = tuple(
+                    {
+                        field: _clean_short_metadata(item.get(field, ""))
+                        for field in (
+                            "plan_id",
+                            "hypothesis",
+                            "change",
+                            "evidence",
+                            "predicted_signal",
+                            "falsifier",
+                            "risk",
+                            "change_scope",
+                        )
+                    }
+                    for item in pending[:12]
+                    if isinstance(item, dict)
+                )
+            dropped = payload.get("drop_plan_ids", [])
+            if isinstance(dropped, list):
+                metadata["drop_plan_ids"] = tuple(
+                    _clean_short_metadata(item) for item in dropped[:12] if item
+                )
     if not metadata["commit_title"]:
         metadata["commit_title"] = _clean_commit_title(metadata.get("change", ""))
     if not metadata["commit_summary"]:
@@ -292,6 +326,9 @@ class CodexCandidateProvider:
             commit_summary=metadata["commit_summary"],
             falsifier=metadata["falsifier"],
             change_scope=metadata["change_scope"] or "kernel-python",
+            plan_id=metadata["plan_id"],
+            pending_plans=metadata["pending_plans"],
+            drop_plan_ids=metadata["drop_plan_ids"],
         )
 
 
@@ -363,6 +400,8 @@ def _build_prompt(
         for case in context.current_performance.cases
     )
     diagnostics = "\n".join(context.previous_diagnostics[-5:]) or "None"
+    proposal_pool = json.dumps(context.proposal_pool, indent=2) if context.proposal_pool else "[]"
+    latest_retro = json.dumps(context.latest_retro, indent=2) if context.latest_retro else "None"
     reference_block = ""
     if getattr(request, "reference_kernel_source", None):
         reference_block = f"\nReference kernel (oracle, do not copy verbatim — use for correctness/performance comparison):\n```python\n{request.reference_kernel_source[:4000]}\n```\n"
@@ -396,6 +435,18 @@ Current measurements:
 
 Recent failed-candidate diagnostics:
 {diagnostics}
+
+Current TL proposal pool:
+{proposal_pool}
+
+Latest Worker retro:
+{latest_retro}
+
+Before editing, re-scan the proposal pool against the latest retro. Select one pending
+plan or add a new evidence-backed plan. Drop pending plans invalidated by the callback.
+Record the selected `plan_id`, up to 12 remaining `pending_plans`, and any
+`drop_plan_ids` in candidate_metadata.json. Each pending plan uses the same causal fields
+as the selected proposal, except `expected_effect` is named `predicted_signal`.
 
 Current source: read and edit `candidate.py` in the working directory.
 """

@@ -929,6 +929,7 @@ def _print_result(
     summary = {
         "artifacts_dir": str(output_dir),
         "manager_log": str(output_dir / "manager.log"),
+        "plan_pool": str(output_dir / "tl" / "plan_pool.json"),
         "result_json": str(output_dir / "result.json"),
         "swimlane": str(output_dir / "swimlane.svg"),
         "stopping_reason": result.stopping_reason,

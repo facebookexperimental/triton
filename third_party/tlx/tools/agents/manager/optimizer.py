@@ -4,7 +4,7 @@ import sys
 import tempfile
 import time
 from collections.abc import Mapping
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -15,8 +15,14 @@ from ..profiler.profiling import (
     extract_ncu_duration_us,
     ncu_regression_diagnostic,
 )
+from ..tl.planner import TLPlanPoolRevision, TLProposalPool
 from ..worker.artifacts import ArtifactStore, CandidateArtifactPaths
-from ..worker.providers import CandidateContext, CandidateProvider, CodexCandidateProvider
+from ..worker.providers import (
+    CandidateContext,
+    CandidateProposal,
+    CandidateProvider,
+    CodexCandidateProvider,
+)
 from ..worker.source import source_digest
 from .models import (
     AutoCommitResult,
@@ -35,6 +41,35 @@ _PROFILE_TOOLS = ("proton_launch", "native_profiler")
 _DIAGNOSTIC_PROFILE_TOOLS = ("proton_intra_kernel",)
 _DIAGNOSTIC_PROFILE_KEY = "diagnostic_proton_intra_kernel"
 _NEAR_THRESHOLD_WINDOW = 0.01
+
+
+def _write_plan_pool_revision(
+    store: ArtifactStore, revision: TLPlanPoolRevision
+) -> Path:
+    path = store.write_json(
+        f"tl/plan_pool.r{revision.revision:04d}.json", revision
+    )
+    store.write_json("tl/plan_pool.json", revision)
+    return path
+
+
+def _retro_observed_signal(performance: PerformanceSummary | None) -> str:
+    if performance is None:
+        return "No runnable candidate measurement was produced."
+    parts = []
+    for evaluation in performance.cases:
+        state = "correct" if evaluation.verification.passed else "incorrect"
+        timing = (
+            f"median={evaluation.timing.median_us:.3f}us, "
+            f"cv={evaluation.timing.coefficient_of_variation:.4f}"
+            if evaluation.timing is not None
+            else "timing=unavailable"
+        )
+        profile = compact_profile_summary(evaluation.profile)
+        parts.append(
+            f"{evaluation.case_id}: {state}, {timing}, profile={profile}"
+        )
+    return "; ".join(parts)[:2000]
 
 
 class PromotionCommitter(Protocol):
@@ -677,6 +712,8 @@ class KernelOptimizer:
         best_commit_summary = ""
         best_profiles = baseline_profiles
         diagnostics: list[str] = []
+        proposal_pool = TLProposalPool()
+        _write_plan_pool_revision(store, proposal_pool.initial())
         promotion_commits: list[AutoCommitResult] = []
         rollback_commit: AutoCommitResult | None = None
         last_auto_commit: AutoCommitResult | None = None
@@ -693,6 +730,11 @@ class KernelOptimizer:
             if time.monotonic() - start_time >= request.budget.max_total_seconds:
                 stopping_reason = "time_budget_exhausted"
                 break
+            # A round is one cohort: every Worker starts from the same frozen
+            # incumbent even though callbacks are processed serially today.
+            round_parent_id = best_experiment_id
+            round_parent_source = best_source
+            round_parent_performance = best_performance
             promoted_this_round = False
             for candidate_index in range(request.budget.candidates_per_round):
                 if time.monotonic() - start_time >= request.budget.max_total_seconds:
@@ -700,10 +742,13 @@ class KernelOptimizer:
                     exhausted = True
                     break
                 experiment_id = f"r{round_index:03d}-c{candidate_index:03d}"
-                parent_id = best_experiment_id
-                parent_source = best_source
+                parent_id = round_parent_id
+                parent_source = round_parent_source
                 proposal = None
                 candidate_artifacts = None
+                plan_id = ""
+                performance = None
+                decision = ""
                 try:
                     _report_performance(experiment_id, "generating", None)
                     proposal = self._provider.propose(
@@ -712,11 +757,31 @@ class KernelOptimizer:
                             round_index=round_index,
                             candidate_index=candidate_index,
                             current_source=parent_source,
-                            current_performance=best_performance,
+                            current_performance=round_parent_performance,
                             previous_diagnostics=tuple(diagnostics),
+                            proposal_pool=proposal_pool.prompt_plans(),
+                            latest_retro=(
+                                asdict(proposal_pool.latest_retro)
+                                if proposal_pool.latest_retro is not None
+                                else None
+                            ),
                         ),
                     )
                     _report_candidate_summary(experiment_id, proposal)
+                    pool_revision = proposal_pool.dispatch(proposal, experiment_id)
+                    plan_id = next(
+                        plan.plan_id
+                        for plan in pool_revision.plans
+                        if plan.worker_id == experiment_id
+                    )
+                    _write_plan_pool_revision(store, pool_revision)
+                    print(
+                        "[tlx-agent] TL_POOL_REFRESH "
+                        f"revision={pool_revision.revision} trigger=dispatch "
+                        f"worker={experiment_id} plan={plan_id!r} recipient=TL",
+                        file=sys.stderr,
+                        flush=True,
+                    )
                     candidate_artifacts = store.write_candidate_artifacts(
                         experiment_id,
                         source=proposal.source,
@@ -847,6 +912,7 @@ class KernelOptimizer:
                         falsifier=proposal.falsifier,
                         change_scope=proposal.change_scope,
                         profile_path=profile_path,
+                        plan_id=plan_id,
                     )
                     rejection_diagnostics = "; ".join(
                         f"{evaluation.case_id}: {evaluation.verification.diagnostics}"
@@ -945,6 +1011,72 @@ class KernelOptimizer:
                         None,
                         diagnostics=message,
                     )
+                if not plan_id:
+                    failure_proposal = proposal or CandidateProposal(
+                        source="",
+                        summary="Worker failed before producing a proposal",
+                        hypothesis="Candidate generation or implementation failed",
+                        expected_effect="No measurable signal was produced",
+                        plan_id=f"plan-{experiment_id}",
+                    )
+                    pool_revision = proposal_pool.dispatch(
+                        failure_proposal, experiment_id
+                    )
+                    plan_id = next(
+                        plan.plan_id
+                        for plan in pool_revision.plans
+                        if plan.worker_id == experiment_id
+                    )
+                    _write_plan_pool_revision(store, pool_revision)
+                if experiment.status == "promoted":
+                    retro_outcome = "global_win"
+                elif performance is not None and not passes_protected_cases(
+                    performance, request.cases
+                ):
+                    retro_outcome = "correctness_failure"
+                elif experiment.status == "failed":
+                    retro_outcome = "implementation_failure"
+                else:
+                    retro_outcome = "performance_rejection"
+                retro_revision = proposal_pool.refresh(
+                    worker_id=experiment_id,
+                    plan_id=plan_id,
+                    outcome=retro_outcome,
+                    observed_signal=_retro_observed_signal(performance),
+                    diagnosis=decision or experiment.diagnostics or retro_outcome,
+                )
+                retro_path = store.write_json(
+                    f"experiments/{experiment_id}/tl_retro.json",
+                    retro_revision.retro,
+                )
+                pool_path = _write_plan_pool_revision(store, retro_revision)
+                experiment = replace(
+                    experiment,
+                    plan_id=plan_id,
+                    tl_retro_path=retro_path,
+                    plan_pool_revision=retro_revision.revision,
+                )
+                dropped = (
+                    ",".join(retro_revision.retro.dropped_plan_ids)
+                    if retro_revision.retro is not None
+                    else ""
+                )
+                print(
+                    "[tlx-agent] TL_RETRO "
+                    f"worker={experiment_id} outcome={retro_outcome} "
+                    f"plan={plan_id!r} diagnosis={(decision or experiment.diagnostics or retro_outcome)!r} "
+                    f"profile_evidence={_retro_observed_signal(performance)!r} recipient=TL",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                print(
+                    "[tlx-agent] TL_POOL_REFRESH "
+                    f"revision={retro_revision.revision} trigger=callback "
+                    f"worker={experiment_id} dropped={dropped!r} "
+                    f"artifact={str(pool_path)!r} recipient=TL",
+                    file=sys.stderr,
+                    flush=True,
+                )
                 experiments.append(experiment)
                 store.write_json(
                     f"experiments/{experiment_id}/result.json", experiment

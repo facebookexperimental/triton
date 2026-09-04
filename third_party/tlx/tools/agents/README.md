@@ -96,6 +96,12 @@ baseline-only and budget-exhausted outcomes, and reports its path in the final l
 and summary. Its vertical lanes are ordered Manager, Build, Knowledge, Profiler, TL,
 Worker, Correctness, and Performance, with one timeline row per Worker run.
 
+TL keeps its mutable, run-scoped proposal state under `tl/plan_pool.json`, with an
+immutable file for every revision and a profiling-aware `tl_retro.json` beside each
+Worker result. Every callback refreshes this pool before the next Worker proposal.
+Workers within one round use the same frozen incumbent source; a promoted result can
+become the base only when the next round starts.
+
 A case may declare `"required_profile": "att"` in its parameters. Manager then
 requires one successfully decoded ATT dispatch with instruction rows during baseline
 preflight and final validation. Counter fallback remains available as a diagnostic but

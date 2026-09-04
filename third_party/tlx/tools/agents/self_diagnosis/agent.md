@@ -6,7 +6,7 @@ Wake after changes to agent orchestration, contracts, profiling, source handling
 
 ## Action space
 
-Run the focused `test_*.py` suite and deterministic fake harness; validate imports, scoring, promotion, subprocess isolation, profiler commands and parsing, required-profile stop gates, complete Manager log persistence, artifact persistence, guidance resolution, architecture routing, final revalidation, and safe VCS behavior. Report failures to the owning agent directory.
+Run the focused `test_*.py` suite and deterministic fake harness; validate imports, scoring, promotion, subprocess isolation, profiler commands and parsing, required-profile stop gates, TL retro and proposal-pool revisions, complete Manager log persistence, artifact persistence, guidance resolution, architecture routing, final revalidation, and safe VCS behavior. Report failures to the owning agent directory.
 
 ## Constraints
 

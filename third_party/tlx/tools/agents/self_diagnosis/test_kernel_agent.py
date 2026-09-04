@@ -55,6 +55,7 @@ from third_party.tlx.tools.agents.manager.optimizer import (
 )
 from third_party.tlx.tools.agents.profiler.backends.gfx942 import att
 from third_party.tlx.tools.agents.profiler.profiling import ProfileRequest
+from third_party.tlx.tools.agents.tl.planner import TLProposalPool
 from third_party.tlx.tools.agents.worker.providers import (
     CandidateContext,
     CandidateProposal,
@@ -310,6 +311,15 @@ class ScoringTest(unittest.TestCase):
                         "schema_version": 1,
                         "hypothesis": "  reduce   work ",
                         "change": "Fold a constant scale.",
+                        "plan_id": "plan-scale",
+                        "pending_plans": [
+                            {
+                                "plan_id": "plan-layout",
+                                "hypothesis": "Improve locality",
+                                "change": "Change the tile layout",
+                            }
+                        ],
+                        "drop_plan_ids": ["plan-old"],
                         "commit_title": "Fold half scale into dS encoding",
                         "commit_summary": "Change summary:\nFold the scale into the encoded exponent.\n\nWhy:\nReduce repeated arithmetic while preserving the generic fallback.",
                     }
@@ -317,6 +327,9 @@ class ScoringTest(unittest.TestCase):
             )
             metadata = _read_candidate_metadata(path)
             self.assertEqual(metadata["hypothesis"], "reduce work")
+            self.assertEqual(metadata["plan_id"], "plan-scale")
+            self.assertEqual(metadata["pending_plans"][0]["plan_id"], "plan-layout")
+            self.assertEqual(metadata["drop_plan_ids"], ("plan-old",))
             self.assertEqual(metadata["commit_title"], "Fold half scale into dS encoding")
             self.assertIn("encoded exponent", metadata["commit_summary"])
             self.assertIn("generic fallback", metadata["commit_summary"])
@@ -359,11 +372,30 @@ class ScoringTest(unittest.TestCase):
         )
         prompt = _build_prompt(
             request,
-            CandidateContext(1, 0, request.kernel_source, performance, ()),
+            CandidateContext(
+                1,
+                0,
+                request.kernel_source,
+                performance,
+                (),
+                proposal_pool=(
+                    {
+                        "plan_id": "plan-layout",
+                        "hypothesis": "Improve locality",
+                    },
+                ),
+                latest_retro={
+                    "worker_id": "r001-c000",
+                    "outcome": "performance_rejection",
+                },
+            ),
         )
         self.assertIn("infer task overlap from a launch timeline", prompt)
         self.assertIn("diagnostic intra-kernel traces", prompt)
         self.assertIn("wrapper_us", prompt)
+        self.assertIn("plan-layout", prompt)
+        self.assertIn("performance_rejection", prompt)
+        self.assertIn("re-scan the proposal pool", prompt)
         self.assertNotIn("xxxxx", prompt)
 
     def test_applies_candidate_unified_diff(self) -> None:
@@ -585,6 +617,7 @@ class CliTest(unittest.TestCase):
             {
                 "artifacts_dir": "/tmp/out",
                 "manager_log": "/tmp/out/manager.log",
+                "plan_pool": "/tmp/out/tl/plan_pool.json",
                 "result_json": "/tmp/out/result.json",
                 "swimlane": "/tmp/out/swimlane.svg",
                 "stopping_reason": "round_budget_exhausted",
@@ -1018,6 +1051,43 @@ class HarnessTest(unittest.TestCase):
 
 
 class KernelOptimizerTest(unittest.TestCase):
+    def test_tl_retro_drops_matching_pending_plan_after_failure(self) -> None:
+        pool = TLProposalPool()
+        proposal = CandidateProposal(
+            "VALUE = 2\n",
+            summary="increase tile width",
+            hypothesis="wider tiles improve reuse",
+            expected_effect="reduce memory stalls",
+            plan_id="selected",
+            pending_plans=(
+                {
+                    "plan_id": "duplicate",
+                    "hypothesis": "wider tiles improve reuse",
+                    "change": "increase tile width",
+                },
+                {
+                    "plan_id": "independent",
+                    "hypothesis": "reduce synchronization",
+                    "change": "change ring depth",
+                },
+            ),
+        )
+        pool.dispatch(proposal, "r001-c000")
+
+        revision = pool.refresh(
+            worker_id="r001-c000",
+            plan_id="selected",
+            outcome="correctness_failure",
+            observed_signal="shape a failed numerical validation",
+            diagnosis="incorrect output",
+        )
+
+        states = {plan.plan_id: plan.state for plan in revision.plans}
+        self.assertEqual(states["selected"], "completed")
+        self.assertEqual(states["duplicate"], "dropped")
+        self.assertEqual(states["independent"], "pending")
+        self.assertEqual(revision.retro.dropped_plan_ids, ("duplicate",))
+
     def test_prior_source_is_rejected_without_adopting_prior_winner(self) -> None:
         baseline_source = "LATENCY_US = 100\nCORRECT = True\n"
         prior_source = "LATENCY_US = 80\nCORRECT = True\n"
@@ -1099,10 +1169,11 @@ class KernelOptimizerTest(unittest.TestCase):
             )
 
             first, second = result.experiments[1:]
-            self.assertEqual(second.parent_id, first.experiment_id)
+            self.assertEqual(first.parent_id, "baseline")
+            self.assertEqual(second.parent_id, "baseline")
             incremental = second.incremental_patch_path.read_text()
             cumulative = second.cumulative_patch_path.read_text()
-            self.assertIn("-LATENCY_US = 80", incremental)
+            self.assertIn("-LATENCY_US = 100", incremental)
             self.assertIn("+LATENCY_US = 60", incremental)
             self.assertIn("-LATENCY_US = 100", cumulative)
             self.assertIn("+LATENCY_US = 60", cumulative)
@@ -1307,6 +1378,10 @@ class KernelOptimizerTest(unittest.TestCase):
                     output_dir=Path(directory),
                 )
             )
+            first_retro = _read_json(
+                Path(directory) / "experiments/r001-c000/tl_retro.json"
+            )
+            latest_pool = _read_json(Path(directory) / "tl/plan_pool.json")
 
         self.assertTrue(result.success)
         self.assertEqual(len(contexts), 2)
@@ -1320,6 +1395,11 @@ class KernelOptimizerTest(unittest.TestCase):
         self.assertIn("cv=0.0000", feedback)
         self.assertIn("speedup=0.8333x", feedback)
         self.assertIn("ncu=unavailable", feedback)
+        self.assertEqual(first_retro["outcome"], "performance_rejection")
+        self.assertEqual(contexts[1].latest_retro["worker_id"], "r001-c000")
+        self.assertGreaterEqual(latest_pool["revision"], 4)
+        self.assertEqual(result.experiments[1].plan_id, "plan-r001-c000")
+        self.assertEqual(result.experiments[1].plan_pool_revision, 2)
 
     def test_continues_after_round_without_promotion(self) -> None:
         provider = FixedCandidateProvider(
