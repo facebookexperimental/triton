@@ -79,7 +79,7 @@ configs = [
         (True, False, False),
         (True, True, False),
     ] for uwb in [False, True]
-    for compact_clc in ([False, True] if grp_n > 4 and uwb and not fast_fixed else [False])
+    for compact_clc in ([False, True] if grp_n > 4 and uwb else [False])
 ] + [
     triton.Config(
         {
@@ -149,6 +149,8 @@ def prune_configs_by_hdim(configs, named_args, **kwargs):
         kv = conf.kwargs.get("NUM_BUFFERS_KV", 0)
         grp_n = conf.kwargs.get("GROUP_SIZE_N", 0)
         is_2cta = conf.kwargs.get("NUM_CTAS", 1) > 1
+        if STAGE == 3 and conf.kwargs.get("FAST_FIXED", False):
+            continue
         if grp_n not in target_group_sizes:
             continue
         if is_2cta:
@@ -436,6 +438,8 @@ def _fwd_softmax_tile_1cta(
     RESCALE_OPT: tl.constexpr,
     SCALAR_N: tl.constexpr,
     FAST_FIXED: tl.constexpr,
+    CAUSAL_FIXED_GAUGE: tl.constexpr,
+    SKIP_CAUSAL_DIAG: tl.constexpr,
 ):
     FAST_BF16: tl.constexpr = FAST_FIXED and out_dtype == tl.bfloat16
     FAST_F16: tl.constexpr = FAST_FIXED and out_dtype == tl.float16
@@ -445,7 +449,38 @@ def _fwd_softmax_tile_1cta(
         for start_n in tl.range(lo, hi, BLOCK_N):
             _, qk_phase = get_bufidx_phase(accum_cnt_qk, 1)
             tlx.barrier_wait(tlx.local_view(qk_fulls, cid), qk_phase)
-            if gauge_cnt == 0:
+            skip_q0 = SKIP_CAUSAL_DIAG and STAGE == 2 and cid == 0 and start_n + BLOCK_N >= hi
+            if skip_q0:
+                for slice_id in tl.static_range(0, NUM_P_SLICES):
+                    p_bufIdx = cid * NUM_P_SLICES + slice_id
+                    tlx.barrier_arrive(tlx.local_view(p_fulls, p_bufIdx))
+            else:
+                if gauge_cnt == 0:
+                    if CAUSAL_FIXED_GAUGE:
+                        qk_fragment = tlx.local_load(tlx.subslice(
+                            tlx.local_view(qk_tiles, cid),
+                            0,
+                            32,
+                        ))
+                        if STAGE == 2:
+                            col_limit_right = (offs_m - start_n + 1)[:, None]
+                            qk_fragment = _apply_causal_mask(qk_fragment, col_limit_right, 32)
+                        m_i = tl.maximum(m_i, tl.max(qk_fragment, 1) * qk_scale)
+                        m_i = tl.ceil(m_i) + _CAUSAL_FIXED_GAUGE_HEADROOM + _ROUNDING_GAUGE
+                    else:
+                        for fragment_id in tl.static_range(0, 4):
+                            qk_fragment = tlx.local_load(tlx.subslice(
+                                tlx.local_view(qk_tiles, cid),
+                                fragment_id * 32,
+                                32,
+                            ))
+                            if STAGE == 2:
+                                col_limit_right = (offs_m - (start_n + fragment_id * 32) + 1)[:, None]
+                                qk_fragment = _apply_causal_mask(qk_fragment, col_limit_right, 32)
+                            m_i = tl.maximum(m_i, tl.max(qk_fragment, 1) * qk_scale)
+                        m_i = tl.ceil(m_i) + _ROUNDING_GAUGE
+                l_ij = tl.zeros([BLOCK_M // 2], dtype=tl.float32)
+                p_pending = tl.zeros([BLOCK_M // 2, 32], dtype=out_dtype)
                 for fragment_id in tl.static_range(0, 4):
                     qk_fragment = tlx.local_load(tlx.subslice(
                         tlx.local_view(qk_tiles, cid),
@@ -455,47 +490,39 @@ def _fwd_softmax_tile_1cta(
                     if STAGE == 2:
                         col_limit_right = (offs_m - (start_n + fragment_id * 32) + 1)[:, None]
                         qk_fragment = _apply_causal_mask(qk_fragment, col_limit_right, 32)
-                    m_i = tl.maximum(m_i, tl.max(qk_fragment, 1) * qk_scale)
-                m_i = tl.ceil(m_i) + _ROUNDING_GAUGE
-            l_ij = tl.zeros([BLOCK_M // 2], dtype=tl.float32)
-            p_pending = tl.zeros([BLOCK_M // 2, 32], dtype=out_dtype)
-            for fragment_id in tl.static_range(0, 4):
-                qk_fragment = tlx.local_load(tlx.subslice(
-                    tlx.local_view(qk_tiles, cid),
-                    fragment_id * 32,
-                    32,
-                ))
-                if STAGE == 2:
-                    col_limit_right = (offs_m - (start_n + fragment_id * 32) + 1)[:, None]
-                    qk_fragment = _apply_causal_mask(qk_fragment, col_limit_right, 32)
-                if FAST_BF16:
-                    p_h = _s2_exp2_bf16(
-                        qk_fragment,
-                        qk_scale * _EXP2_BF16_SCALE,
-                        _EXP2_MAGIC + _EXP2_BF16_SCALE * (_EXP2_BF16_BIAS - m_i[:, None]),
-                    )
-                elif STAGE == 2:
-                    p_i = tl.math.exp2(_fma_f32x2(qk_fragment, qk_scale, -m_i[:, None]))
-                    p_h = p_i.to(out_dtype)
-                else:
-                    p_h = _s2_exp2_f16(
-                        qk_fragment,
-                        qk_scale * _EXP2_F16_SCALE,
-                        _EXP2_MAGIC + _EXP2_F16_SCALE * (_EXP2_F16_BIAS - m_i[:, None]),
-                    )
-                if (FAST_BF16 or FAST_F16) and fragment_id % 2 == 0:
-                    p_pending = p_h
-                elif FAST_BF16 or FAST_F16:
-                    p_bufIdx = cid * 2 + fragment_id // 2
-                    tlx.local_store(tlx.local_view(p_tiles, p_bufIdx), _join_n_2D([p_pending, p_h]))
-                    tlx.barrier_arrive(tlx.local_view(p_fulls, p_bufIdx))
-                if FAST_BF16:
-                    l_ij += tl.reduce(p_h, axis=1, combine_fn=_reduce_bf16).to(tl.float32)
-                elif STAGE == 2:
-                    l_ij += tl.sum(p_i, 1)
-                else:
-                    l_ij += tl.sum(p_h, 1).to(tl.float32)
-            l_i += l_ij
+                    if CAUSAL_FIXED_GAUGE:
+                        p_i = tl.math.exp2(_fma_f32x2(qk_fragment, qk_scale, -m_i[:, None]))
+                        p_h = p_i.to(out_dtype)
+                    elif FAST_BF16:
+                        p_h = _s2_exp2_bf16(
+                            qk_fragment,
+                            qk_scale * _EXP2_BF16_SCALE,
+                            _EXP2_MAGIC + _EXP2_BF16_SCALE * (_EXP2_BF16_BIAS - m_i[:, None]),
+                        )
+                    elif STAGE == 2:
+                        p_i = tl.math.exp2(_fma_f32x2(qk_fragment, qk_scale, -m_i[:, None]))
+                        p_h = p_i.to(out_dtype)
+                    else:
+                        p_h = _s2_exp2_f16(
+                            qk_fragment,
+                            qk_scale * _EXP2_F16_SCALE,
+                            _EXP2_MAGIC + _EXP2_F16_SCALE * (_EXP2_F16_BIAS - m_i[:, None]),
+                        )
+                    if (FAST_BF16 or FAST_F16) and fragment_id % 2 == 0:
+                        p_pending = p_h
+                    elif FAST_BF16 or FAST_F16:
+                        p_bufIdx = cid * 2 + fragment_id // 2
+                        tlx.local_store(tlx.local_view(p_tiles, p_bufIdx), _join_n_2D([p_pending, p_h]))
+                        tlx.barrier_arrive(tlx.local_view(p_fulls, p_bufIdx))
+                    if CAUSAL_FIXED_GAUGE:
+                        l_ij += tl.sum(p_i, 1)
+                    elif FAST_BF16:
+                        l_ij += tl.reduce(p_h, axis=1, combine_fn=_reduce_bf16).to(tl.float32)
+                    elif STAGE == 2:
+                        l_ij += tl.sum(p_i, 1)
+                    else:
+                        l_ij += tl.sum(p_h, 1).to(tl.float32)
+                l_i += l_ij
             accum_cnt_qk += 1
             gauge_cnt += 1
         return m_i, l_i, accum_cnt_qk, gauge_cnt
@@ -506,80 +533,75 @@ def _fwd_softmax_tile_1cta(
         qk_buf_phase = accum_cnt_qk & 1
         alpha_phase = accum_cnt_qk & 1
         tlx.barrier_wait(tlx.local_view(qk_fulls, qk_buf), qk_buf_phase)
-        qk = tlx.local_load(tlx.local_view(qk_tiles, qk_buf))
-
-        if STAGE == 2:
-            col_limit_right = (offs_m - start_n + 1)[:, None]
-            qk = _apply_causal_mask(qk, col_limit_right, BLOCK_N)
-
-        # compute m_i, p in registers
-        # update_row_max: row_max_new = _compute_row_max(qk, row_max[0])
-        # -> FA4 handles one row per thread (32 threads per warp * 4)
-        # -> use fmax_reduce(one row of qk, m_i[0])
-        # -> m_i|m_ij = row_max[0] * scale
-        if RESCALE_OPT:
-            m_ij = tl.maximum(m_i, tl.max(qk, 1))
-        else:
-            m_ij = tl.maximum(m_i, tl.max(qk, 1) * qk_scale)
-
-        # -- compute correction factor
-        # update_row_max: acc_scale_ = (row_max[0] - row_max_new) * scale
-        # -> acc_scale = exp2(acc_scale_)
-        # -> if (acc_scale_ >= -8.0):
-        # ->   row_max_new = row_max[0]; acc_scale = 1.0
-        # -> row_max[0] = row_max_new
-        if RESCALE_OPT:
-            alpha_ = (m_i - m_ij) * qk_scale  # alpha_ is 1D distributed over the warp group
-            alpha = tl.math.exp2(alpha_)
-            rescale_mask = alpha_ >= -8.0
-            alpha = tl.where(rescale_mask, 1.0, alpha)
-            m_ij = tl.where(rescale_mask, m_i, m_ij)
-        else:
-            alpha = tl.math.exp2(m_i - m_ij)
-        tlx.barrier_wait(tlx.local_view(alpha_empties, cid), alpha_phase ^ 1)
-        tlx.local_store(tlx.local_view(alpha_tiles, cid), tl.join(alpha, alpha) if SCALAR_N == 2 else alpha[:, None])
-        tlx.barrier_arrive(tlx.local_view(alpha_fulls, cid))
-        # Shorten alpha's lifetime: consume immediately, add l_ij later
-        l_i *= alpha
-
-        # scale_subtract_rowmax:
-        # -> row_max_scaled = row_max_new * scale
-        # -> s[i], s[i+1] = fma_packed_f32x2((s[i], s[i+1]), (scale, scale), (-row_max_scaled, -row_max_scaled))
-        if RESCALE_OPT:
-            m_scaled = m_ij * qk_scale
-            qk = _fma_f32x2(qk, qk_scale, -m_scaled[:, None])
-        else:
-            qk = _fma_f32x2(qk, qk_scale, -m_ij[:, None])
-        # apply_epx2_convert in FA4:
-        # 128 elements per row is divided into 4 fragments, first fragment covers [0] to [31]
-        # for last fragment, always use SFU, for first 3 fragments, elements 0 to 11 use SFU,
-        # elements 12 to 15 use emulation, elements 16 to 27 use SFU, elements 28 to 31 use emulation
-        # the loop is unrolled twice likely for vectorization
-        qks = _split_n_2D(qk, NUM_MMA_SLICES)
-        l_ij = tl.zeros_like(l_i)
-        p_pending = tl.zeros([BLOCK_M // 2, BLOCK_N // NUM_MMA_SLICES], dtype=out_dtype)
-        for slice_id in tl.static_range(0, NUM_MMA_SLICES):
-            # prepare p for the v dot
-            p_i = tl.math.exp2(qks[slice_id])
-            p_h = p_i.to(out_dtype)
-            if FAST_F16:
-                if slice_id % 2 == 0:
-                    p_pending = p_h
-                else:
-                    p_bufIdx = qk_buf * NUM_P_SLICES + slice_id // 2
-                    tlx.local_store(
-                        tlx.local_view(p_tiles, p_bufIdx),
-                        _join_n_2D([p_pending, p_h]),
-                    )
-                    tlx.barrier_arrive(tlx.local_view(p_fulls, p_bufIdx))
-            else:
+        skip_q0 = SKIP_CAUSAL_DIAG and STAGE == 2 and cid == 0 and start_n + BLOCK_N >= hi
+        if skip_q0:
+            alpha = tl.full([BLOCK_M // 2], 1.0, tl.float32)
+            tlx.barrier_wait(tlx.local_view(alpha_empties, cid), alpha_phase ^ 1)
+            tlx.local_store(
+                tlx.local_view(alpha_tiles, cid),
+                tl.join(alpha, alpha) if SCALAR_N == 2 else alpha[:, None],
+            )
+            tlx.barrier_arrive(tlx.local_view(alpha_fulls, cid))
+            for slice_id in tl.static_range(0, NUM_P_SLICES):
                 p_bufIdx = qk_buf * NUM_P_SLICES + slice_id
-                tlx.local_store(tlx.local_view(p_tiles, p_bufIdx), p_h)
                 tlx.barrier_arrive(tlx.local_view(p_fulls, p_bufIdx))
-            l_ij += tl.sum(p_i, 1)
+        else:
+            qk = tlx.local_load(tlx.local_view(qk_tiles, qk_buf))
 
-        l_i += l_ij
-        m_i = m_ij
+            if STAGE == 2:
+                col_limit_right = (offs_m - start_n + 1)[:, None]
+                qk = _apply_causal_mask(qk, col_limit_right, BLOCK_N)
+
+            if RESCALE_OPT:
+                m_ij = tl.maximum(m_i, tl.max(qk, 1))
+            else:
+                m_ij = tl.maximum(m_i, tl.max(qk, 1) * qk_scale)
+
+            if RESCALE_OPT:
+                alpha_ = (m_i - m_ij) * qk_scale
+                alpha = tl.math.exp2(alpha_)
+                rescale_mask = alpha_ >= -8.0
+                alpha = tl.where(rescale_mask, 1.0, alpha)
+                m_ij = tl.where(rescale_mask, m_i, m_ij)
+            else:
+                alpha = tl.math.exp2(m_i - m_ij)
+            tlx.barrier_wait(tlx.local_view(alpha_empties, cid), alpha_phase ^ 1)
+            tlx.local_store(
+                tlx.local_view(alpha_tiles, cid),
+                tl.join(alpha, alpha) if SCALAR_N == 2 else alpha[:, None],
+            )
+            tlx.barrier_arrive(tlx.local_view(alpha_fulls, cid))
+            l_i *= alpha
+
+            if RESCALE_OPT:
+                m_scaled = m_ij * qk_scale
+                qk = _fma_f32x2(qk, qk_scale, -m_scaled[:, None])
+            else:
+                qk = _fma_f32x2(qk, qk_scale, -m_ij[:, None])
+            qks = _split_n_2D(qk, NUM_MMA_SLICES)
+            l_ij = tl.zeros_like(l_i)
+            p_pending = tl.zeros([BLOCK_M // 2, BLOCK_N // NUM_MMA_SLICES], dtype=out_dtype)
+            for slice_id in tl.static_range(0, NUM_MMA_SLICES):
+                p_i = tl.math.exp2(qks[slice_id])
+                p_h = p_i.to(out_dtype)
+                if FAST_F16:
+                    if slice_id % 2 == 0:
+                        p_pending = p_h
+                    else:
+                        p_bufIdx = qk_buf * NUM_P_SLICES + slice_id // 2
+                        tlx.local_store(
+                            tlx.local_view(p_tiles, p_bufIdx),
+                            _join_n_2D([p_pending, p_h]),
+                        )
+                        tlx.barrier_arrive(tlx.local_view(p_fulls, p_bufIdx))
+                else:
+                    p_bufIdx = qk_buf * NUM_P_SLICES + slice_id
+                    tlx.local_store(tlx.local_view(p_tiles, p_bufIdx), p_h)
+                    tlx.barrier_arrive(tlx.local_view(p_fulls, p_bufIdx))
+                l_ij += tl.sum(p_i, 1)
+
+            l_i += l_ij
+            m_i = m_ij
         accum_cnt_qk += 1
     return m_i, l_i, accum_cnt_qk, gauge_cnt
 
@@ -784,6 +806,8 @@ def _fwd_softmax_tile(
     SCALAR_N: tl.constexpr,
     USE_2CTA: tl.constexpr,
     FAST_FIXED: tl.constexpr,
+    CAUSAL_FIXED_GAUGE: tl.constexpr,
+    SKIP_CAUSAL_DIAG: tl.constexpr,
 ):
     if USE_2CTA:
         if FAST_FIXED:
@@ -854,6 +878,8 @@ def _fwd_softmax_tile(
         RESCALE_OPT,
         SCALAR_N,
         FAST_FIXED,
+        CAUSAL_FIXED_GAUGE,
+        SKIP_CAUSAL_DIAG,
     )
 
 
@@ -982,6 +1008,76 @@ def _fwd_fixed_2cta_control_tile(
     tlx.fence("async_shared")
     tlx.barrier_arrive(o_fulls[cid])
     return accum_cnt_qk, gauge_cnt
+
+
+@triton.jit
+def _fwd_softmax_stages(
+    qk_fulls,
+    qk_tiles,
+    p_fulls,
+    p_tiles,
+    alpha_empties,
+    alpha_fulls,
+    alpha_tiles,
+    acc_fulls,
+    acc_tiles,
+    cid,
+    accum_cnt_qk,
+    gauge_cnt,
+    qk_scale,
+    offs_m,
+    m_i,
+    l_i,
+    start_m,
+    N_CTX,
+    out_dtype,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    NUM_MMA_SLICES: tl.constexpr,
+    STAGE: tl.constexpr,
+    RESCALE_OPT: tl.constexpr,
+    SCALAR_N: tl.constexpr,
+    USE_2CTA: tl.constexpr,
+    FAST_FIXED: tl.constexpr,
+    CAUSAL_FIXED_GAUGE: tl.constexpr,
+    SKIP_CAUSAL_DIAG: tl.constexpr,
+):
+    for stage_bit in tl.static_range(1, 3):
+        if STAGE & stage_bit:
+            m_i, l_i, accum_cnt_qk, gauge_cnt = _fwd_softmax_tile(
+                qk_fulls,
+                qk_tiles,
+                p_fulls,
+                p_tiles,
+                alpha_empties,
+                alpha_fulls,
+                alpha_tiles,
+                acc_fulls,
+                acc_tiles,
+                cid,
+                accum_cnt_qk,
+                gauge_cnt,
+                qk_scale,
+                offs_m,
+                m_i,
+                l_i,
+                start_m,
+                N_CTX,
+                out_dtype,
+                BLOCK_M,
+                BLOCK_N,
+                HEAD_DIM,
+                NUM_MMA_SLICES,
+                STAGE=4 - STAGE if stage_bit == 1 else 2,
+                RESCALE_OPT=RESCALE_OPT,
+                SCALAR_N=SCALAR_N,
+                USE_2CTA=USE_2CTA,
+                FAST_FIXED=FAST_FIXED,
+                CAUSAL_FIXED_GAUGE=CAUSAL_FIXED_GAUGE,
+                SKIP_CAUSAL_DIAG=SKIP_CAUSAL_DIAG,
+            )
+    return m_i, l_i, accum_cnt_qk, gauge_cnt
 
 
 @triton.jit
@@ -1366,6 +1462,7 @@ def _fwd_mma_tile(
     v_empties=None,
     USE_2CTA: tl.constexpr = False,
     SKIP_RESCALE: tl.constexpr = False,
+    SKIP_CAUSAL_Q0_LAST: tl.constexpr = False,
 ):
     v_tiles = v_tiles if USE_2CTA else kv_tiles
     v_fulls = v_fulls if USE_2CTA else kv_fulls
@@ -1466,14 +1563,18 @@ def _fwd_mma_tile(
         k_tile = tlx.local_trans(kv_tiles[k_bufIdx])
         _, qk_phase = get_bufidx_phase(accum_cnt_qk, 1)
 
-        tlx.async_dot(
-            q_tiles[0],
-            k_tile,
-            qk_tiles[0],
-            use_acc=False,
-            mBarriers=[qk_fulls[0]],
-            two_ctas=USE_2CTA,
-        )
+        skip_q0 = SKIP_CAUSAL_Q0_LAST and i + BLOCK_N >= hi
+        if skip_q0:
+            tlx.barrier_arrive(qk_fulls[0])
+        else:
+            tlx.async_dot(
+                q_tiles[0],
+                k_tile,
+                qk_tiles[0],
+                use_acc=False,
+                mBarriers=[qk_fulls[0]],
+                two_ctas=USE_2CTA,
+            )
         if USE_2CTA and SKIP_RESCALE and i + BLOCK_N >= hi:
             tlx.tcgen05_commit(q_empties[q_bufIdx], two_ctas=USE_2CTA)
 
@@ -1562,14 +1663,15 @@ def _fwd_mma_tile(
                     [BLOCK_N * slice_id // NUM_P_SLICES, 0],
                     [BLOCK_N // NUM_P_SLICES, HEAD_DIM_KV],
                 )
-                tlx.async_dot(
-                    p_tiles[p_bufIdx],
-                    kv_slice,
-                    acc_tiles[0],
-                    use_acc=True,
-                    force_async=True,
-                    two_ctas=USE_2CTA,
-                )
+                if not skip_q0:
+                    tlx.async_dot(
+                        p_tiles[p_bufIdx],
+                        kv_slice,
+                        acc_tiles[0],
+                        use_acc=True,
+                        force_async=True,
+                        two_ctas=USE_2CTA,
+                    )
 
     if not SKIP_RESCALE or not USE_2CTA:
         tlx.tcgen05_commit(q_empties[q_bufIdx], two_ctas=USE_2CTA)
@@ -1703,11 +1805,18 @@ def _attn_fwd_ws_kernel(
 
     USE_2CTA: tl.constexpr = NUM_CTAS == 2
     tl.static_assert(not USE_2CTA or BLOCK_M == 256)
+    FAST_BF16: tl.constexpr = (
+        tlx.dtype_of(desc_v) == tl.bfloat16
+        and NUM_MMA_SLICES == 2
+        and not RESCALE_OPT
+    )
     FAST_F16_CAPABLE: tl.constexpr = (tlx.dtype_of(desc_v) == tl.float16 and NUM_MMA_SLICES == 4 and not RESCALE_OPT
                                       and not USE_2CTA)
     # BF16 fixed-gauge row sums are too imprecise for the softmax metadata reused by backward.
     USE_FAST_FIXED: tl.constexpr = FAST_FIXED and FAST_F16_CAPABLE
     USE_FAST_F16: tl.constexpr = USE_FAST_FIXED and FAST_F16_CAPABLE
+    SKIP_CAUSAL_DIAG: tl.constexpr = STAGE == 3 and NUM_PID_M_STATIC <= 16
+    CAUSAL_FIXED_GAUGE: tl.constexpr = USE_FAST_FIXED and FAST_BF16 and STAGE == 3
     FUSE_EPILOG: tl.constexpr = USE_FAST_FIXED and not USE_2CTA
     DIRECT_SCHED: tl.constexpr = USE_2CTA or USE_FAST_F16
     USE_GRID_LPT: tl.constexpr = (
@@ -2036,68 +2145,38 @@ def _attn_fwd_ws_kernel(
                     cid = tlx.async_task_replica_id()
                     group_id = cid
                 offs_m = (start_m * EFFECTIVE_BLOCK_M) + ((group_id * BLOCK_M_SPLIT) + tl.arange(0, BLOCK_M_SPLIT))
-                if STAGE & 1:
-                    m_i, l_i, accum_cnt_qk, gauge_cnt = _fwd_softmax_tile(
-                        qk_fulls,
-                        qk_tiles,
-                        p_fulls,
-                        p_tiles,
-                        alpha_empties,
-                        alpha_fulls,
-                        alpha_tiles,
-                        acc_fulls,
-                        acc_tiles,
-                        cid,
-                        accum_cnt_qk,
-                        gauge_cnt,
-                        qk_scale,
-                        offs_m,
-                        m_i,
-                        l_i,
-                        start_m,
-                        N_CTX,
-                        p_dtype,
-                        BLOCK_M,
-                        BLOCK_N,
-                        HEAD_DIM,
-                        NUM_MMA_SLICES,
-                        STAGE=4 - STAGE,
-                        RESCALE_OPT=RESCALE_OPT,
-                        SCALAR_N=SCALAR_N,
-                        USE_2CTA=USE_2CTA,
-                        FAST_FIXED=USE_FAST_FIXED,
-                    )
-                if STAGE & 2:
-                    m_i, l_i, accum_cnt_qk, gauge_cnt = _fwd_softmax_tile(
-                        qk_fulls,
-                        qk_tiles,
-                        p_fulls,
-                        p_tiles,
-                        alpha_empties,
-                        alpha_fulls,
-                        alpha_tiles,
-                        acc_fulls,
-                        acc_tiles,
-                        cid,
-                        accum_cnt_qk,
-                        gauge_cnt,
-                        qk_scale,
-                        offs_m,
-                        m_i,
-                        l_i,
-                        start_m,
-                        N_CTX,
-                        p_dtype,
-                        BLOCK_M,
-                        BLOCK_N,
-                        HEAD_DIM,
-                        NUM_MMA_SLICES,
-                        STAGE=2,
-                        RESCALE_OPT=RESCALE_OPT,
-                        SCALAR_N=SCALAR_N,
-                        USE_2CTA=USE_2CTA,
-                        FAST_FIXED=USE_FAST_FIXED,
-                    )
+                m_i, l_i, accum_cnt_qk, gauge_cnt = _fwd_softmax_stages(
+                    qk_fulls,
+                    qk_tiles,
+                    p_fulls,
+                    p_tiles,
+                    alpha_empties,
+                    alpha_fulls,
+                    alpha_tiles,
+                    acc_fulls,
+                    acc_tiles,
+                    cid,
+                    accum_cnt_qk,
+                    gauge_cnt,
+                    qk_scale,
+                    offs_m,
+                    m_i,
+                    l_i,
+                    start_m,
+                    N_CTX,
+                    p_dtype,
+                    BLOCK_M,
+                    BLOCK_N,
+                    HEAD_DIM,
+                    NUM_MMA_SLICES,
+                    STAGE,
+                    RESCALE_OPT,
+                    SCALAR_N,
+                    USE_2CTA,
+                    USE_FAST_FIXED,
+                    CAUSAL_FIXED_GAUGE,
+                    SKIP_CAUSAL_DIAG,
+                )
 
                 if USE_2CTA:
                     tlx.barrier_arrive(qk_empties[cid], 1, remote_cta_rank=0)
@@ -2238,6 +2317,7 @@ def _attn_fwd_ws_kernel(
                         None,
                         False,
                         SKIP_RESCALE=USE_FAST_FIXED,
+                        SKIP_CAUSAL_Q0_LAST=SKIP_CAUSAL_DIAG,
                     )
                 tile_count += 1
                 if DIRECT_SCHED:
