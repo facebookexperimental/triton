@@ -533,6 +533,59 @@ CoarseSchedule scheduleKeyOpsMetaWS(scf::ForOp forOp,
       maxDistance = d;
   }
 
+  // A descriptor result can be consumed both as registers and through a
+  // local_alloc feeding MMA.  AutoWS lowers that shape through a staging
+  // buffer and materializes the MMA allocation with a forwarding copy on the
+  // load partition.  Keep that publication in the stage immediately after
+  // the descriptor load.  Otherwise the forwarding copy can inherit the last
+  // compute stage; the next iteration's single-buffer producer acquire may
+  // then block the same load partition before it publishes the current MMA
+  // operand, forming a cycle with MMA.
+  //
+  // MMA-only descriptor loads are fused directly into their allocation and
+  // need no adjustment.
+  for (auto load : forOp.getOps<tt::DescriptorLoadOp>()) {
+    SmallVector<ttg::LocalAllocOp> mmaAllocs;
+    bool hasRegisterConsumer = false;
+    for (Operation *user : load->getUsers()) {
+      auto alloc = dyn_cast<ttg::LocalAllocOp>(user);
+      if (!alloc) {
+        hasRegisterConsumer = true;
+        continue;
+      }
+      SmallVector<Operation *> worklist(alloc->getUsers());
+      DenseSet<Operation *> visited;
+      bool feedsMma = false;
+      while (!worklist.empty() && !feedsMma) {
+        Operation *consumer = worklist.pop_back_val();
+        if (!visited.insert(consumer).second)
+          continue;
+        if (isa<tt::DotOpInterface>(consumer)) {
+          feedsMma = true;
+          break;
+        }
+        if (!consumer->hasTrait<OpTrait::MemDescViewTrait>())
+          continue;
+        for (Value result : consumer->getResults())
+          llvm::append_range(worklist, result.getUsers());
+      }
+      if (feedsMma)
+        mmaAllocs.push_back(alloc);
+    }
+    if (!hasRegisterConsumer || mmaAllocs.empty())
+      continue;
+
+    auto loadIt = distance.find(load);
+    if (loadIt == distance.end() || loadIt->second <= 0)
+      continue;
+    int publicationDistance = loadIt->second - 1;
+    for (ttg::LocalAllocOp alloc : mmaAllocs) {
+      auto allocIt = distance.find(alloc);
+      if (allocIt != distance.end())
+        allocIt->second = std::max(allocIt->second, publicationDistance);
+    }
+  }
+
   // Assign stage to each op reachable from a latency op
   for (auto [op, dist] : distance) {
     // We only schedule ops that are downstream of a latency op
