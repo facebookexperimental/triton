@@ -61,8 +61,6 @@ def table(results: Sequence[Result]) -> str:
                      f"{_tf(_stat(r.tlx, 'p50'))} "
                      f"{_tf(_stat(r.tlx, 'p95'))} "
                      f"{_tf(_stat(r.tlx, 'p99'))}  {_MARK[r.status]}")
-        for note in r.notes:
-            lines.append(f"{'':<{width}} -> {note}")
     return "\n".join(lines)
 
 
@@ -86,13 +84,19 @@ def write_json(results: Sequence[Result], env: dict, path: str | pathlib.Path) -
     return path
 
 
+def _details(results: Sequence[Result], statuses: tuple[Status, ...]) -> list[str]:
+    return [f"  {r.case.key}: {'; '.join(r.notes) or _MARK[r.status]}" for r in results if r.status in statuses]
+
+
 def render(results: Sequence[Result], env: dict, json_path: Optional[str] = None) -> str:
-    out = [table(results), "", summary(results)]
+    out = [table(results), ""]
     if json_path:
         out.append(f"artifact: {write_json(results, env, json_path)}")
+    out.append(summary(results))
+    noisy = _details(results, (Status.NOISY, ))
+    if noisy:
+        out.extend(("", "Noisy data:", *noisy))
     bad = failures(results)
     if bad:
-        out.append("")
-        out.append("Issues:")
-        out.extend(f"  {r.case.key}: {'; '.join(r.notes) or _MARK[r.status]}" for r in bad)
+        out.extend(("", "Issues:", *_details(bad, FAILING)))
     return "\n".join(out)
