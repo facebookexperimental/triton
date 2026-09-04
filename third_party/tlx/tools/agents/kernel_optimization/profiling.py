@@ -6,6 +6,7 @@ import inspect
 import io
 import json
 import re
+import subprocess
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -33,47 +34,77 @@ SUMMARY_NCU_METRIC_ALIASES: Mapping[str, tuple[str, ...]] = {
         "duration_us",
         "gpu__time_duration.sum",
         "gpu__time_duration.avg",
+        "gpu__time_duration",
+        "gpu__time_duration_measured_user",
+        "gpu__time_duration_measured_wallclock",
         "Duration",
     ),
     "sm_throughput_pct": (
         "sm_throughput_pct",
         "sm__throughput.avg.pct_of_peak_sustained_elapsed",
+        "sm__throughput",
     ),
     "dram_throughput_pct": (
         "dram_throughput_pct",
         "dram__throughput.avg.pct_of_peak_sustained_elapsed",
+        "dram__throughput",
+        "gpu__dram_throughput",
     ),
 }
 
 DEEP_NCU_METRIC_ALIASES: Mapping[str, tuple[str, ...]] = {
     **SUMMARY_NCU_METRIC_ALIASES,
-    "barrier_pct": ("smsp__warp_issue_stalled_barrier_per_warp_active.pct",),
-    "async_wait_pct": ("smsp__warp_issue_stalled_wait_per_warp_active.pct",),
+    "barrier_pct": (
+        "smsp__warp_issue_stalled_barrier_per_warp_active.pct",
+        "smsp__warp_issue_stalled_barrier_per_warp_active",
+    ),
+    "async_wait_pct": (
+        "smsp__warp_issue_stalled_wait_per_warp_active.pct",
+        "smsp__warp_issue_stalled_wait_per_warp_active",
+    ),
     "long_scoreboard_pct": (
         "smsp__warp_issue_stalled_long_scoreboard_per_warp_active.pct",
+        "smsp__warp_issue_stalled_long_scoreboard_per_warp_active",
     ),
     "short_scoreboard_pct": (
         "smsp__warp_issue_stalled_short_scoreboard_per_warp_active.pct",
+        "smsp__warp_issue_stalled_short_scoreboard_per_warp_active",
     ),
     "mio_throttle_pct": (
         "smsp__warp_issue_stalled_mio_throttle_per_warp_active.pct",
+        "smsp__warp_issue_stalled_mio_throttle_per_warp_active",
     ),
-    "dependency_pct": ("smsp__warp_issue_stalled_math_pipe_throttle_per_warp_active.pct",),
+    "dependency_pct": (
+        "smsp__warp_issue_stalled_math_pipe_throttle_per_warp_active.pct",
+        "smsp__warp_issue_stalled_math_pipe_throttle_per_warp_active",
+    ),
     "registers_per_thread": ("launch__registers_per_thread",),
     "achieved_occupancy_pct": ("sm__warps_active.avg.pct_of_peak_sustained_active",),
     "theoretical_occupancy_pct": ("launch__occupancy_limit_registers",),
-    "local_load_bytes": ("l1tex__t_bytes_pipe_lsu_mem_local_op_ld.sum",),
-    "local_store_bytes": ("l1tex__t_bytes_pipe_lsu_mem_local_op_st.sum",),
+    "local_load_bytes": (
+        "l1tex__t_bytes_pipe_lsu_mem_local_op_ld.sum",
+        "l1tex__t_bytes_pipe_lsu_mem_local_op_ld",
+    ),
+    "local_store_bytes": (
+        "l1tex__t_bytes_pipe_lsu_mem_local_op_st.sum",
+        "l1tex__t_bytes_pipe_lsu_mem_local_op_st",
+    ),
     "spill_loads": ("launch__sass_reg_spill_loads",),
     "spill_stores": ("launch__sass_reg_spill_stores",),
-    "l1_bytes": ("l1tex__t_bytes.sum",),
-    "l1_hit_rate_pct": ("l1tex__t_sector_hit_rate.pct",),
-    "shared_bank_conflicts": ("l1tex__data_bank_conflicts_pipe_lsu_mem_shared.sum",),
+    "l1_bytes": ("l1tex__t_bytes.sum", "l1tex__t_bytes"),
+    "l1_hit_rate_pct": (
+        "l1tex__t_sector_hit_rate.pct",
+        "l1tex__t_sector_hit_rate",
+    ),
+    "shared_bank_conflicts": (
+        "l1tex__data_bank_conflicts_pipe_lsu_mem_shared.sum",
+        "l1tex__data_bank_conflicts_pipe_lsu_mem_shared",
+    ),
     "l2_read_bytes": ("lts__t_bytes_op_read.sum",),
     "l2_write_bytes": ("lts__t_bytes_op_write.sum",),
     "l2_hit_rate_pct": ("lts__t_sector_hit_rate.pct",),
-    "dram_read_bytes": ("dram__bytes_read.sum",),
-    "dram_write_bytes": ("dram__bytes_write.sum",),
+    "dram_read_bytes": ("dram__bytes_read.sum", "dram__bytes_read"),
+    "dram_write_bytes": ("dram__bytes_write.sum", "dram__bytes_write"),
     "tensor_activity_pct": ("sm__pipe_tensor_active.avg.pct_of_peak_sustained_active",),
     "issue_active_pct": ("smsp__issue_active.avg.pct_of_peak_sustained_active",),
     "eligible_warps_per_cycle": ("smsp__warps_eligible.avg.per_cycle_active",),
@@ -299,8 +330,11 @@ def compact_profile_output(
     }
 
 
-def parse_proton_launch_attribution(payload: Any) -> dict[str, Any]:
+def parse_proton_launch_attribution(
+    payload: Any, *, main_scope: str | None = None
+) -> dict[str, Any]:
     leaves: list[dict[str, Any]] = []
+    leaf_kinds: list[str] = []
     for node in _iter_nodes(payload):
         children = _node_children(node)
         if children:
@@ -311,6 +345,7 @@ def parse_proton_launch_attribution(payload: Any) -> dict[str, Any]:
         name = _node_name(node)
         count = _node_count(node)
         leaves.append({"name": name, "time_us": time_us, "count": count})
+        leaf_kinds.append(_leaf_kind(name, node=node, main_scope=main_scope))
 
     totals = {
         "wrapper_us": 0.0,
@@ -319,11 +354,10 @@ def parse_proton_launch_attribution(payload: Any) -> dict[str, Any]:
         "leaf_time_us": 0.0,
         "count": 0,
     }
-    for leaf in leaves:
+    for leaf, kind in zip(leaves, leaf_kinds):
         time_us = float(leaf["time_us"] or 0.0)
         totals["leaf_time_us"] += time_us
         totals["count"] += int(leaf["count"] or 0)
-        kind = _leaf_kind(leaf["name"])
         if kind == "main_kernel":
             totals["main_kernel_us"] += time_us
         elif kind == "non_main_kernel":
@@ -358,10 +392,114 @@ def parse_ncu_csv(csv_text: str) -> dict[str, dict[str, Any]]:
     return metrics
 
 
+def export_ncu_report_details(
+    report_path: str | Path,
+    *,
+    artifacts_dir: str | Path,
+    level: str = "summary",
+    ncu_binary: str = "ncu",
+    timeout_s: float | None = 120.0,
+) -> dict[str, Any]:
+    _ncu_aliases_for_level(level)
+    report = Path(report_path)
+    output_dir = Path(artifacts_dir)
+    if not report.is_absolute():
+        raise ValueError("NCU report path must be absolute")
+    if not output_dir.is_absolute():
+        raise ValueError("NCU artifacts directory must be absolute")
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    command_path = output_dir / "import_command.json"
+    csv_path = output_dir / "details.csv"
+    stderr_path = output_dir / "import_stderr.txt"
+    command = [
+        ncu_binary,
+        "--import",
+        str(report),
+        "--page",
+        "details",
+        "--csv",
+    ]
+    command_path.write_text(json.dumps(command, indent=2) + "\n")
+    csv_path.write_text("")
+    stderr_path.write_text("")
+    artifacts = {
+        "ncu_report": str(report),
+        "ncu_import_command": str(command_path),
+        "ncu_details_csv": str(csv_path),
+        "ncu_import_stderr": str(stderr_path),
+    }
+    diagnostics: list[str] = []
+    stdout = ""
+    stderr = ""
+    return_code: int | None = None
+
+    if not report.is_file():
+        diagnostics.append(f"NCU report does not exist: {report}")
+    else:
+        try:
+            completed = subprocess.run(
+                command,
+                capture_output=True,
+                check=False,
+                text=True,
+                timeout=timeout_s,
+            )
+            stdout = completed.stdout
+            stderr = completed.stderr
+            return_code = completed.returncode
+            if return_code != 0:
+                diagnostics.append(
+                    f"NCU report import failed with exit code {return_code}"
+                )
+        except subprocess.TimeoutExpired as error:
+            stdout = _subprocess_output_text(error.stdout)
+            stderr = _subprocess_output_text(error.stderr)
+            diagnostics.append(
+                f"NCU report import timed out after {timeout_s} seconds"
+            )
+        except OSError as error:
+            diagnostics.append(
+                f"NCU report import failed: {type(error).__name__}: {error}"
+            )
+
+    csv_path.write_text(stdout)
+    stderr_path.write_text(stderr)
+    raw_metrics = parse_ncu_csv(stdout)
+    if return_code == 0 and not raw_metrics:
+        diagnostics.append("NCU report import produced no metric rows")
+    normalized = normalize_ncu_metrics(raw_metrics, level)
+    return {
+        "success": return_code == 0 and bool(raw_metrics),
+        "ncu": normalized,
+        "artifacts": artifacts,
+        "diagnostics": diagnostics + list(normalized["diagnostics"]),
+    }
+
+
 def parse_ncu_query_metrics(query_text: str) -> set[str]:
-    reader = csv.DictReader(io.StringIO(query_text))
-    if reader.fieldnames is not None:
-        headers = {_normalize_header(header): header for header in reader.fieldnames}
+    lines = query_text.splitlines()
+    for index, line in enumerate(lines):
+        if not line.strip() or line.lstrip().startswith("$"):
+            continue
+        header_reader = csv.reader((line,))
+        header = next(header_reader, ())
+        normalized = {_normalize_header(column) for column in header}
+        name_headers = {
+            "metric_name",
+            "name",
+            "metric",
+            "identifier",
+            "metric_identifier",
+        }
+        if not normalized.intersection(name_headers):
+            continue
+        reader = csv.DictReader(io.StringIO("\n".join(lines[index:])))
+        if reader.fieldnames is None:
+            break
+        headers = {
+            _normalize_header(column): column for column in reader.fieldnames
+        }
         name_key = _first_header(
             headers,
             ("metric_name", "name", "metric", "identifier", "metric_identifier"),
@@ -374,8 +512,9 @@ def parse_ncu_query_metrics(query_text: str) -> set[str]:
             }
             if metrics:
                 return metrics
+        break
     metrics: set[str] = set()
-    for line in query_text.splitlines():
+    for line in lines:
         token = line.strip().split(",", 1)[0].strip().strip('"')
         if token and "__" in token:
             metrics.add(token)
@@ -387,10 +526,27 @@ def select_ncu_metric_names(
 ) -> dict[str, Any]:
     aliases = _ncu_aliases_for_level(level)
     supported = {str(name) for name in supported_names}
+    canonical_supported: dict[str, list[str]] = {}
+    supported_base_metrics: set[str] = set()
+    for name in sorted(supported, key=lambda value: ("." in value, value)):
+        canonical = _canonical_ncu_metric_name(name)
+        canonical_supported.setdefault(canonical, []).append(name)
+        if canonical == _ncu_metric_family(canonical):
+            supported_base_metrics.add(canonical)
     selected: dict[str, str | None] = {}
     diagnostics: list[str] = []
     for semantic_name, candidates in aliases.items():
-        match = next((candidate for candidate in candidates if candidate in supported), None)
+        match = _select_ncu_metric(candidates, supported, canonical_supported)
+        if match is None:
+            match = next(
+                (
+                    candidate
+                    for candidate in candidates
+                    if "__" in candidate
+                    and _ncu_metric_family(candidate) in supported_base_metrics
+                ),
+                None,
+            )
         selected[semantic_name] = match
         if match is None:
             diagnostics.append(f"missing NCU metric for {semantic_name}")
@@ -414,12 +570,23 @@ def normalize_ncu_metrics(raw_metrics: Mapping[str, Any], level: str = "summary"
         if metric_name is None:
             result[group][semantic_name] = None
             continue
-        record = raw_metrics[metric_name]
+        raw_metric_name = _find_raw_ncu_metric_name(raw_metrics, metric_name)
+        if raw_metric_name is None:
+            result[group][semantic_name] = None
+            result["diagnostics"].append(
+                "missing collected NCU metric for "
+                f"{semantic_name}: {metric_name}"
+            )
+            continue
+        record = raw_metrics[raw_metric_name]
         value = _metric_record_value(record)
+        unit = _metric_record_unit(record)
         if semantic_name == "duration_us":
-            value = _duration_to_us(value, _metric_record_unit(record))
+            value = _duration_to_us(value, unit)
+        elif semantic_name.endswith("_bytes"):
+            value = _bytes_to_bytes(value, unit)
         result[group][semantic_name] = value
-        result["raw_metrics"][metric_name] = record
+        result["raw_metrics"][raw_metric_name] = record
     return result
 
 
@@ -519,6 +686,13 @@ def _node_name(node: Mapping[str, Any]) -> str:
         value = node.get(key)
         if value:
             return str(value)
+    frame = node.get("frame")
+    if isinstance(frame, Mapping):
+        value = frame.get("name")
+        if value:
+            return str(value)
+    elif frame:
+        return str(frame)
     return "unknown"
 
 
@@ -534,7 +708,7 @@ def _node_time_us(node: Mapping[str, Any]) -> float | None:
         ("time", 1.0),
         ("duration", 1.0),
     ):
-        value = _coerce_float(node.get(key))
+        value = _coerce_float(_mapping_value(node, key))
         if value is not None:
             return value * multiplier
     metrics = node.get("metrics")
@@ -545,19 +719,114 @@ def _node_time_us(node: Mapping[str, Any]) -> float | None:
 
 def _node_count(node: Mapping[str, Any]) -> int:
     for key in ("count", "calls", "num_calls", "instances"):
-        value = _coerce_float(node.get(key))
+        value = _coerce_float(_mapping_value(node, key))
         if value is not None:
             return int(value)
+    metrics = node.get("metrics")
+    if isinstance(metrics, Mapping):
+        return _node_count(metrics)
     return 1
 
 
-def _leaf_kind(name: object) -> str:
+def _leaf_kind(
+    name: object,
+    *,
+    node: Mapping[str, Any] | None = None,
+    main_scope: str | None = None,
+) -> str:
+    if main_scope is not None:
+        if str(name).strip() == main_scope.strip():
+            return "main_kernel"
+        metrics = node.get("metrics") if node is not None else None
+        if isinstance(metrics, Mapping):
+            device_type = _mapping_value(metrics, "device_type")
+            if str(device_type or "").strip().lower() in {"cuda", "gpu"}:
+                return "non_main_kernel"
+        return "wrapper"
     lowered = str(name).lower()
     if "main" in lowered and "kernel" in lowered:
         return "main_kernel"
     if "kernel" in lowered or "launch" in lowered:
         return "non_main_kernel"
     return "wrapper"
+
+
+def _mapping_value(mapping: Mapping[str, Any], key: str) -> Any:
+    if key in mapping:
+        return mapping[key]
+    normalized_key = _normalize_header(key)
+    for candidate, value in mapping.items():
+        if _normalize_header(str(candidate)) == normalized_key:
+            return value
+    return None
+
+
+def _canonical_ncu_metric_name(name: str) -> str:
+    parts = name.split(".")
+    for index, part in enumerate(parts):
+        if "__" in part:
+            return ".".join(parts[index:])
+    return name
+
+
+def _ncu_metric_family(name: str) -> str:
+    return _canonical_ncu_metric_name(name).split(".", 1)[0]
+
+
+def _select_ncu_metric(
+    candidates: tuple[str, ...],
+    supported: set[str],
+    canonical_supported: Mapping[str, list[str]],
+) -> str | None:
+    for candidate in candidates:
+        if candidate in supported:
+            if "__" in candidate and "." not in candidate:
+                return _preferred_derived_ncu_metric(candidates, candidate)
+            return candidate
+    for candidate in candidates:
+        canonical = _canonical_ncu_metric_name(candidate)
+        matches = canonical_supported.get(canonical, ())
+        if matches:
+            match = matches[0]
+            if "." not in _canonical_ncu_metric_name(match):
+                return _preferred_derived_ncu_metric(candidates, match)
+            return match
+    return None
+
+
+def _preferred_derived_ncu_metric(
+    candidates: tuple[str, ...], base_name: str
+) -> str:
+    family = _ncu_metric_family(base_name)
+    return next(
+        (
+            candidate
+            for candidate in candidates
+            if _ncu_metric_family(candidate) == family
+            and "." in _canonical_ncu_metric_name(candidate)
+        ),
+        base_name,
+    )
+
+
+def _find_raw_ncu_metric_name(
+    raw_metrics: Mapping[str, Any], requested_name: str
+) -> str | None:
+    if requested_name in raw_metrics:
+        return requested_name
+    requested_canonical = _canonical_ncu_metric_name(requested_name)
+    for name in raw_metrics:
+        if _canonical_ncu_metric_name(name) == requested_canonical:
+            return name
+    requested_family = _ncu_metric_family(requested_name)
+    base_matches = [
+        name
+        for name in raw_metrics
+        if _canonical_ncu_metric_name(name) == requested_family
+    ]
+    if len(base_matches) == 1:
+        return base_matches[0]
+    return None
 
 
 def _normalize_header(header: str) -> str:
@@ -574,6 +843,14 @@ def _first_header(headers: Mapping[str, str], candidates: tuple[str, ...]) -> st
 def _parse_metric_value(value: str) -> float | str | None:
     parsed = _coerce_float(value)
     return parsed if parsed is not None else value or None
+
+
+def _subprocess_output_text(value: str | bytes | None) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return value
 
 
 def _coerce_float(value: Any) -> float | None:
@@ -618,6 +895,21 @@ def _duration_to_us(value: float | str | None, unit: str) -> float | None:
     if normalized in {"s", "sec", "second", "seconds"}:
         return duration * 1_000_000.0
     return duration
+
+
+def _bytes_to_bytes(value: float | str | None, unit: str) -> float | None:
+    byte_count = _coerce_float(value)
+    if byte_count is None:
+        return None
+    multiplier = {
+        "byte": 1.0,
+        "bytes": 1.0,
+        "kbyte": 1_000.0,
+        "mbyte": 1_000_000.0,
+        "gbyte": 1_000_000_000.0,
+        "tbyte": 1_000_000_000_000.0,
+    }.get(unit.strip().lower(), 1.0)
+    return byte_count * multiplier
 
 
 def _compact_value(value: Any) -> Any:

@@ -4,12 +4,26 @@ import json
 import subprocess
 import tempfile
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Protocol
 
-from .models import KernelOptimizationRequest, PerformanceSummary
+from .models import KernelOptimizationRequest, KernelTarget, PerformanceSummary
 from .profiling import compact_profile_summary
 from .source import validate_replacement_source
+
+_SKILLS_ROOT = Path(__file__).resolve().parent / "skills"
+_LAYOUT_CONVERSION_SKILL = _SKILLS_ROOT / "common/layout-conversion-efficiency.md"
+_NVIDIA_TARGET_SKILLS = _SKILLS_ROOT / "targets/nvidia"
+_ASYNC_TMA_OUTPUT_SKILL = _NVIDIA_TARGET_SKILLS / "async-tma-output-publication.md"
+_BLACKWELL_CLC_SKILL = _NVIDIA_TARGET_SKILLS / "blackwell-persistent-clc-scheduling.md"
+_BLACKWELL_PIPELINE_SKILL = (
+    _NVIDIA_TARGET_SKILLS / "blackwell-persistent-pipeline-efficiency.md"
+)
+_BLACKWELL_ARCHITECTURES = frozenset(
+    {"blackwell", "sm100", "sm_100", "b200", "b200a", "gb200", "gb300"}
+)
+
 
 TLX_PROMPT_PREAMBLE = """You are optimizing one Triton or TLX kernel against an external deterministic harness.
 The candidate is a complete replacement source file. Preserve every public entry point,
@@ -263,6 +277,57 @@ class CodexCandidateProvider:
         )
 
 
+@lru_cache(maxsize=None)
+def _read_target_skill(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8").strip()
+    except OSError as error:
+        raise RuntimeError(f"unable to read built-in target skill {path}: {error}") from error
+
+
+def _target_skill_paths(target: KernelTarget) -> tuple[Path, ...]:
+    skills = [_LAYOUT_CONVERSION_SKILL]
+    backend = target.backend.strip().lower()
+    if backend not in {"cuda", "nvidia"}:
+        return tuple(skills)
+    architecture = target.architecture.strip().lower()
+    skills.append(_ASYNC_TMA_OUTPUT_SKILL)
+    if architecture in _BLACKWELL_ARCHITECTURES:
+        skills.extend((_BLACKWELL_CLC_SKILL, _BLACKWELL_PIPELINE_SKILL))
+    return tuple(skills)
+
+
+def _target_skill_guidance(target: KernelTarget) -> str:
+    return "\n\n".join(_read_target_skill(path) for path in _target_skill_paths(target))
+
+
+def _prior_run_prompt_block(request: KernelOptimizationRequest) -> str:
+    prior = request.prior_run_evidence
+    if prior is None or not prior.experiments:
+        return ""
+    lines = []
+    for experiment in prior.experiments:
+        speedup = (
+            f"{experiment.aggregate_speedup:.4f}x"
+            if experiment.aggregate_speedup is not None
+            else "unavailable"
+        )
+        lines.append(
+            f"- {experiment.experiment_id}: status={experiment.status}, "
+            f"speedup={speedup}, hypothesis={json.dumps(experiment.hypothesis)}, "
+            f"change={json.dumps(experiment.change)}, "
+            f"diagnostics={json.dumps(experiment.diagnostics)}"
+        )
+    evidence = "\n".join(lines)
+    return (
+        "\nPrior run evidence, read-only:\n"
+        "Do not automatically adopt a prior winner. Do not repeat exact prior "
+        "candidates or semantically equivalent rejected changes; use these "
+        "results only to choose a new evidence-backed hypothesis.\n"
+        f"{evidence[:8000]}\n"
+    )
+
+
 def _build_prompt(
     request: KernelOptimizationRequest,
     context: CandidateContext,
@@ -283,13 +348,20 @@ def _build_prompt(
     reference_block = ""
     if getattr(request, "reference_kernel_source", None):
         reference_block = f"\nReference kernel (oracle, do not copy verbatim — use for correctness/performance comparison):\n```python\n{request.reference_kernel_source[:4000]}\n```\n"
+    target_skills = _target_skill_guidance(request.target)
+    target_skills_block = (
+        f"\nTrusted built-in target optimization skills:\n{target_skills}\n"
+        if target_skills
+        else ""
+    )
     guidance = request.target.optimization_guidance.strip()
     guidance_block = (
         f"\nFrozen target-specific optimization guidance:\n{guidance}\n"
         if guidance
         else ""
     )
-    return f"""{TLX_PROMPT_PREAMBLE}{guidance_block}{reference_block}
+    prior_run_block = _prior_run_prompt_block(request)
+    return f"""{TLX_PROMPT_PREAMBLE}{target_skills_block}{guidance_block}{reference_block}{prior_run_block}
 You are proposing one candidate for the closed loop `build -> verify -> benchmark -> profile -> propose -> repeat`.
 Edit `candidate.py` directly. Do not return source or a diff, and do not claim correctness
 or performance; an external deterministic harness reads the file and decides both.

@@ -6,11 +6,12 @@ import time
 from collections.abc import Mapping
 from dataclasses import replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
-from .artifacts import ArtifactStore
+from .artifacts import ArtifactStore, CandidateArtifactPaths
 from .harness import HarnessExecutionError, SubprocessHarness
 from .models import (
+    AutoCommitResult,
     ExperimentSummary,
     InputCase,
     KernelOptimizationRequest,
@@ -34,6 +35,18 @@ _PROFILE_TOOLS = ("proton_launch", "native_profiler")
 _DIAGNOSTIC_PROFILE_TOOLS = ("proton_intra_kernel",)
 _DIAGNOSTIC_PROFILE_KEY = "diagnostic_proton_intra_kernel"
 _NEAR_THRESHOLD_WINDOW = 0.01
+
+
+class PromotionCommitter(Protocol):
+    def commit_promotion(
+        self,
+        experiment: ExperimentSummary,
+        source: str,
+        baseline: PerformanceSummary,
+        performance: PerformanceSummary,
+    ) -> AutoCommitResult: ...
+
+    def rollback_to_baseline(self, diagnostics: str) -> AutoCommitResult: ...
 
 
 def _profile_request(
@@ -369,11 +382,48 @@ def _ncu_regression_diagnostics(
     return "; ".join(diagnostics)
 
 
+def _report_candidate_artifacts(
+    experiment_id: str, artifacts: CandidateArtifactPaths
+) -> None:
+    print(
+        " ".join(
+            [
+                f"[tlx-agent] {experiment_id} status=artifacts",
+                f"source={str(artifacts.source_path.resolve())!r}",
+                f"incremental_patch={str(artifacts.incremental_patch_path.resolve())!r}",
+                f"cumulative_patch={str(artifacts.cumulative_patch_path.resolve())!r}",
+            ]
+        ),
+        file=sys.stderr,
+        flush=True,
+    )
+    print(
+        f"[tlx-agent] {experiment_id} incremental-diff-begin",
+        file=sys.stderr,
+    )
+    patch = artifacts.incremental_patch_path.read_text()
+    if patch:
+        sys.stderr.write(patch)
+        if not patch.endswith("\n"):
+            sys.stderr.write("\n")
+    else:
+        print("(no source changes)", file=sys.stderr)
+    print(
+        f"[tlx-agent] {experiment_id} incremental-diff-end",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
 class KernelOptimizer:
     def __init__(self, provider: CandidateProvider | None = None) -> None:
         self._provider = provider or CodexCandidateProvider()
 
-    def optimize(self, request: KernelOptimizationRequest) -> KernelOptimizationResult:
+    def optimize(
+        self,
+        request: KernelOptimizationRequest,
+        promotion_committer: PromotionCommitter | None = None,
+    ) -> KernelOptimizationResult:
         artifacts_dir = request.output_dir or Path(
             tempfile.mkdtemp(prefix="tlx-kernel-agent-")
         )
@@ -441,7 +491,15 @@ class KernelOptimizer:
         best_commit_summary = ""
         best_profiles = baseline_profiles
         diagnostics: list[str] = []
-        seen_sources = {source_digest(request.kernel_source)}
+        promotion_commits: list[AutoCommitResult] = []
+        rollback_commit: AutoCommitResult | None = None
+        last_auto_commit: AutoCommitResult | None = None
+        prior_source_hashes = set(
+            request.prior_run_evidence.source_hashes
+            if request.prior_run_evidence is not None
+            else ()
+        )
+        seen_sources = {source_digest(request.kernel_source), *prior_source_hashes}
         stopping_reason = "round_budget_exhausted"
         exhausted = False
 
@@ -456,7 +514,10 @@ class KernelOptimizer:
                     exhausted = True
                     break
                 experiment_id = f"r{round_index:03d}-c{candidate_index:03d}"
+                parent_id = best_experiment_id
+                parent_source = best_source
                 proposal = None
+                candidate_artifacts = None
                 try:
                     _report_performance(experiment_id, "generating", None)
                     proposal = self._provider.propose(
@@ -464,17 +525,29 @@ class KernelOptimizer:
                         CandidateContext(
                             round_index=round_index,
                             candidate_index=candidate_index,
-                            current_source=best_source,
+                            current_source=parent_source,
                             current_performance=best_performance,
                             previous_diagnostics=tuple(diagnostics),
                         ),
                     )
                     _report_candidate_summary(experiment_id, proposal)
+                    candidate_artifacts = store.write_candidate_artifacts(
+                        experiment_id,
+                        source=proposal.source,
+                        parent_source=parent_source,
+                        parent_id=parent_id,
+                        baseline_source=request.kernel_source,
+                    )
+                    _report_candidate_artifacts(experiment_id, candidate_artifacts)
                     digest = source_digest(proposal.source)
                     if digest in seen_sources:
-                        raise ValueError("candidate source duplicates an earlier experiment")
+                        origin = (
+                            "a prior run experiment"
+                            if digest in prior_source_hashes
+                            else "an earlier experiment"
+                        )
+                        raise ValueError(f"candidate source duplicates {origin}")
                     seen_sources.add(digest)
-                    source_path = store.write_source(experiment_id, proposal.source)
                     _report_performance(experiment_id, "evaluating", None)
                     performance = harness.evaluate(
                         proposal.source,
@@ -535,9 +608,11 @@ class KernelOptimizer:
                     experiment = ExperimentSummary(
                         experiment_id=experiment_id,
                         round_index=round_index,
-                        parent_id=best_experiment_id,
+                        parent_id=parent_id,
                         status=status,
-                        source_path=source_path,
+                        source_path=candidate_artifacts.source_path,
+                        incremental_patch_path=candidate_artifacts.incremental_patch_path,
+                        cumulative_patch_path=candidate_artifacts.cumulative_patch_path,
                         performance=performance,
                         mutation_summary=proposal.summary,
                         hypothesis=proposal.hypothesis,
@@ -580,7 +655,26 @@ class KernelOptimizer:
                         cases=request.cases,
                         diagnostics=f"decision={decision}",
                     )
-                    if status == "promoted":
+                    if status == "promoted" and promotion_committer is not None:
+                        commit_result = promotion_committer.commit_promotion(
+                            experiment,
+                            proposal.source,
+                            baseline,
+                            performance,
+                        )
+                        experiment = replace(experiment, auto_commit=commit_result)
+                        last_auto_commit = commit_result
+                        if commit_result.success:
+                            promotion_commits.append(commit_result)
+                        else:
+                            experiment = replace(
+                                experiment,
+                                status="failed",
+                                diagnostics=commit_result.diagnostics,
+                            )
+                            stopping_reason = "promotion_commit_failed"
+                            exhausted = True
+                    if status == "promoted" and not exhausted:
                         best_source = proposal.source
                         best_performance = performance
                         best_experiment_id = experiment_id
@@ -591,15 +685,27 @@ class KernelOptimizer:
                 except Exception as error:  # noqa: BLE001
                     message = f"{experiment_id}: {type(error).__name__}: {error}"
                     diagnostics.append(message)
-                    source_path = store.write_source(
-                        experiment_id, proposal.source if proposal is not None else ""
+                    source_path = (
+                        candidate_artifacts.source_path
+                        if candidate_artifacts is not None
+                        else store.write_source(experiment_id, "")
                     )
                     experiment = ExperimentSummary(
                         experiment_id=experiment_id,
                         round_index=round_index,
-                        parent_id=best_experiment_id,
+                        parent_id=parent_id,
                         status="failed",
                         source_path=source_path,
+                        incremental_patch_path=(
+                            candidate_artifacts.incremental_patch_path
+                            if candidate_artifacts is not None
+                            else None
+                        ),
+                        cumulative_patch_path=(
+                            candidate_artifacts.cumulative_patch_path
+                            if candidate_artifacts is not None
+                            else None
+                        ),
                         diagnostics=message,
                     )
                     _report_performance(
@@ -650,6 +756,13 @@ class KernelOptimizer:
             best_commit_title = ""
             best_commit_summary = ""
             stopping_reason = "finalist_revalidation_failed"
+            if promotion_committer is not None and promotion_commits:
+                rollback_commit = promotion_committer.rollback_to_baseline(
+                    "; ".join(diagnostics) or "final revalidation failed"
+                )
+                last_auto_commit = rollback_commit
+                if not rollback_commit.success:
+                    stopping_reason = "rollback_commit_failed"
         elif best_experiment_id != "baseline":
             if request.diagnostic_proton_intra_kernel:
                 final_diagnostics = _collect_diagnostic_profiles(
@@ -692,6 +805,9 @@ class KernelOptimizer:
             winner_experiment_id=best_experiment_id,
             winner_commit_title=best_commit_title,
             winner_commit_summary=best_commit_summary,
+            promotion_commits=tuple(promotion_commits),
+            rollback_commit=rollback_commit,
+            auto_commit=last_auto_commit,
         )
         store.write_json("result.json", result)
         return result

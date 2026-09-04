@@ -58,6 +58,25 @@ class OptimizationBudget:
 
 
 @dataclass(frozen=True)
+class PriorExperimentEvidence:
+    experiment_id: str
+    status: str
+    hypothesis: str = ""
+    change: str = ""
+    aggregate_speedup: float | None = None
+    diagnostics: str = ""
+
+
+@dataclass(frozen=True)
+class PriorRunEvidence:
+    run_path: Path
+    experiments_path: Path
+    source_hashes: tuple[str, ...] = ()
+    experiments: tuple[PriorExperimentEvidence, ...] = ()
+    warnings: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class KernelOptimizationRequest:
     kernel_source: str
     harness_path: Path
@@ -68,6 +87,7 @@ class KernelOptimizationRequest:
     reference_kernel_source: str | None = None
     output_dir: Path | None = None
     diagnostic_proton_intra_kernel: bool = False
+    prior_run_evidence: PriorRunEvidence | None = None
 
     def __post_init__(self) -> None:
         if not self.kernel_source.strip():
@@ -169,6 +189,8 @@ class ExperimentSummary:
     parent_id: str | None
     status: str
     source_path: Path
+    incremental_patch_path: Path | None = None
+    cumulative_patch_path: Path | None = None
     performance: PerformanceSummary | None = None
     diagnostics: str = ""
     mutation_summary: str = ""
@@ -179,6 +201,7 @@ class ExperimentSummary:
     commit_title: str = ""
     commit_summary: str = ""
     profile_path: Path | None = None
+    auto_commit: AutoCommitResult | None = None
 
 
 @dataclass(frozen=True)
@@ -209,6 +232,8 @@ class KernelOptimizationResult:
     winner_experiment_id: str = "baseline"
     winner_commit_title: str = ""
     winner_commit_summary: str = ""
+    promotion_commits: tuple[AutoCommitResult, ...] = ()
+    rollback_commit: AutoCommitResult | None = None
     auto_commit: AutoCommitResult | None = None
 
 

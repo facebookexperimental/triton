@@ -1,5 +1,5 @@
 ---
-name: trx-kernel-optimization-agent
+name: tlx-kernel-optimization-agent
 description: >
   Execute the TLX Kernel Optimization Agent CLI on a Triton or TLX kernel.
   Use this skill whenever the user says "use the TLX agent", "use the kernel
@@ -11,9 +11,8 @@ description: >
 # Run The TLX Kernel Optimization Agent
 
 The executable is `third_party/tlx/tools/agents/kernel_optimization/cli.py`.
-Use the user-facing name "TLX kernel optimization agent"; the on-disk skill
-name is compatibility-only. Follow the layers below in order. Target-specific
-profiling rules supplement, but never replace, the generic workflow.
+Follow the layers below in order. Target-specific profiling rules supplement,
+but never replace, the generic workflow.
 
 ## Layer 0: Invocation And Safety
 
@@ -33,6 +32,9 @@ profiling rules supplement, but never replace, the generic workflow.
    Submission remains a separate explicit action.
 6. If the live kernel changes concurrently, do not overwrite it. Preserve the
    winner artifact and report the conflict.
+7. When continuing a completed optimization, pass `--prior-run <output-dir>`.
+   This imports prior evidence and source hashes for cross-run deduplication but
+   never adopts the old winner or replaces validation of the current kernel.
 
 Reading agent implementation is allowed only after the CLI reports an internal
 failure that requires diagnosis. The first attempt must use the public contract.
@@ -78,6 +80,17 @@ Read `references/input-contract.md` for the complete construction and
 validation checklist. Do not start the optimization loop until the bundle is
 validated.
 
+Candidate generation automatically receives trusted source-optimization skills
+owned by `third_party/tlx/tools/agents/kernel_optimization/skills/`: every target
+receives layout-conversion efficiency guidance, CUDA/NVIDIA targets additionally
+receive async TMA output publication guidance, and Blackwell targets additionally
+receive persistent CLC scheduling and persistent pipeline efficiency guidance.
+Canonical profiling workflow documentation lives under
+`third_party/tlx/tools/agents/kernel_optimization/docs/profiling/` and is not
+injected as source guidance. Keep workload-specific
+invariants and exclusions in `target.json.optimization_guidance`; they are applied
+after the built-in target skills.
+
 For every candidate, the standard loop is:
 
 ```text
@@ -118,11 +131,13 @@ mapping, and command files as artifacts, and reference them with absolute paths.
 
 Profiling has three distinct layers:
 
-- Proton wrapper/launch attribution: read `references/proton-profiling.md` and
+- Proton wrapper/launch attribution: read
+  `third_party/tlx/tools/agents/kernel_optimization/docs/profiling/proton.md` and
   collect for every correctness-passing candidate.
 - Target summary/deep profiling: request `native_profiler`; each target harness
   maps it to its platform tool. For CUDA/NVIDIA, this is NCU and the harness
-  should follow `targets/nvidia/ncu-profiling.md`.
+  should follow
+  `third_party/tlx/tools/agents/kernel_optimization/docs/profiling/nvidia-ncu.md`.
 - Diagnostic-only Proton intra-kernel instrumentation: use only for attribution
   questions that cannot be answered from wrapper timelines or target counters.
 
@@ -148,7 +163,8 @@ promoted, committed, or used as speedup evidence.
 
 Select target profiling guidance from `target.json`:
 
-- CUDA/NVIDIA: read `targets/nvidia/ncu-profiling.md`.
+- CUDA/NVIDIA: read
+  `third_party/tlx/tools/agents/kernel_optimization/docs/profiling/nvidia-ncu.md`.
 - Other backends: use a sibling target guide when present; otherwise use the
   vendor-neutral `profile()` contract without inventing NVIDIA requirements.
 
@@ -215,6 +231,7 @@ PYTHONPATH=<repo-root> python -m third_party.tlx.tools.agents.kernel_optimizatio
   --cases <absolute-cases.json> \
   --target <absolute-target.json> \
   --output-dir <absolute-output-dir> \
+  --prior-run <optional-previous-output-dir> \
   --provider codex \
   --max-rounds 5 \
   --candidates-per-round 2 \

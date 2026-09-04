@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import subprocess
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable, Literal
 
@@ -29,6 +29,18 @@ class AutoCommitSnapshot:
     dirty_target_at_start: bool
     file_mode: str | None = None
     index_state: str | None = None
+
+
+@dataclass
+class AutoCommitSession:
+    initial_snapshot: AutoCommitSnapshot
+    snapshot: AutoCommitSnapshot
+    promotion_commits: list[AutoCommitResult] = field(default_factory=list)
+    rollback_commit: AutoCommitResult | None = None
+
+    @classmethod
+    def create(cls, snapshot: AutoCommitSnapshot) -> AutoCommitSession:
+        return cls(initial_snapshot=snapshot, snapshot=snapshot)
 
 
 def _run(
@@ -195,14 +207,17 @@ def merge_winner_delta(snapshot: AutoCommitSnapshot, winner_source: str) -> str:
     return completed.stdout
 
 
-def _commit_message(subject: str, body: str = "") -> str:
+def _commit_message(
+    subject: str, body: str = "", *, include_attribution: bool = True
+) -> str:
     cleaned_body = "\n".join(
         line for line in body.replace("\x00", "").splitlines() if line.strip() != ATTRIBUTION
     ).strip()
     paragraphs = [subject.rstrip()]
     if cleaned_body:
         paragraphs.append(cleaned_body)
-    paragraphs.append(ATTRIBUTION)
+    if include_attribution:
+        paragraphs.append(ATTRIBUTION)
     return "\n\n".join(paragraphs) + "\n"
 
 
@@ -234,6 +249,8 @@ def _commit_git(
     winner_source: str,
     subject: str,
     body: str = "",
+    *,
+    include_attribution: bool = True,
 ) -> str:
     assert snapshot.file_mode is not None
     root = snapshot.repo_root
@@ -264,7 +281,9 @@ def _commit_git(
     commit = _run(
         ["git", "commit-tree", tree, "-p", snapshot.base_revision],
         cwd=root,
-        input_text=_commit_message(subject, body),
+        input_text=_commit_message(
+            subject, body, include_attribution=include_attribution
+        ),
     ).stdout.strip()
     _run(
         [
@@ -303,13 +322,23 @@ def _commit_hg(
     winner_source: str,
     subject: str,
     body: str = "",
+    *,
+    include_attribution: bool = True,
 ) -> str:
     root = snapshot.repo_root
     snapshot.target_path.write_text(committed_source)
     succeeded = False
     try:
         _run(
-            ["hg", "commit", "-m", _commit_message(subject, body), snapshot.target_relpath],
+            [
+                "hg",
+                "commit",
+                "-m",
+                _commit_message(
+                    subject, body, include_attribution=include_attribution
+                ),
+                snapshot.target_relpath,
+            ],
             cwd=root,
         )
         succeeded = True
@@ -361,6 +390,119 @@ def commit_winner(
         subject=subject,
         dirty_target_at_start=snapshot.dirty_target_at_start,
     )
+
+
+def _advance_snapshot(
+    snapshot: AutoCommitSnapshot,
+    *,
+    revision: str,
+    parent_source: str,
+    baseline_source: str,
+) -> AutoCommitSnapshot:
+    index_state = snapshot.index_state
+    if snapshot.vcs == "git":
+        index_state = _run(
+            ["git", "ls-files", "-s", "--", snapshot.target_relpath],
+            cwd=snapshot.repo_root,
+        ).stdout
+    return replace(
+        snapshot,
+        base_revision=revision,
+        parent_source=parent_source,
+        baseline_source=baseline_source,
+        index_state=index_state,
+    )
+
+
+def commit_promotion(
+    session: AutoCommitSession,
+    candidate_source: str,
+    subject: str,
+    body: str = "",
+    *,
+    validate_committed_source: Callable[[str], None] | None = None,
+) -> AutoCommitResult:
+    snapshot = session.snapshot
+    result = commit_winner(
+        snapshot,
+        candidate_source,
+        subject,
+        body,
+        validate_committed_source=validate_committed_source,
+    )
+    assert result.commit_revision is not None
+    committed_source = (
+        _run(
+            ["git", "show", f"{result.commit_revision}:{snapshot.target_relpath}"],
+            cwd=snapshot.repo_root,
+        ).stdout
+        if snapshot.vcs == "git"
+        else _run(
+            ["hg", "cat", "-r", result.commit_revision, snapshot.target_relpath],
+            cwd=snapshot.repo_root,
+        ).stdout
+    )
+    session.snapshot = _advance_snapshot(
+        snapshot,
+        revision=result.commit_revision,
+        parent_source=committed_source,
+        baseline_source=candidate_source,
+    )
+    session.promotion_commits.append(result)
+    return result
+
+
+def commit_rollback(
+    session: AutoCommitSession,
+    subject: str,
+    body: str = "",
+) -> AutoCommitResult:
+    if not session.promotion_commits:
+        raise AutoCommitError("no promotion commit is available to roll back")
+    current = session.snapshot
+    initial = session.initial_snapshot
+    rollback_source = initial.baseline_source
+    committed_source = initial.parent_source
+    _verify_snapshot(current)
+    if current.vcs == "git":
+        revision = _commit_git(
+            current,
+            committed_source,
+            rollback_source,
+            subject,
+            body,
+            include_attribution=False,
+        )
+    else:
+        revision = _commit_hg(
+            current,
+            committed_source,
+            rollback_source,
+            subject,
+            body,
+            include_attribution=False,
+        )
+    result = AutoCommitResult(
+        requested=True,
+        success=True,
+        vcs=current.vcs,
+        repo_root=current.repo_root,
+        target_path=current.target_path,
+        target_relpath=current.target_relpath,
+        base_revision=current.base_revision,
+        commit_revision=revision,
+        subject=subject,
+        attribution="",
+        dirty_target_at_start=initial.dirty_target_at_start,
+    )
+    session.snapshot = _advance_snapshot(
+        current,
+        revision=revision,
+        parent_source=committed_source,
+        baseline_source=rollback_source,
+    )
+    session.rollback_commit = result
+    return result
 
 
 def failed_auto_commit(

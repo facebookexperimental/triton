@@ -173,11 +173,27 @@ include `.hatchet`, `.chrome_trace`, target profiler reports, CSV exports,
 async-task or warp mapping files, and the exact commands that generated them.
 Large payloads are spilled into the agent artifact directory automatically.
 
-Generic Proton guidance lives in `references/proton-profiling.md`. Target-specific
-tools and metric mappings live under `targets/<vendor>/`. CUDA/NVIDIA bundles
-must follow `targets/nvidia/ncu-profiling.md`. Other targets must not fabricate
+Generic Proton guidance lives in
+`third_party/tlx/tools/agents/kernel_optimization/docs/profiling/proton.md`.
+CUDA/NVIDIA bundles must follow
+`third_party/tlx/tools/agents/kernel_optimization/docs/profiling/nvidia-ncu.md`.
+Other targets must not fabricate
 NVIDIA fields. Unsupported counters are omitted or represented as `null` with
 diagnostics, never silently converted to zero.
+
+Before freezing a CUDA bundle, its profile implementation must satisfy these
+integration checks:
+
+- pass the target's exact main-kernel scope to
+  `parse_proton_launch_attribution(..., main_scope=...)` and verify the expected
+  main launch has nonzero attributed time;
+- collect NCU with an exported `.ncu-rep`, then call
+  `export_ncu_report_details()` to run `ncu --import ... --page details --csv`;
+- never parse NCU collection stdout as metric CSV when `--export` is enabled,
+  because that stream contains profiler status lines rather than metric rows;
+- retain the report, import command, details CSV, and stderr as absolute artifact
+  paths, and verify at least normalized NCU duration is non-null when NCU is
+  available.
 
 A compact profile response should look like:
 

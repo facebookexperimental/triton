@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from . import optimizer as optimizer_module
+from .artifacts import load_prior_run_evidence
 from .cli import (
     _commit_body,
     _parse_args,
@@ -17,12 +18,15 @@ from .cli import (
 )
 from .harness import StandaloneHarness, SubprocessHarness
 from .models import (
+    AutoCommitResult,
     CaseEvaluation,
     InputCase,
     KernelOptimizationRequest,
     KernelTarget,
     OptimizationBudget,
     PerformanceSummary,
+    PriorExperimentEvidence,
+    PriorRunEvidence,
     TimingSamples,
     VerificationResult,
     is_promotable,
@@ -155,6 +159,124 @@ class ScoringTest(unittest.TestCase):
         self.assertIn("Performance:", prompt)
         self.assertIn("external harness adds", prompt)
         self.assertIn("expected_effect", prompt)
+        self.assertIn("Trusted built-in target optimization skills", prompt)
+        self.assertIn("# TLX Layout Conversion Efficiency", prompt)
+        self.assertIn("# NVIDIA Async TMA Output Publication", prompt)
+        self.assertIn("# Blackwell Persistent CLC Scheduling", prompt)
+        self.assertIn("# Blackwell Persistent Pipeline Efficiency", prompt)
+        self.assertIn("optimize data movement and scheduling", prompt)
+        self.assertNotIn("# NVIDIA Target Profiling With NCU", prompt)
+        self.assertLess(
+            prompt.index("# TLX Layout Conversion Efficiency"),
+            prompt.index("# NVIDIA Async TMA Output Publication"),
+        )
+        self.assertLess(
+            prompt.index("Trusted built-in target optimization skills"),
+            prompt.index("Frozen target-specific optimization guidance"),
+        )
+
+    def test_codex_prompt_selects_nvidia_non_blackwell_skill(self) -> None:
+        request = KernelOptimizationRequest(
+            kernel_source="VALUE = 1\n",
+            harness_path=Path(__file__),
+            cases=(InputCase("target", {}),),
+            target=KernelTarget("nvidia", "hopper"),
+            output_dir=Path("/tmp/tlx-agent-test"),
+        )
+        prompt = _build_prompt(
+            request,
+            CandidateContext(
+                1,
+                0,
+                request.kernel_source,
+                _performance(("target", 100.0)),
+                (),
+            ),
+        )
+        self.assertIn("# TLX Layout Conversion Efficiency", prompt)
+        self.assertIn("# NVIDIA Async TMA Output Publication", prompt)
+        self.assertLess(
+            prompt.index("# TLX Layout Conversion Efficiency"),
+            prompt.index("# NVIDIA Async TMA Output Publication"),
+        )
+        self.assertNotIn("# Blackwell Persistent CLC Scheduling", prompt)
+        self.assertNotIn("# Blackwell Persistent Pipeline Efficiency", prompt)
+        self.assertNotIn("# NVIDIA Target Profiling With NCU", prompt)
+
+    def test_codex_prompt_selects_common_skill_only_for_amd(self) -> None:
+        guidance = "Preserve runtime scale behavior."
+        request = KernelOptimizationRequest(
+            kernel_source="VALUE = 1\n",
+            harness_path=Path(__file__),
+            cases=(InputCase("target", {}),),
+            target=KernelTarget(
+                "amd",
+                "gfx950",
+                optimization_guidance=guidance,
+            ),
+            output_dir=Path("/tmp/tlx-agent-test"),
+        )
+        prompt = _build_prompt(
+            request,
+            CandidateContext(
+                1,
+                0,
+                request.kernel_source,
+                _performance(("target", 100.0)),
+                (),
+            ),
+        )
+        self.assertIn(guidance, prompt)
+        self.assertIn("Trusted built-in target optimization skills", prompt)
+        self.assertIn("# TLX Layout Conversion Efficiency", prompt)
+        self.assertNotIn("# NVIDIA Async TMA Output Publication", prompt)
+        self.assertNotIn("# Blackwell Persistent CLC Scheduling", prompt)
+        self.assertNotIn("# Blackwell Persistent Pipeline Efficiency", prompt)
+        self.assertNotIn("# NVIDIA Target Profiling With NCU", prompt)
+        self.assertLess(
+            prompt.index("# TLX Layout Conversion Efficiency"),
+            prompt.index("Frozen target-specific optimization guidance"),
+        )
+
+    def test_prompt_includes_prior_run_evidence_without_source(self) -> None:
+        prior_source = "SECRET_PRIOR_SOURCE = 1\n"
+        request = KernelOptimizationRequest(
+            kernel_source="VALUE = 1\n",
+            harness_path=Path(__file__),
+            cases=(InputCase("target", {}),),
+            target=KernelTarget("amd", "gfx950"),
+            output_dir=Path("/tmp/tlx-agent-test"),
+            prior_run_evidence=PriorRunEvidence(
+                run_path=Path("/tmp/prior"),
+                experiments_path=Path("/tmp/prior/experiments.json"),
+                source_hashes=(source_digest(prior_source),),
+                experiments=(
+                    PriorExperimentEvidence(
+                        experiment_id="r001-c000",
+                        status="rejected",
+                        hypothesis="wider tiles improve reuse",
+                        change="double the tile width",
+                        aggregate_speedup=0.95,
+                        diagnostics="speedup below threshold",
+                    ),
+                ),
+            ),
+        )
+        prompt = _build_prompt(
+            request,
+            CandidateContext(
+                1,
+                0,
+                request.kernel_source,
+                _performance(("target", 100.0)),
+                (),
+            ),
+        )
+        self.assertIn("Prior run evidence, read-only", prompt)
+        self.assertIn("Do not automatically adopt a prior winner", prompt)
+        self.assertIn("wider tiles improve reuse", prompt)
+        self.assertIn("speedup=0.9500x", prompt)
+        self.assertNotIn(prior_source.strip(), prompt)
 
     def test_candidate_metadata_reads_summary_and_builds_fallback(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -317,10 +439,70 @@ class ScoringTest(unittest.TestCase):
         self.assertEqual(source_digest("VALUE = 1\n"), source_digest("VALUE = 1\n  \n"))
 
 
+class PriorRunEvidenceTest(unittest.TestCase):
+    def test_loads_sources_and_sanitized_evidence_without_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = "VALUE = 2\nCORRECT = True\n"
+            source_path = root / "experiments" / "r001-c000" / "kernel.py"
+            source_path.parent.mkdir(parents=True)
+            source_path.write_text(source)
+            payload = [
+                {
+                    "experiment_id": "r001-c000",
+                    "status": "rejected",
+                    "source_path": "/etc/passwd",
+                    "hypothesis": "  remove   a conversion  ",
+                    "mutation_summary": "pin consumer layout",
+                    "performance": {"aggregate_speedup": 0.99},
+                    "diagnostics": "below threshold",
+                }
+            ]
+            (root / "experiments.json").write_text(json.dumps(payload))
+            before = sorted(path.relative_to(root) for path in root.rglob("*"))
+
+            prior = load_prior_run_evidence(root)
+
+            after = sorted(path.relative_to(root) for path in root.rglob("*"))
+            self.assertEqual(before, after)
+            self.assertEqual(prior.source_hashes, (source_digest(source),))
+            self.assertEqual(prior.experiments[0].hypothesis, "remove a conversion")
+            self.assertEqual(prior.experiments[0].aggregate_speedup, 0.99)
+
+    def test_rejects_unsafe_experiment_id(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "experiments.json").write_text(
+                json.dumps([{"experiment_id": "../escape", "status": "failed"}])
+            )
+            with self.assertRaisesRegex(ValueError, "unsafe experiment_id"):
+                load_prior_run_evidence(root)
+
+    def test_rejects_non_list_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "experiments.json"
+            path.write_text("{}")
+            with self.assertRaisesRegex(ValueError, "must contain a list"):
+                load_prior_run_evidence(path)
+
+
 class CliTest(unittest.TestCase):
     def test_commit_winner_is_enabled_by_default(self) -> None:
         args = _parse_args(["--kernel", "kernel.py", "--output-dir", "/tmp/out"])
         self.assertTrue(args.commit_winner)
+
+    def test_prior_run_arg_parses(self) -> None:
+        args = _parse_args(
+            [
+                "--kernel",
+                "kernel.py",
+                "--output-dir",
+                "/tmp/out",
+                "--prior-run",
+                "/tmp/prior",
+            ]
+        )
+        self.assertEqual(args.prior_run, Path("/tmp/prior"))
 
     def test_commit_winner_can_be_disabled(self) -> None:
         args = _parse_args(
@@ -628,6 +810,145 @@ class CommitBodyTest(unittest.TestCase):
 
 
 class KernelOptimizerTest(unittest.TestCase):
+    def test_prior_source_is_rejected_without_adopting_prior_winner(self) -> None:
+        baseline_source = "LATENCY_US = 100\nCORRECT = True\n"
+        prior_source = "LATENCY_US = 80\nCORRECT = True\n"
+        provider = FixedCandidateProvider([CandidateProposal(prior_source, "duplicate")])
+        prior = PriorRunEvidence(
+            run_path=Path("/tmp/prior"),
+            experiments_path=Path("/tmp/prior/experiments.json"),
+            source_hashes=(source_digest(prior_source),),
+            experiments=(
+                PriorExperimentEvidence(
+                    experiment_id="r001-c000",
+                    status="promoted",
+                    change="prior winner",
+                    aggregate_speedup=1.25,
+                ),
+            ),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            result = KernelOptimizer(provider).optimize(
+                KernelOptimizationRequest(
+                    kernel_source=baseline_source,
+                    harness_path=Path(__file__).with_name("testdata")
+                    / "fake_harness.py",
+                    cases=(InputCase("a", {"scale": 1.0}),),
+                    target=KernelTarget("fake", "fake"),
+                    budget=OptimizationBudget(
+                        max_rounds=1,
+                        candidates_per_round=1,
+                        min_speedup=1.01,
+                        benchmark_repetitions=2,
+                    ),
+                    output_dir=Path(directory),
+                    prior_run_evidence=prior,
+                )
+            )
+            experiment = result.experiments[-1]
+            cached_source = experiment.source_path.read_text()
+            incremental_patch_exists = experiment.incremental_patch_path.is_file()
+            cumulative_patch_exists = experiment.cumulative_patch_path.is_file()
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.winner_experiment_id, "baseline")
+        self.assertEqual(result.best_kernel, baseline_source)
+        self.assertEqual(experiment.status, "failed")
+        self.assertIn(
+            "candidate source duplicates a prior run experiment",
+            experiment.diagnostics,
+        )
+        self.assertEqual(cached_source, prior_source)
+        self.assertTrue(incremental_patch_exists)
+        self.assertTrue(cumulative_patch_exists)
+
+    def test_candidate_patches_track_promoted_parent_and_baseline(self) -> None:
+        baseline_source = "LATENCY_US = 100\nCORRECT = True\n"
+        first_source = "LATENCY_US = 80\nCORRECT = True\n"
+        second_source = "LATENCY_US = 60\nCORRECT = True\n"
+        provider = FixedCandidateProvider(
+            [
+                CandidateProposal(first_source, "first promotion"),
+                CandidateProposal(second_source, "second promotion"),
+            ]
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            result = KernelOptimizer(provider).optimize(
+                KernelOptimizationRequest(
+                    kernel_source=baseline_source,
+                    harness_path=Path(__file__).with_name("testdata")
+                    / "fake_harness.py",
+                    cases=(InputCase("a", {"scale": 1.0}),),
+                    target=KernelTarget("fake", "fake"),
+                    budget=OptimizationBudget(
+                        max_rounds=1,
+                        candidates_per_round=2,
+                        min_speedup=1.01,
+                        benchmark_repetitions=2,
+                    ),
+                    output_dir=Path(directory),
+                )
+            )
+
+            first, second = result.experiments[1:]
+            self.assertEqual(second.parent_id, first.experiment_id)
+            incremental = second.incremental_patch_path.read_text()
+            cumulative = second.cumulative_patch_path.read_text()
+            self.assertIn("-LATENCY_US = 80", incremental)
+            self.assertIn("+LATENCY_US = 60", incremental)
+            self.assertIn("-LATENCY_US = 100", cumulative)
+            self.assertIn("+LATENCY_US = 60", cumulative)
+
+    def test_failed_promotion_commit_does_not_advance_best(self) -> None:
+        class FailingCommitter:
+            def commit_promotion(self, experiment, source, baseline, performance):
+                del experiment, source, baseline, performance
+                return AutoCommitResult(
+                    requested=True,
+                    success=False,
+                    diagnostics="checkpoint failed",
+                )
+
+            def rollback_to_baseline(self, diagnostics):
+                raise AssertionError(f"unexpected rollback: {diagnostics}")
+
+        baseline_source = "LATENCY_US = 100\nCORRECT = True\n"
+        candidate_source = "LATENCY_US = 80\nCORRECT = True\n"
+        with tempfile.TemporaryDirectory() as directory:
+            result = KernelOptimizer(
+                FixedCandidateProvider(
+                    [CandidateProposal(candidate_source, "faster")]
+                )
+            ).optimize(
+                KernelOptimizationRequest(
+                    kernel_source=baseline_source,
+                    harness_path=Path(__file__).with_name("testdata")
+                    / "fake_harness.py",
+                    cases=(InputCase("a", {"scale": 1.0}),),
+                    target=KernelTarget("fake", "fake"),
+                    budget=OptimizationBudget(
+                        max_rounds=1,
+                        candidates_per_round=1,
+                        min_speedup=1.01,
+                        benchmark_repetitions=2,
+                    ),
+                    output_dir=Path(directory),
+                ),
+                FailingCommitter(),
+            )
+            experiment = result.experiments[-1]
+            self.assertTrue(experiment.source_path.is_file())
+            self.assertTrue(experiment.incremental_patch_path.is_file())
+            self.assertTrue(experiment.cumulative_patch_path.is_file())
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.best_kernel, baseline_source)
+        self.assertEqual(result.stopping_reason, "promotion_commit_failed")
+        self.assertEqual(result.promotion_commits, ())
+        self.assertIsNone(result.rollback_commit)
+        self.assertFalse(result.auto_commit.success)
+        self.assertEqual(experiment.status, "failed")
+
     def test_reports_performance_after_each_evaluation(self) -> None:
         provider = FixedCandidateProvider(
             [
@@ -666,6 +987,13 @@ class KernelOptimizerTest(unittest.TestCase):
             output = stderr.getvalue()
             self.assertIn("[tlx-agent] baseline status=baseline", output)
             self.assertIn("median=100.000us", output)
+            self.assertIn("[tlx-agent] r001-c000 status=artifacts", output)
+            self.assertIn("incremental_patch=", output)
+            self.assertIn("cumulative_patch=", output)
+            self.assertIn("[tlx-agent] r001-c000 incremental-diff-begin", output)
+            self.assertIn("-LATENCY_US = 100", output)
+            self.assertIn("+LATENCY_US = 120", output)
+            self.assertIn("[tlx-agent] r001-c000 incremental-diff-end", output)
             self.assertIn("[tlx-agent] r001-c000 status=rejected", output)
             self.assertIn("speedup=0.8333x", output)
             self.assertIn("[tlx-agent] r001-c001 change='faster'", output)
@@ -678,6 +1006,39 @@ class KernelOptimizerTest(unittest.TestCase):
             self.assertEqual(result.winner_commit_title, "Use faster latency path")
             self.assertIn("Use the faster path.", result.winner_commit_summary)
             self.assertTrue(result.success)
+
+    def test_duplicate_candidate_patch_is_logged_before_rejection(self) -> None:
+        source = "LATENCY_US = 100\nCORRECT = True\n"
+        with tempfile.TemporaryDirectory() as directory:
+            stderr = io.StringIO()
+            with redirect_stderr(stderr):
+                result = KernelOptimizer(
+                    FixedCandidateProvider([CandidateProposal(source, "duplicate")])
+                ).optimize(
+                    KernelOptimizationRequest(
+                        kernel_source=source,
+                        harness_path=Path(__file__).with_name("testdata")
+                        / "fake_harness.py",
+                        cases=(InputCase("a", {"scale": 1.0}),),
+                        target=KernelTarget("fake", "fake"),
+                        budget=OptimizationBudget(
+                            max_rounds=1,
+                            candidates_per_round=1,
+                            min_speedup=1.01,
+                            benchmark_repetitions=2,
+                        ),
+                        output_dir=Path(directory),
+                    )
+                )
+
+            output = stderr.getvalue()
+            artifacts_at = output.index("r001-c000 status=artifacts")
+            failed_at = output.index("r001-c000 status=failed")
+            self.assertLess(artifacts_at, failed_at)
+            self.assertIn("r001-c000 incremental-diff-begin", output)
+            self.assertIn("(no source changes)", output)
+            self.assertIn("r001-c000 incremental-diff-end", output)
+            self.assertEqual(result.experiments[-1].status, "failed")
 
     def test_rejected_candidate_evidence_reaches_next_proposal(self) -> None:
         contexts: list[CandidateContext] = []

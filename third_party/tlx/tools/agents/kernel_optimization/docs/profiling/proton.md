@@ -2,8 +2,8 @@
 
 Use Proton for vendor-neutral attribution around the benchmark wrapper, launch
 path, and optional diagnostic source instrumentation. Keep target-specific
-counters in `targets/<vendor>/`; this file only describes Proton usage and
-artifact expectations.
+counter requirements in sibling vendor guides such as `nvidia-ncu.md`; this file
+only describes Proton usage and artifact expectations.
 
 ## Wrapper And Launch Attribution
 
@@ -13,9 +13,23 @@ wrapper, setup/teardown, launch path, synchronization, or the profiled kernel
 window.
 
 An ordinary Proton timeline using `hook='triton'` can show the wrapper and one
-compiled Triton kernel launch. That timeline does not show TLX async-task
-overlap inside the kernel. Do not treat a single kernel region as evidence that
-producer, consumer, TMA, MMA, or store tasks overlapped.
+compiled Triton kernel launch. The target harness must identify that launch with
+its exact scope rather than a name heuristic:
+
+```python
+attribution = parse_proton_launch_attribution(
+    tree,
+    main_scope=main_kernel_scope,
+)
+```
+
+The scope is target knowledge and should not be added to the generic profile
+request. Before freezing the harness, verify that the expected main launch has
+nonzero `main_kernel_us` and helper CUDA launches are attributed as non-main.
+
+This timeline does not show TLX async-task overlap inside the kernel. Do not
+treat a single kernel region as evidence that producer, consumer, TMA, MMA, or
+store tasks overlapped.
 
 Return compact normalized JSON inline and keep raw files in the requested
 `artifacts_dir`:

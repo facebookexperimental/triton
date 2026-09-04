@@ -8,19 +8,29 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable
 
+from .artifacts import load_prior_run_evidence
 from .harness import HarnessExecutionError, SubprocessHarness
 from .models import (
+    AutoCommitResult,
+    ExperimentSummary,
     InputCase,
     KernelOptimizationRequest,
     KernelOptimizationResult,
     KernelTarget,
     OptimizationBudget,
+    PerformanceSummary,
     passes_protected_cases,
     to_json_value,
 )
 from .optimizer import KernelOptimizer
 from .providers import CodexCandidateProvider, MockLLMProvider
-from .vcs import commit_winner, failed_auto_commit, prepare_auto_commit
+from .vcs import (
+    AutoCommitSession,
+    commit_promotion,
+    commit_rollback,
+    failed_auto_commit,
+    prepare_auto_commit,
+)
 
 
 def _load_json(path: Path) -> Any:
@@ -43,6 +53,16 @@ def _parse_args(arguments: list[str] | None = None) -> argparse.Namespace:
         help="Target arch under harnesses/<arch>/targets/<kernel> (e.g. blackwell, hopper, host). Defaults to first available.",
     )
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument(
+        "--prior-run",
+        type=Path,
+        default=None,
+        help=(
+            "Read-only path to a prior TLX Agent output directory or its "
+            "experiments.json; imports evidence and source hashes without "
+            "adopting the prior winner."
+        ),
+    )
     parser.add_argument("--max-rounds", type=int, default=5)
     parser.add_argument("--candidates-per-round", type=int, default=2)
     parser.add_argument("--max-candidate-seconds", type=float, default=600.0)
@@ -225,10 +245,16 @@ def _validate_host_matches_target(
         )
 
 
-def _commit_body(result: KernelOptimizationResult) -> str:
-    baseline_by_id = {case.case_id: case for case in result.baseline.cases}
+def _performance_commit_body(
+    baseline_summary: PerformanceSummary,
+    comparison: PerformanceSummary,
+    experiment_id: str,
+    commit_summary: str,
+    heading: str,
+) -> str:
+    baseline_by_id = {case.case_id: case for case in baseline_summary.cases}
     rows: list[tuple[str, str, str, str, str, str, str]] = []
-    for winner in result.final.cases:
+    for winner in comparison.cases:
         baseline = baseline_by_id.get(winner.case_id)
         baseline_timing = baseline.timing if baseline else None
         winner_timing = winner.timing
@@ -266,12 +292,110 @@ def _commit_body(result: KernelOptimizationResult) -> str:
     table.extend(format_row(row) for row in rows)
     validation = (
         "Performance:\n"
-        f"Final revalidation for {result.winner_experiment_id}:\n"
+        f"{heading} for {experiment_id}:\n"
         + "\n".join(table)
-        + f"\nWeighted aggregate speedup: {result.final.aggregate_speedup:.4f}x."
+        + f"\nWeighted aggregate speedup: {comparison.aggregate_speedup:.4f}x."
     )
-    summary = result.winner_commit_summary.strip()
+    summary = commit_summary.strip()
     return f"{summary}\n\n{validation}" if summary else validation
+
+
+def _commit_body(result: KernelOptimizationResult) -> str:
+    return _performance_commit_body(
+        result.baseline,
+        result.final,
+        result.winner_experiment_id,
+        result.winner_commit_summary,
+        "Final revalidation",
+    )
+
+
+class _PromotionAutoCommitter:
+    def __init__(
+        self,
+        session: AutoCommitSession,
+        harness_path: Path,
+        cases: tuple[InputCase, ...],
+        target: KernelTarget,
+        budget: OptimizationBudget,
+        output_dir: Path,
+        fallback_subject: str,
+        override_subject: str | None,
+    ) -> None:
+        self._session = session
+        self._harness_path = harness_path
+        self._cases = cases
+        self._target = target
+        self._budget = budget
+        self._output_dir = output_dir
+        self._fallback_subject = fallback_subject
+        self._override_subject = override_subject
+
+    def _validate(self, committed_source: str, experiment_id: str) -> None:
+        validation = SubprocessHarness(
+            self._harness_path, self._budget.max_candidate_seconds
+        ).evaluate(
+            committed_source,
+            self._cases,
+            self._target,
+            self._budget.benchmark_repetitions,
+        )
+        self._output_dir.joinpath(
+            "experiments", experiment_id, "commit_revalidation.json"
+        ).write_text(json.dumps(to_json_value(validation), indent=2, sort_keys=True) + "\n")
+        if not passes_protected_cases(validation, self._cases):
+            raise HarnessExecutionError(
+                "merged promotion source failed one or more protected correctness cases"
+            )
+
+    def commit_promotion(
+        self,
+        experiment: ExperimentSummary,
+        source: str,
+        baseline: PerformanceSummary,
+        performance: PerformanceSummary,
+    ) -> AutoCommitResult:
+        subject = self._override_subject or experiment.commit_title or self._fallback_subject
+        try:
+            result = commit_promotion(
+                self._session,
+                source,
+                subject,
+                _performance_commit_body(
+                    baseline,
+                    performance,
+                    experiment.experiment_id,
+                    experiment.commit_summary,
+                    "Promotion evaluation",
+                ),
+                validate_committed_source=lambda committed: self._validate(
+                    committed, experiment.experiment_id
+                ),
+            )
+        except Exception as error:  # noqa: BLE001
+            result = failed_auto_commit(self._session.snapshot, subject, error)
+        _report_commit(result)
+        self._output_dir.joinpath("promotion_commits.json").write_text(
+            json.dumps(
+                to_json_value(tuple(self._session.promotion_commits)),
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n"
+        )
+        return result
+
+    def rollback_to_baseline(self, diagnostics: str) -> AutoCommitResult:
+        subject = f"Revert TLX agent promotions after failed final revalidation"
+        try:
+            result = commit_rollback(self._session, subject, diagnostics)
+        except Exception as error:  # noqa: BLE001
+            result = failed_auto_commit(self._session.snapshot, subject, error)
+        _report_commit(result)
+        self._output_dir.joinpath("rollback_commit.json").write_text(
+            json.dumps(to_json_value(result), indent=2, sort_keys=True) + "\n"
+        )
+        return result
 
 
 def _report_commit(commit_result: object) -> None:
@@ -351,6 +475,27 @@ def main() -> int:
             print(json.dumps(to_json_value(commit_result), indent=2, sort_keys=True))
             return 3
     reference_source = args.reference_kernel.read_text() if args.reference_kernel else None
+    prior_run_evidence = None
+    if args.prior_run is not None:
+        try:
+            prior_run_evidence = load_prior_run_evidence(args.prior_run)
+        except ValueError as error:
+            raise SystemExit(f"--prior-run is invalid: {error}") from error
+        print(
+            "[tlx-agent] prior-run "
+            f"path={json.dumps(str(prior_run_evidence.run_path))} "
+            f"experiments={len(prior_run_evidence.experiments)} "
+            f"source_hashes={len(prior_run_evidence.source_hashes)} "
+            f"warnings={len(prior_run_evidence.warnings)}",
+            file=sys.stderr,
+            flush=True,
+        )
+        for warning in prior_run_evidence.warnings:
+            print(
+                f"[tlx-agent] prior-run warning={json.dumps(warning)}",
+                file=sys.stderr,
+                flush=True,
+            )
     request = KernelOptimizationRequest(
         kernel_source=kernel_source,
         reference_kernel_source=reference_source,
@@ -360,52 +505,28 @@ def main() -> int:
         budget=budget,
         output_dir=args.output_dir,
         diagnostic_proton_intra_kernel=args.diagnostic_proton_intra_kernel,
+        prior_run_evidence=prior_run_evidence,
     )
-    result = KernelOptimizer(provider).optimize(request)
+    promotion_committer = None
+    if commit_snapshot is not None:
+        promotion_committer = _PromotionAutoCommitter(
+            AutoCommitSession.create(commit_snapshot),
+            harness_path,
+            cases,
+            target,
+            budget,
+            args.output_dir,
+            fallback_commit_subject,
+            args.commit_message,
+        )
+    result = KernelOptimizer(provider).optimize(request, promotion_committer)
     exit_code = 0 if result.success else 2
-    if args.commit_winner and result.success:
-        assert commit_snapshot is not None
-        commit_subject = (
-            args.commit_message
-            or result.winner_commit_title
-            or fallback_commit_subject
-        )
-
-        def validate_committed_source(committed_source: str) -> None:
-            harness = SubprocessHarness(harness_path, budget.max_candidate_seconds)
-            validation = harness.evaluate(
-                committed_source,
-                cases,
-                target,
-                budget.benchmark_repetitions,
-            )
-            args.output_dir.joinpath("commit_revalidation.json").write_text(
-                json.dumps(to_json_value(validation), indent=2, sort_keys=True) + "\n"
-            )
-            if not passes_protected_cases(validation, cases):
-                raise HarnessExecutionError(
-                    "merged commit source failed one or more protected correctness cases"
-                )
-
-        try:
-            commit_result = commit_winner(
-                commit_snapshot,
-                result.best_kernel,
-                commit_subject,
-                body=_commit_body(result),
-                validate_committed_source=validate_committed_source,
-            )
-        except Exception as error:  # noqa: BLE001
-            commit_result = failed_auto_commit(commit_snapshot, commit_subject, error)
-            exit_code = 3
-        result = replace(result, auto_commit=commit_result)
-        _report_commit(commit_result)
+    if result.auto_commit is not None:
         args.output_dir.joinpath("auto_commit.json").write_text(
-            json.dumps(to_json_value(commit_result), indent=2, sort_keys=True) + "\n"
+            json.dumps(to_json_value(result.auto_commit), indent=2, sort_keys=True) + "\n"
         )
-        args.output_dir.joinpath("result.json").write_text(
-            json.dumps(to_json_value(result), indent=2, sort_keys=True) + "\n"
-        )
+    if result.stopping_reason in {"promotion_commit_failed", "rollback_commit_failed"}:
+        exit_code = 3
     print(json.dumps(to_json_value(result), indent=2, sort_keys=True))
     return exit_code
 

@@ -2,8 +2,8 @@
 
 Use this guide only when `target.json.backend` is CUDA/NVIDIA. It supplements
 the generic TLX optimization workflow with NVIDIA NCU requirements. Proton
-wrapper/launch attribution and diagnostic instrumentation live in
-`references/proton-profiling.md`.
+wrapper/launch attribution and diagnostic instrumentation live in the sibling
+`proton.md` guide.
 
 ## Metric Discovery
 
@@ -30,6 +30,33 @@ Resolve metrics for these groups when supported:
 
 Persist the raw NCU report, CSV exports, metric mapping, and exact commands as
 absolute artifact paths.
+
+## Report Export
+
+When collection uses `--export`, NCU writes metrics into the `.ncu-rep`; the
+collection process stdout contains `==PROF==` status messages, not metric CSV.
+After a successful collection, every harness must export and normalize the
+report through the shared helper:
+
+```python
+exported = export_ncu_report_details(
+    report_path,
+    artifacts_dir=ncu_artifacts_dir,
+    level=profile_request.level,
+    ncu_binary=ncu_path,
+)
+```
+
+The helper runs `ncu --import REPORT --page details --csv`, persists the exact
+import command, details CSV, and stderr, and returns normalized `ncu` data plus
+diagnostics. Merge those fields into the harness profile response. Do not parse
+collection stdout, synthesize zero for missing fields, or discard correctness
+and benchmark results when report import fails.
+
+Before freezing a CUDA harness, collect one real report and verify that the
+normalized duration is non-null. When the selected metric set includes them,
+also check throughput, occupancy, stalls, cache, and byte counters and confirm
+that units such as `Gbyte` were normalized to bytes.
 
 ## Summary Profile
 
