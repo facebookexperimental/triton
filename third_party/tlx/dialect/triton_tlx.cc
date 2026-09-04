@@ -604,6 +604,32 @@ void init_triton_tlx_ir(py::module_ &m) {
              return mlir::cast<Attribute>(ttg::SharedLinearEncodingAttr::get(
                  context, std::move(linearLayout), alignment));
            })
+      .def("make_nv_mma_layout_attr",
+           [](TritonOpBuilder &self, std::vector<unsigned> version,
+              std::vector<unsigned> warpsPerCTA,
+              std::vector<unsigned> instrShape,
+              std::vector<std::vector<int32_t>> cgaBases) {
+             if (version.size() != 2 || version[0] != 3)
+               throw std::invalid_argument(
+                   "nv_mma_layout currently supports version (3, 0) only");
+             if (warpsPerCTA.size() != 2 ||
+                 llvm::any_of(warpsPerCTA, [](unsigned warps) {
+                   return warps == 0;
+                 }))
+               throw std::invalid_argument(
+                   "warps_per_cta must contain two positive entries");
+             if (instrShape.size() != 3 ||
+                 llvm::any_of(instrShape,
+                              [](unsigned dim) { return dim == 0; }))
+               throw std::invalid_argument(
+                   "instr_shape must contain three positive entries");
+             auto context = self.getBuilder().getContext();
+             auto cgaLayout =
+                 makeCGALayoutFromBases(context, cgaBases, /*rank=*/2);
+             return mlir::cast<Attribute>(ttg::NvidiaMmaEncodingAttr::get(
+                 context, version[0], version[1], warpsPerCTA, cgaLayout,
+                 instrShape));
+           })
       .def("make_nv_mma_encoding_attr",
            [](TritonOpBuilder &self, Value opndA, Value opndAcc,
               unsigned versionMajor, unsigned versionMinor,
@@ -616,6 +642,21 @@ void init_triton_tlx_ir(py::module_ &m) {
              Block *parentBlock = self.getBuilder().getInsertionBlock();
              unsigned numWarps =
                  ttg::maybeLookupNumWarps(parentBlock).value_or(moduleNumWarps);
+             if (auto mmaLayout = dyn_cast_or_null<ttg::NvidiaMmaEncodingAttr>(
+                     tlx::getEffectiveEncoding(retType.getEncoding()))) {
+               auto warpsPerCTA = mmaLayout.getWarpsPerCTA();
+               if (!mmaLayout.isHopper() ||
+                   mmaLayout.getVersionMajor() != versionMajor ||
+                   mmaLayout.getVersionMinor() != versionMinor)
+                 throw std::invalid_argument(
+                     "accumulator has an incompatible NVIDIA MMA layout");
+               if (warpsPerCTA.size() != 2 ||
+                   warpsPerCTA[0] * warpsPerCTA[1] != numWarps)
+                 throw std::invalid_argument(
+                     "accumulator warps_per_cta must have two entries whose "
+                     "product equals the number of executing warps");
+               return mlir::cast<Attribute>(mmaLayout);
+             }
              auto instrShape = mmaVersionToInstrShape(
                  versionMajor, retShapePerCTA, dtypeA, numWarps);
              // Default to row partitioning for now. Should be smarter.
