@@ -69,6 +69,7 @@ configs = [
             "USE_WARP_BARRIER": uwb,
             "FAST_FIXED": fast_fixed,
             "COMPACT_CLC": compact_clc,
+            "GLOBAL_LPT": global_lpt,
         },
         num_stages=1,
         num_warps=4,
@@ -80,6 +81,7 @@ configs = [
         (True, True, False),
     ] for uwb in [False, True]
     for compact_clc in ([False, True] if grp_n > 4 and uwb else [False])
+    for global_lpt in ([False, True] if compact_clc else [False])
 ] + [
     triton.Config(
         {
@@ -97,6 +99,7 @@ configs = [
             "NUM_CTAS": 2,
             "FAST_FIXED": fast_fixed,
             "COMPACT_CLC": False,
+            "GLOBAL_LPT": False,
         },
         num_stages=1,
         num_warps=4,
@@ -306,40 +309,52 @@ def _compute_offsets(
     GROUP_SIZE_N: tl.constexpr,
     NUM_PID_M_STATIC: tl.constexpr,
     GRID_X_STATIC: tl.constexpr,
+    GLOBAL_LPT: tl.constexpr,
 ):
     if STAGE == 3 and GROUP_SIZE_N > 4:
         if GRID_X_STATIC > 0:
             head_lane = tile_idx % GRID_X_STATIC
             grid_row = tile_idx // GRID_X_STATIC
             head_chunks = H // GRID_X_STATIC
-            rows_per_batch: tl.constexpr = NUM_PID_M_STATIC * head_chunks
-            off_z = grid_row // rows_per_batch
-            row_in_batch = grid_row % rows_per_batch
-            if H <= GROUP_SIZE_N:
-                m_in_section = row_in_batch // head_chunks
-                head_chunk = row_in_batch % head_chunks
+            if GLOBAL_LPT:
+                num_batches = num_pid_n // H
+                batch_chunks = num_batches * head_chunks
+                m_in_section = grid_row // batch_chunks
+                batch_chunk = grid_row % batch_chunks
+                off_z = batch_chunk // head_chunks
+                head_chunk = batch_chunk % head_chunks
                 off_h = head_chunk * GRID_X_STATIC + head_lane
             else:
-                chunks_per_full_section: tl.constexpr = GROUP_SIZE_N // GRID_X_STATIC
-                rows_per_full_section: tl.constexpr = NUM_PID_M_STATIC * chunks_per_full_section
-                full_sections: tl.constexpr = H // GROUP_SIZE_N
-                tail_heads: tl.constexpr = H % GROUP_SIZE_N
-                if tail_heads == 0:
-                    section_id = row_in_batch // rows_per_full_section
-                    row_in_section = row_in_batch % rows_per_full_section
-                    m_in_section = row_in_section // chunks_per_full_section
-                    head_chunk = row_in_section % chunks_per_full_section
+                rows_per_batch: tl.constexpr = NUM_PID_M_STATIC * head_chunks
+                off_z = grid_row // rows_per_batch
+                row_in_batch = grid_row % rows_per_batch
+                if H <= GROUP_SIZE_N:
+                    m_in_section = row_in_batch // head_chunks
+                    head_chunk = row_in_batch % head_chunks
+                    off_h = head_chunk * GRID_X_STATIC + head_lane
                 else:
-                    full_rows: tl.constexpr = full_sections * rows_per_full_section
-                    in_tail = row_in_batch >= full_rows
-                    full_row = row_in_batch % rows_per_full_section
-                    tail_chunks: tl.constexpr = tail_heads // GRID_X_STATIC
-                    tail_row = row_in_batch - full_rows
-                    section_id = tl.where(in_tail, full_sections, row_in_batch // rows_per_full_section)
-                    m_in_section = tl.where(in_tail, tail_row // tail_chunks,
-                                            full_row // chunks_per_full_section)
-                    head_chunk = tl.where(in_tail, tail_row % tail_chunks, full_row % chunks_per_full_section)
-                off_h = section_id * GROUP_SIZE_N + head_chunk * GRID_X_STATIC + head_lane
+                    chunks_per_full_section: tl.constexpr = GROUP_SIZE_N // GRID_X_STATIC
+                    rows_per_full_section: tl.constexpr = NUM_PID_M_STATIC * chunks_per_full_section
+                    full_sections: tl.constexpr = H // GROUP_SIZE_N
+                    tail_heads: tl.constexpr = H % GROUP_SIZE_N
+                    if tail_heads == 0:
+                        section_id = row_in_batch // rows_per_full_section
+                        row_in_section = row_in_batch % rows_per_full_section
+                        m_in_section = row_in_section // chunks_per_full_section
+                        head_chunk = row_in_section % chunks_per_full_section
+                    else:
+                        full_rows: tl.constexpr = full_sections * rows_per_full_section
+                        in_tail = row_in_batch >= full_rows
+                        full_row = row_in_batch % rows_per_full_section
+                        tail_chunks: tl.constexpr = tail_heads // GRID_X_STATIC
+                        tail_row = row_in_batch - full_rows
+                        section_id = tl.where(in_tail, full_sections,
+                                              row_in_batch // rows_per_full_section)
+                        m_in_section = tl.where(in_tail, tail_row // tail_chunks,
+                                                full_row // chunks_per_full_section)
+                        head_chunk = tl.where(in_tail, tail_row % tail_chunks,
+                                              full_row % chunks_per_full_section)
+                    off_h = section_id * GROUP_SIZE_N + head_chunk * GRID_X_STATIC + head_lane
             start_m = NUM_PID_M_STATIC - 1 - m_in_section
             off_hz = off_z * H + off_h
         else:
@@ -915,6 +930,7 @@ def _fwd_fixed_2cta_control_tile(
     GROUP_SIZE_N: tl.constexpr,
     NUM_PID_M_STATIC: tl.constexpr,
     GRID_X_STATIC: tl.constexpr,
+    GLOBAL_LPT: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     NUM_MMA_SLICES: tl.constexpr,
     RESCALE_OPT: tl.constexpr,
@@ -931,6 +947,7 @@ def _fwd_fixed_2cta_control_tile(
         GROUP_SIZE_N,
         NUM_PID_M_STATIC,
         GRID_X_STATIC,
+        GLOBAL_LPT,
     )
     m_i = tl.zeros([BLOCK_M_SPLIT], dtype=tl.float32) - float("inf")
     l_i = tl.zeros([BLOCK_M_SPLIT], dtype=tl.float32)
@@ -1123,6 +1140,7 @@ def _fwd_control_tile(
     USE_WHERE: tl.constexpr,
     SKIP_RESCALE,
     FUSE_EPILOG,
+    GLOBAL_LPT: tl.constexpr,
 ):
     start_m, off_hz, lo, hi, qo_offset_y, kv_offset_y = _compute_offsets(
         tile_id // NUM_CTAS,
@@ -1135,6 +1153,7 @@ def _fwd_control_tile(
         GROUP_SIZE_N,
         NUM_PID_M_STATIC,
         GRID_X_STATIC,
+        GLOBAL_LPT,
     )
     control_lo = hi if SKIP_RESCALE else lo
     # Rescale the live output accumulator when the online-softmax gauge changes.
@@ -1759,11 +1778,12 @@ def _attn_fwd_ws(
     NUM_PID_M_STATIC: tl.constexpr = 1,
     GRID_X_STATIC: tl.constexpr = 1,
     COMPACT_CLC: tl.constexpr = False,
+    GLOBAL_LPT: tl.constexpr = False,
 ):
     _attn_fwd_ws_kernel(sm_scale, M, Z, H, desc_q, desc_k, desc_v, desc_o, N_CTX, HEAD_DIM, BLOCK_M, BLOCK_N, STAGE,
                         NUM_BUFFERS_Q, NUM_BUFFERS_KV, NUM_BUFFERS_QK, NUM_MMA_GROUPS, NUM_MMA_SLICES, GROUP_SIZE_N,
                         RESCALE_OPT, USE_WHERE, USE_WARP_BARRIER, NUM_CTAS, PIPELINED, POLICY, DENSE_REGS, FAST_FIXED,
-                        NUM_PID_M_STATIC, GRID_X_STATIC, COMPACT_CLC)
+                        NUM_PID_M_STATIC, GRID_X_STATIC, COMPACT_CLC, GLOBAL_LPT)
 
 
 @triton.jit
@@ -1798,6 +1818,7 @@ def _attn_fwd_ws_kernel(
     NUM_PID_M_STATIC: tl.constexpr = 1,
     GRID_X_STATIC: tl.constexpr = 1,
     COMPACT_CLC: tl.constexpr = False,
+    GLOBAL_LPT: tl.constexpr = False,
 ):
     tl.static_assert(NUM_MMA_GROUPS == 2)
     tl.static_assert(NUM_BUFFERS_QK == 1)
@@ -2034,6 +2055,7 @@ def _attn_fwd_ws_kernel(
                         GROUP_SIZE_N,
                         NUM_PID_M_STATIC,
                         OFFSET_GRID_X,
+                        GLOBAL_LPT,
                         HEAD_DIM,
                         NUM_MMA_SLICES,
                         RESCALE_OPT,
@@ -2085,6 +2107,7 @@ def _attn_fwd_ws_kernel(
                         USE_WHERE,
                         USE_FAST_FIXED,
                         FUSE_EPILOG,
+                        GLOBAL_LPT,
                     )
                 tile_count += 1
                 if DIRECT_SCHED:
@@ -2126,6 +2149,7 @@ def _attn_fwd_ws_kernel(
                     GROUP_SIZE_N,
                     NUM_PID_M_STATIC,
                     OFFSET_GRID_X,
+                    GLOBAL_LPT,
                 )
                 # initialize pointer to m and l
                 m_i = tl.zeros([BLOCK_M_SPLIT], dtype=tl.float32) - float("inf")
@@ -2252,6 +2276,7 @@ def _attn_fwd_ws_kernel(
                     GROUP_SIZE_N,
                     NUM_PID_M_STATIC,
                     OFFSET_GRID_X,
+                    GLOBAL_LPT,
                 )
                 if USE_2CTA:
                     if is_leader:
@@ -2353,6 +2378,7 @@ def _attn_fwd_ws_kernel(
                         GROUP_SIZE_N,
                         NUM_PID_M_STATIC,
                         OFFSET_GRID_X,
+                        GLOBAL_LPT,
                     )
                     accum_cnt_k = _fwd_load_first_k_tile(
                         accum_cnt_k,
@@ -2392,6 +2418,7 @@ def _attn_fwd_ws_kernel(
                     GROUP_SIZE_N,
                     NUM_PID_M_STATIC,
                     OFFSET_GRID_X,
+                    GLOBAL_LPT,
                 )
                 if USE_2CTA:
                     accum_cnt_kv = _fwd_load_tile(
@@ -2493,6 +2520,7 @@ def _attn_fwd_ws_kernel(
                         GROUP_SIZE_N,
                         NUM_PID_M_STATIC,
                         OFFSET_GRID_X,
+                        GLOBAL_LPT,
                     )
                     _, phase = get_bufidx_phase(tile_count, 1)
                     if USE_FAST_FIXED and NUM_GROUPS_PER_CTA == 2:
@@ -4686,6 +4714,11 @@ def _select_forward_plan(q, k, v, causal):
     )
 
 
+def _compact_clc_grid(heads, group, num_pid_m, batches):
+    grid_x = heads if heads <= group else min(group, heads & -heads)
+    return grid_x, num_pid_m * (heads // grid_x) * batches
+
+
 class _attention(torch.autograd.Function):
 
     @staticmethod
@@ -4796,9 +4829,7 @@ class _attention(torch.autograd.Function):
                     and META.get("COMPACT_CLC", False)
                     and num_ctas == 1
                 ):
-                    grid_x = min(group, q.shape[1])
-                    sections = triton.cdiv(q.shape[1], group)
-                    return (grid_x, num_pid_m * sections * q.shape[0])
+                    return _compact_clc_grid(q.shape[1], group, num_pid_m, q.shape[0])
                 n_clusters = num_pid_m * q.shape[0] * q.shape[1]
                 return (n_clusters * num_ctas, )
 
