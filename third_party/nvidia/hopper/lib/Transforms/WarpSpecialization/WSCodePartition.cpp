@@ -4513,26 +4513,42 @@ void insertAsyncComm(
 
     // Optimize TMA loads.
     if (tmaLoads.size() > 0) {
-      // Instead of headConsumer, need to lift out to the same scope.
-      auto consumerWaitPoint = getSameLevelOp(tmaHeadProducer, headConsumer);
-      // Collect additional consumer task IDs beyond the primary headConsumer.
-      SmallVector<int> additionalConsumerTaskIds;
-      auto primaryTaskIds = getAsyncTaskIds(headConsumer);
-      for (const auto &token : commChannel.tokens) {
-        int taskId = token.first;
-        if (std::find(primaryTaskIds.begin(), primaryTaskIds.end(), taskId) ==
-            primaryTaskIds.end())
-          additionalConsumerTaskIds.push_back(taskId);
+      SmallVector<TMAConsumerWaitInfo> consumerWaits;
+      SmallVector<AsyncTaskId> readyTaskIds;
+      for (Operation *consumer : consumerOps) {
+        for (AsyncTaskId taskId : getAsyncTaskIds(consumer)) {
+          if (!llvm::is_contained(readyTaskIds, taskId))
+            readyTaskIds.push_back(taskId);
+        }
+      }
+      for (AsyncTaskId taskId : readyTaskIds) {
+        Operation *taskConsumer = nullptr;
+        Operation *taskInsertionPoint = nullptr;
+        for (Operation *candidate : consumerOps) {
+          if (!llvm::is_contained(getAsyncTaskIds(candidate), taskId))
+            continue;
+          Operation *candidateInsertionPoint =
+              getSameLevelOp(tmaHeadProducer, candidate);
+          if (!taskInsertionPoint ||
+              (candidateInsertionPoint->getBlock() ==
+                   taskInsertionPoint->getBlock() &&
+               candidateInsertionPoint->isBeforeInBlock(taskInsertionPoint))) {
+            taskConsumer = candidate;
+            taskInsertionPoint = candidateInsertionPoint;
+          }
+        }
+        assert(taskConsumer && taskInsertionPoint &&
+               "TMA channel consumer task must have an actual consumer");
+        consumerWaits.push_back({taskId, taskConsumer, taskInsertionPoint});
       }
       auto waitConstraints =
           WSBarrierAttr::forDstTaskAndDirection(
               funcOp.getContext(), masterChannel->relation.first,
               WSBarrierAttr::kDirectionForward)
               .build(funcOp.getContext());
-      optimizeTMALoads(
-          builder, tmaLoads, *commChannel.producerBarrier, bufferIdx, bufferIdx,
-          phase, tmaHeadProducer, headConsumer, consumerWaitPoint,
-          additionalConsumerTaskIds, waitConstraints, twoCTADirectWait);
+      optimizeTMALoads(builder, tmaLoads, *commChannel.producerBarrier,
+                       bufferIdx, bufferIdx, phase, tmaHeadProducer,
+                       consumerWaits, waitConstraints, twoCTADirectWait);
     }
   }
 

@@ -1,4 +1,5 @@
 // RUN: triton-opt %s -split-input-file --nvgpu-warp-specialization="num-stages=3 capability=100 smem-budget=200000" | FileCheck %s
+// RUN: triton-opt %s -split-input-file --nvgpu-warp-specialization="num-stages=3 capability=100 smem-budget=200000" | FileCheck %s --check-prefix=MULTICONSUMER
 
 // Test case: Basic Blackwell matrix multiplication with TMA and warp specialization.
 // This IR represents a GEMM kernel that uses tensor memory for accumulator
@@ -84,6 +85,55 @@ module attributes {"ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32,
     %c = arith.truncf %accumulator_24 {ttg.partition = array<i32: 3>} : tensor<128x128xf32, #blocked> to tensor<128x128xf16, #blocked>
     %c_26 = ttg.convert_layout %c {ttg.partition = array<i32: 3>} : tensor<128x128xf16, #blocked> -> tensor<128x128xf16, #blocked2>
     tt.descriptor_store %c_desc[%offs_am, %offs_bn], %c_26 {ttg.partition = array<i32: 3>} : !tt.tensordesc<128x128xf16, #shared>, tensor<128x128xf16, #blocked2>
+    tt.return
+  }
+}
+
+// -----
+
+// A cooperative 2CTA TMA transfer has one physical completion even when its
+// shared-memory result feeds multiple warp-specialized consumer tasks. Relay
+// that completion from the pair leader to the follower exactly once. Each
+// consumer still needs its own readiness wait, and the cross-task consumer
+// keeps its independent release bookkeeping.
+
+// MULTICONSUMER-LABEL: @tma_2cta_multi_consumer_ready_relay
+// MULTICONSUMER-COUNT-1: ttng.async_tma_copy_global_to_local {{.*}}two_cta = true
+// MULTICONSUMER: ttng.wait_barrier {{.*}}async_task_id = array<i32: 0>
+// MULTICONSUMER: ttng.fence_async_shared
+// MULTICONSUMER: ttng.arrive_barrier {{.*}}shared_cluster_memory
+// MULTICONSUMER: ttng.wait_barrier {{.*}}async_task_id = array<i32: 0>
+// MULTICONSUMER: ttg.local_load {{.*}}async_task_id = array<i32: 0>
+// MULTICONSUMER: ttng.wait_barrier {{.*}}async_task_id = array<i32: 1>
+// MULTICONSUMER-NOT: ttng.fence_async_shared
+// MULTICONSUMER-NOT: ttng.arrive_barrier {{.*}}shared_cluster_memory
+// MULTICONSUMER: ttng.wait_barrier {{.*}}async_task_id = array<i32: 1>
+// MULTICONSUMER: ttg.local_load {{.*}}async_task_id = array<i32: 1>
+// MULTICONSUMER: ttng.arrive_barrier {{.*}}async_task_id = array<i32: 1>
+
+#blocked_multi = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [4, 1], order = [1, 0]}>
+#shared_multi = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#smem_multi = #ttg.shared_memory
+
+module attributes {"ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32, "ttng.two-ctas" = true} {
+  tt.func public @tma_2cta_multi_consumer_ready_relay(%desc: !tt.tensordesc<128x64xf16, #shared_multi>, %out0: !tt.ptr<f16>, %out1: !tt.ptr<f16>) attributes {noinline = false} {
+    %c0 = arith.constant {async_task_id = array<i32: 0, 1>} 0 : i32
+    %ptrs0 = tt.splat %out0 {async_task_id = array<i32: 0>} : !tt.ptr<f16> -> tensor<128x64x!tt.ptr<f16>, #blocked_multi>
+    %ptrs1 = tt.splat %out1 {async_task_id = array<i32: 1>} : !tt.ptr<f16> -> tensor<128x64x!tt.ptr<f16>, #blocked_multi>
+    %i0 = arith.constant {async_task_id = array<i32: 0, 1>} 0 : index
+    %i1 = arith.constant {async_task_id = array<i32: 0, 1>} 1 : index
+    %i4 = arith.constant {async_task_id = array<i32: 0, 1>} 4 : index
+    %buffer = ttg.local_alloc {buffer.copy = 2 : i32, buffer.id = 0 : i32} : () -> !ttg.memdesc<128x64xf16, #shared_multi, #smem_multi, mutable>
+    scf.for %iv = %i0 to %i4 step %i1 {
+      %tile = tt.descriptor_load %desc[%c0, %c0] {async_task_id = array<i32: 0>, loop.cluster = 0 : i32, loop.stage = 0 : i32, two_cta_load} : !tt.tensordesc<128x64xf16, #shared_multi> -> tensor<128x64xf16, #blocked_multi>
+      ttg.local_store %tile, %buffer {async_task_id = array<i32: 0>, loop.cluster = 0 : i32, loop.stage = 0 : i32} : tensor<128x64xf16, #blocked_multi> -> !ttg.memdesc<128x64xf16, #shared_multi, #smem_multi, mutable>
+      %local = ttg.local_load %buffer {async_task_id = array<i32: 0, 1>, loop.cluster = 1 : i32, loop.stage = 0 : i32} : !ttg.memdesc<128x64xf16, #shared_multi, #smem_multi, mutable> -> tensor<128x64xf16, #blocked_multi>
+      %consumer0 = arith.addf %local, %local {async_task_id = array<i32: 0>, loop.cluster = 1 : i32, loop.stage = 0 : i32} : tensor<128x64xf16, #blocked_multi>
+      %consumer1 = arith.subf %local, %local {async_task_id = array<i32: 1>, loop.cluster = 2 : i32, loop.stage = 0 : i32} : tensor<128x64xf16, #blocked_multi>
+      tt.store %ptrs0, %consumer0 {async_task_id = array<i32: 0>} : tensor<128x64x!tt.ptr<f16>, #blocked_multi>
+      tt.store %ptrs1, %consumer1 {async_task_id = array<i32: 1>} : tensor<128x64x!tt.ptr<f16>, #blocked_multi>
+      scf.yield
+    } {async_task_id = array<i32: 0, 1>, tt.warp_specialize}
     tt.return
   }
 }
