@@ -25,6 +25,10 @@ static constexpr AutoWSLoopAttrInfo kAutoWSLoopAttrs[] = {
     {"tt.smem_alloc_algo", AutoWSLoopAttrPropagation::ForwardToInnerLoop},
     {"tt.smem_budget", AutoWSLoopAttrPropagation::ForwardToInnerLoop},
     {"tt.smem_circular_reuse", AutoWSLoopAttrPropagation::ForwardToInnerLoop},
+    // Forwarded: the consumer reads it off the MMA's immediate parent
+    // scf.for, so an annotated scheduler while must hand it to the inner
+    // compute loop or the elision silently does not happen.
+    {"tt.assume_nonempty", AutoWSLoopAttrPropagation::ForwardToInnerLoop},
 };
 
 ArrayRef<AutoWSLoopAttrInfo> getAutoWSLoopAttrs() { return kAutoWSLoopAttrs; }
