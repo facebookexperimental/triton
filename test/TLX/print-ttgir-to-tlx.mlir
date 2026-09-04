@@ -1176,3 +1176,36 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
+
+// -----
+
+// A loop result consumed after the loop must print as the iter_arg the parallel
+// copy assigns, not as the loop op's own SSA name. Only warp_specialize used to
+// create the substitution map that records this, so a loop outside one emitted
+// unbound names -- which on AMD CDNA, having no warp_specialize, is every loop.
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: def loop_results_outside_ws(
+  // CHECK: [[ACC:[a-z0-9_]+]] = cst
+  // CHECK: [[L:[a-z0-9_]+]] = cst_0
+  // CHECK: for {{[a-z0-9_]+}} in range(
+  // CHECK: [[ACC]], [[L]] = {{[a-z0-9_]+}}, {{[a-z0-9_]+}}
+  // Both results resolve to their iter_args, not to %0#0 / %0#1.
+  // CHECK: = [[ACC]] / [[L]]
+  // CHECK-NOT: var_0_0
+  tt.func public @loop_results_outside_ws(%n: i32) attributes {noinline = false} {
+    %c0_i32 = arith.constant 0 : i32
+    %c1_i32 = arith.constant 1 : i32
+    %zero = arith.constant dense<0.000000e+00> : tensor<256xf32, #blocked>
+    %one = arith.constant dense<1.000000e+00> : tensor<256xf32, #blocked>
+    %res:2 = scf.for %i = %c0_i32 to %n step %c1_i32 iter_args(%acc = %zero, %l = %one)
+        -> (tensor<256xf32, #blocked>, tensor<256xf32, #blocked>) : i32 {
+      %a = arith.addf %acc, %l : tensor<256xf32, #blocked>
+      %b = arith.mulf %l, %l : tensor<256xf32, #blocked>
+      scf.yield %a, %b : tensor<256xf32, #blocked>, tensor<256xf32, #blocked>
+    }
+    %div = arith.divf %res#0, %res#1 : tensor<256xf32, #blocked>
+    tt.return
+  }
+}
