@@ -126,6 +126,19 @@ def test_tall_m_heuristic_cluster_fits_one_group(M, N, K):
     assert cfg["GROUP_SIZE_M"] >= cfg["NUM_CTAS"]
 
 
+def test_tall_m_narrow_n_keeps_both_cta_tiles_in_bounds():
+    M, N, K = 64512, 128, 512
+    cfg = sm100.get_heuristic_config(M, N, K, num_sms=148)
+
+    assert cfg["NUM_CTAS"] == 2
+    assert cfg["BLOCK_SIZE_M"] == 128
+    assert cfg["BLOCK_SIZE_N"] == 128
+    assert cfg["BLOCK_SIZE_K"] == 64
+    assert cfg["NUM_MMA_GROUPS"] == 1
+    assert cfg["EPILOGUE_SUBTILE"] == 1
+    assert (cfg["NUM_CTAS"] - 1) * (cfg["BLOCK_SIZE_N"] // cfg["NUM_CTAS"]) < N
+
+
 # --------------------------------------------------------------------------
 # GPU: the layout tests above check the host arithmetic. This checks that the
 # device actually agrees with it, which no amount of host-side reasoning can.

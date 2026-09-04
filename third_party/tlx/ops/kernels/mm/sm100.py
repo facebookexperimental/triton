@@ -17,12 +17,20 @@ import triton.language.extra.tlx as tlx
 from triton.language.extra.tlx.warp_spec import get_bufidx_phase
 from triton.tools.tensor_descriptor import TensorDescriptor
 
-from ._layout import descriptor_layout
+from ._layout import descriptor_layout, shape_has_tma_compatible_strides
 from ._shapes import SM100_FOCUS
 
-#: The shapes `bench_mm.py` gates on for this arch. Correctness runs the union
-#: of every arch's list; perf runs only its own.
-PERF_SHAPES = SM100_FOCUS
+
+def _focus_shape_is_supported(shape):
+    M, N, K, a_strides, b_strides, dtype = shape
+    element_size = {"fp16": 2, "bf16": 2}[dtype]
+    return shape_has_tma_compatible_strides(M, N, K, a_strides, b_strides, element_size)
+
+
+# Keep unsupported captured calls visible without sending them through a
+# benchmark that they cannot execute. The public API tests pin the rejection.
+PERF_SHAPES = [shape for shape in SM100_FOCUS if _focus_shape_is_supported(shape)]
+UNSUPPORTED_SHAPES = [shape for shape in SM100_FOCUS if not _focus_shape_is_supported(shape)]
 
 
 # Cached SM count — never changes during program lifetime.
@@ -84,6 +92,25 @@ def get_heuristic_config(M, N, K, num_sms=148):
     # Use arithmetic intensity to select tile shape, and K size to select BLOCK_K
     if is_tall_m and is_gpu_saturated:
         arithmetic_intensity = K / max(min(M, N), 1)
+        # A 256-wide 2-CTA tile gives CTA1 no B columns when N <= 128.
+        # Sustained launches of that configuration fail. Use a 128-wide tile
+        # with one epilogue store and more M tiles instead.
+        if N <= 128:
+            return {
+                "BLOCK_SIZE_M": 128,
+                "BLOCK_SIZE_N": 128,
+                "BLOCK_SIZE_K": 64,
+                "GROUP_SIZE_M": _select_group_size_m(M, N, 128, num_ctas=2),
+                "NUM_SMEM_BUFFERS": 4,
+                "NUM_TMEM_BUFFERS": 3,
+                "NUM_MMA_GROUPS": 1,
+                "EPILOGUE_SUBTILE": 1,
+                "NUM_CTAS": 2,
+                "SPLIT_K": 1,
+                "INTERLEAVE_EPILOGUE": 0,
+                "ctas_per_cga": (2, 1, 1),
+                "pre_hook": matmul_tma_set_block_size_hook,
+            }
         # For low arithmetic intensity (memory-bound), use narrower tiles with larger BLOCK_K
         if arithmetic_intensity <= 1.5:
             return {
@@ -502,6 +529,11 @@ def preprocess_configs(configs, named_args, **kwargs):
             continue
         # Pair-CTA MMA doesn't work with M=64 per MMA group
         if NUM_CTAS == 2 and BLOCK_M // NUM_MMA_GROUPS == 64:
+            continue
+        # Every CTA in a pair must own at least one B column. A TMA load whose
+        # starting column is at or beyond N is an invalid launch, not a masked
+        # tail tile.
+        if (NUM_CTAS - 1) * (BLOCK_N // NUM_CTAS) >= N:
             continue
         # GROUP_SIZE_M must be a multiple of NUM_CTAS so that consecutive
         # tile_ids (assigned to paired CTAs in a cluster) always map to the
@@ -1561,6 +1593,10 @@ def heuristic_config(M, N, K):
     if group_m % num_ctas != 0:
         raise AssertionError(f"heuristic config for {M}x{N}x{K} has GROUP_SIZE_M={group_m} with "
                              f"NUM_CTAS={num_ctas}; paired CTAs would straddle two pid_n values")
+    block_n = cfg["BLOCK_SIZE_N"]
+    if (num_ctas - 1) * (block_n // num_ctas) >= N:
+        raise AssertionError(f"heuristic config for {M}x{N}x{K} has BLOCK_SIZE_N={block_n} with "
+                             f"NUM_CTAS={num_ctas}; a CTA would start its B tile outside N")
     ctas_per_cga = cfg.pop("ctas_per_cga", None)
     pre_hook = cfg.pop("pre_hook", None) or matmul_tma_set_block_size_hook
     return [triton.Config(cfg, num_warps=4, num_stages=1, pre_hook=pre_hook, ctas_per_cga=ctas_per_cga)]

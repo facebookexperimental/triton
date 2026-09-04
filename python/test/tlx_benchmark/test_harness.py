@@ -993,3 +993,15 @@ def test_mm_benchmark_continues_after_recoverable_error():
     results = bench_mm._run_cases(case_list, run_one)
     assert len(results) == 3
     assert [result.status for result in results] == [Status.OK, Status.ERROR, Status.OK]
+
+
+def test_mm_correctness_reference_uses_true_float32():
+    import bench_mm
+    import torch
+
+    a = torch.tensor([[1.0, 2.0]], dtype=torch.bfloat16)
+    b = torch.tensor([[3.0], [4.0]], dtype=torch.bfloat16)
+    ref = bench_mm._correctness_reference(a, b)
+
+    assert ref.dtype == torch.float32
+    torch.testing.assert_close(ref, a.float() @ b.float())
