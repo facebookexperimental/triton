@@ -1,0 +1,10 @@
+{
+  "backend": "hip",
+  "architecture": "gfx942",
+  "device": "cuda:0",
+  "environment": {
+    "TRITON_DISABLE_POST_MISCHED": "1",
+    "TRITON_USE_C_DISPATCHER": "0",
+    "TLX_CANDIDATE_PACKAGE": "triton.tlx.ops.kernels.mm"
+  }
+}
