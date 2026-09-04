@@ -887,8 +887,11 @@ class InterpreterBuilder:
     def create_dot_scaled(self, lhs: TensorHandle, lhs_scale_handle: Optional[TensorHandle],
                           lhs_format_enum: _ir.ScaleDotElemTypeTY, rhs: TensorHandle,
                           rhs_scale_handle: Optional[TensorHandle], rhs_format_enum: _ir.ScaleDotElemTypeTY,
-                          fast_math: bool, lhs_k_pack: bool, rhs_k_pack: bool,
-                          acc_handle: TensorHandle) -> TensorHandle:
+                          fast_math: bool, lhs_k_pack: bool, rhs_k_pack: bool, acc_handle: TensorHandle,
+                          two_ctas: bool = False) -> TensorHandle:
+        # two_ctas only splits the MMA across a CTA pair on the device; the
+        # operand shapes and the mathematical result are unchanged, so the
+        # interpreter ignores it.
         lhs_data = _prepare_dot_scaled_operand(lhs, lhs_scale_handle, lhs_format_enum, lhs_k_pack, is_rhs=False)
         rhs_data = _prepare_dot_scaled_operand(rhs, rhs_scale_handle, rhs_format_enum, rhs_k_pack, is_rhs=True)
 
