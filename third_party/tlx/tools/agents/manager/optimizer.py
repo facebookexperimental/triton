@@ -498,6 +498,50 @@ def _ncu_regression_diagnostics(
     return "; ".join(diagnostics)
 
 
+def _required_profile_diagnostics(
+    performance: PerformanceSummary,
+    cases: tuple[InputCase, ...],
+) -> str:
+    evaluations = {evaluation.case_id: evaluation for evaluation in performance.cases}
+    diagnostics: list[str] = []
+    for case in cases:
+        required = case.parameters.get("required_profile")
+        if required is None:
+            continue
+        if required != "att":
+            diagnostics.append(f"{case.case_id}: unsupported required_profile={required!r}")
+            continue
+        evaluation = evaluations.get(case.case_id)
+        att = evaluation.profile.get("att") if evaluation is not None else None
+        if not isinstance(att, Mapping):
+            diagnostics.append(f"{case.case_id}: ATT result is missing")
+            continue
+        instruction_rows = att.get("instruction_rows")
+        traced_dispatches = att.get("traced_dispatches")
+        valid = (
+            att.get("mode") == "att"
+            and isinstance(instruction_rows, int)
+            and instruction_rows > 0
+            and traced_dispatches == 1
+            and not att.get("error")
+            and not att.get("parse_error")
+            and not att.get("collection_error")
+        )
+        if valid:
+            continue
+        reason = (
+            att.get("error")
+            or att.get("parse_error")
+            or att.get("collection_error")
+            or att.get("att_unavailable_reason")
+            or f"mode={att.get('mode')!r}, instruction_rows={instruction_rows!r}, "
+            f"traced_dispatches={traced_dispatches!r}"
+        )
+        reason = " ".join(str(reason).replace("\x00", " ").split())[:500]
+        diagnostics.append(f"{case.case_id}: {reason}")
+    return "; ".join(diagnostics)
+
+
 def _report_candidate_artifacts(
     experiment_id: str, artifacts: CandidateArtifactPaths
 ) -> None:
@@ -573,6 +617,23 @@ class KernelOptimizer:
                 "baseline failed one or more protected correctness cases"
             )
         baseline = replace(baseline, aggregate_speedup=1.0)
+        required_profile_diagnostics = _required_profile_diagnostics(
+            baseline, request.cases
+        )
+        if required_profile_diagnostics:
+            baseline_profiles = _profiles_by_case(baseline)
+            store.write_profile("baseline", baseline_profiles)
+            store.write_aggregated_profile("baseline_profile", baseline_profiles)
+            print(
+                "[tlx-agent] MISSING_REQUIRED_PROFILE "
+                f"scope=baseline diagnostics={required_profile_diagnostics!r} "
+                "recipient=Manager action=STOP",
+                file=sys.stderr,
+                flush=True,
+            )
+            raise HarnessExecutionError(
+                "MISSING_REQUIRED_PROFILE: " + required_profile_diagnostics
+            )
         if request.diagnostic_proton_intra_kernel:
             baseline_diagnostics = _collect_diagnostic_profiles(
                 harness,
@@ -909,12 +970,34 @@ class KernelOptimizer:
             ),
         )
         final_ncu_diagnostics = _ncu_regression_diagnostics(baseline, final_profile)
+        final_required_profile_diagnostics = _required_profile_diagnostics(
+            final_profile, request.cases
+        )
+        final_gate_diagnostics = "; ".join(
+            item
+            for item in (
+                final_ncu_diagnostics,
+                (
+                    "MISSING_REQUIRED_PROFILE: "
+                    + final_required_profile_diagnostics
+                    if final_required_profile_diagnostics
+                    else ""
+                ),
+            )
+            if item
+        )
         if best_experiment_id != "baseline" and (
             final_ncu_diagnostics
+            or final_required_profile_diagnostics
             or not is_promotable(final_profile, request.budget, request.cases)
         ):
             if final_ncu_diagnostics:
                 diagnostics.append(f"final: rejected: {final_ncu_diagnostics}")
+            if final_required_profile_diagnostics:
+                diagnostics.append(
+                    "final: MISSING_REQUIRED_PROFILE: "
+                    + final_required_profile_diagnostics
+                )
             best_source = request.kernel_source
             final_profile = baseline
             final_profiles = baseline_profiles
@@ -955,7 +1038,7 @@ class KernelOptimizer:
             final_profile,
             baseline=baseline,
             cases=request.cases,
-            diagnostics=final_ncu_diagnostics,
+            diagnostics=final_gate_diagnostics,
         )
         store.write_aggregated_profile("best_profile", best_profiles)
         # Doc-compatible alias: experiments.json mirrors the experiments list.

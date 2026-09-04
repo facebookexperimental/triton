@@ -1,0 +1,17 @@
+[
+  {
+    "case_id": "target_1024x6144x4096_contiguous",
+    "parameters": {
+      "m": 1024,
+      "n": 6144,
+      "k": 4096,
+      "strides": [[4096, 1], [6144, 1]],
+      "dtype": "float16",
+      "seed": 0,
+      "profile": true,
+      "required_profile": "att"
+    },
+    "weight": 1.0,
+    "protected": true
+  }
+]

@@ -23,7 +23,11 @@ from third_party.tlx.tools.agents.manager.cli import (
     _validate_host_matches_target,
     _write_swimlane,
 )
-from third_party.tlx.tools.agents.build_agent.harness import StandaloneHarness, SubprocessHarness
+from third_party.tlx.tools.agents.build_agent.harness import (
+    HarnessExecutionError,
+    StandaloneHarness,
+    SubprocessHarness,
+)
 from third_party.tlx.tools.agents.manager.models import (
     AutoCommitResult,
     CaseEvaluation,
@@ -41,7 +45,11 @@ from third_party.tlx.tools.agents.manager.models import (
     weighted_geometric_speedup,
 )
 from third_party.tlx.tools.agents.worker.artifacts import load_prior_run_evidence
-from third_party.tlx.tools.agents.manager.optimizer import KernelOptimizer, _profile_log_parts
+from third_party.tlx.tools.agents.manager.optimizer import (
+    KernelOptimizer,
+    _profile_log_parts,
+    _required_profile_diagnostics,
+)
 from third_party.tlx.tools.agents.profiler.backends.gfx942 import att
 from third_party.tlx.tools.agents.profiler.profiling import ProfileRequest
 from third_party.tlx.tools.agents.worker.providers import (
@@ -1780,8 +1788,112 @@ class Gfx942AttTest(unittest.TestCase):
             )
         command = run.call_args.args[0]
         self.assertIn("--kernel-trace", command)
+        self.assertEqual(command[command.index("--output-format") + 1], "csv")
         self.assertEqual(command[command.index("--kernel-iteration-range") + 1], "[4]")
         self.assertEqual(command[command.index("--att-target-cu") + 1], "0")
+
+    def test_att_runtime_is_pinned_to_the_profiler_bundle(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            binary = root / "bin" / "rocprofv3"
+            decoder = root / "lib" / "librocprof-trace-decoder.so"
+            binary.parent.mkdir()
+            decoder.parent.mkdir()
+            binary.touch()
+            decoder.touch()
+
+            args = att._att_runtime_args(str(binary))
+
+        self.assertEqual(args[:2], ["--output-format", "csv"])
+        self.assertEqual(args[args.index("--rocm-root") + 1], str(root))
+        self.assertEqual(
+            args[args.index("--att-library-path") + 1], str(root / "lib")
+        )
+
+    def test_required_att_profile_rejects_counter_fallback(self) -> None:
+        cases = (
+            InputCase(
+                "target",
+                {"required_profile": "att"},
+            ),
+        )
+        fallback = PerformanceSummary(
+            cases=(
+                CaseEvaluation(
+                    case_id="target",
+                    verification=VerificationResult(True),
+                    timing=TimingSamples((10.0,)),
+                    profile={
+                        "att": {
+                            "mode": "counters",
+                            "att_unavailable_reason": "rocprofv3 crashed",
+                        }
+                    },
+                ),
+            )
+        )
+        valid = PerformanceSummary(
+            cases=(
+                CaseEvaluation(
+                    case_id="target",
+                    verification=VerificationResult(True),
+                    timing=TimingSamples((10.0,)),
+                    profile={
+                        "att": {
+                            "mode": "att",
+                            "instruction_rows": 42,
+                            "traced_dispatches": 1,
+                        }
+                    },
+                ),
+            )
+        )
+
+        self.assertIn(
+            "rocprofv3 crashed", _required_profile_diagnostics(fallback, cases)
+        )
+        self.assertEqual(_required_profile_diagnostics(valid, cases), "")
+
+    def test_manager_stops_before_dispatch_when_required_att_is_missing(self) -> None:
+        provider = Mock()
+        fallback = PerformanceSummary(
+            cases=(
+                CaseEvaluation(
+                    case_id="target",
+                    verification=VerificationResult(True),
+                    timing=TimingSamples((10.0,)),
+                    profile={
+                        "att": {
+                            "mode": "counters",
+                            "att_unavailable_reason": "rocprofv3 crashed",
+                        }
+                    },
+                ),
+            )
+        )
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            optimizer_module, "SubprocessHarness"
+        ) as harness_type:
+            harness_type.return_value.evaluate.return_value = fallback
+            with self.assertRaisesRegex(
+                HarnessExecutionError, "MISSING_REQUIRED_PROFILE"
+            ):
+                KernelOptimizer(provider).optimize(
+                    KernelOptimizationRequest(
+                        kernel_source="VALUE = 1\n",
+                        harness_path=Path(__file__),
+                        cases=(
+                            InputCase(
+                                "target",
+                                {"required_profile": "att"},
+                            ),
+                        ),
+                        target=KernelTarget("hip", "gfx942"),
+                        output_dir=Path(directory),
+                    )
+                )
+
+        provider.propose.assert_not_called()
 
     def test_collect_falls_back_to_counters_when_the_att_run_fails(self) -> None:
         # Advertised --att can still fail at run time; without the fallback the
@@ -1798,6 +1910,7 @@ class Gfx942AttTest(unittest.TestCase):
         self.assertEqual(calls, ["att", "counters"])
         self.assertEqual(result["mode"], "counters")
         self.assertEqual(result["att_unavailable_reason"], "decoder missing")
+        self.assertEqual(result["att_failure"]["mode"], "att")
 
     def test_rocprofv3_override(self) -> None:
         with mock.patch.dict("os.environ", {"TLX_ROCPROFV3": "/opt/rocm-dev/bin/rocprofv3"}), mock.patch.object(

@@ -88,6 +88,11 @@ python -m third_party.tlx.tools.agents.manager.cli \
 
 `--arch` selects `validator/targets/<arch>/<kernel>`; `harness`/`cases`/`target` can also be passed explicitly.
 
+A case may declare `"required_profile": "att"` in its parameters. Manager then
+requires one successfully decoded ATT dispatch with instruction rows during baseline
+preflight and final validation. Counter fallback remains available as a diagnostic but
+cannot satisfy that requirement or permit dispatch to continue.
+
 `--prior-run` accepts a completed output directory or its `experiments.json`. It
 imports recomputed source hashes for exact cross-run deduplication and bounded,
 sanitized experiment evidence for candidate prompts. It never mutates prior

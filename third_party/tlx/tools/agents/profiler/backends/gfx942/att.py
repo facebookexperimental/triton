@@ -139,6 +139,33 @@ def _decoder_search_path() -> list[Path]:
     return ordered
 
 
+def _att_runtime_args(binary: str) -> list[str]:
+    """Pin ATT to the profiler's ROCm bundle and avoid ROCpd generation."""
+    args = ["--output-format", "csv"]
+    binary_path = Path(binary).resolve()
+    if binary_path.parent.name != "bin":
+        return args
+    rocm_root = binary_path.parent.parent
+    decoder_dir = rocm_root / "lib"
+    if rocm_root.is_dir():
+        args.extend(("--rocm-root", str(rocm_root)))
+    if decoder_dir.is_dir() and any(
+        path.is_file()
+        for pattern in DECODER_GLOBS
+        for path in decoder_dir.glob(pattern)
+    ):
+        args.extend(("--att-library-path", str(decoder_dir)))
+    return args
+
+
+def _partial_artifacts(output_dir: Path) -> list[str]:
+    return [
+        str(path.relative_to(output_dir))
+        for path in sorted(output_dir.rglob("*"))
+        if path.is_file()
+    ]
+
+
 def collect(
     *,
     kernel_path: Path,
@@ -157,6 +184,7 @@ def collect(
     """
     output_dir.mkdir(parents=True, exist_ok=True)
     cap = capability()
+    att_failure: dict[str, Any] | None = None
 
     def run(mode: str) -> dict[str, Any]:
         return _run(
@@ -175,12 +203,15 @@ def collect(
         if "error" not in result:
             result["capability"] = cap
             return result
+        att_failure = result
         att_error = result["error"]
     else:
         att_error = cap.get("reason", "")
 
     result = run("counters")
     result["att_unavailable_reason"] = att_error
+    if att_failure is not None:
+        result["att_failure"] = att_failure
     result["capability"] = cap
     return result
 
@@ -202,6 +233,7 @@ def _run(
     profiler_args = [binary, "-d", str(output_dir), "-o", "run"]
     if mode == "att":
         profiler_args += [
+            *_att_runtime_args(binary),
             "--att",
             # Keep a dispatch record beside the trace. Among other things, its
             # global dispatch id lets us audit the iteration-range selection.
@@ -271,6 +303,7 @@ def _run(
     }
     if completed.returncode != 0:
         summary["error"] = (completed.stderr or completed.stdout)[-4000:]
+        summary["partial_artifacts"] = _partial_artifacts(output_dir)
         return summary
 
     if mode == "att":
