@@ -1,5 +1,5 @@
 set(LLVM_TARGET_DEFINITIONS Passes.td)
-mlir_tablegen(Passes.h.inc -gen-pass-decls -name Plugins)
+mlir_tablegen(PluginPasses.h.inc -gen-pass-decls -name Plugins)
 add_public_tablegen_target(TritonPluginsIncGen)
 
 llvm_canonicalize_cmake_booleans(

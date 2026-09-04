@@ -14,6 +14,7 @@
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Tools/LayoutUtils.h"
 #include "triton/Tools/LinearLayout.h"
+#include "triton/Tools/PluginUtils.h"
 #include "llvm/Support/Casting.h"
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/optional.h>
@@ -1599,10 +1600,34 @@ void init_triton_tlx_passes(py::module_ &m) {
         });
 }
 
+// Mirror of init_plugin_passes (python/src/passes.cc) under tlx_passes, so a
+// TLX pipeline can insert an out-of-tree pass without reaching into the core
+// `passes.plugin` namespace. loadPlugins() is memoized, so this re-walks the
+// already-loaded plugins rather than dlopening anything a second time; the
+// pass list is the same one `passes.plugin` exposes.
+void init_triton_tlx_plugin_passes(py::module_ &m) {
+  for (const auto &plugin : mlir::triton::plugin::loadPlugins()) {
+    for (const auto &pass : plugin.listPasses()) {
+      std::string wrapped = std::string("add_") + pass.name;
+      m.def(
+          wrapped.c_str(),
+          [pass](mlir::PassManager &pm, std::vector<std::string> args) {
+            pass.addPass(&pm, args);
+          },
+          py::arg("pm"), py::arg("args") = std::vector<std::string>());
+    }
+  }
+}
+
 void init_triton_tlx(py::module_ &m) {
   // load dialects
   m.def("load_dialects", [](mlir::MLIRContext &context) {
     mlir::DialectRegistry registry;
+    // ir.load_dialects already registers these, but only because compiler.py
+    // happens to call it before backend.load_dialects. Register them here too
+    // so a plugin dialect is available on any context TLX is loaded into.
+    for (const auto &plugin : mlir::triton::plugin::loadPlugins())
+      plugin.registerDialects(registry);
     registry.insert<mlir::triton::tlx::TLXDialect>();
     registry.insert<ttag::TritonAMDGPUDialect>();
     context.appendDialectRegistry(registry);
@@ -1613,4 +1638,6 @@ void init_triton_tlx(py::module_ &m) {
   init_triton_tlx_ir(ir);
   auto passes = m.def_submodule("tlx_passes");
   init_triton_tlx_passes(passes);
+  auto plugin = passes.def_submodule("plugin");
+  init_triton_tlx_plugin_passes(plugin);
 }

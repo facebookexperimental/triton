@@ -12,7 +12,7 @@ namespace plugin {
 
 #define GEN_PASS_DECL_TRITONGPUMLIRPLUGIN
 #define GEN_PASS_DEF_TRITONGPUMLIRPLUGIN
-#include "Passes.h.inc"
+#include "PluginPasses.h.inc"
 
 struct MLIRPluginPass : public impl::TritonGPUMLIRPluginBase<MLIRPluginPass> {
   using TritonGPUMLIRPluginBase::TritonGPUMLIRPluginBase;
