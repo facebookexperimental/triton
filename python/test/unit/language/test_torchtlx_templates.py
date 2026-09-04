@@ -2,17 +2,31 @@
 import unittest
 from unittest import mock
 
+import sympy
 import torch
 from torch._inductor import config
+from torch._inductor.codegen.simd_kernel_features import (
+    DisableReduction,
+    EnableReduction,
+)
+from torch._inductor.dependencies import MemoryDep, ReadWrites
+from torch._inductor import ir
+from torch._inductor.scheduler import SchedulerNode
+from torch._inductor.sizevars import SizeVarAllocator
 from torch._inductor.test_case import run_tests, TestCase
 from torch._inductor.utils import run_and_get_code
+from torch._inductor.virtualized import V
 from torch.testing._internal.common_utils import (
     instantiate_parametrized_tests,
     parametrize,
 )
 from torch.testing._internal.inductor_utils import GPU_TYPE
+from torch.utils._ordered_set import OrderedSet
 from torch.utils._triton import has_datacenter_blackwell_tma_device
 from triton.language.extra.tlx.inductor import tlx_config
+from triton.language.extra.tlx.inductor.local_buffer_retention_gfx950 import (
+    LocalBufferRetention,
+)
 from triton.language.extra.tlx.hw.target import current_target
 
 
@@ -73,6 +87,205 @@ TEMPLATE_TEST_SHAPES = [
     # Covered by benchmarks instead.
 ]
 
+
+class TestLocalBufferRetention(TestCase):
+    def _scheduler_node(
+        self,
+        name,
+        *,
+        is_reduction=False,
+        reduction_type="welford_reduce",
+        ancestors=(),
+        rnumel=4096,
+        reads=(),
+        writes=(),
+    ):
+        snode = object.__new__(SchedulerNode)
+        snode.node = object.__new__(ir.ComputedBuffer)
+        snode.node.get_reduction_type = mock.Mock(
+            return_value=reduction_type if is_reduction else None
+        )
+        snode.group = (torch.device("cuda"), (1024, rnumel if is_reduction else 1))
+        snode.is_reduction = mock.Mock(return_value=is_reduction)
+        snode.has_strict_reduction = mock.Mock(return_value=False)
+        snode.get_device = mock.Mock(return_value=torch.device("cuda"))
+        snode.get_operation_names = mock.Mock(return_value=OrderedSet([name]))
+        snode.ancestors = OrderedSet(ancestors)
+        snode.read_writes = ReadWrites(
+            OrderedSet(reads), OrderedSet(writes), OrderedSet()
+        )
+        return snode
+
+    def test_enablement_requires_allow_and_gfx950(self):
+        with mock.patch.object(torch.version, "hip", "6.0"):
+            with mock.patch.object(
+                torch.cuda,
+                "get_device_properties",
+                return_value=mock.Mock(gcnArchName="gfx950:sramecc+:xnack-"),
+            ):
+                with config.patch({"triton.tlx_mode": "allow"}):
+                    self.assertTrue(LocalBufferRetention._is_enabled())
+                with config.patch({"triton.tlx_mode": "force"}):
+                    self.assertFalse(LocalBufferRetention._is_enabled())
+
+            with mock.patch.object(
+                torch.cuda,
+                "get_device_properties",
+                return_value=mock.Mock(gcnArchName="gfx942:sramecc+:xnack-"),
+            ):
+                with config.patch({"triton.tlx_mode": "allow"}):
+                    self.assertFalse(LocalBufferRetention._is_enabled())
+
+    def test_finds_cross_phase_buffer(self):
+        i, r = sympy.symbols("i r", integer=True)
+        dynamic_rows = sympy.Symbol("dynamic_rows", integer=True, positive=True)
+        access = MemoryDep("workspace", 4096 * i + r, (i, r), (128, 4096))
+        first_reduction = self._scheduler_node(
+            "first_reduction", is_reduction=True, reduction_type="sum"
+        )
+        producer = self._scheduler_node(
+            "producer", is_reduction=True, writes=(access,)
+        )
+        consumer = self._scheduler_node(
+            "consumer", is_reduction=True, reads=(access,), writes=(access,)
+        )
+        node_schedule = [
+            first_reduction,
+            DisableReduction,
+            EnableReduction,
+            producer,
+            DisableReduction,
+            EnableReduction,
+            consumer,
+        ]
+        graph = mock.Mock(sizevars=SizeVarAllocator(), scheduler=mock.Mock())
+        graph.get_dtype.return_value = torch.float16
+        graph.get_numel.return_value = dynamic_rows * 4096
+
+        with V.set_graph_handler(graph), mock.patch.object(torch.version, "hip", "6.0"):
+            with config.patch({"triton.tlx_mode": None}):
+                self.assertIsNone(LocalBufferRetention.plan_for(node_schedule))
+            with config.patch({"triton.tlx_mode": "force"}):
+                self.assertIsNone(LocalBufferRetention.plan_for(node_schedule))
+            with config.patch({"triton.tlx_mode": "allow"}):
+                plan = LocalBufferRetention.plan_for(node_schedule)
+
+        self.assertIsNotNone(plan)
+        self.assertEqual(plan.reduction_numel, 4096)
+        self.assertEqual(plan.reduction_block, 2048)
+        self.assertEqual(plan.num_warps, 4)
+        self.assertEqual(plan.waves_per_eu, 4)
+        self.assertEqual(plan.total_bytes, 8192)
+        self.assertEqual(len(plan.buffers), 1)
+        self.assertEqual(plan.buffers[0].name, "workspace")
+        self.assertEqual(plan.buffers[0].store_phase, 2)
+        self.assertEqual(plan.buffers[0].load_phases, (4,))
+
+    def test_rejects_unproven_buffer_multiple(self):
+        i, r = sympy.symbols("i r", integer=True)
+        dynamic_rows = sympy.Symbol("dynamic_rows", integer=True, positive=True)
+        access = MemoryDep("workspace", 4096 * i + r, (i, r), (128, 4096))
+        producer = self._scheduler_node(
+            "producer", is_reduction=True, writes=(access,)
+        )
+        consumer = self._scheduler_node(
+            "consumer", is_reduction=True, reads=(access,), writes=(access,)
+        )
+        graph = mock.Mock(sizevars=SizeVarAllocator(), scheduler=mock.Mock())
+        graph.get_dtype.return_value = torch.float16
+        graph.get_numel.return_value = dynamic_rows * 4096 + 1
+
+        with V.set_graph_handler(graph), mock.patch.object(torch.version, "hip", "6.0"):
+            with config.patch({"triton.tlx_mode": "allow"}):
+                plan = LocalBufferRetention.plan_for(
+                    [producer, DisableReduction, EnableReduction, consumer]
+                )
+
+        self.assertIsNone(plan)
+
+    def test_rejects_local_buffer_overflow(self):
+        i, r = sympy.symbols("i r", integer=True)
+        dynamic_rows = sympy.Symbol("dynamic_rows", integer=True, positive=True)
+        access = MemoryDep("workspace", 16384 * i + r, (i, r), (128, 16384))
+        producer = self._scheduler_node(
+            "producer", is_reduction=True, rnumel=16384, writes=(access,)
+        )
+        consumer = self._scheduler_node(
+            "consumer",
+            is_reduction=True,
+            rnumel=16384,
+            reads=(access,),
+            writes=(access,),
+        )
+        graph = mock.Mock(sizevars=SizeVarAllocator(), scheduler=mock.Mock())
+        graph.get_dtype.return_value = torch.float32
+        graph.get_numel.return_value = dynamic_rows * 16384
+
+        with V.set_graph_handler(graph), mock.patch.object(torch.version, "hip", "6.0"):
+            with config.patch({"triton.tlx_mode": "allow"}):
+                plan = LocalBufferRetention.plan_for(
+                    [producer, DisableReduction, EnableReduction, consumer]
+                )
+
+        self.assertIsNone(plan)
+
+    def test_rejects_nonmatching_access(self):
+        i, r = sympy.symbols("i r", integer=True)
+        store = MemoryDep("workspace", 4096 * i + r, (i, r), (128, 4096))
+        transposed_load = MemoryDep("workspace", i + 128 * r, (i, r), (128, 4096))
+        producer = self._scheduler_node(
+            "producer", is_reduction=True, writes=(store,)
+        )
+        consumer = self._scheduler_node(
+            "consumer",
+            is_reduction=True,
+            reads=(transposed_load,),
+            writes=(store,),
+        )
+        graph = mock.Mock(sizevars=SizeVarAllocator(), scheduler=mock.Mock())
+        graph.get_dtype.return_value = torch.float16
+        graph.get_numel.return_value = 128 * 4096
+
+        with V.set_graph_handler(graph), mock.patch.object(torch.version, "hip", "6.0"):
+            with config.patch({"triton.tlx_mode": "allow"}):
+                plan = LocalBufferRetention.plan_for(
+                    [producer, DisableReduction, EnableReduction, consumer]
+                )
+
+        self.assertIsNone(plan)
+
+    @unittest.skipIf(not is_gfx950(), "Need AMD MI350X (gfx950)")
+    def test_inductor_codegen(self):
+        n = 6144
+
+        def double_layernorm_silu(x, residual, weight1, bias1, weight2, bias2):
+            z = residual + torch.nn.functional.layer_norm(
+                x, (n,), weight1, bias1, 1.0e-5
+            )
+            return z * torch.sigmoid(
+                torch.nn.functional.layer_norm(z, (n,), weight2, bias2, 1.0e-5)
+            )
+
+        # Citrine C3: create test inputs directly on the target GPU.
+        inputs = (
+            torch.randn((2, n), device=GPU_TYPE, dtype=torch.float16),
+            torch.randn((2, n), device=GPU_TYPE, dtype=torch.float16),
+            *(torch.randn((n,), device=GPU_TYPE, dtype=torch.float16) for _ in range(4)),
+        )
+        with config.patch(
+            {"triton.tlx_mode": "allow", "force_disable_caches": True}
+        ):
+            actual, code = run_and_get_code(
+                torch.compile(double_layernorm_silu, fullgraph=True), *inputs
+            )
+
+        expected = double_layernorm_silu(*inputs)
+        torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+        generated_code = "\n".join(code)
+        self.assertIn("tlx.local_alloc", generated_code)
+        self.assertIn("tlx.local_store", generated_code)
+        self.assertIn("tlx.local_load", generated_code)
+        self.assertIn("tl.debug_barrier()", generated_code)
 
 @instantiate_parametrized_tests
 class TestTLXTemplates(TestCase):
