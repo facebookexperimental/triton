@@ -28,6 +28,7 @@ def quantized_matmul_tma_ws(
     B_TYPE: tl.constexpr,
     PACK_FACTOR: tl.constexpr,
     NUM_STAGES: tl.constexpr,
+    TWO_CTAS: tl.constexpr = False,
 ):
     pid = tl.program_id(axis=0)
     num_pid_m = tl.cdiv(M, BLOCK_M)
@@ -51,7 +52,7 @@ def quantized_matmul_tma_ws(
         scale_a = (scale_a.reshape(REP_M, REP_K, 32, 4, 4).trans(0, 3, 2, 1, 4).reshape(BLOCK_M, BLOCK_K // VEC_SIZE))
         scale_b = (scale_b.reshape(REP_N, REP_K, 32, 4, 4).trans(0, 3, 2, 1, 4).reshape(BLOCK_N, BLOCK_K // VEC_SIZE))
 
-        accumulator = tl.dot_scaled(a, scale_a, A_TYPE, b.T, scale_b, B_TYPE, accumulator)
+        accumulator = tl.dot_scaled(a, scale_a, A_TYPE, b.T, scale_b, B_TYPE, accumulator, two_ctas=TWO_CTAS)
         offs_k += BLOCK_K // PACK_FACTOR
         offs_scale_k += REP_K
 
@@ -149,6 +150,90 @@ def test_autows_quantized_matmul_tma(data_kind, scale_kind, vec_size, a_type, b_
         assert "ttg.warp_specialize" in ttgir, "Expected warp specialization in IR"
         assert ("ttng.tc_gen5_mma_scaled" in ttgir), "Expected scaled Blackwell MMA instruction"
         assert expected_ptx in kernel.asm["ptx"]
+
+        ref = torch.matmul(a_ref, b_ref.T)
+        torch.testing.assert_close(ref, c, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell")
+def test_autows_quantized_matmul_tma_2cta(device):
+    """MXFP8 scaled matmul on a 2-CTA (cta_group::2) collective MMA.
+
+    Launched with ctas_per_cga=(2, 1, 1), so each CTA is its own program and the
+    pair cooperates only through the collective MMA. M is sized to two BLOCK_M
+    tiles so the grid is an exact multiple of the cluster and adjacent programs
+    pair up along M, matching how the compiler splits the B operand.
+    """
+    if not hasattr(torch, "float8_e5m2"):
+        pytest.skip("MXFP8 inputs require torch.float8_e5m2")
+
+    with triton.knobs.nvidia.scope():
+        triton.knobs.nvidia.use_meta_ws = True
+        triton.knobs.nvidia.disable_wsbarrier_reorder = True
+
+        vec_size = 32
+        M, N, K = 256, 128, 256
+        BLOCK_M, BLOCK_N, BLOCK_K = 128, 128, 128
+        rep_m = BLOCK_M // 128
+        rep_n = BLOCK_N // 128
+        rep_k = BLOCK_K // vec_size // 4
+
+        torch.manual_seed(42)
+        a, a_ref = _make_quantized_input("mxfp8", (M, K), device)
+        b, b_ref = _make_quantized_input("mxfp8", (N, K), device)
+        scale_a = _make_unit_scale_5d("mxfp8", M, K, vec_size, device)
+        scale_b = _make_unit_scale_5d("mxfp8", N, K, vec_size, device)
+        c = torch.empty((M, N), dtype=torch.float32, device=device)
+
+        def alloc_fn(size, _align, _stream):
+            return torch.empty(size, dtype=torch.int8, device=device)
+
+        triton.set_allocator(alloc_fn)
+
+        a_desc = TensorDescriptor.from_tensor(a, [BLOCK_M, BLOCK_K])
+        b_desc = TensorDescriptor.from_tensor(b, [BLOCK_N, BLOCK_K])
+        c_desc = TensorDescriptor.from_tensor(c, [BLOCK_M, BLOCK_N])
+        a_scale_desc = TensorDescriptor.from_tensor(scale_a, [1, rep_m, rep_k, 2, 256])
+        b_scale_desc = TensorDescriptor.from_tensor(scale_b, [1, rep_n, rep_k, 2, 256])
+
+        grid = (triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N), 1)
+        assert grid[0] % 2 == 0, "ctas_per_cga=(2,1,1) requires an even CTA grid"
+
+        kernel = quantized_matmul_tma_ws[grid](
+            a_desc,
+            a_scale_desc,
+            b_desc,
+            b_scale_desc,
+            c_desc,
+            M,
+            N,
+            K,
+            vec_size,
+            BLOCK_M,
+            BLOCK_N,
+            BLOCK_K,
+            rep_m,
+            rep_n,
+            rep_k,
+            "e5m2",
+            "e5m2",
+            1,
+            # Keep the software pipeline shallow. The cross-CTA rendezvous
+            # barrier that Insert2CTASync emits is a single slot with a one-bit
+            # parity phase, so it only tolerates a follower-CTA drift of one
+            # iteration. Deepening the operand pipeline here will deadlock until
+            # that barrier is multi-buffered to the operand depth.
+            NUM_STAGES=2,
+            TWO_CTAS=True,
+            num_warps=4,
+            ctas_per_cga=(2, 1, 1),
+        )
+
+        ttgir = kernel.asm["ttgir"]
+        assert "ttg.warp_specialize" in ttgir, "Expected warp specialization in IR"
+        assert "ttng.tc_gen5_mma_scaled" in ttgir, "Expected scaled Blackwell MMA instruction"
+        assert "two_ctas" in ttgir, "Expected the scaled MMA to stay 2-CTA (no 1-CTA fallback)"
+        assert "cta_group::2" in kernel.asm["ptx"], "Expected a collective 2-CTA MMA in PTX"
 
         ref = torch.matmul(a_ref, b_ref.T)
         torch.testing.assert_close(ref, c, atol=1e-2, rtol=1e-2)
