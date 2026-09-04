@@ -530,10 +530,13 @@ def _required_profile_diagnostics(
         if valid:
             continue
         reason = (
+            att.get("att_unavailable_reason")
+            if att.get("mode") != "att"
+            else None
+        ) or (
             att.get("error")
             or att.get("parse_error")
             or att.get("collection_error")
-            or att.get("att_unavailable_reason")
             or f"mode={att.get('mode')!r}, instruction_rows={instruction_rows!r}, "
             f"traced_dispatches={traced_dispatches!r}"
         )

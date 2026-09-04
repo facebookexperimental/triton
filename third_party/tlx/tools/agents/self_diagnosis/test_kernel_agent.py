@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import tempfile
 import unittest
 import xml.etree.ElementTree as ET
@@ -1826,6 +1827,7 @@ class Gfx942AttTest(unittest.TestCase):
                     profile={
                         "att": {
                             "mode": "counters",
+                            "error": "counter fallback crashed",
                             "att_unavailable_reason": "rocprofv3 crashed",
                         }
                     },
@@ -1849,9 +1851,9 @@ class Gfx942AttTest(unittest.TestCase):
             )
         )
 
-        self.assertIn(
-            "rocprofv3 crashed", _required_profile_diagnostics(fallback, cases)
-        )
+        diagnostics = _required_profile_diagnostics(fallback, cases)
+        self.assertIn("rocprofv3 crashed", diagnostics)
+        self.assertNotIn("counter fallback crashed", diagnostics)
         self.assertEqual(_required_profile_diagnostics(valid, cases), "")
 
     def test_manager_stops_before_dispatch_when_required_att_is_missing(self) -> None:
@@ -1917,6 +1919,21 @@ class Gfx942AttTest(unittest.TestCase):
                 att.shutil, "which", return_value="/opt/rocm-dev/bin/rocprofv3") as which:
             self.assertEqual(att._rocprofv3(), "/opt/rocm-dev/bin/rocprofv3")
         which.assert_called_once_with("/opt/rocm-dev/bin/rocprofv3")
+
+    def test_rocprofv3_prefers_the_python_toolchain_bundle(self) -> None:
+        with mock.patch.dict("os.environ", {}, clear=True), mock.patch.object(
+                att.sys, "base_prefix", "/opt/platform"), mock.patch.object(
+                    att.os, "access", return_value=True) as access, mock.patch.object(
+                        att.shutil, "which") as which:
+            self.assertEqual(
+                att._rocprofv3(),
+                "/opt/platform/lib/rocm-dev/bin/rocprofv3",
+            )
+
+        access.assert_called_once_with(
+            Path("/opt/platform/lib/rocm-dev/bin/rocprofv3"), os.X_OK
+        )
+        which.assert_not_called()
 
 
 def _write_policy_harness(directory: Path) -> Path:

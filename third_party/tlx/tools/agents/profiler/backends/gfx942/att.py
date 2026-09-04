@@ -20,7 +20,9 @@ than tracing the caller.
 entire ``--att*`` option group unless they find a legacy decoder on
 ``ROCPROF_ATT_LIBRARY_PATH``. Newer drivers bundle
 ``librocprof-trace-decoder`` and expose ATT directly. ``TLX_ROCPROFV3`` can
-select a compatible driver when the system default is older than the runtime.
+select a compatible driver when the system default is older than the runtime;
+the Python toolchain's ``rocm-dev`` bundle is preferred automatically when it
+is available.
 When ATT is absent -- or advertised but broken at run time -- :func:`collect`
 degrades to counters rather than failing the optimization round.
 
@@ -70,6 +72,9 @@ def _rocprofv3() -> str | None:
     override = os.environ.get("TLX_ROCPROFV3")
     if override:
         return shutil.which(override)
+    bundled = Path(sys.base_prefix) / "lib" / "rocm-dev" / "bin" / "rocprofv3"
+    if os.access(bundled, os.X_OK):
+        return str(bundled)
     return shutil.which("rocprofv3")
 
 
