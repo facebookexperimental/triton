@@ -259,6 +259,8 @@ def release_layout(x, _semantic=None):
 
 def require_nv_mma_shared_layout(x: tlx.buffered_tensor, swizzled: bool, _builder=None, fp4Padded: bool = False):
     assert isinstance(x.type.layout, tlx.shared_layout_encoding), "input must be a shared tensor"
+    if isinstance(x.type.layout, tlx.shared_linear_layout_encoding):
+        return _builder.create_require_layout(x.handle, x.type.layout.to_ir(_builder))
     rank = len(x.shape)
     layout = tlx.nv_mma_shared_layout_encoding(
         shape=x.shape,
