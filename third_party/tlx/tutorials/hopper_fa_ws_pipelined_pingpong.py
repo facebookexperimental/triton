@@ -521,13 +521,13 @@ def _attn_bwd_tlx(
                 qkT = tlx.async_dot_wait(0, qkT)
                 qkT *= sm_scale * RCP_LN2
                 pT = tl.math.exp2(qkT - m[None, :])
-                dv = tlx.async_dot(pT.to(tlx.dtype_of(desc_q)), do, dv)
                 dpT = tlx.async_dot(v_slice, doT)
-                dv = tlx.async_dot_wait(1, dv)
-                dpT = tlx.async_dot_wait(0, dpT).to(tl.float32)
-                tlx.barrier_arrive(do_empties[q_buf], 1)
+                dv = tlx.async_dot(pT.to(tlx.dtype_of(desc_q)), do, dv)
+                dpT = tlx.async_dot_wait(1, dpT).to(tl.float32)
                 dsT = pT * (dpT - Di[None, :])
                 dk = tlx.async_dot(dsT.to(tlx.dtype_of(desc_q)), q, dk)
+                dv = tlx.async_dot_wait(1, dv)
+                tlx.barrier_arrive(do_empties[q_buf], 1)
                 tlx.local_store(score_smem, dsT.to(tlx.dtype_of(desc_q)))
                 tlx.fence_async_shared()
 
