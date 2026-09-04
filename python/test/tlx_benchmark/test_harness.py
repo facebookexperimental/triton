@@ -533,3 +533,42 @@ def test_governor_can_be_disabled():
     with Governor(Device(NVIDIA, 0, "NVIDIA B200"), enable=False) as g:
         pass
     assert g.applied == []
+
+
+@pytest.mark.parametrize("message", [
+    "CUDA error: unspecified launch failure",
+    "CUDA error: an illegal memory access was encountered",
+    "device-side assert triggered",
+])
+def test_mm_benchmark_stops_after_fatal_cuda_error(message):
+    import bench_mm
+
+    seen = []
+    case_list = [Case(op="mm", arch="sm100", dtype="bfloat16", shape=(i, i, i)) for i in (1, 2, 3)]
+
+    def run_one(case):
+        seen.append(case)
+        if len(seen) == 2:
+            raise RuntimeError(message)
+        return Result(case=case)
+
+    results = bench_mm._run_cases(case_list, run_one)
+    assert len(seen) == 2
+    assert len(results) == 2
+    assert results[-1].status is Status.ERROR
+    assert "stopping:" in results[-1].notes[-1]
+
+
+def test_mm_benchmark_continues_after_recoverable_error():
+    import bench_mm
+
+    case_list = [Case(op="mm", arch="sm100", dtype="bfloat16", shape=(i, i, i)) for i in (1, 2, 3)]
+
+    def run_one(case):
+        if case.shape[0] == 2:
+            raise ValueError("unsupported layout")
+        return Result(case=case)
+
+    results = bench_mm._run_cases(case_list, run_one)
+    assert len(results) == 3
+    assert [result.status for result in results] == [Status.OK, Status.ERROR, Status.OK]

@@ -114,6 +114,19 @@ def test_heuristic_configs_have_a_sound_workspace(M, N, K):
         assert rows >= written, f"heuristic config for {M}x{N}x{K} on {num_sms} SMs has an aliasing workspace: {cfg}"
 
 
+@pytest.mark.parametrize("M, N, K", [
+    (64512, 128, 512),
+    (1000000, 512, 512),
+    (3159809, 384, 384),
+])
+def test_tall_m_heuristic_cluster_fits_one_group(M, N, K):
+    cfg = sm100.get_heuristic_config(M, N, K, num_sms=148)
+    assert cfg["NUM_CTAS"] == 2
+    assert cfg["GROUP_SIZE_M"] % cfg["NUM_CTAS"] == 0
+
+    assert cfg["GROUP_SIZE_M"] >= cfg["NUM_CTAS"]
+
+
 # --------------------------------------------------------------------------
 # GPU: the layout tests above check the host arithmetic. This checks that the
 # device actually agrees with it, which no amount of host-side reasoning can.
@@ -152,21 +165,13 @@ def _pinned_config(overrides):
 
 
 # ``(M, N, K, NUM_CTAS)``. Each runs across SPLIT_KS_GPU and must agree.
-#
-# TODO(NUM_CTAS=2 on narrow tiles): (384, 512, 8192, 2) would exercise NUM_CTAS
-# padding end-to-end, but is wrong for an unrelated reason. B200, heuristic
-# config (BM=128, BN=64, MMA_GROUPS=2), assert_close atol=0.412 rtol=1e-3:
-# NUM_CTAS=1 passes at SPLIT_K=1 and 4; NUM_CTAS=2 gives 32670/196608 mismatched
-# (16.6%), max abs diff 583.0, at SPLIT_K=1 and 4 alike. Failing at SPLIT_K=1
-# rules out the workspace bug, and it reproduces with the fix reverted.
-# Reachable: (NUM_CTAS=2, NUM_MMA_GROUPS=2) has 88 survivors of
-# preprocess_configs here. Not 2-CTA in general -- 2cta_2group (BN=256) passes.
-# Not filed. NUM_CTAS padding is still covered by the layout tests above.
 GPU_SHAPES = [
     # M % BLOCK_SIZE_M != 0 -- the reported bug (BLOCK_SIZE_M=256 -> 24 rows over).
     (1000, 1000, 1024, 1),
     # Whole region overhangs: one tile of 128 rows holds only 64 real rows.
     (64, 4096, 4096, 1),
+    # Regression for narrow N tiles with two CTAs and two MMA groups.
+    (384, 512, 8192, 2),
 ]
 SPLIT_KS_GPU = [1, 4]
 
@@ -182,7 +187,10 @@ def test_output_is_independent_of_split_k(M, N, K, NUM_CTAS, SPLIT_K):
     a = torch.randn((M, K), device="cuda", dtype=dtype)
     b = torch.randn((K, N), device="cuda", dtype=dtype)
 
-    with _pinned_config({"SPLIT_K": SPLIT_K, "NUM_CTAS": NUM_CTAS}):
+    overrides = {"SPLIT_K": SPLIT_K, "NUM_CTAS": NUM_CTAS}
+    if NUM_CTAS == 2:
+        overrides["GROUP_SIZE_M"] = 2
+    with _pinned_config(overrides):
         torch.cuda.synchronize()
         started = time.perf_counter()
         out = tlx_mm(a, b, arch=ARCH, space="heuristic")

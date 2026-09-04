@@ -17,6 +17,7 @@ import triton.language.extra.tlx as tlx
 from triton.language.extra.tlx.warp_spec import get_bufidx_phase
 from triton.tools.tensor_descriptor import TensorDescriptor
 
+from ._layout import descriptor_layout
 from ._shapes import SM100_FOCUS
 
 #: The shapes `bench_mm.py` gates on for this arch. Correctness runs the union
@@ -89,7 +90,7 @@ def get_heuristic_config(M, N, K, num_sms=148):
                 "BLOCK_SIZE_M": 256,
                 "BLOCK_SIZE_N": 128,
                 "BLOCK_SIZE_K": 128,
-                "GROUP_SIZE_M": _select_group_size_m(M, N, 256),
+                "GROUP_SIZE_M": _select_group_size_m(M, N, 256, num_ctas=2),
                 "NUM_SMEM_BUFFERS": 2,
                 "NUM_TMEM_BUFFERS": 2,
                 "NUM_MMA_GROUPS": 2,
@@ -109,7 +110,7 @@ def get_heuristic_config(M, N, K, num_sms=148):
                     "BLOCK_SIZE_M": 256,
                     "BLOCK_SIZE_N": 256,
                     "BLOCK_SIZE_K": 128,
-                    "GROUP_SIZE_M": _select_group_size_m(M, N, 256),
+                    "GROUP_SIZE_M": _select_group_size_m(M, N, 256, num_ctas=2),
                     "NUM_SMEM_BUFFERS": 2,
                     "NUM_TMEM_BUFFERS": 1,
                     "NUM_MMA_GROUPS": 2,
@@ -125,7 +126,7 @@ def get_heuristic_config(M, N, K, num_sms=148):
                     "BLOCK_SIZE_M": 256,
                     "BLOCK_SIZE_N": 256,
                     "BLOCK_SIZE_K": 64,
-                    "GROUP_SIZE_M": _select_group_size_m(M, N, 256),
+                    "GROUP_SIZE_M": _select_group_size_m(M, N, 256, num_ctas=2),
                     "NUM_SMEM_BUFFERS": 4,
                     "NUM_TMEM_BUFFERS": 1,
                     "NUM_MMA_GROUPS": 2,
@@ -330,7 +331,7 @@ def get_heuristic_config(M, N, K, num_sms=148):
                 "BLOCK_SIZE_M": bm,
                 "BLOCK_SIZE_N": bn,
                 "BLOCK_SIZE_K": bk,
-                "GROUP_SIZE_M": _select_group_size_m(M, N, bm),
+                "GROUP_SIZE_M": _select_group_size_m(M, N, bm, num_ctas=num_ctas),
                 "NUM_SMEM_BUFFERS": num_smem_buffers,
                 "NUM_TMEM_BUFFERS": num_tmem_buffers,
                 "NUM_MMA_GROUPS": num_mma_groups,
@@ -345,7 +346,7 @@ def get_heuristic_config(M, N, K, num_sms=148):
     return best_config
 
 
-def _select_group_size_m(M, N, block_m):
+def _select_group_size_m(M, N, block_m, num_ctas=1):
     """
     Select GROUP_SIZE_M based on the golden rule for tile scheduling.
 
@@ -357,19 +358,23 @@ def _select_group_size_m(M, N, block_m):
     - When M >> N: Use small GROUP_SIZE_M to reuse B (smaller dimension)
     - When N >> M: Use large GROUP_SIZE_M to reuse A (smaller dimension)
     - When M ~ N: Use moderate GROUP_SIZE_M for L2 locality
+
+    Rounded up to a multiple of num_ctas: correctness, not tuning. See the
+    pairing gate in preprocess_configs.
     """
     num_m_tiles = (M + block_m - 1) // block_m
     ratio = M / max(N, 1)
 
     if ratio > 10:
-        # M >> N: sweep M, reuse B
-        return 1
+        # M >> N: sweep M, reuse B. A cluster must stay inside one group.
+        group_size = 1
     elif ratio < 0.1:
         # N >> M: sweep N, reuse A
-        return min(64, num_m_tiles)
+        group_size = min(64, num_m_tiles)
     else:
         # Balanced: moderate group size for L2 locality
-        return min(8, num_m_tiles)
+        group_size = min(8, num_m_tiles)
+    return max(num_ctas, math.ceil(group_size / num_ctas) * num_ctas)
 
 
 def get_cuda_autotune_config():
@@ -1551,6 +1556,11 @@ def heuristic_config(M, N, K):
     if cfg is None:
         return None
     cfg = dict(cfg)
+    # The heuristic path bypasses preprocess_configs, so check its gate here.
+    group_m, num_ctas = cfg["GROUP_SIZE_M"], cfg.get("NUM_CTAS", 1)
+    if group_m % num_ctas != 0:
+        raise AssertionError(f"heuristic config for {M}x{N}x{K} has GROUP_SIZE_M={group_m} with "
+                             f"NUM_CTAS={num_ctas}; paired CTAs would straddle two pid_n values")
     ctas_per_cga = cfg.pop("ctas_per_cga", None)
     pre_hook = cfg.pop("pre_hook", None) or matmul_tma_set_block_size_hook
     return [triton.Config(cfg, num_warps=4, num_stages=1, pre_hook=pre_hook, ctas_per_cga=ctas_per_cga)]
@@ -1602,15 +1612,15 @@ def mm(a, b, *, space="full"):
 
     # A column-major operand's .T is a row-major view of the same memory, so the
     # descriptor flips and the MMA operand is recovered by a metadata-only
-    # transpose. No copy.
-    a_row_major = a.is_contiguous()
-    b_row_major = b.is_contiguous()
+    # transpose. No copy. Padded row-major views keep their original orientation.
+    a_layout = descriptor_layout(a, "a")
+    b_layout = descriptor_layout(b, "b")
+    a_row_major = a_layout.row_major
+    b_row_major = b_layout.row_major
 
     dummy_block = [1, 1]
-    a_src = a if a_row_major else a.T
-    b_src = b if b_row_major else b.T
-    a_desc = TensorDescriptor(a_src, a_src.shape, a_src.stride(), dummy_block)
-    b_desc = TensorDescriptor(b_src, b_src.shape, b_src.stride(), dummy_block)
+    a_desc = TensorDescriptor(a_layout.source, a_layout.source.shape, a_layout.source.stride(), dummy_block)
+    b_desc = TensorDescriptor(b_layout.source, b_layout.source.shape, b_layout.source.stride(), dummy_block)
     c_desc = TensorDescriptor(c, c.shape, c.stride(), dummy_block)
 
     # Dummy workspace; the pre_hook sizes a real one once SPLIT_K is known.

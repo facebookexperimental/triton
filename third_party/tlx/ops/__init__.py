@@ -42,13 +42,28 @@ def mm(a, b, *, arch=None, space="heuristic"):
     Defaults to a single analytically chosen config so the first call stays
     interactive; pass `space="full"` to autotune. See the module docstring.
     """
+    from .kernels.mm._layout import descriptor_layout
+
     fn, spec = impl_for("mm", arch)
-    # Mirror the kernel's operand prep: a non-contiguous operand is fed to its
-    # descriptor transposed, so that is the stride TMA must find aligned.
-    a_src = a if a.is_contiguous() else a.T
-    b_src = b if b.is_contiguous() else b.T
-    check_inputs(spec, dtype=a.dtype, row_strides=(a_src.stride(0), b_src.stride(0), b.shape[1]),
-                 elem_bytes=a.element_size())
+    if a.ndim != 2 or b.ndim != 2:
+        raise InvalidInput(f"{spec} expects two 2D tensors, got {tuple(a.shape)} and {tuple(b.shape)}")
+    if a.shape[1] != b.shape[0]:
+        raise InvalidInput(f"{spec} has incompatible dimensions {tuple(a.shape)} and {tuple(b.shape)}")
+    if a.dtype != b.dtype:
+        raise InvalidInput(f"{spec} expects matching dtypes, got {a.dtype} and {b.dtype}")
+    if a.device != b.device:
+        raise InvalidInput(f"{spec} expects tensors on the same device, got {a.device} and {b.device}")
+
+    if spec.accepts is not None:
+        try:
+            a_layout = descriptor_layout(a, "a")
+            b_layout = descriptor_layout(b, "b")
+        except ValueError as exc:
+            raise InvalidInput(f"{spec} does not support these inputs: {exc}") from exc
+        check_inputs(spec, dtype=a.dtype, row_strides=(a_layout.row_stride, b_layout.row_stride, b.shape[1]),
+                     elem_bytes=a.element_size())
+    else:
+        check_inputs(spec, dtype=a.dtype)
     return fn(a, b, space=space)
 
 
