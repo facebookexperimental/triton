@@ -1,9 +1,13 @@
+#include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Interfaces/CallInterfaces.h"
+#include "mlir/Interfaces/ControlFlowInterfaces.h"
 #include "triton/Analysis/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/Passes.h"
 #include "triton/Tools/Sys/GetEnv.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/Debug.h"
 
 //===----------------------------------------------------------------------===//
@@ -120,6 +124,10 @@ public:
   }
 
 private:
+  static bool isLogicalLifetimeBoundary(Operation *op) {
+    return op->hasAttr("tlx.logical_lifetime_boundary");
+  }
+
   // Erase `fence` if a matching FenceAsyncSharedOp already exists earlier
   // in the same block, with only pure (memory-effect-free) ops in between.
   void eraseIfDuplicateFence(FenceAsyncSharedOp fence) {
@@ -149,9 +157,47 @@ private:
       for (auto *user : v.getUsers()) {
         if (isa<ttg::LocalStoreOp>(user)) {
           result.insert(user);
-        } else if (user->hasTrait<OpTrait::MemDescViewTrait>()) {
-          for (auto res : user->getResults())
-            worklist.push_back(res);
+        } else if (auto yield = dyn_cast<scf::YieldOp>(user)) {
+          Operation *parent = yield->getParentOp();
+          for (auto [index, yielded] : llvm::enumerate(yield.getOperands())) {
+            if (yielded != v)
+              continue;
+            if (auto ifOp = dyn_cast<scf::IfOp>(parent))
+              worklist.push_back(ifOp.getResult(index));
+            else if (auto forOp = dyn_cast<scf::ForOp>(parent))
+              worklist.push_back(forOp.getResult(index));
+            else
+              result.insert(user);
+          }
+        } else if (auto forOp = dyn_cast<scf::ForOp>(user)) {
+          for (auto [index, initArg] : llvm::enumerate(forOp.getInitArgs())) {
+            if (initArg == v)
+              worklist.push_back(forOp.getBody()->getArgument(index + 1));
+          }
+        } else if (auto partOp =
+                       dyn_cast<ttg::WarpSpecializePartitionsOp>(user)) {
+          auto captures = partOp.getExplicitCaptures();
+          auto wsOp = cast<ttg::WarpSpecializeOp>(partOp->getParentOp());
+          for (unsigned i = 0; i < captures.size(); ++i) {
+            if (captures[i] != v)
+              continue;
+            for (Region *region : wsOp.getPartitionRegions())
+              worklist.push_back(region->getArgument(i));
+          }
+        } else if (isa<triton::ReturnOp, CallOpInterface,
+                       RegionBranchOpInterface,
+                       RegionBranchTerminatorOpInterface>(user)) {
+          result.insert(user);
+        } else if (user->hasTrait<OpTrait::MemDescViewTrait>() ||
+                   isMemoryEffectFree(user)) {
+          // A local_alias starts a new logical use of reused physical storage.
+          // Stores in that lifetime do not populate the preceding lifetime.
+          if (isLogicalLifetimeBoundary(user))
+            continue;
+          for (Value res : user->getResults()) {
+            if (isa<ttg::MemDescType>(res.getType()))
+              worklist.push_back(res);
+          }
         }
       }
     }
@@ -216,6 +262,39 @@ private:
 
     auto op = operand.getDefiningOp();
     if (op) {
+      // Do not trace a local_alias back into the physical backing allocation:
+      // the alias is a distinct logical lifetime. Scan forward from the alias
+      // so generic writes within this lifetime are still fenced.
+      if (isLogicalLifetimeBoundary(op)) {
+        findLocalStoresThroughViews(operand, result);
+        return;
+      }
+
+      if (auto ifOp = dyn_cast<scf::IfOp>(op)) {
+        unsigned resultNum = cast<OpResult>(operand).getResultNumber();
+        for (Region *region : {&ifOp.getThenRegion(), &ifOp.getElseRegion()}) {
+          if (region->empty()) {
+            result.insert(op);
+            continue;
+          }
+          auto yield = dyn_cast<scf::YieldOp>(region->front().getTerminator());
+          if (!yield || resultNum >= yield.getNumOperands()) {
+            result.insert(op);
+            continue;
+          }
+          findCopyRegToSharedOps(yield.getOperand(resultNum), visited, result);
+        }
+        return;
+      }
+
+      if (auto forOp = dyn_cast<scf::ForOp>(op)) {
+        unsigned resultNum = cast<OpResult>(operand).getResultNumber();
+        findCopyRegToSharedOps(forOp.getInitArgs()[resultNum], visited, result);
+        auto yieldOp = cast<scf::YieldOp>(forOp.getBody()->getTerminator());
+        findCopyRegToSharedOps(yieldOp.getOperand(resultNum), visited, result);
+        return;
+      }
+
       // reach an alloc copying from register, we need a fence.
       if (auto localAlloc = dyn_cast<ttg::LocalAllocOp>(op)) {
         if (localAlloc.getSrc()) {
@@ -227,42 +306,10 @@ private:
         findLocalStoresThroughViews(localAlloc.getResult(), result);
         if (!result.empty())
           return;
-        // When the alloc is captured by a warp_specialize op, check all
-        // partition regions for local_store ops to the corresponding block
-        // arg. This handles the case where early TMA store lowering creates
-        // a local_alloc + async_tma_copy in the epilogue partition, and
-        // code partitioning splits the alloc: the local_store ends up in
-        // the computation partition while the TMA copy stays in the
-        // epilogue partition.
-        // Walk through memdesc view ops (e.g. memdesc_index) since the
-        // warp_specialize may capture a view of the alloc rather than the
-        // alloc directly.
-        SmallVector<Value> wsWorklist = {localAlloc.getResult()};
-        DenseSet<Value> wsSeen;
-        while (!wsWorklist.empty()) {
-          Value v = wsWorklist.pop_back_val();
-          if (!wsSeen.insert(v).second)
-            continue;
-          for (auto *user : v.getUsers()) {
-            if (auto partOp = dyn_cast<ttg::WarpSpecializePartitionsOp>(user)) {
-              auto captures = partOp.getExplicitCaptures();
-              auto wsOp = cast<ttg::WarpSpecializeOp>(partOp->getParentOp());
-              for (unsigned i = 0; i < captures.size(); i++) {
-                if (captures[i] != v)
-                  continue;
-                for (Region *region : wsOp.getPartitionRegions()) {
-                  Value blockArg = region->getArgument(i);
-                  findLocalStoresThroughViews(blockArg, result);
-                  if (!result.empty())
-                    return;
-                }
-              }
-            } else if (user->hasTrait<OpTrait::MemDescViewTrait>()) {
-              for (auto res : user->getResults())
-                wsWorklist.push_back(res);
-            }
-          }
-        }
+      }
+      if (isa<CallOpInterface, RegionBranchOpInterface>(op)) {
+        result.insert(op);
+        return;
       }
       // if it is not an alloc, iterate over the operands.
       for (auto v : op->getOperands()) {

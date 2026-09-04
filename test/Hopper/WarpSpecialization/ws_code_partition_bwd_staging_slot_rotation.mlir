@@ -27,8 +27,8 @@
 // The original subtiled staging allocs must be erased: leaving zero-use
 // explicit allocs here still charges their SMEM in AllocateSharedMemoryNv.
 // CHECK-NOT: ttg.local_alloc {{.*}}buffer.tmaStaging = 1
-// CHECK-DAG: ttg.memdesc_reinterpret {{.*}} -> !ttg.memdesc<2x128x64xf16
-// CHECK-DAG: ttg.memdesc_reinterpret {{.*}} -> !ttg.memdesc<2x128x64xf16
+// CHECK-DAG: ttg.memdesc_reinterpret {{.*}}tlx.logical_lifetime_boundary{{.*}} -> !ttg.memdesc<2x128x64xf16
+// CHECK-DAG: ttg.memdesc_reinterpret {{.*}}tlx.logical_lifetime_boundary{{.*}} -> !ttg.memdesc<2x128x64xf16
 // Staging slot = (constant subtile index) % K, in the staging task (3): the
 // arith.subi reducing the index takes a CONSTANT (%c...) operand, not the
 // loop accumCnt iter_arg.

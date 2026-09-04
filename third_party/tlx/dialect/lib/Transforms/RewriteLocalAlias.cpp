@@ -50,14 +50,16 @@ int64_t getMemDescStorageBits(ttg::MemDescType ty) {
 // that allocation. This preserves the existing shared- and tensor-memory
 // aliasing semantics, including non-integral logical element-size ratios.
 FailureOr<Value> emitAliasView(OpBuilder &builder, Operation *errorOp,
-                               Location loc, Value base,
-                               ttg::MemDescType dstTy) {
+                               Location loc, Value base, ttg::MemDescType dstTy,
+                               bool isLogicalLifetimeBoundary = false) {
   auto srcTy = cast<ttg::MemDescType>(base.getType());
   int64_t srcBits = getMemDescStorageBits(srcTy);
   int64_t dstBits = getMemDescStorageBits(dstTy);
 
   if (dstBits <= srcBits) {
     auto view = ttg::MemDescReinterpretOp::create(builder, loc, dstTy, base);
+    if (isLogicalLifetimeBoundary)
+      view->setAttr("tlx.logical_lifetime_boundary", builder.getUnitAttr());
     // Explicit storage aliases may intentionally expose the same allocation
     // through a different padded address mapping.
     if (isa<ttg::PaddedSharedEncodingAttr>(srcTy.getEncoding()) ||
@@ -246,7 +248,8 @@ LogicalResult rewriteLocalAlias(ModuleOp m) {
       auto aliasType = cast<ttg::MemDescType>(aliasOp.getResult().getType());
       FailureOr<Value> baseAllocToAlias =
           emitAliasView(builder, aliasOp, baseAllocOp->getLoc(),
-                        baseAllocOp->getResult(0), aliasType);
+                        baseAllocOp->getResult(0), aliasType,
+                        /*isLogicalLifetimeBoundary=*/true);
       if (failed(baseAllocToAlias))
         return failure();
       aliasOp.getResult().replaceAllUsesWith(*baseAllocToAlias);

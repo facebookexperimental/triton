@@ -24,7 +24,7 @@ module attributes {tlx.has_explicit_local_mem_access = true, tlx.has_tlx_ops = t
     %barriers = ttg.local_alloc : () -> !ttg.memdesc<3xi64, #bar_shared, #smem, mutable>
 
     // CHECK-NOT: tlx.local_alias
-    // CHECK: ttg.memdesc_reinterpret %[[$LOCAL_ALLOC]] : !ttg.memdesc<1x64x16xf16, #[[$SHARED]], #smem, mutable> -> !ttg.memdesc<1x32x32xf16, #[[$SHARED1]], #smem, mutable>
+    // CHECK: ttg.memdesc_reinterpret %[[$LOCAL_ALLOC]] {tlx.logical_lifetime_boundary} : !ttg.memdesc<1x64x16xf16, #[[$SHARED]], #smem, mutable> -> !ttg.memdesc<1x32x32xf16, #[[$SHARED1]], #smem, mutable>
     %2 = tlx.local_alias %0 : !ttg.memdesc<1x64x16xf16, #shared, #smem, mutable> -> !ttg.memdesc<1x32x32xf16, #shared1, #smem, mutable>
 
     // CHECK: %[[$TMEM_ALLOC:.*]] = ttng.tmem_alloc : () -> !ttg.memdesc<1x64x32xf32, #[[$TMEM]], #ttng.tensor_memory, mutable>
@@ -32,6 +32,7 @@ module attributes {tlx.has_explicit_local_mem_access = true, tlx.has_tlx_ops = t
 
     // CHECK-NOT: tlx.local_alias
     // CHECK: ttg.memdesc_reinterpret %[[$TMEM_ALLOC]] : !ttg.memdesc<1x64x32xf32, #[[$TMEM]], #ttng.tensor_memory, mutable> -> !ttg.memdesc<1x64x32xf16, #[[$TMEM]], #ttng.tensor_memory, mutable>
+    // CHECK: ttg.memdesc_reinterpret %[[$TMEM_ALLOC]] {tlx.logical_lifetime_boundary} : !ttg.memdesc<1x64x32xf32, #[[$TMEM]], #ttng.tensor_memory, mutable> -> !ttg.memdesc<1x64x32xf32, #[[$TMEM]], #ttng.tensor_memory, mutable>
     %result_0 = tlx.local_alias %result : !ttg.memdesc<1x64x32xf16, #tmem1, #ttng.tensor_memory, mutable> -> !ttg.memdesc<1x64x32xf32, #tmem, #ttng.tensor_memory, mutable>
     %result_1 = ttng.tmem_alloc : () -> !ttg.memdesc<1x64x32xf32, #tmem, #ttng.tensor_memory, mutable>
     ttg.warp_specialize(%0, %result_0, %1, %2, %result_1, %result)
@@ -83,6 +84,7 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx950", "ttg.th
     %0 = ttg.local_alloc : () -> !ttg.memdesc<1x256x128xbf16, #v_shared, #smem, mutable>
     // CHECK-NOT: tlx.local_alias
     // CHECK: ttg.memdesc_reinterpret
+    // CHECK-SAME: {tlx.logical_lifetime_boundary, tlx.storage_alias_view}
     // CHECK-SAME: !ttg.memdesc<1x256x128xbf16
     // CHECK-SAME: -> !ttg.memdesc<2x256x16xbf16
     %1 = tlx.local_alias %0 : !ttg.memdesc<1x256x128xbf16, #v_shared, #smem, mutable> -> !ttg.memdesc<2x256x16xbf16, #ds_shared, #smem, mutable>
@@ -107,6 +109,10 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx950", "ttg.th
     %0 = ttg.local_alloc : () -> !ttg.memdesc<1x256x16xbf16, #plain_shared, #smem, mutable>
     // CHECK-NOT: tlx.local_alias
     // CHECK: ttg.memdesc_reinterpret %[[BACKING]]
+    // CHECK-SAME: {tlx.storage_alias_view}
+    // CHECK-SAME: -> !ttg.memdesc<1x256x16xbf16
+    // CHECK: ttg.memdesc_reinterpret %[[BACKING]]
+    // CHECK-SAME: {tlx.logical_lifetime_boundary, tlx.storage_alias_view}
     // CHECK-SAME: -> !ttg.memdesc<1x256x16xbf16
     %1 = tlx.local_alias %0 : !ttg.memdesc<1x256x16xbf16, #plain_shared, #smem, mutable> -> !ttg.memdesc<1x256x16xbf16, #padded_shared, #smem, mutable>
     tt.return

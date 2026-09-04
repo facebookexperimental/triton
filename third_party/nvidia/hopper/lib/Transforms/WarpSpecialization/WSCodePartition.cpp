@@ -5355,6 +5355,8 @@ void mergeStagingReuseIntoHost(triton::FuncOp funcOp,
       builder.setInsertionPointAfter(insertAnchor);
       auto stagingView = ttg::MemDescReinterpretOp::create(
           builder, stagingAlloc.getLoc(), stagingTy, backingAlloc.getResult());
+      stagingView->setAttr("tlx.logical_lifetime_boundary",
+                           builder.getUnitAttr());
       for (StringRef name : {"buffer.id", "buffer.copy", "buffer.idx_in_group",
                              "allocation.shareGroup", "async_task_id"}) {
         if (auto a = stagingAlloc->getAttr(name))
