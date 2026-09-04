@@ -48,10 +48,11 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 
-  // The CLC lowering replaces tl.program_id(0) with the cluster id; emitting
-  // program_id back re-derives the same value on recompile.
+  // Despite its name, nvg.cluster_id is the CTA's rank within its cluster, in
+  // [0, num_ctas): it lowers to %cluster_ctarank, not to a cluster index.
   // CHECK-LABEL: def cluster_id(
-  // CHECK: tl.program_id(axis=0)
+  // CHECK: tlx.cluster_cta_rank()
+  // CHECK-NOT: tl.program_id
   tt.func public @cluster_id() attributes {noinline = false} {
     %cid = "nvg.cluster_id"() : () -> i32
     tt.return
