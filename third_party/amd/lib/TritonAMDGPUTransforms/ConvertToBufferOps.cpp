@@ -55,6 +55,26 @@ bool isSplatOneConstTensor(const Value v) {
   return false;
 }
 
+// CDNA4 supports unaligned global vector loads in hardware. Keep the normal
+// alignment clamp everywhere else, but let an unmasked plain load use the
+// contiguous per-thread width even when its first element is only 2B aligned.
+// This deliberately does not apply to stores, atomics, masked loads, or
+// buffer_load_to_local, whose legality requirements are different.
+unsigned getUnalignedLoadVectorSize(Value ptr,
+                                    ModuleAxisInfoAnalysis &axisAnalysisPass) {
+  auto tensorTy = dyn_cast<RankedTensorType>(ptr.getType());
+  if (!tensorTy)
+    return 1;
+  auto order = ttg::getOrder(tensorTy);
+  unsigned contig = ttg::getContigPerThread(tensorTy)[order[0]];
+  if (auto *axisInfo = axisAnalysisPass.getAxisInfo(ptr))
+    contig = std::min<unsigned>(contig, axisInfo->getContiguity(order[0]));
+  unsigned pointeeBitWidth = triton::getPointeeBitWidth(tensorTy);
+  unsigned vec =
+      std::min<unsigned>(128 / pointeeBitWidth, std::max<unsigned>(contig, 1));
+  return clampVecSizeForNpot(vec, tensorTy);
+}
+
 bool isByteOffsetSmallerThan2GB(triton::AddPtrOp addPtrOp,
                                 std::shared_ptr<DataFlowSolver> solver) {
   Value elemIdx = addPtrOp.getOffset();
@@ -504,10 +524,12 @@ struct ConvertTritonLoadToBufferLoad : public mlir::OpRewritePattern<SourceOp> {
       mlir::MLIRContext *context,
       DenseMap<Value, SetVector<Operation *>> &assumptions,
       ModuleAxisInfoAnalysis &axisAnalysisPass,
-      std::shared_ptr<DataFlowSolver> solver, bool analyzeSmallTensorOfst_)
+      std::shared_ptr<DataFlowSolver> solver, bool analyzeSmallTensorOfst_,
+      StringRef targetArch_)
       : mlir::OpRewritePattern<SourceOp>(context), assumptions(assumptions),
         axisAnalysisPass(axisAnalysisPass), solver(std::move(solver)),
-        analyzeSmallTensorOfst(analyzeSmallTensorOfst_) {}
+        analyzeSmallTensorOfst(analyzeSmallTensorOfst_),
+        targetArch(targetArch_) {}
   mlir::LogicalResult
   matchAndRewrite(SourceOp op, PatternRewriter &rewriter) const override {
     LDBG("Try to convert: " << op);
@@ -534,9 +556,14 @@ struct ConvertTritonLoadToBufferLoad : public mlir::OpRewritePattern<SourceOp> {
       auto bufferLoadOp = [&]() {
         if constexpr (std::is_same_v<SourceOp, triton::LoadOp>) {
           unsigned contig = getVectorSize(ptr, axisAnalysisPass);
-          if (maybeMask)
+          if (canUseUnalignedVectorizedLoad(op, targetArch)) {
+            contig = std::max(
+                contig, getUnalignedLoadVectorSize(ptr, axisAnalysisPass));
+          }
+          if (maybeMask) {
             contig = std::min<unsigned>(
                 contig, axisAnalysisPass.getMaskAlignment(maybeMask));
+          }
           return triton::amdgpu::BufferLoadOp::create(
               rewriter, op->getLoc(), op.getType(), basePtr, tensorOffset,
               blockStride, op.getCache(), maybeMask, maybeOther, contig);
@@ -569,6 +596,7 @@ private:
   ModuleAxisInfoAnalysis &axisAnalysisPass;
   std::shared_ptr<DataFlowSolver> solver;
   bool analyzeSmallTensorOfst;
+  std::string targetArch;
 };
 
 struct ConvertTritonStoreToBufferStore
@@ -653,15 +681,17 @@ struct TritonAMDGPUConvertToBufferOpsPass
       return signalPassFailure();
 
     AMD::ModuleAxisInfoAnalysis axisInfoAnalysis(mod);
-    patterns.add<ConvertTritonLoadToBufferLoad<tt::LoadOp>,
-                 ConvertTritonStoreToBufferStore>(context, assumptions,
+    patterns.add<ConvertTritonLoadToBufferLoad<tt::LoadOp>>(
+        context, assumptions, axisInfoAnalysis, solver,
+        this->analyzeSmallTensorOfst, this->gfxArch);
+    patterns.add<ConvertTritonStoreToBufferStore>(context, assumptions,
                                                   axisInfoAnalysis, solver,
                                                   this->analyzeSmallTensorOfst);
     if (targetFeatures.supportsBufferLoadToLocal()) {
       patterns
           .add<ConvertTritonLoadToBufferLoad<ttg::AsyncCopyGlobalToLocalOp>>(
               context, assumptions, axisInfoAnalysis, solver,
-              this->analyzeSmallTensorOfst);
+              this->analyzeSmallTensorOfst, this->gfxArch);
     }
 
     if (this->allowBufferAtomics && targetFeatures.supportsBufferAtomicRMW())

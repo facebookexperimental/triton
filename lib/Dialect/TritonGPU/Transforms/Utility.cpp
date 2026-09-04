@@ -206,6 +206,16 @@ unsigned getNumElementsPerThread(Operation *op, SmallVector<unsigned> order,
   unsigned maxContig =
       std::min(valInfo.getContiguity(order[0]), shapePerCTA[order[0]]);
   unsigned alignment = std::min(maxMultiple, maxContig);
+  // Some targets implement unaligned global vector loads in hardware. This
+  // only relaxes the base-alignment clamp: axis analysis must still prove the
+  // elements contiguous, and the normal logical-extent and width caps remain.
+  // A mask additionally limits the width to groups with one shared predicate.
+  if (canUseUnalignedVectorizedLoad(op)) {
+    alignment = maxContig;
+    if (auto load = dyn_cast<triton::LoadOp>(op); load && load.getMask())
+      alignment = std::min(
+          alignment, axisInfoAnalysis.getMaskAlignment(load.getMask()));
+  }
   unsigned maxElementsPerThread = getMaxElementsPerThread(op, maxVecBits);
   unsigned currPerThread = std::min(alignment, maxElementsPerThread);
   LDBG("elemNumBytes: " << elemNumBytes
@@ -1302,6 +1312,25 @@ std::optional<StringRef> getAMDArch(Operation *module) {
   }
 
   return ref.drop_front(4); // drop the "hip:"
+}
+
+bool canUseUnalignedVectorizedLoad(Operation *op) {
+  auto module = op->getParentOfType<ModuleOp>();
+  if (!module)
+    return false;
+  auto arch = getAMDArch(module);
+  return arch && canUseUnalignedVectorizedLoad(op, *arch);
+}
+
+bool canUseUnalignedVectorizedLoad(Operation *op, StringRef targetArch) {
+  auto load = dyn_cast<triton::LoadOp>(op);
+  if (!load || load.getIsVolatile())
+    return false;
+
+  // CDNA4 buffer/global loads accept naturally aligned element addresses for
+  // vector widths up to the existing 128-bit compiler cap. Keep this exact so
+  // future targets must opt in through an explicit capability update.
+  return targetArch == "gfx950";
 }
 
 static inline ttg::SwizzledSharedEncodingAttr
