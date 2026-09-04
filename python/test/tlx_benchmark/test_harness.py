@@ -206,6 +206,27 @@ def test_artifact_is_json_serializable_and_versioned():
     assert "tlx_tflops" not in doc["results"][0]
 
 
+def test_report_groups_notes_after_the_table(tmp_path):
+    from _harness import report
+
+    pip = Result(case=_case(), status=Status.PIP, notes=["speedup 0.746x is under the 0.9x floor"])
+    noisy_case = Case(op="mm", arch="gfx942", dtype="float16", shape=(2048, 1024, 512, True, True))
+    noisy = Result(case=noisy_case, status=Status.NOISY, notes=["CV 4.2% over the 3% limit"])
+
+    rendered = report.render([pip, noisy], {}, tmp_path / "mm.json")
+    table_text, footer = rendered.split("\n\n", 1)
+
+    assert "speedup 0.746x is under" not in table_text
+    assert "CV 4.2% over" not in table_text
+    artifact_at = footer.index("artifact:")
+    summary_at = footer.index("1 PIP, 1 noisy")
+    noisy_at = footer.index("Noisy data:")
+    issues_at = footer.index("Issues:")
+    assert artifact_at < summary_at < noisy_at < issues_at
+    assert "CV 4.2% over the 3% limit" in footer[noisy_at:issues_at]
+    assert "speedup 0.746x is under the 0.9x floor" in footer[issues_at:]
+
+
 # --------------------------------------------------------------------------
 # verdict: the four statuses
 # --------------------------------------------------------------------------
