@@ -553,6 +553,14 @@ class CliTest(unittest.TestCase):
             path = _write_swimlane(review, Path(directory))
             ET.parse(path)
             svg = path.read_text()
+            self.assertIn('width="1920"', svg)
+            self.assertIn("time flows downward", svg)
+            self.assertIn("MANAGER · JUDGE", svg)
+            self.assertIn("TL · SHERIFF", svg)
+            self.assertLess(
+                svg.index("KNOWLEDGE · PRIEST"),
+                svg.index("PROFILER · SEER"),
+            )
             self.assertIn("gfx942 mm 2048×10240×25408", svg)
             self.assertIn("WHAT CHANGED", svg)
             self.assertIn("WHY IT WORKS", svg)
@@ -578,6 +586,7 @@ class CliTest(unittest.TestCase):
                 "artifacts_dir": "/tmp/out",
                 "manager_log": "/tmp/out/manager.log",
                 "result_json": "/tmp/out/result.json",
+                "swimlane": "/tmp/out/swimlane.svg",
                 "stopping_reason": "round_budget_exhausted",
                 "success": False,
                 "final_speedup": 1.0,

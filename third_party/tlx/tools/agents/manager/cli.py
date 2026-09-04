@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import sys
+import textwrap
 import traceback
 from pathlib import Path
 from typing import Any, Callable, TextIO
@@ -667,7 +668,32 @@ def _commit_body(review: dict[str, Any]) -> str:
     )
 
 
-def _write_swimlane(review: dict[str, Any], output_dir: Path) -> Path:
+def _svg_lines(
+    x: int,
+    y: int,
+    text: object,
+    *,
+    css_class: str = "card-text",
+    width: int = 30,
+    limit: int = 2,
+) -> str:
+    value = " ".join(str(text).split())
+    lines = textwrap.wrap(value, width=width, break_long_words=False) or [""]
+    if len(lines) > limit:
+        lines = lines[:limit]
+        lines[-1] = textwrap.shorten(
+            lines[-1], width=width, placeholder="…"
+        )
+    return "".join(
+        f'<text x="{x}" y="{y + index * 18}" class="{css_class}">'
+        f"{escape(line)}</text>"
+        for index, line in enumerate(lines)
+    )
+
+
+def _write_swimlane(
+    review: dict[str, Any], output_dir: Path, result: Any | None = None
+) -> Path:
     path = output_dir / "swimlane.svg"
     primary = review["primary_performance"]
     performance = "No promoted performance result"
@@ -678,62 +704,211 @@ def _write_swimlane(review: dict[str, Any], output_dir: Path) -> Path:
         )
     what = " ".join(review["what_changed"]) or "No promoted source change"
     why = " ".join(review["why_it_works"]) or "No confirmed mechanism"
-
-    roles = (
-        ("MANAGER", "scope · verdict", "#ef6f91"),
-        ("PROFILER", "raw evidence", "#aa7cff"),
-        ("TL", "what · why · PR plan", "#55a4ff"),
-        ("WORKER", "minimal isolated change", "#38c9c4"),
-        ("BUILD", "environment · VCS", "#f3a846"),
-        ("CORRECTNESS", review["correctness_signoff"], "#40c58a"),
-        ("PERFORMANCE", performance, "#a7cf4b"),
-        ("KNOWLEDGE", "approved patch · same PR", "#e979b4"),
+    experiments = (
+        [item for item in result.experiments if item.experiment_id != "baseline"]
+        if result is not None
+        else []
     )
-    boxes = []
-    arrows = []
-    for index, (name, detail, color) in enumerate(roles):
-        x = 24 + index * 194
-        boxes.append(
-            f'<g transform="translate({x} 120)">'
-            f'<rect width="174" height="104" rx="8" fill="#121b2d" '
-            f'stroke="{color}" stroke-width="3"/>'
-            f'<rect width="174" height="34" rx="8" fill="{color}"/>'
-            f'<text x="12" y="23" class="role">{escape(name)}</text>'
-            f'<text x="12" y="61" class="detail">{escape(detail[:28])}</text>'
-            f'</g>'
+    baseline_us = primary.get("before_us") if primary else None
+    primary_case_id = review.get("primary_case")
+    rows: list[dict[str, Any]] = []
+    for experiment in experiments:
+        evaluations = experiment.performance.cases if experiment.performance else ()
+        evaluation = next(
+            (
+                item
+                for item in evaluations
+                if item.case_id == primary_case_id
+            ),
+            evaluations[0] if evaluations else None,
         )
-        if index < len(roles) - 1:
-            arrows.append(
-                f'<path d="M{x + 174} 172H{x + 194}" class="flow"/>'
-            )
+        passed = sum(item.verification.passed for item in evaluations)
+        total = len(evaluations)
+        latency_us = (
+            evaluation.timing.median_us
+            if evaluation is not None and evaluation.timing is not None
+            else None
+        )
+        speedup = baseline_us / latency_us if baseline_us and latency_us else None
+        rows.append(
+            {
+                "id": experiment.experiment_id,
+                "status": experiment.status.upper(),
+                "hypothesis": experiment.hypothesis or "No hypothesis recorded",
+                "change": experiment.mutation_summary or "No source change",
+                "scope": experiment.change_scope or "unknown scope",
+                "passed": passed,
+                "total": total,
+                "latency_us": latency_us,
+                "speedup": speedup,
+            }
+        )
+
+    profile_lines = ["Profiler evidence persisted"]
+    if result is not None:
+        baseline_evaluation = next(
+            (
+                item
+                for item in result.baseline.cases
+                if item.case_id == primary_case_id
+            ),
+            result.baseline.cases[0] if result.baseline.cases else None,
+        )
+        att = (
+            baseline_evaluation.profile.get("att", {})
+            if baseline_evaluation is not None
+            else {}
+        )
+        if isinstance(att, dict) and att.get("mode") == "att":
+            profile_lines = [f"ATT decoded · {att.get('instruction_rows', 0)} rows"]
+            top_stalls = att.get("stall_by_opcode", [])
+            if isinstance(top_stalls, list):
+                profile_lines.extend(
+                    f"{item.get('opcode', 'unknown')} {item.get('stall_pct', 0):.1f}%"
+                    for item in top_stalls[:2]
+                    if isinstance(item, dict)
+                )
+
+    lane_specs = (
+        (30, "MANAGER · JUDGE", "scope · budget · verdict", "#ef6f91", "#2c1420"),
+        (260, "BUILD · WITCH", "environment · VCS", "#f3a846", "#2d2110"),
+        (490, "KNOWLEDGE · PRIEST", "human-approved guidance", "#e979b4", "#301827"),
+        (720, "PROFILER · SEER", "raw evidence only", "#aa7cff", "#211934"),
+        (950, "TL · SHERIFF", "reason · combine · PR plan", "#55a4ff", "#10233b"),
+        (1180, "WORKER · VILLAGER", "isolated implementation", "#38c9c4", "#102e30"),
+        (1410, "CORRECTNESS", "numerical gate", "#40c58a", "#122b20"),
+        (1640, "PERFORMANCE", "all supplied shapes", "#a7cf4b", "#263011"),
+    )
+    row_start = 330
+    row_pitch = 138
+    final_y = row_start + len(rows) * row_pitch + 28
+    height = max(1040, final_y + 190)
+    lane_height = height - 170
+
+    lanes = []
+    headers = []
+    for x, name, detail, color, fill in lane_specs:
+        lanes.append(
+            f'<rect x="{x}" y="105" width="220" height="{lane_height}" '
+            f'rx="10" fill="{fill}" stroke="{color}" class="lane"/>'
+        )
+        headers.append(
+            f'<rect x="{x}" y="105" width="220" height="70" rx="10" fill="{color}"/>'
+            f'<text x="{x + 15}" y="134" class="header">{escape(name)}</text>'
+            f'<text x="{x + 15}" y="155" class="header-sub">{escape(detail)}</text>'
+        )
+
+    row_svg = []
+    for index, row in enumerate(rows):
+        y = row_start + index * row_pitch
+        correct = row["total"] > 0 and row["passed"] == row["total"]
+        status_class = "pass" if row["status"] == "PROMOTED" else "reject"
+        correctness_class = "pass" if correct else "reject"
+        perf_text = (
+            f"{row['latency_us']:.3f} us · {row['speedup']:.4f}x"
+            if row["latency_us"] is not None and row["speedup"] is not None
+            else "blocked · no timing"
+        )
+        row_svg.append(
+            f'<rect x="962" y="{y}" width="196" height="104" rx="8" fill="#1d4e7d" stroke="#55a4ff" class="card"/>'
+            f'<text x="974" y="{y + 23}" class="card-title">{escape(row["id"])} · TL FINDING</text>'
+            f'{_svg_lines(974, y + 45, row["hypothesis"])}'
+            f'<text x="974" y="{y + 91}" class="{status_class}">{escape(row["status"])}</text>'
+            f'<rect x="1192" y="{y}" width="196" height="104" rx="8" fill="#18575a" stroke="#38c9c4" class="card"/>'
+            f'<text x="1204" y="{y + 23}" class="card-title">{escape(row["scope"])}</text>'
+            f'{_svg_lines(1204, y + 45, row["change"], limit=3)}'
+            f'<rect x="1422" y="{y}" width="196" height="104" rx="8" fill="#194d35" stroke="#40c58a" class="card"/>'
+            f'<text x="1434" y="{y + 28}" class="card-title">CALLBACK · {"PASS" if correct else "FAIL"}</text>'
+            f'<text x="1434" y="{y + 60}" class="metric">{row["passed"]} / {row["total"]}</text>'
+            f'<text x="1434" y="{y + 86}" class="{correctness_class}">{"VALIDATED" if correct else "BLOCKED"}</text>'
+            f'<rect x="1652" y="{y}" width="196" height="104" rx="8" fill="#4b5b1f" stroke="#a7cf4b" class="card"/>'
+            f'<text x="1664" y="{y + 28}" class="card-title">ALL-SHAPE SWEEP</text>'
+            f'<text x="1664" y="{y + 58}" class="metric">{escape(perf_text)}</text>'
+            f'<text x="1664" y="{y + 86}" class="{status_class}">{escape(row["status"])}</text>'
+            f'<path d="M1158 {y + 52}H1182" class="flow"/>'
+            f'<path d="M1388 {y + 52}H1412" class="flow"/>'
+            f'<path d="M1618 {y + 52}H1642" class="flow"/>'
+            f'<path d="M1642 {y + 91}C1440 {y + 121} 1260 {y + 121} 1158 {y + 91}" class="feedback"/>'
+        )
+
+    case_count = len(result.baseline.cases) if result is not None else len(review["per_case_performance"])
+    stopping_reason = result.stopping_reason if result is not None else "completed"
+    winner = result.winner_experiment_id if result is not None else "unknown"
+    baseline_text = (
+        f"{baseline_us:.3f} us · 1.0000x"
+        if baseline_us is not None
+        else "timing unavailable"
+    )
+    final_status = "BASELINE RETAINED" if winner == "baseline" else f"WINNER · {winner}"
+    profile_text = " · ".join(profile_lines)
+
     svg = f'''<?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="520" viewBox="0 0 1600 520" role="img" aria-labelledby="title description">
+<svg xmlns="http://www.w3.org/2000/svg" width="1920" height="{height}" viewBox="0 0 1920 {height}" role="img" aria-labelledby="title description">
   <title id="title">{escape(str(review["title"]))}</title>
-  <desc id="description">Kernel optimization handoffs, validation, and review packaging.</desc>
+  <desc id="description">Chronological swimlane of Manager, Build, Knowledge, Profiler, TL, Worker, Correctness, and Performance actions.</desc>
   <defs>
-    <marker id="arrow" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0 0L9 4.5L0 9Z" fill="#9fb0cb"/></marker>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto"><path d="M0 0L10 5L0 10Z" fill="#a9b7d0"/></marker>
+    <marker id="feedback-arrow" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto"><path d="M0 0L10 5L0 10Z" fill="#67a7ff"/></marker>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%"><feDropShadow dx="0" dy="3" stdDeviation="4" flood-color="#000" flood-opacity="0.35"/></filter>
     <style>
-      .title {{ fill:#f5f8ff; font:800 30px Inter,sans-serif; }}
-      .subtitle {{ fill:#a9b7d0; font:14px Inter,sans-serif; }}
-      .role {{ fill:#07101f; font:800 13px Inter,sans-serif; }}
-      .detail {{ fill:#d9e1ef; font:12px Inter,sans-serif; }}
-      .label {{ fill:#86a6d7; font:800 13px Inter,sans-serif; }}
-      .body {{ fill:#e4eaf5; font:13px Inter,sans-serif; }}
-      .flow {{ fill:none; stroke:#9fb0cb; stroke-width:2; marker-end:url(#arrow); }}
+      .page-title {{ fill:#f5f8ff; font:800 32px Inter,sans-serif; letter-spacing:1px; }}
+      .subtitle {{ fill:#a9b7d0; font:15px Inter,sans-serif; }}
+      .header {{ fill:#07101f; font:800 15px Inter,sans-serif; letter-spacing:.6px; }}
+      .header-sub {{ fill:#17243a; font:11px Inter,sans-serif; }}
+      .card-title {{ fill:#f7f9ff; font:800 13px Inter,sans-serif; }}
+      .card-text {{ fill:#d7dfef; font:11px Inter,sans-serif; }}
+      .metric {{ fill:#fff; font:800 12px ui-monospace,SFMono-Regular,Menlo,monospace; }}
+      .lane {{ stroke-width:1; }}
+      .card {{ stroke-width:1.5; filter:url(#shadow); }}
+      .flow {{ fill:none; stroke:#a9b7d0; stroke-width:2; marker-end:url(#arrow); }}
+      .feedback {{ fill:none; stroke:#67a7ff; stroke-width:2; stroke-dasharray:6 5; marker-end:url(#feedback-arrow); }}
+      .divider {{ stroke:#263650; stroke-width:1; stroke-dasharray:4 7; }}
+      .pass {{ fill:#42d392; font:800 11px Inter,sans-serif; }}
+      .reject {{ fill:#ff7f89; font:800 11px Inter,sans-serif; }}
+      .neutral {{ fill:#ffca68; font:800 11px Inter,sans-serif; }}
     </style>
   </defs>
-  <rect width="1600" height="520" fill="#070b14"/>
-  <text x="24" y="48" class="title">{escape(str(review["title"]))}</text>
-  <text x="24" y="76" class="subtitle">profile → reason → implement → build → correctness → performance → knowledge → review</text>
-  {''.join(boxes)}
-  {''.join(arrows)}
-  <rect x="24" y="270" width="1552" height="208" rx="10" fill="#101827" stroke="#314565"/>
-  <text x="44" y="304" class="label">WHAT CHANGED</text>
-  <text x="44" y="330" class="body">{escape(what[:210])}</text>
-  <text x="44" y="370" class="label">WHY IT WORKS</text>
-  <text x="44" y="396" class="body">{escape(why[:210])}</text>
-  <text x="44" y="436" class="label">SIGN-OFF</text>
-  <text x="146" y="436" class="body">{escape(str(review["correctness_signoff"]))} · {escape(performance)}</text>
+  <rect width="1920" height="{height}" fill="#070b14"/>
+  <text x="32" y="47" class="page-title">{escape(str(review["title"]))}</text>
+  <text x="32" y="76" class="subtitle">time flows downward · {case_count} supplied shape(s) · {len(rows)} Worker run(s)</text>
+  {''.join(lanes)}
+  {''.join(headers)}
+  <rect x="42" y="195" width="196" height="94" rx="8" fill="#5b263b" stroke="#ef6f91" class="card"/>
+  <text x="54" y="219" class="card-title">FREEZE CAMPAIGN</text>
+  {_svg_lines(54, 241, f'{case_count} supplied shape(s)')}
+  {_svg_lines(54, 265, f'{len(rows)} Worker run(s)')}
+  <rect x="272" y="195" width="196" height="94" rx="8" fill="#5a3b12" stroke="#f3a846" class="card"/>
+  <text x="284" y="219" class="card-title">PREPARE ENVIRONMENT</text>
+  {_svg_lines(284, 241, 'isolated build and VCS state')}
+  <rect x="732" y="195" width="196" height="94" rx="8" fill="#4a3372" stroke="#aa7cff" class="card"/>
+  <text x="744" y="219" class="card-title">DEEP BASELINE PROFILE</text>
+  {_svg_lines(744, 241, profile_text, limit=3)}
+  <rect x="1652" y="195" width="196" height="94" rx="8" fill="#4b5b1f" stroke="#a7cf4b" class="card"/>
+  <text x="1664" y="219" class="card-title">BASELINE · {case_count}/{case_count}</text>
+  <text x="1664" y="250" class="metric">{escape(baseline_text)}</text>
+  <path d="M238 242H262" class="flow"/><path d="M468 242H722" class="flow"/><path d="M928 242C1240 242 1380 242 1642 242" class="flow"/>
+  <line x1="30" y1="309" x2="1860" y2="309" class="divider"/>
+  {''.join(row_svg)}
+  <line x1="30" y1="{final_y - 18}" x2="1860" y2="{final_y - 18}" class="divider"/>
+  <rect x="42" y="{final_y}" width="196" height="120" rx="8" fill="#5b263b" stroke="#ef6f91" class="card"/>
+  <text x="54" y="{final_y + 24}" class="card-title">FINAL VERDICT</text>
+  {_svg_lines(54, final_y + 48, final_status, limit=2)}
+  {_svg_lines(54, final_y + 88, stopping_reason, limit=2)}
+  <rect x="502" y="{final_y}" width="196" height="120" rx="8" fill="#642d52" stroke="#e979b4" class="card"/>
+  <text x="514" y="{final_y + 24}" class="card-title">KNOWLEDGE</text>
+  {_svg_lines(514, final_y + 48, 'Human approval required before durable guidance changes', limit=4)}
+  <rect x="962" y="{final_y}" width="196" height="120" rx="8" fill="#1d4e7d" stroke="#55a4ff" class="card"/>
+  <text x="974" y="{final_y + 24}" class="card-title">WHY IT WORKS</text>
+  {_svg_lines(974, final_y + 48, why, limit=4)}
+  <rect x="1192" y="{final_y}" width="196" height="120" rx="8" fill="#18575a" stroke="#38c9c4" class="card"/>
+  <text x="1204" y="{final_y + 24}" class="card-title">WHAT CHANGED</text>
+  {_svg_lines(1204, final_y + 48, what, limit=4)}
+  <rect x="1422" y="{final_y}" width="196" height="120" rx="8" fill="#194d35" stroke="#40c58a" class="card"/>
+  <text x="1434" y="{final_y + 24}" class="card-title">FINAL CORRECTNESS</text>
+  {_svg_lines(1434, final_y + 52, review['correctness_signoff'], css_class='metric')}
+  <rect x="1652" y="{final_y}" width="196" height="120" rx="8" fill="#4b5b1f" stroke="#a7cf4b" class="card"/>
+  <text x="1664" y="{final_y + 24}" class="card-title">FINAL PERFORMANCE</text>
+  {_svg_lines(1664, final_y + 52, performance, css_class='metric', limit=3)}
 </svg>
 '''
     path.write_text(svg)
@@ -755,6 +930,7 @@ def _print_result(
         "artifacts_dir": str(output_dir),
         "manager_log": str(output_dir / "manager.log"),
         "result_json": str(output_dir / "result.json"),
+        "swimlane": str(output_dir / "swimlane.svg"),
         "stopping_reason": result.stopping_reason,
         "success": result.success,
         "final_speedup": result.final.aggregate_speedup,
@@ -868,7 +1044,13 @@ def _run(args: argparse.Namespace) -> int:
         )
     result = KernelOptimizer(provider).optimize(request, promotion_committer)
     review = _review_metadata(result, cases, review_title, args.output_dir)
-    _write_swimlane(review, args.output_dir)
+    swimlane_path = _write_swimlane(review, args.output_dir, result)
+    print(
+        "[tlx-agent] FINAL_ARTIFACT "
+        f"kind=swimlane path={str(swimlane_path.resolve())!r} recipient=human",
+        file=sys.stderr,
+        flush=True,
+    )
     args.output_dir.joinpath("review_summary.txt").write_text(
         _format_review_summary(review)
     )

@@ -91,6 +91,10 @@ python -m third_party.tlx.tools.agents.manager.cli \
 Manager mirrors its chronological stdout and stderr to `manager.log` under
 `--output-dir`. The log is created before harness validation, so it also retains
 diagnostics and tracebacks from runs that stop before `result.json` is written.
+Every completed run also writes a detailed chronological `swimlane.svg`, including
+baseline-only and budget-exhausted outcomes, and reports its path in the final log
+and summary. Its vertical lanes are ordered Manager, Build, Knowledge, Profiler, TL,
+Worker, Correctness, and Performance, with one timeline row per Worker run.
 
 A case may declare `"required_profile": "att"` in its parameters. Manager then
 requires one successfully decoded ATT dispatch with instruction rows during baseline
