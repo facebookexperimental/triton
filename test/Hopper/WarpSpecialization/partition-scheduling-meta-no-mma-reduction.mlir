@@ -30,7 +30,7 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:90"} {
 // CHECK: ttg.local_alloc {{.*}}ttg.partition = array<i32: 0>
 // TMA store + its token wait -> epilogue_store partition (1).
 // CHECK: ttng.async_tma_copy_local_to_global {{.*}}ttg.partition = array<i32: 1>
-// CHECK: ttng.async_tma_store_token_wait {{.*}}ttg.partition = array<i32: 1>
+// CHECK: nvws.tma_store_wait {{.*}}ttg.partition = array<i32: 1>
 //
 // The reduction partition is created first => index 0 (default 4-warp group).
 // CHECK: tt.warp_specialize
@@ -60,7 +60,7 @@ tt.func public @rmsnorm_no_mma(
     %norm = arith.mulf %x, %rinv_b : tensor<64x64xf32, #blocked>
     %stage = ttg.local_alloc %norm : (tensor<64x64xf32, #blocked>) -> !ttg.memdesc<64x64xf32, #shared, #smem, mutable>
     %tok = ttng.async_tma_copy_local_to_global %y_desc[%offs, %c0_i32] %stage : !tt.tensordesc<64x64xf32, #shared>, !ttg.memdesc<64x64xf32, #shared, #smem, mutable> -> !ttg.async.token
-    ttng.async_tma_store_token_wait %tok : !ttg.async.token
+    nvws.tma_store_wait %stage : !ttg.memdesc<64x64xf32, #shared, #smem, mutable>
     scf.yield
   } {tt.warp_specialize, tt.separate_epilogue_store = true, tt.merge_epilogue = true}
   tt.return
@@ -72,7 +72,7 @@ tt.func public @rmsnorm_no_mma(
 // CHECK-LABEL: @maxnorm_no_mma
 // CHECK: tt.reduce.return {{.*}}ttg.partition = array<i32: 0>
 // CHECK: ttng.async_tma_copy_local_to_global {{.*}}ttg.partition = array<i32: 1>
-// CHECK: ttng.async_tma_store_token_wait {{.*}}ttg.partition = array<i32: 1>
+// CHECK: nvws.tma_store_wait {{.*}}ttg.partition = array<i32: 1>
 // CHECK: tt.warp_specialize
 // CHECK-SAME: ttg.partition.types = ["reduction", "epilogue_store", "load"]
 tt.func public @maxnorm_no_mma(
@@ -96,7 +96,7 @@ tt.func public @maxnorm_no_mma(
     %norm = arith.divf %x, %m_b : tensor<64x64xf32, #blocked>
     %stage = ttg.local_alloc %norm : (tensor<64x64xf32, #blocked>) -> !ttg.memdesc<64x64xf32, #shared, #smem, mutable>
     %tok = ttng.async_tma_copy_local_to_global %y_desc[%offs, %c0_i32] %stage : !tt.tensordesc<64x64xf32, #shared>, !ttg.memdesc<64x64xf32, #shared, #smem, mutable> -> !ttg.async.token
-    ttng.async_tma_store_token_wait %tok : !ttg.async.token
+    nvws.tma_store_wait %stage : !ttg.memdesc<64x64xf32, #shared, #smem, mutable>
     scf.yield
   } {tt.warp_specialize, tt.separate_epilogue_store = true, tt.merge_epilogue = true}
   tt.return

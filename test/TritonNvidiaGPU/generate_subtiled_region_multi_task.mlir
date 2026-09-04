@@ -386,14 +386,14 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     %trunc0 = arith.truncf %lhs {async_task_id = array<i32: 4>} : tensor<128x128xf32, #blocked2d6> to tensor<128x128xf16, #blocked2d6>
     ttg.local_store %trunc0, %smem0 {async_task_id = array<i32: 4>} : tensor<128x128xf16, #blocked2d6> -> !ttg.memdesc<128x128xf16, #shared6, #smem6, mutable>
     %tok0 = ttng.async_tma_copy_local_to_global %c_desc[%off_m, %off_n] %smem0 {async_task_id = array<i32: 3>} : !tt.tensordesc<128x128xf16, #shared6>, !ttg.memdesc<128x128xf16, #shared6, #smem6, mutable> -> !ttg.async.token
-    ttng.async_tma_store_token_wait %tok0 {async_task_id = array<i32: 3>} : !ttg.async.token
+    nvws.tma_store_wait %smem0 {async_task_id = array<i32: 3>} : !ttg.memdesc<128x128xf16, #shared6, #smem6, mutable>
 
     // Chain 1 (rhs): truncf{4} → addi{4} → local_store{4} → async_tma_copy{3} → wait{3}
     %trunc1 = arith.truncf %rhs {async_task_id = array<i32: 4>} : tensor<128x128xf32, #blocked2d6> to tensor<128x128xf16, #blocked2d6>
     %off_n2 = arith.addi %off_n, %c128 {async_task_id = array<i32: 4>} : i32
     ttg.local_store %trunc1, %smem1 {async_task_id = array<i32: 4>} : tensor<128x128xf16, #blocked2d6> -> !ttg.memdesc<128x128xf16, #shared6, #smem6, mutable>
     %tok1 = ttng.async_tma_copy_local_to_global %c_desc[%off_m, %off_n2] %smem1 {async_task_id = array<i32: 3>} : !tt.tensordesc<128x128xf16, #shared6>, !ttg.memdesc<128x128xf16, #shared6, #smem6, mutable> -> !ttg.async.token
-    ttng.async_tma_store_token_wait %tok1 {async_task_id = array<i32: 3>} : !ttg.async.token
+    nvws.tma_store_wait %smem1 {async_task_id = array<i32: 3>} : !ttg.memdesc<128x128xf16, #shared6, #smem6, mutable>
 
     tt.return
   }

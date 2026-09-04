@@ -1076,8 +1076,9 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
 
   // CHECK: def planned_store_wait(
   // CHECK: tlx.async_descriptor_store_wait(1)
-  tt.func public @planned_store_wait(%tok: !ttg.async.token) {
-    ttng.async_tma_store_token_wait %tok {planned_pending_count = 1 : i32} : !ttg.async.token
+  tt.func public @planned_store_wait(
+      %src: !ttg.memdesc<128x64xf16, #shared1, #smem, mutable>) {
+    nvws.tma_store_wait %src {planned_pending_count = 1 : i32} : !ttg.memdesc<128x64xf16, #shared1, #smem, mutable>
     tt.return
   }
 
@@ -1101,20 +1102,23 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
 
 // -----
 
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#smem = #ttg.shared_memory
 module {
   // CHECK-LABEL: def clc_while(
   // CHECK: tlx.async_descriptor_store_wait(1)
-  // CHECK: arg2 = arg0
+  // CHECK: arg3 = arg0
   // CHECK: while True:
-  // CHECK-NEXT:   var_{{[0-9]+}} = arg2 < arg1
+  // CHECK-NEXT:   var_{{[0-9]+}} = arg3 < arg1
   // CHECK-NEXT:   if not var_{{[0-9]+}}:
-  // CHECK-NEXT:     var_{{[0-9]+}} = arg2
+  // CHECK-NEXT:     var_{{[0-9]+}} = arg3
   // CHECK-NEXT:     break
-  // CHECK-NEXT:   var_{{[0-9]+}} = arg2 + arg1
-  // CHECK-NEXT:   arg2 = var_{{[0-9]+}}
-  tt.func public @clc_while(%start: i32, %limit: i32) -> i32 {
-    %token = ub.poison : !ttg.async.token
-    ttng.async_tma_store_token_wait %token {planned_pending_count = 1 : i32} : !ttg.async.token
+  // CHECK-NEXT:   var_{{[0-9]+}} = arg3 + arg1
+  // CHECK-NEXT:   arg3 = var_{{[0-9]+}}
+  tt.func public @clc_while(
+      %start: i32, %limit: i32,
+      %src: !ttg.memdesc<128x64xf16, #shared, #smem, mutable>) -> i32 {
+    nvws.tma_store_wait %src {planned_pending_count = 1 : i32} : !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
     %result = scf.while (%iter = %start) : (i32) -> i32 {
       %keep_going = arith.cmpi slt, %iter, %limit : i32
       scf.condition(%keep_going) %iter : i32

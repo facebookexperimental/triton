@@ -77,10 +77,9 @@ TMA store lowering is a **pre-pass** that runs before the main WS pipeline
 via TMA) into a three-step sequence visible to the WS pipeline:
 
 1. **`LocalAllocOp`**: Allocate SMEM and store the register data.
-2. **`AsyncTMACopyLocalToGlobalOp`**: Async TMA copy from SMEM to global
-   memory, producing a token.
-3. **`TMAStoreTokenWaitOp`**: Wait for the TMA store to finish reading from
-   SMEM before the buffer can be reused.
+2. **`AsyncTMACopyLocalToGlobalOp`**: Async TMA copy from SMEM to global.
+3. **`NVWS::TMAStoreWaitOp`**: Wait on the staging buffer until the TMA store
+   finishes reading from SMEM and the buffer can be reused.
 
 ### Why This Pre-Pass Is Needed
 
@@ -89,10 +88,10 @@ Without this lowering, the WS pipeline would see only the high-level
 By lowering early, the SMEM buffer becomes visible to the memory planner
 for allocation and the barrier becomes visible for synchronization.
 
-### `TMAStoreTokenWaitLowering` Pass
+### TMA Store Wait Lowering Pass
 
 A separate pass (`NVGPUTMAStoreTokenWaitLoweringPass`) lowers the abstract
-`TMAStoreTokenWaitOp` into concrete operations:
+`NVWS::TMAStoreWaitOp` into concrete operations:
 - `TMAStoreWaitOp`: waits for the async TMA store to complete
 - `ArriveBarrierOp`: signals the associated barrier that the SMEM buffer
   is now free

@@ -293,7 +293,7 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
       tt.store %m_ptrs0_77, %5 {async_task_id = array<i32: 0>} : tensor<128x!tt.ptr<f32>, #blocked>
       ttg.local_store %7, %1 {async_task_id = array<i32: 0>} : tensor<128x128xbf16, #blocked1> -> !ttg.memdesc<128x128xbf16, #shared, #smem, mutable>
       %8 = ttng.async_tma_copy_local_to_global %desc_o[%qo_offset_y_42, %c0_i32] %1 {async_task_id = array<i32: 2>} : !tt.tensordesc<128x128xbf16, #shared>, !ttg.memdesc<128x128xbf16, #shared, #smem, mutable> -> !ttg.async.token
-      ttng.async_tma_store_token_wait %8   {async_task_id = array<i32: 2>} : !ttg.async.token
+      nvws.tma_store_wait %1   {async_task_id = array<i32: 2>} : !ttg.memdesc<128x128xbf16, #shared, #smem, mutable>
       %m_i1 = math.log2 %offsetkv_y_58 {async_task_id = array<i32: 0>} : tensor<128xf32, #ttg.slice<{dim = 1, parent = #linear}>>
       %m_i1_78, %m_i1_79 = ttng.tmem_load %m_ij_0[] {async_task_id = array<i32: 0>} : !ttg.memdesc<128x1xf32, #tmem1, #ttng.tensor_memory, mutable> -> tensor<128x1xf32, #linear4>
       %m_i1_80 = tt.reshape %m_i1_78 {async_task_id = array<i32: 0>} : tensor<128x1xf32, #linear4> -> tensor<128xf32, #linear5>
@@ -308,7 +308,7 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
       tt.store %m_ptrs1, %9 {async_task_id = array<i32: 0>} : tensor<128x!tt.ptr<f32>, #blocked>
       ttg.local_store %11, %0 {async_task_id = array<i32: 0>} : tensor<128x128xbf16, #blocked1> -> !ttg.memdesc<128x128xbf16, #shared, #smem, mutable>
       %12 = ttng.async_tma_copy_local_to_global %desc_o[%q1_47, %c0_i32] %0 {async_task_id = array<i32: 2>} : !tt.tensordesc<128x128xbf16, #shared>, !ttg.memdesc<128x128xbf16, #shared, #smem, mutable> -> !ttg.async.token
-      ttng.async_tma_store_token_wait %12   {async_task_id = array<i32: 2>} : !ttg.async.token
+      nvws.tma_store_wait %0   {async_task_id = array<i32: 2>} : !ttg.memdesc<128x128xbf16, #shared, #smem, mutable>
       %tile_idx_85 = arith.addi %tile_idx_35, %num_progs {async_task_id = array<i32: 0, 2, 3>} : i32
       scf.yield {async_task_id = array<i32: 0, 2, 3>} %tile_idx_85 : i32
     } {async_task_id = array<i32: 0, 1, 2, 3, 4, 5>, tt.merge_epilogue = true, tt.separate_epilogue_store = true, tt.warp_specialize, ttg.partition.stages = [0 : i32, 1 : i32, 0 : i32, 0 : i32, 0 : i32, 0 : i32], ttg.partition.types = ["correction", "gemm", "epilogue_store", "load", "computation", "computation"], ttg.warp_specialize.tag = 0 : i32}

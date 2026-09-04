@@ -4,6 +4,7 @@
 #include "mlir/IR/Block.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
+#include "nvidia/include/Dialect/NVWS/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
@@ -79,7 +80,7 @@ canAdvanceWSBarrierArrivePastWait(std::optional<DictionaryAttr> arrive,
 }
 
 inline bool hasArriveLikeSemantics(Operation *op) {
-  if (auto wait = dyn_cast<TMAStoreTokenWaitOp>(op))
+  if (auto wait = dyn_cast<nvws::TMAStoreWaitOp>(op))
     return !wait.getBarriers().empty();
   // TODO: Refine this using WSBarrier metadata so independent arrive-like ops
   // can be reordered when their channel constraints prove it is safe.

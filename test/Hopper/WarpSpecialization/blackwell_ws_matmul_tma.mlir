@@ -361,7 +361,7 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
 //   async_tma_copy_local_to_global -> async_tma_store_token_wait
 // Partitions: 1 = MMA, 2 = loads, 3 = TMA store, 4 = tmem_load + truncf + convert + alloc
 // The WS pass should fuse the consumer release barrier into the
-// TMAStoreTokenWaitOp instead of emitting a separate arrive_barrier.
+// NVWS::TMAStoreWaitOp instead of emitting a separate arrive_barrier.
 
 // CHECK-LABEL: @matmul_kernel_tma_persistent_early_store
 // CHECK: ttg.warp_specialize
@@ -376,7 +376,7 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
 // CHECK: partition1
 // CHECK: ttng.async_tma_copy_local_to_global
 // Barrier should be fused into the wait op, not a separate arrive_barrier
-// CHECK: ttng.async_tma_store_token_wait %{{.*}}, %{{.*}}[%{{.*}}]
+// CHECK: nvws.tma_store_wait %{{.*}}, %{{.*}}[%{{.*}}]
 // Partition 2: Epilogue load from tensor memory
 // CHECK: partition2
 // CHECK: ttng.tmem_load
@@ -455,7 +455,7 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
       ttng.fence_async_shared {bCluster = false}
       // Partition 3: Async TMA store
       %store_token = ttng.async_tma_copy_local_to_global %c_desc[%offs_am_c, %offs_bn_c] %store_alloc {ttg.partition = array<i32: 3>} : !tt.tensordesc<128x128xf16, #shared8>, !ttg.memdesc<128x128xf16, #shared8, #smem5, mutable> -> !ttg.async.token
-      ttng.async_tma_store_token_wait %store_token {ttg.partition = array<i32: 3>} : !ttg.async.token
+      nvws.tma_store_wait %store_alloc {ttg.partition = array<i32: 3>} : !ttg.memdesc<128x128xf16, #shared8, #smem5, mutable>
       scf.yield %tile_id_c_23 : i32
     } {tt.data_partition_factor = 1 : i32, tt.warp_specialize, ttg.partition.stages = [0 : i32, 1 : i32, 0 : i32, 0 : i32, 0 : i32], ttg.warp_specialize.tag = 0 : i32}
     tt.return

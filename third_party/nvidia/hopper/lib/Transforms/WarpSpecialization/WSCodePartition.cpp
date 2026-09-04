@@ -2659,18 +2659,35 @@ void insertAsyncComm(
       }
     }
 
-    // If any actual consumer is a TMA store-like op, follow its token
-    // result to find TMAStoreTokenWaitOp and add it to actualConsumerOps.
+    // If any actual consumer is a TMA store-like op, find the NVWS wait that
+    // names the same staging buffer and add it to actualConsumerOps.
     // This enables barrier fusion for the early-lowered TMA store/reduce
-    // pattern (local_alloc → async_tma_copy/reduce → token_wait).
+    // pattern (local_alloc → async_tma_copy/reduce → tma_store_wait).
     DenseSet<Operation *> additionalConsumerOps;
     for (auto *op : actualConsumerOps) {
-      if (llvm::isa<ttng::AsyncTMACopyLocalToGlobalOp, ttng::AsyncTMAReduceOp>(
-              op)) {
-        for (auto user : op->getUsers()) {
-          if (llvm::isa<ttng::TMAStoreTokenWaitOp>(user)) {
-            additionalConsumerOps.insert(user);
+      Value src;
+      if (auto store = dyn_cast<ttng::AsyncTMACopyLocalToGlobalOp>(op))
+        src = store.getSrc();
+      else if (auto reduce = dyn_cast<ttng::AsyncTMAReduceOp>(op))
+        src = reduce.getSrc();
+      if (!src)
+        continue;
+      for (auto it = std::next(op->getIterator()), end = op->getBlock()->end();
+           it != end; ++it) {
+        if (auto wait = dyn_cast<ttnvws::TMAStoreWaitOp>(&*it)) {
+          if (wait.getSrc() == src) {
+            additionalConsumerOps.insert(wait);
+            break;
           }
+          continue;
+        }
+        if (auto nextStore =
+                dyn_cast<ttng::AsyncTMACopyLocalToGlobalOp>(&*it)) {
+          if (nextStore.getSrc() == src)
+            break;
+        } else if (auto nextReduce = dyn_cast<ttng::AsyncTMAReduceOp>(&*it)) {
+          if (nextReduce.getSrc() == src)
+            break;
         }
       }
     }
@@ -4442,11 +4459,11 @@ void insertAsyncComm(
                << masterChannel->uniqID << " ");
         } else {
           builder.setLoopScheduleInfoFromOp(consumerReleasePoint);
-          if (auto tokenWaitOp =
-                  dyn_cast<ttng::TMAStoreTokenWaitOp>(consumerReleasePoint)) {
-            tokenWaitOp.addToken(token.second, bufferIdx);
+          if (auto storeWaitOp =
+                  dyn_cast<ttnvws::TMAStoreWaitOp>(consumerReleasePoint)) {
+            storeWaitOp.addToken(token.second, bufferIdx);
             LLVM_DEBUG({
-              LDBG("attached ConsumerRelease token to TMAStoreTokenWaitOp "
+              LDBG("attached ConsumerRelease token to NVWS TMAStoreWaitOp "
                    << masterChannel->uniqID << " ");
               token.second.dump();
             });

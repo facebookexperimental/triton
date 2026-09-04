@@ -1093,35 +1093,6 @@ def TTNG_TMAStoreWaitOp : TTNG_Op<"async_tma_store_wait", [MemWaitOpTrait]> {
   let assemblyFormat = "attr-dict";
 }
 
-def TTNG_TMAStoreTokenWaitOp
-    : TTNG_Op<"async_tma_store_token_wait", [AttrSizedOperandSegments]> {
-  let summary =
-      "wait for a specific TMA store to finish reading from shared memory.";
-  let arguments = (ins TTG_AsyncToken:$token,
-      Variadic<TTG_MemDescType>:$barriers, Variadic<I1>:$barrier_preds,
-      Variadic<AnyType>:$nvws_tokens, Variadic<I32>:$nvws_token_indices);
-  let description = [{
-    Wait for a specific TMA store (identified by its token) to finish reading
-    from shared memory. This allows the shared memory buffer to be rewritten.
-
-    Optionally, after the wait completes, arrive on the given barriers. This
-    is used by warp specialization to embed the consumer release barrier
-    directly into the wait op.
-
-    nvws_tokens / nvws_token_indices carry deferred consumer-release tokens
-    that are resolved into real mbarriers during token lowering.
-  }];
-  let assemblyFormat =
-      "$token custom<BarriersAndPreds>($barriers, $barrier_preds) "
-      "custom<NvwsTokensAndIndices>($nvws_tokens, $nvws_token_indices) "
-      "attr-dict `:` type($token) (`,` qualified(type($barriers))^)? (`,` "
-      "type($nvws_tokens)^)?";
-  let extraClassDeclaration = [{
-    void addBarrier(Value barrier, Value pred);
-    void addToken(Value token, Value idx);
-  }];
-}
-
 def TTNG_TCGen5MMAOp
     : TTNG_Op<"tc_gen5_mma",
               [DeclareOpInterfaceMethods<MemoryEffectsOpInterface>,

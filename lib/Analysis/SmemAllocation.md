@@ -108,16 +108,15 @@ the same SMEM offset and written between the copy and the wait, the TMA reads
 corrupted data.
 
 This is a real bug that manifests with data partitioning (DP=2): two epilogue
-accumulators each get their own `local_alloc → tma_copy → token_wait` sequence.
+accumulators each get their own `local_alloc → tma_copy → nvws.tma_store_wait`
+sequence.
 `TritonGPUReorderInstructions` can move the second `local_alloc` before the
-first `token_wait` (since there's no SSA dependency), and if both buffers share
+first wait (since there's no SSA dependency), and if both buffers share
 offset 0, the second write corrupts the first TMA read.
 
-**Extension:** Liveness is extended to cover the `TMAStoreTokenWaitOp` that
-consumes the token. The forward SSA slice from the `local_alloc`'s defining op
-is walked to find the token wait, and `maxId` is set to that op's ID + 1. This
-is more precise than extending to the full function — it only extends as far as
-the async operation actually needs.
+The `nvws.tma_store_wait` directly consumes the staging memdesc, so ordinary
+SSA liveness keeps the allocation live until the wait without a bespoke token
+forward-slice extension.
 
 ### How Extensions Are Implemented
 

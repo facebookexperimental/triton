@@ -132,3 +132,24 @@ tt.func @token_with_ws_constraints() {
   nvws.consumer_release %0, %c0_i32 {async_task_id = dense<1> : vector<1xi32>, constraints = {WSBarrier = {dstTask = 0 : i32}}} : tensor<3x!nvws.token>, i32
   tt.return
 }
+
+// -----
+
+#shared0 = #ttg.nvmma_shared<{swizzlingByteWidth = 32, transposed = false, elementBitWidth = 16}>
+#barrier = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.target" = "cuda:0", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: @tma_store_wait
+  // CHECK: nvws.tma_store_wait %arg0 : !ttg.memdesc<64x16xf16, {{.*}}, #smem>
+  // CHECK: nvws.tma_store_wait %arg0, %arg1[%arg2] nvws_token %arg3[%arg4]
+  tt.func @tma_store_wait(
+      %src: !ttg.memdesc<64x16xf16, #shared0, #smem>,
+      %bar: !ttg.memdesc<1xi64, #barrier, #smem>, %pred: i1,
+      %token: tensor<2x!nvws.token>, %index: i32) {
+    nvws.tma_store_wait %src : !ttg.memdesc<64x16xf16, #shared0, #smem>
+    nvws.tma_store_wait %src, %bar[%pred] nvws_token %token[%index]
+        : !ttg.memdesc<64x16xf16, #shared0, #smem>,
+          !ttg.memdesc<1xi64, #barrier, #smem>, tensor<2x!nvws.token>
+    tt.return
+  }
+}

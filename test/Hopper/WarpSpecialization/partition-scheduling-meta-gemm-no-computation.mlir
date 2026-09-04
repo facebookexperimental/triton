@@ -41,13 +41,13 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
 // CHECK: ttg.local_alloc {{.*}}ttg.partition = array<i32: [[EPIL]]>
 // --- Epilogue: TMA store → epilogue partition ---
 // CHECK: ttng.async_tma_copy_local_to_global {{.*}}ttg.partition = array<i32: [[EPIL_STORE:[0-9]+]]>
-// CHECK: ttng.async_tma_store_token_wait {{.*}}ttg.partition = array<i32: [[EPIL_STORE]]>
+// CHECK: nvws.tma_store_wait {{.*}}ttg.partition = array<i32: [[EPIL_STORE]]>
 // --- Second half: truncf, convert_layout, local_alloc → default; TMA store → epilogue store ---
 // CHECK: arith.truncf {{.*}}ttg.partition = array<i32: [[EPIL]]>
 // CHECK: ttg.convert_layout {{.*}}ttg.partition = array<i32: [[EPIL]]>
 // CHECK: ttg.local_alloc {{.*}}ttg.partition = array<i32: [[EPIL]]>
 // CHECK: ttng.async_tma_copy_local_to_global {{.*}}ttg.partition = array<i32: [[EPIL_STORE]]>
-// CHECK: ttng.async_tma_store_token_wait {{.*}}ttg.partition = array<i32: [[EPIL_STORE]]>
+// CHECK: nvws.tma_store_wait {{.*}}ttg.partition = array<i32: [[EPIL_STORE]]>
 //
 // --- Partition types ---
 // CHECK: tt.warp_specialize
@@ -136,14 +136,14 @@ tt.func public @persistent_gemm_no_computation_partition(
     %c0_cvt = ttg.convert_layout %c0_f16 : tensor<128x128xf16, #blocked4> -> tensor<128x128xf16, #blocked5>
     %c0_smem = ttg.local_alloc %c0_cvt : (tensor<128x128xf16, #blocked5>) -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
     %store_tok0 = ttng.async_tma_copy_local_to_global %c_desc[%offs_am_c, %offs_bn_c] %c0_smem : !tt.tensordesc<128x128xf16, #shared>, !ttg.memdesc<128x128xf16, #shared, #smem, mutable> -> !ttg.async.token
-    ttng.async_tma_store_token_wait %store_tok0 : !ttg.async.token
+    nvws.tma_store_wait %c0_smem : !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
 
     %c1_f16 = arith.truncf %rhs : tensor<128x128xf32, #blocked4> to tensor<128x128xf16, #blocked4>
     %c1_cvt = ttg.convert_layout %c1_f16 : tensor<128x128xf16, #blocked4> -> tensor<128x128xf16, #blocked5>
     %offs_bn_c2 = arith.addi %offs_bn_c, %c128_i32 : i32
     %c1_smem = ttg.local_alloc %c1_cvt : (tensor<128x128xf16, #blocked5>) -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
     %store_tok1 = ttng.async_tma_copy_local_to_global %c_desc[%offs_am_c, %offs_bn_c2] %c1_smem : !tt.tensordesc<128x128xf16, #shared>, !ttg.memdesc<128x128xf16, #shared, #smem, mutable> -> !ttg.async.token
-    ttng.async_tma_store_token_wait %store_tok1 : !ttg.async.token
+    nvws.tma_store_wait %c1_smem : !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
 
     scf.yield %tile_id_c_next : i32
   } {tt.data_partition_factor = 1 : i32, tt.smem_alloc_algo = 1 : i32, tt.warp_specialize}

@@ -2,6 +2,7 @@
 // META_WS_ONLY
 #include "lib/Dialect/TritonGPU/Transforms/WarpSpecialization/PartitionAttrs.h"
 #include "mlir/IR/IRMapping.h"
+#include "nvidia/include/Dialect/NVWS/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
@@ -12,6 +13,8 @@
 namespace mlir {
 namespace triton {
 namespace nvidia_gpu {
+
+namespace ttnvws = mlir::triton::nvws;
 
 #define GEN_PASS_DEF_TRITONNVIDIAGPUTESTGENERATESUBTILEDREGIONPASS
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/Passes.h.inc"
@@ -523,10 +526,25 @@ collectPerTileChain(Value splitResult, Operation *splitOp, Block *block,
           if (!visited.insert(bufUser).second)
             continue;
           chain.push_back(bufUser);
-          // Pushing the TMA op's token result pulls its
-          // async_tma_store_token_wait into the chain via the normal walk.
-          for (Value r : bufUser->getResults())
-            worklist.push_back(r);
+          for (auto it = std::next(bufUser->getIterator()), end = block->end();
+               it != end; ++it) {
+            if (auto wait = dyn_cast<ttnvws::TMAStoreWaitOp>(&*it)) {
+              if (wait.getSrc() != store.getDst())
+                continue;
+              if (getOpAsyncTaskIds(wait) == getOpAsyncTaskIds(store) &&
+                  !excludeOps.contains(wait) && !isa<SubtiledRegionOp>(wait) &&
+                  visited.insert(wait).second)
+                chain.push_back(wait);
+              break;
+            }
+            if (auto nextStore = dyn_cast<AsyncTMACopyLocalToGlobalOp>(&*it)) {
+              if (nextStore.getSrc() == store.getDst())
+                break;
+            } else if (auto nextReduce = dyn_cast<AsyncTMAReduceOp>(&*it)) {
+              if (nextReduce.getSrc() == store.getDst())
+                break;
+            }
+          }
         }
       }
     }
@@ -1281,11 +1299,6 @@ bool tryGenerateForSplit(triton::SplitOp splitOp) {
           if (isa<SubtiledRegionOp>(user))
             continue;
           tmaChains[t].push_back(user);
-          // Also capture token users (e.g., async_tma_store_token_wait).
-          for (Value result : user->getResults())
-            for (Operation *tokenUser : result.getUsers())
-              if (tokenUser->getBlock() == block)
-                tmaChains[t].push_back(tokenUser);
         }
       }
       llvm::sort(tmaChains[t], [](Operation *a, Operation *b) {

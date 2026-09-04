@@ -260,10 +260,10 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
         %172 = ttg.convert_layout %170 {async_task_id = array<i32: 0>} : tensor<128x128xf32, #linear2> -> tensor<128x128xf32, #blocked2>
         ttg.local_store %171, %60 {async_task_id = array<i32: 0>} : tensor<128x128xf32, #blocked2> -> !ttg.memdesc<128x128xf32, #shared3, #smem, mutable>
         %173 = ttng.async_tma_reduce add, %36[%99, %58] %60 {async_task_id = array<i32: 0>} : !tt.tensordesc<128x128xf32, #shared3>, !ttg.memdesc<128x128xf32, #shared3, #smem, mutable> -> !ttg.async.token
-        ttng.async_tma_store_token_wait %173   {async_task_id = array<i32: 4>, can_rotate_by_buffer_count = 1 : i32} : !ttg.async.token
+        nvws.tma_store_wait %60   {async_task_id = array<i32: 4>, can_rotate_by_buffer_count = 1 : i32} : !ttg.memdesc<128x128xf32, #shared3, #smem, mutable>
         ttg.local_store %172, %61 {async_task_id = array<i32: 0>} : tensor<128x128xf32, #blocked2> -> !ttg.memdesc<128x128xf32, #shared3, #smem, mutable>
         %174 = ttng.async_tma_reduce add, %36[%99, %58] %61 {async_task_id = array<i32: 0>} : !tt.tensordesc<128x128xf32, #shared3>, !ttg.memdesc<128x128xf32, #shared3, #smem, mutable> -> !ttg.async.token
-        ttng.async_tma_store_token_wait %174   {async_task_id = array<i32: 3>, can_rotate_by_buffer_count = 1 : i32} : !ttg.async.token
+        nvws.tma_store_wait %61   {async_task_id = array<i32: 3>, can_rotate_by_buffer_count = 1 : i32} : !ttg.memdesc<128x128xf32, #shared3, #smem, mutable>
         scf.yield {async_task_id = array<i32: 0, 1, 3, 4>} %true, %token_22, %token_26, %167, %token_30, %token_24, %token_28, %168, %token_32 : i1, !ttg.async.token, !ttg.async.token, !ttg.async.token, !ttg.async.token, !ttg.async.token, !ttg.async.token, !ttg.async.token, !ttg.async.token
       } {async_task_id = array<i32: 0, 1, 2, 3, 4>, tt.merge_epilogue = true}
       %result_17, %token_18 = ttng.tmem_load %result[%85#3] {async_task_id = array<i32: 4>, tmem.end = array<i32: 3, 4, 5>, tmem.start = array<i32: 6>} : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #linear1>
@@ -276,10 +276,10 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
       %91 = ttg.convert_layout %89 {async_task_id = array<i32: 3>} : tensor<128x128xbf16, #linear> -> tensor<128x128xbf16, #blocked1>
       ttg.local_store %90, %62 {async_task_id = array<i32: 4>} : tensor<128x128xbf16, #blocked1> -> !ttg.memdesc<128x128xbf16, #shared, #smem, mutable>
       %92 = ttng.async_tma_copy_local_to_global %34[%64, %59] %62 {async_task_id = array<i32: 4>} : !tt.tensordesc<128x128xbf16, #shared>, !ttg.memdesc<128x128xbf16, #shared, #smem, mutable> -> !ttg.async.token
-      ttng.async_tma_store_token_wait %92   {async_task_id = array<i32: 4>, can_rotate_by_buffer_count = 1 : i32} : !ttg.async.token
+      nvws.tma_store_wait %62   {async_task_id = array<i32: 4>, can_rotate_by_buffer_count = 1 : i32} : !ttg.memdesc<128x128xbf16, #shared, #smem, mutable>
       ttg.local_store %91, %63 {async_task_id = array<i32: 3>} : tensor<128x128xbf16, #blocked1> -> !ttg.memdesc<128x128xbf16, #shared, #smem, mutable>
       %93 = ttng.async_tma_copy_local_to_global %35[%65, %59] %63 {async_task_id = array<i32: 3>} : !tt.tensordesc<128x128xbf16, #shared>, !ttg.memdesc<128x128xbf16, #shared, #smem, mutable> -> !ttg.async.token
-      ttng.async_tma_store_token_wait %93   {async_task_id = array<i32: 3>, can_rotate_by_buffer_count = 1 : i32} : !ttg.async.token
+      nvws.tma_store_wait %63   {async_task_id = array<i32: 3>, can_rotate_by_buffer_count = 1 : i32} : !ttg.memdesc<128x128xbf16, #shared, #smem, mutable>
     } {async_task_id = array<i32: 0, 1, 2, 3, 4>, tt.data_partition_factor = 2 : i32, tt.merge_correction = true, tt.merge_epilogue_to_computation = true, tt.warp_specialize, ttg.partition.stages = [0 : i32, 1 : i32, 0 : i32, 0 : i32, 0 : i32], ttg.partition.types = ["reduction", "gemm", "load", "computation", "computation"], ttg.warp_specialize.tag = 0 : i32}
     tt.return
   }

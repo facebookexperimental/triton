@@ -62,7 +62,7 @@ tt.func public @rmsnorm_no_mma(
     %norm = arith.mulf %x, %rinv_b : tensor<64x64xf32, #blocked>
     %stage = ttg.local_alloc %norm : (tensor<64x64xf32, #blocked>) -> !ttg.memdesc<64x64xf32, #shared, #smem, mutable>
     %tok = ttng.async_tma_copy_local_to_global %y_desc[%offs, %c0_i32] %stage : !tt.tensordesc<64x64xf32, #shared>, !ttg.memdesc<64x64xf32, #shared, #smem, mutable> -> !ttg.async.token
-    ttng.async_tma_store_token_wait %tok : !ttg.async.token
+    nvws.tma_store_wait %stage : !ttg.memdesc<64x64xf32, #shared, #smem, mutable>
     scf.yield
   } {tt.warp_specialize, tt.separate_epilogue_store = true, tt.merge_epilogue = true, tt.smem_budget = 200000 : i32}
   tt.return
@@ -98,7 +98,7 @@ tt.func public @maxnorm_no_mma(
     %norm = arith.divf %x, %m_b : tensor<64x64xf32, #blocked>
     %stage = ttg.local_alloc %norm : (tensor<64x64xf32, #blocked>) -> !ttg.memdesc<64x64xf32, #shared, #smem, mutable>
     %tok = ttng.async_tma_copy_local_to_global %y_desc[%offs, %c0_i32] %stage : !tt.tensordesc<64x64xf32, #shared>, !ttg.memdesc<64x64xf32, #shared, #smem, mutable> -> !ttg.async.token
-    ttng.async_tma_store_token_wait %tok : !ttg.async.token
+    nvws.tma_store_wait %stage : !ttg.memdesc<64x64xf32, #shared, #smem, mutable>
     scf.yield
   } {tt.warp_specialize, tt.separate_epilogue_store = true, tt.merge_epilogue = true, tt.smem_budget = 200000 : i32}
   tt.return

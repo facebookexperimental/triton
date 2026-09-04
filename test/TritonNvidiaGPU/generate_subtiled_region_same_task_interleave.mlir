@@ -27,7 +27,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
   // CHECK:        arith.truncf
   // CHECK-NEXT:   ttg.local_store
   // CHECK-NEXT:   ttng.async_tma_copy_local_to_global
-  // CHECK-NEXT:   ttng.async_tma_store_token_wait
+  // CHECK-NEXT:   nvws.tma_store_wait
   // CHECK-NEXT:   ttng.subtiled_region_yield
   // CHECK-NOT: ttng.subtiled_region
   tt.func @same_task_epilogue_interleave(
@@ -48,13 +48,13 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     %trunc0 = arith.truncf %lhs {async_task_id = array<i32: 3>} : tensor<128x64xf32, #blocked2d2> to tensor<128x64xf16, #blocked2d2>
     ttg.local_store %trunc0, %smem0 {async_task_id = array<i32: 3>} : tensor<128x64xf16, #blocked2d2> -> !ttg.memdesc<128x64xf16, #shared2, #smem2, mutable>
     %tok0 = ttng.async_tma_copy_local_to_global %desc[%off0, %off1] %smem0 {async_task_id = array<i32: 3>} : !tt.tensordesc<128x64xf16, #shared2>, !ttg.memdesc<128x64xf16, #shared2, #smem2, mutable> -> !ttg.async.token
-    ttng.async_tma_store_token_wait %tok0 {async_task_id = array<i32: 3>} : !ttg.async.token
+    nvws.tma_store_wait %smem0 {async_task_id = array<i32: 3>} : !ttg.memdesc<128x64xf16, #shared2, #smem2, mutable>
 
     // Tile 1: same chain, all task 3.
     %trunc1 = arith.truncf %rhs {async_task_id = array<i32: 3>} : tensor<128x64xf32, #blocked2d2> to tensor<128x64xf16, #blocked2d2>
     ttg.local_store %trunc1, %smem1 {async_task_id = array<i32: 3>} : tensor<128x64xf16, #blocked2d2> -> !ttg.memdesc<128x64xf16, #shared2, #smem2, mutable>
     %tok1 = ttng.async_tma_copy_local_to_global %desc[%off0, %off2] %smem1 {async_task_id = array<i32: 3>} : !tt.tensordesc<128x64xf16, #shared2>, !ttg.memdesc<128x64xf16, #shared2, #smem2, mutable> -> !ttg.async.token
-    ttng.async_tma_store_token_wait %tok1 {async_task_id = array<i32: 3>} : !ttg.async.token
+    nvws.tma_store_wait %smem1 {async_task_id = array<i32: 3>} : !ttg.memdesc<128x64xf16, #shared2, #smem2, mutable>
 
     tt.return
   }
@@ -65,7 +65,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
   // CHECK: ttng.subtiled_region
   // CHECK:        ttg.local_store
   // CHECK-NEXT:   ttng.async_tma_reduce add
-  // CHECK-NEXT:   ttng.async_tma_store_token_wait
+  // CHECK-NEXT:   nvws.tma_store_wait
   // CHECK-NEXT:   ttng.subtiled_region_yield
   // CHECK-NOT: ttng.subtiled_region
   tt.func @same_task_reduce_interleave(
@@ -83,11 +83,11 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 
     ttg.local_store %lhs, %smem0 {async_task_id = array<i32: 1>} : tensor<128x64xf32, #blocked2d2> -> !ttg.memdesc<128x64xf32, #shared32, #smem2, mutable>
     %tok0 = ttng.async_tma_reduce add, %desc[%off0, %off1] %smem0 {async_task_id = array<i32: 1>} : !tt.tensordesc<128x64xf32, #shared32>, !ttg.memdesc<128x64xf32, #shared32, #smem2, mutable> -> !ttg.async.token
-    ttng.async_tma_store_token_wait %tok0 {async_task_id = array<i32: 1>} : !ttg.async.token
+    nvws.tma_store_wait %smem0 {async_task_id = array<i32: 1>} : !ttg.memdesc<128x64xf32, #shared32, #smem2, mutable>
 
     ttg.local_store %rhs, %smem1 {async_task_id = array<i32: 1>} : tensor<128x64xf32, #blocked2d2> -> !ttg.memdesc<128x64xf32, #shared32, #smem2, mutable>
     %tok1 = ttng.async_tma_reduce add, %desc[%off0, %off2] %smem1 {async_task_id = array<i32: 1>} : !tt.tensordesc<128x64xf32, #shared32>, !ttg.memdesc<128x64xf32, #shared32, #smem2, mutable> -> !ttg.async.token
-    ttng.async_tma_store_token_wait %tok1 {async_task_id = array<i32: 1>} : !ttg.async.token
+    nvws.tma_store_wait %smem1 {async_task_id = array<i32: 1>} : !ttg.memdesc<128x64xf32, #shared32, #smem2, mutable>
     tt.return
   }
 

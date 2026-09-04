@@ -13,9 +13,7 @@
 #define GET_ATTRDEF_CLASSES
 #include "Dialect/NVWS/IR/NVWSAttrEnums.cpp.inc"
 
-#define GET_OP_CLASSES
 #include "Dialect/NVWS/IR/NVWSOpInterfaces.cpp.inc"
-#include "Dialect/NVWS/IR/Ops.cpp.inc"
 
 namespace mlir::triton::nvws {
 
@@ -178,4 +176,118 @@ void ArefGetExitOp::setStage(Value stage) { getStageMutable().assign(stage); }
 void ArefGetEnterOp::setStage(Value stage) { getStageMutable().assign(stage); }
 void ArefBufferOp::setStage(Value stage) { getStageMutable().assign(stage); }
 
+void TMAStoreWaitOp::addBarrier(Value barrier, Value pred) {
+  getBarriersMutable().append(barrier);
+  getBarrierPredsMutable().append(pred);
+}
+
+void TMAStoreWaitOp::addToken(Value token, Value idx) {
+  getNvwsTokensMutable().append(token);
+  getNvwsTokenIndicesMutable().append(idx);
+}
+
+// barriers-and-preds := (`,` ssa-value `[` ssa-value `]`)*
+static ParseResult
+parseBarriersAndPreds(OpAsmParser &p,
+                      SmallVectorImpl<OpAsmParser::UnresolvedOperand> &barriers,
+                      SmallVectorImpl<OpAsmParser::UnresolvedOperand> &preds) {
+  while (succeeded(p.parseOptionalComma())) {
+    if (p.parseOperand(barriers.emplace_back()) || p.parseLSquare() ||
+        p.parseOperand(preds.emplace_back()) || p.parseRSquare())
+      return failure();
+  }
+  return success();
+}
+
+static void printBarriersAndPreds(OpAsmPrinter &p, Operation *op,
+                                  OperandRange barriers, OperandRange preds) {
+  assert(barriers.size() == preds.size());
+  for (auto [barrier, pred] : llvm::zip(barriers, preds))
+    p << ", " << barrier << '[' << pred << ']';
+}
+
+// nvws-tokens-and-indices := (`nvws_token` ssa-value `[` ssa-value `]`)*
+static ParseResult parseNvwsTokensAndIndices(
+    OpAsmParser &p, SmallVectorImpl<OpAsmParser::UnresolvedOperand> &tokens,
+    SmallVectorImpl<OpAsmParser::UnresolvedOperand> &indices) {
+  while (succeeded(p.parseOptionalKeyword("nvws_token"))) {
+    if (p.parseOperand(tokens.emplace_back()) || p.parseLSquare() ||
+        p.parseOperand(indices.emplace_back()) || p.parseRSquare())
+      return failure();
+  }
+  return success();
+}
+
+static void printNvwsTokensAndIndices(OpAsmPrinter &p, Operation *op,
+                                      OperandRange tokens,
+                                      OperandRange indices) {
+  assert(tokens.size() == indices.size());
+  for (auto [token, index] : llvm::zip(tokens, indices))
+    p << " nvws_token " << token << '[' << index << ']';
+}
+
+ParseResult TMAStoreWaitOp::parse(OpAsmParser &parser, OperationState &result) {
+  OpAsmParser::UnresolvedOperand src;
+  SmallVector<OpAsmParser::UnresolvedOperand> barriers;
+  SmallVector<OpAsmParser::UnresolvedOperand> barrierPreds;
+  SmallVector<OpAsmParser::UnresolvedOperand> nvwsTokens;
+  SmallVector<OpAsmParser::UnresolvedOperand> nvwsTokenIndices;
+  Type srcType;
+  SmallVector<Type> barrierTypes;
+  SmallVector<Type> nvwsTokenTypes;
+
+  if (parser.parseOperand(src) ||
+      parseBarriersAndPreds(parser, barriers, barrierPreds) ||
+      parseNvwsTokensAndIndices(parser, nvwsTokens, nvwsTokenIndices) ||
+      parser.parseOptionalAttrDict(result.attributes) || parser.parseColon() ||
+      parser.parseType(srcType))
+    return failure();
+
+  for (size_t i = 0; i < barriers.size(); ++i) {
+    if (parser.parseComma() || parser.parseType(barrierTypes.emplace_back()))
+      return failure();
+  }
+  for (size_t i = 0; i < nvwsTokens.size(); ++i) {
+    if (parser.parseComma() || parser.parseType(nvwsTokenTypes.emplace_back()))
+      return failure();
+  }
+
+  auto loc = parser.getCurrentLocation();
+  auto &builder = parser.getBuilder();
+  if (parser.resolveOperand(src, srcType, result.operands) ||
+      parser.resolveOperands(barriers, barrierTypes, loc, result.operands) ||
+      parser.resolveOperands(barrierPreds, builder.getI1Type(),
+                             result.operands) ||
+      parser.resolveOperands(nvwsTokens, nvwsTokenTypes, loc,
+                             result.operands) ||
+      parser.resolveOperands(nvwsTokenIndices, builder.getI32Type(),
+                             result.operands))
+    return failure();
+
+  result.addAttribute(TMAStoreWaitOp::getOperandSegmentSizeAttr(),
+                      builder.getDenseI32ArrayAttr(
+                          {1, static_cast<int32_t>(barriers.size()),
+                           static_cast<int32_t>(barrierPreds.size()),
+                           static_cast<int32_t>(nvwsTokens.size()),
+                           static_cast<int32_t>(nvwsTokenIndices.size())}));
+  return success();
+}
+
+void TMAStoreWaitOp::print(OpAsmPrinter &printer) {
+  printer << ' ' << getSrc();
+  printBarriersAndPreds(printer, *this, getBarriers(), getBarrierPreds());
+  printNvwsTokensAndIndices(printer, *this, getNvwsTokens(),
+                            getNvwsTokenIndices());
+  printer.printOptionalAttrDict((*this)->getAttrs(),
+                                {getOperandSegmentSizeAttr()});
+  printer << " : " << getSrc().getType();
+  for (Value barrier : getBarriers())
+    printer << ", " << barrier.getType();
+  for (Value token : getNvwsTokens())
+    printer << ", " << token.getType();
+}
+
 } // namespace mlir::triton::nvws
+
+#define GET_OP_CLASSES
+#include "Dialect/NVWS/IR/Ops.cpp.inc"

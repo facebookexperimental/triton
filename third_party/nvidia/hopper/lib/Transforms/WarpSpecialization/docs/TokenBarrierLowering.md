@@ -113,7 +113,7 @@ The NVWS dialect defines these abstract synchronization ops:
 | `ProducerCommitOp` | Producer signals that data is ready |
 | `ConsumerWaitOp` | Consumer waits for data to be available |
 | `ConsumerReleaseOp` | Consumer signals that it has finished reading |
-| `TMAStoreTokenWaitOp` | Special wait for TMA store completion |
+| `NVWS::TMAStoreWaitOp` | Special wait for TMA store completion |
 
 ## Lowering Algorithm
 
@@ -184,7 +184,7 @@ capture becomes two captures (the ready and empty barrier arrays).
 
 ### Step 6: Handle TMA Store Tokens
 
-`TMAStoreTokenWaitOp` is handled specially — it is lowered by adding real
+`NVWS::TMAStoreWaitOp` is handled specially — it is lowered by adding real
 barriers for the TMA store's SMEM buffer. This ensures the SMEM buffer is
 not reused before the TMA store finishes reading from it.
 

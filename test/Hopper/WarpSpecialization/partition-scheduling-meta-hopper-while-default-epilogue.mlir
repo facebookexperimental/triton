@@ -58,7 +58,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
       %out_blocked = ttg.convert_layout %out : tensor<128x128xf16, #mma> -> tensor<128x128xf16, #blocked1>
       %out_smem = ttg.local_alloc %out_blocked : (tensor<128x128xf16, #blocked1>) -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
       %store = ttng.async_tma_copy_local_to_global %c_desc[%tile, %c0] %out_smem : !tt.tensordesc<128x128xf16, #shared>, !ttg.memdesc<128x128xf16, #shared, #smem, mutable> -> !ttg.async.token
-      ttng.async_tma_store_token_wait %store : !ttg.async.token
+      nvws.tma_store_wait %out_smem : !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
       %next = tt.atomic_rmw add, acq_rel, gpu, %counter, %c1, %true : (!tt.ptr<i32>, i32, i1) -> i32
       scf.yield %next : i32
     } attributes {tt.data_partition_factor = 1 : i32, tt.warp_specialize}

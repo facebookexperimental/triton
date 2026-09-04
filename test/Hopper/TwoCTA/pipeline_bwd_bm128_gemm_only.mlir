@@ -311,28 +311,28 @@ module {
             ttg.local_store %200, %202 {async_task_id = array<i32: 0>, loop.cluster = 5 : i32, loop.stage = 0 : i32} : tensor<128x16xf32, #blocked> -> !ttg.memdesc<128x16xf32, #shared1, #smem, mutable>
             %203 = ttg.memdesc_index %103[%c0_i32] {async_task_id = array<i32: 0>, loop.cluster = 5 : i32, loop.stage = 0 : i32} : !ttg.memdesc<1x128x16xf32, #shared1, #smem, mutable> -> !ttg.memdesc<128x16xf32, #shared1, #smem, mutable>
             %204 = ttng.async_tma_reduce add, %arg36[%201, %c0_i32] %203 {async_task_id = array<i32: 0>, loop.cluster = 5 : i32, loop.stage = 0 : i32} : !tt.tensordesc<128x16xf32, #shared1>, !ttg.memdesc<128x16xf32, #shared1, #smem, mutable> -> !ttg.async.token
-            ttng.async_tma_store_token_wait %204   {async_task_id = array<i32: 0>, loop.cluster = 1 : i32, loop.stage = 0 : i32} : !ttg.async.token
+            nvws.tma_store_wait %203   {async_task_id = array<i32: 0>, loop.cluster = 1 : i32, loop.stage = 0 : i32} : !ttg.memdesc<128x16xf32, #shared1, #smem, mutable>
             %205 = arith.mulf %outRHS_9, %cst {async_task_id = array<i32: 0>, loop.cluster = 5 : i32, loop.stage = 0 : i32} : tensor<128x16xf32, #linear>
             %206 = ttg.convert_layout %205 {async_task_id = array<i32: 0>, loop.cluster = 5 : i32, loop.stage = 0 : i32} : tensor<128x16xf32, #linear> -> tensor<128x16xf32, #blocked>
             %207 = ttg.memdesc_index %103[%c0_i32] {async_task_id = array<i32: 0>, loop.cluster = 5 : i32, loop.stage = 0 : i32} : !ttg.memdesc<1x128x16xf32, #shared1, #smem, mutable> -> !ttg.memdesc<128x16xf32, #shared1, #smem, mutable>
             ttg.local_store %206, %207 {async_task_id = array<i32: 0>, loop.cluster = 5 : i32, loop.stage = 0 : i32} : tensor<128x16xf32, #blocked> -> !ttg.memdesc<128x16xf32, #shared1, #smem, mutable>
             %208 = ttg.memdesc_index %103[%c0_i32] {async_task_id = array<i32: 0>, loop.cluster = 5 : i32, loop.stage = 0 : i32} : !ttg.memdesc<1x128x16xf32, #shared1, #smem, mutable> -> !ttg.memdesc<128x16xf32, #shared1, #smem, mutable>
             %209 = ttng.async_tma_reduce add, %arg36[%201, %c16_i32] %208 {async_task_id = array<i32: 0>, loop.cluster = 5 : i32, loop.stage = 0 : i32} : !tt.tensordesc<128x16xf32, #shared1>, !ttg.memdesc<128x16xf32, #shared1, #smem, mutable> -> !ttg.async.token
-            ttng.async_tma_store_token_wait %209   {async_task_id = array<i32: 0>, loop.cluster = 2 : i32, loop.stage = 0 : i32} : !ttg.async.token
+            nvws.tma_store_wait %208   {async_task_id = array<i32: 0>, loop.cluster = 2 : i32, loop.stage = 0 : i32} : !ttg.memdesc<128x16xf32, #shared1, #smem, mutable>
             %210 = arith.mulf %outLHS_10, %cst {async_task_id = array<i32: 0>, loop.cluster = 5 : i32, loop.stage = 0 : i32} : tensor<128x16xf32, #linear>
             %211 = ttg.convert_layout %210 {async_task_id = array<i32: 0>, loop.cluster = 5 : i32, loop.stage = 0 : i32} : tensor<128x16xf32, #linear> -> tensor<128x16xf32, #blocked>
             %212 = ttg.memdesc_index %103[%c0_i32] {async_task_id = array<i32: 0>, loop.cluster = 5 : i32, loop.stage = 0 : i32} : !ttg.memdesc<1x128x16xf32, #shared1, #smem, mutable> -> !ttg.memdesc<128x16xf32, #shared1, #smem, mutable>
             ttg.local_store %211, %212 {async_task_id = array<i32: 0>, loop.cluster = 5 : i32, loop.stage = 0 : i32} : tensor<128x16xf32, #blocked> -> !ttg.memdesc<128x16xf32, #shared1, #smem, mutable>
             %213 = ttg.memdesc_index %103[%c0_i32] {async_task_id = array<i32: 0>, loop.cluster = 5 : i32, loop.stage = 0 : i32} : !ttg.memdesc<1x128x16xf32, #shared1, #smem, mutable> -> !ttg.memdesc<128x16xf32, #shared1, #smem, mutable>
             %214 = ttng.async_tma_reduce add, %arg36[%201, %c32_i32] %213 {async_task_id = array<i32: 0>, loop.cluster = 5 : i32, loop.stage = 0 : i32} : !tt.tensordesc<128x16xf32, #shared1>, !ttg.memdesc<128x16xf32, #shared1, #smem, mutable> -> !ttg.async.token
-            ttng.async_tma_store_token_wait %214   {async_task_id = array<i32: 0>, loop.cluster = 3 : i32, loop.stage = 0 : i32} : !ttg.async.token
+            nvws.tma_store_wait %213   {async_task_id = array<i32: 0>, loop.cluster = 3 : i32, loop.stage = 0 : i32} : !ttg.memdesc<128x16xf32, #shared1, #smem, mutable>
             %215 = arith.mulf %outRHS_11, %cst {async_task_id = array<i32: 0>, loop.cluster = 5 : i32, loop.stage = 0 : i32} : tensor<128x16xf32, #linear>
             %216 = ttg.convert_layout %215 {async_task_id = array<i32: 0>, loop.cluster = 5 : i32, loop.stage = 0 : i32} : tensor<128x16xf32, #linear> -> tensor<128x16xf32, #blocked>
             %217 = ttg.memdesc_index %103[%c0_i32] {async_task_id = array<i32: 0>, loop.cluster = 5 : i32, loop.stage = 0 : i32} : !ttg.memdesc<1x128x16xf32, #shared1, #smem, mutable> -> !ttg.memdesc<128x16xf32, #shared1, #smem, mutable>
             ttg.local_store %216, %217 {async_task_id = array<i32: 0>, loop.cluster = 5 : i32, loop.stage = 0 : i32} : tensor<128x16xf32, #blocked> -> !ttg.memdesc<128x16xf32, #shared1, #smem, mutable>
             %218 = ttg.memdesc_index %103[%c0_i32] {async_task_id = array<i32: 0>, loop.cluster = 5 : i32, loop.stage = 0 : i32} : !ttg.memdesc<1x128x16xf32, #shared1, #smem, mutable> -> !ttg.memdesc<128x16xf32, #shared1, #smem, mutable>
             %219 = ttng.async_tma_reduce add, %arg36[%201, %c48_i32] %218 {async_task_id = array<i32: 0>, loop.cluster = 5 : i32, loop.stage = 0 : i32} : !tt.tensordesc<128x16xf32, #shared1>, !ttg.memdesc<128x16xf32, #shared1, #smem, mutable> -> !ttg.async.token
-            ttng.async_tma_store_token_wait %219   {async_task_id = array<i32: 0>, loop.cluster = 4 : i32, loop.stage = 1 : i32} : !ttg.async.token
+            nvws.tma_store_wait %218   {async_task_id = array<i32: 0>, loop.cluster = 4 : i32, loop.stage = 1 : i32} : !ttg.memdesc<128x16xf32, #shared1, #smem, mutable>
             %220 = arith.addi %arg67, %c128_i32 {async_task_id = array<i32: 0>, loop.cluster = 5 : i32, loop.stage = 0 : i32} : i32
             %221 = arith.addi %arg68, %c1_i64 {async_task_id = array<i32: 0>, loop.cluster = 5 : i32, loop.stage = 0 : i32} : i64
             scf.yield {async_task_id = array<i32: 0>} %220, %221 : i32, i64
@@ -918,56 +918,56 @@ module {
           ttg.local_store %209, %210 {async_task_id = array<i32: 4>} : tensor<128x16xf16, #blocked2> -> !ttg.memdesc<128x16xf16, #shared2, #smem, mutable>
           %211 = ttg.memdesc_index %arg118[%c0_i32_16] {async_task_id = array<i32: 4>} : !ttg.memdesc<1x128x16xf16, #shared2, #smem, mutable> -> !ttg.memdesc<128x16xf16, #shared2, #smem, mutable>
           %212 = ttng.async_tma_copy_local_to_global %arg119[%184, %c0_i32_16] %211 {async_task_id = array<i32: 4>} : !tt.tensordesc<128x16xf16, #shared2>, !ttg.memdesc<128x16xf16, #shared2, #smem, mutable> -> !ttg.async.token
-          ttng.async_tma_store_token_wait %212   {async_task_id = array<i32: 4>, can_rotate_by_buffer_count = 1 : i32} : !ttg.async.token
+          nvws.tma_store_wait %211   {async_task_id = array<i32: 4>, can_rotate_by_buffer_count = 1 : i32} : !ttg.memdesc<128x16xf16, #shared2, #smem, mutable>
           %213 = arith.truncf %outRHS_22 {async_task_id = array<i32: 4>} : tensor<128x16xf32, #linear7> to tensor<128x16xf16, #linear7>
           %214 = ttg.convert_layout %213 {async_task_id = array<i32: 4>} : tensor<128x16xf16, #linear7> -> tensor<128x16xf16, #blocked2>
           %215 = ttg.memdesc_index %arg118[%c0_i32_16] {async_task_id = array<i32: 4>} : !ttg.memdesc<1x128x16xf16, #shared2, #smem, mutable> -> !ttg.memdesc<128x16xf16, #shared2, #smem, mutable>
           ttg.local_store %214, %215 {async_task_id = array<i32: 4>} : tensor<128x16xf16, #blocked2> -> !ttg.memdesc<128x16xf16, #shared2, #smem, mutable>
           %216 = ttg.memdesc_index %arg118[%c0_i32_16] {async_task_id = array<i32: 4>} : !ttg.memdesc<1x128x16xf16, #shared2, #smem, mutable> -> !ttg.memdesc<128x16xf16, #shared2, #smem, mutable>
           %217 = ttng.async_tma_copy_local_to_global %arg119[%184, %c16_i32_11] %216 {async_task_id = array<i32: 4>} : !tt.tensordesc<128x16xf16, #shared2>, !ttg.memdesc<128x16xf16, #shared2, #smem, mutable> -> !ttg.async.token
-          ttng.async_tma_store_token_wait %217   {async_task_id = array<i32: 4>, can_rotate_by_buffer_count = 1 : i32} : !ttg.async.token
+          nvws.tma_store_wait %216   {async_task_id = array<i32: 4>, can_rotate_by_buffer_count = 1 : i32} : !ttg.memdesc<128x16xf16, #shared2, #smem, mutable>
           %218 = arith.truncf %outLHS_23 {async_task_id = array<i32: 4>} : tensor<128x16xf32, #linear7> to tensor<128x16xf16, #linear7>
           %219 = ttg.convert_layout %218 {async_task_id = array<i32: 4>} : tensor<128x16xf16, #linear7> -> tensor<128x16xf16, #blocked2>
           %220 = ttg.memdesc_index %arg118[%c0_i32_16] {async_task_id = array<i32: 4>} : !ttg.memdesc<1x128x16xf16, #shared2, #smem, mutable> -> !ttg.memdesc<128x16xf16, #shared2, #smem, mutable>
           ttg.local_store %219, %220 {async_task_id = array<i32: 4>} : tensor<128x16xf16, #blocked2> -> !ttg.memdesc<128x16xf16, #shared2, #smem, mutable>
           %221 = ttg.memdesc_index %arg118[%c0_i32_16] {async_task_id = array<i32: 4>} : !ttg.memdesc<1x128x16xf16, #shared2, #smem, mutable> -> !ttg.memdesc<128x16xf16, #shared2, #smem, mutable>
           %222 = ttng.async_tma_copy_local_to_global %arg119[%184, %c32_i32_10] %221 {async_task_id = array<i32: 4>} : !tt.tensordesc<128x16xf16, #shared2>, !ttg.memdesc<128x16xf16, #shared2, #smem, mutable> -> !ttg.async.token
-          ttng.async_tma_store_token_wait %222   {async_task_id = array<i32: 4>, can_rotate_by_buffer_count = 1 : i32} : !ttg.async.token
+          nvws.tma_store_wait %221   {async_task_id = array<i32: 4>, can_rotate_by_buffer_count = 1 : i32} : !ttg.memdesc<128x16xf16, #shared2, #smem, mutable>
           %223 = arith.truncf %outRHS_24 {async_task_id = array<i32: 4>} : tensor<128x16xf32, #linear7> to tensor<128x16xf16, #linear7>
           %224 = ttg.convert_layout %223 {async_task_id = array<i32: 4>} : tensor<128x16xf16, #linear7> -> tensor<128x16xf16, #blocked2>
           %225 = ttg.memdesc_index %arg118[%c0_i32_16] {async_task_id = array<i32: 4>} : !ttg.memdesc<1x128x16xf16, #shared2, #smem, mutable> -> !ttg.memdesc<128x16xf16, #shared2, #smem, mutable>
           ttg.local_store %224, %225 {async_task_id = array<i32: 4>} : tensor<128x16xf16, #blocked2> -> !ttg.memdesc<128x16xf16, #shared2, #smem, mutable>
           %226 = ttg.memdesc_index %arg118[%c0_i32_16] {async_task_id = array<i32: 4>} : !ttg.memdesc<1x128x16xf16, #shared2, #smem, mutable> -> !ttg.memdesc<128x16xf16, #shared2, #smem, mutable>
           %227 = ttng.async_tma_copy_local_to_global %arg119[%184, %c48_i32_9] %226 {async_task_id = array<i32: 4>} : !tt.tensordesc<128x16xf16, #shared2>, !ttg.memdesc<128x16xf16, #shared2, #smem, mutable> -> !ttg.async.token
-          ttng.async_tma_store_token_wait %227   {async_task_id = array<i32: 4>, can_rotate_by_buffer_count = 1 : i32} : !ttg.async.token
+          nvws.tma_store_wait %226   {async_task_id = array<i32: 4>, can_rotate_by_buffer_count = 1 : i32} : !ttg.memdesc<128x16xf16, #shared2, #smem, mutable>
           %228 = arith.truncf %outLHS_27 {async_task_id = array<i32: 4>} : tensor<128x16xf32, #linear7> to tensor<128x16xf16, #linear7>
           %229 = ttg.convert_layout %228 {async_task_id = array<i32: 4>} : tensor<128x16xf16, #linear7> -> tensor<128x16xf16, #blocked2>
           %230 = ttg.memdesc_index %arg118[%c0_i32_16] {async_task_id = array<i32: 4>} : !ttg.memdesc<1x128x16xf16, #shared2, #smem, mutable> -> !ttg.memdesc<128x16xf16, #shared2, #smem, mutable>
           ttg.local_store %229, %230 {async_task_id = array<i32: 4>} : tensor<128x16xf16, #blocked2> -> !ttg.memdesc<128x16xf16, #shared2, #smem, mutable>
           %231 = ttg.memdesc_index %arg118[%c0_i32_16] {async_task_id = array<i32: 4>} : !ttg.memdesc<1x128x16xf16, #shared2, #smem, mutable> -> !ttg.memdesc<128x16xf16, #shared2, #smem, mutable>
           %232 = ttng.async_tma_copy_local_to_global %arg119[%184, %c64_i32_8] %231 {async_task_id = array<i32: 4>} : !tt.tensordesc<128x16xf16, #shared2>, !ttg.memdesc<128x16xf16, #shared2, #smem, mutable> -> !ttg.async.token
-          ttng.async_tma_store_token_wait %232   {async_task_id = array<i32: 4>, can_rotate_by_buffer_count = 1 : i32} : !ttg.async.token
+          nvws.tma_store_wait %231   {async_task_id = array<i32: 4>, can_rotate_by_buffer_count = 1 : i32} : !ttg.memdesc<128x16xf16, #shared2, #smem, mutable>
           %233 = arith.truncf %outRHS_28 {async_task_id = array<i32: 4>} : tensor<128x16xf32, #linear7> to tensor<128x16xf16, #linear7>
           %234 = ttg.convert_layout %233 {async_task_id = array<i32: 4>} : tensor<128x16xf16, #linear7> -> tensor<128x16xf16, #blocked2>
           %235 = ttg.memdesc_index %arg118[%c0_i32_16] {async_task_id = array<i32: 4>} : !ttg.memdesc<1x128x16xf16, #shared2, #smem, mutable> -> !ttg.memdesc<128x16xf16, #shared2, #smem, mutable>
           ttg.local_store %234, %235 {async_task_id = array<i32: 4>} : tensor<128x16xf16, #blocked2> -> !ttg.memdesc<128x16xf16, #shared2, #smem, mutable>
           %236 = ttg.memdesc_index %arg118[%c0_i32_16] {async_task_id = array<i32: 4>} : !ttg.memdesc<1x128x16xf16, #shared2, #smem, mutable> -> !ttg.memdesc<128x16xf16, #shared2, #smem, mutable>
           %237 = ttng.async_tma_copy_local_to_global %arg119[%184, %c80_i32] %236 {async_task_id = array<i32: 4>} : !tt.tensordesc<128x16xf16, #shared2>, !ttg.memdesc<128x16xf16, #shared2, #smem, mutable> -> !ttg.async.token
-          ttng.async_tma_store_token_wait %237   {async_task_id = array<i32: 4>, can_rotate_by_buffer_count = 1 : i32} : !ttg.async.token
+          nvws.tma_store_wait %236   {async_task_id = array<i32: 4>, can_rotate_by_buffer_count = 1 : i32} : !ttg.memdesc<128x16xf16, #shared2, #smem, mutable>
           %238 = arith.truncf %outLHS_29 {async_task_id = array<i32: 4>} : tensor<128x16xf32, #linear7> to tensor<128x16xf16, #linear7>
           %239 = ttg.convert_layout %238 {async_task_id = array<i32: 4>} : tensor<128x16xf16, #linear7> -> tensor<128x16xf16, #blocked2>
           %240 = ttg.memdesc_index %arg118[%c0_i32_16] {async_task_id = array<i32: 4>} : !ttg.memdesc<1x128x16xf16, #shared2, #smem, mutable> -> !ttg.memdesc<128x16xf16, #shared2, #smem, mutable>
           ttg.local_store %239, %240 {async_task_id = array<i32: 4>} : tensor<128x16xf16, #blocked2> -> !ttg.memdesc<128x16xf16, #shared2, #smem, mutable>
           %241 = ttg.memdesc_index %arg118[%c0_i32_16] {async_task_id = array<i32: 4>} : !ttg.memdesc<1x128x16xf16, #shared2, #smem, mutable> -> !ttg.memdesc<128x16xf16, #shared2, #smem, mutable>
           %242 = ttng.async_tma_copy_local_to_global %arg119[%184, %c96_i32] %241 {async_task_id = array<i32: 4>} : !tt.tensordesc<128x16xf16, #shared2>, !ttg.memdesc<128x16xf16, #shared2, #smem, mutable> -> !ttg.async.token
-          ttng.async_tma_store_token_wait %242   {async_task_id = array<i32: 4>, can_rotate_by_buffer_count = 1 : i32} : !ttg.async.token
+          nvws.tma_store_wait %241   {async_task_id = array<i32: 4>, can_rotate_by_buffer_count = 1 : i32} : !ttg.memdesc<128x16xf16, #shared2, #smem, mutable>
           %243 = arith.truncf %outRHS_30 {async_task_id = array<i32: 4>} : tensor<128x16xf32, #linear7> to tensor<128x16xf16, #linear7>
           %244 = ttg.convert_layout %243 {async_task_id = array<i32: 4>} : tensor<128x16xf16, #linear7> -> tensor<128x16xf16, #blocked2>
           %245 = ttg.memdesc_index %arg118[%c0_i32_16] {async_task_id = array<i32: 4>} : !ttg.memdesc<1x128x16xf16, #shared2, #smem, mutable> -> !ttg.memdesc<128x16xf16, #shared2, #smem, mutable>
           ttg.local_store %244, %245 {async_task_id = array<i32: 4>} : tensor<128x16xf16, #blocked2> -> !ttg.memdesc<128x16xf16, #shared2, #smem, mutable>
           %246 = ttg.memdesc_index %arg118[%c0_i32_16] {async_task_id = array<i32: 4>} : !ttg.memdesc<1x128x16xf16, #shared2, #smem, mutable> -> !ttg.memdesc<128x16xf16, #shared2, #smem, mutable>
           %247 = ttng.async_tma_copy_local_to_global %arg119[%184, %c112_i32] %246 {async_task_id = array<i32: 4>} : !tt.tensordesc<128x16xf16, #shared2>, !ttg.memdesc<128x16xf16, #shared2, #smem, mutable> -> !ttg.async.token
-          ttng.async_tma_store_token_wait %247   {async_task_id = array<i32: 4>, can_rotate_by_buffer_count = 1 : i32} : !ttg.async.token
+          nvws.tma_store_wait %246   {async_task_id = array<i32: 4>, can_rotate_by_buffer_count = 1 : i32} : !ttg.memdesc<128x16xf16, #shared2, #smem, mutable>
           %248 = ttg.memdesc_index %arg86[%c0_i32_16] {async_task_id = array<i32: 4>} : !ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
           %249 = ttg.memdesc_index %arg95[%c0_i32_16] {async_task_id = array<i32: 4>} : !ttg.memdesc<1x1xi64, #shared4, #smem, mutable> -> !ttg.memdesc<1xi64, #shared4, #smem, mutable>
           %250 = arith.extui %188 {async_task_id = array<i32: 4>} : i1 to i32
@@ -1003,7 +1003,7 @@ module {
           ttg.local_store %268, %269 {async_task_id = array<i32: 4>} : tensor<128x16xf16, #blocked2> -> !ttg.memdesc<128x16xf16, #shared2, #smem, mutable>
           %270 = ttg.memdesc_index %arg120[%c0_i32_16] {async_task_id = array<i32: 4>} : !ttg.memdesc<1x128x16xf16, #shared2, #smem, mutable> -> !ttg.memdesc<128x16xf16, #shared2, #smem, mutable>
           %271 = ttng.async_tma_copy_local_to_global %arg121[%184, %c0_i32_16] %270 {async_task_id = array<i32: 4>} : !tt.tensordesc<128x16xf16, #shared2>, !ttg.memdesc<128x16xf16, #shared2, #smem, mutable> -> !ttg.async.token
-          ttng.async_tma_store_token_wait %271   {async_task_id = array<i32: 4>, can_rotate_by_buffer_count = 1 : i32} : !ttg.async.token
+          nvws.tma_store_wait %270   {async_task_id = array<i32: 4>, can_rotate_by_buffer_count = 1 : i32} : !ttg.memdesc<128x16xf16, #shared2, #smem, mutable>
           %272 = arith.mulf %outRHS_38, %168 {async_task_id = array<i32: 4>} : tensor<128x16xf32, #linear7>
           %273 = arith.truncf %272 {async_task_id = array<i32: 4>} : tensor<128x16xf32, #linear7> to tensor<128x16xf16, #linear7>
           %274 = ttg.convert_layout %273 {async_task_id = array<i32: 4>} : tensor<128x16xf16, #linear7> -> tensor<128x16xf16, #blocked2>
@@ -1011,7 +1011,7 @@ module {
           ttg.local_store %274, %275 {async_task_id = array<i32: 4>} : tensor<128x16xf16, #blocked2> -> !ttg.memdesc<128x16xf16, #shared2, #smem, mutable>
           %276 = ttg.memdesc_index %arg120[%c0_i32_16] {async_task_id = array<i32: 4>} : !ttg.memdesc<1x128x16xf16, #shared2, #smem, mutable> -> !ttg.memdesc<128x16xf16, #shared2, #smem, mutable>
           %277 = ttng.async_tma_copy_local_to_global %arg121[%184, %c16_i32_11] %276 {async_task_id = array<i32: 4>} : !tt.tensordesc<128x16xf16, #shared2>, !ttg.memdesc<128x16xf16, #shared2, #smem, mutable> -> !ttg.async.token
-          ttng.async_tma_store_token_wait %277   {async_task_id = array<i32: 4>, can_rotate_by_buffer_count = 1 : i32} : !ttg.async.token
+          nvws.tma_store_wait %276   {async_task_id = array<i32: 4>, can_rotate_by_buffer_count = 1 : i32} : !ttg.memdesc<128x16xf16, #shared2, #smem, mutable>
           %278 = arith.mulf %outLHS_39, %168 {async_task_id = array<i32: 4>} : tensor<128x16xf32, #linear7>
           %279 = arith.truncf %278 {async_task_id = array<i32: 4>} : tensor<128x16xf32, #linear7> to tensor<128x16xf16, #linear7>
           %280 = ttg.convert_layout %279 {async_task_id = array<i32: 4>} : tensor<128x16xf16, #linear7> -> tensor<128x16xf16, #blocked2>
@@ -1019,7 +1019,7 @@ module {
           ttg.local_store %280, %281 {async_task_id = array<i32: 4>} : tensor<128x16xf16, #blocked2> -> !ttg.memdesc<128x16xf16, #shared2, #smem, mutable>
           %282 = ttg.memdesc_index %arg120[%c0_i32_16] {async_task_id = array<i32: 4>} : !ttg.memdesc<1x128x16xf16, #shared2, #smem, mutable> -> !ttg.memdesc<128x16xf16, #shared2, #smem, mutable>
           %283 = ttng.async_tma_copy_local_to_global %arg121[%184, %c32_i32_10] %282 {async_task_id = array<i32: 4>} : !tt.tensordesc<128x16xf16, #shared2>, !ttg.memdesc<128x16xf16, #shared2, #smem, mutable> -> !ttg.async.token
-          ttng.async_tma_store_token_wait %283   {async_task_id = array<i32: 4>, can_rotate_by_buffer_count = 1 : i32} : !ttg.async.token
+          nvws.tma_store_wait %282   {async_task_id = array<i32: 4>, can_rotate_by_buffer_count = 1 : i32} : !ttg.memdesc<128x16xf16, #shared2, #smem, mutable>
           %284 = arith.mulf %outRHS_40, %168 {async_task_id = array<i32: 4>} : tensor<128x16xf32, #linear7>
           %285 = arith.truncf %284 {async_task_id = array<i32: 4>} : tensor<128x16xf32, #linear7> to tensor<128x16xf16, #linear7>
           %286 = ttg.convert_layout %285 {async_task_id = array<i32: 4>} : tensor<128x16xf16, #linear7> -> tensor<128x16xf16, #blocked2>
@@ -1027,7 +1027,7 @@ module {
           ttg.local_store %286, %287 {async_task_id = array<i32: 4>} : tensor<128x16xf16, #blocked2> -> !ttg.memdesc<128x16xf16, #shared2, #smem, mutable>
           %288 = ttg.memdesc_index %arg120[%c0_i32_16] {async_task_id = array<i32: 4>} : !ttg.memdesc<1x128x16xf16, #shared2, #smem, mutable> -> !ttg.memdesc<128x16xf16, #shared2, #smem, mutable>
           %289 = ttng.async_tma_copy_local_to_global %arg121[%184, %c48_i32_9] %288 {async_task_id = array<i32: 4>} : !tt.tensordesc<128x16xf16, #shared2>, !ttg.memdesc<128x16xf16, #shared2, #smem, mutable> -> !ttg.async.token
-          ttng.async_tma_store_token_wait %289   {async_task_id = array<i32: 4>, can_rotate_by_buffer_count = 1 : i32} : !ttg.async.token
+          nvws.tma_store_wait %288   {async_task_id = array<i32: 4>, can_rotate_by_buffer_count = 1 : i32} : !ttg.memdesc<128x16xf16, #shared2, #smem, mutable>
           %290 = arith.mulf %outLHS_43, %168 {async_task_id = array<i32: 4>} : tensor<128x16xf32, #linear7>
           %291 = arith.truncf %290 {async_task_id = array<i32: 4>} : tensor<128x16xf32, #linear7> to tensor<128x16xf16, #linear7>
           %292 = ttg.convert_layout %291 {async_task_id = array<i32: 4>} : tensor<128x16xf16, #linear7> -> tensor<128x16xf16, #blocked2>
@@ -1035,7 +1035,7 @@ module {
           ttg.local_store %292, %293 {async_task_id = array<i32: 4>} : tensor<128x16xf16, #blocked2> -> !ttg.memdesc<128x16xf16, #shared2, #smem, mutable>
           %294 = ttg.memdesc_index %arg120[%c0_i32_16] {async_task_id = array<i32: 4>} : !ttg.memdesc<1x128x16xf16, #shared2, #smem, mutable> -> !ttg.memdesc<128x16xf16, #shared2, #smem, mutable>
           %295 = ttng.async_tma_copy_local_to_global %arg121[%184, %c64_i32_8] %294 {async_task_id = array<i32: 4>} : !tt.tensordesc<128x16xf16, #shared2>, !ttg.memdesc<128x16xf16, #shared2, #smem, mutable> -> !ttg.async.token
-          ttng.async_tma_store_token_wait %295   {async_task_id = array<i32: 4>, can_rotate_by_buffer_count = 1 : i32} : !ttg.async.token
+          nvws.tma_store_wait %294   {async_task_id = array<i32: 4>, can_rotate_by_buffer_count = 1 : i32} : !ttg.memdesc<128x16xf16, #shared2, #smem, mutable>
           %296 = arith.mulf %outRHS_44, %168 {async_task_id = array<i32: 4>} : tensor<128x16xf32, #linear7>
           %297 = arith.truncf %296 {async_task_id = array<i32: 4>} : tensor<128x16xf32, #linear7> to tensor<128x16xf16, #linear7>
           %298 = ttg.convert_layout %297 {async_task_id = array<i32: 4>} : tensor<128x16xf16, #linear7> -> tensor<128x16xf16, #blocked2>
@@ -1043,7 +1043,7 @@ module {
           ttg.local_store %298, %299 {async_task_id = array<i32: 4>} : tensor<128x16xf16, #blocked2> -> !ttg.memdesc<128x16xf16, #shared2, #smem, mutable>
           %300 = ttg.memdesc_index %arg120[%c0_i32_16] {async_task_id = array<i32: 4>} : !ttg.memdesc<1x128x16xf16, #shared2, #smem, mutable> -> !ttg.memdesc<128x16xf16, #shared2, #smem, mutable>
           %301 = ttng.async_tma_copy_local_to_global %arg121[%184, %c80_i32] %300 {async_task_id = array<i32: 4>} : !tt.tensordesc<128x16xf16, #shared2>, !ttg.memdesc<128x16xf16, #shared2, #smem, mutable> -> !ttg.async.token
-          ttng.async_tma_store_token_wait %301   {async_task_id = array<i32: 4>, can_rotate_by_buffer_count = 1 : i32} : !ttg.async.token
+          nvws.tma_store_wait %300   {async_task_id = array<i32: 4>, can_rotate_by_buffer_count = 1 : i32} : !ttg.memdesc<128x16xf16, #shared2, #smem, mutable>
           %302 = arith.mulf %outLHS_45, %168 {async_task_id = array<i32: 4>} : tensor<128x16xf32, #linear7>
           %303 = arith.truncf %302 {async_task_id = array<i32: 4>} : tensor<128x16xf32, #linear7> to tensor<128x16xf16, #linear7>
           %304 = ttg.convert_layout %303 {async_task_id = array<i32: 4>} : tensor<128x16xf16, #linear7> -> tensor<128x16xf16, #blocked2>
@@ -1051,7 +1051,7 @@ module {
           ttg.local_store %304, %305 {async_task_id = array<i32: 4>} : tensor<128x16xf16, #blocked2> -> !ttg.memdesc<128x16xf16, #shared2, #smem, mutable>
           %306 = ttg.memdesc_index %arg120[%c0_i32_16] {async_task_id = array<i32: 4>} : !ttg.memdesc<1x128x16xf16, #shared2, #smem, mutable> -> !ttg.memdesc<128x16xf16, #shared2, #smem, mutable>
           %307 = ttng.async_tma_copy_local_to_global %arg121[%184, %c96_i32] %306 {async_task_id = array<i32: 4>} : !tt.tensordesc<128x16xf16, #shared2>, !ttg.memdesc<128x16xf16, #shared2, #smem, mutable> -> !ttg.async.token
-          ttng.async_tma_store_token_wait %307   {async_task_id = array<i32: 4>, can_rotate_by_buffer_count = 1 : i32} : !ttg.async.token
+          nvws.tma_store_wait %306   {async_task_id = array<i32: 4>, can_rotate_by_buffer_count = 1 : i32} : !ttg.memdesc<128x16xf16, #shared2, #smem, mutable>
           %308 = arith.mulf %outRHS_46, %168 {async_task_id = array<i32: 4>} : tensor<128x16xf32, #linear7>
           %309 = arith.truncf %308 {async_task_id = array<i32: 4>} : tensor<128x16xf32, #linear7> to tensor<128x16xf16, #linear7>
           %310 = ttg.convert_layout %309 {async_task_id = array<i32: 4>} : tensor<128x16xf16, #linear7> -> tensor<128x16xf16, #blocked2>
@@ -1059,7 +1059,7 @@ module {
           ttg.local_store %310, %311 {async_task_id = array<i32: 4>} : tensor<128x16xf16, #blocked2> -> !ttg.memdesc<128x16xf16, #shared2, #smem, mutable>
           %312 = ttg.memdesc_index %arg120[%c0_i32_16] {async_task_id = array<i32: 4>} : !ttg.memdesc<1x128x16xf16, #shared2, #smem, mutable> -> !ttg.memdesc<128x16xf16, #shared2, #smem, mutable>
           %313 = ttng.async_tma_copy_local_to_global %arg121[%184, %c112_i32] %312 {async_task_id = array<i32: 4>} : !tt.tensordesc<128x16xf16, #shared2>, !ttg.memdesc<128x16xf16, #shared2, #smem, mutable> -> !ttg.async.token
-          ttng.async_tma_store_token_wait %313   {async_task_id = array<i32: 4>, can_rotate_by_buffer_count = 1 : i32} : !ttg.async.token
+          nvws.tma_store_wait %312   {async_task_id = array<i32: 4>, can_rotate_by_buffer_count = 1 : i32} : !ttg.memdesc<128x16xf16, #shared2, #smem, mutable>
           %314 = arith.addi %arg145, %158 {async_task_id = array<i32: 4>} : i32
           %315 = arith.addi %arg146, %c1_i64_6 {async_task_id = array<i32: 4>} : i64
           scf.yield {async_task_id = array<i32: 4>} %314, %315, %189 : i32, i64, i64
@@ -1409,28 +1409,28 @@ module {
             ttg.local_store %200, %202 {async_task_id = array<i32: 0>, loop.cluster = 5 : i32, loop.stage = 0 : i32} : tensor<128x16xf32, #blocked> -> !ttg.memdesc<128x16xf32, #shared1, #smem, mutable>
             %203 = ttg.memdesc_index %103[%c0_i32] {async_task_id = array<i32: 0>, loop.cluster = 5 : i32, loop.stage = 0 : i32} : !ttg.memdesc<1x128x16xf32, #shared1, #smem, mutable> -> !ttg.memdesc<128x16xf32, #shared1, #smem, mutable>
             %204 = ttng.async_tma_reduce add, %arg36[%201, %c0_i32] %203 {async_task_id = array<i32: 0>, loop.cluster = 5 : i32, loop.stage = 0 : i32} : !tt.tensordesc<128x16xf32, #shared1>, !ttg.memdesc<128x16xf32, #shared1, #smem, mutable> -> !ttg.async.token
-            ttng.async_tma_store_token_wait %204   {async_task_id = array<i32: 0>, loop.cluster = 1 : i32, loop.stage = 0 : i32} : !ttg.async.token
+            nvws.tma_store_wait %203   {async_task_id = array<i32: 0>, loop.cluster = 1 : i32, loop.stage = 0 : i32} : !ttg.memdesc<128x16xf32, #shared1, #smem, mutable>
             %205 = arith.mulf %outRHS_9, %cst {async_task_id = array<i32: 0>, loop.cluster = 5 : i32, loop.stage = 0 : i32} : tensor<128x16xf32, #linear>
             %206 = ttg.convert_layout %205 {async_task_id = array<i32: 0>, loop.cluster = 5 : i32, loop.stage = 0 : i32} : tensor<128x16xf32, #linear> -> tensor<128x16xf32, #blocked>
             %207 = ttg.memdesc_index %103[%c0_i32] {async_task_id = array<i32: 0>, loop.cluster = 5 : i32, loop.stage = 0 : i32} : !ttg.memdesc<1x128x16xf32, #shared1, #smem, mutable> -> !ttg.memdesc<128x16xf32, #shared1, #smem, mutable>
             ttg.local_store %206, %207 {async_task_id = array<i32: 0>, loop.cluster = 5 : i32, loop.stage = 0 : i32} : tensor<128x16xf32, #blocked> -> !ttg.memdesc<128x16xf32, #shared1, #smem, mutable>
             %208 = ttg.memdesc_index %103[%c0_i32] {async_task_id = array<i32: 0>, loop.cluster = 5 : i32, loop.stage = 0 : i32} : !ttg.memdesc<1x128x16xf32, #shared1, #smem, mutable> -> !ttg.memdesc<128x16xf32, #shared1, #smem, mutable>
             %209 = ttng.async_tma_reduce add, %arg36[%201, %c16_i32] %208 {async_task_id = array<i32: 0>, loop.cluster = 5 : i32, loop.stage = 0 : i32} : !tt.tensordesc<128x16xf32, #shared1>, !ttg.memdesc<128x16xf32, #shared1, #smem, mutable> -> !ttg.async.token
-            ttng.async_tma_store_token_wait %209   {async_task_id = array<i32: 0>, loop.cluster = 2 : i32, loop.stage = 0 : i32} : !ttg.async.token
+            nvws.tma_store_wait %208   {async_task_id = array<i32: 0>, loop.cluster = 2 : i32, loop.stage = 0 : i32} : !ttg.memdesc<128x16xf32, #shared1, #smem, mutable>
             %210 = arith.mulf %outLHS_10, %cst {async_task_id = array<i32: 0>, loop.cluster = 5 : i32, loop.stage = 0 : i32} : tensor<128x16xf32, #linear>
             %211 = ttg.convert_layout %210 {async_task_id = array<i32: 0>, loop.cluster = 5 : i32, loop.stage = 0 : i32} : tensor<128x16xf32, #linear> -> tensor<128x16xf32, #blocked>
             %212 = ttg.memdesc_index %103[%c0_i32] {async_task_id = array<i32: 0>, loop.cluster = 5 : i32, loop.stage = 0 : i32} : !ttg.memdesc<1x128x16xf32, #shared1, #smem, mutable> -> !ttg.memdesc<128x16xf32, #shared1, #smem, mutable>
             ttg.local_store %211, %212 {async_task_id = array<i32: 0>, loop.cluster = 5 : i32, loop.stage = 0 : i32} : tensor<128x16xf32, #blocked> -> !ttg.memdesc<128x16xf32, #shared1, #smem, mutable>
             %213 = ttg.memdesc_index %103[%c0_i32] {async_task_id = array<i32: 0>, loop.cluster = 5 : i32, loop.stage = 0 : i32} : !ttg.memdesc<1x128x16xf32, #shared1, #smem, mutable> -> !ttg.memdesc<128x16xf32, #shared1, #smem, mutable>
             %214 = ttng.async_tma_reduce add, %arg36[%201, %c32_i32] %213 {async_task_id = array<i32: 0>, loop.cluster = 5 : i32, loop.stage = 0 : i32} : !tt.tensordesc<128x16xf32, #shared1>, !ttg.memdesc<128x16xf32, #shared1, #smem, mutable> -> !ttg.async.token
-            ttng.async_tma_store_token_wait %214   {async_task_id = array<i32: 0>, loop.cluster = 3 : i32, loop.stage = 0 : i32} : !ttg.async.token
+            nvws.tma_store_wait %213   {async_task_id = array<i32: 0>, loop.cluster = 3 : i32, loop.stage = 0 : i32} : !ttg.memdesc<128x16xf32, #shared1, #smem, mutable>
             %215 = arith.mulf %outRHS_11, %cst {async_task_id = array<i32: 0>, loop.cluster = 5 : i32, loop.stage = 0 : i32} : tensor<128x16xf32, #linear>
             %216 = ttg.convert_layout %215 {async_task_id = array<i32: 0>, loop.cluster = 5 : i32, loop.stage = 0 : i32} : tensor<128x16xf32, #linear> -> tensor<128x16xf32, #blocked>
             %217 = ttg.memdesc_index %103[%c0_i32] {async_task_id = array<i32: 0>, loop.cluster = 5 : i32, loop.stage = 0 : i32} : !ttg.memdesc<1x128x16xf32, #shared1, #smem, mutable> -> !ttg.memdesc<128x16xf32, #shared1, #smem, mutable>
             ttg.local_store %216, %217 {async_task_id = array<i32: 0>, loop.cluster = 5 : i32, loop.stage = 0 : i32} : tensor<128x16xf32, #blocked> -> !ttg.memdesc<128x16xf32, #shared1, #smem, mutable>
             %218 = ttg.memdesc_index %103[%c0_i32] {async_task_id = array<i32: 0>, loop.cluster = 5 : i32, loop.stage = 0 : i32} : !ttg.memdesc<1x128x16xf32, #shared1, #smem, mutable> -> !ttg.memdesc<128x16xf32, #shared1, #smem, mutable>
             %219 = ttng.async_tma_reduce add, %arg36[%201, %c48_i32] %218 {async_task_id = array<i32: 0>, loop.cluster = 5 : i32, loop.stage = 0 : i32} : !tt.tensordesc<128x16xf32, #shared1>, !ttg.memdesc<128x16xf32, #shared1, #smem, mutable> -> !ttg.async.token
-            ttng.async_tma_store_token_wait %219   {async_task_id = array<i32: 0>, loop.cluster = 4 : i32, loop.stage = 1 : i32} : !ttg.async.token
+            nvws.tma_store_wait %218   {async_task_id = array<i32: 0>, loop.cluster = 4 : i32, loop.stage = 1 : i32} : !ttg.memdesc<128x16xf32, #shared1, #smem, mutable>
             %220 = arith.addi %arg67, %c128_i32 {async_task_id = array<i32: 0>, loop.cluster = 5 : i32, loop.stage = 0 : i32} : i32
             %221 = arith.addi %arg68, %c1_i64 {async_task_id = array<i32: 0>, loop.cluster = 5 : i32, loop.stage = 0 : i32} : i64
             scf.yield {async_task_id = array<i32: 0>} %220, %221 : i32, i64
@@ -2255,56 +2255,56 @@ module {
           ttg.local_store %273, %274 {async_task_id = array<i32: 4>} : tensor<128x16xf16, #blocked2> -> !ttg.memdesc<128x16xf16, #shared2, #smem, mutable>
           %275 = ttg.memdesc_index %arg118[%c0_i32_16] {async_task_id = array<i32: 4>} : !ttg.memdesc<1x128x16xf16, #shared2, #smem, mutable> -> !ttg.memdesc<128x16xf16, #shared2, #smem, mutable>
           %276 = ttng.async_tma_copy_local_to_global %arg119[%185, %c0_i32_16] %275 {async_task_id = array<i32: 4>} : !tt.tensordesc<128x16xf16, #shared2>, !ttg.memdesc<128x16xf16, #shared2, #smem, mutable> -> !ttg.async.token
-          ttng.async_tma_store_token_wait %276   {async_task_id = array<i32: 4>, can_rotate_by_buffer_count = 1 : i32} : !ttg.async.token
+          nvws.tma_store_wait %275   {async_task_id = array<i32: 4>, can_rotate_by_buffer_count = 1 : i32} : !ttg.memdesc<128x16xf16, #shared2, #smem, mutable>
           %277 = arith.truncf %outRHS_26 {async_task_id = array<i32: 4>} : tensor<128x16xf32, #linear7> to tensor<128x16xf16, #linear7>
           %278 = ttg.convert_layout %277 {async_task_id = array<i32: 4>} : tensor<128x16xf16, #linear7> -> tensor<128x16xf16, #blocked2>
           %279 = ttg.memdesc_index %arg118[%c0_i32_16] {async_task_id = array<i32: 4>} : !ttg.memdesc<1x128x16xf16, #shared2, #smem, mutable> -> !ttg.memdesc<128x16xf16, #shared2, #smem, mutable>
           ttg.local_store %278, %279 {async_task_id = array<i32: 4>} : tensor<128x16xf16, #blocked2> -> !ttg.memdesc<128x16xf16, #shared2, #smem, mutable>
           %280 = ttg.memdesc_index %arg118[%c0_i32_16] {async_task_id = array<i32: 4>} : !ttg.memdesc<1x128x16xf16, #shared2, #smem, mutable> -> !ttg.memdesc<128x16xf16, #shared2, #smem, mutable>
           %281 = ttng.async_tma_copy_local_to_global %arg119[%185, %c16_i32_11] %280 {async_task_id = array<i32: 4>} : !tt.tensordesc<128x16xf16, #shared2>, !ttg.memdesc<128x16xf16, #shared2, #smem, mutable> -> !ttg.async.token
-          ttng.async_tma_store_token_wait %281   {async_task_id = array<i32: 4>, can_rotate_by_buffer_count = 1 : i32} : !ttg.async.token
+          nvws.tma_store_wait %280   {async_task_id = array<i32: 4>, can_rotate_by_buffer_count = 1 : i32} : !ttg.memdesc<128x16xf16, #shared2, #smem, mutable>
           %282 = arith.truncf %outLHS_27 {async_task_id = array<i32: 4>} : tensor<128x16xf32, #linear7> to tensor<128x16xf16, #linear7>
           %283 = ttg.convert_layout %282 {async_task_id = array<i32: 4>} : tensor<128x16xf16, #linear7> -> tensor<128x16xf16, #blocked2>
           %284 = ttg.memdesc_index %arg118[%c0_i32_16] {async_task_id = array<i32: 4>} : !ttg.memdesc<1x128x16xf16, #shared2, #smem, mutable> -> !ttg.memdesc<128x16xf16, #shared2, #smem, mutable>
           ttg.local_store %283, %284 {async_task_id = array<i32: 4>} : tensor<128x16xf16, #blocked2> -> !ttg.memdesc<128x16xf16, #shared2, #smem, mutable>
           %285 = ttg.memdesc_index %arg118[%c0_i32_16] {async_task_id = array<i32: 4>} : !ttg.memdesc<1x128x16xf16, #shared2, #smem, mutable> -> !ttg.memdesc<128x16xf16, #shared2, #smem, mutable>
           %286 = ttng.async_tma_copy_local_to_global %arg119[%185, %c32_i32_10] %285 {async_task_id = array<i32: 4>} : !tt.tensordesc<128x16xf16, #shared2>, !ttg.memdesc<128x16xf16, #shared2, #smem, mutable> -> !ttg.async.token
-          ttng.async_tma_store_token_wait %286   {async_task_id = array<i32: 4>, can_rotate_by_buffer_count = 1 : i32} : !ttg.async.token
+          nvws.tma_store_wait %285   {async_task_id = array<i32: 4>, can_rotate_by_buffer_count = 1 : i32} : !ttg.memdesc<128x16xf16, #shared2, #smem, mutable>
           %287 = arith.truncf %outRHS_28 {async_task_id = array<i32: 4>} : tensor<128x16xf32, #linear7> to tensor<128x16xf16, #linear7>
           %288 = ttg.convert_layout %287 {async_task_id = array<i32: 4>} : tensor<128x16xf16, #linear7> -> tensor<128x16xf16, #blocked2>
           %289 = ttg.memdesc_index %arg118[%c0_i32_16] {async_task_id = array<i32: 4>} : !ttg.memdesc<1x128x16xf16, #shared2, #smem, mutable> -> !ttg.memdesc<128x16xf16, #shared2, #smem, mutable>
           ttg.local_store %288, %289 {async_task_id = array<i32: 4>} : tensor<128x16xf16, #blocked2> -> !ttg.memdesc<128x16xf16, #shared2, #smem, mutable>
           %290 = ttg.memdesc_index %arg118[%c0_i32_16] {async_task_id = array<i32: 4>} : !ttg.memdesc<1x128x16xf16, #shared2, #smem, mutable> -> !ttg.memdesc<128x16xf16, #shared2, #smem, mutable>
           %291 = ttng.async_tma_copy_local_to_global %arg119[%185, %c48_i32_9] %290 {async_task_id = array<i32: 4>} : !tt.tensordesc<128x16xf16, #shared2>, !ttg.memdesc<128x16xf16, #shared2, #smem, mutable> -> !ttg.async.token
-          ttng.async_tma_store_token_wait %291   {async_task_id = array<i32: 4>, can_rotate_by_buffer_count = 1 : i32} : !ttg.async.token
+          nvws.tma_store_wait %290   {async_task_id = array<i32: 4>, can_rotate_by_buffer_count = 1 : i32} : !ttg.memdesc<128x16xf16, #shared2, #smem, mutable>
           %292 = arith.truncf %outLHS_31 {async_task_id = array<i32: 4>} : tensor<128x16xf32, #linear7> to tensor<128x16xf16, #linear7>
           %293 = ttg.convert_layout %292 {async_task_id = array<i32: 4>} : tensor<128x16xf16, #linear7> -> tensor<128x16xf16, #blocked2>
           %294 = ttg.memdesc_index %arg118[%c0_i32_16] {async_task_id = array<i32: 4>} : !ttg.memdesc<1x128x16xf16, #shared2, #smem, mutable> -> !ttg.memdesc<128x16xf16, #shared2, #smem, mutable>
           ttg.local_store %293, %294 {async_task_id = array<i32: 4>} : tensor<128x16xf16, #blocked2> -> !ttg.memdesc<128x16xf16, #shared2, #smem, mutable>
           %295 = ttg.memdesc_index %arg118[%c0_i32_16] {async_task_id = array<i32: 4>} : !ttg.memdesc<1x128x16xf16, #shared2, #smem, mutable> -> !ttg.memdesc<128x16xf16, #shared2, #smem, mutable>
           %296 = ttng.async_tma_copy_local_to_global %arg119[%185, %c64_i32_8] %295 {async_task_id = array<i32: 4>} : !tt.tensordesc<128x16xf16, #shared2>, !ttg.memdesc<128x16xf16, #shared2, #smem, mutable> -> !ttg.async.token
-          ttng.async_tma_store_token_wait %296   {async_task_id = array<i32: 4>, can_rotate_by_buffer_count = 1 : i32} : !ttg.async.token
+          nvws.tma_store_wait %295   {async_task_id = array<i32: 4>, can_rotate_by_buffer_count = 1 : i32} : !ttg.memdesc<128x16xf16, #shared2, #smem, mutable>
           %297 = arith.truncf %outRHS_32 {async_task_id = array<i32: 4>} : tensor<128x16xf32, #linear7> to tensor<128x16xf16, #linear7>
           %298 = ttg.convert_layout %297 {async_task_id = array<i32: 4>} : tensor<128x16xf16, #linear7> -> tensor<128x16xf16, #blocked2>
           %299 = ttg.memdesc_index %arg118[%c0_i32_16] {async_task_id = array<i32: 4>} : !ttg.memdesc<1x128x16xf16, #shared2, #smem, mutable> -> !ttg.memdesc<128x16xf16, #shared2, #smem, mutable>
           ttg.local_store %298, %299 {async_task_id = array<i32: 4>} : tensor<128x16xf16, #blocked2> -> !ttg.memdesc<128x16xf16, #shared2, #smem, mutable>
           %300 = ttg.memdesc_index %arg118[%c0_i32_16] {async_task_id = array<i32: 4>} : !ttg.memdesc<1x128x16xf16, #shared2, #smem, mutable> -> !ttg.memdesc<128x16xf16, #shared2, #smem, mutable>
           %301 = ttng.async_tma_copy_local_to_global %arg119[%185, %c80_i32] %300 {async_task_id = array<i32: 4>} : !tt.tensordesc<128x16xf16, #shared2>, !ttg.memdesc<128x16xf16, #shared2, #smem, mutable> -> !ttg.async.token
-          ttng.async_tma_store_token_wait %301   {async_task_id = array<i32: 4>, can_rotate_by_buffer_count = 1 : i32} : !ttg.async.token
+          nvws.tma_store_wait %300   {async_task_id = array<i32: 4>, can_rotate_by_buffer_count = 1 : i32} : !ttg.memdesc<128x16xf16, #shared2, #smem, mutable>
           %302 = arith.truncf %outLHS_33 {async_task_id = array<i32: 4>} : tensor<128x16xf32, #linear7> to tensor<128x16xf16, #linear7>
           %303 = ttg.convert_layout %302 {async_task_id = array<i32: 4>} : tensor<128x16xf16, #linear7> -> tensor<128x16xf16, #blocked2>
           %304 = ttg.memdesc_index %arg118[%c0_i32_16] {async_task_id = array<i32: 4>} : !ttg.memdesc<1x128x16xf16, #shared2, #smem, mutable> -> !ttg.memdesc<128x16xf16, #shared2, #smem, mutable>
           ttg.local_store %303, %304 {async_task_id = array<i32: 4>} : tensor<128x16xf16, #blocked2> -> !ttg.memdesc<128x16xf16, #shared2, #smem, mutable>
           %305 = ttg.memdesc_index %arg118[%c0_i32_16] {async_task_id = array<i32: 4>} : !ttg.memdesc<1x128x16xf16, #shared2, #smem, mutable> -> !ttg.memdesc<128x16xf16, #shared2, #smem, mutable>
           %306 = ttng.async_tma_copy_local_to_global %arg119[%185, %c96_i32] %305 {async_task_id = array<i32: 4>} : !tt.tensordesc<128x16xf16, #shared2>, !ttg.memdesc<128x16xf16, #shared2, #smem, mutable> -> !ttg.async.token
-          ttng.async_tma_store_token_wait %306   {async_task_id = array<i32: 4>, can_rotate_by_buffer_count = 1 : i32} : !ttg.async.token
+          nvws.tma_store_wait %305   {async_task_id = array<i32: 4>, can_rotate_by_buffer_count = 1 : i32} : !ttg.memdesc<128x16xf16, #shared2, #smem, mutable>
           %307 = arith.truncf %outRHS_34 {async_task_id = array<i32: 4>} : tensor<128x16xf32, #linear7> to tensor<128x16xf16, #linear7>
           %308 = ttg.convert_layout %307 {async_task_id = array<i32: 4>} : tensor<128x16xf16, #linear7> -> tensor<128x16xf16, #blocked2>
           %309 = ttg.memdesc_index %arg118[%c0_i32_16] {async_task_id = array<i32: 4>} : !ttg.memdesc<1x128x16xf16, #shared2, #smem, mutable> -> !ttg.memdesc<128x16xf16, #shared2, #smem, mutable>
           ttg.local_store %308, %309 {async_task_id = array<i32: 4>} : tensor<128x16xf16, #blocked2> -> !ttg.memdesc<128x16xf16, #shared2, #smem, mutable>
           %310 = ttg.memdesc_index %arg118[%c0_i32_16] {async_task_id = array<i32: 4>} : !ttg.memdesc<1x128x16xf16, #shared2, #smem, mutable> -> !ttg.memdesc<128x16xf16, #shared2, #smem, mutable>
           %311 = ttng.async_tma_copy_local_to_global %arg119[%185, %c112_i32] %310 {async_task_id = array<i32: 4>} : !tt.tensordesc<128x16xf16, #shared2>, !ttg.memdesc<128x16xf16, #shared2, #smem, mutable> -> !ttg.async.token
-          ttng.async_tma_store_token_wait %311   {async_task_id = array<i32: 4>, can_rotate_by_buffer_count = 1 : i32} : !ttg.async.token
+          nvws.tma_store_wait %310   {async_task_id = array<i32: 4>, can_rotate_by_buffer_count = 1 : i32} : !ttg.memdesc<128x16xf16, #shared2, #smem, mutable>
           %312 = ttg.memdesc_index %arg86[%c0_i32_16] {async_task_id = array<i32: 4>} : !ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
           %313 = ttg.memdesc_index %arg95[%c0_i32_16] {async_task_id = array<i32: 4>} : !ttg.memdesc<1x1xi64, #shared4, #smem, mutable> -> !ttg.memdesc<1xi64, #shared4, #smem, mutable>
           %314 = arith.extui %189 {async_task_id = array<i32: 4>} : i1 to i32
@@ -2340,7 +2340,7 @@ module {
           ttg.local_store %332, %333 {async_task_id = array<i32: 4>} : tensor<128x16xf16, #blocked2> -> !ttg.memdesc<128x16xf16, #shared2, #smem, mutable>
           %334 = ttg.memdesc_index %arg120[%c0_i32_16] {async_task_id = array<i32: 4>} : !ttg.memdesc<1x128x16xf16, #shared2, #smem, mutable> -> !ttg.memdesc<128x16xf16, #shared2, #smem, mutable>
           %335 = ttng.async_tma_copy_local_to_global %arg121[%185, %c0_i32_16] %334 {async_task_id = array<i32: 4>} : !tt.tensordesc<128x16xf16, #shared2>, !ttg.memdesc<128x16xf16, #shared2, #smem, mutable> -> !ttg.async.token
-          ttng.async_tma_store_token_wait %335   {async_task_id = array<i32: 4>, can_rotate_by_buffer_count = 1 : i32} : !ttg.async.token
+          nvws.tma_store_wait %334   {async_task_id = array<i32: 4>, can_rotate_by_buffer_count = 1 : i32} : !ttg.memdesc<128x16xf16, #shared2, #smem, mutable>
           %336 = arith.mulf %outRHS_42, %169 {async_task_id = array<i32: 4>} : tensor<128x16xf32, #linear7>
           %337 = arith.truncf %336 {async_task_id = array<i32: 4>} : tensor<128x16xf32, #linear7> to tensor<128x16xf16, #linear7>
           %338 = ttg.convert_layout %337 {async_task_id = array<i32: 4>} : tensor<128x16xf16, #linear7> -> tensor<128x16xf16, #blocked2>
@@ -2348,7 +2348,7 @@ module {
           ttg.local_store %338, %339 {async_task_id = array<i32: 4>} : tensor<128x16xf16, #blocked2> -> !ttg.memdesc<128x16xf16, #shared2, #smem, mutable>
           %340 = ttg.memdesc_index %arg120[%c0_i32_16] {async_task_id = array<i32: 4>} : !ttg.memdesc<1x128x16xf16, #shared2, #smem, mutable> -> !ttg.memdesc<128x16xf16, #shared2, #smem, mutable>
           %341 = ttng.async_tma_copy_local_to_global %arg121[%185, %c16_i32_11] %340 {async_task_id = array<i32: 4>} : !tt.tensordesc<128x16xf16, #shared2>, !ttg.memdesc<128x16xf16, #shared2, #smem, mutable> -> !ttg.async.token
-          ttng.async_tma_store_token_wait %341   {async_task_id = array<i32: 4>, can_rotate_by_buffer_count = 1 : i32} : !ttg.async.token
+          nvws.tma_store_wait %340   {async_task_id = array<i32: 4>, can_rotate_by_buffer_count = 1 : i32} : !ttg.memdesc<128x16xf16, #shared2, #smem, mutable>
           %342 = arith.mulf %outLHS_43, %169 {async_task_id = array<i32: 4>} : tensor<128x16xf32, #linear7>
           %343 = arith.truncf %342 {async_task_id = array<i32: 4>} : tensor<128x16xf32, #linear7> to tensor<128x16xf16, #linear7>
           %344 = ttg.convert_layout %343 {async_task_id = array<i32: 4>} : tensor<128x16xf16, #linear7> -> tensor<128x16xf16, #blocked2>
@@ -2356,7 +2356,7 @@ module {
           ttg.local_store %344, %345 {async_task_id = array<i32: 4>} : tensor<128x16xf16, #blocked2> -> !ttg.memdesc<128x16xf16, #shared2, #smem, mutable>
           %346 = ttg.memdesc_index %arg120[%c0_i32_16] {async_task_id = array<i32: 4>} : !ttg.memdesc<1x128x16xf16, #shared2, #smem, mutable> -> !ttg.memdesc<128x16xf16, #shared2, #smem, mutable>
           %347 = ttng.async_tma_copy_local_to_global %arg121[%185, %c32_i32_10] %346 {async_task_id = array<i32: 4>} : !tt.tensordesc<128x16xf16, #shared2>, !ttg.memdesc<128x16xf16, #shared2, #smem, mutable> -> !ttg.async.token
-          ttng.async_tma_store_token_wait %347   {async_task_id = array<i32: 4>, can_rotate_by_buffer_count = 1 : i32} : !ttg.async.token
+          nvws.tma_store_wait %346   {async_task_id = array<i32: 4>, can_rotate_by_buffer_count = 1 : i32} : !ttg.memdesc<128x16xf16, #shared2, #smem, mutable>
           %348 = arith.mulf %outRHS_44, %169 {async_task_id = array<i32: 4>} : tensor<128x16xf32, #linear7>
           %349 = arith.truncf %348 {async_task_id = array<i32: 4>} : tensor<128x16xf32, #linear7> to tensor<128x16xf16, #linear7>
           %350 = ttg.convert_layout %349 {async_task_id = array<i32: 4>} : tensor<128x16xf16, #linear7> -> tensor<128x16xf16, #blocked2>
@@ -2364,7 +2364,7 @@ module {
           ttg.local_store %350, %351 {async_task_id = array<i32: 4>} : tensor<128x16xf16, #blocked2> -> !ttg.memdesc<128x16xf16, #shared2, #smem, mutable>
           %352 = ttg.memdesc_index %arg120[%c0_i32_16] {async_task_id = array<i32: 4>} : !ttg.memdesc<1x128x16xf16, #shared2, #smem, mutable> -> !ttg.memdesc<128x16xf16, #shared2, #smem, mutable>
           %353 = ttng.async_tma_copy_local_to_global %arg121[%185, %c48_i32_9] %352 {async_task_id = array<i32: 4>} : !tt.tensordesc<128x16xf16, #shared2>, !ttg.memdesc<128x16xf16, #shared2, #smem, mutable> -> !ttg.async.token
-          ttng.async_tma_store_token_wait %353   {async_task_id = array<i32: 4>, can_rotate_by_buffer_count = 1 : i32} : !ttg.async.token
+          nvws.tma_store_wait %352   {async_task_id = array<i32: 4>, can_rotate_by_buffer_count = 1 : i32} : !ttg.memdesc<128x16xf16, #shared2, #smem, mutable>
           %354 = arith.mulf %outLHS_47, %169 {async_task_id = array<i32: 4>} : tensor<128x16xf32, #linear7>
           %355 = arith.truncf %354 {async_task_id = array<i32: 4>} : tensor<128x16xf32, #linear7> to tensor<128x16xf16, #linear7>
           %356 = ttg.convert_layout %355 {async_task_id = array<i32: 4>} : tensor<128x16xf16, #linear7> -> tensor<128x16xf16, #blocked2>
@@ -2372,7 +2372,7 @@ module {
           ttg.local_store %356, %357 {async_task_id = array<i32: 4>} : tensor<128x16xf16, #blocked2> -> !ttg.memdesc<128x16xf16, #shared2, #smem, mutable>
           %358 = ttg.memdesc_index %arg120[%c0_i32_16] {async_task_id = array<i32: 4>} : !ttg.memdesc<1x128x16xf16, #shared2, #smem, mutable> -> !ttg.memdesc<128x16xf16, #shared2, #smem, mutable>
           %359 = ttng.async_tma_copy_local_to_global %arg121[%185, %c64_i32_8] %358 {async_task_id = array<i32: 4>} : !tt.tensordesc<128x16xf16, #shared2>, !ttg.memdesc<128x16xf16, #shared2, #smem, mutable> -> !ttg.async.token
-          ttng.async_tma_store_token_wait %359   {async_task_id = array<i32: 4>, can_rotate_by_buffer_count = 1 : i32} : !ttg.async.token
+          nvws.tma_store_wait %358   {async_task_id = array<i32: 4>, can_rotate_by_buffer_count = 1 : i32} : !ttg.memdesc<128x16xf16, #shared2, #smem, mutable>
           %360 = arith.mulf %outRHS_48, %169 {async_task_id = array<i32: 4>} : tensor<128x16xf32, #linear7>
           %361 = arith.truncf %360 {async_task_id = array<i32: 4>} : tensor<128x16xf32, #linear7> to tensor<128x16xf16, #linear7>
           %362 = ttg.convert_layout %361 {async_task_id = array<i32: 4>} : tensor<128x16xf16, #linear7> -> tensor<128x16xf16, #blocked2>
@@ -2380,7 +2380,7 @@ module {
           ttg.local_store %362, %363 {async_task_id = array<i32: 4>} : tensor<128x16xf16, #blocked2> -> !ttg.memdesc<128x16xf16, #shared2, #smem, mutable>
           %364 = ttg.memdesc_index %arg120[%c0_i32_16] {async_task_id = array<i32: 4>} : !ttg.memdesc<1x128x16xf16, #shared2, #smem, mutable> -> !ttg.memdesc<128x16xf16, #shared2, #smem, mutable>
           %365 = ttng.async_tma_copy_local_to_global %arg121[%185, %c80_i32] %364 {async_task_id = array<i32: 4>} : !tt.tensordesc<128x16xf16, #shared2>, !ttg.memdesc<128x16xf16, #shared2, #smem, mutable> -> !ttg.async.token
-          ttng.async_tma_store_token_wait %365   {async_task_id = array<i32: 4>, can_rotate_by_buffer_count = 1 : i32} : !ttg.async.token
+          nvws.tma_store_wait %364   {async_task_id = array<i32: 4>, can_rotate_by_buffer_count = 1 : i32} : !ttg.memdesc<128x16xf16, #shared2, #smem, mutable>
           %366 = arith.mulf %outLHS_49, %169 {async_task_id = array<i32: 4>} : tensor<128x16xf32, #linear7>
           %367 = arith.truncf %366 {async_task_id = array<i32: 4>} : tensor<128x16xf32, #linear7> to tensor<128x16xf16, #linear7>
           %368 = ttg.convert_layout %367 {async_task_id = array<i32: 4>} : tensor<128x16xf16, #linear7> -> tensor<128x16xf16, #blocked2>
@@ -2388,7 +2388,7 @@ module {
           ttg.local_store %368, %369 {async_task_id = array<i32: 4>} : tensor<128x16xf16, #blocked2> -> !ttg.memdesc<128x16xf16, #shared2, #smem, mutable>
           %370 = ttg.memdesc_index %arg120[%c0_i32_16] {async_task_id = array<i32: 4>} : !ttg.memdesc<1x128x16xf16, #shared2, #smem, mutable> -> !ttg.memdesc<128x16xf16, #shared2, #smem, mutable>
           %371 = ttng.async_tma_copy_local_to_global %arg121[%185, %c96_i32] %370 {async_task_id = array<i32: 4>} : !tt.tensordesc<128x16xf16, #shared2>, !ttg.memdesc<128x16xf16, #shared2, #smem, mutable> -> !ttg.async.token
-          ttng.async_tma_store_token_wait %371   {async_task_id = array<i32: 4>, can_rotate_by_buffer_count = 1 : i32} : !ttg.async.token
+          nvws.tma_store_wait %370   {async_task_id = array<i32: 4>, can_rotate_by_buffer_count = 1 : i32} : !ttg.memdesc<128x16xf16, #shared2, #smem, mutable>
           %372 = arith.mulf %outRHS_50, %169 {async_task_id = array<i32: 4>} : tensor<128x16xf32, #linear7>
           %373 = arith.truncf %372 {async_task_id = array<i32: 4>} : tensor<128x16xf32, #linear7> to tensor<128x16xf16, #linear7>
           %374 = ttg.convert_layout %373 {async_task_id = array<i32: 4>} : tensor<128x16xf16, #linear7> -> tensor<128x16xf16, #blocked2>
@@ -2396,7 +2396,7 @@ module {
           ttg.local_store %374, %375 {async_task_id = array<i32: 4>} : tensor<128x16xf16, #blocked2> -> !ttg.memdesc<128x16xf16, #shared2, #smem, mutable>
           %376 = ttg.memdesc_index %arg120[%c0_i32_16] {async_task_id = array<i32: 4>} : !ttg.memdesc<1x128x16xf16, #shared2, #smem, mutable> -> !ttg.memdesc<128x16xf16, #shared2, #smem, mutable>
           %377 = ttng.async_tma_copy_local_to_global %arg121[%185, %c112_i32] %376 {async_task_id = array<i32: 4>} : !tt.tensordesc<128x16xf16, #shared2>, !ttg.memdesc<128x16xf16, #shared2, #smem, mutable> -> !ttg.async.token
-          ttng.async_tma_store_token_wait %377   {async_task_id = array<i32: 4>, can_rotate_by_buffer_count = 1 : i32} : !ttg.async.token
+          nvws.tma_store_wait %376   {async_task_id = array<i32: 4>, can_rotate_by_buffer_count = 1 : i32} : !ttg.memdesc<128x16xf16, #shared2, #smem, mutable>
           %378 = arith.addi %arg145, %159 {async_task_id = array<i32: 4>} : i32
           %379 = arith.addi %arg146, %c1_i64_6 {async_task_id = array<i32: 4>} : i64
           scf.yield {async_task_id = array<i32: 4>} %378, %379, %253#0 : i32, i64, i64

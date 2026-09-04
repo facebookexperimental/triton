@@ -9,6 +9,7 @@
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Support/LLVM.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+#include "nvidia/include/Dialect/NVWS/IR/Dialect.h"
 #include "triton/Analysis/AxisInfo.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
@@ -30,6 +31,7 @@ using namespace mlir;
 namespace tt = mlir::triton;
 namespace ttg = mlir::triton::gpu;
 namespace ttng = mlir::triton::nvidia_gpu;
+namespace nvws = mlir::triton::nvws;
 
 //===----------------------------------------------------------------------===//
 // Hoisting Utilities
@@ -227,7 +229,7 @@ Operation *mlir::triton::predicateOp(RewriterBase &rewriter, Operation *op,
   // rather than being silently mishandled.
   if (isa<tt::DescriptorLoadOp, tt::DescriptorGatherOp,
           ttng::AsyncTMACopyLocalToGlobalOp, ttng::AsyncTMAReduceOp,
-          ttng::AsyncTMAScatterOp, ttng::TMAStoreTokenWaitOp>(op)) {
+          ttng::AsyncTMAScatterOp, nvws::TMAStoreWaitOp>(op)) {
     rewriter.setInsertionPoint(op);
     bool hasResults = op->getNumResults() > 0;
     auto ifOp =
